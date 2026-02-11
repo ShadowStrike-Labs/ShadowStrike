@@ -6,23 +6,25 @@
  * @file ResourceThrottling.c
  * @brief Enterprise-grade resource throttling implementation.
  *
- * Implements CrowdStrike Falcon-class resource management with:
+ * Implements resource management with:
  * - Multi-dimensional resource tracking
  * - Adaptive throttling with exponential backoff
- * - Per-process quota enforcement
- * - Token bucket rate limiting
- * - Deferred work queue processing
+ * - Per-process quota enforcement with per-process limits
+ * - Token bucket rate limiting (CAS-safe)
+ * - Deferred work queue processing via system worker thread
  * - Real-time monitoring via DPC
  *
- * Security Hardened v2.0.0:
- * - All atomic operations use proper memory barriers
- * - Reference counting prevents use-after-free
- * - Lock ordering prevents deadlocks
- * - Integer overflow checks on all calculations
- * - Safe cleanup with drain synchronization
+ * Safety v3.0.0:
+ * - EX_RUNDOWN_REF for lifecycle management
+ * - KSPIN_LOCK for all DPC-accessible state
+ * - Callback rundown protection (CallbackActiveCount)
+ * - StatsLock for atomic statistics snapshots
+ * - Separate LastTokenRefillTime for burst tokens
+ * - Per-process limits (not just global fallback)
+ * - All enum inputs validated before array indexing
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -31,61 +33,33 @@
 #include "../Utilities/MemoryUtils.h"
 
 // ============================================================================
+// COMPILE-TIME ASSERTIONS
+// ============================================================================
+
+C_ASSERT(RtResourceMax == RT_MAX_RESOURCE_TYPES);
+
+// ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
 
-/**
- * @brief Hysteresis threshold for state transitions (percentage of limit)
- */
 #define RT_HYSTERESIS_THRESHOLD         90
-
-/**
- * @brief Minimum samples before state transition
- */
 #define RT_MIN_SAMPLES_FOR_TRANSITION   3
-
-/**
- * @brief Maximum time in throttled state before forced recovery check (ms)
- */
 #define RT_MAX_THROTTLE_DURATION_MS     60000
-
-/**
- * @brief Deferred work processing interval (ms)
- */
 #define RT_DEFERRED_PROCESS_INTERVAL_MS 50
-
-/**
- * @brief Hash bucket count for process tracking
- */
-#define RT_PROCESS_HASH_BUCKETS         64
-
-/**
- * @brief Shutdown drain timeout (ms)
- */
 #define RT_SHUTDOWN_DRAIN_TIMEOUT_MS    5000
 
 // ============================================================================
 // PRIVATE FUNCTION PROTOTYPES
 // ============================================================================
 
-static VOID
-RtpInitializeResourceStates(
-    _Inout_ PRT_THROTTLER Throttler
-);
-
-static VOID
-RtpInitializeProcessQuotas(
-    _Inout_ PRT_THROTTLER Throttler
-);
-
-static VOID
-RtpInitializeDeferredWork(
-    _Inout_ PRT_THROTTLER Throttler
-);
+static VOID RtpInitializeResourceStates(_Inout_ PRT_THROTTLER Throttler);
+static VOID RtpInitializeProcessQuotas(_Inout_ PRT_THROTTLER Throttler);
+static VOID RtpInitializeDeferredWork(_Inout_ PRT_THROTTLER Throttler);
 
 static KDEFERRED_ROUTINE RtpMonitorDpcRoutine;
 static KDEFERRED_ROUTINE RtpDeferredWorkDpcRoutine;
-static IO_WORKITEM_ROUTINE RtpPassiveWorkItemRoutine;
+
+static VOID RtpWorkerThreadRoutine(_In_ PVOID Context);
 
 static VOID
 RtpUpdateResourceState(
@@ -120,42 +94,28 @@ RtpNotifyCallback(
 );
 
 static PRT_PROCESS_QUOTA
+RtpFindProcessQuota(
+    _In_ PRT_THROTTLER Throttler,
+    _In_ HANDLE ProcessId
+);
+
+static PRT_PROCESS_QUOTA
 RtpFindOrCreateProcessQuota(
     _In_ PRT_THROTTLER Throttler,
     _In_ HANDLE ProcessId,
     _In_ BOOLEAN CreateIfNotFound
 );
 
-static ULONG
-RtpHashProcessId(
-    _In_ HANDLE ProcessId
-);
-
-static VOID
-RtpProcessDeferredWorkQueue(
-    _Inout_ PRT_THROTTLER Throttler
-);
-
-static VOID
-RtpDrainDeferredWorkQueue(
-    _Inout_ PRT_THROTTLER Throttler
-);
-
-static BOOLEAN
-RtpAcquireOperationReference(
-    _In_ PRT_THROTTLER Throttler
-);
-
-static VOID
-RtpReleaseOperationReference(
-    _In_ PRT_THROTTLER Throttler
-);
+static ULONG RtpHashProcessId(_In_ HANDLE ProcessId);
+static VOID RtpProcessDeferredWorkQueue(_Inout_ PRT_THROTTLER Throttler);
+static VOID RtpDrainDeferredWorkQueue(_Inout_ PRT_THROTTLER Throttler);
+static VOID RtpDrainProcessQuotas(_Inout_ PRT_THROTTLER Throttler);
 
 // ============================================================================
-// STATIC STRING TABLES
+// STATIC STRING TABLES (bounds checked via C_ASSERT)
 // ============================================================================
 
-static PCWSTR g_ResourceNames[] = {
+static PCWSTR g_ResourceNames[RtResourceMax] = {
     L"CPU",
     L"MemoryNonPaged",
     L"MemoryPaged",
@@ -174,7 +134,7 @@ static PCWSTR g_ResourceNames[] = {
     L"Custom2"
 };
 
-static PCWSTR g_ActionNames[] = {
+static PCWSTR g_ActionNames[RtActionEscalate + 1] = {
     L"None",
     L"Delay",
     L"SkipLowPriority",
@@ -185,13 +145,17 @@ static PCWSTR g_ActionNames[] = {
     L"Escalate"
 };
 
-static PCWSTR g_StateNames[] = {
+static PCWSTR g_StateNames[RtStateRecovery + 1] = {
     L"Normal",
     L"Warning",
     L"Throttled",
     L"Critical",
     L"Recovery"
 };
+
+C_ASSERT(ARRAYSIZE(g_ResourceNames) == RtResourceMax);
+C_ASSERT(ARRAYSIZE(g_ActionNames) == RtActionEscalate + 1);
+C_ASSERT(ARRAYSIZE(g_StateNames) == RtStateRecovery + 1);
 
 // ============================================================================
 // INITIALIZATION AND CLEANUP
@@ -205,23 +169,19 @@ RtInitialize(
 )
 {
     PRT_THROTTLER throttler = NULL;
+    NTSTATUS status;
+    HANDLE threadHandle = NULL;
+    OBJECT_ATTRIBUTES oa;
     ULONG i;
 
     PAGED_CODE();
 
-    //
-    // Validate parameters
-    //
     if (Throttler == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Throttler = NULL;
 
-    //
-    // Allocate throttler structure from non-paged pool
-    // (accessed at DISPATCH_LEVEL in DPC routines)
-    //
     throttler = (PRT_THROTTLER)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(RT_THROTTLER),
@@ -232,58 +192,44 @@ RtInitialize(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Zero-initialize (ShadowStrikeAllocatePoolWithTag already zeros)
-    // but be explicit for safety
-    //
     RtlZeroMemory(throttler, sizeof(RT_THROTTLER));
 
-    //
-    // Set magic value for validation
-    //
     throttler->Magic = RT_THROTTLER_MAGIC;
 
     //
-    // Initialize spin lock for callback (must be usable at DISPATCH_LEVEL)
-    // Note: We use a spin lock instead of push lock because callbacks
-    // may be invoked from DPC context
+    // Initialize spin locks
     //
     KeInitializeSpinLock(&throttler->CallbackSpinLock);
-    ExInitializePushLock(&throttler->ProcessQuotas.Lock);
+    KeInitializeSpinLock(&throttler->StatsLock);
+    KeInitializeSpinLock(&throttler->ProcessQuotas.Lock);
 
     //
-    // Initialize resource states
+    // Initialize rundown protection
+    //
+    ExInitializeRundownProtection(&throttler->RundownRef);
+    throttler->ShutdownFlag = 0;
+
+    //
+    // Initialize resource states (each with its own KSPIN_LOCK)
     //
     RtpInitializeResourceStates(throttler);
-
-    //
-    // Initialize per-process quota tracking
-    //
     RtpInitializeProcessQuotas(throttler);
-
-    //
-    // Initialize deferred work queue
-    //
     RtpInitializeDeferredWork(throttler);
 
     //
-    // Initialize monitoring timer and DPC
+    // Monitoring timer and DPC
     //
     KeInitializeTimer(&throttler->MonitorTimer);
     KeInitializeDpc(&throttler->MonitorDpc, RtpMonitorDpcRoutine, throttler);
 
     //
-    // Initialize shutdown event
+    // Worker thread wake event
     //
-    KeInitializeEvent(&throttler->ShutdownEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&throttler->WorkerWakeEvent, SynchronizationEvent, FALSE);
+    throttler->WorkerShouldExit = 0;
 
     //
-    // Initialize callback notification event for deferred notifications
-    //
-    KeInitializeEvent(&throttler->CallbackNotifyEvent, SynchronizationEvent, FALSE);
-
-    //
-    // Set default configuration for all resources
+    // Set default configuration
     //
     for (i = 0; i < RT_MAX_RESOURCE_TYPES; i++) {
         throttler->Configs[i].Type = (RT_RESOURCE_TYPE)i;
@@ -300,20 +246,47 @@ RtInitialize(
         throttler->Configs[i].BurstCapacity = RT_DEFAULT_BURST_CAPACITY;
     }
 
-    //
-    // Initialize statistics
-    //
     KeQuerySystemTime(&throttler->Stats.StartTime);
     KeQuerySystemTime(&throttler->CreateTime);
 
     //
-    // Set initial reference count
+    // Create system worker thread for PASSIVE_LEVEL deferred work
     //
-    throttler->ReferenceCount = 1;
+    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
 
-    //
-    // Enable throttling by default
-    //
+    status = PsCreateSystemThread(
+        &threadHandle,
+        THREAD_ALL_ACCESS,
+        &oa,
+        NULL,
+        NULL,
+        RtpWorkerThreadRoutine,
+        throttler
+    );
+
+    if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreePoolWithTag(throttler, RT_POOL_TAG);
+        return status;
+    }
+
+    status = ObReferenceObjectByHandle(
+        threadHandle,
+        THREAD_ALL_ACCESS,
+        *PsThreadType,
+        KernelMode,
+        (PVOID*)&throttler->WorkerThread,
+        NULL
+    );
+
+    ZwClose(threadHandle);
+
+    if (!NT_SUCCESS(status)) {
+        InterlockedExchange(&throttler->WorkerShouldExit, 1);
+        KeSetEvent(&throttler->WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
+        ShadowStrikeFreePoolWithTag(throttler, RT_POOL_TAG);
+        return status;
+    }
+
     throttler->Enabled = TRUE;
     throttler->Initialized = TRUE;
 
@@ -325,81 +298,85 @@ RtInitialize(
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 RtShutdown(
-    _Inout_ PRT_THROTTLER Throttler
+    _Inout_ PRT_THROTTLER* Throttler
 )
 {
-    LARGE_INTEGER timeout;
-    NTSTATUS waitStatus;
+    PRT_THROTTLER throttler;
 
     PAGED_CODE();
 
-    if (!RtIsValidThrottler(Throttler)) {
+    if (Throttler == NULL || *Throttler == NULL) {
+        return;
+    }
+
+    throttler = *Throttler;
+    *Throttler = NULL;
+
+    if (!RtIsValidThrottler(throttler)) {
         return;
     }
 
     //
-    // Signal shutdown in progress
+    // 1. Signal shutdown flag (safe to read at any IRQL)
     //
-    InterlockedExchange(&Throttler->ShutdownInProgress, 1);
+    InterlockedExchange(&throttler->ShutdownFlag, 1);
 
     //
-    // Stop monitoring if active
+    // 2. Disable rundown — blocks new ExAcquireRundownProtection calls
     //
-    if (Throttler->MonitoringActive) {
-        RtStopMonitoring(Throttler);
-    }
+    ExWaitForRundownProtectionRelease(&throttler->RundownRef);
 
     //
-    // Stop deferred work processing
+    // 3. Stop monitoring timer + DPC
     //
-    if (Throttler->DeferredWork.ProcessingEnabled) {
-        Throttler->DeferredWork.ProcessingEnabled = FALSE;
-        KeCancelTimer(&Throttler->DeferredWork.ProcessTimer);
-        KeFlushQueuedDpcs();
-    }
+    throttler->MonitoringActive = FALSE;
+    KeCancelTimer(&throttler->MonitorTimer);
 
     //
-    // Drain deferred work queue
+    // 4. Stop deferred work timer + DPC
     //
-    RtpDrainDeferredWorkQueue(Throttler);
+    throttler->DeferredWork.ProcessingEnabled = FALSE;
+    KeCancelTimer(&throttler->DeferredWork.ProcessTimer);
 
     //
-    // Wait for active operations to complete
+    // 5. Flush all DPCs across all processors
     //
-    timeout.QuadPart = -((LONGLONG)RT_SHUTDOWN_DRAIN_TIMEOUT_MS * 10000);
+    KeFlushQueuedDpcs();
 
-    while (Throttler->ActiveOperations > 0) {
-        waitStatus = KeWaitForSingleObject(
-            &Throttler->ShutdownEvent,
+    //
+    // 6. Signal worker thread to exit and wait
+    //
+    InterlockedExchange(&throttler->WorkerShouldExit, 1);
+    KeSetEvent(&throttler->WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
+
+    if (throttler->WorkerThread != NULL) {
+        KeWaitForSingleObject(
+            throttler->WorkerThread,
             Executive,
             KernelMode,
             FALSE,
-            &timeout
+            NULL
         );
-
-        if (waitStatus == STATUS_TIMEOUT) {
-            //
-            // Log warning but continue - don't hang unload
-            //
-            break;
-        }
+        ObDereferenceObject(throttler->WorkerThread);
+        throttler->WorkerThread = NULL;
     }
 
     //
-    // Release reference and check if we should free
+    // 7. Drain deferred work queue (free without executing)
     //
-    if (InterlockedDecrement(&Throttler->ReferenceCount) == 0) {
-        //
-        // Clear magic to prevent use-after-free detection
-        //
-        Throttler->Magic = 0;
-        Throttler->Initialized = FALSE;
+    RtpDrainDeferredWorkQueue(throttler);
 
-        //
-        // Free the structure
-        //
-        ShadowStrikeFreePoolWithTag(Throttler, RT_POOL_TAG);
-    }
+    //
+    // 8. Free all dynamically allocated process quotas
+    //
+    RtpDrainProcessQuotas(throttler);
+
+    //
+    // 9. Invalidate and free
+    //
+    throttler->Magic = 0;
+    throttler->Initialized = FALSE;
+    ShadowStrikeFreePoolWithTag(throttler, RT_POOL_TAG);
 }
 
 // ============================================================================
@@ -417,6 +394,7 @@ RtSetLimits(
 )
 {
     PRT_RESOURCE_CONFIG config;
+    KIRQL oldIrql;
 
     PAGED_CODE();
 
@@ -428,26 +406,20 @@ RtSetLimits(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Validate limit ordering: soft <= hard <= critical
-    //
     if (SoftLimit > HardLimit || HardLimit > CriticalLimit) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (!ExAcquireRundownProtection(&Throttler->RundownRef)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     config = &Throttler->Configs[Resource];
 
-    //
-    // Use push lock for safe update
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Throttler->States[Resource].StateLock);
+    KeAcquireSpinLock(&Throttler->States[Resource].ResourceLock, &oldIrql);
 
-    //
-    // Count configured resources (before setting Enabled)
-    //
     if (!config->Enabled) {
-        Throttler->ConfiguredResourceCount++;
+        InterlockedIncrement(&Throttler->ConfiguredResourceCount);
     }
 
     config->SoftLimit = SoftLimit;
@@ -455,8 +427,9 @@ RtSetLimits(
     config->CriticalLimit = CriticalLimit;
     config->Enabled = TRUE;
 
-    ExReleasePushLockExclusive(&Throttler->States[Resource].StateLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Throttler->States[Resource].ResourceLock, oldIrql);
+
+    ExReleaseRundownProtection(&Throttler->RundownRef);
 
     return STATUS_SUCCESS;
 }
@@ -473,6 +446,7 @@ RtSetActions(
 )
 {
     PRT_RESOURCE_CONFIG config;
+    KIRQL oldIrql;
 
     PAGED_CODE();
 
@@ -484,9 +458,12 @@ RtSetActions(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Clamp delay to valid range
-    //
+    if (SoftAction > RT_ACTION_MAX_VALID ||
+        HardAction > RT_ACTION_MAX_VALID ||
+        CriticalAction > RT_ACTION_MAX_VALID) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     if (DelayMs < RT_MIN_DELAY_MS) {
         DelayMs = RT_MIN_DELAY_MS;
     }
@@ -494,18 +471,22 @@ RtSetActions(
         DelayMs = RT_MAX_DELAY_MS;
     }
 
+    if (!ExAcquireRundownProtection(&Throttler->RundownRef)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     config = &Throttler->Configs[Resource];
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Throttler->States[Resource].StateLock);
+    KeAcquireSpinLock(&Throttler->States[Resource].ResourceLock, &oldIrql);
 
     config->SoftAction = SoftAction;
     config->HardAction = HardAction;
     config->CriticalAction = CriticalAction;
     config->DelayMs = DelayMs;
 
-    ExReleasePushLockExclusive(&Throttler->States[Resource].StateLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Throttler->States[Resource].ResourceLock, oldIrql);
+
+    ExReleaseRundownProtection(&Throttler->RundownRef);
 
     return STATUS_SUCCESS;
 }
@@ -520,6 +501,7 @@ RtSetRateConfig(
 )
 {
     PRT_RESOURCE_CONFIG config;
+    KIRQL oldIrql;
 
     PAGED_CODE();
 
@@ -531,31 +513,24 @@ RtSetRateConfig(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Validate rate window
-    //
-    if (RateWindowMs < 100) {
-        RateWindowMs = 100;
-    }
-    if (RateWindowMs > 60000) {
-        RateWindowMs = 60000;
+    if (RateWindowMs < 100)   RateWindowMs = 100;
+    if (RateWindowMs > 60000) RateWindowMs = 60000;
+
+    if (!ExAcquireRundownProtection(&Throttler->RundownRef)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     config = &Throttler->Configs[Resource];
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Throttler->States[Resource].StateLock);
+    KeAcquireSpinLock(&Throttler->States[Resource].ResourceLock, &oldIrql);
 
     config->RateWindowMs = RateWindowMs;
     config->BurstCapacity = BurstCapacity;
-
-    //
-    // Reset burst tokens to new capacity
-    //
     InterlockedExchange(&Throttler->States[Resource].BurstTokens, (LONG)BurstCapacity);
 
-    ExReleasePushLockExclusive(&Throttler->States[Resource].StateLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Throttler->States[Resource].ResourceLock, oldIrql);
+
+    ExReleaseRundownProtection(&Throttler->RundownRef);
 
     return STATUS_SUCCESS;
 }
@@ -568,6 +543,8 @@ RtEnableResource(
     _In_ BOOLEAN Enable
 )
 {
+    KIRQL oldIrql;
+
     if (!RtIsValidThrottler(Throttler)) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -576,7 +553,9 @@ RtEnableResource(
         return STATUS_INVALID_PARAMETER;
     }
 
+    KeAcquireSpinLock(&Throttler->States[Resource].ResourceLock, &oldIrql);
     Throttler->Configs[Resource].Enabled = Enable;
+    KeReleaseSpinLock(&Throttler->States[Resource].ResourceLock, oldIrql);
 
     return STATUS_SUCCESS;
 }
@@ -601,9 +580,6 @@ RtRegisterCallback(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Use spin lock for thread-safe update (matches RtpNotifyCallback)
-    //
     KeAcquireSpinLock(&Throttler->CallbackSpinLock, &oldIrql);
 
     Throttler->ThrottleCallback = Callback;
@@ -628,15 +604,21 @@ RtUnregisterCallback(
         return;
     }
 
-    //
-    // Use spin lock for thread-safe update (matches RtpNotifyCallback)
-    //
     KeAcquireSpinLock(&Throttler->CallbackSpinLock, &oldIrql);
 
     Throttler->ThrottleCallback = NULL;
     Throttler->CallbackContext = NULL;
 
     KeReleaseSpinLock(&Throttler->CallbackSpinLock, oldIrql);
+
+    //
+    // Wait for any in-flight callback invocations to complete
+    //
+    while (Throttler->CallbackActiveCount > 0) {
+        LARGE_INTEGER delay;
+        delay.QuadPart = -10000; // 1ms
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
 }
 
 // ============================================================================
@@ -662,9 +644,6 @@ RtStartMonitoring(
         return STATUS_ALREADY_REGISTERED;
     }
 
-    //
-    // Clamp interval to valid range
-    //
     if (IntervalMs < RT_MIN_MONITOR_INTERVAL_MS) {
         IntervalMs = RT_MIN_MONITOR_INTERVAL_MS;
     }
@@ -674,9 +653,6 @@ RtStartMonitoring(
 
     Throttler->MonitorIntervalMs = IntervalMs;
 
-    //
-    // Start periodic timer
-    //
     dueTime.QuadPart = -((LONGLONG)IntervalMs * 10000);
 
     KeSetTimerEx(
@@ -689,7 +665,7 @@ RtStartMonitoring(
     Throttler->MonitoringActive = TRUE;
 
     //
-    // Also start deferred work processing
+    // Also start deferred work processing timer
     //
     if (!Throttler->DeferredWork.ProcessingEnabled) {
         dueTime.QuadPart = -((LONGLONG)RT_DEFERRED_PROCESS_INTERVAL_MS * 10000);
@@ -723,17 +699,10 @@ RtStopMonitoring(
         return;
     }
 
-    //
-    // Cancel timer
-    //
-    KeCancelTimer(&Throttler->MonitorTimer);
-
-    //
-    // Flush any pending DPCs
-    //
-    KeFlushQueuedDpcs();
-
     Throttler->MonitoringActive = FALSE;
+
+    KeCancelTimer(&Throttler->MonitorTimer);
+    KeFlushQueuedDpcs();
 }
 
 // ============================================================================
@@ -766,13 +735,10 @@ RtReportUsage(
 
     state = &Throttler->States[Resource];
 
-    //
-    // Atomic update of current usage
-    //
     newValue = InterlockedAdd64(&state->CurrentUsage, Delta);
 
     //
-    // Update peak if necessary (lock-free)
+    // Update peak (lock-free CAS)
     //
     do {
         currentPeak = state->PeakUsage;
@@ -780,10 +746,7 @@ RtReportUsage(
             break;
         }
     } while (InterlockedCompareExchange64(
-        &state->PeakUsage,
-        newValue,
-        currentPeak
-    ) != currentPeak);
+        &state->PeakUsage, newValue, currentPeak) != currentPeak);
 
     return STATUS_SUCCESS;
 }
@@ -797,6 +760,7 @@ RtSetUsage(
 )
 {
     PRT_RESOURCE_STATE state;
+    LONG64 currentPeak;
 
     if (!RtIsValidThrottler(Throttler)) {
         return STATUS_INVALID_PARAMETER;
@@ -808,27 +772,15 @@ RtSetUsage(
 
     state = &Throttler->States[Resource];
 
-    //
-    // Atomic set of current usage
-    //
     InterlockedExchange64(&state->CurrentUsage, (LONG64)Value);
 
-    //
-    // Update peak if necessary (lock-free CAS pattern)
-    //
-    {
-        LONG64 currentPeak;
-        do {
-            currentPeak = state->PeakUsage;
-            if ((LONG64)Value <= currentPeak) {
-                break;
-            }
-        } while (InterlockedCompareExchange64(
-            &state->PeakUsage,
-            (LONG64)Value,
-            currentPeak
-        ) != currentPeak);
-    }
+    do {
+        currentPeak = state->PeakUsage;
+        if ((LONG64)Value <= currentPeak) {
+            break;
+        }
+    } while (InterlockedCompareExchange64(
+        &state->PeakUsage, (LONG64)Value, currentPeak) != currentPeak);
 
     return STATUS_SUCCESS;
 }
@@ -860,35 +812,23 @@ RtCheckThrottle(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Quick check if throttling is disabled
-    //
     if (!Throttler->Enabled || !Throttler->Configs[Resource].Enabled) {
         return STATUS_SUCCESS;
     }
 
     //
-    // Acquire operation reference for safety
+    // Acquire rundown protection — prevents shutdown during operation
     //
-    if (!RtpAcquireOperationReference(Throttler)) {
+    if (!ExAcquireRundownProtection(&Throttler->RundownRef)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Update statistics
-    //
     InterlockedIncrement64(&Throttler->Stats.TotalOperations);
     InterlockedIncrement64(&Throttler->Stats.PerResource[Resource].Checks);
 
-    //
-    // Determine appropriate action based on current state and priority
-    //
     action = RtpDetermineAction(Throttler, Resource, Priority);
     *Action = action;
 
-    //
-    // Set return status based on action
-    //
     switch (action) {
         case RtActionNone:
         case RtActionNotify:
@@ -921,7 +861,7 @@ RtCheckThrottle(
             break;
     }
 
-    RtpReleaseOperationReference(Throttler);
+    ExReleaseRundownProtection(&Throttler->RundownRef);
 
     return status;
 }
@@ -938,10 +878,6 @@ RtShouldProceed(
     NTSTATUS status;
 
     status = RtCheckThrottle(Throttler, Resource, Priority, &action);
-
-    //
-    // Proceed if success or just notification
-    //
     return (NT_SUCCESS(status) || action == RtActionNotify);
 }
 
@@ -957,6 +893,7 @@ RtApplyThrottle(
     PRT_RESOURCE_STATE state;
     LARGE_INTEGER delayInterval;
     ULONG delayMs;
+    KIRQL oldIrql;
 
     if (!RtIsValidThrottler(Throttler)) {
         return STATUS_INVALID_PARAMETER;
@@ -974,48 +911,34 @@ RtApplyThrottle(
             return STATUS_SUCCESS;
 
         case RtActionDelay:
-            //
-            // Get current delay with exponential backoff
-            //
             delayMs = state->CurrentDelayMs;
             if (delayMs < RT_MIN_DELAY_MS) {
                 delayMs = Throttler->Configs[Resource].DelayMs;
             }
 
-            //
-            // Sleep for the delay period
-            //
             delayInterval.QuadPart = -((LONGLONG)delayMs * 10000);
             KeDelayExecutionThread(KernelMode, FALSE, &delayInterval);
 
-            //
-            // Update statistics
-            //
             InterlockedIncrement64(&Throttler->Stats.DelayedOperations);
             InterlockedAdd64(&Throttler->Stats.TotalDelayMs, delayMs);
 
             //
-            // Apply exponential backoff for next delay
+            // Exponential backoff (protected by per-resource lock)
             //
-            delayMs = (delayMs * RT_BACKOFF_MULTIPLIER) / RT_BACKOFF_DIVISOR;
-            if (delayMs > RT_MAX_DELAY_MS) {
-                delayMs = RT_MAX_DELAY_MS;
-            }
+            KeAcquireSpinLock(&state->ResourceLock, &oldIrql);
+            delayMs = (state->CurrentDelayMs * RT_BACKOFF_MULTIPLIER) / RT_BACKOFF_DIVISOR;
+            if (delayMs > RT_MAX_DELAY_MS) delayMs = RT_MAX_DELAY_MS;
+            if (delayMs < RT_MIN_DELAY_MS) delayMs = Throttler->Configs[Resource].DelayMs;
             state->CurrentDelayMs = delayMs;
+            KeReleaseSpinLock(&state->ResourceLock, oldIrql);
 
             return STATUS_SUCCESS;
 
         case RtActionSkipLowPriority:
         case RtActionSample:
-            //
-            // These are decision actions, not execution actions
-            //
             return STATUS_SUCCESS;
 
         case RtActionQueue:
-            //
-            // Caller should use RtQueueDeferredWork instead
-            //
             InterlockedIncrement64(&Throttler->Stats.QueuedOperations);
             return STATUS_DEVICE_BUSY;
 
@@ -1023,9 +946,6 @@ RtApplyThrottle(
             return STATUS_CANCELLED;
 
         case RtActionEscalate:
-            //
-            // Escalation is handled by callback notification
-            //
             return STATUS_DEVICE_BUSY;
 
         default:
@@ -1057,30 +977,15 @@ RtReportProcessUsage(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Also report to global counters
-    //
     RtReportUsage(Throttler, Resource, Delta);
 
-    //
-    // Find or create process quota entry
-    //
     quota = RtpFindOrCreateProcessQuota(Throttler, ProcessId, TRUE);
     if (quota == NULL) {
-        //
-        // Quota table full - just use global tracking
-        //
         return STATUS_SUCCESS;
     }
 
-    //
-    // Update per-process usage
-    //
     InterlockedAdd64(&quota->ResourceUsage[Resource], Delta);
 
-    //
-    // Update last activity time
-    //
     KeQuerySystemTime(&currentTime);
     quota->LastActivity = currentTime;
 
@@ -1113,27 +1018,36 @@ RtCheckProcessThrottle(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Find process quota entry
-    //
-    quota = RtpFindOrCreateProcessQuota(Throttler, ProcessId, FALSE);
+    quota = RtpFindProcessQuota(Throttler, ProcessId);
     if (quota == NULL) {
-        //
-        // Process not tracked - use global throttling
-        //
         return RtCheckThrottle(Throttler, Resource, RtPriorityNormal, Action);
     }
 
-    //
-    // Check if process is exempt
-    //
     if (quota->Exempt) {
         return STATUS_SUCCESS;
     }
 
     //
-    // For now, use global throttle check
-    // Future: implement per-process limits
+    // Check per-process limits if configured
+    //
+    if (quota->ProcessSoftLimit[Resource] != 0) {
+        LONG64 usage = quota->ResourceUsage[Resource];
+
+        if ((ULONG64)usage >= quota->ProcessSoftLimit[Resource]) {
+            InterlockedIncrement64(&quota->ThrottleHits);
+
+            if ((ULONG64)usage >= quota->ProcessSoftLimit[Resource] * 2) {
+                *Action = RtActionAbort;
+                return STATUS_QUOTA_EXCEEDED;
+            }
+
+            *Action = RtActionDelay;
+            return STATUS_DEVICE_BUSY;
+        }
+    }
+
+    //
+    // Fall back to global throttle check
     //
     return RtCheckThrottle(Throttler, Resource, RtPriorityNormal, Action);
 }
@@ -1154,9 +1068,6 @@ RtSetProcessExemption(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Find or create quota entry
-    //
     quota = RtpFindOrCreateProcessQuota(Throttler, ProcessId, TRUE);
     if (quota == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -1177,6 +1088,7 @@ RtRemoveProcess(
     PRT_PROCESS_QUOTA quota;
     ULONG bucket;
     PLIST_ENTRY entry;
+    KIRQL oldIrql;
 
     if (!RtIsValidThrottler(Throttler)) {
         return;
@@ -1184,13 +1096,8 @@ RtRemoveProcess(
 
     bucket = RtpHashProcessId(ProcessId);
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Throttler->ProcessQuotas.Lock);
+    KeAcquireSpinLock(&Throttler->ProcessQuotas.Lock, &oldIrql);
 
-    //
-    // Search directly in the hash bucket - do NOT call RtpFindOrCreateProcessQuota
-    // to avoid deadlock (we already hold the lock)
-    //
     for (entry = Throttler->ProcessQuotas.HashBuckets[bucket].Flink;
          entry != &Throttler->ProcessQuotas.HashBuckets[bucket];
          entry = entry->Flink) {
@@ -1199,14 +1106,15 @@ RtRemoveProcess(
 
         if (quota->ProcessId == ProcessId && quota->InUse) {
             RemoveEntryList(&quota->HashLink);
-            RtlZeroMemory(quota, sizeof(RT_PROCESS_QUOTA));
             InterlockedDecrement(&Throttler->ProcessQuotas.ActiveCount);
-            break;
+            KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
+
+            ShadowStrikeFreePoolWithTag(quota, RT_PROCESS_TAG);
+            return;
         }
     }
 
-    ExReleasePushLockExclusive(&Throttler->ProcessQuotas.Lock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
 }
 
 // ============================================================================
@@ -1235,16 +1143,10 @@ RtQueueDeferredWork(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Check queue depth
-    //
     if (Throttler->DeferredWork.Depth >= Throttler->DeferredWork.MaxDepth) {
         return STATUS_QUOTA_EXCEEDED;
     }
 
-    //
-    // Allocate work item
-    //
     workItem = (PRT_DEFERRED_WORK)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(RT_DEFERRED_WORK),
@@ -1255,15 +1157,12 @@ RtQueueDeferredWork(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Initialize work item
-    //
+    RtlZeroMemory(workItem, sizeof(RT_DEFERRED_WORK));
     InitializeListHead(&workItem->ListEntry);
-    workItem->ResourceType = RtResourceMax;  // Not resource-specific
+    workItem->ResourceType = RtResourceMax;
     workItem->Priority = Priority;
     workItem->Callback = Callback;
     workItem->Context = Context;
-    workItem->RefCount = 1;
 
     KeQuerySystemTime(&currentTime);
     workItem->QueueTime = currentTime;
@@ -1271,18 +1170,10 @@ RtQueueDeferredWork(
     if (TimeoutMs > 0) {
         workItem->ExpirationTime.QuadPart =
             currentTime.QuadPart + ((LONGLONG)TimeoutMs * 10000);
-    } else {
-        workItem->ExpirationTime.QuadPart = 0;
     }
 
-    //
-    // Add to queue (priority-ordered insertion)
-    //
     KeAcquireSpinLock(&Throttler->DeferredWork.Lock, &oldIrql);
 
-    //
-    // Insert based on priority (higher priority = earlier in list)
-    //
     if (IsListEmpty(&Throttler->DeferredWork.Queue)) {
         InsertTailList(&Throttler->DeferredWork.Queue, &workItem->ListEntry);
     } else {
@@ -1297,9 +1188,6 @@ RtQueueDeferredWork(
                 entry, RT_DEFERRED_WORK, ListEntry);
 
             if (Priority < existing->Priority) {
-                //
-                // Insert before this entry (higher priority)
-                //
                 InsertTailList(entry, &workItem->ListEntry);
                 inserted = TRUE;
                 break;
@@ -1314,6 +1202,11 @@ RtQueueDeferredWork(
     InterlockedIncrement(&Throttler->DeferredWork.Depth);
 
     KeReleaseSpinLock(&Throttler->DeferredWork.Lock, oldIrql);
+
+    //
+    // Wake worker thread
+    //
+    KeSetEvent(&Throttler->WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
 
     InterlockedIncrement64(&Throttler->Stats.QueuedOperations);
 
@@ -1348,6 +1241,7 @@ RtGetResourceState(
 )
 {
     PRT_RESOURCE_STATE resourceState;
+    KIRQL oldIrql;
 
     if (State == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1363,6 +1257,8 @@ RtGetResourceState(
 
     resourceState = &Throttler->States[Resource];
 
+    KeAcquireSpinLock(&resourceState->ResourceLock, &oldIrql);
+
     *State = resourceState->State;
 
     if (Usage != NULL) {
@@ -1372,6 +1268,8 @@ RtGetResourceState(
     if (Rate != NULL) {
         *Rate = (ULONG64)resourceState->CurrentRate;
     }
+
+    KeReleaseSpinLock(&resourceState->ResourceLock, oldIrql);
 
     return STATUS_SUCCESS;
 }
@@ -1383,6 +1281,8 @@ RtGetStatistics(
     _Out_ PRT_STATISTICS Stats
 )
 {
+    KIRQL oldIrql;
+
     if (Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1392,9 +1292,11 @@ RtGetStatistics(
     }
 
     //
-    // Copy statistics (atomic reads of volatile fields)
+    // Atomic snapshot under StatsLock
     //
+    KeAcquireSpinLock(&Throttler->StatsLock, &oldIrql);
     RtlCopyMemory(Stats, &Throttler->Stats, sizeof(RT_STATISTICS));
+    KeReleaseSpinLock(&Throttler->StatsLock, oldIrql);
 
     return STATUS_SUCCESS;
 }
@@ -1405,15 +1307,15 @@ RtResetStatistics(
     _In_ PRT_THROTTLER Throttler
 )
 {
+    KIRQL oldIrql;
     ULONG i;
 
     if (!RtIsValidThrottler(Throttler)) {
         return;
     }
 
-    //
-    // Reset all counters
-    //
+    KeAcquireSpinLock(&Throttler->StatsLock, &oldIrql);
+
     InterlockedExchange64(&Throttler->Stats.TotalOperations, 0);
     InterlockedExchange64(&Throttler->Stats.ThrottledOperations, 0);
     InterlockedExchange64(&Throttler->Stats.DelayedOperations, 0);
@@ -1433,6 +1335,8 @@ RtResetStatistics(
     }
 
     KeQuerySystemTime(&Throttler->Stats.StartTime);
+
+    KeReleaseSpinLock(&Throttler->StatsLock, oldIrql);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -1443,6 +1347,7 @@ RtResetResource(
 )
 {
     PRT_RESOURCE_STATE state;
+    KIRQL oldIrql;
 
     if (!RtIsValidThrottler(Throttler)) {
         return;
@@ -1454,9 +1359,8 @@ RtResetResource(
 
     state = &Throttler->States[Resource];
 
-    //
-    // Reset state
-    //
+    KeAcquireSpinLock(&state->ResourceLock, &oldIrql);
+
     state->PreviousState = state->State;
     state->State = RtStateNormal;
     InterlockedExchange64(&state->CurrentUsage, 0);
@@ -1465,16 +1369,13 @@ RtResetResource(
     state->OverLimitCount = 0;
     state->UnderLimitCount = 0;
     state->CurrentDelayMs = 0;
-
-    //
-    // Reset burst tokens
-    //
     InterlockedExchange(
         &state->BurstTokens,
         (LONG)Throttler->Configs[Resource].BurstCapacity
     );
-
     KeQuerySystemTime(&state->StateEnterTime);
+
+    KeReleaseSpinLock(&state->ResourceLock, oldIrql);
 }
 
 // ============================================================================
@@ -1482,38 +1383,29 @@ RtResetResource(
 // ============================================================================
 
 PCWSTR
-RtGetResourceName(
-    _In_ RT_RESOURCE_TYPE Resource
-)
+RtGetResourceName(_In_ RT_RESOURCE_TYPE Resource)
 {
     if (Resource >= RtResourceMax) {
         return L"Unknown";
     }
-
     return g_ResourceNames[Resource];
 }
 
 PCWSTR
-RtGetActionName(
-    _In_ RT_THROTTLE_ACTION Action
-)
+RtGetActionName(_In_ RT_THROTTLE_ACTION Action)
 {
-    if (Action > RtActionEscalate) {
+    if (Action > RT_ACTION_MAX_VALID) {
         return L"Unknown";
     }
-
     return g_ActionNames[Action];
 }
 
 PCWSTR
-RtGetStateName(
-    _In_ RT_THROTTLE_STATE State
-)
+RtGetStateName(_In_ RT_THROTTLE_STATE State)
 {
-    if (State > RtStateRecovery) {
+    if (State > RT_STATE_MAX_VALID) {
         return L"Unknown";
     }
-
     return g_StateNames[State];
 }
 
@@ -1547,10 +1439,11 @@ RtpInitializeResourceStates(
         state->CurrentDelayMs = 0;
         state->StateEnterTime = currentTime;
         state->LastRateCalcTime = currentTime;
+        state->LastTokenRefillTime = currentTime;
         state->RateHistoryIndex = 0;
         state->RateHistorySamples = 0;
 
-        ExInitializePushLock(&state->StateLock);
+        KeInitializeSpinLock(&state->ResourceLock);
     }
 }
 
@@ -1582,8 +1475,6 @@ RtpInitializeDeferredWork(
     KeInitializeTimer(&Throttler->DeferredWork.ProcessTimer);
     KeInitializeDpc(&Throttler->DeferredWork.ProcessDpc,
                     RtpDeferredWorkDpcRoutine, Throttler);
-    KeInitializeEvent(&Throttler->DeferredWork.ShutdownEvent,
-                      NotificationEvent, FALSE);
 }
 
 _Function_class_(KDEFERRED_ROUTINE)
@@ -1606,18 +1497,17 @@ RtpMonitorDpcRoutine(
         return;
     }
 
-    if (RtIsShuttingDown(throttler)) {
+    if (!ExAcquireRundownProtection(&throttler->RundownRef)) {
         return;
     }
 
-    //
-    // Update state for all enabled resources
-    //
     for (i = 0; i < RT_MAX_RESOURCE_TYPES; i++) {
         if (throttler->Configs[i].Enabled) {
             RtpUpdateResourceState(throttler, (RT_RESOURCE_TYPE)i);
         }
     }
+
+    ExReleaseRundownProtection(&throttler->RundownRef);
 }
 
 _Function_class_(KDEFERRED_ROUTINE)
@@ -1639,55 +1529,47 @@ RtpDeferredWorkDpcRoutine(
         return;
     }
 
-    if (RtIsShuttingDown(throttler)) {
-        return;
-    }
-
     //
-    // Process deferred work - queue work item for PASSIVE_LEVEL
+    // Wake worker thread to process deferred work at PASSIVE_LEVEL
     //
-    if (throttler->DeferredWork.Depth > 0 &&
-        throttler->PassiveWorkPending == 0) {
-
-        if (InterlockedCompareExchange(&throttler->PassiveWorkPending, 1, 0) == 0) {
-            //
-            // Queue passive work item if available
-            //
-            if (throttler->PassiveWorkItem != NULL) {
-                IoQueueWorkItem(
-                    throttler->PassiveWorkItem,
-                    RtpPassiveWorkItemRoutine,
-                    DelayedWorkQueue,
-                    throttler
-                );
-            } else {
-                InterlockedExchange(&throttler->PassiveWorkPending, 0);
-            }
-        }
+    if (throttler->DeferredWork.Depth > 0) {
+        KeSetEvent(&throttler->WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
     }
 }
 
-_Function_class_(IO_WORKITEM_ROUTINE)
+/**
+ * @brief System worker thread for PASSIVE_LEVEL deferred work processing.
+ *
+ * Replaces the dead PIO_WORKITEM path. Thread runs until WorkerShouldExit
+ * is set and WorkerWakeEvent is signaled.
+ */
 static VOID
-RtpPassiveWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+RtpWorkerThreadRoutine(
+    _In_ PVOID Context
 )
 {
     PRT_THROTTLER throttler = (PRT_THROTTLER)Context;
+    NTSTATUS waitStatus;
 
-    UNREFERENCED_PARAMETER(DeviceObject);
+    while (TRUE) {
+        waitStatus = KeWaitForSingleObject(
+            &throttler->WorkerWakeEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
 
-    if (throttler == NULL || !RtIsValidThrottler(throttler)) {
-        return;
+        if (throttler->WorkerShouldExit) {
+            break;
+        }
+
+        if (NT_SUCCESS(waitStatus) && RtIsValidThrottler(throttler)) {
+            RtpProcessDeferredWorkQueue(throttler);
+        }
     }
 
-    //
-    // Process deferred work at PASSIVE_LEVEL
-    //
-    RtpProcessDeferredWorkQueue(throttler);
-
-    InterlockedExchange(&throttler->PassiveWorkPending, 0);
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 static VOID
@@ -1704,6 +1586,9 @@ RtpUpdateResourceState(
     RT_THROTTLE_STATE oldState;
     BOOLEAN stateChanged = FALSE;
     RT_THROTTLE_EVENT event;
+    KIRQL oldIrql;
+    ULONG64 softLimit, hardLimit, criticalLimit;
+    RT_THROTTLE_ACTION softAction, hardAction, criticalAction;
 
     state = &Throttler->States[Resource];
     config = &Throttler->Configs[Resource];
@@ -1711,22 +1596,34 @@ RtpUpdateResourceState(
     KeQuerySystemTime(&currentTime);
 
     //
-    // Calculate rate
+    // Acquire per-resource lock to protect state + config reads
+    //
+    KeAcquireSpinLock(&state->ResourceLock, &oldIrql);
+
+    //
+    // Snapshot config under lock
+    //
+    softLimit = config->SoftLimit;
+    hardLimit = config->HardLimit;
+    criticalLimit = config->CriticalLimit;
+    softAction = config->SoftAction;
+    hardAction = config->HardAction;
+    criticalAction = config->CriticalAction;
+
+    //
+    // Calculate rate (modifies RateHistory etc. — under lock)
     //
     RtpCalculateRate(state, currentTime);
 
     //
-    // Refill burst tokens
+    // Refill burst tokens (uses separate LastTokenRefillTime)
     //
     RtpRefillBurstTokens(state, config, currentTime);
 
-    //
-    // Get current usage
-    //
     currentUsage = state->CurrentUsage;
 
     //
-    // Update peak if necessary
+    // Update per-resource peak stat
     //
     if (currentUsage > Throttler->Stats.PerResource[Resource].PeakUsage) {
         InterlockedExchange64(
@@ -1735,41 +1632,32 @@ RtpUpdateResourceState(
         );
     }
 
-    //
-    // Determine new state based on usage vs limits
-    //
     oldState = state->State;
 
-    if ((ULONG64)currentUsage >= config->CriticalLimit) {
+    if ((ULONG64)currentUsage >= criticalLimit) {
         newState = RtStateCritical;
         state->OverLimitCount++;
         state->UnderLimitCount = 0;
-    } else if ((ULONG64)currentUsage >= config->HardLimit) {
+    } else if ((ULONG64)currentUsage >= hardLimit) {
         newState = RtStateThrottled;
         state->OverLimitCount++;
         state->UnderLimitCount = 0;
-    } else if ((ULONG64)currentUsage >= config->SoftLimit) {
+    } else if ((ULONG64)currentUsage >= softLimit) {
         newState = RtStateWarning;
         state->OverLimitCount++;
         state->UnderLimitCount = 0;
     } else {
-        //
-        // Below all limits
-        //
         state->UnderLimitCount++;
         state->OverLimitCount = 0;
 
-        //
-        // Apply hysteresis for recovery
-        //
         if (oldState != RtStateNormal) {
             ULONG64 hysteresisThreshold =
-                (config->SoftLimit * RT_HYSTERESIS_THRESHOLD) / 100;
+                (softLimit * RT_HYSTERESIS_THRESHOLD) / 100;
 
             if ((ULONG64)currentUsage < hysteresisThreshold &&
                 state->UnderLimitCount >= RT_MIN_SAMPLES_FOR_TRANSITION) {
                 newState = RtStateNormal;
-                state->CurrentDelayMs = 0;  // Reset backoff
+                state->CurrentDelayMs = 0;
             } else {
                 newState = RtStateRecovery;
             }
@@ -1778,13 +1666,7 @@ RtpUpdateResourceState(
         }
     }
 
-    //
-    // Check if state changed
-    //
     if (newState != oldState) {
-        //
-        // Require minimum samples for state changes (except critical)
-        //
         if (newState == RtStateCritical ||
             state->OverLimitCount >= RT_MIN_SAMPLES_FOR_TRANSITION ||
             state->UnderLimitCount >= RT_MIN_SAMPLES_FOR_TRANSITION) {
@@ -1798,15 +1680,14 @@ RtpUpdateResourceState(
         }
     }
 
-    //
-    // Store sample for next rate calculation
-    //
     state->LastSampleUsage = currentUsage;
 
+    KeReleaseSpinLock(&state->ResourceLock, oldIrql);
+
     //
-    // Notify callback if state changed
+    // Notify callback outside lock (event is stack-local)
     //
-    if (stateChanged && Throttler->ThrottleCallback != NULL) {
+    if (stateChanged) {
         RtlZeroMemory(&event, sizeof(event));
         event.Resource = Resource;
         event.NewState = newState;
@@ -1817,19 +1698,19 @@ RtpUpdateResourceState(
 
         switch (newState) {
             case RtStateWarning:
-                event.LimitValue = config->SoftLimit;
-                event.Action = config->SoftAction;
+                event.LimitValue = softLimit;
+                event.Action = softAction;
                 break;
             case RtStateThrottled:
-                event.LimitValue = config->HardLimit;
-                event.Action = config->HardAction;
+                event.LimitValue = hardLimit;
+                event.Action = hardAction;
                 break;
             case RtStateCritical:
-                event.LimitValue = config->CriticalLimit;
-                event.Action = config->CriticalAction;
+                event.LimitValue = criticalLimit;
+                event.Action = criticalAction;
                 break;
             default:
-                event.LimitValue = config->SoftLimit;
+                event.LimitValue = softLimit;
                 event.Action = RtActionNone;
                 break;
         }
@@ -1848,32 +1729,16 @@ RtpCalculateRate(
     LONG64 usageDelta;
     LONG64 rate;
 
-    //
-    // Calculate time delta in milliseconds
-    //
     timeDelta = (CurrentTime.QuadPart - State->LastRateCalcTime.QuadPart) / 10000;
 
     if (timeDelta <= 0) {
         return;
     }
 
-    //
-    // Calculate usage delta
-    //
     usageDelta = State->CurrentUsage - State->LastSampleUsage;
 
-    //
-    // Calculate rate (per second)
-    //
-    if (timeDelta > 0) {
-        rate = (usageDelta * 1000) / timeDelta;
-    } else {
-        rate = 0;
-    }
+    rate = (usageDelta * 1000) / timeDelta;
 
-    //
-    // Store in history for averaging
-    //
     State->RateHistory[State->RateHistoryIndex] = rate;
     State->RateHistoryIndex = (State->RateHistoryIndex + 1) % RT_RATE_HISTORY_SIZE;
 
@@ -1881,9 +1746,6 @@ RtpCalculateRate(
         State->RateHistorySamples++;
     }
 
-    //
-    // Calculate moving average
-    //
     if (State->RateHistorySamples > 0) {
         LONG64 sum = 0;
         ULONG i;
@@ -1912,24 +1774,26 @@ RtpRefillBurstTokens(
     LONG newTokens;
 
     //
-    // Calculate time since last refill (in seconds)
+    // Use LastTokenRefillTime (not LastRateCalcTime)
     //
-    timeDelta = (CurrentTime.QuadPart - State->LastRateCalcTime.QuadPart) / 10000000;
+    timeDelta = (CurrentTime.QuadPart - State->LastTokenRefillTime.QuadPart) / 10000000;
 
     if (timeDelta <= 0) {
         return;
     }
 
-    //
-    // Calculate tokens to add
-    //
     tokensToAdd = (LONG)(timeDelta * RT_TOKEN_REFILL_RATE);
     if (tokensToAdd <= 0) {
         return;
     }
 
     //
-    // Add tokens (capped at capacity)
+    // Update refill timestamp
+    //
+    State->LastTokenRefillTime = CurrentTime;
+
+    //
+    // CAS loop for safe token addition
     //
     do {
         currentTokens = State->BurstTokens;
@@ -1939,10 +1803,7 @@ RtpRefillBurstTokens(
             newTokens = (LONG)Config->BurstCapacity;
         }
     } while (InterlockedCompareExchange(
-        &State->BurstTokens,
-        newTokens,
-        currentTokens
-    ) != currentTokens);
+        &State->BurstTokens, newTokens, currentTokens) != currentTokens);
 }
 
 static RT_THROTTLE_ACTION
@@ -1956,28 +1817,34 @@ RtpDetermineAction(
     PRT_RESOURCE_CONFIG config;
     RT_THROTTLE_STATE currentState;
     RT_THROTTLE_ACTION action;
+    LONG prevTokens;
 
     state = &Throttler->States[Resource];
     config = &Throttler->Configs[Resource];
     currentState = state->State;
 
-    //
-    // Critical priority operations are never throttled
-    //
     if (Priority == RtPriorityCritical) {
         return RtActionNone;
     }
 
     //
-    // Check burst tokens for token bucket rate limiting
+    // CAS loop for burst tokens — only decrement if > 0
     //
-    if (state->BurstTokens > 0) {
-        InterlockedDecrement(&state->BurstTokens);
+    do {
+        prevTokens = state->BurstTokens;
+        if (prevTokens <= 0) {
+            break;
+        }
+    } while (InterlockedCompareExchange(
+        &state->BurstTokens, prevTokens - 1, prevTokens) != prevTokens);
+
+    if (prevTokens > 0) {
         return RtActionNone;
     }
 
     //
-    // Determine action based on state and priority
+    // Priority ordering: Critical(0) < High(1) < Normal(2) < Low(3) < Background(4)
+    // >= means "this priority or LESS important"
     //
     switch (currentState) {
         case RtStateNormal:
@@ -2013,11 +1880,8 @@ RtpDetermineAction(
             break;
 
         case RtStateRecovery:
-            //
-            // During recovery, apply reduced throttling
-            //
             if (Priority >= RtPriorityBackground) {
-                action = RtActionDelay;  // Gentle delay during recovery
+                action = RtActionDelay;
             } else {
                 action = RtActionNone;
             }
@@ -2028,9 +1892,6 @@ RtpDetermineAction(
             break;
     }
 
-    //
-    // Track throttle statistics
-    //
     if (action != RtActionNone && action != RtActionNotify) {
         InterlockedIncrement64(&Throttler->Stats.PerResource[Resource].Throttles);
     }
@@ -2048,22 +1909,73 @@ RtpNotifyCallback(
     PVOID context;
     KIRQL oldIrql;
 
-    //
-    // Acquire spin lock (safe at DISPATCH_LEVEL from DPC)
-    //
     KeAcquireSpinLock(&Throttler->CallbackSpinLock, &oldIrql);
 
     callback = Throttler->ThrottleCallback;
     context = Throttler->CallbackContext;
+
+    if (callback != NULL) {
+        //
+        // Increment active count inside lock to prevent
+        // RtUnregisterCallback from completing while we invoke
+        //
+        InterlockedIncrement(&Throttler->CallbackActiveCount);
+    }
 
     KeReleaseSpinLock(&Throttler->CallbackSpinLock, oldIrql);
 
     if (callback != NULL) {
         callback(Event, context);
         InterlockedIncrement64(&Throttler->Stats.AlertsSent);
+        InterlockedDecrement(&Throttler->CallbackActiveCount);
     }
 }
 
+/**
+ * @brief Find existing process quota (read-only, no allocation).
+ *
+ * Uses KSPIN_LOCK — safe at DISPATCH_LEVEL.
+ */
+static PRT_PROCESS_QUOTA
+RtpFindProcessQuota(
+    _In_ PRT_THROTTLER Throttler,
+    _In_ HANDLE ProcessId
+)
+{
+    ULONG bucket;
+    PLIST_ENTRY entry;
+    PRT_PROCESS_QUOTA quota;
+    KIRQL oldIrql;
+
+    bucket = RtpHashProcessId(ProcessId);
+
+    KeAcquireSpinLock(&Throttler->ProcessQuotas.Lock, &oldIrql);
+
+    for (entry = Throttler->ProcessQuotas.HashBuckets[bucket].Flink;
+         entry != &Throttler->ProcessQuotas.HashBuckets[bucket];
+         entry = entry->Flink) {
+
+        quota = CONTAINING_RECORD(entry, RT_PROCESS_QUOTA, HashLink);
+
+        if (quota->ProcessId == ProcessId && quota->InUse) {
+            KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
+            return quota;
+        }
+    }
+
+    KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
+    return NULL;
+}
+
+/**
+ * @brief Find or allocate a process quota entry.
+ *
+ * Process quotas are now individually heap-allocated from NonPagedPoolNx,
+ * not embedded in the RT_THROTTLER struct. This reduces the base struct size
+ * and makes cleanup straightforward.
+ *
+ * Uses KSPIN_LOCK — safe at DISPATCH_LEVEL.
+ */
 static PRT_PROCESS_QUOTA
 RtpFindOrCreateProcessQuota(
     _In_ PRT_THROTTLER Throttler,
@@ -2074,17 +1986,13 @@ RtpFindOrCreateProcessQuota(
     ULONG bucket;
     PLIST_ENTRY entry;
     PRT_PROCESS_QUOTA quota;
-    PRT_PROCESS_QUOTA freeSlot = NULL;
-    ULONG i;
+    PRT_PROCESS_QUOTA newQuota = NULL;
+    KIRQL oldIrql;
 
     bucket = RtpHashProcessId(ProcessId);
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Throttler->ProcessQuotas.Lock);
+    KeAcquireSpinLock(&Throttler->ProcessQuotas.Lock, &oldIrql);
 
-    //
-    // Search hash bucket
-    //
     for (entry = Throttler->ProcessQuotas.HashBuckets[bucket].Flink;
          entry != &Throttler->ProcessQuotas.HashBuckets[bucket];
          entry = entry->Flink) {
@@ -2092,77 +2000,54 @@ RtpFindOrCreateProcessQuota(
         quota = CONTAINING_RECORD(entry, RT_PROCESS_QUOTA, HashLink);
 
         if (quota->ProcessId == ProcessId && quota->InUse) {
-            ExReleasePushLockShared(&Throttler->ProcessQuotas.Lock);
-            KeLeaveCriticalRegion();
+            KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
             return quota;
         }
     }
-
-    ExReleasePushLockShared(&Throttler->ProcessQuotas.Lock);
 
     if (!CreateIfNotFound) {
-        KeLeaveCriticalRegion();
+        KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
         return NULL;
     }
 
     //
-    // Need to create - upgrade to exclusive lock
+    // Check capacity
     //
-    ExAcquirePushLockExclusive(&Throttler->ProcessQuotas.Lock);
-
-    //
-    // Double-check (race condition)
-    //
-    for (entry = Throttler->ProcessQuotas.HashBuckets[bucket].Flink;
-         entry != &Throttler->ProcessQuotas.HashBuckets[bucket];
-         entry = entry->Flink) {
-
-        quota = CONTAINING_RECORD(entry, RT_PROCESS_QUOTA, HashLink);
-
-        if (quota->ProcessId == ProcessId && quota->InUse) {
-            ExReleasePushLockExclusive(&Throttler->ProcessQuotas.Lock);
-            KeLeaveCriticalRegion();
-            return quota;
-        }
-    }
-
-    //
-    // Find free slot
-    //
-    for (i = 0; i < RT_MAX_TRACKED_PROCESSES; i++) {
-        if (!Throttler->ProcessQuotas.Entries[i].InUse) {
-            freeSlot = &Throttler->ProcessQuotas.Entries[i];
-            break;
-        }
-    }
-
-    if (freeSlot == NULL) {
-        ExReleasePushLockExclusive(&Throttler->ProcessQuotas.Lock);
-        KeLeaveCriticalRegion();
+    if (Throttler->ProcessQuotas.ActiveCount >= RT_MAX_TRACKED_PROCESSES) {
+        KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
         return NULL;
     }
 
     //
-    // Initialize new entry
+    // Release lock before allocation (can't allocate at DISPATCH on some paths)
+    // Actually ShadowStrikeAllocatePoolWithTag from NonPagedPoolNx is safe
+    // at DISPATCH_LEVEL. Allocate under lock to avoid TOCTOU on ActiveCount.
     //
-    RtlZeroMemory(freeSlot, sizeof(RT_PROCESS_QUOTA));
-    freeSlot->ProcessId = ProcessId;
-    freeSlot->InUse = TRUE;
-    freeSlot->Exempt = FALSE;
-    KeQuerySystemTime(&freeSlot->LastActivity);
+    newQuota = (PRT_PROCESS_QUOTA)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(RT_PROCESS_QUOTA),
+        RT_PROCESS_TAG
+    );
 
-    //
-    // Add to hash bucket
-    //
+    if (newQuota == NULL) {
+        KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
+        return NULL;
+    }
+
+    RtlZeroMemory(newQuota, sizeof(RT_PROCESS_QUOTA));
+    newQuota->ProcessId = ProcessId;
+    newQuota->InUse = TRUE;
+    newQuota->Exempt = FALSE;
+    KeQuerySystemTime(&newQuota->LastActivity);
+
     InsertTailList(&Throttler->ProcessQuotas.HashBuckets[bucket],
-                   &freeSlot->HashLink);
+                   &newQuota->HashLink);
 
     InterlockedIncrement(&Throttler->ProcessQuotas.ActiveCount);
 
-    ExReleasePushLockExclusive(&Throttler->ProcessQuotas.Lock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
 
-    return freeSlot;
+    return newQuota;
 }
 
 static ULONG
@@ -2172,9 +2057,6 @@ RtpHashProcessId(
 {
     ULONG_PTR pid = (ULONG_PTR)ProcessId;
 
-    //
-    // Simple hash for process ID
-    //
     pid = pid ^ (pid >> 16);
     pid = pid * 0x85ebca6b;
     pid = pid ^ (pid >> 13);
@@ -2195,17 +2077,12 @@ RtpProcessDeferredWorkQueue(
     KIRQL oldIrql;
     BOOLEAN expired;
 
-    PAGED_CODE();
-
     KeQuerySystemTime(&currentTime);
 
     while (TRUE) {
         workItem = NULL;
         expired = FALSE;
 
-        //
-        // Get next work item from queue
-        //
         KeAcquireSpinLock(&Throttler->DeferredWork.Lock, &oldIrql);
 
         if (IsListEmpty(&Throttler->DeferredWork.Queue)) {
@@ -2220,18 +2097,12 @@ RtpProcessDeferredWorkQueue(
 
         workItem = CONTAINING_RECORD(entry, RT_DEFERRED_WORK, ListEntry);
 
-        //
-        // Check expiration
-        //
         if (workItem->ExpirationTime.QuadPart != 0 &&
             currentTime.QuadPart > workItem->ExpirationTime.QuadPart) {
             expired = TRUE;
             InterlockedIncrement64(&Throttler->Stats.DeferredWorkExpired);
         }
 
-        //
-        // Execute callback if not expired
-        //
         if (!expired) {
             callback = (PRT_DEFERRED_CALLBACK)workItem->Callback;
             context = workItem->Context;
@@ -2242,15 +2113,9 @@ RtpProcessDeferredWorkQueue(
             }
         }
 
-        //
-        // Free work item
-        //
         ShadowStrikeFreePoolWithTag(workItem, RT_QUEUE_TAG);
 
-        //
-        // Check if shutting down
-        //
-        if (RtIsShuttingDown(Throttler)) {
+        if (Throttler->WorkerShouldExit) {
             break;
         }
     }
@@ -2265,9 +2130,6 @@ RtpDrainDeferredWorkQueue(
     PRT_DEFERRED_WORK workItem;
     KIRQL oldIrql;
 
-    //
-    // Remove and free all work items without executing
-    //
     while (TRUE) {
         KeAcquireSpinLock(&Throttler->DeferredWork.Lock, &oldIrql);
 
@@ -2282,52 +2144,31 @@ RtpDrainDeferredWorkQueue(
         KeReleaseSpinLock(&Throttler->DeferredWork.Lock, oldIrql);
 
         workItem = CONTAINING_RECORD(entry, RT_DEFERRED_WORK, ListEntry);
-
-        //
-        // Free without executing
-        //
         ShadowStrikeFreePoolWithTag(workItem, RT_QUEUE_TAG);
     }
 }
 
-static BOOLEAN
-RtpAcquireOperationReference(
-    _In_ PRT_THROTTLER Throttler
-)
-{
-    if (RtIsShuttingDown(Throttler)) {
-        return FALSE;
-    }
-
-    InterlockedIncrement(&Throttler->ActiveOperations);
-    RtAcquireReference(Throttler);
-
-    //
-    // Double-check after acquiring
-    //
-    if (RtIsShuttingDown(Throttler)) {
-        InterlockedDecrement(&Throttler->ActiveOperations);
-        RtReleaseReference(Throttler);
-        return FALSE;
-    }
-
-    return TRUE;
-}
-
+/**
+ * @brief Free all dynamically allocated process quota entries.
+ *
+ * Called during shutdown after all operations have drained.
+ */
 static VOID
-RtpReleaseOperationReference(
-    _In_ PRT_THROTTLER Throttler
+RtpDrainProcessQuotas(
+    _Inout_ PRT_THROTTLER Throttler
 )
 {
-    LONG remaining;
+    ULONG i;
+    PLIST_ENTRY entry;
+    PRT_PROCESS_QUOTA quota;
 
-    remaining = InterlockedDecrement(&Throttler->ActiveOperations);
-    RtReleaseReference(Throttler);
-
-    //
-    // Signal shutdown event if draining
-    //
-    if (remaining == 0 && RtIsShuttingDown(Throttler)) {
-        KeSetEvent(&Throttler->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+    for (i = 0; i < RT_PROCESS_HASH_BUCKETS; i++) {
+        while (!IsListEmpty(&Throttler->ProcessQuotas.HashBuckets[i])) {
+            entry = RemoveHeadList(&Throttler->ProcessQuotas.HashBuckets[i]);
+            quota = CONTAINING_RECORD(entry, RT_PROCESS_QUOTA, HashLink);
+            ShadowStrikeFreePoolWithTag(quota, RT_PROCESS_TAG);
+        }
     }
+
+    Throttler->ProcessQuotas.ActiveCount = 0;
 }

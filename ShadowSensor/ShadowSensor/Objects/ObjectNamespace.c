@@ -4,103 +4,51 @@
  * ============================================================================
  *
  * @file ObjectNamespace.c
- * @brief Enterprise-grade private namespace management.
+ * @brief Enterprise-grade secure object directory management.
  *
- * Provides CrowdStrike Falcon-level private namespace creation, management,
- * and security enforcement for the ShadowStrike kernel driver.
- *
- * Key Features:
- * - Atomic initialization (no race conditions)
- * - Restrictive DACL (SYSTEM + Administrators only)
- * - High Integrity Level mandatory label
- * - Full boundary descriptor implementation
- * - Merged SACL (mandatory label + audit ACEs in single ACL)
- * - Self-relative security descriptor (proper memory management)
- * - BSOD-safe resource management with reference counting
- * - Protection against object hijacking and tampering
- * - Graceful handling of partial initialization failures
- * - ETW telemetry integration
- *
- * Security Architecture:
- * - Directory object secured with explicit DACL + merged SACL
- * - Boundary descriptor prevents Medium IL access
- * - All handles tracked for proper cleanup
- * - Reference counting prevents use-after-free during shutdown
- * - Lock-protected state transitions
- * - Atomic operations for initialization flag
- *
- * Memory Management (CRITICAL FIXES):
- * - Uses SELF-RELATIVE security descriptor format
- * - All ACLs embedded in single allocation - no separate tracking needed
- * - Single ExFreePoolWithTag frees everything
- * - No memory leaks, no double-free vulnerabilities
+ * Architecture:
+ * - Creates \\ShadowStrike directory object with restrictive DACL
+ * - High Integrity Level mandatory label in merged SACL
+ * - Self-relative SD: single allocation, single free, no double-free
+ * - EX_RUNDOWN_REF for correct reference lifetime (no manual refcount)
+ * - Anti-squatting: verifies SD owner on STATUS_OBJECT_NAME_COLLISION
+ * - ZwMakeTemporaryObject on cleanup to clear OBJ_PERMANENT
+ * - NonPagedPoolNx for security descriptor (safe at any IRQL)
+ * - ExInitializePushLock (not FsRtl variant) for non-filesystem driver
  *
  * @author ShadowStrike Security Team
- * @version 2.1.0 (Enterprise Edition - Memory Safe)
+ * @version 3.0.0 (Enterprise Edition - Rundown-Protected)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
 
-
 #include "ObjectNamespace.h"
 #include <ntstrsafe.h>
 
-
-#ifndef INVALID_HANDLE_VALUE
-#define INVALID_HANDLE_VALUE ((HANDLE)(LONG_PTR)-1)
-#endif
-
 // ============================================================================
-// GLOBAL STATE
+// GLOBAL STATE (file-scoped — NOT exported in header)
 // ============================================================================
 
-/**
- * @brief Global namespace state instance.
- *
- * This structure maintains all state for the private namespace.
- * Zero-initialized at load time.
- */
-SHADOW_NAMESPACE_STATE g_NamespaceState = { 0 };
-
-// ============================================================================
-// CONSTANTS
-// ============================================================================
-
-/**
- * @brief Sleep interval while waiting for references to drain (ms)
- */
-#define SHADOW_NAMESPACE_DRAIN_SLEEP_MS 100
-
-/**
- * @brief Boundary descriptor name for namespace isolation
- */
-#define SHADOW_BOUNDARY_NAME L"ShadowStrikeBoundary"
-
-/**
- * @brief Initialization state values
- */
-#define NAMESPACE_STATE_UNINITIALIZED 0
-#define NAMESPACE_STATE_INITIALIZING  1
-#define NAMESPACE_STATE_INITIALIZED   2
+static SHADOW_NAMESPACE_STATE g_NamespaceState = { 0 };
 
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
 
-NTSTATUS
-ShadowBuildNamespaceSecurityDescriptor(
+static NTSTATUS
+ShadowpBuildSecurityDescriptor(
     _Outptr_ PSECURITY_DESCRIPTOR* SecurityDescriptor,
     _Out_ PULONG DescriptorSize
     );
 
-NTSTATUS
-ShadowCreateBoundaryDescriptor(
-    _Outptr_ POBJECT_BOUNDARY_DESCRIPTOR* BoundaryDescriptor
+static VOID
+ShadowpCleanupState(
+    _Inout_ PSHADOW_NAMESPACE_STATE State
     );
 
-VOID
-ShadowCleanupNamespaceState(
-    _Inout_ PSHADOW_NAMESPACE_STATE State
+static NTSTATUS
+ShadowpVerifyDirectoryOwner(
+    _In_ HANDLE DirectoryHandle
     );
 
 // ============================================================================
@@ -108,7 +56,7 @@ ShadowCleanupNamespaceState(
 // ============================================================================
 
 /**
- * @brief Create and secure the private namespace.
+ * @brief Create and secure the \\ShadowStrike object directory.
  */
 NTSTATUS
 ShadowCreatePrivateNamespace(
@@ -120,12 +68,12 @@ ShadowCreatePrivateNamespace(
     OBJECT_ATTRIBUTES objectAttributes;
     PSHADOW_NAMESPACE_STATE state = &g_NamespaceState;
     LONG previousState;
+    BOOLEAN created = FALSE;
 
     PAGED_CODE();
 
     //
-    // CRITICAL FIX: Atomic initialization flag to prevent race conditions
-    // This is the CrowdStrike Falcon approach
+    // Atomic one-shot initialization via CAS.
     //
     previousState = InterlockedCompareExchange(
         &state->InitializationState,
@@ -134,14 +82,13 @@ ShadowCreatePrivateNamespace(
     );
 
     if (previousState == NAMESPACE_STATE_INITIALIZED) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Namespace already initialized\n");
         return STATUS_ALREADY_INITIALIZED;
     }
 
     if (previousState == NAMESPACE_STATE_INITIALIZING) {
         //
-        // Another thread is currently initializing - wait for it
+        // Another thread is initializing. Spin-wait and detect BOTH
+        // success (INITIALIZED) and failure (UNINITIALIZED).
         //
         LARGE_INTEGER sleepInterval;
         sleepInterval.QuadPart = -((LONGLONG)50 * 10000LL); // 50ms
@@ -149,8 +96,17 @@ ShadowCreatePrivateNamespace(
         for (ULONG i = 0; i < 100; i++) {
             KeDelayExecutionThread(KernelMode, FALSE, &sleepInterval);
 
-            if (state->InitializationState == NAMESPACE_STATE_INITIALIZED) {
+            LONG current = InterlockedCompareExchange(
+                &state->InitializationState, 0, 0);
+
+            if (current == NAMESPACE_STATE_INITIALIZED) {
                 return STATUS_SUCCESS;
+            }
+            if (current == NAMESPACE_STATE_UNINITIALIZED) {
+                //
+                // First thread failed initialization.
+                //
+                return STATUS_UNSUCCESSFUL;
             }
         }
 
@@ -160,53 +116,38 @@ ShadowCreatePrivateNamespace(
     }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Creating private namespace: %ws\n",
-               SHADOW_NAMESPACE_ROOT);
+               "[ShadowStrike] Creating namespace: %ws\n", SHADOW_NAMESPACE_ROOT);
 
     //
-    // STEP 1: Initialize lock
+    // STEP 1: Initialize push lock (Ex variant, not FsRtl).
     //
-    FsRtlInitializePushLock(&state->Lock);
+    ExInitializePushLock(&state->Lock);
     state->LockInitialized = TRUE;
 
     //
-    // STEP 2: Set configurable drain timeout (default 5 seconds)
+    // STEP 2: Initialize rundown protection.
     //
-    state->DrainTimeoutMs = SHADOW_DEFAULT_DRAIN_TIMEOUT_MS;
+    ExInitializeRundownProtection(&state->RundownRef);
+    state->RundownInitialized = TRUE;
 
     //
-    // STEP 3: Build self-relative security descriptor with merged DACL + SACL
-    // This is the CRITICAL FIX - single allocation contains everything
+    // STEP 3: Build self-relative security descriptor (NonPagedPoolNx).
     //
-    status = ShadowBuildNamespaceSecurityDescriptor(
+    status = ShadowpBuildSecurityDescriptor(
         &state->DirectorySecurityDescriptor,
         &state->SecurityDescriptorSize
     );
 
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to build security descriptor: 0x%X\n", status);
+                   "[ShadowStrike] Failed to build SD: 0x%X\n", status);
         goto cleanup;
     }
 
     state->SecurityDescriptorAllocated = TRUE;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Security descriptor created (self-relative, size=%lu)\n",
-               state->SecurityDescriptorSize);
-
     //
-    // STEP 4: Create boundary descriptor for namespace isolation
-    //
-    status = ShadowCreateBoundaryDescriptor(&state->BoundaryDescriptor);
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to create boundary descriptor: 0x%X\n", status);
-        goto cleanup;
-    }
-
-    //
-    // STEP 5: Create the \ShadowStrike directory object
+    // STEP 4: Create the \\ShadowStrike directory object.
     //
     RtlInitUnicodeString(&directoryName, SHADOW_NAMESPACE_ROOT);
 
@@ -224,39 +165,63 @@ ShadowCreatePrivateNamespace(
         &objectAttributes
     );
 
-    if (!NT_SUCCESS(status)) {
-        if (status == STATUS_OBJECT_NAME_COLLISION) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] Namespace directory already exists\n");
-            //
-            // Try to open the existing directory
-            //
-            status = ZwOpenDirectoryObject(
-                &state->DirectoryHandle,
-                DIRECTORY_ALL_ACCESS,
-                &objectAttributes
-            );
-        }
+    if (NT_SUCCESS(status)) {
+        created = TRUE;
+    } else if (status == STATUS_OBJECT_NAME_COLLISION) {
+        //
+        // Directory already exists. Open it, then verify ownership
+        // to prevent namespace squatting attacks.
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Directory already exists — verifying owner\n");
+
+        //
+        // Remove OBJ_PERMANENT for the open (we didn't create it).
+        //
+        InitializeObjectAttributes(
+            &objectAttributes,
+            &directoryName,
+            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+            NULL,
+            NULL
+        );
+
+        status = ZwOpenDirectoryObject(
+            &state->DirectoryHandle,
+            DIRECTORY_ALL_ACCESS | READ_CONTROL,
+            &objectAttributes
+        );
 
         if (!NT_SUCCESS(status)) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "[ShadowStrike] Failed to create/open directory: 0x%X\n", status);
+                       "[ShadowStrike] Failed to open existing directory: 0x%X\n", status);
             goto cleanup;
         }
-    }
 
-    //
-    // STEP 6: Validate handle before referencing
-    //
-    if (state->DirectoryHandle == NULL || state->DirectoryHandle == INVALID_HANDLE_VALUE) {
+        //
+        // Anti-squatting: verify the directory owner is SYSTEM.
+        //
+        status = ShadowpVerifyDirectoryOwner(state->DirectoryHandle);
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] SECURITY: Directory owner verification failed "
+                       "(possible squatting attack): 0x%X\n", status);
+            ZwClose(state->DirectoryHandle);
+            state->DirectoryHandle = NULL;
+            status = STATUS_ACCESS_DENIED;
+            goto cleanup;
+        }
+    } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Invalid directory handle\n");
-        status = STATUS_INVALID_HANDLE;
+                   "[ShadowStrike] Failed to create directory: 0x%X\n", status);
         goto cleanup;
     }
 
     //
-    // STEP 7: Reference the directory object to prevent premature deletion
+    // STEP 5: Reference the directory object.
+    // We pass NULL for ObjectType because ObDirectoryObjectType is not
+    // publicly exported. The handle was obtained via ZwCreateDirectoryObject
+    // or ZwOpenDirectoryObject in KernelMode, so the type is guaranteed.
     //
     status = ObReferenceObjectByHandle(
         state->DirectoryHandle,
@@ -269,38 +234,34 @@ ShadowCreatePrivateNamespace(
 
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to reference directory object: 0x%X\n", status);
+                   "[ShadowStrike] Failed to reference directory: 0x%X\n", status);
         goto cleanup;
     }
 
     state->DirectoryObjectReferenced = TRUE;
 
     //
-    // STEP 8: Mark namespace as initialized (atomic)
+    // STEP 6: Mark namespace as initialized.
     //
     KeQuerySystemTime(&state->CreationTime);
-    state->ReferenceCount = 0;
     state->Initialized = TRUE;
     state->Destroying = FALSE;
 
     InterlockedExchange(&state->InitializationState, NAMESPACE_STATE_INITIALIZED);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Private namespace created successfully (Enterprise Edition v2.1)\n");
+               "[ShadowStrike] Namespace created successfully (v3.0 rundown-protected)\n");
 
     return STATUS_SUCCESS;
 
 cleanup:
-    //
-    // Cleanup on failure
-    //
     InterlockedExchange(&state->InitializationState, NAMESPACE_STATE_UNINITIALIZED);
-    ShadowCleanupNamespaceState(state);
+    ShadowpCleanupState(state);
     return status;
 }
 
 /**
- * @brief Destroy the private namespace and cleanup resources.
+ * @brief Destroy the namespace and free all resources.
  */
 VOID
 ShadowDestroyPrivateNamespace(
@@ -308,75 +269,66 @@ ShadowDestroyPrivateNamespace(
     )
 {
     PSHADOW_NAMESPACE_STATE state = &g_NamespaceState;
-    ULONG waitIterations = 0;
-    ULONG maxWaitIterations;
-    LARGE_INTEGER sleepInterval;
 
     PAGED_CODE();
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Destroying private namespace\n");
+               "[ShadowStrike] Destroying namespace\n");
 
     //
-    // Mark as destroying to prevent new operations
+    // STEP 1: Set Destroying flag under lock to prevent new operations.
     //
     if (state->LockInitialized) {
-        FsRtlAcquirePushLockExclusive(&state->Lock);
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&state->Lock);
         state->Destroying = TRUE;
         InterlockedExchange(&state->InitializationState, NAMESPACE_STATE_UNINITIALIZED);
-        FsRtlReleasePushLockExclusive(&state->Lock);
+        ExReleasePushLockExclusive(&state->Lock);
+        KeLeaveCriticalRegion();
     } else {
         state->Destroying = TRUE;
         InterlockedExchange(&state->InitializationState, NAMESPACE_STATE_UNINITIALIZED);
     }
 
     //
-    // Wait for all outstanding references to drain (configurable timeout)
+    // STEP 2: Wait for all outstanding rundown references to drain.
+    // ExWaitForRundownProtectionRelease blocks until all
+    // ExAcquireRundownProtection holders call ExReleaseRundownProtection.
+    // After this returns, ExAcquireRundownProtection will return FALSE
+    // for all future callers — no new work can begin.
     //
-    maxWaitIterations = state->DrainTimeoutMs / SHADOW_NAMESPACE_DRAIN_SLEEP_MS;
-    sleepInterval.QuadPart = -((LONGLONG)SHADOW_NAMESPACE_DRAIN_SLEEP_MS * 10000LL);
-
-    while (state->ReferenceCount > 0 && waitIterations < maxWaitIterations) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                   "[ShadowStrike] Waiting for %ld namespace references to drain\n",
-                   state->ReferenceCount);
-
-        KeDelayExecutionThread(KernelMode, FALSE, &sleepInterval);
-        waitIterations++;
-    }
-
-    if (state->ReferenceCount > 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Namespace references did not drain (%ld remaining)\n",
-                   state->ReferenceCount);
+    if (state->RundownInitialized) {
+        ExWaitForRundownProtectionRelease(&state->RundownRef);
     }
 
     //
-    // Perform cleanup
+    // STEP 3: Perform cleanup (all refs are drained, safe to proceed).
     //
-    ShadowCleanupNamespaceState(state);
+    ShadowpCleanupState(state);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Private namespace destroyed\n");
+               "[ShadowStrike] Namespace destroyed\n");
 }
 
 /**
- * @brief Create a named object within the private namespace.
+ * @brief Create a named object within \\ShadowStrike.
  */
 NTSTATUS
 ShadowCreateNamespaceObject(
     _In_ PCWSTR ObjectName,
     _In_ POBJECT_TYPE ObjectType,
+    _In_ SIZE_T SectionSize,
     _Out_ PHANDLE ObjectHandle,
     _Outptr_opt_ PVOID* ObjectPointer
     )
 {
     NTSTATUS status;
-    WCHAR fullPath[SHADOW_MAX_NAMESPACE_NAME];
+    WCHAR fullPath[SHADOW_MAX_NAMESPACE_PATH];
     UNICODE_STRING objectNameStr;
     OBJECT_ATTRIBUTES objectAttributes;
     PSHADOW_NAMESPACE_STATE state = &g_NamespaceState;
     PVOID objectPtr = NULL;
+    size_t nameLen = 0;
 
     PAGED_CODE();
 
@@ -390,23 +342,22 @@ ShadowCreateNamespaceObject(
     }
 
     //
-    // Check if namespace is initialized
+    // Validate ObjectName length before any work.
     //
-    if (!state->Initialized || state->Destroying) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Namespace not initialized or destroying\n");
-        return STATUS_INVALID_DEVICE_STATE;
+    status = RtlStringCchLengthW(ObjectName, SHADOW_MAX_OBJECT_NAME, &nameLen);
+    if (!NT_SUCCESS(status) || nameLen == 0) {
+        return STATUS_INVALID_PARAMETER;
     }
 
     //
-    // Acquire reference to prevent destruction during operation
+    // Acquire rundown protection (returns FALSE if shutting down).
     //
     if (!ShadowReferenceNamespace()) {
         return STATUS_DEVICE_NOT_READY;
     }
 
     //
-    // Build full path: \ShadowStrike\<ObjectName>
+    // Build full path: \\ShadowStrike\\<ObjectName>
     //
     status = RtlStringCbPrintfW(
         fullPath,
@@ -418,7 +369,7 @@ ShadowCreateNamespaceObject(
 
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to build object path: 0x%X\n", status);
+                   "[ShadowStrike] Path construction failed: 0x%X\n", status);
         ShadowDereferenceNamespace();
         return status;
     }
@@ -434,13 +385,9 @@ ShadowCreateNamespaceObject(
     );
 
     //
-    // ENTERPRISE IMPLEMENTATION: Full object type handling
-    // CrowdStrike Falcon-level type-specific creation with complete coverage
+    // Type-specific object creation.
     //
     if (ObjectType == *ExEventObjectType) {
-        //
-        // Create Event object (notification or synchronization)
-        //
         status = ZwCreateEvent(
             ObjectHandle,
             EVENT_ALL_ACCESS,
@@ -448,68 +395,37 @@ ShadowCreateNamespaceObject(
             NotificationEvent,
             FALSE
         );
-
-        if (NT_SUCCESS(status)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                       "[ShadowStrike] Created Event object: %ws\n", ObjectName);
-        }
     }
     else if (ObjectType == *ExSemaphoreObjectType) {
-        //
-        // Create Semaphore object (for resource counting)
-        //
         status = ZwCreateSemaphore(
             ObjectHandle,
             SEMAPHORE_ALL_ACCESS,
             &objectAttributes,
-            0,      // Initial count
-            MAXLONG // Maximum count
+            0,
+            MAXLONG
         );
-
-        if (NT_SUCCESS(status)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                       "[ShadowStrike] Created Semaphore object: %ws\n", ObjectName);
-        }
     }
     else if (ObjectType == *ExMutantObjectType) {
-        //
-        // Create Mutant (Mutex) object (for mutual exclusion)
-        //
         status = ZwCreateMutant(
             ObjectHandle,
             MUTANT_ALL_ACCESS,
             &objectAttributes,
-            FALSE   // Not initially owned
+            FALSE
         );
-
-        if (NT_SUCCESS(status)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                       "[ShadowStrike] Created Mutant object: %ws\n", ObjectName);
-        }
     }
     else if (ObjectType == *ExTimerObjectType) {
-        //
-        // Create Timer object (for timed operations)
-        //
         status = ZwCreateTimer(
             ObjectHandle,
             TIMER_ALL_ACCESS,
             &objectAttributes,
             NotificationTimer
         );
-
-        if (NT_SUCCESS(status)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                       "[ShadowStrike] Created Timer object: %ws\n", ObjectName);
-        }
     }
     else if (ObjectType == *MmSectionObjectType) {
-        //
-        // Create Section object (for shared memory IPC)
-        // This is critical for kernel<->user communication
-        //
         LARGE_INTEGER maxSize;
-        maxSize.QuadPart = 64 * 1024; // 64KB default shared memory region
+        maxSize.QuadPart = (SectionSize > 0)
+            ? (LONGLONG)SectionSize
+            : (LONGLONG)SHADOW_DEFAULT_SECTION_SIZE;
 
         status = ZwCreateSection(
             ObjectHandle,
@@ -520,66 +436,30 @@ ShadowCreateNamespaceObject(
             SEC_COMMIT,
             NULL
         );
-
-        if (NT_SUCCESS(status)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                       "[ShadowStrike] Created Section object: %ws\n", ObjectName);
-        }
     }
-    else if (ObjectType == *IoFileObjectType) {
+    else if (ObjectType == *IoFileObjectType ||
+             ObjectType == *PsProcessType ||
+             ObjectType == *PsThreadType ||
+             ObjectType == *SeTokenObjectType) {
         //
-        // File objects are not directly created via this path
-        // They require proper file system operations
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] File objects must be created via IoCreateFile\n");
-        status = STATUS_OBJECT_TYPE_MISMATCH;
-    }
-    else if (ObjectType == *PsProcessType) {
-        //
-        // Process objects cannot be created - security violation
+        // Dangerous or invalid object types — deny creation.
         //
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Process object creation denied - security violation\n");
-        status = STATUS_ACCESS_DENIED;
-    }
-    else if (ObjectType == *PsThreadType) {
-        //
-        // Thread objects cannot be created - security violation
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Thread object creation denied - security violation\n");
-        status = STATUS_ACCESS_DENIED;
-    }
-    else if (ObjectType == *SeTokenObjectType) {
-        //
-        // Token objects cannot be created - security violation
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Token object creation denied - security violation\n");
+                   "[ShadowStrike] Denied creation of restricted object type: %p\n",
+                   ObjectType);
         status = STATUS_ACCESS_DENIED;
     }
     else {
-        //
-        // Unknown or unsupported object type
-        // Log full details for diagnostic purposes
-        //
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Unsupported object type requested for: %ws (Type=%p)\n",
-                   ObjectName, ObjectType);
-
-        //
-        // Return specific error indicating the object type is not supported
-        // This allows callers to handle gracefully rather than crashing
-        //
+                   "[ShadowStrike] Unsupported object type: %p\n", ObjectType);
         status = STATUS_OBJECT_TYPE_MISMATCH;
     }
 
     //
-    // Get object pointer if requested
+    // Get object pointer if requested and creation succeeded.
     //
     if (NT_SUCCESS(status) && ObjectPointer != NULL && *ObjectHandle != NULL) {
-        status = ObReferenceObjectByHandle(
+        NTSTATUS refStatus = ObReferenceObjectByHandle(
             *ObjectHandle,
             0,
             ObjectType,
@@ -588,102 +468,39 @@ ShadowCreateNamespaceObject(
             NULL
         );
 
-        if (NT_SUCCESS(status)) {
+        if (NT_SUCCESS(refStatus)) {
             *ObjectPointer = objectPtr;
+        } else {
+            //
+            // Reference failed — close the handle to avoid leak.
+            //
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] ObReferenceObjectByHandle failed: 0x%X "
+                       "(closing handle)\n", refStatus);
+            ZwClose(*ObjectHandle);
+            *ObjectHandle = NULL;
+            status = refStatus;
         }
     }
 
+#if DBG
     if (NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                   "[ShadowStrike] Created namespace object: %ws\n", fullPath);
-    } else {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to create namespace object: 0x%X\n", status);
+                   "[ShadowStrike] Created object: %wZ\n", &objectNameStr);
     }
-
-    ShadowDereferenceNamespace();
-    return status;
-}
-
-/**
- * @brief Open an existing object within the private namespace.
- */
-NTSTATUS
-ShadowOpenNamespaceObject(
-    _In_ PCWSTR ObjectName,
-    _In_ ACCESS_MASK DesiredAccess,
-    _Out_ PHANDLE ObjectHandle
-    )
-{
-    NTSTATUS status;
-    WCHAR fullPath[SHADOW_MAX_NAMESPACE_NAME];
-    UNICODE_STRING objectNameStr;
-    OBJECT_ATTRIBUTES objectAttributes;
-    PSHADOW_NAMESPACE_STATE state = &g_NamespaceState;
-
-    PAGED_CODE();
-
-    if (ObjectHandle == NULL || ObjectName == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    *ObjectHandle = NULL;
-
-    //
-    // Check if namespace is initialized
-    //
-    if (!state->Initialized || state->Destroying) {
-        return STATUS_INVALID_DEVICE_STATE;
-    }
-
-    //
-    // Acquire reference
-    //
-    if (!ShadowReferenceNamespace()) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    //
-    // Build full path
-    //
-    status = RtlStringCbPrintfW(
-        fullPath,
-        sizeof(fullPath),
-        L"%ws\\%ws",
-        SHADOW_NAMESPACE_ROOT,
-        ObjectName
-    );
+#endif
 
     if (!NT_SUCCESS(status)) {
-        ShadowDereferenceNamespace();
-        return status;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Object creation failed: 0x%X\n", status);
     }
-
-    RtlInitUnicodeString(&objectNameStr, fullPath);
-
-    InitializeObjectAttributes(
-        &objectAttributes,
-        &objectNameStr,
-        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
-        NULL,
-        NULL
-    );
-
-    //
-    // Attempt to open the directory object
-    //
-    status = ZwOpenDirectoryObject(
-        ObjectHandle,
-        DesiredAccess,
-        &objectAttributes
-    );
 
     ShadowDereferenceNamespace();
     return status;
 }
 
 /**
- * @brief Check if the private namespace is initialized.
+ * @brief Check if the namespace is initialized and not shutting down.
  */
 BOOLEAN
 ShadowIsNamespaceInitialized(
@@ -694,18 +511,21 @@ ShadowIsNamespaceInitialized(
     BOOLEAN initialized = FALSE;
 
     if (state->LockInitialized) {
-        FsRtlAcquirePushLockShared(&state->Lock);
+        KeEnterCriticalRegion();
+        ExAcquirePushLockShared(&state->Lock);
         initialized = state->Initialized && !state->Destroying;
-        FsRtlReleasePushLockShared(&state->Lock);
-    } else {
-        initialized = state->Initialized && !state->Destroying;
+        ExReleasePushLockShared(&state->Lock);
+        KeLeaveCriticalRegion();
     }
 
     return initialized;
 }
 
 /**
- * @brief Acquire a reference to the namespace.
+ * @brief Acquire rundown protection on the namespace.
+ *
+ * Uses EX_RUNDOWN_REF — no TOCTOU races, no manual refcount.
+ * Returns FALSE after ExWaitForRundownProtectionRelease has been called.
  */
 BOOLEAN
 ShadowReferenceNamespace(
@@ -713,35 +533,24 @@ ShadowReferenceNamespace(
     )
 {
     PSHADOW_NAMESPACE_STATE state = &g_NamespaceState;
-    BOOLEAN referenced = FALSE;
 
-    if (state->LockInitialized) {
-        FsRtlAcquirePushLockShared(&state->Lock);
-
-        if (state->Initialized && !state->Destroying) {
-            InterlockedIncrement(&state->ReferenceCount);
-            referenced = TRUE;
-        }
-
-        FsRtlReleasePushLockShared(&state->Lock);
+    if (!state->RundownInitialized) {
+        return FALSE;
     }
 
-    return referenced;
+    //
+    // ExAcquireRundownProtection returns FALSE if rundown is active
+    // (i.e., ShadowDestroyPrivateNamespace called ExWaitForRundownProtectionRelease).
+    //
+    return ExAcquireRundownProtection(&state->RundownRef);
 }
 
 /**
- * @brief Release a reference to the namespace.
+ * @brief Release rundown protection on the namespace.
  *
- * Decrements the namespace reference count atomically. If underflow is detected,
- * this indicates a severe programming error (double-dereference) that could lead
- * to use-after-free vulnerabilities. Such conditions are treated as fatal.
- *
- * Thread Safety:
- * - Uses atomic operations for reference count manipulation
- * - Safe to call from any IRQL <= DISPATCH_LEVEL
- * - Lock-free fast path for normal operation
- *
- * @irql <= DISPATCH_LEVEL
+ * Must be paired with a successful ShadowReferenceNamespace call.
+ * If ShadowDestroyPrivateNamespace is blocked in
+ * ExWaitForRundownProtectionRelease, the last release unblocks it.
  */
 VOID
 ShadowDereferenceNamespace(
@@ -749,102 +558,13 @@ ShadowDereferenceNamespace(
     )
 {
     PSHADOW_NAMESPACE_STATE state = &g_NamespaceState;
-    LONG currentRefCount;
-    LONG newRefCount;
 
-    //
-    // CRITICAL: Validate state before any modification
-    // If lock was never initialized, the namespace was never properly created
-    // and we should not touch the reference count at all
-    //
-    if (!state->LockInitialized) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Dereference called on uninitialized namespace - ignored\n");
+    if (!state->RundownInitialized) {
+        NT_ASSERT(FALSE);
         return;
     }
 
-    //
-    // Read current value first to validate before decrement
-    // This prevents underflow from corrupting state
-    //
-    currentRefCount = InterlockedCompareExchange(&state->ReferenceCount, 0, 0);
-
-    if (currentRefCount <= 0) {
-        //
-        // FATAL: Reference count is already zero or negative
-        // This indicates a double-dereference bug - a serious programming error
-        // that can lead to use-after-free exploits
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] FATAL: Namespace dereference with refcount=%ld "
-                   "(double-dereference detected)\n", currentRefCount);
-
-        //
-        // Capture diagnostic information before bugcheck
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] State: Initialized=%d, Destroying=%d, LockInit=%d\n",
-                   state->Initialized, state->Destroying, state->LockInitialized);
-
-        //
-        // Bugcheck with MANUALLY_INITIATED_CRASH1 which is appropriate for
-        // driver-detected fatal conditions. Parameters provide diagnostic context:
-        //   Param1: ShadowStrike signature ('SSNR' = ShadowStrike Namespace Refcount)
-        //   Param2: Pointer to namespace state for crash dump analysis
-        //   Param3: Current reference count at time of failure
-        //   Param4: Return address for stack analysis
-        //
-        KeBugCheckEx(
-            MANUALLY_INITIATED_CRASH1,
-            (ULONG_PTR)0x53534E52,           // 'SSNR' signature
-            (ULONG_PTR)state,                 // State pointer for dump analysis
-            (ULONG_PTR)currentRefCount,       // Current refcount
-            (ULONG_PTR)_ReturnAddress()       // Caller address
-        );
-
-        //
-        // UNREACHABLE: KeBugCheckEx never returns
-        //
-    }
-
-    //
-    // Safe to decrement - we verified refcount > 0
-    //
-    newRefCount = InterlockedDecrement(&state->ReferenceCount);
-
-    //
-    // Post-decrement validation (belt and suspenders)
-    // This catches race conditions where multiple threads decrement simultaneously
-    //
-    if (newRefCount < 0) {
-        //
-        // Race condition detected - another thread also decremented
-        // Attempt to restore and bugcheck
-        //
-        InterlockedIncrement(&state->ReferenceCount);
-
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] FATAL: Namespace refcount race - underflow after decrement\n");
-
-        KeBugCheckEx(
-            MANUALLY_INITIATED_CRASH1,
-            (ULONG_PTR)0x53534E52,           // 'SSNR' signature
-            (ULONG_PTR)state,
-            (ULONG_PTR)newRefCount,
-            (ULONG_PTR)_ReturnAddress()
-        );
-    }
-
-    //
-    // Trace-level logging for debugging reference leaks
-    // Only in checked builds to avoid performance impact
-    //
-#if DBG
-    if (newRefCount == 0 && state->Destroying) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                   "[ShadowStrike] Namespace reference count reached zero during shutdown\n");
-    }
-#endif
+    ExReleaseRundownProtection(&state->RundownRef);
 }
 
 // ============================================================================
@@ -852,31 +572,18 @@ ShadowDereferenceNamespace(
 // ============================================================================
 
 /**
- * @brief Build SELF-RELATIVE security descriptor with merged DACL and SACL.
+ * @brief Build self-relative security descriptor with DACL + merged SACL.
  *
- * CRITICAL FIX: This function now creates a SELF-RELATIVE security descriptor
- * which embeds all ACLs in a single contiguous allocation. This eliminates:
- * - Memory leaks (no separate ACL allocations to track)
- * - Double-free vulnerabilities (single allocation = single free)
- * - SACL overwrite issues (both mandatory label and audit ACEs in one SACL)
+ * Creates a self-relative SD containing:
+ * - DACL: SYSTEM + Administrators (GENERIC_ALL)
+ * - SACL: High Integrity Level mandatory label + Everyone audit
  *
- * Memory Layout of Self-Relative SD:
- * +---------------------------+
- * | SECURITY_DESCRIPTOR       |
- * +---------------------------+
- * | Owner SID (embedded)      |
- * +---------------------------+
- * | Group SID (embedded)      |
- * +---------------------------+
- * | DACL (embedded)           |
- * +---------------------------+
- * | SACL (embedded)           |
- * +---------------------------+
- *
- * Single ExFreePoolWithTag frees everything.
+ * All ACLs are embedded in the self-relative SD. Single alloc = single free.
+ * Uses NonPagedPoolNx for the final SD so it's safe at any IRQL.
+ * Temporary DACL/SACL during construction use PagedPool (freed before return).
  */
-NTSTATUS
-ShadowBuildNamespaceSecurityDescriptor(
+static NTSTATUS
+ShadowpBuildSecurityDescriptor(
     _Outptr_ PSECURITY_DESCRIPTOR* SecurityDescriptor,
     _Out_ PULONG DescriptorSize
     )
@@ -902,197 +609,123 @@ ShadowBuildNamespaceSecurityDescriptor(
     *DescriptorSize = 0;
 
     //
-    // STEP 1: Create all required SIDs
+    // STEP 1: Create all required SIDs.
     //
-
-    // SYSTEM SID
     status = RtlAllocateAndInitializeSid(
-        &ntAuthority,
-        1,
+        &ntAuthority, 1,
         SECURITY_LOCAL_SYSTEM_RID,
         0, 0, 0, 0, 0, 0, 0,
         &systemSid
     );
-
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to create SYSTEM SID: 0x%X\n", status);
+                   "[ShadowStrike] SYSTEM SID alloc failed: 0x%X\n", status);
         goto cleanup;
     }
 
-    // Administrators SID
     status = RtlAllocateAndInitializeSid(
-        &ntAuthority,
-        2,
+        &ntAuthority, 2,
         SECURITY_BUILTIN_DOMAIN_RID,
         DOMAIN_ALIAS_RID_ADMINS,
         0, 0, 0, 0, 0, 0,
         &adminSid
     );
-
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to create Administrators SID: 0x%X\n", status);
+                   "[ShadowStrike] Admin SID alloc failed: 0x%X\n", status);
         goto cleanup;
     }
 
-    // High Integrity Level SID (for mandatory label)
     status = RtlAllocateAndInitializeSid(
-        &ntAuthority,
-        1,
+        &ntAuthority, 1,
         SECURITY_MANDATORY_HIGH_RID,
         0, 0, 0, 0, 0, 0, 0,
         &highILSid
     );
-
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to create High IL SID: 0x%X\n", status);
+                   "[ShadowStrike] High IL SID alloc failed: 0x%X\n", status);
         goto cleanup;
     }
 
-    // Everyone SID (for audit ACE)
     status = RtlAllocateAndInitializeSid(
-        &worldAuthority,
-        1,
+        &worldAuthority, 1,
         SECURITY_WORLD_RID,
         0, 0, 0, 0, 0, 0, 0,
         &everyoneSid
     );
-
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to create Everyone SID: 0x%X\n", status);
+                   "[ShadowStrike] Everyone SID alloc failed: 0x%X\n", status);
         goto cleanup;
     }
 
     //
-    // STEP 2: Calculate DACL size with overflow protection
+    // STEP 2: Calculate DACL size with overflow protection.
     //
-    daclSize = sizeof(ACL);
+    {
+        ULONG systemSidLen = RtlLengthSid(systemSid);
+        ULONG adminSidLen = RtlLengthSid(adminSid);
 
-    // Two ACCESS_ALLOWED_ACE entries (SYSTEM + Administrators)
-    if (daclSize > MAXULONG - (2 * sizeof(ACCESS_ALLOWED_ACE))) {
-        status = STATUS_INTEGER_OVERFLOW;
-        goto cleanup;
+        //
+        // Each ACCESS_ALLOWED_ACE contains a ULONG SidStart field.
+        // The actual SID replaces SidStart, so net addition = sizeof(ACE) + SidLen - sizeof(ULONG).
+        //
+        daclSize = sizeof(ACL)
+                 + sizeof(ACCESS_ALLOWED_ACE) + systemSidLen - sizeof(ULONG)
+                 + sizeof(ACCESS_ALLOWED_ACE) + adminSidLen  - sizeof(ULONG);
+
+        // Align to ULONG boundary.
+        daclSize = (daclSize + sizeof(ULONG) - 1) & ~(sizeof(ULONG) - 1);
     }
-    daclSize += (2 * sizeof(ACCESS_ALLOWED_ACE));
-
-    // Add SID sizes (subtract SidStart which is already in ACE)
-    if (daclSize > MAXULONG - RtlLengthSid(systemSid) + sizeof(ULONG)) {
-        status = STATUS_INTEGER_OVERFLOW;
-        goto cleanup;
-    }
-    daclSize += RtlLengthSid(systemSid) - sizeof(ULONG);
-
-    if (daclSize > MAXULONG - RtlLengthSid(adminSid) + sizeof(ULONG)) {
-        status = STATUS_INTEGER_OVERFLOW;
-        goto cleanup;
-    }
-    daclSize += RtlLengthSid(adminSid) - sizeof(ULONG);
-
-    // Align to ULONG boundary
-    daclSize = (daclSize + sizeof(ULONG) - 1) & ~(sizeof(ULONG) - 1);
 
     //
-    // STEP 3: Calculate SACL size (mandatory label + audit ACE)
+    // STEP 3: Calculate SACL size (mandatory label + audit ACE).
     //
-    saclSize = sizeof(ACL);
+    {
+        ULONG highILLen = RtlLengthSid(highILSid);
+        ULONG everyoneLen = RtlLengthSid(everyoneSid);
 
-    // SYSTEM_MANDATORY_LABEL_ACE for High IL
-    if (saclSize > MAXULONG - sizeof(SYSTEM_MANDATORY_LABEL_ACE)) {
-        status = STATUS_INTEGER_OVERFLOW;
-        goto cleanup;
+        saclSize = sizeof(ACL)
+                 + sizeof(SYSTEM_MANDATORY_LABEL_ACE) + highILLen    - sizeof(ULONG)
+                 + sizeof(SYSTEM_AUDIT_ACE)           + everyoneLen  - sizeof(ULONG);
+
+        saclSize = (saclSize + sizeof(ULONG) - 1) & ~(sizeof(ULONG) - 1);
     }
-    saclSize += sizeof(SYSTEM_MANDATORY_LABEL_ACE);
-    saclSize += RtlLengthSid(highILSid) - sizeof(ULONG);
-
-    // SYSTEM_AUDIT_ACE for Everyone
-    if (saclSize > MAXULONG - sizeof(SYSTEM_AUDIT_ACE)) {
-        status = STATUS_INTEGER_OVERFLOW;
-        goto cleanup;
-    }
-    saclSize += sizeof(SYSTEM_AUDIT_ACE);
-    saclSize += RtlLengthSid(everyoneSid) - sizeof(ULONG);
-
-    // Align to ULONG boundary
-    saclSize = (saclSize + sizeof(ULONG) - 1) & ~(sizeof(ULONG) - 1);
 
     //
-    // STEP 4: Allocate and initialize DACL
+    // STEP 4: Allocate and initialize DACL (temporary, PagedPool, zeroed).
     //
-    dacl = (PACL)ExAllocatePoolWithTag(
-        PagedPool,
-        daclSize,
-        SHADOW_NAMESPACE_ACL_TAG
-    );
-
+    dacl = (PACL)ExAllocatePoolZero(PagedPool, daclSize, SHADOW_NAMESPACE_ACL_TAG);
     if (dacl == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to allocate DACL\n");
         goto cleanup;
     }
 
     status = RtlCreateAcl(dacl, daclSize, ACL_REVISION);
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to create DACL: 0x%X\n", status);
-        goto cleanup;
-    }
+    if (!NT_SUCCESS(status)) goto cleanup;
 
-    // Add SYSTEM ACE
-    status = RtlAddAccessAllowedAce(
-        dacl,
-        ACL_REVISION,
-        GENERIC_ALL,
-        systemSid
-    );
+    status = RtlAddAccessAllowedAce(dacl, ACL_REVISION, GENERIC_ALL, systemSid);
+    if (!NT_SUCCESS(status)) goto cleanup;
 
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to add SYSTEM ACE: 0x%X\n", status);
-        goto cleanup;
-    }
-
-    // Add Administrators ACE
-    status = RtlAddAccessAllowedAce(
-        dacl,
-        ACL_REVISION,
-        GENERIC_ALL,
-        adminSid
-    );
-
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to add Administrators ACE: 0x%X\n", status);
-        goto cleanup;
-    }
+    status = RtlAddAccessAllowedAce(dacl, ACL_REVISION, GENERIC_ALL, adminSid);
+    if (!NT_SUCCESS(status)) goto cleanup;
 
     //
-    // STEP 5: Allocate and initialize SACL (merged mandatory label + audit)
+    // STEP 5: Allocate and initialize SACL (temporary, PagedPool, zeroed).
     //
-    sacl = (PACL)ExAllocatePoolWithTag(
-        PagedPool,
-        saclSize,
-        SHADOW_NAMESPACE_ACL_TAG
-    );
-
+    sacl = (PACL)ExAllocatePoolZero(PagedPool, saclSize, SHADOW_NAMESPACE_ACL_TAG);
     if (sacl == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to allocate SACL\n");
         goto cleanup;
     }
 
     status = RtlCreateAcl(sacl, saclSize, ACL_REVISION);
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to create SACL: 0x%X\n", status);
-        goto cleanup;
-    }
+    if (!NT_SUCCESS(status)) goto cleanup;
 
-    // Add mandatory label ACE (High Integrity Level)
+    //
+    // Mandatory label ACE — CRITICAL for security. Failure is fatal.
+    //
     status = RtlAddMandatoryAce(
         sacl,
         ACL_REVISION,
@@ -1101,252 +734,198 @@ ShadowBuildNamespaceSecurityDescriptor(
         0,
         highILSid
     );
-
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Failed to add mandatory label ACE: 0x%X (non-fatal)\n", status);
-        // Continue - audit is still valuable
-    }
-
-    // Add audit ACE (Everyone - success and failure)
-    status = RtlAddAuditAccessAce(
-        sacl,
-        ACL_REVISION,
-        GENERIC_ALL,
-        everyoneSid,
-        TRUE,  // Audit success
-        TRUE   // Audit failure
-    );
-
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Failed to add audit ACE: 0x%X (non-fatal)\n", status);
-        // Continue - mandatory label is still valuable
-    }
-
-    //
-    // STEP 6: Create absolute security descriptor
-    //
-    status = RtlCreateSecurityDescriptor(
-        &absoluteSD,
-        SECURITY_DESCRIPTOR_REVISION
-    );
-
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to create security descriptor: 0x%X\n", status);
+                   "[ShadowStrike] Mandatory label ACE failed: 0x%X (FATAL)\n", status);
         goto cleanup;
     }
 
-    // Set DACL
-    status = RtlSetDaclSecurityDescriptor(
-        &absoluteSD,
-        TRUE,  // DACL present
-        dacl,
-        FALSE  // Not defaulted
-    );
-
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to set DACL: 0x%X\n", status);
-        goto cleanup;
-    }
-
-    // Set SACL (contains both mandatory label and audit ACEs)
-    status = RtlSetSaclSecurityDescriptor(
-        &absoluteSD,
-        TRUE,
-        sacl,
-        FALSE
-    );
-
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Failed to set SACL: 0x%X (non-fatal)\n", status);
-        // Continue - DACL protection is sufficient
-    }
-
     //
-    // STEP 7: Convert to self-relative format
-    // This creates a SINGLE allocation containing everything
+    // Audit ACE — non-fatal (nice to have).
     //
-
-    // First call to get required size
-    status = RtlAbsoluteToSelfRelativeSD(
-        &absoluteSD,
-        NULL,
-        &selfRelativeSize
-    );
-
-    if (status != STATUS_BUFFER_TOO_SMALL) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Unexpected status from size query: 0x%X\n", status);
-        if (NT_SUCCESS(status)) {
-            status = STATUS_INTERNAL_ERROR;
+    {
+        NTSTATUS auditStatus = RtlAddAuditAccessAce(
+            sacl, ACL_REVISION, GENERIC_ALL, everyoneSid, TRUE, TRUE);
+        if (!NT_SUCCESS(auditStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] Audit ACE failed: 0x%X (non-fatal)\n", auditStatus);
         }
+    }
+
+    //
+    // STEP 6: Create absolute security descriptor.
+    //
+    status = RtlCreateSecurityDescriptor(&absoluteSD, SECURITY_DESCRIPTOR_REVISION);
+    if (!NT_SUCCESS(status)) goto cleanup;
+
+    status = RtlSetDaclSecurityDescriptor(&absoluteSD, TRUE, dacl, FALSE);
+    if (!NT_SUCCESS(status)) goto cleanup;
+
+    status = RtlSetSaclSecurityDescriptor(&absoluteSD, TRUE, sacl, FALSE);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] SetSacl failed: 0x%X (non-fatal)\n", status);
+        // DACL alone is sufficient; continue.
+    }
+
+    //
+    // STEP 7: Convert to self-relative format (NonPagedPoolNx, zeroed).
+    //
+    status = RtlAbsoluteToSelfRelativeSD(&absoluteSD, NULL, &selfRelativeSize);
+    if (status != STATUS_BUFFER_TOO_SMALL) {
+        if (NT_SUCCESS(status)) status = STATUS_INTERNAL_ERROR;
         goto cleanup;
     }
 
-    // Allocate self-relative SD
-    selfRelativeSD = (PSECURITY_DESCRIPTOR)ExAllocatePoolWithTag(
-        PagedPool,
-        selfRelativeSize,
-        SHADOW_NAMESPACE_SD_TAG
-    );
-
+    selfRelativeSD = (PSECURITY_DESCRIPTOR)ExAllocatePoolZero(
+        NonPagedPoolNx, selfRelativeSize, SHADOW_NAMESPACE_SD_TAG);
     if (selfRelativeSD == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to allocate self-relative SD\n");
         goto cleanup;
     }
 
-    // Convert to self-relative
-    status = RtlAbsoluteToSelfRelativeSD(
-        &absoluteSD,
-        selfRelativeSD,
-        &selfRelativeSize
-    );
-
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to convert to self-relative SD: 0x%X\n", status);
-        goto cleanup;
-    }
+    status = RtlAbsoluteToSelfRelativeSD(&absoluteSD, selfRelativeSD, &selfRelativeSize);
+    if (!NT_SUCCESS(status)) goto cleanup;
 
     //
-    // SUCCESS: Return self-relative security descriptor
-    // The ACLs are now embedded - free the temporary absolute ACLs
+    // SUCCESS — transfer ownership.
     //
     *SecurityDescriptor = selfRelativeSD;
     *DescriptorSize = selfRelativeSize;
-    selfRelativeSD = NULL; // Prevent cleanup from freeing it
-
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Self-relative security descriptor created successfully "
-               "(size=%lu, DACL+merged SACL)\n", selfRelativeSize);
-
+    selfRelativeSD = NULL;
     status = STATUS_SUCCESS;
 
+#if DBG
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+               "[ShadowStrike] Self-relative SD built (size=%lu)\n", *DescriptorSize);
+#endif
+
 cleanup:
-    //
-    // Free temporary allocations (ACLs were copied into self-relative SD)
-    //
-    if (dacl != NULL) {
-        ExFreePoolWithTag(dacl, SHADOW_NAMESPACE_ACL_TAG);
-    }
-    if (sacl != NULL) {
-        ExFreePoolWithTag(sacl, SHADOW_NAMESPACE_ACL_TAG);
-    }
-    if (selfRelativeSD != NULL) {
-        ExFreePoolWithTag(selfRelativeSD, SHADOW_NAMESPACE_SD_TAG);
-    }
-    if (systemSid != NULL) {
-        RtlFreeSid(systemSid);
-    }
-    if (adminSid != NULL) {
-        RtlFreeSid(adminSid);
-    }
-    if (highILSid != NULL) {
-        RtlFreeSid(highILSid);
-    }
-    if (everyoneSid != NULL) {
-        RtlFreeSid(everyoneSid);
-    }
+    if (dacl)          ExFreePoolWithTag(dacl, SHADOW_NAMESPACE_ACL_TAG);
+    if (sacl)          ExFreePoolWithTag(sacl, SHADOW_NAMESPACE_ACL_TAG);
+    if (selfRelativeSD) ExFreePoolWithTag(selfRelativeSD, SHADOW_NAMESPACE_SD_TAG);
+    if (systemSid)     RtlFreeSid(systemSid);
+    if (adminSid)      RtlFreeSid(adminSid);
+    if (highILSid)     RtlFreeSid(highILSid);
+    if (everyoneSid)   RtlFreeSid(everyoneSid);
 
     return status;
 }
 
 /**
- * @brief Create boundary descriptor for namespace isolation.
+ * @brief Verify that an existing directory object is owned by SYSTEM.
+ *
+ * Anti-squatting defense: if \\ShadowStrike already exists, we must
+ * verify its owner before trusting it. An attacker who pre-creates the
+ * directory with permissive ACLs could hijack all namespace objects.
+ *
+ * @param DirectoryHandle  Handle to the existing directory (READ_CONTROL).
+ * @return STATUS_SUCCESS if owner is SYSTEM, STATUS_ACCESS_DENIED otherwise.
  */
-NTSTATUS
-ShadowCreateBoundaryDescriptor(
-    _Outptr_ POBJECT_BOUNDARY_DESCRIPTOR* BoundaryDescriptor
+static NTSTATUS
+ShadowpVerifyDirectoryOwner(
+    _In_ HANDLE DirectoryHandle
     )
 {
     NTSTATUS status;
-    UNICODE_STRING boundaryName;
-    POBJECT_BOUNDARY_DESCRIPTOR boundaryDesc = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    ULONG sdSize = 0;
+    PSID ownerSid = NULL;
+    BOOLEAN ownerDefaulted = FALSE;
     SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
-    PSID highILSid = NULL;
+    PSID systemSid = NULL;
 
     PAGED_CODE();
 
-    if (BoundaryDescriptor == NULL) {
-        return STATUS_INVALID_PARAMETER;
+    //
+    // Query the security descriptor (owner info) for the directory.
+    // First call gets required size.
+    //
+    status = ZwQuerySecurityObject(
+        DirectoryHandle,
+        OWNER_SECURITY_INFORMATION,
+        NULL,
+        0,
+        &sdSize
+    );
+
+    if (status != STATUS_BUFFER_TOO_SMALL || sdSize == 0) {
+        return STATUS_ACCESS_DENIED;
     }
 
-    *BoundaryDescriptor = NULL;
-
-    //
-    // ENTERPRISE FIX: Full boundary descriptor implementation
-    // This is what CrowdStrike Falcon does for namespace isolation
-    //
-    RtlInitUnicodeString(&boundaryName, SHADOW_BOUNDARY_NAME);
-
-    //
-    // Create boundary descriptor
-    //
-    boundaryDesc = RtlCreateBoundaryDescriptor(&boundaryName, 0);
-    if (boundaryDesc == NULL) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to create boundary descriptor\n");
+    sd = (PSECURITY_DESCRIPTOR)ExAllocatePoolZero(
+        PagedPool, sdSize, SHADOW_NAMESPACE_TAG);
+    if (sd == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Create High Integrity Level SID
-    //
-    status = RtlAllocateAndInitializeSid(
-        &ntAuthority,
-        1,
-        SECURITY_MANDATORY_HIGH_RID,
-        0, 0, 0, 0, 0, 0, 0,
-        &highILSid
+    status = ZwQuerySecurityObject(
+        DirectoryHandle,
+        OWNER_SECURITY_INFORMATION,
+        sd,
+        sdSize,
+        &sdSize
     );
 
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to create High IL SID: 0x%X\n", status);
-        RtlDeleteBoundaryDescriptor(boundaryDesc);
+        ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
         return status;
     }
 
     //
-    // Add High IL requirement to boundary descriptor
-    // This prevents Medium IL processes from accessing the namespace
+    // Extract owner SID from the queried SD.
     //
-    status = RtlAddSIDToBoundaryDescriptor(&boundaryDesc, highILSid);
+    status = RtlGetOwnerSecurityDescriptor(sd, &ownerSid, &ownerDefaulted);
+    if (!NT_SUCCESS(status) || ownerSid == NULL) {
+        ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    //
+    // Build SYSTEM SID for comparison.
+    //
+    status = RtlAllocateAndInitializeSid(
+        &ntAuthority, 1,
+        SECURITY_LOCAL_SYSTEM_RID,
+        0, 0, 0, 0, 0, 0, 0,
+        &systemSid
+    );
+
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to add SID to boundary: 0x%X\n", status);
-        RtlFreeSid(highILSid);
-        RtlDeleteBoundaryDescriptor(boundaryDesc);
+        ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
         return status;
     }
 
     //
-    // Success
+    // Compare owner to SYSTEM.
     //
-    *BoundaryDescriptor = boundaryDesc;
+    if (!RtlEqualSid(ownerSid, systemSid)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Directory owner is NOT SYSTEM — rejecting\n");
+        status = STATUS_ACCESS_DENIED;
+    } else {
+        status = STATUS_SUCCESS;
+    }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Boundary descriptor created (High IL required)\n");
+    RtlFreeSid(systemSid);
+    ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
 
-    RtlFreeSid(highILSid);
-    return STATUS_SUCCESS;
+    return status;
 }
 
 /**
  * @brief Cleanup namespace state during shutdown.
  *
- * CRITICAL FIX: This function now correctly handles the self-relative
- * security descriptor. Since the SD is self-relative, all ACLs are
- * embedded within it - only a single free is needed.
+ * Handles partial initialization gracefully. Each resource is checked
+ * before cleanup. Order matters:
+ * 1. ObDereferenceObject (releases kernel reference)
+ * 2. ZwMakeTemporaryObject (clears OBJ_PERMANENT so object can be deleted)
+ * 3. ZwClose (closes handle)
+ * 4. Free SD
+ * 5. Clear state
  */
-VOID
-ShadowCleanupNamespaceState(
+static VOID
+ShadowpCleanupState(
     _Inout_ PSHADOW_NAMESPACE_STATE State
     )
 {
@@ -1356,11 +935,8 @@ ShadowCleanupNamespaceState(
         return;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Cleaning up namespace state\n");
-
     //
-    // Dereference directory object
+    // Dereference directory object (kernel pointer ref).
     //
     if (State->DirectoryObjectReferenced && State->DirectoryObject != NULL) {
         ObDereferenceObject(State->DirectoryObject);
@@ -1369,26 +945,19 @@ ShadowCleanupNamespaceState(
     }
 
     //
-    // Close directory handle
+    // Clear OBJ_PERMANENT and close handle.
+    // ZwMakeTemporaryObject removes the permanent flag so the object
+    // manager can delete the directory when no more references exist.
     //
     if (State->DirectoryHandle != NULL) {
+        ZwMakeTemporaryObject(State->DirectoryHandle);
         ZwClose(State->DirectoryHandle);
         State->DirectoryHandle = NULL;
     }
 
     //
-    // Delete boundary descriptor (if created)
-    //
-    if (State->BoundaryDescriptor != NULL) {
-        RtlDeleteBoundaryDescriptor(State->BoundaryDescriptor);
-        State->BoundaryDescriptor = NULL;
-    }
-
-    //
-    // CRITICAL FIX: Free self-relative security descriptor
-    // This is the ONLY allocation that needs to be freed.
-    // The DACL and SACL are embedded within the self-relative SD,
-    // so freeing the SD frees everything - no memory leaks, no double-free.
+    // Free self-relative security descriptor (single alloc contains
+    // embedded DACL + SACL — no other ACL allocations to free).
     //
     if (State->SecurityDescriptorAllocated && State->DirectorySecurityDescriptor != NULL) {
         ExFreePoolWithTag(State->DirectorySecurityDescriptor, SHADOW_NAMESPACE_SD_TAG);
@@ -1398,21 +967,21 @@ ShadowCleanupNamespaceState(
     }
 
     //
-    // Delete push lock (if initialized)
+    // Push lock has no delete function for Ex variant (it's a no-op).
+    // Just mark as uninitialized.
     //
-    if (State->LockInitialized) {
-        FsRtlDeletePushLock(&State->Lock);
-        State->LockInitialized = FALSE;
-    }
+    State->LockInitialized = FALSE;
 
     //
-    // Clear all state
+    // Clear all state.
     //
     State->Initialized = FALSE;
     State->Destroying = FALSE;
-    State->ReferenceCount = 0;
+    State->RundownInitialized = FALSE;
     InterlockedExchange(&State->InitializationState, NAMESPACE_STATE_UNINITIALIZED);
 
+#if DBG
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Namespace state cleaned up (memory-safe)\n");
+               "[ShadowStrike] Namespace state cleaned up\n");
+#endif
 }

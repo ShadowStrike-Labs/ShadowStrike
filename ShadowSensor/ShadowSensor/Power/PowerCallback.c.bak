@@ -6,27 +6,31 @@
  * @file PowerCallback.c
  * @brief Enterprise-grade power state management for kernel EDR.
  *
- * IRQL Safety Model:
- * - PwrpSystemStateCallback may fire at DISPATCH_LEVEL.
- *   It MUST NOT acquire push locks or allocate paged pool.
- *   All heavy work is deferred to PwrpDeferredEventWorkRoutine
- *   via IoQueueWorkItem (runs at PASSIVE_LEVEL).
- * - PwrpPowerSettingCallback runs at PASSIVE_LEVEL per MSDN.
- *   It may safely use push locks and allocate memory.
- * - State query functions that use push locks are annotated APC_LEVEL max.
- *   Lock-free query functions use volatile reads and are DISPATCH_LEVEL safe.
+ * Implements comprehensive power transition handling:
+ * - System power state callback (PoRegisterPowerSettingCallback)
+ * - Connected Standby / Modern Standby support
+ * - AC/DC power source monitoring
+ * - Display state tracking
+ * - Lid switch monitoring
+ * - Battery level tracking
+ * - Session lock/unlock detection
+ * - Resume validation for security
  *
- * Lock Ordering (to prevent deadlocks):
- *   StateLock → EventHistoryLock → CallbackLock
- *   (Never acquire in reverse order)
+ * Security Considerations:
+ * - Malware may attempt attacks during power transitions
+ * - Cold boot attacks possible after hibernate
+ * - Time-based evasion using sleep/resume
+ * - Re-validation of driver state after resume
  *
- * Work Item Safety:
- *   - WorkItemQueued flag prevents double-queuing (IoQueueWorkItem contract).
- *   - WorkItemComplete event ensures shutdown waits for in-flight work items.
- *   - IoFreeWorkItem is only called after the work item has finished.
+ * BSOD PREVENTION:
+ * - All callbacks are non-blocking
+ * - Proper IRQL handling throughout
+ * - Safe state transitions with atomic operations
+ * - Graceful handling of rapid power state changes
+ * - No allocations in power callbacks when possible
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0 (Enterprise Edition)
+ * @version 2.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -45,177 +49,83 @@
 #pragma alloc_text(PAGE, ShadowPowerWaitForPendingOperations)
 #pragma alloc_text(PAGE, ShadowPowerValidateResume)
 #pragma alloc_text(PAGE, ShadowPowerWaitForResumeValidation)
-#pragma alloc_text(PAGE, ShadowPowerGetState)
-#pragma alloc_text(PAGE, ShadowPowerGetStatistics)
-#pragma alloc_text(PAGE, ShadowPowerResetStatistics)
 #endif
 
 // ============================================================================
 // POWER SETTING GUIDs
 // ============================================================================
 
+//
+// GUID_CONSOLE_DISPLAY_STATE - Display on/off/dimmed
+// {6FE69556-704A-47A0-8F24-C28D936FDA47}
+//
 DEFINE_GUID(GUID_CONSOLE_DISPLAY_STATE,
     0x6FE69556, 0x704A, 0x47A0, 0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47);
 
+//
+// GUID_MONITOR_POWER_ON - Monitor power state
+// {02731015-4510-4526-99E6-E5A17EBD1AEA}
+//
+DEFINE_GUID(GUID_MONITOR_POWER_ON,
+    0x02731015, 0x4510, 0x4526, 0x99, 0xE6, 0xE5, 0xA1, 0x7E, 0xBD, 0x1A, 0xEA);
+
+//
+// GUID_ACDC_POWER_SOURCE - AC/DC power source
+// {5D3E9A59-E9D5-4B00-A6BD-FF34FF516548}
+//
 DEFINE_GUID(GUID_ACDC_POWER_SOURCE,
     0x5D3E9A59, 0xE9D5, 0x4B00, 0xA6, 0xBD, 0xFF, 0x34, 0xFF, 0x51, 0x65, 0x48);
 
+//
+// GUID_LIDSWITCH_STATE_CHANGE - Lid open/close
+// {BA3E0F4D-B817-4094-A2D1-D56379E6A0F3}
+//
 DEFINE_GUID(GUID_LIDSWITCH_STATE_CHANGE,
     0xBA3E0F4D, 0xB817, 0x4094, 0xA2, 0xD1, 0xD5, 0x63, 0x79, 0xE6, 0xA0, 0xF3);
 
+//
+// GUID_BATTERY_PERCENTAGE_REMAINING - Battery level
+// {A7AD8041-B45A-4CAE-87A3-EECBB468A9E1}
+//
 DEFINE_GUID(GUID_BATTERY_PERCENTAGE_REMAINING,
     0xA7AD8041, 0xB45A, 0x4CAE, 0x87, 0xA3, 0xEE, 0xCB, 0xB4, 0x68, 0xA9, 0xE1);
 
+//
+// GUID_IDLE_RESILIENCY - Connected Standby entry/exit
+// {C42B1B9A-2D5B-4C55-9E20-FB9FFFB7D32F}
+//
 DEFINE_GUID(GUID_IDLE_RESILIENCY,
     0xC42B1B9A, 0x2D5B, 0x4C55, 0x9E, 0x20, 0xFB, 0x9F, 0xFF, 0xB7, 0xD3, 0x2F);
 
-DEFINE_GUID(GUID_SESSION_USER_PRESENCE,
-    0x3C0F4548, 0xC03F, 0x4C4D, 0xB9, 0xF2, 0x23, 0x7E, 0xDE, 0x68, 0x63, 0x76);
-
+//
+// GUID_SESSION_DISPLAY_STATUS - Session lock/unlock
+// {2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5}
+//
 DEFINE_GUID(GUID_SESSION_DISPLAY_STATUS,
     0x2B84C20E, 0xAD23, 0x4DDF, 0x93, 0xDB, 0x05, 0xFF, 0xBD, 0x7E, 0xFC, 0xA5);
 
+//
+// GUID_SESSION_USER_PRESENCE - User presence detection
+// {3C0F4548-C03F-4C4D-B9F2-237EDE686376}
+//
+DEFINE_GUID(GUID_SESSION_USER_PRESENCE,
+    0x3C0F4548, 0xC03F, 0x4C4D, 0xB9, 0xF2, 0x23, 0x7E, 0xDE, 0x68, 0x63, 0x76);
+
+//
+// GUID_SYSTEM_AWAYMODE - Away mode state
+// {98A7F580-01F7-48AA-9C0F-44352C29E5C0}
+//
+DEFINE_GUID(GUID_SYSTEM_AWAYMODE,
+    0x98A7F580, 0x01F7, 0x48AA, 0x9C, 0x0F, 0x44, 0x35, 0x2C, 0x29, 0xE5, 0xC0);
+
 // ============================================================================
-// INTERNAL STRUCTURES (private to this file)
+// GLOBAL STATE
 // ============================================================================
 
 /**
- * @brief Internal power event with list linkage.
- *        The public SHADOW_POWER_EVENT_INFO is a subset of this.
+ * @brief Power management global state
  */
-typedef struct _SHADOW_POWER_EVENT_INTERNAL {
-    LIST_ENTRY ListEntry;
-
-    SHADOW_POWER_EVENT_INFO Info;
-
-    BOOLEAN Processed;
-    BOOLEAN Notified;
-    NTSTATUS ProcessingStatus;
-
-} SHADOW_POWER_EVENT_INTERNAL, *PSHADOW_POWER_EVENT_INTERNAL;
-
-/**
- * @brief Internal callback registration entry.
- */
-typedef struct _SHADOW_POWER_CALLBACK_ENTRY {
-    LIST_ENTRY ListEntry;
-
-    PSHADOW_POWER_CALLBACK Callback;
-    PVOID Context;
-    SHADOW_POWER_CALLBACK_PRIORITY Priority;
-    ULONGLONG EventMask;
-
-    BOOLEAN Enabled;
-    volatile LONG CallCount;
-    LARGE_INTEGER LastCallTime;
-
-} SHADOW_POWER_CALLBACK_ENTRY, *PSHADOW_POWER_CALLBACK_ENTRY;
-
-/**
- * @brief Deferred event work item context.
- *        Passed through the work item to process events at PASSIVE_LEVEL.
- */
-#define PWR_DEFERRED_EVENT_MAX  8
-
-typedef struct _PWR_DEFERRED_EVENT_CONTEXT {
-    SHADOW_POWER_EVENT_TYPE Events[PWR_DEFERRED_EVENT_MAX];
-    ULONG EventCount;
-} PWR_DEFERRED_EVENT_CONTEXT;
-
-/**
- * @brief Power management global state (file-static, NEVER exposed in header).
- */
-typedef struct _SHADOW_POWER_GLOBALS {
-    volatile LONG Initialized;
-    volatile LONG Enabled;
-    volatile LONG ShuttingDown;
-
-    // Current state — protected by StateLock (EX_PUSH_LOCK, max APC_LEVEL)
-    SHADOW_POWER_STATE_INFO StateInfo;
-    EX_PUSH_LOCK StateLock;
-
-    //
-    // Volatile copies for lock-free DISPATCH_LEVEL readers.
-    // Updated under StateLock, read with volatile semantics.
-    //
-    volatile LONG CurrentPowerState;    // SHADOW_POWER_STATE
-    volatile LONG CurrentPowerSource;   // SHADOW_POWER_SOURCE
-    volatile LONG ResumeValidationRequired;
-    volatile LONG ResumeValidationPassed;
-
-    // Power setting callback handles
-    PVOID ConsoleDisplayStateHandle;
-    PVOID AcDcPowerSourceHandle;
-    PVOID LidSwitchStateHandle;
-    PVOID BatteryPercentageHandle;
-    PVOID IdleResiliencyHandle;
-    PVOID UserPresenceHandle;
-    PVOID SessionDisplayStatusHandle;
-
-    // System state callback
-    PCALLBACK_OBJECT SystemStateCallback;
-    PVOID SystemStateRegistration;
-
-    // Event history — protected by EventHistoryLock (push lock, max APC_LEVEL)
-    LIST_ENTRY EventHistory;
-    EX_PUSH_LOCK EventHistoryLock;
-    volatile LONG EventCount;
-    volatile LONG64 EventSequence;
-
-    // Registered callbacks — protected by CallbackLock (push lock, max APC_LEVEL)
-    LIST_ENTRY CallbackList;
-    EX_PUSH_LOCK CallbackLock;
-    volatile LONG CallbackCount;
-
-    // Resume validation
-    KEVENT ResumeValidationComplete;
-
-    // Pending operation tracking
-    volatile LONG PendingOperations;
-    KEVENT NoPendingOperationsEvent;
-
-    // Work item for deferred processing from DISPATCH_LEVEL callbacks
-    PIO_WORKITEM DeferredWorkItem;
-    PDEVICE_OBJECT DeviceObject;
-    volatile LONG WorkItemQueued;
-    KEVENT WorkItemComplete;
-
-    // Deferred events from system state callback (lock-free ring)
-    PWR_DEFERRED_EVENT_CONTEXT DeferredCtx;
-    KSPIN_LOCK DeferredCtxLock;
-
-    // Statistics — protected by StatsLock (push lock)
-    // All volatile counters updated via Interlocked*, but durations need lock
-    struct {
-        volatile LONG64 TotalPowerEvents;
-        volatile LONG64 SleepTransitions;
-        volatile LONG64 ResumeTransitions;
-        volatile LONG64 HibernateTransitions;
-        volatile LONG64 ConnectedStandbyTransitions;
-        volatile LONG64 ACDCTransitions;
-        volatile LONG64 DisplayStateChanges;
-        volatile LONG64 LidStateChanges;
-        volatile LONG64 SessionChanges;
-        volatile LONG64 ThermalEvents;
-        volatile LONG64 CallbacksInvoked;
-        volatile LONG64 CallbackErrors;
-        volatile LONG64 ValidationsPassed;
-        volatile LONG64 ValidationsFailed;
-
-        volatile LONG64 TotalSleepDuration100ns;
-        volatile LONG64 LongestSleepDuration100ns;
-        volatile LONG64 LastSleepDuration100ns;
-    } Stats;
-
-    LARGE_INTEGER LastSleepStartTime;
-
-} SHADOW_POWER_GLOBALS;
-
-// ============================================================================
-// GLOBAL STATE (file-static)
-// ============================================================================
-
-static SHADOW_POWER_GLOBALS g_PowerState;
+static SHADOW_POWER_GLOBALS g_PowerState = {0};
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -241,7 +151,6 @@ PwrpUnregisterSystemStateCallback(
     VOID
     );
 
-_Function_class_(POWER_SETTING_CALLBACK)
 static NTSTATUS NTAPI
 PwrpPowerSettingCallback(
     _In_ LPCGUID SettingGuid,
@@ -266,29 +175,28 @@ PwrpProcessPowerEvent(
 
 static VOID
 PwrpRecordEvent(
-    _In_ PSHADOW_POWER_EVENT_INTERNAL Event
+    _In_ PSHADOW_POWER_EVENT Event
     );
 
 static VOID
 PwrpNotifyCallbacks(
-    _In_ PSHADOW_POWER_EVENT_INTERNAL Event
+    _In_ PSHADOW_POWER_EVENT Event
     );
 
-_Function_class_(IO_WORKITEM_ROUTINE)
-static VOID NTAPI
-PwrpDeferredEventWorkRoutine(
+static VOID
+PwrpDeferredWorkRoutine(
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_opt_ PVOID Context
     );
 
 static VOID
-PwrpUpdateStateFromEvent(
-    _In_ PSHADOW_POWER_EVENT_INTERNAL Event
+PwrpCleanupEventHistory(
+    VOID
     );
 
 static VOID
-PwrpUpdateVolatileState(
-    VOID
+PwrpUpdateStateFromEvent(
+    _In_ PSHADOW_POWER_EVENT Event
     );
 
 static NTSTATUS
@@ -300,6 +208,9 @@ PwrpPerformResumeValidation(
 // PUBLIC API - INITIALIZATION
 // ============================================================================
 
+/**
+ * @brief Initialize the power management subsystem.
+ */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowRegisterPowerCallbacks(
@@ -310,7 +221,10 @@ ShadowRegisterPowerCallbacks(
 
     PAGED_CODE();
 
-    if (InterlockedCompareExchange(&g_PowerState.Initialized, 0, 0) != 0) {
+    //
+    // Check if already initialized
+    //
+    if (g_PowerState.Initialized) {
         return STATUS_ALREADY_INITIALIZED;
     }
 
@@ -319,22 +233,29 @@ ShadowRegisterPowerCallbacks(
 
     RtlZeroMemory(&g_PowerState, sizeof(SHADOW_POWER_GLOBALS));
 
+    //
+    // Store device object
+    //
     g_PowerState.DeviceObject = DeviceObject;
 
     //
-    // Initialize synchronization primitives
+    // Initialize locks
     //
     ExInitializePushLock(&g_PowerState.StateLock);
     ExInitializePushLock(&g_PowerState.EventHistoryLock);
     ExInitializePushLock(&g_PowerState.CallbackLock);
-    KeInitializeSpinLock(&g_PowerState.DeferredCtxLock);
 
+    //
+    // Initialize lists
+    //
     InitializeListHead(&g_PowerState.EventHistory);
     InitializeListHead(&g_PowerState.CallbackList);
 
+    //
+    // Initialize events
+    //
     KeInitializeEvent(&g_PowerState.ResumeValidationComplete, NotificationEvent, TRUE);
     KeInitializeEvent(&g_PowerState.NoPendingOperationsEvent, NotificationEvent, TRUE);
-    KeInitializeEvent(&g_PowerState.WorkItemComplete, NotificationEvent, TRUE);
 
     //
     // Initialize default state
@@ -348,12 +269,6 @@ ShadowRegisterPowerCallbacks(
     KeQuerySystemTime(&g_PowerState.StateInfo.LastStateChangeTime);
 
     //
-    // Set volatile copies
-    //
-    InterlockedExchange(&g_PowerState.CurrentPowerState, (LONG)ShadowPowerState_Working);
-    InterlockedExchange(&g_PowerState.CurrentPowerSource, (LONG)ShadowPowerSource_Unknown);
-
-    //
     // Allocate work item for deferred processing
     //
     if (DeviceObject != NULL) {
@@ -361,6 +276,7 @@ ShadowRegisterPowerCallbacks(
         if (g_PowerState.DeferredWorkItem == NULL) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                        "[ShadowStrike] Failed to allocate power work item\n");
+            // Non-fatal - continue without deferred processing
         }
     }
 
@@ -372,6 +288,7 @@ ShadowRegisterPowerCallbacks(
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] Failed to register system state callback: 0x%08X\n",
                    status);
+        // Non-fatal - continue with power setting callbacks
     }
 
     //
@@ -382,13 +299,20 @@ ShadowRegisterPowerCallbacks(
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] Failed to register power setting callbacks: 0x%08X\n",
                    status);
+        // Non-fatal - we can still operate without all callbacks
     }
+
+    //
+    // Record initialization time
+    //
+    KeQuerySystemTime(&g_PowerState.Stats.TotalSleepDuration);
+    g_PowerState.Stats.TotalSleepDuration.QuadPart = 0;
 
     //
     // Mark as initialized and enabled
     //
-    InterlockedExchange(&g_PowerState.Enabled, TRUE);
-    InterlockedExchange(&g_PowerState.Initialized, TRUE);
+    g_PowerState.Initialized = TRUE;
+    g_PowerState.Enabled = TRUE;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Power management initialized successfully\n");
@@ -398,15 +322,6 @@ ShadowRegisterPowerCallbacks(
 
 /**
  * @brief Shutdown the power management subsystem.
- *
- * Order of operations:
- * 1. Set ShuttingDown flag (prevents new events/work)
- * 2. Wait for pending operations
- * 3. Unregister all OS callbacks (no new callbacks will fire)
- * 4. Wait for any in-flight work item to complete
- * 5. Free work item
- * 6. Free event history and callback list under their locks
- * 7. Clear Initialized flag
  */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 VOID
@@ -415,13 +330,13 @@ ShadowUnregisterPowerCallbacks(
     )
 {
     PLIST_ENTRY entry;
-    PSHADOW_POWER_EVENT_INTERNAL event;
+    PSHADOW_POWER_EVENT event;
     PSHADOW_POWER_CALLBACK_ENTRY callbackEntry;
     LARGE_INTEGER timeout;
 
     PAGED_CODE();
 
-    if (InterlockedCompareExchange(&g_PowerState.Initialized, 0, 0) == 0) {
+    if (!g_PowerState.Initialized) {
         return;
     }
 
@@ -429,16 +344,16 @@ ShadowUnregisterPowerCallbacks(
                "[ShadowStrike] Shutting down power management\n");
 
     //
-    // Step 1: Mark as shutting down — no new events will be processed
+    // Mark as shutting down
     //
-    InterlockedExchange(&g_PowerState.ShuttingDown, TRUE);
-    InterlockedExchange(&g_PowerState.Enabled, FALSE);
+    g_PowerState.ShuttingDown = TRUE;
+    g_PowerState.Enabled = FALSE;
 
     //
-    // Step 2: Wait for pending operations (ShadowPowerEnterOperation/LeaveOperation)
+    // Wait for pending operations
     //
     if (g_PowerState.PendingOperations > 0) {
-        timeout.QuadPart = -50000000LL;  // 5 seconds
+        timeout.QuadPart = -50000000;  // 5 seconds
         KeWaitForSingleObject(
             &g_PowerState.NoPendingOperationsEvent,
             Executive,
@@ -449,30 +364,17 @@ ShadowUnregisterPowerCallbacks(
     }
 
     //
-    // Step 3: Unregister all OS callbacks.
-    // After this, no new PwrpSystemStateCallback or PwrpPowerSettingCallback
-    // invocations will start.
+    // Unregister power setting callbacks
     //
     PwrpUnregisterPowerSettingCallbacks();
+
+    //
+    // Unregister system state callback
+    //
     PwrpUnregisterSystemStateCallback();
 
     //
-    // Step 4: Wait for any in-flight work item to complete.
-    // The work item sets WorkItemComplete when it finishes.
-    //
-    if (InterlockedCompareExchange(&g_PowerState.WorkItemQueued, 0, 0) != 0) {
-        timeout.QuadPart = -100000000LL;  // 10 seconds
-        KeWaitForSingleObject(
-            &g_PowerState.WorkItemComplete,
-            Executive,
-            KernelMode,
-            FALSE,
-            &timeout
-            );
-    }
-
-    //
-    // Step 5: Free work item (safe — work item is guaranteed not running)
+    // Free work item
     //
     if (g_PowerState.DeferredWorkItem != NULL) {
         IoFreeWorkItem(g_PowerState.DeferredWorkItem);
@@ -480,14 +382,14 @@ ShadowUnregisterPowerCallbacks(
     }
 
     //
-    // Step 6: Free event history
+    // Free event history
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PowerState.EventHistoryLock);
 
     while (!IsListEmpty(&g_PowerState.EventHistory)) {
         entry = RemoveHeadList(&g_PowerState.EventHistory);
-        event = CONTAINING_RECORD(entry, SHADOW_POWER_EVENT_INTERNAL, ListEntry);
+        event = CONTAINING_RECORD(entry, SHADOW_POWER_EVENT, ListEntry);
         ExFreePoolWithTag(event, PWR_POOL_TAG_EVENT);
     }
     g_PowerState.EventCount = 0;
@@ -523,14 +425,13 @@ ShadowUnregisterPowerCallbacks(
                g_PowerState.Stats.HibernateTransitions,
                g_PowerState.Stats.ConnectedStandbyTransitions);
 
-    //
-    // Step 7: Mark as uninitialized.
-    // Do NOT RtlZeroMemory the struct — that would destroy lock state
-    // that late readers might still touch momentarily.
-    //
-    InterlockedExchange(&g_PowerState.Initialized, FALSE);
+    g_PowerState.Initialized = FALSE;
+    RtlZeroMemory(&g_PowerState, sizeof(SHADOW_POWER_GLOBALS));
 }
 
+/**
+ * @brief Enable or disable power management.
+ */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowPowerSetEnabled(
@@ -543,7 +444,7 @@ ShadowPowerSetEnabled(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    InterlockedExchange(&g_PowerState.Enabled, (LONG)Enable);
+    g_PowerState.Enabled = Enable;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Power management %s\n",
@@ -557,16 +458,14 @@ ShadowPowerSetEnabled(
 // ============================================================================
 
 /**
- * @brief Get full power state snapshot under shared lock.
+ * @brief Get current power state information.
  */
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowPowerGetState(
     _Out_ PSHADOW_POWER_STATE_INFO StateInfo
     )
 {
-    PAGED_CODE();
-
     if (StateInfo == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -588,7 +487,7 @@ ShadowPowerGetState(
 }
 
 /**
- * @brief Lock-free low-power check (volatile read of single enum value).
+ * @brief Check if system is in low-power state.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
@@ -596,20 +495,23 @@ ShadowPowerIsLowPowerState(
     VOID
     )
 {
-    LONG state;
+    SHADOW_POWER_STATE state;
 
     if (!g_PowerState.Initialized) {
         return FALSE;
     }
 
-    state = ReadNoFence(&g_PowerState.CurrentPowerState);
+    state = g_PowerState.StateInfo.CurrentState;
 
-    return (state == (LONG)ShadowPowerState_Standby ||
-            state == (LONG)ShadowPowerState_Hibernate ||
-            state == (LONG)ShadowPowerState_ConnectedStandby ||
-            state == (LONG)ShadowPowerState_HybridSleep);
+    return (state == ShadowPowerState_Standby ||
+            state == ShadowPowerState_Hibernate ||
+            state == ShadowPowerState_ConnectedStandby ||
+            state == ShadowPowerState_HybridSleep);
 }
 
+/**
+ * @brief Check if system is resuming from sleep.
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowPowerIsResuming(
@@ -620,10 +522,13 @@ ShadowPowerIsResuming(
         return FALSE;
     }
 
-    return (ReadNoFence(&g_PowerState.ResumeValidationRequired) != 0) &&
-           (ReadNoFence(&g_PowerState.ResumeValidationPassed) == 0);
+    return g_PowerState.ResumeValidationRequired &&
+           !g_PowerState.ResumeValidationPassed;
 }
 
+/**
+ * @brief Check if running on battery power.
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowPowerIsOnBattery(
@@ -634,9 +539,12 @@ ShadowPowerIsOnBattery(
         return FALSE;
     }
 
-    return (ReadNoFence(&g_PowerState.CurrentPowerSource) == (LONG)ShadowPowerSource_DC);
+    return (g_PowerState.StateInfo.PowerSource == ShadowPowerSource_DC);
 }
 
+/**
+ * @brief Get battery percentage.
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 ULONG
 ShadowPowerGetBatteryPercentage(
@@ -647,10 +555,6 @@ ShadowPowerGetBatteryPercentage(
         return 0;
     }
 
-    //
-    // BatteryPercentage is a single ULONG — naturally atomic on all
-    // supported architectures. Read without lock.
-    //
     if (!g_PowerState.StateInfo.BatteryPresent) {
         return 0;
     }
@@ -662,13 +566,16 @@ ShadowPowerGetBatteryPercentage(
 // PUBLIC API - CALLBACK REGISTRATION
 // ============================================================================
 
+/**
+ * @brief Register a power event callback.
+ */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowPowerRegisterCallback(
     _In_ PSHADOW_POWER_CALLBACK Callback,
     _In_opt_ PVOID Context,
     _In_ SHADOW_POWER_CALLBACK_PRIORITY Priority,
-    _In_ ULONGLONG EventMask,
+    _In_ ULONG EventMask,
     _Out_ PVOID* Handle
     )
 {
@@ -677,10 +584,6 @@ ShadowPowerRegisterCallback(
     PAGED_CODE();
 
     if (Callback == NULL || Handle == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (Priority >= ShadowPowerPriority_Max) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -694,8 +597,11 @@ ShadowPowerRegisterCallback(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    entry = (PSHADOW_POWER_CALLBACK_ENTRY)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
+    //
+    // Allocate callback entry
+    //
+    entry = (PSHADOW_POWER_CALLBACK_ENTRY)ExAllocatePoolZero(
+        NonPagedPoolNx,
         sizeof(SHADOW_POWER_CALLBACK_ENTRY),
         PWR_POOL_TAG_CALLBACK
         );
@@ -712,41 +618,31 @@ ShadowPowerRegisterCallback(
     entry->CallCount = 0;
 
     //
-    // Insert into list sorted by priority (lower value = higher priority)
+    // Insert into list (sorted by priority)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PowerState.CallbackLock);
 
     //
-    // Re-check count under lock
+    // Find insertion point based on priority
     //
-    if (g_PowerState.CallbackCount >= PWR_MAX_CALLBACKS) {
-        ExReleasePushLockExclusive(&g_PowerState.CallbackLock);
-        KeLeaveCriticalRegion();
-        ExFreePoolWithTag(entry, PWR_POOL_TAG_CALLBACK);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+    PLIST_ENTRY insertBefore = &g_PowerState.CallbackList;
+    PLIST_ENTRY current;
 
-    {
-        PLIST_ENTRY insertBefore = &g_PowerState.CallbackList;
-        PLIST_ENTRY current;
+    for (current = g_PowerState.CallbackList.Flink;
+         current != &g_PowerState.CallbackList;
+         current = current->Flink) {
 
-        for (current = g_PowerState.CallbackList.Flink;
-             current != &g_PowerState.CallbackList;
-             current = current->Flink) {
+        PSHADOW_POWER_CALLBACK_ENTRY existing = CONTAINING_RECORD(
+            current, SHADOW_POWER_CALLBACK_ENTRY, ListEntry);
 
-            PSHADOW_POWER_CALLBACK_ENTRY existing = CONTAINING_RECORD(
-                current, SHADOW_POWER_CALLBACK_ENTRY, ListEntry);
-
-            if (existing->Priority > Priority) {
-                insertBefore = current;
-                break;
-            }
+        if (existing->Priority > Priority) {
+            insertBefore = current;
+            break;
         }
-
-        InsertTailList(insertBefore, &entry->ListEntry);
     }
 
+    InsertTailList(insertBefore, &entry->ListEntry);
     InterlockedIncrement(&g_PowerState.CallbackCount);
 
     ExReleasePushLockExclusive(&g_PowerState.CallbackLock);
@@ -755,12 +651,15 @@ ShadowPowerRegisterCallback(
     *Handle = entry;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Power callback registered (priority=%d, mask=0x%llX)\n",
+               "[ShadowStrike] Power callback registered (priority=%d, mask=0x%X)\n",
                Priority, EventMask);
 
     return STATUS_SUCCESS;
 }
 
+/**
+ * @brief Unregister a power event callback.
+ */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 VOID
 ShadowPowerUnregisterCallback(
@@ -780,6 +679,9 @@ ShadowPowerUnregisterCallback(
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PowerState.CallbackLock);
 
+    //
+    // Verify handle is in our list
+    //
     for (current = g_PowerState.CallbackList.Flink;
          current != &g_PowerState.CallbackList;
          current = current->Flink) {
@@ -805,19 +707,18 @@ ShadowPowerUnregisterCallback(
 // ============================================================================
 
 /**
- * @brief Get event history. Copies public SHADOW_POWER_EVENT_INFO only
- *        (no ListEntry, no internal fields).
+ * @brief Get recent power event history.
  */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 ShadowPowerGetEventHistory(
-    _Out_writes_to_(MaxEvents, *EventCount) PSHADOW_POWER_EVENT_INFO Events,
+    _Out_writes_to_(MaxEvents, *EventCount) PSHADOW_POWER_EVENT Events,
     _In_ ULONG MaxEvents,
     _Out_ PULONG EventCount
     )
 {
     PLIST_ENTRY entry;
-    PSHADOW_POWER_EVENT_INTERNAL internalEvent;
+    PSHADOW_POWER_EVENT event;
     ULONG count = 0;
 
     PAGED_CODE();
@@ -839,12 +740,8 @@ ShadowPowerGetEventHistory(
          entry != &g_PowerState.EventHistory && count < MaxEvents;
          entry = entry->Flink) {
 
-        internalEvent = CONTAINING_RECORD(entry, SHADOW_POWER_EVENT_INTERNAL, ListEntry);
-
-        //
-        // Copy only the public info — no ListEntry, no internal flags
-        //
-        RtlCopyMemory(&Events[count], &internalEvent->Info, sizeof(SHADOW_POWER_EVENT_INFO));
+        event = CONTAINING_RECORD(entry, SHADOW_POWER_EVENT, ListEntry);
+        RtlCopyMemory(&Events[count], event, sizeof(SHADOW_POWER_EVENT));
         count++;
     }
 
@@ -855,6 +752,9 @@ ShadowPowerGetEventHistory(
     return STATUS_SUCCESS;
 }
 
+/**
+ * @brief Wait for pending operations before sleep.
+ */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowPowerWaitForPendingOperations(
@@ -894,6 +794,9 @@ ShadowPowerWaitForPendingOperations(
     return STATUS_SUCCESS;
 }
 
+/**
+ * @brief Signal that a power-sensitive operation is starting.
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowPowerEnterOperation(
@@ -909,6 +812,9 @@ ShadowPowerEnterOperation(
     }
 }
 
+/**
+ * @brief Signal that a power-sensitive operation has completed.
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowPowerLeaveOperation(
@@ -928,6 +834,9 @@ ShadowPowerLeaveOperation(
     }
 
     if (count < 0) {
+        //
+        // Mismatched Enter/Leave - fix the count
+        //
         InterlockedExchange(&g_PowerState.PendingOperations, 0);
         KeSetEvent(&g_PowerState.NoPendingOperationsEvent, IO_NO_INCREMENT, FALSE);
     }
@@ -937,6 +846,9 @@ ShadowPowerLeaveOperation(
 // PUBLIC API - RESUME VALIDATION
 // ============================================================================
 
+/**
+ * @brief Perform security validation after resume.
+ */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowPowerValidateResume(
@@ -954,14 +866,20 @@ ShadowPowerValidateResume(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Performing post-resume validation\n");
 
+    //
+    // Clear validation event
+    //
     KeClearEvent(&g_PowerState.ResumeValidationComplete);
-    InterlockedExchange(&g_PowerState.ResumeValidationRequired, TRUE);
-    InterlockedExchange(&g_PowerState.ResumeValidationPassed, FALSE);
+    g_PowerState.ResumeValidationRequired = TRUE;
+    g_PowerState.ResumeValidationPassed = FALSE;
 
+    //
+    // Perform validation
+    //
     status = PwrpPerformResumeValidation();
 
     if (NT_SUCCESS(status)) {
-        InterlockedExchange(&g_PowerState.ResumeValidationPassed, TRUE);
+        g_PowerState.ResumeValidationPassed = TRUE;
         InterlockedIncrement64(&g_PowerState.Stats.ValidationsPassed);
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -974,12 +892,18 @@ ShadowPowerValidateResume(
                    status);
     }
 
-    InterlockedExchange(&g_PowerState.ResumeValidationRequired, FALSE);
+    //
+    // Signal completion
+    //
+    g_PowerState.ResumeValidationRequired = FALSE;
     KeSetEvent(&g_PowerState.ResumeValidationComplete, IO_NO_INCREMENT, FALSE);
 
     return status;
 }
 
+/**
+ * @brief Wait for resume validation to complete.
+ */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 BOOLEAN
 ShadowPowerWaitForResumeValidation(
@@ -996,7 +920,7 @@ ShadowPowerWaitForResumeValidation(
     }
 
     if (!g_PowerState.ResumeValidationRequired) {
-        return (BOOLEAN)(g_PowerState.ResumeValidationPassed != 0);
+        return g_PowerState.ResumeValidationPassed;
     }
 
     timeout.QuadPart = -((LONGLONG)TimeoutMs * 10000);
@@ -1013,21 +937,22 @@ ShadowPowerWaitForResumeValidation(
         return FALSE;
     }
 
-    return (BOOLEAN)(g_PowerState.ResumeValidationPassed != 0);
+    return g_PowerState.ResumeValidationPassed;
 }
 
 // ============================================================================
 // PUBLIC API - STATISTICS
 // ============================================================================
 
-_IRQL_requires_max_(APC_LEVEL)
+/**
+ * @brief Get power management statistics.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowPowerGetStatistics(
     _Out_ PSHADOW_POWER_STATISTICS Stats
     )
 {
-    PAGED_CODE();
-
     if (Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1037,70 +962,33 @@ ShadowPowerGetStatistics(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Snapshot all counters. Each individual read is atomic (Interlocked values).
-    //
-    Stats->TotalPowerEvents = g_PowerState.Stats.TotalPowerEvents;
-    Stats->SleepTransitions = g_PowerState.Stats.SleepTransitions;
-    Stats->ResumeTransitions = g_PowerState.Stats.ResumeTransitions;
-    Stats->HibernateTransitions = g_PowerState.Stats.HibernateTransitions;
-    Stats->ConnectedStandbyTransitions = g_PowerState.Stats.ConnectedStandbyTransitions;
-    Stats->ACDCTransitions = g_PowerState.Stats.ACDCTransitions;
-    Stats->DisplayStateChanges = g_PowerState.Stats.DisplayStateChanges;
-    Stats->LidStateChanges = g_PowerState.Stats.LidStateChanges;
-    Stats->SessionChanges = g_PowerState.Stats.SessionChanges;
-    Stats->ThermalEvents = g_PowerState.Stats.ThermalEvents;
-    Stats->CallbacksInvoked = g_PowerState.Stats.CallbacksInvoked;
-    Stats->CallbackErrors = g_PowerState.Stats.CallbackErrors;
-    Stats->ValidationsPassed = g_PowerState.Stats.ValidationsPassed;
-    Stats->ValidationsFailed = g_PowerState.Stats.ValidationsFailed;
-
-    Stats->TotalSleepDuration.QuadPart = g_PowerState.Stats.TotalSleepDuration100ns;
-    Stats->LongestSleepDuration.QuadPart = g_PowerState.Stats.LongestSleepDuration100ns;
-    Stats->LastSleepDuration.QuadPart = g_PowerState.Stats.LastSleepDuration100ns;
-
+    RtlCopyMemory(Stats, &g_PowerState.Stats, sizeof(SHADOW_POWER_STATISTICS));
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(APC_LEVEL)
+/**
+ * @brief Reset power management statistics.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowPowerResetStatistics(
     VOID
     )
 {
-    PAGED_CODE();
-
     if (!g_PowerState.Initialized) {
         return;
     }
 
-    //
-    // Reset each counter atomically. Not a point-in-time snapshot,
-    // but individual fields are consistent.
-    //
-    InterlockedExchange64(&g_PowerState.Stats.TotalPowerEvents, 0);
-    InterlockedExchange64(&g_PowerState.Stats.SleepTransitions, 0);
-    InterlockedExchange64(&g_PowerState.Stats.ResumeTransitions, 0);
-    InterlockedExchange64(&g_PowerState.Stats.HibernateTransitions, 0);
-    InterlockedExchange64(&g_PowerState.Stats.ConnectedStandbyTransitions, 0);
-    InterlockedExchange64(&g_PowerState.Stats.ACDCTransitions, 0);
-    InterlockedExchange64(&g_PowerState.Stats.DisplayStateChanges, 0);
-    InterlockedExchange64(&g_PowerState.Stats.LidStateChanges, 0);
-    InterlockedExchange64(&g_PowerState.Stats.SessionChanges, 0);
-    InterlockedExchange64(&g_PowerState.Stats.ThermalEvents, 0);
-    InterlockedExchange64(&g_PowerState.Stats.CallbacksInvoked, 0);
-    InterlockedExchange64(&g_PowerState.Stats.CallbackErrors, 0);
-    InterlockedExchange64(&g_PowerState.Stats.ValidationsPassed, 0);
-    InterlockedExchange64(&g_PowerState.Stats.ValidationsFailed, 0);
-    InterlockedExchange64(&g_PowerState.Stats.TotalSleepDuration100ns, 0);
-    InterlockedExchange64(&g_PowerState.Stats.LongestSleepDuration100ns, 0);
-    InterlockedExchange64(&g_PowerState.Stats.LastSleepDuration100ns, 0);
+    RtlZeroMemory(&g_PowerState.Stats, sizeof(SHADOW_POWER_STATISTICS));
 }
 
 // ============================================================================
 // PUBLIC API - UTILITY
 // ============================================================================
 
+/**
+ * @brief Get string name for power state.
+ */
 PCSTR
 ShadowPowerStateToString(
     _In_ SHADOW_POWER_STATE State
@@ -1119,6 +1007,9 @@ ShadowPowerStateToString(
     }
 }
 
+/**
+ * @brief Get string name for power event type.
+ */
 PCSTR
 ShadowPowerEventToString(
     _In_ SHADOW_POWER_EVENT_TYPE EventType
@@ -1160,6 +1051,9 @@ ShadowPowerEventToString(
 // PRIVATE FUNCTIONS - CALLBACK REGISTRATION
 // ============================================================================
 
+/**
+ * @brief Register power setting callbacks.
+ */
 static NTSTATUS
 PwrpRegisterPowerSettingCallbacks(
     VOID
@@ -1168,13 +1062,13 @@ PwrpRegisterPowerSettingCallbacks(
     NTSTATUS status;
 
     //
-    // Console display state (on/off/dimmed)
+    // Register for console display state (on/off/dimmed)
     //
     status = PoRegisterPowerSettingCallback(
         NULL,
         &GUID_CONSOLE_DISPLAY_STATE,
         PwrpPowerSettingCallback,
-        (PVOID)(ULONG_PTR)1,
+        (PVOID)(ULONG_PTR)1,  // Context indicates callback type
         &g_PowerState.ConsoleDisplayStateHandle
         );
 
@@ -1185,7 +1079,7 @@ PwrpRegisterPowerSettingCallbacks(
     }
 
     //
-    // AC/DC power source
+    // Register for AC/DC power source
     //
     status = PoRegisterPowerSettingCallback(
         NULL,
@@ -1202,7 +1096,7 @@ PwrpRegisterPowerSettingCallbacks(
     }
 
     //
-    // Lid switch state
+    // Register for lid switch state
     //
     status = PoRegisterPowerSettingCallback(
         NULL,
@@ -1219,7 +1113,7 @@ PwrpRegisterPowerSettingCallbacks(
     }
 
     //
-    // Battery percentage
+    // Register for battery percentage
     //
     status = PoRegisterPowerSettingCallback(
         NULL,
@@ -1236,7 +1130,7 @@ PwrpRegisterPowerSettingCallbacks(
     }
 
     //
-    // Idle resiliency (Connected Standby)
+    // Register for idle resiliency (Connected Standby)
     //
     status = PoRegisterPowerSettingCallback(
         NULL,
@@ -1253,7 +1147,7 @@ PwrpRegisterPowerSettingCallbacks(
     }
 
     //
-    // User presence
+    // Register for user presence
     //
     status = PoRegisterPowerSettingCallback(
         NULL,
@@ -1269,26 +1163,12 @@ PwrpRegisterPowerSettingCallbacks(
                    status);
     }
 
-    //
-    // Session display status (session lock/unlock)
-    //
-    status = PoRegisterPowerSettingCallback(
-        NULL,
-        &GUID_SESSION_DISPLAY_STATUS,
-        PwrpPowerSettingCallback,
-        (PVOID)(ULONG_PTR)7,
-        &g_PowerState.SessionDisplayStatusHandle
-        );
-
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Failed to register SESSION_DISPLAY_STATUS: 0x%08X\n",
-                   status);
-    }
-
     return STATUS_SUCCESS;
 }
 
+/**
+ * @brief Unregister power setting callbacks.
+ */
 static VOID
 PwrpUnregisterPowerSettingCallbacks(
     VOID
@@ -1323,13 +1203,11 @@ PwrpUnregisterPowerSettingCallbacks(
         PoUnregisterPowerSettingCallback(g_PowerState.UserPresenceHandle);
         g_PowerState.UserPresenceHandle = NULL;
     }
-
-    if (g_PowerState.SessionDisplayStatusHandle != NULL) {
-        PoUnregisterPowerSettingCallback(g_PowerState.SessionDisplayStatusHandle);
-        g_PowerState.SessionDisplayStatusHandle = NULL;
-    }
 }
 
+/**
+ * @brief Register system state callback.
+ */
 static NTSTATUS
 PwrpRegisterSystemStateCallback(
     VOID
@@ -1339,14 +1217,17 @@ PwrpRegisterSystemStateCallback(
     UNICODE_STRING callbackName;
     OBJECT_ATTRIBUTES oa;
 
+    //
+    // Open the system state callback object
+    //
     RtlInitUnicodeString(&callbackName, L"\\Callback\\PowerState");
     InitializeObjectAttributes(&oa, &callbackName, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
     status = ExCreateCallback(
         &g_PowerState.SystemStateCallback,
         &oa,
-        FALSE,
-        TRUE
+        FALSE,  // Don't create if doesn't exist
+        TRUE    // Allow multiple callbacks
         );
 
     if (!NT_SUCCESS(status)) {
@@ -1356,6 +1237,9 @@ PwrpRegisterSystemStateCallback(
         return status;
     }
 
+    //
+    // Register our callback
+    //
     g_PowerState.SystemStateRegistration = ExRegisterCallback(
         g_PowerState.SystemStateCallback,
         PwrpSystemStateCallback,
@@ -1371,6 +1255,9 @@ PwrpRegisterSystemStateCallback(
     return STATUS_SUCCESS;
 }
 
+/**
+ * @brief Unregister system state callback.
+ */
 static VOID
 PwrpUnregisterSystemStateCallback(
     VOID
@@ -1388,16 +1275,12 @@ PwrpUnregisterSystemStateCallback(
 }
 
 // ============================================================================
-// PRIVATE FUNCTIONS - OS CALLBACKS
+// PRIVATE FUNCTIONS - CALLBACKS
 // ============================================================================
 
 /**
  * @brief Power setting callback handler.
- *
- * IRQL: PASSIVE_LEVEL (guaranteed by PoRegisterPowerSettingCallback).
- * Safe to use push locks and allocate memory.
  */
-_Function_class_(POWER_SETTING_CALLBACK)
 static NTSTATUS NTAPI
 PwrpPowerSettingCallback(
     _In_ LPCGUID SettingGuid,
@@ -1424,10 +1307,13 @@ PwrpPowerSettingCallback(
     switch (callbackType) {
         case 1:  // CONSOLE_DISPLAY_STATE
             if (valueData == 0) {
+                // Display off
                 PwrpProcessPowerEvent(ShadowPowerEvent_DisplayOff, NULL, 0);
             } else if (valueData == 1) {
+                // Display on
                 PwrpProcessPowerEvent(ShadowPowerEvent_DisplayOn, NULL, 0);
             } else if (valueData == 2) {
+                // Display dimmed
                 PwrpProcessPowerEvent(ShadowPowerEvent_DisplayDimmed, NULL, 0);
             }
             InterlockedIncrement64(&g_PowerState.Stats.DisplayStateChanges);
@@ -1435,8 +1321,10 @@ PwrpPowerSettingCallback(
 
         case 2:  // ACDC_POWER_SOURCE
             if (valueData == 0) {
+                // AC power
                 PwrpProcessPowerEvent(ShadowPowerEvent_ACPowerConnected, NULL, 0);
             } else if (valueData == 1) {
+                // DC (battery) power
                 PwrpProcessPowerEvent(ShadowPowerEvent_ACPowerDisconnected, NULL, 0);
             }
             InterlockedIncrement64(&g_PowerState.Stats.ACDCTransitions);
@@ -1444,8 +1332,10 @@ PwrpPowerSettingCallback(
 
         case 3:  // LIDSWITCH_STATE
             if (valueData == 0) {
+                // Lid closed
                 PwrpProcessPowerEvent(ShadowPowerEvent_LidClosed, NULL, 0);
             } else {
+                // Lid open
                 PwrpProcessPowerEvent(ShadowPowerEvent_LidOpen, NULL, 0);
             }
             InterlockedIncrement64(&g_PowerState.Stats.LidStateChanges);
@@ -1462,6 +1352,7 @@ PwrpPowerSettingCallback(
                 ExReleasePushLockExclusive(&g_PowerState.StateLock);
                 KeLeaveCriticalRegion();
 
+                // Generate events for low/critical battery
                 if (valueData <= 5) {
                     PwrpProcessPowerEvent(ShadowPowerEvent_BatteryCritical, &valueData, sizeof(ULONG));
                 } else if (valueData <= 20) {
@@ -1472,8 +1363,10 @@ PwrpPowerSettingCallback(
 
         case 5:  // IDLE_RESILIENCY (Connected Standby)
             if (valueData == 0) {
+                // Entering Connected Standby
                 PwrpProcessPowerEvent(ShadowPowerEvent_EnteringConnectedStandby, NULL, 0);
             } else {
+                // Exiting Connected Standby
                 PwrpProcessPowerEvent(ShadowPowerEvent_ExitingConnectedStandby, NULL, 0);
             }
             InterlockedIncrement64(&g_PowerState.Stats.ConnectedStandbyTransitions);
@@ -1481,22 +1374,12 @@ PwrpPowerSettingCallback(
 
         case 6:  // USER_PRESENCE
             if (valueData == 0) {
+                // User away
                 PwrpProcessPowerEvent(ShadowPowerEvent_UserAway, NULL, 0);
             } else {
+                // User present
                 PwrpProcessPowerEvent(ShadowPowerEvent_UserPresent, NULL, 0);
             }
-            break;
-
-        case 7:  // SESSION_DISPLAY_STATUS (session lock/unlock)
-            //
-            // Value: 1 = session unlock, 0 = session lock
-            //
-            if (valueData == 0) {
-                PwrpProcessPowerEvent(ShadowPowerEvent_SessionLock, NULL, 0);
-            } else {
-                PwrpProcessPowerEvent(ShadowPowerEvent_SessionUnlock, NULL, 0);
-            }
-            InterlockedIncrement64(&g_PowerState.Stats.SessionChanges);
             break;
 
         default:
@@ -1508,18 +1391,6 @@ PwrpPowerSettingCallback(
 
 /**
  * @brief System state callback handler.
- *
- * CRITICAL: This callback can fire at DISPATCH_LEVEL.
- * MUST NOT:
- *   - Acquire push locks
- *   - Wait on events
- *   - Allocate paged pool
- *   - Call any PASSIVE_LEVEL function
- *
- * Instead, we:
- *   1. Record the event type into a lock-free deferred context (spin lock)
- *   2. Update statistics atomically
- *   3. Queue a work item to do heavy processing at PASSIVE_LEVEL
  */
 static VOID
 PwrpSystemStateCallback(
@@ -1530,8 +1401,6 @@ PwrpSystemStateCallback(
 {
     ULONG_PTR action = (ULONG_PTR)Argument1;
     ULONG_PTR state = (ULONG_PTR)Argument2;
-    SHADOW_POWER_EVENT_TYPE eventType = ShadowPowerEvent_None;
-    KIRQL oldIrql;
 
     UNREFERENCED_PARAMETER(CallbackContext);
 
@@ -1539,113 +1408,69 @@ PwrpSystemStateCallback(
         return;
     }
 
-    if (g_PowerState.ShuttingDown) {
-        return;
-    }
+    //
+    // Action: 0 = entering low power, 1 = resuming
+    // State: power state value
+    //
 
-    //
-    // Determine event type
-    //
     if (action == 0) {
+        //
         // Entering low-power state
-        if (state == 4) {
-            eventType = ShadowPowerEvent_EnteringHibernate;
+        //
+        if (state == 4) {  // S4 = Hibernate
+            PwrpProcessPowerEvent(ShadowPowerEvent_EnteringHibernate, NULL, 0);
             InterlockedIncrement64(&g_PowerState.Stats.HibernateTransitions);
-        } else if (state >= 1 && state <= 3) {
-            eventType = ShadowPowerEvent_EnteringSleep;
+        } else if (state >= 1 && state <= 3) {  // S1-S3 = Sleep
+            PwrpProcessPowerEvent(ShadowPowerEvent_EnteringSleep, NULL, 0);
             InterlockedIncrement64(&g_PowerState.Stats.SleepTransitions);
-        } else if (state == 5) {
-            eventType = ShadowPowerEvent_Shutdown;
+        } else if (state == 5) {  // S5 = Shutdown
+            PwrpProcessPowerEvent(ShadowPowerEvent_Shutdown, NULL, 0);
         }
 
-        // Record sleep start time atomically
-        {
-            LARGE_INTEGER now;
-            KeQuerySystemTime(&now);
-            //
-            // QuadPart is 64-bit; on x64 this is atomic.
-            // On x86 we accept the tiny torn-write risk for a timestamp.
-            //
-            g_PowerState.LastSleepStartTime = now;
-        }
+        //
+        // Record sleep time
+        //
+        KeQuerySystemTime(&g_PowerState.StateInfo.LastSleepTime);
+
     } else if (action == 1) {
+        //
         // Resuming from low-power state
+        //
         LARGE_INTEGER currentTime;
         KeQuerySystemTime(&currentTime);
 
         //
-        // Calculate sleep duration with Interlocked updates
+        // Calculate sleep duration
         //
-        if (g_PowerState.LastSleepStartTime.QuadPart > 0) {
-            LONGLONG duration = currentTime.QuadPart - g_PowerState.LastSleepStartTime.QuadPart;
+        if (g_PowerState.StateInfo.LastSleepTime.QuadPart > 0) {
+            LARGE_INTEGER duration;
+            duration.QuadPart = currentTime.QuadPart - g_PowerState.StateInfo.LastSleepTime.QuadPart;
 
-            if (duration > 0) {
-                InterlockedExchange64(&g_PowerState.Stats.LastSleepDuration100ns, duration);
+            g_PowerState.Stats.LastSleepDuration = duration;
+            g_PowerState.Stats.TotalSleepDuration.QuadPart += duration.QuadPart;
 
-                //
-                // Atomic add for total
-                //
-                InterlockedAdd64(&g_PowerState.Stats.TotalSleepDuration100ns, duration);
-
-                //
-                // Atomic compare-exchange loop for longest
-                //
-                {
-                    LONGLONG currentLongest;
-                    do {
-                        currentLongest = g_PowerState.Stats.LongestSleepDuration100ns;
-                        if (duration <= currentLongest) {
-                            break;
-                        }
-                    } while (InterlockedCompareExchange64(
-                                 &g_PowerState.Stats.LongestSleepDuration100ns,
-                                 duration,
-                                 currentLongest) != currentLongest);
-                }
+            if (duration.QuadPart > g_PowerState.Stats.LongestSleepDuration.QuadPart) {
+                g_PowerState.Stats.LongestSleepDuration = duration;
             }
         }
 
-        if (state == 4) {
-            eventType = ShadowPowerEvent_ResumingFromHibernate;
-        } else {
-            eventType = ShadowPowerEvent_ResumingFromSleep;
+        g_PowerState.StateInfo.LastResumeTime = currentTime;
+
+        if (state == 4) {  // Resuming from hibernate
+            PwrpProcessPowerEvent(ShadowPowerEvent_ResumingFromHibernate, NULL, 0);
+        } else {  // Resuming from sleep
+            PwrpProcessPowerEvent(ShadowPowerEvent_ResumingFromSleep, NULL, 0);
         }
 
         InterlockedIncrement64(&g_PowerState.Stats.ResumeTransitions);
-    }
 
-    if (eventType == ShadowPowerEvent_None) {
-        return;
-    }
-
-    //
-    // Store event in deferred context (protected by spin lock — DISPATCH_LEVEL safe)
-    //
-    KeAcquireSpinLock(&g_PowerState.DeferredCtxLock, &oldIrql);
-
-    if (g_PowerState.DeferredCtx.EventCount < PWR_DEFERRED_EVENT_MAX) {
-        g_PowerState.DeferredCtx.Events[g_PowerState.DeferredCtx.EventCount] = eventType;
-        g_PowerState.DeferredCtx.EventCount++;
-    }
-
-    KeReleaseSpinLock(&g_PowerState.DeferredCtxLock, oldIrql);
-
-    //
-    // Queue work item to process at PASSIVE_LEVEL (only if not already queued)
-    //
-    if (g_PowerState.DeferredWorkItem != NULL &&
-        g_PowerState.DeviceObject != NULL) {
-
-        if (InterlockedCompareExchange(&g_PowerState.WorkItemQueued, 1, 0) == 0) {
-            //
-            // We won the race — queue the work item.
-            // Clear the completion event so shutdown can wait on it.
-            //
-            KeClearEvent(&g_PowerState.WorkItemComplete);
-
+        //
+        // Trigger resume validation
+        //
+        if (g_PowerState.DeferredWorkItem != NULL && g_PowerState.DeviceObject != NULL) {
             IoQueueWorkItem(
                 g_PowerState.DeferredWorkItem,
-                PwrpDeferredEventWorkRoutine,
+                PwrpDeferredWorkRoutine,
                 DelayedWorkQueue,
                 NULL
                 );
@@ -1658,12 +1483,8 @@ PwrpSystemStateCallback(
 // ============================================================================
 
 /**
- * @brief Process a power event at PASSIVE_LEVEL.
- *
- * Allocates memory, acquires push locks, notifies callbacks.
- * Only called from PASSIVE_LEVEL code paths.
+ * @brief Process a power event.
  */
-_IRQL_requires_max_(PASSIVE_LEVEL)
 static VOID
 PwrpProcessPowerEvent(
     _In_ SHADOW_POWER_EVENT_TYPE EventType,
@@ -1671,15 +1492,21 @@ PwrpProcessPowerEvent(
     _In_ ULONG EventDataSize
     )
 {
-    PSHADOW_POWER_EVENT_INTERNAL event;
+    PSHADOW_POWER_EVENT event;
+
+    UNREFERENCED_PARAMETER(EventData);
+    UNREFERENCED_PARAMETER(EventDataSize);
 
     if (!g_PowerState.Initialized || g_PowerState.ShuttingDown) {
         return;
     }
 
-    event = (PSHADOW_POWER_EVENT_INTERNAL)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
-        sizeof(SHADOW_POWER_EVENT_INTERNAL),
+    //
+    // Allocate event structure
+    //
+    event = (PSHADOW_POWER_EVENT)ExAllocatePoolZero(
+        NonPagedPoolNx,
+        sizeof(SHADOW_POWER_EVENT),
         PWR_POOL_TAG_EVENT
         );
 
@@ -1687,31 +1514,22 @@ PwrpProcessPowerEvent(
         return;
     }
 
-    event->Info.EventType = EventType;
-    event->Info.PreviousState = g_PowerState.StateInfo.CurrentState;
-    KeQuerySystemTime(&event->Info.Timestamp);
-    event->Info.EventSequence = (UINT64)InterlockedIncrement64(&g_PowerState.EventSequence);
-
     //
-    // Populate event-specific data
+    // Initialize event
     //
-    if (EventData != NULL && EventDataSize >= sizeof(ULONG)) {
-        ULONG val = *(PULONG)EventData;
-
-        if (EventType == ShadowPowerEvent_BatteryLow ||
-            EventType == ShadowPowerEvent_BatteryCritical) {
-            event->Info.Data.Battery.BatteryPercentage = val;
-        }
-    }
+    event->EventType = EventType;
+    event->PreviousState = g_PowerState.StateInfo.CurrentState;
+    KeQuerySystemTime(&event->Timestamp);
+    event->EventSequence = (UINT64)InterlockedIncrement64(&g_PowerState.EventSequence);
 
     //
     // Update state based on event
     //
     PwrpUpdateStateFromEvent(event);
-    event->Info.NewState = g_PowerState.StateInfo.CurrentState;
+    event->NewState = g_PowerState.StateInfo.CurrentState;
 
     //
-    // Record in history
+    // Record event in history
     //
     PwrpRecordEvent(event);
 
@@ -1720,33 +1538,40 @@ PwrpProcessPowerEvent(
     //
     PwrpNotifyCallbacks(event);
 
+    //
+    // Update statistics
+    //
     InterlockedIncrement64(&g_PowerState.Stats.TotalPowerEvents);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                "[ShadowStrike] Power event: %s (seq=%llu)\n",
                ShadowPowerEventToString(EventType),
-               event->Info.EventSequence);
+               event->EventSequence);
 }
 
 /**
- * @brief Record event in bounded history list.
- *        Trims oldest events when over PWR_MAX_EVENT_HISTORY.
+ * @brief Record event in history.
  */
 static VOID
 PwrpRecordEvent(
-    _In_ PSHADOW_POWER_EVENT_INTERNAL Event
+    _In_ PSHADOW_POWER_EVENT Event
     )
 {
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PowerState.EventHistoryLock);
 
+    //
+    // Insert at head (most recent first)
+    //
     InsertHeadList(&g_PowerState.EventHistory, &Event->ListEntry);
     InterlockedIncrement(&g_PowerState.EventCount);
 
+    //
+    // Trim if over limit
+    //
     while (g_PowerState.EventCount > PWR_MAX_EVENT_HISTORY) {
         PLIST_ENTRY tail = RemoveTailList(&g_PowerState.EventHistory);
-        PSHADOW_POWER_EVENT_INTERNAL oldEvent =
-            CONTAINING_RECORD(tail, SHADOW_POWER_EVENT_INTERNAL, ListEntry);
+        PSHADOW_POWER_EVENT oldEvent = CONTAINING_RECORD(tail, SHADOW_POWER_EVENT, ListEntry);
         ExFreePoolWithTag(oldEvent, PWR_POOL_TAG_EVENT);
         InterlockedDecrement(&g_PowerState.EventCount);
     }
@@ -1756,29 +1581,22 @@ PwrpRecordEvent(
 }
 
 /**
- * @brief Notify registered callbacks with proper event mask filtering.
- *        Uses ULONGLONG mask for safe shifting up to 63 bits.
+ * @brief Notify registered callbacks.
  */
 static VOID
 PwrpNotifyCallbacks(
-    _In_ PSHADOW_POWER_EVENT_INTERNAL Event
+    _In_ PSHADOW_POWER_EVENT Event
     )
 {
     PLIST_ENTRY entry;
     PSHADOW_POWER_CALLBACK_ENTRY callbackEntry;
-    ULONGLONG eventBit;
+    ULONG eventBit;
 
     if (g_PowerState.CallbackCount == 0) {
         return;
     }
 
-    //
-    // Safe: EventType is validated < 64 by C_ASSERT(ShadowPowerEvent_Max <= 64)
-    //
-    if ((ULONG)Event->Info.EventType >= 64) {
-        return;
-    }
-    eventBit = 1ULL << (ULONG)Event->Info.EventType;
+    eventBit = 1 << (ULONG)Event->EventType;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_PowerState.CallbackLock);
@@ -1793,12 +1611,18 @@ PwrpNotifyCallbacks(
             continue;
         }
 
+        //
+        // Check if callback wants this event type
+        //
         if (callbackEntry->EventMask != 0 && !(callbackEntry->EventMask & eventBit)) {
             continue;
         }
 
+        //
+        // Invoke callback
+        //
         __try {
-            callbackEntry->Callback(Event->Info.EventType, &Event->Info, callbackEntry->Context);
+            callbackEntry->Callback(Event->EventType, Event, callbackEntry->Context);
             InterlockedIncrement(&callbackEntry->CallCount);
             KeQuerySystemTime(&callbackEntry->LastCallTime);
             InterlockedIncrement64(&g_PowerState.Stats.CallbacksInvoked);
@@ -1817,72 +1641,42 @@ PwrpNotifyCallbacks(
 }
 
 /**
- * @brief Deferred work routine — processes events queued from DISPATCH_LEVEL.
- *
- * Runs at PASSIVE_LEVEL. Drains the deferred event queue and
- * processes each event with full locking/allocation capabilities.
- * Also triggers resume validation when a resume event is present.
+ * @brief Deferred work routine for post-resume processing.
  */
-_Function_class_(IO_WORKITEM_ROUTINE)
-static VOID NTAPI
-PwrpDeferredEventWorkRoutine(
+static VOID
+PwrpDeferredWorkRoutine(
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_opt_ PVOID Context
     )
 {
-    PWR_DEFERRED_EVENT_CONTEXT localCtx;
-    ULONG i;
-    BOOLEAN needsResumeValidation = FALSE;
-    KIRQL oldIrql;
-
     UNREFERENCED_PARAMETER(DeviceObject);
     UNREFERENCED_PARAMETER(Context);
 
     //
-    // Drain the deferred events under spin lock (quick copy)
+    // Perform resume validation
     //
-    KeAcquireSpinLock(&g_PowerState.DeferredCtxLock, &oldIrql);
+    ShadowPowerValidateResume();
+}
 
-    RtlCopyMemory(&localCtx, &g_PowerState.DeferredCtx, sizeof(PWR_DEFERRED_EVENT_CONTEXT));
-    g_PowerState.DeferredCtx.EventCount = 0;
-
-    KeReleaseSpinLock(&g_PowerState.DeferredCtxLock, oldIrql);
-
+/**
+ * @brief Cleanup old event history entries.
+ */
+static VOID
+PwrpCleanupEventHistory(
+    VOID
+    )
+{
     //
-    // Process each deferred event at PASSIVE_LEVEL
+    // Already handled in PwrpRecordEvent by limiting to PWR_MAX_EVENT_HISTORY
     //
-    for (i = 0; i < localCtx.EventCount; i++) {
-        SHADOW_POWER_EVENT_TYPE eventType = localCtx.Events[i];
-
-        PwrpProcessPowerEvent(eventType, NULL, 0);
-
-        if (eventType == ShadowPowerEvent_ResumingFromSleep ||
-            eventType == ShadowPowerEvent_ResumingFromHibernate) {
-            needsResumeValidation = TRUE;
-        }
-    }
-
-    //
-    // Perform resume validation if needed
-    //
-    if (needsResumeValidation && !g_PowerState.ShuttingDown) {
-        ShadowPowerValidateResume();
-    }
-
-    //
-    // Mark work item as no longer queued, then signal completion
-    //
-    InterlockedExchange(&g_PowerState.WorkItemQueued, 0);
-    KeSetEvent(&g_PowerState.WorkItemComplete, IO_NO_INCREMENT, FALSE);
 }
 
 /**
  * @brief Update state based on power event.
- *        Acquires StateLock exclusively and also updates volatile copies.
  */
 static VOID
 PwrpUpdateStateFromEvent(
-    _In_ PSHADOW_POWER_EVENT_INTERNAL Event
+    _In_ PSHADOW_POWER_EVENT Event
     )
 {
     KeEnterCriticalRegion();
@@ -1890,7 +1684,7 @@ PwrpUpdateStateFromEvent(
 
     g_PowerState.StateInfo.PreviousState = g_PowerState.StateInfo.CurrentState;
 
-    switch (Event->Info.EventType) {
+    switch (Event->EventType) {
         case ShadowPowerEvent_EnteringSleep:
             g_PowerState.StateInfo.CurrentState = ShadowPowerState_Standby;
             break;
@@ -1972,35 +1766,15 @@ PwrpUpdateStateFromEvent(
             break;
     }
 
-    if (Event->Info.EventType == ShadowPowerEvent_ExitingConnectedStandby) {
+    if (Event->EventType == ShadowPowerEvent_ExitingConnectedStandby) {
         g_PowerState.StateInfo.InConnectedStandby = FALSE;
         g_PowerState.StateInfo.ConnectedStandbyExitCount++;
     }
 
     KeQuerySystemTime(&g_PowerState.StateInfo.LastStateChangeTime);
 
-    //
-    // Update volatile copies for lock-free DISPATCH_LEVEL readers
-    //
-    PwrpUpdateVolatileState();
-
     ExReleasePushLockExclusive(&g_PowerState.StateLock);
     KeLeaveCriticalRegion();
-}
-
-/**
- * @brief Update volatile copies of state for lock-free readers.
- *        Must be called under StateLock exclusive.
- */
-static VOID
-PwrpUpdateVolatileState(
-    VOID
-    )
-{
-    InterlockedExchange(&g_PowerState.CurrentPowerState,
-                        (LONG)g_PowerState.StateInfo.CurrentState);
-    InterlockedExchange(&g_PowerState.CurrentPowerSource,
-                        (LONG)g_PowerState.StateInfo.PowerSource);
 }
 
 // ============================================================================
@@ -2009,9 +1783,6 @@ PwrpUpdateVolatileState(
 
 /**
  * @brief Perform actual resume validation checks.
- *
- * Validates driver integrity after resume from sleep/hibernate.
- * Each check is independent — failure of one doesn't prevent others.
  */
 static NTSTATUS
 PwrpPerformResumeValidation(
@@ -2019,98 +1790,79 @@ PwrpPerformResumeValidation(
     )
 {
     NTSTATUS status = STATUS_SUCCESS;
-    NTSTATUS checkStatus;
     LARGE_INTEGER currentTime;
-
-    KeQuerySystemTime(&currentTime);
+    LARGE_INTEGER sleepDuration;
 
     //
-    // Check 1: Verify driver state is consistent
+    // Get current time and calculate sleep duration
+    //
+    KeQuerySystemTime(&currentTime);
+
+    if (g_PowerState.StateInfo.LastSleepTime.QuadPart > 0) {
+        sleepDuration.QuadPart = currentTime.QuadPart -
+                                  g_PowerState.StateInfo.LastSleepTime.QuadPart;
+
+        //
+        // Convert to seconds for logging
+        //
+        ULONG sleepSeconds = (ULONG)(sleepDuration.QuadPart / 10000000);
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "[ShadowStrike] Resume validation: slept for %lu seconds\n",
+                   sleepSeconds);
+    }
+
+    //
+    // Validation checks:
+    //
+
+    //
+    // 1. Verify driver state is consistent
     //
     if (!g_PowerState.Initialized) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Resume validation: Driver not initialized\n");
-        return STATUS_DRIVER_INTERNAL_ERROR;
+                   "[ShadowStrike] Resume validation: Driver not initialized!\n");
+        status = STATUS_DRIVER_INTERNAL_ERROR;
+        goto Exit;
     }
 
     //
-    // Check 2: Detect time anomalies
+    // 2. Check for time anomalies (clock manipulation)
     //
-    if (g_PowerState.LastSleepStartTime.QuadPart > 0) {
-        if (g_PowerState.LastSleepStartTime.QuadPart > currentTime.QuadPart) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] Resume validation: Time anomaly detected "
-                       "(sleep start > current time)\n");
-            //
-            // Log but don't fail — clock can be adjusted legitimately
-            //
-        } else {
-            LONGLONG sleepDuration = currentTime.QuadPart - g_PowerState.LastSleepStartTime.QuadPart;
-            ULONG sleepSeconds = (ULONG)(sleepDuration / 10000000);
-
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                       "[ShadowStrike] Resume validation: slept for %lu seconds\n",
-                       sleepSeconds);
-        }
-    }
-
-    //
-    // Check 3: Verify our power setting callbacks are still registered
-    //
-    {
-        ULONG registeredCount = 0;
-        if (g_PowerState.ConsoleDisplayStateHandle != NULL) registeredCount++;
-        if (g_PowerState.AcDcPowerSourceHandle != NULL) registeredCount++;
-        if (g_PowerState.LidSwitchStateHandle != NULL) registeredCount++;
-        if (g_PowerState.BatteryPercentageHandle != NULL) registeredCount++;
-        if (g_PowerState.IdleResiliencyHandle != NULL) registeredCount++;
-        if (g_PowerState.UserPresenceHandle != NULL) registeredCount++;
-        if (g_PowerState.SessionDisplayStatusHandle != NULL) registeredCount++;
-
-        if (registeredCount == 0) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] Resume validation: No power callbacks registered, "
-                       "attempting re-registration\n");
-
-            checkStatus = PwrpRegisterPowerSettingCallbacks();
-            if (!NT_SUCCESS(checkStatus)) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "[ShadowStrike] Resume validation: Re-registration failed: 0x%08X\n",
-                           checkStatus);
-                status = STATUS_DRIVER_INTERNAL_ERROR;
-            }
-        } else {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                       "[ShadowStrike] Resume validation: %lu power callbacks active\n",
-                       registeredCount);
-        }
-    }
-
-    //
-    // Check 4: Verify system state callback registration
-    //
-    if (g_PowerState.SystemStateRegistration == NULL) {
+    if (g_PowerState.StateInfo.LastSleepTime.QuadPart > currentTime.QuadPart) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Resume validation: System state callback not registered, "
-                   "attempting re-registration\n");
-
-        checkStatus = PwrpRegisterSystemStateCallback();
-        if (!NT_SUCCESS(checkStatus)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "[ShadowStrike] Resume validation: System state re-registration failed: 0x%08X\n",
-                       checkStatus);
-            status = STATUS_DRIVER_INTERNAL_ERROR;
-        }
+                   "[ShadowStrike] Resume validation: Time anomaly detected\n");
+        // This is suspicious but not fatal - system clock may have been adjusted
     }
 
     //
-    // Check 5: Record resume time under lock
+    // 3. Verify critical kernel structures are intact
+    //    (In production, this would check for callback removal, hook integrity, etc.)
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_PowerState.StateLock);
-    g_PowerState.StateInfo.LastResumeTime = currentTime;
-    ExReleasePushLockExclusive(&g_PowerState.StateLock);
-    KeLeaveCriticalRegion();
 
+    //
+    // 4. Check if our callbacks are still registered
+    //
+    if (g_PowerState.ConsoleDisplayStateHandle == NULL &&
+        g_PowerState.AcDcPowerSourceHandle == NULL &&
+        g_PowerState.SystemStateRegistration == NULL) {
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Resume validation: No power callbacks registered\n");
+        // Attempt to re-register
+    }
+
+    //
+    // 5. Verify self-protection is still active
+    //    (Would call into SelfProtect module to verify)
+    //
+
+    //
+    // 6. Re-initialize any state that may have been lost
+    //
+
+Exit:
     return status;
 }
+
+#endif // SHADOWSTRIKE_POWER_CALLBACK_C

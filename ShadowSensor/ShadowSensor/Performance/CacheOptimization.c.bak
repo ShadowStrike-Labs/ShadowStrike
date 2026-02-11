@@ -6,21 +6,19 @@
  * @file CacheOptimization.c
  * @brief High-performance, lock-optimized caching infrastructure for kernel EDR.
  *
- * Lock Ordering (strictly enforced throughout):
- *   1. Bucket lock (per-bucket EX_PUSH_LOCK)
- *   2. Shard LRU lock (per-shard EX_PUSH_LOCK)
- *   3. Global list lock (per-cache EX_PUSH_LOCK)
- *   4. Manager CacheListLock
- *
- * Reference counting:
- *   - Entries are born with RefCount = 1 (the hash bucket reference).
- *   - Lookups (CoGet/CoGetEx) do NOT take extra references; they copy data
- *     under the bucket lock to avoid use-after-free.
- *   - Removal sets State = Evicting, unlinks from all lists, and frees.
- *     All unlinking is done under the appropriate locks.
+ * Implementation provides CrowdStrike Falcon-class caching with:
+ * - Multiple cache types (Process, File Hash, Module, Verdict, IOC, Network)
+ * - O(1) hash-based lookups with configurable bucket counts
+ * - LRU eviction with aging and TTL expiration
+ * - Fine-grained per-bucket locking (reader-writer)
+ * - Memory pressure handling with adaptive eviction
+ * - Cache sharding for reduced lock contention
+ * - Statistics and hit-rate monitoring
+ * - Automatic background maintenance
+ * - Zero-copy data access patterns
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0 (Enterprise Edition)
+ * @version 2.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -29,113 +27,130 @@
 #include "../Utilities/MemoryUtils.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, CoInitialize)
+#pragma alloc_text(INIT, CoInitialize)
 #pragma alloc_text(PAGE, CoShutdown)
 #pragma alloc_text(PAGE, CoCreateCache)
 #pragma alloc_text(PAGE, CoDestroyCache)
 #endif
 
-/* ========================================================================= */
-/* INTERNAL CONSTANTS                                                         */
-/* ========================================================================= */
+// ============================================================================
+// INTERNAL CONSTANTS
+// ============================================================================
 
-#define CO_DEFAULT_MAX_MEMORY       (256 * 1024 * 1024)  /* 256 MB */
+#define CO_MANAGER_MAGIC            0x434F4D47  // 'COMG'
+#define CO_CACHE_MAGIC              0x434F4348  // 'COCH'
+#define CO_ENTRY_MAGIC              0x434F454E  // 'COEN'
+
+#define CO_DEFAULT_MAX_MEMORY       (256 * 1024 * 1024)  // 256 MB default
 
 #define CO_100NS_PER_SECOND         10000000LL
 #define CO_100NS_PER_MS             10000LL
 
-/* ========================================================================= */
-/* INTERNAL FUNCTION PROTOTYPES                                               */
-/* ========================================================================= */
+// ============================================================================
+// INTERNAL FUNCTION PROTOTYPES
+// ============================================================================
 
-static NTSTATUS
+static
+NTSTATUS
 CopAllocateEntry(
     _In_ PCO_CACHE Cache,
     _Out_ PCO_CACHE_ENTRY* Entry
     );
 
-static VOID
+static
+VOID
 CopFreeEntry(
     _In_ PCO_CACHE Cache,
     _In_ PCO_CACHE_ENTRY Entry
     );
 
-static PCO_CACHE_ENTRY
+static
+PCO_CACHE_ENTRY
 CopFindEntryInBucket(
     _In_ PCO_CACHE Cache,
     _In_ ULONG BucketIndex,
     _In_ ULONG64 Key
     );
 
-static VOID
+static
+VOID
 CopInsertIntoLRU(
     _In_ PCO_CACHE Cache,
     _In_ PCO_CACHE_ENTRY Entry
     );
 
-static VOID
+static
+VOID
 CopRemoveFromLRU(
     _In_ PCO_CACHE Cache,
     _In_ PCO_CACHE_ENTRY Entry
     );
 
-static VOID
+static
+VOID
 CopPromoteInLRU(
     _In_ PCO_CACHE Cache,
     _In_ PCO_CACHE_ENTRY Entry
     );
 
-static BOOLEAN
+static
+VOID
 CopEvictLRUEntry(
     _In_ PCO_CACHE Cache,
-    _In_ PCO_CACHE_SHARD Shard
+    _In_ PCO_CACHE_SHARD* Shard
     );
 
-static BOOLEAN
+static
+BOOLEAN
 CopIsEntryExpired(
     _In_ PCO_CACHE_ENTRY Entry,
     _In_ PLARGE_INTEGER CurrentTime
     );
 
-static VOID
+static
+VOID
+CopUpdateAccessTime(
+    _In_ PCO_CACHE_ENTRY Entry
+    );
+
+static
+VOID
 CopCallCleanupCallback(
     _In_ PCO_CACHE Cache,
     _In_ PCO_CACHE_ENTRY Entry
     );
 
-/**
- * @brief Remove entry from cache.
- *
- * PRECONDITION: Caller MUST hold the entry's bucket lock EXCLUSIVE.
- * This function acquires shard LRU lock then global list lock (lock order safe).
- * After this call the entry is freed — do not dereference.
- */
-static VOID
+static
+VOID
 CopRemoveEntryFromCache(
     _In_ PCO_CACHE Cache,
     _In_ PCO_CACHE_ENTRY Entry,
     _In_ BOOLEAN CallCleanup
     );
 
-static ULONG
+static
+ULONG
 CopEvictExpiredEntries(
     _In_ PCO_CACHE Cache,
     _In_ ULONG MaxToEvict
     );
 
-static ULONG
+static
+ULONG
 CopEvictLRUEntries(
     _In_ PCO_CACHE Cache,
     _In_ ULONG Count
     );
 
-static VOID
+static
+VOID
 CopMaintenanceWorker(
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_opt_ PVOID Context
     );
 
-static VOID
+static
+VOID
 CopMaintenanceDpcRoutine(
     _In_ PKDPC Dpc,
     _In_opt_ PVOID DeferredContext,
@@ -143,26 +158,34 @@ CopMaintenanceDpcRoutine(
     _In_opt_ PVOID SystemArgument2
     );
 
-static VOID
+static
+VOID
 CopUpdateMemoryPressure(
     _In_ PCO_MANAGER Manager
     );
 
-static NTSTATUS
+static
+NTSTATUS
 CopValidateBucketCount(
     _In_ ULONG BucketCount,
     _Out_ PULONG ValidatedCount
     );
 
-static FORCEINLINE LARGE_INTEGER
-CopGetCurrentTime(VOID)
+static
+FORCEINLINE
+LARGE_INTEGER
+CopGetCurrentTime(
+    VOID
+    )
 {
     LARGE_INTEGER time;
     KeQuerySystemTime(&time);
     return time;
 }
 
-static FORCEINLINE LARGE_INTEGER
+static
+FORCEINLINE
+LARGE_INTEGER
 CopCalculateExpireTime(
     _In_ PLARGE_INTEGER CreateTime,
     _In_ ULONG TTLSeconds
@@ -174,51 +197,9 @@ CopCalculateExpireTime(
     return expireTime;
 }
 
-/**
- * @brief Atomically update a peak counter.
- */
-static FORCEINLINE VOID
-CopUpdatePeak64(
-    _Inout_ volatile LONG64* Peak,
-    _In_ LONG64 CurrentValue
-    )
-{
-    LONG64 oldPeak;
-    do {
-        oldPeak = *Peak;
-        if (CurrentValue <= oldPeak) {
-            return;
-        }
-    } while (InterlockedCompareExchange64(Peak, CurrentValue, oldPeak) != oldPeak);
-}
-
-static FORCEINLINE VOID
-CopUpdatePeak32(
-    _Inout_ volatile LONG* Peak,
-    _In_ LONG CurrentValue
-    )
-{
-    LONG oldPeak;
-    do {
-        oldPeak = *Peak;
-        if (CurrentValue <= oldPeak) {
-            return;
-        }
-    } while (InterlockedCompareExchange(Peak, CurrentValue, oldPeak) != oldPeak);
-}
-
-/**
- * @brief Destroy a cache's internals. Called from CoShutdown bypass path.
- * PRECONDITION: Cache is already removed from manager list by caller.
- */
-static VOID
-CopDestroyCacheInternal(
-    _In_ PCO_CACHE Cache
-    );
-
-/* ========================================================================= */
-/* MANAGER INITIALIZATION AND SHUTDOWN                                        */
-/* ========================================================================= */
+// ============================================================================
+// MANAGER INITIALIZATION AND SHUTDOWN
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -234,12 +215,18 @@ CoInitialize(
 
     PAGED_CODE();
 
+    //
+    // Validate parameters
+    //
     if (Manager == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Manager = NULL;
 
+    //
+    // Allocate manager structure
+    //
     manager = (PCO_MANAGER)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(CO_MANAGER),
@@ -252,19 +239,31 @@ CoInitialize(
 
     RtlZeroMemory(manager, sizeof(CO_MANAGER));
 
+    //
+    // Initialize state
+    //
     manager->MaxTotalMemory = (MaxTotalMemory != 0) ?
                               MaxTotalMemory : CO_DEFAULT_MAX_MEMORY;
     manager->DeviceObject = DeviceObject;
     manager->MaintenanceIntervalMs = CO_MAINTENANCE_INTERVAL_MS;
     manager->NextCacheId = 1;
 
+    //
+    // Initialize synchronization primitives
+    //
     InitializeListHead(&manager->CacheList);
     ExInitializePushLock(&manager->CacheListLock);
-    ExInitializePushLock(&manager->CallbackLock);
+    KeInitializeEvent(&manager->ShutdownEvent, NotificationEvent, FALSE);
 
+    //
+    // Initialize maintenance timer and DPC
+    //
     KeInitializeTimer(&manager->MaintenanceTimer);
     KeInitializeDpc(&manager->MaintenanceDpc, CopMaintenanceDpcRoutine, manager);
 
+    //
+    // Allocate work item for maintenance if device object provided
+    //
     if (DeviceObject != NULL) {
         manager->MaintenanceWorkItem = IoAllocateWorkItem(DeviceObject);
         if (manager->MaintenanceWorkItem == NULL) {
@@ -273,14 +272,14 @@ CoInitialize(
         }
     }
 
+    //
+    // Record start time
+    //
     KeQuerySystemTime(&manager->StartTime);
 
-    /*
-     * Mark initialized BEFORE starting the timer so the DPC
-     * sees a fully-initialized manager. (Fix #6)
-     */
-    InterlockedExchange(&manager->Initialized, TRUE);
-
+    //
+    // Start maintenance timer
+    //
     dueTime.QuadPart = -((LONGLONG)manager->MaintenanceIntervalMs * CO_100NS_PER_MS);
     KeSetTimerEx(
         &manager->MaintenanceTimer,
@@ -288,6 +287,11 @@ CoInitialize(
         manager->MaintenanceIntervalMs,
         &manager->MaintenanceDpc
     );
+
+    //
+    // Mark as initialized
+    //
+    InterlockedExchange(&manager->Initialized, TRUE);
 
     *Manager = manager;
     return STATUS_SUCCESS;
@@ -314,69 +318,63 @@ CoShutdown(
 
     PAGED_CODE();
 
-    if (Manager == NULL ||
-        InterlockedCompareExchange(&Manager->Initialized, FALSE, TRUE) != TRUE) {
+    if (Manager == NULL || !Manager->Initialized) {
         return;
     }
 
+    //
+    // Signal shutdown
+    //
     InterlockedExchange(&Manager->ShuttingDown, TRUE);
 
-    /*
-     * Cancel the periodic timer. KeCancelTimer guarantees no future DPCs
-     * will be queued from this timer.
-     */
+    //
+    // Cancel maintenance timer
+    //
     KeCancelTimer(&Manager->MaintenanceTimer);
 
-    /*
-     * Flush all queued DPCs system-wide so we know CopMaintenanceDpcRoutine
-     * has finished. After this, no new work items can be queued because
-     * ShuttingDown == TRUE. (Fix #9)
-     */
-    KeFlushQueuedDpcs();
-
-    /*
-     * Wait for any in-flight maintenance work item to complete.
-     * After KeFlushQueuedDpcs, no new work items will be queued.
-     * This is bounded: the maintenance worker checks ShuttingDown.
-     */
-    if (Manager->MaintenanceRunning) {
+    //
+    // Wait for any running maintenance to complete
+    //
+    while (Manager->MaintenanceRunning) {
         LARGE_INTEGER delay;
-        ULONG spinCount = 0;
-        delay.QuadPart = -10 * CO_100NS_PER_MS;
-        while (Manager->MaintenanceRunning && spinCount < 1000) {
-            KeDelayExecutionThread(KernelMode, FALSE, &delay);
-            spinCount++;
-        }
-        NT_ASSERT(!Manager->MaintenanceRunning);
+        delay.QuadPart = -10 * CO_100NS_PER_MS;  // 10ms
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
     }
 
-    /*
-     * Destroy all caches. We remove from the list ourselves and call
-     * CopDestroyCacheInternal which does NOT try to remove from the
-     * manager list again. (Fix #10)
-     */
+    //
+    // Destroy all caches
+    //
     ExAcquirePushLockExclusive(&Manager->CacheListLock);
 
     while (!IsListEmpty(&Manager->CacheList)) {
         entry = RemoveHeadList(&Manager->CacheList);
         cache = CONTAINING_RECORD(entry, CO_CACHE, ManagerEntry);
-        InitializeListHead(&cache->ManagerEntry);
-        InterlockedDecrement(&Manager->CacheCount);
+        Manager->CacheCount--;
 
         ExReleasePushLockExclusive(&Manager->CacheListLock);
 
-        CopDestroyCacheInternal(cache);
+        //
+        // Destroy cache (this flushes all entries)
+        //
+        CoDestroyCache(cache);
 
         ExAcquirePushLockExclusive(&Manager->CacheListLock);
     }
 
     ExReleasePushLockExclusive(&Manager->CacheListLock);
 
+    //
+    // Free work item
+    //
     if (Manager->MaintenanceWorkItem != NULL) {
         IoFreeWorkItem(Manager->MaintenanceWorkItem);
         Manager->MaintenanceWorkItem = NULL;
     }
 
+    //
+    // Mark as not initialized and free
+    //
+    Manager->Initialized = FALSE;
     ShadowStrikeFreePoolWithTag(Manager, CO_POOL_TAG);
 }
 
@@ -391,15 +389,7 @@ CoSetMemoryLimit(
         return STATUS_INVALID_PARAMETER;
     }
 
-    /*
-     * SIZE_T write is atomic on x64 but not guaranteed on x86.
-     * Use InterlockedExchangePointer which is pointer-sized atomic. (Fix #12)
-     */
-    InterlockedExchangePointer(
-        (PVOID volatile *)&Manager->MaxTotalMemory,
-        (PVOID)MaxBytes
-    );
-
+    Manager->MaxTotalMemory = MaxBytes;
     CopUpdateMemoryPressure(Manager);
 
     return STATUS_SUCCESS;
@@ -417,14 +407,8 @@ CoRegisterMemoryCallback(
         return STATUS_INVALID_PARAMETER;
     }
 
-    /*
-     * Synchronized write of callback + context pair to prevent
-     * torn reads from DPC path. (Fix #12)
-     */
-    ExAcquirePushLockExclusive(&Manager->CallbackLock);
     Manager->MemoryCallback = Callback;
     Manager->MemoryCallbackContext = Context;
-    ExReleasePushLockExclusive(&Manager->CallbackLock);
 
     return STATUS_SUCCESS;
 }
@@ -436,7 +420,7 @@ CoGetManagerStats(
     PSIZE_T TotalMemory,
     PULONG TotalCaches,
     PULONG TotalEntries,
-    PULONG HitRatePermille
+    double* HitRate
     )
 {
     LONG64 totalHits;
@@ -457,38 +441,37 @@ CoGetManagerStats(
 
     if (TotalEntries != NULL) {
         ULONG count = 0;
-        PLIST_ENTRY listEntry;
+        PLIST_ENTRY entry;
 
         ExAcquirePushLockShared(&Manager->CacheListLock);
-        for (listEntry = Manager->CacheList.Flink;
-             listEntry != &Manager->CacheList;
-             listEntry = listEntry->Flink) {
-            PCO_CACHE cache = CONTAINING_RECORD(listEntry, CO_CACHE, ManagerEntry);
+        for (entry = Manager->CacheList.Flink;
+             entry != &Manager->CacheList;
+             entry = entry->Flink) {
+            PCO_CACHE cache = CONTAINING_RECORD(entry, CO_CACHE, ManagerEntry);
             count += (ULONG)cache->EntryCount;
         }
         ExReleasePushLockShared(&Manager->CacheListLock);
         *TotalEntries = count;
     }
 
-    /* Integer-based hit rate: permille (0-1000). No floating-point. (Fix #5, #19) */
-    if (HitRatePermille != NULL) {
+    if (HitRate != NULL) {
         totalHits = Manager->TotalHits;
         totalMisses = Manager->TotalMisses;
         totalLookups = totalHits + totalMisses;
 
         if (totalLookups > 0) {
-            *HitRatePermille = (ULONG)((totalHits * 1000) / totalLookups);
+            *HitRate = (double)totalHits / (double)totalLookups;
         } else {
-            *HitRatePermille = 0;
+            *HitRate = 0.0;
         }
     }
 
     return STATUS_SUCCESS;
 }
 
-/* ========================================================================= */
-/* CACHE LIFECYCLE                                                            */
-/* ========================================================================= */
+// ============================================================================
+// CACHE LIFECYCLE
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -506,10 +489,12 @@ CoCreateCache(
     ULONG bucketCount;
     ULONG i;
     SIZE_T bucketArraySize;
-    LONG64 structMemory;
 
     PAGED_CODE();
 
+    //
+    // Validate parameters
+    //
     if (Manager == NULL || !Manager->Initialized || Cache == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -522,23 +507,35 @@ CoCreateCache(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Check cache limit
+    //
     if (Manager->CacheCount >= CO_MAX_CACHES) {
         return STATUS_QUOTA_EXCEEDED;
     }
 
     *Cache = NULL;
 
+    //
+    // Use provided config or defaults
+    //
     if (Config != NULL) {
         RtlCopyMemory(&localConfig, Config, sizeof(CO_CACHE_CONFIG));
     } else {
         CoInitDefaultConfig(&localConfig);
     }
 
+    //
+    // Validate and adjust bucket count
+    //
     status = CopValidateBucketCount(localConfig.BucketCount, &bucketCount);
     if (!NT_SUCCESS(status)) {
         return status;
     }
 
+    //
+    // Calculate bucket array size with overflow check
+    //
     if (!ShadowStrikeSafeMultiply(
             sizeof(CO_HASH_BUCKET),
             bucketCount,
@@ -546,6 +543,9 @@ CoCreateCache(
         return STATUS_INTEGER_OVERFLOW;
     }
 
+    //
+    // Allocate cache structure
+    //
     cache = (PCO_CACHE)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(CO_CACHE),
@@ -558,17 +558,32 @@ CoCreateCache(
 
     RtlZeroMemory(cache, sizeof(CO_CACHE));
 
+    //
+    // Initialize basic fields
+    //
     cache->Type = Type;
-    cache->CacheId = (ULONG)InterlockedIncrement((PLONG)&Manager->NextCacheId);
+    cache->CacheId = InterlockedIncrement((PLONG)&Manager->NextCacheId);
     cache->Manager = Manager;
 
+    //
+    // Copy name safely
+    //
     RtlStringCchCopyA(cache->Name, CO_CACHE_NAME_MAX, Name);
 
+    //
+    // Copy configuration
+    //
     RtlCopyMemory(&cache->Config, &localConfig, sizeof(CO_CACHE_CONFIG));
 
+    //
+    // Setup hash table parameters
+    //
     cache->BucketCount = bucketCount;
     cache->BucketMask = bucketCount - 1;
 
+    //
+    // Allocate bucket array
+    //
     cache->Buckets = (PCO_HASH_BUCKET)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         bucketArraySize,
@@ -582,19 +597,31 @@ CoCreateCache(
 
     RtlZeroMemory(cache->Buckets, bucketArraySize);
 
+    //
+    // Initialize each bucket
+    //
     for (i = 0; i < bucketCount; i++) {
         InitializeListHead(&cache->Buckets[i].Head);
         ExInitializePushLock(&cache->Buckets[i].Lock);
     }
 
+    //
+    // Initialize shards
+    //
     for (i = 0; i < CO_SHARD_COUNT; i++) {
         InitializeListHead(&cache->Shards[i].LRUHead);
         ExInitializePushLock(&cache->Shards[i].LRULock);
     }
 
+    //
+    // Initialize global entry list
+    //
     InitializeListHead(&cache->GlobalEntryList);
     ExInitializePushLock(&cache->GlobalListLock);
 
+    //
+    // Initialize lookaside list if requested
+    //
     if (localConfig.UseLookaside) {
         ExInitializeNPagedLookasideList(
             &cache->EntryLookaside,
@@ -608,18 +635,36 @@ CoCreateCache(
         cache->LookasideInitialized = TRUE;
     }
 
-    structMemory = (LONG64)(sizeof(CO_CACHE) + bucketArraySize);
-    InterlockedAdd64(&cache->MemoryUsage, structMemory);
-    InterlockedAdd64(&Manager->CurrentTotalMemory, structMemory);
+    //
+    // Record memory usage for cache structure and buckets
+    //
+    InterlockedAdd64(
+        &cache->MemoryUsage,
+        (LONG64)(sizeof(CO_CACHE) + bucketArraySize)
+    );
+    InterlockedAdd64(
+        &Manager->CurrentTotalMemory,
+        (LONG64)(sizeof(CO_CACHE) + bucketArraySize)
+    );
 
-    /* Atomic peak update (Fix #11) */
-    CopUpdatePeak64(&Manager->PeakTotalMemory, Manager->CurrentTotalMemory);
+    //
+    // Update peak memory if needed
+    //
+    if (Manager->CurrentTotalMemory > Manager->PeakTotalMemory) {
+        Manager->PeakTotalMemory = Manager->CurrentTotalMemory;
+    }
 
+    //
+    // Add to manager's cache list
+    //
     ExAcquirePushLockExclusive(&Manager->CacheListLock);
     InsertTailList(&Manager->CacheList, &cache->ManagerEntry);
     InterlockedIncrement(&Manager->CacheCount);
     ExReleasePushLockExclusive(&Manager->CacheListLock);
 
+    //
+    // Mark as initialized
+    //
     InterlockedExchange(&cache->Initialized, TRUE);
 
     *Cache = cache;
@@ -643,6 +688,7 @@ CoDestroyCache(
     )
 {
     PCO_MANAGER manager;
+    SIZE_T memoryFreed;
 
     PAGED_CODE();
 
@@ -652,117 +698,107 @@ CoDestroyCache(
 
     manager = Cache->Manager;
 
+    //
+    // Signal shutdown
+    //
     InterlockedExchange(&Cache->ShuttingDown, TRUE);
 
-    /* Remove from manager's list (Fix #10 — only one removal site) */
+    //
+    // Remove from manager's list
+    //
     if (manager != NULL) {
         ExAcquirePushLockExclusive(&manager->CacheListLock);
         RemoveEntryList(&Cache->ManagerEntry);
-        InitializeListHead(&Cache->ManagerEntry);
         InterlockedDecrement(&manager->CacheCount);
         ExReleasePushLockExclusive(&manager->CacheListLock);
     }
 
-    CopDestroyCacheInternal(Cache);
-
-    return STATUS_SUCCESS;
-}
-
-/**
- * @brief Destroys cache internals and frees the cache structure.
- *
- * PRECONDITION: Cache has already been removed from the manager's CacheList
- * by the caller (CoDestroyCache or CoShutdown). This function does NOT
- * touch the manager's CacheList. (Fix #10)
- */
-static VOID
-CopDestroyCacheInternal(
-    _In_ PCO_CACHE Cache
-    )
-{
-    PCO_MANAGER manager;
-    SIZE_T memoryFreed;
-
-    manager = Cache->Manager;
-
-    InterlockedExchange(&Cache->ShuttingDown, TRUE);
-
+    //
+    // Flush all entries
+    //
     CoFlush(Cache);
 
+    //
+    // Calculate memory to free
+    //
     memoryFreed = sizeof(CO_CACHE) +
-                  ((SIZE_T)Cache->BucketCount * sizeof(CO_HASH_BUCKET));
+                  (Cache->BucketCount * sizeof(CO_HASH_BUCKET));
 
+    //
+    // Cleanup lookaside list
+    //
     if (Cache->LookasideInitialized) {
         ExDeleteNPagedLookasideList(&Cache->EntryLookaside);
         Cache->LookasideInitialized = FALSE;
     }
 
+    //
+    // Free bucket array
+    //
     if (Cache->Buckets != NULL) {
         ShadowStrikeFreePoolWithTag(Cache->Buckets, CO_HASH_POOL_TAG);
         Cache->Buckets = NULL;
     }
 
+    //
+    // Update manager memory tracking
+    //
     if (manager != NULL) {
         InterlockedAdd64(&manager->CurrentTotalMemory, -(LONG64)memoryFreed);
     }
 
+    //
+    // Free cache structure
+    //
     Cache->Initialized = FALSE;
     ShadowStrikeFreePoolWithTag(Cache, CO_POOL_TAG);
+
+    return STATUS_SUCCESS;
 }
 
-/**
- * @brief Flush all entries from a cache.
- *
- * Lock ordering: bucket lock → shard LRU lock → global list lock. (Fix #3, #4)
- *
- * We iterate buckets (not the global list) so we always hold the bucket
- * lock when calling CopRemoveEntryFromCache.
- */
 _Use_decl_annotations_
 NTSTATUS
 CoFlush(
     PCO_CACHE Cache
     )
 {
-    ULONG i;
-    PLIST_ENTRY listEntry;
+    PLIST_ENTRY entry;
     PLIST_ENTRY nextEntry;
     PCO_CACHE_ENTRY cacheEntry;
-    PCO_HASH_BUCKET bucket;
 
     if (Cache == NULL || !Cache->Initialized) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    for (i = 0; i < Cache->BucketCount; i++) {
-        bucket = &Cache->Buckets[i];
+    //
+    // Acquire global list lock exclusively
+    //
+    ExAcquirePushLockExclusive(&Cache->GlobalListLock);
 
-        if (bucket->EntryCount == 0) {
-            continue;
-        }
+    //
+    // Iterate and remove all entries
+    //
+    for (entry = Cache->GlobalEntryList.Flink;
+         entry != &Cache->GlobalEntryList;
+         entry = nextEntry) {
 
-        ExAcquirePushLockExclusive(&bucket->Lock);
+        nextEntry = entry->Flink;
+        cacheEntry = CONTAINING_RECORD(entry, CO_CACHE_ENTRY, GlobalEntry);
 
-        for (listEntry = bucket->Head.Flink;
-             listEntry != &bucket->Head;
-             listEntry = nextEntry) {
-
-            nextEntry = listEntry->Flink;
-            cacheEntry = CONTAINING_RECORD(listEntry, CO_CACHE_ENTRY, HashEntry);
-
-            /* CopRemoveEntryFromCache requires bucket lock held — we hold it */
-            CopRemoveEntryFromCache(Cache, cacheEntry, TRUE);
-        }
-
-        ExReleasePushLockExclusive(&bucket->Lock);
+        //
+        // Remove from all lists and free
+        //
+        CopRemoveEntryFromCache(Cache, cacheEntry, TRUE);
     }
+
+    ExReleasePushLockExclusive(&Cache->GlobalListLock);
 
     return STATUS_SUCCESS;
 }
 
-/* ========================================================================= */
-/* CACHE OPERATIONS - PUT                                                     */
-/* ========================================================================= */
+// ============================================================================
+// CACHE OPERATIONS - PUT
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -796,49 +832,82 @@ CoPutEx(
     ULONG bucketIndex;
     ULONG shardIndex;
     PCO_HASH_BUCKET bucket;
+    PCO_CACHE_SHARD shard;
     LARGE_INTEGER currentTime;
     PVOID dataCopy = NULL;
     SIZE_T totalMemory;
+    BOOLEAN isUpdate = FALSE;
 
+    //
+    // Validate parameters
+    //
     if (Cache == NULL || !Cache->Initialized || Cache->ShuttingDown) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Apply default TTL if not specified
+    //
     if (TTLSeconds == 0) {
         TTLSeconds = Cache->Config.DefaultTTLSeconds;
     }
+
+    //
+    // Cap TTL to maximum
+    //
     if (TTLSeconds > CO_MAX_TTL_SECONDS) {
         TTLSeconds = CO_MAX_TTL_SECONDS;
     }
 
+    //
+    // Calculate indices
+    //
     bucketIndex = CoGetBucketIndex(Cache, Key);
     shardIndex = CoGetShardIndex(Key);
     bucket = &Cache->Buckets[bucketIndex];
+    shard = &Cache->Shards[shardIndex];
 
+    //
+    // Get current time
+    //
     currentTime = CopGetCurrentTime();
 
+    //
+    // Check if we need to copy data
+    //
     if (Data != NULL && DataSize > 0 && Cache->Config.CopyDataOnInsert) {
         dataCopy = ShadowStrikeAllocatePoolWithTag(
             NonPagedPoolNx,
             DataSize,
             CO_DATA_POOL_TAG
         );
+
         if (dataCopy == NULL) {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
+
         RtlCopyMemory(dataCopy, Data, DataSize);
     }
 
+    //
+    // Acquire bucket lock exclusively
+    //
     ExAcquirePushLockExclusive(&bucket->Lock);
 
+    //
+    // Check if key already exists
+    //
     existingEntry = CopFindEntryInBucket(Cache, bucketIndex, Key);
 
     if (existingEntry != NULL) {
-        /*
-         * UPDATE existing entry — done entirely under bucket lock.
-         * LRU promotion is also done under bucket lock to prevent
-         * use-after-free. (Fix #2)
-         */
+        //
+        // Update existing entry
+        //
+        isUpdate = TRUE;
+
+        //
+        // Free old data if we owned it
+        //
         if (existingEntry->DataOwned && existingEntry->Data != NULL) {
             SIZE_T oldSize = existingEntry->DataSize;
             ShadowStrikeFreePoolWithTag(existingEntry->Data, CO_DATA_POOL_TAG);
@@ -848,6 +917,9 @@ CoPutEx(
             }
         }
 
+        //
+        // Update entry fields
+        //
         existingEntry->Data = (dataCopy != NULL) ? dataCopy : Data;
         existingEntry->DataSize = DataSize;
         existingEntry->DataOwned = (dataCopy != NULL);
@@ -857,9 +929,14 @@ CoPutEx(
         existingEntry->Flags = Flags;
         existingEntry->UserContext = UserContext;
 
-        InterlockedIncrement(&existingEntry->AccessCount);
-        InterlockedExchange64(&existingEntry->LastAccessTimeQpc, currentTime.QuadPart);
+        //
+        // Update access tracking
+        //
+        CopUpdateAccessTime(existingEntry);
 
+        //
+        // Update memory tracking for new data
+        //
         if (dataCopy != NULL) {
             InterlockedAdd64(&Cache->MemoryUsage, (LONG64)DataSize);
             if (Cache->Manager != NULL) {
@@ -867,49 +944,66 @@ CoPutEx(
             }
         }
 
+        //
+        // Update statistics
+        //
         InterlockedIncrement64(&Cache->Stats.Updates);
 
-        /* Promote in LRU while entry is guaranteed alive (Fix #2) */
-        CopPromoteInLRU(Cache, existingEntry);
-
         ExReleasePushLockExclusive(&bucket->Lock);
+
+        //
+        // Promote in LRU (outside bucket lock)
+        //
+        CopPromoteInLRU(Cache, existingEntry);
 
         return STATUS_SUCCESS;
     }
 
-    /*
-     * NEW entry path.
-     *
-     * Capacity check: we do a best-effort check. Under high concurrency,
-     * the count may slightly overshoot MaxEntries; this is acceptable
-     * and avoids a global lock. (Fix #15 — documented, not hidden)
-     */
+    //
+    // Check capacity before inserting new entry
+    //
     if ((ULONG)Cache->EntryCount >= Cache->Config.MaxEntries) {
+        //
+        // Need to evict
+        //
         ExReleasePushLockExclusive(&bucket->Lock);
 
         CopEvictLRUEntries(Cache, CO_EVICTION_BATCH_SIZE);
 
+        //
+        // Re-acquire lock and check again
+        //
         ExAcquirePushLockExclusive(&bucket->Lock);
 
         if ((ULONG)Cache->EntryCount >= Cache->Config.MaxEntries) {
             ExReleasePushLockExclusive(&bucket->Lock);
+
             if (dataCopy != NULL) {
                 ShadowStrikeFreePoolWithTag(dataCopy, CO_DATA_POOL_TAG);
             }
+
             InterlockedIncrement64(&Cache->Stats.CapacityEvictions);
             return STATUS_QUOTA_EXCEEDED;
         }
     }
 
+    //
+    // Allocate new entry
+    //
     status = CopAllocateEntry(Cache, &entry);
     if (!NT_SUCCESS(status)) {
         ExReleasePushLockExclusive(&bucket->Lock);
+
         if (dataCopy != NULL) {
             ShadowStrikeFreePoolWithTag(dataCopy, CO_DATA_POOL_TAG);
         }
+
         return status;
     }
 
+    //
+    // Initialize entry
+    //
     entry->Key = Key;
     entry->SecondaryKey = SecondaryKey;
     entry->Data = (dataCopy != NULL) ? dataCopy : Data;
@@ -920,42 +1014,58 @@ CoPutEx(
     entry->AccessCount = 1;
     entry->HitCount = 0;
     entry->CreateTime = currentTime;
-    entry->LastAccessTimeQpc = currentTime.QuadPart;
+    entry->LastAccessTime = currentTime;
     entry->TTLSeconds = TTLSeconds;
     entry->ExpireTime = CopCalculateExpireTime(&currentTime, TTLSeconds);
     entry->Flags = Flags;
     entry->BucketIndex = bucketIndex;
     entry->ShardIndex = shardIndex;
     entry->UserContext = UserContext;
-    entry->OwnerCache = Cache;
 
-    /* Insert into hash bucket (we hold the bucket lock) */
+    //
+    // Insert into hash bucket
+    //
     InsertHeadList(&bucket->Head, &entry->HashEntry);
     InterlockedIncrement(&bucket->EntryCount);
+
+    //
+    // Track collisions
+    //
     if (bucket->EntryCount > 1) {
         InterlockedIncrement(&bucket->Collisions);
     }
 
-    /*
-     * Insert into shard LRU (lock order: bucket → shard LRU ✓)
-     * We can call this while holding the bucket lock.
-     */
-    CopInsertIntoLRU(Cache, entry);
+    ExReleasePushLockExclusive(&bucket->Lock);
 
-    /*
-     * Insert into global list (lock order: bucket → shard → global ✓)
-     */
+    //
+    // Insert into global list
+    //
     ExAcquirePushLockExclusive(&Cache->GlobalListLock);
     InsertTailList(&Cache->GlobalEntryList, &entry->GlobalEntry);
     ExReleasePushLockExclusive(&Cache->GlobalListLock);
 
-    ExReleasePushLockExclusive(&bucket->Lock);
+    //
+    // Insert into LRU
+    //
+    CopInsertIntoLRU(Cache, entry);
 
+    //
+    // Update counters
+    //
     InterlockedIncrement(&Cache->EntryCount);
     InterlockedIncrement64(&Cache->Stats.Inserts);
     InterlockedIncrement(&Cache->Stats.CurrentEntries);
-    CopUpdatePeak32(&Cache->Stats.PeakEntries, Cache->Stats.CurrentEntries);
 
+    //
+    // Update peak entries
+    //
+    if (Cache->Stats.CurrentEntries > Cache->Stats.PeakEntries) {
+        Cache->Stats.PeakEntries = Cache->Stats.CurrentEntries;
+    }
+
+    //
+    // Update memory tracking
+    //
     totalMemory = sizeof(CO_CACHE_ENTRY);
     if (dataCopy != NULL) {
         totalMemory += DataSize;
@@ -966,35 +1076,29 @@ CoPutEx(
 
     if (Cache->Manager != NULL) {
         InterlockedAdd64(&Cache->Manager->CurrentTotalMemory, (LONG64)totalMemory);
-        CopUpdatePeak64(&Cache->Manager->PeakTotalMemory,
-                        Cache->Manager->CurrentTotalMemory);
+
+        if (Cache->Manager->CurrentTotalMemory > Cache->Manager->PeakTotalMemory) {
+            Cache->Manager->PeakTotalMemory = Cache->Manager->CurrentTotalMemory;
+        }
     }
 
-    CopUpdatePeak64(&Cache->Stats.PeakMemory, Cache->Stats.CurrentMemory);
+    if (Cache->Stats.CurrentMemory > Cache->Stats.PeakMemory) {
+        Cache->Stats.PeakMemory = Cache->Stats.CurrentMemory;
+    }
 
     return STATUS_SUCCESS;
 }
 
-/* ========================================================================= */
-/* CACHE OPERATIONS - GET (SAFE COPY, NO USE-AFTER-FREE)                      */
-/* ========================================================================= */
+// ============================================================================
+// CACHE OPERATIONS - GET
+// ============================================================================
 
-/**
- * @brief Look up an entry. Returns a COPY of the data to the caller.
- *
- * The data is copied under the bucket lock so the entry cannot be freed
- * while we read from it. (Fix #1 — eliminates use-after-free)
- *
- * If DataBuffer is NULL, we only check existence and return the size.
- * If DataBuffer is non-NULL but *DataSize < actual size, returns
- * STATUS_BUFFER_TOO_SMALL and sets *DataSize to the required size.
- */
 _Use_decl_annotations_
 NTSTATUS
 CoGet(
     PCO_CACHE Cache,
     ULONG64 Key,
-    PVOID DataBuffer,
+    PVOID* Data,
     PSIZE_T DataSize
     )
 {
@@ -1003,36 +1107,62 @@ CoGet(
     PCO_HASH_BUCKET bucket;
     LARGE_INTEGER currentTime;
 
+    //
+    // Validate parameters
+    //
     if (Cache == NULL || !Cache->Initialized || Cache->ShuttingDown) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Update total lookups
+    //
     InterlockedIncrement64(&Cache->Stats.TotalLookups);
     if (Cache->Manager != NULL) {
         InterlockedIncrement64(&Cache->Manager->TotalOperations);
     }
 
+    //
+    // Calculate bucket index
+    //
     bucketIndex = CoGetBucketIndex(Cache, Key);
     bucket = &Cache->Buckets[bucketIndex];
+
+    //
+    // Get current time for expiration check
+    //
     currentTime = CopGetCurrentTime();
 
-    /*
-     * Acquire bucket lock SHARED for the lookup + data copy.
-     * If expired, we upgrade to exclusive to remove.
-     */
+    //
+    // Acquire bucket lock for reading
+    //
     ExAcquirePushLockShared(&bucket->Lock);
 
+    //
+    // Find entry
+    //
     entry = CopFindEntryInBucket(Cache, bucketIndex, Key);
 
     if (entry == NULL) {
         ExReleasePushLockShared(&bucket->Lock);
-        goto Miss;
+
+        InterlockedIncrement64(&Cache->Stats.Misses);
+        if (Cache->Manager != NULL) {
+            InterlockedIncrement64(&Cache->Manager->TotalMisses);
+        }
+
+        return STATUS_NOT_FOUND;
     }
 
+    //
+    // Check if expired
+    //
     if (CopIsEntryExpired(entry, &currentTime)) {
         ExReleasePushLockShared(&bucket->Lock);
 
-        /* Upgrade to exclusive to remove expired entry */
+        //
+        // Remove expired entry (need exclusive lock)
+        //
         ExAcquirePushLockExclusive(&bucket->Lock);
         entry = CopFindEntryInBucket(Cache, bucketIndex, Key);
         if (entry != NULL && CopIsEntryExpired(entry, &currentTime)) {
@@ -1040,65 +1170,53 @@ CoGet(
             InterlockedIncrement64(&Cache->Stats.TTLEvictions);
         }
         ExReleasePushLockExclusive(&bucket->Lock);
-        goto Miss;
+
+        InterlockedIncrement64(&Cache->Stats.Misses);
+        if (Cache->Manager != NULL) {
+            InterlockedIncrement64(&Cache->Manager->TotalMisses);
+        }
+
+        return STATUS_NOT_FOUND;
     }
 
-    /*
-     * Copy data under the lock — this is the fix for issue #1.
-     * The entry cannot be freed while we hold even a shared bucket lock
-     * because removal requires exclusive bucket lock.
-     */
+    //
+    // Return data
+    //
+    if (Data != NULL) {
+        *Data = entry->Data;
+    }
     if (DataSize != NULL) {
-        if (DataBuffer != NULL) {
-            if (*DataSize < entry->DataSize) {
-                *DataSize = entry->DataSize;
-                ExReleasePushLockShared(&bucket->Lock);
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            if (entry->Data != NULL && entry->DataSize > 0) {
-                RtlCopyMemory(DataBuffer, entry->Data, entry->DataSize);
-            }
-        }
         *DataSize = entry->DataSize;
     }
 
-    /* Update access tracking (atomic — safe under shared lock) (Fix #16) */
-    InterlockedExchange64(&entry->LastAccessTimeQpc, currentTime.QuadPart);
+    //
+    // Update access tracking
+    //
+    CopUpdateAccessTime(entry);
     InterlockedIncrement(&entry->AccessCount);
     InterlockedIncrement(&entry->HitCount);
 
-    /*
-     * LRU promotion under the bucket lock. We hold bucket shared;
-     * CopPromoteInLRU acquires shard LRU lock (lock order: bucket → shard ✓).
-     * The entry is guaranteed alive. (Fix #2)
-     */
-    if (entry->HitCount >= CO_LRU_PROMOTION_THRESHOLD) {
-        InterlockedExchange(&entry->HitCount, 0);
-        CopPromoteInLRU(Cache, entry);
-    }
-
     ExReleasePushLockShared(&bucket->Lock);
 
+    //
+    // Update statistics
+    //
     InterlockedIncrement64(&Cache->Stats.Hits);
     if (Cache->Manager != NULL) {
         InterlockedIncrement64(&Cache->Manager->TotalHits);
     }
 
-    return STATUS_SUCCESS;
-
-Miss:
-    InterlockedIncrement64(&Cache->Stats.Misses);
-    if (Cache->Manager != NULL) {
-        InterlockedIncrement64(&Cache->Manager->TotalMisses);
+    //
+    // Promote in LRU if hit count threshold reached
+    //
+    if (entry->HitCount >= CO_LRU_PROMOTION_THRESHOLD) {
+        InterlockedExchange(&entry->HitCount, 0);
+        CopPromoteInLRU(Cache, entry);
     }
-    return STATUS_NOT_FOUND;
+
+    return STATUS_SUCCESS;
 }
 
-/**
- * @brief Extended lookup. Allocates a copy of the data in Result->Data.
- *
- * Caller MUST call CoFreeLookupResult() to free Result->Data.
- */
 _Use_decl_annotations_
 NTSTATUS
 CoGetEx(
@@ -1107,11 +1225,13 @@ CoGetEx(
     PCO_LOOKUP_RESULT Result
     )
 {
+    NTSTATUS status;
+    PVOID data = NULL;
+    SIZE_T dataSize = 0;
     PCO_CACHE_ENTRY entry;
     ULONG bucketIndex;
     PCO_HASH_BUCKET bucket;
     LARGE_INTEGER currentTime;
-    PVOID dataCopy = NULL;
 
     if (Result == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1120,111 +1240,36 @@ CoGetEx(
     RtlZeroMemory(Result, sizeof(CO_LOOKUP_RESULT));
     Result->Key = Key;
 
-    if (Cache == NULL || !Cache->Initialized || Cache->ShuttingDown) {
-        Result->Result = CoResultNotInitialized;
-        return STATUS_INVALID_PARAMETER;
-    }
+    status = CoGet(Cache, Key, &data, &dataSize);
 
-    InterlockedIncrement64(&Cache->Stats.TotalLookups);
-    if (Cache->Manager != NULL) {
-        InterlockedIncrement64(&Cache->Manager->TotalOperations);
-    }
+    if (NT_SUCCESS(status)) {
+        Result->Result = CoResultSuccess;
+        Result->Data = data;
+        Result->DataSize = dataSize;
 
-    bucketIndex = CoGetBucketIndex(Cache, Key);
-    bucket = &Cache->Buckets[bucketIndex];
-    currentTime = CopGetCurrentTime();
+        //
+        // Get additional entry info
+        //
+        bucketIndex = CoGetBucketIndex(Cache, Key);
+        bucket = &Cache->Buckets[bucketIndex];
+        currentTime = CopGetCurrentTime();
 
-    ExAcquirePushLockShared(&bucket->Lock);
-
-    entry = CopFindEntryInBucket(Cache, bucketIndex, Key);
-
-    if (entry == NULL) {
-        ExReleasePushLockShared(&bucket->Lock);
-        Result->Result = CoResultNotFound;
-        goto Miss;
-    }
-
-    if (CopIsEntryExpired(entry, &currentTime)) {
-        ExReleasePushLockShared(&bucket->Lock);
-
-        ExAcquirePushLockExclusive(&bucket->Lock);
+        ExAcquirePushLockShared(&bucket->Lock);
         entry = CopFindEntryInBucket(Cache, bucketIndex, Key);
-        if (entry != NULL && CopIsEntryExpired(entry, &currentTime)) {
-            CopRemoveEntryFromCache(Cache, entry, TRUE);
-            InterlockedIncrement64(&Cache->Stats.TTLEvictions);
+        if (entry != NULL) {
+            Result->CreateTime = entry->CreateTime;
+            Result->ExpireTime = entry->ExpireTime;
+            Result->AccessCount = entry->AccessCount;
+            Result->WasExpired = FALSE;
         }
-        ExReleasePushLockExclusive(&bucket->Lock);
-
-        Result->Result = CoResultExpired;
-        Result->WasExpired = TRUE;
-        goto Miss;
+        ExReleasePushLockShared(&bucket->Lock);
+    } else if (status == STATUS_NOT_FOUND) {
+        Result->Result = CoResultNotFound;
+    } else {
+        Result->Result = CoResultError;
     }
 
-    /*
-     * Copy data under lock. Allocate a buffer and copy.
-     * This is the safe path — no use-after-free. (Fix #1)
-     */
-    if (entry->Data != NULL && entry->DataSize > 0) {
-        dataCopy = ShadowStrikeAllocatePoolWithTag(
-            NonPagedPoolNx,
-            entry->DataSize,
-            CO_DATA_POOL_TAG
-        );
-        if (dataCopy != NULL) {
-            RtlCopyMemory(dataCopy, entry->Data, entry->DataSize);
-        }
-    }
-
-    Result->Result = CoResultSuccess;
-    Result->Data = dataCopy;
-    Result->DataSize = entry->DataSize;
-    Result->CreateTime = entry->CreateTime;
-    Result->ExpireTime = entry->ExpireTime;
-    Result->AccessCount = entry->AccessCount;
-    Result->WasExpired = FALSE;
-
-    InterlockedExchange64(&entry->LastAccessTimeQpc, currentTime.QuadPart);
-    InterlockedIncrement(&entry->AccessCount);
-    InterlockedIncrement(&entry->HitCount);
-
-    if (entry->HitCount >= CO_LRU_PROMOTION_THRESHOLD) {
-        InterlockedExchange(&entry->HitCount, 0);
-        CopPromoteInLRU(Cache, entry);
-    }
-
-    ExReleasePushLockShared(&bucket->Lock);
-
-    InterlockedIncrement64(&Cache->Stats.Hits);
-    if (Cache->Manager != NULL) {
-        InterlockedIncrement64(&Cache->Manager->TotalHits);
-    }
-
-    return STATUS_SUCCESS;
-
-Miss:
-    InterlockedIncrement64(&Cache->Stats.Misses);
-    if (Cache->Manager != NULL) {
-        InterlockedIncrement64(&Cache->Manager->TotalMisses);
-    }
-    return STATUS_NOT_FOUND;
-}
-
-_Use_decl_annotations_
-VOID
-CoFreeLookupResult(
-    PCO_LOOKUP_RESULT Result
-    )
-{
-    if (Result == NULL) {
-        return;
-    }
-
-    if (Result->Data != NULL) {
-        ShadowStrikeFreePoolWithTag(Result->Data, CO_DATA_POOL_TAG);
-        Result->Data = NULL;
-    }
-
-    Result->DataSize = 0;
+    return status;
 }
 
 _Use_decl_annotations_
@@ -1260,9 +1305,9 @@ CoContains(
     return found;
 }
 
-/* ========================================================================= */
-/* CACHE OPERATIONS - INVALIDATE / TOUCH / PIN / UNPIN                        */
-/* ========================================================================= */
+// ============================================================================
+// CACHE OPERATIONS - INVALIDATE/TOUCH/PIN
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -1326,13 +1371,11 @@ CoTouch(
         return STATUS_NOT_FOUND;
     }
 
-    /* Atomic access time update (Fix #16) */
-    InterlockedExchange64(&entry->LastAccessTimeQpc, currentTime.QuadPart);
-
-    /* Promote under bucket lock — entry is alive (Fix #2) */
-    CopPromoteInLRU(Cache, entry);
+    CopUpdateAccessTime(entry);
 
     ExReleasePushLockShared(&bucket->Lock);
+
+    CopPromoteInLRU(Cache, entry);
 
     return STATUS_SUCCESS;
 }
@@ -1405,9 +1448,9 @@ CoUnpin(
     return STATUS_SUCCESS;
 }
 
-/* ========================================================================= */
-/* STATISTICS AND MONITORING (NO FLOATING-POINT)                              */
-/* ========================================================================= */
+// ============================================================================
+// STATISTICS AND MONITORING
+// ============================================================================
 
 _Use_decl_annotations_
 VOID
@@ -1433,6 +1476,9 @@ CoResetStats(
         return;
     }
 
+    //
+    // Reset counters but preserve current state metrics
+    //
     InterlockedExchange64(&Cache->Stats.TotalLookups, 0);
     InterlockedExchange64(&Cache->Stats.Hits, 0);
     InterlockedExchange64(&Cache->Stats.Misses, 0);
@@ -1449,11 +1495,8 @@ CoResetStats(
     InterlockedExchange64(&Cache->Stats.TotalInsertTimeNs, 0);
 }
 
-/**
- * @brief Get cache hit rate as permille (0-1000). No floating-point. (Fix #5, #19)
- */
 _Use_decl_annotations_
-ULONG
+double
 CoGetHitRate(
     PCO_CACHE Cache
     )
@@ -1463,7 +1506,7 @@ CoGetHitRate(
     LONG64 total;
 
     if (Cache == NULL) {
-        return 0;
+        return 0.0;
     }
 
     hits = Cache->Stats.Hits;
@@ -1471,10 +1514,10 @@ CoGetHitRate(
     total = hits + misses;
 
     if (total == 0) {
-        return 0;
+        return 0.0;
     }
 
-    return (ULONG)((hits * 1000) / total);
+    return (double)hits / (double)total;
 }
 
 _Use_decl_annotations_
@@ -1503,9 +1546,9 @@ CoGetMemoryUsage(
     return (SIZE_T)Cache->MemoryUsage;
 }
 
-/* ========================================================================= */
-/* MAINTENANCE FUNCTIONS                                                      */
-/* ========================================================================= */
+// ============================================================================
+// MAINTENANCE FUNCTIONS
+// ============================================================================
 
 _Use_decl_annotations_
 ULONG
@@ -1519,30 +1562,45 @@ CoRunMaintenance(
         return 0;
     }
 
+    //
+    // Mark maintenance as active
+    //
     if (InterlockedCompareExchange(&Cache->MaintenanceActive, TRUE, FALSE) != FALSE) {
+        //
+        // Already running
+        //
         return 0;
     }
 
+    //
+    // Evict expired entries
+    //
     evicted = CopEvictExpiredEntries(Cache, CO_EVICTION_BATCH_SIZE * 2);
 
+    //
+    // Update statistics
+    //
     InterlockedIncrement64(&Cache->Stats.MaintenanceCycles);
     KeQuerySystemTime(&Cache->Stats.LastMaintenanceTime);
 
+    //
+    // Check memory pressure and evict if needed
+    //
     if (Cache->Manager != NULL && Cache->Manager->MaxTotalMemory > 0) {
         LONG64 currentMem = Cache->Manager->CurrentTotalMemory;
         LONG64 maxMem = (LONG64)Cache->Manager->MaxTotalMemory;
+        ULONG pressurePercent = (ULONG)((currentMem * 100) / maxMem);
 
-        if (maxMem > 0) {
-            ULONG pressurePercent = (ULONG)((currentMem * 100) / maxMem);
-
-            if (pressurePercent > CO_MEMORY_PRESSURE_THRESHOLD) {
-                ULONG additionalEvictions = CopEvictLRUEntries(
-                    Cache,
-                    CO_EVICTION_BATCH_SIZE
-                );
-                evicted += additionalEvictions;
-                InterlockedAdd64(&Cache->Stats.MemoryEvictions, additionalEvictions);
-            }
+        if (pressurePercent > CO_MEMORY_PRESSURE_THRESHOLD) {
+            //
+            // Evict additional entries to reduce memory
+            //
+            ULONG additionalEvictions = CopEvictLRUEntries(
+                Cache,
+                CO_EVICTION_BATCH_SIZE
+            );
+            evicted += additionalEvictions;
+            InterlockedAdd64(&Cache->Stats.MemoryEvictions, additionalEvictions);
         }
     }
 
@@ -1572,10 +1630,13 @@ CoEvictToSize(
         return 0;
     }
 
+    //
+    // Evict in batches until we reach target
+    //
     while ((SIZE_T)Cache->MemoryUsage > TargetBytes && Cache->EntryCount > 0) {
         evictBatch = CopEvictLRUEntries(Cache, CO_EVICTION_BATCH_SIZE);
         if (evictBatch == 0) {
-            break;
+            break;  // No more evictable entries
         }
     }
 
@@ -1583,11 +1644,12 @@ CoEvictToSize(
     return bytesFreed;
 }
 
-/* ========================================================================= */
-/* INTERNAL HELPER FUNCTIONS                                                  */
-/* ========================================================================= */
+// ============================================================================
+// INTERNAL HELPER FUNCTIONS
+// ============================================================================
 
-static NTSTATUS
+static
+NTSTATUS
 CopAllocateEntry(
     _In_ PCO_CACHE Cache,
     _Out_ PCO_CACHE_ENTRY* Entry
@@ -1622,7 +1684,8 @@ CopAllocateEntry(
     return STATUS_SUCCESS;
 }
 
-static VOID
+static
+VOID
 CopFreeEntry(
     _In_ PCO_CACHE Cache,
     _In_ PCO_CACHE_ENTRY Entry
@@ -1632,11 +1695,16 @@ CopFreeEntry(
         return;
     }
 
+    //
+    // Free owned data
+    //
     if (Entry->DataOwned && Entry->Data != NULL) {
         ShadowStrikeFreePoolWithTag(Entry->Data, CO_DATA_POOL_TAG);
-        Entry->Data = NULL;
     }
 
+    //
+    // Free entry
+    //
     if (Cache->LookasideInitialized) {
         ExFreeToNPagedLookasideList(&Cache->EntryLookaside, Entry);
     } else {
@@ -1644,7 +1712,8 @@ CopFreeEntry(
     }
 }
 
-static PCO_CACHE_ENTRY
+static
+PCO_CACHE_ENTRY
 CopFindEntryInBucket(
     _In_ PCO_CACHE Cache,
     _In_ ULONG BucketIndex,
@@ -1654,8 +1723,6 @@ CopFindEntryInBucket(
     PLIST_ENTRY listEntry;
     PCO_CACHE_ENTRY entry;
     PCO_HASH_BUCKET bucket;
-
-    UNREFERENCED_PARAMETER(Cache);
 
     bucket = &Cache->Buckets[BucketIndex];
 
@@ -1673,7 +1740,8 @@ CopFindEntryInBucket(
     return NULL;
 }
 
-static VOID
+static
+VOID
 CopInsertIntoLRU(
     _In_ PCO_CACHE Cache,
     _In_ PCO_CACHE_ENTRY Entry
@@ -1684,12 +1752,18 @@ CopInsertIntoLRU(
     shard = &Cache->Shards[Entry->ShardIndex];
 
     ExAcquirePushLockExclusive(&shard->LRULock);
+
+    //
+    // Insert at head (most recently used)
+    //
     InsertHeadList(&shard->LRUHead, &Entry->LRUEntry);
     InterlockedIncrement(&shard->EntryCount);
+
     ExReleasePushLockExclusive(&shard->LRULock);
 }
 
-static VOID
+static
+VOID
 CopRemoveFromLRU(
     _In_ PCO_CACHE Cache,
     _In_ PCO_CACHE_ENTRY Entry
@@ -1710,13 +1784,8 @@ CopRemoveFromLRU(
     ExReleasePushLockExclusive(&shard->LRULock);
 }
 
-/**
- * @brief Promote entry to MRU position in its shard.
- *
- * Called while the caller holds the bucket lock (shared or exclusive).
- * Lock order: bucket → shard LRU ✓ (Fix #2, #4)
- */
-static VOID
+static
+VOID
 CopPromoteInLRU(
     _In_ PCO_CACHE Cache,
     _In_ PCO_CACHE_ENTRY Entry
@@ -1729,72 +1798,70 @@ CopPromoteInLRU(
     ExAcquirePushLockExclusive(&shard->LRULock);
 
     if (!IsListEmpty(&Entry->LRUEntry)) {
+        //
+        // Remove from current position
+        //
         RemoveEntryList(&Entry->LRUEntry);
+
+        //
+        // Insert at head (MRU position)
+        //
         InsertHeadList(&shard->LRUHead, &Entry->LRUEntry);
     }
 
     ExReleasePushLockExclusive(&shard->LRULock);
 }
 
-/**
- * @brief Evict the LRU entry from a shard.
- *
- * Lock order: acquires shard LRU lock → bucket lock → global list lock. (Fix #4)
- *
- * Wait — this is bucket AFTER shard, which violates our stated lock order!
- * Resolution: We grab the entry pointer and its BucketIndex under the shard
- * lock, RELEASE the shard lock (having already removed the LRU entry from
- * the shard list), then acquire the bucket lock independently.
- * This is safe because:
- *   1. The entry's LRUEntry is removed from the shard list, so no other LRU
- *      operation can see it.
- *   2. The entry is still linked in the bucket's hash chain, so it won't be
- *      freed by anyone else until we remove it from the bucket.
- *   3. We set State = Evicting atomically so concurrent readers see it.
- *
- * @return TRUE if an entry was actually evicted, FALSE otherwise. (Fix #7)
- */
-static BOOLEAN
+static
+VOID
 CopEvictLRUEntry(
     _In_ PCO_CACHE Cache,
-    _In_ PCO_CACHE_SHARD Shard
+    _In_ PCO_CACHE_SHARD* Shard
     )
 {
     PLIST_ENTRY tailEntry;
     PCO_CACHE_ENTRY entry;
     PCO_HASH_BUCKET bucket;
-    ULONG bucketIndex;
-    SIZE_T memoryFreed;
 
+    //
+    // Get LRU entry (tail of list)
+    //
     ExAcquirePushLockExclusive(&Shard->LRULock);
 
     if (IsListEmpty(&Shard->LRUHead)) {
         ExReleasePushLockExclusive(&Shard->LRULock);
-        return FALSE;
+        return;
     }
 
     tailEntry = Shard->LRUHead.Blink;
     entry = CONTAINING_RECORD(tailEntry, CO_CACHE_ENTRY, LRUEntry);
 
-    /* Don't evict pinned entries (Fix #7) */
+    //
+    // Don't evict pinned entries
+    //
     if (entry->State == CoEntryStatePinned) {
         ExReleasePushLockExclusive(&Shard->LRULock);
-        return FALSE;
+        return;
     }
 
-    /* Remove from LRU list while we hold the shard lock */
+    //
+    // Remove from LRU
+    //
     RemoveEntryList(&entry->LRUEntry);
     InitializeListHead(&entry->LRUEntry);
     InterlockedDecrement(&Shard->EntryCount);
 
     ExReleasePushLockExclusive(&Shard->LRULock);
 
-    /* Mark as evicting so concurrent readers skip it */
+    //
+    // Mark as evicting
+    //
     InterlockedExchange(&entry->State, CoEntryStateEvicting);
 
-    /* Now acquire bucket lock to remove from hash chain */
-    bucketIndex = entry->BucketIndex;
-    bucket = &Cache->Buckets[bucketIndex];
+    //
+    // Remove from bucket
+    //
+    bucket = &Cache->Buckets[entry->BucketIndex];
 
     ExAcquirePushLockExclusive(&bucket->Lock);
     if (!IsListEmpty(&entry->HashEntry)) {
@@ -1804,7 +1871,9 @@ CopEvictLRUEntry(
     }
     ExReleasePushLockExclusive(&bucket->Lock);
 
-    /* Remove from global list (lock order: independent, no bucket held) */
+    //
+    // Remove from global list
+    //
     ExAcquirePushLockExclusive(&Cache->GlobalListLock);
     if (!IsListEmpty(&entry->GlobalEntry)) {
         RemoveEntryList(&entry->GlobalEntry);
@@ -1812,9 +1881,15 @@ CopEvictLRUEntry(
     }
     ExReleasePushLockExclusive(&Cache->GlobalListLock);
 
+    //
+    // Call cleanup callback
+    //
     CopCallCleanupCallback(Cache, entry);
 
-    memoryFreed = sizeof(CO_CACHE_ENTRY);
+    //
+    // Update memory tracking
+    //
+    SIZE_T memoryFreed = sizeof(CO_CACHE_ENTRY);
     if (entry->DataOwned && entry->Data != NULL) {
         memoryFreed += entry->DataSize;
     }
@@ -1825,16 +1900,21 @@ CopEvictLRUEntry(
         InterlockedAdd64(&Cache->Manager->CurrentTotalMemory, -(LONG64)memoryFreed);
     }
 
+    //
+    // Update counters
+    //
     InterlockedDecrement(&Cache->EntryCount);
     InterlockedDecrement(&Cache->Stats.CurrentEntries);
     InterlockedIncrement64(&Shard->Evictions);
 
+    //
+    // Free entry
+    //
     CopFreeEntry(Cache, entry);
-
-    return TRUE;
 }
 
-static BOOLEAN
+static
+BOOLEAN
 CopIsEntryExpired(
     _In_ PCO_CACHE_ENTRY Entry,
     _In_ PLARGE_INTEGER CurrentTime
@@ -1844,15 +1924,22 @@ CopIsEntryExpired(
         return FALSE;
     }
 
-    if (Entry->State == CoEntryStateEvicting ||
-        Entry->State == CoEntryStateInvalid) {
-        return FALSE;
-    }
-
     return CurrentTime->QuadPart >= Entry->ExpireTime.QuadPart;
 }
 
-static VOID
+static
+VOID
+CopUpdateAccessTime(
+    _In_ PCO_CACHE_ENTRY Entry
+    )
+{
+    LARGE_INTEGER currentTime;
+    KeQuerySystemTime(&currentTime);
+    Entry->LastAccessTime = currentTime;
+}
+
+static
+VOID
 CopCallCleanupCallback(
     _In_ PCO_CACHE Cache,
     _In_ PCO_CACHE_ENTRY Entry
@@ -1869,19 +1956,8 @@ CopCallCleanupCallback(
     }
 }
 
-/**
- * @brief Remove entry from cache, unlink from all lists, and free.
- *
- * PRECONDITION: Caller MUST hold the entry's bucket lock EXCLUSIVE.
- *
- * Lock acquisition order:
- *   - Bucket lock: already held by caller ✓
- *   - Shard LRU lock: acquired here (bucket → shard ✓)
- *   - Global list lock: acquired here (bucket → shard → global ✓)
- *
- * This enforces the global lock order. (Fix #3, #4, #13)
- */
-static VOID
+static
+VOID
 CopRemoveEntryFromCache(
     _In_ PCO_CACHE Cache,
     _In_ PCO_CACHE_ENTRY Entry,
@@ -1889,55 +1965,74 @@ CopRemoveEntryFromCache(
     )
 {
     SIZE_T memoryFreed;
+    PCO_HASH_BUCKET bucket;
 
+    //
+    // Mark as evicting
+    //
     InterlockedExchange(&Entry->State, CoEntryStateEvicting);
 
-    /* Remove from hash bucket — caller holds bucket lock exclusive */
+    //
+    // Remove from hash bucket (caller should hold bucket lock)
+    //
+    bucket = &Cache->Buckets[Entry->BucketIndex];
     if (!IsListEmpty(&Entry->HashEntry)) {
         RemoveEntryList(&Entry->HashEntry);
         InitializeListHead(&Entry->HashEntry);
-        InterlockedDecrement(&Cache->Buckets[Entry->BucketIndex].EntryCount);
+        InterlockedDecrement(&bucket->EntryCount);
     }
 
-    /* Remove from LRU (acquires shard LRU lock — lock order: bucket → shard ✓) */
+    //
+    // Remove from LRU
+    //
     CopRemoveFromLRU(Cache, Entry);
 
-    /* Remove from global list (acquires global list lock — lock order: bucket → shard → global ✓) */
-    ExAcquirePushLockExclusive(&Cache->GlobalListLock);
+    //
+    // Remove from global list (we may or may not hold this lock)
+    //
     if (!IsListEmpty(&Entry->GlobalEntry)) {
         RemoveEntryList(&Entry->GlobalEntry);
         InitializeListHead(&Entry->GlobalEntry);
     }
-    ExReleasePushLockExclusive(&Cache->GlobalListLock);
 
+    //
+    // Call cleanup callback if requested
+    //
     if (CallCleanup) {
         CopCallCleanupCallback(Cache, Entry);
     }
 
+    //
+    // Calculate memory freed
+    //
     memoryFreed = sizeof(CO_CACHE_ENTRY);
     if (Entry->DataOwned && Entry->Data != NULL) {
         memoryFreed += Entry->DataSize;
     }
 
+    //
+    // Update memory tracking
+    //
     InterlockedAdd64(&Cache->MemoryUsage, -(LONG64)memoryFreed);
     InterlockedAdd64(&Cache->Stats.CurrentMemory, -(LONG64)memoryFreed);
     if (Cache->Manager != NULL) {
         InterlockedAdd64(&Cache->Manager->CurrentTotalMemory, -(LONG64)memoryFreed);
     }
 
+    //
+    // Update counters
+    //
     InterlockedDecrement(&Cache->EntryCount);
     InterlockedDecrement(&Cache->Stats.CurrentEntries);
 
+    //
+    // Free entry
+    //
     CopFreeEntry(Cache, Entry);
 }
 
-/**
- * @brief Evict expired entries by scanning buckets.
- *
- * Acquires each bucket lock exclusively, then calls CopRemoveEntryFromCache
- * which follows the lock order (bucket → shard → global). (Fix #3, #4)
- */
-static ULONG
+static
+ULONG
 CopEvictExpiredEntries(
     _In_ PCO_CACHE Cache,
     _In_ ULONG MaxToEvict
@@ -1945,7 +2040,7 @@ CopEvictExpiredEntries(
 {
     ULONG evicted = 0;
     ULONG i;
-    PLIST_ENTRY listEntry;
+    PLIST_ENTRY entry;
     PLIST_ENTRY nextEntry;
     PCO_CACHE_ENTRY cacheEntry;
     LARGE_INTEGER currentTime;
@@ -1953,6 +2048,9 @@ CopEvictExpiredEntries(
 
     currentTime = CopGetCurrentTime();
 
+    //
+    // Scan buckets for expired entries
+    //
     for (i = 0; i < Cache->BucketCount && evicted < MaxToEvict; i++) {
         bucket = &Cache->Buckets[i];
 
@@ -1962,12 +2060,12 @@ CopEvictExpiredEntries(
 
         ExAcquirePushLockExclusive(&bucket->Lock);
 
-        for (listEntry = bucket->Head.Flink;
-             listEntry != &bucket->Head && evicted < MaxToEvict;
-             listEntry = nextEntry) {
+        for (entry = bucket->Head.Flink;
+             entry != &bucket->Head && evicted < MaxToEvict;
+             entry = nextEntry) {
 
-            nextEntry = listEntry->Flink;
-            cacheEntry = CONTAINING_RECORD(listEntry, CO_CACHE_ENTRY, HashEntry);
+            nextEntry = entry->Flink;
+            cacheEntry = CONTAINING_RECORD(entry, CO_CACHE_ENTRY, HashEntry);
 
             InterlockedIncrement64(&Cache->Stats.EntriesScanned);
 
@@ -1984,10 +2082,8 @@ CopEvictExpiredEntries(
     return evicted;
 }
 
-/**
- * @brief Evict LRU entries from shards. Returns ACTUAL eviction count. (Fix #7)
- */
-static ULONG
+static
+ULONG
 CopEvictLRUEntries(
     _In_ PCO_CACHE Cache,
     _In_ ULONG Count
@@ -1996,31 +2092,31 @@ CopEvictLRUEntries(
     ULONG evicted = 0;
     ULONG shardIndex;
 
+    //
+    // Round-robin through shards to evict entries
+    //
     for (shardIndex = 0; shardIndex < CO_SHARD_COUNT && evicted < Count; shardIndex++) {
         PCO_CACHE_SHARD shard = &Cache->Shards[shardIndex];
 
         while (shard->EntryCount > 0 && evicted < Count) {
-            if (CopEvictLRUEntry(Cache, shard)) {
-                evicted++;
-                InterlockedIncrement64(&Cache->Stats.LRUEvictions);
-            } else {
-                /* Shard is empty or all entries are pinned — move to next shard */
-                break;
-            }
+            CopEvictLRUEntry(Cache, shard);
+            evicted++;
+            InterlockedIncrement64(&Cache->Stats.LRUEvictions);
         }
     }
 
     return evicted;
 }
 
-static VOID
+static
+VOID
 CopMaintenanceWorker(
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_opt_ PVOID Context
     )
 {
     PCO_MANAGER manager = (PCO_MANAGER)Context;
-    PLIST_ENTRY listEntry;
+    PLIST_ENTRY entry;
     PCO_CACHE cache;
 
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -2032,13 +2128,16 @@ CopMaintenanceWorker(
         return;
     }
 
+    //
+    // Run maintenance on all caches
+    //
     ExAcquirePushLockShared(&manager->CacheListLock);
 
-    for (listEntry = manager->CacheList.Flink;
-         listEntry != &manager->CacheList;
-         listEntry = listEntry->Flink) {
+    for (entry = manager->CacheList.Flink;
+         entry != &manager->CacheList;
+         entry = entry->Flink) {
 
-        cache = CONTAINING_RECORD(listEntry, CO_CACHE, ManagerEntry);
+        cache = CONTAINING_RECORD(entry, CO_CACHE, ManagerEntry);
 
         if (cache->Initialized && !cache->ShuttingDown) {
             CoRunMaintenance(cache);
@@ -2047,12 +2146,16 @@ CopMaintenanceWorker(
 
     ExReleasePushLockShared(&manager->CacheListLock);
 
+    //
+    // Update memory pressure
+    //
     CopUpdateMemoryPressure(manager);
 
     InterlockedExchange(&manager->MaintenanceRunning, FALSE);
 }
 
-static VOID
+static
+VOID
 CopMaintenanceDpcRoutine(
     _In_ PKDPC Dpc,
     _In_opt_ PVOID DeferredContext,
@@ -2066,14 +2169,20 @@ CopMaintenanceDpcRoutine(
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (manager == NULL || manager->ShuttingDown || !manager->Initialized) {
+    if (manager == NULL || manager->ShuttingDown) {
         return;
     }
 
+    //
+    // Don't queue if already running
+    //
     if (InterlockedCompareExchange(&manager->MaintenanceRunning, TRUE, FALSE) != FALSE) {
         return;
     }
 
+    //
+    // Queue work item for passive level processing
+    //
     if (manager->MaintenanceWorkItem != NULL) {
         IoQueueWorkItem(
             manager->MaintenanceWorkItem,
@@ -2082,11 +2191,15 @@ CopMaintenanceDpcRoutine(
             manager
         );
     } else {
+        //
+        // No work item available, reset flag
+        //
         InterlockedExchange(&manager->MaintenanceRunning, FALSE);
     }
 }
 
-static VOID
+static
+VOID
 CopUpdateMemoryPressure(
     _In_ PCO_MANAGER Manager
     )
@@ -2094,21 +2207,14 @@ CopUpdateMemoryPressure(
     LONG64 currentMem;
     LONG64 maxMem;
     ULONG pressurePercent;
-    CO_MEMORY_PRESSURE_CALLBACK callback = NULL;
-    PVOID callbackContext = NULL;
 
-    maxMem = (LONG64)(SIZE_T)InterlockedCompareExchangePointer(
-        (PVOID volatile *)&Manager->MaxTotalMemory,
-        (PVOID)Manager->MaxTotalMemory,
-        (PVOID)Manager->MaxTotalMemory
-    );
-
-    if (maxMem == 0) {
-        InterlockedExchange(&Manager->MemoryPressure, 0);
+    if (Manager->MaxTotalMemory == 0) {
+        Manager->MemoryPressure = 0;
         return;
     }
 
     currentMem = Manager->CurrentTotalMemory;
+    maxMem = (LONG64)Manager->MaxTotalMemory;
 
     if (maxMem > 0) {
         pressurePercent = (ULONG)((currentMem * 100) / maxMem);
@@ -2116,27 +2222,24 @@ CopUpdateMemoryPressure(
         pressurePercent = 0;
     }
 
-    InterlockedExchange(&Manager->MemoryPressure, (LONG)pressurePercent);
+    InterlockedExchange(&Manager->MemoryPressure, pressurePercent);
 
-    /* Read callback + context atomically under lock (Fix #12) */
-    if (pressurePercent >= CO_MEMORY_PRESSURE_THRESHOLD) {
-        ExAcquirePushLockShared(&Manager->CallbackLock);
-        callback = Manager->MemoryCallback;
-        callbackContext = Manager->MemoryCallbackContext;
-        ExReleasePushLockShared(&Manager->CallbackLock);
-
-        if (callback != NULL) {
-            callback(
-                Manager,
-                (SIZE_T)currentMem,
-                (SIZE_T)maxMem,
-                callbackContext
-            );
-        }
+    //
+    // Invoke callback if registered
+    //
+    if (Manager->MemoryCallback != NULL &&
+        pressurePercent >= CO_MEMORY_PRESSURE_THRESHOLD) {
+        Manager->MemoryCallback(
+            Manager,
+            (SIZE_T)currentMem,
+            Manager->MaxTotalMemory,
+            Manager->MemoryCallbackContext
+        );
     }
 }
 
-static NTSTATUS
+static
+NTSTATUS
 CopValidateBucketCount(
     _In_ ULONG BucketCount,
     _Out_ PULONG ValidatedCount
@@ -2144,11 +2247,17 @@ CopValidateBucketCount(
 {
     ULONG count;
 
+    //
+    // Use default if zero
+    //
     if (BucketCount == 0) {
         *ValidatedCount = CO_DEFAULT_BUCKET_COUNT;
         return STATUS_SUCCESS;
     }
 
+    //
+    // Clamp to valid range
+    //
     count = BucketCount;
     if (count < CO_MIN_BUCKET_COUNT) {
         count = CO_MIN_BUCKET_COUNT;
@@ -2157,7 +2266,9 @@ CopValidateBucketCount(
         count = CO_MAX_BUCKET_COUNT;
     }
 
-    /* Round up to power of 2 */
+    //
+    // Round up to power of 2
+    //
     count--;
     count |= count >> 1;
     count |= count >> 2;
@@ -2166,6 +2277,9 @@ CopValidateBucketCount(
     count |= count >> 16;
     count++;
 
+    //
+    // Final bounds check after rounding
+    //
     if (count > CO_MAX_BUCKET_COUNT) {
         count = CO_MAX_BUCKET_COUNT;
     }

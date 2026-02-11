@@ -1,6 +1,31 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: PerformanceMonitor.h - Kernel driver performance monitoring
+
+    Purpose: Self-monitoring subsystem that tracks driver performance metrics
+    (callback latencies, memory usage, cache efficiency, event throughput)
+    to detect degradation and enforce resource budgets.
+
+    Naming: All public symbols use the SsPm prefix (ShadowStrike Performance Monitor)
+    to avoid collision with the PrivilegeMonitor PM_ namespace in this codebase.
+
+    IRQL Contracts:
+    - SsPmInitialize:           PASSIVE_LEVEL only
+    - SsPmShutdown:             PASSIVE_LEVEL only
+    - SsPmRecordSample:         <= DISPATCH_LEVEL (spin-lock safe)
+    - SsPmRecordLatency:        <= DISPATCH_LEVEL
+    - SsPmGetStats:             <= APC_LEVEL (PASSIVE preferred)
+    - SsPmSetThreshold:         <= APC_LEVEL
+    - SsPmRegisterAlertCallback:<= APC_LEVEL
+    - SsPmEnableCollection:     PASSIVE_LEVEL only
+    - SsPmDisableCollection:    PASSIVE_LEVEL only
+    - Alert callbacks:          Invoked at DISPATCH_LEVEL (from DPC context)
+
+    All statistics are integer-based (no floating point in kernel).
+    Percentages are stored as parts-per-10000 (basis points) for precision
+    without FP. Latencies are in 100ns ticks (KeQueryPerformanceCounter units
+    converted to QPC ticks).
+
     Copyright (c) ShadowStrike Team
 --*/
 
@@ -12,107 +37,155 @@ extern "C" {
 
 #include <ntddk.h>
 
-#define PM_POOL_TAG 'NOMP'
+//=============================================================================
+// Pool Tags
+//=============================================================================
 
-typedef enum _PM_METRIC_TYPE {
-    PmMetric_CallbackLatency = 0,
-    PmMetric_MemoryUsage,
-    PmMetric_PoolUsage,
-    PmMetric_LookasideHits,
-    PmMetric_LookasideMisses,
-    PmMetric_CacheHitRate,
-    PmMetric_EventsPerSecond,
-    PmMetric_DroppedEvents,
-    PmMetric_CPUUsage,
-    PmMetric_IOOperations,
-} PM_METRIC_TYPE;
+#define SSPM_POOL_TAG         'mPsS'   // SsP m(onitor)
+#define SSPM_POOL_TAG_SAMPLE  'sPsS'   // SsP s(ample)
 
-typedef struct _PM_METRIC_SAMPLE {
-    PM_METRIC_TYPE Type;
+//=============================================================================
+// Metric Types
+//=============================================================================
+
+typedef enum _SSPM_METRIC_TYPE {
+    SsPmMetric_CallbackLatencyUs = 0,   // Callback latency in microseconds
+    SsPmMetric_MemoryBytes,             // Total memory usage in bytes
+    SsPmMetric_PoolBytes,               // Pool allocation bytes
+    SsPmMetric_LookasideHits,           // Lookaside list hits (counter)
+    SsPmMetric_LookasideMisses,         // Lookaside list misses (counter)
+    SsPmMetric_CacheHitRateBps,         // Cache hit rate in basis points (0-10000)
+    SsPmMetric_EventsPerSecond,         // Event throughput
+    SsPmMetric_DroppedEvents,           // Dropped event counter
+    SsPmMetric_CpuTimeBps,             // CPU time in basis points (0-10000)
+    SsPmMetric_IOOperations,            // I/O operation counter
+    SsPmMetric_Count                    // Sentinel — MUST be last
+} SSPM_METRIC_TYPE;
+
+//
+// Compile-time check: ensure metric count fits in buffer array
+//
+C_ASSERT(SsPmMetric_Count <= 16);
+
+//=============================================================================
+// Ring Buffer Sample (no floating point, no LIST_ENTRY)
+//=============================================================================
+
+typedef struct _SSPM_SAMPLE {
     LARGE_INTEGER Timestamp;
-    
-    union {
-        ULONG64 Counter;
-        DOUBLE Percentage;
-        struct {
-            ULONG64 Value;
-            ULONG64 Max;
-        } Bounded;
-    } Value;
-    
-    LIST_ENTRY ListEntry;
-} PM_METRIC_SAMPLE, *PPM_METRIC_SAMPLE;
+    ULONG64 Value;              // Raw metric value (units depend on metric type)
+} SSPM_SAMPLE, *PSSPM_SAMPLE;
 
-typedef struct _PM_METRIC_STATS {
-    PM_METRIC_TYPE Type;
-    
+//=============================================================================
+// Statistics (integer-only, no floating point)
+//=============================================================================
+
+typedef struct _SSPM_METRIC_STATS {
+    SSPM_METRIC_TYPE Type;
     ULONG64 SampleCount;
-    DOUBLE Mean;
-    DOUBLE Min;
-    DOUBLE Max;
-    DOUBLE StandardDeviation;
-    DOUBLE Percentile95;
-    DOUBLE Percentile99;
-    
-    LARGE_INTEGER LastSampleTime;
-} PM_METRIC_STATS, *PPM_METRIC_STATS;
+    ULONG64 Mean;               // Average value
+    ULONG64 Min;
+    ULONG64 Max;
+    ULONG64 Percentile95;
+    ULONG64 Percentile99;
+    LARGE_INTEGER OldestSampleTime;
+    LARGE_INTEGER NewestSampleTime;
+} SSPM_METRIC_STATS, *PSSPM_METRIC_STATS;
 
-typedef struct _PM_THRESHOLD_ALERT {
-    PM_METRIC_TYPE Metric;
-    DOUBLE ThresholdValue;
-    DOUBLE CurrentValue;
-    BOOLEAN IsExceeded;
+//=============================================================================
+// Threshold Alert
+//=============================================================================
+
+typedef struct _SSPM_THRESHOLD_ALERT {
+    SSPM_METRIC_TYPE Metric;
+    ULONG64 ThresholdValue;     // Alert if metric exceeds this
+    ULONG64 CurrentValue;       // Value that triggered the alert
     LARGE_INTEGER AlertTime;
-    LIST_ENTRY ListEntry;
-} PM_THRESHOLD_ALERT, *PPM_THRESHOLD_ALERT;
+} SSPM_THRESHOLD_ALERT, *PSSPM_THRESHOLD_ALERT;
 
-typedef VOID (*PM_ALERT_CALLBACK)(
-    _In_ PPM_THRESHOLD_ALERT Alert,
+//
+// Alert callback — invoked at DISPATCH_LEVEL from DPC context.
+// Implementations MUST NOT block, allocate paged pool, or lower IRQL.
+//
+typedef VOID (*SSPM_ALERT_CALLBACK)(
+    _In_ PSSPM_THRESHOLD_ALERT Alert,
     _In_opt_ PVOID Context
 );
 
-typedef struct _PM_MONITOR {
-    BOOLEAN Initialized;
-    
-    // Sample storage (ring buffer per metric)
-    struct {
-        PPM_METRIC_SAMPLE Samples;
-        ULONG Capacity;
-        ULONG Head;
-        ULONG Count;
-        KSPIN_LOCK Lock;
-    } MetricBuffers[16];
-    
-    // Thresholds
-    LIST_ENTRY ThresholdList;
-    EX_PUSH_LOCK ThresholdLock;
-    
-    // Callback
-    PM_ALERT_CALLBACK AlertCallback;
-    PVOID AlertContext;
-    
-    // Periodic collection
-    KTIMER CollectionTimer;
-    KDPC CollectionDpc;
-    ULONG CollectionIntervalMs;
-    BOOLEAN CollectionEnabled;
-    
-    struct {
-        volatile LONG64 SamplesCollected;
-        volatile LONG64 AlertsTriggered;
-        LARGE_INTEGER StartTime;
-    } Stats;
-} PM_MONITOR, *PPM_MONITOR;
+//=============================================================================
+// Monitor Handle (opaque to callers; internals in .c file)
+//=============================================================================
 
-NTSTATUS PmInitialize(_Out_ PPM_MONITOR* Monitor);
-VOID PmShutdown(_Inout_ PPM_MONITOR Monitor);
-NTSTATUS PmRecordSample(_In_ PPM_MONITOR Monitor, _In_ PM_METRIC_TYPE Metric, _In_ ULONG64 Value);
-NTSTATUS PmRecordPercentage(_In_ PPM_MONITOR Monitor, _In_ PM_METRIC_TYPE Metric, _In_ DOUBLE Percentage);
-NTSTATUS PmGetStats(_In_ PPM_MONITOR Monitor, _In_ PM_METRIC_TYPE Metric, _Out_ PPM_METRIC_STATS Stats);
-NTSTATUS PmSetThreshold(_In_ PPM_MONITOR Monitor, _In_ PM_METRIC_TYPE Metric, _In_ DOUBLE Threshold);
-NTSTATUS PmRegisterAlertCallback(_In_ PPM_MONITOR Monitor, _In_ PM_ALERT_CALLBACK Callback, _In_opt_ PVOID Context);
-NTSTATUS PmEnableCollection(_In_ PPM_MONITOR Monitor, _In_ ULONG IntervalMs);
-NTSTATUS PmDisableCollection(_In_ PPM_MONITOR Monitor);
+typedef struct _SSPM_MONITOR SSPM_MONITOR, *PSSPM_MONITOR;
+
+//=============================================================================
+// Public API
+//=============================================================================
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+SsPmInitialize(
+    _Out_ PSSPM_MONITOR* Monitor
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+SsPmShutdown(
+    _Inout_ PSSPM_MONITOR Monitor
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+SsPmRecordSample(
+    _In_ PSSPM_MONITOR Monitor,
+    _In_ SSPM_METRIC_TYPE Metric,
+    _In_ ULONG64 Value
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+SsPmRecordLatency(
+    _In_ PSSPM_MONITOR Monitor,
+    _In_ SSPM_METRIC_TYPE Metric,
+    _In_ LARGE_INTEGER StartTick
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+SsPmGetStats(
+    _In_ PSSPM_MONITOR Monitor,
+    _In_ SSPM_METRIC_TYPE Metric,
+    _Out_ PSSPM_METRIC_STATS Stats
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+SsPmSetThreshold(
+    _In_ PSSPM_MONITOR Monitor,
+    _In_ SSPM_METRIC_TYPE Metric,
+    _In_ ULONG64 ThresholdValue
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+SsPmRegisterAlertCallback(
+    _In_ PSSPM_MONITOR Monitor,
+    _In_ SSPM_ALERT_CALLBACK Callback,
+    _In_opt_ PVOID Context
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+SsPmEnableCollection(
+    _In_ PSSPM_MONITOR Monitor,
+    _In_ ULONG IntervalMs
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+SsPmDisableCollection(
+    _In_ PSSPM_MONITOR Monitor
+    );
 
 #ifdef __cplusplus
 }

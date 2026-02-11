@@ -1,9 +1,18 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: SSLInspection.h
-    
+
     Purpose: TLS/SSL inspection for encrypted traffic analysis.
-    
+
+    Synchronization model:
+    - All public APIs require IRQL <= APC_LEVEL.
+    - EX_PUSH_LOCK used for all list protection.
+    - EX_RUNDOWN_REF used for safe shutdown draining.
+    - Sessions are reference-counted; callers receive a snapshot (SSL_SESSION_INFO)
+      that is a standalone copy — no pointers into internal lists.
+    - Internal sessions (SSL_SESSION) live on the SessionList and are
+      exclusively owned by the inspector; never returned to callers.
+
     Copyright (c) ShadowStrike Team
 --*/
 
@@ -20,8 +29,17 @@ extern "C" {
 // Pool Tags
 //=============================================================================
 
-#define SSL_POOL_TAG_SESSION    'SSLS'  // SSL - Session
-#define SSL_POOL_TAG_CERT       'CSLS'  // SSL - Certificate
+#define SSL_POOL_TAG_SESSION    'SSLS'  // SSL - Session (internal list entries)
+#define SSL_POOL_TAG_JA3        'JSLS'  // SSL - JA3 bad-list entries
+#define SSL_POOL_TAG_RESULT     'RSLS'  // SSL - Session info snapshots (returned to caller)
+
+//=============================================================================
+// Limits
+//=============================================================================
+
+#define SSL_MAX_ACTIVE_SESSIONS         65536
+#define SSL_MAX_BAD_JA3_ENTRIES         10000
+#define SSL_SESSION_STALE_MS            (5 * 60 * 1000)  // 5-minute TTL
 
 //=============================================================================
 // TLS Versions
@@ -37,7 +55,7 @@ typedef enum _SSL_VERSION {
 } SSL_VERSION;
 
 //=============================================================================
-// TLS Suspicion Flags
+// TLS Suspicion Flags — used with InterlockedOr, must be LONG-compatible
 //=============================================================================
 
 typedef enum _SSL_SUSPICION {
@@ -79,12 +97,15 @@ typedef struct _SSL_CERT_INFO {
 } SSL_CERT_INFO, *PSSL_CERT_INFO;
 
 //=============================================================================
-// TLS Session
+// SSL_SESSION_INFO — Caller-visible snapshot (value type, no list linkage)
+//
+// Returned from SslInspectClientHello. Caller owns this allocation and
+// must free it via SslFreeSessionInfo. Contains NO internal pointers.
 //=============================================================================
 
-typedef struct _SSL_SESSION {
+typedef struct _SSL_SESSION_INFO {
     ULONG64 SessionId;
-    
+
     // Connection
     HANDLE ProcessId;
     union {
@@ -93,69 +114,90 @@ typedef struct _SSL_SESSION {
     } RemoteAddress;
     USHORT RemotePort;
     BOOLEAN IsIPv6;
-    
+
     // TLS details
     SSL_VERSION Version;
     CHAR CipherSuite[64];
     CHAR ServerName[256];               // SNI
-    
+
     // JA3
     SSL_JA3 JA3;
-    
+
     // Certificate
     SSL_CERT_INFO Certificate;
-    
+
     // Suspicion
-    SSL_SUSPICION SuspicionFlags;
+    LONG SuspicionFlags;                // SSL_SUSPICION bitfield
     ULONG SuspicionScore;
-    
+
     // Timing
     LARGE_INTEGER HandshakeTime;
-    
-    LIST_ENTRY ListEntry;
-    
-} SSL_SESSION, *PSSL_SESSION;
+
+} SSL_SESSION_INFO, *PSSL_SESSION_INFO;
 
 //=============================================================================
 // SSL Inspector
 //=============================================================================
 
 typedef struct _SSL_INSPECTOR {
-    BOOLEAN Initialized;
-    
-    // Sessions
+    volatile LONG Initialized;
+
+    // Shutdown synchronization — every public API acquires rundown
+    EX_RUNDOWN_REF RundownRef;
+
+    // Sessions — protected by SessionLock
     LIST_ENTRY SessionList;
     EX_PUSH_LOCK SessionLock;
     volatile LONG SessionCount;
     volatile LONG64 NextSessionId;
-    
-    // Known bad JA3
+
+    // Known bad JA3 — protected by BadJA3Lock
     LIST_ENTRY BadJA3List;
     EX_PUSH_LOCK BadJA3Lock;
-    
+    volatile LONG BadJA3Count;
+
     // Statistics
     struct {
         volatile LONG64 HandshakesInspected;
         volatile LONG64 SuspiciousDetected;
         LARGE_INTEGER StartTime;
     } Stats;
-    
+
 } SSL_INSPECTOR, *PSSL_INSPECTOR;
 
 //=============================================================================
-// Public API
+// Rundown helpers
 //=============================================================================
 
+#define SSL_ACQUIRE_RUNDOWN(Inspector) \
+    ExAcquireRundownProtection(&(Inspector)->RundownRef)
+
+#define SSL_RELEASE_RUNDOWN(Inspector) \
+    ExReleaseRundownProtection(&(Inspector)->RundownRef)
+
+//=============================================================================
+// Public API
+//
+// All functions require IRQL <= APC_LEVEL (PASSIVE_LEVEL recommended).
+//=============================================================================
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 SslInitialize(
     _Out_ PSSL_INSPECTOR* Inspector
     );
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
 VOID
 SslShutdown(
     _Inout_ PSSL_INSPECTOR Inspector
     );
 
+//
+// SslInspectClientHello — parses ClientHello, creates internal session,
+// returns a SNAPSHOT copy to the caller. Caller must free via SslFreeSessionInfo.
+//
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SslInspectClientHello(
     _In_ PSSL_INSPECTOR Inspector,
@@ -165,9 +207,14 @@ SslInspectClientHello(
     _In_ BOOLEAN IsIPv6,
     _In_reads_bytes_(DataSize) PVOID ClientHello,
     _In_ ULONG DataSize,
-    _Out_ PSSL_SESSION* Session
+    _Out_ PSSL_SESSION_INFO* SessionInfo
     );
 
+//
+// SslInspectServerHello — parses ServerHello, updates the existing internal session.
+// All mutation is done under SessionLock exclusive.
+//
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SslInspectServerHello(
     _In_ PSSL_INSPECTOR Inspector,
@@ -178,6 +225,10 @@ SslInspectServerHello(
     _In_ ULONG DataSize
     );
 
+//
+// SslCalculateJA3 — standalone JA3 computation (no inspector state needed).
+//
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SslCalculateJA3(
     _In_reads_bytes_(DataSize) PVOID ClientHello,
@@ -185,6 +236,10 @@ SslCalculateJA3(
     _Out_ PSSL_JA3 JA3
     );
 
+//
+// SslAddBadJA3 — atomically checks for duplicate + inserts under exclusive lock.
+//
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SslAddBadJA3(
     _In_ PSSL_INSPECTOR Inspector,
@@ -192,6 +247,10 @@ SslAddBadJA3(
     _In_opt_ PCSTR MalwareFamily
     );
 
+//
+// SslCheckJA3 — checks if a JA3 hash matches the known-bad list.
+//
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SslCheckJA3(
     _In_ PSSL_INSPECTOR Inspector,
@@ -199,6 +258,18 @@ SslCheckJA3(
     _Out_ PBOOLEAN IsBad,
     _Out_writes_z_(FamilySize) PSTR MalwareFamily,
     _In_ ULONG FamilySize
+    );
+
+//
+// SslRemoveSession — removes and frees an internal session by endpoint.
+//
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+SslRemoveSession(
+    _In_ PSSL_INSPECTOR Inspector,
+    _In_ PVOID RemoteAddress,
+    _In_ USHORT RemotePort,
+    _In_ BOOLEAN IsIPv6
     );
 
 typedef struct _SSL_STATISTICS {
@@ -209,15 +280,31 @@ typedef struct _SSL_STATISTICS {
     LARGE_INTEGER UpTime;
 } SSL_STATISTICS, *PSSL_STATISTICS;
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SslGetStatistics(
     _In_ PSSL_INSPECTOR Inspector,
     _Out_ PSSL_STATISTICS Stats
     );
 
+//
+// SslFreeSessionInfo — frees a snapshot returned by SslInspectClientHello.
+// This is a pure free of the caller's copy — no list removal.
+//
+_IRQL_requires_max_(APC_LEVEL)
 VOID
-SslFreeSession(
-    _In_ PSSL_SESSION Session
+SslFreeSessionInfo(
+    _In_ _Post_invalid_ PSSL_SESSION_INFO SessionInfo
+    );
+
+//
+// SslCleanupStaleSessions — evicts sessions older than SSL_SESSION_STALE_MS.
+// Call periodically (e.g., from a timer work item).
+//
+_IRQL_requires_max_(APC_LEVEL)
+VOID
+SslCleanupStaleSessions(
+    _In_ PSSL_INSPECTOR Inspector
     );
 
 #ifdef __cplusplus

@@ -6,31 +6,35 @@
  * @file ResourceThrottling.h
  * @brief Enterprise-grade resource throttling for kernel-mode EDR operations.
  *
- * Provides CrowdStrike Falcon-class resource management with:
+ * Provides resource management with:
  * - Multi-dimensional resource tracking (CPU, Memory, I/O, Network, Callbacks)
  * - Adaptive throttling with configurable soft/hard limits
- * - Per-process and global resource quotas
+ * - Per-process and global resource quotas with per-process limit enforcement
  * - Real-time usage monitoring with DPC-based sampling
  * - Exponential backoff for sustained overload conditions
  * - Priority-based operation scheduling during throttling
- * - Integration with PerformanceMonitor for telemetry
  * - Work queue management for deferred operations
  * - Burst allowance with token bucket algorithm
  * - Automatic recovery when resources normalize
  *
- * Security Guarantees:
+ * Safety Guarantees:
  * - Prevents resource exhaustion attacks (DoS mitigation)
  * - Protects system stability under heavy load
  * - Atomic operations for all counter updates
- * - Safe cleanup with reference counting
+ * - Safe cleanup with EX_RUNDOWN_REF lifecycle management
  * - No deadlocks through lock ordering discipline
+ * - KSPIN_LOCK for all DPC-accessible state
  *
- * Performance Optimizations:
- * - Lock-free counters for hot paths
- * - Per-CPU sampling to reduce contention
- * - Tiered throttling to minimize impact
- * - Lazy evaluation of expensive metrics
- * - Cache-line aligned structures
+ * Performance:
+ * - Lock-free Interlocked* counters for hot-path usage reporting
+ * - Tiered throttling to minimize impact on normal operations
+ * - Lazy evaluation of expensive metrics (rate calc only in DPC)
+ *
+ * Memory Budget:
+ * - RT_THROTTLER is allocated from NonPagedPoolNx (~25KB base)
+ * - Per-process quota entries allocated individually from NonPagedPoolNx
+ *   (each ~310 bytes, up to RT_MAX_TRACKED_PROCESSES=256 = ~80KB max)
+ * - Deferred work items allocated individually (~64 bytes each)
  *
  * MITRE ATT&CK Coverage:
  * - T1499: Endpoint Denial of Service (resource exhaustion prevention)
@@ -38,7 +42,7 @@
  * - T1498: Network Denial of Service (bandwidth throttling)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -56,236 +60,109 @@ extern "C" {
 // POOL TAGS
 // ============================================================================
 
-/**
- * @brief Primary pool tag: 'RtTh' = Resource Throttling
- */
-#define RT_POOL_TAG                     'hTtR'
+/** @brief Primary pool tag: 'SsRt' = ShadowStrike Resource Throttling */
+#define RT_POOL_TAG                     'tRsS'
 
-/**
- * @brief Pool tag for work items
- */
-#define RT_WORKITEM_TAG                 'iWtR'
+/** @brief Pool tag for per-process quota entries: 'SsRp' */
+#define RT_PROCESS_TAG                  'pRsS'
 
-/**
- * @brief Pool tag for per-process tracking
- */
-#define RT_PROCESS_TAG                  'rPtR'
-
-/**
- * @brief Pool tag for deferred queue entries
- */
-#define RT_QUEUE_TAG                    'uQtR'
+/** @brief Pool tag for deferred queue entries: 'SsRq' */
+#define RT_QUEUE_TAG                    'qRsS'
 
 // ============================================================================
 // CONSTANTS
 // ============================================================================
 
-/**
- * @brief Maximum number of resource types
- */
 #define RT_MAX_RESOURCE_TYPES           16
-
-/**
- * @brief Maximum tracked processes for per-process throttling
- */
 #define RT_MAX_TRACKED_PROCESSES        256
-
-/**
- * @brief Default monitoring interval in milliseconds
- */
 #define RT_DEFAULT_MONITOR_INTERVAL_MS  100
-
-/**
- * @brief Minimum monitoring interval
- */
 #define RT_MIN_MONITOR_INTERVAL_MS      10
-
-/**
- * @brief Maximum monitoring interval
- */
 #define RT_MAX_MONITOR_INTERVAL_MS      10000
-
-/**
- * @brief Default burst allowance (token bucket capacity)
- */
 #define RT_DEFAULT_BURST_CAPACITY       100
-
-/**
- * @brief Token refill rate per second
- */
 #define RT_TOKEN_REFILL_RATE            10
-
-/**
- * @brief Maximum delay for throttled operations (ms)
- */
 #define RT_MAX_DELAY_MS                 1000
-
-/**
- * @brief Minimum delay for throttled operations (ms)
- */
 #define RT_MIN_DELAY_MS                 1
-
-/**
- * @brief Exponential backoff multiplier (fixed point: 1.5 = 150)
- */
 #define RT_BACKOFF_MULTIPLIER           150
-
-/**
- * @brief Backoff divisor for fixed point math
- */
 #define RT_BACKOFF_DIVISOR              100
-
-/**
- * @brief Maximum deferred queue depth
- */
 #define RT_MAX_DEFERRED_QUEUE_DEPTH     1024
-
-/**
- * @brief History window for rate calculations (samples)
- */
 #define RT_RATE_HISTORY_SIZE            64
-
-/**
- * @brief Hysteresis percentage for state transitions
- */
 #define RT_HYSTERESIS_PERCENT           10
+#define RT_PROCESS_HASH_BUCKETS         64
+
+/** @brief Sentinel for action enum validation */
+#define RT_ACTION_MAX_VALID             (RtActionEscalate)
+
+/** @brief Sentinel for state enum validation */
+#define RT_STATE_MAX_VALID              (RtStateRecovery)
 
 // ============================================================================
 // ENUMERATIONS
 // ============================================================================
 
 /**
- * @brief Resource types that can be throttled
+ * @brief Resource types that can be throttled.
  */
 typedef enum _RT_RESOURCE_TYPE {
-    /// CPU time consumption
     RtResourceCpu = 0,
-
-    /// Non-paged pool memory
     RtResourceMemoryNonPaged,
-
-    /// Paged pool memory
     RtResourceMemoryPaged,
-
-    /// Disk I/O operations per second
     RtResourceDiskIops,
-
-    /// Disk I/O bandwidth (bytes/sec)
     RtResourceDiskBandwidth,
-
-    /// Network I/O operations per second
     RtResourceNetworkIops,
-
-    /// Network I/O bandwidth (bytes/sec)
     RtResourceNetworkBandwidth,
-
-    /// Callback invocations per second
     RtResourceCallbackRate,
-
-    /// Event queue depth
     RtResourceEventQueue,
-
-    /// File system operations per second
     RtResourceFsOps,
-
-    /// Registry operations per second
     RtResourceRegOps,
-
-    /// Process/thread creation rate
     RtResourceProcessCreation,
-
-    /// Handle operations per second
     RtResourceHandleOps,
-
-    /// Memory mapping operations
     RtResourceMemoryMaps,
-
-    /// Custom resource type 1
     RtResourceCustom1,
-
-    /// Custom resource type 2
     RtResourceCustom2,
-
-    /// Sentinel value
     RtResourceMax
-
 } RT_RESOURCE_TYPE;
 
 /**
- * @brief Throttle actions when limits are exceeded
+ * @brief Throttle actions when limits are exceeded.
  */
 typedef enum _RT_THROTTLE_ACTION {
-    /// No action - allow operation
     RtActionNone = 0,
-
-    /// Add configurable delay to operation
     RtActionDelay,
-
-    /// Skip low-priority operations
     RtActionSkipLowPriority,
-
-    /// Queue operation for later processing
     RtActionQueue,
-
-    /// Sample operations (process 1 in N)
     RtActionSample,
-
-    /// Abort operation with status
     RtActionAbort,
-
-    /// Notify only (log but allow)
     RtActionNotify,
-
-    /// Escalate to higher severity response
     RtActionEscalate
-
 } RT_THROTTLE_ACTION;
 
 /**
- * @brief Throttle state for a resource
+ * @brief Throttle state for a resource.
  */
 typedef enum _RT_THROTTLE_STATE {
-    /// Normal operation - no throttling
     RtStateNormal = 0,
-
-    /// Warning level - soft limit exceeded
     RtStateWarning,
-
-    /// Throttled - hard limit exceeded
     RtStateThrottled,
-
-    /// Critical - emergency throttling active
     RtStateCritical,
-
-    /// Recovery - transitioning back to normal
     RtStateRecovery
-
 } RT_THROTTLE_STATE;
 
 /**
- * @brief Priority levels for operations
+ * @brief Priority levels for operations.
+ *
+ * ORDERING: Lower numeric value = higher importance.
+ * RtPriorityCritical (0) is never throttled.
+ * Comparisons use >= to mean "this priority or less important".
+ * Example: (Priority >= RtPriorityLow) matches Low and Background.
  */
 typedef enum _RT_PRIORITY {
-    /// Critical - never throttled
-    RtPriorityCritical = 0,
-
-    /// High - throttled only at critical state
-    RtPriorityHigh,
-
-    /// Normal - throttled at warning and above
-    RtPriorityNormal,
-
-    /// Low - throttled first
-    RtPriorityLow,
-
-    /// Background - always throttled when any limit exceeded
-    RtPriorityBackground
-
+    RtPriorityCritical = 0,     ///< Never throttled
+    RtPriorityHigh,             ///< Throttled only at critical state
+    RtPriorityNormal,           ///< Throttled at hard limit and above
+    RtPriorityLow,              ///< Throttled at warning and above
+    RtPriorityBackground        ///< Always throttled when any limit exceeded
 } RT_PRIORITY;
 
-/**
- * @brief Alert severity levels
- */
 typedef enum _RT_ALERT_SEVERITY {
     RtAlertInfo = 0,
     RtAlertWarning,
@@ -298,253 +175,147 @@ typedef enum _RT_ALERT_SEVERITY {
 // ============================================================================
 
 /**
- * @brief Configuration for a single resource limit
+ * @brief Configuration for a single resource limit.
  */
 typedef struct _RT_RESOURCE_CONFIG {
-    /// Resource type this config applies to
     RT_RESOURCE_TYPE Type;
-
-    /// Is this resource being monitored
     BOOLEAN Enabled;
-
-    /// Padding
     UCHAR Reserved[3];
-
-    /// Soft limit - triggers warning state
     ULONG64 SoftLimit;
-
-    /// Hard limit - triggers throttling
     ULONG64 HardLimit;
-
-    /// Critical limit - triggers emergency response
     ULONG64 CriticalLimit;
-
-    /// Action to take at soft limit
     RT_THROTTLE_ACTION SoftAction;
-
-    /// Action to take at hard limit
     RT_THROTTLE_ACTION HardAction;
-
-    /// Action to take at critical limit
     RT_THROTTLE_ACTION CriticalAction;
-
-    /// Delay in milliseconds for RtActionDelay
     ULONG DelayMs;
-
-    /// Sample rate for RtActionSample (1 in N)
     ULONG SampleRate;
-
-    /// Time window for rate-based limits (ms)
     ULONG RateWindowMs;
-
-    /// Burst allowance tokens
     ULONG BurstCapacity;
-
 } RT_RESOURCE_CONFIG, *PRT_RESOURCE_CONFIG;
 
 /**
- * @brief Current state of a resource
+ * @brief Current state of a resource.
+ *
+ * All fields protected by ResourceLock (KSPIN_LOCK) except
+ * CurrentUsage and PeakUsage which use Interlocked* access.
  */
 typedef struct _RT_RESOURCE_STATE {
-    /// Resource type
     RT_RESOURCE_TYPE Type;
-
-    /// Current throttle state
     RT_THROTTLE_STATE State;
-
-    /// Previous state (for hysteresis)
     RT_THROTTLE_STATE PreviousState;
 
-    /// Padding
-    UCHAR Reserved;
-
-    /// Current usage value (atomic)
+    /// Current usage value (Interlocked* access only)
     volatile LONG64 CurrentUsage;
 
-    /// Peak usage in current window
+    /// Peak usage in current window (Interlocked* access only)
     volatile LONG64 PeakUsage;
 
-    /// Usage at last sample
+    /// Usage at last sample (protected by ResourceLock)
     LONG64 LastSampleUsage;
 
-    /// Current rate (operations/second)
+    /// Current rate (Interlocked* for reads, ResourceLock for writes)
     volatile LONG64 CurrentRate;
 
-    /// Available burst tokens
+    /// Available burst tokens (Interlocked* CAS access)
     volatile LONG BurstTokens;
 
-    /// Consecutive samples over limit
     ULONG OverLimitCount;
-
-    /// Consecutive samples under limit
     ULONG UnderLimitCount;
-
-    /// Current delay (for exponential backoff)
     ULONG CurrentDelayMs;
 
-    /// Time entered current state
     LARGE_INTEGER StateEnterTime;
-
-    /// Last rate calculation time
     LARGE_INTEGER LastRateCalcTime;
 
-    /// Rate history for averaging
+    /// Separate timestamp for token refill (not shared with rate calc)
+    LARGE_INTEGER LastTokenRefillTime;
+
     LONG64 RateHistory[RT_RATE_HISTORY_SIZE];
     ULONG RateHistoryIndex;
     ULONG RateHistorySamples;
 
-    /// Lock for state updates (push lock for efficiency)
-    EX_PUSH_LOCK StateLock;
+    /// Per-resource spin lock — safe at DISPATCH_LEVEL (DPC)
+    KSPIN_LOCK ResourceLock;
 
 } RT_RESOURCE_STATE, *PRT_RESOURCE_STATE;
 
 /**
- * @brief Per-process resource tracking
+ * @brief Per-process resource tracking.
+ *
+ * Allocated individually from NonPagedPoolNx.
+ * Protected by ProcessQuotas.Lock (KSPIN_LOCK).
  */
 typedef struct _RT_PROCESS_QUOTA {
-    /// Process ID
     HANDLE ProcessId;
-
-    /// Is this entry in use
     BOOLEAN InUse;
-
-    /// Is this process exempt from throttling
     BOOLEAN Exempt;
-
-    /// Padding
     UCHAR Reserved[6];
-
-    /// Per-resource usage counters
     volatile LONG64 ResourceUsage[RT_MAX_RESOURCE_TYPES];
-
-    /// Per-resource rate counters
     volatile LONG64 ResourceRates[RT_MAX_RESOURCE_TYPES];
-
-    /// Throttle hit count
     volatile LONG64 ThrottleHits;
-
-    /// Last activity time
     LARGE_INTEGER LastActivity;
-
-    /// Hash chain link
     LIST_ENTRY HashLink;
 
+    /// Per-process soft limits (0 = use global)
+    ULONG64 ProcessSoftLimit[RT_MAX_RESOURCE_TYPES];
 } RT_PROCESS_QUOTA, *PRT_PROCESS_QUOTA;
 
 /**
- * @brief Deferred work item for queued operations
+ * @brief Deferred work item for queued operations.
  */
 typedef struct _RT_DEFERRED_WORK {
-    /// List entry for queue
     LIST_ENTRY ListEntry;
-
-    /// Resource type that triggered queueing
     RT_RESOURCE_TYPE ResourceType;
-
-    /// Priority of this work item
     RT_PRIORITY Priority;
-
-    /// Callback to execute
     PVOID Callback;
-
-    /// Context for callback
     PVOID Context;
-
-    /// Queue time for aging
     LARGE_INTEGER QueueTime;
-
-    /// Expiration time (0 = no expiration)
     LARGE_INTEGER ExpirationTime;
-
-    /// Reference count
-    volatile LONG RefCount;
-
 } RT_DEFERRED_WORK, *PRT_DEFERRED_WORK;
 
 /**
- * @brief Throttle event for callback notification
+ * @brief Throttle event for callback notification.
  */
 typedef struct _RT_THROTTLE_EVENT {
-    /// Resource that triggered the event
     RT_RESOURCE_TYPE Resource;
-
-    /// Action being taken
     RT_THROTTLE_ACTION Action;
-
-    /// New state
     RT_THROTTLE_STATE NewState;
-
-    /// Previous state
     RT_THROTTLE_STATE OldState;
-
-    /// Current usage value
     ULONG64 CurrentUsage;
-
-    /// Limit that was exceeded
     ULONG64 LimitValue;
-
-    /// Current rate (if rate-based)
     ULONG64 CurrentRate;
-
-    /// Process ID (if per-process throttling)
     HANDLE ProcessId;
-
-    /// Timestamp
     LARGE_INTEGER Timestamp;
-
 } RT_THROTTLE_EVENT, *PRT_THROTTLE_EVENT;
 
 /**
- * @brief Statistics for the throttling subsystem
+ * @brief Statistics for the throttling subsystem.
+ *
+ * Read via RtGetStatistics under StatsLock for consistent snapshot.
  */
 typedef struct _RT_STATISTICS {
-    /// Total operations checked
     volatile LONG64 TotalOperations;
-
-    /// Operations that were throttled
     volatile LONG64 ThrottledOperations;
-
-    /// Operations that were delayed
     volatile LONG64 DelayedOperations;
-
-    /// Operations that were queued
     volatile LONG64 QueuedOperations;
-
-    /// Operations that were skipped
     volatile LONG64 SkippedOperations;
-
-    /// Operations that were aborted
     volatile LONG64 AbortedOperations;
-
-    /// Total delay time imposed (ms)
     volatile LONG64 TotalDelayMs;
-
-    /// State transitions
     volatile LONG64 StateTransitions;
-
-    /// Alert notifications sent
     volatile LONG64 AlertsSent;
-
-    /// Deferred work items processed
     volatile LONG64 DeferredWorkProcessed;
-
-    /// Deferred work items expired
     volatile LONG64 DeferredWorkExpired;
-
-    /// Start time of statistics collection
     LARGE_INTEGER StartTime;
-
-    /// Per-resource statistics
     struct {
         volatile LONG64 Checks;
         volatile LONG64 Throttles;
         volatile LONG64 PeakUsage;
     } PerResource[RT_MAX_RESOURCE_TYPES];
-
 } RT_STATISTICS, *PRT_STATISTICS;
 
 /**
- * @brief Callback type for throttle notifications
+ * @brief Callback type for throttle notifications.
+ *
+ * Called at DISPATCH_LEVEL from DPC context.
  */
 typedef VOID (*PRT_THROTTLE_CALLBACK)(
     _In_ PRT_THROTTLE_EVENT Event,
@@ -552,52 +323,51 @@ typedef VOID (*PRT_THROTTLE_CALLBACK)(
 );
 
 /**
- * @brief Callback type for deferred work execution
+ * @brief Callback type for deferred work execution.
+ *
+ * Called at PASSIVE_LEVEL from system worker thread.
  */
 typedef NTSTATUS (*PRT_DEFERRED_CALLBACK)(
     _In_opt_ PVOID Context
 );
 
 /**
- * @brief Main throttler structure
+ * @brief Main throttler structure.
+ *
+ * Allocated from NonPagedPoolNx (accessed from DPC context).
+ * Lifecycle managed by EX_RUNDOWN_REF (RundownRef).
  */
 typedef struct _RT_THROTTLER {
-    /// Initialization flag
     BOOLEAN Initialized;
-
-    /// Is throttling globally enabled
     BOOLEAN Enabled;
-
-    /// Is monitoring active
     BOOLEAN MonitoringActive;
-
-    /// Padding
     UCHAR Reserved;
-
-    /// Magic value for validation
     ULONG Magic;
 
-    /// Resource configurations
+    /// Set to 1 before ExWaitForRundownProtectionRelease — safe to read at any IRQL
+    volatile LONG ShutdownFlag;
+
+    /// Resource configurations (protected by per-resource ResourceLock)
     RT_RESOURCE_CONFIG Configs[RT_MAX_RESOURCE_TYPES];
 
-    /// Resource states
+    /// Resource states (protected by per-resource ResourceLock)
     RT_RESOURCE_STATE States[RT_MAX_RESOURCE_TYPES];
 
-    /// Number of configured resources
-    ULONG ConfiguredResourceCount;
+    /// Number of configured resources (Interlocked* access)
+    volatile LONG ConfiguredResourceCount;
 
-    /// Global throttle callback
+    /// Callback — protected by CallbackSpinLock
     PRT_THROTTLE_CALLBACK ThrottleCallback;
     PVOID CallbackContext;
-    EX_PUSH_LOCK CallbackLock;           // For registration at APC_LEVEL
-    KSPIN_LOCK CallbackSpinLock;         // For invocation at DISPATCH_LEVEL
-    KEVENT CallbackNotifyEvent;          // For deferred callback notifications
+    KSPIN_LOCK CallbackSpinLock;
 
-    /// Per-process quota tracking
+    /// Callback rundown — prevents unregister during invocation
+    volatile LONG CallbackActiveCount;
+
+    /// Per-process quota tracking (protected by ProcessQuotas.Lock KSPIN_LOCK)
     struct {
-        RT_PROCESS_QUOTA Entries[RT_MAX_TRACKED_PROCESSES];
-        LIST_ENTRY HashBuckets[64];
-        EX_PUSH_LOCK Lock;
+        LIST_ENTRY HashBuckets[RT_PROCESS_HASH_BUCKETS];
+        KSPIN_LOCK Lock;
         volatile LONG ActiveCount;
     } ProcessQuotas;
 
@@ -609,7 +379,6 @@ typedef struct _RT_THROTTLER {
         LONG MaxDepth;
         KTIMER ProcessTimer;
         KDPC ProcessDpc;
-        KEVENT ShutdownEvent;
         BOOLEAN ProcessingEnabled;
     } DeferredWork;
 
@@ -618,17 +387,17 @@ typedef struct _RT_THROTTLER {
     KDPC MonitorDpc;
     ULONG MonitorIntervalMs;
 
-    /// Work item for PASSIVE_LEVEL processing
-    PIO_WORKITEM PassiveWorkItem;
-    volatile LONG PassiveWorkPending;
+    /// System worker thread for PASSIVE_LEVEL deferred work
+    HANDLE WorkerThreadHandle;
+    PETHREAD WorkerThread;
+    KEVENT WorkerWakeEvent;
+    volatile LONG WorkerShouldExit;
 
-    /// Shutdown synchronization
-    KEVENT ShutdownEvent;
-    volatile LONG ShutdownInProgress;
-    volatile LONG ActiveOperations;
+    /// Lifecycle management via rundown protection
+    EX_RUNDOWN_REF RundownRef;
 
-    /// Reference count for safe cleanup
-    volatile LONG ReferenceCount;
+    /// Spin lock protecting Stats snapshot
+    KSPIN_LOCK StatsLock;
 
     /// Statistics
     RT_STATISTICS Stats;
@@ -647,14 +416,8 @@ typedef struct _RT_THROTTLER {
 /**
  * @brief Initialize the resource throttling subsystem.
  *
- * Creates and initializes a throttler instance with default configuration.
- * Must be called at PASSIVE_LEVEL during driver initialization.
- *
  * @param Throttler     Receives pointer to initialized throttler
- *
- * @return STATUS_SUCCESS on success
- * @return STATUS_INSUFFICIENT_RESOURCES if allocation fails
- *
+ * @return STATUS_SUCCESS or STATUS_INSUFFICIENT_RESOURCES
  * @irql PASSIVE_LEVEL
  */
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -667,37 +430,22 @@ RtInitialize(
 /**
  * @brief Shutdown and cleanup the throttling subsystem.
  *
- * Stops monitoring, drains deferred work queue, and releases all resources.
- * Waits for all active operations to complete.
+ * Stops monitoring, drains deferred work, waits for active operations,
+ * then frees all resources. Sets caller's pointer to NULL.
  *
- * @param Throttler     Throttler to shutdown (set to NULL on return)
- *
+ * @param Throttler     Pointer to throttler pointer (NULLed on return)
  * @irql PASSIVE_LEVEL
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 RtShutdown(
-    _Inout_ PRT_THROTTLER Throttler
+    _Inout_ PRT_THROTTLER* Throttler
 );
 
 // ============================================================================
-// CONFIGURATION
+// CONFIGURATION (all <= APC_LEVEL)
 // ============================================================================
 
-/**
- * @brief Configure limits for a resource type.
- *
- * @param Throttler     Throttler instance
- * @param Resource      Resource type to configure
- * @param SoftLimit     Soft limit (warning threshold)
- * @param HardLimit     Hard limit (throttling threshold)
- * @param CriticalLimit Critical limit (emergency threshold)
- *
- * @return STATUS_SUCCESS on success
- * @return STATUS_INVALID_PARAMETER if limits are invalid
- *
- * @irql <= APC_LEVEL
- */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 RtSetLimits(
@@ -708,20 +456,6 @@ RtSetLimits(
     _In_ ULONG64 CriticalLimit
 );
 
-/**
- * @brief Configure actions for a resource type.
- *
- * @param Throttler     Throttler instance
- * @param Resource      Resource type to configure
- * @param SoftAction    Action at soft limit
- * @param HardAction    Action at hard limit
- * @param CriticalAction Action at critical limit
- * @param DelayMs       Delay for RtActionDelay (1-1000ms)
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= APC_LEVEL
- */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 RtSetActions(
@@ -733,18 +467,6 @@ RtSetActions(
     _In_ ULONG DelayMs
 );
 
-/**
- * @brief Configure rate-based limiting for a resource.
- *
- * @param Throttler     Throttler instance
- * @param Resource      Resource type to configure
- * @param RateWindowMs  Time window for rate calculation (ms)
- * @param BurstCapacity Maximum burst tokens
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= APC_LEVEL
- */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 RtSetRateConfig(
@@ -754,17 +476,6 @@ RtSetRateConfig(
     _In_ ULONG BurstCapacity
 );
 
-/**
- * @brief Enable or disable a resource for throttling.
- *
- * @param Throttler     Throttler instance
- * @param Resource      Resource type
- * @param Enable        TRUE to enable, FALSE to disable
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 RtEnableResource(
@@ -773,17 +484,6 @@ RtEnableResource(
     _In_ BOOLEAN Enable
 );
 
-/**
- * @brief Register callback for throttle events.
- *
- * @param Throttler     Throttler instance
- * @param Callback      Callback function
- * @param Context       Context passed to callback
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= APC_LEVEL
- */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 RtRegisterCallback(
@@ -795,7 +495,8 @@ RtRegisterCallback(
 /**
  * @brief Unregister throttle callback.
  *
- * @param Throttler     Throttler instance
+ * Waits for any in-flight callback invocations to complete
+ * before clearing the callback pointer.
  *
  * @irql <= APC_LEVEL
  */
@@ -809,16 +510,6 @@ RtUnregisterCallback(
 // MONITORING CONTROL
 // ============================================================================
 
-/**
- * @brief Start resource monitoring.
- *
- * @param Throttler     Throttler instance
- * @param IntervalMs    Monitoring interval in milliseconds
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= APC_LEVEL
- */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 RtStartMonitoring(
@@ -826,13 +517,6 @@ RtStartMonitoring(
     _In_ ULONG IntervalMs
 );
 
-/**
- * @brief Stop resource monitoring.
- *
- * @param Throttler     Throttler instance
- *
- * @irql <= APC_LEVEL
- */
 _IRQL_requires_max_(APC_LEVEL)
 VOID
 RtStopMonitoring(
@@ -843,19 +527,6 @@ RtStopMonitoring(
 // USAGE REPORTING AND THROTTLE CHECKING
 // ============================================================================
 
-/**
- * @brief Report resource usage increment.
- *
- * Atomically adds delta to current usage counter.
- *
- * @param Throttler     Throttler instance
- * @param Resource      Resource type
- * @param Delta         Usage increment
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 RtReportUsage(
@@ -864,19 +535,6 @@ RtReportUsage(
     _In_ LONG64 Delta
 );
 
-/**
- * @brief Report absolute resource usage.
- *
- * Sets the current usage to an absolute value.
- *
- * @param Throttler     Throttler instance
- * @param Resource      Resource type
- * @param Value         Absolute usage value
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 RtSetUsage(
@@ -885,22 +543,6 @@ RtSetUsage(
     _In_ ULONG64 Value
 );
 
-/**
- * @brief Check if operation should be throttled.
- *
- * Main throttle decision function. Returns recommended action.
- *
- * @param Throttler     Throttler instance
- * @param Resource      Resource type to check
- * @param Priority      Operation priority
- * @param Action        Receives recommended action
- *
- * @return STATUS_SUCCESS if operation should proceed
- * @return STATUS_DEVICE_BUSY if operation should be delayed/queued
- * @return STATUS_QUOTA_EXCEEDED if operation should be aborted
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
 NTSTATUS
@@ -911,17 +553,6 @@ RtCheckThrottle(
     _Out_ PRT_THROTTLE_ACTION Action
 );
 
-/**
- * @brief Simplified throttle check returning boolean.
- *
- * @param Throttler     Throttler instance
- * @param Resource      Resource type to check
- * @param Priority      Operation priority
- *
- * @return TRUE if operation should proceed, FALSE if throttled
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 RtShouldProceed(
@@ -930,22 +561,6 @@ RtShouldProceed(
     _In_ RT_PRIORITY Priority
 );
 
-/**
- * @brief Apply throttle action (delay if needed).
- *
- * Executes the throttle action, including delays.
- * For RtActionDelay, blocks for the configured delay period.
- *
- * @param Throttler     Throttler instance
- * @param Resource      Resource type
- * @param Action        Action to apply
- *
- * @return STATUS_SUCCESS if operation should continue
- * @return STATUS_CANCELLED if operation should abort
- *
- * @irql PASSIVE_LEVEL (for delay actions)
- * @irql <= DISPATCH_LEVEL (for non-delay actions)
- */
 _When_(Action == RtActionDelay, _IRQL_requires_(PASSIVE_LEVEL))
 _When_(Action != RtActionDelay, _IRQL_requires_max_(DISPATCH_LEVEL))
 NTSTATUS
@@ -961,14 +576,6 @@ RtApplyThrottle(
 
 /**
  * @brief Report per-process resource usage.
- *
- * @param Throttler     Throttler instance
- * @param ProcessId     Process ID
- * @param Resource      Resource type
- * @param Delta         Usage increment
- *
- * @return STATUS_SUCCESS on success
- *
  * @irql <= DISPATCH_LEVEL
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -983,12 +590,8 @@ RtReportProcessUsage(
 /**
  * @brief Check per-process throttle status.
  *
- * @param Throttler     Throttler instance
- * @param ProcessId     Process ID
- * @param Resource      Resource type
- * @param Action        Receives recommended action
- *
- * @return STATUS_SUCCESS or throttle status
+ * Checks per-process limits first; falls back to global if no
+ * per-process limit is set.
  *
  * @irql <= DISPATCH_LEVEL
  */
@@ -1002,17 +605,6 @@ RtCheckProcessThrottle(
     _Out_ PRT_THROTTLE_ACTION Action
 );
 
-/**
- * @brief Exempt a process from throttling.
- *
- * @param Throttler     Throttler instance
- * @param ProcessId     Process ID to exempt
- * @param Exempt        TRUE to exempt, FALSE to remove exemption
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= APC_LEVEL
- */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 RtSetProcessExemption(
@@ -1021,16 +613,6 @@ RtSetProcessExemption(
     _In_ BOOLEAN Exempt
 );
 
-/**
- * @brief Remove process from tracking.
- *
- * Call when process terminates to free tracking resources.
- *
- * @param Throttler     Throttler instance
- * @param ProcessId     Process ID to remove
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 RtRemoveProcess(
@@ -1042,20 +624,6 @@ RtRemoveProcess(
 // DEFERRED WORK QUEUE
 // ============================================================================
 
-/**
- * @brief Queue work for deferred execution.
- *
- * @param Throttler     Throttler instance
- * @param Callback      Work callback function
- * @param Context       Context for callback
- * @param Priority      Work priority
- * @param TimeoutMs     Timeout in ms (0 = no timeout)
- *
- * @return STATUS_SUCCESS if queued
- * @return STATUS_QUOTA_EXCEEDED if queue is full
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 RtQueueDeferredWork(
@@ -1066,15 +634,6 @@ RtQueueDeferredWork(
     _In_ ULONG TimeoutMs
 );
 
-/**
- * @brief Get deferred work queue depth.
- *
- * @param Throttler     Throttler instance
- *
- * @return Current queue depth
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 LONG
 RtGetDeferredQueueDepth(
@@ -1085,19 +644,6 @@ RtGetDeferredQueueDepth(
 // STATE AND STATISTICS
 // ============================================================================
 
-/**
- * @brief Get current state of a resource.
- *
- * @param Throttler     Throttler instance
- * @param Resource      Resource type
- * @param State         Receives current state
- * @param Usage         Receives current usage
- * @param Rate          Receives current rate
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 RtGetResourceState(
@@ -1108,16 +654,6 @@ RtGetResourceState(
     _Out_opt_ PULONG64 Rate
 );
 
-/**
- * @brief Get throttling statistics.
- *
- * @param Throttler     Throttler instance
- * @param Stats         Receives statistics snapshot
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 RtGetStatistics(
@@ -1125,29 +661,12 @@ RtGetStatistics(
     _Out_ PRT_STATISTICS Stats
 );
 
-/**
- * @brief Reset throttling statistics.
- *
- * @param Throttler     Throttler instance
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 RtResetStatistics(
     _In_ PRT_THROTTLER Throttler
 );
 
-/**
- * @brief Reset a resource to normal state.
- *
- * Clears usage counters and resets state to normal.
- *
- * @param Throttler     Throttler instance
- * @param Resource      Resource type to reset
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 RtResetResource(
@@ -1159,54 +678,20 @@ RtResetResource(
 // UTILITY FUNCTIONS
 // ============================================================================
 
-/**
- * @brief Get resource type name string.
- *
- * @param Resource      Resource type
- *
- * @return Static string name of resource type
- *
- * @irql Any
- */
-PCWSTR
-RtGetResourceName(
-    _In_ RT_RESOURCE_TYPE Resource
-);
-
-/**
- * @brief Get action name string.
- *
- * @param Action        Throttle action
- *
- * @return Static string name of action
- *
- * @irql Any
- */
-PCWSTR
-RtGetActionName(
-    _In_ RT_THROTTLE_ACTION Action
-);
-
-/**
- * @brief Get state name string.
- *
- * @param State         Throttle state
- *
- * @return Static string name of state
- *
- * @irql Any
- */
-PCWSTR
-RtGetStateName(
-    _In_ RT_THROTTLE_STATE State
-);
+PCWSTR RtGetResourceName(_In_ RT_RESOURCE_TYPE Resource);
+PCWSTR RtGetActionName(_In_ RT_THROTTLE_ACTION Action);
+PCWSTR RtGetStateName(_In_ RT_THROTTLE_STATE State);
 
 // ============================================================================
 // INLINE UTILITY FUNCTIONS
 // ============================================================================
 
 /**
- * @brief Check if throttler is valid.
+ * @brief Check if throttler pointer is valid.
+ *
+ * Safe to call with NULL (returns FALSE).
+ * NOTE: Does NOT protect against use-after-free on its own —
+ * callers must ensure the pointer is still owned (not freed).
  */
 FORCEINLINE
 BOOLEAN
@@ -1220,30 +705,6 @@ RtIsValidThrottler(
 }
 
 /**
- * @brief Acquire throttler reference.
- */
-FORCEINLINE
-LONG
-RtAcquireReference(
-    _In_ PRT_THROTTLER Throttler
-)
-{
-    return InterlockedIncrement(&Throttler->ReferenceCount);
-}
-
-/**
- * @brief Release throttler reference.
- */
-FORCEINLINE
-LONG
-RtReleaseReference(
-    _In_ PRT_THROTTLER Throttler
-)
-{
-    return InterlockedDecrement(&Throttler->ReferenceCount);
-}
-
-/**
  * @brief Check if shutdown is in progress.
  */
 FORCEINLINE
@@ -1252,7 +713,7 @@ RtIsShuttingDown(
     _In_ PRT_THROTTLER Throttler
 )
 {
-    return (Throttler->ShutdownInProgress != 0);
+    return (InterlockedCompareExchange(&Throttler->ShutdownFlag, 0, 0) != 0);
 }
 
 #ifdef __cplusplus
