@@ -9,23 +9,17 @@
     - NTFS Alternate Data Stream (ADS) protection and detection
     - Path normalization and canonicalization
     - Symbolic link and junction point awareness
-    - Short name (8.3) to long name resolution via FltGetFileNameInformation
+    - Short name (8.3) to long name resolution
     - File extension-based protection rules
-    - Comprehensive audit logging with retrieval API
+    - Comprehensive audit logging
     - Integration with minifilter callbacks
 
-    Security Architecture:
-    - All paths normalized before comparison (case-insensitive via RtlUpcaseUnicodeChar)
-    - ADS stream names stripped using correct post-last-separator logic
+    Security Considerations:
+    - All paths normalized before comparison (case-insensitive)
+    - ADS names stripped to prevent bypass via streams
     - Protected processes exempted from blocking
     - Fail-open on unexpected errors to prevent system instability
     - DoS prevention through resource limits
-    - Reference counting on FP_PROTECTED_PATH prevents use-after-free
-    - All data copied while under lock; no post-lock dereference of list entries
-    - No large stack buffers — hot-path allocations are pool-backed
-    - Config writes protected by exclusive lock
-    - Statistics use InterlockedExchange64 for atomic reset
-    - FP_ENGINE is opaque (defined here only)
 
     MITRE ATT&CK Coverage:
     - T1070.004: Indicator Removal (file deletion protection)
@@ -43,7 +37,7 @@
 #include "../Tracing/Trace.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, FpInitialize)
+#pragma alloc_text(INIT, FpInitialize)
 #pragma alloc_text(PAGE, FpShutdown)
 #pragma alloc_text(PAGE, FpConfigure)
 #pragma alloc_text(PAGE, FpAddProtectedPath)
@@ -68,107 +62,32 @@
 #define FP_PATH_SEPARATOR               L'\\'
 #define FP_SHORT_NAME_MARKER            L'~'
 
-//=============================================================================
-// Internal Structures (only visible in this translation unit)
-//=============================================================================
-
-/**
- * @brief Protected extension entry (internal, embedded in engine array)
- */
-typedef struct _FP_PROTECTED_EXTENSION {
-    BOOLEAN InUse;
-    WCHAR Extension[FP_MAX_EXTENSION_LENGTH];
-    USHORT ExtensionLength;
-    ULONG ProtectionFlags;
-    volatile LONG64 BlockedCount;
-} FP_PROTECTED_EXTENSION, *PFP_PROTECTED_EXTENSION;
-
-/**
- * @brief Protected path entry (internal, reference-counted)
- */
-typedef struct _FP_PROTECTED_PATH {
-    LIST_ENTRY ListEntry;
-
-    WCHAR NormalizedPath[FP_MAX_PATH_LENGTH];
-    USHORT PathLength;
-    BOOLEAN IsDirectory;
-
-    FP_RULE_TYPE RuleType;
-    ULONG ProtectionFlags;
-
-    volatile LONG64 BlockedOperations;
-    volatile LONG64 AuditedOperations;
-
-    LARGE_INTEGER AddedTime;
-    volatile LONG64 LastAccessTimeTicks;
-
-    volatile LONG RefCount;
-} FP_PROTECTED_PATH, *PFP_PROTECTED_PATH;
-
-/**
- * @brief Internal audit entry with LIST_ENTRY for the ring buffer
- */
-typedef struct _FP_AUDIT_ENTRY_INTERNAL {
-    LIST_ENTRY ListEntry;
-    FP_AUDIT_ENTRY_INFO Info;
-} FP_AUDIT_ENTRY_INTERNAL, *PFP_AUDIT_ENTRY_INTERNAL;
-
-/**
- * @brief Engine configuration (protected by ConfigLock)
- */
-typedef struct _FP_ENGINE_CONFIG {
-    BOOLEAN EnablePathNormalization;
-    BOOLEAN EnableStreamProtection;
-    BOOLEAN EnableSymlinkResolution;
-    BOOLEAN EnableShortNameResolution;
-    BOOLEAN EnableAuditLogging;
-    ULONG MaxAuditEntries;
-} FP_ENGINE_CONFIG;
-
-/**
- * @brief File protection engine (opaque — only defined here)
- */
-struct _FP_ENGINE {
-    volatile LONG Initialized;
-
-    //
-    // Protected paths (linked list, reference-counted entries)
-    //
-    LIST_ENTRY ProtectedPathList;
-    EX_PUSH_LOCK PathListLock;
-    volatile LONG ProtectedPathCount;
-
-    //
-    // Protected extensions (static array)
-    //
-    FP_PROTECTED_EXTENSION ProtectedExtensions[FP_MAX_PROTECTED_EXTENSIONS];
-    EX_PUSH_LOCK ExtensionLock;
-    volatile LONG ProtectedExtensionCount;
-
-    //
-    // Audit log (ring buffer)
-    //
-    LIST_ENTRY AuditLog;
-    EX_PUSH_LOCK AuditLogLock;
-    volatile LONG AuditLogCount;
-
-    //
-    // Configuration (protected by ConfigLock)
-    //
-    EX_PUSH_LOCK ConfigLock;
-    FP_ENGINE_CONFIG Config;
-
-    //
-    // Statistics (per-field interlocked access)
-    //
-    FP_STATISTICS Stats;
+//
+// Common stream names to detect
+//
+static const WCHAR* g_KnownStreamNames[] = {
+    L":$DATA",
+    L":Zone.Identifier",
+    L":$ATTRIBUTE_LIST",
+    L":$BITMAP",
+    L":$EA",
+    L":$EA_INFORMATION",
+    L":$FILE_NAME",
+    L":$INDEX_ROOT",
+    L":$INDEX_ALLOCATION",
+    L":$LOGGED_UTILITY_STREAM",
+    L":$OBJECT_ID",
+    L":$REPARSE_POINT"
 };
+
+#define FP_KNOWN_STREAM_COUNT   ARRAYSIZE(g_KnownStreamNames)
 
 //=============================================================================
 // Forward Declarations
 //=============================================================================
 
-static BOOLEAN
+static
+BOOLEAN
 FppMatchPath(
     _In_ PCWSTR TestPath,
     _In_ USHORT TestPathLength,
@@ -177,111 +96,112 @@ FppMatchPath(
     _In_ BOOLEAN IsRecursive
     );
 
-static BOOLEAN
+static
+BOOLEAN
 FppMatchExtension(
     _In_ PCWSTR FileName,
     _In_ PCWSTR Extension,
     _In_ USHORT ExtensionLength
     );
 
-static VOID
-FppReleaseProtectedPath(
-    _Inout_ PFP_PROTECTED_PATH Path
+static
+VOID
+FppFreeProtectedPath(
+    _In_ PFP_PROTECTED_PATH Path
     );
 
-static VOID
+static
+VOID
 FppFreeAuditEntry(
-    _In_ PFP_AUDIT_ENTRY_INTERNAL Entry
+    _In_ PFP_AUDIT_ENTRY Entry
     );
 
-static VOID
+static
+VOID
 FppTrimAuditLog(
     _Inout_ PFP_ENGINE Engine
     );
 
-static NTSTATUS
+static
+NTSTATUS
 FppGetProcessName(
     _In_ HANDLE ProcessId,
     _Out_writes_z_(NameSize) PWCHAR ProcessName,
     _In_ ULONG NameSize
     );
 
-static BOOLEAN
+static
+BOOLEAN
 FppIsShortName(
     _In_ PCWSTR FileName
     );
 
-static VOID
-FppUpcaseInPlace(
-    _Inout_z_ PWCHAR String,
-    _In_ USHORT CharCount
+static
+VOID
+FppExtractFileName(
+    _In_ PCUNICODE_STRING FullPath,
+    _Out_ PUNICODE_STRING FileName
     );
-
-static USHORT
-FppFindStreamSeparator(
-    _In_ PCWSTR Path,
-    _In_ USHORT PathLenChars
-    );
-
-//=============================================================================
-// Helper: Uppercase a WCHAR string in-place using RtlUpcaseUnicodeChar
-// (kernel-safe, no CRT dependency)
-//=============================================================================
 
 static
 VOID
-FppUpcaseInPlace(
-    _Inout_z_ PWCHAR String,
-    _In_ USHORT CharCount
-    )
-{
-    USHORT i;
-    for (i = 0; i < CharCount && String[i] != L'\0'; i++) {
-        String[i] = RtlUpcaseUnicodeChar(String[i]);
-    }
-}
-
-//=============================================================================
-// Helper: Find the first stream separator colon after the last path separator.
-// Returns index of the colon, or 0 if no stream found.
-//=============================================================================
+FppExtractExtension(
+    _In_ PCUNICODE_STRING FileName,
+    _Out_writes_z_(ExtSize) PWCHAR Extension,
+    _In_ ULONG ExtSize
+    );
 
 static
-USHORT
-FppFindStreamSeparator(
-    _In_ PCWSTR Path,
-    _In_ USHORT PathLenChars
+FORCEINLINE
+BOOLEAN
+FppHasStream(
+    _In_ PCUNICODE_STRING Path
     )
 {
-    USHORT LastSep = 0;
     USHORT i;
+    BOOLEAN FoundFirstColon = FALSE;
 
-    //
-    // Find position of last backslash
-    //
-    for (i = 0; i < PathLenChars; i++) {
-        if (Path[i] == FP_PATH_SEPARATOR || Path[i] == L'/') {
-            LastSep = i;
-        }
+    if (Path == NULL || Path->Buffer == NULL || Path->Length == 0) {
+        return FALSE;
     }
 
-    //
-    // Find first colon after the last separator that isn't a drive-letter colon.
-    // Drive-letter colon is at index 1 (e.g., "C:") — skip it.
-    //
-    for (i = LastSep + 1; i < PathLenChars; i++) {
-        if (Path[i] == FP_STREAM_SEPARATOR) {
-            if (i == 1) {
+    for (i = 0; i < Path->Length / sizeof(WCHAR); i++) {
+        if (Path->Buffer[i] == FP_STREAM_SEPARATOR) {
+            if (FoundFirstColon) {
                 //
-                // Drive letter colon (C:), skip
+                // Second colon indicates stream name (e.g., file.txt:stream:$DATA)
                 //
-                continue;
+                return TRUE;
             }
-            return i;
+
+            //
+            // First colon could be drive letter (C:) or stream start
+            //
+            if (i > 0 && i < Path->Length / sizeof(WCHAR) - 1) {
+                //
+                // Check if this looks like a stream (not drive letter)
+                //
+                if (i > 1 || (Path->Buffer[0] != L'\\' && Path->Buffer[0] != L'/')) {
+                    //
+                    // Check next character - if it's not \ or /, it's likely a stream
+                    //
+                    WCHAR NextChar = Path->Buffer[i + 1];
+                    if (NextChar != L'\\' && NextChar != L'/' && NextChar != L'\0') {
+                        //
+                        // Could be stream, need further validation
+                        // Skip if this is position 1 (drive letter case C:)
+                        //
+                        if (i != 1) {
+                            return TRUE;
+                        }
+                    }
+                }
+            }
+            FoundFirstColon = TRUE;
         }
     }
 
-    return 0;
+    return FALSE;
 }
 
 //=============================================================================
@@ -293,6 +213,21 @@ NTSTATUS
 FpInitialize(
     _Out_ PFP_ENGINE* Engine
     )
+/*++
+
+Routine Description:
+
+    Initializes the file protection engine.
+
+Arguments:
+
+    Engine - Receives pointer to the initialized engine.
+
+Return Value:
+
+    STATUS_SUCCESS on success.
+
+--*/
 {
     PFP_ENGINE NewEngine = NULL;
     LARGE_INTEGER CurrentTime;
@@ -305,6 +240,9 @@ FpInitialize(
 
     *Engine = NULL;
 
+    //
+    // Allocate engine structure
+    //
     NewEngine = (PFP_ENGINE)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(FP_ENGINE),
@@ -317,17 +255,27 @@ FpInitialize(
 
     RtlZeroMemory(NewEngine, sizeof(FP_ENGINE));
 
+    //
+    // Initialize protected path list
+    //
     InitializeListHead(&NewEngine->ProtectedPathList);
     ExInitializePushLock(&NewEngine->PathListLock);
 
+    //
+    // Initialize extension array
+    //
     RtlZeroMemory(NewEngine->ProtectedExtensions, sizeof(NewEngine->ProtectedExtensions));
     ExInitializePushLock(&NewEngine->ExtensionLock);
 
+    //
+    // Initialize audit log
+    //
     InitializeListHead(&NewEngine->AuditLog);
     ExInitializePushLock(&NewEngine->AuditLogLock);
 
-    ExInitializePushLock(&NewEngine->ConfigLock);
-
+    //
+    // Set default configuration
+    //
     NewEngine->Config.EnablePathNormalization = TRUE;
     NewEngine->Config.EnableStreamProtection = TRUE;
     NewEngine->Config.EnableSymlinkResolution = TRUE;
@@ -335,10 +283,13 @@ FpInitialize(
     NewEngine->Config.EnableAuditLogging = TRUE;
     NewEngine->Config.MaxAuditEntries = FP_DEFAULT_MAX_AUDIT_ENTRIES;
 
+    //
+    // Initialize statistics
+    //
     KeQuerySystemTime(&CurrentTime);
     NewEngine->Stats.StartTime = CurrentTime;
 
-    InterlockedExchange(&NewEngine->Initialized, TRUE);
+    NewEngine->Initialized = TRUE;
 
     *Engine = NewEngine;
 
@@ -350,20 +301,25 @@ VOID
 FpShutdown(
     _Inout_ PFP_ENGINE Engine
     )
+/*++
+
+Routine Description:
+
+    Shuts down the file protection engine.
+
+--*/
 {
     PLIST_ENTRY Entry;
     PFP_PROTECTED_PATH Path;
-    PFP_AUDIT_ENTRY_INTERNAL AuditEntry;
+    PFP_AUDIT_ENTRY AuditEntry;
 
     PAGED_CODE();
 
-    if (Engine == NULL) {
+    if (Engine == NULL || !Engine->Initialized) {
         return;
     }
 
-    if (InterlockedCompareExchange(&Engine->Initialized, FALSE, TRUE) != TRUE) {
-        return;
-    }
+    Engine->Initialized = FALSE;
 
     //
     // Free all protected paths
@@ -374,7 +330,7 @@ FpShutdown(
     while (!IsListEmpty(&Engine->ProtectedPathList)) {
         Entry = RemoveHeadList(&Engine->ProtectedPathList);
         Path = CONTAINING_RECORD(Entry, FP_PROTECTED_PATH, ListEntry);
-        FppReleaseProtectedPath(Path);
+        FppFreeProtectedPath(Path);
     }
 
     ExReleasePushLockExclusive(&Engine->PathListLock);
@@ -398,13 +354,16 @@ FpShutdown(
 
     while (!IsListEmpty(&Engine->AuditLog)) {
         Entry = RemoveHeadList(&Engine->AuditLog);
-        AuditEntry = CONTAINING_RECORD(Entry, FP_AUDIT_ENTRY_INTERNAL, ListEntry);
+        AuditEntry = CONTAINING_RECORD(Entry, FP_AUDIT_ENTRY, ListEntry);
         FppFreeAuditEntry(AuditEntry);
     }
 
     ExReleasePushLockExclusive(&Engine->AuditLogLock);
     KeLeaveCriticalRegion();
 
+    //
+    // Free engine
+    //
     ShadowStrikeFreePoolWithTag(Engine, FP_POOL_TAG_CONTEXT);
 }
 
@@ -417,26 +376,24 @@ FpConfigure(
     _In_ BOOLEAN EnableSymlinkResolution,
     _In_ BOOLEAN EnableAuditLogging
     )
+/*++
+
+Routine Description:
+
+    Configures the file protection engine.
+
+--*/
 {
     PAGED_CODE();
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL || !Engine->Initialized) {
         return STATUS_INVALID_PARAMETER;
     }
-
-    //
-    // Acquire exclusive ConfigLock to atomically update all config fields
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Engine->ConfigLock);
 
     Engine->Config.EnablePathNormalization = EnableNormalization;
     Engine->Config.EnableStreamProtection = EnableStreamProtection;
     Engine->Config.EnableSymlinkResolution = EnableSymlinkResolution;
     Engine->Config.EnableAuditLogging = EnableAuditLogging;
-
-    ExReleasePushLockExclusive(&Engine->ConfigLock);
-    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -453,6 +410,13 @@ FpAddProtectedPath(
     _In_ ULONG ProtectionFlags,
     _In_ FP_RULE_TYPE RuleType
     )
+/*++
+
+Routine Description:
+
+    Adds a path to the protection list.
+
+--*/
 {
     PFP_PROTECTED_PATH NewPath = NULL;
     PLIST_ENTRY Entry;
@@ -463,7 +427,7 @@ FpAddProtectedPath(
 
     PAGED_CODE();
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL || !Engine->Initialized) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -476,6 +440,17 @@ FpAddProtectedPath(
         return STATUS_NAME_TOO_LONG;
     }
 
+    //
+    // Check limit
+    //
+    if (InterlockedCompareExchange(&Engine->ProtectedPathCount, 0, 0) >=
+        FP_MAX_PROTECTED_PATHS) {
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    //
+    // Allocate new entry
+    //
     NewPath = (PFP_PROTECTED_PATH)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(FP_PROTECTED_PATH),
@@ -488,15 +463,21 @@ FpAddProtectedPath(
 
     RtlZeroMemory(NewPath, sizeof(FP_PROTECTED_PATH));
 
+    //
+    // Copy and normalize path
+    //
     RtlCopyMemory(NewPath->NormalizedPath, Path->Buffer, Path->Length);
     NewPath->NormalizedPath[PathLength] = L'\0';
     NewPath->PathLength = PathLength;
 
     //
-    // Uppercase using kernel-safe per-character upcase (no CRT _wcsupr_s)
+    // Convert to uppercase for case-insensitive matching
     //
-    FppUpcaseInPlace(NewPath->NormalizedPath, PathLength);
+    _wcsupr_s(NewPath->NormalizedPath, FP_MAX_PATH_LENGTH);
 
+    //
+    // Set rule properties
+    //
     NewPath->RuleType = RuleType;
     NewPath->ProtectionFlags = ProtectionFlags;
     NewPath->RefCount = 1;
@@ -504,26 +485,22 @@ FpAddProtectedPath(
     KeQuerySystemTime(&CurrentTime);
     NewPath->AddedTime = CurrentTime;
 
+    //
+    // Determine if this is a directory path (ends with \)
+    //
     if (PathLength > 0 && NewPath->NormalizedPath[PathLength - 1] == FP_PATH_SEPARATOR) {
         NewPath->IsDirectory = TRUE;
     }
 
     //
-    // Insert under exclusive lock — re-check count inside the lock to prevent TOCTOU
+    // Add to list
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->PathListLock);
 
     //
-    // Count check inside the lock (fixes MED-01 TOCTOU)
+    // Check for duplicate
     //
-    if (Engine->ProtectedPathCount >= FP_MAX_PROTECTED_PATHS) {
-        ExReleasePushLockExclusive(&Engine->PathListLock);
-        KeLeaveCriticalRegion();
-        ShadowStrikeFreePoolWithTag(NewPath, FP_POOL_TAG_RULE);
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
     for (Entry = Engine->ProtectedPathList.Flink;
          Entry != &Engine->ProtectedPathList;
          Entry = Entry->Flink) {
@@ -531,9 +508,7 @@ FpAddProtectedPath(
         ExistingPath = CONTAINING_RECORD(Entry, FP_PROTECTED_PATH, ListEntry);
 
         if (ExistingPath->PathLength == NewPath->PathLength &&
-            RtlCompareMemory(ExistingPath->NormalizedPath, NewPath->NormalizedPath,
-                             NewPath->PathLength * sizeof(WCHAR)) ==
-            (SIZE_T)(NewPath->PathLength * sizeof(WCHAR))) {
+            _wcsicmp(ExistingPath->NormalizedPath, NewPath->NormalizedPath) == 0) {
             Duplicate = TRUE;
             break;
         }
@@ -543,7 +518,7 @@ FpAddProtectedPath(
         InsertTailList(&Engine->ProtectedPathList, &NewPath->ListEntry);
         InterlockedIncrement(&Engine->ProtectedPathCount);
         InterlockedIncrement64(&Engine->Stats.PathsProtected);
-        NewPath = NULL;
+        NewPath = NULL;  // Ownership transferred
     }
 
     ExReleasePushLockExclusive(&Engine->PathListLock);
@@ -565,6 +540,13 @@ FpAddProtectedPathW(
     _In_ ULONG ProtectionFlags,
     _In_ FP_RULE_TYPE RuleType
     )
+/*++
+
+Routine Description:
+
+    Adds a path to the protection list (C string version).
+
+--*/
 {
     UNICODE_STRING PathString;
 
@@ -585,15 +567,22 @@ FpRemoveProtectedPath(
     _In_ PFP_ENGINE Engine,
     _In_ PCUNICODE_STRING Path
     )
+/*++
+
+Routine Description:
+
+    Removes a path from the protection list.
+
+--*/
 {
     PLIST_ENTRY Entry;
     PFP_PROTECTED_PATH FoundPath = NULL;
-    PWCHAR NormalizedPath = NULL;
+    WCHAR NormalizedPath[FP_MAX_PATH_LENGTH];
     USHORT PathLength;
 
     PAGED_CODE();
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL || !Engine->Initialized) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -607,21 +596,11 @@ FpRemoveProtectedPath(
     }
 
     //
-    // Allocate normalization buffer from pool instead of stack (was 2KB on stack)
+    // Normalize for comparison
     //
-    NormalizedPath = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
-        PagedPool,
-        FP_MAX_PATH_LENGTH * sizeof(WCHAR),
-        FP_POOL_TAG_WORK
-        );
-
-    if (NormalizedPath == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
     RtlCopyMemory(NormalizedPath, Path->Buffer, Path->Length);
     NormalizedPath[PathLength] = L'\0';
-    FppUpcaseInPlace(NormalizedPath, PathLength);
+    _wcsupr_s(NormalizedPath, FP_MAX_PATH_LENGTH);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->PathListLock);
@@ -633,9 +612,7 @@ FpRemoveProtectedPath(
         PFP_PROTECTED_PATH TestPath = CONTAINING_RECORD(Entry, FP_PROTECTED_PATH, ListEntry);
 
         if (TestPath->PathLength == PathLength &&
-            RtlCompareMemory(TestPath->NormalizedPath, NormalizedPath,
-                             PathLength * sizeof(WCHAR)) ==
-            (SIZE_T)(PathLength * sizeof(WCHAR))) {
+            _wcsicmp(TestPath->NormalizedPath, NormalizedPath) == 0) {
 
             RemoveEntryList(Entry);
             InterlockedDecrement(&Engine->ProtectedPathCount);
@@ -647,10 +624,8 @@ FpRemoveProtectedPath(
     ExReleasePushLockExclusive(&Engine->PathListLock);
     KeLeaveCriticalRegion();
 
-    ShadowStrikeFreePoolWithTag(NormalizedPath, FP_POOL_TAG_WORK);
-
     if (FoundPath != NULL) {
-        FppReleaseProtectedPath(FoundPath);
+        FppFreeProtectedPath(FoundPath);
         return STATUS_SUCCESS;
     }
 
@@ -664,6 +639,13 @@ FpAddProtectedExtension(
     _In_ PCWSTR Extension,
     _In_ ULONG ProtectionFlags
     )
+/*++
+
+Routine Description:
+
+    Adds a protected file extension.
+
+--*/
 {
     LONG i;
     SIZE_T ExtLen;
@@ -671,8 +653,7 @@ FpAddProtectedExtension(
 
     PAGED_CODE();
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE) ||
-        Extension == NULL) {
+    if (Engine == NULL || !Engine->Initialized || Extension == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -684,6 +665,9 @@ FpAddProtectedExtension(
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->ExtensionLock);
 
+    //
+    // Find empty slot
+    //
     for (i = 0; i < FP_MAX_PROTECTED_EXTENSIONS; i++) {
         if (!Engine->ProtectedExtensions[i].InUse) {
             Engine->ProtectedExtensions[i].InUse = TRUE;
@@ -694,7 +678,10 @@ FpAddProtectedExtension(
                 Extension, ExtLen * sizeof(WCHAR));
             Engine->ProtectedExtensions[i].Extension[ExtLen] = L'\0';
 
-            FppUpcaseInPlace(Engine->ProtectedExtensions[i].Extension, (USHORT)ExtLen);
+            //
+            // Uppercase for case-insensitive matching
+            //
+            _wcsupr_s(Engine->ProtectedExtensions[i].Extension, FP_MAX_EXTENSION_LENGTH);
 
             InterlockedIncrement(&Engine->ProtectedExtensionCount);
             InterlockedIncrement64(&Engine->Stats.ExtensionsProtected);
@@ -715,23 +702,33 @@ VOID
 FpClearAllRules(
     _In_ PFP_ENGINE Engine
     )
+/*++
+
+Routine Description:
+
+    Clears all protection rules.
+
+--*/
 {
     PLIST_ENTRY Entry;
     PFP_PROTECTED_PATH Path;
 
     PAGED_CODE();
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL || !Engine->Initialized) {
         return;
     }
 
+    //
+    // Clear path rules
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->PathListLock);
 
     while (!IsListEmpty(&Engine->ProtectedPathList)) {
         Entry = RemoveHeadList(&Engine->ProtectedPathList);
         Path = CONTAINING_RECORD(Entry, FP_PROTECTED_PATH, ListEntry);
-        FppReleaseProtectedPath(Path);
+        FppFreeProtectedPath(Path);
     }
 
     Engine->ProtectedPathCount = 0;
@@ -739,6 +736,9 @@ FpClearAllRules(
     ExReleasePushLockExclusive(&Engine->PathListLock);
     KeLeaveCriticalRegion();
 
+    //
+    // Clear extension rules
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->ExtensionLock);
 
@@ -760,13 +760,20 @@ FpCheckAccess(
     _In_ PCUNICODE_STRING FilePath,
     _In_ FP_OPERATION_TYPE Operation,
     _In_ HANDLE RequestorPid,
-    _In_ ACCESS_MASK DesiredAccess,
-    _Out_opt_ PULONG OutProtectionFlags
+    _In_ ACCESS_MASK DesiredAccess
     )
+/*++
+
+Routine Description:
+
+    Checks if a file operation should be blocked.
+
+--*/
 {
     PLIST_ENTRY Entry;
+    PFP_PROTECTED_PATH MatchedPath = NULL;
     FP_ACCESS_RESULT Result = FpAccess_NotProtected;
-    PWCHAR NormalizedPath = NULL;
+    WCHAR NormalizedPath[FP_MAX_PATH_LENGTH];
     WCHAR FileName[260];
     WCHAR Extension[FP_MAX_EXTENSION_LENGTH];
     USHORT PathLength;
@@ -774,29 +781,9 @@ FpCheckAccess(
     BOOLEAN CheckExtensions = TRUE;
     LONG i;
 
-    //
-    // Captured data from matched path (copied while under lock)
-    //
-    BOOLEAN HaveMatchedPath = FALSE;
-    WCHAR MatchedRulePath[FP_MAX_PATH_LENGTH];
-    ULONG MatchedFlags = 0;
-    volatile LONG64 *MatchedBlockedOps = NULL;
-    volatile LONG64 *MatchedAuditedOps = NULL;
-    volatile LONG64 *MatchedLastAccessTicks = NULL;
-
-    //
-    // Config snapshot (read under config lock)
-    //
-    BOOLEAN CfgStreamProtection;
-    BOOLEAN CfgAuditLogging;
-
     UNREFERENCED_PARAMETER(DesiredAccess);
 
-    if (OutProtectionFlags != NULL) {
-        *OutProtectionFlags = 0;
-    }
-
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL || !Engine->Initialized) {
         return FpAccess_Allow;
     }
 
@@ -804,103 +791,71 @@ FpCheckAccess(
         return FpAccess_Allow;
     }
 
+    //
+    // Update statistics
+    //
     InterlockedIncrement64(&Engine->Stats.TotalChecks);
 
+    //
+    // Allow protected processes (ShadowStrike components)
+    //
     if (ShadowStrikeIsProcessProtected(RequestorPid, NULL)) {
         return FpAccess_Allow;
     }
 
     PathLength = FilePath->Length / sizeof(WCHAR);
     if (PathLength >= FP_MAX_PATH_LENGTH) {
-        return FpAccess_Allow;
+        return FpAccess_Allow;  // Fail-open on invalid paths
     }
 
     //
-    // Read config snapshot under shared lock
+    // Normalize path for comparison
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Engine->ConfigLock);
-    CfgStreamProtection = Engine->Config.EnableStreamProtection;
-    CfgAuditLogging = Engine->Config.EnableAuditLogging;
-    ExReleasePushLockShared(&Engine->ConfigLock);
-    KeLeaveCriticalRegion();
-
-    //
-    // Allocate normalization buffer from pool (not stack — was 2KB)
-    //
-    NormalizedPath = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        FP_MAX_PATH_LENGTH * sizeof(WCHAR),
-        FP_POOL_TAG_WORK
-        );
-
-    if (NormalizedPath == NULL) {
-        return FpAccess_Allow;
-    }
-
     RtlCopyMemory(NormalizedPath, FilePath->Buffer, FilePath->Length);
     NormalizedPath[PathLength] = L'\0';
 
     //
-    // Strip stream name: find first colon after the last path separator.
-    // This handles paths like \Device\HarddiskVolume1\file.txt:stream:$DATA
-    // and correctly ignores drive-letter colons.
+    // Strip stream name if present (protect base file regardless of stream)
     //
-    if (CfgStreamProtection) {
-        USHORT StreamPos = FppFindStreamSeparator(NormalizedPath, PathLength);
-        if (StreamPos > 0) {
-            NormalizedPath[StreamPos] = L'\0';
-            PathLength = StreamPos;
+    if (Engine->Config.EnableStreamProtection && FppHasStream(FilePath)) {
+        PWCHAR StreamSep = wcsrchr(NormalizedPath, FP_STREAM_SEPARATOR);
+        if (StreamSep != NULL && StreamSep > NormalizedPath + 2) {
+            //
+            // Check it's not the drive letter colon
+            //
+            if (*(StreamSep - 1) != L'\\' && *(StreamSep - 1) != L'/') {
+                *StreamSep = L'\0';
+                PathLength = (USHORT)wcslen(NormalizedPath);
+            }
         }
     }
 
     //
-    // Uppercase using kernel-safe RtlUpcaseUnicodeChar
+    // Convert to uppercase
     //
-    FppUpcaseInPlace(NormalizedPath, PathLength);
+    _wcsupr_s(NormalizedPath, FP_MAX_PATH_LENGTH);
 
     //
-    // Extract filename and extension (FileName/Extension are small stack buffers — OK)
+    // Extract filename and extension
     //
-    {
-        PWCHAR LastSlash = NULL;
-        PWCHAR Dot = NULL;
-        USHORT fi;
+    PWCHAR LastSlash = wcsrchr(NormalizedPath, FP_PATH_SEPARATOR);
+    if (LastSlash != NULL) {
+        RtlStringCchCopyW(FileName, ARRAYSIZE(FileName), LastSlash + 1);
+    } else {
+        RtlStringCchCopyW(FileName, ARRAYSIZE(FileName), NormalizedPath);
+    }
 
-        for (fi = PathLength; fi > 0; fi--) {
-            if (NormalizedPath[fi - 1] == FP_PATH_SEPARATOR) {
-                LastSlash = &NormalizedPath[fi];
-                break;
-            }
-        }
-
-        if (LastSlash != NULL) {
-            RtlStringCchCopyW(FileName, ARRAYSIZE(FileName), LastSlash);
-        } else {
-            RtlStringCchCopyW(FileName, ARRAYSIZE(FileName), NormalizedPath);
-        }
-
-        Dot = NULL;
-        for (fi = (USHORT)wcslen(FileName); fi > 0; fi--) {
-            if (FileName[fi - 1] == L'.') {
-                Dot = &FileName[fi - 1];
-                break;
-            }
-        }
-
-        if (Dot != NULL) {
-            RtlStringCchCopyW(Extension, ARRAYSIZE(Extension), Dot);
-            FppUpcaseInPlace(Extension, (USHORT)wcslen(Extension));
-        } else {
-            Extension[0] = L'\0';
-            CheckExtensions = FALSE;
-        }
+    PWCHAR Dot = wcsrchr(FileName, L'.');
+    if (Dot != NULL) {
+        RtlStringCchCopyW(Extension, ARRAYSIZE(Extension), Dot);
+        _wcsupr_s(Extension, FP_MAX_EXTENSION_LENGTH);
+    } else {
+        Extension[0] = L'\0';
+        CheckExtensions = FALSE;
     }
 
     //
-    // Check path rules under shared lock.
-    // CRITICAL: All data from matched path is COPIED while under the lock.
-    // No post-lock dereference of MatchedPath pointer (fixes CRITICAL-02).
+    // Check path rules
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Engine->PathListLock);
@@ -916,34 +871,15 @@ FpCheckAccess(
         if (FppMatchPath(NormalizedPath, PathLength,
             TestPath->NormalizedPath, TestPath->PathLength, IsRecursive)) {
 
-            //
-            // Copy all needed data while under lock
-            //
-            HaveMatchedPath = TRUE;
-            MatchedFlags = TestPath->ProtectionFlags;
+            MatchedPath = TestPath;
             ProtectionFlags = TestPath->ProtectionFlags;
 
-            RtlCopyMemory(MatchedRulePath, TestPath->NormalizedPath,
-                          TestPath->PathLength * sizeof(WCHAR));
-            MatchedRulePath[TestPath->PathLength] = L'\0';
-
             //
-            // Take a reference so we can safely do InterlockedIncrement64
-            // on the entry's counters after releasing the lock.
+            // Update last access time
             //
-            InterlockedIncrement(&TestPath->RefCount);
-            MatchedBlockedOps = &TestPath->BlockedOperations;
-            MatchedAuditedOps = &TestPath->AuditedOperations;
-            MatchedLastAccessTicks = &TestPath->LastAccessTimeTicks;
-
-            //
-            // Update last access time atomically (fixes CRITICAL-01: no write under shared lock)
-            //
-            {
-                LARGE_INTEGER CurrentTime;
-                KeQuerySystemTime(&CurrentTime);
-                InterlockedExchange64(MatchedLastAccessTicks, CurrentTime.QuadPart);
-            }
+            LARGE_INTEGER CurrentTime;
+            KeQuerySystemTime(&CurrentTime);
+            TestPath->LastAccessTime = CurrentTime;
 
             break;
         }
@@ -955,9 +891,7 @@ FpCheckAccess(
     //
     // Check extension rules if no path match
     //
-    if (!HaveMatchedPath && CheckExtensions &&
-        InterlockedCompareExchange(&Engine->ProtectedExtensionCount, 0, 0) > 0) {
-
+    if (MatchedPath == NULL && CheckExtensions && Engine->ProtectedExtensionCount > 0) {
         KeEnterCriticalRegion();
         ExAcquirePushLockShared(&Engine->ExtensionLock);
 
@@ -968,7 +902,7 @@ FpCheckAccess(
                     Engine->ProtectedExtensions[i].ExtensionLength)) {
 
                     ProtectionFlags = Engine->ProtectedExtensions[i].ProtectionFlags;
-                    Result = FpAccess_Block;
+                    Result = FpAccess_Block;  // Will be refined below
                     break;
                 }
             }
@@ -981,43 +915,70 @@ FpCheckAccess(
     //
     // Determine result based on operation and flags
     //
-    if (HaveMatchedPath || ProtectionFlags != 0) {
+    if (MatchedPath != NULL || ProtectionFlags != 0) {
 
+        //
+        // Check if audit-only mode
+        //
         if (ProtectionFlags & FpProtect_AuditOnly) {
             Result = FpAccess_AuditOnly;
         } else {
+            //
+            // Check operation-specific protection
+            //
             BOOLEAN ShouldBlock = FALSE;
 
             switch (Operation) {
             case FpOperation_Write:
                 ShouldBlock = (ProtectionFlags & FpProtect_BlockWrite) != 0;
-                if (ShouldBlock) InterlockedIncrement64(&Engine->Stats.BlockedWrites);
+                if (ShouldBlock) {
+                    InterlockedIncrement64(&Engine->Stats.BlockedWrites);
+                }
                 break;
+
             case FpOperation_Delete:
                 ShouldBlock = (ProtectionFlags & FpProtect_BlockDelete) != 0;
-                if (ShouldBlock) InterlockedIncrement64(&Engine->Stats.BlockedDeletes);
+                if (ShouldBlock) {
+                    InterlockedIncrement64(&Engine->Stats.BlockedDeletes);
+                }
                 break;
+
             case FpOperation_Rename:
                 ShouldBlock = (ProtectionFlags & FpProtect_BlockRename) != 0;
-                if (ShouldBlock) InterlockedIncrement64(&Engine->Stats.BlockedRenames);
+                if (ShouldBlock) {
+                    InterlockedIncrement64(&Engine->Stats.BlockedRenames);
+                }
                 break;
+
             case FpOperation_SetInfo:
                 ShouldBlock = (ProtectionFlags & FpProtect_BlockSetInfo) != 0;
-                if (ShouldBlock) InterlockedIncrement64(&Engine->Stats.BlockedSetInfo);
+                if (ShouldBlock) {
+                    InterlockedIncrement64(&Engine->Stats.BlockedSetInfo);
+                }
                 break;
+
             case FpOperation_SetSecurity:
                 ShouldBlock = (ProtectionFlags & FpProtect_BlockSetSecurity) != 0;
-                if (ShouldBlock) InterlockedIncrement64(&Engine->Stats.BlockedSetSecurity);
+                if (ShouldBlock) {
+                    InterlockedIncrement64(&Engine->Stats.BlockedSetSecurity);
+                }
                 break;
+
             case FpOperation_CreateHardlink:
                 ShouldBlock = (ProtectionFlags & FpProtect_BlockHardlink) != 0;
-                if (ShouldBlock) InterlockedIncrement64(&Engine->Stats.BlockedHardlinks);
+                if (ShouldBlock) {
+                    InterlockedIncrement64(&Engine->Stats.BlockedHardlinks);
+                }
                 break;
+
             case FpOperation_CreateStream:
             case FpOperation_DeleteStream:
                 ShouldBlock = (ProtectionFlags & FpProtect_BlockStreams) != 0;
-                if (ShouldBlock) InterlockedIncrement64(&Engine->Stats.BlockedStreams);
+                if (ShouldBlock) {
+                    InterlockedIncrement64(&Engine->Stats.BlockedStreams);
+                }
                 break;
+
             default:
                 break;
             }
@@ -1026,56 +987,31 @@ FpCheckAccess(
         }
 
         //
-        // Update per-path stats via interlocked ops on ref-counted entry
-        // (safe because we hold a reference from above)
+        // Update matched rule statistics
         //
-        if (HaveMatchedPath) {
+        if (MatchedPath != NULL) {
             if (Result == FpAccess_Block) {
-                InterlockedIncrement64(MatchedBlockedOps);
+                InterlockedIncrement64(&MatchedPath->BlockedOperations);
             } else if (Result == FpAccess_AuditOnly) {
-                InterlockedIncrement64(MatchedAuditedOps);
+                InterlockedIncrement64(&MatchedPath->AuditedOperations);
             }
         }
     }
 
     //
-    // Release the reference we took on the matched path
-    //
-    if (HaveMatchedPath) {
-        //
-        // Find the path again — but we don't need to, we just decrement.
-        // The path can only be freed when RefCount reaches 0.
-        // FppReleaseProtectedPath handles the decrement-and-free.
-        //
-        // We need the original pointer for the decrement. We stored the
-        // volatile pointers which are within the struct, so we can recover
-        // the struct address.
-        //
-        PFP_PROTECTED_PATH RefPath = CONTAINING_RECORD(
-            MatchedBlockedOps, FP_PROTECTED_PATH, BlockedOperations);
-        FppReleaseProtectedPath(RefPath);
-    }
-
-    //
     // Log if audit logging is enabled
     //
-    if (CfgAuditLogging &&
+    if (Engine->Config.EnableAuditLogging &&
         (Result == FpAccess_Block || Result == FpAccess_AuditOnly)) {
 
         UNICODE_STRING RulePath = { 0 };
-        if (HaveMatchedPath) {
-            RtlInitUnicodeString(&RulePath, MatchedRulePath);
+        if (MatchedPath != NULL) {
+            RtlInitUnicodeString(&RulePath, MatchedPath->NormalizedPath);
         }
 
         FpLogAccessAttempt(Engine, FilePath, Operation, Result, RequestorPid,
-            HaveMatchedPath ? &RulePath : NULL);
+            MatchedPath ? &RulePath : NULL);
     }
-
-    if (OutProtectionFlags != NULL) {
-        *OutProtectionFlags = ProtectionFlags;
-    }
-
-    ShadowStrikeFreePoolWithTag(NormalizedPath, FP_POOL_TAG_WORK);
 
     return Result;
 }
@@ -1087,8 +1023,14 @@ FpIsPathProtected(
     _In_ PCUNICODE_STRING Path,
     _Out_opt_ PULONG ProtectionFlags
     )
+/*++
+
+Routine Description:
+
+    Checks if a path is protected.
+
+--*/
 {
-    ULONG Flags = 0;
     FP_ACCESS_RESULT Result;
 
     if (ProtectionFlags != NULL) {
@@ -1096,12 +1038,9 @@ FpIsPathProtected(
     }
 
     Result = FpCheckAccess(Engine, Path, FpOperation_Write,
-        PsGetCurrentProcessId(), 0, &Flags);
+        PsGetCurrentProcessId(), 0);
 
     if (Result == FpAccess_Block || Result == FpAccess_AuditOnly) {
-        if (ProtectionFlags != NULL) {
-            *ProtectionFlags = Flags;
-        }
         return TRUE;
     }
 
@@ -1115,26 +1054,34 @@ FpCheckFileAccess(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ FP_OPERATION_TYPE Operation,
-    _Out_opt_ PFP_ACCESS_CHECK_RESULT ResultInfo
+    _Out_opt_ PFP_PROTECTED_PATH* MatchedRule
     )
+/*++
+
+Routine Description:
+
+    Checks file access with full minifilter context.
+
+--*/
 {
     NTSTATUS Status;
     PFLT_FILE_NAME_INFORMATION FileNameInfo = NULL;
     FP_ACCESS_RESULT Result = FpAccess_Allow;
     HANDLE RequestorPid;
-    ULONG Flags = 0;
 
     UNREFERENCED_PARAMETER(FltObjects);
 
-    if (ResultInfo != NULL) {
-        RtlZeroMemory(ResultInfo, sizeof(FP_ACCESS_CHECK_RESULT));
+    if (MatchedRule != NULL) {
+        *MatchedRule = NULL;
     }
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE) ||
-        Data == NULL) {
+    if (Engine == NULL || !Engine->Initialized || Data == NULL) {
         return FpAccess_Allow;
     }
 
+    //
+    // Get file name information
+    //
     Status = FltGetFileNameInformation(
         Data,
         FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
@@ -1142,7 +1089,7 @@ FpCheckFileAccess(
         );
 
     if (!NT_SUCCESS(Status)) {
-        return FpAccess_Allow;
+        return FpAccess_Allow;  // Fail-open
     }
 
     Status = FltParseFileNameInformation(FileNameInfo);
@@ -1151,31 +1098,17 @@ FpCheckFileAccess(
         return FpAccess_Allow;
     }
 
-    //
-    // FltGetRequestorProcessId returns ULONG — cast properly to HANDLE
-    // (fixes CRITICAL-03)
-    //
-    RequestorPid = (HANDLE)(ULONG_PTR)FltGetRequestorProcessId(Data);
+    RequestorPid = FltGetRequestorProcessId(Data);
 
     Result = FpCheckAccess(
         Engine,
         &FileNameInfo->Name,
         Operation,
         RequestorPid,
-        0,
-        &Flags
+        0
         );
 
     FltReleaseFileNameInformation(FileNameInfo);
-
-    //
-    // Populate result info if requested (fixes INCOMPLETE-04)
-    //
-    if (ResultInfo != NULL) {
-        ResultInfo->Result = Result;
-        ResultInfo->MatchedProtectionFlags = Flags;
-        ResultInfo->HasMatchedRule = (Flags != 0);
-    }
 
     return Result;
 }
@@ -1190,9 +1123,16 @@ FpNormalizePath(
     _In_ PCUNICODE_STRING InputPath,
     _Out_ PFP_PATH_INFO PathInfo
     )
+/*++
+
+Routine Description:
+
+    Normalizes a file path.
+
+--*/
 {
     USHORT PathLength;
-    USHORT StreamPos;
+    PWCHAR StreamSep;
     PWCHAR LastSlash;
     PWCHAR Dot;
 
@@ -1213,35 +1153,55 @@ FpNormalizePath(
         return STATUS_NAME_TOO_LONG;
     }
 
+    //
+    // Copy path
+    //
     RtlCopyMemory(PathInfo->NormalizedPath, InputPath->Buffer, InputPath->Length);
     PathInfo->NormalizedPath[PathLength] = L'\0';
     PathInfo->NormalizedLength = PathLength;
 
     //
-    // Check for stream using correct post-last-separator logic
+    // Check for stream
     //
-    StreamPos = FppFindStreamSeparator(PathInfo->NormalizedPath, PathLength);
-    if (StreamPos > 0) {
+    if (FppHasStream(InputPath)) {
         PathInfo->HasStream = TRUE;
-        RtlStringCchCopyW(PathInfo->StreamName, FP_MAX_STREAM_NAME_LENGTH,
-                          &PathInfo->NormalizedPath[StreamPos]);
-        PathInfo->NormalizedPath[StreamPos] = L'\0';
-        PathInfo->NormalizedLength = StreamPos;
+
+        //
+        // Extract stream name
+        //
+        StreamSep = wcsrchr(PathInfo->NormalizedPath, FP_STREAM_SEPARATOR);
+        if (StreamSep != NULL && StreamSep > PathInfo->NormalizedPath + 2) {
+            RtlStringCchCopyW(PathInfo->StreamName, FP_MAX_STREAM_NAME_LENGTH, StreamSep);
+
+            //
+            // Truncate path at stream separator for base path
+            //
+            *StreamSep = L'\0';
+            PathInfo->NormalizedLength = (USHORT)wcslen(PathInfo->NormalizedPath);
+        }
     }
 
+    //
+    // Extract filename
+    //
     LastSlash = wcsrchr(PathInfo->NormalizedPath, FP_PATH_SEPARATOR);
     if (LastSlash != NULL) {
         RtlStringCchCopyW(PathInfo->FileName, ARRAYSIZE(PathInfo->FileName), LastSlash + 1);
     } else {
-        RtlStringCchCopyW(PathInfo->FileName, ARRAYSIZE(PathInfo->FileName),
-                          PathInfo->NormalizedPath);
+        RtlStringCchCopyW(PathInfo->FileName, ARRAYSIZE(PathInfo->FileName), PathInfo->NormalizedPath);
     }
 
+    //
+    // Extract extension
+    //
     Dot = wcsrchr(PathInfo->FileName, L'.');
     if (Dot != NULL) {
         RtlStringCchCopyW(PathInfo->Extension, FP_MAX_EXTENSION_LENGTH, Dot);
     }
 
+    //
+    // Check for short name
+    //
     PathInfo->IsShortName = FppIsShortName(PathInfo->FileName);
 
     return STATUS_SUCCESS;
@@ -1254,6 +1214,13 @@ FpNormalizePathEx(
     _In_ PFILE_OBJECT FileObject,
     _Out_ PFP_PATH_INFO PathInfo
     )
+/*++
+
+Routine Description:
+
+    Normalizes path with filter context (resolves reparse points, etc.).
+
+--*/
 {
     NTSTATUS Status;
     PFLT_FILE_NAME_INFORMATION FileNameInfo = NULL;
@@ -1266,6 +1233,9 @@ FpNormalizePathEx(
 
     RtlZeroMemory(PathInfo, sizeof(FP_PATH_INFO));
 
+    //
+    // Get normalized file name
+    //
     Status = FltGetFileNameInformationUnsafe(
         FileObject,
         Instance,
@@ -1283,6 +1253,9 @@ FpNormalizePathEx(
         return Status;
     }
 
+    //
+    // Use the basic normalization
+    //
     Status = FpNormalizePath(&FileNameInfo->Name, PathInfo);
 
     FltReleaseFileNameInformation(FileNameInfo);
@@ -1298,12 +1271,19 @@ FpExtractStreamName(
     _In_ ULONG StreamNameSize,
     _Out_ PUNICODE_STRING BasePath
     )
-{
-    USHORT StreamPos;
-    USHORT PathLenChars;
+/*++
 
-    if (FullPath == NULL || StreamName == NULL || BasePath == NULL ||
-        FullPath->Buffer == NULL || FullPath->Length == 0) {
+Routine Description:
+
+    Extracts stream name from path.
+
+--*/
+{
+    USHORT i;
+    USHORT StreamStart = 0;
+    BOOLEAN FoundStream = FALSE;
+
+    if (FullPath == NULL || StreamName == NULL || BasePath == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1312,24 +1292,40 @@ FpExtractStreamName(
     BasePath->Length = FullPath->Length;
     BasePath->MaximumLength = FullPath->MaximumLength;
 
-    PathLenChars = FullPath->Length / sizeof(WCHAR);
-    StreamPos = FppFindStreamSeparator(FullPath->Buffer, PathLenChars);
-
-    if (StreamPos == 0) {
+    if (!FppHasStream(FullPath)) {
         return STATUS_NOT_FOUND;
     }
 
-    {
-        USHORT StreamLen = PathLenChars - StreamPos;
-        if (StreamLen >= StreamNameSize) {
-            StreamLen = (USHORT)(StreamNameSize - 1);
+    //
+    // Find stream separator (skip drive letter colon)
+    //
+    for (i = 2; i < FullPath->Length / sizeof(WCHAR); i++) {
+        if (FullPath->Buffer[i] == FP_STREAM_SEPARATOR) {
+            StreamStart = i;
+            FoundStream = TRUE;
+            break;
         }
-
-        RtlCopyMemory(StreamName, &FullPath->Buffer[StreamPos], StreamLen * sizeof(WCHAR));
-        StreamName[StreamLen] = L'\0';
     }
 
-    BasePath->Length = StreamPos * sizeof(WCHAR);
+    if (!FoundStream) {
+        return STATUS_NOT_FOUND;
+    }
+
+    //
+    // Copy stream name
+    //
+    USHORT StreamLen = (FullPath->Length / sizeof(WCHAR)) - StreamStart;
+    if (StreamLen >= StreamNameSize) {
+        StreamLen = (USHORT)(StreamNameSize - 1);
+    }
+
+    RtlCopyMemory(StreamName, &FullPath->Buffer[StreamStart], StreamLen * sizeof(WCHAR));
+    StreamName[StreamLen] = L'\0';
+
+    //
+    // Adjust base path
+    //
+    BasePath->Length = StreamStart * sizeof(WCHAR);
 
     return STATUS_SUCCESS;
 }
@@ -1340,6 +1336,13 @@ FpStripStreamName(
     _In_ PCUNICODE_STRING FullPath,
     _Out_ PUNICODE_STRING BasePath
     )
+/*++
+
+Routine Description:
+
+    Strips stream name from path.
+
+--*/
 {
     WCHAR StreamName[FP_MAX_STREAM_NAME_LENGTH];
 
@@ -1354,18 +1357,28 @@ FpResolveSymlink(
     _Out_writes_z_(TargetPathSize) PWCHAR TargetPath,
     _In_ ULONG TargetPathSize
     )
+/*++
+
+Routine Description:
+
+    Resolves symbolic link target.
+
+--*/
 {
     NTSTATUS Status;
     PFLT_FILE_NAME_INFORMATION FileNameInfo = NULL;
 
     PAGED_CODE();
 
-    if (Instance == NULL || FileObject == NULL || TargetPath == NULL || TargetPathSize == 0) {
+    if (Instance == NULL || FileObject == NULL || TargetPath == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     TargetPath[0] = L'\0';
 
+    //
+    // Get opened name (follows symlinks)
+    //
     Status = FltGetFileNameInformationUnsafe(
         FileObject,
         Instance,
@@ -1383,15 +1396,16 @@ FpResolveSymlink(
         return Status;
     }
 
-    {
-        USHORT CopyLen = FileNameInfo->Name.Length / sizeof(WCHAR);
-        if (CopyLen >= TargetPathSize) {
-            CopyLen = (USHORT)(TargetPathSize - 1);
-        }
-
-        RtlCopyMemory(TargetPath, FileNameInfo->Name.Buffer, CopyLen * sizeof(WCHAR));
-        TargetPath[CopyLen] = L'\0';
+    //
+    // Copy the resolved path
+    //
+    USHORT CopyLen = FileNameInfo->Name.Length / sizeof(WCHAR);
+    if (CopyLen >= TargetPathSize) {
+        CopyLen = (USHORT)(TargetPathSize - 1);
     }
+
+    RtlCopyMemory(TargetPath, FileNameInfo->Name.Buffer, CopyLen * sizeof(WCHAR));
+    TargetPath[CopyLen] = L'\0';
 
     FltReleaseFileNameInformation(FileNameInfo);
 
@@ -1409,120 +1423,21 @@ FpConvertShortToLongName(
 
 Routine Description:
 
-    Converts a short (8.3) path to its long name equivalent by opening the
-    file and querying FLT_FILE_NAME_NORMALIZED, which automatically resolves
-    short names to long names.
-
-    Caller must free LongPath->Buffer with ExFreePool on success.
+    Converts short name (8.3) to long name.
 
 --*/
 {
-    NTSTATUS Status;
-    HANDLE FileHandle = NULL;
-    PFILE_OBJECT FileObject = NULL;
-    IO_STATUS_BLOCK IoStatus;
-    OBJECT_ATTRIBUTES ObjAttr;
-    UNICODE_STRING MutableShortPath;
-    PFLT_FILE_NAME_INFORMATION FileNameInfo = NULL;
+    UNREFERENCED_PARAMETER(Instance);
+    UNREFERENCED_PARAMETER(ShortPath);
+    UNREFERENCED_PARAMETER(LongPath);
 
     PAGED_CODE();
 
-    if (Instance == NULL || ShortPath == NULL || LongPath == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    LongPath->Buffer = NULL;
-    LongPath->Length = 0;
-    LongPath->MaximumLength = 0;
-
-    if (ShortPath->Buffer == NULL || ShortPath->Length == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
     //
-    // Open file with minimal access to query its normalized name
+    // This would require opening the file and querying FileNameInformation
+    // For now, return the input as-is (full implementation would use FltQueryInformationFile)
     //
-    MutableShortPath = *ShortPath;
-
-    InitializeObjectAttributes(
-        &ObjAttr,
-        &MutableShortPath,
-        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
-        NULL,
-        NULL
-        );
-
-    Status = FltCreateFileEx(
-        NULL,
-        Instance,
-        &FileHandle,
-        &FileObject,
-        FILE_READ_ATTRIBUTES,
-        &ObjAttr,
-        &IoStatus,
-        NULL,
-        FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        FILE_OPEN,
-        FILE_NON_DIRECTORY_FILE,
-        NULL,
-        0,
-        IO_IGNORE_SHARE_ACCESS_CHECK
-        );
-
-    if (!NT_SUCCESS(Status)) {
-        return Status;
-    }
-
-    //
-    // Get normalized name (automatically resolves short → long)
-    //
-    Status = FltGetFileNameInformationUnsafe(
-        FileObject,
-        Instance,
-        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
-        &FileNameInfo
-        );
-
-    if (!NT_SUCCESS(Status)) {
-        ObDereferenceObject(FileObject);
-        FltClose(FileHandle);
-        return Status;
-    }
-
-    Status = FltParseFileNameInformation(FileNameInfo);
-    if (!NT_SUCCESS(Status)) {
-        FltReleaseFileNameInformation(FileNameInfo);
-        ObDereferenceObject(FileObject);
-        FltClose(FileHandle);
-        return Status;
-    }
-
-    //
-    // Allocate and copy the long name
-    //
-    LongPath->Length = FileNameInfo->Name.Length;
-    LongPath->MaximumLength = FileNameInfo->Name.Length + sizeof(WCHAR);
-    LongPath->Buffer = (PWCHAR)ExAllocatePool2(
-        POOL_FLAG_PAGED,
-        LongPath->MaximumLength,
-        FP_POOL_TAG_PATH
-        );
-
-    if (LongPath->Buffer == NULL) {
-        Status = STATUS_INSUFFICIENT_RESOURCES;
-        LongPath->Length = 0;
-        LongPath->MaximumLength = 0;
-    } else {
-        RtlCopyMemory(LongPath->Buffer, FileNameInfo->Name.Buffer, FileNameInfo->Name.Length);
-        LongPath->Buffer[FileNameInfo->Name.Length / sizeof(WCHAR)] = L'\0';
-    }
-
-    FltReleaseFileNameInformation(FileNameInfo);
-    ObDereferenceObject(FileObject);
-    FltClose(FileHandle);
-
-    return Status;
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 //=============================================================================
@@ -1539,29 +1454,20 @@ FpLogAccessAttempt(
     _In_ HANDLE ProcessId,
     _In_opt_ PCUNICODE_STRING RulePath
     )
+/*++
+
+Routine Description:
+
+    Logs an access attempt.
+
+--*/
 {
-    PFP_AUDIT_ENTRY_INTERNAL Entry;
+    PFP_AUDIT_ENTRY Entry;
     LARGE_INTEGER CurrentTime;
     USHORT CopyLen;
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL || !Engine->Initialized || !Engine->Config.EnableAuditLogging) {
         return;
-    }
-
-    //
-    // Re-read config under lock
-    //
-    {
-        BOOLEAN AuditEnabled;
-        KeEnterCriticalRegion();
-        ExAcquirePushLockShared(&Engine->ConfigLock);
-        AuditEnabled = Engine->Config.EnableAuditLogging;
-        ExReleasePushLockShared(&Engine->ConfigLock);
-        KeLeaveCriticalRegion();
-
-        if (!AuditEnabled) {
-            return;
-        }
     }
 
     if (FilePath == NULL || FilePath->Buffer == NULL) {
@@ -1569,46 +1475,57 @@ FpLogAccessAttempt(
     }
 
     //
-    // Allocate audit entry from PagedPool (entries are large ~4.6KB each,
-    // only accessed at <= APC_LEVEL) — fixes DESIGN-02
+    // Allocate audit entry
     //
-    Entry = (PFP_AUDIT_ENTRY_INTERNAL)ShadowStrikeAllocatePoolWithTag(
-        PagedPool,
-        sizeof(FP_AUDIT_ENTRY_INTERNAL),
-        FP_POOL_TAG_AUDIT
+    Entry = (PFP_AUDIT_ENTRY)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(FP_AUDIT_ENTRY),
+        FP_POOL_TAG_CONTEXT
         );
 
     if (Entry == NULL) {
         return;
     }
 
-    RtlZeroMemory(Entry, sizeof(FP_AUDIT_ENTRY_INTERNAL));
+    RtlZeroMemory(Entry, sizeof(FP_AUDIT_ENTRY));
 
     KeQuerySystemTime(&CurrentTime);
-    Entry->Info.Timestamp = CurrentTime;
-    Entry->Info.ProcessId = ProcessId;
-    Entry->Info.ThreadId = PsGetCurrentThreadId();
-    Entry->Info.Operation = Operation;
-    Entry->Info.Result = Result;
+    Entry->Timestamp = CurrentTime;
+    Entry->ProcessId = ProcessId;
+    Entry->ThreadId = PsGetCurrentThreadId();
+    Entry->Operation = Operation;
+    Entry->Result = Result;
 
+    //
+    // Copy file path
+    //
     CopyLen = FilePath->Length / sizeof(WCHAR);
     if (CopyLen >= FP_MAX_PATH_LENGTH) {
         CopyLen = FP_MAX_PATH_LENGTH - 1;
     }
-    RtlCopyMemory(Entry->Info.FilePath, FilePath->Buffer, CopyLen * sizeof(WCHAR));
-    Entry->Info.FilePath[CopyLen] = L'\0';
+    RtlCopyMemory(Entry->FilePath, FilePath->Buffer, CopyLen * sizeof(WCHAR));
+    Entry->FilePath[CopyLen] = L'\0';
 
+    //
+    // Copy rule path if provided
+    //
     if (RulePath != NULL && RulePath->Buffer != NULL) {
         CopyLen = RulePath->Length / sizeof(WCHAR);
         if (CopyLen >= FP_MAX_PATH_LENGTH) {
             CopyLen = FP_MAX_PATH_LENGTH - 1;
         }
-        RtlCopyMemory(Entry->Info.RulePath, RulePath->Buffer, CopyLen * sizeof(WCHAR));
-        Entry->Info.RulePath[CopyLen] = L'\0';
+        RtlCopyMemory(Entry->RulePath, RulePath->Buffer, CopyLen * sizeof(WCHAR));
+        Entry->RulePath[CopyLen] = L'\0';
     }
 
-    FppGetProcessName(ProcessId, Entry->Info.ProcessName, ARRAYSIZE(Entry->Info.ProcessName));
+    //
+    // Get process name
+    //
+    FppGetProcessName(ProcessId, Entry->ProcessName, ARRAYSIZE(Entry->ProcessName));
 
+    //
+    // Add to audit log
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->AuditLogLock);
 
@@ -1616,6 +1533,9 @@ FpLogAccessAttempt(
     InterlockedIncrement(&Engine->AuditLogCount);
     InterlockedIncrement64(&Engine->Stats.AuditEvents);
 
+    //
+    // Trim if over limit
+    //
     FppTrimAuditLog(Engine);
 
     ExReleasePushLockExclusive(&Engine->AuditLogLock);
@@ -1626,61 +1546,27 @@ _Use_decl_annotations_
 NTSTATUS
 FpGetAuditLog(
     _In_ PFP_ENGINE Engine,
-    _Out_writes_to_(*BufferCount, *BufferCount) PFP_AUDIT_ENTRY_INFO Buffer,
-    _Inout_ PULONG BufferCount
+    _Out_ PFP_AUDIT_ENTRY* Entries,
+    _Inout_ PULONG EntryCount
     )
 /*++
 
 Routine Description:
 
-    Copies audit log entries into a caller-provided buffer.
-    Entries are copied oldest-first. The caller provides the buffer
-    and its max capacity in *BufferCount; on return *BufferCount
-    contains the number actually copied.
+    Gets audit log entries.
 
 --*/
 {
-    PLIST_ENTRY Entry;
-    PFP_AUDIT_ENTRY_INTERNAL AuditEntry;
-    ULONG MaxEntries;
-    ULONG Copied = 0;
-
     PAGED_CODE();
 
-    if (Engine == NULL || Buffer == NULL || BufferCount == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
+    UNREFERENCED_PARAMETER(Engine);
+    UNREFERENCED_PARAMETER(Entries);
+    UNREFERENCED_PARAMETER(EntryCount);
 
-    if (!InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    MaxEntries = *BufferCount;
-    *BufferCount = 0;
-
-    if (MaxEntries == 0) {
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Engine->AuditLogLock);
-
-    for (Entry = Engine->AuditLog.Flink;
-         Entry != &Engine->AuditLog && Copied < MaxEntries;
-         Entry = Entry->Flink) {
-
-        AuditEntry = CONTAINING_RECORD(Entry, FP_AUDIT_ENTRY_INTERNAL, ListEntry);
-
-        RtlCopyMemory(&Buffer[Copied], &AuditEntry->Info, sizeof(FP_AUDIT_ENTRY_INFO));
-        Copied++;
-    }
-
-    ExReleasePushLockShared(&Engine->AuditLogLock);
-    KeLeaveCriticalRegion();
-
-    *BufferCount = Copied;
-
-    return STATUS_SUCCESS;
+    //
+    // Implementation would copy entries to caller-provided buffer
+    //
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 _Use_decl_annotations_
@@ -1688,13 +1574,20 @@ VOID
 FpClearAuditLog(
     _In_ PFP_ENGINE Engine
     )
+/*++
+
+Routine Description:
+
+    Clears the audit log.
+
+--*/
 {
     PLIST_ENTRY Entry;
-    PFP_AUDIT_ENTRY_INTERNAL AuditEntry;
+    PFP_AUDIT_ENTRY AuditEntry;
 
     PAGED_CODE();
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL || !Engine->Initialized) {
         return;
     }
 
@@ -1703,7 +1596,7 @@ FpClearAuditLog(
 
     while (!IsListEmpty(&Engine->AuditLog)) {
         Entry = RemoveHeadList(&Engine->AuditLog);
-        AuditEntry = CONTAINING_RECORD(Entry, FP_AUDIT_ENTRY_INTERNAL, ListEntry);
+        AuditEntry = CONTAINING_RECORD(Entry, FP_AUDIT_ENTRY, ListEntry);
         FppFreeAuditEntry(AuditEntry);
     }
 
@@ -1727,8 +1620,7 @@ FpGetStatistics(
 
 Routine Description:
 
-    Reads statistics using per-field volatile reads to avoid torn reads on x86.
-    No lock needed — each field is read atomically via InterlockedCompareExchange64.
+    Gets file protection statistics.
 
 --*/
 {
@@ -1736,21 +1628,7 @@ Routine Description:
         return;
     }
 
-    RtlZeroMemory(Stats, sizeof(FP_STATISTICS));
-
-    Stats->TotalChecks          = InterlockedCompareExchange64(&Engine->Stats.TotalChecks, 0, 0);
-    Stats->PathsProtected       = InterlockedCompareExchange64(&Engine->Stats.PathsProtected, 0, 0);
-    Stats->ExtensionsProtected  = InterlockedCompareExchange64(&Engine->Stats.ExtensionsProtected, 0, 0);
-    Stats->BlockedWrites        = InterlockedCompareExchange64(&Engine->Stats.BlockedWrites, 0, 0);
-    Stats->BlockedDeletes       = InterlockedCompareExchange64(&Engine->Stats.BlockedDeletes, 0, 0);
-    Stats->BlockedRenames       = InterlockedCompareExchange64(&Engine->Stats.BlockedRenames, 0, 0);
-    Stats->BlockedSetInfo       = InterlockedCompareExchange64(&Engine->Stats.BlockedSetInfo, 0, 0);
-    Stats->BlockedSetSecurity   = InterlockedCompareExchange64(&Engine->Stats.BlockedSetSecurity, 0, 0);
-    Stats->BlockedHardlinks     = InterlockedCompareExchange64(&Engine->Stats.BlockedHardlinks, 0, 0);
-    Stats->BlockedStreams        = InterlockedCompareExchange64(&Engine->Stats.BlockedStreams, 0, 0);
-    Stats->AuditEvents          = InterlockedCompareExchange64(&Engine->Stats.AuditEvents, 0, 0);
-    Stats->BypassAttempts        = InterlockedCompareExchange64(&Engine->Stats.BypassAttempts, 0, 0);
-    Stats->StartTime            = Engine->Stats.StartTime;
+    RtlCopyMemory(Stats, &Engine->Stats, sizeof(FP_STATISTICS));
 }
 
 _Use_decl_annotations_
@@ -1762,8 +1640,7 @@ FpResetStatistics(
 
 Routine Description:
 
-    Resets statistics using per-field InterlockedExchange64 to avoid racing
-    with concurrent InterlockedIncrement64 calls.
+    Resets statistics.
 
 --*/
 {
@@ -1775,19 +1652,7 @@ Routine Description:
 
     KeQuerySystemTime(&CurrentTime);
 
-    InterlockedExchange64(&Engine->Stats.TotalChecks, 0);
-    InterlockedExchange64(&Engine->Stats.PathsProtected, 0);
-    InterlockedExchange64(&Engine->Stats.ExtensionsProtected, 0);
-    InterlockedExchange64(&Engine->Stats.BlockedWrites, 0);
-    InterlockedExchange64(&Engine->Stats.BlockedDeletes, 0);
-    InterlockedExchange64(&Engine->Stats.BlockedRenames, 0);
-    InterlockedExchange64(&Engine->Stats.BlockedSetInfo, 0);
-    InterlockedExchange64(&Engine->Stats.BlockedSetSecurity, 0);
-    InterlockedExchange64(&Engine->Stats.BlockedHardlinks, 0);
-    InterlockedExchange64(&Engine->Stats.BlockedStreams, 0);
-    InterlockedExchange64(&Engine->Stats.AuditEvents, 0);
-    InterlockedExchange64(&Engine->Stats.BypassAttempts, 0);
-
+    RtlZeroMemory(&Engine->Stats, sizeof(FP_STATISTICS));
     Engine->Stats.StartTime = CurrentTime;
 }
 
@@ -1804,28 +1669,39 @@ FppMatchPath(
     _In_ USHORT RulePathLength,
     _In_ BOOLEAN IsRecursive
     )
-{
-    USHORT i;
+/*++
 
+Routine Description:
+
+    Checks if test path matches rule path.
+
+--*/
+{
+    //
+    // Case-insensitive prefix match
+    //
     if (TestPathLength < RulePathLength) {
         return FALSE;
     }
 
-    //
-    // Case-insensitive compare using RtlUpcaseUnicodeChar.
-    // Both paths should already be uppercased, but belt-and-suspenders.
-    //
-    for (i = 0; i < RulePathLength; i++) {
-        if (RtlUpcaseUnicodeChar(TestPath[i]) != RtlUpcaseUnicodeChar(RulePath[i])) {
-            return FALSE;
-        }
+    if (_wcsnicmp(TestPath, RulePath, RulePathLength) != 0) {
+        return FALSE;
     }
 
+    //
+    // Exact match
+    //
     if (TestPathLength == RulePathLength) {
         return TRUE;
     }
 
+    //
+    // For recursive rules, check if test path is under rule path
+    //
     if (IsRecursive) {
+        //
+        // Ensure rule path ends at directory boundary
+        //
         if (TestPath[RulePathLength] == FP_PATH_SEPARATOR ||
             RulePath[RulePathLength - 1] == FP_PATH_SEPARATOR) {
             return TRUE;
@@ -1842,64 +1718,36 @@ FppMatchExtension(
     _In_ PCWSTR Extension,
     _In_ USHORT ExtensionLength
     )
+/*++
+
+Routine Description:
+
+    Checks if filename has the specified extension.
+
+--*/
 {
     SIZE_T FileNameLen = wcslen(FileName);
     PCWSTR FileDot;
-    SIZE_T fi;
 
     if (FileNameLen <= ExtensionLength) {
         return FALSE;
     }
 
-    FileDot = NULL;
-    for (fi = FileNameLen; fi > 0; fi--) {
-        if (FileName[fi - 1] == L'.') {
-            FileDot = &FileName[fi - 1];
-            break;
-        }
-    }
-
+    FileDot = wcsrchr(FileName, L'.');
     if (FileDot == NULL) {
         return FALSE;
     }
 
-    //
-    // Case-insensitive compare (both should be uppercased, but be safe)
-    //
-    {
-        SIZE_T extLen = wcslen(FileDot);
-        SIZE_T ruleLen = wcslen(Extension);
-        SIZE_T ci;
-
-        if (extLen != ruleLen) {
-            return FALSE;
-        }
-
-        for (ci = 0; ci < extLen; ci++) {
-            if (RtlUpcaseUnicodeChar(FileDot[ci]) != RtlUpcaseUnicodeChar(Extension[ci])) {
-                return FALSE;
-            }
-        }
-    }
-
-    return TRUE;
+    return _wcsicmp(FileDot, Extension) == 0;
 }
 
-/**
- * @brief Release a reference on a protected path.
- *        When RefCount reaches 0, the entry is freed.
- */
 static
 VOID
-FppReleaseProtectedPath(
-    _Inout_ PFP_PROTECTED_PATH Path
+FppFreeProtectedPath(
+    _In_ PFP_PROTECTED_PATH Path
     )
 {
-    if (Path == NULL) {
-        return;
-    }
-
-    if (InterlockedDecrement(&Path->RefCount) <= 0) {
+    if (Path != NULL) {
         ShadowStrikeFreePoolWithTag(Path, FP_POOL_TAG_RULE);
     }
 }
@@ -1907,11 +1755,11 @@ FppReleaseProtectedPath(
 static
 VOID
 FppFreeAuditEntry(
-    _In_ PFP_AUDIT_ENTRY_INTERNAL Entry
+    _In_ PFP_AUDIT_ENTRY Entry
     )
 {
     if (Entry != NULL) {
-        ShadowStrikeFreePoolWithTag(Entry, FP_POOL_TAG_AUDIT);
+        ShadowStrikeFreePoolWithTag(Entry, FP_POOL_TAG_CONTEXT);
     }
 }
 
@@ -1930,23 +1778,15 @@ Routine Description:
 --*/
 {
     PLIST_ENTRY Entry;
-    PFP_AUDIT_ENTRY_INTERNAL AuditEntry;
-    LONG MaxEntries;
+    PFP_AUDIT_ENTRY AuditEntry;
 
-    //
-    // Read MaxAuditEntries — ConfigLock ordering: we already hold AuditLogLock,
-    // so we read it non-lockingly (it's a ULONG set under ConfigLock at PASSIVE).
-    // This is safe because we only use it as a threshold.
-    //
-    MaxEntries = (LONG)Engine->Config.MaxAuditEntries;
-
-    while (Engine->AuditLogCount > MaxEntries) {
+    while (Engine->AuditLogCount > (LONG)Engine->Config.MaxAuditEntries) {
         if (IsListEmpty(&Engine->AuditLog)) {
             break;
         }
 
         Entry = RemoveHeadList(&Engine->AuditLog);
-        AuditEntry = CONTAINING_RECORD(Entry, FP_AUDIT_ENTRY_INTERNAL, ListEntry);
+        AuditEntry = CONTAINING_RECORD(Entry, FP_AUDIT_ENTRY, ListEntry);
         FppFreeAuditEntry(AuditEntry);
         InterlockedDecrement(&Engine->AuditLogCount);
     }
@@ -1959,6 +1799,13 @@ FppGetProcessName(
     _Out_writes_z_(NameSize) PWCHAR ProcessName,
     _In_ ULONG NameSize
     )
+/*++
+
+Routine Description:
+
+    Gets process name from PID.
+
+--*/
 {
     PEPROCESS Process = NULL;
     NTSTATUS Status;
@@ -1974,6 +1821,9 @@ FppGetProcessName(
 
     Status = SeLocateProcessImageName(Process, &ImageFileName);
     if (NT_SUCCESS(Status) && ImageFileName != NULL) {
+        //
+        // Extract just the filename
+        //
         PWCHAR LastSlash = wcsrchr(ImageFileName->Buffer, L'\\');
         if (LastSlash != NULL) {
             RtlStringCchCopyW(ProcessName, NameSize, LastSlash + 1);
@@ -2001,6 +1851,13 @@ BOOLEAN
 FppIsShortName(
     _In_ PCWSTR FileName
     )
+/*++
+
+Routine Description:
+
+    Checks if filename appears to be a short (8.3) name.
+
+--*/
 {
     SIZE_T Len;
     PCWSTR Tilde;
@@ -2011,12 +1868,21 @@ FppIsShortName(
 
     Len = wcslen(FileName);
 
+    //
+    // Short names are typically 12 chars or less (8.3 format)
+    //
     if (Len > 12) {
         return FALSE;
     }
 
+    //
+    // Look for tilde character (e.g., PROGRA~1)
+    //
     Tilde = wcschr(FileName, FP_SHORT_NAME_MARKER);
     if (Tilde != NULL) {
+        //
+        // Check if followed by digit
+        //
         if (Tilde[1] >= L'1' && Tilde[1] <= L'9') {
             return TRUE;
         }
@@ -2024,3 +1890,76 @@ FppIsShortName(
 
     return FALSE;
 }
+
+static
+VOID
+FppExtractFileName(
+    _In_ PCUNICODE_STRING FullPath,
+    _Out_ PUNICODE_STRING FileName
+    )
+/*++
+
+Routine Description:
+
+    Extracts filename from full path.
+
+--*/
+{
+    USHORT i;
+
+    FileName->Buffer = FullPath->Buffer;
+    FileName->Length = FullPath->Length;
+    FileName->MaximumLength = FullPath->MaximumLength;
+
+    //
+    // Find last separator
+    //
+    for (i = FullPath->Length / sizeof(WCHAR); i > 0; i--) {
+        if (FullPath->Buffer[i - 1] == FP_PATH_SEPARATOR) {
+            FileName->Buffer = &FullPath->Buffer[i];
+            FileName->Length = FullPath->Length - (i * sizeof(WCHAR));
+            FileName->MaximumLength = FileName->Length + sizeof(WCHAR);
+            break;
+        }
+    }
+}
+
+static
+VOID
+FppExtractExtension(
+    _In_ PCUNICODE_STRING FileName,
+    _Out_writes_z_(ExtSize) PWCHAR Extension,
+    _In_ ULONG ExtSize
+    )
+/*++
+
+Routine Description:
+
+    Extracts extension from filename.
+
+--*/
+{
+    USHORT i;
+
+    Extension[0] = L'\0';
+
+    if (FileName == NULL || FileName->Buffer == NULL || FileName->Length == 0) {
+        return;
+    }
+
+    //
+    // Find last dot
+    //
+    for (i = FileName->Length / sizeof(WCHAR); i > 0; i--) {
+        if (FileName->Buffer[i - 1] == L'.') {
+            USHORT ExtLen = (FileName->Length / sizeof(WCHAR)) - (i - 1);
+            if (ExtLen >= ExtSize) {
+                ExtLen = (USHORT)(ExtSize - 1);
+            }
+            RtlCopyMemory(Extension, &FileName->Buffer[i - 1], ExtLen * sizeof(WCHAR));
+            Extension[ExtLen] = L'\0';
+            break;
+        }
+    }
+}
+

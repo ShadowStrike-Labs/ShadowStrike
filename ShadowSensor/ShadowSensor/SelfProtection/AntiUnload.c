@@ -1,39 +1,25 @@
 /**
  * ============================================================================
- * ShadowStrike NGAV - ENTERPRISE ANTI-UNLOAD PROTECTION
+ * ShadowStrike NGAV - ANTI-UNLOAD PROTECTION IMPLEMENTATION
  * ============================================================================
  *
  * @file AntiUnload.c
- * @brief Enterprise-grade driver unload protection and tamper resistance.
+ * @brief Enterprise-grade driver unload prevention and tamper resistance.
  *
- * Implements CrowdStrike Falcon-class anti-unload protection with:
- * - Reference counting to prevent premature unload
- * - Driver object protection via ObRegisterCallbacks
- * - Service control protection monitoring
- * - Device object handle protection
- * - Unload attempt detection and logging
- * - Callback notification for unload attempts
- * - Multi-level protection (Basic to Maximum)
- *
- * Protection Levels:
- * - Basic: Reference counting only
- * - Medium: + Driver object handle protection
- * - High: + Callback registration protection
- * - Maximum: + Active tamper detection and response
- *
- * Attack Vectors Defended:
- * - sc stop/delete commands
- * - Direct NtUnloadDriver calls
- * - Handle-based driver manipulation
- * - Device object removal
- * - Process termination of loader
- * - Callback unregistration attempts
- *
- * CRITICAL: This module is essential for EDR persistence. Attackers
- * commonly attempt to unload security drivers to disable protection.
+ * Architecture:
+ * - DriverUnload = NULL blocks NtUnloadDriver (AuLevel_Basic).
+ * - ObRegisterCallbacks strips dangerous access from handles targeting
+ *   registered protected PIDs (AuLevel_Full).
+ * - Protected processes identified by PID registration (not image name).
+ *   User-mode service calls AuProtectProcess via secured IOCTL.
+ * - PsGetProcessImageFileName for event logging (ANSI, 15 chars, any IRQL).
+ * - EX_RUNDOWN_REF guarantees OB callbacks finish before AuShutdown frees.
+ * - EX_PUSH_LOCK serializes level transitions and callback registration.
+ * - Event history: eviction under spin lock into local list, free outside.
+ * - AuGetEvents deep-copies events (no dangling pointers).
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -49,65 +35,14 @@
 #endif
 
 // ============================================================================
-// PRIVATE CONSTANTS
-// ============================================================================
-
-/**
- * @brief Maximum unload events to keep in history
- */
-#define AU_MAX_EVENTS                   256
-
-/**
- * @brief Pool tag for event allocations
- */
-#define AU_POOL_TAG_EVENT               'eAUA'
-
-/**
- * @brief Dangerous access rights for driver objects
- */
-#define AU_DANGEROUS_DRIVER_ACCESS      (DELETE | WRITE_DAC | WRITE_OWNER)
-
-/**
- * @brief Dangerous access rights for device objects
- */
-#define AU_DANGEROUS_DEVICE_ACCESS      (DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_DATA)
-
-/**
- * @brief Known service control manager process names
- */
-static const WCHAR* g_ServiceControlProcesses[] = {
-    L"services.exe",
-    L"sc.exe",
-    L"net.exe",
-    L"net1.exe",
-    L"taskkill.exe",
-    L"taskmgr.exe",
-    L"procexp.exe",
-    L"procexp64.exe",
-    L"processhacker.exe",
-    NULL
-};
-
-/**
- * @brief Known driver loading utilities
- */
-static const WCHAR* g_DriverLoadUtilities[] = {
-    L"drvload.exe",
-    L"pnputil.exe",
-    L"devcon.exe",
-    L"infdefaultinstall.exe",
-    NULL
-};
-
-// ============================================================================
-// PRIVATE FUNCTION PROTOTYPES
+// PRIVATE PROTOTYPES
 // ============================================================================
 
 static PAU_UNLOAD_EVENT
 AupCreateEvent(
     _In_ AU_UNLOAD_ATTEMPT Type,
-    _In_ HANDLE ProcessId,
-    _In_opt_ PUNICODE_STRING ProcessName,
+    _In_ HANDLE CallerPid,
+    _In_ HANDLE TargetPid,
     _In_ BOOLEAN WasBlocked
     );
 
@@ -122,25 +57,13 @@ AupAddEvent(
     _In_ PAU_UNLOAD_EVENT Event
     );
 
-static BOOLEAN
-AupIsServiceControlProcess(
-    _In_ HANDLE ProcessId
-    );
-
-static BOOLEAN
-AupGetProcessImageName(
-    _In_ HANDLE ProcessId,
-    _Out_writes_z_(BufferSize) PWSTR Buffer,
-    _In_ ULONG BufferSize
-    );
-
 static NTSTATUS
-AupRegisterObjectCallbacks(
+AupRegisterObCallbacks(
     _In_ PAU_PROTECTOR Protector
     );
 
 static VOID
-AupUnregisterObjectCallbacks(
+AupUnregisterObCallbacks(
     _In_ PAU_PROTECTOR Protector
     );
 
@@ -157,45 +80,35 @@ AupThreadPreCallback(
     );
 
 static BOOLEAN
-AupIsProtectedProcess(
+AupIsPidProtected(
     _In_ PAU_PROTECTOR Protector,
-    _In_ PEPROCESS Process
+    _In_ HANDLE ProcessId
     );
 
 static VOID
 AupNotifyCallback(
     _In_ PAU_PROTECTOR Protector,
     _In_ AU_UNLOAD_ATTEMPT AttemptType,
-    _In_ HANDLE SourceProcessId
+    _In_ HANDLE CallerPid
     );
 
 // ============================================================================
-// GLOBAL STATE
+// CALLBACK ALTITUDE
 // ============================================================================
 
 /**
- * @brief Object callback registration data
+ * Altitude for ObRegisterCallbacks.
+ * NOTE: For production, register an official altitude with Microsoft.
+ * This value is a placeholder that must be replaced before WHQL submission.
  */
-static OB_CALLBACK_REGISTRATION g_ObRegistration = { 0 };
-static OB_OPERATION_REGISTRATION g_ObOperations[2] = { 0 };
-
-/**
- * @brief Callback altitude (must be unique per driver)
- */
-static UNICODE_STRING g_CallbackAltitude = RTL_CONSTANT_STRING(L"385201.1337");
+static const WCHAR g_AltitudeBuffer[] = L"385201.1337";
 
 // ============================================================================
-// PUBLIC API - INITIALIZATION
+// PUBLIC API
 // ============================================================================
 
 /**
- * @brief Initialize the anti-unload protection subsystem.
- *
- * @param DriverObject   Driver object to protect.
- * @param Protector      Receives initialized protector handle.
- * @return STATUS_SUCCESS on success.
- *
- * @irql PASSIVE_LEVEL
+ * @brief Initialize anti-unload protection.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
@@ -205,7 +118,7 @@ AuInitialize(
     _Out_ PAU_PROTECTOR* Protector
     )
 {
-    PAU_PROTECTOR protector = NULL;
+    PAU_PROTECTOR p = NULL;
 
     PAGED_CODE();
 
@@ -215,62 +128,60 @@ AuInitialize(
 
     *Protector = NULL;
 
-    //
-    // Allocate protector structure
-    //
-    protector = (PAU_PROTECTOR)ExAllocatePoolZero(
+    p = (PAU_PROTECTOR)ExAllocatePoolZero(
         NonPagedPoolNx,
         sizeof(AU_PROTECTOR),
         AU_POOL_TAG
     );
-
-    if (protector == NULL) {
+    if (p == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Initialize event list and lock
+    // Initialize synchronization primitives.
     //
-    InitializeListHead(&protector->EventList);
-    KeInitializeSpinLock(&protector->EventLock);
-    protector->EventCount = 0;
+    ExInitializePushLock(&p->ConfigLock);
+    ExInitializeRundownProtection(&p->RundownRef);
+    KeInitializeSpinLock(&p->EventLock);
+    KeInitializeSpinLock(&p->PidLock);
+    InitializeListHead(&p->EventList);
 
     //
-    // Store driver object reference
+    // Reference the driver object to prevent premature deletion.
     //
-    protector->ProtectedDriver = DriverObject;
+    ObReferenceObject(DriverObject);
+    p->ProtectedDriver = DriverObject;
 
     //
-    // Initialize reference count to 1 (driver loaded)
+    // Null the unload routine — core anti-unload mechanism.
+    // Save original so AuShutdown can restore it for controlled unload.
     //
-    protector->RefCount = 1;
+    p->OriginalUnload = DriverObject->DriverUnload;
+    DriverObject->DriverUnload = NULL;
 
     //
-    // Set default protection level
+    // Set up altitude string for OB callbacks (from const buffer).
     //
-    protector->Level = AuLevel_Basic;
+    RtlInitUnicodeString(&p->ObAltitude, g_AltitudeBuffer);
 
     //
-    // Initialize statistics
+    // Default protection level.
     //
-    KeQuerySystemTime(&protector->Stats.StartTime);
+    InterlockedExchange(&p->Level, (LONG)AuLevel_Basic);
 
-    protector->Initialized = TRUE;
-    *Protector = protector;
+    KeQuerySystemTime(&p->Stats.StartTime);
+    p->Initialized = TRUE;
+    *Protector = p;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Anti-unload protection initialized (Driver=%p)\n",
+               "[ShadowStrike] Anti-unload initialized (Driver=%p, Unload nulled)\n",
                DriverObject);
 
     return STATUS_SUCCESS;
 }
 
 /**
- * @brief Shutdown the anti-unload protection subsystem.
- *
- * @param Protector   Protector to shutdown.
- *
- * @irql PASSIVE_LEVEL
+ * @brief Shutdown anti-unload protection.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
@@ -278,73 +189,77 @@ AuShutdown(
     _Inout_ PAU_PROTECTOR Protector
     )
 {
-    PLIST_ENTRY listEntry;
+    LIST_ENTRY evictList;
+    PLIST_ENTRY entry;
     PAU_UNLOAD_EVENT event;
-    LIST_ENTRY tempList;
     KIRQL oldIrql;
 
     PAGED_CODE();
 
-    if (Protector == NULL) {
+    if (Protector == NULL || !Protector->Initialized) {
         return;
     }
 
-    if (!Protector->Initialized) {
-        return;
-    }
-
+    //
+    // STEP 1: Mark not initialized so OB callbacks bail out early.
+    //
     Protector->Initialized = FALSE;
 
     //
-    // Unregister object callbacks
+    // STEP 2: Unregister OB callbacks.
+    // After this, no NEW callbacks will fire. But in-flight ones
+    // may still be executing on other CPUs.
     //
-    AupUnregisterObjectCallbacks(Protector);
+    AupUnregisterObCallbacks(Protector);
 
     //
-    // Move events to temp list
+    // STEP 3: Wait for all in-flight OB callbacks to complete.
+    // ExWaitForRundownProtectionRelease blocks until every
+    // ExAcquireRundownProtection holder calls ExReleaseRundownProtection.
     //
-    InitializeListHead(&tempList);
+    ExWaitForRundownProtectionRelease(&Protector->RundownRef);
+
+    //
+    // STEP 4: Free event list (no lock needed — all callbacks are done).
+    //
+    InitializeListHead(&evictList);
 
     KeAcquireSpinLock(&Protector->EventLock, &oldIrql);
-
     while (!IsListEmpty(&Protector->EventList)) {
-        listEntry = RemoveHeadList(&Protector->EventList);
-        InsertTailList(&tempList, listEntry);
+        entry = RemoveHeadList(&Protector->EventList);
+        InsertTailList(&evictList, entry);
     }
-
     Protector->EventCount = 0;
-
     KeReleaseSpinLock(&Protector->EventLock, oldIrql);
 
-    //
-    // Free events outside lock
-    //
-    while (!IsListEmpty(&tempList)) {
-        listEntry = RemoveHeadList(&tempList);
-        event = CONTAINING_RECORD(listEntry, AU_UNLOAD_EVENT, ListEntry);
+    while (!IsListEmpty(&evictList)) {
+        entry = RemoveHeadList(&evictList);
+        event = CONTAINING_RECORD(entry, AU_UNLOAD_EVENT, ListEntry);
         AupFreeEvent(event);
     }
 
+    //
+    // STEP 5: Restore DriverUnload for controlled unload and deref.
+    //
+    if (Protector->ProtectedDriver != NULL) {
+        Protector->ProtectedDriver->DriverUnload = Protector->OriginalUnload;
+        ObDereferenceObject(Protector->ProtectedDriver);
+        Protector->ProtectedDriver = NULL;
+    }
+
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Anti-unload protection shutdown (attempts=%lld, blocked=%lld)\n",
-               Protector->Stats.UnloadAttempts,
+               "[ShadowStrike] Anti-unload shutdown (attempts=%lld, blocked=%lld)\n",
+               Protector->Stats.TotalAttempts,
                Protector->Stats.AttemptsBlocked);
 
+    //
+    // STEP 6: Free protector.
+    //
     ExFreePoolWithTag(Protector, AU_POOL_TAG);
 }
 
-// ============================================================================
-// PUBLIC API - CONFIGURATION
-// ============================================================================
-
 /**
- * @brief Set the protection level.
- *
- * @param Protector   Protector handle.
- * @param Level       New protection level.
- * @return STATUS_SUCCESS on success.
- *
- * @irql PASSIVE_LEVEL
+ * @brief Set protection level.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -354,65 +269,68 @@ AuSetLevel(
     )
 {
     NTSTATUS status = STATUS_SUCCESS;
-    AU_PROTECTION_LEVEL oldLevel;
+    LONG oldLevel;
 
     PAGED_CODE();
 
     if (Protector == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
-
     if (!Protector->Initialized) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    if (Level > AuLevel_Maximum) {
+    if (Level > AuLevel_Full) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    oldLevel = Protector->Level;
-    Protector->Level = Level;
+    //
+    // Serialize level transitions under exclusive lock.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Protector->ConfigLock);
 
-    //
-    // Handle level transitions
-    //
-    if (Level >= AuLevel_Medium && oldLevel < AuLevel_Medium) {
-        //
-        // Upgrading to Medium+ : Register object callbacks
-        //
-        status = AupRegisterObjectCallbacks(Protector);
-        if (!NT_SUCCESS(status)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] Failed to register object callbacks: 0x%08X\n",
-                       status);
-            //
-            // Don't fail - continue with reduced protection
-            //
-            status = STATUS_SUCCESS;
-        }
-    } else if (Level < AuLevel_Medium && oldLevel >= AuLevel_Medium) {
-        //
-        // Downgrading from Medium+ : Unregister object callbacks
-        //
-        AupUnregisterObjectCallbacks(Protector);
+    oldLevel = (LONG)InterlockedCompareExchange(&Protector->Level, 0, 0);
+
+    if ((LONG)Level == oldLevel) {
+        ExReleasePushLockExclusive(&Protector->ConfigLock);
+        KeLeaveCriticalRegion();
+        return STATUS_SUCCESS;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Protection level changed: %d -> %d\n",
-               oldLevel, Level);
+    //
+    // Handle OB callback transitions.
+    //
+    if (Level >= AuLevel_Full && oldLevel < (LONG)AuLevel_Full) {
+        status = AupRegisterObCallbacks(Protector);
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] OB callback registration failed: 0x%X "
+                       "(continuing at Basic level)\n", status);
+            //
+            // Don't fail the overall call — Basic protection remains.
+            //
+            InterlockedExchange(&Protector->Level, (LONG)AuLevel_Basic);
+            ExReleasePushLockExclusive(&Protector->ConfigLock);
+            KeLeaveCriticalRegion();
+            return STATUS_SUCCESS;
+        }
+    } else if ((LONG)Level < (LONG)AuLevel_Full && oldLevel >= (LONG)AuLevel_Full) {
+        AupUnregisterObCallbacks(Protector);
+    }
 
-    return status;
+    InterlockedExchange(&Protector->Level, (LONG)Level);
+
+    ExReleasePushLockExclusive(&Protector->ConfigLock);
+    KeLeaveCriticalRegion();
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike] Protection level: %d -> %d\n", oldLevel, (LONG)Level);
+
+    return STATUS_SUCCESS;
 }
 
 /**
- * @brief Register a callback for unload attempt notifications.
- *
- * @param Protector   Protector handle.
- * @param Callback    Callback function.
- * @param Context     Optional context for callback.
- * @return STATUS_SUCCESS on success.
- *
- * @irql PASSIVE_LEVEL
+ * @brief Register notification callback.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -427,113 +345,126 @@ AuRegisterCallback(
     if (Protector == NULL || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
-
     if (!Protector->Initialized) {
         return STATUS_DEVICE_NOT_READY;
     }
 
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Protector->ConfigLock);
+
     Protector->UserCallback = Callback;
     Protector->CallbackContext = Context;
+
+    ExReleasePushLockExclusive(&Protector->ConfigLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
 
-// ============================================================================
-// PUBLIC API - REFERENCE COUNTING
-// ============================================================================
-
 /**
- * @brief Add a reference to prevent unload.
- *
- * Call this when starting a long-running operation that requires
- * the driver to remain loaded.
- *
- * @param Protector   Protector handle.
- *
- * @irql <= DISPATCH_LEVEL
+ * @brief Register a PID as protected.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
-VOID
-AuAddRef(
-    _In_ PAU_PROTECTOR Protector
+NTSTATUS
+AuProtectProcess(
+    _In_ PAU_PROTECTOR Protector,
+    _In_ HANDLE ProcessId
     )
 {
-    if (Protector == NULL || !Protector->Initialized) {
-        return;
+    KIRQL oldIrql;
+    ULONG i;
+
+    if (Protector == NULL || !Protector->Initialized || ProcessId == NULL) {
+        return STATUS_INVALID_PARAMETER;
     }
 
-    InterlockedIncrement(&Protector->RefCount);
+    KeAcquireSpinLock(&Protector->PidLock, &oldIrql);
+
+    //
+    // Check for duplicate.
+    //
+    for (i = 0; i < Protector->ProtectedPidCount; i++) {
+        if (Protector->ProtectedPids[i] == ProcessId) {
+            KeReleaseSpinLock(&Protector->PidLock, oldIrql);
+            return STATUS_DUPLICATE_OBJECTID;
+        }
+    }
+
+    //
+    // Check capacity.
+    //
+    if (Protector->ProtectedPidCount >= AU_MAX_PROTECTED_PIDS) {
+        KeReleaseSpinLock(&Protector->PidLock, oldIrql);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    Protector->ProtectedPids[Protector->ProtectedPidCount] = ProcessId;
+    Protector->ProtectedPidCount++;
+
+    KeReleaseSpinLock(&Protector->PidLock, oldIrql);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike] Protected PID registered: %p\n", ProcessId);
+
+    return STATUS_SUCCESS;
 }
 
 /**
- * @brief Release a reference.
- *
- * Call this when a long-running operation completes.
- *
- * @param Protector   Protector handle.
- *
- * @irql <= DISPATCH_LEVEL
+ * @brief Unregister a protected PID.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
-AuRelease(
-    _In_ PAU_PROTECTOR Protector
+AuUnprotectProcess(
+    _In_ PAU_PROTECTOR Protector,
+    _In_ HANDLE ProcessId
     )
 {
-    LONG newCount;
+    KIRQL oldIrql;
+    ULONG i;
 
-    if (Protector == NULL || !Protector->Initialized) {
+    if (Protector == NULL || !Protector->Initialized || ProcessId == NULL) {
         return;
     }
 
-    newCount = InterlockedDecrement(&Protector->RefCount);
+    KeAcquireSpinLock(&Protector->PidLock, &oldIrql);
 
-    //
-    // RefCount should never go below 1 during normal operation
-    // (the initial reference from initialization)
-    //
-    if (newCount < 1) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] WARNING: RefCount went below 1 (%d)\n",
-                   newCount);
-
-        //
-        // Restore to 1 to prevent issues
-        //
-        InterlockedCompareExchange(&Protector->RefCount, 1, newCount);
+    for (i = 0; i < Protector->ProtectedPidCount; i++) {
+        if (Protector->ProtectedPids[i] == ProcessId) {
+            //
+            // Compact: move last element into this slot.
+            //
+            Protector->ProtectedPidCount--;
+            if (i < Protector->ProtectedPidCount) {
+                Protector->ProtectedPids[i] =
+                    Protector->ProtectedPids[Protector->ProtectedPidCount];
+            }
+            Protector->ProtectedPids[Protector->ProtectedPidCount] = NULL;
+            break;
+        }
     }
+
+    KeReleaseSpinLock(&Protector->PidLock, oldIrql);
 }
 
-// ============================================================================
-// PUBLIC API - EVENT QUERIES
-// ============================================================================
-
 /**
- * @brief Get recent unload attempt events.
- *
- * @param Protector   Protector handle.
- * @param Events      Array to receive event pointers.
- * @param Max         Maximum events to return.
- * @param Count       Receives actual count returned.
- * @return STATUS_SUCCESS on success.
- *
- * @irql <= DISPATCH_LEVEL
+ * @brief Get recent events (deep copy into caller buffer).
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 AuGetEvents(
     _In_ PAU_PROTECTOR Protector,
-    _Out_writes_to_(Max, *Count) PAU_UNLOAD_EVENT* Events,
+    _Out_writes_to_(Max, *Count) PAU_UNLOAD_EVENT Events,
     _In_ ULONG Max,
     _Out_ PULONG Count
     )
 {
     PLIST_ENTRY listEntry;
-    PAU_UNLOAD_EVENT event;
+    PAU_UNLOAD_EVENT srcEvent;
     ULONG count = 0;
     KIRQL oldIrql;
 
-    if (Protector == NULL || Events == NULL || Count == NULL) {
+    if (Protector == NULL || Events == NULL || Count == NULL || Max == 0) {
+        if (Count) *Count = 0;
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -546,14 +477,34 @@ AuGetEvents(
     KeAcquireSpinLock(&Protector->EventLock, &oldIrql);
 
     //
-    // Walk list from newest to oldest (tail to head)
+    // Walk from newest (tail) to oldest (head).
+    // Deep-copy each event into the caller's flat buffer.
     //
     for (listEntry = Protector->EventList.Blink;
          listEntry != &Protector->EventList && count < Max;
-         listEntry = listEntry->Blink) {
+         listEntry = listEntry->Blink)
+    {
+        srcEvent = CONTAINING_RECORD(listEntry, AU_UNLOAD_EVENT, ListEntry);
 
-        event = CONTAINING_RECORD(listEntry, AU_UNLOAD_EVENT, ListEntry);
-        Events[count++] = event;
+        //
+        // Flat copy — AU_UNLOAD_EVENT has no embedded pointers.
+        //
+        Events[count].Type              = srcEvent->Type;
+        Events[count].CallerProcessId   = srcEvent->CallerProcessId;
+        Events[count].TargetProcessId   = srcEvent->TargetProcessId;
+        Events[count].Timestamp         = srcEvent->Timestamp;
+        Events[count].WasBlocked        = srcEvent->WasBlocked;
+
+        RtlCopyMemory(Events[count].CallerImageName,
+                       srcEvent->CallerImageName,
+                       AU_PROCESS_NAME_LEN);
+
+        //
+        // ListEntry in copy is meaningless — zero it.
+        //
+        InitializeListHead(&Events[count].ListEntry);
+
+        count++;
     }
 
     KeReleaseSpinLock(&Protector->EventLock, oldIrql);
@@ -563,76 +514,78 @@ AuGetEvents(
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - EVENT MANAGEMENT
+// PRIVATE: EVENT MANAGEMENT
 // ============================================================================
 
+/**
+ * @brief Create a flat event (no embedded pointers).
+ *
+ * Uses PsGetProcessImageFileName for caller name — safe at any IRQL,
+ * returns ANSI 15-char max, no allocation needed.
+ */
 static PAU_UNLOAD_EVENT
 AupCreateEvent(
     _In_ AU_UNLOAD_ATTEMPT Type,
-    _In_ HANDLE ProcessId,
-    _In_opt_ PUNICODE_STRING ProcessName,
+    _In_ HANDLE CallerPid,
+    _In_ HANDLE TargetPid,
     _In_ BOOLEAN WasBlocked
     )
 {
     PAU_UNLOAD_EVENT event;
+    PEPROCESS callerProcess = NULL;
+    PCHAR imageName;
 
     event = (PAU_UNLOAD_EVENT)ExAllocatePoolZero(
         NonPagedPoolNx,
         sizeof(AU_UNLOAD_EVENT),
         AU_POOL_TAG_EVENT
     );
-
     if (event == NULL) {
         return NULL;
     }
 
     event->Type = Type;
-    event->ProcessId = ProcessId;
+    event->CallerProcessId = CallerPid;
+    event->TargetProcessId = TargetPid;
     event->WasBlocked = WasBlocked;
-
     KeQuerySystemTime(&event->Timestamp);
-
-    //
-    // Copy process name if provided
-    //
-    if (ProcessName != NULL && ProcessName->Length > 0) {
-        USHORT nameLen = ProcessName->Length;
-        USHORT maxLen = nameLen + sizeof(WCHAR);
-
-        event->ProcessName.Buffer = (PWCH)ExAllocatePoolZero(
-            NonPagedPoolNx,
-            maxLen,
-            AU_POOL_TAG_EVENT
-        );
-
-        if (event->ProcessName.Buffer != NULL) {
-            RtlCopyMemory(event->ProcessName.Buffer, ProcessName->Buffer, nameLen);
-            event->ProcessName.Length = nameLen;
-            event->ProcessName.MaximumLength = maxLen;
-        }
-    }
-
     InitializeListHead(&event->ListEntry);
+
+    //
+    // Get caller image name (ANSI, max 15 chars, safe at any IRQL).
+    //
+    if (NT_SUCCESS(PsLookupProcessByProcessId(CallerPid, &callerProcess))) {
+        imageName = PsGetProcessImageFileName(callerProcess);
+        if (imageName != NULL) {
+            RtlStringCchCopyA(event->CallerImageName,
+                              AU_PROCESS_NAME_LEN,
+                              imageName);
+        }
+        ObDereferenceObject(callerProcess);
+    }
 
     return event;
 }
 
+/**
+ * @brief Free an event (flat struct, single pool free).
+ */
 static VOID
 AupFreeEvent(
     _In_ PAU_UNLOAD_EVENT Event
     )
 {
-    if (Event == NULL) {
-        return;
+    if (Event != NULL) {
+        ExFreePoolWithTag(Event, AU_POOL_TAG_EVENT);
     }
-
-    if (Event->ProcessName.Buffer != NULL) {
-        ExFreePoolWithTag(Event->ProcessName.Buffer, AU_POOL_TAG_EVENT);
-    }
-
-    ExFreePoolWithTag(Event, AU_POOL_TAG_EVENT);
 }
 
+/**
+ * @brief Add event to history, evicting oldest if at capacity.
+ *
+ * Eviction list is built under the spin lock; pool frees happen
+ * OUTSIDE the lock. No lock drop/re-acquire during eviction.
+ */
 static VOID
 AupAddEvent(
     _In_ PAU_PROTECTOR Protector,
@@ -640,190 +593,170 @@ AupAddEvent(
     )
 {
     KIRQL oldIrql;
+    LIST_ENTRY evictList;
+    PLIST_ENTRY entry;
+    PAU_UNLOAD_EVENT oldEvent;
+
+    InitializeListHead(&evictList);
 
     KeAcquireSpinLock(&Protector->EventLock, &oldIrql);
 
     //
-    // Enforce max event limit (evict oldest)
+    // Evict oldest entries to make room (under lock, no pool free here).
     //
-    while (Protector->EventCount >= AU_MAX_EVENTS) {
-        PLIST_ENTRY oldestEntry = RemoveHeadList(&Protector->EventList);
-        PAU_UNLOAD_EVENT oldestEvent = CONTAINING_RECORD(oldestEntry, AU_UNLOAD_EVENT, ListEntry);
-
-        KeReleaseSpinLock(&Protector->EventLock, oldIrql);
-        AupFreeEvent(oldestEvent);
-        KeAcquireSpinLock(&Protector->EventLock, &oldIrql);
-
+    while (Protector->EventCount >= AU_MAX_EVENTS &&
+           !IsListEmpty(&Protector->EventList))
+    {
+        entry = RemoveHeadList(&Protector->EventList);
+        InsertTailList(&evictList, entry);
         Protector->EventCount--;
     }
 
+    //
+    // Insert new event.
+    //
     InsertTailList(&Protector->EventList, &Event->ListEntry);
     Protector->EventCount++;
 
     KeReleaseSpinLock(&Protector->EventLock, oldIrql);
+
+    //
+    // Free evicted events OUTSIDE the lock.
+    //
+    while (!IsListEmpty(&evictList)) {
+        entry = RemoveHeadList(&evictList);
+        oldEvent = CONTAINING_RECORD(entry, AU_UNLOAD_EVENT, ListEntry);
+        AupFreeEvent(oldEvent);
+    }
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - PROCESS IDENTIFICATION
+// PRIVATE: OB CALLBACK REGISTRATION
 // ============================================================================
 
-static BOOLEAN
-AupIsServiceControlProcess(
-    _In_ HANDLE ProcessId
-    )
-{
-    WCHAR imageName[260];
-    ULONG i;
-    PWCHAR baseName;
-
-    if (!AupGetProcessImageName(ProcessId, imageName, sizeof(imageName) / sizeof(WCHAR))) {
-        return FALSE;
-    }
-
-    //
-    // Extract base name
-    //
-    baseName = wcsrchr(imageName, L'\\');
-    if (baseName != NULL) {
-        baseName++;
-    } else {
-        baseName = imageName;
-    }
-
-    //
-    // Check against known service control processes
-    //
-    for (i = 0; g_ServiceControlProcesses[i] != NULL; i++) {
-        if (_wcsicmp(baseName, g_ServiceControlProcesses[i]) == 0) {
-            return TRUE;
-        }
-    }
-
-    return FALSE;
-}
-
-static BOOLEAN
-AupGetProcessImageName(
-    _In_ HANDLE ProcessId,
-    _Out_writes_z_(BufferSize) PWSTR Buffer,
-    _In_ ULONG BufferSize
-    )
-{
-    NTSTATUS status;
-    PEPROCESS process = NULL;
-    PUNICODE_STRING imageName = NULL;
-    BOOLEAN result = FALSE;
-
-    Buffer[0] = L'\0';
-
-    if (ProcessId == NULL) {
-        return FALSE;
-    }
-
-    status = PsLookupProcessByProcessId(ProcessId, &process);
-    if (!NT_SUCCESS(status)) {
-        return FALSE;
-    }
-
-    status = SeLocateProcessImageName(process, &imageName);
-    if (NT_SUCCESS(status) && imageName != NULL) {
-        ULONG copyLen = min(imageName->Length / sizeof(WCHAR), BufferSize - 1);
-        RtlCopyMemory(Buffer, imageName->Buffer, copyLen * sizeof(WCHAR));
-        Buffer[copyLen] = L'\0';
-        result = TRUE;
-
-        ExFreePool(imageName);
-    }
-
-    ObDereferenceObject(process);
-
-    return result;
-}
-
-// ============================================================================
-// PRIVATE IMPLEMENTATION - OBJECT CALLBACKS
-// ============================================================================
-
+/**
+ * @brief Register process/thread OB callbacks.
+ *
+ * Uses per-instance registration structs (not global).
+ * ConfigLock must be held exclusive by caller.
+ */
 static NTSTATUS
-AupRegisterObjectCallbacks(
+AupRegisterObCallbacks(
     _In_ PAU_PROTECTOR Protector
     )
 {
     NTSTATUS status;
 
-    if (Protector->ProcessCallbackHandle != NULL) {
-        //
-        // Already registered
-        //
+    if (Protector->ObCallbackHandle != NULL) {
         return STATUS_SUCCESS;
     }
 
     //
-    // Set up process callback
+    // Process handle operations.
     //
-    g_ObOperations[0].ObjectType = PsProcessType;
-    g_ObOperations[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
-    g_ObOperations[0].PreOperation = AupProcessPreCallback;
-    g_ObOperations[0].PostOperation = NULL;
+    RtlZeroMemory(&Protector->ObOperations, sizeof(Protector->ObOperations));
+
+    Protector->ObOperations[0].ObjectType = PsProcessType;
+    Protector->ObOperations[0].Operations =
+        OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    Protector->ObOperations[0].PreOperation = AupProcessPreCallback;
+    Protector->ObOperations[0].PostOperation = NULL;
 
     //
-    // Set up thread callback
+    // Thread handle operations.
     //
-    g_ObOperations[1].ObjectType = PsThreadType;
-    g_ObOperations[1].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
-    g_ObOperations[1].PreOperation = AupThreadPreCallback;
-    g_ObOperations[1].PostOperation = NULL;
+    Protector->ObOperations[1].ObjectType = PsThreadType;
+    Protector->ObOperations[1].Operations =
+        OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    Protector->ObOperations[1].PreOperation = AupThreadPreCallback;
+    Protector->ObOperations[1].PostOperation = NULL;
 
     //
-    // Set up registration structure
+    // Registration.
     //
-    g_ObRegistration.Version = OB_FLT_REGISTRATION_VERSION;
-    g_ObRegistration.OperationRegistrationCount = 2;
-    g_ObRegistration.Altitude = g_CallbackAltitude;
-    g_ObRegistration.RegistrationContext = Protector;
-    g_ObRegistration.OperationRegistration = g_ObOperations;
+    RtlZeroMemory(&Protector->ObRegistration, sizeof(Protector->ObRegistration));
+    Protector->ObRegistration.Version = OB_FLT_REGISTRATION_VERSION;
+    Protector->ObRegistration.OperationRegistrationCount = 2;
+    Protector->ObRegistration.Altitude = Protector->ObAltitude;
+    Protector->ObRegistration.RegistrationContext = Protector;
+    Protector->ObRegistration.OperationRegistration = Protector->ObOperations;
 
-    status = ObRegisterCallbacks(&g_ObRegistration, &Protector->ProcessCallbackHandle);
-
+    status = ObRegisterCallbacks(&Protector->ObRegistration,
+                                 &Protector->ObCallbackHandle);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] ObRegisterCallbacks failed: 0x%08X\n", status);
-        Protector->ProcessCallbackHandle = NULL;
+                   "[ShadowStrike] ObRegisterCallbacks failed: 0x%X\n", status);
+        Protector->ObCallbackHandle = NULL;
         return status;
     }
 
-    //
-    // Note: ObRegisterCallbacks returns a single handle for all operations
-    //
-    Protector->ThreadCallbackHandle = Protector->ProcessCallbackHandle;
-
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Object callbacks registered\n");
+               "[ShadowStrike] OB callbacks registered\n");
 
     return STATUS_SUCCESS;
 }
 
+/**
+ * @brief Unregister OB callbacks. ConfigLock must be held exclusive by caller.
+ */
 static VOID
-AupUnregisterObjectCallbacks(
+AupUnregisterObCallbacks(
     _In_ PAU_PROTECTOR Protector
     )
 {
-    if (Protector->ProcessCallbackHandle != NULL) {
-        ObUnRegisterCallbacks(Protector->ProcessCallbackHandle);
-        Protector->ProcessCallbackHandle = NULL;
-        Protector->ThreadCallbackHandle = NULL;
+    if (Protector->ObCallbackHandle != NULL) {
+        ObUnRegisterCallbacks(Protector->ObCallbackHandle);
+        Protector->ObCallbackHandle = NULL;
 
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                   "[ShadowStrike] Object callbacks unregistered\n");
+#if DBG
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                   "[ShadowStrike] OB callbacks unregistered\n");
+#endif
     }
 }
 
+// ============================================================================
+// PRIVATE: PID LOOKUP
+// ============================================================================
+
 /**
- * @brief Pre-operation callback for process handle operations.
+ * @brief Check if a PID is in the protected table.
  *
- * This callback is invoked before a handle to a process is created.
- * We use it to detect and potentially block attempts to manipulate
- * our driver loader process.
+ * Safe at any IRQL <= DISPATCH_LEVEL (spin lock).
+ */
+static BOOLEAN
+AupIsPidProtected(
+    _In_ PAU_PROTECTOR Protector,
+    _In_ HANDLE ProcessId
+    )
+{
+    KIRQL oldIrql;
+    ULONG i;
+    BOOLEAN found = FALSE;
+
+    KeAcquireSpinLock(&Protector->PidLock, &oldIrql);
+
+    for (i = 0; i < Protector->ProtectedPidCount; i++) {
+        if (Protector->ProtectedPids[i] == ProcessId) {
+            found = TRUE;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&Protector->PidLock, oldIrql);
+    return found;
+}
+
+// ============================================================================
+// PRIVATE: OB CALLBACKS
+// ============================================================================
+
+/**
+ * @brief Process handle pre-operation callback.
+ *
+ * Strips dangerous access rights from handles targeting protected PIDs.
+ * Skips kernel handles. Uses rundown protection to guarantee the
+ * Protector struct remains valid for the duration of this callback.
  */
 static OB_PREOP_CALLBACK_STATUS
 AupProcessPreCallback(
@@ -836,23 +769,40 @@ AupProcessPreCallback(
     HANDLE targetPid;
     HANDLE callerPid;
     ACCESS_MASK originalAccess;
-    ACCESS_MASK modifiedAccess;
-    BOOLEAN isProtected;
+    ACCESS_MASK stripped;
+    AU_UNLOAD_ATTEMPT attemptType;
     PAU_UNLOAD_EVENT event;
 
-    if (protector == NULL || !protector->Initialized) {
-        return OB_PREOP_SUCCESS;
-    }
-
-    if (protector->Level < AuLevel_Medium) {
+    //
+    // Acquire rundown protection. If this fails, the protector is
+    // shutting down — bail immediately.
+    //
+    if (!ExAcquireRundownProtection(&protector->RundownRef)) {
         return OB_PREOP_SUCCESS;
     }
 
     //
-    // Only interested in processes
+    // Quick checks.
+    //
+    if (!protector->Initialized ||
+        InterlockedCompareExchange(&protector->Level, 0, 0) < (LONG)AuLevel_Full)
+    {
+        goto done;
+    }
+
+    //
+    // Only process objects.
     //
     if (OperationInformation->ObjectType != *PsProcessType) {
-        return OB_PREOP_SUCCESS;
+        goto done;
+    }
+
+    //
+    // Never filter kernel-mode handles — they're trusted and
+    // stripping access can break WER, AV scanners, etc.
+    //
+    if (OperationInformation->KernelHandle) {
+        goto done;
     }
 
     targetProcess = (PEPROCESS)OperationInformation->Object;
@@ -860,95 +810,99 @@ AupProcessPreCallback(
     callerPid = PsGetCurrentProcessId();
 
     //
-    // Don't filter our own handles
+    // Don't filter self-access.
     //
     if (callerPid == targetPid) {
-        return OB_PREOP_SUCCESS;
+        goto done;
     }
 
     //
-    // Check if target is a protected process
+    // Check if target PID is protected (PID-based, not name-based).
     //
-    isProtected = AupIsProtectedProcess(protector, targetProcess);
-
-    if (!isProtected) {
-        return OB_PREOP_SUCCESS;
+    if (!AupIsPidProtected(protector, targetPid)) {
+        goto done;
     }
 
     //
-    // Get original access mask
+    // Get original desired access.
     //
     if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
-        originalAccess = OperationInformation->Parameters->CreateHandleInformation.OriginalDesiredAccess;
+        originalAccess = OperationInformation->Parameters->
+            CreateHandleInformation.OriginalDesiredAccess;
     } else {
-        originalAccess = OperationInformation->Parameters->DuplicateHandleInformation.OriginalDesiredAccess;
+        originalAccess = OperationInformation->Parameters->
+            DuplicateHandleInformation.OriginalDesiredAccess;
     }
 
     //
-    // Check for dangerous access rights
+    // Identify dangerous access bits.
     //
-    if ((originalAccess & (PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
-                           PROCESS_CREATE_THREAD | PROCESS_SUSPEND_RESUME)) == 0) {
-        return OB_PREOP_SUCCESS;
+    stripped = originalAccess & (PROCESS_TERMINATE |
+                                PROCESS_VM_WRITE |
+                                PROCESS_VM_OPERATION |
+                                PROCESS_CREATE_THREAD |
+                                PROCESS_SUSPEND_RESUME);
+
+    if (stripped == 0) {
+        goto done;
     }
 
-    InterlockedIncrement64(&protector->Stats.UnloadAttempts);
+    InterlockedIncrement64(&protector->Stats.TotalAttempts);
 
     //
-    // Strip dangerous access rights
+    // Strip dangerous access.
     //
-    modifiedAccess = originalAccess;
-    modifiedAccess &= ~PROCESS_TERMINATE;
-    modifiedAccess &= ~PROCESS_VM_WRITE;
-    modifiedAccess &= ~PROCESS_VM_OPERATION;
-    modifiedAccess &= ~PROCESS_CREATE_THREAD;
-    modifiedAccess &= ~PROCESS_SUSPEND_RESUME;
+    {
+        ACCESS_MASK safe = originalAccess & ~stripped;
 
-    if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
-        OperationInformation->Parameters->CreateHandleInformation.DesiredAccess = modifiedAccess;
-    } else {
-        OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess = modifiedAccess;
+        if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
+            OperationInformation->Parameters->
+                CreateHandleInformation.DesiredAccess = safe;
+        } else {
+            OperationInformation->Parameters->
+                DuplicateHandleInformation.DesiredAccess = safe;
+        }
     }
 
     InterlockedIncrement64(&protector->Stats.AttemptsBlocked);
 
     //
-    // Log the attempt
+    // Determine attempt type for logging.
     //
+    attemptType = (stripped & PROCESS_TERMINATE)
+                  ? AuAttempt_ProcessTerminate
+                  : AuAttempt_ProcessInject;
+
+#if DBG
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-               "[ShadowStrike] Blocked dangerous process access: Caller=%p Target=%p Access=0x%08X\n",
-               callerPid, targetPid, originalAccess);
+               "[ShadowStrike] Blocked process access: caller=%p target=%p "
+               "original=0x%X stripped=0x%X\n",
+               callerPid, targetPid, originalAccess, stripped);
+#endif
 
     //
-    // Record event
+    // Record event.
     //
-    event = AupCreateEvent(
-        (originalAccess & PROCESS_TERMINATE) ? AuAttempt_ProcessTerminate : AuAttempt_HandleClose,
-        callerPid,
-        NULL,
-        TRUE
-    );
-
+    event = AupCreateEvent(attemptType, callerPid, targetPid, TRUE);
     if (event != NULL) {
         AupAddEvent(protector, event);
     }
 
     //
-    // Notify callback
+    // Notify registered callback.
     //
-    AupNotifyCallback(
-        protector,
-        (originalAccess & PROCESS_TERMINATE) ? AuAttempt_ProcessTerminate : AuAttempt_HandleClose,
-        callerPid
-    );
+    AupNotifyCallback(protector, attemptType, callerPid);
 
+done:
+    ExReleaseRundownProtection(&protector->RundownRef);
     return OB_PREOP_SUCCESS;
 }
 
 /**
- * @brief Pre-operation callback for thread handle operations.
+ * @brief Thread handle pre-operation callback.
  *
- * Similar to process callback, but for thread handles.
+ * Strips dangerous access from handles targeting threads owned by
+ * protected PIDs. Same architecture as the process callback.
  */
 static OB_PREOP_CALLBACK_STATUS
 AupThreadPreCallback(
@@ -959,168 +913,121 @@ AupThreadPreCallback(
     PAU_PROTECTOR protector = (PAU_PROTECTOR)RegistrationContext;
     PETHREAD targetThread;
     PEPROCESS owningProcess;
+    HANDLE ownerPid;
     HANDLE callerPid;
     ACCESS_MASK originalAccess;
-    ACCESS_MASK modifiedAccess;
-    BOOLEAN isProtected;
+    ACCESS_MASK stripped;
+    PAU_UNLOAD_EVENT event;
 
-    if (protector == NULL || !protector->Initialized) {
+    if (!ExAcquireRundownProtection(&protector->RundownRef)) {
         return OB_PREOP_SUCCESS;
     }
 
-    if (protector->Level < AuLevel_Medium) {
-        return OB_PREOP_SUCCESS;
+    if (!protector->Initialized ||
+        InterlockedCompareExchange(&protector->Level, 0, 0) < (LONG)AuLevel_Full)
+    {
+        goto done;
     }
 
-    //
-    // Only interested in threads
-    //
     if (OperationInformation->ObjectType != *PsThreadType) {
-        return OB_PREOP_SUCCESS;
+        goto done;
+    }
+
+    if (OperationInformation->KernelHandle) {
+        goto done;
     }
 
     targetThread = (PETHREAD)OperationInformation->Object;
     owningProcess = IoThreadToProcess(targetThread);
+    ownerPid = PsGetProcessId(owningProcess);
     callerPid = PsGetCurrentProcessId();
 
-    //
-    // Don't filter our own handles
-    //
-    if (callerPid == PsGetProcessId(owningProcess)) {
-        return OB_PREOP_SUCCESS;
+    if (callerPid == ownerPid) {
+        goto done;
     }
 
-    //
-    // Check if owning process is protected
-    //
-    isProtected = AupIsProtectedProcess(protector, owningProcess);
-
-    if (!isProtected) {
-        return OB_PREOP_SUCCESS;
+    if (!AupIsPidProtected(protector, ownerPid)) {
+        goto done;
     }
-
-    //
-    // Get original access mask
-    //
-    if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
-        originalAccess = OperationInformation->Parameters->CreateHandleInformation.OriginalDesiredAccess;
-    } else {
-        originalAccess = OperationInformation->Parameters->DuplicateHandleInformation.OriginalDesiredAccess;
-    }
-
-    //
-    // Check for dangerous access rights
-    //
-    if ((originalAccess & (THREAD_TERMINATE | THREAD_SUSPEND_RESUME |
-                           THREAD_SET_CONTEXT | THREAD_SET_INFORMATION)) == 0) {
-        return OB_PREOP_SUCCESS;
-    }
-
-    //
-    // Strip dangerous access rights
-    //
-    modifiedAccess = originalAccess;
-    modifiedAccess &= ~THREAD_TERMINATE;
-    modifiedAccess &= ~THREAD_SUSPEND_RESUME;
-    modifiedAccess &= ~THREAD_SET_CONTEXT;
-    modifiedAccess &= ~THREAD_SET_INFORMATION;
 
     if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
-        OperationInformation->Parameters->CreateHandleInformation.DesiredAccess = modifiedAccess;
+        originalAccess = OperationInformation->Parameters->
+            CreateHandleInformation.OriginalDesiredAccess;
     } else {
-        OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess = modifiedAccess;
+        originalAccess = OperationInformation->Parameters->
+            DuplicateHandleInformation.OriginalDesiredAccess;
+    }
+
+    stripped = originalAccess & (THREAD_TERMINATE |
+                                THREAD_SUSPEND_RESUME |
+                                THREAD_SET_CONTEXT |
+                                THREAD_SET_INFORMATION);
+
+    if (stripped == 0) {
+        goto done;
+    }
+
+    {
+        ACCESS_MASK safe = originalAccess & ~stripped;
+
+        if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
+            OperationInformation->Parameters->
+                CreateHandleInformation.DesiredAccess = safe;
+        } else {
+            OperationInformation->Parameters->
+                DuplicateHandleInformation.DesiredAccess = safe;
+        }
     }
 
     InterlockedIncrement64(&protector->Stats.AttemptsBlocked);
 
+    event = AupCreateEvent(
+        (stripped & THREAD_TERMINATE) ? AuAttempt_ThreadTerminate : AuAttempt_ThreadInject,
+        callerPid, ownerPid, TRUE);
+    if (event != NULL) {
+        AupAddEvent(protector, event);
+    }
+
+done:
+    ExReleaseRundownProtection(&protector->RundownRef);
     return OB_PREOP_SUCCESS;
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - PROTECTION CHECKS
+// PRIVATE: CALLBACK NOTIFICATION
 // ============================================================================
 
-static BOOLEAN
-AupIsProtectedProcess(
-    _In_ PAU_PROTECTOR Protector,
-    _In_ PEPROCESS Process
-    )
-{
-    HANDLE processId;
-    WCHAR imageName[260];
-    PWCHAR baseName;
-
-    UNREFERENCED_PARAMETER(Protector);
-
-    if (Process == NULL) {
-        return FALSE;
-    }
-
-    processId = PsGetProcessId(Process);
-
-    //
-    // Get the process image name
-    //
-    if (!AupGetProcessImageName(processId, imageName, sizeof(imageName) / sizeof(WCHAR))) {
-        return FALSE;
-    }
-
-    //
-    // Extract base name
-    //
-    baseName = wcsrchr(imageName, L'\\');
-    if (baseName != NULL) {
-        baseName++;
-    } else {
-        baseName = imageName;
-    }
-
-    //
-    // Check if this is one of our protected processes
-    // Protected processes:
-    // - ShadowStrike service
-    // - ShadowStrike tray/UI
-    // - ShadowStrike update service
-    //
-    if (_wcsicmp(baseName, L"ShadowStrikeService.exe") == 0 ||
-        _wcsicmp(baseName, L"ShadowStrikeTray.exe") == 0 ||
-        _wcsicmp(baseName, L"ShadowStrikeUI.exe") == 0 ||
-        _wcsicmp(baseName, L"ShadowStrikeUpdater.exe") == 0 ||
-        _wcsicmp(baseName, L"ShadowStrikeAgent.exe") == 0) {
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
+/**
+ * @brief Notify the registered user callback.
+ *
+ * The callback must not fault — no SEH wrapper. If it faults, the
+ * bugcheck correctly points to the buggy callback, not to us.
+ */
 static VOID
 AupNotifyCallback(
     _In_ PAU_PROTECTOR Protector,
     _In_ AU_UNLOAD_ATTEMPT AttemptType,
-    _In_ HANDLE SourceProcessId
+    _In_ HANDLE CallerPid
     )
 {
-    BOOLEAN shouldBlock;
-
-    if (Protector->UserCallback == NULL) {
-        return;
-    }
+    AU_UNLOAD_CALLBACK callback;
+    PVOID context;
 
     //
-    // Call user callback - it can decide whether to block
+    // Read callback/context atomically under shared lock.
+    // We're in an OB callback context (≤ APC_LEVEL typically),
+    // but push locks require KeEnterCriticalRegion.
     //
-    __try {
-        shouldBlock = Protector->UserCallback(
-            AttemptType,
-            SourceProcessId,
-            Protector->CallbackContext
-        );
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Protector->ConfigLock);
 
-        UNREFERENCED_PARAMETER(shouldBlock);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Exception in user callback: 0x%08X\n",
-                   GetExceptionCode());
+    callback = Protector->UserCallback;
+    context = Protector->CallbackContext;
+
+    ExReleasePushLockShared(&Protector->ConfigLock);
+    KeLeaveCriticalRegion();
+
+    if (callback != NULL) {
+        callback(AttemptType, CallerPid, context);
     }
 }

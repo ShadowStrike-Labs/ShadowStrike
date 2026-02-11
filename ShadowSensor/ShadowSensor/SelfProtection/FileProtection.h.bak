@@ -10,19 +10,17 @@
     - Path normalization and canonicalization
     - Symbolic link and junction point resolution
     - Short name (8.3) to long name resolution
-    - File extension-based protection rules
-    - Comprehensive audit logging
-    - Integration with minifilter callbacks
+    - Reparse point detection and handling
+    - File rename/move tracking
+    - Hardlink protection
+    - Volume-relative path handling
 
     Security Considerations:
     - All paths are normalized before comparison
     - Case-insensitive matching for Windows compatibility
-    - ADS names are stripped to prevent bypass
+    - ADS names are stripped for comparison
     - Symbolic links resolved to prevent bypass
-    - Short names resolved via FltGetFileNameInformation(NORMALIZED)
-    - Opaque engine struct prevents direct internal access
-    - Reference counting on protected paths prevents use-after-free
-    - All stack buffers eliminated from hot paths (pool-allocated)
+    - Short names resolved to prevent bypass
 
     MITRE ATT&CK Coverage:
     - T1070.004: Indicator Removal (file deletion protection)
@@ -41,64 +39,93 @@ extern "C" {
 
 #include <ntifs.h>
 #include <fltKernel.h>
-#include <ntstrsafe.h>
 
 //=============================================================================
 // Constants
 //=============================================================================
 
+/**
+ * @brief Pool tag for file protection allocations
+ */
 #define FP_POOL_TAG_CONTEXT     'CFPF'
 #define FP_POOL_TAG_PATH        'PFPF'
 #define FP_POOL_TAG_RULE        'RFPF'
-#define FP_POOL_TAG_AUDIT       'AFPF'
-#define FP_POOL_TAG_WORK        'WFPF'
 
+/**
+ * @brief Maximum protected paths
+ */
 #define FP_MAX_PROTECTED_PATHS          64
+
+/**
+ * @brief Maximum path length for protected entries
+ */
 #define FP_MAX_PATH_LENGTH              1024
+
+/**
+ * @brief Maximum NTFS stream name length
+ */
 #define FP_MAX_STREAM_NAME_LENGTH       256
+
+/**
+ * @brief Maximum file extension length
+ */
 #define FP_MAX_EXTENSION_LENGTH         32
+
+/**
+ * @brief Maximum number of protected file extensions
+ */
 #define FP_MAX_PROTECTED_EXTENSIONS     32
+
+/**
+ * @brief Maximum audit log entries
+ */
 #define FP_MAX_AUDIT_ENTRIES            1024
 
 //=============================================================================
 // Enumerations
 //=============================================================================
 
+/**
+ * @brief File protection rule type
+ */
 typedef enum _FP_RULE_TYPE {
-    FpRuleType_Path = 0,
-    FpRuleType_Extension,
-    FpRuleType_FileName,
-    FpRuleType_Pattern,
+    FpRuleType_Path = 0,            // Protect specific path/directory
+    FpRuleType_Extension,           // Protect files by extension
+    FpRuleType_FileName,            // Protect specific file name
+    FpRuleType_Pattern,             // Wildcard pattern matching
     FpRuleType_Count
 } FP_RULE_TYPE;
 
+/**
+ * @brief File protection flags
+ */
 typedef enum _FP_PROTECTION_FLAGS {
     FpProtect_None              = 0x00000000,
 
     //
     // Operation protection
     //
-    FpProtect_BlockWrite        = 0x00000001,
-    FpProtect_BlockDelete       = 0x00000002,
-    FpProtect_BlockRename       = 0x00000004,
-    FpProtect_BlockSetInfo      = 0x00000008,
-    FpProtect_BlockSetSecurity  = 0x00000010,
-    FpProtect_BlockHardlink     = 0x00000020,
-    FpProtect_BlockStreams       = 0x00000040,
-    FpProtect_BlockExecute      = 0x00000080,
+    FpProtect_BlockWrite        = 0x00000001,   // Block file writes
+    FpProtect_BlockDelete       = 0x00000002,   // Block file deletion
+    FpProtect_BlockRename       = 0x00000004,   // Block file rename/move
+    FpProtect_BlockSetInfo      = 0x00000008,   // Block SetFileInformation
+    FpProtect_BlockSetSecurity  = 0x00000010,   // Block security changes
+    FpProtect_BlockHardlink     = 0x00000020,   // Block hardlink creation to file
+    FpProtect_BlockStreams      = 0x00000040,   // Block ADS operations
+    FpProtect_BlockExecute      = 0x00000080,   // Block execution (for quarantine)
 
     //
     // Protection scope
     //
-    FpProtect_Recursive         = 0x00000100,
-    FpProtect_IncludeStreams    = 0x00000200,
-    FpProtect_FollowLinks       = 0x00000400,
+    FpProtect_Recursive         = 0x00000100,   // Apply to subdirectories
+    FpProtect_IncludeStreams    = 0x00000200,   // Include NTFS streams
+    FpProtect_FollowLinks       = 0x00000400,   // Follow symbolic links
 
     //
     // Audit flags
     //
-    FpProtect_AuditOnly         = 0x00001000,
-    FpProtect_AlertOnAccess     = 0x00002000,
+    FpProtect_AuditOnly         = 0x00001000,   // Log but don't block
+    FpProtect_AlertOnAccess     = 0x00002000,   // Generate alert on any access
 
     //
     // Convenience combinations
@@ -114,6 +141,9 @@ typedef enum _FP_PROTECTION_FLAGS {
 
 } FP_PROTECTION_FLAGS;
 
+/**
+ * @brief File operation type for access checks
+ */
 typedef enum _FP_OPERATION_TYPE {
     FpOperation_Read = 0,
     FpOperation_Write,
@@ -128,22 +158,75 @@ typedef enum _FP_OPERATION_TYPE {
     FpOperation_Count
 } FP_OPERATION_TYPE;
 
+/**
+ * @brief Access check result
+ */
 typedef enum _FP_ACCESS_RESULT {
-    FpAccess_Allow = 0,
-    FpAccess_Block,
-    FpAccess_AuditOnly,
-    FpAccess_NotProtected
+    FpAccess_Allow = 0,             // Operation allowed
+    FpAccess_Block,                 // Operation blocked
+    FpAccess_AuditOnly,             // Logged but allowed
+    FpAccess_NotProtected           // Path not in protection list
 } FP_ACCESS_RESULT;
 
 //=============================================================================
-// Public Structures (no internal pointers exposed)
+// Structures
 //=============================================================================
 
 /**
- * @brief Public audit log entry for consumption by callers.
- *        No LIST_ENTRY or kernel pointers — safe for user-mode copy.
+ * @brief Protected path entry
  */
-typedef struct _FP_AUDIT_ENTRY_INFO {
+typedef struct _FP_PROTECTED_PATH {
+    LIST_ENTRY ListEntry;
+
+    //
+    // Path information
+    //
+    WCHAR NormalizedPath[FP_MAX_PATH_LENGTH];
+    USHORT PathLength;
+    BOOLEAN IsDirectory;
+
+    //
+    // Rule configuration
+    //
+    FP_RULE_TYPE RuleType;
+    ULONG ProtectionFlags;
+
+    //
+    // Statistics
+    //
+    volatile LONG64 BlockedOperations;
+    volatile LONG64 AuditedOperations;
+
+    //
+    // Timing
+    //
+    LARGE_INTEGER AddedTime;
+    LARGE_INTEGER LastAccessTime;
+
+    //
+    // Reference counting
+    //
+    volatile LONG RefCount;
+
+} FP_PROTECTED_PATH, *PFP_PROTECTED_PATH;
+
+/**
+ * @brief Protected extension entry
+ */
+typedef struct _FP_PROTECTED_EXTENSION {
+    BOOLEAN InUse;
+    WCHAR Extension[FP_MAX_EXTENSION_LENGTH];
+    USHORT ExtensionLength;
+    ULONG ProtectionFlags;
+    volatile LONG64 BlockedCount;
+} FP_PROTECTED_EXTENSION, *PFP_PROTECTED_EXTENSION;
+
+/**
+ * @brief Audit log entry
+ */
+typedef struct _FP_AUDIT_ENTRY {
+    LIST_ENTRY ListEntry;
+
     LARGE_INTEGER Timestamp;
     HANDLE ProcessId;
     HANDLE ThreadId;
@@ -152,19 +235,29 @@ typedef struct _FP_AUDIT_ENTRY_INFO {
     WCHAR ProcessName[260];
     WCHAR FilePath[FP_MAX_PATH_LENGTH];
     WCHAR RulePath[FP_MAX_PATH_LENGTH];
-} FP_AUDIT_ENTRY_INFO, *PFP_AUDIT_ENTRY_INFO;
+
+} FP_AUDIT_ENTRY, *PFP_AUDIT_ENTRY;
 
 /**
  * @brief Path analysis result
  */
 typedef struct _FP_PATH_INFO {
+    //
+    // Normalized path (resolved symlinks, short names)
+    //
     WCHAR NormalizedPath[FP_MAX_PATH_LENGTH];
     USHORT NormalizedLength;
 
+    //
+    // Original path components
+    //
     WCHAR FileName[260];
     WCHAR Extension[FP_MAX_EXTENSION_LENGTH];
     WCHAR StreamName[FP_MAX_STREAM_NAME_LENGTH];
 
+    //
+    // Path characteristics
+    //
     BOOLEAN IsDirectory;
     BOOLEAN HasStream;
     BOOLEAN IsSymlink;
@@ -172,12 +265,16 @@ typedef struct _FP_PATH_INFO {
     BOOLEAN IsReparsePoint;
     BOOLEAN IsShortName;
 
+    //
+    // Volume information
+    //
     WCHAR VolumeName[64];
     ULONG VolumeSerialNumber;
+
 } FP_PATH_INFO, *PFP_PATH_INFO;
 
 /**
- * @brief File protection statistics (public, safe to copy)
+ * @brief File protection statistics
  */
 typedef struct _FP_STATISTICS {
     volatile LONG64 TotalChecks;
@@ -199,25 +296,50 @@ typedef struct _FP_STATISTICS {
 } FP_STATISTICS, *PFP_STATISTICS;
 
 /**
- * @brief Access check result with matched rule info.
- *        Returned by FpCheckFileAccess — contains copies, no dangling pointers.
+ * @brief File protection engine
  */
-typedef struct _FP_ACCESS_CHECK_RESULT {
-    FP_ACCESS_RESULT Result;
-    ULONG MatchedProtectionFlags;
-    WCHAR MatchedRulePath[FP_MAX_PATH_LENGTH];
-    BOOLEAN HasMatchedRule;
-} FP_ACCESS_CHECK_RESULT, *PFP_ACCESS_CHECK_RESULT;
+typedef struct _FP_ENGINE {
+    BOOLEAN Initialized;
 
-//=============================================================================
-// Opaque Engine Type
-//=============================================================================
+    //
+    // Protected paths (linked list)
+    //
+    LIST_ENTRY ProtectedPathList;
+    EX_PUSH_LOCK PathListLock;
+    volatile LONG ProtectedPathCount;
 
-/**
- * @brief Opaque file protection engine handle.
- *        Internal layout is defined only in FileProtection.c.
- */
-typedef struct _FP_ENGINE FP_ENGINE, *PFP_ENGINE;
+    //
+    // Protected extensions (static array)
+    //
+    FP_PROTECTED_EXTENSION ProtectedExtensions[FP_MAX_PROTECTED_EXTENSIONS];
+    EX_PUSH_LOCK ExtensionLock;
+    volatile LONG ProtectedExtensionCount;
+
+    //
+    // Audit log (ring buffer)
+    //
+    LIST_ENTRY AuditLog;
+    EX_PUSH_LOCK AuditLogLock;
+    volatile LONG AuditLogCount;
+
+    //
+    // Configuration
+    //
+    struct {
+        BOOLEAN EnablePathNormalization;
+        BOOLEAN EnableStreamProtection;
+        BOOLEAN EnableSymlinkResolution;
+        BOOLEAN EnableShortNameResolution;
+        BOOLEAN EnableAuditLogging;
+        ULONG MaxAuditEntries;
+    } Config;
+
+    //
+    // Statistics
+    //
+    FP_STATISTICS Stats;
+
+} FP_ENGINE, *PFP_ENGINE;
 
 //=============================================================================
 // Function Prototypes - Engine Management
@@ -225,7 +347,6 @@ typedef struct _FP_ENGINE FP_ENGINE, *PFP_ENGINE;
 
 /**
  * @brief Initialize the file protection engine.
- * @note  Placed in PAGE section (safe to call after DriverEntry).
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -234,7 +355,7 @@ FpInitialize(
     );
 
 /**
- * @brief Shutdown the file protection engine and free all resources.
+ * @brief Shutdown the file protection engine.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
@@ -244,7 +365,6 @@ FpShutdown(
 
 /**
  * @brief Configure the file protection engine.
- *        Thread-safe — uses internal synchronization.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -260,6 +380,9 @@ FpConfigure(
 // Function Prototypes - Path Protection
 //=============================================================================
 
+/**
+ * @brief Add a path to the protection list.
+ */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 FpAddProtectedPath(
@@ -269,6 +392,9 @@ FpAddProtectedPath(
     _In_ FP_RULE_TYPE RuleType
     );
 
+/**
+ * @brief Add a path (C string version).
+ */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 FpAddProtectedPathW(
@@ -278,6 +404,9 @@ FpAddProtectedPathW(
     _In_ FP_RULE_TYPE RuleType
     );
 
+/**
+ * @brief Remove a path from the protection list.
+ */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 FpRemoveProtectedPath(
@@ -285,6 +414,9 @@ FpRemoveProtectedPath(
     _In_ PCUNICODE_STRING Path
     );
 
+/**
+ * @brief Add a protected file extension.
+ */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 FpAddProtectedExtension(
@@ -293,6 +425,9 @@ FpAddProtectedExtension(
     _In_ ULONG ProtectionFlags
     );
 
+/**
+ * @brief Clear all protection rules.
+ */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 FpClearAllRules(
@@ -305,7 +440,6 @@ FpClearAllRules(
 
 /**
  * @brief Check if a file operation should be blocked.
- *        All path data is copied under lock — no dangling references.
  */
 _IRQL_requires_max_(APC_LEVEL)
 FP_ACCESS_RESULT
@@ -314,13 +448,11 @@ FpCheckAccess(
     _In_ PCUNICODE_STRING FilePath,
     _In_ FP_OPERATION_TYPE Operation,
     _In_ HANDLE RequestorPid,
-    _In_ ACCESS_MASK DesiredAccess,
-    _Out_opt_ PULONG OutProtectionFlags
+    _In_ ACCESS_MASK DesiredAccess
     );
 
 /**
- * @brief Check if a path is in the protection list.
- *        Populates ProtectionFlags if matched.
+ * @brief Check if a path is protected.
  */
 _IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
@@ -331,8 +463,7 @@ FpIsPathProtected(
     );
 
 /**
- * @brief Check file access with full minifilter context.
- *        Returns result info with copied matched rule (no dangling pointers).
+ * @brief Check file access with full context.
  */
 _IRQL_requires_max_(APC_LEVEL)
 FP_ACCESS_RESULT
@@ -341,13 +472,16 @@ FpCheckFileAccess(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ FP_OPERATION_TYPE Operation,
-    _Out_opt_ PFP_ACCESS_CHECK_RESULT ResultInfo
+    _Out_opt_ PFP_PROTECTED_PATH* MatchedRule
     );
 
 //=============================================================================
 // Function Prototypes - Path Utilities
 //=============================================================================
 
+/**
+ * @brief Normalize a file path.
+ */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 FpNormalizePath(
@@ -355,6 +489,9 @@ FpNormalizePath(
     _Out_ PFP_PATH_INFO PathInfo
     );
 
+/**
+ * @brief Normalize path with filter context.
+ */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 FpNormalizePathEx(
@@ -363,7 +500,10 @@ FpNormalizePathEx(
     _Out_ PFP_PATH_INFO PathInfo
     );
 
-_IRQL_requires_max_(APC_LEVEL)
+/**
+ * @brief Extract stream name from path.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 FpExtractStreamName(
     _In_ PCUNICODE_STRING FullPath,
@@ -372,13 +512,19 @@ FpExtractStreamName(
     _Out_ PUNICODE_STRING BasePath
     );
 
-_IRQL_requires_max_(APC_LEVEL)
+/**
+ * @brief Strip stream name from path.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 FpStripStreamName(
     _In_ PCUNICODE_STRING FullPath,
     _Out_ PUNICODE_STRING BasePath
     );
 
+/**
+ * @brief Resolve symbolic link target.
+ */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 FpResolveSymlink(
@@ -389,8 +535,7 @@ FpResolveSymlink(
     );
 
 /**
- * @brief Convert short name (8.3) to long name using FltGetFileNameInformation.
- *        Caller must free LongPath->Buffer with ExFreePool.
+ * @brief Convert short name to long name.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -404,6 +549,9 @@ FpConvertShortToLongName(
 // Function Prototypes - Audit Logging
 //=============================================================================
 
+/**
+ * @brief Log an access attempt.
+ */
 _IRQL_requires_max_(APC_LEVEL)
 VOID
 FpLogAccessAttempt(
@@ -416,21 +564,19 @@ FpLogAccessAttempt(
     );
 
 /**
- * @brief Get audit log entries into caller-provided buffer.
- * @param Engine    File protection engine.
- * @param Buffer    Caller-allocated array of FP_AUDIT_ENTRY_INFO.
- * @param BufferCount  On input: max entries Buffer can hold.
- *                     On output: number of entries actually copied.
- * @return STATUS_SUCCESS, STATUS_BUFFER_TOO_SMALL, etc.
+ * @brief Get audit log entries.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 FpGetAuditLog(
     _In_ PFP_ENGINE Engine,
-    _Out_writes_to_(*BufferCount, *BufferCount) PFP_AUDIT_ENTRY_INFO Buffer,
-    _Inout_ PULONG BufferCount
+    _Out_ PFP_AUDIT_ENTRY* Entries,
+    _Inout_ PULONG EntryCount
     );
 
+/**
+ * @brief Clear audit log.
+ */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 FpClearAuditLog(
@@ -442,9 +588,9 @@ FpClearAuditLog(
 //=============================================================================
 
 /**
- * @brief Get file protection statistics (atomic per-field reads).
+ * @brief Get file protection statistics.
  */
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 FpGetStatistics(
     _In_ PFP_ENGINE Engine,
@@ -452,9 +598,9 @@ FpGetStatistics(
     );
 
 /**
- * @brief Reset statistics (atomic per-field exchange).
+ * @brief Reset statistics.
  */
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 FpResetStatistics(
     _In_ PFP_ENGINE Engine
@@ -463,3 +609,4 @@ FpResetStatistics(
 #ifdef __cplusplus
 }
 #endif
+

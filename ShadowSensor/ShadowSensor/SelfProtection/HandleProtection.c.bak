@@ -6,24 +6,30 @@
  * @file HandleProtection.c
  * @brief Enterprise-grade handle protection and forensics engine.
  *
- * SECURITY HARDENING (v2.1.0):
- * - Reference-counted process contexts prevent use-after-free
- * - HppFindProcessContext acquires refcount under lock before return
- * - HpFindHandlesToProcess / HpGetRecentEvents return COPIES, not raw pointers
- * - CallbackLock protects detection callback registration/invocation
- * - Config reads in hot path protected by ConfigLock
- * - HpProcessTerminated inlines hash lookup to avoid self-deadlock
- * - HpFlushAllTracking cleans both ProcessList AND hash table
- * - HppCreateProcessContext does duplicate-check under exclusive lock
- * - HppDetectSensitiveProcesses actually enumerates system processes
- * - HppGetProcessIntegrityLevel queries the actual process token
- * - Bounded spin-wait in HpShutdown
- * - ObjectPointer removed from HP_HANDLE_ENTRY (unsafe without ObReference)
- * - Initialized is volatile LONG with Interlocked operations
- * - ExAllocatePool2 used instead of deprecated ExAllocatePoolWithTag
+ * This module implements comprehensive handle protection capabilities:
+ * - Real-time handle operation analysis
+ * - Cross-process handle detection and tracking
+ * - Suspicious handle pattern detection
+ * - Handle duplication monitoring
+ * - Sensitive process protection (LSASS, CSRSS, etc.)
+ * - Token manipulation detection
+ * - Handle abuse alerting
+ *
+ * Detection Capabilities (MITRE ATT&CK):
+ * - T1055: Process Injection (via handle abuse)
+ * - T1134: Access Token Manipulation
+ * - T1003: OS Credential Dumping (LSASS handle detection)
+ * - T1543: Create or Modify System Process
+ * - T1489: Service Stop (via handle to service process)
+ *
+ * BSOD Prevention:
+ * - All pointer parameters validated before use
+ * - Locks acquired with proper IRQL awareness
+ * - Fail-open on unexpected errors
+ * - Reference counting for all tracked objects
  *
  * @author ShadowStrike Security Team
- * @version 2.1.0 (Enterprise Edition)
+ * @version 2.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -33,7 +39,7 @@
 #include "../Core/Globals.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, HpInitialize)
+#pragma alloc_text(INIT, HpInitialize)
 #pragma alloc_text(PAGE, HpShutdown)
 #pragma alloc_text(PAGE, HpSetConfiguration)
 #pragma alloc_text(PAGE, HpRegisterSensitiveProcess)
@@ -44,6 +50,9 @@
 // PRIVATE CONSTANTS
 // ============================================================================
 
+//
+// Suspicion score thresholds
+//
 #define HP_SCORE_CROSS_PROCESS              10
 #define HP_SCORE_CROSS_SESSION              20
 #define HP_SCORE_CROSS_INTEGRITY            25
@@ -62,13 +71,25 @@
 #define HP_SCORE_PRIVILEGE_ESCALATION       80
 #define HP_SCORE_RAPID_ENUMERATION          35
 #define HP_SCORE_BULK_HANDLE_OPEN           25
-#define HP_SCORE_CREDENTIAL_ACCESS          50
 
 #define HP_ALERT_THRESHOLD                  100
 #define HP_CRITICAL_THRESHOLD               150
 
+//
+// Activity window for rapid detection
+//
 #define HP_ACTIVITY_WINDOW_100NS            (10000000LL)  // 1 second
-#define HP_RAPID_HANDLE_THRESHOLD           20
+#define HP_RAPID_HANDLE_THRESHOLD           20            // Handles per second
+
+//
+// Process name patterns for sensitive processes
+//
+#define HP_LSASS_NAME                       L"lsass.exe"
+#define HP_CSRSS_NAME                       L"csrss.exe"
+#define HP_SMSS_NAME                        L"smss.exe"
+#define HP_SERVICES_NAME                    L"services.exe"
+#define HP_WINLOGON_NAME                    L"winlogon.exe"
+#define HP_SVCHOST_NAME                     L"svchost.exe"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -90,7 +111,8 @@ HppInitializeHashTable(
 
 static VOID
 HppFreeHashTable(
-    _Inout_ LIST_ENTRY** Buckets
+    _Inout_ LIST_ENTRY** Buckets,
+    _In_ ULONG BucketCount
     );
 
 static ULONG
@@ -98,30 +120,14 @@ HppHashProcessId(
     _In_ HANDLE ProcessId
     );
 
-_IRQL_requires_max_(APC_LEVEL)
 static PHP_PROCESS_CONTEXT
 HppFindProcessContext(
     _In_ PHP_PROTECTION_ENGINE Engine,
     _In_ HANDLE ProcessId
     );
 
-_IRQL_requires_max_(APC_LEVEL)
-static VOID
-HppReleaseProcessContext(
-    _In_ PHP_PROTECTION_ENGINE Engine,
-    _Inout_ PHP_PROCESS_CONTEXT Context
-    );
-
-_IRQL_requires_max_(APC_LEVEL)
 static PHP_PROCESS_CONTEXT
 HppCreateProcessContext(
-    _In_ PHP_PROTECTION_ENGINE Engine,
-    _In_ HANDLE ProcessId
-    );
-
-_IRQL_requires_max_(APC_LEVEL)
-static PHP_PROCESS_CONTEXT
-HppFindOrCreateProcessContext(
     _In_ PHP_PROTECTION_ENGINE Engine,
     _In_ HANDLE ProcessId
     );
@@ -223,10 +229,10 @@ HpInitialize(
     *Engine = NULL;
 
     //
-    // Allocate engine structure (NonPagedPoolNx via ExAllocatePool2)
+    // Allocate engine structure
     //
-    engine = (PHP_PROTECTION_ENGINE)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
+    engine = (PHP_PROTECTION_ENGINE)ExAllocatePoolWithTag(
+        NonPagedPoolNx,
         sizeof(HP_PROTECTION_ENGINE),
         HP_POOL_TAG
     );
@@ -235,7 +241,6 @@ HpInitialize(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    // ExAllocatePool2 zero-initializes, but be explicit for clarity
     RtlZeroMemory(engine, sizeof(HP_PROTECTION_ENGINE));
 
     //
@@ -244,7 +249,6 @@ HpInitialize(
     ExInitializePushLock(&engine->ConfigLock);
     ExInitializePushLock(&engine->ProcessListLock);
     ExInitializePushLock(&engine->SensitiveObjectLock);
-    ExInitializePushLock(&engine->CallbackLock);
     KeInitializeSpinLock(&engine->EventHistoryLock);
 
     //
@@ -319,22 +323,7 @@ HpInitialize(
     engine->Config.HistoryRetentionMs = HP_STALE_ENTRY_TIMEOUT_MS;
 
     //
-    // Detect sensitive system processes BEFORE marking initialized
-    //
-    HppDetectSensitiveProcesses(engine);
-
-    //
-    // Record start time
-    //
-    KeQuerySystemTime(&engine->Stats.StartTime);
-
-    //
-    // Mark initialized BEFORE starting the timer
-    //
-    InterlockedExchange(&engine->Initialized, 1);
-
-    //
-    // Initialize analysis timer — AFTER Initialized is set
+    // Initialize analysis timer
     //
     KeInitializeTimer(&engine->AnalysisTimer);
     KeInitializeDpc(
@@ -351,6 +340,17 @@ HpInitialize(
         &engine->AnalysisDpc
     );
 
+    //
+    // Record start time
+    //
+    KeQuerySystemTime(&engine->Stats.StartTime);
+
+    //
+    // Detect sensitive system processes
+    //
+    HppDetectSensitiveProcesses(engine);
+
+    engine->Initialized = TRUE;
     *Engine = engine;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -369,54 +369,45 @@ HpShutdown(
     PHP_PROCESS_CONTEXT processContext;
     PHP_HANDLE_EVENT event;
     KIRQL oldIrql;
-    LONG spins;
 
     PAGED_CODE();
 
-    if (Engine == NULL) {
+    if (Engine == NULL || !Engine->Initialized) {
         return;
     }
 
     //
-    // Atomically mark as shutting down — fail if already shutdown
+    // Mark as shutting down
     //
-    if (InterlockedCompareExchange(&Engine->Initialized, 0, 1) != 1) {
-        return;
-    }
+    Engine->Initialized = FALSE;
 
     //
-    // Cancel analysis timer and flush DPCs
+    // Cancel analysis timer
     //
     KeCancelTimer(&Engine->AnalysisTimer);
     KeFlushQueuedDpcs();
 
     //
-    // Bounded wait for in-progress analysis
+    // Wait for any in-progress analysis
     //
-    for (spins = 0; spins < HP_SHUTDOWN_SPIN_LIMIT; spins++) {
-        if (Engine->AnalysisInProgress == 0) {
-            break;
-        }
+    while (Engine->AnalysisInProgress) {
         LARGE_INTEGER delay;
         delay.QuadPart = -10000; // 1ms
         KeDelayExecutionThread(KernelMode, FALSE, &delay);
     }
 
     //
-    // Free all process contexts — must clean both list AND hash table
+    // Free all process contexts
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->ProcessListLock);
-    ExAcquirePushLockExclusive(&Engine->ProcessHash.Lock);
 
     while (!IsListEmpty(&Engine->ProcessList)) {
         entry = RemoveHeadList(&Engine->ProcessList);
         processContext = CONTAINING_RECORD(entry, HP_PROCESS_CONTEXT, ListEntry);
-        RemoveEntryList(&processContext->HashEntry);
         HppFreeProcessContext(Engine, processContext);
     }
 
-    ExReleasePushLockExclusive(&Engine->ProcessHash.Lock);
     ExReleasePushLockExclusive(&Engine->ProcessListLock);
     KeLeaveCriticalRegion();
 
@@ -436,7 +427,10 @@ HpShutdown(
     //
     // Free hash table
     //
-    HppFreeHashTable(&Engine->ProcessHash.Buckets);
+    HppFreeHashTable(
+        &Engine->ProcessHash.Buckets,
+        Engine->ProcessHash.BucketCount
+    );
 
     //
     // Delete lookaside lists
@@ -469,12 +463,8 @@ HpSetConfiguration(
 {
     PAGED_CODE();
 
-    if (Engine == NULL || Config == NULL) {
+    if (Engine == NULL || !Engine->Initialized || Config == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     KeEnterCriticalRegion();
@@ -495,12 +485,8 @@ HpGetConfiguration(
     _Out_ PHP_CONFIG Config
     )
 {
-    if (Engine == NULL || Config == NULL) {
+    if (Engine == NULL || !Engine->Initialized || Config == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     KeEnterCriticalRegion();
@@ -539,26 +525,13 @@ HpAnalyzeHandleOperation(
     BOOLEAN isProcess = FALSE;
     BOOLEAN isThread = FALSE;
     HP_SUSPICION_FLAGS sensitivityFlags = HpSuspicion_None;
-    HP_CONFIG localConfig;
 
-    if (Engine == NULL || OperationInfo == NULL || Result == NULL) {
+    if (Engine == NULL || !Engine->Initialized ||
+        OperationInfo == NULL || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    //
-    // Snapshot config under lock for consistent read
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Engine->ConfigLock);
-    RtlCopyMemory(&localConfig, &Engine->Config, sizeof(HP_CONFIG));
-    ExReleasePushLockShared(&Engine->ConfigLock);
-    KeLeaveCriticalRegion();
-
-    if (!localConfig.Enabled) {
+    if (!Engine->Config.Enabled) {
         RtlZeroMemory(Result, sizeof(HP_DETECTION_RESULT));
         return STATUS_SUCCESS;
     }
@@ -595,6 +568,9 @@ HpAnalyzeHandleOperation(
             Result->TargetProcessId = targetProcessId;
         }
     } else {
+        //
+        // Not a process or thread - limited tracking
+        //
         objectType = HppGetObjectType(OperationInfo->ObjectType);
         Result->ObjectType = objectType;
         return STATUS_SUCCESS;
@@ -651,6 +627,9 @@ HpAnalyzeHandleOperation(
             flags |= HpSuspicion_ReadMemoryAccess;
         }
 
+        //
+        // Check for credential access (LSASS)
+        //
         if ((flags & HpSuspicion_TargetLSASS) &&
             (requestedAccess & HP_DANGEROUS_PROCESS_READ)) {
             flags |= HpSuspicion_CredentialAccess;
@@ -676,15 +655,24 @@ HpAnalyzeHandleOperation(
     //
     // Determine if we should modify access
     //
-    if (localConfig.StripDangerousAccess && targetSensitivity >= HpSensitivity_High) {
+    if (Engine->Config.StripDangerousAccess && targetSensitivity >= HpSensitivity_High) {
+        //
+        // Strip dangerous access to sensitive processes
+        //
         if (isProcess) {
+            //
+            // For LSASS, block all dangerous access
+            //
             if (flags & HpSuspicion_TargetLSASS) {
-                if (localConfig.BlockLSASSAccess) {
+                if (Engine->Config.BlockLSASSAccess) {
                     modifiedAccess &= ~HP_DANGEROUS_PROCESS_ALL;
                     InterlockedIncrement64(&Engine->Stats.LSASSAccessBlocked);
                 }
             }
 
+            //
+            // For other protected processes, strip terminate and inject
+            //
             if (flags & HpSuspicion_TargetProtected) {
                 modifiedAccess &= ~(PROCESS_TERMINATE | HP_DANGEROUS_PROCESS_INJECT);
                 InterlockedIncrement64(&Engine->Stats.ProtectedAccessBlocked);
@@ -709,6 +697,9 @@ HpAnalyzeHandleOperation(
         Result->AccessModified = TRUE;
         InterlockedIncrement64(&Engine->Stats.AccessStripped);
 
+        //
+        // Record event
+        //
         HppRecordEvent(
             Engine,
             HpEvent_AccessStripped,
@@ -725,9 +716,9 @@ HpAnalyzeHandleOperation(
     Result->ModifiedAccess = modifiedAccess;
 
     //
-    // Alert on suspicious handles
+    // Check if this is suspicious enough to alert
     //
-    if (suspicionScore >= localConfig.SuspicionThreshold) {
+    if (suspicionScore >= Engine->Config.SuspicionThreshold) {
         Result->SuspiciousDetected = TRUE;
         InterlockedIncrement64(&Engine->Stats.SuspiciousHandles);
 
@@ -743,7 +734,10 @@ HpAnalyzeHandleOperation(
             suspicionScore
         );
 
-        if (localConfig.AlertOnSuspicious) {
+        //
+        // Notify callback
+        //
+        if (Engine->Config.AlertOnSuspicious) {
             HppNotifyCallback(Engine, Result);
         }
 
@@ -786,6 +780,7 @@ HpRecordHandle(
     _In_ HANDLE OwnerProcessId,
     _In_ HANDLE Handle,
     _In_ HP_OBJECT_TYPE ObjectType,
+    _In_ PVOID Object,
     _In_ ACCESS_MASK GrantedAccess
     )
 {
@@ -793,12 +788,8 @@ HpRecordHandle(
     PHP_HANDLE_ENTRY handleEntry;
     KIRQL oldIrql;
 
-    if (Engine == NULL) {
+    if (Engine == NULL || !Engine->Initialized) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     if (!Engine->Config.Enabled || !Engine->Config.TrackAllHandles) {
@@ -806,18 +797,20 @@ HpRecordHandle(
     }
 
     //
-    // Find or create process context (ref-counted)
+    // Find or create process context
     //
-    processContext = HppFindOrCreateProcessContext(Engine, OwnerProcessId);
+    processContext = HppFindProcessContext(Engine, OwnerProcessId);
     if (processContext == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        processContext = HppCreateProcessContext(Engine, OwnerProcessId);
+        if (processContext == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
     }
 
     //
     // Check handle limit
     //
     if (processContext->HandleCount >= (LONG)Engine->Config.MaxHandlesPerProcess) {
-        HppReleaseProcessContext(Engine, processContext);
         return STATUS_QUOTA_EXCEEDED;
     }
 
@@ -826,7 +819,6 @@ HpRecordHandle(
     //
     handleEntry = HppCreateHandleEntry(Engine);
     if (handleEntry == NULL) {
-        HppReleaseProcessContext(Engine, processContext);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -834,6 +826,7 @@ HpRecordHandle(
     handleEntry->ObjectType = ObjectType;
     handleEntry->GrantedAccess = GrantedAccess;
     handleEntry->OriginalAccess = GrantedAccess;
+    handleEntry->ObjectPointer = Object;
     handleEntry->OwnerProcessId = OwnerProcessId;
     handleEntry->CreatorProcessId = PsGetCurrentProcessId();
     handleEntry->CreatorThreadId = PsGetCurrentThreadId();
@@ -855,8 +848,6 @@ HpRecordHandle(
     InterlockedIncrement64(&processContext->TotalHandlesOpened);
     InterlockedIncrement(&Engine->Stats.ActiveHandles);
 
-    HppReleaseProcessContext(Engine, processContext);
-
     return STATUS_SUCCESS;
 }
 
@@ -877,33 +868,40 @@ HpRecordDuplication(
 
     UNREFERENCED_PARAMETER(SourceHandle);
 
-    if (Engine == NULL) {
+    if (Engine == NULL || !Engine->Initialized) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     if (!Engine->Config.Enabled) {
         return STATUS_SUCCESS;
     }
 
+    //
+    // Track duplicated handles
+    //
     InterlockedIncrement64(&Engine->Stats.DuplicationsTracked);
 
-    processContext = HppFindOrCreateProcessContext(Engine, TargetProcess);
+    //
+    // Find or create target process context
+    //
+    processContext = HppFindProcessContext(Engine, TargetProcess);
     if (processContext == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        processContext = HppCreateProcessContext(Engine, TargetProcess);
+        if (processContext == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
     }
 
+    //
+    // Create handle entry
+    //
     handleEntry = HppCreateHandleEntry(Engine);
     if (handleEntry == NULL) {
-        HppReleaseProcessContext(Engine, processContext);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     handleEntry->Handle = TargetHandle;
-    handleEntry->ObjectType = HpObjectType_Unknown;
+    handleEntry->ObjectType = HpObjectType_Unknown;  // Would need to query
     handleEntry->GrantedAccess = GrantedAccess;
     handleEntry->OriginalAccess = GrantedAccess;
     handleEntry->OwnerProcessId = TargetProcess;
@@ -914,11 +912,17 @@ HpRecordDuplication(
     KeQuerySystemTime(&handleEntry->CreateTime);
     handleEntry->RefCount = 1;
 
+    //
+    // Add to process handle list
+    //
     KeAcquireSpinLock(&processContext->HandleListLock, &oldIrql);
     InsertTailList(&processContext->HandleList, &handleEntry->ListEntry);
     InterlockedIncrement(&processContext->HandleCount);
     KeReleaseSpinLock(&processContext->HandleListLock, oldIrql);
 
+    //
+    // Record event
+    //
     HppRecordEvent(
         Engine,
         HpEvent_HandleDuplicate,
@@ -930,8 +934,6 @@ HpRecordDuplication(
         HpSuspicion_DuplicatedHandle,
         HP_SCORE_DUPLICATED_HANDLE
     );
-
-    HppReleaseProcessContext(Engine, processContext);
 
     return STATUS_SUCCESS;
 }
@@ -945,19 +947,12 @@ HpRecordHandleClose(
     )
 {
     PHP_PROCESS_CONTEXT processContext;
-    PHP_HANDLE_ENTRY handleEntry = NULL;
+    PHP_HANDLE_ENTRY handleEntry;
     PLIST_ENTRY entry;
     KIRQL oldIrql;
+    BOOLEAN found = FALSE;
 
-    if (Engine == NULL) {
-        return;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return;
-    }
-
-    if (!Engine->Config.Enabled) {
+    if (Engine == NULL || !Engine->Initialized || !Engine->Config.Enabled) {
         return;
     }
 
@@ -972,24 +967,22 @@ HpRecordHandleClose(
          entry != &processContext->HandleList;
          entry = entry->Flink) {
 
-        PHP_HANDLE_ENTRY candidate = CONTAINING_RECORD(entry, HP_HANDLE_ENTRY, ListEntry);
+        handleEntry = CONTAINING_RECORD(entry, HP_HANDLE_ENTRY, ListEntry);
 
-        if (candidate->Handle == Handle) {
-            RemoveEntryList(&candidate->ListEntry);
+        if (handleEntry->Handle == Handle) {
+            RemoveEntryList(&handleEntry->ListEntry);
             InterlockedDecrement(&processContext->HandleCount);
-            handleEntry = candidate;
+            found = TRUE;
             break;
         }
     }
 
     KeReleaseSpinLock(&processContext->HandleListLock, oldIrql);
 
-    if (handleEntry != NULL) {
+    if (found) {
         HppFreeHandleEntry(Engine, handleEntry);
         InterlockedDecrement(&Engine->Stats.ActiveHandles);
     }
-
-    HppReleaseProcessContext(Engine, processContext);
 }
 
 // ============================================================================
@@ -1009,12 +1002,8 @@ HpRegisterSensitiveProcess(
 
     PAGED_CODE();
 
-    if (Engine == NULL) {
+    if (Engine == NULL || !Engine->Initialized) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     KeEnterCriticalRegion();
@@ -1051,11 +1040,7 @@ HpUnregisterSensitiveProcess(
 
     PAGED_CODE();
 
-    if (Engine == NULL) {
-        return;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
+    if (Engine == NULL || !Engine->Initialized) {
         return;
     }
 
@@ -1088,18 +1073,13 @@ HpIsSensitiveProcess(
     BOOLEAN found = FALSE;
     HP_SENSITIVITY_LEVEL sensitivity = HpSensitivity_None;
 
-    if (Engine == NULL) {
-        if (OutSensitivity) *OutSensitivity = HpSensitivity_None;
-        return FALSE;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
+    if (Engine == NULL || !Engine->Initialized) {
         if (OutSensitivity) *OutSensitivity = HpSensitivity_None;
         return FALSE;
     }
 
     //
-    // Check known system processes first (cached PIDs, no lock needed)
+    // Check known system processes first
     //
     if (ProcessId == Engine->LsassProcessId) {
         if (OutSensitivity) *OutSensitivity = HpSensitivity_Critical;
@@ -1154,12 +1134,9 @@ HpAnalyzeProcessHandles(
 {
     PHP_PROCESS_CONTEXT processContext;
 
-    if (Engine == NULL || OutFlags == NULL || OutScore == NULL) {
+    if (Engine == NULL || !Engine->Initialized ||
+        OutFlags == NULL || OutScore == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     *OutFlags = HpSuspicion_None;
@@ -1173,20 +1150,15 @@ HpAnalyzeProcessHandles(
     *OutFlags = processContext->AggregatedFlags;
     *OutScore = processContext->TotalSuspicionScore;
 
-    HppReleaseProcessContext(Engine, processContext);
-
     return STATUS_SUCCESS;
 }
 
-/**
- * @brief Find handles targeting a process — returns COPIES, not raw pointers.
- */
 _Use_decl_annotations_
 NTSTATUS
 HpFindHandlesToProcess(
     _In_ PHP_PROTECTION_ENGINE Engine,
     _In_ HANDLE TargetProcessId,
-    _Out_writes_to_(MaxHandles, *ReturnedCount) HP_HANDLE_ENTRY* Handles,
+    _Out_writes_to_(MaxHandles, *ReturnedCount) PHP_HANDLE_ENTRY* Handles,
     _In_ ULONG MaxHandles,
     _Out_ PULONG ReturnedCount
     )
@@ -1198,12 +1170,9 @@ HpFindHandlesToProcess(
     ULONG count = 0;
     KIRQL oldIrql;
 
-    if (Engine == NULL || Handles == NULL || ReturnedCount == NULL) {
+    if (Engine == NULL || !Engine->Initialized ||
+        Handles == NULL || ReturnedCount == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     *ReturnedCount = 0;
@@ -1217,6 +1186,9 @@ HpFindHandlesToProcess(
 
         processContext = CONTAINING_RECORD(processEntry, HP_PROCESS_CONTEXT, ListEntry);
 
+        //
+        // Skip the target process itself
+        //
         if (processContext->ProcessId == TargetProcessId) {
             continue;
         }
@@ -1230,15 +1202,7 @@ HpFindHandlesToProcess(
             handle = CONTAINING_RECORD(handleEntry, HP_HANDLE_ENTRY, ListEntry);
 
             if (handle->TargetProcessId == TargetProcessId) {
-                //
-                // COPY the entire entry to caller buffer (safe after lock release)
-                //
-                RtlCopyMemory(&Handles[count], handle, sizeof(HP_HANDLE_ENTRY));
-                //
-                // Clear ListEntry in copy so caller doesn't use stale links
-                //
-                InitializeListHead(&Handles[count].ListEntry);
-                count++;
+                Handles[count++] = handle;
             }
         }
 
@@ -1253,6 +1217,28 @@ HpFindHandlesToProcess(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
+NTSTATUS
+HpEnumerateSystemHandles(
+    _In_ PHP_PROTECTION_ENGINE Engine,
+    _In_opt_ HANDLE ProcessId
+    )
+{
+    UNREFERENCED_PARAMETER(Engine);
+    UNREFERENCED_PARAMETER(ProcessId);
+
+    //
+    // System handle enumeration would require ZwQuerySystemInformation
+    // with SystemHandleInformation class. This is an expensive operation
+    // and should be used sparingly.
+    //
+    // For production use, this would be implemented as a background
+    // analysis task with proper rate limiting.
+    //
+
+    return STATUS_NOT_IMPLEMENTED;
+}
+
 // ============================================================================
 // PUBLIC API - CALLBACKS
 // ============================================================================
@@ -1265,25 +1251,12 @@ HpRegisterCallback(
     _In_opt_ PVOID Context
     )
 {
-    if (Engine == NULL || Callback == NULL) {
+    if (Engine == NULL || !Engine->Initialized || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    //
-    // Write both fields atomically under CallbackLock
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Engine->CallbackLock);
-
-    Engine->DetectionCallback = (PVOID)Callback;
+    Engine->DetectionCallback = Callback;
     Engine->DetectionCallbackContext = Context;
-
-    ExReleasePushLockExclusive(&Engine->CallbackLock);
-    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -1294,22 +1267,12 @@ HpUnregisterCallback(
     _In_ PHP_PROTECTION_ENGINE Engine
     )
 {
-    if (Engine == NULL) {
+    if (Engine == NULL || !Engine->Initialized) {
         return;
     }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return;
-    }
-
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Engine->CallbackLock);
 
     Engine->DetectionCallback = NULL;
     Engine->DetectionCallbackContext = NULL;
-
-    ExReleasePushLockExclusive(&Engine->CallbackLock);
-    KeLeaveCriticalRegion();
 }
 
 // ============================================================================
@@ -1323,12 +1286,8 @@ HpGetStatistics(
     _Out_ PHP_STATISTICS Stats
     )
 {
-    if (Engine == NULL || Stats == NULL) {
+    if (Engine == NULL || !Engine->Initialized || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     RtlCopyMemory(Stats, &Engine->Stats, sizeof(HP_STATISTICS));
@@ -1336,14 +1295,11 @@ HpGetStatistics(
     return STATUS_SUCCESS;
 }
 
-/**
- * @brief Get recent events — returns COPIES of event data, not raw pointers.
- */
 _Use_decl_annotations_
 NTSTATUS
 HpGetRecentEvents(
     _In_ PHP_PROTECTION_ENGINE Engine,
-    _Out_writes_to_(MaxEvents, *ReturnedCount) HP_HANDLE_EVENT* Events,
+    _Out_writes_to_(MaxEvents, *ReturnedCount) PHP_HANDLE_EVENT* Events,
     _In_ ULONG MaxEvents,
     _Out_ PULONG ReturnedCount
     )
@@ -1353,12 +1309,9 @@ HpGetRecentEvents(
     ULONG count = 0;
     KIRQL oldIrql;
 
-    if (Engine == NULL || Events == NULL || ReturnedCount == NULL) {
+    if (Engine == NULL || !Engine->Initialized ||
+        Events == NULL || ReturnedCount == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     *ReturnedCount = 0;
@@ -1370,12 +1323,7 @@ HpGetRecentEvents(
          entry = entry->Flink) {
 
         event = CONTAINING_RECORD(entry, HP_HANDLE_EVENT, ListEntry);
-        //
-        // COPY the event to caller buffer
-        //
-        RtlCopyMemory(&Events[count], event, sizeof(HP_HANDLE_EVENT));
-        InitializeListHead(&Events[count].ListEntry);
-        count++;
+        Events[count++] = event;
     }
 
     KeReleaseSpinLock(&Engine->EventHistoryLock, oldIrql);
@@ -1389,13 +1337,6 @@ HpGetRecentEvents(
 // PUBLIC API - CLEANUP
 // ============================================================================
 
-/**
- * @brief Process terminated — inline hash lookup to avoid self-deadlock.
- *
- * The original code called HppFindProcessContext (which acquires ProcessHash.Lock
- * shared) while already holding ProcessHash.Lock exclusive → self-deadlock.
- * Fixed by inlining the hash lookup.
- */
 _Use_decl_annotations_
 VOID
 HpProcessTerminated(
@@ -1403,41 +1344,19 @@ HpProcessTerminated(
     _In_ HANDLE ProcessId
     )
 {
-    PHP_PROCESS_CONTEXT processContext = NULL;
+    PHP_PROCESS_CONTEXT processContext;
     ULONG hash;
     ULONG bucket;
-    PLIST_ENTRY entry;
 
-    if (Engine == NULL) {
+    if (Engine == NULL || !Engine->Initialized) {
         return;
     }
 
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
-        return;
-    }
-
-    hash = HppHashProcessId(ProcessId);
-    bucket = hash & HP_HASH_BUCKET_MASK;
-
-    //
-    // Acquire both locks, then inline the hash lookup
-    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->ProcessListLock);
     ExAcquirePushLockExclusive(&Engine->ProcessHash.Lock);
 
-    for (entry = Engine->ProcessHash.Buckets[bucket].Flink;
-         entry != &Engine->ProcessHash.Buckets[bucket];
-         entry = entry->Flink) {
-
-        PHP_PROCESS_CONTEXT candidate =
-            CONTAINING_RECORD(entry, HP_PROCESS_CONTEXT, HashEntry);
-
-        if (candidate->ProcessId == ProcessId) {
-            processContext = candidate;
-            break;
-        }
-    }
+    processContext = HppFindProcessContext(Engine, ProcessId);
 
     if (processContext != NULL) {
         RemoveEntryList(&processContext->ListEntry);
@@ -1459,11 +1378,6 @@ HpProcessTerminated(
     HpUnregisterSensitiveProcess(Engine, ProcessId);
 }
 
-/**
- * @brief Flush all tracking — cleans BOTH process list AND hash table.
- *
- * Original only removed from ProcessList, leaving dangling hash entries.
- */
 _Use_decl_annotations_
 VOID
 HpFlushAllTracking(
@@ -1475,32 +1389,25 @@ HpFlushAllTracking(
     PHP_HANDLE_EVENT event;
     KIRQL oldIrql;
 
-    if (Engine == NULL) {
-        return;
-    }
-
-    if (InterlockedCompareExchange(&Engine->Initialized, 1, 1) != 1) {
+    if (Engine == NULL || !Engine->Initialized) {
         return;
     }
 
     //
-    // Free all process contexts — remove from BOTH list and hash
+    // Free all process contexts
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->ProcessListLock);
-    ExAcquirePushLockExclusive(&Engine->ProcessHash.Lock);
 
     while (!IsListEmpty(&Engine->ProcessList)) {
         entry = RemoveHeadList(&Engine->ProcessList);
         processContext = CONTAINING_RECORD(entry, HP_PROCESS_CONTEXT, ListEntry);
-        RemoveEntryList(&processContext->HashEntry);
         HppFreeProcessContext(Engine, processContext);
     }
 
     Engine->Stats.TrackedProcesses = 0;
     Engine->Stats.ActiveHandles = 0;
 
-    ExReleasePushLockExclusive(&Engine->ProcessHash.Lock);
     ExReleasePushLockExclusive(&Engine->ProcessListLock);
     KeLeaveCriticalRegion();
 
@@ -1538,11 +1445,7 @@ HppAnalysisTimerDpc(
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (engine == NULL) {
-        return;
-    }
-
-    if (InterlockedCompareExchange(&engine->Initialized, 1, 1) != 1) {
+    if (engine == NULL || !engine->Initialized) {
         return;
     }
 
@@ -1551,7 +1454,7 @@ HppAnalysisTimerDpc(
     }
 
     //
-    // HppCleanupStaleEntries only touches EventHistoryLock (spin lock, DISPATCH safe)
+    // Perform cleanup of stale entries
     //
     HppCleanupStaleEntries(engine);
 
@@ -1571,8 +1474,8 @@ HppInitializeHashTable(
     LIST_ENTRY* buckets;
     ULONG i;
 
-    buckets = (LIST_ENTRY*)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
+    buckets = (LIST_ENTRY*)ExAllocatePoolWithTag(
+        NonPagedPoolNx,
         BucketCount * sizeof(LIST_ENTRY),
         HP_POOL_TAG
     );
@@ -1592,9 +1495,12 @@ HppInitializeHashTable(
 
 static VOID
 HppFreeHashTable(
-    _Inout_ LIST_ENTRY** Buckets
+    _Inout_ LIST_ENTRY** Buckets,
+    _In_ ULONG BucketCount
     )
 {
+    UNREFERENCED_PARAMETER(BucketCount);
+
     if (*Buckets != NULL) {
         ExFreePoolWithTag(*Buckets, HP_POOL_TAG);
         *Buckets = NULL;
@@ -1616,18 +1522,9 @@ HppHashProcessId(
 }
 
 // ============================================================================
-// PRIVATE FUNCTIONS - PROCESS CONTEXT (Reference-counted)
+// PRIVATE FUNCTIONS - PROCESS CONTEXT
 // ============================================================================
 
-/**
- * @brief Find process context by PID — acquires a reference before returning.
- *
- * The returned context is REFERENCE-COUNTED. Caller MUST call
- * HppReleaseProcessContext when done. This prevents use-after-free
- * if another thread calls HpProcessTerminated concurrently.
- *
- * @return Referenced process context, or NULL if not found.
- */
 static PHP_PROCESS_CONTEXT
 HppFindProcessContext(
     _In_ PHP_PROTECTION_ENGINE Engine,
@@ -1640,7 +1537,7 @@ HppFindProcessContext(
     PHP_PROCESS_CONTEXT context;
 
     hash = HppHashProcessId(ProcessId);
-    bucket = hash & HP_HASH_BUCKET_MASK;
+    bucket = hash % Engine->ProcessHash.BucketCount;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Engine->ProcessHash.Lock);
@@ -1652,13 +1549,6 @@ HppFindProcessContext(
         context = CONTAINING_RECORD(entry, HP_PROCESS_CONTEXT, HashEntry);
 
         if (context->ProcessId == ProcessId) {
-            //
-            // Acquire reference WHILE STILL UNDER LOCK
-            // This is the critical fix: the lock protects us from
-            // HpProcessTerminated freeing this context before we ref it.
-            //
-            InterlockedIncrement(&context->RefCount);
-
             ExReleasePushLockShared(&Engine->ProcessHash.Lock);
             KeLeaveCriticalRegion();
             return context;
@@ -1671,34 +1561,6 @@ HppFindProcessContext(
     return NULL;
 }
 
-/**
- * @brief Release a reference on a process context.
- *
- * If the reference count drops to zero, the context is freed.
- * This happens when the context was removed from all lists (by
- * HpProcessTerminated) and the last external reference is released.
- */
-static VOID
-HppReleaseProcessContext(
-    _In_ PHP_PROTECTION_ENGINE Engine,
-    _Inout_ PHP_PROCESS_CONTEXT Context
-    )
-{
-    LONG newRef;
-
-    newRef = InterlockedDecrement(&Context->RefCount);
-
-    if (newRef == 0) {
-        HppFreeProcessContext(Engine, Context);
-    }
-}
-
-/**
- * @brief Create a new process context — checks for duplicates under exclusive lock.
- *
- * Fixed race condition: two threads could both create contexts for the same PID.
- * Now we re-check under exclusive lock before inserting.
- */
 static PHP_PROCESS_CONTEXT
 HppCreateProcessContext(
     _In_ PHP_PROTECTION_ENGINE Engine,
@@ -1710,8 +1572,10 @@ HppCreateProcessContext(
     PEPROCESS process = NULL;
     ULONG hash;
     ULONG bucket;
-    PLIST_ENTRY entry;
 
+    //
+    // Check limit
+    //
     if (Engine->Stats.TrackedProcesses >= HP_MAX_TRACKED_PROCESSES) {
         return NULL;
     }
@@ -1732,7 +1596,7 @@ HppCreateProcessContext(
     KeQuerySystemTime(&context->FirstActivity);
     context->LastActivity = context->FirstActivity;
     context->WindowStart = context->FirstActivity;
-    context->RefCount = 1;  // Initial reference for being in the lists
+    context->RefCount = 1;
 
     //
     // Get process object reference
@@ -1745,81 +1609,24 @@ HppCreateProcessContext(
     }
 
     //
-    // Insert under exclusive lock — but first check for duplicate
+    // Add to lists
     //
     hash = HppHashProcessId(ProcessId);
-    bucket = hash & HP_HASH_BUCKET_MASK;
+    bucket = hash % Engine->ProcessHash.BucketCount;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->ProcessListLock);
     ExAcquirePushLockExclusive(&Engine->ProcessHash.Lock);
 
-    //
-    // Re-check: another thread may have created this context already
-    //
-    for (entry = Engine->ProcessHash.Buckets[bucket].Flink;
-         entry != &Engine->ProcessHash.Buckets[bucket];
-         entry = entry->Flink) {
-
-        PHP_PROCESS_CONTEXT existing =
-            CONTAINING_RECORD(entry, HP_PROCESS_CONTEXT, HashEntry);
-
-        if (existing->ProcessId == ProcessId) {
-            //
-            // Duplicate found — ref it and discard our new allocation
-            //
-            InterlockedIncrement(&existing->RefCount);
-
-            ExReleasePushLockExclusive(&Engine->ProcessHash.Lock);
-            ExReleasePushLockExclusive(&Engine->ProcessListLock);
-            KeLeaveCriticalRegion();
-
-            //
-            // Free the unused context we allocated
-            //
-            if (context->Process != NULL) {
-                ObDereferenceObject(context->Process);
-            }
-            ExFreeToNPagedLookasideList(&Engine->ProcessContextLookaside, context);
-
-            return existing;
-        }
-    }
-
-    //
-    // No duplicate — insert
-    //
     InsertTailList(&Engine->ProcessList, &context->ListEntry);
     InsertTailList(&Engine->ProcessHash.Buckets[bucket], &context->HashEntry);
     InterlockedIncrement(&Engine->Stats.TrackedProcesses);
-
-    //
-    // Take a second reference for the caller
-    //
-    InterlockedIncrement(&context->RefCount);
 
     ExReleasePushLockExclusive(&Engine->ProcessHash.Lock);
     ExReleasePushLockExclusive(&Engine->ProcessListLock);
     KeLeaveCriticalRegion();
 
     return context;
-}
-
-/**
- * @brief Find or create a process context (convenience wrapper).
- * Returns a referenced context. Caller must HppReleaseProcessContext.
- */
-static PHP_PROCESS_CONTEXT
-HppFindOrCreateProcessContext(
-    _In_ PHP_PROTECTION_ENGINE Engine,
-    _In_ HANDLE ProcessId
-    )
-{
-    PHP_PROCESS_CONTEXT ctx = HppFindProcessContext(Engine, ProcessId);
-    if (ctx != NULL) {
-        return ctx;
-    }
-    return HppCreateProcessContext(Engine, ProcessId);
 }
 
 static VOID
@@ -1850,7 +1657,6 @@ HppFreeProcessContext(
     //
     if (Context->Process != NULL) {
         ObDereferenceObject(Context->Process);
-        Context->Process = NULL;
     }
 
     ExFreeToNPagedLookasideList(&Engine->ProcessContextLookaside, Context);
@@ -1928,29 +1734,29 @@ HppGetProcessSensitivity(
     ULONG i;
 
     //
-    // Check known critical processes (cached PIDs, pointer-sized atomic reads)
+    // Check known critical processes
     //
-    if (ProcessId == Engine->LsassProcessId && Engine->LsassProcessId != NULL) {
+    if (ProcessId == Engine->LsassProcessId) {
         *OutFlags = HpSuspicion_TargetLSASS;
         return HpSensitivity_Critical;
     }
 
-    if (ProcessId == Engine->CsrssProcessId && Engine->CsrssProcessId != NULL) {
+    if (ProcessId == Engine->CsrssProcessId) {
         *OutFlags = HpSuspicion_TargetCSRSS;
         return HpSensitivity_Critical;
     }
 
-    if (ProcessId == Engine->SmssProcessId && Engine->SmssProcessId != NULL) {
+    if (ProcessId == Engine->SmssProcessId) {
         *OutFlags = HpSuspicion_TargetSMSS;
         return HpSensitivity_Critical;
     }
 
-    if (ProcessId == Engine->ServicesProcessId && Engine->ServicesProcessId != NULL) {
+    if (ProcessId == Engine->ServicesProcessId) {
         *OutFlags = HpSuspicion_TargetServices;
         return HpSensitivity_High;
     }
 
-    if (ProcessId == Engine->WinlogonProcessId && Engine->WinlogonProcessId != NULL) {
+    if (ProcessId == Engine->WinlogonProcessId) {
         *OutFlags = HpSuspicion_TargetSystem;
         return HpSensitivity_High;
     }
@@ -2015,7 +1821,7 @@ HppCalculateSuspicionScore(
     if (Flags & HpSuspicion_PrivilegeEscalation) score += HP_SCORE_PRIVILEGE_ESCALATION;
     if (Flags & HpSuspicion_RapidEnumeration) score += HP_SCORE_RAPID_ENUMERATION;
     if (Flags & HpSuspicion_BulkHandleOpen) score += HP_SCORE_BULK_HANDLE_OPEN;
-    if (Flags & HpSuspicion_CredentialAccess) score += HP_SCORE_CREDENTIAL_ACCESS;
+    if (Flags & HpSuspicion_CredentialAccess) score += 50;  // Additional for credential access
 
     return score;
 }
@@ -2062,17 +1868,17 @@ HppRecordEvent(
     KeAcquireSpinLock(&Engine->EventHistoryLock, &oldIrql);
 
     //
-    // Evict oldest if at capacity (no Interlocked needed — we hold the spin lock)
+    // Check history limit
     //
     if (Engine->EventCount >= HP_MAX_HANDLE_HISTORY) {
         PLIST_ENTRY oldest = RemoveHeadList(&Engine->EventHistory);
         PHP_HANDLE_EVENT oldEvent = CONTAINING_RECORD(oldest, HP_HANDLE_EVENT, ListEntry);
         ExFreeToNPagedLookasideList(&Engine->EventLookaside, oldEvent);
-        Engine->EventCount--;
+        InterlockedDecrement(&Engine->EventCount);
     }
 
     InsertTailList(&Engine->EventHistory, &event->ListEntry);
-    Engine->EventCount++;
+    InterlockedIncrement(&Engine->EventCount);
 
     KeReleaseSpinLock(&Engine->EventHistoryLock, oldIrql);
 }
@@ -2081,9 +1887,6 @@ HppRecordEvent(
 // PRIVATE FUNCTIONS - CALLBACK NOTIFICATION
 // ============================================================================
 
-/**
- * @brief Notify detection callback — reads callback+context atomically under CallbackLock.
- */
 static VOID
 HppNotifyCallback(
     _In_ PHP_PROTECTION_ENGINE Engine,
@@ -2093,17 +1896,8 @@ HppNotifyCallback(
     HP_DETECTION_CALLBACK callback;
     PVOID context;
 
-    //
-    // Read both fields atomically under shared CallbackLock
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Engine->CallbackLock);
-
     callback = (HP_DETECTION_CALLBACK)Engine->DetectionCallback;
     context = Engine->DetectionCallbackContext;
-
-    ExReleasePushLockShared(&Engine->CallbackLock);
-    KeLeaveCriticalRegion();
 
     if (callback != NULL) {
         callback(Result, context);
@@ -2114,10 +1908,6 @@ HppNotifyCallback(
 // PRIVATE FUNCTIONS - CLEANUP
 // ============================================================================
 
-/**
- * @brief Clean up stale event entries.
- * Called from DPC (DISPATCH_LEVEL) — only uses spin-lock-protected EventHistory.
- */
 static VOID
 HppCleanupStaleEntries(
     _In_ PHP_PROTECTION_ENGINE Engine
@@ -2134,6 +1924,9 @@ HppCleanupStaleEntries(
     cutoffTime.QuadPart = currentTime.QuadPart -
                           ((LONGLONG)Engine->Config.HistoryRetentionMs * 10000);
 
+    //
+    // Clean up old events
+    //
     KeAcquireSpinLock(&Engine->EventHistoryLock, &oldIrql);
 
     for (entry = Engine->EventHistory.Flink;
@@ -2145,9 +1938,12 @@ HppCleanupStaleEntries(
 
         if (event->Timestamp.QuadPart < cutoffTime.QuadPart) {
             RemoveEntryList(&event->ListEntry);
-            Engine->EventCount--;
+            InterlockedDecrement(&Engine->EventCount);
             ExFreeToNPagedLookasideList(&Engine->EventLookaside, event);
         } else {
+            //
+            // Events are in chronological order, stop when we hit recent ones
+            //
             break;
         }
     }
@@ -2164,213 +1960,52 @@ HppIsSystemProcess(
     _In_ HANDLE ProcessId
     )
 {
-    return (ProcessId == (HANDLE)(ULONG_PTR)4);
+    //
+    // System process has PID 4
+    //
+    return (ProcessId == (HANDLE)4);
 }
 
-/**
- * @brief Get the actual integrity level of a process by querying its token.
- *
- * Replaces the original stub that always returned SECURITY_MANDATORY_MEDIUM_RID.
- * Queries TOKEN_MANDATORY_LABEL from the process token.
- *
- * @return TRUE if integrity level was successfully retrieved.
- */
 static BOOLEAN
 HppGetProcessIntegrityLevel(
     _In_ PEPROCESS Process,
     _Out_ PULONG IntegrityLevel
     )
 {
-    NTSTATUS status;
-    PACCESS_TOKEN token = NULL;
-    UCHAR buffer[256];
-    PTOKEN_MANDATORY_LABEL label = NULL;
-    ULONG returnLength = 0;
-    PSID sid;
-    ULONG subAuthorityCount;
-    PULONG ridPtr;
+    UNREFERENCED_PARAMETER(Process);
 
+    //
+    // Getting integrity level requires accessing the process token
+    // and querying TOKEN_MANDATORY_LABEL. For simplicity, we default
+    // to medium integrity.
+    //
     *IntegrityLevel = SECURITY_MANDATORY_MEDIUM_RID;
 
-    //
-    // Get the primary token of the process
-    //
-    token = PsReferencePrimaryToken(Process);
-    if (token == NULL) {
-        return FALSE;
-    }
-
-    //
-    // Query token integrity level
-    //
-    status = SeQueryInformationToken(
-        token,
-        TokenIntegrityLevel,
-        (PVOID*)&label
-    );
-
-    if (NT_SUCCESS(status) && label != NULL) {
-        sid = label->Label.Sid;
-        if (sid != NULL && RtlValidSid(sid)) {
-            subAuthorityCount = *RtlSubAuthorityCountSid(sid);
-            if (subAuthorityCount > 0) {
-                ridPtr = RtlSubAuthoritySid(sid, subAuthorityCount - 1);
-                if (ridPtr != NULL) {
-                    *IntegrityLevel = *ridPtr;
-                }
-            }
-        }
-        ExFreePool(label);
-    }
-
-    PsDereferencePrimaryToken(token);
-
-    UNREFERENCED_PARAMETER(buffer);
-    UNREFERENCED_PARAMETER(returnLength);
-
-    return NT_SUCCESS(status);
+    return TRUE;
 }
 
-/**
- * @brief Detect sensitive system processes at initialization time.
- *
- * Enumerates running processes via ZwQuerySystemInformation to find
- * LSASS, CSRSS, SMSS, services.exe, and winlogon.exe by matching
- * their image file names.
- *
- * Replaces the original stub that set all cached PIDs to NULL.
- */
 static VOID
 HppDetectSensitiveProcesses(
     _In_ PHP_PROTECTION_ENGINE Engine
     )
 {
-    NTSTATUS status;
-    ULONG bufferSize = 0;
-    PVOID buffer = NULL;
-    PSYSTEM_PROCESS_INFORMATION processInfo;
-    UNICODE_STRING lsassName;
-    UNICODE_STRING csrssName;
-    UNICODE_STRING smssName;
-    UNICODE_STRING servicesName;
-    UNICODE_STRING winlogonName;
+    //
+    // In a production implementation, we would enumerate running processes
+    // and identify LSASS, CSRSS, SMSS, etc. by their names.
+    //
+    // For now, these will be populated as processes are encountered
+    // or through explicit registration.
+    //
+    // The process IDs are cached when handle operations target these
+    // processes, identified by their process names.
+    //
 
-    //
-    // Initialize all to NULL
-    //
     Engine->LsassProcessId = NULL;
     Engine->CsrssProcessId = NULL;
     Engine->SmssProcessId = NULL;
     Engine->ServicesProcessId = NULL;
     Engine->WinlogonProcessId = NULL;
 
-    RtlInitUnicodeString(&lsassName, L"lsass.exe");
-    RtlInitUnicodeString(&csrssName, L"csrss.exe");
-    RtlInitUnicodeString(&smssName, L"smss.exe");
-    RtlInitUnicodeString(&servicesName, L"services.exe");
-    RtlInitUnicodeString(&winlogonName, L"winlogon.exe");
-
-    //
-    // Query system process information
-    //
-    bufferSize = 256 * 1024;  // Start with 256 KB
-
-    buffer = ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
-        bufferSize,
-        HP_POOL_TAG
-    );
-
-    if (buffer == NULL) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Failed to allocate buffer for process enumeration\n");
-        return;
-    }
-
-    status = ZwQuerySystemInformation(
-        SystemProcessInformation,
-        buffer,
-        bufferSize,
-        &bufferSize
-    );
-
-    if (status == STATUS_INFO_LENGTH_MISMATCH) {
-        ExFreePoolWithTag(buffer, HP_POOL_TAG);
-
-        //
-        // Retry with the size the system told us + some margin
-        //
-        bufferSize += 64 * 1024;
-
-        buffer = ExAllocatePool2(
-            POOL_FLAG_NON_PAGED,
-            bufferSize,
-            HP_POOL_TAG
-        );
-
-        if (buffer == NULL) {
-            return;
-        }
-
-        status = ZwQuerySystemInformation(
-            SystemProcessInformation,
-            buffer,
-            bufferSize,
-            NULL
-        );
-    }
-
-    if (!NT_SUCCESS(status)) {
-        ExFreePoolWithTag(buffer, HP_POOL_TAG);
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] ZwQuerySystemInformation failed: 0x%08X\n", status);
-        return;
-    }
-
-    //
-    // Walk the process list and match names
-    //
-    processInfo = (PSYSTEM_PROCESS_INFORMATION)buffer;
-
-    for (;;) {
-        if (processInfo->ImageName.Buffer != NULL &&
-            processInfo->ImageName.Length > 0) {
-
-            if (RtlEqualUnicodeString(&processInfo->ImageName, &lsassName, TRUE)) {
-                Engine->LsassProcessId = processInfo->UniqueProcessId;
-            } else if (RtlEqualUnicodeString(&processInfo->ImageName, &csrssName, TRUE)) {
-                //
-                // There can be multiple csrss.exe instances (one per session).
-                // We track the first one (session 0).
-                //
-                if (Engine->CsrssProcessId == NULL) {
-                    Engine->CsrssProcessId = processInfo->UniqueProcessId;
-                }
-            } else if (RtlEqualUnicodeString(&processInfo->ImageName, &smssName, TRUE)) {
-                Engine->SmssProcessId = processInfo->UniqueProcessId;
-            } else if (RtlEqualUnicodeString(&processInfo->ImageName, &servicesName, TRUE)) {
-                Engine->ServicesProcessId = processInfo->UniqueProcessId;
-            } else if (RtlEqualUnicodeString(&processInfo->ImageName, &winlogonName, TRUE)) {
-                if (Engine->WinlogonProcessId == NULL) {
-                    Engine->WinlogonProcessId = processInfo->UniqueProcessId;
-                }
-            }
-        }
-
-        if (processInfo->NextEntryOffset == 0) {
-            break;
-        }
-
-        processInfo = (PSYSTEM_PROCESS_INFORMATION)(
-            (PUCHAR)processInfo + processInfo->NextEntryOffset
-        );
-    }
-
-    ExFreePoolWithTag(buffer, HP_POOL_TAG);
-
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Sensitive process detection: LSASS=%p CSRSS=%p SMSS=%p Services=%p Winlogon=%p\n",
-               Engine->LsassProcessId, Engine->CsrssProcessId,
-               Engine->SmssProcessId, Engine->ServicesProcessId,
-               Engine->WinlogonProcessId);
+               "[ShadowStrike] Sensitive process detection initialized\n");
 }

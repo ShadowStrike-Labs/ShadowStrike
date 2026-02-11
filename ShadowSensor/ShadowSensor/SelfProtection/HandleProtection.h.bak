@@ -24,13 +24,12 @@
  * - T1489: Service Stop (via handle to service process)
  *
  * @author ShadowStrike Security Team
- * @version 2.1.0 (Enterprise Edition)
+ * @version 2.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
 
-#ifndef _SHADOWSTRIKE_HANDLE_PROTECTION_H_
-#define _SHADOWSTRIKE_HANDLE_PROTECTION_H_
+#pragma once
 
 #include <ntifs.h>
 #include <ntddk.h>
@@ -45,7 +44,7 @@ extern "C" {
 // ============================================================================
 
 #define HP_POOL_TAG                             'pHsS'
-#define HP_VERSION                              0x0210
+#define HP_VERSION                              0x0200
 
 /**
  * @brief Maximum handles to track per process.
@@ -68,10 +67,9 @@ extern "C" {
 #define HP_MAX_HANDLE_HISTORY                   10000
 
 /**
- * @brief Hash table bucket count (must be power of 2).
+ * @brief Hash table bucket count.
  */
 #define HP_HASH_BUCKET_COUNT                    512
-#define HP_HASH_BUCKET_MASK                     (HP_HASH_BUCKET_COUNT - 1)
 
 /**
  * @brief Handle analysis interval in milliseconds.
@@ -82,11 +80,6 @@ extern "C" {
  * @brief Stale entry timeout in milliseconds.
  */
 #define HP_STALE_ENTRY_TIMEOUT_MS               300000  // 5 minutes
-
-/**
- * @brief Maximum iterations for bounded spin-waits during shutdown.
- */
-#define HP_SHUTDOWN_SPIN_LIMIT                  1000
 
 // ============================================================================
 // DANGEROUS ACCESS MASKS
@@ -237,12 +230,10 @@ typedef enum _HP_SENSITIVITY_LEVEL {
 
 /**
  * @brief Tracked handle entry.
- *
- * Linked into the owning HP_PROCESS_CONTEXT.HandleList via ListEntry.
- * HashEntry field removed — handles are not independently hashed.
  */
 typedef struct _HP_HANDLE_ENTRY {
-    LIST_ENTRY ListEntry;               // Process handle list linkage
+    LIST_ENTRY ListEntry;               // List linkage
+    LIST_ENTRY HashEntry;               // Hash table linkage
 
     //
     // Handle identification
@@ -253,8 +244,9 @@ typedef struct _HP_HANDLE_ENTRY {
     ACCESS_MASK OriginalAccess;         // Original requested access
 
     //
-    // Target information (for process/thread handles)
+    // Object information
     //
+    PVOID ObjectPointer;                // Kernel object pointer
     HANDLE TargetProcessId;             // For process/thread handles
     HANDLE TargetThreadId;              // For thread handles
 
@@ -269,7 +261,6 @@ typedef struct _HP_HANDLE_ENTRY {
     // Duplication tracking
     //
     BOOLEAN IsDuplicated;               // Was this handle duplicated
-    UINT8 _Pad1[7];
     HANDLE DuplicatedFromProcess;       // Source process for duplication
     HANDLE OriginalHandle;              // Original handle value
 
@@ -295,8 +286,6 @@ typedef struct _HP_HANDLE_ENTRY {
 
 /**
  * @brief Per-process handle tracking context.
- * Reference-counted. Callers that obtain a pointer via HppFindProcessContext
- * must release via HppReleaseProcessContext.
  */
 typedef struct _HP_PROCESS_CONTEXT {
     LIST_ENTRY ListEntry;               // Global list linkage
@@ -345,7 +334,7 @@ typedef struct _HP_PROCESS_CONTEXT {
     LARGE_INTEGER WindowStart;          // Activity window start
 
     //
-    // Reference counting — used to prevent use-after-free
+    // Reference counting
     //
     volatile LONG RefCount;
 
@@ -358,6 +347,7 @@ typedef struct _HP_SENSITIVE_OBJECT {
     LIST_ENTRY ListEntry;
 
     HANDLE ProcessId;                   // For process objects
+    PWSTR ProcessName;                  // Process name pattern
     HP_OBJECT_TYPE ObjectType;          // Type of object
     HP_SENSITIVITY_LEVEL Sensitivity;   // Sensitivity level
     HP_SUSPICION_FLAGS RequiredFlags;   // Flags to apply when accessed
@@ -428,11 +418,11 @@ typedef struct _HP_CONFIG {
  * @brief Main handle protection engine state.
  */
 typedef struct _HP_PROTECTION_ENGINE {
-    volatile LONG Initialized;          // Interlocked init flag (0 or 1)
-    UINT8 Reserved1[4];
+    BOOLEAN Initialized;
+    UINT8 Reserved1[7];
 
     //
-    // Configuration — protected by ConfigLock
+    // Configuration
     //
     HP_CONFIG Config;
     EX_PUSH_LOCK ConfigLock;
@@ -456,7 +446,7 @@ typedef struct _HP_PROTECTION_ENGINE {
     LONG SensitiveObjectCount;
 
     //
-    // Event history — protected by EventHistoryLock (DISPATCH_LEVEL safe)
+    // Event history
     //
     LIST_ENTRY EventHistory;
     KSPIN_LOCK EventHistoryLock;
@@ -484,7 +474,7 @@ typedef struct _HP_PROTECTION_ENGINE {
     HP_STATISTICS Stats;
 
     //
-    // Known sensitive process IDs (cached, set atomically)
+    // Known sensitive process IDs (cached)
     //
     HANDLE LsassProcessId;
     HANDLE CsrssProcessId;
@@ -493,9 +483,8 @@ typedef struct _HP_PROTECTION_ENGINE {
     HANDLE WinlogonProcessId;
 
     //
-    // Detection callback — protected by CallbackLock
+    // Callbacks
     //
-    EX_PUSH_LOCK CallbackLock;
     PVOID DetectionCallback;
     PVOID DetectionCallbackContext;
 
@@ -611,6 +600,7 @@ HpAnalyzeHandleOperation(
  * @param OwnerProcessId Process that owns the handle.
  * @param Handle Handle value.
  * @param ObjectType Type of object.
+ * @param Object Kernel object pointer.
  * @param GrantedAccess Granted access rights.
  * @return STATUS_SUCCESS or error code.
  */
@@ -620,6 +610,7 @@ HpRecordHandle(
     _In_ HANDLE OwnerProcessId,
     _In_ HANDLE Handle,
     _In_ HP_OBJECT_TYPE ObjectType,
+    _In_ PVOID Object,
     _In_ ACCESS_MASK GrantedAccess
     );
 
@@ -721,13 +712,9 @@ HpAnalyzeProcessHandles(
 
 /**
  * @brief Find all cross-process handles targeting a specific process.
- *
- * Returns COPIES of handle entry data, not raw pointers. Caller provides
- * an array of HP_HANDLE_ENTRY structures to receive the data.
- *
  * @param Engine Engine instance.
  * @param TargetProcessId Target process.
- * @param Handles Caller-provided array to receive handle entry COPIES.
+ * @param Handles Buffer to receive handle entries.
  * @param MaxHandles Maximum handles to return.
  * @param ReturnedCount Actual count returned.
  * @return STATUS_SUCCESS or error code.
@@ -736,9 +723,21 @@ NTSTATUS
 HpFindHandlesToProcess(
     _In_ PHP_PROTECTION_ENGINE Engine,
     _In_ HANDLE TargetProcessId,
-    _Out_writes_to_(MaxHandles, *ReturnedCount) HP_HANDLE_ENTRY* Handles,
+    _Out_writes_to_(MaxHandles, *ReturnedCount) PHP_HANDLE_ENTRY* Handles,
     _In_ ULONG MaxHandles,
     _Out_ PULONG ReturnedCount
+    );
+
+/**
+ * @brief Enumerate handles from the system handle table.
+ * @param Engine Engine instance.
+ * @param ProcessId Process to enumerate (NULL for all).
+ * @return STATUS_SUCCESS or error code.
+ */
+NTSTATUS
+HpEnumerateSystemHandles(
+    _In_ PHP_PROTECTION_ENGINE Engine,
+    _In_opt_ HANDLE ProcessId
     );
 
 // ============================================================================
@@ -786,11 +785,8 @@ HpGetStatistics(
 
 /**
  * @brief Get recent handle events.
- *
- * Returns COPIES of event data, not raw pointers.
- *
  * @param Engine Engine instance.
- * @param Events Caller-provided array to receive event COPIES.
+ * @param Events Buffer to receive events.
  * @param MaxEvents Maximum events to return.
  * @param ReturnedCount Actual count returned.
  * @return STATUS_SUCCESS or error code.
@@ -798,7 +794,7 @@ HpGetStatistics(
 NTSTATUS
 HpGetRecentEvents(
     _In_ PHP_PROTECTION_ENGINE Engine,
-    _Out_writes_to_(MaxEvents, *ReturnedCount) HP_HANDLE_EVENT* Events,
+    _Out_writes_to_(MaxEvents, *ReturnedCount) PHP_HANDLE_EVENT* Events,
     _In_ ULONG MaxEvents,
     _Out_ PULONG ReturnedCount
     );
@@ -830,5 +826,3 @@ HpFlushAllTracking(
 #ifdef __cplusplus
 }
 #endif
-
-#endif /* _SHADOWSTRIKE_HANDLE_PROTECTION_H_ */

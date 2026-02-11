@@ -1,49 +1,46 @@
-/**
- * ============================================================================
- * ShadowStrike NGAV - ENTERPRISE CALLBACK PROTECTION ENGINE
- * ============================================================================
- *
- * @file CallbackProtection.c
- * @brief Enterprise-grade callback registration protection against tampering.
- *
- * This module provides comprehensive callback protection capabilities:
- * - SHA-256 integrity hashing of callback code regions
- * - Periodic verification of all registered callbacks
- * - Tamper detection with immediate notification
- * - Automatic callback restoration on tampering
- * - Support for all Windows kernel callback types
- * - Thread-safe concurrent access
- * - Real-time statistics and monitoring
- *
- * Protection Coverage:
- * - Process creation/termination callbacks (PsSetCreateProcessNotifyRoutine)
- * - Thread creation callbacks (PsSetCreateThreadNotifyRoutine)
- * - Image load callbacks (PsSetLoadImageNotifyRoutine)
- * - Registry callbacks (CmRegisterCallback)
- * - Object callbacks (ObRegisterCallbacks)
- * - Minifilter callbacks (FltRegisterFilter)
- * - WFP callouts (FwpsCalloutRegister)
- * - ETW providers (EtwRegister)
- *
- * Threat Mitigation:
- * - Callback unhooking attacks
- * - Code patching of callback functions
- * - Registration handle manipulation
- * - Driver callback table corruption
- *
- * MITRE ATT&CK Coverage:
- * - T1562.001: Disable or Modify Tools
- * - T1014: Rootkit
- * - T1556: Modify Authentication Process
- *
- * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
- * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
- * ============================================================================
- */
+/*++
+    ShadowStrike Next-Generation Antivirus
+    Module: CallbackProtection.c - Callback registration protection engine
+
+    Purpose: Protects kernel callback registrations against tampering by
+             hashing the callback code region (SHA-256 of first 256 bytes)
+             and periodically verifying integrity. On tamper detection,
+             notifies a registered callback and optionally restores the
+             original code via MDL-mapped write.
+
+    Synchronization Strategy:
+    - Single EX_PUSH_LOCK (CallbackLock) protects the callback list AND
+      hash table. Always bracketed with KeEnterCriticalRegion /
+      KeLeaveCriticalRegion (MANDATORY for push locks to prevent APC
+      deadlock).
+    - EX_RUNDOWN_REF on all public APIs. CpShutdown waits for rundown
+      completion before tearing down.
+    - Timer DPC does ZERO lock acquisition — it only queues a work item.
+      All verification runs at PASSIVE_LEVEL on the work item thread.
+    - Tamper notification callback invoked only at PASSIVE_LEVEL.
+
+    Safety Guarantees:
+    - No ProbeForRead on kernel addresses (ProbeForRead is user-mode only).
+    - No MmIsAddressValid (point-in-time, unreliable).
+    - Kernel code reads use __try/__except with direct RtlCopyMemory.
+    - CpProtectCallback duplicate check + insert is atomic under
+      exclusive lock (no TOCTOU).
+    - CpUnprotectCallback removes from both list and hash table under
+      single exclusive lock acquisition.
+    - Reference counting on entries: +1 list, verification bumps refcount
+      while iterating. Free only at refcount==0.
+    - Work item allocated in CpInitialize, waited on during CpShutdown
+      via VerifyComplete event.
+
+    Copyright (c) ShadowStrike Team
+--*/
 
 #include "CallbackProtection.h"
 #include "../Core/Globals.h"
+
+// ============================================================================
+// PAGE SECTION
+// ============================================================================
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, CpInitialize)
@@ -52,28 +49,25 @@
 #pragma alloc_text(PAGE, CpUnprotectCallback)
 #pragma alloc_text(PAGE, CpRegisterTamperCallback)
 #pragma alloc_text(PAGE, CpEnablePeriodicVerify)
+#pragma alloc_text(PAGE, CpDisablePeriodicVerify)
 #pragma alloc_text(PAGE, CpVerifyAll)
-#pragma alloc_text(PAGE, CppComputeCallbackHash)
-#pragma alloc_text(PAGE, CppVerifyCallbackIntegrity)
+#pragma alloc_text(PAGE, CpGetStatistics)
 #endif
 
 // ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
 
-#define CP_MAX_CALLBACKS                    256
-#define CP_DEFAULT_VERIFY_INTERVAL_MS       5000        // 5 seconds
-#define CP_MIN_VERIFY_INTERVAL_MS           1000        // 1 second minimum
-#define CP_MAX_VERIFY_INTERVAL_MS           60000       // 1 minute maximum
-#define CP_CALLBACK_HASH_SIZE               64          // Bytes to hash from callback
-#define CP_LOOKASIDE_DEPTH                  32
+#define CP_DEFAULT_VERIFY_INTERVAL_MS   5000
+#define CP_MIN_VERIFY_INTERVAL_MS       1000
+#define CP_MAX_VERIFY_INTERVAL_MS       60000
+#define CP_LOOKASIDE_DEPTH              16
+#define CP_HASH_BUCKETS                 16
 
-#define CP_POOL_TAG_ENTRY                   'eRPC'
-#define CP_POOL_TAG_HASH                    'hRPC'
+// ============================================================================
+// SHA-256 CONSTANTS
+// ============================================================================
 
-//
-// SHA-256 constants
-//
 static const ULONG g_Sha256K[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
     0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -94,134 +88,190 @@ static const ULONG g_Sha256K[64] = {
 };
 
 // ============================================================================
-// PRIVATE STRUCTURES
+// SHA-256 MACROS
 // ============================================================================
 
-/**
- * @brief SHA-256 context structure.
- */
-typedef struct _CP_SHA256_CONTEXT {
+#define ROTR(x, n)    (((x) >> (n)) | ((x) << (32 - (n))))
+#define CH(x, y, z)   (((x) & (y)) ^ (~(x) & (z)))
+#define MAJ(x, y, z)  (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define EP0(x)         (ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22))
+#define EP1(x)         (ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25))
+#define SIG0(x)        (ROTR(x, 7) ^ ROTR(x, 18) ^ ((x) >> 3))
+#define SIG1(x)        (ROTR(x, 17) ^ ROTR(x, 19) ^ ((x) >> 10))
+
+// ============================================================================
+// INTERNAL STRUCTURES
+// ============================================================================
+
+typedef struct _CP_SHA256_CTX {
     ULONG State[8];
     ULONG64 BitCount;
     UCHAR Buffer[64];
-    ULONG BufferLength;
-} CP_SHA256_CONTEXT, *PCP_SHA256_CONTEXT;
+    ULONG BufferLen;
+} CP_SHA256_CTX;
 
-/**
- * @brief Extended protector state (internal).
- */
-typedef struct _CP_PROTECTOR_INTERNAL {
-    //
-    // Public structure (must be first)
-    //
-    CP_PROTECTOR Public;
-
-    //
-    // Lookaside list for callback entries
-    //
-    NPAGED_LOOKASIDE_LIST EntryLookaside;
-    BOOLEAN LookasideInitialized;
-
-    //
-    // Timer state
-    //
-    volatile BOOLEAN TimerActive;
-    volatile BOOLEAN ShuttingDown;
-
-    //
-    // Verification work item for deferred processing
-    //
-    PIO_WORKITEM VerifyWorkItem;
-    volatile LONG VerifyPending;
-
-    //
-    // Callback entry hash table for fast lookup
-    //
-    struct {
-        LIST_ENTRY Buckets[16];
-        EX_PUSH_LOCK Lock;
-    } EntryHash;
-
-    //
-    // Original callback code backup for restoration
-    //
-    BOOLEAN EnableRestoration;
-
-} CP_PROTECTOR_INTERNAL, *PCP_PROTECTOR_INTERNAL;
-
-/**
- * @brief Extended callback entry (internal).
- */
 typedef struct _CP_CALLBACK_ENTRY_INTERNAL {
     //
-    // Public structure (must be first)
+    // List linkage — main ordered list
     //
-    CP_CALLBACK_ENTRY Public;
+    LIST_ENTRY ListEntry;
 
     //
-    // Hash table linkage
+    // Hash table linkage — fast lookup by Registration pointer
     //
     LIST_ENTRY HashEntry;
     ULONG HashBucket;
 
     //
-    // Original callback code backup (for restoration)
+    // Core identity
     //
-    UCHAR OriginalCode[CP_CALLBACK_HASH_SIZE];
+    CP_CALLBACK_TYPE Type;
+    PVOID Registration;
+    PVOID Callback;
+
+    //
+    // SHA-256 of first CP_CALLBACK_HASH_BYTES bytes of callback code
+    //
+    UCHAR CodeHash[32];
+
+    //
+    // Original code backup for restoration
+    //
+    UCHAR OriginalCode[CP_CALLBACK_HASH_BYTES];
     SIZE_T OriginalCodeSize;
     BOOLEAN HasBackup;
 
     //
-    // Verification state
+    // Protection state
+    //
+    BOOLEAN IsProtected;
+    BOOLEAN WasTampered;
+
+    //
+    // Verification stats per entry
     //
     LARGE_INTEGER LastVerifyTime;
     ULONG VerifyCount;
     ULONG TamperCount;
 
     //
-    // Reference counting
+    // Reference counting: 1 for list ownership, +1 during iteration
     //
     volatile LONG RefCount;
 
-    //
-    // Type-specific metadata
-    //
-    union {
-        struct {
-            BOOLEAN IsEx;           // PsSetCreateProcessNotifyRoutineEx
-            BOOLEAN RemoveOnExit;
-        } Process;
-
-        struct {
-            BOOLEAN IsEx;           // PsSetCreateThreadNotifyRoutineEx
-        } Thread;
-
-        struct {
-            BOOLEAN IsEx;           // PsSetLoadImageNotifyRoutineEx
-        } Image;
-
-        struct {
-            LARGE_INTEGER Cookie;   // CmRegisterCallback cookie
-        } Registry;
-
-        struct {
-            PVOID OperationRegistration;
-        } Object;
-
-        struct {
-            PFLT_FILTER Filter;
-        } Minifilter;
-
-        struct {
-            UINT32 CalloutId;
-        } WFP;
-
-        struct {
-            REGHANDLE RegHandle;
-        } ETW;
-    } TypeData;
-
 } CP_CALLBACK_ENTRY_INTERNAL, *PCP_CALLBACK_ENTRY_INTERNAL;
+
+//
+// Full internal protector state. Opaque to consumers.
+//
+struct _CP_PROTECTOR {
+    //
+    // Lifecycle
+    //
+    volatile LONG Initialized;
+    EX_RUNDOWN_REF RundownRef;
+
+    //
+    // Single lock for callback list + hash table.
+    // ALWAYS use CppAcquire*/CppRelease* wrappers.
+    //
+    EX_PUSH_LOCK CallbackLock;
+    LIST_ENTRY CallbackList;
+    ULONG CallbackCount;
+
+    //
+    // Hash table for O(1) lookup by Registration pointer
+    //
+    LIST_ENTRY HashBuckets[CP_HASH_BUCKETS];
+
+    //
+    // Lookaside for entry allocations
+    //
+    NPAGED_LOOKASIDE_LIST EntryLookaside;
+    BOOLEAN LookasideInitialized;
+
+    //
+    // Tamper notification
+    //
+    CP_TAMPER_CALLBACK TamperCallback;
+    PVOID TamperContext;
+
+    //
+    // Periodic verification via timer → DPC → work item
+    //
+    KTIMER VerifyTimer;
+    KDPC VerifyDpc;
+    ULONG VerifyIntervalMs;
+    volatile LONG TimerActive;
+    volatile LONG PeriodicEnabled;
+
+    //
+    // Work item for PASSIVE_LEVEL verification
+    //
+    PIO_WORKITEM VerifyWorkItem;
+    volatile LONG VerifyPending;
+    KEVENT VerifyComplete;
+
+    //
+    // Enable automatic code restoration on tamper
+    //
+    BOOLEAN EnableRestoration;
+
+    //
+    // Statistics
+    //
+    struct {
+        volatile LONG64 CallbacksProtected;
+        volatile LONG64 TamperAttempts;
+        volatile LONG64 CallbacksRestored;
+        volatile LONG64 VerificationsRun;
+        LARGE_INTEGER StartTime;
+    } Stats;
+};
+
+// ============================================================================
+// PUSH LOCK WRAPPERS — Mandatory KeEnterCriticalRegion bracketing
+// ============================================================================
+
+_IRQL_requires_max_(APC_LEVEL)
+static __forceinline VOID
+CppAcquireLockShared(
+    _Inout_ PEX_PUSH_LOCK Lock
+    )
+{
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(Lock);
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+static __forceinline VOID
+CppReleaseLockShared(
+    _Inout_ PEX_PUSH_LOCK Lock
+    )
+{
+    ExReleasePushLockShared(Lock);
+    KeLeaveCriticalRegion();
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+static __forceinline VOID
+CppAcquireLockExclusive(
+    _Inout_ PEX_PUSH_LOCK Lock
+    )
+{
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(Lock);
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+static __forceinline VOID
+CppReleaseLockExclusive(
+    _Inout_ PEX_PUSH_LOCK Lock
+    )
+{
+    ExReleasePushLockExclusive(Lock);
+    KeLeaveCriticalRegion();
+}
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -229,70 +279,77 @@ typedef struct _CP_CALLBACK_ENTRY_INTERNAL {
 
 static VOID
 CppSha256Init(
-    _Out_ PCP_SHA256_CONTEXT Context
+    _Out_ CP_SHA256_CTX* Ctx
     );
 
 static VOID
 CppSha256Update(
-    _Inout_ PCP_SHA256_CONTEXT Context,
-    _In_reads_bytes_(Length) PCUCHAR Data,
-    _In_ SIZE_T Length
+    _Inout_ CP_SHA256_CTX* Ctx,
+    _In_reads_bytes_(Len) const UCHAR* Data,
+    _In_ SIZE_T Len
     );
 
 static VOID
 CppSha256Final(
-    _Inout_ PCP_SHA256_CONTEXT Context,
-    _Out_writes_bytes_(32) PUCHAR Hash
+    _Inout_ CP_SHA256_CTX* Ctx,
+    _Out_writes_bytes_(32) UCHAR* Hash
     );
 
 static VOID
 CppSha256Transform(
-    _Inout_ PCP_SHA256_CONTEXT Context,
-    _In_reads_bytes_(64) PCUCHAR Block
+    _Inout_ CP_SHA256_CTX* Ctx,
+    _In_reads_bytes_(64) const UCHAR* Block
     );
 
 static NTSTATUS
-CppComputeCallbackHash(
-    _In_ PVOID Callback,
-    _Out_writes_bytes_(32) PUCHAR Hash
+CppComputeCodeHash(
+    _In_ PVOID CodeAddress,
+    _In_ SIZE_T BytesToHash,
+    _Out_writes_bytes_(32) UCHAR* Hash
     );
 
-static BOOLEAN
-CppVerifyCallbackIntegrity(
-    _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
+static NTSTATUS
+CppReadKernelCode(
+    _In_ PVOID Address,
+    _Out_writes_bytes_(Size) PVOID Buffer,
+    _In_ SIZE_T Size
     );
 
 static ULONG
-CppHashRegistration(
-    _In_ PVOID Registration
+CppHashPointer(
+    _In_ PVOID Ptr
     );
 
 static PCP_CALLBACK_ENTRY_INTERNAL
-CppFindEntryByRegistration(
-    _In_ PCP_PROTECTOR_INTERNAL Protector,
+CppFindByRegistration(
+    _In_ PCP_PROTECTOR Protector,
     _In_ PVOID Registration
     );
 
 static VOID
-CppInsertEntryIntoHash(
-    _In_ PCP_PROTECTOR_INTERNAL Protector,
-    _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
+CppReferenceEntry(
+    _Inout_ PCP_CALLBACK_ENTRY_INTERNAL Entry
     );
 
 static VOID
-CppRemoveEntryFromHash(
-    _In_ PCP_PROTECTOR_INTERNAL Protector,
-    _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
+CppDereferenceEntry(
+    _In_ PCP_PROTECTOR Protector,
+    _Inout_ PCP_CALLBACK_ENTRY_INTERNAL Entry
     );
 
-static VOID
-CppNotifyTamper(
-    _In_ PCP_PROTECTOR_INTERNAL Protector,
+static BOOLEAN
+CppVerifySingleEntry(
     _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
     );
 
 static BOOLEAN
 CppRestoreCallback(
+    _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
+    );
+
+static VOID
+CppNotifyTamper(
+    _In_ PCP_PROTECTOR Protector,
     _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
     );
 
@@ -311,63 +368,43 @@ CppVerifyWorkItemRoutine(
     _In_opt_ PVOID Context
     );
 
-static PCSTR
-CppGetCallbackTypeName(
-    _In_ CP_CALLBACK_TYPE Type
+static VOID
+CppArmTimer(
+    _In_ PCP_PROTECTOR Protector
     );
 
 // ============================================================================
 // SHA-256 IMPLEMENTATION
 // ============================================================================
 
-//
-// SHA-256 helper macros
-//
-#define ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
-#define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
-#define MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
-#define EP0(x) (ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22))
-#define EP1(x) (ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25))
-#define SIG0(x) (ROTR(x, 7) ^ ROTR(x, 18) ^ ((x) >> 3))
-#define SIG1(x) (ROTR(x, 17) ^ ROTR(x, 19) ^ ((x) >> 10))
-
 static VOID
 CppSha256Init(
-    _Out_ PCP_SHA256_CONTEXT Context
+    _Out_ CP_SHA256_CTX* Ctx
     )
-/**
- * @brief Initialize SHA-256 context.
- */
 {
-    Context->State[0] = 0x6a09e667;
-    Context->State[1] = 0xbb67ae85;
-    Context->State[2] = 0x3c6ef372;
-    Context->State[3] = 0xa54ff53a;
-    Context->State[4] = 0x510e527f;
-    Context->State[5] = 0x9b05688c;
-    Context->State[6] = 0x1f83d9ab;
-    Context->State[7] = 0x5be0cd19;
-    Context->BitCount = 0;
-    Context->BufferLength = 0;
+    Ctx->State[0] = 0x6a09e667;
+    Ctx->State[1] = 0xbb67ae85;
+    Ctx->State[2] = 0x3c6ef372;
+    Ctx->State[3] = 0xa54ff53a;
+    Ctx->State[4] = 0x510e527f;
+    Ctx->State[5] = 0x9b05688c;
+    Ctx->State[6] = 0x1f83d9ab;
+    Ctx->State[7] = 0x5be0cd19;
+    Ctx->BitCount = 0;
+    Ctx->BufferLen = 0;
 }
 
 static VOID
 CppSha256Transform(
-    _Inout_ PCP_SHA256_CONTEXT Context,
-    _In_reads_bytes_(64) PCUCHAR Block
+    _Inout_ CP_SHA256_CTX* Ctx,
+    _In_reads_bytes_(64) const UCHAR* Block
     )
-/**
- * @brief Process a 64-byte block.
- */
 {
     ULONG a, b, c, d, e, f, g, h;
     ULONG t1, t2;
     ULONG w[64];
     ULONG i;
 
-    //
-    // Prepare message schedule
-    //
     for (i = 0; i < 16; i++) {
         w[i] = ((ULONG)Block[i * 4] << 24) |
                ((ULONG)Block[i * 4 + 1] << 16) |
@@ -379,149 +416,258 @@ CppSha256Transform(
         w[i] = SIG1(w[i - 2]) + w[i - 7] + SIG0(w[i - 15]) + w[i - 16];
     }
 
-    //
-    // Initialize working variables
-    //
-    a = Context->State[0];
-    b = Context->State[1];
-    c = Context->State[2];
-    d = Context->State[3];
-    e = Context->State[4];
-    f = Context->State[5];
-    g = Context->State[6];
-    h = Context->State[7];
+    a = Ctx->State[0]; b = Ctx->State[1];
+    c = Ctx->State[2]; d = Ctx->State[3];
+    e = Ctx->State[4]; f = Ctx->State[5];
+    g = Ctx->State[6]; h = Ctx->State[7];
 
-    //
-    // Compression function
-    //
     for (i = 0; i < 64; i++) {
         t1 = h + EP1(e) + CH(e, f, g) + g_Sha256K[i] + w[i];
         t2 = EP0(a) + MAJ(a, b, c);
-        h = g;
-        g = f;
-        f = e;
-        e = d + t1;
-        d = c;
-        c = b;
-        b = a;
-        a = t1 + t2;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
     }
 
-    //
-    // Update state
-    //
-    Context->State[0] += a;
-    Context->State[1] += b;
-    Context->State[2] += c;
-    Context->State[3] += d;
-    Context->State[4] += e;
-    Context->State[5] += f;
-    Context->State[6] += g;
-    Context->State[7] += h;
+    Ctx->State[0] += a; Ctx->State[1] += b;
+    Ctx->State[2] += c; Ctx->State[3] += d;
+    Ctx->State[4] += e; Ctx->State[5] += f;
+    Ctx->State[6] += g; Ctx->State[7] += h;
 }
 
 static VOID
 CppSha256Update(
-    _Inout_ PCP_SHA256_CONTEXT Context,
-    _In_reads_bytes_(Length) PCUCHAR Data,
-    _In_ SIZE_T Length
+    _Inout_ CP_SHA256_CTX* Ctx,
+    _In_reads_bytes_(Len) const UCHAR* Data,
+    _In_ SIZE_T Len
     )
-/**
- * @brief Update SHA-256 with additional data.
- */
 {
-    SIZE_T i;
     SIZE_T remaining;
 
-    Context->BitCount += Length * 8;
+    Ctx->BitCount += Len * 8;
 
-    //
-    // Process any buffered data first
-    //
-    if (Context->BufferLength > 0) {
-        remaining = 64 - Context->BufferLength;
-
-        if (Length < remaining) {
-            RtlCopyMemory(Context->Buffer + Context->BufferLength, Data, Length);
-            Context->BufferLength += (ULONG)Length;
+    if (Ctx->BufferLen > 0) {
+        remaining = 64 - Ctx->BufferLen;
+        if (Len < remaining) {
+            RtlCopyMemory(Ctx->Buffer + Ctx->BufferLen, Data, Len);
+            Ctx->BufferLen += (ULONG)Len;
             return;
         }
-
-        RtlCopyMemory(Context->Buffer + Context->BufferLength, Data, remaining);
-        CppSha256Transform(Context, Context->Buffer);
+        RtlCopyMemory(Ctx->Buffer + Ctx->BufferLen, Data, remaining);
+        CppSha256Transform(Ctx, Ctx->Buffer);
         Data += remaining;
-        Length -= remaining;
-        Context->BufferLength = 0;
+        Len -= remaining;
+        Ctx->BufferLen = 0;
     }
 
-    //
-    // Process full blocks
-    //
-    while (Length >= 64) {
-        CppSha256Transform(Context, Data);
+    while (Len >= 64) {
+        CppSha256Transform(Ctx, Data);
         Data += 64;
-        Length -= 64;
+        Len -= 64;
     }
 
-    //
-    // Buffer remaining data
-    //
-    if (Length > 0) {
-        RtlCopyMemory(Context->Buffer, Data, Length);
-        Context->BufferLength = (ULONG)Length;
+    if (Len > 0) {
+        RtlCopyMemory(Ctx->Buffer, Data, Len);
+        Ctx->BufferLen = (ULONG)Len;
     }
 }
 
 static VOID
 CppSha256Final(
-    _Inout_ PCP_SHA256_CONTEXT Context,
-    _Out_writes_bytes_(32) PUCHAR Hash
+    _Inout_ CP_SHA256_CTX* Ctx,
+    _Out_writes_bytes_(32) UCHAR* Hash
     )
-/**
- * @brief Finalize SHA-256 and produce hash.
- */
 {
     UCHAR padding[64];
     ULONG padLen;
     UCHAR lenBits[8];
     ULONG i;
 
-    //
-    // Prepare length in bits (big-endian)
-    //
-    lenBits[0] = (UCHAR)(Context->BitCount >> 56);
-    lenBits[1] = (UCHAR)(Context->BitCount >> 48);
-    lenBits[2] = (UCHAR)(Context->BitCount >> 40);
-    lenBits[3] = (UCHAR)(Context->BitCount >> 32);
-    lenBits[4] = (UCHAR)(Context->BitCount >> 24);
-    lenBits[5] = (UCHAR)(Context->BitCount >> 16);
-    lenBits[6] = (UCHAR)(Context->BitCount >> 8);
-    lenBits[7] = (UCHAR)(Context->BitCount);
+    lenBits[0] = (UCHAR)(Ctx->BitCount >> 56);
+    lenBits[1] = (UCHAR)(Ctx->BitCount >> 48);
+    lenBits[2] = (UCHAR)(Ctx->BitCount >> 40);
+    lenBits[3] = (UCHAR)(Ctx->BitCount >> 32);
+    lenBits[4] = (UCHAR)(Ctx->BitCount >> 24);
+    lenBits[5] = (UCHAR)(Ctx->BitCount >> 16);
+    lenBits[6] = (UCHAR)(Ctx->BitCount >> 8);
+    lenBits[7] = (UCHAR)(Ctx->BitCount);
 
-    //
-    // Pad to 56 bytes mod 64
-    //
-    padLen = (Context->BufferLength < 56) ? (56 - Context->BufferLength) : (120 - Context->BufferLength);
+    padLen = (Ctx->BufferLen < 56) ?
+             (56 - Ctx->BufferLen) :
+             (120 - Ctx->BufferLen);
 
     RtlZeroMemory(padding, sizeof(padding));
     padding[0] = 0x80;
 
-    CppSha256Update(Context, padding, padLen);
-    CppSha256Update(Context, lenBits, 8);
+    CppSha256Update(Ctx, padding, padLen);
+    CppSha256Update(Ctx, lenBits, 8);
 
-    //
-    // Produce final hash (big-endian)
-    //
     for (i = 0; i < 8; i++) {
-        Hash[i * 4] = (UCHAR)(Context->State[i] >> 24);
-        Hash[i * 4 + 1] = (UCHAR)(Context->State[i] >> 16);
-        Hash[i * 4 + 2] = (UCHAR)(Context->State[i] >> 8);
-        Hash[i * 4 + 3] = (UCHAR)(Context->State[i]);
+        Hash[i * 4]     = (UCHAR)(Ctx->State[i] >> 24);
+        Hash[i * 4 + 1] = (UCHAR)(Ctx->State[i] >> 16);
+        Hash[i * 4 + 2] = (UCHAR)(Ctx->State[i] >> 8);
+        Hash[i * 4 + 3] = (UCHAR)(Ctx->State[i]);
     }
 }
 
 // ============================================================================
-// INITIALIZATION AND SHUTDOWN
+// KERNEL CODE READ HELPER
+// ============================================================================
+
+/**
+ * Safely read kernel code bytes. No ProbeForRead (kernel addresses only).
+ * No MmIsAddressValid (unreliable). Uses __try/__except for fault handling.
+ */
+static NTSTATUS
+CppReadKernelCode(
+    _In_ PVOID Address,
+    _Out_writes_bytes_(Size) PVOID Buffer,
+    _In_ SIZE_T Size
+    )
+{
+    if (Address == NULL || Buffer == NULL || Size == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Kernel addresses must be above MmUserProbeAddress.
+    // Reject anything in user space.
+    //
+    if ((ULONG_PTR)Address < (ULONG_PTR)MmUserProbeAddress) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    __try {
+        RtlCopyMemory(Buffer, Address, Size);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// HASH COMPUTATION
+// ============================================================================
+
+/**
+ * Compute SHA-256 of BytesToHash bytes starting at CodeAddress.
+ * Reads kernel code safely, then hashes the local copy.
+ */
+static NTSTATUS
+CppComputeCodeHash(
+    _In_ PVOID CodeAddress,
+    _In_ SIZE_T BytesToHash,
+    _Out_writes_bytes_(32) UCHAR* Hash
+    )
+{
+    CP_SHA256_CTX sha;
+    UCHAR localBuf[CP_CALLBACK_HASH_BYTES];
+    NTSTATUS status;
+
+    if (BytesToHash > sizeof(localBuf)) {
+        BytesToHash = sizeof(localBuf);
+    }
+
+    status = CppReadKernelCode(CodeAddress, localBuf, BytesToHash);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    CppSha256Init(&sha);
+    CppSha256Update(&sha, localBuf, BytesToHash);
+    CppSha256Final(&sha, Hash);
+
+    RtlSecureZeroMemory(&sha, sizeof(sha));
+    RtlSecureZeroMemory(localBuf, sizeof(localBuf));
+
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// HASH TABLE HELPERS
+// ============================================================================
+
+static ULONG
+CppHashPointer(
+    _In_ PVOID Ptr
+    )
+{
+    ULONG_PTR val = (ULONG_PTR)Ptr;
+    //
+    // FNV-1a-style mix for pointer → bucket index.
+    // Shift right 4 to discard alignment bits.
+    //
+    val = val >> 4;
+    val ^= val >> 16;
+    return (ULONG)(val % CP_HASH_BUCKETS);
+}
+
+/**
+ * Find entry by Registration pointer in hash table.
+ * Caller MUST hold CallbackLock (shared or exclusive).
+ */
+static PCP_CALLBACK_ENTRY_INTERNAL
+CppFindByRegistration(
+    _In_ PCP_PROTECTOR Protector,
+    _In_ PVOID Registration
+    )
+{
+    ULONG bucket;
+    PLIST_ENTRY entry;
+    PCP_CALLBACK_ENTRY_INTERNAL cbEntry;
+
+    bucket = CppHashPointer(Registration);
+
+    for (entry = Protector->HashBuckets[bucket].Flink;
+         entry != &Protector->HashBuckets[bucket];
+         entry = entry->Flink) {
+
+        cbEntry = CONTAINING_RECORD(entry, CP_CALLBACK_ENTRY_INTERNAL, HashEntry);
+        if (cbEntry->Registration == Registration) {
+            return cbEntry;
+        }
+    }
+
+    return NULL;
+}
+
+// ============================================================================
+// REFERENCE COUNTING
+// ============================================================================
+
+static __forceinline VOID
+CppReferenceEntry(
+    _Inout_ PCP_CALLBACK_ENTRY_INTERNAL Entry
+    )
+{
+    InterlockedIncrement(&Entry->RefCount);
+}
+
+/**
+ * Decrement refcount. When it reaches 0, free to lookaside.
+ * Caller must NOT hold CallbackLock when refcount could reach 0.
+ */
+static VOID
+CppDereferenceEntry(
+    _In_ PCP_PROTECTOR Protector,
+    _Inout_ PCP_CALLBACK_ENTRY_INTERNAL Entry
+    )
+{
+    LONG newRef = InterlockedDecrement(&Entry->RefCount);
+    NT_ASSERT(newRef >= 0);
+
+    if (newRef == 0) {
+        if (Protector->LookasideInitialized) {
+            ExFreeToNPagedLookasideList(&Protector->EntryLookaside, Entry);
+        } else {
+            ExFreePoolWithTag(Entry, CP_POOL_TAG_ENTRY);
+        }
+    }
+}
+
+// ============================================================================
+// INITIALIZATION / SHUTDOWN
 // ============================================================================
 
 _Use_decl_annotations_
@@ -529,15 +675,8 @@ NTSTATUS
 CpInitialize(
     _Out_ PCP_PROTECTOR* Protector
     )
-/**
- * @brief Initialize the callback protection subsystem.
- *
- * Allocates and initializes all data structures required for
- * callback protection including hash tables and verification timer.
- */
 {
-    NTSTATUS status = STATUS_SUCCESS;
-    PCP_PROTECTOR_INTERNAL protector = NULL;
+    PCP_PROTECTOR prot = NULL;
     ULONG i;
 
     PAGED_CODE();
@@ -548,38 +687,26 @@ CpInitialize(
 
     *Protector = NULL;
 
-    //
-    // Allocate protector structure
-    //
-    protector = (PCP_PROTECTOR_INTERNAL)ExAllocatePoolZero(
+    prot = (PCP_PROTECTOR)ExAllocatePoolZero(
         NonPagedPoolNx,
-        sizeof(CP_PROTECTOR_INTERNAL),
+        sizeof(CP_PROTECTOR),
         CP_POOL_TAG
     );
 
-    if (protector == NULL) {
+    if (prot == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Initialize callback list
-    //
-    InitializeListHead(&protector->Public.CallbackList);
-    ExInitializePushLock(&protector->Public.CallbackLock);
+    ExInitializeRundownProtection(&prot->RundownRef);
+    ExInitializePushLock(&prot->CallbackLock);
+    InitializeListHead(&prot->CallbackList);
 
-    //
-    // Initialize hash table
-    //
-    for (i = 0; i < 16; i++) {
-        InitializeListHead(&protector->EntryHash.Buckets[i]);
+    for (i = 0; i < CP_HASH_BUCKETS; i++) {
+        InitializeListHead(&prot->HashBuckets[i]);
     }
-    ExInitializePushLock(&protector->EntryHash.Lock);
 
-    //
-    // Initialize lookaside list
-    //
     ExInitializeNPagedLookasideList(
-        &protector->EntryLookaside,
+        &prot->EntryLookaside,
         NULL,
         NULL,
         POOL_NX_ALLOCATION,
@@ -587,32 +714,35 @@ CpInitialize(
         CP_POOL_TAG_ENTRY,
         CP_LOOKASIDE_DEPTH
     );
+    prot->LookasideInitialized = TRUE;
 
-    protector->LookasideInitialized = TRUE;
+    KeInitializeTimer(&prot->VerifyTimer);
+    KeInitializeDpc(&prot->VerifyDpc, CppVerifyTimerDpc, prot);
+    KeInitializeEvent(&prot->VerifyComplete, NotificationEvent, TRUE);
 
-    //
-    // Initialize verification timer
-    //
-    KeInitializeTimer(&protector->Public.VerifyTimer);
-    KeInitializeDpc(&protector->Public.VerifyDpc, CppVerifyTimerDpc, protector);
-
-    //
-    // Set default verification interval
-    //
-    protector->Public.VerifyIntervalMs = CP_DEFAULT_VERIFY_INTERVAL_MS;
+    prot->VerifyIntervalMs = CP_DEFAULT_VERIFY_INTERVAL_MS;
+    prot->EnableRestoration = TRUE;
 
     //
-    // Enable callback restoration by default
+    // Allocate work item. Requires g_DriverData.DriverObject from Globals.
+    // If DriverObject is not available yet, the work item is NULL and
+    // periodic verification will be unavailable (CpEnablePeriodicVerify
+    // will return STATUS_DEVICE_NOT_READY).
     //
-    protector->EnableRestoration = TRUE;
+    if (g_DriverData.DriverObject != NULL) {
+        //
+        // IoAllocateWorkItem needs a device object. Use the unnamed
+        // control device from the driver object if available.
+        //
+        PDEVICE_OBJECT devObj = g_DriverData.DriverObject->DeviceObject;
+        if (devObj != NULL) {
+            prot->VerifyWorkItem = IoAllocateWorkItem(devObj);
+        }
+    }
 
-    //
-    // Initialize statistics
-    //
-    KeQuerySystemTime(&protector->Public.Stats.StartTime);
-
-    protector->Public.Initialized = TRUE;
-    *Protector = &protector->Public;
+    KeQuerySystemTime(&prot->Stats.StartTime);
+    InterlockedExchange(&prot->Initialized, TRUE);
+    *Protector = prot;
 
     return STATUS_SUCCESS;
 }
@@ -622,16 +752,9 @@ VOID
 CpShutdown(
     _Inout_ PCP_PROTECTOR Protector
     )
-/**
- * @brief Shutdown and cleanup the callback protection subsystem.
- *
- * Cancels verification timer, releases all callback entries,
- * and frees all allocated memory.
- */
 {
-    PCP_PROTECTOR_INTERNAL protector;
     PLIST_ENTRY entry;
-    PCP_CALLBACK_ENTRY_INTERNAL callbackEntry;
+    PCP_CALLBACK_ENTRY_INTERNAL cbEntry;
 
     PAGED_CODE();
 
@@ -639,62 +762,85 @@ CpShutdown(
         return;
     }
 
-    protector = CONTAINING_RECORD(Protector, CP_PROTECTOR_INTERNAL, Public);
-    protector->ShuttingDown = TRUE;
+    //
+    // Prevent new API calls from entering.
+    //
+    InterlockedExchange(&Protector->Initialized, FALSE);
 
     //
-    // Cancel verification timer
+    // Cancel timer. After KeCancelTimer, no new DPCs fire.
     //
-    if (protector->TimerActive) {
+    if (InterlockedExchange(&Protector->TimerActive, FALSE)) {
         KeCancelTimer(&Protector->VerifyTimer);
-        protector->TimerActive = FALSE;
     }
 
     //
-    // Wait for pending DPCs
+    // Flush all queued DPCs so CppVerifyTimerDpc has fully returned.
     //
     KeFlushQueuedDpcs();
 
     //
-    // Free work item if allocated
+    // Wait for any in-flight work item to complete.
+    // The work item sets VerifyComplete when it finishes.
     //
-    if (protector->VerifyWorkItem != NULL) {
-        IoFreeWorkItem(protector->VerifyWorkItem);
-        protector->VerifyWorkItem = NULL;
+    KeWaitForSingleObject(
+        &Protector->VerifyComplete,
+        Executive,
+        KernelMode,
+        FALSE,
+        NULL
+    );
+
+    //
+    // Wait for all in-flight public API calls to drain.
+    //
+    ExWaitForRundownProtectionRelease(&Protector->RundownRef);
+
+    //
+    // Free work item (safe now — no work item is in flight).
+    //
+    if (Protector->VerifyWorkItem != NULL) {
+        IoFreeWorkItem(Protector->VerifyWorkItem);
+        Protector->VerifyWorkItem = NULL;
     }
 
     //
-    // Free all callback entries
+    // Free all callback entries. Nobody is iterating now.
     //
-    ExAcquirePushLockExclusive(&Protector->CallbackLock);
+    CppAcquireLockExclusive(&Protector->CallbackLock);
 
     while (!IsListEmpty(&Protector->CallbackList)) {
         entry = RemoveHeadList(&Protector->CallbackList);
-        callbackEntry = CONTAINING_RECORD(entry, CP_CALLBACK_ENTRY_INTERNAL, Public.ListEntry);
+        cbEntry = CONTAINING_RECORD(entry, CP_CALLBACK_ENTRY_INTERNAL, ListEntry);
 
-        if (protector->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&protector->EntryLookaside, callbackEntry);
+        //
+        // Remove from hash table too.
+        //
+        RemoveEntryList(&cbEntry->HashEntry);
+
+        //
+        // Drop the list reference. If refcount reaches 0 it frees.
+        // Since we waited for rundown, no other thread holds a ref.
+        //
+        cbEntry->RefCount = 0; // Force-free since we own everything
+        if (Protector->LookasideInitialized) {
+            ExFreeToNPagedLookasideList(&Protector->EntryLookaside, cbEntry);
         } else {
-            ExFreePoolWithTag(callbackEntry, CP_POOL_TAG_ENTRY);
+            ExFreePoolWithTag(cbEntry, CP_POOL_TAG_ENTRY);
         }
     }
 
-    ExReleasePushLockExclusive(&Protector->CallbackLock);
+    CppReleaseLockExclusive(&Protector->CallbackLock);
 
     //
-    // Delete lookaside list
+    // Delete lookaside.
     //
-    if (protector->LookasideInitialized) {
-        ExDeleteNPagedLookasideList(&protector->EntryLookaside);
-        protector->LookasideInitialized = FALSE;
+    if (Protector->LookasideInitialized) {
+        ExDeleteNPagedLookasideList(&Protector->EntryLookaside);
+        Protector->LookasideInitialized = FALSE;
     }
 
-    Protector->Initialized = FALSE;
-
-    //
-    // Free protector structure
-    //
-    ExFreePoolWithTag(protector, CP_POOL_TAG);
+    ExFreePoolWithTag(Protector, CP_POOL_TAG);
 }
 
 // ============================================================================
@@ -709,16 +855,10 @@ CpProtectCallback(
     _In_ PVOID Registration,
     _In_ PVOID Callback
     )
-/**
- * @brief Add a callback to the protection list.
- *
- * Computes SHA-256 hash of the callback code and stores
- * it for periodic integrity verification.
- */
 {
-    PCP_PROTECTOR_INTERNAL protector;
     PCP_CALLBACK_ENTRY_INTERNAL newEntry = NULL;
     NTSTATUS status;
+    ULONG bucket;
 
     PAGED_CODE();
 
@@ -727,102 +867,97 @@ CpProtectCallback(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Type > CpCallback_ETW) {
+    if ((ULONG)Type >= (ULONG)CpCallback_MaxType) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    protector = CONTAINING_RECORD(Protector, CP_PROTECTOR_INTERNAL, Public);
-
-    //
-    // Check callback limit
-    //
-    if (Protector->CallbackCount >= CP_MAX_CALLBACKS) {
-        return STATUS_QUOTA_EXCEEDED;
+    if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
     //
-    // Check for duplicate
-    //
-    ExAcquirePushLockShared(&protector->EntryHash.Lock);
-    if (CppFindEntryByRegistration(protector, Registration) != NULL) {
-        ExReleasePushLockShared(&protector->EntryHash.Lock);
-        return STATUS_OBJECT_NAME_EXISTS;
-    }
-    ExReleasePushLockShared(&protector->EntryHash.Lock);
-
-    //
-    // Allocate entry from lookaside
+    // Pre-allocate entry BEFORE acquiring lock.
     //
     newEntry = (PCP_CALLBACK_ENTRY_INTERNAL)ExAllocateFromNPagedLookasideList(
-        &protector->EntryLookaside
+        &Protector->EntryLookaside
     );
 
     if (newEntry == NULL) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlZeroMemory(newEntry, sizeof(CP_CALLBACK_ENTRY_INTERNAL));
+    InitializeListHead(&newEntry->ListEntry);
+    InitializeListHead(&newEntry->HashEntry);
+
+    newEntry->Type = Type;
+    newEntry->Registration = Registration;
+    newEntry->Callback = Callback;
+    newEntry->IsProtected = TRUE;
+    newEntry->RefCount = 1; // Owned by the list
 
     //
-    // Initialize entry
+    // Compute hash of callback code.
     //
-    newEntry->Public.Type = Type;
-    newEntry->Public.Registration = Registration;
-    newEntry->Public.Callback = Callback;
-    newEntry->Public.IsProtected = TRUE;
-    newEntry->Public.WasTampered = FALSE;
-    newEntry->RefCount = 1;
-
-    //
-    // Compute initial hash
-    //
-    status = CppComputeCallbackHash(Callback, newEntry->Public.CallbackHash);
+    status = CppComputeCodeHash(Callback, CP_CALLBACK_HASH_BYTES, newEntry->CodeHash);
     if (!NT_SUCCESS(status)) {
-        ExFreeToNPagedLookasideList(&protector->EntryLookaside, newEntry);
+        ExFreeToNPagedLookasideList(&Protector->EntryLookaside, newEntry);
+        ExReleaseRundownProtection(&Protector->RundownRef);
         return status;
     }
 
     //
-    // Backup original callback code for potential restoration
+    // Backup original code for potential restoration.
     //
-    __try {
-        SIZE_T copySize = min(CP_CALLBACK_HASH_SIZE, MmGetMdlByteCount(IoAllocateMdl(Callback, CP_CALLBACK_HASH_SIZE, FALSE, FALSE, NULL)));
-
-        //
-        // Safely probe and copy the callback code
-        //
-        if (MmIsAddressValid(Callback)) {
-            RtlCopyMemory(newEntry->OriginalCode, Callback, CP_CALLBACK_HASH_SIZE);
-            newEntry->OriginalCodeSize = CP_CALLBACK_HASH_SIZE;
-            newEntry->HasBackup = TRUE;
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        //
-        // Could not backup - continue without restoration capability
-        //
+    status = CppReadKernelCode(Callback, newEntry->OriginalCode, CP_CALLBACK_HASH_BYTES);
+    if (NT_SUCCESS(status)) {
+        newEntry->OriginalCodeSize = CP_CALLBACK_HASH_BYTES;
+        newEntry->HasBackup = TRUE;
+    } else {
         newEntry->HasBackup = FALSE;
     }
 
     KeQuerySystemTime(&newEntry->LastVerifyTime);
 
     //
-    // Insert into callback list
+    // ATOMIC: check duplicate + insert under single exclusive lock.
+    // This eliminates the TOCTOU race.
     //
-    ExAcquirePushLockExclusive(&Protector->CallbackLock);
-    InsertTailList(&Protector->CallbackList, &newEntry->Public.ListEntry);
+    CppAcquireLockExclusive(&Protector->CallbackLock);
+
+    if (Protector->CallbackCount >= CP_MAX_CALLBACKS) {
+        CppReleaseLockExclusive(&Protector->CallbackLock);
+        ExFreeToNPagedLookasideList(&Protector->EntryLookaside, newEntry);
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    if (CppFindByRegistration(Protector, Registration) != NULL) {
+        CppReleaseLockExclusive(&Protector->CallbackLock);
+        ExFreeToNPagedLookasideList(&Protector->EntryLookaside, newEntry);
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_OBJECT_NAME_EXISTS;
+    }
+
+    //
+    // Insert into main list.
+    //
+    InsertTailList(&Protector->CallbackList, &newEntry->ListEntry);
+
+    //
+    // Insert into hash table.
+    //
+    bucket = CppHashPointer(Registration);
+    newEntry->HashBucket = bucket;
+    InsertTailList(&Protector->HashBuckets[bucket], &newEntry->HashEntry);
+
     Protector->CallbackCount++;
-    ExReleasePushLockExclusive(&Protector->CallbackLock);
 
-    //
-    // Insert into hash table
-    //
-    CppInsertEntryIntoHash(protector, newEntry);
+    CppReleaseLockExclusive(&Protector->CallbackLock);
 
-    //
-    // Update statistics
-    //
     InterlockedIncrement64(&Protector->Stats.CallbacksProtected);
+    ExReleaseRundownProtection(&Protector->RundownRef);
 
     return STATUS_SUCCESS;
 }
@@ -833,11 +968,7 @@ CpUnprotectCallback(
     _In_ PCP_PROTECTOR Protector,
     _In_ PVOID Registration
     )
-/**
- * @brief Remove a callback from protection.
- */
 {
-    PCP_PROTECTOR_INTERNAL protector;
     PCP_CALLBACK_ENTRY_INTERNAL entry;
 
     PAGED_CODE();
@@ -846,40 +977,41 @@ CpUnprotectCallback(
         return STATUS_INVALID_PARAMETER;
     }
 
-    protector = CONTAINING_RECORD(Protector, CP_PROTECTOR_INTERNAL, Public);
-
-    //
-    // Find the entry
-    //
-    ExAcquirePushLockExclusive(&protector->EntryHash.Lock);
-    entry = CppFindEntryByRegistration(protector, Registration);
-
-    if (entry == NULL) {
-        ExReleasePushLockExclusive(&protector->EntryHash.Lock);
-        return STATUS_NOT_FOUND;
+    if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
     //
-    // Remove from hash table
+    // ATOMIC: find, remove from both hash table and list under single lock.
+    // No window for use-after-free.
     //
+    CppAcquireLockExclusive(&Protector->CallbackLock);
+
+    entry = CppFindByRegistration(Protector, Registration);
+    if (entry == NULL) {
+        CppReleaseLockExclusive(&Protector->CallbackLock);
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_NOT_FOUND;
+    }
+
+    RemoveEntryList(&entry->ListEntry);
     RemoveEntryList(&entry->HashEntry);
-    ExReleasePushLockExclusive(&protector->EntryHash.Lock);
-
-    //
-    // Remove from callback list
-    //
-    ExAcquirePushLockExclusive(&Protector->CallbackLock);
-    RemoveEntryList(&entry->Public.ListEntry);
     Protector->CallbackCount--;
-    ExReleasePushLockExclusive(&Protector->CallbackLock);
+
+    CppReleaseLockExclusive(&Protector->CallbackLock);
 
     //
-    // Free entry
+    // Drop list reference. If no one else has a ref, this frees the entry.
     //
-    ExFreeToNPagedLookasideList(&protector->EntryLookaside, entry);
+    CppDereferenceEntry(Protector, entry);
 
+    ExReleaseRundownProtection(&Protector->RundownRef);
     return STATUS_SUCCESS;
 }
+
+// ============================================================================
+// TAMPER CALLBACK REGISTRATION
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -888,9 +1020,6 @@ CpRegisterTamperCallback(
     _In_ CP_TAMPER_CALLBACK Callback,
     _In_opt_ PVOID Context
     )
-/**
- * @brief Register callback for tamper notifications.
- */
 {
     PAGED_CODE();
 
@@ -898,11 +1027,26 @@ CpRegisterTamperCallback(
         return STATUS_INVALID_PARAMETER;
     }
 
-    Protector->TamperCallback = Callback;
-    Protector->CallbackContext = Context;
+    if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
 
+    //
+    // Write callback + context under exclusive lock so
+    // CppNotifyTamper (reading under shared) sees consistent state.
+    //
+    CppAcquireLockExclusive(&Protector->CallbackLock);
+    Protector->TamperCallback = Callback;
+    Protector->TamperContext = Context;
+    CppReleaseLockExclusive(&Protector->CallbackLock);
+
+    ExReleaseRundownProtection(&Protector->RundownRef);
     return STATUS_SUCCESS;
 }
+
+// ============================================================================
+// PERIODIC VERIFICATION
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -910,51 +1054,71 @@ CpEnablePeriodicVerify(
     _In_ PCP_PROTECTOR Protector,
     _In_ ULONG IntervalMs
     )
-/**
- * @brief Enable periodic integrity verification.
- */
 {
-    PCP_PROTECTOR_INTERNAL protector;
-    LARGE_INTEGER dueTime;
-
     PAGED_CODE();
 
     if (Protector == NULL || !Protector->Initialized) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (IntervalMs < CP_MIN_VERIFY_INTERVAL_MS || IntervalMs > CP_MAX_VERIFY_INTERVAL_MS) {
+    if (IntervalMs < CP_MIN_VERIFY_INTERVAL_MS ||
+        IntervalMs > CP_MAX_VERIFY_INTERVAL_MS) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    protector = CONTAINING_RECORD(Protector, CP_PROTECTOR_INTERNAL, Public);
+    if (Protector->VerifyWorkItem == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
 
     //
-    // Cancel existing timer if active
+    // Cancel existing timer if active.
     //
-    if (protector->TimerActive) {
+    if (InterlockedExchange(&Protector->TimerActive, FALSE)) {
         KeCancelTimer(&Protector->VerifyTimer);
-        protector->TimerActive = FALSE;
     }
 
     Protector->VerifyIntervalMs = IntervalMs;
-    Protector->PeriodicEnabled = TRUE;
+    InterlockedExchange(&Protector->PeriodicEnabled, TRUE);
 
-    //
-    // Start timer
-    //
-    dueTime.QuadPart = -((LONGLONG)IntervalMs * 10000);
-    KeSetTimerEx(
-        &Protector->VerifyTimer,
-        dueTime,
-        IntervalMs,
-        &Protector->VerifyDpc
-    );
+    CppArmTimer(Protector);
 
-    protector->TimerActive = TRUE;
-
+    ExReleaseRundownProtection(&Protector->RundownRef);
     return STATUS_SUCCESS;
 }
+
+_Use_decl_annotations_
+NTSTATUS
+CpDisablePeriodicVerify(
+    _In_ PCP_PROTECTOR Protector
+    )
+{
+    PAGED_CODE();
+
+    if (Protector == NULL || !Protector->Initialized) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+
+    InterlockedExchange(&Protector->PeriodicEnabled, FALSE);
+
+    if (InterlockedExchange(&Protector->TimerActive, FALSE)) {
+        KeCancelTimer(&Protector->VerifyTimer);
+    }
+
+    ExReleaseRundownProtection(&Protector->RundownRef);
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// FULL VERIFICATION
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -962,18 +1126,19 @@ CpVerifyAll(
     _In_ PCP_PROTECTOR Protector,
     _Out_ PULONG TamperedCount
     )
-/**
- * @brief Verify integrity of all protected callbacks.
- *
- * Computes current hash of each callback and compares
- * with stored hash to detect tampering.
- */
 {
-    PCP_PROTECTOR_INTERNAL protector;
-    PLIST_ENTRY entry;
-    PCP_CALLBACK_ENTRY_INTERNAL callbackEntry;
-    ULONG tamperedCount = 0;
-    LARGE_INTEGER currentTime;
+    PLIST_ENTRY listEntry;
+    PCP_CALLBACK_ENTRY_INTERNAL cbEntry;
+    ULONG tampered = 0;
+    LARGE_INTEGER now;
+    ULONG i;
+
+    //
+    // Fixed-size snapshot array on stack: 256 pointers = 2KB on x64.
+    // Safe for kernel stack (12-24KB typical).
+    //
+    PCP_CALLBACK_ENTRY_INTERNAL snapshot[CP_MAX_CALLBACKS];
+    ULONG snapshotCount = 0;
 
     PAGED_CODE();
 
@@ -983,284 +1148,169 @@ CpVerifyAll(
 
     *TamperedCount = 0;
 
-    protector = CONTAINING_RECORD(Protector, CP_PROTECTOR_INTERNAL, Public);
-
-    if (protector->ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
+    if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
-    KeQuerySystemTime(&currentTime);
+    KeQuerySystemTime(&now);
 
-    ExAcquirePushLockShared(&Protector->CallbackLock);
+    //
+    // Phase 1: Snapshot under shared lock
+    //
+    CppAcquireLockShared(&Protector->CallbackLock);
 
-    for (entry = Protector->CallbackList.Flink;
-         entry != &Protector->CallbackList;
-         entry = entry->Flink) {
+    for (listEntry = Protector->CallbackList.Flink;
+         listEntry != &Protector->CallbackList;
+         listEntry = listEntry->Flink) {
 
-        callbackEntry = CONTAINING_RECORD(entry, CP_CALLBACK_ENTRY_INTERNAL, Public.ListEntry);
+        cbEntry = CONTAINING_RECORD(listEntry, CP_CALLBACK_ENTRY_INTERNAL, ListEntry);
 
-        if (!callbackEntry->Public.IsProtected) {
+        if (!cbEntry->IsProtected) {
             continue;
         }
 
-        //
-        // Verify integrity
-        //
-        if (!CppVerifyCallbackIntegrity(callbackEntry)) {
-            //
-            // Tampering detected!
-            //
-            callbackEntry->Public.WasTampered = TRUE;
-            callbackEntry->TamperCount++;
-            tamperedCount++;
+        if (snapshotCount >= CP_MAX_CALLBACKS) {
+            break;
+        }
+
+        CppReferenceEntry(cbEntry);
+        snapshot[snapshotCount++] = cbEntry;
+    }
+
+    CppReleaseLockShared(&Protector->CallbackLock);
+
+    //
+    // Phase 2: Verify each entry outside the lock at PASSIVE_LEVEL.
+    // No data race — we hold a ref on each entry so it won't be freed.
+    // Verification-specific fields (WasTampered, TamperCount, etc.) are
+    // written exclusively by the verification path, which is single-threaded
+    // (VerifyPending gate ensures only one work item at a time).
+    //
+    for (i = 0; i < snapshotCount; i++) {
+        cbEntry = snapshot[i];
+
+        if (!CppVerifySingleEntry(cbEntry)) {
+            cbEntry->WasTampered = TRUE;
+            cbEntry->TamperCount++;
+            tampered++;
 
             InterlockedIncrement64(&Protector->Stats.TamperAttempts);
 
-            //
-            // Attempt restoration if enabled
-            //
-            if (protector->EnableRestoration && callbackEntry->HasBackup) {
-                if (CppRestoreCallback(callbackEntry)) {
+            if (Protector->EnableRestoration && cbEntry->HasBackup) {
+                if (CppRestoreCallback(cbEntry)) {
                     InterlockedIncrement64(&Protector->Stats.CallbacksRestored);
                 }
             }
 
-            //
-            // Notify tamper callback
-            //
-            CppNotifyTamper(protector, callbackEntry);
+            CppNotifyTamper(Protector, cbEntry);
         }
 
-        callbackEntry->LastVerifyTime = currentTime;
-        callbackEntry->VerifyCount++;
+        cbEntry->LastVerifyTime = now;
+        cbEntry->VerifyCount++;
+
+        CppDereferenceEntry(Protector, cbEntry);
     }
 
-    ExReleasePushLockShared(&Protector->CallbackLock);
+    InterlockedIncrement64(&Protector->Stats.VerificationsRun);
+    *TamperedCount = tampered;
 
-    *TamperedCount = tamperedCount;
-
+    ExReleaseRundownProtection(&Protector->RundownRef);
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// PRIVATE HELPER FUNCTIONS
+// STATISTICS
 // ============================================================================
 
-static NTSTATUS
-CppComputeCallbackHash(
-    _In_ PVOID Callback,
-    _Out_writes_bytes_(32) PUCHAR Hash
+_Use_decl_annotations_
+NTSTATUS
+CpGetStatistics(
+    _In_ PCP_PROTECTOR Protector,
+    _Out_ PCP_STATISTICS Stats
     )
-/**
- * @brief Compute SHA-256 hash of callback code region.
- */
 {
-    CP_SHA256_CONTEXT sha256;
-    UCHAR codeBuffer[CP_CALLBACK_HASH_SIZE];
-    SIZE_T bytesToHash = CP_CALLBACK_HASH_SIZE;
+    LARGE_INTEGER now;
 
     PAGED_CODE();
 
-    if (Callback == NULL || Hash == NULL) {
+    if (Protector == NULL || !Protector->Initialized || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Safely read callback code
-    //
-    __try {
-        if (!MmIsAddressValid(Callback)) {
-            return STATUS_INVALID_ADDRESS;
-        }
+    RtlZeroMemory(Stats, sizeof(CP_STATISTICS));
 
-        //
-        // Probe the address range
-        //
-        ProbeForRead(Callback, bytesToHash, 1);
+    Stats->CallbacksProtected = Protector->Stats.CallbacksProtected;
+    Stats->TamperAttempts = Protector->Stats.TamperAttempts;
+    Stats->CallbacksRestored = Protector->Stats.CallbacksRestored;
+    Stats->VerificationsRun = Protector->Stats.VerificationsRun;
+    Stats->CallbackCount = Protector->CallbackCount;
 
-        //
-        // Copy code to local buffer
-        //
-        RtlCopyMemory(codeBuffer, Callback, bytesToHash);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return GetExceptionCode();
-    }
-
-    //
-    // Compute SHA-256
-    //
-    CppSha256Init(&sha256);
-    CppSha256Update(&sha256, codeBuffer, bytesToHash);
-    CppSha256Final(&sha256, Hash);
-
-    //
-    // Clear sensitive data
-    //
-    RtlSecureZeroMemory(&sha256, sizeof(sha256));
-    RtlSecureZeroMemory(codeBuffer, sizeof(codeBuffer));
+    KeQuerySystemTime(&now);
+    Stats->UpTime.QuadPart = now.QuadPart - Protector->Stats.StartTime.QuadPart;
 
     return STATUS_SUCCESS;
 }
 
+// ============================================================================
+// PRIVATE — SINGLE ENTRY VERIFICATION
+// ============================================================================
+
+/**
+ * Verify integrity of one callback entry by recomputing its code hash.
+ * Returns TRUE if intact, FALSE if tampered or unreadable.
+ */
 static BOOLEAN
-CppVerifyCallbackIntegrity(
+CppVerifySingleEntry(
     _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
     )
-/**
- * @brief Verify integrity of a single callback.
- */
 {
     UCHAR currentHash[32];
     NTSTATUS status;
 
-    PAGED_CODE();
-
-    if (Entry == NULL || Entry->Public.Callback == NULL) {
+    if (Entry == NULL || Entry->Callback == NULL) {
         return FALSE;
     }
 
-    //
-    // Compute current hash
-    //
-    status = CppComputeCallbackHash(Entry->Public.Callback, currentHash);
+    status = CppComputeCodeHash(Entry->Callback, CP_CALLBACK_HASH_BYTES, currentHash);
     if (!NT_SUCCESS(status)) {
-        //
-        // If we can't compute hash, assume tampered
-        //
         return FALSE;
     }
 
-    //
-    // Compare with stored hash
-    //
-    if (RtlCompareMemory(currentHash, Entry->Public.CallbackHash, 32) != 32) {
-        return FALSE;
-    }
-
-    return TRUE;
+    return (RtlCompareMemory(currentHash, Entry->CodeHash, 32) == 32);
 }
 
-static ULONG
-CppHashRegistration(
-    _In_ PVOID Registration
-    )
+// ============================================================================
+// PRIVATE — CALLBACK RESTORATION
+// ============================================================================
+
 /**
- * @brief Hash function for registration pointer.
+ * Restore tampered callback code from backup via MDL-mapped write.
+ * Handles all MDL lifecycle correctly in all error paths.
  */
-{
-    ULONG_PTR ptr = (ULONG_PTR)Registration;
-    return (ULONG)((ptr >> 4) % 16);
-}
-
-static PCP_CALLBACK_ENTRY_INTERNAL
-CppFindEntryByRegistration(
-    _In_ PCP_PROTECTOR_INTERNAL Protector,
-    _In_ PVOID Registration
-    )
-/**
- * @brief Find callback entry by registration handle.
- */
-{
-    ULONG bucket;
-    PLIST_ENTRY entry;
-    PCP_CALLBACK_ENTRY_INTERNAL callbackEntry;
-
-    bucket = CppHashRegistration(Registration);
-
-    for (entry = Protector->EntryHash.Buckets[bucket].Flink;
-         entry != &Protector->EntryHash.Buckets[bucket];
-         entry = entry->Flink) {
-
-        callbackEntry = CONTAINING_RECORD(entry, CP_CALLBACK_ENTRY_INTERNAL, HashEntry);
-
-        if (callbackEntry->Public.Registration == Registration) {
-            return callbackEntry;
-        }
-    }
-
-    return NULL;
-}
-
-static VOID
-CppInsertEntryIntoHash(
-    _In_ PCP_PROTECTOR_INTERNAL Protector,
-    _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
-    )
-/**
- * @brief Insert entry into hash table.
- */
-{
-    ULONG bucket;
-
-    bucket = CppHashRegistration(Entry->Public.Registration);
-    Entry->HashBucket = bucket;
-
-    ExAcquirePushLockExclusive(&Protector->EntryHash.Lock);
-    InsertTailList(&Protector->EntryHash.Buckets[bucket], &Entry->HashEntry);
-    ExReleasePushLockExclusive(&Protector->EntryHash.Lock);
-}
-
-static VOID
-CppRemoveEntryFromHash(
-    _In_ PCP_PROTECTOR_INTERNAL Protector,
-    _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
-    )
-/**
- * @brief Remove entry from hash table.
- */
-{
-    ExAcquirePushLockExclusive(&Protector->EntryHash.Lock);
-    RemoveEntryList(&Entry->HashEntry);
-    ExReleasePushLockExclusive(&Protector->EntryHash.Lock);
-}
-
-static VOID
-CppNotifyTamper(
-    _In_ PCP_PROTECTOR_INTERNAL Protector,
-    _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
-    )
-/**
- * @brief Notify registered tamper callback.
- */
-{
-    CP_TAMPER_CALLBACK callback = Protector->Public.TamperCallback;
-    PVOID context = Protector->Public.CallbackContext;
-
-    if (callback != NULL) {
-        callback(
-            Entry->Public.Type,
-            Entry->Public.Registration,
-            context
-        );
-    }
-}
-
 static BOOLEAN
 CppRestoreCallback(
     _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
     )
-/**
- * @brief Attempt to restore tampered callback code.
- *
- * This is a best-effort restoration - may fail if memory
- * is read-only or page protections prevent writes.
- */
 {
     PMDL mdl = NULL;
-    PVOID mappedAddress = NULL;
+    PVOID mapped = NULL;
     BOOLEAN success = FALSE;
+    BOOLEAN locked = FALSE;
 
     if (!Entry->HasBackup || Entry->OriginalCodeSize == 0) {
         return FALSE;
     }
 
+    //
+    // Validate callback address is in kernel space.
+    //
+    if ((ULONG_PTR)Entry->Callback < (ULONG_PTR)MmUserProbeAddress) {
+        return FALSE;
+    }
+
     __try {
-        //
-        // Allocate MDL for callback region
-        //
         mdl = IoAllocateMdl(
-            Entry->Public.Callback,
+            Entry->Callback,
             (ULONG)Entry->OriginalCodeSize,
             FALSE,
             FALSE,
@@ -1271,21 +1321,16 @@ CppRestoreCallback(
             return FALSE;
         }
 
-        //
-        // Lock pages
-        //
         __try {
             MmProbeAndLockPages(mdl, KernelMode, IoModifyAccess);
+            locked = TRUE;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             IoFreeMdl(mdl);
             return FALSE;
         }
 
-        //
-        // Map with write access
-        //
-        mappedAddress = MmMapLockedPagesSpecifyCache(
+        mapped = MmMapLockedPagesSpecifyCache(
             mdl,
             KernelMode,
             MmCached,
@@ -1294,27 +1339,41 @@ CppRestoreCallback(
             NormalPagePriority
         );
 
-        if (mappedAddress != NULL) {
-            //
-            // Restore original code
-            //
-            RtlCopyMemory(mappedAddress, Entry->OriginalCode, Entry->OriginalCodeSize);
+        if (mapped != NULL) {
+            RtlCopyMemory(mapped, Entry->OriginalCode, Entry->OriginalCodeSize);
+            MmUnmapLockedPages(mapped, mdl);
+            mapped = NULL;
 
             //
-            // Recompute hash
+            // Recompute hash from the actual callback address so
+            // future verifications use the restored code's hash.
             //
-            CppComputeCallbackHash(Entry->Public.Callback, Entry->Public.CallbackHash);
+            CppComputeCodeHash(
+                Entry->Callback,
+                CP_CALLBACK_HASH_BYTES,
+                Entry->CodeHash
+            );
 
-            Entry->Public.WasTampered = FALSE;
+            Entry->WasTampered = FALSE;
             success = TRUE;
-
-            MmUnmapLockedPages(mappedAddress, mdl);
         }
 
-        MmUnlockPages(mdl);
+        if (locked) {
+            MmUnlockPages(mdl);
+        }
         IoFreeMdl(mdl);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
+        //
+        // Clean up MDL state on exception.
+        // mapped was set to NULL after unmap, so no double-unmap.
+        //
+        if (mapped != NULL && mdl != NULL) {
+            MmUnmapLockedPages(mapped, mdl);
+        }
+        if (locked && mdl != NULL) {
+            MmUnlockPages(mdl);
+        }
         if (mdl != NULL) {
             IoFreeMdl(mdl);
         }
@@ -1324,36 +1383,69 @@ CppRestoreCallback(
     return success;
 }
 
-static PCSTR
-CppGetCallbackTypeName(
-    _In_ CP_CALLBACK_TYPE Type
-    )
+// ============================================================================
+// PRIVATE — TAMPER NOTIFICATION
+// ============================================================================
+
 /**
- * @brief Get human-readable name for callback type.
+ * Invoke the registered tamper callback. Always at PASSIVE_LEVEL.
+ * Reads callback pointer under shared lock for consistency.
  */
+static VOID
+CppNotifyTamper(
+    _In_ PCP_PROTECTOR Protector,
+    _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
+    )
 {
-    switch (Type) {
-        case CpCallback_Process:
-            return "Process";
-        case CpCallback_Thread:
-            return "Thread";
-        case CpCallback_Image:
-            return "Image";
-        case CpCallback_Registry:
-            return "Registry";
-        case CpCallback_Object:
-            return "Object";
-        case CpCallback_Minifilter:
-            return "Minifilter";
-        case CpCallback_WFP:
-            return "WFP";
-        case CpCallback_ETW:
-            return "ETW";
-        default:
-            return "Unknown";
+    CP_TAMPER_CALLBACK callback;
+    PVOID context;
+
+    //
+    // Read callback + context under shared lock to get a consistent
+    // snapshot (CpRegisterTamperCallback writes under exclusive).
+    //
+    CppAcquireLockShared(&Protector->CallbackLock);
+    callback = Protector->TamperCallback;
+    context = Protector->TamperContext;
+    CppReleaseLockShared(&Protector->CallbackLock);
+
+    if (callback != NULL) {
+        callback(Entry->Type, Entry->Registration, context);
     }
 }
 
+// ============================================================================
+// PRIVATE — TIMER / DPC / WORK ITEM
+// ============================================================================
+
+static VOID
+CppArmTimer(
+    _In_ PCP_PROTECTOR Protector
+    )
+{
+    LARGE_INTEGER dueTime;
+
+    if (Protector->VerifyIntervalMs == 0) {
+        return;
+    }
+
+    dueTime.QuadPart = -((LONGLONG)Protector->VerifyIntervalMs * 10000);
+
+    KeSetTimerEx(
+        &Protector->VerifyTimer,
+        dueTime,
+        Protector->VerifyIntervalMs,
+        &Protector->VerifyDpc
+    );
+
+    InterlockedExchange(&Protector->TimerActive, TRUE);
+}
+
+/**
+ * Timer DPC — runs at DISPATCH_LEVEL.
+ * Does ZERO lock acquisition. Only queues a work item for PASSIVE_LEVEL
+ * verification. InterlockedCompareExchange prevents stacking.
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 CppVerifyTimerDpc(
@@ -1362,104 +1454,65 @@ CppVerifyTimerDpc(
     _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2
     )
-/**
- * @brief DPC callback for periodic verification.
- *
- * Performs lightweight verification at DISPATCH_LEVEL.
- * For full verification, queues a work item.
- */
 {
-    PCP_PROTECTOR_INTERNAL protector = (PCP_PROTECTOR_INTERNAL)DeferredContext;
-    PLIST_ENTRY entry;
-    PCP_CALLBACK_ENTRY_INTERNAL callbackEntry;
-    ULONG tamperedCount = 0;
+    PCP_PROTECTOR prot = (PCP_PROTECTOR)DeferredContext;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (protector == NULL || protector->ShuttingDown) {
+    if (prot == NULL || !prot->Initialized || !prot->PeriodicEnabled) {
+        return;
+    }
+
+    if (prot->VerifyWorkItem == NULL) {
         return;
     }
 
     //
-    // Quick integrity check at DISPATCH_LEVEL
-    // We can read callback code but should be brief
+    // Gate: only one work item in flight at a time.
     //
-    ExAcquirePushLockShared(&protector->Public.CallbackLock);
-
-    for (entry = protector->Public.CallbackList.Flink;
-         entry != &protector->Public.CallbackList;
-         entry = entry->Flink) {
-
-        callbackEntry = CONTAINING_RECORD(entry, CP_CALLBACK_ENTRY_INTERNAL, Public.ListEntry);
-
-        if (!callbackEntry->Public.IsProtected) {
-            continue;
-        }
-
+    if (InterlockedCompareExchange(&prot->VerifyPending, 1, 0) == 0) {
         //
-        // Lightweight check - just verify address is valid
+        // Clear the completion event so CpShutdown can wait on it.
         //
-        if (!MmIsAddressValid(callbackEntry->Public.Callback)) {
-            //
-            // Callback address became invalid - major tampering
-            //
-            callbackEntry->Public.WasTampered = TRUE;
-            tamperedCount++;
-            InterlockedIncrement64(&protector->Public.Stats.TamperAttempts);
+        KeClearEvent(&prot->VerifyComplete);
 
-            //
-            // Notify immediately
-            //
-            CppNotifyTamper(protector, callbackEntry);
-        }
-    }
-
-    ExReleasePushLockShared(&protector->Public.CallbackLock);
-
-    //
-    // If tampering detected, schedule full verification work item
-    //
-    if (tamperedCount > 0 && protector->VerifyWorkItem != NULL) {
-        if (InterlockedCompareExchange(&protector->VerifyPending, 1, 0) == 0) {
-            IoQueueWorkItem(
-                protector->VerifyWorkItem,
-                CppVerifyWorkItemRoutine,
-                DelayedWorkQueue,
-                protector
-            );
-        }
+        IoQueueWorkItem(
+            prot->VerifyWorkItem,
+            CppVerifyWorkItemRoutine,
+            DelayedWorkQueue,
+            prot
+        );
     }
 }
 
+/**
+ * Work item — runs at PASSIVE_LEVEL. Performs full SHA-256 verification.
+ */
 static VOID
 CppVerifyWorkItemRoutine(
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_opt_ PVOID Context
     )
-/**
- * @brief Work item for full verification at PASSIVE_LEVEL.
- */
 {
-    PCP_PROTECTOR_INTERNAL protector = (PCP_PROTECTOR_INTERNAL)Context;
+    PCP_PROTECTOR prot = (PCP_PROTECTOR)Context;
     ULONG tamperedCount = 0;
 
     UNREFERENCED_PARAMETER(DeviceObject);
 
-    PAGED_CODE();
-
-    if (protector == NULL || protector->ShuttingDown) {
-        return;
+    if (prot == NULL || !prot->Initialized) {
+        goto Done;
     }
 
-    //
-    // Perform full verification
-    //
-    CpVerifyAll(&protector->Public, &tamperedCount);
+    CpVerifyAll(prot, &tamperedCount);
 
+Done:
     //
-    // Clear pending flag
+    // Clear pending flag and signal completion event.
+    // Order matters: clear pending BEFORE signaling so that
+    // CpShutdown sees both cleared.
     //
-    InterlockedExchange(&protector->VerifyPending, 0);
+    InterlockedExchange(&prot->VerifyPending, 0);
+    KeSetEvent(&prot->VerifyComplete, IO_NO_INCREMENT, FALSE);
 }
