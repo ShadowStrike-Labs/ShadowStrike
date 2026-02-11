@@ -1,32 +1,28 @@
 /**
  * ============================================================================
- * ShadowStrike NGAV - ENTERPRISE WPP TRACING CONFIGURATION
+ * ShadowStrike NGAV - WPP TRACING RUNTIME CONFIGURATION
  * ============================================================================
  *
  * @file WppConfig.h
- * @brief Enterprise-grade WPP (Windows Software Trace Preprocessor) configuration.
+ * @brief Runtime configuration types, constants, and API for WPP tracing.
  *
- * Provides CrowdStrike Falcon-level tracing infrastructure with:
- * - Custom WPP type definitions for security-specific data types
- * - Extended trace levels for granular logging control
- * - Custom trace formatters for IP addresses, GUIDs, hashes, etc.
- * - Conditional compilation for debug/release builds
- * - Performance-optimized trace macros
- * - IRQL-safe tracing primitives
- * - Structured logging with correlation IDs
- * - Runtime trace level management
+ * This header provides:
+ * - Trace level and flag constants
+ * - Runtime configuration structures (WPP_TRACE_CONFIG, WPP_TRACE_CONTEXT)
+ * - Component identifiers
+ * - Initialization / shutdown API
+ * - Runtime configuration API (levels, flags, rate limiting)
+ * - Correlation ID and trace context API
+ * - Statistics API
+ * - Convenience macros for common trace patterns
  *
- * WPP Integration:
- * - Control GUID: {D7A3F6C2-9E4B-4D1A-8F3E-2B1C0D9E8F7A}
- * - Use tracelog.exe or traceview.exe to capture traces
- * - PDB files required for trace message formatting
+ * WPP preprocessor directives (control GUIDs, WPP_DEFINE_BIT,
+ * FUNC definitions, CUSTOM_TYPE) belong in Trace.h — not here.
  *
- * MITRE ATT&CK Coverage:
- * - T1070: Indicator Removal (audit trail for forensics)
- * - T1562: Impair Defenses (tamper detection logging)
+ * Implementation is in Trace.c (sole implementation file).
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -40,271 +36,144 @@
 extern "C" {
 #endif
 
-#include <evntrace.h>
+#include <ntddk.h>
 
 // ============================================================================
-// WPP CONTROL AND COMPATIBILITY
+// TRACE LEVELS — Extended beyond standard WPP levels
 // ============================================================================
 
-/**
- * @brief Enable WPP compatibility mode for mixed environments
- */
-#ifndef WPP_COMPATIBILITY_MODE
-#define WPP_COMPATIBILITY_MODE
+#ifndef TRACE_LEVEL_NONE
+#define TRACE_LEVEL_NONE        0   ///< Tracing disabled
+#endif
+#ifndef TRACE_LEVEL_CRITICAL
+#define TRACE_LEVEL_CRITICAL    1   ///< Critical errors causing shutdown
+#endif
+#ifndef TRACE_LEVEL_ERROR
+#define TRACE_LEVEL_ERROR       2   ///< Errors requiring attention
+#endif
+#ifndef TRACE_LEVEL_WARNING
+#define TRACE_LEVEL_WARNING     3   ///< Warnings
+#endif
+#ifndef TRACE_LEVEL_INFORMATION
+#define TRACE_LEVEL_INFORMATION 4   ///< General informational messages
+#endif
+#ifndef TRACE_LEVEL_VERBOSE
+#define TRACE_LEVEL_VERBOSE     5   ///< Detailed diagnostic information
 #endif
 
-/**
- * @brief Check for NULL strings in trace arguments
- */
-#define WPP_CHECK_FOR_NULL_STRING
-
-/**
- * @brief Enable kernel mode WPP
- */
-#define WPP_KERNEL_MODE
+/// Extended levels (6–10) for security/EDR use.
+#define TRACE_LEVEL_SECURITY    6   ///< Security-relevant events
+#define TRACE_LEVEL_AUDIT       7   ///< Audit trail events
+#define TRACE_LEVEL_DEBUG       8   ///< Debug-only messages
+#define TRACE_LEVEL_PERF        9   ///< Performance measurements
+#define TRACE_LEVEL_RESERVED    10  ///< Maximum valid level
 
 // ============================================================================
-// TRACE LEVELS - Extended beyond standard WPP levels
+// TRACE FLAGS — Component-specific filtering
 // ============================================================================
 
-/**
- * @brief Standard WPP trace levels
- */
-#define TRACE_LEVEL_NONE        0   // Tracing disabled
-#define TRACE_LEVEL_CRITICAL    1   // Critical errors causing shutdown
-#define TRACE_LEVEL_ERROR       2   // Errors requiring attention
-#define TRACE_LEVEL_WARNING     3   // Warnings that may indicate problems
-#define TRACE_LEVEL_INFORMATION 4   // General informational messages
-#define TRACE_LEVEL_VERBOSE     5   // Detailed diagnostic information
+/// Core component flags (bits 0–8 match Trace.h WPP_DEFINE_BIT order).
+#define TRACE_FLAG_GENERAL      0x00000001
+#define TRACE_FLAG_FILTER       0x00000002
+#define TRACE_FLAG_SCAN         0x00000004
+#define TRACE_FLAG_COMM         0x00000008
+#define TRACE_FLAG_PROCESS      0x00000010
+#define TRACE_FLAG_REGISTRY     0x00000020
+#define TRACE_FLAG_NETWORK      0x00000040
+#define TRACE_FLAG_SELFPROT     0x00000080
+#define TRACE_FLAG_CACHE        0x00000100
 
-/**
- * @brief Extended trace levels for security operations
- */
-#define TRACE_LEVEL_SECURITY    6   // Security-relevant events
-#define TRACE_LEVEL_AUDIT       7   // Audit trail events
-#define TRACE_LEVEL_DEBUG       8   // Debug-only messages
-#define TRACE_LEVEL_PERF        9   // Performance measurements
-#define TRACE_LEVEL_RESERVED    10  // Reserved for future use
+/// Extended flags (bits 9–19).
+#define TRACE_FLAG_MEMORY       0x00000200
+#define TRACE_FLAG_THREAD       0x00000400
+#define TRACE_FLAG_IMAGE        0x00000800
+#define TRACE_FLAG_BEHAVIOR     0x00001000
+#define TRACE_FLAG_ETW          0x00002000
+#define TRACE_FLAG_CRYPTO       0x00004000
+#define TRACE_FLAG_SYNC         0x00008000
+#define TRACE_FLAG_PERF         0x00010000
+#define TRACE_FLAG_INIT         0x00020000
+#define TRACE_FLAG_IOCTL        0x00040000
+#define TRACE_FLAG_THREAT       0x00080000
 
-// ============================================================================
-// TRACE FLAGS - Component-specific filtering
-// ============================================================================
-
-/**
- * @brief Trace flag definitions (must match Trace.h WPP_DEFINE_BIT order)
- */
-#define TRACE_FLAG_GENERAL      0x00000001  // General driver operations
-#define TRACE_FLAG_FILTER       0x00000002  // Minifilter operations
-#define TRACE_FLAG_SCAN         0x00000004  // File scanning
-#define TRACE_FLAG_COMM         0x00000008  // User-mode communication
-#define TRACE_FLAG_PROCESS      0x00000010  // Process monitoring
-#define TRACE_FLAG_REGISTRY     0x00000020  // Registry monitoring
-#define TRACE_FLAG_NETWORK      0x00000040  // Network monitoring
-#define TRACE_FLAG_SELFPROT     0x00000080  // Self-protection
-#define TRACE_FLAG_CACHE        0x00000100  // Cache operations
-
-/**
- * @brief Extended trace flags
- */
-#define TRACE_FLAG_MEMORY       0x00000200  // Memory operations
-#define TRACE_FLAG_THREAD       0x00000400  // Thread operations
-#define TRACE_FLAG_IMAGE        0x00000800  // Image load operations
-#define TRACE_FLAG_BEHAVIOR     0x00001000  // Behavioral analysis
-#define TRACE_FLAG_ETW          0x00002000  // ETW provider
-#define TRACE_FLAG_CRYPTO       0x00004000  // Cryptographic operations
-#define TRACE_FLAG_SYNC         0x00008000  // Synchronization primitives
-#define TRACE_FLAG_PERF         0x00010000  // Performance tracing
-#define TRACE_FLAG_INIT         0x00020000  // Initialization/shutdown
-#define TRACE_FLAG_IOCTL        0x00040000  // IOCTL handling
-#define TRACE_FLAG_THREAT       0x00080000  // Threat detection events
-
-/**
- * @brief Composite trace flags
- */
-#define TRACE_FLAG_ALL          0xFFFFFFFF  // All flags enabled
+/// Composite masks.
+#define TRACE_FLAG_ALL          0xFFFFFFFF
 #define TRACE_FLAG_SECURITY_ALL (TRACE_FLAG_SELFPROT | TRACE_FLAG_BEHAVIOR | TRACE_FLAG_THREAT)
-#define TRACE_FLAG_MONITOR_ALL  (TRACE_FLAG_PROCESS | TRACE_FLAG_REGISTRY | TRACE_FLAG_NETWORK | TRACE_FLAG_THREAD | TRACE_FLAG_IMAGE)
+#define TRACE_FLAG_MONITOR_ALL  (TRACE_FLAG_PROCESS | TRACE_FLAG_REGISTRY | TRACE_FLAG_NETWORK | \
+                                 TRACE_FLAG_THREAD | TRACE_FLAG_IMAGE)
 
 // ============================================================================
 // POOL TAGS
 // ============================================================================
 
-#define WPP_POOL_TAG_TRACE      'rTsS'  // SsTr - Trace buffer
-#define WPP_POOL_TAG_FORMAT     'fTsS'  // SsTf - Format string
-#define WPP_POOL_TAG_CONTEXT    'cTsS'  // SsTc - Trace context
+#define WPP_POOL_TAG_TRACE      'rTsS'  ///< SsTr — Trace buffer
+#define WPP_POOL_TAG_FORMAT     'fTsS'  ///< SsTf — Format string
+#define WPP_POOL_TAG_CONTEXT    'cTsS'  ///< SsTc — Trace context
 
 // ============================================================================
-// CUSTOM TYPE DEFINITIONS FOR WPP
+// RUNTIME CONFIGURATION STRUCTURES
 // ============================================================================
 
 /**
- * @brief Custom WPP types for security-specific data
+ * @brief Runtime trace configuration.
  *
- * These extend WPP's built-in types with security-focused formatters.
- * Use these in trace format strings: %!IPADDR!, %!HASH!, etc.
- */
-
-//
-// begin_wpp config
-//
-// CUSTOM_TYPE(IPADDR, ItemIPAddr);
-// CUSTOM_TYPE(IPV6ADDR, ItemIPV6Addr);
-// CUSTOM_TYPE(MACADDR, ItemMACAddr);
-// CUSTOM_TYPE(GUID, ItemGUID);
-// CUSTOM_TYPE(HASH, ItemHexDump);
-// CUSTOM_TYPE(NTSTATUS, ItemNTSTATUS);
-// CUSTOM_TYPE(HRESULT, ItemHRESULT);
-// CUSTOM_TYPE(IRQL, ItemIRQL);
-// CUSTOM_TYPE(BOOLEAN, ItemBoolean);
-// CUSTOM_TYPE(POINTER, ItemPointer);
-// CUSTOM_TYPE(USTR, ItemWString);
-// CUSTOM_TYPE(ASTR, ItemString);
-// CUSTOM_TYPE(HEXDUMP, ItemHexDump);
-// CUSTOM_TYPE(FILETIME, ItemFileTime);
-// CUSTOM_TYPE(TIMESTAMP, ItemTimestamp);
-// CUSTOM_TYPE(SID, ItemSID);
-// CUSTOM_TYPE(PID, ItemULong);
-// CUSTOM_TYPE(TID, ItemULong);
-//
-// end_wpp
-//
-
-// ============================================================================
-// WPP FUNCTION DEFINITIONS
-// ============================================================================
-
-//
-// begin_wpp config
-//
-// FUNC TraceEvents(LEVEL, FLAGS, MSG, ...);
-// FUNC TraceError{LEVEL=TRACE_LEVEL_ERROR}(FLAGS, MSG, ...);
-// FUNC TraceWarning{LEVEL=TRACE_LEVEL_WARNING}(FLAGS, MSG, ...);
-// FUNC TraceInfo{LEVEL=TRACE_LEVEL_INFORMATION}(FLAGS, MSG, ...);
-// FUNC TraceVerbose{LEVEL=TRACE_LEVEL_VERBOSE}(FLAGS, MSG, ...);
-// FUNC TraceSecurity{LEVEL=TRACE_LEVEL_SECURITY}(FLAGS, MSG, ...);
-// FUNC TracePerf{LEVEL=TRACE_LEVEL_PERF}(FLAGS, MSG, ...);
-//
-// FUNC TraceEnter{LEVEL=TRACE_LEVEL_VERBOSE}(FLAGS, MSG, ...);
-// FUNC TraceExit{LEVEL=TRACE_LEVEL_VERBOSE}(FLAGS, MSG, ...);
-//
-// FUNC TraceFatal{LEVEL=TRACE_LEVEL_CRITICAL}(FLAGS, MSG, ...);
-//
-// USEPREFIX(TraceEvents, "%!STDPREFIX! [%!FUNC!] ");
-// USEPREFIX(TraceError, "%!STDPREFIX! [%!FUNC!] ERROR: ");
-// USEPREFIX(TraceWarning, "%!STDPREFIX! [%!FUNC!] WARNING: ");
-// USEPREFIX(TraceInfo, "%!STDPREFIX! [%!FUNC!] INFO: ");
-// USEPREFIX(TraceVerbose, "%!STDPREFIX! [%!FUNC!] VERBOSE: ");
-// USEPREFIX(TraceSecurity, "%!STDPREFIX! [%!FUNC!] SECURITY: ");
-// USEPREFIX(TracePerf, "%!STDPREFIX! [%!FUNC!] PERF: ");
-// USEPREFIX(TraceEnter, "%!STDPREFIX! [%!FUNC!] ENTER: ");
-// USEPREFIX(TraceExit, "%!STDPREFIX! [%!FUNC!] EXIT: ");
-// USEPREFIX(TraceFatal, "%!STDPREFIX! [%!FUNC!] FATAL: ");
-//
-// end_wpp
-//
-
-// ============================================================================
-// WPP CONDITIONAL MACROS
-// ============================================================================
-
-/**
- * @brief Level and flags condition macro
- */
-#define WPP_LEVEL_FLAGS_LOGGER(level, flags) \
-    WPP_LEVEL_LOGGER(flags)
-
-#define WPP_LEVEL_FLAGS_ENABLED(level, flags) \
-    (WPP_LEVEL_ENABLED(flags) && WPP_CONTROL(WPP_BIT_ ## flags).Level >= level)
-
-// ============================================================================
-// RUNTIME TRACE CONFIGURATION
-// ============================================================================
-
-/**
- * @brief Runtime trace configuration structure
+ * All volatile fields are updated via InterlockedXxx.
+ * Non-volatile scalar fields (MinimumLevel, MaximumLevel, BOOLEAN enables)
+ * are naturally atomic on x86/x64 for aligned reads/writes; concurrent
+ * updates use InterlockedOr/InterlockedAnd for flag bitmasks.
  */
 typedef struct _WPP_TRACE_CONFIG {
-    //
-    // Enable flags
-    //
     BOOLEAN TracingEnabled;
     BOOLEAN DebugTracingEnabled;
     BOOLEAN PerfTracingEnabled;
     BOOLEAN SecurityTracingEnabled;
 
-    //
-    // Level configuration
-    //
-    UCHAR MinimumLevel;
-    UCHAR MaximumLevel;
-    UCHAR Reserved[2];
+    UCHAR   MinimumLevel;
+    UCHAR   MaximumLevel;
+    UCHAR   Reserved[2];
 
-    //
-    // Flag configuration
-    //
-    ULONG EnabledFlags;
-    ULONG DisabledFlags;
+    ULONG   EnabledFlags;           ///< Updated via InterlockedOr/And
+    ULONG   DisabledFlags;          ///< Updated via InterlockedOr/And
 
-    //
-    // Rate limiting
-    //
-    ULONG MaxTracesPerSecond;
-    ULONG CurrentSecondTraces;
-    LARGE_INTEGER CurrentSecondStart;
+    ULONG   MaxTracesPerSecond;     ///< 0 = unlimited
+    volatile LONG CurrentSecondTraces;
+    volatile LONG64 CurrentSecondStart; ///< In 100ns units (atomically swapped)
 
-    //
-    // Statistics
-    //
     volatile LONG64 TotalTraces;
     volatile LONG64 DroppedTraces;
     volatile LONG64 ErrorCount;
 
-    //
-    // Correlation
-    //
-    GUID SessionGuid;
+    GUID    SessionGuid;
     volatile LONG64 SequenceNumber;
-
 } WPP_TRACE_CONFIG, *PWPP_TRACE_CONFIG;
 
 /**
- * @brief Trace context for structured logging
+ * @brief Trace context for structured logging.
+ *
+ * Stack-allocated by the caller; filled by WppCreateTraceContext,
+ * completed by WppCompleteTraceContext.
  */
 typedef struct _WPP_TRACE_CONTEXT {
-    //
-    // Correlation ID for request tracking
-    //
     UINT64 CorrelationId;
     UINT64 ParentCorrelationId;
 
-    //
-    // Process/thread context
-    //
     UINT32 ProcessId;
     UINT32 ThreadId;
 
-    //
-    // Component identification
-    //
     UINT32 ComponentId;
     UINT32 SubComponentId;
 
-    //
-    // Timing
-    //
-    UINT64 StartTimestamp;
-    UINT64 EndTimestamp;
+    UINT64 StartTimestamp;          ///< 100ns system time
+    UINT64 EndTimestamp;            ///< 100ns system time (0 until completed)
 
-    //
-    // Optional custom data
-    //
-    PVOID CustomData;
-    ULONG CustomDataSize;
-
+    PVOID  CustomData;
+    ULONG  CustomDataSize;
 } WPP_TRACE_CONTEXT, *PWPP_TRACE_CONTEXT;
 
 /**
- * @brief Component IDs for tracing
+ * @brief Component identifiers for tracing.
+ *
+ * Array index into the component name table returned by WppGetComponentName.
  */
 typedef enum _WPP_COMPONENT_ID {
     WppComponent_Unknown = 0,
@@ -328,18 +197,22 @@ typedef enum _WPP_COMPONENT_ID {
 } WPP_COMPONENT_ID;
 
 // ============================================================================
-// INITIALIZATION API
+// LEVEL NAME COUNT — compile-time sync guard
+// ============================================================================
+
+#define WPP_LEVEL_NAME_COUNT    10  ///< Must match LevelNames[] in Trace.c
+
+// ============================================================================
+// INITIALIZATION / SHUTDOWN API
 // ============================================================================
 
 /**
  * @brief Initialize WPP tracing subsystem.
  *
- * Must be called during DriverEntry before any trace calls.
+ * Calls WPP_INIT_TRACING internally. Must be called during DriverEntry
+ * before any trace macros are invoked.
  *
- * @param DriverObject Driver object pointer.
- * @param RegistryPath Registry path for driver.
- *
- * @return STATUS_SUCCESS on success.
+ * NOTE: Placed in INIT section — do NOT call after DriverEntry returns.
  *
  * @irql PASSIVE_LEVEL
  */
@@ -353,9 +226,7 @@ WppTraceInitialize(
 /**
  * @brief Shutdown WPP tracing subsystem.
  *
- * Must be called during driver unload.
- *
- * @param DriverObject Driver object pointer.
+ * Calls WPP_CLEANUP internally. Must be called during DriverUnload.
  *
  * @irql PASSIVE_LEVEL
  */
@@ -367,9 +238,6 @@ WppTraceShutdown(
 
 /**
  * @brief Check if tracing is initialized and enabled.
- *
- * @return TRUE if tracing is ready.
- *
  * @irql <= DISPATCH_LEVEL
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -382,40 +250,21 @@ WppTraceIsEnabled(
 // RUNTIME CONFIGURATION API
 // ============================================================================
 
-/**
- * @brief Set minimum trace level.
- *
- * @param Level Minimum level to trace.
- *
- * @irql <= DISPATCH_LEVEL
- */
+/** @irql <= DISPATCH_LEVEL */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 WppSetMinimumLevel(
     _In_ UCHAR Level
     );
 
-/**
- * @brief Get current minimum trace level.
- *
- * @return Current minimum level.
- *
- * @irql <= DISPATCH_LEVEL
- */
+/** @irql <= DISPATCH_LEVEL */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 UCHAR
 WppGetMinimumLevel(
     VOID
     );
 
-/**
- * @brief Enable/disable specific trace flags.
- *
- * @param Flags Flags to modify.
- * @param Enable TRUE to enable, FALSE to disable.
- *
- * @irql <= DISPATCH_LEVEL
- */
+/** @irql <= DISPATCH_LEVEL */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 WppSetTraceFlags(
@@ -423,60 +272,53 @@ WppSetTraceFlags(
     _In_ BOOLEAN Enable
     );
 
-/**
- * @brief Get currently enabled trace flags.
- *
- * @return Current enabled flags.
- *
- * @irql <= DISPATCH_LEVEL
- */
+/** @irql <= DISPATCH_LEVEL */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 ULONG
 WppGetTraceFlags(
     VOID
     );
 
-/**
- * @brief Set trace rate limit.
- *
- * @param MaxTracesPerSecond Maximum traces per second (0 = unlimited).
- *
- * @irql <= DISPATCH_LEVEL
- */
+/** @irql <= DISPATCH_LEVEL */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 WppSetRateLimit(
     _In_ ULONG MaxTracesPerSecond
     );
 
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+WppSetDebugTracing(
+    _In_ BOOLEAN Enable
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+WppSetPerfTracing(
+    _In_ BOOLEAN Enable
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+WppSetSecurityTracing(
+    _In_ BOOLEAN Enable
+    );
+
 // ============================================================================
 // CORRELATION API
 // ============================================================================
 
-/**
- * @brief Generate a new correlation ID.
- *
- * @return New unique correlation ID.
- *
- * @irql <= DISPATCH_LEVEL
- */
+/** @irql <= DISPATCH_LEVEL */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 UINT64
 WppGenerateCorrelationId(
     VOID
     );
 
-/**
- * @brief Create a trace context.
- *
- * @param Context Receives initialized context.
- * @param ComponentId Source component.
- * @param ParentCorrelationId Parent correlation ID (0 for root).
- *
- * @return STATUS_SUCCESS on success.
- *
- * @irql <= DISPATCH_LEVEL
- */
+/** @irql <= DISPATCH_LEVEL */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 WppCreateTraceContext(
@@ -485,13 +327,7 @@ WppCreateTraceContext(
     _In_ UINT64 ParentCorrelationId
     );
 
-/**
- * @brief Complete a trace context (record end time).
- *
- * @param Context Context to complete.
- *
- * @irql <= DISPATCH_LEVEL
- */
+/** @irql <= DISPATCH_LEVEL */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 WppCompleteTraceContext(
@@ -502,17 +338,7 @@ WppCompleteTraceContext(
 // STATISTICS API
 // ============================================================================
 
-/**
- * @brief Get trace statistics.
- *
- * @param TotalTraces Receives total trace count.
- * @param DroppedTraces Receives dropped trace count.
- * @param ErrorCount Receives error count.
- *
- * @return STATUS_SUCCESS on success.
- *
- * @irql <= DISPATCH_LEVEL
- */
+/** @irql <= DISPATCH_LEVEL */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 WppGetStatistics(
@@ -521,11 +347,7 @@ WppGetStatistics(
     _Out_opt_ PUINT64 ErrorCount
     );
 
-/**
- * @brief Reset trace statistics.
- *
- * @irql <= DISPATCH_LEVEL
- */
+/** @irql <= DISPATCH_LEVEL */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 WppResetStatistics(
@@ -533,36 +355,172 @@ WppResetStatistics(
     );
 
 // ============================================================================
-// HELPER MACROS
+// EXTENDED API (previously in WppConfig.c, now in Trace.c)
 // ============================================================================
 
-/**
- * @brief Trace function entry with timing
- */
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+WppGetConfiguration(
+    _Out_ PWPP_TRACE_CONFIG Config
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+UINT64
+WppGetElapsedMicroseconds(
+    _In_ PWPP_TRACE_CONTEXT Context
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+WppFormatCorrelationId(
+    _In_ UINT64 CorrelationId,
+    _Out_writes_(BufferSize) PWCHAR Buffer,
+    _In_ SIZE_T BufferSize
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+WppShouldTrace(
+    _In_ UCHAR Level,
+    _In_ ULONG Flags
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+WppRecordError(
+    VOID
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+WppRecordTrace(
+    VOID
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+UINT64
+WppGetSequenceNumber(
+    VOID
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+WppGetSessionGuid(
+    _Out_ PGUID SessionGuid
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+WppIsDebugTracingEnabled(
+    VOID
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+WppIsPerfTracingEnabled(
+    VOID
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+WppIsSecurityTracingEnabled(
+    VOID
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+WppDumpConfiguration(
+    VOID
+    );
+
+// ============================================================================
+// FORMATTING HELPERS
+// ============================================================================
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG
+WppFormatStatus(
+    _In_ NTSTATUS Status,
+    _Out_writes_(BufferSize) PCHAR Buffer,
+    _In_ ULONG BufferSize
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG
+WppFormatGuid(
+    _In_ PGUID Guid,
+    _Out_writes_(BufferSize) PCHAR Buffer,
+    _In_ ULONG BufferSize
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG
+WppFormatHexDump(
+    _In_reads_bytes_(DataSize) PVOID Data,
+    _In_ ULONG DataSize,
+    _Out_writes_(BufferSize) PCHAR Buffer,
+    _In_ ULONG BufferSize
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG
+WppFormatTimestamp(
+    _In_ UINT64 Timestamp,
+    _Out_writes_(BufferSize) PCHAR Buffer,
+    _In_ ULONG BufferSize
+    );
+
+// ============================================================================
+// NAME LOOKUP (regular functions — avoid inline static array duplication)
+// ============================================================================
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PCSTR
+WppGetComponentName(
+    _In_ WPP_COMPONENT_ID ComponentId
+    );
+
+/** @irql <= DISPATCH_LEVEL */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PCSTR
+WppGetLevelName(
+    _In_ UCHAR Level
+    );
+
+// ============================================================================
+// CONVENIENCE MACROS
+// ============================================================================
+
+/** Trace function entry. */
 #define WPP_TRACE_ENTRY(flags) \
-    do { \
-        TraceEnter(flags, "-->"); \
-    } while (0)
+    do { TraceEnter(flags, "-->"); } while (0)
 
-/**
- * @brief Trace function exit with timing
- */
+/** Trace function exit. */
 #define WPP_TRACE_EXIT(flags) \
-    do { \
-        TraceExit(flags, "<--"); \
-    } while (0)
+    do { TraceExit(flags, "<--"); } while (0)
 
-/**
- * @brief Trace function exit with status
- */
+/** Trace function exit with NTSTATUS. */
 #define WPP_TRACE_EXIT_STATUS(flags, status) \
-    do { \
-        TraceExit(flags, "<-- Status=%!STATUS!", status); \
-    } while (0)
+    do { TraceExit(flags, "<-- Status=%!STATUS!", status); } while (0)
 
-/**
- * @brief Trace NTSTATUS error if not success
- */
+/** Trace NTSTATUS error if not success. */
 #define WPP_TRACE_STATUS(flags, status) \
     do { \
         if (!NT_SUCCESS(status)) { \
@@ -570,44 +528,46 @@ WppResetStatistics(
         } \
     } while (0)
 
-/**
- * @brief Trace with correlation ID
- */
+/** Trace with correlation ID. */
 #define WPP_TRACE_CORRELATED(level, flags, correlationId, msg, ...) \
     do { \
         TraceEvents(level, flags, "[CID:%I64u] " msg, correlationId, __VA_ARGS__); \
     } while (0)
 
-/**
- * @brief Trace security-relevant event
- */
+/** Trace security event. */
 #define WPP_TRACE_SECURITY_EVENT(flags, eventType, processId, msg, ...) \
     do { \
         TraceSecurity(flags, "[%s] PID:%u " msg, eventType, processId, __VA_ARGS__); \
     } while (0)
 
 /**
- * @brief Trace performance measurement
+ * @brief Performance measurement macros.
+ *
+ * Usage:
+ *   LARGE_INTEGER perfStart;
+ *   WPP_TRACE_PERF_START(&perfStart);
+ *   ... work ...
+ *   WPP_TRACE_PERF_END(TRACE_FLAG_PERF, &perfStart, "MyOperation");
+ *
+ * The context parameter must point to a LARGE_INTEGER (not WPP_TRACE_CONTEXT).
  */
-#define WPP_TRACE_PERF_START(context) \
+#define WPP_TRACE_PERF_START(pLargeInt) \
+    do { *(pLargeInt) = KeQueryPerformanceCounter(NULL); } while (0)
+
+#define WPP_TRACE_PERF_END(flags, pLargeInt, operation) \
     do { \
-        KeQueryPerformanceCounter(&(context)->StartTime); \
+        LARGE_INTEGER _wppEndTime, _wppFreq; \
+        UINT64 _wppElapsedUs; \
+        _wppEndTime = KeQueryPerformanceCounter(&_wppFreq); \
+        _wppElapsedUs = (((UINT64)(_wppEndTime.QuadPart - (pLargeInt)->QuadPart)) * 1000000) \
+                        / (UINT64)_wppFreq.QuadPart; \
+        TracePerf(flags, "%s completed in %I64u us", operation, _wppElapsedUs); \
     } while (0)
 
-#define WPP_TRACE_PERF_END(flags, context, operation) \
-    do { \
-        LARGE_INTEGER endTime, freq; \
-        endTime = KeQueryPerformanceCounter(&freq); \
-        UINT64 elapsedUs = ((endTime.QuadPart - (context)->StartTime.QuadPart) * 1000000) / freq.QuadPart; \
-        TracePerf(flags, "%s completed in %I64u us", operation, elapsedUs); \
-    } while (0)
-
-/**
- * @brief Conditional trace based on runtime config
- */
+/** Conditional trace based on runtime config. */
 #define WPP_TRACE_IF_ENABLED(level, flags, msg, ...) \
     do { \
-        if (WppTraceIsEnabled() && WppGetMinimumLevel() <= (level)) { \
+        if (WppShouldTrace((UCHAR)(level), (flags))) { \
             TraceEvents(level, flags, msg, __VA_ARGS__); \
         } \
     } while (0)
@@ -618,15 +578,9 @@ WppResetStatistics(
 
 #if DBG
 
-/**
- * @brief Debug-only trace
- */
 #define WPP_TRACE_DEBUG(flags, msg, ...) \
     TraceVerbose(flags, "[DEBUG] " msg, __VA_ARGS__)
 
-/**
- * @brief Assert with trace
- */
 #define WPP_ASSERT_TRACE(condition, flags, msg, ...) \
     do { \
         if (!(condition)) { \
@@ -637,82 +591,13 @@ WppResetStatistics(
 
 #else
 
-#define WPP_TRACE_DEBUG(flags, msg, ...) ((void)0)
+#define WPP_TRACE_DEBUG(flags, msg, ...)            ((void)0)
 #define WPP_ASSERT_TRACE(condition, flags, msg, ...) ((void)0)
 
-#endif // DBG
-
-// ============================================================================
-// INLINE UTILITIES
-// ============================================================================
-
-/**
- * @brief Get component name string for tracing.
- */
-FORCEINLINE
-PCSTR
-WppGetComponentName(
-    _In_ WPP_COMPONENT_ID ComponentId
-    )
-{
-    static const PCSTR ComponentNames[] = {
-        "Unknown",
-        "Core",
-        "Filter",
-        "Scan",
-        "Communication",
-        "Process",
-        "Registry",
-        "Network",
-        "SelfProtection",
-        "Cache",
-        "Memory",
-        "Thread",
-        "Image",
-        "Behavior",
-        "ETW",
-        "Crypto",
-        "Sync"
-    };
-
-    if (ComponentId >= WppComponent_Max) {
-        return "Invalid";
-    }
-
-    return ComponentNames[ComponentId];
-}
-
-/**
- * @brief Get trace level name string.
- */
-FORCEINLINE
-PCSTR
-WppGetLevelName(
-    _In_ UCHAR Level
-    )
-{
-    static const PCSTR LevelNames[] = {
-        "NONE",
-        "CRITICAL",
-        "ERROR",
-        "WARNING",
-        "INFO",
-        "VERBOSE",
-        "SECURITY",
-        "AUDIT",
-        "DEBUG",
-        "PERF"
-    };
-
-    if (Level >= ARRAYSIZE(LevelNames)) {
-        return "UNKNOWN";
-    }
-
-    return LevelNames[Level];
-}
+#endif /* DBG */
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // _SHADOWSTRIKE_WPP_CONFIG_H_
+#endif /* _SHADOWSTRIKE_WPP_CONFIG_H_ */

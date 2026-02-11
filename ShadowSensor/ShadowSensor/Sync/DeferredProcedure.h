@@ -1,16 +1,27 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: DeferredProcedure.h
-    
-    Purpose: DPC (Deferred Procedure Call) management for
-             high-priority deferred work at DISPATCH_LEVEL.
-             
+
+    Purpose:
+        Pre-allocated DPC (Deferred Procedure Call) object pool for
+        high-IRQL deferred work in the ShadowStrike kernel sensor.
+
     Architecture:
-    - DPC object pool to avoid allocation at high IRQL
-    - Threaded DPCs for longer operations
-    - DPC chaining for sequential work
-    - Per-CPU DPC affinity support
-    
+        - Fixed-size object pool allocated at PASSIVE_LEVEL (init time).
+        - Lock-free SLIST for O(1) alloc/free at any IRQL <= DISPATCH.
+        - Threaded DPCs for operations that may lower to PASSIVE_LEVEL.
+        - Per-processor targeting via KeSetTargetProcessorDpcEx (>64 CPU safe).
+        - ActiveCount + DrainEvent for deterministic shutdown without spin-wait.
+        - No SEH in DPC callbacks (undefined behavior at DISPATCH_LEVEL).
+        - No chaining (removed: fundamentally unsafe without ownership model).
+        - Inline context capped at 64 bytes; larger payloads use external API.
+
+    IRQL contract:
+        DpcInitialize   — PASSIVE_LEVEL (INIT section)
+        DpcShutdown     — PASSIVE_LEVEL (PAGE section)
+        DpcQueue*       — any IRQL <= DISPATCH_LEVEL
+        DpcGetStatistics— any IRQL <= DISPATCH_LEVEL
+
     Copyright (c) ShadowStrike Team
 --*/
 
@@ -22,40 +33,41 @@ extern "C" {
 
 #include <ntddk.h>
 
-//=============================================================================
+// ============================================================================
 // Pool Tags
-//=============================================================================
+// ============================================================================
 
-#define DPC_POOL_TAG_OBJECT     'OCPD'  // DPC - Object
-#define DPC_POOL_TAG_CONTEXT    'XCPD'  // DPC - Context
-#define DPC_POOL_TAG_CHAIN      'HCPD'  // DPC - Chain
+#define DPC_POOL_TAG    'cPDd'  // dDPc — DPC pool
 
-//=============================================================================
+// ============================================================================
 // Configuration Constants
-//=============================================================================
+// ============================================================================
 
-#define DPC_POOL_SIZE_DEFAULT       256     // Pre-allocated DPCs
+#define DPC_POOL_SIZE_DEFAULT       256
 #define DPC_POOL_SIZE_MIN           32
 #define DPC_POOL_SIZE_MAX           4096
-#define DPC_MAX_CONTEXT_SIZE        256     // Inline context size
-#define DPC_CHAIN_MAX_LENGTH        16      // Max DPCs in a chain
-#define DPC_THREADED_STACK_SIZE     (16 * 1024)  // 16 KB
 
-//=============================================================================
+/**
+ * Maximum inline context bytes stored inside DPC_OBJECT.
+ * Keeps sizeof(DPC_OBJECT) compact.  Callers needing more should
+ * use DpcQueueExternal with caller-managed lifetime.
+ */
+#define DPC_MAX_CONTEXT_SIZE        64
+
+// ============================================================================
 // DPC Types
-//=============================================================================
+// ============================================================================
 
 typedef enum _DPC_TYPE {
-    DpcType_Normal = 0,                 // Normal DPC
-    DpcType_Threaded,                   // Threaded DPC (can block)
-    DpcType_HighImportance,             // High importance (front of queue)
-    DpcType_MediumImportance,           // Medium importance
-    DpcType_LowImportance               // Low importance (back of queue)
+    DpcType_Normal = 0,             /**< Normal DPC, medium importance.       */
+    DpcType_Threaded,               /**< Threaded DPC — may lower to PASSIVE. */
+    DpcType_HighImportance,         /**< Queued at front of DPC queue.        */
+    DpcType_LowImportance           /**< Queued at back of DPC queue.         */
 } DPC_TYPE;
 
-//=============================================================================
+// ============================================================================
 // DPC State
-//=============================================================================
+// ============================================================================
 
 typedef enum _DPC_STATE {
     DpcState_Free = 0,
@@ -65,175 +77,169 @@ typedef enum _DPC_STATE {
     DpcState_Completed
 } DPC_STATE;
 
-//=============================================================================
+// ============================================================================
 // Callback Types
-//=============================================================================
+// ============================================================================
 
+/**
+ * DPC work callback.  Runs at DISPATCH_LEVEL (normal DPC) or
+ * PASSIVE/APC (threaded DPC).  Must not raise exceptions.
+ */
 typedef VOID (*DPC_CALLBACK)(
     _In_opt_ PVOID Context,
     _In_ ULONG ContextSize
     );
 
+/**
+ * Optional completion notification after DPC callback returns.
+ * Runs at the same IRQL as the DPC callback.
+ */
 typedef VOID (*DPC_COMPLETION_CALLBACK)(
     _In_ NTSTATUS Status,
-    _In_opt_ PVOID Context
+    _In_opt_ PVOID CompletionContext
     );
 
-//=============================================================================
-// DPC Object
-//=============================================================================
+// ============================================================================
+// DPC Object  (pool element)
+//
+// SLIST_ENTRY MUST be the first field so that the struct's natural
+// alignment (DECLSPEC_ALIGN) guarantees the 16-byte alignment
+// required by InterlockedPushEntrySList / InterlockedPopEntrySList
+// on x64 (CMPXCHG16B).
+// ============================================================================
 
-typedef struct _DPC_OBJECT {
-    //
-    // Kernel DPC
-    //
+typedef struct DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT) _DPC_OBJECT {
+
+    /** Free-list linkage — MUST be first for SLIST alignment. */
+    SLIST_ENTRY FreeListEntry;
+
+    /** Kernel DPC object. */
     KDPC Dpc;
-    
-    //
-    // Object identification
-    //
+
+    /** Per-object identifier (1-based, stable across reuse). */
     ULONG ObjectId;
+
     DPC_TYPE Type;
     volatile DPC_STATE State;
-    
-    //
-    // Callback
-    //
+
+    /** Work callback + optional completion. */
     DPC_CALLBACK Callback;
     DPC_COMPLETION_CALLBACK CompletionCallback;
-    
-    //
-    // Context (inline for small contexts)
-    //
+    PVOID CompletionContext;
+
+    /** Inline context for small payloads (<= DPC_MAX_CONTEXT_SIZE). */
     UCHAR InlineContext[DPC_MAX_CONTEXT_SIZE];
+
+    /** External context pointer — caller manages lifetime. */
     PVOID ExternalContext;
+
     ULONG ContextSize;
     BOOLEAN UseInlineContext;
-    
-    //
-    // Targeting
-    //
-    ULONG TargetProcessor;
+
+    /** Processor targeting (PROCESSOR_NUMBER for >64 CPU support). */
+    PROCESSOR_NUMBER TargetProcessor;
     BOOLEAN ProcessorTargeted;
-    
-    //
-    // Chaining
-    //
-    struct _DPC_OBJECT* NextInChain;
-    ULONG ChainIndex;
-    ULONG ChainLength;
-    PVOID ChainContext;
-    
-    //
-    // Statistics
-    //
+
+    /** Timestamps for diagnostics. */
     LARGE_INTEGER QueueTime;
     LARGE_INTEGER ExecuteTime;
     LARGE_INTEGER CompleteTime;
-    
-    //
-    // Reference counting
-    //
-    volatile LONG RefCount;
-    
-    //
-    // List linkage (for free pool)
-    //
-    SLIST_ENTRY FreeListEntry;
-    
+
 } DPC_OBJECT, *PDPC_OBJECT;
 
-//=============================================================================
+// ============================================================================
 // DPC Manager
-//=============================================================================
+// ============================================================================
 
-typedef struct _DPC_MANAGER {
-    //
-    // Initialization state
-    //
-    BOOLEAN Initialized;
-    
-    //
-    // Object pool (lock-free)
-    //
+typedef struct DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT) _DPC_MANAGER {
+
+    /** Set TRUE after successful init; cleared at start of shutdown. */
+    volatile LONG Initialized;
+
+    // ---- Lock-free object pool ----
+
     SLIST_HEADER FreePool;
     volatile LONG FreeCount;
     volatile LONG AllocatedCount;
     ULONG PoolSize;
-    
-    //
-    // Pool backing memory
-    //
+
+    /** Contiguous backing array — freed in DpcShutdown. */
     PDPC_OBJECT PoolMemory;
-    ULONG PoolMemorySize;
-    
-    //
-    // ID generation
-    //
-    volatile LONG NextObjectId;
-    
-    //
-    // Statistics
-    //
-    struct {
-        volatile LONG64 TotalQueued;
-        volatile LONG64 TotalExecuted;
-        volatile LONG64 TotalCancelled;
-        volatile LONG64 PoolExhausted;
-        volatile LONG64 ChainedDpcs;
-        LARGE_INTEGER StartTime;
-    } Stats;
-    
-    //
-    // Configuration
-    //
-    struct {
-        ULONG DefaultPoolSize;
-        BOOLEAN PreferThreadedDpc;
-        BOOLEAN EnableChaining;
-    } Config;
-    
+    SIZE_T PoolMemorySize;
+
+    // ---- Shutdown drain ----
+
+    /**
+     * Number of DPC callbacks currently in-flight.
+     * Incremented inside DPC routine, decremented in complete path.
+     * When it reaches 0 AND the manager is shutting down, DrainEvent
+     * is signaled so DpcShutdown can proceed safely.
+     */
+    volatile LONG ActiveCount;
+    KEVENT DrainEvent;
+
+    // ---- Statistics (individually atomic, not collectively) ----
+
+    volatile LONG64 TotalQueued;
+    volatile LONG64 TotalExecuted;
+    volatile LONG64 TotalCancelled;
+    volatile LONG64 PoolExhausted;
+    LARGE_INTEGER StartTime;
+
 } DPC_MANAGER, *PDPC_MANAGER;
 
-//=============================================================================
-// DPC Options
-//=============================================================================
+// ============================================================================
+// DPC Options  (passed to DpcQueue)
+// ============================================================================
 
 typedef struct _DPC_OPTIONS {
     DPC_TYPE Type;
-    ULONG TargetProcessor;              // Set to MAXULONG for any CPU
+    PROCESSOR_NUMBER TargetProcessor;   /**< Ignored unless Targeted is TRUE. */
+    BOOLEAN Targeted;                   /**< TRUE to pin DPC to a processor.  */
     DPC_COMPLETION_CALLBACK CompletionCallback;
     PVOID CompletionContext;
 } DPC_OPTIONS, *PDPC_OPTIONS;
 
-//=============================================================================
-// Public API - Initialization
-//=============================================================================
+// ============================================================================
+// Public API — Initialization
+// ============================================================================
 
-//
-// Initialize the DPC manager
-//
+/**
+ * Allocate and initialize a DPC manager with a pre-allocated object pool.
+ *
+ * @param Manager   Receives the new manager pointer.  Set to NULL on failure.
+ * @param PoolSize  Desired pool size (clamped to [DPC_POOL_SIZE_MIN, MAX]).
+ *                  Pass 0 for DPC_POOL_SIZE_DEFAULT.
+ * @return STATUS_SUCCESS or error.
+ *
+ * IRQL: PASSIVE_LEVEL (INIT section).
+ */
 NTSTATUS
 DpcInitialize(
     _Out_ PDPC_MANAGER* Manager,
     _In_ ULONG PoolSize
     );
 
-//
-// Shutdown the DPC manager
-//
+/**
+ * Drain all in-flight DPCs, flush system DPC queues, free resources.
+ * On return, *Manager is NULL and the pointer is invalid.
+ *
+ * IRQL: PASSIVE_LEVEL.
+ */
 VOID
 DpcShutdown(
-    _Inout_ PDPC_MANAGER Manager
+    _Inout_ PDPC_MANAGER* Manager
     );
 
-//=============================================================================
-// Public API - DPC Operations
-//=============================================================================
+// ============================================================================
+// Public API — DPC Queue Operations
+// ============================================================================
 
-//
-// Queue a DPC with inline context
-//
+/**
+ * Queue a DPC with an inline copy of the context buffer.
+ * ContextSize must be <= DPC_MAX_CONTEXT_SIZE.
+ * Safe to call at any IRQL <= DISPATCH_LEVEL.
+ */
 NTSTATUS
 DpcQueue(
     _In_ PDPC_MANAGER Manager,
@@ -243,32 +249,37 @@ DpcQueue(
     _In_opt_ PDPC_OPTIONS Options
     );
 
-//
-// Queue a DPC with external context (caller manages lifetime)
-//
+/**
+ * Queue a DPC with caller-managed external context.
+ * The caller must keep Context valid until the DPC completes.
+ * ContextSize is passed through to the callback for convenience.
+ */
 NTSTATUS
 DpcQueueExternal(
     _In_ PDPC_MANAGER Manager,
     _In_ DPC_CALLBACK Callback,
     _In_ PVOID Context,
+    _In_ ULONG ContextSize,
     _In_opt_ PDPC_OPTIONS Options
     );
 
-//
-// Queue a DPC targeted at specific processor
-//
+/**
+ * Queue a DPC targeted at a specific processor.
+ * ProcessorGroup/ProcessorNumber identify the logical CPU.
+ */
 NTSTATUS
 DpcQueueOnProcessor(
     _In_ PDPC_MANAGER Manager,
     _In_ DPC_CALLBACK Callback,
     _In_reads_bytes_opt_(ContextSize) PVOID Context,
     _In_ ULONG ContextSize,
-    _In_ ULONG ProcessorNumber
+    _In_ USHORT ProcessorGroup,
+    _In_ UCHAR ProcessorNumber
     );
 
-//
-// Queue a threaded DPC (can run at PASSIVE_LEVEL)
-//
+/**
+ * Queue a threaded DPC (may execute at PASSIVE_LEVEL).
+ */
 NTSTATUS
 DpcQueueThreaded(
     _In_ PDPC_MANAGER Manager,
@@ -277,45 +288,9 @@ DpcQueueThreaded(
     _In_ ULONG ContextSize
     );
 
-//=============================================================================
-// Public API - DPC Chaining
-//=============================================================================
-
-//
-// Create a chain of DPCs to execute sequentially
-//
-NTSTATUS
-DpcCreateChain(
-    _In_ PDPC_MANAGER Manager,
-    _In_reads_(Count) DPC_CALLBACK* Callbacks,
-    _In_reads_opt_(Count) PVOID* Contexts,
-    _In_reads_opt_(Count) ULONG* ContextSizes,
-    _In_ ULONG Count,
-    _In_opt_ DPC_COMPLETION_CALLBACK ChainCompletion,
-    _Out_opt_ PULONG ChainId
-    );
-
-//
-// Queue a chain
-//
-NTSTATUS
-DpcQueueChain(
-    _In_ PDPC_MANAGER Manager,
-    _In_ ULONG ChainId
-    );
-
-//
-// Cancel a chain
-//
-NTSTATUS
-DpcCancelChain(
-    _In_ PDPC_MANAGER Manager,
-    _In_ ULONG ChainId
-    );
-
-//=============================================================================
-// Public API - Statistics
-//=============================================================================
+// ============================================================================
+// Public API — Statistics
+// ============================================================================
 
 typedef struct _DPC_STATISTICS {
     ULONG PoolSize;
@@ -325,36 +300,18 @@ typedef struct _DPC_STATISTICS {
     ULONG64 TotalExecuted;
     ULONG64 TotalCancelled;
     ULONG64 PoolExhausted;
-    ULONG64 ChainedDpcs;
     LARGE_INTEGER UpTime;
 } DPC_STATISTICS, *PDPC_STATISTICS;
 
+/**
+ * Snapshot current statistics.  Not collectively atomic — individual
+ * counters are read atomically but the snapshot may be slightly skewed.
+ */
 NTSTATUS
 DpcGetStatistics(
     _In_ PDPC_MANAGER Manager,
     _Out_ PDPC_STATISTICS Stats
     );
-
-VOID
-DpcResetStatistics(
-    _Inout_ PDPC_MANAGER Manager
-    );
-
-//=============================================================================
-// Helper Macros
-//=============================================================================
-
-//
-// Quick queue macros
-//
-#define DpcQueueNormal(Manager, Callback, Context, Size) \
-    DpcQueue(Manager, Callback, Context, Size, NULL)
-
-#define DpcQueueHigh(Manager, Callback, Context, Size) \
-    do { \
-        DPC_OPTIONS _opts = { .Type = DpcType_HighImportance }; \
-        DpcQueue(Manager, Callback, Context, Size, &_opts); \
-    } while (0)
 
 #ifdef __cplusplus
 }

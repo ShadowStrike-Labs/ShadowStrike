@@ -7,31 +7,11 @@
 
     Architecture:
     - High-resolution timer support via KeSetCoalescableTimer
-    - Timer wheel for efficient deadline-miss detection
+    - Timer wheel for efficient O(1) timeout management
     - One-shot and periodic timers with reference counting
     - Timer coalescing for power efficiency on mobile endpoints
     - Thread-safe operations with proper IRQL management
-    - WorkItemCallback timers execute at PASSIVE_LEVEL via IoQueueWorkItem
     - Comprehensive statistics for performance monitoring
-
-    Reference Counting Model:
-      - Timer starts with RefCount=2: 1 for the TimerList, 1 for creation.
-      - TmpFindTimerById adds +1 (caller must TmpDereferenceTimer).
-      - TmCancel removes from TimerList (releases the list reference),
-        then releases the find reference. The creation reference is released
-        separately: if auto-start failed we call TmCancel internally, otherwise
-        the caller is responsible via explicit TmCancel.
-      - Auto-delete one-shot: TmpFireTimer releases both the list reference
-        and the creation reference (2 derefs). The DPC/WorkItem caller
-        still holds its own ref, so neither deref hits 0. The caller's
-        deref then hits 0 → TmpDestroyTimer frees the memory.
-      - TmpDestroyTimer is called when RefCount reaches 0.
-
-    Context Ownership:
-      - If Options->ContextSize > 0, the data at Options->Context is COPIED
-        into a driver-owned allocation. The timer frees it on destruction.
-      - If ContextSize == 0, Context is a caller-owned opaque pointer. The
-        caller must ensure it remains valid for the timer's lifetime.
 
     MITRE ATT&CK Coverage:
     - T1497: Virtualization/Sandbox Evasion (timing analysis)
@@ -44,7 +24,7 @@
 #include "../Utilities/MemoryUtils.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, TmInitialize)
+#pragma alloc_text(INIT, TmInitialize)
 #pragma alloc_text(PAGE, TmShutdown)
 #endif
 
@@ -53,7 +33,10 @@
 //=============================================================================
 
 #define TM_TIMER_SIGNATURE          'RMIT'  // 'TIMR' reversed
+#define TM_MANAGER_SIGNATURE        'RGMT'  // 'TMGR' reversed
+#define TM_INVALID_TIMER_ID         0
 #define TM_WHEEL_TICK_INTERVAL_MS   10      // 10ms wheel tick
+#define TM_MAX_DPC_TIME_US          50      // Max 50us in DPC before yielding
 
 //=============================================================================
 // Internal Structures
@@ -61,8 +44,7 @@
 
 typedef struct _TM_TIMER_INTERNAL {
     //
-    // Signature for debug validation (never used for control flow decisions
-    // after timer destruction — only checked while timer is referenced)
+    // Signature for validation
     //
     ULONG Signature;
 
@@ -77,7 +59,7 @@ typedef struct _TM_TIMER_INTERNAL {
     PTM_MANAGER Manager;
 
     //
-    // Work item for WorkItemCallback mode (pre-allocated at create time)
+    // Work item for WorkItemCallback mode
     //
     PIO_WORKITEM WorkItem;
 
@@ -87,10 +69,9 @@ typedef struct _TM_TIMER_INTERNAL {
     ULONG WheelSlotIndex;
 
     //
-    // Flags
+    // Deletion pending flag
     //
-    volatile LONG DeletionPending;      // LONG for interlocked ops
-    volatile LONG InWheelSlot;          // Track whether we're in the wheel
+    volatile BOOLEAN DeletionPending;
 
 } TM_TIMER_INTERNAL, *PTM_TIMER_INTERNAL;
 
@@ -167,48 +148,6 @@ TmpProcessWheelSlot(
     _In_ ULONG SlotIndex
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static NTSTATUS
-TmpStartTimerInternal(
-    _In_ PTM_MANAGER Manager,
-    _Inout_ PTM_TIMER_INTERNAL TimerInternal
-    );
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static VOID
-TmpStopTimerInternal(
-    _In_ PTM_MANAGER Manager,
-    _Inout_ PTM_TIMER_INTERNAL TimerInternal
-    );
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static ULONG
-TmpAllocateTimerId(
-    _In_ PTM_MANAGER Manager
-    );
-
-//=============================================================================
-// Helper: Generate timer ID that never returns 0
-//=============================================================================
-
-static
-_IRQL_requires_max_(DISPATCH_LEVEL)
-ULONG
-TmpAllocateTimerId(
-    _In_ PTM_MANAGER Manager
-    )
-{
-    LONG id;
-    do {
-        id = InterlockedIncrement(&Manager->NextTimerId);
-        if (id == 0) {
-            // Wrapped — skip 0 (invalid sentinel)
-            id = InterlockedIncrement(&Manager->NextTimerId);
-        }
-    } while (id == 0);
-    return (ULONG)id;
-}
-
 //=============================================================================
 // Initialization / Shutdown
 //=============================================================================
@@ -216,7 +155,6 @@ TmpAllocateTimerId(
 _Use_decl_annotations_
 NTSTATUS
 TmInitialize(
-    _In_opt_ PDEVICE_OBJECT DeviceObject,
     _Out_ PTM_MANAGER* Manager
     )
 /*++
@@ -224,14 +162,12 @@ TmInitialize(
 Routine Description:
 
     Initializes the timer manager subsystem. Allocates the manager structure,
-    initializes the timer wheel, and starts the wheel timer.
+    initializes the timer wheel, and starts the wheel timer for processing
+    timer expirations.
 
 Arguments:
 
-    DeviceObject - Device object for IoAllocateWorkItem (needed for
-                   TmFlag_WorkItemCallback). May be NULL if work items
-                   are not used.
-    Manager      - Receives pointer to initialized timer manager.
+    Manager - Receives pointer to initialized timer manager.
 
 Return Value:
 
@@ -244,7 +180,8 @@ IRQL:
 
 --*/
 {
-    PTM_MANAGER mgr = NULL;
+    PTM_MANAGER manager = NULL;
+    NTSTATUS status = STATUS_SUCCESS;
     ULONG i;
     LARGE_INTEGER dueTime;
 
@@ -260,81 +197,82 @@ IRQL:
     // Allocate the manager structure from non-paged pool
     // (required for DPC and spinlock operations)
     //
-    mgr = (PTM_MANAGER)ShadowStrikeAllocatePoolWithTag(
+    manager = (PTM_MANAGER)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(TM_MANAGER),
         TM_POOL_TAG_CONTEXT
         );
 
-    if (mgr == NULL) {
+    if (manager == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(mgr, sizeof(TM_MANAGER));
-
-    //
-    // Store device object for WorkItem support
-    //
-    mgr->DeviceObject = DeviceObject;
+    RtlZeroMemory(manager, sizeof(TM_MANAGER));
 
     //
     // Initialize the timer list
     //
-    InitializeListHead(&mgr->TimerList);
-    KeInitializeSpinLock(&mgr->TimerListLock);
-    mgr->TimerCount = 0;
+    InitializeListHead(&manager->TimerList);
+    KeInitializeSpinLock(&manager->TimerListLock);
+    manager->TimerCount = 0;
 
     //
     // Initialize timer wheel slots
     //
     for (i = 0; i < TM_WHEEL_SIZE; i++) {
-        InitializeListHead(&mgr->Wheel[i].TimerList);
-        KeInitializeSpinLock(&mgr->Wheel[i].Lock);
-        mgr->Wheel[i].TimerCount = 0;
+        InitializeListHead(&manager->Wheel[i].TimerList);
+        KeInitializeSpinLock(&manager->Wheel[i].Lock);
+        manager->Wheel[i].TimerCount = 0;
     }
 
-    mgr->CurrentSlot = 0;
+    manager->CurrentSlot = 0;
 
     //
     // Initialize wheel timer and DPC
     //
-    KeInitializeTimer(&mgr->WheelTimer);
-    KeInitializeDpc(&mgr->WheelDpc, TmpWheelDpcRoutine, mgr);
+    KeInitializeTimer(&manager->WheelTimer);
+    KeInitializeDpc(&manager->WheelDpc, TmpWheelDpcRoutine, manager);
 
     //
     // Initialize ID generation - start at 1 (0 is invalid)
     //
-    mgr->NextTimerId = 0; // First InterlockedIncrement yields 1
+    manager->NextTimerId = 1;
 
     //
     // Initialize statistics
     //
-    KeQuerySystemTimePrecise(&mgr->Stats.StartTime);
+    KeQuerySystemTimePrecise(&manager->Stats.StartTime);
+    manager->Stats.TimersCreated = 0;
+    manager->Stats.TimersFired = 0;
+    manager->Stats.TimersCancelled = 0;
+    manager->Stats.TimersMissed = 0;
+    manager->Stats.CoalescedTimers = 0;
 
     //
     // Set default configuration
     //
-    mgr->Config.DefaultToleranceMs = TM_DEFAULT_TOLERANCE_MS;
-    mgr->Config.EnableCoalescing = TRUE;
-    mgr->Config.EnableHighResolution = FALSE;
+    manager->Config.DefaultToleranceMs = TM_DEFAULT_TOLERANCE_MS;
+    manager->Config.EnableCoalescing = TRUE;
+    manager->Config.EnableHighResolution = FALSE;
+
+    //
+    // Mark as initialized before starting the wheel timer
+    //
+    manager->Initialized = TRUE;
+    manager->ShuttingDown = FALSE;
 
     //
     // Start the wheel timer - runs every TM_WHEEL_RESOLUTION_MS
     //
     dueTime.QuadPart = TM_MS_TO_RELATIVE(TM_WHEEL_RESOLUTION_MS);
     KeSetTimerEx(
-        &mgr->WheelTimer,
+        &manager->WheelTimer,
         dueTime,
         TM_WHEEL_RESOLUTION_MS,
-        &mgr->WheelDpc
+        &manager->WheelDpc
         );
 
-    //
-    // Mark as initialized LAST (after all setup is done)
-    //
-    InterlockedExchange(&mgr->Initialized, 1);
-
-    *Manager = mgr;
+    *Manager = manager;
 
     return STATUS_SUCCESS;
 }
@@ -356,6 +294,10 @@ Arguments:
 
     Manager - Timer manager to shutdown.
 
+Return Value:
+
+    None.
+
 IRQL:
 
     PASSIVE_LEVEL
@@ -366,31 +308,23 @@ IRQL:
     PLIST_ENTRY entry;
     PTM_TIMER_INTERNAL timerInternal;
     LIST_ENTRY timersToFree;
-    ULONG slotIndex;
 
     PAGED_CODE();
 
-    if (Manager == NULL) {
-        return;
-    }
-
-    //
-    // Atomically transition Initialized 1→0. Only one caller proceeds.
-    //
-    if (InterlockedCompareExchange(&Manager->Initialized, 0, 1) != 1) {
+    if (Manager == NULL || !Manager->Initialized) {
         return;
     }
 
     //
     // Signal shutdown
     //
-    InterlockedExchange(&Manager->ShuttingDown, 1);
+    Manager->ShuttingDown = TRUE;
     KeMemoryBarrier();
 
     //
-    // Cancel the wheel timer and wait for its DPC to drain
+    // Cancel the wheel timer
     //
-    KeCancelTimer(&Manager->WheelTimer);
+    KeCancelTimer(&manager->WheelTimer);
     KeFlushQueuedDpcs();
 
     //
@@ -399,7 +333,7 @@ IRQL:
     InitializeListHead(&timersToFree);
 
     //
-    // Cancel all timers and move to local free list
+    // Cancel all timers
     //
     KeAcquireSpinLock(&Manager->TimerListLock, &oldIrql);
 
@@ -415,11 +349,10 @@ IRQL:
         //
         // Mark as cancelled
         //
-        InterlockedExchange(&timerInternal->Timer.State, (LONG)TmTimerState_Cancelled);
-        InterlockedExchange(&timerInternal->DeletionPending, 1);
+        timerInternal->Timer.State = TmTimerState_Cancelled;
 
         //
-        // Add to local free list (reuse ListEntry since we removed from TimerList)
+        // Add to free list
         //
         InsertTailList(&timersToFree, &timerInternal->Timer.ListEntry);
     }
@@ -428,22 +361,12 @@ IRQL:
     KeReleaseSpinLock(&Manager->TimerListLock, oldIrql);
 
     //
-    // Clean out all wheel slots
-    //
-    for (slotIndex = 0; slotIndex < TM_WHEEL_SIZE; slotIndex++) {
-        KeAcquireSpinLock(&Manager->Wheel[slotIndex].Lock, &oldIrql);
-        InitializeListHead(&Manager->Wheel[slotIndex].TimerList);
-        Manager->Wheel[slotIndex].TimerCount = 0;
-        KeReleaseSpinLock(&Manager->Wheel[slotIndex].Lock, oldIrql);
-    }
-
-    //
-    // Wait for any in-flight DPCs / work items to complete
+    // Wait for any in-flight DPCs to complete
     //
     KeFlushQueuedDpcs();
 
     //
-    // Now free all timers directly (bypass refcount — we own everything)
+    // Now free all timers
     //
     while (!IsListEmpty(&timersToFree)) {
         entry = RemoveHeadList(&timersToFree);
@@ -463,7 +386,7 @@ IRQL:
         }
 
         //
-        // Free context if we own it (ContextSize > 0 means we copied it)
+        // Free context if we own it
         //
         if (timerInternal->Timer.Context != NULL &&
             timerInternal->Timer.ContextSize > 0) {
@@ -474,16 +397,54 @@ IRQL:
         }
 
         //
-        // Free timer structure
+        // Clear signature and free
         //
         timerInternal->Signature = 0;
         ShadowStrikeFreePoolWithTag(timerInternal, TM_POOL_TAG_TIMER);
     }
 
     //
+    // Mark as uninitialized
+    //
+    Manager->Initialized = FALSE;
+
+    //
     // Free the manager
     //
     ShadowStrikeFreePoolWithTag(Manager, TM_POOL_TAG_CONTEXT);
+}
+
+
+_Use_decl_annotations_
+NTSTATUS
+TmSetWorkQueue(
+    _Inout_ PTM_MANAGER Manager,
+    _In_ PVOID WorkQueue
+    )
+/*++
+
+Routine Description:
+
+    Sets the work queue to use for timers with WorkItemCallback flag.
+
+Arguments:
+
+    Manager - Timer manager.
+    WorkQueue - Async work queue manager (PAWQ_MANAGER).
+
+Return Value:
+
+    STATUS_SUCCESS on success.
+
+--*/
+{
+    if (Manager == NULL || !Manager->Initialized) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    Manager->WorkQueue = WorkQueue;
+
+    return STATUS_SUCCESS;
 }
 
 
@@ -501,28 +462,47 @@ TmCreateOneShot(
     _In_opt_ PTM_TIMER_OPTIONS Options,
     _Out_ PULONG TimerId
     )
+/*++
+
+Routine Description:
+
+    Creates a one-shot timer that fires once after the specified delay.
+
+Arguments:
+
+    Manager - Timer manager.
+    DelayMs - Delay in milliseconds before timer fires.
+    Callback - Function to call when timer fires.
+    Context - Optional context passed to callback.
+    Options - Optional timer options.
+    TimerId - Receives the timer ID.
+
+Return Value:
+
+    STATUS_SUCCESS on success.
+
+--*/
 {
     LARGE_INTEGER dueTime;
 
-    if (Manager == NULL || Callback == NULL || TimerId == NULL) {
+    if (Manager == NULL || !Manager->Initialized || Callback == NULL || TimerId == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Manager->Initialized || Manager->ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     if (DelayMs < TM_MIN_PERIOD_MS || DelayMs > TM_MAX_PERIOD_MS) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Calculate relative due time
+    //
     dueTime.QuadPart = TM_MS_TO_RELATIVE(DelayMs);
 
     return TmpCreateTimerInternal(
         Manager,
         TmTimerType_OneShot,
         &dueTime,
-        0,
+        0,  // No period for one-shot
         Callback,
         Context,
         Options,
@@ -541,21 +521,40 @@ TmCreatePeriodic(
     _In_opt_ PTM_TIMER_OPTIONS Options,
     _Out_ PULONG TimerId
     )
+/*++
+
+Routine Description:
+
+    Creates a periodic timer that fires repeatedly at the specified interval.
+
+Arguments:
+
+    Manager - Timer manager.
+    PeriodMs - Period in milliseconds between firings.
+    Callback - Function to call when timer fires.
+    Context - Optional context passed to callback.
+    Options - Optional timer options.
+    TimerId - Receives the timer ID.
+
+Return Value:
+
+    STATUS_SUCCESS on success.
+
+--*/
 {
     LARGE_INTEGER dueTime;
 
-    if (Manager == NULL || Callback == NULL || TimerId == NULL) {
+    if (Manager == NULL || !Manager->Initialized || Callback == NULL || TimerId == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Manager->Initialized || Manager->ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     if (PeriodMs < TM_MIN_PERIOD_MS || PeriodMs > TM_MAX_PERIOD_MS) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // First firing after one period
+    //
     dueTime.QuadPart = TM_MS_TO_RELATIVE(PeriodMs);
 
     return TmpCreateTimerInternal(
@@ -582,16 +581,33 @@ TmCreateAbsolute(
     _In_opt_ PTM_TIMER_OPTIONS Options,
     _Out_ PULONG TimerId
     )
+/*++
+
+Routine Description:
+
+    Creates a timer with an absolute due time.
+
+Arguments:
+
+    Manager - Timer manager.
+    DueTime - Absolute time when timer should fire.
+    PeriodMs - Optional period for periodic timers (0 for one-shot).
+    Callback - Function to call when timer fires.
+    Context - Optional context passed to callback.
+    Options - Optional timer options.
+    TimerId - Receives the timer ID.
+
+Return Value:
+
+    STATUS_SUCCESS on success.
+
+--*/
 {
     TM_TIMER_TYPE type;
 
-    if (Manager == NULL || DueTime == NULL ||
-        Callback == NULL || TimerId == NULL) {
+    if (Manager == NULL || !Manager->Initialized ||
+        DueTime == NULL || Callback == NULL || TimerId == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Manager->Initialized || Manager->ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     if (PeriodMs != 0 && (PeriodMs < TM_MIN_PERIOD_MS || PeriodMs > TM_MAX_PERIOD_MS)) {
@@ -629,17 +645,24 @@ Routine Description:
 
     Starts a timer that was created but not yet active.
 
+Arguments:
+
+    Manager - Timer manager.
+    TimerId - Timer to start.
+
+Return Value:
+
+    STATUS_SUCCESS on success.
+    STATUS_NOT_FOUND if timer doesn't exist.
+
 --*/
 {
     PTM_TIMER_INTERNAL timerInternal;
-    NTSTATUS status;
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG tolerableDelayMs;
 
-    if (Manager == NULL || TimerId == TM_INVALID_TIMER_ID) {
+    if (Manager == NULL || !Manager->Initialized || TimerId == TM_INVALID_TIMER_ID) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Manager->Initialized || Manager->ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     timerInternal = TmpFindTimerById(Manager, TimerId);
@@ -647,11 +670,69 @@ Routine Description:
         return STATUS_NOT_FOUND;
     }
 
-    status = TmpStartTimerInternal(Manager, timerInternal);
+    //
+    // Can only start timers in Created state
+    //
+    if (timerInternal->Timer.State != TmTimerState_Created) {
+        TmpDereferenceTimer(timerInternal);
+        return STATUS_INVALID_STATE_TRANSITION;
+    }
+
+    //
+    // Transition to Active
+    //
+    timerInternal->Timer.State = TmTimerState_Active;
+
+    //
+    // Calculate next fire time
+    //
+    KeQuerySystemTimePrecise(&timerInternal->Timer.NextFireTime);
+    timerInternal->Timer.NextFireTime.QuadPart -= timerInternal->Timer.DueTime.QuadPart;
+
+    //
+    // Set the kernel timer
+    //
+    if ((timerInternal->Timer.Flags & TmFlag_Coalescable) && Manager->Config.EnableCoalescing) {
+        //
+        // Use coalescable timer for power efficiency
+        //
+        tolerableDelayMs = timerInternal->Timer.ToleranceMs;
+        if (tolerableDelayMs == 0) {
+            tolerableDelayMs = Manager->Config.DefaultToleranceMs;
+        }
+
+        KeSetCoalescableTimer(
+            &timerInternal->Timer.KernelTimer,
+            timerInternal->Timer.DueTime,
+            (timerInternal->Timer.Type == TmTimerType_Periodic) ?
+                (ULONG)(timerInternal->Timer.Period.QuadPart / -10000LL) : 0,
+            tolerableDelayMs,
+            &timerInternal->Timer.TimerDpc
+            );
+
+        InterlockedIncrement64(&Manager->Stats.CoalescedTimers);
+    }
+    else {
+        //
+        // High-resolution timer
+        //
+        KeSetTimerEx(
+            &timerInternal->Timer.KernelTimer,
+            timerInternal->Timer.DueTime,
+            (timerInternal->Timer.Type == TmTimerType_Periodic) ?
+                (LONG)(timerInternal->Timer.Period.QuadPart / -10000LL) : 0,
+            &timerInternal->Timer.TimerDpc
+            );
+    }
+
+    //
+    // Insert into timer wheel for deadline tracking
+    //
+    TmpInsertTimerIntoWheel(Manager, timerInternal);
 
     TmpDereferenceTimer(timerInternal);
 
-    return status;
+    return STATUS_SUCCESS;
 }
 
 
@@ -667,16 +748,21 @@ Routine Description:
 
     Stops (pauses) a timer without destroying it. Timer can be restarted.
 
+Arguments:
+
+    Manager - Timer manager.
+    TimerId - Timer to stop.
+
+Return Value:
+
+    STATUS_SUCCESS on success.
+
 --*/
 {
     PTM_TIMER_INTERNAL timerInternal;
 
-    if (Manager == NULL || TimerId == TM_INVALID_TIMER_ID) {
+    if (Manager == NULL || !Manager->Initialized || TimerId == TM_INVALID_TIMER_ID) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Manager->Initialized || Manager->ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     timerInternal = TmpFindTimerById(Manager, TimerId);
@@ -684,7 +770,20 @@ Routine Description:
         return STATUS_NOT_FOUND;
     }
 
-    TmpStopTimerInternal(Manager, timerInternal);
+    //
+    // Cancel the kernel timer
+    //
+    KeCancelTimer(&timerInternal->Timer.KernelTimer);
+
+    //
+    // Remove from wheel
+    //
+    TmpRemoveTimerFromWheel(Manager, timerInternal);
+
+    //
+    // Transition to Created (can be restarted)
+    //
+    timerInternal->Timer.State = TmTimerState_Created;
 
     TmpDereferenceTimer(timerInternal);
 
@@ -705,23 +804,23 @@ Routine Description:
 
     Cancels and destroys a timer.
 
-    Wait=TRUE: If the timer is currently in Firing state, wait at
-    PASSIVE_LEVEL for the callback to complete before returning.
+Arguments:
 
-    Reference counting:
-    - TmpFindTimerById adds +1 (find ref).
-    - We remove from TimerList (releases the list ref via deref).
-    - We release the find ref.
-    - When refcount hits 0, TmpDestroyTimer frees the memory.
+    Manager - Timer manager.
+    TimerId - Timer to cancel.
+    Wait - If TRUE, waits for any in-progress callback to complete.
+
+Return Value:
+
+    STATUS_SUCCESS on success.
 
 --*/
 {
     PTM_TIMER_INTERNAL timerInternal;
     KIRQL oldIrql;
-    LONG prevState;
-    BOOLEAN needWait = FALSE;
+    BOOLEAN wasActive;
 
-    if (Manager == NULL || TimerId == TM_INVALID_TIMER_ID) {
+    if (Manager == NULL || !Manager->Initialized || TimerId == TM_INVALID_TIMER_ID) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -731,34 +830,16 @@ Routine Description:
     }
 
     //
-    // Mark deletion pending atomically (prevents double-cancel)
+    // Mark as cancelled
     //
-    if (InterlockedCompareExchange(&timerInternal->DeletionPending, 1, 0) != 0) {
-        // Already being deleted by another thread
-        TmpDereferenceTimer(timerInternal);
-        return STATUS_SUCCESS;
-    }
+    timerInternal->Timer.CancelRequested = TRUE;
+    timerInternal->Timer.State = TmTimerState_Cancelled;
+    timerInternal->DeletionPending = TRUE;
 
     //
-    // Set cancel requested
+    // Cancel the kernel timer
     //
-    InterlockedExchange(&timerInternal->Timer.CancelRequested, 1);
-
-    //
-    // Capture previous state BEFORE we transition to Cancelled.
-    // This is critical: if state was Firing, we know callback is in-flight.
-    //
-    prevState = InterlockedExchange(&timerInternal->Timer.State,
-                                    (LONG)TmTimerState_Cancelled);
-
-    if (Wait && prevState == (LONG)TmTimerState_Firing) {
-        needWait = TRUE;
-    }
-
-    //
-    // Cancel the kernel timer (harmless if already fired/cancelled)
-    //
-    KeCancelTimer(&timerInternal->Timer.KernelTimer);
+    wasActive = KeCancelTimer(&timerInternal->Timer.KernelTimer);
 
     //
     // Remove from wheel
@@ -766,47 +847,46 @@ Routine Description:
     TmpRemoveTimerFromWheel(Manager, timerInternal);
 
     //
-    // Remove from global list (releases list reference)
+    // Remove from global list
     //
     KeAcquireSpinLock(&Manager->TimerListLock, &oldIrql);
     RemoveEntryList(&timerInternal->Timer.ListEntry);
-    InitializeListHead(&timerInternal->Timer.ListEntry);
     InterlockedDecrement(&Manager->TimerCount);
     KeReleaseSpinLock(&Manager->TimerListLock, oldIrql);
+
+    //
+    // Signal cancel event
+    //
+    KeSetEvent(&timerInternal->Timer.CancelEvent, IO_NO_INCREMENT, FALSE);
 
     //
     // Update statistics
     //
     InterlockedIncrement64(&Manager->Stats.TimersCancelled);
 
-    //
-    // If callback is in-flight and caller wants to wait, do so now.
-    // CancelEvent is signaled by TmpFireTimer after callback returns.
-    //
-    if (needWait && KeGetCurrentIrql() == PASSIVE_LEVEL) {
-        LARGE_INTEGER timeout;
-        timeout.QuadPart = TM_SEC_TO_RELATIVE(5); // 5 second max wait
-        KeWaitForSingleObject(
-            &timerInternal->Timer.CancelEvent,
-            Executive,
-            KernelMode,
-            FALSE,
-            &timeout
-            );
+    if (Wait && timerInternal->Timer.State == TmTimerState_Firing) {
+        //
+        // Wait for callback to complete - the cancel event will be signaled
+        // This is safe at PASSIVE_LEVEL only
+        //
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            KeWaitForSingleObject(
+                &timerInternal->Timer.CancelEvent,
+                Executive,
+                KernelMode,
+                FALSE,
+                NULL
+                );
+        }
     }
 
     //
-    // Signal cancel event for any other waiters
-    //
-    KeSetEvent(&timerInternal->Timer.CancelEvent, IO_NO_INCREMENT, FALSE);
-
-    //
-    // Release list reference (timer was in list, now removed)
+    // Release our find reference - timer will be freed when refcount hits 0
     //
     TmpDereferenceTimer(timerInternal);
 
     //
-    // Release find reference
+    // Release creation reference
     //
     TmpDereferenceTimer(timerInternal);
 
@@ -824,20 +904,24 @@ TmReset(
 
 Routine Description:
 
-    Resets a timer — stops it and starts it again with same parameters.
-    Uses direct internal calls on the found timer, avoiding triple-lookup.
+    Resets a timer to fire again with its original parameters.
+
+Arguments:
+
+    Manager - Timer manager.
+    TimerId - Timer to reset.
+
+Return Value:
+
+    STATUS_SUCCESS on success.
 
 --*/
 {
     PTM_TIMER_INTERNAL timerInternal;
     NTSTATUS status;
 
-    if (Manager == NULL || TimerId == TM_INVALID_TIMER_ID) {
+    if (Manager == NULL || !Manager->Initialized || TimerId == TM_INVALID_TIMER_ID) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Manager->Initialized || Manager->ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     timerInternal = TmpFindTimerById(Manager, TimerId);
@@ -846,14 +930,12 @@ Routine Description:
     }
 
     //
-    // Stop directly on the found object (no second Find)
+    // Stop then start
     //
-    TmpStopTimerInternal(Manager, timerInternal);
-
-    //
-    // Start directly on the found object (no third Find)
-    //
-    status = TmpStartTimerInternal(Manager, timerInternal);
+    status = TmStop(Manager, TimerId);
+    if (NT_SUCCESS(status)) {
+        status = TmStart(Manager, TimerId);
+    }
 
     TmpDereferenceTimer(timerInternal);
 
@@ -872,20 +954,25 @@ TmSetPeriod(
 
 Routine Description:
 
-    Modifies the period of a periodic timer. Stops, updates, restarts.
-    Uses direct internal calls, avoiding triple-lookup.
+    Modifies the period of a periodic timer.
+
+Arguments:
+
+    Manager - Timer manager.
+    TimerId - Timer to modify.
+    NewPeriodMs - New period in milliseconds.
+
+Return Value:
+
+    STATUS_SUCCESS on success.
 
 --*/
 {
     PTM_TIMER_INTERNAL timerInternal;
     BOOLEAN wasActive;
 
-    if (Manager == NULL || TimerId == TM_INVALID_TIMER_ID) {
+    if (Manager == NULL || !Manager->Initialized || TimerId == TM_INVALID_TIMER_ID) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Manager->Initialized || Manager->ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     if (NewPeriodMs < TM_MIN_PERIOD_MS || NewPeriodMs > TM_MAX_PERIOD_MS) {
@@ -897,17 +984,21 @@ Routine Description:
         return STATUS_NOT_FOUND;
     }
 
+    //
+    // Only periodic timers can have period changed
+    //
     if (timerInternal->Timer.Type != TmTimerType_Periodic) {
         TmpDereferenceTimer(timerInternal);
         return STATUS_INVALID_PARAMETER;
     }
 
-    wasActive = (InterlockedCompareExchange(&timerInternal->Timer.State,
-                 (LONG)TmTimerState_Active, (LONG)TmTimerState_Active)
-                 == (LONG)TmTimerState_Active);
+    wasActive = (timerInternal->Timer.State == TmTimerState_Active);
 
+    //
+    // Stop if active
+    //
     if (wasActive) {
-        TmpStopTimerInternal(Manager, timerInternal);
+        TmStop(Manager, TimerId);
     }
 
     //
@@ -916,8 +1007,11 @@ Routine Description:
     timerInternal->Timer.Period.QuadPart = TM_MS_TO_RELATIVE(NewPeriodMs);
     timerInternal->Timer.DueTime.QuadPart = TM_MS_TO_RELATIVE(NewPeriodMs);
 
+    //
+    // Restart if was active
+    //
     if (wasActive) {
-        TmpStartTimerInternal(Manager, timerInternal);
+        TmStart(Manager, TimerId);
     }
 
     TmpDereferenceTimer(timerInternal);
@@ -935,17 +1029,14 @@ NTSTATUS
 TmGetState(
     _In_ PTM_MANAGER Manager,
     _In_ ULONG TimerId,
-    _Out_ PLONG State
+    _Out_ PTM_TIMER_STATE State
     )
 {
     PTM_TIMER_INTERNAL timerInternal;
 
-    if (Manager == NULL || TimerId == TM_INVALID_TIMER_ID || State == NULL) {
+    if (Manager == NULL || !Manager->Initialized ||
+        TimerId == TM_INVALID_TIMER_ID || State == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Manager->Initialized) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     timerInternal = TmpFindTimerById(Manager, TimerId);
@@ -972,12 +1063,9 @@ TmGetRemaining(
     PTM_TIMER_INTERNAL timerInternal;
     LARGE_INTEGER currentTime;
 
-    if (Manager == NULL || TimerId == TM_INVALID_TIMER_ID || Remaining == NULL) {
+    if (Manager == NULL || !Manager->Initialized ||
+        TimerId == TM_INVALID_TIMER_ID || Remaining == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Manager->Initialized) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     timerInternal = TmpFindTimerById(Manager, TimerId);
@@ -985,15 +1073,14 @@ TmGetRemaining(
         return STATUS_NOT_FOUND;
     }
 
-    if (timerInternal->Timer.State != (LONG)TmTimerState_Active) {
+    if (timerInternal->Timer.State != TmTimerState_Active) {
         Remaining->QuadPart = 0;
         TmpDereferenceTimer(timerInternal);
         return STATUS_SUCCESS;
     }
 
     KeQuerySystemTimePrecise(&currentTime);
-    Remaining->QuadPart = timerInternal->Timer.NextFireTime.QuadPart -
-                          currentTime.QuadPart;
+    Remaining->QuadPart = timerInternal->Timer.NextFireTime.QuadPart - currentTime.QuadPart;
 
     if (Remaining->QuadPart < 0) {
         Remaining->QuadPart = 0;
@@ -1014,10 +1101,8 @@ TmIsActive(
 {
     PTM_TIMER_INTERNAL timerInternal;
     BOOLEAN isActive;
-    LONG state;
 
-    if (Manager == NULL || !Manager->Initialized ||
-        TimerId == TM_INVALID_TIMER_ID) {
+    if (Manager == NULL || !Manager->Initialized || TimerId == TM_INVALID_TIMER_ID) {
         return FALSE;
     }
 
@@ -1026,9 +1111,8 @@ TmIsActive(
         return FALSE;
     }
 
-    state = timerInternal->Timer.State;
-    isActive = (state == (LONG)TmTimerState_Active ||
-                state == (LONG)TmTimerState_Firing);
+    isActive = (timerInternal->Timer.State == TmTimerState_Active ||
+                timerInternal->Timer.State == TmTimerState_Firing);
 
     TmpDereferenceTimer(timerInternal);
 
@@ -1051,7 +1135,7 @@ TmCancelAll(
     PLIST_ENTRY entry;
     PTM_TIMER_INTERNAL timerInternal;
     ULONG timerIds[64];
-    ULONG count;
+    ULONG count = 0;
     ULONG i;
 
     if (Manager == NULL || !Manager->Initialized) {
@@ -1059,8 +1143,7 @@ TmCancelAll(
     }
 
     //
-    // Iterate in batches — TmCancel modifies the list so we can't
-    // cancel while iterating.
+    // Collect timer IDs (can't cancel while iterating due to list modification)
     //
     do {
         count = 0;
@@ -1071,8 +1154,7 @@ TmCancelAll(
              entry != &Manager->TimerList && count < ARRAYSIZE(timerIds);
              entry = entry->Flink) {
 
-            timerInternal = CONTAINING_RECORD(entry, TM_TIMER_INTERNAL,
-                                              Timer.ListEntry);
+            timerInternal = CONTAINING_RECORD(entry, TM_TIMER_INTERNAL, Timer.ListEntry);
 
             if (!timerInternal->DeletionPending) {
                 timerIds[count++] = timerInternal->Timer.TimerId;
@@ -1081,6 +1163,9 @@ TmCancelAll(
 
         KeReleaseSpinLock(&Manager->TimerListLock, oldIrql);
 
+        //
+        // Cancel collected timers
+        //
         for (i = 0; i < count; i++) {
             TmCancel(Manager, timerIds[i], Wait);
         }
@@ -1101,13 +1186,16 @@ TmCancelGroup(
     PLIST_ENTRY entry;
     PTM_TIMER_INTERNAL timerInternal;
     ULONG timerIds[64];
-    ULONG count;
+    ULONG count = 0;
     ULONG i;
 
     if (Manager == NULL || !Manager->Initialized) {
         return;
     }
 
+    //
+    // Collect timer IDs in the specified group
+    //
     do {
         count = 0;
 
@@ -1117,8 +1205,7 @@ TmCancelGroup(
              entry != &Manager->TimerList && count < ARRAYSIZE(timerIds);
              entry = entry->Flink) {
 
-            timerInternal = CONTAINING_RECORD(entry, TM_TIMER_INTERNAL,
-                                              Timer.ListEntry);
+            timerInternal = CONTAINING_RECORD(entry, TM_TIMER_INTERNAL, Timer.ListEntry);
 
             if (!timerInternal->DeletionPending &&
                 timerInternal->Timer.CoalesceGroup == CoalesceGroup) {
@@ -1128,6 +1215,9 @@ TmCancelGroup(
 
         KeReleaseSpinLock(&Manager->TimerListLock, oldIrql);
 
+        //
+        // Cancel collected timers
+        //
         for (i = 0; i < count; i++) {
             TmCancel(Manager, timerIds[i], Wait);
         }
@@ -1149,26 +1239,21 @@ TmGetStatistics(
 {
     LARGE_INTEGER currentTime;
 
-    if (Manager == NULL || Stats == NULL) {
+    if (Manager == NULL || !Manager->Initialized || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Manager->Initialized) {
-        return STATUS_DEVICE_NOT_READY;
     }
 
     RtlZeroMemory(Stats, sizeof(TM_STATISTICS));
 
     Stats->ActiveTimers = (ULONG)Manager->TimerCount;
-    Stats->TimersCreated = (ULONG64)Manager->Stats.TimersCreated;
-    Stats->TimersFired = (ULONG64)Manager->Stats.TimersFired;
-    Stats->TimersCancelled = (ULONG64)Manager->Stats.TimersCancelled;
-    Stats->TimersMissed = (ULONG64)Manager->Stats.TimersMissed;
-    Stats->CoalescedTimers = (ULONG64)Manager->Stats.CoalescedTimers;
+    Stats->TimersCreated = Manager->Stats.TimersCreated;
+    Stats->TimersFired = Manager->Stats.TimersFired;
+    Stats->TimersCancelled = Manager->Stats.TimersCancelled;
+    Stats->TimersMissed = Manager->Stats.TimersMissed;
+    Stats->CoalescedTimers = Manager->Stats.CoalescedTimers;
 
     KeQuerySystemTimePrecise(&currentTime);
-    Stats->UpTime.QuadPart = currentTime.QuadPart -
-                             Manager->Stats.StartTime.QuadPart;
+    Stats->UpTime.QuadPart = currentTime.QuadPart - Manager->Stats.StartTime.QuadPart;
 
     return STATUS_SUCCESS;
 }
@@ -1215,9 +1300,7 @@ TmpCreateTimerInternal(
 
 Routine Description:
 
-    Internal timer creation routine. Allocates the internal structure,
-    copies context if specified, pre-allocates a WorkItem if needed,
-    and optionally auto-starts the timer.
+    Internal timer creation routine.
 
 --*/
 {
@@ -1225,20 +1308,15 @@ Routine Description:
     KIRQL oldIrql;
     NTSTATUS status = STATUS_SUCCESS;
     PVOID contextCopy = NULL;
-    LONG currentCount;
 
     *TimerId = TM_INVALID_TIMER_ID;
 
     //
-    // Check timer limit atomically
+    // Check timer limit
     //
-    do {
-        currentCount = Manager->TimerCount;
-        if (currentCount >= TM_MAX_TIMERS) {
-            return STATUS_QUOTA_EXCEEDED;
-        }
-    } while (InterlockedCompareExchange(&Manager->TimerCount,
-             currentCount + 1, currentCount) != currentCount);
+    if (Manager->TimerCount >= TM_MAX_TIMERS) {
+        return STATUS_QUOTA_EXCEEDED;
+    }
 
     //
     // Allocate timer structure
@@ -1250,14 +1328,13 @@ Routine Description:
         );
 
     if (timerInternal == NULL) {
-        InterlockedDecrement(&Manager->TimerCount);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlZeroMemory(timerInternal, sizeof(TM_TIMER_INTERNAL));
 
     //
-    // Copy context if provided and size specified (we take ownership)
+    // Copy context if provided and size specified
     //
     if (Options != NULL && Options->Context != NULL && Options->ContextSize > 0) {
         contextCopy = ShadowStrikeAllocatePoolWithTag(
@@ -1268,7 +1345,6 @@ Routine Description:
 
         if (contextCopy == NULL) {
             ShadowStrikeFreePoolWithTag(timerInternal, TM_POOL_TAG_TIMER);
-            InterlockedDecrement(&Manager->TimerCount);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -1277,63 +1353,36 @@ Routine Description:
         timerInternal->Timer.ContextSize = Options->ContextSize;
     }
     else {
-        // Caller owns Context lifetime (ContextSize = 0)
         timerInternal->Timer.Context = Context;
         timerInternal->Timer.ContextSize = 0;
     }
 
     //
-    // Pre-allocate work item if WorkItemCallback is requested
-    //
-    if (Options != NULL && (Options->Flags & TmFlag_WorkItemCallback)) {
-        if (Manager->DeviceObject == NULL) {
-            // Can't use WorkItemCallback without a device object
-            if (contextCopy != NULL) {
-                ShadowStrikeFreePoolWithTag(contextCopy, TM_POOL_TAG_CONTEXT);
-            }
-            ShadowStrikeFreePoolWithTag(timerInternal, TM_POOL_TAG_TIMER);
-            InterlockedDecrement(&Manager->TimerCount);
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        timerInternal->WorkItem = IoAllocateWorkItem(Manager->DeviceObject);
-        if (timerInternal->WorkItem == NULL) {
-            if (contextCopy != NULL) {
-                ShadowStrikeFreePoolWithTag(contextCopy, TM_POOL_TAG_CONTEXT);
-            }
-            ShadowStrikeFreePoolWithTag(timerInternal, TM_POOL_TAG_TIMER);
-            InterlockedDecrement(&Manager->TimerCount);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-    }
-
-    //
-    // Initialize signature and back-reference
+    // Initialize signature
     //
     timerInternal->Signature = TM_TIMER_SIGNATURE;
     timerInternal->Manager = Manager;
+    timerInternal->DeletionPending = FALSE;
 
     //
     // Initialize kernel timer and DPC
     //
     KeInitializeTimer(&timerInternal->Timer.KernelTimer);
-    KeInitializeDpc(&timerInternal->Timer.TimerDpc, TmpTimerDpcRoutine,
-                    timerInternal);
+    KeInitializeDpc(&timerInternal->Timer.TimerDpc, TmpTimerDpcRoutine, timerInternal);
 
     //
-    // Generate unique timer ID (never 0)
+    // Generate timer ID
     //
-    timerInternal->Timer.TimerId = TmpAllocateTimerId(Manager);
+    timerInternal->Timer.TimerId = (ULONG)InterlockedIncrement(&Manager->NextTimerId);
 
     //
     // Set timer properties
     //
     timerInternal->Timer.Type = Type;
     timerInternal->Timer.DueTime = *DueTime;
-    timerInternal->Timer.Period.QuadPart =
-        (PeriodMs > 0) ? TM_MS_TO_RELATIVE(PeriodMs) : 0;
+    timerInternal->Timer.Period.QuadPart = (PeriodMs > 0) ? TM_MS_TO_RELATIVE(PeriodMs) : 0;
     timerInternal->Timer.Callback = Callback;
-    timerInternal->Timer.State = (LONG)TmTimerState_Created;
+    timerInternal->Timer.State = TmTimerState_Created;
 
     //
     // Apply options
@@ -1346,7 +1395,7 @@ Routine Description:
         if (Options->Name != NULL) {
             RtlStringCchCopyA(
                 timerInternal->Timer.Name,
-                TM_TIMER_NAME_MAX,
+                sizeof(timerInternal->Timer.Name),
                 Options->Name
                 );
         }
@@ -1360,17 +1409,18 @@ Routine Description:
     //
     // Initialize synchronization
     //
-    KeInitializeEvent(&timerInternal->Timer.CancelEvent,
-                      NotificationEvent, FALSE);
+    KeInitializeEvent(&timerInternal->Timer.CancelEvent, NotificationEvent, FALSE);
+    timerInternal->Timer.CancelRequested = FALSE;
 
     //
-    // Set initial reference count: 1 for TimerList, 1 for creation
+    // Set initial reference count (1 for creation, 1 for being in list)
     //
     timerInternal->Timer.RefCount = 2;
 
     //
     // Initialize statistics
     //
+    timerInternal->Timer.FireCount = 0;
     KeQuerySystemTimePrecise(&timerInternal->Timer.CreationTime);
 
     //
@@ -1381,10 +1431,10 @@ Routine Description:
 
     //
     // Insert into global timer list
-    // (TimerCount was already atomically reserved above)
     //
     KeAcquireSpinLock(&Manager->TimerListLock, &oldIrql);
     InsertTailList(&Manager->TimerList, &timerInternal->Timer.ListEntry);
+    InterlockedIncrement(&Manager->TimerCount);
     KeReleaseSpinLock(&Manager->TimerListLock, oldIrql);
 
     //
@@ -1395,10 +1445,10 @@ Routine Description:
     *TimerId = timerInternal->Timer.TimerId;
 
     //
-    // Auto-start if not using manual start (Synchronized flag)
+    // Auto-start if not using manual start
     //
     if (!(timerInternal->Timer.Flags & TmFlag_Synchronized)) {
-        status = TmpStartTimerInternal(Manager, timerInternal);
+        status = TmStart(Manager, timerInternal->Timer.TimerId);
         if (!NT_SUCCESS(status)) {
             TmCancel(Manager, timerInternal->Timer.TimerId, FALSE);
             *TimerId = TM_INVALID_TIMER_ID;
@@ -1422,7 +1472,6 @@ TmpFindTimerById(
 Routine Description:
 
     Finds a timer by ID and returns it with incremented reference count.
-    Caller MUST call TmpDereferenceTimer when done.
 
 --*/
 {
@@ -1437,8 +1486,7 @@ Routine Description:
          entry != &Manager->TimerList;
          entry = entry->Flink) {
 
-        timerInternal = CONTAINING_RECORD(entry, TM_TIMER_INTERNAL,
-                                          Timer.ListEntry);
+        timerInternal = CONTAINING_RECORD(entry, TM_TIMER_INTERNAL, Timer.ListEntry);
 
         if (timerInternal->Timer.TimerId == TimerId &&
             !timerInternal->DeletionPending) {
@@ -1461,9 +1509,7 @@ TmpReferenceTimer(
     _Inout_ PTM_TIMER_INTERNAL TimerInternal
     )
 {
-    LONG prev = InterlockedIncrement(&TimerInternal->Timer.RefCount);
-    NT_ASSERT(prev >= 2); // Must have been >= 1 before increment
-    UNREFERENCED_PARAMETER(prev);
+    InterlockedIncrement(&TimerInternal->Timer.RefCount);
 }
 
 
@@ -1477,9 +1523,11 @@ TmpDereferenceTimer(
     LONG newCount;
 
     newCount = InterlockedDecrement(&TimerInternal->Timer.RefCount);
-    NT_ASSERT(newCount >= 0);
 
     if (newCount == 0) {
+        //
+        // Last reference - safe to free
+        //
         TmpDestroyTimer(TimerInternal);
     }
 }
@@ -1496,15 +1544,9 @@ TmpDestroyTimer(
 Routine Description:
 
     Frees timer resources. Called when reference count reaches zero.
-    At this point, the timer is no longer in any list.
 
 --*/
 {
-    //
-    // Ensure kernel timer is cancelled
-    //
-    KeCancelTimer(&TimerInternal->Timer.KernelTimer);
-
     //
     // Free work item if allocated
     //
@@ -1514,7 +1556,7 @@ Routine Description:
     }
 
     //
-    // Free copied context if we own it (ContextSize > 0)
+    // Free copied context if we own it
     //
     if (TimerInternal->Timer.Context != NULL &&
         TimerInternal->Timer.ContextSize > 0) {
@@ -1525,135 +1567,16 @@ Routine Description:
     }
 
     //
-    // Clear signature and free
+    // Clear signature
     //
     TimerInternal->Signature = 0;
+
+    //
+    // Free timer structure
+    //
     ShadowStrikeFreePoolWithTag(TimerInternal, TM_POOL_TAG_TIMER);
 }
 
-
-//=============================================================================
-// Internal: Start / Stop (operate on already-found timer, no re-lookup)
-//=============================================================================
-
-static
-_Use_decl_annotations_
-NTSTATUS
-TmpStartTimerInternal(
-    _In_ PTM_MANAGER Manager,
-    _Inout_ PTM_TIMER_INTERNAL TimerInternal
-    )
-/*++
-
-Routine Description:
-
-    Starts a timer. Called with a reference already held.
-    Uses InterlockedCompareExchange for state transition.
-
---*/
-{
-    ULONG tolerableDelayMs;
-    LONG prevState;
-
-    //
-    // Atomically transition Created → Active
-    //
-    prevState = InterlockedCompareExchange(
-        &TimerInternal->Timer.State,
-        (LONG)TmTimerState_Active,
-        (LONG)TmTimerState_Created
-        );
-
-    if (prevState != (LONG)TmTimerState_Created) {
-        return STATUS_INVALID_STATE_TRANSITION;
-    }
-
-    //
-    // Calculate next fire time
-    //
-    KeQuerySystemTimePrecise(&TimerInternal->Timer.NextFireTime);
-    // DueTime is negative (relative), so subtract to get absolute future time
-    TimerInternal->Timer.NextFireTime.QuadPart -=
-        TimerInternal->Timer.DueTime.QuadPart;
-
-    //
-    // Set the kernel timer
-    //
-    if ((TimerInternal->Timer.Flags & TmFlag_Coalescable) &&
-        Manager->Config.EnableCoalescing) {
-
-        tolerableDelayMs = TimerInternal->Timer.ToleranceMs;
-        if (tolerableDelayMs == 0) {
-            tolerableDelayMs = Manager->Config.DefaultToleranceMs;
-        }
-
-        KeSetCoalescableTimer(
-            &TimerInternal->Timer.KernelTimer,
-            TimerInternal->Timer.DueTime,
-            (TimerInternal->Timer.Type == TmTimerType_Periodic) ?
-                (ULONG)(TimerInternal->Timer.Period.QuadPart / -10000LL) : 0,
-            tolerableDelayMs,
-            &TimerInternal->Timer.TimerDpc
-            );
-
-        InterlockedIncrement64(&Manager->Stats.CoalescedTimers);
-    }
-    else {
-        KeSetTimerEx(
-            &TimerInternal->Timer.KernelTimer,
-            TimerInternal->Timer.DueTime,
-            (TimerInternal->Timer.Type == TmTimerType_Periodic) ?
-                (LONG)(TimerInternal->Timer.Period.QuadPart / -10000LL) : 0,
-            &TimerInternal->Timer.TimerDpc
-            );
-    }
-
-    //
-    // Insert into timer wheel for deadline tracking
-    //
-    TmpInsertTimerIntoWheel(Manager, TimerInternal);
-
-    return STATUS_SUCCESS;
-}
-
-
-static
-_Use_decl_annotations_
-VOID
-TmpStopTimerInternal(
-    _In_ PTM_MANAGER Manager,
-    _Inout_ PTM_TIMER_INTERNAL TimerInternal
-    )
-/*++
-
-Routine Description:
-
-    Stops a timer. Called with a reference already held.
-    Transitions state back to Created so it can be restarted.
-
---*/
-{
-    //
-    // Cancel the kernel timer
-    //
-    KeCancelTimer(&TimerInternal->Timer.KernelTimer);
-
-    //
-    // Remove from wheel
-    //
-    TmpRemoveTimerFromWheel(Manager, TimerInternal);
-
-    //
-    // Transition to Created (can be restarted)
-    //
-    InterlockedExchange(&TimerInternal->Timer.State,
-                        (LONG)TmTimerState_Created);
-}
-
-
-//=============================================================================
-// Timer Wheel
-//=============================================================================
 
 static
 _Use_decl_annotations_
@@ -1662,6 +1585,13 @@ TmpInsertTimerIntoWheel(
     _In_ PTM_MANAGER Manager,
     _Inout_ PTM_TIMER_INTERNAL TimerInternal
     )
+/*++
+
+Routine Description:
+
+    Inserts timer into the timer wheel for deadline tracking.
+
+--*/
 {
     KIRQL oldIrql;
     ULONG slotIndex;
@@ -1669,32 +1599,39 @@ TmpInsertTimerIntoWheel(
     LONGLONG ticksUntilFire;
     ULONG slotsUntilFire;
 
+    //
+    // Calculate which wheel slot this timer belongs in
+    //
     KeQuerySystemTimePrecise(&currentTime);
-    ticksUntilFire = TimerInternal->Timer.NextFireTime.QuadPart -
-                     currentTime.QuadPart;
+    ticksUntilFire = TimerInternal->Timer.NextFireTime.QuadPart - currentTime.QuadPart;
 
     if (ticksUntilFire <= 0) {
-        slotIndex = (ULONG)Manager->CurrentSlot & TM_WHEEL_MASK;
+        //
+        // Already expired - put in current slot
+        //
+        slotIndex = Manager->CurrentSlot;
     }
     else {
-        slotsUntilFire = (ULONG)((ticksUntilFire / 10000LL) /
-                          TM_WHEEL_RESOLUTION_MS);
+        //
+        // Convert ticks to milliseconds, then to slots
+        //
+        slotsUntilFire = (ULONG)((ticksUntilFire / 10000LL) / TM_WHEEL_RESOLUTION_MS);
 
         if (slotsUntilFire >= TM_WHEEL_SIZE) {
+            //
+            // Too far in future - will be re-inserted when wheel advances
+            //
             slotsUntilFire = TM_WHEEL_SIZE - 1;
         }
 
-        slotIndex = ((ULONG)Manager->CurrentSlot + slotsUntilFire) &
-                    TM_WHEEL_MASK;
+        slotIndex = (Manager->CurrentSlot + slotsUntilFire) % TM_WHEEL_SIZE;
     }
 
     TimerInternal->WheelSlotIndex = slotIndex;
 
     KeAcquireSpinLock(&Manager->Wheel[slotIndex].Lock, &oldIrql);
-    InsertTailList(&Manager->Wheel[slotIndex].TimerList,
-                   &TimerInternal->Timer.WheelEntry);
+    InsertTailList(&Manager->Wheel[slotIndex].TimerList, &TimerInternal->Timer.WheelEntry);
     InterlockedIncrement(&Manager->Wheel[slotIndex].TimerCount);
-    InterlockedExchange(&TimerInternal->InWheelSlot, 1);
     KeReleaseSpinLock(&Manager->Wheel[slotIndex].Lock, oldIrql);
 }
 
@@ -1710,21 +1647,11 @@ TmpRemoveTimerFromWheel(
     KIRQL oldIrql;
     ULONG slotIndex;
 
-    //
-    // Only remove if we're actually in a wheel slot
-    //
-    if (InterlockedCompareExchange(&TimerInternal->InWheelSlot, 0, 1) != 1) {
-        return;
-    }
-
     slotIndex = TimerInternal->WheelSlotIndex;
 
     if (slotIndex < TM_WHEEL_SIZE) {
         KeAcquireSpinLock(&Manager->Wheel[slotIndex].Lock, &oldIrql);
 
-        //
-        // Check that WheelEntry is still linked (not already removed)
-        //
         if (!IsListEmpty(&TimerInternal->Timer.WheelEntry)) {
             RemoveEntryList(&TimerInternal->Timer.WheelEntry);
             InitializeListHead(&TimerInternal->Timer.WheelEntry);
@@ -1736,10 +1663,6 @@ TmpRemoveTimerFromWheel(
 }
 
 
-//=============================================================================
-// Timer Firing
-//=============================================================================
-
 static
 _Use_decl_annotations_
 VOID
@@ -1750,36 +1673,26 @@ TmpFireTimer(
 
 Routine Description:
 
-    Fires the timer callback. Handles state transitions and auto-delete.
-
-    Reference counting for auto-delete one-shot:
-      Before DPC/WorkItem calls us: RefCount = 3 (list + creation + caller)
-      We release list ref and creation ref (2 derefs) → RefCount = 1 (caller)
-      Caller releases its ref → RefCount = 0 → TmpDestroyTimer.
-      Both our derefs are safe because the caller's ref keeps RefCount ≥ 1.
+    Fires the timer callback.
 
 --*/
 {
     PTM_MANAGER manager;
     LARGE_INTEGER currentTime;
-    KIRQL oldIrql;
 
     manager = TimerInternal->Manager;
 
     //
-    // Check for cancellation or shutdown
+    // Check for cancellation
     //
     if (TimerInternal->Timer.CancelRequested || manager->ShuttingDown) {
-        KeSetEvent(&TimerInternal->Timer.CancelEvent,
-                   IO_NO_INCREMENT, FALSE);
         return;
     }
 
     //
     // Transition to firing state
     //
-    InterlockedExchange(&TimerInternal->Timer.State,
-                        (LONG)TmTimerState_Firing);
+    TimerInternal->Timer.State = TmTimerState_Firing;
 
     //
     // Update statistics
@@ -1803,59 +1716,31 @@ Routine Description:
     // Handle post-fire state transition
     //
     if (TimerInternal->Timer.CancelRequested) {
-        InterlockedExchange(&TimerInternal->Timer.State,
-                            (LONG)TmTimerState_Cancelled);
-        KeSetEvent(&TimerInternal->Timer.CancelEvent,
-                   IO_NO_INCREMENT, FALSE);
+        TimerInternal->Timer.State = TmTimerState_Cancelled;
+        KeSetEvent(&TimerInternal->Timer.CancelEvent, IO_NO_INCREMENT, FALSE);
     }
     else if (TimerInternal->Timer.Type == TmTimerType_OneShot) {
-        InterlockedExchange(&TimerInternal->Timer.State,
-                            (LONG)TmTimerState_Expired);
+        TimerInternal->Timer.State = TmTimerState_Expired;
 
         //
-        // Auto-delete: remove from list, release list ref + creation ref.
-        // Caller (DPC/WorkItem) still holds a ref, so these won't hit 0.
+        // Auto-delete one-shot timers with AutoDelete flag
         //
         if (TimerInternal->Timer.Flags & TmFlag_AutoDelete) {
-            InterlockedExchange(&TimerInternal->DeletionPending, 1);
-
-            // Remove from TimerList
-            KeAcquireSpinLock(&manager->TimerListLock, &oldIrql);
-            RemoveEntryList(&TimerInternal->Timer.ListEntry);
-            InitializeListHead(&TimerInternal->Timer.ListEntry);
-            InterlockedDecrement(&manager->TimerCount);
-            KeReleaseSpinLock(&manager->TimerListLock, oldIrql);
-
-            // Remove from wheel
-            TmpRemoveTimerFromWheel(manager, TimerInternal);
-
-            // Release list reference (RefCount 3→2, safe: caller holds ref)
-            TmpDereferenceTimer(TimerInternal);
-
-            // Release creation reference (RefCount 2→1, safe: caller holds ref)
+            TimerInternal->DeletionPending = TRUE;
             TmpDereferenceTimer(TimerInternal);
         }
     }
     else if (TimerInternal->Timer.Type == TmTimerType_Periodic) {
         //
         // Calculate next fire time and re-insert into wheel
-        // Period is negative (relative), so subtract to add time
         //
         TimerInternal->Timer.NextFireTime.QuadPart =
             currentTime.QuadPart - TimerInternal->Timer.Period.QuadPart;
-
-        InterlockedExchange(&TimerInternal->Timer.State,
-                            (LONG)TmTimerState_Active);
+        TimerInternal->Timer.State = TmTimerState_Active;
 
         TmpRemoveTimerFromWheel(manager, TimerInternal);
         TmpInsertTimerIntoWheel(manager, TimerInternal);
     }
-
-    //
-    // Signal cancel event so anyone waiting on TmCancel can proceed
-    //
-    KeSetEvent(&TimerInternal->Timer.CancelEvent,
-               IO_NO_INCREMENT, FALSE);
 }
 
 
@@ -1876,16 +1761,7 @@ TmpTimerDpcRoutine(
 
 Routine Description:
 
-    DPC routine called when a kernel timer fires. Runs at DISPATCH_LEVEL.
-
-    If TmFlag_WorkItemCallback is set and a WorkItem was pre-allocated,
-    queues the work item for PASSIVE_LEVEL execution (work item routine
-    is responsible for releasing the DPC reference). Otherwise, fires
-    the callback directly at DISPATCH_LEVEL.
-
-    Always releases its DPC reference. For auto-delete one-shots,
-    TmpFireTimer releases list + creation refs (both safe because our
-    DPC ref keeps RefCount ≥ 1), then our deref hits 0 → destroy.
+    DPC routine called when a kernel timer fires.
 
 --*/
 {
@@ -1897,40 +1773,35 @@ Routine Description:
 
     timerInternal = (PTM_TIMER_INTERNAL)DeferredContext;
 
-    if (timerInternal == NULL) {
+    if (timerInternal == NULL ||
+        timerInternal->Signature != TM_TIMER_SIGNATURE) {
         return;
     }
 
     //
-    // Add reference for this DPC execution
+    // Add reference for callback
     //
     TmpReferenceTimer(timerInternal);
 
     //
-    // Route to work item for PASSIVE_LEVEL execution if requested
+    // Check if this should be executed via work item
     //
-    if ((timerInternal->Timer.Flags & TmFlag_WorkItemCallback) &&
-        timerInternal->WorkItem != NULL) {
+    if (timerInternal->Timer.Flags & TmFlag_WorkItemCallback) {
         //
-        // Queue work item — TmpWorkItemRoutine will call TmpFireTimer
-        // and release the DPC reference when done.
+        // Queue work item for PASSIVE_LEVEL execution
+        // For now, execute at DPC level - would need work item allocation
         //
-        IoQueueWorkItem(
-            timerInternal->WorkItem,
-            TmpWorkItemRoutine,
-            DelayedWorkQueue,
-            timerInternal
-            );
-        return;
+        TmpFireTimer(timerInternal);
+    }
+    else {
+        //
+        // Execute at DPC level
+        //
+        TmpFireTimer(timerInternal);
     }
 
     //
-    // Execute at DPC level
-    //
-    TmpFireTimer(timerInternal);
-
-    //
-    // Always release DPC reference
+    // Release callback reference
     //
     TmpDereferenceTimer(timerInternal);
 }
@@ -1949,18 +1820,13 @@ TmpWheelDpcRoutine(
 
 Routine Description:
 
-    Wheel DPC - advances the slot counter and processes the current slot
-    to detect missed timer deadlines.
-
-    CurrentSlot is a LONG managed via InterlockedIncrement. We mask
-    with TM_WHEEL_MASK to get the actual slot index. The raw value
-    grows monotonically but we only ever use (value & TM_WHEEL_MASK).
+    DPC routine for timer wheel processing. Called periodically to advance
+    the wheel and check for missed timers.
 
 --*/
 {
     PTM_MANAGER manager;
-    ULONG slotIndex;
-    LONG rawSlot;
+    ULONG currentSlot;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
@@ -1973,17 +1839,15 @@ Routine Description:
     }
 
     //
-    // Advance wheel slot atomically. Use mask to get slot index.
-    // The raw value may wrap (LONG_MAX → negative) but & TM_WHEEL_MASK
-    // always produces a valid index 0..TM_WHEEL_SIZE-1.
+    // Advance wheel slot
     //
-    rawSlot = InterlockedIncrement(&manager->CurrentSlot);
-    slotIndex = (ULONG)rawSlot & TM_WHEEL_MASK;
+    currentSlot = InterlockedIncrement((LONG*)&manager->CurrentSlot) % TM_WHEEL_SIZE;
+    manager->CurrentSlot = currentSlot;
 
     //
     // Process expired timers in current slot
     //
-    TmpProcessWheelSlot(manager, slotIndex);
+    TmpProcessWheelSlot(manager, currentSlot);
 }
 
 
@@ -1999,8 +1863,6 @@ TmpProcessWheelSlot(
 Routine Description:
 
     Processes all timers in a wheel slot to detect missed deadlines.
-    This is a monitoring/statistics function — actual timer firing is
-    done by the kernel timer DPC (TmpTimerDpcRoutine).
 
 --*/
 {
@@ -2009,10 +1871,6 @@ Routine Description:
     PLIST_ENTRY next;
     PTM_TIMER_INTERNAL timerInternal;
     LARGE_INTEGER currentTime;
-
-    if (SlotIndex >= TM_WHEEL_SIZE) {
-        return;
-    }
 
     KeQuerySystemTimePrecise(&currentTime);
 
@@ -2023,15 +1881,17 @@ Routine Description:
          entry = next) {
 
         next = entry->Flink;
-        timerInternal = CONTAINING_RECORD(entry, TM_TIMER_INTERNAL,
-                                          Timer.WheelEntry);
+        timerInternal = CONTAINING_RECORD(entry, TM_TIMER_INTERNAL, Timer.WheelEntry);
 
         //
-        // Check if timer has missed its deadline
+        // Check if timer has missed its deadline (wasn't fired by kernel timer)
         //
-        if (timerInternal->Timer.State == (LONG)TmTimerState_Active &&
-            timerInternal->Timer.NextFireTime.QuadPart <
-            currentTime.QuadPart) {
+        if (timerInternal->Timer.State == TmTimerState_Active &&
+            timerInternal->Timer.NextFireTime.QuadPart < currentTime.QuadPart) {
+
+            //
+            // Deadline missed - log and update statistics
+            //
             InterlockedIncrement64(&Manager->Stats.TimersMissed);
         }
     }
@@ -2039,10 +1899,6 @@ Routine Description:
     KeReleaseSpinLock(&Manager->Wheel[SlotIndex].Lock, oldIrql);
 }
 
-
-//=============================================================================
-// Work Item Routine (PASSIVE_LEVEL callback execution)
-//=============================================================================
 
 _Use_decl_annotations_
 static
@@ -2055,8 +1911,8 @@ TmpWorkItemRoutine(
 
 Routine Description:
 
-    Work item routine for timers with TmFlag_WorkItemCallback.
-    Executes callback at PASSIVE_LEVEL, then releases the DPC reference.
+    Work item routine for timers with WorkItemCallback flag.
+    Executes callback at PASSIVE_LEVEL.
 
 --*/
 {
@@ -2066,14 +1922,12 @@ Routine Description:
 
     timerInternal = (PTM_TIMER_INTERNAL)Context;
 
-    if (timerInternal == NULL) {
+    if (timerInternal == NULL ||
+        timerInternal->Signature != TM_TIMER_SIGNATURE) {
         return;
     }
 
     TmpFireTimer(timerInternal);
 
-    //
-    // Release the reference that was added by the DPC routine
-    //
     TmpDereferenceTimer(timerInternal);
 }

@@ -1,36 +1,47 @@
 /**
  * ============================================================================
- * ShadowStrike NGAV - ENTERPRISE DPC MANAGEMENT ENGINE
+ * ShadowStrike NGAV — Enterprise DPC Management
  * ============================================================================
  *
  * @file DeferredProcedure.c
- * @brief High-performance DPC (Deferred Procedure Call) management for kernel EDR.
  *
- * Implementation provides CrowdStrike Falcon-class DPC infrastructure with:
- * - Lock-free DPC object pool to avoid allocation at high IRQL
- * - Threaded DPCs for longer operations
- * - DPC chaining for sequential work execution
- * - Per-CPU DPC affinity support
- * - High/Medium/Low importance scheduling
- * - Comprehensive statistics and monitoring
- * - Safe cleanup with reference counting
+ * Pre-allocated, lock-free DPC object pool for the ShadowStrike kernel
+ * sensor.  Provides O(1) DPC object allocation via SLIST at any IRQL
+ * up to DISPATCH_LEVEL, threaded-DPC support, per-processor targeting
+ * with PROCESSOR_NUMBER (>64 CPU safe), and deterministic shutdown
+ * drain via ActiveCount + KEVENT.
  *
- * Security Guarantees:
- * - All parameters validated before use
- * - Pool objects pre-allocated to avoid DISPATCH_LEVEL allocation
- * - Reference counting prevents use-after-free
- * - Proper cleanup on all error paths
- * - No memory leaks under any circumstances
+ * Design decisions (enterprise rationale):
  *
- * Performance Characteristics:
- * - O(1) DPC object allocation from lock-free pool
- * - Minimal lock contention via SLIST
- * - Inline context for small payloads (no allocation)
- * - Cache-aligned structures to prevent false sharing
+ *   1. SLIST_ENTRY is the FIRST field in DPC_OBJECT so that the struct's
+ *      DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT) directive guarantees
+ *      the 16-byte alignment required by CMPXCHG16B on x64.
  *
- * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
- * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
+ *   2. No SEH (__try/__except) in DPC callbacks.  DPC routines run at
+ *      DISPATCH_LEVEL where SEH is undefined behavior.  Faults must
+ *      bugcheck — masking them corrupts kernel state silently.
+ *
+ *   3. No chaining.  The original chain design stored cross-object
+ *      pointers with no ownership model, creating use-after-free and
+ *      double-free races between the chain DPC routine and
+ *      DpcCancelChain.  Chaining was removed entirely.
+ *
+ *   4. ActiveCount / DrainEvent replace spin-wait shutdown.  Each DPC
+ *      routine increments ActiveCount on entry and decrements on
+ *      completion.  DpcShutdown cancels queued DPCs, flushes system
+ *      queues, then waits on DrainEvent (signaled when ActiveCount
+ *      hits 0 during shutdown).
+ *
+ *   5. Dead RefCount code removed.  It was never used — false safety
+ *      claim.  Lifetime is managed by pool ownership + ActiveCount.
+ *
+ *   6. KeSetTargetProcessorDpcEx with PROCESSOR_NUMBER replaces
+ *      deprecated KeSetTargetProcessorDpc (CCHAR truncation on >64 CPUs).
+ *
+ *   7. Inline context reduced to 64 bytes (from 256) to keep
+ *      DPC_OBJECT small and conserve NonPagedPoolNx.
+ *
+ * @copyright (c) ShadowStrike Team.  All rights reserved.
  * ============================================================================
  */
 
@@ -43,133 +54,50 @@
 #endif
 
 // ============================================================================
-// INTERNAL CONSTANTS
+// Internal helpers
 // ============================================================================
 
-#define DPC_MANAGER_MAGIC           0x4450434D  // 'DPCM'
-#define DPC_OBJECT_MAGIC            0x4450434F  // 'DPCO'
+static PDPC_OBJECT
+DpcpAllocateObject(_In_ PDPC_MANAGER Manager);
 
-#define DPC_100NS_PER_MS            10000LL
-#define DPC_100NS_PER_SECOND        10000000LL
+static VOID
+DpcpFreeObject(_In_ PDPC_MANAGER Manager, _In_ PDPC_OBJECT Object);
 
-// ============================================================================
-// INTERNAL FUNCTION PROTOTYPES
-// ============================================================================
+static VOID
+DpcpResetObject(_In_ PDPC_OBJECT Object);
 
-static
-PDPC_OBJECT
-DpcpAllocateObject(
-    _In_ PDPC_MANAGER Manager
-    );
+static KDEFERRED_ROUTINE DpcpDpcRoutine;
 
-static
-VOID
-DpcpFreeObject(
-    _In_ PDPC_MANAGER Manager,
-    _In_ PDPC_OBJECT Object
-    );
+static VOID
+DpcpCompleteObject(_In_ PDPC_MANAGER Manager,
+                   _In_ PDPC_OBJECT Object,
+                   _In_ NTSTATUS Status);
 
-static
-VOID
-DpcpInitializeObject(
-    _In_ PDPC_OBJECT Object,
-    _In_ ULONG ObjectId
-    );
+static NTSTATUS
+DpcpCopyContext(_In_ PDPC_OBJECT Object,
+                _In_reads_bytes_opt_(ContextSize) PVOID Context,
+                _In_ ULONG ContextSize);
 
-static
-VOID
-DpcpResetObject(
-    _In_ PDPC_OBJECT Object
-    );
+static VOID
+DpcpClearContext(_In_ PDPC_OBJECT Object);
 
-static
-KDEFERRED_ROUTINE DpcpGenericDpcRoutine;
-
-static
-KDEFERRED_ROUTINE DpcpChainDpcRoutine;
-
-static
-VOID
-DpcpExecuteCallback(
-    _In_ PDPC_OBJECT Object
-    );
-
-static
-VOID
-DpcpCompleteObject(
-    _In_ PDPC_MANAGER Manager,
-    _In_ PDPC_OBJECT Object,
-    _In_ NTSTATUS Status
-    );
-
-static
-NTSTATUS
-DpcpCopyContext(
-    _In_ PDPC_OBJECT Object,
-    _In_reads_bytes_opt_(ContextSize) PVOID Context,
-    _In_ ULONG ContextSize
-    );
-
-static
-VOID
-DpcpFreeContext(
-    _In_ PDPC_OBJECT Object
-    );
-
-static
-FORCEINLINE
-VOID
-DpcpReferenceObject(
-    _In_ PDPC_OBJECT Object
-    )
+static FORCEINLINE BOOLEAN
+DpcpIsValidManager(_In_opt_ PDPC_MANAGER Manager)
 {
-    InterlockedIncrement(&Object->RefCount);
+    return (Manager != NULL &&
+            InterlockedCompareExchange(&Manager->Initialized, 1, 1) == 1);
 }
 
-static
-FORCEINLINE
-LONG
-DpcpDereferenceObject(
-    _In_ PDPC_OBJECT Object
-    )
+static FORCEINLINE LARGE_INTEGER
+DpcpGetCurrentTime(VOID)
 {
-    return InterlockedDecrement(&Object->RefCount);
-}
-
-static
-FORCEINLINE
-LARGE_INTEGER
-DpcpGetCurrentTime(
-    VOID
-    )
-{
-    LARGE_INTEGER time;
-    KeQuerySystemTime(&time);
-    return time;
-}
-
-static
-FORCEINLINE
-BOOLEAN
-DpcpIsValidManager(
-    _In_opt_ PDPC_MANAGER Manager
-    )
-{
-    return (Manager != NULL && Manager->Initialized);
-}
-
-static
-FORCEINLINE
-BOOLEAN
-DpcpIsValidObject(
-    _In_opt_ PDPC_OBJECT Object
-    )
-{
-    return (Object != NULL && Object->State != DpcState_Free);
+    LARGE_INTEGER t;
+    KeQuerySystemTime(&t);
+    return t;
 }
 
 // ============================================================================
-// MANAGER INITIALIZATION AND SHUTDOWN
+// DpcInitialize
 // ============================================================================
 
 _Use_decl_annotations_
@@ -179,204 +107,180 @@ DpcInitialize(
     ULONG PoolSize
     )
 {
-    NTSTATUS status = STATUS_SUCCESS;
-    PDPC_MANAGER manager = NULL;
-    ULONG actualPoolSize;
+    NTSTATUS status;
+    PDPC_MANAGER mgr = NULL;
+    ULONG actualSize;
+    SIZE_T poolBytes;
     ULONG i;
-    SIZE_T poolMemorySize;
 
     PAGED_CODE();
 
-    //
-    // Validate parameters
-    //
     if (Manager == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
-
     *Manager = NULL;
 
     //
-    // Validate and adjust pool size
+    // Clamp pool size.
     //
     if (PoolSize == 0) {
-        actualPoolSize = DPC_POOL_SIZE_DEFAULT;
+        actualSize = DPC_POOL_SIZE_DEFAULT;
     } else if (PoolSize < DPC_POOL_SIZE_MIN) {
-        actualPoolSize = DPC_POOL_SIZE_MIN;
+        actualSize = DPC_POOL_SIZE_MIN;
     } else if (PoolSize > DPC_POOL_SIZE_MAX) {
-        actualPoolSize = DPC_POOL_SIZE_MAX;
+        actualSize = DPC_POOL_SIZE_MAX;
     } else {
-        actualPoolSize = PoolSize;
+        actualSize = PoolSize;
     }
 
     //
-    // Calculate pool memory size with overflow check
+    // Overflow-safe allocation size.
     //
-    if (!ShadowStrikeSafeMultiply(
-            sizeof(DPC_OBJECT),
-            actualPoolSize,
-            &poolMemorySize)) {
+    if (!ShadowStrikeSafeMultiply(sizeof(DPC_OBJECT), actualSize, &poolBytes)) {
         return STATUS_INTEGER_OVERFLOW;
     }
 
     //
-    // Allocate manager structure
+    // Allocate manager (NonPagedPoolNx — accessed at DISPATCH_LEVEL).
     //
-    manager = (PDPC_MANAGER)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(DPC_MANAGER),
-        DPC_POOL_TAG_OBJECT
-    );
-
-    if (manager == NULL) {
+    mgr = (PDPC_MANAGER)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx, sizeof(DPC_MANAGER), DPC_POOL_TAG);
+    if (mgr == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-
-    RtlZeroMemory(manager, sizeof(DPC_MANAGER));
-
-    //
-    // Initialize lock-free free pool
-    //
-    InitializeSListHead(&manager->FreePool);
-    manager->PoolSize = actualPoolSize;
+    RtlZeroMemory(mgr, sizeof(DPC_MANAGER));
 
     //
-    // Allocate pool memory for DPC objects
+    // Allocate object array.
     //
-    manager->PoolMemory = (PDPC_OBJECT)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        poolMemorySize,
-        DPC_POOL_TAG_OBJECT
-    );
-
-    if (manager->PoolMemory == NULL) {
+    mgr->PoolMemory = (PDPC_OBJECT)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx, poolBytes, DPC_POOL_TAG);
+    if (mgr->PoolMemory == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
-        goto Cleanup;
+        goto Fail;
     }
-
-    RtlZeroMemory(manager->PoolMemory, poolMemorySize);
-    manager->PoolMemorySize = (ULONG)poolMemorySize;
+    RtlZeroMemory(mgr->PoolMemory, poolBytes);
+    mgr->PoolMemorySize = poolBytes;
+    mgr->PoolSize = actualSize;
 
     //
-    // Initialize each DPC object and add to free pool
+    // Initialize SLIST free pool and push every object.
     //
-    for (i = 0; i < actualPoolSize; i++) {
-        PDPC_OBJECT object = &manager->PoolMemory[i];
+    InitializeSListHead(&mgr->FreePool);
 
-        DpcpInitializeObject(object, i + 1);
-
-        //
-        // Push to free list
-        //
-        InterlockedPushEntrySList(
-            &manager->FreePool,
-            &object->FreeListEntry
-        );
-        InterlockedIncrement(&manager->FreeCount);
+    for (i = 0; i < actualSize; i++) {
+        PDPC_OBJECT obj = &mgr->PoolMemory[i];
+        obj->ObjectId = i + 1;
+        obj->State = DpcState_Free;
+        InterlockedPushEntrySList(&mgr->FreePool, &obj->FreeListEntry);
     }
+    mgr->FreeCount = (LONG)actualSize;
 
     //
-    // Initialize configuration
+    // Drain event — signaled when ActiveCount reaches 0 during shutdown.
     //
-    manager->Config.DefaultPoolSize = actualPoolSize;
-    manager->Config.PreferThreadedDpc = FALSE;
-    manager->Config.EnableChaining = TRUE;
+    KeInitializeEvent(&mgr->DrainEvent, NotificationEvent, FALSE);
 
     //
-    // Initialize statistics
+    // Statistics start time.
     //
-    KeQuerySystemTime(&manager->Stats.StartTime);
+    KeQuerySystemTime(&mgr->StartTime);
 
     //
-    // Mark as initialized
+    // Publish — Initialized is the gate for all queue operations.
     //
-    manager->Initialized = TRUE;
+    InterlockedExchange(&mgr->Initialized, 1);
 
-    *Manager = manager;
+    *Manager = mgr;
     return STATUS_SUCCESS;
 
-Cleanup:
-    if (manager != NULL) {
-        if (manager->PoolMemory != NULL) {
-            ShadowStrikeFreePoolWithTag(manager->PoolMemory, DPC_POOL_TAG_OBJECT);
-        }
-        ShadowStrikeFreePoolWithTag(manager, DPC_POOL_TAG_OBJECT);
+Fail:
+    if (mgr->PoolMemory != NULL) {
+        ShadowStrikeFreePoolWithTag(mgr->PoolMemory, DPC_POOL_TAG);
     }
-
+    ShadowStrikeFreePoolWithTag(mgr, DPC_POOL_TAG);
     return status;
 }
+
+// ============================================================================
+// DpcShutdown
+// ============================================================================
 
 _Use_decl_annotations_
 VOID
 DpcShutdown(
-    PDPC_MANAGER Manager
+    PDPC_MANAGER* Manager
     )
 {
+    PDPC_MANAGER mgr;
     ULONG i;
-    PDPC_OBJECT object;
 
     PAGED_CODE();
 
-    if (Manager == NULL || !Manager->Initialized) {
+    if (Manager == NULL || *Manager == NULL) {
         return;
     }
 
-    //
-    // Mark as shutting down
-    //
-    Manager->Initialized = FALSE;
+    mgr = *Manager;
+    *Manager = NULL;
 
     //
-    // Wait for all queued DPCs to complete and cancel pending ones
+    // STEP 1: Gate — reject all new DpcQueue calls.
     //
-    for (i = 0; i < Manager->PoolSize; i++) {
-        object = &Manager->PoolMemory[i];
+    InterlockedExchange(&mgr->Initialized, 0);
 
-        if (object->State == DpcState_Queued) {
-            //
-            // Try to remove from queue
-            //
-            if (KeRemoveQueueDpc(&object->Dpc)) {
+    //
+    // STEP 2: Cancel all queued (but not yet running) DPCs.
+    //
+    for (i = 0; i < mgr->PoolSize; i++) {
+        PDPC_OBJECT obj = &mgr->PoolMemory[i];
+        if (obj->State == DpcState_Queued) {
+            if (KeRemoveQueueDpc(&obj->Dpc)) {
                 //
-                // Successfully removed, free any external context
+                // Successfully dequeued — dec ActiveCount (was incremented
+                // when we called KeInsertQueueDpc successfully).
+                // Note: ActiveCount is incremented in the DPC *routine*
+                // entry, not at queue time, so we do NOT decrement here.
+                // Just reset the object.
                 //
-                DpcpFreeContext(object);
-                DpcpResetObject(object);
-                InterlockedIncrement64(&Manager->Stats.TotalCancelled);
+                DpcpClearContext(obj);
+                DpcpResetObject(obj);
+                InterlockedIncrement64(&mgr->TotalCancelled);
             }
-        }
-
-        //
-        // Wait for running DPCs
-        //
-        while (object->State == DpcState_Running) {
-            LARGE_INTEGER delay;
-            delay.QuadPart = -1 * DPC_100NS_PER_MS;  // 1ms
-            KeDelayExecutionThread(KernelMode, FALSE, &delay);
         }
     }
 
     //
-    // Flush all DPCs on all processors
+    // STEP 3: Flush all system DPC queues.  After this, no DPC from
+    // this driver can be pending in any processor's DPC queue.
     //
     KeFlushQueuedDpcs();
 
     //
-    // Free pool memory
+    // STEP 4: Wait for any in-flight callbacks to complete.
+    // ActiveCount is incremented at DPC routine entry and decremented
+    // in DpcpCompleteObject.  If it's already 0, DrainEvent may
+    // already be signaled (we set it in the decrement path when
+    // Initialized == 0 and count reaches 0).
     //
-    if (Manager->PoolMemory != NULL) {
-        ShadowStrikeFreePoolWithTag(Manager->PoolMemory, DPC_POOL_TAG_OBJECT);
-        Manager->PoolMemory = NULL;
+    if (InterlockedCompareExchange(&mgr->ActiveCount, 0, 0) > 0) {
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -30LL * 10000000LL;   // 30 seconds
+        KeWaitForSingleObject(&mgr->DrainEvent, Executive,
+                              KernelMode, FALSE, &timeout);
     }
 
     //
-    // Free manager
+    // STEP 5: Free resources.
     //
-    ShadowStrikeFreePoolWithTag(Manager, DPC_POOL_TAG_OBJECT);
+    if (mgr->PoolMemory != NULL) {
+        ShadowStrikeFreePoolWithTag(mgr->PoolMemory, DPC_POOL_TAG);
+    }
+    ShadowStrikeFreePoolWithTag(mgr, DPC_POOL_TAG);
 }
 
 // ============================================================================
-// DPC QUEUE OPERATIONS
+// DpcQueue  — queue a DPC with inline context copy
 // ============================================================================
 
 _Use_decl_annotations_
@@ -389,135 +293,109 @@ DpcQueue(
     PDPC_OPTIONS Options
     )
 {
-    NTSTATUS status = STATUS_SUCCESS;
-    PDPC_OBJECT object = NULL;
-    DPC_TYPE dpcType;
-    BOOLEAN targeted = FALSE;
-    ULONG targetProcessor = 0;
+    PDPC_OBJECT obj;
+    DPC_TYPE type;
+    NTSTATUS status;
 
-    //
-    // Validate parameters
-    //
-    if (!DpcpIsValidManager(Manager)) {
+    if (!DpcpIsValidManager(Manager) || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
-
-    if (Callback == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (ContextSize > DPC_MAX_CONTEXT_SIZE && Context != NULL) {
+    if (Context != NULL && ContextSize > DPC_MAX_CONTEXT_SIZE) {
         return STATUS_BUFFER_TOO_SMALL;
     }
 
     //
-    // Parse options
+    // Allocate from free pool.
     //
-    if (Options != NULL) {
-        dpcType = Options->Type;
-        if (Options->TargetProcessor != MAXULONG) {
-            targeted = TRUE;
-            targetProcessor = Options->TargetProcessor;
-        }
-    } else {
-        dpcType = DpcType_Normal;
-    }
-
-    //
-    // Allocate DPC object from pool
-    //
-    object = DpcpAllocateObject(Manager);
-    if (object == NULL) {
-        InterlockedIncrement64(&Manager->Stats.PoolExhausted);
+    obj = DpcpAllocateObject(Manager);
+    if (obj == NULL) {
+        InterlockedIncrement64(&Manager->PoolExhausted);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Configure object
+    // Parse options.
     //
-    object->Type = dpcType;
-    object->Callback = Callback;
-    object->ProcessorTargeted = targeted;
-    object->TargetProcessor = targetProcessor;
-
+    type = DpcType_Normal;
     if (Options != NULL) {
-        object->CompletionCallback = Options->CompletionCallback;
+        type = Options->Type;
+        obj->CompletionCallback = Options->CompletionCallback;
+        obj->CompletionContext  = Options->CompletionContext;
+        if (Options->Targeted) {
+            obj->TargetProcessor  = Options->TargetProcessor;
+            obj->ProcessorTargeted = TRUE;
+        }
     }
+    obj->Type     = type;
+    obj->Callback = Callback;
 
     //
-    // Copy context if provided
+    // Copy inline context.
     //
     if (Context != NULL && ContextSize > 0) {
-        status = DpcpCopyContext(object, Context, ContextSize);
+        status = DpcpCopyContext(obj, Context, ContextSize);
         if (!NT_SUCCESS(status)) {
-            DpcpFreeObject(Manager, object);
+            DpcpFreeObject(Manager, obj);
             return status;
         }
     }
 
     //
-    // Initialize the kernel DPC
+    // Initialize kernel DPC — either normal or threaded, never both.
     //
-    KeInitializeDpc(&object->Dpc, DpcpGenericDpcRoutine, object);
-
-    //
-    // Set importance based on type
-    //
-    switch (dpcType) {
+    if (type == DpcType_Threaded) {
+        KeInitializeThreadedDpc(&obj->Dpc, DpcpDpcRoutine, obj);
+    } else {
+        KeInitializeDpc(&obj->Dpc, DpcpDpcRoutine, obj);
+        switch (type) {
         case DpcType_HighImportance:
-            KeSetImportanceDpc(&object->Dpc, HighImportance);
-            break;
-        case DpcType_MediumImportance:
-            KeSetImportanceDpc(&object->Dpc, MediumImportance);
+            KeSetImportanceDpc(&obj->Dpc, HighImportance);
             break;
         case DpcType_LowImportance:
-            KeSetImportanceDpc(&object->Dpc, LowImportance);
-            break;
-        case DpcType_Threaded:
-            KeInitializeThreadedDpc(&object->Dpc, DpcpGenericDpcRoutine, object);
+            KeSetImportanceDpc(&obj->Dpc, LowImportance);
             break;
         default:
-            KeSetImportanceDpc(&object->Dpc, MediumImportance);
+            KeSetImportanceDpc(&obj->Dpc, MediumImportance);
             break;
+        }
     }
 
     //
-    // Set target processor if specified
+    // Processor targeting — use Ex variant for >64 CPU support.
     //
-    if (targeted) {
-        KeSetTargetProcessorDpc(&object->Dpc, (CCHAR)targetProcessor);
+    if (obj->ProcessorTargeted) {
+        status = KeSetTargetProcessorDpcEx(&obj->Dpc, &obj->TargetProcessor);
+        if (!NT_SUCCESS(status)) {
+            DpcpClearContext(obj);
+            DpcpFreeObject(Manager, obj);
+            return status;
+        }
     }
 
     //
-    // Record queue time
+    // Record queue time, transition to Queued.
     //
-    object->QueueTime = DpcpGetCurrentTime();
+    obj->QueueTime = DpcpGetCurrentTime();
+    InterlockedExchange((PLONG)&obj->State, DpcState_Queued);
 
     //
-    // Update state
+    // Insert into kernel DPC queue.  SystemArgument1 carries the
+    // Manager pointer so the DPC routine can complete the object.
     //
-    InterlockedExchange((PLONG)&object->State, DpcState_Queued);
-
-    //
-    // Queue the DPC
-    //
-    if (!KeInsertQueueDpc(&object->Dpc, Manager, NULL)) {
-        //
-        // DPC was already queued (shouldn't happen with fresh object)
-        //
-        InterlockedExchange((PLONG)&object->State, DpcState_Free);
-        DpcpFreeContext(object);
-        DpcpFreeObject(Manager, object);
+    if (!KeInsertQueueDpc(&obj->Dpc, Manager, NULL)) {
+        InterlockedExchange((PLONG)&obj->State, DpcState_Free);
+        DpcpClearContext(obj);
+        DpcpFreeObject(Manager, obj);
         return STATUS_UNSUCCESSFUL;
     }
 
-    //
-    // Update statistics
-    //
-    InterlockedIncrement64(&Manager->Stats.TotalQueued);
-
+    InterlockedIncrement64(&Manager->TotalQueued);
     return STATUS_SUCCESS;
 }
+
+// ============================================================================
+// DpcQueueExternal — caller-managed context lifetime
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -525,110 +403,82 @@ DpcQueueExternal(
     PDPC_MANAGER Manager,
     DPC_CALLBACK Callback,
     PVOID Context,
+    ULONG ContextSize,
     PDPC_OPTIONS Options
     )
 {
-    NTSTATUS status = STATUS_SUCCESS;
-    PDPC_OBJECT object = NULL;
-    DPC_TYPE dpcType;
-    BOOLEAN targeted = FALSE;
-    ULONG targetProcessor = 0;
+    PDPC_OBJECT obj;
+    DPC_TYPE type;
+    NTSTATUS status;
 
-    //
-    // Validate parameters
-    //
-    if (!DpcpIsValidManager(Manager)) {
+    if (!DpcpIsValidManager(Manager) || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Callback == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // Parse options
-    //
-    if (Options != NULL) {
-        dpcType = Options->Type;
-        if (Options->TargetProcessor != MAXULONG) {
-            targeted = TRUE;
-            targetProcessor = Options->TargetProcessor;
-        }
-    } else {
-        dpcType = DpcType_Normal;
-    }
-
-    //
-    // Allocate DPC object from pool
-    //
-    object = DpcpAllocateObject(Manager);
-    if (object == NULL) {
-        InterlockedIncrement64(&Manager->Stats.PoolExhausted);
+    obj = DpcpAllocateObject(Manager);
+    if (obj == NULL) {
+        InterlockedIncrement64(&Manager->PoolExhausted);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Configure object with external context
-    //
-    object->Type = dpcType;
-    object->Callback = Callback;
-    object->ExternalContext = Context;
-    object->UseInlineContext = FALSE;
-    object->ContextSize = 0;  // Unknown for external
-    object->ProcessorTargeted = targeted;
-    object->TargetProcessor = targetProcessor;
-
+    type = DpcType_Normal;
     if (Options != NULL) {
-        object->CompletionCallback = Options->CompletionCallback;
-    }
-
-    //
-    // Initialize the kernel DPC
-    //
-    if (dpcType == DpcType_Threaded) {
-        KeInitializeThreadedDpc(&object->Dpc, DpcpGenericDpcRoutine, object);
-    } else {
-        KeInitializeDpc(&object->Dpc, DpcpGenericDpcRoutine, object);
-
-        switch (dpcType) {
-            case DpcType_HighImportance:
-                KeSetImportanceDpc(&object->Dpc, HighImportance);
-                break;
-            case DpcType_LowImportance:
-                KeSetImportanceDpc(&object->Dpc, LowImportance);
-                break;
-            default:
-                KeSetImportanceDpc(&object->Dpc, MediumImportance);
-                break;
+        type = Options->Type;
+        obj->CompletionCallback = Options->CompletionCallback;
+        obj->CompletionContext  = Options->CompletionContext;
+        if (Options->Targeted) {
+            obj->TargetProcessor  = Options->TargetProcessor;
+            obj->ProcessorTargeted = TRUE;
         }
     }
 
-    //
-    // Set target processor if specified
-    //
-    if (targeted) {
-        KeSetTargetProcessorDpc(&object->Dpc, (CCHAR)targetProcessor);
+    obj->Type            = type;
+    obj->Callback        = Callback;
+    obj->ExternalContext = Context;
+    obj->UseInlineContext = FALSE;
+    obj->ContextSize     = ContextSize;
+
+    if (type == DpcType_Threaded) {
+        KeInitializeThreadedDpc(&obj->Dpc, DpcpDpcRoutine, obj);
+    } else {
+        KeInitializeDpc(&obj->Dpc, DpcpDpcRoutine, obj);
+        switch (type) {
+        case DpcType_HighImportance:
+            KeSetImportanceDpc(&obj->Dpc, HighImportance);
+            break;
+        case DpcType_LowImportance:
+            KeSetImportanceDpc(&obj->Dpc, LowImportance);
+            break;
+        default:
+            KeSetImportanceDpc(&obj->Dpc, MediumImportance);
+            break;
+        }
     }
 
-    //
-    // Record queue time and update state
-    //
-    object->QueueTime = DpcpGetCurrentTime();
-    InterlockedExchange((PLONG)&object->State, DpcState_Queued);
+    if (obj->ProcessorTargeted) {
+        status = KeSetTargetProcessorDpcEx(&obj->Dpc, &obj->TargetProcessor);
+        if (!NT_SUCCESS(status)) {
+            DpcpFreeObject(Manager, obj);
+            return status;
+        }
+    }
 
-    //
-    // Queue the DPC
-    //
-    if (!KeInsertQueueDpc(&object->Dpc, Manager, NULL)) {
-        InterlockedExchange((PLONG)&object->State, DpcState_Free);
-        DpcpFreeObject(Manager, object);
+    obj->QueueTime = DpcpGetCurrentTime();
+    InterlockedExchange((PLONG)&obj->State, DpcState_Queued);
+
+    if (!KeInsertQueueDpc(&obj->Dpc, Manager, NULL)) {
+        InterlockedExchange((PLONG)&obj->State, DpcState_Free);
+        DpcpFreeObject(Manager, obj);
         return STATUS_UNSUCCESSFUL;
     }
 
-    InterlockedIncrement64(&Manager->Stats.TotalQueued);
-
+    InterlockedIncrement64(&Manager->TotalQueued);
     return STATUS_SUCCESS;
 }
+
+// ============================================================================
+// DpcQueueOnProcessor — convenience wrapper
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -637,17 +487,22 @@ DpcQueueOnProcessor(
     DPC_CALLBACK Callback,
     PVOID Context,
     ULONG ContextSize,
-    ULONG ProcessorNumber
+    USHORT ProcessorGroup,
+    UCHAR ProcessorNumber
     )
 {
-    DPC_OPTIONS options;
-
-    RtlZeroMemory(&options, sizeof(DPC_OPTIONS));
-    options.Type = DpcType_Normal;
-    options.TargetProcessor = ProcessorNumber;
-
-    return DpcQueue(Manager, Callback, Context, ContextSize, &options);
+    DPC_OPTIONS opts;
+    RtlZeroMemory(&opts, sizeof(opts));
+    opts.Type = DpcType_Normal;
+    opts.Targeted = TRUE;
+    opts.TargetProcessor.Group  = ProcessorGroup;
+    opts.TargetProcessor.Number = ProcessorNumber;
+    return DpcQueue(Manager, Callback, Context, ContextSize, &opts);
 }
+
+// ============================================================================
+// DpcQueueThreaded — convenience wrapper
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -658,307 +513,14 @@ DpcQueueThreaded(
     ULONG ContextSize
     )
 {
-    DPC_OPTIONS options;
-
-    RtlZeroMemory(&options, sizeof(DPC_OPTIONS));
-    options.Type = DpcType_Threaded;
-    options.TargetProcessor = MAXULONG;
-
-    return DpcQueue(Manager, Callback, Context, ContextSize, &options);
+    DPC_OPTIONS opts;
+    RtlZeroMemory(&opts, sizeof(opts));
+    opts.Type = DpcType_Threaded;
+    return DpcQueue(Manager, Callback, Context, ContextSize, &opts);
 }
 
 // ============================================================================
-// DPC CHAINING
-// ============================================================================
-
-_Use_decl_annotations_
-NTSTATUS
-DpcCreateChain(
-    PDPC_MANAGER Manager,
-    DPC_CALLBACK* Callbacks,
-    PVOID* Contexts,
-    ULONG* ContextSizes,
-    ULONG Count,
-    DPC_COMPLETION_CALLBACK ChainCompletion,
-    PULONG ChainId
-    )
-{
-    NTSTATUS status = STATUS_SUCCESS;
-    PDPC_OBJECT* chainObjects = NULL;
-    PDPC_OBJECT firstObject = NULL;
-    ULONG i;
-    ULONG allocatedCount = 0;
-
-    //
-    // Validate parameters
-    //
-    if (!DpcpIsValidManager(Manager)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (Callbacks == NULL || Count == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (Count > DPC_CHAIN_MAX_LENGTH) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Manager->Config.EnableChaining) {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    //
-    // Allocate temporary array to hold chain objects
-    //
-    chainObjects = (PDPC_OBJECT*)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        Count * sizeof(PDPC_OBJECT),
-        DPC_POOL_TAG_CHAIN
-    );
-
-    if (chainObjects == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    RtlZeroMemory(chainObjects, Count * sizeof(PDPC_OBJECT));
-
-    //
-    // Allocate all chain objects first
-    //
-    for (i = 0; i < Count; i++) {
-        chainObjects[i] = DpcpAllocateObject(Manager);
-        if (chainObjects[i] == NULL) {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-            goto Cleanup;
-        }
-        allocatedCount++;
-
-        //
-        // Validate callback
-        //
-        if (Callbacks[i] == NULL) {
-            status = STATUS_INVALID_PARAMETER;
-            goto Cleanup;
-        }
-    }
-
-    //
-    // Configure each object in the chain
-    //
-    for (i = 0; i < Count; i++) {
-        PDPC_OBJECT object = chainObjects[i];
-        ULONG contextSize = 0;
-        PVOID context = NULL;
-
-        if (ContextSizes != NULL) {
-            contextSize = ContextSizes[i];
-        }
-        if (Contexts != NULL) {
-            context = Contexts[i];
-        }
-
-        object->Type = DpcType_Normal;
-        object->Callback = Callbacks[i];
-        object->ChainIndex = i;
-        object->ChainLength = Count;
-
-        //
-        // Set up chain linkage
-        //
-        if (i < Count - 1) {
-            object->NextInChain = chainObjects[i + 1];
-        } else {
-            object->NextInChain = NULL;
-            object->CompletionCallback = ChainCompletion;
-        }
-
-        //
-        // Copy context
-        //
-        if (context != NULL && contextSize > 0) {
-            if (contextSize <= DPC_MAX_CONTEXT_SIZE) {
-                status = DpcpCopyContext(object, context, contextSize);
-                if (!NT_SUCCESS(status)) {
-                    goto Cleanup;
-                }
-            } else {
-                //
-                // Context too large for inline
-                //
-                status = STATUS_BUFFER_TOO_SMALL;
-                goto Cleanup;
-            }
-        }
-
-        //
-        // Initialize DPC for chain execution
-        //
-        KeInitializeDpc(&object->Dpc, DpcpChainDpcRoutine, object);
-        KeSetImportanceDpc(&object->Dpc, MediumImportance);
-    }
-
-    //
-    // Return chain ID (first object's ID)
-    //
-    firstObject = chainObjects[0];
-    if (ChainId != NULL) {
-        *ChainId = firstObject->ObjectId;
-    }
-
-    //
-    // Update statistics
-    //
-    InterlockedAdd64(&Manager->Stats.ChainedDpcs, Count);
-
-    //
-    // Free temporary array (objects are still valid in pool)
-    //
-    ShadowStrikeFreePoolWithTag(chainObjects, DPC_POOL_TAG_CHAIN);
-
-    return STATUS_SUCCESS;
-
-Cleanup:
-    //
-    // Free all allocated objects on failure
-    //
-    for (i = 0; i < allocatedCount; i++) {
-        if (chainObjects[i] != NULL) {
-            DpcpFreeContext(chainObjects[i]);
-            DpcpFreeObject(Manager, chainObjects[i]);
-        }
-    }
-
-    if (chainObjects != NULL) {
-        ShadowStrikeFreePoolWithTag(chainObjects, DPC_POOL_TAG_CHAIN);
-    }
-
-    return status;
-}
-
-_Use_decl_annotations_
-NTSTATUS
-DpcQueueChain(
-    PDPC_MANAGER Manager,
-    ULONG ChainId
-    )
-{
-    PDPC_OBJECT object = NULL;
-    ULONG i;
-
-    //
-    // Validate parameters
-    //
-    if (!DpcpIsValidManager(Manager)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (ChainId == 0 || ChainId > Manager->PoolSize) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // Find the chain head object
-    //
-    for (i = 0; i < Manager->PoolSize; i++) {
-        PDPC_OBJECT candidate = &Manager->PoolMemory[i];
-        if (candidate->ObjectId == ChainId &&
-            candidate->ChainIndex == 0 &&
-            candidate->State == DpcState_Allocated) {
-            object = candidate;
-            break;
-        }
-    }
-
-    if (object == NULL) {
-        return STATUS_NOT_FOUND;
-    }
-
-    //
-    // Queue the first DPC in the chain
-    //
-    object->QueueTime = DpcpGetCurrentTime();
-    InterlockedExchange((PLONG)&object->State, DpcState_Queued);
-
-    if (!KeInsertQueueDpc(&object->Dpc, Manager, NULL)) {
-        InterlockedExchange((PLONG)&object->State, DpcState_Allocated);
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    InterlockedIncrement64(&Manager->Stats.TotalQueued);
-
-    return STATUS_SUCCESS;
-}
-
-_Use_decl_annotations_
-NTSTATUS
-DpcCancelChain(
-    PDPC_MANAGER Manager,
-    ULONG ChainId
-    )
-{
-    PDPC_OBJECT object = NULL;
-    PDPC_OBJECT current;
-    ULONG i;
-    ULONG cancelledCount = 0;
-
-    //
-    // Validate parameters
-    //
-    if (!DpcpIsValidManager(Manager)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (ChainId == 0 || ChainId > Manager->PoolSize) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // Find the chain head object
-    //
-    for (i = 0; i < Manager->PoolSize; i++) {
-        PDPC_OBJECT candidate = &Manager->PoolMemory[i];
-        if (candidate->ObjectId == ChainId && candidate->ChainIndex == 0) {
-            object = candidate;
-            break;
-        }
-    }
-
-    if (object == NULL) {
-        return STATUS_NOT_FOUND;
-    }
-
-    //
-    // Cancel all DPCs in the chain
-    //
-    current = object;
-    while (current != NULL) {
-        PDPC_OBJECT next = current->NextInChain;
-
-        if (current->State == DpcState_Queued) {
-            if (KeRemoveQueueDpc(&current->Dpc)) {
-                DpcpFreeContext(current);
-                DpcpResetObject(current);
-                DpcpFreeObject(Manager, current);
-                cancelledCount++;
-            }
-        } else if (current->State == DpcState_Allocated) {
-            DpcpFreeContext(current);
-            DpcpResetObject(current);
-            DpcpFreeObject(Manager, current);
-            cancelledCount++;
-        }
-
-        current = next;
-    }
-
-    InterlockedAdd64(&Manager->Stats.TotalCancelled, cancelledCount);
-
-    return STATUS_SUCCESS;
-}
-
-// ============================================================================
-// STATISTICS
+// DpcGetStatistics
 // ============================================================================
 
 _Use_decl_annotations_
@@ -968,52 +530,30 @@ DpcGetStatistics(
     PDPC_STATISTICS Stats
     )
 {
-    LARGE_INTEGER currentTime;
+    LARGE_INTEGER now;
 
     if (!DpcpIsValidManager(Manager) || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    RtlZeroMemory(Stats, sizeof(DPC_STATISTICS));
+    RtlZeroMemory(Stats, sizeof(*Stats));
 
-    Stats->PoolSize = Manager->PoolSize;
-    Stats->FreeCount = (ULONG)Manager->FreeCount;
+    Stats->PoolSize       = Manager->PoolSize;
+    Stats->FreeCount      = (ULONG)Manager->FreeCount;
     Stats->AllocatedCount = (ULONG)Manager->AllocatedCount;
-    Stats->TotalQueued = Manager->Stats.TotalQueued;
-    Stats->TotalExecuted = Manager->Stats.TotalExecuted;
-    Stats->TotalCancelled = Manager->Stats.TotalCancelled;
-    Stats->PoolExhausted = Manager->Stats.PoolExhausted;
-    Stats->ChainedDpcs = Manager->Stats.ChainedDpcs;
+    Stats->TotalQueued    = (ULONG64)Manager->TotalQueued;
+    Stats->TotalExecuted  = (ULONG64)Manager->TotalExecuted;
+    Stats->TotalCancelled = (ULONG64)Manager->TotalCancelled;
+    Stats->PoolExhausted  = (ULONG64)Manager->PoolExhausted;
 
-    //
-    // Calculate uptime
-    //
-    KeQuerySystemTime(&currentTime);
-    Stats->UpTime.QuadPart = currentTime.QuadPart - Manager->Stats.StartTime.QuadPart;
+    KeQuerySystemTime(&now);
+    Stats->UpTime.QuadPart = now.QuadPart - Manager->StartTime.QuadPart;
 
     return STATUS_SUCCESS;
 }
 
-_Use_decl_annotations_
-VOID
-DpcResetStatistics(
-    PDPC_MANAGER Manager
-    )
-{
-    if (!DpcpIsValidManager(Manager)) {
-        return;
-    }
-
-    InterlockedExchange64(&Manager->Stats.TotalQueued, 0);
-    InterlockedExchange64(&Manager->Stats.TotalExecuted, 0);
-    InterlockedExchange64(&Manager->Stats.TotalCancelled, 0);
-    InterlockedExchange64(&Manager->Stats.PoolExhausted, 0);
-    InterlockedExchange64(&Manager->Stats.ChainedDpcs, 0);
-    KeQuerySystemTime(&Manager->Stats.StartTime);
-}
-
 // ============================================================================
-// INTERNAL HELPER FUNCTIONS
+// Internal: DpcpAllocateObject  (any IRQL <= DISPATCH)
 // ============================================================================
 
 static
@@ -1023,30 +563,35 @@ DpcpAllocateObject(
     )
 {
     PSLIST_ENTRY entry;
-    PDPC_OBJECT object;
+    PDPC_OBJECT obj;
 
-    //
-    // Pop from lock-free free list
-    //
     entry = InterlockedPopEntrySList(&Manager->FreePool);
     if (entry == NULL) {
         return NULL;
     }
 
-    object = CONTAINING_RECORD(entry, DPC_OBJECT, FreeListEntry);
+    //
+    // FreeListEntry is the FIRST field, so CONTAINING_RECORD is a
+    // no-op cast — but we use it for type safety.
+    //
+    obj = CONTAINING_RECORD(entry, DPC_OBJECT, FreeListEntry);
 
     InterlockedDecrement(&Manager->FreeCount);
     InterlockedIncrement(&Manager->AllocatedCount);
 
     //
-    // Reset and mark as allocated
+    // Selective reset — clear only the mutable fields, not the
+    // entire 200+ byte struct (avoids wasting cycles at DISPATCH).
     //
-    DpcpResetObject(object);
-    object->State = DpcState_Allocated;
-    object->RefCount = 1;
+    DpcpResetObject(obj);
+    obj->State = DpcState_Allocated;
 
-    return object;
+    return obj;
 }
+
+// ============================================================================
+// Internal: DpcpFreeObject  (any IRQL <= DISPATCH)
+// ============================================================================
 
 static
 VOID
@@ -1055,36 +600,23 @@ DpcpFreeObject(
     _In_ PDPC_OBJECT Object
     )
 {
-    if (Object == NULL) {
-        return;
-    }
-
-    //
-    // Reset state
-    //
     DpcpResetObject(Object);
 
-    //
-    // Push back to free list
-    //
     InterlockedPushEntrySList(&Manager->FreePool, &Object->FreeListEntry);
 
     InterlockedDecrement(&Manager->AllocatedCount);
     InterlockedIncrement(&Manager->FreeCount);
 }
 
-static
-VOID
-DpcpInitializeObject(
-    _In_ PDPC_OBJECT Object,
-    _In_ ULONG ObjectId
-    )
-{
-    RtlZeroMemory(Object, sizeof(DPC_OBJECT));
-    Object->ObjectId = ObjectId;
-    Object->State = DpcState_Free;
-    Object->RefCount = 0;
-}
+// ============================================================================
+// Internal: DpcpResetObject
+//
+// Selectively clears mutable fields instead of RtlZeroMemory on the
+// entire struct.  This avoids zeroing the KDPC and FreeListEntry
+// (which could be in use by the SLIST infrastructure) and saves
+// cycles in the hot DPC completion path at DISPATCH_LEVEL.
+// ObjectId is stable across reuse and is NOT cleared.
+// ============================================================================
 
 static
 VOID
@@ -1092,163 +624,97 @@ DpcpResetObject(
     _In_ PDPC_OBJECT Object
     )
 {
-    ULONG savedId = Object->ObjectId;
+    Object->State              = DpcState_Free;
+    Object->Type               = DpcType_Normal;
+    Object->Callback           = NULL;
+    Object->CompletionCallback = NULL;
+    Object->CompletionContext  = NULL;
+    Object->ExternalContext    = NULL;
+    Object->ContextSize        = 0;
+    Object->UseInlineContext   = FALSE;
+    Object->ProcessorTargeted  = FALSE;
+    Object->QueueTime.QuadPart = 0;
+    Object->ExecuteTime.QuadPart = 0;
+    Object->CompleteTime.QuadPart = 0;
 
     //
-    // Free any external context we allocated
+    // Zero inline context to prevent info-leak of prior DPC data.
     //
-    DpcpFreeContext(Object);
-
-    //
-    // Clear all fields except ObjectId
-    //
-    RtlZeroMemory(Object, sizeof(DPC_OBJECT));
-    Object->ObjectId = savedId;
-    Object->State = DpcState_Free;
+    RtlZeroMemory(Object->InlineContext, DPC_MAX_CONTEXT_SIZE);
+    RtlZeroMemory(&Object->TargetProcessor, sizeof(PROCESSOR_NUMBER));
 }
+
+// ============================================================================
+// Internal: DpcpDpcRoutine  (runs at DISPATCH_LEVEL for normal DPCs)
+//
+// This is the single DPC routine for all queued DPCs.
+// ActiveCount tracks in-flight callbacks for deterministic shutdown.
+// No SEH — faults at DISPATCH_LEVEL must bugcheck, not be silenced.
+// ============================================================================
 
 static
 VOID
-DpcpGenericDpcRoutine(
+DpcpDpcRoutine(
     _In_ PKDPC Dpc,
     _In_opt_ PVOID DeferredContext,
     _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2
     )
 {
-    PDPC_OBJECT object = (PDPC_OBJECT)DeferredContext;
-    PDPC_MANAGER manager = (PDPC_MANAGER)SystemArgument1;
+    PDPC_OBJECT obj = (PDPC_OBJECT)DeferredContext;
+    PDPC_MANAGER mgr = (PDPC_MANAGER)SystemArgument1;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (object == NULL || manager == NULL) {
+    if (obj == NULL || mgr == NULL) {
         return;
     }
 
     //
-    // Update state
+    // Track in-flight callbacks for shutdown drain.
     //
-    object->ExecuteTime = DpcpGetCurrentTime();
-    InterlockedExchange((PLONG)&object->State, DpcState_Running);
+    InterlockedIncrement(&mgr->ActiveCount);
+
+    obj->ExecuteTime = DpcpGetCurrentTime();
+    InterlockedExchange((PLONG)&obj->State, DpcState_Running);
 
     //
-    // Execute callback
+    // Execute the user callback.  No SEH — if this faults, the
+    // system must bugcheck.  Masking exceptions at DISPATCH_LEVEL
+    // is undefined behavior and silently corrupts kernel state.
     //
-    DpcpExecuteCallback(object);
+    if (obj->Callback != NULL) {
+        PVOID ctx;
+        ULONG ctxSize;
 
-    //
-    // Complete
-    //
-    DpcpCompleteObject(manager, object, STATUS_SUCCESS);
-}
-
-static
-VOID
-DpcpChainDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    )
-{
-    PDPC_OBJECT object = (PDPC_OBJECT)DeferredContext;
-    PDPC_MANAGER manager = (PDPC_MANAGER)SystemArgument1;
-    PDPC_OBJECT nextInChain;
-
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    if (object == NULL || manager == NULL) {
-        return;
-    }
-
-    //
-    // Update state
-    //
-    object->ExecuteTime = DpcpGetCurrentTime();
-    InterlockedExchange((PLONG)&object->State, DpcState_Running);
-
-    //
-    // Execute callback
-    //
-    DpcpExecuteCallback(object);
-
-    //
-    // Get next in chain before completing this object
-    //
-    nextInChain = object->NextInChain;
-
-    //
-    // Complete this object
-    //
-    DpcpCompleteObject(manager, object, STATUS_SUCCESS);
-
-    //
-    // Queue next in chain if exists
-    //
-    if (nextInChain != NULL) {
-        nextInChain->QueueTime = DpcpGetCurrentTime();
-        InterlockedExchange((PLONG)&nextInChain->State, DpcState_Queued);
-
-        if (!KeInsertQueueDpc(&nextInChain->Dpc, manager, NULL)) {
-            //
-            // Failed to queue next, clean up remaining chain
-            //
-            PDPC_OBJECT current = nextInChain;
-            while (current != NULL) {
-                PDPC_OBJECT next = current->NextInChain;
-                DpcpFreeContext(current);
-                DpcpResetObject(current);
-                DpcpFreeObject(manager, current);
-                current = next;
-            }
+        if (obj->UseInlineContext) {
+            ctx     = obj->InlineContext;
+            ctxSize = obj->ContextSize;
+        } else if (obj->ExternalContext != NULL) {
+            ctx     = obj->ExternalContext;
+            ctxSize = obj->ContextSize;
         } else {
-            InterlockedIncrement64(&manager->Stats.TotalQueued);
+            ctx     = NULL;
+            ctxSize = 0;
         }
+
+        obj->Callback(ctx, ctxSize);
     }
+
+    //
+    // Complete: stats, optional completion callback, return to pool.
+    //
+    DpcpCompleteObject(mgr, obj, STATUS_SUCCESS);
 }
 
-static
-VOID
-DpcpExecuteCallback(
-    _In_ PDPC_OBJECT Object
-    )
-{
-    PVOID context;
-    ULONG contextSize;
-
-    if (Object->Callback == NULL) {
-        return;
-    }
-
-    //
-    // Determine context to pass
-    //
-    if (Object->UseInlineContext) {
-        context = Object->InlineContext;
-        contextSize = Object->ContextSize;
-    } else if (Object->ExternalContext != NULL) {
-        context = Object->ExternalContext;
-        contextSize = Object->ContextSize;
-    } else {
-        context = NULL;
-        contextSize = 0;
-    }
-
-    //
-    // Execute the callback
-    //
-    __try {
-        Object->Callback(context, contextSize);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        //
-        // Callback raised exception - log but continue
-        // In production, this would be logged via ETW
-        //
-    }
-}
+// ============================================================================
+// Internal: DpcpCompleteObject
+//
+// Runs at DISPATCH_LEVEL (or PASSIVE for threaded DPCs).
+// Decrements ActiveCount and signals DrainEvent if the manager is
+// shutting down and all callbacks have finished.
+// ============================================================================
 
 static
 VOID
@@ -1258,41 +724,41 @@ DpcpCompleteObject(
     _In_ NTSTATUS Status
     )
 {
-    //
-    // Record completion time
-    //
-    Object->CompleteTime = DpcpGetCurrentTime();
+    LONG remaining;
 
-    //
-    // Update state
-    //
+    Object->CompleteTime = DpcpGetCurrentTime();
     InterlockedExchange((PLONG)&Object->State, DpcState_Completed);
 
     //
-    // Call completion callback if registered
+    // Fire optional completion callback (no SEH — same rationale).
     //
     if (Object->CompletionCallback != NULL) {
-        __try {
-            Object->CompletionCallback(Status, Object->ChainContext);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            //
-            // Completion callback raised exception
-            //
-        }
+        Object->CompletionCallback(Status, Object->CompletionContext);
     }
 
-    //
-    // Update statistics
-    //
-    InterlockedIncrement64(&Manager->Stats.TotalExecuted);
+    InterlockedIncrement64(&Manager->TotalExecuted);
 
     //
-    // Free context and return to pool
+    // Return object to free pool.
     //
-    DpcpFreeContext(Object);
+    DpcpClearContext(Object);
     DpcpFreeObject(Manager, Object);
+
+    //
+    // Decrement in-flight counter.  If we're shutting down
+    // (Initialized == 0) and this was the last active DPC,
+    // signal the drain event so DpcShutdown can proceed.
+    //
+    remaining = InterlockedDecrement(&Manager->ActiveCount);
+    if (remaining == 0 &&
+        InterlockedCompareExchange(&Manager->Initialized, 0, 0) == 0) {
+        KeSetEvent(&Manager->DrainEvent, IO_NO_INCREMENT, FALSE);
+    }
 }
+
+// ============================================================================
+// Internal: DpcpCopyContext
+// ============================================================================
 
 static
 NTSTATUS
@@ -1308,32 +774,26 @@ DpcpCopyContext(
         return STATUS_SUCCESS;
     }
 
-    if (ContextSize <= DPC_MAX_CONTEXT_SIZE) {
-        //
-        // Use inline context
-        //
-        RtlCopyMemory(Object->InlineContext, Context, ContextSize);
-        Object->UseInlineContext = TRUE;
-        Object->ContextSize = ContextSize;
-        return STATUS_SUCCESS;
+    if (ContextSize > DPC_MAX_CONTEXT_SIZE) {
+        return STATUS_BUFFER_TOO_SMALL;
     }
 
-    //
-    // Context too large for inline storage
-    //
-    return STATUS_BUFFER_TOO_SMALL;
+    RtlCopyMemory(Object->InlineContext, Context, ContextSize);
+    Object->UseInlineContext = TRUE;
+    Object->ContextSize = ContextSize;
+    return STATUS_SUCCESS;
 }
+
+// ============================================================================
+// Internal: DpcpClearContext
+// ============================================================================
 
 static
 VOID
-DpcpFreeContext(
+DpcpClearContext(
     _In_ PDPC_OBJECT Object
     )
 {
-    //
-    // Inline context doesn't need freeing
-    // External context is caller's responsibility
-    //
     Object->UseInlineContext = FALSE;
     Object->ExternalContext = NULL;
     Object->ContextSize = 0;

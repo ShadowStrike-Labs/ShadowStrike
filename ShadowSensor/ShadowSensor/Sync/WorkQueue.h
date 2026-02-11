@@ -6,45 +6,33 @@
  * @file WorkQueue.h
  * @brief Enterprise-grade work queue for kernel-mode EDR deferred processing.
  *
- * Provides CrowdStrike Falcon-level work queue capabilities with:
- * - System work queue integration (IoQueueWorkItem/ExQueueWorkItem)
- * - Filter manager work queue support (FltQueueGenericWorkItem)
- * - Priority-based work scheduling (Critical, High, Normal, Low, Background)
- * - Bounded queue with configurable backpressure
+ * Provides:
+ * - IoWorkItem integration for safe driver unload
+ * - FltQueueGenericWorkItem for filter manager operations
+ * - Priority-based dispatch (Critical, High, Normal, Low, Background)
+ * - Bounded queue with backpressure
  * - Work item cancellation with cleanup callbacks
  * - Rundown protection for safe driver unload
- * - Per-CPU work distribution for cache locality
- * - Work item batching for efficiency
- * - Comprehensive statistics and monitoring
- * - IRQL-aware operation selection
- *
- * Architecture:
- * - Uses IoWorkItem for device-associated work (preferred for unload safety)
- * - Falls back to ExWorkItem for lightweight operations
- * - Integrates with FltQueueGenericWorkItem when filter instance available
+ * - Delayed (timer-based) work items
  * - Reference-counted work items prevent use-after-free
- * - Rundown protection ensures clean driver unload
  *
- * Security Guarantees:
- * - Work items are validated before execution
- * - Context memory is properly managed (copy or reference)
- * - Cancellation is atomic and safe
- * - All operations are thread-safe
- * - Resource limits prevent DoS via queue flooding
- *
- * Performance Optimizations:
- * - Lookaside list for work item allocations
- * - Lock-free submission path where possible
- * - Batched notifications to reduce overhead
- * - Per-priority queues for fairness
- *
- * MITRE ATT&CK Coverage:
- * - T1055: Process Injection (deferred async processing)
- * - T1106: Native API (safe work deferral)
- * - T1562: Impair Defenses (reliable async execution)
+ * v2.1.0 Changes (Enterprise Hardened):
+ * ======================================
+ * - KeEnterCriticalRegion around all push lock acquisitions
+ * - Removed INIT segment pragmas (was BSOD on re-init)
+ * - DPC never executes work directly; always defers to IoWorkItem
+ * - Proper SLIST item freeing during shutdown
+ * - Fixed rundown protection balance on retry path
+ * - Separate ListEntry for ActiveList vs priority queue (was corruption)
+ * - Legacy callback wrapper instead of UB function pointer cast
+ * - All per-priority stats use interlocked operations
+ * - Context copies always use NonPaged pool (callable from DISPATCH)
+ * - Wait polling uses KeQueryPerformanceCounter for accurate timing
+ * - Shutdown cancels timers and calls KeFlushQueuedDpcs
+ * - Removed unimplemented features (serialization, affinity, batching, timeout)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition - Hardened)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -64,258 +52,100 @@ extern "C" {
 // POOL TAGS
 // ============================================================================
 
-/**
- * @brief Pool tag for work queue manager: 'qWSs'
- */
 #define SHADOW_WQ_TAG               'qWSs'
-
-/**
- * @brief Pool tag for work items: 'iWSs'
- */
 #define SHADOW_WQ_ITEM_TAG          'iWSs'
-
-/**
- * @brief Pool tag for work context: 'cWSs'
- */
 #define SHADOW_WQ_CONTEXT_TAG       'cWSs'
-
-/**
- * @brief Pool tag for batch allocations: 'bWSs'
- */
-#define SHADOW_WQ_BATCH_TAG         'bWSs'
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
 // ============================================================================
 
-/**
- * @brief Default maximum pending work items
- */
 #define WQ_DEFAULT_MAX_PENDING          65536
-
-/**
- * @brief Minimum allowed pending work items
- */
 #define WQ_MIN_MAX_PENDING              256
-
-/**
- * @brief Maximum allowed pending work items
- */
 #define WQ_MAX_MAX_PENDING              (1024 * 1024)
 
-/**
- * @brief Maximum inline context size (larger contexts are heap-allocated)
- */
+/// Contexts <= this size use inline storage in the work item
 #define WQ_MAX_INLINE_CONTEXT_SIZE      128
 
-/**
- * @brief Maximum external context size (safety limit)
- */
+/// Safety limit for external context allocations
 #define WQ_MAX_CONTEXT_SIZE             (64 * 1024)
 
-/**
- * @brief Default work item timeout (0 = no timeout)
- */
-#define WQ_DEFAULT_TIMEOUT_MS           0
-
-/**
- * @brief Shutdown timeout for pending work items
- */
+/// Shutdown timeout waiting for in-flight items
 #define WQ_SHUTDOWN_TIMEOUT_MS          30000
 
-/**
- * @brief Lookaside list depth for work items
- */
+/// Lookaside list depth for work item recycling
 #define WQ_LOOKASIDE_DEPTH              512
-
-/**
- * @brief Maximum batch size for batched submissions
- */
-#define WQ_MAX_BATCH_SIZE               64
-
-/**
- * @brief Work queue version for compatibility
- */
-#define WQ_VERSION_MAJOR                2
-#define WQ_VERSION_MINOR                0
 
 // ============================================================================
 // ENUMERATIONS
 // ============================================================================
 
-/**
- * @brief Work item priority levels
- */
 typedef enum _SHADOWSTRIKE_WQ_PRIORITY {
-    /// Background priority - lowest, runs when system is idle
     ShadowWqPriorityBackground = 0,
-
-    /// Low priority - below normal operations
     ShadowWqPriorityLow,
-
-    /// Normal priority - default for most work items
     ShadowWqPriorityNormal,
-
-    /// High priority - time-sensitive operations
     ShadowWqPriorityHigh,
-
-    /// Critical priority - must execute ASAP
     ShadowWqPriorityCritical,
-
-    /// Number of priority levels
     ShadowWqPriorityCount
-
 } SHADOWSTRIKE_WQ_PRIORITY;
 
-/**
- * @brief Work queue type
- */
 typedef enum _SHADOWSTRIKE_WQ_TYPE {
-    /// System work queue (IoQueueWorkItem)
-    ShadowWqTypeSystem = 0,
-
-    /// Filter manager work queue (FltQueueGenericWorkItem)
-    ShadowWqTypeFilter,
-
-    /// Executive work queue (ExQueueWorkItem)
-    ShadowWqTypeExecutive,
-
-    /// Delayed work queue (timer-based)
-    ShadowWqTypeDelayed
-
+    ShadowWqTypeSystem = 0,     // IoQueueWorkItem
+    ShadowWqTypeFilter,         // FltQueueGenericWorkItem
+    ShadowWqTypeDelayed         // Timer -> IoQueueWorkItem
 } SHADOWSTRIKE_WQ_TYPE;
 
-/**
- * @brief Work item state
- */
 typedef enum _SHADOWSTRIKE_WQ_ITEM_STATE {
-    /// Item is free/unallocated
     ShadowWqItemStateFree = 0,
-
-    /// Item is allocated but not queued
     ShadowWqItemStateAllocated,
-
-    /// Item is queued waiting for execution
     ShadowWqItemStateQueued,
-
-    /// Item is currently executing
     ShadowWqItemStateRunning,
-
-    /// Item completed successfully
     ShadowWqItemStateCompleted,
-
-    /// Item was cancelled
     ShadowWqItemStateCancelled,
-
-    /// Item failed during execution
     ShadowWqItemStateFailed
-
 } SHADOWSTRIKE_WQ_ITEM_STATE;
 
-/**
- * @brief Work queue state
- */
 typedef enum _SHADOWSTRIKE_WQ_STATE {
-    /// Queue is not initialized
     ShadowWqStateUninitialized = 0,
-
-    /// Queue is initializing
     ShadowWqStateInitializing,
-
-    /// Queue is running and accepting work
     ShadowWqStateRunning,
-
-    /// Queue is paused (not accepting new work)
     ShadowWqStatePaused,
-
-    /// Queue is draining (processing remaining, not accepting new)
     ShadowWqStateDraining,
-
-    /// Queue is shutting down
     ShadowWqStateShutdown
-
 } SHADOWSTRIKE_WQ_STATE;
 
 /**
- * @brief Work item flags
+ * @brief Work item flags (only implemented features)
  */
 typedef enum _SHADOWSTRIKE_WQ_FLAGS {
-    /// No special flags
     ShadowWqFlagNone                = 0x00000000,
-
-    /// Copy context data (don't reference caller's buffer)
     ShadowWqFlagCopyContext         = 0x00000001,
-
-    /// Work item can be cancelled
     ShadowWqFlagCancellable         = 0x00000002,
-
-    /// Delete context on completion (if copied)
     ShadowWqFlagDeleteContext       = 0x00000004,
-
-    /// Signal completion event when done
     ShadowWqFlagSignalCompletion    = 0x00000008,
-
-    /// Long-running operation (use different queue)
     ShadowWqFlagLongRunning         = 0x00000010,
-
-    /// Execute on specific processor
-    ShadowWqFlagProcessorAffinity   = 0x00000020,
-
-    /// Execute serially with same key
-    ShadowWqFlagSerialized          = 0x00000040,
-
-    /// Retry on failure
     ShadowWqFlagRetryOnFailure      = 0x00000080,
-
-    /// Use non-paged pool for context
-    ShadowWqFlagNonPagedContext     = 0x00000100,
-
-    /// Part of a batch submission
-    ShadowWqFlagBatched             = 0x00000200,
-
-    /// High importance (front of queue)
-    ShadowWqFlagHighImportance      = 0x00000400,
-
-    /// Secure wipe context on completion
     ShadowWqFlagSecureContext       = 0x00000800
-
 } SHADOWSTRIKE_WQ_FLAGS;
 
 // ============================================================================
 // CALLBACK TYPES
 // ============================================================================
 
-/**
- * @brief Work routine callback type
- *
- * @param Context       User-provided context
- * @param ContextSize   Size of context in bytes
- *
- * @return NTSTATUS indicating success or failure
- *
- * @note Runs at PASSIVE_LEVEL
- */
+/// Work routine: returns NTSTATUS, receives context + size
 typedef NTSTATUS
 (*PFN_SHADOWSTRIKE_WORK_ROUTINE)(
     _In_opt_ PVOID Context,
     _In_ ULONG ContextSize
     );
 
-/**
- * @brief Legacy work routine (no return value)
- */
+/// Legacy work routine: void return, context only
 typedef VOID
 (*PFN_SHADOWSTRIKE_WORK_ROUTINE_LEGACY)(
     _In_opt_ PVOID Context
     );
 
-/**
- * @brief Completion callback type
- *
- * @param Status        Completion status
- * @param Context       Original work context
- * @param CompletionCtx Completion-specific context
- */
+/// Completion callback
 typedef VOID
 (*PFN_SHADOWSTRIKE_WQ_COMPLETION)(
     _In_ NTSTATUS Status,
@@ -323,26 +153,14 @@ typedef VOID
     _In_opt_ PVOID CompletionContext
     );
 
-/**
- * @brief Cleanup callback for context
- *
- * @param Context       Context to clean up
- * @param ContextSize   Size of context
- */
+/// Cleanup callback for owned context
 typedef VOID
 (*PFN_SHADOWSTRIKE_WQ_CLEANUP)(
     _In_opt_ PVOID Context,
     _In_ ULONG ContextSize
     );
 
-/**
- * @brief Cancel callback type
- *
- * @param Context       Work context being cancelled
- * @param ContextSize   Size of context
- *
- * @note Called when work item is cancelled before execution
- */
+/// Cancel callback
 typedef VOID
 (*PFN_SHADOWSTRIKE_WQ_CANCEL)(
     _In_opt_ PVOID Context,
@@ -354,25 +172,14 @@ typedef VOID
 // ============================================================================
 
 /**
- * @brief Work item options for submission
+ * @brief Options for advanced work item submission
  */
 typedef struct _SHADOWSTRIKE_WQ_OPTIONS {
-    /// Work item priority
     SHADOWSTRIKE_WQ_PRIORITY Priority;
-
-    /// Work item flags
     ULONG Flags;
-
-    /// Timeout in milliseconds (0 = no timeout)
-    ULONG TimeoutMs;
-
-    /// Serialization key (for ordered execution)
-    ULONG64 SerializationKey;
 
     /// Completion callback (optional)
     PFN_SHADOWSTRIKE_WQ_COMPLETION CompletionCallback;
-
-    /// Completion context (optional)
     PVOID CompletionContext;
 
     /// Cleanup callback for context (optional)
@@ -381,67 +188,59 @@ typedef struct _SHADOWSTRIKE_WQ_OPTIONS {
     /// Cancel callback (optional)
     PFN_SHADOWSTRIKE_WQ_CANCEL CancelCallback;
 
-    /// Completion event to signal (optional)
+    /// Completion event to signal (optional, must be NonPaged)
     PKEVENT CompletionEvent;
 
-    /// Target processor for affinity (if flag set)
-    ULONG TargetProcessor;
-
-    /// Maximum retry count (if retry flag set)
+    /// Maximum retry count (if ShadowWqFlagRetryOnFailure set)
     ULONG MaxRetries;
 
     /// Retry delay in milliseconds
     ULONG RetryDelayMs;
 
-    /// Reserved for future use
-    ULONG Reserved[2];
-
 } SHADOWSTRIKE_WQ_OPTIONS, *PSHADOWSTRIKE_WQ_OPTIONS;
 
 /**
- * @brief Work item structure
+ * @brief Work item structure (internal, exposed for inline helpers only)
+ *
+ * Users should NOT access fields directly.
  */
 typedef struct _SHADOWSTRIKE_WORK_ITEM {
-    /// List entry for queue linkage
-    LIST_ENTRY ListEntry;
+    /// List entry for ActiveList tracking
+    LIST_ENTRY ActiveListEntry;
 
-    /// Work item ID (unique identifier)
+    /// Work item ID
     ULONG64 ItemId;
 
-    /// Work routine to execute
+    /// Work routine
     PFN_SHADOWSTRIKE_WORK_ROUTINE Routine;
 
-    /// User context
+    /// User context pointer
     PVOID Context;
 
-    /// Context size
+    /// Context size in bytes
     ULONG ContextSize;
 
-    /// Inline context storage (for small contexts)
+    /// Inline context (for small contexts, avoids separate allocation)
     UCHAR InlineContext[WQ_MAX_INLINE_CONTEXT_SIZE];
 
-    /// TRUE if using inline context
+    /// TRUE if Context points to InlineContext
     BOOLEAN UsingInlineContext;
 
-    /// Work item state
-    volatile SHADOWSTRIKE_WQ_ITEM_STATE State;
+    /// Current state (atomic)
+    volatile LONG State;
 
-    /// Work item priority
+    /// Priority level
     SHADOWSTRIKE_WQ_PRIORITY Priority;
 
-    /// Work item flags
+    /// Flags
     ULONG Flags;
 
-    /// Options snapshot
+    /// Snapshot of submission options
     SHADOWSTRIKE_WQ_OPTIONS Options;
 
-    /// Submission timestamp
+    /// Timestamps
     LARGE_INTEGER SubmitTime;
-
-    /// Start execution timestamp
     LARGE_INTEGER StartTime;
-
-    /// Completion timestamp
     LARGE_INTEGER EndTime;
 
     /// Completion status
@@ -450,129 +249,59 @@ typedef struct _SHADOWSTRIKE_WORK_ITEM {
     /// Retry count
     ULONG RetryCount;
 
-    /// Reference count
+    /// Reference count (atomic)
     volatile LONG RefCount;
 
-    /// Cancellation flag
-    volatile BOOLEAN CancelRequested;
+    /// Cancellation requested (atomic)
+    volatile LONG CancelRequested;
 
-    /// Work item type indicator
+    /// Work queue type
     SHADOWSTRIKE_WQ_TYPE Type;
 
-    /// IO work item (for system queue type)
+    /// IoWorkItem handle (for system + delayed types)
     PIO_WORKITEM IoWorkItem;
 
-    /// Filter work item (for filter queue type)
+    /// Filter work item handle
     PFLT_GENERIC_WORKITEM FltWorkItem;
 
-    /// Timer for delayed execution
+    /// Timer + DPC for delayed execution
     KTIMER DelayTimer;
-
-    /// DPC for timer
     KDPC DelayDpc;
 
     /// Back-reference to manager
     struct _SHADOWSTRIKE_WQ_MANAGER* Manager;
 
-    /// SLIST entry for free list
+    /// SLIST entry for free list (must be MEMORY_ALLOCATION_ALIGNMENT aligned)
     SLIST_ENTRY FreeListEntry;
 
-    /// Padding for cache alignment
-    UCHAR Padding[8];
+    /// Legacy wrapper: original void-return callback
+    PFN_SHADOWSTRIKE_WORK_ROUTINE_LEGACY LegacyRoutine;
 
 } SHADOWSTRIKE_WORK_ITEM, *PSHADOWSTRIKE_WORK_ITEM;
-
-/**
- * @brief Per-priority queue structure
- */
-typedef struct _SHADOWSTRIKE_WQ_PRIORITY_QUEUE {
-    /// Queue head
-    LIST_ENTRY Head;
-
-    /// Queue lock
-    KSPIN_LOCK Lock;
-
-    /// Current item count
-    volatile LONG Count;
-
-    /// Peak item count
-    volatile LONG PeakCount;
-
-    /// Maximum allowed items
-    ULONG MaxItems;
-
-    /// Total items enqueued
-    volatile LONG64 TotalEnqueued;
-
-    /// Total items dequeued
-    volatile LONG64 TotalDequeued;
-
-    /// Total items dropped (queue full)
-    volatile LONG64 TotalDropped;
-
-} SHADOWSTRIKE_WQ_PRIORITY_QUEUE, *PSHADOWSTRIKE_WQ_PRIORITY_QUEUE;
 
 /**
  * @brief Work queue statistics
  */
 typedef struct _SHADOWSTRIKE_WQ_STATISTICS {
-    /// Current queue state
-    SHADOWSTRIKE_WQ_STATE State;
+    volatile LONG State;
 
-    /// Total items submitted
     volatile LONG64 TotalSubmitted;
-
-    /// Total items completed successfully
     volatile LONG64 TotalCompleted;
-
-    /// Total items failed
     volatile LONG64 TotalFailed;
-
-    /// Total items cancelled
     volatile LONG64 TotalCancelled;
-
-    /// Total items timed out
-    volatile LONG64 TotalTimedOut;
-
-    /// Total retries
     volatile LONG64 TotalRetries;
-
-    /// Current pending items
-    volatile LONG CurrentPending;
-
-    /// Peak pending items
-    volatile LONG PeakPending;
-
-    /// Current executing items
-    volatile LONG CurrentExecuting;
-
-    /// Peak executing items
-    volatile LONG PeakExecuting;
-
-    /// Items dropped due to queue full
     volatile LONG64 TotalDropped;
 
-    /// Queue full events
-    volatile LONG64 QueueFullEvents;
+    volatile LONG CurrentPending;
+    volatile LONG PeakPending;
+    volatile LONG CurrentExecuting;
+    volatile LONG PeakExecuting;
 
-    /// Average wait time (microseconds)
-    ULONG64 AverageWaitTimeUs;
+    /// Timing (microseconds, accumulated)
+    volatile LONG64 TotalWaitTimeUs;
+    volatile LONG64 TotalExecTimeUs;
+    volatile LONG64 TimingSampleCount;
 
-    /// Average execution time (microseconds)
-    ULONG64 AverageExecTimeUs;
-
-    /// Per-priority statistics
-    struct {
-        ULONG64 Submitted;
-        ULONG64 Completed;
-        ULONG Pending;
-        ULONG Peak;
-    } PerPriority[ShadowWqPriorityCount];
-
-    /// Uptime
-    LARGE_INTEGER Uptime;
-
-    /// Start time
     LARGE_INTEGER StartTime;
 
 } SHADOWSTRIKE_WQ_STATISTICS, *PSHADOWSTRIKE_WQ_STATISTICS;
@@ -581,32 +310,20 @@ typedef struct _SHADOWSTRIKE_WQ_STATISTICS {
  * @brief Work queue configuration
  */
 typedef struct _SHADOWSTRIKE_WQ_CONFIG {
-    /// Maximum pending items per priority
-    ULONG MaxPendingPerPriority;
-
     /// Total maximum pending items
     ULONG MaxPendingTotal;
-
-    /// Default timeout for items (0 = none)
-    ULONG DefaultTimeoutMs;
 
     /// Lookaside list depth
     USHORT LookasideDepth;
 
-    /// Enable statistics collection
-    BOOLEAN EnableStatistics;
-
     /// Enable detailed timing
     BOOLEAN EnableDetailedTiming;
 
-    /// Device object for IoWorkItem (optional)
+    /// Device object for IoWorkItem (required for system queue)
     PDEVICE_OBJECT DeviceObject;
 
     /// Filter handle for FltWorkItem (optional)
     PFLT_FILTER FilterHandle;
-
-    /// Reserved
-    ULONG Reserved[4];
 
 } SHADOWSTRIKE_WQ_CONFIG, *PSHADOWSTRIKE_WQ_CONFIG;
 
@@ -614,26 +331,23 @@ typedef struct _SHADOWSTRIKE_WQ_CONFIG {
  * @brief Work queue manager
  */
 typedef struct _SHADOWSTRIKE_WQ_MANAGER {
-    /// Manager state
-    volatile SHADOWSTRIKE_WQ_STATE State;
+    /// Manager state (atomic)
+    volatile LONG State;
 
     /// Initialization lock
     EX_PUSH_LOCK InitLock;
 
-    /// Reference count for initialization
+    /// Reference count for init/shutdown balancing
     volatile LONG InitCount;
 
-    /// Priority queues
-    SHADOWSTRIKE_WQ_PRIORITY_QUEUE Queues[ShadowWqPriorityCount];
-
-    /// Free list for work items (lock-free SLIST)
-    SLIST_HEADER FreeList;
-    volatile LONG FreeCount;
-
-    /// Active work items list
+    /// Active work items (tracked via ActiveListEntry)
     LIST_ENTRY ActiveList;
     KSPIN_LOCK ActiveListLock;
     volatile LONG ActiveCount;
+
+    /// Free list (lock-free SLIST for recycling)
+    SLIST_HEADER FreeList;
+    volatile LONG FreeCount;
 
     /// Work item ID generator
     volatile LONG64 NextItemId;
@@ -644,132 +358,71 @@ typedef struct _SHADOWSTRIKE_WQ_MANAGER {
     /// Statistics
     SHADOWSTRIKE_WQ_STATISTICS Stats;
 
-    /// Device object for IoWorkItem
+    /// Device/filter handles (read with InterlockedCompareExchangePointer)
     PDEVICE_OBJECT DeviceObject;
-
-    /// Filter handle for FltWorkItem
     PFLT_FILTER FilterHandle;
 
-    /// Rundown protection
+    /// Rundown protection for safe shutdown
     EX_RUNDOWN_REF RundownProtection;
 
-    /// Shutdown event
+    /// Shutdown + drain events
     KEVENT ShutdownEvent;
-
-    /// Drain complete event
     KEVENT DrainCompleteEvent;
 
-    /// Lookaside list for work items
+    /// Lookaside for work items
     NPAGED_LOOKASIDE_LIST WorkItemLookaside;
     BOOLEAN LookasideInitialized;
 
-    /// Serialization support
-    struct {
-        LIST_ENTRY ActiveKeys;
-        KSPIN_LOCK Lock;
-    } Serialization;
+    /// Current pending count (separate from stats for precise tracking)
+    volatile LONG PendingCount;
 
-    /// Timing statistics
-    struct {
-        volatile LONG64 TotalWaitTime;
-        volatile LONG64 TotalExecTime;
-        volatile LONG64 SampleCount;
-    } Timing;
+    /// Maximum pending (from config, cached for fast check)
+    LONG MaxPending;
 
 } SHADOWSTRIKE_WQ_MANAGER, *PSHADOWSTRIKE_WQ_MANAGER;
 
 // ============================================================================
-// SUBSYSTEM INITIALIZATION
+// PUBLIC API
 // ============================================================================
 
-/**
- * @brief Initialize the work queue subsystem.
- *
- * Must be called during driver initialization before any work queue operations.
- * Thread-safe with reference counting.
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql PASSIVE_LEVEL
- */
+/// Initialize with default config
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeWorkQueueInitialize(
     VOID
     );
 
-/**
- * @brief Initialize work queue with configuration.
- *
- * @param Config        Configuration options
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql PASSIVE_LEVEL
- */
+/// Initialize with explicit config
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeWorkQueueInitializeEx(
     _In_ PSHADOWSTRIKE_WQ_CONFIG Config
     );
 
-/**
- * @brief Shutdown the work queue subsystem.
- *
- * Waits for pending work items to complete or times out.
- *
- * @param WaitForCompletion     TRUE to wait for pending items
- *
- * @irql PASSIVE_LEVEL
- */
+/// Shutdown. Waits for in-flight items if WaitForCompletion is TRUE.
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowStrikeWorkQueueShutdown(
     _In_ BOOLEAN WaitForCompletion
     );
 
-/**
- * @brief Check if work queue is initialized.
- *
- * @return TRUE if initialized and ready
- *
- * @irql <= DISPATCH_LEVEL
- */
+/// Check if initialized and running
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowStrikeWorkQueueIsInitialized(
     VOID
     );
 
-/**
- * @brief Get current work queue state.
- *
- * @return Current state
- *
- * @irql <= DISPATCH_LEVEL
- */
+/// Get current state
 _IRQL_requires_max_(DISPATCH_LEVEL)
 SHADOWSTRIKE_WQ_STATE
 ShadowStrikeWorkQueueGetState(
     VOID
     );
 
-// ============================================================================
-// WORK ITEM SUBMISSION - SIMPLE API
-// ============================================================================
+// ----- Simple submission API -----
 
-/**
- * @brief Queue a work item (simple API).
- *
- * Legacy-compatible simple interface for queuing work.
- *
- * @param Routine       Work routine to execute
- * @param Context       User context (referenced, not copied)
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
+/// Queue work (legacy void-return callback, normal priority)
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowStrikeQueueWorkItem(
@@ -777,17 +430,7 @@ ShadowStrikeQueueWorkItem(
     _In_opt_ PVOID Context
     );
 
-/**
- * @brief Queue a work item with priority.
- *
- * @param Routine       Work routine to execute
- * @param Context       User context
- * @param Priority      Work item priority
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
+/// Queue work with priority (legacy callback)
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowStrikeQueueWorkItemWithPriority(
@@ -796,20 +439,7 @@ ShadowStrikeQueueWorkItemWithPriority(
     _In_ SHADOWSTRIKE_WQ_PRIORITY Priority
     );
 
-/**
- * @brief Queue a work item with copied context.
- *
- * Context is copied to internal storage - caller's buffer can be freed.
- *
- * @param Routine       Work routine to execute
- * @param Context       Context to copy
- * @param ContextSize   Size of context
- * @param Priority      Work item priority
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
+/// Queue work with copied context
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowStrikeQueueWorkItemWithContext(
@@ -819,23 +449,9 @@ ShadowStrikeQueueWorkItemWithContext(
     _In_ SHADOWSTRIKE_WQ_PRIORITY Priority
     );
 
-// ============================================================================
-// WORK ITEM SUBMISSION - ADVANCED API
-// ============================================================================
+// ----- Advanced submission API -----
 
-/**
- * @brief Queue a work item with full options.
- *
- * @param Routine       Work routine to execute
- * @param Context       User context
- * @param ContextSize   Size of context (0 if just pointer)
- * @param Options       Work item options (NULL for defaults)
- * @param ItemId        Receives work item ID (optional)
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
+/// Queue work with full options
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowStrikeQueueWorkItemEx(
@@ -846,22 +462,7 @@ ShadowStrikeQueueWorkItemEx(
     _Out_opt_ PULONG64 ItemId
     );
 
-/**
- * @brief Queue a delayed work item.
- *
- * Work item will be queued after specified delay.
- *
- * @param Routine       Work routine to execute
- * @param Context       User context
- * @param ContextSize   Size of context
- * @param DelayMs       Delay in milliseconds
- * @param Options       Work item options (optional)
- * @param ItemId        Receives work item ID (optional)
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
+/// Queue delayed work item (fires after DelayMs)
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowStrikeQueueDelayedWorkItem(
@@ -873,22 +474,7 @@ ShadowStrikeQueueDelayedWorkItem(
     _Out_opt_ PULONG64 ItemId
     );
 
-/**
- * @brief Queue work item using filter manager.
- *
- * Uses FltQueueGenericWorkItem for filter driver work.
- *
- * @param Instance      Filter instance
- * @param Routine       Work routine
- * @param Context       User context
- * @param ContextSize   Size of context
- * @param Options       Work item options
- * @param ItemId        Receives work item ID
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
+/// Queue work via filter manager
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowStrikeQueueFilterWorkItem(
@@ -900,73 +486,25 @@ ShadowStrikeQueueFilterWorkItem(
     _Out_opt_ PULONG64 ItemId
     );
 
-// ============================================================================
-// WORK ITEM MANAGEMENT
-// ============================================================================
+// ----- Work item management -----
 
-/**
- * @brief Cancel a work item by ID.
- *
- * @param ItemId        Work item ID to cancel
- *
- * @return STATUS_SUCCESS if cancelled
- *         STATUS_NOT_FOUND if item not found
- *         STATUS_UNSUCCESSFUL if already executing
- *
- * @irql <= DISPATCH_LEVEL
- */
+/// Cancel a work item by ID
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowStrikeCancelWorkItem(
     _In_ ULONG64 ItemId
     );
 
-/**
- * @brief Cancel all work items with serialization key.
- *
- * @param SerializationKey  Key to match
- *
- * @return Number of items cancelled
- *
- * @irql <= DISPATCH_LEVEL
- */
-_IRQL_requires_max_(DISPATCH_LEVEL)
-ULONG
-ShadowStrikeCancelWorkItemsByKey(
-    _In_ ULONG64 SerializationKey
-    );
-
-/**
- * @brief Wait for a work item to complete.
- *
- * @param ItemId        Work item ID
- * @param TimeoutMs     Timeout in milliseconds (0 = infinite)
- * @param Status        Receives completion status
- *
- * @return STATUS_SUCCESS if completed
- *         STATUS_TIMEOUT if timed out
- *         STATUS_NOT_FOUND if item not found
- *
- * @irql PASSIVE_LEVEL
- */
+/// Wait for a work item to complete
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeWaitForWorkItem(
     _In_ ULONG64 ItemId,
     _In_ ULONG TimeoutMs,
-    _Out_opt_ PNTSTATUS Status
+    _Out_opt_ PNTSTATUS CompletionStatus
     );
 
-/**
- * @brief Get work item state.
- *
- * @param ItemId        Work item ID
- * @param State         Receives current state
- *
- * @return STATUS_SUCCESS if found
- *
- * @irql <= DISPATCH_LEVEL
- */
+/// Get work item state
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowStrikeGetWorkItemState(
@@ -974,248 +512,90 @@ ShadowStrikeGetWorkItemState(
     _Out_ PSHADOWSTRIKE_WQ_ITEM_STATE State
     );
 
-// ============================================================================
-// QUEUE CONTROL
-// ============================================================================
+// ----- Queue control -----
 
-/**
- * @brief Pause work queue (stop accepting new items).
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
-NTSTATUS
-ShadowStrikeWorkQueuePause(
-    VOID
-    );
+NTSTATUS ShadowStrikeWorkQueuePause(VOID);
 
-/**
- * @brief Resume work queue.
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
-NTSTATUS
-ShadowStrikeWorkQueueResume(
-    VOID
-    );
+NTSTATUS ShadowStrikeWorkQueueResume(VOID);
 
-/**
- * @brief Drain work queue (wait for all pending items).
- *
- * @param TimeoutMs     Timeout in milliseconds
- *
- * @return STATUS_SUCCESS if drained
- *         STATUS_TIMEOUT if timed out
- *
- * @irql PASSIVE_LEVEL
- */
 _IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS
-ShadowStrikeWorkQueueDrain(
-    _In_ ULONG TimeoutMs
-    );
+NTSTATUS ShadowStrikeWorkQueueDrain(_In_ ULONG TimeoutMs);
 
-/**
- * @brief Flush work queue (cancel all pending items).
- *
- * @return Number of items cancelled
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
-ULONG
-ShadowStrikeWorkQueueFlush(
-    VOID
-    );
+ULONG ShadowStrikeWorkQueueFlush(VOID);
 
-// ============================================================================
-// STATISTICS
-// ============================================================================
+// ----- Statistics -----
 
-/**
- * @brief Get work queue statistics.
- *
- * @param Statistics    Receives current statistics
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
-VOID
-ShadowStrikeGetWorkQueueStatistics(
-    _Out_ PSHADOWSTRIKE_WQ_STATISTICS Statistics
-    );
+VOID ShadowStrikeGetWorkQueueStatistics(
+    _Out_ PSHADOWSTRIKE_WQ_STATISTICS Statistics);
 
-/**
- * @brief Reset work queue statistics.
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
-VOID
-ShadowStrikeResetWorkQueueStatistics(
-    VOID
-    );
+VOID ShadowStrikeResetWorkQueueStatistics(VOID);
 
-/**
- * @brief Get pending work item count.
- *
- * @return Number of pending items
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
-LONG
-ShadowStrikeGetPendingWorkItemCount(
-    VOID
-    );
+LONG ShadowStrikeGetPendingWorkItemCount(VOID);
 
-/**
- * @brief Get pending count by priority.
- *
- * @param Priority      Priority level
- *
- * @return Number of pending items at priority
- *
- * @irql <= DISPATCH_LEVEL
- */
-_IRQL_requires_max_(DISPATCH_LEVEL)
-LONG
-ShadowStrikeGetPendingWorkItemCountByPriority(
-    _In_ SHADOWSTRIKE_WQ_PRIORITY Priority
-    );
+// ----- Configuration -----
 
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
-
-/**
- * @brief Set device object for IoWorkItem.
- *
- * @param DeviceObject  Device object to use
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql PASSIVE_LEVEL
- */
 _IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS
-ShadowStrikeWorkQueueSetDeviceObject(
-    _In_ PDEVICE_OBJECT DeviceObject
-    );
+NTSTATUS ShadowStrikeWorkQueueSetDeviceObject(
+    _In_ PDEVICE_OBJECT DeviceObject);
 
-/**
- * @brief Set filter handle for FltWorkItem.
- *
- * @param FilterHandle  Filter handle
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql PASSIVE_LEVEL
- */
 _IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS
-ShadowStrikeWorkQueueSetFilterHandle(
-    _In_ PFLT_FILTER FilterHandle
-    );
+NTSTATUS ShadowStrikeWorkQueueSetFilterHandle(
+    _In_ PFLT_FILTER FilterHandle);
 
-/**
- * @brief Initialize default options structure.
- *
- * @param Options       Options to initialize
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
-VOID
-ShadowStrikeInitWorkQueueOptions(
-    _Out_ PSHADOWSTRIKE_WQ_OPTIONS Options
-    );
+VOID ShadowStrikeInitWorkQueueOptions(
+    _Out_ PSHADOWSTRIKE_WQ_OPTIONS Options);
 
-/**
- * @brief Initialize default configuration.
- *
- * @param Config        Configuration to initialize
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
-VOID
-ShadowStrikeInitWorkQueueConfig(
-    _Out_ PSHADOWSTRIKE_WQ_CONFIG Config
-    );
+VOID ShadowStrikeInitWorkQueueConfig(
+    _Out_ PSHADOWSTRIKE_WQ_CONFIG Config);
 
 // ============================================================================
-// INLINE UTILITY FUNCTIONS
+// INLINE UTILITIES
 // ============================================================================
 
-/**
- * @brief Check if priority is valid.
- */
-FORCEINLINE
-BOOLEAN
+FORCEINLINE BOOLEAN
 ShadowStrikeIsValidWqPriority(
-    _In_ SHADOWSTRIKE_WQ_PRIORITY Priority
-    )
+    _In_ SHADOWSTRIKE_WQ_PRIORITY Priority)
 {
     return (Priority >= ShadowWqPriorityBackground &&
             Priority < ShadowWqPriorityCount);
 }
 
-/**
- * @brief Map Windows work queue type to our priority.
- */
-FORCEINLINE
-WORK_QUEUE_TYPE
+FORCEINLINE WORK_QUEUE_TYPE
 ShadowStrikeWqPriorityToWorkQueueType(
-    _In_ SHADOWSTRIKE_WQ_PRIORITY Priority
-    )
+    _In_ SHADOWSTRIKE_WQ_PRIORITY Priority)
 {
     switch (Priority) {
         case ShadowWqPriorityCritical:
-            return CriticalWorkQueue;
         case ShadowWqPriorityHigh:
             return CriticalWorkQueue;
-        case ShadowWqPriorityNormal:
-            return DelayedWorkQueue;
-        case ShadowWqPriorityLow:
-            return DelayedWorkQueue;
-        case ShadowWqPriorityBackground:
-            return DelayedWorkQueue;
         default:
             return DelayedWorkQueue;
     }
 }
 
-/**
- * @brief Get current timestamp in 100ns units.
- */
-FORCEINLINE
-LARGE_INTEGER
-ShadowStrikeWqGetTimestamp(
-    VOID
-    )
+FORCEINLINE LARGE_INTEGER
+ShadowStrikeWqGetTimestamp(VOID)
 {
     LARGE_INTEGER Time;
     KeQuerySystemTimePrecise(&Time);
     return Time;
 }
 
-/**
- * @brief Calculate elapsed time in microseconds.
- */
-FORCEINLINE
-ULONG64
+FORCEINLINE ULONG64
 ShadowStrikeWqGetElapsedUs(
-    _In_ PLARGE_INTEGER StartTime,
-    _In_ PLARGE_INTEGER EndTime
-    )
+    _In_ PLARGE_INTEGER Start,
+    _In_ PLARGE_INTEGER End)
 {
-    return (ULONG64)((EndTime->QuadPart - StartTime->QuadPart) / 10);
+    if (End->QuadPart <= Start->QuadPart) return 0;
+    return (ULONG64)((End->QuadPart - Start->QuadPart) / 10);
 }
 
 #ifdef __cplusplus

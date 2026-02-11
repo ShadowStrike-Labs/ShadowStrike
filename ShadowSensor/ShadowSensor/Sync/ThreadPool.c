@@ -6,220 +6,235 @@
  * @file ThreadPool.c
  * @brief Enterprise-grade managed thread pool for kernel-mode EDR operations.
  *
- * Implements CrowdStrike Falcon-class thread management with:
- * - Dynamic thread scaling based on workload metrics
- * - CPU affinity and NUMA-aware thread placement
- * - Priority-based thread scheduling
- * - Graceful shutdown with work completion guarantees
- * - Per-thread statistics and performance monitoring
- * - Idle thread timeout and automatic cleanup
- * - Integration with work queue systems
+ * IRQL Safety Architecture:
+ * - Scale timer fires DPC at DISPATCH_LEVEL.
+ *   DPC queues IoWorkItem to defer ALL scaling work to PASSIVE_LEVEL.
+ *   PsCreateSystemThread and thread cleanup ONLY happen at PASSIVE_LEVEL.
+ * - Worker threads run at PASSIVE_LEVEL. They apply their own affinity
+ *   and priority at startup (not from creating thread).
+ * - All pool configuration changes require PASSIVE_LEVEL.
+ * - Counters (ThreadCount, IdleThreadCount, RunningThreadCount) are
+ *   volatile LONGs, updated with Interlocked* ops — safe at any IRQL.
  *
- * Security Hardened v2.0.0:
- * - All thread operations are synchronized
- * - Reference counting prevents use-after-free
- * - Safe cleanup with drain synchronization
- * - No race conditions in scaling operations
- * - Proper IRQL handling throughout
+ * Synchronization:
+ * - ThreadListLock (KSPIN_LOCK): protects ThreadList add/remove.
+ *   Acquired briefly at <= DISPATCH_LEVEL.
+ * - ExecutorLock (EX_PUSH_LOCK): protects WorkExecutor pointer swap.
+ *   Acquired shared in worker threads, exclusive in TpSetWorkExecutor.
+ * - ConfigLock (EX_PUSH_LOCK): protects MinThreads/MaxThreads/thresholds.
+ * - ScaleInProgress (InterlockedCAS): prevents concurrent scale operations.
  *
- * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * Thread Lifecycle:
+ * - TppCreateThread: alloc info → PsCreateSystemThread → ObReferenceObjectByHandle
+ *   → add to list → signal StartEvent. PASSIVE_LEVEL only.
+ * - TppDestroyThread: signal StopEvent → wait → ObDereference → ZwClose
+ *   → cleanup callback → free. PASSIVE_LEVEL only.
+ * - Worker thread exit: save pre-exit state → decrement correct counter
+ *   → remove self from list under spinlock → decrement ThreadCount.
+ *
+ * Memory:
+ * - All allocations use ShadowStrikeAllocatePoolWithTag / ShadowStrikeFreePoolWithTag.
+ *   No lookaside list (avoids alloc/free mismatch bugs).
+ *
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
 
 #include "ThreadPool.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Core/Globals.h"
 
 // ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
 
-/**
- * @brief Magic value for pool validation
- */
 #define TP_POOL_MAGIC                   0x50545048  // 'PTPH'
-
-/**
- * @brief Thread stack size (default kernel stack)
- */
-#define TP_THREAD_STACK_SIZE            0
-
-/**
- * @brief Maximum time to wait for thread termination (ms)
- */
-#define TP_THREAD_TERMINATE_TIMEOUT_MS  10000
-
-/**
- * @brief Minimum interval between scale operations (ms)
- */
-#define TP_SCALE_COOLDOWN_MS            5000
-
-/**
- * @brief Default work executor timeout (ms)
- */
-#define TP_WORK_EXECUTOR_TIMEOUT_MS     100
-
-/**
- * @brief Thread info magic for validation
- */
 #define TP_THREAD_INFO_MAGIC            0x54495450  // 'TITP'
+#define TP_THREAD_STACK_SIZE            0           // Default kernel stack
+#define TP_THREAD_TERMINATE_TIMEOUT_MS  10000
+#define TP_SCALE_COOLDOWN_MS            5000
+#define TP_WORK_WAIT_TIMEOUT_MS         100
 
 // ============================================================================
-// EXTENDED INTERNAL STRUCTURES
+// INTERNAL STRUCTURES (private to this .c file)
 // ============================================================================
 
-/**
- * @brief Extended thread pool structure with internal fields
- */
-typedef struct _TP_THREAD_POOL_INTERNAL {
-    //
-    // Public structure (must be first)
-    //
-    TP_THREAD_POOL Public;
-
-    //
-    // Validation
-    //
+//
+// TP_THREAD_INFO: Full per-thread state. Opaque to callers.
+//
+struct _TP_THREAD_INFO {
     ULONG Magic;
 
-    //
-    // Work executor
-    //
+    // Thread identity
+    HANDLE ThreadHandle;
+    PKTHREAD ThreadObject;
+    ULONG ThreadIndex;
+
+    // Thread state
+    volatile TP_THREAD_STATE State;
+    volatile BOOLEAN ShutdownRequested;
+
+    // Idle tracking
+    LARGE_INTEGER LastActivityTime;
+    LARGE_INTEGER IdleStartTime;
+    LARGE_INTEGER WorkStartTime;
+
+    // Statistics (per-thread, updated with Interlocked)
+    volatile LONG64 WorkItemsCompleted;
+    volatile LONG64 TotalWorkTimeMs;
+    volatile LONG64 TotalIdleTimeMs;
+
+    // Thread control events
+    KEVENT StartEvent;          // Signaled to let worker start
+    KEVENT StopEvent;           // Signaled to request worker exit
+    volatile LONG StopRequested;
+
+    // Work execution state
+    volatile LONG IsExecuting;
+
+    // Owner pool (back-pointer, protected by pool lifetime)
+    struct _TP_THREAD_POOL* Pool;
+
+    // List linkage (protected by Pool->ThreadListLock)
+    LIST_ENTRY ListEntry;
+};
+
+//
+// TP_THREAD_POOL: Full pool state. Opaque to callers.
+//
+struct _TP_THREAD_POOL {
+    ULONG Magic;
+    volatile BOOLEAN Initialized;
+    volatile BOOLEAN ShuttingDown;
+
+    // Thread list (protected by ThreadListLock)
+    LIST_ENTRY ThreadList;
+    KSPIN_LOCK ThreadListLock;
+    volatile LONG ThreadCount;
+    volatile LONG IdleThreadCount;
+    volatile LONG RunningThreadCount;
+
+    // Thread limits (protected by ConfigLock)
+    ULONG MinThreads;
+    ULONG MaxThreads;
+
+    // Events
+    KSEMAPHORE WorkAvailableSemaphore;  // Semaphore (wakes one thread per signal)
+    KEVENT ShutdownEvent;               // Manual-reset (broadcast)
+    KEVENT AllThreadsStoppedEvent;      // Manual-reset
+
+    // Scaling
+    KTIMER ScaleTimer;
+    KDPC ScaleDpc;
+    volatile BOOLEAN ScalingEnabled;
+    ULONG ScaleUpThreshold;
+    ULONG ScaleDownThreshold;
+    ULONG ScaleIntervalMs;
+    ULONG IdleTimeoutMs;
+    LARGE_INTEGER LastScaleTime;
+    volatile LONG ScaleInProgress;
+
+    // DPC → work item deferral for scaling
+    PIO_WORKITEM ScaleWorkItem;
+    PDEVICE_OBJECT DeviceObject;
+    volatile LONG ScaleWorkItemQueued;
+    KEVENT ScaleWorkItemComplete;
+
+    // Work executor (protected by ExecutorLock)
     TP_WORK_EXECUTOR WorkExecutor;
     PVOID ExecutorContext;
     EX_PUSH_LOCK ExecutorLock;
 
-    //
-    // Scaling state
-    //
-    LARGE_INTEGER LastScaleTime;
-    volatile LONG ScaleInProgress;
-    ULONG ScaleIntervalMs;
-    ULONG IdleTimeoutMs;
+    // Configuration lock
+    EX_PUSH_LOCK ConfigLock;
 
-    //
-    // Reference counting
-    //
+    // Callbacks
+    TP_THREAD_INIT_CALLBACK InitCallback;
+    TP_THREAD_CLEANUP_CALLBACK CleanupCallback;
+    PVOID CallbackContext;
+
+    // Priority / affinity
+    TP_THREAD_PRIORITY DefaultPriority;
+    KAFFINITY AffinityMask;
+
+    // Reference counting (prevents free while threads still reference pool)
     volatile LONG ReferenceCount;
 
-    //
     // Thread ID assignment
-    //
     volatile LONG NextThreadIndex;
 
-    //
-    // Lookaside for thread info
-    //
-    NPAGED_LOOKASIDE_LIST ThreadInfoLookaside;
-    BOOLEAN LookasideInitialized;
-
-} TP_THREAD_POOL_INTERNAL, *PTP_THREAD_POOL_INTERNAL;
-
-/**
- * @brief Extended thread info with internal fields
- */
-typedef struct _TP_THREAD_INFO_INTERNAL {
-    //
-    // Public structure (must be first)
-    //
-    TP_THREAD_INFO Public;
-
-    //
-    // Validation
-    //
-    ULONG Magic;
-
-    //
-    // Owner pool reference
-    //
-    PTP_THREAD_POOL_INTERNAL Pool;
-
-    //
-    // Thread control
-    //
-    KEVENT StartEvent;
-    KEVENT StopEvent;
-    volatile LONG StopRequested;
-
-    //
-    // Work execution state
-    //
-    volatile LONG IsExecuting;
-    LARGE_INTEGER ExecutionStartTime;
-
-} TP_THREAD_INFO_INTERNAL, *PTP_THREAD_INFO_INTERNAL;
+    // Statistics
+    struct {
+        volatile LONG64 TotalWorkItems;
+        volatile LONG64 ThreadsCreated;
+        volatile LONG64 ThreadsDestroyed;
+        volatile LONG64 ScaleUpCount;
+        volatile LONG64 ScaleDownCount;
+        LARGE_INTEGER StartTime;
+    } Stats;
+};
 
 // ============================================================================
 // PRIVATE FUNCTION PROTOTYPES
 // ============================================================================
 
 static KSTART_ROUTINE TppWorkerThreadRoutine;
-
 static KDEFERRED_ROUTINE TppScaleDpcRoutine;
 
+_Function_class_(IO_WORKITEM_ROUTINE)
+static VOID NTAPI
+TppScaleWorkItemRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 TppCreateThread(
-    _Inout_ PTP_THREAD_POOL_INTERNAL Pool,
-    _Out_ PTP_THREAD_INFO_INTERNAL* ThreadInfo
-);
+    _Inout_ PTP_THREAD_POOL Pool,
+    _Out_ PTP_THREAD_INFO* ThreadInfo
+    );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 TppDestroyThread(
-    _Inout_ PTP_THREAD_INFO_INTERNAL ThreadInfo,
+    _Inout_ PTP_THREAD_INFO ThreadInfo,
     _In_ BOOLEAN Wait
-);
+    );
 
 static VOID
 TppSignalThreadStop(
-    _Inout_ PTP_THREAD_INFO_INTERNAL ThreadInfo
-);
+    _Inout_ PTP_THREAD_INFO ThreadInfo
+    );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static BOOLEAN
 TppIsValidPool(
     _In_opt_ PTP_THREAD_POOL Pool
-);
-
-static BOOLEAN
-TppIsValidThreadInfo(
-    _In_opt_ PTP_THREAD_INFO_INTERNAL ThreadInfo
-);
+    );
 
 static VOID
 TppAcquirePoolReference(
-    _Inout_ PTP_THREAD_POOL_INTERNAL Pool
-);
+    _Inout_ PTP_THREAD_POOL Pool
+    );
 
 static VOID
 TppReleasePoolReference(
-    _Inout_ PTP_THREAD_POOL_INTERNAL Pool
-);
-
-static VOID
-TppUpdateThreadStatistics(
-    _Inout_ PTP_THREAD_INFO_INTERNAL ThreadInfo,
-    _In_ BOOLEAN WorkCompleted,
-    _In_ LARGE_INTEGER WorkTime
-);
+    _Inout_ PTP_THREAD_POOL Pool
+    );
 
 static VOID
 TppSetThreadPriority(
     _In_ PKTHREAD Thread,
     _In_ TP_THREAD_PRIORITY Priority
-);
+    );
 
-static VOID
-TppSetThreadAffinity(
-    _In_ PKTHREAD Thread,
-    _In_ KAFFINITY AffinityMask,
-    _In_ BOOLEAN UseIdealProcessor,
-    _In_ ULONG ThreadIndex
-);
-
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 TppEvaluateScaling(
-    _Inout_ PTP_THREAD_POOL_INTERNAL Pool
-);
+    _Inout_ PTP_THREAD_POOL Pool
+    );
 
 static VOID
 TppDefaultWorkExecutor(
@@ -227,7 +242,7 @@ TppDefaultWorkExecutor(
     _In_ PKEVENT WorkEvent,
     _In_ PKEVENT ShutdownEvent,
     _In_opt_ PVOID ExecutorContext
-);
+    );
 
 // ============================================================================
 // INITIALIZATION AND CLEANUP
@@ -237,19 +252,18 @@ _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 TpCreate(
     _Out_ PTP_THREAD_POOL* Pool,
-    _In_ PTP_CONFIG Config
+    _In_ const TP_CONFIG* Config
 )
 {
     NTSTATUS status = STATUS_SUCCESS;
-    PTP_THREAD_POOL_INTERNAL pool = NULL;
+    PTP_THREAD_POOL pool = NULL;
+    TP_CONFIG localConfig;
     ULONG i;
     LARGE_INTEGER dueTime;
+    BOOLEAN timerStarted = FALSE;
 
     PAGED_CODE();
 
-    //
-    // Validate parameters
-    //
     if (Pool == NULL || Config == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -257,161 +271,160 @@ TpCreate(
     *Pool = NULL;
 
     //
-    // Validate configuration
+    // Make a local copy of config so we don't modify caller's _In_ struct
     //
-    if (Config->MinThreads < TP_MIN_THREADS) {
-        Config->MinThreads = TP_MIN_THREADS;
+    RtlCopyMemory(&localConfig, Config, sizeof(TP_CONFIG));
+
+    //
+    // Validate and clamp configuration
+    //
+    if (localConfig.MinThreads < TP_MIN_THREADS) {
+        localConfig.MinThreads = TP_MIN_THREADS;
     }
-    if (Config->MaxThreads > TP_MAX_THREADS) {
-        Config->MaxThreads = TP_MAX_THREADS;
+    if (localConfig.MaxThreads > TP_MAX_THREADS) {
+        localConfig.MaxThreads = TP_MAX_THREADS;
     }
-    if (Config->MinThreads > Config->MaxThreads) {
+    if (localConfig.MaxThreads < localConfig.MinThreads) {
         return STATUS_INVALID_PARAMETER;
+    }
+    if (localConfig.ScaleUpThreshold == 0) {
+        localConfig.ScaleUpThreshold = TP_SCALE_UP_THRESHOLD;
+    }
+    if (localConfig.ScaleDownThreshold == 0) {
+        localConfig.ScaleDownThreshold = TP_SCALE_DOWN_THRESHOLD;
+    }
+    if (localConfig.ScaleIntervalMs == 0) {
+        localConfig.ScaleIntervalMs = TP_SCALE_INTERVAL_MS;
+    }
+    if (localConfig.IdleTimeoutMs == 0) {
+        localConfig.IdleTimeoutMs = TP_IDLE_TIMEOUT_MS;
     }
 
     //
     // Allocate pool structure
     //
-    pool = (PTP_THREAD_POOL_INTERNAL)ShadowStrikeAllocatePoolWithTag(
+    pool = (PTP_THREAD_POOL)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
-        sizeof(TP_THREAD_POOL_INTERNAL),
+        sizeof(TP_THREAD_POOL),
         TP_POOL_TAG_CONTEXT
     );
-
     if (pool == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    RtlZeroMemory(pool, sizeof(TP_THREAD_POOL));
 
-    RtlZeroMemory(pool, sizeof(TP_THREAD_POOL_INTERNAL));
-
-    //
-    // Initialize magic for validation
-    //
     pool->Magic = TP_POOL_MAGIC;
+    pool->ReferenceCount = 1;
 
     //
-    // Initialize thread list
+    // Initialize synchronization
     //
-    InitializeListHead(&pool->Public.ThreadList);
-    KeInitializeSpinLock(&pool->Public.ThreadListLock);
+    InitializeListHead(&pool->ThreadList);
+    KeInitializeSpinLock(&pool->ThreadListLock);
+    ExInitializePushLock(&pool->ExecutorLock);
+    ExInitializePushLock(&pool->ConfigLock);
 
     //
-    // Set thread limits
+    // Store configuration
     //
-    pool->Public.MinThreads = Config->MinThreads;
-    pool->Public.MaxThreads = Config->MaxThreads;
+    pool->MinThreads = localConfig.MinThreads;
+    pool->MaxThreads = localConfig.MaxThreads;
+    pool->ScaleUpThreshold = localConfig.ScaleUpThreshold;
+    pool->ScaleDownThreshold = localConfig.ScaleDownThreshold;
+    pool->ScaleIntervalMs = localConfig.ScaleIntervalMs;
+    pool->IdleTimeoutMs = localConfig.IdleTimeoutMs;
+    pool->DefaultPriority = localConfig.DefaultPriority;
+    pool->AffinityMask = localConfig.AffinityMask != 0 ?
+        localConfig.AffinityMask : KeQueryActiveProcessors();
+    pool->DeviceObject = localConfig.DeviceObject;
 
     //
-    // Initialize events
+    // Initialize events/semaphore
     //
-    KeInitializeEvent(&pool->Public.WorkAvailableEvent, SynchronizationEvent, FALSE);
-    KeInitializeEvent(&pool->Public.ShutdownEvent, NotificationEvent, FALSE);
-    KeInitializeEvent(&pool->Public.AllThreadsStoppedEvent, NotificationEvent, FALSE);
+    KeInitializeSemaphore(&pool->WorkAvailableSemaphore, 0, MAXLONG);
+    KeInitializeEvent(&pool->ShutdownEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&pool->AllThreadsStoppedEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&pool->ScaleWorkItemComplete, NotificationEvent, TRUE);
 
     //
-    // Initialize scaling
+    // Initialize scaling timer/DPC
     //
-    pool->Public.ScaleUpThreshold = Config->ScaleUpThreshold > 0 ?
-        Config->ScaleUpThreshold : TP_SCALE_UP_THRESHOLD;
-    pool->Public.ScaleDownThreshold = Config->ScaleDownThreshold > 0 ?
-        Config->ScaleDownThreshold : TP_SCALE_DOWN_THRESHOLD;
-    pool->ScaleIntervalMs = Config->ScaleIntervalMs > 0 ?
-        Config->ScaleIntervalMs : TP_SCALE_INTERVAL_MS;
-    pool->IdleTimeoutMs = Config->IdleTimeoutMs > 0 ?
-        Config->IdleTimeoutMs : TP_IDLE_TIMEOUT_MS;
+    KeInitializeTimer(&pool->ScaleTimer);
+    KeInitializeDpc(&pool->ScaleDpc, TppScaleDpcRoutine, pool);
 
-    KeInitializeTimer(&pool->Public.ScaleTimer);
-    KeInitializeDpc(&pool->Public.ScaleDpc, TppScaleDpcRoutine, pool);
+    //
+    // Allocate scale work item (for DPC → PASSIVE deferral)
+    //
+    if (pool->DeviceObject != NULL) {
+        pool->ScaleWorkItem = IoAllocateWorkItem(pool->DeviceObject);
+        if (pool->ScaleWorkItem == NULL) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:TP] WARNING: No DeviceObject for scale work item. "
+                       "Scaling will be disabled.\n");
+        }
+    }
 
     //
     // Set callbacks
     //
-    pool->Public.InitCallback = Config->InitCallback;
-    pool->Public.CleanupCallback = Config->CleanupCallback;
-    pool->Public.CallbackContext = Config->CallbackContext;
+    pool->InitCallback = localConfig.InitCallback;
+    pool->CleanupCallback = localConfig.CleanupCallback;
+    pool->CallbackContext = localConfig.CallbackContext;
 
     //
-    // Set priority and affinity
-    //
-    pool->Public.DefaultPriority = Config->DefaultPriority;
-    pool->Public.AffinityMask = Config->AffinityMask != 0 ?
-        Config->AffinityMask : KeQueryActiveProcessors();
-    pool->Public.UseIdealProcessor = TRUE;
-
-    //
-    // Initialize executor lock
-    //
-    ExInitializePushLock(&pool->ExecutorLock);
-
-    //
-    // Set default work executor
+    // Set default work executor (logs warning that no real executor is set)
     //
     pool->WorkExecutor = TppDefaultWorkExecutor;
     pool->ExecutorContext = NULL;
 
     //
-    // Initialize reference count
-    //
-    pool->ReferenceCount = 1;
-
-    //
-    // Initialize lookaside list for thread info
-    //
-    ExInitializeNPagedLookasideList(
-        &pool->ThreadInfoLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(TP_THREAD_INFO_INTERNAL),
-        TP_POOL_TAG_THREAD,
-        0
-    );
-    pool->LookasideInitialized = TRUE;
-
-    //
     // Initialize statistics
     //
-    KeQuerySystemTime(&pool->Public.Stats.StartTime);
+    KeQuerySystemTime(&pool->Stats.StartTime);
+
+    //
+    // Mark initialized BEFORE creating threads so TpDestroy works on partial cleanup
+    //
+    pool->Initialized = TRUE;
 
     //
     // Create initial threads
     //
-    for (i = 0; i < Config->MinThreads; i++) {
-        PTP_THREAD_INFO_INTERNAL threadInfo;
+    for (i = 0; i < localConfig.MinThreads; i++) {
+        PTP_THREAD_INFO threadInfo;
 
         status = TppCreateThread(pool, &threadInfo);
         if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike:TP] Failed to create initial thread %u: 0x%08X\n",
+                       i, status);
             //
-            // Cleanup already created threads
+            // Cleanup already-created threads.
+            // Initialized=TRUE so TpDestroy will work properly.
             //
-            TpDestroy(&pool->Public, TRUE);
+            TpDestroy(&pool, TRUE);
             return status;
         }
     }
 
     //
-    // Enable scaling if requested
+    // Enable scaling if requested and work item is available
     //
-    if (Config->EnableScaling) {
-        pool->Public.ScalingEnabled = TRUE;
+    if (localConfig.EnableScaling && pool->ScaleWorkItem != NULL) {
+        pool->ScalingEnabled = TRUE;
         KeQuerySystemTime(&pool->LastScaleTime);
 
         dueTime.QuadPart = -((LONGLONG)pool->ScaleIntervalMs * 10000);
         KeSetTimerEx(
-            &pool->Public.ScaleTimer,
+            &pool->ScaleTimer,
             dueTime,
             pool->ScaleIntervalMs,
-            &pool->Public.ScaleDpc
+            &pool->ScaleDpc
         );
+        timerStarted = TRUE;
     }
 
-    //
-    // Mark as initialized
-    //
-    pool->Public.Initialized = TRUE;
-
-    *Pool = &pool->Public;
-
+    *Pool = pool;
     return STATUS_SUCCESS;
 }
 
@@ -420,7 +433,8 @@ NTSTATUS
 TpCreateDefault(
     _Out_ PTP_THREAD_POOL* Pool,
     _In_ ULONG MinThreads,
-    _In_ ULONG MaxThreads
+    _In_ ULONG MaxThreads,
+    _In_opt_ PDEVICE_OBJECT DeviceObject
 )
 {
     TP_CONFIG config;
@@ -431,12 +445,13 @@ TpCreateDefault(
     config.MinThreads = MinThreads > 0 ? MinThreads : TP_DEFAULT_MIN_THREADS;
     config.MaxThreads = MaxThreads > 0 ? MaxThreads : TP_DEFAULT_MAX_THREADS;
     config.DefaultPriority = TpPriority_Normal;
-    config.AffinityMask = 0;  // Use all processors
+    config.AffinityMask = 0;
     config.EnableScaling = TRUE;
     config.ScaleUpThreshold = TP_SCALE_UP_THRESHOLD;
     config.ScaleDownThreshold = TP_SCALE_DOWN_THRESHOLD;
     config.ScaleIntervalMs = TP_SCALE_INTERVAL_MS;
     config.IdleTimeoutMs = TP_IDLE_TIMEOUT_MS;
+    config.DeviceObject = DeviceObject;
 
     return TpCreate(Pool, &config);
 }
@@ -444,76 +459,54 @@ TpCreateDefault(
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 TpDestroy(
-    _Inout_ PTP_THREAD_POOL Pool,
+    _Inout_ PTP_THREAD_POOL* PoolPtr,
     _In_ BOOLEAN WaitForCompletion
 )
 {
-    PTP_THREAD_POOL_INTERNAL pool;
+    PTP_THREAD_POOL pool;
     PLIST_ENTRY entry;
-    PTP_THREAD_INFO_INTERNAL threadInfo;
+    PTP_THREAD_INFO threadInfo;
     LARGE_INTEGER timeout;
     KIRQL oldIrql;
     LIST_ENTRY threadsToDestroy;
 
     PAGED_CODE();
 
-    if (!TppIsValidPool(Pool)) {
+    if (PoolPtr == NULL || *PoolPtr == NULL) {
         return;
     }
 
-    pool = CONTAINING_RECORD(Pool, TP_THREAD_POOL_INTERNAL, Public);
+    pool = *PoolPtr;
+    *PoolPtr = NULL;
+
+    if (!TppIsValidPool(pool)) {
+        return;
+    }
 
     //
-    // Signal shutdown
+    // Step 1: Set shutdown flag and signal shutdown event.
+    // This causes all worker threads to exit their main loops.
     //
-    Pool->ShuttingDown = TRUE;
-    KeSetEvent(&Pool->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+    pool->ShuttingDown = TRUE;
+    KeSetEvent(&pool->ShutdownEvent, IO_NO_INCREMENT, FALSE);
 
     //
-    // Stop scaling timer
+    // Step 2: Cancel scaling timer and flush DPCs.
+    // After KeFlushQueuedDpcs, no DPC can be running.
     //
-    if (Pool->ScalingEnabled) {
-        KeCancelTimer(&Pool->ScaleTimer);
+    if (pool->ScalingEnabled) {
+        KeCancelTimer(&pool->ScaleTimer);
         KeFlushQueuedDpcs();
-        Pool->ScalingEnabled = FALSE;
+        pool->ScalingEnabled = FALSE;
     }
 
     //
-    // Wake all waiting threads
+    // Step 3: Wait for any in-flight scale work item to complete.
     //
-    KeSetEvent(&Pool->WorkAvailableEvent, IO_NO_INCREMENT, FALSE);
-
-    //
-    // Signal all threads to stop
-    //
-    InitializeListHead(&threadsToDestroy);
-
-    KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
-
-    while (!IsListEmpty(&Pool->ThreadList)) {
-        entry = RemoveHeadList(&Pool->ThreadList);
-        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO_INTERNAL, Public.ListEntry);
-        InsertTailList(&threadsToDestroy, &threadInfo->Public.ListEntry);
-    }
-
-    KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
-
-    //
-    // Destroy each thread
-    //
-    while (!IsListEmpty(&threadsToDestroy)) {
-        entry = RemoveHeadList(&threadsToDestroy);
-        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO_INTERNAL, Public.ListEntry);
-        TppDestroyThread(threadInfo, WaitForCompletion);
-    }
-
-    //
-    // Wait for all threads if requested
-    //
-    if (WaitForCompletion && Pool->ThreadCount > 0) {
+    if (pool->ScaleWorkItem != NULL) {
         timeout.QuadPart = -((LONGLONG)TP_THREAD_TERMINATE_TIMEOUT_MS * 10000);
         KeWaitForSingleObject(
-            &Pool->AllThreadsStoppedEvent,
+            &pool->ScaleWorkItemComplete,
             Executive,
             KernelMode,
             FALSE,
@@ -522,18 +515,61 @@ TpDestroy(
     }
 
     //
-    // Cleanup lookaside list
+    // Step 4: Wake all sleeping threads so they exit.
+    // Release a large count on the semaphore to ensure all threads wake.
     //
-    if (pool->LookasideInitialized) {
-        ExDeleteNPagedLookasideList(&pool->ThreadInfoLookaside);
-        pool->LookasideInitialized = FALSE;
+    KeReleaseSemaphore(&pool->WorkAvailableSemaphore, IO_NO_INCREMENT,
+                       TP_MAX_THREADS, FALSE);
+
+    //
+    // Step 5: Collect all threads from list under spinlock.
+    //
+    InitializeListHead(&threadsToDestroy);
+
+    KeAcquireSpinLock(&pool->ThreadListLock, &oldIrql);
+    while (!IsListEmpty(&pool->ThreadList)) {
+        entry = RemoveHeadList(&pool->ThreadList);
+        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
+        InsertTailList(&threadsToDestroy, &threadInfo->ListEntry);
+    }
+    KeReleaseSpinLock(&pool->ThreadListLock, oldIrql);
+
+    //
+    // Step 6: Destroy each thread (signal stop + wait + cleanup).
+    //
+    while (!IsListEmpty(&threadsToDestroy)) {
+        entry = RemoveHeadList(&threadsToDestroy);
+        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
+        TppDestroyThread(threadInfo, WaitForCompletion);
     }
 
     //
-    // Clear magic and release
+    // Step 7: Wait for any threads that exited on their own.
+    //
+    if (WaitForCompletion && pool->ThreadCount > 0) {
+        timeout.QuadPart = -((LONGLONG)TP_THREAD_TERMINATE_TIMEOUT_MS * 10000);
+        KeWaitForSingleObject(
+            &pool->AllThreadsStoppedEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &timeout
+        );
+    }
+
+    //
+    // Step 8: Free scale work item.
+    //
+    if (pool->ScaleWorkItem != NULL) {
+        IoFreeWorkItem(pool->ScaleWorkItem);
+        pool->ScaleWorkItem = NULL;
+    }
+
+    //
+    // Step 9: Invalidate and release pool.
     //
     pool->Magic = 0;
-    Pool->Initialized = FALSE;
+    pool->Initialized = FALSE;
 
     TppReleasePoolReference(pool);
 }
@@ -542,64 +578,67 @@ TpDestroy(
 // THREAD MANAGEMENT
 // ============================================================================
 
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 TpAddThreads(
     _Inout_ PTP_THREAD_POOL Pool,
     _In_ ULONG Count
 )
 {
-    PTP_THREAD_POOL_INTERNAL pool;
     NTSTATUS status = STATUS_SUCCESS;
     ULONG i;
     ULONG created = 0;
+    ULONG currentCount;
+    ULONG maxThreads;
+    ULONG allowedCount;
 
     PAGED_CODE();
 
-    if (!TppIsValidPool(Pool)) {
+    if (!TppIsValidPool(Pool) || Count == 0) {
         return STATUS_INVALID_PARAMETER;
     }
-
-    if (Count == 0) {
-        return STATUS_SUCCESS;
-    }
-
-    pool = CONTAINING_RECORD(Pool, TP_THREAD_POOL_INTERNAL, Public);
 
     if (Pool->ShuttingDown) {
         return STATUS_DEVICE_NOT_READY;
     }
 
     //
-    // Check if we can add threads
+    // Read limits under ConfigLock to avoid TOCTOU
     //
-    if ((ULONG)Pool->ThreadCount >= Pool->MaxThreads) {
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Pool->ConfigLock);
+    maxThreads = Pool->MaxThreads;
+    ExReleasePushLockShared(&Pool->ConfigLock);
+    KeLeaveCriticalRegion();
+
+    currentCount = (ULONG)InterlockedCompareExchange(&Pool->ThreadCount, 0, 0);
+    if (currentCount >= maxThreads) {
         return STATUS_QUOTA_EXCEEDED;
     }
 
-    //
-    // Clamp count to maximum allowed
-    //
-    if ((ULONG)Pool->ThreadCount + Count > Pool->MaxThreads) {
-        Count = Pool->MaxThreads - (ULONG)Pool->ThreadCount;
+    allowedCount = maxThreads - currentCount;
+    if (Count > allowedCount) {
+        Count = allowedCount;
     }
 
-    //
-    // Create threads
-    //
     for (i = 0; i < Count; i++) {
-        PTP_THREAD_INFO_INTERNAL threadInfo;
+        PTP_THREAD_INFO threadInfo;
 
-        status = TppCreateThread(pool, &threadInfo);
+        //
+        // Re-check limit before each creation (other threads may be adding too)
+        //
+        currentCount = (ULONG)InterlockedCompareExchange(&Pool->ThreadCount, 0, 0);
+        if (currentCount >= maxThreads) {
+            break;
+        }
+
+        status = TppCreateThread(Pool, &threadInfo);
         if (!NT_SUCCESS(status)) {
             break;
         }
         created++;
     }
 
-    //
-    // Update statistics
-    //
     if (created > 0) {
         InterlockedAdd64(&Pool->Stats.ThreadsCreated, created);
     }
@@ -607,7 +646,7 @@ TpAddThreads(
     return created > 0 ? STATUS_SUCCESS : status;
 }
 
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 TpRemoveThreads(
     _Inout_ PTP_THREAD_POOL Pool,
@@ -615,62 +654,62 @@ TpRemoveThreads(
     _In_ BOOLEAN WaitForCompletion
 )
 {
-    PTP_THREAD_POOL_INTERNAL pool;
     PLIST_ENTRY entry;
-    PTP_THREAD_INFO_INTERNAL threadInfo;
+    PTP_THREAD_INFO threadInfo;
     KIRQL oldIrql;
     ULONG removed = 0;
+    ULONG minThreads;
+    ULONG currentCount;
     LIST_ENTRY threadsToRemove;
 
     PAGED_CODE();
 
-    if (!TppIsValidPool(Pool)) {
+    if (!TppIsValidPool(Pool) || Count == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Read limits under ConfigLock
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Pool->ConfigLock);
+    minThreads = Pool->MinThreads;
+    ExReleasePushLockShared(&Pool->ConfigLock);
+    KeLeaveCriticalRegion();
+
+    currentCount = (ULONG)InterlockedCompareExchange(&Pool->ThreadCount, 0, 0);
+    if (currentCount <= minThreads) {
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Clamp count to not go below minimum
+    //
+    if (currentCount - Count < minThreads) {
+        Count = currentCount - minThreads;
+    }
     if (Count == 0) {
         return STATUS_SUCCESS;
     }
 
-    pool = CONTAINING_RECORD(Pool, TP_THREAD_POOL_INTERNAL, Public);
-
     //
-    // Don't remove below minimum
-    //
-    if ((ULONG)Pool->ThreadCount <= Pool->MinThreads) {
-        return STATUS_SUCCESS;
-    }
-
-    //
-    // Clamp count
-    //
-    if ((ULONG)Pool->ThreadCount - Count < Pool->MinThreads) {
-        Count = (ULONG)Pool->ThreadCount - Pool->MinThreads;
-    }
-
-    if (Count == 0) {
-        return STATUS_SUCCESS;
-    }
-
-    //
-    // Find idle threads to remove (prefer idle over running)
+    // Prefer removing idle threads first
     //
     InitializeListHead(&threadsToRemove);
 
     KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
 
+    // Pass 1: remove idle threads
     for (entry = Pool->ThreadList.Flink;
          entry != &Pool->ThreadList && removed < Count;
          /* advance in loop */) {
 
         PLIST_ENTRY next = entry->Flink;
-        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO_INTERNAL, Public.ListEntry);
+        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
 
-        //
-        // Prefer idle threads
-        //
-        if (threadInfo->Public.State == TpThreadState_Idle) {
+        if (threadInfo->State == TpThreadState_Idle) {
             RemoveEntryList(entry);
+            InitializeListHead(entry);
             InsertTailList(&threadsToRemove, entry);
             removed++;
         }
@@ -678,18 +717,18 @@ TpRemoveThreads(
         entry = next;
     }
 
-    //
-    // If we still need to remove more, take running threads
-    //
+    // Pass 2: if still need more, take running threads
     for (entry = Pool->ThreadList.Flink;
          entry != &Pool->ThreadList && removed < Count;
          /* advance in loop */) {
 
         PLIST_ENTRY next = entry->Flink;
-        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO_INTERNAL, Public.ListEntry);
+        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
 
-        if (threadInfo->Public.State == TpThreadState_Running) {
+        if (threadInfo->State == TpThreadState_Running ||
+            threadInfo->State == TpThreadState_Starting) {
             RemoveEntryList(entry);
+            InitializeListHead(entry);
             InsertTailList(&threadsToRemove, entry);
             removed++;
         }
@@ -700,17 +739,14 @@ TpRemoveThreads(
     KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
 
     //
-    // Destroy removed threads
+    // Destroy removed threads outside spinlock
     //
     while (!IsListEmpty(&threadsToRemove)) {
         entry = RemoveHeadList(&threadsToRemove);
-        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO_INTERNAL, Public.ListEntry);
+        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
         TppDestroyThread(threadInfo, WaitForCompletion);
     }
 
-    //
-    // Update statistics
-    //
     if (removed > 0) {
         InterlockedAdd64(&Pool->Stats.ThreadsDestroyed, removed);
     }
@@ -718,7 +754,7 @@ TpRemoveThreads(
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 TpSetThreadCount(
     _Inout_ PTP_THREAD_POOL Pool,
@@ -726,13 +762,12 @@ TpSetThreadCount(
     _In_ ULONG MaxThreads
 )
 {
+    PAGED_CODE();
+
     if (!TppIsValidPool(Pool)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Validate
-    //
     if (MinThreads < TP_MIN_THREADS) {
         MinThreads = TP_MIN_THREADS;
     }
@@ -743,11 +778,18 @@ TpSetThreadCount(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Update under exclusive ConfigLock
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Pool->ConfigLock);
     Pool->MinThreads = MinThreads;
     Pool->MaxThreads = MaxThreads;
+    ExReleasePushLockExclusive(&Pool->ConfigLock);
+    KeLeaveCriticalRegion();
 
     //
-    // Trigger scaling to adjust if needed
+    // Trigger scaling to adjust thread count to new limits
     //
     TpTriggerScale(Pool);
 
@@ -758,9 +800,9 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 TpGetThreadCount(
     _In_ PTP_THREAD_POOL Pool,
-    _Out_ PULONG Total,
-    _Out_ PULONG Idle,
-    _Out_ PULONG Running
+    _Out_opt_ PULONG Total,
+    _Out_opt_ PULONG Idle,
+    _Out_opt_ PULONG Running
 )
 {
     if (!TppIsValidPool(Pool)) {
@@ -770,16 +812,16 @@ TpGetThreadCount(
         return;
     }
 
-    if (Total) *Total = (ULONG)Pool->ThreadCount;
-    if (Idle) *Idle = (ULONG)Pool->IdleThreadCount;
-    if (Running) *Running = (ULONG)Pool->RunningThreadCount;
+    if (Total) *Total = (ULONG)InterlockedCompareExchange(&Pool->ThreadCount, 0, 0);
+    if (Idle) *Idle = (ULONG)InterlockedCompareExchange(&Pool->IdleThreadCount, 0, 0);
+    if (Running) *Running = (ULONG)InterlockedCompareExchange(&Pool->RunningThreadCount, 0, 0);
 }
 
 // ============================================================================
 // SCALING CONTROL
 // ============================================================================
 
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 TpSetScaling(
     _Inout_ PTP_THREAD_POOL Pool,
@@ -788,7 +830,6 @@ TpSetScaling(
     _In_ ULONG ScaleDownThreshold
 )
 {
-    PTP_THREAD_POOL_INTERNAL pool;
     LARGE_INTEGER dueTime;
 
     PAGED_CODE();
@@ -797,11 +838,6 @@ TpSetScaling(
         return STATUS_INVALID_PARAMETER;
     }
 
-    pool = CONTAINING_RECORD(Pool, TP_THREAD_POOL_INTERNAL, Public);
-
-    //
-    // Validate thresholds
-    //
     if (ScaleUpThreshold > 100 || ScaleDownThreshold > 100) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -809,29 +845,35 @@ TpSetScaling(
         return STATUS_INVALID_PARAMETER;
     }
 
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Pool->ConfigLock);
     Pool->ScaleUpThreshold = ScaleUpThreshold;
     Pool->ScaleDownThreshold = ScaleDownThreshold;
+    ExReleasePushLockExclusive(&Pool->ConfigLock);
+    KeLeaveCriticalRegion();
 
     if (Enable && !Pool->ScalingEnabled) {
-        //
-        // Start scaling timer
-        //
-        Pool->ScalingEnabled = TRUE;
-        KeQuerySystemTime(&pool->LastScaleTime);
+        if (Pool->ScaleWorkItem == NULL) {
+            return STATUS_DEVICE_NOT_READY;
+        }
 
-        dueTime.QuadPart = -((LONGLONG)pool->ScaleIntervalMs * 10000);
+        Pool->ScalingEnabled = TRUE;
+        KeQuerySystemTime(&Pool->LastScaleTime);
+
+        dueTime.QuadPart = -((LONGLONG)Pool->ScaleIntervalMs * 10000);
         KeSetTimerEx(
             &Pool->ScaleTimer,
             dueTime,
-            pool->ScaleIntervalMs,
+            Pool->ScaleIntervalMs,
             &Pool->ScaleDpc
         );
     } else if (!Enable && Pool->ScalingEnabled) {
-        //
-        // Stop scaling timer
-        //
         Pool->ScalingEnabled = FALSE;
         KeCancelTimer(&Pool->ScaleTimer);
+        //
+        // Flush DPCs to ensure no DPC is in-flight after disable
+        //
+        KeFlushQueuedDpcs();
     }
 
     return STATUS_SUCCESS;
@@ -843,27 +885,21 @@ TpTriggerScale(
     _In_ PTP_THREAD_POOL Pool
 )
 {
-    PTP_THREAD_POOL_INTERNAL pool;
-
     if (!TppIsValidPool(Pool)) {
         return;
     }
 
-    pool = CONTAINING_RECORD(Pool, TP_THREAD_POOL_INTERNAL, Public);
-
     //
-    // Queue DPC for scaling evaluation
+    // Queue DPC which will defer to work item at PASSIVE_LEVEL
     //
-    if (Pool->ScalingEnabled) {
-        KeInsertQueueDpc(&Pool->ScaleDpc, NULL, NULL);
-    }
+    KeInsertQueueDpc(&Pool->ScaleDpc, NULL, NULL);
 }
 
 // ============================================================================
 // THREAD PRIORITY AND AFFINITY
 // ============================================================================
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 TpSetPriority(
     _Inout_ PTP_THREAD_POOL Pool,
@@ -871,8 +907,10 @@ TpSetPriority(
 )
 {
     PLIST_ENTRY entry;
-    PTP_THREAD_INFO_INTERNAL threadInfo;
+    PTP_THREAD_INFO threadInfo;
     KIRQL oldIrql;
+
+    PAGED_CODE();
 
     if (!TppIsValidPool(Pool)) {
         return STATUS_INVALID_PARAMETER;
@@ -889,10 +927,9 @@ TpSetPriority(
          entry != &Pool->ThreadList;
          entry = entry->Flink) {
 
-        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO_INTERNAL, Public.ListEntry);
-
-        if (threadInfo->Public.ThreadObject != NULL) {
-            TppSetThreadPriority(threadInfo->Public.ThreadObject, Priority);
+        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
+        if (threadInfo->ThreadObject != NULL) {
+            TppSetThreadPriority(threadInfo->ThreadObject, Priority);
         }
     }
 
@@ -901,16 +938,14 @@ TpSetPriority(
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 TpSetAffinity(
     _Inout_ PTP_THREAD_POOL Pool,
     _In_ KAFFINITY AffinityMask
 )
 {
-    PLIST_ENTRY entry;
-    PTP_THREAD_INFO_INTERNAL threadInfo;
-    KIRQL oldIrql;
+    PAGED_CODE();
 
     if (!TppIsValidPool(Pool)) {
         return STATUS_INVALID_PARAMETER;
@@ -923,27 +958,11 @@ TpSetAffinity(
     Pool->AffinityMask = AffinityMask;
 
     //
-    // Update all existing threads
+    // Threads will pick up the new affinity on their next wake cycle
+    // since they read Pool->AffinityMask at startup.
+    // For immediate change, we would need to signal each thread.
+    // This is the safe approach — no KeSetSystemAffinityThread from wrong thread.
     //
-    KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
-
-    for (entry = Pool->ThreadList.Flink;
-         entry != &Pool->ThreadList;
-         entry = entry->Flink) {
-
-        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO_INTERNAL, Public.ListEntry);
-
-        if (threadInfo->Public.ThreadObject != NULL) {
-            TppSetThreadAffinity(
-                threadInfo->Public.ThreadObject,
-                AffinityMask,
-                Pool->UseIdealProcessor,
-                threadInfo->Public.ThreadIndex
-            );
-        }
-    }
-
-    KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
 
     return STATUS_SUCCESS;
 }
@@ -962,27 +981,17 @@ TpSignalWorkAvailable(
         return;
     }
 
-    KeSetEvent(&Pool->WorkAvailableEvent, IO_NO_INCREMENT, FALSE);
-}
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-PKEVENT
-TpGetWorkAvailableEvent(
-    _In_ PTP_THREAD_POOL Pool
-)
-{
-    if (!TppIsValidPool(Pool)) {
-        return NULL;
-    }
-
-    return &Pool->WorkAvailableEvent;
+    //
+    // Release one count on the semaphore to wake one idle thread
+    //
+    KeReleaseSemaphore(&Pool->WorkAvailableSemaphore, IO_NO_INCREMENT, 1, FALSE);
 }
 
 // ============================================================================
 // WORK EXECUTOR
 // ============================================================================
 
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 TpSetWorkExecutor(
     _Inout_ PTP_THREAD_POOL Pool,
@@ -990,33 +999,24 @@ TpSetWorkExecutor(
     _In_opt_ PVOID Context
 )
 {
-    PTP_THREAD_POOL_INTERNAL pool;
-
     PAGED_CODE();
 
-    if (!TppIsValidPool(Pool)) {
+    if (!TppIsValidPool(Pool) || Executor == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
-
-    if (Executor == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    pool = CONTAINING_RECORD(Pool, TP_THREAD_POOL_INTERNAL, Public);
 
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&pool->ExecutorLock);
-
-    pool->WorkExecutor = Executor;
-    pool->ExecutorContext = Context;
-
-    ExReleasePushLockExclusive(&pool->ExecutorLock);
+    ExAcquirePushLockExclusive(&Pool->ExecutorLock);
+    Pool->WorkExecutor = Executor;
+    Pool->ExecutorContext = Context;
+    ExReleasePushLockExclusive(&Pool->ExecutorLock);
     KeLeaveCriticalRegion();
 
     //
-    // Wake threads to use new executor
+    // Wake all threads to use new executor
     //
-    TpSignalWorkAvailable(Pool);
+    KeReleaseSemaphore(&Pool->WorkAvailableSemaphore, IO_NO_INCREMENT,
+                       TP_MAX_THREADS, FALSE);
 
     return STATUS_SUCCESS;
 }
@@ -1032,74 +1032,67 @@ TpGetStatistics(
     _Out_ PTP_STATISTICS Stats
 )
 {
-    PTP_THREAD_POOL_INTERNAL pool;
     PLIST_ENTRY entry;
-    PTP_THREAD_INFO_INTERNAL threadInfo;
+    PTP_THREAD_INFO threadInfo;
     KIRQL oldIrql;
     LARGE_INTEGER currentTime;
     LONG64 totalWorkTime = 0;
     LONG64 totalIdleTime = 0;
     ULONG threadCount = 0;
+    LONG64 totalWorkItems;
 
     if (Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
-
     RtlZeroMemory(Stats, sizeof(TP_STATISTICS));
 
     if (!TppIsValidPool(Pool)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    pool = CONTAINING_RECORD(Pool, TP_THREAD_POOL_INTERNAL, Public);
-
     KeQuerySystemTime(&currentTime);
 
     //
-    // Basic counts
+    // Read counters atomically
     //
-    Stats->TotalThreads = (ULONG)Pool->ThreadCount;
-    Stats->IdleThreads = (ULONG)Pool->IdleThreadCount;
-    Stats->RunningThreads = (ULONG)Pool->RunningThreadCount;
+    Stats->TotalThreads = (ULONG)InterlockedCompareExchange(&Pool->ThreadCount, 0, 0);
+    Stats->IdleThreads = (ULONG)InterlockedCompareExchange(&Pool->IdleThreadCount, 0, 0);
+    Stats->RunningThreads = (ULONG)InterlockedCompareExchange(&Pool->RunningThreadCount, 0, 0);
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Pool->ConfigLock);
     Stats->MinThreads = Pool->MinThreads;
     Stats->MaxThreads = Pool->MaxThreads;
+    ExReleasePushLockShared(&Pool->ConfigLock);
+    KeLeaveCriticalRegion();
 
-    //
-    // Statistics
-    //
-    Stats->TotalWorkItems = Pool->Stats.TotalWorkItems;
-    Stats->ThreadsCreated = Pool->Stats.ThreadsCreated;
-    Stats->ThreadsDestroyed = Pool->Stats.ThreadsDestroyed;
-    Stats->ScaleUpCount = Pool->Stats.ScaleUpCount;
-    Stats->ScaleDownCount = Pool->Stats.ScaleDownCount;
+    totalWorkItems = InterlockedCompareExchange64(&Pool->Stats.TotalWorkItems, 0, 0);
+    Stats->TotalWorkItems = (ULONG64)totalWorkItems;
+    Stats->ThreadsCreated = (ULONG64)InterlockedCompareExchange64(&Pool->Stats.ThreadsCreated, 0, 0);
+    Stats->ThreadsDestroyed = (ULONG64)InterlockedCompareExchange64(&Pool->Stats.ThreadsDestroyed, 0, 0);
+    Stats->ScaleUpCount = (ULONG64)InterlockedCompareExchange64(&Pool->Stats.ScaleUpCount, 0, 0);
+    Stats->ScaleDownCount = (ULONG64)InterlockedCompareExchange64(&Pool->Stats.ScaleDownCount, 0, 0);
     Stats->ScalingEnabled = Pool->ScalingEnabled;
 
-    //
-    // Calculate uptime
-    //
     Stats->UpTime.QuadPart = currentTime.QuadPart - Pool->Stats.StartTime.QuadPart;
 
     //
-    // Calculate average times from thread statistics
+    // Aggregate per-thread statistics under spinlock
     //
     KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
-
     for (entry = Pool->ThreadList.Flink;
          entry != &Pool->ThreadList;
          entry = entry->Flink) {
-
-        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO_INTERNAL, Public.ListEntry);
-        totalWorkTime += threadInfo->Public.TotalWorkTimeMs;
-        totalIdleTime += threadInfo->Public.TotalIdleTimeMs;
+        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
+        totalWorkTime += InterlockedCompareExchange64(&threadInfo->TotalWorkTimeMs, 0, 0);
+        totalIdleTime += InterlockedCompareExchange64(&threadInfo->TotalIdleTimeMs, 0, 0);
         threadCount++;
     }
-
     KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
 
-    if (threadCount > 0 && Stats->TotalWorkItems > 0) {
-        Stats->AverageWorkTimeMs = (ULONG)(totalWorkTime / Stats->TotalWorkItems);
+    if (threadCount > 0 && totalWorkItems > 0) {
+        Stats->AverageWorkTimeMs = (ULONG)(totalWorkTime / totalWorkItems);
     }
-
     if (threadCount > 0) {
         Stats->AverageIdleTimeMs = (ULONG)(totalIdleTime / threadCount);
     }
@@ -1114,16 +1107,13 @@ TpResetStatistics(
 )
 {
     PLIST_ENTRY entry;
-    PTP_THREAD_INFO_INTERNAL threadInfo;
+    PTP_THREAD_INFO threadInfo;
     KIRQL oldIrql;
 
     if (!TppIsValidPool(Pool)) {
         return;
     }
 
-    //
-    // Reset pool statistics
-    //
     InterlockedExchange64(&Pool->Stats.TotalWorkItems, 0);
     InterlockedExchange64(&Pool->Stats.ThreadsCreated, 0);
     InterlockedExchange64(&Pool->Stats.ThreadsDestroyed, 0);
@@ -1131,82 +1121,82 @@ TpResetStatistics(
     InterlockedExchange64(&Pool->Stats.ScaleDownCount, 0);
     KeQuerySystemTime(&Pool->Stats.StartTime);
 
-    //
-    // Reset per-thread statistics
-    //
     KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
-
     for (entry = Pool->ThreadList.Flink;
          entry != &Pool->ThreadList;
          entry = entry->Flink) {
-
-        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO_INTERNAL, Public.ListEntry);
-        InterlockedExchange64(&threadInfo->Public.WorkItemsCompleted, 0);
-        InterlockedExchange64(&threadInfo->Public.TotalWorkTimeMs, 0);
-        InterlockedExchange64(&threadInfo->Public.TotalIdleTimeMs, 0);
+        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
+        InterlockedExchange64(&threadInfo->WorkItemsCompleted, 0);
+        InterlockedExchange64(&threadInfo->TotalWorkTimeMs, 0);
+        InterlockedExchange64(&threadInfo->TotalIdleTimeMs, 0);
     }
-
     KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - THREAD CREATION/DESTRUCTION
+// PUBLIC HELPER
 // ============================================================================
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG
+TpGetThreadIndex(
+    _In_ PTP_THREAD_INFO ThreadInfo
+)
+{
+    if (ThreadInfo == NULL || ThreadInfo->Magic != TP_THREAD_INFO_MAGIC) {
+        return (ULONG)-1;
+    }
+    return ThreadInfo->ThreadIndex;
+}
+
+// ============================================================================
+// PRIVATE IMPLEMENTATION - THREAD CREATION / DESTRUCTION
+// ============================================================================
+
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 TppCreateThread(
-    _Inout_ PTP_THREAD_POOL_INTERNAL Pool,
-    _Out_ PTP_THREAD_INFO_INTERNAL* ThreadInfo
+    _Inout_ PTP_THREAD_POOL Pool,
+    _Out_ PTP_THREAD_INFO* ThreadInfo
 )
 {
     NTSTATUS status;
-    PTP_THREAD_INFO_INTERNAL threadInfo = NULL;
+    PTP_THREAD_INFO info = NULL;
     OBJECT_ATTRIBUTES objAttr;
     HANDLE threadHandle = NULL;
     KIRQL oldIrql;
 
+    PAGED_CODE();
+
     *ThreadInfo = NULL;
 
     //
-    // Allocate thread info from lookaside
+    // Allocate thread info — always use the same allocator
     //
-    if (Pool->LookasideInitialized) {
-        threadInfo = (PTP_THREAD_INFO_INTERNAL)ExAllocateFromNPagedLookasideList(
-            &Pool->ThreadInfoLookaside
-        );
-    }
-
-    if (threadInfo == NULL) {
-        threadInfo = (PTP_THREAD_INFO_INTERNAL)ShadowStrikeAllocatePoolWithTag(
-            NonPagedPoolNx,
-            sizeof(TP_THREAD_INFO_INTERNAL),
-            TP_POOL_TAG_THREAD
-        );
-    }
-
-    if (threadInfo == NULL) {
+    info = (PTP_THREAD_INFO)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(TP_THREAD_INFO),
+        TP_POOL_TAG_THREAD
+    );
+    if (info == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    RtlZeroMemory(info, sizeof(TP_THREAD_INFO));
 
-    RtlZeroMemory(threadInfo, sizeof(TP_THREAD_INFO_INTERNAL));
+    info->Magic = TP_THREAD_INFO_MAGIC;
+    info->Pool = Pool;
+    info->ThreadIndex = (ULONG)InterlockedIncrement(&Pool->NextThreadIndex) - 1;
+    info->State = TpThreadState_Starting;
 
-    //
-    // Initialize
-    //
-    threadInfo->Magic = TP_THREAD_INFO_MAGIC;
-    threadInfo->Pool = Pool;
-    threadInfo->Public.ThreadIndex = InterlockedIncrement(&Pool->NextThreadIndex) - 1;
-    threadInfo->Public.State = TpThreadState_Starting;
+    InitializeListHead(&info->ListEntry);
+    KeInitializeEvent(&info->StartEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&info->StopEvent, NotificationEvent, FALSE);
 
-    InitializeListHead(&threadInfo->Public.ListEntry);
-    KeInitializeEvent(&threadInfo->StartEvent, NotificationEvent, FALSE);
-    KeInitializeEvent(&threadInfo->StopEvent, NotificationEvent, FALSE);
-
-    KeQuerySystemTime(&threadInfo->Public.LastActivityTime);
-    KeQuerySystemTime(&threadInfo->Public.IdleStartTime);
+    KeQuerySystemTime(&info->LastActivityTime);
+    KeQuerySystemTime(&info->IdleStartTime);
 
     //
-    // Acquire reference on pool
+    // Acquire pool reference BEFORE creating thread (thread will use pool)
     //
     TppAcquirePoolReference(Pool);
 
@@ -1222,95 +1212,84 @@ TppCreateThread(
         NULL,
         NULL,
         TppWorkerThreadRoutine,
-        threadInfo
+        info
     );
-
     if (!NT_SUCCESS(status)) {
         TppReleasePoolReference(Pool);
-        ShadowStrikeFreePoolWithTag(threadInfo, TP_POOL_TAG_THREAD);
+        ShadowStrikeFreePoolWithTag(info, TP_POOL_TAG_THREAD);
         return status;
     }
 
     //
-    // Get thread object
+    // Get thread object reference
     //
     status = ObReferenceObjectByHandle(
         threadHandle,
         THREAD_ALL_ACCESS,
         *PsThreadType,
         KernelMode,
-        (PVOID*)&threadInfo->Public.ThreadObject,
+        (PVOID*)&info->ThreadObject,
         NULL
     );
-
     if (!NT_SUCCESS(status)) {
+        //
+        // Thread is already created but we can't get the object.
+        // Signal it to stop immediately and close the handle.
+        // DO NOT release pool ref here — the thread owns it and will release on exit.
+        //
+        info->StopRequested = 1;
+        KeSetEvent(&info->StartEvent, IO_NO_INCREMENT, FALSE);
         ZwClose(threadHandle);
-        //
-        // Thread will terminate itself when it starts
-        //
-        threadInfo->StopRequested = 1;
-        KeSetEvent(&threadInfo->StartEvent, IO_NO_INCREMENT, FALSE);
-        TppReleasePoolReference(Pool);
         return status;
     }
 
-    threadInfo->Public.ThreadHandle = threadHandle;
+    info->ThreadHandle = threadHandle;
 
     //
-    // Set priority and affinity
+    // Add to thread list BEFORE signaling start
     //
-    TppSetThreadPriority(threadInfo->Public.ThreadObject, Pool->Public.DefaultPriority);
-    TppSetThreadAffinity(
-        threadInfo->Public.ThreadObject,
-        Pool->Public.AffinityMask,
-        Pool->Public.UseIdealProcessor,
-        threadInfo->Public.ThreadIndex
-    );
+    KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
+    InsertTailList(&Pool->ThreadList, &info->ListEntry);
+    InterlockedIncrement(&Pool->ThreadCount);
+    InterlockedIncrement(&Pool->IdleThreadCount);
+    KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
 
     //
-    // Add to thread list
+    // Signal thread to begin
     //
-    KeAcquireSpinLock(&Pool->Public.ThreadListLock, &oldIrql);
-    InsertTailList(&Pool->Public.ThreadList, &threadInfo->Public.ListEntry);
-    InterlockedIncrement(&Pool->Public.ThreadCount);
-    InterlockedIncrement(&Pool->Public.IdleThreadCount);
-    KeReleaseSpinLock(&Pool->Public.ThreadListLock, oldIrql);
+    KeSetEvent(&info->StartEvent, IO_NO_INCREMENT, FALSE);
 
-    //
-    // Signal thread to start
-    //
-    KeSetEvent(&threadInfo->StartEvent, IO_NO_INCREMENT, FALSE);
-
-    *ThreadInfo = threadInfo;
-
+    *ThreadInfo = info;
     return STATUS_SUCCESS;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 TppDestroyThread(
-    _Inout_ PTP_THREAD_INFO_INTERNAL ThreadInfo,
+    _Inout_ PTP_THREAD_INFO ThreadInfo,
     _In_ BOOLEAN Wait
 )
 {
     LARGE_INTEGER timeout;
 
-    if (!TppIsValidThreadInfo(ThreadInfo)) {
+    PAGED_CODE();
+
+    if (ThreadInfo == NULL || ThreadInfo->Magic != TP_THREAD_INFO_MAGIC) {
         return;
     }
 
     //
-    // Signal thread to stop
+    // Signal the thread to stop
     //
     TppSignalThreadStop(ThreadInfo);
 
     //
-    // Wait for thread to terminate if requested
+    // Wait for thread to terminate
     //
-    if (Wait && ThreadInfo->Public.ThreadObject != NULL) {
+    if (Wait && ThreadInfo->ThreadObject != NULL) {
         timeout.QuadPart = -((LONGLONG)TP_THREAD_TERMINATE_TIMEOUT_MS * 10000);
-
         KeWaitForSingleObject(
-            ThreadInfo->Public.ThreadObject,
+            ThreadInfo->ThreadObject,
             Executive,
             KernelMode,
             FALSE,
@@ -1321,49 +1300,51 @@ TppDestroyThread(
     //
     // Release thread object reference
     //
-    if (ThreadInfo->Public.ThreadObject != NULL) {
-        ObDereferenceObject(ThreadInfo->Public.ThreadObject);
-        ThreadInfo->Public.ThreadObject = NULL;
+    if (ThreadInfo->ThreadObject != NULL) {
+        ObDereferenceObject(ThreadInfo->ThreadObject);
+        ThreadInfo->ThreadObject = NULL;
     }
 
     //
     // Close thread handle
     //
-    if (ThreadInfo->Public.ThreadHandle != NULL) {
-        ZwClose(ThreadInfo->Public.ThreadHandle);
-        ThreadInfo->Public.ThreadHandle = NULL;
+    if (ThreadInfo->ThreadHandle != NULL) {
+        ZwClose(ThreadInfo->ThreadHandle);
+        ThreadInfo->ThreadHandle = NULL;
     }
 
     //
-    // Call cleanup callback
+    // Call cleanup callback at PASSIVE_LEVEL
     //
-    if (ThreadInfo->Pool->Public.CleanupCallback != NULL) {
-        ThreadInfo->Pool->Public.CleanupCallback(
-            ThreadInfo->Public.ThreadIndex,
-            ThreadInfo->Pool->Public.CallbackContext
+    if (ThreadInfo->Pool != NULL && ThreadInfo->Pool->CleanupCallback != NULL) {
+        ThreadInfo->Pool->CleanupCallback(
+            ThreadInfo->ThreadIndex,
+            ThreadInfo->Pool->CallbackContext
         );
     }
 
     //
-    // Clear magic
+    // Invalidate and free
     //
     ThreadInfo->Magic = 0;
 
     //
-    // Release pool reference and free
+    // Release pool reference (may free pool if last reference)
     //
-    TppReleasePoolReference(ThreadInfo->Pool);
+    if (ThreadInfo->Pool != NULL) {
+        TppReleasePoolReference(ThreadInfo->Pool);
+    }
 
     ShadowStrikeFreePoolWithTag(ThreadInfo, TP_POOL_TAG_THREAD);
 }
 
 static VOID
 TppSignalThreadStop(
-    _Inout_ PTP_THREAD_INFO_INTERNAL ThreadInfo
+    _Inout_ PTP_THREAD_INFO ThreadInfo
 )
 {
     InterlockedExchange(&ThreadInfo->StopRequested, 1);
-    ThreadInfo->Public.ShutdownRequested = TRUE;
+    ThreadInfo->ShutdownRequested = TRUE;
     KeSetEvent(&ThreadInfo->StopEvent, IO_NO_INCREMENT, FALSE);
 }
 
@@ -1377,16 +1358,21 @@ TppWorkerThreadRoutine(
     _In_ PVOID StartContext
 )
 {
-    PTP_THREAD_INFO_INTERNAL threadInfo = (PTP_THREAD_INFO_INTERNAL)StartContext;
-    PTP_THREAD_POOL_INTERNAL pool;
-    PVOID waitObjects[2];
+    PTP_THREAD_INFO threadInfo = (PTP_THREAD_INFO)StartContext;
+    PTP_THREAD_POOL pool;
+    PVOID waitObjects[3];
     NTSTATUS waitStatus;
     LARGE_INTEGER timeout;
     LARGE_INTEGER currentTime;
     TP_WORK_EXECUTOR executor;
     PVOID executorContext;
+    TP_THREAD_STATE preExitState;
+    KAFFINITY affinityMask;
+    ULONG processorCount;
+    ULONG idealProc;
+    KIRQL oldIrql;
 
-    if (!TppIsValidThreadInfo(threadInfo)) {
+    if (threadInfo == NULL || threadInfo->Magic != TP_THREAD_INFO_MAGIC) {
         PsTerminateSystemThread(STATUS_INVALID_PARAMETER);
         return;
     }
@@ -1394,7 +1380,7 @@ TppWorkerThreadRoutine(
     pool = threadInfo->Pool;
 
     //
-    // Wait for start signal
+    // Wait for start signal from creating thread
     //
     KeWaitForSingleObject(
         &threadInfo->StartEvent,
@@ -1405,45 +1391,71 @@ TppWorkerThreadRoutine(
     );
 
     //
-    // Check if we should exit immediately
+    // Check if we should exit immediately (ObReferenceObjectByHandle failed)
     //
     if (threadInfo->StopRequested) {
-        goto Exit;
+        goto ExitCleanup;
     }
+
+    //
+    // Apply CPU affinity from within THIS thread context (CRITICAL-05 fix).
+    // KeSetSystemAffinityThread affects the CALLING thread, so it must be
+    // called from the thread itself.
+    //
+    affinityMask = pool->AffinityMask;
+    if (affinityMask != 0) {
+        KeSetSystemAffinityThread(affinityMask);
+    }
+
+    //
+    // Set ideal processor for cache locality
+    //
+    processorCount = KeQueryActiveProcessorCount(NULL);
+    if (processorCount > 0) {
+        idealProc = threadInfo->ThreadIndex % processorCount;
+        KeSetIdealProcessorThread(KeGetCurrentThread(), (CCHAR)idealProc);
+    }
+
+    //
+    // Apply thread priority
+    //
+    TppSetThreadPriority(KeGetCurrentThread(), pool->DefaultPriority);
 
     //
     // Call initialization callback
     //
-    if (pool->Public.InitCallback != NULL) {
-        pool->Public.InitCallback(
-            threadInfo->Public.ThreadIndex,
-            pool->Public.CallbackContext
+    if (pool->InitCallback != NULL) {
+        pool->InitCallback(
+            threadInfo->ThreadIndex,
+            pool->CallbackContext
         );
     }
 
     //
     // Mark as idle
     //
-    threadInfo->Public.State = TpThreadState_Idle;
-    KeQuerySystemTime(&threadInfo->Public.IdleStartTime);
+    threadInfo->State = TpThreadState_Idle;
+    KeQuerySystemTime(&threadInfo->IdleStartTime);
 
     //
-    // Set up wait objects
+    // Set up wait objects:
+    //   [0] = WorkAvailableSemaphore (auto-decremented on wake)
+    //   [1] = StopEvent (thread-specific stop)
+    //   [2] = ShutdownEvent (pool-wide shutdown)
     //
-    waitObjects[0] = &pool->Public.WorkAvailableEvent;
+    waitObjects[0] = &pool->WorkAvailableSemaphore;
     waitObjects[1] = &threadInfo->StopEvent;
+    waitObjects[2] = &pool->ShutdownEvent;
 
     //
     // Main work loop
     //
-    while (!threadInfo->StopRequested && !pool->Public.ShuttingDown) {
-        //
-        // Wait for work or stop signal
-        //
-        timeout.QuadPart = -((LONGLONG)TP_WORK_EXECUTOR_TIMEOUT_MS * 10000);
+    while (!threadInfo->StopRequested && !pool->ShuttingDown) {
+
+        timeout.QuadPart = -((LONGLONG)TP_WORK_WAIT_TIMEOUT_MS * 10000);
 
         waitStatus = KeWaitForMultipleObjects(
-            2,
+            3,
             waitObjects,
             WaitAny,
             Executive,
@@ -1453,104 +1465,178 @@ TppWorkerThreadRoutine(
             NULL
         );
 
-        if (threadInfo->StopRequested || pool->Public.ShuttingDown) {
+        //
+        // Check exit conditions
+        //
+        if (threadInfo->StopRequested || pool->ShuttingDown) {
             break;
         }
 
         //
-        // Get current executor
+        // If signaled by StopEvent or ShutdownEvent → exit
         //
-        KeEnterCriticalRegion();
-        ExAcquirePushLockShared(&pool->ExecutorLock);
-        executor = pool->WorkExecutor;
-        executorContext = pool->ExecutorContext;
-        ExReleasePushLockShared(&pool->ExecutorLock);
-        KeLeaveCriticalRegion();
-
-        if (executor != NULL && waitStatus == STATUS_WAIT_0) {
-            //
-            // Update state to running
-            //
-            threadInfo->Public.State = TpThreadState_Running;
-            InterlockedDecrement(&pool->Public.IdleThreadCount);
-            InterlockedIncrement(&pool->Public.RunningThreadCount);
-            KeQuerySystemTime(&threadInfo->Public.WorkStartTime);
-            threadInfo->IsExecuting = 1;
-
-            //
-            // Update idle time statistics
-            //
-            KeQuerySystemTime(&currentTime);
-            InterlockedAdd64(
-                &threadInfo->Public.TotalIdleTimeMs,
-                (currentTime.QuadPart - threadInfo->Public.IdleStartTime.QuadPart) / 10000
-            );
-
-            //
-            // Execute work
-            //
-            executor(
-                &threadInfo->Public,
-                &pool->Public.WorkAvailableEvent,
-                &pool->Public.ShutdownEvent,
-                executorContext
-            );
-
-            //
-            // Update work time statistics
-            //
-            KeQuerySystemTime(&currentTime);
-            InterlockedAdd64(
-                &threadInfo->Public.TotalWorkTimeMs,
-                (currentTime.QuadPart - threadInfo->Public.WorkStartTime.QuadPart) / 10000
-            );
-
-            //
-            // Return to idle
-            //
-            threadInfo->IsExecuting = 0;
-            threadInfo->Public.State = TpThreadState_Idle;
-            InterlockedDecrement(&pool->Public.RunningThreadCount);
-            InterlockedIncrement(&pool->Public.IdleThreadCount);
-            KeQuerySystemTime(&threadInfo->Public.IdleStartTime);
-            KeQuerySystemTime(&threadInfo->Public.LastActivityTime);
+        if (waitStatus == STATUS_WAIT_1 || waitStatus == STATUS_WAIT_2) {
+            break;
         }
+
+        //
+        // If work semaphore was signaled → execute work
+        //
+        if (waitStatus == STATUS_WAIT_0) {
+            //
+            // Get current executor under shared lock
+            //
+            KeEnterCriticalRegion();
+            ExAcquirePushLockShared(&pool->ExecutorLock);
+            executor = pool->WorkExecutor;
+            executorContext = pool->ExecutorContext;
+            ExReleasePushLockShared(&pool->ExecutorLock);
+            KeLeaveCriticalRegion();
+
+            if (executor != NULL) {
+                //
+                // Transition: Idle → Running
+                //
+                threadInfo->State = TpThreadState_Running;
+                InterlockedDecrement(&pool->IdleThreadCount);
+                InterlockedIncrement(&pool->RunningThreadCount);
+                KeQuerySystemTime(&threadInfo->WorkStartTime);
+                InterlockedExchange(&threadInfo->IsExecuting, 1);
+
+                //
+                // Track idle time
+                //
+                KeQuerySystemTime(&currentTime);
+                InterlockedAdd64(
+                    &threadInfo->TotalIdleTimeMs,
+                    (currentTime.QuadPart - threadInfo->IdleStartTime.QuadPart) / 10000
+                );
+
+                //
+                // Execute work.
+                // The executor is called with the semaphore (as PKEVENT-compatible)
+                // and shutdown event so it can implement its own wait loop.
+                //
+                executor(
+                    threadInfo,
+                    (PKEVENT)&pool->WorkAvailableSemaphore,
+                    &pool->ShutdownEvent,
+                    executorContext
+                );
+
+                //
+                // Track work time
+                //
+                KeQuerySystemTime(&currentTime);
+                InterlockedAdd64(
+                    &threadInfo->TotalWorkTimeMs,
+                    (currentTime.QuadPart - threadInfo->WorkStartTime.QuadPart) / 10000
+                );
+                InterlockedIncrement64(&threadInfo->WorkItemsCompleted);
+                InterlockedIncrement64(&pool->Stats.TotalWorkItems);
+
+                //
+                // Transition: Running → Idle
+                //
+                InterlockedExchange(&threadInfo->IsExecuting, 0);
+                InterlockedDecrement(&pool->RunningThreadCount);
+                InterlockedIncrement(&pool->IdleThreadCount);
+                threadInfo->State = TpThreadState_Idle;
+                KeQuerySystemTime(&threadInfo->IdleStartTime);
+                KeQuerySystemTime(&threadInfo->LastActivityTime);
+            }
+        }
+
+        // STATUS_TIMEOUT: just loop and check conditions again
     }
 
-Exit:
+ExitCleanup:
     //
-    // Mark as stopping
+    // CRITICAL-03 fix: Save state BEFORE setting Stopping,
+    // then decrement the correct counter based on saved state.
     //
-    threadInfo->Public.State = TpThreadState_Stopping;
+    preExitState = threadInfo->State;
+    threadInfo->State = TpThreadState_Stopping;
 
-    //
-    // Update counts
-    //
-    if (threadInfo->Public.State == TpThreadState_Idle ||
-        threadInfo->Public.State == TpThreadState_Starting) {
-        InterlockedDecrement(&pool->Public.IdleThreadCount);
-    } else if (threadInfo->Public.State == TpThreadState_Running) {
-        InterlockedDecrement(&pool->Public.RunningThreadCount);
+    if (preExitState == TpThreadState_Idle ||
+        preExitState == TpThreadState_Starting) {
+        InterlockedDecrement(&pool->IdleThreadCount);
+    } else if (preExitState == TpThreadState_Running) {
+        InterlockedDecrement(&pool->RunningThreadCount);
     }
 
-    InterlockedDecrement(&pool->Public.ThreadCount);
+    //
+    // HIGH-05 fix: Remove ourselves from the thread list under spinlock.
+    // TppDestroyThread also removes us, but if thread exits on its own
+    // (e.g., due to StopRequested set by scale-down), we must self-remove.
+    // Check if we're still in a list before removing.
+    //
+    KeAcquireSpinLock(&pool->ThreadListLock, &oldIrql);
+    if (!IsListEmpty(&threadInfo->ListEntry)) {
+        RemoveEntryList(&threadInfo->ListEntry);
+        InitializeListHead(&threadInfo->ListEntry);
+    }
+    KeReleaseSpinLock(&pool->ThreadListLock, oldIrql);
+
+    InterlockedDecrement(&pool->ThreadCount);
 
     //
     // Signal if last thread
     //
-    if (pool->Public.ThreadCount == 0) {
-        KeSetEvent(&pool->Public.AllThreadsStoppedEvent, IO_NO_INCREMENT, FALSE);
+    if (InterlockedCompareExchange(&pool->ThreadCount, 0, 0) == 0) {
+        KeSetEvent(&pool->AllThreadsStoppedEvent, IO_NO_INCREMENT, FALSE);
     }
 
-    threadInfo->Public.State = TpThreadState_Stopped;
+    threadInfo->State = TpThreadState_Stopped;
+
+    //
+    // For threads removed by scale-down (StopRequested but pool not shutting down),
+    // we need to self-cleanup since TppDestroyThread won't be called.
+    // The thread already removed itself from the list. Now free resources.
+    //
+    if (threadInfo->StopRequested && !pool->ShuttingDown) {
+        //
+        // Close our own handle and dereference ourselves
+        //
+        if (threadInfo->ThreadHandle != NULL) {
+            ZwClose(threadInfo->ThreadHandle);
+            threadInfo->ThreadHandle = NULL;
+        }
+        if (threadInfo->ThreadObject != NULL) {
+            ObDereferenceObject(threadInfo->ThreadObject);
+            threadInfo->ThreadObject = NULL;
+        }
+
+        //
+        // Cleanup callback
+        //
+        if (pool->CleanupCallback != NULL) {
+            pool->CleanupCallback(
+                threadInfo->ThreadIndex,
+                pool->CallbackContext
+            );
+        }
+
+        threadInfo->Magic = 0;
+        TppReleasePoolReference(pool);
+        ShadowStrikeFreePoolWithTag(threadInfo, TP_POOL_TAG_THREAD);
+        InterlockedIncrement64(&pool->Stats.ThreadsDestroyed);
+    }
 
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - SCALING
+// PRIVATE IMPLEMENTATION - SCALING (DPC → WORK ITEM → PASSIVE_LEVEL)
 // ============================================================================
 
+/**
+ * @brief DPC routine fired by the scale timer.
+ *
+ * Runs at DISPATCH_LEVEL. MUST NOT call PsCreateSystemThread, ZwClose,
+ * KeWaitForSingleObject, or any PASSIVE_LEVEL API.
+ * Defers ALL scaling work to TppScaleWorkItemRoutine via IoQueueWorkItem.
+ */
 _Function_class_(KDEFERRED_ROUTINE)
 static VOID
 TppScaleDpcRoutine(
@@ -1560,26 +1646,79 @@ TppScaleDpcRoutine(
     _In_opt_ PVOID SystemArgument2
 )
 {
-    PTP_THREAD_POOL_INTERNAL pool = (PTP_THREAD_POOL_INTERNAL)DeferredContext;
+    PTP_THREAD_POOL pool = (PTP_THREAD_POOL)DeferredContext;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (pool == NULL || !TppIsValidPool(&pool->Public)) {
+    if (pool == NULL || pool->Magic != TP_POOL_MAGIC) {
         return;
     }
 
-    if (pool->Public.ShuttingDown) {
+    if (pool->ShuttingDown) {
+        return;
+    }
+
+    //
+    // Guard against double-queuing the work item (IoQueueWorkItem contract)
+    //
+    if (pool->ScaleWorkItem != NULL) {
+        if (InterlockedCompareExchange(&pool->ScaleWorkItemQueued, 1, 0) == 0) {
+            KeClearEvent(&pool->ScaleWorkItemComplete);
+            IoQueueWorkItem(
+                pool->ScaleWorkItem,
+                TppScaleWorkItemRoutine,
+                DelayedWorkQueue,
+                pool
+            );
+        }
+    }
+}
+
+/**
+ * @brief Work item routine for scaling. Runs at PASSIVE_LEVEL.
+ *
+ * Safe to call PsCreateSystemThread, ZwClose, KeWaitForSingleObject, etc.
+ */
+_Function_class_(IO_WORKITEM_ROUTINE)
+static VOID NTAPI
+TppScaleWorkItemRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+)
+{
+    PTP_THREAD_POOL pool = (PTP_THREAD_POOL)Context;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    if (pool == NULL || pool->Magic != TP_POOL_MAGIC || pool->ShuttingDown) {
+        if (pool != NULL) {
+            InterlockedExchange(&pool->ScaleWorkItemQueued, 0);
+            KeSetEvent(&pool->ScaleWorkItemComplete, IO_NO_INCREMENT, FALSE);
+        }
         return;
     }
 
     TppEvaluateScaling(pool);
+
+    //
+    // Allow next DPC to queue another work item
+    //
+    InterlockedExchange(&pool->ScaleWorkItemQueued, 0);
+    KeSetEvent(&pool->ScaleWorkItemComplete, IO_NO_INCREMENT, FALSE);
 }
 
+/**
+ * @brief Evaluate current thread utilization and scale up/down.
+ *
+ * IRQL: PASSIVE_LEVEL (called from work item routine).
+ * This function may create or signal threads.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 TppEvaluateScaling(
-    _Inout_ PTP_THREAD_POOL_INTERNAL Pool
+    _Inout_ PTP_THREAD_POOL Pool
 )
 {
     LARGE_INTEGER currentTime;
@@ -1588,11 +1727,17 @@ TppEvaluateScaling(
     ULONG idleThreads;
     ULONG runningThreads;
     ULONG utilization;
+    ULONG minThreads;
+    ULONG maxThreads;
+    ULONG scaleUp;
+    ULONG scaleDown;
     BOOLEAN shouldScaleUp = FALSE;
     BOOLEAN shouldScaleDown = FALSE;
 
+    PAGED_CODE();
+
     //
-    // Check cooldown
+    // Cooldown check
     //
     KeQuerySystemTime(&currentTime);
     timeSinceLastScale = (currentTime.QuadPart - Pool->LastScaleTime.QuadPart) / 10000;
@@ -1609,95 +1754,106 @@ TppEvaluateScaling(
     }
 
     //
-    // Get current state
+    // Read configuration under lock
     //
-    totalThreads = (ULONG)Pool->Public.ThreadCount;
-    idleThreads = (ULONG)Pool->Public.IdleThreadCount;
-    runningThreads = (ULONG)Pool->Public.RunningThreadCount;
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Pool->ConfigLock);
+    minThreads = Pool->MinThreads;
+    maxThreads = Pool->MaxThreads;
+    scaleUp = Pool->ScaleUpThreshold;
+    scaleDown = Pool->ScaleDownThreshold;
+    ExReleasePushLockShared(&Pool->ConfigLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Read current state
+    //
+    totalThreads = (ULONG)InterlockedCompareExchange(&Pool->ThreadCount, 0, 0);
+    idleThreads = (ULONG)InterlockedCompareExchange(&Pool->IdleThreadCount, 0, 0);
+    runningThreads = (ULONG)InterlockedCompareExchange(&Pool->RunningThreadCount, 0, 0);
 
     if (totalThreads == 0) {
-        Pool->ScaleInProgress = 0;
+        InterlockedExchange(&Pool->ScaleInProgress, 0);
         return;
     }
 
-    //
-    // Calculate utilization (running / total * 100)
-    //
     utilization = (runningThreads * 100) / totalThreads;
 
-    //
-    // Determine scaling action
-    //
-    if (utilization >= Pool->Public.ScaleUpThreshold &&
-        totalThreads < Pool->Public.MaxThreads) {
+    if (utilization >= scaleUp && totalThreads < maxThreads) {
         shouldScaleUp = TRUE;
-    } else if (utilization <= Pool->Public.ScaleDownThreshold &&
-               totalThreads > Pool->Public.MinThreads) {
+    } else if (utilization <= scaleDown && totalThreads > minThreads) {
         shouldScaleDown = TRUE;
     }
 
-    //
-    // Perform scaling (must drop spinlock to create/destroy threads)
-    //
     if (shouldScaleUp) {
-        PTP_THREAD_INFO_INTERNAL newThread;
+        //
+        // CRITICAL-01 fix: PsCreateSystemThread now runs at PASSIVE_LEVEL
+        // (this function is called from a work item routine).
+        //
+        PTP_THREAD_INFO newThread;
         NTSTATUS status = TppCreateThread(Pool, &newThread);
         if (NT_SUCCESS(status)) {
-            InterlockedIncrement64(&Pool->Public.Stats.ScaleUpCount);
-            InterlockedIncrement64(&Pool->Public.Stats.ThreadsCreated);
+            InterlockedIncrement64(&Pool->Stats.ScaleUpCount);
+            InterlockedIncrement64(&Pool->Stats.ThreadsCreated);
         }
     } else if (shouldScaleDown) {
         //
-        // Find an idle thread to remove
+        // CRITICAL-02 fix: Find idle thread with timeout exceeded.
+        // Remove from list under spinlock. Signal stop.
+        // The worker thread handles its own cleanup (self-destruct pattern).
         //
         PLIST_ENTRY entry;
-        PTP_THREAD_INFO_INTERNAL threadToRemove = NULL;
+        PTP_THREAD_INFO threadToRemove = NULL;
         KIRQL oldIrql;
 
-        KeAcquireSpinLock(&Pool->Public.ThreadListLock, &oldIrql);
+        KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
 
-        for (entry = Pool->Public.ThreadList.Flink;
-             entry != &Pool->Public.ThreadList;
+        for (entry = Pool->ThreadList.Flink;
+             entry != &Pool->ThreadList;
              entry = entry->Flink) {
 
-            PTP_THREAD_INFO_INTERNAL threadInfo =
-                CONTAINING_RECORD(entry, TP_THREAD_INFO_INTERNAL, Public.ListEntry);
+            PTP_THREAD_INFO ti = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
 
-            if (threadInfo->Public.State == TpThreadState_Idle) {
-                //
-                // Check idle timeout
-                //
+            if (ti->State == TpThreadState_Idle) {
                 LARGE_INTEGER idleTime;
-                idleTime.QuadPart = currentTime.QuadPart - threadInfo->Public.IdleStartTime.QuadPart;
+                idleTime.QuadPart = currentTime.QuadPart - ti->IdleStartTime.QuadPart;
 
-                if (idleTime.QuadPart / 10000 >= Pool->IdleTimeoutMs) {
-                    RemoveEntryList(entry);
-                    threadToRemove = threadInfo;
+                if (idleTime.QuadPart / 10000 >= (LONGLONG)Pool->IdleTimeoutMs) {
+                    //
+                    // DON'T remove from list here — the thread will self-remove on exit
+                    //
+                    threadToRemove = ti;
                     break;
                 }
             }
         }
 
-        KeReleaseSpinLock(&Pool->Public.ThreadListLock, oldIrql);
+        KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
 
         if (threadToRemove != NULL) {
             //
-            // Signal stop without waiting (we're in DPC context)
+            // Signal the thread to stop. It will self-cleanup.
             //
             TppSignalThreadStop(threadToRemove);
-            InterlockedIncrement64(&Pool->Public.Stats.ScaleDownCount);
-            InterlockedIncrement64(&Pool->Public.Stats.ThreadsDestroyed);
+            InterlockedIncrement64(&Pool->Stats.ScaleDownCount);
         }
     }
 
     Pool->LastScaleTime = currentTime;
-    Pool->ScaleInProgress = 0;
+    InterlockedExchange(&Pool->ScaleInProgress, 0);
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - DEFAULT WORK EXECUTOR
+// PRIVATE IMPLEMENTATION - UTILITY FUNCTIONS
 // ============================================================================
 
+/**
+ * @brief Default work executor — logs a warning and returns.
+ *
+ * If no executor is set, work signals are consumed with a warning.
+ * In production, callers MUST set a real executor via TpSetWorkExecutor
+ * before signaling work.
+ */
 static VOID
 TppDefaultWorkExecutor(
     _In_ PTP_THREAD_INFO ThreadInfo,
@@ -1711,141 +1867,103 @@ TppDefaultWorkExecutor(
     UNREFERENCED_PARAMETER(ShutdownEvent);
     UNREFERENCED_PARAMETER(ExecutorContext);
 
-    //
-    // Default executor does nothing - caller should set custom executor
-    // that integrates with their work queue implementation
-    //
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+               "[ShadowStrike:TP] WARNING: Default work executor invoked. "
+               "No work executor set. Call TpSetWorkExecutor() before signaling work.\n");
 }
 
-// ============================================================================
-// PRIVATE IMPLEMENTATION - UTILITY FUNCTIONS
-// ============================================================================
-
+/**
+ * @brief Validate pool pointer (safe at any IRQL).
+ *
+ * Only checks Magic and Initialized flag. No dereference of untrusted pointers.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static BOOLEAN
 TppIsValidPool(
     _In_opt_ PTP_THREAD_POOL Pool
 )
 {
-    PTP_THREAD_POOL_INTERNAL pool;
-
     if (Pool == NULL) {
         return FALSE;
     }
 
-    pool = CONTAINING_RECORD(Pool, TP_THREAD_POOL_INTERNAL, Public);
-
-    return (pool->Magic == TP_POOL_MAGIC && Pool->Initialized);
+    //
+    // __try is NOT available in kernel code at DISPATCH_LEVEL for structured
+    // exception handling on arbitrary pointers. We trust that callers pass
+    // valid pool pointers that were returned from TpCreate.
+    //
+    return (Pool->Magic == TP_POOL_MAGIC && Pool->Initialized);
 }
 
-static BOOLEAN
-TppIsValidThreadInfo(
-    _In_opt_ PTP_THREAD_INFO_INTERNAL ThreadInfo
-)
-{
-    return (ThreadInfo != NULL && ThreadInfo->Magic == TP_THREAD_INFO_MAGIC);
-}
-
+/**
+ * @brief Acquire a reference on the pool.
+ */
 static VOID
 TppAcquirePoolReference(
-    _Inout_ PTP_THREAD_POOL_INTERNAL Pool
+    _Inout_ PTP_THREAD_POOL Pool
 )
 {
     InterlockedIncrement(&Pool->ReferenceCount);
 }
 
+/**
+ * @brief Release a reference on the pool. Frees on last release.
+ */
 static VOID
 TppReleasePoolReference(
-    _Inout_ PTP_THREAD_POOL_INTERNAL Pool
+    _Inout_ PTP_THREAD_POOL Pool
 )
 {
     LONG ref = InterlockedDecrement(&Pool->ReferenceCount);
 
     if (ref == 0) {
-        //
-        // Final release - free the pool structure
-        //
         ShadowStrikeFreePoolWithTag(Pool, TP_POOL_TAG_CONTEXT);
     }
 }
 
-static VOID
-TppUpdateThreadStatistics(
-    _Inout_ PTP_THREAD_INFO_INTERNAL ThreadInfo,
-    _In_ BOOLEAN WorkCompleted,
-    _In_ LARGE_INTEGER WorkTime
-)
-{
-    if (WorkCompleted) {
-        InterlockedIncrement64(&ThreadInfo->Public.WorkItemsCompleted);
-        InterlockedIncrement64(&ThreadInfo->Pool->Public.Stats.TotalWorkItems);
-    }
-
-    InterlockedAdd64(&ThreadInfo->Public.TotalWorkTimeMs, WorkTime.QuadPart / 10000);
-}
-
+/**
+ * @brief Set kernel thread priority.
+ *
+ * Uses KeSetPriorityThread (absolute priority), NOT KeSetBasePriorityThread
+ * (which takes a priority INCREMENT, not an absolute value — HIGH-06 fix).
+ *
+ * KeSetPriorityThread is safe at any IRQL.
+ */
 static VOID
 TppSetThreadPriority(
     _In_ PKTHREAD Thread,
     _In_ TP_THREAD_PRIORITY Priority
 )
 {
-    KPRIORITY basePriority;
+    KPRIORITY absolutePriority;
 
-    //
-    // Map our priority to kernel priority
-    //
     switch (Priority) {
         case TpPriority_Lowest:
-            basePriority = LOW_PRIORITY;
+            absolutePriority = LOW_PRIORITY + 1;
             break;
         case TpPriority_BelowNormal:
-            basePriority = LOW_REALTIME_PRIORITY - 2;
+            absolutePriority = LOW_REALTIME_PRIORITY - 2;
             break;
         case TpPriority_Normal:
-            basePriority = LOW_REALTIME_PRIORITY;
+            absolutePriority = LOW_REALTIME_PRIORITY;
             break;
         case TpPriority_AboveNormal:
-            basePriority = LOW_REALTIME_PRIORITY + 2;
+            absolutePriority = LOW_REALTIME_PRIORITY + 2;
             break;
         case TpPriority_Highest:
-            basePriority = HIGH_PRIORITY;
+            absolutePriority = HIGH_PRIORITY;
             break;
         case TpPriority_TimeCritical:
-            basePriority = HIGH_PRIORITY + 1;
+            absolutePriority = HIGH_PRIORITY + 1;
             break;
         default:
-            basePriority = LOW_REALTIME_PRIORITY;
+            absolutePriority = LOW_REALTIME_PRIORITY;
             break;
     }
 
-    KeSetBasePriorityThread(Thread, basePriority);
-}
-
-static VOID
-TppSetThreadAffinity(
-    _In_ PKTHREAD Thread,
-    _In_ KAFFINITY AffinityMask,
-    _In_ BOOLEAN UseIdealProcessor,
-    _In_ ULONG ThreadIndex
-)
-{
-    UNREFERENCED_PARAMETER(Thread);
-
     //
-    // Set thread affinity
+    // HIGH-06 fix: KeSetPriorityThread takes absolute priority.
+    // KeSetBasePriorityThread takes an INCREMENT — wrong API for absolute values.
     //
-    if (AffinityMask != 0) {
-        KeSetSystemAffinityThread(AffinityMask);
-    }
-
-    //
-    // Set ideal processor for better cache locality
-    //
-    if (UseIdealProcessor) {
-        ULONG processorCount = KeQueryActiveProcessorCount(NULL);
-        if (processorCount > 0) {
-            ULONG idealProcessor = ThreadIndex % processorCount;
-            KeSetIdealProcessorThread(Thread, (CCHAR)idealProcessor);
-        }
-    }
+    KeSetPriorityThread(Thread, absolutePriority);
 }

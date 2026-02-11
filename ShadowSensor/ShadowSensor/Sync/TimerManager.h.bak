@@ -1,29 +1,26 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: TimerManager.h
-
+    
     Purpose: Centralized timer management for periodic tasks,
              timeouts, and scheduled work in the kernel driver.
-
+             
     Architecture:
     - High-resolution timer support via KeSetCoalescableTimer
-    - Timer wheel for efficient deadline-miss detection
-    - One-shot and periodic timers with reference counting
+    - Timer wheel for efficient timeout management
+    - One-shot and periodic timers
     - Timer coalescing for power efficiency
-    - WorkItem support for PASSIVE_LEVEL callbacks via IoQueueWorkItem
-
+    
     Copyright (c) ShadowStrike Team
 --*/
 
-#ifndef _SHADOWSTRIKE_TIMER_MANAGER_H_
-#define _SHADOWSTRIKE_TIMER_MANAGER_H_
+#pragma once
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #include <ntddk.h>
-#include <ntstrsafe.h>
 
 //=============================================================================
 // Pool Tags
@@ -44,8 +41,7 @@ extern "C" {
 #define TM_DEFAULT_TOLERANCE_MS     50      // Default timer tolerance
 
 // Timer wheel configuration
-#define TM_WHEEL_SIZE               256     // Slots in timer wheel (power of 2)
-#define TM_WHEEL_MASK               (TM_WHEEL_SIZE - 1)
+#define TM_WHEEL_SIZE               256     // Slots in timer wheel
 #define TM_WHEEL_RESOLUTION_MS      10      // Resolution per slot
 #define TM_WHEEL_SPAN_MS            (TM_WHEEL_SIZE * TM_WHEEL_RESOLUTION_MS)
 
@@ -53,12 +49,6 @@ extern "C" {
 #define TM_COALESCE_GROUP_TELEMETRY     1
 #define TM_COALESCE_GROUP_MAINTENANCE   2
 #define TM_COALESCE_GROUP_STATISTICS    3
-
-// Name field max length (including NUL)
-#define TM_TIMER_NAME_MAX           32
-
-// Shutdown spin limit to avoid livelock
-#define TM_SHUTDOWN_SPIN_LIMIT      5000
 
 //=============================================================================
 // Timer Types
@@ -94,9 +84,9 @@ typedef enum _TM_TIMER_FLAGS {
     TmFlag_Coalescable          = 0x00000002,   // Can be coalesced
     TmFlag_NoWake               = 0x00000004,   // Don't wake from sleep
     TmFlag_DpcCallback          = 0x00000008,   // Callback runs at DISPATCH
-    TmFlag_WorkItemCallback     = 0x00000010,   // Callback queued as work item (PASSIVE)
+    TmFlag_WorkItemCallback     = 0x00000010,   // Callback queued as work item
     TmFlag_AutoDelete           = 0x00000020,   // Delete after one-shot fires
-    TmFlag_Synchronized         = 0x00000040,   // Manual start (don't auto-start on create)
+    TmFlag_Synchronized         = 0x00000040,   // Synchronize with cancel
 } TM_TIMER_FLAGS;
 
 //=============================================================================
@@ -109,7 +99,7 @@ typedef VOID (*TM_TIMER_CALLBACK)(
     );
 
 //=============================================================================
-// Timer Object (public portion, embedded in internal struct)
+// Timer Object
 //=============================================================================
 
 typedef struct _TM_TIMER {
@@ -118,35 +108,35 @@ typedef struct _TM_TIMER {
     //
     KTIMER KernelTimer;
     KDPC TimerDpc;
-
+    
     //
     // Timer identification
     //
     ULONG TimerId;
-    CHAR Name[TM_TIMER_NAME_MAX];
+    CHAR Name[32];
     TM_TIMER_TYPE Type;
     TM_TIMER_FLAGS Flags;
-    volatile LONG State;    // TM_TIMER_STATE via InterlockedCompareExchange
-
+    volatile TM_TIMER_STATE State;
+    
     //
     // Timing parameters
     //
-    LARGE_INTEGER DueTime;              // When to fire (relative, negative 100ns)
-    LARGE_INTEGER Period;               // Period for periodic timers (negative 100ns)
+    LARGE_INTEGER DueTime;              // When to fire (absolute)
+    LARGE_INTEGER Period;               // Period for periodic timers
     ULONG ToleranceMs;                  // Tolerance for coalescing
-
+    
     //
     // Callback
     //
     TM_TIMER_CALLBACK Callback;
     PVOID Context;
-    ULONG ContextSize;                  // >0 means we own Context (copied)
-
+    ULONG ContextSize;
+    
     //
     // Coalescing
     //
     ULONG CoalesceGroup;
-
+    
     //
     // Statistics
     //
@@ -154,24 +144,24 @@ typedef struct _TM_TIMER {
     LARGE_INTEGER LastFireTime;
     LARGE_INTEGER NextFireTime;
     LARGE_INTEGER CreationTime;
-
+    
     //
     // Cancellation support
     //
     KEVENT CancelEvent;
-    volatile LONG CancelRequested;      // LONG for Interlocked ops
-
+    volatile BOOLEAN CancelRequested;
+    
     //
     // Reference counting
     //
     volatile LONG RefCount;
-
+    
     //
     // List linkage
     //
-    LIST_ENTRY ListEntry;               // Link in TM_MANAGER::TimerList
-    LIST_ENTRY WheelEntry;              // Link in TM_WHEEL_SLOT::TimerList
-
+    LIST_ENTRY ListEntry;
+    LIST_ENTRY WheelEntry;
+    
 } TM_TIMER, *PTM_TIMER;
 
 //=============================================================================
@@ -190,36 +180,36 @@ typedef struct _TM_WHEEL_SLOT {
 
 typedef struct _TM_MANAGER {
     //
-    // Initialization state — volatile LONG for interlocked CAS
+    // Initialization state
     //
-    volatile LONG Initialized;          // 0 = not init, 1 = initialized
-    volatile LONG ShuttingDown;         // 0 = running, 1 = shutting down
-
+    BOOLEAN Initialized;
+    volatile BOOLEAN ShuttingDown;
+    
     //
     // Timer list
     //
     LIST_ENTRY TimerList;
     KSPIN_LOCK TimerListLock;
     volatile LONG TimerCount;
-
+    
     //
-    // Timer wheel for deadline-miss detection
+    // Timer wheel for efficient timeout management
     //
     TM_WHEEL_SLOT Wheel[TM_WHEEL_SIZE];
-    volatile LONG CurrentSlot;          // LONG for InterlockedIncrement
+    volatile ULONG CurrentSlot;
     KTIMER WheelTimer;
     KDPC WheelDpc;
-
+    
     //
-    // ID generation — uses InterlockedIncrement, never returns 0
+    // ID generation
     //
     volatile LONG NextTimerId;
-
+    
     //
-    // Device object for IoAllocateWorkItem (WorkItemCallback support)
+    // Work queue integration (for WorkItem callbacks)
     //
-    PDEVICE_OBJECT DeviceObject;
-
+    PVOID WorkQueue;                    // PAWQ_MANAGER
+    
     //
     // Statistics
     //
@@ -231,7 +221,7 @@ typedef struct _TM_MANAGER {
         volatile LONG64 CoalescedTimers;
         LARGE_INTEGER StartTime;
     } Stats;
-
+    
     //
     // Configuration
     //
@@ -240,11 +230,11 @@ typedef struct _TM_MANAGER {
         BOOLEAN EnableCoalescing;
         BOOLEAN EnableHighResolution;
     } Config;
-
+    
 } TM_MANAGER, *PTM_MANAGER;
 
 //=============================================================================
-// Timer Options (passed to create functions)
+// Timer Options
 //=============================================================================
 
 typedef struct _TM_TIMER_OPTIONS {
@@ -253,29 +243,46 @@ typedef struct _TM_TIMER_OPTIONS {
     ULONG ToleranceMs;
     ULONG CoalesceGroup;
     PCSTR Name;
-    PVOID Context;                      // If ContextSize > 0, data is COPIED
-    ULONG ContextSize;                  // 0 = caller owns Context lifetime
+    PVOID Context;
+    ULONG ContextSize;
 } TM_TIMER_OPTIONS, *PTM_TIMER_OPTIONS;
 
 //=============================================================================
 // Public API - Initialization
 //=============================================================================
 
+//
+// Initialize the timer manager
+//
 NTSTATUS
 TmInitialize(
-    _In_opt_ PDEVICE_OBJECT DeviceObject,
     _Out_ PTM_MANAGER* Manager
     );
 
+//
+// Shutdown the timer manager
+//
 VOID
 TmShutdown(
     _Inout_ PTM_MANAGER Manager
+    );
+
+//
+// Set work queue for WorkItem callbacks
+//
+NTSTATUS
+TmSetWorkQueue(
+    _Inout_ PTM_MANAGER Manager,
+    _In_ PVOID WorkQueue
     );
 
 //=============================================================================
 // Public API - Timer Creation
 //=============================================================================
 
+//
+// Create a one-shot timer
+//
 NTSTATUS
 TmCreateOneShot(
     _In_ PTM_MANAGER Manager,
@@ -286,6 +293,9 @@ TmCreateOneShot(
     _Out_ PULONG TimerId
     );
 
+//
+// Create a periodic timer
+//
 NTSTATUS
 TmCreatePeriodic(
     _In_ PTM_MANAGER Manager,
@@ -296,6 +306,9 @@ TmCreatePeriodic(
     _Out_ PULONG TimerId
     );
 
+//
+// Create timer with absolute due time
+//
 NTSTATUS
 TmCreateAbsolute(
     _In_ PTM_MANAGER Manager,
@@ -311,18 +324,27 @@ TmCreateAbsolute(
 // Public API - Timer Control
 //=============================================================================
 
+//
+// Start a timer
+//
 NTSTATUS
 TmStart(
     _In_ PTM_MANAGER Manager,
     _In_ ULONG TimerId
     );
 
+//
+// Stop (pause) a timer
+//
 NTSTATUS
 TmStop(
     _In_ PTM_MANAGER Manager,
     _In_ ULONG TimerId
     );
 
+//
+// Cancel and delete a timer
+//
 NTSTATUS
 TmCancel(
     _In_ PTM_MANAGER Manager,
@@ -330,12 +352,18 @@ TmCancel(
     _In_ BOOLEAN Wait
     );
 
+//
+// Reset a timer (restart with same parameters)
+//
 NTSTATUS
 TmReset(
     _In_ PTM_MANAGER Manager,
     _In_ ULONG TimerId
     );
 
+//
+// Modify timer period
+//
 NTSTATUS
 TmSetPeriod(
     _In_ PTM_MANAGER Manager,
@@ -347,13 +375,19 @@ TmSetPeriod(
 // Public API - Timer Query
 //=============================================================================
 
+//
+// Get timer state
+//
 NTSTATUS
 TmGetState(
     _In_ PTM_MANAGER Manager,
     _In_ ULONG TimerId,
-    _Out_ PLONG State
+    _Out_ PTM_TIMER_STATE State
     );
 
+//
+// Get time until next fire
+//
 NTSTATUS
 TmGetRemaining(
     _In_ PTM_MANAGER Manager,
@@ -361,6 +395,9 @@ TmGetRemaining(
     _Out_ PLARGE_INTEGER Remaining
     );
 
+//
+// Check if timer is active
+//
 BOOLEAN
 TmIsActive(
     _In_ PTM_MANAGER Manager,
@@ -371,12 +408,18 @@ TmIsActive(
 // Public API - Bulk Operations
 //=============================================================================
 
+//
+// Cancel all timers
+//
 VOID
 TmCancelAll(
     _In_ PTM_MANAGER Manager,
     _In_ BOOLEAN Wait
     );
 
+//
+// Cancel timers in a coalesce group
+//
 VOID
 TmCancelGroup(
     _In_ PTM_MANAGER Manager,
@@ -416,17 +459,10 @@ TmResetStatistics(
 //
 // Convert milliseconds to 100-nanosecond intervals (negative for relative)
 //
-#define TM_MS_TO_RELATIVE(ms)  (-(LONGLONG)(ms) * 10000LL)
+#define TM_MS_TO_RELATIVE(ms) (-(LONGLONG)(ms) * 10000LL)
 #define TM_SEC_TO_RELATIVE(sec) TM_MS_TO_RELATIVE((sec) * 1000)
 #define TM_MIN_TO_RELATIVE(min) TM_SEC_TO_RELATIVE((min) * 60)
-
-//
-// Invalid timer ID sentinel
-//
-#define TM_INVALID_TIMER_ID     0
 
 #ifdef __cplusplus
 }
 #endif
-
-#endif // _SHADOWSTRIKE_TIMER_MANAGER_H_

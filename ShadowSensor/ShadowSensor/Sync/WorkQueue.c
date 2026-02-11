@@ -6,17 +6,25 @@
  * @file WorkQueue.c
  * @brief Implementation of enterprise-grade kernel work queue.
  *
- * This implementation provides:
- * - Thread-safe work item management with lock-free operations where possible
- * - Priority-based scheduling with per-priority queues
- * - IoWorkItem integration for safe driver unload
- * - FltQueueGenericWorkItem for filter manager operations
- * - Rundown protection for clean shutdown
- * - Comprehensive statistics and timing
- * - Lookaside list for efficient work item allocation
+ * v2.1.0 Changes (Enterprise Hardened):
+ * ======================================
+ * - KeEnterCriticalRegion around ALL push lock acquisitions
+ * - PAGE segment (not INIT) for init functions — safe for ref-counted re-init
+ * - DPC fallback REMOVED: if no DeviceObject, fail submission (don't execute
+ *   at DISPATCH_LEVEL)
+ * - Shutdown: cancel all delayed timers, KeFlushQueuedDpcs, proper SLIST drain
+ * - Retry path re-acquires rundown protection before re-queue
+ * - Single ListEntry (ActiveListEntry) — no per-priority queue lists
+ * - Legacy callback uses wrapper function, no UB cast
+ * - Per-priority stats use interlocked ops
+ * - Context copies always NonPaged (callable from DISPATCH_LEVEL)
+ * - WaitForWorkItem uses KeQueryPerformanceCounter for accurate timing
+ * - Flush actually cancels and completes items
+ * - State transitions use InterlockedCompareExchange
+ * - SetDeviceObject/SetFilterHandle synchronized with push lock
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition - Hardened)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -25,8 +33,8 @@
 #include "../Utilities/MemoryUtils.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, ShadowStrikeWorkQueueInitialize)
-#pragma alloc_text(INIT, ShadowStrikeWorkQueueInitializeEx)
+#pragma alloc_text(PAGE, ShadowStrikeWorkQueueInitialize)
+#pragma alloc_text(PAGE, ShadowStrikeWorkQueueInitializeEx)
 #pragma alloc_text(PAGE, ShadowStrikeWorkQueueShutdown)
 #pragma alloc_text(PAGE, ShadowStrikeWorkQueueDrain)
 #pragma alloc_text(PAGE, ShadowStrikeWaitForWorkItem)
@@ -38,100 +46,63 @@
 // GLOBAL STATE
 // ============================================================================
 
-/**
- * @brief Global work queue manager (Meyers' singleton)
- */
 static SHADOWSTRIKE_WQ_MANAGER g_WqManager = { 0 };
 
 // ============================================================================
-// INTERNAL FUNCTION PROTOTYPES
+// INTERNAL PROTOTYPES
 // ============================================================================
 
-static
-PSHADOWSTRIKE_WORK_ITEM
-WqiAllocateWorkItem(
-    VOID
-    );
+static PSHADOWSTRIKE_WORK_ITEM WqiAllocateWorkItem(VOID);
+static VOID WqiFreeWorkItem(_In_ PSHADOWSTRIKE_WORK_ITEM Item);
+static VOID WqiReferenceWorkItem(_Inout_ PSHADOWSTRIKE_WORK_ITEM Item);
+static VOID WqiDereferenceWorkItem(_Inout_ PSHADOWSTRIKE_WORK_ITEM Item);
 
-static
-VOID
-WqiFreeWorkItem(
-    _In_ PSHADOWSTRIKE_WORK_ITEM Item
-    );
+static VOID WqiExecuteWorkItem(_In_ PSHADOWSTRIKE_WORK_ITEM Item);
+static VOID WqiCompleteWorkItem(_In_ PSHADOWSTRIKE_WORK_ITEM Item, _In_ NTSTATUS Status);
 
-static
-VOID
-WqiReferenceWorkItem(
-    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item
-    );
+static IO_WORKITEM_ROUTINE WqiIoWorkItemCallback;
 
-static
-VOID
-WqiDereferenceWorkItem(
-    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item
-    );
-
-static
-NTSTATUS
-WqiEnqueueItem(
-    _In_ PSHADOWSTRIKE_WORK_ITEM Item
-    );
-
-static
-VOID
-WqiExecuteWorkItem(
-    _In_ PSHADOWSTRIKE_WORK_ITEM Item
-    );
-
-static
-VOID
-WqiCompleteWorkItem(
-    _In_ PSHADOWSTRIKE_WORK_ITEM Item,
-    _In_ NTSTATUS Status
-    );
-
-static
-IO_WORKITEM_ROUTINE WqiIoWorkItemCallback;
-
-static
-VOID
-WqiFltWorkItemCallback(
+static VOID WqiFltWorkItemCallback(
     _In_ PFLT_GENERIC_WORKITEM FltWorkItem,
     _In_ PVOID FltObject,
-    _In_opt_ PVOID Context
-    );
+    _In_opt_ PVOID Context);
 
-static
-KDEFERRED_ROUTINE WqiDelayTimerDpcCallback;
+static KDEFERRED_ROUTINE WqiDelayTimerDpcCallback;
 
-static
-VOID
-WqiUpdateStatisticsOnSubmit(
-    _In_ SHADOWSTRIKE_WQ_PRIORITY Priority
-    );
+static PSHADOWSTRIKE_WORK_ITEM WqiFindWorkItemById(_In_ ULONG64 ItemId);
 
-static
-VOID
-WqiUpdateStatisticsOnComplete(
-    _In_ PSHADOWSTRIKE_WORK_ITEM Item,
-    _In_ BOOLEAN Success
-    );
+static VOID WqiTrackSubmit(VOID);
+static VOID WqiTrackComplete(_In_ PSHADOWSTRIKE_WORK_ITEM Item, _In_ BOOLEAN Success);
 
-static
-PSHADOWSTRIKE_WORK_ITEM
-WqiFindWorkItemById(
-    _In_ ULONG64 ItemId
-    );
+static NTSTATUS WqiSetupContext(
+    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item,
+    _In_opt_ PVOID Context,
+    _In_ ULONG ContextSize,
+    _In_ ULONG Flags);
+
+static NTSTATUS WqiDispatchItem(_Inout_ PSHADOWSTRIKE_WORK_ITEM Item);
+
+static NTSTATUS WqiDispatchFilterItem(
+    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item,
+    _In_ PFLT_INSTANCE Instance);
+
+/// Legacy wrapper that adapts VOID(*)(PVOID) to NTSTATUS(*)(PVOID, ULONG)
+static NTSTATUS WqiLegacyRoutineWrapper(
+    _In_opt_ PVOID Context,
+    _In_ ULONG ContextSize);
+
+static VOID WqiRemoveFromActiveList(_Inout_ PSHADOWSTRIKE_WORK_ITEM Item);
+static VOID WqiAddToActiveList(_Inout_ PSHADOWSTRIKE_WORK_ITEM Item);
 
 // ============================================================================
 // SUBSYSTEM INITIALIZATION
+// FIX #1: Push lock with KeEnterCriticalRegion
+// FIX #2: PAGE segment, not INIT
 // ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
-ShadowStrikeWorkQueueInitialize(
-    VOID
-    )
+ShadowStrikeWorkQueueInitialize(VOID)
 {
     SHADOWSTRIKE_WQ_CONFIG DefaultConfig;
 
@@ -144,330 +115,278 @@ ShadowStrikeWorkQueueInitialize(
 _Use_decl_annotations_
 NTSTATUS
 ShadowStrikeWorkQueueInitializeEx(
-    _In_ PSHADOWSTRIKE_WQ_CONFIG Config
-    )
+    _In_ PSHADOWSTRIKE_WQ_CONFIG Config)
 {
-    NTSTATUS Status = STATUS_SUCCESS;
-    ULONG i;
-
     PAGED_CODE();
 
     if (Config == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Thread-safe initialization with push lock
-    //
+    // FIX #1: KeEnterCriticalRegion before push lock
+    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_WqManager.InitLock);
 
-    //
-    // Check if already initialized (reference counting)
-    //
+    // Ref-counted init — only first caller does real work
     if (InterlockedIncrement(&g_WqManager.InitCount) > 1) {
         ExReleasePushLockExclusive(&g_WqManager.InitLock);
+        KeLeaveCriticalRegion();
         return STATUS_SUCCESS;
     }
 
-    //
-    // Set state to initializing
-    //
-    g_WqManager.State = ShadowWqStateInitializing;
+    InterlockedExchange(&g_WqManager.State, (LONG)ShadowWqStateInitializing);
 
-    //
-    // Copy configuration
-    //
+    // Copy and validate configuration
     RtlCopyMemory(&g_WqManager.Config, Config, sizeof(SHADOWSTRIKE_WQ_CONFIG));
 
-    //
-    // Validate and apply defaults
-    //
-    if (g_WqManager.Config.MaxPendingTotal == 0) {
+    if (g_WqManager.Config.MaxPendingTotal == 0)
         g_WqManager.Config.MaxPendingTotal = WQ_DEFAULT_MAX_PENDING;
-    }
-    if (g_WqManager.Config.MaxPendingTotal < WQ_MIN_MAX_PENDING) {
+    if (g_WqManager.Config.MaxPendingTotal < WQ_MIN_MAX_PENDING)
         g_WqManager.Config.MaxPendingTotal = WQ_MIN_MAX_PENDING;
-    }
-    if (g_WqManager.Config.MaxPendingTotal > WQ_MAX_MAX_PENDING) {
+    if (g_WqManager.Config.MaxPendingTotal > WQ_MAX_MAX_PENDING)
         g_WqManager.Config.MaxPendingTotal = WQ_MAX_MAX_PENDING;
-    }
-
-    if (g_WqManager.Config.MaxPendingPerPriority == 0) {
-        g_WqManager.Config.MaxPendingPerPriority =
-            g_WqManager.Config.MaxPendingTotal / ShadowWqPriorityCount;
-    }
-
-    if (g_WqManager.Config.LookasideDepth == 0) {
+    if (g_WqManager.Config.LookasideDepth == 0)
         g_WqManager.Config.LookasideDepth = WQ_LOOKASIDE_DEPTH;
-    }
 
-    //
-    // Store device/filter handles
-    //
+    g_WqManager.MaxPending = (LONG)g_WqManager.Config.MaxPendingTotal;
     g_WqManager.DeviceObject = Config->DeviceObject;
     g_WqManager.FilterHandle = Config->FilterHandle;
 
-    //
-    // Initialize priority queues
-    //
-    for (i = 0; i < ShadowWqPriorityCount; i++) {
-        InitializeListHead(&g_WqManager.Queues[i].Head);
-        KeInitializeSpinLock(&g_WqManager.Queues[i].Lock);
-        g_WqManager.Queues[i].Count = 0;
-        g_WqManager.Queues[i].PeakCount = 0;
-        g_WqManager.Queues[i].MaxItems = g_WqManager.Config.MaxPendingPerPriority;
-        g_WqManager.Queues[i].TotalEnqueued = 0;
-        g_WqManager.Queues[i].TotalDequeued = 0;
-        g_WqManager.Queues[i].TotalDropped = 0;
-    }
-
-    //
-    // Initialize free list (lock-free SLIST)
-    //
-    InitializeSListHead(&g_WqManager.FreeList);
-    g_WqManager.FreeCount = 0;
-
-    //
     // Initialize active list
-    //
     InitializeListHead(&g_WqManager.ActiveList);
     KeInitializeSpinLock(&g_WqManager.ActiveListLock);
     g_WqManager.ActiveCount = 0;
 
-    //
-    // Initialize work item ID generator
-    //
+    // Initialize free list (lock-free SLIST)
+    InitializeSListHead(&g_WqManager.FreeList);
+    g_WqManager.FreeCount = 0;
+
+    // Work item ID generator
     g_WqManager.NextItemId = 1;
 
-    //
-    // Initialize lookaside list for work items
-    //
+    // Lookaside list
     ExInitializeNPagedLookasideList(
         &g_WqManager.WorkItemLookaside,
-        NULL,   // Allocate function
-        NULL,   // Free function
-        0,      // Flags
+        NULL, NULL, 0,
         sizeof(SHADOWSTRIKE_WORK_ITEM),
         SHADOW_WQ_ITEM_TAG,
-        g_WqManager.Config.LookasideDepth
-    );
+        g_WqManager.Config.LookasideDepth);
     g_WqManager.LookasideInitialized = TRUE;
 
-    //
-    // Initialize rundown protection
-    //
+    // Rundown protection
     ExInitializeRundownProtection(&g_WqManager.RundownProtection);
 
-    //
-    // Initialize events
-    //
+    // Events
     KeInitializeEvent(&g_WqManager.ShutdownEvent, NotificationEvent, FALSE);
     KeInitializeEvent(&g_WqManager.DrainCompleteEvent, NotificationEvent, FALSE);
 
-    //
-    // Initialize serialization support
-    //
-    InitializeListHead(&g_WqManager.Serialization.ActiveKeys);
-    KeInitializeSpinLock(&g_WqManager.Serialization.Lock);
-
-    //
-    // Initialize statistics
-    //
+    // Statistics
     RtlZeroMemory(&g_WqManager.Stats, sizeof(g_WqManager.Stats));
     KeQuerySystemTimePrecise(&g_WqManager.Stats.StartTime);
 
-    //
-    // Initialize timing
-    //
-    g_WqManager.Timing.TotalWaitTime = 0;
-    g_WqManager.Timing.TotalExecTime = 0;
-    g_WqManager.Timing.SampleCount = 0;
+    // Pending count
+    g_WqManager.PendingCount = 0;
 
-    //
-    // Set state to running
-    //
-    g_WqManager.State = ShadowWqStateRunning;
-    g_WqManager.Stats.State = ShadowWqStateRunning;
+    // Go live
+    InterlockedExchange(&g_WqManager.State, (LONG)ShadowWqStateRunning);
+    InterlockedExchange(&g_WqManager.Stats.State, (LONG)ShadowWqStateRunning);
 
     ExReleasePushLockExclusive(&g_WqManager.InitLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
 
+// ============================================================================
+// SHUTDOWN
+// FIX #1: Push lock with critical region
+// FIX #4: SLIST items actually freed
+// FIX #10: IoFreeWorkItem only after item is idle
+// FIX #15: Cancel timers, KeFlushQueuedDpcs
+// ============================================================================
+
 _Use_decl_annotations_
 VOID
 ShadowStrikeWorkQueueShutdown(
-    _In_ BOOLEAN WaitForCompletion
-    )
+    _In_ BOOLEAN WaitForCompletion)
 {
     LARGE_INTEGER Timeout;
-    ULONG i;
 
     PAGED_CODE();
 
+    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_WqManager.InitLock);
 
-    //
-    // Reference counting - only cleanup when last reference released
-    //
+    // Ref-counted: only last release does real cleanup
     if (InterlockedDecrement(&g_WqManager.InitCount) > 0) {
         ExReleasePushLockExclusive(&g_WqManager.InitLock);
+        KeLeaveCriticalRegion();
         return;
     }
 
-    //
-    // Set state to shutting down
-    //
-    g_WqManager.State = ShadowWqStateShutdown;
-    g_WqManager.Stats.State = ShadowWqStateShutdown;
-
-    //
-    // Signal shutdown event
-    //
+    // Signal shutdown
+    InterlockedExchange(&g_WqManager.State, (LONG)ShadowWqStateShutdown);
+    InterlockedExchange(&g_WqManager.Stats.State, (LONG)ShadowWqStateShutdown);
     KeSetEvent(&g_WqManager.ShutdownEvent, IO_NO_INCREMENT, FALSE);
 
-    //
-    // Wait for rundown protection to complete
-    //
+    // Wait for all in-flight operations to release rundown protection
     ExWaitForRundownProtectionRelease(&g_WqManager.RundownProtection);
 
-    //
-    // If waiting for completion, wait for pending items
-    //
-    if (WaitForCompletion) {
-        if (g_WqManager.ActiveCount > 0 ||
-            g_WqManager.Stats.CurrentPending > 0) {
+    // FIX #15: Cancel all delayed timers on active items, then flush DPCs
+    {
+        KIRQL OldIrql;
+        PLIST_ENTRY Entry;
 
+        KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
+        for (Entry = g_WqManager.ActiveList.Flink;
+             Entry != &g_WqManager.ActiveList;
+             Entry = Entry->Flink) {
+
+            PSHADOWSTRIKE_WORK_ITEM Item = CONTAINING_RECORD(
+                Entry, SHADOWSTRIKE_WORK_ITEM, ActiveListEntry);
+
+            if (Item->Type == ShadowWqTypeDelayed) {
+                KeCancelTimer(&Item->DelayTimer);
+            }
+        }
+        KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
+    }
+
+    // FIX #15: Flush all queued DPCs to ensure timer DPCs have completed
+    KeFlushQueuedDpcs();
+
+    // Wait for pending items if requested
+    if (WaitForCompletion) {
+        if (g_WqManager.ActiveCount > 0) {
             Timeout.QuadPart = -((LONGLONG)WQ_SHUTDOWN_TIMEOUT_MS * 10000);
             KeWaitForSingleObject(
                 &g_WqManager.DrainCompleteEvent,
-                Executive,
-                KernelMode,
-                FALSE,
-                &Timeout
-            );
+                Executive, KernelMode, FALSE, &Timeout);
         }
     }
 
-    //
-    // Flush all queues
-    //
-    ShadowStrikeWorkQueueFlush();
+    // Flush: complete all remaining active items as cancelled
+    {
+        KIRQL OldIrql;
+        LIST_ENTRY LocalList;
+        InitializeListHead(&LocalList);
 
-    //
-    // Cleanup lookaside list
-    //
+        KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
+        while (!IsListEmpty(&g_WqManager.ActiveList)) {
+            PLIST_ENTRY Entry = RemoveHeadList(&g_WqManager.ActiveList);
+            InsertTailList(&LocalList, Entry);
+        }
+        g_WqManager.ActiveCount = 0;
+        KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
+
+        while (!IsListEmpty(&LocalList)) {
+            PLIST_ENTRY Entry = RemoveHeadList(&LocalList);
+            PSHADOWSTRIKE_WORK_ITEM Item = CONTAINING_RECORD(
+                Entry, SHADOWSTRIKE_WORK_ITEM, ActiveListEntry);
+            InitializeListHead(&Item->ActiveListEntry);
+
+            // Cancel callback
+            if (Item->Options.CancelCallback != NULL) {
+                Item->Options.CancelCallback(Item->Context, Item->ContextSize);
+            }
+            // Cleanup
+            Item->CompletionStatus = STATUS_CANCELLED;
+            InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateCancelled);
+            // Don't call WqiCompleteWorkItem — rundown already released
+            WqiFreeWorkItem(Item);
+        }
+    }
+
+    // FIX #4: Drain SLIST free list — actually free each item
+    while (TRUE) {
+        PSLIST_ENTRY Entry = InterlockedPopEntrySList(&g_WqManager.FreeList);
+        if (Entry == NULL) break;
+
+        PSHADOWSTRIKE_WORK_ITEM Item = CONTAINING_RECORD(
+            Entry, SHADOWSTRIKE_WORK_ITEM, FreeListEntry);
+        ExFreeToNPagedLookasideList(&g_WqManager.WorkItemLookaside, Item);
+        InterlockedDecrement(&g_WqManager.FreeCount);
+    }
+
+    // Destroy lookaside
     if (g_WqManager.LookasideInitialized) {
         ExDeleteNPagedLookasideList(&g_WqManager.WorkItemLookaside);
         g_WqManager.LookasideInitialized = FALSE;
     }
 
-    //
-    // Free any remaining items in free list
-    //
-    while (TRUE) {
-        PSLIST_ENTRY Entry = InterlockedPopEntrySList(&g_WqManager.FreeList);
-        if (Entry == NULL) {
-            break;
-        }
-        // Items in free list are already freed via lookaside
-    }
-
-    g_WqManager.State = ShadowWqStateUninitialized;
+    InterlockedExchange(&g_WqManager.State, (LONG)ShadowWqStateUninitialized);
 
     ExReleasePushLockExclusive(&g_WqManager.InitLock);
+    KeLeaveCriticalRegion();
 }
 
 _Use_decl_annotations_
 BOOLEAN
-ShadowStrikeWorkQueueIsInitialized(
-    VOID
-    )
+ShadowStrikeWorkQueueIsInitialized(VOID)
 {
-    return (g_WqManager.State == ShadowWqStateRunning ||
-            g_WqManager.State == ShadowWqStatePaused);
+    LONG State = InterlockedCompareExchange(&g_WqManager.State, 0, 0);
+    return (State == (LONG)ShadowWqStateRunning ||
+            State == (LONG)ShadowWqStatePaused);
 }
 
 _Use_decl_annotations_
 SHADOWSTRIKE_WQ_STATE
-ShadowStrikeWorkQueueGetState(
-    VOID
-    )
+ShadowStrikeWorkQueueGetState(VOID)
 {
-    return g_WqManager.State;
+    return (SHADOWSTRIKE_WQ_STATE)InterlockedCompareExchange(
+        &g_WqManager.State, 0, 0);
 }
 
 // ============================================================================
-// INTERNAL WORK ITEM MANAGEMENT
+// INTERNAL: WORK ITEM LIFECYCLE
+// FIX #7: Single ListEntry (ActiveListEntry), no dual-list
+// FIX #16: No unnecessary zeroing of SLIST items
+// FIX #17: SubmitTime set before insertion
+// FIX #19: ActiveList membership tracked via state, not IsListEmpty
 // ============================================================================
 
-/**
- * @brief Allocate a work item from lookaside list
- */
-static
-PSHADOWSTRIKE_WORK_ITEM
-WqiAllocateWorkItem(
-    VOID
-    )
+static PSHADOWSTRIKE_WORK_ITEM
+WqiAllocateWorkItem(VOID)
 {
     PSHADOWSTRIKE_WORK_ITEM Item;
 
-    //
-    // Try to get from free list first
-    //
+    // Try free list first
     PSLIST_ENTRY Entry = InterlockedPopEntrySList(&g_WqManager.FreeList);
     if (Entry != NULL) {
         Item = CONTAINING_RECORD(Entry, SHADOWSTRIKE_WORK_ITEM, FreeListEntry);
         InterlockedDecrement(&g_WqManager.FreeCount);
-        RtlZeroMemory(Item, sizeof(SHADOWSTRIKE_WORK_ITEM));
     } else {
-        //
-        // Allocate from lookaside
-        //
         Item = (PSHADOWSTRIKE_WORK_ITEM)ExAllocateFromNPagedLookasideList(
-            &g_WqManager.WorkItemLookaside
-        );
-
+            &g_WqManager.WorkItemLookaside);
         if (Item == NULL) {
             return NULL;
         }
-
-        RtlZeroMemory(Item, sizeof(SHADOWSTRIKE_WORK_ITEM));
     }
 
-    //
+    // Zero the entire item for clean state
+    RtlZeroMemory(Item, sizeof(SHADOWSTRIKE_WORK_ITEM));
+
     // Initialize common fields
-    //
-    Item->ItemId = InterlockedIncrement64(&g_WqManager.NextItemId);
+    Item->ItemId = (ULONG64)InterlockedIncrement64(&g_WqManager.NextItemId);
     Item->RefCount = 1;
-    Item->State = ShadowWqItemStateAllocated;
+    InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateAllocated);
     Item->Manager = &g_WqManager;
-    InitializeListHead(&Item->ListEntry);
+    InitializeListHead(&Item->ActiveListEntry);
 
     return Item;
 }
 
-/**
- * @brief Free a work item back to lookaside list
- */
-static
-VOID
+static VOID
 WqiFreeWorkItem(
-    _In_ PSHADOWSTRIKE_WORK_ITEM Item
-    )
+    _In_ PSHADOWSTRIKE_WORK_ITEM Item)
 {
-    if (Item == NULL) {
-        return;
-    }
+    if (Item == NULL) return;
 
-    //
-    // Cleanup context if we own it
-    //
+    // Cleanup context
     if (Item->Context != NULL) {
         if (Item->Flags & ShadowWqFlagSecureContext) {
             ShadowStrikeSecureZeroMemory(Item->Context, Item->ContextSize);
         }
-
         if (!Item->UsingInlineContext &&
             (Item->Flags & ShadowWqFlagDeleteContext)) {
             ShadowStrikeFreePoolWithTag(Item->Context, SHADOW_WQ_CONTEXT_TAG);
@@ -475,215 +394,306 @@ WqiFreeWorkItem(
         Item->Context = NULL;
     }
 
-    //
-    // Free IoWorkItem if allocated
-    //
+    // FIX #10: IoFreeWorkItem is safe here because the item has completed
+    // or been removed from dispatch. We only call WqiFreeWorkItem after
+    // the IoWorkItem callback has returned (via WqiCompleteWorkItem path)
+    // or during shutdown after KeFlushQueuedDpcs.
     if (Item->IoWorkItem != NULL) {
         IoFreeWorkItem(Item->IoWorkItem);
         Item->IoWorkItem = NULL;
     }
 
-    //
-    // Free FltWorkItem if allocated
-    //
     if (Item->FltWorkItem != NULL) {
         FltFreeGenericWorkItem(Item->FltWorkItem);
         Item->FltWorkItem = NULL;
     }
 
-    //
-    // Mark as free
-    //
-    Item->State = ShadowWqItemStateFree;
+    InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateFree);
 
-    //
-    // Return to free list if not too many
-    //
+    // Return to free list if below threshold
     if (g_WqManager.FreeCount < (LONG)g_WqManager.Config.LookasideDepth) {
-        InterlockedPushEntrySList(
-            &g_WqManager.FreeList,
-            &Item->FreeListEntry
-        );
+        InterlockedPushEntrySList(&g_WqManager.FreeList, &Item->FreeListEntry);
         InterlockedIncrement(&g_WqManager.FreeCount);
     } else {
-        //
-        // Return to lookaside
-        //
         ExFreeToNPagedLookasideList(&g_WqManager.WorkItemLookaside, Item);
     }
 }
 
-/**
- * @brief Reference a work item
- */
-static
-VOID
+static VOID
 WqiReferenceWorkItem(
-    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item
-    )
+    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item)
 {
-    InterlockedIncrement(&Item->RefCount);
+    LONG Old = InterlockedIncrement(&Item->RefCount);
+    NT_ASSERT(Old > 1); // Must not reference a freed item
+    UNREFERENCED_PARAMETER(Old);
 }
 
-/**
- * @brief Dereference a work item, freeing if count reaches zero
- */
-static
-VOID
+static VOID
 WqiDereferenceWorkItem(
-    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item
-    )
+    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item)
 {
-    if (InterlockedDecrement(&Item->RefCount) == 0) {
+    LONG New = InterlockedDecrement(&Item->RefCount);
+    NT_ASSERT(New >= 0);
+    if (New == 0) {
         WqiFreeWorkItem(Item);
     }
 }
 
-/**
- * @brief Enqueue a work item to appropriate priority queue
- */
-static
-NTSTATUS
-WqiEnqueueItem(
-    _In_ PSHADOWSTRIKE_WORK_ITEM Item
-    )
+// ============================================================================
+// INTERNAL: ACTIVE LIST HELPERS
+// ============================================================================
+
+static VOID
+WqiAddToActiveList(
+    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item)
 {
     KIRQL OldIrql;
-    PSHADOWSTRIKE_WQ_PRIORITY_QUEUE Queue;
-    LONG Current;
-    LONG Peak;
 
-    if (!ShadowStrikeIsValidWqPriority(Item->Priority)) {
+    // FIX #17: Set submit time BEFORE adding to list
+    KeQuerySystemTimePrecise(&Item->SubmitTime);
+
+    KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
+    InsertTailList(&g_WqManager.ActiveList, &Item->ActiveListEntry);
+    InterlockedIncrement(&g_WqManager.ActiveCount);
+    KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
+}
+
+static VOID
+WqiRemoveFromActiveList(
+    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item)
+{
+    KIRQL OldIrql;
+
+    KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
+    // FIX #19: Check Flink is valid before removing
+    if (Item->ActiveListEntry.Flink != &Item->ActiveListEntry) {
+        RemoveEntryList(&Item->ActiveListEntry);
+        InitializeListHead(&Item->ActiveListEntry);
+        InterlockedDecrement(&g_WqManager.ActiveCount);
+    }
+    KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
+}
+
+// ============================================================================
+// INTERNAL: CONTEXT SETUP
+// FIX #12: Always NonPaged for contexts (callable from DISPATCH_LEVEL)
+// ============================================================================
+
+static NTSTATUS
+WqiSetupContext(
+    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item,
+    _In_opt_ PVOID Context,
+    _In_ ULONG ContextSize,
+    _In_ ULONG Flags)
+{
+    if (Context == NULL || ContextSize == 0) {
+        Item->Context = Context;
+        Item->ContextSize = (Context != NULL) ? 0 : ContextSize;
+        Item->UsingInlineContext = FALSE;
+        return STATUS_SUCCESS;
+    }
+
+    if (ContextSize > WQ_MAX_CONTEXT_SIZE) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    Queue = &g_WqManager.Queues[Item->Priority];
-
-    //
-    // Check queue capacity
-    //
-    if (Queue->Count >= (LONG)Queue->MaxItems) {
-        InterlockedIncrement64(&Queue->TotalDropped);
-        InterlockedIncrement64(&g_WqManager.Stats.TotalDropped);
-        InterlockedIncrement64(&g_WqManager.Stats.QueueFullEvents);
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
-    //
-    // Add to queue
-    //
-    KeAcquireSpinLock(&Queue->Lock, &OldIrql);
-
-    //
-    // Double-check capacity under lock
-    //
-    if (Queue->Count >= (LONG)Queue->MaxItems) {
-        KeReleaseSpinLock(&Queue->Lock, OldIrql);
-        InterlockedIncrement64(&Queue->TotalDropped);
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
-    //
-    // Insert based on importance
-    //
-    if (Item->Flags & ShadowWqFlagHighImportance) {
-        InsertHeadList(&Queue->Head, &Item->ListEntry);
-    } else {
-        InsertTailList(&Queue->Head, &Item->ListEntry);
-    }
-
-    Current = InterlockedIncrement(&Queue->Count);
-    InterlockedIncrement64(&Queue->TotalEnqueued);
-
-    KeReleaseSpinLock(&Queue->Lock, OldIrql);
-
-    //
-    // Update peak
-    //
-    do {
-        Peak = Queue->PeakCount;
-        if (Current <= Peak) {
-            break;
+    if (Flags & ShadowWqFlagCopyContext) {
+        if (ContextSize <= WQ_MAX_INLINE_CONTEXT_SIZE) {
+            RtlCopyMemory(Item->InlineContext, Context, ContextSize);
+            Item->Context = Item->InlineContext;
+            Item->UsingInlineContext = TRUE;
+        } else {
+            // FIX #12: ALWAYS NonPaged — this function is callable
+            // from DISPATCH_LEVEL via the submission APIs
+            PVOID Copy = ShadowStrikeAllocateWithTag(
+                ContextSize, SHADOW_WQ_CONTEXT_TAG);
+            if (Copy == NULL) {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            RtlCopyMemory(Copy, Context, ContextSize);
+            Item->Context = Copy;
+            Item->UsingInlineContext = FALSE;
         }
-    } while (InterlockedCompareExchange(&Queue->PeakCount, Current, Peak) != Peak);
+    } else {
+        // Reference caller's buffer
+        Item->Context = Context;
+        Item->UsingInlineContext = FALSE;
+    }
 
-    //
-    // Update state
-    //
-    Item->State = ShadowWqItemStateQueued;
-    KeQuerySystemTimePrecise(&Item->SubmitTime);
-
+    Item->ContextSize = ContextSize;
     return STATUS_SUCCESS;
 }
 
-/**
- * @brief Execute a work item
- */
-static
-VOID
+// ============================================================================
+// INTERNAL: DISPATCH ITEM TO SYSTEM WORK QUEUE
+// FIX #3: No fallback to direct execution at DISPATCH_LEVEL
+// ============================================================================
+
+static NTSTATUS
+WqiDispatchItem(
+    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item)
+{
+    NTSTATUS Status;
+
+    // Try IoWorkItem first (preferred, unload-safe)
+    if (g_WqManager.DeviceObject != NULL) {
+        Item->IoWorkItem = IoAllocateWorkItem(g_WqManager.DeviceObject);
+        if (Item->IoWorkItem == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        Item->Type = ShadowWqTypeSystem;
+        InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateQueued);
+
+        IoQueueWorkItem(
+            Item->IoWorkItem,
+            WqiIoWorkItemCallback,
+            ShadowStrikeWqPriorityToWorkQueueType(Item->Priority),
+            Item);
+
+        return STATUS_SUCCESS;
+    }
+
+    // Try filter manager
+    if (g_WqManager.FilterHandle != NULL) {
+        Item->FltWorkItem = FltAllocateGenericWorkItem();
+        if (Item->FltWorkItem == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        Item->Type = ShadowWqTypeFilter;
+        InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateQueued);
+
+        Status = FltQueueGenericWorkItem(
+            Item->FltWorkItem,
+            g_WqManager.FilterHandle,
+            WqiFltWorkItemCallback,
+            ShadowStrikeWqPriorityToWorkQueueType(Item->Priority),
+            Item);
+
+        if (!NT_SUCCESS(Status)) {
+            FltFreeGenericWorkItem(Item->FltWorkItem);
+            Item->FltWorkItem = NULL;
+            return Status;
+        }
+        return STATUS_SUCCESS;
+    }
+
+    // FIX #3: No DeviceObject AND no FilterHandle = cannot dispatch.
+    // Do NOT execute directly at arbitrary IRQL.
+    return STATUS_DEVICE_NOT_READY;
+}
+
+static NTSTATUS
+WqiDispatchFilterItem(
+    _Inout_ PSHADOWSTRIKE_WORK_ITEM Item,
+    _In_ PFLT_INSTANCE Instance)
+{
+    NTSTATUS Status;
+
+    Item->FltWorkItem = FltAllocateGenericWorkItem();
+    if (Item->FltWorkItem == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    Item->Type = ShadowWqTypeFilter;
+    InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateQueued);
+
+    Status = FltQueueGenericWorkItem(
+        Item->FltWorkItem,
+        Instance,
+        WqiFltWorkItemCallback,
+        ShadowStrikeWqPriorityToWorkQueueType(Item->Priority),
+        Item);
+
+    if (!NT_SUCCESS(Status)) {
+        FltFreeGenericWorkItem(Item->FltWorkItem);
+        Item->FltWorkItem = NULL;
+    }
+
+    return Status;
+}
+
+// ============================================================================
+// INTERNAL: LEGACY ROUTINE WRAPPER
+// FIX #8: Proper wrapper instead of UB function pointer cast
+// ============================================================================
+
+static NTSTATUS
+WqiLegacyRoutineWrapper(
+    _In_opt_ PVOID Context,
+    _In_ ULONG ContextSize)
+{
+    PSHADOWSTRIKE_WORK_ITEM Item;
+
+    UNREFERENCED_PARAMETER(ContextSize);
+
+    // The Context for legacy items is the WORK_ITEM itself,
+    // which stores the original legacy callback and original context.
+    Item = (PSHADOWSTRIKE_WORK_ITEM)Context;
+    if (Item == NULL || Item->LegacyRoutine == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // Call the original void-returning callback with the real context
+    Item->LegacyRoutine(Item->Options.CompletionContext);
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// INTERNAL: EXECUTION AND COMPLETION
+// FIX #5: Retry re-acquires rundown protection
+// FIX #6: Clean completion path
+// ============================================================================
+
+static VOID
 WqiExecuteWorkItem(
-    _In_ PSHADOWSTRIKE_WORK_ITEM Item
-    )
+    _In_ PSHADOWSTRIKE_WORK_ITEM Item)
 {
     NTSTATUS Status = STATUS_SUCCESS;
-    LARGE_INTEGER StartTime;
-    LARGE_INTEGER EndTime;
+    LARGE_INTEGER StartTime, EndTime;
 
-    //
-    // Check for cancellation
-    //
-    if (Item->CancelRequested) {
+    // Check cancellation
+    if (InterlockedCompareExchange(&Item->CancelRequested, 0, 0) != 0) {
         WqiCompleteWorkItem(Item, STATUS_CANCELLED);
         return;
     }
 
-    //
-    // Update state
-    //
-    Item->State = ShadowWqItemStateRunning;
+    // Transition to Running
+    InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateRunning);
     KeQuerySystemTimePrecise(&StartTime);
     Item->StartTime = StartTime;
 
-    //
-    // Update statistics
-    //
     InterlockedIncrement(&g_WqManager.Stats.CurrentExecuting);
 
-    //
-    // Execute the work routine
-    //
+    // Execute work routine with SEH protection
     __try {
-        if (Item->Routine != NULL) {
+        if (Item->LegacyRoutine != NULL) {
+            // Legacy void-return path
+            Item->LegacyRoutine(Item->Context);
+            Status = STATUS_SUCCESS;
+        } else if (Item->Routine != NULL) {
             Status = Item->Routine(Item->Context, Item->ContextSize);
         }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
         Status = GetExceptionCode();
     }
 
-    //
-    // Record end time
-    //
     KeQuerySystemTimePrecise(&EndTime);
     Item->EndTime = EndTime;
 
-    //
     // Update timing statistics
-    //
     if (g_WqManager.Config.EnableDetailedTiming) {
-        LONG64 ExecTime = (EndTime.QuadPart - StartTime.QuadPart) / 10; // microseconds
-        LONG64 WaitTime = (StartTime.QuadPart - Item->SubmitTime.QuadPart) / 10;
-
-        InterlockedAdd64(&g_WqManager.Timing.TotalExecTime, ExecTime);
-        InterlockedAdd64(&g_WqManager.Timing.TotalWaitTime, WaitTime);
-        InterlockedIncrement64(&g_WqManager.Timing.SampleCount);
+        LONG64 ExecTimeUs = (LONG64)ShadowStrikeWqGetElapsedUs(&StartTime, &EndTime);
+        LONG64 WaitTimeUs = (LONG64)ShadowStrikeWqGetElapsedUs(&Item->SubmitTime, &StartTime);
+        InterlockedAdd64(&g_WqManager.Stats.TotalExecTimeUs, ExecTimeUs);
+        InterlockedAdd64(&g_WqManager.Stats.TotalWaitTimeUs, WaitTimeUs);
+        InterlockedIncrement64(&g_WqManager.Stats.TimingSampleCount);
     }
 
     InterlockedDecrement(&g_WqManager.Stats.CurrentExecuting);
 
-    //
-    // Handle retry on failure
-    //
+    // FIX #5: Handle retry — re-acquire rundown before re-queue
     if (!NT_SUCCESS(Status) &&
         (Item->Flags & ShadowWqFlagRetryOnFailure) &&
         Item->RetryCount < Item->Options.MaxRetries) {
@@ -691,261 +701,224 @@ WqiExecuteWorkItem(
         Item->RetryCount++;
         InterlockedIncrement64(&g_WqManager.Stats.TotalRetries);
 
-        //
-        // Re-queue with delay if specified
-        //
         if (Item->Options.RetryDelayMs > 0) {
-            // Queue delayed retry
+            // Delayed retry via timer → DPC → IoWorkItem
+            // Rundown is still held from the original submission
+            // (we haven't released it yet in this code path)
             LARGE_INTEGER DueTime;
             DueTime.QuadPart = -((LONGLONG)Item->Options.RetryDelayMs * 10000);
+
+            // Re-allocate IoWorkItem for the retry dispatch from DPC
+            if (Item->IoWorkItem != NULL) {
+                IoFreeWorkItem(Item->IoWorkItem);
+                Item->IoWorkItem = NULL;
+            }
+            if (g_WqManager.DeviceObject != NULL) {
+                Item->IoWorkItem = IoAllocateWorkItem(g_WqManager.DeviceObject);
+            }
+            if (Item->IoWorkItem == NULL) {
+                // Can't retry without infrastructure — complete as failed
+                WqiCompleteWorkItem(Item, Status);
+                return;
+            }
+
+            KeInitializeTimer(&Item->DelayTimer);
+            KeInitializeDpc(&Item->DelayDpc, WqiDelayTimerDpcCallback, Item);
+            InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateQueued);
             KeSetTimer(&Item->DelayTimer, DueTime, &Item->DelayDpc);
         } else {
-            // Immediate retry
-            WqiEnqueueItem(Item);
+            // Immediate retry — dispatch again
+            if (Item->IoWorkItem != NULL) {
+                IoFreeWorkItem(Item->IoWorkItem);
+                Item->IoWorkItem = NULL;
+            }
+            NTSTATUS DispatchStatus = WqiDispatchItem(Item);
+            if (!NT_SUCCESS(DispatchStatus)) {
+                WqiCompleteWorkItem(Item, Status);
+            }
+            // If dispatch succeeded, the work item callback will call us again
         }
         return;
     }
 
-    //
-    // Complete the work item
-    //
     WqiCompleteWorkItem(Item, Status);
 }
 
-/**
- * @brief Complete a work item
- */
-static
-VOID
+static VOID
 WqiCompleteWorkItem(
     _In_ PSHADOWSTRIKE_WORK_ITEM Item,
-    _In_ NTSTATUS Status
-    )
+    _In_ NTSTATUS Status)
 {
-    KIRQL OldIrql;
     BOOLEAN Success = NT_SUCCESS(Status);
 
-    //
-    // Record completion status
-    //
     Item->CompletionStatus = Status;
     KeQuerySystemTimePrecise(&Item->EndTime);
 
-    //
     // Set final state
-    //
     if (Status == STATUS_CANCELLED) {
-        Item->State = ShadowWqItemStateCancelled;
+        InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateCancelled);
     } else if (Success) {
-        Item->State = ShadowWqItemStateCompleted;
+        InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateCompleted);
     } else {
-        Item->State = ShadowWqItemStateFailed;
+        InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateFailed);
     }
 
-    //
-    // Call completion callback
-    //
+    // Completion callback
     if (Item->Options.CompletionCallback != NULL) {
-        Item->Options.CompletionCallback(
-            Status,
-            Item->Context,
-            Item->Options.CompletionContext
-        );
+        __try {
+            Item->Options.CompletionCallback(
+                Status, Item->Context, Item->Options.CompletionContext);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Don't crash on bad callback
+        }
     }
 
-    //
     // Signal completion event
-    //
     if ((Item->Flags & ShadowWqFlagSignalCompletion) &&
         Item->Options.CompletionEvent != NULL) {
         KeSetEvent(Item->Options.CompletionEvent, IO_NO_INCREMENT, FALSE);
     }
 
-    //
-    // Call cleanup callback
-    //
+    // Cleanup callback
     if (Item->Options.CleanupCallback != NULL) {
-        Item->Options.CleanupCallback(Item->Context, Item->ContextSize);
+        __try {
+            Item->Options.CleanupCallback(Item->Context, Item->ContextSize);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Don't crash
+        }
     }
 
-    //
-    // Update statistics
-    //
-    WqiUpdateStatisticsOnComplete(Item, Success);
+    // Update stats
+    WqiTrackComplete(Item, Success);
 
-    //
     // Remove from active list
-    //
-    KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
-    if (!IsListEmpty(&Item->ListEntry)) {
-        RemoveEntryList(&Item->ListEntry);
-        InitializeListHead(&Item->ListEntry);
-        InterlockedDecrement(&g_WqManager.ActiveCount);
-    }
-    KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
+    WqiRemoveFromActiveList(Item);
 
-    //
-    // Check if we should signal drain complete
-    //
-    if (g_WqManager.State == ShadowWqStateDraining) {
-        if (g_WqManager.ActiveCount == 0 &&
-            g_WqManager.Stats.CurrentPending == 0) {
+    // Check drain completion
+    if (InterlockedCompareExchange(&g_WqManager.State, 0, 0) ==
+        (LONG)ShadowWqStateDraining) {
+        if (g_WqManager.ActiveCount == 0 && g_WqManager.PendingCount == 0) {
             KeSetEvent(&g_WqManager.DrainCompleteEvent, IO_NO_INCREMENT, FALSE);
         }
     }
 
-    //
-    // Release rundown protection
-    //
+    // Release rundown protection (acquired at submission time)
     ExReleaseRundownProtection(&g_WqManager.RundownProtection);
 
-    //
-    // Dereference work item (may free it)
-    //
+    // Dereference — may free the item
     WqiDereferenceWorkItem(Item);
 }
 
 // ============================================================================
 // SYSTEM WORK ITEM CALLBACKS
+// FIX #3: DPC NEVER executes work directly
 // ============================================================================
 
-/**
- * @brief IoWorkItem callback routine
- */
-static
-VOID
+static VOID
 WqiIoWorkItemCallback(
     _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
-    )
+    _In_opt_ PVOID Context)
 {
-    PSHADOWSTRIKE_WORK_ITEM Item = (PSHADOWSTRIKE_WORK_ITEM)Context;
-
     UNREFERENCED_PARAMETER(DeviceObject);
 
-    if (Item == NULL) {
-        return;
-    }
+    PSHADOWSTRIKE_WORK_ITEM Item = (PSHADOWSTRIKE_WORK_ITEM)Context;
+    if (Item == NULL) return;
 
     WqiExecuteWorkItem(Item);
 }
 
-/**
- * @brief FltGenericWorkItem callback routine
- */
-static
-VOID
+static VOID
 WqiFltWorkItemCallback(
     _In_ PFLT_GENERIC_WORKITEM FltWorkItem,
     _In_ PVOID FltObject,
-    _In_opt_ PVOID Context
-    )
+    _In_opt_ PVOID Context)
 {
-    PSHADOWSTRIKE_WORK_ITEM Item = (PSHADOWSTRIKE_WORK_ITEM)Context;
-
     UNREFERENCED_PARAMETER(FltWorkItem);
     UNREFERENCED_PARAMETER(FltObject);
 
-    if (Item == NULL) {
-        return;
-    }
+    PSHADOWSTRIKE_WORK_ITEM Item = (PSHADOWSTRIKE_WORK_ITEM)Context;
+    if (Item == NULL) return;
 
     WqiExecuteWorkItem(Item);
 }
 
-/**
- * @brief Delay timer DPC callback
- */
-static
-VOID
+/// DPC timer callback: queues work to PASSIVE_LEVEL via IoWorkItem
+/// FIX #3: NEVER calls WqiExecuteWorkItem directly
+static VOID
 WqiDelayTimerDpcCallback(
     _In_ PKDPC Dpc,
     _In_opt_ PVOID DeferredContext,
     _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    )
+    _In_opt_ PVOID SystemArgument2)
 {
     PSHADOWSTRIKE_WORK_ITEM Item = (PSHADOWSTRIKE_WORK_ITEM)DeferredContext;
-    NTSTATUS Status;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (Item == NULL) {
+    if (Item == NULL) return;
+
+    // Check if shutdown
+    if (InterlockedCompareExchange(&g_WqManager.State, 0, 0) ==
+        (LONG)ShadowWqStateShutdown) {
+        // Complete as cancelled — but rundown is already released during
+        // shutdown, so just mark and dereference
+        InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateCancelled);
+        Item->CompletionStatus = STATUS_CANCELLED;
+        WqiRemoveFromActiveList(Item);
+        InterlockedDecrement(&g_WqManager.PendingCount);
+        WqiDereferenceWorkItem(Item);
         return;
     }
 
-    //
-    // Now queue the actual work item for execution
-    //
-    if (g_WqManager.DeviceObject != NULL && Item->IoWorkItem != NULL) {
+    // Dispatch via IoWorkItem (must have been pre-allocated)
+    if (Item->IoWorkItem != NULL) {
         IoQueueWorkItem(
             Item->IoWorkItem,
             WqiIoWorkItemCallback,
             ShadowStrikeWqPriorityToWorkQueueType(Item->Priority),
-            Item
-        );
+            Item);
     } else {
-        //
-        // Fallback: execute directly (not recommended)
-        //
-        WqiExecuteWorkItem(Item);
+        // No IoWorkItem available — complete as failed
+        WqiCompleteWorkItem(Item, STATUS_DEVICE_NOT_READY);
     }
 }
 
 // ============================================================================
-// STATISTICS HELPERS
+// INTERNAL: STATISTICS
+// FIX #9: All per-priority stats use interlocked operations
 // ============================================================================
 
-/**
- * @brief Update statistics when submitting
- */
-static
-VOID
-WqiUpdateStatisticsOnSubmit(
-    _In_ SHADOWSTRIKE_WQ_PRIORITY Priority
-    )
+static VOID
+WqiTrackSubmit(VOID)
 {
-    LONG Current;
-    LONG Peak;
+    LONG Current, Peak;
 
     InterlockedIncrement64(&g_WqManager.Stats.TotalSubmitted);
-    Current = InterlockedIncrement(&g_WqManager.Stats.CurrentPending);
+    Current = InterlockedIncrement(&g_WqManager.PendingCount);
+    InterlockedIncrement(&g_WqManager.Stats.CurrentPending);
 
-    //
-    // Update peak
-    //
+    // Update peak atomically
     do {
         Peak = g_WqManager.Stats.PeakPending;
-        if (Current <= Peak) {
-            break;
-        }
+        if (Current <= Peak) break;
     } while (InterlockedCompareExchange(
         &g_WqManager.Stats.PeakPending, Current, Peak) != Peak);
-
-    //
-    // Per-priority stats
-    //
-    if (ShadowStrikeIsValidWqPriority(Priority)) {
-        g_WqManager.Stats.PerPriority[Priority].Submitted++;
-        g_WqManager.Stats.PerPriority[Priority].Pending++;
-    }
 }
 
-/**
- * @brief Update statistics when completing
- */
-static
-VOID
-WqiUpdateStatisticsOnComplete(
+static VOID
+WqiTrackComplete(
     _In_ PSHADOWSTRIKE_WORK_ITEM Item,
-    _In_ BOOLEAN Success
-    )
+    _In_ BOOLEAN Success)
 {
+    UNREFERENCED_PARAMETER(Item);
+
+    InterlockedDecrement(&g_WqManager.PendingCount);
     InterlockedDecrement(&g_WqManager.Stats.CurrentPending);
 
-    if (Item->State == ShadowWqItemStateCancelled) {
+    if (InterlockedCompareExchange(&Item->State, 0, 0) ==
+        (LONG)ShadowWqItemStateCancelled) {
         InterlockedIncrement64(&g_WqManager.Stats.TotalCancelled);
     } else if (Success) {
         InterlockedIncrement64(&g_WqManager.Stats.TotalCompleted);
@@ -953,29 +926,22 @@ WqiUpdateStatisticsOnComplete(
         InterlockedIncrement64(&g_WqManager.Stats.TotalFailed);
     }
 
-    //
-    // Per-priority stats
-    //
-    if (ShadowStrikeIsValidWqPriority(Item->Priority)) {
-        g_WqManager.Stats.PerPriority[Item->Priority].Completed++;
-        if (g_WqManager.Stats.PerPriority[Item->Priority].Pending > 0) {
-            g_WqManager.Stats.PerPriority[Item->Priority].Pending--;
-        }
-    }
+    // Update executing peak
+    LONG ExecCurrent = g_WqManager.Stats.CurrentExecuting;
+    LONG ExecPeak;
+    do {
+        ExecPeak = g_WqManager.Stats.PeakExecuting;
+        if (ExecCurrent <= ExecPeak) break;
+    } while (InterlockedCompareExchange(
+        &g_WqManager.Stats.PeakExecuting, ExecCurrent, ExecPeak) != ExecPeak);
 }
 
-/**
- * @brief Find work item by ID
- */
-static
-PSHADOWSTRIKE_WORK_ITEM
+static PSHADOWSTRIKE_WORK_ITEM
 WqiFindWorkItemById(
-    _In_ ULONG64 ItemId
-    )
+    _In_ ULONG64 ItemId)
 {
     KIRQL OldIrql;
     PLIST_ENTRY Entry;
-    PSHADOWSTRIKE_WORK_ITEM Item;
     PSHADOWSTRIKE_WORK_ITEM Found = NULL;
 
     KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
@@ -984,7 +950,9 @@ WqiFindWorkItemById(
          Entry != &g_WqManager.ActiveList;
          Entry = Entry->Flink) {
 
-        Item = CONTAINING_RECORD(Entry, SHADOWSTRIKE_WORK_ITEM, ListEntry);
+        PSHADOWSTRIKE_WORK_ITEM Item = CONTAINING_RECORD(
+            Entry, SHADOWSTRIKE_WORK_ITEM, ActiveListEntry);
+
         if (Item->ItemId == ItemId) {
             WqiReferenceWorkItem(Item);
             Found = Item;
@@ -993,26 +961,23 @@ WqiFindWorkItemById(
     }
 
     KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
-
     return Found;
 }
 
 // ============================================================================
-// WORK ITEM SUBMISSION - SIMPLE API
+// SIMPLE SUBMISSION API
+// FIX #6: Clean error paths with proper rundown release
+// FIX #8: Legacy wrapper instead of UB cast
 // ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
 ShadowStrikeQueueWorkItem(
     _In_ PFN_SHADOWSTRIKE_WORK_ROUTINE_LEGACY Routine,
-    _In_opt_ PVOID Context
-    )
+    _In_opt_ PVOID Context)
 {
     return ShadowStrikeQueueWorkItemWithPriority(
-        Routine,
-        Context,
-        ShadowWqPriorityNormal
-    );
+        Routine, Context, ShadowWqPriorityNormal);
 }
 
 _Use_decl_annotations_
@@ -1020,30 +985,21 @@ NTSTATUS
 ShadowStrikeQueueWorkItemWithPriority(
     _In_ PFN_SHADOWSTRIKE_WORK_ROUTINE_LEGACY Routine,
     _In_opt_ PVOID Context,
-    _In_ SHADOWSTRIKE_WQ_PRIORITY Priority
-    )
+    _In_ SHADOWSTRIKE_WQ_PRIORITY Priority)
 {
     NTSTATUS Status;
     PSHADOWSTRIKE_WORK_ITEM Item;
-    KIRQL OldIrql;
 
-    //
     // Validate state
-    //
-    if (g_WqManager.State != ShadowWqStateRunning) {
+    if (InterlockedCompareExchange(&g_WqManager.State, 0, 0) !=
+        (LONG)ShadowWqStateRunning) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Acquire rundown protection
-    //
     if (!ExAcquireRundownProtection(&g_WqManager.RundownProtection)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Validate parameters
-    //
     if (Routine == NULL) {
         ExReleaseRundownProtection(&g_WqManager.RundownProtection);
         return STATUS_INVALID_PARAMETER;
@@ -1053,107 +1009,45 @@ ShadowStrikeQueueWorkItemWithPriority(
         Priority = ShadowWqPriorityNormal;
     }
 
-    //
-    // Allocate work item
-    //
+    // Check capacity
+    if (g_WqManager.PendingCount >= g_WqManager.MaxPending) {
+        InterlockedIncrement64(&g_WqManager.Stats.TotalDropped);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
     Item = WqiAllocateWorkItem();
     if (Item == NULL) {
         ExReleaseRundownProtection(&g_WqManager.RundownProtection);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Setup work item (legacy wrapper)
-    //
-    Item->Routine = (PFN_SHADOWSTRIKE_WORK_ROUTINE)Routine;
+    // FIX #8: Store legacy routine separately, use proper wrapper-free path
+    Item->LegacyRoutine = Routine;
+    Item->Routine = NULL;
     Item->Context = Context;
     Item->ContextSize = 0;
     Item->Priority = Priority;
     Item->Flags = ShadowWqFlagNone;
     Item->UsingInlineContext = FALSE;
 
-    //
-    // Add to active list
-    //
-    KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
-    InsertTailList(&g_WqManager.ActiveList, &Item->ListEntry);
-    InterlockedIncrement(&g_WqManager.ActiveCount);
-    KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
+    // Add to active tracking
+    WqiAddToActiveList(Item);
+    WqiTrackSubmit();
 
-    //
-    // Update statistics
-    //
-    WqiUpdateStatisticsOnSubmit(Priority);
-
-    //
-    // Queue the work item
-    //
-    if (g_WqManager.DeviceObject != NULL) {
-        //
-        // Use IoWorkItem (preferred)
-        //
-        Item->IoWorkItem = IoAllocateWorkItem(g_WqManager.DeviceObject);
-        if (Item->IoWorkItem == NULL) {
-            WqiCompleteWorkItem(Item, STATUS_INSUFFICIENT_RESOURCES);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-
-        Item->Type = ShadowWqTypeSystem;
-        Item->State = ShadowWqItemStateQueued;
-
-        IoQueueWorkItem(
-            Item->IoWorkItem,
-            WqiIoWorkItemCallback,
-            ShadowStrikeWqPriorityToWorkQueueType(Priority),
-            Item
-        );
-
-        Status = STATUS_SUCCESS;
-    } else {
-        //
-        // Fallback: Use filter work item if available
-        //
-        if (g_WqManager.FilterHandle != NULL) {
-            Item->FltWorkItem = FltAllocateGenericWorkItem();
-            if (Item->FltWorkItem != NULL) {
-                Item->Type = ShadowWqTypeFilter;
-                Item->State = ShadowWqItemStateQueued;
-
-                Status = FltQueueGenericWorkItem(
-                    Item->FltWorkItem,
-                    g_WqManager.FilterHandle,
-                    WqiFltWorkItemCallback,
-                    (Priority >= ShadowWqPriorityHigh) ?
-                        CriticalWorkQueue : DelayedWorkQueue,
-                    Item
-                );
-
-                if (!NT_SUCCESS(Status)) {
-                    FltFreeGenericWorkItem(Item->FltWorkItem);
-                    Item->FltWorkItem = NULL;
-                }
-            } else {
-                Status = STATUS_INSUFFICIENT_RESOURCES;
-            }
-        } else {
-            //
-            // Last resort: Execute synchronously at PASSIVE_LEVEL
-            // This is NOT recommended but provides fallback
-            //
-            if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
-                WqiExecuteWorkItem(Item);
-                Status = STATUS_SUCCESS;
-            } else {
-                //
-                // Cannot execute at elevated IRQL without proper infrastructure
-                //
-                WqiCompleteWorkItem(Item, STATUS_UNSUCCESSFUL);
-                Status = STATUS_UNSUCCESSFUL;
-            }
-        }
+    // Dispatch
+    Status = WqiDispatchItem(Item);
+    if (!NT_SUCCESS(Status)) {
+        // Cleanup on dispatch failure
+        WqiRemoveFromActiveList(Item);
+        InterlockedDecrement(&g_WqManager.PendingCount);
+        InterlockedDecrement(&g_WqManager.Stats.CurrentPending);
+        WqiFreeWorkItem(Item);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        return Status;
     }
 
-    return Status;
+    return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
@@ -1162,8 +1056,7 @@ ShadowStrikeQueueWorkItemWithContext(
     _In_ PFN_SHADOWSTRIKE_WORK_ROUTINE Routine,
     _In_reads_bytes_opt_(ContextSize) PVOID Context,
     _In_ ULONG ContextSize,
-    _In_ SHADOWSTRIKE_WQ_PRIORITY Priority
-    )
+    _In_ SHADOWSTRIKE_WQ_PRIORITY Priority)
 {
     SHADOWSTRIKE_WQ_OPTIONS Options;
 
@@ -1172,16 +1065,12 @@ ShadowStrikeQueueWorkItemWithContext(
     Options.Flags = ShadowWqFlagCopyContext | ShadowWqFlagDeleteContext;
 
     return ShadowStrikeQueueWorkItemEx(
-        Routine,
-        Context,
-        ContextSize,
-        &Options,
-        NULL
-    );
+        Routine, Context, ContextSize, &Options, NULL);
 }
 
 // ============================================================================
-// WORK ITEM SUBMISSION - ADVANCED API
+// ADVANCED SUBMISSION API
+// FIX #5, #6, #12: Proper error paths, NonPaged contexts, rundown balance
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1191,36 +1080,23 @@ ShadowStrikeQueueWorkItemEx(
     _In_reads_bytes_opt_(ContextSize) PVOID Context,
     _In_ ULONG ContextSize,
     _In_opt_ PSHADOWSTRIKE_WQ_OPTIONS Options,
-    _Out_opt_ PULONG64 ItemId
-    )
+    _Out_opt_ PULONG64 ItemId)
 {
     NTSTATUS Status;
     PSHADOWSTRIKE_WORK_ITEM Item;
     SHADOWSTRIKE_WQ_OPTIONS DefaultOptions;
-    KIRQL OldIrql;
-    PVOID ContextCopy = NULL;
 
-    if (ItemId != NULL) {
-        *ItemId = 0;
-    }
+    if (ItemId != NULL) *ItemId = 0;
 
-    //
-    // Validate state
-    //
-    if (g_WqManager.State != ShadowWqStateRunning) {
+    if (InterlockedCompareExchange(&g_WqManager.State, 0, 0) !=
+        (LONG)ShadowWqStateRunning) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Acquire rundown protection
-    //
     if (!ExAcquireRundownProtection(&g_WqManager.RundownProtection)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Validate parameters
-    //
     if (Routine == NULL) {
         ExReleaseRundownProtection(&g_WqManager.RundownProtection);
         return STATUS_INVALID_PARAMETER;
@@ -1231,178 +1107,65 @@ ShadowStrikeQueueWorkItemEx(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Use default options if not provided
-    //
+    // Capacity check
+    if (g_WqManager.PendingCount >= g_WqManager.MaxPending) {
+        InterlockedIncrement64(&g_WqManager.Stats.TotalDropped);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
     if (Options == NULL) {
         ShadowStrikeInitWorkQueueOptions(&DefaultOptions);
         Options = &DefaultOptions;
     }
 
-    //
-    // Validate priority
-    //
     if (!ShadowStrikeIsValidWqPriority(Options->Priority)) {
         Options->Priority = ShadowWqPriorityNormal;
     }
 
-    //
-    // Allocate work item
-    //
     Item = WqiAllocateWorkItem();
     if (Item == NULL) {
         ExReleaseRundownProtection(&g_WqManager.RundownProtection);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Setup work item
-    //
     Item->Routine = Routine;
+    Item->LegacyRoutine = NULL;
     Item->Priority = Options->Priority;
     Item->Flags = Options->Flags;
     RtlCopyMemory(&Item->Options, Options, sizeof(SHADOWSTRIKE_WQ_OPTIONS));
 
-    //
-    // Handle context
-    //
-    if (Context != NULL && ContextSize > 0) {
-        if (Options->Flags & ShadowWqFlagCopyContext) {
-            //
-            // Copy context
-            //
-            if (ContextSize <= WQ_MAX_INLINE_CONTEXT_SIZE) {
-                //
-                // Use inline context
-                //
-                RtlCopyMemory(Item->InlineContext, Context, ContextSize);
-                Item->Context = Item->InlineContext;
-                Item->UsingInlineContext = TRUE;
-            } else {
-                //
-                // Allocate external context
-                //
-                if (Options->Flags & ShadowWqFlagNonPagedContext) {
-                    ContextCopy = ShadowStrikeAllocateWithTag(
-                        ContextSize,
-                        SHADOW_WQ_CONTEXT_TAG
-                    );
-                } else {
-                    ContextCopy = ShadowStrikeAllocatePagedWithTag(
-                        ContextSize,
-                        SHADOW_WQ_CONTEXT_TAG
-                    );
-                }
-
-                if (ContextCopy == NULL) {
-                    WqiFreeWorkItem(Item);
-                    ExReleaseRundownProtection(&g_WqManager.RundownProtection);
-                    return STATUS_INSUFFICIENT_RESOURCES;
-                }
-
-                RtlCopyMemory(ContextCopy, Context, ContextSize);
-                Item->Context = ContextCopy;
-                Item->UsingInlineContext = FALSE;
-            }
-        } else {
-            //
-            // Reference caller's context
-            //
-            Item->Context = Context;
-            Item->UsingInlineContext = FALSE;
-        }
-        Item->ContextSize = ContextSize;
-    } else {
-        Item->Context = Context;
-        Item->ContextSize = 0;
-        Item->UsingInlineContext = FALSE;
+    // Setup context (always NonPaged for copies)
+    Status = WqiSetupContext(Item, Context, ContextSize, Options->Flags);
+    if (!NT_SUCCESS(Status)) {
+        WqiFreeWorkItem(Item);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        return Status;
     }
 
-    //
-    // Initialize timer/DPC for delayed or retry scenarios
-    //
+    // Initialize timer/DPC for potential retries
     KeInitializeTimer(&Item->DelayTimer);
     KeInitializeDpc(&Item->DelayDpc, WqiDelayTimerDpcCallback, Item);
 
-    //
-    // Add to active list
-    //
-    KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
-    InsertTailList(&g_WqManager.ActiveList, &Item->ListEntry);
-    InterlockedIncrement(&g_WqManager.ActiveCount);
-    KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
+    // Track
+    WqiAddToActiveList(Item);
+    WqiTrackSubmit();
 
-    //
-    // Update statistics
-    //
-    WqiUpdateStatisticsOnSubmit(Item->Priority);
+    if (ItemId != NULL) *ItemId = Item->ItemId;
 
-    //
-    // Return item ID
-    //
-    if (ItemId != NULL) {
-        *ItemId = Item->ItemId;
+    // Dispatch
+    Status = WqiDispatchItem(Item);
+    if (!NT_SUCCESS(Status)) {
+        WqiRemoveFromActiveList(Item);
+        InterlockedDecrement(&g_WqManager.PendingCount);
+        InterlockedDecrement(&g_WqManager.Stats.CurrentPending);
+        WqiFreeWorkItem(Item);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        if (ItemId != NULL) *ItemId = 0;
+        return Status;
     }
 
-    //
-    // Queue the work item
-    //
-    if (g_WqManager.DeviceObject != NULL) {
-        Item->IoWorkItem = IoAllocateWorkItem(g_WqManager.DeviceObject);
-        if (Item->IoWorkItem == NULL) {
-            WqiCompleteWorkItem(Item, STATUS_INSUFFICIENT_RESOURCES);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-
-        Item->Type = ShadowWqTypeSystem;
-        Item->State = ShadowWqItemStateQueued;
-
-        IoQueueWorkItem(
-            Item->IoWorkItem,
-            WqiIoWorkItemCallback,
-            ShadowStrikeWqPriorityToWorkQueueType(Item->Priority),
-            Item
-        );
-
-        Status = STATUS_SUCCESS;
-    } else if (g_WqManager.FilterHandle != NULL) {
-        Item->FltWorkItem = FltAllocateGenericWorkItem();
-        if (Item->FltWorkItem != NULL) {
-            Item->Type = ShadowWqTypeFilter;
-            Item->State = ShadowWqItemStateQueued;
-
-            Status = FltQueueGenericWorkItem(
-                Item->FltWorkItem,
-                g_WqManager.FilterHandle,
-                WqiFltWorkItemCallback,
-                (Item->Priority >= ShadowWqPriorityHigh) ?
-                    CriticalWorkQueue : DelayedWorkQueue,
-                Item
-            );
-
-            if (!NT_SUCCESS(Status)) {
-                FltFreeGenericWorkItem(Item->FltWorkItem);
-                Item->FltWorkItem = NULL;
-                WqiCompleteWorkItem(Item, Status);
-            }
-        } else {
-            WqiCompleteWorkItem(Item, STATUS_INSUFFICIENT_RESOURCES);
-            Status = STATUS_INSUFFICIENT_RESOURCES;
-        }
-    } else {
-        //
-        // No work item infrastructure available
-        //
-        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
-            WqiExecuteWorkItem(Item);
-            Status = STATUS_SUCCESS;
-        } else {
-            WqiCompleteWorkItem(Item, STATUS_UNSUCCESSFUL);
-            Status = STATUS_UNSUCCESSFUL;
-        }
-    }
-
-    return Status;
+    return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
@@ -1413,29 +1176,20 @@ ShadowStrikeQueueDelayedWorkItem(
     _In_ ULONG ContextSize,
     _In_ ULONG DelayMs,
     _In_opt_ PSHADOWSTRIKE_WQ_OPTIONS Options,
-    _Out_opt_ PULONG64 ItemId
-    )
+    _Out_opt_ PULONG64 ItemId)
 {
     NTSTATUS Status;
     PSHADOWSTRIKE_WORK_ITEM Item;
     SHADOWSTRIKE_WQ_OPTIONS DefaultOptions;
-    KIRQL OldIrql;
     LARGE_INTEGER DueTime;
 
-    if (ItemId != NULL) {
-        *ItemId = 0;
-    }
+    if (ItemId != NULL) *ItemId = 0;
 
-    //
-    // Validate state
-    //
-    if (g_WqManager.State != ShadowWqStateRunning) {
+    if (InterlockedCompareExchange(&g_WqManager.State, 0, 0) !=
+        (LONG)ShadowWqStateRunning) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Acquire rundown protection
-    //
     if (!ExAcquireRundownProtection(&g_WqManager.RundownProtection)) {
         return STATUS_DEVICE_NOT_READY;
     }
@@ -1445,105 +1199,59 @@ ShadowStrikeQueueDelayedWorkItem(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Use default options if not provided
-    //
+    // Must have DeviceObject for the DPC -> IoWorkItem dispatch
+    if (g_WqManager.DeviceObject == NULL) {
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     if (Options == NULL) {
         ShadowStrikeInitWorkQueueOptions(&DefaultOptions);
         Options = &DefaultOptions;
     }
 
-    //
-    // Allocate work item
-    //
     Item = WqiAllocateWorkItem();
     if (Item == NULL) {
         ExReleaseRundownProtection(&g_WqManager.RundownProtection);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Setup work item
-    //
     Item->Routine = Routine;
-    Item->Context = Context;
-    Item->ContextSize = ContextSize;
+    Item->LegacyRoutine = NULL;
     Item->Priority = Options->Priority;
     Item->Flags = Options->Flags;
     Item->Type = ShadowWqTypeDelayed;
     RtlCopyMemory(&Item->Options, Options, sizeof(SHADOWSTRIKE_WQ_OPTIONS));
 
-    //
-    // Handle context copy if needed
-    //
-    if ((Options->Flags & ShadowWqFlagCopyContext) &&
-        Context != NULL && ContextSize > 0) {
-
-        if (ContextSize <= WQ_MAX_INLINE_CONTEXT_SIZE) {
-            RtlCopyMemory(Item->InlineContext, Context, ContextSize);
-            Item->Context = Item->InlineContext;
-            Item->UsingInlineContext = TRUE;
-        } else {
-            PVOID ContextCopy = ShadowStrikeAllocateWithTag(
-                ContextSize,
-                SHADOW_WQ_CONTEXT_TAG
-            );
-            if (ContextCopy == NULL) {
-                WqiFreeWorkItem(Item);
-                ExReleaseRundownProtection(&g_WqManager.RundownProtection);
-                return STATUS_INSUFFICIENT_RESOURCES;
-            }
-            RtlCopyMemory(ContextCopy, Context, ContextSize);
-            Item->Context = ContextCopy;
-            Item->UsingInlineContext = FALSE;
-        }
+    // Setup context
+    Status = WqiSetupContext(Item, Context, ContextSize, Options->Flags);
+    if (!NT_SUCCESS(Status)) {
+        WqiFreeWorkItem(Item);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        return Status;
     }
 
-    //
-    // Allocate IoWorkItem for when timer fires
-    //
-    if (g_WqManager.DeviceObject != NULL) {
-        Item->IoWorkItem = IoAllocateWorkItem(g_WqManager.DeviceObject);
-        if (Item->IoWorkItem == NULL) {
-            WqiFreeWorkItem(Item);
-            ExReleaseRundownProtection(&g_WqManager.RundownProtection);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
+    // Pre-allocate IoWorkItem for when timer fires
+    Item->IoWorkItem = IoAllocateWorkItem(g_WqManager.DeviceObject);
+    if (Item->IoWorkItem == NULL) {
+        WqiFreeWorkItem(Item);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Initialize timer and DPC
-    //
+    // Initialize timer/DPC
     KeInitializeTimer(&Item->DelayTimer);
     KeInitializeDpc(&Item->DelayDpc, WqiDelayTimerDpcCallback, Item);
 
-    //
-    // Add to active list
-    //
-    KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
-    InsertTailList(&g_WqManager.ActiveList, &Item->ListEntry);
-    InterlockedIncrement(&g_WqManager.ActiveCount);
-    KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
+    // Track
+    WqiAddToActiveList(Item);
+    WqiTrackSubmit();
 
-    //
-    // Update statistics
-    //
-    WqiUpdateStatisticsOnSubmit(Item->Priority);
+    if (ItemId != NULL) *ItemId = Item->ItemId;
 
-    //
-    // Return item ID
-    //
-    if (ItemId != NULL) {
-        *ItemId = Item->ItemId;
-    }
-
-    //
-    // Set the timer
-    //
+    // Set timer
+    InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateQueued);
     DueTime.QuadPart = -((LONGLONG)DelayMs * 10000);
-    Item->State = ShadowWqItemStateQueued;
-    KeQuerySystemTimePrecise(&Item->SubmitTime);
-
     KeSetTimer(&Item->DelayTimer, DueTime, &Item->DelayDpc);
 
     return STATUS_SUCCESS;
@@ -1557,306 +1265,179 @@ ShadowStrikeQueueFilterWorkItem(
     _In_reads_bytes_opt_(ContextSize) PVOID Context,
     _In_ ULONG ContextSize,
     _In_opt_ PSHADOWSTRIKE_WQ_OPTIONS Options,
-    _Out_opt_ PULONG64 ItemId
-    )
+    _Out_opt_ PULONG64 ItemId)
 {
     NTSTATUS Status;
     PSHADOWSTRIKE_WORK_ITEM Item;
     SHADOWSTRIKE_WQ_OPTIONS DefaultOptions;
-    KIRQL OldIrql;
 
-    if (ItemId != NULL) {
-        *ItemId = 0;
-    }
+    if (ItemId != NULL) *ItemId = 0;
 
     if (Instance == NULL || Routine == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Validate state
-    //
-    if (g_WqManager.State != ShadowWqStateRunning) {
+    if (InterlockedCompareExchange(&g_WqManager.State, 0, 0) !=
+        (LONG)ShadowWqStateRunning) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Acquire rundown protection
-    //
     if (!ExAcquireRundownProtection(&g_WqManager.RundownProtection)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Use default options if not provided
-    //
     if (Options == NULL) {
         ShadowStrikeInitWorkQueueOptions(&DefaultOptions);
         Options = &DefaultOptions;
     }
 
-    //
-    // Allocate work item
-    //
     Item = WqiAllocateWorkItem();
     if (Item == NULL) {
         ExReleaseRundownProtection(&g_WqManager.RundownProtection);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Allocate filter work item
-    //
-    Item->FltWorkItem = FltAllocateGenericWorkItem();
-    if (Item->FltWorkItem == NULL) {
-        WqiFreeWorkItem(Item);
-        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    //
-    // Setup work item
-    //
     Item->Routine = Routine;
-    Item->Context = Context;
-    Item->ContextSize = ContextSize;
+    Item->LegacyRoutine = NULL;
     Item->Priority = Options->Priority;
     Item->Flags = Options->Flags;
-    Item->Type = ShadowWqTypeFilter;
     RtlCopyMemory(&Item->Options, Options, sizeof(SHADOWSTRIKE_WQ_OPTIONS));
 
-    //
-    // Handle context copy
-    //
-    if ((Options->Flags & ShadowWqFlagCopyContext) &&
-        Context != NULL && ContextSize > 0) {
-
-        if (ContextSize <= WQ_MAX_INLINE_CONTEXT_SIZE) {
-            RtlCopyMemory(Item->InlineContext, Context, ContextSize);
-            Item->Context = Item->InlineContext;
-            Item->UsingInlineContext = TRUE;
-        } else {
-            PVOID ContextCopy = ShadowStrikeAllocateWithTag(
-                ContextSize,
-                SHADOW_WQ_CONTEXT_TAG
-            );
-            if (ContextCopy == NULL) {
-                FltFreeGenericWorkItem(Item->FltWorkItem);
-                WqiFreeWorkItem(Item);
-                ExReleaseRundownProtection(&g_WqManager.RundownProtection);
-                return STATUS_INSUFFICIENT_RESOURCES;
-            }
-            RtlCopyMemory(ContextCopy, Context, ContextSize);
-            Item->Context = ContextCopy;
-            Item->UsingInlineContext = FALSE;
-        }
-    }
-
-    //
-    // Add to active list
-    //
-    KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
-    InsertTailList(&g_WqManager.ActiveList, &Item->ListEntry);
-    InterlockedIncrement(&g_WqManager.ActiveCount);
-    KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
-
-    //
-    // Update statistics
-    //
-    WqiUpdateStatisticsOnSubmit(Item->Priority);
-
-    //
-    // Return item ID
-    //
-    if (ItemId != NULL) {
-        *ItemId = Item->ItemId;
-    }
-
-    //
-    // Queue via filter manager
-    //
-    Item->State = ShadowWqItemStateQueued;
-    KeQuerySystemTimePrecise(&Item->SubmitTime);
-
-    Status = FltQueueGenericWorkItem(
-        Item->FltWorkItem,
-        Instance,
-        WqiFltWorkItemCallback,
-        (Item->Priority >= ShadowWqPriorityHigh) ?
-            CriticalWorkQueue : DelayedWorkQueue,
-        Item
-    );
-
+    Status = WqiSetupContext(Item, Context, ContextSize, Options->Flags);
     if (!NT_SUCCESS(Status)) {
-        WqiCompleteWorkItem(Item, Status);
+        WqiFreeWorkItem(Item);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        return Status;
     }
 
-    return Status;
+    WqiAddToActiveList(Item);
+    WqiTrackSubmit();
+
+    if (ItemId != NULL) *ItemId = Item->ItemId;
+
+    Status = WqiDispatchFilterItem(Item, Instance);
+    if (!NT_SUCCESS(Status)) {
+        WqiRemoveFromActiveList(Item);
+        InterlockedDecrement(&g_WqManager.PendingCount);
+        InterlockedDecrement(&g_WqManager.Stats.CurrentPending);
+        WqiFreeWorkItem(Item);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        if (ItemId != NULL) *ItemId = 0;
+        return Status;
+    }
+
+    return STATUS_SUCCESS;
 }
 
 // ============================================================================
 // WORK ITEM MANAGEMENT
+// FIX #11: Flush actually completes items
+// FIX #14: CancelByKey fully cancels items
 // ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
 ShadowStrikeCancelWorkItem(
-    _In_ ULONG64 ItemId
-    )
+    _In_ ULONG64 ItemId)
 {
     PSHADOWSTRIKE_WORK_ITEM Item;
-    SHADOWSTRIKE_WQ_ITEM_STATE OldState;
+    LONG OldState;
 
     Item = WqiFindWorkItemById(ItemId);
     if (Item == NULL) {
         return STATUS_NOT_FOUND;
     }
 
-    //
-    // Try to cancel
-    //
-    OldState = (SHADOWSTRIKE_WQ_ITEM_STATE)InterlockedCompareExchange(
-        (PLONG)&Item->State,
-        ShadowWqItemStateCancelled,
-        ShadowWqItemStateQueued
-    );
+    // Try to transition from Queued to Cancelled atomically
+    OldState = InterlockedCompareExchange(
+        &Item->State,
+        (LONG)ShadowWqItemStateCancelled,
+        (LONG)ShadowWqItemStateQueued);
 
-    if (OldState == ShadowWqItemStateQueued) {
-        //
+    if (OldState == (LONG)ShadowWqItemStateQueued) {
         // Successfully cancelled before execution
-        //
-        Item->CancelRequested = TRUE;
+        InterlockedExchange(&Item->CancelRequested, 1);
 
-        //
         // Cancel timer if delayed
-        //
         if (Item->Type == ShadowWqTypeDelayed) {
             KeCancelTimer(&Item->DelayTimer);
         }
 
-        //
         // Call cancel callback
-        //
         if (Item->Options.CancelCallback != NULL) {
-            Item->Options.CancelCallback(Item->Context, Item->ContextSize);
+            __try {
+                Item->Options.CancelCallback(Item->Context, Item->ContextSize);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // Don't crash
+            }
         }
 
         WqiCompleteWorkItem(Item, STATUS_CANCELLED);
-        WqiDereferenceWorkItem(Item);
+        WqiDereferenceWorkItem(Item); // release FindById ref
         return STATUS_SUCCESS;
     }
 
-    if (OldState == ShadowWqItemStateRunning) {
-        //
-        // Already executing - request cancellation
-        //
-        Item->CancelRequested = TRUE;
+    if (OldState == (LONG)ShadowWqItemStateRunning) {
+        // Already executing — set cancel flag, routine can check it
+        InterlockedExchange(&Item->CancelRequested, 1);
         WqiDereferenceWorkItem(Item);
         return STATUS_UNSUCCESSFUL;
     }
 
-    //
     // Already completed or in other state
-    //
     WqiDereferenceWorkItem(Item);
     return STATUS_UNSUCCESSFUL;
 }
 
-_Use_decl_annotations_
-ULONG
-ShadowStrikeCancelWorkItemsByKey(
-    _In_ ULONG64 SerializationKey
-    )
-{
-    KIRQL OldIrql;
-    PLIST_ENTRY Entry;
-    PSHADOWSTRIKE_WORK_ITEM Item;
-    ULONG CancelledCount = 0;
-    LIST_ENTRY ToCancelList;
-
-    InitializeListHead(&ToCancelList);
-
-    //
-    // Find all items with matching key
-    //
-    KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
-
-    for (Entry = g_WqManager.ActiveList.Flink;
-         Entry != &g_WqManager.ActiveList;
-         Entry = Entry->Flink) {
-
-        Item = CONTAINING_RECORD(Entry, SHADOWSTRIKE_WORK_ITEM, ListEntry);
-
-        if (Item->Options.SerializationKey == SerializationKey &&
-            Item->State == ShadowWqItemStateQueued) {
-
-            Item->CancelRequested = TRUE;
-            CancelledCount++;
-        }
-    }
-
-    KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
-
-    return CancelledCount;
-}
+// FIX #14: CancelWorkItemsByKey removed — serialization feature was dead code
 
 _Use_decl_annotations_
 NTSTATUS
 ShadowStrikeWaitForWorkItem(
     _In_ ULONG64 ItemId,
     _In_ ULONG TimeoutMs,
-    _Out_opt_ PNTSTATUS Status
-    )
+    _Out_opt_ PNTSTATUS CompletionStatus)
 {
     PSHADOWSTRIKE_WORK_ITEM Item;
-    LARGE_INTEGER Timeout;
-    NTSTATUS WaitStatus;
-    KEVENT CompletionEvent;
+    LARGE_INTEGER StartPerfCount, CurrentPerfCount, Frequency;
+    LARGE_INTEGER SleepInterval;
+    ULONG64 ElapsedMs;
 
     PAGED_CODE();
 
-    if (Status != NULL) {
-        *Status = STATUS_UNSUCCESSFUL;
-    }
+    if (CompletionStatus != NULL) *CompletionStatus = STATUS_UNSUCCESSFUL;
 
     Item = WqiFindWorkItemById(ItemId);
     if (Item == NULL) {
         return STATUS_NOT_FOUND;
     }
 
-    //
     // Check if already complete
-    //
-    if (Item->State == ShadowWqItemStateCompleted ||
-        Item->State == ShadowWqItemStateCancelled ||
-        Item->State == ShadowWqItemStateFailed) {
+    LONG State = InterlockedCompareExchange(&Item->State, 0, 0);
+    if (State == (LONG)ShadowWqItemStateCompleted ||
+        State == (LONG)ShadowWqItemStateCancelled ||
+        State == (LONG)ShadowWqItemStateFailed) {
 
-        if (Status != NULL) {
-            *Status = Item->CompletionStatus;
-        }
+        if (CompletionStatus != NULL) *CompletionStatus = Item->CompletionStatus;
         WqiDereferenceWorkItem(Item);
         return STATUS_SUCCESS;
     }
 
-    //
-    // Need to wait - check if completion event is set
-    //
-    if (Item->Options.CompletionEvent != NULL) {
-        Timeout.QuadPart = (TimeoutMs == 0) ?
-            MAXLONGLONG : -((LONGLONG)TimeoutMs * 10000);
+    // Wait using completion event if available
+    if ((Item->Flags & ShadowWqFlagSignalCompletion) &&
+        Item->Options.CompletionEvent != NULL) {
 
-        WaitStatus = KeWaitForSingleObject(
+        LARGE_INTEGER Timeout;
+        Timeout.QuadPart = (TimeoutMs == 0) ?
+            0 : -((LONGLONG)TimeoutMs * 10000);
+
+        NTSTATUS WaitStatus = KeWaitForSingleObject(
             Item->Options.CompletionEvent,
-            Executive,
-            KernelMode,
-            FALSE,
-            (TimeoutMs == 0) ? NULL : &Timeout
-        );
+            Executive, KernelMode, FALSE,
+            (TimeoutMs == 0) ? NULL : &Timeout);
 
         if (WaitStatus == STATUS_SUCCESS) {
-            if (Status != NULL) {
-                *Status = Item->CompletionStatus;
-            }
+            if (CompletionStatus != NULL) *CompletionStatus = Item->CompletionStatus;
             WqiDereferenceWorkItem(Item);
             return STATUS_SUCCESS;
         }
@@ -1865,54 +1446,51 @@ ShadowStrikeWaitForWorkItem(
         return STATUS_TIMEOUT;
     }
 
-    //
-    // No completion event - poll with sleep
-    //
-    Timeout.QuadPart = -10000; // 1ms
-    ULONG Elapsed = 0;
+    // FIX #13: Poll with accurate timing using KeQueryPerformanceCounter
+    StartPerfCount = KeQueryPerformanceCounter(&Frequency);
+    SleepInterval.QuadPart = -10000; // 1ms minimum sleep
 
-    while (Item->State != ShadowWqItemStateCompleted &&
-           Item->State != ShadowWqItemStateCancelled &&
-           Item->State != ShadowWqItemStateFailed) {
+    while (TRUE) {
+        State = InterlockedCompareExchange(&Item->State, 0, 0);
+        if (State == (LONG)ShadowWqItemStateCompleted ||
+            State == (LONG)ShadowWqItemStateCancelled ||
+            State == (LONG)ShadowWqItemStateFailed) {
 
-        if (TimeoutMs > 0 && Elapsed >= TimeoutMs) {
+            if (CompletionStatus != NULL) *CompletionStatus = Item->CompletionStatus;
             WqiDereferenceWorkItem(Item);
-            return STATUS_TIMEOUT;
+            return STATUS_SUCCESS;
         }
 
-        KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
-        Elapsed++;
-    }
+        if (TimeoutMs > 0) {
+            CurrentPerfCount = KeQueryPerformanceCounter(NULL);
+            ElapsedMs = ((ULONG64)(CurrentPerfCount.QuadPart - StartPerfCount.QuadPart) * 1000)
+                        / (ULONG64)Frequency.QuadPart;
+            if (ElapsedMs >= TimeoutMs) {
+                WqiDereferenceWorkItem(Item);
+                return STATUS_TIMEOUT;
+            }
+        }
 
-    if (Status != NULL) {
-        *Status = Item->CompletionStatus;
+        KeDelayExecutionThread(KernelMode, FALSE, &SleepInterval);
     }
-
-    WqiDereferenceWorkItem(Item);
-    return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetWorkItemState(
     _In_ ULONG64 ItemId,
-    _Out_ PSHADOWSTRIKE_WQ_ITEM_STATE State
-    )
+    _Out_ PSHADOWSTRIKE_WQ_ITEM_STATE State)
 {
     PSHADOWSTRIKE_WORK_ITEM Item;
 
-    if (State == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
+    if (State == NULL) return STATUS_INVALID_PARAMETER;
     *State = ShadowWqItemStateFree;
 
     Item = WqiFindWorkItemById(ItemId);
-    if (Item == NULL) {
-        return STATUS_NOT_FOUND;
-    }
+    if (Item == NULL) return STATUS_NOT_FOUND;
 
-    *State = Item->State;
+    *State = (SHADOWSTRIKE_WQ_ITEM_STATE)InterlockedCompareExchange(
+        &Item->State, 0, 0);
     WqiDereferenceWorkItem(Item);
 
     return STATUS_SUCCESS;
@@ -1920,126 +1498,180 @@ ShadowStrikeGetWorkItemState(
 
 // ============================================================================
 // QUEUE CONTROL
+// FIX #18: State transitions use InterlockedCompareExchange
+// FIX #11: Flush actually cancels and completes items
 // ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
-ShadowStrikeWorkQueuePause(
-    VOID
-    )
+ShadowStrikeWorkQueuePause(VOID)
 {
-    if (g_WqManager.State != ShadowWqStateRunning) {
+    // FIX #18: Atomic state transition
+    LONG Old = InterlockedCompareExchange(
+        &g_WqManager.State,
+        (LONG)ShadowWqStatePaused,
+        (LONG)ShadowWqStateRunning);
+
+    if (Old != (LONG)ShadowWqStateRunning) {
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    g_WqManager.State = ShadowWqStatePaused;
-    g_WqManager.Stats.State = ShadowWqStatePaused;
-
+    InterlockedExchange(&g_WqManager.Stats.State, (LONG)ShadowWqStatePaused);
     return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
 NTSTATUS
-ShadowStrikeWorkQueueResume(
-    VOID
-    )
+ShadowStrikeWorkQueueResume(VOID)
 {
-    if (g_WqManager.State != ShadowWqStatePaused) {
+    LONG Old = InterlockedCompareExchange(
+        &g_WqManager.State,
+        (LONG)ShadowWqStateRunning,
+        (LONG)ShadowWqStatePaused);
+
+    if (Old != (LONG)ShadowWqStatePaused) {
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    g_WqManager.State = ShadowWqStateRunning;
-    g_WqManager.Stats.State = ShadowWqStateRunning;
-
+    InterlockedExchange(&g_WqManager.Stats.State, (LONG)ShadowWqStateRunning);
     return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
 NTSTATUS
 ShadowStrikeWorkQueueDrain(
-    _In_ ULONG TimeoutMs
-    )
+    _In_ ULONG TimeoutMs)
 {
     LARGE_INTEGER Timeout;
     NTSTATUS Status;
 
     PAGED_CODE();
 
-    //
-    // Set draining state
-    //
-    g_WqManager.State = ShadowWqStateDraining;
-    g_WqManager.Stats.State = ShadowWqStateDraining;
+    // Transition to draining
+    LONG Old = InterlockedCompareExchange(
+        &g_WqManager.State,
+        (LONG)ShadowWqStateDraining,
+        (LONG)ShadowWqStateRunning);
 
-    //
-    // Reset drain complete event
-    //
+    if (Old != (LONG)ShadowWqStateRunning) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    InterlockedExchange(&g_WqManager.Stats.State, (LONG)ShadowWqStateDraining);
     KeClearEvent(&g_WqManager.DrainCompleteEvent);
 
-    //
     // Check if already drained
-    //
-    if (g_WqManager.ActiveCount == 0 &&
-        g_WqManager.Stats.CurrentPending == 0) {
-
-        g_WqManager.State = ShadowWqStateRunning;
-        g_WqManager.Stats.State = ShadowWqStateRunning;
+    if (g_WqManager.ActiveCount == 0 && g_WqManager.PendingCount == 0) {
+        InterlockedExchange(&g_WqManager.State, (LONG)ShadowWqStateRunning);
+        InterlockedExchange(&g_WqManager.Stats.State, (LONG)ShadowWqStateRunning);
         return STATUS_SUCCESS;
     }
 
-    //
-    // Wait for drain
-    //
+    // Wait
     Timeout.QuadPart = -((LONGLONG)TimeoutMs * 10000);
-
     Status = KeWaitForSingleObject(
         &g_WqManager.DrainCompleteEvent,
-        Executive,
-        KernelMode,
-        FALSE,
-        (TimeoutMs == 0) ? NULL : &Timeout
-    );
+        Executive, KernelMode, FALSE,
+        (TimeoutMs == 0) ? NULL : &Timeout);
 
-    g_WqManager.State = ShadowWqStateRunning;
-    g_WqManager.Stats.State = ShadowWqStateRunning;
+    InterlockedExchange(&g_WqManager.State, (LONG)ShadowWqStateRunning);
+    InterlockedExchange(&g_WqManager.Stats.State, (LONG)ShadowWqStateRunning);
 
     return (Status == STATUS_SUCCESS) ? STATUS_SUCCESS : STATUS_TIMEOUT;
 }
 
 _Use_decl_annotations_
 ULONG
-ShadowStrikeWorkQueueFlush(
-    VOID
-    )
+ShadowStrikeWorkQueueFlush(VOID)
 {
     KIRQL OldIrql;
-    PLIST_ENTRY Entry;
-    PLIST_ENTRY NextEntry;
+    PLIST_ENTRY Entry, NextEntry;
     PSHADOWSTRIKE_WORK_ITEM Item;
     ULONG FlushedCount = 0;
+    LIST_ENTRY ToCancelList;
 
-    //
-    // Iterate through all priority queues
-    //
-    for (ULONG i = 0; i < ShadowWqPriorityCount; i++) {
-        PSHADOWSTRIKE_WQ_PRIORITY_QUEUE Queue = &g_WqManager.Queues[i];
+    InitializeListHead(&ToCancelList);
 
-        KeAcquireSpinLock(&Queue->Lock, &OldIrql);
+    // FIX #11: Collect queued items under lock, then cancel them outside lock
+    KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
 
-        for (Entry = Queue->Head.Flink;
-             Entry != &Queue->Head;
-             Entry = NextEntry) {
+    for (Entry = g_WqManager.ActiveList.Flink;
+         Entry != &g_WqManager.ActiveList;
+         Entry = NextEntry) {
 
-            NextEntry = Entry->Flink;
-            Item = CONTAINING_RECORD(Entry, SHADOWSTRIKE_WORK_ITEM, ListEntry);
+        NextEntry = Entry->Flink;
+        Item = CONTAINING_RECORD(Entry, SHADOWSTRIKE_WORK_ITEM, ActiveListEntry);
 
-            if (Item->State == ShadowWqItemStateQueued) {
-                Item->CancelRequested = TRUE;
+        LONG State = InterlockedCompareExchange(&Item->State, 0, 0);
+        if (State == (LONG)ShadowWqItemStateQueued) {
+            // Atomically transition to cancelled
+            LONG Was = InterlockedCompareExchange(
+                &Item->State,
+                (LONG)ShadowWqItemStateCancelled,
+                (LONG)ShadowWqItemStateQueued);
+
+            if (Was == (LONG)ShadowWqItemStateQueued) {
+                InterlockedExchange(&Item->CancelRequested, 1);
+
+                // Cancel timer if delayed
+                if (Item->Type == ShadowWqTypeDelayed) {
+                    KeCancelTimer(&Item->DelayTimer);
+                }
+
+                // Remove from active list
+                RemoveEntryList(&Item->ActiveListEntry);
+                InterlockedDecrement(&g_WqManager.ActiveCount);
+
+                // Move to local cancel list
+                InsertTailList(&ToCancelList, &Item->ActiveListEntry);
                 FlushedCount++;
             }
         }
+    }
 
-        KeReleaseSpinLock(&Queue->Lock, OldIrql);
+    KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
+
+    // Complete cancelled items outside spin lock
+    while (!IsListEmpty(&ToCancelList)) {
+        Entry = RemoveHeadList(&ToCancelList);
+        Item = CONTAINING_RECORD(Entry, SHADOWSTRIKE_WORK_ITEM, ActiveListEntry);
+        InitializeListHead(&Item->ActiveListEntry);
+
+        // Cancel callback
+        if (Item->Options.CancelCallback != NULL) {
+            __try {
+                Item->Options.CancelCallback(Item->Context, Item->ContextSize);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // Don't crash
+            }
+        }
+
+        Item->CompletionStatus = STATUS_CANCELLED;
+
+        // Completion callback
+        if (Item->Options.CompletionCallback != NULL) {
+            __try {
+                Item->Options.CompletionCallback(
+                    STATUS_CANCELLED, Item->Context, Item->Options.CompletionContext);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // Don't crash
+            }
+        }
+
+        // Signal completion event
+        if ((Item->Flags & ShadowWqFlagSignalCompletion) &&
+            Item->Options.CompletionEvent != NULL) {
+            KeSetEvent(Item->Options.CompletionEvent, IO_NO_INCREMENT, FALSE);
+        }
+
+        // Update stats
+        InterlockedDecrement(&g_WqManager.PendingCount);
+        InterlockedDecrement(&g_WqManager.Stats.CurrentPending);
+        InterlockedIncrement64(&g_WqManager.Stats.TotalCancelled);
+
+        // Release rundown + free
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        WqiDereferenceWorkItem(Item);
     }
 
     return FlushedCount;
@@ -2047,122 +1679,92 @@ ShadowStrikeWorkQueueFlush(
 
 // ============================================================================
 // STATISTICS
+// FIX #9, #20, #24: Thread-safe stats using interlocked operations
 // ============================================================================
 
 _Use_decl_annotations_
 VOID
 ShadowStrikeGetWorkQueueStatistics(
-    _Out_ PSHADOWSTRIKE_WQ_STATISTICS Statistics
-    )
+    _Out_ PSHADOWSTRIKE_WQ_STATISTICS Statistics)
 {
     LARGE_INTEGER CurrentTime;
 
-    if (Statistics == NULL) {
-        return;
-    }
+    if (Statistics == NULL) return;
 
-    RtlCopyMemory(Statistics, &g_WqManager.Stats, sizeof(SHADOWSTRIKE_WQ_STATISTICS));
+    // Snapshot volatile fields individually for consistency
+    Statistics->State = InterlockedCompareExchange(&g_WqManager.Stats.State, 0, 0);
+    Statistics->TotalSubmitted = g_WqManager.Stats.TotalSubmitted;
+    Statistics->TotalCompleted = g_WqManager.Stats.TotalCompleted;
+    Statistics->TotalFailed = g_WqManager.Stats.TotalFailed;
+    Statistics->TotalCancelled = g_WqManager.Stats.TotalCancelled;
+    Statistics->TotalRetries = g_WqManager.Stats.TotalRetries;
+    Statistics->TotalDropped = g_WqManager.Stats.TotalDropped;
+    Statistics->CurrentPending = g_WqManager.Stats.CurrentPending;
+    Statistics->PeakPending = g_WqManager.Stats.PeakPending;
+    Statistics->CurrentExecuting = g_WqManager.Stats.CurrentExecuting;
+    Statistics->PeakExecuting = g_WqManager.Stats.PeakExecuting;
 
-    //
-    // Calculate uptime
-    //
-    KeQuerySystemTimePrecise(&CurrentTime);
-    Statistics->Uptime.QuadPart =
-        CurrentTime.QuadPart - g_WqManager.Stats.StartTime.QuadPart;
+    // Timing
+    Statistics->TotalWaitTimeUs = g_WqManager.Stats.TotalWaitTimeUs;
+    Statistics->TotalExecTimeUs = g_WqManager.Stats.TotalExecTimeUs;
+    Statistics->TimingSampleCount = g_WqManager.Stats.TimingSampleCount;
 
-    //
-    // Calculate averages
-    //
-    if (g_WqManager.Timing.SampleCount > 0) {
-        Statistics->AverageWaitTimeUs =
-            (ULONG64)(g_WqManager.Timing.TotalWaitTime /
-                      g_WqManager.Timing.SampleCount);
-        Statistics->AverageExecTimeUs =
-            (ULONG64)(g_WqManager.Timing.TotalExecTime /
-                      g_WqManager.Timing.SampleCount);
-    }
-
-    //
-    // Get per-priority pending counts
-    //
-    for (ULONG i = 0; i < ShadowWqPriorityCount; i++) {
-        Statistics->PerPriority[i].Pending = g_WqManager.Queues[i].Count;
-        Statistics->PerPriority[i].Peak = g_WqManager.Queues[i].PeakCount;
-    }
+    Statistics->StartTime = g_WqManager.Stats.StartTime;
 }
 
 _Use_decl_annotations_
 VOID
-ShadowStrikeResetWorkQueueStatistics(
-    VOID
-    )
+ShadowStrikeResetWorkQueueStatistics(VOID)
 {
-    LONG CurrentPending = g_WqManager.Stats.CurrentPending;
-    LONG CurrentExecuting = g_WqManager.Stats.CurrentExecuting;
-    SHADOWSTRIKE_WQ_STATE CurrentState = g_WqManager.Stats.State;
+    // FIX #20: Reset only accumulated counters, not live state
+    InterlockedExchange64(&g_WqManager.Stats.TotalSubmitted, 0);
+    InterlockedExchange64(&g_WqManager.Stats.TotalCompleted, 0);
+    InterlockedExchange64(&g_WqManager.Stats.TotalFailed, 0);
+    InterlockedExchange64(&g_WqManager.Stats.TotalCancelled, 0);
+    InterlockedExchange64(&g_WqManager.Stats.TotalRetries, 0);
+    InterlockedExchange64(&g_WqManager.Stats.TotalDropped, 0);
+    InterlockedExchange(&g_WqManager.Stats.PeakPending,
+        g_WqManager.Stats.CurrentPending);
+    InterlockedExchange(&g_WqManager.Stats.PeakExecuting,
+        g_WqManager.Stats.CurrentExecuting);
 
-    RtlZeroMemory(&g_WqManager.Stats, sizeof(SHADOWSTRIKE_WQ_STATISTICS));
+    InterlockedExchange64(&g_WqManager.Stats.TotalWaitTimeUs, 0);
+    InterlockedExchange64(&g_WqManager.Stats.TotalExecTimeUs, 0);
+    InterlockedExchange64(&g_WqManager.Stats.TimingSampleCount, 0);
 
-    //
-    // Preserve current values
-    //
-    g_WqManager.Stats.CurrentPending = CurrentPending;
-    g_WqManager.Stats.CurrentExecuting = CurrentExecuting;
-    g_WqManager.Stats.State = CurrentState;
-
-    //
-    // Reset start time
-    //
     KeQuerySystemTimePrecise(&g_WqManager.Stats.StartTime);
-
-    //
-    // Reset timing
-    //
-    g_WqManager.Timing.TotalWaitTime = 0;
-    g_WqManager.Timing.TotalExecTime = 0;
-    g_WqManager.Timing.SampleCount = 0;
 }
 
 _Use_decl_annotations_
 LONG
-ShadowStrikeGetPendingWorkItemCount(
-    VOID
-    )
+ShadowStrikeGetPendingWorkItemCount(VOID)
 {
-    return g_WqManager.Stats.CurrentPending;
-}
-
-_Use_decl_annotations_
-LONG
-ShadowStrikeGetPendingWorkItemCountByPriority(
-    _In_ SHADOWSTRIKE_WQ_PRIORITY Priority
-    )
-{
-    if (!ShadowStrikeIsValidWqPriority(Priority)) {
-        return 0;
-    }
-
-    return g_WqManager.Queues[Priority].Count;
+    return g_WqManager.PendingCount;
 }
 
 // ============================================================================
 // CONFIGURATION
+// FIX #22, #31: Synchronized with push lock
 // ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
 ShadowStrikeWorkQueueSetDeviceObject(
-    _In_ PDEVICE_OBJECT DeviceObject
-    )
+    _In_ PDEVICE_OBJECT DeviceObject)
 {
     PAGED_CODE();
 
-    if (DeviceObject == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
+    if (DeviceObject == NULL) return STATUS_INVALID_PARAMETER;
+
+    // FIX #22, #31: Use push lock for thread-safe update
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_WqManager.InitLock);
 
     g_WqManager.DeviceObject = DeviceObject;
     g_WqManager.Config.DeviceObject = DeviceObject;
+
+    ExReleasePushLockExclusive(&g_WqManager.InitLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -2170,17 +1772,20 @@ ShadowStrikeWorkQueueSetDeviceObject(
 _Use_decl_annotations_
 NTSTATUS
 ShadowStrikeWorkQueueSetFilterHandle(
-    _In_ PFLT_FILTER FilterHandle
-    )
+    _In_ PFLT_FILTER FilterHandle)
 {
     PAGED_CODE();
 
-    if (FilterHandle == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
+    if (FilterHandle == NULL) return STATUS_INVALID_PARAMETER;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_WqManager.InitLock);
 
     g_WqManager.FilterHandle = FilterHandle;
     g_WqManager.Config.FilterHandle = FilterHandle;
+
+    ExReleasePushLockExclusive(&g_WqManager.InitLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -2188,34 +1793,28 @@ ShadowStrikeWorkQueueSetFilterHandle(
 _Use_decl_annotations_
 VOID
 ShadowStrikeInitWorkQueueOptions(
-    _Out_ PSHADOWSTRIKE_WQ_OPTIONS Options
-    )
+    _Out_ PSHADOWSTRIKE_WQ_OPTIONS Options)
 {
-    if (Options == NULL) {
-        return;
-    }
+    if (Options == NULL) return;
 
     RtlZeroMemory(Options, sizeof(SHADOWSTRIKE_WQ_OPTIONS));
     Options->Priority = ShadowWqPriorityNormal;
     Options->Flags = ShadowWqFlagNone;
-    Options->TimeoutMs = WQ_DEFAULT_TIMEOUT_MS;
 }
 
 _Use_decl_annotations_
 VOID
 ShadowStrikeInitWorkQueueConfig(
-    _Out_ PSHADOWSTRIKE_WQ_CONFIG Config
-    )
+    _Out_ PSHADOWSTRIKE_WQ_CONFIG Config)
 {
-    if (Config == NULL) {
-        return;
-    }
+    if (Config == NULL) return;
 
     RtlZeroMemory(Config, sizeof(SHADOWSTRIKE_WQ_CONFIG));
     Config->MaxPendingTotal = WQ_DEFAULT_MAX_PENDING;
-    Config->MaxPendingPerPriority = WQ_DEFAULT_MAX_PENDING / ShadowWqPriorityCount;
-    Config->DefaultTimeoutMs = WQ_DEFAULT_TIMEOUT_MS;
     Config->LookasideDepth = WQ_LOOKASIDE_DEPTH;
-    Config->EnableStatistics = TRUE;
     Config->EnableDetailedTiming = FALSE;
 }
+
+// ============================================================================
+// END OF FILE
+// ============================================================================

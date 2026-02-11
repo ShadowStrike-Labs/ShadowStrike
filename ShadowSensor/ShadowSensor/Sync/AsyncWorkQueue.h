@@ -1,16 +1,37 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: AsyncWorkQueue.h
-    
+
     Purpose: Asynchronous work queue for deferred processing of
              kernel events without blocking critical paths.
-             
+
     Architecture:
-    - Multiple priority levels (Critical, High, Normal, Low)
-    - Work stealing between threads for load balancing
-    - Bounded queue with back-pressure support
-    - Per-CPU local queues for reduced contention
-    
+    - Four priority levels (Critical, High, Normal, Low)
+    - Bounded queues with back-pressure (STATUS_QUOTA_EXCEEDED)
+    - Dynamic thread pool with idle-timeout scaling
+    - Serialized execution by key (mutual exclusion per key)
+    - Work item chaining (sequential pipeline execution)
+    - Reference-counted items for safe concurrent access
+    - EX_RUNDOWN_REF lifecycle: every public API acquires rundown
+      protection; shutdown waits for all outstanding calls to drain
+    - EX_PUSH_LOCK synchronization (IRQL <= APC_LEVEL for all ops)
+    - All callbacks execute at PASSIVE_LEVEL outside any lock
+
+    Thread safety:
+    - All public APIs are safe to call concurrently.
+    - AwqInitialize must be called once before any other API.
+    - AwqShutdown always waits for all workers and pending items.
+    - After AwqShutdown returns, the handle is invalid.
+
+    Callback lifetime contract:
+    - WorkCallback: called at PASSIVE_LEVEL on a worker thread.
+      The Context pointer is valid for the duration of the call.
+    - CompletionCallback: called at PASSIVE_LEVEL after the work
+      callback returns. Called even on failure or cancellation.
+    - CleanupCallback: called at PASSIVE_LEVEL after completion
+      callback. Always called if set, regardless of DeleteContext.
+      Called before the context is freed.
+
     Copyright (c) ShadowStrike Team
 --*/
 
@@ -22,428 +43,251 @@ extern "C" {
 
 #include <ntddk.h>
 
-//=============================================================================
-// Pool Tags
-//=============================================================================
+// ============================================================================
+// Pool Tags (one per allocation type for leak tracking)
+// ============================================================================
 
-#define AWQ_POOL_TAG_QUEUE      'QWQA'  // Async Work Queue - Queue
-#define AWQ_POOL_TAG_ITEM       'IWQA'  // Async Work Queue - Item
-#define AWQ_POOL_TAG_THREAD     'TWQA'  // Async Work Queue - Thread
-#define AWQ_POOL_TAG_CONTEXT    'CWQA'  // Async Work Queue - Context
+#define AWQ_POOL_TAG_MGR        'mWQA'  // Manager structure
+#define AWQ_POOL_TAG_ITEM       'iWQA'  // Work items
+#define AWQ_POOL_TAG_THREAD     'tWQA'  // Worker thread structs
+#define AWQ_POOL_TAG_CTX        'cWQA'  // Copied context buffers
+#define AWQ_POOL_TAG_HASH       'hWQA'  // Hash table buckets/chains
+#define AWQ_POOL_TAG_SKEY       'sWQA'  // Serialization key entries
 
-//=============================================================================
+// ============================================================================
 // Configuration Constants
-//=============================================================================
+// ============================================================================
 
-// Queue sizes
-#define AWQ_DEFAULT_QUEUE_SIZE          16384       // Items per queue
-#define AWQ_MIN_QUEUE_SIZE              256
-#define AWQ_MAX_QUEUE_SIZE              (1024 * 1024)
-
-// Thread pool
-#define AWQ_MIN_THREADS                 2
+#define AWQ_MIN_THREADS                 1
 #define AWQ_MAX_THREADS                 64
-#define AWQ_DEFAULT_THREADS_PER_CPU     2
-#define AWQ_MAX_IDLE_THREADS            8
+#define AWQ_DEFAULT_THREADS_PER_CPU     1
 
-// Timeouts
-#define AWQ_DEFAULT_TIMEOUT_MS          5000        // 5 seconds
-#define AWQ_SHUTDOWN_TIMEOUT_MS         30000       // 30 seconds
-#define AWQ_IDLE_TIMEOUT_MS             60000       // 1 minute
+#define AWQ_MIN_QUEUE_SIZE              64
+#define AWQ_MAX_QUEUE_SIZE              (256 * 1024)
+#define AWQ_DEFAULT_QUEUE_SIZE          4096
 
-// Work item limits
-#define AWQ_MAX_WORK_ITEM_SIZE          (64 * 1024) // 64 KB context
-#define AWQ_MAX_PENDING_ITEMS           (1024 * 1024)
+#define AWQ_DEFAULT_TIMEOUT_MS          5000
+#define AWQ_SHUTDOWN_TIMEOUT_MS         30000
+#define AWQ_IDLE_TIMEOUT_MS             60000
 
-//=============================================================================
+#define AWQ_MAX_CONTEXT_SIZE            (64 * 1024)
+#define AWQ_MAX_CHAIN_LENGTH            64
+#define AWQ_MAX_RETRIES                 5
+#define AWQ_ITEM_CACHE_SIZE             128
+#define AWQ_HASH_BUCKET_COUNT           1024
+
+// ============================================================================
 // Priority Levels
-//=============================================================================
+// ============================================================================
 
 typedef enum _AWQ_PRIORITY {
-    AwqPriority_Low = 0,                // Background tasks
-    AwqPriority_Normal = 1,             // Default priority
-    AwqPriority_High = 2,               // Important tasks
-    AwqPriority_Critical = 3,           // Must execute ASAP
-    AwqPriority_Max = 4
+    AwqPriority_Low      = 0,
+    AwqPriority_Normal   = 1,
+    AwqPriority_High     = 2,
+    AwqPriority_Critical = 3,
+    AwqPriority_Count    = 4
 } AWQ_PRIORITY;
 
-//=============================================================================
+// ============================================================================
 // Work Item Flags
-//=============================================================================
+// ============================================================================
 
 typedef enum _AWQ_WORK_FLAGS {
-    AwqFlag_None                = 0x00000000,
-    AwqFlag_LongRunning         = 0x00000001,   // May take a long time
-    AwqFlag_CanCancel           = 0x00000002,   // Can be cancelled
-    AwqFlag_Serialized          = 0x00000004,   // Execute serially (by key)
-    AwqFlag_DeleteContext       = 0x00000008,   // Free context on completion
-    AwqFlag_NotifyCompletion    = 0x00000010,   // Signal event on completion
-    AwqFlag_RetryOnFailure      = 0x00000020,   // Retry if callback fails
-    AwqFlag_ChainedItem         = 0x00000040,   // Part of a chain
-    AwqFlag_NonPagedContext     = 0x00000080,   // Context in non-paged pool
-    AwqFlag_AffineToSubmitter   = 0x00000100,   // Execute on submitting CPU
+    AwqFlag_None             = 0x00000000,
+    AwqFlag_CanCancel        = 0x00000001,
+    AwqFlag_DeleteContext    = 0x00000002,  // Queue copies context; frees on completion
+    AwqFlag_RetryOnFailure   = 0x00000004,
+    AwqFlag_Serialized       = 0x00000008,  // Mutually exclusive by SerializationKey
 } AWQ_WORK_FLAGS;
 
-//=============================================================================
-// Work Item State
-//=============================================================================
+// ============================================================================
+// Work Item State (value type returned to callers)
+// ============================================================================
 
 typedef enum _AWQ_ITEM_STATE {
-    AwqItemState_Free = 0,
+    AwqItemState_Unknown    = 0,
     AwqItemState_Queued,
     AwqItemState_Running,
     AwqItemState_Completed,
     AwqItemState_Cancelled,
     AwqItemState_Failed,
-    AwqItemState_Retrying
 } AWQ_ITEM_STATE;
 
-//=============================================================================
+// ============================================================================
 // Queue State
-//=============================================================================
+// ============================================================================
 
 typedef enum _AWQ_QUEUE_STATE {
     AwqQueueState_Uninitialized = 0,
-    AwqQueueState_Initializing,
     AwqQueueState_Running,
     AwqQueueState_Paused,
     AwqQueueState_Draining,
-    AwqQueueState_Shutdown
+    AwqQueueState_ShuttingDown,
 } AWQ_QUEUE_STATE;
 
-//=============================================================================
-// Callback Types
-//=============================================================================
+// ============================================================================
+// Callback Signatures
+//
+// All callbacks are invoked at PASSIVE_LEVEL outside any lock.
+// The callee MUST NOT call back into the AWQ module from within
+// a callback (no submit, cancel, wait, etc.) to avoid deadlock.
+// ============================================================================
 
-//
-// Work callback - executed for each work item
-//
-typedef NTSTATUS (*AWQ_WORK_CALLBACK)(
+typedef NTSTATUS
+(AWQ_WORK_CALLBACK)(
     _In_opt_ PVOID Context,
     _In_ ULONG ContextSize
     );
+typedef AWQ_WORK_CALLBACK *PAWQ_WORK_CALLBACK;
 
-//
-// Completion callback - called when work item completes
-//
-typedef VOID (*AWQ_COMPLETION_CALLBACK)(
-    _In_ NTSTATUS Status,
+typedef VOID
+(AWQ_COMPLETION_CALLBACK)(
+    _In_ NTSTATUS CompletionStatus,
     _In_opt_ PVOID Context,
     _In_opt_ PVOID CompletionContext
     );
+typedef AWQ_COMPLETION_CALLBACK *PAWQ_COMPLETION_CALLBACK;
 
-//
-// Cleanup callback - called to free context
-//
-typedef VOID (*AWQ_CLEANUP_CALLBACK)(
+typedef VOID
+(AWQ_CLEANUP_CALLBACK)(
     _In_opt_ PVOID Context
     );
+typedef AWQ_CLEANUP_CALLBACK *PAWQ_CLEANUP_CALLBACK;
 
-//=============================================================================
-// Work Item
-//=============================================================================
+// ============================================================================
+// Opaque Handle
+//
+// Callers receive and pass HAWQ_MANAGER. Internal structures are
+// hidden in the .c file. No internal fields are exposed.
+// ============================================================================
 
-typedef struct _AWQ_WORK_ITEM {
-    //
-    // List linkage
-    //
-    LIST_ENTRY ListEntry;
-    
-    //
-    // Item identification
-    //
-    ULONG64 ItemId;
-    ULONG64 SerializationKey;           // For serialized execution
-    AWQ_PRIORITY Priority;
-    AWQ_WORK_FLAGS Flags;
-    volatile AWQ_ITEM_STATE State;
-    
-    //
-    // Callbacks
-    //
-    AWQ_WORK_CALLBACK WorkCallback;
-    AWQ_COMPLETION_CALLBACK CompletionCallback;
-    AWQ_CLEANUP_CALLBACK CleanupCallback;
-    PVOID CompletionContext;
-    
-    //
-    // Work context
-    //
-    PVOID Context;
-    ULONG ContextSize;
-    
-    //
-    // Timing
-    //
-    LARGE_INTEGER SubmitTime;
-    LARGE_INTEGER StartTime;
-    LARGE_INTEGER EndTime;
-    ULONG TimeoutMs;
-    
-    //
-    // Retry support
-    //
-    ULONG RetryCount;
-    ULONG MaxRetries;
-    ULONG RetryDelayMs;
-    
-    //
-    // Completion signaling
-    //
-    PKEVENT CompletionEvent;
-    NTSTATUS CompletionStatus;
-    
-    //
-    // Chaining support
-    //
-    struct _AWQ_WORK_ITEM* NextInChain;
-    ULONG ChainIndex;
-    ULONG ChainLength;
-    
-    //
-    // Execution tracking
-    //
-    ULONG ExecutingCpu;
-    HANDLE ExecutingThread;
-    
-    //
-    // Reference counting
-    //
-    volatile LONG RefCount;
-    
-} AWQ_WORK_ITEM, *PAWQ_WORK_ITEM;
+DECLARE_HANDLE(HAWQ_MANAGER);
 
-//=============================================================================
-// Per-Priority Queue
-//=============================================================================
-
-typedef struct _AWQ_PRIORITY_QUEUE {
-    //
-    // Queue storage (lock-free MPMC)
-    //
-    LIST_ENTRY ItemList;
-    KSPIN_LOCK Lock;
-    
-    //
-    // Queue state
-    //
-    volatile LONG ItemCount;
-    volatile LONG PeakCount;
-    ULONG MaxItems;
-    
-    //
-    // Statistics
-    //
-    volatile LONG64 TotalEnqueued;
-    volatile LONG64 TotalDequeued;
-    volatile LONG64 TotalDropped;
-    
-    //
-    // Semaphore for waiting threads
-    //
-    KSEMAPHORE ItemSemaphore;
-    
-} AWQ_PRIORITY_QUEUE, *PAWQ_PRIORITY_QUEUE;
-
-//=============================================================================
-// Worker Thread
-//=============================================================================
-
-typedef struct _AWQ_WORKER_THREAD {
-    //
-    // Thread handle
-    //
-    HANDLE ThreadHandle;
-    PKTHREAD ThreadObject;
-    ULONG ThreadId;
-    
-    //
-    // Thread state
-    //
-    volatile BOOLEAN Running;
-    volatile BOOLEAN Idle;
-    LARGE_INTEGER IdleStartTime;
-    
-    //
-    // Current work
-    //
-    PAWQ_WORK_ITEM CurrentItem;
-    
-    //
-    // Statistics
-    //
-    volatile LONG64 ItemsProcessed;
-    volatile LONG64 TotalProcessingTime;
-    
-    //
-    // Affinity
-    //
-    ULONG PreferredCpu;
-    BOOLEAN AffinitySet;
-    
-    //
-    // List linkage
-    //
-    LIST_ENTRY ListEntry;
-    
-} AWQ_WORKER_THREAD, *PAWQ_WORKER_THREAD;
-
-//=============================================================================
-// Work Queue Manager
-//=============================================================================
-
-typedef struct _AWQ_MANAGER {
-    //
-    // Queue state
-    //
-    volatile AWQ_QUEUE_STATE State;
-    
-    //
-    // Priority queues
-    //
-    AWQ_PRIORITY_QUEUE PriorityQueues[AwqPriority_Max];
-    
-    //
-    // Worker threads
-    //
-    LIST_ENTRY WorkerList;
-    KSPIN_LOCK WorkerListLock;
-    volatile LONG WorkerCount;
-    volatile LONG IdleWorkerCount;
-    volatile LONG ActiveWorkerCount;
-    ULONG MinWorkers;
-    ULONG MaxWorkers;
-    
-    //
-    // Thread management
-    //
-    KEVENT NewWorkEvent;                // Signal when work available
-    KEVENT ShutdownEvent;               // Signal for shutdown
-    KEVENT DrainCompleteEvent;          // Signal when drained
-    
-    //
-    // Work item ID generation
-    //
-    volatile LONG64 NextItemId;
-    
-    //
-    // Serialization support
-    //
-    struct {
-        LIST_ENTRY ActiveKeys;          // Keys with running items
-        KSPIN_LOCK Lock;
-    } Serialization;
-    
-    //
-    // Statistics
-    //
-    struct {
-        volatile LONG64 TotalSubmitted;
-        volatile LONG64 TotalCompleted;
-        volatile LONG64 TotalCancelled;
-        volatile LONG64 TotalFailed;
-        volatile LONG64 TotalRetries;
-        volatile LONG64 TotalTimeouts;
-        LARGE_INTEGER StartTime;
-    } Stats;
-    
-    //
-    // Configuration
-    //
-    struct {
-        ULONG DefaultTimeoutMs;
-        ULONG MaxItemSize;
-        ULONG MaxQueueSize;
-        BOOLEAN EnableWorkStealing;
-        BOOLEAN EnableDynamicThreads;
-    } Config;
-    
-    //
-    // Free list for work items
-    //
-    struct {
-        LIST_ENTRY FreeList;
-        KSPIN_LOCK Lock;
-        volatile LONG FreeCount;
-        ULONG MaxFreeItems;
-    } ItemCache;
-    
-} AWQ_MANAGER, *PAWQ_MANAGER;
-
-//=============================================================================
-// Work Item Options
-//=============================================================================
+// ============================================================================
+// Submission Options (caller fills before AwqSubmit)
+// ============================================================================
 
 typedef struct _AWQ_SUBMIT_OPTIONS {
-    AWQ_PRIORITY Priority;
-    AWQ_WORK_FLAGS Flags;
-    ULONG TimeoutMs;
-    ULONG64 SerializationKey;
-    AWQ_COMPLETION_CALLBACK CompletionCallback;
-    AWQ_CLEANUP_CALLBACK CleanupCallback;
-    PVOID CompletionContext;
-    ULONG MaxRetries;
-    ULONG RetryDelayMs;
-    PKEVENT CompletionEvent;
+    AWQ_PRIORITY            Priority;
+    AWQ_WORK_FLAGS          Flags;
+    ULONG                   TimeoutMs;          // 0 = use default
+    ULONG64                 SerializationKey;   // Non-zero enables serialization
+    PAWQ_COMPLETION_CALLBACK CompletionCallback;
+    PAWQ_CLEANUP_CALLBACK   CleanupCallback;
+    PVOID                   CompletionContext;
+    ULONG                   MaxRetries;         // Capped at AWQ_MAX_RETRIES
+    ULONG                   RetryDelayMs;
 } AWQ_SUBMIT_OPTIONS, *PAWQ_SUBMIT_OPTIONS;
 
-//=============================================================================
-// Public API - Initialization
-//=============================================================================
+// ============================================================================
+// Statistics (value-type snapshot, safe to read without lock)
+// ============================================================================
+
+typedef struct _AWQ_STATISTICS {
+    AWQ_QUEUE_STATE State;
+
+    ULONG64 TotalSubmitted;
+    ULONG64 TotalCompleted;
+    ULONG64 TotalCancelled;
+    ULONG64 TotalFailed;
+    ULONG64 TotalRetries;
+
+    ULONG   PendingItems[AwqPriority_Count];
+    ULONG   TotalPending;
+
+    ULONG   WorkerCount;
+    ULONG   IdleWorkers;
+    ULONG   ActiveWorkers;
+
+    LARGE_INTEGER UpTime;
+    ULONG64 ItemsPerSecond;
+
+    struct {
+        ULONG64 Enqueued;
+        ULONG64 Dequeued;
+        ULONG64 Dropped;
+        ULONG   Pending;
+    } PerPriority[AwqPriority_Count];
+
+} AWQ_STATISTICS, *PAWQ_STATISTICS;
+
+// ============================================================================
+// Public API — Lifecycle
+// ============================================================================
 
 //
-// Initialize the work queue manager
+// Initialize the work queue. Must be called at PASSIVE_LEVEL.
+// On success, *Handle is valid until AwqShutdown is called.
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqInitialize(
-    _Out_ PAWQ_MANAGER* Manager,
+    _Out_ HAWQ_MANAGER *Handle,
     _In_ ULONG MinThreads,
     _In_ ULONG MaxThreads,
     _In_ ULONG MaxQueueSize
     );
 
 //
-// Shutdown the work queue manager
+// Shut down the work queue. Cancels pending items, waits for all
+// running items and workers to finish, then frees all resources.
+// After return, Handle is invalid. Idempotent.
 //
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 AwqShutdown(
-    _Inout_ PAWQ_MANAGER Manager,
-    _In_ BOOLEAN WaitForCompletion
+    _In_ HAWQ_MANAGER Handle
     );
 
-//
-// Pause/Resume processing
-//
+// ============================================================================
+// Public API — Queue Control
+// ============================================================================
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqPause(
-    _Inout_ PAWQ_MANAGER Manager
+    _In_ HAWQ_MANAGER Handle
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqResume(
-    _Inout_ PAWQ_MANAGER Manager
+    _In_ HAWQ_MANAGER Handle
     );
 
 //
-// Drain all pending work
+// Drain: stop accepting new work and wait for all pending/running
+// items to complete. Returns STATUS_TIMEOUT if TimeoutMs expires.
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqDrain(
-    _Inout_ PAWQ_MANAGER Manager,
+    _In_ HAWQ_MANAGER Handle,
     _In_ ULONG TimeoutMs
     );
 
-//=============================================================================
-// Public API - Work Submission
-//=============================================================================
+// ============================================================================
+// Public API — Work Submission
+// ============================================================================
 
 //
-// Submit a work item
+// Submit a single work item. If Options is NULL, uses Normal
+// priority with default timeout. If AwqFlag_DeleteContext is set,
+// the queue copies Context and frees the copy after callbacks.
 //
+// Returns STATUS_QUOTA_EXCEEDED if the target queue is full.
+// Returns STATUS_DEVICE_NOT_READY if the queue is not running.
+//
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqSubmit(
-    _In_ PAWQ_MANAGER Manager,
-    _In_ AWQ_WORK_CALLBACK Callback,
+    _In_ HAWQ_MANAGER Handle,
+    _In_ PAWQ_WORK_CALLBACK Callback,
     _In_opt_ PVOID Context,
     _In_ ULONG ContextSize,
     _In_opt_ PAWQ_SUBMIT_OPTIONS Options,
@@ -451,12 +295,14 @@ AwqSubmit(
     );
 
 //
-// Submit with inline context (allocates and copies)
+// Convenience: submit with copied context at given priority.
 //
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqSubmitWithContext(
-    _In_ PAWQ_MANAGER Manager,
-    _In_ AWQ_WORK_CALLBACK Callback,
+    _In_ HAWQ_MANAGER Handle,
+    _In_ PAWQ_WORK_CALLBACK Callback,
     _In_reads_bytes_(ContextSize) PVOID Context,
     _In_ ULONG ContextSize,
     _In_ AWQ_PRIORITY Priority,
@@ -464,208 +310,128 @@ AwqSubmitWithContext(
     );
 
 //
-// Submit a chain of work items
+// Submit a chain of items. Each item executes sequentially — the
+// next item is enqueued only when the previous one succeeds. On
+// failure, remaining chain items are cleaned up. Returns the ID
+// of the first item in ChainId.
 //
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqSubmitChain(
-    _In_ PAWQ_MANAGER Manager,
-    _In_reads_(Count) AWQ_WORK_CALLBACK* Callbacks,
-    _In_reads_opt_(Count) PVOID* Contexts,
-    _In_reads_opt_(Count) ULONG* ContextSizes,
+    _In_ HAWQ_MANAGER Handle,
+    _In_reads_(Count) PAWQ_WORK_CALLBACK *Callbacks,
+    _In_reads_opt_(Count) PVOID *Contexts,
+    _In_reads_opt_(Count) ULONG *ContextSizes,
     _In_ ULONG Count,
     _In_ AWQ_PRIORITY Priority,
     _Out_opt_ PULONG64 ChainId
     );
 
-//=============================================================================
-// Public API - Work Item Management
-//=============================================================================
+// ============================================================================
+// Public API — Item Management
+// ============================================================================
 
-//
-// Cancel a work item by ID
-//
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqCancel(
-    _In_ PAWQ_MANAGER Manager,
+    _In_ HAWQ_MANAGER Handle,
     _In_ ULONG64 ItemId
     );
 
-//
-// Cancel all items with serialization key
-//
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqCancelByKey(
-    _In_ PAWQ_MANAGER Manager,
+    _In_ HAWQ_MANAGER Handle,
     _In_ ULONG64 SerializationKey
     );
 
 //
-// Wait for a specific item to complete
+// Wait for a specific item to complete. The item's completion
+// status is returned in *ItemStatus. Returns STATUS_NOT_FOUND
+// if the item has already been completed and reclaimed.
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqWaitForItem(
-    _In_ PAWQ_MANAGER Manager,
+    _In_ HAWQ_MANAGER Handle,
     _In_ ULONG64 ItemId,
     _In_ ULONG TimeoutMs,
     _Out_opt_ PNTSTATUS ItemStatus
     );
 
-//
-// Wait for all items with key to complete
-//
-NTSTATUS
-AwqWaitForKey(
-    _In_ PAWQ_MANAGER Manager,
-    _In_ ULONG64 SerializationKey,
-    _In_ ULONG TimeoutMs
-    );
-
-//
-// Get item status
-//
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqGetItemStatus(
-    _In_ PAWQ_MANAGER Manager,
+    _In_ HAWQ_MANAGER Handle,
     _In_ ULONG64 ItemId,
-    _Out_ PAWQ_ITEM_STATE State,
+    _Out_ AWQ_ITEM_STATE *State,
     _Out_opt_ PNTSTATUS CompletionStatus
     );
 
-//=============================================================================
-// Public API - Thread Management
-//=============================================================================
+// ============================================================================
+// Public API — Thread Pool
+// ============================================================================
 
-//
-// Adjust thread pool size
-//
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqSetThreadCount(
-    _Inout_ PAWQ_MANAGER Manager,
+    _In_ HAWQ_MANAGER Handle,
     _In_ ULONG MinThreads,
     _In_ ULONG MaxThreads
     );
 
-//
-// Get current thread count
-//
-VOID
-AwqGetThreadCount(
-    _In_ PAWQ_MANAGER Manager,
-    _Out_ PULONG Current,
-    _Out_ PULONG Idle,
-    _Out_ PULONG Active
-    );
+// ============================================================================
+// Public API — Statistics & Configuration
+// ============================================================================
 
-//=============================================================================
-// Public API - Statistics
-//=============================================================================
-
-typedef struct _AWQ_STATISTICS {
-    //
-    // Queue state
-    //
-    AWQ_QUEUE_STATE State;
-    
-    //
-    // Item counts
-    //
-    ULONG64 TotalSubmitted;
-    ULONG64 TotalCompleted;
-    ULONG64 TotalCancelled;
-    ULONG64 TotalFailed;
-    ULONG64 TotalRetries;
-    ULONG64 TotalTimeouts;
-    
-    //
-    // Queue depths
-    //
-    ULONG PendingItems[AwqPriority_Max];
-    ULONG TotalPending;
-    ULONG PeakPending;
-    
-    //
-    // Thread pool
-    //
-    ULONG WorkerCount;
-    ULONG IdleWorkers;
-    ULONG ActiveWorkers;
-    
-    //
-    // Timing
-    //
-    LARGE_INTEGER UpTime;
-    ULONG64 AverageWaitTimeUs;
-    ULONG64 AverageProcessTimeUs;
-    ULONG64 ItemsPerSecond;
-    
-    //
-    // Per-priority breakdown
-    //
-    struct {
-        ULONG64 Submitted;
-        ULONG64 Completed;
-        ULONG Pending;
-    } PerPriority[AwqPriority_Max];
-    
-} AWQ_STATISTICS, *PAWQ_STATISTICS;
-
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqGetStatistics(
-    _In_ PAWQ_MANAGER Manager,
+    _In_ HAWQ_MANAGER Handle,
     _Out_ PAWQ_STATISTICS Stats
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 AwqResetStatistics(
-    _Inout_ PAWQ_MANAGER Manager
+    _In_ HAWQ_MANAGER Handle
     );
 
-//=============================================================================
-// Public API - Configuration
-//=============================================================================
-
-//
-// Set default timeout
-//
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqSetDefaultTimeout(
-    _Inout_ PAWQ_MANAGER Manager,
+    _In_ HAWQ_MANAGER Handle,
     _In_ ULONG TimeoutMs
     );
 
-//
-// Enable/disable work stealing
-//
-NTSTATUS
-AwqSetWorkStealing(
-    _Inout_ PAWQ_MANAGER Manager,
-    _In_ BOOLEAN Enable
-    );
-
-//
-// Enable/disable dynamic thread scaling
-//
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 AwqSetDynamicThreads(
-    _Inout_ PAWQ_MANAGER Manager,
+    _In_ HAWQ_MANAGER Handle,
     _In_ BOOLEAN Enable
     );
 
-//=============================================================================
-// Helper Macros
-//=============================================================================
+// ============================================================================
+// Convenience Macros
+// ============================================================================
 
-//
-// Quick submit for common cases
-//
-#define AwqSubmitNormal(Manager, Callback, Context, Size) \
-    AwqSubmitWithContext(Manager, Callback, Context, Size, AwqPriority_Normal, NULL)
+#define AwqSubmitNormal(h, cb, ctx, sz) \
+    AwqSubmitWithContext((h), (cb), (ctx), (sz), AwqPriority_Normal, NULL)
 
-#define AwqSubmitHigh(Manager, Callback, Context, Size) \
-    AwqSubmitWithContext(Manager, Callback, Context, Size, AwqPriority_High, NULL)
+#define AwqSubmitHigh(h, cb, ctx, sz) \
+    AwqSubmitWithContext((h), (cb), (ctx), (sz), AwqPriority_High, NULL)
 
-#define AwqSubmitCritical(Manager, Callback, Context, Size) \
-    AwqSubmitWithContext(Manager, Callback, Context, Size, AwqPriority_Critical, NULL)
+#define AwqSubmitCritical(h, cb, ctx, sz) \
+    AwqSubmitWithContext((h), (cb), (ctx), (sz), AwqPriority_Critical, NULL)
 
 #ifdef __cplusplus
 }

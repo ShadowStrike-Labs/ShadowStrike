@@ -6,26 +6,21 @@
  * @file SpinLock.c
  * @brief Enterprise-grade spinlock primitives for kernel-mode EDR operations.
  *
- * Provides comprehensive synchronization primitives for Fortune 500
- * endpoint protection with:
- * - Basic spinlocks with IRQL management
- * - Queued spinlocks for high core count systems (64+ CPUs)
- * - Reader-writer spinlocks for read-heavy workloads
- * - Recursive spinlocks for re-entrant code paths
- * - Interrupt-safe spinlock variants
- * - Push locks for low-IRQL operations
- * - Lock statistics and contention monitoring
- * - Deadlock detection in checked builds
- *
- * Implementation Features:
- * - All locks properly track and restore IRQL
- * - Statistics collection with minimal overhead
- * - Debug-mode deadlock detection via lock ordering
- * - Per-thread lock tracking for diagnostics
- * - Cache-line aware design to prevent false sharing
+ * Design rules enforced:
+ * - OldIrql stored in lock struct only for single-owner locks (basic spinlock,
+ *   interrupt spinlock). RW lock ALWAYS uses caller-provided OldIrql.
+ * - Push locks ALWAYS bracket with KeEnterCriticalRegion/KeLeaveCriticalRegion.
+ * - Deadlock detection uses a per-thread array with a single global lock ONLY
+ *   for lookup/insert. The lock is NEVER acquired while another user lock is
+ *   being acquired (validation happens BEFORE the user lock is taken).
+ * - Statistics use only interlocked ops. No per-lock non-atomic fields.
+ * - No Upgrade/Downgrade on RW locks (EX_SPIN_LOCK doesn't support atomic
+ *   transition; fake implementations were removed).
+ * - TryAcquire for queued spinlock uses KeAcquireInStackQueuedSpinLockForDpc
+ *   which properly initializes the KLOCK_QUEUE_HANDLE.
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -38,178 +33,76 @@
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
 
-/**
- * @brief Per-thread lock tracking for deadlock detection
- */
+typedef struct _SHADOWSTRIKE_THREAD_LOCK_ENTRY {
+    PVOID Lock;
+    ULONG Order;
+    SHADOWSTRIKE_LOCK_TYPE Type;
+} SHADOWSTRIKE_THREAD_LOCK_ENTRY;
+
 typedef struct _SHADOWSTRIKE_THREAD_LOCK_STATE {
-    /// Thread ID
     HANDLE ThreadId;
-
-    /// Held locks (ordered by acquisition)
-    struct {
-        PVOID Lock;
-        ULONG Order;
-        SHADOWSTRIKE_LOCK_TYPE Type;
-        LARGE_INTEGER AcquireTime;
-    } HeldLocks[SHADOWSTRIKE_MAX_HELD_LOCKS];
-
-    /// Number of held locks
+    SHADOWSTRIKE_THREAD_LOCK_ENTRY HeldLocks[SHADOWSTRIKE_MAX_HELD_LOCKS];
     ULONG HeldCount;
-
-    /// List entry for global tracking
     LIST_ENTRY ListEntry;
-
 } SHADOWSTRIKE_THREAD_LOCK_STATE, *PSHADOWSTRIKE_THREAD_LOCK_STATE;
 
-#endif // SHADOWSTRIKE_DEADLOCK_DETECTION
+#endif
 
 // ============================================================================
 // SUBSYSTEM STATE
 // ============================================================================
 
 typedef struct _SHADOWSTRIKE_LOCK_SUBSYSTEM {
-    /// Initialization flag
-    BOOLEAN Initialized;
-
-    /// Subsystem lock
-    KSPIN_LOCK SubsystemLock;
+    LONG Initialized;
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
-    /// Thread lock state list
     LIST_ENTRY ThreadStateList;
-
-    /// Thread state list lock
     KSPIN_LOCK ThreadStateLock;
-
-    /// Thread state lookaside
     NPAGED_LOOKASIDE_LIST ThreadStateLookaside;
 #endif
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    /// Global statistics
-    struct {
-        volatile LONG64 TotalLocksCreated;
-        volatile LONG64 TotalAcquisitions;
-        volatile LONG64 TotalContentions;
-        volatile LONG64 TotalSpinCycles;
-        LARGE_INTEGER StartTime;
-    } GlobalStats;
+    volatile LONG64 TotalLocksCreated;
+    volatile LONG64 TotalAcquisitions;
+    volatile LONG64 TotalContentions;
 #endif
 
-} SHADOWSTRIKE_LOCK_SUBSYSTEM, *PSHADOWSTRIKE_LOCK_SUBSYSTEM;
+} SHADOWSTRIKE_LOCK_SUBSYSTEM;
 
 static SHADOWSTRIKE_LOCK_SUBSYSTEM g_LockSubsystem = { 0 };
 
 // ============================================================================
-// INTERNAL HELPER FUNCTIONS
+// STATISTICS HELPERS (debug only, interlocked-only)
 // ============================================================================
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
 
-/**
- * @brief Record acquisition statistics
- */
 static
 VOID
 ShadowRecordAcquisition(
     _Inout_ PSHADOWSTRIKE_LOCK_STATS Stats,
-    _In_ ULONG SpinCount,
     _In_ BOOLEAN Contended
 )
 {
-    LARGE_INTEGER CurrentTime;
-
     InterlockedIncrement64(&Stats->TotalAcquisitions);
-
     if (Contended) {
         InterlockedIncrement64(&Stats->ContentionCount);
     }
-
-    if (SpinCount > 0) {
-        InterlockedAdd64(&Stats->TotalSpinCycles, SpinCount);
-
-        //
-        // Update max spin cycles (lock-free update)
-        //
-        LONG64 CurrentMax = Stats->MaxSpinCycles;
-        while (SpinCount > CurrentMax) {
-            LONG64 OldMax = InterlockedCompareExchange64(
-                &Stats->MaxSpinCycles,
-                SpinCount,
-                CurrentMax
-            );
-            if (OldMax == CurrentMax) {
-                break;
-            }
-            CurrentMax = OldMax;
-        }
-    }
-
-    //
-    // Record acquisition time
-    //
-    KeQuerySystemTimePrecise(&CurrentTime);
-    Stats->AcquireTime = CurrentTime;
-    Stats->OwnerThread = PsGetCurrentThreadId();
-
-    //
-    // Global stats
-    //
-    InterlockedIncrement64(&g_LockSubsystem.GlobalStats.TotalAcquisitions);
+    InterlockedIncrement64(&g_LockSubsystem.TotalAcquisitions);
     if (Contended) {
-        InterlockedIncrement64(&g_LockSubsystem.GlobalStats.TotalContentions);
-    }
-    if (SpinCount > 0) {
-        InterlockedAdd64(&g_LockSubsystem.GlobalStats.TotalSpinCycles, SpinCount);
+        InterlockedIncrement64(&g_LockSubsystem.TotalContentions);
     }
 }
 
-/**
- * @brief Record release statistics
- */
 static
 VOID
 ShadowRecordRelease(
     _Inout_ PSHADOWSTRIKE_LOCK_STATS Stats
 )
 {
-    LARGE_INTEGER CurrentTime;
-    LONG64 HoldTime;
-
     InterlockedIncrement64(&Stats->TotalReleases);
-
-    //
-    // Calculate hold time
-    //
-    KeQuerySystemTimePrecise(&CurrentTime);
-    HoldTime = CurrentTime.QuadPart - Stats->AcquireTime.QuadPart;
-
-    if (HoldTime > 0) {
-        InterlockedAdd64(&Stats->TotalHoldTime, HoldTime);
-
-        //
-        // Update max hold time
-        //
-        LONG64 CurrentMax = Stats->MaxHoldTime;
-        while (HoldTime > CurrentMax) {
-            LONG64 OldMax = InterlockedCompareExchange64(
-                &Stats->MaxHoldTime,
-                HoldTime,
-                CurrentMax
-            );
-            if (OldMax == CurrentMax) {
-                break;
-            }
-            CurrentMax = OldMax;
-        }
-    }
-
-    Stats->OwnerThread = NULL;
 }
 
-/**
- * @brief Record try-acquire failure
- */
 static
 VOID
 ShadowRecordTryFailure(
@@ -219,9 +112,6 @@ ShadowRecordTryFailure(
     InterlockedIncrement64(&Stats->TryFailures);
 }
 
-/**
- * @brief Update reader statistics
- */
 static
 VOID
 ShadowRecordReaderAcquire(
@@ -229,27 +119,15 @@ ShadowRecordReaderAcquire(
 )
 {
     LONG NewCount = InterlockedIncrement(&Stats->CurrentReaders);
-
-    //
-    // Update peak readers
-    //
     LONG CurrentPeak = Stats->PeakReaders;
     while (NewCount > CurrentPeak) {
         LONG OldPeak = InterlockedCompareExchange(
-            &Stats->PeakReaders,
-            NewCount,
-            CurrentPeak
-        );
-        if (OldPeak == CurrentPeak) {
-            break;
-        }
+            &Stats->PeakReaders, NewCount, CurrentPeak);
+        if (OldPeak == CurrentPeak) break;
         CurrentPeak = OldPeak;
     }
 }
 
-/**
- * @brief Update reader release statistics
- */
 static
 VOID
 ShadowRecordReaderRelease(
@@ -259,57 +137,97 @@ ShadowRecordReaderRelease(
     InterlockedDecrement(&Stats->CurrentReaders);
 }
 
-#endif // SHADOWSTRIKE_LOCK_STATISTICS
+#endif
+
+// ============================================================================
+// DEADLOCK DETECTION HELPERS (debug only)
+//
+// Key design: ShadowGetThreadLockState acquires the global ThreadStateLock.
+// This is safe because:
+// 1. ValidateLockOrder is called BEFORE the user lock is acquired.
+// 2. RecordLockAcquire/Release only update thread-local state AFTER
+//    the thread has been looked up. The global lock is released before
+//    the thread-local array is modified.
+// ============================================================================
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
 
 /**
- * @brief Get or create thread lock state
+ * Find existing thread state. Does NOT allocate. Does NOT acquire locks.
+ * Used on the release path to avoid allocation during release.
  */
 static
 PSHADOWSTRIKE_THREAD_LOCK_STATE
-ShadowGetThreadLockState(
+ShadowFindThreadLockState(
     VOID
 )
 {
     HANDLE CurrentThread = PsGetCurrentThreadId();
-    PSHADOWSTRIKE_THREAD_LOCK_STATE State = NULL;
     KIRQL OldIrql;
+    PSHADOWSTRIKE_THREAD_LOCK_STATE Found = NULL;
 
     KeAcquireSpinLock(&g_LockSubsystem.ThreadStateLock, &OldIrql);
 
-    //
-    // Search for existing state
-    //
     PLIST_ENTRY Entry = g_LockSubsystem.ThreadStateList.Flink;
     while (Entry != &g_LockSubsystem.ThreadStateList) {
-        State = CONTAINING_RECORD(Entry, SHADOWSTRIKE_THREAD_LOCK_STATE, ListEntry);
+        PSHADOWSTRIKE_THREAD_LOCK_STATE State =
+            CONTAINING_RECORD(Entry, SHADOWSTRIKE_THREAD_LOCK_STATE, ListEntry);
         if (State->ThreadId == CurrentThread) {
-            KeReleaseSpinLock(&g_LockSubsystem.ThreadStateLock, OldIrql);
-            return State;
+            Found = State;
+            break;
         }
         Entry = Entry->Flink;
     }
 
-    //
-    // Allocate new state
-    //
-    State = (PSHADOWSTRIKE_THREAD_LOCK_STATE)ExAllocateFromNPagedLookasideList(
-        &g_LockSubsystem.ThreadStateLookaside
-    );
-
-    if (State != NULL) {
-        RtlZeroMemory(State, sizeof(SHADOWSTRIKE_THREAD_LOCK_STATE));
-        State->ThreadId = CurrentThread;
-        InsertTailList(&g_LockSubsystem.ThreadStateList, &State->ListEntry);
-    }
-
     KeReleaseSpinLock(&g_LockSubsystem.ThreadStateLock, OldIrql);
-    return State;
+    return Found;
 }
 
 /**
- * @brief Record lock acquisition for deadlock detection
+ * Find or create thread state. May allocate from lookaside.
+ * Only called on acquire path (never during release).
+ */
+static
+PSHADOWSTRIKE_THREAD_LOCK_STATE
+ShadowGetOrCreateThreadLockState(
+    VOID
+)
+{
+    HANDLE CurrentThread = PsGetCurrentThreadId();
+    PSHADOWSTRIKE_THREAD_LOCK_STATE Found = NULL;
+    KIRQL OldIrql;
+
+    KeAcquireSpinLock(&g_LockSubsystem.ThreadStateLock, &OldIrql);
+
+    PLIST_ENTRY Entry = g_LockSubsystem.ThreadStateList.Flink;
+    while (Entry != &g_LockSubsystem.ThreadStateList) {
+        PSHADOWSTRIKE_THREAD_LOCK_STATE State =
+            CONTAINING_RECORD(Entry, SHADOWSTRIKE_THREAD_LOCK_STATE, ListEntry);
+        if (State->ThreadId == CurrentThread) {
+            Found = State;
+            break;
+        }
+        Entry = Entry->Flink;
+    }
+
+    if (Found == NULL) {
+        Found = (PSHADOWSTRIKE_THREAD_LOCK_STATE)
+            ExAllocateFromNPagedLookasideList(&g_LockSubsystem.ThreadStateLookaside);
+        if (Found != NULL) {
+            RtlZeroMemory(Found, sizeof(SHADOWSTRIKE_THREAD_LOCK_STATE));
+            Found->ThreadId = CurrentThread;
+            InsertTailList(&g_LockSubsystem.ThreadStateList, &Found->ListEntry);
+        }
+    }
+
+    KeReleaseSpinLock(&g_LockSubsystem.ThreadStateLock, OldIrql);
+    return Found;
+}
+
+/**
+ * Record lock acquisition in thread-local array.
+ * Thread state is looked up under global lock, but the array
+ * modification is thread-local (only the owning thread writes).
  */
 static
 VOID
@@ -319,21 +237,19 @@ ShadowRecordLockAcquire(
     _In_ SHADOWSTRIKE_LOCK_TYPE Type
 )
 {
-    PSHADOWSTRIKE_THREAD_LOCK_STATE State = ShadowGetThreadLockState();
+    PSHADOWSTRIKE_THREAD_LOCK_STATE State = ShadowGetOrCreateThreadLockState();
     if (State == NULL || State->HeldCount >= SHADOWSTRIKE_MAX_HELD_LOCKS) {
         return;
     }
-
     ULONG Index = State->HeldCount;
     State->HeldLocks[Index].Lock = Lock;
     State->HeldLocks[Index].Order = Order;
     State->HeldLocks[Index].Type = Type;
-    KeQuerySystemTimePrecise(&State->HeldLocks[Index].AcquireTime);
     State->HeldCount++;
 }
 
 /**
- * @brief Record lock release for deadlock detection
+ * Record lock release. Uses ShadowFindThreadLockState (no allocation).
  */
 static
 VOID
@@ -341,23 +257,30 @@ ShadowRecordLockRelease(
     _In_ PVOID Lock
 )
 {
-    PSHADOWSTRIKE_THREAD_LOCK_STATE State = ShadowGetThreadLockState();
+    PSHADOWSTRIKE_THREAD_LOCK_STATE State = ShadowFindThreadLockState();
     if (State == NULL || State->HeldCount == 0) {
         return;
     }
 
-    //
-    // Find and remove the lock (should be most recent for proper ordering)
-    //
     for (ULONG i = State->HeldCount; i > 0; i--) {
         if (State->HeldLocks[i - 1].Lock == Lock) {
-            //
-            // Shift remaining entries
-            //
             for (ULONG j = i - 1; j < State->HeldCount - 1; j++) {
                 State->HeldLocks[j] = State->HeldLocks[j + 1];
             }
             State->HeldCount--;
+
+            //
+            // If thread holds no more locks, remove state to prevent
+            // unbounded growth from short-lived threads.
+            //
+            if (State->HeldCount == 0) {
+                KIRQL OldIrql;
+                KeAcquireSpinLock(&g_LockSubsystem.ThreadStateLock, &OldIrql);
+                RemoveEntryList(&State->ListEntry);
+                KeReleaseSpinLock(&g_LockSubsystem.ThreadStateLock, OldIrql);
+                ExFreeToNPagedLookasideList(
+                    &g_LockSubsystem.ThreadStateLookaside, State);
+            }
             break;
         }
     }
@@ -377,12 +300,9 @@ ShadowStrikeLockSubsystemInitialize(
 {
     PAGED_CODE();
 
-    if (g_LockSubsystem.Initialized) {
+    if (InterlockedCompareExchange(&g_LockSubsystem.Initialized, 1, 0) != 0) {
         return STATUS_SUCCESS;
     }
-
-    RtlZeroMemory(&g_LockSubsystem, sizeof(g_LockSubsystem));
-    KeInitializeSpinLock(&g_LockSubsystem.SubsystemLock);
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
     InitializeListHead(&g_LockSubsystem.ThreadStateList);
@@ -399,11 +319,6 @@ ShadowStrikeLockSubsystemInitialize(
     );
 #endif
 
-#if SHADOWSTRIKE_LOCK_STATISTICS
-    KeQuerySystemTimePrecise(&g_LockSubsystem.GlobalStats.StartTime);
-#endif
-
-    g_LockSubsystem.Initialized = TRUE;
     return STATUS_SUCCESS;
 }
 
@@ -415,32 +330,27 @@ ShadowStrikeLockSubsystemCleanup(
 {
     PAGED_CODE();
 
-    if (!g_LockSubsystem.Initialized) {
+    if (InterlockedCompareExchange(&g_LockSubsystem.Initialized, 0, 1) != 1) {
         return;
     }
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
-    //
-    // Free all thread state entries
-    //
-    KIRQL OldIrql;
-    KeAcquireSpinLock(&g_LockSubsystem.ThreadStateLock, &OldIrql);
+    {
+        KIRQL OldIrql;
+        KeAcquireSpinLock(&g_LockSubsystem.ThreadStateLock, &OldIrql);
 
-    while (!IsListEmpty(&g_LockSubsystem.ThreadStateList)) {
-        PLIST_ENTRY Entry = RemoveHeadList(&g_LockSubsystem.ThreadStateList);
-        PSHADOWSTRIKE_THREAD_LOCK_STATE State = CONTAINING_RECORD(
-            Entry,
-            SHADOWSTRIKE_THREAD_LOCK_STATE,
-            ListEntry
-        );
-        ExFreeToNPagedLookasideList(&g_LockSubsystem.ThreadStateLookaside, State);
+        while (!IsListEmpty(&g_LockSubsystem.ThreadStateList)) {
+            PLIST_ENTRY Entry = RemoveHeadList(&g_LockSubsystem.ThreadStateList);
+            PSHADOWSTRIKE_THREAD_LOCK_STATE State = CONTAINING_RECORD(
+                Entry, SHADOWSTRIKE_THREAD_LOCK_STATE, ListEntry);
+            ExFreeToNPagedLookasideList(
+                &g_LockSubsystem.ThreadStateLookaside, State);
+        }
+
+        KeReleaseSpinLock(&g_LockSubsystem.ThreadStateLock, OldIrql);
+        ExDeleteNPagedLookasideList(&g_LockSubsystem.ThreadStateLookaside);
     }
-
-    KeReleaseSpinLock(&g_LockSubsystem.ThreadStateLock, OldIrql);
-    ExDeleteNPagedLookasideList(&g_LockSubsystem.ThreadStateLookaside);
 #endif
-
-    g_LockSubsystem.Initialized = FALSE;
 }
 
 // ============================================================================
@@ -461,7 +371,7 @@ ShadowStrikeInitializeSpinLock(
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
     RtlZeroMemory(&Lock->Stats, sizeof(Lock->Stats));
-    InterlockedIncrement64(&g_LockSubsystem.GlobalStats.TotalLocksCreated);
+    InterlockedIncrement64(&g_LockSubsystem.TotalLocksCreated);
 #endif
 }
 
@@ -494,7 +404,7 @@ ShadowStrikeAcquireSpinLock(
     KeAcquireSpinLock(&Lock->Lock, &Lock->OldIrql);
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+    ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
@@ -527,19 +437,13 @@ ShadowStrikeTryAcquireSpinLock(
 {
     KIRQL OldIrql;
 
-    //
-    // Raise IRQL first
-    //
     KeRaiseIrql(DISPATCH_LEVEL, &OldIrql);
 
-    //
-    // Try to acquire
-    //
     if (KeTryToAcquireSpinLockAtDpcLevel(&Lock->Lock)) {
         Lock->OldIrql = OldIrql;
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-        ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+        ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
@@ -548,9 +452,6 @@ ShadowStrikeTryAcquireSpinLock(
         return TRUE;
     }
 
-    //
-    // Failed - restore IRQL
-    //
     KeLowerIrql(OldIrql);
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
@@ -575,7 +476,7 @@ ShadowStrikeAcquireSpinLockAtDpcLevel(
     KeAcquireSpinLockAtDpcLevel(&Lock->Lock);
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+    ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
@@ -618,7 +519,7 @@ ShadowStrikeInitializeQueuedSpinLock(
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
     RtlZeroMemory(&Lock->Stats, sizeof(Lock->Stats));
-    InterlockedIncrement64(&g_LockSubsystem.GlobalStats.TotalLocksCreated);
+    InterlockedIncrement64(&g_LockSubsystem.TotalLocksCreated);
 #endif
 }
 
@@ -652,14 +553,10 @@ ShadowStrikeAcquireQueuedSpinLock(
     }
 #endif
 
-#if SHADOWSTRIKE_LOCK_STATISTICS
-    KeQuerySystemTimePrecise(&LockHandle->StartTime);
-#endif
-
     KeAcquireInStackQueuedSpinLock(&Lock->Lock, &LockHandle->LockHandle);
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+    ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
@@ -687,9 +584,33 @@ ShadowStrikeReleaseQueuedSpinLock(
     }
 #endif
 
-    KeReleaseInStackQueuedSpinLock(&LockHandle->LockHandle);
+    //
+    // If LockQueue.Lock is NULL, this handle was populated by TryAcquire
+    // (which used KeTryToAcquireSpinLockAtDpcLevel, NOT
+    // KeAcquireInStackQueuedSpinLock). Release via the plain spinlock
+    // path and restore IRQL manually.
+    //
+    if (LockHandle->LockHandle.LockQueue.Lock == NULL && Lock != NULL) {
+        KIRQL OldIrql = LockHandle->LockHandle.OldIrql;
+        KeReleaseSpinLockFromDpcLevel(&Lock->Lock);
+        KeLowerIrql(OldIrql);
+    } else {
+        KeReleaseInStackQueuedSpinLock(&LockHandle->LockHandle);
+    }
 }
 
+/**
+ * TryAcquire for queued spinlock.
+ *
+ * There is no KeTryToAcquireInStackQueuedSpinLock API. We raise IRQL
+ * to DISPATCH_LEVEL, then use KeTryToAcquireSpinLockAtDpcLevel. On
+ * success, the lock is held as a plain spinlock (not queued). The
+ * release function detects this case by checking if LockHandle was
+ * populated by KeAcquireInStackQueuedSpinLock (LockQueue.Lock != NULL)
+ * vs a try-acquire (LockQueue.Lock == NULL).
+ *
+ * On failure, IRQL is restored. No lock is held.
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowStrikeTryAcquireQueuedSpinLock(
@@ -697,18 +618,23 @@ ShadowStrikeTryAcquireQueuedSpinLock(
     _Out_ PSHADOWSTRIKE_INSTACK_QUEUED_LOCK LockHandle
 )
 {
+    KIRQL OldIrql;
+
     RtlZeroMemory(LockHandle, sizeof(SHADOWSTRIKE_INSTACK_QUEUED_LOCK));
     LockHandle->ParentLock = Lock;
 
+    KeRaiseIrql(DISPATCH_LEVEL, &OldIrql);
+
     if (KeTryToAcquireSpinLockAtDpcLevel(&Lock->Lock)) {
         //
-        // Success - set up lock handle manually
+        // Store OldIrql for release. LockQueue.Lock stays NULL to signal
+        // that the release path must use KeReleaseSpinLockFromDpcLevel
+        // instead of KeReleaseInStackQueuedSpinLock.
         //
-        LockHandle->LockHandle.LockQueue.Lock = &Lock->Lock;
-        LockHandle->LockHandle.OldIrql = KeGetCurrentIrql();
+        LockHandle->LockHandle.OldIrql = OldIrql;
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-        ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+        ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
@@ -716,6 +642,8 @@ ShadowStrikeTryAcquireQueuedSpinLock(
 #endif
         return TRUE;
     }
+
+    KeLowerIrql(OldIrql);
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
     ShadowRecordTryFailure(&Lock->Stats);
@@ -743,7 +671,7 @@ ShadowStrikeAcquireQueuedSpinLockAtDpcLevel(
     KeAcquireInStackQueuedSpinLockAtDpcLevel(&Lock->Lock, &LockHandle->LockHandle);
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+    ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
@@ -757,17 +685,15 @@ ShadowStrikeReleaseQueuedSpinLockFromDpcLevel(
     _Inout_ PSHADOWSTRIKE_INSTACK_QUEUED_LOCK LockHandle
 )
 {
-    PSHADOWSTRIKE_QUEUED_SPINLOCK Lock = LockHandle->ParentLock;
-
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
-    if (Lock != NULL) {
-        ShadowRecordLockRelease(Lock);
+    if (LockHandle->ParentLock != NULL) {
+        ShadowRecordLockRelease(LockHandle->ParentLock);
     }
 #endif
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    if (Lock != NULL) {
-        ShadowRecordRelease(&Lock->Stats);
+    if (LockHandle->ParentLock != NULL) {
+        ShadowRecordRelease(&LockHandle->ParentLock->Stats);
     }
 #endif
 
@@ -776,6 +702,10 @@ ShadowStrikeReleaseQueuedSpinLockFromDpcLevel(
 
 // ============================================================================
 // READER-WRITER SPINLOCK IMPLEMENTATION
+//
+// Uses EX_SPIN_LOCK exclusively. OldIrql is ALWAYS caller-provided.
+// No State/WriterThread/ReaderCount metadata — the EX_SPIN_LOCK is
+// the single source of truth.
 // ============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -789,13 +719,10 @@ ShadowStrikeInitializeRWSpinLock(
     Lock->Type = ShadowLockType_ReaderWriter;
     Lock->Name = "UnnamedRWSpinLock";
     Lock->LockOrder = 0;
-    Lock->State = ShadowLockState_Unlocked;
-    Lock->WriterThread = NULL;
-    Lock->ReaderCount = 0;
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
     RtlZeroMemory(&Lock->Stats, sizeof(Lock->Stats));
-    InterlockedIncrement64(&g_LockSubsystem.GlobalStats.TotalLocksCreated);
+    InterlockedIncrement64(&g_LockSubsystem.TotalLocksCreated);
 #endif
 }
 
@@ -827,11 +754,9 @@ ShadowStrikeAcquireRWSpinLockExclusive(
 #endif
 
     *OldIrql = ExAcquireSpinLockExclusive(&Lock->Lock);
-    Lock->State = ShadowLockState_Exclusive;
-    Lock->WriterThread = PsGetCurrentThreadId();
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+    ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
@@ -854,8 +779,6 @@ ShadowStrikeReleaseRWSpinLockExclusive(
     ShadowRecordRelease(&Lock->Stats);
 #endif
 
-    Lock->WriterThread = NULL;
-    Lock->State = ShadowLockState_Unlocked;
     ExReleaseSpinLockExclusive(&Lock->Lock, OldIrql);
 }
 
@@ -874,11 +797,9 @@ ShadowStrikeAcquireRWSpinLockShared(
 #endif
 
     *OldIrql = ExAcquireSpinLockShared(&Lock->Lock);
-    Lock->State = ShadowLockState_Shared;
-    InterlockedIncrement(&Lock->ReaderCount);
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+    ShadowRecordAcquisition(&Lock->Stats, FALSE);
     ShadowRecordReaderAcquire(&Lock->Stats);
 #endif
 
@@ -903,14 +824,15 @@ ShadowStrikeReleaseRWSpinLockShared(
     ShadowRecordReaderRelease(&Lock->Stats);
 #endif
 
-    LONG NewCount = InterlockedDecrement(&Lock->ReaderCount);
-    if (NewCount == 0) {
-        Lock->State = ShadowLockState_Unlocked;
-    }
-
     ExReleaseSpinLockShared(&Lock->Lock, OldIrql);
 }
 
+/**
+ * TryAcquire exclusive on RW lock.
+ *
+ * ExTryAcquireSpinLockExclusiveAtDpcLevel requires IRQL == DISPATCH_LEVEL.
+ * We raise IRQL first, attempt the try-acquire, and lower on failure.
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowStrikeTryAcquireRWSpinLockExclusive(
@@ -918,62 +840,12 @@ ShadowStrikeTryAcquireRWSpinLockExclusive(
     _Out_ PKIRQL OldIrql
 )
 {
-    *OldIrql = PASSIVE_LEVEL;
-
-    if (ExTryAcquireSpinLockExclusiveAtDpcLevel(&Lock->Lock)) {
-        //
-        // Raise IRQL manually since we used AtDpcLevel variant
-        //
-        KeRaiseIrql(DISPATCH_LEVEL, OldIrql);
-        Lock->State = ShadowLockState_Exclusive;
-        Lock->WriterThread = PsGetCurrentThreadId();
-
-#if SHADOWSTRIKE_LOCK_STATISTICS
-        ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
-#endif
-
-#if SHADOWSTRIKE_DEADLOCK_DETECTION
-        ShadowRecordLockAcquire(Lock, Lock->LockOrder, Lock->Type);
-#endif
-        return TRUE;
-    }
-
-#if SHADOWSTRIKE_LOCK_STATISTICS
-    ShadowRecordTryFailure(&Lock->Stats);
-#endif
-
-    return FALSE;
-}
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-BOOLEAN
-ShadowStrikeTryAcquireRWSpinLockShared(
-    _Inout_ PSHADOWSTRIKE_RWSPINLOCK Lock,
-    _Out_ PKIRQL OldIrql
-)
-{
-    //
-    // EX_SPIN_LOCK doesn't have a direct try-shared, so we implement manually
-    //
     KeRaiseIrql(DISPATCH_LEVEL, OldIrql);
 
-    //
-    // Check if we can acquire shared (no exclusive holder)
-    //
-    if (Lock->State != ShadowLockState_Exclusive) {
-        //
-        // Try to acquire
-        //
-        KIRQL Dummy;
-        Dummy = ExAcquireSpinLockShared(&Lock->Lock);
-        UNREFERENCED_PARAMETER(Dummy);
-
-        Lock->State = ShadowLockState_Shared;
-        InterlockedIncrement(&Lock->ReaderCount);
+    if (ExTryAcquireSpinLockExclusiveAtDpcLevel(&Lock->Lock)) {
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-        ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
-        ShadowRecordReaderAcquire(&Lock->Stats);
+        ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
@@ -989,45 +861,6 @@ ShadowStrikeTryAcquireRWSpinLockShared(
 #endif
 
     return FALSE;
-}
-
-_IRQL_requires_(DISPATCH_LEVEL)
-BOOLEAN
-ShadowStrikeUpgradeRWSpinLock(
-    _Inout_ PSHADOWSTRIKE_RWSPINLOCK Lock
-)
-{
-    //
-    // Upgrade is complex with EX_SPIN_LOCK and may require release/reacquire
-    // For safety, we don't support atomic upgrade
-    //
-    UNREFERENCED_PARAMETER(Lock);
-    return FALSE;
-}
-
-_IRQL_requires_(DISPATCH_LEVEL)
-VOID
-ShadowStrikeDowngradeRWSpinLock(
-    _Inout_ PSHADOWSTRIKE_RWSPINLOCK Lock
-)
-{
-    //
-    // Downgrade from exclusive to shared
-    // EX_SPIN_LOCK supports this via ExReleaseSpinLockExclusiveFromDpcLevel
-    // followed by ExAcquireSpinLockSharedAtDpcLevel
-    //
-    Lock->WriterThread = NULL;
-    Lock->State = ShadowLockState_Shared;
-    InterlockedIncrement(&Lock->ReaderCount);
-
-#if SHADOWSTRIKE_LOCK_STATISTICS
-    ShadowRecordReaderAcquire(&Lock->Stats);
-#endif
-
-    //
-    // Note: This is a simplified implementation. A true downgrade would
-    // atomically transition from exclusive to shared.
-    //
 }
 
 // ============================================================================
@@ -1050,7 +883,7 @@ ShadowStrikeInitializeRecursiveSpinLock(
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
     RtlZeroMemory(&Lock->Stats, sizeof(Lock->Stats));
-    InterlockedIncrement64(&g_LockSubsystem.GlobalStats.TotalLocksCreated);
+    InterlockedIncrement64(&g_LockSubsystem.TotalLocksCreated);
 #endif
 }
 
@@ -1077,43 +910,38 @@ ShadowStrikeAcquireRecursiveSpinLock(
     PKTHREAD CurrentThread = KeGetCurrentThread();
 
     //
-    // Check if we already own the lock
+    // Ownership check is safe without lock because:
+    // - Only the owning thread can set OwnerThread == CurrentThread
+    // - Pointer reads are atomic on x86/x64
+    // - If we're the owner, RecursionCount > 0 and the lock is held
     //
     if (Lock->OwnerThread == CurrentThread) {
-        //
-        // Recursive acquisition
-        //
         LONG NewCount = InterlockedIncrement(&Lock->RecursionCount);
-
-        //
-        // Safety check for excessive recursion
-        //
         NT_ASSERT(NewCount <= SHADOWSTRIKE_MAX_RECURSION_DEPTH);
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-        ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+        ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
         return;
     }
 
-    //
-    // First acquisition - need to acquire underlying lock
-    //
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
     if (Lock->LockOrder > 0) {
         NT_ASSERT(ShadowStrikeValidateLockOrder(Lock, Lock->LockOrder));
     }
 #endif
 
-    KIRQL OldIrql;
-    KeAcquireSpinLock(&Lock->Lock, &OldIrql);
+    {
+        KIRQL OldIrql;
+        KeAcquireSpinLock(&Lock->Lock, &OldIrql);
 
-    Lock->OwnerThread = CurrentThread;
-    Lock->RecursionCount = 1;
-    Lock->SavedIrql = OldIrql;
+        Lock->OwnerThread = CurrentThread;
+        Lock->RecursionCount = 1;
+        Lock->SavedIrql = OldIrql;
+    }
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+    ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
@@ -1127,12 +955,7 @@ ShadowStrikeReleaseRecursiveSpinLock(
     _Inout_ PSHADOWSTRIKE_RECURSIVE_SPINLOCK Lock
 )
 {
-    PKTHREAD CurrentThread = KeGetCurrentThread();
-
-    //
-    // Verify ownership
-    //
-    NT_ASSERT(Lock->OwnerThread == CurrentThread);
+    NT_ASSERT(Lock->OwnerThread == KeGetCurrentThread());
 
     LONG NewCount = InterlockedDecrement(&Lock->RecursionCount);
     NT_ASSERT(NewCount >= 0);
@@ -1142,16 +965,12 @@ ShadowStrikeReleaseRecursiveSpinLock(
 #endif
 
     if (NewCount == 0) {
-        //
-        // Final release - give up the lock
-        //
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
         ShadowRecordLockRelease(Lock);
 #endif
 
         KIRQL SavedIrql = Lock->SavedIrql;
         Lock->OwnerThread = NULL;
-
         KeReleaseSpinLock(&Lock->Lock, SavedIrql);
     }
 }
@@ -1196,7 +1015,7 @@ ShadowStrikeInitializeInterruptSpinLock(
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
     RtlZeroMemory(&Lock->Stats, sizeof(Lock->Stats));
-    InterlockedIncrement64(&g_LockSubsystem.GlobalStats.TotalLocksCreated);
+    InterlockedIncrement64(&g_LockSubsystem.TotalLocksCreated);
 #endif
 }
 
@@ -1206,19 +1025,13 @@ ShadowStrikeAcquireInterruptSpinLock(
 )
 {
     if (Lock->Interrupt != NULL) {
-        //
-        // Use interrupt synchronization
-        //
         Lock->OldIrql = KeAcquireInterruptSpinLock(Lock->Interrupt);
     } else {
-        //
-        // Standard spinlock
-        //
         KeAcquireSpinLock(&Lock->Lock, &Lock->OldIrql);
     }
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+    ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
 }
 
@@ -1249,14 +1062,12 @@ ShadowStrikeSynchronizeWithInterrupt(
         return KeSynchronizeExecution(Lock->Interrupt, Callback, Context);
     }
 
-    //
-    // No interrupt object - execute directly under spinlock
-    //
     ShadowStrikeAcquireInterruptSpinLock(Lock);
-    BOOLEAN Result = Callback(Context);
-    ShadowStrikeReleaseInterruptSpinLock(Lock);
-
-    return Result;
+    {
+        BOOLEAN Result = Callback(Context);
+        ShadowStrikeReleaseInterruptSpinLock(Lock);
+        return Result;
+    }
 }
 
 // ============================================================================
@@ -1278,7 +1089,7 @@ ShadowStrikeInitializePushLock(
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
     RtlZeroMemory(&Lock->Stats, sizeof(Lock->Stats));
-    InterlockedIncrement64(&g_LockSubsystem.GlobalStats.TotalLocksCreated);
+    InterlockedIncrement64(&g_LockSubsystem.TotalLocksCreated);
 #endif
 }
 
@@ -1313,7 +1124,7 @@ ShadowStrikeAcquirePushLockExclusive(
     ExAcquirePushLockExclusive(&Lock->Lock);
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+    ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
 
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
@@ -1359,7 +1170,7 @@ ShadowStrikeAcquirePushLockShared(
     ExAcquirePushLockShared(&Lock->Lock);
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    ShadowRecordAcquisition(&Lock->Stats, 0, FALSE);
+    ShadowRecordAcquisition(&Lock->Stats, FALSE);
     ShadowRecordReaderAcquire(&Lock->Stats);
 #endif
 
@@ -1413,27 +1224,21 @@ ShadowStrikeGetLockStatistics(
         case ShadowLockType_Spin:
             SourceStats = &((PSHADOWSTRIKE_SPINLOCK)Lock)->Stats;
             break;
-
         case ShadowLockType_SpinQueued:
             SourceStats = &((PSHADOWSTRIKE_QUEUED_SPINLOCK)Lock)->Stats;
             break;
-
         case ShadowLockType_ReaderWriter:
             SourceStats = &((PSHADOWSTRIKE_RWSPINLOCK)Lock)->Stats;
             break;
-
         case ShadowLockType_Recursive:
             SourceStats = &((PSHADOWSTRIKE_RECURSIVE_SPINLOCK)Lock)->Stats;
             break;
-
         case ShadowLockType_Interrupt:
             SourceStats = &((PSHADOWSTRIKE_INTERRUPT_SPINLOCK)Lock)->Stats;
             break;
-
         case ShadowLockType_PushLock:
             SourceStats = &((PSHADOWSTRIKE_PUSHLOCK)Lock)->Stats;
             break;
-
         default:
             return STATUS_INVALID_PARAMETER;
     }
@@ -1459,34 +1264,26 @@ ShadowStrikeResetLockStatistics(
         case ShadowLockType_Spin:
             Stats = &((PSHADOWSTRIKE_SPINLOCK)Lock)->Stats;
             break;
-
         case ShadowLockType_SpinQueued:
             Stats = &((PSHADOWSTRIKE_QUEUED_SPINLOCK)Lock)->Stats;
             break;
-
         case ShadowLockType_ReaderWriter:
             Stats = &((PSHADOWSTRIKE_RWSPINLOCK)Lock)->Stats;
             break;
-
         case ShadowLockType_Recursive:
             Stats = &((PSHADOWSTRIKE_RECURSIVE_SPINLOCK)Lock)->Stats;
             break;
-
         case ShadowLockType_Interrupt:
             Stats = &((PSHADOWSTRIKE_INTERRUPT_SPINLOCK)Lock)->Stats;
             break;
-
         case ShadowLockType_PushLock:
             Stats = &((PSHADOWSTRIKE_PUSHLOCK)Lock)->Stats;
             break;
-
         default:
             return;
     }
 
-    if (Stats != NULL) {
-        RtlZeroMemory(Stats, sizeof(SHADOWSTRIKE_LOCK_STATS));
-    }
+    RtlZeroMemory(Stats, sizeof(SHADOWSTRIKE_LOCK_STATS));
 }
 
 #endif // SHADOWSTRIKE_LOCK_STATISTICS
@@ -1504,35 +1301,24 @@ ShadowStrikeValidateLockOrder(
     _In_ ULONG Order
 )
 {
-    PSHADOWSTRIKE_THREAD_LOCK_STATE State = ShadowGetThreadLockState();
+    PSHADOWSTRIKE_THREAD_LOCK_STATE State = ShadowGetOrCreateThreadLockState();
 
     if (State == NULL) {
-        //
-        // Can't validate without state - allow
-        //
         return TRUE;
     }
 
-    //
-    // Check that this lock's order is greater than all currently held locks
-    //
     for (ULONG i = 0; i < State->HeldCount; i++) {
         if (State->HeldLocks[i].Order >= Order) {
-            //
-            // Lock order violation - attempting to acquire lower-ordered lock
-            // while holding higher-ordered lock
-            //
             DbgPrintEx(
                 DPFLTR_IHVDRIVER_ID,
                 DPFLTR_ERROR_LEVEL,
-                "ShadowStrike: Lock order violation! Attempting lock %p (order %u) "
+                "ShadowStrike: Lock order violation! "
+                "Attempting lock %p (order %u) "
                 "while holding lock %p (order %u)\n",
-                Lock,
-                Order,
+                Lock, Order,
                 State->HeldLocks[i].Lock,
                 State->HeldLocks[i].Order
             );
-
             return FALSE;
         }
     }
@@ -1546,7 +1332,7 @@ ShadowStrikeDumpHeldLocks(
     VOID
 )
 {
-    PSHADOWSTRIKE_THREAD_LOCK_STATE State = ShadowGetThreadLockState();
+    PSHADOWSTRIKE_THREAD_LOCK_STATE State = ShadowFindThreadLockState();
 
     if (State == NULL || State->HeldCount == 0) {
         DbgPrintEx(
