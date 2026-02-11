@@ -12,26 +12,21 @@
  * - Connection state machine with callback notifications
  * - Real-time flow statistics and bandwidth monitoring
  * - TLS/SSL metadata extraction and JA3 fingerprinting support
- * - Automatic stale connection cleanup via DPC timer
- * - Thread-safe reference counting for connection objects
+ * - Automatic stale connection cleanup via work-item-deferred timer
+ * - Deterministic reference counting — objects freed on last release
  * - Memory-efficient lookaside list allocations
  *
- * Performance Characteristics:
- * - O(1) lookup by flow ID (hash table)
- * - O(1) lookup by 5-tuple (hash table)
- * - Lock-free statistics updates (InterlockedXxx)
- * - Minimal lock contention via push locks
- * - Lookaside lists for connection/process allocations
- *
- * MITRE ATT&CK Coverage:
- * - T1071: Application Layer Protocol (connection profiling)
- * - T1095: Non-Application Layer Protocol
- * - T1571: Non-Standard Port
- * - T1572: Protocol Tunneling
- * - T1573: Encrypted Channel
+ * Lock Ordering Hierarchy (see ConnectionTracker.h):
+ *   1. ConnectionListLock
+ *   2. ConnectionHash.Lock
+ *   3. FlowHash.Lock
+ *   4. ProcessListLock
+ *   5. ProcessHash.Lock
+ *   6. CT_PROCESS_CONTEXT.ConnectionLock
+ *   7. CallbackLock
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition - Hardened)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -53,6 +48,7 @@
 #pragma alloc_text(PAGE, CtpCleanupStaleConnections)
 #pragma alloc_text(PAGE, CtpGetOrCreateProcessContext)
 #pragma alloc_text(PAGE, CtpResolveProcessInfo)
+#pragma alloc_text(PAGE, CtpCleanupWorkItemRoutine)
 #endif
 
 // ============================================================================
@@ -70,30 +66,21 @@
 // PRIVATE STRUCTURES
 // ============================================================================
 
-/**
- * @brief Flow hash entry for O(1) flow ID lookup.
- */
 typedef struct _CT_FLOW_HASH_ENTRY {
     LIST_ENTRY ListEntry;
     UINT64 FlowId;
     PCT_CONNECTION Connection;
 } CT_FLOW_HASH_ENTRY, *PCT_FLOW_HASH_ENTRY;
 
-/**
- * @brief Registered callback entry.
- */
 typedef struct _CT_CALLBACK_ENTRY {
     CT_CONNECTION_CALLBACK Callback;
     PVOID Context;
     BOOLEAN InUse;
 } CT_CALLBACK_ENTRY, *PCT_CALLBACK_ENTRY;
 
-/**
- * @brief Internal tracker state (extends public CT_TRACKER).
- */
 typedef struct _CT_TRACKER_INTERNAL {
     //
-    // Public structure (must be first)
+    // Public structure (must be first for CONTAINING_RECORD)
     //
     CT_TRACKER Public;
 
@@ -121,10 +108,12 @@ typedef struct _CT_TRACKER_INTERNAL {
     BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup state
+    // Cleanup infrastructure
     //
     volatile BOOLEAN CleanupTimerActive;
     volatile BOOLEAN ShuttingDown;
+    WORK_QUEUE_ITEM CleanupWorkQueueItem;
+    volatile LONG CleanupWorkItemPending;
 
 } CT_TRACKER_INTERNAL, *PCT_TRACKER_INTERNAL;
 
@@ -165,10 +154,16 @@ CtpReleaseProcessContext(
     );
 
 static VOID
+CtpFreeProcessContext(
+    _In_ PCT_TRACKER_INTERNAL Tracker,
+    _In_ PCT_PROCESS_CONTEXT Context
+    );
+
+static VOID
 CtpResolveProcessInfo(
     _In_ HANDLE ProcessId,
     _Out_ PUNICODE_STRING ProcessName,
-    _Out_ PUNICODE_STRING ProcessPath
+    _Out_opt_ PUNICODE_STRING ProcessPath
     );
 
 static VOID
@@ -178,7 +173,7 @@ CtpInsertConnection(
     );
 
 static VOID
-CtpRemoveConnection(
+CtpRemoveConnectionFromLists(
     _In_ PCT_TRACKER_INTERNAL Tracker,
     _In_ PCT_CONNECTION Connection
     );
@@ -207,6 +202,11 @@ CtpCleanupTimerDpc(
     );
 
 static VOID
+CtpCleanupWorkItemRoutine(
+    _In_ PVOID Parameter
+    );
+
+static VOID
 CtpCleanupStaleConnections(
     _In_ PCT_TRACKER_INTERNAL Tracker
     );
@@ -220,13 +220,6 @@ NTSTATUS
 CtInitialize(
     _Out_ PCT_TRACKER* Tracker
     )
-/**
- * @brief Initialize the connection tracker subsystem.
- *
- * Allocates and initializes all data structures required for
- * connection tracking including hash tables, lookaside lists,
- * and cleanup timer.
- */
 {
     NTSTATUS status = STATUS_SUCCESS;
     PCT_TRACKER_INTERNAL tracker = NULL;
@@ -242,7 +235,7 @@ CtInitialize(
     *Tracker = NULL;
 
     //
-    // Allocate tracker structure
+    // Allocate tracker structure from NonPagedPoolNx
     //
     tracker = (PCT_TRACKER_INTERNAL)ExAllocatePoolZero(
         NonPagedPoolNx,
@@ -353,11 +346,18 @@ CtInitialize(
     tracker->LookasideInitialized = TRUE;
 
     //
-    // Initialize cleanup timer
+    // Initialize cleanup timer and work item.
+    // The DPC only queues a work item; all real work runs at PASSIVE_LEVEL.
     //
     KeInitializeTimer(&tracker->Public.CleanupTimer);
     KeInitializeDpc(&tracker->Public.CleanupDpc, CtpCleanupTimerDpc, tracker);
     tracker->Public.CleanupIntervalMs = CT_CONNECTION_TIMEOUT_MS / 2;
+    tracker->CleanupWorkItemPending = 0;
+    ExInitializeWorkItem(
+        &tracker->CleanupWorkQueueItem,
+        CtpCleanupWorkItemRoutine,
+        tracker
+    );
 
     //
     // Set default configuration
@@ -391,6 +391,11 @@ CtInitialize(
 
 Cleanup:
     if (tracker != NULL) {
+        if (tracker->LookasideInitialized) {
+            ExDeleteNPagedLookasideList(&tracker->ConnectionLookaside);
+            ExDeleteNPagedLookasideList(&tracker->ProcessContextLookaside);
+            ExDeleteNPagedLookasideList(&tracker->FlowHashLookaside);
+        }
         if (tracker->Public.ConnectionHash.Buckets != NULL) {
             ExFreePoolWithTag(tracker->Public.ConnectionHash.Buckets, CT_POOL_TAG_CONN);
         }
@@ -408,12 +413,6 @@ VOID
 CtShutdown(
     _Inout_ PCT_TRACKER Tracker
     )
-/**
- * @brief Shutdown and cleanup the connection tracker.
- *
- * Cancels cleanup timer, releases all connections and
- * process contexts, frees all allocated memory.
- */
 {
     PCT_TRACKER_INTERNAL tracker;
     PLIST_ENTRY entry;
@@ -427,23 +426,35 @@ CtShutdown(
     }
 
     tracker = CONTAINING_RECORD(Tracker, CT_TRACKER_INTERNAL, Public);
-    tracker->ShuttingDown = TRUE;
 
     //
-    // Cancel cleanup timer
+    // Signal shutdown — prevents DPC/work item from doing more work
+    //
+    tracker->ShuttingDown = TRUE;
+    MemoryBarrier();
+
+    //
+    // Cancel cleanup timer and flush pending DPCs
     //
     if (tracker->CleanupTimerActive) {
         KeCancelTimer(&Tracker->CleanupTimer);
         tracker->CleanupTimerActive = FALSE;
     }
-
-    //
-    // Wait for any pending DPCs to complete
-    //
     KeFlushQueuedDpcs();
 
     //
-    // Free all connections
+    // Wait for any pending cleanup work item to drain.
+    // After KeFlushQueuedDpcs, no new DPC will fire, so the work item
+    // counter can only be 0 or actively running. We spin briefly.
+    //
+    while (InterlockedCompareExchange(&tracker->CleanupWorkItemPending, 0, 0) != 0) {
+        LARGE_INTEGER delay;
+        delay.QuadPart = -10000; // 1ms
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
+
+    //
+    // Free all connections — remove from all lists first
     //
     ExAcquirePushLockExclusive(&Tracker->ConnectionListLock);
 
@@ -452,20 +463,19 @@ CtShutdown(
         connection = CONTAINING_RECORD(entry, CT_CONNECTION, GlobalListEntry);
 
         //
-        // Free connection resources
+        // Mark as removed so CtpFreeConnection doesn't try to unlink again
         //
-        if (connection->ProcessName.Buffer != NULL) {
-            ExFreePoolWithTag(connection->ProcessName.Buffer, CT_POOL_TAG_CONN);
-        }
-        if (connection->ProcessPath.Buffer != NULL) {
-            ExFreePoolWithTag(connection->ProcessPath.Buffer, CT_POOL_TAG_CONN);
+        InterlockedOr(&connection->Flags, CtFlag_RemovedFromLists);
+
+        //
+        // Release process context reference held by this connection
+        //
+        if (connection->ProcessContextRef != NULL) {
+            CtpReleaseProcessContext(tracker, connection->ProcessContextRef);
+            connection->ProcessContextRef = NULL;
         }
 
-        if (tracker->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&tracker->ConnectionLookaside, connection);
-        } else {
-            ExFreePoolWithTag(connection, CT_POOL_TAG_CONN);
-        }
+        CtpFreeConnection(tracker, connection);
     }
 
     ExReleasePushLockExclusive(&Tracker->ConnectionListLock);
@@ -477,23 +487,31 @@ CtShutdown(
 
     while (!IsListEmpty(&Tracker->ProcessList)) {
         entry = RemoveHeadList(&Tracker->ProcessList);
-        processCtx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, ListEntry);
+        processCtx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, GlobalListEntry);
 
-        if (processCtx->ProcessName.Buffer != NULL) {
-            ExFreePoolWithTag(processCtx->ProcessName.Buffer, CT_POOL_TAG_PROC);
-        }
-
-        if (tracker->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&tracker->ProcessContextLookaside, processCtx);
-        } else {
-            ExFreePoolWithTag(processCtx, CT_POOL_TAG_PROC);
-        }
+        CtpFreeProcessContext(tracker, processCtx);
     }
 
     ExReleasePushLockExclusive(&Tracker->ProcessListLock);
 
     //
-    // Free hash tables
+    // Free flow hash entries
+    //
+    {
+        ULONG i;
+        ExAcquirePushLockExclusive(&Tracker->FlowHash.Lock);
+        for (i = 0; i < Tracker->FlowHash.BucketCount; i++) {
+            while (!IsListEmpty(&Tracker->FlowHash.Buckets[i])) {
+                entry = RemoveHeadList(&Tracker->FlowHash.Buckets[i]);
+                PCT_FLOW_HASH_ENTRY fe = CONTAINING_RECORD(entry, CT_FLOW_HASH_ENTRY, ListEntry);
+                ExFreeToNPagedLookasideList(&tracker->FlowHashLookaside, fe);
+            }
+        }
+        ExReleasePushLockExclusive(&Tracker->FlowHash.Lock);
+    }
+
+    //
+    // Free hash table bucket arrays
     //
     if (Tracker->ConnectionHash.Buckets != NULL) {
         ExFreePoolWithTag(Tracker->ConnectionHash.Buckets, CT_POOL_TAG_CONN);
@@ -518,7 +536,7 @@ CtShutdown(
     Tracker->Initialized = FALSE;
 
     //
-    // Free tracker structure
+    // Free tracker structure itself
     //
     ExFreePoolWithTag(tracker, CT_POOL_TAG_CONN);
 }
@@ -542,12 +560,6 @@ CtCreateConnection(
     _In_ BOOLEAN IsIPv6,
     _Out_ PCT_CONNECTION* Connection
     )
-/**
- * @brief Create a new tracked connection.
- *
- * Allocates a connection entry, populates with endpoint information,
- * inserts into hash tables, and links to process context.
- */
 {
     NTSTATUS status = STATUS_SUCCESS;
     PCT_TRACKER_INTERNAL tracker;
@@ -556,6 +568,9 @@ CtCreateConnection(
     PCT_FLOW_HASH_ENTRY flowEntry = NULL;
     ULONG flowBucket;
     ULONG connBucket;
+    LONG currentCount;
+    KIRQL oldIrql;
+    BOOLEAN duplicateFlow = FALSE;
 
     PAGED_CODE();
 
@@ -571,12 +586,18 @@ CtCreateConnection(
     tracker = CONTAINING_RECORD(Tracker, CT_TRACKER_INTERNAL, Public);
 
     //
-    // Check connection limit
+    // Atomically check and reserve a connection slot to prevent exceeding limit.
     //
-    if ((ULONG)Tracker->ConnectionCount >= Tracker->Config.MaxConnections) {
-        InterlockedIncrement64(&Tracker->Stats.BlockedConnections);
-        return STATUS_QUOTA_EXCEEDED;
-    }
+    do {
+        currentCount = Tracker->ConnectionCount;
+        if ((ULONG)currentCount >= Tracker->Config.MaxConnections) {
+            InterlockedIncrement64(&Tracker->Stats.BlockedConnections);
+            return STATUS_QUOTA_EXCEEDED;
+        }
+    } while (InterlockedCompareExchange(
+                &Tracker->ConnectionCount,
+                currentCount + 1,
+                currentCount) != currentCount);
 
     //
     // Allocate connection from lookaside
@@ -586,6 +607,7 @@ CtCreateConnection(
     );
 
     if (connection == NULL) {
+        InterlockedDecrement(&Tracker->ConnectionCount);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -600,30 +622,36 @@ CtCreateConnection(
 
     if (flowEntry == NULL) {
         ExFreeToNPagedLookasideList(&tracker->ConnectionLookaside, connection);
+        InterlockedDecrement(&Tracker->ConnectionCount);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Initialize connection
+    // Initialize connection (immutable fields)
     //
     connection->ConnectionId = (ULONG64)InterlockedIncrement64(&Tracker->NextConnectionId);
     connection->FlowId = FlowId;
-    connection->State = CtState_New;
+    connection->State = (LONG)CtState_New;
     connection->Direction = Direction;
     connection->Protocol = Protocol;
     connection->IsIPv6 = IsIPv6;
     connection->ProcessId = ProcessId;
-    connection->RefCount = 1;
+    connection->RefCount = 1;  // One reference for being in the tracking lists
+    connection->OwnerTracker = Tracker;
+    connection->TlsInfo = NULL;
 
     KeQuerySystemTime(&connection->CreateTime);
 
     //
-    // Copy addresses
+    // Copy addresses — caller guarantees kernel-mode pointers
     //
+    NT_ASSERT(LocalAddress >= MmSystemRangeStart);
+    NT_ASSERT(RemoteAddress >= MmSystemRangeStart);
+
     if (IsIPv6) {
         RtlCopyMemory(&connection->LocalAddress.IPv6, LocalAddress, sizeof(IN6_ADDR));
         RtlCopyMemory(&connection->RemoteAddress.IPv6, RemoteAddress, sizeof(IN6_ADDR));
-        connection->Flags |= CtFlag_IPv6;
+        InterlockedOr(&connection->Flags, CtFlag_IPv6);
     } else {
         RtlCopyMemory(&connection->LocalAddress.IPv4, LocalAddress, sizeof(IN_ADDR));
         RtlCopyMemory(&connection->RemoteAddress.IPv4, RemoteAddress, sizeof(IN_ADDR));
@@ -633,12 +661,23 @@ CtCreateConnection(
     connection->RemotePort = RemotePort;
 
     //
-    // Check for loopback
+    // Check for loopback (IPv4 and IPv6)
     //
     if (!IsIPv6) {
         UCHAR firstByte = ((PUCHAR)LocalAddress)[0];
         if (firstByte == 127) {
-            connection->Flags |= CtFlag_Loopback;
+            InterlockedOr(&connection->Flags, CtFlag_Loopback);
+        }
+    } else {
+        //
+        // IPv6 loopback is ::1 (all zeros except last byte = 1)
+        //
+        static const IN6_ADDR ipv6Loopback = { .u.Byte = {
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+        }};
+        if (RtlCompareMemory(&connection->LocalAddress.IPv6, &ipv6Loopback,
+                             sizeof(IN6_ADDR)) == sizeof(IN6_ADDR)) {
+            InterlockedOr(&connection->Flags, CtFlag_Loopback);
         }
     }
 
@@ -646,15 +685,15 @@ CtCreateConnection(
     // Initialize flow statistics
     //
     connection->Stats.FirstPacketTime = connection->CreateTime;
-    connection->Stats.LastPacketTime = connection->CreateTime;
+    InterlockedExchange64(&connection->Stats.LastPacketTime, connection->CreateTime.QuadPart);
 
     //
-    // Get or create process context
+    // Get or create process context (adds a reference for us)
     //
     processCtx = CtpGetOrCreateProcessContext(tracker, ProcessId);
     if (processCtx != NULL) {
         //
-        // Copy process info to connection
+        // Copy process name to connection
         //
         if (processCtx->ProcessName.Buffer != NULL) {
             connection->ProcessName.MaximumLength = processCtx->ProcessName.Length + sizeof(WCHAR);
@@ -670,16 +709,22 @@ CtCreateConnection(
         }
 
         //
-        // Link connection to process
+        // Link connection to process. Use proper KeAcquireSpinLock
+        // (we are at PASSIVE_LEVEL, must raise to DISPATCH).
         //
-        KeAcquireSpinLockAtDpcLevel(&processCtx->ConnectionLock);
+        KeAcquireSpinLock(&processCtx->ConnectionLock, &oldIrql);
         InsertTailList(&processCtx->ConnectionList, &connection->ProcessListEntry);
         InterlockedIncrement(&processCtx->ConnectionCount);
         InterlockedIncrement(&processCtx->ActiveConnectionCount);
         InterlockedIncrement64(&processCtx->TotalConnections);
-        KeReleaseSpinLockFromDpcLevel(&processCtx->ConnectionLock);
+        KeReleaseSpinLock(&processCtx->ConnectionLock, oldIrql);
 
-        connection->ProcessToken = (ULONG64)(ULONG_PTR)processCtx;
+        //
+        // Hold a reference on the process context for this connection.
+        // The caller's reference from CtpGetOrCreateProcessContext is
+        // transferred to the connection — no extra addref needed.
+        //
+        connection->ProcessContextRef = processCtx;
     }
 
     //
@@ -690,13 +735,52 @@ CtCreateConnection(
     InitializeListHead(&flowEntry->ListEntry);
 
     //
-    // Insert into flow hash table
+    // Check for duplicate FlowId and insert into flow hash table
     //
     flowBucket = CtpHashFlowId(FlowId);
 
     ExAcquirePushLockExclusive(&Tracker->FlowHash.Lock);
-    InsertTailList(&Tracker->FlowHash.Buckets[flowBucket], &flowEntry->ListEntry);
+    {
+        PLIST_ENTRY fe;
+        for (fe = Tracker->FlowHash.Buckets[flowBucket].Flink;
+             fe != &Tracker->FlowHash.Buckets[flowBucket];
+             fe = fe->Flink) {
+
+            PCT_FLOW_HASH_ENTRY existing = CONTAINING_RECORD(fe, CT_FLOW_HASH_ENTRY, ListEntry);
+            if (existing->FlowId == FlowId) {
+                duplicateFlow = TRUE;
+                break;
+            }
+        }
+
+        if (!duplicateFlow) {
+            InsertTailList(&Tracker->FlowHash.Buckets[flowBucket], &flowEntry->ListEntry);
+        }
+    }
     ExReleasePushLockExclusive(&Tracker->FlowHash.Lock);
+
+    if (duplicateFlow) {
+        //
+        // FlowId already tracked — roll back everything
+        //
+        if (processCtx != NULL) {
+            KeAcquireSpinLock(&processCtx->ConnectionLock, &oldIrql);
+            RemoveEntryList(&connection->ProcessListEntry);
+            InterlockedDecrement(&processCtx->ConnectionCount);
+            InterlockedDecrement(&processCtx->ActiveConnectionCount);
+            InterlockedDecrement64(&processCtx->TotalConnections);
+            KeReleaseSpinLock(&processCtx->ConnectionLock, oldIrql);
+            CtpReleaseProcessContext(tracker, processCtx);
+            connection->ProcessContextRef = NULL;
+        }
+        if (connection->ProcessName.Buffer != NULL) {
+            ExFreePoolWithTag(connection->ProcessName.Buffer, CT_POOL_TAG_CONN);
+        }
+        ExFreeToNPagedLookasideList(&tracker->FlowHashLookaside, flowEntry);
+        ExFreeToNPagedLookasideList(&tracker->ConnectionLookaside, connection);
+        InterlockedDecrement(&Tracker->ConnectionCount);
+        return STATUS_DUPLICATE_OBJECTID;
+    }
 
     //
     // Insert into connection hash table
@@ -712,11 +796,10 @@ CtCreateConnection(
     ExReleasePushLockExclusive(&Tracker->ConnectionHash.Lock);
 
     //
-    // Insert into global list
+    // Insert into global list (count already incremented atomically above)
     //
     ExAcquirePushLockExclusive(&Tracker->ConnectionListLock);
     InsertTailList(&Tracker->ConnectionList, &connection->GlobalListEntry);
-    InterlockedIncrement(&Tracker->ConnectionCount);
     ExReleasePushLockExclusive(&Tracker->ConnectionListLock);
 
     //
@@ -726,12 +809,12 @@ CtCreateConnection(
     InterlockedIncrement64(&Tracker->Stats.ActiveConnections);
 
     //
-    // Notify callbacks
+    // Notify callbacks (outside all locks)
     //
     CtpNotifyCallbacks(tracker, connection, CtState_New, CtState_New);
 
     //
-    // Add reference for caller
+    // Add reference for caller (total refcount is now 2: lists + caller)
     //
     CtAddRef(connection);
     *Connection = connection;
@@ -746,11 +829,6 @@ CtUpdateConnectionState(
     _In_ UINT64 FlowId,
     _In_ CT_CONNECTION_STATE NewState
     )
-/**
- * @brief Update the state of an existing connection.
- *
- * Transitions connection state machine and notifies registered callbacks.
- */
 {
     NTSTATUS status;
     PCT_TRACKER_INTERNAL tracker;
@@ -763,22 +841,39 @@ CtUpdateConnectionState(
 
     tracker = CONTAINING_RECORD(Tracker, CT_TRACKER_INTERNAL, Public);
 
-    //
-    // Find connection by flow ID
-    //
     status = CtFindByFlowId(Tracker, FlowId, &connection);
     if (!NT_SUCCESS(status)) {
         return status;
     }
 
     //
-    // Update state
+    // Atomically swap state
     //
-    oldState = connection->State;
-    connection->State = NewState;
+    oldState = (CT_CONNECTION_STATE)InterlockedExchange(&connection->State, (LONG)NewState);
 
     //
-    // Update timestamps based on state
+    // Determine if this transition affects active connection count.
+    // Only decrement if transitioning FROM an active state TO a terminal state.
+    //
+    {
+        BOOLEAN wasActive = (oldState == CtState_New ||
+                             oldState == CtState_Connecting ||
+                             oldState == CtState_Connected ||
+                             oldState == CtState_Established ||
+                             oldState == CtState_Closing);
+
+        BOOLEAN isTerminal = (NewState == CtState_Closed ||
+                              NewState == CtState_TimedOut ||
+                              NewState == CtState_Error ||
+                              NewState == CtState_Blocked);
+
+        if (wasActive && isTerminal) {
+            InterlockedDecrement64(&Tracker->Stats.ActiveConnections);
+        }
+    }
+
+    //
+    // Update timestamps based on new state
     //
     switch (NewState) {
         case CtState_Connected:
@@ -790,14 +885,12 @@ CtUpdateConnectionState(
         case CtState_TimedOut:
         case CtState_Error:
             KeQuerySystemTime(&connection->CloseTime);
-            InterlockedDecrement64(&Tracker->Stats.ActiveConnections);
             break;
 
         case CtState_Blocked:
             KeQuerySystemTime(&connection->CloseTime);
-            connection->Flags |= CtFlag_Blocked;
+            InterlockedOr(&connection->Flags, CtFlag_Blocked);
             InterlockedIncrement64(&Tracker->Stats.BlockedConnections);
-            InterlockedDecrement64(&Tracker->Stats.ActiveConnections);
             break;
 
         default:
@@ -810,7 +903,7 @@ CtUpdateConnectionState(
     CtpNotifyCallbacks(tracker, connection, oldState, NewState);
 
     //
-    // Release our reference
+    // Release lookup reference
     //
     CtRelease(connection);
 
@@ -823,12 +916,6 @@ CtRemoveConnection(
     _In_ PCT_TRACKER Tracker,
     _In_ UINT64 FlowId
     )
-/**
- * @brief Remove a connection from tracking.
- *
- * Removes from all hash tables and lists, notifies callbacks,
- * and schedules connection for cleanup.
- */
 {
     NTSTATUS status;
     PCT_TRACKER_INTERNAL tracker;
@@ -842,41 +929,43 @@ CtRemoveConnection(
     tracker = CONTAINING_RECORD(Tracker, CT_TRACKER_INTERNAL, Public);
 
     //
-    // Find and remove from flow hash
+    // Find connection (adds a reference)
     //
     status = CtFindByFlowId(Tracker, FlowId, &connection);
     if (!NT_SUCCESS(status)) {
         return status;
     }
 
-    oldState = connection->State;
-
     //
-    // Update state if not already closed
+    // Read current state. volatile LONG reads are atomic on all
+    // Windows-supported architectures for aligned 32-bit values.
     //
-    if (connection->State != CtState_Closed &&
-        connection->State != CtState_Blocked &&
-        connection->State != CtState_TimedOut) {
+    oldState = (CT_CONNECTION_STATE)connection->State;
 
-        connection->State = CtState_Closed;
+    if (oldState != CtState_Closed && oldState != CtState_Blocked &&
+        oldState != CtState_TimedOut && oldState != CtState_Error) {
+        //
+        // Transition to Closed and update stats exactly once
+        //
+        InterlockedExchange(&connection->State, (LONG)CtState_Closed);
         KeQuerySystemTime(&connection->CloseTime);
         InterlockedDecrement64(&Tracker->Stats.ActiveConnections);
     }
 
     //
-    // Notify callbacks
+    // Notify callbacks before removal
     //
     CtpNotifyCallbacks(tracker, connection, oldState, CtState_Closed);
 
     //
-    // Remove from tracking structures
+    // Remove from all tracking structures
     //
-    CtpRemoveConnection(tracker, connection);
+    CtpRemoveConnectionFromLists(tracker, connection);
 
     //
-    // Release lookup reference and original reference
+    // Release the lookup reference. The lists reference was already
+    // released by CtpRemoveConnectionFromLists via CtRelease.
     //
-    CtRelease(connection);
     CtRelease(connection);
 
     return STATUS_SUCCESS;
@@ -893,11 +982,6 @@ CtFindByFlowId(
     _In_ UINT64 FlowId,
     _Out_ PCT_CONNECTION* Connection
     )
-/**
- * @brief Find connection by WFP flow ID.
- *
- * O(1) lookup via flow hash table. Adds reference to returned connection.
- */
 {
     ULONG bucket;
     PLIST_ENTRY entry;
@@ -949,15 +1033,10 @@ CtFindByEndpoints(
     _In_ BOOLEAN IsIPv6,
     _Out_ PCT_CONNECTION* Connection
     )
-/**
- * @brief Find connection by 5-tuple (addresses, ports, protocol).
- *
- * O(1) lookup via connection hash table. Adds reference to returned connection.
- */
 {
     ULONG bucket;
     PLIST_ENTRY entry;
-    PCT_CONNECTION connection = NULL;
+    PCT_CONNECTION conn;
     SIZE_T addrSize;
 
     if (Tracker == NULL || !Tracker->Initialized || Connection == NULL) {
@@ -983,27 +1062,27 @@ CtFindByEndpoints(
          entry != &Tracker->ConnectionHash.Buckets[bucket];
          entry = entry->Flink) {
 
-        connection = CONTAINING_RECORD(entry, CT_CONNECTION, HashListEntry);
+        conn = CONTAINING_RECORD(entry, CT_CONNECTION, HashListEntry);
 
-        if (connection->Protocol == Protocol &&
-            connection->IsIPv6 == IsIPv6 &&
-            connection->LocalPort == LocalPort &&
-            connection->RemotePort == RemotePort) {
+        if (conn->Protocol == Protocol &&
+            conn->IsIPv6 == IsIPv6 &&
+            conn->LocalPort == LocalPort &&
+            conn->RemotePort == RemotePort) {
 
             PVOID connLocal = IsIPv6 ?
-                (PVOID)&connection->LocalAddress.IPv6 :
-                (PVOID)&connection->LocalAddress.IPv4;
+                (PVOID)&conn->LocalAddress.IPv6 :
+                (PVOID)&conn->LocalAddress.IPv4;
 
             PVOID connRemote = IsIPv6 ?
-                (PVOID)&connection->RemoteAddress.IPv6 :
-                (PVOID)&connection->RemoteAddress.IPv4;
+                (PVOID)&conn->RemoteAddress.IPv6 :
+                (PVOID)&conn->RemoteAddress.IPv4;
 
             if (RtlCompareMemory(connLocal, LocalAddress, addrSize) == addrSize &&
                 RtlCompareMemory(connRemote, RemoteAddress, addrSize) == addrSize) {
 
-                CtAddRef(connection);
+                CtAddRef(conn);
                 ExReleasePushLockShared(&Tracker->ConnectionHash.Lock);
-                *Connection = connection;
+                *Connection = conn;
                 return STATUS_SUCCESS;
             }
         }
@@ -1028,11 +1107,6 @@ CtUpdateStats(
     _In_ ULONG PacketsSent,
     _In_ ULONG PacketsReceived
     )
-/**
- * @brief Update flow statistics for a connection.
- *
- * Lock-free statistics updates using interlocked operations.
- */
 {
     NTSTATUS status;
     PCT_CONNECTION connection = NULL;
@@ -1048,24 +1122,24 @@ CtUpdateStats(
     }
 
     //
-    // Update connection statistics (lock-free)
+    // Update connection statistics (all lock-free via Interlocked)
     //
     if (BytesSent > 0) {
         InterlockedAdd64(&connection->Stats.BytesSent, (LONG64)BytesSent);
-        InterlockedAdd64(&connection->Stats.PacketsSent, PacketsSent);
+        InterlockedAdd64(&connection->Stats.PacketsSent, (LONG64)PacketsSent);
     }
 
     if (BytesReceived > 0) {
         InterlockedAdd64(&connection->Stats.BytesReceived, (LONG64)BytesReceived);
-        InterlockedAdd64(&connection->Stats.PacketsReceived, PacketsReceived);
+        InterlockedAdd64(&connection->Stats.PacketsReceived, (LONG64)PacketsReceived);
     }
 
     //
-    // Update last packet time
+    // Atomically update last packet time (safe for 32-bit and 64-bit)
     //
     KeQuerySystemTime(&currentTime);
-    connection->Stats.LastPacketTime = currentTime;
-    connection->Stats.IdleTimeMs = 0;
+    InterlockedExchange64(&connection->Stats.LastPacketTime, currentTime.QuadPart);
+    InterlockedExchange(&connection->Stats.IdleTimeMs, 0);
 
     //
     // Update global statistics
@@ -1074,20 +1148,24 @@ CtUpdateStats(
     InterlockedAdd64(&Tracker->Stats.TotalBytesReceived, (LONG64)BytesReceived);
 
     //
-    // Update process context if available
+    // Update process context if available (referenced pointer — safe)
     //
-    if (connection->ProcessToken != 0) {
-        PCT_PROCESS_CONTEXT processCtx = (PCT_PROCESS_CONTEXT)(ULONG_PTR)connection->ProcessToken;
-        InterlockedAdd64(&processCtx->TotalBytesSent, (LONG64)BytesSent);
-        InterlockedAdd64(&processCtx->TotalBytesReceived, (LONG64)BytesReceived);
+    {
+        PCT_PROCESS_CONTEXT processCtx = connection->ProcessContextRef;
+        if (processCtx != NULL) {
+            InterlockedAdd64(&processCtx->TotalBytesSent, (LONG64)BytesSent);
+            InterlockedAdd64(&processCtx->TotalBytesReceived, (LONG64)BytesReceived);
+        }
     }
 
     //
-    // Check for large transfer flag
+    // Check for large transfer flag (atomic flag set)
     //
-    LONG64 totalBytes = connection->Stats.BytesSent + connection->Stats.BytesReceived;
-    if (totalBytes > (10 * 1024 * 1024)) { // 10 MB
-        connection->Flags |= CtFlag_LargeTransfer;
+    {
+        LONG64 totalBytes = connection->Stats.BytesSent + connection->Stats.BytesReceived;
+        if (totalBytes > (10LL * 1024 * 1024)) {
+            InterlockedOr(&connection->Flags, CtFlag_LargeTransfer);
+        }
     }
 
     CtRelease(connection);
@@ -1108,12 +1186,6 @@ CtGetProcessConnections(
     _In_ ULONG MaxConnections,
     _Out_ PULONG ConnectionCount
     )
-/**
- * @brief Get all connections for a specific process.
- *
- * Returns array of connection pointers with references added.
- * Caller must release each connection.
- */
 {
     PCT_TRACKER_INTERNAL tracker;
     PCT_PROCESS_CONTEXT processCtx = NULL;
@@ -1144,7 +1216,7 @@ CtGetProcessConnections(
          entry != &tracker->ProcessHash.Buckets[bucket];
          entry = entry->Flink) {
 
-        PCT_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, ListEntry);
+        PCT_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, HashListEntry);
         if (ctx->ProcessId == ProcessId) {
             processCtx = ctx;
             InterlockedIncrement(&processCtx->RefCount);
@@ -1159,7 +1231,7 @@ CtGetProcessConnections(
     }
 
     //
-    // Enumerate connections for this process
+    // Enumerate connections for this process under spin lock
     //
     KeAcquireSpinLock(&processCtx->ConnectionLock, &oldIrql);
 
@@ -1175,7 +1247,7 @@ CtGetProcessConnections(
     KeReleaseSpinLock(&processCtx->ConnectionLock, oldIrql);
 
     //
-    // Release process context
+    // Release process context reference
     //
     CtpReleaseProcessContext(tracker, processCtx);
 
@@ -1192,9 +1264,6 @@ CtGetProcessNetworkStats(
     _Out_ PULONG64 BytesReceived,
     _Out_ PULONG ActiveConnections
     )
-/**
- * @brief Get aggregate network statistics for a process.
- */
 {
     PCT_TRACKER_INTERNAL tracker;
     PCT_PROCESS_CONTEXT processCtx = NULL;
@@ -1225,7 +1294,7 @@ CtGetProcessNetworkStats(
          entry != &tracker->ProcessHash.Buckets[bucket];
          entry = entry->Flink) {
 
-        PCT_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, ListEntry);
+        PCT_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, HashListEntry);
         if (ctx->ProcessId == ProcessId) {
             processCtx = ctx;
             break;
@@ -1258,16 +1327,13 @@ CtEnumerateConnections(
     _In_ CT_ENUM_CALLBACK Callback,
     _In_opt_ PVOID Context
     )
-/**
- * @brief Enumerate all tracked connections.
- *
- * Calls callback for each connection. Callback returns FALSE to stop.
- */
 {
+    PCT_CONNECTION* snapshot = NULL;
+    ULONG count;
+    ULONG capacity;
+    ULONG i;
     PLIST_ENTRY entry;
-    PLIST_ENTRY nextEntry;
     PCT_CONNECTION connection;
-    BOOLEAN continueEnum = TRUE;
 
     PAGED_CODE();
 
@@ -1275,26 +1341,67 @@ CtEnumerateConnections(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Build a snapshot of connection pointers under the lock,
+    // then invoke callbacks outside the lock. This eliminates
+    // the use-after-free race of the old design.
+    //
+
     ExAcquirePushLockShared(&Tracker->ConnectionListLock);
 
-    for (entry = Tracker->ConnectionList.Flink;
-         entry != &Tracker->ConnectionList && continueEnum;
-         entry = nextEntry) {
-
-        nextEntry = entry->Flink;
-        connection = CONTAINING_RECORD(entry, CT_CONNECTION, GlobalListEntry);
-
-        CtAddRef(connection);
+    count = (ULONG)Tracker->ConnectionCount;
+    if (count == 0) {
         ExReleasePushLockShared(&Tracker->ConnectionListLock);
+        return STATUS_SUCCESS;
+    }
 
-        continueEnum = Callback(connection, Context);
+    capacity = count;
 
-        CtRelease(connection);
+    //
+    // Allocate snapshot array. Using NonPagedPoolNx because we hold
+    // a push lock (APC_LEVEL). Pool allocation is safe at APC_LEVEL.
+    //
+    snapshot = (PCT_CONNECTION*)ExAllocatePoolZero(
+        NonPagedPoolNx,
+        sizeof(PCT_CONNECTION) * capacity,
+        CT_POOL_TAG_SNAP
+    );
 
-        ExAcquirePushLockShared(&Tracker->ConnectionListLock);
+    if (snapshot == NULL) {
+        ExReleasePushLockShared(&Tracker->ConnectionListLock);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    count = 0;
+    for (entry = Tracker->ConnectionList.Flink;
+         entry != &Tracker->ConnectionList && count < capacity;
+         entry = entry->Flink) {
+
+        connection = CONTAINING_RECORD(entry, CT_CONNECTION, GlobalListEntry);
+        CtAddRef(connection);
+        snapshot[count++] = connection;
     }
 
     ExReleasePushLockShared(&Tracker->ConnectionListLock);
+
+    //
+    // Invoke callbacks outside all locks
+    //
+    for (i = 0; i < count; i++) {
+        BOOLEAN continueEnum = Callback(snapshot[i], Context);
+        CtRelease(snapshot[i]);
+        if (!continueEnum) {
+            //
+            // Release remaining references
+            //
+            for (i = i + 1; i < count; i++) {
+                CtRelease(snapshot[i]);
+            }
+            break;
+        }
+    }
+
+    ExFreePoolWithTag(snapshot, CT_POOL_TAG_SNAP);
 
     return STATUS_SUCCESS;
 }
@@ -1310,9 +1417,6 @@ CtRegisterCallback(
     _In_ CT_CONNECTION_CALLBACK Callback,
     _In_opt_ PVOID Context
     )
-/**
- * @brief Register a callback for connection state changes.
- */
 {
     PCT_TRACKER_INTERNAL tracker;
     ULONG i;
@@ -1350,9 +1454,6 @@ CtUnregisterCallback(
     _In_ PCT_TRACKER Tracker,
     _In_ CT_CONNECTION_CALLBACK Callback
     )
-/**
- * @brief Unregister a previously registered callback.
- */
 {
     PCT_TRACKER_INTERNAL tracker;
     ULONG i;
@@ -1391,12 +1492,10 @@ VOID
 CtAddRef(
     _In_ PCT_CONNECTION Connection
     )
-/**
- * @brief Add reference to connection.
- */
 {
     if (Connection != NULL) {
-        InterlockedIncrement(&Connection->RefCount);
+        LONG newRef = InterlockedIncrement(&Connection->RefCount);
+        NT_ASSERT(newRef > 1);  // Must not addref a zero-ref object
     }
 }
 
@@ -1405,22 +1504,28 @@ VOID
 CtRelease(
     _In_ PCT_CONNECTION Connection
     )
-/**
- * @brief Release reference to connection.
- *
- * Connection is freed when reference count reaches zero.
- * Note: Actual freeing is deferred to cleanup to avoid
- * complex locking during release.
- */
 {
-    if (Connection != NULL) {
-        LONG newRef = InterlockedDecrement(&Connection->RefCount);
-        NT_ASSERT(newRef >= 0);
+    LONG newRef;
+    PCT_TRACKER_INTERNAL tracker;
 
+    if (Connection == NULL) {
+        return;
+    }
+
+    newRef = InterlockedDecrement(&Connection->RefCount);
+    NT_ASSERT(newRef >= 0);
+
+    if (newRef == 0) {
         //
-        // Actual cleanup happens in CtpCleanupStaleConnections
-        // to avoid freeing while still in hash tables
+        // Last reference dropped — free the connection.
+        // The connection MUST have been removed from all lists before
+        // the last reference is released (CtFlag_RemovedFromLists set).
         //
+        NT_ASSERT(Connection->Flags & CtFlag_RemovedFromLists);
+        NT_ASSERT(Connection->OwnerTracker != NULL);
+
+        tracker = CONTAINING_RECORD(Connection->OwnerTracker, CT_TRACKER_INTERNAL, Public);
+        CtpFreeConnection(tracker, Connection);
     }
 }
 
@@ -1434,9 +1539,6 @@ CtGetStatistics(
     _In_ PCT_TRACKER Tracker,
     _Out_ PCT_STATISTICS Stats
     )
-/**
- * @brief Get connection tracker statistics snapshot.
- */
 {
     LARGE_INTEGER currentTime;
 
@@ -1467,13 +1569,7 @@ static ULONG
 CtpHashFlowId(
     _In_ UINT64 FlowId
     )
-/**
- * @brief Hash function for flow ID lookup.
- */
 {
-    //
-    // Simple multiplicative hash
-    //
     ULONG64 hash = FlowId;
     hash = (hash ^ (hash >> 33)) * 0xff51afd7ed558ccdULL;
     hash = (hash ^ (hash >> 33)) * 0xc4ceb9fe1a85ec53ULL;
@@ -1491,9 +1587,6 @@ CtpHash5Tuple(
     _In_ UCHAR Protocol,
     _In_ BOOLEAN IsIPv6
     )
-/**
- * @brief Hash function for 5-tuple lookup.
- */
 {
     ULONG hash = 0;
     SIZE_T addrSize = IsIPv6 ? sizeof(IN6_ADDR) : sizeof(IN_ADDR);
@@ -1501,9 +1594,7 @@ CtpHash5Tuple(
     PUCHAR remoteBytes = (PUCHAR)RemoteAddress;
     SIZE_T i;
 
-    //
-    // FNV-1a style hash
-    //
+    // FNV-1a
     hash = 2166136261;
 
     for (i = 0; i < addrSize; i++) {
@@ -1536,9 +1627,6 @@ static ULONG
 CtpHashProcessId(
     _In_ HANDLE ProcessId
     )
-/**
- * @brief Hash function for process ID lookup.
- */
 {
     ULONG_PTR pid = (ULONG_PTR)ProcessId;
     return (ULONG)((pid >> 2) % CT_PROCESS_HASH_BUCKET_COUNT);
@@ -1549,9 +1637,6 @@ CtpGetOrCreateProcessContext(
     _In_ PCT_TRACKER_INTERNAL Tracker,
     _In_ HANDLE ProcessId
     )
-/**
- * @brief Get existing or create new process context.
- */
 {
     PCT_PROCESS_CONTEXT context = NULL;
     PLIST_ENTRY entry;
@@ -1571,7 +1656,7 @@ CtpGetOrCreateProcessContext(
          entry != &Tracker->ProcessHash.Buckets[bucket];
          entry = entry->Flink) {
 
-        PCT_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, ListEntry);
+        PCT_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, HashListEntry);
         if (ctx->ProcessId == ProcessId) {
             context = ctx;
             InterlockedIncrement(&context->RefCount);
@@ -1599,10 +1684,10 @@ CtpGetOrCreateProcessContext(
     RtlZeroMemory(context, sizeof(CT_PROCESS_CONTEXT));
 
     context->ProcessId = ProcessId;
-    context->RefCount = 2; // One for hash, one for caller
+    context->RefCount = 2; // One for hash table, one for caller
 
     //
-    // Get process object
+    // Get process object reference
     //
     status = PsLookupProcessByProcessId(ProcessId, &context->Process);
     if (!NT_SUCCESS(status)) {
@@ -1610,7 +1695,7 @@ CtpGetOrCreateProcessContext(
     }
 
     //
-    // Initialize connection list
+    // Initialize connection list and spin lock
     //
     InitializeListHead(&context->ConnectionList);
     KeInitializeSpinLock(&context->ConnectionLock);
@@ -1621,25 +1706,26 @@ CtpGetOrCreateProcessContext(
     CtpResolveProcessInfo(ProcessId, &context->ProcessName, NULL);
 
     //
-    // Insert into hash and list
+    // Insert into hash and global list.
+    // Acquire ProcessListLock first, then ProcessHash.Lock (lock ordering).
     //
-    ExAcquirePushLockExclusive(&Tracker->ProcessHash.Lock);
     ExAcquirePushLockExclusive(&Tracker->Public.ProcessListLock);
+    ExAcquirePushLockExclusive(&Tracker->ProcessHash.Lock);
 
     //
-    // Double-check another thread didn't create it
+    // Double-check: another thread may have created it concurrently
     //
     for (entry = Tracker->ProcessHash.Buckets[bucket].Flink;
          entry != &Tracker->ProcessHash.Buckets[bucket];
          entry = entry->Flink) {
 
-        PCT_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, ListEntry);
+        PCT_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, HashListEntry);
         if (ctx->ProcessId == ProcessId) {
             //
-            // Already exists, free our new one
+            // Race lost — free our new one, use existing
             //
-            ExReleasePushLockExclusive(&Tracker->Public.ProcessListLock);
             ExReleasePushLockExclusive(&Tracker->ProcessHash.Lock);
+            ExReleasePushLockExclusive(&Tracker->Public.ProcessListLock);
 
             if (context->Process != NULL) {
                 ObDereferenceObject(context->Process);
@@ -1655,14 +1741,14 @@ CtpGetOrCreateProcessContext(
     }
 
     //
-    // Insert new context
+    // Insert new context — separate ListEntry for hash and global list
     //
-    InsertTailList(&Tracker->ProcessHash.Buckets[bucket], &context->ListEntry);
-    InsertTailList(&Tracker->Public.ProcessList, &context->ListEntry);
+    InsertTailList(&Tracker->ProcessHash.Buckets[bucket], &context->HashListEntry);
+    InsertTailList(&Tracker->Public.ProcessList, &context->GlobalListEntry);
     InterlockedIncrement(&Tracker->Public.ProcessCount);
 
-    ExReleasePushLockExclusive(&Tracker->Public.ProcessListLock);
     ExReleasePushLockExclusive(&Tracker->ProcessHash.Lock);
+    ExReleasePushLockExclusive(&Tracker->Public.ProcessListLock);
 
     return context;
 }
@@ -1672,18 +1758,47 @@ CtpReleaseProcessContext(
     _In_ PCT_TRACKER_INTERNAL Tracker,
     _In_ PCT_PROCESS_CONTEXT Context
     )
-/**
- * @brief Release reference to process context.
- */
 {
-    if (Context != NULL) {
-        InterlockedDecrement(&Context->RefCount);
-        //
-        // Actual cleanup happens in CtpCleanupStaleConnections
-        //
+    LONG newRef;
+
+    if (Context == NULL) {
+        return;
     }
 
-    UNREFERENCED_PARAMETER(Tracker);
+    newRef = InterlockedDecrement(&Context->RefCount);
+    NT_ASSERT(newRef >= 0);
+
+    if (newRef == 0) {
+        //
+        // Last reference gone — remove from lists and free.
+        // This should only happen during cleanup when the context
+        // has already been removed from hash/global lists.
+        //
+        CtpFreeProcessContext(Tracker, Context);
+    }
+}
+
+static VOID
+CtpFreeProcessContext(
+    _In_ PCT_TRACKER_INTERNAL Tracker,
+    _In_ PCT_PROCESS_CONTEXT Context
+    )
+{
+    if (Context->Process != NULL) {
+        ObDereferenceObject(Context->Process);
+        Context->Process = NULL;
+    }
+
+    if (Context->ProcessName.Buffer != NULL) {
+        ExFreePoolWithTag(Context->ProcessName.Buffer, CT_POOL_TAG_PROC);
+        Context->ProcessName.Buffer = NULL;
+    }
+
+    if (Tracker->LookasideInitialized) {
+        ExFreeToNPagedLookasideList(&Tracker->ProcessContextLookaside, Context);
+    } else {
+        ExFreePoolWithTag(Context, CT_POOL_TAG_PROC);
+    }
 }
 
 static VOID
@@ -1692,13 +1807,10 @@ CtpResolveProcessInfo(
     _Out_ PUNICODE_STRING ProcessName,
     _Out_opt_ PUNICODE_STRING ProcessPath
     )
-/**
- * @brief Resolve process name and path from PID.
- */
 {
     NTSTATUS status;
     PEPROCESS process = NULL;
-    PUNICODE_STRING imageName = NULL;
+    PUCHAR imageFileName;
 
     PAGED_CODE();
 
@@ -1713,40 +1825,39 @@ CtpResolveProcessInfo(
     }
 
     //
-    // Get process image file name
+    // Use PsGetProcessImageFileName — safe, documented, returns a
+    // pointer to the EPROCESS internal 15-char ANSI name. We convert
+    // to UNICODE_STRING. This avoids SeLocateProcessImageName which
+    // has ambiguous ownership semantics across Windows versions.
     //
-    status = SeLocateProcessImageName(process, &imageName);
-    if (NT_SUCCESS(status) && imageName != NULL) {
+    imageFileName = PsGetProcessImageFileName(process);
+    if (imageFileName != NULL) {
+        ANSI_STRING ansiName;
+        UNICODE_STRING unicodeName;
 
-        //
-        // Extract just the filename from the path
-        //
-        PWCHAR lastSlash = imageName->Buffer;
-        PWCHAR p = imageName->Buffer;
-        USHORT nameLen;
+        RtlInitAnsiString(&ansiName, (PCSZ)imageFileName);
 
-        while (*p != L'\0') {
-            if (*p == L'\\' || *p == L'/') {
-                lastSlash = p + 1;
+        status = RtlAnsiStringToUnicodeString(&unicodeName, &ansiName, TRUE);
+        if (NT_SUCCESS(status)) {
+            //
+            // Allocate our own copy with our pool tag
+            //
+            ProcessName->MaximumLength = unicodeName.Length + sizeof(WCHAR);
+            ProcessName->Buffer = (PWCH)ExAllocatePoolZero(
+                NonPagedPoolNx,
+                ProcessName->MaximumLength,
+                CT_POOL_TAG_PROC
+            );
+
+            if (ProcessName->Buffer != NULL) {
+                RtlCopyMemory(ProcessName->Buffer, unicodeName.Buffer, unicodeName.Length);
+                ProcessName->Length = unicodeName.Length;
+            } else {
+                ProcessName->MaximumLength = 0;
             }
-            p++;
+
+            RtlFreeUnicodeString(&unicodeName);
         }
-
-        nameLen = (USHORT)((p - lastSlash) * sizeof(WCHAR));
-
-        ProcessName->Buffer = (PWCH)ExAllocatePoolZero(
-            NonPagedPoolNx,
-            nameLen + sizeof(WCHAR),
-            CT_POOL_TAG_PROC
-        );
-
-        if (ProcessName->Buffer != NULL) {
-            RtlCopyMemory(ProcessName->Buffer, lastSlash, nameLen);
-            ProcessName->Length = nameLen;
-            ProcessName->MaximumLength = nameLen + sizeof(WCHAR);
-        }
-
-        ExFreePool(imageName);
     }
 
     ObDereferenceObject(process);
@@ -1759,48 +1870,82 @@ CtpNotifyCallbacks(
     _In_ CT_CONNECTION_STATE OldState,
     _In_ CT_CONNECTION_STATE NewState
     )
-/**
- * @brief Notify all registered callbacks of state change.
- */
 {
+    CT_CALLBACK_ENTRY callbackSnapshot[CT_MAX_CALLBACKS];
     ULONG i;
+    ULONG count = 0;
 
     if (Tracker->CallbackCount == 0) {
         return;
     }
 
+    //
+    // Snapshot callbacks under the lock, then invoke outside.
+    // This prevents deadlock if a callback tries to unregister
+    // itself or do other tracker operations (though callbacks
+    // MUST NOT call back into Ct* APIs per contract).
+    //
     ExAcquirePushLockShared(&Tracker->CallbackLock);
 
     for (i = 0; i < CT_MAX_CALLBACKS; i++) {
         if (Tracker->Callbacks[i].InUse && Tracker->Callbacks[i].Callback != NULL) {
-            Tracker->Callbacks[i].Callback(
-                Connection,
-                OldState,
-                NewState,
-                Tracker->Callbacks[i].Context
-            );
+            callbackSnapshot[count] = Tracker->Callbacks[i];
+            count++;
         }
     }
 
     ExReleasePushLockShared(&Tracker->CallbackLock);
+
+    //
+    // Invoke callbacks outside all locks
+    //
+    for (i = 0; i < count; i++) {
+        callbackSnapshot[i].Callback(
+            Connection,
+            OldState,
+            NewState,
+            callbackSnapshot[i].Context
+        );
+    }
 }
 
 static VOID
-CtpRemoveConnection(
+CtpRemoveConnectionFromLists(
     _In_ PCT_TRACKER_INTERNAL Tracker,
     _In_ PCT_CONNECTION Connection
     )
-/**
- * @brief Remove connection from all tracking structures.
- */
 {
     ULONG flowBucket;
-    ULONG connBucket;
     PLIST_ENTRY entry;
     PCT_FLOW_HASH_ENTRY flowEntry = NULL;
+    KIRQL oldIrql;
 
     //
-    // Remove from flow hash
+    // Atomically check if already removed
+    //
+    if (InterlockedOr(&Connection->Flags, CtFlag_RemovedFromLists) & CtFlag_RemovedFromLists) {
+        return;  // Already removed by another thread
+    }
+
+    //
+    // Remove from global list (lock order #1)
+    //
+    ExAcquirePushLockExclusive(&Tracker->Public.ConnectionListLock);
+    RemoveEntryList(&Connection->GlobalListEntry);
+    InitializeListHead(&Connection->GlobalListEntry);
+    InterlockedDecrement(&Tracker->Public.ConnectionCount);
+    ExReleasePushLockExclusive(&Tracker->Public.ConnectionListLock);
+
+    //
+    // Remove from connection hash (lock order #2)
+    //
+    ExAcquirePushLockExclusive(&Tracker->Public.ConnectionHash.Lock);
+    RemoveEntryList(&Connection->HashListEntry);
+    InitializeListHead(&Connection->HashListEntry);
+    ExReleasePushLockExclusive(&Tracker->Public.ConnectionHash.Lock);
+
+    //
+    // Remove from flow hash (lock order #3)
     //
     flowBucket = CtpHashFlowId(Connection->FlowId);
 
@@ -1825,41 +1970,40 @@ CtpRemoveConnection(
     }
 
     //
-    // Remove from connection hash
+    // Remove from process context (lock order #6)
     //
-    ExAcquirePushLockExclusive(&Tracker->Public.ConnectionHash.Lock);
-    RemoveEntryList(&Connection->HashListEntry);
-    ExReleasePushLockExclusive(&Tracker->Public.ConnectionHash.Lock);
-
-    //
-    // Remove from process context
-    //
-    if (Connection->ProcessToken != 0) {
-        PCT_PROCESS_CONTEXT processCtx = (PCT_PROCESS_CONTEXT)(ULONG_PTR)Connection->ProcessToken;
-        KIRQL oldIrql;
+    if (Connection->ProcessContextRef != NULL) {
+        PCT_PROCESS_CONTEXT processCtx = Connection->ProcessContextRef;
 
         KeAcquireSpinLock(&processCtx->ConnectionLock, &oldIrql);
         RemoveEntryList(&Connection->ProcessListEntry);
+        InitializeListHead(&Connection->ProcessListEntry);
         InterlockedDecrement(&processCtx->ConnectionCount);
 
-        if (Connection->State == CtState_Connected ||
-            Connection->State == CtState_Established ||
-            Connection->State == CtState_Connecting) {
-            InterlockedDecrement(&processCtx->ActiveConnectionCount);
+        {
+            CT_CONNECTION_STATE state = (CT_CONNECTION_STATE)Connection->State;
+            if (state == CtState_Connected ||
+                state == CtState_Established ||
+                state == CtState_Connecting ||
+                state == CtState_New) {
+                InterlockedDecrement(&processCtx->ActiveConnectionCount);
+            }
         }
 
         KeReleaseSpinLock(&processCtx->ConnectionLock, oldIrql);
 
-        Connection->ProcessToken = 0;
+        //
+        // Release the process context reference held by this connection
+        //
+        CtpReleaseProcessContext(Tracker, processCtx);
+        Connection->ProcessContextRef = NULL;
     }
 
     //
-    // Remove from global list
+    // Release the "in lists" reference. If this was the last reference,
+    // CtRelease will call CtpFreeConnection.
     //
-    ExAcquirePushLockExclusive(&Tracker->Public.ConnectionListLock);
-    RemoveEntryList(&Connection->GlobalListEntry);
-    InterlockedDecrement(&Tracker->Public.ConnectionCount);
-    ExReleasePushLockExclusive(&Tracker->Public.ConnectionListLock);
+    CtRelease(Connection);
 }
 
 static VOID
@@ -1867,16 +2011,20 @@ CtpFreeConnection(
     _In_ PCT_TRACKER_INTERNAL Tracker,
     _In_ PCT_CONNECTION Connection
     )
-/**
- * @brief Free connection and associated resources.
- */
 {
     if (Connection->ProcessName.Buffer != NULL) {
         ExFreePoolWithTag(Connection->ProcessName.Buffer, CT_POOL_TAG_CONN);
+        Connection->ProcessName.Buffer = NULL;
     }
 
     if (Connection->ProcessPath.Buffer != NULL) {
         ExFreePoolWithTag(Connection->ProcessPath.Buffer, CT_POOL_TAG_CONN);
+        Connection->ProcessPath.Buffer = NULL;
+    }
+
+    if (Connection->TlsInfo != NULL) {
+        ExFreePoolWithTag(Connection->TlsInfo, CT_POOL_TAG_CONN);
+        Connection->TlsInfo = NULL;
     }
 
     if (Tracker->LookasideInitialized) {
@@ -1886,6 +2034,10 @@ CtpFreeConnection(
     }
 }
 
+// ============================================================================
+// CLEANUP TIMER AND WORK ITEM
+// ============================================================================
+
 _IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 CtpCleanupTimerDpc(
@@ -1894,9 +2046,6 @@ CtpCleanupTimerDpc(
     _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2
     )
-/**
- * @brief DPC callback for periodic cleanup.
- */
 {
     PCT_TRACKER_INTERNAL tracker = (PCT_TRACKER_INTERNAL)DeferredContext;
 
@@ -1909,83 +2058,127 @@ CtpCleanupTimerDpc(
     }
 
     //
-    // Queue work item for actual cleanup (needs PASSIVE_LEVEL)
+    // The DPC runs at DISPATCH_LEVEL — we MUST NOT touch push locks here.
+    // Instead, queue a work item that runs at PASSIVE_LEVEL.
     //
-    // For production, use a work item. For this implementation,
-    // we mark stale connections here and clean them on next operation.
-    //
+    if (InterlockedCompareExchange(&tracker->CleanupWorkItemPending, 1, 0) == 0) {
+        ExQueueWorkItem(&tracker->CleanupWorkQueueItem, DelayedWorkQueue);
+    }
+}
 
-    LARGE_INTEGER currentTime;
-    LARGE_INTEGER timeoutInterval;
-    PLIST_ENTRY entry;
-    PCT_CONNECTION connection;
+static VOID
+CtpCleanupWorkItemRoutine(
+    _In_ PVOID Parameter
+    )
+{
+    PCT_TRACKER_INTERNAL tracker = (PCT_TRACKER_INTERNAL)Parameter;
 
-    KeQuerySystemTime(&currentTime);
-    timeoutInterval.QuadPart = (LONGLONG)tracker->Public.Config.ConnectionTimeoutMs * 10000;
+    PAGED_CODE();
 
-    //
-    // Quick scan to mark timed out connections
-    //
-    ExAcquirePushLockShared(&tracker->Public.ConnectionListLock);
-
-    for (entry = tracker->Public.ConnectionList.Flink;
-         entry != &tracker->Public.ConnectionList;
-         entry = entry->Flink) {
-
-        connection = CONTAINING_RECORD(entry, CT_CONNECTION, GlobalListEntry);
-
-        //
-        // Check for timeout (closed connections with no refs or idle too long)
-        //
-        if (connection->State == CtState_Closed ||
-            connection->State == CtState_TimedOut ||
-            connection->State == CtState_Blocked) {
-
-            if (connection->RefCount <= 1) {
-                //
-                // Mark for cleanup
-                //
-                connection->State = CtState_TimedOut;
-            }
+    if (tracker == NULL || tracker->ShuttingDown) {
+        if (tracker != NULL) {
+            InterlockedExchange(&tracker->CleanupWorkItemPending, 0);
         }
-        else {
-            //
-            // Check idle time
-            //
-            LARGE_INTEGER idleTime;
-            idleTime.QuadPart = currentTime.QuadPart - connection->Stats.LastPacketTime.QuadPart;
-
-            if (idleTime.QuadPart > timeoutInterval.QuadPart) {
-                connection->Stats.IdleTimeMs = (ULONG)(idleTime.QuadPart / 10000);
-            }
-        }
+        return;
     }
 
-    ExReleasePushLockShared(&tracker->Public.ConnectionListLock);
+    CtpCleanupStaleConnections(tracker);
+
+    //
+    // Re-initialize work item for next use.
+    // ExQueueWorkItem requires the item to be re-initialized after completion.
+    //
+    ExInitializeWorkItem(
+        &tracker->CleanupWorkQueueItem,
+        CtpCleanupWorkItemRoutine,
+        tracker
+    );
+
+    InterlockedExchange(&tracker->CleanupWorkItemPending, 0);
 }
 
 static VOID
 CtpCleanupStaleConnections(
     _In_ PCT_TRACKER_INTERNAL Tracker
     )
-/**
- * @brief Clean up stale and timed out connections.
- *
- * Called periodically to free connections that are closed
- * and have no outstanding references.
- */
 {
     PLIST_ENTRY entry;
     PLIST_ENTRY nextEntry;
     PCT_CONNECTION connection;
-    LIST_ENTRY freeList;
+    PCT_CONNECTION* staleList = NULL;
+    ULONG staleCount = 0;
+    ULONG staleCapacity = 0;
+    LARGE_INTEGER currentTime;
+    LARGE_INTEGER timeoutInterval;
+    ULONG i;
 
     PAGED_CODE();
 
-    InitializeListHead(&freeList);
+    KeQuerySystemTime(&currentTime);
+    timeoutInterval.QuadPart = (LONGLONG)Tracker->Public.Config.ConnectionTimeoutMs * 10000;
 
     //
-    // Collect connections to free
+    // First pass: under shared lock, count stale candidates and update idle times
+    //
+    ExAcquirePushLockShared(&Tracker->Public.ConnectionListLock);
+
+    for (entry = Tracker->Public.ConnectionList.Flink;
+         entry != &Tracker->Public.ConnectionList;
+         entry = entry->Flink) {
+
+        connection = CONTAINING_RECORD(entry, CT_CONNECTION, GlobalListEntry);
+        CT_CONNECTION_STATE state = (CT_CONNECTION_STATE)connection->State;
+
+        if (state == CtState_Closed || state == CtState_TimedOut ||
+            state == CtState_Blocked || state == CtState_Error) {
+            staleCapacity++;
+        } else {
+            //
+            // Update idle time for active connections
+            //
+            LONG64 lastPacket = InterlockedCompareExchange64(
+                &connection->Stats.LastPacketTime, 0, 0);
+            LARGE_INTEGER idleTime;
+            idleTime.QuadPart = currentTime.QuadPart - lastPacket;
+
+            if (idleTime.QuadPart > timeoutInterval.QuadPart) {
+                InterlockedExchange(
+                    &connection->Stats.IdleTimeMs,
+                    (LONG)(idleTime.QuadPart / 10000));
+
+                //
+                // Transition idle connections to TimedOut
+                //
+                InterlockedCompareExchange(&connection->State,
+                    (LONG)CtState_TimedOut,
+                    (LONG)state);
+                staleCapacity++;
+            }
+        }
+    }
+
+    ExReleasePushLockShared(&Tracker->Public.ConnectionListLock);
+
+    if (staleCapacity == 0) {
+        return;
+    }
+
+    //
+    // Allocate array for stale connection pointers
+    //
+    staleList = (PCT_CONNECTION*)ExAllocatePoolZero(
+        NonPagedPoolNx,
+        sizeof(PCT_CONNECTION) * staleCapacity,
+        CT_POOL_TAG_SNAP
+    );
+
+    if (staleList == NULL) {
+        return;  // Best-effort cleanup; will retry next cycle
+    }
+
+    //
+    // Second pass: under exclusive lock, collect stale connections
+    // with refcount == 1 (only the lists reference remains).
     //
     ExAcquirePushLockExclusive(&Tracker->Public.ConnectionListLock);
 
@@ -1995,39 +2188,33 @@ CtpCleanupStaleConnections(
 
         nextEntry = entry->Flink;
         connection = CONTAINING_RECORD(entry, CT_CONNECTION, GlobalListEntry);
+        CT_CONNECTION_STATE state = (CT_CONNECTION_STATE)connection->State;
 
-        if ((connection->State == CtState_Closed ||
-             connection->State == CtState_TimedOut ||
-             connection->State == CtState_Blocked ||
-             connection->State == CtState_Error) &&
-            connection->RefCount <= 1) {
-
-            //
-            // Remove from global list only (others removed by CtpRemoveConnection)
-            //
-            RemoveEntryList(&connection->GlobalListEntry);
-            InterlockedDecrement(&Tracker->Public.ConnectionCount);
+        if ((state == CtState_Closed || state == CtState_TimedOut ||
+             state == CtState_Blocked || state == CtState_Error) &&
+            connection->RefCount == 1 &&
+            staleCount < staleCapacity) {
 
             //
-            // Add to free list
+            // Add ref to prevent free while we still hold a pointer
             //
-            InsertTailList(&freeList, &connection->GlobalListEntry);
+            CtAddRef(connection);
+            staleList[staleCount++] = connection;
         }
     }
 
     ExReleasePushLockExclusive(&Tracker->Public.ConnectionListLock);
 
     //
-    // Free collected connections
+    // Remove and release collected connections outside the lock.
+    // CtpRemoveConnectionFromLists handles idempotent removal and
+    // releases the "in-lists" reference. Our extra ref keeps the
+    // object alive until we release it.
     //
-    while (!IsListEmpty(&freeList)) {
-        entry = RemoveHeadList(&freeList);
-        connection = CONTAINING_RECORD(entry, CT_CONNECTION, GlobalListEntry);
-
-        //
-        // Need to remove from other structures first
-        //
-        CtpRemoveConnection(Tracker, connection);
-        CtpFreeConnection(Tracker, connection);
+    for (i = 0; i < staleCount; i++) {
+        CtpRemoveConnectionFromLists(Tracker, staleList[i]);
+        CtRelease(staleList[i]);  // Release our temporary ref
     }
+
+    ExFreePoolWithTag(staleList, CT_POOL_TAG_SNAP);
 }

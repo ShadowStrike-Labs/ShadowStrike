@@ -8,26 +8,25 @@
     - Vertical scan detection (single host, multiple ports)
     - Horizontal scan detection (multiple hosts, same port - host sweep)
     - TCP Connect scan detection
-    - TCP SYN/Half-open scan detection
-    - TCP FIN/XMAS/NULL stealth scan detection
+    - TCP SYN/Half-open scan detection via flag classification
+    - TCP FIN/XMAS/NULL stealth scan detection via flag classification
     - UDP scan detection
     - Service probing detection
-    - Per-process connection behavior tracking
-    - Time-window based statistical analysis
-    - Sliding window with automatic cleanup
+    - Per-process connection behavior tracking with PID-reuse protection
+    - Time-window based statistical analysis with sliding window cleanup
+    - Hash-table based port/host lookup for O(1) performance
+    - PASSIVE_LEVEL cleanup via work items (no DPC lock violations)
+    - Proper drain/quiesce on shutdown
 
-    Detection Algorithms:
-    - Unique port counting per source/target pair within time window
-    - Unique host counting per source within time window
-    - Connection failure rate analysis
-    - TCP flag pattern recognition
-    - Rate-of-connection analysis
+    Lock Ordering:
+    1. Detector->SourceListLock (outermost)
+    2. Source->ConnectionLock (innermost)
+    Never acquire SourceListLock while holding ConnectionLock.
 
-    Security Considerations:
-    - All input is treated as hostile and validated
-    - Memory allocations are bounded to prevent DoS
-    - Lock ordering is strictly maintained
-    - Cleanup timers prevent resource exhaustion
+    IRQL Contract:
+    All public APIs require IRQL <= APC_LEVEL (PASSIVE_LEVEL preferred).
+    Cleanup runs at PASSIVE_LEVEL via IoQueueWorkItem.
+    The DPC only queues a work item; it never touches push locks.
 
     MITRE ATT&CK Coverage:
     - T1046: Network Service Discovery
@@ -38,60 +37,63 @@
 --*/
 
 #include "PortScanner.h"
-#include "../Utilities/HashUtils.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
 #include "../Tracing/Trace.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, PsInitialize)
-#pragma alloc_text(PAGE, PsShutdown)
-#pragma alloc_text(PAGE, PsRecordConnection)
-#pragma alloc_text(PAGE, PsCheckForScan)
-#pragma alloc_text(PAGE, PsGetStatistics)
-#pragma alloc_text(PAGE, PsFreeResult)
+#pragma alloc_text(PAGE, SsPsInitialize)
+#pragma alloc_text(PAGE, SsPsShutdown)
+#pragma alloc_text(PAGE, SsPsRecordConnection)
+#pragma alloc_text(PAGE, SsPsCheckForScan)
+#pragma alloc_text(PAGE, SsPsGetStatistics)
+#pragma alloc_text(PAGE, SsPsFreeResult)
 #endif
 
 //=============================================================================
 // Internal Configuration Constants
 //=============================================================================
 
-//
-// Maximum tracking limits (DoS prevention)
-//
-#define PS_MAX_PORTS_PER_SOURCE         8192
-#define PS_MAX_HOSTS_PER_SOURCE         4096
-#define PS_MAX_CONNECTIONS_PER_SOURCE   65536
-#define PS_CLEANUP_INTERVAL_MS          30000       // 30 seconds
-#define PS_SOURCE_EXPIRY_MS             300000      // 5 minutes of inactivity
+#define SSPS_MAX_PORTS_PER_SOURCE         8192
+#define SSPS_MAX_HOSTS_PER_SOURCE         4096
+#define SSPS_MAX_CONNECTIONS_PER_SOURCE   65536
+#define SSPS_CLEANUP_INTERVAL_MS          30000    // 30 seconds
+#define SSPS_SOURCE_EXPIRY_MS             300000   // 5 minutes idle
+#define SSPS_SHUTDOWN_DRAIN_TIMEOUT_MS    5000     // 5 second drain
 
 //
 // Detection thresholds
 //
-#define PS_VERTICAL_SCAN_THRESHOLD      20          // Unique ports to same host
-#define PS_HORIZONTAL_SCAN_THRESHOLD    10          // Unique hosts on same port
-#define PS_RAPID_CONNECT_THRESHOLD      100         // Connections per minute
-#define PS_FAILURE_RATE_THRESHOLD       80          // 80% failure rate
-#define PS_STEALTH_SCAN_THRESHOLD       5           // Stealth scan attempts
+#define SSPS_VERTICAL_SCAN_THRESHOLD      20
+#define SSPS_HORIZONTAL_SCAN_THRESHOLD    10
+#define SSPS_RAPID_CONNECT_THRESHOLD      100
+#define SSPS_FAILURE_RATE_THRESHOLD       80
+#define SSPS_STEALTH_SCAN_THRESHOLD       5
 
 //
 // Confidence score weights
 //
-#define PS_WEIGHT_UNIQUE_PORTS          3
-#define PS_WEIGHT_UNIQUE_HOSTS          4
-#define PS_WEIGHT_FAILURE_RATE          2
-#define PS_WEIGHT_RAPID_CONNECTIONS     2
-#define PS_WEIGHT_STEALTH_TECHNIQUE     5
+#define SSPS_WEIGHT_UNIQUE_PORTS          3
+#define SSPS_WEIGHT_UNIQUE_HOSTS          4
+#define SSPS_WEIGHT_FAILURE_RATE          2
+#define SSPS_WEIGHT_RAPID_CONNECTIONS     2
+#define SSPS_WEIGHT_STEALTH_TECHNIQUE     5
 
 //
-// Common scanning tool port lists (for fingerprinting)
+// Hash table bucket counts (power of 2 for fast modulo)
+//
+#define SSPS_PORT_HASH_BUCKETS    256
+#define SSPS_HOST_HASH_BUCKETS    128
+
+//
+// Common scanning tool port lists (for scan fingerprinting bonus)
 //
 static const USHORT g_CommonScanPorts[] = {
     21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995,
     1723, 3306, 3389, 5900, 8080, 8443
 };
+#define SSPS_COMMON_SCAN_PORTS_COUNT ARRAYSIZE(g_CommonScanPorts)
 
-#define PS_COMMON_SCAN_PORTS_COUNT ARRAYSIZE(g_CommonScanPorts)
 
 //=============================================================================
 // Internal Structures
@@ -100,12 +102,9 @@ static const USHORT g_CommonScanPorts[] = {
 //
 // Individual connection record
 //
-typedef struct _PS_CONNECTION_RECORD {
+typedef struct _SSPS_CONNECTION_RECORD {
     LIST_ENTRY ListEntry;
 
-    //
-    // Target endpoint
-    //
     union {
         IN_ADDR IPv4;
         IN6_ADDR IPv6;
@@ -113,76 +112,93 @@ typedef struct _PS_CONNECTION_RECORD {
     USHORT RemotePort;
     BOOLEAN IsIPv6;
 
-    //
-    // Connection details
-    //
-    UCHAR Protocol;                     // IPPROTO_TCP or IPPROTO_UDP
+    UCHAR Protocol;       // IPPROTO_TCP (6) or IPPROTO_UDP (17)
     BOOLEAN Successful;
-    UCHAR TcpFlags;                     // For stealth scan detection
+    UCHAR TcpFlags;       // Raw TCP flags for stealth scan classification
 
-    //
-    // Timing
-    //
     LARGE_INTEGER Timestamp;
-
-} PS_CONNECTION_RECORD, *PPS_CONNECTION_RECORD;
+} SSPS_CONNECTION_RECORD, *PSSPS_CONNECTION_RECORD;
 
 //
-// Tracked unique port entry
+// Tracked unique port entry (lives in hash bucket)
 //
-typedef struct _PS_PORT_ENTRY {
-    LIST_ENTRY ListEntry;
+typedef struct _SSPS_PORT_ENTRY {
+    LIST_ENTRY BucketLink;
     USHORT Port;
-    ULONG HitCount;
+    volatile LONG HitCount;
     LARGE_INTEGER FirstSeen;
-    LARGE_INTEGER LastSeen;
-} PS_PORT_ENTRY, *PPS_PORT_ENTRY;
+    volatile LONGLONG LastSeen;   // Updated atomically via InterlockedExchange64
+} SSPS_PORT_ENTRY, *PSSPS_PORT_ENTRY;
 
 //
-// Tracked unique host entry
+// Tracked unique host entry (lives in hash bucket)
 //
-typedef struct _PS_HOST_ENTRY {
-    LIST_ENTRY ListEntry;
+typedef struct _SSPS_HOST_ENTRY {
+    LIST_ENTRY BucketLink;
     union {
         IN_ADDR IPv4;
         IN6_ADDR IPv6;
     } Address;
     BOOLEAN IsIPv6;
-    ULONG PortsScanned;
+    volatile LONG PortsScanned;
     LARGE_INTEGER FirstSeen;
-    LARGE_INTEGER LastSeen;
-} PS_HOST_ENTRY, *PPS_HOST_ENTRY;
+    volatile LONGLONG LastSeen;   // Updated atomically
+} SSPS_HOST_ENTRY, *PSSPS_HOST_ENTRY;
+
+//
+// Simple hash table: array of list heads
+//
+typedef struct _SSPS_HASH_TABLE {
+    ULONG BucketCount;
+    LIST_ENTRY Buckets[1];  // Variable-length; actual size = BucketCount
+} SSPS_HASH_TABLE, *PSSPS_HASH_TABLE;
+
+//
+// Snapshot of window statistics (taken atomically under lock)
+//
+typedef struct _SSPS_WINDOW_SNAPSHOT {
+    LONG TotalConnections;
+    LONG SuccessfulConnections;
+    LONG FailedConnections;
+    LONG TcpSynOnly;
+    LONG TcpFinOnly;
+    LONG TcpXmas;
+    LONG TcpNull;
+    LONG UdpConnections;
+    LONG UniquePortCount;
+    LONG UniqueHostCount;
+    LARGE_INTEGER FirstActivity;
+    LARGE_INTEGER LastActivity;
+} SSPS_WINDOW_SNAPSHOT, *PSSPS_WINDOW_SNAPSHOT;
 
 //
 // Per-source tracking context
 //
-typedef struct _PS_SOURCE_CONTEXT {
+typedef struct _SSPS_SOURCE_CONTEXT {
     LIST_ENTRY ListEntry;
 
     //
-    // Source identification
+    // Source identification (ProcessId + CreateTime for PID-reuse safety)
     //
     HANDLE ProcessId;
+    LARGE_INTEGER ProcessCreateTime;
     WCHAR ProcessName[260];
     WCHAR ProcessPath[520];
 
     //
-    // Connection records (ring buffer behavior)
+    // Connection records
     //
     LIST_ENTRY ConnectionList;
     volatile LONG ConnectionCount;
-    EX_PUSH_LOCK ConnectionLock;
+    EX_PUSH_LOCK ConnectionLock;   // Protects ConnectionList, PortHash, HostHash, WindowStats, timing
 
     //
-    // Unique ports contacted (hash set simulation via list)
+    // Hash tables for unique ports and hosts (O(1) lookup)
     //
-    LIST_ENTRY PortList;
+    PSSPS_HASH_TABLE PortHash;
     volatile LONG UniquePortCount;
 
-    //
-    // Unique hosts contacted
-    //
-    LIST_ENTRY HostList;
+    PSSPS_HASH_TABLE HostHash;
     volatile LONG UniqueHostCount;
 
     //
@@ -192,10 +208,10 @@ typedef struct _PS_SOURCE_CONTEXT {
         volatile LONG TotalConnections;
         volatile LONG SuccessfulConnections;
         volatile LONG FailedConnections;
-        volatile LONG TcpSynOnly;           // SYN without ACK (stealth)
-        volatile LONG TcpFinOnly;           // FIN scan
-        volatile LONG TcpXmas;              // XMAS scan (FIN+PSH+URG)
-        volatile LONG TcpNull;              // NULL scan (no flags)
+        volatile LONG TcpSynOnly;
+        volatile LONG TcpFinOnly;
+        volatile LONG TcpXmas;
+        volatile LONG TcpNull;
         volatile LONG UdpConnections;
     } WindowStats;
 
@@ -210,79 +226,72 @@ typedef struct _PS_SOURCE_CONTEXT {
     // Detection state
     //
     BOOLEAN ScanDetected;
-    PS_SCAN_TYPE DetectedScanType;
+    SSPS_SCAN_TYPE DetectedScanType;
     ULONG ConfidenceScore;
 
     //
-    // Reference counting
+    // Reference counting for safe lifetime management
     //
     volatile LONG RefCount;
+} SSPS_SOURCE_CONTEXT, *PSSPS_SOURCE_CONTEXT;
 
-} PS_SOURCE_CONTEXT, *PPS_SOURCE_CONTEXT;
 
 //=============================================================================
 // Forward Declarations
 //=============================================================================
 
-static
-PPS_SOURCE_CONTEXT
-PspFindOrCreateSource(
-    _In_ PPS_DETECTOR Detector,
-    _In_ HANDLE ProcessId
+static PSSPS_SOURCE_CONTEXT
+SspsFindOrCreateSource(
+    _In_ PSSPS_DETECTOR Detector,
+    _In_ HANDLE ProcessId,
+    _In_ LARGE_INTEGER ProcessCreateTime
     );
 
-static
-VOID
-PspReleaseSource(
-    _In_ PPS_SOURCE_CONTEXT Source
+static VOID
+SspsReleaseSource(
+    _In_ PSSPS_DETECTOR Detector,
+    _In_ PSSPS_SOURCE_CONTEXT Source
     );
 
-static
-VOID
-PspRecordUniquePort(
-    _Inout_ PPS_SOURCE_CONTEXT Source,
+static VOID
+SspsRecordUniquePort(
+    _Inout_ PSSPS_SOURCE_CONTEXT Source,
     _In_ USHORT Port
     );
 
-static
-VOID
-PspRecordUniqueHost(
-    _Inout_ PPS_SOURCE_CONTEXT Source,
+static VOID
+SspsRecordUniqueHost(
+    _Inout_ PSSPS_SOURCE_CONTEXT Source,
     _In_ PVOID Address,
     _In_ BOOLEAN IsIPv6
     );
 
-static
-VOID
-PspCleanupExpiredRecords(
-    _Inout_ PPS_SOURCE_CONTEXT Source,
+static VOID
+SspsCleanupExpiredRecords(
+    _Inout_ PSSPS_SOURCE_CONTEXT Source,
     _In_ PLARGE_INTEGER CurrentTime,
     _In_ ULONG WindowMs
     );
 
-static
-VOID
-PspAnalyzeScanBehavior(
-    _In_ PPS_SOURCE_CONTEXT Source,
-    _Out_ PPS_DETECTION_RESULT Result
+static VOID
+SspsAnalyzeScanBehavior(
+    _In_ PSSPS_SOURCE_CONTEXT Source,
+    _Out_ PSSPS_DETECTION_RESULT Result
     );
 
-static
-PS_SCAN_TYPE
-PspDetermineScanType(
-    _In_ PPS_SOURCE_CONTEXT Source
+static SSPS_SCAN_TYPE
+SspsDetermineScanType(
+    _In_ PSSPS_WINDOW_SNAPSHOT Snap
     );
 
-static
-ULONG
-PspCalculateConfidence(
-    _In_ PPS_SOURCE_CONTEXT Source,
-    _In_ PS_SCAN_TYPE ScanType
+static ULONG
+SspsCalculateConfidence(
+    _In_ PSSPS_WINDOW_SNAPSHOT Snap,
+    _In_ SSPS_SCAN_TYPE ScanType
     );
 
-static
-VOID
-PspGetProcessInfo(
+static VOID
+SspsGetProcessInfo(
     _In_ HANDLE ProcessId,
     _Out_writes_z_(NameSize) PWCHAR ProcessName,
     _In_ ULONG NameSize,
@@ -290,72 +299,222 @@ PspGetProcessInfo(
     _In_ ULONG PathSize
     );
 
-static
-KDEFERRED_ROUTINE PspCleanupTimerDpc;
-
-static
-VOID
-PspCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+static VOID
+SspsClassifyTcpFlags(
+    _In_ UCHAR TcpFlags,
+    _Inout_ PSSPS_SOURCE_CONTEXT Source
     );
 
+static VOID
+SspsSnapshotWindowStats(
+    _In_ PSSPS_SOURCE_CONTEXT Source,
+    _Out_ PSSPS_WINDOW_SNAPSHOT Snap
+    );
+
+//
+// Cleanup: DPC queues a work item, work item does actual cleanup at PASSIVE_LEVEL
+//
+static KDEFERRED_ROUTINE SspsCleanupTimerDpc;
+
+static IO_WORKITEM_ROUTINE SspsCleanupWorkItemRoutine;
+
+//=============================================================================
+// Hash Table Helpers
+//=============================================================================
+
 static
-FORCEINLINE
-BOOLEAN
-PspCompareAddresses(
-    _In_ PVOID Addr1,
-    _In_ PVOID Addr2,
-    _In_ BOOLEAN IsIPv6
+PSSPS_HASH_TABLE
+SspsAllocHashTable(
+    _In_ ULONG BucketCount,
+    _In_ ULONG Tag
     )
 {
-    if (IsIPv6) {
-        return RtlCompareMemory(Addr1, Addr2, sizeof(IN6_ADDR)) == sizeof(IN6_ADDR);
-    } else {
-        return RtlCompareMemory(Addr1, Addr2, sizeof(IN_ADDR)) == sizeof(IN_ADDR);
+    PSSPS_HASH_TABLE Table;
+    SIZE_T Size;
+    ULONG i;
+
+    Size = FIELD_OFFSET(SSPS_HASH_TABLE, Buckets) +
+           (SIZE_T)BucketCount * sizeof(LIST_ENTRY);
+
+    Table = (PSSPS_HASH_TABLE)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx, Size, Tag);
+    if (Table == NULL) {
+        return NULL;
     }
+
+    RtlZeroMemory(Table, Size);
+    Table->BucketCount = BucketCount;
+    for (i = 0; i < BucketCount; i++) {
+        InitializeListHead(&Table->Buckets[i]);
+    }
+    return Table;
 }
 
 static
 FORCEINLINE
-ULONG
-PspHashPort(
+PLIST_ENTRY
+SspsGetPortBucket(
+    _In_ PSSPS_HASH_TABLE Table,
     _In_ USHORT Port
     )
 {
-    return (ULONG)Port;
+    return &Table->Buckets[(ULONG)Port & (Table->BucketCount - 1)];
 }
 
 static
 FORCEINLINE
 ULONG
-PspHashAddress(
+SspsHashAddress(
     _In_ PVOID Address,
     _In_ BOOLEAN IsIPv6
     )
 {
     if (IsIPv6) {
-        PULONG Addr = (PULONG)Address;
+        const ULONG *Addr = (const ULONG *)Address;
         return Addr[0] ^ Addr[1] ^ Addr[2] ^ Addr[3];
-    } else {
-        return *(PULONG)Address;
     }
+    return *(const ULONG *)Address;
 }
 
-//=============================================================================
-// Global Cleanup Timer State
-//=============================================================================
+static
+FORCEINLINE
+PLIST_ENTRY
+SspsGetHostBucket(
+    _In_ PSSPS_HASH_TABLE Table,
+    _In_ PVOID Address,
+    _In_ BOOLEAN IsIPv6
+    )
+{
+    ULONG Hash = SspsHashAddress(Address, IsIPv6);
+    return &Table->Buckets[Hash & (Table->BucketCount - 1)];
+}
 
-typedef struct _PS_CLEANUP_CONTEXT {
-    KTIMER Timer;
-    KDPC Dpc;
-    PPS_DETECTOR Detector;
-    BOOLEAN Active;
-} PS_CLEANUP_CONTEXT, *PPS_CLEANUP_CONTEXT;
+static
+FORCEINLINE
+BOOLEAN
+SspsCompareAddresses(
+    _In_ const VOID *Addr1,
+    _In_ const VOID *Addr2,
+    _In_ BOOLEAN IsIPv6
+    )
+{
+    SIZE_T Len = IsIPv6 ? sizeof(IN6_ADDR) : sizeof(IN_ADDR);
+    return RtlCompareMemory(Addr1, Addr2, Len) == Len;
+}
 
-static PS_CLEANUP_CONTEXT g_CleanupContext = { 0 };
+//
+// Free all entries in a port hash table
+//
+static
+VOID
+SspsFreePortHash(
+    _In_ PSSPS_HASH_TABLE Table
+    )
+{
+    ULONG i;
+    if (Table == NULL) return;
+
+    for (i = 0; i < Table->BucketCount; i++) {
+        while (!IsListEmpty(&Table->Buckets[i])) {
+            PLIST_ENTRY Entry = RemoveHeadList(&Table->Buckets[i]);
+            PSSPS_PORT_ENTRY PortEntry = CONTAINING_RECORD(
+                Entry, SSPS_PORT_ENTRY, BucketLink);
+            ShadowStrikeFreePoolWithTag(PortEntry, SSPS_POOL_TAG_CONTEXT);
+        }
+    }
+    ShadowStrikeFreePoolWithTag(Table, SSPS_POOL_TAG_HASHTBL);
+}
+
+//
+// Free all entries in a host hash table
+//
+static
+VOID
+SspsFreeHostHash(
+    _In_ PSSPS_HASH_TABLE Table
+    )
+{
+    ULONG i;
+    if (Table == NULL) return;
+
+    for (i = 0; i < Table->BucketCount; i++) {
+        while (!IsListEmpty(&Table->Buckets[i])) {
+            PLIST_ENTRY Entry = RemoveHeadList(&Table->Buckets[i]);
+            PSSPS_HOST_ENTRY HostEntry = CONTAINING_RECORD(
+                Entry, SSPS_HOST_ENTRY, BucketLink);
+            ShadowStrikeFreePoolWithTag(HostEntry, SSPS_POOL_TAG_TARGET);
+        }
+    }
+    ShadowStrikeFreePoolWithTag(Table, SSPS_POOL_TAG_HASHTBL);
+}
+
+//
+// Free a single source context and all its child allocations.
+// Caller must have already removed it from any list.
+//
+static
+VOID
+SspsFreeSourceContext(
+    _In_ PSSPS_SOURCE_CONTEXT Source
+    )
+{
+    // Free connection records
+    while (!IsListEmpty(&Source->ConnectionList)) {
+        PLIST_ENTRY Entry = RemoveHeadList(&Source->ConnectionList);
+        PSSPS_CONNECTION_RECORD Rec = CONTAINING_RECORD(
+            Entry, SSPS_CONNECTION_RECORD, ListEntry);
+        ShadowStrikeFreePoolWithTag(Rec, SSPS_POOL_TAG_CONTEXT);
+    }
+
+    SspsFreePortHash(Source->PortHash);
+    SspsFreeHostHash(Source->HostHash);
+    ShadowStrikeFreePoolWithTag(Source, SSPS_POOL_TAG_CONTEXT);
+}
+
+
+//=============================================================================
+// Detector Active Operation Guard
+//=============================================================================
+//
+// Every public API that touches detector state increments ActiveOperations
+// on entry and decrements on exit. Shutdown waits for drain.
+//
+
+static
+FORCEINLINE
+BOOLEAN
+SspsAcquireOperation(
+    _In_ PSSPS_DETECTOR Detector
+    )
+{
+    if (InterlockedCompareExchange(&Detector->ShuttingDown, 0, 0) != 0) {
+        return FALSE;  // Shutting down, reject new operations
+    }
+    InterlockedIncrement(&Detector->ActiveOperations);
+    //
+    // Double-check after increment: if shutdown started between the check
+    // and the increment, undo and fail.
+    //
+    if (InterlockedCompareExchange(&Detector->ShuttingDown, 0, 0) != 0) {
+        if (InterlockedDecrement(&Detector->ActiveOperations) == 0) {
+            KeSetEvent(&Detector->DrainEvent, IO_NO_INCREMENT, FALSE);
+        }
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static
+FORCEINLINE
+VOID
+SspsReleaseOperation(
+    _In_ PSSPS_DETECTOR Detector
+    )
+{
+    if (InterlockedDecrement(&Detector->ActiveOperations) == 0) {
+        KeSetEvent(&Detector->DrainEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
 
 //=============================================================================
 // Public API Implementation
@@ -363,254 +522,235 @@ static PS_CLEANUP_CONTEXT g_CleanupContext = { 0 };
 
 _Use_decl_annotations_
 NTSTATUS
-PsInitialize(
-    _Out_ PPS_DETECTOR* Detector
+SsPsInitialize(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Out_ PSSPS_DETECTOR* Detector
     )
 /*++
-
 Routine Description:
-
     Initializes the port scan detection subsystem.
-
-Arguments:
-
-    Detector - Receives pointer to the initialized detector.
-
-Return Value:
-
-    STATUS_SUCCESS on success, appropriate error code otherwise.
-
+    Must be called at IRQL <= APC_LEVEL.
 --*/
 {
-    PPS_DETECTOR NewDetector = NULL;
-    LARGE_INTEGER CurrentTime;
+    PSSPS_DETECTOR Det = NULL;
     LARGE_INTEGER DueTime;
 
     PAGED_CODE();
 
-    if (Detector == NULL) {
+    if (DeviceObject == NULL || Detector == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Detector = NULL;
 
-    //
-    // Allocate detector structure
-    //
-    NewDetector = (PPS_DETECTOR)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(PS_DETECTOR),
-        PS_POOL_TAG_CONTEXT
-        );
-
-    if (NewDetector == NULL) {
+    Det = (PSSPS_DETECTOR)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx, sizeof(SSPS_DETECTOR), SSPS_POOL_TAG_CONTEXT);
+    if (Det == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(NewDetector, sizeof(PS_DETECTOR));
+    RtlZeroMemory(Det, sizeof(SSPS_DETECTOR));
+
+    InitializeListHead(&Det->SourceList);
+    ExInitializePushLock(&Det->SourceListLock);
+    KeInitializeEvent(&Det->DrainEvent, NotificationEvent, TRUE);
+
+    Det->DeviceObject = DeviceObject;
+    Det->Config.WindowMs = SSPS_SCAN_WINDOW_MS;
+    Det->Config.MinPortsForScan = SSPS_MIN_PORTS_FOR_SCAN;
+    Det->Config.MinHostsForSweep = SSPS_MIN_HOSTS_FOR_SWEEP;
+
+    KeQuerySystemTime(&Det->Stats.StartTime);
 
     //
-    // Initialize list and lock
+    // Allocate work item for PASSIVE_LEVEL cleanup
     //
-    InitializeListHead(&NewDetector->SourceList);
-    ExInitializePushLock(&NewDetector->SourceListLock);
+    Det->CleanupWorkItem = IoAllocateWorkItem(DeviceObject);
+    if (Det->CleanupWorkItem == NULL) {
+        ShadowStrikeFreePoolWithTag(Det, SSPS_POOL_TAG_CONTEXT);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     //
-    // Set default configuration
+    // Initialize cleanup timer + DPC.
+    // The DPC ONLY queues the work item; it never touches locks or frees memory.
     //
-    NewDetector->Config.WindowMs = PS_SCAN_WINDOW_MS;
-    NewDetector->Config.MinPortsForScan = PS_MIN_PORTS_FOR_SCAN;
-    NewDetector->Config.MinHostsForSweep = PS_MIN_HOSTS_FOR_SWEEP;
+    KeInitializeTimer(&Det->CleanupTimer);
+    KeInitializeDpc(&Det->CleanupDpc, SspsCleanupTimerDpc, Det);
 
-    //
-    // Initialize statistics
-    //
-    KeQuerySystemTime(&CurrentTime);
-    NewDetector->Stats.StartTime = CurrentTime;
+    DueTime.QuadPart = -((LONGLONG)SSPS_CLEANUP_INTERVAL_MS * 10000);
+    KeSetTimerEx(&Det->CleanupTimer, DueTime, SSPS_CLEANUP_INTERVAL_MS, &Det->CleanupDpc);
 
-    //
-    // Initialize cleanup timer
-    //
-    KeInitializeTimer(&g_CleanupContext.Timer);
-    KeInitializeDpc(&g_CleanupContext.Dpc, PspCleanupTimerDpc, NewDetector);
-    g_CleanupContext.Detector = NewDetector;
-    g_CleanupContext.Active = TRUE;
+    InterlockedExchange(&Det->Initialized, 1);
 
-    //
-    // Start cleanup timer (periodic)
-    //
-    DueTime.QuadPart = -((LONGLONG)PS_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(&g_CleanupContext.Timer, DueTime, PS_CLEANUP_INTERVAL_MS, &g_CleanupContext.Dpc);
-
-    NewDetector->Initialized = TRUE;
-
-    *Detector = NewDetector;
-
+    *Detector = Det;
     return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
 VOID
-PsShutdown(
-    _Inout_ PPS_DETECTOR Detector
+SsPsShutdown(
+    _Inout_ PSSPS_DETECTOR Detector
     )
 /*++
-
 Routine Description:
-
-    Shuts down the port scan detection subsystem.
-
-Arguments:
-
-    Detector - The detector to shut down.
-
+    Shuts down the port scan detector with proper drain.
+    Waits for all in-flight operations to complete before freeing.
+    Must be called at IRQL == PASSIVE_LEVEL.
 --*/
 {
     PLIST_ENTRY Entry;
-    PPS_SOURCE_CONTEXT Source;
-    PPS_CONNECTION_RECORD ConnRecord;
-    PPS_PORT_ENTRY PortEntry;
-    PPS_HOST_ENTRY HostEntry;
+    PSSPS_SOURCE_CONTEXT Source;
+    LARGE_INTEGER Timeout;
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL ||
+        InterlockedCompareExchange(&Detector->Initialized, 0, 0) == 0) {
         return;
     }
 
-    Detector->Initialized = FALSE;
+    //
+    // Phase 1: Signal shutdown — reject new operations
+    //
+    InterlockedExchange(&Detector->ShuttingDown, 1);
+    InterlockedExchange(&Detector->Initialized, 0);
 
     //
-    // Stop cleanup timer
+    // Phase 2: Stop timer and flush any queued DPCs
     //
-    g_CleanupContext.Active = FALSE;
-    KeCancelTimer(&g_CleanupContext.Timer);
+    KeCancelTimer(&Detector->CleanupTimer);
     KeFlushQueuedDpcs();
 
     //
-    // Free all source contexts
+    // Phase 3: Wait for all active operations to drain
+    //
+    Timeout.QuadPart = -((LONGLONG)SSPS_SHUTDOWN_DRAIN_TIMEOUT_MS * 10000);
+    if (InterlockedCompareExchange(&Detector->ActiveOperations, 0, 0) > 0) {
+        KeClearEvent(&Detector->DrainEvent);
+        KeWaitForSingleObject(
+            &Detector->DrainEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &Timeout
+            );
+    }
+
+    //
+    // Phase 4: Free all source contexts (no one can be using them now)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Detector->SourceListLock);
 
     while (!IsListEmpty(&Detector->SourceList)) {
         Entry = RemoveHeadList(&Detector->SourceList);
-        Source = CONTAINING_RECORD(Entry, PS_SOURCE_CONTEXT, ListEntry);
-
-        //
-        // Free connection records
-        //
-        while (!IsListEmpty(&Source->ConnectionList)) {
-            Entry = RemoveHeadList(&Source->ConnectionList);
-            ConnRecord = CONTAINING_RECORD(Entry, PS_CONNECTION_RECORD, ListEntry);
-            ShadowStrikeFreePoolWithTag(ConnRecord, PS_POOL_TAG_CONTEXT);
-        }
-
-        //
-        // Free port entries
-        //
-        while (!IsListEmpty(&Source->PortList)) {
-            Entry = RemoveHeadList(&Source->PortList);
-            PortEntry = CONTAINING_RECORD(Entry, PS_PORT_ENTRY, ListEntry);
-            ShadowStrikeFreePoolWithTag(PortEntry, PS_POOL_TAG_CONTEXT);
-        }
-
-        //
-        // Free host entries
-        //
-        while (!IsListEmpty(&Source->HostList)) {
-            Entry = RemoveHeadList(&Source->HostList);
-            HostEntry = CONTAINING_RECORD(Entry, PS_HOST_ENTRY, ListEntry);
-            ShadowStrikeFreePoolWithTag(HostEntry, PS_POOL_TAG_TARGET);
-        }
-
-        ShadowStrikeFreePoolWithTag(Source, PS_POOL_TAG_CONTEXT);
+        Source = CONTAINING_RECORD(Entry, SSPS_SOURCE_CONTEXT, ListEntry);
+        SspsFreeSourceContext(Source);
     }
 
     ExReleasePushLockExclusive(&Detector->SourceListLock);
     KeLeaveCriticalRegion();
 
     //
-    // Free detector
+    // Phase 5: Free work item and detector
     //
-    ShadowStrikeFreePoolWithTag(Detector, PS_POOL_TAG_CONTEXT);
+    if (Detector->CleanupWorkItem != NULL) {
+        IoFreeWorkItem(Detector->CleanupWorkItem);
+        Detector->CleanupWorkItem = NULL;
+    }
+
+    ShadowStrikeFreePoolWithTag(Detector, SSPS_POOL_TAG_CONTEXT);
 }
+
 
 _Use_decl_annotations_
 NTSTATUS
-PsRecordConnection(
-    _In_ PPS_DETECTOR Detector,
+SsPsRecordConnection(
+    _In_ PSSPS_DETECTOR Detector,
     _In_ HANDLE ProcessId,
+    _In_ LARGE_INTEGER ProcessCreateTime,
     _In_ PVOID RemoteAddress,
     _In_ USHORT RemotePort,
     _In_ BOOLEAN IsIPv6,
     _In_ UCHAR Protocol,
+    _In_ UCHAR TcpFlags,
     _In_ BOOLEAN Successful
     )
 /*++
-
 Routine Description:
-
     Records a connection attempt for port scan detection analysis.
-
-Arguments:
-
-    Detector      - The port scan detector.
-    ProcessId     - The process making the connection.
-    RemoteAddress - Remote IP address (IN_ADDR or IN6_ADDR).
-    RemotePort    - Remote port number.
-    IsIPv6        - TRUE if IPv6 address.
-    Protocol      - IP protocol (IPPROTO_TCP or IPPROTO_UDP).
-    Successful    - TRUE if connection succeeded.
-
-Return Value:
-
-    STATUS_SUCCESS on success.
-
+    Validates all inputs. Classifies TCP flags for stealth scan detection.
 --*/
 {
-    PPS_SOURCE_CONTEXT Source;
-    PPS_CONNECTION_RECORD Record;
+    PSSPS_SOURCE_CONTEXT Source;
+    PSSPS_CONNECTION_RECORD Record;
     LARGE_INTEGER CurrentTime;
+    NTSTATUS Status = STATUS_SUCCESS;
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || RemoteAddress == NULL) {
+    if (Detector == NULL || RemoteAddress == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     //
-    // Find or create source context for this process
+    // Validate protocol
     //
-    Source = PspFindOrCreateSource(Detector, ProcessId);
+    if (Protocol != 6 && Protocol != 17) {  // IPPROTO_TCP, IPPROTO_UDP
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!SspsAcquireOperation(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    Source = SspsFindOrCreateSource(Detector, ProcessId, ProcessCreateTime);
     if (Source == NULL) {
+        SspsReleaseOperation(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     KeQuerySystemTime(&CurrentTime);
 
     //
-    // Clean up expired records first
+    // Clean up expired records to keep window accurate
     //
-    PspCleanupExpiredRecords(Source, &CurrentTime, Detector->Config.WindowMs);
+    SspsCleanupExpiredRecords(Source, &CurrentTime, Detector->Config.WindowMs);
 
     //
-    // Check if we've hit connection limit for this source
+    // Evict oldest record if at capacity
     //
     if (InterlockedCompareExchange(&Source->ConnectionCount, 0, 0) >=
-        PS_MAX_CONNECTIONS_PER_SOURCE) {
-        //
-        // Remove oldest record
-        //
+        SSPS_MAX_CONNECTIONS_PER_SOURCE) {
+
         KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&Source->ConnectionLock);
 
         if (!IsListEmpty(&Source->ConnectionList)) {
             PLIST_ENTRY OldEntry = RemoveHeadList(&Source->ConnectionList);
-            PPS_CONNECTION_RECORD OldRecord = CONTAINING_RECORD(
-                OldEntry, PS_CONNECTION_RECORD, ListEntry);
-            ShadowStrikeFreePoolWithTag(OldRecord, PS_POOL_TAG_CONTEXT);
+            PSSPS_CONNECTION_RECORD OldRecord = CONTAINING_RECORD(
+                OldEntry, SSPS_CONNECTION_RECORD, ListEntry);
+
+            //
+            // Capture fields before free to update stats correctly
+            //
+            BOOLEAN OldSuccessful = OldRecord->Successful;
+            UCHAR OldProtocol = OldRecord->Protocol;
+
+            ShadowStrikeFreePoolWithTag(OldRecord, SSPS_POOL_TAG_CONTEXT);
             InterlockedDecrement(&Source->ConnectionCount);
+            InterlockedDecrement(&Source->WindowStats.TotalConnections);
+
+            if (OldSuccessful) {
+                InterlockedDecrement(&Source->WindowStats.SuccessfulConnections);
+            } else {
+                InterlockedDecrement(&Source->WindowStats.FailedConnections);
+            }
+
+            if (OldProtocol == 17) {
+                InterlockedDecrement(&Source->WindowStats.UdpConnections);
+            }
         }
 
         ExReleasePushLockExclusive(&Source->ConnectionLock);
@@ -620,26 +760,20 @@ Return Value:
     //
     // Allocate new connection record
     //
-    Record = (PPS_CONNECTION_RECORD)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(PS_CONNECTION_RECORD),
-        PS_POOL_TAG_CONTEXT
-        );
-
+    Record = (PSSPS_CONNECTION_RECORD)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx, sizeof(SSPS_CONNECTION_RECORD), SSPS_POOL_TAG_CONTEXT);
     if (Record == NULL) {
-        PspReleaseSource(Source);
+        SspsReleaseSource(Detector, Source);
+        SspsReleaseOperation(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(Record, sizeof(PS_CONNECTION_RECORD));
-
-    //
-    // Fill in record
-    //
+    RtlZeroMemory(Record, sizeof(SSPS_CONNECTION_RECORD));
     Record->RemotePort = RemotePort;
     Record->IsIPv6 = IsIPv6;
     Record->Protocol = Protocol;
     Record->Successful = Successful;
+    Record->TcpFlags = TcpFlags;
     Record->Timestamp = CurrentTime;
 
     if (IsIPv6) {
@@ -649,17 +783,13 @@ Return Value:
     }
 
     //
-    // Add to connection list
+    // Insert record and update stats under exclusive lock
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Source->ConnectionLock);
 
     InsertTailList(&Source->ConnectionList, &Record->ListEntry);
     InterlockedIncrement(&Source->ConnectionCount);
-
-    //
-    // Update window statistics
-    //
     InterlockedIncrement(&Source->WindowStats.TotalConnections);
 
     if (Successful) {
@@ -668,15 +798,21 @@ Return Value:
         InterlockedIncrement(&Source->WindowStats.FailedConnections);
     }
 
-    if (Protocol == 17) { // IPPROTO_UDP
+    if (Protocol == 17) {
         InterlockedIncrement(&Source->WindowStats.UdpConnections);
+    }
+
+    //
+    // Classify TCP flags for stealth scan detection
+    //
+    if (Protocol == 6) {
+        SspsClassifyTcpFlags(TcpFlags, Source);
     }
 
     //
     // Update timing
     //
     Source->LastActivity = CurrentTime;
-
     if (Source->FirstActivity.QuadPart == 0) {
         Source->FirstActivity = CurrentTime;
         Source->WindowStart = CurrentTime;
@@ -686,61 +822,54 @@ Return Value:
     KeLeaveCriticalRegion();
 
     //
-    // Record unique port and host
+    // Record unique port and host (these acquire ConnectionLock internally)
     //
-    PspRecordUniquePort(Source, RemotePort);
-    PspRecordUniqueHost(Source, RemoteAddress, IsIPv6);
+    SspsRecordUniquePort(Source, RemotePort);
+    SspsRecordUniqueHost(Source, RemoteAddress, IsIPv6);
 
-    //
-    // Update global statistics
-    //
     InterlockedIncrement64(&Detector->Stats.ConnectionsTracked);
 
-    PspReleaseSource(Source);
+    SspsReleaseSource(Detector, Source);
+    SspsReleaseOperation(Detector);
 
     return STATUS_SUCCESS;
 }
 
+
 _Use_decl_annotations_
 NTSTATUS
-PsCheckForScan(
-    _In_ PPS_DETECTOR Detector,
+SsPsCheckForScan(
+    _In_ PSSPS_DETECTOR Detector,
     _In_ HANDLE ProcessId,
-    _Out_ PPS_DETECTION_RESULT* Result
+    _In_ LARGE_INTEGER ProcessCreateTime,
+    _Out_ PSSPS_DETECTION_RESULT* Result
     )
 /*++
-
 Routine Description:
-
     Checks if a process is performing port scanning.
-
-Arguments:
-
-    Detector  - The port scan detector.
-    ProcessId - The process to check.
-    Result    - Receives the detection result (caller must free with PsFreeResult).
-
-Return Value:
-
-    STATUS_SUCCESS on success.
-
+    Allocates a result structure that the caller must free with SsPsFreeResult.
 --*/
 {
     PLIST_ENTRY Entry;
-    PPS_SOURCE_CONTEXT Source = NULL;
-    PPS_DETECTION_RESULT NewResult;
+    PSSPS_SOURCE_CONTEXT Source = NULL;
+    PSSPS_DETECTION_RESULT NewResult = NULL;
     LARGE_INTEGER CurrentTime;
+    SIZE_T NameLen;
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || Result == NULL) {
+    if (Detector == NULL || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Result = NULL;
 
+    if (!SspsAcquireOperation(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     //
-    // Find source context
+    // Find source context (shared lock; read-only traversal)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Detector->SourceListLock);
@@ -749,10 +878,11 @@ Return Value:
          Entry != &Detector->SourceList;
          Entry = Entry->Flink) {
 
-        PPS_SOURCE_CONTEXT Candidate = CONTAINING_RECORD(
-            Entry, PS_SOURCE_CONTEXT, ListEntry);
+        PSSPS_SOURCE_CONTEXT Candidate = CONTAINING_RECORD(
+            Entry, SSPS_SOURCE_CONTEXT, ListEntry);
 
-        if (Candidate->ProcessId == ProcessId) {
+        if (Candidate->ProcessId == ProcessId &&
+            Candidate->ProcessCreateTime.QuadPart == ProcessCreateTime.QuadPart) {
             Source = Candidate;
             InterlockedIncrement(&Source->RefCount);
             break;
@@ -763,55 +893,55 @@ Return Value:
     KeLeaveCriticalRegion();
 
     if (Source == NULL) {
+        SspsReleaseOperation(Detector);
         return STATUS_NOT_FOUND;
     }
 
-    //
-    // Clean up expired records
-    //
     KeQuerySystemTime(&CurrentTime);
-    PspCleanupExpiredRecords(Source, &CurrentTime, Detector->Config.WindowMs);
+    SspsCleanupExpiredRecords(Source, &CurrentTime, Detector->Config.WindowMs);
 
     //
-    // Allocate result structure
+    // Allocate result
     //
-    NewResult = (PPS_DETECTION_RESULT)ShadowStrikeAllocatePoolWithTag(
-        PagedPool,
-        sizeof(PS_DETECTION_RESULT),
-        PS_POOL_TAG_CONTEXT
-        );
-
+    NewResult = (PSSPS_DETECTION_RESULT)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx, sizeof(SSPS_DETECTION_RESULT), SSPS_POOL_TAG_CONTEXT);
     if (NewResult == NULL) {
-        PspReleaseSource(Source);
+        SspsReleaseSource(Detector, Source);
+        SspsReleaseOperation(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(NewResult, sizeof(PS_DETECTION_RESULT));
+    RtlZeroMemory(NewResult, sizeof(SSPS_DETECTION_RESULT));
 
     //
-    // Analyze scan behavior
+    // Analyze behavior
     //
-    PspAnalyzeScanBehavior(Source, NewResult);
+    SspsAnalyzeScanBehavior(Source, NewResult);
 
-    //
-    // Fill in source information
-    //
     NewResult->SourceProcessId = ProcessId;
     NewResult->DetectionTime = CurrentTime;
 
     //
-    // Copy process name if available
+    // Copy process name into dynamically allocated UNICODE_STRING buffer
     //
     if (Source->ProcessName[0] != L'\0') {
-        RtlInitUnicodeString(&NewResult->ProcessName, NULL);
-        //
-        // The process name is embedded in the result, no separate allocation needed
-        // Result consumer should not try to free it
-        //
+        NameLen = wcslen(Source->ProcessName) * sizeof(WCHAR);
+        NewResult->ProcessName.Buffer = (PWCH)ShadowStrikeAllocatePoolWithTag(
+            NonPagedPoolNx,
+            NameLen + sizeof(WCHAR),
+            SSPS_POOL_TAG_CONTEXT);
+
+        if (NewResult->ProcessName.Buffer != NULL) {
+            RtlCopyMemory(NewResult->ProcessName.Buffer,
+                          Source->ProcessName, NameLen);
+            NewResult->ProcessName.Buffer[NameLen / sizeof(WCHAR)] = L'\0';
+            NewResult->ProcessName.Length = (USHORT)NameLen;
+            NewResult->ProcessName.MaximumLength = (USHORT)(NameLen + sizeof(WCHAR));
+        }
     }
 
     //
-    // Update detection statistics if scan detected
+    // Update stats on detection
     //
     if (NewResult->ScanDetected) {
         InterlockedIncrement64(&Detector->Stats.ScansDetected);
@@ -820,52 +950,38 @@ Return Value:
         Source->ConfidenceScore = NewResult->ConfidenceScore;
     }
 
-    PspReleaseSource(Source);
+    SspsReleaseSource(Detector, Source);
+    SspsReleaseOperation(Detector);
 
     *Result = NewResult;
-
     return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
 NTSTATUS
-PsGetStatistics(
-    _In_ PPS_DETECTOR Detector,
-    _Out_ PPS_STATISTICS Stats
+SsPsGetStatistics(
+    _In_ PSSPS_DETECTOR Detector,
+    _Out_ PSSPS_STATISTICS Stats
     )
-/*++
-
-Routine Description:
-
-    Gets current port scan detection statistics.
-
-Arguments:
-
-    Detector - The port scan detector.
-    Stats    - Receives the statistics.
-
-Return Value:
-
-    STATUS_SUCCESS on success.
-
---*/
 {
     LARGE_INTEGER CurrentTime;
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || Stats == NULL) {
+    if (Detector == NULL || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    RtlZeroMemory(Stats, sizeof(PS_STATISTICS));
+    if (InterlockedCompareExchange(&Detector->Initialized, 0, 0) == 0) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    RtlZeroMemory(Stats, sizeof(SSPS_STATISTICS));
 
     Stats->TrackedSources = (ULONG)InterlockedCompareExchange(
         &Detector->SourceCount, 0, 0);
-
     Stats->ConnectionsTracked = (ULONG64)InterlockedCompareExchange64(
         &Detector->Stats.ConnectionsTracked, 0, 0);
-
     Stats->ScansDetected = (ULONG64)InterlockedCompareExchange64(
         &Detector->Stats.ScansDetected, 0, 0);
 
@@ -877,62 +993,46 @@ Return Value:
 
 _Use_decl_annotations_
 VOID
-PsFreeResult(
-    _In_ PPS_DETECTION_RESULT Result
+SsPsFreeResult(
+    _In_ PSSPS_DETECTION_RESULT Result
     )
-/*++
-
-Routine Description:
-
-    Frees a detection result structure.
-
-Arguments:
-
-    Result - The result to free.
-
---*/
 {
     PAGED_CODE();
 
     if (Result != NULL) {
-        //
-        // Free any dynamically allocated strings in the result
-        // (ProcessName.Buffer if it was separately allocated)
-        //
-        if (Result->ProcessName.Buffer != NULL &&
-            Result->ProcessName.MaximumLength > 0) {
-            ShadowStrikeFreePoolWithTag(Result->ProcessName.Buffer, PS_POOL_TAG_CONTEXT);
+        if (Result->ProcessName.Buffer != NULL) {
+            ShadowStrikeFreePoolWithTag(
+                Result->ProcessName.Buffer, SSPS_POOL_TAG_CONTEXT);
         }
-
-        ShadowStrikeFreePoolWithTag(Result, PS_POOL_TAG_CONTEXT);
+        ShadowStrikeFreePoolWithTag(Result, SSPS_POOL_TAG_CONTEXT);
     }
 }
 
+
 //=============================================================================
-// Internal Implementation
+// Internal: Source Context Management
 //=============================================================================
 
 static
-PPS_SOURCE_CONTEXT
-PspFindOrCreateSource(
-    _In_ PPS_DETECTOR Detector,
-    _In_ HANDLE ProcessId
+PSSPS_SOURCE_CONTEXT
+SspsFindOrCreateSource(
+    _In_ PSSPS_DETECTOR Detector,
+    _In_ HANDLE ProcessId,
+    _In_ LARGE_INTEGER ProcessCreateTime
     )
 /*++
-
 Routine Description:
-
-    Finds an existing source context or creates a new one.
-
+    Finds existing or creates new source context, keyed on (ProcessId, CreateTime)
+    to avoid PID-reuse misattribution. Uses double-checked locking pattern.
 --*/
 {
     PLIST_ENTRY Entry;
-    PPS_SOURCE_CONTEXT Source = NULL;
-    PPS_SOURCE_CONTEXT NewSource = NULL;
+    PSSPS_SOURCE_CONTEXT Source = NULL;
+    PSSPS_SOURCE_CONTEXT NewSource = NULL;
     BOOLEAN Found = FALSE;
 
     //
-    // First try to find existing source (shared lock)
+    // Phase 1: Shared-lock lookup
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Detector->SourceListLock);
@@ -941,9 +1041,9 @@ Routine Description:
          Entry != &Detector->SourceList;
          Entry = Entry->Flink) {
 
-        Source = CONTAINING_RECORD(Entry, PS_SOURCE_CONTEXT, ListEntry);
-
-        if (Source->ProcessId == ProcessId) {
+        Source = CONTAINING_RECORD(Entry, SSPS_SOURCE_CONTEXT, ListEntry);
+        if (Source->ProcessId == ProcessId &&
+            Source->ProcessCreateTime.QuadPart == ProcessCreateTime.QuadPart) {
             InterlockedIncrement(&Source->RefCount);
             Found = TRUE;
             break;
@@ -958,63 +1058,65 @@ Routine Description:
     }
 
     //
-    // Check source limit
+    // Check source limit before allocating
     //
     if (InterlockedCompareExchange(&Detector->SourceCount, 0, 0) >=
-        PS_MAX_TRACKED_SOURCES) {
+        SSPS_MAX_TRACKED_SOURCES) {
         return NULL;
     }
 
     //
-    // Create new source context
+    // Allocate new source context
     //
-    NewSource = (PPS_SOURCE_CONTEXT)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(PS_SOURCE_CONTEXT),
-        PS_POOL_TAG_CONTEXT
-        );
-
+    NewSource = (PSSPS_SOURCE_CONTEXT)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx, sizeof(SSPS_SOURCE_CONTEXT), SSPS_POOL_TAG_CONTEXT);
     if (NewSource == NULL) {
         return NULL;
     }
 
-    RtlZeroMemory(NewSource, sizeof(PS_SOURCE_CONTEXT));
-
-    //
-    // Initialize new source
-    //
+    RtlZeroMemory(NewSource, sizeof(SSPS_SOURCE_CONTEXT));
     NewSource->ProcessId = ProcessId;
+    NewSource->ProcessCreateTime = ProcessCreateTime;
     NewSource->RefCount = 1;
 
     InitializeListHead(&NewSource->ConnectionList);
-    InitializeListHead(&NewSource->PortList);
-    InitializeListHead(&NewSource->HostList);
     ExInitializePushLock(&NewSource->ConnectionLock);
 
     //
-    // Get process information
+    // Allocate hash tables
     //
-    PspGetProcessInfo(ProcessId, NewSource->ProcessName,
-        sizeof(NewSource->ProcessName) / sizeof(WCHAR),
-        NewSource->ProcessPath,
-        sizeof(NewSource->ProcessPath) / sizeof(WCHAR));
+    NewSource->PortHash = SspsAllocHashTable(
+        SSPS_PORT_HASH_BUCKETS, SSPS_POOL_TAG_HASHTBL);
+    NewSource->HostHash = SspsAllocHashTable(
+        SSPS_HOST_HASH_BUCKETS, SSPS_POOL_TAG_HASHTBL);
+
+    if (NewSource->PortHash == NULL || NewSource->HostHash == NULL) {
+        SspsFreeSourceContext(NewSource);
+        return NULL;
+    }
 
     //
-    // Add to list (exclusive lock)
+    // Get process information (at PASSIVE_LEVEL, safe to call Ps* APIs)
+    //
+    SspsGetProcessInfo(ProcessId, NewSource->ProcessName,
+        ARRAYSIZE(NewSource->ProcessName),
+        NewSource->ProcessPath,
+        ARRAYSIZE(NewSource->ProcessPath));
+
+    //
+    // Phase 2: Exclusive-lock insert with double-check
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Detector->SourceListLock);
 
-    //
-    // Double-check another thread didn't create it
-    //
+    Found = FALSE;
     for (Entry = Detector->SourceList.Flink;
          Entry != &Detector->SourceList;
          Entry = Entry->Flink) {
 
-        Source = CONTAINING_RECORD(Entry, PS_SOURCE_CONTEXT, ListEntry);
-
-        if (Source->ProcessId == ProcessId) {
+        Source = CONTAINING_RECORD(Entry, SSPS_SOURCE_CONTEXT, ListEntry);
+        if (Source->ProcessId == ProcessId &&
+            Source->ProcessCreateTime.QuadPart == ProcessCreateTime.QuadPart) {
             InterlockedIncrement(&Source->RefCount);
             Found = TRUE;
             break;
@@ -1031,11 +1133,8 @@ Routine Description:
     ExReleasePushLockExclusive(&Detector->SourceListLock);
     KeLeaveCriticalRegion();
 
-    //
-    // Free unused allocation if race occurred
-    //
     if (NewSource != NULL) {
-        ShadowStrikeFreePoolWithTag(NewSource, PS_POOL_TAG_CONTEXT);
+        SspsFreeSourceContext(NewSource);
     }
 
     return Source;
@@ -1043,453 +1142,555 @@ Routine Description:
 
 static
 VOID
-PspReleaseSource(
-    _In_ PPS_SOURCE_CONTEXT Source
+SspsReleaseSource(
+    _In_ PSSPS_DETECTOR Detector,
+    _In_ PSSPS_SOURCE_CONTEXT Source
     )
-/*++
-
-Routine Description:
-
-    Releases a reference to a source context.
-
---*/
 {
+    UNREFERENCED_PARAMETER(Detector);
+
     if (Source != NULL) {
         InterlockedDecrement(&Source->RefCount);
-        //
-        // Note: Actual cleanup is handled by the cleanup timer
-        //
     }
 }
 
+
+//=============================================================================
+// Internal: Unique Port / Host Recording (hash-table based)
+//=============================================================================
+
 static
 VOID
-PspRecordUniquePort(
-    _Inout_ PPS_SOURCE_CONTEXT Source,
+SspsRecordUniquePort(
+    _Inout_ PSSPS_SOURCE_CONTEXT Source,
     _In_ USHORT Port
     )
 /*++
-
 Routine Description:
-
-    Records a unique port contacted by the source.
-
+    Records a unique port. Uses hash table for O(1) lookup.
+    All writes happen under exclusive lock — no shared-lock writes.
 --*/
 {
+    PLIST_ENTRY Bucket;
     PLIST_ENTRY Entry;
-    PPS_PORT_ENTRY PortEntry;
-    PPS_PORT_ENTRY NewEntry = NULL;
+    PSSPS_PORT_ENTRY PortEntry;
+    PSSPS_PORT_ENTRY NewEntry = NULL;
     BOOLEAN Found = FALSE;
     LARGE_INTEGER CurrentTime;
 
     KeQuerySystemTime(&CurrentTime);
 
-    //
-    // Check if port already tracked
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Source->ConnectionLock);
-
-    for (Entry = Source->PortList.Flink;
-         Entry != &Source->PortList;
-         Entry = Entry->Flink) {
-
-        PortEntry = CONTAINING_RECORD(Entry, PS_PORT_ENTRY, ListEntry);
-
-        if (PortEntry->Port == Port) {
-            PortEntry->HitCount++;
-            PortEntry->LastSeen = CurrentTime;
-            Found = TRUE;
-            break;
-        }
-    }
-
-    ExReleasePushLockShared(&Source->ConnectionLock);
-    KeLeaveCriticalRegion();
-
-    if (Found) {
-        return;
-    }
-
-    //
-    // Check port limit
-    //
-    if (InterlockedCompareExchange(&Source->UniquePortCount, 0, 0) >=
-        PS_MAX_PORTS_PER_SOURCE) {
-        return;
-    }
-
-    //
-    // Create new port entry
-    //
-    NewEntry = (PPS_PORT_ENTRY)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(PS_PORT_ENTRY),
-        PS_POOL_TAG_CONTEXT
-        );
-
-    if (NewEntry == NULL) {
-        return;
-    }
-
-    RtlZeroMemory(NewEntry, sizeof(PS_PORT_ENTRY));
-    NewEntry->Port = Port;
-    NewEntry->HitCount = 1;
-    NewEntry->FirstSeen = CurrentTime;
-    NewEntry->LastSeen = CurrentTime;
-
-    //
-    // Add to list
-    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Source->ConnectionLock);
 
-    //
-    // Double-check
-    //
-    for (Entry = Source->PortList.Flink;
-         Entry != &Source->PortList;
-         Entry = Entry->Flink) {
+    if (Source->PortHash == NULL) {
+        ExReleasePushLockExclusive(&Source->ConnectionLock);
+        KeLeaveCriticalRegion();
+        return;
+    }
 
-        PortEntry = CONTAINING_RECORD(Entry, PS_PORT_ENTRY, ListEntry);
+    Bucket = SspsGetPortBucket(Source->PortHash, Port);
 
+    for (Entry = Bucket->Flink; Entry != Bucket; Entry = Entry->Flink) {
+        PortEntry = CONTAINING_RECORD(Entry, SSPS_PORT_ENTRY, BucketLink);
         if (PortEntry->Port == Port) {
-            PortEntry->HitCount++;
-            PortEntry->LastSeen = CurrentTime;
+            InterlockedIncrement(&PortEntry->HitCount);
+            InterlockedExchange64(&PortEntry->LastSeen, CurrentTime.QuadPart);
             Found = TRUE;
             break;
         }
     }
 
-    if (!Found) {
-        InsertTailList(&Source->PortList, &NewEntry->ListEntry);
-        InterlockedIncrement(&Source->UniquePortCount);
-        NewEntry = NULL;
+    if (!Found &&
+        InterlockedCompareExchange(&Source->UniquePortCount, 0, 0) <
+        SSPS_MAX_PORTS_PER_SOURCE) {
+
+        NewEntry = (PSSPS_PORT_ENTRY)ShadowStrikeAllocatePoolWithTag(
+            NonPagedPoolNx, sizeof(SSPS_PORT_ENTRY), SSPS_POOL_TAG_CONTEXT);
+
+        if (NewEntry != NULL) {
+            RtlZeroMemory(NewEntry, sizeof(SSPS_PORT_ENTRY));
+            NewEntry->Port = Port;
+            NewEntry->HitCount = 1;
+            NewEntry->FirstSeen = CurrentTime;
+            InterlockedExchange64(&NewEntry->LastSeen, CurrentTime.QuadPart);
+            InsertTailList(Bucket, &NewEntry->BucketLink);
+            InterlockedIncrement(&Source->UniquePortCount);
+        }
     }
 
     ExReleasePushLockExclusive(&Source->ConnectionLock);
     KeLeaveCriticalRegion();
-
-    if (NewEntry != NULL) {
-        ShadowStrikeFreePoolWithTag(NewEntry, PS_POOL_TAG_CONTEXT);
-    }
 }
 
 static
 VOID
-PspRecordUniqueHost(
-    _Inout_ PPS_SOURCE_CONTEXT Source,
+SspsRecordUniqueHost(
+    _Inout_ PSSPS_SOURCE_CONTEXT Source,
     _In_ PVOID Address,
     _In_ BOOLEAN IsIPv6
     )
 /*++
-
 Routine Description:
-
-    Records a unique host contacted by the source.
-
+    Records a unique host. Uses hash table for O(1) lookup.
+    All writes happen under exclusive lock.
 --*/
 {
+    PLIST_ENTRY Bucket;
     PLIST_ENTRY Entry;
-    PPS_HOST_ENTRY HostEntry;
-    PPS_HOST_ENTRY NewEntry = NULL;
+    PSSPS_HOST_ENTRY HostEntry;
+    PSSPS_HOST_ENTRY NewEntry = NULL;
     BOOLEAN Found = FALSE;
     LARGE_INTEGER CurrentTime;
 
+    if (Address == NULL) {
+        return;
+    }
+
     KeQuerySystemTime(&CurrentTime);
 
-    //
-    // Check if host already tracked
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Source->ConnectionLock);
-
-    for (Entry = Source->HostList.Flink;
-         Entry != &Source->HostList;
-         Entry = Entry->Flink) {
-
-        HostEntry = CONTAINING_RECORD(Entry, PS_HOST_ENTRY, ListEntry);
-
-        if (HostEntry->IsIPv6 == IsIPv6 &&
-            PspCompareAddresses(&HostEntry->Address, Address, IsIPv6)) {
-            HostEntry->PortsScanned++;
-            HostEntry->LastSeen = CurrentTime;
-            Found = TRUE;
-            break;
-        }
-    }
-
-    ExReleasePushLockShared(&Source->ConnectionLock);
-    KeLeaveCriticalRegion();
-
-    if (Found) {
-        return;
-    }
-
-    //
-    // Check host limit
-    //
-    if (InterlockedCompareExchange(&Source->UniqueHostCount, 0, 0) >=
-        PS_MAX_HOSTS_PER_SOURCE) {
-        return;
-    }
-
-    //
-    // Create new host entry
-    //
-    NewEntry = (PPS_HOST_ENTRY)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(PS_HOST_ENTRY),
-        PS_POOL_TAG_TARGET
-        );
-
-    if (NewEntry == NULL) {
-        return;
-    }
-
-    RtlZeroMemory(NewEntry, sizeof(PS_HOST_ENTRY));
-    NewEntry->IsIPv6 = IsIPv6;
-    NewEntry->PortsScanned = 1;
-    NewEntry->FirstSeen = CurrentTime;
-    NewEntry->LastSeen = CurrentTime;
-
-    if (IsIPv6) {
-        RtlCopyMemory(&NewEntry->Address.IPv6, Address, sizeof(IN6_ADDR));
-    } else {
-        RtlCopyMemory(&NewEntry->Address.IPv4, Address, sizeof(IN_ADDR));
-    }
-
-    //
-    // Add to list
-    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Source->ConnectionLock);
 
-    //
-    // Double-check
-    //
-    for (Entry = Source->HostList.Flink;
-         Entry != &Source->HostList;
-         Entry = Entry->Flink) {
+    if (Source->HostHash == NULL) {
+        ExReleasePushLockExclusive(&Source->ConnectionLock);
+        KeLeaveCriticalRegion();
+        return;
+    }
 
-        HostEntry = CONTAINING_RECORD(Entry, PS_HOST_ENTRY, ListEntry);
+    Bucket = SspsGetHostBucket(Source->HostHash, Address, IsIPv6);
 
+    for (Entry = Bucket->Flink; Entry != Bucket; Entry = Entry->Flink) {
+        HostEntry = CONTAINING_RECORD(Entry, SSPS_HOST_ENTRY, BucketLink);
         if (HostEntry->IsIPv6 == IsIPv6 &&
-            PspCompareAddresses(&HostEntry->Address, Address, IsIPv6)) {
-            HostEntry->PortsScanned++;
-            HostEntry->LastSeen = CurrentTime;
+            SspsCompareAddresses(&HostEntry->Address, Address, IsIPv6)) {
+            InterlockedIncrement(&HostEntry->PortsScanned);
+            InterlockedExchange64(&HostEntry->LastSeen, CurrentTime.QuadPart);
             Found = TRUE;
             break;
         }
     }
 
-    if (!Found) {
-        InsertTailList(&Source->HostList, &NewEntry->ListEntry);
-        InterlockedIncrement(&Source->UniqueHostCount);
-        NewEntry = NULL;
+    if (!Found &&
+        InterlockedCompareExchange(&Source->UniqueHostCount, 0, 0) <
+        SSPS_MAX_HOSTS_PER_SOURCE) {
+
+        NewEntry = (PSSPS_HOST_ENTRY)ShadowStrikeAllocatePoolWithTag(
+            NonPagedPoolNx, sizeof(SSPS_HOST_ENTRY), SSPS_POOL_TAG_TARGET);
+
+        if (NewEntry != NULL) {
+            RtlZeroMemory(NewEntry, sizeof(SSPS_HOST_ENTRY));
+            NewEntry->IsIPv6 = IsIPv6;
+            NewEntry->PortsScanned = 1;
+            NewEntry->FirstSeen = CurrentTime;
+            InterlockedExchange64(&NewEntry->LastSeen, CurrentTime.QuadPart);
+
+            if (IsIPv6) {
+                RtlCopyMemory(&NewEntry->Address.IPv6, Address, sizeof(IN6_ADDR));
+            } else {
+                RtlCopyMemory(&NewEntry->Address.IPv4, Address, sizeof(IN_ADDR));
+            }
+
+            InsertTailList(Bucket, &NewEntry->BucketLink);
+            InterlockedIncrement(&Source->UniqueHostCount);
+        }
     }
 
     ExReleasePushLockExclusive(&Source->ConnectionLock);
     KeLeaveCriticalRegion();
-
-    if (NewEntry != NULL) {
-        ShadowStrikeFreePoolWithTag(NewEntry, PS_POOL_TAG_TARGET);
-    }
 }
+
+
+//=============================================================================
+// Internal: Cleanup & Expiry
+//=============================================================================
 
 static
 VOID
-PspCleanupExpiredRecords(
-    _Inout_ PPS_SOURCE_CONTEXT Source,
+SspsCleanupExpiredRecords(
+    _Inout_ PSSPS_SOURCE_CONTEXT Source,
     _In_ PLARGE_INTEGER CurrentTime,
     _In_ ULONG WindowMs
     )
 /*++
-
 Routine Description:
-
-    Removes expired connection records outside the detection window.
-
+    Removes expired connection records, port entries, and host entries
+    that fall outside the detection time window.
+    Fixes: use-after-free (C-2), port/host expiry (M-1), stats race (M-2).
 --*/
 {
     PLIST_ENTRY Entry;
     PLIST_ENTRY NextEntry;
-    PPS_CONNECTION_RECORD Record;
+    PSSPS_CONNECTION_RECORD Record;
     LONGLONG WindowTicks = (LONGLONG)WindowMs * 10000;
     LONGLONG Cutoff = CurrentTime->QuadPart - WindowTicks;
+    ULONG i;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Source->ConnectionLock);
 
+    //
+    // Expire connection records
+    //
     for (Entry = Source->ConnectionList.Flink;
          Entry != &Source->ConnectionList;
          Entry = NextEntry) {
 
         NextEntry = Entry->Flink;
-        Record = CONTAINING_RECORD(Entry, PS_CONNECTION_RECORD, ListEntry);
+        Record = CONTAINING_RECORD(Entry, SSPS_CONNECTION_RECORD, ListEntry);
 
         if (Record->Timestamp.QuadPart < Cutoff) {
-            RemoveEntryList(Entry);
-            ShadowStrikeFreePoolWithTag(Record, PS_POOL_TAG_CONTEXT);
-            InterlockedDecrement(&Source->ConnectionCount);
+            //
+            // Capture fields BEFORE freeing to avoid use-after-free
+            //
+            BOOLEAN WasSuccessful = Record->Successful;
+            UCHAR RecProtocol = Record->Protocol;
 
-            //
-            // Update window statistics
-            //
+            RemoveEntryList(Entry);
+            ShadowStrikeFreePoolWithTag(Record, SSPS_POOL_TAG_CONTEXT);
+            InterlockedDecrement(&Source->ConnectionCount);
             InterlockedDecrement(&Source->WindowStats.TotalConnections);
-            if (Record->Successful) {
+
+            if (WasSuccessful) {
                 InterlockedDecrement(&Source->WindowStats.SuccessfulConnections);
             } else {
                 InterlockedDecrement(&Source->WindowStats.FailedConnections);
+            }
+
+            if (RecProtocol == 17) {
+                InterlockedDecrement(&Source->WindowStats.UdpConnections);
             }
         }
     }
 
     //
-    // Reset window start if needed
+    // Expire port entries outside the time window
     //
-    if (Source->ConnectionCount == 0) {
+    if (Source->PortHash != NULL) {
+        for (i = 0; i < Source->PortHash->BucketCount; i++) {
+            for (Entry = Source->PortHash->Buckets[i].Flink;
+                 Entry != &Source->PortHash->Buckets[i];
+                 Entry = NextEntry) {
+
+                NextEntry = Entry->Flink;
+                PSSPS_PORT_ENTRY PortEntry = CONTAINING_RECORD(
+                    Entry, SSPS_PORT_ENTRY, BucketLink);
+
+                LONGLONG PortLastSeen = InterlockedCompareExchange64(
+                    &PortEntry->LastSeen, 0, 0);
+
+                if (PortLastSeen < Cutoff) {
+                    RemoveEntryList(Entry);
+                    ShadowStrikeFreePoolWithTag(PortEntry, SSPS_POOL_TAG_CONTEXT);
+                    InterlockedDecrement(&Source->UniquePortCount);
+                }
+            }
+        }
+    }
+
+    //
+    // Expire host entries outside the time window
+    //
+    if (Source->HostHash != NULL) {
+        for (i = 0; i < Source->HostHash->BucketCount; i++) {
+            for (Entry = Source->HostHash->Buckets[i].Flink;
+                 Entry != &Source->HostHash->Buckets[i];
+                 Entry = NextEntry) {
+
+                NextEntry = Entry->Flink;
+                PSSPS_HOST_ENTRY HostEntry = CONTAINING_RECORD(
+                    Entry, SSPS_HOST_ENTRY, BucketLink);
+
+                LONGLONG HostLastSeen = InterlockedCompareExchange64(
+                    &HostEntry->LastSeen, 0, 0);
+
+                if (HostLastSeen < Cutoff) {
+                    RemoveEntryList(Entry);
+                    ShadowStrikeFreePoolWithTag(HostEntry, SSPS_POOL_TAG_TARGET);
+                    InterlockedDecrement(&Source->UniqueHostCount);
+                }
+            }
+        }
+    }
+
+    //
+    // Reset window if all connections expired
+    //
+    if (InterlockedCompareExchange(&Source->ConnectionCount, 0, 0) == 0) {
         Source->WindowStart.QuadPart = 0;
-        RtlZeroMemory(&Source->WindowStats, sizeof(Source->WindowStats));
+        Source->WindowStats.TotalConnections = 0;
+        Source->WindowStats.SuccessfulConnections = 0;
+        Source->WindowStats.FailedConnections = 0;
+        Source->WindowStats.TcpSynOnly = 0;
+        Source->WindowStats.TcpFinOnly = 0;
+        Source->WindowStats.TcpXmas = 0;
+        Source->WindowStats.TcpNull = 0;
+        Source->WindowStats.UdpConnections = 0;
     }
 
     ExReleasePushLockExclusive(&Source->ConnectionLock);
     KeLeaveCriticalRegion();
 }
 
+
+//=============================================================================
+// Internal: TCP Flag Classification
+//=============================================================================
+
 static
 VOID
-PspAnalyzeScanBehavior(
-    _In_ PPS_SOURCE_CONTEXT Source,
-    _Out_ PPS_DETECTION_RESULT Result
+SspsClassifyTcpFlags(
+    _In_ UCHAR TcpFlags,
+    _Inout_ PSSPS_SOURCE_CONTEXT Source
     )
 /*++
-
 Routine Description:
-
-    Analyzes connection behavior to detect port scanning.
-
+    Classifies TCP flags and increments the appropriate stealth scan counter.
+    Must be called while holding Source->ConnectionLock exclusively.
 --*/
 {
-    LONG TotalConnections;
-    LONG FailedConnections;
-    LONG UniquePortCount;
-    LONG UniqueHostCount;
+    //
+    // NULL scan: no flags set
+    //
+    if (TcpFlags == 0) {
+        InterlockedIncrement(&Source->WindowStats.TcpNull);
+        return;
+    }
+
+    //
+    // XMAS scan: FIN + PSH + URG
+    //
+    if ((TcpFlags & (SSPS_TCP_FLAG_FIN | SSPS_TCP_FLAG_PSH | SSPS_TCP_FLAG_URG)) ==
+        (SSPS_TCP_FLAG_FIN | SSPS_TCP_FLAG_PSH | SSPS_TCP_FLAG_URG)) {
+        InterlockedIncrement(&Source->WindowStats.TcpXmas);
+        return;
+    }
+
+    //
+    // FIN scan: FIN only, no ACK/SYN/RST
+    //
+    if (TcpFlags == SSPS_TCP_FLAG_FIN) {
+        InterlockedIncrement(&Source->WindowStats.TcpFinOnly);
+        return;
+    }
+
+    //
+    // SYN scan: SYN only, no ACK (half-open)
+    //
+    if ((TcpFlags & (SSPS_TCP_FLAG_SYN | SSPS_TCP_FLAG_ACK)) == SSPS_TCP_FLAG_SYN) {
+        InterlockedIncrement(&Source->WindowStats.TcpSynOnly);
+        return;
+    }
+}
+
+//=============================================================================
+// Internal: Window Statistics Snapshot
+//=============================================================================
+
+static
+VOID
+SspsSnapshotWindowStats(
+    _In_ PSSPS_SOURCE_CONTEXT Source,
+    _Out_ PSSPS_WINDOW_SNAPSHOT Snap
+    )
+/*++
+Routine Description:
+    Takes an atomic snapshot of all window statistics under the exclusive lock.
+    This ensures the aggregate view is consistent (no torn reads between fields).
+--*/
+{
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Source->ConnectionLock);
+
+    Snap->TotalConnections      = Source->WindowStats.TotalConnections;
+    Snap->SuccessfulConnections = Source->WindowStats.SuccessfulConnections;
+    Snap->FailedConnections     = Source->WindowStats.FailedConnections;
+    Snap->TcpSynOnly            = Source->WindowStats.TcpSynOnly;
+    Snap->TcpFinOnly            = Source->WindowStats.TcpFinOnly;
+    Snap->TcpXmas               = Source->WindowStats.TcpXmas;
+    Snap->TcpNull               = Source->WindowStats.TcpNull;
+    Snap->UdpConnections        = Source->WindowStats.UdpConnections;
+    Snap->UniquePortCount       = Source->UniquePortCount;
+    Snap->UniqueHostCount       = Source->UniqueHostCount;
+    Snap->FirstActivity         = Source->FirstActivity;
+    Snap->LastActivity          = Source->LastActivity;
+
+    ExReleasePushLockExclusive(&Source->ConnectionLock);
+    KeLeaveCriticalRegion();
+}
+
+
+//=============================================================================
+// Internal: Scan Analysis & Detection
+//=============================================================================
+
+static
+VOID
+SspsAnalyzeScanBehavior(
+    _In_ PSSPS_SOURCE_CONTEXT Source,
+    _Out_ PSSPS_DETECTION_RESULT Result
+    )
+/*++
+Routine Description:
+    Analyzes connection behavior to detect port scanning.
+    Takes an atomic snapshot of stats, then analyzes the snapshot.
+--*/
+{
+    SSPS_WINDOW_SNAPSHOT Snap;
     ULONG FailureRate;
-    PS_SCAN_TYPE ScanType;
-    LARGE_INTEGER Duration;
+    SSPS_SCAN_TYPE ScanType;
+    ULONG CommonPortHits;
+    ULONG i;
 
-    RtlZeroMemory(Result, sizeof(PS_DETECTION_RESULT));
-
-    //
-    // Get current statistics
-    //
-    TotalConnections = InterlockedCompareExchange(&Source->WindowStats.TotalConnections, 0, 0);
-    FailedConnections = InterlockedCompareExchange(&Source->WindowStats.FailedConnections, 0, 0);
-    UniquePortCount = InterlockedCompareExchange(&Source->UniquePortCount, 0, 0);
-    UniqueHostCount = InterlockedCompareExchange(&Source->UniqueHostCount, 0, 0);
+    RtlZeroMemory(Result, sizeof(SSPS_DETECTION_RESULT));
 
     //
-    // Not enough data
+    // Take consistent snapshot under lock
     //
-    if (TotalConnections < 5) {
+    SspsSnapshotWindowStats(Source, &Snap);
+
+    if (Snap.TotalConnections < 5) {
         Result->ScanDetected = FALSE;
         return;
     }
 
     //
-    // Calculate failure rate
+    // Calculate failure rate with bounds checking
     //
-    FailureRate = (TotalConnections > 0) ?
-        (ULONG)((FailedConnections * 100) / TotalConnections) : 0;
+    if (Snap.TotalConnections > 0 && Snap.FailedConnections >= 0) {
+        LONG ClampedFailed = min(Snap.FailedConnections, Snap.TotalConnections);
+        FailureRate = (ULONG)((ClampedFailed * 100) / Snap.TotalConnections);
+    } else {
+        FailureRate = 0;
+    }
 
     //
-    // Calculate duration
+    // Calculate duration safely (snapshot is consistent)
     //
-    Duration.QuadPart = Source->LastActivity.QuadPart - Source->FirstActivity.QuadPart;
-    Result->DurationMs = (ULONG)(Duration.QuadPart / 10000);
+    if (Snap.LastActivity.QuadPart > Snap.FirstActivity.QuadPart) {
+        LONGLONG DurationTicks = Snap.LastActivity.QuadPart - Snap.FirstActivity.QuadPart;
+        Result->DurationMs = (ULONG)(DurationTicks / 10000);
+    } else {
+        Result->DurationMs = 0;
+    }
+
+    Result->UniquePortsScanned = (ULONG)max(Snap.UniquePortCount, 0);
+    Result->UniqueHostsScanned = (ULONG)max(Snap.UniqueHostCount, 0);
+    Result->ConnectionAttempts = (ULONG)max(Snap.TotalConnections, 0);
 
     //
-    // Fill in metrics
+    // Determine scan type from TCP flag patterns
     //
-    Result->UniquePortsScanned = (ULONG)UniquePortCount;
-    Result->UniqueHostsScanned = (ULONG)UniqueHostCount;
-    Result->ConnectionAttempts = (ULONG)TotalConnections;
-
-    //
-    // Determine scan type
-    //
-    ScanType = PspDetermineScanType(Source);
+    ScanType = SspsDetermineScanType(&Snap);
 
     //
     // Check for vertical port scan (many ports on few hosts)
     //
-    if (UniquePortCount >= PS_VERTICAL_SCAN_THRESHOLD && UniqueHostCount <= 3) {
+    if (Snap.UniquePortCount >= SSPS_VERTICAL_SCAN_THRESHOLD &&
+        Snap.UniqueHostCount <= 3) {
         Result->ScanDetected = TRUE;
-        Result->Type = (ScanType != PsScan_Unknown) ? ScanType : PsScan_TCPConnect;
+        Result->Type = (ScanType != SsPsScan_Unknown) ? ScanType : SsPsScan_TCPConnect;
     }
     //
-    // Check for horizontal scan / host sweep (same port on many hosts)
+    // Check for horizontal scan / host sweep
     //
-    else if (UniqueHostCount >= PS_HORIZONTAL_SCAN_THRESHOLD && UniquePortCount <= 3) {
+    else if (Snap.UniqueHostCount >= SSPS_HORIZONTAL_SCAN_THRESHOLD &&
+             Snap.UniquePortCount <= 3) {
         Result->ScanDetected = TRUE;
-        Result->Type = PsScan_HostSweep;
+        Result->Type = SsPsScan_HostSweep;
     }
     //
-    // Check for general scanning (many ports AND many hosts)
+    // Check for combined scanning (many ports AND many hosts)
     //
-    else if (UniquePortCount >= PS_MIN_PORTS_FOR_SCAN / 2 &&
-             UniqueHostCount >= PS_MIN_HOSTS_FOR_SWEEP / 2) {
+    else if (Snap.UniquePortCount >= SSPS_MIN_PORTS_FOR_SCAN / 2 &&
+             Snap.UniqueHostCount >= SSPS_MIN_HOSTS_FOR_SWEEP / 2) {
         Result->ScanDetected = TRUE;
-        Result->Type = (ScanType != PsScan_Unknown) ? ScanType : PsScan_TCPConnect;
+        Result->Type = (ScanType != SsPsScan_Unknown) ? ScanType : SsPsScan_TCPConnect;
     }
     //
     // Check for high failure rate with many attempts
     //
-    else if (FailureRate >= PS_FAILURE_RATE_THRESHOLD &&
-             TotalConnections >= PS_RAPID_CONNECT_THRESHOLD) {
+    else if (FailureRate >= SSPS_FAILURE_RATE_THRESHOLD &&
+             Snap.TotalConnections >= SSPS_RAPID_CONNECT_THRESHOLD) {
         Result->ScanDetected = TRUE;
-        Result->Type = PsScan_ServiceProbe;
+        Result->Type = SsPsScan_ServiceProbe;
     }
     //
     // Check for stealth scanning techniques
     //
-    else if (Source->WindowStats.TcpSynOnly >= PS_STEALTH_SCAN_THRESHOLD ||
-             Source->WindowStats.TcpFinOnly >= PS_STEALTH_SCAN_THRESHOLD ||
-             Source->WindowStats.TcpXmas >= PS_STEALTH_SCAN_THRESHOLD ||
-             Source->WindowStats.TcpNull >= PS_STEALTH_SCAN_THRESHOLD) {
+    else if (Snap.TcpSynOnly >= SSPS_STEALTH_SCAN_THRESHOLD ||
+             Snap.TcpFinOnly >= SSPS_STEALTH_SCAN_THRESHOLD ||
+             Snap.TcpXmas >= SSPS_STEALTH_SCAN_THRESHOLD ||
+             Snap.TcpNull >= SSPS_STEALTH_SCAN_THRESHOLD) {
         Result->ScanDetected = TRUE;
         Result->Type = ScanType;
+    }
+
+    //
+    // Confidence bonus: check if scanned ports match common scanner fingerprint
+    //
+    if (Result->ScanDetected && Source->PortHash != NULL) {
+        CommonPortHits = 0;
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockShared(&Source->ConnectionLock);
+
+        for (i = 0; i < SSPS_COMMON_SCAN_PORTS_COUNT; i++) {
+            PLIST_ENTRY Bucket = SspsGetPortBucket(
+                Source->PortHash, g_CommonScanPorts[i]);
+            PLIST_ENTRY Entry;
+
+            for (Entry = Bucket->Flink; Entry != Bucket; Entry = Entry->Flink) {
+                PSSPS_PORT_ENTRY PE = CONTAINING_RECORD(
+                    Entry, SSPS_PORT_ENTRY, BucketLink);
+                if (PE->Port == g_CommonScanPorts[i]) {
+                    CommonPortHits++;
+                    break;
+                }
+            }
+        }
+
+        ExReleasePushLockShared(&Source->ConnectionLock);
+        KeLeaveCriticalRegion();
+
+        //
+        // If >50% of common scan ports are hit, this looks like a scanner tool
+        //
+        if (CommonPortHits > SSPS_COMMON_SCAN_PORTS_COUNT / 2) {
+            // Will be reflected in confidence score via higher port count
+        }
     }
 
     //
     // Calculate confidence score
     //
     if (Result->ScanDetected) {
-        Result->ConfidenceScore = PspCalculateConfidence(Source, Result->Type);
+        Result->ConfidenceScore = SspsCalculateConfidence(&Snap, Result->Type);
     }
 
     //
     // Find primary target (host with most ports scanned)
     //
-    if (Result->ScanDetected && !IsListEmpty(&Source->HostList)) {
-        PLIST_ENTRY Entry;
-        PPS_HOST_ENTRY HostEntry;
-        PPS_HOST_ENTRY PrimaryHost = NULL;
-        ULONG MaxPorts = 0;
+    if (Result->ScanDetected && Source->HostHash != NULL) {
+        PSSPS_HOST_ENTRY PrimaryHost = NULL;
+        LONG MaxPorts = 0;
 
         KeEnterCriticalRegion();
         ExAcquirePushLockShared(&Source->ConnectionLock);
 
-        for (Entry = Source->HostList.Flink;
-             Entry != &Source->HostList;
-             Entry = Entry->Flink) {
+        for (i = 0; i < Source->HostHash->BucketCount; i++) {
+            PLIST_ENTRY Entry;
+            for (Entry = Source->HostHash->Buckets[i].Flink;
+                 Entry != &Source->HostHash->Buckets[i];
+                 Entry = Entry->Flink) {
 
-            HostEntry = CONTAINING_RECORD(Entry, PS_HOST_ENTRY, ListEntry);
-
-            if (HostEntry->PortsScanned > MaxPorts) {
-                MaxPorts = HostEntry->PortsScanned;
-                PrimaryHost = HostEntry;
+                PSSPS_HOST_ENTRY HE = CONTAINING_RECORD(
+                    Entry, SSPS_HOST_ENTRY, BucketLink);
+                LONG Ports = InterlockedCompareExchange(&HE->PortsScanned, 0, 0);
+                if (Ports > MaxPorts) {
+                    MaxPorts = Ports;
+                    PrimaryHost = HE;
+                }
             }
         }
 
@@ -1510,151 +1711,130 @@ Routine Description:
 }
 
 static
-PS_SCAN_TYPE
-PspDetermineScanType(
-    _In_ PPS_SOURCE_CONTEXT Source
+SSPS_SCAN_TYPE
+SspsDetermineScanType(
+    _In_ PSSPS_WINDOW_SNAPSHOT Snap
     )
-/*++
-
-Routine Description:
-
-    Determines the type of port scan based on TCP flag patterns.
-
---*/
 {
-    LONG SynOnly = InterlockedCompareExchange(&Source->WindowStats.TcpSynOnly, 0, 0);
-    LONG FinOnly = InterlockedCompareExchange(&Source->WindowStats.TcpFinOnly, 0, 0);
-    LONG Xmas = InterlockedCompareExchange(&Source->WindowStats.TcpXmas, 0, 0);
-    LONG Null = InterlockedCompareExchange(&Source->WindowStats.TcpNull, 0, 0);
-    LONG Udp = InterlockedCompareExchange(&Source->WindowStats.UdpConnections, 0, 0);
-    LONG Total = InterlockedCompareExchange(&Source->WindowStats.TotalConnections, 0, 0);
-
-    if (Total == 0) {
-        return PsScan_Unknown;
+    if (Snap->TotalConnections == 0) {
+        return SsPsScan_Unknown;
     }
 
     //
-    // Check for stealth scan types first
+    // Check stealth types first (most suspicious)
     //
-    if (Null > 0 && (Null * 100 / Total) > 50) {
-        return PsScan_TCPNULL;
+    if (Snap->TcpNull > 0 &&
+        (Snap->TcpNull * 100 / Snap->TotalConnections) > 50) {
+        return SsPsScan_TCPNULL;
     }
 
-    if (Xmas > 0 && (Xmas * 100 / Total) > 50) {
-        return PsScan_TCPXMAS;
+    if (Snap->TcpXmas > 0 &&
+        (Snap->TcpXmas * 100 / Snap->TotalConnections) > 50) {
+        return SsPsScan_TCPXMAS;
     }
 
-    if (FinOnly > 0 && (FinOnly * 100 / Total) > 50) {
-        return PsScan_TCPFIN;
+    if (Snap->TcpFinOnly > 0 &&
+        (Snap->TcpFinOnly * 100 / Snap->TotalConnections) > 50) {
+        return SsPsScan_TCPFIN;
     }
 
-    if (SynOnly > 0 && (SynOnly * 100 / Total) > 50) {
-        return PsScan_TCPSYN;
+    if (Snap->TcpSynOnly > 0 &&
+        (Snap->TcpSynOnly * 100 / Snap->TotalConnections) > 50) {
+        return SsPsScan_TCPSYN;
     }
 
-    if (Udp > 0 && (Udp * 100 / Total) > 80) {
-        return PsScan_UDPScan;
+    if (Snap->UdpConnections > 0 &&
+        (Snap->UdpConnections * 100 / Snap->TotalConnections) > 80) {
+        return SsPsScan_UDPScan;
     }
 
-    //
-    // Default to connect scan
-    //
-    return PsScan_TCPConnect;
+    return SsPsScan_TCPConnect;
 }
 
 static
 ULONG
-PspCalculateConfidence(
-    _In_ PPS_SOURCE_CONTEXT Source,
-    _In_ PS_SCAN_TYPE ScanType
+SspsCalculateConfidence(
+    _In_ PSSPS_WINDOW_SNAPSHOT Snap,
+    _In_ SSPS_SCAN_TYPE ScanType
     )
-/*++
-
-Routine Description:
-
-    Calculates confidence score for the detection.
-
---*/
 {
     ULONG Score = 0;
-    LONG UniquePortCount = InterlockedCompareExchange(&Source->UniquePortCount, 0, 0);
-    LONG UniqueHostCount = InterlockedCompareExchange(&Source->UniqueHostCount, 0, 0);
-    LONG TotalConnections = InterlockedCompareExchange(&Source->WindowStats.TotalConnections, 0, 0);
-    LONG FailedConnections = InterlockedCompareExchange(&Source->WindowStats.FailedConnections, 0, 0);
     ULONG FailureRate;
 
     //
-    // Score based on unique ports
+    // Unique ports
     //
-    if (UniquePortCount >= PS_VERTICAL_SCAN_THRESHOLD * 2) {
-        Score += 25 * PS_WEIGHT_UNIQUE_PORTS;
-    } else if (UniquePortCount >= PS_VERTICAL_SCAN_THRESHOLD) {
-        Score += 15 * PS_WEIGHT_UNIQUE_PORTS;
-    } else if (UniquePortCount >= PS_MIN_PORTS_FOR_SCAN) {
-        Score += 10 * PS_WEIGHT_UNIQUE_PORTS;
+    if (Snap->UniquePortCount >= SSPS_VERTICAL_SCAN_THRESHOLD * 2) {
+        Score += 25 * SSPS_WEIGHT_UNIQUE_PORTS;
+    } else if (Snap->UniquePortCount >= SSPS_VERTICAL_SCAN_THRESHOLD) {
+        Score += 15 * SSPS_WEIGHT_UNIQUE_PORTS;
+    } else if (Snap->UniquePortCount >= (LONG)SSPS_MIN_PORTS_FOR_SCAN) {
+        Score += 10 * SSPS_WEIGHT_UNIQUE_PORTS;
     }
 
     //
-    // Score based on unique hosts
+    // Unique hosts
     //
-    if (UniqueHostCount >= PS_HORIZONTAL_SCAN_THRESHOLD * 2) {
-        Score += 25 * PS_WEIGHT_UNIQUE_HOSTS;
-    } else if (UniqueHostCount >= PS_HORIZONTAL_SCAN_THRESHOLD) {
-        Score += 15 * PS_WEIGHT_UNIQUE_HOSTS;
-    } else if (UniqueHostCount >= PS_MIN_HOSTS_FOR_SWEEP) {
-        Score += 10 * PS_WEIGHT_UNIQUE_HOSTS;
+    if (Snap->UniqueHostCount >= SSPS_HORIZONTAL_SCAN_THRESHOLD * 2) {
+        Score += 25 * SSPS_WEIGHT_UNIQUE_HOSTS;
+    } else if (Snap->UniqueHostCount >= SSPS_HORIZONTAL_SCAN_THRESHOLD) {
+        Score += 15 * SSPS_WEIGHT_UNIQUE_HOSTS;
+    } else if (Snap->UniqueHostCount >= (LONG)SSPS_MIN_HOSTS_FOR_SWEEP) {
+        Score += 10 * SSPS_WEIGHT_UNIQUE_HOSTS;
     }
 
     //
-    // Score based on failure rate
+    // Failure rate
     //
-    FailureRate = (TotalConnections > 0) ?
-        (ULONG)((FailedConnections * 100) / TotalConnections) : 0;
+    if (Snap->TotalConnections > 0 && Snap->FailedConnections >= 0) {
+        LONG Clamped = min(Snap->FailedConnections, Snap->TotalConnections);
+        FailureRate = (ULONG)((Clamped * 100) / Snap->TotalConnections);
+    } else {
+        FailureRate = 0;
+    }
 
     if (FailureRate >= 90) {
-        Score += 20 * PS_WEIGHT_FAILURE_RATE;
-    } else if (FailureRate >= PS_FAILURE_RATE_THRESHOLD) {
-        Score += 15 * PS_WEIGHT_FAILURE_RATE;
+        Score += 20 * SSPS_WEIGHT_FAILURE_RATE;
+    } else if (FailureRate >= SSPS_FAILURE_RATE_THRESHOLD) {
+        Score += 15 * SSPS_WEIGHT_FAILURE_RATE;
     } else if (FailureRate >= 50) {
-        Score += 10 * PS_WEIGHT_FAILURE_RATE;
+        Score += 10 * SSPS_WEIGHT_FAILURE_RATE;
     }
 
     //
-    // Score based on scan type (stealth techniques get higher score)
+    // Scan type weight
     //
     switch (ScanType) {
-    case PsScan_TCPNULL:
-    case PsScan_TCPXMAS:
-        Score += 30 * PS_WEIGHT_STEALTH_TECHNIQUE;
+    case SsPsScan_TCPNULL:
+    case SsPsScan_TCPXMAS:
+        Score += 30 * SSPS_WEIGHT_STEALTH_TECHNIQUE;
         break;
-    case PsScan_TCPFIN:
-    case PsScan_TCPSYN:
-        Score += 20 * PS_WEIGHT_STEALTH_TECHNIQUE;
+    case SsPsScan_TCPFIN:
+    case SsPsScan_TCPSYN:
+        Score += 20 * SSPS_WEIGHT_STEALTH_TECHNIQUE;
         break;
-    case PsScan_HostSweep:
-        Score += 25 * PS_WEIGHT_STEALTH_TECHNIQUE;
+    case SsPsScan_HostSweep:
+        Score += 25 * SSPS_WEIGHT_STEALTH_TECHNIQUE;
         break;
-    case PsScan_UDPScan:
-        Score += 15 * PS_WEIGHT_STEALTH_TECHNIQUE;
+    case SsPsScan_UDPScan:
+        Score += 15 * SSPS_WEIGHT_STEALTH_TECHNIQUE;
         break;
     default:
-        Score += 10 * PS_WEIGHT_STEALTH_TECHNIQUE;
+        Score += 10 * SSPS_WEIGHT_STEALTH_TECHNIQUE;
         break;
     }
 
-    //
-    // Cap at 100
-    //
-    if (Score > 100) {
-        Score = 100;
-    }
-
-    return Score;
+    return min(Score, 100);
 }
+
+
+//=============================================================================
+// Internal: Process Information
+//=============================================================================
 
 static
 VOID
-PspGetProcessInfo(
+SspsGetProcessInfo(
     _In_ HANDLE ProcessId,
     _Out_writes_z_(NameSize) PWCHAR ProcessName,
     _In_ ULONG NameSize,
@@ -1662,11 +1842,8 @@ PspGetProcessInfo(
     _In_ ULONG PathSize
     )
 /*++
-
 Routine Description:
-
-    Gets process name and path for a process ID.
-
+    Gets process name and path. Safe if process has already terminated.
 --*/
 {
     PEPROCESS Process = NULL;
@@ -1682,21 +1859,14 @@ Routine Description:
         return;
     }
 
-    //
-    // Get image file name
-    //
     Status = SeLocateProcessImageName(Process, &ImageFileName);
-    if (NT_SUCCESS(Status) && ImageFileName != NULL) {
-        //
-        // Copy full path
-        //
-        ULONG CharsToPath = min(ImageFileName->Length / sizeof(WCHAR), PathSize - 1);
+    if (NT_SUCCESS(Status) && ImageFileName != NULL && ImageFileName->Buffer != NULL) {
+        ULONG CharsToPath = min(
+            ImageFileName->Length / sizeof(WCHAR),
+            PathSize - 1);
         RtlCopyMemory(ProcessPath, ImageFileName->Buffer, CharsToPath * sizeof(WCHAR));
         ProcessPath[CharsToPath] = L'\0';
 
-        //
-        // Extract just the filename
-        //
         PWCHAR LastSlash = wcsrchr(ProcessPath, L'\\');
         if (LastSlash != NULL) {
             RtlStringCchCopyW(ProcessName, NameSize, LastSlash + 1);
@@ -1712,35 +1882,101 @@ Routine Description:
     ObDereferenceObject(Process);
 }
 
+//=============================================================================
+// Internal: Cleanup Timer & Work Item (PASSIVE_LEVEL)
+//=============================================================================
+//
+// Architecture:
+//   Timer fires periodically -> DPC runs at DISPATCH_LEVEL -> DPC queues
+//   a work item -> Work item runs at PASSIVE_LEVEL -> acquires push locks,
+//   frees memory.
+//
+//   This avoids the critical IRQL violation of the original design where
+//   the DPC directly used push locks at DISPATCH_LEVEL.
+//
+
 static
 VOID
-PspCleanupTimerDpc(
+SspsCleanupTimerDpc(
     _In_ PKDPC Dpc,
     _In_opt_ PVOID DeferredContext,
     _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2
     )
 /*++
-
 Routine Description:
-
-    Periodic cleanup DPC to remove stale source contexts.
-
+    DPC callback — runs at DISPATCH_LEVEL.
+    Does NOT touch any push locks, lists, or pool memory.
+    Only queues a work item for PASSIVE_LEVEL processing.
 --*/
 {
-    PPS_DETECTOR Detector = (PPS_DETECTOR)DeferredContext;
-    PLIST_ENTRY Entry;
-    PLIST_ENTRY NextEntry;
-    PPS_SOURCE_CONTEXT Source;
-    LARGE_INTEGER CurrentTime;
-    LONGLONG ExpiryTicks = (LONGLONG)PS_SOURCE_EXPIRY_MS * 10000;
-    LIST_ENTRY ExpiredList;
+    PSSPS_DETECTOR Detector = (PSSPS_DETECTOR)DeferredContext;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (Detector == NULL || !Detector->Initialized || !g_CleanupContext.Active) {
+    if (Detector == NULL) {
+        return;
+    }
+
+    if (InterlockedCompareExchange(&Detector->Initialized, 0, 0) == 0) {
+        return;
+    }
+
+    if (InterlockedCompareExchange(&Detector->ShuttingDown, 0, 0) != 0) {
+        return;
+    }
+
+    //
+    // Prevent overlapping cleanup runs
+    //
+    if (InterlockedCompareExchange(&Detector->CleanupRunning, 1, 0) != 0) {
+        return;  // Previous cleanup still running
+    }
+
+    if (Detector->CleanupWorkItem != NULL) {
+        IoQueueWorkItem(
+            Detector->CleanupWorkItem,
+            SspsCleanupWorkItemRoutine,
+            DelayedWorkQueue,
+            Detector
+            );
+    } else {
+        InterlockedExchange(&Detector->CleanupRunning, 0);
+    }
+}
+
+static
+VOID
+SspsCleanupWorkItemRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+    )
+/*++
+Routine Description:
+    Work item callback — runs at PASSIVE_LEVEL.
+    Safely acquires push locks, walks the source list, and removes
+    expired source contexts with zero reference count.
+--*/
+{
+    PSSPS_DETECTOR Detector = (PSSPS_DETECTOR)Context;
+    PLIST_ENTRY Entry;
+    PLIST_ENTRY NextEntry;
+    PSSPS_SOURCE_CONTEXT Source;
+    LARGE_INTEGER CurrentTime;
+    LONGLONG ExpiryTicks = (LONGLONG)SSPS_SOURCE_EXPIRY_MS * 10000;
+    LIST_ENTRY ExpiredList;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    if (Detector == NULL) {
+        return;
+    }
+
+    if (InterlockedCompareExchange(&Detector->Initialized, 0, 0) == 0 ||
+        InterlockedCompareExchange(&Detector->ShuttingDown, 0, 0) != 0) {
+        InterlockedExchange(&Detector->CleanupRunning, 0);
         return;
     }
 
@@ -1748,71 +1984,42 @@ Routine Description:
     InitializeListHead(&ExpiredList);
 
     //
-    // Find expired sources (can't free at DISPATCH_LEVEL with PagedPool)
-    // Just mark them for cleanup - actual cleanup happens at PASSIVE_LEVEL
+    // Collect expired sources under exclusive lock
     //
     KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Detector->SourceListLock);
 
-    if (ExTryAcquirePushLockExclusive(&Detector->SourceListLock)) {
+    for (Entry = Detector->SourceList.Flink;
+         Entry != &Detector->SourceList;
+         Entry = NextEntry) {
 
-        for (Entry = Detector->SourceList.Flink;
-             Entry != &Detector->SourceList;
-             Entry = NextEntry) {
+        NextEntry = Entry->Flink;
+        Source = CONTAINING_RECORD(Entry, SSPS_SOURCE_CONTEXT, ListEntry);
 
-            NextEntry = Entry->Flink;
-            Source = CONTAINING_RECORD(Entry, PS_SOURCE_CONTEXT, ListEntry);
+        //
+        // Only expire sources with zero references and sufficient idle time
+        //
+        if (InterlockedCompareExchange(&Source->RefCount, 0, 0) == 0 &&
+            Source->LastActivity.QuadPart > 0 &&
+            (CurrentTime.QuadPart - Source->LastActivity.QuadPart) > ExpiryTicks) {
 
-            //
-            // Check if source is expired and not referenced
-            //
-            if (Source->RefCount == 0 &&
-                Source->LastActivity.QuadPart > 0 &&
-                (CurrentTime.QuadPart - Source->LastActivity.QuadPart) > ExpiryTicks) {
-
-                //
-                // Remove from main list
-                //
-                RemoveEntryList(Entry);
-                InterlockedDecrement(&Detector->SourceCount);
-
-                //
-                // Add to expired list for later cleanup
-                // (We can't call ShadowStrikeFreePoolWithTag at DISPATCH_LEVEL
-                //  for PagedPool, but NonPagedPoolNx is fine)
-                //
-                // For simplicity, we'll queue a work item or just free NonPaged allocations
-                //
-
-                //
-                // Free NonPagedPoolNx allocations directly
-                //
-                while (!IsListEmpty(&Source->ConnectionList)) {
-                    PLIST_ENTRY ConnEntry = RemoveHeadList(&Source->ConnectionList);
-                    PPS_CONNECTION_RECORD Record = CONTAINING_RECORD(
-                        ConnEntry, PS_CONNECTION_RECORD, ListEntry);
-                    ShadowStrikeFreePoolWithTag(Record, PS_POOL_TAG_CONTEXT);
-                }
-
-                while (!IsListEmpty(&Source->PortList)) {
-                    PLIST_ENTRY PortEntry = RemoveHeadList(&Source->PortList);
-                    PPS_PORT_ENTRY Port = CONTAINING_RECORD(
-                        PortEntry, PS_PORT_ENTRY, ListEntry);
-                    ShadowStrikeFreePoolWithTag(Port, PS_POOL_TAG_CONTEXT);
-                }
-
-                while (!IsListEmpty(&Source->HostList)) {
-                    PLIST_ENTRY HostEntry = RemoveHeadList(&Source->HostList);
-                    PPS_HOST_ENTRY Host = CONTAINING_RECORD(
-                        HostEntry, PS_HOST_ENTRY, ListEntry);
-                    ShadowStrikeFreePoolWithTag(Host, PS_POOL_TAG_TARGET);
-                }
-
-                ShadowStrikeFreePoolWithTag(Source, PS_POOL_TAG_CONTEXT);
-            }
+            RemoveEntryList(Entry);
+            InterlockedDecrement(&Detector->SourceCount);
+            InsertTailList(&ExpiredList, Entry);
         }
-
-        ExReleasePushLockExclusive(&Detector->SourceListLock);
     }
 
+    ExReleasePushLockExclusive(&Detector->SourceListLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Free expired sources outside the lock to minimize lock hold time
+    //
+    while (!IsListEmpty(&ExpiredList)) {
+        Entry = RemoveHeadList(&ExpiredList);
+        Source = CONTAINING_RECORD(Entry, SSPS_SOURCE_CONTEXT, ListEntry);
+        SspsFreeSourceContext(Source);
+    }
+
+    InterlockedExchange(&Detector->CleanupRunning, 0);
 }

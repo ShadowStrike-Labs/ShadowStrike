@@ -16,6 +16,8 @@ This module provides comprehensive DNS security monitoring:
 - High-entropy subdomain detection
 - Base64/hex encoded subdomain detection
 - Query rate anomaly detection
+- Homoglyph and typosquatting detection
+- Known malicious domain blocking
 
 Detection Techniques Covered (MITRE ATT&CK):
 - T1071.004: Application Layer Protocol - DNS
@@ -29,12 +31,12 @@ Performance Characteristics:
 - O(1) transaction ID lookup via hash table
 - O(1) domain cache lookup via hash table
 - Lock-free statistics using InterlockedXxx
-- NPAGED_LOOKASIDE_LIST for frequent allocations
+- NPAGED_LOOKASIDE_LIST for query allocations
 - EX_PUSH_LOCK for reader-writer synchronization
 - Configurable cache sizes and TTLs
 
 @author ShadowStrike Security Team
-@version 3.0.0 (Enterprise Edition - Security Hardened)
+@version 2.0.0 (Enterprise Edition)
 @copyright (c) 2026 ShadowStrike Security. All rights reserved.
 ===============================================================================
 --*/
@@ -49,29 +51,28 @@ Performance Characteristics:
 // INTERNAL CONSTANTS
 // ============================================================================
 
-#define DNS_POOL_TAG                    'MNSD'
+#define DNS_POOL_TAG                    'MNSD'  // DSNM - DNS Monitor
 #define DNS_TRANSACTION_HASH_BUCKETS    256
 #define DNS_DOMAIN_HASH_BUCKETS         1024
+#define DNS_PROCESS_HASH_BUCKETS        128
 #define DNS_MAX_PACKET_SIZE             65535
-#define DNS_MIN_PACKET_SIZE             12
+#define DNS_MIN_PACKET_SIZE             12      // DNS header only
 #define DNS_HEADER_SIZE                 12
 #define DNS_MAX_LABELS                  127
-#define DNS_CLEANUP_INTERVAL_MS         60000
-#define DNS_QUERY_EXPIRATION_MS         300000
-#define DNS_CACHE_EXPIRATION_MS         3600000
-#define DNS_PROCESS_IDLE_EXPIRATION_MS  600000   // 10 min idle
-#define DNS_TUNNEL_IDLE_EXPIRATION_MS   1800000  // 30 min idle
+#define DNS_CLEANUP_INTERVAL_MS         60000   // 1 minute
+#define DNS_QUERY_EXPIRATION_MS         300000  // 5 minutes
+#define DNS_CACHE_EXPIRATION_MS         3600000 // 1 hour
 
 //
 // DNS packet flags
 //
-#define DNS_FLAG_QR                     0x8000
+#define DNS_FLAG_QR                     0x8000  // Query/Response
 #define DNS_FLAG_OPCODE_MASK            0x7800
-#define DNS_FLAG_AA                     0x0400
-#define DNS_FLAG_TC                     0x0200
-#define DNS_FLAG_RD                     0x0100
-#define DNS_FLAG_RA                     0x0080
-#define DNS_FLAG_Z_MASK                 0x0070
+#define DNS_FLAG_AA                     0x0400  // Authoritative Answer
+#define DNS_FLAG_TC                     0x0200  // Truncation
+#define DNS_FLAG_RD                     0x0100  // Recursion Desired
+#define DNS_FLAG_RA                     0x0080  // Recursion Available
+#define DNS_FLAG_Z_MASK                 0x0070  // Reserved
 #define DNS_FLAG_RCODE_MASK             0x000F
 
 //
@@ -87,17 +88,17 @@ Performance Characteristics:
 //
 // Entropy thresholds
 //
-#define DNS_ENTROPY_HIGH_THRESHOLD      380
-#define DNS_ENTROPY_TUNNEL_THRESHOLD    420
+#define DNS_ENTROPY_HIGH_THRESHOLD      380     // 3.8 * 100
+#define DNS_ENTROPY_TUNNEL_THRESHOLD    420     // 4.2 * 100
 #define DNS_SUBDOMAIN_LENGTH_THRESHOLD  32
 #define DNS_SUBDOMAIN_COUNT_THRESHOLD   5
-#define DNS_QUERY_RATE_THRESHOLD        100
+#define DNS_QUERY_RATE_THRESHOLD        100     // per minute
 
 //
 // DGA detection constants
 //
-#define DGA_CONSONANT_THRESHOLD         70
-#define DGA_DIGIT_THRESHOLD             30
+#define DGA_CONSONANT_THRESHOLD         70      // 70% consonants
+#define DGA_DIGIT_THRESHOLD             30      // 30% digits
 #define DGA_MIN_DOMAIN_LENGTH           8
 #define DGA_MAX_CONSECUTIVE_CONSONANTS  5
 #define DGA_BIGRAM_SCORE_THRESHOLD      200
@@ -108,6 +109,9 @@ Performance Characteristics:
 
 #pragma pack(push, 1)
 
+//
+// DNS header structure
+//
 typedef struct _DNS_HEADER {
     USHORT TransactionId;
     USHORT Flags;
@@ -117,11 +121,17 @@ typedef struct _DNS_HEADER {
     USHORT AdditionalCount;
 } DNS_HEADER, *PDNS_HEADER;
 
+//
+// DNS question structure (after name)
+//
 typedef struct _DNS_QUESTION_FOOTER {
     USHORT Type;
     USHORT Class;
 } DNS_QUESTION_FOOTER, *PDNS_QUESTION_FOOTER;
 
+//
+// DNS resource record structure (after name)
+//
 typedef struct _DNS_RR_HEADER {
     USHORT Type;
     USHORT Class;
@@ -134,6 +144,31 @@ typedef struct _DNS_RR_HEADER {
 // ============================================================================
 // INTERNAL STRUCTURES
 // ============================================================================
+
+//
+// Pending query tracking
+//
+typedef struct _DNS_PENDING_QUERY {
+    LIST_ENTRY ListEntry;
+    LIST_ENTRY HashEntry;
+    LIST_ENTRY ProcessListEntry;
+
+    USHORT TransactionId;
+    LARGE_INTEGER QueryTime;
+    HANDLE ProcessId;
+
+    CHAR DomainName[DNS_MAX_NAME_LENGTH + 1];
+    DNS_RECORD_TYPE RecordType;
+
+    union {
+        IN_ADDR IPv4;
+        IN6_ADDR IPv6;
+    } ServerAddress;
+    BOOLEAN IsIPv6;
+    USHORT ServerPort;
+
+    volatile LONG RefCount;
+} DNS_PENDING_QUERY, *PDNS_PENDING_QUERY;
 
 //
 // Tunneling detection state per base domain
@@ -152,8 +187,8 @@ typedef struct _DNS_TUNNEL_CONTEXT {
     volatile LONG TxtQueries;
     volatile LONG UniqueSubdomains;
     volatile LONG64 TotalSubdomainLength;
-    volatile LONG MaxSubdomainLength;
-    volatile LONG64 TotalEntropySum;
+    ULONG MaxSubdomainLength;
+    ULONG64 TotalEntropySum;
 
     BOOLEAN TunnelingDetected;
     ULONG TunnelingScore;
@@ -163,48 +198,17 @@ typedef struct _DNS_TUNNEL_CONTEXT {
 } DNS_TUNNEL_CONTEXT, *PDNS_TUNNEL_CONTEXT;
 
 //
-// Full monitor state (opaque to callers; DNS_MONITOR is this struct)
+// Extended monitor state
 //
-struct _DNS_MONITOR {
-    //
-    // Initialization state
-    //
-    volatile LONG Initialized;
+typedef struct _DNS_MONITOR_INTERNAL {
+    DNS_MONITOR Public;
 
     //
-    // Query tracking
+    // Pending queries (waiting for response)
     //
-    LIST_ENTRY QueryList;
-    EX_PUSH_LOCK QueryListLock;
-    volatile LONG QueryCount;
-    volatile LONG64 NextQueryId;
-
-    //
-    // Transaction ID hash for O(1) response correlation
-    //
-    struct {
-        LIST_ENTRY* Buckets;
-        ULONG BucketCount;
-        EX_PUSH_LOCK Lock;
-    } TransactionHash;
-
-    //
-    // Domain cache
-    //
-    LIST_ENTRY DomainCache;
-    EX_PUSH_LOCK DomainCacheLock;
-    volatile LONG CacheEntryCount;
-    struct {
-        LIST_ENTRY* Buckets;
-        ULONG BucketCount;
-    } DomainHash;
-
-    //
-    // Process contexts
-    //
-    LIST_ENTRY ProcessList;
-    EX_PUSH_LOCK ProcessListLock;
-    volatile LONG ProcessCount;
+    LIST_ENTRY PendingQueryList;
+    EX_PUSH_LOCK PendingQueryLock;
+    volatile LONG PendingQueryCount;
 
     //
     // Tunneling detection contexts
@@ -216,15 +220,6 @@ struct _DNS_MONITOR {
         LIST_ENTRY* Buckets;
         ULONG BucketCount;
     } TunnelHash;
-
-    //
-    // Cleanup: timer fires DPC, DPC queues work item at PASSIVE_LEVEL
-    //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    PIO_WORKITEM CleanupWorkItem;
-    PDEVICE_OBJECT DeviceObject;
-    volatile LONG CleanupInProgress;
 
     //
     // Lookaside lists
@@ -247,29 +242,16 @@ struct _DNS_MONITOR {
     } Callbacks;
 
     //
-    // Statistics
+    // Reputation manager reference
     //
-    struct {
-        volatile LONG64 TotalQueries;
-        volatile LONG64 TotalResponses;
-        volatile LONG64 SuspiciousQueries;
-        volatile LONG64 BlockedQueries;
-        volatile LONG64 TunnelDetections;
-        LARGE_INTEGER StartTime;
-    } Stats;
+    PNR_MANAGER ReputationManager;
 
     //
-    // Configuration
+    // C2 detector reference
     //
-    struct {
-        BOOLEAN EnableTunnelingDetection;
-        BOOLEAN EnableDGADetection;
-        ULONG EntropyThreshold;
-        ULONG MaxSubdomainLength;
-        ULONG QueryRateThreshold;
-    } Config;
-};
+    PC2_DETECTOR C2Detector;
 
+} DNS_MONITOR_INTERNAL, *PDNS_MONITOR_INTERNAL;
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -299,12 +281,10 @@ DnspParseDnsName(
 
 static NTSTATUS
 DnspParseQuery(
-    _In_ PDNS_MONITOR Monitor,
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_reads_bytes_(PacketSize) PUCHAR Packet,
     _In_ ULONG PacketSize,
     _In_ HANDLE ProcessId,
-    _In_ PVOID SourceAddress,
-    _In_ USHORT SourcePort,
     _In_ PVOID ServerAddress,
     _In_ USHORT ServerPort,
     _In_ BOOLEAN IsIPv6,
@@ -313,7 +293,7 @@ DnspParseQuery(
 
 static NTSTATUS
 DnspParseResponse(
-    _In_ PDNS_MONITOR Monitor,
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_reads_bytes_(PacketSize) PUCHAR Packet,
     _In_ ULONG PacketSize,
     _In_ PVOID ServerAddress,
@@ -352,14 +332,8 @@ DnspExtractBaseDomain(
 
 static PDNS_TUNNEL_CONTEXT
 DnspGetOrCreateTunnelContext(
-    _In_ PDNS_MONITOR Monitor,
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_ PCSTR BaseDomain
-    );
-
-static VOID
-DnspDereferenceTunnelContext(
-    _In_ PDNS_MONITOR Monitor,
-    _In_ PDNS_TUNNEL_CONTEXT Context
     );
 
 static VOID
@@ -377,14 +351,8 @@ DnspCheckTunneling(
     );
 
 static PDNS_PROCESS_CONTEXT
-DnspFindProcessContext(
-    _In_ PDNS_MONITOR Monitor,
-    _In_ HANDLE ProcessId
-    );
-
-static PDNS_PROCESS_CONTEXT
 DnspGetOrCreateProcessContext(
-    _In_ PDNS_MONITOR Monitor,
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_ HANDLE ProcessId
     );
 
@@ -395,20 +363,19 @@ DnspReferenceProcessContext(
 
 static VOID
 DnspDereferenceProcessContext(
-    _In_ PDNS_MONITOR Monitor,
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_ PDNS_PROCESS_CONTEXT Context
     );
 
-_Requires_lock_held_(Monitor->DomainCacheLock)
 static PDNS_DOMAIN_CACHE
-DnspLookupDomainCacheLocked(
-    _In_ PDNS_MONITOR Monitor,
+DnspLookupDomainCache(
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_ PCSTR DomainName
     );
 
 static NTSTATUS
 DnspAddToDomainCache(
-    _In_ PDNS_MONITOR Monitor,
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_ PCSTR DomainName,
     _In_ PDNS_QUERY Query
     );
@@ -422,34 +389,17 @@ DnspCleanupTimerDpc(
     );
 
 static VOID
-DnspCleanupWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
-    );
-
-static VOID
 DnspCleanupExpiredEntries(
-    _In_ PDNS_MONITOR Monitor
-    );
-
-static VOID
-DnspFreeQuery(
-    _In_ PDNS_MONITOR Monitor,
-    _In_ PDNS_QUERY Query
-    );
-
-static VOID
-DnspPopulateProcessName(
-    _In_ HANDLE ProcessId,
-    _Out_writes_(MaxChars) PWCHAR Buffer,
-    _In_ ULONG MaxChars,
-    _Out_ PUSHORT LengthInBytes
+    _In_ PDNS_MONITOR_INTERNAL Monitor
     );
 
 // ============================================================================
 // CHARACTER CLASSIFICATION TABLES
 // ============================================================================
 
+//
+// Vowel lookup table
+//
 static const BOOLEAN g_IsVowel[256] = {
     ['a'] = TRUE, ['A'] = TRUE,
     ['e'] = TRUE, ['E'] = TRUE,
@@ -458,6 +408,9 @@ static const BOOLEAN g_IsVowel[256] = {
     ['u'] = TRUE, ['U'] = TRUE,
 };
 
+//
+// Hex character lookup table
+//
 static const BOOLEAN g_IsHexChar[256] = {
     ['0'] = TRUE, ['1'] = TRUE, ['2'] = TRUE, ['3'] = TRUE,
     ['4'] = TRUE, ['5'] = TRUE, ['6'] = TRUE, ['7'] = TRUE,
@@ -468,6 +421,9 @@ static const BOOLEAN g_IsHexChar[256] = {
     ['E'] = TRUE, ['F'] = TRUE,
 };
 
+//
+// Base64 character lookup table
+//
 static const BOOLEAN g_IsBase64Char[256] = {
     ['A'] = TRUE, ['B'] = TRUE, ['C'] = TRUE, ['D'] = TRUE,
     ['E'] = TRUE, ['F'] = TRUE, ['G'] = TRUE, ['H'] = TRUE,
@@ -490,113 +446,37 @@ static const BOOLEAN g_IsBase64Char[256] = {
 };
 
 //
-// Fixed-point log2 lookup table: -log2(p/256)*256 for p in [1..255]
-// Used for Shannon entropy calculation without floating point.
-// Entry i = round(-log2(i/256) * 256) for i >= 1.
+// Common English bigrams for DGA detection (low values = common)
 //
-static const USHORT g_Log2Table[256] = {
-       0, 2048, 1792, 1664, 1536, 1446, 1378, 1322, 1280, 1238, 1202, 1170,
-    1142, 1116, 1092, 1070, 1024, 1004,  986,  968,  952,  936,  922,  908,
-     896,  884,  872,  860,  850,  840,  830,  822,  768,  760,  752,  744,
-     736,  730,  722,  716,  710,  704,  698,  692,  686,  680,  676,  670,
-     666,  660,  656,  650,  646,  642,  638,  634,  630,  626,  622,  618,
-     614,  610,  608,  604,  512,  508,  506,  502,  500,  496,  494,  490,
-     488,  486,  482,  480,  478,  474,  472,  470,  468,  466,  462,  460,
-     458,  456,  454,  452,  450,  448,  446,  444,  442,  440,  438,  436,
-     434,  432,  430,  428,  426,  424,  422,  420,  418,  416,  414,  412,
-     410,  410,  408,  406,  404,  402,  400,  398,  398,  396,  394,  392,
-     390,  390,  388,  386,  384,  384,  382,  380,  256,  254,  254,  252,
-     252,  250,  250,  248,  248,  246,  246,  244,  244,  242,  242,  240,
-     240,  238,  238,  236,  236,  236,  234,  234,  232,  232,  230,  230,
-     228,  228,  228,  226,  226,  224,  224,  224,  222,  222,  220,  220,
-     220,  218,  218,  216,  216,  216,  214,  214,  214,  212,  212,  210,
-     210,  210,  208,  208,  208,  206,  206,  206,  204,  204,  204,  202,
-     202,  202,  200,  200,  200,  198,  198,  198,  196,  196,  196,  194,
-     194,  194,  194,  192,  192,  192,  190,  190,  190,  188,  188,  188,
-     188,  186,  186,  186,  184,  184,  184,  184,  182,  182,  182,  180,
-     180,  180,  180,  178,  178,  178,  178,  176,  176,  176,  176,  174,
-     174,  174,  174,  172,  172,  172,  172,  170,  170,  170,  170,  168,
-     168,  168,  168,  168,
-};
-
 static const UCHAR g_BigramScore[26][26] = {
     //  a   b   c   d   e   f   g   h   i   j   k   l   m   n   o   p   q   r   s   t   u   v   w   x   y   z
-    {  50, 20, 30, 30, 50, 20, 30, 20, 40, 10, 20, 40, 30, 50, 50, 30,  5, 40, 40, 50, 30, 20, 20,  5, 30,  5 },
-    {  30, 10, 10, 10, 40, 10, 10, 10, 30,  5,  5, 30, 10, 10, 40, 10,  5, 30, 20, 10, 30,  5,  5,  5, 20,  5 },
-    {  40, 10, 20, 10, 40, 10, 10, 40, 30,  5, 30, 30, 10, 10, 50, 10,  5, 30, 20, 40, 30,  5,  5,  5, 20,  5 },
-    {  40, 10, 10, 20, 50, 10, 20, 10, 40,  5,  5, 20, 20, 20, 40, 10,  5, 30, 30, 20, 30,  5, 20,  5, 30,  5 },
-    {  50, 20, 30, 50, 50, 30, 20, 20, 40, 10, 10, 40, 30, 50, 40, 30,  5, 50, 50, 50, 30, 30, 30, 30, 30,  5 },
-    {  40, 10, 10, 10, 40, 30, 10, 10, 40,  5,  5, 30, 10, 10, 50, 10,  5, 40, 20, 40, 40,  5,  5,  5, 20,  5 },
-    {  40, 10, 10, 10, 40, 10, 20, 30, 30,  5,  5, 20, 20, 20, 40, 10,  5, 40, 30, 20, 30,  5,  5,  5, 20,  5 },
-    {  50, 10, 10, 10, 50, 10, 10, 10, 40,  5,  5, 10, 20, 10, 40, 10,  5, 20, 20, 30, 20,  5, 10,  5, 20,  5 },
-    {  40, 20, 40, 40, 40, 30, 30, 10, 10, 10, 20, 40, 40, 50, 50, 20,  5, 30, 50, 50, 20, 30, 10,  5, 10, 20 },
-    {  30, 10, 10, 10, 30, 10, 10, 10, 20,  5,  5, 10, 10, 10, 30, 10,  5, 10, 10, 10, 30,  5,  5,  5, 10,  5 },
-    {  30, 10, 10, 10, 40, 10, 10, 10, 30,  5,  5, 20, 10, 30, 30, 10,  5, 10, 30, 10, 10,  5, 20,  5, 20,  5 },
-    {  50, 10, 10, 30, 50, 20, 10, 10, 50, 10, 20, 40, 20, 10, 50, 20,  5, 10, 30, 30, 30,  5, 20,  5, 40,  5 },
-    {  50, 20, 10, 10, 50, 10, 10, 10, 40,  5,  5, 10, 30, 20, 50, 30,  5, 10, 30, 10, 30,  5, 10,  5, 30,  5 },
-    {  50, 10, 30, 50, 50, 20, 50, 20, 40, 10, 20, 20, 20, 30, 50, 10,  5, 10, 40, 50, 30, 10, 20,  5, 30,  5 },
-    {  40, 20, 20, 30, 40, 40, 20, 10, 30, 10, 20, 30, 40, 50, 50, 30,  5, 50, 40, 40, 50, 30, 40, 10, 20, 10 },
-    {  40, 10, 10, 10, 40, 10, 10, 30, 30,  5,  5, 40, 20, 10, 40, 30,  5, 50, 30, 30, 30,  5, 20,  5, 30,  5 },
-    {  10,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5, 30,  5,  5,  5,  5,  5 },
-    {  50, 20, 20, 30, 50, 20, 20, 10, 50, 10, 20, 30, 30, 30, 50, 20,  5, 30, 40, 40, 30, 20, 20,  5, 40,  5 },
-    {  40, 10, 30, 10, 50, 20, 10, 40, 50, 10, 20, 20, 30, 20, 50, 40,  5, 10, 50, 50, 40,  5, 30,  5, 30,  5 },
-    {  50, 10, 20, 10, 50, 10, 10, 50, 50,  5,  5, 30, 20, 10, 50, 10,  5, 40, 40, 40, 40,  5, 30,  5, 40,  5 },
-    {  40, 20, 30, 30, 40, 10, 30, 10, 30, 10, 10, 40, 30, 50, 20, 30,  5, 50, 50, 50, 10, 10, 10,  5, 20,  5 },
-    {  40, 10, 10, 10, 50, 10, 10, 10, 40,  5,  5, 10, 10, 10, 40, 10,  5, 10, 10, 10, 10,  5,  5,  5, 20,  5 },
-    {  50, 10, 10, 20, 40, 10, 10, 40, 40, 10, 10, 10, 10, 30, 40, 10,  5, 20, 20, 10, 10,  5, 10,  5, 10,  5 },
-    {  20,  5, 20,  5, 20,  5,  5, 10, 20,  5,  5,  5,  5,  5, 10, 30,  5,  5,  5, 30,  5,  5,  5,  5, 10,  5 },
-    {  30, 10, 10, 10, 30, 10, 10, 10, 30, 10, 10, 20, 20, 20, 40, 20,  5, 20, 40, 30, 10,  5, 20,  5, 10,  5 },
-    {  30,  5,  5,  5, 30,  5,  5,  5, 20,  5,  5, 10,  5,  5, 20,  5,  5,  5,  5,  5,  5,  5,  5,  5, 10, 20 },
+    {  50, 20, 30, 30, 50, 20, 30, 20, 40, 10, 20, 40, 30, 50, 50, 30,  5, 40, 40, 50, 30, 20, 20,  5, 30,  5 }, // a
+    {  30, 10, 10, 10, 40, 10, 10, 10, 30,  5,  5, 30, 10, 10, 40, 10,  5, 30, 20, 10, 30,  5,  5,  5, 20,  5 }, // b
+    {  40, 10, 20, 10, 40, 10, 10, 40, 30,  5, 30, 30, 10, 10, 50, 10,  5, 30, 20, 40, 30,  5,  5,  5, 20,  5 }, // c
+    {  40, 10, 10, 20, 50, 10, 20, 10, 40,  5,  5, 20, 20, 20, 40, 10,  5, 30, 30, 20, 30,  5, 20,  5, 30,  5 }, // d
+    {  50, 20, 30, 50, 50, 30, 20, 20, 40, 10, 10, 40, 30, 50, 40, 30,  5, 50, 50, 50, 30, 30, 30, 30, 30,  5 }, // e
+    {  40, 10, 10, 10, 40, 30, 10, 10, 40,  5,  5, 30, 10, 10, 50, 10,  5, 40, 20, 40, 40,  5,  5,  5, 20,  5 }, // f
+    {  40, 10, 10, 10, 40, 10, 20, 30, 30,  5,  5, 20, 20, 20, 40, 10,  5, 40, 30, 20, 30,  5,  5,  5, 20,  5 }, // g
+    {  50, 10, 10, 10, 50, 10, 10, 10, 40,  5,  5, 10, 20, 10, 40, 10,  5, 20, 20, 30, 20,  5, 10,  5, 20,  5 }, // h
+    {  40, 20, 40, 40, 40, 30, 30, 10, 10, 10, 20, 40, 40, 50, 50, 20,  5, 30, 50, 50, 20, 30, 10,  5, 10, 20 }, // i
+    {  30, 10, 10, 10, 30, 10, 10, 10, 20,  5,  5, 10, 10, 10, 30, 10,  5, 10, 10, 10, 30,  5,  5,  5, 10,  5 }, // j
+    {  30, 10, 10, 10, 40, 10, 10, 10, 30,  5,  5, 20, 10, 30, 30, 10,  5, 10, 30, 10, 10,  5, 20,  5, 20,  5 }, // k
+    {  50, 10, 10, 30, 50, 20, 10, 10, 50, 10, 20, 40, 20, 10, 50, 20,  5, 10, 30, 30, 30,  5, 20,  5, 40,  5 }, // l
+    {  50, 20, 10, 10, 50, 10, 10, 10, 40,  5,  5, 10, 30, 20, 50, 30,  5, 10, 30, 10, 30,  5, 10,  5, 30,  5 }, // m
+    {  50, 10, 30, 50, 50, 20, 50, 20, 40, 10, 20, 20, 20, 30, 50, 10,  5, 10, 40, 50, 30, 10, 20,  5, 30,  5 }, // n
+    {  40, 20, 20, 30, 40, 40, 20, 10, 30, 10, 20, 30, 40, 50, 50, 30,  5, 50, 40, 40, 50, 30, 40, 10, 20, 10 }, // o
+    {  40, 10, 10, 10, 40, 10, 10, 30, 30,  5,  5, 40, 20, 10, 40, 30,  5, 50, 30, 30, 30,  5, 20,  5, 30,  5 }, // p
+    {  10,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5, 30,  5,  5,  5,  5,  5 }, // q
+    {  50, 20, 20, 30, 50, 20, 20, 10, 50, 10, 20, 30, 30, 30, 50, 20,  5, 30, 40, 40, 30, 20, 20,  5, 40,  5 }, // r
+    {  40, 10, 30, 10, 50, 20, 10, 40, 50, 10, 20, 20, 30, 20, 50, 40,  5, 10, 50, 50, 40,  5, 30,  5, 30,  5 }, // s
+    {  50, 10, 20, 10, 50, 10, 10, 50, 50,  5,  5, 30, 20, 10, 50, 10,  5, 40, 40, 40, 40,  5, 30,  5, 40,  5 }, // t
+    {  40, 20, 30, 30, 40, 10, 30, 10, 30, 10, 10, 40, 30, 50, 20, 30,  5, 50, 50, 50, 10, 10, 10,  5, 20,  5 }, // u
+    {  40, 10, 10, 10, 50, 10, 10, 10, 40,  5,  5, 10, 10, 10, 40, 10,  5, 10, 10, 10, 10,  5,  5,  5, 20,  5 }, // v
+    {  50, 10, 10, 20, 40, 10, 10, 40, 40, 10, 10, 10, 10, 30, 40, 10,  5, 20, 20, 10, 10,  5, 10,  5, 10,  5 }, // w
+    {  20,  5, 20,  5, 20,  5,  5, 10, 20,  5,  5,  5,  5,  5, 10, 30,  5,  5,  5, 30,  5,  5,  5,  5, 10,  5 }, // x
+    {  30, 10, 10, 10, 30, 10, 10, 10, 30, 10, 10, 20, 20, 20, 40, 20,  5, 20, 40, 30, 10,  5, 20,  5, 10,  5 }, // y
+    {  30,  5,  5,  5, 30,  5,  5,  5, 20,  5,  5, 10,  5,  5, 20,  5,  5,  5,  5,  5,  5,  5,  5,  5, 10, 20 }, // z
 };
-
-
-// ============================================================================
-// HELPER - PROCESS NAME POPULATION
-// ============================================================================
-
-static VOID
-DnspPopulateProcessName(
-    _In_ HANDLE ProcessId,
-    _Out_writes_(MaxChars) PWCHAR Buffer,
-    _In_ ULONG MaxChars,
-    _Out_ PUSHORT LengthInBytes
-    )
-/*++
-Routine Description:
-    Best-effort population of process image name.
-    Safe to call at PASSIVE_LEVEL only.
---*/
-{
-    NTSTATUS status;
-    PEPROCESS process = NULL;
-    PUNICODE_STRING imageName = NULL;
-
-    Buffer[0] = L'\0';
-    *LengthInBytes = 0;
-
-    if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
-        return;
-    }
-
-    status = PsLookupProcessByProcessId(ProcessId, &process);
-    if (!NT_SUCCESS(status)) {
-        return;
-    }
-
-    status = SeLocateProcessImageName(process, &imageName);
-    if (NT_SUCCESS(status) && imageName != NULL && imageName->Buffer != NULL) {
-        ULONG copyChars = imageName->Length / sizeof(WCHAR);
-        if (copyChars >= MaxChars) {
-            copyChars = MaxChars - 1;
-        }
-        RtlCopyMemory(Buffer, imageName->Buffer, copyChars * sizeof(WCHAR));
-        Buffer[copyChars] = L'\0';
-        *LengthInBytes = (USHORT)(copyChars * sizeof(WCHAR));
-        ExFreePool(imageName);
-    }
-
-    ObDereferenceObject(process);
-}
 
 // ============================================================================
 // PUBLIC API - INITIALIZATION
@@ -606,9 +486,19 @@ NTSTATUS
 DnsInitialize(
     _Out_ PDNS_MONITOR* Monitor
     )
+/*++
+Routine Description:
+    Initializes the DNS monitoring subsystem.
+
+Arguments:
+    Monitor - Receives pointer to initialized monitor.
+
+Return Value:
+    STATUS_SUCCESS on success.
+--*/
 {
     NTSTATUS status;
-    PDNS_MONITOR monitor = NULL;
+    PDNS_MONITOR_INTERNAL monitor = NULL;
     ULONG i;
     LARGE_INTEGER dueTime;
 
@@ -618,9 +508,12 @@ DnsInitialize(
 
     *Monitor = NULL;
 
-    monitor = (PDNS_MONITOR)ExAllocatePool2(
+    //
+    // Allocate monitor structure
+    //
+    monitor = (PDNS_MONITOR_INTERNAL)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
-        sizeof(DNS_MONITOR),
+        sizeof(DNS_MONITOR_INTERNAL),
         DNS_POOL_TAG
     );
 
@@ -628,62 +521,65 @@ DnsInitialize(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    // ExAllocatePool2 zeroes memory; no redundant RtlZeroMemory needed.
+    RtlZeroMemory(monitor, sizeof(DNS_MONITOR_INTERNAL));
 
     //
     // Initialize locks
     //
-    ExInitializePushLock(&monitor->QueryListLock);
-    ExInitializePushLock(&monitor->DomainCacheLock);
-    ExInitializePushLock(&monitor->ProcessListLock);
+    ExInitializePushLock(&monitor->Public.QueryListLock);
+    ExInitializePushLock(&monitor->Public.DomainCacheLock);
+    ExInitializePushLock(&monitor->Public.ProcessListLock);
+    ExInitializePushLock(&monitor->PendingQueryLock);
     ExInitializePushLock(&monitor->TunnelContextLock);
     ExInitializePushLock(&monitor->Callbacks.Lock);
-    ExInitializePushLock(&monitor->TransactionHash.Lock);
 
     //
     // Initialize lists
     //
-    InitializeListHead(&monitor->QueryList);
-    InitializeListHead(&monitor->DomainCache);
-    InitializeListHead(&monitor->ProcessList);
+    InitializeListHead(&monitor->Public.QueryList);
+    InitializeListHead(&monitor->Public.DomainCache);
+    InitializeListHead(&monitor->Public.ProcessList);
+    InitializeListHead(&monitor->PendingQueryList);
     InitializeListHead(&monitor->TunnelContextList);
 
     //
     // Allocate transaction hash table
     //
-    monitor->TransactionHash.BucketCount = DNS_TRANSACTION_HASH_BUCKETS;
-    monitor->TransactionHash.Buckets = (PLIST_ENTRY)ExAllocatePool2(
+    monitor->Public.TransactionHash.BucketCount = DNS_TRANSACTION_HASH_BUCKETS;
+    monitor->Public.TransactionHash.Buckets = (PLIST_ENTRY)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         sizeof(LIST_ENTRY) * DNS_TRANSACTION_HASH_BUCKETS,
         DNS_POOL_TAG
     );
 
-    if (monitor->TransactionHash.Buckets == NULL) {
+    if (monitor->Public.TransactionHash.Buckets == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto Cleanup;
     }
 
     for (i = 0; i < DNS_TRANSACTION_HASH_BUCKETS; i++) {
-        InitializeListHead(&monitor->TransactionHash.Buckets[i]);
+        InitializeListHead(&monitor->Public.TransactionHash.Buckets[i]);
     }
+
+    KeInitializeSpinLock(&monitor->Public.TransactionHash.Lock);
 
     //
     // Allocate domain hash table
     //
-    monitor->DomainHash.BucketCount = DNS_DOMAIN_HASH_BUCKETS;
-    monitor->DomainHash.Buckets = (PLIST_ENTRY)ExAllocatePool2(
+    monitor->Public.DomainHash.BucketCount = DNS_DOMAIN_HASH_BUCKETS;
+    monitor->Public.DomainHash.Buckets = (PLIST_ENTRY)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         sizeof(LIST_ENTRY) * DNS_DOMAIN_HASH_BUCKETS,
         DNS_POOL_TAG
     );
 
-    if (monitor->DomainHash.Buckets == NULL) {
+    if (monitor->Public.DomainHash.Buckets == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto Cleanup;
     }
 
     for (i = 0; i < DNS_DOMAIN_HASH_BUCKETS; i++) {
-        InitializeListHead(&monitor->DomainHash.Buckets[i]);
+        InitializeListHead(&monitor->Public.DomainHash.Buckets[i]);
     }
 
     //
@@ -709,89 +605,87 @@ DnsInitialize(
     // Initialize lookaside lists
     //
     ExInitializeNPagedLookasideList(
-        &monitor->QueryLookaside, NULL, NULL, 0,
-        sizeof(DNS_QUERY), DNS_POOL_TAG_QUERY, 0
+        &monitor->QueryLookaside,
+        NULL,
+        NULL,
+        0,
+        sizeof(DNS_QUERY),
+        DNS_POOL_TAG_QUERY,
+        0
     );
 
     ExInitializeNPagedLookasideList(
-        &monitor->DomainCacheLookaside, NULL, NULL, 0,
-        sizeof(DNS_DOMAIN_CACHE), DNS_POOL_TAG_CACHE, 0
+        &monitor->DomainCacheLookaside,
+        NULL,
+        NULL,
+        0,
+        sizeof(DNS_DOMAIN_CACHE),
+        DNS_POOL_TAG_CACHE,
+        0
     );
 
     ExInitializeNPagedLookasideList(
-        &monitor->ProcessContextLookaside, NULL, NULL, 0,
-        sizeof(DNS_PROCESS_CONTEXT), DNS_POOL_TAG, 0
+        &monitor->ProcessContextLookaside,
+        NULL,
+        NULL,
+        0,
+        sizeof(DNS_PROCESS_CONTEXT),
+        DNS_POOL_TAG,
+        0
     );
 
     ExInitializeNPagedLookasideList(
-        &monitor->TunnelContextLookaside, NULL, NULL, 0,
-        sizeof(DNS_TUNNEL_CONTEXT), DNS_POOL_TAG, 0
+        &monitor->TunnelContextLookaside,
+        NULL,
+        NULL,
+        0,
+        sizeof(DNS_TUNNEL_CONTEXT),
+        DNS_POOL_TAG,
+        0
     );
 
     monitor->LookasideInitialized = TRUE;
 
     //
-    // Initialize cleanup timer + work item.
-    // DPC fires at DISPATCH_LEVEL and queues a work item at PASSIVE_LEVEL.
+    // Initialize cleanup timer
     //
-    KeInitializeTimer(&monitor->CleanupTimer);
-    KeInitializeDpc(&monitor->CleanupDpc, DnspCleanupTimerDpc, monitor);
-
-    //
-    // Work item requires a device object. Obtain from globals.
-    // If DeviceObject is not available, cleanup will be deferred to shutdown.
-    //
-    if (g_DriverData.DeviceObject != NULL) {
-        monitor->DeviceObject = g_DriverData.DeviceObject;
-        monitor->CleanupWorkItem = IoAllocateWorkItem(monitor->DeviceObject);
-        if (monitor->CleanupWorkItem == NULL) {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-            goto Cleanup;
-        }
-    }
-
-    monitor->CleanupInProgress = 0;
+    KeInitializeTimer(&monitor->Public.CleanupTimer);
+    KeInitializeDpc(&monitor->Public.CleanupDpc, DnspCleanupTimerDpc, monitor);
 
     dueTime.QuadPart = -((LONGLONG)DNS_CLEANUP_INTERVAL_MS * 10000);
     KeSetTimerEx(
-        &monitor->CleanupTimer,
+        &monitor->Public.CleanupTimer,
         dueTime,
         DNS_CLEANUP_INTERVAL_MS,
-        &monitor->CleanupDpc
+        &monitor->Public.CleanupDpc
     );
 
     //
     // Set default configuration
     //
-    monitor->Config.EnableTunnelingDetection = TRUE;
-    monitor->Config.EnableDGADetection = TRUE;
-    monitor->Config.EntropyThreshold = DNS_TUNNEL_ENTROPY_THRESHOLD;
-    monitor->Config.MaxSubdomainLength = DNS_SUBDOMAIN_LENGTH_THRESHOLD;
-    monitor->Config.QueryRateThreshold = DNS_QUERY_RATE_THRESHOLD;
+    monitor->Public.Config.EnableTunnelingDetection = TRUE;
+    monitor->Public.Config.EnableDGADetection = TRUE;
+    monitor->Public.Config.EntropyThreshold = DNS_TUNNEL_ENTROPY_THRESHOLD;
+    monitor->Public.Config.MaxSubdomainLength = DNS_SUBDOMAIN_LENGTH_THRESHOLD;
+    monitor->Public.Config.QueryRateThreshold = DNS_QUERY_RATE_THRESHOLD;
 
-    KeQuerySystemTimePrecise(&monitor->Stats.StartTime);
+    //
+    // Record start time
+    //
+    KeQuerySystemTimePrecise(&monitor->Public.Stats.StartTime);
 
-    InterlockedExchange(&monitor->Initialized, TRUE);
-    *Monitor = monitor;
+    monitor->Public.Initialized = TRUE;
+    *Monitor = &monitor->Public;
 
     return STATUS_SUCCESS;
 
 Cleanup:
     if (monitor != NULL) {
-        if (monitor->CleanupWorkItem != NULL) {
-            IoFreeWorkItem(monitor->CleanupWorkItem);
+        if (monitor->Public.TransactionHash.Buckets != NULL) {
+            ExFreePoolWithTag(monitor->Public.TransactionHash.Buckets, DNS_POOL_TAG);
         }
-        if (monitor->LookasideInitialized) {
-            ExDeleteNPagedLookasideList(&monitor->QueryLookaside);
-            ExDeleteNPagedLookasideList(&monitor->DomainCacheLookaside);
-            ExDeleteNPagedLookasideList(&monitor->ProcessContextLookaside);
-            ExDeleteNPagedLookasideList(&monitor->TunnelContextLookaside);
-        }
-        if (monitor->TransactionHash.Buckets != NULL) {
-            ExFreePoolWithTag(monitor->TransactionHash.Buckets, DNS_POOL_TAG);
-        }
-        if (monitor->DomainHash.Buckets != NULL) {
-            ExFreePoolWithTag(monitor->DomainHash.Buckets, DNS_POOL_TAG);
+        if (monitor->Public.DomainHash.Buckets != NULL) {
+            ExFreePoolWithTag(monitor->Public.DomainHash.Buckets, DNS_POOL_TAG);
         }
         if (monitor->TunnelHash.Buckets != NULL) {
             ExFreePoolWithTag(monitor->TunnelHash.Buckets, DNS_POOL_TAG);
@@ -802,151 +696,137 @@ Cleanup:
     return status;
 }
 
-
-// ============================================================================
-// PUBLIC API - SHUTDOWN
-// ============================================================================
-
 VOID
 DnsShutdown(
     _Inout_ PDNS_MONITOR Monitor
     )
+/*++
+Routine Description:
+    Shuts down the DNS monitoring subsystem and frees all resources.
+
+Arguments:
+    Monitor - Monitor to shutdown.
+--*/
 {
+    PDNS_MONITOR_INTERNAL monitor;
     PLIST_ENTRY entry;
     PDNS_QUERY query;
     PDNS_DOMAIN_CACHE domainEntry;
     PDNS_PROCESS_CONTEXT processCtx;
     PDNS_TUNNEL_CONTEXT tunnelCtx;
 
-    if (Monitor == NULL || !InterlockedExchange(&Monitor->Initialized, FALSE)) {
+    if (Monitor == NULL || !Monitor->Initialized) {
         return;
     }
 
-    //
-    // Cancel cleanup timer and wait for any in-flight DPC to complete.
-    //
-    KeCancelTimer(&Monitor->CleanupTimer);
-    KeFlushQueuedDpcs();
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
+    monitor->Public.Initialized = FALSE;
 
     //
-    // Wait for any in-progress work item to finish.
+    // Cancel cleanup timer
     //
-    while (InterlockedCompareExchange(&Monitor->CleanupInProgress, 0, 0) != 0) {
-        LARGE_INTEGER delay;
-        delay.QuadPart = -10000; // 1ms
-        KeDelayExecutionThread(KernelMode, FALSE, &delay);
-    }
+    KeCancelTimer(&monitor->Public.CleanupTimer);
 
     //
-    // Free all queries — remove from ALL lists
+    // Free all queries
     //
-    ExAcquirePushLockExclusive(&Monitor->QueryListLock);
-    ExAcquirePushLockExclusive(&Monitor->TransactionHash.Lock);
+    ExAcquirePushLockExclusive(&monitor->Public.QueryListLock);
 
-    while (!IsListEmpty(&Monitor->QueryList)) {
-        entry = RemoveHeadList(&Monitor->QueryList);
+    while (!IsListEmpty(&monitor->Public.QueryList)) {
+        entry = RemoveHeadList(&monitor->Public.QueryList);
         query = CONTAINING_RECORD(entry, DNS_QUERY, ListEntry);
 
-        // Remove from transaction hash
-        RemoveEntryList(&query->HashEntry);
-
-        // Remove from process list (if linked)
-        if (query->ProcessListEntry.Flink != NULL &&
-            query->ProcessListEntry.Blink != NULL) {
-            RemoveEntryList(&query->ProcessListEntry);
+        if (query->ProcessName.Buffer != NULL) {
+            ExFreePoolWithTag(query->ProcessName.Buffer, DNS_POOL_TAG_QUERY);
         }
 
-        if (Monitor->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&Monitor->QueryLookaside, query);
+        if (monitor->LookasideInitialized) {
+            ExFreeToNPagedLookasideList(&monitor->QueryLookaside, query);
         }
     }
 
-    ExReleasePushLockExclusive(&Monitor->TransactionHash.Lock);
-    ExReleasePushLockExclusive(&Monitor->QueryListLock);
+    ExReleasePushLockExclusive(&monitor->Public.QueryListLock);
 
     //
     // Free domain cache
     //
-    ExAcquirePushLockExclusive(&Monitor->DomainCacheLock);
+    ExAcquirePushLockExclusive(&monitor->Public.DomainCacheLock);
 
-    while (!IsListEmpty(&Monitor->DomainCache)) {
-        entry = RemoveHeadList(&Monitor->DomainCache);
+    while (!IsListEmpty(&monitor->Public.DomainCache)) {
+        entry = RemoveHeadList(&monitor->Public.DomainCache);
         domainEntry = CONTAINING_RECORD(entry, DNS_DOMAIN_CACHE, ListEntry);
-        RemoveEntryList(&domainEntry->HashEntry);
 
-        if (Monitor->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&Monitor->DomainCacheLookaside, domainEntry);
+        if (monitor->LookasideInitialized) {
+            ExFreeToNPagedLookasideList(&monitor->DomainCacheLookaside, domainEntry);
         }
     }
 
-    ExReleasePushLockExclusive(&Monitor->DomainCacheLock);
+    ExReleasePushLockExclusive(&monitor->Public.DomainCacheLock);
 
     //
     // Free process contexts
     //
-    ExAcquirePushLockExclusive(&Monitor->ProcessListLock);
+    ExAcquirePushLockExclusive(&monitor->Public.ProcessListLock);
 
-    while (!IsListEmpty(&Monitor->ProcessList)) {
-        entry = RemoveHeadList(&Monitor->ProcessList);
+    while (!IsListEmpty(&monitor->Public.ProcessList)) {
+        entry = RemoveHeadList(&monitor->Public.ProcessList);
         processCtx = CONTAINING_RECORD(entry, DNS_PROCESS_CONTEXT, ListEntry);
 
-        if (Monitor->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&Monitor->ProcessContextLookaside, processCtx);
+        if (processCtx->ProcessName.Buffer != NULL) {
+            ExFreePoolWithTag(processCtx->ProcessName.Buffer, DNS_POOL_TAG);
+        }
+
+        if (monitor->LookasideInitialized) {
+            ExFreeToNPagedLookasideList(&monitor->ProcessContextLookaside, processCtx);
         }
     }
 
-    ExReleasePushLockExclusive(&Monitor->ProcessListLock);
+    ExReleasePushLockExclusive(&monitor->Public.ProcessListLock);
 
     //
     // Free tunnel contexts
     //
-    ExAcquirePushLockExclusive(&Monitor->TunnelContextLock);
+    ExAcquirePushLockExclusive(&monitor->TunnelContextLock);
 
-    while (!IsListEmpty(&Monitor->TunnelContextList)) {
-        entry = RemoveHeadList(&Monitor->TunnelContextList);
+    while (!IsListEmpty(&monitor->TunnelContextList)) {
+        entry = RemoveHeadList(&monitor->TunnelContextList);
         tunnelCtx = CONTAINING_RECORD(entry, DNS_TUNNEL_CONTEXT, ListEntry);
-        RemoveEntryList(&tunnelCtx->HashEntry);
 
-        if (Monitor->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&Monitor->TunnelContextLookaside, tunnelCtx);
+        if (monitor->LookasideInitialized) {
+            ExFreeToNPagedLookasideList(&monitor->TunnelContextLookaside, tunnelCtx);
         }
     }
 
-    ExReleasePushLockExclusive(&Monitor->TunnelContextLock);
+    ExReleasePushLockExclusive(&monitor->TunnelContextLock);
 
     //
     // Free lookaside lists
     //
-    if (Monitor->LookasideInitialized) {
-        ExDeleteNPagedLookasideList(&Monitor->QueryLookaside);
-        ExDeleteNPagedLookasideList(&Monitor->DomainCacheLookaside);
-        ExDeleteNPagedLookasideList(&Monitor->ProcessContextLookaside);
-        ExDeleteNPagedLookasideList(&Monitor->TunnelContextLookaside);
-    }
-
-    //
-    // Free work item
-    //
-    if (Monitor->CleanupWorkItem != NULL) {
-        IoFreeWorkItem(Monitor->CleanupWorkItem);
+    if (monitor->LookasideInitialized) {
+        ExDeleteNPagedLookasideList(&monitor->QueryLookaside);
+        ExDeleteNPagedLookasideList(&monitor->DomainCacheLookaside);
+        ExDeleteNPagedLookasideList(&monitor->ProcessContextLookaside);
+        ExDeleteNPagedLookasideList(&monitor->TunnelContextLookaside);
     }
 
     //
     // Free hash tables
     //
-    if (Monitor->TransactionHash.Buckets != NULL) {
-        ExFreePoolWithTag(Monitor->TransactionHash.Buckets, DNS_POOL_TAG);
+    if (monitor->Public.TransactionHash.Buckets != NULL) {
+        ExFreePoolWithTag(monitor->Public.TransactionHash.Buckets, DNS_POOL_TAG);
     }
-    if (Monitor->DomainHash.Buckets != NULL) {
-        ExFreePoolWithTag(Monitor->DomainHash.Buckets, DNS_POOL_TAG);
+    if (monitor->Public.DomainHash.Buckets != NULL) {
+        ExFreePoolWithTag(monitor->Public.DomainHash.Buckets, DNS_POOL_TAG);
     }
-    if (Monitor->TunnelHash.Buckets != NULL) {
-        ExFreePoolWithTag(Monitor->TunnelHash.Buckets, DNS_POOL_TAG);
+    if (monitor->TunnelHash.Buckets != NULL) {
+        ExFreePoolWithTag(monitor->TunnelHash.Buckets, DNS_POOL_TAG);
     }
 
-    ExFreePoolWithTag(Monitor, DNS_POOL_TAG);
+    //
+    // Free monitor structure
+    //
+    ExFreePoolWithTag(monitor, DNS_POOL_TAG);
 }
-
 
 // ============================================================================
 // PUBLIC API - QUERY PROCESSING
@@ -965,16 +845,37 @@ DnsProcessQuery(
     _In_ BOOLEAN IsIPv6,
     _Out_opt_ PDNS_QUERY* Query
     )
+/*++
+Routine Description:
+    Processes an outbound DNS query packet.
+
+Arguments:
+    Monitor - DNS monitor instance.
+    ProcessId - Originating process ID.
+    DnsPacket - Raw DNS packet data.
+    PacketSize - Size of packet in bytes.
+    SourceAddress - Source IP address.
+    SourcePort - Source port.
+    ServerAddress - DNS server address.
+    ServerPort - DNS server port (usually 53).
+    IsIPv6 - TRUE if IPv6 addresses.
+    Query - Optional, receives parsed query structure.
+
+Return Value:
+    STATUS_SUCCESS on success.
+--*/
 {
     NTSTATUS status;
+    PDNS_MONITOR_INTERNAL monitor;
     PDNS_QUERY query = NULL;
     PDNS_PROCESS_CONTEXT processCtx;
     PDNS_TUNNEL_CONTEXT tunnelCtx;
     CHAR baseDomain[DNS_MAX_NAME_LENGTH + 1];
     ULONG tunnelScore;
     BOOLEAN shouldBlock = FALSE;
-    ULONG txHashBucket;
-    KIRQL oldIrql;
+
+    UNREFERENCED_PARAMETER(SourceAddress);
+    UNREFERENCED_PARAMETER(SourcePort);
 
     if (Monitor == NULL || !Monitor->Initialized || DnsPacket == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -984,16 +885,16 @@ DnsProcessQuery(
         return STATUS_INVALID_PARAMETER;
     }
 
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
+
     //
-    // Parse the DNS query — now also receives source address info
+    // Parse the DNS query
     //
     status = DnspParseQuery(
-        Monitor,
+        monitor,
         (PUCHAR)DnsPacket,
         PacketSize,
         ProcessId,
-        SourceAddress,
-        SourcePort,
         ServerAddress,
         ServerPort,
         IsIPv6,
@@ -1004,7 +905,10 @@ DnsProcessQuery(
         return status;
     }
 
-    InterlockedIncrement64(&Monitor->Stats.TotalQueries);
+    //
+    // Update statistics
+    //
+    InterlockedIncrement64(&monitor->Public.Stats.TotalQueries);
 
     //
     // Analyze the domain
@@ -1025,29 +929,35 @@ DnsProcessQuery(
     query->SuspicionFlags = DnsSuspicion_None;
     query->SuspicionScore = 0;
 
-    if (query->Analysis.Entropy > Monitor->Config.EntropyThreshold) {
+    // High entropy detection
+    if (query->Analysis.Entropy > monitor->Public.Config.EntropyThreshold) {
         query->SuspicionFlags |= DnsSuspicion_HighEntropy;
         query->SuspicionScore += 20;
     }
 
-    if (query->Analysis.MaxLabelLength > Monitor->Config.MaxSubdomainLength) {
+    // Long subdomain detection
+    if (query->Analysis.MaxLabelLength > monitor->Public.Config.MaxSubdomainLength) {
         query->SuspicionFlags |= DnsSuspicion_LongSubdomain;
         query->SuspicionScore += 15;
     }
 
+    // Many subdomains detection
     if (query->Analysis.SubdomainCount > DNS_SUBDOMAIN_COUNT_THRESHOLD) {
         query->SuspicionFlags |= DnsSuspicion_ManySubdomains;
         query->SuspicionScore += 10;
     }
 
+    // Base64-like encoding detection
     if (query->Analysis.IsBase64Like && query->Analysis.MaxLabelLength > 20) {
         query->SuspicionScore += 25;
     }
 
+    // Hex encoding detection
     if (query->Analysis.ContainsHex && query->Analysis.MaxLabelLength > 16) {
         query->SuspicionScore += 15;
     }
 
+    // Unusual query type detection
     if (query->RecordType == DnsType_TXT ||
         query->RecordType == DnsType_ANY ||
         query->RecordType == DnsType_NULL) {
@@ -1058,22 +968,21 @@ DnsProcessQuery(
     //
     // DGA detection
     //
-    if (Monitor->Config.EnableDGADetection) {
+    if (monitor->Public.Config.EnableDGADetection) {
         ULONG dgaConfidence;
         if (DnspIsDGADomain(query->DomainName, &dgaConfidence)) {
             query->SuspicionFlags |= DnsSuspicion_DGA;
-            query->SuspicionScore += (dgaConfidence / 2);
+            query->SuspicionScore += (dgaConfidence / 2);  // Up to 50 points
         }
     }
 
     //
     // Tunneling detection
     //
-    tunnelCtx = NULL;
-    if (Monitor->Config.EnableTunnelingDetection) {
+    if (monitor->Public.Config.EnableTunnelingDetection) {
         DnspExtractBaseDomain(query->DomainName, baseDomain, sizeof(baseDomain));
 
-        tunnelCtx = DnspGetOrCreateTunnelContext(Monitor, baseDomain);
+        tunnelCtx = DnspGetOrCreateTunnelContext(monitor, baseDomain);
         if (tunnelCtx != NULL) {
             DnspUpdateTunnelMetrics(
                 tunnelCtx,
@@ -1085,25 +994,16 @@ DnsProcessQuery(
             if (DnspCheckTunneling(tunnelCtx, &tunnelScore)) {
                 query->SuspicionFlags |= DnsSuspicion_TunnelPattern;
                 query->SuspicionScore += tunnelScore;
-                InterlockedIncrement64(&Monitor->Stats.TunnelDetections);
-            }
 
-            DnspDereferenceTunnelContext(Monitor, tunnelCtx);
-            tunnelCtx = NULL;
+                InterlockedIncrement64(&monitor->Public.Stats.TunnelDetections);
+            }
         }
     }
 
     //
-    // Cap score at 100
+    // Update process context
     //
-    if (query->SuspicionScore > 100) {
-        query->SuspicionScore = 100;
-    }
-
-    //
-    // Update process context — hold reference until done with ALL uses
-    //
-    processCtx = DnspGetOrCreateProcessContext(Monitor, ProcessId);
+    processCtx = DnspGetOrCreateProcessContext(monitor, ProcessId);
     if (processCtx != NULL) {
         InterlockedIncrement(&processCtx->TotalQueries);
 
@@ -1111,11 +1011,13 @@ DnsProcessQuery(
             InterlockedIncrement(&processCtx->SuspiciousQueries);
         }
 
-        // Correct spinlock usage: acquire at current IRQL
-        KeAcquireSpinLock(&processCtx->QueryLock, &oldIrql);
+        // Add to process query list
+        KeAcquireSpinLockAtDpcLevel(&processCtx->QueryLock);
         InsertTailList(&processCtx->QueryList, &query->ProcessListEntry);
         InterlockedIncrement(&processCtx->QueryCount);
-        KeReleaseSpinLock(&processCtx->QueryLock, oldIrql);
+        KeReleaseSpinLockFromDpcLevel(&processCtx->QueryLock);
+
+        DnspDereferenceProcessContext(monitor, processCtx);
     }
 
     //
@@ -1124,64 +1026,52 @@ DnsProcessQuery(
     if (query->SuspicionScore >= DNS_TUNNEL_ENTROPY_THRESHOLD) {
         query->SuspicionFlags |= DnsSuspicion_KnownBad;
 
-        ExAcquirePushLockShared(&Monitor->Callbacks.Lock);
-        if (Monitor->Callbacks.BlockCallback != NULL) {
-            shouldBlock = Monitor->Callbacks.BlockCallback(
+        // Check block callback
+        ExAcquirePushLockShared(&monitor->Callbacks.Lock);
+        if (monitor->Callbacks.BlockCallback != NULL) {
+            shouldBlock = monitor->Callbacks.BlockCallback(
                 query,
-                Monitor->Callbacks.BlockContext
+                monitor->Callbacks.BlockContext
             );
         }
-        ExReleasePushLockShared(&Monitor->Callbacks.Lock);
+        ExReleasePushLockShared(&monitor->Callbacks.Lock);
 
         if (shouldBlock) {
-            InterlockedIncrement64(&Monitor->Stats.BlockedQueries);
+            InterlockedIncrement64(&monitor->Public.Stats.BlockedQueries);
             if (processCtx != NULL) {
                 InterlockedIncrement(&processCtx->BlockedQueries);
             }
         }
     }
 
+    //
+    // Track suspicious queries
+    //
     if (query->SuspicionFlags != DnsSuspicion_None) {
-        InterlockedIncrement64(&Monitor->Stats.SuspiciousQueries);
+        InterlockedIncrement64(&monitor->Public.Stats.SuspiciousQueries);
     }
 
     //
     // Invoke query callback
     //
-    ExAcquirePushLockShared(&Monitor->Callbacks.Lock);
-    if (Monitor->Callbacks.QueryCallback != NULL) {
-        Monitor->Callbacks.QueryCallback(query, Monitor->Callbacks.QueryContext);
+    ExAcquirePushLockShared(&monitor->Callbacks.Lock);
+    if (monitor->Callbacks.QueryCallback != NULL) {
+        monitor->Callbacks.QueryCallback(query, monitor->Callbacks.QueryContext);
     }
-    ExReleasePushLockShared(&Monitor->Callbacks.Lock);
+    ExReleasePushLockShared(&monitor->Callbacks.Lock);
 
     //
-    // Now dereference process context after all uses are done (fix HIGH-02)
+    // Add to global query list
     //
-    if (processCtx != NULL) {
-        DnspDereferenceProcessContext(Monitor, processCtx);
-        processCtx = NULL;
-    }
+    ExAcquirePushLockExclusive(&monitor->Public.QueryListLock);
+    InsertTailList(&monitor->Public.QueryList, &query->ListEntry);
+    InterlockedIncrement(&monitor->Public.QueryCount);
+    ExReleasePushLockExclusive(&monitor->Public.QueryListLock);
 
     //
-    // Add to global query list AND transaction hash atomically
+    // Update domain cache
     //
-    txHashBucket = DnspHashTransactionId(
-        query->TransactionId,
-        &query->ServerAddress,
-        query->IsIPv6
-    ) % Monitor->TransactionHash.BucketCount;
-
-    ExAcquirePushLockExclusive(&Monitor->QueryListLock);
-    ExAcquirePushLockExclusive(&Monitor->TransactionHash.Lock);
-
-    InsertTailList(&Monitor->QueryList, &query->ListEntry);
-    InsertTailList(&Monitor->TransactionHash.Buckets[txHashBucket], &query->HashEntry);
-    InterlockedIncrement(&Monitor->QueryCount);
-
-    ExReleasePushLockExclusive(&Monitor->TransactionHash.Lock);
-    ExReleasePushLockExclusive(&Monitor->QueryListLock);
-
-    DnspAddToDomainCache(Monitor, query->DomainName, query);
+    DnspAddToDomainCache(monitor, query->DomainName, query);
 
     if (Query != NULL) {
         *Query = query;
@@ -1198,7 +1088,23 @@ DnsProcessResponse(
     _In_ PVOID ServerAddress,
     _In_ BOOLEAN IsIPv6
     )
+/*++
+Routine Description:
+    Processes an inbound DNS response packet.
+
+Arguments:
+    Monitor - DNS monitor instance.
+    DnsPacket - Raw DNS packet data.
+    PacketSize - Size of packet in bytes.
+    ServerAddress - DNS server address.
+    IsIPv6 - TRUE if IPv6 address.
+
+Return Value:
+    STATUS_SUCCESS on success.
+--*/
 {
+    PDNS_MONITOR_INTERNAL monitor;
+
     if (Monitor == NULL || !Monitor->Initialized || DnsPacket == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1207,15 +1113,16 @@ DnsProcessResponse(
         return STATUS_INVALID_PARAMETER;
     }
 
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
+
     return DnspParseResponse(
-        Monitor,
+        monitor,
         (PUCHAR)DnsPacket,
         PacketSize,
         ServerAddress,
         IsIPv6
     );
 }
-
 
 // ============================================================================
 // PUBLIC API - QUERY ANALYSIS
@@ -1228,7 +1135,21 @@ DnsAnalyzeQuery(
     _Out_ PDNS_SUSPICION SuspicionFlags,
     _Out_ PULONG SuspicionScore
     )
+/*++
+Routine Description:
+    Analyzes a domain name for suspicious characteristics.
+
+Arguments:
+    Monitor - DNS monitor instance.
+    DomainName - Domain name to analyze.
+    SuspicionFlags - Receives suspicion flags.
+    SuspicionScore - Receives suspicion score (0-100).
+
+Return Value:
+    STATUS_SUCCESS on success.
+--*/
 {
+    PDNS_MONITOR_INTERNAL monitor;
     ULONG entropy;
     ULONG subdomainCount;
     ULONG maxLabelLength;
@@ -1242,9 +1163,14 @@ DnsAnalyzeQuery(
         return STATUS_INVALID_PARAMETER;
     }
 
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
+
     *SuspicionFlags = DnsSuspicion_None;
     *SuspicionScore = 0;
 
+    //
+    // Analyze domain characteristics
+    //
     DnspAnalyzeDomain(
         DomainName,
         &entropy,
@@ -1255,36 +1181,43 @@ DnsAnalyzeQuery(
         &isBase64Like
     );
 
-    if (entropy > Monitor->Config.EntropyThreshold) {
+    // High entropy
+    if (entropy > monitor->Public.Config.EntropyThreshold) {
         *SuspicionFlags |= DnsSuspicion_HighEntropy;
         *SuspicionScore += 20;
     }
 
-    if (maxLabelLength > Monitor->Config.MaxSubdomainLength) {
+    // Long subdomain
+    if (maxLabelLength > monitor->Public.Config.MaxSubdomainLength) {
         *SuspicionFlags |= DnsSuspicion_LongSubdomain;
         *SuspicionScore += 15;
     }
 
+    // Many subdomains
     if (subdomainCount > DNS_SUBDOMAIN_COUNT_THRESHOLD) {
         *SuspicionFlags |= DnsSuspicion_ManySubdomains;
         *SuspicionScore += 10;
     }
 
+    // Base64-like
     if (isBase64Like && maxLabelLength > 20) {
         *SuspicionScore += 25;
     }
 
+    // Hex encoding
     if (containsHex && maxLabelLength > 16) {
         *SuspicionScore += 15;
     }
 
-    if (Monitor->Config.EnableDGADetection) {
+    // DGA detection
+    if (monitor->Public.Config.EnableDGADetection) {
         if (DnspIsDGADomain(DomainName, &dgaConfidence)) {
             *SuspicionFlags |= DnsSuspicion_DGA;
             *SuspicionScore += (dgaConfidence / 2);
         }
     }
 
+    // Cap at 100
     if (*SuspicionScore > 100) {
         *SuspicionScore = 100;
     }
@@ -1299,54 +1232,80 @@ DnsDetectTunneling(
     _Out_ PBOOLEAN TunnelingDetected,
     _Out_opt_ PULONG Score
     )
+/*++
+Routine Description:
+    Detects DNS tunneling activity for a process.
+
+Arguments:
+    Monitor - DNS monitor instance.
+    ProcessId - Process to analyze.
+    TunnelingDetected - Receives TRUE if tunneling detected.
+    Score - Optional, receives tunneling score.
+
+Return Value:
+    STATUS_SUCCESS on success.
+--*/
 {
+    PDNS_MONITOR_INTERNAL monitor;
     PDNS_PROCESS_CONTEXT processCtx;
     ULONG totalScore = 0;
     ULONG queriesPerMinute;
+    LARGE_INTEGER currentTime;
 
     if (Monitor == NULL || !Monitor->Initialized ||
         TunnelingDetected == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
+
     *TunnelingDetected = FALSE;
     if (Score != NULL) {
         *Score = 0;
     }
 
-    // Lookup only — do not create context for a read-only query
-    processCtx = DnspFindProcessContext(Monitor, ProcessId);
+    //
+    // Find process context
+    //
+    processCtx = DnspGetOrCreateProcessContext(monitor, ProcessId);
     if (processCtx == NULL) {
         return STATUS_NOT_FOUND;
     }
 
+    KeQuerySystemTimePrecise(&currentTime);
+
+    //
+    // Analyze process DNS behavior
+    //
+
+    // High volume of queries
     queriesPerMinute = processCtx->QueriesPerMinute;
-    if (queriesPerMinute > Monitor->Config.QueryRateThreshold) {
+    if (queriesPerMinute > monitor->Public.Config.QueryRateThreshold) {
         totalScore += 30;
     }
 
+    // High ratio of suspicious queries
     if (processCtx->TotalQueries > 10) {
-        LONG total = processCtx->TotalQueries;
-        LONG suspicious = processCtx->SuspiciousQueries;
-        if (total > 0) {
-            ULONG suspiciousRatio = ((ULONG)suspicious * 100) / (ULONG)total;
-            if (suspiciousRatio > 50) {
-                totalScore += 40;
-            } else if (suspiciousRatio > 25) {
-                totalScore += 20;
-            }
+        ULONG suspiciousRatio = (processCtx->SuspiciousQueries * 100) /
+                                 processCtx->TotalQueries;
+        if (suspiciousRatio > 50) {
+            totalScore += 40;
+        } else if (suspiciousRatio > 25) {
+            totalScore += 20;
         }
     }
 
+    // High unique domain count
     if (processCtx->UniqueDomainsQueried > 100) {
         totalScore += 20;
     }
 
+    // Flagged for high DNS activity
     if (processCtx->HighDnsActivity) {
         totalScore += 10;
     }
 
-    DnspDereferenceProcessContext(Monitor, processCtx);
+    DnspDereferenceProcessContext(monitor, processCtx);
 
     *TunnelingDetected = (totalScore >= 50);
     if (Score != NULL) {
@@ -1363,6 +1322,19 @@ DnsDetectDGA(
     _Out_ PBOOLEAN IsDGA,
     _Out_opt_ PULONG Confidence
     )
+/*++
+Routine Description:
+    Detects if a domain name appears to be generated by a DGA.
+
+Arguments:
+    Monitor - DNS monitor instance.
+    DomainName - Domain name to analyze.
+    IsDGA - Receives TRUE if DGA detected.
+    Confidence - Optional, receives confidence score (0-100).
+
+Return Value:
+    STATUS_SUCCESS on success.
+--*/
 {
     ULONG confidence = 0;
 
@@ -1384,42 +1356,41 @@ DnsDetectDGA(
 // PUBLIC API - DOMAIN CACHE
 // ============================================================================
 
-_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 DnsLookupDomain(
     _In_ PDNS_MONITOR Monitor,
     _In_ PCSTR DomainName,
-    _Out_ PDNS_DOMAIN_CACHE EntryCopy
+    _Out_ PDNS_DOMAIN_CACHE* Entry
     )
 /*++
 Routine Description:
-    Looks up a domain in the cache and returns a COPY of the entry.
-    Caller does not receive a live pointer — safe against concurrent cleanup.
+    Looks up a domain in the cache.
+
+Arguments:
+    Monitor - DNS monitor instance.
+    DomainName - Domain name to lookup.
+    Entry - Receives pointer to cache entry.
+
+Return Value:
+    STATUS_SUCCESS if found, STATUS_NOT_FOUND otherwise.
 --*/
 {
+    PDNS_MONITOR_INTERNAL monitor;
     PDNS_DOMAIN_CACHE entry;
 
     if (Monitor == NULL || !Monitor->Initialized ||
-        DomainName == NULL || EntryCopy == NULL) {
+        DomainName == NULL || Entry == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    ExAcquirePushLockShared(&Monitor->DomainCacheLock);
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
 
-    entry = DnspLookupDomainCacheLocked(Monitor, DomainName);
+    entry = DnspLookupDomainCache(monitor, DomainName);
     if (entry == NULL) {
-        ExReleasePushLockShared(&Monitor->DomainCacheLock);
         return STATUS_NOT_FOUND;
     }
 
-    RtlCopyMemory(EntryCopy, entry, sizeof(DNS_DOMAIN_CACHE));
-
-    // Invalidate list linkage in the copy so caller cannot corrupt lists
-    InitializeListHead(&EntryCopy->ListEntry);
-    InitializeListHead(&EntryCopy->HashEntry);
-
-    ExReleasePushLockShared(&Monitor->DomainCacheLock);
-
+    *Entry = entry;
     return STATUS_SUCCESS;
 }
 
@@ -1427,33 +1398,41 @@ NTSTATUS
 DnsSetDomainReputation(
     _In_ PDNS_MONITOR Monitor,
     _In_ PCSTR DomainName,
-    _In_ DNS_REPUTATION Reputation,
+    _In_ ULONG Reputation,
     _In_ ULONG Score
     )
+/*++
+Routine Description:
+    Sets the reputation for a cached domain.
+
+Arguments:
+    Monitor - DNS monitor instance.
+    DomainName - Domain name.
+    Reputation - Reputation level.
+    Score - Reputation score (0-100, higher = safer).
+
+Return Value:
+    STATUS_SUCCESS on success.
+--*/
 {
+    PDNS_MONITOR_INTERNAL monitor;
     PDNS_DOMAIN_CACHE entry;
 
     if (Monitor == NULL || !Monitor->Initialized || DomainName == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Reputation >= DnsReputation_MaxValue) {
-        return STATUS_INVALID_PARAMETER;
-    }
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
 
-    if (Score > 100) {
-        return STATUS_INVALID_PARAMETER;
-    }
+    ExAcquirePushLockExclusive(&monitor->Public.DomainCacheLock);
 
-    ExAcquirePushLockExclusive(&Monitor->DomainCacheLock);
-
-    entry = DnspLookupDomainCacheLocked(Monitor, DomainName);
+    entry = DnspLookupDomainCache(monitor, DomainName);
     if (entry != NULL) {
         entry->Reputation = Reputation;
         entry->ReputationScore = Score;
     }
 
-    ExReleasePushLockExclusive(&Monitor->DomainCacheLock);
+    ExReleasePushLockExclusive(&monitor->Public.DomainCacheLock);
 
     return (entry != NULL) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
@@ -1470,27 +1449,41 @@ DnsGetProcessQueries(
     _In_ ULONG MaxQueries,
     _Out_ PULONG QueryCount
     )
+/*++
+Routine Description:
+    Gets DNS queries for a specific process.
+
+Arguments:
+    Monitor - DNS monitor instance.
+    ProcessId - Process ID.
+    Queries - Array to receive query pointers.
+    MaxQueries - Maximum queries to return.
+    QueryCount - Receives actual count.
+
+Return Value:
+    STATUS_SUCCESS on success.
+--*/
 {
+    PDNS_MONITOR_INTERNAL monitor;
     PDNS_PROCESS_CONTEXT processCtx;
     PLIST_ENTRY entry;
     PDNS_QUERY query;
     ULONG count = 0;
-    KIRQL oldIrql;
 
     if (Monitor == NULL || !Monitor->Initialized ||
         Queries == NULL || QueryCount == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
     *QueryCount = 0;
 
-    // Lookup only — do not create for read-only query
-    processCtx = DnspFindProcessContext(Monitor, ProcessId);
+    processCtx = DnspGetOrCreateProcessContext(monitor, ProcessId);
     if (processCtx == NULL) {
         return STATUS_NOT_FOUND;
     }
 
-    KeAcquireSpinLock(&processCtx->QueryLock, &oldIrql);
+    KeAcquireSpinLockAtDpcLevel(&processCtx->QueryLock);
 
     for (entry = processCtx->QueryList.Flink;
          entry != &processCtx->QueryList && count < MaxQueries;
@@ -1500,9 +1493,9 @@ DnsGetProcessQueries(
         Queries[count++] = query;
     }
 
-    KeReleaseSpinLock(&processCtx->QueryLock, oldIrql);
+    KeReleaseSpinLockFromDpcLevel(&processCtx->QueryLock);
 
-    DnspDereferenceProcessContext(Monitor, processCtx);
+    DnspDereferenceProcessContext(monitor, processCtx);
 
     *QueryCount = count;
     return STATUS_SUCCESS;
@@ -1516,7 +1509,22 @@ DnsGetProcessStats(
     _Out_ PULONG UniqueDomains,
     _Out_ PULONG SuspiciousQueries
     )
+/*++
+Routine Description:
+    Gets DNS statistics for a specific process.
+
+Arguments:
+    Monitor - DNS monitor instance.
+    ProcessId - Process ID.
+    TotalQueries - Receives total query count.
+    UniqueDomains - Receives unique domain count.
+    SuspiciousQueries - Receives suspicious query count.
+
+Return Value:
+    STATUS_SUCCESS on success.
+--*/
 {
+    PDNS_MONITOR_INTERNAL monitor;
     PDNS_PROCESS_CONTEXT processCtx;
 
     if (Monitor == NULL || !Monitor->Initialized ||
@@ -1525,8 +1533,9 @@ DnsGetProcessStats(
         return STATUS_INVALID_PARAMETER;
     }
 
-    // Lookup only
-    processCtx = DnspFindProcessContext(Monitor, ProcessId);
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
+
+    processCtx = DnspGetOrCreateProcessContext(monitor, ProcessId);
     if (processCtx == NULL) {
         return STATUS_NOT_FOUND;
     }
@@ -1535,7 +1544,7 @@ DnsGetProcessStats(
     *UniqueDomains = processCtx->UniqueDomainsQueried;
     *SuspiciousQueries = processCtx->SuspiciousQueries;
 
-    DnspDereferenceProcessContext(Monitor, processCtx);
+    DnspDereferenceProcessContext(monitor, processCtx);
 
     return STATUS_SUCCESS;
 }
@@ -1551,14 +1560,18 @@ DnsRegisterQueryCallback(
     _In_opt_ PVOID Context
     )
 {
+    PDNS_MONITOR_INTERNAL monitor;
+
     if (Monitor == NULL || !Monitor->Initialized || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    ExAcquirePushLockExclusive(&Monitor->Callbacks.Lock);
-    Monitor->Callbacks.QueryCallback = Callback;
-    Monitor->Callbacks.QueryContext = Context;
-    ExReleasePushLockExclusive(&Monitor->Callbacks.Lock);
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
+
+    ExAcquirePushLockExclusive(&monitor->Callbacks.Lock);
+    monitor->Callbacks.QueryCallback = Callback;
+    monitor->Callbacks.QueryContext = Context;
+    ExReleasePushLockExclusive(&monitor->Callbacks.Lock);
 
     return STATUS_SUCCESS;
 }
@@ -1570,14 +1583,18 @@ DnsRegisterBlockCallback(
     _In_opt_ PVOID Context
     )
 {
+    PDNS_MONITOR_INTERNAL monitor;
+
     if (Monitor == NULL || !Monitor->Initialized || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    ExAcquirePushLockExclusive(&Monitor->Callbacks.Lock);
-    Monitor->Callbacks.BlockCallback = Callback;
-    Monitor->Callbacks.BlockContext = Context;
-    ExReleasePushLockExclusive(&Monitor->Callbacks.Lock);
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
+
+    ExAcquirePushLockExclusive(&monitor->Callbacks.Lock);
+    monitor->Callbacks.BlockCallback = Callback;
+    monitor->Callbacks.BlockContext = Context;
+    ExReleasePushLockExclusive(&monitor->Callbacks.Lock);
 
     return STATUS_SUCCESS;
 }
@@ -1587,16 +1604,20 @@ DnsUnregisterCallbacks(
     _In_ PDNS_MONITOR Monitor
     )
 {
+    PDNS_MONITOR_INTERNAL monitor;
+
     if (Monitor == NULL || !Monitor->Initialized) {
         return;
     }
 
-    ExAcquirePushLockExclusive(&Monitor->Callbacks.Lock);
-    Monitor->Callbacks.QueryCallback = NULL;
-    Monitor->Callbacks.QueryContext = NULL;
-    Monitor->Callbacks.BlockCallback = NULL;
-    Monitor->Callbacks.BlockContext = NULL;
-    ExReleasePushLockExclusive(&Monitor->Callbacks.Lock);
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
+
+    ExAcquirePushLockExclusive(&monitor->Callbacks.Lock);
+    monitor->Callbacks.QueryCallback = NULL;
+    monitor->Callbacks.QueryContext = NULL;
+    monitor->Callbacks.BlockCallback = NULL;
+    monitor->Callbacks.BlockContext = NULL;
+    ExReleasePushLockExclusive(&monitor->Callbacks.Lock);
 }
 
 // ============================================================================
@@ -1609,27 +1630,29 @@ DnsGetStatistics(
     _Out_ PDNS_STATISTICS Stats
     )
 {
+    PDNS_MONITOR_INTERNAL monitor;
     LARGE_INTEGER currentTime;
 
     if (Monitor == NULL || !Monitor->Initialized || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    monitor = CONTAINING_RECORD(Monitor, DNS_MONITOR_INTERNAL, Public);
+
     KeQuerySystemTimePrecise(&currentTime);
 
-    Stats->TotalQueries = Monitor->Stats.TotalQueries;
-    Stats->TotalResponses = Monitor->Stats.TotalResponses;
-    Stats->SuspiciousQueries = Monitor->Stats.SuspiciousQueries;
-    Stats->BlockedQueries = Monitor->Stats.BlockedQueries;
-    Stats->TunnelDetections = Monitor->Stats.TunnelDetections;
-    Stats->CacheEntries = Monitor->CacheEntryCount;
-    Stats->TrackedProcesses = Monitor->ProcessCount;
+    Stats->TotalQueries = monitor->Public.Stats.TotalQueries;
+    Stats->TotalResponses = monitor->Public.Stats.TotalResponses;
+    Stats->SuspiciousQueries = monitor->Public.Stats.SuspiciousQueries;
+    Stats->BlockedQueries = monitor->Public.Stats.BlockedQueries;
+    Stats->TunnelDetections = monitor->Public.Stats.TunnelDetections;
+    Stats->CacheEntries = monitor->Public.CacheEntryCount;
+    Stats->TrackedProcesses = monitor->Public.ProcessCount;
     Stats->UpTime.QuadPart = currentTime.QuadPart -
-                              Monitor->Stats.StartTime.QuadPart;
+                              monitor->Public.Stats.StartTime.QuadPart;
 
     return STATUS_SUCCESS;
 }
-
 
 // ============================================================================
 // INTERNAL HELPERS - HASHING
@@ -1639,11 +1662,22 @@ static ULONG
 DnspHashString(
     _In_ PCSTR String
     )
+/*++
+Routine Description:
+    Computes a hash for a string (case-insensitive).
+
+Arguments:
+    String - String to hash.
+
+Return Value:
+    Hash value.
+--*/
 {
     ULONG hash = 5381;
     UCHAR c;
 
     while ((c = (UCHAR)*String++) != 0) {
+        // Convert to lowercase
         if (c >= 'A' && c <= 'Z') {
             c = c + ('a' - 'A');
         }
@@ -1687,6 +1721,21 @@ DnspParseDnsName(
     _In_ ULONG MaxNameLength,
     _Out_ PULONG BytesConsumed
     )
+/*++
+Routine Description:
+    Parses a DNS name from a packet, handling compression.
+
+Arguments:
+    Packet - DNS packet data.
+    PacketSize - Total packet size.
+    Offset - Starting offset in packet.
+    NameBuffer - Buffer to receive parsed name.
+    MaxNameLength - Size of name buffer.
+    BytesConsumed - Receives bytes consumed from packet.
+
+Return Value:
+    STATUS_SUCCESS on success.
+--*/
 {
     ULONG currentOffset = Offset;
     ULONG nameOffset = 0;
@@ -1704,6 +1753,7 @@ DnspParseDnsName(
     while (currentOffset < PacketSize) {
         labelLength = Packet[currentOffset];
 
+        // End of name
         if (labelLength == 0) {
             if (!jumped) {
                 bytesConsumed = currentOffset - Offset + 1;
@@ -1721,14 +1771,17 @@ DnspParseDnsName(
                 bytesConsumed = currentOffset - Offset + 2;
             }
 
+            // Follow pointer
             USHORT pointer = ((labelLength & 0x3F) << 8) | Packet[currentOffset + 1];
             if (pointer >= currentOffset) {
+                // Forward reference - invalid
                 return STATUS_INVALID_NETWORK_RESPONSE;
             }
 
             currentOffset = pointer;
             jumped = TRUE;
 
+            // Prevent infinite loops
             if (++jumpCount > DNS_MAX_LABELS) {
                 return STATUS_INVALID_NETWORK_RESPONSE;
             }
@@ -1736,11 +1789,7 @@ DnspParseDnsName(
             continue;
         }
 
-        // Reject reserved label types (bits 7-6 = 01 or 10)
-        if ((labelLength & 0xC0) != 0x00) {
-            return STATUS_INVALID_NETWORK_RESPONSE;
-        }
-
+        // Regular label
         if (labelLength > DNS_MAX_LABEL_LENGTH) {
             return STATUS_INVALID_NETWORK_RESPONSE;
         }
@@ -1749,6 +1798,7 @@ DnspParseDnsName(
             return STATUS_INVALID_NETWORK_RESPONSE;
         }
 
+        // Add dot separator if not first label
         if (nameOffset > 0) {
             if (nameOffset + 1 >= MaxNameLength) {
                 return STATUS_BUFFER_TOO_SMALL;
@@ -1756,6 +1806,7 @@ DnspParseDnsName(
             NameBuffer[nameOffset++] = '.';
         }
 
+        // Copy label
         if (nameOffset + labelLength >= MaxNameLength) {
             return STATUS_BUFFER_TOO_SMALL;
         }
@@ -1774,12 +1825,10 @@ DnspParseDnsName(
 
 static NTSTATUS
 DnspParseQuery(
-    _In_ PDNS_MONITOR Monitor,
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_reads_bytes_(PacketSize) PUCHAR Packet,
     _In_ ULONG PacketSize,
     _In_ HANDLE ProcessId,
-    _In_ PVOID SourceAddress,
-    _In_ USHORT SourcePort,
     _In_ PVOID ServerAddress,
     _In_ USHORT ServerPort,
     _In_ BOOLEAN IsIPv6,
@@ -1799,39 +1848,41 @@ DnspParseQuery(
 
     header = (PDNS_HEADER)Packet;
 
+    // Verify this is a query (QR bit = 0)
     if (RtlUshortByteSwap(header->Flags) & DNS_FLAG_QR) {
         return STATUS_INVALID_NETWORK_RESPONSE;
     }
 
+    // Must have at least one question
     if (RtlUshortByteSwap(header->QuestionCount) < 1) {
         return STATUS_INVALID_NETWORK_RESPONSE;
     }
 
+    //
+    // Allocate query structure
+    //
     query = (PDNS_QUERY)ExAllocateFromNPagedLookasideList(&Monitor->QueryLookaside);
     if (query == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    // Lookaside does NOT zero memory — must zero explicitly
     RtlZeroMemory(query, sizeof(DNS_QUERY));
 
     query->TransactionId = RtlUshortByteSwap(header->TransactionId);
-    query->QueryId = InterlockedIncrement64(&Monitor->NextQueryId);
+    query->QueryId = InterlockedIncrement64(&Monitor->Public.NextQueryId);
     query->ProcessId = ProcessId;
     KeQuerySystemTimePrecise(&query->QueryTime);
-
-    // Initialize list entries to safe state
-    InitializeListHead(&query->ListEntry);
-    InitializeListHead(&query->ProcessListEntry);
-    InitializeListHead(&query->HashEntry);
 
     //
     // Parse the question section
     //
     offset = DNS_HEADER_SIZE;
     status = DnspParseDnsName(
-        Packet, PacketSize, offset,
-        query->DomainName, sizeof(query->DomainName),
+        Packet,
+        PacketSize,
+        offset,
+        query->DomainName,
+        sizeof(query->DomainName),
         &bytesConsumed
     );
 
@@ -1842,6 +1893,7 @@ DnspParseQuery(
 
     offset += bytesConsumed;
 
+    // Read question footer
     if (offset + sizeof(DNS_QUESTION_FOOTER) > PacketSize) {
         ExFreeToNPagedLookasideList(&Monitor->QueryLookaside, query);
         return STATUS_INVALID_NETWORK_RESPONSE;
@@ -1850,39 +1902,31 @@ DnspParseQuery(
     questionFooter = (PDNS_QUESTION_FOOTER)&Packet[offset];
     query->RecordType = (DNS_RECORD_TYPE)RtlUshortByteSwap(questionFooter->Type);
 
-    // Populate source address (fix MED-04)
+    // Store server address
     if (IsIPv6) {
-        RtlCopyMemory(&query->SourceAddress.IPv6, SourceAddress, sizeof(IN6_ADDR));
         RtlCopyMemory(&query->ServerAddress.IPv6, ServerAddress, sizeof(IN6_ADDR));
     } else {
-        RtlCopyMemory(&query->SourceAddress.IPv4, SourceAddress, sizeof(IN_ADDR));
         RtlCopyMemory(&query->ServerAddress.IPv4, ServerAddress, sizeof(IN_ADDR));
     }
-    query->SourcePort = SourcePort;
     query->ServerPort = ServerPort;
     query->IsIPv6 = IsIPv6;
 
     // Parse flags
     USHORT flags = RtlUshortByteSwap(header->Flags);
-    if (flags & DNS_FLAG_RD) query->Flags |= DnsFlag_Recursive;
-    if (flags & DNS_FLAG_TC) query->Flags |= DnsFlag_Truncated;
-
-    // Populate process name (best-effort, PASSIVE_LEVEL only)
-    DnspPopulateProcessName(
-        ProcessId,
-        query->ProcessNameBuffer,
-        ARRAYSIZE(query->ProcessNameBuffer),
-        &query->ProcessNameLength
-    );
+    if (flags & DNS_FLAG_RD) {
+        query->Flags |= DnsFlag_Recursive;
+    }
+    if (flags & DNS_FLAG_TC) {
+        query->Flags |= DnsFlag_Truncated;
+    }
 
     *Query = query;
     return STATUS_SUCCESS;
 }
 
-
 static NTSTATUS
 DnspParseResponse(
-    _In_ PDNS_MONITOR Monitor,
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_reads_bytes_(PacketSize) PUCHAR Packet,
     _In_ ULONG PacketSize,
     _In_ PVOID ServerAddress,
@@ -1899,12 +1943,16 @@ DnspParseResponse(
     PLIST_ENTRY entry;
     ULONG hashBucket;
 
+    UNREFERENCED_PARAMETER(ServerAddress);
+    UNREFERENCED_PARAMETER(IsIPv6);
+
     if (PacketSize < DNS_HEADER_SIZE) {
         return STATUS_INVALID_NETWORK_RESPONSE;
     }
 
     header = (PDNS_HEADER)Packet;
 
+    // Verify this is a response (QR bit = 1)
     if (!(RtlUshortByteSwap(header->Flags) & DNS_FLAG_QR)) {
         return STATUS_INVALID_NETWORK_RESPONSE;
     }
@@ -1913,18 +1961,17 @@ DnspParseResponse(
     answerCount = RtlUshortByteSwap(header->AnswerCount);
 
     //
-    // O(1) lookup via transaction hash table — EXCLUSIVE lock for writes
+    // Find matching pending query
     //
-    hashBucket = DnspHashTransactionId(transactionId, ServerAddress, IsIPv6)
-                 % Monitor->TransactionHash.BucketCount;
+    hashBucket = transactionId % DNS_TRANSACTION_HASH_BUCKETS;
 
-    ExAcquirePushLockExclusive(&Monitor->TransactionHash.Lock);
+    ExAcquirePushLockShared(&Monitor->Public.QueryListLock);
 
-    for (entry = Monitor->TransactionHash.Buckets[hashBucket].Flink;
-         entry != &Monitor->TransactionHash.Buckets[hashBucket];
+    for (entry = Monitor->Public.QueryList.Flink;
+         entry != &Monitor->Public.QueryList;
          entry = entry->Flink) {
 
-        PDNS_QUERY candidate = CONTAINING_RECORD(entry, DNS_QUERY, HashEntry);
+        PDNS_QUERY candidate = CONTAINING_RECORD(entry, DNS_QUERY, ListEntry);
         if (candidate->TransactionId == transactionId &&
             !candidate->Response.Received) {
             query = candidate;
@@ -1933,28 +1980,31 @@ DnspParseResponse(
     }
 
     if (query == NULL) {
-        ExReleasePushLockExclusive(&Monitor->TransactionHash.Lock);
+        ExReleasePushLockShared(&Monitor->Public.QueryListLock);
         return STATUS_NOT_FOUND;
     }
 
     //
-    // All writes to query happen under exclusive lock
+    // Update response data
     //
     KeQuerySystemTimePrecise(&query->ResponseTime);
     query->Response.Received = TRUE;
     query->Response.ResponseCode = RtlUshortByteSwap(header->Flags) & DNS_FLAG_RCODE_MASK;
     query->Response.AnswerCount = answerCount;
 
+    // Calculate latency
     query->LatencyMs = (ULONG)((query->ResponseTime.QuadPart -
                                 query->QueryTime.QuadPart) / 10000);
 
+    ExReleasePushLockShared(&Monitor->Public.QueryListLock);
+
     //
-    // Parse answers within the lock
+    // Parse answers if present
     //
     if (answerCount > 0) {
+        // Skip question section
         offset = DNS_HEADER_SIZE;
 
-        // Skip question section with bounds checking
         USHORT questionCount = RtlUshortByteSwap(header->QuestionCount);
         for (USHORT i = 0; i < questionCount && offset < PacketSize; i++) {
             if (!NT_SUCCESS(DnspParseDnsName(Packet, PacketSize, offset,
@@ -1962,18 +2012,13 @@ DnspParseResponse(
                                              &bytesConsumed))) {
                 break;
             }
-            offset += bytesConsumed;
-            // Bounds check before adding footer size
-            if (offset + sizeof(DNS_QUESTION_FOOTER) > PacketSize) {
-                goto DoneParsingAnswers;
-            }
-            offset += sizeof(DNS_QUESTION_FOOTER);
+            offset += bytesConsumed + sizeof(DNS_QUESTION_FOOTER);
         }
 
         // Parse answer records
         ULONG addressCount = 0;
-        ULONG cnameCount = 0;
         for (USHORT i = 0; i < answerCount && offset < PacketSize; i++) {
+            // Parse name
             if (!NT_SUCCESS(DnspParseDnsName(Packet, PacketSize, offset,
                                              domainName, sizeof(domainName),
                                              &bytesConsumed))) {
@@ -1995,53 +2040,32 @@ DnspParseResponse(
                 break;
             }
 
+            // Store TTL from first record
             if (i == 0) {
                 query->Response.TTL = RtlUlongByteSwap(rrHeader->TTL);
             }
 
-            // A records
-            if (rrType == DnsType_A && dataLength == 4 &&
-                addressCount < DNS_MAX_RESPONSE_ADDRESSES) {
-                query->Response.Addresses[addressCount].IsIPv6 = FALSE;
-                RtlCopyMemory(&query->Response.Addresses[addressCount].Address.IPv4,
+            // Extract A/AAAA records
+            if (rrType == DnsType_A && dataLength == 4 && addressCount < 16) {
+                RtlCopyMemory(&query->Response.Addresses.IPv4[addressCount],
                               &Packet[offset], 4);
                 addressCount++;
-            }
-            // AAAA records
-            else if (rrType == DnsType_AAAA && dataLength == 16 &&
-                     addressCount < DNS_MAX_RESPONSE_ADDRESSES) {
-                query->Response.Addresses[addressCount].IsIPv6 = TRUE;
-                RtlCopyMemory(&query->Response.Addresses[addressCount].Address.IPv6,
+            } else if (rrType == DnsType_AAAA && dataLength == 16 && addressCount < 16) {
+                RtlCopyMemory(&query->Response.Addresses.IPv6[addressCount],
                               &Packet[offset], 16);
                 addressCount++;
-            }
-            // CNAME records (fix INCOMPLETE-05)
-            else if (rrType == DnsType_CNAME && cnameCount < DNS_MAX_CNAMES) {
-                ULONG cnameConsumed;
-                if (NT_SUCCESS(DnspParseDnsName(
-                        Packet, PacketSize, offset,
-                        query->Response.CNAMEs[cnameCount],
-                        sizeof(query->Response.CNAMEs[cnameCount]),
-                        &cnameConsumed))) {
-                    cnameCount++;
-                }
             }
 
             offset += dataLength;
         }
 
         query->Response.AddressCount = addressCount;
-        query->Response.CNAMECount = cnameCount;
     }
 
-DoneParsingAnswers:
-    ExReleasePushLockExclusive(&Monitor->TransactionHash.Lock);
-
-    InterlockedIncrement64(&Monitor->Stats.TotalResponses);
+    InterlockedIncrement64(&Monitor->Public.Stats.TotalResponses);
 
     return STATUS_SUCCESS;
 }
-
 
 // ============================================================================
 // INTERNAL HELPERS - ENTROPY & ANALYSIS
@@ -2054,62 +2078,59 @@ DnspCalculateEntropy(
     )
 /*++
 Routine Description:
-    Calculates Shannon entropy using fixed-point arithmetic and a log2 lookup
-    table. Returns entropy * 100 (e.g., 380 = 3.80 bits per character).
-    Uses pool-allocated frequency table to reduce stack pressure.
+    Calculates Shannon entropy of a string (scaled by 100).
+
+Arguments:
+    String - Input string.
+    Length - String length.
+
+Return Value:
+    Entropy value * 100 (e.g., 380 = 3.80 bits).
 --*/
 {
-    PULONG charCount;
+    ULONG charCount[256] = {0};
     ULONG i;
-    ULONG64 entropy = 0;
+    ULONG entropy = 0;
 
     if (Length == 0) {
         return 0;
     }
 
-    // Allocate frequency table from pool to avoid 1KB stack allocation
-    charCount = (PULONG)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
-        sizeof(ULONG) * 256,
-        DNS_POOL_TAG
-    );
-
-    if (charCount == NULL) {
-        return 0;
-    }
-
+    // Count character frequencies
     for (i = 0; i < Length; i++) {
         charCount[(UCHAR)String[i]]++;
     }
 
-    //
-    // Shannon entropy: H = -sum( (count/len) * log2(count/len) )
-    //                    = log2(len) - (1/len) * sum( count * log2(count) )
-    //
-    // Using lookup table: g_Log2Table[i] ~ -log2(i/256)*256
-    // We normalize counts to [0..255] range for the lookup.
-    //
+    // Calculate entropy
+    // Entropy = -sum(p * log2(p))
+    // We use integer approximation: p * log2(p) * 100
     for (i = 0; i < 256; i++) {
         if (charCount[i] > 0) {
-            // p = charCount[i] / Length, scaled to [0..255]
-            ULONG scaled = (charCount[i] * 255) / Length;
-            if (scaled == 0) scaled = 1;
-            if (scaled > 255) scaled = 255;
+            ULONG p = (charCount[i] * 1000) / Length;  // Probability * 1000
 
-            // Contribution: p * (-log2(p)) = (count/len) * g_Log2Table[scaled]/256
-            // Scaled by 100 for output
-            ULONG64 contribution = (ULONG64)charCount[i] * g_Log2Table[scaled];
-            entropy += contribution;
+            // Approximate -p * log2(p) using lookup or calculation
+            // log2(p/1000) where p is in [1, 1000]
+            // We'll use a simplified approximation
+            ULONG logValue;
+            if (p >= 500) {
+                logValue = 10;   // ~log2(0.5) = 1
+            } else if (p >= 250) {
+                logValue = 20;   // ~log2(0.25) = 2
+            } else if (p >= 125) {
+                logValue = 30;   // ~log2(0.125) = 3
+            } else if (p >= 62) {
+                logValue = 40;   // ~log2(0.0625) = 4
+            } else if (p >= 31) {
+                logValue = 50;   // ~log2(0.03125) = 5
+            } else {
+                logValue = 60;   // Higher entropy contribution
+            }
+
+            entropy += (p * logValue) / 100;
         }
     }
 
-    ExFreePoolWithTag(charCount, DNS_POOL_TAG);
-
-    // entropy is sum(count * g_Log2Table[scaled])
-    // Divide by Length (for probability) and by 256 (log table scale), multiply by 100
-    ULONG result = (ULONG)((entropy * 100) / ((ULONG64)Length * 256));
-
-    return result;
+    return entropy;
 }
 
 static VOID
@@ -2122,6 +2143,10 @@ DnspAnalyzeDomain(
     _Out_ PBOOLEAN ContainsHex,
     _Out_ PBOOLEAN IsBase64Like
     )
+/*++
+Routine Description:
+    Analyzes domain name characteristics for suspicious patterns.
+--*/
 {
     ULONG length;
     ULONG labelCount = 0;
@@ -2130,6 +2155,7 @@ DnspAnalyzeDomain(
     ULONG digitCount = 0;
     ULONG hexCount = 0;
     ULONG base64Count = 0;
+    ULONG letterCount = 0;
     ULONG i;
 
     *Entropy = 0;
@@ -2166,15 +2192,19 @@ DnspAnalyzeDomain(
             if (g_IsBase64Char[(UCHAR)c]) {
                 base64Count++;
             }
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+                letterCount++;
+            }
         }
     }
 
+    // Handle last label
     if (currentLabelLength > maxLabel) {
         maxLabel = currentLabelLength;
     }
     labelCount++;
 
-    // Entropy of first subdomain
+    // Calculate entropy of first subdomain (most likely to contain encoded data)
     PCSTR firstDot = strchr(DomainName, '.');
     if (firstDot != NULL) {
         ULONG firstLabelLen = (ULONG)(firstDot - DomainName);
@@ -2183,10 +2213,12 @@ DnspAnalyzeDomain(
         *Entropy = DnspCalculateEntropy(DomainName, length);
     }
 
+    // Subdomain count (exclude TLD and domain)
     *SubdomainCount = (labelCount > 2) ? labelCount - 2 : 0;
     *MaxLabelLength = maxLabel;
     *ContainsNumbers = (digitCount > 0);
 
+    // Hex-like if most chars are hex and length suggests encoding
     ULONG nonDotLength = length - labelCount + 1;
     if (nonDotLength > 0) {
         *ContainsHex = (hexCount * 100 / nonDotLength) > 80;
@@ -2199,7 +2231,19 @@ DnspIsDGADomain(
     _In_ PCSTR DomainName,
     _Out_ PULONG Confidence
     )
+/*++
+Routine Description:
+    Detects if domain appears to be DGA-generated.
+
+Arguments:
+    DomainName - Domain to analyze.
+    Confidence - Receives confidence score (0-100).
+
+Return Value:
+    TRUE if DGA-like.
+--*/
 {
+    ULONG length;
     ULONG consonantCount = 0;
     ULONG vowelCount = 0;
     ULONG digitCount = 0;
@@ -2218,6 +2262,7 @@ DnspIsDGADomain(
         return FALSE;
     }
 
+    // Analyze only the domain part (not TLD)
     firstDot = strchr(DomainName, '.');
     if (firstDot == NULL) {
         return FALSE;
@@ -2229,6 +2274,7 @@ DnspIsDGADomain(
         return FALSE;
     }
 
+    // Analyze character distribution
     for (p = DomainName; p < firstDot; p++) {
         CHAR c = *p;
         CHAR lower = (c >= 'A' && c <= 'Z') ? c + 32 : c;
@@ -2247,6 +2293,7 @@ DnspIsDGADomain(
             }
         }
 
+        // Calculate bigram score
         if (p > DomainName && lower >= 'a' && lower <= 'z') {
             CHAR prevLower = (*(p-1) >= 'A' && *(p-1) <= 'Z') ?
                             *(p-1) + 32 : *(p-1);
@@ -2257,6 +2304,9 @@ DnspIsDGADomain(
         }
     }
 
+    // Scoring
+
+    // High consonant ratio
     ULONG totalLetters = consonantCount + vowelCount;
     if (totalLetters > 0) {
         ULONG consonantRatio = (consonantCount * 100) / totalLetters;
@@ -2265,6 +2315,7 @@ DnspIsDGADomain(
         }
     }
 
+    // High digit ratio
     if (domainPartLength > 0) {
         ULONG digitRatio = (digitCount * 100) / domainPartLength;
         if (digitRatio > DGA_DIGIT_THRESHOLD) {
@@ -2272,10 +2323,12 @@ DnspIsDGADomain(
         }
     }
 
+    // Too many consecutive consonants
     if (maxConsecutiveConsonants > DGA_MAX_CONSECUTIVE_CONSONANTS) {
         score += 25;
     }
 
+    // Low bigram score (unusual character pairs)
     if (bigramCount > 0) {
         ULONG avgBigramScore = bigramScore / bigramCount;
         if (avgBigramScore < 20) {
@@ -2285,14 +2338,14 @@ DnspIsDGADomain(
         }
     }
 
+    // Length heuristics
     if (domainPartLength > 15 && domainPartLength < 25) {
-        score += 10;
+        score += 10;  // Common DGA length range
     }
 
     *Confidence = score > 100 ? 100 : score;
     return (score >= 50);
 }
-
 
 // ============================================================================
 // INTERNAL HELPERS - TUNNELING DETECTION
@@ -2304,6 +2357,10 @@ DnspExtractBaseDomain(
     _Out_writes_z_(MaxLength) PSTR BaseDomain,
     _In_ ULONG MaxLength
     )
+/*++
+Routine Description:
+    Extracts the base domain (domain + TLD) from a full domain name.
+--*/
 {
     ULONG length;
     PCSTR p;
@@ -2319,11 +2376,8 @@ DnspExtractBaseDomain(
     }
 
     length = (ULONG)strlen(FullDomain);
-    if (length == 0) {
-        BaseDomain[0] = '\0';
-        return;
-    }
 
+    // Find last two dots
     for (p = FullDomain + length - 1; p >= FullDomain; p--) {
         if (*p == '.') {
             dotCount++;
@@ -2337,6 +2391,7 @@ DnspExtractBaseDomain(
     }
 
     if (secondLastDot != NULL) {
+        // Return domain.tld
         PCSTR baseDomainStart = secondLastDot + 1;
         ULONG baseLength = (ULONG)(FullDomain + length - baseDomainStart);
 
@@ -2347,7 +2402,7 @@ DnspExtractBaseDomain(
             BaseDomain[0] = '\0';
         }
     } else {
-        // MaxLength is count of CHARs, sizeof() matches for CHAR arrays
+        // No subdomain, return as-is
         if (length < MaxLength) {
             RtlCopyMemory(BaseDomain, FullDomain, length + 1);
         } else {
@@ -2358,7 +2413,7 @@ DnspExtractBaseDomain(
 
 static PDNS_TUNNEL_CONTEXT
 DnspGetOrCreateTunnelContext(
-    _In_ PDNS_MONITOR Monitor,
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_ PCSTR BaseDomain
     )
 {
@@ -2370,6 +2425,7 @@ DnspGetOrCreateTunnelContext(
     hash = DnspHashString(BaseDomain);
     bucket = hash % Monitor->TunnelHash.BucketCount;
 
+    // Search existing
     ExAcquirePushLockShared(&Monitor->TunnelContextLock);
 
     for (entry = Monitor->TunnelHash.Buckets[bucket].Flink;
@@ -2393,11 +2449,7 @@ DnspGetOrCreateTunnelContext(
         return context;
     }
 
-    // Enforce limit (fix DESIGN-03)
-    if (Monitor->TunnelContextCount >= DNS_MAX_TUNNEL_CONTEXTS) {
-        return NULL;
-    }
-
+    // Create new
     context = (PDNS_TUNNEL_CONTEXT)ExAllocateFromNPagedLookasideList(
         &Monitor->TunnelContextLookaside);
 
@@ -2406,19 +2458,14 @@ DnspGetOrCreateTunnelContext(
     }
 
     RtlZeroMemory(context, sizeof(DNS_TUNNEL_CONTEXT));
-    // RtlStringCchCopyA: second param is count of chars, sizeof(CHAR[]) == char count
-    RtlStringCchCopyA(context->BaseDomain,
-                       ARRAYSIZE(context->BaseDomain),
-                       BaseDomain);
+    RtlStringCchCopyA(context->BaseDomain, sizeof(context->BaseDomain), BaseDomain);
     context->DomainHash = hash;
-    context->RefCount = 2;  // One for list, one for caller
+    context->RefCount = 1;
     KeQuerySystemTimePrecise(&context->FirstQuery);
-    InitializeListHead(&context->ListEntry);
-    InitializeListHead(&context->HashEntry);
 
     ExAcquirePushLockExclusive(&Monitor->TunnelContextLock);
 
-    // Double-check race
+    // Check again in case of race
     for (entry = Monitor->TunnelHash.Buckets[bucket].Flink;
          entry != &Monitor->TunnelHash.Buckets[bucket];
          entry = entry->Flink) {
@@ -2428,6 +2475,7 @@ DnspGetOrCreateTunnelContext(
 
         if (candidate->DomainHash == hash &&
             _stricmp(candidate->BaseDomain, BaseDomain) == 0) {
+            // Someone else added it
             ExReleasePushLockExclusive(&Monitor->TunnelContextLock);
             ExFreeToNPagedLookasideList(&Monitor->TunnelContextLookaside, context);
             InterlockedIncrement(&candidate->RefCount);
@@ -2435,6 +2483,7 @@ DnspGetOrCreateTunnelContext(
         }
     }
 
+    // Add to lists
     InsertTailList(&Monitor->TunnelContextList, &context->ListEntry);
     InsertTailList(&Monitor->TunnelHash.Buckets[bucket], &context->HashEntry);
     InterlockedIncrement(&Monitor->TunnelContextCount);
@@ -2442,18 +2491,6 @@ DnspGetOrCreateTunnelContext(
     ExReleasePushLockExclusive(&Monitor->TunnelContextLock);
 
     return context;
-}
-
-static VOID
-DnspDereferenceTunnelContext(
-    _In_ PDNS_MONITOR Monitor,
-    _In_ PDNS_TUNNEL_CONTEXT Context
-    )
-{
-    UNREFERENCED_PARAMETER(Monitor);
-
-    // Just release caller's reference. Cleanup timer handles removal.
-    InterlockedDecrement(&Context->RefCount);
 }
 
 static VOID
@@ -2466,8 +2503,6 @@ DnspUpdateTunnelMetrics(
 {
     ULONG subdomainLength;
     PCSTR baseDomainStart;
-    LONG currentMax;
-    LONG newVal;
 
     KeQuerySystemTimePrecise(&Context->LastQuery);
     InterlockedIncrement(&Context->TotalQueries);
@@ -2476,25 +2511,22 @@ DnspUpdateTunnelMetrics(
         InterlockedIncrement(&Context->TxtQueries);
     }
 
+    // Calculate subdomain length
     baseDomainStart = strstr(FullDomain, Context->BaseDomain);
     if (baseDomainStart != NULL && baseDomainStart > FullDomain) {
         subdomainLength = (ULONG)(baseDomainStart - FullDomain - 1);
 
-        InterlockedAdd64(&Context->TotalSubdomainLength, (LONG64)subdomainLength);
+        InterlockedAdd64(&Context->TotalSubdomainLength, subdomainLength);
 
-        // Atomic max update via InterlockedCompareExchange
-        newVal = (LONG)subdomainLength;
-        do {
-            currentMax = Context->MaxSubdomainLength;
-            if (newVal <= currentMax) break;
-        } while (InterlockedCompareExchange(&Context->MaxSubdomainLength,
-                                            newVal, currentMax) != currentMax);
+        if (subdomainLength > Context->MaxSubdomainLength) {
+            Context->MaxSubdomainLength = subdomainLength;
+        }
 
+        // Assume new unique subdomain (approximate)
         InterlockedIncrement(&Context->UniqueSubdomains);
     }
 
-    // Atomic 64-bit add for entropy sum
-    InterlockedAdd64(&Context->TotalEntropySum, (LONG64)Entropy);
+    Context->TotalEntropySum += Entropy;
 }
 
 static BOOLEAN
@@ -2506,35 +2538,38 @@ DnspCheckTunneling(
     ULONG score = 0;
     LARGE_INTEGER currentTime;
     LONGLONG elapsedMs;
-    LONG totalQueries;
+    ULONG queriesPerMinute;
+    ULONG avgSubdomainLength;
+    ULONG avgEntropy;
 
     *Score = 0;
 
-    totalQueries = Context->TotalQueries;
-    if (totalQueries < 10) {
+    if (Context->TotalQueries < 10) {
         return FALSE;
     }
 
     KeQuerySystemTimePrecise(&currentTime);
     elapsedMs = (currentTime.QuadPart - Context->FirstQuery.QuadPart) / 10000;
 
-    if (elapsedMs < 60000) {
+    if (elapsedMs < 60000) {  // Less than 1 minute
         return FALSE;
     }
 
-    // Safe division: use LONGLONG arithmetic, guard against zero/overflow
-    if (elapsedMs > 0) {
-        LONGLONG qpm = ((LONGLONG)totalQueries * 60000LL) / elapsedMs;
-        if (qpm > 50) {
-            score += 30;
-        } else if (qpm > 20) {
-            score += 15;
-        }
+    // Calculate metrics
+    queriesPerMinute = (Context->TotalQueries * 60000) / (ULONG)elapsedMs;
+    avgSubdomainLength = (ULONG)(Context->TotalSubdomainLength / Context->TotalQueries);
+    avgEntropy = (ULONG)(Context->TotalEntropySum / Context->TotalQueries);
+
+    // High query rate
+    if (queriesPerMinute > 50) {
+        score += 30;
+    } else if (queriesPerMinute > 20) {
+        score += 15;
     }
 
-    // TXT query ratio
-    if (totalQueries > 0) {
-        ULONG txtRatio = ((ULONG)Context->TxtQueries * 100) / (ULONG)totalQueries;
+    // High TXT query ratio
+    if (Context->TotalQueries > 0) {
+        ULONG txtRatio = (Context->TxtQueries * 100) / Context->TotalQueries;
         if (txtRatio > 50) {
             score += 25;
         } else if (txtRatio > 25) {
@@ -2542,26 +2577,21 @@ DnspCheckTunneling(
         }
     }
 
-    // Average subdomain length
-    if (totalQueries > 0) {
-        ULONG avgSubdomainLength = (ULONG)(Context->TotalSubdomainLength / totalQueries);
-        if (avgSubdomainLength > 40) {
-            score += 30;
-        } else if (avgSubdomainLength > 25) {
-            score += 15;
-        }
+    // Long average subdomain
+    if (avgSubdomainLength > 40) {
+        score += 30;
+    } else if (avgSubdomainLength > 25) {
+        score += 15;
     }
 
-    // Average entropy
-    if (totalQueries > 0) {
-        ULONG avgEntropy = (ULONG)(Context->TotalEntropySum / totalQueries);
-        if (avgEntropy > 420) {
-            score += 25;
-        } else if (avgEntropy > 380) {
-            score += 10;
-        }
+    // High entropy
+    if (avgEntropy > 420) {
+        score += 25;
+    } else if (avgEntropy > 380) {
+        score += 10;
     }
 
+    // Many unique subdomains
     if (Context->UniqueSubdomains > 100) {
         score += 20;
     } else if (Context->UniqueSubdomains > 50) {
@@ -2576,29 +2606,24 @@ DnspCheckTunneling(
     return Context->TunnelingDetected;
 }
 
-
 // ============================================================================
 // INTERNAL HELPERS - PROCESS CONTEXT
 // ============================================================================
 
 static PDNS_PROCESS_CONTEXT
-DnspFindProcessContext(
-    _In_ PDNS_MONITOR Monitor,
+DnspGetOrCreateProcessContext(
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_ HANDLE ProcessId
     )
-/*++
-Routine Description:
-    Lookup-only process context search. Does NOT create a new context.
-    Returns with RefCount incremented, caller must dereference.
---*/
 {
     PLIST_ENTRY entry;
     PDNS_PROCESS_CONTEXT context = NULL;
 
-    ExAcquirePushLockShared(&Monitor->ProcessListLock);
+    // Search existing
+    ExAcquirePushLockShared(&Monitor->Public.ProcessListLock);
 
-    for (entry = Monitor->ProcessList.Flink;
-         entry != &Monitor->ProcessList;
+    for (entry = Monitor->Public.ProcessList.Flink;
+         entry != &Monitor->Public.ProcessList;
          entry = entry->Flink) {
 
         PDNS_PROCESS_CONTEXT candidate = CONTAINING_RECORD(
@@ -2611,31 +2636,13 @@ Routine Description:
         }
     }
 
-    ExReleasePushLockShared(&Monitor->ProcessListLock);
+    ExReleasePushLockShared(&Monitor->Public.ProcessListLock);
 
-    return context;
-}
-
-static PDNS_PROCESS_CONTEXT
-DnspGetOrCreateProcessContext(
-    _In_ PDNS_MONITOR Monitor,
-    _In_ HANDLE ProcessId
-    )
-{
-    PLIST_ENTRY entry;
-    PDNS_PROCESS_CONTEXT context = NULL;
-
-    // Try lookup first
-    context = DnspFindProcessContext(Monitor, ProcessId);
     if (context != NULL) {
         return context;
     }
 
-    // Enforce limit (fix DESIGN-03)
-    if (Monitor->ProcessCount >= DNS_MAX_PROCESS_CONTEXTS) {
-        return NULL;
-    }
-
+    // Create new
     context = (PDNS_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
         &Monitor->ProcessContextLookaside);
 
@@ -2645,41 +2652,32 @@ DnspGetOrCreateProcessContext(
 
     RtlZeroMemory(context, sizeof(DNS_PROCESS_CONTEXT));
     context->ProcessId = ProcessId;
-    context->RefCount = 2;  // One for list, one for caller
+    context->RefCount = 1;
     InitializeListHead(&context->QueryList);
     KeInitializeSpinLock(&context->QueryLock);
-    KeQuerySystemTimePrecise(&context->CreationTime);
 
-    // Populate process name (best-effort)
-    DnspPopulateProcessName(
-        ProcessId,
-        context->ProcessNameBuffer,
-        ARRAYSIZE(context->ProcessNameBuffer),
-        &context->ProcessNameLength
-    );
+    ExAcquirePushLockExclusive(&Monitor->Public.ProcessListLock);
 
-    ExAcquirePushLockExclusive(&Monitor->ProcessListLock);
-
-    // Double-check race
-    for (entry = Monitor->ProcessList.Flink;
-         entry != &Monitor->ProcessList;
+    // Check again
+    for (entry = Monitor->Public.ProcessList.Flink;
+         entry != &Monitor->Public.ProcessList;
          entry = entry->Flink) {
 
         PDNS_PROCESS_CONTEXT candidate = CONTAINING_RECORD(
             entry, DNS_PROCESS_CONTEXT, ListEntry);
 
         if (candidate->ProcessId == ProcessId) {
-            ExReleasePushLockExclusive(&Monitor->ProcessListLock);
+            ExReleasePushLockExclusive(&Monitor->Public.ProcessListLock);
             ExFreeToNPagedLookasideList(&Monitor->ProcessContextLookaside, context);
             InterlockedIncrement(&candidate->RefCount);
             return candidate;
         }
     }
 
-    InsertTailList(&Monitor->ProcessList, &context->ListEntry);
-    InterlockedIncrement(&Monitor->ProcessCount);
+    InsertTailList(&Monitor->Public.ProcessList, &context->ListEntry);
+    InterlockedIncrement(&Monitor->Public.ProcessCount);
 
-    ExReleasePushLockExclusive(&Monitor->ProcessListLock);
+    ExReleasePushLockExclusive(&Monitor->Public.ProcessListLock);
 
     return context;
 }
@@ -2694,32 +2692,26 @@ DnspReferenceProcessContext(
 
 static VOID
 DnspDereferenceProcessContext(
-    _In_ PDNS_MONITOR Monitor,
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_ PDNS_PROCESS_CONTEXT Context
     )
 {
     UNREFERENCED_PARAMETER(Monitor);
 
-    // Caller's reference released. List reference + cleanup timer handle lifetime.
-    InterlockedDecrement(&Context->RefCount);
+    if (InterlockedDecrement(&Context->RefCount) == 0) {
+        // Context will be cleaned up by cleanup timer
+    }
 }
 
 // ============================================================================
 // INTERNAL HELPERS - DOMAIN CACHE
 // ============================================================================
 
-_Requires_lock_held_(Monitor->DomainCacheLock)
 static PDNS_DOMAIN_CACHE
-DnspLookupDomainCacheLocked(
-    _In_ PDNS_MONITOR Monitor,
+DnspLookupDomainCache(
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_ PCSTR DomainName
     )
-/*++
-Routine Description:
-    Looks up a domain in the hash table.
-    CALLER MUST HOLD DomainCacheLock (shared or exclusive).
-    Updates QueryCount and LastSeen atomically.
---*/
 {
     ULONG hash;
     ULONG bucket;
@@ -2727,10 +2719,10 @@ Routine Description:
     PDNS_DOMAIN_CACHE cacheEntry = NULL;
 
     hash = DnspHashString(DomainName);
-    bucket = hash % Monitor->DomainHash.BucketCount;
+    bucket = hash % Monitor->Public.DomainHash.BucketCount;
 
-    for (entry = Monitor->DomainHash.Buckets[bucket].Flink;
-         entry != &Monitor->DomainHash.Buckets[bucket];
+    for (entry = Monitor->Public.DomainHash.Buckets[bucket].Flink;
+         entry != &Monitor->Public.DomainHash.Buckets[bucket];
          entry = entry->Flink) {
 
         PDNS_DOMAIN_CACHE candidate = CONTAINING_RECORD(
@@ -2750,7 +2742,7 @@ Routine Description:
 
 static NTSTATUS
 DnspAddToDomainCache(
-    _In_ PDNS_MONITOR Monitor,
+    _In_ PDNS_MONITOR_INTERNAL Monitor,
     _In_ PCSTR DomainName,
     _In_ PDNS_QUERY Query
     )
@@ -2759,43 +2751,36 @@ DnspAddToDomainCache(
     ULONG bucket;
     PDNS_DOMAIN_CACHE cacheEntry;
     LARGE_INTEGER currentTime;
-    PLIST_ENTRY entry;
 
-    // Acquire exclusive lock for the entire check-and-insert (fix CRITICAL-05)
-    ExAcquirePushLockExclusive(&Monitor->DomainCacheLock);
-
-    // Check if already exists under lock
-    if (DnspLookupDomainCacheLocked(Monitor, DomainName) != NULL) {
-        ExReleasePushLockExclusive(&Monitor->DomainCacheLock);
+    // Check if already exists
+    cacheEntry = DnspLookupDomainCache(Monitor, DomainName);
+    if (cacheEntry != NULL) {
         return STATUS_SUCCESS;
     }
 
     // Check cache limit
-    if (Monitor->CacheEntryCount >= DNS_MAX_CACHED_QUERIES) {
-        ExReleasePushLockExclusive(&Monitor->DomainCacheLock);
+    if (Monitor->Public.CacheEntryCount >= DNS_MAX_CACHED_QUERIES) {
         return STATUS_QUOTA_EXCEEDED;
     }
 
+    // Allocate new entry
     cacheEntry = (PDNS_DOMAIN_CACHE)ExAllocateFromNPagedLookasideList(
         &Monitor->DomainCacheLookaside);
 
     if (cacheEntry == NULL) {
-        ExReleasePushLockExclusive(&Monitor->DomainCacheLock);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlZeroMemory(cacheEntry, sizeof(DNS_DOMAIN_CACHE));
 
     hash = DnspHashString(DomainName);
-    bucket = hash % Monitor->DomainHash.BucketCount;
+    bucket = hash % Monitor->Public.DomainHash.BucketCount;
 
-    RtlStringCchCopyA(cacheEntry->DomainName,
-                       ARRAYSIZE(cacheEntry->DomainName),
-                       DomainName);
+    RtlStringCchCopyA(cacheEntry->DomainName, sizeof(cacheEntry->DomainName), DomainName);
     cacheEntry->DomainHash = hash;
     cacheEntry->QueryCount = 1;
     cacheEntry->UniqueProcesses = 1;
-    cacheEntry->Reputation = DnsReputation_Unknown;
+    cacheEntry->Reputation = Reputation_Unknown;
 
     KeQuerySystemTimePrecise(&currentTime);
     cacheEntry->FirstSeen = currentTime;
@@ -2803,68 +2788,35 @@ DnspAddToDomainCache(
     cacheEntry->ExpirationTime.QuadPart = currentTime.QuadPart +
                                            ((LONGLONG)DNS_CACHE_TTL_SECONDS * 10000000);
 
-    // Copy resolution data with proper per-address type tracking
+    // Copy resolution data if available
     if (Query->Response.Received && Query->Response.AddressCount > 0) {
-        ULONG copyCount = min(Query->Response.AddressCount, DNS_MAX_CACHED_ADDRESSES);
-        for (ULONG i = 0; i < copyCount; i++) {
-            cacheEntry->KnownAddresses[i] = Query->Response.Addresses[i];
+        ULONG copyCount = min(Query->Response.AddressCount, 8);
+        if (Query->IsIPv6) {
+            RtlCopyMemory(cacheEntry->KnownAddresses.IPv6,
+                          Query->Response.Addresses.IPv6,
+                          copyCount * sizeof(IN6_ADDR));
+        } else {
+            RtlCopyMemory(cacheEntry->KnownAddresses.IPv4,
+                          Query->Response.Addresses.IPv4,
+                          copyCount * sizeof(IN_ADDR));
         }
         cacheEntry->AddressCount = copyCount;
     }
 
-    InitializeListHead(&cacheEntry->ListEntry);
-    InitializeListHead(&cacheEntry->HashEntry);
+    // Add to lists
+    ExAcquirePushLockExclusive(&Monitor->Public.DomainCacheLock);
 
-    InsertTailList(&Monitor->DomainCache, &cacheEntry->ListEntry);
-    InsertTailList(&Monitor->DomainHash.Buckets[bucket], &cacheEntry->HashEntry);
-    InterlockedIncrement(&Monitor->CacheEntryCount);
+    InsertTailList(&Monitor->Public.DomainCache, &cacheEntry->ListEntry);
+    InsertTailList(&Monitor->Public.DomainHash.Buckets[bucket], &cacheEntry->HashEntry);
+    InterlockedIncrement(&Monitor->Public.CacheEntryCount);
 
-    ExReleasePushLockExclusive(&Monitor->DomainCacheLock);
+    ExReleasePushLockExclusive(&Monitor->Public.DomainCacheLock);
 
     return STATUS_SUCCESS;
 }
 
-
 // ============================================================================
-// INTERNAL HELPERS - QUERY FREE
-// ============================================================================
-
-static VOID
-DnspFreeQuery(
-    _In_ PDNS_MONITOR Monitor,
-    _In_ PDNS_QUERY Query
-    )
-/*++
-Routine Description:
-    Frees a query. Caller must have already removed Query from
-    QueryList and HashEntry lists. This function removes from
-    ProcessListEntry if still linked.
---*/
-{
-    // Remove from process query list if still linked
-    if (Query->ProcessListEntry.Flink != NULL &&
-        Query->ProcessListEntry.Blink != NULL &&
-        !IsListEmpty(&Query->ProcessListEntry)) {
-        // Need process context lock — find process context
-        PDNS_PROCESS_CONTEXT processCtx = DnspFindProcessContext(Monitor, Query->ProcessId);
-        if (processCtx != NULL) {
-            KIRQL oldIrql;
-            KeAcquireSpinLock(&processCtx->QueryLock, &oldIrql);
-            RemoveEntryList(&Query->ProcessListEntry);
-            InterlockedDecrement(&processCtx->QueryCount);
-            KeReleaseSpinLock(&processCtx->QueryLock, oldIrql);
-            DnspDereferenceProcessContext(Monitor, processCtx);
-        } else {
-            // Process context already gone — just unlink safely
-            RemoveEntryList(&Query->ProcessListEntry);
-        }
-    }
-
-    ExFreeToNPagedLookasideList(&Monitor->QueryLookaside, Query);
-}
-
-// ============================================================================
-// INTERNAL HELPERS - CLEANUP (RUNS AT PASSIVE_LEVEL VIA WORK ITEM)
+// INTERNAL HELPERS - CLEANUP
 // ============================================================================
 
 static VOID NTAPI
@@ -2874,122 +2826,66 @@ DnspCleanupTimerDpc(
     _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2
     )
-/*++
-Routine Description:
-    DPC callback for cleanup timer. Runs at DISPATCH_LEVEL.
-    We CANNOT acquire push locks here. Queue a work item instead.
---*/
 {
-    PDNS_MONITOR monitor = (PDNS_MONITOR)DeferredContext;
+    PDNS_MONITOR_INTERNAL monitor = (PDNS_MONITOR_INTERNAL)DeferredContext;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (monitor == NULL || !monitor->Initialized) {
-        return;
-    }
-
-    if (monitor->CleanupWorkItem == NULL) {
-        return;
-    }
-
-    // Only queue if no cleanup already in progress
-    if (InterlockedCompareExchange(&monitor->CleanupInProgress, 1, 0) == 0) {
-        IoQueueWorkItem(
-            monitor->CleanupWorkItem,
-            DnspCleanupWorkItemRoutine,
-            DelayedWorkQueue,
-            monitor
-        );
-    }
-}
-
-static VOID
-DnspCleanupWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
-    )
-/*++
-Routine Description:
-    Work item callback. Runs at PASSIVE_LEVEL — safe to acquire push locks.
---*/
-{
-    PDNS_MONITOR monitor = (PDNS_MONITOR)Context;
-
-    UNREFERENCED_PARAMETER(DeviceObject);
-
-    if (monitor == NULL) {
-        return;
-    }
-
-    if (!monitor->Initialized) {
-        InterlockedExchange(&monitor->CleanupInProgress, 0);
+    if (monitor == NULL || !monitor->Public.Initialized) {
         return;
     }
 
     DnspCleanupExpiredEntries(monitor);
-
-    InterlockedExchange(&monitor->CleanupInProgress, 0);
 }
 
 static VOID
 DnspCleanupExpiredEntries(
-    _In_ PDNS_MONITOR Monitor
+    _In_ PDNS_MONITOR_INTERNAL Monitor
     )
-/*++
-Routine Description:
-    Removes expired queries, domain cache entries, idle process contexts,
-    and idle tunnel contexts. Runs at PASSIVE_LEVEL.
---*/
 {
     LARGE_INTEGER currentTime;
     PLIST_ENTRY entry;
     PLIST_ENTRY nextEntry;
     LIST_ENTRY expiredQueries;
     LIST_ENTRY expiredDomains;
-    LIST_ENTRY expiredProcesses;
-    LIST_ENTRY expiredTunnels;
 
     InitializeListHead(&expiredQueries);
     InitializeListHead(&expiredDomains);
-    InitializeListHead(&expiredProcesses);
-    InitializeListHead(&expiredTunnels);
 
     KeQuerySystemTimePrecise(&currentTime);
 
     //
-    // Collect expired queries — remove from BOTH QueryList and TransactionHash
+    // Collect expired queries
     //
-    ExAcquirePushLockExclusive(&Monitor->QueryListLock);
-    ExAcquirePushLockExclusive(&Monitor->TransactionHash.Lock);
+    ExAcquirePushLockExclusive(&Monitor->Public.QueryListLock);
 
-    for (entry = Monitor->QueryList.Flink;
-         entry != &Monitor->QueryList;
+    for (entry = Monitor->Public.QueryList.Flink;
+         entry != &Monitor->Public.QueryList;
          entry = nextEntry) {
 
         nextEntry = entry->Flink;
         PDNS_QUERY query = CONTAINING_RECORD(entry, DNS_QUERY, ListEntry);
 
+        // Expire queries older than 5 minutes
         LONGLONG ageMs = (currentTime.QuadPart - query->QueryTime.QuadPart) / 10000;
         if (ageMs > DNS_QUERY_EXPIRATION_MS) {
             RemoveEntryList(&query->ListEntry);
-            RemoveEntryList(&query->HashEntry);
             InsertTailList(&expiredQueries, &query->ListEntry);
-            InterlockedDecrement(&Monitor->QueryCount);
+            InterlockedDecrement(&Monitor->Public.QueryCount);
         }
     }
 
-    ExReleasePushLockExclusive(&Monitor->TransactionHash.Lock);
-    ExReleasePushLockExclusive(&Monitor->QueryListLock);
+    ExReleasePushLockExclusive(&Monitor->Public.QueryListLock);
 
     //
     // Collect expired domain cache entries
     //
-    ExAcquirePushLockExclusive(&Monitor->DomainCacheLock);
+    ExAcquirePushLockExclusive(&Monitor->Public.DomainCacheLock);
 
-    for (entry = Monitor->DomainCache.Flink;
-         entry != &Monitor->DomainCache;
+    for (entry = Monitor->Public.DomainCache.Flink;
+         entry != &Monitor->Public.DomainCache;
          entry = nextEntry) {
 
         nextEntry = entry->Flink;
@@ -3000,63 +2896,11 @@ Routine Description:
             RemoveEntryList(&domainEntry->ListEntry);
             RemoveEntryList(&domainEntry->HashEntry);
             InsertTailList(&expiredDomains, &domainEntry->ListEntry);
-            InterlockedDecrement(&Monitor->CacheEntryCount);
+            InterlockedDecrement(&Monitor->Public.CacheEntryCount);
         }
     }
 
-    ExReleasePushLockExclusive(&Monitor->DomainCacheLock);
-
-    //
-    // Collect idle process contexts (RefCount == 1 means only list reference)
-    //
-    ExAcquirePushLockExclusive(&Monitor->ProcessListLock);
-
-    for (entry = Monitor->ProcessList.Flink;
-         entry != &Monitor->ProcessList;
-         entry = nextEntry) {
-
-        nextEntry = entry->Flink;
-        PDNS_PROCESS_CONTEXT processCtx = CONTAINING_RECORD(
-            entry, DNS_PROCESS_CONTEXT, ListEntry);
-
-        // Only remove if refcount is exactly 1 (list reference only) and idle
-        if (processCtx->RefCount == 1) {
-            LONGLONG idleMs = (currentTime.QuadPart - processCtx->CreationTime.QuadPart) / 10000;
-            if (idleMs > DNS_PROCESS_IDLE_EXPIRATION_MS && processCtx->TotalQueries == 0) {
-                RemoveEntryList(&processCtx->ListEntry);
-                InsertTailList(&expiredProcesses, &processCtx->ListEntry);
-                InterlockedDecrement(&Monitor->ProcessCount);
-            }
-        }
-    }
-
-    ExReleasePushLockExclusive(&Monitor->ProcessListLock);
-
-    //
-    // Collect idle tunnel contexts
-    //
-    ExAcquirePushLockExclusive(&Monitor->TunnelContextLock);
-
-    for (entry = Monitor->TunnelContextList.Flink;
-         entry != &Monitor->TunnelContextList;
-         entry = nextEntry) {
-
-        nextEntry = entry->Flink;
-        PDNS_TUNNEL_CONTEXT tunnelCtx = CONTAINING_RECORD(
-            entry, DNS_TUNNEL_CONTEXT, ListEntry);
-
-        if (tunnelCtx->RefCount == 1) {
-            LONGLONG idleMs = (currentTime.QuadPart - tunnelCtx->LastQuery.QuadPart) / 10000;
-            if (idleMs > DNS_TUNNEL_IDLE_EXPIRATION_MS) {
-                RemoveEntryList(&tunnelCtx->ListEntry);
-                RemoveEntryList(&tunnelCtx->HashEntry);
-                InsertTailList(&expiredTunnels, &tunnelCtx->ListEntry);
-                InterlockedDecrement(&Monitor->TunnelContextCount);
-            }
-        }
-    }
-
-    ExReleasePushLockExclusive(&Monitor->TunnelContextLock);
+    ExReleasePushLockExclusive(&Monitor->Public.DomainCacheLock);
 
     //
     // Free expired entries outside of locks
@@ -3064,28 +2908,19 @@ Routine Description:
     while (!IsListEmpty(&expiredQueries)) {
         entry = RemoveHeadList(&expiredQueries);
         PDNS_QUERY query = CONTAINING_RECORD(entry, DNS_QUERY, ListEntry);
-        // DnspFreeQuery handles ProcessListEntry removal
-        DnspFreeQuery(Monitor, query);
+
+        if (query->ProcessName.Buffer != NULL) {
+            ExFreePoolWithTag(query->ProcessName.Buffer, DNS_POOL_TAG_QUERY);
+        }
+
+        ExFreeToNPagedLookasideList(&Monitor->QueryLookaside, query);
     }
 
     while (!IsListEmpty(&expiredDomains)) {
         entry = RemoveHeadList(&expiredDomains);
         PDNS_DOMAIN_CACHE domainEntry = CONTAINING_RECORD(
             entry, DNS_DOMAIN_CACHE, ListEntry);
+
         ExFreeToNPagedLookasideList(&Monitor->DomainCacheLookaside, domainEntry);
-    }
-
-    while (!IsListEmpty(&expiredProcesses)) {
-        entry = RemoveHeadList(&expiredProcesses);
-        PDNS_PROCESS_CONTEXT processCtx = CONTAINING_RECORD(
-            entry, DNS_PROCESS_CONTEXT, ListEntry);
-        ExFreeToNPagedLookasideList(&Monitor->ProcessContextLookaside, processCtx);
-    }
-
-    while (!IsListEmpty(&expiredTunnels)) {
-        entry = RemoveHeadList(&expiredTunnels);
-        PDNS_TUNNEL_CONTEXT tunnelCtx = CONTAINING_RECORD(
-            entry, DNS_TUNNEL_CONTEXT, ListEntry);
-        ExFreeToNPagedLookasideList(&Monitor->TunnelContextLookaside, tunnelCtx);
     }
 }

@@ -1,16 +1,27 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: ConnectionTracker.h
-    
+
     Purpose: Network connection state tracking for monitoring
              all inbound and outbound network activity.
-             
+
     Architecture:
     - Per-process connection tracking
-    - Connection lifetime management
+    - Connection lifetime management with deterministic refcounting
     - Flow correlation with processes
     - Bandwidth and data transfer monitoring
-    
+
+    Lock Ordering Hierarchy (acquire in this order, never invert):
+      1. ConnectionListLock          (global connection list)
+      2. ConnectionHash.Lock         (5-tuple hash)
+      3. FlowHash.Lock               (flow ID hash)
+      4. ProcessListLock             (global process list)
+      5. ProcessHash.Lock            (process hash - internal)
+      6. CT_PROCESS_CONTEXT.ConnectionLock (per-process spin lock)
+      7. CallbackLock                (internal callback array)
+
+    Callbacks MUST NOT call back into the tracker.
+
     Copyright (c) ShadowStrike Team
 --*/
 
@@ -32,6 +43,8 @@ extern "C" {
 #define CT_POOL_TAG_CONN        'NCTC'  // Connection Tracker - Connection
 #define CT_POOL_TAG_FLOW        'FCTC'  // Connection Tracker - Flow
 #define CT_POOL_TAG_PROC        'PCTC'  // Connection Tracker - Process
+#define CT_POOL_TAG_WORK        'WCTC'  // Connection Tracker - Work Item
+#define CT_POOL_TAG_SNAP        'SCTC'  // Connection Tracker - Snapshot
 
 //=============================================================================
 // Configuration Constants
@@ -88,6 +101,7 @@ typedef enum _CT_CONNECTION_FLAGS {
     CtFlag_Service          = 0x00000200,   // Windows service
     CtFlag_HighFrequency    = 0x00000400,   // High packet rate
     CtFlag_LargeTransfer    = 0x00000800,   // Large data transfer
+    CtFlag_RemovedFromLists = 0x00001000,   // Unlinked from all tracking
 } CT_CONNECTION_FLAGS;
 
 //=============================================================================
@@ -96,17 +110,17 @@ typedef enum _CT_CONNECTION_FLAGS {
 
 typedef struct _CT_FLOW_STATS {
     //
-    // Packet counts
+    // Packet counts (lock-free via Interlocked)
     //
     volatile LONG64 PacketsSent;
     volatile LONG64 PacketsReceived;
-    
+
     //
-    // Byte counts
+    // Byte counts (lock-free via Interlocked)
     //
     volatile LONG64 BytesSent;
     volatile LONG64 BytesReceived;
-    
+
     //
     // Rate tracking
     //
@@ -114,14 +128,14 @@ typedef struct _CT_FLOW_STATS {
     ULONG CurrentRecvRate;              // Bytes/sec
     ULONG PeakSendRate;
     ULONG PeakRecvRate;
-    
+
     //
-    // Timing
+    // Timing — use InterlockedExchange64 for LastPacketTime
     //
     LARGE_INTEGER FirstPacketTime;
-    LARGE_INTEGER LastPacketTime;
-    ULONG IdleTimeMs;
-    
+    volatile LONG64 LastPacketTime;      // 100ns ticks, atomic
+    volatile LONG IdleTimeMs;
+
 } CT_FLOW_STATS, *PCT_FLOW_STATS;
 
 //=============================================================================
@@ -135,15 +149,15 @@ typedef struct _CT_CONNECTION {
     ULONG64 ConnectionId;
     UINT64 FlowId;                      // WFP flow ID
     UINT16 LayerId;                     // WFP layer
-    
+
     //
-    // Connection details
+    // Connection details — State and Flags are volatile for atomic access
     //
-    CT_CONNECTION_STATE State;
+    volatile LONG State;                // CT_CONNECTION_STATE via InterlockedExchange
     CT_DIRECTION Direction;
-    CT_CONNECTION_FLAGS Flags;
+    volatile LONG Flags;                // CT_CONNECTION_FLAGS via InterlockedOr/And
     UCHAR Protocol;                     // IPPROTO_*
-    
+
     //
     // Local endpoint
     //
@@ -153,7 +167,7 @@ typedef struct _CT_CONNECTION {
     } LocalAddress;
     USHORT LocalPort;
     BOOLEAN IsIPv6;
-    
+
     //
     // Remote endpoint
     //
@@ -163,58 +177,72 @@ typedef struct _CT_CONNECTION {
     } RemoteAddress;
     USHORT RemotePort;
     CHAR RemoteHostname[256];           // If resolved
-    
+
     //
-    // Process context
+    // Process context — ProcessId is immutable after creation.
+    // ProcessContextRef is a referenced pointer; holds a refcount
+    // on the CT_PROCESS_CONTEXT it points to. Only accessed/cleared
+    // under the global connection list lock or during final free.
     //
     HANDLE ProcessId;
     UNICODE_STRING ProcessName;
     UNICODE_STRING ProcessPath;
-    ULONG64 ProcessToken;
-    
+    struct _CT_PROCESS_CONTEXT* ProcessContextRef;
+
     //
     // Flow statistics
     //
     CT_FLOW_STATS Stats;
-    
+
     //
-    // TLS information
+    // TLS information (allocated on demand — NULL if no TLS)
     //
-    struct {
-        BOOLEAN IsTLS;
-        USHORT TLSVersion;
-        CHAR CipherSuite[64];
-        CHAR ServerName[256];           // SNI
-        UCHAR JA3Hash[16];              // MD5 of JA3
-        UCHAR JA3SHash[16];             // MD5 of JA3S
-    } TLS;
-    
+    struct _CT_TLS_INFO* TlsInfo;
+
     //
     // Timing
     //
     LARGE_INTEGER CreateTime;
     LARGE_INTEGER ConnectTime;
     LARGE_INTEGER CloseTime;
-    
+
     //
     // Suspicion tracking
     //
     ULONG SuspicionScore;
     ULONG SuspicionFlags;
-    
+
     //
-    // Reference counting
+    // Reference counting — free on drop to zero
     //
     volatile LONG RefCount;
-    
+
     //
-    // List linkage
+    // Back-pointer to owning tracker (for release-triggered free)
+    //
+    struct _CT_TRACKER* OwnerTracker;
+
+    //
+    // List linkage — each entry is for exactly one list
     //
     LIST_ENTRY GlobalListEntry;
     LIST_ENTRY ProcessListEntry;
     LIST_ENTRY HashListEntry;
-    
+
 } CT_CONNECTION, *PCT_CONNECTION;
+
+//=============================================================================
+// TLS Information (heap-allocated on demand)
+//=============================================================================
+
+typedef struct _CT_TLS_INFO {
+    BOOLEAN IsTLS;
+    USHORT TLSVersion;
+    CHAR CipherSuite[64];
+    CHAR ServerName[256];               // SNI
+    UCHAR JA3Hash[16];                  // MD5 of JA3
+    UCHAR JA3SHash[16];                 // MD5 of JA3S
+} CT_TLS_INFO, *PCT_TLS_INFO;
 
 //=============================================================================
 // Process Network Context
@@ -225,51 +253,52 @@ typedef struct _CT_PROCESS_CONTEXT {
     // Process identification
     //
     HANDLE ProcessId;
-    PEPROCESS Process;
+    PEPROCESS Process;                  // Referenced via ObReferenceObject
     UNICODE_STRING ProcessName;
-    
+
     //
-    // Connections
+    // Connections (protected by ConnectionLock spin lock)
     //
     LIST_ENTRY ConnectionList;
     KSPIN_LOCK ConnectionLock;
     volatile LONG ConnectionCount;
     volatile LONG ActiveConnectionCount;
-    
+
     //
-    // Aggregate statistics
+    // Aggregate statistics (lock-free via Interlocked)
     //
     volatile LONG64 TotalBytesSent;
     volatile LONG64 TotalBytesReceived;
     volatile LONG64 TotalConnections;
-    
+
     //
     // Per-port tracking
     //
     ULONG UniqueRemotePorts;
     ULONG UniqueLocalPorts;
-    
+
     //
     // Behavior tracking
     //
     ULONG ConnectionsPerMinute;
     ULONG PortScoreIndicator;
     BOOLEAN HighNetworkActivity;
-    
+
     //
     // Reference counting
     //
     volatile LONG RefCount;
-    
+
     //
-    // List linkage
+    // List linkage — separate entries for hash and global list
     //
-    LIST_ENTRY ListEntry;
-    
+    LIST_ENTRY HashListEntry;           // ProcessHash bucket
+    LIST_ENTRY GlobalListEntry;         // Public.ProcessList
+
 } CT_PROCESS_CONTEXT, *PCT_PROCESS_CONTEXT;
 
 //=============================================================================
-// Connection Tracker
+// Connection Tracker (public portion)
 //=============================================================================
 
 typedef struct _CT_TRACKER {
@@ -277,14 +306,14 @@ typedef struct _CT_TRACKER {
     // Initialization state
     //
     BOOLEAN Initialized;
-    
+
     //
     // Connection list
     //
     LIST_ENTRY ConnectionList;
     EX_PUSH_LOCK ConnectionListLock;
     volatile LONG ConnectionCount;
-    
+
     //
     // Connection hash table (by 5-tuple)
     //
@@ -293,7 +322,7 @@ typedef struct _CT_TRACKER {
         ULONG BucketCount;
         EX_PUSH_LOCK Lock;
     } ConnectionHash;
-    
+
     //
     // Flow ID lookup
     //
@@ -302,26 +331,26 @@ typedef struct _CT_TRACKER {
         ULONG BucketCount;
         EX_PUSH_LOCK Lock;
     } FlowHash;
-    
+
     //
     // Process contexts
     //
     LIST_ENTRY ProcessList;
     EX_PUSH_LOCK ProcessListLock;
     volatile LONG ProcessCount;
-    
+
     //
     // ID generation
     //
     volatile LONG64 NextConnectionId;
-    
+
     //
     // Cleanup timer
     //
     KTIMER CleanupTimer;
     KDPC CleanupDpc;
     ULONG CleanupIntervalMs;
-    
+
     //
     // Statistics
     //
@@ -333,7 +362,7 @@ typedef struct _CT_TRACKER {
         volatile LONG64 TotalBytesReceived;
         LARGE_INTEGER StartTime;
     } Stats;
-    
+
     //
     // Configuration
     //
@@ -343,13 +372,14 @@ typedef struct _CT_TRACKER {
         BOOLEAN TrackAllProcesses;
         BOOLEAN EnableTLSInspection;
     } Config;
-    
+
 } CT_TRACKER, *PCT_TRACKER;
 
 //=============================================================================
 // Callback Types
 //=============================================================================
 
+// WARNING: Callbacks MUST NOT call back into any Ct* API — deadlock will result.
 typedef VOID (*CT_CONNECTION_CALLBACK)(
     _In_ PCT_CONNECTION Connection,
     _In_ CT_CONNECTION_STATE OldState,
@@ -466,6 +496,7 @@ CtGetProcessNetworkStats(
 // Public API - Enumeration
 //=============================================================================
 
+// WARNING: Callback MUST NOT call back into any Ct* API.
 typedef BOOLEAN (*CT_ENUM_CALLBACK)(
     _In_ PCT_CONNECTION Connection,
     _In_opt_ PVOID Context

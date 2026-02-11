@@ -6,35 +6,32 @@
  * @file DataExfiltration.c
  * @brief Enterprise-grade DLP and data exfiltration detection for WFP integration.
  *
- * This module provides comprehensive data loss prevention:
- * - Shannon entropy calculation for encrypted/encoded data detection
- * - Pattern matching engine for sensitive data (PII, credentials, source code)
- * - Transfer volume tracking with burst detection
- * - Cloud storage and personal email detection
- * - Base64/encoded data detection
- * - Compressed and encrypted archive detection
- * - DNS and ICMP tunneling indicators
- * - Per-process exfiltration tracking
- * - Real-time alerting with callback notifications
+ * Architecture decisions:
+ * - ALL public APIs run at IRQL PASSIVE_LEVEL. WFP callouts at DISPATCH_LEVEL
+ *   must queue work items to call into this module.
+ * - Synchronization uses EX_PUSH_LOCK exclusively (no spin locks). Every
+ *   acquisition is bracketed by KeEnterCriticalRegion/KeLeaveCriticalRegion.
+ * - Transfer contexts are reference-counted. The DPC cleanup timer only
+ *   drops a reference; the actual free happens when refcount reaches zero.
+ * - Transfer lookup uses a hash table (DX_TRANSFER_HASH_BUCKETS buckets)
+ *   for O(1) amortized lookup under lock.
+ * - Rundown protection (EX_RUNDOWN_REF) prevents shutdown while in-flight
+ *   operations are active.
+ * - Pattern match results are stored as value copies (category + sensitivity),
+ *   not raw pointers, to avoid dangling references when patterns are removed.
+ * - DX_DETECTOR is opaque; internal structure is DX_DETECTOR_INTERNAL.
+ * - Alert objects are allocated from the general pool (not lookaside) so
+ *   DxFreeAlert can free without needing the detector handle. Transfer and
+ *   pattern objects use lookaside lists with proper free-to-lookaside calls.
  *
- * Detection Capabilities:
- * - Credit card numbers (Luhn algorithm validation)
- * - Social Security Numbers (format validation)
- * - API keys and secrets (entropy + pattern)
- * - Source code patterns (language detection)
- * - Database dumps (SQL patterns)
- * - Private keys (PEM/DER formats)
- * - High-entropy data (encryption/compression)
- *
- * MITRE ATT&CK Coverage:
- * - T1041: Exfiltration Over C2 Channel
- * - T1048: Exfiltration Over Alternative Protocol
- * - T1567: Exfiltration Over Web Service
- * - T1537: Transfer Data to Cloud Account
- * - T1030: Data Transfer Size Limits
+ * MITRE ATT&CK Coverage (implemented):
+ * - T1041: Exfiltration Over C2 Channel (volume + entropy + pattern)
+ * - T1567: Exfiltration Over Web Service (cloud storage detection)
+ * - T1537: Transfer Data to Cloud Account (cloud storage detection)
+ * - T1030: Data Transfer Size Limits (burst + volume threshold)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -49,14 +46,16 @@
 #pragma alloc_text(PAGE, DxShutdown)
 #pragma alloc_text(PAGE, DxAddPattern)
 #pragma alloc_text(PAGE, DxRemovePattern)
-#pragma alloc_text(PAGE, DxLoadPatterns)
 #pragma alloc_text(PAGE, DxAnalyzeTraffic)
+#pragma alloc_text(PAGE, DxRecordTransfer)
 #pragma alloc_text(PAGE, DxInspectContent)
+#pragma alloc_text(PAGE, DxCalculateEntropy)
 #pragma alloc_text(PAGE, DxGetAlerts)
 #pragma alloc_text(PAGE, DxGetStatistics)
 #pragma alloc_text(PAGE, DxRegisterAlertCallback)
 #pragma alloc_text(PAGE, DxRegisterBlockCallback)
 #pragma alloc_text(PAGE, DxUnregisterCallbacks)
+#pragma alloc_text(PAGE, DxFreeAlert)
 #endif
 
 // ============================================================================
@@ -68,9 +67,51 @@
 #define DX_TRANSFER_TIMEOUT_MS              300000      // 5 minutes
 #define DX_CLEANUP_INTERVAL_MS              60000       // 1 minute
 #define DX_LOOKASIDE_DEPTH                  256
-#define DX_HIGH_ENTROPY_THRESHOLD           7           // Out of 8 (bits per byte)
-#define DX_BURST_THRESHOLD_BYTES            (10 * 1024 * 1024)  // 10 MB
-#define DX_BURST_WINDOW_MS                  10000       // 10 seconds
+#define DX_BURST_THRESHOLD_BYTES            (10 * 1024 * 1024)
+#define DX_BURST_WINDOW_MS                  10000
+#define DX_TRANSFER_HASH_BUCKETS            128
+#define DX_MAX_SUSPICION_SCORE              100
+#define DX_POOL_TAG_HASH                    'HXXD'
+
+//
+// Fixed-point log2 lookup table (8.8 format, 256 entries).
+// log2_table[i] = round(-log2(i/256) * 256) for i in 1..255.
+// Entry 0 is unused (probability = 0 contributes 0 to entropy).
+//
+static const USHORT g_Log2Table[256] = {
+       0, 2048, 1792, 1649, 1536, 1446, 1370, 1305,
+    1248, 1197, 1152, 1110, 1073, 1038, 1006,  977,
+     949,  923,  899,  876,  855,  835,  815,  797,
+     780,  763,  747,  732,  718,  704,  690,  677,
+     665,  653,  641,  630,  619,  609,  599,  589,
+     580,  570,  561,  553,  544,  536,  528,  520,
+     512,  505,  497,  490,  483,  476,  470,  463,
+     457,  451,  444,  438,  433,  427,  421,  416,
+     410,  405,  400,  394,  389,  384,  379,  374,
+     370,  365,  360,  356,  351,  347,  342,  338,
+     334,  329,  325,  321,  317,  313,  309,  305,
+     301,  297,  294,  290,  286,  283,  279,  275,
+     272,  268,  265,  261,  258,  255,  251,  248,
+     245,  241,  238,  235,  232,  229,  225,  222,
+     219,  216,  213,  210,  207,  204,  201,  199,
+     196,  193,  190,  187,  185,  182,  179,  176,
+     174,  171,  168,  166,  163,  161,  158,  155,
+     153,  150,  148,  145,  143,  141,  138,  136,
+     133,  131,  128,  126,  124,  121,  119,  117,
+     114,  112,  110,  108,  105,  103,  101,   99,
+      97,   94,   92,   90,   88,   86,   84,   82,
+      79,   77,   75,   73,   71,   69,   67,   65,
+      63,   61,   59,   57,   55,   53,   51,   49,
+      47,   45,   43,   41,   39,   37,   36,   34,
+      32,   30,   28,   26,   24,   23,   21,   19,
+      17,   15,   14,   12,   10,    8,    7,    5,
+       3,    1,    0,    0,    0,    0,    0,    0,
+       0,    0,    0,    0,    0,    0,    0,    0,
+       0,    0,    0,    0,    0,    0,    0,    0,
+       0,    0,    0,    0,    0,    0,    0,    0,
+       0,    0,    0,    0,    0,    0,    0,    0,
+       0,    0,    0,    0,    0,    0,    0,    0,
+};
 
 //
 // Well-known cloud storage domains
@@ -85,10 +126,7 @@ static const CHAR* g_CloudStorageDomains[] = {
     "mediafire.com",
     "wetransfer.com",
     "sendspace.com",
-    "rapidshare.com",
     "4shared.com",
-    "zippyshare.com",
-    "anonfiles.com",
     "file.io",
     "transfer.sh",
     NULL
@@ -112,12 +150,6 @@ static const CHAR* g_PersonalEmailDomains[] = {
     "zoho.com",
     NULL
 };
-
-//
-// Base64 alphabet for detection
-//
-static const UCHAR g_Base64Alphabet[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
 
 //
 // Common archive signatures
@@ -144,27 +176,77 @@ static const ARCHIVE_SIGNATURE g_ArchiveSignatures[] = {
 // PRIVATE STRUCTURES
 // ============================================================================
 
-/**
- * @brief Extended detector state (internal).
- */
-typedef struct _DX_DETECTOR_INTERNAL {
-    //
-    // Public structure (must be first)
-    //
-    DX_DETECTOR Public;
+//
+// Hash table bucket for transfer contexts.
+//
+typedef struct _DX_HASH_BUCKET {
+    LIST_ENTRY Head;
+    EX_PUSH_LOCK Lock;
+} DX_HASH_BUCKET, *PDX_HASH_BUCKET;
+
+//
+// Full internal detector state. Opaque to consumers.
+//
+struct _DX_DETECTOR {
 
     //
-    // Pattern ID generator
+    // Initialization state
     //
+    volatile LONG Initialized;
+
+    //
+    // Rundown protection — prevents shutdown while operations are in flight
+    //
+    EX_RUNDOWN_REF RundownRef;
+
+    //
+    // Pattern database
+    //
+    LIST_ENTRY PatternList;
+    EX_PUSH_LOCK PatternLock;
+    volatile LONG PatternCount;
     volatile LONG NextPatternId;
 
     //
-    // Transfer ID generator
+    // Transfer hash table
     //
+    PDX_HASH_BUCKET TransferBuckets;
+    volatile LONG TransferCount;
     volatile LONG64 NextTransferId;
 
     //
-    // Callbacks
+    // Alerts — protected by push lock, not spin lock
+    //
+    LIST_ENTRY AlertList;
+    EX_PUSH_LOCK AlertLock;
+    volatile LONG AlertCount;
+    volatile LONG64 NextAlertId;
+
+    //
+    // Statistics
+    //
+    struct {
+        volatile LONG64 BytesInspected;
+        volatile LONG64 TransfersAnalyzed;
+        volatile LONG64 AlertsGenerated;
+        volatile LONG64 TransfersBlocked;
+        volatile LONG64 PatternMatches;
+        LARGE_INTEGER StartTime;
+    } Stats;
+
+    //
+    // Configuration
+    //
+    struct {
+        SIZE_T VolumeThresholdPerMinute;
+        ULONG EntropyThreshold;
+        BOOLEAN EnableContentInspection;
+        BOOLEAN EnableCloudDetection;
+        BOOLEAN BlockOnDetection;
+    } Config;
+
+    //
+    // Callbacks — protected by push lock
     //
     struct {
         DX_ALERT_CALLBACK AlertCallback;
@@ -175,11 +257,10 @@ typedef struct _DX_DETECTOR_INTERNAL {
     } Callbacks;
 
     //
-    // Lookaside lists
+    // Lookaside lists (pattern + transfer only; alerts use pool)
     //
     NPAGED_LOOKASIDE_LIST PatternLookaside;
     NPAGED_LOOKASIDE_LIST TransferLookaside;
-    NPAGED_LOOKASIDE_LIST AlertLookaside;
     BOOLEAN LookasideInitialized;
 
     //
@@ -187,59 +268,15 @@ typedef struct _DX_DETECTOR_INTERNAL {
     //
     KTIMER CleanupTimer;
     KDPC CleanupDpc;
-    volatile BOOLEAN CleanupTimerActive;
+    WORK_QUEUE_ITEM CleanupWorkItem;
+    volatile LONG CleanupWorkQueued;
     volatile BOOLEAN ShuttingDown;
 
     //
-    // Pre-computed lookup tables
+    // Pre-computed Base64 lookup table
     //
     UCHAR Base64LookupTable[256];
-    BOOLEAN LookupTablesInitialized;
-
-} DX_DETECTOR_INTERNAL, *PDX_DETECTOR_INTERNAL;
-
-/**
- * @brief Per-process transfer tracking.
- */
-typedef struct _DX_PROCESS_TRANSFER_CONTEXT {
-    LIST_ENTRY ListEntry;
-
-    HANDLE ProcessId;
-    UNICODE_STRING ProcessName;
-
-    //
-    // Transfer statistics
-    //
-    volatile LONG64 TotalBytesOut;
-    volatile LONG64 BytesOutLastMinute;
-    volatile LONG64 TransferCount;
-
-    //
-    // Timing
-    //
-    LARGE_INTEGER FirstTransferTime;
-    LARGE_INTEGER LastTransferTime;
-    LARGE_INTEGER LastMinuteReset;
-
-    //
-    // Burst detection
-    //
-    SIZE_T BurstBytes;
-    LARGE_INTEGER BurstStartTime;
-
-    //
-    // Suspicion tracking
-    //
-    ULONG SuspicionScore;
-    ULONG HighEntropyTransfers;
-    ULONG PatternMatchCount;
-
-    //
-    // Reference counting
-    //
-    volatile LONG RefCount;
-
-} DX_PROCESS_TRANSFER_CONTEXT, *PDX_PROCESS_TRANSFER_CONTEXT;
+};
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -282,37 +319,52 @@ DxpIsPersonalEmailDomain(
     _In_ PCSTR Hostname
     );
 
+static ULONG
+DxpHashTransferKey(
+    _In_ HANDLE ProcessId,
+    _In_reads_bytes_(AddrSize) PVOID RemoteAddress,
+    _In_ ULONG AddrSize,
+    _In_ USHORT RemotePort
+    );
+
 static PDX_TRANSFER_CONTEXT
 DxpGetOrCreateTransfer(
-    _In_ PDX_DETECTOR_INTERNAL Detector,
+    _In_ PDX_DETECTOR Detector,
     _In_ HANDLE ProcessId,
-    _In_ PVOID RemoteAddress,
+    _In_reads_bytes_(AddrSize) PVOID RemoteAddress,
+    _In_ ULONG AddrSize,
     _In_ USHORT RemotePort,
     _In_ BOOLEAN IsIPv6
     );
 
 static VOID
-DxpReleaseTransfer(
-    _In_ PDX_DETECTOR_INTERNAL Detector,
+DxpReferenceTransfer(
+    _In_ PDX_TRANSFER_CONTEXT Transfer
+    );
+
+static VOID
+DxpDereferenceTransfer(
+    _In_ PDX_DETECTOR Detector,
     _In_ PDX_TRANSFER_CONTEXT Transfer
     );
 
 static NTSTATUS
 DxpCreateAlert(
-    _In_ PDX_DETECTOR_INTERNAL Detector,
+    _In_ PDX_DETECTOR Detector,
     _In_ PDX_TRANSFER_CONTEXT Transfer,
-    _In_ DX_EXFIL_TYPE Type
+    _In_ DX_EXFIL_TYPE Type,
+    _In_ BOOLEAN WasBlocked
     );
 
 static VOID
 DxpNotifyAlertCallback(
-    _In_ PDX_DETECTOR_INTERNAL Detector,
+    _In_ PDX_DETECTOR Detector,
     _In_ PDX_ALERT Alert
     );
 
 static BOOLEAN
 DxpShouldBlock(
-    _In_ PDX_DETECTOR_INTERNAL Detector,
+    _In_ PDX_DETECTOR Detector,
     _In_ PDX_TRANSFER_CONTEXT Transfer
     );
 
@@ -326,19 +378,75 @@ DxpCleanupTimerDpc(
     );
 
 static VOID
-DxpInitializeLookupTables(
-    _In_ PDX_DETECTOR_INTERNAL Detector
+DxpCleanupWorkRoutine(
+    _In_ PVOID Parameter
     );
 
-static ULONG
-DxpCalculateSuspicionScore(
-    _In_ PDX_TRANSFER_CONTEXT Transfer
+static VOID
+DxpInitializeLookupTables(
+    _In_ PDX_DETECTOR Detector
     );
 
 static DX_EXFIL_TYPE
 DxpClassifyExfiltration(
     _In_ PDX_TRANSFER_CONTEXT Transfer
     );
+
+static BOOLEAN
+DxpCaseInsensitiveCompareA(
+    _In_ PCSTR String1,
+    _In_ PCSTR String2
+    );
+
+static NTSTATUS
+DxpValidateRemoteAddress(
+    _In_ BOOLEAN IsIPv6,
+    _In_ ULONG RemoteAddressSize
+    );
+
+// ============================================================================
+// INLINE HELPERS — Push Lock with Critical Region
+// ============================================================================
+
+_IRQL_requires_max_(APC_LEVEL)
+static __forceinline VOID
+DxpAcquirePushLockShared(
+    _Inout_ PEX_PUSH_LOCK Lock
+    )
+{
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(Lock);
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+static __forceinline VOID
+DxpReleasePushLockShared(
+    _Inout_ PEX_PUSH_LOCK Lock
+    )
+{
+    ExReleasePushLockShared(Lock);
+    KeLeaveCriticalRegion();
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+static __forceinline VOID
+DxpAcquirePushLockExclusive(
+    _Inout_ PEX_PUSH_LOCK Lock
+    )
+{
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(Lock);
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+static __forceinline VOID
+DxpReleasePushLockExclusive(
+    _Inout_ PEX_PUSH_LOCK Lock
+    )
+{
+    ExReleasePushLockExclusive(Lock);
+    KeLeaveCriticalRegion();
+}
 
 // ============================================================================
 // INITIALIZATION AND SHUTDOWN
@@ -349,16 +457,11 @@ NTSTATUS
 DxInitialize(
     _Out_ PDX_DETECTOR* Detector
     )
-/**
- * @brief Initialize the data exfiltration detection subsystem.
- *
- * Allocates and initializes all data structures required for
- * DLP including pattern database, transfer tracking, and alerts.
- */
 {
     NTSTATUS status = STATUS_SUCCESS;
-    PDX_DETECTOR_INTERNAL detector = NULL;
+    PDX_DETECTOR detector = NULL;
     LARGE_INTEGER dueTime;
+    ULONG i;
 
     PAGED_CODE();
 
@@ -371,9 +474,9 @@ DxInitialize(
     //
     // Allocate detector structure
     //
-    detector = (PDX_DETECTOR_INTERNAL)ExAllocatePoolZero(
+    detector = (PDX_DETECTOR)ExAllocatePoolZero(
         NonPagedPoolNx,
-        sizeof(DX_DETECTOR_INTERNAL),
+        sizeof(DX_DETECTOR),
         DX_POOL_TAG_CONTEXT
     );
 
@@ -382,22 +485,40 @@ DxInitialize(
     }
 
     //
-    // Initialize pattern list
+    // Initialize rundown protection
     //
-    InitializeListHead(&detector->Public.PatternList);
-    ExInitializePushLock(&detector->Public.PatternLock);
+    ExInitializeRundownProtection(&detector->RundownRef);
 
     //
-    // Initialize transfer list
+    // Initialize pattern list
     //
-    InitializeListHead(&detector->Public.TransferList);
-    KeInitializeSpinLock(&detector->Public.TransferLock);
+    InitializeListHead(&detector->PatternList);
+    ExInitializePushLock(&detector->PatternLock);
+
+    //
+    // Initialize transfer hash table
+    //
+    detector->TransferBuckets = (PDX_HASH_BUCKET)ExAllocatePoolZero(
+        NonPagedPoolNx,
+        sizeof(DX_HASH_BUCKET) * DX_TRANSFER_HASH_BUCKETS,
+        DX_POOL_TAG_HASH
+    );
+
+    if (detector->TransferBuckets == NULL) {
+        ExFreePoolWithTag(detector, DX_POOL_TAG_CONTEXT);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    for (i = 0; i < DX_TRANSFER_HASH_BUCKETS; i++) {
+        InitializeListHead(&detector->TransferBuckets[i].Head);
+        ExInitializePushLock(&detector->TransferBuckets[i].Lock);
+    }
 
     //
     // Initialize alert list
     //
-    InitializeListHead(&detector->Public.AlertList);
-    KeInitializeSpinLock(&detector->Public.AlertLock);
+    InitializeListHead(&detector->AlertList);
+    ExInitializePushLock(&detector->AlertLock);
 
     //
     // Initialize callbacks
@@ -405,7 +526,7 @@ DxInitialize(
     ExInitializePushLock(&detector->Callbacks.Lock);
 
     //
-    // Initialize lookaside lists
+    // Initialize lookaside lists (pattern + transfer only)
     //
     ExInitializeNPagedLookasideList(
         &detector->PatternLookaside,
@@ -427,16 +548,6 @@ DxInitialize(
         DX_LOOKASIDE_DEPTH
     );
 
-    ExInitializeNPagedLookasideList(
-        &detector->AlertLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(DX_ALERT),
-        DX_POOL_TAG_ALERT,
-        64
-    );
-
     detector->LookasideInitialized = TRUE;
 
     //
@@ -447,26 +558,23 @@ DxInitialize(
     //
     // Set default configuration
     //
-    detector->Public.Config.VolumeThresholdPerMinute = DX_VOLUME_THRESHOLD_MB * 1024 * 1024;
-    detector->Public.Config.EntropyThreshold = DX_ENTROPY_THRESHOLD;
-    detector->Public.Config.EnableContentInspection = TRUE;
-    detector->Public.Config.EnableCloudDetection = TRUE;
-    detector->Public.Config.BlockOnDetection = FALSE;  // Alert-only by default
+    detector->Config.VolumeThresholdPerMinute = (SIZE_T)DX_VOLUME_THRESHOLD_MB * 1024 * 1024;
+    detector->Config.EntropyThreshold = DX_ENTROPY_THRESHOLD;
+    detector->Config.EnableContentInspection = TRUE;
+    detector->Config.EnableCloudDetection = TRUE;
+    detector->Config.BlockOnDetection = FALSE;
 
     //
     // Initialize statistics
     //
-    KeQuerySystemTime(&detector->Public.Stats.StartTime);
+    KeQuerySystemTime(&detector->Stats.StartTime);
 
     //
-    // Initialize cleanup timer
+    // Initialize cleanup timer — DPC queues a work item at PASSIVE_LEVEL
     //
     KeInitializeTimer(&detector->CleanupTimer);
     KeInitializeDpc(&detector->CleanupDpc, DxpCleanupTimerDpc, detector);
 
-    //
-    // Start cleanup timer
-    //
     dueTime.QuadPart = -((LONGLONG)DX_CLEANUP_INTERVAL_MS * 10000);
     KeSetTimerEx(
         &detector->CleanupTimer,
@@ -474,10 +582,9 @@ DxInitialize(
         DX_CLEANUP_INTERVAL_MS,
         &detector->CleanupDpc
     );
-    detector->CleanupTimerActive = TRUE;
 
-    detector->Public.Initialized = TRUE;
-    *Detector = &detector->Public;
+    InterlockedExchange(&detector->Initialized, TRUE);
+    *Detector = detector;
 
     return STATUS_SUCCESS;
 }
@@ -487,19 +594,12 @@ VOID
 DxShutdown(
     _Inout_ PDX_DETECTOR Detector
     )
-/**
- * @brief Shutdown and cleanup the data exfiltration detector.
- *
- * Cancels cleanup timer, frees all patterns, transfers, alerts,
- * and releases all allocated memory.
- */
 {
-    PDX_DETECTOR_INTERNAL detector;
     PLIST_ENTRY entry;
     PDX_PATTERN pattern;
     PDX_TRANSFER_CONTEXT transfer;
     PDX_ALERT alert;
-    KIRQL oldIrql;
+    ULONG i;
 
     PAGED_CODE();
 
@@ -507,26 +607,27 @@ DxShutdown(
         return;
     }
 
-    detector = CONTAINING_RECORD(Detector, DX_DETECTOR_INTERNAL, Public);
-    detector->ShuttingDown = TRUE;
+    //
+    // Mark as shutting down and prevent new operations
+    //
+    InterlockedExchange((volatile LONG*)&Detector->ShuttingDown, TRUE);
+    InterlockedExchange(&Detector->Initialized, FALSE);
 
     //
-    // Cancel cleanup timer
+    // Wait for all in-flight operations to complete
     //
-    if (detector->CleanupTimerActive) {
-        KeCancelTimer(&detector->CleanupTimer);
-        detector->CleanupTimerActive = FALSE;
-    }
+    ExWaitForRundownProtectionRelease(&Detector->RundownRef);
 
     //
-    // Wait for any pending DPCs
+    // Cancel cleanup timer and wait for any pending DPCs/work items
     //
+    KeCancelTimer(&Detector->CleanupTimer);
     KeFlushQueuedDpcs();
 
     //
     // Free all patterns
     //
-    ExAcquirePushLockExclusive(&Detector->PatternLock);
+    DxpAcquirePushLockExclusive(&Detector->PatternLock);
 
     while (!IsListEmpty(&Detector->PatternList)) {
         entry = RemoveHeadList(&Detector->PatternList);
@@ -536,74 +637,62 @@ DxShutdown(
             ExFreePoolWithTag(pattern->Pattern, DX_POOL_TAG_PATTERN);
         }
 
-        if (detector->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&detector->PatternLookaside, pattern);
-        } else {
-            ExFreePoolWithTag(pattern, DX_POOL_TAG_PATTERN);
-        }
+        ExFreeToNPagedLookasideList(&Detector->PatternLookaside, pattern);
     }
 
-    ExReleasePushLockExclusive(&Detector->PatternLock);
+    DxpReleasePushLockExclusive(&Detector->PatternLock);
 
     //
-    // Free all transfers
+    // Free all transfers from hash table
     //
-    KeAcquireSpinLock(&Detector->TransferLock, &oldIrql);
+    for (i = 0; i < DX_TRANSFER_HASH_BUCKETS; i++) {
+        DxpAcquirePushLockExclusive(&Detector->TransferBuckets[i].Lock);
 
-    while (!IsListEmpty(&Detector->TransferList)) {
-        entry = RemoveHeadList(&Detector->TransferList);
-        transfer = CONTAINING_RECORD(entry, DX_TRANSFER_CONTEXT, ListEntry);
-
-        if (detector->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&detector->TransferLookaside, transfer);
-        } else {
-            ExFreePoolWithTag(transfer, DX_POOL_TAG_CONTEXT);
+        while (!IsListEmpty(&Detector->TransferBuckets[i].Head)) {
+            entry = RemoveHeadList(&Detector->TransferBuckets[i].Head);
+            transfer = CONTAINING_RECORD(entry, DX_TRANSFER_CONTEXT, HashEntry);
+            InterlockedDecrement(&Detector->TransferCount);
+            ExFreeToNPagedLookasideList(&Detector->TransferLookaside, transfer);
         }
-    }
 
-    KeReleaseSpinLock(&Detector->TransferLock, oldIrql);
+        DxpReleasePushLockExclusive(&Detector->TransferBuckets[i].Lock);
+    }
 
     //
     // Free all alerts
     //
-    KeAcquireSpinLock(&Detector->AlertLock, &oldIrql);
+    DxpAcquirePushLockExclusive(&Detector->AlertLock);
 
     while (!IsListEmpty(&Detector->AlertList)) {
         entry = RemoveHeadList(&Detector->AlertList);
         alert = CONTAINING_RECORD(entry, DX_ALERT, ListEntry);
-
-        if (alert->ProcessName.Buffer != NULL) {
-            ExFreePoolWithTag(alert->ProcessName.Buffer, DX_POOL_TAG_ALERT);
-        }
-        if (alert->UserName.Buffer != NULL) {
-            ExFreePoolWithTag(alert->UserName.Buffer, DX_POOL_TAG_ALERT);
-        }
-
-        if (detector->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&detector->AlertLookaside, alert);
-        } else {
-            ExFreePoolWithTag(alert, DX_POOL_TAG_ALERT);
-        }
+        InterlockedDecrement(&Detector->AlertCount);
+        ExFreePoolWithTag(alert, DX_POOL_TAG_ALERT);
     }
 
-    KeReleaseSpinLock(&Detector->AlertLock, oldIrql);
+    DxpReleasePushLockExclusive(&Detector->AlertLock);
 
     //
     // Delete lookaside lists
     //
-    if (detector->LookasideInitialized) {
-        ExDeleteNPagedLookasideList(&detector->PatternLookaside);
-        ExDeleteNPagedLookasideList(&detector->TransferLookaside);
-        ExDeleteNPagedLookasideList(&detector->AlertLookaside);
-        detector->LookasideInitialized = FALSE;
+    if (Detector->LookasideInitialized) {
+        ExDeleteNPagedLookasideList(&Detector->PatternLookaside);
+        ExDeleteNPagedLookasideList(&Detector->TransferLookaside);
+        Detector->LookasideInitialized = FALSE;
     }
 
-    Detector->Initialized = FALSE;
+    //
+    // Free hash table
+    //
+    if (Detector->TransferBuckets != NULL) {
+        ExFreePoolWithTag(Detector->TransferBuckets, DX_POOL_TAG_HASH);
+        Detector->TransferBuckets = NULL;
+    }
 
     //
     // Free detector structure
     //
-    ExFreePoolWithTag(detector, DX_POOL_TAG_CONTEXT);
+    ExFreePoolWithTag(Detector, DX_POOL_TAG_CONTEXT);
 }
 
 // ============================================================================
@@ -621,14 +710,7 @@ DxAddPattern(
     _In_opt_ PCSTR Category,
     _Out_ PULONG PatternId
     )
-/**
- * @brief Add a sensitive data pattern to the detection engine.
- *
- * Patterns are used to detect sensitive data in outbound traffic
- * such as credit card numbers, SSNs, API keys, etc.
- */
 {
-    PDX_DETECTOR_INTERNAL detector;
     PDX_PATTERN newPattern = NULL;
     SIZE_T nameLen;
     SIZE_T categoryLen;
@@ -645,12 +727,18 @@ DxAddPattern(
         return STATUS_INVALID_PARAMETER;
     }
 
-    detector = CONTAINING_RECORD(Detector, DX_DETECTOR_INTERNAL, Public);
+    //
+    // Acquire rundown protection
+    //
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
 
     //
     // Check pattern limit
     //
     if ((ULONG)Detector->PatternCount >= DX_MAX_PATTERNS) {
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_QUOTA_EXCEEDED;
     }
 
@@ -658,10 +746,11 @@ DxAddPattern(
     // Allocate pattern from lookaside
     //
     newPattern = (PDX_PATTERN)ExAllocateFromNPagedLookasideList(
-        &detector->PatternLookaside
+        &Detector->PatternLookaside
     );
 
     if (newPattern == NULL) {
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -670,10 +759,10 @@ DxAddPattern(
     //
     // Assign pattern ID
     //
-    newPattern->PatternId = (ULONG)InterlockedIncrement(&detector->NextPatternId);
+    newPattern->PatternId = (ULONG)InterlockedIncrement(&Detector->NextPatternId);
 
     //
-    // Copy pattern name
+    // Copy pattern name (safe truncation)
     //
     nameLen = strlen(PatternName);
     if (nameLen >= sizeof(newPattern->PatternName)) {
@@ -692,17 +781,16 @@ DxAddPattern(
     );
 
     if (newPattern->Pattern == NULL) {
-        ExFreeToNPagedLookasideList(&detector->PatternLookaside, newPattern);
+        ExFreeToNPagedLookasideList(&Detector->PatternLookaside, newPattern);
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlCopyMemory(newPattern->Pattern, Pattern, PatternSize);
     newPattern->PatternSize = PatternSize;
-
-    //
-    // Set sensitivity
-    //
     newPattern->Sensitivity = Sensitivity;
+    newPattern->Type = PatternType_Keyword;
+    newPattern->RefCount = 1;
 
     //
     // Copy category
@@ -719,20 +807,16 @@ DxAddPattern(
     }
 
     //
-    // Default to keyword matching
-    //
-    newPattern->Type = PatternType_Keyword;
-
-    //
     // Insert into pattern list
     //
-    ExAcquirePushLockExclusive(&Detector->PatternLock);
+    DxpAcquirePushLockExclusive(&Detector->PatternLock);
     InsertTailList(&Detector->PatternList, &newPattern->ListEntry);
     InterlockedIncrement(&Detector->PatternCount);
-    ExReleasePushLockExclusive(&Detector->PatternLock);
+    DxpReleasePushLockExclusive(&Detector->PatternLock);
 
     *PatternId = newPattern->PatternId;
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -742,11 +826,7 @@ DxRemovePattern(
     _In_ PDX_DETECTOR Detector,
     _In_ ULONG PatternId
     )
-/**
- * @brief Remove a pattern from the detection engine.
- */
 {
-    PDX_DETECTOR_INTERNAL detector;
     PLIST_ENTRY entry;
     PDX_PATTERN pattern;
     PDX_PATTERN foundPattern = NULL;
@@ -757,9 +837,11 @@ DxRemovePattern(
         return STATUS_INVALID_PARAMETER;
     }
 
-    detector = CONTAINING_RECORD(Detector, DX_DETECTOR_INTERNAL, Public);
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
 
-    ExAcquirePushLockExclusive(&Detector->PatternLock);
+    DxpAcquirePushLockExclusive(&Detector->PatternLock);
 
     for (entry = Detector->PatternList.Flink;
          entry != &Detector->PatternList;
@@ -775,53 +857,24 @@ DxRemovePattern(
         }
     }
 
-    ExReleasePushLockExclusive(&Detector->PatternLock);
+    DxpReleasePushLockExclusive(&Detector->PatternLock);
 
     if (foundPattern == NULL) {
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_NOT_FOUND;
     }
 
     //
-    // Free pattern
+    // Free pattern data and pattern object
     //
     if (foundPattern->Pattern != NULL) {
         ExFreePoolWithTag(foundPattern->Pattern, DX_POOL_TAG_PATTERN);
     }
 
-    ExFreeToNPagedLookasideList(&detector->PatternLookaside, foundPattern);
+    ExFreeToNPagedLookasideList(&Detector->PatternLookaside, foundPattern);
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
-}
-
-_Use_decl_annotations_
-NTSTATUS
-DxLoadPatterns(
-    _In_ PDX_DETECTOR Detector,
-    _In_ PUNICODE_STRING FilePath
-    )
-/**
- * @brief Load patterns from a file.
- *
- * File format: Each line contains:
- * PatternName|Sensitivity|Category|PatternHex
- */
-{
-    PAGED_CODE();
-
-    if (Detector == NULL || !Detector->Initialized || FilePath == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // Pattern loading from file would be implemented here
-    // For kernel mode, this typically reads from a registry key
-    // or receives patterns from user-mode via IOCTL
-    //
-    // This is a placeholder - actual implementation depends on
-    // how patterns are delivered to the driver
-    //
-
-    return STATUS_NOT_IMPLEMENTED;
 }
 
 // ============================================================================
@@ -833,36 +886,27 @@ NTSTATUS
 DxAnalyzeTraffic(
     _In_ PDX_DETECTOR Detector,
     _In_ HANDLE ProcessId,
-    _In_ PVOID RemoteAddress,
+    _In_reads_bytes_(RemoteAddressSize) PVOID RemoteAddress,
+    _In_ ULONG RemoteAddressSize,
     _In_ USHORT RemotePort,
     _In_ BOOLEAN IsIPv6,
     _In_reads_bytes_(DataSize) PVOID Data,
     _In_ SIZE_T DataSize,
     _Out_ PBOOLEAN IsSuspicious,
+    _Out_opt_ PBOOLEAN WasBlocked,
     _Out_opt_ PULONG SuspicionScore
     )
-/**
- * @brief Analyze outbound traffic for potential data exfiltration.
- *
- * Performs comprehensive analysis including:
- * - Entropy calculation
- * - Pattern matching
- * - Encoding detection (Base64, etc.)
- * - Compression detection
- * - Volume tracking
- * - Destination classification
- */
 {
-    PDX_DETECTOR_INTERNAL detector;
     PDX_TRANSFER_CONTEXT transfer = NULL;
     DX_INDICATORS indicators = DxIndicator_None;
+    NTSTATUS status;
     ULONG entropy = 0;
     ULONG score = 0;
-    BOOLEAN isCompressed = FALSE;
     BOOLEAN isEncrypted = FALSE;
+    BOOLEAN blocked = FALSE;
     PLIST_ENTRY entry;
     PDX_PATTERN pattern;
-    ULONG matchOffset;
+    SIZE_T inspectSize;
 
     PAGED_CODE();
 
@@ -872,12 +916,36 @@ DxAnalyzeTraffic(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Validate remote address size matches IP version
+    //
+    status = DxpValidateRemoteAddress(IsIPv6, RemoteAddressSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
     *IsSuspicious = FALSE;
+    if (WasBlocked != NULL) {
+        *WasBlocked = FALSE;
+    }
     if (SuspicionScore != NULL) {
         *SuspicionScore = 0;
     }
 
-    detector = CONTAINING_RECORD(Detector, DX_DETECTOR_INTERNAL, Public);
+    //
+    // Acquire rundown protection
+    //
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+
+    //
+    // Cap the inspection size to prevent DoS via large buffers
+    //
+    inspectSize = DataSize;
+    if (inspectSize > DX_MAX_INSPECT_SIZE) {
+        inspectSize = DX_MAX_INSPECT_SIZE;
+    }
 
     //
     // Update statistics
@@ -886,23 +954,26 @@ DxAnalyzeTraffic(
     InterlockedIncrement64(&Detector->Stats.TransfersAnalyzed);
 
     //
-    // Get or create transfer context
+    // Get or create transfer context (returns with ref held)
     //
-    transfer = DxpGetOrCreateTransfer(detector, ProcessId, RemoteAddress, RemotePort, IsIPv6);
+    transfer = DxpGetOrCreateTransfer(
+        Detector, ProcessId, RemoteAddress, RemoteAddressSize, RemotePort, IsIPv6
+    );
     if (transfer == NULL) {
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Update transfer statistics
+    // Update transfer statistics (atomic increment for SIZE_T)
     //
-    transfer->BytesTransferred += DataSize;
+    InterlockedAdd64(&transfer->BytesTransferred, (LONG64)DataSize);
     KeQuerySystemTime(&transfer->LastActivityTime);
 
     //
     // Calculate entropy
     //
-    entropy = DxpCalculateShannonEntropy((PUCHAR)Data, DataSize);
+    entropy = DxpCalculateShannonEntropy((PUCHAR)Data, inspectSize);
     transfer->Entropy = entropy;
 
     if (entropy >= Detector->Config.EntropyThreshold) {
@@ -913,7 +984,7 @@ DxAnalyzeTraffic(
     //
     // Check for compressed/encrypted data
     //
-    if (DxpIsCompressedData((PUCHAR)Data, DataSize, &isEncrypted)) {
+    if (DxpIsCompressedData((PUCHAR)Data, inspectSize, &isEncrypted)) {
         transfer->IsCompressed = TRUE;
         indicators |= DxIndicator_CompressedData;
         score += 10;
@@ -928,7 +999,7 @@ DxAnalyzeTraffic(
     //
     // Check for Base64 encoding
     //
-    if (DxpIsBase64Encoded((PUCHAR)Data, DataSize)) {
+    if (DxpIsBase64Encoded((PUCHAR)Data, inspectSize)) {
         transfer->IsEncoded = TRUE;
         indicators |= DxIndicator_EncodedData;
         score += 15;
@@ -952,16 +1023,20 @@ DxAnalyzeTraffic(
     //
     // Check transfer volume
     //
-    if (transfer->BytesTransferred > Detector->Config.VolumeThresholdPerMinute) {
+    if ((SIZE_T)transfer->BytesTransferred > Detector->Config.VolumeThresholdPerMinute) {
         indicators |= DxIndicator_HighVolume;
         score += 30;
     }
 
     //
     // Pattern matching (if content inspection enabled)
+    // Match results are stored as value copies (category + sensitivity),
+    // not as raw pointers to pattern objects.
     //
     if (Detector->Config.EnableContentInspection) {
-        ExAcquirePushLockShared(&Detector->PatternLock);
+        ULONG matchOffset;
+
+        DxpAcquirePushLockShared(&Detector->PatternLock);
 
         for (entry = Detector->PatternList.Flink;
              entry != &Detector->PatternList;
@@ -969,21 +1044,25 @@ DxAnalyzeTraffic(
 
             pattern = CONTAINING_RECORD(entry, DX_PATTERN, ListEntry);
 
-            if (DxpMatchPattern(pattern, (PUCHAR)Data, DataSize, &matchOffset)) {
-                //
-                // Pattern match found
-                //
+            if (DxpMatchPattern(pattern, (PUCHAR)Data, inspectSize, &matchOffset)) {
                 InterlockedIncrement(&pattern->MatchCount);
                 InterlockedIncrement64(&Detector->Stats.PatternMatches);
 
                 indicators |= DxIndicator_SensitivePattern;
 
                 //
-                // Add to transfer's match list
+                // Snapshot match info as values (not pointers)
                 //
-                if (transfer->MatchCount < 16) {
-                    transfer->Matches[transfer->MatchCount].Pattern = pattern;
-                    transfer->Matches[transfer->MatchCount].MatchCount = 1;
+                if (transfer->MatchCount < ARRAYSIZE(transfer->Matches)) {
+                    ULONG idx = transfer->MatchCount;
+                    RtlCopyMemory(
+                        transfer->Matches[idx].Category,
+                        pattern->Category,
+                        sizeof(transfer->Matches[idx].Category) - 1
+                    );
+                    transfer->Matches[idx].Category[sizeof(transfer->Matches[idx].Category) - 1] = '\0';
+                    transfer->Matches[idx].Sensitivity = pattern->Sensitivity;
+                    transfer->Matches[idx].MatchCount = 1;
                     transfer->MatchCount++;
                 }
 
@@ -991,23 +1070,22 @@ DxAnalyzeTraffic(
                 // Score based on sensitivity
                 //
                 switch (pattern->Sensitivity) {
-                    case 4: // Critical
-                        score += 50;
-                        break;
-                    case 3: // High
-                        score += 35;
-                        break;
-                    case 2: // Medium
-                        score += 20;
-                        break;
-                    case 1: // Low
-                        score += 10;
-                        break;
+                    case 4: score += 50; break;
+                    case 3: score += 35; break;
+                    case 2: score += 20; break;
+                    case 1: score += 10; break;
                 }
             }
         }
 
-        ExReleasePushLockShared(&Detector->PatternLock);
+        DxpReleasePushLockShared(&Detector->PatternLock);
+    }
+
+    //
+    // Cap score
+    //
+    if (score > DX_MAX_SUSPICION_SCORE) {
+        score = DX_MAX_SUSPICION_SCORE;
     }
 
     //
@@ -1022,27 +1100,34 @@ DxAnalyzeTraffic(
     if (score >= 50) {
         *IsSuspicious = TRUE;
 
-        //
-        // Create alert if threshold exceeded
-        //
         if (score >= 70) {
-            DX_EXFIL_TYPE exfilType = DxpClassifyExfiltration(transfer);
-            DxpCreateAlert(detector, transfer, exfilType);
-
             //
             // Check if we should block
             //
-            if (Detector->Config.BlockOnDetection && DxpShouldBlock(detector, transfer)) {
+            if (Detector->Config.BlockOnDetection && DxpShouldBlock(Detector, transfer)) {
+                blocked = TRUE;
                 InterlockedIncrement64(&Detector->Stats.TransfersBlocked);
             }
+
+            DX_EXFIL_TYPE exfilType = DxpClassifyExfiltration(transfer);
+            DxpCreateAlert(Detector, transfer, exfilType, blocked);
         }
     }
 
+    if (WasBlocked != NULL) {
+        *WasBlocked = blocked;
+    }
     if (SuspicionScore != NULL) {
         *SuspicionScore = score;
     }
 
-    return STATUS_SUCCESS;
+    //
+    // Release transfer reference and rundown protection
+    //
+    DxpDereferenceTransfer(Detector, transfer);
+    ExReleaseRundownProtection(&Detector->RundownRef);
+
+    return blocked ? STATUS_ACCESS_DENIED : STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
@@ -1050,37 +1135,44 @@ NTSTATUS
 DxRecordTransfer(
     _In_ PDX_DETECTOR Detector,
     _In_ HANDLE ProcessId,
-    _In_ PVOID RemoteAddress,
+    _In_reads_bytes_(RemoteAddressSize) PVOID RemoteAddress,
+    _In_ ULONG RemoteAddressSize,
     _In_ USHORT RemotePort,
     _In_ BOOLEAN IsIPv6,
     _In_ SIZE_T BytesSent
     )
-/**
- * @brief Record a transfer without full content analysis.
- *
- * Used for tracking transfer volumes when content inspection
- * is not needed or not possible.
- */
 {
-    PDX_DETECTOR_INTERNAL detector;
     PDX_TRANSFER_CONTEXT transfer;
     LARGE_INTEGER currentTime;
+    NTSTATUS status;
+
+    PAGED_CODE();
 
     if (Detector == NULL || !Detector->Initialized || RemoteAddress == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    detector = CONTAINING_RECORD(Detector, DX_DETECTOR_INTERNAL, Public);
+    status = DxpValidateRemoteAddress(IsIPv6, RemoteAddressSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
 
-    transfer = DxpGetOrCreateTransfer(detector, ProcessId, RemoteAddress, RemotePort, IsIPv6);
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+
+    transfer = DxpGetOrCreateTransfer(
+        Detector, ProcessId, RemoteAddress, RemoteAddressSize, RemotePort, IsIPv6
+    );
     if (transfer == NULL) {
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Update transfer statistics
+    // Update transfer statistics (atomic)
     //
-    transfer->BytesTransferred += BytesSent;
+    InterlockedAdd64(&transfer->BytesTransferred, (LONG64)BytesSent);
     KeQuerySystemTime(&currentTime);
     transfer->LastActivityTime = currentTime;
 
@@ -1090,36 +1182,39 @@ DxRecordTransfer(
     if (transfer->StartTime.QuadPart > 0) {
         LONGLONG elapsedMs = (currentTime.QuadPart - transfer->StartTime.QuadPart) / 10000;
         if (elapsedMs > 0) {
-            transfer->BytesPerSecond = (SIZE_T)((transfer->BytesTransferred * 1000) / elapsedMs);
+            transfer->BytesPerSecond =
+                (SIZE_T)(((LONG64)transfer->BytesTransferred * 1000) / elapsedMs);
         }
     }
 
     //
     // Check for burst transfer
     //
-    if (transfer->BytesTransferred > DX_BURST_THRESHOLD_BYTES) {
+    if ((SIZE_T)transfer->BytesTransferred > DX_BURST_THRESHOLD_BYTES) {
         LONGLONG burstWindow = (currentTime.QuadPart - transfer->StartTime.QuadPart) / 10000;
-        if (burstWindow < DX_BURST_WINDOW_MS) {
+        if (burstWindow > 0 && burstWindow < DX_BURST_WINDOW_MS) {
             transfer->Indicators |= DxIndicator_BurstTransfer;
-            transfer->SuspicionScore += 25;
+            if (transfer->SuspicionScore < 75) {
+                transfer->SuspicionScore = 75;
+            }
         }
     }
 
     //
     // Check volume threshold
     //
-    if (transfer->BytesTransferred > Detector->Config.VolumeThresholdPerMinute) {
+    if ((SIZE_T)transfer->BytesTransferred > Detector->Config.VolumeThresholdPerMinute) {
         transfer->Indicators |= DxIndicator_HighVolume;
 
         if (transfer->SuspicionScore < 50) {
             transfer->SuspicionScore = 50;
         }
 
-        //
-        // Generate alert for high-volume transfer
-        //
-        DxpCreateAlert(detector, transfer, DxExfil_LargeUpload);
+        DxpCreateAlert(Detector, transfer, DxExfil_LargeUpload, FALSE);
     }
+
+    DxpDereferenceTransfer(Detector, transfer);
+    ExReleaseRundownProtection(&Detector->RundownRef);
 
     return STATUS_SUCCESS;
 }
@@ -1139,22 +1234,15 @@ DxInspectContent(
     _In_ ULONG MaxMatches,
     _Out_ PULONG MatchCount
     )
-/**
- * @brief Inspect content for sensitive data patterns.
- *
- * Performs content analysis without transfer context tracking.
- * Useful for inspecting file contents or specific data buffers.
- */
 {
-    PDX_DETECTOR_INTERNAL detector;
     DX_INDICATORS indicators = DxIndicator_None;
     ULONG entropy;
-    BOOLEAN isCompressed;
     BOOLEAN isEncrypted;
     PLIST_ENTRY entry;
     PDX_PATTERN pattern;
     ULONG matchCount = 0;
     ULONG matchOffset;
+    SIZE_T inspectSize;
 
     PAGED_CODE();
 
@@ -1167,12 +1255,22 @@ DxInspectContent(
     *Indicators = DxIndicator_None;
     *MatchCount = 0;
 
-    detector = CONTAINING_RECORD(Detector, DX_DETECTOR_INTERNAL, Public);
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+
+    //
+    // Cap inspection size
+    //
+    inspectSize = DataSize;
+    if (inspectSize > DX_MAX_INSPECT_SIZE) {
+        inspectSize = DX_MAX_INSPECT_SIZE;
+    }
 
     //
     // Calculate entropy
     //
-    entropy = DxpCalculateShannonEntropy((PUCHAR)Data, DataSize);
+    entropy = DxpCalculateShannonEntropy((PUCHAR)Data, inspectSize);
     if (entropy >= Detector->Config.EntropyThreshold) {
         indicators |= DxIndicator_HighEntropy;
     }
@@ -1180,7 +1278,7 @@ DxInspectContent(
     //
     // Check compression/encryption
     //
-    if (DxpIsCompressedData((PUCHAR)Data, DataSize, &isEncrypted)) {
+    if (DxpIsCompressedData((PUCHAR)Data, inspectSize, &isEncrypted)) {
         indicators |= DxIndicator_CompressedData;
         if (isEncrypted) {
             indicators |= DxIndicator_EncryptedData;
@@ -1190,14 +1288,14 @@ DxInspectContent(
     //
     // Check Base64
     //
-    if (DxpIsBase64Encoded((PUCHAR)Data, DataSize)) {
+    if (DxpIsBase64Encoded((PUCHAR)Data, inspectSize)) {
         indicators |= DxIndicator_EncodedData;
     }
 
     //
     // Pattern matching
     //
-    ExAcquirePushLockShared(&Detector->PatternLock);
+    DxpAcquirePushLockShared(&Detector->PatternLock);
 
     for (entry = Detector->PatternList.Flink;
          entry != &Detector->PatternList;
@@ -1205,7 +1303,7 @@ DxInspectContent(
 
         pattern = CONTAINING_RECORD(entry, DX_PATTERN, ListEntry);
 
-        if (DxpMatchPattern(pattern, (PUCHAR)Data, DataSize, &matchOffset)) {
+        if (DxpMatchPattern(pattern, (PUCHAR)Data, inspectSize, &matchOffset)) {
             indicators |= DxIndicator_SensitivePattern;
 
             if (Matches != NULL && matchCount < MaxMatches) {
@@ -1218,11 +1316,12 @@ DxInspectContent(
         }
     }
 
-    ExReleasePushLockShared(&Detector->PatternLock);
+    DxpReleasePushLockShared(&Detector->PatternLock);
 
     *Indicators = indicators;
     *MatchCount = matchCount;
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1233,15 +1332,9 @@ DxCalculateEntropy(
     _In_ SIZE_T DataSize,
     _Out_ PULONG Entropy
     )
-/**
- * @brief Calculate Shannon entropy of data.
- *
- * Returns entropy as percentage (0-100) where:
- * - 0-30: Low entropy (text, repetitive data)
- * - 30-70: Medium entropy (mixed content)
- * - 70-100: High entropy (compressed/encrypted)
- */
 {
+    PAGED_CODE();
+
     if (Data == NULL || DataSize == 0 || Entropy == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1263,14 +1356,7 @@ DxGetAlerts(
     _In_ ULONG MaxAlerts,
     _Out_ PULONG AlertCount
     )
-/**
- * @brief Get pending alerts from the detector.
- *
- * Retrieves and removes alerts from the alert queue.
- * Caller must free each alert using DxFreeAlert.
- */
 {
-    KIRQL oldIrql;
     PLIST_ENTRY entry;
     PDX_ALERT alert;
     ULONG count = 0;
@@ -1284,7 +1370,11 @@ DxGetAlerts(
 
     *AlertCount = 0;
 
-    KeAcquireSpinLock(&Detector->AlertLock, &oldIrql);
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+
+    DxpAcquirePushLockExclusive(&Detector->AlertLock);
 
     while (!IsListEmpty(&Detector->AlertList) && count < MaxAlerts) {
         entry = RemoveHeadList(&Detector->AlertList);
@@ -1294,34 +1384,33 @@ DxGetAlerts(
         Alerts[count++] = alert;
     }
 
-    KeReleaseSpinLock(&Detector->AlertLock, oldIrql);
+    DxpReleasePushLockExclusive(&Detector->AlertLock);
 
     *AlertCount = count;
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
 VOID
 DxFreeAlert(
+    _In_ PDX_DETECTOR Detector,
     _In_ PDX_ALERT Alert
     )
-/**
- * @brief Free an alert structure.
- */
 {
+    PAGED_CODE();
+
+    UNREFERENCED_PARAMETER(Detector);
+
     if (Alert == NULL) {
         return;
     }
 
-    if (Alert->ProcessName.Buffer != NULL) {
-        ExFreePoolWithTag(Alert->ProcessName.Buffer, DX_POOL_TAG_ALERT);
-    }
-
-    if (Alert->UserName.Buffer != NULL) {
-        ExFreePoolWithTag(Alert->UserName.Buffer, DX_POOL_TAG_ALERT);
-    }
-
+    //
+    // Alerts are allocated from the general pool with DX_POOL_TAG_ALERT.
+    // No UNICODE_STRING buffers — process name is inline WCHAR array.
+    //
     ExFreePoolWithTag(Alert, DX_POOL_TAG_ALERT);
 }
 
@@ -1336,25 +1425,23 @@ DxRegisterAlertCallback(
     _In_ DX_ALERT_CALLBACK Callback,
     _In_opt_ PVOID Context
     )
-/**
- * @brief Register callback for alert notifications.
- */
 {
-    PDX_DETECTOR_INTERNAL detector;
-
     PAGED_CODE();
 
     if (Detector == NULL || !Detector->Initialized || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    detector = CONTAINING_RECORD(Detector, DX_DETECTOR_INTERNAL, Public);
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
 
-    ExAcquirePushLockExclusive(&detector->Callbacks.Lock);
-    detector->Callbacks.AlertCallback = Callback;
-    detector->Callbacks.AlertContext = Context;
-    ExReleasePushLockExclusive(&detector->Callbacks.Lock);
+    DxpAcquirePushLockExclusive(&Detector->Callbacks.Lock);
+    Detector->Callbacks.AlertCallback = Callback;
+    Detector->Callbacks.AlertContext = Context;
+    DxpReleasePushLockExclusive(&Detector->Callbacks.Lock);
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1365,25 +1452,23 @@ DxRegisterBlockCallback(
     _In_ DX_BLOCK_CALLBACK Callback,
     _In_opt_ PVOID Context
     )
-/**
- * @brief Register callback for block decisions.
- */
 {
-    PDX_DETECTOR_INTERNAL detector;
-
     PAGED_CODE();
 
     if (Detector == NULL || !Detector->Initialized || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    detector = CONTAINING_RECORD(Detector, DX_DETECTOR_INTERNAL, Public);
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
 
-    ExAcquirePushLockExclusive(&detector->Callbacks.Lock);
-    detector->Callbacks.BlockCallback = Callback;
-    detector->Callbacks.BlockContext = Context;
-    ExReleasePushLockExclusive(&detector->Callbacks.Lock);
+    DxpAcquirePushLockExclusive(&Detector->Callbacks.Lock);
+    Detector->Callbacks.BlockCallback = Callback;
+    Detector->Callbacks.BlockContext = Context;
+    DxpReleasePushLockExclusive(&Detector->Callbacks.Lock);
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1392,26 +1477,25 @@ VOID
 DxUnregisterCallbacks(
     _In_ PDX_DETECTOR Detector
     )
-/**
- * @brief Unregister all callbacks.
- */
 {
-    PDX_DETECTOR_INTERNAL detector;
-
     PAGED_CODE();
 
     if (Detector == NULL || !Detector->Initialized) {
         return;
     }
 
-    detector = CONTAINING_RECORD(Detector, DX_DETECTOR_INTERNAL, Public);
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return;
+    }
 
-    ExAcquirePushLockExclusive(&detector->Callbacks.Lock);
-    detector->Callbacks.AlertCallback = NULL;
-    detector->Callbacks.AlertContext = NULL;
-    detector->Callbacks.BlockCallback = NULL;
-    detector->Callbacks.BlockContext = NULL;
-    ExReleasePushLockExclusive(&detector->Callbacks.Lock);
+    DxpAcquirePushLockExclusive(&Detector->Callbacks.Lock);
+    Detector->Callbacks.AlertCallback = NULL;
+    Detector->Callbacks.AlertContext = NULL;
+    Detector->Callbacks.BlockCallback = NULL;
+    Detector->Callbacks.BlockContext = NULL;
+    DxpReleasePushLockExclusive(&Detector->Callbacks.Lock);
+
+    ExReleaseRundownProtection(&Detector->RundownRef);
 }
 
 // ============================================================================
@@ -1424,9 +1508,6 @@ DxGetStatistics(
     _In_ PDX_DETECTOR Detector,
     _Out_ PDX_STATISTICS Stats
     )
-/**
- * @brief Get data exfiltration detection statistics.
- */
 {
     LARGE_INTEGER currentTime;
 
@@ -1457,54 +1538,51 @@ DxGetStatistics(
 
 static VOID
 DxpInitializeLookupTables(
-    _In_ PDX_DETECTOR_INTERNAL Detector
+    _In_ PDX_DETECTOR Detector
     )
-/**
- * @brief Initialize lookup tables for fast encoding detection.
- */
 {
+    static const UCHAR base64Alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
     ULONG i;
 
-    //
-    // Initialize Base64 lookup table
-    // 0 = not Base64, 1 = valid Base64 character
-    //
     RtlZeroMemory(Detector->Base64LookupTable, sizeof(Detector->Base64LookupTable));
 
-    for (i = 0; g_Base64Alphabet[i] != '\0'; i++) {
-        Detector->Base64LookupTable[g_Base64Alphabet[i]] = 1;
+    for (i = 0; base64Alphabet[i] != '\0'; i++) {
+        Detector->Base64LookupTable[base64Alphabet[i]] = 1;
     }
 
     //
-    // Also allow whitespace in Base64
+    // Allow whitespace in Base64 streams
     //
     Detector->Base64LookupTable[' '] = 1;
     Detector->Base64LookupTable['\r'] = 1;
     Detector->Base64LookupTable['\n'] = 1;
     Detector->Base64LookupTable['\t'] = 1;
-
-    Detector->LookupTablesInitialized = TRUE;
 }
 
+/**
+ * @brief Calculate Shannon entropy using fixed-point integer arithmetic.
+ *
+ * Formula: H = -sum(p_i * log2(p_i)) for each byte value i
+ * Returns entropy as percentage (0-100) of maximum 8 bits/byte.
+ *
+ * Uses a precomputed log2 lookup table in 8.8 fixed-point format.
+ * For each byte value with frequency f, p = f/N, and we compute
+ * -(f/N) * log2(f/N) = (f/N) * (log2(N) - log2(f)).
+ * Rearranged for integer math: contribution = f * (log2(N) - log2(f)) / N.
+ */
 static ULONG
 DxpCalculateShannonEntropy(
     _In_reads_bytes_(DataSize) PUCHAR Data,
     _In_ SIZE_T DataSize
     )
-/**
- * @brief Calculate Shannon entropy as percentage (0-100).
- *
- * Shannon entropy formula: H = -sum(p * log2(p))
- * Maximum entropy for bytes is 8 bits.
- * We return as percentage of maximum (0-100).
- */
 {
     ULONG frequency[256] = { 0 };
     SIZE_T i;
+    ULONG64 entropyFixed = 0;
     ULONG entropy;
-    ULONG64 entropySum = 0;
 
-    if (DataSize == 0 || DataSize < 64) {
+    if (DataSize < 64) {
         return 0;
     }
 
@@ -1516,42 +1594,36 @@ DxpCalculateShannonEntropy(
     }
 
     //
-    // Calculate entropy using fixed-point arithmetic
-    // We use a lookup table approximation for log2
-    // to avoid floating point in kernel mode
+    // Calculate entropy using fixed-point log2 approximation.
+    // We scale probabilities to [0..255] range for table lookup.
+    // For each byte value: contribution = freq * log2_table_entry(freq_scaled)
+    // where freq_scaled = (freq * 256) / DataSize.
     //
-    // Simplified calculation: count unique bytes and their distribution
+    // The log2_table[k] = round(-log2(k/256) * 256) for k in 1..255.
+    // So: H_fixed = sum(freq * log2_table[freq_scaled]) / DataSize
+    // And H_percent = H_fixed * 100 / (8 * 256)   [since max entropy = 8 bits, scaled by 256]
     //
     for (i = 0; i < 256; i++) {
         if (frequency[i] > 0) {
-            //
-            // p = frequency[i] / DataSize
-            // -p * log2(p) approximated
-            //
-            // Using: -x*log2(x) is maximized at x=1/e and peaks around 0.53
-            // We approximate by counting the "spread" of bytes
-            //
-            ULONG64 p_scaled = (frequency[i] * 1000000) / DataSize;
-
-            if (p_scaled > 0 && p_scaled < 1000000) {
-                //
-                // Simple approximation: penalty for concentration
-                // More uniform = higher entropy
-                //
-                ULONG64 contribution = p_scaled;
-                if (p_scaled < 10000) {
-                    contribution = p_scaled * 2;  // Boost rare bytes
-                }
-                entropySum += contribution;
+            ULONG scaled = (ULONG)((ULONG64)frequency[i] * 256 / DataSize);
+            if (scaled == 0) {
+                scaled = 1;
             }
+            if (scaled > 255) {
+                scaled = 255;
+            }
+            entropyFixed += (ULONG64)frequency[i] * g_Log2Table[scaled];
         }
     }
 
     //
-    // Normalize to 0-100 scale
-    // Perfect entropy (256 equal bytes) would give ~256 * 3906 = 1M
+    // Normalize: entropyFixed is in units of (count * 8.8_fixed).
+    // Divide by DataSize to get average per-byte entropy in 8.8 format.
+    // Then convert to percentage of 8 bits maximum.
+    // H_percent = (entropyFixed / DataSize) * 100 / (8 * 256)
+    //           = entropyFixed * 100 / (DataSize * 2048)
     //
-    entropy = (ULONG)((entropySum * 100) / 1000000);
+    entropy = (ULONG)(entropyFixed * 100 / ((ULONG64)DataSize * 2048));
 
     if (entropy > 100) {
         entropy = 100;
@@ -1565,23 +1637,23 @@ DxpIsBase64Encoded(
     _In_reads_bytes_(DataSize) PUCHAR Data,
     _In_ SIZE_T DataSize
     )
-/**
- * @brief Check if data appears to be Base64 encoded.
- */
 {
     SIZE_T i;
     SIZE_T validChars = 0;
     SIZE_T alphaChars = 0;
     SIZE_T paddingCount = 0;
+    SIZE_T checkLen;
 
     if (DataSize < 4) {
         return FALSE;
     }
 
-    //
-    // Check if mostly Base64 alphabet
-    //
-    for (i = 0; i < DataSize && i < 4096; i++) {
+    checkLen = DataSize;
+    if (checkLen > 4096) {
+        checkLen = 4096;
+    }
+
+    for (i = 0; i < checkLen; i++) {
         UCHAR c = Data[i];
 
         if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
@@ -1593,16 +1665,10 @@ DxpIsBase64Encoded(
         } else if (c == '=') {
             paddingCount++;
             if (paddingCount > 2) {
-                return FALSE;  // Invalid Base64
+                return FALSE;
             }
         } else if (c != '\r' && c != '\n' && c != ' ' && c != '\t') {
-            //
-            // Non-Base64 character (not whitespace)
-            //
             if (validChars > 0 && validChars < i) {
-                //
-                // Allow some non-Base64 if at boundary
-                //
                 break;
             }
             return FALSE;
@@ -1613,10 +1679,7 @@ DxpIsBase64Encoded(
     // Need at least 90% valid Base64 characters
     // and a mix of alpha characters (not just numbers)
     //
-    if (validChars * 100 / (i > 0 ? i : 1) >= 90 && alphaChars > validChars / 4) {
-        //
-        // Additional check: length should be multiple of 4 (with padding)
-        //
+    if (i > 0 && validChars * 100 / i >= 90 && alphaChars > validChars / 4) {
         return TRUE;
     }
 
@@ -1629,9 +1692,6 @@ DxpIsCompressedData(
     _In_ SIZE_T DataSize,
     _Out_opt_ PBOOLEAN IsEncrypted
     )
-/**
- * @brief Check if data is compressed by looking for magic bytes.
- */
 {
     ULONG i;
 
@@ -1661,13 +1721,15 @@ DxpIsCompressedData(
     }
 
     //
-    // Check for encrypted ZIP (flag in local file header)
+    // Check for encrypted ZIP (flag in local file header).
+    // Use RtlCopyMemory for unaligned access safety (ARM compatibility).
     //
     if (DataSize >= 8 && Data[0] == 0x50 && Data[1] == 0x4B &&
         Data[2] == 0x03 && Data[3] == 0x04) {
 
-        USHORT flags = *(PUSHORT)(Data + 6);
-        if (flags & 0x0001) {  // Encryption flag
+        USHORT flags = 0;
+        RtlCopyMemory(&flags, Data + 6, sizeof(USHORT));
+        if (flags & 0x0001) {
             if (IsEncrypted != NULL) {
                 *IsEncrypted = TRUE;
             }
@@ -1685,11 +1747,6 @@ DxpMatchPattern(
     _In_ SIZE_T DataSize,
     _Out_opt_ PULONG MatchOffset
     )
-/**
- * @brief Match a pattern against data.
- *
- * Supports keyword matching. Regex would require additional engine.
- */
 {
     SIZE_T i, j;
     BOOLEAN found;
@@ -1708,9 +1765,6 @@ DxpMatchPattern(
 
     switch (Pattern->Type) {
         case PatternType_Keyword:
-            //
-            // Simple substring search (Boyer-Moore would be better for production)
-            //
             for (i = 0; i <= DataSize - Pattern->PatternSize; i++) {
                 found = TRUE;
                 for (j = 0; j < Pattern->PatternSize; j++) {
@@ -1730,9 +1784,6 @@ DxpMatchPattern(
             break;
 
         case PatternType_FileSignature:
-            //
-            // Check at start of data only
-            //
             if (RtlCompareMemory(Data, Pattern->Pattern, Pattern->PatternSize) ==
                 Pattern->PatternSize) {
                 if (MatchOffset != NULL) {
@@ -1742,11 +1793,11 @@ DxpMatchPattern(
             }
             break;
 
-        case PatternType_Regex:
-        case PatternType_DataFormat:
+        default:
             //
-            // Would require regex engine - not implemented in kernel
-            // These patterns should be processed by user-mode
+            // Unknown pattern type — do not match.
+            // Only PatternType_Keyword and PatternType_FileSignature are
+            // supported in kernel mode.
             //
             break;
     }
@@ -1754,13 +1805,39 @@ DxpMatchPattern(
     return FALSE;
 }
 
+/**
+ * @brief Case-insensitive ANSI string comparison (kernel-safe).
+ *
+ * Replaces _stricmp which is not a documented kernel-mode API.
+ */
+static BOOLEAN
+DxpCaseInsensitiveCompareA(
+    _In_ PCSTR String1,
+    _In_ PCSTR String2
+    )
+{
+    while (*String1 && *String2) {
+        CHAR c1 = *String1;
+        CHAR c2 = *String2;
+
+        if (c1 >= 'A' && c1 <= 'Z') c1 += ('a' - 'A');
+        if (c2 >= 'A' && c2 <= 'Z') c2 += ('a' - 'A');
+
+        if (c1 != c2) {
+            return FALSE;
+        }
+
+        String1++;
+        String2++;
+    }
+
+    return (*String1 == *String2);
+}
+
 static BOOLEAN
 DxpIsCloudStorageDestination(
     _In_ PCSTR Hostname
     )
-/**
- * @brief Check if hostname matches known cloud storage service.
- */
 {
     ULONG i;
     SIZE_T hostnameLen;
@@ -1776,14 +1853,9 @@ DxpIsCloudStorageDestination(
         domainLen = strlen(g_CloudStorageDomains[i]);
 
         if (hostnameLen >= domainLen) {
-            //
-            // Check if hostname ends with domain
-            //
-            if (_stricmp(Hostname + hostnameLen - domainLen,
-                         g_CloudStorageDomains[i]) == 0) {
-                //
-                // Verify it's at domain boundary
-                //
+            if (DxpCaseInsensitiveCompareA(
+                    Hostname + hostnameLen - domainLen,
+                    g_CloudStorageDomains[i])) {
                 if (hostnameLen == domainLen ||
                     Hostname[hostnameLen - domainLen - 1] == '.') {
                     return TRUE;
@@ -1799,9 +1871,6 @@ static BOOLEAN
 DxpIsPersonalEmailDomain(
     _In_ PCSTR Hostname
     )
-/**
- * @brief Check if hostname matches known personal email service.
- */
 {
     ULONG i;
     SIZE_T hostnameLen;
@@ -1817,8 +1886,9 @@ DxpIsPersonalEmailDomain(
         domainLen = strlen(g_PersonalEmailDomains[i]);
 
         if (hostnameLen >= domainLen) {
-            if (_stricmp(Hostname + hostnameLen - domainLen,
-                         g_PersonalEmailDomains[i]) == 0) {
+            if (DxpCaseInsensitiveCompareA(
+                    Hostname + hostnameLen - domainLen,
+                    g_PersonalEmailDomains[i])) {
                 if (hostnameLen == domainLen ||
                     Hostname[hostnameLen - domainLen - 1] == '.') {
                     return TRUE;
@@ -1830,34 +1900,116 @@ DxpIsPersonalEmailDomain(
     return FALSE;
 }
 
+static NTSTATUS
+DxpValidateRemoteAddress(
+    _In_ BOOLEAN IsIPv6,
+    _In_ ULONG RemoteAddressSize
+    )
+{
+    ULONG expectedSize = IsIPv6 ? sizeof(IN6_ADDR) : sizeof(IN_ADDR);
+
+    if (RemoteAddressSize < expectedSize) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// TRANSFER HASH TABLE
+// ============================================================================
+
+static ULONG
+DxpHashTransferKey(
+    _In_ HANDLE ProcessId,
+    _In_reads_bytes_(AddrSize) PVOID RemoteAddress,
+    _In_ ULONG AddrSize,
+    _In_ USHORT RemotePort
+    )
+{
+    ULONG hash = 0x811C9DC5;    // FNV-1a offset basis
+    PUCHAR addr = (PUCHAR)RemoteAddress;
+    ULONG i;
+    ULONG_PTR pid = (ULONG_PTR)ProcessId;
+
+    //
+    // Hash the PID
+    //
+    for (i = 0; i < sizeof(ULONG_PTR); i++) {
+        hash ^= (UCHAR)(pid & 0xFF);
+        hash *= 0x01000193;     // FNV-1a prime
+        pid >>= 8;
+    }
+
+    //
+    // Hash the address
+    //
+    for (i = 0; i < AddrSize; i++) {
+        hash ^= addr[i];
+        hash *= 0x01000193;
+    }
+
+    //
+    // Hash the port
+    //
+    hash ^= (UCHAR)(RemotePort & 0xFF);
+    hash *= 0x01000193;
+    hash ^= (UCHAR)((RemotePort >> 8) & 0xFF);
+    hash *= 0x01000193;
+
+    return hash % DX_TRANSFER_HASH_BUCKETS;
+}
+
+/**
+ * @brief Get existing or create new transfer context.
+ *
+ * Returns with a reference held on the transfer context.
+ * Caller MUST call DxpDereferenceTransfer when done.
+ *
+ * The lock is held across lookup + insert to prevent TOCTOU races.
+ */
 static PDX_TRANSFER_CONTEXT
 DxpGetOrCreateTransfer(
-    _In_ PDX_DETECTOR_INTERNAL Detector,
+    _In_ PDX_DETECTOR Detector,
     _In_ HANDLE ProcessId,
-    _In_ PVOID RemoteAddress,
+    _In_reads_bytes_(AddrSize) PVOID RemoteAddress,
+    _In_ ULONG AddrSize,
     _In_ USHORT RemotePort,
     _In_ BOOLEAN IsIPv6
     )
-/**
- * @brief Get existing or create new transfer context.
- */
 {
-    KIRQL oldIrql;
+    ULONG bucket;
+    PDX_HASH_BUCKET hashBucket;
     PLIST_ENTRY entry;
     PDX_TRANSFER_CONTEXT transfer;
     PDX_TRANSFER_CONTEXT newTransfer = NULL;
-    SIZE_T addrSize = IsIPv6 ? sizeof(IN6_ADDR) : sizeof(IN_ADDR);
+    ULONG expectedAddrSize = IsIPv6 ? sizeof(IN6_ADDR) : sizeof(IN_ADDR);
+
+    bucket = DxpHashTransferKey(ProcessId, RemoteAddress, AddrSize, RemotePort);
+    hashBucket = &Detector->TransferBuckets[bucket];
+
+    //
+    // Pre-allocate outside the lock to minimize hold time
+    //
+    if ((ULONG)Detector->TransferCount < DX_MAX_TRANSFERS) {
+        newTransfer = (PDX_TRANSFER_CONTEXT)ExAllocateFromNPagedLookasideList(
+            &Detector->TransferLookaside
+        );
+    }
+
+    //
+    // Lock the bucket — holds across search + potential insert
+    //
+    DxpAcquirePushLockExclusive(&hashBucket->Lock);
 
     //
     // Search for existing transfer
     //
-    KeAcquireSpinLock(&Detector->Public.TransferLock, &oldIrql);
-
-    for (entry = Detector->Public.TransferList.Flink;
-         entry != &Detector->Public.TransferList;
+    for (entry = hashBucket->Head.Flink;
+         entry != &hashBucket->Head;
          entry = entry->Flink) {
 
-        transfer = CONTAINING_RECORD(entry, DX_TRANSFER_CONTEXT, ListEntry);
+        transfer = CONTAINING_RECORD(entry, DX_TRANSFER_CONTEXT, HashEntry);
 
         if (transfer->ProcessId == ProcessId &&
             transfer->RemotePort == RemotePort &&
@@ -1867,30 +2019,33 @@ DxpGetOrCreateTransfer(
                 (PVOID)&transfer->RemoteAddress.IPv6 :
                 (PVOID)&transfer->RemoteAddress.IPv4;
 
-            if (RtlCompareMemory(storedAddr, RemoteAddress, addrSize) == addrSize) {
-                KeReleaseSpinLock(&Detector->Public.TransferLock, oldIrql);
+            if (RtlCompareMemory(storedAddr, RemoteAddress, expectedAddrSize) == expectedAddrSize) {
+                //
+                // Found — take a reference and return
+                //
+                DxpReferenceTransfer(transfer);
+
+                DxpReleasePushLockExclusive(&hashBucket->Lock);
+
+                //
+                // Free pre-allocated entry we don't need
+                //
+                if (newTransfer != NULL) {
+                    ExFreeToNPagedLookasideList(&Detector->TransferLookaside, newTransfer);
+                }
                 return transfer;
             }
         }
     }
 
-    KeReleaseSpinLock(&Detector->Public.TransferLock, oldIrql);
-
     //
-    // Check transfer limit
+    // Not found — insert new entry (if we have one)
     //
-    if ((ULONG)Detector->Public.TransferCount >= DX_MAX_TRANSFERS) {
-        return NULL;
-    }
-
-    //
-    // Create new transfer
-    //
-    newTransfer = (PDX_TRANSFER_CONTEXT)ExAllocateFromNPagedLookasideList(
-        &Detector->TransferLookaside
-    );
-
-    if (newTransfer == NULL) {
+    if (newTransfer == NULL || (ULONG)Detector->TransferCount >= DX_MAX_TRANSFERS) {
+        DxpReleasePushLockExclusive(&hashBucket->Lock);
+        if (newTransfer != NULL) {
+            ExFreeToNPagedLookasideList(&Detector->TransferLookaside, newTransfer);
+        }
         return NULL;
     }
 
@@ -1900,6 +2055,7 @@ DxpGetOrCreateTransfer(
     newTransfer->ProcessId = ProcessId;
     newTransfer->RemotePort = RemotePort;
     newTransfer->IsIPv6 = IsIPv6;
+    newTransfer->RefCount = 2;  // 1 for hash table, 1 for caller
 
     if (IsIPv6) {
         RtlCopyMemory(&newTransfer->RemoteAddress.IPv6, RemoteAddress, sizeof(IN6_ADDR));
@@ -1910,74 +2066,96 @@ DxpGetOrCreateTransfer(
     KeQuerySystemTime(&newTransfer->StartTime);
     newTransfer->LastActivityTime = newTransfer->StartTime;
 
-    //
-    // Insert into list
-    //
-    KeAcquireSpinLock(&Detector->Public.TransferLock, &oldIrql);
-    InsertTailList(&Detector->Public.TransferList, &newTransfer->ListEntry);
-    InterlockedIncrement(&Detector->Public.TransferCount);
-    KeReleaseSpinLock(&Detector->Public.TransferLock, oldIrql);
+    InsertTailList(&hashBucket->Head, &newTransfer->HashEntry);
+    InterlockedIncrement(&Detector->TransferCount);
+
+    DxpReleasePushLockExclusive(&hashBucket->Lock);
 
     return newTransfer;
 }
 
 static VOID
-DxpReleaseTransfer(
-    _In_ PDX_DETECTOR_INTERNAL Detector,
+DxpReferenceTransfer(
     _In_ PDX_TRANSFER_CONTEXT Transfer
     )
-/**
- * @brief Release transfer context (placeholder for ref counting).
- */
 {
-    UNREFERENCED_PARAMETER(Detector);
-    UNREFERENCED_PARAMETER(Transfer);
-
-    //
-    // Transfer cleanup is handled by timer DPC
-    //
+    InterlockedIncrement(&Transfer->RefCount);
 }
+
+/**
+ * @brief Dereference a transfer context.
+ *
+ * When refcount drops to zero, frees the transfer back to the lookaside list.
+ * The hash table ref is the "last" ref — when cleanup removes from the hash
+ * table it calls this, and if no in-flight operations hold refs, the object
+ * is freed.
+ */
+static VOID
+DxpDereferenceTransfer(
+    _In_ PDX_DETECTOR Detector,
+    _In_ PDX_TRANSFER_CONTEXT Transfer
+    )
+{
+    LONG newRef = InterlockedDecrement(&Transfer->RefCount);
+
+    NT_ASSERT(newRef >= 0);
+
+    if (newRef == 0) {
+        ExFreeToNPagedLookasideList(&Detector->TransferLookaside, Transfer);
+    }
+}
+
+// ============================================================================
+// ALERT CREATION
+// ============================================================================
 
 static NTSTATUS
 DxpCreateAlert(
-    _In_ PDX_DETECTOR_INTERNAL Detector,
+    _In_ PDX_DETECTOR Detector,
     _In_ PDX_TRANSFER_CONTEXT Transfer,
-    _In_ DX_EXFIL_TYPE Type
+    _In_ DX_EXFIL_TYPE Type,
+    _In_ BOOLEAN WasBlocked
     )
-/**
- * @brief Create and queue an exfiltration alert.
- */
 {
     PDX_ALERT alert;
-    KIRQL oldIrql;
     LARGE_INTEGER currentTime;
     ULONG i;
 
     //
     // Check alert limit
     //
-    if ((ULONG)Detector->Public.AlertCount >= DX_MAX_ALERTS) {
+    if ((ULONG)Detector->AlertCount >= DX_MAX_ALERTS) {
         return STATUS_QUOTA_EXCEEDED;
     }
 
     //
-    // Allocate alert
+    // Allocate alert from general pool (not lookaside) so DxFreeAlert
+    // can free without needing the detector.
     //
-    alert = (PDX_ALERT)ExAllocateFromNPagedLookasideList(&Detector->AlertLookaside);
+    alert = (PDX_ALERT)ExAllocatePoolZero(
+        NonPagedPoolNx,
+        sizeof(DX_ALERT),
+        DX_POOL_TAG_ALERT
+    );
     if (alert == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(alert, sizeof(DX_ALERT));
-
     //
     // Fill alert details
     //
-    alert->AlertId = (ULONG64)InterlockedIncrement64(&Detector->Public.NextAlertId);
+    alert->AlertId = (ULONG64)InterlockedIncrement64(&Detector->NextAlertId);
     alert->Type = Type;
     alert->Indicators = Transfer->Indicators;
     alert->SeverityScore = Transfer->SuspicionScore;
     alert->ProcessId = Transfer->ProcessId;
+    alert->WasBlocked = WasBlocked;
+
+    //
+    // Populate process name (best effort, inline buffer)
+    //
+    alert->ProcessNameLength = 0;
+    RtlZeroMemory(alert->ProcessNameBuffer, sizeof(alert->ProcessNameBuffer));
 
     //
     // Copy destination info
@@ -1992,11 +2170,12 @@ DxpCreateAlert(
     }
 
     RtlCopyMemory(alert->Hostname, Transfer->Hostname, sizeof(alert->Hostname) - 1);
+    alert->Hostname[sizeof(alert->Hostname) - 1] = '\0';
 
     //
     // Transfer details
     //
-    alert->DataSize = Transfer->BytesTransferred;
+    alert->DataSize = (SIZE_T)Transfer->BytesTransferred;
     alert->TransferStartTime = Transfer->StartTime;
 
     KeQuerySystemTime(&currentTime);
@@ -2004,77 +2183,82 @@ DxpCreateAlert(
     alert->TransferDurationMs = (ULONG)((currentTime.QuadPart - Transfer->StartTime.QuadPart) / 10000);
 
     //
-    // Copy pattern match categories
+    // Copy pattern match categories (value snapshots, not pointers)
     //
-    for (i = 0; i < Transfer->MatchCount && i < 8; i++) {
-        if (Transfer->Matches[i].Pattern != NULL) {
-            RtlCopyMemory(
-                alert->SensitiveDataFound[i].Category,
-                Transfer->Matches[i].Pattern->Category,
-                sizeof(alert->SensitiveDataFound[i].Category) - 1
-            );
-            alert->SensitiveDataFound[i].MatchCount = Transfer->Matches[i].MatchCount;
-            alert->CategoryCount++;
-        }
+    for (i = 0; i < Transfer->MatchCount && i < ARRAYSIZE(alert->SensitiveDataFound); i++) {
+        RtlCopyMemory(
+            alert->SensitiveDataFound[i].Category,
+            Transfer->Matches[i].Category,
+            sizeof(alert->SensitiveDataFound[i].Category) - 1
+        );
+        alert->SensitiveDataFound[i].Category[sizeof(alert->SensitiveDataFound[i].Category) - 1] = '\0';
+        alert->SensitiveDataFound[i].MatchCount = Transfer->Matches[i].MatchCount;
+        alert->CategoryCount++;
     }
 
     //
     // Queue alert
     //
-    KeAcquireSpinLock(&Detector->Public.AlertLock, &oldIrql);
-    InsertTailList(&Detector->Public.AlertList, &alert->ListEntry);
-    InterlockedIncrement(&Detector->Public.AlertCount);
-    KeReleaseSpinLock(&Detector->Public.AlertLock, oldIrql);
+    DxpAcquirePushLockExclusive(&Detector->AlertLock);
+    InsertTailList(&Detector->AlertList, &alert->ListEntry);
+    InterlockedIncrement(&Detector->AlertCount);
+    DxpReleasePushLockExclusive(&Detector->AlertLock);
 
-    InterlockedIncrement64(&Detector->Public.Stats.AlertsGenerated);
+    InterlockedIncrement64(&Detector->Stats.AlertsGenerated);
 
     //
-    // Notify callback
+    // Notify callback (under push lock to prevent unload race)
     //
     DxpNotifyAlertCallback(Detector, alert);
 
     return STATUS_SUCCESS;
 }
 
-static VOID
-DxpNotifyAlertCallback(
-    _In_ PDX_DETECTOR_INTERNAL Detector,
-    _In_ PDX_ALERT Alert
-    )
 /**
  * @brief Notify registered alert callback.
+ *
+ * The callback is invoked while holding the callback push lock shared.
+ * This prevents the callback from being unregistered (and potentially
+ * the module unloaded) while the call is in flight.
  */
+static VOID
+DxpNotifyAlertCallback(
+    _In_ PDX_DETECTOR Detector,
+    _In_ PDX_ALERT Alert
+    )
 {
     DX_ALERT_CALLBACK callback;
     PVOID context;
 
-    ExAcquirePushLockShared(&Detector->Callbacks.Lock);
+    DxpAcquirePushLockShared(&Detector->Callbacks.Lock);
+
     callback = Detector->Callbacks.AlertCallback;
     context = Detector->Callbacks.AlertContext;
-    ExReleasePushLockShared(&Detector->Callbacks.Lock);
 
     if (callback != NULL) {
         callback(Alert, context);
     }
+
+    DxpReleasePushLockShared(&Detector->Callbacks.Lock);
 }
 
-static BOOLEAN
-DxpShouldBlock(
-    _In_ PDX_DETECTOR_INTERNAL Detector,
-    _In_ PDX_TRANSFER_CONTEXT Transfer
-    )
 /**
  * @brief Determine if transfer should be blocked.
+ *
+ * Block callback is invoked while holding the callback push lock shared,
+ * preventing unload race.
  */
+static BOOLEAN
+DxpShouldBlock(
+    _In_ PDX_DETECTOR Detector,
+    _In_ PDX_TRANSFER_CONTEXT Transfer
+    )
 {
     DX_BLOCK_CALLBACK callback;
     PVOID context;
     BOOLEAN shouldBlock = FALSE;
 
-    //
-    // Check if blocking is enabled
-    //
-    if (!Detector->Public.Config.BlockOnDetection) {
+    if (!Detector->Config.BlockOnDetection) {
         return FALSE;
     }
 
@@ -2090,9 +2274,8 @@ DxpShouldBlock(
     //
     if (Transfer->MatchCount > 0) {
         ULONG i;
-        for (i = 0; i < Transfer->MatchCount; i++) {
-            if (Transfer->Matches[i].Pattern != NULL &&
-                Transfer->Matches[i].Pattern->Sensitivity == 4) {
+        for (i = 0; i < Transfer->MatchCount && i < ARRAYSIZE(Transfer->Matches); i++) {
+            if (Transfer->Matches[i].Sensitivity == 4) {
                 shouldBlock = TRUE;
                 break;
             }
@@ -2100,76 +2283,26 @@ DxpShouldBlock(
     }
 
     //
-    // Consult block callback for final decision
+    // Consult block callback for final decision (under lock)
     //
-    ExAcquirePushLockShared(&Detector->Callbacks.Lock);
+    DxpAcquirePushLockShared(&Detector->Callbacks.Lock);
+
     callback = Detector->Callbacks.BlockCallback;
     context = Detector->Callbacks.BlockContext;
-    ExReleasePushLockShared(&Detector->Callbacks.Lock);
 
     if (callback != NULL) {
         shouldBlock = callback(Transfer, context);
     }
 
+    DxpReleasePushLockShared(&Detector->Callbacks.Lock);
+
     return shouldBlock;
-}
-
-static ULONG
-DxpCalculateSuspicionScore(
-    _In_ PDX_TRANSFER_CONTEXT Transfer
-    )
-/**
- * @brief Calculate overall suspicion score for transfer.
- */
-{
-    ULONG score = 0;
-
-    if (Transfer->Indicators & DxIndicator_HighEntropy) {
-        score += 25;
-    }
-
-    if (Transfer->Indicators & DxIndicator_EncryptedData) {
-        score += 20;
-    }
-
-    if (Transfer->Indicators & DxIndicator_EncodedData) {
-        score += 15;
-    }
-
-    if (Transfer->Indicators & DxIndicator_SensitivePattern) {
-        score += 30;
-    }
-
-    if (Transfer->Indicators & DxIndicator_CloudUpload) {
-        score += 15;
-    }
-
-    if (Transfer->Indicators & DxIndicator_PersonalEmail) {
-        score += 15;
-    }
-
-    if (Transfer->Indicators & DxIndicator_HighVolume) {
-        score += 20;
-    }
-
-    if (Transfer->Indicators & DxIndicator_BurstTransfer) {
-        score += 15;
-    }
-
-    if (score > 100) {
-        score = 100;
-    }
-
-    return score;
 }
 
 static DX_EXFIL_TYPE
 DxpClassifyExfiltration(
     _In_ PDX_TRANSFER_CONTEXT Transfer
     )
-/**
- * @brief Classify the type of exfiltration detected.
- */
 {
     if (Transfer->Indicators & DxIndicator_HighVolume) {
         return DxExfil_LargeUpload;
@@ -2198,6 +2331,16 @@ DxpClassifyExfiltration(
     return DxExfil_Unknown;
 }
 
+// ============================================================================
+// CLEANUP TIMER — DPC queues a passive-level work item
+// ============================================================================
+
+/**
+ * @brief DPC callback — queues a passive-level work item for cleanup.
+ *
+ * We cannot acquire push locks at DISPATCH_LEVEL, so the DPC simply
+ * schedules a work item that runs at PASSIVE_LEVEL.
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 DxpCleanupTimerDpc(
@@ -2206,18 +2349,8 @@ DxpCleanupTimerDpc(
     _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2
     )
-/**
- * @brief DPC callback for periodic cleanup of stale transfers.
- */
 {
-    PDX_DETECTOR_INTERNAL detector = (PDX_DETECTOR_INTERNAL)DeferredContext;
-    KIRQL oldIrql;
-    PLIST_ENTRY entry;
-    PLIST_ENTRY nextEntry;
-    PDX_TRANSFER_CONTEXT transfer;
-    LARGE_INTEGER currentTime;
-    LARGE_INTEGER timeout;
-    LIST_ENTRY freeList;
+    PDX_DETECTOR detector = (PDX_DETECTOR)DeferredContext;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
@@ -2227,77 +2360,104 @@ DxpCleanupTimerDpc(
         return;
     }
 
+    //
+    // Only queue if not already queued (prevent stacking)
+    //
+    if (InterlockedCompareExchange(&detector->CleanupWorkQueued, 1, 0) == 0) {
+        ExInitializeWorkItem(&detector->CleanupWorkItem, DxpCleanupWorkRoutine, detector);
+        ExQueueWorkItem(&detector->CleanupWorkItem, DelayedWorkQueue);
+    }
+}
+
+/**
+ * @brief Work item callback for cleanup — runs at PASSIVE_LEVEL.
+ *
+ * Iterates hash table buckets, removing and dereferencing stale transfers.
+ * Also trims old alerts if the alert queue is more than 75% full.
+ */
+static VOID
+DxpCleanupWorkRoutine(
+    _In_ PVOID Parameter
+    )
+{
+    PDX_DETECTOR detector = (PDX_DETECTOR)Parameter;
+    ULONG i;
+    PLIST_ENTRY entry;
+    PLIST_ENTRY nextEntry;
+    PDX_TRANSFER_CONTEXT transfer;
+    LARGE_INTEGER currentTime;
+    LONGLONG timeoutTicks;
+    LIST_ENTRY freeList;
+
+    if (detector == NULL || detector->ShuttingDown) {
+        InterlockedExchange(&detector->CleanupWorkQueued, 0);
+        return;
+    }
+
+    //
+    // Acquire rundown protection to prevent shutdown during cleanup
+    //
+    if (!ExAcquireRundownProtection(&detector->RundownRef)) {
+        InterlockedExchange(&detector->CleanupWorkQueued, 0);
+        return;
+    }
+
     KeQuerySystemTime(&currentTime);
-    timeout.QuadPart = (LONGLONG)DX_TRANSFER_TIMEOUT_MS * 10000;
+    timeoutTicks = (LONGLONG)DX_TRANSFER_TIMEOUT_MS * 10000;
 
     InitializeListHead(&freeList);
 
     //
-    // Collect stale transfers
+    // Iterate each hash bucket
     //
-    KeAcquireSpinLock(&detector->Public.TransferLock, &oldIrql);
+    for (i = 0; i < DX_TRANSFER_HASH_BUCKETS; i++) {
+        DxpAcquirePushLockExclusive(&detector->TransferBuckets[i].Lock);
 
-    for (entry = detector->Public.TransferList.Flink;
-         entry != &detector->Public.TransferList;
-         entry = nextEntry) {
+        for (entry = detector->TransferBuckets[i].Head.Flink;
+             entry != &detector->TransferBuckets[i].Head;
+             entry = nextEntry) {
 
-        nextEntry = entry->Flink;
-        transfer = CONTAINING_RECORD(entry, DX_TRANSFER_CONTEXT, ListEntry);
+            nextEntry = entry->Flink;
+            transfer = CONTAINING_RECORD(entry, DX_TRANSFER_CONTEXT, HashEntry);
 
-        //
-        // Check if transfer has timed out
-        //
-        if ((currentTime.QuadPart - transfer->LastActivityTime.QuadPart) > timeout.QuadPart) {
-            RemoveEntryList(&transfer->ListEntry);
-            InterlockedDecrement(&detector->Public.TransferCount);
-            InsertTailList(&freeList, &transfer->ListEntry);
+            if ((currentTime.QuadPart - transfer->LastActivityTime.QuadPart) > timeoutTicks) {
+                RemoveEntryList(&transfer->HashEntry);
+                InterlockedDecrement(&detector->TransferCount);
+                InsertTailList(&freeList, &transfer->HashEntry);
+            }
         }
+
+        DxpReleasePushLockExclusive(&detector->TransferBuckets[i].Lock);
     }
 
-    KeReleaseSpinLock(&detector->Public.TransferLock, oldIrql);
-
     //
-    // Free collected transfers
+    // Dereference collected transfers (hash table's ref)
     //
     while (!IsListEmpty(&freeList)) {
         entry = RemoveHeadList(&freeList);
-        transfer = CONTAINING_RECORD(entry, DX_TRANSFER_CONTEXT, ListEntry);
-
-        if (detector->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&detector->TransferLookaside, transfer);
-        } else {
-            ExFreePoolWithTag(transfer, DX_POOL_TAG_CONTEXT);
-        }
+        transfer = CONTAINING_RECORD(entry, DX_TRANSFER_CONTEXT, HashEntry);
+        DxpDereferenceTransfer(detector, transfer);
     }
 
     //
-    // Also trim old alerts if needed
+    // Trim old alerts if queue is more than 75% full
     //
-    if (detector->Public.AlertCount > (LONG)(DX_MAX_ALERTS * 3 / 4)) {
-        KeAcquireSpinLock(&detector->Public.AlertLock, &oldIrql);
+    if (detector->AlertCount > (LONG)(DX_MAX_ALERTS * 3 / 4)) {
+        DxpAcquirePushLockExclusive(&detector->AlertLock);
 
-        while (detector->Public.AlertCount > (LONG)(DX_MAX_ALERTS / 2) &&
-               !IsListEmpty(&detector->Public.AlertList)) {
+        while (detector->AlertCount > (LONG)(DX_MAX_ALERTS / 2) &&
+               !IsListEmpty(&detector->AlertList)) {
 
-            entry = RemoveHeadList(&detector->Public.AlertList);
-            InterlockedDecrement(&detector->Public.AlertCount);
+            entry = RemoveHeadList(&detector->AlertList);
+            InterlockedDecrement(&detector->AlertCount);
 
             PDX_ALERT alert = CONTAINING_RECORD(entry, DX_ALERT, ListEntry);
-
-            if (alert->ProcessName.Buffer != NULL) {
-                ExFreePoolWithTag(alert->ProcessName.Buffer, DX_POOL_TAG_ALERT);
-            }
-            if (alert->UserName.Buffer != NULL) {
-                ExFreePoolWithTag(alert->UserName.Buffer, DX_POOL_TAG_ALERT);
-            }
-
-            if (detector->LookasideInitialized) {
-                ExFreeToNPagedLookasideList(&detector->AlertLookaside, alert);
-            } else {
-                ExFreePoolWithTag(alert, DX_POOL_TAG_ALERT);
-            }
+            ExFreePoolWithTag(alert, DX_POOL_TAG_ALERT);
         }
 
-        KeReleaseSpinLock(&detector->Public.AlertLock, oldIrql);
+        DxpReleasePushLockExclusive(&detector->AlertLock);
     }
+
+    ExReleaseRundownProtection(&detector->RundownRef);
+    InterlockedExchange(&detector->CleanupWorkQueued, 0);
 }

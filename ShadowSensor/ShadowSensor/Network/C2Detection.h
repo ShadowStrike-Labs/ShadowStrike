@@ -1,16 +1,23 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: C2Detection.h
-    
+
     Purpose: Command and Control (C2) communication detection
              through traffic analysis and beaconing detection.
-             
+
     Architecture:
     - Beaconing interval analysis
     - JA3/JA3S fingerprinting
     - Known C2 infrastructure detection
     - Protocol anomaly detection
-    
+
+    Synchronization model:
+    - All public APIs require IRQL <= APC_LEVEL.
+    - EX_PUSH_LOCK used for all list/hash protection.
+    - EX_RUNDOWN_REF used for safe shutdown draining.
+    - Periodic analysis runs at PASSIVE_LEVEL via work item.
+    - No spin locks — beacon samples protected by push locks.
+
     Copyright (c) ShadowStrike Team
 --*/
 
@@ -21,15 +28,18 @@ extern "C" {
 #endif
 
 #include <ntddk.h>
+#include "ConnectionTracker.h"
 #include "../../Shared/NetworkTypes.h"
 
 //=============================================================================
 // Pool Tags
 //=============================================================================
 
-#define C2_POOL_TAG_CONTEXT     'XC2C'  // C2 Detection - Context
-#define C2_POOL_TAG_BEACON      'BC2C'  // C2 Detection - Beacon
-#define C2_POOL_TAG_IOC         'IC2C'  // C2 Detection - IOC
+#define C2_POOL_TAG_CONTEXT     'XC2C'
+#define C2_POOL_TAG_BEACON      'BC2C'
+#define C2_POOL_TAG_IOC         'IC2C'
+#define C2_POOL_TAG_RESULT      'RC2C'
+#define C2_POOL_TAG_WORK        'WC2C'
 
 //=============================================================================
 // Configuration Constants
@@ -37,10 +47,12 @@ extern "C" {
 
 #define C2_MAX_BEACON_SAMPLES           1024
 #define C2_MIN_BEACON_SAMPLES           10
-#define C2_BEACON_JITTER_THRESHOLD      20      // Percent
+#define C2_BEACON_JITTER_THRESHOLD      20
 #define C2_MAX_TRACKED_DESTINATIONS     16384
-#define C2_ANALYSIS_WINDOW_MS           300000  // 5 minutes
+#define C2_MAX_TRACKED_PROCESSES        4096
+#define C2_ANALYSIS_WINDOW_MS           300000
 #define C2_JA3_HASH_SIZE                32
+#define C2_MAX_PROCESS_NAME             260
 
 //=============================================================================
 // C2 Types
@@ -60,7 +72,7 @@ typedef enum _C2_TYPE {
 } C2_TYPE;
 
 //=============================================================================
-// C2 Indicators
+// C2 Indicators (bitmask — use InterlockedOr for concurrent updates)
 //=============================================================================
 
 typedef enum _C2_INDICATORS {
@@ -98,39 +110,26 @@ typedef struct _C2_BEACON_SAMPLE {
 //=============================================================================
 
 typedef struct _C2_BEACON_ANALYSIS {
-    //
-    // Sample data
-    //
     ULONG SampleCount;
     ULONG64 FirstSampleTime;
     ULONG64 LastSampleTime;
-    
-    //
-    // Interval analysis
-    //
+
     ULONG MeanIntervalMs;
     ULONG MedianIntervalMs;
     ULONG MinIntervalMs;
     ULONG MaxIntervalMs;
     ULONG StdDeviation;
-    ULONG JitterPercent;                // (StdDev / Mean) * 100
-    
-    //
-    // Size analysis
-    //
+    ULONG JitterPercent;
+
     ULONG MeanDataSize;
     ULONG MinDataSize;
     ULONG MaxDataSize;
     BOOLEAN ConsistentSize;
-    
-    //
-    // Pattern detection
-    //
+
     BOOLEAN RegularBeaconDetected;
     BOOLEAN JitteredBeaconDetected;
-    ULONG DetectedInterval;             // Best-guess interval
-    ULONG ConfidenceScore;              // 0-100
-    
+    ULONG DetectedInterval;
+    ULONG ConfidenceScore;
 } C2_BEACON_ANALYSIS, *PC2_BEACON_ANALYSIS;
 
 //=============================================================================
@@ -138,19 +137,27 @@ typedef struct _C2_BEACON_ANALYSIS {
 //=============================================================================
 
 typedef struct _C2_JA3_FINGERPRINT {
-    CHAR JA3String[512];                // Full JA3 string
-    UCHAR JA3Hash[16];                  // MD5 hash
-    CHAR JA3SString[512];               // Full JA3S string
-    UCHAR JA3SHash[16];                 // MD5 hash
+    CHAR JA3String[512];
+    UCHAR JA3Hash[16];
+    CHAR JA3SString[512];
+    UCHAR JA3SHash[16];
     BOOLEAN IsKnownMalicious;
-    CHAR MalwareFamily[64];             // If known
+    CHAR MalwareFamily[64];
 } C2_JA3_FINGERPRINT, *PC2_JA3_FINGERPRINT;
 
 //=============================================================================
 // Destination Context
+//
+// Reference counted. All lookups return a referenced pointer.
+// Callers must call C2pDereferenceDestination when done.
 //=============================================================================
 
 typedef struct _C2_DESTINATION {
+    //
+    // Reference counting — must be first for clarity
+    //
+    volatile LONG RefCount;
+
     //
     // Destination identification
     //
@@ -162,48 +169,47 @@ typedef struct _C2_DESTINATION {
     USHORT Port;
     CHAR Hostname[256];
     ULONG DestinationHash;
-    
+
     //
-    // Connection tracking
+    // Connection tracking (all interlocked)
     //
     volatile LONG ConnectionCount;
     volatile LONG ActiveConnections;
     LARGE_INTEGER FirstSeen;
     LARGE_INTEGER LastSeen;
-    
+
     //
-    // Beacon samples
+    // Beacon samples — protected by SampleLock (push lock, <= APC_LEVEL)
     //
     LIST_ENTRY BeaconSamples;
-    KSPIN_LOCK SampleLock;
+    EX_PUSH_LOCK SampleLock;
     volatile LONG SampleCount;
-    
+
     //
-    // Analysis results
+    // Analysis results — written only under DestinationLock exclusive
     //
     C2_BEACON_ANALYSIS BeaconAnalysis;
     C2_JA3_FINGERPRINT JA3Fingerprint;
-    
+
     //
-    // C2 detection
+    // C2 detection — Indicators updated via InterlockedOr
     //
     C2_TYPE DetectedType;
-    C2_INDICATORS Indicators;
+    volatile LONG Indicators;
     ULONG SuspicionScore;
     BOOLEAN IsConfirmedC2;
-    
+
     //
-    // Associated processes
+    // Associated processes — protected by DestinationLock
     //
     HANDLE AssociatedProcesses[16];
     ULONG ProcessCount;
-    
+
     //
     // List linkage
     //
     LIST_ENTRY ListEntry;
     LIST_ENTRY HashEntry;
-    
 } C2_DESTINATION, *PC2_DESTINATION;
 
 //=============================================================================
@@ -211,52 +217,38 @@ typedef struct _C2_DESTINATION {
 //=============================================================================
 
 typedef struct _C2_PROCESS_CONTEXT {
-    //
-    // Process identification
-    //
     HANDLE ProcessId;
-    UNICODE_STRING ProcessName;
-    
-    //
-    // Tracked destinations
-    //
+    WCHAR ProcessName[C2_MAX_PROCESS_NAME];
+
     LIST_ENTRY DestinationList;
-    KSPIN_LOCK DestinationLock;
+    EX_PUSH_LOCK DestinationLock;
     volatile LONG DestinationCount;
-    
-    //
-    // C2 suspicion
-    //
+
     ULONG HighestSuspicionScore;
     C2_TYPE SuspectedC2Type;
     BOOLEAN HasConfirmedC2;
-    
-    //
-    // Reference counting
-    //
+
     volatile LONG RefCount;
-    
-    //
-    // List linkage
-    //
+
     LIST_ENTRY ListEntry;
-    
 } C2_PROCESS_CONTEXT, *PC2_PROCESS_CONTEXT;
 
 //=============================================================================
 // IOC Entry
 //=============================================================================
 
+typedef enum _C2_IOC_TYPE {
+    IOCType_IP,
+    IOCType_Domain,
+    IOCType_JA3,
+    IOCType_JA3S,
+    IOCType_UserAgent,
+    IOCType_URL
+} C2_IOC_TYPE;
+
 typedef struct _C2_IOC {
-    enum {
-        IOCType_IP,
-        IOCType_Domain,
-        IOCType_JA3,
-        IOCType_JA3S,
-        IOCType_UserAgent,
-        IOCType_URL
-    } Type;
-    
+    C2_IOC_TYPE Type;
+
     union {
         struct {
             IN_ADDR Address;
@@ -268,131 +260,125 @@ typedef struct _C2_IOC {
         CHAR UserAgent[256];
         CHAR URL[512];
     } Value;
-    
+
     CHAR MalwareFamily[64];
     CHAR ThreatActor[64];
     LARGE_INTEGER AddedTime;
     LARGE_INTEGER ExpirationTime;
-    
+
+    volatile LONG RefCount;
     LIST_ENTRY ListEntry;
     LIST_ENTRY HashEntry;
-    
 } C2_IOC, *PC2_IOC;
 
 //=============================================================================
 // C2 Detection Result
+//
+// Self-contained value type. No pointers to internal structures.
+// Allocated with ExAllocatePool2, freed with ExFreePoolWithTag.
 //=============================================================================
 
 typedef struct _C2_DETECTION_RESULT {
-    //
-    // Detection summary
-    //
     BOOLEAN C2Detected;
     C2_TYPE Type;
     C2_INDICATORS Indicators;
     ULONG ConfidenceScore;
     ULONG SeverityScore;
-    
-    //
-    // Source process
-    //
+
     HANDLE ProcessId;
-    UNICODE_STRING ProcessName;
-    
+    WCHAR ProcessName[C2_MAX_PROCESS_NAME];
+
     //
-    // Destination
+    // Destination snapshot (copied, not referenced)
     //
-    PC2_DESTINATION Destination;
-    
-    //
-    // Beacon analysis
-    //
+    struct {
+        union {
+            IN_ADDR IPv4;
+            IN6_ADDR IPv6;
+        } Address;
+        BOOLEAN IsIPv6;
+        USHORT Port;
+        CHAR Hostname[256];
+    } Destination;
+
     C2_BEACON_ANALYSIS BeaconAnalysis;
-    
+
     //
-    // IOC matches
+    // IOC match (copied, not referenced)
     //
     struct {
         BOOLEAN Matched;
-        PC2_IOC IOC;
+        C2_IOC_TYPE Type;
+        CHAR MalwareFamily[64];
+        CHAR ThreatActor[64];
     } IOCMatch;
-    
-    //
-    // JA3 analysis
-    //
+
     C2_JA3_FINGERPRINT JA3;
-    
-    //
-    // Threat intelligence
-    //
+
     CHAR MalwareFamily[64];
     CHAR ThreatActor[64];
     CHAR CampaignId[64];
-    
-    //
-    // Timing
-    //
+
     LARGE_INTEGER DetectionTime;
-    
 } C2_DETECTION_RESULT, *PC2_DETECTION_RESULT;
 
 //=============================================================================
-// C2 Detector
+// C2 Detector (opaque to callers — internal layout in .c)
 //=============================================================================
 
 typedef struct _C2_DETECTOR {
     //
-    // Initialization state
+    // Shutdown synchronization — rundown reference
     //
-    BOOLEAN Initialized;
-    
+    EX_RUNDOWN_REF RundownRef;
+    volatile LONG Initialized;
+
     //
-    // Destination tracking
+    // Destination tracking — single push lock protects list + hash
     //
     LIST_ENTRY DestinationList;
-    EX_PUSH_LOCK DestinationListLock;
+    EX_PUSH_LOCK DestinationLock;
     volatile LONG DestinationCount;
-    
-    //
-    // Destination hash
-    //
+
     struct {
         LIST_ENTRY* Buckets;
         ULONG BucketCount;
-        EX_PUSH_LOCK Lock;
     } DestinationHash;
-    
+
     //
     // Process contexts
     //
     LIST_ENTRY ProcessList;
     EX_PUSH_LOCK ProcessListLock;
     volatile LONG ProcessCount;
-    
+
     //
     // IOC database
     //
     LIST_ENTRY IOCList;
     EX_PUSH_LOCK IOCLock;
     volatile LONG IOCCount;
-    struct {
-        LIST_ENTRY* Buckets;
-        ULONG BucketCount;
-    } IOCHash;
-    
+
     //
     // Known JA3 fingerprints
     //
     LIST_ENTRY KnownJA3List;
     EX_PUSH_LOCK JA3Lock;
-    
+    volatile LONG KnownJA3Count;
+
     //
-    // Analysis timer
+    // Analysis timer — DPC queues a work item at PASSIVE_LEVEL
     //
     KTIMER AnalysisTimer;
     KDPC AnalysisDpc;
     ULONG AnalysisIntervalMs;
-    
+
+    //
+    // Cleanup event — signaled when cleanup work item completes
+    //
+    KEVENT CleanupCompleteEvent;
+    volatile LONG CleanupInProgress;
+
     //
     // Statistics
     //
@@ -403,7 +389,7 @@ typedef struct _C2_DETECTOR {
         volatile LONG64 IOCMatches;
         LARGE_INTEGER StartTime;
     } Stats;
-    
+
     //
     // Configuration
     //
@@ -414,7 +400,6 @@ typedef struct _C2_DETECTOR {
         BOOLEAN EnableJA3Analysis;
         BOOLEAN EnableBeaconDetection;
     } Config;
-    
 } C2_DETECTOR, *PC2_DETECTOR;
 
 //=============================================================================
@@ -432,6 +417,7 @@ typedef VOID (*C2_DETECTION_CALLBACK)(
 
 NTSTATUS
 C2Initialize(
+    _In_ PDEVICE_OBJECT DeviceObject,
     _Out_ PC2_DETECTOR* Detector
     );
 
@@ -521,12 +507,6 @@ C2RemoveIOC(
     _In_ PC2_IOC IOC
     );
 
-NTSTATUS
-C2LoadIOCFile(
-    _In_ PC2_DETECTOR Detector,
-    _In_ PUNICODE_STRING FilePath
-    );
-
 //=============================================================================
 // Public API - JA3 Database
 //=============================================================================
@@ -579,6 +559,7 @@ C2FreeResult(
 
 typedef struct _C2_STATISTICS {
     ULONG TrackedDestinations;
+    ULONG TrackedProcesses;
     ULONG64 ConnectionsAnalyzed;
     ULONG64 BeaconsDetected;
     ULONG64 C2Detected;

@@ -24,17 +24,15 @@
  * - T1572: Protocol Tunneling
  * - T1090: Proxy (Domain Fronting)
  *
- * Supported C2 Framework Detection:
- * - Cobalt Strike (Beacon)
- * - Metasploit (Meterpreter)
- * - Empire/Covenant
- * - PoshC2
- * - Sliver
- * - Brute Ratel
- * - Custom/Unknown C2
+ * Synchronization model:
+ * - All public APIs acquire EX_RUNDOWN_REF for safe shutdown.
+ * - All locks are EX_PUSH_LOCK (IRQL <= APC_LEVEL).
+ * - No spin locks anywhere. Beacon samples use per-destination push lock.
+ * - Timer DPC queues a system work item for PASSIVE_LEVEL analysis.
+ * - Destinations and IOCs are reference-counted.
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -43,6 +41,7 @@
 #include "ConnectionTracker.h"
 #include "../Core/Globals.h"
 #include "../../Shared/NetworkTypes.h"
+#include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, C2Initialize)
@@ -53,21 +52,20 @@
 // PRIVATE CONSTANTS
 // ============================================================================
 
-#define C2_VERSION                          0x0200
+#define C2_VERSION                          0x0300
 #define C2_HASH_BUCKET_COUNT                1024
-#define C2_IOC_HASH_BUCKET_COUNT            4096
 #define C2_MAX_CALLBACKS                    8
-#define C2_CLEANUP_INTERVAL_MS              60000
+#define C2_CLEANUP_STALE_AGE_MS             600000
 #define C2_ANALYSIS_TIMER_INTERVAL_MS       5000
 
 //
 // Beacon detection thresholds
 //
 #define C2_MIN_SAMPLES_FOR_ANALYSIS         5
-#define C2_PERFECT_BEACON_JITTER            5       // 5% or less
-#define C2_TYPICAL_BEACON_JITTER            25      // 25% or less
-#define C2_SUSPICIOUS_INTERVAL_MIN_MS       1000    // 1 second
-#define C2_SUSPICIOUS_INTERVAL_MAX_MS       3600000 // 1 hour
+#define C2_PERFECT_BEACON_JITTER            5
+#define C2_TYPICAL_BEACON_JITTER            25
+#define C2_SUSPICIOUS_INTERVAL_MIN_MS       1000
+#define C2_SUSPICIOUS_INTERVAL_MAX_MS       3600000
 
 //
 // Scoring thresholds
@@ -95,49 +93,33 @@
 // Known C2 ports
 //
 static const USHORT g_SuspiciousC2Ports[] = {
-    4444,   // Metasploit default
-    5555,   // Common backdoor
-    6666,   // Common backdoor
-    8080,   // HTTP alt (often abused)
-    8443,   // HTTPS alt
-    9001,   // Tor
-    9050,   // Tor SOCKS
-    31337,  // Elite/Back Orifice
-    12345,  // NetBus
-    54321,  // Common backdoor
+    4444, 5555, 6666, 8080, 8443,
+    9001, 9050, 31337, 12345, 54321,
 };
 
 //
-// Known malicious JA3 fingerprints (Cobalt Strike, Metasploit, etc.)
+// Known malicious JA3 fingerprints
 //
-typedef struct _C2_KNOWN_JA3 {
+typedef struct _C2_KNOWN_JA3_ENTRY {
     UCHAR Hash[16];
     CHAR Framework[32];
-    CHAR Description[64];
-} C2_KNOWN_JA3, *PC2_KNOWN_JA3;
+} C2_KNOWN_JA3_ENTRY;
 
-static const C2_KNOWN_JA3 g_KnownMaliciousJA3[] = {
-    // Cobalt Strike default
+static const C2_KNOWN_JA3_ENTRY g_KnownMaliciousJA3[] = {
     { { 0x72, 0xa5, 0x89, 0xda, 0x58, 0x6c, 0x44, 0x6d, 0xab, 0x21, 0x8e, 0x59, 0x55, 0xc3, 0x0c, 0x86 },
-      "CobaltStrike", "Default Beacon JA3" },
-    // Cobalt Strike 4.x
+      "CobaltStrike" },
     { { 0x6e, 0x37, 0x9c, 0x0c, 0x0a, 0x8e, 0x4e, 0x80, 0x58, 0x9c, 0x7f, 0xa5, 0x93, 0x3c, 0x65, 0x32 },
-      "CobaltStrike", "Beacon 4.x JA3" },
-    // Metasploit Meterpreter
+      "CobaltStrike" },
     { { 0x3b, 0x5f, 0xc0, 0x67, 0xce, 0xb2, 0xd2, 0x42, 0x28, 0x6f, 0x19, 0x6e, 0xdc, 0x44, 0x5a, 0x4e },
-      "Metasploit", "Meterpreter HTTPS" },
-    // Empire
+      "Metasploit" },
     { { 0x29, 0xd9, 0x11, 0xb8, 0x15, 0xeb, 0x59, 0x0c, 0x45, 0xe7, 0xf8, 0x5d, 0x87, 0xa1, 0x9c, 0x0a },
-      "Empire", "PowerShell Empire" },
-    // PoshC2
+      "Empire" },
     { { 0x51, 0xc6, 0x4a, 0xc4, 0x82, 0x16, 0x89, 0xaf, 0xe6, 0x5e, 0x1d, 0x68, 0xd4, 0xb8, 0x34, 0x0d },
-      "PoshC2", "PoshC2 Implant" },
-    // Sliver
+      "PoshC2" },
     { { 0x44, 0x8f, 0x1c, 0x2b, 0xa7, 0x89, 0x3c, 0x4d, 0x9e, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d, 0x6e, 0x7f },
-      "Sliver", "Sliver C2 Implant" },
-    // Brute Ratel
+      "Sliver" },
     { { 0x33, 0x92, 0xde, 0x23, 0x8a, 0x17, 0x4e, 0xc1, 0xc8, 0x6a, 0x9e, 0x51, 0x2b, 0x74, 0xf9, 0x80 },
-      "BruteRatel", "Brute Ratel C4" },
+      "BruteRatel" },
 };
 
 // ============================================================================
@@ -148,190 +130,147 @@ typedef struct _C2_CALLBACK_ENTRY {
     C2_DETECTION_CALLBACK Callback;
     PVOID Context;
     BOOLEAN InUse;
-    UINT8 Reserved[7];
 } C2_CALLBACK_ENTRY, *PC2_CALLBACK_ENTRY;
 
 // ============================================================================
-// PRIVATE STRUCTURES
+// INTERNAL DETECTOR STATE
 // ============================================================================
 
-/**
- * @brief Internal detector state.
- */
 typedef struct _C2_DETECTOR_INTERNAL {
     C2_DETECTOR Public;
 
-    //
-    // Callbacks
-    //
     C2_CALLBACK_ENTRY Callbacks[C2_MAX_CALLBACKS];
     EX_PUSH_LOCK CallbackLock;
 
-    //
-    // Lookaside lists
-    //
     NPAGED_LOOKASIDE_LIST DestinationLookaside;
     NPAGED_LOOKASIDE_LIST SampleLookaside;
     NPAGED_LOOKASIDE_LIST IOCLookaside;
-    NPAGED_LOOKASIDE_LIST ResultLookaside;
     BOOLEAN LookasideInitialized;
-    UINT8 Reserved[7];
 
-    //
-    // Cleanup work item
-    //
-    PIO_WORKITEM CleanupWorkItem;
-    volatile LONG CleanupInProgress;
+    PIO_WORKITEM AnalysisWorkItem;
+    volatile LONG AnalysisWorkItemQueued;
 
+    PDEVICE_OBJECT DeviceObject;
 } C2_DETECTOR_INTERNAL, *PC2_DETECTOR_INTERNAL;
 
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
 
-static VOID
-C2pAnalysisTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    );
+static VOID C2pAnalysisTimerDpc(
+    _In_ PKDPC Dpc, _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID Arg1, _In_opt_ PVOID Arg2);
 
-static VOID
-C2pCleanupWorkItem(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
-    );
+static VOID C2pAnalysisWorkItemRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Context);
 
-static NTSTATUS
-C2pInitializeHashTable(
-    _Out_ LIST_ENTRY** Buckets,
-    _In_ ULONG BucketCount
-    );
+static VOID C2pCleanupStaleEntries(
+    _In_ PC2_DETECTOR_INTERNAL Detector);
 
-static VOID
-C2pFreeHashTable(
-    _Inout_ LIST_ENTRY** Buckets,
-    _In_ ULONG BucketCount
-    );
+static NTSTATUS C2pInitializeHashTable(
+    _Out_ LIST_ENTRY** Buckets, _In_ ULONG BucketCount);
 
-static ULONG
-C2pHashAddress(
-    _In_ PVOID Address,
-    _In_ USHORT Port,
-    _In_ BOOLEAN IsIPv6
-    );
+static VOID C2pFreeHashTable(
+    _Inout_ LIST_ENTRY** Buckets);
 
-static ULONG
-C2pHashString(
-    _In_ PCSTR String,
-    _In_ ULONG Length
-    );
+static ULONG C2pHashAddress(
+    _In_ PVOID Address, _In_ USHORT Port, _In_ BOOLEAN IsIPv6);
 
-static PC2_DESTINATION
-C2pFindDestination(
+//
+// Destination management — all require DestinationLock held by caller
+//
+static PC2_DESTINATION C2pFindDestinationLocked(
     _In_ PC2_DETECTOR Detector,
-    _In_ PVOID Address,
-    _In_ USHORT Port,
-    _In_ BOOLEAN IsIPv6
-    );
+    _In_ PVOID Address, _In_ USHORT Port, _In_ BOOLEAN IsIPv6);
 
-static PC2_DESTINATION
-C2pCreateDestination(
+static PC2_DESTINATION C2pFindOrCreateDestination(
     _In_ PC2_DETECTOR_INTERNAL Detector,
-    _In_ PVOID Address,
-    _In_ USHORT Port,
-    _In_ BOOLEAN IsIPv6,
-    _In_opt_ PCSTR Hostname
-    );
+    _In_ PVOID Address, _In_ USHORT Port, _In_ BOOLEAN IsIPv6,
+    _In_opt_ PCSTR Hostname);
 
-static VOID
-C2pFreeDestination(
+static VOID C2pReferenceDestination(
+    _Inout_ PC2_DESTINATION Destination);
+
+static VOID C2pDereferenceDestination(
     _In_ PC2_DETECTOR_INTERNAL Detector,
-    _Inout_ PC2_DESTINATION Destination
-    );
+    _Inout_ PC2_DESTINATION Destination);
 
-static VOID
-C2pAddBeaconSample(
+static VOID C2pFreeDestinationUnsafe(
+    _In_ PC2_DETECTOR_INTERNAL Detector,
+    _Inout_ PC2_DESTINATION Destination);
+
+static VOID C2pFreeBeaconSamples(
+    _In_ PC2_DETECTOR_INTERNAL Detector,
+    _Inout_ PC2_DESTINATION Destination);
+
+static VOID C2pAddBeaconSample(
     _In_ PC2_DETECTOR_INTERNAL Detector,
     _Inout_ PC2_DESTINATION Destination,
-    _In_ ULONG DataSize,
-    _In_ CT_DIRECTION Direction
-    );
+    _In_ ULONG DataSize, _In_ CT_DIRECTION Direction);
 
-static VOID
-C2pAnalyzeBeaconing(
-    _Inout_ PC2_DESTINATION Destination
-    );
+//
+// Analysis — runs at PASSIVE_LEVEL
+//
+static VOID C2pAnalyzeBeaconing(
+    _Inout_ PC2_DESTINATION Destination,
+    _In_ PULONG IntervalBuffer, _In_ ULONG IntervalBufferCount);
 
-static VOID
-C2pCalculateIntervalStatistics(
-    _In_ PC2_DESTINATION Destination,
-    _Out_ PULONG MeanInterval,
-    _Out_ PULONG StdDeviation,
-    _Out_ PULONG MedianInterval
-    );
+static VOID C2pCalculateIntervalStats(
+    _Inout_ PULONG Intervals, _In_ ULONG Count,
+    _Out_ PULONG MeanInterval, _Out_ PULONG StdDeviation,
+    _Out_ PULONG MedianInterval);
 
-static BOOLEAN
-C2pCheckKnownJA3(
-    _In_ PC2_DETECTOR Detector,
-    _In_ PUCHAR JA3Hash,
-    _Out_writes_z_(FamilySize) PSTR MalwareFamily,
-    _In_ ULONG FamilySize
-    );
+static VOID C2pInsertionSort(
+    _Inout_ PULONG Array, _In_ ULONG Count);
 
-static BOOLEAN
-C2pIsSuspiciousPort(
-    _In_ USHORT Port
-    );
+static BOOLEAN C2pCheckKnownJA3(
+    _In_ PC2_DETECTOR Detector, _In_ PUCHAR JA3Hash,
+    _Out_writes_z_(FamilySize) PSTR MalwareFamily, _In_ ULONG FamilySize);
 
-static VOID
-C2pCalculateSuspicionScore(
-    _Inout_ PC2_DESTINATION Destination
-    );
+static BOOLEAN C2pIsSuspiciousPort(_In_ USHORT Port);
 
-static VOID
-C2pNotifyCallbacks(
+static VOID C2pCalculateSuspicionScore(
+    _Inout_ PC2_DESTINATION Destination);
+
+static VOID C2pNotifyCallbacks(
     _In_ PC2_DETECTOR_INTERNAL Detector,
-    _In_ PC2_DETECTION_RESULT Result
-    );
+    _In_ PC2_DETECTION_RESULT Result);
 
-static VOID
-C2pFreeBeaconSamples(
-    _In_ PC2_DETECTOR_INTERNAL Detector,
-    _Inout_ PC2_DESTINATION Destination
-    );
+//
+// Process context
+//
+static PC2_PROCESS_CONTEXT C2pFindOrCreateProcessContext(
+    _In_ PC2_DETECTOR Detector, _In_ HANDLE ProcessId);
 
-static PC2_PROCESS_CONTEXT
-C2pFindProcessContext(
-    _In_ PC2_DETECTOR Detector,
-    _In_ HANDLE ProcessId
-    );
+static VOID C2pFreeProcessContext(
+    _Inout_ PC2_PROCESS_CONTEXT Context);
 
-static PC2_PROCESS_CONTEXT
-C2pCreateProcessContext(
-    _In_ PC2_DETECTOR Detector,
-    _In_ HANDLE ProcessId
-    );
+//
+// Result helpers
+//
+static PC2_DETECTION_RESULT C2pAllocateResult(VOID);
 
-static VOID
-C2pFreeProcessContext(
-    _Inout_ PC2_PROCESS_CONTEXT Context
-    );
+static VOID C2pFillResultFromDestination(
+    _Out_ PC2_DETECTION_RESULT Result,
+    _In_ PC2_DESTINATION Destination);
 
-static ULONG
-C2pQuickSort(
-    _Inout_ PULONG Array,
-    _In_ ULONG Count
-    );
+//
+// Rundown helpers
+//
+#define C2_ACQUIRE_RUNDOWN(det) \
+    ExAcquireRundownProtection(&(det)->RundownRef)
+
+#define C2_RELEASE_RUNDOWN(det) \
+    ExReleaseRundownProtection(&(det)->RundownRef)
 
 // ============================================================================
-// PUBLIC API - INITIALIZATION
+// PUBLIC API — INITIALIZATION
 // ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
 C2Initialize(
+    _In_ PDEVICE_OBJECT DeviceObject,
     _Out_ PC2_DETECTOR* Detector
     )
 {
@@ -342,17 +281,14 @@ C2Initialize(
 
     PAGED_CODE();
 
-    if (Detector == NULL) {
+    if (DeviceObject == NULL || Detector == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Detector = NULL;
 
-    //
-    // Allocate detector structure
-    //
-    detector = (PC2_DETECTOR_INTERNAL)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    detector = (PC2_DETECTOR_INTERNAL)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(C2_DETECTOR_INTERNAL),
         C2_POOL_TAG_CONTEXT
     );
@@ -361,13 +297,14 @@ C2Initialize(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(detector, sizeof(C2_DETECTOR_INTERNAL));
+    //
+    // ExAllocatePool2 zeroes memory. Initialize non-zero fields.
+    //
 
-    //
-    // Initialize lists and locks
-    //
+    ExInitializeRundownProtection(&detector->Public.RundownRef);
+
     InitializeListHead(&detector->Public.DestinationList);
-    ExInitializePushLock(&detector->Public.DestinationListLock);
+    ExInitializePushLock(&detector->Public.DestinationLock);
 
     InitializeListHead(&detector->Public.ProcessList);
     ExInitializePushLock(&detector->Public.ProcessListLock);
@@ -380,6 +317,9 @@ C2Initialize(
 
     ExInitializePushLock(&detector->CallbackLock);
 
+    KeInitializeEvent(&detector->Public.CleanupCompleteEvent,
+                      NotificationEvent, TRUE);
+
     //
     // Initialize destination hash table
     //
@@ -387,81 +327,34 @@ C2Initialize(
         &detector->Public.DestinationHash.Buckets,
         C2_HASH_BUCKET_COUNT
     );
-
     if (!NT_SUCCESS(status)) {
         ExFreePoolWithTag(detector, C2_POOL_TAG_CONTEXT);
         return status;
     }
-
     detector->Public.DestinationHash.BucketCount = C2_HASH_BUCKET_COUNT;
-    ExInitializePushLock(&detector->Public.DestinationHash.Lock);
-
-    //
-    // Initialize IOC hash table
-    //
-    status = C2pInitializeHashTable(
-        &detector->Public.IOCHash.Buckets,
-        C2_IOC_HASH_BUCKET_COUNT
-    );
-
-    if (!NT_SUCCESS(status)) {
-        C2pFreeHashTable(
-            &detector->Public.DestinationHash.Buckets,
-            C2_HASH_BUCKET_COUNT
-        );
-        ExFreePoolWithTag(detector, C2_POOL_TAG_CONTEXT);
-        return status;
-    }
-
-    detector->Public.IOCHash.BucketCount = C2_IOC_HASH_BUCKET_COUNT;
 
     //
     // Initialize lookaside lists
     //
     ExInitializeNPagedLookasideList(
-        &detector->DestinationLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(C2_DESTINATION),
-        C2_POOL_TAG_CONTEXT,
-        0
-    );
+        &detector->DestinationLookaside, NULL, NULL,
+        POOL_NX_ALLOCATION, sizeof(C2_DESTINATION),
+        C2_POOL_TAG_CONTEXT, 0);
 
     ExInitializeNPagedLookasideList(
-        &detector->SampleLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(C2_BEACON_SAMPLE),
-        C2_POOL_TAG_BEACON,
-        0
-    );
+        &detector->SampleLookaside, NULL, NULL,
+        POOL_NX_ALLOCATION, sizeof(C2_BEACON_SAMPLE),
+        C2_POOL_TAG_BEACON, 0);
 
     ExInitializeNPagedLookasideList(
-        &detector->IOCLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(C2_IOC),
-        C2_POOL_TAG_IOC,
-        0
-    );
-
-    ExInitializeNPagedLookasideList(
-        &detector->ResultLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(C2_DETECTION_RESULT),
-        C2_POOL_TAG_CONTEXT,
-        0
-    );
+        &detector->IOCLookaside, NULL, NULL,
+        POOL_NX_ALLOCATION, sizeof(C2_IOC),
+        C2_POOL_TAG_IOC, 0);
 
     detector->LookasideInitialized = TRUE;
 
     //
-    // Initialize default configuration
+    // Default configuration
     //
     detector->Public.Config.MinBeaconSamples = C2_MIN_BEACON_SAMPLES;
     detector->Public.Config.BeaconJitterThreshold = C2_BEACON_JITTER_THRESHOLD;
@@ -470,36 +363,41 @@ C2Initialize(
     detector->Public.Config.EnableBeaconDetection = TRUE;
 
     //
-    // Initialize timer and DPC for periodic analysis
+    // Allocate work item for PASSIVE_LEVEL analysis.
+    // Must be done before starting the timer/DPC.
+    //
+    detector->DeviceObject = DeviceObject;
+    detector->AnalysisWorkItem = IoAllocateWorkItem(DeviceObject);
+    if (detector->AnalysisWorkItem == NULL) {
+        ExDeleteNPagedLookasideList(&detector->IOCLookaside);
+        ExDeleteNPagedLookasideList(&detector->SampleLookaside);
+        ExDeleteNPagedLookasideList(&detector->DestinationLookaside);
+        ExFreePoolWithTag(detector->Public.DestinationHash.Buckets, C2_POOL_TAG_CONTEXT);
+        ExFreePoolWithTag(detector, C2_POOL_TAG_CONTEXT);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
+    // Timer + DPC → work item architecture.
+    // DPC runs at DISPATCH_LEVEL but only queues a PASSIVE_LEVEL work item.
     //
     KeInitializeTimer(&detector->Public.AnalysisTimer);
-    KeInitializeDpc(
-        &detector->Public.AnalysisDpc,
-        C2pAnalysisTimerDpc,
-        detector
-    );
-
+    KeInitializeDpc(&detector->Public.AnalysisDpc,
+                    C2pAnalysisTimerDpc, detector);
     detector->Public.AnalysisIntervalMs = C2_ANALYSIS_TIMER_INTERVAL_MS;
 
-    //
-    // Start the analysis timer
-    //
     timerDue.QuadPart = -((LONGLONG)detector->Public.AnalysisIntervalMs * 10000);
-    KeSetTimerEx(
-        &detector->Public.AnalysisTimer,
-        timerDue,
-        detector->Public.AnalysisIntervalMs,
-        &detector->Public.AnalysisDpc
-    );
+    KeSetTimerEx(&detector->Public.AnalysisTimer, timerDue,
+                 detector->Public.AnalysisIntervalMs,
+                 &detector->Public.AnalysisDpc);
 
-    //
-    // Record start time
-    //
     KeQuerySystemTime(&detector->Public.Stats.StartTime);
 
     //
     // Load built-in JA3 fingerprints
     //
+    InterlockedExchange(&detector->Public.Initialized, TRUE);
+
     for (i = 0; i < ARRAYSIZE(g_KnownMaliciousJA3); i++) {
         C2AddKnownJA3(
             &detector->Public,
@@ -508,9 +406,7 @@ C2Initialize(
         );
     }
 
-    detector->Public.Initialized = TRUE;
     *Detector = &detector->Public;
-
     return STATUS_SUCCESS;
 }
 
@@ -528,38 +424,27 @@ C2Shutdown(
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL || !InterlockedExchange(&Detector->Initialized, FALSE)) {
         return;
     }
 
     detector = CONTAINING_RECORD(Detector, C2_DETECTOR_INTERNAL, Public);
 
     //
-    // Mark as shutting down
-    //
-    Detector->Initialized = FALSE;
-
-    //
-    // Cancel the analysis timer
+    // Cancel timer, flush DPCs, then wait for all in-flight rundown refs.
     //
     KeCancelTimer(&Detector->AnalysisTimer);
     KeFlushQueuedDpcs();
+    ExWaitForRundownProtectionRelease(&Detector->RundownRef);
 
     //
-    // Wait for cleanup to complete
+    // At this point no new operations can start and all in-flight ones
+    // have completed. We own the detector exclusively.
     //
-    while (detector->CleanupInProgress) {
-        LARGE_INTEGER delay;
-        delay.QuadPart = -10000; // 1ms
-        KeDelayExecutionThread(KernelMode, FALSE, &delay);
-    }
 
     //
-    // Free all destinations
+    // Free all destinations (no lock needed — exclusive ownership)
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Detector->DestinationListLock);
-
     while (!IsListEmpty(&Detector->DestinationList)) {
         entry = RemoveHeadList(&Detector->DestinationList);
         destination = CONTAINING_RECORD(entry, C2_DESTINATION, ListEntry);
@@ -567,51 +452,37 @@ C2Shutdown(
         ExFreeToNPagedLookasideList(&detector->DestinationLookaside, destination);
     }
 
-    ExReleasePushLockExclusive(&Detector->DestinationListLock);
-    KeLeaveCriticalRegion();
-
     //
     // Free all process contexts
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Detector->ProcessListLock);
-
     while (!IsListEmpty(&Detector->ProcessList)) {
         entry = RemoveHeadList(&Detector->ProcessList);
         processContext = CONTAINING_RECORD(entry, C2_PROCESS_CONTEXT, ListEntry);
         C2pFreeProcessContext(processContext);
     }
 
-    ExReleasePushLockExclusive(&Detector->ProcessListLock);
-    KeLeaveCriticalRegion();
-
     //
     // Free all IOCs
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Detector->IOCLock);
-
     while (!IsListEmpty(&Detector->IOCList)) {
         entry = RemoveHeadList(&Detector->IOCList);
         ioc = CONTAINING_RECORD(entry, C2_IOC, ListEntry);
         ExFreeToNPagedLookasideList(&detector->IOCLookaside, ioc);
     }
 
-    ExReleasePushLockExclusive(&Detector->IOCLock);
-    KeLeaveCriticalRegion();
+    //
+    // Free KnownJA3 list entries
+    //
+    while (!IsListEmpty(&Detector->KnownJA3List)) {
+        entry = RemoveHeadList(&Detector->KnownJA3List);
+        ioc = CONTAINING_RECORD(entry, C2_IOC, ListEntry);
+        ExFreeToNPagedLookasideList(&detector->IOCLookaside, ioc);
+    }
 
     //
-    // Free hash tables
+    // Free hash table
     //
-    C2pFreeHashTable(
-        &Detector->DestinationHash.Buckets,
-        Detector->DestinationHash.BucketCount
-    );
-
-    C2pFreeHashTable(
-        &Detector->IOCHash.Buckets,
-        Detector->IOCHash.BucketCount
-    );
+    C2pFreeHashTable(&Detector->DestinationHash.Buckets);
 
     //
     // Delete lookaside lists
@@ -620,17 +491,21 @@ C2Shutdown(
         ExDeleteNPagedLookasideList(&detector->DestinationLookaside);
         ExDeleteNPagedLookasideList(&detector->SampleLookaside);
         ExDeleteNPagedLookasideList(&detector->IOCLookaside);
-        ExDeleteNPagedLookasideList(&detector->ResultLookaside);
     }
 
     //
-    // Free detector
+    // Free work item if allocated
     //
+    if (detector->AnalysisWorkItem != NULL) {
+        IoFreeWorkItem(detector->AnalysisWorkItem);
+        detector->AnalysisWorkItem = NULL;
+    }
+
     ExFreePoolWithTag(detector, C2_POOL_TAG_CONTEXT);
 }
 
 // ============================================================================
-// PUBLIC API - TRAFFIC RECORDING
+// PUBLIC API — TRAFFIC RECORDING
 // ============================================================================
 
 _Use_decl_annotations_
@@ -646,51 +521,46 @@ C2RecordConnection(
 {
     PC2_DETECTOR_INTERNAL detector;
     PC2_DESTINATION destination;
-    PC2_PROCESS_CONTEXT processContext;
     ULONG i;
 
-    if (Detector == NULL || !Detector->Initialized || RemoteAddress == NULL) {
+    if (Detector == NULL || RemoteAddress == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return STATUS_DELETE_PENDING;
     }
 
     detector = CONTAINING_RECORD(Detector, C2_DETECTOR_INTERNAL, Public);
 
     //
-    // Find or create destination
+    // Atomic find-or-create under exclusive lock
     //
-    destination = C2pFindDestination(Detector, RemoteAddress, RemotePort, IsIPv6);
+    destination = C2pFindOrCreateDestination(
+        detector, RemoteAddress, RemotePort, IsIPv6, Hostname);
 
     if (destination == NULL) {
-        destination = C2pCreateDestination(
-            detector,
-            RemoteAddress,
-            RemotePort,
-            IsIPv6,
-            Hostname
-        );
-
-        if (destination == NULL) {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
+        C2_RELEASE_RUNDOWN(Detector);
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Update connection count
+    // destination is referenced — safe to use outside lock
     //
     InterlockedIncrement(&destination->ConnectionCount);
     InterlockedIncrement(&destination->ActiveConnections);
     KeQuerySystemTime(&destination->LastSeen);
 
-    //
-    // Check for suspicious port
-    //
     if (C2pIsSuspiciousPort(RemotePort)) {
-        destination->Indicators |= C2Indicator_AbnormalPort;
+        InterlockedOr(&destination->Indicators, C2Indicator_AbnormalPort);
     }
 
     //
-    // Track process association
+    // Track process association under destination lock
     //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Detector->DestinationLock);
+
     for (i = 0; i < ARRAYSIZE(destination->AssociatedProcesses); i++) {
         if (destination->AssociatedProcesses[i] == ProcessId) {
             break;
@@ -702,18 +572,17 @@ C2RecordConnection(
         }
     }
 
-    //
-    // Update process context
-    //
-    processContext = C2pFindProcessContext(Detector, ProcessId);
-    if (processContext == NULL) {
-        processContext = C2pCreateProcessContext(Detector, ProcessId);
-    }
+    ExReleasePushLockExclusive(&Detector->DestinationLock);
+    KeLeaveCriticalRegion();
 
     //
-    // Update statistics
+    // Ensure process context exists
     //
+    C2pFindOrCreateProcessContext(Detector, ProcessId);
+
+    C2pDereferenceDestination(detector, destination);
     InterlockedIncrement64(&Detector->Stats.ConnectionsAnalyzed);
+    C2_RELEASE_RUNDOWN(Detector);
 
     return STATUS_SUCCESS;
 }
@@ -735,43 +604,29 @@ C2RecordTraffic(
 
     UNREFERENCED_PARAMETER(ProcessId);
 
-    if (Detector == NULL || !Detector->Initialized || RemoteAddress == NULL) {
+    if (Detector == NULL || RemoteAddress == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return STATUS_DELETE_PENDING;
     }
 
     detector = CONTAINING_RECORD(Detector, C2_DETECTOR_INTERNAL, Public);
 
-    //
-    // Find destination
-    //
-    destination = C2pFindDestination(Detector, RemoteAddress, RemotePort, IsIPv6);
+    destination = C2pFindOrCreateDestination(
+        detector, RemoteAddress, RemotePort, IsIPv6, NULL);
 
     if (destination == NULL) {
-        //
-        // Create new destination if not found
-        //
-        destination = C2pCreateDestination(
-            detector,
-            RemoteAddress,
-            RemotePort,
-            IsIPv6,
-            NULL
-        );
-
-        if (destination == NULL) {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
+        C2_RELEASE_RUNDOWN(Detector);
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Add beacon sample
-    //
     C2pAddBeaconSample(detector, destination, DataSize, Direction);
-
-    //
-    // Update last seen
-    //
     KeQuerySystemTime(&destination->LastSeen);
+
+    C2pDereferenceDestination(detector, destination);
+    C2_RELEASE_RUNDOWN(Detector);
 
     return STATUS_SUCCESS;
 }
@@ -793,62 +648,53 @@ C2RecordTLSHandshake(
 
     UNREFERENCED_PARAMETER(ProcessId);
 
-    if (Detector == NULL || !Detector->Initialized ||
-        RemoteAddress == NULL || JA3 == NULL) {
+    if (Detector == NULL || RemoteAddress == NULL || JA3 == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return STATUS_DELETE_PENDING;
     }
 
     detector = CONTAINING_RECORD(Detector, C2_DETECTOR_INTERNAL, Public);
 
-    //
-    // Find or create destination
-    //
-    destination = C2pFindDestination(Detector, RemoteAddress, RemotePort, IsIPv6);
+    destination = C2pFindOrCreateDestination(
+        detector, RemoteAddress, RemotePort, IsIPv6, NULL);
 
     if (destination == NULL) {
-        destination = C2pCreateDestination(
-            detector,
-            RemoteAddress,
-            RemotePort,
-            IsIPv6,
-            NULL
-        );
-
-        if (destination == NULL) {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
+        C2_RELEASE_RUNDOWN(Detector);
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Store JA3 fingerprint
+    // Store JA3 under lock (struct copy is not atomic)
     //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Detector->DestinationLock);
+
     RtlCopyMemory(&destination->JA3Fingerprint, JA3, sizeof(C2_JA3_FINGERPRINT));
 
-    //
-    // Check against known malicious JA3
-    //
     if (Detector->Config.EnableJA3Analysis) {
         if (C2pCheckKnownJA3(Detector, JA3->JA3Hash, malwareFamily, sizeof(malwareFamily))) {
-            destination->Indicators |= C2Indicator_KnownJA3;
+            InterlockedOr(&destination->Indicators, C2Indicator_KnownJA3);
             destination->JA3Fingerprint.IsKnownMalicious = TRUE;
-            RtlCopyMemory(
-                destination->JA3Fingerprint.MalwareFamily,
-                malwareFamily,
-                sizeof(destination->JA3Fingerprint.MalwareFamily)
-            );
-
-            //
-            // Update suspicion score
-            //
-            destination->SuspicionScore += C2_SCORE_KNOWN_JA3;
+            RtlCopyMemory(destination->JA3Fingerprint.MalwareFamily,
+                          malwareFamily,
+                          sizeof(destination->JA3Fingerprint.MalwareFamily));
         }
     }
+
+    ExReleasePushLockExclusive(&Detector->DestinationLock);
+    KeLeaveCriticalRegion();
+
+    C2pDereferenceDestination(detector, destination);
+    C2_RELEASE_RUNDOWN(Detector);
 
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// PUBLIC API - DETECTION
+// PUBLIC API — DETECTION
 // ============================================================================
 
 _Use_decl_annotations_
@@ -864,88 +710,80 @@ C2AnalyzeDestination(
     PC2_DETECTOR_INTERNAL detector;
     PC2_DESTINATION destination;
     PC2_DETECTION_RESULT result;
+    PULONG intervalBuffer = NULL;
 
-    if (Detector == NULL || !Detector->Initialized ||
-        RemoteAddress == NULL || Result == NULL) {
+    if (Detector == NULL || RemoteAddress == NULL || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Result = NULL;
 
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return STATUS_DELETE_PENDING;
+    }
+
     detector = CONTAINING_RECORD(Detector, C2_DETECTOR_INTERNAL, Public);
 
     //
-    // Find destination
+    // Find destination under shared lock, take reference
     //
-    destination = C2pFindDestination(Detector, RemoteAddress, RemotePort, IsIPv6);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Detector->DestinationLock);
+
+    destination = C2pFindDestinationLocked(Detector, RemoteAddress, RemotePort, IsIPv6);
+    if (destination != NULL) {
+        C2pReferenceDestination(destination);
+    }
+
+    ExReleasePushLockShared(&Detector->DestinationLock);
+    KeLeaveCriticalRegion();
 
     if (destination == NULL) {
+        C2_RELEASE_RUNDOWN(Detector);
         return STATUS_NOT_FOUND;
     }
 
     //
-    // Perform beacon analysis
+    // Pool-allocate interval buffer to avoid stack overflow
     //
-    C2pAnalyzeBeaconing(destination);
+    intervalBuffer = (PULONG)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        C2_MAX_BEACON_SAMPLES * sizeof(ULONG),
+        C2_POOL_TAG_WORK);
 
-    //
-    // Calculate suspicion score
-    //
-    C2pCalculateSuspicionScore(destination);
+    if (intervalBuffer != NULL) {
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&Detector->DestinationLock);
 
-    //
-    // Allocate result
-    //
-    result = (PC2_DETECTION_RESULT)ExAllocateFromNPagedLookasideList(
-        &detector->ResultLookaside
-    );
+        C2pAnalyzeBeaconing(destination, intervalBuffer, C2_MAX_BEACON_SAMPLES);
+        C2pCalculateSuspicionScore(destination);
 
+        ExReleasePushLockExclusive(&Detector->DestinationLock);
+        KeLeaveCriticalRegion();
+
+        ExFreePoolWithTag(intervalBuffer, C2_POOL_TAG_WORK);
+    }
+
+    result = C2pAllocateResult();
     if (result == NULL) {
+        C2pDereferenceDestination(detector, destination);
+        C2_RELEASE_RUNDOWN(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(result, sizeof(C2_DETECTION_RESULT));
+    C2pFillResultFromDestination(result, destination);
 
-    //
-    // Fill result
-    //
-    result->C2Detected = (destination->SuspicionScore >= C2_ALERT_THRESHOLD);
-    result->Type = destination->DetectedType;
-    result->Indicators = destination->Indicators;
-    result->ConfidenceScore = min(destination->SuspicionScore, 100);
-    result->SeverityScore = destination->SuspicionScore;
-    result->Destination = destination;
-
-    //
-    // Copy beacon analysis
-    //
-    RtlCopyMemory(
-        &result->BeaconAnalysis,
-        &destination->BeaconAnalysis,
-        sizeof(C2_BEACON_ANALYSIS)
-    );
-
-    //
-    // Copy JA3 if available
-    //
-    RtlCopyMemory(
-        &result->JA3,
-        &destination->JA3Fingerprint,
-        sizeof(C2_JA3_FINGERPRINT)
-    );
-
-    KeQuerySystemTime(&result->DetectionTime);
-
-    //
-    // Update statistics
-    //
     if (result->C2Detected) {
         InterlockedIncrement64(&Detector->Stats.C2Detected);
-        destination->IsConfirmedC2 = (destination->SuspicionScore >= C2_CONFIRMED_THRESHOLD);
+        if (destination->SuspicionScore >= C2_CONFIRMED_THRESHOLD) {
+            destination->IsConfirmedC2 = TRUE;
+        }
     }
 
-    *Result = result;
+    C2pDereferenceDestination(detector, destination);
+    C2_RELEASE_RUNDOWN(Detector);
 
+    *Result = result;
     return STATUS_SUCCESS;
 }
 
@@ -957,53 +795,69 @@ C2AnalyzeProcess(
     _Out_ PC2_DETECTION_RESULT* Result
     )
 {
-    PC2_DETECTOR_INTERNAL detector;
     PC2_PROCESS_CONTEXT processContext;
     PC2_DETECTION_RESULT result;
 
-    if (Detector == NULL || !Detector->Initialized || Result == NULL) {
+    if (Detector == NULL || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Result = NULL;
 
-    detector = CONTAINING_RECORD(Detector, C2_DETECTOR_INTERNAL, Public);
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return STATUS_DELETE_PENDING;
+    }
 
     //
-    // Find process context
+    // Find process context under shared lock
     //
-    processContext = C2pFindProcessContext(Detector, ProcessId);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Detector->ProcessListLock);
+
+    processContext = NULL;
+    {
+        PLIST_ENTRY entry;
+        PC2_PROCESS_CONTEXT ctx;
+        for (entry = Detector->ProcessList.Flink;
+             entry != &Detector->ProcessList;
+             entry = entry->Flink) {
+            ctx = CONTAINING_RECORD(entry, C2_PROCESS_CONTEXT, ListEntry);
+            if (ctx->ProcessId == ProcessId) {
+                processContext = ctx;
+                break;
+            }
+        }
+    }
 
     if (processContext == NULL) {
+        ExReleasePushLockShared(&Detector->ProcessListLock);
+        KeLeaveCriticalRegion();
+        C2_RELEASE_RUNDOWN(Detector);
         return STATUS_NOT_FOUND;
     }
 
-    //
-    // Allocate result
-    //
-    result = (PC2_DETECTION_RESULT)ExAllocateFromNPagedLookasideList(
-        &detector->ResultLookaside
-    );
-
+    result = C2pAllocateResult();
     if (result == NULL) {
+        ExReleasePushLockShared(&Detector->ProcessListLock);
+        KeLeaveCriticalRegion();
+        C2_RELEASE_RUNDOWN(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(result, sizeof(C2_DETECTION_RESULT));
-
-    //
-    // Fill result
-    //
     result->C2Detected = processContext->HasConfirmedC2;
     result->Type = processContext->SuspectedC2Type;
     result->ConfidenceScore = min(processContext->HighestSuspicionScore, 100);
     result->SeverityScore = processContext->HighestSuspicionScore;
     result->ProcessId = ProcessId;
-
+    RtlCopyMemory(result->ProcessName, processContext->ProcessName,
+                   sizeof(result->ProcessName));
     KeQuerySystemTime(&result->DetectionTime);
 
-    *Result = result;
+    ExReleasePushLockShared(&Detector->ProcessListLock);
+    KeLeaveCriticalRegion();
+    C2_RELEASE_RUNDOWN(Detector);
 
+    *Result = result;
     return STATUS_SUCCESS;
 }
 
@@ -1020,11 +874,9 @@ C2CheckIOC(
 {
     PLIST_ENTRY entry;
     PC2_IOC ioc;
-    ULONG hostnameLen;
     BOOLEAN found = FALSE;
 
-    if (Detector == NULL || !Detector->Initialized ||
-        RemoteAddress == NULL || IsKnownC2 == NULL) {
+    if (Detector == NULL || RemoteAddress == NULL || IsKnownC2 == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1033,38 +885,31 @@ C2CheckIOC(
         *MatchedIOC = NULL;
     }
 
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return STATUS_DELETE_PENDING;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Detector->IOCLock);
 
-    //
-    // Search IOC list
-    //
     for (entry = Detector->IOCList.Flink;
          entry != &Detector->IOCList;
          entry = entry->Flink) {
 
         ioc = CONTAINING_RECORD(entry, C2_IOC, ListEntry);
 
-        if (ioc->Type == IOCType_IP) {
-            //
-            // Check IP match
-            //
-            if (IsIPv6 == ioc->Value.IP.IsIPv6) {
-                if (IsIPv6) {
-                    if (RtlEqualMemory(RemoteAddress, &ioc->Value.IP.Address6, sizeof(IN6_ADDR))) {
-                        found = TRUE;
-                    }
-                } else {
-                    if (RtlEqualMemory(RemoteAddress, &ioc->Value.IP.Address, sizeof(IN_ADDR))) {
-                        found = TRUE;
-                    }
+        if (ioc->Type == IOCType_IP && IsIPv6 == ioc->Value.IP.IsIPv6) {
+            if (IsIPv6) {
+                if (RtlEqualMemory(RemoteAddress, &ioc->Value.IP.Address6, sizeof(IN6_ADDR))) {
+                    found = TRUE;
+                }
+            } else {
+                if (RtlEqualMemory(RemoteAddress, &ioc->Value.IP.Address, sizeof(IN_ADDR))) {
+                    found = TRUE;
                 }
             }
         } else if (ioc->Type == IOCType_Domain && Hostname != NULL) {
-            //
-            // Check domain match
-            //
-            hostnameLen = (ULONG)strlen(Hostname);
+            ULONG hostnameLen = (ULONG)strlen(Hostname);
             if (hostnameLen > 0 && hostnameLen < 256) {
                 if (_stricmp(Hostname, ioc->Value.Domain) == 0) {
                     found = TRUE;
@@ -1075,6 +920,12 @@ C2CheckIOC(
         if (found) {
             *IsKnownC2 = TRUE;
             if (MatchedIOC) {
+                //
+                // Return referenced IOC pointer. Caller must be aware the
+                // pointer is valid only while holding rundown or IOCLock.
+                // For safety, take a reference.
+                //
+                InterlockedIncrement(&ioc->RefCount);
                 *MatchedIOC = ioc;
             }
             InterlockedIncrement64(&Detector->Stats.IOCMatches);
@@ -1084,12 +935,13 @@ C2CheckIOC(
 
     ExReleasePushLockShared(&Detector->IOCLock);
     KeLeaveCriticalRegion();
+    C2_RELEASE_RUNDOWN(Detector);
 
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// PUBLIC API - IOC MANAGEMENT
+// PUBLIC API — IOC MANAGEMENT
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1102,41 +954,36 @@ C2AddIOC(
     PC2_DETECTOR_INTERNAL detector;
     PC2_IOC newIOC;
 
-    if (Detector == NULL || !Detector->Initialized || IOC == NULL) {
+    if (Detector == NULL || IOC == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return STATUS_DELETE_PENDING;
     }
 
     detector = CONTAINING_RECORD(Detector, C2_DETECTOR_INTERNAL, Public);
 
-    //
-    // Allocate IOC entry
-    //
-    newIOC = (PC2_IOC)ExAllocateFromNPagedLookasideList(
-        &detector->IOCLookaside
-    );
-
+    newIOC = (PC2_IOC)ExAllocateFromNPagedLookasideList(&detector->IOCLookaside);
     if (newIOC == NULL) {
+        C2_RELEASE_RUNDOWN(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Copy IOC data
-    //
     RtlCopyMemory(newIOC, IOC, sizeof(C2_IOC));
     KeQuerySystemTime(&newIOC->AddedTime);
+    newIOC->RefCount = 1;
+    InitializeListHead(&newIOC->ListEntry);
+    InitializeListHead(&newIOC->HashEntry);
 
-    //
-    // Add to list
-    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Detector->IOCLock);
-
     InsertTailList(&Detector->IOCList, &newIOC->ListEntry);
     InterlockedIncrement(&Detector->IOCCount);
-
     ExReleasePushLockExclusive(&Detector->IOCLock);
     KeLeaveCriticalRegion();
 
+    C2_RELEASE_RUNDOWN(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -1148,46 +995,53 @@ C2RemoveIOC(
     )
 {
     PC2_DETECTOR_INTERNAL detector;
+    PLIST_ENTRY entry;
+    BOOLEAN found = FALSE;
 
-    if (Detector == NULL || !Detector->Initialized || IOC == NULL) {
+    if (Detector == NULL || IOC == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return STATUS_DELETE_PENDING;
     }
 
     detector = CONTAINING_RECORD(Detector, C2_DETECTOR_INTERNAL, Public);
 
+    //
+    // Validate the IOC is actually in our list before removing
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Detector->IOCLock);
 
-    RemoveEntryList(&IOC->ListEntry);
-    InterlockedDecrement(&Detector->IOCCount);
+    for (entry = Detector->IOCList.Flink;
+         entry != &Detector->IOCList;
+         entry = entry->Flink) {
+        if (entry == &IOC->ListEntry) {
+            found = TRUE;
+            break;
+        }
+    }
+
+    if (found) {
+        RemoveEntryList(&IOC->ListEntry);
+        InterlockedDecrement(&Detector->IOCCount);
+    }
 
     ExReleasePushLockExclusive(&Detector->IOCLock);
     KeLeaveCriticalRegion();
 
-    ExFreeToNPagedLookasideList(&detector->IOCLookaside, IOC);
+    if (found) {
+        ExFreeToNPagedLookasideList(&detector->IOCLookaside, IOC);
+    }
 
-    return STATUS_SUCCESS;
-}
+    C2_RELEASE_RUNDOWN(Detector);
 
-_Use_decl_annotations_
-NTSTATUS
-C2LoadIOCFile(
-    _In_ PC2_DETECTOR Detector,
-    _In_ PUNICODE_STRING FilePath
-    )
-{
-    UNREFERENCED_PARAMETER(Detector);
-    UNREFERENCED_PARAMETER(FilePath);
-
-    //
-    // IOC file loading would be implemented here
-    // Format: JSON or STIX/TAXII compatible
-    //
-    return STATUS_NOT_IMPLEMENTED;
+    return found ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
 
 // ============================================================================
-// PUBLIC API - JA3 DATABASE
+// PUBLIC API — JA3 DATABASE
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1201,49 +1055,37 @@ C2AddKnownJA3(
     PC2_IOC ioc;
     PC2_DETECTOR_INTERNAL detector;
 
-    if (Detector == NULL || !Detector->Initialized ||
-        JA3Hash == NULL || MalwareFamily == NULL) {
+    if (Detector == NULL || JA3Hash == NULL || MalwareFamily == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return STATUS_DELETE_PENDING;
     }
 
     detector = CONTAINING_RECORD(Detector, C2_DETECTOR_INTERNAL, Public);
 
-    //
-    // Allocate IOC for JA3
-    //
-    ioc = (PC2_IOC)ExAllocateFromNPagedLookasideList(
-        &detector->IOCLookaside
-    );
-
+    ioc = (PC2_IOC)ExAllocateFromNPagedLookasideList(&detector->IOCLookaside);
     if (ioc == NULL) {
+        C2_RELEASE_RUNDOWN(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlZeroMemory(ioc, sizeof(C2_IOC));
     ioc->Type = IOCType_JA3;
+    ioc->RefCount = 1;
     RtlCopyMemory(ioc->Value.JA3Hash, JA3Hash, 16);
-
-    if (MalwareFamily != NULL) {
-        RtlStringCchCopyA(
-            ioc->MalwareFamily,
-            sizeof(ioc->MalwareFamily),
-            MalwareFamily
-        );
-    }
-
+    RtlStringCchCopyA(ioc->MalwareFamily, sizeof(ioc->MalwareFamily), MalwareFamily);
     KeQuerySystemTime(&ioc->AddedTime);
 
-    //
-    // Add to JA3 list
-    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Detector->JA3Lock);
-
     InsertTailList(&Detector->KnownJA3List, &ioc->ListEntry);
-
+    InterlockedIncrement(&Detector->KnownJA3Count);
     ExReleasePushLockExclusive(&Detector->JA3Lock);
     KeLeaveCriticalRegion();
 
+    C2_RELEASE_RUNDOWN(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -1259,16 +1101,18 @@ C2LookupJA3(
 {
     PLIST_ENTRY entry;
     PC2_IOC ioc;
-    BOOLEAN found = FALSE;
 
-    if (Detector == NULL || !Detector->Initialized ||
-        JA3Hash == NULL || IsKnown == NULL) {
+    if (Detector == NULL || JA3Hash == NULL || IsKnown == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *IsKnown = FALSE;
     if (MalwareFamily && FamilySize > 0) {
         MalwareFamily[0] = '\0';
+    }
+
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return STATUS_DELETE_PENDING;
     }
 
     KeEnterCriticalRegion();
@@ -1282,9 +1126,7 @@ C2LookupJA3(
 
         if (ioc->Type == IOCType_JA3 &&
             RtlEqualMemory(JA3Hash, ioc->Value.JA3Hash, 16)) {
-            found = TRUE;
             *IsKnown = TRUE;
-
             if (MalwareFamily && FamilySize > 0) {
                 RtlStringCchCopyA(MalwareFamily, FamilySize, ioc->MalwareFamily);
             }
@@ -1294,12 +1136,13 @@ C2LookupJA3(
 
     ExReleasePushLockShared(&Detector->JA3Lock);
     KeLeaveCriticalRegion();
+    C2_RELEASE_RUNDOWN(Detector);
 
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// PUBLIC API - CALLBACKS
+// PUBLIC API — CALLBACKS
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1314,8 +1157,12 @@ C2RegisterCallback(
     ULONG i;
     NTSTATUS status = STATUS_INSUFFICIENT_RESOURCES;
 
-    if (Detector == NULL || !Detector->Initialized || Callback == NULL) {
+    if (Detector == NULL || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return STATUS_DELETE_PENDING;
     }
 
     detector = CONTAINING_RECORD(Detector, C2_DETECTOR_INTERNAL, Public);
@@ -1335,6 +1182,7 @@ C2RegisterCallback(
 
     ExReleasePushLockExclusive(&detector->CallbackLock);
     KeLeaveCriticalRegion();
+    C2_RELEASE_RUNDOWN(Detector);
 
     return status;
 }
@@ -1349,7 +1197,11 @@ C2UnregisterCallback(
     PC2_DETECTOR_INTERNAL detector;
     ULONG i;
 
-    if (Detector == NULL || !Detector->Initialized || Callback == NULL) {
+    if (Detector == NULL || Callback == NULL) {
+        return;
+    }
+
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
         return;
     }
 
@@ -1370,10 +1222,11 @@ C2UnregisterCallback(
 
     ExReleasePushLockExclusive(&detector->CallbackLock);
     KeLeaveCriticalRegion();
+    C2_RELEASE_RUNDOWN(Detector);
 }
 
 // ============================================================================
-// PUBLIC API - RESULTS
+// PUBLIC API — RESULTS
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1382,19 +1235,13 @@ C2FreeResult(
     _In_ PC2_DETECTION_RESULT Result
     )
 {
-    if (Result == NULL) {
-        return;
+    if (Result != NULL) {
+        ExFreePoolWithTag(Result, C2_POOL_TAG_RESULT);
     }
-
-    //
-    // Result was allocated from lookaside - can't easily return to it
-    // without detector reference, so use tagged free
-    //
-    ExFreePoolWithTag(Result, C2_POOL_TAG_CONTEXT);
 }
 
 // ============================================================================
-// PUBLIC API - STATISTICS
+// PUBLIC API — STATISTICS
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1406,133 +1253,206 @@ C2GetStatistics(
 {
     LARGE_INTEGER currentTime;
 
-    if (Detector == NULL || !Detector->Initialized || Stats == NULL) {
+    if (Detector == NULL || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return STATUS_DELETE_PENDING;
     }
 
     RtlZeroMemory(Stats, sizeof(C2_STATISTICS));
 
-    Stats->TrackedDestinations = Detector->DestinationCount;
+    Stats->TrackedDestinations = (ULONG)Detector->DestinationCount;
+    Stats->TrackedProcesses = (ULONG)Detector->ProcessCount;
     Stats->ConnectionsAnalyzed = Detector->Stats.ConnectionsAnalyzed;
     Stats->BeaconsDetected = Detector->Stats.BeaconsDetected;
     Stats->C2Detected = Detector->Stats.C2Detected;
     Stats->IOCMatches = Detector->Stats.IOCMatches;
-    Stats->IOCCount = Detector->IOCCount;
+    Stats->IOCCount = (ULONG)Detector->IOCCount;
+    Stats->KnownJA3Count = (ULONG)Detector->KnownJA3Count;
 
-    //
-    // Calculate uptime
-    //
     KeQuerySystemTime(&currentTime);
     Stats->UpTime.QuadPart = currentTime.QuadPart - Detector->Stats.StartTime.QuadPart;
 
+    C2_RELEASE_RUNDOWN(Detector);
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// PRIVATE FUNCTIONS - TIMER
+// PRIVATE — TIMER DPC (DISPATCH_LEVEL)
+//
+// Only queues a work item. Does NO list traversal, lock acquisition, or
+// allocation beyond IoQueueWorkItemEx.
 // ============================================================================
 
 static VOID
 C2pAnalysisTimerDpc(
     _In_ PKDPC Dpc,
     _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+    _In_opt_ PVOID Arg1,
+    _In_opt_ PVOID Arg2
     )
 {
     PC2_DETECTOR_INTERNAL detector = (PC2_DETECTOR_INTERNAL)DeferredContext;
-    PLIST_ENTRY entry;
-    PC2_DESTINATION destination;
-    PC2_DETECTION_RESULT result;
-    LARGE_INTEGER currentTime;
-    LARGE_INTEGER cutoffTime;
 
     UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(Arg1);
+    UNREFERENCED_PARAMETER(Arg2);
 
     if (detector == NULL || !detector->Public.Initialized) {
         return;
     }
 
-    KeQuerySystemTime(&currentTime);
-    cutoffTime.QuadPart = currentTime.QuadPart -
-                          ((LONGLONG)detector->Public.Config.AnalysisWindowMs * 10000);
-
     //
-    // Analyze each destination
+    // Avoid queuing multiple concurrent work items
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&detector->Public.DestinationListLock);
-
-    for (entry = detector->Public.DestinationList.Flink;
-         entry != &detector->Public.DestinationList;
-         entry = entry->Flink) {
-
-        destination = CONTAINING_RECORD(entry, C2_DESTINATION, ListEntry);
-
-        //
-        // Skip recently analyzed destinations
-        //
-        if (destination->LastSeen.QuadPart < cutoffTime.QuadPart) {
-            continue;
-        }
-
-        //
-        // Perform beacon analysis
-        //
-        if (destination->SampleCount >= (LONG)detector->Public.Config.MinBeaconSamples) {
-            C2pAnalyzeBeaconing(destination);
-            C2pCalculateSuspicionScore(destination);
-
-            //
-            // Check if this is a new C2 detection
-            //
-            if (destination->SuspicionScore >= C2_ALERT_THRESHOLD &&
-                !destination->IsConfirmedC2) {
-
-                InterlockedIncrement64(&detector->Public.Stats.C2Detected);
-
-                if (destination->SuspicionScore >= C2_CONFIRMED_THRESHOLD) {
-                    destination->IsConfirmedC2 = TRUE;
-                }
-
-                //
-                // Create result for callbacks
-                //
-                result = (PC2_DETECTION_RESULT)ExAllocateFromNPagedLookasideList(
-                    &detector->ResultLookaside
-                );
-
-                if (result != NULL) {
-                    RtlZeroMemory(result, sizeof(C2_DETECTION_RESULT));
-                    result->C2Detected = TRUE;
-                    result->Type = destination->DetectedType;
-                    result->Indicators = destination->Indicators;
-                    result->ConfidenceScore = min(destination->SuspicionScore, 100);
-                    result->SeverityScore = destination->SuspicionScore;
-                    result->Destination = destination;
-                    RtlCopyMemory(
-                        &result->BeaconAnalysis,
-                        &destination->BeaconAnalysis,
-                        sizeof(C2_BEACON_ANALYSIS)
-                    );
-                    KeQuerySystemTime(&result->DetectionTime);
-
-                    C2pNotifyCallbacks(detector, result);
-
-                    ExFreeToNPagedLookasideList(&detector->ResultLookaside, result);
-                }
-            }
+    if (InterlockedCompareExchange(&detector->AnalysisWorkItemQueued, 1, 0) == 0) {
+        if (detector->AnalysisWorkItem != NULL) {
+            IoQueueWorkItem(detector->AnalysisWorkItem,
+                            C2pAnalysisWorkItemRoutine,
+                            DelayedWorkQueue,
+                            detector);
+        } else {
+            InterlockedExchange(&detector->AnalysisWorkItemQueued, 0);
         }
     }
-
-    ExReleasePushLockShared(&detector->Public.DestinationListLock);
-    KeLeaveCriticalRegion();
 }
 
 // ============================================================================
-// PRIVATE FUNCTIONS - HASH TABLE
+// PRIVATE — ANALYSIS WORK ITEM (PASSIVE_LEVEL)
+// ============================================================================
+
+static VOID
+C2pAnalysisWorkItemRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+    )
+{
+    PC2_DETECTOR_INTERNAL detector = (PC2_DETECTOR_INTERNAL)Context;
+    PC2_DETECTOR pub;
+    PLIST_ENTRY entry;
+    PC2_DESTINATION destination;
+    LARGE_INTEGER currentTime;
+    LARGE_INTEGER cutoffTime;
+    PULONG intervalBuffer = NULL;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    if (detector == NULL) {
+        return;
+    }
+
+    pub = &detector->Public;
+
+    if (!C2_ACQUIRE_RUNDOWN(pub)) {
+        InterlockedExchange(&detector->AnalysisWorkItemQueued, 0);
+        return;
+    }
+
+    //
+    // Pool-allocate scratch buffer for interval analysis (avoids stack overflow)
+    //
+    intervalBuffer = (PULONG)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        C2_MAX_BEACON_SAMPLES * sizeof(ULONG),
+        C2_POOL_TAG_WORK);
+
+    if (intervalBuffer == NULL) {
+        InterlockedExchange(&detector->AnalysisWorkItemQueued, 0);
+        C2_RELEASE_RUNDOWN(pub);
+        return;
+    }
+
+    KeQuerySystemTime(&currentTime);
+    cutoffTime.QuadPart = currentTime.QuadPart -
+                          ((LONGLONG)pub->Config.AnalysisWindowMs * 10000);
+
+    //
+    // Phase 1: Analyze destinations under exclusive lock (PASSIVE_LEVEL — safe).
+    //          Collect detection results into a pool-allocated array.
+    //          Do NOT invoke callbacks while holding the lock.
+    //
+    {
+#define C2_MAX_PENDING_RESULTS  32
+        PC2_DETECTION_RESULT pendingResults = NULL;
+        ULONG pendingCount = 0;
+
+        pendingResults = (PC2_DETECTION_RESULT)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
+            C2_MAX_PENDING_RESULTS * sizeof(C2_DETECTION_RESULT),
+            C2_POOL_TAG_WORK);
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&pub->DestinationLock);
+
+        for (entry = pub->DestinationList.Flink;
+             entry != &pub->DestinationList;
+             entry = entry->Flink) {
+
+            destination = CONTAINING_RECORD(entry, C2_DESTINATION, ListEntry);
+
+            if (destination->LastSeen.QuadPart < cutoffTime.QuadPart) {
+                continue;
+            }
+
+            if (destination->SampleCount >= (LONG)pub->Config.MinBeaconSamples) {
+                C2pAnalyzeBeaconing(destination, intervalBuffer, C2_MAX_BEACON_SAMPLES);
+                C2pCalculateSuspicionScore(destination);
+
+                if (destination->SuspicionScore >= C2_ALERT_THRESHOLD &&
+                    !destination->IsConfirmedC2) {
+
+                    InterlockedIncrement64(&pub->Stats.C2Detected);
+
+                    if (destination->SuspicionScore >= C2_CONFIRMED_THRESHOLD) {
+                        destination->IsConfirmedC2 = TRUE;
+                    }
+
+                    //
+                    // Snapshot result for deferred callback notification
+                    //
+                    if (pendingResults != NULL && pendingCount < C2_MAX_PENDING_RESULTS) {
+                        RtlZeroMemory(&pendingResults[pendingCount],
+                                      sizeof(C2_DETECTION_RESULT));
+                        C2pFillResultFromDestination(&pendingResults[pendingCount],
+                                                     destination);
+                        pendingResults[pendingCount].C2Detected = TRUE;
+                        pendingCount++;
+                    }
+                }
+            }
+        }
+
+        ExReleasePushLockExclusive(&pub->DestinationLock);
+        KeLeaveCriticalRegion();
+
+        //
+        // Phase 2: Notify callbacks OUTSIDE the lock — safe for re-entrant APIs.
+        //
+        if (pendingResults != NULL) {
+            ULONG resultIdx;
+            for (resultIdx = 0; resultIdx < pendingCount; resultIdx++) {
+                C2pNotifyCallbacks(detector, &pendingResults[resultIdx]);
+            }
+            ExFreePoolWithTag(pendingResults, C2_POOL_TAG_WORK);
+        }
+#undef C2_MAX_PENDING_RESULTS
+    }
+
+    ExFreePoolWithTag(intervalBuffer, C2_POOL_TAG_WORK);
+
+    //
+    // Periodically clean stale entries
+    //
+    C2pCleanupStaleEntries(detector);
+
+    InterlockedExchange(&detector->AnalysisWorkItemQueued, 0);
+    C2_RELEASE_RUNDOWN(pub);
+}
+
+// ============================================================================
+// PRIVATE — HASH TABLE
 // ============================================================================
 
 static NTSTATUS
@@ -1544,11 +1464,10 @@ C2pInitializeHashTable(
     LIST_ENTRY* buckets;
     ULONG i;
 
-    buckets = (LIST_ENTRY*)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    buckets = (LIST_ENTRY*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         BucketCount * sizeof(LIST_ENTRY),
-        C2_POOL_TAG_CONTEXT
-    );
+        C2_POOL_TAG_CONTEXT);
 
     if (buckets == NULL) {
         *Buckets = NULL;
@@ -1565,12 +1484,9 @@ C2pInitializeHashTable(
 
 static VOID
 C2pFreeHashTable(
-    _Inout_ LIST_ENTRY** Buckets,
-    _In_ ULONG BucketCount
+    _Inout_ LIST_ENTRY** Buckets
     )
 {
-    UNREFERENCED_PARAMETER(BucketCount);
-
     if (*Buckets != NULL) {
         ExFreePoolWithTag(*Buckets, C2_POOL_TAG_CONTEXT);
         *Buckets = NULL;
@@ -1585,17 +1501,9 @@ C2pHashAddress(
     )
 {
     ULONG hash = 2166136261u;
-    PUCHAR bytes;
-    SIZE_T len;
+    PUCHAR bytes = (PUCHAR)Address;
+    SIZE_T len = IsIPv6 ? 16 : 4;
     SIZE_T i;
-
-    if (IsIPv6) {
-        bytes = (PUCHAR)Address;
-        len = 16;
-    } else {
-        bytes = (PUCHAR)Address;
-        len = 4;
-    }
 
     for (i = 0; i < len; i++) {
         hash ^= bytes[i];
@@ -1610,29 +1518,17 @@ C2pHashAddress(
     return hash;
 }
 
-static ULONG
-C2pHashString(
-    _In_ PCSTR String,
-    _In_ ULONG Length
-    )
-{
-    ULONG hash = 2166136261u;
-    ULONG i;
-
-    for (i = 0; i < Length; i++) {
-        hash ^= (UCHAR)String[i];
-        hash *= 16777619u;
-    }
-
-    return hash;
-}
-
 // ============================================================================
-// PRIVATE FUNCTIONS - DESTINATION MANAGEMENT
+// PRIVATE — DESTINATION MANAGEMENT
+//
+// Single DestinationLock protects both list and hash table.
 // ============================================================================
 
+//
+// Caller must hold DestinationLock (shared or exclusive).
+//
 static PC2_DESTINATION
-C2pFindDestination(
+C2pFindDestinationLocked(
     _In_ PC2_DETECTOR Detector,
     _In_ PVOID Address,
     _In_ USHORT Port,
@@ -1647,46 +1543,33 @@ C2pFindDestination(
     hash = C2pHashAddress(Address, Port, IsIPv6);
     bucket = hash % Detector->DestinationHash.BucketCount;
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Detector->DestinationHash.Lock);
-
     for (entry = Detector->DestinationHash.Buckets[bucket].Flink;
          entry != &Detector->DestinationHash.Buckets[bucket];
          entry = entry->Flink) {
 
         destination = CONTAINING_RECORD(entry, C2_DESTINATION, HashEntry);
 
-        if (destination->Port == Port &&
-            destination->IsIPv6 == IsIPv6) {
-
-            BOOLEAN match = FALSE;
-
+        if (destination->Port == Port && destination->IsIPv6 == IsIPv6) {
+            BOOLEAN match;
             if (IsIPv6) {
-                if (RtlEqualMemory(Address, &destination->Address.IPv6, sizeof(IN6_ADDR))) {
-                    match = TRUE;
-                }
+                match = RtlEqualMemory(Address, &destination->Address.IPv6, sizeof(IN6_ADDR));
             } else {
-                if (RtlEqualMemory(Address, &destination->Address.IPv4, sizeof(IN_ADDR))) {
-                    match = TRUE;
-                }
+                match = RtlEqualMemory(Address, &destination->Address.IPv4, sizeof(IN_ADDR));
             }
-
             if (match) {
-                ExReleasePushLockShared(&Detector->DestinationHash.Lock);
-                KeLeaveCriticalRegion();
                 return destination;
             }
         }
     }
 
-    ExReleasePushLockShared(&Detector->DestinationHash.Lock);
-    KeLeaveCriticalRegion();
-
     return NULL;
 }
 
+//
+// Atomic find-or-create. Returns a referenced destination.
+//
 static PC2_DESTINATION
-C2pCreateDestination(
+C2pFindOrCreateDestination(
     _In_ PC2_DETECTOR_INTERNAL Detector,
     _In_ PVOID Address,
     _In_ USHORT Port,
@@ -1694,33 +1577,49 @@ C2pCreateDestination(
     _In_opt_ PCSTR Hostname
     )
 {
+    PC2_DETECTOR pub = &Detector->Public;
     PC2_DESTINATION destination;
     ULONG hash;
     ULONG bucket;
 
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&pub->DestinationLock);
+
     //
-    // Check limit
+    // Try to find existing
     //
-    if (Detector->Public.DestinationCount >= C2_MAX_TRACKED_DESTINATIONS) {
+    destination = C2pFindDestinationLocked(pub, Address, Port, IsIPv6);
+    if (destination != NULL) {
+        C2pReferenceDestination(destination);
+        ExReleasePushLockExclusive(&pub->DestinationLock);
+        KeLeaveCriticalRegion();
+        return destination;
+    }
+
+    //
+    // Check count limit
+    //
+    if (pub->DestinationCount >= C2_MAX_TRACKED_DESTINATIONS) {
+        ExReleasePushLockExclusive(&pub->DestinationLock);
+        KeLeaveCriticalRegion();
         return NULL;
     }
 
     //
-    // Allocate destination
+    // Allocate and initialize
     //
     destination = (PC2_DESTINATION)ExAllocateFromNPagedLookasideList(
-        &Detector->DestinationLookaside
-    );
+        &Detector->DestinationLookaside);
 
     if (destination == NULL) {
+        ExReleasePushLockExclusive(&pub->DestinationLock);
+        KeLeaveCriticalRegion();
         return NULL;
     }
 
     RtlZeroMemory(destination, sizeof(C2_DESTINATION));
+    destination->RefCount = 1; // Caller's reference
 
-    //
-    // Initialize
-    //
     if (IsIPv6) {
         RtlCopyMemory(&destination->Address.IPv6, Address, sizeof(IN6_ADDR));
     } else {
@@ -1731,44 +1630,62 @@ C2pCreateDestination(
     destination->Port = Port;
 
     if (Hostname != NULL) {
-        RtlStringCchCopyA(
-            destination->Hostname,
-            sizeof(destination->Hostname),
-            Hostname
-        );
+        RtlStringCchCopyA(destination->Hostname,
+                          sizeof(destination->Hostname), Hostname);
     }
 
     hash = C2pHashAddress(Address, Port, IsIPv6);
     destination->DestinationHash = hash;
 
     InitializeListHead(&destination->BeaconSamples);
-    KeInitializeSpinLock(&destination->SampleLock);
+    ExInitializePushLock(&destination->SampleLock);
 
     KeQuerySystemTime(&destination->FirstSeen);
     destination->LastSeen = destination->FirstSeen;
 
     //
-    // Add to lists
+    // Insert into list and hash
     //
-    bucket = hash % Detector->Public.DestinationHash.BucketCount;
+    bucket = hash % pub->DestinationHash.BucketCount;
+    InsertTailList(&pub->DestinationList, &destination->ListEntry);
+    InsertTailList(&pub->DestinationHash.Buckets[bucket], &destination->HashEntry);
+    InterlockedIncrement(&pub->DestinationCount);
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Detector->Public.DestinationListLock);
-    ExAcquirePushLockExclusive(&Detector->Public.DestinationHash.Lock);
+    //
+    // Take a second reference for the list ownership
+    //
+    C2pReferenceDestination(destination);
 
-    InsertTailList(&Detector->Public.DestinationList, &destination->ListEntry);
-    InsertTailList(&Detector->Public.DestinationHash.Buckets[bucket], &destination->HashEntry);
-    InterlockedIncrement(&Detector->Public.DestinationCount);
-
-    ExReleasePushLockExclusive(&Detector->Public.DestinationHash.Lock);
-    ExReleasePushLockExclusive(&Detector->Public.DestinationListLock);
+    ExReleasePushLockExclusive(&pub->DestinationLock);
     KeLeaveCriticalRegion();
 
     return destination;
 }
 
 static VOID
-C2pFreeDestination(
+C2pReferenceDestination(
+    _Inout_ PC2_DESTINATION Destination
+    )
+{
+    InterlockedIncrement(&Destination->RefCount);
+}
+
+static VOID
+C2pDereferenceDestination(
+    _In_ PC2_DETECTOR_INTERNAL Detector,
+    _Inout_ PC2_DESTINATION Destination
+    )
+{
+    LONG newRef = InterlockedDecrement(&Destination->RefCount);
+    NT_ASSERT(newRef >= 0);
+
+    if (newRef == 0) {
+        C2pFreeDestinationUnsafe(Detector, Destination);
+    }
+}
+
+static VOID
+C2pFreeDestinationUnsafe(
     _In_ PC2_DETECTOR_INTERNAL Detector,
     _Inout_ PC2_DESTINATION Destination
     )
@@ -1777,8 +1694,29 @@ C2pFreeDestination(
     ExFreeToNPagedLookasideList(&Detector->DestinationLookaside, Destination);
 }
 
+static VOID
+C2pFreeBeaconSamples(
+    _In_ PC2_DETECTOR_INTERNAL Detector,
+    _Inout_ PC2_DESTINATION Destination
+    )
+{
+    PLIST_ENTRY entry;
+    PC2_BEACON_SAMPLE sample;
+
+    //
+    // Only called when destination is exclusively owned (refcount 0 or shutdown)
+    //
+    while (!IsListEmpty(&Destination->BeaconSamples)) {
+        entry = RemoveHeadList(&Destination->BeaconSamples);
+        sample = CONTAINING_RECORD(entry, C2_BEACON_SAMPLE, ListEntry);
+        ExFreeToNPagedLookasideList(&Detector->SampleLookaside, sample);
+    }
+
+    Destination->SampleCount = 0;
+}
+
 // ============================================================================
-// PRIVATE FUNCTIONS - BEACON ANALYSIS
+// PRIVATE — BEACON SAMPLE RECORDING
 // ============================================================================
 
 static VOID
@@ -1790,157 +1728,149 @@ C2pAddBeaconSample(
     )
 {
     PC2_BEACON_SAMPLE sample;
-    KIRQL oldIrql;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Destination->SampleLock);
 
     //
-    // Check sample limit
+    // Remove oldest if at capacity
     //
     if (Destination->SampleCount >= C2_MAX_BEACON_SAMPLES) {
-        //
-        // Remove oldest sample
-        //
-        KeAcquireSpinLock(&Destination->SampleLock, &oldIrql);
-
         if (!IsListEmpty(&Destination->BeaconSamples)) {
             PLIST_ENTRY oldest = RemoveHeadList(&Destination->BeaconSamples);
             sample = CONTAINING_RECORD(oldest, C2_BEACON_SAMPLE, ListEntry);
             ExFreeToNPagedLookasideList(&Detector->SampleLookaside, sample);
-            InterlockedDecrement(&Destination->SampleCount);
+            Destination->SampleCount--;
         }
-
-        KeReleaseSpinLock(&Destination->SampleLock, oldIrql);
     }
 
     //
     // Allocate new sample
     //
     sample = (PC2_BEACON_SAMPLE)ExAllocateFromNPagedLookasideList(
-        &Detector->SampleLookaside
-    );
+        &Detector->SampleLookaside);
 
-    if (sample == NULL) {
-        return;
+    if (sample != NULL) {
+        RtlZeroMemory(sample, sizeof(C2_BEACON_SAMPLE));
+        KeQuerySystemTime(&sample->Timestamp);
+        sample->DataSize = DataSize;
+        sample->Direction = Direction;
+
+        InsertTailList(&Destination->BeaconSamples, &sample->ListEntry);
+        Destination->SampleCount++;
     }
 
-    RtlZeroMemory(sample, sizeof(C2_BEACON_SAMPLE));
-    KeQuerySystemTime(&sample->Timestamp);
-    sample->DataSize = DataSize;
-    sample->Direction = Direction;
-
-    //
-    // Add to list
-    //
-    KeAcquireSpinLock(&Destination->SampleLock, &oldIrql);
-    InsertTailList(&Destination->BeaconSamples, &sample->ListEntry);
-    InterlockedIncrement(&Destination->SampleCount);
-    KeReleaseSpinLock(&Destination->SampleLock, oldIrql);
+    ExReleasePushLockExclusive(&Destination->SampleLock);
+    KeLeaveCriticalRegion();
 }
+
+// ============================================================================
+// PRIVATE — BEACON ANALYSIS (PASSIVE_LEVEL)
+//
+// Caller must hold DestinationLock exclusive. IntervalBuffer is a
+// caller-provided pool-allocated scratch buffer.
+// ============================================================================
 
 static VOID
 C2pAnalyzeBeaconing(
-    _Inout_ PC2_DESTINATION Destination
+    _Inout_ PC2_DESTINATION Destination,
+    _In_ PULONG IntervalBuffer,
+    _In_ ULONG IntervalBufferCount
     )
 {
     PC2_BEACON_ANALYSIS analysis = &Destination->BeaconAnalysis;
     PLIST_ENTRY entry;
     PC2_BEACON_SAMPLE sample;
     PC2_BEACON_SAMPLE prevSample = NULL;
-    ULONG intervals[C2_MAX_BEACON_SAMPLES];
-    ULONG sizes[C2_MAX_BEACON_SAMPLES];
     ULONG intervalCount = 0;
     ULONG sizeCount = 0;
-    ULONG meanInterval;
-    ULONG stdDeviation;
-    ULONG medianInterval;
     ULONG64 totalSize = 0;
     ULONG minSize = MAXULONG;
     ULONG maxSize = 0;
-    KIRQL oldIrql;
+    ULONG minInterval = MAXULONG;
+    ULONG maxInterval = 0;
+    ULONG meanInterval = 0;
+    ULONG stdDeviation = 0;
+    ULONG medianInterval = 0;
+    LARGE_INTEGER firstTime = {0};
+    LARGE_INTEGER lastTime = {0};
 
     if (Destination->SampleCount < C2_MIN_BEACON_SAMPLES) {
         return;
     }
 
-    RtlZeroMemory(intervals, sizeof(intervals));
-    RtlZeroMemory(sizes, sizeof(sizes));
-
     //
-    // Collect intervals and sizes
+    // Collect intervals from sample list.
+    // SampleLock is a push lock — acquire at APC_LEVEL.
     //
-    KeAcquireSpinLock(&Destination->SampleLock, &oldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Destination->SampleLock);
 
     for (entry = Destination->BeaconSamples.Flink;
-         entry != &Destination->BeaconSamples && intervalCount < C2_MAX_BEACON_SAMPLES - 1;
+         entry != &Destination->BeaconSamples &&
+         intervalCount < IntervalBufferCount - 1;
          entry = entry->Flink) {
 
         sample = CONTAINING_RECORD(entry, C2_BEACON_SAMPLE, ListEntry);
 
+        // Track first and last sample timestamps
+        if (sizeCount == 0) {
+            firstTime = sample->Timestamp;
+        }
+        lastTime = sample->Timestamp;
+
         if (prevSample != NULL) {
             ULONG64 intervalMs = (sample->Timestamp.QuadPart -
                                   prevSample->Timestamp.QuadPart) / 10000;
-
-            if (intervalMs <= MAXULONG) {
-                intervals[intervalCount++] = (ULONG)intervalMs;
+            if (intervalMs > 0 && intervalMs <= MAXULONG) {
+                ULONG interval = (ULONG)intervalMs;
+                IntervalBuffer[intervalCount++] = interval;
+                if (interval < minInterval) minInterval = interval;
+                if (interval > maxInterval) maxInterval = interval;
             }
         }
 
-        if (sizeCount < C2_MAX_BEACON_SAMPLES) {
-            sizes[sizeCount++] = sample->DataSize;
-            totalSize += sample->DataSize;
-
-            if (sample->DataSize < minSize) {
-                minSize = sample->DataSize;
-            }
-            if (sample->DataSize > maxSize) {
-                maxSize = sample->DataSize;
-            }
-        }
+        totalSize += sample->DataSize;
+        sizeCount++;
+        if (sample->DataSize < minSize) minSize = sample->DataSize;
+        if (sample->DataSize > maxSize) maxSize = sample->DataSize;
 
         prevSample = sample;
     }
 
-    KeReleaseSpinLock(&Destination->SampleLock, oldIrql);
+    ExReleasePushLockShared(&Destination->SampleLock);
+    KeLeaveCriticalRegion();
 
     if (intervalCount < C2_MIN_SAMPLES_FOR_ANALYSIS) {
         return;
     }
 
     //
-    // Calculate statistics
+    // Calculate statistics using the pool-allocated buffer
     //
-    C2pCalculateIntervalStatistics(
-        Destination,
-        &meanInterval,
-        &stdDeviation,
-        &medianInterval
-    );
+    C2pCalculateIntervalStats(IntervalBuffer, intervalCount,
+                              &meanInterval, &stdDeviation, &medianInterval);
 
-    //
-    // Update analysis
-    //
     analysis->SampleCount = Destination->SampleCount;
+    analysis->FirstSampleTime = (ULONG64)firstTime.QuadPart;
+    analysis->LastSampleTime = (ULONG64)lastTime.QuadPart;
     analysis->MeanIntervalMs = meanInterval;
     analysis->StdDeviation = stdDeviation;
     analysis->MedianIntervalMs = medianInterval;
+    analysis->MinIntervalMs = (minInterval == MAXULONG) ? 0 : minInterval;
+    analysis->MaxIntervalMs = maxInterval;
 
-    //
-    // Calculate jitter percentage
-    //
     if (meanInterval > 0) {
         analysis->JitterPercent = (stdDeviation * 100) / meanInterval;
+    } else {
+        analysis->JitterPercent = 0;
     }
 
-    //
-    // Size analysis
-    //
     if (sizeCount > 0) {
         analysis->MeanDataSize = (ULONG)(totalSize / sizeCount);
         analysis->MinDataSize = minSize;
         analysis->MaxDataSize = maxSize;
 
-        //
-        // Check for consistent size (within 10%)
-        //
         if (maxSize > 0) {
             ULONG sizeVariance = ((maxSize - minSize) * 100) / maxSize;
             analysis->ConsistentSize = (sizeVariance <= 10);
@@ -1955,11 +1885,12 @@ C2pAnalyzeBeaconing(
 
         if (analysis->JitterPercent <= C2_PERFECT_BEACON_JITTER) {
             analysis->RegularBeaconDetected = TRUE;
-            Destination->Indicators |= C2Indicator_RegularBeaconing;
-            InterlockedIncrement64(&Destination->BeaconAnalysis.ConfidenceScore);
+            InterlockedOr(&Destination->Indicators,
+                          (LONG)C2Indicator_RegularBeaconing);
         } else if (analysis->JitterPercent <= C2_TYPICAL_BEACON_JITTER) {
             analysis->JitteredBeaconDetected = TRUE;
-            Destination->Indicators |= C2Indicator_JitteredBeaconing;
+            InterlockedOr(&Destination->Indicators,
+                          (LONG)C2Indicator_JitteredBeaconing);
         }
 
         analysis->DetectedInterval = meanInterval;
@@ -1967,83 +1898,52 @@ C2pAnalyzeBeaconing(
     }
 }
 
+// ============================================================================
+// PRIVATE — INTERVAL STATISTICS
+//
+// Operates entirely on the caller-provided array. No locks or allocations.
+// ============================================================================
+
 static VOID
-C2pCalculateIntervalStatistics(
-    _In_ PC2_DESTINATION Destination,
+C2pCalculateIntervalStats(
+    _Inout_ PULONG Intervals,
+    _In_ ULONG Count,
     _Out_ PULONG MeanInterval,
     _Out_ PULONG StdDeviation,
     _Out_ PULONG MedianInterval
     )
 {
-    PLIST_ENTRY entry;
-    PC2_BEACON_SAMPLE sample;
-    PC2_BEACON_SAMPLE prevSample = NULL;
-    ULONG intervals[C2_MAX_BEACON_SAMPLES];
-    ULONG intervalCount = 0;
     ULONG64 sum = 0;
     ULONG64 sumSquares = 0;
     ULONG mean;
     ULONG variance;
-    KIRQL oldIrql;
     ULONG i;
 
     *MeanInterval = 0;
     *StdDeviation = 0;
     *MedianInterval = 0;
 
-    //
-    // Collect intervals
-    //
-    KeAcquireSpinLock(&Destination->SampleLock, &oldIrql);
-
-    for (entry = Destination->BeaconSamples.Flink;
-         entry != &Destination->BeaconSamples && intervalCount < C2_MAX_BEACON_SAMPLES - 1;
-         entry = entry->Flink) {
-
-        sample = CONTAINING_RECORD(entry, C2_BEACON_SAMPLE, ListEntry);
-
-        if (prevSample != NULL) {
-            ULONG64 intervalMs = (sample->Timestamp.QuadPart -
-                                  prevSample->Timestamp.QuadPart) / 10000;
-
-            if (intervalMs > 0 && intervalMs <= MAXULONG) {
-                intervals[intervalCount++] = (ULONG)intervalMs;
-                sum += intervalMs;
-            }
-        }
-
-        prevSample = sample;
-    }
-
-    KeReleaseSpinLock(&Destination->SampleLock, oldIrql);
-
-    if (intervalCount == 0) {
+    if (Count == 0) {
         return;
     }
 
-    //
-    // Calculate mean
-    //
-    mean = (ULONG)(sum / intervalCount);
-    *MeanInterval = mean;
-
-    //
-    // Calculate standard deviation
-    //
-    for (i = 0; i < intervalCount; i++) {
-        LONG diff = (LONG)intervals[i] - (LONG)mean;
-        sumSquares += (ULONG64)(diff * diff);
+    for (i = 0; i < Count; i++) {
+        sum += Intervals[i];
     }
 
-    variance = (ULONG)(sumSquares / intervalCount);
+    mean = (ULONG)(sum / Count);
+    *MeanInterval = mean;
 
-    //
-    // Integer square root approximation
-    //
+    for (i = 0; i < Count; i++) {
+        LONG diff = (LONG)Intervals[i] - (LONG)mean;
+        sumSquares += (ULONG64)((LONG64)diff * diff);
+    }
+
+    variance = (ULONG)(sumSquares / Count);
+
     if (variance > 0) {
         ULONG root = variance;
         ULONG x = variance;
-
         while (x > 0) {
             root = x;
             x = (x + variance / x) / 2;
@@ -2052,15 +1952,31 @@ C2pCalculateIntervalStatistics(
         *StdDeviation = root;
     }
 
-    //
-    // Calculate median (simple sort)
-    //
-    C2pQuickSort(intervals, intervalCount);
-    *MedianInterval = intervals[intervalCount / 2];
+    C2pInsertionSort(Intervals, Count);
+    *MedianInterval = Intervals[Count / 2];
+}
+
+static VOID
+C2pInsertionSort(
+    _Inout_ PULONG Array,
+    _In_ ULONG Count
+    )
+{
+    ULONG i, j, temp;
+
+    for (i = 1; i < Count; i++) {
+        temp = Array[i];
+        j = i;
+        while (j > 0 && Array[j - 1] > temp) {
+            Array[j] = Array[j - 1];
+            j--;
+        }
+        Array[j] = temp;
+    }
 }
 
 // ============================================================================
-// PRIVATE FUNCTIONS - JA3 CHECKING
+// PRIVATE — JA3 CHECKING
 // ============================================================================
 
 static BOOLEAN
@@ -2071,16 +1987,41 @@ C2pCheckKnownJA3(
     _In_ ULONG FamilySize
     )
 {
-    BOOLEAN isKnown = FALSE;
-    NTSTATUS status;
+    //
+    // Internal lookup — caller already holds rundown protection.
+    // Only acquire JA3Lock, do NOT re-acquire rundown.
+    //
+    PLIST_ENTRY entry;
+    PC2_IOC ioc;
+    BOOLEAN found = FALSE;
 
-    status = C2LookupJA3(Detector, JA3Hash, &isKnown, MalwareFamily, FamilySize);
-
-    if (!NT_SUCCESS(status)) {
-        return FALSE;
+    if (MalwareFamily && FamilySize > 0) {
+        MalwareFamily[0] = '\0';
     }
 
-    return isKnown;
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Detector->JA3Lock);
+
+    for (entry = Detector->KnownJA3List.Flink;
+         entry != &Detector->KnownJA3List;
+         entry = entry->Flink) {
+
+        ioc = CONTAINING_RECORD(entry, C2_IOC, ListEntry);
+
+        if (ioc->Type == IOCType_JA3 &&
+            RtlEqualMemory(JA3Hash, ioc->Value.JA3Hash, 16)) {
+            found = TRUE;
+            if (MalwareFamily && FamilySize > 0) {
+                RtlStringCchCopyA(MalwareFamily, FamilySize, ioc->MalwareFamily);
+            }
+            break;
+        }
+    }
+
+    ExReleasePushLockShared(&Detector->JA3Lock);
+    KeLeaveCriticalRegion();
+
+    return found;
 }
 
 static BOOLEAN
@@ -2089,18 +2030,19 @@ C2pIsSuspiciousPort(
     )
 {
     ULONG i;
-
     for (i = 0; i < ARRAYSIZE(g_SuspiciousC2Ports); i++) {
         if (Port == g_SuspiciousC2Ports[i]) {
             return TRUE;
         }
     }
-
     return FALSE;
 }
 
 // ============================================================================
-// PRIVATE FUNCTIONS - SCORING
+// PRIVATE — SCORING
+//
+// Caller must hold DestinationLock exclusive.
+// Score is fully recalculated from indicators — no accumulation races.
 // ============================================================================
 
 static VOID
@@ -2109,83 +2051,37 @@ C2pCalculateSuspicionScore(
     )
 {
     ULONG score = 0;
+    LONG indicators = Destination->Indicators;
 
-    //
-    // Beacon detection scores
-    //
-    if (Destination->Indicators & C2Indicator_RegularBeaconing) {
+    if (indicators & C2Indicator_RegularBeaconing) {
         score += C2_SCORE_REGULAR_BEACON;
         Destination->DetectedType = C2Type_HTTPSBeacon;
     }
 
-    if (Destination->Indicators & C2Indicator_JitteredBeaconing) {
+    if (indicators & C2Indicator_JitteredBeaconing) {
         score += C2_SCORE_JITTERED_BEACON;
         if (Destination->DetectedType == C2Type_Unknown) {
             Destination->DetectedType = C2Type_HTTPSBeacon;
         }
     }
 
-    //
-    // JA3 scores
-    //
-    if (Destination->Indicators & C2Indicator_KnownJA3) {
-        score += C2_SCORE_KNOWN_JA3;
-    }
+    if (indicators & C2Indicator_KnownJA3)       score += C2_SCORE_KNOWN_JA3;
+    if (indicators & C2Indicator_KnownIP)        score += C2_SCORE_KNOWN_IP;
+    if (indicators & C2Indicator_KnownDomain)    score += C2_SCORE_KNOWN_DOMAIN;
+    if (indicators & C2Indicator_AbnormalPort)    score += C2_SCORE_ABNORMAL_PORT;
+    if (indicators & C2Indicator_EncodedPayload)  score += C2_SCORE_ENCODED_PAYLOAD;
+    if (indicators & C2Indicator_ProtocolAnomaly) score += C2_SCORE_PROTOCOL_ANOMALY;
 
-    //
-    // IOC scores
-    //
-    if (Destination->Indicators & C2Indicator_KnownIP) {
-        score += C2_SCORE_KNOWN_IP;
-    }
-
-    if (Destination->Indicators & C2Indicator_KnownDomain) {
-        score += C2_SCORE_KNOWN_DOMAIN;
-    }
-
-    //
-    // Port scores
-    //
-    if (Destination->Indicators & C2Indicator_AbnormalPort) {
-        score += C2_SCORE_ABNORMAL_PORT;
-    }
-
-    //
-    // Protocol scores
-    //
-    if (Destination->Indicators & C2Indicator_EncodedPayload) {
-        score += C2_SCORE_ENCODED_PAYLOAD;
-    }
-
-    if (Destination->Indicators & C2Indicator_ProtocolAnomaly) {
-        score += C2_SCORE_PROTOCOL_ANOMALY;
-    }
-
-    //
-    // Domain scores
-    //
-    if (Destination->Indicators & C2Indicator_DomainFronting) {
+    if (indicators & C2Indicator_DomainFronting) {
         score += C2_SCORE_DOMAIN_FRONTING;
         Destination->DetectedType = C2Type_DomainFronting;
     }
 
-    if (Destination->Indicators & C2Indicator_NewlyRegistered) {
-        score += C2_SCORE_NEWLY_REGISTERED;
-    }
-
-    //
-    // TLS scores
-    //
-    if (Destination->Indicators & C2Indicator_SelfSignedCert) {
-        score += C2_SCORE_SELF_SIGNED_CERT;
-    }
-
-    //
-    // Data pattern scores
-    //
-    if (Destination->Indicators & C2Indicator_DataSizePattern) {
-        score += C2_SCORE_DATA_SIZE_PATTERN;
-    }
+    if (indicators & C2Indicator_NewlyRegistered) score += C2_SCORE_NEWLY_REGISTERED;
+    if (indicators & C2Indicator_SelfSignedCert)  score += C2_SCORE_SELF_SIGNED_CERT;
+    if (indicators & C2Indicator_DataSizePattern) score += C2_SCORE_DATA_SIZE_PATTERN;
+    if (indicators & C2Indicator_LongSleepPattern) score += C2_SCORE_LONG_SLEEP;
+    if (indicators & C2Indicator_HighFrequency)   score += C2_SCORE_HIGH_FREQUENCY;
 
     if (Destination->BeaconAnalysis.ConsistentSize) {
         score += C2_SCORE_CONSISTENT_SIZE;
@@ -2195,7 +2091,7 @@ C2pCalculateSuspicionScore(
 }
 
 // ============================================================================
-// PRIVATE FUNCTIONS - CALLBACKS
+// PRIVATE — CALLBACKS
 // ============================================================================
 
 static VOID
@@ -2220,38 +2116,11 @@ C2pNotifyCallbacks(
 }
 
 // ============================================================================
-// PRIVATE FUNCTIONS - CLEANUP
-// ============================================================================
-
-static VOID
-C2pFreeBeaconSamples(
-    _In_ PC2_DETECTOR_INTERNAL Detector,
-    _Inout_ PC2_DESTINATION Destination
-    )
-{
-    KIRQL oldIrql;
-    PLIST_ENTRY entry;
-    PC2_BEACON_SAMPLE sample;
-
-    KeAcquireSpinLock(&Destination->SampleLock, &oldIrql);
-
-    while (!IsListEmpty(&Destination->BeaconSamples)) {
-        entry = RemoveHeadList(&Destination->BeaconSamples);
-        sample = CONTAINING_RECORD(entry, C2_BEACON_SAMPLE, ListEntry);
-        ExFreeToNPagedLookasideList(&Detector->SampleLookaside, sample);
-    }
-
-    Destination->SampleCount = 0;
-
-    KeReleaseSpinLock(&Destination->SampleLock, oldIrql);
-}
-
-// ============================================================================
-// PRIVATE FUNCTIONS - PROCESS CONTEXT
+// PRIVATE — PROCESS CONTEXT
 // ============================================================================
 
 static PC2_PROCESS_CONTEXT
-C2pFindProcessContext(
+C2pFindOrCreateProcessContext(
     _In_ PC2_DETECTOR Detector,
     _In_ HANDLE ProcessId
     )
@@ -2259,54 +2128,51 @@ C2pFindProcessContext(
     PLIST_ENTRY entry;
     PC2_PROCESS_CONTEXT context;
 
+    //
+    // Atomic find-or-create under exclusive lock
+    //
     KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Detector->ProcessListLock);
+    ExAcquirePushLockExclusive(&Detector->ProcessListLock);
 
     for (entry = Detector->ProcessList.Flink;
          entry != &Detector->ProcessList;
          entry = entry->Flink) {
-
         context = CONTAINING_RECORD(entry, C2_PROCESS_CONTEXT, ListEntry);
-
         if (context->ProcessId == ProcessId) {
-            ExReleasePushLockShared(&Detector->ProcessListLock);
+            ExReleasePushLockExclusive(&Detector->ProcessListLock);
             KeLeaveCriticalRegion();
             return context;
         }
     }
 
-    ExReleasePushLockShared(&Detector->ProcessListLock);
-    KeLeaveCriticalRegion();
-
-    return NULL;
-}
-
-static PC2_PROCESS_CONTEXT
-C2pCreateProcessContext(
-    _In_ PC2_DETECTOR Detector,
-    _In_ HANDLE ProcessId
-    )
-{
-    PC2_PROCESS_CONTEXT context;
-
-    context = (PC2_PROCESS_CONTEXT)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(C2_PROCESS_CONTEXT),
-        C2_POOL_TAG_CONTEXT
-    );
-
-    if (context == NULL) {
+    //
+    // Check limit
+    //
+    if (Detector->ProcessCount >= C2_MAX_TRACKED_PROCESSES) {
+        ExReleasePushLockExclusive(&Detector->ProcessListLock);
+        KeLeaveCriticalRegion();
         return NULL;
     }
 
-    RtlZeroMemory(context, sizeof(C2_PROCESS_CONTEXT));
-    context->ProcessId = ProcessId;
-    InitializeListHead(&context->DestinationList);
-    KeInitializeSpinLock(&context->DestinationLock);
-    context->RefCount = 1;
+    //
+    // Allocate new context
+    //
+    context = (PC2_PROCESS_CONTEXT)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(C2_PROCESS_CONTEXT),
+        C2_POOL_TAG_CONTEXT);
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Detector->ProcessListLock);
+    if (context == NULL) {
+        ExReleasePushLockExclusive(&Detector->ProcessListLock);
+        KeLeaveCriticalRegion();
+        return NULL;
+    }
+
+    context->ProcessId = ProcessId;
+    context->ProcessName[0] = L'\0';
+    InitializeListHead(&context->DestinationList);
+    ExInitializePushLock(&context->DestinationLock);
+    context->RefCount = 1;
 
     InsertTailList(&Detector->ProcessList, &context->ListEntry);
     InterlockedIncrement(&Detector->ProcessCount);
@@ -2322,80 +2188,90 @@ C2pFreeProcessContext(
     _Inout_ PC2_PROCESS_CONTEXT Context
     )
 {
-    if (Context->ProcessName.Buffer != NULL) {
-        ExFreePoolWithTag(Context->ProcessName.Buffer, C2_POOL_TAG_CONTEXT);
-    }
-
     ExFreePoolWithTag(Context, C2_POOL_TAG_CONTEXT);
 }
 
 // ============================================================================
-// PRIVATE FUNCTIONS - UTILITIES
+// PRIVATE — RESULT ALLOCATION
+//
+// Results are allocated with ExAllocatePool2 and freed with ExFreePoolWithTag.
+// This avoids the lookaside-alloc/pool-free mismatch.
 // ============================================================================
 
-static ULONG
-C2pQuickSort(
-    _Inout_ PULONG Array,
-    _In_ ULONG Count
-    )
+static PC2_DETECTION_RESULT
+C2pAllocateResult(VOID)
 {
-    ULONG i, j;
-    ULONG temp;
-
-    //
-    // Simple insertion sort for small arrays
-    //
-    for (i = 1; i < Count; i++) {
-        temp = Array[i];
-        j = i;
-
-        while (j > 0 && Array[j - 1] > temp) {
-            Array[j] = Array[j - 1];
-            j--;
-        }
-
-        Array[j] = temp;
-    }
-
-    return Count;
+    return (PC2_DETECTION_RESULT)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(C2_DETECTION_RESULT),
+        C2_POOL_TAG_RESULT);
 }
 
 static VOID
-C2pCleanupWorkItem(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+C2pFillResultFromDestination(
+    _Out_ PC2_DETECTION_RESULT Result,
+    _In_ PC2_DESTINATION Destination
     )
 {
-    PC2_DETECTOR_INTERNAL detector = (PC2_DETECTOR_INTERNAL)Context;
-    PLIST_ENTRY entry;
-    PLIST_ENTRY next;
+    RtlZeroMemory(Result, sizeof(C2_DETECTION_RESULT));
+
+    Result->C2Detected = (Destination->SuspicionScore >= C2_ALERT_THRESHOLD);
+    Result->Type = Destination->DetectedType;
+    Result->Indicators = (C2_INDICATORS)Destination->Indicators;
+    Result->ConfidenceScore = min(Destination->SuspicionScore, 100);
+    Result->SeverityScore = Destination->SuspicionScore;
+
+    //
+    // Snapshot destination identity (no raw pointer stored)
+    //
+    if (Destination->IsIPv6) {
+        RtlCopyMemory(&Result->Destination.Address.IPv6,
+                       &Destination->Address.IPv6, sizeof(IN6_ADDR));
+    } else {
+        RtlCopyMemory(&Result->Destination.Address.IPv4,
+                       &Destination->Address.IPv4, sizeof(IN_ADDR));
+    }
+    Result->Destination.IsIPv6 = Destination->IsIPv6;
+    Result->Destination.Port = Destination->Port;
+    RtlCopyMemory(Result->Destination.Hostname, Destination->Hostname,
+                   sizeof(Result->Destination.Hostname));
+
+    RtlCopyMemory(&Result->BeaconAnalysis, &Destination->BeaconAnalysis,
+                   sizeof(C2_BEACON_ANALYSIS));
+    RtlCopyMemory(&Result->JA3, &Destination->JA3Fingerprint,
+                   sizeof(C2_JA3_FINGERPRINT));
+
+    KeQuerySystemTime(&Result->DetectionTime);
+}
+
+// ============================================================================
+// PRIVATE — STALE ENTRY CLEANUP (PASSIVE_LEVEL)
+// ============================================================================
+
+static VOID
+C2pCleanupStaleEntries(
+    _In_ PC2_DETECTOR_INTERNAL Detector
+    )
+{
+    PC2_DETECTOR pub = &Detector->Public;
+    PLIST_ENTRY entry, next;
     PC2_DESTINATION destination;
     LARGE_INTEGER currentTime;
     LARGE_INTEGER cutoffTime;
 
-    UNREFERENCED_PARAMETER(DeviceObject);
-
-    if (detector == NULL || !detector->Public.Initialized) {
-        return;
-    }
-
-    if (InterlockedCompareExchange(&detector->CleanupInProgress, 1, 0) != 0) {
+    if (InterlockedCompareExchange(&pub->CleanupInProgress, 1, 0) != 0) {
         return;
     }
 
     KeQuerySystemTime(&currentTime);
     cutoffTime.QuadPart = currentTime.QuadPart -
-                          ((LONGLONG)C2_CLEANUP_INTERVAL_MS * 10000 * 10); // 10 minutes
+                          ((LONGLONG)C2_CLEANUP_STALE_AGE_MS * 10000);
 
-    //
-    // Remove stale destinations
-    //
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&detector->Public.DestinationListLock);
-    ExAcquirePushLockExclusive(&detector->Public.DestinationHash.Lock);
+    ExAcquirePushLockExclusive(&pub->DestinationLock);
 
-    for (entry = detector->Public.DestinationList.Flink;
-         entry != &detector->Public.DestinationList;
+    for (entry = pub->DestinationList.Flink;
+         entry != &pub->DestinationList;
          entry = next) {
 
         next = entry->Flink;
@@ -2407,15 +2283,19 @@ C2pCleanupWorkItem(
 
             RemoveEntryList(&destination->ListEntry);
             RemoveEntryList(&destination->HashEntry);
-            InterlockedDecrement(&detector->Public.DestinationCount);
+            InterlockedDecrement(&pub->DestinationCount);
 
-            C2pFreeDestination(detector, destination);
+            //
+            // Release the list's reference. If this was the last ref
+            // the destination is freed.
+            //
+            C2pDereferenceDestination(Detector, destination);
         }
     }
 
-    ExReleasePushLockExclusive(&detector->Public.DestinationHash.Lock);
-    ExReleasePushLockExclusive(&detector->Public.DestinationListLock);
+    ExReleasePushLockExclusive(&pub->DestinationLock);
     KeLeaveCriticalRegion();
 
-    InterlockedExchange(&detector->CleanupInProgress, 0);
+    InterlockedExchange(&pub->CleanupInProgress, 0);
+    KeSetEvent(&pub->CleanupCompleteEvent, IO_NO_INCREMENT, FALSE);
 }

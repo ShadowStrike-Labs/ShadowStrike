@@ -41,11 +41,6 @@ extern "C" {
 #define DNS_QUERY_TIMEOUT_MS            30000
 #define DNS_CACHE_TTL_SECONDS           3600
 #define DNS_TUNNEL_ENTROPY_THRESHOLD    75
-#define DNS_MAX_PROCESS_CONTEXTS        4096
-#define DNS_MAX_TUNNEL_CONTEXTS         4096
-#define DNS_MAX_RESPONSE_ADDRESSES      16
-#define DNS_MAX_CNAMES                  4
-#define DNS_MAX_CACHED_ADDRESSES        8
 
 //=============================================================================
 // DNS Record Types
@@ -56,7 +51,6 @@ typedef enum _DNS_RECORD_TYPE {
     DnsType_NS          = 2,
     DnsType_CNAME       = 5,
     DnsType_SOA         = 6,
-    DnsType_NULL        = 10,
     DnsType_PTR         = 12,
     DnsType_MX          = 15,
     DnsType_TXT         = 16,
@@ -86,44 +80,19 @@ typedef enum _DNS_QUERY_FLAGS {
 
 typedef enum _DNS_SUSPICION {
     DnsSuspicion_None               = 0x00000000,
-    DnsSuspicion_HighEntropy        = 0x00000001,
-    DnsSuspicion_LongSubdomain      = 0x00000002,
-    DnsSuspicion_ManySubdomains     = 0x00000004,
-    DnsSuspicion_DGA                = 0x00000008,
-    DnsSuspicion_FastFlux           = 0x00000010,
-    DnsSuspicion_NewlyRegistered    = 0x00000020,
-    DnsSuspicion_TunnelPattern      = 0x00000040,
-    DnsSuspicion_UnusualType        = 0x00000080,
-    DnsSuspicion_HighVolume         = 0x00000100,
-    DnsSuspicion_KnownBad           = 0x00000200,
-    DnsSuspicion_HomoglyphAttack    = 0x00000400,
-    DnsSuspicion_Typosquatting      = 0x00000800,
+    DnsSuspicion_HighEntropy        = 0x00000001,   // High entropy subdomain
+    DnsSuspicion_LongSubdomain      = 0x00000002,   // Unusually long
+    DnsSuspicion_ManySubdomains     = 0x00000004,   // Many subdomain levels
+    DnsSuspicion_DGA                = 0x00000008,   // DGA-like pattern
+    DnsSuspicion_FastFlux           = 0x00000010,   // Fast-flux DNS
+    DnsSuspicion_NewlyRegistered    = 0x00000020,   // New domain
+    DnsSuspicion_TunnelPattern      = 0x00000040,   // Tunneling pattern
+    DnsSuspicion_UnusualType        = 0x00000080,   // Unusual record type
+    DnsSuspicion_HighVolume         = 0x00000100,   // High query volume
+    DnsSuspicion_KnownBad           = 0x00000200,   // Known malicious
+    DnsSuspicion_HomoglyphAttack    = 0x00000400,   // IDN homoglyph
+    DnsSuspicion_Typosquatting      = 0x00000800,   // Typosquat of known
 } DNS_SUSPICION;
-
-//=============================================================================
-// Domain Reputation (named enum, not anonymous inside struct)
-//=============================================================================
-
-typedef enum _DNS_REPUTATION {
-    DnsReputation_Unknown = 0,
-    DnsReputation_Safe,
-    DnsReputation_Suspicious,
-    DnsReputation_Malicious,
-    DnsReputation_Whitelisted,
-    DnsReputation_MaxValue
-} DNS_REPUTATION;
-
-//=============================================================================
-// Resolved Address Entry (supports mixed A/AAAA)
-//=============================================================================
-
-typedef struct _DNS_RESOLVED_ADDRESS {
-    BOOLEAN IsIPv6;
-    union {
-        IN_ADDR IPv4;
-        IN6_ADDR IPv6;
-    } Address;
-} DNS_RESOLVED_ADDRESS, *PDNS_RESOLVED_ADDRESS;
 
 //=============================================================================
 // DNS Query Entry
@@ -147,8 +116,7 @@ typedef struct _DNS_QUERY {
     // Source information
     //
     HANDLE ProcessId;
-    WCHAR ProcessNameBuffer[260];
-    USHORT ProcessNameLength;       // in bytes
+    UNICODE_STRING ProcessName;
     union {
         IN_ADDR IPv4;
         IN6_ADDR IPv6;
@@ -173,9 +141,12 @@ typedef struct _DNS_QUERY {
         USHORT ResponseCode;
         ULONG AnswerCount;
         ULONG TTL;
-        DNS_RESOLVED_ADDRESS Addresses[DNS_MAX_RESPONSE_ADDRESSES];
+        union {
+            IN_ADDR IPv4[16];
+            IN6_ADDR IPv6[16];
+        } Addresses;
         ULONG AddressCount;
-        CHAR CNAMEs[DNS_MAX_CNAMES][DNS_MAX_NAME_LENGTH + 1];
+        CHAR CNAMEs[4][DNS_MAX_NAME_LENGTH + 1];
         ULONG CNAMECount;
     } Response;
     
@@ -196,7 +167,7 @@ typedef struct _DNS_QUERY {
     // Analysis results
     //
     struct {
-        ULONG Entropy;                  // 0-800 (scaled by 100)
+        ULONG Entropy;                  // 0-100
         ULONG SubdomainCount;
         ULONG MaxLabelLength;
         BOOLEAN ContainsNumbers;
@@ -233,15 +204,24 @@ typedef struct _DNS_DOMAIN_CACHE {
     LARGE_INTEGER LastSeen;
     
     //
-    // Resolution data (supports mixed A/AAAA)
+    // Resolution data
     //
-    DNS_RESOLVED_ADDRESS KnownAddresses[DNS_MAX_CACHED_ADDRESSES];
+    union {
+        IN_ADDR IPv4[8];
+        IN6_ADDR IPv6[8];
+    } KnownAddresses;
     ULONG AddressCount;
     
     //
     // Reputation
     //
-    DNS_REPUTATION Reputation;
+    enum {
+        Reputation_Unknown = 0,
+        Reputation_Safe,
+        Reputation_Suspicious,
+        Reputation_Malicious,
+        Reputation_Whitelisted
+    } Reputation;
     ULONG ReputationScore;              // 0-100 (higher = safer)
     
     //
@@ -266,8 +246,7 @@ typedef struct _DNS_PROCESS_CONTEXT {
     // Process identification
     //
     HANDLE ProcessId;
-    WCHAR ProcessNameBuffer[260];
-    USHORT ProcessNameLength;       // in bytes
+    UNICODE_STRING ProcessName;
     
     //
     // Query tracking
@@ -290,7 +269,6 @@ typedef struct _DNS_PROCESS_CONTEXT {
     ULONG QueriesPerMinute;
     ULONG UniqueDomainsPerMinute;
     BOOLEAN HighDnsActivity;
-    LARGE_INTEGER CreationTime;
     
     //
     // Reference counting
@@ -305,10 +283,80 @@ typedef struct _DNS_PROCESS_CONTEXT {
 } DNS_PROCESS_CONTEXT, *PDNS_PROCESS_CONTEXT;
 
 //=============================================================================
-// DNS Monitor (opaque handle — internals hidden in .c)
+// DNS Monitor
 //=============================================================================
 
-typedef struct _DNS_MONITOR DNS_MONITOR, *PDNS_MONITOR;
+typedef struct _DNS_MONITOR {
+    //
+    // Initialization state
+    //
+    BOOLEAN Initialized;
+    
+    //
+    // Query tracking
+    //
+    LIST_ENTRY QueryList;
+    EX_PUSH_LOCK QueryListLock;
+    volatile LONG QueryCount;
+    volatile LONG64 NextQueryId;
+    
+    //
+    // Transaction ID lookup
+    //
+    struct {
+        LIST_ENTRY* Buckets;
+        ULONG BucketCount;
+        KSPIN_LOCK Lock;
+    } TransactionHash;
+    
+    //
+    // Domain cache
+    //
+    LIST_ENTRY DomainCache;
+    EX_PUSH_LOCK DomainCacheLock;
+    volatile LONG CacheEntryCount;
+    struct {
+        LIST_ENTRY* Buckets;
+        ULONG BucketCount;
+    } DomainHash;
+    
+    //
+    // Process contexts
+    //
+    LIST_ENTRY ProcessList;
+    EX_PUSH_LOCK ProcessListLock;
+    volatile LONG ProcessCount;
+    
+    //
+    // Cleanup timer
+    //
+    KTIMER CleanupTimer;
+    KDPC CleanupDpc;
+    
+    //
+    // Statistics
+    //
+    struct {
+        volatile LONG64 TotalQueries;
+        volatile LONG64 TotalResponses;
+        volatile LONG64 SuspiciousQueries;
+        volatile LONG64 BlockedQueries;
+        volatile LONG64 TunnelDetections;
+        LARGE_INTEGER StartTime;
+    } Stats;
+    
+    //
+    // Configuration
+    //
+    struct {
+        BOOLEAN EnableTunnelingDetection;
+        BOOLEAN EnableDGADetection;
+        ULONG EntropyThreshold;
+        ULONG MaxSubdomainLength;
+        ULONG QueryRateThreshold;
+    } Config;
+    
+} DNS_MONITOR, *PDNS_MONITOR;
 
 //=============================================================================
 // Callback Types
@@ -397,19 +445,18 @@ DnsDetectDGA(
 // Public API - Domain Cache
 //=============================================================================
 
-_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 DnsLookupDomain(
     _In_ PDNS_MONITOR Monitor,
     _In_ PCSTR DomainName,
-    _Out_ PDNS_DOMAIN_CACHE EntryCopy
+    _Out_ PDNS_DOMAIN_CACHE* Entry
     );
 
 NTSTATUS
 DnsSetDomainReputation(
     _In_ PDNS_MONITOR Monitor,
     _In_ PCSTR DomainName,
-    _In_ DNS_REPUTATION Reputation,
+    _In_ ULONG Reputation,
     _In_ ULONG Score
     );
 

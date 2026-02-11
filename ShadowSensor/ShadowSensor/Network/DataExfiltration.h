@@ -1,10 +1,24 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: DataExfiltration.h
-    
+
     Purpose: Data exfiltration detection and prevention (DLP)
              through traffic analysis and content inspection.
-             
+
+    Architecture:
+    - All public APIs run at IRQL PASSIVE_LEVEL only.
+    - Synchronization uses EX_PUSH_LOCK (PASSIVE/APC safe) throughout.
+    - Transfer lookup uses a hash table (O(1) amortized) instead of linear scan.
+    - Transfer contexts are reference-counted; DPC cleanup only releases refs.
+    - Rundown protection (EX_RUNDOWN_REF) guards shutdown vs in-flight operations.
+    - DX_DETECTOR is opaque to consumers; internal state is hidden in .c file.
+
+    MITRE ATT&CK Coverage (implemented):
+    - T1041: Exfiltration Over C2 Channel
+    - T1567: Exfiltration Over Web Service
+    - T1537: Transfer Data to Cloud Account
+    - T1030: Data Transfer Size Limits
+
     Copyright (c) ShadowStrike Team
 --*/
 
@@ -21,9 +35,9 @@ extern "C" {
 // Pool Tags
 //=============================================================================
 
-#define DX_POOL_TAG_CONTEXT     'CXXD'  // Data Exfil - Context
-#define DX_POOL_TAG_PATTERN     'PXXD'  // Data Exfil - Pattern
-#define DX_POOL_TAG_ALERT       'AXXD'  // Data Exfil - Alert
+#define DX_POOL_TAG_CONTEXT     'CXXD'
+#define DX_POOL_TAG_PATTERN     'PXXD'
+#define DX_POOL_TAG_ALERT       'AXXD'
 
 //=============================================================================
 // Configuration
@@ -31,7 +45,8 @@ extern "C" {
 
 #define DX_MAX_PATTERNS                 1024
 #define DX_MAX_CONTENT_SAMPLE           4096
-#define DX_VOLUME_THRESHOLD_MB          100     // Per minute
+#define DX_MAX_INSPECT_SIZE             (64 * 1024)  // Max bytes to inspect per call
+#define DX_VOLUME_THRESHOLD_MB          100
 #define DX_ENTROPY_THRESHOLD            80
 
 //=============================================================================
@@ -45,9 +60,6 @@ typedef enum _DX_EXFIL_TYPE {
     DxExfil_EncryptedArchive,
     DxExfil_CloudStorage,
     DxExfil_EmailAttachment,
-    DxExfil_DNSTunnel,
-    DxExfil_ICMPTunnel,
-    DxExfil_SteganoGraphy,
     DxExfil_SensitiveData,
 } DX_EXFIL_TYPE;
 
@@ -61,63 +73,54 @@ typedef enum _DX_INDICATORS {
     DxIndicator_HighEntropy         = 0x00000002,
     DxIndicator_CompressedData      = 0x00000004,
     DxIndicator_EncryptedData       = 0x00000008,
-    DxIndicator_EncodedData         = 0x00000010,   // Base64, etc.
+    DxIndicator_EncodedData         = 0x00000010,
     DxIndicator_SensitivePattern    = 0x00000020,
     DxIndicator_UnusualDestination  = 0x00000040,
     DxIndicator_UnusualProtocol     = 0x00000080,
-    DxIndicator_UnusualTime         = 0x00000100,   // Off-hours
+    DxIndicator_UnusualTime         = 0x00000100,
     DxIndicator_BurstTransfer       = 0x00000200,
     DxIndicator_CloudUpload         = 0x00000400,
     DxIndicator_PersonalEmail       = 0x00000800,
 } DX_INDICATORS;
 
 //=============================================================================
-// Sensitive Data Pattern
+// Pattern Types
+//=============================================================================
+
+typedef enum _DX_PATTERN_TYPE {
+    PatternType_Keyword = 0,
+    PatternType_FileSignature,
+} DX_PATTERN_TYPE;
+
+//=============================================================================
+// Sensitive Data Pattern (read-only view for callers)
 //=============================================================================
 
 typedef struct _DX_PATTERN {
     ULONG PatternId;
     CHAR PatternName[64];
-    
-    enum {
-        PatternType_Regex,
-        PatternType_Keyword,
-        PatternType_FileSignature,
-        PatternType_DataFormat,
-    } Type;
-    
+    DX_PATTERN_TYPE Type;
+
     PUCHAR Pattern;
     ULONG PatternSize;
-    
-    enum {
-        Sensitivity_Low = 1,
-        Sensitivity_Medium = 2,
-        Sensitivity_High = 3,
-        Sensitivity_Critical = 4,
-    } Sensitivity;
-    
-    CHAR Category[32];                  // PII, Financial, Source Code, etc.
-    
+
+    ULONG Sensitivity;          // 1=Low, 2=Medium, 3=High, 4=Critical
+    CHAR Category[32];
+
     volatile LONG MatchCount;
-    
+    volatile LONG RefCount;     // Reference count for safe lifetime
     LIST_ENTRY ListEntry;
-    
+
 } DX_PATTERN, *PDX_PATTERN;
 
 //=============================================================================
-// Transfer Context
+// Transfer Context (reference-counted)
 //=============================================================================
 
 typedef struct _DX_TRANSFER_CONTEXT {
-    //
-    // Transfer identification
-    //
     ULONG64 TransferId;
     HANDLE ProcessId;
-    
-    //
-    // Destination
-    //
+
     union {
         IN_ADDR IPv4;
         IN6_ADDR IPv6;
@@ -125,43 +128,41 @@ typedef struct _DX_TRANSFER_CONTEXT {
     USHORT RemotePort;
     BOOLEAN IsIPv6;
     CHAR Hostname[256];
-    
-    //
-    // Transfer statistics
-    //
-    SIZE_T BytesTransferred;
+
+    volatile LONG64 BytesTransferred;
     SIZE_T BytesPerSecond;
     LARGE_INTEGER StartTime;
     LARGE_INTEGER LastActivityTime;
-    
-    //
-    // Content analysis
-    //
+
     ULONG Entropy;
     BOOLEAN IsCompressed;
     BOOLEAN IsEncrypted;
     BOOLEAN IsEncoded;
-    
+
     //
-    // Pattern matches
+    // Pattern match snapshots — stores copies of category/sensitivity,
+    // not raw pointers to pattern objects (avoids dangling pointer).
     //
     struct {
-        PDX_PATTERN Pattern;
+        CHAR Category[32];
+        ULONG Sensitivity;
         ULONG MatchCount;
     } Matches[16];
     ULONG MatchCount;
-    
-    //
-    // Indicators
-    //
+
     DX_INDICATORS Indicators;
     ULONG SuspicionScore;
-    
+
     //
-    // List linkage
+    // Reference counting for safe lifetime management
     //
-    LIST_ENTRY ListEntry;
-    
+    volatile LONG RefCount;
+
+    //
+    // Hash table linkage
+    //
+    LIST_ENTRY HashEntry;
+
 } DX_TRANSFER_CONTEXT, *PDX_TRANSFER_CONTEXT;
 
 //=============================================================================
@@ -169,24 +170,15 @@ typedef struct _DX_TRANSFER_CONTEXT {
 //=============================================================================
 
 typedef struct _DX_ALERT {
-    //
-    // Alert details
-    //
     ULONG64 AlertId;
     DX_EXFIL_TYPE Type;
     DX_INDICATORS Indicators;
     ULONG SeverityScore;
-    
-    //
-    // Source
-    //
+
     HANDLE ProcessId;
-    UNICODE_STRING ProcessName;
-    UNICODE_STRING UserName;
-    
-    //
-    // Destination
-    //
+    WCHAR ProcessNameBuffer[260];
+    USHORT ProcessNameLength;        // in bytes
+
     union {
         IN_ADDR IPv4;
         IN6_ADDR IPv6;
@@ -194,96 +186,33 @@ typedef struct _DX_ALERT {
     BOOLEAN IsIPv6;
     CHAR Hostname[256];
     USHORT RemotePort;
-    
-    //
-    // Transfer details
-    //
+
     SIZE_T DataSize;
     LARGE_INTEGER TransferStartTime;
     ULONG TransferDurationMs;
-    
-    //
-    // Content summary
-    //
+
     struct {
         CHAR Category[32];
         ULONG MatchCount;
     } SensitiveDataFound[8];
     ULONG CategoryCount;
-    
-    //
-    // Action taken
-    //
+
     BOOLEAN WasBlocked;
-    
-    //
-    // Timing
-    //
     LARGE_INTEGER AlertTime;
-    
-    //
-    // List linkage
-    //
     LIST_ENTRY ListEntry;
-    
+
 } DX_ALERT, *PDX_ALERT;
 
 //=============================================================================
-// Data Exfiltration Detector
+// Opaque Detector Handle
 //=============================================================================
 
-typedef struct _DX_DETECTOR {
-    //
-    // Initialization state
-    //
-    BOOLEAN Initialized;
-    
-    //
-    // Pattern database
-    //
-    LIST_ENTRY PatternList;
-    EX_PUSH_LOCK PatternLock;
-    volatile LONG PatternCount;
-    
-    //
-    // Active transfers
-    //
-    LIST_ENTRY TransferList;
-    KSPIN_LOCK TransferLock;
-    volatile LONG TransferCount;
-    
-    //
-    // Alerts
-    //
-    LIST_ENTRY AlertList;
-    KSPIN_LOCK AlertLock;
-    volatile LONG AlertCount;
-    volatile LONG64 NextAlertId;
-    
-    //
-    // Statistics
-    //
-    struct {
-        volatile LONG64 BytesInspected;
-        volatile LONG64 TransfersAnalyzed;
-        volatile LONG64 AlertsGenerated;
-        volatile LONG64 TransfersBlocked;
-        volatile LONG64 PatternMatches;
-        LARGE_INTEGER StartTime;
-    } Stats;
-    
-    //
-    // Configuration
-    //
-    struct {
-        SIZE_T VolumeThresholdPerMinute;
-        ULONG EntropyThreshold;
-        BOOLEAN EnableContentInspection;
-        BOOLEAN EnableCloudDetection;
-        BOOLEAN BlockOnDetection;
-    } Config;
-    
-} DX_DETECTOR, *PDX_DETECTOR;
+//
+// DX_DETECTOR is opaque — consumers receive PDX_DETECTOR but cannot
+// access internal fields. The full structure is defined only in
+// DataExfiltration.c.
+//
+typedef struct _DX_DETECTOR DX_DETECTOR, *PDX_DETECTOR;
 
 //=============================================================================
 // Callback Types
@@ -300,23 +229,26 @@ typedef BOOLEAN (*DX_BLOCK_CALLBACK)(
     );
 
 //=============================================================================
-// Public API - Initialization
+// Public API - Initialization (PASSIVE_LEVEL only)
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 DxInitialize(
     _Out_ PDX_DETECTOR* Detector
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 DxShutdown(
     _Inout_ PDX_DETECTOR Detector
     );
 
 //=============================================================================
-// Public API - Pattern Management
+// Public API - Pattern Management (PASSIVE_LEVEL only)
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 DxAddPattern(
     _In_ PDX_DETECTOR Detector,
@@ -328,49 +260,50 @@ DxAddPattern(
     _Out_ PULONG PatternId
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 DxRemovePattern(
     _In_ PDX_DETECTOR Detector,
     _In_ ULONG PatternId
     );
 
-NTSTATUS
-DxLoadPatterns(
-    _In_ PDX_DETECTOR Detector,
-    _In_ PUNICODE_STRING FilePath
-    );
-
 //=============================================================================
-// Public API - Traffic Analysis
+// Public API - Traffic Analysis (PASSIVE_LEVEL only)
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 DxAnalyzeTraffic(
     _In_ PDX_DETECTOR Detector,
     _In_ HANDLE ProcessId,
-    _In_ PVOID RemoteAddress,
+    _In_reads_bytes_(RemoteAddressSize) PVOID RemoteAddress,
+    _In_ ULONG RemoteAddressSize,
     _In_ USHORT RemotePort,
     _In_ BOOLEAN IsIPv6,
     _In_reads_bytes_(DataSize) PVOID Data,
     _In_ SIZE_T DataSize,
     _Out_ PBOOLEAN IsSuspicious,
+    _Out_opt_ PBOOLEAN WasBlocked,
     _Out_opt_ PULONG SuspicionScore
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 DxRecordTransfer(
     _In_ PDX_DETECTOR Detector,
     _In_ HANDLE ProcessId,
-    _In_ PVOID RemoteAddress,
+    _In_reads_bytes_(RemoteAddressSize) PVOID RemoteAddress,
+    _In_ ULONG RemoteAddressSize,
     _In_ USHORT RemotePort,
     _In_ BOOLEAN IsIPv6,
     _In_ SIZE_T BytesSent
     );
 
 //=============================================================================
-// Public API - Content Inspection
+// Public API - Content Inspection (PASSIVE_LEVEL only)
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 DxInspectContent(
     _In_ PDX_DETECTOR Detector,
@@ -382,6 +315,7 @@ DxInspectContent(
     _Out_ PULONG MatchCount
     );
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 DxCalculateEntropy(
     _In_reads_bytes_(DataSize) PVOID Data,
@@ -390,9 +324,10 @@ DxCalculateEntropy(
     );
 
 //=============================================================================
-// Public API - Alerts
+// Public API - Alerts (PASSIVE_LEVEL only)
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 DxGetAlerts(
     _In_ PDX_DETECTOR Detector,
@@ -401,15 +336,18 @@ DxGetAlerts(
     _Out_ PULONG AlertCount
     );
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
 VOID
 DxFreeAlert(
+    _In_ PDX_DETECTOR Detector,
     _In_ PDX_ALERT Alert
     );
 
 //=============================================================================
-// Public API - Callbacks
+// Public API - Callbacks (PASSIVE_LEVEL only)
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 DxRegisterAlertCallback(
     _In_ PDX_DETECTOR Detector,
@@ -417,6 +355,7 @@ DxRegisterAlertCallback(
     _In_opt_ PVOID Context
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 DxRegisterBlockCallback(
     _In_ PDX_DETECTOR Detector,
@@ -424,6 +363,7 @@ DxRegisterBlockCallback(
     _In_opt_ PVOID Context
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 DxUnregisterCallbacks(
     _In_ PDX_DETECTOR Detector
@@ -443,6 +383,7 @@ typedef struct _DX_STATISTICS {
     LARGE_INTEGER UpTime;
 } DX_STATISTICS, *PDX_STATISTICS;
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 DxGetStatistics(
     _In_ PDX_DETECTOR Detector,

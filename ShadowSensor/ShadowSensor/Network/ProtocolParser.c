@@ -4,30 +4,26 @@
  * ============================================================================
  *
  * @file ProtocolParser.c
- * @brief Enterprise-grade network protocol parsing for HTTP, DNS, and more.
+ * @brief Enterprise-grade network protocol parsing for HTTP/1.x and DNS.
  *
- * Implements CrowdStrike Falcon-class protocol parsing with:
+ * Features:
  * - HTTP/1.0, HTTP/1.1 request and response parsing
- * - DNS query and response parsing with compression support
+ * - DNS query and response parsing with compression pointer safety
  * - Suspicious pattern detection (C2 beacons, encoded payloads)
  * - Header extraction and normalization
- * - Content-Type and encoding detection
- * - Thread-safe operation with minimal allocations
+ * - Thread-safe via EX_RUNDOWN_REF (concurrent parse + safe shutdown)
+ * - Memory-budgeted: caps concurrent outstanding allocations
  *
- * Security Considerations:
- * - All input is treated as hostile
- * - Strict bounds checking on all operations
- * - No unbounded allocations
+ * Security model:
+ * - All input is treated as hostile / attacker-controlled
+ * - Strict bounds checking on all buffer operations
+ * - Bounded allocations from PagedPool (never NonPagedPool)
  * - Malformed packet detection and rejection
- *
- * Performance Optimizations:
- * - Zero-copy parsing where possible
- * - Lookaside list allocations
- * - Early rejection of non-matching data
- * - Minimal string operations
+ * - No CRT string functions — all bounded kernel equivalents
+ * - Body data is copied (never aliased into caller buffer)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -47,34 +43,14 @@
 // PRIVATE CONSTANTS
 // ============================================================================
 
-/**
- * @brief Minimum size for HTTP data detection
- */
 #define PP_MIN_HTTP_SIZE                16
-
-/**
- * @brief Minimum size for DNS packet
- */
 #define PP_MIN_DNS_SIZE                 12
-
-/**
- * @brief DNS header size
- */
 #define PP_DNS_HEADER_SIZE              12
-
-/**
- * @brief Maximum DNS name length after decompression
- */
 #define PP_MAX_DNS_NAME                 256
+#define PP_MAX_DNS_COMPRESSION_DEPTH    8
+#define PP_MAX_STATUS_CODE_DIGITS       3
+#define PP_MAX_CONTENT_LENGTH_DIGITS    15
 
-/**
- * @brief Maximum DNS compression pointer depth (prevent infinite loops)
- */
-#define PP_MAX_DNS_COMPRESSION_DEPTH    16
-
-/**
- * @brief HTTP method strings
- */
 static const CHAR* g_HttpMethods[] = {
     "",           // Unknown
     "GET",
@@ -93,34 +69,19 @@ static const ULONG g_HttpMethodLengths[] = {
 };
 
 /**
- * @brief Suspicious User-Agent patterns (C2 indicators)
- */
-static const CHAR* g_SuspiciousUserAgents[] = {
-    "Mozilla/4.0",              // Old, often used by malware
-    "Mozilla/5.0 (compatible)", // Generic, often default in C2
-    "Java/",                    // Java downloaders
-    "Python-urllib",            // Python scripts
-    "curl/",                    // Command line tools
-    "Wget/",                    // Command line tools
-    "PowerShell/",              // PowerShell scripts
-    NULL
-};
-
-/**
- * @brief Suspicious URI patterns
+ * Suspicious URI patterns — indicators of exploitation attempts.
+ * These are attack-vector patterns, not legitimate tool signatures.
  */
 static const CHAR* g_SuspiciousUriPatterns[] = {
-    "/admin",
-    "/shell",
-    "/cmd",
-    "/exec",
-    "/eval",
-    "/upload",
-    "..%2f",                    // Path traversal encoded
-    "..%5c",                    // Path traversal encoded
+    "..%2f",                    // Path traversal (URL-encoded /)
+    "..%5c",                    // Path traversal (URL-encoded \)
     "%00",                      // Null byte injection
     "<script",                  // XSS attempt
     "UNION%20SELECT",           // SQL injection
+    "%27OR%20",                 // SQL injection (encoded ')
+    "/etc/passwd",              // LFI attempt
+    "cmd.exe",                  // RCE attempt
+    "powershell%20",            // RCE attempt
     NULL
 };
 
@@ -183,16 +144,18 @@ PppCalculateSuspicionScore(
     _Inout_ PPP_HTTP_REQUEST Request
     );
 
-static PCSTR
+static NTSTATUS
 PppFindLineEnd(
     _In_reads_bytes_(DataSize) PCSTR Data,
     _In_ ULONG DataSize,
-    _Out_ PULONG LineLength
+    _Out_ PULONG LineLength,
+    _Out_ PCSTR* LineEnd
     );
 
 static VOID
 PppTrimWhitespace(
-    _Inout_ PSTR String
+    _Inout_ PSTR String,
+    _In_ ULONG MaxLen
     );
 
 static ULONG
@@ -211,23 +174,88 @@ PppParseDnsName(
     _Out_ PULONG BytesConsumed
     );
 
-static ULONG
-PppCalculateDomainEntropy(
-    _In_z_ PCSTR Domain
+static BOOLEAN
+PppSafeBoundedSearch(
+    _In_reads_bytes_(HaystackLen) PCSTR Haystack,
+    _In_ ULONG HaystackLen,
+    _In_z_ PCSTR Needle
     );
+
+static NTSTATUS
+PppParseUlongBounded(
+    _In_reads_bytes_(MaxLen) PCSTR String,
+    _In_ ULONG MaxLen,
+    _In_ ULONG MaxValue,
+    _Out_ PULONG Result
+    );
+
+// Rundown helpers
+static BOOLEAN
+PppAcquireRundown(
+    _In_ PPP_PARSER Parser
+    );
+
+static VOID
+PppReleaseRundown(
+    _In_ PPP_PARSER Parser
+    );
+
+// Allocation tracking
+static BOOLEAN
+PppTrackAllocation(
+    _In_ PPP_PARSER Parser
+    );
+
+static VOID
+PppUntrackAllocation(
+    _In_ PPP_PARSER Parser
+    );
+
+// ============================================================================
+// PRIVATE - RUNDOWN + ALLOCATION TRACKING
+// ============================================================================
+
+static BOOLEAN
+PppAcquireRundown(
+    _In_ PPP_PARSER Parser
+    )
+{
+    return ExAcquireRundownProtection(&Parser->RundownRef);
+}
+
+static VOID
+PppReleaseRundown(
+    _In_ PPP_PARSER Parser
+    )
+{
+    ExReleaseRundownProtection(&Parser->RundownRef);
+}
+
+static BOOLEAN
+PppTrackAllocation(
+    _In_ PPP_PARSER Parser
+    )
+{
+    LONG current = InterlockedIncrement(&Parser->ActiveAllocations);
+    if (current > PP_MAX_CONCURRENT_ALLOCS) {
+        InterlockedDecrement(&Parser->ActiveAllocations);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static VOID
+PppUntrackAllocation(
+    _In_ PPP_PARSER Parser
+    )
+{
+    InterlockedDecrement(&Parser->ActiveAllocations);
+}
 
 // ============================================================================
 // PUBLIC API - INITIALIZATION
 // ============================================================================
 
-/**
- * @brief Initialize the protocol parser.
- *
- * @param Parser    Receives initialized parser handle.
- * @return STATUS_SUCCESS on success.
- *
- * @irql PASSIVE_LEVEL
- */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
@@ -245,11 +273,8 @@ PpInitialize(
 
     *Parser = NULL;
 
-    //
-    // Allocate parser context
-    //
     parser = (PPP_PARSER)ExAllocatePoolZero(
-        NonPagedPoolNx,
+        PagedPool,
         sizeof(PP_PARSER),
         PP_POOL_TAG_PARSER
     );
@@ -258,9 +283,9 @@ PpInitialize(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Initialize statistics
-    //
+    ExInitializeRundownProtection(&parser->RundownRef);
+    KeInitializeSpinLock(&parser->StatsLock);
+    parser->ActiveAllocations = 0;
     KeQuerySystemTime(&parser->Stats.StartTime);
     parser->Initialized = TRUE;
 
@@ -275,53 +300,53 @@ PpInitialize(
 /**
  * @brief Shutdown the protocol parser.
  *
- * @param Parser    Parser to shutdown.
- *
- * @irql PASSIVE_LEVEL
+ * Waits for all outstanding parse operations to complete (via rundown),
+ * then frees the parser and NULLs the caller's pointer.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 PpShutdown(
-    _Inout_ PPP_PARSER Parser
+    _Inout_ PPP_PARSER* Parser
     )
 {
+    PPP_PARSER parser;
+
     PAGED_CODE();
 
-    if (Parser == NULL) {
+    if (Parser == NULL || *Parser == NULL) {
         return;
     }
 
-    if (!Parser->Initialized) {
+    parser = *Parser;
+    *Parser = NULL;
+
+    if (!parser->Initialized) {
+        ExFreePoolWithTag(parser, PP_POOL_TAG_PARSER);
         return;
     }
 
-    Parser->Initialized = FALSE;
+    parser->Initialized = FALSE;
+
+    //
+    // Wait for all in-flight parse operations to complete.
+    // After this returns, no new rundown acquisitions will succeed.
+    //
+    ExWaitForRundownProtectionRelease(&parser->RundownRef);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Protocol parser shutdown (HTTP Req: %lld, Resp: %lld, DNS: %lld, Errors: %lld)\n",
-               Parser->Stats.HTTPRequestsParsed,
-               Parser->Stats.HTTPResponsesParsed,
-               Parser->Stats.DNSPacketsParsed,
-               Parser->Stats.ParseErrors);
+               parser->Stats.HTTPRequestsParsed,
+               parser->Stats.HTTPResponsesParsed,
+               parser->Stats.DNSPacketsParsed,
+               parser->Stats.ParseErrors);
 
-    ExFreePoolWithTag(Parser, PP_POOL_TAG_PARSER);
+    ExFreePoolWithTag(parser, PP_POOL_TAG_PARSER);
 }
 
 // ============================================================================
 // PUBLIC API - HTTP PARSING
 // ============================================================================
 
-/**
- * @brief Parse an HTTP request.
- *
- * @param Parser    Parser handle.
- * @param Data      Raw HTTP data.
- * @param DataSize  Size of data in bytes.
- * @param Request   Receives parsed request.
- * @return STATUS_SUCCESS on success.
- *
- * @irql PASSIVE_LEVEL
- */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
@@ -346,13 +371,22 @@ PpParseHTTPRequest(
 
     *Request = NULL;
 
-    if (!Parser->Initialized) {
+    //
+    // Acquire rundown protection — prevents shutdown during this parse.
+    //
+    if (!PppAcquireRundown(Parser)) {
         return STATUS_DEVICE_NOT_READY;
+    }
+
+    if (!Parser->Initialized) {
+        status = STATUS_DEVICE_NOT_READY;
+        goto ReleaseRundown;
     }
 
     if (DataSize < PP_MIN_HTTP_SIZE) {
         InterlockedIncrement64(&Parser->Stats.ParseErrors);
-        return STATUS_BUFFER_TOO_SMALL;
+        status = STATUS_BUFFER_TOO_SMALL;
+        goto ReleaseRundown;
     }
 
     //
@@ -363,21 +397,33 @@ PpParseHTTPRequest(
 
     if (!PppIsHttpMethod(data, DataSize, &method, &methodLength)) {
         InterlockedIncrement64(&Parser->Stats.ParseErrors);
-        return STATUS_INVALID_PARAMETER;
+        status = STATUS_INVALID_PARAMETER;
+        goto ReleaseRundown;
     }
 
     //
-    // Allocate request structure
+    // Check allocation budget
+    //
+    if (!PppTrackAllocation(Parser)) {
+        InterlockedIncrement64(&Parser->Stats.ParseErrors);
+        status = STATUS_QUOTA_EXCEEDED;
+        goto ReleaseRundown;
+    }
+
+    //
+    // Allocate request structure from PagedPool
     //
     request = (PPP_HTTP_REQUEST)ExAllocatePoolZero(
-        NonPagedPoolNx,
+        PagedPool,
         sizeof(PP_HTTP_REQUEST),
         PP_POOL_TAG_HEADER
     );
 
     if (request == NULL) {
+        PppUntrackAllocation(Parser);
         InterlockedIncrement64(&Parser->Stats.ParseErrors);
-        return STATUS_INSUFFICIENT_RESOURCES;
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto ReleaseRundown;
     }
 
     request->Method = method;
@@ -418,13 +464,26 @@ PpParseHTTPRequest(
     PppExtractCommonRequestHeaders(request);
 
     //
-    // Check for body
+    // Copy body into owned allocation (never alias caller's buffer)
     //
     if (totalConsumed < DataSize && request->ContentLength > 0) {
-        ULONG bodySize = min(request->ContentLength, DataSize - totalConsumed);
+        ULONG bodyAvailable = DataSize - totalConsumed;
+        ULONG bodySize = min(request->ContentLength, bodyAvailable);
+        bodySize = min(bodySize, PP_MAX_BODY_COPY_SIZE);
 
-        request->Body = (PVOID)(data + totalConsumed);
-        request->BodySize = bodySize;
+        if (bodySize > 0) {
+            request->Body = ExAllocatePoolZero(
+                PagedPool,
+                bodySize,
+                PP_POOL_TAG_BODY
+            );
+
+            if (request->Body != NULL) {
+                RtlCopyMemory(request->Body, data + totalConsumed, bodySize);
+                request->BodySize = bodySize;
+            }
+            // Non-fatal if body alloc fails — headers are still useful
+        }
     }
 
     //
@@ -435,28 +494,25 @@ PpParseHTTPRequest(
     InterlockedIncrement64(&Parser->Stats.HTTPRequestsParsed);
     *Request = request;
 
+    PppReleaseRundown(Parser);
     return STATUS_SUCCESS;
 
 Cleanup:
     if (request != NULL) {
+        if (request->Body != NULL) {
+            ExFreePoolWithTag(request->Body, PP_POOL_TAG_BODY);
+        }
         ExFreePoolWithTag(request, PP_POOL_TAG_HEADER);
     }
 
+    PppUntrackAllocation(Parser);
     InterlockedIncrement64(&Parser->Stats.ParseErrors);
+
+ReleaseRundown:
+    PppReleaseRundown(Parser);
     return status;
 }
 
-/**
- * @brief Parse an HTTP response.
- *
- * @param Parser    Parser handle.
- * @param Data      Raw HTTP data.
- * @param DataSize  Size of data in bytes.
- * @param Response  Receives parsed response.
- * @return STATUS_SUCCESS on success.
- *
- * @irql PASSIVE_LEVEL
- */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
@@ -481,40 +537,46 @@ PpParseHTTPResponse(
 
     *Response = NULL;
 
-    if (!Parser->Initialized) {
+    if (!PppAcquireRundown(Parser)) {
         return STATUS_DEVICE_NOT_READY;
+    }
+
+    if (!Parser->Initialized) {
+        status = STATUS_DEVICE_NOT_READY;
+        goto ReleaseRundown;
     }
 
     if (DataSize < PP_MIN_HTTP_SIZE) {
         InterlockedIncrement64(&Parser->Stats.ParseErrors);
-        return STATUS_BUFFER_TOO_SMALL;
+        status = STATUS_BUFFER_TOO_SMALL;
+        goto ReleaseRundown;
     }
 
-    //
-    // Verify this is an HTTP response
-    //
     if (!PppIsHttpResponse(data, DataSize)) {
         InterlockedIncrement64(&Parser->Stats.ParseErrors);
-        return STATUS_INVALID_PARAMETER;
+        status = STATUS_INVALID_PARAMETER;
+        goto ReleaseRundown;
     }
 
-    //
-    // Allocate response structure
-    //
+    if (!PppTrackAllocation(Parser)) {
+        InterlockedIncrement64(&Parser->Stats.ParseErrors);
+        status = STATUS_QUOTA_EXCEEDED;
+        goto ReleaseRundown;
+    }
+
     response = (PPP_HTTP_RESPONSE)ExAllocatePoolZero(
-        NonPagedPoolNx,
+        PagedPool,
         sizeof(PP_HTTP_RESPONSE),
         PP_POOL_TAG_HEADER
     );
 
     if (response == NULL) {
+        PppUntrackAllocation(Parser);
         InterlockedIncrement64(&Parser->Stats.ParseErrors);
-        return STATUS_INSUFFICIENT_RESOURCES;
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto ReleaseRundown;
     }
 
-    //
-    // Parse status line
-    //
     status = PppParseStatusLine(data, DataSize, response, &bytesConsumed);
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
@@ -522,9 +584,6 @@ PpParseHTTPResponse(
 
     totalConsumed = bytesConsumed;
 
-    //
-    // Parse headers
-    //
     if (totalConsumed < DataSize) {
         status = PppParseHeaders(
             data + totalConsumed,
@@ -542,57 +601,84 @@ PpParseHTTPResponse(
         totalConsumed += bytesConsumed;
     }
 
-    //
-    // Extract common headers
-    //
     PppExtractCommonResponseHeaders(response);
 
     //
-    // Check for body
+    // Copy body into owned allocation
     //
     if (totalConsumed < DataSize && response->ContentLength > 0) {
-        ULONG bodySize = min(response->ContentLength, DataSize - totalConsumed);
+        ULONG bodyAvailable = DataSize - totalConsumed;
+        ULONG bodySize = min(response->ContentLength, bodyAvailable);
+        bodySize = min(bodySize, PP_MAX_BODY_COPY_SIZE);
 
-        response->Body = (PVOID)(data + totalConsumed);
-        response->BodySize = bodySize;
+        if (bodySize > 0) {
+            response->Body = ExAllocatePoolZero(
+                PagedPool,
+                bodySize,
+                PP_POOL_TAG_BODY
+            );
+
+            if (response->Body != NULL) {
+                RtlCopyMemory(response->Body, data + totalConsumed, bodySize);
+                response->BodySize = bodySize;
+            }
+        }
     }
 
     InterlockedIncrement64(&Parser->Stats.HTTPResponsesParsed);
     *Response = response;
 
+    PppReleaseRundown(Parser);
     return STATUS_SUCCESS;
 
 Cleanup:
     if (response != NULL) {
+        if (response->Body != NULL) {
+            ExFreePoolWithTag(response->Body, PP_POOL_TAG_BODY);
+        }
         ExFreePoolWithTag(response, PP_POOL_TAG_HEADER);
     }
 
+    PppUntrackAllocation(Parser);
     InterlockedIncrement64(&Parser->Stats.ParseErrors);
+
+ReleaseRundown:
+    PppReleaseRundown(Parser);
     return status;
 }
 
 /**
- * @brief Free an HTTP request structure.
+ * @brief Free an HTTP request structure and its owned body.
  */
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 PpFreeHTTPRequest(
-    _In_ PPP_HTTP_REQUEST Request
+    _In_opt_ _Post_invalid_ PPP_HTTP_REQUEST Request
     )
 {
     if (Request != NULL) {
+        if (Request->Body != NULL) {
+            ExFreePoolWithTag(Request->Body, PP_POOL_TAG_BODY);
+            Request->Body = NULL;
+        }
         ExFreePoolWithTag(Request, PP_POOL_TAG_HEADER);
     }
 }
 
 /**
- * @brief Free an HTTP response structure.
+ * @brief Free an HTTP response structure and its owned body.
  */
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 PpFreeHTTPResponse(
-    _In_ PPP_HTTP_RESPONSE Response
+    _In_opt_ _Post_invalid_ PPP_HTTP_RESPONSE Response
     )
 {
     if (Response != NULL) {
+        if (Response->Body != NULL) {
+            ExFreePoolWithTag(Response->Body, PP_POOL_TAG_BODY);
+            Response->Body = NULL;
+        }
         ExFreePoolWithTag(Response, PP_POOL_TAG_HEADER);
     }
 }
@@ -601,17 +687,6 @@ PpFreeHTTPResponse(
 // PUBLIC API - DNS PARSING
 // ============================================================================
 
-/**
- * @brief Parse a DNS packet.
- *
- * @param Parser    Parser handle.
- * @param Data      Raw DNS data.
- * @param DataSize  Size of data in bytes.
- * @param Packet    Receives parsed packet.
- * @return STATUS_SUCCESS on success.
- *
- * @irql PASSIVE_LEVEL
- */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
@@ -637,64 +712,64 @@ PpParseDNSPacket(
 
     *Packet = NULL;
 
-    if (!Parser->Initialized) {
+    if (!PppAcquireRundown(Parser)) {
         return STATUS_DEVICE_NOT_READY;
+    }
+
+    if (!Parser->Initialized) {
+        status = STATUS_DEVICE_NOT_READY;
+        goto ReleaseRundown;
     }
 
     if (DataSize < PP_MIN_DNS_SIZE) {
         InterlockedIncrement64(&Parser->Stats.ParseErrors);
-        return STATUS_BUFFER_TOO_SMALL;
+        status = STATUS_BUFFER_TOO_SMALL;
+        goto ReleaseRundown;
     }
 
-    //
-    // Allocate packet structure
-    //
+    if (!PppTrackAllocation(Parser)) {
+        InterlockedIncrement64(&Parser->Stats.ParseErrors);
+        status = STATUS_QUOTA_EXCEEDED;
+        goto ReleaseRundown;
+    }
+
     packet = (PPP_DNS_PACKET)ExAllocatePoolZero(
-        NonPagedPoolNx,
+        PagedPool,
         sizeof(PP_DNS_PACKET),
         PP_POOL_TAG_HEADER
     );
 
     if (packet == NULL) {
+        PppUntrackAllocation(Parser);
         InterlockedIncrement64(&Parser->Stats.ParseErrors);
-        return STATUS_INSUFFICIENT_RESOURCES;
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto ReleaseRundown;
     }
 
     //
     // Parse DNS header (12 bytes)
-    // Format:
-    //   0-1:  Transaction ID
-    //   2-3:  Flags
-    //   4-5:  Question Count
-    //   6-7:  Answer Count
-    //   8-9:  Authority Count
-    //   10-11: Additional Count
     //
     packet->TransactionId = (USHORT)((data[0] << 8) | data[1]);
     packet->Flags = (USHORT)((data[2] << 8) | data[3]);
-    packet->QuestionCount = (USHORT)((data[4] << 8) | data[5]);
-    packet->AnswerCount = (USHORT)((data[6] << 8) | data[7]);
-    packet->AuthorityCount = (USHORT)((data[8] << 8) | data[9]);
-    packet->AdditionalCount = (USHORT)((data[10] << 8) | data[11]);
 
-    //
+    // Store raw wire counts before clamping
+    packet->RawQuestionCount = (USHORT)((data[4] << 8) | data[5]);
+    packet->RawAnswerCount = (USHORT)((data[6] << 8) | data[7]);
+    packet->RawAuthorityCount = (USHORT)((data[8] << 8) | data[9]);
+    packet->RawAdditionalCount = (USHORT)((data[10] << 8) | data[11]);
+
     // Decode flags
-    //
     packet->IsQuery = ((packet->Flags & 0x8000) == 0);
     packet->IsResponse = ((packet->Flags & 0x8000) != 0);
     packet->IsRecursionDesired = ((packet->Flags & 0x0100) != 0);
     packet->IsRecursionAvailable = ((packet->Flags & 0x0080) != 0);
     packet->ResponseCode = (USHORT)(packet->Flags & 0x000F);
 
-    //
-    // Validate counts (security: prevent excessive parsing)
-    //
-    if (packet->QuestionCount > 8) {
-        packet->QuestionCount = 8;
-    }
-    if (packet->AnswerCount > 16) {
-        packet->AnswerCount = 16;
-    }
+    // Clamp to array bounds for safe parsing
+    packet->QuestionCount = min(packet->RawQuestionCount, PP_MAX_DNS_QUESTIONS);
+    packet->AnswerCount = min(packet->RawAnswerCount, PP_MAX_DNS_ANSWERS);
+    packet->AuthorityCount = packet->RawAuthorityCount;
+    packet->AdditionalCount = packet->RawAdditionalCount;
 
     //
     // Parse questions
@@ -715,9 +790,7 @@ PpParseDNSPacket(
 
         offset += bytesConsumed;
 
-        //
-        // Parse QTYPE and QCLASS (4 bytes)
-        //
+        // QTYPE + QCLASS = 4 bytes
         if (offset + 4 > DataSize) {
             status = STATUS_BUFFER_TOO_SMALL;
             goto Cleanup;
@@ -729,7 +802,7 @@ PpParseDNSPacket(
     }
 
     //
-    // Parse answers (for responses)
+    // Parse answers
     //
     for (i = 0; i < packet->AnswerCount && offset < DataSize; i++) {
         status = PppParseDnsName(
@@ -747,9 +820,7 @@ PpParseDNSPacket(
 
         offset += bytesConsumed;
 
-        //
-        // Parse TYPE, CLASS, TTL, RDLENGTH (10 bytes)
-        //
+        // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) = 10 bytes
         if (offset + 10 > DataSize) {
             status = STATUS_BUFFER_TOO_SMALL;
             goto Cleanup;
@@ -765,9 +836,6 @@ PpParseDNSPacket(
         USHORT rdLength = (USHORT)((data[offset + 8] << 8) | data[offset + 9]);
         offset += 10;
 
-        //
-        // Parse RDATA based on type
-        //
         if (offset + rdLength > DataSize) {
             status = STATUS_BUFFER_TOO_SMALL;
             goto Cleanup;
@@ -793,7 +861,7 @@ PpParseDNSPacket(
             case DNS_TYPE_CNAME:
             case DNS_TYPE_NS:
             case DNS_TYPE_PTR:
-                PppParseDnsName(
+                status = PppParseDnsName(
                     data,
                     DataSize,
                     offset,
@@ -801,16 +869,19 @@ PpParseDNSPacket(
                     sizeof(packet->Answers[i].Data.CNAME),
                     &bytesConsumed
                 );
+                if (!NT_SUCCESS(status)) {
+                    // Non-fatal for individual RDATA — clear and continue
+                    packet->Answers[i].Data.CNAME[0] = '\0';
+                    status = STATUS_SUCCESS;
+                }
                 break;
 
             case DNS_TYPE_TXT:
                 if (rdLength > 0 && rdLength <= sizeof(packet->Answers[i].Data.TXT)) {
-                    //
-                    // TXT records start with length byte
-                    //
                     UCHAR txtLen = data[offset];
                     if (txtLen > 0 && (ULONG)(txtLen + 1) <= rdLength) {
-                        ULONG copyLen = min(txtLen, sizeof(packet->Answers[i].Data.TXT) - 1);
+                        ULONG copyLen = min((ULONG)txtLen,
+                                            sizeof(packet->Answers[i].Data.TXT) - 1);
                         RtlCopyMemory(packet->Answers[i].Data.TXT,
                                       data + offset + 1,
                                       copyLen);
@@ -820,9 +891,6 @@ PpParseDNSPacket(
                 break;
 
             default:
-                //
-                // Skip unknown record types
-                //
                 break;
         }
 
@@ -832,6 +900,7 @@ PpParseDNSPacket(
     InterlockedIncrement64(&Parser->Stats.DNSPacketsParsed);
     *Packet = packet;
 
+    PppReleaseRundown(Parser);
     return STATUS_SUCCESS;
 
 Cleanup:
@@ -839,16 +908,21 @@ Cleanup:
         ExFreePoolWithTag(packet, PP_POOL_TAG_HEADER);
     }
 
+    PppUntrackAllocation(Parser);
     InterlockedIncrement64(&Parser->Stats.ParseErrors);
+
+ReleaseRundown:
+    PppReleaseRundown(Parser);
     return status;
 }
 
 /**
  * @brief Free a DNS packet structure.
  */
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 PpFreeDNSPacket(
-    _In_ PPP_DNS_PACKET Packet
+    _In_opt_ _Post_invalid_ PPP_DNS_PACKET Packet
     )
 {
     if (Packet != NULL) {
@@ -860,9 +934,7 @@ PpFreeDNSPacket(
 // PUBLIC API - UTILITY FUNCTIONS
 // ============================================================================
 
-/**
- * @brief Check if data appears to be HTTP.
- */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 PpIsHTTPData(
     _In_reads_bytes_(DataSize) PVOID Data,
@@ -877,16 +949,10 @@ PpIsHTTPData(
         return FALSE;
     }
 
-    //
-    // Check for request (method)
-    //
     if (PppIsHttpMethod(data, DataSize, &method, &methodLength)) {
         return TRUE;
     }
 
-    //
-    // Check for response (HTTP/x.x)
-    //
     if (PppIsHttpResponse(data, DataSize)) {
         return TRUE;
     }
@@ -894,9 +960,7 @@ PpIsHTTPData(
     return FALSE;
 }
 
-/**
- * @brief Check if data appears to be DNS.
- */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 PpIsDNSData(
     _In_reads_bytes_(DataSize) PVOID Data,
@@ -912,19 +976,10 @@ PpIsDNSData(
         return FALSE;
     }
 
-    //
-    // Extract flags and question count
-    //
     flags = (USHORT)((data[2] << 8) | data[3]);
     qdCount = (USHORT)((data[4] << 8) | data[5]);
     opcode = (flags >> 11) & 0x0F;
 
-    //
-    // Validate:
-    // - Opcode should be 0 (standard query), 1 (inverse), or 2 (status)
-    // - Question count should be reasonable
-    // - Z bits (unused) should be 0
-    //
     if (opcode > 2) {
         return FALSE;
     }
@@ -933,9 +988,7 @@ PpIsDNSData(
         return FALSE;
     }
 
-    //
-    // Check that Z bits are 0 (bits 4-6 of second flag byte)
-    //
+    // Z bits (must be zero per RFC 1035)
     if ((flags & 0x0070) != 0) {
         return FALSE;
     }
@@ -943,9 +996,7 @@ PpIsDNSData(
     return TRUE;
 }
 
-/**
- * @brief Extract host from HTTP request.
- */
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 PpExtractHostFromRequest(
     _In_ PPP_HTTP_REQUEST Request,
@@ -966,12 +1017,11 @@ PpExtractHostFromRequest(
     return STATUS_NOT_FOUND;
 }
 
-/**
- * @brief Extract full URL from HTTP request.
- */
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 PpExtractURLFromRequest(
     _In_ PPP_HTTP_REQUEST Request,
+    _In_ BOOLEAN IsSecure,
     _Out_writes_z_(URLSize) PSTR URL,
     _In_ ULONG URLSize
     )
@@ -988,7 +1038,8 @@ PpExtractURLFromRequest(
         status = RtlStringCchPrintfA(
             URL,
             URLSize,
-            "http://%s%s",
+            "%s://%s%s",
+            IsSecure ? "https" : "http",
             Request->Host,
             Request->URI
         );
@@ -1003,8 +1054,9 @@ PpExtractURLFromRequest(
 }
 
 /**
- * @brief Get parser statistics.
+ * @brief Get parser statistics (atomic snapshot under spinlock).
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 PpGetStatistics(
     _In_ PPP_PARSER Parser,
@@ -1012,19 +1064,27 @@ PpGetStatistics(
     )
 {
     LARGE_INTEGER currentTime;
+    KIRQL oldIrql;
 
     if (Parser == NULL || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    RtlZeroMemory(Stats, sizeof(PP_STATISTICS));
+
     if (!Parser->Initialized) {
         return STATUS_DEVICE_NOT_READY;
     }
+
+    KeAcquireSpinLock(&Parser->StatsLock, &oldIrql);
 
     Stats->HTTPRequestsParsed = Parser->Stats.HTTPRequestsParsed;
     Stats->HTTPResponsesParsed = Parser->Stats.HTTPResponsesParsed;
     Stats->DNSPacketsParsed = Parser->Stats.DNSPacketsParsed;
     Stats->ParseErrors = Parser->Stats.ParseErrors;
+    Stats->ActiveAllocations = Parser->ActiveAllocations;
+
+    KeReleaseSpinLock(&Parser->StatsLock, oldIrql);
 
     KeQuerySystemTime(&currentTime);
     Stats->UpTime.QuadPart = currentTime.QuadPart - Parser->Stats.StartTime.QuadPart;
@@ -1072,15 +1132,47 @@ PppIsHttpResponse(
     )
 {
     //
-    // Check for "HTTP/1." prefix
+    // Accept HTTP/1.x ONLY — HTTP/2 uses binary framing and cannot
+    // be parsed with this line-based parser.
     //
     if (DataSize >= 8 &&
         Data[0] == 'H' && Data[1] == 'T' && Data[2] == 'T' && Data[3] == 'P' &&
-        Data[4] == '/' && (Data[5] == '1' || Data[5] == '2') && Data[6] == '.') {
+        Data[4] == '/' && Data[5] == '1' && Data[6] == '.') {
         return TRUE;
     }
 
     return FALSE;
+}
+
+/**
+ * @brief Find end of a line within a bounded buffer.
+ *
+ * Returns STATUS_SUCCESS if a line ending (\r or \n) is found.
+ * Returns STATUS_BUFFER_TOO_SMALL if no line ending exists (incomplete data).
+ */
+static NTSTATUS
+PppFindLineEnd(
+    _In_reads_bytes_(DataSize) PCSTR Data,
+    _In_ ULONG DataSize,
+    _Out_ PULONG LineLength,
+    _Out_ PCSTR* LineEnd
+    )
+{
+    ULONG i;
+
+    *LineLength = 0;
+    *LineEnd = NULL;
+
+    for (i = 0; i < DataSize; i++) {
+        if (Data[i] == '\r' || Data[i] == '\n') {
+            *LineLength = i;
+            *LineEnd = Data + i;
+            return STATUS_SUCCESS;
+        }
+    }
+
+    // No line ending found — incomplete HTTP data
+    return STATUS_BUFFER_TOO_SMALL;
 }
 
 static NTSTATUS
@@ -1092,27 +1184,23 @@ PppParseRequestLine(
     )
 {
     ULONG lineLength = 0;
-    PCSTR lineEnd;
+    PCSTR lineEnd = NULL;
     PCSTR ptr = Data;
     PCSTR uriStart;
     PCSTR uriEnd;
     PCSTR versionStart;
     ULONG uriLength;
     ULONG versionLength;
+    NTSTATUS status;
 
     *BytesConsumed = 0;
 
-    //
-    // Find end of request line
-    //
-    lineEnd = PppFindLineEnd(Data, DataSize, &lineLength);
-    if (lineEnd == NULL) {
+    status = PppFindLineEnd(Data, DataSize, &lineLength, &lineEnd);
+    if (!NT_SUCCESS(status)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
     // Skip method (already parsed)
-    //
     while (ptr < lineEnd && *ptr != ' ') {
         ptr++;
     }
@@ -1121,16 +1209,12 @@ PppParseRequestLine(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
     // Skip space(s)
-    //
     while (ptr < lineEnd && *ptr == ' ') {
         ptr++;
     }
 
-    //
     // Parse URI
-    //
     uriStart = ptr;
     while (ptr < lineEnd && *ptr != ' ') {
         ptr++;
@@ -1145,16 +1229,12 @@ PppParseRequestLine(
     RtlCopyMemory(Request->URI, uriStart, uriLength);
     Request->URI[uriLength] = '\0';
 
-    //
     // Skip space(s)
-    //
     while (ptr < lineEnd && *ptr == ' ') {
         ptr++;
     }
 
-    //
     // Parse HTTP version
-    //
     versionStart = ptr;
     versionLength = (ULONG)(lineEnd - versionStart);
     if (versionLength >= sizeof(Request->Version)) {
@@ -1163,11 +1243,9 @@ PppParseRequestLine(
 
     RtlCopyMemory(Request->Version, versionStart, versionLength);
     Request->Version[versionLength] = '\0';
-    PppTrimWhitespace(Request->Version);
+    PppTrimWhitespace(Request->Version, sizeof(Request->Version));
 
-    //
     // Calculate bytes consumed (including CRLF)
-    //
     *BytesConsumed = lineLength;
     if (lineLength + 2 <= DataSize &&
         Data[lineLength] == '\r' && Data[lineLength + 1] == '\n') {
@@ -1188,27 +1266,24 @@ PppParseStatusLine(
     )
 {
     ULONG lineLength = 0;
-    PCSTR lineEnd;
+    PCSTR lineEnd = NULL;
     PCSTR ptr = Data;
     PCSTR versionEnd;
     ULONG versionLength;
     ULONG statusCode = 0;
+    ULONG digitCount = 0;
     PCSTR reasonStart;
     ULONG reasonLength;
+    NTSTATUS status;
 
     *BytesConsumed = 0;
 
-    //
-    // Find end of status line
-    //
-    lineEnd = PppFindLineEnd(Data, DataSize, &lineLength);
-    if (lineEnd == NULL) {
+    status = PppFindLineEnd(Data, DataSize, &lineLength, &lineEnd);
+    if (!NT_SUCCESS(status)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
     // Parse HTTP version
-    //
     versionEnd = ptr;
     while (versionEnd < lineEnd && *versionEnd != ' ') {
         versionEnd++;
@@ -1224,33 +1299,33 @@ PppParseStatusLine(
 
     ptr = versionEnd;
 
-    //
     // Skip space(s)
-    //
     while (ptr < lineEnd && *ptr == ' ') {
         ptr++;
     }
 
     //
-    // Parse status code
+    // Parse status code — strictly 3 digits, range 100-599
     //
-    while (ptr < lineEnd && *ptr >= '0' && *ptr <= '9') {
-        statusCode = statusCode * 10 + (*ptr - '0');
+    while (ptr < lineEnd && *ptr >= '0' && *ptr <= '9' &&
+           digitCount < PP_MAX_STATUS_CODE_DIGITS) {
+        statusCode = statusCode * 10 + (ULONG)(*ptr - '0');
         ptr++;
+        digitCount++;
+    }
+
+    if (digitCount != 3 || statusCode < 100 || statusCode > 599) {
+        return STATUS_INVALID_PARAMETER;
     }
 
     Response->StatusCode = (USHORT)statusCode;
 
-    //
     // Skip space(s)
-    //
     while (ptr < lineEnd && *ptr == ' ') {
         ptr++;
     }
 
-    //
     // Parse reason phrase
-    //
     reasonStart = ptr;
     reasonLength = (ULONG)(lineEnd - reasonStart);
     if (reasonLength >= sizeof(Response->ReasonPhrase)) {
@@ -1259,11 +1334,9 @@ PppParseStatusLine(
 
     RtlCopyMemory(Response->ReasonPhrase, reasonStart, reasonLength);
     Response->ReasonPhrase[reasonLength] = '\0';
-    PppTrimWhitespace(Response->ReasonPhrase);
+    PppTrimWhitespace(Response->ReasonPhrase, sizeof(Response->ReasonPhrase));
 
-    //
     // Calculate bytes consumed
-    //
     *BytesConsumed = lineLength;
     if (lineLength + 2 <= DataSize &&
         Data[lineLength] == '\r' && Data[lineLength + 1] == '\n') {
@@ -1295,26 +1368,21 @@ PppParseHeaders(
 
     while (ptr < end && count < MaxHeaders) {
         ULONG lineLength = 0;
-        PCSTR lineEnd;
+        PCSTR lineEnd = NULL;
         PCSTR colonPos;
         ULONG nameLength;
         ULONG valueLength;
+        ULONG remaining = (ULONG)(end - ptr);
+        NTSTATUS lineStatus;
 
-        //
-        // Find end of header line
-        //
-        lineEnd = PppFindLineEnd(ptr, (ULONG)(end - ptr), &lineLength);
-        if (lineEnd == NULL) {
+        lineStatus = PppFindLineEnd(ptr, remaining, &lineLength, &lineEnd);
+        if (!NT_SUCCESS(lineStatus)) {
+            // No more complete lines — stop parsing
             break;
         }
 
-        //
         // Check for empty line (end of headers)
-        //
         if (lineLength == 0 || (lineLength == 1 && *ptr == '\r')) {
-            //
-            // Skip CRLF
-            //
             if (ptr + 2 <= end && ptr[0] == '\r' && ptr[1] == '\n') {
                 totalConsumed += 2;
             } else if (ptr + 1 <= end && ptr[0] == '\n') {
@@ -1323,36 +1391,28 @@ PppParseHeaders(
             break;
         }
 
-        //
         // Find colon separator
-        //
         colonPos = ptr;
         while (colonPos < lineEnd && *colonPos != ':') {
             colonPos++;
         }
 
         if (colonPos >= lineEnd) {
-            //
-            // Malformed header - skip it
-            //
+            // Malformed header — skip
             goto NextLine;
         }
 
-        //
-        // Extract name
-        //
+        // Extract name — reject if oversized (do not silently truncate)
         nameLength = (ULONG)(colonPos - ptr);
-        if (nameLength >= PP_MAX_HEADER_NAME_LENGTH) {
-            nameLength = PP_MAX_HEADER_NAME_LENGTH - 1;
+        if (nameLength == 0 || nameLength >= PP_MAX_HEADER_NAME_LENGTH) {
+            goto NextLine;
         }
 
         RtlCopyMemory(Headers[count].Name, ptr, nameLength);
         Headers[count].Name[nameLength] = '\0';
-        PppTrimWhitespace(Headers[count].Name);
+        PppTrimWhitespace(Headers[count].Name, PP_MAX_HEADER_NAME_LENGTH);
 
-        //
         // Extract value (skip colon and leading whitespace)
-        //
         colonPos++;
         while (colonPos < lineEnd && (*colonPos == ' ' || *colonPos == '\t')) {
             colonPos++;
@@ -1360,19 +1420,17 @@ PppParseHeaders(
 
         valueLength = (ULONG)(lineEnd - colonPos);
         if (valueLength >= PP_MAX_HEADER_VALUE_LENGTH) {
-            valueLength = PP_MAX_HEADER_VALUE_LENGTH - 1;
+            // Reject oversized header values
+            goto NextLine;
         }
 
         RtlCopyMemory(Headers[count].Value, colonPos, valueLength);
         Headers[count].Value[valueLength] = '\0';
-        PppTrimWhitespace(Headers[count].Value);
+        PppTrimWhitespace(Headers[count].Value, PP_MAX_HEADER_VALUE_LENGTH);
 
         count++;
 
 NextLine:
-        //
-        // Move to next line
-        //
         if (ptr + lineLength + 2 <= end &&
             ptr[lineLength] == '\r' && ptr[lineLength + 1] == '\n') {
             totalConsumed += lineLength + 2;
@@ -1393,6 +1451,44 @@ NextLine:
     return STATUS_SUCCESS;
 }
 
+/**
+ * @brief Bounded case-insensitive comparison of two null-terminated
+ *        strings within known-bounded buffers.
+ */
+static BOOLEAN
+PppStrEqualInsensitive(
+    _In_z_ PCSTR A,
+    _In_ ULONG AMaxLen,
+    _In_z_ PCSTR B
+    )
+{
+    ULONG i;
+    ULONG bLen = 0;
+    ULONG aLen = PppSafeStrLen(A, AMaxLen);
+
+    // Get B length (B is a compile-time constant — bounded)
+    for (bLen = 0; B[bLen] != '\0'; bLen++) {}
+
+    if (aLen != bLen) {
+        return FALSE;
+    }
+
+    for (i = 0; i < aLen; i++) {
+        CHAR ca = A[i];
+        CHAR cb = B[i];
+
+        // Uppercase both
+        if (ca >= 'a' && ca <= 'z') ca -= ('a' - 'A');
+        if (cb >= 'a' && cb <= 'z') cb -= ('a' - 'A');
+
+        if (ca != cb) {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
 static VOID
 PppExtractCommonRequestHeaders(
     _Inout_ PPP_HTTP_REQUEST Request
@@ -1401,31 +1497,45 @@ PppExtractCommonRequestHeaders(
     ULONG i;
 
     for (i = 0; i < Request->HeaderCount; i++) {
-        if (_stricmp(Request->Headers[i].Name, "Host") == 0) {
+        if (PppStrEqualInsensitive(Request->Headers[i].Name,
+                                   PP_MAX_HEADER_NAME_LENGTH, "Host")) {
             RtlStringCchCopyA(Request->Host,
                               sizeof(Request->Host),
                               Request->Headers[i].Value);
         }
-        else if (_stricmp(Request->Headers[i].Name, "User-Agent") == 0) {
+        else if (PppStrEqualInsensitive(Request->Headers[i].Name,
+                                        PP_MAX_HEADER_NAME_LENGTH, "User-Agent")) {
             RtlStringCchCopyA(Request->UserAgent,
                               sizeof(Request->UserAgent),
                               Request->Headers[i].Value);
         }
-        else if (_stricmp(Request->Headers[i].Name, "Content-Type") == 0) {
+        else if (PppStrEqualInsensitive(Request->Headers[i].Name,
+                                        PP_MAX_HEADER_NAME_LENGTH, "Content-Type")) {
             RtlStringCchCopyA(Request->ContentType,
                               sizeof(Request->ContentType),
                               Request->Headers[i].Value);
         }
-        else if (_stricmp(Request->Headers[i].Name, "Content-Length") == 0) {
-            PSTR endPtr;
-            Request->ContentLength = strtoul(Request->Headers[i].Value, &endPtr, 10);
+        else if (PppStrEqualInsensitive(Request->Headers[i].Name,
+                                        PP_MAX_HEADER_NAME_LENGTH, "Content-Length")) {
+            ULONG value = 0;
+            NTSTATUS clStatus = PppParseUlongBounded(
+                Request->Headers[i].Value,
+                PP_MAX_HEADER_VALUE_LENGTH,
+                PP_MAX_CONTENT_LENGTH,
+                &value
+            );
+            if (NT_SUCCESS(clStatus)) {
+                Request->ContentLength = value;
+            }
         }
-        else if (_stricmp(Request->Headers[i].Name, "Cookie") == 0) {
+        else if (PppStrEqualInsensitive(Request->Headers[i].Name,
+                                        PP_MAX_HEADER_NAME_LENGTH, "Cookie")) {
             RtlStringCchCopyA(Request->Cookie,
                               sizeof(Request->Cookie),
                               Request->Headers[i].Value);
         }
-        else if (_stricmp(Request->Headers[i].Name, "Referer") == 0) {
+        else if (PppStrEqualInsensitive(Request->Headers[i].Name,
+                                        PP_MAX_HEADER_NAME_LENGTH, "Referer")) {
             RtlStringCchCopyA(Request->Referer,
                               sizeof(Request->Referer),
                               Request->Headers[i].Value);
@@ -1441,21 +1551,33 @@ PppExtractCommonResponseHeaders(
     ULONG i;
 
     for (i = 0; i < Response->HeaderCount; i++) {
-        if (_stricmp(Response->Headers[i].Name, "Content-Type") == 0) {
+        if (PppStrEqualInsensitive(Response->Headers[i].Name,
+                                   PP_MAX_HEADER_NAME_LENGTH, "Content-Type")) {
             RtlStringCchCopyA(Response->ContentType,
                               sizeof(Response->ContentType),
                               Response->Headers[i].Value);
         }
-        else if (_stricmp(Response->Headers[i].Name, "Content-Length") == 0) {
-            PSTR endPtr;
-            Response->ContentLength = strtoul(Response->Headers[i].Value, &endPtr, 10);
+        else if (PppStrEqualInsensitive(Response->Headers[i].Name,
+                                        PP_MAX_HEADER_NAME_LENGTH, "Content-Length")) {
+            ULONG value = 0;
+            NTSTATUS clStatus = PppParseUlongBounded(
+                Response->Headers[i].Value,
+                PP_MAX_HEADER_VALUE_LENGTH,
+                PP_MAX_CONTENT_LENGTH,
+                &value
+            );
+            if (NT_SUCCESS(clStatus)) {
+                Response->ContentLength = value;
+            }
         }
-        else if (_stricmp(Response->Headers[i].Name, "Server") == 0) {
+        else if (PppStrEqualInsensitive(Response->Headers[i].Name,
+                                        PP_MAX_HEADER_NAME_LENGTH, "Server")) {
             RtlStringCchCopyA(Response->Server,
                               sizeof(Response->Server),
                               Response->Headers[i].Value);
         }
-        else if (_stricmp(Response->Headers[i].Name, "Set-Cookie") == 0) {
+        else if (PppStrEqualInsensitive(Response->Headers[i].Name,
+                                        PP_MAX_HEADER_NAME_LENGTH, "Set-Cookie")) {
             RtlStringCchCopyA(Response->SetCookie,
                               sizeof(Response->SetCookie),
                               Response->Headers[i].Value);
@@ -1470,68 +1592,50 @@ PppCalculateSuspicionScore(
 {
     ULONG score = 0;
     ULONG i;
+    ULONG uaLen;
+    ULONG uriLen;
 
     //
-    // Check for suspicious User-Agent
+    // Check User-Agent
     //
-    if (Request->UserAgent[0] != '\0') {
-        for (i = 0; g_SuspiciousUserAgents[i] != NULL; i++) {
-            if (strstr(Request->UserAgent, g_SuspiciousUserAgents[i]) != NULL) {
-                score += 20;
-                break;
-            }
-        }
-
-        //
-        // Empty or very short User-Agent is suspicious
-        //
-        if (strlen(Request->UserAgent) < 10) {
-            score += 15;
+    uaLen = PppSafeStrLen(Request->UserAgent, sizeof(Request->UserAgent));
+    if (uaLen > 0) {
+        if (uaLen < 10) {
+            score += 15;    // Very short UA is suspicious
         }
     } else {
-        //
-        // Missing User-Agent is suspicious
-        //
-        score += 25;
+        score += 25;        // Missing UA is suspicious
     }
 
     //
-    // Check for suspicious URI patterns
+    // Check for attack patterns in URI (not legitimate tool names)
     //
-    if (Request->URI[0] != '\0') {
+    uriLen = PppSafeStrLen(Request->URI, sizeof(Request->URI));
+    if (uriLen > 0) {
         for (i = 0; g_SuspiciousUriPatterns[i] != NULL; i++) {
-            if (strstr(Request->URI, g_SuspiciousUriPatterns[i]) != NULL) {
+            if (PppSafeBoundedSearch(Request->URI, uriLen,
+                                     g_SuspiciousUriPatterns[i])) {
                 score += 30;
                 break;
             }
         }
 
-        //
-        // Very long URI is suspicious
-        //
-        if (strlen(Request->URI) > 512) {
-            score += 10;
-        }
-
-        //
-        // Base64-encoded data in URI is suspicious
-        //
-        if (strstr(Request->URI, "==") != NULL) {
-            score += 15;
+        if (uriLen > 512) {
+            score += 10;    // Very long URI
         }
     }
 
     //
-    // POST/PUT to non-standard port could be exfiltration
+    // Large POST/PUT could indicate exfiltration
     //
     if (Request->Method == HttpMethod_POST || Request->Method == HttpMethod_PUT) {
-        if (Request->ContentLength > 1024 * 1024) {  // > 1MB
+        if (Request->ContentLength > 1024 * 1024) {
             score += 20;
         }
     }
 
     //
-    // Missing Host header is suspicious
+    // Missing Host header
     //
     if (Request->Host[0] == '\0') {
         score += 15;
@@ -1545,62 +1649,40 @@ PppCalculateSuspicionScore(
 // PRIVATE IMPLEMENTATION - STRING HELPERS
 // ============================================================================
 
-static PCSTR
-PppFindLineEnd(
-    _In_reads_bytes_(DataSize) PCSTR Data,
-    _In_ ULONG DataSize,
-    _Out_ PULONG LineLength
-    )
-{
-    ULONG i;
-
-    *LineLength = 0;
-
-    for (i = 0; i < DataSize; i++) {
-        if (Data[i] == '\r' || Data[i] == '\n') {
-            *LineLength = i;
-            return Data + i;
-        }
-    }
-
-    //
-    // No line ending found - treat entire buffer as line
-    //
-    *LineLength = DataSize;
-    return Data + DataSize;
-}
-
 static VOID
 PppTrimWhitespace(
-    _Inout_ PSTR String
+    _Inout_ PSTR String,
+    _In_ ULONG MaxLen
     )
 {
+    ULONG len;
     PSTR end;
     PSTR start = String;
 
-    if (String == NULL || *String == '\0') {
+    if (String == NULL) {
         return;
     }
 
-    //
+    len = PppSafeStrLen(String, MaxLen);
+    if (len == 0) {
+        return;
+    }
+
     // Trim trailing whitespace
-    //
-    end = String + strlen(String) - 1;
+    end = String + len - 1;
     while (end > String && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
         *end = '\0';
         end--;
     }
 
-    //
     // Trim leading whitespace (shift left)
-    //
     while (*start == ' ' || *start == '\t') {
         start++;
     }
 
     if (start != String) {
-        ULONG len = (ULONG)strlen(start);
-        RtlMoveMemory(String, start, len + 1);
+        ULONG remaining = PppSafeStrLen(start, MaxLen - (ULONG)(start - String));
+        RtlMoveMemory(String, start, remaining + 1);
     }
 }
 
@@ -1619,6 +1701,105 @@ PppSafeStrLen(
     }
 
     return MaxLen;
+}
+
+/**
+ * @brief Bounded substring search — safe replacement for strstr().
+ *
+ * Searches within a length-bounded haystack for a null-terminated needle.
+ * Never reads past HaystackLen bytes.
+ */
+static BOOLEAN
+PppSafeBoundedSearch(
+    _In_reads_bytes_(HaystackLen) PCSTR Haystack,
+    _In_ ULONG HaystackLen,
+    _In_z_ PCSTR Needle
+    )
+{
+    ULONG needleLen = 0;
+    ULONG i, j;
+
+    // Get needle length
+    for (needleLen = 0; Needle[needleLen] != '\0'; needleLen++) {}
+
+    if (needleLen == 0 || needleLen > HaystackLen) {
+        return FALSE;
+    }
+
+    for (i = 0; i <= HaystackLen - needleLen; i++) {
+        BOOLEAN match = TRUE;
+        for (j = 0; j < needleLen; j++) {
+            if (Haystack[i + j] != Needle[j]) {
+                match = FALSE;
+                break;
+            }
+        }
+        if (match) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+/**
+ * @brief Parse a decimal ULONG from a bounded string with overflow protection.
+ *
+ * Stops at first non-digit. Rejects values > MaxValue.
+ * Replaces strtoul() for kernel safety.
+ */
+static NTSTATUS
+PppParseUlongBounded(
+    _In_reads_bytes_(MaxLen) PCSTR String,
+    _In_ ULONG MaxLen,
+    _In_ ULONG MaxValue,
+    _Out_ PULONG Result
+    )
+{
+    ULONG i;
+    ULONG value = 0;
+    ULONG digitCount = 0;
+
+    *Result = 0;
+
+    for (i = 0; i < MaxLen && String[i] != '\0'; i++) {
+        // Skip leading whitespace
+        if (digitCount == 0 && (String[i] == ' ' || String[i] == '\t')) {
+            continue;
+        }
+
+        if (String[i] < '0' || String[i] > '9') {
+            break;
+        }
+
+        digitCount++;
+        if (digitCount > PP_MAX_CONTENT_LENGTH_DIGITS) {
+            return STATUS_INTEGER_OVERFLOW;
+        }
+
+        // Check for overflow before multiply
+        if (value > (MAXULONG / 10)) {
+            return STATUS_INTEGER_OVERFLOW;
+        }
+        value *= 10;
+
+        ULONG digit = (ULONG)(String[i] - '0');
+        if (value > MAXULONG - digit) {
+            return STATUS_INTEGER_OVERFLOW;
+        }
+        value += digit;
+    }
+
+    if (digitCount == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (value > MaxValue) {
+        return STATUS_INTEGER_OVERFLOW;
+    }
+
+    *Result = value;
+    return STATUS_SUCCESS;
 }
 
 // ============================================================================
@@ -1644,7 +1825,7 @@ PppParseDnsName(
     *BytesConsumed = 0;
     NameBuffer[0] = '\0';
 
-    if (Offset >= PacketSize) {
+    if (Offset >= PacketSize || NameBufferSize == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1655,19 +1836,24 @@ PppParseDnsName(
         // Check for compression pointer (top 2 bits set)
         //
         if ((labelLen & 0xC0) == 0xC0) {
-            //
-            // Compression pointer
-            //
             if (pos + 1 >= PacketSize) {
                 return STATUS_INVALID_PARAMETER;
             }
 
             USHORT pointer = ((USHORT)(labelLen & 0x3F) << 8) | Packet[pos + 1];
 
+            //
+            // Pointer must point backward into the packet (never into
+            // the DNS header's first 12 bytes of raw header if the name
+            // data cannot be there, and must not point at or past current
+            // position to prevent cycles).
+            //
             if (pointer >= PacketSize || pointer >= pos) {
-                //
-                // Invalid pointer (must point backward)
-                //
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            // DNS header is 12 bytes — valid name data starts at offset 12
+            if (pointer < PP_DNS_HEADER_SIZE) {
                 return STATUS_INVALID_PARAMETER;
             }
 
@@ -1678,9 +1864,6 @@ PppParseDnsName(
 
             compressionDepth++;
             if (compressionDepth > PP_MAX_DNS_COMPRESSION_DEPTH) {
-                //
-                // Compression loop detected
-                //
                 return STATUS_INVALID_PARAMETER;
             }
 
@@ -1688,9 +1871,7 @@ PppParseDnsName(
             continue;
         }
 
-        //
-        // Check for end of name
-        //
+        // End of name
         if (labelLen == 0) {
             if (!jumped) {
                 *BytesConsumed = pos - Offset + 1;
@@ -1698,9 +1879,6 @@ PppParseDnsName(
                 *BytesConsumed = firstJumpOffset - Offset;
             }
 
-            //
-            // Remove trailing dot if present
-            //
             if (namePos > 0 && NameBuffer[namePos - 1] == '.') {
                 NameBuffer[namePos - 1] = '\0';
             } else {
@@ -1710,9 +1888,7 @@ PppParseDnsName(
             return STATUS_SUCCESS;
         }
 
-        //
-        // Validate label length
-        //
+        // Validate label length (max 63 per RFC 1035)
         if (labelLen > 63) {
             return STATUS_INVALID_PARAMETER;
         }
@@ -1721,27 +1897,21 @@ PppParseDnsName(
             return STATUS_INVALID_PARAMETER;
         }
 
-        //
-        // Add separator if not first label
-        //
+        // Add separator
         if (namePos > 0 && namePos < NameBufferSize - 1) {
             NameBuffer[namePos++] = '.';
         }
 
-        //
         // Copy label
-        //
-        ULONG copyLen = min(labelLen, NameBufferSize - namePos - 1);
+        ULONG copyLen = min((ULONG)labelLen, NameBufferSize - namePos - 1);
         RtlCopyMemory(NameBuffer + namePos, Packet + pos + 1, copyLen);
         namePos += copyLen;
 
         pos += 1 + labelLen;
     }
 
-    //
-    // Ran out of buffer or packet
-    //
-    NameBuffer[namePos] = '\0';
+    // Ran out of buffer or packet — terminate what we have
+    NameBuffer[min(namePos, NameBufferSize - 1)] = '\0';
 
     if (!jumped) {
         *BytesConsumed = pos - Offset;
@@ -1750,60 +1920,4 @@ PppParseDnsName(
     }
 
     return STATUS_SUCCESS;
-}
-
-static ULONG
-PppCalculateDomainEntropy(
-    _In_z_ PCSTR Domain
-    )
-{
-    ULONG charCounts[256] = { 0 };
-    ULONG len = 0;
-    ULONG i;
-    ULONG entropy = 0;
-
-    if (Domain == NULL || Domain[0] == '\0') {
-        return 0;
-    }
-
-    //
-    // Count character frequencies
-    //
-    for (i = 0; Domain[i] != '\0' && i < 256; i++) {
-        charCounts[(UCHAR)Domain[i]]++;
-        len++;
-    }
-
-    if (len == 0) {
-        return 0;
-    }
-
-    //
-    // Calculate Shannon entropy (scaled by 1000)
-    // H = -sum(p * log2(p)) where p = count/len
-    //
-    // Simplified: count unique chars and their distribution
-    //
-    ULONG uniqueChars = 0;
-    ULONG maxCount = 0;
-
-    for (i = 0; i < 256; i++) {
-        if (charCounts[i] > 0) {
-            uniqueChars++;
-            if (charCounts[i] > maxCount) {
-                maxCount = charCounts[i];
-            }
-        }
-    }
-
-    //
-    // Simple entropy approximation:
-    // High unique chars + even distribution = high entropy
-    //
-    if (len > 0) {
-        entropy = (uniqueChars * 100) / len;  // Unique ratio
-        entropy += (len - maxCount) * 10 / len;  // Distribution evenness
-    }
-
-    return entropy;
 }

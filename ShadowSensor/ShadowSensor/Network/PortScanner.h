@@ -1,9 +1,12 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: PortScanner.h
-    
+
     Purpose: Port scan detection to identify reconnaissance activity.
-    
+
+    Naming: All public symbols use the SsPs prefix (ShadowStrike Port Scanner)
+    to avoid collision with the NT kernel Ps* namespace.
+
     Copyright (c) ShadowStrike Team
 --*/
 
@@ -14,146 +17,175 @@ extern "C" {
 #endif
 
 #include <ntddk.h>
+#include <ntstrsafe.h>
 #include "../../Shared/NetworkTypes.h"
 
 //=============================================================================
 // Pool Tags
 //=============================================================================
 
-#define PS_POOL_TAG_CONTEXT     'CXSP'  // Port Scanner - Context
-#define PS_POOL_TAG_TARGET      'GTSP'  // Port Scanner - Target
+#define SSPS_POOL_TAG_CONTEXT     'CXSP'  // Port Scanner - Context
+#define SSPS_POOL_TAG_TARGET      'GTSP'  // Port Scanner - Target
+#define SSPS_POOL_TAG_HASHTBL     'HTSP'  // Port Scanner - Hash Table
 
 //=============================================================================
 // Configuration
 //=============================================================================
 
-#define PS_SCAN_WINDOW_MS               60000   // 1 minute
-#define PS_MIN_PORTS_FOR_SCAN           20      // Unique ports
-#define PS_MIN_HOSTS_FOR_SWEEP          10      // Unique hosts
-#define PS_MAX_TRACKED_SOURCES          4096
+#define SSPS_SCAN_WINDOW_MS               60000   // 1 minute
+#define SSPS_MIN_PORTS_FOR_SCAN           20      // Unique ports
+#define SSPS_MIN_HOSTS_FOR_SWEEP          10      // Unique hosts
+#define SSPS_MAX_TRACKED_SOURCES          4096
+
+//=============================================================================
+// TCP Flag Constants (for stealth scan classification)
+//=============================================================================
+
+#define SSPS_TCP_FLAG_FIN     0x01
+#define SSPS_TCP_FLAG_SYN     0x02
+#define SSPS_TCP_FLAG_RST     0x04
+#define SSPS_TCP_FLAG_PSH     0x08
+#define SSPS_TCP_FLAG_ACK     0x10
+#define SSPS_TCP_FLAG_URG     0x20
 
 //=============================================================================
 // Scan Types
 //=============================================================================
 
-typedef enum _PS_SCAN_TYPE {
-    PsScan_Unknown = 0,
-    PsScan_TCPConnect,
-    PsScan_TCPSYN,
-    PsScan_TCPFIN,
-    PsScan_TCPXMAS,
-    PsScan_TCPNULL,
-    PsScan_UDPScan,
-    PsScan_HostSweep,
-    PsScan_ServiceProbe,
-} PS_SCAN_TYPE;
+typedef enum _SSPS_SCAN_TYPE {
+    SsPsScan_Unknown = 0,
+    SsPsScan_TCPConnect,
+    SsPsScan_TCPSYN,
+    SsPsScan_TCPFIN,
+    SsPsScan_TCPXMAS,
+    SsPsScan_TCPNULL,
+    SsPsScan_UDPScan,
+    SsPsScan_HostSweep,
+    SsPsScan_ServiceProbe,
+} SSPS_SCAN_TYPE;
 
 //=============================================================================
 // Scan Detection Result
 //=============================================================================
 
-typedef struct _PS_DETECTION_RESULT {
+typedef struct _SSPS_DETECTION_RESULT {
     BOOLEAN ScanDetected;
-    PS_SCAN_TYPE Type;
+    SSPS_SCAN_TYPE Type;
     ULONG ConfidenceScore;
-    
+
     // Source
     HANDLE SourceProcessId;
-    UNICODE_STRING ProcessName;
-    
+    UNICODE_STRING ProcessName;   // Dynamically allocated; freed by SsPsFreeResult
+
     // Scan metrics
     ULONG UniquePortsScanned;
     ULONG UniqueHostsScanned;
     ULONG ConnectionAttempts;
     ULONG DurationMs;
-    
+
     // Target information
     union {
         IN_ADDR IPv4;
         IN6_ADDR IPv6;
     } PrimaryTarget;
     BOOLEAN IsIPv6;
-    
+
     LARGE_INTEGER DetectionTime;
-    
-} PS_DETECTION_RESULT, *PPS_DETECTION_RESULT;
+
+} SSPS_DETECTION_RESULT, *PSSPS_DETECTION_RESULT;
 
 //=============================================================================
 // Port Scanner Detector
 //=============================================================================
 
-typedef struct _PS_DETECTOR {
-    BOOLEAN Initialized;
-    
+typedef struct _SSPS_DETECTOR {
+    volatile LONG Initialized;       // Interlocked flag for safe shutdown
+    volatile LONG ShuttingDown;      // Drain flag
+
     // Source tracking
     LIST_ENTRY SourceList;
     EX_PUSH_LOCK SourceListLock;
     volatile LONG SourceCount;
-    
+
+    // Active reference count for drain
+    volatile LONG ActiveOperations;
+    KEVENT DrainEvent;               // Signaled when ActiveOperations == 0
+
+    // Cleanup work item (runs at PASSIVE_LEVEL, not DPC)
+    PIO_WORKITEM CleanupWorkItem;
+    KTIMER CleanupTimer;
+    KDPC CleanupDpc;
+    volatile LONG CleanupRunning;    // Prevents concurrent cleanup runs
+    PDEVICE_OBJECT DeviceObject;     // For IoAllocateWorkItem
+
     // Configuration
     struct {
         ULONG WindowMs;
         ULONG MinPortsForScan;
         ULONG MinHostsForSweep;
     } Config;
-    
+
     // Statistics
     struct {
         volatile LONG64 ConnectionsTracked;
         volatile LONG64 ScansDetected;
         LARGE_INTEGER StartTime;
     } Stats;
-    
-} PS_DETECTOR, *PPS_DETECTOR;
+
+} SSPS_DETECTOR, *PSSPS_DETECTOR;
 
 //=============================================================================
 // Public API
 //=============================================================================
 
 NTSTATUS
-PsInitialize(
-    _Out_ PPS_DETECTOR* Detector
+SsPsInitialize(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Out_ PSSPS_DETECTOR* Detector
     );
 
 VOID
-PsShutdown(
-    _Inout_ PPS_DETECTOR Detector
+SsPsShutdown(
+    _Inout_ PSSPS_DETECTOR Detector
     );
 
 NTSTATUS
-PsRecordConnection(
-    _In_ PPS_DETECTOR Detector,
+SsPsRecordConnection(
+    _In_ PSSPS_DETECTOR Detector,
     _In_ HANDLE ProcessId,
+    _In_ LARGE_INTEGER ProcessCreateTime,
     _In_ PVOID RemoteAddress,
     _In_ USHORT RemotePort,
     _In_ BOOLEAN IsIPv6,
     _In_ UCHAR Protocol,
+    _In_ UCHAR TcpFlags,
     _In_ BOOLEAN Successful
     );
 
 NTSTATUS
-PsCheckForScan(
-    _In_ PPS_DETECTOR Detector,
+SsPsCheckForScan(
+    _In_ PSSPS_DETECTOR Detector,
     _In_ HANDLE ProcessId,
-    _Out_ PPS_DETECTION_RESULT* Result
+    _In_ LARGE_INTEGER ProcessCreateTime,
+    _Out_ PSSPS_DETECTION_RESULT* Result
     );
 
-typedef struct _PS_STATISTICS {
+typedef struct _SSPS_STATISTICS {
     ULONG TrackedSources;
     ULONG64 ConnectionsTracked;
     ULONG64 ScansDetected;
     LARGE_INTEGER UpTime;
-} PS_STATISTICS, *PPS_STATISTICS;
+} SSPS_STATISTICS, *PSSPS_STATISTICS;
 
 NTSTATUS
-PsGetStatistics(
-    _In_ PPS_DETECTOR Detector,
-    _Out_ PPS_STATISTICS Stats
+SsPsGetStatistics(
+    _In_ PSSPS_DETECTOR Detector,
+    _Out_ PSSPS_STATISTICS Stats
     );
 
 VOID
-PsFreeResult(
-    _In_ PPS_DETECTION_RESULT Result
+SsPsFreeResult(
+    _In_ PSSPS_DETECTION_RESULT Result
     );
 
 #ifdef __cplusplus

@@ -16,12 +16,13 @@
  * - Data exfiltration prevention
  *
  * @author ShadowStrike Security Team
- * @version 1.0.0
+ * @version 2.1.0
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
 
-#pragma once
+#ifndef SHADOWSTRIKE_NETWORK_FILTER_H
+#define SHADOWSTRIKE_NETWORK_FILTER_H
 
 #include <fltKernel.h>
 #include <fwpsk.h>
@@ -33,52 +34,15 @@
 // WFP FILTER CONFIGURATION
 // ============================================================================
 
-/**
- * @brief WFP provider GUID.
- */
-// {A5E8F2D1-3B4C-4D5E-9F6A-7B8C9D0E1F2A}
-DEFINE_GUID(SHADOWSTRIKE_WFP_PROVIDER_GUID,
-    0xa5e8f2d1, 0x3b4c, 0x4d5e, 0x9f, 0x6a, 0x7b, 0x8c, 0x9d, 0x0e, 0x1f, 0x2a);
-
-/**
- * @brief WFP sublayer GUID.
- */
-// {B6F9A3E2-4C5D-5E6F-A071-8C9D0E1F2A3B}
-DEFINE_GUID(SHADOWSTRIKE_WFP_SUBLAYER_GUID,
-    0xb6f9a3e2, 0x4c5d, 0x5e6f, 0xa0, 0x71, 0x8c, 0x9d, 0x0e, 0x1f, 0x2a, 0x3b);
-
-/**
- * @brief Callout GUIDs for each layer.
- */
-// ALE Connect v4
-// {C7A0B4F3-5D6E-6F70-B182-9D0E1F2A3B4C}
-DEFINE_GUID(SHADOWSTRIKE_ALE_CONNECT_V4_CALLOUT_GUID,
-    0xc7a0b4f3, 0x5d6e, 0x6f70, 0xb1, 0x82, 0x9d, 0x0e, 0x1f, 0x2a, 0x3b, 0x4c);
-
-// ALE Connect v6
-// {D8B1C5A4-6E7F-7081-C293-0E1F2A3B4C5D}
-DEFINE_GUID(SHADOWSTRIKE_ALE_CONNECT_V6_CALLOUT_GUID,
-    0xd8b1c5a4, 0x6e7f, 0x7081, 0xc2, 0x93, 0x0e, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d);
-
-// ALE Recv Accept v4
-// {E9C2D6B5-7F80-8192-D3A4-1F2A3B4C5D6E}
-DEFINE_GUID(SHADOWSTRIKE_ALE_RECV_ACCEPT_V4_CALLOUT_GUID,
-    0xe9c2d6b5, 0x7f80, 0x8192, 0xd3, 0xa4, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d, 0x6e);
-
-// ALE Recv Accept v6
-// {F0D3E7C6-8091-92A3-E4B5-2A3B4C5D6E7F}
-DEFINE_GUID(SHADOWSTRIKE_ALE_RECV_ACCEPT_V6_CALLOUT_GUID,
-    0xf0d3e7c6, 0x8091, 0x92a3, 0xe4, 0xb5, 0x2a, 0x3b, 0x4c, 0x5d, 0x6e, 0x7f);
-
-// Outbound Transport v4 (for DNS)
-// {01E4F8D7-91A2-A3B4-F5C6-3B4C5D6E7F80}
-DEFINE_GUID(SHADOWSTRIKE_OUTBOUND_TRANSPORT_V4_CALLOUT_GUID,
-    0x01e4f8d7, 0x91a2, 0xa3b4, 0xf5, 0xc6, 0x3b, 0x4c, 0x5d, 0x6e, 0x7f, 0x80);
-
-// Stream v4 (TCP data inspection)
-// {12F5A9E8-02B3-B4C5-A6D7-4C5D6E7F8091}
-DEFINE_GUID(SHADOWSTRIKE_STREAM_V4_CALLOUT_GUID,
-    0x12f5a9e8, 0x02b3, 0xb4c5, 0xa6, 0xd7, 0x4c, 0x5d, 0x6e, 0x7f, 0x80, 0x91);
+// GUIDs are declared here, defined via INITGUID in NetworkFilter.c
+EXTERN_C const GUID SHADOWSTRIKE_WFP_PROVIDER_GUID;
+EXTERN_C const GUID SHADOWSTRIKE_WFP_SUBLAYER_GUID;
+EXTERN_C const GUID SHADOWSTRIKE_ALE_CONNECT_V4_CALLOUT_GUID;
+EXTERN_C const GUID SHADOWSTRIKE_ALE_CONNECT_V6_CALLOUT_GUID;
+EXTERN_C const GUID SHADOWSTRIKE_ALE_RECV_ACCEPT_V4_CALLOUT_GUID;
+EXTERN_C const GUID SHADOWSTRIKE_ALE_RECV_ACCEPT_V6_CALLOUT_GUID;
+EXTERN_C const GUID SHADOWSTRIKE_OUTBOUND_TRANSPORT_V4_CALLOUT_GUID;
+EXTERN_C const GUID SHADOWSTRIKE_STREAM_V4_CALLOUT_GUID;
 
 /**
  * @brief Pool tags.
@@ -222,6 +186,8 @@ typedef struct _NF_DNS_ENTRY {
  * @brief DNS tunneling detection state.
  */
 typedef struct _NF_DNS_TUNNEL_STATE {
+    LIST_ENTRY ListEntry;
+    
     WCHAR BaseDomain[MAX_DNS_NAME_LENGTH];
     UINT32 BaseDomainHash;
     
@@ -246,20 +212,72 @@ typedef struct _NF_DNS_TUNNEL_STATE {
 } NF_DNS_TUNNEL_STATE, *PNF_DNS_TUNNEL_STATE;
 
 // ============================================================================
-// NETWORK FILTER GLOBAL STATE
+// BLOCKED DOMAIN ENTRY
+// ============================================================================
+
+/**
+ * @brief Maximum number of blocked domains.
+ */
+#define NF_MAX_BLOCKED_DOMAINS          4096
+
+/**
+ * @brief Blocked domain entry.
+ */
+typedef struct _NF_BLOCKED_DOMAIN {
+    LIST_ENTRY ListEntry;
+    WCHAR DomainName[MAX_DNS_NAME_LENGTH];
+    UINT32 DomainHash;
+    NETWORK_BLOCK_REASON Reason;
+} NF_BLOCKED_DOMAIN, *PNF_BLOCKED_DOMAIN;
+
+// ============================================================================
+// SAFE STATISTICS STRUCTURE (for external consumption)
+// ============================================================================
+
+/**
+ * @brief Safe, read-only statistics snapshot.
+ *
+ * This structure contains only counter values and is safe to copy
+ * to user-mode or other kernel components. It does NOT expose
+ * kernel handles, locks, or internal pointers.
+ */
+typedef struct _NF_FILTER_STATISTICS {
+    BOOLEAN Initialized;
+    BOOLEAN Enabled;
+    UINT16 Reserved1;
+    
+    UINT32 ActiveConnectionCount;
+    UINT32 ActiveDnsQueryCount;
+    UINT32 BlockedDomainCount;
+    
+    LONG64 TotalConnectionsMonitored;
+    LONG64 TotalConnectionsBlocked;
+    LONG64 TotalDnsQueriesMonitored;
+    LONG64 TotalDnsQueriesBlocked;
+    LONG64 TotalBytesMonitored;
+    LONG64 TotalC2Detections;
+    LONG64 TotalExfiltrationDetections;
+    LONG64 TotalDnsTunnelingDetections;
+    LONG64 EventsDropped;
+    
+    NETWORK_MONITOR_CONFIG CurrentConfig;
+} NF_FILTER_STATISTICS, *PNF_FILTER_STATISTICS;
+
+// ============================================================================
+// NETWORK FILTER GLOBAL STATE (internal — do not expose outside module)
 // ============================================================================
 
 /**
  * @brief Network filter global state.
  */
 typedef struct _NETWORK_FILTER_GLOBALS {
-    // Initialization state
-    BOOLEAN Initialized;
-    BOOLEAN Enabled;
-    UINT16 Reserved1;
+    // Initialization state (atomic access only)
+    volatile LONG InitState;              // 0=uninit, 1=initializing, 2=initialized
+    volatile LONG Enabled;                // 0=disabled, 1=enabled
     
-    // Configuration
+    // Configuration (protected by ConfigLock)
     NETWORK_MONITOR_CONFIG Config;
+    EX_PUSH_LOCK ConfigLock;
     
     // WFP handles
     HANDLE WfpEngineHandle;
@@ -278,27 +296,31 @@ typedef struct _NETWORK_FILTER_GLOBALS {
     UINT64 OutboundTransportV4FilterId;
     UINT64 StreamV4FilterId;
     
-    // Connection tracking
+    // Connection tracking (protected by ConnectionLock)
     LIST_ENTRY ConnectionList;
-    ERESOURCE ConnectionLock;
-    UINT32 ConnectionCount;
+    EX_PUSH_LOCK ConnectionLock;
+    volatile LONG ConnectionCount;
     volatile LONG64 NextConnectionId;
     
-    // DNS tracking
+    // DNS tracking (protected by DnsLock)
     LIST_ENTRY DnsQueryList;
-    ERESOURCE DnsLock;
-    UINT32 DnsQueryCount;
+    EX_PUSH_LOCK DnsLock;
+    volatile LONG DnsQueryCount;
     
-    // DNS tunneling state (per domain)
+    // DNS tunneling state (protected by DnsLock)
     LIST_ENTRY DnsTunnelStateList;
     UINT32 DnsTunnelStateCount;
+    
+    // Blocked domain list (protected by DnsLock)
+    LIST_ENTRY BlockedDomainList;
+    volatile LONG BlockedDomainCount;
     
     // Lookaside lists
     NPAGED_LOOKASIDE_LIST ConnectionLookaside;
     NPAGED_LOOKASIDE_LIST DnsLookaside;
     NPAGED_LOOKASIDE_LIST EventLookaside;
     
-    // Statistics
+    // Statistics (lock-free atomic access)
     volatile LONG64 TotalConnectionsMonitored;
     volatile LONG64 TotalConnectionsBlocked;
     volatile LONG64 TotalDnsQueriesMonitored;
@@ -309,13 +331,21 @@ typedef struct _NETWORK_FILTER_GLOBALS {
     volatile LONG64 TotalDnsTunnelingDetections;
     volatile LONG64 EventsDropped;
     
-    // Rate limiting
+    // Rate limiting (atomic access)
     volatile LONG EventsThisSecond;
-    UINT64 CurrentSecondStart;
+    volatile LONG64 CurrentSecondStart;
     
     // Device object for WFP
     PDEVICE_OBJECT WfpDeviceObject;
+    
+    // Cleanup work item
+    PIO_WORKITEM CleanupWorkItem;
 } NETWORK_FILTER_GLOBALS, *PNETWORK_FILTER_GLOBALS;
+
+// Init state constants
+#define NF_INIT_STATE_UNINITIALIZED     0
+#define NF_INIT_STATE_INITIALIZING      1
+#define NF_INIT_STATE_INITIALIZED       2
 
 // ============================================================================
 // PUBLIC API - INITIALIZATION
@@ -489,13 +519,13 @@ NfFilterIsKnownMaliciousJA3(
 // ============================================================================
 
 /**
- * @brief Get network filter statistics.
- * @param Stats Output statistics.
+ * @brief Get network filter statistics (safe snapshot).
+ * @param Stats Output statistics — contains only counters, no kernel pointers.
  * @return STATUS_SUCCESS on success.
  */
 NTSTATUS
 NfFilterGetStatistics(
-    _Out_ PNETWORK_FILTER_GLOBALS Stats
+    _Out_ PNF_FILTER_STATISTICS Stats
     );
 
 /**
