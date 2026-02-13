@@ -13,25 +13,47 @@
  * - Reliability (comprehensive error handling, leak detection)
  * - Auditability (pool tags, allocation tracking)
  *
- * CRITICAL FIXES IN VERSION 2.1.0:
+ * CRITICAL FIXES IN VERSION 2.2.0:
+ * --------------------------------
+ * 1. Fixed initialization race condition
+ *    - Removed redundant stats zeroing after Initialized flag (TOCTOU)
+ *    - g_MemoryState is statically zero-initialized; re-zeroing is racy
+ * 2. Fixed FreePool/FreePoolWithTag byte tracking
+ *    - These paths have no allocation size; now track count only
+ *    - Byte-accurate tracking only via ShadowStrikeSecureFree
+ * 3. Fixed contiguous/aligned alloc paths in AllocatePoolWithFlags
+ *    - Now honors MustSucceed and RaiseOnFailure for all paths
+ *    - Documented that contiguous allocs MUST use FreeContiguous
+ * 4. Fixed double-free race in ShadowStrikeFreeAligned
+ *    - Magic check-and-clear is now atomic via InterlockedCompareExchange
+ * 5. Added DISPATCH_LEVEL wipe size cap in ShadowStrikeFreeAligned
+ *    - Prevents DPC timeout on large aligned allocations
+ * 6. Added POOL_NX_ALLOCATION flag for non-paged lookaside lists
+ *    - Prevents executable pool allocations on Win8+
+ * 7. Fixed MustSucceed retry logic
+ *    - No longer spins at DISPATCH_LEVEL (pointless without delay)
+ * 8. Added kernel address validation in ShadowStrikeCreateMdl
+ *    - Prevents BSOD from passing user-mode addresses to MmBuildMdlForNonPagedPool
+ * 9. Added user address range validation in ShadowStrikeMapMemory
+ *    - Defense-in-depth before MmProbeAndLockPages for UserMode
+ * 10. Added MdlMappingNoExecute in ShadowStrikeMapToSystemAddress
+ *     - Prevents mapped pages from being executable (Win8+)
+ * 11. Made contiguous memory cache type configurable
+ *     - ShadowStrikeAllocateContiguous now accepts CacheType parameter
+ * 12. Documented partial wipe limitation in ShadowStrikeSecureFree
+ *
+ * FIXES IN VERSION 2.1.0:
  * --------------------------------
  * 1. Fixed pool tag mismatch in ShadowStrikeCaptureUserBufferSecure
- *    - Now passes correct tag to allocation function
- * 2. Fixed initialization race condition
- *    - Uses InterlockedCompareExchange for thread-safe init
+ * 2. Fixed initialization race (InterlockedCompareExchange)
  * 3. Added IRQL validation in ShadowStrikeLookasideFree
- *    - Prevents BSOD from freeing paged memory at DISPATCH_LEVEL
  * 4. Fixed user address validation
- *    - Proper range checks including end address overflow
  * 5. Removed unreliable MmIsAddressValid-based ShadowStrikeIsMemoryValid
- *    - Replaced with ShadowStrikeIsValidUserAddressRange (range-only check)
  * 6. Improved secure wipe performance
- *    - Uses RtlSecureZeroMemory where available
- *    - Word-aligned writes for better performance
  * 7. Removed unused spin lock from global state
  *
  * @author ShadowStrike Security Team
- * @version 2.1.0 (Enterprise Edition)
+ * @version 2.2.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -94,7 +116,23 @@ static SHADOWSTRIKE_MEMORY_STATE g_MemoryState = { 0 };
     } while (0)
 
 /**
- * @brief Update free statistics
+ * @brief Update free statistics (count only, no byte tracking).
+ *
+ * Used by ShadowStrikeFreePool/ShadowStrikeFreePoolWithTag where the
+ * original allocation size is unknown.  Byte-accurate tracking is only
+ * available through ShadowStrikeSecureFree which receives the size.
+ */
+#define MEMORY_TRACK_FREE_COUNT_ONLY() \
+    do { \
+        InterlockedIncrement64(&g_MemoryState.TotalFrees); \
+        InterlockedDecrement64(&g_MemoryState.CurrentAllocations); \
+    } while (0)
+
+/**
+ * @brief Update free statistics with byte tracking.
+ *
+ * Used by ShadowStrikeSecureFree and other paths where the allocation
+ * size is known.
  */
 #define MEMORY_TRACK_FREE(Size) \
     do { \
@@ -204,8 +242,11 @@ ShadowStrikeInitializeMemoryUtils(
     PAGED_CODE();
 
     //
-    // Thread-safe initialization using interlocked compare-exchange
-    // This prevents race conditions if two threads call init simultaneously
+    // Thread-safe initialization using interlocked compare-exchange.
+    // g_MemoryState is statically zero-initialized, so statistics are
+    // already zero at first call. We must NOT zero them after setting
+    // the Initialized flag — another thread could already be allocating
+    // and we would clobber its stats.
     //
     if (InterlockedCompareExchange(&g_MemoryState.Initialized, 1, 0) != 0) {
         //
@@ -215,20 +256,8 @@ ShadowStrikeInitializeMemoryUtils(
     }
 
     //
-    // Zero the statistics (Initialized already set to 1)
-    //
-    g_MemoryState.TotalAllocations = 0;
-    g_MemoryState.TotalFrees = 0;
-    g_MemoryState.TotalBytesAllocated = 0;
-    g_MemoryState.TotalBytesFreed = 0;
-    g_MemoryState.AllocationFailures = 0;
-    g_MemoryState.CurrentAllocations = 0;
-    g_MemoryState.CurrentBytesAllocated = 0;
-    g_MemoryState.PeakAllocations = 0;
-    g_MemoryState.PeakBytesAllocated = 0;
-
-    //
-    // Memory barrier to ensure all writes are visible
+    // Memory barrier to ensure the Initialized flag is visible to all
+    // processors before any allocations proceed.
     //
     KeMemoryBarrier();
 
@@ -393,40 +422,47 @@ ShadowStrikeAllocatePoolWithFlags(
     PVOID Buffer = NULL;
 
     //
-    // Handle alignment flags by delegating to aligned allocator
+    // Handle alignment flags by delegating to aligned allocator.
+    // NOTE: Aligned allocations MUST be freed with ShadowStrikeFreeAligned.
     //
     if (Flags & ShadowAllocCacheAligned) {
-        return ShadowStrikeAllocateAligned(
+        Buffer = ShadowStrikeAllocateAligned(
             PoolType,
             NumberOfBytes,
             SHADOWSTRIKE_CACHE_LINE_SIZE,
             Tag
         );
+        goto HandlePostAllocationFlags;
     }
 
     if (Flags & ShadowAllocPageAligned) {
-        return ShadowStrikeAllocateAligned(
+        Buffer = ShadowStrikeAllocateAligned(
             PoolType,
             NumberOfBytes,
             PAGE_SIZE,
             Tag
         );
+        goto HandlePostAllocationFlags;
     }
 
     //
-    // Handle contiguous memory request
+    // Handle contiguous memory request.
+    // CRITICAL: Contiguous allocations MUST be freed with
+    // ShadowStrikeFreeContiguous — never ShadowStrikeFree.
     //
     if (Flags & ShadowAllocContiguous) {
         PHYSICAL_ADDRESS Lowest = { 0 };
         PHYSICAL_ADDRESS Highest = { .QuadPart = -1 };
         PHYSICAL_ADDRESS Boundary = { 0 };
 
-        return ShadowStrikeAllocateContiguous(
+        Buffer = ShadowStrikeAllocateContiguous(
             NumberOfBytes,
             Lowest,
             Highest,
-            Boundary
+            Boundary,
+            MmNonCached
         );
+        goto HandlePostAllocationFlags;
     }
 
     //
@@ -435,23 +471,23 @@ ShadowStrikeAllocatePoolWithFlags(
     Buffer = ShadowStrikeAllocatePoolWithTag(PoolType, NumberOfBytes, Tag);
 
     //
-    // Handle must-succeed flag (retry logic)
+    // Handle must-succeed flag (retry logic).
+    // Only retry at <= APC_LEVEL where we can sleep. At DISPATCH_LEVEL,
+    // retrying without delay is a pointless busy-wait that will not help.
     //
     if (Buffer == NULL && (Flags & ShadowAllocMustSucceed)) {
-        //
-        // Brief delay and retry for transient failures
-        // This is a last-resort measure for critical allocations
-        //
-        LARGE_INTEGER Delay;
-        Delay.QuadPart = -10 * 1000; // 1ms
+        if (KeGetCurrentIrql() <= APC_LEVEL) {
+            LARGE_INTEGER Delay;
+            Delay.QuadPart = -10 * 1000; // 1ms
 
-        for (ULONG Retry = 0; Retry < 3 && Buffer == NULL; Retry++) {
-            if (KeGetCurrentIrql() <= APC_LEVEL) {
+            for (ULONG Retry = 0; Retry < 3 && Buffer == NULL; Retry++) {
                 KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+                Buffer = ShadowStrikeAllocatePoolWithTag(PoolType, NumberOfBytes, Tag);
             }
-            Buffer = ShadowStrikeAllocatePoolWithTag(PoolType, NumberOfBytes, Tag);
         }
     }
+
+HandlePostAllocationFlags:
 
     //
     // Handle raise-on-failure flag
@@ -640,7 +676,7 @@ ShadowStrikeFreePool(
 {
     if (P != NULL) {
         ExFreePool(P);
-        MEMORY_TRACK_FREE(0);
+        MEMORY_TRACK_FREE_COUNT_ONLY();
     }
 }
 
@@ -653,7 +689,7 @@ ShadowStrikeFreePoolWithTag(
 {
     if (P != NULL) {
         ExFreePoolWithTag(P, Tag);
-        MEMORY_TRACK_FREE(0);
+        MEMORY_TRACK_FREE_COUNT_ONLY();
     }
 }
 
@@ -676,20 +712,26 @@ ShadowStrikeFreeAligned(
     Header = (PSHADOWSTRIKE_ALIGNED_HEADER)((ULONG_PTR)P - sizeof(SHADOWSTRIKE_ALIGNED_HEADER));
 
     //
-    // Validate magic to catch corruption or invalid pointers
+    // Validate magic to catch corruption or invalid pointers.
+    // Use InterlockedCompareExchange to atomically check-and-clear,
+    // preventing double-free if two threads race on the same pointer.
     //
-    if (Header->Magic != SHADOWSTRIKE_ALIGNED_MAGIC) {
+    if ((ULONG)InterlockedCompareExchange(
+            (volatile LONG*)&Header->Magic,
+            0,
+            (LONG)SHADOWSTRIKE_ALIGNED_MAGIC
+        ) != SHADOWSTRIKE_ALIGNED_MAGIC) {
 #if DBG
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_ERROR_LEVEL,
-            "[ShadowStrike] ERROR: Invalid aligned pointer passed to ShadowStrikeFreeAligned: %p\n",
+            "[ShadowStrike] ERROR: Invalid or already-freed aligned pointer: %p\n",
             P
         );
 #endif
         //
-        // In production, we cannot safely free this
-        // Better to leak than corrupt or crash
+        // In production, we cannot safely free this.
+        // Better to leak than corrupt or crash.
         //
         return;
     }
@@ -700,15 +742,17 @@ ShadowStrikeFreeAligned(
     AllocationSize = Header->AllocationSize;
 
     //
-    // Clear magic to prevent double-free detection issues
-    //
-    Header->Magic = 0;
-
-    //
-    // Secure wipe the user data portion
+    // Secure wipe the user data portion.
+    // Apply same DISPATCH_LEVEL size cap as ShadowStrikeSecureFree
+    // to avoid DPC timeout on large aligned allocations.
     //
     if (AllocationSize > 0) {
-        ShadowStrikeSecureZeroMemory(P, AllocationSize);
+        if (KeGetCurrentIrql() >= DISPATCH_LEVEL &&
+            AllocationSize > SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE) {
+            ShadowStrikeSecureZeroMemory(P, SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE);
+        } else {
+            ShadowStrikeSecureZeroMemory(P, AllocationSize);
+        }
     }
 
     //
@@ -733,11 +777,14 @@ ShadowStrikeSecureFree(
     }
 
     //
-    // At DISPATCH_LEVEL, limit wipe size to prevent DPC timeout
+    // At DISPATCH_LEVEL, limit wipe size to prevent DPC timeout.
+    // SECURITY NOTE: Remaining bytes beyond the cap are NOT wiped.
+    // Callers handling truly sensitive data (keys, credentials) should
+    // ensure they free at <= APC_LEVEL for a complete wipe.
     //
     if (KeGetCurrentIrql() >= DISPATCH_LEVEL && Size > SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE) {
         //
-        // Just zero what we can safely do at DISPATCH_LEVEL
+        // Partial wipe — zero what we can safely do at DISPATCH_LEVEL
         //
         ShadowStrikeSecureZeroMemory(P, SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE);
     } else {
@@ -801,14 +848,21 @@ ShadowStrikeLookasideInit(
     }
 
     //
-    // Initialize the appropriate lookaside list type
+    // Initialize the appropriate lookaside list type.
+    // POOL_NX_ALLOCATION ensures non-executable pool on Win8+.
     //
+#if (NTDDI_VERSION >= NTDDI_WIN8)
+    #define SHADOWSTRIKE_NX_FLAG POOL_NX_ALLOCATION
+#else
+    #define SHADOWSTRIKE_NX_FLAG 0
+#endif
+
     if (IsPaged) {
         ExInitializePagedLookasideList(
             &Lookaside->PagedList,
             NULL,   // Allocate function (use default)
             NULL,   // Free function (use default)
-            0,      // Flags
+            0,      // Flags (paged pool is never executable)
             EntrySize,
             Tag,
             Depth
@@ -818,12 +872,14 @@ ShadowStrikeLookasideInit(
             &Lookaside->NonPagedList,
             NULL,   // Allocate function (use default)
             NULL,   // Free function (use default)
-            0,      // Flags
+            SHADOWSTRIKE_NX_FLAG,
             EntrySize,
             Tag,
             Depth
         );
     }
+
+#undef SHADOWSTRIKE_NX_FLAG
 
     Lookaside->Initialized = TRUE;
 
@@ -1291,6 +1347,16 @@ ShadowStrikeMapMemory(
     }
 
     //
+    // For UserMode, validate the address range falls within user space
+    // before proceeding. Defense-in-depth against kernel address abuse.
+    //
+    if (AccessMode == UserMode) {
+        if (!ShadowStrikeIsValidUserAddressRange(Buffer, Length)) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
+
+    //
     // Allocate MDL
     //
     Mdl = IoAllocateMdl(Buffer, (ULONG)Length, FALSE, FALSE, NULL);
@@ -1342,16 +1408,26 @@ ShadowStrikeMapToSystemAddress(
     }
 
     //
-    // Map to system address
+    // Map to system address.
+    // Use MdlMappingNoExecute to prevent the mapped pages from being
+    // executable — security hardening against code injection.
     //
+#if (NTDDI_VERSION >= NTDDI_WIN8)
+    #define SHADOWSTRIKE_MDL_PRIORITY (NormalPagePriority | MdlMappingNoExecute)
+#else
+    #define SHADOWSTRIKE_MDL_PRIORITY NormalPagePriority
+#endif
+
     SystemAddress = MmMapLockedPagesSpecifyCache(
         MappedMemory->Mdl,
         KernelMode,
         CacheType,
         NULL,
         FALSE,
-        NormalPagePriority
+        SHADOWSTRIKE_MDL_PRIORITY
     );
+
+#undef SHADOWSTRIKE_MDL_PRIORITY
 
     if (SystemAddress == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -1429,8 +1505,18 @@ ShadowStrikeCreateMdl(
     }
 
     //
-    // Build MDL for non-paged kernel buffer
+    // Build MDL for non-paged kernel buffer.
+    // IMPORTANT: Caller MUST ensure Buffer points to non-paged pool.
+    // MmBuildMdlForNonPagedPool on paged memory is undefined behavior
+    // and will cause BSOD under memory pressure.
     //
+    // We validate the buffer is in kernel space as a basic sanity check.
+    //
+    if (Buffer < MmSystemRangeStart) {
+        IoFreeMdl(NewMdl);
+        return STATUS_INVALID_ADDRESS;
+    }
+
     MmBuildMdlForNonPagedPool(NewMdl);
 
     *Mdl = NewMdl;
@@ -1700,7 +1786,8 @@ ShadowStrikeAllocateContiguous(
     _In_ SIZE_T NumberOfBytes,
     _In_ PHYSICAL_ADDRESS LowestAcceptable,
     _In_ PHYSICAL_ADDRESS HighestAcceptable,
-    _In_opt_ PHYSICAL_ADDRESS BoundaryAddressMultiple
+    _In_opt_ PHYSICAL_ADDRESS BoundaryAddressMultiple,
+    _In_ MEMORY_CACHING_TYPE CacheType
     )
 {
     PVOID Buffer = NULL;
@@ -1714,7 +1801,7 @@ ShadowStrikeAllocateContiguous(
         LowestAcceptable,
         HighestAcceptable,
         BoundaryAddressMultiple,
-        MmNonCached
+        CacheType
     );
 
     if (Buffer != NULL) {

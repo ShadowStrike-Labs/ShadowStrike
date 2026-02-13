@@ -4,25 +4,52 @@
  * ============================================================================
  *
  * @file SyscallMonitor.h
- * @brief Syscall monitoring subsystem header for ShadowSensor kernel driver.
+ * @brief Syscall monitoring orchestration layer for ShadowSensor kernel driver.
  *
- * This module provides syscall monitoring capabilities including:
- * - Direct syscall detection (syscalls not from ntdll.dll)
- * - Heaven's Gate detection (WoW64 abuse)
- * - Syscall argument validation
- * - Call stack analysis
- * - SSDT integrity monitoring
+ * This module is the top-level coordinator for syscall monitoring. It delegates
+ * to the specialized subsystems (SyscallTable, SyscallHooks, DirectSyscallDetector)
+ * and provides:
+ * - Unified syscall analysis entry point
+ * - Per-process syscall context tracking with reference counting
+ * - NTDLL integrity verification
+ * - Call stack anomaly analysis
+ * - Behavioral event emission for direct syscall / Heaven's Gate detections
+ * - Process lifecycle integration (create/destroy tracking)
+ *
+ * Thread Safety:
+ * - All public APIs are safe to call from PASSIVE_LEVEL.
+ * - Process contexts are reference-counted. Callers MUST pair
+ *   ScMonitorGetProcessContext with ScMonitorReleaseProcessContext.
+ * - Context removal marks the context as "removed" and the last Release
+ *   call performs the actual free (deferred-deletion pattern).
+ *
+ * Object Lifetime:
+ * - SC_PROCESS_CONTEXT.ProcessObject is referenced via ObReferenceObject
+ *   at creation and dereferenced via ObDereferenceObject on final release.
+ *
+ * Memory:
+ * - SYSCALL_CALL_CONTEXT is ~800 bytes. Callers on hot paths MUST allocate
+ *   from pool (or use the EventLookaside), NOT from stack.
  *
  * @author ShadowStrike Security Team
- * @version 1.0.0
+ * @version 2.0.0
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
 
-#pragma once
+#ifndef SHADOWSTRIKE_SYSCALL_MONITOR_H
+#define SHADOWSTRIKE_SYSCALL_MONITOR_H
 
-#include <fltKernel.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <ntddk.h>
+#include <ntstrsafe.h>
 #include "../../Shared/BehaviorTypes.h"
+#include "SyscallTable.h"
+#include "DirectSyscallDetector.h"
+#include "SyscallHooks.h"
 
 // ============================================================================
 // SYSCALL MONITOR CONFIGURATION
@@ -201,43 +228,61 @@ typedef enum _HOOK_TYPE {
 // ============================================================================
 
 /**
+ * @brief Maximum suspicious caller cache entries.
+ */
+#define SC_MAX_SUSPICIOUS_CALLERS         64
+
+/**
  * @brief Per-process syscall monitoring context.
+ *
+ * Lifetime:
+ * - Created via ScMonitorGetProcessContext (auto-creates if absent).
+ * - ProcessObject is ObReferenceObject'd at creation; dereferenced on final release.
+ * - Reference-counted. Callers MUST pair Get with Release.
+ * - ScMonitorRemoveProcessContext sets the Removed flag and unlinks from the list.
+ *   The last ScMonitorReleaseProcessContext call performs the actual free.
+ *
+ * SyscallCounts[] indexing:
+ * - Indexed by a lookup index [0..MonitoredSyscallCount), NOT by raw syscall number.
+ *   The implementation maintains a mapping from syscall number to index via the
+ *   SyscallTable module.
  */
 typedef struct _SC_PROCESS_CONTEXT {
     LIST_ENTRY ListEntry;
-    
-    // Process info
+
+    // Process identification
     UINT32 ProcessId;
-    PEPROCESS ProcessObject;
+    PEPROCESS ProcessObject;              // ObReferenceObject'd; deref on final release
     UINT64 ProcessCreateTime;
     BOOLEAN IsWoW64;
-    UINT8 Reserved[3];
-    
+    BOOLEAN Removed;                      // Set when unlinked; last Release frees
+    UINT8 Reserved[2];
+
     // NTDLL info for this process
     UINT64 NtdllBase;
     UINT64 NtdllSize;
     UINT64 Wow64NtdllBase;                // For WoW64 processes
     UINT64 Wow64NtdllSize;
-    
-    // Statistics
-    UINT64 TotalSyscalls;
-    UINT64 DirectSyscalls;                // Not from ntdll
-    UINT64 SuspiciousSyscalls;
+
+    // Statistics (interlocked updates)
+    volatile LONG64 TotalSyscalls;
+    volatile LONG64 DirectSyscalls;       // Not from ntdll
+    volatile LONG64 SuspiciousSyscalls;
     UINT32 UniqueCallers;
     UINT32 Flags;
-    
-    // Per-syscall counts (for anomaly detection)
+
+    // Per-syscall counts (indexed by monitored-syscall index, not raw number)
     UINT32 SyscallCounts[SC_MAX_MONITORED_SYSCALLS];
     UINT32 MonitoredSyscallCount;
-    
-    // Suspicious callers cache
-    UINT64 SuspiciousCallers[32];
-    UINT32 SuspiciousCallerCount;
-    
+
+    // Suspicious callers circular buffer
+    UINT64 SuspiciousCallers[SC_MAX_SUSPICIOUS_CALLERS];
+    UINT32 SuspiciousCallerCount;         // Total added (wraps; index = Count % MAX)
+
     // Integrity state
     NTDLL_INTEGRITY_STATE NtdllIntegrity;
-    
-    // Reference counting
+
+    // Reference counting (interlocked)
     volatile LONG RefCount;
 } SC_PROCESS_CONTEXT, *PSC_PROCESS_CONTEXT;
 
@@ -253,52 +298,100 @@ typedef struct _SC_PROCESS_CONTEXT {
 // ============================================================================
 
 /**
- * @brief Syscall monitor global state.
+ * @brief Maximum process contexts to track concurrently.
+ */
+#define SC_MAX_PROCESS_CONTEXTS           8192
+
+/**
+ * @brief Maximum known good caller cache entries.
+ */
+#define SC_MAX_KNOWN_GOOD_CALLERS         4096
+
+/**
+ * @brief Known good caller cache entry.
+ */
+typedef struct _SC_KNOWN_GOOD_CALLER {
+    LIST_ENTRY ListEntry;
+    UINT64 CallerAddress;
+    UINT64 ModuleBase;
+    UINT64 ModuleSize;
+    WCHAR ModuleName[64];
+    UINT64 AddedTimestamp;
+} SC_KNOWN_GOOD_CALLER, *PSC_KNOWN_GOOD_CALLER;
+
+/**
+ * @brief Syscall monitor global state (INTERNAL — never exposed to callers).
+ *
+ * Synchronization:
+ * - ProcessLock: EX_PUSH_LOCK protecting ProcessContextList.
+ * - CallerCacheLock: EX_PUSH_LOCK protecting KnownGoodCallers.
+ * - Both require KeEnterCriticalRegion before acquisition.
  */
 typedef struct _SYSCALL_MONITOR_GLOBALS {
     // Initialization state
     BOOLEAN Initialized;
     BOOLEAN Enabled;
-    UINT16 Reserved1;
-    
-    // Syscall table
-    PSYSCALL_DEFINITION SyscallTable;
-    UINT32 SyscallTableSize;
-    UINT32 MonitoredSyscallCount;
-    
+    volatile LONG ShuttingDown;
+
+    // Magic for validation
+    ULONG Magic;
+
+    // Syscall table (delegated to SyscallTable module)
+    SST_TABLE_HANDLE SyscallTableHandle;
+
+    // Direct syscall detector (delegated)
+    PDSD_DETECTOR DirectSyscallDetector;
+
     // System NTDLL reference
     UINT64 SystemNtdllBase;
     UINT64 SystemNtdllSize;
     UINT8 SystemNtdllHash[32];
-    
+
     // Process contexts
     LIST_ENTRY ProcessContextList;
-    ERESOURCE ProcessLock;
-    UINT32 ProcessContextCount;
-    UINT32 Reserved2;
-    
+    EX_PUSH_LOCK ProcessLock;
+    volatile LONG ProcessContextCount;
+
     // Known good caller cache
     LIST_ENTRY KnownGoodCallers;
-    ERESOURCE CallerCacheLock;
-    UINT32 KnownGoodCallerCount;
-    UINT32 Reserved3;
-    
+    EX_PUSH_LOCK CallerCacheLock;
+    volatile LONG KnownGoodCallerCount;
+
     // Lookaside lists
     NPAGED_LOOKASIDE_LIST ContextLookaside;
+    BOOLEAN ContextLookasideInitialized;
     NPAGED_LOOKASIDE_LIST EventLookaside;
-    
-    // Statistics
+    BOOLEAN EventLookasideInitialized;
+
+    // Statistics (interlocked updates only)
     volatile LONG64 TotalSyscallsMonitored;
     volatile LONG64 TotalDirectSyscalls;
     volatile LONG64 TotalHeavensGate;
     volatile LONG64 TotalSuspiciousCalls;
     volatile LONG64 TotalBlocked;
-    
-    // Hooks (if using hook-based monitoring)
-    PVOID SyscallHookHandle;
-    BOOLEAN UsingHookMonitoring;
-    UINT8 Reserved4[7];
+
+    // Reference counting for graceful shutdown
+    volatile LONG ReferenceCount;
+    KEVENT ShutdownEvent;
 } SYSCALL_MONITOR_GLOBALS, *PSYSCALL_MONITOR_GLOBALS;
+
+/**
+ * @brief Safe statistics snapshot (safe to copy — contains only scalar fields).
+ *
+ * Use ScMonitorGetStatistics to populate this struct. This is the ONLY
+ * struct callers should use to read monitor statistics.
+ */
+typedef struct _SYSCALL_MONITOR_STATISTICS {
+    BOOLEAN Initialized;
+    BOOLEAN Enabled;
+    UINT32 ProcessContextCount;
+    UINT32 KnownGoodCallerCount;
+    LONG64 TotalSyscallsMonitored;
+    LONG64 TotalDirectSyscalls;
+    LONG64 TotalHeavensGate;
+    LONG64 TotalSuspiciousCalls;
+    LONG64 TotalBlocked;
+} SYSCALL_MONITOR_STATISTICS, *PSYSCALL_MONITOR_STATISTICS;
 
 // ============================================================================
 // PUBLIC API - INITIALIZATION
@@ -308,12 +401,15 @@ typedef struct _SYSCALL_MONITOR_GLOBALS {
  * @brief Initialize the syscall monitoring subsystem.
  * @return STATUS_SUCCESS on success.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ScMonitorInitialize(VOID);
 
 /**
  * @brief Shutdown the syscall monitoring subsystem.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ScMonitorShutdown(VOID);
 
@@ -322,6 +418,8 @@ ScMonitorShutdown(VOID);
  * @param Enable TRUE to enable, FALSE to disable.
  * @return STATUS_SUCCESS on success.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ScMonitorSetEnabled(
     _In_ BOOLEAN Enable
@@ -333,15 +431,24 @@ ScMonitorSetEnabled(
 
 /**
  * @brief Analyze syscall call context.
+ *
+ * Core analysis entry point. Determines if a syscall is suspicious by checking:
+ * - Whether the caller is from ntdll (direct syscall detection)
+ * - Heaven's Gate indicators
+ * - Call stack anomalies
+ * - Cross-process operation flags
+ *
  * @param ProcessId Calling process ID.
  * @param ThreadId Calling thread ID.
  * @param SyscallNumber Syscall number.
  * @param ReturnAddress Return address of syscall.
- * @param Arguments Syscall arguments.
- * @param ArgumentCount Number of arguments.
- * @param Context Output call context.
+ * @param Arguments Syscall arguments (may be NULL).
+ * @param ArgumentCount Number of arguments (max 8).
+ * @param Context Output call context (pool-allocated by caller; may be NULL).
  * @return STATUS_SUCCESS to allow, STATUS_ACCESS_DENIED to block.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ScMonitorAnalyzeSyscall(
     _In_ UINT32 ProcessId,
@@ -360,6 +467,7 @@ ScMonitorAnalyzeSyscall(
  * @param IsWoW64 TRUE if checking WoW64 ntdll.
  * @return TRUE if from ntdll.
  */
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ScMonitorIsFromNtdll(
     _In_ UINT32 ProcessId,
@@ -373,6 +481,7 @@ ScMonitorIsFromNtdll(
  * @param Context Call context.
  * @return TRUE if Heaven's Gate detected.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 BOOLEAN
 ScMonitorDetectHeavensGate(
     _In_ UINT32 ProcessId,
@@ -389,6 +498,8 @@ ScMonitorDetectHeavensGate(
  * @param AnomalyFlags Output anomaly flags.
  * @return STATUS_SUCCESS on success.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ScMonitorAnalyzeCallStack(
     _In_ UINT32 ProcessId,
@@ -416,6 +527,8 @@ ScMonitorAnalyzeCallStack(
  * @param IntegrityState Output integrity state.
  * @return STATUS_SUCCESS on success.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ScMonitorVerifyNtdllIntegrity(
     _In_ UINT32 ProcessId,
@@ -430,6 +543,8 @@ ScMonitorVerifyNtdllIntegrity(
  * @param FunctionCount Output number of hooked functions.
  * @return STATUS_SUCCESS on success.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ScMonitorGetNtdllHooks(
     _In_ UINT32 ProcessId,
@@ -439,15 +554,24 @@ ScMonitorGetNtdllHooks(
     );
 
 /**
- * @brief Restore ntdll hooks (for our own protection bypass).
- * @param ProcessId Process ID.
- * @param FunctionName Function name to restore.
+ * @brief Restore a hooked ntdll function to its original bytes.
+ *
+ * SECURITY WARNING: This writes to another process's address space.
+ * - FunctionName is validated against a hardcoded allowlist of Nt* functions.
+ * - Original bytes are verified against the SystemNtdllHash before writing.
+ * - Every restore operation is logged for forensic audit.
+ * - FunctionName must be null-terminated and <= 63 characters.
+ *
+ * @param ProcessId Process ID to restore function in.
+ * @param FunctionName Name of the Nt* function to restore.
  * @return STATUS_SUCCESS on success.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ScMonitorRestoreNtdllFunction(
     _In_ UINT32 ProcessId,
-    _In_ PCSTR FunctionName
+    _In_z_ PCSTR FunctionName
     );
 
 // ============================================================================
@@ -455,30 +579,45 @@ ScMonitorRestoreNtdllFunction(
 // ============================================================================
 
 /**
- * @brief Get syscall context for process.
+ * @brief Get syscall context for process (creates if absent).
+ *
+ * Increments the context reference count. Caller MUST call
+ * ScMonitorReleaseProcessContext when done.
+ *
  * @param ProcessId Process ID.
- * @param Context Output context pointer.
- * @return STATUS_SUCCESS if found.
+ * @param Context Output context pointer (referenced; caller must release).
+ * @return STATUS_SUCCESS if found or created.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ScMonitorGetProcessContext(
     _In_ UINT32 ProcessId,
-    _Out_ PSC_PROCESS_CONTEXT* Context
+    _Outptr_ PSC_PROCESS_CONTEXT* Context
     );
 
 /**
  * @brief Release process context reference.
+ *
+ * If this is the last reference and the context is marked Removed,
+ * the context is freed and ProcessObject is ObDereferenced.
+ *
  * @param Context Context to release.
  */
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 ScMonitorReleaseProcessContext(
     _In_ PSC_PROCESS_CONTEXT Context
     );
 
 /**
- * @brief Remove process context.
+ * @brief Remove process context (marks as removed, unlinks from list).
+ *
+ * The actual free is deferred until the last reference is released.
+ *
  * @param ProcessId Process ID.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ScMonitorRemoveProcessContext(
     _In_ UINT32 ProcessId
@@ -489,12 +628,14 @@ ScMonitorRemoveProcessContext(
 // ============================================================================
 
 /**
- * @brief Resolve syscall number to name.
+ * @brief Resolve syscall number to name (delegates to SyscallTable).
  * @param SyscallNumber Syscall number.
  * @param Name Output name buffer.
- * @param NameSize Buffer size.
+ * @param NameSize Buffer size in bytes.
  * @return STATUS_SUCCESS on success.
  */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ScMonitorGetSyscallName(
     _In_ UINT32 SyscallNumber,
@@ -503,14 +644,16 @@ ScMonitorGetSyscallName(
     );
 
 /**
- * @brief Resolve syscall name to number.
- * @param Name Syscall name.
+ * @brief Resolve syscall name to number (delegates to SyscallTable).
+ * @param Name Syscall name (null-terminated).
  * @param SyscallNumber Output syscall number.
  * @return STATUS_SUCCESS on success.
  */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ScMonitorGetSyscallNumber(
-    _In_ PCSTR Name,
+    _In_z_ PCSTR Name,
     _Out_ PUINT32 SyscallNumber
     );
 
@@ -520,6 +663,8 @@ ScMonitorGetSyscallNumber(
  * @param Definition Output definition.
  * @return STATUS_SUCCESS on success.
  */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ScMonitorGetSyscallDefinition(
     _In_ UINT32 SyscallNumber,
@@ -531,13 +676,14 @@ ScMonitorGetSyscallDefinition(
 // ============================================================================
 
 /**
- * @brief Get syscall monitor statistics.
- * @param Stats Output statistics.
+ * @brief Get syscall monitor statistics (safe snapshot — no kernel objects).
+ * @param Stats Output statistics snapshot.
  * @return STATUS_SUCCESS on success.
  */
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 ScMonitorGetStatistics(
-    _Out_ PSYSCALL_MONITOR_GLOBALS Stats
+    _Out_ PSYSCALL_MONITOR_STATISTICS Stats
     );
 
 /**
@@ -548,6 +694,7 @@ ScMonitorGetStatistics(
  * @param SuspiciousSyscalls Output suspicious syscalls.
  * @return STATUS_SUCCESS on success.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ScMonitorGetProcessStats(
     _In_ UINT32 ProcessId,
@@ -555,5 +702,9 @@ ScMonitorGetProcessStats(
     _Out_ PUINT64 DirectSyscalls,
     _Out_ PUINT64 SuspiciousSyscalls
     );
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // SHADOWSTRIKE_SYSCALL_MONITOR_H

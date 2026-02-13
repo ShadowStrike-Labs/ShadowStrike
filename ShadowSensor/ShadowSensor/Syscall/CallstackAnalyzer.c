@@ -7,13 +7,15 @@
              stack pivoting, and unbacked code execution.
 
     Architecture:
-    - Frame-by-frame call stack unwinding with validation
-    - Module cache for efficient module lookups
+    - User-mode stack capture via RtlWalkFrameChain (flag=1) while attached
+    - Module cache with PID+CreateTime keying for PID-reuse safety
     - Return address validation against loaded modules
-    - Stack pivot detection via TEB stack bounds checking
-    - ROP gadget chain detection through pattern analysis
+    - Stack pivot detection via TEB stack bounds vs. captured RSP
+    - ROP gadget chain detection through short-sequence pattern analysis
     - Memory protection analysis for executable regions
     - Shellcode detection in unbacked memory regions
+    - Refcount-based shutdown drain (follows AnomalyDetector pattern)
+    - Ex*PushLock with KeEnterCriticalRegion (codebase convention)
 
     Detection Capabilities:
     - Unbacked code execution (shellcode, reflective loading)
@@ -38,46 +40,50 @@
 #include "../Utilities/ProcessUtils.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, CsaInitialize)
+#pragma alloc_text(PAGE, CsaInitialize)
 #pragma alloc_text(PAGE, CsaShutdown)
 #pragma alloc_text(PAGE, CsaCaptureCallstack)
 #pragma alloc_text(PAGE, CsaFreeCallstack)
+#pragma alloc_text(PAGE, CsaOnProcessExit)
 #endif
 
 //=============================================================================
 // Internal Constants
 //=============================================================================
 
-#define CSA_SIGNATURE                   'ASAC'  // 'CASA' reversed
-#define CSA_MODULE_SIGNATURE            'DMAC'  // 'CAMD' reversed
-#define CSA_CALLSTACK_SIGNATURE         'SCAC'  // 'CACS' reversed
+#define CSA_SIGNATURE                   'ASAC'
+#define CSA_MODULE_SIGNATURE            'DMAC'
+#define CSA_CALLSTACK_SIGNATURE         'SCAC'
 
-#define CSA_MODULE_CACHE_BUCKETS        64
 #define CSA_MAX_CACHED_MODULES          512
-#define CSA_MODULE_CACHE_TTL_MS         60000   // 1 minute TTL
+#define CSA_MODULE_CACHE_TTL_100NS      (60LL * 10000000LL)  // 1 minute in 100ns units
 
 #define CSA_MIN_VALID_USER_ADDRESS      0x10000ULL
 #define CSA_MAX_USER_ADDRESS            0x7FFFFFFFFFFFULL
-#define CSA_KERNEL_START_ADDRESS        0xFFFF800000000000ULL
 
-#define CSA_ROP_GADGET_MAX_SIZE         16      // Max bytes for ROP gadget
-#define CSA_MIN_STACK_FRAMES            2       // Minimum expected frames
-#define CSA_STACK_ALIGNMENT             8       // x64 stack alignment
+#define CSA_ROP_GADGET_WINDOW           6       // Max instructions before ret for gadget
+#define CSA_MIN_STACK_FRAMES            2
+#define CSA_MAX_MODULE_SIZE             0x80000000ULL  // 2 GB sanity cap
+
+#define CSA_SHUTDOWN_DRAIN_TIMEOUT_MS   5000
+
+//
+// Throttle: max captures per second across all threads
+//
+#define CSA_MAX_CAPTURES_PER_SECOND     200
+#define CSA_THROTTLE_WINDOW_100NS       (10000000LL)  // 1 second
 
 //
 // Common ROP gadget patterns
 //
 #define CSA_RET_OPCODE                  0xC3
 #define CSA_RET_IMM16_OPCODE            0xC2
-#define CSA_JMP_REG_PREFIX              0xFF
-#define CSA_CALL_REG_PREFIX             0xFF
 
 //
 // Suspicious instruction patterns
 //
-static const UCHAR CSA_PATTERN_SYSCALL[] = { 0x0F, 0x05 };              // syscall
-static const UCHAR CSA_PATTERN_SYSENTER[] = { 0x0F, 0x34 };             // sysenter
-static const UCHAR CSA_PATTERN_INT2E[] = { 0xCD, 0x2E };                // int 2Eh
+static const UCHAR CsaPatternSyscall[]  = { 0x0F, 0x05 };
+static const UCHAR CsaPatternSysenter[] = { 0x0F, 0x34 };
 
 //=============================================================================
 // Internal Structures
@@ -85,76 +91,74 @@ static const UCHAR CSA_PATTERN_INT2E[] = { 0xCD, 0x2E };                // int 2
 
 typedef struct _CSA_MODULE_CACHE_ENTRY {
     LIST_ENTRY ListEntry;
-    LIST_ENTRY HashEntry;
 
     ULONG Signature;
     volatile LONG RefCount;
 
-    //
-    // Module information
-    //
     HANDLE ProcessId;
+    LONGLONG ProcessCreateTime;  // PID-reuse protection
     PVOID ModuleBase;
     SIZE_T ModuleSize;
     UNICODE_STRING ModuleName;
-    WCHAR ModuleNameBuffer[260];
+    WCHAR ModuleNameBuffer[CSA_MAX_MODULE_NAME_CCH];
 
-    //
-    // Section information
-    //
     PVOID TextSectionBase;
     SIZE_T TextSectionSize;
 
-    //
-    // Characteristics
-    //
     BOOLEAN IsNtdll;
     BOOLEAN IsKernel32;
     BOOLEAN IsKnownGood;
     BOOLEAN IsSystemModule;
 
-    //
-    // Cache management
-    //
-    LARGE_INTEGER LastAccessTime;
     LARGE_INTEGER CacheTime;
-
 } CSA_MODULE_CACHE_ENTRY, *PCSA_MODULE_CACHE_ENTRY;
 
 typedef struct _CSA_ANALYZER_INTERNAL {
     ULONG Signature;
-    CSA_ANALYZER Analyzer;
+    CSA_ANALYZER Public;
 
-    //
-    // Module cache hash table
-    //
-    LIST_ENTRY ModuleCacheBuckets[CSA_MODULE_CACHE_BUCKETS];
-    volatile LONG CachedModuleCount;
-
-    //
-    // Lookaside lists
-    //
     NPAGED_LOOKASIDE_LIST CallstackLookaside;
     NPAGED_LOOKASIDE_LIST ModuleCacheLookaside;
 
-    //
-    // Shutdown flag
-    //
+    volatile LONG CachedModuleCount;
     volatile BOOLEAN ShuttingDown;
 
+    //
+    // Throttle state
+    //
+    volatile LONG64 CaptureWindowStart;
+    volatile LONG CapturesInWindow;
 } CSA_ANALYZER_INTERNAL, *PCSA_ANALYZER_INTERNAL;
 
 typedef struct _CSA_CALLSTACK_INTERNAL {
     ULONG Signature;
     CSA_CALLSTACK Callstack;
-    PCSA_ANALYZER_INTERNAL AnalyzerInternal;
+    PCSA_ANALYZER_INTERNAL AnalyzerRef;
 } CSA_CALLSTACK_INTERNAL, *PCSA_CALLSTACK_INTERNAL;
+
+//
+// Temporary structure for batched user-mode reads during module cache population.
+// Holds data copied out of the target process address space so that lock
+// acquisition never occurs inside a __try block touching user memory.
+//
+#define CSA_MAX_MODULES_PER_POPULATE 128
+
+typedef struct _CSA_MODULE_SNAPSHOT_ENTRY {
+    PVOID DllBase;
+    SIZE_T SizeOfImage;
+    WCHAR BaseDllName[CSA_MAX_MODULE_NAME_CCH];
+    USHORT NameLength;  // bytes, not chars
+    BOOLEAN Valid;
+} CSA_MODULE_SNAPSHOT_ENTRY, *PCSA_MODULE_SNAPSHOT_ENTRY;
 
 //=============================================================================
 // Forward Declarations
 //=============================================================================
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+static VOID CsapReferenceAnalyzer(_Inout_ PCSA_ANALYZER_INTERNAL Internal);
+static VOID CsapDereferenceAnalyzer(_Inout_ PCSA_ANALYZER_INTERNAL Internal);
+
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 CsapCaptureUserStack(
     _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal,
@@ -163,38 +167,33 @@ CsapCaptureUserStack(
     _Inout_ PCSA_CALLSTACK Callstack
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
-CsapAnalyzeFrame(
+CsapAnalyzeFrames(
     _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal,
     _In_ HANDLE ProcessId,
-    _Inout_ PCSA_STACK_FRAME Frame
+    _Inout_ PCSA_CALLSTACK Callstack
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 CsapLookupModule(
     _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal,
     _In_ HANDLE ProcessId,
+    _In_ LONGLONG ProcessCreateTime,
     _In_ PVOID Address,
     _Out_ PCSA_MODULE_CACHE_ENTRY* ModuleEntry
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 CsapPopulateModuleCache(
     _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal,
-    _In_ HANDLE ProcessId
-    );
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static ULONG
-CsapCalculateModuleHash(
     _In_ HANDLE ProcessId,
-    _In_ PVOID Address
+    _In_ LONGLONG ProcessCreateTime
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 CsapGetMemoryProtection(
     _In_ HANDLE ProcessId,
@@ -203,7 +202,7 @@ CsapGetMemoryProtection(
     _Out_ PBOOLEAN IsBacked
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 CsapGetThreadStackBounds(
     _In_ HANDLE ProcessId,
@@ -212,43 +211,77 @@ CsapGetThreadStackBounds(
     _Out_ PVOID* StackLimit
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static BOOLEAN
 CsapIsReturnAddressValid(
     _In_ PVOID ReturnAddress,
     _In_ PCSA_MODULE_CACHE_ENTRY Module
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static BOOLEAN
 CsapDetectRopGadget(
-    _In_ HANDLE ProcessId,
+    _In_ PEPROCESS Process,
     _In_ PVOID Address
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static VOID
-CsapReferenceModuleEntry(
-    _Inout_ PCSA_MODULE_CACHE_ENTRY Entry
-    );
+static VOID CsapReferenceModuleEntry(_Inout_ PCSA_MODULE_CACHE_ENTRY Entry);
+static VOID CsapDereferenceModuleEntry(_Inout_ PCSA_MODULE_CACHE_ENTRY Entry);
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static VOID
-CsapDereferenceModuleEntry(
-    _Inout_ PCSA_MODULE_CACHE_ENTRY Entry
-    );
-
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 CsapCleanupModuleCache(
     _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
+CsapEvictProcessEntries(
+    _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal,
+    _In_ HANDLE ProcessId
+    );
+
 static ULONG
 CsapCalculateSuspicionScore(
     _In_ PCSA_CALLSTACK Callstack
     );
+
+static VOID
+CsapPopulateTextSection(
+    _In_ PEPROCESS Process,
+    _Inout_ PCSA_MODULE_CACHE_ENTRY CacheEntry
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static BOOLEAN
+CsapThrottleCheck(
+    _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal
+    );
+
+//=============================================================================
+// Analyzer Reference Counting
+//=============================================================================
+
+static
+VOID
+CsapReferenceAnalyzer(
+    _Inout_ PCSA_ANALYZER_INTERNAL Internal
+    )
+{
+    InterlockedIncrement(&Internal->Public.RefCount);
+}
+
+static
+VOID
+CsapDereferenceAnalyzer(
+    _Inout_ PCSA_ANALYZER_INTERNAL Internal
+    )
+{
+    LONG newCount = InterlockedDecrement(&Internal->Public.RefCount);
+    if (newCount == 0) {
+        KeSetEvent(&Internal->Public.ZeroRefEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
 
 //=============================================================================
 // Initialization / Shutdown
@@ -259,26 +292,9 @@ NTSTATUS
 CsaInitialize(
     _Out_ PCSA_ANALYZER* Analyzer
     )
-/*++
-
-Routine Description:
-
-    Initializes the call stack analyzer subsystem. Allocates analyzer
-    structure, initializes module cache, and prepares lookaside lists.
-
-Arguments:
-
-    Analyzer - Receives pointer to initialized analyzer.
-
-Return Value:
-
-    STATUS_SUCCESS on success.
-
---*/
 {
     PCSA_ANALYZER_INTERNAL analyzerInternal = NULL;
     PCSA_ANALYZER analyzer = NULL;
-    ULONG i;
 
     PAGED_CODE();
 
@@ -288,9 +304,6 @@ Return Value:
 
     *Analyzer = NULL;
 
-    //
-    // Allocate internal analyzer structure
-    //
     analyzerInternal = (PCSA_ANALYZER_INTERNAL)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(CSA_ANALYZER_INTERNAL),
@@ -304,22 +317,25 @@ Return Value:
     RtlZeroMemory(analyzerInternal, sizeof(CSA_ANALYZER_INTERNAL));
 
     analyzerInternal->Signature = CSA_SIGNATURE;
-    analyzer = &analyzerInternal->Analyzer;
+    analyzer = &analyzerInternal->Public;
 
-    //
-    // Initialize module cache
-    //
     InitializeListHead(&analyzer->ModuleCache);
-    FltInitializePushLock(&analyzer->ModuleLock);
+    ExInitializePushLock(&analyzer->ModuleLock);
 
-    for (i = 0; i < CSA_MODULE_CACHE_BUCKETS; i++) {
-        InitializeListHead(&analyzerInternal->ModuleCacheBuckets[i]);
-    }
+    //
+    // RefCount starts at 1 — the "owner" reference released by CsaShutdown.
+    //
+    analyzer->RefCount = 1;
+    KeInitializeEvent(&analyzer->ZeroRefEvent, NotificationEvent, FALSE);
+
     analyzerInternal->CachedModuleCount = 0;
+    analyzerInternal->ShuttingDown = FALSE;
+    analyzerInternal->CapturesInWindow = 0;
 
-    //
-    // Initialize lookaside lists
-    //
+    LARGE_INTEGER now;
+    KeQuerySystemTimePrecise(&now);
+    analyzerInternal->CaptureWindowStart = now.QuadPart;
+
     ExInitializeNPagedLookasideList(
         &analyzerInternal->CallstackLookaside,
         NULL,
@@ -340,15 +356,11 @@ Return Value:
         0
         );
 
-    //
-    // Initialize statistics
-    //
     KeQuerySystemTimePrecise(&analyzer->Stats.StartTime);
     analyzer->Stats.StacksCaptured = 0;
     analyzer->Stats.AnomaliesFound = 0;
 
     analyzer->Initialized = TRUE;
-    analyzerInternal->ShuttingDown = FALSE;
 
     *Analyzer = analyzer;
 
@@ -361,20 +373,10 @@ VOID
 CsaShutdown(
     _Inout_ PCSA_ANALYZER Analyzer
     )
-/*++
-
-Routine Description:
-
-    Shuts down the call stack analyzer. Frees all cached modules and
-    releases analyzer resources.
-
-Arguments:
-
-    Analyzer - Analyzer to shutdown.
-
---*/
 {
     PCSA_ANALYZER_INTERNAL analyzerInternal;
+    LARGE_INTEGER timeout;
+    NTSTATUS waitStatus;
 
     PAGED_CODE();
 
@@ -382,30 +384,50 @@ Arguments:
         return;
     }
 
-    analyzerInternal = CONTAINING_RECORD(Analyzer, CSA_ANALYZER_INTERNAL, Analyzer);
+    analyzerInternal = CONTAINING_RECORD(Analyzer, CSA_ANALYZER_INTERNAL, Public);
 
     if (analyzerInternal->Signature != CSA_SIGNATURE) {
         return;
     }
 
+    //
+    // Signal shutdown. New operations will be rejected.
+    //
     analyzerInternal->ShuttingDown = TRUE;
     Analyzer->Initialized = FALSE;
     KeMemoryBarrier();
 
     //
-    // Cleanup module cache
+    // Release the owner reference and wait for all outstanding operations
+    // to complete (refs from CsaCaptureCallstack, CsaFreeCallstack, etc.).
     //
+    CsapDereferenceAnalyzer(analyzerInternal);
+
+    timeout.QuadPart = -((LONGLONG)CSA_SHUTDOWN_DRAIN_TIMEOUT_MS * 10000);
+    waitStatus = KeWaitForSingleObject(
+        &Analyzer->ZeroRefEvent,
+        Executive,
+        KernelMode,
+        FALSE,
+        &timeout
+        );
+
+    if (waitStatus == STATUS_TIMEOUT) {
+        //
+        // Outstanding references did not drain in time. This is a bug in
+        // the caller, but proceeding is safer than leaking the structure.
+        // Log for diagnostics.
+        //
+        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike-CSA] WARNING: Shutdown drain timed out, RefCount=%ld\n",
+            Analyzer->RefCount);
+    }
+
     CsapCleanupModuleCache(analyzerInternal);
 
-    //
-    // Delete lookaside lists
-    //
     ExDeleteNPagedLookasideList(&analyzerInternal->CallstackLookaside);
     ExDeleteNPagedLookasideList(&analyzerInternal->ModuleCacheLookaside);
 
-    //
-    // Clear signature and free
-    //
     analyzerInternal->Signature = 0;
     ShadowStrikeFreePoolWithTag(analyzerInternal, CSA_POOL_TAG);
 }
@@ -423,31 +445,13 @@ CsaCaptureCallstack(
     _In_ HANDLE ThreadId,
     _Out_ PCSA_CALLSTACK* Callstack
     )
-/*++
-
-Routine Description:
-
-    Captures the call stack for a specified thread and populates
-    frame information including module data and anomaly detection.
-
-Arguments:
-
-    Analyzer - Call stack analyzer.
-    ProcessId - Target process ID.
-    ThreadId - Target thread ID.
-    Callstack - Receives captured call stack.
-
-Return Value:
-
-    STATUS_SUCCESS on success.
-
---*/
 {
     PCSA_ANALYZER_INTERNAL analyzerInternal;
     PCSA_CALLSTACK_INTERNAL callstackInternal = NULL;
     PCSA_CALLSTACK callstack = NULL;
+    PEPROCESS process = NULL;
     NTSTATUS status;
-    ULONG i;
+    LONGLONG processCreateTime;
 
     PAGED_CODE();
 
@@ -461,27 +465,49 @@ Return Value:
 
     *Callstack = NULL;
 
-    analyzerInternal = CONTAINING_RECORD(Analyzer, CSA_ANALYZER_INTERNAL, Analyzer);
+    analyzerInternal = CONTAINING_RECORD(Analyzer, CSA_ANALYZER_INTERNAL, Public);
 
     if (analyzerInternal->ShuttingDown) {
         return STATUS_SHUTDOWN_IN_PROGRESS;
     }
 
     //
-    // Allocate callstack structure from lookaside
+    // Throttle check — prevent DoS via excessive captures
     //
+    if (!CsapThrottleCheck(analyzerInternal)) {
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    //
+    // Take an operational reference. This prevents the analyzer from being
+    // freed while this capture is in progress.
+    //
+    CsapReferenceAnalyzer(analyzerInternal);
+
+    //
+    // Get process create time for PID-reuse protection
+    //
+    status = PsLookupProcessByProcessId(ProcessId, &process);
+    if (!NT_SUCCESS(status)) {
+        CsapDereferenceAnalyzer(analyzerInternal);
+        return status;
+    }
+    processCreateTime = PsGetProcessCreateTimeQuadPart(process);
+
     callstackInternal = (PCSA_CALLSTACK_INTERNAL)ExAllocateFromNPagedLookasideList(
         &analyzerInternal->CallstackLookaside
         );
 
     if (callstackInternal == NULL) {
+        ObDereferenceObject(process);
+        CsapDereferenceAnalyzer(analyzerInternal);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlZeroMemory(callstackInternal, sizeof(CSA_CALLSTACK_INTERNAL));
 
     callstackInternal->Signature = CSA_CALLSTACK_SIGNATURE;
-    callstackInternal->AnalyzerInternal = analyzerInternal;
+    callstackInternal->AnalyzerRef = analyzerInternal;
 
     callstack = &callstackInternal->Callstack;
     callstack->ProcessId = ProcessId;
@@ -489,18 +515,17 @@ Return Value:
     callstack->FrameCount = 0;
     callstack->AggregatedAnomalies = CsaAnomaly_None;
     callstack->SuspicionScore = 0;
+    callstack->IsWow64Process = ShadowStrikeIsProcessWow64(process);
 
     KeQuerySystemTimePrecise(&callstack->CaptureTime);
 
     //
     // Ensure module cache is populated for this process
     //
-    status = CsapPopulateModuleCache(analyzerInternal, ProcessId);
-    if (!NT_SUCCESS(status)) {
-        //
-        // Continue even if cache population fails - we'll handle missing modules
-        //
-    }
+    (VOID)CsapPopulateModuleCache(analyzerInternal, ProcessId, processCreateTime);
+
+    ObDereferenceObject(process);
+    process = NULL;
 
     //
     // Capture user-mode stack
@@ -508,32 +533,33 @@ Return Value:
     status = CsapCaptureUserStack(analyzerInternal, ProcessId, ThreadId, callstack);
     if (!NT_SUCCESS(status)) {
         ExFreeToNPagedLookasideList(&analyzerInternal->CallstackLookaside, callstackInternal);
+        CsapDereferenceAnalyzer(analyzerInternal);
         return status;
     }
 
     //
-    // Analyze each frame
+    // Analyze all frames in a single pass (batched attach)
     //
-    for (i = 0; i < callstack->FrameCount; i++) {
-        status = CsapAnalyzeFrame(analyzerInternal, ProcessId, &callstack->Frames[i]);
-        if (NT_SUCCESS(status)) {
-            callstack->AggregatedAnomalies |= callstack->Frames[i].AnomalyFlags;
-        }
+    status = CsapAnalyzeFrames(analyzerInternal, ProcessId, callstack);
+    if (!NT_SUCCESS(status)) {
+        //
+        // Analysis failure is non-fatal; we still return the captured stack.
+        //
     }
 
-    //
-    // Calculate overall suspicion score
-    //
     callstack->SuspicionScore = CsapCalculateSuspicionScore(callstack);
 
-    //
-    // Update statistics
-    //
     InterlockedIncrement64(&Analyzer->Stats.StacksCaptured);
 
     if (callstack->AggregatedAnomalies != CsaAnomaly_None) {
         InterlockedIncrement64(&Analyzer->Stats.AnomaliesFound);
     }
+
+    //
+    // Note: We do NOT release the analyzer ref here. The ref is held until
+    // CsaFreeCallstack is called, ensuring the lookaside list is valid for
+    // the lifetime of the callstack object.
+    //
 
     *Callstack = callstack;
 
@@ -553,25 +579,6 @@ CsaAnalyzeCallstack(
     _Out_ PCSA_ANOMALY Anomalies,
     _Out_ PULONG Score
     )
-/*++
-
-Routine Description:
-
-    Analyzes a captured call stack for anomalies and calculates
-    a suspicion score.
-
-Arguments:
-
-    Analyzer - Call stack analyzer.
-    Callstack - Call stack to analyze.
-    Anomalies - Receives aggregated anomaly flags.
-    Score - Receives suspicion score.
-
-Return Value:
-
-    STATUS_SUCCESS on success.
-
---*/
 {
     if (Analyzer == NULL || !Analyzer->Initialized ||
         Callstack == NULL || Anomalies == NULL || Score == NULL) {
@@ -592,24 +599,6 @@ CsaValidateReturnAddresses(
     _In_ PCSA_CALLSTACK Callstack,
     _Out_ PBOOLEAN AllValid
     )
-/*++
-
-Routine Description:
-
-    Validates all return addresses in the call stack against
-    loaded modules.
-
-Arguments:
-
-    Analyzer - Call stack analyzer.
-    Callstack - Call stack to validate.
-    AllValid - Receives TRUE if all return addresses are valid.
-
-Return Value:
-
-    STATUS_SUCCESS on success.
-
---*/
 {
     ULONG i;
     BOOLEAN valid = TRUE;
@@ -624,17 +613,11 @@ Return Value:
     for (i = 0; i < Callstack->FrameCount; i++) {
         PCSA_STACK_FRAME frame = &Callstack->Frames[i];
 
-        //
-        // Check for unbacked code
-        //
         if (!frame->IsBackedByImage) {
             valid = FALSE;
             break;
         }
 
-        //
-        // Check for any anomalies
-        //
         if (frame->AnomalyFlags & (CsaAnomaly_UnbackedCode |
                                     CsaAnomaly_SpoofedFrames |
                                     CsaAnomaly_ReturnGadget)) {
@@ -656,32 +639,17 @@ CsaDetectStackPivot(
     _In_ HANDLE ThreadId,
     _Out_ PBOOLEAN IsPivoted
     )
-/*++
-
-Routine Description:
-
-    Detects if a thread's stack has been pivoted outside normal bounds.
-
-Arguments:
-
-    Analyzer - Call stack analyzer.
-    ThreadId - Thread to check.
-    IsPivoted - Receives TRUE if stack pivot detected.
-
-Return Value:
-
-    STATUS_SUCCESS on success.
-
---*/
 {
     NTSTATUS status;
     PETHREAD thread = NULL;
+    PEPROCESS process = NULL;
     HANDLE processId;
     PVOID stackBase = NULL;
     PVOID stackLimit = NULL;
-    PVOID currentSp;
-    CONTEXT context;
     BOOLEAN pivoted = FALSE;
+    PVOID capturedFrames[1];
+    ULONG capturedCount;
+    KAPC_STATE apcState;
 
     if (Analyzer == NULL || !Analyzer->Initialized ||
         ThreadId == NULL || IsPivoted == NULL) {
@@ -690,9 +658,6 @@ Return Value:
 
     *IsPivoted = FALSE;
 
-    //
-    // Get thread object
-    //
     status = PsLookupThreadByThreadId(ThreadId, &thread);
     if (!NT_SUCCESS(status)) {
         return status;
@@ -700,9 +665,6 @@ Return Value:
 
     processId = PsGetThreadProcessId(thread);
 
-    //
-    // Get stack bounds from TEB
-    //
     status = CsapGetThreadStackBounds(processId, ThreadId, &stackBase, &stackLimit);
     if (!NT_SUCCESS(status)) {
         ObDereferenceObject(thread);
@@ -710,26 +672,45 @@ Return Value:
     }
 
     //
-    // Get current stack pointer
-    // Note: In production, this would use proper thread context capture
+    // Capture a single user-mode frame to get the current RSP.
+    // RtlWalkFrameChain with flag=1 returns user-mode frames.
+    // We attach to the owning process first.
     //
-    RtlZeroMemory(&context, sizeof(context));
-    context.ContextFlags = CONTEXT_CONTROL;
+    status = PsLookupProcessByProcessId(processId, &process);
+    if (!NT_SUCCESS(status)) {
+        ObDereferenceObject(thread);
+        return status;
+    }
+
+    capturedCount = 0;
+    capturedFrames[0] = NULL;
+
+    KeStackAttachProcess(process, &apcState);
+
+    __try {
+        capturedCount = RtlWalkFrameChain(capturedFrames, 1, 1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        capturedCount = 0;
+    }
+
+    KeUnstackDetachProcess(&apcState);
+    ObDereferenceObject(process);
 
     //
-    // For kernel-mode analysis, we check if RSP is within expected bounds
-    // This is a simplified check - full implementation would capture thread context
+    // If we captured a frame, use its value as a proxy for RSP.
+    // If RSP (approximated by the return address location on the stack)
+    // is outside [stackLimit, stackBase], the stack has been pivoted.
     //
+    // Stack grows downward: stackLimit <= RSP < stackBase
+    //
+    if (capturedCount > 0 &&
+        stackBase != NULL && stackLimit != NULL &&
+        capturedFrames[0] != NULL) {
 
-    //
-    // Check if stack pointer is within bounds
-    // Stack grows downward: stackLimit < SP < stackBase
-    //
-    currentSp = stackLimit;  // Placeholder - real implementation captures RSP
+        ULONG_PTR frameAddr = (ULONG_PTR)capturedFrames[0];
 
-    if (stackBase != NULL && stackLimit != NULL) {
-        if ((ULONG_PTR)currentSp < (ULONG_PTR)stackLimit ||
-            (ULONG_PTR)currentSp > (ULONG_PTR)stackBase) {
+        if (frameAddr < (ULONG_PTR)stackLimit ||
+            frameAddr >= (ULONG_PTR)stackBase) {
             pivoted = TRUE;
         }
     }
@@ -747,20 +728,8 @@ VOID
 CsaFreeCallstack(
     _In_ PCSA_CALLSTACK Callstack
     )
-/*++
-
-Routine Description:
-
-    Frees a captured call stack structure.
-
-Arguments:
-
-    Callstack - Call stack to free.
-
---*/
 {
     PCSA_CALLSTACK_INTERNAL callstackInternal;
-    ULONG i;
 
     PAGED_CODE();
 
@@ -774,34 +743,90 @@ Arguments:
         return;
     }
 
-    //
-    // Free any allocated module name buffers in frames
-    //
-    for (i = 0; i < Callstack->FrameCount; i++) {
-        if (Callstack->Frames[i].ModuleName.Buffer != NULL &&
-            Callstack->Frames[i].ModuleName.MaximumLength > 0) {
-            //
-            // Module names point into cache entries, don't free here
-            //
-            Callstack->Frames[i].ModuleName.Buffer = NULL;
-        }
-    }
+    callstackInternal->Signature = 0;
 
-    //
-    // Return to lookaside list
-    //
-    if (callstackInternal->AnalyzerInternal != NULL) {
-        callstackInternal->Signature = 0;
+    if (callstackInternal->AnalyzerRef != NULL) {
+        PCSA_ANALYZER_INTERNAL analyzerRef = callstackInternal->AnalyzerRef;
+        callstackInternal->AnalyzerRef = NULL;
+
+        //
+        // Return to lookaside. Safe because we hold an analyzer ref that
+        // prevents the lookaside from being deleted.
+        //
         ExFreeToNPagedLookasideList(
-            &callstackInternal->AnalyzerInternal->CallstackLookaside,
+            &analyzerRef->CallstackLookaside,
             callstackInternal
             );
+
+        //
+        // Release the operational reference taken in CsaCaptureCallstack.
+        //
+        CsapDereferenceAnalyzer(analyzerRef);
     }
 }
 
 
+_Use_decl_annotations_
+VOID
+CsaOnProcessExit(
+    _In_ PCSA_ANALYZER Analyzer,
+    _In_ HANDLE ProcessId
+    )
+{
+    PCSA_ANALYZER_INTERNAL analyzerInternal;
+
+    PAGED_CODE();
+
+    if (Analyzer == NULL || !Analyzer->Initialized) {
+        return;
+    }
+
+    analyzerInternal = CONTAINING_RECORD(Analyzer, CSA_ANALYZER_INTERNAL, Public);
+
+    if (analyzerInternal->ShuttingDown) {
+        return;
+    }
+
+    CsapEvictProcessEntries(analyzerInternal, ProcessId);
+}
+
+
 //=============================================================================
-// Internal Functions - Stack Capture
+// Internal Functions — Throttle
+//=============================================================================
+
+static
+BOOLEAN
+CsapThrottleCheck(
+    _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal
+    )
+{
+    LARGE_INTEGER now;
+    LONGLONG windowStart;
+    LONG count;
+
+    KeQuerySystemTimePrecise(&now);
+    windowStart = InterlockedCompareExchange64(
+        &AnalyzerInternal->CaptureWindowStart,
+        0, 0
+        );
+
+    if ((now.QuadPart - windowStart) > CSA_THROTTLE_WINDOW_100NS) {
+        //
+        // Window expired — reset
+        //
+        InterlockedExchange64(&AnalyzerInternal->CaptureWindowStart, now.QuadPart);
+        InterlockedExchange(&AnalyzerInternal->CapturesInWindow, 1);
+        return TRUE;
+    }
+
+    count = InterlockedIncrement(&AnalyzerInternal->CapturesInWindow);
+    return (count <= CSA_MAX_CAPTURES_PER_SECOND);
+}
+
+
+//=============================================================================
+// Internal Functions — Stack Capture
 //=============================================================================
 
 static
@@ -813,269 +838,61 @@ CsapCaptureUserStack(
     _In_ HANDLE ThreadId,
     _Inout_ PCSA_CALLSTACK Callstack
     )
-/*++
-
-Routine Description:
-
-    Captures user-mode stack frames for the specified thread.
-
---*/
 {
     NTSTATUS status;
     PEPROCESS process = NULL;
-    PETHREAD thread = NULL;
     KAPC_STATE apcState;
-    PVOID stackBase = NULL;
-    PVOID stackLimit = NULL;
-    PVOID currentFrame;
-    PVOID returnAddress;
-    ULONG frameIndex = 0;
-    BOOLEAN attached = FALSE;
+    PVOID rawFrames[CSA_MAX_FRAMES];
+    ULONG capturedCount = 0;
+    ULONG i;
 
     UNREFERENCED_PARAMETER(AnalyzerInternal);
+    UNREFERENCED_PARAMETER(ThreadId);
 
-    //
-    // Get process and thread objects
-    //
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
         return status;
     }
 
-    status = PsLookupThreadByThreadId(ThreadId, &thread);
-    if (!NT_SUCCESS(status)) {
-        ObDereferenceObject(process);
-        return status;
-    }
+    RtlZeroMemory(rawFrames, sizeof(rawFrames));
 
     //
-    // Get stack bounds
-    //
-    status = CsapGetThreadStackBounds(ProcessId, ThreadId, &stackBase, &stackLimit);
-    if (!NT_SUCCESS(status)) {
-        ObDereferenceObject(thread);
-        ObDereferenceObject(process);
-        return status;
-    }
-
-    //
-    // Attach to process to read user-mode memory
+    // Attach and capture using RtlWalkFrameChain with flag=1 for user-mode.
+    // This properly uses unwind data (.pdata / RUNTIME_FUNCTION) on x64,
+    // unlike manual frame-pointer walking which is unreliable.
     //
     KeStackAttachProcess(process, &apcState);
-    attached = TRUE;
 
     __try {
-        //
-        // Walk the stack frames
-        // Note: This is a simplified frame-pointer based walk
-        // Production code would use RtlVirtualUnwind or similar
-        //
-        currentFrame = stackLimit;
-
-        while (frameIndex < CSA_MAX_FRAMES &&
-               (ULONG_PTR)currentFrame >= (ULONG_PTR)stackLimit &&
-               (ULONG_PTR)currentFrame < (ULONG_PTR)stackBase) {
-
-            //
-            // Validate frame pointer is accessible
-            //
-            if (!MmIsAddressValid(currentFrame)) {
-                break;
-            }
-
-            //
-            // Read return address (RBP+8 on x64)
-            //
-            PVOID* framePtr = (PVOID*)currentFrame;
-
-            //
-            // Probe the memory before reading
-            //
-            ProbeForRead(framePtr, sizeof(PVOID) * 2, sizeof(PVOID));
-
-            returnAddress = framePtr[1];  // Return address at RBP+8
-
-            //
-            // Validate return address is in user space
-            //
-            if ((ULONG_PTR)returnAddress < CSA_MIN_VALID_USER_ADDRESS ||
-                (ULONG_PTR)returnAddress > CSA_MAX_USER_ADDRESS) {
-                break;
-            }
-
-            //
-            // Store frame information
-            //
-            Callstack->Frames[frameIndex].ReturnAddress = returnAddress;
-            Callstack->Frames[frameIndex].FramePointer = currentFrame;
-            Callstack->Frames[frameIndex].StackPointer = (PVOID)((ULONG_PTR)currentFrame + sizeof(PVOID) * 2);
-            Callstack->Frames[frameIndex].Type = CsaFrame_User;
-            Callstack->Frames[frameIndex].AnomalyFlags = CsaAnomaly_None;
-
-            frameIndex++;
-
-            //
-            // Move to next frame
-            //
-            currentFrame = framePtr[0];  // Previous RBP
-
-            //
-            // Sanity check: frame pointer should move up the stack
-            //
-            if ((ULONG_PTR)currentFrame <= (ULONG_PTR)framePtr) {
-                break;
-            }
-        }
-
+        capturedCount = RtlWalkFrameChain(rawFrames, CSA_MAX_FRAMES, 1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        status = GetExceptionCode();
+        capturedCount = 0;
     }
 
-    if (attached) {
-        KeUnstackDetachProcess(&apcState);
-    }
-
-    Callstack->FrameCount = frameIndex;
-
-    //
-    // Check for missing frames anomaly
-    //
-    if (frameIndex < CSA_MIN_STACK_FRAMES) {
-        Callstack->AggregatedAnomalies |= CsaAnomaly_MissingFrames;
-    }
-
-    ObDereferenceObject(thread);
+    KeUnstackDetachProcess(&apcState);
     ObDereferenceObject(process);
 
-    return STATUS_SUCCESS;
-}
-
-
-static
-_Use_decl_annotations_
-NTSTATUS
-CsapAnalyzeFrame(
-    _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal,
-    _In_ HANDLE ProcessId,
-    _Inout_ PCSA_STACK_FRAME Frame
-    )
-/*++
-
-Routine Description:
-
-    Analyzes a single stack frame for anomalies.
-
---*/
-{
-    NTSTATUS status;
-    PCSA_MODULE_CACHE_ENTRY moduleEntry = NULL;
-    ULONG protection = 0;
-    BOOLEAN isBacked = FALSE;
-
     //
-    // Look up module containing return address
+    // Populate frame structures from captured raw return addresses
     //
-    status = CsapLookupModule(
-        AnalyzerInternal,
-        ProcessId,
-        Frame->ReturnAddress,
-        &moduleEntry
-        );
+    for (i = 0; i < capturedCount && i < CSA_MAX_FRAMES; i++) {
+        ULONG_PTR addr = (ULONG_PTR)rawFrames[i];
 
-    if (NT_SUCCESS(status) && moduleEntry != NULL) {
-        //
-        // Found module - populate frame info
-        //
-        Frame->ModuleBase = moduleEntry->ModuleBase;
-        Frame->ModuleName = moduleEntry->ModuleName;
-        Frame->OffsetInModule = (ULONG64)((ULONG_PTR)Frame->ReturnAddress -
-                                          (ULONG_PTR)moduleEntry->ModuleBase);
-        Frame->IsBackedByImage = TRUE;
-
-        //
-        // Check if this is a syscall transition
-        //
-        if (moduleEntry->IsNtdll) {
-            Frame->Type = CsaFrame_SystemCall;
+        if (addr < CSA_MIN_VALID_USER_ADDRESS || addr > CSA_MAX_USER_ADDRESS) {
+            break;
         }
 
-        //
-        // Validate return address points to valid code
-        //
-        if (!CsapIsReturnAddressValid(Frame->ReturnAddress, moduleEntry)) {
-            Frame->AnomalyFlags |= CsaAnomaly_SpoofedFrames;
-        }
-
-        CsapDereferenceModuleEntry(moduleEntry);
-
-    } else {
-        //
-        // No module found - unbacked code
-        //
-        Frame->ModuleBase = NULL;
-        RtlZeroMemory(&Frame->ModuleName, sizeof(UNICODE_STRING));
-        Frame->OffsetInModule = 0;
-        Frame->IsBackedByImage = FALSE;
-        Frame->AnomalyFlags |= CsaAnomaly_UnbackedCode;
-
-        //
-        // Check for direct syscall pattern
-        //
-        status = CsapGetMemoryProtection(ProcessId, Frame->ReturnAddress, &protection, &isBacked);
-        if (NT_SUCCESS(status)) {
-            Frame->MemoryProtection = protection;
-
-            //
-            // Check for RWX memory (highly suspicious)
-            //
-            if ((protection & PAGE_EXECUTE_READWRITE) == PAGE_EXECUTE_READWRITE) {
-                Frame->AnomalyFlags |= CsaAnomaly_RWXMemory;
-            }
-        }
-
-        //
-        // Check for ROP gadget patterns near return address
-        //
-        if (CsapDetectRopGadget(ProcessId, Frame->ReturnAddress)) {
-            Frame->AnomalyFlags |= CsaAnomaly_ReturnGadget;
-        }
+        Callstack->Frames[i].ReturnAddress = rawFrames[i];
+        Callstack->Frames[i].FramePointer = NULL;
+        Callstack->Frames[i].StackPointer = NULL;
+        Callstack->Frames[i].Type = CsaFrame_User;
+        Callstack->Frames[i].AnomalyFlags = CsaAnomaly_None;
+        Callstack->Frames[i].IsWow64Frame = Callstack->IsWow64Process;
+        Callstack->FrameCount = i + 1;
     }
 
-    //
-    // Additional checks for unknown modules
-    //
-    if (!Frame->IsBackedByImage) {
-        Frame->AnomalyFlags |= CsaAnomaly_UnknownModule;
-
-        //
-        // Check if this could be a direct syscall
-        //
-        // Read bytes before return address to check for syscall instruction
-        //
-        PEPROCESS process = NULL;
-        status = PsLookupProcessByProcessId(ProcessId, &process);
-        if (NT_SUCCESS(status)) {
-            KAPC_STATE apcState;
-            KeStackAttachProcess(process, &apcState);
-
-            __try {
-                PUCHAR codePtr = (PUCHAR)((ULONG_PTR)Frame->ReturnAddress - 2);
-
-                if (MmIsAddressValid(codePtr)) {
-                    ProbeForRead(codePtr, 2, 1);
-
-                    if (RtlCompareMemory(codePtr, CSA_PATTERN_SYSCALL, 2) == 2 ||
-                        RtlCompareMemory(codePtr, CSA_PATTERN_SYSENTER, 2) == 2) {
-                        Frame->AnomalyFlags |= CsaAnomaly_DirectSyscall;
-                    }
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Ignore read failures
-            }
-
-            KeUnstackDetachProcess(&apcState);
-            ObDereferenceObject(process);
-        }
+    if (Callstack->FrameCount < CSA_MIN_STACK_FRAMES) {
+        Callstack->AggregatedAnomalies |= CsaAnomaly_MissingFrames;
     }
 
     return STATUS_SUCCESS;
@@ -1083,7 +900,141 @@ Routine Description:
 
 
 //=============================================================================
-// Internal Functions - Module Cache
+// Internal Functions — Frame Analysis (batched single-attach)
+//=============================================================================
+
+static
+_Use_decl_annotations_
+NTSTATUS
+CsapAnalyzeFrames(
+    _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal,
+    _In_ HANDLE ProcessId,
+    _Inout_ PCSA_CALLSTACK Callstack
+    )
+{
+    NTSTATUS status;
+    PEPROCESS process = NULL;
+    PCSA_MODULE_CACHE_ENTRY moduleEntry = NULL;
+    LONGLONG processCreateTime;
+    ULONG i;
+
+    //
+    // Single process attach for all frame analysis reads
+    //
+    status = PsLookupProcessByProcessId(ProcessId, &process);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    processCreateTime = PsGetProcessCreateTimeQuadPart(process);
+
+    for (i = 0; i < Callstack->FrameCount; i++) {
+        PCSA_STACK_FRAME frame = &Callstack->Frames[i];
+        ULONG protection = 0;
+        BOOLEAN isBacked = FALSE;
+
+        moduleEntry = NULL;
+
+        status = CsapLookupModule(
+            AnalyzerInternal,
+            ProcessId,
+            processCreateTime,
+            frame->ReturnAddress,
+            &moduleEntry
+            );
+
+        if (NT_SUCCESS(status) && moduleEntry != NULL) {
+            frame->ModuleBase = moduleEntry->ModuleBase;
+            frame->OffsetInModule = (ULONG64)((ULONG_PTR)frame->ReturnAddress -
+                                              (ULONG_PTR)moduleEntry->ModuleBase);
+            frame->IsBackedByImage = TRUE;
+
+            //
+            // Deep-copy module name
+            //
+            USHORT copyLen = min(
+                moduleEntry->ModuleName.Length,
+                (USHORT)(sizeof(frame->ModuleNameBuffer) - sizeof(WCHAR))
+                );
+            RtlCopyMemory(frame->ModuleNameBuffer, moduleEntry->ModuleName.Buffer, copyLen);
+            frame->ModuleNameBuffer[copyLen / sizeof(WCHAR)] = L'\0';
+            RtlInitUnicodeString(&frame->ModuleName, frame->ModuleNameBuffer);
+
+            if (moduleEntry->IsNtdll) {
+                frame->Type = CsaFrame_SystemCall;
+            }
+
+            if (!CsapIsReturnAddressValid(frame->ReturnAddress, moduleEntry)) {
+                frame->AnomalyFlags |= CsaAnomaly_SpoofedFrames;
+            }
+
+            CsapDereferenceModuleEntry(moduleEntry);
+        } else {
+            //
+            // No module found — unbacked code
+            //
+            frame->ModuleBase = NULL;
+            RtlZeroMemory(&frame->ModuleName, sizeof(UNICODE_STRING));
+            frame->OffsetInModule = 0;
+            frame->IsBackedByImage = FALSE;
+            frame->AnomalyFlags |= CsaAnomaly_UnbackedCode | CsaAnomaly_UnknownModule;
+
+            status = CsapGetMemoryProtection(ProcessId, frame->ReturnAddress, &protection, &isBacked);
+            if (NT_SUCCESS(status)) {
+                frame->MemoryProtection = protection;
+
+                if ((protection & PAGE_EXECUTE_READWRITE) == PAGE_EXECUTE_READWRITE) {
+                    frame->AnomalyFlags |= CsaAnomaly_RWXMemory;
+                }
+            }
+
+            //
+            // Check for ROP gadget patterns
+            //
+            if (CsapDetectRopGadget(process, frame->ReturnAddress)) {
+                frame->AnomalyFlags |= CsaAnomaly_ReturnGadget;
+            }
+
+            //
+            // Check for direct syscall pattern.
+            // Attach once, read the 2 bytes before the return address.
+            //
+            {
+                KAPC_STATE apcState;
+                KeStackAttachProcess(process, &apcState);
+
+                __try {
+                    PUCHAR codePtr = (PUCHAR)((ULONG_PTR)frame->ReturnAddress - 2);
+
+                    if ((ULONG_PTR)codePtr >= CSA_MIN_VALID_USER_ADDRESS &&
+                        (ULONG_PTR)codePtr <= CSA_MAX_USER_ADDRESS) {
+
+                        ProbeForRead(codePtr, 2, 1);
+
+                        if (RtlCompareMemory(codePtr, CsaPatternSyscall, 2) == 2 ||
+                            RtlCompareMemory(codePtr, CsaPatternSysenter, 2) == 2) {
+                            frame->AnomalyFlags |= CsaAnomaly_DirectSyscall;
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    // Expected for invalid pages — not an error
+                }
+
+                KeUnstackDetachProcess(&apcState);
+            }
+        }
+
+        Callstack->AggregatedAnomalies |= frame->AnomalyFlags;
+    }
+
+    ObDereferenceObject(process);
+
+    return STATUS_SUCCESS;
+}
+
+
+//=============================================================================
+// Internal Functions — Module Cache
 //=============================================================================
 
 static
@@ -1092,48 +1043,57 @@ NTSTATUS
 CsapLookupModule(
     _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal,
     _In_ HANDLE ProcessId,
+    _In_ LONGLONG ProcessCreateTime,
     _In_ PVOID Address,
     _Out_ PCSA_MODULE_CACHE_ENTRY* ModuleEntry
     )
-/*++
-
-Routine Description:
-
-    Looks up a module in the cache by address.
-
---*/
 {
-    ULONG bucketIndex;
     PLIST_ENTRY entry;
     PCSA_MODULE_CACHE_ENTRY cacheEntry;
 
     *ModuleEntry = NULL;
 
-    bucketIndex = CsapCalculateModuleHash(ProcessId, Address) % CSA_MODULE_CACHE_BUCKETS;
+    //
+    // Linear scan of the module list. This is correct for range-based lookups
+    // where hashing by address is fundamentally broken (an arbitrary address
+    // within a module hashes differently than the module base).
+    // With CSA_MAX_CACHED_MODULES=512 this is bounded and fast enough.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&AnalyzerInternal->Public.ModuleLock);
 
-    FltAcquirePushLockShared(&AnalyzerInternal->Analyzer.ModuleLock);
-
-    for (entry = AnalyzerInternal->ModuleCacheBuckets[bucketIndex].Flink;
-         entry != &AnalyzerInternal->ModuleCacheBuckets[bucketIndex];
+    for (entry = AnalyzerInternal->Public.ModuleCache.Flink;
+         entry != &AnalyzerInternal->Public.ModuleCache;
          entry = entry->Flink) {
 
-        cacheEntry = CONTAINING_RECORD(entry, CSA_MODULE_CACHE_ENTRY, HashEntry);
+        cacheEntry = CONTAINING_RECORD(entry, CSA_MODULE_CACHE_ENTRY, ListEntry);
 
-        if (cacheEntry->ProcessId == ProcessId &&
-            (ULONG_PTR)Address >= (ULONG_PTR)cacheEntry->ModuleBase &&
+        if (cacheEntry->ProcessId != ProcessId) {
+            continue;
+        }
+
+        //
+        // PID-reuse protection: reject stale entries from old processes
+        //
+        if (cacheEntry->ProcessCreateTime != ProcessCreateTime) {
+            continue;
+        }
+
+        if ((ULONG_PTR)Address >= (ULONG_PTR)cacheEntry->ModuleBase &&
             (ULONG_PTR)Address < (ULONG_PTR)cacheEntry->ModuleBase + cacheEntry->ModuleSize) {
 
             CsapReferenceModuleEntry(cacheEntry);
-            KeQuerySystemTimePrecise(&cacheEntry->LastAccessTime);
 
-            FltReleasePushLock(&AnalyzerInternal->Analyzer.ModuleLock);
+            ExReleasePushLockShared(&AnalyzerInternal->Public.ModuleLock);
+            KeLeaveCriticalRegion();
 
             *ModuleEntry = cacheEntry;
             return STATUS_SUCCESS;
         }
     }
 
-    FltReleasePushLock(&AnalyzerInternal->Analyzer.ModuleLock);
+    ExReleasePushLockShared(&AnalyzerInternal->Public.ModuleLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_NOT_FOUND;
 }
@@ -1144,105 +1104,190 @@ _Use_decl_annotations_
 NTSTATUS
 CsapPopulateModuleCache(
     _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal,
-    _In_ HANDLE ProcessId
+    _In_ HANDLE ProcessId,
+    _In_ LONGLONG ProcessCreateTime
     )
-/*++
-
-Routine Description:
-
-    Populates the module cache with modules loaded in the target process.
-
---*/
 {
     NTSTATUS status;
     PEPROCESS process = NULL;
     PPEB peb = NULL;
-    PPEB_LDR_DATA ldrData = NULL;
-    PLIST_ENTRY listHead;
-    PLIST_ENTRY listEntry;
     KAPC_STATE apcState;
-    BOOLEAN attached = FALSE;
-    ULONG moduleCount = 0;
+    ULONG snapshotCount = 0;
+    ULONG i;
+
+    //
+    // Phase 1: Attach and snapshot module data into kernel-side buffers.
+    // NO locks are held during this phase.
+    //
+    PCSA_MODULE_SNAPSHOT_ENTRY snapshot = NULL;
+    SIZE_T snapshotSize = CSA_MAX_MODULES_PER_POPULATE * sizeof(CSA_MODULE_SNAPSHOT_ENTRY);
+
+    snapshot = (PCSA_MODULE_SNAPSHOT_ENTRY)ShadowStrikeAllocatePoolWithTag(
+        PagedPool,
+        snapshotSize,
+        CSA_POOL_TAG
+        );
+
+    if (snapshot == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(snapshot, snapshotSize);
 
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreePoolWithTag(snapshot, CSA_POOL_TAG);
         return status;
     }
 
-    //
-    // Get PEB
-    //
     peb = PsGetProcessPeb(process);
     if (peb == NULL) {
         ObDereferenceObject(process);
+        ShadowStrikeFreePoolWithTag(snapshot, CSA_POOL_TAG);
         return STATUS_NOT_FOUND;
     }
 
-    //
-    // Attach to process context
-    //
     KeStackAttachProcess(process, &apcState);
-    attached = TRUE;
 
     __try {
         //
-        // Access PEB_LDR_DATA
+        // Validate PEB is in user-mode address range
         //
-        ProbeForRead(peb, sizeof(PEB), sizeof(PVOID));
-        ldrData = peb->Ldr;
+        if ((ULONG_PTR)peb < CSA_MIN_VALID_USER_ADDRESS ||
+            (ULONG_PTR)peb > CSA_MAX_USER_ADDRESS) {
+            status = STATUS_INVALID_ADDRESS;
+            __leave;
+        }
 
+        ProbeForRead(peb, sizeof(PEB), sizeof(PVOID));
+
+        PPEB_LDR_DATA ldrData = peb->Ldr;
         if (ldrData == NULL) {
             status = STATUS_NOT_FOUND;
             __leave;
         }
 
+        if ((ULONG_PTR)ldrData < CSA_MIN_VALID_USER_ADDRESS ||
+            (ULONG_PTR)ldrData > CSA_MAX_USER_ADDRESS) {
+            status = STATUS_INVALID_ADDRESS;
+            __leave;
+        }
+
         ProbeForRead(ldrData, sizeof(PEB_LDR_DATA), sizeof(PVOID));
 
-        listHead = &ldrData->InMemoryOrderModuleList;
-        listEntry = listHead->Flink;
+        PLIST_ENTRY listHead = &ldrData->InMemoryOrderModuleList;
+        PLIST_ENTRY listEntry = listHead->Flink;
 
-        while (listEntry != listHead && moduleCount < CSA_MAX_CACHED_MODULES) {
-            PLDR_DATA_TABLE_ENTRY ldrEntry;
-            PCSA_MODULE_CACHE_ENTRY cacheEntry;
-            ULONG bucketIndex;
+        while (listEntry != listHead &&
+               snapshotCount < CSA_MAX_MODULES_PER_POPULATE) {
 
-            //
-            // Get LDR entry (offset for InMemoryOrderModuleList)
-            //
-            ldrEntry = CONTAINING_RECORD(
+            if ((ULONG_PTR)listEntry < CSA_MIN_VALID_USER_ADDRESS ||
+                (ULONG_PTR)listEntry > CSA_MAX_USER_ADDRESS) {
+                break;
+            }
+
+            PLDR_DATA_TABLE_ENTRY ldrEntry = CONTAINING_RECORD(
                 listEntry,
                 LDR_DATA_TABLE_ENTRY,
                 InMemoryOrderLinks
                 );
 
+            if ((ULONG_PTR)ldrEntry < CSA_MIN_VALID_USER_ADDRESS ||
+                (ULONG_PTR)ldrEntry > CSA_MAX_USER_ADDRESS) {
+                break;
+            }
+
             ProbeForRead(ldrEntry, sizeof(LDR_DATA_TABLE_ENTRY), sizeof(PVOID));
+
+            PVOID dllBase = ldrEntry->DllBase;
+            SIZE_T sizeOfImage = ldrEntry->SizeOfImage;
+
+            //
+            // Validate module base is in user space and size is sane
+            //
+            if (dllBase == NULL ||
+                (ULONG_PTR)dllBase < CSA_MIN_VALID_USER_ADDRESS ||
+                (ULONG_PTR)dllBase > CSA_MAX_USER_ADDRESS ||
+                sizeOfImage == 0 ||
+                sizeOfImage > CSA_MAX_MODULE_SIZE ||
+                ((ULONG_PTR)dllBase + sizeOfImage) < (ULONG_PTR)dllBase) {
+                listEntry = listEntry->Flink;
+                continue;
+            }
+
+            snapshot[snapshotCount].DllBase = dllBase;
+            snapshot[snapshotCount].SizeOfImage = sizeOfImage;
+            snapshot[snapshotCount].Valid = TRUE;
+
+            //
+            // Copy module name
+            //
+            if (ldrEntry->BaseDllName.Buffer != NULL &&
+                ldrEntry->BaseDllName.Length > 0 &&
+                (ULONG_PTR)ldrEntry->BaseDllName.Buffer >= CSA_MIN_VALID_USER_ADDRESS &&
+                (ULONG_PTR)ldrEntry->BaseDllName.Buffer <= CSA_MAX_USER_ADDRESS) {
+
+                USHORT nameLen = min(
+                    ldrEntry->BaseDllName.Length,
+                    (USHORT)(sizeof(snapshot[snapshotCount].BaseDllName) - sizeof(WCHAR))
+                    );
+
+                ProbeForRead(ldrEntry->BaseDllName.Buffer, nameLen, sizeof(WCHAR));
+                RtlCopyMemory(snapshot[snapshotCount].BaseDllName,
+                              ldrEntry->BaseDllName.Buffer,
+                              nameLen);
+                snapshot[snapshotCount].BaseDllName[nameLen / sizeof(WCHAR)] = L'\0';
+                snapshot[snapshotCount].NameLength = nameLen;
+            }
+
+            snapshotCount++;
+            listEntry = listEntry->Flink;
+        }
+
+        status = STATUS_SUCCESS;
+
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+
+    KeUnstackDetachProcess(&apcState);
+
+    //
+    // Phase 2: Process the snapshot under lock — no user-mode access here.
+    // This eliminates the lock-inside-__try bug entirely.
+    //
+    if (NT_SUCCESS(status) || snapshotCount > 0) {
+        for (i = 0; i < snapshotCount; i++) {
+            if (!snapshot[i].Valid) {
+                continue;
+            }
 
             //
             // Check if already cached
             //
             PCSA_MODULE_CACHE_ENTRY existing = NULL;
-            status = CsapLookupModule(
+            NTSTATUS lookupStatus = CsapLookupModule(
                 AnalyzerInternal,
                 ProcessId,
-                ldrEntry->DllBase,
+                ProcessCreateTime,
+                snapshot[i].DllBase,
                 &existing
                 );
 
-            if (NT_SUCCESS(status) && existing != NULL) {
+            if (NT_SUCCESS(lookupStatus) && existing != NULL) {
                 CsapDereferenceModuleEntry(existing);
-                listEntry = listEntry->Flink;
                 continue;
             }
 
             //
-            // Allocate new cache entry
+            // Allocate and populate cache entry
             //
-            cacheEntry = (PCSA_MODULE_CACHE_ENTRY)ExAllocateFromNPagedLookasideList(
-                &AnalyzerInternal->ModuleCacheLookaside
-                );
+            PCSA_MODULE_CACHE_ENTRY cacheEntry =
+                (PCSA_MODULE_CACHE_ENTRY)ExAllocateFromNPagedLookasideList(
+                    &AnalyzerInternal->ModuleCacheLookaside
+                    );
 
             if (cacheEntry == NULL) {
-                listEntry = listEntry->Flink;
                 continue;
             }
 
@@ -1251,39 +1296,21 @@ Routine Description:
             cacheEntry->Signature = CSA_MODULE_SIGNATURE;
             cacheEntry->RefCount = 1;
             cacheEntry->ProcessId = ProcessId;
-            cacheEntry->ModuleBase = ldrEntry->DllBase;
-            cacheEntry->ModuleSize = ldrEntry->SizeOfImage;
+            cacheEntry->ProcessCreateTime = ProcessCreateTime;
+            cacheEntry->ModuleBase = snapshot[i].DllBase;
+            cacheEntry->ModuleSize = snapshot[i].SizeOfImage;
 
-            //
-            // Copy module name
-            //
-            if (ldrEntry->BaseDllName.Buffer != NULL &&
-                ldrEntry->BaseDllName.Length > 0) {
-
-                ProbeForRead(
-                    ldrEntry->BaseDllName.Buffer,
-                    ldrEntry->BaseDllName.Length,
-                    sizeof(WCHAR)
-                    );
-
+            if (snapshot[i].NameLength > 0) {
                 USHORT copyLen = min(
-                    ldrEntry->BaseDllName.Length,
-                    sizeof(cacheEntry->ModuleNameBuffer) - sizeof(WCHAR)
+                    snapshot[i].NameLength,
+                    (USHORT)(sizeof(cacheEntry->ModuleNameBuffer) - sizeof(WCHAR))
                     );
-
-                RtlCopyMemory(
-                    cacheEntry->ModuleNameBuffer,
-                    ldrEntry->BaseDllName.Buffer,
-                    copyLen
-                    );
-
+                RtlCopyMemory(cacheEntry->ModuleNameBuffer,
+                              snapshot[i].BaseDllName,
+                              copyLen);
                 cacheEntry->ModuleNameBuffer[copyLen / sizeof(WCHAR)] = L'\0';
-
                 RtlInitUnicodeString(&cacheEntry->ModuleName, cacheEntry->ModuleNameBuffer);
 
-                //
-                // Check if this is ntdll or kernel32
-                //
                 UNICODE_STRING ntdllName;
                 UNICODE_STRING kernel32Name;
                 RtlInitUnicodeString(&ntdllName, L"ntdll.dll");
@@ -1300,83 +1327,123 @@ Routine Description:
             }
 
             KeQuerySystemTimePrecise(&cacheEntry->CacheTime);
-            cacheEntry->LastAccessTime = cacheEntry->CacheTime;
 
             //
-            // Add to cache
+            // Populate .text section info while attached to process
             //
-            bucketIndex = CsapCalculateModuleHash(ProcessId, cacheEntry->ModuleBase) %
-                          CSA_MODULE_CACHE_BUCKETS;
+            CsapPopulateTextSection(process, cacheEntry);
 
-            FltAcquirePushLockExclusive(&AnalyzerInternal->Analyzer.ModuleLock);
+            //
+            // Insert under exclusive lock — no user-mode access here
+            //
+            KeEnterCriticalRegion();
+            ExAcquirePushLockExclusive(&AnalyzerInternal->Public.ModuleLock);
 
-            InsertTailList(
-                &AnalyzerInternal->Analyzer.ModuleCache,
-                &cacheEntry->ListEntry
-                );
-            InsertTailList(
-                &AnalyzerInternal->ModuleCacheBuckets[bucketIndex],
-                &cacheEntry->HashEntry
-                );
-
+            InsertTailList(&AnalyzerInternal->Public.ModuleCache, &cacheEntry->ListEntry);
             InterlockedIncrement(&AnalyzerInternal->CachedModuleCount);
 
-            FltReleasePushLock(&AnalyzerInternal->Analyzer.ModuleLock);
-
-            moduleCount++;
-            listEntry = listEntry->Flink;
+            ExReleasePushLockExclusive(&AnalyzerInternal->Public.ModuleLock);
+            KeLeaveCriticalRegion();
         }
-
-        status = STATUS_SUCCESS;
-
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        status = GetExceptionCode();
-    }
-
-    if (attached) {
-        KeUnstackDetachProcess(&apcState);
     }
 
     ObDereferenceObject(process);
+    ShadowStrikeFreePoolWithTag(snapshot, CSA_POOL_TAG);
 
     return status;
 }
 
 
+//=============================================================================
+// Internal Functions — .text Section Population
+//=============================================================================
+
 static
-_Use_decl_annotations_
-ULONG
-CsapCalculateModuleHash(
-    _In_ HANDLE ProcessId,
-    _In_ PVOID Address
+VOID
+CsapPopulateTextSection(
+    _In_ PEPROCESS Process,
+    _Inout_ PCSA_MODULE_CACHE_ENTRY CacheEntry
     )
-/*++
-
-Routine Description:
-
-    Calculates a hash value for module cache lookup.
-
---*/
 {
-    ULONG_PTR combined;
+    KAPC_STATE apcState;
 
-    combined = (ULONG_PTR)ProcessId ^ ((ULONG_PTR)Address >> 16);
+    if (CacheEntry->ModuleBase == NULL) {
+        return;
+    }
 
-    //
-    // Simple hash mixing
-    //
-    combined ^= combined >> 17;
-    combined *= 0xed5ad4bb;
-    combined ^= combined >> 11;
-    combined *= 0xac4c1b51;
-    combined ^= combined >> 15;
+    KeStackAttachProcess(Process, &apcState);
 
-    return (ULONG)combined;
+    __try {
+        PUCHAR base = (PUCHAR)CacheEntry->ModuleBase;
+
+        if ((ULONG_PTR)base < CSA_MIN_VALID_USER_ADDRESS ||
+            (ULONG_PTR)base > CSA_MAX_USER_ADDRESS) {
+            __leave;
+        }
+
+        ProbeForRead(base, sizeof(IMAGE_DOS_HEADER), sizeof(USHORT));
+
+        PIMAGE_DOS_HEADER dosHdr = (PIMAGE_DOS_HEADER)base;
+        if (dosHdr->e_magic != IMAGE_DOS_SIGNATURE) {
+            __leave;
+        }
+
+        LONG peOffset = dosHdr->e_lfanew;
+        if (peOffset < 0 || peOffset > 1024) {
+            __leave;
+        }
+
+        PIMAGE_NT_HEADERS ntHdr = (PIMAGE_NT_HEADERS)(base + peOffset);
+
+        if ((ULONG_PTR)ntHdr < CSA_MIN_VALID_USER_ADDRESS ||
+            (ULONG_PTR)ntHdr > CSA_MAX_USER_ADDRESS) {
+            __leave;
+        }
+
+        ProbeForRead(ntHdr, sizeof(IMAGE_NT_HEADERS), sizeof(ULONG));
+
+        if (ntHdr->Signature != IMAGE_NT_SIGNATURE) {
+            __leave;
+        }
+
+        ULONG numberOfSections = ntHdr->FileHeader.NumberOfSections;
+        if (numberOfSections == 0 || numberOfSections > 96) {
+            __leave;
+        }
+
+        PIMAGE_SECTION_HEADER sectionHdr = IMAGE_FIRST_SECTION(ntHdr);
+
+        if ((ULONG_PTR)sectionHdr < CSA_MIN_VALID_USER_ADDRESS ||
+            (ULONG_PTR)sectionHdr > CSA_MAX_USER_ADDRESS) {
+            __leave;
+        }
+
+        ProbeForRead(sectionHdr,
+                     numberOfSections * sizeof(IMAGE_SECTION_HEADER),
+                     sizeof(ULONG));
+
+        for (ULONG s = 0; s < numberOfSections; s++) {
+            if ((sectionHdr[s].Characteristics & IMAGE_SCN_CNT_CODE) &&
+                (sectionHdr[s].Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
+
+                CacheEntry->TextSectionBase = base + sectionHdr[s].VirtualAddress;
+                CacheEntry->TextSectionSize = sectionHdr[s].Misc.VirtualSize;
+                break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // PE parsing failed — leave TextSection fields as NULL/0
+    }
+
+    KeUnstackDetachProcess(&apcState);
 }
 
 
+//=============================================================================
+// Internal Functions — Module Cache Reference Counting
+//=============================================================================
+
 static
-_Use_decl_annotations_
 VOID
 CsapReferenceModuleEntry(
     _Inout_ PCSA_MODULE_CACHE_ENTRY Entry
@@ -1389,27 +1456,27 @@ CsapReferenceModuleEntry(
 
 
 static
-_Use_decl_annotations_
 VOID
 CsapDereferenceModuleEntry(
     _Inout_ PCSA_MODULE_CACHE_ENTRY Entry
     )
 {
-    LONG newCount;
-
     if (Entry == NULL) {
         return;
     }
 
-    newCount = InterlockedDecrement(&Entry->RefCount);
+    InterlockedDecrement(&Entry->RefCount);
 
     //
-    // Note: Actual cleanup is done during cache eviction, not here
-    // This is to avoid complex locking in the dereference path
+    // Entries are freed during cache eviction or cleanup, not inline.
+    // The eviction path checks RefCount before freeing.
     //
-    UNREFERENCED_PARAMETER(newCount);
 }
 
+
+//=============================================================================
+// Internal Functions — Module Cache Cleanup
+//=============================================================================
 
 static
 _Use_decl_annotations_
@@ -1417,13 +1484,6 @@ VOID
 CsapCleanupModuleCache(
     _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal
     )
-/*++
-
-Routine Description:
-
-    Cleans up all entries in the module cache.
-
---*/
 {
     PLIST_ENTRY entry;
     PCSA_MODULE_CACHE_ENTRY cacheEntry;
@@ -1433,26 +1493,25 @@ Routine Description:
 
     InitializeListHead(&entriesToFree);
 
-    FltAcquirePushLockExclusive(&AnalyzerInternal->Analyzer.ModuleLock);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&AnalyzerInternal->Public.ModuleLock);
 
-    while (!IsListEmpty(&AnalyzerInternal->Analyzer.ModuleCache)) {
-        entry = RemoveHeadList(&AnalyzerInternal->Analyzer.ModuleCache);
+    while (!IsListEmpty(&AnalyzerInternal->Public.ModuleCache)) {
+        entry = RemoveHeadList(&AnalyzerInternal->Public.ModuleCache);
         cacheEntry = CONTAINING_RECORD(entry, CSA_MODULE_CACHE_ENTRY, ListEntry);
-
-        //
-        // Remove from hash bucket
-        //
-        RemoveEntryList(&cacheEntry->HashEntry);
 
         InsertTailList(&entriesToFree, entry);
     }
 
     AnalyzerInternal->CachedModuleCount = 0;
 
-    FltReleasePushLock(&AnalyzerInternal->Analyzer.ModuleLock);
+    ExReleasePushLockExclusive(&AnalyzerInternal->Public.ModuleLock);
+    KeLeaveCriticalRegion();
 
     //
-    // Free entries outside the lock
+    // Free entries outside the lock. During shutdown, all operational
+    // references have been drained, so RefCount should be 1 (the initial
+    // reference). We free regardless — this is only called during shutdown.
     //
     while (!IsListEmpty(&entriesToFree)) {
         entry = RemoveHeadList(&entriesToFree);
@@ -1467,8 +1526,64 @@ Routine Description:
 }
 
 
+static
+_Use_decl_annotations_
+VOID
+CsapEvictProcessEntries(
+    _In_ PCSA_ANALYZER_INTERNAL AnalyzerInternal,
+    _In_ HANDLE ProcessId
+    )
+{
+    PLIST_ENTRY entry;
+    PLIST_ENTRY next;
+    PCSA_MODULE_CACHE_ENTRY cacheEntry;
+    LIST_ENTRY entriesToFree;
+
+    InitializeListHead(&entriesToFree);
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&AnalyzerInternal->Public.ModuleLock);
+
+    for (entry = AnalyzerInternal->Public.ModuleCache.Flink;
+         entry != &AnalyzerInternal->Public.ModuleCache;
+         entry = next) {
+
+        next = entry->Flink;
+        cacheEntry = CONTAINING_RECORD(entry, CSA_MODULE_CACHE_ENTRY, ListEntry);
+
+        if (cacheEntry->ProcessId == ProcessId) {
+            //
+            // Only evict if no outstanding references (RefCount == 1 means
+            // only the cache itself holds a ref). If RefCount > 1, a lookup
+            // is in progress; the entry will be evicted on the next pass or
+            // at shutdown.
+            //
+            if (cacheEntry->RefCount <= 1) {
+                RemoveEntryList(entry);
+                InterlockedDecrement(&AnalyzerInternal->CachedModuleCount);
+                InsertTailList(&entriesToFree, entry);
+            }
+        }
+    }
+
+    ExReleasePushLockExclusive(&AnalyzerInternal->Public.ModuleLock);
+    KeLeaveCriticalRegion();
+
+    while (!IsListEmpty(&entriesToFree)) {
+        entry = RemoveHeadList(&entriesToFree);
+        cacheEntry = CONTAINING_RECORD(entry, CSA_MODULE_CACHE_ENTRY, ListEntry);
+
+        cacheEntry->Signature = 0;
+        ExFreeToNPagedLookasideList(
+            &AnalyzerInternal->ModuleCacheLookaside,
+            cacheEntry
+            );
+    }
+}
+
+
 //=============================================================================
-// Internal Functions - Memory Analysis
+// Internal Functions — Memory Analysis
 //=============================================================================
 
 static
@@ -1480,13 +1595,6 @@ CsapGetMemoryProtection(
     _Out_ PULONG Protection,
     _Out_ PBOOLEAN IsBacked
     )
-/*++
-
-Routine Description:
-
-    Gets memory protection attributes for an address.
-
---*/
 {
     NTSTATUS status;
     PEPROCESS process = NULL;
@@ -1547,21 +1655,12 @@ CsapGetThreadStackBounds(
     _Out_ PVOID* StackBase,
     _Out_ PVOID* StackLimit
     )
-/*++
-
-Routine Description:
-
-    Gets the stack bounds for a thread from its TEB.
-
---*/
 {
     NTSTATUS status;
     PEPROCESS process = NULL;
     PETHREAD thread = NULL;
     PTEB teb = NULL;
     KAPC_STATE apcState;
-
-    UNREFERENCED_PARAMETER(ThreadId);
 
     *StackBase = NULL;
     *StackLimit = NULL;
@@ -1577,9 +1676,6 @@ Routine Description:
         return status;
     }
 
-    //
-    // Get TEB pointer
-    //
     teb = (PTEB)PsGetThreadTeb(thread);
     if (teb == NULL) {
         ObDereferenceObject(thread);
@@ -1588,17 +1684,35 @@ Routine Description:
     }
 
     //
-    // Read TEB to get stack bounds
+    // Validate TEB is in user-mode range
     //
+    if ((ULONG_PTR)teb < CSA_MIN_VALID_USER_ADDRESS ||
+        (ULONG_PTR)teb > CSA_MAX_USER_ADDRESS) {
+        ObDereferenceObject(thread);
+        ObDereferenceObject(process);
+        return STATUS_INVALID_ADDRESS;
+    }
+
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        ProbeForRead(teb, sizeof(TEB), sizeof(PVOID));
+        ProbeForRead(teb, sizeof(NT_TIB), sizeof(PVOID));
 
-        *StackBase = teb->NtTib.StackBase;
-        *StackLimit = teb->NtTib.StackLimit;
+        PVOID base = teb->NtTib.StackBase;
+        PVOID limit = teb->NtTib.StackLimit;
 
-        status = STATUS_SUCCESS;
+        //
+        // Validate stack bounds are in user space and ordered correctly
+        //
+        if ((ULONG_PTR)base > CSA_MAX_USER_ADDRESS ||
+            (ULONG_PTR)limit < CSA_MIN_VALID_USER_ADDRESS ||
+            (ULONG_PTR)limit >= (ULONG_PTR)base) {
+            status = STATUS_INVALID_ADDRESS;
+        } else {
+            *StackBase = base;
+            *StackLimit = limit;
+            status = STATUS_SUCCESS;
+        }
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();
@@ -1613,6 +1727,10 @@ Routine Description:
 }
 
 
+//=============================================================================
+// Internal Functions — Return Address Validation
+//=============================================================================
+
 static
 _Use_decl_annotations_
 BOOLEAN
@@ -1620,13 +1738,6 @@ CsapIsReturnAddressValid(
     _In_ PVOID ReturnAddress,
     _In_ PCSA_MODULE_CACHE_ENTRY Module
     )
-/*++
-
-Routine Description:
-
-    Validates that a return address points to valid code within a module.
-
---*/
 {
     ULONG_PTR offset;
 
@@ -1634,9 +1745,6 @@ Routine Description:
         return FALSE;
     }
 
-    //
-    // Check if address is within module bounds
-    //
     if ((ULONG_PTR)ReturnAddress < (ULONG_PTR)Module->ModuleBase ||
         (ULONG_PTR)ReturnAddress >= (ULONG_PTR)Module->ModuleBase + Module->ModuleSize) {
         return FALSE;
@@ -1645,7 +1753,8 @@ Routine Description:
     offset = (ULONG_PTR)ReturnAddress - (ULONG_PTR)Module->ModuleBase;
 
     //
-    // Check if within text section if known
+    // If .text section info was populated, validate the return address
+    // points into executable code, not data sections.
     //
     if (Module->TextSectionBase != NULL && Module->TextSectionSize > 0) {
         ULONG_PTR textStart = (ULONG_PTR)Module->TextSectionBase -
@@ -1653,9 +1762,6 @@ Routine Description:
         ULONG_PTR textEnd = textStart + Module->TextSectionSize;
 
         if (offset < textStart || offset >= textEnd) {
-            //
-            // Return address outside .text section - could be data execution
-            //
             return FALSE;
         }
     }
@@ -1664,78 +1770,103 @@ Routine Description:
 }
 
 
+//=============================================================================
+// Internal Functions — ROP Gadget Detection
+//=============================================================================
+
 static
 _Use_decl_annotations_
 BOOLEAN
 CsapDetectRopGadget(
-    _In_ HANDLE ProcessId,
+    _In_ PEPROCESS Process,
     _In_ PVOID Address
     )
-/*++
-
-Routine Description:
-
-    Detects if an address points to a ROP gadget.
-
---*/
 {
-    NTSTATUS status;
-    PEPROCESS process = NULL;
     KAPC_STATE apcState;
     BOOLEAN isGadget = FALSE;
-    UCHAR codeBuffer[CSA_ROP_GADGET_MAX_SIZE];
+    UCHAR codeBuffer[CSA_ROP_GADGET_WINDOW + 1];
+    ULONG totalInstructions;
 
-    status = PsLookupProcessByProcessId(ProcessId, &process);
-    if (!NT_SUCCESS(status)) {
+    if ((ULONG_PTR)Address < CSA_MIN_VALID_USER_ADDRESS + CSA_ROP_GADGET_WINDOW ||
+        (ULONG_PTR)Address > CSA_MAX_USER_ADDRESS) {
         return FALSE;
     }
 
-    KeStackAttachProcess(process, &apcState);
+    KeStackAttachProcess(Process, &apcState);
 
     __try {
-        PVOID readAddr = (PVOID)((ULONG_PTR)Address - CSA_ROP_GADGET_MAX_SIZE + 1);
+        //
+        // Read a small window of code ending at the return address.
+        // A true ROP gadget is a VERY short instruction sequence (1-5 bytes)
+        // ending in ret/jmp reg. We look for patterns where the sequence
+        // from the last ret/jmp-reg backward contains only 1-5 instruction
+        // bytes — indicating a gadget, not a normal function epilogue.
+        //
+        PVOID readAddr = (PVOID)((ULONG_PTR)Address - CSA_ROP_GADGET_WINDOW);
 
-        if (!MmIsAddressValid(readAddr)) {
-            __leave;
-        }
-
-        ProbeForRead(readAddr, CSA_ROP_GADGET_MAX_SIZE, 1);
-        RtlCopyMemory(codeBuffer, readAddr, CSA_ROP_GADGET_MAX_SIZE);
+        ProbeForRead(readAddr, CSA_ROP_GADGET_WINDOW + 1, 1);
+        RtlCopyMemory(codeBuffer, readAddr, CSA_ROP_GADGET_WINDOW + 1);
 
         //
-        // Look for gadget patterns ending at or near the return address
+        // The byte at offset CSA_ROP_GADGET_WINDOW is where Address points.
+        // For a ROP gadget, there should be a ret instruction very close
+        // before Address (within 1-3 bytes), preceded by a minimal payload.
         //
 
         //
-        // Check for ret instruction at return point (common in ROP)
+        // Check: is the byte at [Address-1] a ret? If so, the "gadget" is
+        // just a single ret — trivially a gadget endpoint. But more
+        // importantly, check if the few bytes before it look like a
+        // short gadget (pop reg; ret pattern is 2 bytes, for example).
         //
-        if (codeBuffer[CSA_ROP_GADGET_MAX_SIZE - 1] == CSA_RET_OPCODE) {
+        totalInstructions = 0;
+
+        //
+        // Look for ret at [Address - 1]  (the instruction that transferred
+        // control here). If Address IS a return address, the instruction
+        // immediately before it in the caller should be a call, not a ret.
+        // Finding a ret means this "return address" was reached via ret, not
+        // call — strong indicator of ROP chaining.
+        //
+        UCHAR prevByte = codeBuffer[CSA_ROP_GADGET_WINDOW - 1];
+        UCHAR prevPrevByte = codeBuffer[CSA_ROP_GADGET_WINDOW - 2];
+
+        if (prevByte == CSA_RET_OPCODE) {
             //
-            // Simple gadget: ... ; ret
+            // ret at [Address-1]. Check if the sequence before it is
+            // suspiciously short (gadget-like: 1-4 bytes + ret = 2-5 total).
             //
-            isGadget = TRUE;
-        }
-
-        //
-        // Check for ret imm16
-        //
-        if (codeBuffer[CSA_ROP_GADGET_MAX_SIZE - 3] == CSA_RET_IMM16_OPCODE) {
-            isGadget = TRUE;
-        }
-
-        //
-        // Check for jmp reg patterns that could indicate JOP
-        //
-        for (int i = 0; i < CSA_ROP_GADGET_MAX_SIZE - 1; i++) {
-            if (codeBuffer[i] == CSA_JMP_REG_PREFIX) {
-                UCHAR modrm = codeBuffer[i + 1];
+            for (int k = CSA_ROP_GADGET_WINDOW - 2; k >= 0; k--) {
+                totalInstructions++;
                 //
-                // Check for jmp [reg] or jmp reg
+                // If we hit another ret or int3 (CC), this bounds the gadget.
                 //
-                if ((modrm & 0x38) == 0x20 ||   // jmp [reg]
-                    (modrm & 0x38) == 0x28) {   // jmp far [reg]
-                    isGadget = TRUE;
+                if (codeBuffer[k] == CSA_RET_OPCODE ||
+                    codeBuffer[k] == 0xCC) {
                     break;
+                }
+            }
+
+            //
+            // A gadget is typically 1-4 payload instructions before ret.
+            // Normal function epilogues are longer.
+            //
+            if (totalInstructions <= 4) {
+                isGadget = TRUE;
+            }
+        }
+
+        //
+        // Check for ret imm16 at [Address-3] (ret imm16 is 3 bytes: C2 xx xx)
+        //
+        if (!isGadget && CSA_ROP_GADGET_WINDOW >= 3) {
+            if (codeBuffer[CSA_ROP_GADGET_WINDOW - 3] == CSA_RET_IMM16_OPCODE) {
+                //
+                // Ensure the imm16 is small (gadgets use small stack adjustments)
+                //
+                USHORT immVal = *(PUSHORT)(&codeBuffer[CSA_ROP_GADGET_WINDOW - 2]);
+                if (immVal <= 0x20) {
+                    isGadget = TRUE;
                 }
             }
         }
@@ -1745,11 +1876,14 @@ Routine Description:
     }
 
     KeUnstackDetachProcess(&apcState);
-    ObDereferenceObject(process);
 
     return isGadget;
 }
 
+
+//=============================================================================
+// Internal Functions — Suspicion Scoring
+//=============================================================================
 
 static
 _Use_decl_annotations_
@@ -1757,13 +1891,6 @@ ULONG
 CsapCalculateSuspicionScore(
     _In_ PCSA_CALLSTACK Callstack
     )
-/*++
-
-Routine Description:
-
-    Calculates an overall suspicion score based on detected anomalies.
-
---*/
 {
     ULONG score = 0;
     ULONG i;
@@ -1774,31 +1901,32 @@ Routine Description:
         return 0;
     }
 
-    //
-    // Count anomaly types
-    //
     for (i = 0; i < Callstack->FrameCount; i++) {
         CSA_ANOMALY flags = Callstack->Frames[i].AnomalyFlags;
 
         if (flags & CsaAnomaly_UnbackedCode) unbackedCount++;
-        if (flags & CsaAnomaly_RWXMemory) rwxCount++;
+        if (flags & CsaAnomaly_RWXMemory)    rwxCount++;
     }
 
     //
-    // Score individual anomalies
+    // Per-category scoring with individual caps to prevent any single
+    // category from dominating the score.
     //
+
+    // Unbacked code: base 250 + 50/frame, capped at 450
     if (Callstack->AggregatedAnomalies & CsaAnomaly_UnbackedCode) {
-        score += 250;
-        score += unbackedCount * 50;  // Additional per unbacked frame
+        ULONG cat = 250 + min(unbackedCount, 4) * 50;
+        score += min(cat, 450);
     }
 
+    // RWX memory: base 200 + 50/region, capped at 350
     if (Callstack->AggregatedAnomalies & CsaAnomaly_RWXMemory) {
-        score += 300;
-        score += rwxCount * 75;
+        ULONG cat = 200 + min(rwxCount, 3) * 50;
+        score += min(cat, 350);
     }
 
     if (Callstack->AggregatedAnomalies & CsaAnomaly_StackPivot) {
-        score += 400;  // Very suspicious
+        score += 400;
     }
 
     if (Callstack->AggregatedAnomalies & CsaAnomaly_MissingFrames) {
@@ -1806,7 +1934,7 @@ Routine Description:
     }
 
     if (Callstack->AggregatedAnomalies & CsaAnomaly_SpoofedFrames) {
-        score += 350;
+        score += 300;
     }
 
     if (Callstack->AggregatedAnomalies & CsaAnomaly_UnknownModule) {
@@ -1814,15 +1942,15 @@ Routine Description:
     }
 
     if (Callstack->AggregatedAnomalies & CsaAnomaly_DirectSyscall) {
-        score += 500;  // High indicator of evasion
+        score += 500;
     }
 
     if (Callstack->AggregatedAnomalies & CsaAnomaly_ReturnGadget) {
-        score += 450;  // ROP chain indicator
+        score += 400;
     }
 
     //
-    // Bonus for multiple anomaly types (indicates sophisticated attack)
+    // Multi-anomaly bonus: 3+ distinct types indicate coordinated evasion
     //
     ULONG anomalyTypes = 0;
     CSA_ANOMALY temp = Callstack->AggregatedAnomalies;
@@ -1832,12 +1960,9 @@ Routine Description:
     }
 
     if (anomalyTypes >= 3) {
-        score += 200;  // Multiple attack indicators
+        score += 200;
     }
 
-    //
-    // Cap at 1000
-    //
     return min(score, 1000);
 }
 

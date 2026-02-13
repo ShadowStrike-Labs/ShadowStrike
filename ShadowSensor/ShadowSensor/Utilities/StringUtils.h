@@ -15,7 +15,6 @@
  * - Memory-safe string builders
  * - File extension extraction
  * - Process name parsing
- * - Registry path manipulation
  * - Command-line argument parsing
  *
  * Security Guarantees:
@@ -578,7 +577,8 @@ ShadowStrikeStringBuilderInit(
  *
  * @return STATUS_SUCCESS or error
  *
- * @irql Depends on pool type
+ * @irql If builder uses PagedPool: PASSIVE_LEVEL.
+ *       If builder uses NonPagedPoolNx: <= DISPATCH_LEVEL.
  */
 NTSTATUS
 ShadowStrikeStringBuilderAppend(
@@ -607,7 +607,13 @@ ShadowStrikeStringBuilderAppendCString(
  * @param Format        Format string
  * @param ...           Format arguments
  *
- * @return STATUS_SUCCESS or error
+ * @return STATUS_SUCCESS or error.
+ *         Returns STATUS_BUFFER_OVERFLOW if formatted output exceeds
+ *         511 characters (internal stack buffer limit).
+ *
+ * @note Maximum single format output is 511 wide characters. For longer
+ *       strings, use ShadowStrikeStringBuilderAppend with a pre-formatted
+ *       UNICODE_STRING.
  */
 NTSTATUS
 ShadowStrikeStringBuilderAppendFormat(
@@ -621,8 +627,14 @@ ShadowStrikeStringBuilderAppendFormat(
  *
  * @param Builder       String builder
  * @param String        Receives UNICODE_STRING pointing to builder buffer
+ *
+ * @return TRUE if conversion succeeded, FALSE if builder content exceeds
+ *         UNICODE_STRING capacity (MAXUSHORT bytes) or parameters are NULL.
+ *
+ * @note The returned string points into the builder's internal buffer.
+ *       It becomes invalid after builder cleanup or appends that reallocate.
  */
-VOID
+BOOLEAN
 ShadowStrikeStringBuilderToUnicodeString(
     _In_ PSHADOW_STRING_BUILDER Builder,
     _Out_ PUNICODE_STRING String
@@ -827,13 +839,15 @@ ShadowStrikeIsStringPrintable(
     );
 
 /**
- * @brief Check if string is valid file path.
+ * @brief Check if string is valid DOS file path.
  *
- * Checks for invalid path characters.
+ * Checks for invalid path characters. Only validates DOS-style paths.
+ * NT device paths and UNC paths may be incorrectly rejected.
+ * Use ShadowStrikeGetPathType() first for non-DOS paths.
  *
  * @param Path      Path to validate
  *
- * @return TRUE if valid path
+ * @return TRUE if valid DOS path
  *
  * @irql <= DISPATCH_LEVEL
  */

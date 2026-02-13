@@ -182,7 +182,8 @@ typedef struct _SHADOW_FILE_READ_CONTEXT {
     BOOLEAN EndOfFile;
     NTSTATUS LastStatus;
     BOOLEAN UsedLookaside;
-    UCHAR Reserved[3];
+    BOOLEAN ReferencesHeld;
+    UCHAR Reserved[2];
 } SHADOW_FILE_READ_CONTEXT, *PSHADOW_FILE_READ_CONTEXT;
 
 // ============================================================================
@@ -193,7 +194,7 @@ _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 ShadowStrikeInitializeFileUtils(
-    VOID
+    _In_ PFLT_FILTER FilterHandle
     );
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -329,7 +330,7 @@ ShadowStrikeDetectFileType(
     _Out_ PSHADOW_FILE_TYPE FileType
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 ShadowStrikeDetectFileTypeByExtension(
@@ -347,13 +348,13 @@ ShadowStrikeIsFilePE(
     _Out_opt_ PBOOLEAN Is64Bit
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowStrikeIsExecutableExtension(
     _In_ PCUNICODE_STRING FileName
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowStrikeIsScriptExtension(
     _In_ PCUNICODE_STRING FileName
@@ -372,7 +373,7 @@ ShadowStrikeHasAlternateDataStreams(
     _Out_ PBOOLEAN HasADS
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowStrikeIsAlternateDataStream(
     _In_ PCUNICODE_STRING FileName

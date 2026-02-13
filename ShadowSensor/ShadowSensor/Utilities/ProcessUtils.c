@@ -145,10 +145,6 @@ typedef BOOLEAN (NTAPI *PFN_PSISSECUREPROCESS)(
     _In_ PEPROCESS Process
 );
 
-typedef PACCESS_TOKEN (NTAPI *PFN_PSREFERENCEPRIMARYTOKEN)(
-    _In_ PEPROCESS Process
-);
-
 // ============================================================================
 // INITIALIZATION STATE VALUES
 // ============================================================================
@@ -196,7 +192,6 @@ typedef struct _SHADOW_PROCESS_UTILS_STATE {
     PFN_PSISPROCESSTERMINATING      PsIsProcessTerminating;
     PFN_PSISPROTECTEDPROCESS        PsIsProtectedProcess;
     PFN_PSISSECUREPROCESS           PsIsSecureProcess;
-    PFN_PSREFERENCEPRIMARYTOKEN     PsReferencePrimaryToken;
 
     //
     // System process EPROCESS for reference
@@ -228,7 +223,7 @@ static SHADOW_PROCESS_UTILS_STATE g_ProcessUtilsState = { 0 };
 // ============================================================================
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, ShadowProcessUtilsInitialize)
+#pragma alloc_text(PAGE, ShadowProcessUtilsInitialize)
 #pragma alloc_text(PAGE, ShadowProcessUtilsCleanup)
 #pragma alloc_text(PAGE, ShadowStrikeGetProcessImagePath)
 #pragma alloc_text(PAGE, ShadowStrikeGetProcessImageName)
@@ -239,6 +234,7 @@ static SHADOW_PROCESS_UTILS_STATE g_ProcessUtilsState = { 0 };
 #pragma alloc_text(PAGE, ShadowStrikeGetParentProcessId)
 #pragma alloc_text(PAGE, ShadowStrikeGetCreatingProcess)
 #pragma alloc_text(PAGE, ShadowStrikeStoreCreatingProcessContext)
+#pragma alloc_text(PAGE, ShadowStrikeRemoveCreatingProcessContext)
 #pragma alloc_text(PAGE, ShadowStrikeValidateParentChild)
 #pragma alloc_text(PAGE, ShadowStrikeIsSystemProcess)
 #pragma alloc_text(PAGE, ShadowStrikeIsProcessElevated)
@@ -315,6 +311,10 @@ ShadowOpenProcessInternal(
 
 /**
  * @brief Get token from process with proper reference.
+ *
+ * PsReferencePrimaryToken is safe on terminating processes as long as we
+ * hold an EPROCESS reference. The token remains valid until the process
+ * object is fully destroyed. No TOCTOU termination check needed.
  */
 static
 NTSTATUS
@@ -331,15 +331,6 @@ ShadowGetProcessToken(
     Status = PsLookupProcessByProcessId(ProcessId, &Process);
     if (!NT_SUCCESS(Status)) {
         return Status;
-    }
-
-    //
-    // Check if process is terminating before accessing token
-    //
-    if (g_ProcessUtilsState.PsIsProcessTerminating != NULL &&
-        g_ProcessUtilsState.PsIsProcessTerminating(Process)) {
-        ObDereferenceObject(Process);
-        return STATUS_PROCESS_IS_TERMINATING;
     }
 
     *Token = PsReferencePrimaryToken(Process);
@@ -526,8 +517,8 @@ ShadowIsSystemToken(
 {
     NTSTATUS Status;
     HANDLE TokenHandle = NULL;
-    PTOKEN_USER TokenUser = NULL;
-    ULONG TokenUserSize = 0;
+    PTOKEN_USER pTokenUserInfo = NULL;
+    ULONG TokenUserInfoSize = 0;
     ULONG ReturnLength = 0;
     BOOLEAN IsSystem = FALSE;
     UCHAR LocalSystemSidBuffer[SECURITY_MAX_SID_SIZE];
@@ -568,11 +559,11 @@ ShadowIsSystemToken(
     }
 
     //
-    // Query required size for TokenUser
+    // Query required size for token user information
     //
     Status = ZwQueryInformationToken(
         TokenHandle,
-        TokenUser,
+        TokenUser,    // TOKEN_INFORMATION_CLASS enum value (= 1)
         NULL,
         0,
         &ReturnLength
@@ -588,40 +579,40 @@ ShadowIsSystemToken(
         return FALSE;
     }
 
-    TokenUserSize = ReturnLength;
-    TokenUser = (PTOKEN_USER)ShadowStrikeAllocatePagedWithTag(
-        TokenUserSize,
+    TokenUserInfoSize = ReturnLength;
+    pTokenUserInfo = (PTOKEN_USER)ShadowStrikeAllocatePagedWithTag(
+        TokenUserInfoSize,
         SHADOW_TOKEN_TAG
     );
 
-    if (TokenUser == NULL) {
+    if (pTokenUserInfo == NULL) {
         ZwClose(TokenHandle);
         return FALSE;
     }
 
     Status = ZwQueryInformationToken(
         TokenHandle,
-        TokenUser,
-        TokenUser,
-        TokenUserSize,
+        TokenUser,    // TOKEN_INFORMATION_CLASS enum value (= 1)
+        pTokenUserInfo,
+        TokenUserInfoSize,
         &ReturnLength
     );
 
     ZwClose(TokenHandle);
 
     if (!NT_SUCCESS(Status)) {
-        ShadowStrikeFreePoolWithTag(TokenUser, SHADOW_TOKEN_TAG);
+        ShadowStrikeFreePoolWithTag(pTokenUserInfo, SHADOW_TOKEN_TAG);
         return FALSE;
     }
 
     //
     // Validate and compare SIDs
     //
-    if (TokenUser->User.Sid != NULL && RtlValidSid(TokenUser->User.Sid)) {
-        IsSystem = RtlEqualSid(TokenUser->User.Sid, LocalSystemSid);
+    if (pTokenUserInfo->User.Sid != NULL && RtlValidSid(pTokenUserInfo->User.Sid)) {
+        IsSystem = RtlEqualSid(pTokenUserInfo->User.Sid, LocalSystemSid);
     }
 
-    ShadowStrikeFreePoolWithTag(TokenUser, SHADOW_TOKEN_TAG);
+    ShadowStrikeFreePoolWithTag(pTokenUserInfo, SHADOW_TOKEN_TAG);
     return IsSystem;
 }
 
@@ -668,12 +659,21 @@ ShadowValidateUnicodeStringFromQuery(
 
     //
     // Validate that buffer pointer is after the UNICODE_STRING header
-    // and within reasonable bounds
+    // and within reasonable bounds. Use subtraction-based checks to
+    // prevent pointer arithmetic overflow.
     //
     if (String->Buffer != NULL) {
         ULONG_PTR BufferStart = (ULONG_PTR)String;
-        ULONG_PTR BufferEnd = BufferStart + BufferSize;
         ULONG_PTR StringBuffer = (ULONG_PTR)String->Buffer;
+
+        //
+        // Check for overflow in BufferStart + BufferSize
+        //
+        if (BufferSize > (MAXULONG_PTR - BufferStart)) {
+            return FALSE;
+        }
+
+        ULONG_PTR BufferEnd = BufferStart + BufferSize;
 
         if (StringBuffer < BufferStart || StringBuffer >= BufferEnd) {
             //
@@ -682,7 +682,10 @@ ShadowValidateUnicodeStringFromQuery(
             return FALSE;
         }
 
-        if (StringBuffer + String->Length > BufferEnd) {
+        //
+        // Use subtraction to avoid overflow: String->Length > (BufferEnd - StringBuffer)
+        //
+        if (String->Length > (BufferEnd - StringBuffer)) {
             //
             // String data extends beyond buffer - invalid
             //
@@ -711,6 +714,7 @@ ShadowHashProcessId(
 // INITIALIZATION
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowProcessUtilsInitialize(
     VOID
@@ -808,9 +812,6 @@ ShadowProcessUtilsInitialize(
     g_ProcessUtilsState.PsIsSecureProcess =
         (PFN_PSISSECUREPROCESS)ShadowResolveSystemRoutine(L"PsIsSecureProcess");
 
-    g_ProcessUtilsState.PsReferencePrimaryToken =
-        (PFN_PSREFERENCEPRIMARYTOKEN)ShadowResolveSystemRoutine(L"PsReferencePrimaryToken");
-
     //
     // Get System process reference
     //
@@ -827,6 +828,7 @@ ShadowProcessUtilsInitialize(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 VOID
 ShadowProcessUtilsCleanup(
     VOID
@@ -836,13 +838,28 @@ ShadowProcessUtilsCleanup(
     PLIST_ENTRY ListHead;
     PLIST_ENTRY Entry;
     PSHADOW_CREATING_CONTEXT_ENTRY ContextEntry;
+    LONG PreviousState;
 
     PAGED_CODE();
 
     //
-    // Mark as uninitialized first
+    // Atomically transition from INITIALIZED to INITIALIZING (used as "shutting down").
+    // This prevents new callers from using the module, while allowing in-flight
+    // operations that already read INITIALIZED to complete normally.
+    // We do NOT set UNINITIALIZED until everything is torn down.
     //
-    InterlockedExchange(&g_ProcessUtilsState.InitializationState, PROCUTILS_STATE_UNINITIALIZED);
+    PreviousState = InterlockedCompareExchange(
+        &g_ProcessUtilsState.InitializationState,
+        PROCUTILS_STATE_INITIALIZING,
+        PROCUTILS_STATE_INITIALIZED
+    );
+
+    if (PreviousState != PROCUTILS_STATE_INITIALIZED) {
+        //
+        // Already uninitialized or mid-init — nothing to do
+        //
+        return;
+    }
 
     //
     // Cleanup creating context table
@@ -877,6 +894,11 @@ ShadowProcessUtilsCleanup(
     g_ProcessUtilsState.PsIsSecureProcess = NULL;
     g_ProcessUtilsState.SystemProcess = NULL;
 
+    //
+    // NOW mark as fully uninitialized — cleanup is complete
+    //
+    InterlockedExchange(&g_ProcessUtilsState.InitializationState, PROCUTILS_STATE_UNINITIALIZED);
+
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] ProcessUtils cleaned up\n");
 }
@@ -885,6 +907,7 @@ ShadowProcessUtilsCleanup(
 // PROCESS INFORMATION RETRIEVAL
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetProcessImagePath(
     _In_ HANDLE ProcessId,
@@ -1015,8 +1038,14 @@ ShadowStrikeGetProcessImagePath(
     }
 
     //
-    // Allocate new buffer for caller
+    // Allocate new buffer for caller. Validate that Length + sizeof(WCHAR)
+    // doesn't overflow USHORT (MaximumLength is USHORT).
     //
+    if (ReturnedPath->Length > (MAXUSHORT - sizeof(WCHAR))) {
+        ShadowStrikeFreePoolWithTag(Buffer, SHADOW_PROCINFO_TAG);
+        return STATUS_NAME_TOO_LONG;
+    }
+
     ImagePath->MaximumLength = ReturnedPath->Length + sizeof(WCHAR);
     ImagePath->Buffer = (PWCH)ShadowStrikeAllocatePagedWithTag(
         ImagePath->MaximumLength,
@@ -1042,6 +1071,7 @@ ShadowStrikeGetProcessImagePath(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetProcessImageName(
     _In_ HANDLE ProcessId,
@@ -1098,6 +1128,7 @@ ShadowStrikeGetProcessImageName(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetProcessCommandLine(
     _In_ HANDLE ProcessId,
@@ -1270,6 +1301,7 @@ ShadowStrikeGetProcessCommandLine(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetProcessInfo(
     _In_ HANDLE ProcessId,
@@ -1277,6 +1309,7 @@ ShadowStrikeGetProcessInfo(
 )
 {
     NTSTATUS Status;
+    NTSTATUS subStatus;
     PEPROCESS Process = NULL;
     PACCESS_TOKEN Token = NULL;
     HANDLE ParentPid = NULL;
@@ -1299,7 +1332,7 @@ ShadowStrikeGetProcessInfo(
     ProcessInfo->ProcessId = ProcessId;
 
     //
-    // Get EPROCESS
+    // Get EPROCESS — this is mandatory, fail if we cannot
     //
     Status = PsLookupProcessByProcessId(ProcessId, &Process);
     if (!NT_SUCCESS(Status)) {
@@ -1316,15 +1349,15 @@ ShadowStrikeGetProcessInfo(
     }
 
     //
-    // Get parent process ID
+    // Get parent process ID (best-effort)
     //
-    Status = ShadowStrikeGetParentProcessId(ProcessId, &ParentPid);
-    if (NT_SUCCESS(Status)) {
+    subStatus = ShadowStrikeGetParentProcessId(ProcessId, &ParentPid);
+    if (NT_SUCCESS(subStatus)) {
         ProcessInfo->ParentProcessId = ParentPid;
     }
 
     //
-    // Get creating process/thread
+    // Get creating process/thread (best-effort)
     //
     ShadowStrikeGetCreatingProcess(
         Process,
@@ -1333,10 +1366,10 @@ ShadowStrikeGetProcessInfo(
     );
 
     //
-    // Image path
+    // Image path (best-effort)
     //
-    Status = ShadowStrikeGetProcessImagePath(ProcessId, &ProcessInfo->ImagePath);
-    if (NT_SUCCESS(Status) && ProcessInfo->ImagePath.Length > 0) {
+    subStatus = ShadowStrikeGetProcessImagePath(ProcessId, &ProcessInfo->ImagePath);
+    if (NT_SUCCESS(subStatus) && ProcessInfo->ImagePath.Length > 0) {
         //
         // Extract filename
         //
@@ -1349,22 +1382,23 @@ ShadowStrikeGetProcessInfo(
             );
             if (ProcessInfo->ImageFileName.Buffer != NULL) {
                 RtlCopyUnicodeString(&ProcessInfo->ImageFileName, &TempFileName);
+                ProcessInfo->ImageFileName.Buffer[ProcessInfo->ImageFileName.Length / sizeof(WCHAR)] = UNICODE_NULL;
             }
         }
     }
 
     //
-    // Command line
+    // Command line (best-effort)
     //
     ShadowStrikeGetProcessCommandLine(ProcessId, &ProcessInfo->CommandLine);
 
     //
-    // Session ID
+    // Session ID (best-effort)
     //
     ShadowStrikeGetProcessSessionId(ProcessId, &ProcessInfo->SessionId);
 
     //
-    // Security attributes
+    // Security attributes (best-effort)
     //
     ShadowStrikeGetProcessIntegrityLevel(ProcessId, &ProcessInfo->IntegrityLevel);
 
@@ -1383,20 +1417,20 @@ ShadowStrikeGetProcessInfo(
     }
 
     //
-    // Token analysis
+    // Token analysis (best-effort — uses dedicated tokenStatus)
     //
-    Status = ShadowGetProcessToken(ProcessId, &Token);
-    if (NT_SUCCESS(Status) && Token != NULL) {
+    subStatus = ShadowGetProcessToken(ProcessId, &Token);
+    if (NT_SUCCESS(subStatus) && Token != NULL) {
         //
         // Check elevation
         //
         ProcessInfo->IsElevated = SeTokenIsAdmin(Token);
 
         //
-        // Get user SID using ZwQueryInformationToken (proper method)
+        // Get user SID
         //
         HANDLE TokenHandle = NULL;
-        Status = ObOpenObjectByPointer(
+        NTSTATUS tokenStatus = ObOpenObjectByPointer(
             Token,
             OBJ_KERNEL_HANDLE,
             NULL,
@@ -1406,55 +1440,55 @@ ShadowStrikeGetProcessInfo(
             &TokenHandle
         );
 
-        if (NT_SUCCESS(Status)) {
-            PTOKEN_USER TokenUser = NULL;
-            ULONG TokenUserSize = 0;
+        if (NT_SUCCESS(tokenStatus)) {
+            PTOKEN_USER pTokenUserInfo = NULL;
+            ULONG TokenUserInfoSize = 0;
             ULONG ReturnLength = 0;
 
-            Status = ZwQueryInformationToken(
+            tokenStatus = ZwQueryInformationToken(
                 TokenHandle,
-                TokenUser,
+                TokenUser,    // TOKEN_INFORMATION_CLASS enum value (= 1)
                 NULL,
                 0,
                 &ReturnLength
             );
 
-            if (Status == STATUS_BUFFER_TOO_SMALL && ReturnLength > 0 &&
+            if (tokenStatus == STATUS_BUFFER_TOO_SMALL && ReturnLength > 0 &&
                 ReturnLength <= SHADOW_MAX_TOKEN_INFO_SIZE) {
 
-                TokenUserSize = ReturnLength;
-                TokenUser = (PTOKEN_USER)ShadowStrikeAllocatePagedWithTag(
-                    TokenUserSize,
+                TokenUserInfoSize = ReturnLength;
+                pTokenUserInfo = (PTOKEN_USER)ShadowStrikeAllocatePagedWithTag(
+                    TokenUserInfoSize,
                     SHADOW_TOKEN_TAG
                 );
 
-                if (TokenUser != NULL) {
-                    Status = ZwQueryInformationToken(
+                if (pTokenUserInfo != NULL) {
+                    tokenStatus = ZwQueryInformationToken(
                         TokenHandle,
-                        TokenUser,
-                        TokenUser,
-                        TokenUserSize,
+                        TokenUser,    // TOKEN_INFORMATION_CLASS enum value (= 1)
+                        pTokenUserInfo,
+                        TokenUserInfoSize,
                         &ReturnLength
                     );
 
-                    if (NT_SUCCESS(Status) && TokenUser->User.Sid != NULL &&
-                        RtlValidSid(TokenUser->User.Sid)) {
+                    if (NT_SUCCESS(tokenStatus) && pTokenUserInfo->User.Sid != NULL &&
+                        RtlValidSid(pTokenUserInfo->User.Sid)) {
 
-                        ULONG SidLength = RtlLengthSid(TokenUser->User.Sid);
+                        ULONG SidLength = RtlLengthSid(pTokenUserInfo->User.Sid);
                         ProcessInfo->TokenUser = (PTOKEN_USER)ShadowStrikeAllocatePagedWithTag(
                             sizeof(TOKEN_USER) + SidLength,
                             SHADOW_PROCESS_TAG
                         );
 
                         if (ProcessInfo->TokenUser != NULL) {
-                            ProcessInfo->TokenUser->User.Attributes = TokenUser->User.Attributes;
+                            ProcessInfo->TokenUser->User.Attributes = pTokenUserInfo->User.Attributes;
                             ProcessInfo->TokenUser->User.Sid = (PSID)((PUCHAR)ProcessInfo->TokenUser + sizeof(TOKEN_USER));
-                            RtlCopySid(SidLength, ProcessInfo->TokenUser->User.Sid, TokenUser->User.Sid);
+                            RtlCopySid(SidLength, ProcessInfo->TokenUser->User.Sid, pTokenUserInfo->User.Sid);
                             ProcessInfo->TokenUserSize = sizeof(TOKEN_USER) + SidLength;
                         }
                     }
 
-                    ShadowStrikeFreePoolWithTag(TokenUser, SHADOW_TOKEN_TAG);
+                    ShadowStrikeFreePoolWithTag(pTokenUserInfo, SHADOW_TOKEN_TAG);
                 }
             }
 
@@ -1476,7 +1510,7 @@ ShadowStrikeGetProcessInfo(
     }
 
     //
-    // Signature validation
+    // Signature / protection info (best-effort)
     //
     ShadowStrikeValidateProcessSignature(
         ProcessId,
@@ -1485,7 +1519,7 @@ ShadowStrikeGetProcessInfo(
     );
 
     //
-    // Process type classification
+    // Process type classification (best-effort)
     //
     ShadowStrikeClassifyProcess(ProcessId, &ProcessInfo->ProcessType);
 
@@ -1556,6 +1590,7 @@ ShadowFreeProcessString(
 // PARENT/CHILD RELATIONSHIPS
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetParentProcessId(
     _In_ HANDLE ProcessId,
@@ -1615,6 +1650,7 @@ ShadowStrikeGetParentProcessId(
     return Status;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetCreatingProcess(
     _In_ PEPROCESS Process,
@@ -1678,6 +1714,7 @@ ShadowStrikeGetCreatingProcess(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeStoreCreatingProcessContext(
     _In_ HANDLE TargetProcessId,
@@ -1736,6 +1773,58 @@ ShadowStrikeStoreCreatingProcessContext(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
+VOID
+ShadowStrikeRemoveCreatingProcessContext(
+    _In_ HANDLE TargetProcessId
+)
+{
+    ULONG Hash;
+    PLIST_ENTRY ListHead;
+    PLIST_ENTRY Entry;
+    PSHADOW_CREATING_CONTEXT_ENTRY ContextEntry;
+    PSHADOW_CREATING_CONTEXT_ENTRY FoundEntry = NULL;
+
+    PAGED_CODE();
+
+    if (!ShadowStrikeIsValidProcessId(TargetProcessId)) {
+        return;
+    }
+
+    if (g_ProcessUtilsState.InitializationState != PROCUTILS_STATE_INITIALIZED) {
+        return;
+    }
+
+    Hash = ShadowHashProcessId(TargetProcessId);
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ProcessUtilsState.CreatingContextLock);
+
+    ListHead = &g_ProcessUtilsState.CreatingContextTable[Hash];
+
+    for (Entry = ListHead->Flink; Entry != ListHead; Entry = Entry->Flink) {
+        ContextEntry = CONTAINING_RECORD(Entry, SHADOW_CREATING_CONTEXT_ENTRY, ListEntry);
+
+        if (ContextEntry->TargetProcessId == TargetProcessId) {
+            RemoveEntryList(&ContextEntry->ListEntry);
+            InterlockedDecrement(&g_ProcessUtilsState.CreatingContextCount);
+            FoundEntry = ContextEntry;
+            break;
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_ProcessUtilsState.CreatingContextLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Free outside the lock to minimize hold time
+    //
+    if (FoundEntry != NULL) {
+        ShadowStrikeFreePoolWithTag(FoundEntry, SHADOW_PROCINFO_TAG);
+    }
+}
+
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeValidateParentChild(
     _In_ HANDLE ChildId,
@@ -1744,7 +1833,9 @@ ShadowStrikeValidateParentChild(
 )
 {
     NTSTATUS Status;
-    HANDLE ActualParentId = NULL;
+    PEPROCESS Process = NULL;
+    HANDLE CreatingProcessId = NULL;
+    HANDLE InheritedParentId = NULL;
 
     PAGED_CODE();
 
@@ -1758,16 +1849,40 @@ ShadowStrikeValidateParentChild(
         return STATUS_INVALID_PARAMETER;
     }
 
-    Status = ShadowStrikeGetParentProcessId(ChildId, &ActualParentId);
+    //
+    // First check the creating context table (captured at creation time).
+    // This is the authoritative source — not spoofable.
+    //
+    Status = PsLookupProcessByProcessId(ChildId, &Process);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    Status = ShadowStrikeGetCreatingProcess(Process, &CreatingProcessId, NULL);
+    ObDereferenceObject(Process);
+
     if (!NT_SUCCESS(Status)) {
         return Status;
     }
 
     //
-    // Compare claimed parent with actual parent
-    // This detects parent PID spoofing attacks (T1134.004)
+    // Also get the inherited (potentially spoofed) parent PID
     //
-    *IsValid = (ActualParentId == ClaimedParentId);
+    ShadowStrikeGetParentProcessId(ChildId, &InheritedParentId);
+
+    //
+    // Validate: the claimed parent must match our captured creating process.
+    // If the inherited PID differs from the captured creating PID,
+    // this indicates parent PID spoofing (T1134.004).
+    //
+    if (CreatingProcessId != NULL) {
+        *IsValid = (ClaimedParentId == CreatingProcessId);
+    } else {
+        //
+        // No captured context — fall back to inherited (less reliable)
+        //
+        *IsValid = (ClaimedParentId == InheritedParentId);
+    }
 
     return STATUS_SUCCESS;
 }
@@ -1776,6 +1891,7 @@ ShadowStrikeValidateParentChild(
 // PROCESS STATE AND FLAGS
 // ============================================================================
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsProcessTerminating(
     _In_ PEPROCESS Process
@@ -1800,6 +1916,7 @@ ShadowStrikeIsProcessTerminating(
     return (ExitTime.QuadPart != 0);
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsProcessWow64(
     _In_ PEPROCESS Process
@@ -1823,6 +1940,7 @@ ShadowStrikeIsProcessWow64(
 #endif
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsProcessProtected(
     _In_ PEPROCESS Process
@@ -1845,6 +1963,7 @@ ShadowStrikeIsProcessProtected(
     return FALSE;
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsProcessDebugged(
     _In_ PEPROCESS Process
@@ -1861,6 +1980,7 @@ ShadowStrikeIsProcessDebugged(
     return (PsGetProcessDebugPort(Process) != NULL);
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsSystemProcess(
     _In_ HANDLE ProcessId
@@ -1894,6 +2014,7 @@ ShadowStrikeIsSystemProcess(
     return IsSystem;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeIsProcessElevated(
     _In_ HANDLE ProcessId,
@@ -1933,6 +2054,7 @@ ShadowStrikeIsProcessElevated(
 // TOKEN AND PRIVILEGE ANALYSIS
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetProcessIntegrityLevel(
     _In_ HANDLE ProcessId,
@@ -1973,6 +2095,7 @@ ShadowStrikeGetProcessIntegrityLevel(
     return Status;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetProcessSessionId(
     _In_ HANDLE ProcessId,
@@ -2005,6 +2128,7 @@ ShadowStrikeGetProcessSessionId(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeProcessHasPrivilege(
     _In_ HANDLE ProcessId,
@@ -2014,8 +2138,9 @@ ShadowStrikeProcessHasPrivilege(
 {
     NTSTATUS Status;
     PEPROCESS Process = NULL;
-    SECURITY_SUBJECT_CONTEXT SubjectContext;
+    PACCESS_TOKEN Token = NULL;
     PRIVILEGE_SET PrivilegeSet;
+    SECURITY_SUBJECT_CONTEXT SubjectContext;
     BOOLEAN Result = FALSE;
 
     PAGED_CODE();
@@ -2036,15 +2161,31 @@ ShadowStrikeProcessHasPrivilege(
     }
 
     //
-    // CRITICAL FIX: Use SeCaptureSubjectContext instead of accessing
-    // Token->PrimarySecurityContext directly (which is an opaque structure)
+    // Check if process is terminating to avoid unsafe operations
     //
-    // We need to attach to the target process context to capture its security context
-    //
-    KAPC_STATE ApcState;
-    KeStackAttachProcess(Process, &ApcState);
+    if (ShadowStrikeIsProcessTerminating(Process)) {
+        ObDereferenceObject(Process);
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
 
-    SeCaptureSubjectContext(&SubjectContext);
+    //
+    // Get primary token — safe even on terminating processes as long
+    // as we hold an EPROCESS reference, but we check anyway above.
+    //
+    Token = PsReferencePrimaryToken(Process);
+    if (Token == NULL) {
+        ObDereferenceObject(Process);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    //
+    // Build subject context manually from the token.
+    // This avoids KeStackAttachProcess which is dangerous for terminating
+    // processes and unnecessary for privilege checking.
+    //
+    RtlZeroMemory(&SubjectContext, sizeof(SubjectContext));
+    SubjectContext.PrimaryToken = Token;
+    SubjectContext.ProcessAuditId = Process;
 
     //
     // Build privilege set
@@ -2055,20 +2196,18 @@ ShadowStrikeProcessHasPrivilege(
     PrivilegeSet.Privilege[0].Attributes = 0;
 
     //
-    // Check privilege using proper subject context
+    // Check privilege using subject context
     //
     Result = SePrivilegeCheck(&PrivilegeSet, &SubjectContext, UserMode);
 
-    SeReleaseSubjectContext(&SubjectContext);
-
-    KeUnstackDetachProcess(&ApcState);
-
+    PsDereferencePrimaryToken(Token);
     ObDereferenceObject(Process);
 
     *HasPrivilege = Result;
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetProcessUserSid(
     _In_ HANDLE ProcessId,
@@ -2079,8 +2218,8 @@ ShadowStrikeGetProcessUserSid(
     NTSTATUS Status;
     PACCESS_TOKEN Token = NULL;
     HANDLE TokenHandle = NULL;
-    PTOKEN_USER TokenUser = NULL;
-    ULONG TokenUserSize = 0;
+    PTOKEN_USER pTokenUserInfo = NULL;
+    ULONG TokenUserInfoSize = 0;
     ULONG ReturnLength = 0;
     ULONG SidLength;
 
@@ -2121,11 +2260,11 @@ ShadowStrikeGetProcessUserSid(
     }
 
     //
-    // Query required size for TokenUser
+    // Query required size for token user information
     //
     Status = ZwQueryInformationToken(
         TokenHandle,
-        TokenUser,
+        TokenUser,    // TOKEN_INFORMATION_CLASS enum value (= 1)
         NULL,
         0,
         &ReturnLength
@@ -2143,10 +2282,10 @@ ShadowStrikeGetProcessUserSid(
         return STATUS_BUFFER_OVERFLOW;
     }
 
-    TokenUserSize = ReturnLength;
-    TokenUser = (PTOKEN_USER)ShadowStrikeAllocatePagedWithTag(TokenUserSize, SHADOW_TOKEN_TAG);
+    TokenUserInfoSize = ReturnLength;
+    pTokenUserInfo = (PTOKEN_USER)ShadowStrikeAllocatePagedWithTag(TokenUserInfoSize, SHADOW_TOKEN_TAG);
 
-    if (TokenUser == NULL) {
+    if (pTokenUserInfo == NULL) {
         ZwClose(TokenHandle);
         PsDereferencePrimaryToken(Token);
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -2154,9 +2293,9 @@ ShadowStrikeGetProcessUserSid(
 
     Status = ZwQueryInformationToken(
         TokenHandle,
-        TokenUser,
-        TokenUser,
-        TokenUserSize,
+        TokenUser,    // TOKEN_INFORMATION_CLASS enum value (= 1)
+        pTokenUserInfo,
+        TokenUserInfoSize,
         &ReturnLength
     );
 
@@ -2164,40 +2303,40 @@ ShadowStrikeGetProcessUserSid(
     PsDereferencePrimaryToken(Token);
 
     if (!NT_SUCCESS(Status)) {
-        ShadowStrikeFreePoolWithTag(TokenUser, SHADOW_TOKEN_TAG);
+        ShadowStrikeFreePoolWithTag(pTokenUserInfo, SHADOW_TOKEN_TAG);
         return Status;
     }
 
     //
     // Validate SID
     //
-    if (TokenUser->User.Sid == NULL || !RtlValidSid(TokenUser->User.Sid)) {
-        ShadowStrikeFreePoolWithTag(TokenUser, SHADOW_TOKEN_TAG);
+    if (pTokenUserInfo->User.Sid == NULL || !RtlValidSid(pTokenUserInfo->User.Sid)) {
+        ShadowStrikeFreePoolWithTag(pTokenUserInfo, SHADOW_TOKEN_TAG);
         return STATUS_INVALID_SID;
     }
 
     //
     // Allocate and copy SID
     //
-    SidLength = RtlLengthSid(TokenUser->User.Sid);
+    SidLength = RtlLengthSid(pTokenUserInfo->User.Sid);
     *UserSid = (PSID)ShadowStrikeAllocatePagedWithTag(SidLength, SHADOW_SID_TAG);
 
     if (*UserSid == NULL) {
-        ShadowStrikeFreePoolWithTag(TokenUser, SHADOW_TOKEN_TAG);
+        ShadowStrikeFreePoolWithTag(pTokenUserInfo, SHADOW_TOKEN_TAG);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    Status = RtlCopySid(SidLength, *UserSid, TokenUser->User.Sid);
+    Status = RtlCopySid(SidLength, *UserSid, pTokenUserInfo->User.Sid);
     if (!NT_SUCCESS(Status)) {
         ShadowStrikeFreePoolWithTag(*UserSid, SHADOW_SID_TAG);
         *UserSid = NULL;
-        ShadowStrikeFreePoolWithTag(TokenUser, SHADOW_TOKEN_TAG);
+        ShadowStrikeFreePoolWithTag(pTokenUserInfo, SHADOW_TOKEN_TAG);
         return Status;
     }
 
     *SidSize = SidLength;
 
-    ShadowStrikeFreePoolWithTag(TokenUser, SHADOW_TOKEN_TAG);
+    ShadowStrikeFreePoolWithTag(pTokenUserInfo, SHADOW_TOKEN_TAG);
     return STATUS_SUCCESS;
 }
 
@@ -2205,6 +2344,7 @@ ShadowStrikeGetProcessUserSid(
 // HANDLE OPERATIONS
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetProcessIdFromHandle(
     _In_ HANDLE ProcessHandle,
@@ -2212,8 +2352,7 @@ ShadowStrikeGetProcessIdFromHandle(
 )
 {
     NTSTATUS Status;
-    PROCESS_BASIC_INFORMATION BasicInfo;
-    ULONG ReturnLength;
+    PEPROCESS Process = NULL;
 
     PAGED_CODE();
 
@@ -2223,35 +2362,39 @@ ShadowStrikeGetProcessIdFromHandle(
 
     *ProcessId = NULL;
 
-    if (g_ProcessUtilsState.InitializationState != PROCUTILS_STATE_INITIALIZED) {
-        Status = ShadowProcessUtilsInitialize();
-        if (!NT_SUCCESS(Status)) {
-            return Status;
-        }
-    }
-
     if (ProcessHandle == NULL || ProcessHandle == NtCurrentProcess()) {
         *ProcessId = PsGetCurrentProcessId();
         return STATUS_SUCCESS;
     }
 
-    RtlZeroMemory(&BasicInfo, sizeof(BasicInfo));
-
-    Status = g_ProcessUtilsState.ZwQueryInformationProcess(
+    //
+    // Use ObReferenceObjectByHandle to safely resolve the handle.
+    // This respects handle table ownership and prevents user-mode
+    // handles from being misinterpreted as kernel handles.
+    // Using KernelMode access mode since this is a kernel-internal function.
+    // If the handle came from user-mode, the caller should have already
+    // validated it or used the appropriate access mode.
+    //
+    Status = ObReferenceObjectByHandle(
         ProcessHandle,
-        ProcessBasicInformation,
-        &BasicInfo,
-        sizeof(BasicInfo),
-        &ReturnLength
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        *PsProcessType,
+        KernelMode,
+        (PVOID*)&Process,
+        NULL
     );
 
-    if (NT_SUCCESS(Status)) {
-        *ProcessId = (HANDLE)BasicInfo.UniqueProcessId;
+    if (!NT_SUCCESS(Status)) {
+        return Status;
     }
 
-    return Status;
+    *ProcessId = PsGetProcessId(Process);
+    ObDereferenceObject(Process);
+
+    return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetProcessObject(
     _In_ HANDLE ProcessId,
@@ -2273,6 +2416,7 @@ ShadowStrikeGetProcessObject(
     return PsLookupProcessByProcessId(ProcessId, Process);
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeOpenProcess(
     _In_ HANDLE ProcessId,
@@ -2299,6 +2443,7 @@ ShadowStrikeOpenProcess(
 // THREAD OPERATIONS
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetThreadInfo(
     _In_ HANDLE ThreadId,
@@ -2352,6 +2497,7 @@ ShadowStrikeGetThreadInfo(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsThreadTerminating(
     _In_ PETHREAD Thread
@@ -2364,6 +2510,7 @@ ShadowStrikeIsThreadTerminating(
     return PsIsThreadTerminating(Thread);
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetThreadStartAddress(
     _In_ HANDLE ThreadId,
@@ -2445,6 +2592,7 @@ ShadowStrikeGetThreadStartAddress(
 // PROCESS VALIDATION
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeValidateProcessSignature(
     _In_ HANDLE ProcessId,
@@ -2545,24 +2693,32 @@ ShadowStrikeValidateProcessSignature(
                 }
             }
         }
-    } else if (Status == STATUS_INVALID_INFO_CLASS) {
+    } else if (Status == STATUS_INVALID_INFO_CLASS ||
+               Status == STATUS_NOT_IMPLEMENTED) {
         //
-        // ProcessProtectionInformation not supported on this OS version
-        // This is expected on older systems
+        // ProcessProtectionInformation not supported on this OS version.
+        // This is expected on older systems — not an error.
         //
         Status = STATUS_SUCCESS;
+    } else {
+        //
+        // Unexpected query failure — propagate the actual error
+        //
+        return Status;
     }
 
     //
-    // Note: For complete signature validation of non-protected processes,
-    // we would need to use Code Integrity APIs (CiCheckSignedFile, etc.)
-    // or hook into the image load callback infrastructure.
-    // This is typically done at image load time and cached.
+    // Note: This function only checks PPL protection status.
+    // For complete signature validation of non-protected processes,
+    // Code Integrity APIs (CiCheckSignedFile, etc.) or image load
+    // callback infrastructure would be required. Signature status
+    // of non-PPL processes should be cached at image load time.
     //
 
-    return STATUS_SUCCESS;
+    return Status;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeIsWindowsProcess(
     _In_ HANDLE ProcessId,
@@ -2571,9 +2727,6 @@ ShadowStrikeIsWindowsProcess(
 {
     NTSTATUS Status;
     UNICODE_STRING ImagePath = { 0 };
-    UNICODE_STRING WindowsDir;
-    UNICODE_STRING System32Dir;
-    UNICODE_STRING SysWow64Dir;
 
     PAGED_CODE();
 
@@ -2597,22 +2750,92 @@ ShadowStrikeIsWindowsProcess(
     }
 
     //
-    // Check common Windows paths
+    // NT image paths start with \Device\HarddiskVolume*\.
+    // We validate the path contains \Windows\ at the correct position
+    // (right after the volume prefix) and then contains \System32\ or \SysWOW64\.
     //
-    RtlInitUnicodeString(&WindowsDir, L"\\Windows\\");
-    RtlInitUnicodeString(&System32Dir, L"\\System32\\");
-    RtlInitUnicodeString(&SysWow64Dir, L"\\SysWOW64\\");
+    // Valid patterns (case-insensitive):
+    //   \Device\HarddiskVolume<N>\Windows\System32\...
+    //   \Device\HarddiskVolume<N>\Windows\SysWOW64\...
+    //   \SystemRoot\System32\...
+    //
+    // NOT valid: C:\Users\evil\Windows\System32\malware.exe
+    //
+    {
+        UNICODE_STRING DevicePrefix;
+        UNICODE_STRING SystemRootPrefix;
+        UNICODE_STRING WindowsSuffix;
 
-    if (ShadowStrikeStringContains(&ImagePath, &WindowsDir, TRUE) &&
-        (ShadowStrikeStringContains(&ImagePath, &System32Dir, TRUE) ||
-         ShadowStrikeStringContains(&ImagePath, &SysWow64Dir, TRUE))) {
-        *IsWindowsProcess = TRUE;
+        RtlInitUnicodeString(&DevicePrefix, L"\\Device\\HarddiskVolume");
+        RtlInitUnicodeString(&SystemRootPrefix, L"\\SystemRoot\\");
+
+        //
+        // Check \SystemRoot\ prefix first (shorter path)
+        //
+        if (ImagePath.Length >= SystemRootPrefix.Length &&
+            RtlPrefixUnicodeString(&SystemRootPrefix, &ImagePath, TRUE)) {
+            *IsWindowsProcess = TRUE;
+        }
+        //
+        // Check \Device\HarddiskVolume*\Windows\System32 or \SysWOW64\
+        //
+        else if (ImagePath.Length >= DevicePrefix.Length &&
+                 RtlPrefixUnicodeString(&DevicePrefix, &ImagePath, TRUE)) {
+            //
+            // Find \Windows\ after the volume number
+            // Scan for first backslash after "HarddiskVolume<digits>"
+            //
+            USHORT i;
+            USHORT volumeEndOffset = 0;
+            PWCH pathBuffer = ImagePath.Buffer;
+            USHORT charCount = ImagePath.Length / sizeof(WCHAR);
+
+            //
+            // Skip past \Device\HarddiskVolume<digits>
+            //
+            for (i = DevicePrefix.Length / sizeof(WCHAR); i < charCount; i++) {
+                if (pathBuffer[i] == L'\\') {
+                    volumeEndOffset = i;
+                    break;
+                }
+            }
+
+            if (volumeEndOffset > 0) {
+                //
+                // Remaining path after volume should start with \Windows\System32\ or \Windows\SysWOW64\
+                //
+                UNICODE_STRING Remainder;
+                UNICODE_STRING WinSystem32;
+                UNICODE_STRING WinSysWow64;
+                UNICODE_STRING WinWinSxS;
+
+                Remainder.Buffer = &pathBuffer[volumeEndOffset];
+                Remainder.Length = ImagePath.Length - (volumeEndOffset * sizeof(WCHAR));
+                Remainder.MaximumLength = Remainder.Length;
+
+                RtlInitUnicodeString(&WinSystem32, L"\\Windows\\System32\\");
+                RtlInitUnicodeString(&WinSysWow64, L"\\Windows\\SysWOW64\\");
+                RtlInitUnicodeString(&WinWinSxS,   L"\\Windows\\WinSxS\\");
+
+                if (Remainder.Length >= WinSystem32.Length &&
+                    RtlPrefixUnicodeString(&WinSystem32, &Remainder, TRUE)) {
+                    *IsWindowsProcess = TRUE;
+                } else if (Remainder.Length >= WinSysWow64.Length &&
+                           RtlPrefixUnicodeString(&WinSysWow64, &Remainder, TRUE)) {
+                    *IsWindowsProcess = TRUE;
+                } else if (Remainder.Length >= WinWinSxS.Length &&
+                           RtlPrefixUnicodeString(&WinWinSxS, &Remainder, TRUE)) {
+                    *IsWindowsProcess = TRUE;
+                }
+            }
+        }
     }
 
     ShadowFreeProcessString(&ImagePath);
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeClassifyProcess(
     _In_ HANDLE ProcessId,
@@ -2678,12 +2901,21 @@ ShadowStrikeClassifyProcess(
     //
     if (SessionId == 0) {
         //
-        // Could be System, Service, or Native
+        // Session 0: distinguish native, system, and service processes
         //
+        BOOLEAN isWindowsSess0 = FALSE;
+        ShadowStrikeIsWindowsProcess(ProcessId, &isWindowsSess0);
         ShadowStrikeGetProcessIntegrityLevel(ProcessId, &IntegrityLevel);
-        if (IntegrityLevel == ShadowIntegritySystem) {
-            *ProcessType = ShadowProcessService;
+
+        if (IntegrityLevel == ShadowIntegritySystem && isWindowsSess0) {
+            //
+            // System-integrity Windows binary in session 0 (csrss, smss, lsass, etc.)
+            //
+            *ProcessType = ShadowProcessNative;
         } else {
+            //
+            // Service or other session-0 process
+            //
             *ProcessType = ShadowProcessService;
         }
         return STATUS_SUCCESS;

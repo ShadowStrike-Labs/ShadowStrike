@@ -7,7 +7,7 @@
              modifications used by malware for evasion.
 
     Architecture:
-    - Clean NTDLL reference copy for comparison baseline
+    - Clean NTDLL reference from disk (\SystemRoot\System32\ntdll.dll)
     - Per-process NTDLL state tracking with function-level granularity
     - Inline hook detection (JMP, CALL, MOV patterns)
     - Syscall stub validation (mov eax, X; syscall sequence)
@@ -37,7 +37,7 @@
 #include "../Utilities/HashUtils.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, NiInitialize)
+#pragma alloc_text(PAGE, NiInitialize)
 #pragma alloc_text(PAGE, NiShutdown)
 #pragma alloc_text(PAGE, NiScanProcess)
 #pragma alloc_text(PAGE, NiCheckFunction)
@@ -51,8 +51,6 @@
 //=============================================================================
 
 #define NI_SIGNATURE                    'TNIM'  // 'MINT' reversed
-#define NI_PROCESS_SIGNATURE            'PNIM'  // 'MINP' reversed
-#define NI_FUNCTION_SIGNATURE           'FNIM'  // 'MINF' reversed
 
 #define NI_MAX_PROCESSES                256
 #define NI_MAX_FUNCTIONS                2048
@@ -63,22 +61,29 @@
 #define NI_MAX_USER_ADDRESS             0x7FFFFFFFFFFFULL
 
 //
+// Sane upper bound for ntdll.dll (real ntdll is ~2MB, allow 16MB for safety)
+//
+#define NI_MAX_NTDLL_SIZE               (16ULL * 1024 * 1024)
+
+//
+// Maximum modules to enumerate in PEB LDR walk (prevents infinite loop on
+// corrupted list from hostile process)
+//
+#define NI_MAX_LDR_MODULES              4096
+
+//
 // Hook detection patterns
 //
 #define NI_JMP_REL32_OPCODE             0xE9    // JMP rel32
 #define NI_JMP_ABS_PREFIX               0xFF    // JMP r/m64
 #define NI_CALL_REL32_OPCODE            0xE8    // CALL rel32
-#define NI_MOV_R10_RCX                  0x4C8B  // mov r10, rcx (syscall pattern)
-#define NI_MOV_EAX_IMM32                0xB8    // mov eax, imm32 (syscall number)
-#define NI_SYSCALL_OPCODE               0x050F  // syscall (0F 05)
-#define NI_INT_2E                       0x2ECD  // int 2Eh
+#define NI_MOV_EAX_IMM32               0xB8    // mov eax, imm32 (syscall number)
 #define NI_NOP_OPCODE                   0x90    // NOP
-#define NI_HOTPATCH_MOV_EDI             0x8BFF  // mov edi, edi (hotpatch)
 
 //
 // Critical ntdll functions to monitor
 //
-static const PCHAR NI_CRITICAL_FUNCTIONS[] = {
+static const CHAR* const NI_CRITICAL_FUNCTIONS[] = {
     "NtCreateFile",
     "NtOpenFile",
     "NtReadFile",
@@ -168,7 +173,7 @@ typedef struct _NI_MONITOR_INTERNAL {
     UCHAR CleanTextHash[32];
 
     //
-    // Export table from clean NTDLL
+    // Export table from clean NTDLL (pointers into CleanNtdllCopy)
     //
     struct {
         PVOID ExportDirectory;
@@ -180,17 +185,56 @@ typedef struct _NI_MONITOR_INTERNAL {
     } CleanExports;
 
     //
-    // Lookaside lists
+    // Lookaside lists for high-frequency allocations
     //
-    NPAGED_LOOKASIDE_LIST ProcessLookaside;
-    NPAGED_LOOKASIDE_LIST FunctionLookaside;
+    PAGED_LOOKASIDE_LIST ProcessLookaside;
+    PAGED_LOOKASIDE_LIST FunctionLookaside;
 
     //
-    // Shutdown flag
+    // Shutdown flag (interlocked access only)
     //
-    volatile BOOLEAN ShuttingDown;
+    volatile LONG ShuttingDown;
 
 } NI_MONITOR_INTERNAL, *PNI_MONITOR_INTERNAL;
+
+//
+// Helpers: acquire/release active operation count for safe shutdown drain
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static __forceinline BOOLEAN
+NipAcquireOperation(
+    _In_ PNI_MONITOR Monitor
+    )
+{
+    if (!InterlockedCompareExchange(&Monitor->Initialized, 1, 1)) {
+        return FALSE;
+    }
+
+    InterlockedIncrement(&Monitor->ActiveOperations);
+
+    //
+    // Re-check after increment: if shutdown raced in, undo and fail
+    //
+    if (!InterlockedCompareExchange(&Monitor->Initialized, 1, 1)) {
+        if (InterlockedDecrement(&Monitor->ActiveOperations) == 0) {
+            KeSetEvent(&Monitor->DrainEvent, IO_NO_INCREMENT, FALSE);
+        }
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static __forceinline VOID
+NipReleaseOperation(
+    _In_ PNI_MONITOR Monitor
+    )
+{
+    if (InterlockedDecrement(&Monitor->ActiveOperations) == 0) {
+        KeSetEvent(&Monitor->DrainEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
 
 //=============================================================================
 // Forward Declarations
@@ -275,9 +319,9 @@ NipValidateSyscallStub(
     _In_ SIZE_T Size
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(PASSIVE_LEVEL)
 static PNI_PROCESS_NTDLL
-NipFindProcessState(
+NipFindProcessStateLocked(
     _In_ PNI_MONITOR Monitor,
     _In_ HANDLE ProcessId
     );
@@ -299,6 +343,13 @@ NipComputeTextSectionHash(
     _Out_writes_(32) PUCHAR Hash
     );
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static NTSTATUS
+NipReadNtdllFromDisk(
+    _Out_ PVOID* Buffer,
+    _Out_ PSIZE_T BufferSize
+    );
+
 //=============================================================================
 // Initialization / Shutdown
 //=============================================================================
@@ -312,8 +363,8 @@ NiInitialize(
 
 Routine Description:
 
-    Initializes the NTDLL integrity monitor. Captures a clean copy of NTDLL
-    from the System process for use as a reference baseline.
+    Initializes the NTDLL integrity monitor. Reads a clean copy of NTDLL
+    from disk (\SystemRoot\System32\ntdll.dll) for use as a reference baseline.
 
 Arguments:
 
@@ -338,12 +389,13 @@ Return Value:
     *Monitor = NULL;
 
     //
-    // Allocate internal monitor structure
+    // Allocate internal monitor structure from paged pool — all access is
+    // at PASSIVE_LEVEL so no need to consume precious non-paged pool.
     //
     monitorInternal = (PNI_MONITOR_INTERNAL)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
+        PagedPool,
         sizeof(NI_MONITOR_INTERNAL),
-        NI_POOL_TAG
+        NI_POOL_TAG_MONITOR
         );
 
     if (monitorInternal == NULL) {
@@ -356,43 +408,45 @@ Return Value:
     monitor = &monitorInternal->Monitor;
 
     //
-    // Initialize process list
+    // Initialize process list and lock
     //
     InitializeListHead(&monitor->ProcessList);
     FltInitializePushLock(&monitor->ProcessLock);
     monitor->ProcessCount = 0;
+    monitor->ActiveOperations = 0;
+    KeInitializeEvent(&monitor->DrainEvent, NotificationEvent, TRUE);
 
     //
-    // Initialize lookaside lists
+    // Initialize lookaside lists (paged — all callers at PASSIVE_LEVEL)
     //
-    ExInitializeNPagedLookasideList(
+    ExInitializePagedLookasideList(
         &monitorInternal->ProcessLookaside,
         NULL,
         NULL,
-        POOL_NX_ALLOCATION,
+        0,
         sizeof(NI_PROCESS_NTDLL),
-        NI_POOL_TAG,
+        NI_POOL_TAG_PROCESS,
         0
         );
 
-    ExInitializeNPagedLookasideList(
+    ExInitializePagedLookasideList(
         &monitorInternal->FunctionLookaside,
         NULL,
         NULL,
-        POOL_NX_ALLOCATION,
+        0,
         sizeof(NI_FUNCTION_STATE),
-        NI_POOL_TAG,
+        NI_POOL_TAG_FUNCTION,
         0
         );
 
     //
-    // Capture clean NTDLL from a trusted source
+    // Capture clean NTDLL from disk (trusted source)
     //
     status = NipCaptureCleanNtdll(monitorInternal);
     if (!NT_SUCCESS(status)) {
-        ExDeleteNPagedLookasideList(&monitorInternal->ProcessLookaside);
-        ExDeleteNPagedLookasideList(&monitorInternal->FunctionLookaside);
-        ShadowStrikeFreePoolWithTag(monitorInternal, NI_POOL_TAG);
+        ExDeletePagedLookasideList(&monitorInternal->ProcessLookaside);
+        ExDeletePagedLookasideList(&monitorInternal->FunctionLookaside);
+        ShadowStrikeFreePoolWithTag(monitorInternal, NI_POOL_TAG_MONITOR);
         return status;
     }
 
@@ -404,8 +458,8 @@ Return Value:
     monitor->Stats.ModificationsFound = 0;
     monitor->Stats.HooksDetected = 0;
 
-    monitor->Initialized = TRUE;
-    monitorInternal->ShuttingDown = FALSE;
+    InterlockedExchange(&monitor->Initialized, TRUE);
+    InterlockedExchange(&monitorInternal->ShuttingDown, FALSE);
 
     *Monitor = monitor;
 
@@ -422,8 +476,8 @@ NiShutdown(
 
 Routine Description:
 
-    Shuts down the NTDLL integrity monitor. Frees all process states
-    and releases the clean NTDLL copy.
+    Shuts down the NTDLL integrity monitor. Drains active operations,
+    frees all process states, and releases the clean NTDLL copy.
 
 Arguments:
 
@@ -438,7 +492,14 @@ Arguments:
 
     PAGED_CODE();
 
-    if (Monitor == NULL || !Monitor->Initialized) {
+    if (Monitor == NULL) {
+        return;
+    }
+
+    //
+    // Atomically mark as not initialized. If already not initialized, bail.
+    //
+    if (!InterlockedCompareExchange(&Monitor->Initialized, FALSE, TRUE)) {
         return;
     }
 
@@ -448,12 +509,25 @@ Arguments:
         return;
     }
 
-    monitorInternal->ShuttingDown = TRUE;
-    Monitor->Initialized = FALSE;
+    InterlockedExchange(&monitorInternal->ShuttingDown, TRUE);
     KeMemoryBarrier();
 
     //
-    // Collect all process states for cleanup
+    // Wait for all in-flight operations to complete (drain)
+    //
+    if (Monitor->ActiveOperations > 0) {
+        KeClearEvent(&Monitor->DrainEvent);
+        KeWaitForSingleObject(
+            &Monitor->DrainEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+            );
+    }
+
+    //
+    // All operations drained — collect process states for cleanup
     //
     InitializeListHead(&statesToFree);
 
@@ -469,7 +543,7 @@ Arguments:
     FltReleasePushLock(&Monitor->ProcessLock);
 
     //
-    // Free all process states
+    // Free all process states outside of lock
     //
     while (!IsListEmpty(&statesToFree)) {
         entry = RemoveHeadList(&statesToFree);
@@ -481,7 +555,7 @@ Arguments:
     // Free clean NTDLL copy
     //
     if (Monitor->CleanNtdllCopy != NULL) {
-        ShadowStrikeFreePoolWithTag(Monitor->CleanNtdllCopy, NI_POOL_TAG);
+        ShadowStrikeFreePoolWithTag(Monitor->CleanNtdllCopy, NI_POOL_TAG_NTDLL);
         Monitor->CleanNtdllCopy = NULL;
         Monitor->CleanNtdllSize = 0;
     }
@@ -489,14 +563,14 @@ Arguments:
     //
     // Delete lookaside lists
     //
-    ExDeleteNPagedLookasideList(&monitorInternal->ProcessLookaside);
-    ExDeleteNPagedLookasideList(&monitorInternal->FunctionLookaside);
+    ExDeletePagedLookasideList(&monitorInternal->ProcessLookaside);
+    ExDeletePagedLookasideList(&monitorInternal->FunctionLookaside);
 
     //
-    // Clear signature and free
+    // Clear signature and free monitor
     //
     monitorInternal->Signature = 0;
-    ShadowStrikeFreePoolWithTag(monitorInternal, NI_POOL_TAG);
+    ShadowStrikeFreePoolWithTag(monitorInternal, NI_POOL_TAG_MONITOR);
 }
 
 
@@ -518,6 +592,9 @@ Routine Description:
     Scans a process's NTDLL for modifications and hooks. Creates or updates
     the process state with current function prologues and modification flags.
 
+    Thread-safe: uses push lock for process list and function list access.
+    The find-or-create is performed atomically under the process list lock.
+
 Arguments:
 
     Monitor - NTDLL integrity monitor.
@@ -538,11 +615,10 @@ Return Value:
     SIZE_T ntdllSize = 0;
     ULONG i;
     BOOLEAN newState = FALSE;
-    KIRQL oldIrql;
 
     PAGED_CODE();
 
-    if (Monitor == NULL || !Monitor->Initialized || State == NULL) {
+    if (Monitor == NULL || State == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -552,26 +628,39 @@ Return Value:
 
     *State = NULL;
 
-    monitorInternal = CONTAINING_RECORD(Monitor, NI_MONITOR_INTERNAL, Monitor);
-
-    if (monitorInternal->ShuttingDown) {
+    if (!NipAcquireOperation(Monitor)) {
         return STATUS_SHUTDOWN_IN_PROGRESS;
     }
 
+    monitorInternal = CONTAINING_RECORD(Monitor, NI_MONITOR_INTERNAL, Monitor);
+
     //
-    // Check if we already have state for this process
+    // Atomic find-or-create under exclusive lock to prevent duplicate entries
     //
-    processState = NipFindProcessState(Monitor, ProcessId);
+    FltAcquirePushLockExclusive(&Monitor->ProcessLock);
+
+    processState = NipFindProcessStateLocked(Monitor, ProcessId);
 
     if (processState == NULL) {
         //
+        // Enforce max process count to bound memory usage
+        //
+        if (Monitor->ProcessCount >= NI_MAX_PROCESSES) {
+            FltReleasePushLock(&Monitor->ProcessLock);
+            NipReleaseOperation(Monitor);
+            return STATUS_QUOTA_EXCEEDED;
+        }
+
+        //
         // Create new process state
         //
-        processState = (PNI_PROCESS_NTDLL)ExAllocateFromNPagedLookasideList(
+        processState = (PNI_PROCESS_NTDLL)ExAllocateFromPagedLookasideList(
             &monitorInternal->ProcessLookaside
             );
 
         if (processState == NULL) {
+            FltReleasePushLock(&Monitor->ProcessLock);
+            NipReleaseOperation(Monitor);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -579,12 +668,23 @@ Return Value:
 
         processState->ProcessId = ProcessId;
         InitializeListHead(&processState->FunctionList);
-        KeInitializeSpinLock(&processState->FunctionLock);
+        FltInitializePushLock(&processState->FunctionLock);
         processState->FunctionCount = 0;
         processState->ModificationCount = 0;
+        processState->HookCount = 0;
+        processState->HashValid = FALSE;
+
+        //
+        // Insert into list while we hold the exclusive lock
+        //
+        InsertTailList(&Monitor->ProcessList, &processState->ListEntry);
+        InterlockedIncrement(&Monitor->ProcessCount);
+        InterlockedIncrement64(&Monitor->Stats.ProcessesMonitored);
 
         newState = TRUE;
     }
+
+    FltReleasePushLock(&Monitor->ProcessLock);
 
     //
     // Get NTDLL base for this process
@@ -592,8 +692,16 @@ Return Value:
     status = NipGetProcessNtdll(ProcessId, &ntdllBase, &ntdllSize);
     if (!NT_SUCCESS(status)) {
         if (newState) {
-            ExFreeToNPagedLookasideList(&monitorInternal->ProcessLookaside, processState);
+            //
+            // Remove the state we just inserted
+            //
+            FltAcquirePushLockExclusive(&Monitor->ProcessLock);
+            RemoveEntryList(&processState->ListEntry);
+            InterlockedDecrement(&Monitor->ProcessCount);
+            FltReleasePushLock(&Monitor->ProcessLock);
+            NipFreeProcessState(monitorInternal, processState);
         }
+        NipReleaseOperation(Monitor);
         return status;
     }
 
@@ -611,11 +719,7 @@ Return Value:
         processState->Hash
         );
 
-    if (!NT_SUCCESS(status)) {
-        //
-        // Continue even if hash fails - we can still check individual functions
-        //
-    }
+    processState->HashValid = NT_SUCCESS(status);
 
     //
     // Clear existing function states if updating
@@ -626,7 +730,7 @@ Return Value:
 
         InitializeListHead(&toFree);
 
-        KeAcquireSpinLock(&processState->FunctionLock, &oldIrql);
+        FltAcquirePushLockExclusive(&processState->FunctionLock);
 
         while (!IsListEmpty(&processState->FunctionList)) {
             entry = RemoveHeadList(&processState->FunctionList);
@@ -634,12 +738,12 @@ Return Value:
         }
         processState->FunctionCount = 0;
 
-        KeReleaseSpinLock(&processState->FunctionLock, oldIrql);
+        FltReleasePushLock(&processState->FunctionLock);
 
         while (!IsListEmpty(&toFree)) {
             entry = RemoveHeadList(&toFree);
             functionState = CONTAINING_RECORD(entry, NI_FUNCTION_STATE, ListEntry);
-            ExFreeToNPagedLookasideList(&monitorInternal->FunctionLookaside, functionState);
+            ExFreeToPagedLookasideList(&monitorInternal->FunctionLookaside, functionState);
         }
     }
 
@@ -647,6 +751,7 @@ Return Value:
     // Scan critical functions
     //
     processState->ModificationCount = 0;
+    processState->HookCount = 0;
 
     for (i = 0; i < NI_CRITICAL_FUNCTION_COUNT; i++) {
         PCSTR functionName = NI_CRITICAL_FUNCTIONS[i];
@@ -655,6 +760,7 @@ Return Value:
         UCHAR currentPrologue[NI_PROLOGUE_SIZE] = {0};
         PVOID functionAddress;
         NI_MODIFICATION modType;
+        SIZE_T nameLen;
 
         //
         // Look up function in clean NTDLL
@@ -692,7 +798,7 @@ Return Value:
         //
         // Allocate function state
         //
-        functionState = (PNI_FUNCTION_STATE)ExAllocateFromNPagedLookasideList(
+        functionState = (PNI_FUNCTION_STATE)ExAllocateFromPagedLookasideList(
             &monitorInternal->FunctionLookaside
             );
 
@@ -703,10 +809,11 @@ Return Value:
         RtlZeroMemory(functionState, sizeof(NI_FUNCTION_STATE));
 
         //
-        // Fill function state
+        // Fill function state with bounded string copy
         //
-        RtlCopyMemory(functionState->FunctionName, functionName,
-                      min(strlen(functionName), sizeof(functionState->FunctionName) - 1));
+        nameLen = strnlen(functionName, sizeof(functionState->FunctionName) - 1);
+        RtlCopyMemory(functionState->FunctionName, functionName, nameLen);
+        functionState->FunctionName[nameLen] = '\0';
 
         functionState->ExpectedAddress = (PVOID)((ULONG_PTR)Monitor->CleanNtdllCopy + functionRva);
         functionState->CurrentAddress = functionAddress;
@@ -727,33 +834,25 @@ Return Value:
             InterlockedIncrement64(&Monitor->Stats.ModificationsFound);
 
             if (modType == NiMod_HookInstalled) {
+                processState->HookCount++;
                 InterlockedIncrement64(&Monitor->Stats.HooksDetected);
             }
         }
 
         //
-        // Add to function list
+        // Add to function list under push lock
         //
-        KeAcquireSpinLock(&processState->FunctionLock, &oldIrql);
+        FltAcquirePushLockExclusive(&processState->FunctionLock);
         InsertTailList(&processState->FunctionList, &functionState->ListEntry);
         processState->FunctionCount++;
-        KeReleaseSpinLock(&processState->FunctionLock, oldIrql);
+        FltReleasePushLock(&processState->FunctionLock);
     }
 
     KeQuerySystemTimePrecise(&processState->LastCheck);
 
-    //
-    // Add to process list if new
-    //
-    if (newState) {
-        FltAcquirePushLockExclusive(&Monitor->ProcessLock);
-        InsertTailList(&Monitor->ProcessList, &processState->ListEntry);
-        InterlockedIncrement(&Monitor->ProcessCount);
-        InterlockedIncrement64(&Monitor->Stats.ProcessesMonitored);
-        FltReleasePushLock(&Monitor->ProcessLock);
-    }
-
     *State = processState;
+
+    NipReleaseOperation(Monitor);
 
     return STATUS_SUCCESS;
 }
@@ -796,11 +895,11 @@ Return Value:
     UCHAR currentPrologue[NI_PROLOGUE_SIZE] = {0};
     PVOID functionAddress;
     NI_MODIFICATION modType;
+    SIZE_T nameLen;
 
     PAGED_CODE();
 
-    if (Monitor == NULL || !Monitor->Initialized ||
-        FunctionName == NULL || State == NULL) {
+    if (Monitor == NULL || FunctionName == NULL || State == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -810,17 +909,18 @@ Return Value:
 
     *State = NULL;
 
-    monitorInternal = CONTAINING_RECORD(Monitor, NI_MONITOR_INTERNAL, Monitor);
-
-    if (monitorInternal->ShuttingDown) {
+    if (!NipAcquireOperation(Monitor)) {
         return STATUS_SHUTDOWN_IN_PROGRESS;
     }
+
+    monitorInternal = CONTAINING_RECORD(Monitor, NI_MONITOR_INTERNAL, Monitor);
 
     //
     // Get NTDLL base for this process
     //
     status = NipGetProcessNtdll(ProcessId, &ntdllBase, &ntdllSize);
     if (!NT_SUCCESS(status)) {
+        NipReleaseOperation(Monitor);
         return status;
     }
 
@@ -835,6 +935,7 @@ Return Value:
         );
 
     if (!NT_SUCCESS(status)) {
+        NipReleaseOperation(Monitor);
         return status;
     }
 
@@ -854,27 +955,30 @@ Return Value:
         );
 
     if (!NT_SUCCESS(status)) {
+        NipReleaseOperation(Monitor);
         return status;
     }
 
     //
     // Allocate function state
     //
-    functionState = (PNI_FUNCTION_STATE)ExAllocateFromNPagedLookasideList(
+    functionState = (PNI_FUNCTION_STATE)ExAllocateFromPagedLookasideList(
         &monitorInternal->FunctionLookaside
         );
 
     if (functionState == NULL) {
+        NipReleaseOperation(Monitor);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlZeroMemory(functionState, sizeof(NI_FUNCTION_STATE));
 
     //
-    // Fill function state
+    // Fill function state with bounded string copy
     //
-    RtlCopyMemory(functionState->FunctionName, FunctionName,
-                  min(strlen(FunctionName), sizeof(functionState->FunctionName) - 1));
+    nameLen = strnlen(FunctionName, sizeof(functionState->FunctionName) - 1);
+    RtlCopyMemory(functionState->FunctionName, FunctionName, nameLen);
+    functionState->FunctionName[nameLen] = '\0';
 
     functionState->ExpectedAddress = (PVOID)((ULONG_PTR)Monitor->CleanNtdllCopy + functionRva);
     functionState->CurrentAddress = functionAddress;
@@ -891,6 +995,8 @@ Return Value:
     functionState->ModificationType = modType;
 
     *State = functionState;
+
+    NipReleaseOperation(Monitor);
 
     return STATUS_SUCCESS;
 }
@@ -930,12 +1036,11 @@ Return Value:
     PNI_PROCESS_NTDLL processState = NULL;
     NTSTATUS status;
     ULONG hookIndex = 0;
-    BOOLEAN freeState = FALSE;
+    ULONG totalHooks = 0;
 
     PAGED_CODE();
 
-    if (Monitor == NULL || !Monitor->Initialized ||
-        Hooks == NULL || Count == NULL) {
+    if (Monitor == NULL || Hooks == NULL || Count == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -945,32 +1050,32 @@ Return Value:
         return STATUS_BUFFER_TOO_SMALL;
     }
 
-    monitorInternal = CONTAINING_RECORD(Monitor, NI_MONITOR_INTERNAL, Monitor);
-
-    if (monitorInternal->ShuttingDown) {
+    if (!NipAcquireOperation(Monitor)) {
         return STATUS_SHUTDOWN_IN_PROGRESS;
     }
+
+    monitorInternal = CONTAINING_RECORD(Monitor, NI_MONITOR_INTERNAL, Monitor);
 
     //
     // Scan the process to get current state
     //
     status = NiScanProcess(Monitor, ProcessId, &processState);
     if (!NT_SUCCESS(status)) {
+        NipReleaseOperation(Monitor);
         return status;
     }
 
     //
-    // Iterate function states and collect hooked ones
+    // Iterate function states and collect hooked ones (push lock, PASSIVE safe)
     //
     if (processState != NULL) {
         PLIST_ENTRY entry;
         PNI_FUNCTION_STATE funcState;
-        KIRQL oldIrql;
 
-        KeAcquireSpinLock(&processState->FunctionLock, &oldIrql);
+        FltAcquirePushLockShared(&processState->FunctionLock);
 
         for (entry = processState->FunctionList.Flink;
-             entry != &processState->FunctionList && hookIndex < Max;
+             entry != &processState->FunctionList;
              entry = entry->Flink) {
 
             funcState = CONTAINING_RECORD(entry, NI_FUNCTION_STATE, ListEntry);
@@ -978,30 +1083,36 @@ Return Value:
             if (funcState->IsModified &&
                 funcState->ModificationType == NiMod_HookInstalled) {
 
-                //
-                // Allocate a copy for the caller
-                //
-                PNI_FUNCTION_STATE hookCopy = (PNI_FUNCTION_STATE)ExAllocateFromNPagedLookasideList(
-                    &monitorInternal->FunctionLookaside
-                    );
+                totalHooks++;
 
-                if (hookCopy != NULL) {
-                    RtlCopyMemory(hookCopy, funcState, sizeof(NI_FUNCTION_STATE));
-                    InitializeListHead(&hookCopy->ListEntry);
-                    Hooks[hookIndex++] = hookCopy;
+                if (hookIndex < Max) {
+                    //
+                    // Allocate a copy for the caller
+                    //
+                    PNI_FUNCTION_STATE hookCopy = (PNI_FUNCTION_STATE)ExAllocateFromPagedLookasideList(
+                        &monitorInternal->FunctionLookaside
+                        );
+
+                    if (hookCopy != NULL) {
+                        RtlCopyMemory(hookCopy, funcState, sizeof(NI_FUNCTION_STATE));
+                        InitializeListHead(&hookCopy->ListEntry);
+                        Hooks[hookIndex++] = hookCopy;
+                    }
                 }
             }
         }
 
-        KeReleaseSpinLock(&processState->FunctionLock, oldIrql);
+        FltReleasePushLock(&processState->FunctionLock);
     }
 
     *Count = hookIndex;
 
+    NipReleaseOperation(Monitor);
+
     //
-    // Check if there are more hooks than we could return
+    // Report overflow based on actual hook count, not ModificationCount
     //
-    if (processState != NULL && processState->ModificationCount > Max) {
+    if (totalHooks > Max) {
         return STATUS_BUFFER_TOO_SMALL;
     }
 
@@ -1032,6 +1143,7 @@ Arguments:
 Return Value:
 
     STATUS_SUCCESS on success.
+    STATUS_NOT_SUPPORTED if clean hash is unavailable.
 
 --*/
 {
@@ -1043,16 +1155,24 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Monitor == NULL || !Monitor->Initialized || IsModified == NULL) {
+    if (Monitor == NULL || IsModified == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *IsModified = TRUE;  // Assume modified until proven otherwise
 
+    if (!NipAcquireOperation(Monitor)) {
+        return STATUS_SHUTDOWN_IN_PROGRESS;
+    }
+
     monitorInternal = CONTAINING_RECORD(Monitor, NI_MONITOR_INTERNAL, Monitor);
 
-    if (monitorInternal->ShuttingDown) {
-        return STATUS_SHUTDOWN_IN_PROGRESS;
+    //
+    // Cannot compare if clean hash was never computed successfully
+    //
+    if (!Monitor->CleanHashValid) {
+        NipReleaseOperation(Monitor);
+        return STATUS_NOT_SUPPORTED;
     }
 
     //
@@ -1060,6 +1180,7 @@ Return Value:
     //
     status = NipGetProcessNtdll(ProcessId, &ntdllBase, &ntdllSize);
     if (!NT_SUCCESS(status)) {
+        NipReleaseOperation(Monitor);
         return status;
     }
 
@@ -1075,6 +1196,7 @@ Return Value:
         );
 
     if (!NT_SUCCESS(status)) {
+        NipReleaseOperation(Monitor);
         return status;
     }
 
@@ -1083,6 +1205,8 @@ Return Value:
     //
     *IsModified = (RtlCompareMemory(processHash, monitorInternal->CleanTextHash, 32) != 32);
 
+    NipReleaseOperation(Monitor);
+
     return STATUS_SUCCESS;
 }
 
@@ -1090,29 +1214,49 @@ Return Value:
 _Use_decl_annotations_
 VOID
 NiFreeState(
+    _In_ PNI_MONITOR Monitor,
     _In_ PNI_PROCESS_NTDLL State
     )
 /*++
 
 Routine Description:
 
-    Frees a process NTDLL state structure.
-    Note: This only frees a standalone state, not one in the monitor's list.
+    Removes a process NTDLL state from the monitor and frees it along
+    with all associated function states.
 
 Arguments:
 
+    Monitor - The owning monitor (needed for lookaside lists and process list).
     State - State to free.
 
 --*/
 {
+    PNI_MONITOR_INTERNAL monitorInternal;
+
     PAGED_CODE();
 
-    //
-    // Note: Function states within the process are not freed here
-    // as they may still be in use. The full cleanup happens in NiShutdown.
-    //
+    if (Monitor == NULL || State == NULL) {
+        return;
+    }
 
-    UNREFERENCED_PARAMETER(State);
+    monitorInternal = CONTAINING_RECORD(Monitor, NI_MONITOR_INTERNAL, Monitor);
+
+    if (monitorInternal->Signature != NI_SIGNATURE) {
+        return;
+    }
+
+    //
+    // Remove from process list under exclusive lock
+    //
+    FltAcquirePushLockExclusive(&Monitor->ProcessLock);
+    RemoveEntryList(&State->ListEntry);
+    InterlockedDecrement(&Monitor->ProcessCount);
+    FltReleasePushLock(&Monitor->ProcessLock);
+
+    //
+    // Free the state and all its function children
+    //
+    NipFreeProcessState(monitorInternal, State);
 }
 
 
@@ -1130,95 +1274,46 @@ NipCaptureCleanNtdll(
 
 Routine Description:
 
-    Captures a clean copy of NTDLL from the System process (PID 4)
-    or reads from disk as a fallback.
+    Captures a clean copy of NTDLL by reading it from disk
+    (\SystemRoot\System32\ntdll.dll). This is the only trusted source;
+    reading from any process address space would be vulnerable to
+    pre-existing hooks.
 
 --*/
 {
     NTSTATUS status;
-    PVOID ntdllBase = NULL;
-    SIZE_T ntdllSize = 0;
     PVOID cleanCopy = NULL;
+    SIZE_T cleanSize = 0;
     PVOID textBase = NULL;
     SIZE_T textSize = 0;
     ULONG_PTR textRva = 0;
-    PEPROCESS systemProcess = NULL;
-    KAPC_STATE apcState;
 
     //
-    // Get System process (PID 4)
+    // Read ntdll.dll from disk — trusted baseline
     //
-    status = PsLookupProcessByProcessId((HANDLE)4, &systemProcess);
+    status = NipReadNtdllFromDisk(&cleanCopy, &cleanSize);
     if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    //
-    // Get NTDLL base from System process
-    // Note: System process doesn't have a user-mode NTDLL, so we need to
-    // get it from another clean process like csrss or smss
-    //
-    ObDereferenceObject(systemProcess);
-
-    //
-    // Try to get NTDLL from current process as initial source
-    // In production, this would be from a trusted process or disk
-    //
-    status = NipGetProcessNtdll(PsGetCurrentProcessId(), &ntdllBase, &ntdllSize);
-    if (!NT_SUCCESS(status)) {
-        //
-        // Fallback: try to read from disk
-        //
-        // For now, return error - disk reading would be implemented separately
-        //
-        return status;
-    }
-
-    //
-    // Allocate buffer for clean copy
-    //
-    cleanCopy = ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        ntdllSize,
-        NI_POOL_TAG
-        );
-
-    if (cleanCopy == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    //
-    // Read NTDLL into our buffer
-    //
-    status = NipReadProcessMemory(
-        PsGetCurrentProcessId(),
-        ntdllBase,
-        cleanCopy,
-        ntdllSize
-        );
-
-    if (!NT_SUCCESS(status)) {
-        ShadowStrikeFreePoolWithTag(cleanCopy, NI_POOL_TAG);
         return status;
     }
 
     MonitorInternal->Monitor.CleanNtdllCopy = cleanCopy;
-    MonitorInternal->Monitor.CleanNtdllSize = ntdllSize;
+    MonitorInternal->Monitor.CleanNtdllSize = cleanSize;
 
     //
-    // Parse .text section
+    // Parse .text section from clean copy
     //
     status = NipGetTextSection(
         cleanCopy,
-        ntdllSize,
+        cleanSize,
         &textBase,
         &textSize,
         &textRva
         );
 
     if (!NT_SUCCESS(status)) {
-        ShadowStrikeFreePoolWithTag(cleanCopy, NI_POOL_TAG);
+        ShadowStrikeFreePoolWithTag(cleanCopy, NI_POOL_TAG_NTDLL);
         MonitorInternal->Monitor.CleanNtdllCopy = NULL;
+        MonitorInternal->Monitor.CleanNtdllSize = 0;
         return status;
     }
 
@@ -1229,18 +1324,24 @@ Routine Description:
     //
     // Compute hash of clean .text section
     //
-    status = ShadowStrikeComputeSha256(
-        textBase,
-        textSize,
-        MonitorInternal->CleanTextHash,
-        sizeof(MonitorInternal->CleanTextHash)
-        );
+    if (textSize <= MAXULONG) {
+        status = ShadowStrikeComputeSha256(
+            textBase,
+            (ULONG)textSize,
+            MonitorInternal->CleanTextHash
+            );
+    } else {
+        status = STATUS_INTEGER_OVERFLOW;
+    }
 
     if (!NT_SUCCESS(status)) {
         //
-        // Non-fatal - continue without hash
+        // Hash failure is tracked — NiCompareToClean will check this flag
         //
         RtlZeroMemory(MonitorInternal->CleanTextHash, sizeof(MonitorInternal->CleanTextHash));
+        MonitorInternal->Monitor.CleanHashValid = FALSE;
+    } else {
+        MonitorInternal->Monitor.CleanHashValid = TRUE;
     }
 
     //
@@ -1248,7 +1349,7 @@ Routine Description:
     //
     status = NipParseExportTable(
         cleanCopy,
-        ntdllSize,
+        cleanSize,
         &MonitorInternal->CleanExports.ExportDirectory,
         &MonitorInternal->CleanExports.NumberOfFunctions,
         &MonitorInternal->CleanExports.NumberOfNames,
@@ -1259,10 +1360,11 @@ Routine Description:
 
     if (!NT_SUCCESS(status)) {
         //
-        // Export parsing failure is critical
+        // Export parsing failure is critical — cannot monitor functions
         //
-        ShadowStrikeFreePoolWithTag(cleanCopy, NI_POOL_TAG);
+        ShadowStrikeFreePoolWithTag(cleanCopy, NI_POOL_TAG_NTDLL);
         MonitorInternal->Monitor.CleanNtdllCopy = NULL;
+        MonitorInternal->Monitor.CleanNtdllSize = 0;
         return status;
     }
 
@@ -1282,7 +1384,13 @@ NipGetProcessNtdll(
 
 Routine Description:
 
-    Gets the base address and size of ntdll.dll in a process.
+    Gets the base address and size of ntdll.dll in a process by walking
+    the PEB loader data structures.
+
+    Security:
+    - Iterates at most NI_MAX_LDR_MODULES to prevent infinite loops on
+      corrupted lists from hostile processes.
+    - Validates returned base address and size against sane bounds.
 
 --*/
 {
@@ -1295,6 +1403,9 @@ Routine Description:
     KAPC_STATE apcState;
     BOOLEAN found = FALSE;
     UNICODE_STRING ntdllName;
+    ULONG iterationCount = 0;
+
+    PAGED_CODE();
 
     *NtdllBase = NULL;
     *NtdllSize = 0;
@@ -1328,8 +1439,10 @@ Routine Description:
         listHead = &ldrData->InMemoryOrderModuleList;
         listEntry = listHead->Flink;
 
-        while (listEntry != listHead) {
+        while (listEntry != listHead && iterationCount < NI_MAX_LDR_MODULES) {
             PLDR_DATA_TABLE_ENTRY ldrEntry;
+
+            iterationCount++;
 
             ldrEntry = CONTAINING_RECORD(
                 listEntry,
@@ -1349,8 +1462,37 @@ Routine Description:
                     );
 
                 if (RtlCompareUnicodeString(&ldrEntry->BaseDllName, &ntdllName, TRUE) == 0) {
+                    ULONG_PTR baseAddr = (ULONG_PTR)ldrEntry->DllBase;
+                    SIZE_T imageSize = ldrEntry->SizeOfImage;
+
+                    //
+                    // Validate address is in valid user-mode range
+                    //
+                    if (baseAddr < NI_MIN_VALID_USER_ADDRESS ||
+                        baseAddr > NI_MAX_USER_ADDRESS) {
+                        status = STATUS_INVALID_ADDRESS;
+                        __leave;
+                    }
+
+                    //
+                    // Validate size is sane (ntdll is typically 1-4 MB)
+                    //
+                    if (imageSize == 0 || imageSize > NI_MAX_NTDLL_SIZE) {
+                        status = STATUS_INVALID_IMAGE_FORMAT;
+                        __leave;
+                    }
+
+                    //
+                    // Validate base + size doesn't overflow or exceed user range
+                    //
+                    if (baseAddr + imageSize < baseAddr ||
+                        baseAddr + imageSize > NI_MAX_USER_ADDRESS) {
+                        status = STATUS_INVALID_ADDRESS;
+                        __leave;
+                    }
+
                     *NtdllBase = ldrEntry->DllBase;
-                    *NtdllSize = ldrEntry->SizeOfImage;
+                    *NtdllSize = imageSize;
                     found = TRUE;
                     break;
                 }
@@ -1386,6 +1528,8 @@ NipReadProcessMemory(
 Routine Description:
 
     Safely reads memory from a process's address space.
+    Uses SEH to handle faults — MmIsAddressValid is NOT used as it
+    is fundamentally racy (TOCTOU) and cannot protect multi-page reads.
 
 --*/
 {
@@ -1393,8 +1537,20 @@ Routine Description:
     PEPROCESS process = NULL;
     KAPC_STATE apcState;
 
+    PAGED_CODE();
+
     if (Size == 0) {
         return STATUS_SUCCESS;
+    }
+
+    //
+    // Validate source is in user-mode range
+    //
+    if ((ULONG_PTR)SourceAddress < NI_MIN_VALID_USER_ADDRESS ||
+        (ULONG_PTR)SourceAddress > NI_MAX_USER_ADDRESS ||
+        (ULONG_PTR)SourceAddress + Size < (ULONG_PTR)SourceAddress ||
+        (ULONG_PTR)SourceAddress + Size > NI_MAX_USER_ADDRESS) {
+        return STATUS_INVALID_ADDRESS;
     }
 
     status = PsLookupProcessByProcessId(ProcessId, &process);
@@ -1405,11 +1561,6 @@ Routine Description:
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        if (!MmIsAddressValid(SourceAddress)) {
-            status = STATUS_ACCESS_VIOLATION;
-            __leave;
-        }
-
         ProbeForRead(SourceAddress, Size, 1);
         RtlCopyMemory(Destination, SourceAddress, Size);
         status = STATUS_SUCCESS;
@@ -1440,6 +1591,7 @@ NipGetTextSection(
 Routine Description:
 
     Parses PE headers to find the .text section.
+    Validates all offsets and sizes against ModuleSize bounds.
 
 --*/
 {
@@ -1462,7 +1614,15 @@ Routine Description:
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
-    if ((SIZE_T)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > ModuleSize) {
+    //
+    // e_lfanew is LONG (signed). Reject negative values and values that
+    // would place NT headers before the DOS header ends.
+    //
+    if (dosHeader->e_lfanew < (LONG)sizeof(IMAGE_DOS_HEADER)) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    if ((SIZE_T)(ULONG)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > ModuleSize) {
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
@@ -1478,24 +1638,50 @@ Routine Description:
     sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
 
     for (i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+        SIZE_T sectionEnd;
+        SIZE_T effectiveSize;
+
         if ((PUCHAR)&sectionHeader[i] + sizeof(IMAGE_SECTION_HEADER) >
             (PUCHAR)ModuleBase + ModuleSize) {
             break;
         }
 
         //
-        // Look for .text or executable section
+        // Look for .text or first executable code section
         //
         if (RtlCompareMemory(sectionHeader[i].Name, ".text", 5) == 5 ||
             (sectionHeader[i].Characteristics & IMAGE_SCN_CNT_CODE)) {
 
-            *TextRva = sectionHeader[i].VirtualAddress;
-            *TextSize = sectionHeader[i].Misc.VirtualSize;
-            *TextBase = (PVOID)((PUCHAR)ModuleBase + sectionHeader[i].VirtualAddress);
+            ULONG virtualAddress = sectionHeader[i].VirtualAddress;
+            ULONG virtualSize = sectionHeader[i].Misc.VirtualSize;
+            ULONG rawSize = sectionHeader[i].SizeOfRawData;
 
-            if ((PUCHAR)*TextBase + *TextSize <= (PUCHAR)ModuleBase + ModuleSize) {
-                return STATUS_SUCCESS;
+            //
+            // Use the smaller of VirtualSize and SizeOfRawData to avoid
+            // reading uninitialized memory beyond the actual section data
+            //
+            if (virtualSize == 0) {
+                continue;
             }
+
+            effectiveSize = (SIZE_T)min(virtualSize, rawSize);
+            if (effectiveSize == 0) {
+                effectiveSize = (SIZE_T)virtualSize;
+            }
+
+            //
+            // Validate section fits within module bounds
+            //
+            sectionEnd = (SIZE_T)virtualAddress + effectiveSize;
+            if (sectionEnd < (SIZE_T)virtualAddress || sectionEnd > ModuleSize) {
+                continue;
+            }
+
+            *TextRva = virtualAddress;
+            *TextSize = effectiveSize;
+            *TextBase = (PVOID)((PUCHAR)ModuleBase + virtualAddress);
+
+            return STATUS_SUCCESS;
         }
     }
 
@@ -1520,7 +1706,8 @@ NipParseExportTable(
 
 Routine Description:
 
-    Parses the PE export directory.
+    Parses the PE export directory with full bounds checking on all
+    array pointers to prevent out-of-bounds reads on malformed PEs.
 
 --*/
 {
@@ -1530,6 +1717,7 @@ Routine Description:
     PIMAGE_EXPORT_DIRECTORY exportDir;
     ULONG exportDirRva;
     ULONG exportDirSize;
+    SIZE_T arrayEnd;
 
     *ExportDirectory = NULL;
     *NumberOfFunctions = 0;
@@ -1545,6 +1733,14 @@ Routine Description:
     dosHeader = (PIMAGE_DOS_HEADER)ModuleBase;
 
     if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    if (dosHeader->e_lfanew < (LONG)sizeof(IMAGE_DOS_HEADER)) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    if ((SIZE_T)(ULONG)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > ModuleSize) {
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
@@ -1565,7 +1761,7 @@ Routine Description:
         return STATUS_NOT_FOUND;
     }
 
-    if (exportDirRva + sizeof(IMAGE_EXPORT_DIRECTORY) > ModuleSize) {
+    if ((SIZE_T)exportDirRva + sizeof(IMAGE_EXPORT_DIRECTORY) > ModuleSize) {
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
@@ -1575,15 +1771,45 @@ Routine Description:
     *NumberOfFunctions = exportDir->NumberOfFunctions;
     *NumberOfNames = exportDir->NumberOfNames;
 
+    //
+    // Validate AddressOfFunctions array fits within module
+    //
     if (exportDir->AddressOfFunctions != 0) {
+        arrayEnd = (SIZE_T)exportDir->AddressOfFunctions +
+                   (SIZE_T)exportDir->NumberOfFunctions * sizeof(ULONG);
+
+        if (arrayEnd > ModuleSize || arrayEnd < (SIZE_T)exportDir->AddressOfFunctions) {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
         *AddressOfFunctions = (PULONG)((PUCHAR)ModuleBase + exportDir->AddressOfFunctions);
     }
 
+    //
+    // Validate AddressOfNames array fits within module
+    //
     if (exportDir->AddressOfNames != 0) {
+        arrayEnd = (SIZE_T)exportDir->AddressOfNames +
+                   (SIZE_T)exportDir->NumberOfNames * sizeof(ULONG);
+
+        if (arrayEnd > ModuleSize || arrayEnd < (SIZE_T)exportDir->AddressOfNames) {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
         *AddressOfNames = (PULONG)((PUCHAR)ModuleBase + exportDir->AddressOfNames);
     }
 
+    //
+    // Validate AddressOfNameOrdinals array fits within module
+    //
     if (exportDir->AddressOfNameOrdinals != 0) {
+        arrayEnd = (SIZE_T)exportDir->AddressOfNameOrdinals +
+                   (SIZE_T)exportDir->NumberOfNames * sizeof(USHORT);
+
+        if (arrayEnd > ModuleSize || arrayEnd < (SIZE_T)exportDir->AddressOfNameOrdinals) {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
         *AddressOfNameOrdinals = (PUSHORT)((PUCHAR)ModuleBase + exportDir->AddressOfNameOrdinals);
     }
 
@@ -1605,6 +1831,7 @@ NipLookupExportByName(
 Routine Description:
 
     Looks up an export by name in the clean NTDLL copy.
+    Validates all RVAs and ordinals against module bounds.
 
 --*/
 {
@@ -1613,6 +1840,7 @@ Routine Description:
     PULONG addressOfFunctions;
     ULONG i;
     PVOID cleanBase;
+    SIZE_T cleanSize;
     SIZE_T nameLen;
 
     *FunctionRva = 0;
@@ -1625,35 +1853,64 @@ Routine Description:
     }
 
     cleanBase = MonitorInternal->Monitor.CleanNtdllCopy;
+    cleanSize = MonitorInternal->Monitor.CleanNtdllSize;
     addressOfNames = MonitorInternal->CleanExports.AddressOfNames;
     addressOfOrdinals = MonitorInternal->CleanExports.AddressOfNameOrdinals;
     addressOfFunctions = MonitorInternal->CleanExports.AddressOfFunctions;
-    nameLen = strlen(FunctionName);
 
     //
-    // Binary search would be more efficient, but linear is simple and correct
+    // Use bounded length for function name
     //
+    nameLen = strnlen(FunctionName, 256);
+    if (nameLen == 0 || nameLen >= 256) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     for (i = 0; i < MonitorInternal->CleanExports.NumberOfNames; i++) {
-        PCSTR exportName = (PCSTR)((PUCHAR)cleanBase + addressOfNames[i]);
+        ULONG nameRva = addressOfNames[i];
+        PCSTR exportName;
+        USHORT ordinal;
+        ULONG functionRva;
+
+        //
+        // Validate name RVA points within module and leaves room for at least
+        // one character + null terminator
+        //
+        if ((SIZE_T)nameRva + nameLen + 1 > cleanSize) {
+            continue;
+        }
+
+        exportName = (PCSTR)((PUCHAR)cleanBase + nameRva);
 
         if (RtlCompareMemory(exportName, FunctionName, nameLen + 1) == nameLen + 1) {
             //
-            // Found it - get the function RVA
+            // Found it — validate ordinal is within functions array
             //
-            USHORT ordinal = addressOfOrdinals[i];
-            ULONG functionRva = addressOfFunctions[ordinal];
+            ordinal = addressOfOrdinals[i];
+
+            if (ordinal >= MonitorInternal->CleanExports.NumberOfFunctions) {
+                return STATUS_INVALID_IMAGE_FORMAT;
+            }
+
+            functionRva = addressOfFunctions[ordinal];
+
+            //
+            // Validate function RVA is within module
+            //
+            if ((SIZE_T)functionRva + NI_PROLOGUE_SIZE > cleanSize) {
+                return STATUS_INVALID_IMAGE_FORMAT;
+            }
 
             *FunctionRva = functionRva;
 
             //
-            // Copy the prologue bytes
+            // Copy the prologue bytes (already bounds-checked above)
             //
-            PVOID prologueAddr = (PVOID)((PUCHAR)cleanBase + functionRva);
-
-            if ((PUCHAR)prologueAddr + NI_PROLOGUE_SIZE <=
-                (PUCHAR)cleanBase + MonitorInternal->Monitor.CleanNtdllSize) {
-                RtlCopyMemory(ExpectedPrologue, prologueAddr, NI_PROLOGUE_SIZE);
-            }
+            RtlCopyMemory(
+                ExpectedPrologue,
+                (PUCHAR)cleanBase + functionRva,
+                NI_PROLOGUE_SIZE
+                );
 
             return STATUS_SUCCESS;
         }
@@ -1679,10 +1936,16 @@ NipDetectHookType(
 
 Routine Description:
 
-    Detects the type of modification in a function prologue.
+    Detects the type of modification in a function prologue by comparing
+    against known hook patterns.
 
 --*/
 {
+    ULONG expectedSyscall = 0;
+    ULONG currentSyscall = 0;
+    BOOLEAN expectedIsSyscall;
+    BOOLEAN currentIsSyscall;
+
     //
     // First check if they match exactly
     //
@@ -1691,7 +1954,7 @@ Routine Description:
     }
 
     //
-    // Check for JMP rel32 (E9 xx xx xx xx)
+    // Check for JMP rel32 (E9 xx xx xx xx) — most common inline hook
     //
     if (CurrentPrologue[0] == NI_JMP_REL32_OPCODE) {
         return NiMod_HookInstalled;
@@ -1707,46 +1970,40 @@ Routine Description:
     //
     // Check for MOV RAX, imm64; JMP RAX (48 B8 ... FF E0)
     //
-    if (CurrentPrologue[0] == 0x48 && CurrentPrologue[1] == 0xB8) {
-        //
-        // Look for JMP RAX at offset 10
-        //
-        if (Size >= 12 && CurrentPrologue[10] == 0xFF && CurrentPrologue[11] == 0xE0) {
-            return NiMod_HookInstalled;
-        }
+    if (Size >= 12 &&
+        CurrentPrologue[0] == 0x48 && CurrentPrologue[1] == 0xB8 &&
+        CurrentPrologue[10] == 0xFF && CurrentPrologue[11] == 0xE0) {
+        return NiMod_HookInstalled;
     }
 
     //
     // Check for MOV R10, imm64; JMP R10 (49 BA ... 41 FF E2)
     //
-    if (CurrentPrologue[0] == 0x49 && CurrentPrologue[1] == 0xBA) {
-        if (Size >= 13 && CurrentPrologue[10] == 0x41 &&
-            CurrentPrologue[11] == 0xFF && CurrentPrologue[12] == 0xE2) {
-            return NiMod_HookInstalled;
-        }
-    }
-
-    //
-    // Check for PUSH + RET (50-57 C3) - stack-based hook
-    //
-    if ((CurrentPrologue[0] >= 0x50 && CurrentPrologue[0] <= 0x57) &&
-        Size >= 2 && CurrentPrologue[1] == 0xC3) {
+    if (Size >= 13 &&
+        CurrentPrologue[0] == 0x49 && CurrentPrologue[1] == 0xBA &&
+        CurrentPrologue[10] == 0x41 &&
+        CurrentPrologue[11] == 0xFF && CurrentPrologue[12] == 0xE2) {
         return NiMod_HookInstalled;
     }
 
     //
-    // Check for hotpatch pattern modification (CC or EB at -1 from entry)
-    // In x64, hotpatch is typically JMP rel8 at -5
+    // Check for PUSH imm64 + RET pattern — only flag as hook if the expected
+    // prologue does NOT start with the same PUSH register (reduces false
+    // positives from ICF / tail-call optimizations)
     //
+    if (Size >= 2 &&
+        (CurrentPrologue[0] >= 0x50 && CurrentPrologue[0] <= 0x57) &&
+        CurrentPrologue[1] == 0xC3 &&
+        !(ExpectedPrologue[0] >= 0x50 && ExpectedPrologue[0] <= 0x57 &&
+          ExpectedPrologue[1] == 0xC3)) {
+        return NiMod_HookInstalled;
+    }
 
     //
     // Check if this is a syscall stub that has been modified
     //
-    ULONG expectedSyscall = 0;
-    ULONG currentSyscall = 0;
-
-    BOOLEAN expectedIsSyscall = NipIsSyscallStub(ExpectedPrologue, Size, &expectedSyscall);
-    BOOLEAN currentIsSyscall = NipIsSyscallStub(CurrentPrologue, Size, &currentSyscall);
+    expectedIsSyscall = NipIsSyscallStub(ExpectedPrologue, Size, &expectedSyscall);
+    currentIsSyscall = NipIsSyscallStub(CurrentPrologue, Size, &currentSyscall);
 
     if (expectedIsSyscall) {
         if (!currentIsSyscall) {
@@ -1764,7 +2021,7 @@ Routine Description:
         }
 
         //
-        // Syscall stub exists but bytes differ - instruction patch
+        // Syscall stub exists but bytes differ — instruction patch
         //
         if (!NipValidateSyscallStub(CurrentPrologue, ExpectedPrologue, Size)) {
             return NiMod_InstructionPatch;
@@ -1901,7 +2158,7 @@ Routine Description:
 static
 _Use_decl_annotations_
 PNI_PROCESS_NTDLL
-NipFindProcessState(
+NipFindProcessStateLocked(
     _In_ PNI_MONITOR Monitor,
     _In_ HANDLE ProcessId
     )
@@ -1910,13 +2167,13 @@ NipFindProcessState(
 Routine Description:
 
     Finds an existing process state in the monitor's list.
+    CALLER MUST HOLD Monitor->ProcessLock (shared or exclusive).
+    Returns pointer valid only while lock is held.
 
 --*/
 {
     PLIST_ENTRY entry;
     PNI_PROCESS_NTDLL processState;
-
-    FltAcquirePushLockShared(&Monitor->ProcessLock);
 
     for (entry = Monitor->ProcessList.Flink;
          entry != &Monitor->ProcessList;
@@ -1925,12 +2182,9 @@ Routine Description:
         processState = CONTAINING_RECORD(entry, NI_PROCESS_NTDLL, ListEntry);
 
         if (processState->ProcessId == ProcessId) {
-            FltReleasePushLock(&Monitor->ProcessLock);
             return processState;
         }
     }
-
-    FltReleasePushLock(&Monitor->ProcessLock);
 
     return NULL;
 }
@@ -1948,20 +2202,20 @@ NipFreeProcessState(
 Routine Description:
 
     Frees a process state and all its function states.
+    State must already be removed from the monitor's process list.
 
 --*/
 {
     PLIST_ENTRY entry;
     PNI_FUNCTION_STATE functionState;
-    KIRQL oldIrql;
     LIST_ENTRY toFree;
 
     InitializeListHead(&toFree);
 
     //
-    // Collect all function states
+    // Collect all function states under push lock
     //
-    KeAcquireSpinLock(&State->FunctionLock, &oldIrql);
+    FltAcquirePushLockExclusive(&State->FunctionLock);
 
     while (!IsListEmpty(&State->FunctionList)) {
         entry = RemoveHeadList(&State->FunctionList);
@@ -1970,21 +2224,21 @@ Routine Description:
 
     State->FunctionCount = 0;
 
-    KeReleaseSpinLock(&State->FunctionLock, oldIrql);
+    FltReleasePushLock(&State->FunctionLock);
 
     //
-    // Free function states
+    // Free function states outside of lock
     //
     while (!IsListEmpty(&toFree)) {
         entry = RemoveHeadList(&toFree);
         functionState = CONTAINING_RECORD(entry, NI_FUNCTION_STATE, ListEntry);
-        ExFreeToNPagedLookasideList(&MonitorInternal->FunctionLookaside, functionState);
+        ExFreeToPagedLookasideList(&MonitorInternal->FunctionLookaside, functionState);
     }
 
     //
     // Free process state
     //
-    ExFreeToNPagedLookasideList(&MonitorInternal->ProcessLookaside, State);
+    ExFreeToPagedLookasideList(&MonitorInternal->ProcessLookaside, State);
 }
 
 
@@ -2010,6 +2264,8 @@ Routine Description:
     PVOID textBuffer = NULL;
     PVOID textAddress;
 
+    PAGED_CODE();
+
     RtlZeroMemory(Hash, 32);
 
     if (TextSize == 0 || TextSize > 16 * 1024 * 1024) {
@@ -2017,12 +2273,19 @@ Routine Description:
     }
 
     //
+    // ShadowStrikeComputeSha256 takes ULONG Length — validate no truncation
+    //
+    if (TextSize > MAXULONG) {
+        return STATUS_INTEGER_OVERFLOW;
+    }
+
+    //
     // Allocate buffer for .text section
     //
     textBuffer = ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
+        PagedPool,
         TextSize,
-        NI_POOL_TAG
+        NI_POOL_TAG_TEMP
         );
 
     if (textBuffer == NULL) {
@@ -2040,17 +2303,156 @@ Routine Description:
     status = NipReadProcessMemory(ProcessId, textAddress, textBuffer, TextSize);
 
     if (!NT_SUCCESS(status)) {
-        ShadowStrikeFreePoolWithTag(textBuffer, NI_POOL_TAG);
+        ShadowStrikeFreePoolWithTag(textBuffer, NI_POOL_TAG_TEMP);
         return status;
     }
 
     //
-    // Compute hash
+    // Compute hash (3 arguments: Buffer, Length, Hash)
     //
-    status = ShadowStrikeComputeSha256(textBuffer, TextSize, Hash, 32);
+    status = ShadowStrikeComputeSha256(textBuffer, (ULONG)TextSize, Hash);
 
-    ShadowStrikeFreePoolWithTag(textBuffer, NI_POOL_TAG);
+    ShadowStrikeFreePoolWithTag(textBuffer, NI_POOL_TAG_TEMP);
 
     return status;
+}
+
+
+//=============================================================================
+// Internal Functions - Disk-based NTDLL Capture
+//=============================================================================
+
+static
+_Use_decl_annotations_
+NTSTATUS
+NipReadNtdllFromDisk(
+    _Out_ PVOID* Buffer,
+    _Out_ PSIZE_T BufferSize
+    )
+/*++
+
+Routine Description:
+
+    Reads ntdll.dll from the known system path on disk.
+    This provides a trusted, unhookable baseline for integrity comparison.
+
+    Uses ZwOpenFile / ZwReadFile at PASSIVE_LEVEL.
+
+--*/
+{
+    NTSTATUS status;
+    UNICODE_STRING filePath;
+    OBJECT_ATTRIBUTES objAttr;
+    IO_STATUS_BLOCK ioStatusBlock;
+    HANDLE fileHandle = NULL;
+    FILE_STANDARD_INFORMATION fileInfo;
+    PVOID buffer = NULL;
+    LARGE_INTEGER fileSize;
+    LARGE_INTEGER byteOffset;
+
+    PAGED_CODE();
+
+    *Buffer = NULL;
+    *BufferSize = 0;
+
+    RtlInitUnicodeString(&filePath, L"\\SystemRoot\\System32\\ntdll.dll");
+
+    InitializeObjectAttributes(
+        &objAttr,
+        &filePath,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+        NULL,
+        NULL
+        );
+
+    status = ZwOpenFile(
+        &fileHandle,
+        FILE_READ_DATA | SYNCHRONIZE,
+        &objAttr,
+        &ioStatusBlock,
+        FILE_SHARE_READ,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE
+        );
+
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    //
+    // Query file size
+    //
+    status = ZwQueryInformationFile(
+        fileHandle,
+        &ioStatusBlock,
+        &fileInfo,
+        sizeof(fileInfo),
+        FileStandardInformation
+        );
+
+    if (!NT_SUCCESS(status)) {
+        ZwClose(fileHandle);
+        return status;
+    }
+
+    fileSize = fileInfo.EndOfFile;
+
+    //
+    // Validate file size is sane
+    //
+    if (fileSize.QuadPart == 0 || (ULONGLONG)fileSize.QuadPart > NI_MAX_NTDLL_SIZE) {
+        ZwClose(fileHandle);
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    //
+    // Allocate buffer (paged pool — only accessed at PASSIVE_LEVEL)
+    //
+    buffer = ShadowStrikeAllocatePoolWithTag(
+        PagedPool,
+        (SIZE_T)fileSize.QuadPart,
+        NI_POOL_TAG_NTDLL
+        );
+
+    if (buffer == NULL) {
+        ZwClose(fileHandle);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
+    // Read the entire file
+    //
+    byteOffset.QuadPart = 0;
+
+    status = ZwReadFile(
+        fileHandle,
+        NULL,
+        NULL,
+        NULL,
+        &ioStatusBlock,
+        buffer,
+        (ULONG)fileSize.QuadPart,
+        &byteOffset,
+        NULL
+        );
+
+    ZwClose(fileHandle);
+
+    if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreePoolWithTag(buffer, NI_POOL_TAG_NTDLL);
+        return status;
+    }
+
+    //
+    // Verify we read the expected amount
+    //
+    if (ioStatusBlock.Information != (ULONG_PTR)fileSize.QuadPart) {
+        ShadowStrikeFreePoolWithTag(buffer, NI_POOL_TAG_NTDLL);
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
+
+    *Buffer = buffer;
+    *BufferSize = (SIZE_T)fileSize.QuadPart;
+
+    return STATUS_SUCCESS;
 }
 

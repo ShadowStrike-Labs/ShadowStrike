@@ -6,42 +6,8 @@
  * @file KtmMonitor.c
  * @brief Enterprise-grade ransomware detection via Kernel Transaction Manager.
  *
- * Implements CrowdStrike Falcon-level protection against ransomware families
- * that use transacted file operations (TxF) for atomic encryption:
- * - LockBit 2.0/3.0
- * - BlackCat/ALPHV
- * - REvil/Sodinokibi
- * - Conti
- * - DarkSide
- * - Hive
- *
- * Key Capabilities:
- * - Transaction object monitoring (ObRegisterCallbacks)
- * - High-velocity file operation detection (50 files/sec threshold)
- * - Behavioral threat scoring
- * - Volume shadow copy deletion detection
- * - Transacted registry persistence monitoring
- * - LRU cache with reference counting
- * - Real-time alerting
- * - BSOD-safe implementation
- *
- * BSOD Safety Guarantees:
- * - Atomic initialization (no race conditions)
- * - Proper lock hierarchy (no deadlocks)
- * - Exception handling in callbacks
- * - Reference counting (no use-after-free)
- * - Transaction cleanup on process exit
- * - SECURITY HARDENING: All critical vulnerabilities patched (v2.1.0)
- *
- * Security Fixes (v2.1.0):
- * - Fixed use-after-free in cleanup (reference draining)
- * - Fixed race condition in reference counting
- * - Fixed integer overflow in ransomware detection
- * - Added reference validation before increment
- * - Improved concurrent cleanup safety
- *
  * @author ShadowStrike Security Team
- * @version 2.1.0 (Enterprise Edition - Security Hardened)
+ * @version 3.1.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -52,18 +18,12 @@
 // GLOBAL STATE
 // ============================================================================
 
-/**
- * @brief Global KTM monitor state.
- */
 SHADOW_KTM_MONITOR_STATE g_KtmMonitorState = { 0 };
 
 // ============================================================================
 // CONSTANTS
 // ============================================================================
 
-/**
- * @brief Ransomware target file extensions (case-insensitive)
- */
 static const WCHAR* g_RansomwareTargetExtensions[] = {
     L".doc", L".docx", L".xls", L".xlsx", L".ppt", L".pptx",
     L".pdf", L".txt", L".jpg", L".png", L".mp4", L".avi",
@@ -73,9 +33,6 @@ static const WCHAR* g_RansomwareTargetExtensions[] = {
     NULL
 };
 
-/**
- * @brief Suspicious process names that may use transactions
- */
 static const WCHAR* g_SuspiciousProcessNames[] = {
     L"powershell.exe",
     L"cmd.exe",
@@ -88,59 +45,283 @@ static const WCHAR* g_SuspiciousProcessNames[] = {
     NULL
 };
 
-/**
- * @brief Reference drain timeout per iteration (100ns units)
- */
-#define SHADOW_REFCOUNT_DRAIN_INTERVAL_MS 100
-#define SHADOW_REFCOUNT_DRAIN_MAX_ITERATIONS 50  // 5 seconds total
-
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
 
+static BOOLEAN
+ShadowIsSuspiciousProcessCached(
+    _In_ PCWSTR ProcessName
+    );
+
+static NTSTATUS
+ShadowCreateKtmCommunicationPort(
+    _In_ PFLT_FILTER FilterHandle
+    );
+
+#define SHADOW_KTM_PORT_NAME L"\\ShadowStrikeKtmPort"
+
+// ============================================================================
+// REFERENCE COUNTING — CAS LOOP IMPLEMENTATION
+// ============================================================================
+
+/**
+ * @brief Acquire additional reference via atomic CAS loop.
+ *
+ * Returns FALSE if refcount is <= 0 or is the DESTROYING sentinel,
+ * meaning the transaction is being freed and must not be touched.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+ShadowReferenceKtmTransaction(
+    _In_ PSHADOW_KTM_TRANSACTION Transaction
+    )
+{
+    LONG oldRefCount;
+    LONG newRefCount;
+
+    if (Transaction == NULL) {
+        return FALSE;
+    }
+
+    for (;;) {
+        oldRefCount = Transaction->ReferenceCount;
+
+        if (oldRefCount <= 0 || oldRefCount == SHADOW_KTM_REFCOUNT_DESTROYING) {
+            return FALSE;
+        }
+
+        newRefCount = oldRefCount + 1;
+
+        if (InterlockedCompareExchange(
+                &Transaction->ReferenceCount,
+                newRefCount,
+                oldRefCount) == oldRefCount) {
+            return TRUE;
+        }
+
+        //
+        // CAS failed — another thread modified the refcount. Retry.
+        //
+    }
+}
+
+/**
+ * @brief Release transaction reference.
+ *
+ * On final release (refcount → 0), sets DESTROYING sentinel and frees.
+ * On detected underflow or double-free, logs and leaks rather than
+ * crashing the customer's machine.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ShadowReleaseKtmTransaction(
+    _In_ PSHADOW_KTM_TRANSACTION Transaction
+    )
+{
+    LONG newRefCount;
+
+    if (Transaction == NULL) {
+        return;
+    }
+
+    //
+    // Validate magic before touching refcount. If magic is wrong,
+    // we are operating on freed / corrupted memory — do not touch it.
+    //
+    if (Transaction->Magic != SHADOW_KTM_TRANSACTION_MAGIC) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] KTM: Release called on transaction with bad magic "
+                   "(0x%08lX != 0x%08lX) — memory corruption suspected, leaking\n",
+                   Transaction->Magic, SHADOW_KTM_TRANSACTION_MAGIC);
+        InterlockedIncrement64(&g_KtmMonitorState.Stats.RefCountRaces);
+        return;
+    }
+
+    //
+    // Pre-check: if refcount is already <= 0 this is a double-free.
+    // Log and leak — never crash the customer's machine for a refcount bug.
+    //
+    if (Transaction->ReferenceCount <= 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] KTM: Double-release detected (refcount=%ld, "
+                   "GUID={%08lX-...}). Leaking to prevent use-after-free.\n",
+                   Transaction->ReferenceCount,
+                   Transaction->TransactionGuid.Data1);
+        InterlockedIncrement64(&g_KtmMonitorState.Stats.RefCountRaces);
+        return;
+    }
+
+    newRefCount = InterlockedDecrement(&Transaction->ReferenceCount);
+
+    if (newRefCount == 0) {
+        //
+        // Set DESTROYING sentinel so concurrent ShadowReferenceKtmTransaction
+        // callers will see it and back off before we actually free.
+        //
+        InterlockedExchange(&Transaction->ReferenceCount, SHADOW_KTM_REFCOUNT_DESTROYING);
+
+        //
+        // Poison the magic to detect use-after-free in debug builds.
+        //
+        Transaction->Magic = 0xDEADBEEF;
+
+        ExFreePoolWithTag(Transaction, SHADOW_KTM_TRANSACTION_TAG);
+    }
+    else if (newRefCount < 0) {
+        //
+        // Underflow race — restore and leak. Do NOT bugcheck.
+        //
+        InterlockedIncrement(&Transaction->ReferenceCount);
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] KTM: Refcount underflow after decrement "
+                   "(newRefCount=%ld). Leaking transaction.\n", newRefCount);
+        InterlockedIncrement64(&g_KtmMonitorState.Stats.RefCountRaces);
+    }
+}
+
+// ============================================================================
+// VALIDATION
+// ============================================================================
+
+/**
+ * @brief Validate transaction structure integrity.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+ShadowValidateKtmTransaction(
+    _In_ PSHADOW_KTM_TRANSACTION Transaction
+    )
+{
+    if (Transaction == NULL) {
+        return FALSE;
+    }
+
+    if (Transaction->Magic != SHADOW_KTM_TRANSACTION_MAGIC) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] KTM: Transaction magic mismatch "
+                   "(0x%08lX != 0x%08lX)\n",
+                   Transaction->Magic, SHADOW_KTM_TRANSACTION_MAGIC);
+        return FALSE;
+    }
+
+    if (Transaction->ReferenceCount <= 0) {
+        return FALSE;
+    }
+
+    if (Transaction->ThreatScore < 0 || Transaction->ThreatScore > 100) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+// ============================================================================
+// PROCESS NAME HELPER (PASSIVE_LEVEL ONLY)
+// ============================================================================
+
+/**
+ * @brief Get process image name. Allocates from NonPagedPool so the
+ *        returned buffer is safe to use at any IRQL for reads.
+ *        Caller frees ImageName->Buffer with SHADOW_KTM_STRING_TAG.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowGetProcessImageName(
     _In_ HANDLE ProcessId,
     _Out_ PUNICODE_STRING ImageName
-    );
+    )
+{
+    NTSTATUS status;
+    PEPROCESS process = NULL;
+    PUNICODE_STRING processImageName = NULL;
 
-BOOLEAN
-ShadowIsRansomwareTargetExtension(
-    _In_ PUNICODE_STRING FilePath
-    );
+    ImageName->Buffer = NULL;
+    ImageName->Length = 0;
+    ImageName->MaximumLength = 0;
 
-BOOLEAN
-ShadowIsSuspiciousProcess(
-    _In_ HANDLE ProcessId
-    );
+    status = PsLookupProcessByProcessId(ProcessId, &process);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
 
-VOID
-ShadowEvictLruTransaction(
-    VOID
-    );
+    status = SeLocateProcessImageName(process, &processImageName);
+    if (NT_SUCCESS(status) && processImageName != NULL && processImageName->Buffer != NULL) {
 
-VOID
-ShadowCleanupTransactionEntries(
-    VOID
-    );
+        ImageName->MaximumLength = processImageName->Length + sizeof(WCHAR);
+        ImageName->Buffer = (PWCH)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
+            ImageName->MaximumLength,
+            SHADOW_KTM_STRING_TAG
+        );
 
-VOID
-ShadowCleanupKtmAlertQueue(
-    VOID
-    );
+        if (ImageName->Buffer != NULL) {
+            RtlCopyUnicodeString(ImageName, processImageName);
+            //
+            // Guarantee null-termination for safe %ws usage
+            //
+            ImageName->Buffer[ImageName->Length / sizeof(WCHAR)] = L'\0';
+        } else {
+            ImageName->MaximumLength = 0;
+            status = STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        ExFreePool(processImageName);
+    }
+
+    ObDereferenceObject(process);
+    return status;
+}
+
+/**
+ * @brief Check if cached process name matches a suspicious process.
+ *        Uses only the embedded ProcessName field — safe at any IRQL.
+ */
+static BOOLEAN
+ShadowIsSuspiciousProcessCached(
+    _In_ PCWSTR ProcessName
+    )
+{
+    ULONG i;
+    UNICODE_STRING nameStr;
+    UNICODE_STRING suspiciousStr;
+
+    if (ProcessName == NULL || ProcessName[0] == L'\0') {
+        return FALSE;
+    }
+
+    RtlInitUnicodeString(&nameStr, ProcessName);
+
+    for (i = 0; g_SuspiciousProcessNames[i] != NULL; i++) {
+        RtlInitUnicodeString(&suspiciousStr, g_SuspiciousProcessNames[i]);
+
+        //
+        // Case-insensitive substring search using UNICODE_STRING APIs.
+        // Check if the suspicious name appears anywhere in the path.
+        //
+        if (nameStr.Length >= suspiciousStr.Length) {
+            USHORT maxOffset = (nameStr.Length - suspiciousStr.Length) / sizeof(WCHAR);
+            for (USHORT offset = 0; offset <= maxOffset; offset++) {
+                UNICODE_STRING sub;
+                sub.Buffer = nameStr.Buffer + offset;
+                sub.Length = suspiciousStr.Length;
+                sub.MaximumLength = suspiciousStr.Length;
+
+                if (RtlEqualUnicodeString(&sub, &suspiciousStr, TRUE)) {
+                    return TRUE;
+                }
+            }
+        }
+    }
+
+    return FALSE;
+}
 
 // ============================================================================
 // COMMUNICATION PORT IMPLEMENTATION
 // ============================================================================
 
-/**
- * @brief KTM communication port name
- */
-#define SHADOW_KTM_PORT_NAME L"\\ShadowStrikeKtmPort"
-
-/**
- * @brief Connect notify callback for KTM port
- */
 NTSTATUS
 ShadowKtmPortConnectNotify(
     _In_ PFLT_PORT ClientPort,
@@ -163,15 +344,16 @@ ShadowKtmPortConnectNotify(
     }
 
     //
-    // Accept only one client connection for KTM alerts
+    // MaxConnections=1 in FltCreateCommunicationPort provides the primary
+    // guard. This check is defense-in-depth.
     //
-    if (state->ClientPort != NULL) {
+    if (InterlockedCompareExchangePointer(
+            (PVOID*)&state->ClientPort, ClientPort, NULL) != NULL) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] KTM port: Rejecting additional connection\n");
         return STATUS_CONNECTION_COUNT_LIMIT;
     }
 
-    state->ClientPort = ClientPort;
     *ConnectionPortCookie = state;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -181,9 +363,6 @@ ShadowKtmPortConnectNotify(
     return STATUS_SUCCESS;
 }
 
-/**
- * @brief Disconnect notify callback for KTM port
- */
 VOID
 ShadowKtmPortDisconnectNotify(
     _In_opt_ PVOID ConnectionCookie
@@ -203,7 +382,9 @@ ShadowKtmPortDisconnectNotify(
 }
 
 /**
- * @brief Message notify callback for KTM port
+ * @brief Message notify callback for KTM port.
+ *
+ * The OutputBuffer comes from user mode. We must probe it before writing.
  */
 NTSTATUS
 ShadowKtmPortMessageNotify(
@@ -229,11 +410,19 @@ ShadowKtmPortMessageNotify(
     }
 
     //
-    // Handle statistics query
+    // Handle statistics query — probe the user-mode output buffer first.
     //
     if (OutputBuffer != NULL && OutputBufferLength >= sizeof(SHADOW_KTM_STATISTICS)) {
-        ShadowGetKtmStatistics((PSHADOW_KTM_STATISTICS)OutputBuffer);
-        *ReturnOutputBufferLength = sizeof(SHADOW_KTM_STATISTICS);
+        __try {
+            ProbeForWrite(OutputBuffer, sizeof(SHADOW_KTM_STATISTICS), sizeof(ULONG));
+            ShadowGetKtmStatistics((PSHADOW_KTM_STATISTICS)OutputBuffer);
+            *ReturnOutputBufferLength = sizeof(SHADOW_KTM_STATISTICS);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] KTM port: Exception probing output buffer: 0x%X\n",
+                       GetExceptionCode());
+            return GetExceptionCode();
+        }
         return STATUS_SUCCESS;
     }
 
@@ -241,16 +430,9 @@ ShadowKtmPortMessageNotify(
 }
 
 /**
- * @brief Create KTM communication port for user-mode alerts.
- *
- * Creates a dedicated filter communication port for real-time ransomware
- * alerts to the user-mode service.
- *
- * @param FilterHandle  Filter handle from FltRegisterFilter
- *
- * @return STATUS_SUCCESS on success
+ * @brief Create KTM communication port with restricted DACL.
  */
-NTSTATUS
+static NTSTATUS
 ShadowCreateKtmCommunicationPort(
     _In_ PFLT_FILTER FilterHandle
     )
@@ -267,14 +449,8 @@ ShadowCreateKtmCommunicationPort(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Store filter handle for later use
-    //
     state->FilterHandle = FilterHandle;
 
-    //
-    // Build security descriptor allowing SYSTEM and Administrators
-    //
     status = FltBuildDefaultSecurityDescriptor(
         &securityDescriptor,
         FLT_PORT_ALL_ACCESS
@@ -296,18 +472,15 @@ ShadowCreateKtmCommunicationPort(
         securityDescriptor
     );
 
-    //
-    // Create the communication port
-    //
     status = FltCreateCommunicationPort(
         FilterHandle,
         &state->ServerPort,
         &objectAttributes,
-        state,                          // ServerPortCookie
+        state,
         ShadowKtmPortConnectNotify,
         ShadowKtmPortDisconnectNotify,
         ShadowKtmPortMessageNotify,
-        1                               // MaxConnections
+        1
     );
 
     FltFreeSecurityDescriptor(securityDescriptor);
@@ -331,9 +504,7 @@ ShadowCreateKtmCommunicationPort(
 // PUBLIC FUNCTIONS
 // ============================================================================
 
-/**
- * @brief Initialize KTM monitoring subsystem.
- */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowInitializeKtmMonitor(
     _In_ PFLT_FILTER FilterHandle
@@ -346,10 +517,6 @@ ShadowInitializeKtmMonitor(
 
     PAGED_CODE();
 
-    //
-    // CRITICAL FIX: Atomic initialization to prevent race conditions
-    // This is the CrowdStrike Falcon approach
-    //
     previousState = InterlockedCompareExchange(
         &state->InitializationState,
         KTM_STATE_INITIALIZING,
@@ -363,10 +530,7 @@ ShadowInitializeKtmMonitor(
     }
 
     if (previousState == KTM_STATE_INITIALIZING) {
-        //
-        // Another thread is currently initializing - wait for it
-        //
-        sleepInterval.QuadPart = -((LONGLONG)50 * 10000LL); // 50ms
+        sleepInterval.QuadPart = -((LONGLONG)50 * 10000LL);
 
         for (ULONG i = 0; i < 100; i++) {
             KeDelayExecutionThread(KernelMode, FALSE, &sleepInterval);
@@ -382,7 +546,7 @@ ShadowInitializeKtmMonitor(
     }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Initializing KTM Transaction Monitor (Enterprise Edition v2.1)\n");
+               "[ShadowStrike] Initializing KTM Transaction Monitor v3.1\n");
 
     //
     // Initialize synchronization
@@ -391,6 +555,28 @@ ShadowInitializeKtmMonitor(
     state->LockInitialized = TRUE;
 
     KeInitializeSpinLock(&state->AlertLock);
+    KeInitializeSpinLock(&state->StatsLock);
+
+    //
+    // Initialize lookaside lists for high-performance allocation
+    //
+    ExInitializeNPagedLookasideList(
+        &state->TransactionLookaside,
+        NULL, NULL, 0,
+        sizeof(SHADOW_KTM_TRANSACTION),
+        SHADOW_KTM_TRANSACTION_TAG,
+        0
+    );
+    state->TransactionLookasideInitialized = TRUE;
+
+    ExInitializeNPagedLookasideList(
+        &state->AlertLookaside,
+        NULL, NULL, 0,
+        sizeof(SHADOW_KTM_ALERT),
+        SHADOW_KTM_ALERT_TAG,
+        0
+    );
+    state->AlertLookasideInitialized = TRUE;
 
     //
     // Initialize transaction tracking list
@@ -407,7 +593,7 @@ ShadowInitializeKtmMonitor(
     state->MaxAlerts = SHADOW_MAX_KTM_ALERT_QUEUE;
 
     //
-    // Initialize configuration (default: monitoring enabled, blocking disabled)
+    // Configuration defaults
     //
     state->MonitoringEnabled = TRUE;
     state->BlockingEnabled = FALSE;
@@ -415,15 +601,8 @@ ShadowInitializeKtmMonitor(
     state->RateLimitingEnabled = TRUE;
     state->ThreatThreshold = SHADOW_KTM_THREAT_THRESHOLD;
     state->RansomwareThreshold = SHADOW_RANSOMWARE_THRESHOLD_FILES_PER_SEC;
-
-    //
-    // Convert rate limit window to 100ns units
-    //
     state->RateLimitWindow.QuadPart = SHADOW_RANSOMWARE_DETECTION_WINDOW_MS * 10000LL;
 
-    //
-    // Zero statistics
-    //
     RtlZeroMemory(&state->Stats, sizeof(SHADOW_KTM_STATISTICS));
 
     //
@@ -437,18 +616,12 @@ ShadowInitializeKtmMonitor(
     }
 
     //
-    // ENTERPRISE IMPLEMENTATION: Create dedicated KTM alert communication port
-    // This enables real-time ransomware alerts to user-mode service
+    // Create communication port (non-fatal if it fails)
     //
     status = ShadowCreateKtmCommunicationPort(FilterHandle);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] KTM communication port creation failed: 0x%X (alerts will be queued internally)\n",
-                   status);
-        //
-        // Non-fatal: Continue without real-time communication
-        // Alerts will be queued and retrieved via IOCTL
-        //
+                   "[ShadowStrike] KTM comm port creation failed: 0x%X (non-fatal)\n", status);
         state->ServerPort = NULL;
         state->ClientPort = NULL;
         state->CommunicationPortOpen = FALSE;
@@ -459,27 +632,21 @@ ShadowInitializeKtmMonitor(
     //
     KeQuerySystemTime(&state->InitTime);
     state->Initialized = TRUE;
-    state->ShuttingDown = FALSE;
-
+    InterlockedExchange(&state->ShuttingDown, FALSE);
     InterlockedExchange(&state->InitializationState, KTM_STATE_INITIALIZED);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] KTM Transaction Monitor initialized successfully (Security Hardened)\n");
+               "[ShadowStrike] KTM Transaction Monitor initialized successfully\n");
 
     return STATUS_SUCCESS;
 
 cleanup:
-    //
-    // Cleanup on failure
-    //
     InterlockedExchange(&state->InitializationState, KTM_STATE_UNINITIALIZED);
     ShadowCleanupKtmMonitor();
     return status;
 }
 
-/**
- * @brief Cleanup KTM monitoring subsystem.
- */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowCleanupKtmMonitor(
     VOID
@@ -493,46 +660,49 @@ ShadowCleanupKtmMonitor(
                "[ShadowStrike] Cleaning up KTM Transaction Monitor\n");
 
     //
-    // Mark as shutting down
+    // Signal shutdown
     //
-    if (state->LockInitialized) {
-        FsRtlAcquirePushLockExclusive(&state->Lock);
-        state->ShuttingDown = TRUE;
-        InterlockedExchange(&state->InitializationState, KTM_STATE_UNINITIALIZED);
-        FsRtlReleasePushLockExclusive(&state->Lock);
-    } else {
-        state->ShuttingDown = TRUE;
-        InterlockedExchange(&state->InitializationState, KTM_STATE_UNINITIALIZED);
-    }
+    InterlockedExchange(&state->ShuttingDown, TRUE);
+    InterlockedExchange(&state->InitializationState, KTM_STATE_SHUTTING_DOWN);
 
     //
-    // Unregister callbacks
+    // Unregister callbacks FIRST — no new callbacks after this returns
     //
     ShadowUnregisterTransactionCallbacks();
 
     //
-    // Cleanup all transaction entries
+    // Now safe to drain transaction entries
     //
     ShadowCleanupTransactionEntries();
-
-    //
-    // Cleanup alert queue
-    //
     ShadowCleanupKtmAlertQueue();
 
     //
-    // Close communication port
+    // Close communication ports — server port first to stop new connections,
+    // then client port.
     //
     if (state->ServerPort != NULL) {
         FltCloseCommunicationPort(state->ServerPort);
         state->ServerPort = NULL;
     }
-    //
-    // Close communication port properly using stored filter handle
-    //
+
     if (state->ClientPort != NULL) {
         FltCloseClientPort(state->FilterHandle, &state->ClientPort);
         state->ClientPort = NULL;
+    }
+
+    state->CommunicationPortOpen = FALSE;
+
+    //
+    // Delete lookaside lists
+    //
+    if (state->TransactionLookasideInitialized) {
+        ExDeleteNPagedLookasideList(&state->TransactionLookaside);
+        state->TransactionLookasideInitialized = FALSE;
+    }
+
+    if (state->AlertLookasideInitialized) {
+        ExDeleteNPagedLookasideList(&state->AlertLookaside);
+        state->AlertLookasideInitialized = FALSE;
     }
 
     //
@@ -543,24 +713,18 @@ ShadowCleanupKtmMonitor(
         state->LockInitialized = FALSE;
     }
 
-    //
-    // Clear state
-    //
     state->Initialized = FALSE;
+    InterlockedExchange(&state->InitializationState, KTM_STATE_UNINITIALIZED);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] KTM Transaction Monitor cleaned up\n");
 }
 
-/**
- * @brief Register transaction object callbacks.
- *
- * ENTERPRISE IMPLEMENTATION: Full ObRegisterCallbacks registration for
- * TmTx (Transaction) and TmRm (Resource Manager) object types with
- * dynamic type resolution for cross-version compatibility.
- *
- * Supports Windows 7 SP1 through Windows 11 23H2.
- */
+// ============================================================================
+// CALLBACK REGISTRATION
+// ============================================================================
+
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowRegisterTransactionCallbacks(
     VOID
@@ -573,6 +737,11 @@ ShadowRegisterTransactionCallbacks(
     PSHADOW_KTM_MONITOR_STATE state = &g_KtmMonitorState;
     POBJECT_TYPE tmTxObjectType = NULL;
     POBJECT_TYPE tmRmObjectType = NULL;
+    UNICODE_STRING tmTxTypeName;
+    UNICODE_STRING tmRmTypeName;
+    PVOID* pTmTxType;
+    PVOID* pTmRmType;
+    USHORT operationCount;
 
     PAGED_CODE();
 
@@ -580,76 +749,38 @@ ShadowRegisterTransactionCallbacks(
         return STATUS_ALREADY_REGISTERED;
     }
 
-    //
-    // ENTERPRISE IMPLEMENTATION: Dynamic object type resolution
-    // TmTx and TmRm object types are not exported on all Windows versions
-    // We use MmGetSystemRoutineAddress to resolve them dynamically
-    //
-    UNICODE_STRING tmTxTypeName;
-    UNICODE_STRING tmRmTypeName;
-
     RtlInitUnicodeString(&tmTxTypeName, L"TmTransactionObjectType");
     RtlInitUnicodeString(&tmRmTypeName, L"TmResourceManagerObjectType");
 
-    //
-    // Attempt to resolve transaction object type
-    //
-    PVOID* pTmTxType = (PVOID*)MmGetSystemRoutineAddress(&tmTxTypeName);
-    PVOID* pTmRmType = (PVOID*)MmGetSystemRoutineAddress(&tmRmTypeName);
+    pTmTxType = (PVOID*)MmGetSystemRoutineAddress(&tmTxTypeName);
+    pTmRmType = (PVOID*)MmGetSystemRoutineAddress(&tmRmTypeName);
 
     if (pTmTxType != NULL && *pTmTxType != NULL) {
         tmTxObjectType = (POBJECT_TYPE)*pTmTxType;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                   "[ShadowStrike] Resolved TmTransactionObjectType: %p\n", tmTxObjectType);
     }
 
     if (pTmRmType != NULL && *pTmRmType != NULL) {
         tmRmObjectType = (POBJECT_TYPE)*pTmRmType;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                   "[ShadowStrike] Resolved TmResourceManagerObjectType: %p\n", tmRmObjectType);
     }
 
-    //
-    // If transaction types are not available, use fallback monitoring
-    // This happens on older Windows versions or Server Core installations
-    //
     if (tmTxObjectType == NULL) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Transaction object types not available on this OS - "
-                   "using minifilter-based transaction monitoring (fallback mode)\n");
-
+                   "[ShadowStrike] TmTx type not available — fallback mode\n");
         state->TransactionCallbackHandle = NULL;
         state->CallbacksRegistered = FALSE;
-
-        //
-        // Return success - fallback mode is acceptable
-        // Transaction monitoring will rely on minifilter callbacks instead
-        //
         return STATUS_SUCCESS;
     }
 
-    //
-    // Build operation registration array
-    //
     RtlZeroMemory(operationRegistration, sizeof(operationRegistration));
 
-    //
-    // Register for Transaction object (TmTx) operations
-    //
     operationRegistration[0].ObjectType = tmTxObjectType;
     operationRegistration[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
     operationRegistration[0].PreOperation = ShadowTransactionPreOperationCallback;
     operationRegistration[0].PostOperation = ShadowTransactionPostOperationCallback;
 
-    //
-    // Determine registration count based on available types
-    //
-    USHORT operationCount = 1;
+    operationCount = 1;
 
     if (tmRmObjectType != NULL) {
-        //
-        // Register for Resource Manager object (TmRm) operations
-        //
         operationRegistration[1].ObjectType = tmRmObjectType;
         operationRegistration[1].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
         operationRegistration[1].PreOperation = ShadowTransactionPreOperationCallback;
@@ -657,10 +788,6 @@ ShadowRegisterTransactionCallbacks(
         operationCount = 2;
     }
 
-    //
-    // Setup callback registration
-    // Altitude 385200 is in the FSFilter Anti-Virus range (320000-389999)
-    //
     RtlInitUnicodeString(&altitude, L"385200");
 
     RtlZeroMemory(&callbackRegistration, sizeof(callbackRegistration));
@@ -670,48 +797,29 @@ ShadowRegisterTransactionCallbacks(
     callbackRegistration.RegistrationContext = state;
     callbackRegistration.OperationRegistration = operationRegistration;
 
-    //
-    // Register callbacks
-    //
     status = ObRegisterCallbacks(
         &callbackRegistration,
         &state->TransactionCallbackHandle
     );
 
     if (!NT_SUCCESS(status)) {
-        //
-        // ObRegisterCallbacks can fail for several reasons:
-        // - Driver not signed with valid certificate (STATUS_ACCESS_DENIED)
-        // - Object type doesn't support callbacks (STATUS_NOT_SUPPORTED)
-        // - System resource exhaustion (STATUS_INSUFFICIENT_RESOURCES)
-        //
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] ObRegisterCallbacks failed: 0x%X - "
-                   "falling back to minifilter transaction monitoring\n", status);
-
+                   "[ShadowStrike] ObRegisterCallbacks failed: 0x%X — fallback mode\n", status);
         state->TransactionCallbackHandle = NULL;
         state->CallbacksRegistered = FALSE;
-
-        //
-        // Return success - fallback mode is acceptable
-        //
         return STATUS_SUCCESS;
     }
 
     state->CallbacksRegistered = TRUE;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Transaction object callbacks registered successfully "
-               "(TmTx=%s, TmRm=%s)\n",
-               tmTxObjectType != NULL ? "YES" : "NO",
+               "[ShadowStrike] Transaction callbacks registered (TmTx=YES, TmRm=%s)\n",
                tmRmObjectType != NULL ? "YES" : "NO");
 
     return STATUS_SUCCESS;
 }
 
-/**
- * @brief Unregister transaction object callbacks.
- */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowUnregisterTransactionCallbacks(
     VOID
@@ -731,9 +839,17 @@ ShadowUnregisterTransactionCallbacks(
     }
 }
 
+// ============================================================================
+// TRANSACTION TRACKING
+// ============================================================================
+
 /**
- * @brief Track new transaction.
+ * @brief Track a new transaction.
+ *
+ * Allocates via lookaside list, sets magic, captures process name at
+ * PASSIVE_LEVEL, inserts into LRU list.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowTrackTransaction(
     _In_ GUID TransactionGuid,
@@ -741,10 +857,12 @@ ShadowTrackTransaction(
     _Outptr_ PSHADOW_KTM_TRANSACTION* Transaction
     )
 {
-    NTSTATUS status;
     PSHADOW_KTM_TRANSACTION transaction = NULL;
     PSHADOW_KTM_MONITOR_STATE state = &g_KtmMonitorState;
     UNICODE_STRING imageN = { 0 };
+    NTSTATUS status;
+
+    PAGED_CODE();
 
     *Transaction = NULL;
 
@@ -753,13 +871,19 @@ ShadowTrackTransaction(
     }
 
     //
-    // Allocate transaction tracking structure
+    // Allocate from lookaside list (NonPagedPool, pre-sized)
     //
-    transaction = (PSHADOW_KTM_TRANSACTION)ExAllocatePoolWithTag(
-        NonPagedPool,
-        sizeof(SHADOW_KTM_TRANSACTION),
-        SHADOW_KTM_TRANSACTION_TAG
-    );
+    if (state->TransactionLookasideInitialized) {
+        transaction = (PSHADOW_KTM_TRANSACTION)ExAllocateFromNPagedLookasideList(
+            &state->TransactionLookaside
+        );
+    } else {
+        transaction = (PSHADOW_KTM_TRANSACTION)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
+            sizeof(SHADOW_KTM_TRANSACTION),
+            SHADOW_KTM_TRANSACTION_TAG
+        );
+    }
 
     if (transaction == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -768,18 +892,20 @@ ShadowTrackTransaction(
     RtlZeroMemory(transaction, sizeof(SHADOW_KTM_TRANSACTION));
 
     //
-    // Initialize transaction entry
+    // Set magic for validation
     //
+    transaction->Magic = SHADOW_KTM_TRANSACTION_MAGIC;
     RtlCopyMemory(&transaction->TransactionGuid, &TransactionGuid, sizeof(GUID));
     transaction->ProcessId = ProcessId;
     transaction->ReferenceCount = 1;
+    transaction->RemovedFromList = FALSE;
 
     KeQuerySystemTime(&transaction->CreateTime);
     transaction->LastActivityTime = transaction->CreateTime;
     transaction->RateWindowStart = transaction->CreateTime;
 
     //
-    // Get process name
+    // Capture process name at PASSIVE_LEVEL (safe here)
     //
     status = ShadowGetProcessImageName(ProcessId, &imageN);
     if (NT_SUCCESS(status) && imageN.Buffer != NULL) {
@@ -794,14 +920,11 @@ ShadowTrackTransaction(
     }
 
     //
-    // Add to tracking list
+    // Insert into LRU list
     //
     FsRtlAcquirePushLockExclusive(&state->Lock);
 
-    //
-    // Check if cache is full - evict LRU if needed
-    //
-    if (state->TransactionCount >= (LONG)state->MaxTransactions) {
+    if ((ULONG)state->TransactionCount >= state->MaxTransactions) {
         ShadowEvictLruTransaction();
     }
 
@@ -810,9 +933,6 @@ ShadowTrackTransaction(
 
     FsRtlReleasePushLockExclusive(&state->Lock);
 
-    //
-    // Update statistics
-    //
     InterlockedIncrement64(&state->Stats.TotalTransactions);
 
     *Transaction = transaction;
@@ -820,11 +940,12 @@ ShadowTrackTransaction(
 }
 
 /**
- * @brief Find existing transaction.
+ * @brief Find existing transaction by GUID.
  *
- * SECURITY FIX (v2.1.0): Added reference count validation to prevent race condition
- * where transaction could be freed between lookup and reference increment.
+ * Uses CAS-based reference increment under exclusive lock to prevent
+ * use-after-free.
  */
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 ShadowFindKtmTransaction(
     _In_ GUID TransactionGuid,
@@ -842,47 +963,23 @@ ShadowFindKtmTransaction(
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    //
-    // CRITICAL FIX: Use EXCLUSIVE lock when modifying list (moving to front)
-    //
     FsRtlAcquirePushLockExclusive(&state->Lock);
 
-    //
-    // Search transaction list
-    //
     for (entry = state->TransactionList.Flink;
          entry != &state->TransactionList;
          entry = entry->Flink) {
 
         transaction = CONTAINING_RECORD(entry, SHADOW_KTM_TRANSACTION, ListEntry);
 
-        if (RtlCompareMemory(&transaction->TransactionGuid, &TransactionGuid, sizeof(GUID)) == sizeof(GUID)) {
-            //
-            // SECURITY FIX (v2.1.0): Validate refcount is positive before incrementing
-            // This prevents race condition where transaction is being freed concurrently
-            //
-            LONG oldRefCount = transaction->ReferenceCount;
-            if (oldRefCount <= 0) {
-                //
-                // Transaction is being freed, skip it
-                //
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                           "[ShadowStrike] Skipping transaction with invalid refcount (%ld)\n",
-                           oldRefCount);
-                continue;
-            }
+        if (RtlCompareMemory(&transaction->TransactionGuid,
+                             &TransactionGuid, sizeof(GUID)) == sizeof(GUID)) {
 
             //
-            // Atomically increment and verify success
+            // Use CAS loop to safely acquire reference.
+            // Under exclusive lock, this is belt-and-suspenders.
             //
-            LONG newRefCount = InterlockedIncrement(&transaction->ReferenceCount);
-            if (newRefCount <= 1) {
-                //
-                // Raced with cleanup - decrement back and skip
-                //
-                InterlockedDecrement(&transaction->ReferenceCount);
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                           "[ShadowStrike] Race detected during reference increment\n");
+            if (!ShadowReferenceKtmTransaction(transaction)) {
+                InterlockedIncrement64(&state->Stats.RefCountRaces);
                 continue;
             }
 
@@ -894,10 +991,12 @@ ShadowFindKtmTransaction(
             //
             LARGE_INTEGER currentTime;
             KeQuerySystemTime(&currentTime);
-            InterlockedExchange64(&transaction->LastActivityTime.QuadPart, currentTime.QuadPart);
+            InterlockedExchange64(
+                &transaction->LastActivityTime.QuadPart,
+                currentTime.QuadPart);
 
             //
-            // Move to front (LRU) - safe because we have EXCLUSIVE lock
+            // Move to front (LRU)
             //
             RemoveEntryList(&transaction->ListEntry);
             InsertHeadList(&state->TransactionList, &transaction->ListEntry);
@@ -917,101 +1016,14 @@ ShadowFindKtmTransaction(
     return STATUS_SUCCESS;
 }
 
-/**
- * @brief Release transaction reference.
- *
- * ENTERPRISE IMPLEMENTATION: Proper reference count management with
- * pre-validation to prevent underflow and use-after-free vulnerabilities.
- *
- * @param Transaction   Transaction to release (must not be NULL)
- *
- * @irql <= DISPATCH_LEVEL
- */
-VOID
-ShadowReleaseKtmTransaction(
-    _In_ PSHADOW_KTM_TRANSACTION Transaction
-    )
-{
-    LONG currentRefCount;
-    LONG newRefCount;
-
-    if (Transaction == NULL) {
-        return;
-    }
-
-    //
-    // ENTERPRISE FIX: Pre-validate reference count before decrement
-    // This prevents underflow from corrupting state
-    //
-    currentRefCount = InterlockedCompareExchange(&Transaction->ReferenceCount, 0, 0);
-
-    if (currentRefCount <= 0) {
-        //
-        // FATAL: Reference count is already zero or negative
-        // This indicates a double-release bug
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] FATAL: Transaction release with refcount=%ld "
-                   "(double-release detected, GUID={%08lX-...})\n",
-                   currentRefCount, Transaction->TransactionGuid.Data1);
-
-        //
-        // Bugcheck with diagnostic information
-        // Using MANUALLY_INITIATED_CRASH1 for driver-detected fatal errors
-        //
-        KeBugCheckEx(
-            MANUALLY_INITIATED_CRASH1,
-            (ULONG_PTR)0x4B544D52,           // 'KTMR' - KTM Refcount error
-            (ULONG_PTR)Transaction,           // Transaction pointer
-            (ULONG_PTR)currentRefCount,       // Current refcount
-            (ULONG_PTR)_ReturnAddress()       // Caller address
-        );
-
-        //
-        // UNREACHABLE
-        //
-    }
-
-    //
-    // Safe to decrement
-    //
-    newRefCount = InterlockedDecrement(&Transaction->ReferenceCount);
-
-    if (newRefCount == 0) {
-        //
-        // Last reference - free the transaction entry
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                   "[ShadowStrike] Freeing transaction (GUID={%08lX-...})\n",
-                   Transaction->TransactionGuid.Data1);
-
-        ExFreePoolWithTag(Transaction, SHADOW_KTM_TRANSACTION_TAG);
-    }
-    else if (newRefCount < 0) {
-        //
-        // Race condition detected - restore and bugcheck
-        //
-        InterlockedIncrement(&Transaction->ReferenceCount);
-
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] FATAL: Transaction refcount race - underflow after decrement\n");
-
-        KeBugCheckEx(
-            MANUALLY_INITIATED_CRASH1,
-            (ULONG_PTR)0x4B544D52,           // 'KTMR' signature
-            (ULONG_PTR)Transaction,
-            (ULONG_PTR)newRefCount,
-            (ULONG_PTR)_ReturnAddress()
-        );
-    }
-}
+// ============================================================================
+// THREAT SCORING (DISPATCH_LEVEL SAFE — uses cached data only)
+// ============================================================================
 
 /**
- * @brief Calculate threat score for transaction.
- *
- * SECURITY FIX (v2.1.0): Fixed integer overflow in files-per-second calculation
- * that could allow ransomware to bypass detection thresholds.
+ * @brief Calculate threat score using cached process name (no IRQL issues).
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowCalculateKtmThreatScore(
     _In_ PSHADOW_KTM_TRANSACTION Transaction,
@@ -1028,54 +1040,46 @@ ShadowCalculateKtmThreatScore(
 
     *ThreatScore = 0;
 
+    if (!ShadowValidateKtmTransaction(Transaction)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     //
-    // THREAT FACTOR 1: High-velocity file operations (ransomware signature)
-    // SECURITY FIX (v2.1.0): Added overflow detection
+    // FACTOR 1: High-velocity file operations
     //
     if (Transaction->FilesModified > 10) {
         KeQuerySystemTime(&currentTime);
         timeDelta = currentTime.QuadPart - Transaction->RateWindowStart.QuadPart;
 
         if (timeDelta > 0) {
-            //
-            // SECURITY FIX: Prevent integer overflow by checking bounds first
-            //
             LONGLONG filesModified64 = (LONGLONG)Transaction->FilesModified;
             LONGLONG numerator = filesModified64 * 10000000LL;
 
-            //
-            // Detect overflow: if division doesn't match original, overflow occurred
-            //
             if (numerator / 10000000LL != filesModified64) {
-                //
-                // Overflow detected - assume maximum rate (definitely ransomware)
-                //
                 filesPerSecond = ULONG_MAX;
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                           "[ShadowStrike] Integer overflow detected in rate calculation - max rate assumed\n");
             } else {
                 filesPerSecond = (ULONG)(numerator / timeDelta);
             }
 
             if (filesPerSecond >= g_KtmMonitorState.RansomwareThreshold) {
-                score += 60;  // CRITICAL: Mass file encryption pattern
+                score += 60;
                 Transaction->HasRansomwarePattern = TRUE;
             }
             else if (filesPerSecond >= (g_KtmMonitorState.RansomwareThreshold / 2)) {
-                score += 30;  // HIGH: Suspicious velocity
+                score += 30;
             }
         }
     }
 
     //
-    // THREAT FACTOR 2: Suspicious process name
+    // FACTOR 2: Suspicious process (uses cached name — safe at any IRQL)
     //
-    if (ShadowIsSuspiciousProcess(Transaction->ProcessId)) {
+    if (ShadowIsSuspiciousProcessCached(Transaction->ProcessName)) {
         score += 15;
     }
 
     //
-    // THREAT FACTOR 3: Large number of transacted operations
+    // FACTOR 3: Large operation counts
     //
     if (Transaction->FileOperationCount > 100) {
         score += 10;
@@ -1086,32 +1090,34 @@ ShadowCalculateKtmThreatScore(
     }
 
     //
-    // THREAT FACTOR 4: Transaction commit after mass operations
+    // FACTOR 4: Commit after mass operations
     //
     if (Transaction->IsCommitted && Transaction->FilesModified > 20) {
         score += 15;
     }
 
-    //
-    // Cap at 100
-    //
     if (score > 100) {
         score = 100;
     }
 
     *ThreatScore = score;
-
-    //
-    // Update transaction threat score
-    //
     InterlockedExchange(&Transaction->ThreatScore, (LONG)score);
 
     return STATUS_SUCCESS;
 }
 
+// ============================================================================
+// FILE EXTENSION CHECK (DISPATCH_LEVEL SAFE — pool-allocated buffer)
+// ============================================================================
+
 /**
- * @brief Check if file extension is ransomware target.
+ * @brief Check if file extension is a ransomware target.
+ *
+ * Allocates a temporary buffer from NonPagedPool instead of using a
+ * large stack buffer. Uses RtlDowncaseUnicodeChar for kernel-safe
+ * lowercasing.
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowIsRansomwareTargetFile(
     _In_ PUNICODE_STRING FilePath
@@ -1119,46 +1125,77 @@ ShadowIsRansomwareTargetFile(
 {
     ULONG i;
     PWCHAR extension;
-    WCHAR lowerPath[SHADOW_MAX_FILE_PATH];
-    USHORT copyLength;
+    PWCHAR lowerBuf;
+    USHORT charCount;
+    USHORT idx;
+    UNICODE_STRING extStr;
+    UNICODE_STRING targetStr;
+    BOOLEAN result = FALSE;
 
     if (FilePath == NULL || FilePath->Buffer == NULL || FilePath->Length == 0) {
         return FALSE;
     }
 
-    //
-    // Copy to local buffer and convert to lowercase
-    //
-    copyLength = min(FilePath->Length / sizeof(WCHAR), SHADOW_MAX_FILE_PATH - 1);
-    RtlCopyMemory(lowerPath, FilePath->Buffer, copyLength * sizeof(WCHAR));
-    lowerPath[copyLength] = L'\0';
-    _wcslwr(lowerPath);
-
-    //
-    // Find last dot (extension separator)
-    //
-    extension = wcsrchr(lowerPath, L'.');
-    if (extension == NULL) {
+    charCount = FilePath->Length / sizeof(WCHAR);
+    if (charCount == 0 || charCount > SHADOW_MAX_FILE_PATH) {
         return FALSE;
     }
 
     //
-    // Check against target extensions
+    // Allocate from NonPagedPool — safe at DISPATCH_LEVEL
     //
-    for (i = 0; g_RansomwareTargetExtensions[i] != NULL; i++) {
-        if (wcscmp(extension, g_RansomwareTargetExtensions[i]) == 0) {
-            return TRUE;
+    lowerBuf = (PWCHAR)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        (SIZE_T)(charCount + 1) * sizeof(WCHAR),
+        SHADOW_KTM_STRING_TAG
+    );
+
+    if (lowerBuf == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Copy and lowercase using kernel-safe RtlDowncaseUnicodeChar
+    //
+    for (idx = 0; idx < charCount; idx++) {
+        lowerBuf[idx] = RtlDowncaseUnicodeChar(FilePath->Buffer[idx]);
+    }
+    lowerBuf[charCount] = L'\0';
+
+    //
+    // Find last dot
+    //
+    extension = NULL;
+    for (idx = charCount; idx > 0; idx--) {
+        if (lowerBuf[idx - 1] == L'.') {
+            extension = &lowerBuf[idx - 1];
+            break;
+        }
+        if (lowerBuf[idx - 1] == L'\\' || lowerBuf[idx - 1] == L'/') {
+            break;
         }
     }
 
-    return FALSE;
+    if (extension != NULL) {
+        RtlInitUnicodeString(&extStr, extension);
+
+        for (i = 0; g_RansomwareTargetExtensions[i] != NULL; i++) {
+            RtlInitUnicodeString(&targetStr, g_RansomwareTargetExtensions[i]);
+            if (RtlEqualUnicodeString(&extStr, &targetStr, FALSE)) {
+                result = TRUE;
+                break;
+            }
+        }
+    }
+
+    ExFreePoolWithTag(lowerBuf, SHADOW_KTM_STRING_TAG);
+    return result;
 }
 
 /**
- * @brief Check for ransomware pattern (high-velocity file operations).
- *
- * SECURITY FIX (v2.1.0): Fixed integer overflow in rate calculation.
+ * @brief Detect ransomware file modification pattern.
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowDetectRansomwarePattern(
     _In_ PSHADOW_KTM_TRANSACTION Transaction
@@ -1167,21 +1204,17 @@ ShadowDetectRansomwarePattern(
     LARGE_INTEGER currentTime;
     LONGLONG timeDelta;
     ULONG filesPerSecond;
+    LONGLONG filesModified64;
+    LONGLONG numerator;
 
     if (Transaction == NULL) {
         return FALSE;
     }
 
-    //
-    // Already detected?
-    //
     if (Transaction->HasRansomwarePattern) {
         return TRUE;
     }
 
-    //
-    // Check if file modification rate exceeds threshold
-    //
     if (Transaction->FilesModified < 10) {
         return FALSE;
     }
@@ -1193,30 +1226,21 @@ ShadowDetectRansomwarePattern(
         return FALSE;
     }
 
-    //
-    // SECURITY FIX (v2.1.0): Prevent integer overflow
-    //
-    LONGLONG filesModified64 = (LONGLONG)Transaction->FilesModified;
-    LONGLONG numerator = filesModified64 * 10000000LL;
+    filesModified64 = (LONGLONG)Transaction->FilesModified;
+    numerator = filesModified64 * 10000000LL;
 
     if (numerator / 10000000LL != filesModified64) {
-        //
-        // Overflow detected - assume maximum rate (definitely ransomware)
-        //
         filesPerSecond = ULONG_MAX;
     } else {
         filesPerSecond = (ULONG)(numerator / timeDelta);
     }
 
     if (filesPerSecond >= g_KtmMonitorState.RansomwareThreshold) {
-        //
-        // RANSOMWARE DETECTED!
-        //
         Transaction->HasRansomwarePattern = TRUE;
         InterlockedIncrement64(&g_KtmMonitorState.Stats.RansomwareDetections);
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] RANSOMWARE DETECTED! Process=%p (%ws), Files/Sec=%lu\n",
+                   "[ShadowStrike] RANSOMWARE DETECTED! PID=%p (%ws), Files/Sec=%lu\n",
                    Transaction->ProcessId, Transaction->ProcessName, filesPerSecond);
 
         return TRUE;
@@ -1225,53 +1249,50 @@ ShadowDetectRansomwarePattern(
     return FALSE;
 }
 
+// ============================================================================
+// FILE OPERATION RECORDING
+// ============================================================================
+
 /**
  * @brief Record transacted file operation.
+ *
+ * Must be called at PASSIVE_LEVEL because ShadowQueueKtmAlert captures
+ * process name via ShadowGetProcessImageName (PsLookupProcessByProcessId).
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowRecordTransactedFileOperation(
     _In_ PSHADOW_KTM_TRANSACTION Transaction,
     _In_ PUNICODE_STRING FilePath
     )
 {
+    LARGE_INTEGER currentTime;
+
+    PAGED_CODE();
+
     if (Transaction == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Increment operation counters
-    //
     InterlockedIncrement(&Transaction->FileOperationCount);
     InterlockedIncrement64(&g_KtmMonitorState.Stats.TransactedFileOperations);
 
-    //
-    // Check if this is a ransomware target file
-    //
     if (FilePath != NULL && ShadowIsRansomwareTargetFile(FilePath)) {
         InterlockedIncrement(&Transaction->FilesModified);
         InterlockedIncrement64(&g_KtmMonitorState.Stats.FilesEncrypted);
     }
 
-    //
-    // Update activity time
-    //
-    LARGE_INTEGER currentTime;
     KeQuerySystemTime(&currentTime);
     InterlockedExchange64(&Transaction->LastActivityTime.QuadPart, currentTime.QuadPart);
 
-    //
-    // Check for ransomware pattern
-    //
     if (ShadowDetectRansomwarePattern(Transaction)) {
-        //
-        // Queue high-priority alert
-        //
         ULONG threatScore = 0;
         ShadowCalculateKtmThreatScore(Transaction, KtmOperationFileWrite, &threatScore);
 
         ShadowQueueKtmAlert(
             KtmAlertRansomware,
             Transaction->ProcessId,
+            Transaction->ProcessName,
             Transaction->TransactionGuid,
             (ULONG)Transaction->FilesModified,
             threatScore,
@@ -1285,12 +1306,15 @@ ShadowRecordTransactedFileOperation(
 /**
  * @brief Mark transaction as committed.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowMarkTransactionCommitted(
     _In_ PSHADOW_KTM_TRANSACTION Transaction
     )
 {
     ULONG threatScore = 0;
+
+    PAGED_CODE();
 
     if (Transaction == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1301,24 +1325,16 @@ ShadowMarkTransactionCommitted(
 
     InterlockedIncrement64(&g_KtmMonitorState.Stats.TotalCommits);
 
-    //
-    // Check if this is a mass commit (ransomware)
-    //
     if (Transaction->FilesModified > 20) {
         InterlockedIncrement64(&g_KtmMonitorState.Stats.MassCommitOperations);
 
-        //
-        // Calculate final threat score
-        //
         ShadowCalculateKtmThreatScore(Transaction, KtmOperationCommit, &threatScore);
 
-        //
-        // Queue alert if high threat
-        //
         if (threatScore >= g_KtmMonitorState.ThreatThreshold) {
             ShadowQueueKtmAlert(
                 KtmAlertMassCommit,
                 Transaction->ProcessId,
+                Transaction->ProcessName,
                 Transaction->TransactionGuid,
                 (ULONG)Transaction->FilesModified,
                 threatScore,
@@ -1330,35 +1346,45 @@ ShadowMarkTransactionCommitted(
     return STATUS_SUCCESS;
 }
 
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
 /**
- * @brief Get KTM monitoring statistics.
+ * @brief Get atomic snapshot of statistics under spinlock.
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowGetKtmStatistics(
     _Out_ PSHADOW_KTM_STATISTICS Stats
     )
 {
     PSHADOW_KTM_MONITOR_STATE state = &g_KtmMonitorState;
+    KIRQL oldIrql;
 
     if (Stats == NULL) {
         return;
     }
 
-    //
-    // Copy statistics atomically
-    // Note: Individual LONG64 reads are atomic, but full structure copy is not
-    // This is acceptable for statistics gathering
-    //
+    KeAcquireSpinLock(&state->StatsLock, &oldIrql);
     RtlCopyMemory(Stats, &state->Stats, sizeof(SHADOW_KTM_STATISTICS));
+    KeReleaseSpinLock(&state->StatsLock, oldIrql);
 }
 
+// ============================================================================
+// ALERT QUEUE
+// ============================================================================
+
 /**
- * @brief Queue KTM threat alert for user-mode notification.
+ * @brief Queue a KTM threat alert. ProcessName is used from the caller's
+ *        pre-captured buffer (safe at any IRQL). If NULL, we leave it blank.
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowQueueKtmAlert(
     _In_ SHADOW_KTM_ALERT_TYPE AlertType,
     _In_ HANDLE ProcessId,
+    _In_opt_ PCWSTR ProcessName,
     _In_ GUID TransactionGuid,
     _In_ ULONG FilesAffected,
     _In_ ULONG ThreatScore,
@@ -1368,17 +1394,21 @@ ShadowQueueKtmAlert(
     PSHADOW_KTM_MONITOR_STATE state = &g_KtmMonitorState;
     PSHADOW_KTM_ALERT alert = NULL;
     KIRQL oldIrql;
-    UNICODE_STRING imageName = { 0 };
-    NTSTATUS status;
 
     //
-    // Allocate alert structure
+    // Allocate from lookaside (NonPagedPool — safe at DISPATCH)
     //
-    alert = (PSHADOW_KTM_ALERT)ExAllocatePoolWithTag(
-        NonPagedPool,
-        sizeof(SHADOW_KTM_ALERT),
-        SHADOW_KTM_ALERT_TAG
-    );
+    if (state->AlertLookasideInitialized) {
+        alert = (PSHADOW_KTM_ALERT)ExAllocateFromNPagedLookasideList(
+            &state->AlertLookaside
+        );
+    } else {
+        alert = (PSHADOW_KTM_ALERT)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
+            sizeof(SHADOW_KTM_ALERT),
+            SHADOW_KTM_ALERT_TAG
+        );
+    }
 
     if (alert == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -1386,55 +1416,65 @@ ShadowQueueKtmAlert(
 
     RtlZeroMemory(alert, sizeof(SHADOW_KTM_ALERT));
 
-    //
-    // Initialize alert
-    //
     alert->AlertType = AlertType;
     alert->ThreatScore = ThreatScore;
     alert->ProcessId = ProcessId;
     RtlCopyMemory(&alert->TransactionGuid, &TransactionGuid, sizeof(GUID));
     alert->FilesAffected = FilesAffected;
     alert->WasBlocked = WasBlocked;
-
     KeQuerySystemTime(&alert->AlertTime);
 
     //
-    // Get process name
+    // Copy pre-captured process name (safe at any IRQL)
     //
-    status = ShadowGetProcessImageName(ProcessId, &imageName);
-    if (NT_SUCCESS(status) && imageName.Buffer != NULL) {
-        USHORT copyLength = min(imageName.Length / sizeof(WCHAR), SHADOW_MAX_PROCESS_NAME - 1);
-        RtlCopyMemory(alert->ProcessName, imageName.Buffer, copyLength * sizeof(WCHAR));
-        alert->ProcessName[copyLength] = L'\0';
-        ExFreePoolWithTag(imageName.Buffer, SHADOW_KTM_STRING_TAG);
+    if (ProcessName != NULL) {
+        NTSTATUS copyStatus = RtlStringCchCopyW(
+            alert->ProcessName,
+            SHADOW_MAX_PROCESS_NAME,
+            ProcessName
+        );
+        if (!NT_SUCCESS(copyStatus)) {
+            alert->ProcessName[0] = L'\0';
+        }
     }
 
     //
-    // Add to alert queue
+    // Insert into queue under spinlock. Alert count is modified only
+    // under this spinlock, so use plain increment (not Interlocked).
     //
     KeAcquireSpinLock(&state->AlertLock, &oldIrql);
 
-    //
-    // Check if queue is full - drop oldest if needed
-    //
     if (state->AlertCount >= (LONG)state->MaxAlerts) {
         PLIST_ENTRY oldEntry = RemoveTailList(&state->AlertQueue);
         PSHADOW_KTM_ALERT oldAlert = CONTAINING_RECORD(oldEntry, SHADOW_KTM_ALERT, ListEntry);
-        ExFreePoolWithTag(oldAlert, SHADOW_KTM_ALERT_TAG);
-        InterlockedDecrement(&state->AlertCount);
+        state->AlertCount--;
+
+        if (state->AlertLookasideInitialized) {
+            ExFreeToNPagedLookasideList(&state->AlertLookaside, oldAlert);
+        } else {
+            ExFreePoolWithTag(oldAlert, SHADOW_KTM_ALERT_TAG);
+        }
     }
 
     InsertHeadList(&state->AlertQueue, &alert->ListEntry);
-    InterlockedIncrement(&state->AlertCount);
-    InterlockedIncrement64(&state->Stats.ThreatAlerts);
+    state->AlertCount++;
 
     KeReleaseSpinLock(&state->AlertLock, oldIrql);
+
+    InterlockedIncrement64(&state->Stats.ThreatAlerts);
 
     return STATUS_SUCCESS;
 }
 
+// ============================================================================
+// MINIFILTER TRANSACTION NOTIFICATION
+// ============================================================================
+
 /**
  * @brief Minifilter transaction notification callback.
+ *
+ * Handles commit/rollback notifications from Filter Manager for transactions
+ * the minifilter has enlisted in.
  */
 NTSTATUS
 ShadowKtmNotificationCallback(
@@ -1445,24 +1485,28 @@ ShadowKtmNotificationCallback(
 {
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(TransactionContext);
-    UNREFERENCED_PARAMETER(NotificationMask);
 
-    //
-    // Legacy callback for compatibility
-    // Transaction monitoring is primarily handled through ObRegisterCallbacks
-    //
+    if (NotificationMask & TRANSACTION_NOTIFY_COMMIT) {
+        InterlockedIncrement64(&g_KtmMonitorState.Stats.TotalCommits);
+    }
+
+    if (NotificationMask & TRANSACTION_NOTIFY_ROLLBACK) {
+        InterlockedIncrement64(&g_KtmMonitorState.Stats.TotalRollbacks);
+    }
+
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// CALLBACK FUNCTIONS
+// OB CALLBACK FUNCTIONS
 // ============================================================================
 
 /**
- * @brief Pre-operation callback for transaction access.
+ * @brief Pre-operation callback for transaction object access.
  *
- * ENTERPRISE IMPLEMENTATION: Full transaction GUID extraction and tracking
- * with ransomware behavioral analysis.
+ * Called at PASSIVE_LEVEL by the Object Manager. Exception handling is
+ * scoped narrowly around the ObQueryNameString path (which can fail
+ * with STATUS_ACCESS_VIOLATION on certain object types).
  */
 OB_PREOP_CALLBACK_STATUS
 ShadowTransactionPreOperationCallback(
@@ -1480,9 +1524,6 @@ ShadowTransactionPreOperationCallback(
     POBJECT_NAME_INFORMATION objectNameInfo = NULL;
     ULONG returnLength = 0;
 
-    //
-    // CRITICAL: NULL validation to prevent BSOD
-    //
     if (OperationInformation == NULL || OperationInformation->Object == NULL) {
         return OB_PREOP_SUCCESS;
     }
@@ -1491,176 +1532,168 @@ ShadowTransactionPreOperationCallback(
         return OB_PREOP_SUCCESS;
     }
 
-    //
-    // Skip kernel-mode callers (trusted)
-    //
     if (OperationInformation->KernelHandle) {
         return OB_PREOP_SUCCESS;
     }
 
+    if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
+        requestedAccess = OperationInformation->Parameters->CreateHandleInformation.DesiredAccess;
+    } else if (OperationInformation->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
+        requestedAccess = OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess;
+    } else {
+        return OB_PREOP_SUCCESS;
+    }
+
+    if ((requestedAccess & SUSPICIOUS_TRANSACTION_ACCESS) == 0) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    InterlockedIncrement64(&state->Stats.SuspiciousTransactions);
+    currentProcessId = PsGetCurrentProcessId();
+
+    //
+    // Narrow exception scope: ObQueryNameString can fail on certain
+    // object types with access violations. We handle only those.
+    //
     __try {
-        //
-        // Get requested access rights
-        //
-        if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
-            requestedAccess = OperationInformation->Parameters->CreateHandleInformation.DesiredAccess;
-        } else if (OperationInformation->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
-            requestedAccess = OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess;
-        } else {
-            return OB_PREOP_SUCCESS;
-        }
-
-        //
-        // Check for suspicious transaction access patterns
-        //
-        if ((requestedAccess & SUSPICIOUS_TRANSACTION_ACCESS) == 0) {
-            return OB_PREOP_SUCCESS;
-        }
-
-        InterlockedIncrement64(&state->Stats.SuspiciousTransactions);
-
-        //
-        // ENTERPRISE IMPLEMENTATION: Extract transaction GUID from object name
-        // Transaction objects are named as: \Transaction\{GUID}
-        //
-        currentProcessId = PsGetCurrentProcessId();
-
-        //
-        // Query object name to extract transaction GUID
-        //
         status = ObQueryNameString(
             OperationInformation->Object,
-            NULL,
-            0,
+            NULL, 0, &returnLength
+        );
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Exception in ObQueryNameString (size query): 0x%X\n",
+                   GetExceptionCode());
+        return OB_PREOP_SUCCESS;
+    }
+
+    if (status != STATUS_INFO_LENGTH_MISMATCH || returnLength == 0) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    //
+    // Cap allocation to prevent abuse via inflated returnLength
+    //
+    if (returnLength > 4096) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    objectNameInfo = (POBJECT_NAME_INFORMATION)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        returnLength,
+        SHADOW_KTM_STRING_TAG
+    );
+
+    if (objectNameInfo == NULL) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    __try {
+        status = ObQueryNameString(
+            OperationInformation->Object,
+            objectNameInfo,
+            returnLength,
             &returnLength
         );
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ExFreePoolWithTag(objectNameInfo, SHADOW_KTM_STRING_TAG);
+        return OB_PREOP_SUCCESS;
+    }
 
-        if (status == STATUS_INFO_LENGTH_MISMATCH && returnLength > 0) {
-            //
-            // Allocate buffer for object name
-            //
-            objectNameInfo = (POBJECT_NAME_INFORMATION)ExAllocatePoolWithTag(
-                NonPagedPool,
-                returnLength,
-                SHADOW_KTM_STRING_TAG
-            );
+    if (!NT_SUCCESS(status) || objectNameInfo->Name.Buffer == NULL) {
+        ExFreePoolWithTag(objectNameInfo, SHADOW_KTM_STRING_TAG);
+        return OB_PREOP_SUCCESS;
+    }
 
-            if (objectNameInfo != NULL) {
-                status = ObQueryNameString(
-                    OperationInformation->Object,
-                    objectNameInfo,
-                    returnLength,
-                    &returnLength
+    //
+    // Ensure the name buffer is null-terminated for safe RtlInitUnicodeString usage
+    //
+    if (objectNameInfo->Name.Length < objectNameInfo->Name.MaximumLength) {
+        objectNameInfo->Name.Buffer[objectNameInfo->Name.Length / sizeof(WCHAR)] = L'\0';
+    }
+
+    //
+    // Find GUID in the object name
+    //
+    PWCHAR guidStart = NULL;
+    USHORT nameChars = objectNameInfo->Name.Length / sizeof(WCHAR);
+    for (USHORT idx = 0; idx < nameChars; idx++) {
+        if (objectNameInfo->Name.Buffer[idx] == L'{') {
+            guidStart = &objectNameInfo->Name.Buffer[idx];
+            break;
+        }
+    }
+
+    if (guidStart != NULL) {
+        UNICODE_STRING guidString;
+        RtlInitUnicodeString(&guidString, guidStart);
+
+        status = RtlGUIDFromString(&guidString, &transactionGuid);
+        if (NT_SUCCESS(status)) {
+
+            status = ShadowFindKtmTransaction(transactionGuid, &transaction);
+
+            if (status == STATUS_NOT_FOUND) {
+                status = ShadowTrackTransaction(
+                    transactionGuid,
+                    currentProcessId,
+                    &transaction
+                );
+            }
+
+            if (NT_SUCCESS(status) && transaction != NULL) {
+
+                ShadowCalculateKtmThreatScore(
+                    transaction,
+                    KtmOperationCreate,
+                    &threatScore
                 );
 
-                if (NT_SUCCESS(status) && objectNameInfo->Name.Buffer != NULL) {
-                    //
-                    // Parse GUID from object name
-                    // Format: \Transaction\{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
-                    //
-                    PWCHAR guidStart = wcsstr(objectNameInfo->Name.Buffer, L"{");
-                    if (guidStart != NULL) {
-                        UNICODE_STRING guidString;
-                        RtlInitUnicodeString(&guidString, guidStart);
+                if (state->BlockingEnabled &&
+                    threatScore >= state->ThreatThreshold) {
 
-                        status = RtlGUIDFromString(&guidString, &transactionGuid);
-                        if (NT_SUCCESS(status)) {
-                            //
-                            // Successfully extracted GUID - track this transaction
-                            //
-                            status = ShadowFindKtmTransaction(transactionGuid, &transaction);
+                    transaction->IsBlocked = TRUE;
+                    InterlockedIncrement64(&state->Stats.BlockedTransactions);
 
-                            if (status == STATUS_NOT_FOUND) {
-                                //
-                                // New transaction - create tracking entry
-                                //
-                                status = ShadowTrackTransaction(
-                                    transactionGuid,
-                                    currentProcessId,
-                                    &transaction
-                                );
-                            }
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                               "[ShadowStrike] BLOCKED: PID=%p, Score=%lu, "
+                               "GUID={%08lX-...}\n",
+                               currentProcessId, threatScore,
+                               transactionGuid.Data1);
 
-                            if (NT_SUCCESS(status) && transaction != NULL) {
-                                //
-                                // Calculate threat score for this access
-                                //
-                                ShadowCalculateKtmThreatScore(
-                                    transaction,
-                                    KtmOperationCreate,
-                                    &threatScore
-                                );
+                    ShadowQueueKtmAlert(
+                        KtmAlertRansomware,
+                        currentProcessId,
+                        transaction->ProcessName,
+                        transactionGuid,
+                        (ULONG)transaction->FilesModified,
+                        threatScore,
+                        TRUE
+                    );
 
-                                //
-                                // Check if blocking is enabled and threat exceeds threshold
-                                //
-                                if (state->BlockingEnabled &&
-                                    threatScore >= state->ThreatThreshold) {
-
-                                    transaction->IsBlocked = TRUE;
-                                    InterlockedIncrement64(&state->Stats.BlockedTransactions);
-
-                                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                                               "[ShadowStrike] BLOCKED transaction access: "
-                                               "Process=%p, ThreatScore=%lu, GUID={%08lX-...}\n",
-                                               currentProcessId, threatScore,
-                                               transactionGuid.Data1);
-
-                                    //
-                                    // Queue alert for blocked transaction
-                                    //
-                                    ShadowQueueKtmAlert(
-                                        KtmAlertRansomware,
-                                        currentProcessId,
-                                        transactionGuid,
-                                        (ULONG)transaction->FilesModified,
-                                        threatScore,
-                                        TRUE
-                                    );
-
-                                    //
-                                    // Strip dangerous access rights
-                                    //
-                                    if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
-                                        OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &=
-                                            ~(TRANSACTION_COMMIT | TRANSACTION_ROLLBACK);
-                                    } else {
-                                        OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess &=
-                                            ~(TRANSACTION_COMMIT | TRANSACTION_ROLLBACK);
-                                    }
-                                }
-
-                                //
-                                // Release transaction reference
-                                //
-                                ShadowReleaseKtmTransaction(transaction);
-                            }
-                        }
+                    if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
+                        OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &=
+                            ~(TRANSACTION_COMMIT | TRANSACTION_ROLLBACK);
+                    } else {
+                        OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess &=
+                            ~(TRANSACTION_COMMIT | TRANSACTION_ROLLBACK);
                     }
                 }
 
-                ExFreePoolWithTag(objectNameInfo, SHADOW_KTM_STRING_TAG);
+                ShadowReleaseKtmTransaction(transaction);
             }
         }
-
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                   "[ShadowStrike] Transaction access: Process=%p, Access=0x%X, ThreatScore=%lu\n",
-                   currentProcessId, requestedAccess, threatScore);
-
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        //
-        // Exception handler to prevent BSOD
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Exception in transaction callback: 0x%X\n",
-                   GetExceptionCode());
     }
+
+    ExFreePoolWithTag(objectNameInfo, SHADOW_KTM_STRING_TAG);
 
     return OB_PREOP_SUCCESS;
 }
 
 /**
  * @brief Post-operation callback for transaction access.
+ *
+ * Records telemetry for completed handle operations.
  */
 VOID
 ShadowTransactionPostOperationCallback(
@@ -1668,110 +1701,31 @@ ShadowTransactionPostOperationCallback(
     _In_ POB_POST_OPERATION_INFORMATION OperationInformation
     )
 {
-    UNREFERENCED_PARAMETER(RegistrationContext);
-    UNREFERENCED_PARAMETER(OperationInformation);
+    PSHADOW_KTM_MONITOR_STATE state = (PSHADOW_KTM_MONITOR_STATE)RegistrationContext;
+
+    if (state == NULL || !state->Initialized || state->ShuttingDown) {
+        return;
+    }
+
+    if (OperationInformation == NULL) {
+        return;
+    }
 
     //
-    // Post-operation telemetry could be added here
-    // For now, we primarily use pre-operation callback
+    // Record the status of the completed operation for telemetry.
+    // A failed handle creation from a previously-blocked process is
+    // an indicator that our pre-op access stripping is effective.
     //
+    if (!NT_SUCCESS(OperationInformation->ReturnStatus)) {
+        InterlockedIncrement64(&state->Stats.BlockedTransactions);
+    }
 }
 
 // ============================================================================
-// PRIVATE HELPER FUNCTIONS
+// INTERNAL CLEANUP
 // ============================================================================
 
-/**
- * @brief Get process image name.
- */
-NTSTATUS
-ShadowGetProcessImageName(
-    _In_ HANDLE ProcessId,
-    _Out_ PUNICODE_STRING ImageName
-    )
-{
-    NTSTATUS status;
-    PEPROCESS process = NULL;
-    PUNICODE_STRING processImageName = NULL;
-
-    ImageName->Buffer = NULL;
-    ImageName->Length = 0;
-    ImageName->MaximumLength = 0;
-
-    //
-    // Reference the process
-    //
-    status = PsLookupProcessByProcessId(ProcessId, &process);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    //
-    // Get image name
-    //
-    status = SeLocateProcessImageName(process, &processImageName);
-    if (NT_SUCCESS(status) && processImageName != NULL && processImageName->Buffer != NULL) {
-        //
-        // Allocate buffer and copy
-        //
-        ImageName->MaximumLength = processImageName->Length + sizeof(WCHAR);
-        ImageName->Buffer = (PWCH)ExAllocatePoolWithTag(
-            PagedPool,
-            ImageName->MaximumLength,
-            SHADOW_KTM_STRING_TAG
-        );
-
-        if (ImageName->Buffer != NULL) {
-            RtlCopyUnicodeString(ImageName, processImageName);
-        } else {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-        }
-
-        ExFreePool(processImageName);
-    }
-
-    ObDereferenceObject(process);
-    return status;
-}
-
-/**
- * @brief Check if process is suspicious.
- */
-BOOLEAN
-ShadowIsSuspiciousProcess(
-    _In_ HANDLE ProcessId
-    )
-{
-    NTSTATUS status;
-    UNICODE_STRING imageName = { 0 };
-    BOOLEAN isSuspicious = FALSE;
-    ULONG i;
-
-    if (ProcessId == NULL) {
-        return FALSE;
-    }
-
-    status = ShadowGetProcessImageName(ProcessId, &imageName);
-    if (!NT_SUCCESS(status) || imageName.Buffer == NULL) {
-        return FALSE;
-    }
-
-    _wcslwr(imageName.Buffer);
-
-    for (i = 0; g_SuspiciousProcessNames[i] != NULL; i++) {
-        if (wcsstr(imageName.Buffer, g_SuspiciousProcessNames[i]) != NULL) {
-            isSuspicious = TRUE;
-            break;
-        }
-    }
-
-    ExFreePoolWithTag(imageName.Buffer, SHADOW_KTM_STRING_TAG);
-    return isSuspicious;
-}
-
-/**
- * @brief Evict least recently used transaction from cache.
- */
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 ShadowEvictLruTransaction(
     VOID
@@ -1782,32 +1736,27 @@ ShadowEvictLruTransaction(
     PSHADOW_KTM_TRANSACTION transaction;
 
     //
-    // Lock must be held by caller (EXCLUSIVE)
+    // Caller holds Lock exclusively.
     //
 
-    //
-    // Remove tail (least recently used)
-    //
     if (!IsListEmpty(&state->TransactionList)) {
         entry = RemoveTailList(&state->TransactionList);
         transaction = CONTAINING_RECORD(entry, SHADOW_KTM_TRANSACTION, ListEntry);
 
+        InterlockedExchange(&transaction->RemovedFromList, TRUE);
         InterlockedDecrement(&state->TransactionCount);
 
-        //
-        // Release reference (may free if no other references)
-        //
         ShadowReleaseKtmTransaction(transaction);
     }
 }
 
 /**
- * @brief Cleanup all transaction tracking entries.
+ * @brief Cleanup all transaction tracking entries with reference draining.
  *
- * SECURITY FIX (v2.1.0): Fixed use-after-free vulnerability by implementing
- * proper reference count draining instead of forcibly setting refcount to 1.
- * This prevents crashes and memory corruption during driver unload.
+ * Called after ObUnRegisterCallbacks returns, so no new callbacks can fire.
+ * Marks each entry as removed from list, then drains references.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowCleanupTransactionEntries(
     VOID
@@ -1819,34 +1768,32 @@ ShadowCleanupTransactionEntries(
     LARGE_INTEGER drainInterval;
     ULONG totalLeaked = 0;
 
+    PAGED_CODE();
+
     if (!state->LockInitialized) {
         return;
     }
 
-    FsRtlAcquirePushLockExclusive(&state->Lock);
-
-    //
-    // SECURITY FIX (v2.1.0): Proper reference draining to prevent use-after-free
-    //
     drainInterval.QuadPart = -((LONGLONG)SHADOW_REFCOUNT_DRAIN_INTERVAL_MS * 10000LL);
 
-    //
-    // Free all transaction entries with proper reference draining
-    //
+    FsRtlAcquirePushLockExclusive(&state->Lock);
+
     while (!IsListEmpty(&state->TransactionList)) {
         entry = RemoveHeadList(&state->TransactionList);
         transaction = CONTAINING_RECORD(entry, SHADOW_KTM_TRANSACTION, ListEntry);
 
+        InterlockedExchange(&transaction->RemovedFromList, TRUE);
         InterlockedDecrement(&state->TransactionCount);
 
         //
-        // Wait for outstanding references to drain (with timeout)
+        // Drain outstanding references with timeout.
+        // Since callbacks are already unregistered, no NEW references
+        // can be taken — we only wait for in-flight ones to complete.
         //
         ULONG spinCount = 0;
-        while (transaction->ReferenceCount > 1 && spinCount < SHADOW_REFCOUNT_DRAIN_MAX_ITERATIONS) {
-            //
-            // Release lock temporarily to allow other threads to complete
-            //
+        while (transaction->ReferenceCount > 1 &&
+               spinCount < SHADOW_REFCOUNT_DRAIN_MAX_ITERATIONS) {
+
             FsRtlReleasePushLockExclusive(&state->Lock);
             KeDelayExecutionThread(KernelMode, FALSE, &drainInterval);
             FsRtlAcquirePushLockExclusive(&state->Lock);
@@ -1854,22 +1801,13 @@ ShadowCleanupTransactionEntries(
             spinCount++;
         }
 
-        //
-        // Check if references drained successfully
-        //
         if (transaction->ReferenceCount == 1) {
-            //
-            // Safe to release - this will free the transaction
-            //
             ShadowReleaseKtmTransaction(transaction);
         } else {
-            //
-            // ENTERPRISE FIX: References did not drain - leak with warning
-            // This is safer than forcing cleanup (which causes use-after-free)
-            //
             totalLeaked++;
+            InterlockedIncrement64(&state->Stats.TransactionsLeaked);
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] Transaction leaked during cleanup (refcount=%ld) - safer than forcing free\n",
+                       "[ShadowStrike] Transaction leaked (refcount=%ld)\n",
                        transaction->ReferenceCount);
         }
     }
@@ -1878,17 +1816,12 @@ ShadowCleanupTransactionEntries(
 
     if (totalLeaked > 0) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] %lu transactions leaked during cleanup (total allocated: ~%lu bytes)\n",
-                   totalLeaked, totalLeaked * sizeof(SHADOW_KTM_TRANSACTION));
+                   "[ShadowStrike] %lu transactions leaked during cleanup\n",
+                   totalLeaked);
     }
-
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Cleaned up all transaction tracking entries (Security Hardened v2.1)\n");
 }
 
-/**
- * @brief Cleanup KTM alert queue.
- */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowCleanupKtmAlertQueue(
     VOID
@@ -1899,17 +1832,20 @@ ShadowCleanupKtmAlertQueue(
     PSHADOW_KTM_ALERT alert;
     KIRQL oldIrql;
 
+    PAGED_CODE();
+
     KeAcquireSpinLock(&state->AlertLock, &oldIrql);
 
-    //
-    // Free all alerts
-    //
     while (!IsListEmpty(&state->AlertQueue)) {
         entry = RemoveHeadList(&state->AlertQueue);
         alert = CONTAINING_RECORD(entry, SHADOW_KTM_ALERT, ListEntry);
+        state->AlertCount--;
 
-        InterlockedDecrement(&state->AlertCount);
-        ExFreePoolWithTag(alert, SHADOW_KTM_ALERT_TAG);
+        if (state->AlertLookasideInitialized) {
+            ExFreeToNPagedLookasideList(&state->AlertLookaside, alert);
+        } else {
+            ExFreePoolWithTag(alert, SHADOW_KTM_ALERT_TAG);
+        }
     }
 
     KeReleaseSpinLock(&state->AlertLock, oldIrql);

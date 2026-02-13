@@ -31,7 +31,21 @@
  * - Non-paged pool minimization strategies
  * - IRQL-aware operation selection
  *
- * CRITICAL FIXES IN VERSION 2.1.0:
+ * CRITICAL FIXES IN VERSION 2.2.0:
+ * - Fixed initialization race (stats zeroed after Initialized flag)
+ * - Fixed FreePool/FreePoolWithTag tracking Size=0 (stats corruption)
+ * - Fixed contiguous alloc via flags skipping MustSucceed/RaiseOnFailure
+ * - Fixed FreeAligned double-free race on Magic field (atomic CAS)
+ * - Fixed FreeAligned missing DISPATCH wipe size cap
+ * - Added POOL_NX_ALLOCATION for non-paged lookaside lists
+ * - Fixed MustSucceed retry spinning at DISPATCH_LEVEL
+ * - Added kernel address validation in CreateMdl
+ * - Added user address validation in MapMemory for UserMode
+ * - Added MdlMappingNoExecute in MapToSystemAddress
+ * - Made contiguous alloc cache type configurable
+ * - Documented partial wipe limitation in SecureFree
+ *
+ * FIXES IN VERSION 2.1.0:
  * - Fixed ShadowStrikeAlignUp integer overflow vulnerability
  * - Fixed pool tag mismatch in secure buffer capture
  * - Added IRQL validation in paged lookaside free
@@ -41,7 +55,7 @@
  * - Improved secure wipe performance
  *
  * @author ShadowStrike Security Team
- * @version 2.1.0 (Enterprise Edition)
+ * @version 2.2.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -478,6 +492,11 @@ ShadowStrikeAllocatePoolWithTag(
  * @return Pointer to allocated memory, or NULL on failure
  *
  * @irql Depends on pool type and flags
+ *
+ * @warning ShadowAllocCacheAligned / ShadowAllocPageAligned allocations
+ *          MUST be freed with ShadowStrikeFreeAligned.
+ * @warning ShadowAllocContiguous allocations MUST be freed with
+ *          ShadowStrikeFreeContiguous — never ShadowStrikeFree.
  */
 _Must_inspect_result_
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -606,6 +625,10 @@ ShadowStrikeFreeAligned(
  * @param Tag      Pool tag
  *
  * @irql <= DISPATCH_LEVEL (size limited at DISPATCH_LEVEL)
+ *
+ * @warning At DISPATCH_LEVEL, only the first SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE
+ *          bytes are wiped. Callers handling keys or credentials should free
+ *          at <= APC_LEVEL for a complete wipe.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
@@ -889,15 +912,18 @@ ShadowStrikeUnmapMemory(
     );
 
 /**
- * @brief Create MDL for kernel buffer.
+ * @brief Create MDL for non-paged kernel buffer.
  *
- * Simple MDL creation for kernel-mode buffers.
+ * Creates an MDL and builds it for non-paged pool memory.
+ * Buffer MUST reside in non-paged pool (kernel address space).
+ * Passing a paged pool or user-mode buffer is undefined behavior.
  *
- * @param Buffer       Kernel buffer
+ * @param Buffer       Non-paged kernel buffer
  * @param Length       Buffer length
  * @param Mdl          Receives MDL pointer
  *
  * @return STATUS_SUCCESS on success
+ *         STATUS_INVALID_ADDRESS if Buffer is not a kernel address
  *
  * @irql <= DISPATCH_LEVEL
  */
@@ -1099,6 +1125,7 @@ ShadowStrikeGetPhysicalAddress(
  * @param LowestAcceptable     Lowest physical address
  * @param HighestAcceptable    Highest physical address
  * @param BoundaryAddressMultiple  Alignment boundary
+ * @param CacheType            Cache type (MmNonCached, MmCached, etc.)
  *
  * @return Virtual address of allocated memory, or NULL
  *
@@ -1112,7 +1139,8 @@ ShadowStrikeAllocateContiguous(
     _In_ SIZE_T NumberOfBytes,
     _In_ PHYSICAL_ADDRESS LowestAcceptable,
     _In_ PHYSICAL_ADDRESS HighestAcceptable,
-    _In_opt_ PHYSICAL_ADDRESS BoundaryAddressMultiple
+    _In_opt_ PHYSICAL_ADDRESS BoundaryAddressMultiple,
+    _In_ MEMORY_CACHING_TYPE CacheType
     );
 
 /**

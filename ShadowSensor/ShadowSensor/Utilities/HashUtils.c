@@ -14,28 +14,39 @@
  * - HMAC support for message authentication
  * - Multi-algorithm parallel hashing for threat intelligence
  *
- * CRITICAL FIXES IN THIS VERSION (v2.1.0):
+ * CRITICAL FIXES IN THIS VERSION (v2.2.0):
  * =========================================
- * 1. PUSH LOCK INITIALIZATION: EX_PUSH_LOCK now properly initialized via
- *    ExInitializePushLock before any use
+ * 1. INITIALIZATION STATE: All code paths now correctly check
+ *    g_HashGlobals.InitializationState instead of nonexistent .Initialized field
  *
- * 2. INITIALIZATION STATE MACHINE: Atomic 3-state initialization prevents
- *    race conditions during concurrent Initialize calls
+ * 2. SECTION PLACEMENT: ShadowStrikeInitializeHashUtils moved from INIT to PAGE
+ *    section to support reference-counted re-initialization after DriverEntry
  *
- * 3. CLEANUP TIMEOUT: Bounded wait loop prevents infinite hang if operations
- *    never complete (10 second timeout)
+ * 3. SAFE SHUTDOWN: HASH_STATE_SHUTTING_DOWN prevents new operations during cleanup;
+ *    provider handles are leaked (not closed) if operations remain after drain timeout
  *
- * 4. PROVIDER VALIDATION: All multi-hash operations verify provider
- *    initialization before use
+ * 4. NON-CACHED I/O ALIGNMENT: FltAllocatePoolAlignedWithTag used for read buffers
+ *    when FLTFL_IO_OPERATION_NON_CACHED is requested
  *
- * 5. CNG ERROR HANDLING: All BCryptHashData return values checked
+ * 5. CNG ERROR HANDLING: All BCryptHashData return values checked in every path
+ *    (FileMultiHash, FileHashByPath)
  *
- * 6. THREAD-SAFE STATISTICS: Reset uses proper atomic operations
+ * 6. HASHBYPATH HARDENING: Added initialization check, algorithm handle validation,
+ *    HashiEnterOperation/HashiLeaveOperation tracking, negative file size rejection
  *
- * 7. IRQL VALIDATION: Debug assertions verify IRQL requirements
+ * 7. STRING PARSING SECURITY: ShadowStrikeStringToHash rejects length mismatch
+ *    instead of silent truncation; wcslen replaced with bounded wcsnlen
+ *
+ * 8. STRINGSIZE SEMANTICS: ShadowStrikeHashToString StringSize parameter is now
+ *    consistently WCHAR count (matching SAL annotations)
+ *
+ * 9. OVERFLOW SAFETY: HashiGetTimestampMicroseconds uses split arithmetic;
+ *    InterlockedAdd64 caps ULONG64→LONG64 conversion
+ *
+ * 10. DEAD CODE REMOVED: EX_PUSH_LOCK (never used), empty if-block, stale comments
  *
  * @author ShadowStrike Security Team
- * @version 2.1.0 (Enterprise Edition - Production Ready)
+ * @version 2.2.0 (Enterprise Edition - Production Ready)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -45,7 +56,7 @@
 #include "StringUtils.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, ShadowStrikeInitializeHashUtils)
+#pragma alloc_text(PAGE, ShadowStrikeInitializeHashUtils)
 #pragma alloc_text(PAGE, ShadowStrikeCleanupHashUtils)
 #pragma alloc_text(PAGE, ShadowStrikeComputeFileHash)
 #pragma alloc_text(PAGE, ShadowStrikeComputeFileHashEx)
@@ -64,6 +75,7 @@
 #define HASH_STATE_UNINITIALIZED    0
 #define HASH_STATE_INITIALIZING     1
 #define HASH_STATE_INITIALIZED      2
+#define HASH_STATE_SHUTTING_DOWN    3
 
 /**
  * @brief Cleanup timeout (10 seconds in 100ns units)
@@ -99,10 +111,12 @@ typedef struct _SHADOWSTRIKE_HASH_PROVIDER {
 /**
  * @brief Global hash subsystem state
  *
- * CRITICAL FIX v2.1.0:
- * - InitLock is now properly initialized via ExInitializePushLock
- * - Initialization uses proper atomic state machine
- * - Cleanup has bounded wait with timeout
+ * Thread-safe lifecycle via atomic InitializationState:
+ *   0 = UNINITIALIZED, 1 = INITIALIZING, 2 = INITIALIZED, 3 = SHUTTING_DOWN
+ *
+ * ShuttingDown flag prevents new operations from starting during cleanup,
+ * allowing the cleanup path to safely drain outstanding operations before
+ * closing CNG provider handles.
  */
 typedef struct _SHADOWSTRIKE_HASH_GLOBALS {
     /// Algorithm providers
@@ -113,23 +127,15 @@ typedef struct _SHADOWSTRIKE_HASH_GLOBALS {
     ULONG HmacSha256ObjectSize;
 
     /// Subsystem initialization state machine
-    /// Values: HASH_STATE_UNINITIALIZED (0), HASH_STATE_INITIALIZING (1), HASH_STATE_INITIALIZED (2)
+    /// Values: HASH_STATE_UNINITIALIZED (0), HASH_STATE_INITIALIZING (1),
+    ///         HASH_STATE_INITIALIZED (2), HASH_STATE_SHUTTING_DOWN (3)
     volatile LONG InitializationState;
 
     /// Reference count for nested Initialize/Cleanup calls
     volatile LONG ReferenceCount;
 
-    /// Synchronization - MUST be initialized before use
-    EX_PUSH_LOCK InitLock;
-
-    /// TRUE if InitLock has been initialized
-    BOOLEAN LockInitialized;
-
     /// Statistics
     SHADOWSTRIKE_HASH_STATISTICS Statistics;
-
-    /// Reserved for alignment
-    UCHAR Reserved[3];
 
 } SHADOWSTRIKE_HASH_GLOBALS, *PSHADOWSTRIKE_HASH_GLOBALS;
 
@@ -206,10 +212,16 @@ HashiGetHashObjectSize(
 }
 
 /**
- * @brief Update statistics for operation start
+ * @brief Attempt to enter a hash operation.
+ *
+ * Atomically increments CurrentOperations if the subsystem is initialized.
+ * Returns FALSE if the subsystem is shutting down or not initialized,
+ * preventing new operations from starting during cleanup.
+ *
+ * @return TRUE if operation may proceed, FALSE if rejected
  */
 static
-VOID
+BOOLEAN
 HashiEnterOperation(
     VOID
     )
@@ -217,11 +229,26 @@ HashiEnterOperation(
     LONG Current;
     LONG Peak;
 
+    //
+    // Reject if not in INITIALIZED state (covers SHUTTING_DOWN, UNINITIALIZED)
+    //
+    if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED) {
+        return FALSE;
+    }
+
     InterlockedIncrement64(&g_HashGlobals.Statistics.TotalOperations);
     Current = InterlockedIncrement(&g_HashGlobals.Statistics.CurrentOperations);
 
     //
-    // Update peak if current exceeds it (lock-free)
+    // Re-check after increment — if shutdown raced in, back out
+    //
+    if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED) {
+        InterlockedDecrement(&g_HashGlobals.Statistics.CurrentOperations);
+        return FALSE;
+    }
+
+    //
+    // Update peak if current exceeds it (lock-free CAS loop)
     //
     do {
         Peak = g_HashGlobals.Statistics.PeakOperations;
@@ -232,6 +259,8 @@ HashiEnterOperation(
         &g_HashGlobals.Statistics.PeakOperations,
         Current,
         Peak) != Peak);
+
+    return TRUE;
 }
 
 /**
@@ -250,6 +279,14 @@ HashiLeaveOperation(
 
     if (Success) {
         InterlockedIncrement64(&g_HashGlobals.Statistics.SuccessfulOperations);
+
+        //
+        // Cap BytesHashed to LONGLONG_MAX to avoid signed overflow in InterlockedAdd64.
+        // Cumulative counter — individual values are bounded by HASH_MAX_FILE_SIZE_LIMIT.
+        //
+        if (BytesHashed > (ULONG64)MAXLONGLONG) {
+            BytesHashed = (ULONG64)MAXLONGLONG;
+        }
         InterlockedAdd64(&g_HashGlobals.Statistics.TotalBytesHashed, (LONG64)BytesHashed);
     } else {
         InterlockedIncrement64(&g_HashGlobals.Statistics.FailedOperations);
@@ -302,7 +339,7 @@ HashiComputeBufferHashInternal(
     //
     // Validate subsystem is initialized
     //
-    if (!g_HashGlobals.Initialized) {
+    if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED) {
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -402,7 +439,7 @@ Cleanup:
 }
 
 /**
- * @brief Get current timestamp in microseconds
+ * @brief Get current timestamp in microseconds (overflow-safe)
  */
 static
 ULONG64
@@ -412,6 +449,8 @@ HashiGetTimestampMicroseconds(
 {
     LARGE_INTEGER PerformanceCounter;
     LARGE_INTEGER Frequency;
+    ULONG64 Seconds;
+    ULONG64 Remainder;
 
     PerformanceCounter = KeQueryPerformanceCounter(&Frequency);
 
@@ -419,7 +458,14 @@ HashiGetTimestampMicroseconds(
         return 0;
     }
 
-    return (ULONG64)((PerformanceCounter.QuadPart * 1000000) / Frequency.QuadPart);
+    //
+    // Split into seconds + remainder to avoid intermediate overflow.
+    // Counter * 1000000 can overflow LONGLONG on high-frequency TSC counters.
+    //
+    Seconds = (ULONG64)PerformanceCounter.QuadPart / (ULONG64)Frequency.QuadPart;
+    Remainder = (ULONG64)PerformanceCounter.QuadPart % (ULONG64)Frequency.QuadPart;
+
+    return (Seconds * 1000000ULL) + ((Remainder * 1000000ULL) / (ULONG64)Frequency.QuadPart);
 }
 
 // ============================================================================
@@ -459,6 +505,13 @@ ShadowStrikeInitializeHashUtils(
         return STATUS_SUCCESS;
     }
 
+    if (PreviousState == HASH_STATE_SHUTTING_DOWN) {
+        //
+        // Subsystem is shutting down — cannot re-initialize during teardown
+        //
+        return STATUS_UNSUCCESSFUL;
+    }
+
     if (PreviousState == HASH_STATE_INITIALIZING) {
         //
         // Another thread is initializing - wait for completion with timeout
@@ -488,14 +541,6 @@ ShadowStrikeInitializeHashUtils(
     // We won the race - we're the initializing thread
     // PreviousState == HASH_STATE_UNINITIALIZED
     //
-
-    //
-    // CRITICAL FIX: Initialize push lock BEFORE first use
-    //
-    if (!g_HashGlobals.LockInitialized) {
-        ExInitializePushLock(&g_HashGlobals.InitLock);
-        g_HashGlobals.LockInitialized = TRUE;
-    }
 
     //
     // Zero out statistics
@@ -651,6 +696,7 @@ ShadowStrikeCleanupHashUtils(
 {
     SHADOWSTRIKE_HASH_ALGORITHM Algorithm;
     ULONG WaitIterations;
+    LONG PreviousState;
 
     PAGED_CODE();
 
@@ -669,8 +715,24 @@ ShadowStrikeCleanupHashUtils(
     }
 
     //
-    // CRITICAL FIX: Bounded wait for outstanding operations with timeout
-    // Prevents infinite hang if operations never complete
+    // Atomically transition to SHUTTING_DOWN.
+    // This prevents HashiEnterOperation from accepting new operations.
+    // Operations already in-flight will complete against still-valid provider handles.
+    //
+    PreviousState = InterlockedCompareExchange(
+        &g_HashGlobals.InitializationState,
+        HASH_STATE_SHUTTING_DOWN,
+        HASH_STATE_INITIALIZED
+    );
+
+    if (PreviousState != HASH_STATE_INITIALIZED) {
+        return;
+    }
+
+    //
+    // Drain outstanding operations with bounded wait.
+    // HashiEnterOperation now rejects new work, so CurrentOperations is monotonically
+    // decreasing. We wait up to 30 seconds for all in-flight operations to complete.
     //
     WaitIterations = 0;
     while (g_HashGlobals.Statistics.CurrentOperations > 0 &&
@@ -682,18 +744,23 @@ ShadowStrikeCleanupHashUtils(
         WaitIterations++;
     }
 
-    if (WaitIterations >= HASH_CLEANUP_MAX_WAIT_ITERATIONS) {
-        //
-        // Timeout reached - log warning but proceed with cleanup
-        // Outstanding operations will fail gracefully
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] HashUtils cleanup timeout: %ld operations still pending\n",
+    if (g_HashGlobals.Statistics.CurrentOperations > 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] HashUtils cleanup: %ld operations still outstanding after drain timeout. "
+                   "Provider handles will be leaked to prevent BSOD.\n",
                    g_HashGlobals.Statistics.CurrentOperations);
+
+        //
+        // SAFETY: Do NOT close provider handles if operations are still using them.
+        // Leaking handles is vastly preferable to a use-after-free BSOD.
+        // Mark as uninitialized so no new operations start.
+        //
+        InterlockedExchange(&g_HashGlobals.InitializationState, HASH_STATE_UNINITIALIZED);
+        return;
     }
 
     //
-    // Close all algorithm providers
+    // All operations drained — safe to close provider handles
     //
     for (Algorithm = ShadowHashAlgorithmSha256;
          Algorithm < ShadowHashAlgorithmCount;
@@ -717,7 +784,7 @@ ShadowStrikeCleanupHashUtils(
     }
 
     //
-    // Mark as uninitialized
+    // Mark as uninitialized — re-initialization is now possible
     //
     InterlockedExchange(&g_HashGlobals.InitializationState, HASH_STATE_UNINITIALIZED);
 }
@@ -788,13 +855,9 @@ ShadowStrikeComputeSha256(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Length == 0) {
-        //
-        // Hash of empty input - compute it properly
-        //
+    if (!HashiEnterOperation()) {
+        return STATUS_UNSUCCESSFUL;
     }
-
-    HashiEnterOperation();
 
     Status = HashiComputeBufferHashInternal(
         ShadowHashAlgorithmSha256,
@@ -823,7 +886,9 @@ ShadowStrikeComputeSha1(
         return STATUS_INVALID_PARAMETER;
     }
 
-    HashiEnterOperation();
+    if (!HashiEnterOperation()) {
+        return STATUS_UNSUCCESSFUL;
+    }
 
     Status = HashiComputeBufferHashInternal(
         ShadowHashAlgorithmSha1,
@@ -852,7 +917,9 @@ ShadowStrikeComputeMd5(
         return STATUS_INVALID_PARAMETER;
     }
 
-    HashiEnterOperation();
+    if (!HashiEnterOperation()) {
+        return STATUS_UNSUCCESSFUL;
+    }
 
     Status = HashiComputeBufferHashInternal(
         ShadowHashAlgorithmMd5,
@@ -881,7 +948,9 @@ ShadowStrikeComputeSha512(
         return STATUS_INVALID_PARAMETER;
     }
 
-    HashiEnterOperation();
+    if (!HashiEnterOperation()) {
+        return STATUS_UNSUCCESSFUL;
+    }
 
     Status = HashiComputeBufferHashInternal(
         ShadowHashAlgorithmSha512,
@@ -929,7 +998,12 @@ ShadowStrikeComputeBufferHash(
     Result->HashSize = HashSize;
 
     StartTime = HashiGetTimestampMicroseconds();
-    HashiEnterOperation();
+
+    if (!HashiEnterOperation()) {
+        Result->Status = ShadowHashStatusNotInitialized;
+        Result->NtStatus = STATUS_UNSUCCESSFUL;
+        return STATUS_UNSUCCESSFUL;
+    }
 
     Status = HashiComputeBufferHashInternal(
         Algorithm,
@@ -974,12 +1048,16 @@ ShadowStrikeComputeMultiHash(
 
     RtlZeroMemory(Result, sizeof(SHADOWSTRIKE_MULTI_HASH_RESULT));
 
-    HashiEnterOperation();
+    if (!HashiEnterOperation()) {
+        Result->Status = ShadowHashStatusNotInitialized;
+        Result->NtStatus = STATUS_UNSUCCESSFUL;
+        return STATUS_UNSUCCESSFUL;
+    }
 
     //
-    // Compute all three hashes
-    // In a more optimized implementation, we could process data once
-    // and feed it to all three hash contexts. For now, we compute separately.
+    // Compute all three hashes independently.
+    // Buffer hashing is CPU-bound, not I/O-bound, so separate passes
+    // are acceptable — the data is already in memory.
     //
 
     Sha256Status = HashiComputeBufferHashInternal(
@@ -1164,14 +1242,19 @@ ShadowStrikeComputeFileHashEx(
     //
     // Validate subsystem
     //
-    if (!g_HashGlobals.Initialized) {
+    if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED) {
         Result->Status = ShadowHashStatusNotInitialized;
         Result->NtStatus = STATUS_UNSUCCESSFUL;
         return STATUS_UNSUCCESSFUL;
     }
 
     StartTime = HashiGetTimestampMicroseconds();
-    HashiEnterOperation();
+
+    if (!HashiEnterOperation()) {
+        Result->Status = ShadowHashStatusNotInitialized;
+        Result->NtStatus = STATUS_UNSUCCESSFUL;
+        return STATUS_UNSUCCESSFUL;
+    }
 
     //
     // Get file size
@@ -1191,7 +1274,17 @@ ShadowStrikeComputeFileHashEx(
         goto Cleanup;
     }
 
-    Result->TotalFileSize = FileInfo.EndOfFile.QuadPart;
+    //
+    // Reject negative or zero file sizes from malformed filesystems
+    //
+    if (FileInfo.EndOfFile.QuadPart < 0) {
+        Result->Status = ShadowHashStatusInvalidFile;
+        Result->NtStatus = STATUS_INVALID_PARAMETER;
+        Status = STATUS_INVALID_PARAMETER;
+        goto Cleanup;
+    }
+
+    Result->TotalFileSize = (ULONG64)FileInfo.EndOfFile.QuadPart;
 
     //
     // Check file size limit
@@ -1231,9 +1324,18 @@ ShadowStrikeComputeFileHashEx(
     }
 
     //
-    // Allocate read buffer
+    // Allocate read buffer.
+    // For non-cached I/O, use FltAllocatePoolAlignedWithTag to guarantee
+    // the buffer meets the volume's alignment requirement (sector-aligned).
     //
-    if (Flags & ShadowHashFlagPagedBuffer) {
+    if (Flags & ShadowHashFlagNonCached) {
+        pbReadBuffer = (PUCHAR)FltAllocatePoolAlignedWithTag(
+            Instance,
+            NonPagedPoolNx,
+            (SIZE_T)cbChunkSize,
+            SHADOWSTRIKE_HASH_BUF_TAG
+        );
+    } else if (Flags & ShadowHashFlagPagedBuffer) {
         pbReadBuffer = (PUCHAR)ShadowStrikeAllocatePagedWithTag(cbChunkSize, SHADOWSTRIKE_HASH_BUF_TAG);
     } else {
         pbReadBuffer = (PUCHAR)ShadowStrikeAllocateWithTag(cbChunkSize, SHADOWSTRIKE_HASH_BUF_TAG);
@@ -1361,7 +1463,11 @@ Cleanup:
         if (Flags & ShadowHashFlagSecureWipe) {
             ShadowStrikeSecureZeroMemory(pbReadBuffer, cbChunkSize);
         }
-        ShadowStrikeFreePoolWithTag(pbReadBuffer, SHADOWSTRIKE_HASH_BUF_TAG);
+        if (Flags & ShadowHashFlagNonCached) {
+            FltFreePoolAlignedWithTag(Instance, pbReadBuffer, SHADOWSTRIKE_HASH_BUF_TAG);
+        } else {
+            ShadowStrikeFreePoolWithTag(pbReadBuffer, SHADOWSTRIKE_HASH_BUF_TAG);
+        }
     }
 
     HashiLeaveOperation(
@@ -1411,7 +1517,7 @@ ShadowStrikeComputeFileMultiHash(
     RtlZeroMemory(Result, sizeof(SHADOWSTRIKE_MULTI_HASH_RESULT));
 
     //
-    // Apply configuration
+    // Apply configuration with full bounds clamping
     //
     if (Config != NULL) {
         MaxFileSize = Config->MaxFileSize;
@@ -1423,11 +1529,25 @@ ShadowStrikeComputeFileMultiHash(
         Flags = ShadowHashFlagNonCached;
     }
 
-    if (MaxFileSize == 0) MaxFileSize = HASH_MAX_FILE_SIZE_DEFAULT;
-    if (cbChunkSize == 0) cbChunkSize = HASH_DEFAULT_CHUNK_SIZE;
+    if (MaxFileSize == 0) {
+        MaxFileSize = HASH_MAX_FILE_SIZE_DEFAULT;
+    }
+    if (MaxFileSize > HASH_MAX_FILE_SIZE_LIMIT) {
+        MaxFileSize = HASH_MAX_FILE_SIZE_LIMIT;
+    }
+
+    if (cbChunkSize == 0) {
+        cbChunkSize = HASH_DEFAULT_CHUNK_SIZE;
+    }
+    if (cbChunkSize < HASH_MIN_CHUNK_SIZE) {
+        cbChunkSize = HASH_MIN_CHUNK_SIZE;
+    }
+    if (cbChunkSize > HASH_MAX_CHUNK_SIZE) {
+        cbChunkSize = HASH_MAX_CHUNK_SIZE;
+    }
 
     //
-    // CRITICAL FIX: Use proper initialization state check
+    // Validate initialization state
     //
     if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED) {
         Result->Status = ShadowHashStatusNotInitialized;
@@ -1435,7 +1555,7 @@ ShadowStrikeComputeFileMultiHash(
     }
 
     //
-    // CRITICAL FIX: Verify all required providers are initialized before use
+    // Verify all required providers are initialized before use
     //
     if (!g_HashGlobals.Providers[ShadowHashAlgorithmSha256].Initialized ||
         !g_HashGlobals.Providers[ShadowHashAlgorithmSha1].Initialized ||
@@ -1445,7 +1565,11 @@ ShadowStrikeComputeFileMultiHash(
         return STATUS_NOT_SUPPORTED;
     }
 
-    HashiEnterOperation();
+    if (!HashiEnterOperation()) {
+        Result->Status = ShadowHashStatusNotInitialized;
+        Result->NtStatus = STATUS_UNSUCCESSFUL;
+        return STATUS_UNSUCCESSFUL;
+    }
 
     //
     // Get file size
@@ -1465,7 +1589,18 @@ ShadowStrikeComputeFileMultiHash(
         goto Cleanup;
     }
 
+    //
+    // Reject negative file sizes from malformed filesystems
+    //
+    if (FileInfo.EndOfFile.QuadPart < 0) {
+        Result->Status = ShadowHashStatusInvalidFile;
+        Result->NtStatus = STATUS_INVALID_PARAMETER;
+        Status = STATUS_INVALID_PARAMETER;
+        goto Cleanup;
+    }
+
     if ((ULONG64)FileInfo.EndOfFile.QuadPart > MaxFileSize) {
+        InterlockedIncrement64(&g_HashGlobals.Statistics.SizeLimitExceeded);
         Result->Status = ShadowHashStatusFileTooLarge;
         Result->NtStatus = STATUS_FILE_TOO_LARGE;
         Status = STATUS_FILE_TOO_LARGE;
@@ -1490,7 +1625,19 @@ ShadowStrikeComputeFileMultiHash(
         SHADOWSTRIKE_HASH_OBJ_TAG
     );
 
-    pbReadBuffer = (PUCHAR)ShadowStrikeAllocateWithTag(cbChunkSize, SHADOWSTRIKE_HASH_BUF_TAG);
+    //
+    // Allocate read buffer — use aligned allocation for non-cached I/O
+    //
+    if (Flags & ShadowHashFlagNonCached) {
+        pbReadBuffer = (PUCHAR)FltAllocatePoolAlignedWithTag(
+            Instance,
+            NonPagedPoolNx,
+            (SIZE_T)cbChunkSize,
+            SHADOWSTRIKE_HASH_BUF_TAG
+        );
+    } else {
+        pbReadBuffer = (PUCHAR)ShadowStrikeAllocateWithTag(cbChunkSize, SHADOWSTRIKE_HASH_BUF_TAG);
+    }
 
     if (pbHashObjSha256 == NULL || pbHashObjSha1 == NULL ||
         pbHashObjMd5 == NULL || pbReadBuffer == NULL) {
@@ -1536,13 +1683,19 @@ ShadowStrikeComputeFileMultiHash(
     ByteOffset.QuadPart = 0;
 
     while (ByteOffset.QuadPart < FileInfo.EndOfFile.QuadPart) {
+        ULONG ReadFlags = FLTFL_IO_OPERATION_DO_NOT_UPDATE_BYTE_OFFSET;
+
+        if (Flags & ShadowHashFlagNonCached) {
+            ReadFlags |= FLTFL_IO_OPERATION_NON_CACHED;
+        }
+
         Status = FltReadFile(
             Instance,
             FileObject,
             &ByteOffset,
             cbChunkSize,
             pbReadBuffer,
-            FLTFL_IO_OPERATION_NON_CACHED | FLTFL_IO_OPERATION_DO_NOT_UPDATE_BYTE_OFFSET,
+            ReadFlags,
             &BytesRead,
             NULL,
             NULL
@@ -1553,43 +1706,97 @@ ShadowStrikeComputeFileMultiHash(
                 Status = STATUS_SUCCESS;
                 break;
             }
+
+            if (Flags & ShadowHashFlagAllowPartial) {
+                Status = STATUS_SUCCESS;
+                break;
+            }
+
+            Result->Status = ShadowHashStatusAccessDenied;
+            Result->NtStatus = Status;
             goto Cleanup;
         }
 
         if (BytesRead == 0) break;
 
         //
-        // Feed data to all three hash contexts
+        // Feed data to all three hash contexts — check each return value.
+        // A silent failure here would produce an incorrect hash, which for
+        // a security product is worse than returning an error.
         //
-        BCryptHashData(hHashSha256, pbReadBuffer, BytesRead, 0);
-        BCryptHashData(hHashSha1, pbReadBuffer, BytesRead, 0);
-        BCryptHashData(hHashMd5, pbReadBuffer, BytesRead, 0);
+        if (!Sha256Failed) {
+            HashStatus = BCryptHashData(hHashSha256, pbReadBuffer, BytesRead, 0);
+            if (!NT_SUCCESS(HashStatus)) {
+                Sha256Failed = TRUE;
+                InterlockedIncrement64(&g_HashGlobals.Statistics.CngErrors);
+            }
+        }
+
+        if (!Sha1Failed) {
+            HashStatus = BCryptHashData(hHashSha1, pbReadBuffer, BytesRead, 0);
+            if (!NT_SUCCESS(HashStatus)) {
+                Sha1Failed = TRUE;
+                InterlockedIncrement64(&g_HashGlobals.Statistics.CngErrors);
+            }
+        }
+
+        if (!Md5Failed) {
+            HashStatus = BCryptHashData(hHashMd5, pbReadBuffer, BytesRead, 0);
+            if (!NT_SUCCESS(HashStatus)) {
+                Md5Failed = TRUE;
+                InterlockedIncrement64(&g_HashGlobals.Statistics.CngErrors);
+            }
+        }
+
+        //
+        // If all three algorithms failed, abort the loop
+        //
+        if (Sha256Failed && Sha1Failed && Md5Failed) {
+            Result->Status = ShadowHashStatusAlgorithmError;
+            Result->NtStatus = STATUS_UNSUCCESSFUL;
+            Status = STATUS_UNSUCCESSFUL;
+            goto Cleanup;
+        }
 
         Result->BytesHashed += BytesRead;
         ByteOffset.QuadPart += BytesRead;
     }
 
     //
-    // Finalize all hashes
+    // Finalize all non-failed hashes
     //
-    Status = BCryptFinishHash(hHashSha256, Result->Sha256, SHA256_HASH_SIZE, 0);
-    if (NT_SUCCESS(Status)) {
-        Result->AlgorithmsComputed |= (1 << ShadowHashAlgorithmSha256);
+    if (!Sha256Failed) {
+        HashStatus = BCryptFinishHash(hHashSha256, Result->Sha256, SHA256_HASH_SIZE, 0);
+        if (NT_SUCCESS(HashStatus)) {
+            Result->AlgorithmsComputed |= (1 << ShadowHashAlgorithmSha256);
+        }
     }
 
-    Status = BCryptFinishHash(hHashSha1, Result->Sha1, SHA1_HASH_SIZE, 0);
-    if (NT_SUCCESS(Status)) {
-        Result->AlgorithmsComputed |= (1 << ShadowHashAlgorithmSha1);
+    if (!Sha1Failed) {
+        HashStatus = BCryptFinishHash(hHashSha1, Result->Sha1, SHA1_HASH_SIZE, 0);
+        if (NT_SUCCESS(HashStatus)) {
+            Result->AlgorithmsComputed |= (1 << ShadowHashAlgorithmSha1);
+        }
     }
 
-    Status = BCryptFinishHash(hHashMd5, Result->Md5, MD5_HASH_SIZE, 0);
-    if (NT_SUCCESS(Status)) {
-        Result->AlgorithmsComputed |= (1 << ShadowHashAlgorithmMd5);
+    if (!Md5Failed) {
+        HashStatus = BCryptFinishHash(hHashMd5, Result->Md5, MD5_HASH_SIZE, 0);
+        if (NT_SUCCESS(HashStatus)) {
+            Result->AlgorithmsComputed |= (1 << ShadowHashAlgorithmMd5);
+        }
     }
 
-    Result->Status = ShadowHashStatusSuccess;
-    Result->NtStatus = STATUS_SUCCESS;
-    Status = STATUS_SUCCESS;
+    if (Result->AlgorithmsComputed != 0) {
+        Result->Status = (Sha256Failed || Sha1Failed || Md5Failed)
+            ? ShadowHashStatusPartial
+            : ShadowHashStatusSuccess;
+        Result->NtStatus = STATUS_SUCCESS;
+        Status = STATUS_SUCCESS;
+    } else {
+        Result->Status = ShadowHashStatusAlgorithmError;
+        Result->NtStatus = STATUS_UNSUCCESSFUL;
+        Status = STATUS_UNSUCCESSFUL;
+    }
 
 Cleanup:
     if (hHashSha256) BCryptDestroyHash(hHashSha256);
@@ -1612,7 +1819,14 @@ Cleanup:
         ShadowStrikeFreePoolWithTag(pbHashObjMd5, SHADOWSTRIKE_HASH_OBJ_TAG);
     }
     if (pbReadBuffer) {
-        ShadowStrikeFreePoolWithTag(pbReadBuffer, SHADOWSTRIKE_HASH_BUF_TAG);
+        if (Flags & ShadowHashFlagSecureWipe) {
+            ShadowStrikeSecureZeroMemory(pbReadBuffer, cbChunkSize);
+        }
+        if (Flags & ShadowHashFlagNonCached) {
+            FltFreePoolAlignedWithTag(Instance, pbReadBuffer, SHADOWSTRIKE_HASH_BUF_TAG);
+        } else {
+            ShadowStrikeFreePoolWithTag(pbReadBuffer, SHADOWSTRIKE_HASH_BUF_TAG);
+        }
     }
 
     HashiLeaveOperation(
@@ -1634,14 +1848,28 @@ ShadowStrikeComputeFileHashByPath(
     )
 {
     NTSTATUS Status;
+    NTSTATUS HashStatus;
     OBJECT_ATTRIBUTES ObjectAttributes;
     IO_STATUS_BLOCK IoStatusBlock;
     HANDLE FileHandle = NULL;
     PFILE_OBJECT FileObject = NULL;
+    FILE_STANDARD_INFORMATION FileInfo;
+    PUCHAR pbBuffer = NULL;
+    PUCHAR pbHashObject = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    BCRYPT_ALG_HANDLE hAlgorithm;
+    ULONG cbHashObject;
+    ULONG HashSize;
+    LARGE_INTEGER ByteOffset;
+    ULONG ChunkSize = HASH_DEFAULT_CHUNK_SIZE;
 
     PAGED_CODE();
 
     if (FilePath == NULL || Result == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (Algorithm <= ShadowHashAlgorithmNone || Algorithm >= ShadowHashAlgorithmCount) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1651,6 +1879,44 @@ ShadowStrikeComputeFileHashByPath(
 
     RtlZeroMemory(Result, sizeof(SHADOWSTRIKE_HASH_RESULT));
     Result->Algorithm = Algorithm;
+
+    //
+    // Validate initialization state before any work
+    //
+    if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED) {
+        Result->Status = ShadowHashStatusNotInitialized;
+        Result->NtStatus = STATUS_UNSUCCESSFUL;
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    //
+    // Validate algorithm handle and sizes before opening the file
+    //
+    hAlgorithm = HashiGetAlgorithmHandle(Algorithm);
+    if (hAlgorithm == NULL) {
+        Result->Status = ShadowHashStatusAlgorithmError;
+        Result->NtStatus = STATUS_NOT_SUPPORTED;
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    cbHashObject = HashiGetHashObjectSize(Algorithm);
+    if (cbHashObject == 0) {
+        Result->Status = ShadowHashStatusAlgorithmError;
+        Result->NtStatus = STATUS_UNSUCCESSFUL;
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    HashSize = ShadowStrikeGetHashSize(Algorithm);
+    Result->HashSize = HashSize;
+
+    //
+    // Track operation for safe shutdown synchronization
+    //
+    if (!HashiEnterOperation()) {
+        Result->Status = ShadowHashStatusNotInitialized;
+        Result->NtStatus = STATUS_UNSUCCESSFUL;
+        return STATUS_UNSUCCESSFUL;
+    }
 
     InitializeObjectAttributes(
         &ObjectAttributes,
@@ -1677,7 +1943,7 @@ ShadowStrikeComputeFileHashByPath(
     if (!NT_SUCCESS(Status)) {
         Result->Status = ShadowHashStatusAccessDenied;
         Result->NtStatus = Status;
-        return Status;
+        goto Cleanup;
     }
 
     Status = ObReferenceObjectByHandle(
@@ -1690,134 +1956,151 @@ ShadowStrikeComputeFileHashByPath(
     );
 
     if (!NT_SUCCESS(Status)) {
-        ZwClose(FileHandle);
         Result->Status = ShadowHashStatusAccessDenied;
         Result->NtStatus = Status;
-        return Status;
+        goto Cleanup;
     }
 
     //
-    // Note: This path-based function cannot use FltReadFile without a filter instance.
-    // For full implementation, we would need to use ZwReadFile or have access to a filter instance.
-    // This is a simplified implementation that reads the file directly.
+    // Get file size
     //
+    Status = ZwQueryInformationFile(
+        FileHandle,
+        &IoStatusBlock,
+        &FileInfo,
+        sizeof(FileInfo),
+        FileStandardInformation
+    );
+
+    if (!NT_SUCCESS(Status)) {
+        Result->Status = ShadowHashStatusAccessDenied;
+        Result->NtStatus = Status;
+        goto Cleanup;
+    }
 
     //
-    // For now, we'll implement a ZwReadFile-based approach
+    // Reject negative file sizes from malformed filesystems
     //
-    {
-        FILE_STANDARD_INFORMATION FileInfo;
-        PUCHAR pbBuffer = NULL;
-        PUCHAR pbHashObject = NULL;
-        BCRYPT_HASH_HANDLE hHash = NULL;
-        BCRYPT_ALG_HANDLE hAlgorithm;
-        ULONG cbHashObject;
-        ULONG HashSize;
-        LARGE_INTEGER ByteOffset;
-        ULONG ChunkSize = HASH_DEFAULT_CHUNK_SIZE;
+    if (FileInfo.EndOfFile.QuadPart < 0) {
+        Result->Status = ShadowHashStatusInvalidFile;
+        Result->NtStatus = STATUS_INVALID_PARAMETER;
+        Status = STATUS_INVALID_PARAMETER;
+        goto Cleanup;
+    }
 
-        //
-        // Get file size
-        //
-        Status = ZwQueryInformationFile(
+    Result->TotalFileSize = (ULONG64)FileInfo.EndOfFile.QuadPart;
+
+    if ((ULONG64)FileInfo.EndOfFile.QuadPart > HASH_MAX_FILE_SIZE_DEFAULT) {
+        InterlockedIncrement64(&g_HashGlobals.Statistics.SizeLimitExceeded);
+        Result->Status = ShadowHashStatusFileTooLarge;
+        Result->NtStatus = STATUS_FILE_TOO_LARGE;
+        Status = STATUS_FILE_TOO_LARGE;
+        goto Cleanup;
+    }
+
+    //
+    // Allocate hash object and read buffer
+    //
+    pbHashObject = (PUCHAR)ShadowStrikeAllocateWithTag(cbHashObject, SHADOWSTRIKE_HASH_OBJ_TAG);
+    pbBuffer = (PUCHAR)ShadowStrikeAllocateWithTag(ChunkSize, SHADOWSTRIKE_HASH_BUF_TAG);
+
+    if (pbHashObject == NULL || pbBuffer == NULL) {
+        Result->Status = ShadowHashStatusMemoryError;
+        Result->NtStatus = STATUS_INSUFFICIENT_RESOURCES;
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Cleanup;
+    }
+
+    Status = BCryptCreateHash(hAlgorithm, &hHash, pbHashObject, cbHashObject, NULL, 0, 0);
+    if (!NT_SUCCESS(Status)) {
+        InterlockedIncrement64(&g_HashGlobals.Statistics.CngErrors);
+        Result->Status = ShadowHashStatusAlgorithmError;
+        Result->NtStatus = Status;
+        goto Cleanup;
+    }
+
+    ByteOffset.QuadPart = 0;
+
+    while (ByteOffset.QuadPart < FileInfo.EndOfFile.QuadPart) {
+        Status = ZwReadFile(
             FileHandle,
+            NULL,
+            NULL,
+            NULL,
             &IoStatusBlock,
-            &FileInfo,
-            sizeof(FileInfo),
-            FileStandardInformation
+            pbBuffer,
+            ChunkSize,
+            &ByteOffset,
+            NULL
         );
 
         if (!NT_SUCCESS(Status)) {
+            if (Status == STATUS_END_OF_FILE) {
+                Status = STATUS_SUCCESS;
+                break;
+            }
             Result->Status = ShadowHashStatusAccessDenied;
             Result->NtStatus = Status;
-            goto PathCleanup;
+            goto Cleanup;
         }
 
-        Result->TotalFileSize = FileInfo.EndOfFile.QuadPart;
+        if (IoStatusBlock.Information == 0) break;
 
-        if ((ULONG64)FileInfo.EndOfFile.QuadPart > HASH_MAX_FILE_SIZE_DEFAULT) {
-            Result->Status = ShadowHashStatusFileTooLarge;
-            Result->NtStatus = STATUS_FILE_TOO_LARGE;
-            Status = STATUS_FILE_TOO_LARGE;
-            goto PathCleanup;
-        }
-
-        hAlgorithm = HashiGetAlgorithmHandle(Algorithm);
-        cbHashObject = HashiGetHashObjectSize(Algorithm);
-        HashSize = ShadowStrikeGetHashSize(Algorithm);
-        Result->HashSize = HashSize;
-
-        pbHashObject = (PUCHAR)ShadowStrikeAllocateWithTag(cbHashObject, SHADOWSTRIKE_HASH_OBJ_TAG);
-        pbBuffer = (PUCHAR)ShadowStrikeAllocateWithTag(ChunkSize, SHADOWSTRIKE_HASH_BUF_TAG);
-
-        if (pbHashObject == NULL || pbBuffer == NULL) {
-            Result->Status = ShadowHashStatusMemoryError;
-            Result->NtStatus = STATUS_INSUFFICIENT_RESOURCES;
-            Status = STATUS_INSUFFICIENT_RESOURCES;
-            goto PathCleanup;
-        }
-
-        Status = BCryptCreateHash(hAlgorithm, &hHash, pbHashObject, cbHashObject, NULL, 0, 0);
-        if (!NT_SUCCESS(Status)) {
+        //
+        // Check BCryptHashData return value — a silent failure here
+        // would produce an incorrect hash
+        //
+        HashStatus = BCryptHashData(hHash, pbBuffer, (ULONG)IoStatusBlock.Information, 0);
+        if (!NT_SUCCESS(HashStatus)) {
+            InterlockedIncrement64(&g_HashGlobals.Statistics.CngErrors);
             Result->Status = ShadowHashStatusAlgorithmError;
-            Result->NtStatus = Status;
-            goto PathCleanup;
+            Result->NtStatus = HashStatus;
+            Status = HashStatus;
+            goto Cleanup;
         }
 
-        ByteOffset.QuadPart = 0;
-
-        while (ByteOffset.QuadPart < FileInfo.EndOfFile.QuadPart) {
-            Status = ZwReadFile(
-                FileHandle,
-                NULL,
-                NULL,
-                NULL,
-                &IoStatusBlock,
-                pbBuffer,
-                ChunkSize,
-                &ByteOffset,
-                NULL
-            );
-
-            if (!NT_SUCCESS(Status)) {
-                if (Status == STATUS_END_OF_FILE) {
-                    Status = STATUS_SUCCESS;
-                    break;
-                }
-                Result->Status = ShadowHashStatusAccessDenied;
-                Result->NtStatus = Status;
-                goto PathCleanup;
-            }
-
-            if (IoStatusBlock.Information == 0) break;
-
-            BCryptHashData(hHash, pbBuffer, (ULONG)IoStatusBlock.Information, 0);
-            Result->BytesHashed += IoStatusBlock.Information;
-            ByteOffset.QuadPart += IoStatusBlock.Information;
-        }
-
-        Status = BCryptFinishHash(hHash, Result->Hash, HashSize, 0);
-        if (NT_SUCCESS(Status)) {
-            Result->Status = ShadowHashStatusSuccess;
-            Result->NtStatus = STATUS_SUCCESS;
-        } else {
-            Result->Status = ShadowHashStatusAlgorithmError;
-            Result->NtStatus = Status;
-        }
-
-PathCleanup:
-        if (hHash) BCryptDestroyHash(hHash);
-        if (pbHashObject) {
-            ShadowStrikeSecureZeroMemory(pbHashObject, cbHashObject);
-            ShadowStrikeFreePoolWithTag(pbHashObject, SHADOWSTRIKE_HASH_OBJ_TAG);
-        }
-        if (pbBuffer) {
-            ShadowStrikeFreePoolWithTag(pbBuffer, SHADOWSTRIKE_HASH_BUF_TAG);
-        }
+        Result->BytesHashed += IoStatusBlock.Information;
+        ByteOffset.QuadPart += IoStatusBlock.Information;
     }
 
-    ObDereferenceObject(FileObject);
-    ZwClose(FileHandle);
+    Status = BCryptFinishHash(hHash, Result->Hash, HashSize, 0);
+    if (NT_SUCCESS(Status)) {
+        Result->Status = ShadowHashStatusSuccess;
+        Result->NtStatus = STATUS_SUCCESS;
+    } else {
+        InterlockedIncrement64(&g_HashGlobals.Statistics.CngErrors);
+        Result->Status = ShadowHashStatusAlgorithmError;
+        Result->NtStatus = Status;
+    }
+
+Cleanup:
+    if (hHash != NULL) {
+        BCryptDestroyHash(hHash);
+    }
+
+    if (pbHashObject != NULL) {
+        ShadowStrikeSecureZeroMemory(pbHashObject, cbHashObject);
+        ShadowStrikeFreePoolWithTag(pbHashObject, SHADOWSTRIKE_HASH_OBJ_TAG);
+    }
+
+    if (pbBuffer != NULL) {
+        ShadowStrikeFreePoolWithTag(pbBuffer, SHADOWSTRIKE_HASH_BUF_TAG);
+    }
+
+    if (FileObject != NULL) {
+        ObDereferenceObject(FileObject);
+    }
+
+    if (FileHandle != NULL) {
+        ZwClose(FileHandle);
+    }
+
+    HashiLeaveOperation(
+        Result->Status == ShadowHashStatusSuccess,
+        Algorithm,
+        Result->BytesHashed,
+        TRUE
+    );
 
     return Status;
 }
@@ -1847,7 +2130,7 @@ ShadowStrikeHashContextInit(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!g_HashGlobals.Initialized) {
+    if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED) {
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -2087,15 +2370,23 @@ ShadowStrikeHashToString(
     )
 {
     ULONG i;
-    ULONG RequiredSize;
+    ULONG RequiredCharCount;
     PCWSTR HexChars;
 
     if (Hash == NULL || String == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    RequiredSize = (HashSize * 2 + 1) * sizeof(WCHAR);
-    if (StringSize < RequiredSize) {
+    if (HashSize == 0 || HashSize > MAX_HASH_SIZE) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // StringSize is in WCHAR count (matching SAL _Out_writes_z_ semantics).
+    // Need HashSize*2 hex chars + 1 null terminator.
+    //
+    RequiredCharCount = HashSize * 2 + 1;
+    if (StringSize < RequiredCharCount) {
         return STATUS_BUFFER_TOO_SMALL;
     }
 
@@ -2130,14 +2421,33 @@ ShadowStrikeStringToHash(
         return STATUS_INVALID_PARAMETER;
     }
 
-    StringLength = wcslen(String);
+    if (HashSize == 0 || HashSize > MAX_HASH_SIZE) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Bounded string length scan — prevent unbounded reads on malformed input.
+    // Maximum valid hex string for MAX_HASH_SIZE is MAX_HASH_SIZE*2 chars.
+    //
+    StringLength = wcsnlen(String, (SIZE_T)MAX_HASH_SIZE * 2 + 1);
+    if (StringLength > (SIZE_T)MAX_HASH_SIZE * 2) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     if (StringLength % 2 != 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
     BytesToWrite = (ULONG)(StringLength / 2);
-    if (BytesToWrite > HashSize) {
-        BytesToWrite = HashSize;
+
+    //
+    // Reject input that doesn't exactly match expected hash size.
+    // Silently truncating would produce a prefix-only hash, which is
+    // a security-relevant parsing bug — an attacker could craft
+    // prefix-colliding hash strings to bypass comparison.
+    //
+    if (BytesToWrite != HashSize) {
+        return STATUS_INVALID_PARAMETER;
     }
 
     for (i = 0; i < BytesToWrite; i++) {
@@ -2176,7 +2486,7 @@ ShadowStrikeSha256ToString(
 {
     NTSTATUS Status;
     PWCHAR Buffer;
-    ULONG BufferSize;
+    ULONG BufferSizeBytes;
 
     PAGED_CODE();
 
@@ -2184,9 +2494,14 @@ ShadowStrikeSha256ToString(
         return STATUS_INVALID_PARAMETER;
     }
 
-    BufferSize = SHA256_STRING_SIZE * sizeof(WCHAR);
+    BufferSizeBytes = SHA256_STRING_SIZE * sizeof(WCHAR);
 
-    Buffer = (PWCHAR)ShadowStrikeAllocatePagedWithTag(BufferSize, SHADOW_STRING_TAG);
+    //
+    // Verify buffer size fits in USHORT for UNICODE_STRING.MaximumLength
+    //
+    C_ASSERT(SHA256_STRING_SIZE * sizeof(WCHAR) <= MAXUSHORT);
+
+    Buffer = (PWCHAR)ShadowStrikeAllocatePagedWithTag(BufferSizeBytes, SHADOW_STRING_TAG);
     if (Buffer == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -2195,7 +2510,7 @@ ShadowStrikeSha256ToString(
         Hash,
         SHA256_HASH_SIZE,
         Buffer,
-        BufferSize,
+        SHA256_STRING_SIZE,   // WCHAR count, not bytes
         FALSE  // lowercase
     );
 
@@ -2205,8 +2520,8 @@ ShadowStrikeSha256ToString(
     }
 
     String->Buffer = Buffer;
-    String->Length = SHA256_HASH_SIZE * 2 * sizeof(WCHAR);
-    String->MaximumLength = (USHORT)BufferSize;
+    String->Length = (USHORT)(SHA256_HASH_SIZE * 2 * sizeof(WCHAR));
+    String->MaximumLength = (USHORT)BufferSizeBytes;
 
     return STATUS_SUCCESS;
 }
@@ -2233,7 +2548,8 @@ ShadowStrikeComputeHmacSha256(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!g_HashGlobals.Initialized || g_HashGlobals.HmacSha256Handle == NULL) {
+    if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED ||
+        g_HashGlobals.HmacSha256Handle == NULL) {
         return STATUS_UNSUCCESSFUL;
     }
 

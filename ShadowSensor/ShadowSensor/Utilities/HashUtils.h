@@ -6,16 +6,13 @@
  * @file HashUtils.h
  * @brief Enterprise-grade cryptographic hashing for kernel-mode EDR operations.
  *
- * Provides CrowdStrike Falcon-level hashing capabilities with:
- * - CNG (Cryptography API: Next Generation) SHA-256/SHA-1/MD5 wrappers
+ * Provides enterprise-grade hashing capabilities with:
+ * - CNG (Cryptography API: Next Generation) SHA-256/SHA-1/MD5/SHA-512 wrappers
  * - Streaming hash computation for large files (zero-copy where possible)
  * - Memory buffer hashing with IRQL-aware implementations
  * - Hash comparison with constant-time operations (timing-attack resistant)
- * - Hash caching infrastructure for performance optimization
- * - Authenticode hash extraction for PE files
- * - HMAC support for integrity verification
- * - Fuzzy hashing (ssdeep-style) for malware similarity detection
- * - Import hash (imphash) computation for threat intelligence
+ * - Multi-algorithm parallel hashing for threat intelligence
+ * - HMAC-SHA256 support for integrity verification
  *
  * Security Guarantees:
  * - All hash operations use FIPS-compliant CNG providers
@@ -35,11 +32,9 @@
  * MITRE ATT&CK Coverage:
  * - T1027: Obfuscated Files (hash-based detection)
  * - T1036: Masquerading (hash verification)
- * - T1553: Subvert Trust Controls (Authenticode hash validation)
- * - T1574: Hijack Execution Flow (import hash detection)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.2.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -174,13 +169,7 @@ typedef enum _SHADOWSTRIKE_HASH_FLAGS {
     ShadowHashFlagSecureWipe        = 0x00000008,
 
     /// Use paged pool for read buffer (lower IRQL operations)
-    ShadowHashFlagPagedBuffer       = 0x00000010,
-
-    /// Compute Authenticode hash (PE files only)
-    ShadowHashFlagAuthenticode      = 0x00000020,
-
-    /// Verify PE signature while hashing
-    ShadowHashFlagVerifySignature   = 0x00000040
+    ShadowHashFlagPagedBuffer       = 0x00000010
 
 } SHADOWSTRIKE_HASH_FLAGS;
 
@@ -828,8 +817,8 @@ ShadowStrikeCompareSha256(
  *
  * @param Hash          Hash bytes
  * @param HashSize      Size of hash
- * @param String        Receives hex string (must be at least HashSize*2+1)
- * @param StringSize    Size of string buffer in bytes
+ * @param String        Receives hex string (must hold at least HashSize*2+1 WCHARs)
+ * @param StringSize    Size of string buffer in WCHAR count (not bytes)
  * @param Uppercase     TRUE for uppercase hex, FALSE for lowercase
  *
  * @return STATUS_SUCCESS on success
@@ -849,12 +838,15 @@ ShadowStrikeHashToString(
 /**
  * @brief Convert hexadecimal string to hash bytes.
  *
- * @param String        Hex string (null-terminated)
- * @param Hash          Receives hash bytes
- * @param HashSize      Size of hash buffer
- * @param BytesWritten  Receives number of bytes written
+ * The hex string length must exactly match HashSize (StringLength/2 == HashSize).
+ * Mismatched lengths are rejected to prevent silent truncation.
  *
- * @return STATUS_SUCCESS on success
+ * @param String        Hex string (null-terminated, bounded scan)
+ * @param Hash          Receives hash bytes
+ * @param HashSize      Expected hash size in bytes
+ * @param BytesWritten  Receives number of bytes written (optional)
+ *
+ * @return STATUS_SUCCESS on success, STATUS_INVALID_PARAMETER on length mismatch
  *
  * @irql <= DISPATCH_LEVEL
  */

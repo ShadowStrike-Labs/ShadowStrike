@@ -466,6 +466,23 @@ ShadowStrikeStoreCreatingProcessContext(
     );
 
 /**
+ * @brief Remove creating process context (call from exit callback).
+ *
+ * Removes the stored creating process context for a process that has exited.
+ * Must be called from PsSetCreateProcessNotifyRoutineEx exit path to prevent
+ * unbounded memory growth in the context table.
+ *
+ * @param TargetProcessId   Process ID of the exiting process
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ShadowStrikeRemoveCreatingProcessContext(
+    _In_ HANDLE TargetProcessId
+    );
+
+/**
  * @brief Validate parent-child relationship.
  *
  * Checks if ParentId is the actual parent of ChildId.
@@ -782,14 +799,20 @@ ShadowStrikeGetThreadStartAddress(
 // ============================================================================
 
 /**
- * @brief Validate process image signature.
+ * @brief Query process protection (PPL) and signer status.
  *
- * Checks if process image is properly signed.
- * Uses Code Integrity APIs where available.
+ * Queries ProcessProtectionInformation to determine if the process is
+ * a Protected Process Light (PPL). PPL processes are by definition signed.
+ *
+ * @note This function only checks PPL protection status, NOT the actual
+ *       code-signing signature of the process image. For non-PPL processes,
+ *       IsSigned will remain FALSE even if the image is Authenticode-signed.
+ *       Full image signature validation requires Code Integrity APIs at
+ *       image load time and should be cached separately.
  *
  * @param ProcessId         Process ID
- * @param IsSigned          Receives signature status
- * @param SignerType        Receives signer type (optional)
+ * @param IsSigned          Receives TRUE if process is PPL-protected
+ * @param SignerType        Receives signer type if PPL (optional)
  *
  * @return STATUS_SUCCESS or error
  *

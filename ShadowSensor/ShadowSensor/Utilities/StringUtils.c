@@ -34,20 +34,40 @@
 // ============================================================================
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, ShadowStrikeCopyUnicodeString)
+//
+// Functions callable at DISPATCH_LEVEL are NOT placed in PAGE section.
+// Only functions that require PASSIVE_LEVEL (allocations from PagedPool,
+// Zw* calls, etc.) are placed here.
+//
+// NOT paged (callable at <= DISPATCH_LEVEL):
+//   ShadowStrikeCopyUnicodeString
+//   ShadowStrikeFreeUnicodeString
+//   ShadowStrikeIsStringMatch
+//   ShadowStrikeGetPathType
+//   ShadowStrikeGetFileName
+//   ShadowStrikeGetFileExtension
+//   ShadowStrikeAppendUnicodeString
+//   ShadowStrikeStringStartsWith
+//   ShadowStrikeStringEndsWith
+//   ShadowStrikeStringContains
+//   ShadowStrikeFindSubstring
+//   ShadowStrikeHashUnicodeString
+//   ShadowStrikeHashUnicodeString64
+//   ShadowStrikeStringToLower
+//   ShadowStrikeStringToUpper
+//   ShadowStrikeIsValidUnicodeString
+//   ShadowStrikeIsStringPrintable
+//   ShadowStrikeIsValidFilePath
+//   ShadowStrikeCompareStringToCString
+//   ShadowStrikeStringBuilderCleanup
+//
 #pragma alloc_text(PAGE, ShadowStrikeCloneUnicodeString)
-#pragma alloc_text(PAGE, ShadowStrikeFreeUnicodeString)
-#pragma alloc_text(PAGE, ShadowStrikeIsStringMatch)
-#pragma alloc_text(PAGE, ShadowStrikeGetPathType)
-#pragma alloc_text(PAGE, ShadowStrikeGetFileName)
-#pragma alloc_text(PAGE, ShadowStrikeGetFileExtension)
 #pragma alloc_text(PAGE, ShadowStrikeGetDirectoryPath)
 #pragma alloc_text(PAGE, ShadowStrikeNormalizePath)
 #pragma alloc_text(PAGE, ShadowStrikeDosPathToNtPath)
 #pragma alloc_text(PAGE, ShadowStrikeNtPathToDosPath)
 #pragma alloc_text(PAGE, ShadowStrikeMatchWildcard)
 #pragma alloc_text(PAGE, ShadowStrikeStringBuilderInit)
-#pragma alloc_text(PAGE, ShadowStrikeStringBuilderCleanup)
 #pragma alloc_text(PAGE, ShadowStrikeParseCommandLine)
 #pragma alloc_text(PAGE, ShadowStrikeFreeCommandLineArgs)
 #pragma alloc_text(PAGE, ShadowStrikeGetExePathFromCommandLine)
@@ -72,9 +92,23 @@
 #define SHADOW_FNV1A_PRIME_64 0x100000001b3ULL
 
 /**
- * @brief Invalid path characters
+ * @brief Invalid path characters for DOS paths
  */
 static const WCHAR g_InvalidPathChars[] = L"<>:\"|?*";
+
+/**
+ * @brief Number of invalid path characters (compile-time constant).
+ */
+#define SHADOW_INVALID_PATH_CHAR_COUNT (ARRAYSIZE(g_InvalidPathChars) - 1)
+
+//
+// Compile-time safety: Ensure SHADOW_MAX_PATH * sizeof(WCHAR) fits in USHORT.
+// If SHADOW_MAX_PATH is ever increased beyond 32767, these assertions fire
+// at compile time, preventing silent USHORT truncation in ZwQuerySymbolicLinkObject
+// MaximumLength parameters and UNICODE_STRING construction.
+//
+C_ASSERT(SHADOW_MAX_PATH * sizeof(WCHAR) <= MAXUSHORT);
+C_ASSERT(SHADOW_MAX_PATH <= (MAXUSHORT / sizeof(WCHAR)));
 
 /**
  * @brief String builder growth factor
@@ -94,7 +128,9 @@ ShadowStrikeCopyUnicodeString(
     _In_ PCUNICODE_STRING Source
     )
 {
-    PAGED_CODE();
+    //
+    // Callable at <= DISPATCH_LEVEL (no paged allocation, pure memory copy)
+    //
 
     //
     // Validate parameters
@@ -143,6 +179,10 @@ ShadowStrikeAppendUnicodeString(
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (Destination->Buffer == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     if (Source->Buffer == NULL || Source->Length == 0) {
         return STATUS_SUCCESS;
     }
@@ -181,8 +221,8 @@ ShadowStrikeCloneUnicodeString(
     // Calculate allocation size with overflow check
     //
     allocationSize = (SIZE_T)Source->Length + sizeof(WCHAR);
-    if (allocationSize < Source->Length) {
-        return STATUS_INTEGER_OVERFLOW;
+    if (allocationSize < Source->Length || allocationSize > MAXUSHORT) {
+        return (allocationSize > MAXUSHORT) ? STATUS_NAME_TOO_LONG : STATUS_INTEGER_OVERFLOW;
     }
 
     //
@@ -241,8 +281,8 @@ ShadowStrikeCloneUnicodeStringNonPaged(
     // Calculate allocation size with overflow check
     //
     allocationSize = (SIZE_T)Source->Length + sizeof(WCHAR);
-    if (allocationSize < Source->Length) {
-        return STATUS_INTEGER_OVERFLOW;
+    if (allocationSize < Source->Length || allocationSize > MAXUSHORT) {
+        return (allocationSize > MAXUSHORT) ? STATUS_NAME_TOO_LONG : STATUS_INTEGER_OVERFLOW;
     }
 
     //
@@ -314,7 +354,9 @@ ShadowStrikeIsStringMatch(
     _In_ BOOLEAN CaseInsensitive
     )
 {
-    PAGED_CODE();
+    //
+    // Callable at <= DISPATCH_LEVEL (RtlEqualUnicodeString is DISPATCH-safe)
+    //
 
     if (String1 == NULL || String2 == NULL) {
         return FALSE;
@@ -329,6 +371,8 @@ ShadowStrikeIsStringMatch(
 
 /**
  * @brief Compare UNICODE_STRING with C string.
+ *
+ * Uses bounded scan of CString to prevent runaway reads on unterminated input.
  */
 BOOLEAN
 ShadowStrikeCompareStringToCString(
@@ -338,12 +382,30 @@ ShadowStrikeCompareStringToCString(
     )
 {
     UNICODE_STRING tempString;
+    SIZE_T cstringLen;
 
     if (String == NULL || CString == NULL) {
         return FALSE;
     }
 
-    RtlInitUnicodeString(&tempString, CString);
+    //
+    // Bounded length scan — cap at SHADOW_MAX_PATH to prevent unbounded
+    // wcslen if CString is not properly null-terminated.
+    // wcsnlen is available in kernel CRT (ntoskrnl exports).
+    //
+    cstringLen = wcsnlen(CString, SHADOW_MAX_PATH);
+    if (cstringLen >= SHADOW_MAX_PATH) {
+        //
+        // CString exceeds maximum sane length — no UNICODE_STRING can match
+        // since Length is USHORT (max ~32K chars). Reject as non-match.
+        //
+        return FALSE;
+    }
+
+    tempString.Buffer = (PWCH)CString;
+    tempString.Length = (USHORT)(cstringLen * sizeof(WCHAR));
+    tempString.MaximumLength = tempString.Length;
+
     return RtlEqualUnicodeString(String, &tempString, CaseInsensitive);
 }
 
@@ -359,7 +421,9 @@ ShadowStrikeGetPathType(
     _In_ PCUNICODE_STRING Path
     )
 {
-    PAGED_CODE();
+    //
+    // Callable at <= DISPATCH_LEVEL (pure buffer inspection, no allocation)
+    //
 
     if (ShadowStrikeIsStringEmpty(Path)) {
         return ShadowPathUnknown;
@@ -443,7 +507,9 @@ ShadowStrikeGetFileName(
     USHORT lengthChars;
     PWCHAR lastSeparator = NULL;
 
-    PAGED_CODE();
+    //
+    // Callable at <= DISPATCH_LEVEL (pure buffer inspection, no allocation)
+    //
 
     FileName->Buffer = NULL;
     FileName->Length = 0;
@@ -504,7 +570,9 @@ ShadowStrikeGetFileExtension(
     USHORT lengthChars;
     PWCHAR lastDot = NULL;
 
-    PAGED_CODE();
+    //
+    // Callable at <= DISPATCH_LEVEL (pure buffer inspection, no allocation)
+    //
 
     Extension->Buffer = NULL;
     Extension->Length = 0;
@@ -625,7 +693,7 @@ ShadowStrikeNormalizePath(
     )
 {
     PWCHAR outputBuffer = NULL;
-    PWCHAR components[256];  // Max path depth - enforced with error on overflow
+    PWCHAR components[128];  // Max path depth — 1KB on x64, bounded with error check
     ULONG componentCount = 0;
     USHORT inputLengthChars;
     PWCHAR componentStart;
@@ -701,7 +769,7 @@ ShadowStrikeNormalizePath(
                 // Normal component - add to list
                 // CRITICAL: Check for array overflow and return error
                 //
-                if (componentCount >= 256) {
+                if (componentCount >= ARRAYSIZE(components)) {
                     ExFreePoolWithTag(outputBuffer, SHADOW_PATH_TAG);
                     return STATUS_NAME_TOO_LONG;
                 }
@@ -1371,6 +1439,14 @@ ShadowStrikeStringEndsWith(
         return FALSE;
     }
 
+    //
+    // UNICODE_STRING Length must be WCHAR-aligned (even number).
+    // Odd lengths produce misaligned buffer access.
+    //
+    if ((String->Length | Suffix->Length) & 1) {
+        return FALSE;
+    }
+
     if (String->Length < Suffix->Length) {
         return FALSE;
     }
@@ -1539,6 +1615,14 @@ ShadowStrikeHashUnicodeString64(
 // ============================================================================
 
 /**
+ * @brief Maximum string builder capacity in characters.
+ *
+ * Capped to prevent overflow when converting to UNICODE_STRING
+ * (Length/MaximumLength are USHORT = max 65535 bytes = 32767 WCHARs).
+ */
+#define STRING_BUILDER_MAX_CAPACITY ((SIZE_T)SHADOW_MAX_PATH + 1)
+
+/**
  * @brief Initialize string builder.
  */
 NTSTATUS
@@ -1548,19 +1632,49 @@ ShadowStrikeStringBuilderInit(
     _In_ POOL_TYPE PoolType
     )
 {
+    SIZE_T allocationBytes;
+
     PAGED_CODE();
 
     if (Builder == NULL || InitialCapacity == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Validate PoolType — only accept safe pool types
+    //
+    if (PoolType != PagedPool && PoolType != NonPagedPoolNx) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Cap capacity to prevent overflow in SIZE_T multiplication
+    // and to keep UNICODE_STRING conversion safe
+    //
+    if (InitialCapacity > STRING_BUILDER_MAX_CAPACITY) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    allocationBytes = InitialCapacity * sizeof(WCHAR);
+
     RtlZeroMemory(Builder, sizeof(SHADOW_STRING_BUILDER));
 
-    Builder->Buffer = (PWCHAR)ExAllocatePoolWithTag(
-        PoolType,
-        InitialCapacity * sizeof(WCHAR),
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+    Builder->Buffer = (PWCHAR)ExAllocatePool2(
+        (PoolType == PagedPool) ? POOL_FLAG_PAGED : POOL_FLAG_NON_PAGED,
+        allocationBytes,
         SHADOW_STRING_TAG
     );
+#else
+#pragma warning(push)
+#pragma warning(disable: 4996)
+    Builder->Buffer = (PWCHAR)ExAllocatePoolWithTag(
+        PoolType,
+        allocationBytes,
+        SHADOW_STRING_TAG
+    );
+#pragma warning(pop)
+#endif
 
     if (Builder->Buffer == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -1578,6 +1692,9 @@ ShadowStrikeStringBuilderInit(
 
 /**
  * @brief Internal function to grow builder buffer.
+ *
+ * @note If builder uses PagedPool, this function must be called at
+ *       IRQL < DISPATCH_LEVEL. Callers at DISPATCH must use NonPagedPoolNx builders.
  */
 static
 NTSTATUS
@@ -1588,19 +1705,43 @@ ShadowStrikeStringBuilderGrow(
 {
     PWCHAR newBuffer;
     SIZE_T newCapacity;
+    SIZE_T allocationBytes;
 
     //
-    // Calculate new capacity
+    // IRQL safety: PagedPool allocation at DISPATCH_LEVEL → BSOD.
+    // Catch this programming error early with a clear status.
+    //
+    if (Builder->PoolType == PagedPool && KeGetCurrentIrql() >= DISPATCH_LEVEL) {
+        NT_ASSERT(FALSE);  // Debug builds: break immediately
+        Builder->Overflow = TRUE;
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    //
+    // Enforce absolute cap to prevent runaway growth
+    //
+    if (RequiredCapacity > STRING_BUILDER_MAX_CAPACITY) {
+        Builder->Overflow = TRUE;
+        return STATUS_BUFFER_OVERFLOW;
+    }
+
+    //
+    // Calculate new capacity with doubling strategy
     //
     newCapacity = Builder->Capacity * STRING_BUILDER_GROWTH_FACTOR;
     if (newCapacity < RequiredCapacity) {
         newCapacity = RequiredCapacity;
     }
+    if (newCapacity > STRING_BUILDER_MAX_CAPACITY) {
+        newCapacity = STRING_BUILDER_MAX_CAPACITY;
+    }
 
     //
-    // Overflow check
+    // Safe multiplication — explicit check rather than relying on wrap-around
+    // (wrap-around check is dead code on 64-bit where SIZE_T is 8 bytes)
     //
-    if (newCapacity * sizeof(WCHAR) < newCapacity) {
+    allocationBytes = newCapacity * sizeof(WCHAR);
+    if (newCapacity != 0 && allocationBytes / sizeof(WCHAR) != newCapacity) {
         Builder->Overflow = TRUE;
         return STATUS_INTEGER_OVERFLOW;
     }
@@ -1608,11 +1749,22 @@ ShadowStrikeStringBuilderGrow(
     //
     // Allocate new buffer
     //
-    newBuffer = (PWCHAR)ExAllocatePoolWithTag(
-        Builder->PoolType,
-        newCapacity * sizeof(WCHAR),
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+    newBuffer = (PWCHAR)ExAllocatePool2(
+        (Builder->PoolType == PagedPool) ? POOL_FLAG_PAGED : POOL_FLAG_NON_PAGED,
+        allocationBytes,
         Builder->PoolTag
     );
+#else
+#pragma warning(push)
+#pragma warning(disable: 4996)
+    newBuffer = (PWCHAR)ExAllocatePoolWithTag(
+        Builder->PoolType,
+        allocationBytes,
+        Builder->PoolTag
+    );
+#pragma warning(pop)
+#endif
 
     if (newBuffer == NULL) {
         Builder->Overflow = TRUE;
@@ -1749,26 +1901,50 @@ ShadowStrikeStringBuilderAppendFormat(
 }
 
 /**
- * @brief Get UNICODE_STRING from builder.
+ * @brief Get UNICODE_STRING from builder (no allocation).
+ *
+ * @note The returned UNICODE_STRING points into the builder's buffer.
+ *       It becomes invalid after builder cleanup or further appends
+ *       that trigger reallocation.
+ *
+ * @return TRUE if conversion succeeded, FALSE if builder content
+ *         exceeds UNICODE_STRING capacity (MAXUSHORT bytes).
  */
-VOID
+BOOLEAN
 ShadowStrikeStringBuilderToUnicodeString(
     _In_ PSHADOW_STRING_BUILDER Builder,
     _Out_ PUNICODE_STRING String
     )
 {
+    SIZE_T lengthBytes;
+    SIZE_T capacityBytes;
+
     if (Builder == NULL || String == NULL) {
         if (String != NULL) {
             String->Buffer = NULL;
             String->Length = 0;
             String->MaximumLength = 0;
         }
-        return;
+        return FALSE;
+    }
+
+    lengthBytes = Builder->Length * sizeof(WCHAR);
+    capacityBytes = Builder->Capacity * sizeof(WCHAR);
+
+    //
+    // UNICODE_STRING Length/MaximumLength are USHORT — reject if too large
+    //
+    if (lengthBytes > MAXUSHORT || capacityBytes > MAXUSHORT) {
+        String->Buffer = NULL;
+        String->Length = 0;
+        String->MaximumLength = 0;
+        return FALSE;
     }
 
     String->Buffer = Builder->Buffer;
-    String->Length = (USHORT)(Builder->Length * sizeof(WCHAR));
-    String->MaximumLength = (USHORT)(Builder->Capacity * sizeof(WCHAR));
+    String->Length = (USHORT)lengthBytes;
+    String->MaximumLength = (USHORT)capacityBytes;
+    return TRUE;
 }
 
 /**
@@ -1779,7 +1955,11 @@ ShadowStrikeStringBuilderCleanup(
     _Inout_ PSHADOW_STRING_BUILDER Builder
     )
 {
-    PAGED_CODE();
+    //
+    // NO PAGED_CODE() — Builder may use NonPagedPoolNx, and caller
+    // may need to cleanup at DISPATCH_LEVEL. ExFreePoolWithTag is
+    // safe at <= DISPATCH_LEVEL.
+    //
 
     if (Builder == NULL) {
         return;
@@ -1898,6 +2078,14 @@ ShadowStrikeParseCommandLine(
 
                         argCount++;
                     }
+                } else {
+                    //
+                    // Argument limit exceeded — fail explicitly rather than
+                    // silently dropping arguments (an attacker could hide
+                    // malicious arguments beyond the limit to evade detection)
+                    //
+                    status = STATUS_BUFFER_OVERFLOW;
+                    goto cleanup;
                 }
                 inArg = FALSE;
             }
@@ -2145,6 +2333,17 @@ ShadowStrikeUnicodeToAnsi(
     //
     ansiLength = RtlUnicodeStringToAnsiSize(UnicodeString);
 
+    if (ansiLength == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Validate size fits in USHORT for ANSI_STRING.MaximumLength
+    //
+    if (ansiLength > MAXUSHORT) {
+        return STATUS_NAME_TOO_LONG;
+    }
+
     AnsiString->Buffer = (PCHAR)ExAllocatePoolWithTag(
         PagedPool,
         ansiLength,
@@ -2269,9 +2468,16 @@ ShadowStrikeIsValidUnicodeString(
     }
 
     //
-    // Empty string is valid
+    // Empty string is valid only if consistent
     //
     if (String->Length == 0) {
+        //
+        // If MaximumLength > 0, Buffer must be non-null (buffer is allocated
+        // but currently empty). Buffer==NULL with MaximumLength>0 is inconsistent.
+        //
+        if (String->MaximumLength > 0 && String->Buffer == NULL) {
+            return FALSE;
+        }
         return TRUE;
     }
 
@@ -2331,7 +2537,12 @@ ShadowStrikeIsStringPrintable(
 }
 
 /**
- * @brief Check if string is valid file path.
+ * @brief Check if string is a valid DOS file path.
+ *
+ * @note This validates DOS-style paths (e.g., C:\Windows\file.txt).
+ *       NT device paths (\Device\...) and UNC paths (\\server\share)
+ *       may contain characters that this function rejects (e.g., '?' in \\?\).
+ *       Use ShadowStrikeGetPathType() first if you need to validate non-DOS paths.
  */
 BOOLEAN
 ShadowStrikeIsValidFilePath(
@@ -2347,7 +2558,7 @@ ShadowStrikeIsValidFilePath(
     }
 
     lengthChars = Path->Length / sizeof(WCHAR);
-    invalidCount = (USHORT)(wcslen(g_InvalidPathChars));
+    invalidCount = SHADOW_INVALID_PATH_CHAR_COUNT;
 
     //
     // Check for invalid characters (skip first 3 chars for drive letter)

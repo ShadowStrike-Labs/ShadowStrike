@@ -1,6 +1,11 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: NtdllIntegrity.h - Ntdll integrity monitoring
+
+    Provides kernel-mode NTDLL integrity verification by comparing
+    per-process ntdll.dll memory against a clean on-disk baseline.
+    Detects inline hooks, syscall stub tampering, and PE modifications.
+
     Copyright (c) ShadowStrike Team
 --*/
 
@@ -12,7 +17,14 @@ extern "C" {
 
 #include <ntddk.h>
 
-#define NI_POOL_TAG 'ININ'
+//
+// Distinct pool tags for different allocation categories (aids debugging)
+//
+#define NI_POOL_TAG_MONITOR     'mNIs'  // Monitor structure
+#define NI_POOL_TAG_PROCESS     'pNIs'  // Process state
+#define NI_POOL_TAG_FUNCTION    'fNIs'  // Function state
+#define NI_POOL_TAG_NTDLL       'nNIs'  // Clean NTDLL copy
+#define NI_POOL_TAG_TEMP        'tNIs'  // Temporary buffers
 
 typedef enum _NI_MODIFICATION {
     NiMod_None = 0,
@@ -41,30 +53,37 @@ typedef struct _NI_PROCESS_NTDLL {
     PVOID NtdllBase;
     SIZE_T NtdllSize;
     UCHAR Hash[32];                     // SHA-256 of .text section
+    BOOLEAN HashValid;                  // TRUE if Hash was computed successfully
     
-    // Function states
+    // Function states - protected by FunctionLock (push lock, PASSIVE/APC safe)
     LIST_ENTRY FunctionList;
-    KSPIN_LOCK FunctionLock;
+    EX_PUSH_LOCK FunctionLock;
     ULONG FunctionCount;
     
     // Modification tracking
     ULONG ModificationCount;
+    ULONG HookCount;                    // Count of NiMod_HookInstalled specifically
     LARGE_INTEGER LastCheck;
     
     LIST_ENTRY ListEntry;
 } NI_PROCESS_NTDLL, *PNI_PROCESS_NTDLL;
 
 typedef struct _NI_MONITOR {
-    BOOLEAN Initialized;
+    volatile LONG Initialized;
     
     // Clean ntdll reference
     PVOID CleanNtdllCopy;
     SIZE_T CleanNtdllSize;
+    BOOLEAN CleanHashValid;             // TRUE if clean hash was computed
     
     // Process tracking
     LIST_ENTRY ProcessList;
     EX_PUSH_LOCK ProcessLock;
     volatile LONG ProcessCount;
+    
+    // Active operation count for safe shutdown drain
+    volatile LONG ActiveOperations;
+    KEVENT DrainEvent;
     
     struct {
         volatile LONG64 ProcessesMonitored;
@@ -74,13 +93,26 @@ typedef struct _NI_MONITOR {
     } Stats;
 } NI_MONITOR, *PNI_MONITOR;
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS NiInitialize(_Out_ PNI_MONITOR* Monitor);
+
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID NiShutdown(_Inout_ PNI_MONITOR Monitor);
+
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS NiScanProcess(_In_ PNI_MONITOR Monitor, _In_ HANDLE ProcessId, _Out_ PNI_PROCESS_NTDLL* State);
+
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS NiCheckFunction(_In_ PNI_MONITOR Monitor, _In_ HANDLE ProcessId, _In_ PCSTR FunctionName, _Out_ PNI_FUNCTION_STATE* State);
+
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS NiDetectHooks(_In_ PNI_MONITOR Monitor, _In_ HANDLE ProcessId, _Out_writes_to_(Max, *Count) PNI_FUNCTION_STATE* Hooks, _In_ ULONG Max, _Out_ PULONG Count);
+
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS NiCompareToClean(_In_ PNI_MONITOR Monitor, _In_ HANDLE ProcessId, _Out_ PBOOLEAN IsModified);
-VOID NiFreeState(_In_ PNI_PROCESS_NTDLL State);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID NiFreeState(_In_ PNI_MONITOR Monitor, _In_ PNI_PROCESS_NTDLL State);
 
 #ifdef __cplusplus
 }
