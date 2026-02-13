@@ -42,7 +42,7 @@
 
 #include "StreamContext.h"
 #include "../Core/Globals.h"
-#include "../Shared/VerdictTypes.h"
+#include"../../Shared/VerdictTypes.h"
 
 // ============================================================================
 // PAGED CODE PRAGMA

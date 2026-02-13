@@ -34,7 +34,7 @@
  *    - Subroutine reordering
  *
  * 4. FUZZY MATCHING
- *    - SSDEEP integration
+ *    - Fuzzy hash integration
  *    - TLSH similarity
  *    - Normalized hash matching
  *    - Family clustering
@@ -133,8 +133,8 @@ namespace PolyConstants {
     /// @brief Minimum code size for analysis
     inline constexpr size_t MIN_CODE_SIZE = 32;
     
-    /// @brief SSDEEP similarity threshold
-    inline constexpr uint32_t SSDEEP_THRESHOLD = 70;
+    /// @brief Fuzzy hash similarity threshold
+    inline constexpr uint32_t FUZZY_THRESHOLD = 70;
     
     /// @brief Decryption loop detection threshold
     inline constexpr uint32_t DECRYPT_LOOP_THRESHOLD = 5;
@@ -361,8 +361,8 @@ struct PolyResult {
     /// @brief Fuzzy hash matches
     std::vector<FuzzyHashMatch> fuzzyMatches;
     
-    /// @brief SSDEEP hash (of normalized code)
-    std::string ssdeepHash;
+    /// @brief Fuzzy hash (of normalized code)
+    std::string fuzzyHash;
     
     /// @brief TLSH hash (of normalized code)
     std::string tlshHash;
@@ -389,8 +389,8 @@ struct PolyAnalysisOptions {
     /// @brief Enable fuzzy matching
     bool enableFuzzyMatching = true;
     
-    /// @brief SSDEEP threshold
-    uint32_t ssdeepThreshold = PolyConstants::SSDEEP_THRESHOLD;
+    /// @brief Fuzzy hash threshold
+    uint32_t fuzzyThreshold = PolyConstants::FUZZY_THRESHOLD;
     
     /// @brief Enable decryption loop detection
     bool detectDecryptionLoops = true;
@@ -548,14 +548,14 @@ public:
     /// @brief Match with fuzzy hash database
     [[nodiscard]] std::vector<FuzzyHashMatch> FuzzyMatch(std::span<const uint8_t> normalizedCode);
     
-    /// @brief Calculate SSDEEP hash
-    [[nodiscard]] std::string CalculateSSDeep(std::span<const uint8_t> data);
+    /// @brief Calculate fuzzy hash
+    [[nodiscard]] std::string CalculateFuzzyHash(std::span<const uint8_t> data);
     
     /// @brief Calculate TLSH hash
     [[nodiscard]] std::string CalculateTLSH(std::span<const uint8_t> data);
     
-    /// @brief Compare SSDEEP hashes
-    [[nodiscard]] uint32_t CompareSSDeep(const std::string& hash1, const std::string& hash2);
+    /// @brief Compare fuzzy hashes
+    [[nodiscard]] uint32_t CompareFuzzyHash(const std::string& hash1, const std::string& hash2);
 
     // ========================================================================
     // CALLBACKS

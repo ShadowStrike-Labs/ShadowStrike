@@ -18,7 +18,7 @@
  * - SHA-256 (modern signatures)
  * - SHA-512 (high-security)
  * - ImpHash (PE import hashes)
- * - SSDEEP (fuzzy matching)
+ * - CTPH Fuzzy hash (context-triggered piecewise)
  * - TLSH (Trend Micro Locality Sensitive Hash)
  *
  * Architecture:
@@ -246,7 +246,7 @@ public:
     // Check if hash exists (bloom filter fast path)
     [[nodiscard]] bool Contains(const HashValue& hash) const noexcept;
 
-    // Fuzzy hash matching (SSDEEP/TLSH)
+    // Fuzzy hash matching (CTPH/TLSH)
     [[nodiscard]] std::vector<DetectionResult> FuzzyMatch(
         const HashValue& hash,
         uint32_t similarityThreshold = 80              // 0-100

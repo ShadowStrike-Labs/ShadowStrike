@@ -151,7 +151,7 @@ ShadowStrike/
 │   ├── nlohmann/json.hpp           # JSON parsing
 │   ├── pugixml/                    # XML parsing
 │   ├── SQLiteCpp/                  # SQLite C++ wrapper
-│   ├── ssdeep/                     # Fuzzy hashing
+│   ├── FuzzyHasher/                # CTPH fuzzy hashing
 │   └── tlsh/                       # Trend Micro Locality Sensitive Hash
 │
 ├── tests/                          # Unit tests
@@ -292,7 +292,7 @@ Query Hash → Cache Check → Bloom Filter → Hash Bucket → Result
 | SHA1 | 160-bit | Standard malware hashes |
 | SHA256 | 256-bit | Modern standard |
 | SHA512 | 512-bit | High security |
-| SSDEEP | variable | Fuzzy matching |
+| FUZZY | variable | Fuzzy matching |
 | TLSH | 70 chars | Similarity detection |
 | ImpHash | 128-bit | PE import hash |
 
@@ -960,7 +960,7 @@ The current infrastructure is designed to integrate with future components:
 | nlohmann/json | 3.11+ | JSON parsing |
 | pugixml | 1.13+ | XML parsing |
 | SQLiteCpp | 3.3+ | SQLite wrapper |
-| ssdeep | 2.14+ | Fuzzy hashing |
+| FuzzyHasher | 1.0 | CTPH fuzzy hashing (built-in) |
 | TLSH | 4.8+ | Locality sensitive hash |
 | GoogleTest | 1.14+ | Unit testing |
 | YARA | 4.3+ | Rule matching |

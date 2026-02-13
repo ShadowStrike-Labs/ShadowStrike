@@ -297,7 +297,7 @@ struct EngineResult {
     uint64_t scanDurationUs = 0;        ///< Microseconds
     std::string sha256;                 ///< File hash (calculated during scan)
     std::string md5;                    ///< MD5 hash
-    std::string ssdeep;                 ///< Fuzzy hash
+    std::string fuzzyHash;               ///< Fuzzy hash
 
     // Detailed findings
     std::vector<std::string> detectionMethods;  ///< All methods that detected

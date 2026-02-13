@@ -669,7 +669,7 @@ enum class HashAlgorithm : uint8_t {
     SHA512 = 3,         ///< 64 bytes - high security
     SHA3_256 = 4,       ///< 32 bytes - NIST standard
     SHA3_512 = 5,       ///< 64 bytes - NIST standard
-    SSDEEP = 6,         ///< Variable - fuzzy hash
+    FUZZY = 6,          ///< Variable - context-triggered piecewise hash
     TLSH = 7,           ///< 70 bytes - locality sensitive
     ImpHash = 8,        ///< 16 bytes - PE import hash
     TypeHash = 9,       ///< 32 bytes - type-based hash
@@ -685,7 +685,7 @@ enum class HashAlgorithm : uint8_t {
         case HashAlgorithm::SHA512:       return 64;
         case HashAlgorithm::SHA3_256:     return 32;
         case HashAlgorithm::SHA3_512:     return 64;
-        case HashAlgorithm::SSDEEP:       return 72;  // Max SSDEEP length
+        case HashAlgorithm::FUZZY:        return 72;  // Max fuzzy hash length
         case HashAlgorithm::TLSH:         return 70;
         case HashAlgorithm::ImpHash:      return 16;
         case HashAlgorithm::TypeHash:     return 32;
@@ -703,7 +703,7 @@ enum class HashAlgorithm : uint8_t {
         case HashAlgorithm::SHA512:       return "SHA-512";
         case HashAlgorithm::SHA3_256:     return "SHA3-256";
         case HashAlgorithm::SHA3_512:     return "SHA3-512";
-        case HashAlgorithm::SSDEEP:       return "SSDEEP";
+        case HashAlgorithm::FUZZY:        return "FUZZY";
         case HashAlgorithm::TLSH:         return "TLSH";
         case HashAlgorithm::ImpHash:      return "ImpHash";
         case HashAlgorithm::TypeHash:     return "TypeHash";
@@ -1124,7 +1124,7 @@ struct alignas(4) HashValue {
     /// @brief Reserved for alignment
     uint8_t reserved[2];
     
-    /// @brief Hash data (max 72 bytes for SSDEEP)
+    /// @brief Hash data (max 72 bytes for fuzzy hashes)
     std::array<uint8_t, 72> data;
     
     // =========================================================================
@@ -1210,8 +1210,8 @@ struct alignas(4) HashValue {
     [[nodiscard]] bool IsValid() const noexcept {
         if (length == 0) return false;
         uint8_t expected = GetHashLength(algorithm);
-        // SSDEEP and TLSH have variable length
-        if (algorithm == HashAlgorithm::SSDEEP || algorithm == HashAlgorithm::TLSH) {
+        // Fuzzy and TLSH have variable length
+        if (algorithm == HashAlgorithm::FUZZY || algorithm == HashAlgorithm::TLSH) {
             return length > 0 && length <= expected;
         }
         return length == expected;

@@ -668,7 +668,7 @@ struct alignas(256) ExecutableInfo {
     std::string sha1Hex;
     std::string sha256Hex;
     std::string imphash;
-    std::string ssdeep;
+    std::string fuzzyHash;
 
     // File metadata
     uint64_t fileSize{ 0 };

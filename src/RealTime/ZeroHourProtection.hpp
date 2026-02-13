@@ -387,11 +387,11 @@ struct alignas(8) FileHash {
     std::array<uint8_t, 32> sha256{ 0 };
     std::array<uint8_t, 16> md5{ 0 };
     std::array<uint8_t, 4> imphash{ 0 };       ///< Import hash (PE files)
-    std::array<uint8_t, 32> ssdeep{ 0 };       ///< Fuzzy hash
+    std::array<uint8_t, 32> fuzzyHash{ 0 };     ///< Fuzzy hash
     std::array<uint8_t, 32> tlsh{ 0 };         ///< Trend Micro LSH
     
     bool hasImphash{ false };
-    bool hasSsdeep{ false };
+    bool hasFuzzyHash{ false };
     bool hasTlsh{ false };
 
     // String representations (computed on demand)

@@ -2377,7 +2377,7 @@ std::vector<HashType> GetSupportedHashTypes() noexcept {
         HashType::SHA256,
         HashType::SHA512,
         HashType::IMPHASH,
-        HashType::SSDEEP,
+        HashType::FUZZY,
         HashType::TLSH
     };
 }

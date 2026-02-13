@@ -23,7 +23,7 @@
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/JSONUtils.hpp"
 #include "../Utils/StringUtils.hpp"
-#include <ssdeep/fuzzy.h>
+#include "../FuzzyHasher/FuzzyHasher.hpp"
 #include <tlsh/tlsh.h>
 #include <format>
 #include <chrono>

@@ -31,9 +31,7 @@
 #include "../SignatureStore/SignatureStore.hpp"
 
 // Fuzzy hashing libraries
-extern "C" {
-#include "ssdeep/fuzzy.h"
-}
+#include "../FuzzyHasher/FuzzyHasher.hpp"
 #include "tlsh/tlsh.h"
 
 #include <Zydis/Zydis.h>
@@ -1574,7 +1572,7 @@ static const wchar_t* TechniqueToStringInternal(MetamorphicTechnique technique) 
     case MetamorphicTechnique::STRUCT_TLSCallbacks: return L"TLS Callbacks Present";
     case MetamorphicTechnique::STRUCT_MultipleEntryPoints: return L"Multiple Entry Points";
     case MetamorphicTechnique::STRUCT_SelfReferential: return L"Self-Referential Structures";
-    case MetamorphicTechnique::SIMILARITY_SSDeepMatch: return L"SSDEEP Fuzzy Match";
+    case MetamorphicTechnique::SIMILARITY_FuzzyMatch: return L"Fuzzy Hash Match";
     case MetamorphicTechnique::SIMILARITY_TLSHMatch: return L"TLSH Fuzzy Match";
     case MetamorphicTechnique::SIMILARITY_FunctionMatch: return L"Function Similarity Match";
     case MetamorphicTechnique::SIMILARITY_BasicBlockMatch: return L"Basic Block Match";
@@ -2466,8 +2464,8 @@ bool MetamorphicDetector::PerformFuzzyMatching(
         // PHASE 1: Compute fuzzy hashes for the file
         // ====================================================================
         
-        // ComputeSSDeep/ComputeTLSH return std::optional<std::string>
-        std::optional<std::string> ssdeepHash = ComputeSSDeep(filePath, err);
+        // ComputeFuzzyHash/ComputeTLSH return std::optional<std::string>
+        std::optional<std::string> fuzzyHashResult = ComputeFuzzyHash(filePath, err);
         std::optional<std::string> tlshHash = ComputeTLSH(filePath, err);
 
         // ====================================================================
@@ -2477,30 +2475,30 @@ bool MetamorphicDetector::PerformFuzzyMatching(
         bool hasHashStoreMatches = false;
         
         if (m_impl->m_hashStore && m_impl->m_hashStore->IsInitialized()) {
-            // Check SSDEEP hash against known malware database
-            if (ssdeepHash.has_value() && !ssdeepHash->empty()) {
+            // Check fuzzy hash against known malware database
+            if (fuzzyHashResult.has_value() && !fuzzyHashResult->empty()) {
                 // Convert to HashValue for HashStore lookup
-                SignatureStore::HashValue ssdeepHashValue;
-                ssdeepHashValue.type = SignatureStore::HashType::SSDEEP;
+                SignatureStore::HashValue fuzzyHashValue;
+                fuzzyHashValue.type = SignatureStore::HashType::FUZZY;
                 
-                // Copy hash data (SSDEEP hashes are up to 64 bytes)
-                const std::string& hashStr = *ssdeepHash;
-                size_t copyLen = std::min(hashStr.size(), ssdeepHashValue.data.size());
-                std::memcpy(ssdeepHashValue.data.data(), hashStr.data(), copyLen);
-                ssdeepHashValue.length = static_cast<uint8_t>(copyLen);
+                // Copy hash data (fuzzy hashes are up to 64 bytes)
+                const std::string& hashStr = *fuzzyHashResult;
+                size_t copyLen = std::min(hashStr.size(), fuzzyHashValue.data.size());
+                std::memcpy(fuzzyHashValue.data.data(), hashStr.data(), copyLen);
+                fuzzyHashValue.length = static_cast<uint8_t>(copyLen);
                 
                 // Perform fuzzy matching against database
                 // FuzzyMatch returns matches above similarity threshold
-                auto fuzzyMatches = m_impl->m_hashStore->FuzzyMatch(ssdeepHashValue, 70);
+                auto fuzzyMatches = m_impl->m_hashStore->FuzzyMatch(fuzzyHashValue, 70);
                 
                 for (const auto& match : fuzzyMatches) {
                     FuzzyHashMatch fuzzyMatch;
-                    fuzzyMatch.hashType = L"SSDEEP";
-                    fuzzyMatch.computedHash = Utils::StringUtils::ToWide(*ssdeepHash);
+                    fuzzyMatch.hashType = L"FUZZY";
+                    fuzzyMatch.computedHash = Utils::StringUtils::ToWide(*fuzzyHashResult);
                     fuzzyMatch.matchedHash = Utils::StringUtils::ToWide(match.signatureName);
                     fuzzyMatch.malwareFamily = Utils::StringUtils::ToWide(match.signatureName);
                     
-                    // SSDEEP similarity score is 0-100
+                    // Fuzzy similarity score is 0-100
                     fuzzyMatch.similarityScore = 100; // HashStore doesn't expose similarity directly
                     
                     // Convert threat level to confidence
@@ -2592,7 +2590,7 @@ bool MetamorphicDetector::PerformFuzzyMatching(
         // ====================================================================
         
         if (m_impl->m_sigStore && m_impl->m_sigStore->IsInitialized() && 
-            ssdeepHash.has_value() && !ssdeepHash->empty()) {
+            fuzzyHashResult.has_value() && !fuzzyHashResult->empty()) {
             
             // Use SignatureStore's unified scanning with fuzzy hash option
             SignatureStore::ScanOptions scanOpts;
@@ -2601,16 +2599,16 @@ bool MetamorphicDetector::PerformFuzzyMatching(
             scanOpts.enableYaraScan = false;
             scanOpts.maxResults = 10;
             
-            // Look up by SSDEEP hash string (already narrow string)
+            // Look up by fuzzy hash string (already narrow string)
             auto lookupResult = m_impl->m_sigStore->LookupHashString(
-                *ssdeepHash,
-                SignatureStore::HashType::SSDEEP
+                *fuzzyHashResult,
+                SignatureStore::HashType::FUZZY
             );
             
             if (lookupResult.has_value()) {
                 FuzzyHashMatch sigMatch;
-                sigMatch.hashType = L"SSDEEP";
-                sigMatch.computedHash = Utils::StringUtils::ToWide(*ssdeepHash);
+                sigMatch.hashType = L"FUZZY";
+                sigMatch.computedHash = Utils::StringUtils::ToWide(*fuzzyHashResult);
                 sigMatch.matchedHash = Utils::StringUtils::ToWide(lookupResult->signatureName);
                 sigMatch.malwareFamily = Utils::StringUtils::ToWide(lookupResult->signatureName);
                 sigMatch.similarityScore = 100; // Exact match from lookup
@@ -2639,18 +2637,18 @@ bool MetamorphicDetector::PerformFuzzyMatching(
         // ====================================================================
         
         if (!hasHashStoreMatches) {
-            // Add SSDEEP hash result (no match but hash computed)
-            if (ssdeepHash.has_value() && !ssdeepHash->empty()) {
-                FuzzyHashMatch ssdeepResult;
-                ssdeepResult.hashType = L"SSDEEP";
-                ssdeepResult.computedHash = Utils::StringUtils::ToWide(*ssdeepHash);
-                ssdeepResult.matchedHash.clear(); // No match
-                ssdeepResult.malwareFamily.clear();
-                ssdeepResult.similarityScore = 0;
-                ssdeepResult.confidence = 0.0;
-                ssdeepResult.isSignificant = false;
+            // Add fuzzy hash result (no match but hash computed)
+            if (fuzzyHashResult.has_value() && !fuzzyHashResult->empty()) {
+                FuzzyHashMatch fuzzyResult;
+                fuzzyResult.hashType = L"FUZZY";
+                fuzzyResult.computedHash = Utils::StringUtils::ToWide(*fuzzyHashResult);
+                fuzzyResult.matchedHash.clear(); // No match
+                fuzzyResult.malwareFamily.clear();
+                fuzzyResult.similarityScore = 0;
+                fuzzyResult.confidence = 0.0;
+                fuzzyResult.isSignificant = false;
                 
-                outMatches.push_back(std::move(ssdeepResult));
+                outMatches.push_back(std::move(fuzzyResult));
             }
             
             // Add TLSH hash result
@@ -2828,7 +2826,7 @@ bool MetamorphicDetector::MatchKnownFamilies(
     }
 }
 
-std::optional<std::string> MetamorphicDetector::ComputeSSDeep(
+std::optional<std::string> MetamorphicDetector::ComputeFuzzyHash(
     const std::wstring& filePath,
     MetamorphicError* err) noexcept
 {
@@ -2846,34 +2844,34 @@ std::optional<std::string> MetamorphicDetector::ComputeSSDeep(
         if (!mappedFile.mapReadOnly(filePath)) {
             if (err) {
                 err->win32Code = GetLastError();
-                err->message = L"Failed to map file for SSDEEP: " + filePath;
+                err->message = L"Failed to map file for fuzzy hashing: " + filePath;
             }
             return std::nullopt;
         }
 
-        // SSDEEP needs minimum ~4KB for meaningful hash
-        constexpr size_t SSDEEP_MIN_SIZE = 4096;
-        if (mappedFile.size() < SSDEEP_MIN_SIZE) {
+        // Fuzzy hashing needs minimum ~4KB for meaningful digest
+        constexpr size_t FUZZY_MIN_SIZE = 4096;
+        if (mappedFile.size() < FUZZY_MIN_SIZE) {
             if (err) {
                 err->win32Code = ERROR_INSUFFICIENT_BUFFER;
-                err->message = L"File too small for SSDEEP (< 4KB)";
+                err->message = L"File too small for fuzzy hashing (< 4KB)";
             }
             SS_LOG_DEBUG(L"MetamorphicDetector", 
-                L"File too small for SSDEEP: {} ({} bytes)", 
+                L"File too small for fuzzy hashing: {} ({} bytes)", 
                 filePath, mappedFile.size());
             return std::nullopt;
         }
 
         // Cap at 256MB to prevent excessive memory/time usage
-        constexpr size_t SSDEEP_MAX_SIZE = 256 * 1024 * 1024;
-        size_t hashSize = std::min(mappedFile.size(), SSDEEP_MAX_SIZE);
+        constexpr size_t FUZZY_MAX_SIZE = 256 * 1024 * 1024;
+        size_t hashSize = std::min(mappedFile.size(), FUZZY_MAX_SIZE);
 
-        // Allocate result buffer (FUZZY_MAX_RESULT = 148 bytes)
-        char hashBuffer[FUZZY_MAX_RESULT + 1] = { 0 };
+        // Allocate result buffer
+        char hashBuffer[ShadowStrike::FuzzyHasher::kMaxResultLength + 1] = { 0 };
 
-        // Compute SSDEEP using the library's buffer-based API
-        int result = fuzzy_hash_buf(
-            static_cast<const unsigned char*>(mappedFile.data()),
+        // Compute fuzzy hash using the CTPH engine
+        int result = ShadowStrike::FuzzyHasher::HashBufferRaw(
+            static_cast<const uint8_t*>(mappedFile.data()),
             static_cast<uint32_t>(hashSize),
             hashBuffer
         );
@@ -2881,25 +2879,25 @@ std::optional<std::string> MetamorphicDetector::ComputeSSDeep(
         if (result != 0) {
             if (err) {
                 err->win32Code = ERROR_INVALID_DATA;
-                err->message = L"SSDEEP computation failed with code: " + 
+                err->message = L"Fuzzy hash computation failed with code: " + 
                     std::to_wstring(result);
             }
             SS_LOG_WARN(L"MetamorphicDetector", 
-                L"SSDEEP computation failed (ret={}) for: {}", result, filePath);
+                L"Fuzzy hash computation failed (ret={}) for: {}", result, filePath);
             return std::nullopt;
         }
 
         if (hashBuffer[0] == '\0') {
             if (err) {
                 err->win32Code = ERROR_INVALID_DATA;
-                err->message = L"SSDEEP returned empty hash";
+                err->message = L"Fuzzy hash returned empty digest";
             }
             return std::nullopt;
         }
 
         std::string hash(hashBuffer);
         SS_LOG_DEBUG(L"MetamorphicDetector", 
-            L"SSDEEP computed: {} for: {}", 
+            L"Fuzzy hash computed: {} for: {}", 
             Utils::StringUtils::ToWide(hash), filePath);
 
         return hash;
@@ -2907,11 +2905,11 @@ std::optional<std::string> MetamorphicDetector::ComputeSSDeep(
     } catch (const std::exception& e) {
         if (err) {
             err->win32Code = ERROR_INTERNAL_ERROR;
-            err->message = L"Exception in ComputeSSDeep: " + 
+            err->message = L"Exception in ComputeFuzzyHash: " + 
                 Utils::StringUtils::ToWide(e.what());
         }
         SS_LOG_ERROR(L"MetamorphicDetector", 
-            L"Exception in ComputeSSDeep: {}", 
+            L"Exception in ComputeFuzzyHash: {}", 
             Utils::StringUtils::ToWide(e.what()));
         return std::nullopt;
     }
@@ -3015,27 +3013,27 @@ std::optional<std::string> MetamorphicDetector::ComputeTLSH(
     }
 }
 
-int MetamorphicDetector::CompareSSDeep(const std::string& hash1, const std::string& hash2) noexcept {
+int MetamorphicDetector::CompareFuzzyHash(const std::string& hash1, const std::string& hash2) noexcept {
     // Validate inputs
     if (hash1.empty() || hash2.empty()) {
         return 0; // No similarity if either hash is empty
     }
 
-    // SSDEEP hash format: blocksize:hash1:hash2
+    // Fuzzy hash format: blocksize:hash1:hash2
     // Validate basic format
     if (hash1.find(':') == std::string::npos || hash2.find(':') == std::string::npos) {
         SS_LOG_WARN(L"MetamorphicDetector", 
-            L"Invalid SSDEEP hash format in CompareSSDeep");
+            L"Invalid fuzzy hash format in CompareFuzzyHash");
         return 0;
     }
 
-    // Use ssdeep library's fuzzy_compare function
+    // Use CTPH engine's comparison function
     // Returns: 0-100 similarity score, or -1 on error
-    int score = fuzzy_compare(hash1.c_str(), hash2.c_str());
+    int score = ShadowStrike::FuzzyHasher::Compare(hash1.c_str(), hash2.c_str());
 
     if (score < 0) {
         SS_LOG_WARN(L"MetamorphicDetector", 
-            L"fuzzy_compare returned error: {}", score);
+            L"Fuzzy hash comparison returned error: {}", score);
         return 0;
     }
 
@@ -4821,7 +4819,7 @@ void MetamorphicDetector::AnalyzePacking(
  * @brief Perform fuzzy hash matching and family similarity analysis
  *
  * Compares the analyzed file against known malware families using:
- * - SSDEEP fuzzy hashing (context-triggered piecewise hashing)
+ * - CTPH fuzzy hashing (context-triggered piecewise hashing)
  * - TLSH locality-sensitive hashing
  * - Function-level similarity matching
  * - Basic block CFG comparison
@@ -4847,20 +4845,20 @@ void MetamorphicDetector::PerformSimilarityAnalysis(
     }
 
     // ========================================================================
-    // SSDEEP Fuzzy Hash Matching
+    // CTPH Fuzzy Hash Matching
     // ========================================================================
 
     if (m_impl->m_hashStore) {
-        auto ssdeepHash = ComputeSSDeep(filePath, nullptr);
-        if (ssdeepHash) {
+        auto fuzzyHashStr = ComputeFuzzyHash(filePath, nullptr);
+        if (fuzzyHashStr) {
             // Store for result
-            result.ssdeepHash = *ssdeepHash;
+            result.fuzzyHash = *fuzzyHashStr;
 
             // Query hash store for similar hashes
             // Note: This is a simplified implementation
             // Real implementation would query the HashStore's fuzzy index
 
-            // For now, we mark that SSDEEP was computed successfully
+            // For now, we mark that fuzzy hash was computed successfully
             // The actual matching would be performed by HashStore
         }
     }

@@ -6,7 +6,7 @@
 #include"HashStore.hpp"
 #include <algorithm>
 #include<tlsh/tlsh.h>
-#include<ssdeep/fuzzy.h>
+#include "../FuzzyHasher/FuzzyHasher.hpp"
 #include <format>
 
 namespace ShadowStrike {
@@ -186,9 +186,9 @@ namespace ShadowStrike {
             // STEP 1: CRITICAL INPUT VALIDATION
             // ========================================================================
 
-            if (hash.type != HashType::SSDEEP && hash.type != HashType::TLSH) {
+            if (hash.type != HashType::FUZZY && hash.type != HashType::TLSH) {
                 SS_LOG_ERROR(L"HashStore",
-                    L"FuzzyMatch: Unsupported hash type %u (only SSDEEP/TLSH supported)",
+                    L"FuzzyMatch: Unsupported hash type %u (only FUZZY/TLSH supported)",
                     static_cast<uint8_t>(hash.type));
                 return results;
             }
@@ -216,7 +216,7 @@ namespace ShadowStrike {
                 return results;
             }
 
-            // SSDEEP/TLSH can have longer variable-length hashes
+            // Fuzzy/TLSH can have longer variable-length hashes
             constexpr uint8_t MAX_FUZZY_HASH_LEN = 128;  // Increased for fuzzy hashes
             if (hash.length > MAX_FUZZY_HASH_LEN) {
                 SS_LOG_ERROR(L"HashStore",
@@ -275,7 +275,7 @@ namespace ShadowStrike {
             // STEP 4: PREPARE HASH FOR COMPARISON (Native Library Format)
             // ========================================================================
 
-            // Use larger buffer for fuzzy hashes (SSDEEP/TLSH can be longer)
+            // Use larger buffer for fuzzy hashes (CTPH/TLSH can be longer)
             std::array<char, 256> hashBuffer{};
             // Ensure we don't copy more than buffer can hold minus null terminator
             const size_t maxCopyLen = hashBuffer.size() - 1;
@@ -287,13 +287,13 @@ namespace ShadowStrike {
 
             const char* hashString = hashBuffer.data();
 
-            // Validate SSDEEP format
-            if (hash.type == HashType::SSDEEP) {
+            // Validate fuzzy hash format
+            if (hash.type == HashType::FUZZY) {
                 const size_t colonCount = static_cast<size_t>(
                     std::count(hashString, hashString + copyLen, ':'));
                 if (colonCount != 2) {
                     SS_LOG_ERROR(L"HashStore",
-                        L"FuzzyMatch: Invalid SSDEEP format (expected 2 colons, found %zu)",
+                        L"FuzzyMatch: Invalid fuzzy hash format (expected 2 colons, found %zu)",
                         colonCount);
                     return results;
                 }
@@ -433,7 +433,7 @@ namespace ShadowStrike {
                 std::vector<std::pair<uint64_t, HashValue>> filteredCandidates;
                 filteredCandidates.reserve(candidates.size() / 10);
 
-                if (hash.type == HashType::SSDEEP) {
+                if (hash.type == HashType::FUZZY) {
                     // Extract blocksize from query hash with exception safety
                     const char* colonPtr = std::strchr(hashString, ':');
                     // Safely compute distance to avoid pointer arithmetic issues
@@ -453,7 +453,7 @@ namespace ShadowStrike {
                                         ? static_cast<uint32_t>(parsedBlockSize) : UINT32_MAX;
 
                                     SS_LOG_DEBUG(L"HashStore",
-                                        L"FuzzyMatch: SSDEEP blocksize filter (query=%u)",
+                                        L"FuzzyMatch: Fuzzy blocksize filter (query=%u)",
                                         queryBlockSize);
 
                                     // Filter candidates by blocksize (±50%)
@@ -502,7 +502,7 @@ namespace ShadowStrike {
                             }
                             catch (const std::exception& ex) {
                                 SS_LOG_WARN(L"HashStore",
-                                    L"FuzzyMatch: Failed to parse SSDEEP blocksize: %S", ex.what());
+                                    L"FuzzyMatch: Failed to parse fuzzy blocksize: %S", ex.what());
                                 // Fall through without filtering
                             }
                         }
@@ -605,16 +605,16 @@ namespace ShadowStrike {
                 int similarityScore = 0;
                 bool computeSuccess = false;
 
-                if (hash.type == HashType::SSDEEP) {
+                if (hash.type == HashType::FUZZY) {
                     // ================================================================
-                    // SSDEEP: Use libfuzzy fuzzy_compare()
+                    // Fuzzy hash: context-triggered piecewise comparison
                     // ================================================================
 
-                    similarityScore = fuzzy_compare(hashString, candidateString);
+                    similarityScore = ShadowStrike::FuzzyHasher::Compare(hashString, candidateString);
 
                     if (similarityScore < 0) {
                         SS_LOG_DEBUG(L"HashStore",
-                            L"FuzzyMatch: SSDEEP comparison error for candidate #%zu",
+                            L"FuzzyMatch: Fuzzy comparison error for candidate #%zu",
                             i);
                         continue;
                     }
@@ -622,7 +622,7 @@ namespace ShadowStrike {
                     computeSuccess = true;
 
                     SS_LOG_TRACE(L"HashStore",
-                        L"FuzzyMatch: SSDEEP candidate #%zu → similarity=%d%%",
+                        L"FuzzyMatch: Fuzzy candidate #%zu → similarity=%d%%",
                         i, similarityScore);
                 }
                 else if (hash.type == HashType::TLSH) {

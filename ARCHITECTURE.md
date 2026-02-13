@@ -26,7 +26,7 @@ ShadowStrike/
 │   ├── nlohmann/
 │   ├── pugixml/
 │   ├── SQLiteCpp/
-│   ├── ssdeep/
+│   ├── FuzzyHasher/
 │   ├── tlsh/
 │   ├── YARA/
 │   └── Zydis/

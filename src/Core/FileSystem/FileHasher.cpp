@@ -46,7 +46,7 @@
 #endif
 
 // External fuzzy hash libraries (assumed available)
-// #include <ssdeep.h>
+// Fuzzy hashing via FuzzyHasher module
 // #include <tlsh.h>
 
 namespace ShadowStrike {
@@ -100,7 +100,7 @@ constexpr bool HasFlag(HashAlgorithm value, HashAlgorithm flag) noexcept {
         case HashAlgorithm::SHA512: return "SHA512";
         case HashAlgorithm::SHA3_256: return "SHA3-256";
         case HashAlgorithm::SHA3_512: return "SHA3-512";
-        case HashAlgorithm::SSDEEP: return "ssdeep";
+        case HashAlgorithm::FUZZY: return "fuzzy";
         case HashAlgorithm::TLSH: return "TLSH";
         case HashAlgorithm::IMPHASH: return "imphash";
         case HashAlgorithm::AUTHENTIHASH: return "authentihash";
@@ -225,7 +225,7 @@ void FileHasherStatistics::Reset() noexcept {
     sha1Computed.store(0, std::memory_order_relaxed);
     sha256Computed.store(0, std::memory_order_relaxed);
     sha512Computed.store(0, std::memory_order_relaxed);
-    ssdeepComputed.store(0, std::memory_order_relaxed);
+    fuzzyHashComputed.store(0, std::memory_order_relaxed);
     tlshComputed.store(0, std::memory_order_relaxed);
     imphashComputed.store(0, std::memory_order_relaxed);
     averageTimeUs.store(0, std::memory_order_relaxed);
@@ -241,7 +241,7 @@ void FileHasherStatistics::Reset() noexcept {
 
 bool FileHashes::IsValid() const noexcept {
     return hasMD5 || hasSHA1 || hasSHA256 || hasSHA512 ||
-           hasSHA3_256 || hasSHA3_512 || hasSSDeep || hasTLSH ||
+           hasSHA3_256 || hasSHA3_512 || hasFuzzyHash || hasTLSH ||
            hasImpHash || hasAuthentihash;
 }
 
@@ -257,7 +257,7 @@ std::string FileHashes::ToJson() const {
     if (hasSHA512) oss << "  \"sha512\": \"" << sha512Hex << "\",\n";
     if (hasSHA3_256) oss << "  \"sha3_256\": \"" << sha3_256Hex << "\",\n";
     if (hasSHA3_512) oss << "  \"sha3_512\": \"" << sha3_512Hex << "\",\n";
-    if (hasSSDeep) oss << "  \"ssdeep\": \"" << ssdeep << "\",\n";
+    if (hasFuzzyHash) oss << "  \"fuzzyHash\": \"" << fuzzyHash << "\",\n";
     if (hasTLSH) oss << "  \"tlsh\": \"" << tlsh << "\",\n";
     if (hasImpHash) oss << "  \"imphash\": \"" << imphash << "\",\n";
     if (hasAuthentihash) oss << "  \"authentihash\": \"" << authentihash << "\",\n";
@@ -278,7 +278,7 @@ bool HashComparison::IsMatch() const noexcept {
 }
 
 bool HashComparison::IsSimilar() const noexcept {
-    return ssdeepSimilarity >= 50.0 || tlshDistance <= 100;
+    return fuzzySimilarity >= 50.0 || tlshDistance <= 100;
 }
 
 std::string HashComparison::ToJson() const {
@@ -286,7 +286,7 @@ std::string HashComparison::ToJson() const {
     oss << "{\n";
     oss << "  \"md5Match\": " << (md5Match ? "true" : "false") << ",\n";
     oss << "  \"sha256Match\": " << (sha256Match ? "true" : "false") << ",\n";
-    oss << "  \"ssdeepSimilarity\": " << ssdeepSimilarity << ",\n";
+    oss << "  \"fuzzySimilarity\": " << fuzzySimilarity << ",\n";
     oss << "  \"tlshDistance\": " << tlshDistance << ",\n";
     oss << "  \"isMatch\": " << (IsMatch() ? "true" : "false") << ",\n";
     oss << "  \"isSimilar\": " << (IsSimilar() ? "true" : "false") << "\n";
@@ -635,8 +635,8 @@ public:
 
             // Compute fuzzy hashes
             if (m_config.computeFuzzyHashes) {
-                if (HasFlag(algorithms, HashAlgorithm::SSDEEP)) {
-                    ComputeSSDeepImpl(filePath, result);
+                if (HasFlag(algorithms, HashAlgorithm::FUZZY)) {
+                    ComputeFuzzyHashImpl(filePath, result);
                 }
                 if (HasFlag(algorithms, HashAlgorithm::TLSH)) {
                     ComputeTLSHImpl(filePath, result);
@@ -818,20 +818,20 @@ public:
         }
     }
 
-    void ComputeSSDeepImpl(const std::wstring& filePath, FileHashes& result) {
+    void ComputeFuzzyHashImpl(const std::wstring& filePath, FileHashes& result) {
         try {
-            // TODO: Integrate ssdeep library
+            // TODO: Integrate FuzzyHasher module
             // For now, placeholder implementation
-            Logger::Debug("FileHasher: ssdeep computation not yet implemented");
+            Logger::Debug("FileHasher: fuzzy hash computation not yet implemented");
 
-            // Simulated ssdeep hash format: blocksize:hash1:hash2
-            result.ssdeep = "3:PLACEHOLDER:HASH";
-            result.hasSSDeep = false; // Set to true when implemented
+            // Placeholder fuzzy hash format: blocksize:hash1:hash2
+            result.fuzzyHash = "3:PLACEHOLDER:HASH";
+            result.hasFuzzyHash = false; // Set to true when implemented
 
-            // m_stats.ssdeepComputed.fetch_add(1, std::memory_order_relaxed);
+            // m_stats.fuzzyHashComputed.fetch_add(1, std::memory_order_relaxed);
 
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: ssdeep exception: {}", e.what());
+            Logger::Error("FileHasher: fuzzy hash exception: {}", e.what());
         }
     }
 
@@ -989,8 +989,8 @@ public:
             }
 
             // Compare fuzzy hashes
-            if (hashes1.hasSSDeep && hashes2.hasSSDeep) {
-                result.ssdeepSimilarity = CompareSSDeepImpl(hashes1.ssdeep, hashes2.ssdeep);
+            if (hashes1.hasFuzzyHash && hashes2.hasFuzzyHash) {
+                result.fuzzySimilarity = CompareFuzzyHashImpl(hashes1.fuzzyHash, hashes2.fuzzyHash);
             }
             if (hashes1.hasTLSH && hashes2.hasTLSH) {
                 result.tlshDistance = ComputeTLSHDistanceImpl(hashes1.tlsh, hashes2.tlsh);
@@ -1004,14 +1004,14 @@ public:
         }
     }
 
-    [[nodiscard]] double CompareSSDeepImpl(
-        std::string_view ssdeep1,
-        std::string_view ssdeep2
+    [[nodiscard]] double CompareFuzzyHashImpl(
+        std::string_view hash1,
+        std::string_view hash2
     ) const noexcept {
         try {
-            // TODO: Implement ssdeep comparison using library
+            // TODO: Implement fuzzy hash comparison using FuzzyHasher
             // For now, return 0.0 (no similarity)
-            Logger::Debug("FileHasher: ssdeep comparison not yet implemented");
+            Logger::Debug("FileHasher: fuzzy hash comparison not yet implemented");
             return 0.0;
 
         } catch (...) {
@@ -1130,7 +1130,7 @@ public:
         if (hashes.hasSHA512) count++;
         if (hashes.hasSHA3_256) count++;
         if (hashes.hasSHA3_512) count++;
-        if (hashes.hasSSDeep) count++;
+        if (hashes.hasFuzzyHash) count++;
         if (hashes.hasTLSH) count++;
         if (hashes.hasImpHash) count++;
         if (hashes.hasAuthentihash) count++;
@@ -1316,9 +1316,9 @@ std::string FileHasher::ComputeSHA3_512(const std::wstring& filePath) {
     return hashes.sha3_512Hex;
 }
 
-std::string FileHasher::ComputeSSDeep(const std::wstring& filePath) {
-    auto hashes = ComputeAll(filePath, HashAlgorithm::SSDEEP);
-    return hashes.ssdeep;
+std::string FileHasher::ComputeFuzzyHash(const std::wstring& filePath) {
+    auto hashes = ComputeAll(filePath, HashAlgorithm::FUZZY);
+    return hashes.fuzzyHash;
 }
 
 std::string FileHasher::ComputeTLSH(const std::wstring& filePath) {
@@ -1392,12 +1392,12 @@ HashComparison FileHasher::Compare(
     return m_impl->CompareImpl(hashes1, hashes2);
 }
 
-double FileHasher::CompareSSDeep(
-    std::string_view ssdeep1,
-    std::string_view ssdeep2
+double FileHasher::CompareFuzzyHash(
+    std::string_view hash1,
+    std::string_view hash2
 ) const noexcept {
     if (!IsInitialized()) return 0.0;
-    return m_impl->CompareSSDeepImpl(ssdeep1, ssdeep2);
+    return m_impl->CompareFuzzyHashImpl(hash1, hash2);
 }
 
 uint32_t FileHasher::ComputeTLSHDistance(
@@ -1432,8 +1432,8 @@ std::optional<size_t> FileHasher::FindBestMatch(
     for (size_t i = 0; i < candidates.size(); i++) {
         auto comparison = Compare(hashes, candidates[i]);
 
-        if (comparison.ssdeepSimilarity > bestSimilarity) {
-            bestSimilarity = comparison.ssdeepSimilarity;
+        if (comparison.fuzzySimilarity > bestSimilarity) {
+            bestSimilarity = comparison.fuzzySimilarity;
             if (bestSimilarity >= minSimilarity) {
                 bestIndex = i;
             }
@@ -1580,7 +1580,7 @@ bool FileHasher::SelfTest() {
 FileHasher::VersionInfo FileHasher::GetVersionInfo() const {
     VersionInfo info{};
     info.hasherVersion = "3.0.0";
-    info.ssdeepVersion = "2.14.1"; // TODO: Get from library
+    info.fuzzyHasherVersion = "1.0.0"; // ShadowStrike FuzzyHasher
     info.tlshVersion = "4.5.1";    // TODO: Get from library
     info.lastUpdate = system_clock::now();
     return info;

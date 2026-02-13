@@ -275,8 +275,8 @@ TEST(SignatureFormatTest, IMPHASHIs16Bytes) {
     EXPECT_EQ(GetHashLengthForType(HashType::IMPHASH), 16);
 }
 
-TEST(SignatureFormatTest, SSDeepIs64Bytes) {
-    EXPECT_EQ(GetHashLengthForType(HashType::SSDEEP), 64);
+TEST(SignatureFormatTest, FuzzyIs64Bytes) {
+    EXPECT_EQ(GetHashLengthForType(HashType::FUZZY), 64);
 }
 
 TEST(SignatureFormatTest, TLSHIs35Bytes) {
@@ -293,7 +293,7 @@ TEST(SignatureFormatTest, AllTypesHaveValidStrings) {
     EXPECT_STREQ(Format::HashTypeToString(HashType::SHA256), "SHA256");
     EXPECT_STREQ(Format::HashTypeToString(HashType::SHA512), "SHA512");
     EXPECT_STREQ(Format::HashTypeToString(HashType::IMPHASH), "IMPHASH");
-    EXPECT_STREQ(Format::HashTypeToString(HashType::SSDEEP), "SSDEEP");
+    EXPECT_STREQ(Format::HashTypeToString(HashType::FUZZY), "FUZZY");
     EXPECT_STREQ(Format::HashTypeToString(HashType::TLSH), "TLSH");
 }
 

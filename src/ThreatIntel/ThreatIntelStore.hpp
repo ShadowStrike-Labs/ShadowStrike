@@ -1011,7 +1011,7 @@ public:
     
     /**
      * @brief Lookup a file hash
-     * @param algorithm Hash algorithm ("MD5", "SHA1", "SHA256", "SSDEEP", "TLSH")
+     * @param algorithm Hash algorithm ("MD5", "SHA1", "SHA256", "FUZZY", "TLSH")
      * @param hashValue Hash value as hex string
      * @param options Lookup options
      * @return Lookup result

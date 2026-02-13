@@ -189,10 +189,10 @@ TEST_F(SignatureBuilderUtilsTest, ComputeFileHash_InvalidHashType_IMPHASH) {
     EXPECT_FALSE(hash.has_value());
 }
 
-TEST_F(SignatureBuilderUtilsTest, ComputeFileHash_InvalidHashType_SSDEEP) {
+TEST_F(SignatureBuilderUtilsTest, ComputeFileHash_InvalidHashType_Fuzzy) {
     auto filePath = CreateTempFile("test");
 
-    auto hash = m_builder->ComputeFileHash(filePath, HashType::SSDEEP);
+    auto hash = m_builder->ComputeFileHash(filePath, HashType::FUZZY);
 
     EXPECT_FALSE(hash.has_value());
 }

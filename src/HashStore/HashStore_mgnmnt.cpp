@@ -87,8 +87,8 @@ namespace ShadowStrike {
             case HashType::SHA256: expectedLen = 32; break;
             case HashType::SHA512: expectedLen = 64; break;
             case HashType::IMPHASH: expectedLen = 32; break;
-                // SSDEEP and TLSH have variable lengths
-            case HashType::SSDEEP:
+                // Fuzzy and TLSH have variable lengths
+            case HashType::FUZZY:
             case HashType::TLSH:
                 expectedLen = 0; // Variable
                 break;

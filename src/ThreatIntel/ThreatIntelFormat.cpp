@@ -843,8 +843,8 @@ std::optional<HashValue> ParseHashString(
         return std::nullopt;
     }
     
-    // For SSDEEP and TLSH, the string IS the hash (not hex encoded)
-    if (algo == HashAlgorithm::SSDEEP || algo == HashAlgorithm::TLSH) {
+    // For fuzzy and TLSH, the string IS the hash (not hex encoded)
+    if (algo == HashAlgorithm::FUZZY || algo == HashAlgorithm::TLSH) {
         // Validate length fits in hash data array
         constexpr size_t MAX_FUZZY_HASH_LEN = 72;
         if (hashStr.length() > MAX_FUZZY_HASH_LEN || 
@@ -910,8 +910,8 @@ std::string FormatHashString(const HashValue& hash) {
         return {};  // Invalid hash state
     }
     
-    // For SSDEEP and TLSH, return as-is (not hex encoded)
-    if (hash.algorithm == HashAlgorithm::SSDEEP || 
+    // For fuzzy and TLSH, return as-is (not hex encoded)
+    if (hash.algorithm == HashAlgorithm::FUZZY || 
         hash.algorithm == HashAlgorithm::TLSH) {
         // Ensure null-safety: don't read past actual length
         return std::string(

@@ -430,7 +430,7 @@ namespace {
                 expectedLen = 64;
                 break;
             case HashType::IMPHASH:
-            case HashType::SSDEEP:
+            case HashType::FUZZY:
             case HashType::TLSH:
                 SS_LOG_ERROR(L"SignatureBuilder",
                     L"ComputeFileHash: Hash type %u requires binary parsing, not supported for files",
@@ -771,7 +771,7 @@ namespace {
                 expectedLen = 64;
                 break;
             case HashType::IMPHASH:
-            case HashType::SSDEEP:
+            case HashType::FUZZY:
             case HashType::TLSH:
                 SS_LOG_ERROR(L"SignatureBuilder",
                     L"ComputeBufferHash: Hash type %u requires special parsing",

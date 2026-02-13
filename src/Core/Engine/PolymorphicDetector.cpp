@@ -10,7 +10,7 @@
  * - Dead code elimination and control flow deobfuscation
  * - Polymorphic engine detection (Mistfall, MtE, DAME, VCL, TPE, EPC, SMEG, etc.)
  * - Decryption loop detection with XOR/ADD/SUB key extraction
- * - Fuzzy matching using SSDEEP and TLSH algorithms
+ * - Fuzzy matching using CTPH and TLSH algorithms
  * - Mutation pattern classification (register swap, instruction substitution, etc.)
  * - Metamorphic code analysis with semantic equivalence detection
  *
@@ -74,8 +74,8 @@
 // EXTERNAL LIBRARY INCLUDES
 // ============================================================================
 
-// SSDEEP fuzzy hashing
-#include "../../External/ssdeep/fuzzy.h"
+// Context-triggered piecewise fuzzy hashing
+#include "../../FuzzyHasher/FuzzyHasher.hpp"
 
 // TLSH locality-sensitive hashing
 #include "../../External/tlsh/tlsh.h"
@@ -319,9 +319,9 @@ namespace ShadowStrike::Core::Engine {
 
         // Fuzzy matching
         [[nodiscard]] std::vector<FuzzyHashMatch> FuzzyMatchInternal(std::span<const uint8_t> normalizedCode) noexcept;
-        [[nodiscard]] std::string CalculateSSDeepInternal(std::span<const uint8_t> data) noexcept;
+        [[nodiscard]] std::string CalculateFuzzyHashInternal(std::span<const uint8_t> data) noexcept;
         [[nodiscard]] std::string CalculateTLSHInternal(std::span<const uint8_t> data) noexcept;
-        [[nodiscard]] uint32_t CompareSSDeep(const std::string& hash1, const std::string& hash2) noexcept;
+        [[nodiscard]] uint32_t CompareFuzzyHash(const std::string& hash1, const std::string& hash2) noexcept;
         [[nodiscard]] uint32_t CompareTLSH(const std::string& hash1, const std::string& hash2) noexcept;
 
         // Scoring
@@ -515,8 +515,8 @@ namespace ShadowStrike::Core::Engine {
             }
 
             // Calculate fuzzy hashes
-            if (options.calculateSSDeep) {
-                result.ssdeepHash = CalculateSSDeepInternal(result.normalizedBody.empty() ? code : result.normalizedBody);
+            if (options.calculateFuzzyHash) {
+                result.fuzzyHash = CalculateFuzzyHashInternal(result.normalizedBody.empty() ? code : result.normalizedBody);
             }
 
             if (options.calculateTLSH) {
@@ -1326,8 +1326,8 @@ namespace ShadowStrike::Core::Engine {
         std::vector<FuzzyHashMatch> matches;
 
         try {
-            // Calculate SSDEEP hash
-            const std::string ssdeepHash = CalculateSSDeepInternal(normalizedCode);
+            // Calculate fuzzy hash
+            const std::string fuzzyHashStr = CalculateFuzzyHashInternal(normalizedCode);
 
             // Calculate TLSH hash
             const std::string tlshHash = CalculateTLSHInternal(normalizedCode);
@@ -1335,14 +1335,14 @@ namespace ShadowStrike::Core::Engine {
             // Compare against known samples (placeholder - would query database)
             // Full implementation would:
             // 1. Query HashStore for similar samples
-            // 2. Compare SSDEEP/TLSH hashes
+            // 2. Compare CTPH/TLSH hashes
             // 3. Return matches above similarity threshold
 
             // Placeholder match
             FuzzyHashMatch match;
             match.malwareFamily = "ExampleFamily";
             match.similarityScore = 0.85;
-            match.matchedHash = ssdeepHash;
+            match.matchedHash = fuzzyHashStr;
             match.detectionDate = std::chrono::system_clock::now();
 
             // Only add if similarity is high enough
@@ -1358,22 +1358,26 @@ namespace ShadowStrike::Core::Engine {
         return matches;
     }
 
-    std::string PolymorphicDetector::Impl::CalculateSSDeepInternal(std::span<const uint8_t> data) noexcept {
+    std::string PolymorphicDetector::Impl::CalculateFuzzyHashInternal(std::span<const uint8_t> data) noexcept {
         try {
             if (data.empty()) {
                 return "";
             }
 
-            // Use external SSDEEP library
-            char result[FUZZY_MAX_RESULT];
-            if (fuzzy_hash_buf(data.data(), static_cast<uint32_t>(data.size()), result) == 0) {
+            // Cap input size to prevent uint32_t truncation and excessive processing
+            constexpr size_t kMaxFuzzyHashInput = 256 * 1024 * 1024; // 256MB
+            const size_t hashSize = std::min(data.size(), kMaxFuzzyHashInput);
+
+            // Use CTPH fuzzy hashing engine
+            char result[ShadowStrike::FuzzyHasher::kMaxResultLength];
+            if (ShadowStrike::FuzzyHasher::HashBufferRaw(data.data(), static_cast<uint32_t>(hashSize), result) == 0) {
                 return std::string(result);
             }
 
             return "";
 
         } catch (...) {
-            Utils::Logger::Error(L"PolymorphicDetector: Exception during SSDEEP calculation");
+            Utils::Logger::Error(L"PolymorphicDetector: Exception during fuzzy hash calculation");
             return "";
         }
     }
@@ -1397,14 +1401,14 @@ namespace ShadowStrike::Core::Engine {
         }
     }
 
-    uint32_t PolymorphicDetector::Impl::CompareSSDeep(const std::string& hash1, const std::string& hash2) noexcept {
+    uint32_t PolymorphicDetector::Impl::CompareFuzzyHash(const std::string& hash1, const std::string& hash2) noexcept {
         try {
             if (hash1.empty() || hash2.empty()) {
                 return 0;
             }
 
-            // Use SSDEEP library to compare
-            const int similarity = fuzzy_compare(hash1.c_str(), hash2.c_str());
+            // Use CTPH engine to compare
+            const int similarity = ShadowStrike::FuzzyHasher::Compare(hash1.c_str(), hash2.c_str());
 
             return (similarity >= 0) ? static_cast<uint32_t>(similarity) : 0;
 
@@ -1662,13 +1666,13 @@ namespace ShadowStrike::Core::Engine {
         return m_impl->FuzzyMatchInternal(normalizedCode);
     }
 
-    std::string PolymorphicDetector::CalculateSSDeep(std::span<const uint8_t> data) noexcept {
+    std::string PolymorphicDetector::CalculateFuzzyHash(std::span<const uint8_t> data) noexcept {
         if (!IsInitialized()) {
             Utils::Logger::Error(L"PolymorphicDetector: Not initialized");
             return "";
         }
 
-        return m_impl->CalculateSSDeepInternal(data);
+        return m_impl->CalculateFuzzyHashInternal(data);
     }
 
     std::string PolymorphicDetector::CalculateTLSH(std::span<const uint8_t> data) noexcept {

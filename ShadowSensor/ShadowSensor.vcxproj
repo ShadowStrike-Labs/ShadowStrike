@@ -121,13 +121,15 @@
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="ShadowSensor\ALPC\AlpcMonitor.c" />
+    <ClCompile Include="ShadowSensor\ALPC\AlpcPortMonitor.c" />
     <ClCompile Include="ShadowSensor\Context\InstanceContext.c" />
     <ClCompile Include="ShadowSensor\Context\StreamContext.c" />
     <ClCompile Include="ShadowSensor\Objects\ObjectNamespace.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ShadowSensor\ALPC\AlpcMonitor.h" />
+    <ClInclude Include="ShadowSensor\ALPC\AlpcPortMonitor.h" />
+    <ClInclude Include="ShadowSensor\ALPC\AlpcTypes.h" />
     <ClInclude Include="ShadowSensor\Context\InstanceContext.h" />
     <ClInclude Include="ShadowSensor\Context\StreamContext.h" />
     <ClInclude Include="ShadowSensor\Objects\ObjectNamespace.h" />

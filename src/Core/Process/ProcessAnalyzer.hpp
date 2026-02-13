@@ -627,7 +627,7 @@ struct alignas(64) ModuleInfo {
     std::array<uint8_t, 32> sha256Hash{};
     std::array<uint8_t, 16> md5Hash{};
     std::string imphash;                              ///< Import hash
-    std::string ssdeepHash;                           ///< Fuzzy hash
+    std::string fuzzyHash;                            ///< Fuzzy hash
 
     // Import/Export analysis
     uint32_t importCount = 0;

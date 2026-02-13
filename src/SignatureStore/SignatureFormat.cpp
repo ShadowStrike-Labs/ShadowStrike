@@ -372,7 +372,7 @@ const char* HashTypeToString(HashType type) noexcept {
         case HashType::SHA256:  return "SHA256";
         case HashType::SHA512:  return "SHA512";
         case HashType::IMPHASH: return "IMPHASH";
-        case HashType::SSDEEP:  return "SSDEEP";
+        case HashType::FUZZY:   return "FUZZY";
         case HashType::TLSH:    return "TLSH";
         default:                return "UNKNOWN";
     }
@@ -446,7 +446,7 @@ uint8_t GetHashLength(HashType type) noexcept {
         case HashType::SHA256:  return 32;
         case HashType::SHA512:  return 64;
         case HashType::IMPHASH: return 16; // MD5-based
-        case HashType::SSDEEP:  return 64; // Variable, max 64
+        case HashType::FUZZY:   return 64; // Variable, max 64
         case HashType::TLSH:    return 35; // 70 hex chars = 35 bytes
         default:                return 0;
     }
@@ -500,7 +500,7 @@ std::optional<HashValue> ParseHashString(const std::string& hashStr, HashType ty
     }
 
     // For fixed-length hashes, validate exact length
-    if (type != HashType::SSDEEP && type != HashType::TLSH) {
+    if (type != HashType::FUZZY && type != HashType::TLSH) {
         if (cleanedLen != static_cast<size_t>(expectedLen) * 2) {
             SS_LOG_ERROR(L"SignatureStore", 
                 L"ParseHashString: invalid length %zu for %S (expected %u hex chars)",
@@ -541,7 +541,7 @@ std::optional<HashValue> ParseHashString(const std::string& hashStr, HashType ty
     }
 
     // Set actual length
-    if (type == HashType::SSDEEP || type == HashType::TLSH) {
+    if (type == HashType::FUZZY || type == HashType::TLSH) {
         hash.length = static_cast<uint8_t>(byteCount);
     } else {
         hash.length = expectedLen;

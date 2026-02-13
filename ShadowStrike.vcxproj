@@ -367,14 +367,9 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="src\external\ssdeep\edit_dist.c">
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
-    </ClCompile>
-    <ClCompile Include="src\external\ssdeep\fuzzy.c">
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
-    </ClCompile>
+    <ClCompile Include="src\FuzzyHasher\FuzzyHasher.cpp" />
+    <ClCompile Include="src\FuzzyHasher\DigestGenerator.cpp" />
+    <ClCompile Include="src\FuzzyHasher\DigestComparer.cpp" />
     <ClCompile Include="src\external\tlsh\input_desc.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
@@ -686,9 +681,12 @@
     <ClInclude Include="include\sqlitecpp\Transaction.h" />
     <ClInclude Include="include\sqlitecpp\Utils.h" />
     <ClInclude Include="include\sqlitecpp\VariadicBind.h" />
-    <ClInclude Include="include\ssdeep\edit_dist.h" />
-    <ClInclude Include="include\ssdeep\fuzzy.h" />
-    <ClInclude Include="include\ssdeep\sum_table.h" />
+    <ClInclude Include="src\FuzzyHasher\FuzzyHasher.hpp" />
+    <ClInclude Include="src\FuzzyHasher\DigestGenerator.hpp" />
+    <ClInclude Include="src\FuzzyHasher\DigestComparer.hpp" />
+    <ClInclude Include="src\FuzzyHasher\RollingHash.hpp" />
+    <ClInclude Include="src\FuzzyHasher\ChunkHash.hpp" />
+    <ClInclude Include="src\FuzzyHasher\EditDistance.hpp" />
     <ClInclude Include="include\tlsh\input_desc.h" />
     <ClInclude Include="include\tlsh\shared_file_functions.h" />
     <ClInclude Include="include\tlsh\tlsh.h" />

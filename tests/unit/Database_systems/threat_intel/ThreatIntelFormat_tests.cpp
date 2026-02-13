@@ -433,11 +433,11 @@ TEST(ThreatIntelFormat_Hash, ParseHashString_InvalidLength) {
 	EXPECT_FALSE(ParseHashString("gggggggggggggggggggggggggggggggg", HashAlgorithm::MD5).has_value());
 }
 
-TEST(ThreatIntelFormat_Hash, ParseHashString_SSDEEP) {
-	const std::string ssdeep = "3:AXGBicFlgVNhBGcL6wCrFQEv:AXGHsNhxLsr2C";
-	auto hash = ParseHashString(ssdeep, HashAlgorithm::SSDEEP);
+TEST(ThreatIntelFormat_Hash, ParseHashString_Fuzzy) {
+	const std::string fuzzyStr = "3:AXGBicFlgVNhBGcL6wCrFQEv:AXGHsNhxLsr2C";
+	auto hash = ParseHashString(fuzzyStr, HashAlgorithm::FUZZY);
 	ASSERT_TRUE(hash.has_value());
-	EXPECT_EQ(hash->algorithm, HashAlgorithm::SSDEEP);
+	EXPECT_EQ(hash->algorithm, HashAlgorithm::FUZZY);
 }
 
 TEST(ThreatIntelFormat_Hash, ParseHashString_TLSH) {
@@ -485,7 +485,7 @@ TEST(ThreatIntelFormat_Hash, GetHashLength_AllAlgorithms) {
 	EXPECT_EQ(GetHashLength(HashAlgorithm::SHA1), 20);
 	EXPECT_EQ(GetHashLength(HashAlgorithm::SHA256), 32);
 	EXPECT_EQ(GetHashLength(HashAlgorithm::SHA512), 64);
-	EXPECT_GT(GetHashLength(HashAlgorithm::SSDEEP), 0);
+	EXPECT_GT(GetHashLength(HashAlgorithm::FUZZY), 0);
 	EXPECT_GT(GetHashLength(HashAlgorithm::TLSH), 0);
 }
 

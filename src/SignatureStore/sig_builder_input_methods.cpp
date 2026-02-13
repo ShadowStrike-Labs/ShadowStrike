@@ -129,7 +129,7 @@ namespace SignatureStore {
             case HashType::SHA256: expectedLen = 32; break;
             case HashType::SHA512: expectedLen = 64; break;
             case HashType::IMPHASH: expectedLen = 32; break;
-            case HashType::SSDEEP:
+            case HashType::FUZZY:
             case HashType::TLSH:
                 expectedLen = 0;  // Variable length
                 break;
@@ -315,8 +315,8 @@ namespace SignatureStore {
             // STEP 5: ENTROPY VALIDATION (Reject weak/random hashes)
             // ========================================================================
 
-            // Skip entropy check for variable-length hashes (SSDEEP, TLSH)
-            if (input.hash.type != HashType::SSDEEP && input.hash.type != HashType::TLSH) {
+            // Skip entropy check for variable-length hashes (fuzzy, TLSH)
+            if (input.hash.type != HashType::FUZZY && input.hash.type != HashType::TLSH) {
                 // Bounds-check hash length before accessing data
                 if (input.hash.length > 0 && input.hash.length <= 64) {
                     // Calculate Shannon entropy

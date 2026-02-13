@@ -24,9 +24,6 @@
     </Inf>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="ShadowSensor\ALPC\AlpcMonitor.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="ShadowSensor\Context\InstanceContext.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -34,6 +31,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="ShadowSensor\Objects\ObjectNamespace.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\ALPC\AlpcPortMonitor.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -48,6 +48,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ShadowSensor\Objects\ObjectNamespace.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\ALPC\AlpcPortMonitor.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\ALPC\AlpcTypes.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

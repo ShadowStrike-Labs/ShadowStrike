@@ -20,7 +20,7 @@
  *    - SHA-3 (256/512)
  *
  * 2. FUZZY HASHES
- *    - ssdeep (context-triggered piecewise)
+ *    - CTPH fuzzy (context-triggered piecewise)
  *    - TLSH (locality-sensitive)
  *    - imphash (import hash)
  *    - authentihash (PE hash)
@@ -44,7 +44,7 @@
  *   │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
  *   │  │ CryptoEngine │  │ FuzzyEngine  │  │    StreamProcessor       │  │
  *   │  │              │  │              │  │                          │  │
- *   │  │ - MD5        │  │ - ssdeep     │  │ - Chunked reading        │  │
+ *   │  │ - MD5        │  │ - CTPH fuzzy     │  │ - Chunked reading        │  │
  *   │  │ - SHA-1/256  │  │ - TLSH       │  │ - Memory mapping         │  │
  *   │  │ - SHA-3      │  │ - imphash    │  │ - Async I/O              │  │
  *   │  └──────────────┘  └──────────────┘  └──────────────────────────┘  │
@@ -159,7 +159,7 @@ enum class HashAlgorithm : uint16_t {
     SHA3_512 = 0x0020,
 
     // Fuzzy
-    SSDEEP = 0x0100,
+    FUZZY = 0x0100,
     TLSH = 0x0200,
     IMPHASH = 0x0400,
     AUTHENTIHASH = 0x0800,
@@ -167,9 +167,9 @@ enum class HashAlgorithm : uint16_t {
     // Composite
     All = 0x0FFF,
     AllCrypto = MD5 | SHA1 | SHA256 | SHA512 | SHA3_256 | SHA3_512,
-    AllFuzzy = SSDEEP | TLSH | IMPHASH | AUTHENTIHASH,
+    AllFuzzy = FUZZY | TLSH | IMPHASH | AUTHENTIHASH,
     Standard = MD5 | SHA1 | SHA256,
-    Modern = SHA256 | SHA3_256 | SSDEEP
+    Modern = SHA256 | SHA3_256 | FUZZY
 };
 
 // Enable bitwise operations
@@ -232,7 +232,7 @@ struct alignas(256) FileHashes {
     std::string sha3_512Hex;
 
     // Fuzzy hashes
-    std::string ssdeep;
+    std::string fuzzyHash;
     std::string tlsh;
     std::string imphash;
     std::string authentihash;
@@ -249,7 +249,7 @@ struct alignas(256) FileHashes {
     bool hasSHA256{ false };
     bool hasSHA512{ false };
     bool hasSHA3{ false };
-    bool hasSSDeep{ false };
+    bool hasFuzzyHash{ false };
     bool hasTLSH{ false };
     bool hasImpHash{ false };
     bool hasAuthentihash{ false };
@@ -283,7 +283,7 @@ struct alignas(64) PartialHashes {
  */
 struct alignas(32) HashComparison {
     bool areIdentical{ false };
-    double ssdeepSimilarity{ 0.0 };        // 0-100%
+    double fuzzySimilarity{ 0.0 };        // 0-100%
     double tlshDistance{ 0.0 };            // Lower = more similar
     bool sameFamily{ false };              // Based on fuzzy hash
 };
@@ -326,7 +326,7 @@ struct alignas(128) FileHasherStatistics {
     std::atomic<uint64_t> md5Computed{ 0 };
     std::atomic<uint64_t> sha1Computed{ 0 };
     std::atomic<uint64_t> sha256Computed{ 0 };
-    std::atomic<uint64_t> ssdeepComputed{ 0 };
+    std::atomic<uint64_t> fuzzyHashComputed{ 0 };
 
     std::atomic<uint64_t> averageTimeUs{ 0 };
     std::atomic<uint64_t> maxTimeUs{ 0 };
@@ -366,7 +366,7 @@ using HashProgressCallback = std::function<void(uint64_t bytesProcessed, uint64_
  * // Compute all standard hashes
  * auto hashes = hasher.ComputeAll(L"suspicious.exe");
  * LOG_INFO << "SHA256: " << hashes.sha256Hex;
- * LOG_INFO << "ssdeep: " << hashes.ssdeep;
+ * LOG_INFO << "fuzzyHash: " << hashes.fuzzyHash;
  * 
  * // Async hashing
  * hasher.ComputeAllAsync(L"large_file.bin", [](const FileHashes& h) {
@@ -375,7 +375,7 @@ using HashProgressCallback = std::function<void(uint64_t bytesProcessed, uint64_
  * 
  * // Compare files using fuzzy hash
  * auto comparison = hasher.Compare(file1Hashes, file2Hashes);
- * if (comparison.ssdeepSimilarity > 80.0) {
+ * if (comparison.fuzzySimilarity > 80.0) {
  *     LOG_INFO << "Files are similar variants";
  * }
  * 
@@ -485,11 +485,11 @@ public:
     [[nodiscard]] std::string ComputeSHA512(const std::wstring& filePath);
 
     /**
-     * @brief Computes ssdeep fuzzy hash.
+     * @brief Computes CTPH fuzzy hash.
      * @param filePath Path to file.
-     * @return ssdeep hash string.
+     * @return Fuzzy hash string.
      */
-    [[nodiscard]] std::string ComputeSSDeep(const std::wstring& filePath);
+    [[nodiscard]] std::string ComputeFuzzyHash(const std::wstring& filePath);
 
     /**
      * @brief Computes TLSH fuzzy hash.
@@ -575,12 +575,12 @@ public:
     [[nodiscard]] HashComparison Compare(const FileHashes& hashes1, const FileHashes& hashes2) const;
 
     /**
-     * @brief Compares ssdeep hashes.
-     * @param ssdeep1 First ssdeep hash.
-     * @param ssdeep2 Second ssdeep hash.
+     * @brief Compares fuzzy hashes.
+     * @param hash1 First fuzzy hash.
+     * @param hash2 Second fuzzy hash.
      * @return Similarity percentage (0-100).
      */
-    [[nodiscard]] double CompareSSDeep(std::string_view ssdeep1, std::string_view ssdeep2) const;
+    [[nodiscard]] double CompareFuzzyHash(std::string_view hash1, std::string_view hash2) const;
 
     /**
      * @brief Computes TLSH distance.

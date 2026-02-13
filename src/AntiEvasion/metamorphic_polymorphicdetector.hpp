@@ -50,7 +50,7 @@
  * - Anti-disassembly tricks
  *
  * SIMILARITY ANALYSIS:
- * - Fuzzy hashing (SSDEEP, TLSH, LZJD, Nilsimsa)
+ * - Fuzzy hashing (CTPH, TLSH, LZJD, Nilsimsa)
  * - Function-level similarity
  * - Basic block similarity
  * - Structural similarity (CFG/PDG comparison)
@@ -91,7 +91,7 @@
  * ============================================================================
  *
  * - SignatureStore - Pattern matching for known engines
- * - HashStore - SSDEEP/TLSH fuzzy matching
+ * - HashStore - CTPH/TLSH fuzzy matching
  * - PatternStore - Aho-Corasick for decoder patterns
  * - ProcessUtils - Memory reading for process analysis
  * - ThreatIntel - Family correlation and reputation
@@ -253,8 +253,8 @@ namespace ShadowStrike {
             /// @brief Critical metamorphic score threshold
             inline constexpr double CRITICAL_METAMORPHIC_THRESHOLD = 90.0;
 
-            /// @brief SSDEEP similarity threshold for variant matching (0-100)
-            inline constexpr int SSDEEP_SIMILARITY_THRESHOLD = 30;
+            /// @brief Fuzzy hash similarity threshold for variant matching (0-100)
+            inline constexpr int FUZZY_SIMILARITY_THRESHOLD = 30;
 
             /// @brief TLSH distance threshold (lower = more similar)
             inline constexpr int TLSH_DISTANCE_THRESHOLD = 150;
@@ -751,8 +751,8 @@ namespace ShadowStrike {
             // SIMILARITY INDICATORS (261-280)
             // ========================================================================
 
-            /// @brief SSDEEP fuzzy match found
-            SIMILARITY_SSDeepMatch = 261,
+            /// @brief Fuzzy hash match found
+            SIMILARITY_FuzzyMatch = 261,
 
             /// @brief TLSH fuzzy match found
             SIMILARITY_TLSHMatch = 262,
@@ -1283,7 +1283,7 @@ namespace ShadowStrike {
          * @brief Fuzzy hash match information
          */
         struct FuzzyHashMatch {
-            /// @brief Hash type (SSDEEP, TLSH)
+            /// @brief Hash type (CTPH, TLSH)
             std::wstring hashType;
 
             /// @brief Computed hash value
@@ -1292,7 +1292,7 @@ namespace ShadowStrike {
             /// @brief Matched hash from database (empty if no match)
             std::wstring matchedHash;
 
-            /// @brief Similarity score (SSDEEP: 0-100, TLSH: distance where lower=better)
+            /// @brief Similarity score (fuzzy: 0-100, TLSH: distance where lower=better)
             int similarityScore = 0;
 
             /// @brief Matched malware family name (from HashStore/SignatureStore)
@@ -1474,8 +1474,8 @@ namespace ShadowStrike {
             /// @brief Maximum raw data size
             size_t maxRawDataSize = 256;
 
-            /// @brief SSDEEP similarity threshold
-            int ssdeepThreshold = MetamorphicConstants::SSDEEP_SIMILARITY_THRESHOLD;
+            /// @brief Fuzzy hash similarity threshold
+            int fuzzyThreshold = MetamorphicConstants::FUZZY_SIMILARITY_THRESHOLD;
 
             /// @brief TLSH distance threshold
             int tlshThreshold = MetamorphicConstants::TLSH_DISTANCE_THRESHOLD;
@@ -1612,8 +1612,8 @@ namespace ShadowStrike {
             // FUZZY HASHING RESULTS
             // ========================================================================
 
-            /// @brief SSDEEP fuzzy hash
-            std::string ssdeepHash;
+            /// @brief CTPH fuzzy hash
+            std::string fuzzyHash;
 
             /// @brief TLSH fuzzy hash
             std::string tlshHash;
@@ -1964,9 +1964,9 @@ namespace ShadowStrike {
             ) noexcept;
 
             /**
-             * @brief Compute SSDEEP hash
+             * @brief Compute fuzzy hash
              */
-            [[nodiscard]] std::optional<std::string> ComputeSSDeep(
+            [[nodiscard]] std::optional<std::string> ComputeFuzzyHash(
                 const std::wstring& filePath,
                 MetamorphicError* err = nullptr
             ) noexcept;
@@ -1980,9 +1980,9 @@ namespace ShadowStrike {
             ) noexcept;
 
             /**
-             * @brief Compare SSDEEP hashes
+             * @brief Compare fuzzy hashes
              */
-            [[nodiscard]] int CompareSSDeep(
+            [[nodiscard]] int CompareFuzzyHash(
                 const std::string& hash1,
                 const std::string& hash2
             ) noexcept;

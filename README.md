@@ -142,7 +142,7 @@ ShadowStrike/
 │   ├── nlohmann/
 │   ├── pugixml/
 │   ├── SQLiteCpp/
-│   ├── ssdeep/
+│   ├── FuzzyHasher/
 │   ├── tlsh/
 │   ├── YARA/
 │   └── Zydis/
@@ -259,7 +259,7 @@ This project stands on the shoulders of giants:
 - The Windows Driver Kit documentation and samples
 - The YARA project for malware pattern matching
 - The security research community for detection techniques
-- Open source projects: SQLite, Zydis, ssdeep, and others
+- Open source projects: SQLite, Zydis, and others
 
 ---
 

@@ -632,8 +632,8 @@ struct QuarantineHashes {
     /// @brief SHA256 hash (hex string)
     std::string sha256;
     
-    /// @brief SSDEEP fuzzy hash
-    std::string ssdeep;
+    /// @brief CTPH fuzzy hash
+    std::string fuzzyHash;
     
     /// @brief TLSH locality hash
     std::string tlsh;

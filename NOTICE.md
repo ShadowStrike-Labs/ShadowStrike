@@ -29,10 +29,9 @@ This NOTICE file lists the third-party libraries used in ShadowStrike and their 
 - **License:** MIT License
 - **Link:** [https://github.com/SRombauts/SQLiteCpp](https://github.com/SRombauts/SQLiteCpp)
 
-### 5. ssdeep
-- **Purpose:** Fuzzy hashing
-- **License:** BSD-style license
-- **Link:** [https://ssdeep-project.github.io/](https://ssdeep-project.github.io/)
+### 5. FuzzyHasher (Built-in)
+- **License:** AGPL-3.0-only (ShadowStrike internal module)
+- **Description:** Clean room CTPH implementation for fuzzy hashing
 
 ### 6. TLSH
 - **Purpose:** Trend Locality Sensitive Hashing

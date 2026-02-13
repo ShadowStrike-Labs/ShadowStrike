@@ -25,7 +25,7 @@
  * - Lifecycle: Initialize, CreateNew, Close, double-init protection
  * - Hash Lookup: Single, batch, string parsing, cache behavior
  * - Hash Management: Add, remove, update, batch operations
- * - Fuzzy Matching: SSDEEP, TLSH, thresholds, edge cases
+ * - Fuzzy Matching: CTPH, TLSH, thresholds, edge cases
  * - Import/Export: File formats, JSON, error handling
  * - Statistics: All metrics, reset, per-type stats
  * - Maintenance: Rebuild, compact, verify, flush
@@ -1114,12 +1114,12 @@ TEST_F(HashStoreTestFixture, HashStore_FuzzyMatch_ThresholdTooLow) {
     
     ASSERT_TRUE(store.CreateNew(dbPath).IsSuccess());
     
-    HashValue ssdeep{};
-    ssdeep.type = HashType::SSDEEP;
-    ssdeep.length = 10;
+    HashValue fuzzyHash{};
+    fuzzyHash.type = HashType::FUZZY;
+    fuzzyHash.length = 10;
     
     // Threshold below 50 should be clamped
-    auto results = store.FuzzyMatch(ssdeep, 30);
+    auto results = store.FuzzyMatch(fuzzyHash, 30);
     
     // Should still execute (with clamped threshold)
     EXPECT_TRUE(results.empty());  // No matches in empty DB
@@ -1133,12 +1133,12 @@ TEST_F(HashStoreTestFixture, HashStore_FuzzyMatch_ThresholdTooHigh) {
     
     ASSERT_TRUE(store.CreateNew(dbPath).IsSuccess());
     
-    HashValue ssdeep{};
-    ssdeep.type = HashType::SSDEEP;
-    ssdeep.length = 10;
+    HashValue fuzzyHash{};
+    fuzzyHash.type = HashType::FUZZY;
+    fuzzyHash.length = 10;
     
     // Threshold above 100 should be clamped
-    auto results = store.FuzzyMatch(ssdeep, 150);
+    auto results = store.FuzzyMatch(fuzzyHash, 150);
     
     EXPECT_TRUE(results.empty());
     
@@ -1152,7 +1152,7 @@ TEST_F(HashStoreTestFixture, HashStore_FuzzyMatch_ZeroLength) {
     ASSERT_TRUE(store.CreateNew(dbPath).IsSuccess());
     
     HashValue invalid{};
-    invalid.type = HashType::SSDEEP;
+    invalid.type = HashType::FUZZY;
     invalid.length = 0;
     
     auto results = store.FuzzyMatch(invalid, 80);
@@ -1169,7 +1169,7 @@ TEST_F(HashStoreTestFixture, HashStore_FuzzyMatch_TooLong) {
     ASSERT_TRUE(store.CreateNew(dbPath).IsSuccess());
     
     HashValue invalid{};
-    invalid.type = HashType::SSDEEP;
+    invalid.type = HashType::FUZZY;
     invalid.length = 200;  // Too long
     
     auto results = store.FuzzyMatch(invalid, 80);

@@ -85,7 +85,7 @@ enum class HashType : uint8_t {
     SHA256 = 2,
     SHA512 = 3,
     IMPHASH = 4,        // PE Import Hash
-    SSDEEP = 5,         // Fuzzy hash
+    FUZZY = 5,          // Context-triggered piecewise hash
     TLSH = 6            // Trend Micro Locality Sensitive Hash
 };
 
@@ -129,7 +129,7 @@ static_assert(alignof(HashValue) == 8, "HashValue must be 8-byte aligned");
         case HashType::SHA256:  return 32;
         case HashType::SHA512:  return 64;
         case HashType::IMPHASH: return 16;
-        case HashType::SSDEEP:  return 64;
+        case HashType::FUZZY:   return 64;
         case HashType::TLSH:    return 35;
         default:                return 0;
     }

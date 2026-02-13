@@ -65,7 +65,7 @@
  *    - Self-signed detection
  *
  * 9. **Fuzzy Matching**
- *    - SSDEEP similarity
+ *    - Fuzzy hash similarity
  *    - TLSH locality hashing
  *    - ImpHash matching
  *    - Section hash matching
@@ -139,7 +139,7 @@
  * │                                   ▼                                   │
  * │  ┌─────────────────────────────────────────────────────────────────┐   │
  * │  │                    Fuzzy Matching (HashStore)                    │   │
- * │  │  - SSDEEP similarity                                             │   │
+ * │  │  - Fuzzy hash similarity                                             │   │
  * │  │  - TLSH matching                                                 │   │
  * │  │  - ImpHash correlation                                           │   │
  * │  └─────────────────────────────────────────────────────────────────┘   │
@@ -149,7 +149,7 @@
  * INTEGRATION POINTS
  * =============================================================================
  *
- * - **HashStore**: SSDEEP/TLSH fuzzy matching, ImpHash database
+ * - **HashStore**: CTPH/TLSH fuzzy matching, ImpHash database
  * - **SignatureStore**: YARA rules for packer detection
  * - **PatternStore**: String patterns, shellcode signatures
  * - **ThreatIntel**: Certificate reputation, known stolen certs
@@ -193,7 +193,7 @@
 #include "../../Utils/FileUtils.hpp"          // PE/ELF parsing
 #include "../../Utils/HashUtils.hpp"          // ImpHash calculation
 #include "../../Utils/StringUtils.hpp"        // String extraction
-#include "../../HashStore/HashStore.hpp"      // SSDEEP/TLSH fuzzy matching
+#include "../../HashStore/HashStore.hpp"      // CTPH/TLSH fuzzy matching
 #include "../../PatternStore/PatternStore.hpp" // String/shellcode patterns
 #include "../../SignatureStore/SignatureStore.hpp" // YARA rules
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Cert reputation
@@ -370,14 +370,14 @@ namespace HeuristicConstants {
     // Fuzzy Matching
     // -------------------------------------------------------------------------
     
-    /// @brief SSDEEP minimum similarity for match
-    constexpr int SSDEEP_MIN_SIMILARITY = 40;
+    /// @brief Fuzzy hash minimum similarity for match
+    constexpr int FUZZY_MIN_SIMILARITY = 40;
     
     /// @brief TLSH maximum distance for match
     constexpr int TLSH_MAX_DISTANCE = 100;
     
-    /// @brief High similarity threshold for SSDEEP
-    constexpr int SSDEEP_HIGH_SIMILARITY = 80;
+    /// @brief High similarity threshold for fuzzy hash
+    constexpr int FUZZY_HIGH_SIMILARITY = 80;
     
     // -------------------------------------------------------------------------
     // PE Analysis
@@ -1410,8 +1410,8 @@ struct PackerDetection {
  * @brief Fuzzy hash matching result.
  */
 struct FuzzyMatchResult {
-    /// @brief SSDEEP hash
-    std::string ssdeep;
+    /// @brief Fuzzy hash
+    std::string fuzzyHash;
     
     /// @brief TLSH hash
     std::string tlsh;
@@ -1419,8 +1419,8 @@ struct FuzzyMatchResult {
     /// @brief ImpHash
     std::string impHash;
     
-    /// @brief Best SSDEEP similarity (0-100)
-    int ssdeepSimilarity = 0;
+    /// @brief Best fuzzy hash similarity (0-100)
+    int fuzzySimilarity = 0;
     
     /// @brief Best TLSH distance (0 = identical)
     int tlshDistance = 256;
@@ -1880,8 +1880,8 @@ struct HeuristicAnalyzerConfig {
     /// @brief Malicious threshold
     double maliciousThreshold = HeuristicConstants::MALICIOUS_THRESHOLD;
     
-    /// @brief SSDEEP minimum similarity
-    int ssdeepMinSimilarity = HeuristicConstants::SSDEEP_MIN_SIMILARITY;
+    /// @brief Fuzzy hash minimum similarity
+    int fuzzyMinSimilarity = HeuristicConstants::FUZZY_MIN_SIMILARITY;
     
     /// @brief TLSH maximum distance
     int tlshMaxDistance = HeuristicConstants::TLSH_MAX_DISTANCE;
@@ -1956,7 +1956,7 @@ struct HeuristicAnalyzerConfig {
         config.highEntropyThreshold = 6.5;
         config.suspiciousThreshold = 20.0;
         config.maliciousThreshold = 50.0;
-        config.ssdeepMinSimilarity = 30;
+        config.fuzzyMinSimilarity = 30;
         return config;
     }
     
@@ -2283,11 +2283,11 @@ public:
     [[nodiscard]] std::string CalculateImpHash(std::span<const uint8_t> data) const;
 
     /**
-     * @brief Calculate SSDEEP hash.
+     * @brief Calculate fuzzy hash.
      * @param data File data.
-     * @return SSDEEP hash string.
+     * @return Fuzzy hash string.
      */
-    [[nodiscard]] std::string CalculateSSDeep(std::span<const uint8_t> data) const;
+    [[nodiscard]] std::string CalculateFuzzyHash(std::span<const uint8_t> data) const;
 
     /**
      * @brief Calculate TLSH hash.
@@ -2319,12 +2319,12 @@ public:
     // =========================================================================
 
     /**
-     * @brief Compare SSDEEP hashes.
+     * @brief Compare fuzzy hashes.
      * @param hash1 First hash.
      * @param hash2 Second hash.
      * @return Similarity (0-100).
      */
-    [[nodiscard]] int CompareSSDeep(
+    [[nodiscard]] int CompareFuzzyHash(
         const std::string& hash1,
         const std::string& hash2
     ) const;
@@ -2342,13 +2342,13 @@ public:
 
     /**
      * @brief Query HashStore for fuzzy matches.
-     * @param ssdeep SSDEEP hash.
+     * @param fuzzyHash Fuzzy hash.
      * @param tlsh TLSH hash.
      * @param impHash ImpHash.
      * @return Fuzzy match result.
      */
     [[nodiscard]] FuzzyMatchResult QueryFuzzyMatch(
-        const std::string& ssdeep,
+        const std::string& fuzzyHash,
         const std::string& tlsh,
         const std::string& impHash
     );

@@ -22,7 +22,7 @@
  * - Entropy calculation with Shannon/Chi-square/Kolmogorov
  * - Packer detection (200+ signatures for UPX, ASPack, FSG, PECompact, etc.)
  * - String analysis (URLs, IPs, registry keys, file paths, crypto keys)
- * - Fuzzy matching (SSDEEP, TLSH, ImpHash, RichPE)
+ * - Fuzzy matching (CTPH, TLSH, ImpHash, RichPE)
  * - Certificate validation and trust chain analysis
  * - Scoring methodology with weighted categories
  *
@@ -1175,7 +1175,7 @@ FuzzyMatchResult HeuristicAnalyzer::PerformFuzzyMatching(
         auto sha256 = Utils::HashUtils::CalculateSHA256(fileData);
 
         // Check against known malware hashes (simplified)
-        // Real implementation would use SSDEEP/TLSH from HashStore
+        // Real implementation would use CTPH/TLSH from HashStore
 
         result.matchedHash = sha256;
         result.hashType = FuzzyHashType::SHA256;

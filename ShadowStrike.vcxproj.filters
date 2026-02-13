@@ -13,6 +13,12 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav</Extensions>
     </Filter>
+    <Filter Include="Source Files\FuzzyHasher">
+      <UniqueIdentifier>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\FuzzyHasher">
+      <UniqueIdentifier>{B2C3D4E5-F6A7-8901-BCDE-F12345678901}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\Main.cpp">
@@ -60,11 +66,14 @@
     <ClCompile Include="src\external\sqlitecpp\sqlite3.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\external\ssdeep\edit_dist.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="src\FuzzyHasher\FuzzyHasher.cpp">
+      <Filter>Source Files\FuzzyHasher</Filter>
     </ClCompile>
-    <ClCompile Include="src\external\ssdeep\fuzzy.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="src\FuzzyHasher\DigestGenerator.cpp">
+      <Filter>Source Files\FuzzyHasher</Filter>
+    </ClCompile>
+    <ClCompile Include="src\FuzzyHasher\DigestComparer.cpp">
+      <Filter>Source Files\FuzzyHasher</Filter>
     </ClCompile>
     <ClCompile Include="src\external\tlsh\input_desc.cpp">
       <Filter>Source Files</Filter>
@@ -1475,14 +1484,23 @@
     <ClInclude Include="include\sqlitecpp\VariadicBind.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="include\ssdeep\edit_dist.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\FuzzyHasher\FuzzyHasher.hpp">
+      <Filter>Header Files\FuzzyHasher</Filter>
     </ClInclude>
-    <ClInclude Include="include\ssdeep\fuzzy.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\FuzzyHasher\DigestGenerator.hpp">
+      <Filter>Header Files\FuzzyHasher</Filter>
     </ClInclude>
-    <ClInclude Include="include\ssdeep\sum_table.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\FuzzyHasher\DigestComparer.hpp">
+      <Filter>Header Files\FuzzyHasher</Filter>
+    </ClInclude>
+    <ClInclude Include="src\FuzzyHasher\RollingHash.hpp">
+      <Filter>Header Files\FuzzyHasher</Filter>
+    </ClInclude>
+    <ClInclude Include="src\FuzzyHasher\ChunkHash.hpp">
+      <Filter>Header Files\FuzzyHasher</Filter>
+    </ClInclude>
+    <ClInclude Include="src\FuzzyHasher\EditDistance.hpp">
+      <Filter>Header Files\FuzzyHasher</Filter>
     </ClInclude>
     <ClInclude Include="include\tlsh\input_desc.h">
       <Filter>Header Files</Filter>
