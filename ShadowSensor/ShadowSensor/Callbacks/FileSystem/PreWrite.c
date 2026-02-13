@@ -53,6 +53,8 @@ MITRE ATT&CK Coverage:
 --*/
 
 #include "FileSystemCallbacks.h"
+#include "FileBackupEngine.h"
+#include "USBDeviceControl.h"
 #include "../../Core/Globals.h"
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../Cache/ScanCache.h"
@@ -874,6 +876,26 @@ Return Value:
     }
 
     // =========================================================================
+    // USB DEVICE CONTROL — Block writes to restricted removable media
+    // =========================================================================
+
+    if (UdcIsWriteBlocked(FltObjects)) {
+        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+        Data->IoStatus.Information = 0;
+        BlockWrite = TRUE;
+
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/PreWrite] BLOCKED: USB write policy denied: %wZ (PID=%lu)\n",
+            &NameInfo->Name,
+            HandleToULong(RequestorPid)
+            );
+
+        goto Cleanup;
+    }
+
+    // =========================================================================
     // CANARY FILE CHECK (Honeypot Detection)
     // =========================================================================
 
@@ -939,6 +961,12 @@ Return Value:
             }
         }
     }
+
+    // =========================================================================
+    // RANSOMWARE ROLLBACK — Copy-on-first-write backup before modification
+    // =========================================================================
+
+    FbePreWriteBackup(Data, FltObjects, RequestorPid, &NameInfo->Name);
 
     // =========================================================================
     // ALLOCATE COMPLETION CONTEXT FOR ADVANCED ANALYSIS

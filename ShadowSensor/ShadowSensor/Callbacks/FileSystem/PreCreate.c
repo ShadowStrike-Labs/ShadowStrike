@@ -44,10 +44,12 @@ Performance Characteristics:
 
 #include "PreCreate.h"
 #include "FileSystemCallbacks.h"
+#include "USBDeviceControl.h"
 #include "../../Core/Globals.h"
 #include "../../Communication/CommPort.h"
 #include "../../Communication/ScanBridge.h"
 #include "../../SelfProtection/SelfProtect.h"
+#include "../../SelfProtection/FirmwareIntegrity.h"
 #include "../../Cache/ScanCache.h"
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../Utilities/MemoryUtils.h"
@@ -1035,6 +1037,37 @@ Return Value:
                     );
             }
         }
+    }
+
+    // =========================================================================
+    // EFI SYSTEM PARTITION PROTECTION — Bootkit prevention
+    // =========================================================================
+
+    if (FiCheckEspAccess(FltObjects, &NameInfo->Name, RequestorPid)) {
+        ThreatScore += 50;
+        SuspiciousFlags |= PcSuspiciousAdsAccess; // reuse flag for ESP alert
+    }
+
+    // =========================================================================
+    // USB AUTORUN BLOCKING — Removable media autorun prevention
+    // =========================================================================
+
+    if (UdcCheckAutorun(FltObjects, &NameInfo->Name)) {
+        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+        Data->IoStatus.Information = 0;
+
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/PreCreate] BLOCKED: Autorun on removable media: %wZ (PID=%lu)\n",
+            &NameInfo->Name,
+            HandleToULong(RequestorPid)
+            );
+
+        FltReleaseFileNameInformation(NameInfo);
+        SHADOWSTRIKE_LEAVE_OPERATION();
+        ExReleaseRundownProtection(&g_PcState.RundownRef);
+        return FLT_PREOP_COMPLETE;
     }
 
     //

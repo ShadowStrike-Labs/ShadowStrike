@@ -45,6 +45,9 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     FilterMessageType_ThreadNotify,       // Remote thread creation
     FilterMessageType_ImageLoad,          // Image load (DLL/Driver)
     FilterMessageType_RegistryNotify,     // Registry operation
+    FilterMessageType_NamedPipeEvent,     // Named pipe creation/connection (C2/lateral movement)
+    FilterMessageType_FileBackupEvent,    // File backed up for ransomware rollback
+    FilterMessageType_FileRollbackEvent,  // Files restored from ransomware backup
 
     //
     // ALPC Notifications (0x40 - 0x4F)

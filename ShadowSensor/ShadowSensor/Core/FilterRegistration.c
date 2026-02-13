@@ -35,6 +35,8 @@
 #include "../Shared/SharedDefs.h"
 #include "../Shared/MessageProtocol.h"
 #include "../Shared/VerdictTypes.h"
+#include "../Callbacks/FileSystem/NamedPipeMonitor.h"
+#include "../Callbacks/FileSystem/USBDeviceControl.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeInstanceSetup)
@@ -196,6 +198,18 @@ CONST FLT_OPERATION_REGISTRATION g_OperationCallbacks[] = {
         NULL
     },
 
+    //
+    // IRP_MJ_CREATE_NAMED_PIPE - Named pipe creation
+    // Critical for C2 channel and lateral movement detection
+    //
+    {
+        IRP_MJ_CREATE_NAMED_PIPE,
+        0,
+        ShadowStrikePreCreateNamedPipe,
+        ShadowStrikePostCreateNamedPipe,
+        NULL
+    },
+
     { IRP_MJ_OPERATION_END }
 };
 
@@ -320,7 +334,6 @@ ShadowStrikeInstanceSetup(
     PAGED_CODE();
     NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
-    UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(Flags);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
@@ -397,6 +410,13 @@ ShadowStrikeInstanceSetup(
 
     if (!attachToVolume) {
         status = STATUS_FLT_DO_NOT_ATTACH;
+    }
+
+    //
+    // Notify USB Device Control of volume attachment for removable media tracking
+    //
+    if (attachToVolume) {
+        UdcCheckVolumePolicy(FltObjects);
     }
 
     return status;
@@ -1445,4 +1465,41 @@ ShadowStrikeDeferredScanWorker(
 
     ExFreePoolWithTag(scanContext, SHADOW_WORK_ITEM_TAG);
     FltFreeDeferredIoWorkItem(WorkItem);
+}
+
+// ============================================================================
+// FILE SYSTEM CALLBACKS - NAMED PIPE MONITORING
+// ============================================================================
+
+/**
+ * @brief Pre-operation callback for IRP_MJ_CREATE_NAMED_PIPE.
+ *        Dispatches to NamedPipeMonitor module for C2/lateral movement detection.
+ */
+FLT_PREOP_CALLBACK_STATUS
+ShadowStrikePreCreateNamedPipe(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    )
+{
+    if (!ShadowStrikeIsDriverReady()) {
+        *CompletionContext = NULL;
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    return NpMonPreCreateNamedPipe(Data, FltObjects, CompletionContext);
+}
+
+/**
+ * @brief Post-operation callback for IRP_MJ_CREATE_NAMED_PIPE.
+ */
+FLT_POSTOP_CALLBACK_STATUS
+ShadowStrikePostCreateNamedPipe(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ PVOID CompletionContext,
+    _In_ FLT_POST_OPERATION_FLAGS Flags
+    )
+{
+    return NpMonPostCreateNamedPipe(Data, FltObjects, CompletionContext, Flags);
 }

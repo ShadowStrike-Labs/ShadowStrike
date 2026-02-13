@@ -1,18 +1,23 @@
 ;
 ; ShadowSensor.inf
 ;
+; ShadowStrike NGAV Minifilter Driver Installation
+;
+; Copyright (c) 2026 ShadowStrike Security. All rights reserved.
+;
 
 [Version]
 Signature   = "$WINDOWS NT$"
-Class       = System ; TODO: specify appropriate Class
-ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318} ; TODO: specify appropriate ClassGuid
+Class       = "AntiVirus"
+ClassGuid   = {b1d1a169-c54f-4379-81db-bee7d88d7454}
 Provider    = %ManufacturerName%
 CatalogFile = ShadowSensor.cat
-DriverVer   = ; TODO: set DriverVer in stampinf property pages
+DriverVer   = 02/13/2026,3.0.0.0
 PnpLockdown = 1
 
 [DestinationDirs]
-DefaultDestDir = 13
+DefaultDestDir          = 13
+ShadowSensor.CopyFiles  = 13
 
 [SourceDisksNames]
 1 = %DiskName%,,,""
@@ -21,42 +26,77 @@ DefaultDestDir = 13
 ShadowSensor.sys = 1,,
 
 ;*****************************************
-; Install Section
+; Default Install Sections
 ;*****************************************
 
-[Manufacturer]
-%ManufacturerName% = Standard,NT$ARCH$.10.0...16299 ; %13% support introduced in build 16299
+[DefaultInstall.NTAMD64]
+OptionDesc = %ShadowSensor.SVCDESC%
+CopyFiles  = ShadowSensor.CopyFiles
 
-[Standard.NT$ARCH$.10.0...16299]
-%ShadowSensor.DeviceDesc% = ShadowSensor_Device, Root\ShadowSensor ; TODO: edit hw-id
+[DefaultInstall.NTAMD64.Services]
+AddService = %ServiceName%,,ShadowSensor.Service
 
-[ShadowSensor_Device.NT]
-CopyFiles = File_Copy
+;*****************************************
+; Default Uninstall Sections
+;*****************************************
 
-[File_Copy]
+[DefaultUninstall.NTAMD64]
+DelFiles   = ShadowSensor.CopyFiles
+LegacyUninstall = 1
+
+[DefaultUninstall.NTAMD64.Services]
+DelService = %ServiceName%,0x200
+
+;*****************************************
+; File Copy Section
+;*****************************************
+
+[ShadowSensor.CopyFiles]
 ShadowSensor.sys
 
-;-------------- Service installation
-[ShadowSensor_Device.NT.Services]
-AddService = ShadowSensor,%SPSVCINST_ASSOCSERVICE%, ShadowSensor_Service_Inst
+;*****************************************
+; Service Installation
+;*****************************************
 
-; -------------- ShadowSensor driver install sections
-[ShadowSensor_Service_Inst]
+[ShadowSensor.Service]
 DisplayName    = %ShadowSensor.SVCDESC%
-ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
-StartType      = 3               ; SERVICE_DEMAND_START
-ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+Description    = %ShadowSensor.Description%
+ServiceType    = 2                  ; SERVICE_FILE_SYSTEM_DRIVER
+StartType      = 3                  ; SERVICE_DEMAND_START
+ErrorControl   = 1                  ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %13%\ShadowSensor.sys
+LoadOrderGroup = "FSFilter Anti-Virus"
+AddReg         = ShadowSensor.AddRegistry
 
-[ShadowSensor_Device.NT.Wdf]
-KmdfService = ShadowSensor, ShadowSensor_wdfsect
+;*****************************************
+; Minifilter Instance Registration
+;*****************************************
+
+[ShadowSensor.AddRegistry]
+HKR,"Instances","DefaultInstance",0,%DefaultInstance%
+HKR,"Instances\%DefaultInstance%","Altitude",0,%Altitude%
+HKR,"Instances\%DefaultInstance%","Flags",0x00010001,%Flags%
+
+;*****************************************
+; WDF Section (KMDF)
+;*****************************************
+
+[ShadowSensor.Wdf]
+KmdfService = %ServiceName%, ShadowSensor_wdfsect
 
 [ShadowSensor_wdfsect]
 KmdfLibraryVersion = $KMDFVERSION$
 
+;*****************************************
+; Strings
+;*****************************************
+
 [Strings]
-SPSVCINST_ASSOCSERVICE = 0x00000002
-ManufacturerName = "<Your manufacturer name>" ;TODO: Replace with your manufacturer name
-DiskName = "ShadowSensor Installation Disk"
-ShadowSensor.DeviceDesc = "ShadowSensor Device"
-ShadowSensor.SVCDESC = "ShadowSensor Service"
+ManufacturerName        = "ShadowStrike Security"
+ServiceName             = "ShadowSensor"
+DiskName                = "ShadowStrike ShadowSensor Installation Disk"
+ShadowSensor.SVCDESC    = "ShadowStrike NGAV Sensor"
+ShadowSensor.Description = "ShadowStrike Next-Generation AntiVirus kernel sensor for real-time threat detection and prevention"
+DefaultInstance         = "ShadowSensor Instance"
+Altitude                = "385210"
+Flags                   = 0x0

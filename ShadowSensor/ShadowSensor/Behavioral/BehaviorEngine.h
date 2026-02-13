@@ -565,6 +565,7 @@ BeEngineRemediateChain(
 #define BE_REMEDIATE_QUARANTINE_FILES     0x00000004
 #define BE_REMEDIATE_BLOCK_NETWORK        0x00000008
 #define BE_REMEDIATE_ROLLBACK_REGISTRY    0x00000010
+#define BE_REMEDIATE_ROLLBACK_FILES       0x00000020  // Ransomware file rollback via FileBackupEngine
 
 // ============================================================================
 // PUBLIC API - PROCESS CONTEXT

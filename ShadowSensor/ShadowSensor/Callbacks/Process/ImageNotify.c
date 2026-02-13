@@ -30,6 +30,8 @@
 --*/
 
 #include "ImageNotify.h"
+#include "AmsiBypassDetector.h"
+#include "AppControl.h"
 #include "../../Core/Globals.h"
 #include "../../Communication/ScanBridge.h"
 #include "../../Utilities/MemoryUtils.h"
@@ -2067,6 +2069,20 @@ Arguments:
     if (config.EnableModuleTracking && ProcessId != NULL) {
         ImgpAddModuleToTracking(event);
     }
+
+    //
+    // Application Control — check DLL/image against allowlist/blocklist
+    // This can flag unauthorized DLL loads for audit or enforcement
+    //
+    if (ProcessId != NULL) {
+        AcCheckImageLoad(ProcessId, FullImageName, ImageInfo);
+    }
+
+    //
+    // AMSI Bypass Detection — monitor amsi.dll loads and check integrity
+    // Detects runtime patching of AmsiScanBuffer/AmsiOpenSession (T1562.001)
+    //
+    AbdNotifyImageLoad(ProcessId, FullImageName, ImageInfo);
 
     //
     // Send notification to user mode if threshold met

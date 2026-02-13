@@ -11,6 +11,7 @@
  * - IRP_MJ_WRITE (File write) - Change detection
  * - IRP_MJ_SET_INFORMATION (Delete/Rename) - Self-protection
  * - IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION (Execute)
+ * - IRP_MJ_CREATE_NAMED_PIPE (Named pipe monitoring)
  *
  * @author ShadowStrike Security Team
  * @version 1.0.0
@@ -93,6 +94,29 @@ ShadowStrikePreAcquireSection(
     _Inout_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    );
+
+/**
+ * @brief Pre-operation callback for IRP_MJ_CREATE_NAMED_PIPE.
+ *        Detects C2 channel and lateral movement pipe creation.
+ */
+FLT_PREOP_CALLBACK_STATUS
+ShadowStrikePreCreateNamedPipe(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    );
+
+/**
+ * @brief Post-operation callback for IRP_MJ_CREATE_NAMED_PIPE.
+ *        Records successfully created pipes for tracking.
+ */
+FLT_POSTOP_CALLBACK_STATUS
+ShadowStrikePostCreateNamedPipe(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ PVOID CompletionContext,
+    _In_ FLT_POST_OPERATION_FLAGS Flags
     );
 
 #endif // SHADOWSTRIKE_FS_CALLBACKS_H

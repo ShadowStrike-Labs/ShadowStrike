@@ -56,6 +56,9 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Behavioral/ThreatScoring.h"
+#include "WSLMonitor.h"
+#include "AppControl.h"
+#include "ClipboardMonitor.h"
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
@@ -1332,6 +1335,43 @@ Arguments:
                 25,
                 "Reflective loading pattern detected"
                 );
+        }
+    }
+
+    //
+    // WSL/Container escape detection — classify WSL processes and detect
+    // host escape attempts (MITRE T1611)
+    //
+    WslMonCheckProcessCreate(ProcessId, CreateInfo);
+
+    //
+    // Clipboard abuse detection — detect clipboard data theft patterns (T1115)
+    //
+    {
+        ULONG cbIndicators = CbMonCheckProcessCreate(ProcessId, CreateInfo);
+        if (cbIndicators != 0 && g_ProcessMonitor.ThreatScoringEngine != NULL) {
+            TsAddFactor(
+                g_ProcessMonitor.ThreatScoringEngine,
+                ProcessId,
+                TsFactor_MITRE,
+                "T1115-ClipboardAbuse",
+                15,
+                "Clipboard data access/theft indicators detected"
+                );
+        }
+    }
+
+    //
+    // Application Control — enforce allowlist/blocklist policy
+    // In Enforce mode this can block process creation (MITRE M1038)
+    //
+    {
+        NTSTATUS AcStatus = AcCheckProcessExecution(
+            ProcessId,
+            CreateInfo
+            );
+        if (AcStatus == STATUS_ACCESS_DENIED && CreateInfo != NULL) {
+            ShouldBlock = TRUE;
         }
     }
 

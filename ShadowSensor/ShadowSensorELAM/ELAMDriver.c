@@ -881,16 +881,227 @@ ElamLoadSignatureData(
     PDRIVER_OBJECT DriverObject
     )
 {
-    // In a real implementation, this would:
-    // 1. Access the driver's PE resource section
-    // 2. Find the ELAM signature resource (RT_RCDATA)
-    // 3. Parse and validate the signature data
-    // 4. Copy to non-paged pool
+    NTSTATUS status;
+    PIMAGE_DOS_HEADER dosHeader;
+    PIMAGE_NT_HEADERS ntHeaders;
+    PIMAGE_DATA_DIRECTORY resourceDir;
+    PIMAGE_RESOURCE_DIRECTORY resRoot;
+    PIMAGE_RESOURCE_DIRECTORY_ENTRY resEntry;
+    PVOID driverBase;
+    ULONG driverSize;
+    PVOID resourceData = NULL;
+    ULONG resourceSize = 0;
+    BOOLEAN foundResource = FALSE;
 
-    // For now, use embedded signatures
-    UNREFERENCED_PARAMETER(DriverObject);
+    if (DriverObject == NULL || DriverObject->DriverStart == NULL) {
+        return ElamLoadEmbeddedSignatures();
+    }
 
-    return ElamLoadEmbeddedSignatures();
+    driverBase = DriverObject->DriverStart;
+    driverSize = DriverObject->DriverSize;
+
+    //
+    // Validate PE headers with bounds checking
+    //
+    if (driverSize < sizeof(IMAGE_DOS_HEADER)) {
+        goto FallbackEmbedded;
+    }
+
+    dosHeader = (PIMAGE_DOS_HEADER)driverBase;
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        goto FallbackEmbedded;
+    }
+
+    if ((ULONG)dosHeader->e_lfanew >= driverSize ||
+        (ULONG)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS) > driverSize) {
+        goto FallbackEmbedded;
+    }
+
+    ntHeaders = (PIMAGE_NT_HEADERS)((PUCHAR)driverBase + dosHeader->e_lfanew);
+    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
+        goto FallbackEmbedded;
+    }
+
+    //
+    // Locate resource directory (IMAGE_DIRECTORY_ENTRY_RESOURCE = 2)
+    //
+    if (ntHeaders->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_RESOURCE) {
+        goto FallbackEmbedded;
+    }
+
+    resourceDir = &ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE];
+    if (resourceDir->VirtualAddress == 0 || resourceDir->Size == 0) {
+        goto FallbackEmbedded;
+    }
+
+    if (resourceDir->VirtualAddress + resourceDir->Size > driverSize) {
+        goto FallbackEmbedded;
+    }
+
+    //
+    // Walk the resource directory looking for RT_RCDATA (type 10)
+    // RT_RCDATA entries contain our signature blob
+    //
+    resRoot = (PIMAGE_RESOURCE_DIRECTORY)((PUCHAR)driverBase + resourceDir->VirtualAddress);
+
+    {
+        USHORT numEntries = resRoot->NumberOfNamedEntries + resRoot->NumberOfIdEntries;
+        USHORT i;
+
+        resEntry = (PIMAGE_RESOURCE_DIRECTORY_ENTRY)(resRoot + 1);
+
+        for (i = 0; i < numEntries && !foundResource; i++) {
+            //
+            // Look for RT_RCDATA (10) by ID
+            //
+            if (!resEntry[i].NameIsString && resEntry[i].Id == 10) {  // RT_RCDATA
+                if (resEntry[i].DataIsDirectory) {
+                    //
+                    // Descend into type directory → name directory → language entry
+                    //
+                    PIMAGE_RESOURCE_DIRECTORY nameDir;
+                    ULONG nameDirOffset = resEntry[i].OffsetToDirectory;
+
+                    if (nameDirOffset + sizeof(IMAGE_RESOURCE_DIRECTORY) > resourceDir->Size) {
+                        continue;
+                    }
+
+                    nameDir = (PIMAGE_RESOURCE_DIRECTORY)((PUCHAR)resRoot + nameDirOffset);
+                    USHORT nameCount = nameDir->NumberOfNamedEntries + nameDir->NumberOfIdEntries;
+
+                    if (nameCount > 0) {
+                        PIMAGE_RESOURCE_DIRECTORY_ENTRY nameEntry;
+                        nameEntry = (PIMAGE_RESOURCE_DIRECTORY_ENTRY)(nameDir + 1);
+
+                        //
+                        // Look for our specific resource ID (ELAM_RESOURCE_SIGNATURE_TYPE = 1)
+                        //
+                        for (USHORT j = 0; j < nameCount; j++) {
+                            if (!nameEntry[j].NameIsString &&
+                                nameEntry[j].Id == ELAM_RESOURCE_SIGNATURE_TYPE) {
+
+                                if (nameEntry[j].DataIsDirectory) {
+                                    //
+                                    // Language directory — take first entry
+                                    //
+                                    PIMAGE_RESOURCE_DIRECTORY langDir;
+                                    ULONG langOffset = nameEntry[j].OffsetToDirectory;
+
+                                    if (langOffset + sizeof(IMAGE_RESOURCE_DIRECTORY) > resourceDir->Size) {
+                                        continue;
+                                    }
+
+                                    langDir = (PIMAGE_RESOURCE_DIRECTORY)((PUCHAR)resRoot + langOffset);
+                                    USHORT langCount = langDir->NumberOfNamedEntries + langDir->NumberOfIdEntries;
+
+                                    if (langCount > 0) {
+                                        PIMAGE_RESOURCE_DIRECTORY_ENTRY langEntry;
+                                        langEntry = (PIMAGE_RESOURCE_DIRECTORY_ENTRY)(langDir + 1);
+
+                                        if (!langEntry[0].DataIsDirectory) {
+                                            PIMAGE_RESOURCE_DATA_ENTRY dataEntry;
+                                            dataEntry = (PIMAGE_RESOURCE_DATA_ENTRY)(
+                                                (PUCHAR)resRoot + langEntry[0].OffsetToData);
+
+                                            if (dataEntry->OffsetToData + dataEntry->Size <= driverSize &&
+                                                dataEntry->Size >= sizeof(ELAM_SIGNATURE_HEADER)) {
+
+                                                resourceData = (PUCHAR)driverBase + dataEntry->OffsetToData;
+                                                resourceSize = dataEntry->Size;
+                                                foundResource = TRUE;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    //
+                                    // Direct data entry (no language subdirectory)
+                                    //
+                                    PIMAGE_RESOURCE_DATA_ENTRY dataEntry;
+                                    dataEntry = (PIMAGE_RESOURCE_DATA_ENTRY)(
+                                        (PUCHAR)resRoot + nameEntry[j].OffsetToData);
+
+                                    if (dataEntry->OffsetToData + dataEntry->Size <= driverSize &&
+                                        dataEntry->Size >= sizeof(ELAM_SIGNATURE_HEADER)) {
+
+                                        resourceData = (PUCHAR)driverBase + dataEntry->OffsetToData;
+                                        resourceSize = dataEntry->Size;
+                                        foundResource = TRUE;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!foundResource || resourceData == NULL || resourceSize < sizeof(ELAM_SIGNATURE_HEADER)) {
+        goto FallbackEmbedded;
+    }
+
+    //
+    // Validate the resource data is a valid ELAM signature blob
+    //
+    {
+        PELAM_SIGNATURE_HEADER resHeader = (PELAM_SIGNATURE_HEADER)resourceData;
+
+        if (resHeader->Magic != ELAM_SIGNATURE_MAGIC ||
+            resHeader->Version != ELAM_SIGNATURE_VERSION ||
+            resHeader->TotalSize > resourceSize ||
+            resHeader->SignatureCount > ELAM_MAX_SIGNATURE_ENTRIES ||
+            resHeader->HashCount > ELAM_MAX_HASH_ENTRIES) {
+
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/ELAM] PE resource signature blob failed validation "
+                "(magic=0x%08X, ver=%u, size=%u/%u)\n",
+                resHeader->Magic, resHeader->Version,
+                resHeader->TotalSize, resourceSize);
+
+            goto FallbackEmbedded;
+        }
+    }
+
+    //
+    // Copy validated signature data to non-paged pool
+    //
+    {
+        PELAM_SIGNATURE_HEADER sigCopy;
+
+        sigCopy = (PELAM_SIGNATURE_HEADER)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
+            resourceSize,
+            ELAM_POOL_TAG
+            );
+
+        if (sigCopy == NULL) {
+            goto FallbackEmbedded;
+        }
+
+        RtlCopyMemory(sigCopy, resourceData, resourceSize);
+
+        g_ElamGlobals.SignatureData = sigCopy;
+        g_ElamGlobals.SignatureDataSize = resourceSize;
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "[ShadowStrike/ELAM] Loaded %u signatures + %u hashes from PE resource (%u bytes)\n",
+            sigCopy->SignatureCount, sigCopy->HashCount, resourceSize);
+
+        return STATUS_SUCCESS;
+    }
+
+FallbackEmbedded:
+    //
+    // No PE resource found — use minimal embedded signatures
+    //
+    status = ElamLoadEmbeddedSignatures();
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike/ELAM] Using embedded signatures (no PE resource): 0x%08X\n",
+        status);
+
+    return status;
 }
 
 /**

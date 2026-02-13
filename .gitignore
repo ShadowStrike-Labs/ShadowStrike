@@ -378,3 +378,6 @@ SHADOWSTRIKE_3_YEAR_ROADMAP.md
 *.pvslog
 *.plog
 
+# Backup files (use git history instead)
+*.bak
+

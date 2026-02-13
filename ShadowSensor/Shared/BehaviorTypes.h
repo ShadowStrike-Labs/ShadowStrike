@@ -182,6 +182,59 @@ typedef enum _BEHAVIOR_EVENT_TYPE {
     BehaviorEvent_ServiceStopping               = 0x0807,
     BehaviorEvent_DataDestruction               = 0x0808,
 
+    // Named Pipe / IPC (0x0900 - 0x09FF)
+    BehaviorEvent_NamedPipeCreated              = 0x0900,
+    BehaviorEvent_NamedPipeC2Detected           = 0x0901,
+    BehaviorEvent_NamedPipeHighEntropy          = 0x0902,
+    BehaviorEvent_NamedPipeCrossProcess         = 0x0903,
+    BehaviorEvent_NamedPipeLateralMovement      = 0x0904,
+    BehaviorEvent_NamedPipeBlocked              = 0x0905,
+
+    // File Backup/Rollback Events (0x0A00 - 0x0A05)
+    BehaviorEvent_FileBackupCreated             = 0x0A00,
+    BehaviorEvent_FileBackupFailed              = 0x0A01,
+    BehaviorEvent_FileRollbackStarted           = 0x0A02,
+    BehaviorEvent_FileRollbackComplete          = 0x0A03,
+    BehaviorEvent_FileRollbackFailed            = 0x0A04,
+    BehaviorEvent_FileBackupEvicted             = 0x0A05,
+
+    // USB Device Control Events (0x0B00 - 0x0B05)
+    BehaviorEvent_USBDeviceMounted              = 0x0B00,
+    BehaviorEvent_USBDeviceDismounted           = 0x0B01,
+    BehaviorEvent_USBWriteBlocked               = 0x0B02,
+    BehaviorEvent_USBDeviceBlocked              = 0x0B03,
+    BehaviorEvent_USBAutorunDetected            = 0x0B04,
+    BehaviorEvent_USBAutorunBlocked             = 0x0B05,
+
+    // WSL/Container Events (0x0C00 - 0x0C05)
+    BehaviorEvent_WslProcessDetected            = 0x0C00,
+    BehaviorEvent_WslChildSpawn                 = 0x0C01,
+    BehaviorEvent_WslFileSystemCrossing         = 0x0C02,
+    BehaviorEvent_WslCredentialAccess           = 0x0C03,
+    BehaviorEvent_WslDriverAccess               = 0x0C04,
+    BehaviorEvent_WslContainerEscape            = 0x0C05,
+
+    // Application Control Events (0x0D00 - 0x0D04)
+    BehaviorEvent_AppControlBlocked             = 0x0D00,
+    BehaviorEvent_AppControlAudited             = 0x0D01,
+    BehaviorEvent_AppControlDllBlocked          = 0x0D02,
+    BehaviorEvent_AppControlLearned             = 0x0D03,
+    BehaviorEvent_AppControlPolicyViolation     = 0x0D04,
+
+    // Firmware/UEFI Events (0x0E00 - 0x0E04)
+    BehaviorEvent_FirmwareSecureBootDisabled    = 0x0E00,
+    BehaviorEvent_FirmwareEspWrite              = 0x0E01,
+    BehaviorEvent_FirmwareBcdModification       = 0x0E02,
+    BehaviorEvent_FirmwareBootkitDetected       = 0x0E03,
+    BehaviorEvent_FirmwareIntegrityFailure      = 0x0E04,
+
+    // Clipboard Abuse Events (0x0F00 - 0x0F04) — MITRE T1115
+    BehaviorEvent_ClipboardCommandLine          = 0x0F00,
+    BehaviorEvent_ClipboardStealerImage         = 0x0F01,
+    BehaviorEvent_ClipboardRapidTempWrites      = 0x0F02,
+    BehaviorEvent_ClipboardEncodedCommand       = 0x0F03,
+    BehaviorEvent_ClipboardCrossProcess         = 0x0F04,
+
     BehaviorEvent_Max                           = 0xFFFF
 } BEHAVIOR_EVENT_TYPE;
 

@@ -70,6 +70,7 @@
 #include "../Core/Globals.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
+#include "../Callbacks/FileSystem/FileBackupEngine.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -1552,6 +1553,29 @@ BeEngineRemediateChain(
         //
         BeEngineReleaseChain(chain);
         return STATUS_ACCESS_DENIED;
+    }
+
+    //
+    // Rollback file modifications if ransomware detected
+    // CRITICAL: Must happen BEFORE process termination so we have valid PID
+    //
+    if (RemediationFlags & BE_REMEDIATE_ROLLBACK_FILES) {
+        ULONG filesRestored = 0;
+        FBE_ROLLBACK_RESULT rollbackResult;
+
+        rollbackResult = FbeRollbackProcess(
+            (HANDLE)(ULONG_PTR)chain->PrimaryProcessId,
+            &filesRestored
+            );
+
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            (rollbackResult == FbeRollback_Success) ? DPFLTR_INFO_LEVEL : DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/BehaviorEngine] Ransomware rollback for PID %u: result=%d, files=%lu\n",
+            chain->PrimaryProcessId,
+            rollbackResult,
+            filesRestored
+            );
     }
 
     //

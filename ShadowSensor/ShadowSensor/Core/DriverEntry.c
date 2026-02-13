@@ -35,6 +35,14 @@
 #include "../Utilities/HashUtils.h"
 #include "../Shared/SharedDefs.h"
 #include "../Shared/PortName.h"
+#include "../Callbacks/FileSystem/NamedPipeMonitor.h"
+#include "../Callbacks/Process/AmsiBypassDetector.h"
+#include "../Callbacks/FileSystem/FileBackupEngine.h"
+#include "../Callbacks/FileSystem/USBDeviceControl.h"
+#include "../Callbacks/Process/WSLMonitor.h"
+#include "../Callbacks/Process/AppControl.h"
+#include "../SelfProtection/FirmwareIntegrity.h"
+#include "../Callbacks/Process/ClipboardMonitor.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, DriverEntry)
@@ -297,6 +305,118 @@ DriverEntry(
     }
 
     //
+    // Step 14.5: Initialize named pipe monitoring
+    //
+    status = NpMonInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize named pipe monitor: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_NamedPipeMonInitialized;
+        ShadowStrikeLogInitStatus("Named Pipe Monitor", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.6: Initialize AMSI bypass detector
+    //
+    status = AbdInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize AMSI bypass detector: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_AmsiBypassDetInitialized;
+        ShadowStrikeLogInitStatus("AMSI Bypass Detector", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.7: Initialize file backup engine (ransomware rollback)
+    //
+    status = FbeInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize file backup engine: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_FileBackupEngineInitialized;
+        ShadowStrikeLogInitStatus("File Backup Engine", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.8: Initialize USB device control
+    //
+    status = UdcInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize USB device control: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_USBDeviceControlInitialized;
+        ShadowStrikeLogInitStatus("USB Device Control", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.9: Initialize WSL/Container monitor
+    //
+    status = WslMonInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize WSL monitor: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_WslMonitorInitialized;
+        ShadowStrikeLogInitStatus("WSL/Container Monitor", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.10: Initialize application control
+    //
+    status = AcInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize application control: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_AppControlInitialized;
+        ShadowStrikeLogInitStatus("Application Control", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.11: Initialize firmware integrity monitor
+    //
+    status = FiInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize firmware integrity: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_FirmwareIntegrityInitialized;
+        ShadowStrikeLogInitStatus("Firmware Integrity", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.12: Initialize Clipboard Monitor (heuristic clipboard abuse detection)
+    //
+    status = CbMonInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize clipboard monitor: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_ClipboardMonitorInitialized;
+        ShadowStrikeLogInitStatus("Clipboard Monitor", STATUS_SUCCESS);
+    }
+
+    //
     // Step 15: Start filtering
     //
     status = FltStartFiltering(g_DriverData.FilterHandle);
@@ -404,6 +524,62 @@ ShadowStrikeUnload(
     //
     if (g_InitFlags & InitFlag_SelfProtectInitialized) {
         ShadowStrikeShutdownSelfProtection();
+    }
+
+    //
+    // Step 4.5: Shutdown named pipe monitoring
+    //
+    if (g_InitFlags & InitFlag_NamedPipeMonInitialized) {
+        NpMonShutdown();
+    }
+
+    //
+    // Step 4.6: Shutdown AMSI bypass detector
+    //
+    if (g_InitFlags & InitFlag_AmsiBypassDetInitialized) {
+        AbdShutdown();
+    }
+
+    //
+    // Step 4.7: Shutdown file backup engine
+    //
+    if (g_InitFlags & InitFlag_FileBackupEngineInitialized) {
+        FbeShutdown();
+    }
+
+    //
+    // Step 4.8: Shutdown USB device control
+    //
+    if (g_InitFlags & InitFlag_USBDeviceControlInitialized) {
+        UdcShutdown();
+    }
+
+    //
+    // Step 4.9: Shutdown WSL monitor
+    //
+    if (g_InitFlags & InitFlag_WslMonitorInitialized) {
+        WslMonShutdown();
+    }
+
+    //
+    // Step 4.10: Shutdown application control
+    //
+    if (g_InitFlags & InitFlag_AppControlInitialized) {
+        AcShutdown();
+    }
+
+    //
+    // Step 4.11: Shutdown firmware integrity
+    //
+    if (g_InitFlags & InitFlag_FirmwareIntegrityInitialized) {
+        FiShutdown();
+    }
+
+    //
+    // Step 4.12: Shutdown clipboard monitor
+    //
+    if (g_InitFlags & InitFlag_ClipboardMonitorInitialized) {
+        CbMonShutdown();
     }
 
     //
@@ -1018,6 +1194,38 @@ ShadowStrikeCleanupByFlags(
 
     if (InitFlags & InitFlag_SelfProtectInitialized) {
         ShadowStrikeShutdownSelfProtection();
+    }
+
+    if (InitFlags & InitFlag_NamedPipeMonInitialized) {
+        NpMonShutdown();
+    }
+
+    if (InitFlags & InitFlag_AmsiBypassDetInitialized) {
+        AbdShutdown();
+    }
+
+    if (InitFlags & InitFlag_FileBackupEngineInitialized) {
+        FbeShutdown();
+    }
+
+    if (InitFlags & InitFlag_USBDeviceControlInitialized) {
+        UdcShutdown();
+    }
+
+    if (InitFlags & InitFlag_WslMonitorInitialized) {
+        WslMonShutdown();
+    }
+
+    if (InitFlags & InitFlag_AppControlInitialized) {
+        AcShutdown();
+    }
+
+    if (InitFlags & InitFlag_FirmwareIntegrityInitialized) {
+        FiShutdown();
+    }
+
+    if (InitFlags & InitFlag_ClipboardMonitorInitialized) {
+        CbMonShutdown();
     }
 
     if (InitFlags & InitFlag_HashUtilsInitialized) {

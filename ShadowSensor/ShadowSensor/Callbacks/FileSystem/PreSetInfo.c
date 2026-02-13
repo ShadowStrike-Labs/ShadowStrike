@@ -63,6 +63,7 @@
 
 #include "PreSetInfo.h"
 #include "FileSystemCallbacks.h"
+#include "FileBackupEngine.h"
 #include "../../Core/Globals.h"
 #include "../../Shared/SharedDefs.h"
 #include "../../SelfProtection/SelfProtect.h"
@@ -1046,6 +1047,19 @@ ShadowStrikePreSetInformation(
                 goto CompleteOperation;
             }
         }
+    }
+
+    //
+    // ========================================================================
+    // RANSOMWARE ROLLBACK — Backup file before rename/delete
+    // ========================================================================
+    //
+    if (infoClass == FileDispositionInformation ||
+        infoClass == FileDispositionInformationEx ||
+        infoClass == FileRenameInformation ||
+        infoClass == FileRenameInformationEx) {
+
+        FbePreSetInfoBackup(Data, FltObjects, requestorPid, &nameInfo->Name, infoClass);
     }
 
     //

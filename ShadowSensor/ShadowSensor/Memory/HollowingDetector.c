@@ -35,6 +35,7 @@
 #include "../Utilities/HashUtils.h"
 #include "../Utilities/ProcessUtils.h"
 #include "../ETW/TelemetryEvents.h"
+#include "../Core/Globals.h"
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -2270,19 +2271,10 @@ PhpCheckFileTransacted(
     OBJECT_ATTRIBUTES objAttr;
     IO_STATUS_BLOCK ioStatus;
     HANDLE fileHandle = NULL;
+    PFILE_OBJECT fileObject = NULL;
+    PTRANSACTION_PARAMETER_BLOCK txnParams = NULL;
 
     *IsTransacted = FALSE;
-
-    //
-    // M-1: LIMITATION — This is a heuristic stub. True TxF doppelganging
-    // detection requires IoGetTransactionParameterBlock() or FltGetTransactionContext()
-    // in a minifilter. The current approach only detects the case where the
-    // transacted file has been rolled back (file no longer exists). Active
-    // transactions with committed data will NOT be detected here.
-    //
-    // TODO: Implement full TxF detection via minifilter transaction awareness
-    // once the minifilter component is integrated.
-    //
 
     //
     // Try to open the file
@@ -2306,9 +2298,9 @@ PhpCheckFileTransacted(
 
     if (!NT_SUCCESS(status)) {
         //
-        // L-4 fix: File doesn't exist — set IsTransacted heuristic but
-        // return STATUS_SUCCESS so the caller treats the indicator as valid
-        // rather than treating this as an error.
+        // File doesn't exist — possible rolled-back TxF transaction.
+        // This is a strong doppelganging indicator: the process image
+        // was created from a transacted file that was subsequently rolled back.
         //
         if (status == STATUS_OBJECT_NAME_NOT_FOUND ||
             status == STATUS_OBJECT_PATH_NOT_FOUND) {
@@ -2316,6 +2308,31 @@ PhpCheckFileTransacted(
             return STATUS_SUCCESS;
         }
         return status;
+    }
+
+    //
+    // Get the FILE_OBJECT and check for active transaction via
+    // IoGetTransactionParameterBlock. This detects process doppelganging
+    // where the file is still within an active TxF transaction.
+    //
+    status = ObReferenceObjectByHandle(
+        fileHandle,
+        0,
+        *IoFileObjectType,
+        KernelMode,
+        (PVOID*)&fileObject,
+        NULL
+    );
+
+    if (NT_SUCCESS(status)) {
+        txnParams = IoGetTransactionParameterBlock(fileObject);
+        if (txnParams != NULL) {
+            //
+            // File is part of an active transaction — strong doppelganging indicator
+            //
+            *IsTransacted = TRUE;
+        }
+        ObDereferenceObject(fileObject);
     }
 
     ZwClose(fileHandle);

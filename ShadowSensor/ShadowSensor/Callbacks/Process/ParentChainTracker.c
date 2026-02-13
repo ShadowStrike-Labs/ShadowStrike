@@ -1610,9 +1610,39 @@ PctpIsSystemProcess(
                         g_SystemProcesses[i].ImageName,
                         g_SystemProcesses[i].ImageNameLength)) {
                     //
-                    // TODO: If MustBeInSystem32, verify path contains \Windows\System32\
-                    // For now, just match by name
+                    // If the system process must reside in System32,
+                    // verify the full path contains \Windows\System32\
+                    // (case-insensitive). A svchost.exe running from
+                    // C:\Temp\ is a masquerading indicator (T1036.005).
                     //
+                    if (g_SystemProcesses[i].MustBeInSystem32) {
+                        static const WCHAR System32Path[] = L"\\Windows\\System32\\";
+                        static const USHORT System32PathLen = sizeof(System32Path) - sizeof(WCHAR);
+                        USHORT pathChars = ImageName->Length / sizeof(WCHAR);
+                        USHORT needleChars = System32PathLen / sizeof(WCHAR);
+                        BOOLEAN pathValid = FALSE;
+
+                        if (pathChars >= needleChars) {
+                            USHORT maxOffset = pathChars - needleChars;
+                            for (USHORT j = 0; j <= maxOffset; j++) {
+                                if (_wcsnicmp(&ImageName->Buffer[j],
+                                              System32Path, needleChars) == 0) {
+                                    pathValid = TRUE;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!pathValid) {
+                            //
+                            // Name matches a system process but path is NOT
+                            // in System32 — do not classify as system process.
+                            // Caller will treat this as masquerading.
+                            //
+                            continue;
+                        }
+                    }
+
                     return TRUE;
                 }
             }

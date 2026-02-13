@@ -79,11 +79,43 @@ REVISION HISTORY:
 #include <ntstrsafe.h>
 
 // ============================================================================
+// SYSTEM STRUCTURES (for ZwQuerySystemInformation thread enumeration)
+// ============================================================================
+
+#ifndef SystemProcessInformation
+#define SystemProcessInformation 5
+#endif
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQuerySystemInformation(
+    _In_ ULONG SystemInformationClass,
+    _Out_writes_bytes_opt_(SystemInformationLength) PVOID SystemInformation,
+    _In_ ULONG SystemInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+//
+// Thread wait state — matches kernel KTHREAD_STATE
+// Value 5 = Waiting (includes suspended threads)
+//
+#define PAS_THREAD_STATE_WAITING    5
+
+//
+// Suspend wait reason — KWAIT_REASON::Suspended = 5
+//
+#define PAS_WAIT_REASON_SUSPENDED   5
+
+// ============================================================================
 // INTERNAL CONSTANTS
 // ============================================================================
 
 #define PAS_POOL_TAG                    'sAPP'  // PPAS - PreAcquireSection
+#define PAS_POOL_TAG_QUERY              'qAPP'  // PPAQ - PreAcquireSection Query
 #define PAS_MAX_TRACKED_MAPPINGS        4096
+#define PAS_SYSINFO_INITIAL_BUFFER      (256 * 1024)
+#define PAS_SYSINFO_MAX_BUFFER          (4 * 1024 * 1024)
 #define PAS_MAPPING_TIMEOUT_100NS       (300000LL * 10000LL)  // 5 minutes in 100ns
 #define PAS_CLEANUP_INTERVAL_MS         60000   // 1 minute
 #define PAS_MAX_PROCESS_MAPPINGS        256     // Max tracked per process
@@ -688,16 +720,123 @@ PaspIsProcessSuspended(
     _In_ HANDLE ProcessId
     )
 {
+    NTSTATUS status;
+    PVOID buffer = NULL;
+    ULONG bufferSize = PAS_SYSINFO_INITIAL_BUFFER;
+    ULONG returnLength = 0;
+    PSYSTEM_PROCESS_INFORMATION processInfo;
+    BOOLEAN hasSuspendedThreads = FALSE;
+
+    if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
+        return FALSE;
+    }
+
+    buffer = ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        bufferSize,
+        PAS_POOL_TAG_QUERY
+    );
+
+    if (buffer == NULL) {
+        return FALSE;
+    }
+
+    status = ZwQuerySystemInformation(
+        SystemProcessInformation,
+        buffer,
+        bufferSize,
+        &returnLength
+    );
+
+    if (status == STATUS_INFO_LENGTH_MISMATCH) {
+        ExFreePoolWithTag(buffer, PAS_POOL_TAG_QUERY);
+
+        bufferSize = returnLength + (64 * 1024);
+        if (bufferSize > PAS_SYSINFO_MAX_BUFFER) {
+            return FALSE;
+        }
+
+        buffer = ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
+            bufferSize,
+            PAS_POOL_TAG_QUERY
+        );
+
+        if (buffer == NULL) {
+            return FALSE;
+        }
+
+        status = ZwQuerySystemInformation(
+            SystemProcessInformation,
+            buffer,
+            bufferSize,
+            NULL
+        );
+    }
+
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(buffer, PAS_POOL_TAG_QUERY);
+        return FALSE;
+    }
+
     //
-    // This would require enumerating threads and checking suspend count.
-    // For now, we rely on other heuristics. A full implementation would
-    // use ZwQuerySystemInformation with SystemProcessInformation class.
+    // Walk the process list to find our target PID
     //
-    // TODO: Implement thread suspension check via SystemProcessInformation
-    // For enterprise deployment, this should query actual thread states.
-    //
-    UNREFERENCED_PARAMETER(ProcessId);
-    return FALSE;
+    processInfo = (PSYSTEM_PROCESS_INFORMATION)buffer;
+
+    for (;;) {
+        if (processInfo->UniqueProcessId == ProcessId) {
+            //
+            // Found our process. Walk its thread array to check for
+            // suspended threads. SYSTEM_PROCESS_INFORMATION is followed
+            // by NumberOfThreads SYSTEM_THREAD_INFORMATION entries.
+            //
+            ULONG threadCount = processInfo->NumberOfThreads;
+            ULONG suspendedCount = 0;
+            PSYSTEM_THREAD_INFORMATION threadInfo;
+
+            if (threadCount == 0) {
+                break;
+            }
+
+            //
+            // Threads array starts immediately after the SYSTEM_PROCESS_INFORMATION
+            //
+            threadInfo = (PSYSTEM_THREAD_INFORMATION)(processInfo + 1);
+
+            for (ULONG i = 0; i < threadCount; i++) {
+                //
+                // ThreadState == Waiting (5) and WaitReason == Suspended (5)
+                // indicates a suspended thread
+                //
+                if (threadInfo[i].ThreadState == PAS_THREAD_STATE_WAITING &&
+                    threadInfo[i].WaitReason == PAS_WAIT_REASON_SUSPENDED) {
+                    suspendedCount++;
+                }
+            }
+
+            //
+            // If ALL threads are suspended, this is a strong hollowing indicator.
+            // A single suspended thread in a multi-threaded process is less significant.
+            //
+            if (suspendedCount > 0 && suspendedCount == threadCount) {
+                hasSuspendedThreads = TRUE;
+            }
+
+            break;
+        }
+
+        if (processInfo->NextEntryOffset == 0) {
+            break;
+        }
+
+        processInfo = (PSYSTEM_PROCESS_INFORMATION)(
+            (PUCHAR)processInfo + processInfo->NextEntryOffset
+        );
+    }
+
+    ExFreePoolWithTag(buffer, PAS_POOL_TAG_QUERY);
+    return hasSuspendedThreads;
 }
 
 // ============================================================================
