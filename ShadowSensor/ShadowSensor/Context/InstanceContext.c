@@ -30,24 +30,6 @@
 #include "InstanceContext.h"
 #include "../Core/Globals.h"
 
-#ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, ShadowCreateInstanceContext)
-#pragma alloc_text(PAGE, ShadowGetInstanceContext)
-#pragma alloc_text(PAGE, ShadowCleanupInstanceContext)
-#pragma alloc_text(PAGE, ShadowInitializeInstanceVolumeInfo)
-#pragma alloc_text(PAGE, ShadowInstanceIsNetworkVolume)
-#pragma alloc_text(PAGE, ShadowInstanceIsRemovableMedia)
-#pragma alloc_text(PAGE, ShadowInstanceSupportsFileIds)
-#pragma alloc_text(PAGE, ShadowInstanceSupportsStreams)
-#pragma alloc_text(PAGE, ShadowInstanceGetFilesystemType)
-#pragma alloc_text(PAGE, ShadowInstanceCopyVolumeName)
-#pragma alloc_text(PAGE, ShadowpQueryVolumeProperties)
-#pragma alloc_text(PAGE, ShadowpQueryFilesystemCapabilities)
-#pragma alloc_text(PAGE, ShadowpQueryVolumeSerialNumber)
-#pragma alloc_text(PAGE, ShadowpDetermineVolumeType)
-#pragma alloc_text(PAGE, ShadowpAllocateAndCopyString)
-#pragma alloc_text(PAGE, ShadowpValidateInstanceContext)
-#endif
 
 // ============================================================================
 // PRIVATE HELPER PROTOTYPES
@@ -59,7 +41,7 @@ static
 NTSTATUS
 ShadowpQueryVolumeProperties(
     _In_ PFLT_VOLUME Volume,
-    _Out_ PDEVICE_TYPE DeviceType,
+    _Out_ DEVICE_TYPE* DeviceType,
     _Out_ PULONG DeviceCharacteristics,
     _Out_ PFLT_FILESYSTEM_TYPE FilesystemType
     );
@@ -137,6 +119,25 @@ ShadowpValidateInstanceContext(
     _In_opt_ PSHADOW_INSTANCE_CONTEXT Context,
     _In_ BOOLEAN RequireInitialized
     );
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, ShadowCreateInstanceContext)
+#pragma alloc_text(PAGE, ShadowGetInstanceContext)
+#pragma alloc_text(PAGE, ShadowCleanupInstanceContext)
+#pragma alloc_text(PAGE, ShadowInitializeInstanceVolumeInfo)
+#pragma alloc_text(PAGE, ShadowInstanceIsNetworkVolume)
+#pragma alloc_text(PAGE, ShadowInstanceIsRemovableMedia)
+#pragma alloc_text(PAGE, ShadowInstanceSupportsFileIds)
+#pragma alloc_text(PAGE, ShadowInstanceSupportsStreams)
+#pragma alloc_text(PAGE, ShadowInstanceGetFilesystemType)
+#pragma alloc_text(PAGE, ShadowInstanceCopyVolumeName)
+#pragma alloc_text(PAGE, ShadowpQueryVolumeProperties)
+#pragma alloc_text(PAGE, ShadowpQueryFilesystemCapabilities)
+#pragma alloc_text(PAGE, ShadowpQueryVolumeSerialNumber)
+#pragma alloc_text(PAGE, ShadowpDetermineVolumeType)
+#pragma alloc_text(PAGE, ShadowpAllocateAndCopyString)
+#pragma alloc_text(PAGE, ShadowpValidateInstanceContext)
+#endif
 
 // ============================================================================
 // PUBLIC FUNCTIONS
@@ -1133,7 +1134,7 @@ static
 NTSTATUS
 ShadowpQueryVolumeProperties(
     PFLT_VOLUME Volume,
-    PDEVICE_TYPE DeviceType,
+    DEVICE_TYPE* DeviceType,
     PULONG DeviceCharacteristics,
     PFLT_FILESYSTEM_TYPE FilesystemType
     )
