@@ -16,7 +16,8 @@
  * ============================================================================
  */
 
-#pragma once
+#ifndef SHADOWSTRIKE_ATTACK_PATTERNS_H
+#define SHADOWSTRIKE_ATTACK_PATTERNS_H
 
 #ifdef _KERNEL_MODE
     #include <fltKernel.h>

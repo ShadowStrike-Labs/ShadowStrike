@@ -16,7 +16,9 @@
  * ============================================================================
  */
 
-#pragma once
+#ifndef MEMORY_TYPES_H
+#define MEMORY_TYPES_H
+
 
 #ifdef _KERNEL_MODE
     #include <fltKernel.h>

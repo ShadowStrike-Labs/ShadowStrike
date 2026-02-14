@@ -41,7 +41,7 @@
 // COMPILE-TIME VALIDATIONS
 // ============================================================================
 
-C_ASSERT(sizeof(FILTER_MESSAGE_HEADER) <= 64);
+C_ASSERT(sizeof(SS_MESSAGE_HEADER) <= 64);
 C_ASSERT(sizeof(SHADOWSTRIKE_GENERIC_REPLY) <= 32);
 C_ASSERT(MAX_PROCESS_NAME_LENGTH <= 520);
 
@@ -105,7 +105,7 @@ MhShutdown(
 typedef NTSTATUS
 (*PMH_MESSAGE_HANDLER_CALLBACK)(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,

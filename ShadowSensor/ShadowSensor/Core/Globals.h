@@ -25,10 +25,10 @@ extern "C" {
 #include <fltKernel.h>
 #include <ntddk.h>
 #include <wdm.h>
-#include "../Shared/SharedDefs.h"
-#include "../Shared/MessageProtocol.h"
-#include "../Shared/VerdictTypes.h"
-#include "../Shared/ErrorCodes.h"
+#include "../../Shared/SharedDefs.h"
+#include "../../Shared/MessageProtocol.h"
+#include "../../Shared/VerdictTypes.h"
+#include "../../Shared/ErrorCodes.h"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -412,36 +412,10 @@ extern SHADOWSTRIKE_DRIVER_DATA g_DriverData;
 // ============================================================================
 // VOLATILE BOOLEAN ACCESS HELPERS
 // ============================================================================
-
-/**
- * @brief Read a boolean with acquire semantics.
- * Ensures proper memory ordering for checking shutdown/init flags.
- */
-FORCEINLINE
-BOOLEAN
-ReadBooleanAcquire(
-    _In_ volatile BOOLEAN* Value
-    )
-{
-    BOOLEAN result = *Value;
-    MemoryBarrier();
-    return result;
-}
-
-/**
- * @brief Write a boolean with release semantics.
- * Ensures proper memory ordering when setting shutdown/init flags.
- */
-FORCEINLINE
-VOID
-WriteBooleanRelease(
-    _Out_ volatile BOOLEAN* Target,
-    _In_ BOOLEAN Value
-    )
-{
-    MemoryBarrier();
-    *Target = Value;
-}
+//
+// ReadBooleanAcquire and WriteBooleanRelease are provided by wdm.h
+// in WDK 10.0.26100+. No custom implementations needed.
+//
 
 // ============================================================================
 // DEFAULT CONFIGURATION

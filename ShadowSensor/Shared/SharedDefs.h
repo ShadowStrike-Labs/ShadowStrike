@@ -15,7 +15,8 @@
  * ============================================================================
  */
 
-#pragma once
+#ifndef SHADOWSTRIKE_SHARED_DEFS_H
+#define SHADOWSTRIKE_SHARED_DEFS_H
 
 #ifdef _KERNEL_MODE
     #include <fltKernel.h>
@@ -394,7 +395,6 @@ typedef struct _SHADOWSTRIKE_FILE_SCAN_REQUEST {
 #ifndef SHADOWSTRIKE_MESSAGE_HEADER_DEFINED
 #define SHADOWSTRIKE_MESSAGE_HEADER_DEFINED
 struct _SHADOWSTRIKE_MESSAGE_HEADER;
-typedef struct _SHADOWSTRIKE_MESSAGE_HEADER* PSHADOWSTRIKE_MESSAGE_HEADER;
 #endif
 
 #endif // SHADOWSTRIKE_SHARED_DEFS_H

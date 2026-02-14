@@ -166,7 +166,7 @@ MhpValidateAndCopyMessage(
     _In_ ULONG UserBufferSize,
     _Out_ PVOID* KernelBuffer,
     _Out_ PULONG KernelBufferSize,
-    _Out_ PFILTER_MESSAGE_HEADER* Header,
+    _Out_ PSS_MESSAGE_HEADER* Header,
     _Out_ PVOID* Payload,
     _Out_ PULONG PayloadSize
     );
@@ -192,7 +192,7 @@ MhpIsPrivilegedOperation(
 static NTSTATUS
 MhpHandleHeartbeat(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -203,7 +203,7 @@ MhpHandleHeartbeat(
 static NTSTATUS
 MhpHandleConfigUpdate(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -214,7 +214,7 @@ MhpHandleConfigUpdate(
 static NTSTATUS
 MhpHandlePolicyUpdate(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -225,7 +225,7 @@ MhpHandlePolicyUpdate(
 static NTSTATUS
 MhpHandleDriverStatusQuery(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -236,7 +236,7 @@ MhpHandleDriverStatusQuery(
 static NTSTATUS
 MhpHandleProtectedProcessRegister(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -247,7 +247,7 @@ MhpHandleProtectedProcessRegister(
 static NTSTATUS
 MhpHandleScanVerdict(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -258,7 +258,7 @@ MhpHandleScanVerdict(
 static NTSTATUS
 MhpHandleEnableFiltering(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -269,7 +269,7 @@ MhpHandleEnableFiltering(
 static NTSTATUS
 MhpHandleDisableFiltering(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -768,14 +768,14 @@ MhpValidateAndCopyMessage(
     _In_ ULONG UserBufferSize,
     _Out_ PVOID* KernelBuffer,
     _Out_ PULONG KernelBufferSize,
-    _Out_ PFILTER_MESSAGE_HEADER* Header,
+    _Out_ PSS_MESSAGE_HEADER* Header,
     _Out_ PVOID* Payload,
     _Out_ PULONG PayloadSize
     )
 {
     NTSTATUS status = STATUS_SUCCESS;
     PVOID kernelBuf = NULL;
-    PFILTER_MESSAGE_HEADER hdr;
+    PSS_MESSAGE_HEADER hdr;
 
     PAGED_CODE();
 
@@ -792,7 +792,7 @@ MhpValidateAndCopyMessage(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (UserBufferSize < sizeof(FILTER_MESSAGE_HEADER)) {
+    if (UserBufferSize < sizeof(SS_MESSAGE_HEADER)) {
         return SHADOWSTRIKE_ERROR_BUFFER_TOO_SMALL;
     }
 
@@ -836,7 +836,7 @@ MhpValidateAndCopyMessage(
     //
     // Now validate the copied header (safe kernel memory)
     //
-    hdr = (PFILTER_MESSAGE_HEADER)kernelBuf;
+    hdr = (PSS_MESSAGE_HEADER)kernelBuf;
 
     //
     // Validate magic
@@ -866,9 +866,9 @@ MhpValidateAndCopyMessage(
     }
 
     //
-    // Safe subtraction - we already validated UserBufferSize >= sizeof(FILTER_MESSAGE_HEADER)
+    // Safe subtraction - we already validated UserBufferSize >= sizeof(SS_MESSAGE_HEADER)
     //
-    ULONG maxPayloadSize = UserBufferSize - sizeof(FILTER_MESSAGE_HEADER);
+    ULONG maxPayloadSize = UserBufferSize - sizeof(SS_MESSAGE_HEADER);
     if (hdr->DataSize > maxPayloadSize) {
         ExFreePoolWithTag(kernelBuf, MH_KERNEL_BUFFER_TAG);
         return SHADOWSTRIKE_ERROR_INVALID_MESSAGE;
@@ -882,7 +882,7 @@ MhpValidateAndCopyMessage(
     *Header = hdr;
 
     if (hdr->DataSize > 0) {
-        *Payload = (PUCHAR)kernelBuf + sizeof(FILTER_MESSAGE_HEADER);
+        *Payload = (PUCHAR)kernelBuf + sizeof(SS_MESSAGE_HEADER);
         *PayloadSize = hdr->DataSize;
     }
 
@@ -964,7 +964,7 @@ ShadowStrikeProcessUserMessage(
     NTSTATUS status;
     PVOID kernelBuffer = NULL;
     ULONG kernelBufferSize = 0;
-    PFILTER_MESSAGE_HEADER header = NULL;
+    PSS_MESSAGE_HEADER header = NULL;
     PVOID payload = NULL;
     ULONG payloadSize = 0;
     PMH_HANDLER_ENTRY handlerEntry = NULL;
@@ -1160,7 +1160,7 @@ ShadowStrikeProcessUserMessage(
 static NTSTATUS
 MhpHandleHeartbeat(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -1200,7 +1200,7 @@ MhpHandleHeartbeat(
 static NTSTATUS
 MhpHandleConfigUpdate(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -1240,7 +1240,7 @@ MhpHandleConfigUpdate(
 static NTSTATUS
 MhpHandlePolicyUpdate(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -1335,7 +1335,7 @@ MhpHandlePolicyUpdate(
 static NTSTATUS
 MhpHandleDriverStatusQuery(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -1410,7 +1410,7 @@ MhpHandleDriverStatusQuery(
 static NTSTATUS
 MhpHandleProtectedProcessRegister(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -1552,7 +1552,7 @@ MhpHandleProtectedProcessRegister(
 static NTSTATUS
 MhpHandleScanVerdict(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -1611,7 +1611,7 @@ MhpHandleScanVerdict(
 static NTSTATUS
 MhpHandleEnableFiltering(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
@@ -1662,7 +1662,7 @@ MhpHandleEnableFiltering(
 static NTSTATUS
 MhpHandleDisableFiltering(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
-    _In_ PFILTER_MESSAGE_HEADER Header,
+    _In_ PSS_MESSAGE_HEADER Header,
     _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
     _In_ ULONG PayloadSize,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,

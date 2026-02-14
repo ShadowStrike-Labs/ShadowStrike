@@ -59,7 +59,6 @@
 #pragma alloc_text(PAGE, ShadowSetStreamVerdict)
 #pragma alloc_text(PAGE, ShadowMarkScanInProgress)
 #pragma alloc_text(PAGE, ShadowShouldRescan)
-#pragma alloc_text(PAGE, ShadowInitializeStreamContextFileInfo)
 #pragma alloc_text(PAGE, ShadowSetStreamContextHash)
 #endif
 
@@ -1259,21 +1258,22 @@ ShadowQueryVolumeSerial(
     NTSTATUS status;
     UCHAR buffer[sizeof(FILE_FS_VOLUME_INFORMATION) + 256 * sizeof(WCHAR)];
     PFILE_FS_VOLUME_INFORMATION volumeInfo = (PFILE_FS_VOLUME_INFORMATION)buffer;
-    ULONG bytesReturned;
 
     PAGED_CODE();
 
     RtlZeroMemory(buffer, sizeof(buffer));
 
     //
-    // Query volume information to get serial number
+    // Query volume information to get serial number.
+    // FltQueryVolumeInformation(Instance, Irp, FsInfo, Length, InfoClass)
+    // Pass NULL for IRP — direct query without associated I/O request.
     //
     status = FltQueryVolumeInformation(
         Instance,
+        NULL,
         volumeInfo,
         sizeof(buffer),
-        FileFsVolumeInformation,
-        &bytesReturned
+        FileFsVolumeInformation
     );
 
     if (!NT_SUCCESS(status)) {
@@ -1281,10 +1281,6 @@ ShadowQueryVolumeSerial(
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                    "[ShadowStrike] FltQueryVolumeInformation failed: 0x%08X\n", status);
 #endif
-        return;
-    }
-
-    if (bytesReturned < FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel)) {
         return;
     }
 

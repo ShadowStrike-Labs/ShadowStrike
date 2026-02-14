@@ -38,9 +38,6 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="ShadowSensor\ALPC\AlpcMonitor.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="ShadowSensor\Context\InstanceContext.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -54,6 +51,39 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ShadowSensor\ALPC\AlpcTypes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Shared\AttackPatterns.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Shared\BehaviorTypes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Shared\ErrorCodes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Shared\MemoryTypes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Shared\MessageProtocol.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Shared\MessageTypes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Shared\NetworkTypes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Shared\PortName.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Shared\SharedDefs.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Shared\TelemetryTypes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Shared\VerdictTypes.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

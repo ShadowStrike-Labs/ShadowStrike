@@ -16,7 +16,8 @@
  * ============================================================================
  */
 
-#pragma once
+#ifndef SHADOWSTRIKE_TELEMETRY_TYPES_H
+#define SHADOWSTRIKE_TELEMETRY_TYPES_H
 
 #ifdef _KERNEL_MODE
     #include <fltKernel.h>

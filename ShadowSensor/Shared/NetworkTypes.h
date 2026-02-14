@@ -16,7 +16,8 @@
  * ============================================================================
  */
 
-#pragma once
+#ifndef SHADOWSTRIKE_NETWORK_TYPES_H
+#define SHADOWSTRIKE_NETWORK_TYPES_H
 
 #ifdef _KERNEL_MODE
     #include <fltKernel.h>

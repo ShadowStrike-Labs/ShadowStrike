@@ -14,7 +14,7 @@
 //
 // Common Message Header
 //
-typedef struct _FILTER_MESSAGE_HEADER {
+typedef struct _SHADOWSTRIKE_MESSAGE_HEADER {
     UINT32 Magic;           // SHADOWSTRIKE_MESSAGE_MAGIC
     UINT16 Version;         // SHADOWSTRIKE_PROTOCOL_VERSION
     UINT16 MessageType;     // SHADOWSTRIKE_MESSAGE_TYPE
@@ -24,10 +24,26 @@ typedef struct _FILTER_MESSAGE_HEADER {
     UINT64 Timestamp;       // Kernel timestamp
     UINT32 Flags;           // Message flags
     UINT32 Reserved;        // Padding/Reserved
-} FILTER_MESSAGE_HEADER, *PFILTER_MESSAGE_HEADER;
+} SHADOWSTRIKE_MESSAGE_HEADER, *PSHADOWSTRIKE_MESSAGE_HEADER;
 
-// Typedef for legacy code compatibility if needed, though we prefer FILTER_MESSAGE_HEADER
-typedef FILTER_MESSAGE_HEADER SHADOWSTRIKE_MESSAGE_HEADER, *PSHADOWSTRIKE_MESSAGE_HEADER;
+//
+// Backward compatibility aliases for code that references FILTER_MESSAGE_HEADER.
+// In kernel mode, WDK defines its own FILTER_MESSAGE_HEADER (fltUserStructures.h)
+// with a completely different layout, so we must NOT redefine it there.
+// Instead, redirect all our references to SHADOWSTRIKE_MESSAGE_HEADER.
+//
+#ifdef __FLT_USER_STRUCTURES_H__
+// Kernel mode: WDK owns FILTER_MESSAGE_HEADER. Our code must use SHADOWSTRIKE_MESSAGE_HEADER.
+// MessageHandler code uses SS_MESSAGE_HEADER as the portable alias.
+#define SS_MESSAGE_HEADER   SHADOWSTRIKE_MESSAGE_HEADER
+#define PSS_MESSAGE_HEADER  PSHADOWSTRIKE_MESSAGE_HEADER
+#else
+// User mode: no WDK conflict, provide direct aliases.
+typedef SHADOWSTRIKE_MESSAGE_HEADER  FILTER_MESSAGE_HEADER;
+typedef PSHADOWSTRIKE_MESSAGE_HEADER PFILTER_MESSAGE_HEADER;
+#define SS_MESSAGE_HEADER   SHADOWSTRIKE_MESSAGE_HEADER
+#define PSS_MESSAGE_HEADER  PSHADOWSTRIKE_MESSAGE_HEADER
+#endif
 
 //
 // 1. File Scan Request (FilterMessageType_ScanRequest)
@@ -81,7 +97,7 @@ typedef struct _SHADOWSTRIKE_SCAN_VERDICT_REPLY {
 // 3. Process Notification (FilterMessageType_ProcessNotify)
 //
 typedef struct _SHADOWSTRIKE_PROCESS_NOTIFICATION {
-    FILTER_MESSAGE_HEADER Header; // Header included for convenience in some contexts, or payload starts here?
+    SS_MESSAGE_HEADER Header; // Header included for convenience in some contexts, or payload starts here?
                                   // Standard convention: Payload struct follows header.
                                   // BUT ScanBridge.c casts Header+1 to specific type.
                                   // So this struct should contain ONLY payload.
