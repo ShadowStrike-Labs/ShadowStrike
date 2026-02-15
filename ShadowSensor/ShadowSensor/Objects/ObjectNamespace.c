@@ -26,6 +26,73 @@
 #include <ntstrsafe.h>
 
 // ============================================================================
+// UNDECLARED NTOSKRNL EXPORTS
+// ============================================================================
+//
+// The following symbols are exported by ntoskrnl.lib but not declared in
+// standard WDK headers. We provide declarations so the linker can resolve them.
+//
+
+NTKERNELAPI
+NTSTATUS
+NTAPI
+ZwCreateSemaphore(
+    _Out_ PHANDLE SemaphoreHandle,
+    _In_ ACCESS_MASK DesiredAccess,
+    _In_opt_ POBJECT_ATTRIBUTES ObjectAttributes,
+    _In_ LONG InitialCount,
+    _In_ LONG MaximumCount
+    );
+
+NTKERNELAPI extern POBJECT_TYPE *ExTimerObjectType;
+NTKERNELAPI extern POBJECT_TYPE *MmSectionObjectType;
+
+NTKERNELAPI
+NTSTATUS
+NTAPI
+RtlAddMandatoryAce(
+    _Inout_ PACL Acl,
+    _In_ ULONG AceRevision,
+    _In_ ULONG AceFlags,
+    _In_ ULONG MandatoryPolicy,
+    _In_ UCHAR AceType,
+    _In_ PSID LabelSid
+    );
+
+NTKERNELAPI
+NTSTATUS
+NTAPI
+RtlAddAuditAccessAceEx(
+    _Inout_ PACL Acl,
+    _In_ ULONG AceRevision,
+    _In_ ULONG AceFlags,
+    _In_ ACCESS_MASK AccessMask,
+    _In_ PSID Sid,
+    _In_ BOOLEAN AuditSuccess,
+    _In_ BOOLEAN AuditFailure
+    );
+
+NTKERNELAPI
+NTSTATUS
+NTAPI
+RtlSetSaclSecurityDescriptor(
+    _Inout_ PSECURITY_DESCRIPTOR SecurityDescriptor,
+    _In_ BOOLEAN SaclPresent,
+    _In_opt_ PACL Sacl,
+    _In_ BOOLEAN SaclDefaulted
+    );
+
+//
+// Access mask constants not in km headers (defined in um\winnt.h).
+//
+#ifndef TIMER_ALL_ACCESS
+#define TIMER_QUERY_STATE   0x0001
+#define TIMER_MODIFY_STATE  0x0002
+#define TIMER_ALL_ACCESS    (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | \
+                             TIMER_QUERY_STATE | TIMER_MODIFY_STATE)
+#endif
+
+// ============================================================================
 // GLOBAL STATE (file-scoped — NOT exported in header)
 // ============================================================================
 
@@ -405,14 +472,6 @@ ShadowCreateNamespaceObject(
             MAXLONG
         );
     }
-    else if (ObjectType == *ExMutantObjectType) {
-        status = ZwCreateMutant(
-            ObjectHandle,
-            MUTANT_ALL_ACCESS,
-            &objectAttributes,
-            FALSE
-        );
-    }
     else if (ObjectType == *ExTimerObjectType) {
         status = ZwCreateTimer(
             ObjectHandle,
@@ -731,7 +790,7 @@ ShadowpBuildSecurityDescriptor(
         ACL_REVISION,
         0,
         SYSTEM_MANDATORY_LABEL_NO_WRITE_UP | SYSTEM_MANDATORY_LABEL_NO_READ_UP,
-        0,
+        SYSTEM_MANDATORY_LABEL_ACE_TYPE,
         highILSid
     );
     if (!NT_SUCCESS(status)) {
@@ -744,8 +803,8 @@ ShadowpBuildSecurityDescriptor(
     // Audit ACE — non-fatal (nice to have).
     //
     {
-        NTSTATUS auditStatus = RtlAddAuditAccessAce(
-            sacl, ACL_REVISION, GENERIC_ALL, everyoneSid, TRUE, TRUE);
+        NTSTATUS auditStatus = RtlAddAuditAccessAceEx(
+            sacl, ACL_REVISION, 0, GENERIC_ALL, everyoneSid, TRUE, TRUE);
         if (!NT_SUCCESS(auditStatus)) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                        "[ShadowStrike] Audit ACE failed: 0x%X (non-fatal)\n", auditStatus);
