@@ -27,7 +27,6 @@
  */
 
 #include "StringUtils.h"
-#include "MemoryUtils.h"
 
 // ============================================================================
 // ALLOC_PRAGMA
@@ -44,7 +43,7 @@
 //   ShadowStrikeFreeUnicodeString
 //   ShadowStrikeIsStringMatch
 //   ShadowStrikeGetPathType
-//   ShadowStrikeGetFileName
+//   ShadowStrikeGetFileNameFromPath
 //   ShadowStrikeGetFileExtension
 //   ShadowStrikeAppendUnicodeString
 //   ShadowStrikeStringStartsWith
@@ -228,8 +227,8 @@ ShadowStrikeCloneUnicodeString(
     //
     // Allocate buffer from paged pool
     //
-    Destination->Buffer = (PWCH)ExAllocatePoolWithTag(
-        PagedPool,
+    Destination->Buffer = (PWCH)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         allocationSize,
         SHADOW_STRING_TAG
     );
@@ -288,8 +287,8 @@ ShadowStrikeCloneUnicodeStringNonPaged(
     //
     // Allocate buffer from non-paged pool
     //
-    Destination->Buffer = (PWCH)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    Destination->Buffer = (PWCH)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         allocationSize,
         SHADOW_STRING_TAG
     );
@@ -498,7 +497,7 @@ ShadowStrikeGetPathType(
  * @brief Extract file name from path.
  */
 NTSTATUS
-ShadowStrikeGetFileName(
+ShadowStrikeGetFileNameFromPath(
     _In_ PCUNICODE_STRING FullPath,
     _Out_ PUNICODE_STRING FileName
     )
@@ -581,7 +580,7 @@ ShadowStrikeGetFileExtension(
     //
     // Get filename first
     //
-    status = ShadowStrikeGetFileName(FullPath, &fileName);
+    status = ShadowStrikeGetFileNameFromPath(FullPath, &fileName);
     if (!NT_SUCCESS(status)) {
         return status;
     }
@@ -659,8 +658,8 @@ ShadowStrikeGetDirectoryPath(
     //
     // Allocate and copy
     //
-    Directory->Buffer = (PWCH)ExAllocatePoolWithTag(
-        PagedPool,
+    Directory->Buffer = (PWCH)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         dirLength + sizeof(WCHAR),
         SHADOW_PATH_TAG
     );
@@ -2013,8 +2012,8 @@ ShadowStrikeParseCommandLine(
     //
     // Allocate array for argument pointers
     //
-    argArray = (PUNICODE_STRING*)ExAllocatePoolWithTag(
-        PagedPool,
+    argArray = (PUNICODE_STRING*)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         maxArgs * sizeof(PUNICODE_STRING),
         SHADOW_STRING_TAG
     );
@@ -2022,8 +2021,6 @@ ShadowStrikeParseCommandLine(
     if (argArray == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-
-    RtlZeroMemory(argArray, maxArgs * sizeof(PUNICODE_STRING));
 
     //
     // Parse command line
@@ -2053,8 +2050,8 @@ ShadowStrikeParseCommandLine(
                     }
 
                     if (argLen > 0) {
-                        argArray[argCount] = (PUNICODE_STRING)ExAllocatePoolWithTag(
-                            PagedPool,
+                        argArray[argCount] = (PUNICODE_STRING)ExAllocatePool2(
+                            POOL_FLAG_PAGED,
                             sizeof(UNICODE_STRING),
                             SHADOW_STRING_TAG
                         );
@@ -2344,8 +2341,8 @@ ShadowStrikeUnicodeToAnsi(
         return STATUS_NAME_TOO_LONG;
     }
 
-    AnsiString->Buffer = (PCHAR)ExAllocatePoolWithTag(
-        PagedPool,
+    AnsiString->Buffer = (PCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         ansiLength,
         SHADOW_STRING_TAG
     );
@@ -2412,7 +2409,7 @@ ShadowStrikeIntegerToUnicodeString(
  */
 NTSTATUS
 ShadowStrikeGuidToUnicodeString(
-    _In_ PCGUID Guid,
+    _In_ LPCGUID Guid,
     _Out_ PUNICODE_STRING String
     )
 {

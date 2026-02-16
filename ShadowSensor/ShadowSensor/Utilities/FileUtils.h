@@ -89,7 +89,7 @@ typedef enum _SHADOW_FILE_TYPE {
     ShadowFileTypeMedia,
     ShadowFileTypeData,
     ShadowFileTypeMax
-} SHADOW_FILE_TYPE;
+} SHADOW_FILE_TYPE, *PSHADOW_FILE_TYPE;
 
 typedef enum _SHADOW_VOLUME_TYPE {
     ShadowVolumeUnknown = 0,
@@ -99,7 +99,7 @@ typedef enum _SHADOW_VOLUME_TYPE {
     ShadowVolumeCDROM,
     ShadowVolumeRAM,
     ShadowVolumeVirtual
-} SHADOW_VOLUME_TYPE;
+} SHADOW_VOLUME_TYPE, *PSHADOW_VOLUME_TYPE;
 
 typedef enum _SHADOW_FILE_DISPOSITION {
     ShadowDispositionSupersede = 0,

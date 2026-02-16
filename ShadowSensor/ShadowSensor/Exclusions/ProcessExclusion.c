@@ -653,7 +653,7 @@ ShadowStrikeOnProcessCreate(
         //
         // Extract process name for process name exclusion check
         //
-        status = ShadowStrikeGetFileName(ImagePath, &processName);
+        status = ShadowStrikeGetFileNameFromPath(ImagePath, &processName);
 
         //
         // Check path exclusions via ExclusionManager

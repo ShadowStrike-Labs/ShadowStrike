@@ -306,7 +306,7 @@ ShadowStrikeGetPathType(
  * @irql <= DISPATCH_LEVEL
  */
 NTSTATUS
-ShadowStrikeGetFileName(
+ShadowStrikeGetFileNameFromPath(
     _In_ PCUNICODE_STRING FullPath,
     _Out_ PUNICODE_STRING FileName
     );
@@ -800,7 +800,7 @@ ShadowStrikeIntegerToUnicodeString(
  */
 NTSTATUS
 ShadowStrikeGuidToUnicodeString(
-    _In_ PCGUID Guid,
+    _In_ LPCGUID Guid,
     _Out_ PUNICODE_STRING String
     );
 
