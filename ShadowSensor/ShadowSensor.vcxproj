@@ -126,6 +126,11 @@
     <ClCompile Include="ShadowSensor\Context\StreamContext.c" />
     <ClCompile Include="ShadowSensor\Objects\ObjectNamespace.c" />
     <ClCompile Include="ShadowSensor\Transactions\KtmMonitor.c" />
+    <ClCompile Include="ShadowSensor\Utilities\FileUtils.c" />
+    <ClCompile Include="ShadowSensor\Utilities\HashUtils.c" />
+    <ClCompile Include="ShadowSensor\Utilities\MemoryUtils.c" />
+    <ClCompile Include="ShadowSensor\Utilities\ProcessUtils.c" />
+    <ClCompile Include="ShadowSensor\Utilities\StringUtils.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ShadowSensor\ALPC\AlpcPortMonitor.h" />
@@ -134,6 +139,11 @@
     <ClInclude Include="ShadowSensor\Context\StreamContext.h" />
     <ClInclude Include="ShadowSensor\Objects\ObjectNamespace.h" />
     <ClInclude Include="ShadowSensor\Transactions\KtmMonitor.h" />
+    <ClInclude Include="ShadowSensor\Utilities\FileUtils.h" />
+    <ClInclude Include="ShadowSensor\Utilities\HashUtils.h" />
+    <ClInclude Include="ShadowSensor\Utilities\MemoryUtils.h" />
+    <ClInclude Include="ShadowSensor\Utilities\ProcessUtils.h" />
+    <ClInclude Include="ShadowSensor\Utilities\StringUtils.h" />
     <ClInclude Include="Shared\AttackPatterns.h" />
     <ClInclude Include="Shared\BehaviorTypes.h" />
     <ClInclude Include="Shared\ErrorCodes.h" />

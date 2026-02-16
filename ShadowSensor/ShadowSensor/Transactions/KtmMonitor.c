@@ -13,6 +13,7 @@
  */
 
 #include "KtmMonitor.h"
+#include <limits.h>
 
 // ============================================================================
 // GLOBAL STATE
@@ -551,7 +552,7 @@ ShadowInitializeKtmMonitor(
     //
     // Initialize synchronization
     //
-    FsRtlInitializePushLock(&state->Lock);
+    ExInitializePushLock(&state->Lock);
     state->LockInitialized = TRUE;
 
     KeInitializeSpinLock(&state->AlertLock);
@@ -709,7 +710,7 @@ ShadowCleanupKtmMonitor(
     // Delete push lock
     //
     if (state->LockInitialized) {
-        FsRtlDeletePushLock(&state->Lock);
+        // EX_PUSH_LOCK requires no explicit deletion
         state->LockInitialized = FALSE;
     }
 
@@ -735,12 +736,10 @@ ShadowRegisterTransactionCallbacks(
     OB_CALLBACK_REGISTRATION callbackRegistration;
     UNICODE_STRING altitude;
     PSHADOW_KTM_MONITOR_STATE state = &g_KtmMonitorState;
-    POBJECT_TYPE tmTxObjectType = NULL;
-    POBJECT_TYPE tmRmObjectType = NULL;
+    POBJECT_TYPE* pTmTxType = NULL;
+    POBJECT_TYPE* pTmRmType = NULL;
     UNICODE_STRING tmTxTypeName;
     UNICODE_STRING tmRmTypeName;
-    PVOID* pTmTxType;
-    PVOID* pTmRmType;
     USHORT operationCount;
 
     PAGED_CODE();
@@ -752,18 +751,10 @@ ShadowRegisterTransactionCallbacks(
     RtlInitUnicodeString(&tmTxTypeName, L"TmTransactionObjectType");
     RtlInitUnicodeString(&tmRmTypeName, L"TmResourceManagerObjectType");
 
-    pTmTxType = (PVOID*)MmGetSystemRoutineAddress(&tmTxTypeName);
-    pTmRmType = (PVOID*)MmGetSystemRoutineAddress(&tmRmTypeName);
+    pTmTxType = (POBJECT_TYPE*)MmGetSystemRoutineAddress(&tmTxTypeName);
+    pTmRmType = (POBJECT_TYPE*)MmGetSystemRoutineAddress(&tmRmTypeName);
 
-    if (pTmTxType != NULL && *pTmTxType != NULL) {
-        tmTxObjectType = (POBJECT_TYPE)*pTmTxType;
-    }
-
-    if (pTmRmType != NULL && *pTmRmType != NULL) {
-        tmRmObjectType = (POBJECT_TYPE)*pTmRmType;
-    }
-
-    if (tmTxObjectType == NULL) {
+    if (pTmTxType == NULL || *pTmTxType == NULL) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] TmTx type not available — fallback mode\n");
         state->TransactionCallbackHandle = NULL;
@@ -773,15 +764,15 @@ ShadowRegisterTransactionCallbacks(
 
     RtlZeroMemory(operationRegistration, sizeof(operationRegistration));
 
-    operationRegistration[0].ObjectType = tmTxObjectType;
+    operationRegistration[0].ObjectType = pTmTxType;
     operationRegistration[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
     operationRegistration[0].PreOperation = ShadowTransactionPreOperationCallback;
     operationRegistration[0].PostOperation = ShadowTransactionPostOperationCallback;
 
     operationCount = 1;
 
-    if (tmRmObjectType != NULL) {
-        operationRegistration[1].ObjectType = tmRmObjectType;
+    if (pTmRmType != NULL && *pTmRmType != NULL) {
+        operationRegistration[1].ObjectType = pTmRmType;
         operationRegistration[1].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
         operationRegistration[1].PreOperation = ShadowTransactionPreOperationCallback;
         operationRegistration[1].PostOperation = ShadowTransactionPostOperationCallback;
@@ -814,7 +805,7 @@ ShadowRegisterTransactionCallbacks(
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Transaction callbacks registered (TmTx=YES, TmRm=%s)\n",
-               tmRmObjectType != NULL ? "YES" : "NO");
+               (pTmRmType != NULL && *pTmRmType != NULL) ? "YES" : "NO");
 
     return STATUS_SUCCESS;
 }
@@ -922,7 +913,7 @@ ShadowTrackTransaction(
     //
     // Insert into LRU list
     //
-    FsRtlAcquirePushLockExclusive(&state->Lock);
+    ExAcquirePushLockExclusive(&state->Lock);
 
     if ((ULONG)state->TransactionCount >= state->MaxTransactions) {
         ShadowEvictLruTransaction();
@@ -931,7 +922,7 @@ ShadowTrackTransaction(
     InsertHeadList(&state->TransactionList, &transaction->ListEntry);
     InterlockedIncrement(&state->TransactionCount);
 
-    FsRtlReleasePushLockExclusive(&state->Lock);
+    ExReleasePushLockExclusive(&state->Lock);
 
     InterlockedIncrement64(&state->Stats.TotalTransactions);
 
@@ -963,7 +954,7 @@ ShadowFindKtmTransaction(
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    FsRtlAcquirePushLockExclusive(&state->Lock);
+    ExAcquirePushLockExclusive(&state->Lock);
 
     for (entry = state->TransactionList.Flink;
          entry != &state->TransactionList;
@@ -1006,7 +997,7 @@ ShadowFindKtmTransaction(
         }
     }
 
-    FsRtlReleasePushLockExclusive(&state->Lock);
+    ExReleasePushLockExclusive(&state->Lock);
 
     if (!found) {
         InterlockedIncrement64(&state->Stats.CacheMisses);
@@ -1776,7 +1767,7 @@ ShadowCleanupTransactionEntries(
 
     drainInterval.QuadPart = -((LONGLONG)SHADOW_REFCOUNT_DRAIN_INTERVAL_MS * 10000LL);
 
-    FsRtlAcquirePushLockExclusive(&state->Lock);
+    ExAcquirePushLockExclusive(&state->Lock);
 
     while (!IsListEmpty(&state->TransactionList)) {
         entry = RemoveHeadList(&state->TransactionList);
@@ -1794,9 +1785,9 @@ ShadowCleanupTransactionEntries(
         while (transaction->ReferenceCount > 1 &&
                spinCount < SHADOW_REFCOUNT_DRAIN_MAX_ITERATIONS) {
 
-            FsRtlReleasePushLockExclusive(&state->Lock);
+            ExReleasePushLockExclusive(&state->Lock);
             KeDelayExecutionThread(KernelMode, FALSE, &drainInterval);
-            FsRtlAcquirePushLockExclusive(&state->Lock);
+            ExAcquirePushLockExclusive(&state->Lock);
 
             spinCount++;
         }
@@ -1812,7 +1803,7 @@ ShadowCleanupTransactionEntries(
         }
     }
 
-    FsRtlReleasePushLockExclusive(&state->Lock);
+    ExReleasePushLockExclusive(&state->Lock);
 
     if (totalLeaked > 0) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
