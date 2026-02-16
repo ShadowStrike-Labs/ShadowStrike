@@ -125,6 +125,7 @@
     <ClCompile Include="ShadowSensor\Context\InstanceContext.c" />
     <ClCompile Include="ShadowSensor\Context\StreamContext.c" />
     <ClCompile Include="ShadowSensor\Objects\ObjectNamespace.c" />
+    <ClCompile Include="ShadowSensor\Transactions\KtmMonitor.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ShadowSensor\ALPC\AlpcPortMonitor.h" />
@@ -132,6 +133,7 @@
     <ClInclude Include="ShadowSensor\Context\InstanceContext.h" />
     <ClInclude Include="ShadowSensor\Context\StreamContext.h" />
     <ClInclude Include="ShadowSensor\Objects\ObjectNamespace.h" />
+    <ClInclude Include="ShadowSensor\Transactions\KtmMonitor.h" />
     <ClInclude Include="Shared\AttackPatterns.h" />
     <ClInclude Include="Shared\BehaviorTypes.h" />
     <ClInclude Include="Shared\ErrorCodes.h" />

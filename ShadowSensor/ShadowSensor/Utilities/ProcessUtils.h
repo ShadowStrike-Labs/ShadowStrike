@@ -118,7 +118,7 @@ typedef enum _SHADOW_INTEGRITY_LEVEL {
     ShadowIntegritySystem = 5,
     ShadowIntegrityProtected = 6,
     ShadowIntegrityUnknown = 0xFF
-} SHADOW_INTEGRITY_LEVEL;
+} SHADOW_INTEGRITY_LEVEL, *PSHADOW_INTEGRITY_LEVEL;
 
 /**
  * @brief Process protection level (PPL)
@@ -128,7 +128,7 @@ typedef enum _SHADOW_PROTECTION_LEVEL {
     ShadowProtectionLight = 1,          // PsProtectedSignerAntimalware
     ShadowProtectionFull = 2,           // PsProtectedSignerWindows
     ShadowProtectionSecure = 3          // Secure process (trustlet)
-} SHADOW_PROTECTION_LEVEL;
+} SHADOW_PROTECTION_LEVEL, *PSHADOW_PROTECTION_LEVEL;
 
 /**
  * @brief Process type classification
@@ -142,7 +142,7 @@ typedef enum _SHADOW_PROCESS_TYPE {
     ShadowProcessUWP,                   // UWP/Store app
     ShadowProcessWow64,                 // 32-bit on 64-bit
     ShadowProcessProtected              // Protected process
-} SHADOW_PROCESS_TYPE;
+} SHADOW_PROCESS_TYPE, *PSHADOW_PROCESS_TYPE;
 
 /**
  * @brief Process signer types (for protected processes)
@@ -157,7 +157,7 @@ typedef enum _SHADOW_SIGNER_TYPE {
     ShadowSignerWinTcb = 6,
     ShadowSignerWinSystem = 7,
     ShadowSignerApp = 8
-} SHADOW_SIGNER_TYPE;
+} SHADOW_SIGNER_TYPE, *PSHADOW_SIGNER_TYPE;
 
 // ============================================================================
 // STRUCTURES

@@ -144,6 +144,14 @@ ZwQueryObject(
 
 SHADOW_ALPC_MONITOR_STATE g_AlpcPortMonitorState = { 0 };
 
+/**
+ * @brief Resolved ALPC Port object type.
+ *
+ * OB_OPERATION_REGISTRATION.ObjectType expects POBJECT_TYPE* (pointer to
+ * pointer). This static stores the resolved type so we can take its address.
+ */
+static POBJECT_TYPE g_AlpcPortObjectType = NULL;
+
 // ============================================================================
 // SENSITIVE ALPC PORT PATTERNS
 // ============================================================================
@@ -238,17 +246,27 @@ ShadowAlpcpExtractPortNameSafe(
     _In_ ULONG MaxLength
     );
 
-static NTSTATUS
-ShadowAlpcpGetProcessIntegrityRid(
-    _In_ HANDLE ProcessId,
-    _Out_ PULONG IntegrityRid
-    );
-
 static VOID
 ShadowAlpcpGetProcessNameSafe(
     _In_ HANDLE ProcessId,
     _Out_writes_(MaxLength) PWCHAR ProcessName,
     _In_ ULONG MaxLength
+    );
+
+// ============================================================================
+// UNDECLARED NTOSKRNL EXPORTS
+// ============================================================================
+
+NTKERNELAPI
+POBJECT_TYPE
+ObGetObjectType(
+    _In_ PVOID Object
+    );
+
+NTKERNELAPI
+ULONG
+PsGetProcessSessionId(
+    _In_ PEPROCESS Process
     );
 
 // ============================================================================
@@ -263,7 +281,6 @@ ShadowAlpcInitialize(
 {
     NTSTATUS status = STATUS_SUCCESS;
     PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcPortMonitorState;
-    POBJECT_TYPE alpcPortType = NULL;
     OB_OPERATION_REGISTRATION operationRegistration;
     OB_CALLBACK_REGISTRATION callbackRegistration;
     UNICODE_STRING altitude;
@@ -411,7 +428,7 @@ ShadowAlpcInitialize(
     //
     // Resolve ALPC Port object type
     //
-    status = ShadowAlpcpResolveAlpcPortType(&alpcPortType);
+    status = ShadowAlpcpResolveAlpcPortType(&g_AlpcPortObjectType);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike/ALPC] Could not resolve ALPC Port type: 0x%X\n", status);
@@ -419,15 +436,15 @@ ShadowAlpcInitialize(
         // ALPC Port type resolution failed - this is expected on some systems
         // Continue without object callbacks (rely on ETW if available)
         //
-        alpcPortType = NULL;
+        g_AlpcPortObjectType = NULL;
     }
 
     //
     // Register object callbacks if we have the ALPC Port type
     //
-    if (alpcPortType != NULL) {
+    if (g_AlpcPortObjectType != NULL) {
         RtlZeroMemory(&operationRegistration, sizeof(operationRegistration));
-        operationRegistration.ObjectType = alpcPortType;
+        operationRegistration.ObjectType = &g_AlpcPortObjectType;
         operationRegistration.Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
         operationRegistration.PreOperation = ShadowAlpcPortPreCallback;
         operationRegistration.PostOperation = ShadowAlpcPortPostCallback;
@@ -1595,7 +1612,7 @@ ShadowAlpcPortPreCallback(
     context.PortObject = OperationInformation->Object;
     context.SourceProcessId = PsGetCurrentProcessId();
     context.SourceProcess = PsGetCurrentProcess();
-    context.IsKernelHandle = OperationInformation->KernelHandle;
+    context.IsKernelHandle = (BOOLEAN)(OperationInformation->KernelHandle != 0);
 
     if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
         context.Operation = AlpcOperationCreatePort;
@@ -1724,13 +1741,33 @@ ShadowAlpcPortPostCallback(
     _In_ POB_POST_OPERATION_INFORMATION OperationInformation
     )
 {
-    UNREFERENCED_PARAMETER(RegistrationContext);
-    UNREFERENCED_PARAMETER(OperationInformation);
+    PSHADOW_ALPC_MONITOR_STATE state = (PSHADOW_ALPC_MONITOR_STATE)RegistrationContext;
+
+    if (state == NULL || !state->Initialized || state->ShuttingDown) {
+        return;
+    }
+
+    if (OperationInformation == NULL || OperationInformation->Object == NULL) {
+        return;
+    }
 
     //
-    // Post-operation telemetry could track actual granted access
-    // Currently not needed - pre-operation handles all detection
+    // Skip kernel handles — no telemetry value.
     //
+    if (OperationInformation->KernelHandle) {
+        return;
+    }
+
+    //
+    // Track post-op statistics for completed operations.
+    //
+    if (NT_SUCCESS(OperationInformation->ReturnStatus)) {
+        if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
+            InterlockedIncrement64(&state->Stats.PortsCreated);
+        } else if (OperationInformation->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
+            InterlockedIncrement64(&state->Stats.ConnectionsEstablished);
+        }
+    }
 }
 
 // ============================================================================
@@ -1755,7 +1792,6 @@ ShadowAlpcpResolveAlpcPortType(
 {
     NTSTATUS status = STATUS_NOT_FOUND;
     ULONG i;
-    POBJECT_TYPE objectType = NULL;
     UNICODE_STRING alpcPortTypeName;
     UNICODE_STRING currentTypeName;
     PVOID typeInfoBuffer = NULL;
@@ -2044,7 +2080,7 @@ ShadowAlpcpExtractPortNameSafe(
     );
 
     if (NT_SUCCESS(status) && nameInfo->Name.Buffer != NULL && nameInfo->Name.Length > 0) {
-        USHORT copyLen = min(nameInfo->Name.Length / sizeof(WCHAR), MaxLength - 1);
+        USHORT copyLen = (USHORT)min(nameInfo->Name.Length / sizeof(WCHAR), (SIZE_T)(MaxLength - 1));
         RtlCopyMemory(PortName, nameInfo->Name.Buffer, copyLen * sizeof(WCHAR));
         PortName[copyLen] = L'\0';
     }
@@ -2073,7 +2109,7 @@ ShadowAlpcpGetProcessNameSafe(
     //
     status = ShadowStrikeGetProcessImageName(ProcessId, &imageName);
     if (NT_SUCCESS(status) && imageName.Buffer != NULL && imageName.Length > 0) {
-        USHORT copyLen = min(imageName.Length / sizeof(WCHAR), MaxLength - 1);
+        USHORT copyLen = (USHORT)min(imageName.Length / sizeof(WCHAR), (SIZE_T)(MaxLength - 1));
         RtlCopyMemory(ProcessName, imageName.Buffer, copyLen * sizeof(WCHAR));
         ProcessName[copyLen] = L'\0';
         ShadowFreeProcessString(&imageName);
@@ -2268,7 +2304,6 @@ ShadowAlpcpCleanupStaleEntries(
     PSHADOW_ALPC_PORT_ENTRY portEntry;
     LIST_ENTRY staleList;
     ULONG i;
-    ULONG staleHash;
 
     KeQuerySystemTime(&currentTime);
     InitializeListHead(&staleList);

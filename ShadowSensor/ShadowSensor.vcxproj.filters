@@ -36,6 +36,9 @@
     <ClCompile Include="ShadowSensor\ALPC\AlpcPortMonitor.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ShadowSensor\Transactions\KtmMonitor.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ShadowSensor\Context\InstanceContext.h">
@@ -84,6 +87,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Shared\VerdictTypes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\Transactions\KtmMonitor.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

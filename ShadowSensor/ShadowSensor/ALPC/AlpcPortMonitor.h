@@ -75,8 +75,8 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
 #include <ntifs.h>
+#include <ntddk.h>
 #include <wdm.h>
 #include <ntstrsafe.h>
 #include "AlpcTypes.h"
