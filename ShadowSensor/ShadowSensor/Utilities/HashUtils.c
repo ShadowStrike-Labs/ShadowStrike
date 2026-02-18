@@ -333,7 +333,7 @@ HashiComputeBufferHashInternal(
     BCRYPT_ALG_HANDLE hAlgorithm;
     BCRYPT_HASH_HANDLE hHash = NULL;
     PUCHAR pbHashObject = NULL;
-    ULONG cbHashObject;
+    ULONG cbHashObject = 0;
     ULONG ExpectedHashSize;
 
     //
@@ -1179,7 +1179,7 @@ ShadowStrikeComputeFileHashEx(
     BCRYPT_HASH_HANDLE hHash = NULL;
     PUCHAR pbHashObject = NULL;
     PUCHAR pbReadBuffer = NULL;
-    ULONG cbHashObject;
+    ULONG cbHashObject = 0;
     ULONG cbChunkSize;
     ULONG64 MaxFileSize;
     LARGE_INTEGER ByteOffset;
@@ -1858,7 +1858,7 @@ ShadowStrikeComputeFileHashByPath(
     PUCHAR pbHashObject = NULL;
     BCRYPT_HASH_HANDLE hHash = NULL;
     BCRYPT_ALG_HANDLE hAlgorithm;
-    ULONG cbHashObject;
+    ULONG cbHashObject = 0;
     ULONG HashSize;
     LARGE_INTEGER ByteOffset;
     ULONG ChunkSize = HASH_DEFAULT_CHUNK_SIZE;
@@ -2118,7 +2118,7 @@ ShadowStrikeHashContextInit(
 {
     NTSTATUS Status;
     BCRYPT_ALG_HANDLE hAlgorithm;
-    ULONG cbHashObject;
+    ULONG cbHashObject = 0;
 
     if (Context == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -2271,7 +2271,6 @@ ShadowStrikeHashContextClone(
     )
 {
     NTSTATUS Status;
-    BCRYPT_ALG_HANDLE hAlgorithm;
 
     if (Source == NULL || Destination == NULL) {
         return STATUS_INVALID_PARAMETER;
