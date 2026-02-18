@@ -86,6 +86,9 @@ typedef struct _SHADOWSTRIKE_MEMORY_STATE {
     volatile LONG64 PeakAllocations;
     volatile LONG64 PeakBytesAllocated;
 
+    /// Corruption events (invalid magic, double-free, pointer tampering)
+    volatile LONG64 CorruptionEvents;
+
 } SHADOWSTRIKE_MEMORY_STATE, *PSHADOWSTRIKE_MEMORY_STATE;
 
 static SHADOWSTRIKE_MEMORY_STATE g_MemoryState = { 0 };
@@ -148,6 +151,12 @@ static SHADOWSTRIKE_MEMORY_STATE g_MemoryState = { 0 };
 #define MEMORY_TRACK_FAILURE() \
     InterlockedIncrement64(&g_MemoryState.AllocationFailures)
 
+/**
+ * @brief Track memory corruption event (invalid magic, double-free, pointer tampering)
+ */
+#define MEMORY_TRACK_CORRUPTION() \
+    InterlockedIncrement64(&g_MemoryState.CorruptionEvents)
+
 // ============================================================================
 // PAGED/NON-PAGED CODE SEGMENT DECLARATIONS
 // ============================================================================
@@ -185,7 +194,6 @@ ShadowStrikeSecureFillMemory(
     volatile UCHAR* BytePtr;
     volatile SIZE_T* WordPtr;
     SIZE_T WordPattern;
-    SIZE_T i;
 
     if (Destination == NULL || Length == 0) {
         return;
@@ -291,11 +299,13 @@ ShadowStrikeCleanupMemoryUtils(
             "  Outstanding allocations: %lld\n"
             "  Outstanding bytes: %lld\n"
             "  Total allocations: %lld\n"
-            "  Total frees: %lld\n",
+            "  Total frees: %lld\n"
+            "  Corruption events: %lld\n",
             g_MemoryState.CurrentAllocations,
             g_MemoryState.CurrentBytesAllocated,
             g_MemoryState.TotalAllocations,
-            g_MemoryState.TotalFrees
+            g_MemoryState.TotalFrees,
+            g_MemoryState.CorruptionEvents
         );
     }
 #endif
@@ -701,8 +711,42 @@ ShadowStrikeFreeAligned(
 {
     PSHADOWSTRIKE_ALIGNED_HEADER Header = NULL;
     SIZE_T AllocationSize = 0;
+    PVOID OriginalPointer = NULL;
 
     if (P == NULL) {
+        return;
+    }
+
+    //
+    // Validate that P is a kernel-mode address before deriving the header.
+    // A user-mode or sub-page pointer could cause an access violation.
+    //
+    if (!ShadowStrikeIsKernelAddress(P)) {
+        MEMORY_TRACK_CORRUPTION();
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike] CORRUPTION: ShadowStrikeFreeAligned called with "
+            "non-kernel address %p — refusing to free\n",
+            P
+        );
+        return;
+    }
+
+    //
+    // Ensure the header region is also within kernel space.
+    // If P is too close to the kernel base, subtracting the header size
+    // could wrap into user space.
+    //
+    if ((ULONG_PTR)P < sizeof(SHADOWSTRIKE_ALIGNED_HEADER)) {
+        MEMORY_TRACK_CORRUPTION();
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike] CORRUPTION: ShadowStrikeFreeAligned pointer %p "
+            "too low for header derivation — refusing to free\n",
+            P
+        );
         return;
     }
 
@@ -712,7 +756,7 @@ ShadowStrikeFreeAligned(
     Header = (PSHADOWSTRIKE_ALIGNED_HEADER)((ULONG_PTR)P - sizeof(SHADOWSTRIKE_ALIGNED_HEADER));
 
     //
-    // Validate magic to catch corruption or invalid pointers.
+    // Validate magic to catch corruption, invalid pointers, or double-free.
     // Use InterlockedCompareExchange to atomically check-and-clear,
     // preventing double-free if two threads race on the same pointer.
     //
@@ -721,30 +765,74 @@ ShadowStrikeFreeAligned(
             0,
             (LONG)SHADOWSTRIKE_ALIGNED_MAGIC
         ) != SHADOWSTRIKE_ALIGNED_MAGIC) {
-#if DBG
+
+        MEMORY_TRACK_CORRUPTION();
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_ERROR_LEVEL,
-            "[ShadowStrike] ERROR: Invalid or already-freed aligned pointer: %p\n",
-            P
+            "[ShadowStrike] CORRUPTION: Invalid or already-freed aligned "
+            "pointer %p (header at %p, magic=0x%08X expected=0x%08X) — "
+            "refusing to free to prevent pool corruption\n",
+            P,
+            Header,
+            Header->Magic,
+            SHADOWSTRIKE_ALIGNED_MAGIC
         );
-#endif
-        //
-        // In production, we cannot safely free this.
-        // Better to leak than corrupt or crash.
-        //
         return;
     }
 
     //
-    // Save allocation size for secure wipe
+    // Capture and validate fields from the header before we wipe anything.
+    // After the atomic magic clear above, we own this header exclusively.
     //
     AllocationSize = Header->AllocationSize;
+    OriginalPointer = Header->OriginalPointer;
+
+    //
+    // Validate OriginalPointer is a kernel address and precedes P.
+    // The raw allocation starts at OriginalPointer, and the aligned buffer
+    // is somewhere after OriginalPointer + HeaderSize. If OriginalPointer
+    // is NULL, non-kernel, or past P, the header is corrupted.
+    //
+    if (OriginalPointer == NULL ||
+        !ShadowStrikeIsKernelAddress(OriginalPointer) ||
+        (ULONG_PTR)OriginalPointer >= (ULONG_PTR)P) {
+
+        MEMORY_TRACK_CORRUPTION();
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike] CORRUPTION: Aligned header at %p has invalid "
+            "OriginalPointer=%p (aligned buffer=%p) — refusing to free\n",
+            Header,
+            OriginalPointer,
+            P
+        );
+        return;
+    }
+
+    //
+    // Validate AllocationSize against maximum.
+    // A corrupted header could have an enormous size, causing
+    // ShadowStrikeSecureZeroMemory to wipe past the buffer boundary.
+    //
+    if (AllocationSize > SHADOWSTRIKE_MAX_ALLOCATION_SIZE) {
+        MEMORY_TRACK_CORRUPTION();
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike] CORRUPTION: Aligned header at %p has "
+            "AllocationSize=%llu exceeding maximum %llu — refusing to free\n",
+            Header,
+            (ULONGLONG)AllocationSize,
+            (ULONGLONG)SHADOWSTRIKE_MAX_ALLOCATION_SIZE
+        );
+        return;
+    }
 
     //
     // Secure wipe the user data portion.
-    // Apply same DISPATCH_LEVEL size cap as ShadowStrikeSecureFree
-    // to avoid DPC timeout on large aligned allocations.
+    // Apply DISPATCH_LEVEL size cap to avoid DPC timeout on large buffers.
     //
     if (AllocationSize > 0) {
         if (KeGetCurrentIrql() >= DISPATCH_LEVEL &&
@@ -756,9 +844,13 @@ ShadowStrikeFreeAligned(
     }
 
     //
-    // Free the original raw allocation
+    // Track the free with byte-accurate statistics.
+    // We bypass ShadowStrikeFreePoolWithTag here to use MEMORY_TRACK_FREE
+    // instead of MEMORY_TRACK_FREE_COUNT_ONLY, since we know the exact
+    // allocation size from the header.
     //
-    ShadowStrikeFreePoolWithTag(Header->OriginalPointer, SHADOWSTRIKE_ALIGNED_TAG);
+    MEMORY_TRACK_FREE(AllocationSize);
+    ExFreePoolWithTag(OriginalPointer, SHADOWSTRIKE_ALIGNED_TAG);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
