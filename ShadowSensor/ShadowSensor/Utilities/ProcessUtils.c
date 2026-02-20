@@ -63,6 +63,8 @@
 //
 // PS_PROTECTION structure for protected process detection
 //
+#pragma warning(push)
+#pragma warning(disable:4201)  // nameless struct/union — required for bitfield layout
 typedef struct _PS_PROTECTION {
     union {
         UCHAR Level;
@@ -73,6 +75,7 @@ typedef struct _PS_PROTECTION {
         };
     };
 } PS_PROTECTION, *PPS_PROTECTION;
+#pragma warning(pop)
 
 //
 // Protection types
@@ -95,15 +98,29 @@ typedef struct _PS_PROTECTION {
 #define PsProtectedSignerApp            8
 
 //
-// Token integrity levels
+// Token integrity levels (guard against WDK redefinition)
 //
+#ifndef SECURITY_MANDATORY_UNTRUSTED_RID
 #define SECURITY_MANDATORY_UNTRUSTED_RID        0x00000000
+#endif
+#ifndef SECURITY_MANDATORY_LOW_RID
 #define SECURITY_MANDATORY_LOW_RID              0x00001000
+#endif
+#ifndef SECURITY_MANDATORY_MEDIUM_RID
 #define SECURITY_MANDATORY_MEDIUM_RID           0x00002000
+#endif
+#ifndef SECURITY_MANDATORY_MEDIUM_PLUS_RID
 #define SECURITY_MANDATORY_MEDIUM_PLUS_RID      0x00002100
+#endif
+#ifndef SECURITY_MANDATORY_HIGH_RID
 #define SECURITY_MANDATORY_HIGH_RID             0x00003000
+#endif
+#ifndef SECURITY_MANDATORY_SYSTEM_RID
 #define SECURITY_MANDATORY_SYSTEM_RID           0x00004000
+#endif
+#ifndef SECURITY_MANDATORY_PROTECTED_PROCESS_RID
 #define SECURITY_MANDATORY_PROTECTED_PROCESS_RID 0x00005000
+#endif
 
 // ============================================================================
 // FUNCTION POINTER TYPES
@@ -129,7 +146,7 @@ typedef PPEB (NTAPI *PFN_PSGETPROCESSPEB)(
     _In_ PEPROCESS Process
 );
 
-typedef PPEB32 (NTAPI *PFN_PSGETPROCESSWOW64PROCESS)(
+typedef PVOID (NTAPI *PFN_PSGETPROCESSWOW64PROCESS)(
     _In_ PEPROCESS Process
 );
 
@@ -152,6 +169,47 @@ typedef BOOLEAN (NTAPI *PFN_PSISSECUREPROCESS)(
 #define PROCUTILS_STATE_UNINITIALIZED   0
 #define PROCUTILS_STATE_INITIALIZING    1
 #define PROCUTILS_STATE_INITIALIZED     2
+
+//
+// Process access rights — not available in km headers
+//
+#ifndef PROCESS_QUERY_LIMITED_INFORMATION
+#define PROCESS_QUERY_LIMITED_INFORMATION  0x1000
+#endif
+
+//
+// Extern declarations for ntoskrnl exports not in WDK headers
+//
+extern PVOID NTAPI PsGetProcessWow64Process(_In_ PEPROCESS Process);
+
+extern HANDLE NTAPI PsGetProcessInheritedFromUniqueProcessId(
+    _In_ PEPROCESS Process
+);
+
+extern PVOID NTAPI PsGetProcessDebugPort(
+    _In_ PEPROCESS Process
+);
+
+extern ULONG NTAPI PsGetProcessSessionId(
+    _In_ PEPROCESS Process
+);
+
+extern NTSTATUS NTAPI PsReferenceProcessFilePointer(
+    _In_ PEPROCESS Process,
+    _Out_ PVOID *OutFileObject
+);
+
+extern NTSTATUS NTAPI ZwOpenThread(
+    _Out_ PHANDLE ThreadHandle,
+    _In_ ACCESS_MASK DesiredAccess,
+    _In_ POBJECT_ATTRIBUTES ObjectAttributes,
+    _In_opt_ PCLIENT_ID ClientId
+);
+
+//
+// RtlCreateWellKnownSid is a user-mode ntdll API, NOT exported by ntoskrnl.
+// We build well-known SIDs manually using RtlInitializeSid + RtlSubAuthoritySid.
+//
 
 // ============================================================================
 // CREATING PROCESS CONTEXT TABLE
@@ -523,22 +581,20 @@ ShadowIsSystemToken(
     BOOLEAN IsSystem = FALSE;
     UCHAR LocalSystemSidBuffer[SECURITY_MAX_SID_SIZE];
     PSID LocalSystemSid = (PSID)LocalSystemSidBuffer;
-    ULONG SidSize = sizeof(LocalSystemSidBuffer);
 
     PAGED_CODE();
 
     //
-    // Create well-known LocalSystem SID (S-1-5-18)
+    // Build LocalSystem SID (S-1-5-18) using kernel-safe APIs.
+    // RtlCreateWellKnownSid is ntdll-only, not exported by ntoskrnl.
     //
-    Status = RtlCreateWellKnownSid(
-        WinLocalSystemSid,
-        NULL,
-        LocalSystemSid,
-        &SidSize
-    );
-
-    if (!NT_SUCCESS(Status)) {
-        return FALSE;
+    {
+        SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
+        Status = RtlInitializeSid(LocalSystemSid, &NtAuthority, 1);
+        if (!NT_SUCCESS(Status)) {
+            return FALSE;
+        }
+        *RtlSubAuthoritySid(LocalSystemSid, 0) = SECURITY_LOCAL_SYSTEM_RID;
     }
 
     //
@@ -1101,7 +1157,7 @@ ShadowStrikeGetProcessImageName(
     //
     // Extract filename from path
     //
-    Status = ShadowStrikeGetFileName(&FullPath, &FileName);
+    Status = ShadowStrikeGetFileNameFromPath(&FullPath, &FileName);
     if (!NT_SUCCESS(Status)) {
         ShadowFreeProcessString(&FullPath);
         return Status;
@@ -1374,7 +1430,7 @@ ShadowStrikeGetProcessInfo(
         // Extract filename
         //
         UNICODE_STRING TempFileName = { 0 };
-        if (NT_SUCCESS(ShadowStrikeGetFileName(&ProcessInfo->ImagePath, &TempFileName))) {
+        if (NT_SUCCESS(ShadowStrikeGetFileNameFromPath(&ProcessInfo->ImagePath, &TempFileName))) {
             ProcessInfo->ImageFileName.MaximumLength = TempFileName.Length + sizeof(WCHAR);
             ProcessInfo->ImageFileName.Buffer = (PWCH)ShadowStrikeAllocatePagedWithTag(
                 ProcessInfo->ImageFileName.MaximumLength,
@@ -1909,11 +1965,13 @@ ShadowStrikeIsProcessTerminating(
     }
 
     //
-    // Fallback: Check if process exit time is set
-    // This is less reliable but works on older systems
+    // Fallback: PsIsProcessTerminating not resolved.
+    // On our target platform (Windows 10/11 x64) this should never happen.
+    // PsGetProcessExitTime(VOID) only returns the *current* process's exit
+    // time — it cannot query an arbitrary PEPROCESS, so it is not usable here.
+    // Conservative default: assume terminating to prevent use-after-free.
     //
-    LARGE_INTEGER ExitTime = PsGetProcessExitTime(Process);
-    return (ExitTime.QuadPart != 0);
+    return TRUE;
 }
 
 _Use_decl_annotations_
@@ -1925,7 +1983,6 @@ ShadowStrikeIsProcessWow64(
     if (Process == NULL) {
         return FALSE;
     }
-
 #ifdef _WIN64
     //
     // On 64-bit, check for WOW64 process using the documented API
@@ -2486,7 +2543,7 @@ ShadowStrikeGetThreadInfo(
     //
     // Get creation time
     //
-    ThreadInfo->CreateTime = PsGetThreadCreateTime(Thread);
+    ThreadInfo->CreateTime.QuadPart = PsGetThreadCreateTime(Thread);
 
     //
     // Check if system thread
@@ -2592,6 +2649,57 @@ ShadowStrikeGetThreadStartAddress(
 // PROCESS VALIDATION
 // ============================================================================
 
+//
+// SeGetCachedSigningLevel — exported by ntoskrnl but not declared in WDK headers.
+// Returns the Code Integrity cached signing level for a file object.
+// Available on Windows 8.1+ (NTDDI_WINBLUE).
+//
+extern NTSTATUS NTAPI SeGetCachedSigningLevel(
+    _In_  PFILE_OBJECT   FileObject,
+    _Out_ PULONG         Flags,
+    _Out_ PSE_SIGNING_LEVEL SigningLevel,
+    _Reserved_ PVOID     Reserved1,
+    _Reserved_ PULONG    Reserved2,
+    _Reserved_ PULONG    Reserved3
+);
+
+/**
+ * @brief Map SE_SIGNING_LEVEL to SHADOW_SIGNER_TYPE.
+ */
+static
+SHADOW_SIGNER_TYPE
+ShadowpMapSigningLevelToSignerType(
+    _In_ SE_SIGNING_LEVEL SigningLevel
+)
+{
+    switch (SigningLevel) {
+        case SE_SIGNING_LEVEL_UNCHECKED:
+        case SE_SIGNING_LEVEL_UNSIGNED:
+            return ShadowSignerNone;
+        case SE_SIGNING_LEVEL_AUTHENTICODE:
+            return ShadowSignerAuthenticode;
+        case SE_SIGNING_LEVEL_STORE:
+            return ShadowSignerApp;
+        case SE_SIGNING_LEVEL_ANTIMALWARE:
+            return ShadowSignerAntimalware;
+        case SE_SIGNING_LEVEL_MICROSOFT:
+            return ShadowSignerWindows;
+        case SE_SIGNING_LEVEL_WINDOWS:
+            return ShadowSignerWindows;
+        case SE_SIGNING_LEVEL_WINDOWS_TCB:
+            return ShadowSignerWinTcb;
+        default:
+            //
+            // Enterprise, Developer, CodeGen, Custom, DynamicCodegen
+            // — signed but not a well-known category
+            //
+            if (SigningLevel >= SE_SIGNING_LEVEL_ENTERPRISE) {
+                return ShadowSignerAuthenticode;
+            }
+            return ShadowSignerNone;
+    }
+}
+
 _Use_decl_annotations_
 NTSTATUS
 ShadowStrikeValidateProcessSignature(
@@ -2604,9 +2712,14 @@ ShadowStrikeValidateProcessSignature(
     HANDLE ProcessHandle = NULL;
     PS_PROTECTION Protection;
     ULONG ReturnLength;
+    PEPROCESS Process = NULL;
+    PFILE_OBJECT ImageFileObject = NULL;
 
     PAGED_CODE();
 
+    //
+    // Validate output parameters
+    //
     if (IsSigned == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -2616,10 +2729,27 @@ ShadowStrikeValidateProcessSignature(
         *SignerType = ShadowSignerNone;
     }
 
+    //
+    // Validate process ID — reject NULL and idle process (PID 0)
+    //
     if (!ShadowStrikeIsValidProcessId(ProcessId)) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // System process (PID 4) is always Windows-signed by definition
+    //
+    if (ShadowStrikeIsSystemProcessId(ProcessId)) {
+        *IsSigned = TRUE;
+        if (SignerType != NULL) {
+            *SignerType = ShadowSignerWinSystem;
+        }
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Ensure subsystem is initialized (resolves ZwQueryInformationProcess etc.)
+    //
     if (g_ProcessUtilsState.InitializationState != PROCUTILS_STATE_INITIALIZED) {
         Status = ShadowProcessUtilsInitialize();
         if (!NT_SUCCESS(Status)) {
@@ -2628,7 +2758,15 @@ ShadowStrikeValidateProcessSignature(
     }
 
     //
-    // Query protection information (Windows 8.1+)
+    // Verify ZwQueryInformationProcess was resolved
+    //
+    if (g_ProcessUtilsState.ZwQueryInformationProcess == NULL) {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    //
+    // Phase 1: Query PPL protection information (Windows 8.1+).
+    // Protected processes are by definition signed with a known signer.
     //
     Status = ShadowOpenProcessInternal(
         ProcessId,
@@ -2651,69 +2789,118 @@ ShadowStrikeValidateProcessSignature(
     );
 
     ZwClose(ProcessHandle);
+    ProcessHandle = NULL;
 
-    if (NT_SUCCESS(Status)) {
+    if (NT_SUCCESS(Status) && Protection.Type != PsProtectedTypeNone) {
         //
-        // Protected processes are by definition signed
+        // Protected process — determine signer from PPL info
         //
-        if (Protection.Type != PsProtectedTypeNone) {
-            *IsSigned = TRUE;
-            if (SignerType != NULL) {
-                //
-                // Map protection signer to our enum
-                //
-                switch (Protection.Signer) {
-                    case PsProtectedSignerAuthenticode:
-                        *SignerType = ShadowSignerAuthenticode;
-                        break;
-                    case PsProtectedSignerCodeGen:
-                        *SignerType = ShadowSignerCodeGen;
-                        break;
-                    case PsProtectedSignerAntimalware:
-                        *SignerType = ShadowSignerAntimalware;
-                        break;
-                    case PsProtectedSignerLsa:
-                        *SignerType = ShadowSignerLsa;
-                        break;
-                    case PsProtectedSignerWindows:
-                        *SignerType = ShadowSignerWindows;
-                        break;
-                    case PsProtectedSignerWinTcb:
-                        *SignerType = ShadowSignerWinTcb;
-                        break;
-                    case PsProtectedSignerWinSystem:
-                        *SignerType = ShadowSignerWinSystem;
-                        break;
-                    case PsProtectedSignerApp:
-                        *SignerType = ShadowSignerApp;
-                        break;
-                    default:
-                        *SignerType = ShadowSignerNone;
-                        break;
-                }
+        *IsSigned = TRUE;
+        if (SignerType != NULL) {
+            switch (Protection.Signer) {
+                case PsProtectedSignerAuthenticode:
+                    *SignerType = ShadowSignerAuthenticode;
+                    break;
+                case PsProtectedSignerCodeGen:
+                    *SignerType = ShadowSignerCodeGen;
+                    break;
+                case PsProtectedSignerAntimalware:
+                    *SignerType = ShadowSignerAntimalware;
+                    break;
+                case PsProtectedSignerLsa:
+                    *SignerType = ShadowSignerLsa;
+                    break;
+                case PsProtectedSignerWindows:
+                    *SignerType = ShadowSignerWindows;
+                    break;
+                case PsProtectedSignerWinTcb:
+                    *SignerType = ShadowSignerWinTcb;
+                    break;
+                case PsProtectedSignerWinSystem:
+                    *SignerType = ShadowSignerWinSystem;
+                    break;
+                case PsProtectedSignerApp:
+                    *SignerType = ShadowSignerApp;
+                    break;
+                default:
+                    *SignerType = ShadowSignerNone;
+                    break;
             }
         }
-    } else if (Status == STATUS_INVALID_INFO_CLASS ||
-               Status == STATUS_NOT_IMPLEMENTED) {
-        //
-        // ProcessProtectionInformation not supported on this OS version.
-        // This is expected on older systems — not an error.
-        //
-        Status = STATUS_SUCCESS;
-    } else {
-        //
-        // Unexpected query failure — propagate the actual error
-        //
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // ProcessProtectionInformation may fail on older OS — not fatal.
+    // Fall through to image-based signing check.
+    //
+
+    //
+    // Phase 2: Check cached signing level on the process image file.
+    // SeGetCachedSigningLevel returns the Code Integrity result cached
+    // on the image section at load time. This covers non-PPL signed
+    // executables (Authenticode, Microsoft catalog-signed, etc.).
+    //
+    Status = PsLookupProcessByProcessId(ProcessId, &Process);
+    if (!NT_SUCCESS(Status)) {
         return Status;
     }
 
     //
-    // Note: This function only checks PPL protection status.
-    // For complete signature validation of non-protected processes,
-    // Code Integrity APIs (CiCheckSignedFile, etc.) or image load
-    // callback infrastructure would be required. Signature status
-    // of non-PPL processes should be cached at image load time.
+    // Get the image file object from the EPROCESS.
+    // PsReferenceProcessFilePointer adds a reference we must release.
     //
+    Status = PsReferenceProcessFilePointer(Process, &ImageFileObject);
+    ObDereferenceObject(Process);
+    Process = NULL;
+
+    if (!NT_SUCCESS(Status)) {
+        //
+        // Cannot obtain file object — process may be exiting or
+        // have no image section (e.g. minimal processes).
+        // Return success with IsSigned = FALSE (unknown signing status).
+        //
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Query the cached Code Integrity signing level
+    //
+    {
+        ULONG CiFlags = 0;
+        SE_SIGNING_LEVEL SigningLevel = SE_SIGNING_LEVEL_UNCHECKED;
+
+        Status = SeGetCachedSigningLevel(
+            ImageFileObject,
+            &CiFlags,
+            &SigningLevel,
+            NULL,
+            NULL,
+            NULL
+        );
+
+        ObDereferenceObject(ImageFileObject);
+        ImageFileObject = NULL;
+
+        if (NT_SUCCESS(Status)) {
+            if (SigningLevel > SE_SIGNING_LEVEL_UNSIGNED) {
+                *IsSigned = TRUE;
+                if (SignerType != NULL) {
+                    *SignerType = ShadowpMapSigningLevelToSignerType(SigningLevel);
+                }
+            }
+        } else if (Status == STATUS_NOT_FOUND ||
+                   Status == STATUS_INVALID_INFO_CLASS) {
+            //
+            // No cached signing level — image was not validated by CI.
+            // Treat as unsigned. This is not an error condition.
+            //
+            Status = STATUS_SUCCESS;
+        }
+        //
+        // Other errors (e.g. STATUS_ACCESS_DENIED) are propagated.
+        //
+    }
 
     return Status;
 }
@@ -2764,7 +2951,6 @@ ShadowStrikeIsWindowsProcess(
     {
         UNICODE_STRING DevicePrefix;
         UNICODE_STRING SystemRootPrefix;
-        UNICODE_STRING WindowsSuffix;
 
         RtlInitUnicodeString(&DevicePrefix, L"\\Device\\HarddiskVolume");
         RtlInitUnicodeString(&SystemRootPrefix, L"\\SystemRoot\\");
