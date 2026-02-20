@@ -54,7 +54,7 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
+#include <ntifs.h>
 
 // ============================================================================
 // POOL TAGS
@@ -134,7 +134,7 @@ typedef enum _RT_THROTTLE_ACTION {
     RtActionAbort,
     RtActionNotify,
     RtActionEscalate
-} RT_THROTTLE_ACTION;
+} RT_THROTTLE_ACTION, *PRT_THROTTLE_ACTION;
 
 /**
  * @brief Throttle state for a resource.
@@ -145,7 +145,7 @@ typedef enum _RT_THROTTLE_STATE {
     RtStateThrottled,
     RtStateCritical,
     RtStateRecovery
-} RT_THROTTLE_STATE;
+} RT_THROTTLE_STATE, *PRT_THROTTLE_STATE;
 
 /**
  * @brief Priority levels for operations.
@@ -260,13 +260,22 @@ typedef struct _RT_PROCESS_QUOTA {
 } RT_PROCESS_QUOTA, *PRT_PROCESS_QUOTA;
 
 /**
+ * @brief Callback type for deferred work execution.
+ *
+ * Called at PASSIVE_LEVEL from system worker thread.
+ */
+typedef NTSTATUS (*PRT_DEFERRED_CALLBACK)(
+    _In_opt_ PVOID Context
+);
+
+/**
  * @brief Deferred work item for queued operations.
  */
 typedef struct _RT_DEFERRED_WORK {
     LIST_ENTRY ListEntry;
     RT_RESOURCE_TYPE ResourceType;
     RT_PRIORITY Priority;
-    PVOID Callback;
+    PRT_DEFERRED_CALLBACK Callback;
     PVOID Context;
     LARGE_INTEGER QueueTime;
     LARGE_INTEGER ExpirationTime;
@@ -319,15 +328,6 @@ typedef struct _RT_STATISTICS {
  */
 typedef VOID (*PRT_THROTTLE_CALLBACK)(
     _In_ PRT_THROTTLE_EVENT Event,
-    _In_opt_ PVOID Context
-);
-
-/**
- * @brief Callback type for deferred work execution.
- *
- * Called at PASSIVE_LEVEL from system worker thread.
- */
-typedef NTSTATUS (*PRT_DEFERRED_CALLBACK)(
     _In_opt_ PVOID Context
 );
 

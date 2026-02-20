@@ -2104,7 +2104,7 @@ RtpProcessDeferredWorkQueue(
         }
 
         if (!expired) {
-            callback = (PRT_DEFERRED_CALLBACK)workItem->Callback;
+            callback = workItem->Callback;
             context = workItem->Context;
 
             if (callback != NULL) {
