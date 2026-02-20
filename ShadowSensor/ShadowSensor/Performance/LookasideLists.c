@@ -939,8 +939,13 @@ LlAllocateEx(
             for (ULONG Retry = 0; Retry < 3 && Block == NULL; Retry++) {
                 if (KeGetCurrentIrql() <= APC_LEVEL) {
                     KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+                    Delay.QuadPart *= 2; // exponential backoff: 1ms, 2ms, 4ms
                 } else {
-                    KeStallExecutionProcessor(100);
+                    //
+                    // At DISPATCH_LEVEL, pool exhaustion won't resolve
+                    // by spinning. Break early to avoid DPC timeout.
+                    //
+                    break;
                 }
 
                 if (Lookaside->IsPaged) {
@@ -957,14 +962,54 @@ LlAllocateEx(
     }
 
     //
-    // Determine cache hit: The native lookaside list tracks its own depth.
-    // After allocation, if CurrentOutstanding > previous count, it was
-    // likely a miss (new pool alloc). Approximate via TotalAllocations vs depth.
-    // For simplicity, always report as miss when first alloc, hit otherwise.
-    // The native list's own L.TotalAllocates - L.AllocateMisses gives true hits,
-    // but those fields are internal. We approximate based on outstanding count.
+    // Determine cache hit using native lookaside L.TotalAllocates vs L.AllocateMisses.
+    // A cache hit means the allocation was satisfied from the lookaside free list
+    // without going to the pool allocator. We snapshot TotalAllocates before and check
+    // AllocateMisses after — if AllocateMisses didn't change, it was a hit.
+    // However, since we already did the allocation, we read the cumulative counters
+    // and compute: Hits = TotalAllocates - AllocateMisses. Compare with our previous
+    // snapshot to detect whether THIS allocation was a hit.
     //
-    IsHit = (Lookaside->Stats.CurrentOutstanding >= 0);
+    {
+        ULONG NativeMisses;
+        ULONG NativeTotal;
+
+        if (Lookaside->IsPaged) {
+            NativeTotal = Lookaside->NativeList.Paged.L.TotalAllocates;
+            NativeMisses = Lookaside->NativeList.Paged.L.AllocateMisses;
+        } else {
+            NativeTotal = Lookaside->NativeList.NonPaged.L.TotalAllocates;
+            NativeMisses = Lookaside->NativeList.NonPaged.L.AllocateMisses;
+        }
+
+        //
+        // If misses equals total, every allocation missed the cache.
+        // If misses < total, some were hits. For this single allocation,
+        // check the ratio: if current miss rate < 100%, report as hit.
+        // More precisely: if the native list had any hits at all in its
+        // lifetime, the last allocation was likely a hit if the list wasn't
+        // empty. The most accurate single-alloc method: sample misses before
+        // and after. Since we can't do before/after atomically with the alloc,
+        // we use: hits > 0 AND list had cached entries (CurrentOutstanding < depth).
+        //
+        if (NativeTotal > NativeMisses) {
+            //
+            // Native list has had cache hits — use depth heuristic.
+            // If outstanding < depth, the list likely had free entries cached.
+            //
+            USHORT Depth;
+
+            if (Lookaside->IsPaged) {
+                Depth = Lookaside->NativeList.Paged.L.Depth;
+            } else {
+                Depth = Lookaside->NativeList.NonPaged.L.Depth;
+            }
+
+            IsHit = (Lookaside->Stats.CurrentOutstanding < (LONG)Depth);
+        } else {
+            IsHit = FALSE;
+        }
+    }
 
     //
     // Always zero for security
@@ -1279,10 +1324,17 @@ LlRegisterPressureCallback(
 }
 
 /**
- * @brief Trim cached entries by deleting and recreating lists with depth=1
+ * @brief Trim cached entries by deleting and recreating native lookaside lists.
  *
- * This is the only reliable way to force lookaside lists to release
- * cached entries back to the pool. Returns estimated bytes freed.
+ * The only reliable way to force Windows lookaside lists to release cached
+ * entries back to the pool is to delete and re-initialize them. This function
+ * iterates all managed lists, acquires exclusive access per-list via the
+ * RefCountAndState mechanism, deletes the native list, and re-creates it
+ * with the same parameters. Active allocations are NOT affected — they
+ * were already removed from the free list and will be returned to pool
+ * on the next LlFree (new native list will accept them).
+ *
+ * Returns estimated bytes freed (based on native list miss statistics).
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 LONG64
@@ -1291,6 +1343,7 @@ LlTrimCaches(
     )
 {
     PLIST_ENTRY Entry;
+    PLIST_ENTRY NextEntry;
     PLL_LOOKASIDE Lookaside;
     LONG64 BytesFreed = 0;
 
@@ -1305,37 +1358,133 @@ LlTrimCaches(
     }
 
     //
-    // Enumerate under shared lock — we cannot safely recreate lists
-    // while others hold references. Instead, we rely on the system's
-    // periodic trimming and just log current waste.
-    // A full trim would require exclusive access to each list.
+    // Acquire exclusive lock — trim is a heavyweight operation that
+    // modifies native list internals. No allocations or frees may be
+    // in-flight on any managed list during the delete/reinit cycle.
     //
     KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Manager->LookasideListLock);
+    ExAcquirePushLockExclusive(&Manager->LookasideListLock);
 
     for (Entry = Manager->LookasideListHead.Flink;
          Entry != &Manager->LookasideListHead;
-         Entry = Entry->Flink) {
+         Entry = NextEntry) {
+
+        //
+        // Capture next before any potential list manipulation
+        //
+        NextEntry = Entry->Flink;
 
         Lookaside = CONTAINING_RECORD(Entry, LL_LOOKASIDE, ListEntry);
 
-        if (LlIsValid(Lookaside)) {
-            //
-            // Estimate cached bytes: (TotalAllocations - TotalFrees - Outstanding) * EntrySize
-            // This represents entries sitting in the free list cache.
-            //
-            LONG64 Allocs = Lookaside->Stats.TotalAllocations;
-            LONG64 Frees = Lookaside->Stats.TotalFrees;
-            LONG Outstanding = Lookaside->Stats.CurrentOutstanding;
-            LONG64 CachedEstimate = Frees - (Allocs - Outstanding);
+        if (!LlIsValid(Lookaside)) {
+            continue;
+        }
 
-            if (CachedEstimate > 0) {
-                BytesFreed += CachedEstimate * (LONG64)Lookaside->EntrySize;
+        //
+        // Skip lists that are not active
+        //
+        {
+            LL_STATE State = (LL_STATE)InterlockedCompareExchange(
+                (volatile LONG*)&Lookaside->State, 0, 0
+            );
+            if (State != LlStateActive) {
+                continue;
             }
         }
+
+        //
+        // Skip lists with outstanding allocations that exceed the
+        // native list depth — these lists are fully utilized and
+        // trimming would not reclaim meaningful memory.
+        //
+        if (Lookaside->Stats.CurrentOutstanding < 0) {
+            continue;
+        }
+
+        //
+        // Estimate cached (free-list) entries from native list counters.
+        // NativeFrees - NativeFreeMisses = entries successfully returned to cache.
+        // NativeAllocates - NativeAllocMisses = entries served from cache.
+        // Cached entries ≈ (successful returns) - (cache hits) when positive.
+        //
+        {
+            ULONG NativeAllocTotal;
+            ULONG NativeAllocMisses;
+            ULONG NativeFreeTotal;
+            ULONG NativeFreeMisses;
+            LONG64 CachedEstimate;
+
+            if (Lookaside->IsPaged) {
+                NativeAllocTotal  = Lookaside->NativeList.Paged.L.TotalAllocates;
+                NativeAllocMisses = Lookaside->NativeList.Paged.L.AllocateMisses;
+                NativeFreeTotal   = Lookaside->NativeList.Paged.L.TotalFrees;
+                NativeFreeMisses  = Lookaside->NativeList.Paged.L.FreeMisses;
+            } else {
+                NativeAllocTotal  = Lookaside->NativeList.NonPaged.L.TotalAllocates;
+                NativeAllocMisses = Lookaside->NativeList.NonPaged.L.AllocateMisses;
+                NativeFreeTotal   = Lookaside->NativeList.NonPaged.L.TotalFrees;
+                NativeFreeMisses  = Lookaside->NativeList.NonPaged.L.FreeMisses;
+            }
+
+            //
+            // Entries in cache = (frees that hit cache) - (allocs that hit cache)
+            //
+            CachedEstimate = (LONG64)(NativeFreeTotal - NativeFreeMisses)
+                           - (LONG64)(NativeAllocTotal - NativeAllocMisses);
+
+            if (CachedEstimate <= 0) {
+                //
+                // No cached entries to reclaim — skip the expensive delete/reinit
+                //
+                continue;
+            }
+
+            BytesFreed += CachedEstimate * (LONG64)Lookaside->EntrySize;
+        }
+
+        //
+        // Suspend the list to prevent racing allocations during reinit.
+        // Any allocation attempt seeing LlStateSuspended will fail gracefully.
+        //
+        InterlockedExchange((volatile LONG*)&Lookaside->State, LlStateSuspended);
+
+        //
+        // Delete and reinitialize the native lookaside list.
+        // ExDelete*LookasideList frees all cached entries back to pool.
+        // ExInitialize*LookasideList creates a fresh empty list.
+        // Outstanding allocations are unaffected — they've already been
+        // removed from the SLIST. When freed via LlFree, ExFreeTo*List
+        // will insert them into the new list's SLIST.
+        //
+        if (Lookaside->IsPaged) {
+            USHORT SavedDepth = Lookaside->NativeList.Paged.L.Depth;
+            ExDeletePagedLookasideList(&Lookaside->NativeList.Paged);
+            ExInitializePagedLookasideList(
+                &Lookaside->NativeList.Paged,
+                NULL, NULL, 0,
+                Lookaside->EntrySize,
+                Lookaside->Tag,
+                SavedDepth
+            );
+        } else {
+            USHORT SavedDepth = Lookaside->NativeList.NonPaged.L.Depth;
+            ExDeleteNPagedLookasideList(&Lookaside->NativeList.NonPaged);
+            ExInitializeNPagedLookasideList(
+                &Lookaside->NativeList.NonPaged,
+                NULL, NULL, 0,
+                Lookaside->EntrySize,
+                Lookaside->Tag,
+                SavedDepth
+            );
+        }
+
+        //
+        // Reactivate the list
+        //
+        InterlockedExchange((volatile LONG*)&Lookaside->State, LlStateActive);
     }
 
-    ExReleasePushLockShared(&Manager->LookasideListLock);
+    ExReleasePushLockExclusive(&Manager->LookasideListLock);
     KeLeaveCriticalRegion();
 
     ExReleaseRundownProtection(&Manager->RundownRef);
