@@ -862,12 +862,19 @@ WqiDelayTimerDpcCallback(
     // Check if shutdown
     if (InterlockedCompareExchange(&g_WqManager.State, 0, 0) ==
         (LONG)ShadowWqStateShutdown) {
-        // Complete as cancelled — but rundown is already released during
-        // shutdown, so just mark and dereference
+        //
+        // Complete as cancelled. Must release rundown protection
+        // (acquired at submission time) so ExWaitForRundownProtectionRelease
+        // in the shutdown path can complete. Without this, driver unload
+        // hangs indefinitely.
+        //
         InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateCancelled);
         Item->CompletionStatus = STATUS_CANCELLED;
         WqiRemoveFromActiveList(Item);
         InterlockedDecrement(&g_WqManager.PendingCount);
+        InterlockedDecrement(&g_WqManager.Stats.CurrentPending);
+        InterlockedIncrement64(&g_WqManager.Stats.TotalCancelled);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
         WqiDereferenceWorkItem(Item);
         return;
     }
@@ -912,8 +919,6 @@ WqiTrackComplete(
     _In_ PSHADOWSTRIKE_WORK_ITEM Item,
     _In_ BOOLEAN Success)
 {
-    UNREFERENCED_PARAMETER(Item);
-
     InterlockedDecrement(&g_WqManager.PendingCount);
     InterlockedDecrement(&g_WqManager.Stats.CurrentPending);
 
@@ -1687,8 +1692,6 @@ VOID
 ShadowStrikeGetWorkQueueStatistics(
     _Out_ PSHADOWSTRIKE_WQ_STATISTICS Statistics)
 {
-    LARGE_INTEGER CurrentTime;
-
     if (Statistics == NULL) return;
 
     // Snapshot volatile fields individually for consistency
@@ -1814,7 +1817,3 @@ ShadowStrikeInitWorkQueueConfig(
     Config->LookasideDepth = WQ_LOOKASIDE_DEPTH;
     Config->EnableDetailedTiming = FALSE;
 }
-
-// ============================================================================
-// END OF FILE
-// ============================================================================

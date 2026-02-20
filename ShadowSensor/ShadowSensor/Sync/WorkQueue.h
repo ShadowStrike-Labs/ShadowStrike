@@ -103,7 +103,7 @@ typedef enum _SHADOWSTRIKE_WQ_ITEM_STATE {
     ShadowWqItemStateCompleted,
     ShadowWqItemStateCancelled,
     ShadowWqItemStateFailed
-} SHADOWSTRIKE_WQ_ITEM_STATE;
+} SHADOWSTRIKE_WQ_ITEM_STATE, *PSHADOWSTRIKE_WQ_ITEM_STATE;
 
 typedef enum _SHADOWSTRIKE_WQ_STATE {
     ShadowWqStateUninitialized = 0,
