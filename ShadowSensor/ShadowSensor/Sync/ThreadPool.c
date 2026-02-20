@@ -93,6 +93,10 @@ struct _TP_THREAD_INFO {
     // Work execution state
     volatile LONG IsExecuting;
 
+    // Lifecycle flags
+    volatile LONG Registered;       // TRUE if added to pool's ThreadList and counters
+    volatile LONG OwnerWillDestroy; // TRUE if TppDestroyThread will handle cleanup
+
     // Owner pool (back-pointer, protected by pool lifetime)
     struct _TP_THREAD_POOL* Pool;
 
@@ -945,26 +949,134 @@ TpSetAffinity(
     _In_ KAFFINITY AffinityMask
 )
 {
+    KAFFINITY systemAffinity;
+    PLIST_ENTRY entry;
+    PTP_THREAD_INFO threadInfo;
+    KIRQL oldIrql;
+    ULONG successCount = 0;
+    ULONG failCount = 0;
+
     PAGED_CODE();
 
     if (!TppIsValidPool(Pool)) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Get system-supported affinity for validation
+    //
+    systemAffinity = KeQueryActiveProcessors();
+
     if (AffinityMask == 0) {
-        AffinityMask = KeQueryActiveProcessors();
+        AffinityMask = systemAffinity;
     }
 
+    //
+    // Validate: mask must specify at least one active processor.
+    // Mask bits for non-existent processors are stripped to prevent BSOD.
+    //
+    AffinityMask &= systemAffinity;
+    if (AffinityMask == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Store new mask — new threads will use this at startup
+    //
     Pool->AffinityMask = AffinityMask;
 
     //
-    // Threads will pick up the new affinity on their next wake cycle
-    // since they read Pool->AffinityMask at startup.
-    // For immediate change, we would need to signal each thread.
-    // This is the safe approach — no KeSetSystemAffinityThread from wrong thread.
+    // Apply immediately to all existing threads via ZwSetInformationThread.
+    // KeSetSystemAffinityThread only affects the CALLING thread, so it cannot
+    // be used here. ZwSetInformationThread with ThreadAffinityMask properly
+    // sets the affinity of any thread given its handle.
     //
+    KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
 
-    return STATUS_SUCCESS;
+    for (entry = Pool->ThreadList.Flink;
+         entry != &Pool->ThreadList;
+         entry = entry->Flink) {
+
+        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
+
+        if (threadInfo->ThreadHandle != NULL &&
+            threadInfo->State != TpThreadState_Stopping &&
+            threadInfo->State != TpThreadState_Stopped) {
+
+            //
+            // ZwSetInformationThread requires PASSIVE_LEVEL and cannot be
+            // called under a spinlock. Collect info and apply outside.
+            // But we need the handle to stay valid. Since we hold the list
+            // lock, the thread can't be destroyed, and the handle is valid.
+            // Use a two-pass approach: mark threads, then apply.
+            //
+            // Actually, we can't call Zw* under spinlock. Break approach:
+            // We'll iterate, ref the thread object, release lock, apply, re-lock.
+            // Simpler: since shutdown is checked and pool ref protects pool,
+            // collect handles in a local array and apply after releasing the lock.
+            //
+            // For simplicity and IRQL-safety, defer to signaling approach.
+            //
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
+
+    //
+    // Apply affinity to each thread outside the spinlock.
+    // We iterate the list, reference each thread's handle, and call
+    // ZwSetInformationThread at PASSIVE_LEVEL.
+    //
+    {
+        HANDLE threadHandles[TP_MAX_THREADS];
+        ULONG handleCount = 0;
+        ULONG i;
+
+        KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
+        for (entry = Pool->ThreadList.Flink;
+             entry != &Pool->ThreadList && handleCount < TP_MAX_THREADS;
+             entry = entry->Flink) {
+
+            threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
+            if (threadInfo->ThreadHandle != NULL &&
+                threadInfo->State != TpThreadState_Stopping &&
+                threadInfo->State != TpThreadState_Stopped) {
+                threadHandles[handleCount++] = threadInfo->ThreadHandle;
+            }
+        }
+        KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
+
+        //
+        // Apply at PASSIVE_LEVEL. Handles remain valid because:
+        // - Pool is not shutting down (checked by TppIsValidPool)
+        // - Threads don't close their own handles unless stop-requested AND
+        //   pool is not shutting down (self-cleanup path)
+        // - We're at PASSIVE_LEVEL, so no concurrent TpDestroy can proceed
+        //   past the thread list collection phase
+        //
+        for (i = 0; i < handleCount; i++) {
+            NTSTATUS status = ZwSetInformationThread(
+                threadHandles[i],
+                ThreadAffinityMask,
+                &AffinityMask,
+                sizeof(KAFFINITY)
+            );
+            if (NT_SUCCESS(status)) {
+                successCount++;
+            } else {
+                failCount++;
+#if DBG
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike:TP] TpSetAffinity: ZwSetInformationThread "
+                    "failed for handle %p: 0x%08X\n",
+                    threadHandles[i], status);
+#endif
+            }
+        }
+    }
+
+    return (failCount > 0 && successCount == 0) ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
 }
 
 // ============================================================================
@@ -1250,6 +1362,7 @@ TppCreateThread(
     //
     KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
     InsertTailList(&Pool->ThreadList, &info->ListEntry);
+    InterlockedExchange(&info->Registered, 1);
     InterlockedIncrement(&Pool->ThreadCount);
     InterlockedIncrement(&Pool->IdleThreadCount);
     KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
@@ -1277,6 +1390,14 @@ TppDestroyThread(
     if (ThreadInfo == NULL || ThreadInfo->Magic != TP_THREAD_INFO_MAGIC) {
         return;
     }
+
+    //
+    // Mark that this thread's cleanup is owned by TppDestroyThread,
+    // NOT by the thread's self-cleanup path. Prevents double-free
+    // when TpRemoveThreads calls TppDestroyThread concurrently with
+    // the thread's own exit path.
+    //
+    InterlockedExchange(&ThreadInfo->OwnerWillDestroy, 1);
 
     //
     // Signal the thread to stop
@@ -1552,49 +1673,59 @@ TppWorkerThreadRoutine(
 
 ExitCleanup:
     //
-    // CRITICAL-03 fix: Save state BEFORE setting Stopping,
-    // then decrement the correct counter based on saved state.
+    // Only decrement pool counters if this thread was registered in the pool.
+    // Threads that failed ObReferenceObjectByHandle during creation were never
+    // added to the pool list or counted — decrementing would corrupt counters.
     //
-    preExitState = threadInfo->State;
-    threadInfo->State = TpThreadState_Stopping;
+    if (threadInfo->Registered) {
+        //
+        // Save state BEFORE setting Stopping,
+        // then decrement the correct counter based on saved state.
+        //
+        preExitState = threadInfo->State;
+        threadInfo->State = TpThreadState_Stopping;
 
-    if (preExitState == TpThreadState_Idle ||
-        preExitState == TpThreadState_Starting) {
-        InterlockedDecrement(&pool->IdleThreadCount);
-    } else if (preExitState == TpThreadState_Running) {
-        InterlockedDecrement(&pool->RunningThreadCount);
-    }
+        if (preExitState == TpThreadState_Idle ||
+            preExitState == TpThreadState_Starting) {
+            InterlockedDecrement(&pool->IdleThreadCount);
+        } else if (preExitState == TpThreadState_Running) {
+            InterlockedDecrement(&pool->RunningThreadCount);
+        }
 
-    //
-    // HIGH-05 fix: Remove ourselves from the thread list under spinlock.
-    // TppDestroyThread also removes us, but if thread exits on its own
-    // (e.g., due to StopRequested set by scale-down), we must self-remove.
-    // Check if we're still in a list before removing.
-    //
-    KeAcquireSpinLock(&pool->ThreadListLock, &oldIrql);
-    if (!IsListEmpty(&threadInfo->ListEntry)) {
-        RemoveEntryList(&threadInfo->ListEntry);
-        InitializeListHead(&threadInfo->ListEntry);
-    }
-    KeReleaseSpinLock(&pool->ThreadListLock, oldIrql);
+        //
+        // Remove ourselves from the thread list under spinlock.
+        // TppDestroyThread may have already removed us (TpRemoveThreads path),
+        // so check IsListEmpty first.
+        //
+        KeAcquireSpinLock(&pool->ThreadListLock, &oldIrql);
+        if (!IsListEmpty(&threadInfo->ListEntry)) {
+            RemoveEntryList(&threadInfo->ListEntry);
+            InitializeListHead(&threadInfo->ListEntry);
+        }
+        KeReleaseSpinLock(&pool->ThreadListLock, oldIrql);
 
-    InterlockedDecrement(&pool->ThreadCount);
+        InterlockedDecrement(&pool->ThreadCount);
 
-    //
-    // Signal if last thread
-    //
-    if (InterlockedCompareExchange(&pool->ThreadCount, 0, 0) == 0) {
-        KeSetEvent(&pool->AllThreadsStoppedEvent, IO_NO_INCREMENT, FALSE);
+        //
+        // Signal if last thread
+        //
+        if (InterlockedCompareExchange(&pool->ThreadCount, 0, 0) == 0) {
+            KeSetEvent(&pool->AllThreadsStoppedEvent, IO_NO_INCREMENT, FALSE);
+        }
+    } else {
+        threadInfo->State = TpThreadState_Stopping;
     }
 
     threadInfo->State = TpThreadState_Stopped;
 
     //
-    // For threads removed by scale-down (StopRequested but pool not shutting down),
-    // we need to self-cleanup since TppDestroyThread won't be called.
-    // The thread already removed itself from the list. Now free resources.
+    // Self-cleanup: only if NOT owned by TppDestroyThread.
+    // This covers: (1) scale-down, (2) unregistered threads (ObRef failure),
+    // (3) threads that self-remove during shutdown before TpDestroy collects them.
+    // OwnerWillDestroy is the sole discriminator — set by TppDestroyThread
+    // before signaling stop.
     //
-    if (threadInfo->StopRequested && !pool->ShuttingDown) {
+    if (!threadInfo->OwnerWillDestroy) {
         //
         // Close our own handle and dereference ourselves
         //

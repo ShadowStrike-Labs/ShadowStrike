@@ -37,7 +37,7 @@
     - T1497: Virtualization/Sandbox Evasion (timing analysis)
     - T1082: System Information Discovery (scheduled enumeration)
 
-    Copyright (c) ShadowStrike Team
+    Copyright (c) ShadowStrike 
 --*/
 
 #include "TimerManager.h"
