@@ -592,11 +592,14 @@ AwqShutdown(
         Entry = RemoveHeadList(&Mgr->Serialization.KeyList);
         PAWQ_SKEY SK = CONTAINING_RECORD(Entry, AWQ_SKEY, ListEntry);
 
-        // Free any pending items on this key
+        // Complete pending items properly — they are registered in the hash
+        // table and active items list. Raw ExFreePoolWithTag would leave
+        // dangling entries → use-after-free during hash cleanup.
         while (!IsListEmpty(&SK->PendingItems)) {
             PLIST_ENTRY PE = RemoveHeadList(&SK->PendingItems);
             PAWQ_WORK_ITEM_I PI = CONTAINING_RECORD(PE, AWQ_WORK_ITEM_I, QueueLink);
-            ExFreePoolWithTag(PI, AWQ_POOL_TAG_ITEM);
+            InterlockedExchange(&PI->State, (LONG)AwqItemState_Cancelled);
+            AwqpCompleteItem(Mgr, PI, STATUS_CANCELLED);
         }
         ExFreePoolWithTag(SK, AWQ_POOL_TAG_SKEY);
     }
@@ -719,10 +722,30 @@ AwqDrain(
     }
 
     //
-    // Set draining state (block new submissions)
+    // Set draining state (block new submissions).
+    // CRITICAL: Clear the drain event BEFORE setting state to Draining.
+    // If we set Draining first, a worker completing the last item could
+    // signal DrainCompleteEvent between our state-set and event-clear,
+    // and KeClearEvent would lose that signal → drain hangs until timeout.
     //
-    InterlockedExchange(&Mgr->State, (LONG)AwqQueueState_Draining);
     KeClearEvent(&Mgr->DrainCompleteEvent);
+    MemoryBarrier();
+    InterlockedExchange(&Mgr->State, (LONG)AwqQueueState_Draining);
+
+    //
+    // Re-check: items may have completed between initial check and state change
+    //
+    {
+        ULONG PostCheckPending = 0;
+        for (i = 0; i < AwqPriority_Count; i++) {
+            PostCheckPending += (ULONG)Mgr->Queues[i].ItemCount;
+        }
+        if (PostCheckPending == 0 && Mgr->ActiveWorkerCount == 0) {
+            InterlockedExchange(&Mgr->State, (LONG)AwqQueueState_Running);
+            ExReleaseRundownProtection(&Mgr->RundownRef);
+            return STATUS_SUCCESS;
+        }
+    }
 
     if (TimeoutMs == 0) TimeoutMs = AWQ_SHUTDOWN_TIMEOUT_MS;
     Timeout.QuadPart = -((LONGLONG)TimeoutMs * 10000);
@@ -1084,22 +1107,23 @@ AwqCancel(
     }
 
     //
-    // Try to cancel: must be Queued
+    // Try to cancel: CAS must be done UNDER the queue lock to prevent
+    // a race with AwqpDequeue. Without the lock, Dequeue could remove
+    // the item from the list between our CAS and RemoveEntryList,
+    // causing double-remove list corruption.
     //
-    if (InterlockedCompareExchange(&Item->State,
-            (LONG)AwqItemState_Cancelled,
-            (LONG)AwqItemState_Queued) == (LONG)AwqItemState_Queued) {
-
-        //
-        // Remove from priority queue
-        //
+    {
         PAWQ_PQUEUE Q = &Mgr->Queues[Item->Priority];
         AWQ_LOCK_EXCLUSIVE(&Q->Lock);
-        RemoveEntryList(&Item->QueueLink);
-        InterlockedDecrement(&Q->ItemCount);
+        if (InterlockedCompareExchange(&Item->State,
+                (LONG)AwqItemState_Cancelled,
+                (LONG)AwqItemState_Queued) == (LONG)AwqItemState_Queued) {
+            RemoveEntryList(&Item->QueueLink);
+            InitializeListHead(&Item->QueueLink);
+            InterlockedDecrement(&Q->ItemCount);
+            Removed = TRUE;
+        }
         AWQ_UNLOCK_EXCLUSIVE(&Q->Lock);
-
-        Removed = TRUE;
     }
 
     if (Removed) {
@@ -1739,21 +1763,33 @@ AwqpDequeue(
     LONG p;
 
     //
-    // Highest priority first
+    // Highest priority first.
+    // We CAS item state from Queued→Running UNDER the queue lock
+    // to prevent a race with AwqCancel. If Cancel won the CAS first
+    // (state is Cancelled), we skip the item — Cancel will remove it.
     //
     for (p = AwqPriority_Count - 1; p >= 0; p--) {
         PAWQ_PQUEUE Q = &Mgr->Queues[p];
+        PLIST_ENTRY Entry, Next;
 
         if (Q->ItemCount == 0) continue;
 
         AWQ_LOCK_EXCLUSIVE(&Q->Lock);
-        if (!IsListEmpty(&Q->ItemList)) {
-            PLIST_ENTRY E = RemoveHeadList(&Q->ItemList);
-            PAWQ_WORK_ITEM_I Item = CONTAINING_RECORD(E, AWQ_WORK_ITEM_I, QueueLink);
-            InterlockedDecrement(&Q->ItemCount);
-            InterlockedIncrement64(&Q->TotalDequeued);
-            AWQ_UNLOCK_EXCLUSIVE(&Q->Lock);
-            return Item;
+        for (Entry = Q->ItemList.Flink; Entry != &Q->ItemList; Entry = Next) {
+            PAWQ_WORK_ITEM_I Item = CONTAINING_RECORD(Entry, AWQ_WORK_ITEM_I, QueueLink);
+            Next = Entry->Flink;
+
+            if (InterlockedCompareExchange(&Item->State,
+                    (LONG)AwqItemState_Running,
+                    (LONG)AwqItemState_Queued) == (LONG)AwqItemState_Queued) {
+                RemoveEntryList(Entry);
+                InitializeListHead(&Item->QueueLink);
+                InterlockedDecrement(&Q->ItemCount);
+                InterlockedIncrement64(&Q->TotalDequeued);
+                AWQ_UNLOCK_EXCLUSIVE(&Q->Lock);
+                return Item;
+            }
+            // Item was concurrently cancelled — skip, Cancel will clean it up
         }
         AWQ_UNLOCK_EXCLUSIVE(&Q->Lock);
     }
