@@ -891,6 +891,44 @@ CoPutEx(
 
         ExAcquirePushLockExclusive(&bucket->Lock);
 
+        /*
+         * Re-check for existing key: another thread may have inserted the
+         * same key while we released the bucket lock for eviction.
+         * Without this check, duplicate keys would corrupt the hash chain.
+         */
+        existingEntry = CopFindEntryInBucket(Cache, bucketIndex, Key);
+        if (existingEntry != NULL) {
+            /* Race: another thread inserted this key — update it instead */
+            if (existingEntry->DataOwned && existingEntry->Data != NULL) {
+                SIZE_T oldSize = existingEntry->DataSize;
+                ShadowStrikeFreePoolWithTag(existingEntry->Data, CO_DATA_POOL_TAG);
+                InterlockedAdd64(&Cache->MemoryUsage, -(LONG64)oldSize);
+                if (Cache->Manager != NULL) {
+                    InterlockedAdd64(&Cache->Manager->CurrentTotalMemory, -(LONG64)oldSize);
+                }
+            }
+            existingEntry->Data = (dataCopy != NULL) ? dataCopy : Data;
+            existingEntry->DataSize = DataSize;
+            existingEntry->DataOwned = (dataCopy != NULL);
+            existingEntry->SecondaryKey = SecondaryKey;
+            existingEntry->TTLSeconds = TTLSeconds;
+            existingEntry->ExpireTime = CopCalculateExpireTime(&currentTime, TTLSeconds);
+            existingEntry->Flags = Flags;
+            existingEntry->UserContext = UserContext;
+            InterlockedIncrement(&existingEntry->AccessCount);
+            InterlockedExchange64(&existingEntry->LastAccessTimeQpc, currentTime.QuadPart);
+            if (dataCopy != NULL) {
+                InterlockedAdd64(&Cache->MemoryUsage, (LONG64)DataSize);
+                if (Cache->Manager != NULL) {
+                    InterlockedAdd64(&Cache->Manager->CurrentTotalMemory, (LONG64)DataSize);
+                }
+            }
+            InterlockedIncrement64(&Cache->Stats.Updates);
+            CopPromoteInLRU(Cache, existingEntry);
+            ExReleasePushLockExclusive(&bucket->Lock);
+            return STATUS_SUCCESS;
+        }
+
         if ((ULONG)Cache->EntryCount >= Cache->Config.MaxEntries) {
             ExReleasePushLockExclusive(&bucket->Lock);
             if (dataCopy != NULL) {
@@ -1170,9 +1208,16 @@ CoGetEx(
             entry->DataSize,
             CO_DATA_POOL_TAG
         );
-        if (dataCopy != NULL) {
-            RtlCopyMemory(dataCopy, entry->Data, entry->DataSize);
+        if (dataCopy == NULL) {
+            /*
+             * Pool allocation failed — cannot copy entry data.
+             * Do NOT report CoResultSuccess with NULL data; callers
+             * would dereference NULL. Release lock and return error.
+             */
+            ExReleasePushLockShared(&bucket->Lock);
+            return STATUS_INSUFFICIENT_RESOURCES;
         }
+        RtlCopyMemory(dataCopy, entry->Data, entry->DataSize);
     }
 
     Result->Result = CoResultSuccess;
@@ -1654,8 +1699,6 @@ CopFindEntryInBucket(
     PLIST_ENTRY listEntry;
     PCO_CACHE_ENTRY entry;
     PCO_HASH_BUCKET bucket;
-
-    UNREFERENCED_PARAMETER(Cache);
 
     bucket = &Cache->Buckets[BucketIndex];
 

@@ -36,8 +36,7 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
-#include <wdm.h>
+#include <ntifs.h>
 #include <ntstrsafe.h>
 
 /* ========================================================================= */
