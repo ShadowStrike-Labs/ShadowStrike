@@ -6,7 +6,7 @@
  * @file FileUtils.c
  * @brief Enterprise-grade file operations for kernel-mode EDR/XDR.
  *
- * Implements CrowdStrike Falcon-class file handling with:
+ * Implements enterprise-grade class file handling with:
  * - Safe file information retrieval with proper IRQL handling
  * - Normalized path acquisition (NT/DOS path conversion)
  * - File attribute and metadata extraction
