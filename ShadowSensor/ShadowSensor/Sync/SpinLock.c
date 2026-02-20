@@ -55,6 +55,13 @@ typedef struct _SHADOWSTRIKE_THREAD_LOCK_STATE {
 typedef struct _SHADOWSTRIKE_LOCK_SUBSYSTEM {
     LONG Initialized;
 
+    //
+    // Production counter: tracks recursive spinlock depth overflows.
+    // Non-zero value indicates a re-entrant callback bug. Available
+    // in ALL builds for telemetry and health monitoring.
+    //
+    volatile LONG64 RecursionOverflows;
+
 #if SHADOWSTRIKE_DEADLOCK_DETECTION
     LIST_ENTRY ThreadStateList;
     KSPIN_LOCK ThreadStateLock;
@@ -621,7 +628,6 @@ ShadowStrikeTryAcquireQueuedSpinLock(
     KIRQL OldIrql;
 
     RtlZeroMemory(LockHandle, sizeof(SHADOWSTRIKE_INSTACK_QUEUED_LOCK));
-    LockHandle->ParentLock = Lock;
 
     KeRaiseIrql(DISPATCH_LEVEL, &OldIrql);
 
@@ -631,6 +637,10 @@ ShadowStrikeTryAcquireQueuedSpinLock(
         // that the release path must use KeReleaseSpinLockFromDpcLevel
         // instead of KeReleaseInStackQueuedSpinLock.
         //
+        // ParentLock set ONLY on success to prevent accidental use
+        // of the handle after a failed try-acquire.
+        //
+        LockHandle->ParentLock = Lock;
         LockHandle->LockHandle.OldIrql = OldIrql;
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
@@ -917,7 +927,30 @@ ShadowStrikeAcquireRecursiveSpinLock(
     //
     if (Lock->OwnerThread == CurrentThread) {
         LONG NewCount = InterlockedIncrement(&Lock->RecursionCount);
-        NT_ASSERT(NewCount <= SHADOWSTRIKE_MAX_RECURSION_DEPTH);
+
+        //
+        // SECURITY: Enforce recursion depth in ALL builds.
+        // The acquisition proceeds (VOID return — rejecting would cause
+        // unmatched Release → BSOD), but we track the overflow for
+        // production telemetry. The real risk is kernel stack overflow
+        // from the caller's re-entrant pattern, not from lock accounting.
+        //
+        if (NewCount > SHADOWSTRIKE_MAX_RECURSION_DEPTH) {
+            InterlockedIncrement64(&g_LockSubsystem.RecursionOverflows);
+#if DBG
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike] CRITICAL: Recursive spinlock '%s' depth "
+                "overflow (%ld > %d) on thread %p\n",
+                Lock->Name ? Lock->Name : "Unknown",
+                (long)NewCount,
+                SHADOWSTRIKE_MAX_RECURSION_DEPTH,
+                (PVOID)PsGetCurrentThreadId()
+            );
+            NT_ASSERT(!"Recursive spinlock depth overflow");
+#endif
+        }
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
         ShadowRecordAcquisition(&Lock->Stats, FALSE);
