@@ -850,7 +850,6 @@ ShadowStrikeGetVolumeSerial(
     )
 {
     NTSTATUS status;
-    PFLT_VOLUME volume = NULL;
     union {
         FILE_FS_VOLUME_INFORMATION VolumeInfo;
         UCHAR Buffer[sizeof(FILE_FS_VOLUME_INFORMATION) + 64 * sizeof(WCHAR)];
@@ -1801,7 +1800,6 @@ ShadowpValidateStreamInfo(
     )
 {
     ULONG minRequired;
-    ULONG nameEnd;
 
     //
     // Check that the structure header fits
