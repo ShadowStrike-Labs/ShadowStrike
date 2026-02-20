@@ -29,9 +29,6 @@
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, SsPmInitialize)
 #pragma alloc_text(PAGE, SsPmShutdown)
-#pragma alloc_text(PAGE, SsPmGetStats)
-#pragma alloc_text(PAGE, SsPmSetThreshold)
-#pragma alloc_text(PAGE, SsPmRegisterAlertCallback)
 #pragma alloc_text(PAGE, SsPmEnableCollection)
 #pragma alloc_text(PAGE, SsPmDisableCollection)
 #endif
@@ -41,11 +38,8 @@
 //=============================================================================
 
 #define SSPM_DEFAULT_RING_CAPACITY    1024     // Samples per metric
-#define SSPM_MAX_RING_CAPACITY        65536
 #define SSPM_MIN_COLLECTION_INTERVAL  100      // 100ms minimum
 #define SSPM_MAX_COLLECTION_INTERVAL  60000    // 60s maximum
-#define SSPM_SHUTDOWN_SIGNATURE       0xDEADPM0F
-#define SSPM_QPC_UNINITIALIZED        0
 
 //=============================================================================
 // Internal Structures
@@ -104,11 +98,6 @@ struct _SSPM_MONITOR {
     KDPC CollectionDpc;
     ULONG CollectionIntervalMs;
     volatile LONG CollectionEnabled;
-
-    //
-    // QPC frequency for latency conversion
-    //
-    LARGE_INTEGER QpcFrequency;
 
     //
     // Global statistics
@@ -248,11 +237,6 @@ SsPmInitialize(
     KeInitializeSpinLock(&Mon->CallbackLock);
 
     //
-    // Get QPC frequency for latency conversions
-    //
-    KeQueryPerformanceCounter(&Mon->QpcFrequency);
-
-    //
     // Allocate ring buffers for each metric
     //
     for (i = 0; i < SsPmMetric_Count; i++) {
@@ -331,11 +315,15 @@ SsPmShutdown(
     KeFlushQueuedDpcs();
 
     //
-    // Phase 3: Wait for in-flight operations to drain
+    // Phase 3: Wait for in-flight operations to drain.
+    // CRITICAL: Clear event BEFORE reading count to prevent race where an
+    // operation completes (sets event) between our read and KeClearEvent,
+    // which would lose the signal and cause a spurious 5-second wait.
     //
+    KeClearEvent(&Monitor->DrainEvent);
+    MemoryBarrier();
     if (InterlockedCompareExchange(&Monitor->ActiveOperations, 0, 0) > 0) {
         Timeout.QuadPart = -(5LL * 10000000LL);  // 5 seconds
-        KeClearEvent(&Monitor->DrainEvent);
         KeWaitForSingleObject(
             &Monitor->DrainEvent,
             Executive,
@@ -503,7 +491,10 @@ Routine Description:
     ULONG i, Index;
     ULONG64 Sum;
 
-    PAGED_CODE();
+    //
+    // This function acquires KSPIN_LOCK (raises to DISPATCH_LEVEL),
+    // so it must NOT be in a PAGE section. Caller must ensure IRQL <= APC_LEVEL.
+    //
 
     if (Monitor == NULL || Stats == NULL || !SspmiIsValidMetric(Metric)) {
         return STATUS_INVALID_PARAMETER;
@@ -639,8 +630,6 @@ SsPmSetThreshold(
 {
     KIRQL OldIrql;
 
-    PAGED_CODE();
-
     if (Monitor == NULL || !SspmiIsValidMetric(Metric)) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -672,8 +661,6 @@ SsPmRegisterAlertCallback(
     )
 {
     KIRQL OldIrql;
-
-    PAGED_CODE();
 
     if (Monitor == NULL || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
