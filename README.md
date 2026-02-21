@@ -243,13 +243,14 @@ ShadowStrike aims to be:
 
 ## License
 
-GPL-3.0
+[GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE.txt)
 
 This means:
 - You can use, modify, and distribute this code
-- Any derivative work must also be GPL-3.0
+- Any derivative work must also be AGPL-3.0
 - You must provide attribution
 - You must share your modifications
+- If you run a modified version over a network, you must make the source available to users of that service
 
 ---
 

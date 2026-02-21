@@ -1,6 +1,20 @@
-// This is an open source non-commercial project. Dear PVS-Studio, please check it.
-// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
-
+/*
+ * ShadowStrike - Enterprise NGAV/EDR Platform
+ * Copyright (C) 2026 ShadowStrike Security
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
 #include"pch.h"
 #include "NetworkUtils.hpp"
 #include <algorithm>
@@ -687,8 +701,7 @@ namespace ShadowStrike {
 
 			/**
             * Detects if the provided data buffer corresponds to common HTTP traffic patterns.
-            * Optimized to satisfy PVS-Studio V814 by avoiding redundant strlen calls.
-            * * @param data The raw byte buffer to analyze.
+            * @param data The raw byte buffer to analyze.
             * @return True if a known HTTP method or response header is detected at the start of the buffer.
             */
 			bool IsHttpTraffic(const std::vector<uint8_t>& data) noexcept {
@@ -821,7 +834,7 @@ namespace ShadowStrike {
 				};
 
 				for (const char* cmd : ftpCommands) {
-					// Optimization: Pre-calculate command length to fix PVS-Studio V814
+					// Pre-calculate command length to avoid redundant strlen calls in the comparison loop
 					const size_t cmdLen = std::strlen(cmd);
 
 					// Ensure buffer contains enough data for comparison
@@ -907,7 +920,7 @@ namespace ShadowStrike {
 							// Check if it's a 220 Greeting containing "SMTP"
 							if (codeNum == 220 && data.size() >= 10) {
 								// Search for "SMTP" in the greeting banner (case-insensitive not required for protocol keywords)
-								// We avoid PVS-Studio V734 by searching for "SMTP" only, which covers "ESMTP"
+								// Searching for "SMTP" covers "ESMTP" since the latter contains the substring
 								const char* rawData = reinterpret_cast<const char*>(data.data());
 								if (std::strstr(rawData, "SMTP") != nullptr) {
 									return true;

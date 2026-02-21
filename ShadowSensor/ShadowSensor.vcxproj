@@ -122,8 +122,20 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ShadowSensor\ALPC\AlpcPortMonitor.c" />
+    <ClCompile Include="ShadowSensor\Communication\CommPort.c" />
+    <ClCompile Include="ShadowSensor\Communication\Compression.c" />
+    <ClCompile Include="ShadowSensor\Communication\Encryption.c" />
+    <ClCompile Include="ShadowSensor\Communication\MessageHandler.c" />
+    <ClCompile Include="ShadowSensor\Communication\MessageQueue.c" />
+    <ClCompile Include="ShadowSensor\Communication\ScanBridge.c" />
+    <ClCompile Include="ShadowSensor\Communication\TelemetryBuffer.c" />
     <ClCompile Include="ShadowSensor\Context\InstanceContext.c" />
     <ClCompile Include="ShadowSensor\Context\StreamContext.c" />
+    <ClCompile Include="ShadowSensor\ETW\ETWConsumer.c" />
+    <ClCompile Include="ShadowSensor\ETW\ETWProvider.c" />
+    <ClCompile Include="ShadowSensor\ETW\EventSchema.c" />
+    <ClCompile Include="ShadowSensor\ETW\ManifestGenerator.c" />
+    <ClCompile Include="ShadowSensor\ETW\TelemetryEvents.c" />
     <ClCompile Include="ShadowSensor\Objects\ObjectNamespace.c" />
     <ClCompile Include="ShadowSensor\Performance\BatchProcessing.c" />
     <ClCompile Include="ShadowSensor\Performance\CacheOptimization.c" />
@@ -136,6 +148,7 @@
     <ClCompile Include="ShadowSensor\Sync\ThreadPool.c" />
     <ClCompile Include="ShadowSensor\Sync\TimerManager.c" />
     <ClCompile Include="ShadowSensor\Sync\WorkQueue.c" />
+    <ClCompile Include="ShadowSensor\Tracing\Trace.c" />
     <ClCompile Include="ShadowSensor\Transactions\KtmMonitor.c" />
     <ClCompile Include="ShadowSensor\Utilities\FileUtils.c" />
     <ClCompile Include="ShadowSensor\Utilities\HashUtils.c" />
@@ -146,8 +159,20 @@
   <ItemGroup>
     <ClInclude Include="ShadowSensor\ALPC\AlpcPortMonitor.h" />
     <ClInclude Include="ShadowSensor\ALPC\AlpcTypes.h" />
+    <ClInclude Include="ShadowSensor\Communication\CommPort.h" />
+    <ClInclude Include="ShadowSensor\Communication\Compression.h" />
+    <ClInclude Include="ShadowSensor\Communication\Encryption.h" />
+    <ClInclude Include="ShadowSensor\Communication\MessageHandler.h" />
+    <ClInclude Include="ShadowSensor\Communication\MessageQueue.h" />
+    <ClInclude Include="ShadowSensor\Communication\ScanBridge.h" />
+    <ClInclude Include="ShadowSensor\Communication\TelemetryBuffer.h" />
     <ClInclude Include="ShadowSensor\Context\InstanceContext.h" />
     <ClInclude Include="ShadowSensor\Context\StreamContext.h" />
+    <ClInclude Include="ShadowSensor\ETW\ETWConsumer.h" />
+    <ClInclude Include="ShadowSensor\ETW\ETWProvider.h" />
+    <ClInclude Include="ShadowSensor\ETW\EventSchema.h" />
+    <ClInclude Include="ShadowSensor\ETW\ManifestGenerator.h" />
+    <ClInclude Include="ShadowSensor\ETW\TelemetryEvents.h" />
     <ClInclude Include="ShadowSensor\Objects\ObjectNamespace.h" />
     <ClInclude Include="ShadowSensor\Performance\BatchProcessing.h" />
     <ClInclude Include="ShadowSensor\Performance\CacheOptimization.h" />
@@ -160,6 +185,8 @@
     <ClInclude Include="ShadowSensor\Sync\ThreadPool.h" />
     <ClInclude Include="ShadowSensor\Sync\TimerManager.h" />
     <ClInclude Include="ShadowSensor\Sync\WorkQueue.h" />
+    <ClInclude Include="ShadowSensor\Tracing\Trace.h" />
+    <ClInclude Include="ShadowSensor\Tracing\WppConfig.h" />
     <ClInclude Include="ShadowSensor\Transactions\KtmMonitor.h" />
     <ClInclude Include="ShadowSensor\Utilities\FileUtils.h" />
     <ClInclude Include="ShadowSensor\Utilities\HashUtils.h" />

@@ -1,6 +1,20 @@
-// This is an open source non-commercial project. Dear PVS-Studio, please check it.
-// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
-
+/*
+ * ShadowStrike - Enterprise NGAV/EDR Platform
+ * Copyright (C) 2026 ShadowStrike Security
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
 /*
  * ============================================================================
  * ShadowStrike SignatureIndex - COMPREHENSIVE UNIT TESTS
@@ -9,7 +23,6 @@
  * Copyright (c) 2026 ShadowStrike Security Suite
  * All rights reserved.
  *
- * PROPRIETARY AND CONFIDENTIAL
  *
  * Enterprise-grade unit tests for SignatureIndex B+Tree module
  * Tests cover all critical B+Tree operations with edge cases
@@ -533,7 +546,7 @@ TEST_F(SignatureIndexTestFixture, BatchInsertWithDuplicatesPartialSuccess) {
     ASSERT_TRUE(index.CreateNew(buffer.get(), indexSize, usedSize).IsSuccess());
 
     // Prepare batch data. 
-    // We use reserve(3) to prevent multiple memory reallocations (PVS-Studio V827 fix).
+    // Pre-reserve capacity to prevent multiple memory reallocations.
     std::vector<std::pair<HashValue, uint64_t>> entries;
     entries.reserve(3);
 

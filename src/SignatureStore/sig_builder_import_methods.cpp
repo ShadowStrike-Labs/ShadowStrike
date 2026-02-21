@@ -1,6 +1,20 @@
-﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
-// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
-
+/*
+ * ShadowStrike - Enterprise NGAV/EDR Platform
+ * Copyright (C) 2026 ShadowStrike Security
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
 /*
  * ============================================================================
  * ShadowStrike SignatureBuilder - IMPORT METHODS IMPLEMENTATION
@@ -9,7 +23,6 @@
  * Copyright (c) 2026 ShadowStrike Security Suite
  * All rights reserved.
  *
- * PROPRIETARY AND CONFIDENTIAL
  *
  * High-performance import methods for signature database building.
  * Supports: Hash files, CSV, JSON, YARA rules, ClamAV, Database merge
@@ -1681,7 +1694,6 @@ namespace {
             parseOpts.maxDepth = 16; // Restrict nesting depth for security
 
             try {
-                // PVS-Studio check: Parse return value is mandatory
                 if (!Parse(jsonData, jsonRoot, &jsonErr, parseOpts)) {
                     SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: Syntax error at %zu:%zu - %S",
                         jsonErr.line, jsonErr.column, jsonErr.message.c_str());
@@ -1739,7 +1751,7 @@ namespace {
                 std::string hashStr;
                 std::string name;
 
-                // Validate return values of Get<T> as per PVS-Studio V547/V601
+                // Validate all mandatory fields — missing any one is a format error
                 bool mandatoryCheck = Get<std::string>(entry, "type", typeStr) &&
                     Get<std::string>(entry, "hash", hashStr) &&
                     Get<std::string>(entry, "name", name);

@@ -87,6 +87,45 @@
     <ClCompile Include="ShadowSensor\Sync\WorkQueue.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ShadowSensor\Communication\CommPort.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\Communication\Compression.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\Communication\Encryption.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\Communication\MessageHandler.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\Communication\MessageQueue.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\Communication\ScanBridge.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\Communication\TelemetryBuffer.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\ETW\ETWConsumer.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\ETW\ETWProvider.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\ETW\EventSchema.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\ETW\ManifestGenerator.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\ETW\TelemetryEvents.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ShadowSensor\Tracing\Trace.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ShadowSensor\Context\InstanceContext.h">
@@ -186,6 +225,48 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ShadowSensor\Sync\WorkQueue.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\Communication\CommPort.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\Communication\Compression.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\Communication\Encryption.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\Communication\MessageHandler.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\Communication\MessageQueue.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\Communication\ScanBridge.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\Communication\TelemetryBuffer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\ETW\ETWConsumer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\ETW\ETWProvider.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\ETW\EventSchema.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\ETW\ManifestGenerator.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\ETW\TelemetryEvents.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\Tracing\Trace.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ShadowSensor\Tracing\WppConfig.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
