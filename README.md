@@ -266,7 +266,7 @@ This project stands on the shoulders of giants:
 
 ## Contact
 
-This is a personal project. For now, use GitHub issues for all communication.
+For contact use : contact@ShadowStrike.dev
 
 ---
 
