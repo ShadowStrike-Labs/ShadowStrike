@@ -76,8 +76,8 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
-#include <wdm.h>
 #include <ntstrsafe.h>
 
 // ============================================================================
