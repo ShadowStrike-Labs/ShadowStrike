@@ -39,6 +39,20 @@
  * ============================================================================
  */
 
+#include "TelemetryEvents.h"
+#include "../Utilities/MemoryUtils.h"
+#include "../Utilities/StringUtils.h"
+#include "../Sync/SpinLock.h"
+#include <ntstrsafe.h>
+
+//
+// MmGetSessionId is exported by ntoskrnl.exe since Windows Vista but
+// not always declared in WDK headers depending on NTDDI_VERSION settings.
+//
+#ifndef MmGetSessionId
+NTKERNELAPI ULONG MmGetSessionId(_In_ PEPROCESS Process);
+#endif
+
 #include <initguid.h>
 
 // ============================================================================
@@ -48,12 +62,6 @@
 // {A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
 DEFINE_GUID(SHADOWSTRIKE_TELEMETRY_PROVIDER_GUID,
     0xA1B2C3D4, 0xE5F6, 0x7890, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x90);
-
-#include "TelemetryEvents.h"
-#include "../Utilities/MemoryUtils.h"
-#include "../Utilities/StringUtils.h"
-#include "../Sync/SpinLock.h"
-#include <ntstrsafe.h>
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -917,13 +925,12 @@ TepInitializeEventHeader(
     Header->ThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
 
     //
-    // Session ID: PsGetCurrentProcessSessionId internally reads from the
-    // EPROCESS. Safe at DISPATCH_LEVEL on x64 Windows 10+, but we guard
-    // with an IRQL check for maximum portability. If called above
-    // PASSIVE_LEVEL, we set session ID to 0 (unknown).
+    // Session ID: MmGetSessionId reads the session from the current
+    // EPROCESS. Safe at APC_LEVEL and below. At higher IRQL levels,
+    // we set session ID to 0 (unknown) to avoid potential issues.
     //
     if (KeGetCurrentIrql() <= APC_LEVEL) {
-        Header->SessionId = PsGetCurrentProcessSessionId();
+        Header->SessionId = (UINT32)MmGetSessionId(PsGetCurrentProcess());
     } else {
         Header->SessionId = 0;
     }
@@ -1284,6 +1291,13 @@ TeLogProcessCreate(
     event->CreatingThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
     event->ThreatScore = ThreatScore;
     event->Flags = Flags;
+
+    //
+    // Override the header's auto-filled ProcessId with the new process ID.
+    // The header auto-fills with PsGetCurrentProcessId() (the creator),
+    // but for process-create events the target PID is more relevant.
+    //
+    event->Header.ProcessId = ProcessId;
 
     TepCopyUnicodeStringSafe(event->ImagePath, MAX_FILE_PATH_LENGTH, ImagePath);
     TepCopyUnicodeStringSafe(event->CommandLine, TE_MAX_COMMAND_LINE_CHARS, CommandLine);
@@ -2466,7 +2480,7 @@ NTSTATUS
 TeLogError(
     _In_ DRIVER_COMPONENT_ID ComponentId,
     _In_ NTSTATUS ErrorCode,
-    _In_ ERROR_SEVERITY Severity,
+    _In_ TELEMETRY_ERROR_SEVERITY Severity,
     _In_ PCSTR FileName,
     _In_ PCSTR FunctionName,
     _In_ UINT32 LineNumber,

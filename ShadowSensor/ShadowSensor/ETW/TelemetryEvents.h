@@ -186,48 +186,51 @@ typedef enum _TE_EVENT_LEVEL {
 
 /**
  * @brief Telemetry event keywords (bitmask for filtering).
+ *
+ * C enums are int-sized, but ETW keywords are UINT64. Use #define constants
+ * with a UINT64 typedef to support the full 64-bit bitmask range.
  */
-typedef enum _TE_EVENT_KEYWORD {
-    TeKeyword_None          = 0x0000000000000000ULL,
+typedef UINT64 TE_EVENT_KEYWORD;
 
-    // Activity categories
-    TeKeyword_Process       = 0x0000000000000001ULL,    ///< Process events
-    TeKeyword_Thread        = 0x0000000000000002ULL,    ///< Thread events
-    TeKeyword_Image         = 0x0000000000000004ULL,    ///< Image load events
-    TeKeyword_File          = 0x0000000000000008ULL,    ///< File system events
-    TeKeyword_Registry      = 0x0000000000000010ULL,    ///< Registry events
-    TeKeyword_Network       = 0x0000000000000020ULL,    ///< Network events
-    TeKeyword_Memory        = 0x0000000000000040ULL,    ///< Memory events
+#define TeKeyword_None              0x0000000000000000ULL
 
-    // Security categories
-    TeKeyword_Security      = 0x0000000000000080ULL,    ///< Security events
-    TeKeyword_Detection     = 0x0000000000000100ULL,    ///< Detection events
-    TeKeyword_Behavioral    = 0x0000000000000200ULL,    ///< Behavioral events
-    TeKeyword_Threat        = 0x0000000000000400ULL,    ///< Threat events
-    TeKeyword_Attack        = 0x0000000000000800ULL,    ///< Attack chain events
+// Activity categories
+#define TeKeyword_Process           0x0000000000000001ULL
+#define TeKeyword_Thread            0x0000000000000002ULL
+#define TeKeyword_Image             0x0000000000000004ULL
+#define TeKeyword_File              0x0000000000000008ULL
+#define TeKeyword_Registry          0x0000000000000010ULL
+#define TeKeyword_Network           0x0000000000000020ULL
+#define TeKeyword_Memory            0x0000000000000040ULL
 
-    // Operational categories
-    TeKeyword_Performance   = 0x0000000000001000ULL,    ///< Performance metrics
-    TeKeyword_Health        = 0x0000000000002000ULL,    ///< Health status
-    TeKeyword_Diagnostic    = 0x0000000000004000ULL,    ///< Diagnostics
-    TeKeyword_Audit         = 0x0000000000008000ULL,    ///< Audit trail
+// Security categories
+#define TeKeyword_Security          0x0000000000000080ULL
+#define TeKeyword_Detection         0x0000000000000100ULL
+#define TeKeyword_Behavioral        0x0000000000000200ULL
+#define TeKeyword_Threat            0x0000000000000400ULL
+#define TeKeyword_Attack            0x0000000000000800ULL
 
-    // Special categories
-    TeKeyword_SelfProtect   = 0x0000000000010000ULL,    ///< Self-protection
-    TeKeyword_Evasion       = 0x0000000000020000ULL,    ///< Evasion detection
-    TeKeyword_Injection     = 0x0000000000040000ULL,    ///< Injection detection
-    TeKeyword_Credential    = 0x0000000000080000ULL,    ///< Credential access
-    TeKeyword_Ransomware    = 0x0000000000100000ULL,    ///< Ransomware detection
+// Operational categories
+#define TeKeyword_Performance       0x0000000000001000ULL
+#define TeKeyword_Health            0x0000000000002000ULL
+#define TeKeyword_Diagnostic        0x0000000000004000ULL
+#define TeKeyword_Audit             0x0000000000008000ULL
 
-    // Debug (high bit)
-    TeKeyword_Debug         = 0x8000000000000000ULL,    ///< Debug events
+// Special categories
+#define TeKeyword_SelfProtect       0x0000000000010000ULL
+#define TeKeyword_Evasion           0x0000000000020000ULL
+#define TeKeyword_Injection         0x0000000000040000ULL
+#define TeKeyword_Credential        0x0000000000080000ULL
+#define TeKeyword_Ransomware        0x0000000000100000ULL
 
-    // Combinations
-    TeKeyword_AllActivity   = 0x000000000000007FULL,
-    TeKeyword_AllSecurity   = 0x0000000000000F80ULL,
-    TeKeyword_AllOperational= 0x000000000000F000ULL,
-    TeKeyword_All           = 0x7FFFFFFFFFFFFFFFULL
-} TE_EVENT_KEYWORD;
+// Debug (high bit)
+#define TeKeyword_Debug             0x8000000000000000ULL
+
+// Combinations
+#define TeKeyword_AllActivity       0x000000000000007FULL
+#define TeKeyword_AllSecurity       0x0000000000000F80ULL
+#define TeKeyword_AllOperational    0x000000000000F000ULL
+#define TeKeyword_All               0x7FFFFFFFFFFFFFFFULL
 
 // ============================================================================
 // EVENT IDENTIFIERS
@@ -435,7 +438,7 @@ typedef struct _TE_EVENT_HEADER {
     UINT64 ActivityId;                  ///< Activity ID for tracing
 } TE_EVENT_HEADER, *PTE_EVENT_HEADER;
 
-C_ASSERT(sizeof(TE_EVENT_HEADER) == 80);
+C_ASSERT(sizeof(TE_EVENT_HEADER) == 72);
 
 // Event header flags
 #define TE_FLAG_BLOCKING            0x0001  ///< Event can block operation
@@ -690,7 +693,7 @@ typedef struct _TE_OPERATIONAL_EVENT {
     TE_EVENT_HEADER Header;
     DRIVER_COMPONENT_ID ComponentId;
     COMPONENT_HEALTH_STATUS HealthStatus;
-    ERROR_SEVERITY ErrorSeverity;
+    TELEMETRY_ERROR_SEVERITY ErrorSeverity;
     UINT32 ErrorCode;
     UINT64 ContextValue1;
     UINT64 ContextValue2;
@@ -1251,7 +1254,7 @@ NTSTATUS
 TeLogError(
     _In_ DRIVER_COMPONENT_ID ComponentId,
     _In_ NTSTATUS ErrorCode,
-    _In_ ERROR_SEVERITY Severity,
+    _In_ TELEMETRY_ERROR_SEVERITY Severity,
     _In_ PCSTR FileName,
     _In_ PCSTR FunctionName,
     _In_ UINT32 LineNumber,

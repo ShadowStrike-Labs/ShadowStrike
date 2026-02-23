@@ -1819,7 +1819,7 @@ Return Value:
 --*/
 {
     NTSTATUS Status = STATUS_SUCCESS;
-    MG_STRING_BUILDER ErrorBuilder;
+    MG_STRING_BUILDER ErrorBuilder = { 0 };
     ULONG Errors = 0;
     PLIST_ENTRY Entry, Entry2;
     PES_EVENT_DEFINITION Event, Event2;

@@ -144,13 +144,13 @@ typedef enum _COMPONENT_HEALTH_STATUS {
 /**
  * @brief Error severity levels.
  */
-typedef enum _ERROR_SEVERITY {
+typedef enum _TELEMETRY_ERROR_SEVERITY {
     ErrorSeverity_Info = 0,
     ErrorSeverity_Warning,
     ErrorSeverity_Error,
     ErrorSeverity_Critical,
     ErrorSeverity_Fatal
-} ERROR_SEVERITY;
+} TELEMETRY_ERROR_SEVERITY;
 
 // ============================================================================
 // TELEMETRY STRUCTURES
@@ -254,6 +254,7 @@ typedef struct _TELEMETRY_PERFORMANCE {
         UINT64 RemoteThreadsDetected;
         UINT64 ImageLoads;
         UINT64 SuspiciousImageLoads;
+        UINT64 TotalEventsProcessed;
         UINT32 AverageLatencyUs;
         UINT32 MaxLatencyUs;
     } Process;
@@ -332,7 +333,7 @@ typedef struct _TELEMETRY_COMPONENT_HEALTH {
     
     // Error info (if degraded/failed)
     UINT32 LastErrorCode;
-    ERROR_SEVERITY ErrorSeverity;
+    TELEMETRY_ERROR_SEVERITY ErrorSeverity;
     WCHAR ErrorMessage[MAX_ERROR_MESSAGE_LENGTH];
     WCHAR ComponentName[MAX_COMPONENT_NAME_LENGTH];
     
@@ -348,7 +349,7 @@ typedef struct _TELEMETRY_ERROR {
     
     // Error details
     UINT32 ErrorCode;                     // NTSTATUS or custom code
-    ERROR_SEVERITY Severity;
+    TELEMETRY_ERROR_SEVERITY Severity;
     DRIVER_COMPONENT_ID SourceComponent;
     UINT32 Reserved1;
     

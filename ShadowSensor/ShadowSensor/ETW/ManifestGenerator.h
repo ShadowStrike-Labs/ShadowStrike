@@ -23,7 +23,7 @@ ShadowStrike NGAV - ETW MANIFEST GENERATOR
 @file ManifestGenerator.h
 @brief Enterprise-grade ETW manifest and header generation for ShadowSensor.
 
-Provides CrowdStrike Falcon-class ETW instrumentation manifest generation:
+Provides Enterprise-Grade-class ETW instrumentation manifest generation:
 - Full Windows Event Log manifest XML generation (RFC 4122 GUID compliant)
 - C/C++ header file generation for compile-time event definitions
 - Message table resource generation for localized event messages
@@ -69,6 +69,7 @@ MITRE ATT&CK Coverage:
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 #include <ntstrsafe.h>
 #include "EventSchema.h"

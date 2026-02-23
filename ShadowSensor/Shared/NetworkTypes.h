@@ -204,6 +204,8 @@ typedef enum _NETWORK_THREAT_TYPE {
 // ============================================================================
 
 #pragma pack(push, 1)
+#pragma warning(push)
+#pragma warning(disable:4201) // nameless struct/union — required for IP address overlay
 
 /**
  * @brief IPv4 address structure.
@@ -706,6 +708,7 @@ typedef enum _NETWORK_BLOCK_REASON {
 } NETWORK_BLOCK_REASON;
 
 #pragma pack(pop)
+#pragma warning(pop)
 
 // ============================================================================
 // NETWORK MONITORING CONFIGURATION

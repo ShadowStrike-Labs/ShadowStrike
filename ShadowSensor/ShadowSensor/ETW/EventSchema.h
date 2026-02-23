@@ -86,9 +86,19 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 #include <evntrace.h>
 #include <ntstrsafe.h>
+
+//
+// PCGUID is not defined in WDK kernel headers (it comes from ObjBase.h
+// in user-mode). Define it here for kernel-mode usage.
+//
+#ifndef PCGUID_DEFINED
+#define PCGUID_DEFINED
+typedef const GUID* PCGUID;
+#endif
 
 // ============================================================================
 // POOL TAGS

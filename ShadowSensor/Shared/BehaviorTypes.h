@@ -747,5 +747,3 @@ const wchar_t* AttackStageToString(ATTACK_CHAIN_STAGE stage);
 #ifdef __cplusplus
 }
 #endif
-
-#endif // SHADOWSTRIKE_BEHAVIOR_TYPES_H
