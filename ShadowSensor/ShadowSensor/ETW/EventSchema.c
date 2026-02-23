@@ -54,6 +54,25 @@
 #include "../Utilities/StringUtils.h"
 #include <ntstrsafe.h>
 
+//
+// FLOAT, DOUBLE, FILETIME, SYSTEMTIME are not declared in WDK kernel
+// headers. Define their sizes explicitly for the ETW type-size table.
+// va_copy may not be available in MSVC C mode; define a fallback.
+//
+#define ES_SIZEOF_FLOAT         4   // IEEE 754 single-precision
+#define ES_SIZEOF_DOUBLE        8   // IEEE 754 double-precision
+#define ES_SIZEOF_FILETIME      8   // Two ULONG (dwLowDateTime + dwHighDateTime)
+#define ES_SIZEOF_SYSTEMTIME   16   // Eight WORD fields
+
+#ifndef va_copy
+#define va_copy(dest, src) ((dest) = (src))
+#endif
+
+//
+// Maximum length of a value map name (matches ES_VALUE_MAP.Name[] size).
+//
+#define ES_MAX_VALUE_MAP_NAME  ES_MAX_FIELD_NAME
+
 // ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
@@ -175,16 +194,16 @@ static ULONG g_FieldTypeSizes[] = {
     sizeof(INT16),          // EsType_INT16
     sizeof(INT32),          // EsType_INT32
     sizeof(INT64),          // EsType_INT64
-    sizeof(FLOAT),          // EsType_FLOAT
-    sizeof(DOUBLE),         // EsType_DOUBLE
+    ES_SIZEOF_FLOAT,        // EsType_FLOAT
+    ES_SIZEOF_DOUBLE,       // EsType_DOUBLE
     sizeof(UINT8),          // EsType_BOOL
     0,                      // EsType_BINARY (variable)
     0,                      // EsType_ANSISTRING (variable)
     0,                      // EsType_UNICODESTRING (variable)
     sizeof(GUID),           // EsType_GUID
     sizeof(PVOID),          // EsType_POINTER
-    sizeof(FILETIME),       // EsType_FILETIME
-    sizeof(SYSTEMTIME),     // EsType_SYSTEMTIME
+    ES_SIZEOF_FILETIME,     // EsType_FILETIME
+    ES_SIZEOF_SYSTEMTIME,   // EsType_SYSTEMTIME
     0,                      // EsType_SID (variable)
     sizeof(UINT32),         // EsType_HEXINT32
     sizeof(UINT64),         // EsType_HEXINT64
@@ -309,32 +328,6 @@ static NTSTATUS
 EspXmlAppendEscaped(
     _Inout_ PES_XML_CONTEXT Context,
     _In_ PCSTR Str
-);
-
-static NTSTATUS
-EspXmlOpenElement(
-    _Inout_ PES_XML_CONTEXT Context,
-    _In_ PCSTR ElementName
-);
-
-static NTSTATUS
-EspXmlCloseElement(
-    _Inout_ PES_XML_CONTEXT Context,
-    _In_ PCSTR ElementName
-);
-
-static NTSTATUS
-EspXmlAddAttribute(
-    _Inout_ PES_XML_CONTEXT Context,
-    _In_ PCSTR Name,
-    _In_ PCSTR Value
-);
-
-static NTSTATUS
-EspGenerateProviderElement(
-    _In_ PES_SCHEMA Schema,
-    _Inout_ PES_XML_CONTEXT Context,
-    _In_ PES_MANIFEST_OPTIONS Options
 );
 
 static NTSTATUS
@@ -838,7 +831,6 @@ EsRegisterEvent(
     _In_ PCES_EVENT_DEFINITION Event
 )
 {
-    NTSTATUS status = STATUS_SUCCESS;
     PES_EVENT_DEFINITION newEvent = NULL;
     BOOLEAN duplicateFound = FALSE;
     ULONG bucket;
@@ -1094,7 +1086,6 @@ EsUnregisterEvent(
 )
 {
     PES_EVENT_DEFINITION event = NULL;
-    NTSTATUS status;
 
     PAGED_CODE();
 
@@ -2634,7 +2625,6 @@ EsSerializeSchema(
     _Out_ PSIZE_T BufferSize
 )
 {
-    NTSTATUS status = STATUS_SUCCESS;
     SIZE_T totalSize;
     PUCHAR buffer = NULL;
     PUCHAR currentPos;
