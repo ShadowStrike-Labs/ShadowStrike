@@ -44,6 +44,14 @@
 #include "ETWProvider.h"
 #include "../Utilities/MemoryUtils.h"
 
+//
+// MmGetSessionId is exported by ntoskrnl.exe since Windows Vista but
+// not always declared in WDK headers depending on NTDDI_VERSION settings.
+//
+#ifndef MmGetSessionId
+NTKERNELAPI ULONG MmGetSessionId(_In_ PEPROCESS Process);
+#endif
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, EtwProviderInitialize)
 #pragma alloc_text(PAGE, EtwProviderShutdown)
@@ -1695,10 +1703,9 @@ EtwpFillCommonHeader(
     Common->ThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
 
     //
-    // Populate session ID. PsGetCurrentProcessSessionId is safe at
-    // any IRQL <= DISPATCH_LEVEL and does not access paged memory.
+    // Populate session ID via MmGetSessionId. Safe at IRQL <= DISPATCH_LEVEL.
     //
-    sessionId = PsGetCurrentProcessSessionId();
+    sessionId = MmGetSessionId(PsGetCurrentProcess());
     Common->SessionId = sessionId;
     Common->Reserved = 0;
 }
