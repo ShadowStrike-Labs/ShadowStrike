@@ -39,6 +39,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 #include <ntstrsafe.h>
 
@@ -248,6 +249,15 @@ typedef struct _TM_MANAGER {
         volatile LONG64 CoalescedTimers;
         LARGE_INTEGER StartTime;
     } Stats;
+
+    //
+    // Work item drain support — tracks in-flight work items so
+    // TmShutdown can wait for them before freeing timer memory.
+    // KeFlushQueuedDpcs only drains DPCs, not work items queued
+    // by those DPCs via IoQueueWorkItem.
+    //
+    volatile LONG PendingWorkItems;
+    KEVENT AllWorkItemsDrained;
 
     //
     // Configuration

@@ -336,6 +336,12 @@ IRQL:
     mgr->Config.EnableHighResolution = FALSE;
 
     //
+    // Initialize work item drain support
+    //
+    mgr->PendingWorkItems = 0;
+    KeInitializeEvent(&mgr->AllWorkItemsDrained, NotificationEvent, TRUE);
+
+    //
     // Start the wheel timer - runs every TM_WHEEL_RESOLUTION_MS
     //
     dueTime.QuadPart = TM_MS_TO_RELATIVE(TM_WHEEL_RESOLUTION_MS);
@@ -455,9 +461,29 @@ IRQL:
     }
 
     //
-    // Wait for any in-flight DPCs / work items to complete
+    // Wait for any in-flight DPCs to complete.
+    // NOTE: KeFlushQueuedDpcs only drains DPCs — it does NOT wait for
+    // work items that those DPCs may have queued via IoQueueWorkItem.
     //
     KeFlushQueuedDpcs();
+
+    //
+    // Wait for all in-flight work items to complete. DPCs increment
+    // PendingWorkItems before IoQueueWorkItem; TmpWorkItemRoutine
+    // decrements and signals AllWorkItemsDrained when it reaches 0.
+    // Without this, IoFreeWorkItem on an active work item → BSOD.
+    //
+    if (Manager->PendingWorkItems > 0) {
+        LARGE_INTEGER drainTimeout;
+        drainTimeout.QuadPart = TM_SEC_TO_RELATIVE(10);
+        KeWaitForSingleObject(
+            &Manager->AllWorkItemsDrained,
+            Executive,
+            KernelMode,
+            FALSE,
+            &drainTimeout
+            );
+    }
 
     //
     // Now free all timers directly (bypass refcount — we own everything)
@@ -1478,9 +1504,9 @@ TmpReferenceTimer(
     _Inout_ PTM_TIMER_INTERNAL TimerInternal
     )
 {
-    LONG prev = InterlockedIncrement(&TimerInternal->Timer.RefCount);
-    NT_ASSERT(prev >= 2); // Must have been >= 1 before increment
-    UNREFERENCED_PARAMETER(prev);
+    LONG newRef = InterlockedIncrement(&TimerInternal->Timer.RefCount);
+    NT_ASSERT(newRef >= 2); // New value >= 2 means old value was >= 1
+    UNREFERENCED_PARAMETER(newRef);
 }
 
 
@@ -1924,14 +1950,25 @@ Routine Description:
     TmpReferenceTimer(timerInternal);
 
     //
-    // Route to work item for PASSIVE_LEVEL execution if requested
+    // If manager is shutting down, do not queue work items or fire.
+    // TmShutdown will handle cleanup. Release our DPC ref and bail.
+    //
+    if (timerInternal->Manager->ShuttingDown) {
+        TmpDereferenceTimer(timerInternal);
+        return;
+    }
+
+    //
+    // Route to work item for PASSIVE_LEVEL execution if requested.
+    // Increment PendingWorkItems BEFORE IoQueueWorkItem so TmShutdown
+    // knows to wait. TmpWorkItemRoutine will decrement and signal.
     //
     if ((timerInternal->Timer.Flags & TmFlag_WorkItemCallback) &&
         timerInternal->WorkItem != NULL) {
-        //
-        // Queue work item — TmpWorkItemRoutine will call TmpFireTimer
-        // and release the DPC reference when done.
-        //
+
+        InterlockedIncrement(&timerInternal->Manager->PendingWorkItems);
+        KeClearEvent(&timerInternal->Manager->AllWorkItemsDrained);
+
         IoQueueWorkItem(
             timerInternal->WorkItem,
             TmpWorkItemRoutine,
@@ -2078,6 +2115,7 @@ Routine Description:
 --*/
 {
     PTM_TIMER_INTERNAL timerInternal;
+    PTM_MANAGER manager;
 
     UNREFERENCED_PARAMETER(DeviceObject);
 
@@ -2087,10 +2125,28 @@ Routine Description:
         return;
     }
 
+    //
+    // Save manager pointer before TmpDereferenceTimer — the deref may
+    // hit RefCount=0 and free timerInternal, making timerInternal->Manager
+    // a use-after-free. Manager itself is safe because TmShutdown is
+    // blocked on AllWorkItemsDrained until we signal it below.
+    //
+    manager = timerInternal->Manager;
+
     TmpFireTimer(timerInternal);
 
     //
     // Release the reference that was added by the DPC routine
     //
     TmpDereferenceTimer(timerInternal);
+
+    //
+    // Decrement pending work item count. If this was the last in-flight
+    // work item, signal AllWorkItemsDrained so TmShutdown can proceed
+    // safely with IoFreeWorkItem / memory deallocation.
+    //
+    if (InterlockedDecrement(&manager->PendingWorkItems) == 0) {
+        KeSetEvent(&manager->AllWorkItemsDrained,
+                   IO_NO_INCREMENT, FALSE);
+    }
 }
