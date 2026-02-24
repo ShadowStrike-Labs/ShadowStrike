@@ -39,9 +39,19 @@
 #include "CommPort.h"
 #include "../Core/Globals.h"
 #include "../../Shared/SharedDefs.h"
-#include "../../Shared/PortName.h"
 #include "../../Shared/MessageTypes.h"
 #include "../../Shared/ErrorCodes.h"
+
+//
+// Semi-documented kernel API — declared in ntddk.h but may be gated
+// behind version checks in some WDK builds.
+//
+NTKERNELAPI
+HANDLE
+NTAPI
+PsGetProcessInheritedFromUniqueProcessId(
+    _In_ PEPROCESS Process
+    );
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeCreateCommunicationPort)
@@ -89,7 +99,7 @@ static NTSTATUS
 ShadowStrikeValidateInputBuffer(
     _In_reads_bytes_(BufferLength) PVOID Buffer,
     _In_ ULONG BufferLength,
-    _Out_ PSHADOWSTRIKE_MESSAGE_HEADER* Header
+    _Out_ PSHADOWSTRIKE_MESSAGE_HEADER Header
     );
 
 static NTSTATUS
@@ -135,6 +145,139 @@ ShadowStrikeGetProcessImagePath(
     _In_ ULONG BufferSize,
     _Out_ PULONG ActualLength
     );
+
+// ============================================================================
+// INTERNAL HELPER IMPLEMENTATIONS
+// ============================================================================
+
+/**
+ * @brief Validate user-mode input buffer and safely copy message header.
+ *
+ * Probes the buffer, copies the header to a safe kernel location,
+ * and validates magic, version, size consistency.
+ */
+static NTSTATUS
+ShadowStrikeValidateInputBuffer(
+    _In_reads_bytes_(BufferLength) PVOID Buffer,
+    _In_ ULONG BufferLength,
+    _Out_ PSHADOWSTRIKE_MESSAGE_HEADER Header
+    )
+{
+    if (Buffer == NULL || Header == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (BufferLength < sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    //
+    // Safely probe and copy from user-mode buffer
+    //
+    __try {
+        ProbeForRead(Buffer, BufferLength, sizeof(UINT32));
+        RtlCopyMemory(Header, Buffer, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Exception probing input buffer (status=0x%08X)\n",
+                   GetExceptionCode());
+        return STATUS_INVALID_USER_BUFFER;
+    }
+
+    //
+    // Validate magic and version
+    //
+    if (!SHADOWSTRIKE_VALID_MESSAGE_HEADER(Header)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Invalid message header (magic=0x%08X, version=%u)\n",
+                   Header->Magic, Header->Version);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Validate TotalSize does not exceed buffer
+    //
+    if (Header->TotalSize > BufferLength) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Message size mismatch: header=%u, buffer=%u\n",
+                   Header->TotalSize, BufferLength);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Validate DataSize consistency
+    //
+    if (Header->DataSize > Header->TotalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] DataSize exceeds available space\n");
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Get process image path for a given process ID.
+ *
+ * Uses SeLocateProcessImageName to retrieve the full image path,
+ * copies it to the caller-provided buffer with null termination.
+ */
+static NTSTATUS
+ShadowStrikeGetProcessImagePath(
+    _In_ HANDLE ProcessId,
+    _Out_writes_bytes_(BufferSize) PWCHAR Buffer,
+    _In_ ULONG BufferSize,
+    _Out_ PULONG ActualLength
+    )
+{
+    NTSTATUS status;
+    PEPROCESS process = NULL;
+    PUNICODE_STRING imageName = NULL;
+    ULONG copyLength;
+
+    PAGED_CODE();
+
+    if (Buffer == NULL || ActualLength == NULL || BufferSize < sizeof(WCHAR)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *ActualLength = 0;
+    Buffer[0] = L'\0';
+
+    status = PsLookupProcessByProcessId(ProcessId, &process);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SeLocateProcessImageName(process, &imageName);
+    ObDereferenceObject(process);
+
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (imageName == NULL || imageName->Buffer == NULL || imageName->Length == 0) {
+        if (imageName != NULL) {
+            ExFreePool(imageName);
+        }
+        return STATUS_NOT_FOUND;
+    }
+
+    //
+    // Copy as much as fits, always null-terminate
+    //
+    copyLength = imageName->Length;
+    if (copyLength > BufferSize - sizeof(WCHAR)) {
+        copyLength = BufferSize - sizeof(WCHAR);
+    }
+
+    RtlCopyMemory(Buffer, imageName->Buffer, copyLength);
+    Buffer[copyLength / sizeof(WCHAR)] = L'\0';
+    *ActualLength = copyLength + sizeof(WCHAR);
+
+    ExFreePool(imageName);
+    return STATUS_SUCCESS;
+}
 
 // ============================================================================
 // PORT CREATION AND DESTRUCTION
@@ -571,54 +714,14 @@ ShadowStrikeMessageNotify(
     }
 
     //
-    // Validate input buffer size
+    // Validate input buffer and safely copy header
     //
-    if (InputBuffer == NULL || InputBufferLength < sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // Safely copy message header from user-mode buffer
-    //
-    __try {
-        ProbeForRead(InputBuffer, InputBufferLength, sizeof(UINT32));
-        RtlCopyMemory(&localHeader, InputBuffer, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Exception reading input buffer\n");
-        return STATUS_INVALID_USER_BUFFER;
+    status = ShadowStrikeValidateInputBuffer(InputBuffer, InputBufferLength, &localHeader);
+    if (!NT_SUCCESS(status)) {
+        return status;
     }
 
     header = &localHeader;
-
-    //
-    // Validate message header
-    //
-    if (!SHADOWSTRIKE_VALID_MESSAGE_HEADER(header)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Invalid message header (magic=0x%08X, version=%u)\n",
-                   header->Magic, header->Version);
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // Validate that TotalSize matches actual buffer length
-    //
-    if (header->TotalSize > InputBufferLength) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Message size mismatch: header=%u, buffer=%u\n",
-                   header->TotalSize, InputBufferLength);
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // Validate DataSize consistency
-    //
-    if (header->DataSize > header->TotalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] DataSize exceeds available space\n");
-        return STATUS_INVALID_PARAMETER;
-    }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                "[ShadowStrike] Message received: type=%u, id=%llu, slot=%ld\n",
@@ -1147,6 +1250,14 @@ ShadowStrikeSendScanRequest(
     );
 
     //
+    // Update per-client stats BEFORE releasing reference
+    //
+    if (NT_SUCCESS(status)) {
+        InterlockedIncrement64(&clientRef->MessagesSent);
+        InterlockedIncrement64(&clientRef->RepliesReceived);
+    }
+
+    //
     // Release client reference
     //
     ShadowStrikeReleaseClientPort(clientRef);
@@ -1156,8 +1267,6 @@ ShadowStrikeSendScanRequest(
     if (NT_SUCCESS(status)) {
         SHADOWSTRIKE_INC_STAT(MessagesSent);
         SHADOWSTRIKE_INC_STAT(RepliesReceived);
-        InterlockedIncrement64(&clientRef->MessagesSent);
-        InterlockedIncrement64(&clientRef->RepliesReceived);
         *ReplySize = replySize;
     } else if (status == STATUS_TIMEOUT) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
@@ -1212,11 +1321,17 @@ ShadowStrikeSendNotification(
         &timeout
     );
 
+    //
+    // Update per-client stats BEFORE releasing reference
+    //
+    if (NT_SUCCESS(status)) {
+        InterlockedIncrement64(&clientRef->MessagesSent);
+    }
+
     ShadowStrikeReleaseClientPort(clientRef);
 
     if (NT_SUCCESS(status)) {
         SHADOWSTRIKE_INC_STAT(MessagesSent);
-        InterlockedIncrement64(&clientRef->MessagesSent);
     }
 
     return status;
@@ -1457,12 +1572,12 @@ ShadowStrikeClientHasCapability(
 
 PVOID
 ShadowStrikeAllocateMessageBuffer(
-    _In_ SIZE_T Size
+    _In_ ULONG Size
     )
 {
     PSHADOWSTRIKE_MESSAGE_BUFFER_HEADER header = NULL;
-    SIZE_T totalSize;
-    SIZE_T lookasideMaxPayload;
+    ULONG totalSize;
+    ULONG lookasideMaxPayload;
 
     if (Size == 0) {
         return NULL;
@@ -1731,9 +1846,13 @@ ShadowStrikeBuildFileScanRequest(
     }
 
     //
-    // Get session ID
+    // Get session ID from callback data
     //
-    scanRequest->SessionId = PsGetCurrentProcessSessionId();
+    {
+        ULONG sessionId = 0;
+        FltGetRequestorSessionId(Data, &sessionId);
+        scanRequest->SessionId = sessionId;
+    }
 
     scanRequest->FileSize = 0;  // Set in post-create if needed
     scanRequest->FileAttributes = 0;
@@ -1786,10 +1905,13 @@ ShadowStrikeVerifyClient(
     PEPROCESS process = NULL;
     PUNICODE_STRING imageName = NULL;
     BOOLEAN isVerified = FALSE;
+    ULONG hash = 0;
+    USHORT i;
+    USHORT charCount;
 
     PAGED_CODE();
 
-    *Capabilities = ShadowStrikeCapMinimal;
+    *Capabilities = (ULONG)ShadowStrikeCapMinimal;
     RtlZeroMemory(ImageHash, 32);
 
     //
@@ -1820,23 +1942,32 @@ ShadowStrikeVerifyClient(
     // For now, we check if the image name contains "ShadowStrike"
     //
     if (imageName->Buffer != NULL && imageName->Length > 0) {
-        UNICODE_STRING searchString;
-        RtlInitUnicodeString(&searchString, L"ShadowStrike");
 
         //
-        // Simple substring check (case-insensitive would be better)
+        // Ensure null-termination before wcsstr.
+        // SeLocateProcessImageName allocates with space for terminator,
+        // but verify MaximumLength allows it.
         //
-        if (wcsstr(imageName->Buffer, L"ShadowStrike") != NULL ||
-            wcsstr(imageName->Buffer, L"shadowstrike") != NULL) {
-            isVerified = TRUE;
+        charCount = imageName->Length / sizeof(WCHAR);
+        if (imageName->MaximumLength > imageName->Length) {
+            imageName->Buffer[charCount] = L'\0';
         }
 
         //
-        // Compute simple hash of image path for tracking
-        // In production, use SHA-256
+        // Case-insensitive substring check using safe length-bounded comparison.
+        // Only proceed with wcsstr if we confirmed null-termination above.
         //
-        ULONG hash = 0;
-        for (USHORT i = 0; i < imageName->Length / sizeof(WCHAR); i++) {
+        if (imageName->MaximumLength > imageName->Length) {
+            if (wcsstr(imageName->Buffer, L"ShadowStrike") != NULL ||
+                wcsstr(imageName->Buffer, L"shadowstrike") != NULL) {
+                isVerified = TRUE;
+            }
+        }
+
+        //
+        // Compute hash of image path for tracking (DJB2-variant)
+        //
+        for (i = 0; i < charCount; i++) {
             hash = hash * 31 + imageName->Buffer[i];
         }
         RtlCopyMemory(ImageHash, &hash, sizeof(hash));
@@ -1846,11 +1977,11 @@ ShadowStrikeVerifyClient(
     ObDereferenceObject(process);
 
     if (isVerified) {
-        *Capabilities = ShadowStrikeCapServiceDefault;
+        *Capabilities = (ULONG)ShadowStrikeCapServiceDefault;
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                    "[ShadowStrike] Client verified with full capabilities\n");
     } else {
-        *Capabilities = ShadowStrikeCapMinimal;
+        *Capabilities = (ULONG)ShadowStrikeCapMinimal;
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] Client not verified - minimal capabilities\n");
     }

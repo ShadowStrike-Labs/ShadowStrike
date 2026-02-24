@@ -329,22 +329,22 @@ ShadowStrikeSendNotification(
 /**
  * @brief Send process notification to user-mode.
  *
- * @param ProcessId     Target process ID
- * @param ParentId      Parent process ID
- * @param Create        TRUE for creation, FALSE for termination
- * @param ImageName     Process image path (optional)
- * @param CommandLine   Process command line (optional)
- * @return STATUS_SUCCESS if queued successfully.
+ * @param Notification  Pre-built notification buffer.
+ * @param Size          Total size of notification in bytes.
+ * @param RequireReply  If TRUE, wait for verdict reply.
+ * @param Reply         Output verdict reply buffer (optional).
+ * @param ReplySize     In/out reply buffer size (optional).
+ * @return STATUS_SUCCESS if sent successfully.
  *
  * @irql PASSIVE_LEVEL
  */
 NTSTATUS
 ShadowStrikeSendProcessNotification(
-    _In_ HANDLE ProcessId,
-    _In_ HANDLE ParentId,
-    _In_ BOOLEAN Create,
-    _In_opt_ PUNICODE_STRING ImageName,
-    _In_opt_ PUNICODE_STRING CommandLine
+    _In_reads_bytes_(Size) PSHADOWSTRIKE_PROCESS_NOTIFICATION Notification,
+    _In_ ULONG Size,
+    _In_ BOOLEAN RequireReply,
+    _Out_writes_bytes_opt_(*ReplySize) PSHADOWSTRIKE_PROCESS_VERDICT_REPLY Reply,
+    _Inout_opt_ PULONG ReplySize
     );
 
 // ============================================================================
@@ -511,11 +511,9 @@ ShadowStrikeFreeMessageBuffer(
  * @param MessageType  Type of message.
  * @param DataSize     Size of payload data.
  *
- * @return STATUS_SUCCESS on success, STATUS_INVALID_PARAMETER if Header is NULL
- *
  * @irql <= DISPATCH_LEVEL
  */
-NTSTATUS
+VOID
 ShadowStrikeInitMessageHeader(
     _Out_ PSHADOWSTRIKE_MESSAGE_HEADER Header,
     _In_ SHADOWSTRIKE_MESSAGE_TYPE MessageType,
