@@ -94,8 +94,9 @@ typedef enum _MQ_COMPLETION_STATE {
  * - Structure freed when RefCount reaches 0
  *
  * Response buffer:
- * - Response data is copied INTO ResponseData[] under lock
- * - This prevents writing to caller's potentially-freed stack
+ * - ResponseData is dynamically allocated at completion time
+ * - This avoids embedding 64KB per completion from nonpaged pool
+ * - The waiter copies from ResponseData after the event is signaled
  */
 typedef struct _MQ_PENDING_COMPLETION {
     // Validation
@@ -121,12 +122,14 @@ typedef struct _MQ_PENDING_COMPLETION {
 
     // Result
     volatile NTSTATUS CompletionStatus;
-    volatile UINT32 ResponseSize;
 
-    // Response buffer - data copied here under lock
-    // Caller copies from here after wait completes
+    // Response buffer - dynamically allocated based on actual response size
+    // to avoid wasting 64KB of nonpaged pool per blocking message.
+    // ResponseBufferSize: max size the waiter can accept (set at creation)
+    // ResponseSize: actual bytes written by completer (set at completion)
     UINT32 ResponseBufferSize;
-    UINT8 ResponseData[MQ_MAX_RESPONSE_SIZE];
+    volatile UINT32 ResponseSize;
+    PUINT8 ResponseData;    // Dynamically allocated, NULL until response arrives
 } MQ_PENDING_COMPLETION, *PMQ_PENDING_COMPLETION;
 
 // ============================================================================
@@ -234,7 +237,11 @@ MqpIsRunning(
     VOID
     )
 {
-    return (InterlockedCompareExchange(&g_MqGlobals.State, MqState_Running, MqState_Running) == MqState_Running);
+    //
+    // Simple volatile read — a CAS-as-read here would interfere with
+    // shutdown transitions by rewriting MqState_Running back.
+    //
+    return (ReadNoFence((volatile LONG*)&g_MqGlobals.State) == MqState_Running);
 }
 
 // ============================================================================
@@ -452,7 +459,6 @@ MqShutdown(
 {
     ULONG i;
     PLIST_ENTRY entry;
-    PQUEUED_MESSAGE message;
     PMQ_PENDING_COMPLETION completion;
     KIRQL oldIrql;
     LARGE_INTEGER timeout;
@@ -502,44 +508,72 @@ MqShutdown(
     }
 
     //
-    // Cancel all pending completions and release list references
+    // Cancel all pending completions and release list references.
+    // Completions whose waiter already released are collected into
+    // a local list for deferred freeing outside the spinlock.
     //
-    KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
+    {
+        LIST_ENTRY orphanedCompletions;
+        PLIST_ENTRY orphanEntry;
+        PMQ_PENDING_COMPLETION orphanCompletion;
 
-    while (!IsListEmpty(&g_PendingCompletionList)) {
-        entry = RemoveHeadList(&g_PendingCompletionList);
-        completion = CONTAINING_RECORD(entry, MQ_PENDING_COMPLETION, ListEntry);
-        InitializeListHead(&completion->ListEntry);  // Prevent double-remove
-        InterlockedDecrement(&g_PendingCompletionCount);
+        InitializeListHead(&orphanedCompletions);
 
-        //
-        // Mark as cancelled and signal waiter
-        //
-        InterlockedExchange(&completion->State, MqCompletionState_Cancelled);
-        completion->CompletionStatus = STATUS_CANCELLED;
-        KeSetEvent(&completion->CompletionEvent, IO_NO_INCREMENT, FALSE);
+        KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
 
-        //
-        // Release list's reference (waiter still has one)
-        // Cannot call MqpReleasePendingCompletion under spinlock as it may free
-        //
-        if (InterlockedDecrement(&completion->RefCount) == 0) {
+        while (!IsListEmpty(&g_PendingCompletionList)) {
+            entry = RemoveHeadList(&g_PendingCompletionList);
+            completion = CONTAINING_RECORD(entry, MQ_PENDING_COMPLETION, ListEntry);
+            InitializeListHead(&completion->ListEntry);
+            InterlockedDecrement(&g_PendingCompletionCount);
+
             //
-            // Waiter already released - we need to free
-            // But we're under spinlock, so mark for later
+            // Mark as cancelled and signal waiter
             //
-            completion->Magic = 0;  // Invalidate
+            InterlockedExchange(&completion->State, MqCompletionState_Cancelled);
+            completion->CompletionStatus = STATUS_CANCELLED;
+            KeSetEvent(&completion->CompletionEvent, IO_NO_INCREMENT, FALSE);
+
+            //
+            // Release list's reference (waiter still has one).
+            // If refcount hits 0, waiter already released — collect for deferred free.
+            //
+            if (InterlockedDecrement(&completion->RefCount) == 0) {
+                completion->Magic = 0;
+                InsertTailList(&orphanedCompletions, &completion->ListEntry);
+            }
+        }
+
+        //
+        // Track that we need to wait for outstanding completions
+        //
+        if (g_MqGlobals.OutstandingCompletions > 0) {
+            KeClearEvent(&g_MqGlobals.AllCompletionsReleasedEvent);
+        }
+
+        KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
+
+        //
+        // Free orphaned completions outside the spinlock
+        //
+        while (!IsListEmpty(&orphanedCompletions)) {
+            orphanEntry = RemoveHeadList(&orphanedCompletions);
+            orphanCompletion = CONTAINING_RECORD(orphanEntry, MQ_PENDING_COMPLETION, ListEntry);
+
+            if (orphanCompletion->ResponseData != NULL) {
+                ExFreePoolWithTag(orphanCompletion->ResponseData, MQ_POOL_TAG_MESSAGE);
+                orphanCompletion->ResponseData = NULL;
+            }
+
+            if (InterlockedDecrement(&g_MqGlobals.OutstandingCompletions) == 0) {
+                KeSetEvent(&g_MqGlobals.AllCompletionsReleasedEvent, IO_NO_INCREMENT, FALSE);
+            }
+
+            if (g_PendingCompletionLookasideInitialized) {
+                ExFreeToNPagedLookasideList(&g_PendingCompletionLookaside, orphanCompletion);
+            }
         }
     }
-
-    //
-    // Track that we need to wait for outstanding completions
-    //
-    if (g_MqGlobals.OutstandingCompletions > 0) {
-        KeClearEvent(&g_MqGlobals.AllCompletionsReleasedEvent);
-    }
-
-    KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
 
     //
     // Wait for all outstanding completions to be released
@@ -563,23 +597,35 @@ MqShutdown(
 
     //
     // Drain all priority queues
+    // Collect messages to a local list under lock, then free outside lock.
     //
-    for (i = 0; i < MessagePriority_Max; i++) {
-        KeAcquireSpinLock(&g_MqGlobals.Queues[i].Lock, &oldIrql);
+    {
+        LIST_ENTRY drainList;
+        PLIST_ENTRY drainEntry;
+        PQUEUED_MESSAGE drainMessage;
 
-        while (!IsListEmpty(&g_MqGlobals.Queues[i].MessageList)) {
-            entry = RemoveHeadList(&g_MqGlobals.Queues[i].MessageList);
-            message = CONTAINING_RECORD(entry, QUEUED_MESSAGE, ListEntry);
-            InterlockedDecrement(&g_MqGlobals.Queues[i].Count);
+        InitializeListHead(&drainList);
 
-            //
-            // Cannot free under spinlock if using lookaside
-            // Mark as invalid and free after releasing lock
-            //
-            message->Magic = 0;
+        for (i = 0; i < MessagePriority_Max; i++) {
+            KeAcquireSpinLock(&g_MqGlobals.Queues[i].Lock, &oldIrql);
+
+            while (!IsListEmpty(&g_MqGlobals.Queues[i].MessageList)) {
+                entry = RemoveHeadList(&g_MqGlobals.Queues[i].MessageList);
+                InterlockedDecrement(&g_MqGlobals.Queues[i].Count);
+                InsertTailList(&drainList, entry);
+            }
+
+            KeReleaseSpinLock(&g_MqGlobals.Queues[i].Lock, oldIrql);
         }
 
-        KeReleaseSpinLock(&g_MqGlobals.Queues[i].Lock, oldIrql);
+        //
+        // Now free all collected messages outside any spinlock
+        //
+        while (!IsListEmpty(&drainList)) {
+            drainEntry = RemoveHeadList(&drainList);
+            drainMessage = CONTAINING_RECORD(drainEntry, QUEUED_MESSAGE, ListEntry);
+            MqpFreeMessageInternal(drainMessage);
+        }
     }
 
     g_MqGlobals.TotalMessageCount = 0;
@@ -694,7 +740,6 @@ MqEnqueueMessage(
     LONG currentDepth;
     LONG newDepth;
     LONG maxDepth;
-    BOOLEAN slotReserved = FALSE;
 
     //
     // Initialize output
@@ -736,7 +781,6 @@ MqEnqueueMessage(
         // High priority - always succeeds, just increment
         //
         InterlockedIncrement(&g_MqGlobals.TotalMessageCount);
-        slotReserved = TRUE;
     } else {
         //
         // Normal/Low priority - must reserve slot atomically
@@ -749,8 +793,6 @@ MqEnqueueMessage(
             }
             newDepth = currentDepth + 1;
         } while (InterlockedCompareExchange(&g_MqGlobals.TotalMessageCount, newDepth, currentDepth) != currentDepth);
-
-        slotReserved = TRUE;
     }
 
     //
@@ -1041,13 +1083,12 @@ MqEnqueueMessageAndWait(
     }
 
     //
-    // Handle wait result
+    // Handle wait result.
+    // Read the completion state atomically. Using ReadNoFence on the
+    // volatile LONG is sufficient here — the KeWaitForSingleObject
+    // return already provides the acquire barrier.
     //
-    completionState = (MQ_COMPLETION_STATE)InterlockedCompareExchange(
-        &pendingCompletion->State,
-        pendingCompletion->State,
-        pendingCompletion->State
-    );
+    completionState = (MQ_COMPLETION_STATE)ReadNoFence(&pendingCompletion->State);
 
     if (status == STATUS_SUCCESS && completionState == MqCompletionState_Completed) {
         //
@@ -1349,23 +1390,42 @@ MqCompleteMessage(
     }
 
     //
-    // Copy response data into completion structure under lock
-    // This is safe because completion is reference-counted
+    // Dynamically allocate response buffer and copy response data.
+    // This avoids embedding 64KB in every completion structure.
     //
-    KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
-
     if (ResponseData != NULL && ResponseSize > 0) {
         copySize = min(ResponseSize, completion->ResponseBufferSize);
         copySize = min(copySize, MQ_MAX_RESPONSE_SIZE);
-        RtlCopyMemory(completion->ResponseData, ResponseData, copySize);
-        completion->ResponseSize = copySize;
+
+        PUINT8 responseBuf = (PUINT8)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, copySize, MQ_POOL_TAG_MESSAGE);
+
+        if (responseBuf != NULL) {
+            RtlCopyMemory(responseBuf, ResponseData, copySize);
+
+            KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
+            completion->ResponseData = responseBuf;
+            completion->ResponseSize = copySize;
+            completion->CompletionStatus = Status;
+            KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
+        } else {
+            //
+            // Allocation failed — complete with error status but no response data
+            //
+            MQ_LOG_ERROR("Failed to allocate %u byte response buffer for message %llu",
+                         copySize, (unsigned long long)MessageId);
+            KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
+            completion->ResponseData = NULL;
+            completion->ResponseSize = 0;
+            completion->CompletionStatus = STATUS_INSUFFICIENT_RESOURCES;
+            KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
+        }
     } else {
+        KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
         completion->ResponseSize = 0;
+        completion->CompletionStatus = Status;
+        KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
     }
-
-    completion->CompletionStatus = Status;
-
-    KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
 
     //
     // Signal completion event
@@ -1752,7 +1812,7 @@ MqpAllocateMessage(
         //
         // Direct allocation for larger messages
         //
-        message = (PQUEUED_MESSAGE)ExAllocatePoolZero(NonPagedPoolNx, allocSize, MQ_POOL_TAG_MESSAGE);
+        message = (PQUEUED_MESSAGE)ExAllocatePool2(POOL_FLAG_NON_PAGED, allocSize, MQ_POOL_TAG_MESSAGE);
         if (message != NULL) {
             message->AllocSource = MqAllocSource_Pool;
         }
@@ -1945,9 +2005,14 @@ MqpReleasePendingCompletion(
 
     if (newRefCount == 0) {
         //
-        // Last reference - free the structure
+        // Last reference - free response buffer and the structure
         //
         Completion->Magic = 0;  // Invalidate
+
+        if (Completion->ResponseData != NULL) {
+            ExFreePoolWithTag(Completion->ResponseData, MQ_POOL_TAG_MESSAGE);
+            Completion->ResponseData = NULL;
+        }
 
         //
         // Update outstanding completion count
@@ -2071,6 +2136,11 @@ MqpCleanupExpiredCompletions(
     UINT64 currentTime = MqpGetCurrentTimeMs();
     UINT64 timeout = MQ_COMPLETION_TIMEOUT_DEFAULT;
     LONG previousState;
+    LIST_ENTRY expiredList;
+    PLIST_ENTRY expiredEntry;
+    PMQ_PENDING_COMPLETION expiredCompletion;
+
+    InitializeListHead(&expiredList);
 
     KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
 
@@ -2096,10 +2166,15 @@ MqpCleanupExpiredCompletions(
 
             if (previousState == MqCompletionState_Pending) {
                 //
-                // Successfully transitioned - signal timeout
+                // Successfully transitioned — signal timeout, then remove from
+                // the global list and collect for deferred reference release.
                 //
                 completion->CompletionStatus = STATUS_TIMEOUT;
                 KeSetEvent(&completion->CompletionEvent, IO_NO_INCREMENT, FALSE);
+
+                RemoveEntryList(&completion->ListEntry);
+                InterlockedDecrement(&g_PendingCompletionCount);
+                InsertTailList(&expiredList, &completion->ListEntry);
 
                 MQ_LOG_WARNING("Expired pending completion: id=%llu, age=%llums",
                               (unsigned long long)completion->MessageId,
@@ -2109,6 +2184,17 @@ MqpCleanupExpiredCompletions(
     }
 
     KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
+
+    //
+    // Release list references outside the spinlock.
+    // The waiter still holds its own reference and will free when done.
+    //
+    while (!IsListEmpty(&expiredList)) {
+        expiredEntry = RemoveHeadList(&expiredList);
+        expiredCompletion = CONTAINING_RECORD(expiredEntry, MQ_PENDING_COMPLETION, ListEntry);
+        InitializeListHead(&expiredCompletion->ListEntry);
+        MqpReleasePendingCompletion(expiredCompletion);
+    }
 }
 
 /**
