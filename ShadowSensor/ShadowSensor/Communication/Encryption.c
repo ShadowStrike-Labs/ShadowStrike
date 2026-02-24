@@ -757,12 +757,13 @@ Routine Description:
     KeInitializeSpinLock(&key->NonceLock);
 
     //
-    // Initialize BCrypt key handle
+    // Store algorithm handle reference for temp key creation in encrypt/decrypt.
+    // We deliberately do NOT create a persistent BCrypt key handle here:
+    // the key material is about to be obfuscated, and a persistent handle
+    // would retain the unobfuscated key in BCrypt internal buffers, defeating
+    // the obfuscation scheme. Encrypt/decrypt create ephemeral handles.
     //
-    status = EncpInitializeBCryptKey(Manager, key);
-    if (!NT_SUCCESS(status)) {
-        goto Cleanup;
-    }
+    key->AlgHandle = Manager->AesGcmAlgHandle;
 
     //
     // Set key lifecycle
@@ -946,6 +947,7 @@ Routine Description:
     // Derive key using HKDF
     //
     status = EncHkdfDerive(
+        Manager->HmacAlgHandle,
         deobfuscatedMasterKey,
         ENC_AES_KEY_SIZE_256,
         salt,
@@ -1002,12 +1004,9 @@ Routine Description:
     KeInitializeSpinLock(&key->NonceLock);
 
     //
-    // Initialize BCrypt key handle
+    // Store algorithm handle — no persistent BCrypt key handle (see EncGenerateKey)
     //
-    status = EncpInitializeBCryptKey(Manager, key);
-    if (!NT_SUCCESS(status)) {
-        goto Cleanup;
-    }
+    key->AlgHandle = Manager->AesGcmAlgHandle;
 
     //
     // Set lifecycle
@@ -1205,12 +1204,9 @@ Routine Description:
     KeInitializeSpinLock(&key->NonceLock);
 
     //
-    // Initialize BCrypt key handle
+    // Store algorithm handle — no persistent BCrypt key handle (see EncGenerateKey)
     //
-    status = EncpInitializeBCryptKey(Manager, key);
-    if (!NT_SUCCESS(status)) {
-        goto Cleanup;
-    }
+    key->AlgHandle = Manager->AesGcmAlgHandle;
 
     //
     // Set lifecycle
@@ -1335,6 +1331,9 @@ Routine Description:
 {
     PENC_KEY_INTERNAL keyInternal;
     BOOLEAN wasInList = FALSE;
+    KIRQL oldIrql;
+    LARGE_INTEGER drainDelay;
+    ULONG drainWaitCount;
 
     PAGED_CODE();
 
@@ -1380,7 +1379,6 @@ Routine Description:
     //
     // Clear from active keys if present
     //
-    KIRQL oldIrql;
     KeAcquireSpinLock(&Manager->ActiveKeysLock, &oldIrql);
     for (ULONG i = 0; i < EncKeyType_Max; i++) {
         if (Manager->ActiveKeys[i] == Key) {
@@ -1388,6 +1386,25 @@ Routine Description:
         }
     }
     KeReleaseSpinLock(&Manager->ActiveKeysLock, oldIrql);
+
+    //
+    // Drain in-flight references before freeing.
+    // After marking IsBeingDestroyed and removing from all lists,
+    // no new AddRefs can succeed. Wait for existing holders to release.
+    //
+    drainDelay.QuadPart = -10000LL;  // 1ms
+    drainWaitCount = 0;
+
+    while (ReadNoFence(&Key->RefCount) > 0) {
+        if (++drainWaitCount > 5000) {
+            //
+            // 5 second timeout — break to avoid driver hang.
+            // Remaining refs are leaked encrypt/decrypt operations.
+            //
+            break;
+        }
+        KeDelayExecutionThread(KernelMode, FALSE, &drainDelay);
+    }
 
     //
     // Cleanup BCrypt handles
@@ -1441,9 +1458,7 @@ EncGetActiveKey(
 
     KeAcquireSpinLock(&Manager->ActiveKeysLock, &oldIrql);
     key = Manager->ActiveKeys[KeyType];
-    if (key != NULL && !key->IsBeingDestroyed) {
-        EncKeyAddRef(key);
-    } else {
+    if (key != NULL && !EncKeyAddRef(key)) {
         key = NULL;
     }
     KeReleaseSpinLock(&Manager->ActiveKeysLock, oldIrql);
@@ -1475,7 +1490,14 @@ EncSetActiveKey(
 
     oldKey = Manager->ActiveKeys[KeyType];
     Manager->ActiveKeys[KeyType] = Key;
-    EncKeyAddRef(Key);
+    if (!EncKeyAddRef(Key)) {
+        //
+        // Key is being destroyed — cannot set as active
+        //
+        Manager->ActiveKeys[KeyType] = oldKey;
+        KeReleaseSpinLock(&Manager->ActiveKeysLock, oldIrql);
+        return STATUS_UNSUCCESSFUL;
+    }
 
     KeReleaseSpinLock(&Manager->ActiveKeysLock, oldIrql);
 
@@ -1491,14 +1513,35 @@ EncSetActiveKey(
 
 
 _Use_decl_annotations_
-VOID
+BOOLEAN
 EncKeyAddRef(
     _In_ PENC_KEY Key
     )
 {
-    if (Key != NULL && !Key->IsBeingDestroyed) {
-        InterlockedIncrement(&Key->RefCount);
+    LONG oldRef;
+    LONG newRef;
+
+    if (Key == NULL) {
+        return FALSE;
     }
+
+    //
+    // CAS loop: atomically check IsBeingDestroyed and increment RefCount.
+    // This eliminates the TOCTOU window between checking the flag and
+    // modifying the counter.
+    //
+    do {
+        oldRef = ReadNoFence(&Key->RefCount);
+
+        if (oldRef <= 0 || Key->IsBeingDestroyed) {
+            return FALSE;
+        }
+
+        newRef = oldRef + 1;
+
+    } while (InterlockedCompareExchange(&Key->RefCount, newRef, oldRef) != oldRef);
+
+    return TRUE;
 }
 
 
@@ -1595,7 +1638,9 @@ Routine Description:
     //
     if (Options != NULL && Options->Key != NULL) {
         key = Options->Key;
-        EncKeyAddRef(key);
+        if (!EncKeyAddRef(key)) {
+            return STATUS_ENCRYPTION_FAILED;
+        }
     } else {
         key = EncGetActiveKey(Manager, KeyType);
         if (key == NULL) {
@@ -1846,7 +1891,9 @@ Routine Description:
     //
     if (Options != NULL && Options->Key != NULL) {
         key = Options->Key;
-        EncKeyAddRef(key);
+        if (!EncKeyAddRef(key)) {
+            return STATUS_DECRYPTION_FAILED;
+        }
     } else {
         KeEnterCriticalRegion();
         ExAcquireResourceSharedLite(&Manager->KeyListLock, TRUE);
@@ -1856,9 +1903,8 @@ Routine Description:
              entry = entry->Flink) {
 
             PENC_KEY candidate = CONTAINING_RECORD(entry, ENC_KEY, ListEntry);
-            if (candidate->KeyId == localHeader.KeyId && !candidate->IsBeingDestroyed) {
+            if (candidate->KeyId == localHeader.KeyId && EncKeyAddRef(candidate)) {
                 key = candidate;
-                EncKeyAddRef(key);
                 break;
             }
         }
@@ -2034,7 +2080,10 @@ EncCreateContext(
     RtlZeroMemory(ctx, sizeof(ENC_CONTEXT));
 
     ctx->CurrentKey = Key;
-    EncKeyAddRef(Key);
+    if (!EncKeyAddRef(Key)) {
+        ShadowStrikeFreePoolWithTag(ctx, ENC_POOL_TAG_CONTEXT);
+        return STATUS_UNSUCCESSFUL;
+    }
 
     ctx->Algorithm = Key->Algorithm;
     ctx->Flags = Flags;
@@ -2569,6 +2618,7 @@ EncConstantTimeCompare(
 _Use_decl_annotations_
 NTSTATUS
 EncHmacSha256(
+    _In_opt_ BCRYPT_ALG_HANDLE HmacAlgHandle,
     _In_reads_bytes_(KeySize) PVOID Key,
     _In_ ULONG KeySize,
     _In_reads_bytes_(DataSize) PVOID Data,
@@ -2577,7 +2627,8 @@ EncHmacSha256(
     )
 {
     NTSTATUS status;
-    BCRYPT_ALG_HANDLE algHandle = NULL;
+    BCRYPT_ALG_HANDLE localAlgHandle = NULL;
+    BCRYPT_ALG_HANDLE algToUse;
     BCRYPT_HASH_HANDLE hashHandle = NULL;
     ULONG hashLength;
     ULONG resultLength;
@@ -2589,24 +2640,30 @@ EncHmacSha256(
     }
 
     //
-    // Open HMAC-SHA256 provider
+    // Use pre-opened handle if available, otherwise open a new one (slow path)
     //
-    status = BCryptOpenAlgorithmProvider(
-        &algHandle,
-        BCRYPT_SHA256_ALGORITHM,
-        NULL,
-        BCRYPT_ALG_HANDLE_HMAC_FLAG
-        );
+    if (HmacAlgHandle != NULL) {
+        algToUse = HmacAlgHandle;
+    } else {
+        status = BCryptOpenAlgorithmProvider(
+            &localAlgHandle,
+            BCRYPT_SHA256_ALGORITHM,
+            NULL,
+            BCRYPT_ALG_HANDLE_HMAC_FLAG
+            );
 
-    if (!NT_SUCCESS(status)) {
-        return status;
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        algToUse = localAlgHandle;
     }
 
     //
     // Create hash object
     //
     status = BCryptCreateHash(
-        algHandle,
+        algToUse,
         &hashHandle,
         NULL,
         0,
@@ -2616,8 +2673,7 @@ EncHmacSha256(
         );
 
     if (!NT_SUCCESS(status)) {
-        BCryptCloseAlgorithmProvider(algHandle, 0);
-        return status;
+        goto Cleanup;
     }
 
     //
@@ -2625,16 +2681,14 @@ EncHmacSha256(
     //
     status = BCryptHashData(hashHandle, (PUCHAR)Data, DataSize, 0);
     if (!NT_SUCCESS(status)) {
-        BCryptDestroyHash(hashHandle);
-        BCryptCloseAlgorithmProvider(algHandle, 0);
-        return status;
+        goto Cleanup;
     }
 
     //
     // Get hash length
     //
     status = BCryptGetProperty(
-        algHandle,
+        algToUse,
         BCRYPT_HASH_LENGTH,
         (PUCHAR)&hashLength,
         sizeof(hashLength),
@@ -2643,9 +2697,8 @@ EncHmacSha256(
         );
 
     if (!NT_SUCCESS(status) || hashLength != 32) {
-        BCryptDestroyHash(hashHandle);
-        BCryptCloseAlgorithmProvider(algHandle, 0);
-        return STATUS_INTERNAL_ERROR;
+        status = STATUS_INTERNAL_ERROR;
+        goto Cleanup;
     }
 
     //
@@ -2653,8 +2706,14 @@ EncHmacSha256(
     //
     status = BCryptFinishHash(hashHandle, Hmac, 32, 0);
 
-    BCryptDestroyHash(hashHandle);
-    BCryptCloseAlgorithmProvider(algHandle, 0);
+Cleanup:
+    if (hashHandle != NULL) {
+        BCryptDestroyHash(hashHandle);
+    }
+
+    if (localAlgHandle != NULL) {
+        BCryptCloseAlgorithmProvider(localAlgHandle, 0);
+    }
 
     return status;
 }
@@ -2663,6 +2722,7 @@ EncHmacSha256(
 _Use_decl_annotations_
 NTSTATUS
 EncHkdfDerive(
+    _In_opt_ BCRYPT_ALG_HANDLE HmacAlgHandle,
     _In_reads_bytes_(IKMSize) PVOID IKM,
     _In_ ULONG IKMSize,
     _In_reads_bytes_opt_(SaltSize) PVOID Salt,
@@ -2704,6 +2764,7 @@ Routine Description:
     // HKDF-Extract: PRK = HMAC-Hash(salt, IKM)
     //
     status = EncHmacSha256(
+        HmacAlgHandle,
         (Salt != NULL && SaltSize > 0) ? Salt : defaultSalt,
         (Salt != NULL && SaltSize > 0) ? SaltSize : sizeof(defaultSalt),
         IKM,
@@ -2746,7 +2807,7 @@ Routine Description:
         //
         // T(N) = HMAC(PRK, input)
         //
-        status = EncHmacSha256(prk, sizeof(prk), hmacInput, hmacInputLen, t);
+        status = EncHmacSha256(HmacAlgHandle, prk, sizeof(prk), hmacInput, hmacInputLen, t);
         if (!NT_SUCCESS(status)) {
             EncSecureClear(prk, sizeof(prk));
             EncSecureClear(t, sizeof(t));

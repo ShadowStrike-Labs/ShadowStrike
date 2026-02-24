@@ -474,9 +474,10 @@ EncSetActiveKey(
 
 //
 // Add/release key reference
+// EncKeyAddRef returns TRUE if reference was acquired, FALSE if key is being destroyed
 //
 _IRQL_requires_max_(DISPATCH_LEVEL)
-VOID
+BOOLEAN
 EncKeyAddRef(
     _In_ PENC_KEY Key
     );
@@ -682,11 +683,14 @@ EncConstantTimeCompare(
 
 //
 // Calculate HMAC-SHA256
+// Pass a pre-opened HmacAlgHandle to avoid per-call BCryptOpenAlgorithmProvider overhead.
+// If HmacAlgHandle is NULL, opens and closes a provider internally (slow path).
 //
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 EncHmacSha256(
+    _In_opt_ BCRYPT_ALG_HANDLE HmacAlgHandle,
     _In_reads_bytes_(KeySize) PVOID Key,
     _In_ ULONG KeySize,
     _In_reads_bytes_(DataSize) PVOID Data,
@@ -696,11 +700,14 @@ EncHmacSha256(
 
 //
 // HKDF key derivation
+// Pass a pre-opened HmacAlgHandle for efficient HMAC operations.
+// If HmacAlgHandle is NULL, each HMAC call opens a new provider (slow path).
 //
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 EncHkdfDerive(
+    _In_opt_ BCRYPT_ALG_HANDLE HmacAlgHandle,
     _In_reads_bytes_(IKMSize) PVOID IKM,
     _In_ ULONG IKMSize,
     _In_reads_bytes_opt_(SaltSize) PVOID Salt,
