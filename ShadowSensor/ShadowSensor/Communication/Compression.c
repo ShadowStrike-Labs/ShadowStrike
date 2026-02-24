@@ -49,6 +49,14 @@
 #include "Compression.h"
 #include "../Utilities/MemoryUtils.h"
 
+//
+// Forward declaration required before alloc_text pragma
+//
+static VOID
+ComppDestroyDictionaryInternal(
+    _Inout_ PCOMP_DICTIONARY Dictionary
+    );
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, CompInitialize)
 #pragma alloc_text(PAGE, CompShutdown)
@@ -235,8 +243,8 @@ ComppQueueDeferredDictionaryCleanup(
     //
     // Allocate cleanup structure from NonPaged pool (we're at elevated IRQL)
     //
-    Cleanup = (PCOMP_DEFERRED_CLEANUP)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    Cleanup = (PCOMP_DEFERRED_CLEANUP)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(COMP_DEFERRED_CLEANUP),
         COMP_POOL_TAG_CONTEXT
     );
@@ -273,11 +281,6 @@ ComppQueueDeferredDictionaryCleanup(
 //=============================================================================
 // Forward Declarations - Internal Helpers
 //=============================================================================
-
-static VOID
-ComppDestroyDictionaryInternal(
-    _Inout_ PCOMP_DICTIONARY Dictionary
-    );
 
 static PCOMP_MANAGER
 ComppAcquireManager(
@@ -396,7 +399,7 @@ ComppReleaseManager(
 
 static ULONG
 ComppCalculateCrc32(
-    _In_reads_bytes_(Size) const PVOID Data,
+    _In_reads_bytes_(Size) const VOID* Data,
     _In_ ULONG Size
     );
 
@@ -418,17 +421,17 @@ ComppWriteLE16(
 
 static FORCEINLINE USHORT
 ComppReadLE16(
-    _In_reads_bytes_(2) const PVOID Ptr
+    _In_reads_bytes_(2) const VOID* Ptr
     );
 
 static FORCEINLINE ULONG
 ComppRead32(
-    _In_reads_bytes_(4) const PVOID Ptr
+    _In_reads_bytes_(4) const VOID* Ptr
     );
 
 static FORCEINLINE ULONG64
 ComppRead64(
-    _In_reads_bytes_(8) const PVOID Ptr
+    _In_reads_bytes_(8) const VOID* Ptr
     );
 
 static FORCEINLINE ULONG
@@ -487,7 +490,7 @@ ComppDecompressSafe(
  */
 static ULONG
 ComppCalculateCrc32(
-    _In_reads_bytes_(Size) const PVOID Data,
+    _In_reads_bytes_(Size) const VOID* Data,
     _In_ ULONG Size
     )
 {
@@ -544,7 +547,7 @@ ComppWriteLE16(
  */
 static FORCEINLINE USHORT
 ComppReadLE16(
-    _In_reads_bytes_(2) const PVOID Ptr
+    _In_reads_bytes_(2) const VOID* Ptr
     )
 {
     const UCHAR* p = (const UCHAR*)Ptr;
@@ -556,7 +559,7 @@ ComppReadLE16(
  */
 static FORCEINLINE ULONG
 ComppRead32(
-    _In_reads_bytes_(4) const PVOID Ptr
+    _In_reads_bytes_(4) const VOID* Ptr
     )
 {
     ULONG Value;
@@ -569,7 +572,7 @@ ComppRead32(
  */
 static FORCEINLINE ULONG64
 ComppRead64(
-    _In_reads_bytes_(8) const PVOID Ptr
+    _In_reads_bytes_(8) const VOID* Ptr
     )
 {
     ULONG64 Value;
@@ -688,7 +691,6 @@ ComppCompressGeneric(
 
     UCHAR* Op = (UCHAR*)Dest;
     UCHAR* OLimit = Op + MaxOutputSize;
-    UCHAR* Token;
 
     ULONG* HashTable = State->HashTable;
     ULONG StepSize;
@@ -1764,13 +1766,24 @@ CompShutdown(
     }
 
     //
-    // Wait for all references to be released
-    // This is a simple spin-wait; in production consider using an event
+    // Wait for all references to be released with bounded timeout
+    // to prevent infinite hang if reference leak occurs
     //
-    while (InterlockedCompareExchange(&Manager->RefCount, 0, 0) > 0) {
-        LARGE_INTEGER Delay;
-        Delay.QuadPart = -10000;  // 1ms
-        KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+    {
+        ULONG WaitIterations = 0;
+        const ULONG MaxWaitIterations = 5000;  // 5 seconds max at 1ms per iteration
+
+        while (InterlockedCompareExchange(&Manager->RefCount, 0, 0) > 0) {
+            LARGE_INTEGER Delay;
+
+            if (++WaitIterations > MaxWaitIterations) {
+                NT_ASSERT(FALSE && "CompShutdown: RefCount drain timeout - possible reference leak");
+                break;
+            }
+
+            Delay.QuadPart = -10000;  // 1ms
+            KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+        }
     }
 
     //
@@ -1877,7 +1890,7 @@ CompGetBound(
     //
     // Check for overflow in final calculation
     //
-    if (InputSize > ULONG_MAX - LZ4Overhead - sizeof(COMP_HEADER)) {
+    if (InputSize > (ULONG)-1 - LZ4Overhead - sizeof(COMP_HEADER)) {
         return 0;  // Overflow would occur
     }
 
@@ -1990,6 +2003,9 @@ CompCompress(
     // Check output buffer size
     //
     MaxCompressedSize = CompGetBound(InputSize, Algorithm);
+    if (MaxCompressedSize == 0) {
+        return STATUS_INVALID_PARAMETER;  // CompGetBound failed (input too large)
+    }
     if (OutputSize < MaxCompressedSize) {
         return STATUS_BUFFER_TOO_SMALL;
     }
@@ -2299,7 +2315,10 @@ CompCreateContext(
     Ctx->Acceleration = LZ4_ACCELERATION_DEFAULT;
     Ctx->Flags = CompFlag_Checksum;
 
-    KeInitializeSpinLock(&Ctx->Lock);
+    //
+    // EX_SPIN_LOCK is zero-initialized by RtlZeroMemory above.
+    // Do NOT use KeInitializeSpinLock (wrong type for EX_SPIN_LOCK).
+    //
 
     //
     // Allocate internal state based on algorithm
@@ -2371,8 +2390,12 @@ CompDestroyContext(
         ShadowStrikeFreePoolWithTag(Context->WorkBuffer, COMP_POOL_TAG_BUFFER);
     }
 
-    if (Context->Dictionary != NULL) {
-        ShadowStrikeFreePoolWithTag(Context->Dictionary, COMP_POOL_TAG_DICT);
+    //
+    // Release dictionary reference if held (refcounted - do NOT pool-free)
+    //
+    if (Context->DictionaryRef != NULL) {
+        CompDictionaryRelease(Context->DictionaryRef);
+        Context->DictionaryRef = NULL;
     }
 
     ShadowStrikeFreePoolWithTag(Context, COMP_POOL_TAG_CONTEXT);
@@ -3352,6 +3375,10 @@ CompDecompressInPlace(
     }
 
     OriginalSize = Header->OriginalSize;
+
+    if (OriginalSize > COMP_MAX_INPUT_SIZE) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     if (BufferSize < OriginalSize) {
         return STATUS_BUFFER_TOO_SMALL;

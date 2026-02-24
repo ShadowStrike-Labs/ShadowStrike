@@ -38,10 +38,10 @@
 
 #include "CommPort.h"
 #include "../Core/Globals.h"
-#include "../Shared/SharedDefs.h"
-#include "../Shared/PortName.h"
-#include "../Shared/MessageTypes.h"
-#include "../Shared/ErrorCodes.h"
+#include "../../Shared/SharedDefs.h"
+#include "../../Shared/PortName.h"
+#include "../../Shared/MessageTypes.h"
+#include "../../Shared/ErrorCodes.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeCreateCommunicationPort)
