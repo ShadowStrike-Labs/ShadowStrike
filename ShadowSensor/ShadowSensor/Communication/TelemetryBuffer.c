@@ -60,6 +60,14 @@
 
 #include "TelemetryBuffer.h"
 
+//
+// MmGetSessionId is exported by ntoskrnl.exe since Windows Vista but
+// not always declared in WDK headers depending on NTDDI_VERSION settings.
+//
+#ifndef MmGetSessionId
+NTKERNELAPI ULONG MmGetSessionId(_In_ PEPROCESS Process);
+#endif
+
 // ============================================================================
 // INTERNAL CONSTANTS
 // ============================================================================
@@ -250,7 +258,7 @@ TbpGetSessionId(
     ULONG sessionId = 0;
 
     if (process != NULL) {
-        sessionId = PsGetProcessSessionId(process);
+        sessionId = MmGetSessionId(process);
     }
 
     return sessionId;
@@ -1607,6 +1615,8 @@ TbDequeue(
 
     PAGED_CODE();
 
+    UNREFERENCED_PARAMETER(Options);
+
     *BytesReturned = 0;
     *EntriesReturned = 0;
 
@@ -2228,7 +2238,7 @@ TbRegisterOverflowCallback(
 
     ExAcquirePushLockExclusive(&Manager->OverflowCallbackLock);
 
-    Manager->OverflowCallback = Callback;
+    Manager->OverflowCallback = (PVOID)Callback;
     Manager->OverflowCallbackContext = Context;
 
     ExReleasePushLockExclusive(&Manager->OverflowCallbackLock);

@@ -43,6 +43,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 
 //=============================================================================
@@ -276,7 +277,7 @@ typedef struct _TB_ENTRY_HEADER {
     ULONG Reserved;
 } TB_ENTRY_HEADER, *PTB_ENTRY_HEADER;
 
-C_ASSERT(sizeof(TB_ENTRY_HEADER) == 80);
+C_ASSERT(sizeof(TB_ENTRY_HEADER) == 84);
 
 #define TB_ENTRY_SIGNATURE  'HBET'
 
@@ -304,9 +305,9 @@ typedef struct _TB_RING_BUFFER {
     //
     // Producer/Consumer indices (cache-line aligned)
     //
-    volatile LONG64 ProducerIndex __declspec(align(64));
-    volatile LONG64 ConsumerIndex __declspec(align(64));
-    volatile LONG64 CommittedCount __declspec(align(64));  // Number of committed slots
+    DECLSPEC_ALIGN(64) volatile LONG64 ProducerIndex;
+    DECLSPEC_ALIGN(64) volatile LONG64 ConsumerIndex;
+    DECLSPEC_ALIGN(64) volatile LONG64 CommittedCount;  // Number of committed slots
 
     //
     // Buffer state
