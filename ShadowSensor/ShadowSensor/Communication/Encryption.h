@@ -43,7 +43,9 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
+#include <ntintsafe.h>
 #include <bcrypt.h>
 #include <ntstrsafe.h>
 

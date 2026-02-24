@@ -425,6 +425,7 @@ Routine Description:
     //
     InitializeListHead(&keysToFree);
 
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
 
     while (!IsListEmpty(&Manager->KeyList)) {
@@ -438,6 +439,7 @@ Routine Description:
     RtlZeroMemory(Manager->ActiveKeys, sizeof(Manager->ActiveKeys));
 
     ExReleaseResourceLite(&Manager->KeyListLock);
+    KeLeaveCriticalRegion();
 
     //
     // Destroy all keys outside of lock
@@ -792,10 +794,12 @@ Routine Description:
     //
     // Add to key list under exclusive lock
     //
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
     InsertTailList(&Manager->KeyList, &key->ListEntry);
     Manager->KeyCount++;
     ExReleaseResourceLite(&Manager->KeyListLock);
+    KeLeaveCriticalRegion();
 
     *Key = key;
 
@@ -1031,10 +1035,12 @@ Routine Description:
     //
     // Add to key list
     //
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
     InsertTailList(&Manager->KeyList, &key->ListEntry);
     Manager->KeyCount++;
     ExReleaseResourceLite(&Manager->KeyListLock);
+    KeLeaveCriticalRegion();
 
     //
     // Clear salt
@@ -1232,10 +1238,12 @@ Routine Description:
     //
     // Add to key list
     //
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
     InsertTailList(&Manager->KeyList, &key->ListEntry);
     Manager->KeyCount++;
     ExReleaseResourceLite(&Manager->KeyListLock);
+    KeLeaveCriticalRegion();
 
     *Key = key;
 
@@ -1355,6 +1363,7 @@ Routine Description:
     // Remove from list under exclusive lock BEFORE freeing
     //
     if (!Key->RemovedFromList) {
+        KeEnterCriticalRegion();
         ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
 
         if (!Key->RemovedFromList) {
@@ -1365,6 +1374,7 @@ Routine Description:
         }
 
         ExReleaseResourceLite(&Manager->KeyListLock);
+        KeLeaveCriticalRegion();
     }
 
     //
@@ -1656,7 +1666,11 @@ Routine Description:
     RtlCopyMemory(header->Nonce, nonce, ENC_GCM_NONCE_SIZE);
     header->KeyId = key->KeyId;
     header->AADSize = (Options != NULL) ? Options->AADSize : 0;
-    KeQuerySystemTimePrecise(&header->Timestamp);
+    {
+        LARGE_INTEGER encTimestamp;
+        KeQuerySystemTimePrecise(&encTimestamp);
+        RtlCopyMemory(&header->Timestamp, &encTimestamp, sizeof(LARGE_INTEGER));
+    }
 
     ciphertext = (PUCHAR)Output + sizeof(ENC_HEADER);
 
@@ -1834,6 +1848,7 @@ Routine Description:
         key = Options->Key;
         EncKeyAddRef(key);
     } else {
+        KeEnterCriticalRegion();
         ExAcquireResourceSharedLite(&Manager->KeyListLock, TRUE);
 
         for (entry = Manager->KeyList.Flink;
@@ -1849,6 +1864,7 @@ Routine Description:
         }
 
         ExReleaseResourceLite(&Manager->KeyListLock);
+        KeLeaveCriticalRegion();
 
         if (key == NULL) {
             return STATUS_DECRYPTION_FAILED;
@@ -2357,6 +2373,14 @@ EncSetAutoRotation(
         return STATUS_INVALID_DEVICE_STATE;
     }
 
+    //
+    // Validate IntervalSeconds to prevent overflow in ms conversion
+    // KeSetTimerEx period is LONG (max 2147483647 ms ≈ 24.8 days)
+    //
+    if (Enable && IntervalSeconds > 2147483) {
+        return STATUS_INTEGER_OVERFLOW;
+    }
+
     Manager->RotationIntervalSeconds = IntervalSeconds;
     Manager->Config.KeyExpirationSeconds = IntervalSeconds;
 
@@ -2368,7 +2392,7 @@ EncSetAutoRotation(
         KeSetTimerEx(
             &Manager->RotationTimer,
             dueTime,
-            IntervalSeconds * 1000,  // Period in ms
+            IntervalSeconds * 1000,  // Period in ms (validated above)
             &Manager->RotationDpc
             );
         Manager->AutoRotationEnabled = TRUE;
@@ -2977,7 +3001,7 @@ Routine Description:
     }
 
     if (Key->ObfuscationKey == NULL) {
-        return STATUS_INVALID_STATE;
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
     ExAcquireFastMutex(&Key->ObfuscationMutex);
