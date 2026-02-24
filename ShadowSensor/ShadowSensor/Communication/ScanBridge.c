@@ -355,7 +355,6 @@ ShadowStrikeScanBridgeInitialize(
     VOID
 )
 {
-    NTSTATUS status = STATUS_SUCCESS;
     ULONG i;
 
     PAGED_CODE();
@@ -460,8 +459,6 @@ ShadowStrikeScanBridgeShutdown(
     VOID
 )
 {
-    LARGE_INTEGER timeout;
-    NTSTATUS waitStatus;
     KIRQL oldIrql;
     LIST_ENTRY localList;
     PLIST_ENTRY entry;
@@ -580,7 +577,6 @@ ShadowStrikeBuildFileScanRequestEx(
     UNICODE_STRING processName = { 0 };
     HANDLE processId;
     ULONG totalSize = 0;
-    ULONG tempSize = 0;
     ULONG filePathLen = 0;
     ULONG processNameLen = 0;
     PUCHAR dataPtr;
@@ -666,7 +662,7 @@ ShadowStrikeBuildFileScanRequestEx(
     //
     // Get process name (best effort)
     //
-    status = ShadowStrikeGetProcessName(processId, &processName);
+    status = ShadowStrikeGetProcessImageName(processId, &processName);
     if (NT_SUCCESS(status) && processName.Buffer != NULL) {
         processNameLen = processName.Length;
         if (processNameLen > SB_MAX_PROCESS_NAME_LENGTH) {
@@ -1248,6 +1244,12 @@ ShadowStrikeSendThreadNotification(
     PAGED_CODE();
 
     //
+    // Create is available for future use when the notification struct
+    // is extended to distinguish thread creation vs termination.
+    //
+    UNREFERENCED_PARAMETER(Create);
+
+    //
     // Check if notifications are enabled
     //
     if (!g_DriverData.Initialized || !g_DriverData.Config.NotificationsEnabled) {
@@ -1417,9 +1419,12 @@ ShadowStrikeSendImageNotification(
     // Get signature information from extended info if available
     //
     if (ImageInfo->ExtendedInfoPresent) {
-        PIMAGE_INFO_EX imageInfoEx = CONTAINING_RECORD(ImageInfo, IMAGE_INFO_EX, ImageInfo);
-        notification->SignatureLevel = imageInfoEx->ImageSignatureLevel;
-        notification->SignatureType = imageInfoEx->ImageSignatureType;
+        //
+        // ImageSignatureLevel and ImageSignatureType are bit fields on
+        // IMAGE_INFO itself (available when ExtendedInfoPresent is set).
+        //
+        notification->SignatureLevel = (UINT8)ImageInfo->ImageSignatureLevel;
+        notification->SignatureType = (UINT8)ImageInfo->ImageSignatureType;
     } else {
         notification->SignatureLevel = 0;
         notification->SignatureType = 0;
@@ -1700,6 +1705,11 @@ ShadowStrikeSendMessageEx(
     PAGED_CODE();
 
     //
+    // Priority is reserved for future priority-based queue routing.
+    //
+    UNREFERENCED_PARAMETER(Priority);
+
+    //
     // Validate parameters
     //
     if (InputBuffer == NULL || InputBufferSize == 0) {
@@ -1753,7 +1763,6 @@ ShadowStrikeAllocateMessageBuffer(
 )
 {
     PSB_BUFFER_HEADER bufferHeader = NULL;
-    PVOID userBuffer = NULL;
     ULONG totalSize;
     ULONG source;
 
@@ -2268,7 +2277,7 @@ SbpSendWithRetry(
     _In_ ULONG MaxRetries
 )
 {
-    NTSTATUS status;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
     PFLT_PORT clientPort;
     LARGE_INTEGER timeout;
     ULONG attempt;

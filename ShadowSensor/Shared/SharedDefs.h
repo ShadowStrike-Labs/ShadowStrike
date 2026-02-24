@@ -235,8 +235,11 @@ typedef enum _SHADOWSTRIKE_FILE_ACCESS_TYPE {
     ShadowStrikeAccessCreate,
     ShadowStrikeAccessRename,
     ShadowStrikeAccessDelete,
+    ShadowStrikeAccessSetInfo,
     ShadowStrikeAccessMax
 } SHADOWSTRIKE_FILE_ACCESS_TYPE;
+
+typedef SHADOWSTRIKE_FILE_ACCESS_TYPE SHADOWSTRIKE_ACCESS_TYPE;
 
 // ============================================================================
 // PRIORITY LEVELS

@@ -69,9 +69,9 @@ extern "C" {
 #endif
 
 #include <fltKernel.h>
-#include "../Shared/MessageProtocol.h"
-#include "../Shared/VerdictTypes.h"
-#include "../Shared/MessageTypes.h"
+#include "../../Shared/MessageProtocol.h"
+#include "../../Shared/VerdictTypes.h"
+#include "../../Shared/MessageTypes.h"
 
 // ============================================================================
 // POOL TAGS
@@ -228,15 +228,19 @@ extern "C" {
 // ERROR CODES
 // ============================================================================
 
-/**
- * @brief Port not connected error
- */
-#define SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED   ((NTSTATUS)0xE0000001L)
+//
+// Use canonical error codes from ErrorCodes.h when available.
+// ScanBridge-specific error codes use the 0xE00000xx range.
+//
+#include "../../Shared/ErrorCodes.h"
 
-/**
- * @brief Scan timeout error
- */
+#ifndef SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED
+#define SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED   ((NTSTATUS)0xE0000001L)
+#endif
+
+#ifndef SHADOWSTRIKE_ERROR_SCAN_TIMEOUT
 #define SHADOWSTRIKE_ERROR_SCAN_TIMEOUT         ((NTSTATUS)0xE0000002L)
+#endif
 
 /**
  * @brief Circuit breaker open error
@@ -257,25 +261,10 @@ extern "C" {
 // ENUMERATIONS
 // ============================================================================
 
-/**
- * @brief File access types for scan requests
- */
-typedef enum _SHADOWSTRIKE_ACCESS_TYPE {
-    ShadowStrikeAccessNone = 0,
-    ShadowStrikeAccessRead = 1,
-    ShadowStrikeAccessWrite = 2,
-    ShadowStrikeAccessExecute = 3,
-    ShadowStrikeAccessCreate = 4,
-    ShadowStrikeAccessRename = 5,
-    ShadowStrikeAccessDelete = 6,
-    ShadowStrikeAccessSetInfo = 7,
-    ShadowStrikeAccessMax
-} SHADOWSTRIKE_ACCESS_TYPE;
-
-/**
- * @brief File access type (alias for compatibility)
- */
-typedef SHADOWSTRIKE_ACCESS_TYPE SHADOWSTRIKE_FILE_ACCESS_TYPE;
+//
+// SHADOWSTRIKE_ACCESS_TYPE and SHADOWSTRIKE_FILE_ACCESS_TYPE are defined
+// in SharedDefs.h (included via MessageProtocol.h).
+//
 
 /**
  * @brief Message priority levels
@@ -404,16 +393,10 @@ typedef struct _SB_STATISTICS {
 
 } SB_STATISTICS, *PSB_STATISTICS;
 
-/**
- * @brief Process verdict reply structure
- */
-typedef struct _SHADOWSTRIKE_PROCESS_VERDICT_REPLY {
-    UINT64 MessageId;
-    UINT8 Verdict;
-    UINT8 Action;           // Block, Allow, Monitor
-    UINT16 Flags;
-    UINT32 Reserved;
-} SHADOWSTRIKE_PROCESS_VERDICT_REPLY, *PSHADOWSTRIKE_PROCESS_VERDICT_REPLY;
+//
+// SHADOWSTRIKE_PROCESS_VERDICT_REPLY is defined in SharedDefs.h
+// (included via MessageProtocol.h).
+//
 
 // ============================================================================
 // INITIALIZATION AND CLEANUP

@@ -41,8 +41,8 @@ extern "C" {
 #endif
 
 #include <fltKernel.h>
-#include "../Shared/SharedDefs.h"
-#include "../Shared/MessageProtocol.h"
+#include "../../Shared/SharedDefs.h"
+#include "../../Shared/MessageProtocol.h"
 
 // ============================================================================
 // CLIENT CAPABILITY FLAGS
@@ -329,22 +329,22 @@ ShadowStrikeSendNotification(
 /**
  * @brief Send process notification to user-mode.
  *
- * @param Notification  Process notification structure.
- * @param Size          Size of the notification.
- * @param RequireReply  TRUE if verdict is needed.
- * @param Reply         Receives verdict reply if RequireReply is TRUE.
- * @param ReplySize     Size of reply buffer.
- * @return STATUS_SUCCESS on success.
+ * @param ProcessId     Target process ID
+ * @param ParentId      Parent process ID
+ * @param Create        TRUE for creation, FALSE for termination
+ * @param ImageName     Process image path (optional)
+ * @param CommandLine   Process command line (optional)
+ * @return STATUS_SUCCESS if queued successfully.
  *
- * @irql PASSIVE_LEVEL (if RequireReply), <= APC_LEVEL otherwise
+ * @irql PASSIVE_LEVEL
  */
 NTSTATUS
 ShadowStrikeSendProcessNotification(
-    _In_reads_bytes_(Size) PSHADOWSTRIKE_PROCESS_NOTIFICATION Notification,
-    _In_ ULONG Size,
-    _In_ BOOLEAN RequireReply,
-    _Out_writes_bytes_opt_(*ReplySize) PSHADOWSTRIKE_PROCESS_VERDICT_REPLY Reply,
-    _Inout_opt_ PULONG ReplySize
+    _In_ HANDLE ProcessId,
+    _In_ HANDLE ParentId,
+    _In_ BOOLEAN Create,
+    _In_opt_ PUNICODE_STRING ImageName,
+    _In_opt_ PUNICODE_STRING CommandLine
     );
 
 // ============================================================================
@@ -378,6 +378,22 @@ ShadowStrikeGetConnectedClientCount(
 // ============================================================================
 // CLIENT PORT REFERENCE MANAGEMENT
 // ============================================================================
+
+/**
+ * @brief Get the primary scanner port handle.
+ *
+ * Returns the raw PFLT_PORT for the primary scanner connection.
+ * Caller should use ShadowStrikeAcquirePrimaryScannerPort for
+ * reference-counted access in most cases.
+ *
+ * @return PFLT_PORT if connected, NULL otherwise.
+ *
+ * @irql <= APC_LEVEL
+ */
+PFLT_PORT
+ShadowStrikeGetPrimaryScannerPort(
+    VOID
+    );
 
 /**
  * @brief Acquire reference to primary scanner port.
@@ -469,7 +485,7 @@ ShadowStrikeClientHasCapability(
  */
 PVOID
 ShadowStrikeAllocateMessageBuffer(
-    _In_ SIZE_T Size
+    _In_ ULONG Size
     );
 
 /**
@@ -495,9 +511,11 @@ ShadowStrikeFreeMessageBuffer(
  * @param MessageType  Type of message.
  * @param DataSize     Size of payload data.
  *
- * @irql Any
+ * @return STATUS_SUCCESS on success, STATUS_INVALID_PARAMETER if Header is NULL
+ *
+ * @irql <= DISPATCH_LEVEL
  */
-VOID
+NTSTATUS
 ShadowStrikeInitMessageHeader(
     _Out_ PSHADOWSTRIKE_MESSAGE_HEADER Header,
     _In_ SHADOWSTRIKE_MESSAGE_TYPE MessageType,
