@@ -81,6 +81,13 @@
 //
 #define MH_MAX_INPUT_BUFFER_SIZE        (64 * 1024)
 
+//
+// Maximum size for local kernel output buffer.
+// Handlers write into this, then it's copied to user-mode under SEH.
+// Must accommodate the largest response struct (SHADOWSTRIKE_DRIVER_STATUS).
+//
+#define MH_MAX_LOCAL_OUTPUT_SIZE        512
+
 // ============================================================================
 // COMPILE-TIME VALIDATIONS
 // ============================================================================
@@ -88,6 +95,8 @@
 C_ASSERT(MH_MAX_HANDLERS >= FilterMessageType_Max);
 C_ASSERT(MH_MAX_PROTECTED_PROCESSES > 0);
 C_ASSERT(MH_MAX_PROTECTED_PROCESSES <= 1024);
+C_ASSERT(sizeof(SHADOWSTRIKE_DRIVER_STATUS) <= MH_MAX_LOCAL_OUTPUT_SIZE);
+C_ASSERT(sizeof(SHADOWSTRIKE_GENERIC_REPLY) <= MH_MAX_LOCAL_OUTPUT_SIZE);
 
 // ============================================================================
 // TYPES
@@ -495,6 +504,38 @@ MhShutdown(
     }
 
     //
+    // Wait for all in-flight handler invocations to drain.
+    // After InitState is UNINITIALIZED, no new invocations will start,
+    // but existing ones may still be running.
+    //
+    {
+        ULONG drainAttempts = 0;
+        const ULONG maxDrainAttempts = 500;  // 5 seconds max
+        BOOLEAN allDrained;
+
+        do {
+            allDrained = TRUE;
+            for (ULONG i = 0; i < MH_MAX_HANDLERS; i++) {
+                if (g_MhGlobals.Handlers[i].ActiveInvocations > 0) {
+                    allDrained = FALSE;
+                    break;
+                }
+            }
+
+            if (!allDrained) {
+                LARGE_INTEGER delay;
+                delay.QuadPart = -100000;  // 10ms
+                KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            }
+        } while (!allDrained && ++drainAttempts < maxDrainAttempts);
+
+        if (!allDrained) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/MH] Shutdown: timeout waiting for active handlers to drain\n");
+        }
+    }
+
+    //
     // Clear protected process list under exclusive lock
     //
     KeEnterCriticalRegion();
@@ -602,6 +643,8 @@ MhUnregisterHandler(
     LONG activeCount;
     ULONG waitCount = 0;
     const ULONG maxWaitIterations = 1000;  // 10 seconds max
+    LARGE_INTEGER delay;
+    BOOLEAN timedOut = FALSE;
 
     PAGED_CODE();
 
@@ -627,7 +670,9 @@ MhUnregisterHandler(
     MemoryBarrier();
 
     //
-    // Wait for active invocations to complete
+    // Wait for active invocations to complete.
+    // Release lock during sleep to avoid blocking dispatch.
+    // Re-acquire before each check and before final cleanup.
     //
     while ((activeCount = g_MhGlobals.Handlers[slot].ActiveInvocations) > 0) {
         ExReleasePushLockExclusive(&g_MhGlobals.HandlersLock);
@@ -635,19 +680,22 @@ MhUnregisterHandler(
 
         if (++waitCount > maxWaitIterations) {
             //
-            // Timeout waiting for callbacks - log and continue
-            // This should not happen in normal operation
+            // Timeout waiting for callbacks to drain.
+            // Re-acquire lock before falling through to cleanup.
             //
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                        "[ShadowStrike/MH] Timeout waiting for handler %u to drain (active=%d)\n",
                        MessageType, activeCount);
+            timedOut = TRUE;
+
+            KeEnterCriticalRegion();
+            ExAcquirePushLockExclusive(&g_MhGlobals.HandlersLock);
             break;
         }
 
         //
         // Wait 10ms and retry
         //
-        LARGE_INTEGER delay;
         delay.QuadPart = -100000;  // 10ms in 100ns units
         KeDelayExecutionThread(KernelMode, FALSE, &delay);
 
@@ -656,13 +704,17 @@ MhUnregisterHandler(
     }
 
     //
-    // Clear the handler entry
+    // Clear the handler entry — lock is always held here
     //
     g_MhGlobals.Handlers[slot].Callback = NULL;
     g_MhGlobals.Handlers[slot].Context = NULL;
 
     ExReleasePushLockExclusive(&g_MhGlobals.HandlersLock);
     KeLeaveCriticalRegion();
+
+    if (timedOut) {
+        return STATUS_TIMEOUT;
+    }
 
     return STATUS_SUCCESS;
 }
@@ -814,7 +866,7 @@ MhpValidateAndCopyMessage(
     }
 
     if (UserBufferSize > MH_MAX_INPUT_BUFFER_SIZE) {
-        return SHADOWSTRIKE_ERROR_BUFFER_TOO_SMALL;
+        return STATUS_INVALID_BUFFER_SIZE;
     }
 
     //
@@ -988,7 +1040,7 @@ ShadowStrikeProcessUserMessage(
     PMH_MESSAGE_HANDLER_CALLBACK callback = NULL;
     PVOID context = NULL;
     ULONG slot;
-    UCHAR localOutputBuffer[256];
+    UCHAR localOutputBuffer[MH_MAX_LOCAL_OUTPUT_SIZE];
     ULONG localOutputLength = 0;
 
     PAGED_CODE();
@@ -1100,20 +1152,33 @@ ShadowStrikeProcessUserMessage(
     }
 
     //
-    // Call handler with kernel-mode buffers (safe)
-    // Use local output buffer first, then copy to user
+    // Call handler with kernel-mode buffers (safe).
+    // Handlers write into the local stack buffer, which we then copy
+    // to user-mode under SEH. Cap at MH_MAX_LOCAL_OUTPUT_SIZE.
     //
     RtlZeroMemory(localOutputBuffer, sizeof(localOutputBuffer));
 
-    status = callback(
-        ClientContext,
-        header,
-        payload,
-        payloadSize,
-        (OutputBuffer != NULL) ? localOutputBuffer : NULL,
-        (OutputBuffer != NULL) ? min(OutputBufferSize, sizeof(localOutputBuffer)) : 0,
-        &localOutputLength
-    );
+    {
+        ULONG effectiveOutputSize = 0;
+        if (OutputBuffer != NULL) {
+            effectiveOutputSize = min(OutputBufferSize, sizeof(localOutputBuffer));
+            if (OutputBufferSize > sizeof(localOutputBuffer)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike/MH] Output buffer %u exceeds local buffer %u, capping\n",
+                           OutputBufferSize, (ULONG)sizeof(localOutputBuffer));
+            }
+        }
+
+        status = callback(
+            ClientContext,
+            header,
+            payload,
+            payloadSize,
+            (OutputBuffer != NULL) ? localOutputBuffer : NULL,
+            effectiveOutputSize,
+            &localOutputLength
+        );
+    }
 
     //
     // Decrement active invocations
