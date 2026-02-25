@@ -27,6 +27,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 
 #define DSD_POOL_TAG 'DSSD'
@@ -41,7 +42,7 @@ typedef enum _DSD_TECHNIQUE {
     DsdTechnique_HalosGate,             // Neighbor syscall walking
     DsdTechnique_TartarusGate,          // Exception-based resolution
     DsdTechnique_SysWhispers,           // SysWhispers patterns
-} DSD_TECHNIQUE;
+} DSD_TECHNIQUE, *PDSD_TECHNIQUE;
 
 //
 // DSD_DETECTION is an opaque snapshot returned to callers.

@@ -730,5 +730,3 @@ NTSTATUS
 BeEngineGetStatistics(
     _Out_ PBEHAVIOR_ENGINE_GLOBALS Stats
     );
-
-#endif // SHADOWSTRIKE_BEHAVIOR_ENGINE_H

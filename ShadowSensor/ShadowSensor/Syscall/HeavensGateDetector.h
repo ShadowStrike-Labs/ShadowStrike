@@ -45,6 +45,7 @@ Callback routines are invoked at PASSIVE_LEVEL.
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 
 // ============================================================================

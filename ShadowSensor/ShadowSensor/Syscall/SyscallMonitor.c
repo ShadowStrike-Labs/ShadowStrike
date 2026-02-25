@@ -44,6 +44,8 @@
 #include "../Utilities/ProcessUtils.h"
 #include "../Utilities/HashUtils.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../../Shared/KernelProcessTypes.h"
+#include <ntimage.h>
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -797,6 +799,7 @@ ScMonitorDetectHeavensGate(
 
             status = DsdValidateCallstack(
                 g_ScState.DirectSyscallDetector,
+                ULongToHandle(ProcessId),
                 ULongToHandle(Context->ThreadId),
                 &isValid,
                 &technique
@@ -876,6 +879,7 @@ ScMonitorAnalyzeCallStack(
     if (g_ScState.DirectSyscallDetector != NULL) {
         status = DsdValidateCallstack(
             g_ScState.DirectSyscallDetector,
+            ULongToHandle(ProcessId),
             ULongToHandle(ThreadId),
             &callstackValid,
             &technique
@@ -1034,13 +1038,14 @@ ScMonitorVerifyNtdllIntegrity(
 
     __try {
         PVOID ntdllBase = (PVOID)(ULONG_PTR)procCtx->NtdllBase;
+        ULONG ntdllSize = (ULONG)procCtx->NtdllSize;
         PIMAGE_DOS_HEADER dosHeader;
         PIMAGE_NT_HEADERS ntHeaders;
         PIMAGE_SECTION_HEADER sectionHeader;
         USHORT sectionCount;
         USHORT idx;
 
-        ProbeForRead(ntdllBase, sizeof(IMAGE_DOS_HEADER), 1);
+        ProbeForRead(ntdllBase, sizeof(IMAGE_DOS_HEADER), sizeof(USHORT));
         dosHeader = (PIMAGE_DOS_HEADER)ntdllBase;
 
         if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
@@ -1048,10 +1053,19 @@ ScMonitorVerifyNtdllIntegrity(
             __leave;
         }
 
+        //
+        // Validate e_lfanew bounds before use
+        //
+        if (dosHeader->e_lfanew < (LONG)sizeof(IMAGE_DOS_HEADER) ||
+            (ULONG)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS) > ntdllSize) {
+            status = STATUS_INVALID_IMAGE_FORMAT;
+            __leave;
+        }
+
         ntHeaders = (PIMAGE_NT_HEADERS)(
             (PUCHAR)ntdllBase + dosHeader->e_lfanew
         );
-        ProbeForRead(ntHeaders, sizeof(IMAGE_NT_HEADERS), 1);
+        ProbeForRead(ntHeaders, sizeof(IMAGE_NT_HEADERS), sizeof(ULONG));
 
         if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
             status = STATUS_INVALID_IMAGE_FORMAT;
@@ -1068,7 +1082,7 @@ ScMonitorVerifyNtdllIntegrity(
         ProbeForRead(
             sectionHeader,
             sectionCount * sizeof(IMAGE_SECTION_HEADER),
-            1
+            sizeof(ULONG)
         );
 
         for (idx = 0; idx < sectionCount; idx++) {
@@ -1078,9 +1092,20 @@ ScMonitorVerifyNtdllIntegrity(
                 sectionHeader[idx].Name[3] == 'x' &&
                 sectionHeader[idx].Name[4] == 't') {
 
-                PVOID textBase =
-                    (PUCHAR)ntdllBase + sectionHeader[idx].VirtualAddress;
+                ULONG textRva = sectionHeader[idx].VirtualAddress;
                 ULONG textSize = sectionHeader[idx].Misc.VirtualSize;
+                PVOID textBase;
+
+                //
+                // Validate .text section bounds within module
+                //
+                if (textRva == 0 || textSize == 0 ||
+                    textRva + textSize > ntdllSize) {
+                    status = STATUS_INVALID_IMAGE_FORMAT;
+                    __leave;
+                }
+
+                textBase = (PUCHAR)ntdllBase + textRva;
 
                 //
                 // Cap to 16MB to prevent excessive hashing
@@ -1218,6 +1243,7 @@ ScMonitorGetNtdllHooks(
 
     __try {
         PVOID ntdllBase = (PVOID)(ULONG_PTR)procCtx->NtdllBase;
+        ULONG ntdllSize = (ULONG)procCtx->NtdllSize;
         PIMAGE_DOS_HEADER dosHeader;
         PIMAGE_NT_HEADERS ntHeaders;
         PIMAGE_EXPORT_DIRECTORY exportDir;
@@ -1230,7 +1256,7 @@ ScMonitorGetNtdllHooks(
         ULONG numNames;
         ULONG idx;
 
-        ProbeForRead(ntdllBase, sizeof(IMAGE_DOS_HEADER), 1);
+        ProbeForRead(ntdllBase, sizeof(IMAGE_DOS_HEADER), sizeof(USHORT));
         dosHeader = (PIMAGE_DOS_HEADER)ntdllBase;
 
         if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
@@ -1238,10 +1264,19 @@ ScMonitorGetNtdllHooks(
             __leave;
         }
 
+        //
+        // Validate e_lfanew bounds before use
+        //
+        if (dosHeader->e_lfanew < (LONG)sizeof(IMAGE_DOS_HEADER) ||
+            (ULONG)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS) > ntdllSize) {
+            status = STATUS_INVALID_IMAGE_FORMAT;
+            __leave;
+        }
+
         ntHeaders = (PIMAGE_NT_HEADERS)(
             (PUCHAR)ntdllBase + dosHeader->e_lfanew
         );
-        ProbeForRead(ntHeaders, sizeof(IMAGE_NT_HEADERS), 1);
+        ProbeForRead(ntHeaders, sizeof(IMAGE_NT_HEADERS), sizeof(ULONG));
 
         if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
             status = STATUS_INVALID_IMAGE_FORMAT;
@@ -1258,16 +1293,35 @@ ScMonitorGetNtdllHooks(
             __leave;
         }
 
+        //
+        // Validate export directory is within module bounds
+        //
+        if (exportRva + sizeof(IMAGE_EXPORT_DIRECTORY) > ntdllSize) {
+            status = STATUS_INVALID_IMAGE_FORMAT;
+            __leave;
+        }
+
         exportDir = (PIMAGE_EXPORT_DIRECTORY)(
             (PUCHAR)ntdllBase + exportRva
         );
-        ProbeForRead(exportDir, sizeof(IMAGE_EXPORT_DIRECTORY), 1);
+        ProbeForRead(exportDir, sizeof(IMAGE_EXPORT_DIRECTORY), sizeof(ULONG));
 
         numFunctions = exportDir->NumberOfFunctions;
         numNames = exportDir->NumberOfNames;
 
-        if (numFunctions == 0 || numNames == 0 || numNames > 16384) {
+        if (numFunctions == 0 || numNames == 0 || numNames > 16384 ||
+            numFunctions > 16384) {
             status = STATUS_NOT_FOUND;
+            __leave;
+        }
+
+        //
+        // Validate export table array RVAs are within module bounds
+        //
+        if (exportDir->AddressOfFunctions + numFunctions * sizeof(ULONG) > ntdllSize ||
+            exportDir->AddressOfNames + numNames * sizeof(ULONG) > ntdllSize ||
+            exportDir->AddressOfNameOrdinals + numNames * sizeof(USHORT) > ntdllSize) {
+            status = STATUS_INVALID_IMAGE_FORMAT;
             __leave;
         }
 
@@ -1306,7 +1360,19 @@ ScMonitorGetNtdllHooks(
             HOOK_TYPE hookType = HookType_None;
 
             funcName = (PCSTR)((PUCHAR)ntdllBase + nameRvas[idx]);
-            ProbeForRead((PVOID)funcName, 3, 1);
+
+            //
+            // Validate name RVA is within module bounds.
+            // Probe enough bytes for typical Nt* function names (max ~64 chars).
+            //
+            if (nameRvas[idx] >= ntdllSize) {
+                continue;
+            }
+            {
+                ULONG maxNameProbe = min(SC_MAX_FUNCTION_NAME_LENGTH + 1,
+                                         ntdllSize - nameRvas[idx]);
+                ProbeForRead((PVOID)funcName, maxNameProbe, 1);
+            }
 
             //
             // Only check Nt* and Zw* functions (syscall stubs)
@@ -1321,6 +1387,14 @@ ScMonitorGetNtdllHooks(
             }
 
             funcRva = functionRvas[ordinals[idx]];
+
+            //
+            // Validate function RVA is within module bounds
+            //
+            if (funcRva + sizeof(prologue) > ntdllSize) {
+                continue;
+            }
+
             funcAddr = (PUCHAR)ntdllBase + funcRva;
 
             ProbeForRead(funcAddr, sizeof(prologue), 1);
@@ -2014,11 +2088,13 @@ ScpAddSuspiciousCaller(
     UINT32 index;
 
     //
-    // Circular buffer insertion - wraps automatically, no overflow
+    // Atomically claim a slot; wraps automatically, no overflow.
+    // Benign race on the array element write is acceptable —
+    // worst case is a single overwritten address, which is fine
+    // for a diagnostic circular buffer.
     //
-    index = Context->SuspiciousCallerCount % SC_MAX_SUSPICIOUS_CALLERS;
-    Context->SuspiciousCallers[index] = CallerAddress;
-    Context->SuspiciousCallerCount++;
+    index = (UINT32)InterlockedIncrement((PLONG)&Context->SuspiciousCallerCount) - 1;
+    Context->SuspiciousCallers[index % SC_MAX_SUSPICIOUS_CALLERS] = CallerAddress;
 }
 
 // ============================================================================
@@ -2036,7 +2112,10 @@ ScpIsAddressInRange(
         return FALSE;
     }
 
-    return (Address >= Base && Address < (Base + Size));
+    //
+    // Overflow-safe range check: Address >= Base && (Address - Base) < Size
+    //
+    return (Address >= Base && (Address - Base) < Size);
 }
 
 static BOOLEAN
@@ -2162,7 +2241,7 @@ ScpPopulateNtdllInfo(
     NTSTATUS status;
     PEPROCESS process = NULL;
     KAPC_STATE apcState;
-    PPEB peb = NULL;
+    PKM_PEB kmPeb = NULL;
 
     if (Context == NULL || Context->ProcessObject == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -2170,46 +2249,48 @@ ScpPopulateNtdllInfo(
 
     process = Context->ProcessObject;
 
-    peb = PsGetProcessPeb(process);
-    if (peb == NULL) {
+    kmPeb = (PKM_PEB)PsGetProcessPeb(process);
+    if (kmPeb == NULL) {
         return STATUS_NOT_FOUND;
     }
 
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        PPEB_LDR_DATA ldr;
+        PKM_PEB_LDR_DATA ldr;
         PLIST_ENTRY moduleList;
         PLIST_ENTRY entry;
+        ULONG walkCount = 0;
 
-        ProbeForRead(peb, sizeof(PEB), 1);
-        ldr = peb->Ldr;
+        ProbeForRead(kmPeb, KM_PEB_PROBE_SIZE, sizeof(PVOID));
+        ldr = kmPeb->Ldr;
 
         if (ldr == NULL) {
             status = STATUS_NOT_FOUND;
             __leave;
         }
 
-        ProbeForRead(ldr, sizeof(PEB_LDR_DATA), 1);
+        ProbeForRead(ldr, KM_PEB_LDR_PROBE_SIZE, sizeof(PVOID));
         moduleList = &ldr->InLoadOrderModuleList;
 
         //
-        // Walk loaded module list looking for ntdll.dll
+        // Walk loaded module list looking for ntdll.dll.
+        // Cap iterations to prevent infinite loops on corrupted lists.
         //
         for (entry = moduleList->Flink;
-             entry != moduleList;
-             entry = entry->Flink) {
+             entry != moduleList && walkCount < KM_MAX_MODULE_WALK_COUNT;
+             entry = entry->Flink, walkCount++) {
 
-            PLDR_DATA_TABLE_ENTRY moduleEntry;
+            PKM_LDR_DATA_TABLE_ENTRY moduleEntry;
             UNICODE_STRING ntdllName;
 
-            ProbeForRead(entry, sizeof(LIST_ENTRY), 1);
+            ProbeForRead(entry, sizeof(LIST_ENTRY), sizeof(PVOID));
             moduleEntry = CONTAINING_RECORD(
                 entry,
-                LDR_DATA_TABLE_ENTRY,
+                KM_LDR_DATA_TABLE_ENTRY,
                 InLoadOrderLinks
             );
-            ProbeForRead(moduleEntry, sizeof(LDR_DATA_TABLE_ENTRY), 1);
+            ProbeForRead(moduleEntry, KM_LDR_ENTRY_PROBE_SIZE, sizeof(PVOID));
 
             if (moduleEntry->BaseDllName.Buffer == NULL ||
                 moduleEntry->BaseDllName.Length == 0) {
@@ -2241,23 +2322,24 @@ ScpPopulateNtdllInfo(
         // For WoW64 processes, find the second ntdll instance (32-bit)
         //
         if (Context->IsWoW64 && Context->NtdllBase != 0) {
+            walkCount = 0;
             for (entry = moduleList->Flink;
-                 entry != moduleList;
-                 entry = entry->Flink) {
+                 entry != moduleList && walkCount < KM_MAX_MODULE_WALK_COUNT;
+                 entry = entry->Flink, walkCount++) {
 
-                PLDR_DATA_TABLE_ENTRY moduleEntry;
+                PKM_LDR_DATA_TABLE_ENTRY moduleEntry;
                 UNICODE_STRING ntdllName;
 
-                ProbeForRead(entry, sizeof(LIST_ENTRY), 1);
+                ProbeForRead(entry, sizeof(LIST_ENTRY), sizeof(PVOID));
                 moduleEntry = CONTAINING_RECORD(
                     entry,
-                    LDR_DATA_TABLE_ENTRY,
+                    KM_LDR_DATA_TABLE_ENTRY,
                     InLoadOrderLinks
                 );
                 ProbeForRead(
                     moduleEntry,
-                    sizeof(LDR_DATA_TABLE_ENTRY),
-                    1
+                    KM_LDR_ENTRY_PROBE_SIZE,
+                    sizeof(PVOID)
                 );
 
                 if (moduleEntry->BaseDllName.Buffer == NULL ||

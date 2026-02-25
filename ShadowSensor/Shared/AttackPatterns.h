@@ -67,7 +67,7 @@ typedef enum _MITRE_TACTIC {
     Tactic_Exfiltration           = 0x000D,   // TA0010
     Tactic_Impact                 = 0x000E,   // TA0040
     Tactic_Max
-} MITRE_TACTIC;
+} MITRE_TACTIC, *PMITRE_TACTIC;
 
 // ============================================================================
 // MITRE ATT&CK TECHNIQUE IDs
@@ -579,7 +579,8 @@ typedef struct _ATTACK_DETECTION_RULE {
     UINT32 Reserved;
 } ATTACK_DETECTION_RULE, *PATTACK_DETECTION_RULE;
 
-// Rule flags
+// Rule flags (guarded to avoid redefinition with BehaviorTypes.h)
+#ifndef RULE_FLAG_ENABLED
 #define RULE_FLAG_ENABLED                 0x00000001
 #define RULE_FLAG_BLOCKING                0x00000002
 #define RULE_FLAG_ALERTING                0x00000004
@@ -589,6 +590,7 @@ typedef struct _ATTACK_DETECTION_RULE {
 #define RULE_FLAG_REQUIRES_CORRELATION    0x00000040
 #define RULE_FLAG_KERNEL_ONLY             0x00000080
 #define RULE_FLAG_USER_MODE_ONLY          0x00000100
+#endif
 
 // Response actions
 typedef enum _ATTACK_RESPONSE_ACTION {
@@ -677,12 +679,22 @@ typedef struct _ATTACK_CHAIN {
     UINT32 Reserved;
 } ATTACK_CHAIN, *PATTACK_CHAIN;
 
-// Attack chain flags
+// Attack chain flags (guarded to avoid redefinition with BehaviorTypes.h)
+#ifndef CHAIN_FLAG_ACTIVE
 #define CHAIN_FLAG_ACTIVE                 0x00000001
+#endif
+#ifndef CHAIN_FLAG_BLOCKED
 #define CHAIN_FLAG_BLOCKED                0x00000002
+#endif
+#ifndef CHAIN_FLAG_REMEDIATED
 #define CHAIN_FLAG_REMEDIATED             0x00000004
+#endif
+#ifndef CHAIN_FLAG_FALSE_POSITIVE
 #define CHAIN_FLAG_FALSE_POSITIVE         0x00000008
+#endif
+#ifndef CHAIN_FLAG_CRITICAL
 #define CHAIN_FLAG_CRITICAL               0x00000010
+#endif
 #define CHAIN_FLAG_APT_LIKELY             0x00000020
 #define CHAIN_FLAG_RANSOMWARE_LIKELY      0x00000040
 #define CHAIN_FLAG_COINMINER_LIKELY       0x00000080

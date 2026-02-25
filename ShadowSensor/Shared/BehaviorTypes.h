@@ -670,7 +670,7 @@ typedef enum _BEHAVIOR_RESPONSE_ACTION {
     BehaviorResponse_Remediate,           // Auto-remediate
     BehaviorResponse_Investigate,         // Collect more data
     BehaviorResponse_Max
-} BEHAVIOR_RESPONSE_ACTION;
+} BEHAVIOR_RESPONSE_ACTION, *PBEHAVIOR_RESPONSE_ACTION;
 
 // ============================================================================
 // BEHAVIORAL RULE STRUCTURES
