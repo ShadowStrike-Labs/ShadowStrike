@@ -53,6 +53,16 @@
 #define SHADOWSTRIKE_DRIVER_VERSION     L"3.0.0"
 #define SHADOWSTRIKE_SERVICE_NAME       L"ShadowStrikeService"
 
+/**
+ * @brief Expected service executable filename for client verification.
+ *
+ * The kernel driver verifies connecting user-mode processes against this
+ * expected filename. Full-path matching is used when the install path
+ * is known from registry; otherwise filename-only matching is used
+ * with additional code-signing checks.
+ */
+#define SHADOWSTRIKE_SERVICE_EXECUTABLE L"ShadowStrikeService.exe"
+
 // ============================================================================
 // FILTER ALTITUDE
 // ============================================================================

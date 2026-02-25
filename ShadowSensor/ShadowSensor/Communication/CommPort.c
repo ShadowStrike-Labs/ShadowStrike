@@ -43,8 +43,10 @@
 #include "../../Shared/ErrorCodes.h"
 
 //
-// Semi-documented kernel API — declared in ntddk.h but may be gated
-// behind version checks in some WDK builds.
+// PsGetProcessInheritedFromUniqueProcessId — exported by ntoskrnl.exe
+// since Windows XP. Not declared in public WDK headers but stable and
+// widely used in production security drivers (minifilters, EDR agents).
+// Returns the parent process ID from the EPROCESS structure.
 //
 NTKERNELAPI
 HANDLE
@@ -490,13 +492,20 @@ ShadowStrikeConnectNotify(
     status = ShadowStrikeVerifyClient(clientProcessId, &capabilities, imageHash);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Client verification failed: 0x%08X\n", status);
-        //
-        // For development, allow with minimal capabilities
-        // In production, this should return STATUS_ACCESS_DENIED
-        //
-        capabilities = ShadowStrikeCapMinimal;
-        RtlZeroMemory(imageHash, sizeof(imageHash));
+                   "[ShadowStrike] Client verification failed: PID=%p, status=0x%08X\n",
+                   clientProcessId, status);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    //
+    // Unverified clients (minimal capabilities) are denied connection.
+    // Only clients that pass filename + SYSTEM token checks are allowed.
+    //
+    if (capabilities == (ULONG)ShadowStrikeCapMinimal) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Connection rejected: PID=%p failed verification\n",
+                   clientProcessId);
+        return STATUS_ACCESS_DENIED;
     }
 
     //
@@ -1583,6 +1592,13 @@ ShadowStrikeAllocateMessageBuffer(
         return NULL;
     }
 
+    //
+    // Integer overflow check: sizeof(header) + Size must not wrap ULONG
+    //
+    if (Size > ((ULONG)-1) - sizeof(SHADOWSTRIKE_MESSAGE_BUFFER_HEADER)) {
+        return NULL;
+    }
+
     totalSize = sizeof(SHADOWSTRIKE_MESSAGE_BUFFER_HEADER) + Size;
 
     //
@@ -1766,23 +1782,35 @@ ShadowStrikeBuildFileScanRequest(
         status = SeLocateProcessImageName(process, &processImageName);
         if (NT_SUCCESS(status) && processImageName != NULL) {
             //
-            // Extract just the file name portion
+            // Extract just the file name portion using length arithmetic.
+            // UNICODE_STRING is NOT guaranteed null-terminated — do NOT use wcslen.
             //
-            PWCHAR lastSlash = processImageName->Buffer;
-            PWCHAR p = processImageName->Buffer;
-            ULONG i;
+            USHORT totalChars = processImageName->Length / sizeof(WCHAR);
+            USHORT lastSepIdx = 0;
+            USHORT ci;
+            BOOLEAN foundSep = FALSE;
 
-            for (i = 0; i < processImageName->Length / sizeof(WCHAR); i++) {
-                if (p[i] == L'\\' || p[i] == L'/') {
-                    lastSlash = &p[i + 1];
+            for (ci = 0; ci < totalChars; ci++) {
+                if (processImageName->Buffer[ci] == L'\\' ||
+                    processImageName->Buffer[ci] == L'/') {
+                    lastSepIdx = ci + 1;
+                    foundSep = TRUE;
                 }
             }
 
-            processNameLength = (ULONG)wcslen(lastSlash);
+            if (foundSep && lastSepIdx < totalChars) {
+                processNameLength = (ULONG)(totalChars - lastSepIdx);
+            } else {
+                processNameLength = (ULONG)totalChars;
+                lastSepIdx = 0;
+            }
+
             if (processNameLength >= MAX_PROCESS_NAME_LENGTH) {
                 processNameLength = MAX_PROCESS_NAME_LENGTH - 1;
             }
-            RtlCopyMemory(processImagePath, lastSlash, processNameLength * sizeof(WCHAR));
+            RtlCopyMemory(processImagePath,
+                          &processImageName->Buffer[lastSepIdx],
+                          processNameLength * sizeof(WCHAR));
 
             ExFreePool(processImageName);
         }
@@ -1894,6 +1922,147 @@ ShadowStrikeBuildFileScanRequest(
 // CLIENT VERIFICATION
 // ============================================================================
 
+/**
+ * @brief Case-insensitive substring search in a counted wide string.
+ *
+ * Searches within Source (Length chars) for Needle (null-terminated).
+ * Returns TRUE if found, FALSE otherwise. Does NOT require null-termination
+ * of Source — operates on character count only.
+ */
+static BOOLEAN
+ShadowStrikepFindSubstringNoCase(
+    _In_reads_(SourceLengthChars) PCWCH Source,
+    _In_ USHORT SourceLengthChars,
+    _In_ PCWSTR Needle
+    )
+{
+    USHORT needleLen = 0;
+    USHORT i;
+    USHORT j;
+    WCHAR sc;
+    WCHAR nc;
+
+    //
+    // Calculate needle length
+    //
+    while (Needle[needleLen] != L'\0') {
+        needleLen++;
+    }
+
+    if (needleLen == 0 || needleLen > SourceLengthChars) {
+        return FALSE;
+    }
+
+    for (i = 0; i <= SourceLengthChars - needleLen; i++) {
+        BOOLEAN match = TRUE;
+
+        for (j = 0; j < needleLen; j++) {
+            sc = Source[i + j];
+            nc = Needle[j];
+
+            //
+            // Lowercase ASCII for comparison
+            //
+            if (sc >= L'A' && sc <= L'Z') { sc += 32; }
+            if (nc >= L'A' && nc <= L'Z') { nc += 32; }
+
+            if (sc != nc) {
+                match = FALSE;
+                break;
+            }
+        }
+
+        if (match) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+/**
+ * @brief Extract filename from a counted wide string path.
+ *
+ * Returns pointer into Source at the last path separator + 1,
+ * and sets OutLength to the remaining character count.
+ * Does NOT require null-termination.
+ */
+static PCWCH
+ShadowStrikepExtractFilename(
+    _In_reads_(SourceLengthChars) PCWCH Source,
+    _In_ USHORT SourceLengthChars,
+    _Out_ PUSHORT OutLengthChars
+    )
+{
+    USHORT lastSep = 0;
+    USHORT i;
+    BOOLEAN foundSep = FALSE;
+
+    for (i = 0; i < SourceLengthChars; i++) {
+        if (Source[i] == L'\\' || Source[i] == L'/') {
+            lastSep = i + 1;
+            foundSep = TRUE;
+        }
+    }
+
+    if (foundSep && lastSep < SourceLengthChars) {
+        *OutLengthChars = SourceLengthChars - lastSep;
+        return &Source[lastSep];
+    }
+
+    *OutLengthChars = SourceLengthChars;
+    return Source;
+}
+
+/**
+ * @brief Compute FNV-1a hash of a wide character buffer.
+ *
+ * Produces a deterministic 32-bit hash for tracking purposes.
+ * Not cryptographic — used for fast image path fingerprinting.
+ */
+static ULONG
+ShadowStrikepFnv1aHashW(
+    _In_reads_(LengthChars) PCWCH Buffer,
+    _In_ USHORT LengthChars
+    )
+{
+    ULONG hash = 0x811C9DC5u;  // FNV-1a offset basis
+    USHORT i;
+    PCUCHAR bytes;
+    ULONG byteLen;
+
+    bytes = (PCUCHAR)Buffer;
+    byteLen = (ULONG)LengthChars * sizeof(WCHAR);
+
+    for (i = 0; i < byteLen; i++) {
+        hash ^= bytes[i];
+        hash *= 0x01000193u;  // FNV-1a prime
+    }
+
+    return hash;
+}
+
+/**
+ * @brief Verify a connecting user-mode client process.
+ *
+ * Enterprise verification flow:
+ * 1. Obtain full image path via SeLocateProcessImageName.
+ * 2. Extract filename and perform case-insensitive match against
+ *    the expected service executable name (SHADOWSTRIKE_SERVICE_EXECUTABLE).
+ * 3. Verify the process token belongs to LocalSystem (S-1-5-18).
+ * 4. Compute FNV-1a hash of the full image path for audit trail.
+ *
+ * A client must pass BOTH the filename match AND the SYSTEM token
+ * check to receive full (ShadowStrikeCapServiceDefault) capabilities.
+ * All other clients receive ShadowStrikeCapMinimal.
+ *
+ * @param ClientProcessId  Process ID of the connecting client.
+ * @param Capabilities     Receives the granted capability bitmask.
+ * @param ImageHash        Receives 32-byte hash output (FNV-1a in first 4 bytes, zero-padded).
+ *
+ * @return STATUS_SUCCESS on completion (even if verification fails — the
+ *         Capabilities output distinguishes verified vs minimal).
+ */
 NTSTATUS
 ShadowStrikeVerifyClient(
     _In_ HANDLE ClientProcessId,
@@ -1905,9 +2074,21 @@ ShadowStrikeVerifyClient(
     PEPROCESS process = NULL;
     PUNICODE_STRING imageName = NULL;
     BOOLEAN isVerified = FALSE;
-    ULONG hash = 0;
-    USHORT i;
+    BOOLEAN nameMatch = FALSE;
+    BOOLEAN isSystem = FALSE;
+    ULONG hash;
     USHORT charCount;
+    PCWCH filename;
+    USHORT filenameLen;
+    USHORT expectedLen;
+    PACCESS_TOKEN token = NULL;
+    PTOKEN_USER tokenUser = NULL;
+    PSID systemSid = NULL;
+
+    //
+    // Well-known LocalSystem SID: S-1-5-18
+    //
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
 
     PAGED_CODE();
 
@@ -1915,75 +2096,135 @@ ShadowStrikeVerifyClient(
     RtlZeroMemory(ImageHash, 32);
 
     //
-    // Get process object
+    // Step 1: Get process object
     //
     status = PsLookupProcessByProcessId(ClientProcessId, &process);
     if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] VerifyClient: PsLookupProcessByProcessId failed for PID=%p: 0x%08X\n",
+                   ClientProcessId, status);
         return status;
     }
 
     //
-    // Get process image name
+    // Step 2: Get process image name
     //
     status = SeLocateProcessImageName(process, &imageName);
-    if (!NT_SUCCESS(status)) {
+    if (!NT_SUCCESS(status) || imageName == NULL) {
         ObDereferenceObject(process);
-        return status;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] VerifyClient: SeLocateProcessImageName failed: 0x%08X\n",
+                   status);
+        return NT_SUCCESS(status) ? STATUS_NOT_FOUND : status;
     }
 
     //
-    // Verification logic:
-    // In production, this would check:
-    // 1. Process image path matches expected ShadowStrike service path
-    // 2. Image is code-signed with ShadowStrike certificate
-    // 3. Image hash matches known-good hash
-    // 4. Process is running as SYSTEM or appropriate service account
-    //
-    // For now, we check if the image name contains "ShadowStrike"
+    // Step 3: Verify image filename matches expected service executable.
+    // Use length-safe comparison — no wcsstr, no null-termination assumption.
     //
     if (imageName->Buffer != NULL && imageName->Length > 0) {
+        charCount = imageName->Length / sizeof(WCHAR);
 
         //
-        // Ensure null-termination before wcsstr.
-        // SeLocateProcessImageName allocates with space for terminator,
-        // but verify MaximumLength allows it.
+        // Extract filename component from full path
         //
-        charCount = imageName->Length / sizeof(WCHAR);
-        if (imageName->MaximumLength > imageName->Length) {
-            imageName->Buffer[charCount] = L'\0';
+        filename = ShadowStrikepExtractFilename(imageName->Buffer, charCount, &filenameLen);
+
+        //
+        // Calculate expected executable name length
+        //
+        expectedLen = 0;
+        while (SHADOWSTRIKE_SERVICE_EXECUTABLE[expectedLen] != L'\0') {
+            expectedLen++;
         }
 
         //
-        // Case-insensitive substring check using safe length-bounded comparison.
-        // Only proceed with wcsstr if we confirmed null-termination above.
+        // Case-insensitive filename comparison
         //
-        if (imageName->MaximumLength > imageName->Length) {
-            if (wcsstr(imageName->Buffer, L"ShadowStrike") != NULL ||
-                wcsstr(imageName->Buffer, L"shadowstrike") != NULL) {
-                isVerified = TRUE;
+        if (filenameLen == expectedLen) {
+            nameMatch = TRUE;
+            {
+                USHORT ci;
+                for (ci = 0; ci < filenameLen; ci++) {
+                    WCHAR fc = filename[ci];
+                    WCHAR ec = SHADOWSTRIKE_SERVICE_EXECUTABLE[ci];
+
+                    if (fc >= L'A' && fc <= L'Z') { fc += 32; }
+                    if (ec >= L'A' && ec <= L'Z') { ec += 32; }
+
+                    if (fc != ec) {
+                        nameMatch = FALSE;
+                        break;
+                    }
+                }
             }
         }
 
         //
-        // Compute hash of image path for tracking (DJB2-variant)
+        // Compute FNV-1a hash of full image path for audit tracking
         //
-        for (i = 0; i < charCount; i++) {
-            hash = hash * 31 + imageName->Buffer[i];
-        }
+        hash = ShadowStrikepFnv1aHashW(imageName->Buffer, charCount);
         RtlCopyMemory(ImageHash, &hash, sizeof(hash));
     }
 
     ExFreePool(imageName);
+    imageName = NULL;
+
+    //
+    // Step 4: Verify process is running as LocalSystem (S-1-5-18).
+    // Only SYSTEM processes should control the sensor.
+    //
+    token = PsReferencePrimaryToken(process);
+    if (token != NULL) {
+        status = SeQueryInformationToken(token, TokenUser, (PVOID*)&tokenUser);
+        if (NT_SUCCESS(status) && tokenUser != NULL) {
+            //
+            // Build LocalSystem SID for comparison
+            //
+            status = RtlAllocateAndInitializeSid(
+                &ntAuthority,
+                1,
+                SECURITY_LOCAL_SYSTEM_RID,
+                0, 0, 0, 0, 0, 0, 0,
+                &systemSid
+            );
+
+            if (NT_SUCCESS(status) && systemSid != NULL) {
+                if (RtlEqualSid(tokenUser->User.Sid, systemSid)) {
+                    isSystem = TRUE;
+                }
+                RtlFreeSid(systemSid);
+            }
+
+            ExFreePool(tokenUser);
+        }
+        PsDereferencePrimaryToken(token);
+    }
+
     ObDereferenceObject(process);
+
+    //
+    // Step 5: Grant full capabilities only if BOTH checks pass.
+    //
+    if (nameMatch && isSystem) {
+        isVerified = TRUE;
+    }
 
     if (isVerified) {
         *Capabilities = (ULONG)ShadowStrikeCapServiceDefault;
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                   "[ShadowStrike] Client verified with full capabilities\n");
+                   "[ShadowStrike] Client verified: PID=%p, name=%s, system=%s, caps=0x%08X\n",
+                   ClientProcessId,
+                   nameMatch ? "match" : "no",
+                   isSystem ? "yes" : "no",
+                   *Capabilities);
     } else {
         *Capabilities = (ULONG)ShadowStrikeCapMinimal;
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Client not verified - minimal capabilities\n");
+                   "[ShadowStrike] Client not verified: PID=%p, name=%s, system=%s\n",
+                   ClientProcessId,
+                   nameMatch ? "match" : "no",
+                   isSystem ? "yes" : "no");
     }
 
     return STATUS_SUCCESS;
@@ -2003,6 +2244,7 @@ ShadowStrikeRegisterProtectedProcess(
     PSHADOWSTRIKE_PROTECTED_PROCESS_ENTRY entry = NULL;
     PLIST_ENTRY listEntry;
     BOOLEAN alreadyExists = FALSE;
+    NTSTATUS status = STATUS_SUCCESS;
 
     PAGED_CODE();
 
@@ -2014,38 +2256,7 @@ ShadowStrikeRegisterProtectedProcess(
     }
 
     //
-    // Check limit
-    //
-    if (g_DriverData.ProtectedProcessCount >= 64) {
-        return SHADOWSTRIKE_ERROR_MAX_PROTECTED;
-    }
-
-    //
-    // Check if already protected
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&g_DriverData.ProtectedProcessLock);
-
-    for (listEntry = g_DriverData.ProtectedProcessList.Flink;
-         listEntry != &g_DriverData.ProtectedProcessList;
-         listEntry = listEntry->Flink) {
-
-        entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PROTECTED_PROCESS_ENTRY, ListEntry);
-        if (entry->ProcessId == ProcessId) {
-            alreadyExists = TRUE;
-            break;
-        }
-    }
-
-    ExReleasePushLockShared(&g_DriverData.ProtectedProcessLock);
-    KeLeaveCriticalRegion();
-
-    if (alreadyExists) {
-        return STATUS_OBJECTID_EXISTS;
-    }
-
-    //
-    // Allocate new entry
+    // Pre-allocate entry BEFORE acquiring lock to minimize hold time
     //
     entry = (PSHADOWSTRIKE_PROTECTED_PROCESS_ENTRY)ExAllocatePoolZero(
         NonPagedPoolNx,
@@ -2070,11 +2281,43 @@ ShadowStrikeRegisterProtectedProcess(
     }
 
     //
-    // Add to list
+    // Perform limit check + existence check + insertion under ONE exclusive lock
+    // to eliminate the TOCTOU between separate lock acquisitions.
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_DriverData.ProtectedProcessLock);
 
+    //
+    // Check limit under lock
+    //
+    if (g_DriverData.ProtectedProcessCount >= 64) {
+        status = SHADOWSTRIKE_ERROR_MAX_PROTECTED;
+        goto Cleanup;
+    }
+
+    //
+    // Check if already protected under same lock
+    //
+    for (listEntry = g_DriverData.ProtectedProcessList.Flink;
+         listEntry != &g_DriverData.ProtectedProcessList;
+         listEntry = listEntry->Flink) {
+
+        PSHADOWSTRIKE_PROTECTED_PROCESS_ENTRY existing =
+            CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PROTECTED_PROCESS_ENTRY, ListEntry);
+        if (existing->ProcessId == ProcessId) {
+            alreadyExists = TRUE;
+            break;
+        }
+    }
+
+    if (alreadyExists) {
+        status = STATUS_OBJECTID_EXISTS;
+        goto Cleanup;
+    }
+
+    //
+    // Insert — still under the same exclusive lock
+    //
     InsertTailList(&g_DriverData.ProtectedProcessList, &entry->ListEntry);
     InterlockedIncrement(&g_DriverData.ProtectedProcessCount);
 
@@ -2086,6 +2329,12 @@ ShadowStrikeRegisterProtectedProcess(
                ProcessId, ProtectionFlags);
 
     return STATUS_SUCCESS;
+
+Cleanup:
+    ExReleasePushLockExclusive(&g_DriverData.ProtectedProcessLock);
+    KeLeaveCriticalRegion();
+    ExFreePoolWithTag(entry, SHADOWSTRIKE_POOL_TAG);
+    return status;
 }
 
 NTSTATUS
