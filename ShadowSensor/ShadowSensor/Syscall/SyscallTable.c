@@ -111,7 +111,7 @@ typedef struct _SST_BUILD_RANGE {
 
 static const SST_STATIC_DEFINITION g_SyscallsWin10_14393[] = {
     /* Process manipulation */
-    { 0x0055, "NtCreateProcess",            8,  SstCategory_Process, SstRisk_Critical,  SST_FLAG_INJECTION_RISK | SST_FLAG_CROSS_PROCESS },
+    { 0x00B3, "NtCreateProcess",            8,  SstCategory_Process, SstRisk_Critical,  SST_FLAG_INJECTION_RISK | SST_FLAG_CROSS_PROCESS },
     { 0x00B4, "NtCreateProcessEx",          9,  SstCategory_Process, SstRisk_Critical,  SST_FLAG_INJECTION_RISK | SST_FLAG_CROSS_PROCESS },
     { 0x00C7, "NtCreateUserProcess",       11,  SstCategory_Process, SstRisk_Critical,  SST_FLAG_INJECTION_RISK },
     { 0x002C, "NtOpenProcess",              4,  SstCategory_Process, SstRisk_High,      SST_FLAG_CROSS_PROCESS | SST_FLAG_HANDLE_GRANT },
@@ -156,7 +156,7 @@ static const SST_STATIC_DEFINITION g_SyscallsWin10_14393[] = {
     /* Security / privilege */
     { 0x0024, "NtOpenProcessToken",         3,  SstCategory_Security, SstRisk_High,      SST_FLAG_CREDENTIAL_RISK | SST_FLAG_HANDLE_GRANT },
     { 0x0025, "NtOpenProcessTokenEx",       4,  SstCategory_Security, SstRisk_High,      SST_FLAG_CREDENTIAL_RISK | SST_FLAG_HANDLE_GRANT },
-    { 0x0036, "NtOpenThreadToken",          4,  SstCategory_Security, SstRisk_High,      SST_FLAG_CREDENTIAL_RISK | SST_FLAG_HANDLE_GRANT },
+    { 0x0037, "NtOpenThreadToken",          4,  SstCategory_Security, SstRisk_High,      SST_FLAG_CREDENTIAL_RISK | SST_FLAG_HANDLE_GRANT },
     { 0x009C, "NtAdjustPrivilegesToken",    6,  SstCategory_Security, SstRisk_Critical,  SST_FLAG_CREDENTIAL_RISK },
     { 0x00C3, "NtDuplicateToken",           6,  SstCategory_Security, SstRisk_High,      SST_FLAG_CREDENTIAL_RISK | SST_FLAG_HANDLE_GRANT },
 
@@ -174,7 +174,7 @@ static const SST_STATIC_DEFINITION g_SyscallsWin10_14393[] = {
 
 static const SST_STATIC_DEFINITION g_SyscallsWin11_22000[] = {
     /* Process manipulation — some numbers shifted in Win11 */
-    { 0x0055, "NtCreateProcess",            8,  SstCategory_Process, SstRisk_Critical,  SST_FLAG_INJECTION_RISK | SST_FLAG_CROSS_PROCESS },
+    { 0x00B5, "NtCreateProcess",            8,  SstCategory_Process, SstRisk_Critical,  SST_FLAG_INJECTION_RISK | SST_FLAG_CROSS_PROCESS },
     { 0x00B4, "NtCreateProcessEx",          9,  SstCategory_Process, SstRisk_Critical,  SST_FLAG_INJECTION_RISK | SST_FLAG_CROSS_PROCESS },
     { 0x00C9, "NtCreateUserProcess",       11,  SstCategory_Process, SstRisk_Critical,  SST_FLAG_INJECTION_RISK },
     { 0x002C, "NtOpenProcess",              4,  SstCategory_Process, SstRisk_High,      SST_FLAG_CROSS_PROCESS | SST_FLAG_HANDLE_GRANT },
@@ -219,7 +219,7 @@ static const SST_STATIC_DEFINITION g_SyscallsWin11_22000[] = {
     /* Security / privilege */
     { 0x0024, "NtOpenProcessToken",         3,  SstCategory_Security, SstRisk_High,      SST_FLAG_CREDENTIAL_RISK | SST_FLAG_HANDLE_GRANT },
     { 0x0025, "NtOpenProcessTokenEx",       4,  SstCategory_Security, SstRisk_High,      SST_FLAG_CREDENTIAL_RISK | SST_FLAG_HANDLE_GRANT },
-    { 0x0036, "NtOpenThreadToken",          4,  SstCategory_Security, SstRisk_High,      SST_FLAG_CREDENTIAL_RISK | SST_FLAG_HANDLE_GRANT },
+    { 0x0037, "NtOpenThreadToken",          4,  SstCategory_Security, SstRisk_High,      SST_FLAG_CREDENTIAL_RISK | SST_FLAG_HANDLE_GRANT },
     { 0x009C, "NtAdjustPrivilegesToken",    6,  SstCategory_Security, SstRisk_Critical,  SST_FLAG_CREDENTIAL_RISK },
     { 0x00C5, "NtDuplicateToken",           6,  SstCategory_Security, SstRisk_High,      SST_FLAG_CREDENTIAL_RISK | SST_FLAG_HANDLE_GRANT },
 
@@ -543,15 +543,18 @@ SstpPopulateFromBuildRange(
     )
 {
     ULONG i;
+    ULONG entryIndex;
     ULONG bucketIdx;
 
     if (Range->DefinitionCount > SST_MAX_ENTRIES) {
         return STATUS_BUFFER_OVERFLOW;
     }
 
+    entryIndex = 0;
+
     for (i = 0; i < Range->DefinitionCount; i++) {
         const SST_STATIC_DEFINITION *def = &Range->Definitions[i];
-        PSST_ENTRY entry = &Table->Entries[i];
+        PSST_ENTRY entry;
 
         /* Validate syscall number is in range */
         if (def->Number >= SST_MAX_SYSCALL_NUMBER) {
@@ -562,6 +565,8 @@ SstpPopulateFromBuildRange(
         if (def->Name == NULL) {
             continue;
         }
+
+        entry = &Table->Entries[entryIndex];
 
         entry->Number = def->Number;
         entry->ArgumentCount = def->ArgumentCount;
@@ -589,6 +594,7 @@ SstpPopulateFromBuildRange(
             &Table->NameBuckets[bucketIdx].Head,
             &entry->NameHashLink);
 
+        entryIndex++;
         Table->EntryCount++;
     }
 
