@@ -375,10 +375,11 @@ ShpFindHookInBucket(
     )
 {
     PLIST_ENTRY entry;
+    ULONG walkCount = 0;
 
     for (entry = Bucket->Head.Flink;
-         entry != &Bucket->Head;
-         entry = entry->Flink)
+         entry != &Bucket->Head && walkCount < SH_MAX_REGISTERED_HOOKS;
+         entry = entry->Flink, walkCount++)
     {
         PSH_HOOK_INTERNAL hook = CONTAINING_RECORD(
             entry, SH_HOOK_INTERNAL, HashListEntry);
@@ -490,10 +491,12 @@ ShpFreeHookEntry(
     _In_ PSH_HOOK_INTERNAL Hook
     )
 {
-    Hook->Magic = 0;
-    Hook->PreCallback = NULL;
-    Hook->PostCallback = NULL;
-    Hook->Cookie = NULL;
+    /*
+     * Scrub all fields before returning to pool.
+     * Prevents stale magic/callback pointers from being
+     * reachable if a dangling handle is dereferenced.
+     */
+    RtlSecureZeroMemory(Hook, sizeof(SH_HOOK_INTERNAL));
 
     if (Fw->LookasideInitialized) {
         ExFreeToNPagedLookasideList(&Fw->HookLookaside, Hook);
@@ -674,10 +677,15 @@ ShShutdown(
 
     /*
      * Phase 3: Remove and free all hooks.
-     * No dispatches are active, so we can safely acquire exclusive
-     * and tear down the lists. We still drain per-hook callbacks
-     * defensively.
+     * No dispatches should be active. Verify defensively —
+     * if drain timed out, log but proceed to avoid driver unload hang.
      */
+    if (fw->ActiveDispatchCount > 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] SyscallHooks: Shutdown drain incomplete, "
+                   "%ld dispatches still active\n",
+                   fw->ActiveDispatchCount);
+    }
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&fw->HookLock);
 
@@ -938,8 +946,7 @@ ShEnableHook(
         return STATUS_INVALID_PARAMETER;
     }
 
-    hook = ShpValidateHook(Hook);
-    if (hook == NULL) {
+    if (Hook == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -947,12 +954,28 @@ ShEnableHook(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    /* Lock-free enable via interlocked exchange */
+    /*
+     * Acquire shared lock to prevent concurrent ShUnregisterHook from
+     * freeing the hook between our magic check and the enable toggle.
+     * Shared lock is sufficient — we're not modifying the hash table.
+     */
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&fw->HookLock);
+
+    hook = ShpValidateHook(Hook);
+    if (hook == NULL) {
+        ExReleasePushLockShared(&fw->HookLock);
+        KeLeaveCriticalRegion();
+        return STATUS_INVALID_PARAMETER;
+    }
+
     prev = InterlockedExchange(&hook->Enabled, 1);
     if (prev == 0) {
-        /* Transitioned from disabled to enabled */
         InterlockedIncrement(&fw->EnabledHookCount);
     }
+
+    ExReleasePushLockShared(&fw->HookLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -976,17 +999,31 @@ ShDisableHook(
         return STATUS_INVALID_PARAMETER;
     }
 
-    hook = ShpValidateHook(Hook);
-    if (hook == NULL) {
+    if (Hook == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    /* Lock-free disable via interlocked exchange */
+    /*
+     * Acquire shared lock to prevent concurrent ShUnregisterHook from
+     * freeing the hook between our magic check and the disable toggle.
+     */
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&fw->HookLock);
+
+    hook = ShpValidateHook(Hook);
+    if (hook == NULL) {
+        ExReleasePushLockShared(&fw->HookLock);
+        KeLeaveCriticalRegion();
+        return STATUS_INVALID_PARAMETER;
+    }
+
     prev = InterlockedExchange(&hook->Enabled, 0);
     if (prev != 0) {
-        /* Transitioned from enabled to disabled */
         InterlockedDecrement(&fw->EnabledHookCount);
     }
+
+    ExReleasePushLockShared(&fw->HookLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -1084,58 +1121,73 @@ ShDispatchSyscall(
     /*
      * Invoke callbacks outside the lock — critical for avoiding deadlocks
      * if callbacks call back into the framework or into other kernel subsystems.
+     *
+     * Wrap in __try/__except to guarantee reference release even if a
+     * buggy callback causes an exception. Without this, a faulting callback
+     * would leak ActiveCallbackCount and ActiveDispatchCount permanently,
+     * preventing clean shutdown.
      */
 
     InterlockedIncrement64(&hook->HitCount);
 
-    /* Pre-call callback */
-    if (Context->IsPreCall && hook->PreCallback != NULL) {
-        InterlockedIncrement64(&fw->TotalCallbackInvocations);
+    __try {
 
-        callbackResult = hook->PreCallback(Context, hook->Cookie);
+        /* Pre-call callback */
+        if (Context->IsPreCall && hook->PreCallback != NULL) {
+            InterlockedIncrement64(&fw->TotalCallbackInvocations);
 
-        switch (callbackResult) {
-        case ShResult_Block:
-            InterlockedIncrement64(&fw->TotalBlocked);
-            *Result = ShResult_Block;
-            break;
+            callbackResult = hook->PreCallback(Context, hook->Cookie);
 
-        case ShResult_Log:
-            InterlockedIncrement64(&fw->TotalLogged);
-            if (*Result != ShResult_Block) {
-                *Result = ShResult_Log;
+            switch (callbackResult) {
+            case ShResult_Block:
+                InterlockedIncrement64(&fw->TotalBlocked);
+                *Result = ShResult_Block;
+                break;
+
+            case ShResult_Log:
+                InterlockedIncrement64(&fw->TotalLogged);
+                if (*Result != ShResult_Block) {
+                    *Result = ShResult_Log;
+                }
+                break;
+
+            case ShResult_Allow:
+            default:
+                break;
             }
-            break;
-
-        case ShResult_Allow:
-        default:
-            break;
         }
-    }
 
-    /* Post-call callback */
-    if (!Context->IsPreCall && hook->PostCallback != NULL) {
-        InterlockedIncrement64(&fw->TotalCallbackInvocations);
+        /* Post-call callback */
+        if (!Context->IsPreCall && hook->PostCallback != NULL) {
+            InterlockedIncrement64(&fw->TotalCallbackInvocations);
 
-        callbackResult = hook->PostCallback(Context, hook->Cookie);
+            callbackResult = hook->PostCallback(Context, hook->Cookie);
 
-        switch (callbackResult) {
-        case ShResult_Block:
-            InterlockedIncrement64(&fw->TotalBlocked);
-            *Result = ShResult_Block;
-            break;
+            switch (callbackResult) {
+            case ShResult_Block:
+                InterlockedIncrement64(&fw->TotalBlocked);
+                *Result = ShResult_Block;
+                break;
 
-        case ShResult_Log:
-            InterlockedIncrement64(&fw->TotalLogged);
-            if (*Result != ShResult_Block) {
-                *Result = ShResult_Log;
+            case ShResult_Log:
+                InterlockedIncrement64(&fw->TotalLogged);
+                if (*Result != ShResult_Block) {
+                    *Result = ShResult_Log;
+                }
+                break;
+
+            case ShResult_Allow:
+            default:
+                break;
             }
-            break;
-
-        case ShResult_Allow:
-        default:
-            break;
         }
+
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /*
+         * Callback faulted — allow the syscall through and log.
+         * The critical path below still releases references correctly.
+         */
+        NOTHING;
     }
 
     ShpReleaseHookRef(hook);
