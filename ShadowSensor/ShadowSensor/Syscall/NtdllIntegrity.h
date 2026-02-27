@@ -132,6 +132,9 @@ NTSTATUS NiCompareToClean(_In_ PNI_MONITOR Monitor, _In_ HANDLE ProcessId, _Out_
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID NiFreeState(_In_ PNI_MONITOR Monitor, _In_ PNI_PROCESS_NTDLL State);
 
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID NiFreeFunctionState(_In_ PNI_MONITOR Monitor, _In_ PNI_FUNCTION_STATE FunctionState);
+
 #ifdef __cplusplus
 }
 #endif

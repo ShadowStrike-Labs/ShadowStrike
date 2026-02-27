@@ -50,8 +50,10 @@
 --*/
 
 #include "NtdllIntegrity.h"
+#include "../../Shared/KernelProcessTypes.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/HashUtils.h"
+#include <ntimage.h>
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, NiInitialize)
@@ -61,6 +63,7 @@
 #pragma alloc_text(PAGE, NiDetectHooks)
 #pragma alloc_text(PAGE, NiCompareToClean)
 #pragma alloc_text(PAGE, NiFreeState)
+#pragma alloc_text(PAGE, NiFreeFunctionState)
 #endif
 
 //=============================================================================
@@ -530,17 +533,32 @@ Arguments:
     KeMemoryBarrier();
 
     //
-    // Wait for all in-flight operations to complete (drain)
+    // Wait for all in-flight operations to complete (drain).
+    // Clear event BEFORE checking count to prevent race: an operation
+    // completing between check and clear would set the event, then
+    // we'd clear it and wait forever (deadlock).
     //
+    KeClearEvent(&Monitor->DrainEvent);
+
     if (Monitor->ActiveOperations > 0) {
-        KeClearEvent(&Monitor->DrainEvent);
-        KeWaitForSingleObject(
+        LARGE_INTEGER drainTimeout;
+        NTSTATUS waitStatus;
+
+        drainTimeout.QuadPart = -10LL * 1000 * 1000 * 10; // 10 seconds
+
+        waitStatus = KeWaitForSingleObject(
             &Monitor->DrainEvent,
             Executive,
             KernelMode,
             FALSE,
-            NULL
+            &drainTimeout
             );
+
+        if (waitStatus == STATUS_TIMEOUT) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] NtdllIntegrity: drain timeout, %ld ops still active\n",
+                       Monitor->ActiveOperations);
+        }
     }
 
     //
@@ -1088,13 +1106,15 @@ Return Value:
     if (processState != NULL) {
         PLIST_ENTRY entry;
         PNI_FUNCTION_STATE funcState;
+        ULONG walkCount = 0;
 
         FltAcquirePushLockShared(&processState->FunctionLock);
 
         for (entry = processState->FunctionList.Flink;
-             entry != &processState->FunctionList;
+             entry != &processState->FunctionList && walkCount < NI_MAX_FUNCTIONS;
              entry = entry->Flink) {
 
+            walkCount++;
             funcState = CONTAINING_RECORD(entry, NI_FUNCTION_STATE, ListEntry);
 
             if (funcState->IsModified &&
@@ -1277,6 +1297,45 @@ Arguments:
 }
 
 
+_Use_decl_annotations_
+VOID
+NiFreeFunctionState(
+    _In_ PNI_MONITOR Monitor,
+    _In_ PNI_FUNCTION_STATE FunctionState
+    )
+/*++
+
+Routine Description:
+
+    Frees a single function state returned by NiCheckFunction or NiDetectHooks.
+    The caller MUST pass the same monitor that produced the state.
+
+Arguments:
+
+    Monitor - The owning monitor (needed for lookaside list).
+    FunctionState - Function state to free.
+
+--*/
+{
+    PNI_MONITOR_INTERNAL monitorInternal;
+
+    PAGED_CODE();
+
+    if (Monitor == NULL || FunctionState == NULL) {
+        return;
+    }
+
+    monitorInternal = CONTAINING_RECORD(Monitor, NI_MONITOR_INTERNAL, Monitor);
+
+    if (monitorInternal->Signature != NI_SIGNATURE) {
+        return;
+    }
+
+    RtlSecureZeroMemory(FunctionState, sizeof(NI_FUNCTION_STATE));
+    ExFreeToPagedLookasideList(&monitorInternal->FunctionLookaside, FunctionState);
+}
+
+
 //=============================================================================
 // Internal Functions - NTDLL Capture
 //=============================================================================
@@ -1414,7 +1473,7 @@ Routine Description:
     NTSTATUS status;
     PEPROCESS process = NULL;
     PPEB peb = NULL;
-    PPEB_LDR_DATA ldrData = NULL;
+    PKM_PEB_LDR_DATA ldrData = NULL;
     PLIST_ENTRY listHead;
     PLIST_ENTRY listEntry;
     KAPC_STATE apcState;
@@ -1443,31 +1502,31 @@ Routine Description:
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        ProbeForRead(peb, sizeof(PEB), sizeof(PVOID));
-        ldrData = peb->Ldr;
+        ProbeForRead(peb, KM_PEB_PROBE_SIZE, sizeof(PVOID));
+        ldrData = ((PKM_PEB)peb)->Ldr;
 
         if (ldrData == NULL) {
             status = STATUS_NOT_FOUND;
             __leave;
         }
 
-        ProbeForRead(ldrData, sizeof(PEB_LDR_DATA), sizeof(PVOID));
+        ProbeForRead(ldrData, KM_PEB_LDR_PROBE_SIZE, sizeof(PVOID));
 
         listHead = &ldrData->InMemoryOrderModuleList;
         listEntry = listHead->Flink;
 
         while (listEntry != listHead && iterationCount < NI_MAX_LDR_MODULES) {
-            PLDR_DATA_TABLE_ENTRY ldrEntry;
+            PKM_LDR_DATA_TABLE_ENTRY ldrEntry;
 
             iterationCount++;
 
             ldrEntry = CONTAINING_RECORD(
                 listEntry,
-                LDR_DATA_TABLE_ENTRY,
+                KM_LDR_DATA_TABLE_ENTRY,
                 InMemoryOrderLinks
                 );
 
-            ProbeForRead(ldrEntry, sizeof(LDR_DATA_TABLE_ENTRY), sizeof(PVOID));
+            ProbeForRead(ldrEntry, KM_LDR_ENTRY_PROBE_SIZE, sizeof(PVOID));
 
             if (ldrEntry->BaseDllName.Buffer != NULL &&
                 ldrEntry->BaseDllName.Length > 0) {
@@ -2191,11 +2250,13 @@ Routine Description:
 {
     PLIST_ENTRY entry;
     PNI_PROCESS_NTDLL processState;
+    ULONG iterations = 0;
 
     for (entry = Monitor->ProcessList.Flink;
-         entry != &Monitor->ProcessList;
+         entry != &Monitor->ProcessList && iterations < NI_MAX_PROCESSES;
          entry = entry->Flink) {
 
+        iterations++;
         processState = CONTAINING_RECORD(entry, NI_PROCESS_NTDLL, ListEntry);
 
         if (processState->ProcessId == ProcessId) {
