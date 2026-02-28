@@ -66,12 +66,18 @@ ZwWriteVirtualMemory(
 // ============================================================================
 
 #define SC_MAGIC                        0x53434D4E  // 'SCMN'
-#define SC_SHUTDOWN_DRAIN_TIMEOUT_MS    5000
+//
+// Shutdown drain is INFINITE — we MUST wait for all in-flight operations
+// to complete before freeing sub-modules and process contexts. A timeout
+// here leads to use-after-free and BSOD under adversarial load.
+//
 
 //
-// NTDLL integrity is expensive. Check once per N syscalls per process.
+// NTDLL integrity is expensive. Check interval is randomized per-process
+// in [SC_NTDLL_CHECK_MIN, SC_NTDLL_CHECK_MAX) to prevent timing attacks.
 //
-#define SC_NTDLL_CHECK_INTERVAL         500
+#define SC_NTDLL_CHECK_MIN              200
+#define SC_NTDLL_CHECK_MAX              800
 
 //
 // Threat score thresholds
@@ -303,7 +309,6 @@ _Use_decl_annotations_
 VOID
 ScMonitorShutdown(VOID)
 {
-    LARGE_INTEGER timeout;
     PLIST_ENTRY entry;
     PLIST_ENTRY next;
 
@@ -324,9 +329,15 @@ ScMonitorShutdown(VOID)
     KeClearEvent(&g_ScState.ShutdownEvent);
     ScpReleaseReference();
 
-    timeout.QuadPart = -((LONGLONG)SC_SHUTDOWN_DRAIN_TIMEOUT_MS * 10000);
+    //
+    // Wait INDEFINITELY for in-flight operations to drain.
+    // A timeout here would allow use-after-free when we free sub-modules
+    // and process contexts below. Under adversarial load, threads may be
+    // deep inside sub-module calls (NI reading process memory, CSA walking
+    // stacks). We MUST wait for them to finish.
+    //
     (VOID)KeWaitForSingleObject(
-        &g_ScState.ShutdownEvent, Executive, KernelMode, FALSE, &timeout);
+        &g_ScState.ShutdownEvent, Executive, KernelMode, FALSE, NULL);
 
     //
     // Shutdown sub-modules in reverse initialization order
@@ -621,14 +632,22 @@ ScpCreateProcessContext(
     ctx->ProcessId = ProcessId;
 
     //
-    // Reference the process object for lifetime safety
+    // Reference the process object for lifetime safety.
+    // If the process already exited (race between hook entry and lookup),
+    // do NOT create a context — it would be permanently leaked since
+    // no process-exit notification will fire for a dead PID.
     //
     status = PsLookupProcessByProcessId(
         (HANDLE)(ULONG_PTR)ProcessId, &process);
-    if (NT_SUCCESS(status)) {
-        ctx->ProcessObject = process;   // Already referenced by PsLookup
-        ctx->IsWoW64 = (BOOLEAN)(PsGetProcessWow64Process(process) != NULL);
+    if (!NT_SUCCESS(status)) {
+        ScpFreeProcessContext(ctx);
+        ExReleasePushLockExclusive(&g_ScState.ProcessLock);
+        KeLeaveCriticalRegion();
+        return STATUS_PROCESS_IS_TERMINATING;
     }
+
+    ctx->ProcessObject = process;   // Already referenced by PsLookup
+    ctx->IsWoW64 = (BOOLEAN)(PsGetProcessWow64Process(process) != NULL);
 
     ctx->ProcessCreateTime = (UINT64)KeQueryPerformanceCounter(NULL).QuadPart;
 
@@ -677,11 +696,13 @@ ScpPopulateProcessNtdllInfo(
         Context->NtdllSize = (UINT64)ntdllState->NtdllSize;
 
         //
-        // Populate integrity state
+        // Populate integrity state.
+        // Do NOT set IsIntact=TRUE without actual verification.
+        // The first syscall will trigger an immediate NI check (callCount==1).
         //
         Context->NtdllIntegrity.NtdllBase = Context->NtdllBase;
         Context->NtdllIntegrity.NtdllSize = Context->NtdllSize;
-        Context->NtdllIntegrity.IsIntact = TRUE;
+        Context->NtdllIntegrity.IsIntact = FALSE;
 
         if (ntdllState->HashValid) {
             RtlCopyMemory(
@@ -724,13 +745,20 @@ ScpAddSuspiciousCaller(
     )
 /*++
     Adds to the circular buffer of suspicious callers.
+    Uses atomic increment-first to claim slots and avoid race collisions.
 --*/
 {
+    LONG claimed;
     UINT32 index;
 
-    index = Context->SuspiciousCallerCount % SC_MAX_SUSPICIOUS_CALLERS;
+    //
+    // Atomically claim a slot index FIRST, then write.
+    // This prevents two threads from computing the same index
+    // and silently overwriting each other.
+    //
+    claimed = InterlockedIncrement((volatile LONG*)&Context->SuspiciousCallerCount) - 1;
+    index = ((UINT32)claimed) % SC_MAX_SUSPICIOUS_CALLERS;
     Context->SuspiciousCallers[index] = CallerAddress;
-    InterlockedIncrement((volatile LONG*)&Context->SuspiciousCallerCount);
 }
 
 
@@ -1157,12 +1185,24 @@ Return Value:
     //
     // Step 6: Periodic NTDLL Integrity Check (delegate to NI)
     //
+    // Check interval is randomized per-process using a hash of ProcessId
+    // to prevent attackers from predicting when the next check fires.
+    // Also checks on the FIRST syscall (callCount==1) so newly created
+    // processes are not given a free 500-syscall window.
+    //
     if (g_ScState.NtdllIntegrityMonitor != NULL &&
         procCtx->NtdllBase != 0) {
 
         LONG64 callCount = InterlockedIncrement64(&procCtx->TotalSyscalls);
 
-        if ((callCount % SC_NTDLL_CHECK_INTERVAL) == 0) {
+        //
+        // Per-process randomized interval in [SC_NTDLL_CHECK_MIN, SC_NTDLL_CHECK_MAX)
+        // Uses a simple hash of ProcessId — different per process but deterministic.
+        //
+        ULONG perProcessInterval = SC_NTDLL_CHECK_MIN +
+            ((ProcessId * 2654435761UL) % (SC_NTDLL_CHECK_MAX - SC_NTDLL_CHECK_MIN));
+
+        if (callCount == 1 || (callCount % perProcessInterval) == 0) {
             BOOLEAN isModified = FALSE;
 
             NTSTATUS niStatus = NiCompareToClean(
@@ -1176,7 +1216,7 @@ Return Value:
                 threatScore += 300;
                 procCtx->NtdllIntegrity.IsIntact = FALSE;
                 procCtx->NtdllIntegrity.IsHooked = TRUE;
-                procCtx->Flags |= SC_PROC_FLAG_NTDLL_MODIFIED;
+                InterlockedOr((volatile LONG*)&procCtx->Flags, SC_PROC_FLAG_NTDLL_MODIFIED);
             }
 
             procCtx->NtdllIntegrity.LastVerifyTime =
@@ -1240,10 +1280,10 @@ Return Value:
 
         if (detectFlags & SC_DETECT_DIRECT_SYSCALL) {
             InterlockedIncrement64(&procCtx->DirectSyscalls);
-            procCtx->Flags |= SC_PROC_FLAG_DIRECT_SYSCALLS;
+            InterlockedOr((volatile LONG*)&procCtx->Flags, SC_PROC_FLAG_DIRECT_SYSCALLS);
         }
         if (detectFlags & SC_DETECT_HEAVENS_GATE) {
-            procCtx->Flags |= SC_PROC_FLAG_HEAVENS_GATE;
+            InterlockedOr((volatile LONG*)&procCtx->Flags, SC_PROC_FLAG_HEAVENS_GATE);
         }
 
         InterlockedIncrement64(&procCtx->SuspiciousSyscalls);
@@ -1917,24 +1957,34 @@ ScpEmitEvasionEvent(
     }
 
     //
-    // Build compact event payload on stack
+    // Allocate event payload from the EventLookaside (not stack).
+    // SYSCALL_CALL_CONTEXT is ~800 bytes — too large for kernel stack,
+    // especially in a deep call chain (hook→analysis→sub-modules→emit).
     //
-    SYSCALL_CALL_CONTEXT eventData = { 0 };
-    eventData.SyscallNumber = SyscallNumber;
-    eventData.ProcessId = ProcessId;
-    eventData.DetectionFlags = DetectionFlags;
-    eventData.ThreatScore = ThreatScore;
+    PSYSCALL_CALL_CONTEXT eventData = (PSYSCALL_CALL_CONTEXT)
+        ExAllocateFromNPagedLookasideList(&g_ScState.EventLookaside);
+    if (eventData == NULL) {
+        return;
+    }
+
+    RtlZeroMemory(eventData, sizeof(SYSCALL_CALL_CONTEXT));
+    eventData->SyscallNumber = SyscallNumber;
+    eventData->ProcessId = ProcessId;
+    eventData->DetectionFlags = DetectionFlags;
+    eventData->ThreatScore = ThreatScore;
 
     (VOID)BeEngineSubmitEvent(
         eventType,
         BehaviorCategory_DefenseEvasion,
         ProcessId,
-        &eventData,
-        sizeof(eventData),
+        eventData,
+        sizeof(SYSCALL_CALL_CONTEXT),
         ThreatScore,
         ShouldBlock,
         &response
         );
+
+    ExFreeToNPagedLookasideList(&g_ScState.EventLookaside, eventData);
 
     if (response == BehaviorResponse_Terminate) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
