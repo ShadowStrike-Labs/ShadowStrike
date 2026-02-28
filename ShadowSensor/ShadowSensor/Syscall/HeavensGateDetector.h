@@ -67,6 +67,12 @@ typedef enum _HGD_GATE_TYPE {
 } HGD_GATE_TYPE;
 
 // ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
+typedef struct _HGD_TRANSITION_INFO HGD_TRANSITION_INFO, *PHGD_TRANSITION_INFO;
+
+// ============================================================================
 // CALLBACK TYPE
 // ============================================================================
 
@@ -79,7 +85,7 @@ typedef enum _HGD_GATE_TYPE {
 //
 typedef VOID
 (NTAPI *HGD_DETECTION_CALLBACK)(
-    _In_ struct _HGD_TRANSITION_INFO* Transition,
+    _In_ PHGD_TRANSITION_INFO Transition,
     _In_opt_ PVOID Context
     );
 
@@ -92,7 +98,7 @@ typedef VOID
 // Returned by HgdAnalyzeTransition and HgdGetTransitions.
 // Must be freed with HgdFreeTransition.
 //
-typedef struct _HGD_TRANSITION_INFO {
+struct _HGD_TRANSITION_INFO {
     HANDLE ProcessId;
     HANDLE ThreadId;
 
@@ -127,7 +133,7 @@ typedef struct _HGD_TRANSITION_INFO {
 
     ULONG SuspicionScore;
     LARGE_INTEGER Timestamp;
-} HGD_TRANSITION_INFO, *PHGD_TRANSITION_INFO;
+};
 
 //
 // Opaque detector handle.

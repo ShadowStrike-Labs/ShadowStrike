@@ -57,9 +57,19 @@ Detection Techniques Covered:
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/ProcessUtils.h"
 #include "../Sync/WorkQueue.h"
-#include "../Tracing/Trace.h"
 #include "../Tracing/WppConfig.h"
+#include "../../Shared/KernelProcessTypes.h"
 #include <ntstrsafe.h>
+
+//
+// TraceEvents is a WPP-generated macro. Until WPP preprocessing is enabled
+// in the build system, provide a no-op fallback to allow compilation.
+//
+#ifndef TraceEvents
+#define TraceEvents(Level, Flags, Msg, ...) \
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL, \
+        "[ShadowStrike][HGD] " Msg "\n", ##__VA_ARGS__)
+#endif
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, HgdInitialize)
@@ -651,15 +661,21 @@ Arguments:
     }
 
     //
-    // Wait for any in-flight work items to complete
+    // Wait for any in-flight work items to complete.
+    // Clear the event BEFORE checking the count to avoid the race where
+    // the last work item completes between our check and the wait.
     //
+    KeClearEvent(&Detector->ShutdownComplete);
     if (InterlockedCompareExchange(&Detector->PendingWorkItems, 0, 0) > 0) {
+        LARGE_INTEGER Timeout;
+        Timeout.QuadPart = -10LL * 1000 * 1000 * 10;  // 10 seconds
+
         KeWaitForSingleObject(
             &Detector->ShutdownComplete,
             Executive,
             KernelMode,
             FALSE,
-            NULL
+            &Timeout
             );
     }
 
@@ -984,7 +1000,6 @@ Return Value:
     PHGD_TRANSITION_INTERNAL InternalTransition;
     PHGD_TRANSITION_INFO Copy;
     ULONG Found = 0;
-    ULONG i;
 
     PAGED_CODE();
 
@@ -1895,28 +1910,28 @@ Routine Description:
     }
 
     //
-    // Check if address is in known modules
+    // Check if address is in known modules (overflow-safe range check)
     //
-    if (ProcessContext->NtdllBase32 != NULL) {
+    if (ProcessContext->NtdllBase32 != NULL && ProcessContext->NtdllSize32 != 0) {
         ULONG_PTR TransAddr = (ULONG_PTR)TransitionAddress;
         ULONG_PTR NtdllStart = (ULONG_PTR)ProcessContext->NtdllBase32;
-        ULONG_PTR NtdllEnd = NtdllStart + ProcessContext->NtdllSize32;
 
-        if (TransAddr >= NtdllStart && TransAddr < NtdllEnd) {
+        if (TransAddr >= NtdllStart &&
+            (TransAddr - NtdllStart) < ProcessContext->NtdllSize32) {
             *SuspicionScore = HGD_SUSPICION_LOW;
             return HgdGate_WoW64Transition;
         }
     }
 
     //
-    // Check if in wow64cpu.dll range
+    // Check if in wow64cpu.dll range (overflow-safe)
     //
-    if (ProcessContext->Wow64CpuBase != NULL) {
+    if (ProcessContext->Wow64CpuBase != NULL && ProcessContext->Wow64CpuSize != 0) {
         ULONG_PTR TransAddr = (ULONG_PTR)TransitionAddress;
         ULONG_PTR CpuStart = (ULONG_PTR)ProcessContext->Wow64CpuBase;
-        ULONG_PTR CpuEnd = CpuStart + ProcessContext->Wow64CpuSize;
 
-        if (TransAddr >= CpuStart && TransAddr < CpuEnd) {
+        if (TransAddr >= CpuStart &&
+            (TransAddr - CpuStart) < ProcessContext->Wow64CpuSize) {
             *SuspicionScore = 0;
             return HgdGate_WoW64Transition;
         }
@@ -2361,12 +2376,13 @@ Routine Description:
     NTSTATUS Status;
     PEPROCESS Process = NULL;
     PPEB Peb = NULL;
-    PPEB_LDR_DATA LdrData = NULL;
+    PKM_PEB_LDR_DATA LdrData = NULL;
     PLIST_ENTRY ListHead;
     PLIST_ENTRY ListEntry;
     KAPC_STATE ApcState;
     BOOLEAN Found = FALSE;
     BOOLEAN Attached = FALSE;
+    ULONG WalkCount = 0;
 
     *ModuleBase = NULL;
     *ModuleSize = 0;
@@ -2391,29 +2407,29 @@ Routine Description:
         KeStackAttachProcess(Process, &ApcState);
         Attached = TRUE;
 
-        ProbeForRead(Peb, sizeof(PEB), sizeof(PVOID));
-        LdrData = Peb->Ldr;
+        ProbeForRead(Peb, KM_PEB_PROBE_SIZE, sizeof(PVOID));
+        LdrData = (PKM_PEB_LDR_DATA)((PKM_PEB)Peb)->Ldr;
 
         if (LdrData == NULL) {
             Status = STATUS_NOT_FOUND;
             __leave;
         }
 
-        ProbeForRead(LdrData, sizeof(PEB_LDR_DATA), sizeof(PVOID));
+        ProbeForRead(LdrData, KM_PEB_LDR_PROBE_SIZE, sizeof(PVOID));
 
         ListHead = &LdrData->InMemoryOrderModuleList;
         ListEntry = ListHead->Flink;
 
-        while (ListEntry != ListHead) {
-            PLDR_DATA_TABLE_ENTRY LdrEntry;
+        while (ListEntry != ListHead && WalkCount < KM_MAX_MODULE_WALK_COUNT) {
+            PKM_LDR_DATA_TABLE_ENTRY LdrEntry;
 
             LdrEntry = CONTAINING_RECORD(
                 ListEntry,
-                LDR_DATA_TABLE_ENTRY,
+                KM_LDR_DATA_TABLE_ENTRY,
                 InMemoryOrderLinks
                 );
 
-            ProbeForRead(LdrEntry, sizeof(LDR_DATA_TABLE_ENTRY), sizeof(PVOID));
+            ProbeForRead(LdrEntry, KM_LDR_ENTRY_PROBE_SIZE, sizeof(PVOID));
 
             if (LdrEntry->BaseDllName.Buffer != NULL &&
                 LdrEntry->BaseDllName.Length > 0 &&
@@ -2435,6 +2451,7 @@ Routine Description:
             }
 
             ListEntry = ListEntry->Flink;
+            WalkCount++;
         }
 
         if (!Found) {
