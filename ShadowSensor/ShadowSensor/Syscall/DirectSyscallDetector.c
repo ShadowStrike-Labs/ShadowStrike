@@ -72,6 +72,7 @@
 #define DSD_SHUTDOWN_TIMEOUT_MS             5000
 #define DSD_RATE_LIMIT_WINDOW_100NS         10000000LL  // 1 second in 100ns units
 #define DSD_MAX_MODULE_NAME_CHARS           260
+#define DSD_TARTARUS_EXTENDED_SCAN_BYTES    256
 
 // ============================================================================
 // SYSCALL INSTRUCTION PATTERNS
@@ -202,6 +203,12 @@ typedef struct _DSD_DETECTION_INTERNAL {
     ULONG SysWhispersVersion;
     BOOLEAN HasSysWhispersPattern;
 
+    //
+    // Tartarus Gate exception-based evasion indicators
+    //
+    BOOLEAN HasExceptionSetup;
+    BOOLEAN HasExceptionTrigger;
+
 } DSD_DETECTION_INTERNAL, *PDSD_DETECTION_INTERNAL;
 
 typedef struct _DSD_WHITELIST_ENTRY {
@@ -295,7 +302,9 @@ DsdpIsHalosGatePattern(
 static BOOLEAN
 DsdpIsTartarusGatePattern(
     _In_reads_bytes_(Length) PUCHAR Instructions,
-    _In_ ULONG Length
+    _In_ ULONG Length,
+    _Out_opt_ PBOOLEAN OutExceptionSetup,
+    _Out_opt_ PBOOLEAN OutExceptionTrigger
 );
 
 static BOOLEAN
@@ -711,11 +720,56 @@ DsdAnalyzeSyscall(
         InterlockedIncrement64(&detector->Base.Stats.HalosGateCalls);
     }
 
-    // 6. Tartarus Gate
-    if (technique == DsdTechnique_None &&
-        DsdpIsTartarusGatePattern(instructionBuffer, capturedLength)) {
-        technique = DsdTechnique_TartarusGate;
-        InterlockedIncrement64(&detector->Base.Stats.TartarusGateCalls);
+    // 6. Tartarus Gate (exception-based SSN resolution)
+    if (technique == DsdTechnique_None) {
+        BOOLEAN excSetup = FALSE;
+        BOOLEAN excTrigger = FALSE;
+        if (DsdpIsTartarusGatePattern(instructionBuffer, capturedLength,
+                                       &excSetup, &excTrigger)) {
+            technique = DsdTechnique_TartarusGate;
+            detection->HasExceptionSetup = TRUE;
+            detection->HasExceptionTrigger = TRUE;
+            InterlockedIncrement64(&detector->Base.Stats.TartarusGateCalls);
+        } else {
+            //
+            // Partial evidence found in the 64-byte window.
+            // SEH/VEH setup and exception trigger are often far apart.
+            // Do a wider scan to catch scattered Tartarus patterns.
+            //
+            if (excSetup || excTrigger) {
+                PUCHAR extBuf = (PUCHAR)ShadowStrikeAllocatePoolWithTag(
+                    NonPagedPoolNx,
+                    DSD_TARTARUS_EXTENDED_SCAN_BYTES,
+                    DSD_POOL_TAG);
+
+                if (extBuf != NULL) {
+                    BOOLEAN extSetup = FALSE;
+                    BOOLEAN extTrigger = FALSE;
+                    NTSTATUS extStatus = DsdpSafeReadProcessMemory(
+                        ProcessId,
+                        CallerAddress,
+                        extBuf,
+                        DSD_TARTARUS_EXTENDED_SCAN_BYTES);
+
+                    if (NT_SUCCESS(extStatus)) {
+                        if (DsdpIsTartarusGatePattern(
+                                extBuf,
+                                DSD_TARTARUS_EXTENDED_SCAN_BYTES,
+                                &extSetup,
+                                &extTrigger)) {
+                            technique = DsdTechnique_TartarusGate;
+                            detection->HasExceptionSetup = extSetup;
+                            detection->HasExceptionTrigger = extTrigger;
+                            InterlockedIncrement64(
+                                &detector->Base.Stats.TartarusGateCalls);
+                        }
+                    }
+
+                    RtlSecureZeroMemory(extBuf, DSD_TARTARUS_EXTENDED_SCAN_BYTES);
+                    ShadowStrikeFreePoolWithTag(extBuf, DSD_POOL_TAG);
+                }
+            }
+        }
     }
 
     // 7. Indirect syscall (requires real RIP for displacement calc)
@@ -910,7 +964,7 @@ DsdDetectTechnique(
         goto Cleanup;
     }
 
-    if (DsdpIsTartarusGatePattern(buffer, Length)) {
+    if (DsdpIsTartarusGatePattern(buffer, Length, NULL, NULL)) {
         *Technique = DsdTechnique_TartarusGate;
         goto Cleanup;
     }
@@ -1960,70 +2014,421 @@ DsdpIsHalosGatePattern(
 /**
  * @brief Detect Tartarus Gate: exception-based SSN resolution.
  *
- * Requires BOTH an SEH frame setup (fs:[0] push/pop pattern) AND
- * an intentional exception trigger (int3, ud2). The old logic
- * matched ANY fs:/gs: prefix or ANY call instruction, which
- * matches virtually all x64 code. This version requires the
- * actual SEH frame setup sequence.
+ * Comprehensive detection covering all known variants:
+ *
+ * Exception handler registration:
+ *   - SEH via fs:[0] (x86/WoW64) with all register encodings
+ *   - VEH via AddVectoredExceptionHandler call pattern (x64 + x86)
+ *   - SetUnhandledExceptionFilter call pattern
+ *   - x64 gs: TEB manipulation
+ *
+ * Intentional exception triggers:
+ *   - int 3 (CC) — breakpoint
+ *   - ud2 (0F 0B) — undefined instruction
+ *   - int 2d (CD 2D) — debug service
+ *   - int 1 (CD 01) — single step
+ *   - int 29h (CD 29) — fast fail
+ *   - hlt (F4) — privilege exception in ring 3
+ *   - in/out (EC/ED/EE/EF) — I/O privilege exception
+ *   - Null pointer dereference (xor reg,reg + mov [reg],X)
+ *   - Write to NULL (C7 05 00000000 ...)
+ *   - Division by zero (xor reg,reg + div reg)
+ *
+ * Reports partial evidence via output parameters so the caller can
+ * request an extended scan window if only one half was found.
  */
 static BOOLEAN
 DsdpIsTartarusGatePattern(
     _In_reads_bytes_(Length) PUCHAR Instructions,
-    _In_ ULONG Length
+    _In_ ULONG Length,
+    _Out_opt_ PBOOLEAN OutExceptionSetup,
+    _Out_opt_ PBOOLEAN OutExceptionTrigger
 )
 {
-    BOOLEAN hasSehFrameSetup = FALSE;
+    BOOLEAN hasExceptionSetup = FALSE;
     BOOLEAN hasExceptionTrigger = FALSE;
+    ULONG i;
+    ULONG remaining;
+    UCHAR next;
+    ULONG searchEnd;
+    ULONG j;
+    UCHAR divReg;
+    UCHAR xorTarget;
+    ULONG lookback;
 
-    if (Length < 20) {
+    if (Length < 10) {
+        if (OutExceptionSetup)  *OutExceptionSetup  = FALSE;
+        if (OutExceptionTrigger) *OutExceptionTrigger = FALSE;
         return FALSE;
     }
 
-    for (ULONG i = 0; i < Length - 4; i++) {
+    for (i = 0; i < Length; i++) {
+        remaining = Length - i;
+
+        // ================================================================
+        // EXCEPTION HANDLER REGISTRATION PATTERNS
+        // ================================================================
 
         //
-        // SEH frame setup: push dword ptr fs:[0] => 64 FF 35 00 00 00 00
-        // or mov eax, fs:[0] => 64 A1 00 00 00 00
+        // --- SEH via fs:[0] (x86 / WoW64) ---
+        // fs: prefix = 0x64
         //
-        if (Instructions[i] == 0x64) {  // fs: prefix
-            if (i + 6 < Length &&
-                Instructions[i + 1] == 0xFF && Instructions[i + 2] == 0x35 &&
-                *(PULONG)(&Instructions[i + 3]) == 0) {
-                hasSehFrameSetup = TRUE;
+        if (Instructions[i] == 0x64 && remaining >= 3) {
+            next = Instructions[i + 1];
+
+            // push dword ptr fs:[0] => 64 FF 35 00 00 00 00
+            if (remaining >= 7 &&
+                next == 0xFF && Instructions[i + 2] == 0x35 &&
+                Instructions[i + 3] == 0x00 && Instructions[i + 4] == 0x00 &&
+                Instructions[i + 5] == 0x00 && Instructions[i + 6] == 0x00) {
+                hasExceptionSetup = TRUE;
             }
-            if (i + 5 < Length &&
-                Instructions[i + 1] == 0xA1 &&
-                *(PULONG)(&Instructions[i + 2]) == 0) {
-                hasSehFrameSetup = TRUE;
+
+            // mov eax, fs:[0] => 64 A1 00 00 00 00
+            if (remaining >= 6 &&
+                next == 0xA1 &&
+                Instructions[i + 2] == 0x00 && Instructions[i + 3] == 0x00 &&
+                Instructions[i + 4] == 0x00 && Instructions[i + 5] == 0x00) {
+                hasExceptionSetup = TRUE;
+            }
+
+            // mov reg, dword ptr fs:[disp32=0] => 64 8B ModRM 00 00 00 00
+            // ModRM with mod=00, r/m=101 (disp32) encodes [disp32].
+            // (reg & 0xC7) == 0x05 means mod=00, rm=101.
+            if (remaining >= 7 &&
+                next == 0x8B &&
+                (Instructions[i + 2] & 0xC7) == 0x05 &&
+                Instructions[i + 3] == 0x00 && Instructions[i + 4] == 0x00 &&
+                Instructions[i + 5] == 0x00 && Instructions[i + 6] == 0x00) {
+                hasExceptionSetup = TRUE;
+            }
+
+            // mov fs:[0], reg => 64 89 ModRM 00 00 00 00 (writing new SEH frame)
+            if (remaining >= 7 &&
+                next == 0x89 &&
+                (Instructions[i + 2] & 0xC7) == 0x05 &&
+                Instructions[i + 3] == 0x00 && Instructions[i + 4] == 0x00 &&
+                Instructions[i + 5] == 0x00 && Instructions[i + 6] == 0x00) {
+                hasExceptionSetup = TRUE;
+            }
+
+            // mov dword ptr fs:[0], esp => 64 89 25 00 00 00 00
+            if (remaining >= 7 &&
+                next == 0x89 && Instructions[i + 2] == 0x25 &&
+                Instructions[i + 3] == 0x00 && Instructions[i + 4] == 0x00 &&
+                Instructions[i + 5] == 0x00 && Instructions[i + 6] == 0x00) {
+                hasExceptionSetup = TRUE;
             }
         }
 
         //
-        // VEH: call to AddVectoredExceptionHandler is hard to detect
-        // purely from bytes. Instead, look for RtlAddVectoredExceptionHandler
-        // patterns: sub rsp, 28h; ... call rel32; ... with specific register setup.
-        // This is imprecise but combined with exception trigger it's meaningful.
+        // --- x64 gs: TEB access ---
+        // gs: prefix = 0x65. On x64, gs:[0x00] is ExceptionList in the TEB.
+        // REX.W (0x48) may precede the segment prefix or follow it.
         //
+        if (Instructions[i] == 0x65 && remaining >= 5) {
+            // gs: prefix followed by REX.W + MOV reg, [disp32]
+            // 65 48 8B XX XX XX XX XX or 65 48 89 XX XX XX XX XX
+            if (Instructions[i + 1] == 0x48 && remaining >= 8) {
+                UCHAR op = Instructions[i + 2];
+                if (op == 0x8B || op == 0x89) {
+                    // Check ModRM for [disp32] addressing (mod=00, rm=100 or 101)
+                    UCHAR modrm = Instructions[i + 3];
+                    if ((modrm & 0xC7) == 0x04 || (modrm & 0xC7) == 0x05) {
+                        hasExceptionSetup = TRUE;
+                    }
+                }
+            }
+        }
 
-        // int 3 (CC) — intentional breakpoint
+        //
+        // --- REX.W gs: (0x48 0x65 ...) — some compilers emit REX before segment ---
+        //
+        if (Instructions[i] == 0x48 && remaining >= 6 &&
+            Instructions[i + 1] == 0x65) {
+            UCHAR op = Instructions[i + 2];
+            if (op == 0x8B || op == 0x89) {
+                hasExceptionSetup = TRUE;
+            }
+        }
+
+        //
+        // --- VEH registration: AddVectoredExceptionHandler(1, handler) ---
+        // x64 calling convention: mov ecx, 1; lea rdx, [rip+XX]; call
+        //
+        // mov ecx, 1 => B9 01 00 00 00
+        //
+        if (remaining >= 5 &&
+            Instructions[i] == 0xB9 &&
+            Instructions[i + 1] == 0x01 &&
+            Instructions[i + 2] == 0x00 &&
+            Instructions[i + 3] == 0x00 &&
+            Instructions[i + 4] == 0x00) {
+
+            //
+            // Look for lea rdx, [rip+disp32] (48 8D 15) followed by
+            // call (E8 or FF 15) within the next 25 bytes.
+            //
+            searchEnd = (i + 30 < Length) ? i + 30 : Length;
+            for (j = i + 5; j < searchEnd; j++) {
+                // lea rdx, [rip+disp32] => 48 8D 15 XX XX XX XX
+                if (j + 6 < Length &&
+                    Instructions[j] == 0x48 &&
+                    Instructions[j + 1] == 0x8D &&
+                    Instructions[j + 2] == 0x15) {
+
+                    // Now look for call rel32 or call [rip+disp32] nearby
+                    ULONG callEnd = (j + 20 < Length) ? j + 20 : Length;
+                    ULONG k;
+                    for (k = j + 7; k < callEnd; k++) {
+                        if (Instructions[k] == 0xE8 && k + 4 < Length) {
+                            hasExceptionSetup = TRUE;
+                            break;
+                        }
+                        if (k + 5 < Length &&
+                            Instructions[k] == 0xFF &&
+                            Instructions[k + 1] == 0x15) {
+                            hasExceptionSetup = TRUE;
+                            break;
+                        }
+                    }
+                    if (hasExceptionSetup) break;
+                }
+
+                // mov rdx, imm64 => 48 BA XX XX XX XX XX XX XX XX
+                if (j + 9 < Length &&
+                    Instructions[j] == 0x48 &&
+                    Instructions[j + 1] == 0xBA) {
+                    ULONG callEnd = (j + 20 < Length) ? j + 20 : Length;
+                    ULONG k;
+                    for (k = j + 10; k < callEnd; k++) {
+                        if (Instructions[k] == 0xE8 && k + 4 < Length) {
+                            hasExceptionSetup = TRUE;
+                            break;
+                        }
+                        if (k + 5 < Length &&
+                            Instructions[k] == 0xFF &&
+                            Instructions[k + 1] == 0x15) {
+                            hasExceptionSetup = TRUE;
+                            break;
+                        }
+                    }
+                    if (hasExceptionSetup) break;
+                }
+            }
+        }
+
+        //
+        // --- x86 VEH: push 1; ...; call ---
+        // push 1 => 6A 01
+        //
+        if (remaining >= 2 &&
+            Instructions[i] == 0x6A && Instructions[i + 1] == 0x01) {
+
+            searchEnd = (i + 20 < Length) ? i + 20 : Length;
+            for (j = i + 2; j < searchEnd; j++) {
+                // push imm32 (68 XX XX XX XX) followed by call
+                if (j + 4 < Length && Instructions[j] == 0x68) {
+                    ULONG callEnd = (j + 10 < Length) ? j + 10 : Length;
+                    ULONG k;
+                    for (k = j + 5; k < callEnd; k++) {
+                        if (Instructions[k] == 0xE8 && k + 4 < Length) {
+                            hasExceptionSetup = TRUE;
+                            break;
+                        }
+                    }
+                    if (hasExceptionSetup) break;
+                }
+            }
+        }
+
+        //
+        // --- SetUnhandledExceptionFilter pattern ---
+        // lea rcx, [rip+disp32]; call rel32
+        // 48 8D 0D XX XX XX XX E8 XX XX XX XX
+        //
+        if (remaining >= 12 &&
+            Instructions[i] == 0x48 &&
+            Instructions[i + 1] == 0x8D &&
+            Instructions[i + 2] == 0x0D) {
+
+            searchEnd = (i + 15 < Length) ? i + 15 : Length;
+            for (j = i + 7; j < searchEnd; j++) {
+                if (Instructions[j] == 0xE8 && j + 4 < Length) {
+                    hasExceptionSetup = TRUE;
+                    break;
+                }
+                if (j + 1 < Length &&
+                    Instructions[j] == 0xFF && Instructions[j + 1] == 0x15) {
+                    hasExceptionSetup = TRUE;
+                    break;
+                }
+            }
+        }
+
+        // ================================================================
+        // INTENTIONAL EXCEPTION TRIGGER PATTERNS
+        // ================================================================
+
+        // int 3 (CC) — breakpoint exception
         if (Instructions[i] == 0xCC) {
             hasExceptionTrigger = TRUE;
         }
 
-        // ud2 (0F 0B) — intentional undefined instruction
-        if (i + 1 < Length &&
+        // ud2 (0F 0B) — undefined instruction exception
+        if (remaining >= 2 &&
             Instructions[i] == 0x0F && Instructions[i + 1] == 0x0B) {
             hasExceptionTrigger = TRUE;
         }
 
-        // int 2d (CD 2D) — debug service exception
-        if (i + 1 < Length &&
+        // int 2d (CD 2D) — debug service exception (anti-debug + Tartarus)
+        if (remaining >= 2 &&
             Instructions[i] == 0xCD && Instructions[i + 1] == 0x2D) {
             hasExceptionTrigger = TRUE;
         }
+
+        // int 1 (CD 01) — single step exception
+        if (remaining >= 2 &&
+            Instructions[i] == 0xCD && Instructions[i + 1] == 0x01) {
+            hasExceptionTrigger = TRUE;
+        }
+
+        // int 29h (CD 29) — KiFastFailDispatch / __fastfail
+        if (remaining >= 2 &&
+            Instructions[i] == 0xCD && Instructions[i + 1] == 0x29) {
+            hasExceptionTrigger = TRUE;
+        }
+
+        // hlt (F4) — causes #GP in ring 3
+        if (Instructions[i] == 0xF4) {
+            hasExceptionTrigger = TRUE;
+        }
+
+        // Privileged I/O: in/out (EC/ED/EE/EF) — #GP in ring 3
+        if (Instructions[i] == 0xEC || Instructions[i] == 0xED ||
+            Instructions[i] == 0xEE || Instructions[i] == 0xEF) {
+            hasExceptionTrigger = TRUE;
+        }
+
+        // cli (FA) / sti (FB) — privileged instructions, #GP in ring 3
+        if (Instructions[i] == 0xFA || Instructions[i] == 0xFB) {
+            hasExceptionTrigger = TRUE;
+        }
+
+        //
+        // --- Null pointer dereference: write to absolute address 0 ---
+        // mov dword ptr ds:[0], imm32 => C7 05 00 00 00 00 XX XX XX XX
+        //
+        if (remaining >= 10 &&
+            Instructions[i] == 0xC7 && Instructions[i + 1] == 0x05 &&
+            Instructions[i + 2] == 0x00 && Instructions[i + 3] == 0x00 &&
+            Instructions[i + 4] == 0x00 && Instructions[i + 5] == 0x00) {
+            hasExceptionTrigger = TRUE;
+        }
+
+        //
+        // --- Null deref via zeroed register ---
+        // xor reg, reg  (33 CX / 31 CX)  OR  sub reg, reg (2B CX / 29 CX)
+        // followed within 12 bytes by mov [reg], X  or  mov X, [reg]
+        //
+        if (remaining >= 4) {
+            BOOLEAN isZero = FALSE;
+            UCHAR zeroedReg = 0xFF;
+
+            // xor eax, eax  (33 C0 or 31 C0)
+            // xor ecx, ecx  (33 C9 or 31 C9)
+            // xor edx, edx  (33 D2 or 31 D2)
+            // Pattern: (31|33) (C0|C9|D2|DB|E4|ED|F6|FF) where src==dst
+            if (Instructions[i] == 0x33 || Instructions[i] == 0x31) {
+                UCHAR modrm = Instructions[i + 1];
+                UCHAR src = (modrm >> 3) & 0x07;
+                UCHAR dst = modrm & 0x07;
+                if (src == dst && (modrm & 0xC0) == 0xC0) {
+                    isZero = TRUE;
+                    zeroedReg = dst;
+                }
+            }
+
+            // sub eax, eax (2B C0 or 29 C0)
+            if (Instructions[i] == 0x2B || Instructions[i] == 0x29) {
+                UCHAR modrm = Instructions[i + 1];
+                UCHAR src = (modrm >> 3) & 0x07;
+                UCHAR dst = modrm & 0x07;
+                if (src == dst && (modrm & 0xC0) == 0xC0) {
+                    isZero = TRUE;
+                    zeroedReg = dst;
+                }
+            }
+
+            if (isZero) {
+                searchEnd = (i + 14 < Length) ? i + 14 : Length;
+                for (j = i + 2; j + 1 < searchEnd; j++) {
+                    // mov [reg], imm/reg  => 89 ModRM or C7 ModRM
+                    // where ModRM indicates [reg] addressing (mod=00, rm=zeroedReg)
+                    if ((Instructions[j] == 0x89 || Instructions[j] == 0xC7) &&
+                        (Instructions[j + 1] & 0xC7) == zeroedReg &&
+                        (Instructions[j + 1] & 0xC0) == 0x00) {
+                        hasExceptionTrigger = TRUE;
+                        break;
+                    }
+                    // mov reg, [reg] => 8B ModRM
+                    if (Instructions[j] == 0x8B &&
+                        (Instructions[j + 1] & 0x07) == zeroedReg &&
+                        (Instructions[j + 1] & 0xC0) == 0x00) {
+                        hasExceptionTrigger = TRUE;
+                        break;
+                    }
+                }
+            }
+        }
+
+        //
+        // --- Division by zero ---
+        // xor reg, reg (zeroes divisor) followed by div reg or idiv reg
+        // div reg  => F7 /6  (F7 F0+reg)
+        // idiv reg => F7 /7  (F7 F8+reg)
+        //
+        if (remaining >= 2 && Instructions[i] == 0xF7) {
+            UCHAR modrm = Instructions[i + 1];
+            //
+            // div reg:  F7 with /6 => modrm & 0x38 == 0x30, mod=11 (0xC0)
+            // idiv reg: F7 with /7 => modrm & 0x38 == 0x38, mod=11 (0xC0)
+            //
+            if ((modrm & 0xC0) == 0xC0 &&
+                ((modrm & 0x38) == 0x30 || (modrm & 0x38) == 0x38)) {
+
+                divReg = modrm & 0x07;
+                lookback = (i >= 10) ? i - 10 : 0;
+
+                for (j = lookback; j + 1 < i; j++) {
+                    // xor reg, reg
+                    if ((Instructions[j] == 0x33 || Instructions[j] == 0x31)) {
+                        xorTarget = Instructions[j + 1];
+                        if ((xorTarget & 0xC0) == 0xC0) {
+                            UCHAR src = (xorTarget >> 3) & 0x07;
+                            UCHAR dst = xorTarget & 0x07;
+                            if (src == dst && dst == divReg) {
+                                hasExceptionTrigger = TRUE;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    return (hasSehFrameSetup && hasExceptionTrigger);
+    //
+    // Report partial evidence to the caller so it can request an
+    // extended scan window if only one half was found.
+    //
+    if (OutExceptionSetup)  *OutExceptionSetup  = hasExceptionSetup;
+    if (OutExceptionTrigger) *OutExceptionTrigger = hasExceptionTrigger;
+
+    //
+    // Full Tartarus Gate = exception handling setup + intentional trigger.
+    //
+    return (hasExceptionSetup && hasExceptionTrigger);
 }
 
 /**
@@ -2207,6 +2612,20 @@ DsdpCalculateSuspicionScore(
     }
 
     if (!Detection->HasReturnToNtdll && Detection->Base.ReturnAddressCount > 0) {
+        score += 5;
+    }
+
+    //
+    // Exception-based evasion indicators boost.
+    // Even if the primary technique wasn't classified as Tartarus Gate,
+    // the presence of exception setup/trigger patterns alongside any
+    // other evasion technique is a strong signal of layered evasion.
+    //
+    if (Detection->HasExceptionSetup && Detection->HasExceptionTrigger) {
+        if (Detection->Base.Technique != DsdTechnique_TartarusGate) {
+            score += 15;
+        }
+    } else if (Detection->HasExceptionSetup || Detection->HasExceptionTrigger) {
         score += 5;
     }
 
