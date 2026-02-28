@@ -266,7 +266,7 @@ This project stands on the shoulders of giants:
 
 ## Contact
 
-For contact use : contact@ShadowStrike.dev
+For contact use : ShadowStrike.Labs@outlook.com
 
 ---
 
