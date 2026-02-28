@@ -541,24 +541,22 @@ Arguments:
     KeClearEvent(&Monitor->DrainEvent);
 
     if (Monitor->ActiveOperations > 0) {
-        LARGE_INTEGER drainTimeout;
         NTSTATUS waitStatus;
 
-        drainTimeout.QuadPart = -10LL * 1000 * 1000 * 10; // 10 seconds
-
+        //
+        // Wait INDEFINITELY for all in-flight operations to drain.
+        // A timeout here leads to use-after-free when we free process states
+        // and the monitor structure below.
+        //
         waitStatus = KeWaitForSingleObject(
             &Monitor->DrainEvent,
             Executive,
             KernelMode,
             FALSE,
-            &drainTimeout
+            NULL
             );
 
-        if (waitStatus == STATUS_TIMEOUT) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "[ShadowStrike] NtdllIntegrity: drain timeout, %ld ops still active\n",
-                       Monitor->ActiveOperations);
-        }
+        UNREFERENCED_PARAMETER(waitStatus);
     }
 
     //
@@ -2033,6 +2031,22 @@ Routine Description:
     // Check for JMP rel32 (E9 xx xx xx xx) — most common inline hook
     //
     if (CurrentPrologue[0] == NI_JMP_REL32_OPCODE) {
+        return NiMod_HookInstalled;
+    }
+
+    //
+    // Check for CALL rel32 (E8 xx xx xx xx) — used to evade JMP-only detection.
+    // A CALL redirects execution identically for hooking purposes; the return
+    // address pushed on the stack is consumed by the trampoline.
+    //
+    if (CurrentPrologue[0] == NI_CALL_REL32_OPCODE) {
+        return NiMod_HookInstalled;
+    }
+
+    //
+    // Check for JMP short (EB xx) — 2-byte near jump used in hotpatch hooks
+    //
+    if (CurrentPrologue[0] == 0xEB) {
         return NiMod_HookInstalled;
     }
 

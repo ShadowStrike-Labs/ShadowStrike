@@ -240,9 +240,9 @@ static const SST_STATIC_DEFINITION g_SyscallsWin11_22000[] = {
  * Maps OS build number ranges to their corresponding syscall definitions.
  */
 static const SST_BUILD_RANGE g_BuildRanges[] = {
-    /* Windows 10 RS1 (1607) through 21H2 */
+    /* Windows 10 RS1 (1607) through 22H2 + Windows Server 2019/2022 */
     {
-        14393, 19045,
+        14393, 21999,
         g_SyscallsWin10_14393,
         RTL_NUMBER_OF(g_SyscallsWin10_14393)
     },
@@ -424,7 +424,7 @@ SstpHashName(
     ULONG hash = SST_FNV_OFFSET_BASIS;
     const CHAR *p;
 
-    for (p = Name; *p != '\0'; p++) {
+    for (p = Name; *p != '\0' && (p - Name) < SST_MAX_NAME_LENGTH; p++) {
         CHAR c = *p;
         /* ASCII lowercase fold */
         if (c >= 'A' && c <= 'Z') {

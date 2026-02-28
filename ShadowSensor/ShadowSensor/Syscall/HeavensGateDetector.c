@@ -847,6 +847,20 @@ Return Value:
     InternalTransition->Info.SourceCS = HGD_CS_SEGMENT_32BIT;
     InternalTransition->Info.TargetCS = HGD_CS_SEGMENT_64BIT;
     InternalTransition->Info.SuspicionScore = SuspicionScore;
+
+    //
+    // Update per-process suspicion score (keep the maximum seen).
+    // This ensures HgdGetProcessFlags returns a meaningful score.
+    //
+    {
+        LONG oldScore, newScore;
+        do {
+            oldScore = InterlockedCompareExchange(&ProcessContext->SuspicionScore, 0, 0);
+            if ((LONG)SuspicionScore <= oldScore) break;
+            newScore = InterlockedCompareExchange(
+                &ProcessContext->SuspicionScore, (LONG)SuspicionScore, oldScore);
+        } while (newScore != oldScore);
+    }
     InternalTransition->Info.IsFromWow64 =
         HgdpIsKnownWow64Address(Detector, ProcessContext, TransitionAddress);
     KeQuerySystemTime(&InternalTransition->Info.Timestamp);
@@ -901,10 +915,12 @@ Return Value:
     HgdpInsertTransition(Detector, InternalTransition);
 
     //
-    // Notify callbacks for medium+ suspicion
+    // Notify callbacks for medium+ suspicion.
+    // Use the deep-copied Result (caller-owned) NOT InternalTransition->Info
+    // which is list-owned and can be freed concurrently by HgdShutdown.
     //
     if (SuspicionScore >= HGD_SUSPICION_MEDIUM) {
-        HgdpNotifyCallbacks(Detector, &InternalTransition->Info);
+        HgdpNotifyCallbacks(Detector, Result);
     }
 
     HgdpDereferenceProcessContext(Detector, ProcessContext);
@@ -2488,7 +2504,7 @@ Routine Description:
     // EA xx xx xx xx 33 00 (JMP FAR 0x33:addr)
     //
     UCHAR Pattern1[] = { 0xEA, 0x00, 0x00, 0x00, 0x00, 0x33, 0x00 };
-    HgdpAddPattern(Detector, Pattern1, 2, TRUE,
+    HgdpAddPattern(Detector, Pattern1, sizeof(Pattern1), TRUE,
         "JMP FAR 0x33 (wow64cpu transition)");
 
     //

@@ -478,19 +478,18 @@ DsdShutdown(
     DsdpReleaseReference(detector);
 
     //
-    // Wait for all outstanding references to drain, with a bounded timeout.
-    // Use KeClearEvent + atomic check to avoid TOCTOU race.
+    // Wait INDEFINITELY for all outstanding references to drain.
+    // A timeout here leads to use-after-free when we free detections,
+    // whitelists, and the detector itself below.
     //
     KeClearEvent(&detector->ShutdownEvent);
     if (InterlockedCompareExchange(&detector->ReferenceCount, 0, 0) > 0) {
-        LARGE_INTEGER timeout;
-        timeout.QuadPart = -(LONGLONG)DSD_SHUTDOWN_TIMEOUT_MS * 10000LL;  // relative, ms -> 100ns
         KeWaitForSingleObject(
             &detector->ShutdownEvent,
             Executive,
             KernelMode,
             FALSE,
-            &timeout
+            NULL
         );
     }
 
@@ -1642,11 +1641,14 @@ DsdpCheckRateLimit(
     lastReset = InterlockedCompareExchange64(&Detector->LastRateLimitReset, 0, 0);
 
     //
-    // If more than 1 second since last reset, reset the window
+    // If more than 1 second since last reset, reset the window.
+    // Use CAS on LastRateLimitReset so only one thread wins the reset.
     //
     if ((now.QuadPart - lastReset) >= DSD_RATE_LIMIT_WINDOW_100NS) {
-        InterlockedExchange64(&Detector->LastRateLimitReset, now.QuadPart);
-        InterlockedExchange64(&Detector->AnalysisCountInWindow, 0);
+        if (InterlockedCompareExchange64(&Detector->LastRateLimitReset,
+                now.QuadPart, lastReset) == lastReset) {
+            InterlockedExchange64(&Detector->AnalysisCountInWindow, 0);
+        }
     }
 
     count = InterlockedIncrement64(&Detector->AnalysisCountInWindow);

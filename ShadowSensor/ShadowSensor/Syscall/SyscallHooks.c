@@ -452,11 +452,15 @@ ShpDrainHookCallbacks(
 
     interval.QuadPart = SH_DRAIN_POLL_INTERVAL_100NS;
 
-    while (Hook->ActiveCallbackCount > 0 &&
-           iterations < SH_MAX_DRAIN_ITERATIONS)
+    while (Hook->ActiveCallbackCount > 0)
     {
         KeDelayExecutionThread(KernelMode, FALSE, &interval);
         iterations++;
+        if (iterations == SH_MAX_DRAIN_ITERATIONS) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike] SyscallHooks: Hook drain taking long, %ld callbacks remain\n",
+                Hook->ActiveCallbackCount);
+        }
     }
 }
 
@@ -473,11 +477,21 @@ ShpDrainAllDispatches(
 
     interval.QuadPart = SH_DRAIN_POLL_INTERVAL_100NS;
 
-    while (Fw->ActiveDispatchCount > 0 &&
-           iterations < SH_MAX_DRAIN_ITERATIONS)
+    while (Fw->ActiveDispatchCount > 0)
     {
         KeDelayExecutionThread(KernelMode, FALSE, &interval);
         iterations++;
+
+        //
+        // Safety diagnostic: if draining takes unusually long, log it
+        // but do NOT give up — we MUST wait for all dispatches to complete
+        // to prevent use-after-free on teardown.
+        //
+        if (iterations == SH_MAX_DRAIN_ITERATIONS) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike] SyscallHooks: Drain taking long, %ld dispatches remain\n",
+                Fw->ActiveDispatchCount);
+        }
     }
 }
 
@@ -1061,31 +1075,29 @@ ShDispatchSyscall(
         return STATUS_INVALID_PARAMETER;
     }
 
+    /*
+     * Acquire dispatch reference FIRST — before ANY access to fw fields.
+     * This ensures ShShutdown's drain sees our reference and waits,
+     * preventing UAF if shutdown frees fw while we're in rate limit check.
+     */
+    ShpAcquireDispatchRef(fw);
+
     /* Reject if shutting down */
     if (fw->ShuttingDown) {
+        ShpReleaseDispatchRef(fw);
         return STATUS_DEVICE_NOT_READY;
     }
 
     /* Rate limit check */
     if (!ShpCheckRateLimit(fw)) {
+        ShpReleaseDispatchRef(fw);
         return STATUS_SUCCESS;  /* Silently allow — rate limited */
     }
 
     /* Validate syscall number */
     if (Context->SyscallNumber >= SH_MAX_SYSCALL_NUMBER) {
-        return STATUS_SUCCESS;  /* Unknown syscall — allow through */
-    }
-
-    /*
-     * Acquire dispatch reference BEFORE looking up the hook.
-     * This ensures ShShutdown sees our reference and waits.
-     */
-    ShpAcquireDispatchRef(fw);
-
-    /* Re-check shutdown after acquiring reference */
-    if (fw->ShuttingDown) {
         ShpReleaseDispatchRef(fw);
-        return STATUS_DEVICE_NOT_READY;
+        return STATUS_SUCCESS;  /* Unknown syscall — allow through */
     }
 
     InterlockedIncrement64(&fw->TotalDispatches);

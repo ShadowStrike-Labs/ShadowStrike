@@ -87,6 +87,9 @@ PsGetThreadTeb(
 #pragma alloc_text(PAGE, CsaCaptureCallstack)
 #pragma alloc_text(PAGE, CsaFreeCallstack)
 #pragma alloc_text(PAGE, CsaOnProcessExit)
+#pragma alloc_text(PAGE, CsaAnalyzeCallstack)
+#pragma alloc_text(PAGE, CsaValidateReturnAddresses)
+#pragma alloc_text(PAGE, CsaDetectStackPivot)
 #endif
 
 //=============================================================================
@@ -417,8 +420,6 @@ CsaShutdown(
     )
 {
     PCSA_ANALYZER_INTERNAL analyzerInternal;
-    LARGE_INTEGER timeout;
-    NTSTATUS waitStatus;
 
     PAGED_CODE();
 
@@ -440,33 +441,20 @@ CsaShutdown(
     KeMemoryBarrier();
 
     //
-    // Release the owner reference and wait for all outstanding operations
-    // to complete (refs from CsaCaptureCallstack, CsaFreeCallstack, etc.).
-    // Clear the event BEFORE decrementing to prevent TOCTOU: if the last
-    // ref drops between decrement and wait, KeSetEvent is not lost.
+    // Release the owner reference and wait INDEFINITELY for all outstanding
+    // operations to complete. A timeout here leads to use-after-free when
+    // in-flight callstacks call CsaFreeCallstack on a destroyed lookaside.
     //
     KeClearEvent(&Analyzer->ZeroRefEvent);
     CsapDereferenceAnalyzer(analyzerInternal);
 
-    timeout.QuadPart = -((LONGLONG)CSA_SHUTDOWN_DRAIN_TIMEOUT_MS * 10000);
-    waitStatus = KeWaitForSingleObject(
+    (VOID)KeWaitForSingleObject(
         &Analyzer->ZeroRefEvent,
         Executive,
         KernelMode,
         FALSE,
-        &timeout
+        NULL
         );
-
-    if (waitStatus == STATUS_TIMEOUT) {
-        //
-        // Outstanding references did not drain in time. This is a bug in
-        // the caller, but proceeding is safer than leaking the structure.
-        // Log for diagnostics.
-        //
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-            "[ShadowStrike-CSA] WARNING: Shutdown drain timed out, RefCount=%ld\n",
-            Analyzer->RefCount);
-    }
 
     CsapCleanupModuleCache(analyzerInternal);
 
@@ -512,7 +500,15 @@ CsaCaptureCallstack(
 
     analyzerInternal = CONTAINING_RECORD(Analyzer, CSA_ANALYZER_INTERNAL, Public);
 
+    //
+    // Take an operational reference FIRST — before checking ShuttingDown.
+    // This prevents a UAF race where shutdown completes and frees the
+    // analyzer between our ShuttingDown check and the reference increment.
+    //
+    CsapReferenceAnalyzer(analyzerInternal);
+
     if (analyzerInternal->ShuttingDown) {
+        CsapDereferenceAnalyzer(analyzerInternal);
         return STATUS_SHUTDOWN_IN_PROGRESS;
     }
 
@@ -520,14 +516,9 @@ CsaCaptureCallstack(
     // Throttle check — prevent DoS via excessive captures
     //
     if (!CsapThrottleCheck(analyzerInternal)) {
+        CsapDereferenceAnalyzer(analyzerInternal);
         return STATUS_QUOTA_EXCEEDED;
     }
-
-    //
-    // Take an operational reference. This prevents the analyzer from being
-    // freed while this capture is in progress.
-    //
-    CsapReferenceAnalyzer(analyzerInternal);
 
     //
     // Get process create time for PID-reuse protection
@@ -625,6 +616,8 @@ CsaAnalyzeCallstack(
     _Out_ PULONG Score
     )
 {
+    PAGED_CODE();
+
     if (Analyzer == NULL || !Analyzer->Initialized ||
         Callstack == NULL || Anomalies == NULL || Score == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -647,6 +640,8 @@ CsaValidateReturnAddresses(
 {
     ULONG i;
     BOOLEAN valid = TRUE;
+
+    PAGED_CODE();
 
     if (Analyzer == NULL || !Analyzer->Initialized ||
         Callstack == NULL || AllValid == NULL) {
@@ -693,6 +688,8 @@ CsaDetectStackPivot(
     PVOID capturedFrames[16];
     ULONG capturedCount;
     KAPC_STATE apcState;
+
+    PAGED_CODE();
 
     if (Analyzer == NULL || !Analyzer->Initialized ||
         ThreadId == NULL || IsPivoted == NULL) {
@@ -920,11 +917,19 @@ CsaOnProcessExit(
 
     analyzerInternal = CONTAINING_RECORD(Analyzer, CSA_ANALYZER_INTERNAL, Public);
 
+    //
+    // Take reference before ShuttingDown check to prevent UAF race.
+    //
+    CsapReferenceAnalyzer(analyzerInternal);
+
     if (analyzerInternal->ShuttingDown) {
+        CsapDereferenceAnalyzer(analyzerInternal);
         return;
     }
 
     CsapEvictProcessEntries(analyzerInternal, ProcessId);
+
+    CsapDereferenceAnalyzer(analyzerInternal);
 }
 
 
@@ -1458,13 +1463,21 @@ CsapPopulateModuleCache(
             CsapPopulateTextSection(process, cacheEntry);
 
             //
-            // Insert under exclusive lock — no user-mode access here
+            // Insert under exclusive lock — enforce cache size limit
             //
             KeEnterCriticalRegion();
             ExAcquirePushLockExclusive(&AnalyzerInternal->Public.ModuleLock);
 
-            InsertTailList(&AnalyzerInternal->Public.ModuleCache, &cacheEntry->ListEntry);
-            InterlockedIncrement(&AnalyzerInternal->CachedModuleCount);
+            if (AnalyzerInternal->CachedModuleCount < CSA_MAX_CACHED_MODULES) {
+                InsertTailList(&AnalyzerInternal->Public.ModuleCache, &cacheEntry->ListEntry);
+                InterlockedIncrement(&AnalyzerInternal->CachedModuleCount);
+            } else {
+                //
+                // Cache full — free the entry we just allocated
+                //
+                ExFreeToNPagedLookasideList(
+                    &AnalyzerInternal->ModuleCacheLookaside, cacheEntry);
+            }
 
             ExReleasePushLockExclusive(&AnalyzerInternal->Public.ModuleLock);
             KeLeaveCriticalRegion();
