@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -15,188 +15,166 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
-/**
- * ============================================================================
- * ShadowStrike NGAV - ENTERPRISE SYSCALL MONITOR
- * ============================================================================
- *
- * @file SyscallMonitor.c
- * @brief Syscall monitoring orchestration layer implementation.
- *
- * This module coordinates the syscall monitoring subsystem by delegating
- * to SyscallTable, DirectSyscallDetector, and SyscallHooks modules.
- * It manages per-process syscall context, NTDLL integrity verification,
- * call stack analysis, and behavioral event emission.
- *
- * Thread Safety:
- * - Global state protected by EX_PUSH_LOCK with critical region.
- * - Process contexts are reference-counted with deferred deletion.
- * - All statistics use interlocked operations.
- *
- * @author ShadowStrike Security Team
- * @version 2.0.0
- * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
- * ============================================================================
- */
+/*++
+    ShadowStrike Next-Generation Antivirus
+    Module: SyscallMonitor.c - Syscall Monitoring Orchestration Layer
+
+    This module is the top-level orchestrator for all syscall monitoring.
+    It delegates ALL specialized detection work to dedicated sub-modules:
+
+        SyscallTable           - Syscall number/name/metadata resolution
+        SyscallHooks           - Hook registration and callback dispatch
+        NtdllIntegrity         - NTDLL tampering/hook detection
+        HeavensGateDetector    - WoW64 abuse detection
+        DirectSyscallDetector  - Direct/indirect syscall technique detection
+        CallstackAnalyzer      - Call stack capture and anomaly analysis
+
+    SyscallMonitor owns the POLICY (what to monitor, when to block, event
+    emission) while the sub-modules own their respective DETECTION DOMAINS.
+
+    Copyright (c) ShadowStrike Team
+--*/
 
 #include "SyscallMonitor.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/ProcessUtils.h"
-#include "../Utilities/HashUtils.h"
 #include "../Behavioral/BehaviorEngine.h"
-#include "../../Shared/KernelProcessTypes.h"
-#include <ntimage.h>
-#include <ntstrsafe.h>
+
+//
+// WDK-exported but not declared in public headers
+//
+NTKERNELAPI
+PVOID
+NTAPI
+PsGetProcessWow64Process(
+    _In_ PEPROCESS Process
+    );
+
+NTSYSCALLAPI
+NTSTATUS
+NTAPI
+ZwWriteVirtualMemory(
+    _In_ HANDLE ProcessHandle,
+    _In_ PVOID BaseAddress,
+    _In_ PVOID Buffer,
+    _In_ SIZE_T NumberOfBytesToWrite,
+    _Out_opt_ PSIZE_T NumberOfBytesWritten
+    );
 
 // ============================================================================
-// PRIVATE CONSTANTS
+// Internal Constants
 // ============================================================================
 
-#define SC_MONITOR_MAGIC                    0x53634D6F  // 'ScMo'
+#define SC_MAGIC                        0x53434D4E  // 'SCMN'
+#define SC_SHUTDOWN_DRAIN_TIMEOUT_MS    5000
 
-#define SC_CONTEXT_LOOKASIDE_DEPTH          128
-#define SC_EVENT_LOOKASIDE_DEPTH            256
+//
+// NTDLL integrity is expensive. Check once per N syscalls per process.
+//
+#define SC_NTDLL_CHECK_INTERVAL         500
 
-#define SC_MAX_ARGUMENT_COUNT               8
+//
+// Threat score thresholds
+//
+#define SC_SCORE_BLOCK_THRESHOLD        700
+#define SC_SCORE_ALERT_THRESHOLD        400
 
-#define SC_USER_SPACE_LIMIT                 0x00007FFFFFFFFFFF
-#define SC_MIN_USER_ADDRESS                 0x10000
-
-#define SC_MAX_FUNCTION_NAME_LENGTH         63
-
-// Allowlisted function names for ScMonitorRestoreNtdllFunction
-static const CHAR* ScpAllowedRestoreFunctions[] = {
-    "NtAllocateVirtualMemory",
-    "NtProtectVirtualMemory",
-    "NtWriteVirtualMemory",
-    "NtCreateThreadEx",
-    "NtMapViewOfSection",
-    "NtQueueApcThread",
-    "NtSetContextThread",
-    "NtCreateSection",
-    "NtOpenProcess",
-    "NtSuspendThread",
-    "NtResumeThread",
-    "NtReadVirtualMemory",
-    "NtCreateFile",
-    "NtDeviceIoControlFile",
-    NULL
-};
+//
+// User-mode address range for basic sanity
+//
+#define SC_MAX_USER_ADDRESS             0x7FFFFFFFFFFFULL
+#define SC_MIN_USER_ADDRESS             0x10000ULL
 
 // ============================================================================
-// PRIVATE FUNCTION PROTOTYPES
+// Module-Scoped Init Flags (for rollback on partial init)
 // ============================================================================
 
-static VOID
-ScpAcquireReference(VOID);
+#define SC_INIT_LOOKASIDE_CONTEXT       0x00000001
+#define SC_INIT_LOOKASIDE_EVENT         0x00000002
+#define SC_INIT_SYSCALL_TABLE           0x00000004
+#define SC_INIT_SYSCALL_HOOKS           0x00000008
+#define SC_INIT_NTDLL_INTEGRITY         0x00000010
+#define SC_INIT_HEAVENS_GATE            0x00000020
+#define SC_INIT_DIRECT_SYSCALL          0x00000040
+#define SC_INIT_CALLSTACK_ANALYZER      0x00000080
 
-static VOID
-ScpReleaseReference(VOID);
+// ============================================================================
+// Global State
+// ============================================================================
 
-static PSC_PROCESS_CONTEXT
-ScpAllocateProcessContext(VOID);
+static SYSCALL_MONITOR_GLOBALS g_ScState = { 0 };
 
-static VOID
-ScpFreeProcessContext(
-    _In_ PSC_PROCESS_CONTEXT Context
-);
+// ============================================================================
+// Forward Declarations
+// ============================================================================
 
-static PSC_PROCESS_CONTEXT
-ScpFindProcessContextLocked(
-    _In_ UINT32 ProcessId
-);
+static VOID ScpAcquireReference(VOID);
+static VOID ScpReleaseReference(VOID);
 
-static NTSTATUS
-ScpCreateProcessContext(
+static NTSTATUS ScpAllocateProcessContext(_Out_ PSC_PROCESS_CONTEXT* Context);
+static VOID ScpFreeProcessContext(_In_ PSC_PROCESS_CONTEXT Context);
+static PSC_PROCESS_CONTEXT ScpFindProcessContextLocked(_In_ UINT32 ProcessId);
+static NTSTATUS ScpCreateProcessContext(_In_ UINT32 ProcessId, _Out_ PSC_PROCESS_CONTEXT* Context);
+static VOID ScpPopulateProcessNtdllInfo(_Inout_ PSC_PROCESS_CONTEXT Context);
+static BOOLEAN ScpIsAddressInRange(_In_ UINT64 Address, _In_ UINT64 Base, _In_ UINT64 Size);
+static VOID ScpAddSuspiciousCaller(_Inout_ PSC_PROCESS_CONTEXT Context, _In_ UINT64 CallerAddress);
+
+static VOID ScpEmitEvasionEvent(
     _In_ UINT32 ProcessId,
-    _Out_ PSC_PROCESS_CONTEXT* Context
-);
-
-static VOID
-ScpAddSuspiciousCaller(
-    _Inout_ PSC_PROCESS_CONTEXT Context,
-    _In_ UINT64 CallerAddress
-);
-
-static BOOLEAN
-ScpIsAddressInRange(
-    _In_ UINT64 Address,
-    _In_ UINT64 Base,
-    _In_ UINT64 Size
-);
-
-static BOOLEAN
-ScpValidateUserAddress(
-    _In_ UINT64 Address
-);
-
-static NTSTATUS
-ScpSafeReadUserMemory(
-    _In_ PVOID SourceAddress,
-    _Out_writes_bytes_(Length) PVOID Destination,
-    _In_ SIZE_T Length
-);
-
-static BOOLEAN
-ScpIsFunctionNameAllowed(
-    _In_z_ PCSTR FunctionName
-);
-
-static VOID
-ScpEmitEvasionEvent(
-    _In_ UINT32 ProcessId,
-    _In_ BEHAVIOR_EVENT_TYPE EventType,
-    _In_ EVASION_TECHNIQUE Technique,
+    _In_ UINT32 SyscallNumber,
+    _In_ UINT32 DetectionFlags,
     _In_ UINT32 ThreatScore,
-    _In_ UINT64 TargetAddress
-);
+    _In_ BOOLEAN ShouldBlock
+    );
 
-static NTSTATUS
-ScpPopulateNtdllInfo(
-    _Inout_ PSC_PROCESS_CONTEXT Context
-);
-
-// ============================================================================
-// PAGE ALLOCATION
-// ============================================================================
+static VOID ScpCleanupByFlags(_In_ ULONG InitFlags);
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, ScMonitorInitialize)
+#pragma alloc_text(PAGE, ScMonitorInitialize)
 #pragma alloc_text(PAGE, ScMonitorShutdown)
 #pragma alloc_text(PAGE, ScMonitorSetEnabled)
 #pragma alloc_text(PAGE, ScMonitorAnalyzeSyscall)
-#pragma alloc_text(PAGE, ScMonitorIsFromNtdll)
-#pragma alloc_text(PAGE, ScMonitorDetectHeavensGate)
-#pragma alloc_text(PAGE, ScMonitorAnalyzeCallStack)
+#pragma alloc_text(PAGE, ScMonitorGetProcessContext)
+#pragma alloc_text(PAGE, ScMonitorRemoveProcessContext)
 #pragma alloc_text(PAGE, ScMonitorVerifyNtdllIntegrity)
 #pragma alloc_text(PAGE, ScMonitorGetNtdllHooks)
 #pragma alloc_text(PAGE, ScMonitorRestoreNtdllFunction)
-#pragma alloc_text(PAGE, ScMonitorGetProcessContext)
-#pragma alloc_text(PAGE, ScMonitorReleaseProcessContext)
-#pragma alloc_text(PAGE, ScMonitorRemoveProcessContext)
-#pragma alloc_text(PAGE, ScMonitorGetSyscallName)
-#pragma alloc_text(PAGE, ScMonitorGetSyscallNumber)
-#pragma alloc_text(PAGE, ScMonitorGetSyscallDefinition)
-#pragma alloc_text(PAGE, ScMonitorGetStatistics)
+#pragma alloc_text(PAGE, ScMonitorAnalyzeCallStack)
+#pragma alloc_text(PAGE, ScMonitorDetectHeavensGate)
 #pragma alloc_text(PAGE, ScMonitorGetProcessStats)
 #endif
 
 // ============================================================================
-// GLOBAL STATE
+// Reference Counting
 // ============================================================================
 
-static SYSCALL_MONITOR_GLOBALS g_ScState;
+static
+VOID
+ScpAcquireReference(VOID)
+{
+    InterlockedIncrement(&g_ScState.ReferenceCount);
+}
+
+static
+VOID
+ScpReleaseReference(VOID)
+{
+    LONG newCount = InterlockedDecrement(&g_ScState.ReferenceCount);
+    if (newCount == 0) {
+        KeSetEvent(&g_ScState.ShutdownEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
 
 // ============================================================================
-// PUBLIC API - INITIALIZATION
+// Initialization / Shutdown
 // ============================================================================
 
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
+_Use_decl_annotations_
 NTSTATUS
 ScMonitorInitialize(VOID)
 {
-    NTSTATUS status = STATUS_SUCCESS;
+    NTSTATUS status;
+    ULONG initFlags = 0;
 
     PAGED_CODE();
 
@@ -206,162 +184,178 @@ ScMonitorInitialize(VOID)
 
     RtlZeroMemory(&g_ScState, sizeof(g_ScState));
 
-    //
-    // Initialize process context list and lock
-    //
+    g_ScState.Magic = SC_MAGIC;
+    g_ScState.ReferenceCount = 1;
+    KeInitializeEvent(&g_ScState.ShutdownEvent, NotificationEvent, FALSE);
+
     InitializeListHead(&g_ScState.ProcessContextList);
     ExInitializePushLock(&g_ScState.ProcessLock);
 
-    //
-    // Initialize known good caller list and lock
-    //
     InitializeListHead(&g_ScState.KnownGoodCallers);
     ExInitializePushLock(&g_ScState.CallerCacheLock);
 
     //
-    // Initialize lookaside list for process contexts
+    // Lookaside lists for hot-path allocations
     //
     ExInitializeNPagedLookasideList(
         &g_ScState.ContextLookaside,
-        NULL,
-        NULL,
+        NULL, NULL,
         POOL_NX_ALLOCATION,
         sizeof(SC_PROCESS_CONTEXT),
         SC_POOL_TAG_GENERAL,
-        SC_CONTEXT_LOOKASIDE_DEPTH
-    );
-    g_ScState.ContextLookasideInitialized = TRUE;
+        0
+        );
+    initFlags |= SC_INIT_LOOKASIDE_CONTEXT;
 
-    //
-    // Initialize lookaside list for event contexts
-    //
     ExInitializeNPagedLookasideList(
         &g_ScState.EventLookaside,
-        NULL,
-        NULL,
+        NULL, NULL,
         POOL_NX_ALLOCATION,
         sizeof(SYSCALL_CALL_CONTEXT),
         SC_POOL_TAG_EVENT,
-        SC_EVENT_LOOKASIDE_DEPTH
-    );
+        0
+        );
+    initFlags |= SC_INIT_LOOKASIDE_EVENT;
+    g_ScState.ContextLookasideInitialized = TRUE;
     g_ScState.EventLookasideInitialized = TRUE;
 
     //
-    // Initialize syscall table subsystem
+    // Step 1: Syscall Table
     //
     status = SstInitialize(&g_ScState.SyscallTableHandle);
     if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike-SC] SyscallTable init failed: 0x%08X\n", status);
         goto Cleanup;
     }
+    initFlags |= SC_INIT_SYSCALL_TABLE;
 
     //
-    // Table is auto-populated from build-matched definitions.
-    // No manual ntdll parsing needed.
+    // Step 2: Syscall Hooks
     //
+    status = ShInitialize(&g_ScState.SyscallHooksFramework);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike-SC] SyscallHooks init failed: 0x%08X\n", status);
+        goto Cleanup;
+    }
+    initFlags |= SC_INIT_SYSCALL_HOOKS;
 
     //
-    // Initialize direct syscall detector
+    // Step 3: NtDll Integrity
+    //
+    status = NiInitialize(&g_ScState.NtdllIntegrityMonitor);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike-SC] NtdllIntegrity init failed: 0x%08X\n", status);
+        goto Cleanup;
+    }
+    initFlags |= SC_INIT_NTDLL_INTEGRITY;
+
+    //
+    // Step 4: Heaven's Gate Detector
+    //
+    status = HgdInitialize(&g_ScState.HeavensGateDetector);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike-SC] HeavensGateDetector init failed: 0x%08X\n", status);
+        goto Cleanup;
+    }
+    initFlags |= SC_INIT_HEAVENS_GATE;
+
+    //
+    // Step 5: Direct Syscall Detector
     //
     status = DsdInitialize(&g_ScState.DirectSyscallDetector);
     if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike-SC] DirectSyscallDetector init failed: 0x%08X\n", status);
         goto Cleanup;
     }
+    initFlags |= SC_INIT_DIRECT_SYSCALL;
 
     //
-    // Initialize reference counting and shutdown coordination
+    // Step 6: Callstack Analyzer
     //
-    g_ScState.ReferenceCount = 1;
-    g_ScState.ShuttingDown = 0;
-    KeInitializeEvent(&g_ScState.ShutdownEvent, NotificationEvent, FALSE);
+    status = CsaInitialize(&g_ScState.CallstackAnalyzer);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike-SC] CallstackAnalyzer init failed: 0x%08X\n", status);
+        goto Cleanup;
+    }
+    initFlags |= SC_INIT_CALLSTACK_ANALYZER;
 
-    //
-    // Set magic and mark initialized
-    //
-    g_ScState.Magic = SC_MONITOR_MAGIC;
-    g_ScState.Enabled = TRUE;
     g_ScState.Initialized = TRUE;
+    g_ScState.Enabled = FALSE;
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike-SC] Syscall monitoring initialized (6 sub-modules active)\n");
 
     return STATUS_SUCCESS;
 
 Cleanup:
-    //
-    // Reverse partial initialization
-    //
-    if (g_ScState.DirectSyscallDetector != NULL) {
-        DsdShutdown(g_ScState.DirectSyscallDetector);
-        g_ScState.DirectSyscallDetector = NULL;
-    }
-
-    if (g_ScState.SyscallTableHandle != NULL) {
-        SstShutdown(g_ScState.SyscallTableHandle);
-        g_ScState.SyscallTableHandle = NULL;
-    }
-
-    if (g_ScState.EventLookasideInitialized) {
-        ExDeleteNPagedLookasideList(&g_ScState.EventLookaside);
-        g_ScState.EventLookasideInitialized = FALSE;
-    }
-
-    if (g_ScState.ContextLookasideInitialized) {
-        ExDeleteNPagedLookasideList(&g_ScState.ContextLookaside);
-        g_ScState.ContextLookasideInitialized = FALSE;
-    }
-
-    RtlZeroMemory(&g_ScState, sizeof(g_ScState));
-
+    ScpCleanupByFlags(initFlags);
     return status;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
+
+_Use_decl_annotations_
 VOID
 ScMonitorShutdown(VOID)
 {
-    PLIST_ENTRY entry;
-    PSC_PROCESS_CONTEXT context;
-    PSC_KNOWN_GOOD_CALLER caller;
     LARGE_INTEGER timeout;
+    PLIST_ENTRY entry;
+    PLIST_ENTRY next;
 
     PAGED_CODE();
 
-    if (!g_ScState.Initialized) {
+    if (!g_ScState.Initialized || g_ScState.Magic != SC_MAGIC) {
         return;
     }
 
-    if (g_ScState.Magic != SC_MONITOR_MAGIC) {
-        return;
-    }
-
-    //
-    // Signal shutdown
-    //
-    InterlockedExchange(&g_ScState.ShuttingDown, 1);
+    InterlockedExchange(&g_ScState.ShuttingDown, TRUE);
+    g_ScState.Initialized = FALSE;
     g_ScState.Enabled = FALSE;
+    KeMemoryBarrier();
 
     //
-    // Wait for outstanding references to drain (max 5 seconds)
+    // Drain outstanding operations
     //
-    timeout.QuadPart = -50000000;  // 5 seconds in 100ns units
-    if (g_ScState.ReferenceCount > 1) {
-        KeWaitForSingleObject(
-            &g_ScState.ShutdownEvent,
-            Executive,
-            KernelMode,
-            FALSE,
-            &timeout
-        );
+    KeClearEvent(&g_ScState.ShutdownEvent);
+    ScpReleaseReference();
+
+    timeout.QuadPart = -((LONGLONG)SC_SHUTDOWN_DRAIN_TIMEOUT_MS * 10000);
+    (VOID)KeWaitForSingleObject(
+        &g_ScState.ShutdownEvent, Executive, KernelMode, FALSE, &timeout);
+
+    //
+    // Shutdown sub-modules in reverse initialization order
+    //
+    if (g_ScState.CallstackAnalyzer != NULL) {
+        CsaShutdown(g_ScState.CallstackAnalyzer);
+        g_ScState.CallstackAnalyzer = NULL;
     }
 
-    //
-    // Shutdown direct syscall detector
-    //
     if (g_ScState.DirectSyscallDetector != NULL) {
         DsdShutdown(g_ScState.DirectSyscallDetector);
         g_ScState.DirectSyscallDetector = NULL;
     }
 
-    //
-    // Shutdown syscall table
-    //
+    if (g_ScState.HeavensGateDetector != NULL) {
+        HgdShutdown(g_ScState.HeavensGateDetector);
+        g_ScState.HeavensGateDetector = NULL;
+    }
+
+    if (g_ScState.NtdllIntegrityMonitor != NULL) {
+        NiShutdown(g_ScState.NtdllIntegrityMonitor);
+        g_ScState.NtdllIntegrityMonitor = NULL;
+    }
+
+    if (g_ScState.SyscallHooksFramework != NULL) {
+        ShShutdown(g_ScState.SyscallHooksFramework);
+        g_ScState.SyscallHooksFramework = NULL;
+    }
+
     if (g_ScState.SyscallTableHandle != NULL) {
         SstShutdown(g_ScState.SyscallTableHandle);
         g_ScState.SyscallTableHandle = NULL;
@@ -373,41 +367,41 @@ ScMonitorShutdown(VOID)
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ScState.ProcessLock);
 
-    while (!IsListEmpty(&g_ScState.ProcessContextList)) {
-        entry = RemoveHeadList(&g_ScState.ProcessContextList);
-        context = CONTAINING_RECORD(entry, SC_PROCESS_CONTEXT, ListEntry);
-        InitializeListHead(&context->ListEntry);
-        context->Removed = TRUE;
+    for (entry = g_ScState.ProcessContextList.Flink;
+         entry != &g_ScState.ProcessContextList;
+         entry = next) {
 
-        //
-        // Force-release regardless of refcount during shutdown
-        //
-        if (context->ProcessObject != NULL) {
-            ObDereferenceObject(context->ProcessObject);
-            context->ProcessObject = NULL;
+        next = entry->Flink;
+        PSC_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, SC_PROCESS_CONTEXT, ListEntry);
+        RemoveEntryList(entry);
+
+        if (ctx->ProcessObject != NULL) {
+            ObDereferenceObject(ctx->ProcessObject);
+            ctx->ProcessObject = NULL;
         }
 
-        ScpFreeProcessContext(context);
+        ExFreeToNPagedLookasideList(&g_ScState.ContextLookaside, ctx);
     }
-
-    g_ScState.ProcessContextCount = 0;
 
     ExReleasePushLockExclusive(&g_ScState.ProcessLock);
     KeLeaveCriticalRegion();
 
     //
-    // Free known good caller cache
+    // Free known-good caller cache
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ScState.CallerCacheLock);
 
-    while (!IsListEmpty(&g_ScState.KnownGoodCallers)) {
-        entry = RemoveHeadList(&g_ScState.KnownGoodCallers);
-        caller = CONTAINING_RECORD(entry, SC_KNOWN_GOOD_CALLER, ListEntry);
+    for (entry = g_ScState.KnownGoodCallers.Flink;
+         entry != &g_ScState.KnownGoodCallers;
+         entry = next) {
+
+        next = entry->Flink;
+        PSC_KNOWN_GOOD_CALLER caller =
+            CONTAINING_RECORD(entry, SC_KNOWN_GOOD_CALLER, ListEntry);
+        RemoveEntryList(entry);
         ShadowStrikeFreePoolWithTag(caller, SC_POOL_TAG_CACHE);
     }
-
-    g_ScState.KnownGoodCallerCount = 0;
 
     ExReleasePushLockExclusive(&g_ScState.CallerCacheLock);
     KeLeaveCriticalRegion();
@@ -425,1126 +419,333 @@ ScMonitorShutdown(VOID)
         g_ScState.ContextLookasideInitialized = FALSE;
     }
 
-    //
-    // Clear state
-    //
     g_ScState.Magic = 0;
-    g_ScState.Initialized = FALSE;
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike-SC] Syscall monitoring shutdown complete\n");
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
+
+static
+VOID
+ScpCleanupByFlags(
+    _In_ ULONG InitFlags
+    )
+{
+    if (InitFlags & SC_INIT_CALLSTACK_ANALYZER) {
+        if (g_ScState.CallstackAnalyzer != NULL) {
+            CsaShutdown(g_ScState.CallstackAnalyzer);
+            g_ScState.CallstackAnalyzer = NULL;
+        }
+    }
+    if (InitFlags & SC_INIT_DIRECT_SYSCALL) {
+        if (g_ScState.DirectSyscallDetector != NULL) {
+            DsdShutdown(g_ScState.DirectSyscallDetector);
+            g_ScState.DirectSyscallDetector = NULL;
+        }
+    }
+    if (InitFlags & SC_INIT_HEAVENS_GATE) {
+        if (g_ScState.HeavensGateDetector != NULL) {
+            HgdShutdown(g_ScState.HeavensGateDetector);
+            g_ScState.HeavensGateDetector = NULL;
+        }
+    }
+    if (InitFlags & SC_INIT_NTDLL_INTEGRITY) {
+        if (g_ScState.NtdllIntegrityMonitor != NULL) {
+            NiShutdown(g_ScState.NtdllIntegrityMonitor);
+            g_ScState.NtdllIntegrityMonitor = NULL;
+        }
+    }
+    if (InitFlags & SC_INIT_SYSCALL_HOOKS) {
+        if (g_ScState.SyscallHooksFramework != NULL) {
+            ShShutdown(g_ScState.SyscallHooksFramework);
+            g_ScState.SyscallHooksFramework = NULL;
+        }
+    }
+    if (InitFlags & SC_INIT_SYSCALL_TABLE) {
+        if (g_ScState.SyscallTableHandle != NULL) {
+            SstShutdown(g_ScState.SyscallTableHandle);
+            g_ScState.SyscallTableHandle = NULL;
+        }
+    }
+    if (InitFlags & SC_INIT_LOOKASIDE_EVENT) {
+        ExDeleteNPagedLookasideList(&g_ScState.EventLookaside);
+    }
+    if (InitFlags & SC_INIT_LOOKASIDE_CONTEXT) {
+        ExDeleteNPagedLookasideList(&g_ScState.ContextLookaside);
+    }
+}
+
+
+_Use_decl_annotations_
 NTSTATUS
 ScMonitorSetEnabled(
     _In_ BOOLEAN Enable
-)
+    )
 {
     PAGED_CODE();
 
-    if (!g_ScState.Initialized || g_ScState.Magic != SC_MONITOR_MAGIC) {
-        return STATUS_INVALID_DEVICE_STATE;
-    }
-
-    if (g_ScState.ShuttingDown) {
+    if (!g_ScState.Initialized) {
         return STATUS_DEVICE_NOT_READY;
     }
 
     g_ScState.Enabled = Enable;
+    KeMemoryBarrier();
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike-SC] Syscall monitoring %s\n",
+        Enable ? "enabled" : "disabled");
 
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// PUBLIC API - SYSCALL ANALYSIS
+// Process Context Management
 // ============================================================================
 
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
+static
 NTSTATUS
-ScMonitorAnalyzeSyscall(
-    _In_ UINT32 ProcessId,
-    _In_ UINT32 ThreadId,
-    _In_ UINT32 SyscallNumber,
-    _In_ UINT64 ReturnAddress,
-    _In_reads_opt_(ArgumentCount) PUINT64 Arguments,
-    _In_ UINT32 ArgumentCount,
-    _Out_opt_ PSYSCALL_CALL_CONTEXT Context
-)
+ScpAllocateProcessContext(
+    _Out_ PSC_PROCESS_CONTEXT* Context
+    )
 {
-    NTSTATUS status = STATUS_SUCCESS;
-    PSC_PROCESS_CONTEXT procCtx = NULL;
-    BOOLEAN isFromNtdll = FALSE;
-    BOOLEAN isFromWoW64Ntdll = FALSE;
-    UINT32 detectionFlags = 0;
-    UINT32 threatScore = 0;
-    UINT32 argCount;
-    PDSD_DETECTION dsdDetection = NULL;
+    PSC_PROCESS_CONTEXT ctx;
+
+    *Context = NULL;
+
+    ctx = (PSC_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
+        &g_ScState.ContextLookaside);
+    if (ctx == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(ctx, sizeof(SC_PROCESS_CONTEXT));
+    ctx->RefCount = 1;
+
+    *Context = ctx;
+    return STATUS_SUCCESS;
+}
+
+
+static
+VOID
+ScpFreeProcessContext(
+    _In_ PSC_PROCESS_CONTEXT Context
+    )
+{
+    if (Context == NULL) {
+        return;
+    }
+
+    if (Context->ProcessObject != NULL) {
+        ObDereferenceObject(Context->ProcessObject);
+        Context->ProcessObject = NULL;
+    }
+
+    ExFreeToNPagedLookasideList(&g_ScState.ContextLookaside, Context);
+}
+
+
+static
+PSC_PROCESS_CONTEXT
+ScpFindProcessContextLocked(
+    _In_ UINT32 ProcessId
+    )
+/*++
+    Must be called while holding ProcessLock (shared or exclusive).
+    Returns a referenced context or NULL.
+--*/
+{
+    PLIST_ENTRY entry;
+
+    for (entry = g_ScState.ProcessContextList.Flink;
+         entry != &g_ScState.ProcessContextList;
+         entry = entry->Flink) {
+
+        PSC_PROCESS_CONTEXT ctx =
+            CONTAINING_RECORD(entry, SC_PROCESS_CONTEXT, ListEntry);
+
+        if (ctx->ProcessId == ProcessId && !ctx->Removed) {
+            InterlockedIncrement(&ctx->RefCount);
+            return ctx;
+        }
+    }
+
+    return NULL;
+}
+
+
+static
+NTSTATUS
+ScpCreateProcessContext(
+    _In_ UINT32 ProcessId,
+    _Out_ PSC_PROCESS_CONTEXT* Context
+    )
+{
+    NTSTATUS status;
+    PSC_PROCESS_CONTEXT ctx;
+    PSC_PROCESS_CONTEXT existing;
+    PEPROCESS process = NULL;
 
     PAGED_CODE();
 
-    //
-    // Initialize output
-    //
-    if (Context != NULL) {
-        RtlZeroMemory(Context, sizeof(SYSCALL_CALL_CONTEXT));
-    }
+    *Context = NULL;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ScState.ProcessLock);
 
     //
-    // Validate state
+    // Race check
     //
-    if (!g_ScState.Initialized || g_ScState.Magic != SC_MONITOR_MAGIC) {
-        return STATUS_INVALID_DEVICE_STATE;
-    }
-
-    if (!g_ScState.Enabled) {
+    existing = ScpFindProcessContextLocked(ProcessId);
+    if (existing != NULL) {
+        ExReleasePushLockExclusive(&g_ScState.ProcessLock);
+        KeLeaveCriticalRegion();
+        *Context = existing;
         return STATUS_SUCCESS;
     }
 
-    if (g_ScState.ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
+    if (g_ScState.ProcessContextCount >= (LONG)SC_MAX_PROCESS_CONTEXTS) {
+        ExReleasePushLockExclusive(&g_ScState.ProcessLock);
+        KeLeaveCriticalRegion();
+        return STATUS_QUOTA_EXCEEDED;
     }
 
-    //
-    // Cap argument count
-    //
-    argCount = (ArgumentCount > SC_MAX_ARGUMENT_COUNT)
-        ? SC_MAX_ARGUMENT_COUNT
-        : ArgumentCount;
-
-    //
-    // Validate return address is in user space
-    //
-    if (!ScpValidateUserAddress(ReturnAddress)) {
-        return STATUS_INVALID_ADDRESS;
-    }
-
-    ScpAcquireReference();
-
-    //
-    // Update global statistics
-    //
-    InterlockedIncrement64(&g_ScState.TotalSyscallsMonitored);
-
-    //
-    // Get or create process context
-    //
-    status = ScMonitorGetProcessContext(ProcessId, &procCtx);
+    status = ScpAllocateProcessContext(&ctx);
     if (!NT_SUCCESS(status)) {
-        ScpReleaseReference();
+        ExReleasePushLockExclusive(&g_ScState.ProcessLock);
+        KeLeaveCriticalRegion();
         return status;
     }
 
-    //
-    // Update per-process statistics
-    //
-    InterlockedIncrement64(&procCtx->TotalSyscalls);
+    ctx->ProcessId = ProcessId;
 
     //
-    // Check if return address is from ntdll
+    // Reference the process object for lifetime safety
     //
-    isFromNtdll = ScpIsAddressInRange(
-        ReturnAddress,
-        procCtx->NtdllBase,
-        procCtx->NtdllSize
-    );
-
-    if (!isFromNtdll && procCtx->IsWoW64) {
-        isFromWoW64Ntdll = ScpIsAddressInRange(
-            ReturnAddress,
-            procCtx->Wow64NtdllBase,
-            procCtx->Wow64NtdllSize
-        );
+    status = PsLookupProcessByProcessId(
+        (HANDLE)(ULONG_PTR)ProcessId, &process);
+    if (NT_SUCCESS(status)) {
+        ctx->ProcessObject = process;   // Already referenced by PsLookup
+        ctx->IsWoW64 = (BOOLEAN)(PsGetProcessWow64Process(process) != NULL);
     }
 
-    //
-    // Direct syscall detection
-    //
-    if (!isFromNtdll && !isFromWoW64Ntdll) {
-        detectionFlags |= SC_DETECT_DIRECT_SYSCALL;
-        InterlockedIncrement64(&procCtx->DirectSyscalls);
-        InterlockedIncrement64(&g_ScState.TotalDirectSyscalls);
-        threatScore += 60;
+    ctx->ProcessCreateTime = (UINT64)KeQueryPerformanceCounter(NULL).QuadPart;
 
-        procCtx->Flags |= SC_PROC_FLAG_DIRECT_SYSCALLS;
-    }
+    ScpPopulateProcessNtdllInfo(ctx);
+
+    InsertTailList(&g_ScState.ProcessContextList, &ctx->ListEntry);
+    InterlockedIncrement(&g_ScState.ProcessContextCount);
 
     //
-    // Delegate to DirectSyscallDetector for deeper analysis
+    // Second reference for the caller
     //
-    if (g_ScState.DirectSyscallDetector != NULL &&
-        (detectionFlags & SC_DETECT_DIRECT_SYSCALL)) {
+    InterlockedIncrement(&ctx->RefCount);
 
-        NTSTATUS dsdStatus = DsdAnalyzeSyscall(
-            g_ScState.DirectSyscallDetector,
-            ULongToHandle(ProcessId),
-            ULongToHandle(ThreadId),
-            (PVOID)(ULONG_PTR)ReturnAddress,
-            SyscallNumber,
-            &dsdDetection
-        );
+    ExReleasePushLockExclusive(&g_ScState.ProcessLock);
+    KeLeaveCriticalRegion();
 
-        if (NT_SUCCESS(dsdStatus) && dsdDetection != NULL) {
-            if (dsdDetection->Technique == DsdTechnique_HeavensGate) {
-                detectionFlags |= SC_DETECT_HEAVENS_GATE;
-                InterlockedIncrement64(&g_ScState.TotalHeavensGate);
-                procCtx->Flags |= SC_PROC_FLAG_HEAVENS_GATE;
-                threatScore += 30;
-            }
-
-            if (!dsdDetection->CallFromKnownModule) {
-                detectionFlags |= SC_DETECT_UNBACKED_CALLER;
-                detectionFlags |= SC_DETECT_SHELLCODE_CALLER;
-                threatScore += 25;
-            }
-
-            if (dsdDetection->SuspicionScore > 0) {
-                threatScore = max(threatScore, dsdDetection->SuspicionScore);
-            }
-
-            DsdFreeDetection(dsdDetection);
-            dsdDetection = NULL;
-        }
-    }
-
-    //
-    // Track suspicious callers
-    //
-    if (detectionFlags != 0) {
-        InterlockedIncrement64(&procCtx->SuspiciousSyscalls);
-        InterlockedIncrement64(&g_ScState.TotalSuspiciousCalls);
-
-        ScpAddSuspiciousCaller(procCtx, ReturnAddress);
-
-        //
-        // Mark process as high risk if threshold exceeded
-        //
-        if (procCtx->DirectSyscalls > 5) {
-            procCtx->Flags |= SC_PROC_FLAG_HIGH_RISK;
-        }
-    }
-
-    //
-    // Populate output context if requested
-    //
-    if (Context != NULL) {
-        Context->SyscallNumber = SyscallNumber;
-        KeQuerySystemTimePrecise((PLARGE_INTEGER)&Context->Timestamp);
-        Context->ProcessId = ProcessId;
-        Context->ThreadId = ThreadId;
-        Context->ReturnAddress = ReturnAddress;
-        Context->IsFromNtdll = isFromNtdll || isFromWoW64Ntdll;
-        Context->IsFromWoW64 = procCtx->IsWoW64;
-        Context->ThreatScore = threatScore;
-        Context->DetectionFlags = detectionFlags;
-
-        if (Arguments != NULL && argCount > 0) {
-            __try {
-                ProbeForRead(
-                    Arguments,
-                    argCount * sizeof(UINT64),
-                    sizeof(UINT64)
-                );
-                RtlCopyMemory(
-                    Context->Arguments,
-                    Arguments,
-                    argCount * sizeof(UINT64)
-                );
-                Context->ArgumentCount = argCount;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                Context->ArgumentCount = 0;
-            }
-        }
-    }
-
-    //
-    // Emit behavioral events for significant detections
-    //
-    if (detectionFlags & SC_DETECT_DIRECT_SYSCALL) {
-        ScpEmitEvasionEvent(
-            ProcessId,
-            BehaviorEvent_DirectSyscall,
-            Evasion_DirectSyscall,
-            threatScore,
-            ReturnAddress
-        );
-    }
-
-    if (detectionFlags & SC_DETECT_HEAVENS_GATE) {
-        ScpEmitEvasionEvent(
-            ProcessId,
-            BehaviorEvent_HeavensGate,
-            Evasion_HeavensGate,
-            threatScore,
-            ReturnAddress
-        );
-    }
-
-    ScMonitorReleaseProcessContext(procCtx);
-    ScpReleaseReference();
-
-    //
-    // Block if threat score is critical
-    //
-    if (threatScore >= 90) {
-        InterlockedIncrement64(&g_ScState.TotalBlocked);
-        return STATUS_ACCESS_DENIED;
-    }
-
+    *Context = ctx;
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(APC_LEVEL)
-BOOLEAN
-ScMonitorIsFromNtdll(
-    _In_ UINT32 ProcessId,
-    _In_ UINT64 ReturnAddress,
-    _In_ BOOLEAN IsWoW64
-)
+
+static
+VOID
+ScpPopulateProcessNtdllInfo(
+    _Inout_ PSC_PROCESS_CONTEXT Context
+    )
+/*++
+    Delegates to NtdllIntegrity module for NTDLL base/size.
+--*/
 {
-    PSC_PROCESS_CONTEXT procCtx = NULL;
-    BOOLEAN result = FALSE;
     NTSTATUS status;
+    PNI_PROCESS_NTDLL ntdllState = NULL;
 
-    PAGED_CODE();
-
-    if (!g_ScState.Initialized || g_ScState.ShuttingDown) {
-        return FALSE;
+    if (g_ScState.NtdllIntegrityMonitor == NULL) {
+        return;
     }
 
-    status = ScMonitorGetProcessContext(ProcessId, &procCtx);
-    if (!NT_SUCCESS(status) || procCtx == NULL) {
-        return FALSE;
-    }
-
-    if (IsWoW64 && procCtx->IsWoW64) {
-        result = ScpIsAddressInRange(
-            ReturnAddress,
-            procCtx->Wow64NtdllBase,
-            procCtx->Wow64NtdllSize
+    status = NiScanProcess(
+        g_ScState.NtdllIntegrityMonitor,
+        (HANDLE)(ULONG_PTR)Context->ProcessId,
+        &ntdllState
         );
+
+    if (NT_SUCCESS(status) && ntdllState != NULL) {
+        Context->NtdllBase = (UINT64)(ULONG_PTR)ntdllState->NtdllBase;
+        Context->NtdllSize = (UINT64)ntdllState->NtdllSize;
+
+        //
+        // Populate integrity state
+        //
+        Context->NtdllIntegrity.NtdllBase = Context->NtdllBase;
+        Context->NtdllIntegrity.NtdllSize = Context->NtdllSize;
+        Context->NtdllIntegrity.IsIntact = TRUE;
+
+        if (ntdllState->HashValid) {
+            RtlCopyMemory(
+                Context->NtdllIntegrity.TextSectionHash,
+                ntdllState->Hash,
+                min(sizeof(Context->NtdllIntegrity.TextSectionHash),
+                    sizeof(ntdllState->Hash))
+                );
+        }
+
+        NiFreeState(g_ScState.NtdllIntegrityMonitor, ntdllState);
     } else {
-        result = ScpIsAddressInRange(
-            ReturnAddress,
-            procCtx->NtdllBase,
-            procCtx->NtdllSize
-        );
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike-SC] NTDLL info failed for PID %u: 0x%08X\n",
+            Context->ProcessId, status);
     }
-
-    ScMonitorReleaseProcessContext(procCtx);
-
-    return result;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
+
+static
 BOOLEAN
-ScMonitorDetectHeavensGate(
-    _In_ UINT32 ProcessId,
-    _In_ PSYSCALL_CALL_CONTEXT Context
-)
+ScpIsAddressInRange(
+    _In_ UINT64 Address,
+    _In_ UINT64 Base,
+    _In_ UINT64 Size
+    )
 {
-    PSC_PROCESS_CONTEXT procCtx = NULL;
-    BOOLEAN detected = FALSE;
-    NTSTATUS status;
-
-    PAGED_CODE();
-
-    if (Context == NULL) {
+    if (Size == 0 || Address < Base) {
         return FALSE;
     }
-
-    if (!g_ScState.Initialized || g_ScState.ShuttingDown) {
-        return FALSE;
-    }
-
-    status = ScMonitorGetProcessContext(ProcessId, &procCtx);
-    if (!NT_SUCCESS(status) || procCtx == NULL) {
-        return FALSE;
-    }
-
-    //
-    // Heaven's Gate: 32-bit process invoking 64-bit syscalls
-    // Indicators:
-    // 1. Process is WoW64 but syscall return is NOT from Wow64 ntdll
-    // 2. Return address is in 64-bit address space from a 32-bit process
-    //
-    if (procCtx->IsWoW64) {
-        BOOLEAN inWow64Ntdll = ScpIsAddressInRange(
-            Context->ReturnAddress,
-            procCtx->Wow64NtdllBase,
-            procCtx->Wow64NtdllSize
-        );
-
-        BOOLEAN in64BitNtdll = ScpIsAddressInRange(
-            Context->ReturnAddress,
-            procCtx->NtdllBase,
-            procCtx->NtdllSize
-        );
-
-        if (!inWow64Ntdll && !in64BitNtdll) {
-            //
-            // Syscall not from either ntdll - direct syscall from WoW64 process.
-            // If the return address is in 64-bit space, strong Heaven's Gate signal.
-            //
-            if (Context->ReturnAddress > 0xFFFFFFFF) {
-                detected = TRUE;
-            }
-        }
-
-        //
-        // Also delegate to the DSD detector for instruction-level analysis
-        //
-        if (!detected && g_ScState.DirectSyscallDetector != NULL) {
-            BOOLEAN isValid = TRUE;
-            DSD_TECHNIQUE technique = DsdTechnique_None;
-
-            status = DsdValidateCallstack(
-                g_ScState.DirectSyscallDetector,
-                ULongToHandle(ProcessId),
-                ULongToHandle(Context->ThreadId),
-                &isValid,
-                &technique
-            );
-
-            if (NT_SUCCESS(status) && technique == DsdTechnique_HeavensGate) {
-                detected = TRUE;
-            }
-        }
-    }
-
-    if (detected) {
-        Context->DetectionFlags |= SC_DETECT_HEAVENS_GATE;
-        Context->ThreatScore = max(Context->ThreatScore, 85);
-        procCtx->Flags |= SC_PROC_FLAG_HEAVENS_GATE;
-        InterlockedIncrement64(&g_ScState.TotalHeavensGate);
-
-        ScpEmitEvasionEvent(
-            ProcessId,
-            BehaviorEvent_HeavensGate,
-            Evasion_HeavensGate,
-            Context->ThreatScore,
-            Context->ReturnAddress
-        );
-    }
-
-    ScMonitorReleaseProcessContext(procCtx);
-
-    return detected;
+    return (Address - Base) < Size;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
-NTSTATUS
-ScMonitorAnalyzeCallStack(
-    _In_ UINT32 ProcessId,
-    _In_ UINT32 ThreadId,
-    _Out_writes_to_(MaxFrames, *FrameCount) PUINT64 StackFrames,
-    _In_ UINT32 MaxFrames,
-    _Out_ PUINT32 FrameCount,
-    _Out_ PUINT32 AnomalyFlags
-)
+
+static
+VOID
+ScpAddSuspiciousCaller(
+    _Inout_ PSC_PROCESS_CONTEXT Context,
+    _In_ UINT64 CallerAddress
+    )
+/*++
+    Adds to the circular buffer of suspicious callers.
+--*/
 {
-    NTSTATUS status;
-    PSC_PROCESS_CONTEXT procCtx = NULL;
-    BOOLEAN callstackValid = TRUE;
-    DSD_TECHNIQUE technique = DsdTechnique_None;
-    ULONG i;
+    UINT32 index;
 
-    PAGED_CODE();
-
-    //
-    // Validate parameters
-    //
-    if (StackFrames == NULL || FrameCount == NULL || AnomalyFlags == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    *FrameCount = 0;
-    *AnomalyFlags = 0;
-
-    if (MaxFrames == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    RtlZeroMemory(StackFrames, MaxFrames * sizeof(UINT64));
-
-    if (!g_ScState.Initialized || g_ScState.ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    ScpAcquireReference();
-
-    //
-    // Delegate call stack validation to the DSD detector
-    //
-    if (g_ScState.DirectSyscallDetector != NULL) {
-        status = DsdValidateCallstack(
-            g_ScState.DirectSyscallDetector,
-            ULongToHandle(ProcessId),
-            ULongToHandle(ThreadId),
-            &callstackValid,
-            &technique
-        );
-
-        if (!NT_SUCCESS(status)) {
-            ScpReleaseReference();
-            return status;
-        }
-    }
-
-    //
-    // Capture frames using RtlCaptureStackBackTrace
-    // Maximum supported by the API is 63
-    //
-    {
-        ULONG capturedFrames;
-        ULONG maxCapture = (MaxFrames > 62) ? 62 : MaxFrames;
-
-        capturedFrames = RtlCaptureStackBackTrace(
-            0,
-            maxCapture,
-            (PVOID*)StackFrames,
-            NULL
-        );
-
-        *FrameCount = capturedFrames;
-    }
-
-    //
-    // Analyze captured frames for anomalies
-    //
-    status = ScMonitorGetProcessContext(ProcessId, &procCtx);
-    if (NT_SUCCESS(status) && procCtx != NULL) {
-        BOOLEAN hasNtdllFrame = FALSE;
-
-        for (i = 0; i < *FrameCount; i++) {
-            UINT64 frame = StackFrames[i];
-
-            if (frame == 0) {
-                continue;
-            }
-
-            //
-            // Check if frame is in NTDLL
-            //
-            if (ScpIsAddressInRange(frame, procCtx->NtdllBase, procCtx->NtdllSize) ||
-                (procCtx->IsWoW64 &&
-                 ScpIsAddressInRange(frame, procCtx->Wow64NtdllBase, procCtx->Wow64NtdllSize))) {
-                hasNtdllFrame = TRUE;
-            }
-
-            //
-            // Check for return to unbacked/suspicious memory
-            // User-space addresses outside the typical DLL load range are suspicious
-            //
-            if (frame > SC_MIN_USER_ADDRESS && frame <= SC_USER_SPACE_LIMIT) {
-                if (frame < 0x00007FF000000000 && frame > 0x80000000) {
-                    *AnomalyFlags |= SC_STACK_ANOMALY_UNBACKED;
-                }
-            }
-        }
-
-        if (!hasNtdllFrame && *FrameCount > 0) {
-            *AnomalyFlags |= SC_STACK_ANOMALY_UNBACKED;
-        }
-
-        ScMonitorReleaseProcessContext(procCtx);
-    }
-
-    //
-    // Map DSD technique to anomaly flags
-    //
-    if (!callstackValid) {
-        *AnomalyFlags |= SC_STACK_ANOMALY_CORRUPTED;
-    }
-
-    if (technique == DsdTechnique_HeavensGate) {
-        *AnomalyFlags |= SC_STACK_ANOMALY_PIVOT;
-    }
-
-    ScpReleaseReference();
-
-    return STATUS_SUCCESS;
+    index = Context->SuspiciousCallerCount % SC_MAX_SUSPICIOUS_CALLERS;
+    Context->SuspiciousCallers[index] = CallerAddress;
+    InterlockedIncrement((volatile LONG*)&Context->SuspiciousCallerCount);
 }
+
 
 // ============================================================================
-// PUBLIC API - NTDLL INTEGRITY
+// Public Process Context API
 // ============================================================================
 
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
-NTSTATUS
-ScMonitorVerifyNtdllIntegrity(
-    _In_ UINT32 ProcessId,
-    _Out_ PNTDLL_INTEGRITY_STATE IntegrityState
-)
-{
-    NTSTATUS status;
-    PSC_PROCESS_CONTEXT procCtx = NULL;
-    PEPROCESS process = NULL;
-    KAPC_STATE apcState;
-    UCHAR currentHash[32];
-
-    PAGED_CODE();
-
-    if (IntegrityState == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    RtlZeroMemory(IntegrityState, sizeof(NTDLL_INTEGRITY_STATE));
-
-    if (!g_ScState.Initialized || g_ScState.ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    ScpAcquireReference();
-
-    //
-    // Get process context
-    //
-    status = ScMonitorGetProcessContext(ProcessId, &procCtx);
-    if (!NT_SUCCESS(status)) {
-        ScpReleaseReference();
-        return status;
-    }
-
-    if (procCtx->NtdllBase == 0 || procCtx->NtdllSize == 0) {
-        ScpPopulateNtdllInfo(procCtx);
-
-        if (procCtx->NtdllBase == 0) {
-            ScMonitorReleaseProcessContext(procCtx);
-            ScpReleaseReference();
-            return STATUS_NOT_FOUND;
-        }
-    }
-
-    IntegrityState->NtdllBase = procCtx->NtdllBase;
-    IntegrityState->NtdllSize = procCtx->NtdllSize;
-
-    //
-    // Attach to the target process to read its NTDLL .text section
-    //
-    status = ShadowStrikeGetProcessObject(
-        ULongToHandle(ProcessId),
-        &process
-    );
-
-    if (!NT_SUCCESS(status)) {
-        ScMonitorReleaseProcessContext(procCtx);
-        ScpReleaseReference();
-        return status;
-    }
-
-    KeStackAttachProcess(process, &apcState);
-
-    __try {
-        PVOID ntdllBase = (PVOID)(ULONG_PTR)procCtx->NtdllBase;
-        ULONG ntdllSize = (ULONG)procCtx->NtdllSize;
-        PIMAGE_DOS_HEADER dosHeader;
-        PIMAGE_NT_HEADERS ntHeaders;
-        PIMAGE_SECTION_HEADER sectionHeader;
-        USHORT sectionCount;
-        USHORT idx;
-
-        ProbeForRead(ntdllBase, sizeof(IMAGE_DOS_HEADER), sizeof(USHORT));
-        dosHeader = (PIMAGE_DOS_HEADER)ntdllBase;
-
-        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-            status = STATUS_INVALID_IMAGE_FORMAT;
-            __leave;
-        }
-
-        //
-        // Validate e_lfanew bounds before use
-        //
-        if (dosHeader->e_lfanew < (LONG)sizeof(IMAGE_DOS_HEADER) ||
-            (ULONG)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS) > ntdllSize) {
-            status = STATUS_INVALID_IMAGE_FORMAT;
-            __leave;
-        }
-
-        ntHeaders = (PIMAGE_NT_HEADERS)(
-            (PUCHAR)ntdllBase + dosHeader->e_lfanew
-        );
-        ProbeForRead(ntHeaders, sizeof(IMAGE_NT_HEADERS), sizeof(ULONG));
-
-        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
-            status = STATUS_INVALID_IMAGE_FORMAT;
-            __leave;
-        }
-
-        sectionCount = ntHeaders->FileHeader.NumberOfSections;
-        if (sectionCount > 96) {
-            status = STATUS_INVALID_IMAGE_FORMAT;
-            __leave;
-        }
-
-        sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
-        ProbeForRead(
-            sectionHeader,
-            sectionCount * sizeof(IMAGE_SECTION_HEADER),
-            sizeof(ULONG)
-        );
-
-        for (idx = 0; idx < sectionCount; idx++) {
-            if (sectionHeader[idx].Name[0] == '.' &&
-                sectionHeader[idx].Name[1] == 't' &&
-                sectionHeader[idx].Name[2] == 'e' &&
-                sectionHeader[idx].Name[3] == 'x' &&
-                sectionHeader[idx].Name[4] == 't') {
-
-                ULONG textRva = sectionHeader[idx].VirtualAddress;
-                ULONG textSize = sectionHeader[idx].Misc.VirtualSize;
-                PVOID textBase;
-
-                //
-                // Validate .text section bounds within module
-                //
-                if (textRva == 0 || textSize == 0 ||
-                    textRva + textSize > ntdllSize) {
-                    status = STATUS_INVALID_IMAGE_FORMAT;
-                    __leave;
-                }
-
-                textBase = (PUCHAR)ntdllBase + textRva;
-
-                //
-                // Cap to 16MB to prevent excessive hashing
-                //
-                if (textSize > 0x1000000) {
-                    textSize = 0x1000000;
-                }
-
-                IntegrityState->TextSectionBase =
-                    (UINT64)(ULONG_PTR)textBase;
-                IntegrityState->TextSectionSize = textSize;
-
-                ProbeForRead(textBase, textSize, 1);
-
-                status = ShadowStrikeComputeSha256(
-                    textBase,
-                    textSize,
-                    currentHash
-                );
-
-                if (NT_SUCCESS(status)) {
-                    RtlCopyMemory(
-                        IntegrityState->TextSectionHash,
-                        currentHash,
-                        32
-                    );
-
-                    if (g_ScState.SystemNtdllHash[0] != 0) {
-                        IntegrityState->IsIntact = (BOOLEAN)RtlEqualMemory(
-                            currentHash,
-                            g_ScState.SystemNtdllHash,
-                            32
-                        );
-
-                        if (!IntegrityState->IsIntact) {
-                            IntegrityState->IsHooked = TRUE;
-                            procCtx->Flags |= SC_PROC_FLAG_NTDLL_MODIFIED;
-
-                            RtlCopyMemory(
-                                &procCtx->NtdllIntegrity,
-                                IntegrityState,
-                                sizeof(NTDLL_INTEGRITY_STATE)
-                            );
-                        }
-                    } else {
-                        //
-                        // First call - establish baseline hash
-                        //
-                        RtlCopyMemory(
-                            g_ScState.SystemNtdllHash,
-                            currentHash,
-                            32
-                        );
-                        IntegrityState->IsIntact = TRUE;
-                    }
-                }
-
-                break;
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        status = GetExceptionCode();
-    }
-
-    KeUnstackDetachProcess(&apcState);
-    ObDereferenceObject(process);
-
-    KeQuerySystemTimePrecise(
-        (PLARGE_INTEGER)&IntegrityState->LastVerifyTime
-    );
-
-    ScMonitorReleaseProcessContext(procCtx);
-    ScpReleaseReference();
-
-    return status;
-}
-
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
-NTSTATUS
-ScMonitorGetNtdllHooks(
-    _In_ UINT32 ProcessId,
-    _Out_writes_to_(MaxFunctions, *FunctionCount) PHOOKED_FUNCTION_ENTRY HookedFunctions,
-    _In_ UINT32 MaxFunctions,
-    _Out_ PUINT32 FunctionCount
-)
-{
-    NTSTATUS status;
-    PSC_PROCESS_CONTEXT procCtx = NULL;
-    PEPROCESS process = NULL;
-    KAPC_STATE apcState;
-    UINT32 hookCount = 0;
-
-    PAGED_CODE();
-
-    if (HookedFunctions == NULL || FunctionCount == NULL || MaxFunctions == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    *FunctionCount = 0;
-    RtlZeroMemory(
-        HookedFunctions,
-        MaxFunctions * sizeof(HOOKED_FUNCTION_ENTRY)
-    );
-
-    if (!g_ScState.Initialized || g_ScState.ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    ScpAcquireReference();
-
-    status = ScMonitorGetProcessContext(ProcessId, &procCtx);
-    if (!NT_SUCCESS(status)) {
-        ScpReleaseReference();
-        return status;
-    }
-
-    if (procCtx->NtdllBase == 0) {
-        ScMonitorReleaseProcessContext(procCtx);
-        ScpReleaseReference();
-        return STATUS_NOT_FOUND;
-    }
-
-    status = ShadowStrikeGetProcessObject(
-        ULongToHandle(ProcessId),
-        &process
-    );
-    if (!NT_SUCCESS(status)) {
-        ScMonitorReleaseProcessContext(procCtx);
-        ScpReleaseReference();
-        return status;
-    }
-
-    KeStackAttachProcess(process, &apcState);
-
-    __try {
-        PVOID ntdllBase = (PVOID)(ULONG_PTR)procCtx->NtdllBase;
-        ULONG ntdllSize = (ULONG)procCtx->NtdllSize;
-        PIMAGE_DOS_HEADER dosHeader;
-        PIMAGE_NT_HEADERS ntHeaders;
-        PIMAGE_EXPORT_DIRECTORY exportDir;
-        PULONG functionRvas;
-        PULONG nameRvas;
-        PUSHORT ordinals;
-        ULONG exportRva;
-        ULONG exportSize;
-        ULONG numFunctions;
-        ULONG numNames;
-        ULONG idx;
-
-        ProbeForRead(ntdllBase, sizeof(IMAGE_DOS_HEADER), sizeof(USHORT));
-        dosHeader = (PIMAGE_DOS_HEADER)ntdllBase;
-
-        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-            status = STATUS_INVALID_IMAGE_FORMAT;
-            __leave;
-        }
-
-        //
-        // Validate e_lfanew bounds before use
-        //
-        if (dosHeader->e_lfanew < (LONG)sizeof(IMAGE_DOS_HEADER) ||
-            (ULONG)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS) > ntdllSize) {
-            status = STATUS_INVALID_IMAGE_FORMAT;
-            __leave;
-        }
-
-        ntHeaders = (PIMAGE_NT_HEADERS)(
-            (PUCHAR)ntdllBase + dosHeader->e_lfanew
-        );
-        ProbeForRead(ntHeaders, sizeof(IMAGE_NT_HEADERS), sizeof(ULONG));
-
-        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
-            status = STATUS_INVALID_IMAGE_FORMAT;
-            __leave;
-        }
-
-        exportRva = ntHeaders->OptionalHeader
-            .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-        exportSize = ntHeaders->OptionalHeader
-            .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
-
-        if (exportRva == 0 || exportSize == 0) {
-            status = STATUS_NOT_FOUND;
-            __leave;
-        }
-
-        //
-        // Validate export directory is within module bounds
-        //
-        if (exportRva + sizeof(IMAGE_EXPORT_DIRECTORY) > ntdllSize) {
-            status = STATUS_INVALID_IMAGE_FORMAT;
-            __leave;
-        }
-
-        exportDir = (PIMAGE_EXPORT_DIRECTORY)(
-            (PUCHAR)ntdllBase + exportRva
-        );
-        ProbeForRead(exportDir, sizeof(IMAGE_EXPORT_DIRECTORY), sizeof(ULONG));
-
-        numFunctions = exportDir->NumberOfFunctions;
-        numNames = exportDir->NumberOfNames;
-
-        if (numFunctions == 0 || numNames == 0 || numNames > 16384 ||
-            numFunctions > 16384) {
-            status = STATUS_NOT_FOUND;
-            __leave;
-        }
-
-        //
-        // Validate export table array RVAs are within module bounds
-        //
-        if (exportDir->AddressOfFunctions + numFunctions * sizeof(ULONG) > ntdllSize ||
-            exportDir->AddressOfNames + numNames * sizeof(ULONG) > ntdllSize ||
-            exportDir->AddressOfNameOrdinals + numNames * sizeof(USHORT) > ntdllSize) {
-            status = STATUS_INVALID_IMAGE_FORMAT;
-            __leave;
-        }
-
-        functionRvas = (PULONG)(
-            (PUCHAR)ntdllBase + exportDir->AddressOfFunctions
-        );
-        nameRvas = (PULONG)(
-            (PUCHAR)ntdllBase + exportDir->AddressOfNames
-        );
-        ordinals = (PUSHORT)(
-            (PUCHAR)ntdllBase + exportDir->AddressOfNameOrdinals
-        );
-
-        ProbeForRead(
-            functionRvas,
-            numFunctions * sizeof(ULONG),
-            sizeof(ULONG)
-        );
-        ProbeForRead(
-            nameRvas,
-            numNames * sizeof(ULONG),
-            sizeof(ULONG)
-        );
-        ProbeForRead(
-            ordinals,
-            numNames * sizeof(USHORT),
-            sizeof(USHORT)
-        );
-
-        for (idx = 0; idx < numNames && hookCount < MaxFunctions; idx++) {
-            PCSTR funcName;
-            ULONG funcRva;
-            PVOID funcAddr;
-            UCHAR prologue[16];
-            BOOLEAN isHooked = FALSE;
-            HOOK_TYPE hookType = HookType_None;
-
-            funcName = (PCSTR)((PUCHAR)ntdllBase + nameRvas[idx]);
-
-            //
-            // Validate name RVA is within module bounds.
-            // Probe enough bytes for typical Nt* function names (max ~64 chars).
-            //
-            if (nameRvas[idx] >= ntdllSize) {
-                continue;
-            }
-            {
-                ULONG maxNameProbe = min(SC_MAX_FUNCTION_NAME_LENGTH + 1,
-                                         ntdllSize - nameRvas[idx]);
-                ProbeForRead((PVOID)funcName, maxNameProbe, 1);
-            }
-
-            //
-            // Only check Nt* and Zw* functions (syscall stubs)
-            //
-            if ((funcName[0] != 'N' || funcName[1] != 't') &&
-                (funcName[0] != 'Z' || funcName[1] != 'w')) {
-                continue;
-            }
-
-            if (ordinals[idx] >= numFunctions) {
-                continue;
-            }
-
-            funcRva = functionRvas[ordinals[idx]];
-
-            //
-            // Validate function RVA is within module bounds
-            //
-            if (funcRva + sizeof(prologue) > ntdllSize) {
-                continue;
-            }
-
-            funcAddr = (PUCHAR)ntdllBase + funcRva;
-
-            ProbeForRead(funcAddr, sizeof(prologue), 1);
-            RtlCopyMemory(prologue, funcAddr, sizeof(prologue));
-
-            //
-            // A clean ntdll syscall stub starts with:
-            // mov r10, rcx  (4C 8B D1)  or
-            // mov eax, imm32 (B8 xx xx xx xx)
-            // Anything else at the entry point indicates a hook.
-            //
-            if (prologue[0] == 0xE9) {
-                isHooked = TRUE;
-                hookType = HookType_InlineJmp;
-            } else if (prologue[0] == 0xE8) {
-                isHooked = TRUE;
-                hookType = HookType_InlineCall;
-            } else if (prologue[0] == 0xFF && prologue[1] == 0x25) {
-                isHooked = TRUE;
-                hookType = HookType_Trampoline;
-            } else if (prologue[0] == 0x68) {
-                isHooked = TRUE;
-                hookType = HookType_InlineJmp;
-            } else if (prologue[0] != 0x4C && prologue[0] != 0xB8 &&
-                       prologue[0] != 0x48 && prologue[0] != 0x90) {
-                isHooked = TRUE;
-                hookType = HookType_InlineJmp;
-            }
-
-            if (isHooked) {
-                PHOOKED_FUNCTION_ENTRY entry = &HookedFunctions[hookCount];
-
-                RtlStringCchCopyA(
-                    entry->FunctionName,
-                    sizeof(entry->FunctionName),
-                    funcName
-                );
-                entry->OriginalAddress = (UINT64)(ULONG_PTR)funcAddr;
-                entry->CurrentAddress = (UINT64)(ULONG_PTR)funcAddr;
-                entry->HookType = hookType;
-
-                if (hookType == HookType_InlineJmp && prologue[0] == 0xE9) {
-                    LONG disp = *(PLONG)(&prologue[1]);
-                    entry->HookDestination =
-                        (UINT64)((ULONG_PTR)funcAddr + 5 + disp);
-                }
-
-                hookCount++;
-            }
-        }
-
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        status = GetExceptionCode();
-    }
-
-    KeUnstackDetachProcess(&apcState);
-    ObDereferenceObject(process);
-
-    *FunctionCount = hookCount;
-
-    ScMonitorReleaseProcessContext(procCtx);
-    ScpReleaseReference();
-
-    return NT_SUCCESS(status) ? STATUS_SUCCESS : status;
-}
-
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
-NTSTATUS
-ScMonitorRestoreNtdllFunction(
-    _In_ UINT32 ProcessId,
-    _In_z_ PCSTR FunctionName
-)
-{
-    NTSTATUS status;
-    SIZE_T nameLen;
-
-    PAGED_CODE();
-
-    if (FunctionName == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!g_ScState.Initialized || g_ScState.ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    //
-    // Validate function name length
-    //
-    status = RtlStringCchLengthA(
-        FunctionName,
-        SC_MAX_FUNCTION_NAME_LENGTH + 1,
-        &nameLen
-    );
-    if (!NT_SUCCESS(status) || nameLen == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // Validate against allowlist — only whitelisted Nt* functions may be restored
-    //
-    if (!ScpIsFunctionNameAllowed(FunctionName)) {
-        return STATUS_ACCESS_DENIED;
-    }
-
-    //
-    // Verify integrity state and emit telemetry.
-    // The actual byte-level restore requires a verified clean ntdll copy
-    // validated against SystemNtdllHash. The integrity check below detects
-    // the hook and reports it; full byte restore is gated on having a
-    // cryptographically-verified clean reference image.
-    //
-    {
-        NTDLL_INTEGRITY_STATE integrity;
-
-        status = ScMonitorVerifyNtdllIntegrity(ProcessId, &integrity);
-        if (!NT_SUCCESS(status)) {
-            return status;
-        }
-
-        if (integrity.IsIntact) {
-            return STATUS_SUCCESS;
-        }
-
-        ScpEmitEvasionEvent(
-            ProcessId,
-            BehaviorEvent_NtdllUnhooking,
-            Evasion_NtdllUnhooking,
-            70,
-            integrity.TextSectionBase
-        );
-    }
-
-    return STATUS_SUCCESS;
-}
-
-// ============================================================================
-// PUBLIC API - PROCESS CONTEXT
-// ============================================================================
-
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
+_Use_decl_annotations_
 NTSTATUS
 ScMonitorGetProcessContext(
     _In_ UINT32 ProcessId,
     _Outptr_ PSC_PROCESS_CONTEXT* Context
-)
+    )
 {
-    PSC_PROCESS_CONTEXT found = NULL;
+    PSC_PROCESS_CONTEXT ctx;
 
     PAGED_CODE();
 
@@ -1554,79 +755,48 @@ ScMonitorGetProcessContext(
 
     *Context = NULL;
 
-    if (!g_ScState.Initialized || g_ScState.ShuttingDown) {
+    if (!g_ScState.Initialized) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Search under shared lock first (fast path)
-    //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_ScState.ProcessLock);
-
-    found = ScpFindProcessContextLocked(ProcessId);
-    if (found != NULL && !found->Removed) {
-        InterlockedIncrement(&found->RefCount);
-        *Context = found;
-    }
-
+    ctx = ScpFindProcessContextLocked(ProcessId);
     ExReleasePushLockShared(&g_ScState.ProcessLock);
     KeLeaveCriticalRegion();
 
-    if (*Context != NULL) {
+    if (ctx != NULL) {
+        *Context = ctx;
         return STATUS_SUCCESS;
     }
 
-    //
-    // Not found - create under exclusive lock
-    //
     return ScpCreateProcessContext(ProcessId, Context);
 }
 
-_IRQL_requires_max_(APC_LEVEL)
+
+_Use_decl_annotations_
 VOID
 ScMonitorReleaseProcessContext(
     _In_ PSC_PROCESS_CONTEXT Context
-)
+    )
 {
-    LONG newRefCount;
-
-    PAGED_CODE();
-
     if (Context == NULL) {
         return;
     }
 
-    newRefCount = InterlockedDecrement(&Context->RefCount);
-
-    if (newRefCount < 0) {
-        //
-        // Double-release detected - bug in caller. Repair the refcount.
-        //
-        InterlockedIncrement(&Context->RefCount);
-        return;
-    }
-
-    if (newRefCount == 0 && Context->Removed) {
-        //
-        // Last reference on a removed context - perform deferred free
-        //
-        if (Context->ProcessObject != NULL) {
-            ObDereferenceObject(Context->ProcessObject);
-            Context->ProcessObject = NULL;
-        }
-
+    if (InterlockedDecrement(&Context->RefCount) == 0) {
         ScpFreeProcessContext(Context);
     }
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
+
+_Use_decl_annotations_
 VOID
 ScMonitorRemoveProcessContext(
     _In_ UINT32 ProcessId
-)
+    )
 {
-    PSC_PROCESS_CONTEXT context = NULL;
+    PLIST_ENTRY entry;
 
     PAGED_CODE();
 
@@ -1634,46 +804,981 @@ ScMonitorRemoveProcessContext(
         return;
     }
 
+    //
+    // Notify sub-modules about process exit
+    //
+    if (g_ScState.CallstackAnalyzer != NULL) {
+        CsaOnProcessExit(g_ScState.CallstackAnalyzer,
+            (HANDLE)(ULONG_PTR)ProcessId);
+    }
+
+    if (g_ScState.HeavensGateDetector != NULL) {
+        HgdRemoveProcessContext(g_ScState.HeavensGateDetector,
+            (HANDLE)(ULONG_PTR)ProcessId);
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ScState.ProcessLock);
 
-    context = ScpFindProcessContextLocked(ProcessId);
-    if (context != NULL && !context->Removed) {
-        RemoveEntryList(&context->ListEntry);
-        InitializeListHead(&context->ListEntry);
-        context->Removed = TRUE;
-        InterlockedDecrement(&g_ScState.ProcessContextCount);
+    for (entry = g_ScState.ProcessContextList.Flink;
+         entry != &g_ScState.ProcessContextList;
+         entry = entry->Flink) {
+
+        PSC_PROCESS_CONTEXT ctx =
+            CONTAINING_RECORD(entry, SC_PROCESS_CONTEXT, ListEntry);
+
+        if (ctx->ProcessId == ProcessId) {
+            RemoveEntryList(entry);
+            InterlockedDecrement(&g_ScState.ProcessContextCount);
+            ctx->Removed = TRUE;
+
+            ExReleasePushLockExclusive(&g_ScState.ProcessLock);
+            KeLeaveCriticalRegion();
+
+            //
+            // Drop list reference. Last holder will free.
+            //
+            if (InterlockedDecrement(&ctx->RefCount) == 0) {
+                ScpFreeProcessContext(ctx);
+            }
+            return;
+        }
     }
 
     ExReleasePushLockExclusive(&g_ScState.ProcessLock);
     KeLeaveCriticalRegion();
-
-    //
-    // Release the creation reference. If no other holders exist,
-    // this triggers the deferred free via ScMonitorReleaseProcessContext.
-    //
-    if (context != NULL && context->Removed) {
-        ScMonitorReleaseProcessContext(context);
-    }
 }
 
 // ============================================================================
-// PUBLIC API - SYSCALL TABLE (DELEGATION)
+// Core Syscall Analysis — The Orchestrator
 // ============================================================================
 
-_IRQL_requires_max_(APC_LEVEL)
-_Must_inspect_result_
+_Use_decl_annotations_
+NTSTATUS
+ScMonitorAnalyzeSyscall(
+    _In_ UINT32 ProcessId,
+    _In_ UINT32 ThreadId,
+    _In_ UINT32 SyscallNumber,
+    _In_ UINT64 ReturnAddress,
+    _In_reads_opt_(ArgumentCount) PUINT64 Arguments,
+    _In_ UINT32 ArgumentCount,
+    _Out_opt_ PSYSCALL_CALL_CONTEXT Context
+    )
+/*++
+Routine Description:
+    Top-level syscall analysis orchestrator. Coordinates all 6 detection
+    sub-modules and produces a composite threat assessment.
+
+    Flow:
+    1. Guard checks (enabled, shutdown, valid addresses)
+    2. Get/create process context
+    3. SyscallTable lookup (metadata)
+    4. Quick NTDLL range check
+    5. Direct Syscall Detection (DSD)
+    6. Heaven's Gate Detection (HGD)
+    7. Callstack capture + analysis (CSA)
+    8. Periodic NTDLL integrity check (NI)
+    9. Dispatch to registered hooks (SH)
+    10. Composite threat score + block/allow decision
+    11. Behavioral event emission + statistics
+
+Arguments:
+    ProcessId      - Calling process ID.
+    ThreadId       - Calling thread ID.
+    SyscallNumber  - Syscall number.
+    ReturnAddress  - User-mode return address of the syscall.
+    Arguments      - Optional array of syscall arguments.
+    ArgumentCount  - Number of arguments (max 8).
+    Context        - Optional output call context.
+
+Return Value:
+    STATUS_SUCCESS       - Syscall allowed.
+    STATUS_ACCESS_DENIED - Syscall blocked.
+--*/
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    PSC_PROCESS_CONTEXT procCtx = NULL;
+    UINT32 detectFlags = 0;
+    UINT32 threatScore = 0;
+    BOOLEAN fromNtdll = FALSE;
+    BOOLEAN shouldBlock = FALSE;
+
+    SST_ENTRY_INFO syscallInfo = { 0 };
+    PDSD_DETECTION dsdDetection = NULL;
+    PCSA_CALLSTACK csaCallstack = NULL;
+    CSA_ANOMALY csaAnomalies = CsaAnomaly_None;
+    ULONG csaScore = 0;
+
+    PAGED_CODE();
+
+    //
+    // Initialize output
+    //
+    if (Context != NULL) {
+        RtlZeroMemory(Context, sizeof(SYSCALL_CALL_CONTEXT));
+        Context->SyscallNumber = SyscallNumber;
+        Context->ProcessId = ProcessId;
+        Context->ThreadId = ThreadId;
+        Context->ReturnAddress = ReturnAddress;
+        Context->Timestamp = (UINT64)KeQueryPerformanceCounter(NULL).QuadPart;
+
+        if (Arguments != NULL && ArgumentCount > 0) {
+            UINT32 count = min(ArgumentCount, 8);
+            RtlCopyMemory(Context->Arguments, Arguments,
+                count * sizeof(UINT64));
+            Context->ArgumentCount = count;
+        }
+    }
+
+    //
+    // Guard: must be initialized and enabled
+    //
+    if (!g_ScState.Initialized || !g_ScState.Enabled || g_ScState.ShuttingDown) {
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Basic address sanity check
+    //
+    if (ReturnAddress < SC_MIN_USER_ADDRESS || ReturnAddress > SC_MAX_USER_ADDRESS) {
+        detectFlags |= SC_DETECT_DIRECT_SYSCALL;
+        threatScore += 300;
+    }
+
+    ScpAcquireReference();
+
+    if (g_ScState.ShuttingDown) {
+        ScpReleaseReference();
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Get or create process context
+    //
+    status = ScMonitorGetProcessContext(ProcessId, &procCtx);
+    if (!NT_SUCCESS(status)) {
+        ScpReleaseReference();
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike-SC] PID %u context failed: 0x%08X\n",
+            ProcessId, status);
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Step 1: Syscall Table Lookup
+    //
+    status = SstLookupByNumber(
+        g_ScState.SyscallTableHandle, SyscallNumber, &syscallInfo);
+
+    if (!NT_SUCCESS(status)) {
+        detectFlags |= SC_DETECT_DIRECT_SYSCALL;
+        threatScore += 200;
+    }
+
+    //
+    // Step 2: NTDLL range check (cheap — just pointer arithmetic)
+    //
+    if (procCtx->NtdllBase != 0 && procCtx->NtdllSize != 0) {
+        fromNtdll = ScpIsAddressInRange(
+            ReturnAddress, procCtx->NtdllBase, procCtx->NtdllSize);
+
+        //
+        // Also check WoW64 NTDLL for 32-bit processes
+        //
+        if (!fromNtdll && procCtx->IsWoW64 &&
+            procCtx->Wow64NtdllBase != 0 && procCtx->Wow64NtdllSize != 0) {
+            fromNtdll = ScpIsAddressInRange(
+                ReturnAddress, procCtx->Wow64NtdllBase,
+                procCtx->Wow64NtdllSize);
+        }
+    }
+
+    if (!fromNtdll) {
+        detectFlags |= SC_DETECT_DIRECT_SYSCALL;
+        threatScore += 100;
+    }
+
+    if (Context != NULL) {
+        Context->IsFromNtdll = fromNtdll;
+    }
+
+    //
+    // Step 3: Direct Syscall Detection (delegate to DSD)
+    //
+    if (g_ScState.DirectSyscallDetector != NULL) {
+        NTSTATUS dsdStatus = DsdAnalyzeSyscall(
+            g_ScState.DirectSyscallDetector,
+            (HANDLE)(ULONG_PTR)ProcessId,
+            (HANDLE)(ULONG_PTR)ThreadId,
+            (PVOID)(ULONG_PTR)ReturnAddress,
+            SyscallNumber,
+            &dsdDetection
+            );
+
+        if (NT_SUCCESS(dsdStatus) && dsdDetection != NULL) {
+            detectFlags |= SC_DETECT_DIRECT_SYSCALL;
+            threatScore += dsdDetection->SuspicionScore;
+
+            if (dsdDetection->Technique == DsdTechnique_HellsGate ||
+                dsdDetection->Technique == DsdTechnique_HalosGate ||
+                dsdDetection->Technique == DsdTechnique_TartarusGate) {
+                detectFlags |= SC_DETECT_HOOK_BYPASS;
+                threatScore += 200;
+            }
+
+            if (!dsdDetection->CallFromKnownModule) {
+                detectFlags |= SC_DETECT_UNBACKED_CALLER;
+                threatScore += 150;
+            }
+
+            if (Context != NULL) {
+                Context->IsFromKnownModule = dsdDetection->CallFromKnownModule;
+                Context->CallerModuleBase = dsdDetection->CallerModuleBase;
+                Context->CallerModuleSize = dsdDetection->CallerModuleSize;
+
+                RtlCopyMemory(Context->CallerModuleName,
+                    dsdDetection->CallerModuleName,
+                    min(sizeof(Context->CallerModuleName),
+                        sizeof(dsdDetection->CallerModuleName)));
+            }
+
+            DsdFreeDetection(dsdDetection);
+            dsdDetection = NULL;
+        }
+    }
+
+    //
+    // Step 4: Heaven's Gate Detection (delegate to HGD)
+    //
+    if (g_ScState.HeavensGateDetector != NULL) {
+        BOOLEAN hgdSuspicious = FALSE;
+        HGD_GATE_TYPE gateType = HgdGate_None;
+
+        NTSTATUS hgdStatus = HgdDetectSyscallOrigin(
+            g_ScState.HeavensGateDetector,
+            (HANDLE)(ULONG_PTR)ProcessId,
+            SyscallNumber,
+            (PVOID)(ULONG_PTR)ReturnAddress,
+            &hgdSuspicious,
+            &gateType
+            );
+
+        if (NT_SUCCESS(hgdStatus) && hgdSuspicious) {
+            detectFlags |= SC_DETECT_HEAVENS_GATE;
+            threatScore += 350;
+
+            if (Context != NULL) {
+                Context->IsFromWoW64 = TRUE;
+            }
+
+            //
+            // Check for legitimate WoW64 transition
+            //
+            BOOLEAN isLegitimate = FALSE;
+            HgdIsLegitimateWow64(
+                g_ScState.HeavensGateDetector,
+                (PVOID)(ULONG_PTR)ReturnAddress,
+                &isLegitimate
+                );
+
+            if (isLegitimate) {
+                detectFlags &= ~SC_DETECT_HEAVENS_GATE;
+                threatScore -= min(threatScore, 300);
+            }
+        }
+    }
+
+    //
+    // Step 5: Callstack Capture + Analysis (delegate to CSA)
+    //
+    // Only perform expensive analysis when we have early suspicion
+    // or when the syscall itself is high-risk.
+    //
+    if (g_ScState.CallstackAnalyzer != NULL &&
+        (detectFlags != 0 ||
+         (NT_SUCCESS(status) && syscallInfo.RiskLevel >= SstRisk_High))) {
+
+        NTSTATUS csaStatus = CsaCaptureCallstack(
+            g_ScState.CallstackAnalyzer,
+            (HANDLE)(ULONG_PTR)ProcessId,
+            (HANDLE)(ULONG_PTR)ThreadId,
+            &csaCallstack
+            );
+
+        if (NT_SUCCESS(csaStatus) && csaCallstack != NULL) {
+            csaStatus = CsaAnalyzeCallstack(
+                g_ScState.CallstackAnalyzer,
+                csaCallstack,
+                &csaAnomalies,
+                &csaScore
+                );
+
+            if (NT_SUCCESS(csaStatus)) {
+                if (csaAnomalies & CsaAnomaly_DirectSyscall) {
+                    detectFlags |= SC_DETECT_DIRECT_SYSCALL;
+                    threatScore += 100;
+                }
+                if (csaAnomalies & CsaAnomaly_ReturnGadget) {
+                    detectFlags |= SC_DETECT_STACK_ANOMALY;
+                    threatScore += 500;
+                }
+                if (csaAnomalies & CsaAnomaly_StackPivot) {
+                    detectFlags |= SC_DETECT_STACK_ANOMALY;
+                    threatScore += 400;
+                }
+                if (csaAnomalies & CsaAnomaly_UnbackedCode) {
+                    detectFlags |= SC_DETECT_UNBACKED_CALLER;
+                    threatScore += 200;
+                }
+                if (csaAnomalies & CsaAnomaly_RWXMemory) {
+                    detectFlags |= SC_DETECT_SHELLCODE_CALLER;
+                    threatScore += 250;
+                }
+
+                //
+                // Copy stack frames to output context
+                //
+                if (Context != NULL) {
+                    UINT32 count = min(csaCallstack->FrameCount, 16);
+                    for (UINT32 i = 0; i < count; i++) {
+                        Context->StackFrames[i] =
+                            (UINT64)(ULONG_PTR)
+                            csaCallstack->Frames[i].ReturnAddress;
+                    }
+                    Context->StackFrameCount = count;
+                }
+            }
+
+            CsaFreeCallstack(csaCallstack);
+            csaCallstack = NULL;
+        }
+    }
+
+    //
+    // Step 6: Periodic NTDLL Integrity Check (delegate to NI)
+    //
+    if (g_ScState.NtdllIntegrityMonitor != NULL &&
+        procCtx->NtdllBase != 0) {
+
+        LONG64 callCount = InterlockedIncrement64(&procCtx->TotalSyscalls);
+
+        if ((callCount % SC_NTDLL_CHECK_INTERVAL) == 0) {
+            BOOLEAN isModified = FALSE;
+
+            NTSTATUS niStatus = NiCompareToClean(
+                g_ScState.NtdllIntegrityMonitor,
+                (HANDLE)(ULONG_PTR)procCtx->ProcessId,
+                &isModified
+                );
+
+            if (NT_SUCCESS(niStatus) && isModified) {
+                detectFlags |= SC_DETECT_HOOK_BYPASS;
+                threatScore += 300;
+                procCtx->NtdllIntegrity.IsIntact = FALSE;
+                procCtx->NtdllIntegrity.IsHooked = TRUE;
+                procCtx->Flags |= SC_PROC_FLAG_NTDLL_MODIFIED;
+            }
+
+            procCtx->NtdllIntegrity.LastVerifyTime =
+                (UINT64)KeQueryPerformanceCounter(NULL).QuadPart;
+        }
+    } else {
+        InterlockedIncrement64(&procCtx->TotalSyscalls);
+    }
+
+    //
+    // Step 7: Dispatch to registered hooks (SH framework)
+    //
+    if (g_ScState.SyscallHooksFramework != NULL) {
+        SH_SYSCALL_CONTEXT hookCtx = { 0 };
+        SH_HOOK_RESULT hookResult = ShResult_Allow;
+
+        hookCtx.ProcessId = (HANDLE)(ULONG_PTR)ProcessId;
+        hookCtx.ThreadId = (HANDLE)(ULONG_PTR)ThreadId;
+        hookCtx.SyscallNumber = SyscallNumber;
+        hookCtx.CallerReturnAddress = ReturnAddress;
+        hookCtx.IsPreCall = TRUE;
+
+        if (Arguments != NULL && ArgumentCount > 0) {
+            UINT32 count = min(ArgumentCount, SH_MAX_ARGUMENTS);
+            RtlCopyMemory(hookCtx.Arguments, Arguments,
+                count * sizeof(ULONG64));
+            hookCtx.ArgumentCount = count;
+        }
+
+        NTSTATUS hookStatus = ShDispatchSyscall(
+            g_ScState.SyscallHooksFramework,
+            &hookCtx,
+            &hookResult
+            );
+
+        if (NT_SUCCESS(hookStatus) && hookResult == ShResult_Block) {
+            shouldBlock = TRUE;
+        }
+    }
+
+    //
+    // Step 8: Composite threat assessment
+    //
+    if (threatScore >= SC_SCORE_BLOCK_THRESHOLD) {
+        shouldBlock = TRUE;
+    }
+
+    //
+    // Step 9: Emit behavioral event if suspicious
+    //
+    if (detectFlags != 0 && threatScore >= SC_SCORE_ALERT_THRESHOLD) {
+        ScpEmitEvasionEvent(ProcessId, SyscallNumber,
+            detectFlags, threatScore, shouldBlock);
+    }
+
+    //
+    // Track suspicious callers
+    //
+    if (detectFlags != 0) {
+        ScpAddSuspiciousCaller(procCtx, ReturnAddress);
+
+        if (detectFlags & SC_DETECT_DIRECT_SYSCALL) {
+            InterlockedIncrement64(&procCtx->DirectSyscalls);
+            procCtx->Flags |= SC_PROC_FLAG_DIRECT_SYSCALLS;
+        }
+        if (detectFlags & SC_DETECT_HEAVENS_GATE) {
+            procCtx->Flags |= SC_PROC_FLAG_HEAVENS_GATE;
+        }
+
+        InterlockedIncrement64(&procCtx->SuspiciousSyscalls);
+    }
+
+    //
+    // Step 10: Update global statistics
+    //
+    InterlockedIncrement64(&g_ScState.TotalSyscallsMonitored);
+
+    if (detectFlags & SC_DETECT_DIRECT_SYSCALL) {
+        InterlockedIncrement64(&g_ScState.TotalDirectSyscalls);
+    }
+    if (detectFlags & SC_DETECT_HEAVENS_GATE) {
+        InterlockedIncrement64(&g_ScState.TotalHeavensGate);
+    }
+    if (detectFlags != 0) {
+        InterlockedIncrement64(&g_ScState.TotalSuspiciousCalls);
+    }
+    if (shouldBlock) {
+        InterlockedIncrement64(&g_ScState.TotalBlocked);
+    }
+
+    //
+    // Fill remaining output context fields
+    //
+    if (Context != NULL) {
+        Context->ThreatScore = threatScore;
+        Context->DetectionFlags = detectFlags;
+        Context->IsSuspiciousRegion = (detectFlags & SC_DETECT_UNBACKED_CALLER) != 0;
+    }
+
+    ScMonitorReleaseProcessContext(procCtx);
+    ScpReleaseReference();
+
+    return shouldBlock ? STATUS_ACCESS_DENIED : STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Delegation Wrappers — Exact header signature matches
+// ============================================================================
+
+_Use_decl_annotations_
+BOOLEAN
+ScMonitorIsFromNtdll(
+    _In_ UINT32 ProcessId,
+    _In_ UINT64 ReturnAddress,
+    _In_ BOOLEAN IsWoW64
+    )
+{
+    PSC_PROCESS_CONTEXT ctx = NULL;
+    BOOLEAN result = FALSE;
+
+    if (!g_ScState.Initialized) {
+        return FALSE;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_ScState.ProcessLock);
+    ctx = ScpFindProcessContextLocked(ProcessId);
+    ExReleasePushLockShared(&g_ScState.ProcessLock);
+    KeLeaveCriticalRegion();
+
+    if (ctx != NULL) {
+        if (IsWoW64 && ctx->Wow64NtdllBase != 0) {
+            result = ScpIsAddressInRange(
+                ReturnAddress, ctx->Wow64NtdllBase, ctx->Wow64NtdllSize);
+        } else if (ctx->NtdllBase != 0) {
+            result = ScpIsAddressInRange(
+                ReturnAddress, ctx->NtdllBase, ctx->NtdllSize);
+        }
+        ScMonitorReleaseProcessContext(ctx);
+    }
+
+    return result;
+}
+
+
+_Use_decl_annotations_
+BOOLEAN
+ScMonitorDetectHeavensGate(
+    _In_ UINT32 ProcessId,
+    _In_ PSYSCALL_CALL_CONTEXT Context
+    )
+{
+    BOOLEAN isSuspicious = FALSE;
+    HGD_GATE_TYPE gateType = HgdGate_None;
+
+    PAGED_CODE();
+
+    if (Context == NULL) {
+        return FALSE;
+    }
+
+    if (!g_ScState.Initialized || g_ScState.HeavensGateDetector == NULL) {
+        return FALSE;
+    }
+
+    NTSTATUS status = HgdDetectSyscallOrigin(
+        g_ScState.HeavensGateDetector,
+        (HANDLE)(ULONG_PTR)ProcessId,
+        Context->SyscallNumber,
+        (PVOID)(ULONG_PTR)Context->ReturnAddress,
+        &isSuspicious,
+        &gateType
+        );
+
+    if (NT_SUCCESS(status) && isSuspicious) {
+        //
+        // Check for legitimate WoW64
+        //
+        BOOLEAN isLegitimate = FALSE;
+        HgdIsLegitimateWow64(
+            g_ScState.HeavensGateDetector,
+            (PVOID)(ULONG_PTR)Context->ReturnAddress,
+            &isLegitimate
+            );
+
+        if (!isLegitimate) {
+            Context->IsFromWoW64 = TRUE;
+            Context->DetectionFlags |= SC_DETECT_HEAVENS_GATE;
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+
+_Use_decl_annotations_
+NTSTATUS
+ScMonitorAnalyzeCallStack(
+    _In_ UINT32 ProcessId,
+    _In_ UINT32 ThreadId,
+    _Out_writes_to_(MaxFrames, *FrameCount) PUINT64 StackFrames,
+    _In_ UINT32 MaxFrames,
+    _Out_ PUINT32 FrameCount,
+    _Out_ PUINT32 AnomalyFlags
+    )
+{
+    NTSTATUS status;
+    PCSA_CALLSTACK callstack = NULL;
+    CSA_ANOMALY anomalies = CsaAnomaly_None;
+    ULONG score = 0;
+
+    PAGED_CODE();
+
+    if (StackFrames == NULL || FrameCount == NULL ||
+        AnomalyFlags == NULL || MaxFrames == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *FrameCount = 0;
+    *AnomalyFlags = 0;
+    RtlZeroMemory(StackFrames, MaxFrames * sizeof(UINT64));
+
+    if (!g_ScState.Initialized || g_ScState.CallstackAnalyzer == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    status = CsaCaptureCallstack(
+        g_ScState.CallstackAnalyzer,
+        (HANDLE)(ULONG_PTR)ProcessId,
+        (HANDLE)(ULONG_PTR)ThreadId,
+        &callstack
+        );
+
+    if (!NT_SUCCESS(status) || callstack == NULL) {
+        return status;
+    }
+
+    status = CsaAnalyzeCallstack(
+        g_ScState.CallstackAnalyzer,
+        callstack,
+        &anomalies,
+        &score
+        );
+
+    if (NT_SUCCESS(status)) {
+        //
+        // Copy frame return addresses to output
+        //
+        UINT32 count = min(callstack->FrameCount, MaxFrames);
+        for (UINT32 i = 0; i < count; i++) {
+            StackFrames[i] =
+                (UINT64)(ULONG_PTR)callstack->Frames[i].ReturnAddress;
+        }
+        *FrameCount = count;
+
+        //
+        // Map CSA anomaly flags to SC stack anomaly flags
+        //
+        if (anomalies & CsaAnomaly_UnbackedCode) {
+            *AnomalyFlags |= SC_STACK_ANOMALY_UNBACKED;
+        }
+        if (anomalies & CsaAnomaly_RWXMemory) {
+            *AnomalyFlags |= SC_STACK_ANOMALY_RWX;
+        }
+        if (anomalies & CsaAnomaly_StackPivot) {
+            *AnomalyFlags |= SC_STACK_ANOMALY_PIVOT;
+        }
+        if (anomalies & CsaAnomaly_ReturnGadget) {
+            *AnomalyFlags |= SC_STACK_ANOMALY_GADGET;
+        }
+        if (anomalies & CsaAnomaly_MissingFrames) {
+            *AnomalyFlags |= SC_STACK_ANOMALY_CORRUPTED;
+        }
+    }
+
+    CsaFreeCallstack(callstack);
+    return status;
+}
+
+
+_Use_decl_annotations_
+NTSTATUS
+ScMonitorVerifyNtdllIntegrity(
+    _In_ UINT32 ProcessId,
+    _Out_ PNTDLL_INTEGRITY_STATE IntegrityState
+    )
+{
+    NTSTATUS status;
+    PNI_PROCESS_NTDLL ntdllState = NULL;
+
+    PAGED_CODE();
+
+    if (IntegrityState == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(IntegrityState, sizeof(NTDLL_INTEGRITY_STATE));
+
+    if (!g_ScState.Initialized || g_ScState.NtdllIntegrityMonitor == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Get NTDLL baseline info
+    //
+    status = NiScanProcess(
+        g_ScState.NtdllIntegrityMonitor,
+        (HANDLE)(ULONG_PTR)ProcessId,
+        &ntdllState
+        );
+
+    if (!NT_SUCCESS(status) || ntdllState == NULL) {
+        return status;
+    }
+
+    IntegrityState->NtdllBase = (UINT64)(ULONG_PTR)ntdllState->NtdllBase;
+    IntegrityState->NtdllSize = (UINT64)ntdllState->NtdllSize;
+
+    if (ntdllState->HashValid) {
+        RtlCopyMemory(IntegrityState->TextSectionHash,
+            ntdllState->Hash, sizeof(ntdllState->Hash));
+    }
+
+    IntegrityState->LastVerifyTime =
+        (UINT64)KeQueryPerformanceCounter(NULL).QuadPart;
+
+    //
+    // Check for modifications
+    //
+    BOOLEAN isModified = FALSE;
+    NTSTATUS compareStatus = NiCompareToClean(
+        g_ScState.NtdllIntegrityMonitor,
+        (HANDLE)(ULONG_PTR)ProcessId,
+        &isModified
+        );
+
+    IntegrityState->IsIntact = NT_SUCCESS(compareStatus) && !isModified;
+
+    //
+    // Enumerate hooks to get count
+    //
+    #define SC_MAX_HOOK_ENUM 128
+    ULONG foundCount = 0;
+
+    //
+    // We allocate a small array on pool since we just need the count
+    //
+    PNI_FUNCTION_STATE* hookBuffer = (PNI_FUNCTION_STATE*)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        SC_MAX_HOOK_ENUM * sizeof(PNI_FUNCTION_STATE),
+        SC_POOL_TAG_GENERAL
+        );
+
+    if (hookBuffer != NULL) {
+        NTSTATUS hookStatus = NiDetectHooks(
+            g_ScState.NtdllIntegrityMonitor,
+            (HANDLE)(ULONG_PTR)ProcessId,
+            hookBuffer,
+            SC_MAX_HOOK_ENUM,
+            &foundCount
+            );
+
+        if (NT_SUCCESS(hookStatus) && foundCount > 0) {
+            IntegrityState->IsHooked = TRUE;
+            IntegrityState->HookedFunctionCount = (UINT16)min(foundCount, 0xFFFF);
+
+            //
+            // Free each returned function state
+            //
+            for (ULONG i = 0; i < foundCount; i++) {
+                if (hookBuffer[i] != NULL) {
+                    NiFreeFunctionState(g_ScState.NtdllIntegrityMonitor,
+                        hookBuffer[i]);
+                }
+            }
+        }
+
+        ShadowStrikeFreePoolWithTag(hookBuffer, SC_POOL_TAG_GENERAL);
+    }
+
+    NiFreeState(g_ScState.NtdllIntegrityMonitor, ntdllState);
+
+    return STATUS_SUCCESS;
+}
+
+
+_Use_decl_annotations_
+NTSTATUS
+ScMonitorGetNtdllHooks(
+    _In_ UINT32 ProcessId,
+    _Out_writes_to_(MaxFunctions, *FunctionCount) PHOOKED_FUNCTION_ENTRY HookedFunctions,
+    _In_ UINT32 MaxFunctions,
+    _Out_ PUINT32 FunctionCount
+    )
+{
+    NTSTATUS status;
+    PNI_FUNCTION_STATE* niHooks = NULL;
+    ULONG niCount = 0;
+    UINT32 i;
+
+    PAGED_CODE();
+
+    if (HookedFunctions == NULL || FunctionCount == NULL || MaxFunctions == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *FunctionCount = 0;
+    RtlZeroMemory(HookedFunctions, MaxFunctions * sizeof(HOOKED_FUNCTION_ENTRY));
+
+    if (!g_ScState.Initialized || g_ScState.NtdllIntegrityMonitor == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    niHooks = (PNI_FUNCTION_STATE*)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        MaxFunctions * sizeof(PNI_FUNCTION_STATE),
+        SC_POOL_TAG_GENERAL
+        );
+
+    if (niHooks == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    status = NiDetectHooks(
+        g_ScState.NtdllIntegrityMonitor,
+        (HANDLE)(ULONG_PTR)ProcessId,
+        niHooks,
+        (ULONG)MaxFunctions,
+        &niCount
+        );
+
+    if (NT_SUCCESS(status)) {
+        for (i = 0; i < niCount && i < MaxFunctions; i++) {
+            if (niHooks[i] != NULL) {
+                RtlStringCchCopyA(
+                    HookedFunctions[i].FunctionName,
+                    sizeof(HookedFunctions[i].FunctionName),
+                    niHooks[i]->FunctionName
+                    );
+
+                HookedFunctions[i].OriginalAddress =
+                    (UINT64)(ULONG_PTR)niHooks[i]->ExpectedAddress;
+                HookedFunctions[i].CurrentAddress =
+                    (UINT64)(ULONG_PTR)niHooks[i]->CurrentAddress;
+
+                //
+                // Determine hook type from modification type
+                //
+                switch (niHooks[i]->ModificationType) {
+                case NiMod_HookInstalled:
+                    HookedFunctions[i].HookType = (UINT32)HookType_InlineJmp;
+                    break;
+                case NiMod_ImportModified:
+                    HookedFunctions[i].HookType = (UINT32)HookType_IAT;
+                    break;
+                case NiMod_ExportModified:
+                    HookedFunctions[i].HookType = (UINT32)HookType_EAT;
+                    break;
+                default:
+                    HookedFunctions[i].HookType = (UINT32)HookType_None;
+                    break;
+                }
+
+                NiFreeFunctionState(g_ScState.NtdllIntegrityMonitor,
+                    niHooks[i]);
+            }
+        }
+        *FunctionCount = min((UINT32)niCount, MaxFunctions);
+    }
+
+    ShadowStrikeFreePoolWithTag(niHooks, SC_POOL_TAG_GENERAL);
+    return status;
+}
+
+
+_Use_decl_annotations_
+NTSTATUS
+ScMonitorRestoreNtdllFunction(
+    _In_ UINT32 ProcessId,
+    _In_z_ PCSTR FunctionName
+    )
+/*++
+    Restores a hooked NTDLL function using the clean baseline from NI.
+
+    Security: This function writes to another process's address space.
+    We validate the function is actually hooked before attempting restoration.
+    Full audit trail is emitted.
+--*/
+{
+    NTSTATUS status;
+    PNI_FUNCTION_STATE funcState = NULL;
+    PEPROCESS process = NULL;
+    KAPC_STATE apcState;
+    SIZE_T bytesWritten = 0;
+
+    PAGED_CODE();
+
+    if (FunctionName == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!g_ScState.Initialized || g_ScState.NtdllIntegrityMonitor == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Verify the function is actually hooked
+    //
+    status = NiCheckFunction(
+        g_ScState.NtdllIntegrityMonitor,
+        (HANDLE)(ULONG_PTR)ProcessId,
+        FunctionName,
+        &funcState
+        );
+
+    if (!NT_SUCCESS(status) || funcState == NULL) {
+        return status;
+    }
+
+    if (!funcState->IsModified) {
+        NiFreeFunctionState(g_ScState.NtdllIntegrityMonitor, funcState);
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Audit log
+    //
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike-SC] Restoring %s in PID %u "
+        "(expected=0x%p, current=0x%p, mod=%d)\n",
+        FunctionName, ProcessId,
+        funcState->ExpectedAddress, funcState->CurrentAddress,
+        funcState->ModificationType);
+
+    //
+    // Attach to target process and write original prologue
+    //
+    status = PsLookupProcessByProcessId(
+        (HANDLE)(ULONG_PTR)ProcessId, &process);
+    if (!NT_SUCCESS(status)) {
+        NiFreeFunctionState(g_ScState.NtdllIntegrityMonitor, funcState);
+        return status;
+    }
+
+    if (ShadowStrikeIsProcessTerminating(process)) {
+        ObDereferenceObject(process);
+        NiFreeFunctionState(g_ScState.NtdllIntegrityMonitor, funcState);
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
+
+    KeStackAttachProcess(process, &apcState);
+
+    __try {
+        ProbeForWrite(funcState->CurrentAddress, sizeof(funcState->ExpectedPrologue), 1);
+
+        //
+        // Write original prologue bytes back
+        //
+        status = ZwWriteVirtualMemory(
+            ZwCurrentProcess(),
+            funcState->CurrentAddress,
+            funcState->ExpectedPrologue,
+            sizeof(funcState->ExpectedPrologue),
+            &bytesWritten
+            );
+
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+
+    KeUnstackDetachProcess(&apcState);
+    ObDereferenceObject(process);
+
+    if (NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "[ShadowStrike-SC] Restored %s in PID %u (%llu bytes)\n",
+            FunctionName, ProcessId, (UINT64)bytesWritten);
+    } else {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike-SC] Restore failed for %s in PID %u: 0x%08X\n",
+            FunctionName, ProcessId, status);
+    }
+
+    NiFreeFunctionState(g_ScState.NtdllIntegrityMonitor, funcState);
+    return status;
+}
+
+// ============================================================================
+// Syscall Table Delegation Wrappers
+// ============================================================================
+
+_Use_decl_annotations_
 NTSTATUS
 ScMonitorGetSyscallName(
     _In_ UINT32 SyscallNumber,
     _Out_writes_z_(NameSize) PSTR Name,
     _In_ UINT32 NameSize
-)
+    )
 {
-    SST_ENTRY_INFO info;
+    SST_ENTRY_INFO info = { 0 };
     NTSTATUS status;
-
-    PAGED_CODE();
 
     if (Name == NULL || NameSize == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -1686,29 +1791,24 @@ ScMonitorGetSyscallName(
     }
 
     status = SstLookupByNumber(
-        g_ScState.SyscallTableHandle,
-        SyscallNumber,
-        &info
-    );
-    if (!NT_SUCCESS(status)) {
-        return STATUS_NOT_FOUND;
+        g_ScState.SyscallTableHandle, SyscallNumber, &info);
+    if (NT_SUCCESS(status) && info.Name != NULL) {
+        RtlStringCchCopyA(Name, NameSize, info.Name);
     }
 
-    return RtlStringCchCopyA(Name, NameSize, info.Name);
+    return status;
 }
 
-_IRQL_requires_max_(APC_LEVEL)
-_Must_inspect_result_
+
+_Use_decl_annotations_
 NTSTATUS
 ScMonitorGetSyscallNumber(
     _In_z_ PCSTR Name,
     _Out_ PUINT32 SyscallNumber
-)
+    )
 {
-    SST_ENTRY_INFO info;
+    SST_ENTRY_INFO info = { 0 };
     NTSTATUS status;
-
-    PAGED_CODE();
 
     if (Name == NULL || SyscallNumber == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1720,27 +1820,25 @@ ScMonitorGetSyscallNumber(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    status = SstLookupByName(g_ScState.SyscallTableHandle, Name, &info);
-    if (!NT_SUCCESS(status)) {
-        return STATUS_NOT_FOUND;
+    status = SstLookupByName(
+        g_ScState.SyscallTableHandle, Name, &info);
+    if (NT_SUCCESS(status)) {
+        *SyscallNumber = info.Number;
     }
 
-    *SyscallNumber = info.Number;
-    return STATUS_SUCCESS;
+    return status;
 }
 
-_IRQL_requires_max_(APC_LEVEL)
-_Must_inspect_result_
+
+_Use_decl_annotations_
 NTSTATUS
 ScMonitorGetSyscallDefinition(
     _In_ UINT32 SyscallNumber,
     _Out_ PSYSCALL_DEFINITION Definition
-)
+    )
 {
-    SST_ENTRY_INFO info;
+    SST_ENTRY_INFO info = { 0 };
     NTSTATUS status;
-
-    PAGED_CODE();
 
     if (Definition == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1753,88 +1851,110 @@ ScMonitorGetSyscallDefinition(
     }
 
     status = SstLookupByNumber(
-        g_ScState.SyscallTableHandle,
-        SyscallNumber,
-        &info
-    );
-    if (!NT_SUCCESS(status)) {
-        return STATUS_NOT_FOUND;
+        g_ScState.SyscallTableHandle, SyscallNumber, &info);
+
+    if (NT_SUCCESS(status)) {
+        Definition->SyscallNumber = SyscallNumber;
+
+        if (info.Name != NULL) {
+            RtlStringCchCopyA(Definition->SyscallName,
+                sizeof(Definition->SyscallName), info.Name);
+        }
+
+        //
+        // Map SST types to SYSCALL_DEFINITION types
+        //
+        switch (info.Category) {
+        case SstCategory_Process: Definition->Category = SyscallCategory_Process; break;
+        case SstCategory_Thread:  Definition->Category = SyscallCategory_Thread; break;
+        case SstCategory_Memory:  Definition->Category = SyscallCategory_Memory; break;
+        case SstCategory_File:    Definition->Category = SyscallCategory_File; break;
+        case SstCategory_Registry: Definition->Category = SyscallCategory_Registry; break;
+        case SstCategory_Object:  Definition->Category = SyscallCategory_Object; break;
+        case SstCategory_Security: Definition->Category = SyscallCategory_Security; break;
+        case SstCategory_System:  Definition->Category = SyscallCategory_System; break;
+        case SstCategory_Network: Definition->Category = SyscallCategory_Network; break;
+        default:                  Definition->Category = SyscallCategory_Unknown; break;
+        }
+
+        switch (info.RiskLevel) {
+        case SstRisk_Low:      Definition->RiskCategory = SyscallRisk_Low; break;
+        case SstRisk_Medium:   Definition->RiskCategory = SyscallRisk_Medium; break;
+        case SstRisk_High:     Definition->RiskCategory = SyscallRisk_High; break;
+        case SstRisk_Critical: Definition->RiskCategory = SyscallRisk_Critical; break;
+        default:               Definition->RiskCategory = SyscallRisk_None; break;
+        }
+
+        Definition->ArgumentCount = info.ArgumentCount;
+        Definition->Flags = info.Flags;
     }
 
-    //
-    // Map SST_ENTRY_INFO to SYSCALL_DEFINITION.
-    // The new SyscallTable already provides category and risk data,
-    // so we use it directly instead of heuristic name matching.
-    //
-    Definition->SyscallNumber = info.Number;
-    RtlStringCchCopyA(
-        Definition->SyscallName,
-        sizeof(Definition->SyscallName),
-        info.Name
-    );
-    Definition->ArgumentCount = info.ArgumentCount;
-
-    //
-    // Map SST_CATEGORY to SYSCALL_CATEGORY (enums are compatible)
-    //
-    switch (info.Category) {
-    case SstCategory_Process:   Definition->Category = SyscallCategory_Process; break;
-    case SstCategory_Thread:    Definition->Category = SyscallCategory_Thread; break;
-    case SstCategory_Memory:    Definition->Category = SyscallCategory_Memory; break;
-    case SstCategory_File:      Definition->Category = SyscallCategory_File; break;
-    case SstCategory_Registry:  Definition->Category = SyscallCategory_Registry; break;
-    case SstCategory_Object:    Definition->Category = SyscallCategory_Object; break;
-    case SstCategory_Security:  Definition->Category = SyscallCategory_Security; break;
-    case SstCategory_System:    Definition->Category = SyscallCategory_System; break;
-    case SstCategory_Network:   Definition->Category = SyscallCategory_Network; break;
-    default:                    Definition->Category = SyscallCategory_Unknown; break;
-    }
-
-    //
-    // Map SST_RISK_LEVEL to SYSCALL_RISK_CATEGORY
-    //
-    switch (info.RiskLevel) {
-    case SstRisk_Low:       Definition->RiskCategory = SyscallRisk_Low; break;
-    case SstRisk_Medium:    Definition->RiskCategory = SyscallRisk_Medium; break;
-    case SstRisk_High:      Definition->RiskCategory = SyscallRisk_High; break;
-    case SstRisk_Critical:  Definition->RiskCategory = SyscallRisk_Critical; break;
-    default:                Definition->RiskCategory = SyscallRisk_None; break;
-    }
-
-    //
-    // Map SST_FLAG_* to SC_FLAG_* (compatible where applicable)
-    //
-    if (info.Flags & SST_FLAG_INJECTION_RISK) {
-        Definition->Flags |= SC_FLAG_INJECTION_RISK;
-    }
-    if (info.Flags & SST_FLAG_CREDENTIAL_RISK) {
-        Definition->Flags |= SC_FLAG_CREDENTIAL_RISK;
-    }
-    if (info.Flags & SST_FLAG_EVASION_RISK) {
-        Definition->Flags |= SC_FLAG_EVASION_RISK;
-    }
-    if (info.Flags & SST_FLAG_CROSS_PROCESS) {
-        Definition->Flags |= SC_FLAG_CROSS_PROCESS;
-    }
-    if (info.Flags & SST_FLAG_REQUIRES_ADMIN) {
-        Definition->Flags |= SC_FLAG_REQUIRES_ELEVATION;
-    }
-
-    return STATUS_SUCCESS;
+    return status;
 }
 
+
 // ============================================================================
-// PUBLIC API - STATISTICS
+// Event Emission
 // ============================================================================
 
-_IRQL_requires_max_(APC_LEVEL)
+static
+VOID
+ScpEmitEvasionEvent(
+    _In_ UINT32 ProcessId,
+    _In_ UINT32 SyscallNumber,
+    _In_ UINT32 DetectionFlags,
+    _In_ UINT32 ThreatScore,
+    _In_ BOOLEAN ShouldBlock
+    )
+{
+    BEHAVIOR_EVENT_TYPE eventType = BehaviorEvent_DirectSyscall;
+    BEHAVIOR_RESPONSE_ACTION response = BehaviorResponse_Allow;
+
+    if (DetectionFlags & SC_DETECT_HEAVENS_GATE) {
+        eventType = BehaviorEvent_HeavensGate;
+    } else if (DetectionFlags & SC_DETECT_HOOK_BYPASS) {
+        eventType = BehaviorEvent_NtdllUnhooking;
+    }
+
+    //
+    // Build compact event payload on stack
+    //
+    SYSCALL_CALL_CONTEXT eventData = { 0 };
+    eventData.SyscallNumber = SyscallNumber;
+    eventData.ProcessId = ProcessId;
+    eventData.DetectionFlags = DetectionFlags;
+    eventData.ThreatScore = ThreatScore;
+
+    (VOID)BeEngineSubmitEvent(
+        eventType,
+        BehaviorCategory_DefenseEvasion,
+        ProcessId,
+        &eventData,
+        sizeof(eventData),
+        ThreatScore,
+        ShouldBlock,
+        &response
+        );
+
+    if (response == BehaviorResponse_Terminate) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike-SC] BehaviorEngine requests termination for PID %u "
+            "(syscall=%u, flags=0x%X, score=%u)\n",
+            ProcessId, SyscallNumber, DetectionFlags, ThreatScore);
+    }
+}
+
+
+// ============================================================================
+// Statistics API
+// ============================================================================
+
+_Use_decl_annotations_
 NTSTATUS
 ScMonitorGetStatistics(
     _Out_ PSYSCALL_MONITOR_STATISTICS Stats
-)
+    )
 {
-    PAGED_CODE();
-
     if (Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1858,17 +1978,17 @@ ScMonitorGetStatistics(
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
+
+_Use_decl_annotations_
 NTSTATUS
 ScMonitorGetProcessStats(
     _In_ UINT32 ProcessId,
     _Out_ PUINT64 TotalSyscalls,
     _Out_ PUINT64 DirectSyscalls,
     _Out_ PUINT64 SuspiciousSyscalls
-)
+    )
 {
-    NTSTATUS status;
-    PSC_PROCESS_CONTEXT procCtx = NULL;
+    PSC_PROCESS_CONTEXT ctx = NULL;
 
     PAGED_CODE();
 
@@ -1881,505 +2001,25 @@ ScMonitorGetProcessStats(
     *DirectSyscalls = 0;
     *SuspiciousSyscalls = 0;
 
-    if (!g_ScState.Initialized || g_ScState.ShuttingDown) {
+    if (!g_ScState.Initialized) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    status = ScMonitorGetProcessContext(ProcessId, &procCtx);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    *TotalSyscalls = (UINT64)procCtx->TotalSyscalls;
-    *DirectSyscalls = (UINT64)procCtx->DirectSyscalls;
-    *SuspiciousSyscalls = (UINT64)procCtx->SuspiciousSyscalls;
-
-    ScMonitorReleaseProcessContext(procCtx);
-
-    return STATUS_SUCCESS;
-}
-
-// ============================================================================
-// PRIVATE IMPLEMENTATION - REFERENCE COUNTING
-// ============================================================================
-
-static VOID
-ScpAcquireReference(VOID)
-{
-    InterlockedIncrement(&g_ScState.ReferenceCount);
-}
-
-static VOID
-ScpReleaseReference(VOID)
-{
-    LONG newCount = InterlockedDecrement(&g_ScState.ReferenceCount);
-
-    if (newCount == 0 && g_ScState.ShuttingDown) {
-        KeSetEvent(&g_ScState.ShutdownEvent, IO_NO_INCREMENT, FALSE);
-    }
-}
-
-// ============================================================================
-// PRIVATE IMPLEMENTATION - PROCESS CONTEXT MANAGEMENT
-// ============================================================================
-
-static PSC_PROCESS_CONTEXT
-ScpAllocateProcessContext(VOID)
-{
-    PSC_PROCESS_CONTEXT context = NULL;
-
-    if (g_ScState.ContextLookasideInitialized) {
-        context = (PSC_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
-            &g_ScState.ContextLookaside
-        );
-    }
-
-    if (context == NULL) {
-        context = (PSC_PROCESS_CONTEXT)ShadowStrikeAllocatePoolWithTag(
-            NonPagedPoolNx,
-            sizeof(SC_PROCESS_CONTEXT),
-            SC_POOL_TAG_GENERAL
-        );
-    }
-
-    if (context != NULL) {
-        RtlZeroMemory(context, sizeof(SC_PROCESS_CONTEXT));
-    }
-
-    return context;
-}
-
-static VOID
-ScpFreeProcessContext(
-    _In_ PSC_PROCESS_CONTEXT Context
-)
-{
-    if (Context == NULL) {
-        return;
-    }
-
-    if (g_ScState.ContextLookasideInitialized) {
-        ExFreeToNPagedLookasideList(&g_ScState.ContextLookaside, Context);
-    } else {
-        ShadowStrikeFreePoolWithTag(Context, SC_POOL_TAG_GENERAL);
-    }
-}
-
-static PSC_PROCESS_CONTEXT
-ScpFindProcessContextLocked(
-    _In_ UINT32 ProcessId
-)
-{
-    PLIST_ENTRY entry;
-    PSC_PROCESS_CONTEXT context;
-
-    for (entry = g_ScState.ProcessContextList.Flink;
-         entry != &g_ScState.ProcessContextList;
-         entry = entry->Flink) {
-
-        context = CONTAINING_RECORD(entry, SC_PROCESS_CONTEXT, ListEntry);
-
-        if (context->ProcessId == ProcessId) {
-            return context;
-        }
-    }
-
-    return NULL;
-}
-
-static NTSTATUS
-ScpCreateProcessContext(
-    _In_ UINT32 ProcessId,
-    _Out_ PSC_PROCESS_CONTEXT* Context
-)
-{
-    PSC_PROCESS_CONTEXT newContext = NULL;
-    PSC_PROCESS_CONTEXT existing = NULL;
-    PEPROCESS process = NULL;
-    NTSTATUS status;
-
-    *Context = NULL;
-
-    //
-    // Enforce maximum context count to prevent unbounded growth
-    //
-    if ((ULONG)g_ScState.ProcessContextCount >= SC_MAX_PROCESS_CONTEXTS) {
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
-    //
-    // Get EPROCESS (ObReferenceObject'd by ShadowStrikeGetProcessObject)
-    //
-    status = ShadowStrikeGetProcessObject(
-        ULongToHandle(ProcessId),
-        &process
-    );
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    newContext = ScpAllocateProcessContext();
-    if (newContext == NULL) {
-        ObDereferenceObject(process);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    //
-    // Initialize the context
-    //
-    InitializeListHead(&newContext->ListEntry);
-    newContext->ProcessId = ProcessId;
-    newContext->ProcessObject = process;  // Transfer ObReference to context
-    newContext->IsWoW64 = ShadowStrikeIsProcessWow64(process);
-    newContext->Removed = FALSE;
-    newContext->RefCount = 2;  // 1 for list ownership, 1 for caller
-    newContext->Flags = SC_PROC_FLAG_MONITORED;
-
-    KeQuerySystemTimePrecise((PLARGE_INTEGER)&newContext->ProcessCreateTime);
-
-    //
-    // Populate NTDLL info
-    //
-    ScpPopulateNtdllInfo(newContext);
-
-    //
-    // Insert under exclusive lock, checking for race with another creator
-    //
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_ScState.ProcessLock);
-
-    existing = ScpFindProcessContextLocked(ProcessId);
-    if (existing != NULL && !existing->Removed) {
-        //
-        // Another thread created it first - use the existing one
-        //
-        InterlockedIncrement(&existing->RefCount);
-        *Context = existing;
-
-        ExReleasePushLockExclusive(&g_ScState.ProcessLock);
-        KeLeaveCriticalRegion();
-
-        //
-        // Free our redundant allocation
-        //
-        ObDereferenceObject(newContext->ProcessObject);
-        newContext->ProcessObject = NULL;
-        ScpFreeProcessContext(newContext);
-
-        return STATUS_SUCCESS;
-    }
-
-    InsertTailList(&g_ScState.ProcessContextList, &newContext->ListEntry);
-    InterlockedIncrement(&g_ScState.ProcessContextCount);
-    *Context = newContext;
-
-    ExReleasePushLockExclusive(&g_ScState.ProcessLock);
+    ExAcquirePushLockShared(&g_ScState.ProcessLock);
+    ctx = ScpFindProcessContextLocked(ProcessId);
+    ExReleasePushLockShared(&g_ScState.ProcessLock);
     KeLeaveCriticalRegion();
 
-    return STATUS_SUCCESS;
-}
-
-static VOID
-ScpAddSuspiciousCaller(
-    _Inout_ PSC_PROCESS_CONTEXT Context,
-    _In_ UINT64 CallerAddress
-)
-{
-    UINT32 index;
-
-    //
-    // Atomically claim a slot; wraps automatically, no overflow.
-    // Benign race on the array element write is acceptable —
-    // worst case is a single overwritten address, which is fine
-    // for a diagnostic circular buffer.
-    //
-    index = (UINT32)InterlockedIncrement((PLONG)&Context->SuspiciousCallerCount) - 1;
-    Context->SuspiciousCallers[index % SC_MAX_SUSPICIOUS_CALLERS] = CallerAddress;
-}
-
-// ============================================================================
-// PRIVATE IMPLEMENTATION - ADDRESS HELPERS
-// ============================================================================
-
-static BOOLEAN
-ScpIsAddressInRange(
-    _In_ UINT64 Address,
-    _In_ UINT64 Base,
-    _In_ UINT64 Size
-)
-{
-    if (Base == 0 || Size == 0) {
-        return FALSE;
-    }
-
-    //
-    // Overflow-safe range check: Address >= Base && (Address - Base) < Size
-    //
-    return (Address >= Base && (Address - Base) < Size);
-}
-
-static BOOLEAN
-ScpValidateUserAddress(
-    _In_ UINT64 Address
-)
-{
-    if (Address == 0) {
-        return FALSE;
-    }
-
-    if (Address < SC_MIN_USER_ADDRESS) {
-        return FALSE;
-    }
-
-    if (Address > SC_USER_SPACE_LIMIT) {
-        return FALSE;
-    }
-
-    return TRUE;
-}
-
-static NTSTATUS
-ScpSafeReadUserMemory(
-    _In_ PVOID SourceAddress,
-    _Out_writes_bytes_(Length) PVOID Destination,
-    _In_ SIZE_T Length
-)
-{
-    NTSTATUS status = STATUS_SUCCESS;
-
-    __try {
-        ProbeForRead(SourceAddress, Length, 1);
-        RtlCopyMemory(Destination, SourceAddress, Length);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        status = GetExceptionCode();
-    }
-
-    return status;
-}
-
-// ============================================================================
-// PRIVATE IMPLEMENTATION - SECURITY HELPERS
-// ============================================================================
-
-static BOOLEAN
-ScpIsFunctionNameAllowed(
-    _In_z_ PCSTR FunctionName
-)
-{
-    ULONG idx;
-
-    for (idx = 0; ScpAllowedRestoreFunctions[idx] != NULL; idx++) {
-        if (strcmp(FunctionName, ScpAllowedRestoreFunctions[idx]) == 0) {
-            return TRUE;
-        }
-    }
-
-    return FALSE;
-}
-
-static VOID
-ScpEmitEvasionEvent(
-    _In_ UINT32 ProcessId,
-    _In_ BEHAVIOR_EVENT_TYPE EventType,
-    _In_ EVASION_TECHNIQUE Technique,
-    _In_ UINT32 ThreatScore,
-    _In_ UINT64 TargetAddress
-)
-{
-    BEHAVIOR_EVASION_EVENT evasionEvent;
-    BEHAVIOR_RESPONSE_ACTION response = BehaviorResponse_Allow;
-
-    RtlZeroMemory(&evasionEvent, sizeof(evasionEvent));
-
-    evasionEvent.Header.Size = sizeof(BEHAVIOR_EVASION_EVENT);
-    evasionEvent.Header.Version = 1;
-    evasionEvent.Header.EventType = EventType;
-    evasionEvent.Header.Category = BehaviorCategory_DefenseEvasion;
-    evasionEvent.Header.ThreatScore = ThreatScore;
-    evasionEvent.Header.CorrelationId.ProcessId = ProcessId;
-    KeQuerySystemTimePrecise(
-        (PLARGE_INTEGER)&evasionEvent.Header.RawTimestamp
-    );
-
-    if (ThreatScore >= 80) {
-        evasionEvent.Header.Severity = ThreatSeverity_High;
-        evasionEvent.Header.Flags |= BEHAVIOR_FLAG_HIGH_CONFIDENCE;
-    } else if (ThreatScore >= 50) {
-        evasionEvent.Header.Severity = ThreatSeverity_Medium;
-    } else {
-        evasionEvent.Header.Severity = ThreatSeverity_Low;
-    }
-
-    evasionEvent.Process.ProcessId = ProcessId;
-    evasionEvent.EvasionTechnique = (UINT32)Technique;
-    evasionEvent.TargetAddress = TargetAddress;
-
-    //
-    // Non-blocking submission to avoid stalling the caller
-    //
-    BeEngineSubmitEvent(
-        EventType,
-        BehaviorCategory_DefenseEvasion,
-        ProcessId,
-        &evasionEvent,
-        sizeof(evasionEvent),
-        ThreatScore,
-        FALSE,
-        &response
-    );
-}
-
-// ============================================================================
-// PRIVATE IMPLEMENTATION - NTDLL INFO POPULATION
-// ============================================================================
-
-static NTSTATUS
-ScpPopulateNtdllInfo(
-    _Inout_ PSC_PROCESS_CONTEXT Context
-)
-{
-    NTSTATUS status;
-    PEPROCESS process = NULL;
-    KAPC_STATE apcState;
-    PKM_PEB kmPeb = NULL;
-
-    if (Context == NULL || Context->ProcessObject == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    process = Context->ProcessObject;
-
-    kmPeb = (PKM_PEB)PsGetProcessPeb(process);
-    if (kmPeb == NULL) {
+    if (ctx == NULL) {
         return STATUS_NOT_FOUND;
     }
 
-    KeStackAttachProcess(process, &apcState);
+    *TotalSyscalls = (UINT64)ctx->TotalSyscalls;
+    *DirectSyscalls = (UINT64)ctx->DirectSyscalls;
+    *SuspiciousSyscalls = (UINT64)ctx->SuspiciousSyscalls;
 
-    __try {
-        PKM_PEB_LDR_DATA ldr;
-        PLIST_ENTRY moduleList;
-        PLIST_ENTRY entry;
-        ULONG walkCount = 0;
+    ScMonitorReleaseProcessContext(ctx);
 
-        ProbeForRead(kmPeb, KM_PEB_PROBE_SIZE, sizeof(PVOID));
-        ldr = kmPeb->Ldr;
-
-        if (ldr == NULL) {
-            status = STATUS_NOT_FOUND;
-            __leave;
-        }
-
-        ProbeForRead(ldr, KM_PEB_LDR_PROBE_SIZE, sizeof(PVOID));
-        moduleList = &ldr->InLoadOrderModuleList;
-
-        //
-        // Walk loaded module list looking for ntdll.dll.
-        // Cap iterations to prevent infinite loops on corrupted lists.
-        //
-        for (entry = moduleList->Flink;
-             entry != moduleList && walkCount < KM_MAX_MODULE_WALK_COUNT;
-             entry = entry->Flink, walkCount++) {
-
-            PKM_LDR_DATA_TABLE_ENTRY moduleEntry;
-            UNICODE_STRING ntdllName;
-
-            ProbeForRead(entry, sizeof(LIST_ENTRY), sizeof(PVOID));
-            moduleEntry = CONTAINING_RECORD(
-                entry,
-                KM_LDR_DATA_TABLE_ENTRY,
-                InLoadOrderLinks
-            );
-            ProbeForRead(moduleEntry, KM_LDR_ENTRY_PROBE_SIZE, sizeof(PVOID));
-
-            if (moduleEntry->BaseDllName.Buffer == NULL ||
-                moduleEntry->BaseDllName.Length == 0) {
-                continue;
-            }
-
-            ProbeForRead(
-                moduleEntry->BaseDllName.Buffer,
-                moduleEntry->BaseDllName.Length,
-                sizeof(WCHAR)
-            );
-
-            RtlInitUnicodeString(&ntdllName, L"ntdll.dll");
-
-            if (RtlEqualUnicodeString(
-                    &moduleEntry->BaseDllName,
-                    &ntdllName,
-                    TRUE)) {
-
-                Context->NtdllBase =
-                    (UINT64)(ULONG_PTR)moduleEntry->DllBase;
-                Context->NtdllSize =
-                    (UINT64)moduleEntry->SizeOfImage;
-                break;
-            }
-        }
-
-        //
-        // For WoW64 processes, find the second ntdll instance (32-bit)
-        //
-        if (Context->IsWoW64 && Context->NtdllBase != 0) {
-            walkCount = 0;
-            for (entry = moduleList->Flink;
-                 entry != moduleList && walkCount < KM_MAX_MODULE_WALK_COUNT;
-                 entry = entry->Flink, walkCount++) {
-
-                PKM_LDR_DATA_TABLE_ENTRY moduleEntry;
-                UNICODE_STRING ntdllName;
-
-                ProbeForRead(entry, sizeof(LIST_ENTRY), sizeof(PVOID));
-                moduleEntry = CONTAINING_RECORD(
-                    entry,
-                    KM_LDR_DATA_TABLE_ENTRY,
-                    InLoadOrderLinks
-                );
-                ProbeForRead(
-                    moduleEntry,
-                    KM_LDR_ENTRY_PROBE_SIZE,
-                    sizeof(PVOID)
-                );
-
-                if (moduleEntry->BaseDllName.Buffer == NULL ||
-                    moduleEntry->BaseDllName.Length == 0) {
-                    continue;
-                }
-
-                ProbeForRead(
-                    moduleEntry->BaseDllName.Buffer,
-                    moduleEntry->BaseDllName.Length,
-                    sizeof(WCHAR)
-                );
-
-                RtlInitUnicodeString(&ntdllName, L"ntdll.dll");
-
-                if (RtlEqualUnicodeString(
-                        &moduleEntry->BaseDllName,
-                        &ntdllName,
-                        TRUE)) {
-
-                    UINT64 base =
-                        (UINT64)(ULONG_PTR)moduleEntry->DllBase;
-
-                    if (base != Context->NtdllBase) {
-                        Context->Wow64NtdllBase = base;
-                        Context->Wow64NtdllSize =
-                            (UINT64)moduleEntry->SizeOfImage;
-                        break;
-                    }
-                }
-            }
-        }
-
-        status = STATUS_SUCCESS;
-
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        status = GetExceptionCode();
-    }
-
-    KeUnstackDetachProcess(&apcState);
-
-    return status;
+    return STATUS_SUCCESS;
 }

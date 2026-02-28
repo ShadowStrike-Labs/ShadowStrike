@@ -68,6 +68,9 @@ extern "C" {
 #include "SyscallTable.h"
 #include "DirectSyscallDetector.h"
 #include "SyscallHooks.h"
+#include "NtdllIntegrity.h"
+#include "HeavensGateDetector.h"
+#include "CallstackAnalyzer.h"
 
 // ============================================================================
 // SYSCALL MONITOR CONFIGURATION
@@ -359,6 +362,18 @@ typedef struct _SYSCALL_MONITOR_GLOBALS {
 
     // Direct syscall detector (delegated)
     PDSD_DETECTOR DirectSyscallDetector;
+
+    // NtDll integrity monitor (delegated)
+    PNI_MONITOR NtdllIntegrityMonitor;
+
+    // Heaven's Gate detector (delegated)
+    PHGD_DETECTOR HeavensGateDetector;
+
+    // Call stack analyzer (delegated)
+    PCSA_ANALYZER CallstackAnalyzer;
+
+    // Syscall hooks framework (delegated)
+    SH_FRAMEWORK_HANDLE SyscallHooksFramework;
 
     // System NTDLL reference
     UINT64 SystemNtdllBase;
