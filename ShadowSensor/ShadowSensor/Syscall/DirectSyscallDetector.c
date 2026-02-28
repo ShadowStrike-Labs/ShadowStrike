@@ -44,6 +44,7 @@
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
 #include "../Utilities/ProcessUtils.h"
+#include "../../Shared/KernelProcessTypes.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -468,9 +469,11 @@ DsdShutdown(
     DsdpReleaseReference(detector);
 
     //
-    // Wait for all outstanding references to drain, with a bounded timeout
+    // Wait for all outstanding references to drain, with a bounded timeout.
+    // Use KeClearEvent + atomic check to avoid TOCTOU race.
     //
-    if (detector->ReferenceCount > 0) {
+    KeClearEvent(&detector->ShutdownEvent);
+    if (InterlockedCompareExchange(&detector->ReferenceCount, 0, 0) > 0) {
         LARGE_INTEGER timeout;
         timeout.QuadPart = -(LONGLONG)DSD_SHUTDOWN_TIMEOUT_MS * 10000LL;  // relative, ms -> 100ns
         KeWaitForSingleObject(
@@ -768,7 +771,8 @@ DsdAnalyzeSyscall(
     if (NT_SUCCESS(status) && detection->Base.ReturnAddressCount > 0 && ntdllInfo.Valid) {
         for (ULONG i = 0; i < detection->Base.ReturnAddressCount; i++) {
             ULONG_PTR retAddr = (ULONG_PTR)detection->Base.ReturnAddresses[i];
-            if (retAddr >= ntdllInfo.Base && retAddr < ntdllInfo.Base + ntdllInfo.Size) {
+            if (retAddr >= ntdllInfo.Base &&
+                (retAddr - ntdllInfo.Base) < ntdllInfo.Size) {
                 detection->HasReturnToNtdll = TRUE;
                 break;
             }
@@ -1244,6 +1248,11 @@ DsdpSafeReadProcessMemory(
         return status;
     }
 
+    if (ShadowStrikeIsProcessTerminating(process)) {
+        ObDereferenceObject(process);
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
+
     KeStackAttachProcess(process, &apcState);
 
     __try {
@@ -1287,6 +1296,11 @@ DsdpResolveNtdllForProcess(
         return status;
     }
 
+    if (ShadowStrikeIsProcessTerminating(process)) {
+        ObDereferenceObject(process);
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
+
     peb = PsGetProcessPeb(process);
     if (peb == NULL) {
         ObDereferenceObject(process);
@@ -1296,17 +1310,17 @@ DsdpResolveNtdllForProcess(
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        PPEB_LDR_DATA ldrData;
+        PKM_PEB_LDR_DATA ldrData;
 
-        ProbeForRead(peb, sizeof(PEB), sizeof(PVOID));
-        ldrData = peb->Ldr;
+        ProbeForRead(peb, KM_PEB_PROBE_SIZE, sizeof(PVOID));
+        ldrData = (PKM_PEB_LDR_DATA)((PKM_PEB)peb)->Ldr;
 
         if (ldrData == NULL) {
             status = STATUS_NOT_FOUND;
             __leave;
         }
 
-        ProbeForRead(ldrData, sizeof(PEB_LDR_DATA), sizeof(PVOID));
+        ProbeForRead(ldrData, KM_PEB_LDR_PROBE_SIZE, sizeof(PVOID));
 
         PLIST_ENTRY listHead = &ldrData->InMemoryOrderModuleList;
         PLIST_ENTRY listEntry = listHead->Flink;
@@ -1314,17 +1328,17 @@ DsdpResolveNtdllForProcess(
         while (listEntry != listHead &&
                iterationCount < DSD_MAX_MODULE_WALK_ITERATIONS) {
 
-            PLDR_DATA_TABLE_ENTRY ldrEntry;
+            PKM_LDR_DATA_TABLE_ENTRY ldrEntry;
 
             iterationCount++;
 
             ldrEntry = CONTAINING_RECORD(
                 listEntry,
-                LDR_DATA_TABLE_ENTRY,
+                KM_LDR_DATA_TABLE_ENTRY,
                 InMemoryOrderLinks
             );
 
-            ProbeForRead(ldrEntry, sizeof(LDR_DATA_TABLE_ENTRY), sizeof(PVOID));
+            ProbeForRead(ldrEntry, KM_LDR_ENTRY_PROBE_SIZE, sizeof(PVOID));
 
             if (ldrEntry->BaseDllName.Buffer != NULL &&
                 ldrEntry->BaseDllName.Length > 0 &&
@@ -1406,20 +1420,25 @@ DsdpFindModuleForAddress(
         return STATUS_NOT_FOUND;
     }
 
+    if (ShadowStrikeIsProcessTerminating(process)) {
+        ObDereferenceObject(process);
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
+
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        PPEB_LDR_DATA ldrData;
+        PKM_PEB_LDR_DATA ldrData;
 
-        ProbeForRead(peb, sizeof(PEB), sizeof(PVOID));
-        ldrData = peb->Ldr;
+        ProbeForRead(peb, KM_PEB_PROBE_SIZE, sizeof(PVOID));
+        ldrData = (PKM_PEB_LDR_DATA)((PKM_PEB)peb)->Ldr;
 
         if (ldrData == NULL) {
             status = STATUS_NOT_FOUND;
             __leave;
         }
 
-        ProbeForRead(ldrData, sizeof(PEB_LDR_DATA), sizeof(PVOID));
+        ProbeForRead(ldrData, KM_PEB_LDR_PROBE_SIZE, sizeof(PVOID));
 
         PLIST_ENTRY listHead = &ldrData->InMemoryOrderModuleList;
         PLIST_ENTRY listEntry = listHead->Flink;
@@ -1427,25 +1446,27 @@ DsdpFindModuleForAddress(
         while (listEntry != listHead &&
                iterationCount < DSD_MAX_MODULE_WALK_ITERATIONS) {
 
-            PLDR_DATA_TABLE_ENTRY ldrEntry;
+            PKM_LDR_DATA_TABLE_ENTRY ldrEntry;
             ULONG_PTR moduleStart;
-            ULONG_PTR moduleEnd;
 
             iterationCount++;
 
             ldrEntry = CONTAINING_RECORD(
                 listEntry,
-                LDR_DATA_TABLE_ENTRY,
+                KM_LDR_DATA_TABLE_ENTRY,
                 InMemoryOrderLinks
             );
 
-            ProbeForRead(ldrEntry, sizeof(LDR_DATA_TABLE_ENTRY), sizeof(PVOID));
+            ProbeForRead(ldrEntry, KM_LDR_ENTRY_PROBE_SIZE, sizeof(PVOID));
 
             moduleStart = (ULONG_PTR)ldrEntry->DllBase;
-            moduleEnd = moduleStart + ldrEntry->SizeOfImage;
 
-            if ((ULONG_PTR)Address >= moduleStart &&
-                (ULONG_PTR)Address < moduleEnd) {
+            //
+            // Overflow-safe range check: (Address - moduleStart) < Size
+            //
+            if (ldrEntry->SizeOfImage != 0 &&
+                (ULONG_PTR)Address >= moduleStart &&
+                ((ULONG_PTR)Address - moduleStart) < ldrEntry->SizeOfImage) {
 
                 ModuleInfo->Base = moduleStart;
                 ModuleInfo->Size = ldrEntry->SizeOfImage;
@@ -1512,7 +1533,6 @@ DsdpCaptureUserCallStack(
 {
     NTSTATUS status = STATUS_SUCCESS;
     PEPROCESS process = NULL;
-    PETHREAD thread = NULL;
     KAPC_STATE apcState;
     ULONG capturedCount = 0;
 
@@ -1524,6 +1544,11 @@ DsdpCaptureUserCallStack(
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
         return status;
+    }
+
+    if (ShadowStrikeIsProcessTerminating(process)) {
+        ObDereferenceObject(process);
+        return STATUS_PROCESS_IS_TERMINATING;
     }
 
     KeStackAttachProcess(process, &apcState);
@@ -1700,7 +1725,7 @@ DsdpIsIndirectSyscallPattern(
             ULONG_PTR targetAddr = instrAddr + 5 + (LONG_PTR)displacement;
 
             if (targetAddr >= NtdllInfo->Base &&
-                targetAddr < NtdllInfo->Base + NtdllInfo->Size) {
+                (targetAddr - NtdllInfo->Base) < NtdllInfo->Size) {
                 //
                 // A jmp into NTDLL preceded by mov eax,SSN is a strong
                 // indicator of an indirect syscall stub.
