@@ -58,7 +58,7 @@ typedef enum _CSA_ANOMALY {
     CsaAnomaly_UnknownModule        = 0x00000020,
     CsaAnomaly_DirectSyscall        = 0x00000040,
     CsaAnomaly_ReturnGadget         = 0x00000080,
-} CSA_ANOMALY;
+} CSA_ANOMALY, *PCSA_ANOMALY;
 
 typedef struct _CSA_STACK_FRAME {
     PVOID ReturnAddress;

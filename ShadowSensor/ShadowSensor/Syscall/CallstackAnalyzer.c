@@ -55,6 +55,31 @@
 #include "CallstackAnalyzer.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/ProcessUtils.h"
+#include "../../Shared/KernelProcessTypes.h"
+#include <ntimage.h>
+
+//
+// User-mode constants not exposed in WDK kernel headers.
+// Values are stable across all Windows NT versions.
+//
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION   0x0400
+#endif
+
+#ifndef MEM_IMAGE
+#define MEM_IMAGE                   0x1000000
+#endif
+
+//
+// PsGetThreadTeb — returns the user-mode TEB address of a thread.
+// Exported by ntoskrnl.exe, not declared in WDK headers (NT 6.0+).
+//
+NTKERNELAPI
+PVOID
+NTAPI
+PsGetThreadTeb(
+    _In_ PETHREAD Thread
+);
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, CsaInitialize)
@@ -78,7 +103,7 @@
 #define CSA_MIN_VALID_USER_ADDRESS      0x10000ULL
 #define CSA_MAX_USER_ADDRESS            0x7FFFFFFFFFFFULL
 
-#define CSA_ROP_GADGET_WINDOW           6       // Max instructions before ret for gadget
+#define CSA_ROP_GADGET_WINDOW           8       // Max bytes before address for gadget analysis
 #define CSA_MIN_STACK_FRAMES            2
 #define CSA_MAX_MODULE_SIZE             0x80000000ULL  // 2 GB sanity cap
 
@@ -236,8 +261,8 @@ CsapIsReturnAddressValid(
     );
 
 _IRQL_requires_(PASSIVE_LEVEL)
-static BOOLEAN
-CsapDetectRopGadget(
+static CSA_ANOMALY
+CsapAnalyzeUnbackedCode(
     _In_ PEPROCESS Process,
     _In_ PVOID Address
     );
@@ -417,7 +442,10 @@ CsaShutdown(
     //
     // Release the owner reference and wait for all outstanding operations
     // to complete (refs from CsaCaptureCallstack, CsaFreeCallstack, etc.).
+    // Clear the event BEFORE decrementing to prevent TOCTOU: if the last
+    // ref drops between decrement and wait, KeSetEvent is not lost.
     //
+    KeClearEvent(&Analyzer->ZeroRefEvent);
     CsapDereferenceAnalyzer(analyzerInternal);
 
     timeout.QuadPart = -((LONGLONG)CSA_SHUTDOWN_DRAIN_TIMEOUT_MS * 10000);
@@ -661,10 +689,8 @@ CsaDetectStackPivot(
     PETHREAD thread = NULL;
     PEPROCESS process = NULL;
     HANDLE processId;
-    PVOID stackBase = NULL;
-    PVOID stackLimit = NULL;
     BOOLEAN pivoted = FALSE;
-    PVOID capturedFrames[1];
+    PVOID capturedFrames[16];
     ULONG capturedCount;
     KAPC_STATE apcState;
 
@@ -682,56 +708,150 @@ CsaDetectStackPivot(
 
     processId = PsGetThreadProcessId(thread);
 
-    status = CsapGetThreadStackBounds(processId, ThreadId, &stackBase, &stackLimit);
-    if (!NT_SUCCESS(status)) {
-        ObDereferenceObject(thread);
-        return status;
-    }
-
-    //
-    // Capture a single user-mode frame to get the current RSP.
-    // RtlWalkFrameChain with flag=1 returns user-mode frames.
-    // We attach to the owning process first.
-    //
     status = PsLookupProcessByProcessId(processId, &process);
     if (!NT_SUCCESS(status)) {
         ObDereferenceObject(thread);
         return status;
     }
 
+    if (ShadowStrikeIsProcessTerminating(process)) {
+        ObDereferenceObject(process);
+        ObDereferenceObject(thread);
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
+
+    //
+    // Walk up to 16 user-mode frames. RtlWalkFrameChain with flag=1
+    // traverses user-mode frames only.
+    //
     capturedCount = 0;
-    capturedFrames[0] = NULL;
+    RtlZeroMemory(capturedFrames, sizeof(capturedFrames));
 
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        capturedCount = RtlWalkFrameChain(capturedFrames, 1, 1);
+        capturedCount = RtlWalkFrameChain(capturedFrames, 16, 1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        capturedCount = 0;
+        //
+        // Stack walk threw an exception — the stack is corrupted or pivoted
+        // to an unmapped region. Strong indicator.
+        //
+        pivoted = TRUE;
     }
 
     KeUnstackDetachProcess(&apcState);
-    ObDereferenceObject(process);
+
+    if (pivoted) {
+        *IsPivoted = TRUE;
+        ObDereferenceObject(process);
+        ObDereferenceObject(thread);
+        return STATUS_SUCCESS;
+    }
+
+    if (capturedCount == 0) {
+        //
+        // Zero frames could mean the thread is at its entry point or
+        // in kernel-only context. Not conclusive on its own.
+        //
+        ObDereferenceObject(process);
+        ObDereferenceObject(thread);
+        return STATUS_SUCCESS;
+    }
 
     //
-    // If we captured a frame, use its value as a proxy for RSP.
-    // If RSP (approximated by the return address location on the stack)
-    // is outside [stackLimit, stackBase], the stack has been pivoted.
+    // Heuristic 1: All captured return addresses must be in valid user range.
     //
-    // Stack grows downward: stackLimit <= RSP < stackBase
-    //
-    if (capturedCount > 0 &&
-        stackBase != NULL && stackLimit != NULL &&
-        capturedFrames[0] != NULL) {
+    {
+        ULONG invalidCount = 0;
+        for (ULONG i = 0; i < capturedCount; i++) {
+            ULONG_PTR addr = (ULONG_PTR)capturedFrames[i];
+            if (addr < CSA_MIN_VALID_USER_ADDRESS || addr > CSA_MAX_USER_ADDRESS) {
+                invalidCount++;
+            }
+        }
 
-        ULONG_PTR frameAddr = (ULONG_PTR)capturedFrames[0];
-
-        if (frameAddr < (ULONG_PTR)stackLimit ||
-            frameAddr >= (ULONG_PTR)stackBase) {
+        if (invalidCount == capturedCount) {
             pivoted = TRUE;
         }
     }
 
+    //
+    // Heuristic 2: Verify CALL instruction precedes each return address.
+    // In a legitimate stack, every return address is placed by a CALL.
+    // In a ROP chain / pivoted stack, "return addresses" are arbitrary.
+    // We check up to 8 frames for:
+    //   - E8 xx xx xx xx  (call rel32) at [addr-5]
+    //   - FF 15 xx xx xx xx (call [rip+disp32]) at [addr-6]
+    //   - FF D0..D7 (call reg) at [addr-2]
+    //
+    if (!pivoted && capturedCount > 0) {
+        ULONG noCallCount = 0;
+        ULONG checkedFrames = 0;
+
+        KeStackAttachProcess(process, &apcState);
+
+        __try {
+            for (ULONG i = 0; i < capturedCount && i < 8; i++) {
+                ULONG_PTR addr = (ULONG_PTR)capturedFrames[i];
+                if (addr < CSA_MIN_VALID_USER_ADDRESS + 7 ||
+                    addr > CSA_MAX_USER_ADDRESS) {
+                    continue;
+                }
+
+                UCHAR buf[7];
+                PVOID readAddr = (PVOID)(addr - 7);
+
+                ProbeForRead(readAddr, 7, 1);
+                RtlCopyMemory(buf, readAddr, 7);
+
+                BOOLEAN foundCall = FALSE;
+
+                // call rel32: E8 at [addr-5] → buf[2]
+                if (buf[2] == 0xE8) {
+                    foundCall = TRUE;
+                }
+
+                // call [rip+disp32]: FF 15 at [addr-6] → buf[1..2]
+                if (!foundCall && buf[1] == 0xFF && buf[2] == 0x15) {
+                    foundCall = TRUE;
+                }
+
+                // call reg: FF D0..D7 at [addr-2] → buf[5..6]
+                if (!foundCall && buf[5] == 0xFF &&
+                    buf[6] >= 0xD0 && buf[6] <= 0xD7) {
+                    foundCall = TRUE;
+                }
+
+                // call [reg]: FF 10..17 at [addr-2] → buf[5..6]
+                if (!foundCall && buf[5] == 0xFF &&
+                    buf[6] >= 0x10 && buf[6] <= 0x17) {
+                    foundCall = TRUE;
+                }
+
+                checkedFrames++;
+                if (!foundCall) {
+                    noCallCount++;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            //
+            // Exception reading code near return addresses — suspicious
+            // but not conclusive by itself.
+            //
+        }
+
+        KeUnstackDetachProcess(&apcState);
+
+        //
+        // If 2/3+ of checked frames have no preceding CALL instruction,
+        // the stack is very likely pivoted or ROP-chained.
+        //
+        if (checkedFrames >= 3 && noCallCount >= ((checkedFrames * 2) / 3)) {
+            pivoted = TRUE;
+        }
+    }
+
+    ObDereferenceObject(process);
     ObDereferenceObject(thread);
 
     *IsPivoted = pivoted;
@@ -871,6 +991,11 @@ CsapCaptureUserStack(
         return status;
     }
 
+    if (ShadowStrikeIsProcessTerminating(process)) {
+        ObDereferenceObject(process);
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
+
     RtlZeroMemory(rawFrames, sizeof(rawFrames));
 
     //
@@ -943,6 +1068,11 @@ CsapAnalyzeFrames(
         return status;
     }
 
+    if (ShadowStrikeIsProcessTerminating(process)) {
+        ObDereferenceObject(process);
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
+
     processCreateTime = PsGetProcessCreateTimeQuadPart(process);
 
     for (i = 0; i < Callstack->FrameCount; i++) {
@@ -1006,39 +1136,10 @@ CsapAnalyzeFrames(
             }
 
             //
-            // Check for ROP gadget patterns
+            // Single-attach analysis of unbacked code: ROP gadgets + direct syscall
             //
-            if (CsapDetectRopGadget(process, frame->ReturnAddress)) {
-                frame->AnomalyFlags |= CsaAnomaly_ReturnGadget;
-            }
-
-            //
-            // Check for direct syscall pattern.
-            // Attach once, read the 2 bytes before the return address.
-            //
-            {
-                KAPC_STATE apcState;
-                KeStackAttachProcess(process, &apcState);
-
-                __try {
-                    PUCHAR codePtr = (PUCHAR)((ULONG_PTR)frame->ReturnAddress - 2);
-
-                    if ((ULONG_PTR)codePtr >= CSA_MIN_VALID_USER_ADDRESS &&
-                        (ULONG_PTR)codePtr <= CSA_MAX_USER_ADDRESS) {
-
-                        ProbeForRead(codePtr, 2, 1);
-
-                        if (RtlCompareMemory(codePtr, CsaPatternSyscall, 2) == 2 ||
-                            RtlCompareMemory(codePtr, CsaPatternSysenter, 2) == 2) {
-                            frame->AnomalyFlags |= CsaAnomaly_DirectSyscall;
-                        }
-                    }
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    // Expected for invalid pages — not an error
-                }
-
-                KeUnstackDetachProcess(&apcState);
-            }
+            CSA_ANOMALY codeAnomalies = CsapAnalyzeUnbackedCode(process, frame->ReturnAddress);
+            frame->AnomalyFlags |= codeAnomalies;
         }
 
         Callstack->AggregatedAnomalies |= frame->AnomalyFlags;
@@ -1097,7 +1198,7 @@ CsapLookupModule(
         }
 
         if ((ULONG_PTR)Address >= (ULONG_PTR)cacheEntry->ModuleBase &&
-            (ULONG_PTR)Address < (ULONG_PTR)cacheEntry->ModuleBase + cacheEntry->ModuleSize) {
+            ((ULONG_PTR)Address - (ULONG_PTR)cacheEntry->ModuleBase) < cacheEntry->ModuleSize) {
 
             CsapReferenceModuleEntry(cacheEntry);
 
@@ -1127,7 +1228,7 @@ CsapPopulateModuleCache(
 {
     NTSTATUS status;
     PEPROCESS process = NULL;
-    PPEB peb = NULL;
+    PKM_PEB peb = NULL;
     KAPC_STATE apcState;
     ULONG snapshotCount = 0;
     ULONG i;
@@ -1157,7 +1258,13 @@ CsapPopulateModuleCache(
         return status;
     }
 
-    peb = PsGetProcessPeb(process);
+    if (ShadowStrikeIsProcessTerminating(process)) {
+        ObDereferenceObject(process);
+        ShadowStrikeFreePoolWithTag(snapshot, CSA_POOL_TAG);
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
+
+    peb = (PKM_PEB)PsGetProcessPeb(process);
     if (peb == NULL) {
         ObDereferenceObject(process);
         ShadowStrikeFreePoolWithTag(snapshot, CSA_POOL_TAG);
@@ -1176,9 +1283,9 @@ CsapPopulateModuleCache(
             __leave;
         }
 
-        ProbeForRead(peb, sizeof(PEB), sizeof(PVOID));
+        ProbeForRead(peb, KM_PEB_PROBE_SIZE, sizeof(PVOID));
 
-        PPEB_LDR_DATA ldrData = peb->Ldr;
+        PKM_PEB_LDR_DATA ldrData = peb->Ldr;
         if (ldrData == NULL) {
             status = STATUS_NOT_FOUND;
             __leave;
@@ -1190,7 +1297,7 @@ CsapPopulateModuleCache(
             __leave;
         }
 
-        ProbeForRead(ldrData, sizeof(PEB_LDR_DATA), sizeof(PVOID));
+        ProbeForRead(ldrData, KM_PEB_LDR_PROBE_SIZE, sizeof(PVOID));
 
         PLIST_ENTRY listHead = &ldrData->InMemoryOrderModuleList;
         PLIST_ENTRY listEntry = listHead->Flink;
@@ -1203,9 +1310,9 @@ CsapPopulateModuleCache(
                 break;
             }
 
-            PLDR_DATA_TABLE_ENTRY ldrEntry = CONTAINING_RECORD(
+            PKM_LDR_DATA_TABLE_ENTRY ldrEntry = CONTAINING_RECORD(
                 listEntry,
-                LDR_DATA_TABLE_ENTRY,
+                KM_LDR_DATA_TABLE_ENTRY,
                 InMemoryOrderLinks
                 );
 
@@ -1214,7 +1321,7 @@ CsapPopulateModuleCache(
                 break;
             }
 
-            ProbeForRead(ldrEntry, sizeof(LDR_DATA_TABLE_ENTRY), sizeof(PVOID));
+            ProbeForRead(ldrEntry, KM_LDR_ENTRY_PROBE_SIZE, sizeof(PVOID));
 
             PVOID dllBase = ldrEntry->DllBase;
             SIZE_T sizeOfImage = ldrEntry->SizeOfImage;
@@ -1676,7 +1783,8 @@ CsapGetThreadStackBounds(
     NTSTATUS status;
     PEPROCESS process = NULL;
     PETHREAD thread = NULL;
-    PTEB teb = NULL;
+    PVOID tebRaw = NULL;
+    PNT_TIB tib = NULL;
     KAPC_STATE apcState;
 
     *StackBase = NULL;
@@ -1693,8 +1801,8 @@ CsapGetThreadStackBounds(
         return status;
     }
 
-    teb = (PTEB)PsGetThreadTeb(thread);
-    if (teb == NULL) {
+    tebRaw = PsGetThreadTeb(thread);
+    if (tebRaw == NULL) {
         ObDereferenceObject(thread);
         ObDereferenceObject(process);
         return STATUS_NOT_FOUND;
@@ -1703,20 +1811,28 @@ CsapGetThreadStackBounds(
     //
     // Validate TEB is in user-mode range
     //
-    if ((ULONG_PTR)teb < CSA_MIN_VALID_USER_ADDRESS ||
-        (ULONG_PTR)teb > CSA_MAX_USER_ADDRESS) {
+    if ((ULONG_PTR)tebRaw < CSA_MIN_VALID_USER_ADDRESS ||
+        (ULONG_PTR)tebRaw > CSA_MAX_USER_ADDRESS) {
         ObDereferenceObject(thread);
         ObDereferenceObject(process);
         return STATUS_INVALID_ADDRESS;
     }
 
+    tib = (PNT_TIB)tebRaw;
+
+    if (ShadowStrikeIsProcessTerminating(process)) {
+        ObDereferenceObject(thread);
+        ObDereferenceObject(process);
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
+
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        ProbeForRead(teb, sizeof(NT_TIB), sizeof(PVOID));
+        ProbeForRead(tib, sizeof(NT_TIB), sizeof(PVOID));
 
-        PVOID base = teb->NtTib.StackBase;
-        PVOID limit = teb->NtTib.StackLimit;
+        PVOID base = tib->StackBase;
+        PVOID limit = tib->StackLimit;
 
         //
         // Validate stack bounds are in user space and ordered correctly
@@ -1763,7 +1879,7 @@ CsapIsReturnAddressValid(
     }
 
     if ((ULONG_PTR)ReturnAddress < (ULONG_PTR)Module->ModuleBase ||
-        (ULONG_PTR)ReturnAddress >= (ULONG_PTR)Module->ModuleBase + Module->ModuleSize) {
+        ((ULONG_PTR)ReturnAddress - (ULONG_PTR)Module->ModuleBase) >= Module->ModuleSize) {
         return FALSE;
     }
 
@@ -1776,9 +1892,8 @@ CsapIsReturnAddressValid(
     if (Module->TextSectionBase != NULL && Module->TextSectionSize > 0) {
         ULONG_PTR textStart = (ULONG_PTR)Module->TextSectionBase -
                               (ULONG_PTR)Module->ModuleBase;
-        ULONG_PTR textEnd = textStart + Module->TextSectionSize;
 
-        if (offset < textStart || offset >= textEnd) {
+        if (offset < textStart || (offset - textStart) >= Module->TextSectionSize) {
             return FALSE;
         }
     }
@@ -1793,108 +1908,206 @@ CsapIsReturnAddressValid(
 
 static
 _Use_decl_annotations_
-BOOLEAN
-CsapDetectRopGadget(
+CSA_ANOMALY
+CsapAnalyzeUnbackedCode(
     _In_ PEPROCESS Process,
     _In_ PVOID Address
     )
+/*++
+Routine Description:
+    Performs comprehensive analysis of an unbacked return address in a single
+    process attach. Detects ROP gadget patterns, direct syscall instructions,
+    and other suspicious code sequences. Returns a bitmask of anomaly flags.
+
+    This replaces the old separate CsapDetectRopGadget + inline direct syscall
+    check, eliminating redundant KeStackAttachProcess calls per frame.
+
+Arguments:
+    Process - Target process (already referenced by caller).
+    Address - Return address to analyze.
+
+Return Value:
+    Bitmask of CSA_ANOMALY flags detected at this address.
+--*/
 {
     KAPC_STATE apcState;
-    BOOLEAN isGadget = FALSE;
-    UCHAR codeBuffer[CSA_ROP_GADGET_WINDOW + 1];
+    CSA_ANOMALY result = CsaAnomaly_None;
+    UCHAR codeBuffer[CSA_ROP_GADGET_WINDOW + 2];
     ULONG totalInstructions;
 
     if ((ULONG_PTR)Address < CSA_MIN_VALID_USER_ADDRESS + CSA_ROP_GADGET_WINDOW ||
         (ULONG_PTR)Address > CSA_MAX_USER_ADDRESS) {
-        return FALSE;
+        return CsaAnomaly_None;
     }
 
     KeStackAttachProcess(Process, &apcState);
 
     __try {
-        //
-        // Read a small window of code ending at the return address.
-        // A true ROP gadget is a VERY short instruction sequence (1-5 bytes)
-        // ending in ret/jmp reg. We look for patterns where the sequence
-        // from the last ret/jmp-reg backward contains only 1-5 instruction
-        // bytes — indicating a gadget, not a normal function epilogue.
-        //
         PVOID readAddr = (PVOID)((ULONG_PTR)Address - CSA_ROP_GADGET_WINDOW);
 
-        ProbeForRead(readAddr, CSA_ROP_GADGET_WINDOW + 1, 1);
-        RtlCopyMemory(codeBuffer, readAddr, CSA_ROP_GADGET_WINDOW + 1);
+        ProbeForRead(readAddr, CSA_ROP_GADGET_WINDOW + 2, 1);
+        RtlCopyMemory(codeBuffer, readAddr, CSA_ROP_GADGET_WINDOW + 2);
 
         //
-        // The byte at offset CSA_ROP_GADGET_WINDOW is where Address points.
-        // For a ROP gadget, there should be a ret instruction very close
-        // before Address (within 1-3 bytes), preceded by a minimal payload.
+        // === Direct syscall / sysenter detection ===
+        // If the 2 bytes immediately before the return address are
+        // syscall (0F 05) or sysenter (0F 34), this is a direct system call
+        // from unbacked memory — extremely suspicious.
         //
+        UCHAR b0 = codeBuffer[CSA_ROP_GADGET_WINDOW - 2];  // [Address - 2]
+        UCHAR b1 = codeBuffer[CSA_ROP_GADGET_WINDOW - 1];  // [Address - 1]
+
+        if ((b0 == 0x0F && b1 == 0x05) ||   // syscall
+            (b0 == 0x0F && b1 == 0x34)) {    // sysenter
+            result |= CsaAnomaly_DirectSyscall;
+        }
 
         //
-        // Check: is the byte at [Address-1] a ret? If so, the "gadget" is
-        // just a single ret — trivially a gadget endpoint. But more
-        // importantly, check if the few bytes before it look like a
-        // short gadget (pop reg; ret pattern is 2 bytes, for example).
+        // === ROP gadget detection ===
+        // A ROP gadget is a short instruction sequence ending in a control
+        // transfer that an attacker chains together. We check for multiple
+        // gadget terminator patterns and measure how short the preceding
+        // code is (shorter = more likely a gadget, not a real function).
         //
-        totalInstructions = 0;
+        UCHAR prevByte  = codeBuffer[CSA_ROP_GADGET_WINDOW - 1];  // [Address - 1]
+        UCHAR prev2Byte = codeBuffer[CSA_ROP_GADGET_WINDOW - 2];  // [Address - 2]
 
         //
-        // Look for ret at [Address - 1]  (the instruction that transferred
-        // control here). If Address IS a return address, the instruction
-        // immediately before it in the caller should be a call, not a ret.
-        // Finding a ret means this "return address" was reached via ret, not
-        // call — strong indicator of ROP chaining.
+        // Pattern 1: ret (C3) at [Address - 1]
+        // ROP chain terminators. Check if the code before it is gadget-short.
         //
-        UCHAR prevByte = codeBuffer[CSA_ROP_GADGET_WINDOW - 1];
-        UCHAR prevPrevByte = codeBuffer[CSA_ROP_GADGET_WINDOW - 2];
-
         if (prevByte == CSA_RET_OPCODE) {
-            //
-            // ret at [Address-1]. Check if the sequence before it is
-            // suspiciously short (gadget-like: 1-4 bytes + ret = 2-5 total).
-            //
+            totalInstructions = 0;
             for (int k = CSA_ROP_GADGET_WINDOW - 2; k >= 0; k--) {
                 totalInstructions++;
-                //
-                // If we hit another ret or int3 (CC), this bounds the gadget.
-                //
                 if (codeBuffer[k] == CSA_RET_OPCODE ||
-                    codeBuffer[k] == 0xCC) {
+                    codeBuffer[k] == 0xCC) {   // int3 (padding / boundary)
                     break;
                 }
             }
-
-            //
-            // A gadget is typically 1-4 payload instructions before ret.
-            // Normal function epilogues are longer.
-            //
             if (totalInstructions <= 4) {
-                isGadget = TRUE;
+                result |= CsaAnomaly_ReturnGadget;
             }
         }
 
         //
-        // Check for ret imm16 at [Address-3] (ret imm16 is 3 bytes: C2 xx xx)
+        // Pattern 2: ret imm16 (C2 xx xx) at [Address - 3]
+        // Used in gadgets that need to clean up stack arguments.
         //
-        if (!isGadget && CSA_ROP_GADGET_WINDOW >= 3) {
+        if (!(result & CsaAnomaly_ReturnGadget) && CSA_ROP_GADGET_WINDOW >= 3) {
             if (codeBuffer[CSA_ROP_GADGET_WINDOW - 3] == CSA_RET_IMM16_OPCODE) {
-                //
-                // Ensure the imm16 is small (gadgets use small stack adjustments)
-                //
                 USHORT immVal = *(PUSHORT)(&codeBuffer[CSA_ROP_GADGET_WINDOW - 2]);
-                if (immVal <= 0x20) {
-                    isGadget = TRUE;
+                if (immVal <= 0x40) {
+                    result |= CsaAnomaly_ReturnGadget;
                 }
+            }
+        }
+
+        //
+        // Pattern 3: jmp reg (FF E0..E7) at [Address - 2]
+        // JOP (Jump-Oriented Programming) gadgets.
+        // FF E0 = jmp rax, FF E1 = jmp rcx, ..., FF E7 = jmp rdi
+        //
+        if (!(result & CsaAnomaly_ReturnGadget)) {
+            if (prev2Byte == 0xFF && (prevByte >= 0xE0 && prevByte <= 0xE7)) {
+                totalInstructions = 0;
+                for (int k = CSA_ROP_GADGET_WINDOW - 3; k >= 0; k--) {
+                    totalInstructions++;
+                    if (codeBuffer[k] == CSA_RET_OPCODE ||
+                        codeBuffer[k] == 0xCC) {
+                        break;
+                    }
+                }
+                if (totalInstructions <= 4) {
+                    result |= CsaAnomaly_ReturnGadget;
+                }
+            }
+        }
+
+        //
+        // Pattern 4: call reg (FF D0..D7) at [Address - 2]
+        // COP (Call-Oriented Programming) gadgets.
+        // FF D0 = call rax, FF D1 = call rcx, ..., FF D7 = call rdi
+        //
+        if (!(result & CsaAnomaly_ReturnGadget)) {
+            if (prev2Byte == 0xFF && (prevByte >= 0xD0 && prevByte <= 0xD7)) {
+                totalInstructions = 0;
+                for (int k = CSA_ROP_GADGET_WINDOW - 3; k >= 0; k--) {
+                    totalInstructions++;
+                    if (codeBuffer[k] == CSA_RET_OPCODE ||
+                        codeBuffer[k] == 0xCC) {
+                        break;
+                    }
+                }
+                if (totalInstructions <= 3) {
+                    result |= CsaAnomaly_ReturnGadget;
+                }
+            }
+        }
+
+        //
+        // Pattern 5: jmp [reg] / jmp [reg+disp8] (FF 20..27 / FF 60..67)
+        // Indirect jump gadgets used in vtable-based JOP chains.
+        //
+        if (!(result & CsaAnomaly_ReturnGadget)) {
+            if (prev2Byte == 0xFF &&
+                ((prevByte >= 0x20 && prevByte <= 0x27) ||
+                 (prevByte >= 0x60 && prevByte <= 0x67))) {
+                result |= CsaAnomaly_ReturnGadget;
+            }
+        }
+
+        //
+        // Pattern 6: syscall (0F 05) or sysenter (0F 34) as gadget terminator
+        // Attackers chain to a syscall gadget to invoke kernel services directly.
+        //
+        if (!(result & CsaAnomaly_ReturnGadget)) {
+            if ((prev2Byte == 0x0F && prevByte == 0x05) ||
+                (prev2Byte == 0x0F && prevByte == 0x34)) {
+                totalInstructions = 0;
+                for (int k = CSA_ROP_GADGET_WINDOW - 3; k >= 0; k--) {
+                    totalInstructions++;
+                    if (codeBuffer[k] == CSA_RET_OPCODE ||
+                        codeBuffer[k] == 0xCC) {
+                        break;
+                    }
+                }
+                if (totalInstructions <= 4) {
+                    result |= CsaAnomaly_ReturnGadget;
+                }
+            }
+        }
+
+        //
+        // Pattern 7: pop-pop-ret sequence detection
+        // Classic SEH exploitation pattern. pop = 58-5F (pop rax..rdi).
+        // Look for 2+ consecutive pops followed by ret within window.
+        //
+        if (!(result & CsaAnomaly_ReturnGadget) && prevByte == CSA_RET_OPCODE) {
+            ULONG popCount = 0;
+            for (int k = CSA_ROP_GADGET_WINDOW - 2; k >= 0; k--) {
+                UCHAR byte = codeBuffer[k];
+                if (byte >= 0x58 && byte <= 0x5F) {
+                    popCount++;
+                } else {
+                    break;
+                }
+            }
+            if (popCount >= 2) {
+                result |= CsaAnomaly_ReturnGadget;
             }
         }
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        isGadget = FALSE;
+        //
+        // Access violation reading user memory — address may be unmapped.
+        // Return what we have (likely nothing), don't flag as error.
+        //
     }
 
     KeUnstackDetachProcess(&apcState);
 
-    return isGadget;
+    return result;
 }
 
 
