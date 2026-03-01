@@ -1,8 +1,8 @@
-# ShadowStrike
+# ShadowStrike Phantom
 
-**Next-Generation Antivirus Engine for Windows**
+**Next-Generation Endpoint Protection Platform for Windows**
 
-A from-scratch implementation of an enterprise-grade endpoint protection platform for Windows 10/11 64-bit Operating Systems , built with the same architectural principles as industry leaders. This is not a wrapper around existing tools—it's a complete antivirus engine with custom kernel drivers, memory-mapped databases, YARA integration, and real-time threat detection.
+A from-scratch implementation of an enterprise-grade endpoint protection platform for Windows 10/11 64-bit operating systems, built with the same architectural principles as industry leaders. This is not a wrapper around existing tools — it's a complete EDR/XDR platform with a custom kernel sensor (PhantomSensor), memory-mapped databases, YARA integration, and real-time threat detection.
 
 ---
 
@@ -25,7 +25,7 @@ A from-scratch implementation of an enterprise-grade endpoint protection platfor
 
 ## The Vision
 
-ShadowStrike aims to be a fully functional, open-source Windows antivirus that implements the same detection techniques used by commercial endpoint protection platforms:
+ShadowStrike Phantom aims to be a fully functional, open-source Windows endpoint protection platform that implements the same detection techniques used by commercial EDR/XDR solutions:
 
 - **Kernel-level file system filtering** via Windows Filter Manager (minifilter)
 - **Real-time process monitoring** with injection detection
@@ -36,6 +36,8 @@ ShadowStrike aims to be a fully functional, open-source Windows antivirus that i
 - **Threat intelligence feeds** with IOC management
 
 This is a 3-5 year development effort. The goal is a production-ready beta by 2028.
+
+The platform will ship in three tiers in future: **Phantom Home**, **Phantom EDR**, and **Phantom XDR**.
 
 ---
 
@@ -60,7 +62,7 @@ This is a 3-5 year development effort. The goal is a production-ready beta by 20
 │                              KERNEL MODE                                     │
 ├───────────────────────────────────┼─────────────────────────────────────────┤
 │                    ┌──────────────┴──────────────┐                           │
-│                    │     ShadowStrikeFlt.sys     │                           │
+│                    │       PhantomSensor.sys     │                           │
 │                    │      (Minifilter Driver)    │                           │
 │                    └──────────────┬──────────────┘                           │
 │                                   │                                          │
@@ -83,7 +85,7 @@ This is a 3-5 year development effort. The goal is a production-ready beta by 20
 
 ## Core Technologies
 
-### Kernel Driver (Shadow Sensor)
+### Kernel Driver (PhantomSensor)
 - Windows Filter Manager minifilter for file system interception
 - `CmRegisterCallbackEx` for registry monitoring
 - `PsSetCreateProcessNotifyRoutineEx` for process creation tracking
@@ -124,7 +126,7 @@ ShadowStrike/
 ├── Drivers/
 │   ├── Build/
 │   ├── Install/
-│   ├── ShadowSensor/
+│   ├── PhantomSensor/
 │   │   ├── cache/
 │   │   ├── callbacks/
 │   │   ├── communication/
@@ -222,9 +224,9 @@ If you're interested in contributing:
 
 Commercial antivirus products are black boxes. Users trust them with kernel-level access to their systems without being able to verify what they actually do.
 
-ShadowStrike aims to be:
+ShadowStrike Phantom aims to be:
 - **Transparent**: Every line of code is auditable
-- **Educational**: Learn how real AV engines work
+- **Educational**: Learn how real EDR/XDR engines work
 - **Trustworthy**: No hidden telemetry or backdoors
 - **Community-driven**: Built by and for the security community
 
@@ -232,9 +234,9 @@ ShadowStrike aims to be:
 
 ## Disclaimer
 
-**This software is experimental and should not be used for production security FOR NOW.**
+**ShadowStrike Phantom is experimental and should not be used for production security FOR NOW.**
 
-- Do not rely on ShadowStrike to protect your systems
+- Do not rely on ShadowStrike Phantom to protect your systems
 - The detection capabilities are incomplete
 - The self-protection mechanisms are not battle-tested
 - Use at your own risk
