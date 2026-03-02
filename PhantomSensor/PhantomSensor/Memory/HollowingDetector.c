@@ -53,10 +53,105 @@
 #include "../Utilities/ProcessUtils.h"
 #include "../ETW/TelemetryEvents.h"
 #include "../Core/Globals.h"
+#include <ntimage.h>
 
 // ============================================================================
-// PRIVATE CONSTANTS
+// KERNEL-MODE TYPE DEFINITIONS
 // ============================================================================
+//
+// Process access rights — defined in winnt.h (user-mode) but not always
+// available in WDK kernel headers. Define if not present.
+//
+#ifndef PROCESS_VM_READ
+#define PROCESS_VM_READ             0x0010
+#endif
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION   0x0400
+#endif
+
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
+
+//
+// PROCESS_BASIC_INFORMATION is defined in ntddk.h — no need to redefine.
+//
+
+//
+// PEB subset for process hollowing analysis.
+// The full PEB is ~500+ bytes. We need ProcessParameters and ImageBaseAddress
+// which are at stable, well-documented offsets.
+//
+typedef struct _PH_PEB {
+    BOOLEAN         InheritedAddressSpace;      // 0x00
+    BOOLEAN         ReadImageFileExecOptions;   // 0x01
+    BOOLEAN         BeingDebugged;              // 0x02
+    BOOLEAN         BitField;                   // 0x03
+    UCHAR           Padding0[4];                // 0x04
+    HANDLE          Mutant;                     // 0x08
+    PVOID           ImageBaseAddress;            // 0x10
+    PVOID           Ldr;                         // 0x18
+    PVOID           ProcessParameters;           // 0x20
+} PH_PEB, *PPH_PEB;
+
+//
+// RTL_USER_PROCESS_PARAMETERS subset.
+// We only need ImagePathName and CommandLine for PEB tampering detection.
+//
+typedef struct _PH_RTL_USER_PROCESS_PARAMETERS {
+    ULONG MaximumLength;
+    ULONG Length;
+    ULONG Flags;
+    ULONG DebugFlags;
+    PVOID ConsoleHandle;
+    ULONG ConsoleFlags;
+    HANDLE StandardInput;
+    HANDLE StandardOutput;
+    HANDLE StandardError;
+    UNICODE_STRING CurrentDirectory_DosPath;
+    HANDLE CurrentDirectory_Handle;
+    UNICODE_STRING DllPath;
+    UNICODE_STRING ImagePathName;
+    UNICODE_STRING CommandLine;
+} PH_RTL_USER_PROCESS_PARAMETERS, *PPH_RTL_USER_PROCESS_PARAMETERS;
+
+//
+// Forward declaration: ZwQueryInformationProcess (not in all WDK headers).
+//
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQueryInformationProcess(
+    _In_ HANDLE ProcessHandle,
+    _In_ PROCESSINFOCLASS ProcessInformationClass,
+    _Out_writes_bytes_(ProcessInformationLength) PVOID ProcessInformation,
+    _In_ ULONG ProcessInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+//
+// Forward declaration: ZwReadVirtualMemory (undocumented but stable).
+// Required for cross-process memory reads during image comparison.
+//
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwReadVirtualMemory(
+    _In_ HANDLE ProcessHandle,
+    _In_opt_ PVOID BaseAddress,
+    _Out_writes_bytes_(BufferSize) PVOID Buffer,
+    _In_ SIZE_T BufferSize,
+    _Out_opt_ PSIZE_T NumberOfBytesRead
+    );
+
+//
+// User-mode address validation helper.
+//
+#ifndef SHADOWSTRIKE_IS_USER_ADDRESS_DECLARED
+#define ShadowStrikeIsUserAddress(addr) \
+    ((ULONG_PTR)(addr) >= 0x10000 && (ULONG_PTR)(addr) < (ULONG_PTR)MM_HIGHEST_USER_ADDRESS)
+#define SHADOWSTRIKE_IS_USER_ADDRESS_DECLARED
+#endif
 
 #define PH_VERSION                      1
 #define PH_MAX_CALLBACKS                8
@@ -1695,11 +1790,12 @@ PhpAnalyzePEB(
     PROCESS_BASIC_INFORMATION pbi = { 0 };
     ULONG returnLength = 0;
     PVOID pebAddress = NULL;
-    PEB peb = { 0 };
+    PH_PEB peb = { 0 };
     SIZE_T bytesRead = 0;
     UNICODE_STRING pebImagePath = { 0 };
 
     UNREFERENCED_PARAMETER(Detector);
+    UNREFERENCED_PARAMETER(Process);
 
     //
     // Get PEB address
@@ -1722,17 +1818,17 @@ PhpAnalyzePEB(
     }
 
     //
-    // Read PEB from process
+    // Read PEB from process (only our partial struct — safe)
     //
     status = PhpReadProcessMemory(
         ProcessHandle,
         pebAddress,
         &peb,
-        sizeof(PEB),
+        sizeof(PH_PEB),
         &bytesRead
     );
 
-    if (!NT_SUCCESS(status) || bytesRead < sizeof(PEB)) {
+    if (!NT_SUCCESS(status) || bytesRead < sizeof(PH_PEB)) {
         return status;
     }
 
@@ -1744,17 +1840,17 @@ PhpAnalyzePEB(
     // A hostile process can point this into kernel space.
     //
     if (peb.ProcessParameters != NULL && ShadowStrikeIsUserAddress(peb.ProcessParameters)) {
-        RTL_USER_PROCESS_PARAMETERS params = { 0 };
+        PH_RTL_USER_PROCESS_PARAMETERS params = { 0 };
 
         status = PhpReadProcessMemory(
             ProcessHandle,
             peb.ProcessParameters,
             &params,
-            sizeof(RTL_USER_PROCESS_PARAMETERS),
+            sizeof(PH_RTL_USER_PROCESS_PARAMETERS),
             &bytesRead
         );
 
-        if (NT_SUCCESS(status) && bytesRead >= sizeof(RTL_USER_PROCESS_PARAMETERS)) {
+        if (NT_SUCCESS(status) && bytesRead >= sizeof(PH_RTL_USER_PROCESS_PARAMETERS)) {
             //
             // Read the image path name from process memory
             // H-6 fix: Also validate params.ImagePathName.Buffer is user-mode
@@ -1839,9 +1935,15 @@ PhpAnalyzeMemoryRegions(
     UNREFERENCED_PARAMETER(Process);
 
     //
-    // Enumerate memory regions
+    // Enumerate memory regions.
+    // Cap at 16384 iterations to prevent excessive scan time on
+    // processes with highly fragmented address spaces.
     //
-    while (TRUE) {
+    #define PH_MAX_REGION_ITERATIONS 16384
+    ULONG iterations = 0;
+
+    while (iterations < PH_MAX_REGION_ITERATIONS) {
+        iterations++;
         status = ZwQueryVirtualMemory(
             ProcessHandle,
             currentAddress,
@@ -2238,7 +2340,7 @@ PhpCompareMemoryWithFile(
         if (MemoryHash != NULL) {
             status = ShadowStrikeComputeSha256(
                 memoryBuffer,
-                compareSize,
+                (ULONG)compareSize,
                 memHash
             );
 
@@ -2250,7 +2352,7 @@ PhpCompareMemoryWithFile(
         if (FileHash != NULL) {
             status = ShadowStrikeComputeSha256(
                 fileBuffer,
-                compareSize,
+                (ULONG)compareSize,
                 fHash
             );
 
@@ -2289,7 +2391,7 @@ PhpCheckFileTransacted(
     IO_STATUS_BLOCK ioStatus;
     HANDLE fileHandle = NULL;
     PFILE_OBJECT fileObject = NULL;
-    PTRANSACTION_PARAMETER_BLOCK txnParams = NULL;
+    PTXN_PARAMETER_BLOCK txnParams = NULL;
 
     *IsTransacted = FALSE;
 
@@ -2395,7 +2497,15 @@ PhpCheckFileDeleted(
         if (status == STATUS_OBJECT_NAME_NOT_FOUND ||
             status == STATUS_OBJECT_PATH_NOT_FOUND ||
             status == STATUS_DELETE_PENDING) {
+            //
+            // File is confirmed deleted or pending deletion.
+            // Return STATUS_SUCCESS so callers that check
+            // NT_SUCCESS(status) && isDeleted will see the detection.
+            // Without this, process ghosting goes completely undetected
+            // for fully-deleted backing files.
+            //
             *IsDeleted = TRUE;
+            return STATUS_SUCCESS;
         }
         return status;
     }
@@ -2521,11 +2631,14 @@ PhpDetermineHollowingType(
     PH_INDICATORS indicators = Result->Indicators;
 
     //
-    // Check for specific hollowing types based on indicator combinations
+    // Check for specific hollowing types based on indicator combinations.
+    // Order matters: most specific first, then broader heuristics.
     //
 
     //
-    // Process Doppelganging: Transacted file + section mismatch
+    // Process Doppelganging: Transacted file + section mismatch.
+    // TxF-based attack creates a section from a transacted file,
+    // then rolls back the transaction leaving no trace on disk.
     //
     if ((indicators & PhIndicator_TransactedFile) ||
         ((indicators & PhIndicator_NoPhysicalFile) &&
@@ -2534,15 +2647,19 @@ PhpDetermineHollowingType(
     }
 
     //
-    // Process Ghosting: Deleted backing file
+    // Process Ghosting: Deleted backing file.
+    // Attacker marks the file for deletion before creating the section,
+    // so the process runs with no on-disk image.
     //
     if (indicators & PhIndicator_DeletedFile) {
         return PhHollowing_Ghosting;
     }
 
     //
-    // Process Herpaderping: File modified after section creation
-    // (Hash mismatch but file still exists and not transacted)
+    // Process Herpaderping: File modified after section creation.
+    // Hash mismatch but file still exists and not transacted.
+    // The on-disk file was overwritten AFTER NtCreateSection but
+    // BEFORE the AV had a chance to scan the original content.
     //
     if ((indicators & PhIndicator_HashMismatch) &&
         !(indicators & PhIndicator_TransactedFile) &&
@@ -2552,7 +2669,21 @@ PhpDetermineHollowingType(
     }
 
     //
-    // Classic Process Hollowing: Entry point modified, section mismatch
+    // Process Overwriting (RunPE): Header + section mismatch but
+    // entry point is still valid (points to the overwritten code).
+    // Attacker unmaps the original image and maps a new one at the
+    // same base address with a valid entry point.
+    //
+    if ((indicators & PhIndicator_HeaderModified) &&
+        (indicators & PhIndicator_SectionMismatch) &&
+        !(indicators & PhIndicator_EntryPointModified)) {
+        return PhHollowing_Overwriting;
+    }
+
+    //
+    // Classic Process Hollowing: Entry point modified, section mismatch.
+    // The original code section is replaced with malicious code and
+    // the entry point redirected to the payload.
     //
     if ((indicators & PhIndicator_EntryPointModified) &&
         (indicators & PhIndicator_SectionMismatch)) {
@@ -2560,11 +2691,33 @@ PhpDetermineHollowingType(
     }
 
     //
-    // Module Stomping: Image path mismatch with PEB modification
+    // Classic Process Hollowing variant: Entry point modified alone.
+    // Some hollowing implementations only modify the entry point
+    // without fully replacing the section (partial hollowing).
+    //
+    if ((indicators & PhIndicator_EntryPointModified) &&
+        (indicators & PhIndicator_HashMismatch)) {
+        return PhHollowing_Classic;
+    }
+
+    //
+    // Module Stomping: Image path mismatch with PEB modification.
+    // Attacker loads a legitimate DLL, then overwrites its code
+    // section with malicious code while fixing up the PEB.
     //
     if ((indicators & PhIndicator_ImagePathMismatch) &&
         (indicators & PhIndicator_ModifiedPEB)) {
         return PhHollowing_ModuleStomping;
+    }
+
+    //
+    // Phantom DLL Hollowing: No physical file + hidden memory.
+    // Attacker creates a section from phantom (never-committed)
+    // memory, resulting in executable code with no file backing.
+    //
+    if ((indicators & PhIndicator_NoPhysicalFile) &&
+        (indicators & PhIndicator_HiddenMemory)) {
+        return PhHollowing_Phantom;
     }
 
     //
