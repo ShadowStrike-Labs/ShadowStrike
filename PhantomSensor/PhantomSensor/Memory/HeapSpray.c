@@ -159,14 +159,14 @@ HspReferenceProcessContext(
 _IRQL_requires_max_(APC_LEVEL)
 static VOID
 HspDereferenceProcessContext(
-    _In_ PHS_DETECTOR_INTERNAL* DetectorInternal,
+    _In_ PHS_DETECTOR_INTERNAL DetectorInternal,
     _Inout_ PHS_PROCESS_CONTEXT Context
     );
 
 _IRQL_requires_max_(APC_LEVEL)
 static VOID
 HspDestroyProcessContext(
-    _In_ PHS_DETECTOR_INTERNAL* DetectorInternal,
+    _In_ PHS_DETECTOR_INTERNAL DetectorInternal,
     _Inout_ PHS_PROCESS_CONTEXT Context
     );
 
@@ -316,7 +316,6 @@ Return Value:
 {
     PHS_DETECTOR_INTERNAL detectorInternal = NULL;
     PHS_DETECTOR detector = NULL;
-    NTSTATUS status = STATUS_SUCCESS;
     ULONG i;
 
     PAGED_CODE();
@@ -632,7 +631,7 @@ Return Value:
 --*/
 {
     PHS_DETECTOR_INTERNAL detectorInternal;
-    PHS_PROCESS_CONTEXT context;
+    PHS_PROCESS_CONTEXT context = NULL;
     PLIST_ENTRY entry;
     BOOLEAN found = FALSE;
 
@@ -797,9 +796,14 @@ Return Value:
         SIZE_T sampleSize = min(Size, HS_PATTERN_SAMPLE_SIZE);
 
         //
-        // Validate that the address is in user-mode range
+        // Validate that the address is in user-mode range and does NOT wrap.
+        // An attacker could supply a Size close to MAXSIZE_T so that
+        // Address + sampleSize wraps into kernel space.
         //
-        if ((ULONG_PTR)Address <= (ULONG_PTR)MM_HIGHEST_USER_ADDRESS &&
+        if ((ULONG_PTR)Address >= 0x10000 &&
+            (ULONG_PTR)Address <= (ULONG_PTR)MM_HIGHEST_USER_ADDRESS &&
+            sampleSize > 0 &&
+            ((ULONG_PTR)Address + sampleSize - 1) >= (ULONG_PTR)Address &&
             ((ULONG_PTR)Address + sampleSize - 1) <= (ULONG_PTR)MM_HIGHEST_USER_ADDRESS) {
 
             ProbeForRead(Address, sampleSize, sizeof(UCHAR));
@@ -870,6 +874,14 @@ Return Value:
             ));
 
         InterlockedIncrement64(&Detector->Stats.SpraysDetected);
+    } else if (sprayScore < HS_MIN_SCORE_FOR_SPRAY / 2) {
+        //
+        // Score dropped well below threshold — clear spray flag.
+        // This prevents a single early detection from permanently flagging
+        // a process that later becomes clean (e.g., after GC or free burst).
+        // We use half-threshold as hysteresis to avoid oscillation.
+        //
+        InterlockedExchange(&context->SprayInProgress, FALSE);
     }
 
     //
@@ -1007,7 +1019,16 @@ Return Value:
             RemoveEntryList(&record->ListEntry);
             RemoveEntryList(&record->HashEntry);
             context->AllocationCount--;
-            context->TotalAllocatedSize -= record->Size;
+
+            //
+            // Guard against underflow (double-free or corruption)
+            //
+            if (context->TotalAllocatedSize >= record->Size) {
+                context->TotalAllocatedSize -= record->Size;
+            } else {
+                context->TotalAllocatedSize = 0;
+            }
+
             found = TRUE;
             break;
         }
@@ -1278,7 +1299,7 @@ Return Value:
     // Calculate allocations per second
     //
     if (result->DurationMs > 0) {
-        result->AllocationsPerSecond = (allocCount * 1000) / result->DurationMs;
+        result->AllocationsPerSecond = (ULONG)(((ULONG64)allocCount * 1000) / result->DurationMs);
     }
 
     HspDereferenceProcessContext(detectorInternal, context);
@@ -1671,7 +1692,7 @@ static
 _Use_decl_annotations_
 VOID
 HspDereferenceProcessContext(
-    _In_ PHS_DETECTOR_INTERNAL* DetectorInternal,
+    _In_ PHS_DETECTOR_INTERNAL DetectorInternal,
     _Inout_ PHS_PROCESS_CONTEXT Context
     )
 {
@@ -1689,7 +1710,7 @@ static
 _Use_decl_annotations_
 VOID
 HspDestroyProcessContext(
-    _In_ PHS_DETECTOR_INTERNAL* DetectorInternal,
+    _In_ PHS_DETECTOR_INTERNAL DetectorInternal,
     _Inout_ PHS_PROCESS_CONTEXT Context
     )
 /*++
@@ -1993,13 +2014,34 @@ Routine Description:
     }
 
     //
-    // Check for BSTR-like patterns (length prefixed)
+    // Check for BSTR-like patterns (length-prefixed Unicode strings).
+    // Require the sample to be large enough and the declared length to be
+    // consistent with the sample size to reduce false positives.
     //
-    if (SampleSize >= 4) {
+    if (SampleSize >= 8) {
         ULONG potentialLength;
         RtlCopyMemory(&potentialLength, PatternSample, sizeof(ULONG));
-        if (potentialLength > 0 && potentialLength < 0x10000) {
-            return HsSprayType_StringSpray;
+        //
+        // BSTR length is byte count of the string body (excludes prefix).
+        // Require: non-zero, within 64K, and must be plausible relative to
+        // what we sampled (at least half the remaining sample is the string).
+        //
+        if (potentialLength > 0 && potentialLength < 0x10000 &&
+            potentialLength >= (SampleSize - sizeof(ULONG)) / 2) {
+            //
+            // Additionally verify the body looks like Unicode (even bytes
+            // are printable ASCII, odd bytes are 0x00 for Latin text)
+            //
+            ULONG unicodeHits = 0;
+            for (ULONG k = 4; k + 1 < SampleSize; k += 2) {
+                if (PatternSample[k] >= 0x20 && PatternSample[k] < 0x7F &&
+                    PatternSample[k + 1] == 0x00) {
+                    unicodeHits++;
+                }
+            }
+            if (unicodeHits > (SampleSize - 4) / 4) {
+                return HsSprayType_StringSpray;
+            }
         }
     }
 
@@ -2168,7 +2210,16 @@ Routine Description:
             RemoveEntryList(&record->ListEntry);
             RemoveEntryList(&record->HashEntry);
             Context->AllocationCount--;
-            Context->TotalAllocatedSize -= record->Size;
+
+            //
+            // Guard against underflow (corruption or accounting drift)
+            //
+            if (Context->TotalAllocatedSize >= record->Size) {
+                Context->TotalAllocatedSize -= record->Size;
+            } else {
+                Context->TotalAllocatedSize = 0;
+            }
+
             pruneCount++;
             InsertTailList(&recordsToFree, &record->ListEntry);
         }
@@ -2293,8 +2344,29 @@ Routine Description:
             dword == HS_NOP_SLIDE_0A ||
             dword == HS_HEAP_SPRAY_MAGIC_1 ||
             dword == HS_HEAP_SPRAY_MAGIC_2 ||
-            dword == 0x90909090) {
+            dword == 0x90909090 ||
+            dword == 0x0C0C0C0C ||
+            dword == 0x04040404 ||      // Heap spray landing pad
+            dword == 0x06060606 ||      // Alternative landing pad
+            dword == 0x07070707 ||      // Alternative landing pad
+            dword == 0x08080808) {      // Alternative landing pad
             return TRUE;
+        }
+    }
+
+    //
+    // Check for large regions of single repeated byte (any value).
+    // A 256-byte sample that's 90%+ the same byte is spray-like.
+    //
+    if (Size >= 16) {
+        ULONG counts[256] = {0};
+        for (i = 0; i < Size; i++) {
+            counts[Data[i]]++;
+        }
+        for (i = 0; i < 256; i++) {
+            if (counts[i] * 100 / Size >= 90) {
+                return TRUE;
+            }
         }
     }
 
@@ -2449,6 +2521,33 @@ Routine Description:
             Data[i+3] == 0x04 &&
             Data[i+4] == 0x25 &&
             Data[i+5] == 0x60) {
+            return TRUE;
+        }
+
+        //
+        // x64 syscall stub pattern (MOV R10, RCX; MOV EAX, imm32; SYSCALL)
+        // 4C 8B D1 B8 XX XX XX XX 0F 05
+        // Used by direct-syscall shellcode to bypass ntdll hooks.
+        //
+        if (i + 9 < Size &&
+            Data[i] == 0x4C &&
+            Data[i+1] == 0x8B &&
+            Data[i+2] == 0xD1 &&
+            Data[i+3] == 0xB8 &&
+            Data[i+8] == 0x0F &&
+            Data[i+9] == 0x05) {
+            return TRUE;
+        }
+
+        //
+        // WinExec / VirtualAlloc hash resolution stub
+        // Hash-based API resolution: rotate-add loop pattern
+        // ROR EDX, 0x0D; ADD EDX, ... (D1 CA / C1 CA 0D)
+        //
+        if (i + 2 < Size &&
+            Data[i] == 0xC1 &&
+            Data[i+1] == 0xCA &&
+            Data[i+2] == 0x0D) {
             return TRUE;
         }
     }

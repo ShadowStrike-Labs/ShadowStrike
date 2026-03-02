@@ -37,6 +37,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 #include "../../Shared/MemoryTypes.h"
 
@@ -72,7 +73,7 @@ typedef enum _HS_SPRAY_TYPE {
     HsSprayType_TypedArraySpray,        // TypedArray spray
     HsSprayType_ObjectSpray,            // Object spray
     HsSprayType_WasmSpray,              // WebAssembly spray
-} HS_SPRAY_TYPE;
+} HS_SPRAY_TYPE, *PHS_SPRAY_TYPE;
 
 //=============================================================================
 // Detection Flags

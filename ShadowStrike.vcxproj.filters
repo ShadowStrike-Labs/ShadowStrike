@@ -1317,6 +1317,33 @@
     <ClCompile Include="drivers\ShadowSensor\Context\InstanceContext.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\HeapSpray.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\HollowingDetector.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\InjectionDetector.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\MemoryMonitor.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\MemoryScanner.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\ROPDetector.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\SectionTracker.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\ShellcodeDetector.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\VadTracker.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\gmock\gmock-actions.h">
@@ -1941,6 +1968,33 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="drivers\ShadowSensor\Context\InstanceContext.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\HeapSpray.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\HollowingDetector.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\InjectionDetector.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\MemoryMonitor.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\MemoryScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\ROPDetector.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\SectionTracker.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\ShellcodeDetector.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\VadTracker.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
