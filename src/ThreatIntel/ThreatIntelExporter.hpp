@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -106,7 +106,7 @@ enum class ExportFormat : uint8_t {
     /// @brief Binary format for high-speed transfer
     Binary = 8,
     
-    /// @brief CrowdStrike IOC format
+    /// @brief enterprise-grade IOC format
     CrowdStrike = 9,
     
     /// @brief Microsoft Sentinel format

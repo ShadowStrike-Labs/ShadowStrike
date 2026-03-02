@@ -31,7 +31,7 @@
  * - Stress testing
  *
  * Quality Standards:
- * - CrowdStrike/Kaspersky enterprise-grade testing
+ * - Enterprise-grade testing
  * - Full code path coverage
  * - Security-focused test cases
  * - Performance validation

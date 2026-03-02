@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -40,7 +40,7 @@
  * - Query result aggregation from multiple sources
  * - Performance monitoring and adaptive optimization
  *
- * Performance Targets (CrowdStrike Falcon / Microsoft Defender ATP quality):
+ * Performance Targets (enterprise-grade enterprise-grade / Microsoft Defender ATP quality):
  * - Cache hit: < 50ns average
  * - Index hit: < 100ns average
  * - Database hit: < 500ns average

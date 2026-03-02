@@ -231,8 +231,8 @@ public:
     }
 
     void ConnectToDriver() {
-        // Connects to \\.\ShadowSensor
-        m_hDriver = CreateFileW(L"\\\\.\\ShadowSensor",
+        // Connects to \\.\PhantomSensor
+        m_hDriver = CreateFileW(L"\\\\.\\PhantomSensor",
             GENERIC_READ | GENERIC_WRITE,
             0, nullptr, OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -648,7 +648,7 @@ public:
         ProtectionResult result;
         m_stats.processProtections++;
 
-        // Enterprise EDR: Send IOCTL to ShadowSensor
+        // Enterprise EDR: Send IOCTL to PhantomSensor
         if (m_hDriver != INVALID_HANDLE_VALUE) {
             // Simulated IOCTL: IOCTL_SS_PROTECT_PROCESS
             // In real code: DeviceIoControl(...)

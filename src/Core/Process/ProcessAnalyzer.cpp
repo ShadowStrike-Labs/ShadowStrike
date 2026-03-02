@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -23,8 +23,8 @@
  * @file ProcessAnalyzer.cpp
  * @brief Enterprise-grade comprehensive process analysis orchestrator implementation
  *
- * Production-level implementation competing with CrowdStrike Falcon EDR,
- * Kaspersky EDR, and BitDefender GravityZone for process analysis.
+ * Production-level implementation competing with enterprise-grade enterprise-grade EDR,
+ * enterprise-grade EDR, and enterprise-grade GravityZone for process analysis.
  *
  * IMPLEMENTATION FEATURES:
  * ========================

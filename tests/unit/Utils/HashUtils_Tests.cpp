@@ -28,7 +28,7 @@
  * Coverage: SHA1/256/384/512/MD5, HMAC, hex conversion, FNV hashing,
  *           file hashing, streaming API, security features, edge cases
  *
- * Test Standards: Sophos/CrowdStrike enterprise quality
+ * Test Standards: Enterprise-grade quality
  *
  * ============================================================================
  */

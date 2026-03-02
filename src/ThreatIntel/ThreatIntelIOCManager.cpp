@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -25,7 +25,7 @@
  * All rights reserved.
  *
  *
- * Enterprise-grade implementation of IOC management with CrowdStrike Falcon/
+ * Enterprise-grade implementation of IOC management with enterprise-grade enterprise-grade/
  * Microsoft Defender ATP quality standards.
  *
  * Implementation follows these principles:

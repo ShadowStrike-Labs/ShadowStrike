@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -25,7 +25,7 @@
  *
  * Production-level implementation of comprehensive DNS monitoring with DGA
  * detection, DNS tunneling analysis, response validation, and threat intelligence
- * integration. Competes with CrowdStrike Falcon DNS Protection, Cisco Umbrella.
+ * integration. Competes with enterprise-grade enterprise-grade DNS Protection, Cisco Umbrella.
  *
  * IMPLEMENTATION FEATURES:
  * ========================

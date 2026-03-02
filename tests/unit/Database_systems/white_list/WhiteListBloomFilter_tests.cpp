@@ -37,7 +37,7 @@
  * - Performance Benchmarks
  *
  * Quality Standards:
- * - CrowdStrike Falcon / Kaspersky / Bitdefender quality
+ * - Enterprise-grade quality
  * - Thread-safety verification under high concurrency
  * - Memory leak detection through multiple cycles
  * - Performance guardrails (latency, throughput)

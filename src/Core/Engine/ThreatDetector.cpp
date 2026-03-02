@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -24,7 +24,7 @@
  * @brief Enterprise-grade central threat detection and event correlation engine
  *
  * Production-level implementation of multi-engine threat detection orchestration.
- * Competes with CrowdStrike Falcon EDR, Kaspersky EDR, and BitDefender GravityZone.
+ * Competes with enterprise-grade enterprise-grade EDR, enterprise-grade EDR, and enterprise-grade GravityZone.
  *
  * IMPLEMENTATION FEATURES:
  * ========================

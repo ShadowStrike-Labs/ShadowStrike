@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -23,8 +23,8 @@
  * @file TorDetector.cpp
  * @brief Enterprise-grade Tor network detection and monitoring engine implementation
  *
- * Production-level implementation competing with CrowdStrike Falcon EDR,
- * Kaspersky EDR, and BitDefender GravityZone for Tor detection.
+ * Production-level implementation competing with enterprise-grade enterprise-grade EDR,
+ * enterprise-grade EDR, and enterprise-grade GravityZone for Tor detection.
  *
  * IMPLEMENTATION FEATURES:
  * ========================

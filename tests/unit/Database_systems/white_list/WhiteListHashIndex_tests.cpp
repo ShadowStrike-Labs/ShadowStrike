@@ -41,7 +41,7 @@
  * 9. Memory Corruption Detection
  * 10. Stress Tests
  *
- * Target: CrowdStrike / Kaspersky enterprise-grade quality
+ * Target: Enterprise-grade quality
  *
  * Copyright (c) 2026 ShadowStrike Security Suite
  */

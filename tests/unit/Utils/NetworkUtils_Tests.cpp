@@ -29,7 +29,7 @@
  *           DNS resolution (localhost), ping (localhost), URL parsing,
  *           port detection, MAC address parsing, protocol detection
  *
- * Test Standards: Sophos/CrowdStrike enterprise quality
+ * Test Standards: Enterprise-grade quality
  * Strategy: Use localhost (127.0.0.1, ::1) and system APIs for validation
  *
  * ============================================================================

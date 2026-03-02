@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -58,7 +58,7 @@
  * │                    MemoryMappedView (Zero-copy)                        │
  * └───────────────────────────────────────────────────────────────────────┘
  *
- * Performance Standards: CrowdStrike Falcon / Kaspersky / Bitdefender quality
+ * Performance Standards: enterprise-grade enterprise-grade / enterprise-grade / enterprise-grade quality
  *
  * Thread Safety:
  * - All public methods are thread-safe unless explicitly documented otherwise

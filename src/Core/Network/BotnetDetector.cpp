@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -23,8 +23,8 @@
  * @file BotnetDetector.cpp
  * @brief Enterprise-grade botnet and C2 detection engine implementation
  *
- * Production-level implementation competing with CrowdStrike Falcon EDR,
- * Kaspersky EDR, and BitDefender GravityZone for botnet detection.
+ * Production-level implementation competing with enterprise-grade enterprise-grade EDR,
+ * enterprise-grade EDR, and enterprise-grade GravityZone for botnet detection.
  *
  * IMPLEMENTATION FEATURES:
  * ========================

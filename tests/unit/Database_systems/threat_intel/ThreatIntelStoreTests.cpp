@@ -34,7 +34,7 @@
  * - Production Stress & Concurrency
  *
  * Quality Standards:
- * - CrowdStrike Falcon / Microsoft Defender ATP level reliability
+ * - Enterprise-grade reliability
  * - Thread-safety verification under high concurrency
  * - Memory leak detection through multiple init/shutdown cycles
  * - Performance guardrails (latency, throughput)

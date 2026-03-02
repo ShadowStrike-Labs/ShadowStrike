@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -40,7 +40,7 @@
  * │ - Generic Index (Extensible B+Tree for all other IOC types)        │
  * └─────────────────────────────────────────────────────────────────────┘
  *
- * Performance Targets (CrowdStrike Falcon / Microsoft Defender ATP quality):
+ * Performance Targets (enterprise-grade enterprise-grade / Microsoft Defender ATP quality):
  * - IPv4 lookup: < 50ns average (radix tree)
  * - IPv6 lookup: < 80ns average (patricia trie)
  * - Domain lookup: < 100ns average (suffix trie + hash)

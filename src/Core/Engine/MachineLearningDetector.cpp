@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -25,7 +25,7 @@
  *
  * Production-level implementation of machine learning malware classification
  * with multi-model ensemble, ONNX runtime, GPU acceleration, and explainability.
- * Competes with CrowdStrike Falcon ML, Kaspersky ML, and BitDefender AI.
+ * Competes with enterprise-grade enterprise-grade ML, enterprise-grade ML, and enterprise-grade AI.
  *
  * IMPLEMENTATION FEATURES:
  * ========================

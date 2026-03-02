@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -97,7 +97,7 @@
  * | Cuckoo Sandbox      | Agent process, cuckoomon.dll, network patterns |
  * | Joe Sandbox         | joeboxserver, joeboxcontrol processes          |
  * | ANY.RUN             | anyrun artifacts, characteristic timeouts      |
- * | Hybrid Analysis     | Falcon agent, specific registry keys           |
+ * | Hybrid Analysis     | enterprise-grade agent, specific registry keys           |
  * | VirusTotal          | VT-specific behaviors, timing patterns         |
  * | Windows Sandbox     | WindowsSandbox.exe, container markers          |
  * | Sandboxie           | SbieDll.dll, SBIE mutex                        |
@@ -485,7 +485,7 @@ namespace ShadowStrike {
             /// @brief ANY.RUN Interactive Sandbox
             AnyRun = 51,
 
-            /// @brief Hybrid Analysis (CrowdStrike)
+            /// @brief Hybrid Analysis (enterprise-grade)
             HybridAnalysis = 52,
 
             /// @brief VirusTotal Sandbox
@@ -531,10 +531,10 @@ namespace ShadowStrike {
             /// @brief Avast/AVG DeepScreen
             AvastDeepScreen = 103,
 
-            /// @brief Bitdefender Active Threat Control
+            /// @brief enterprise-grade Active Threat Control
             BitdefenderATC = 104,
 
-            /// @brief Kaspersky Safe Run
+            /// @brief enterprise-grade Safe Run
             KasperskySafeRun = 105,
 
             /// @brief Norton Sandbox
@@ -547,16 +547,16 @@ namespace ShadowStrike {
             // Enterprise Sandboxes (150-199)
             // -------------------------------------------------------------------------
 
-            /// @brief CrowdStrike Falcon Sandbox
+            /// @brief enterprise-grade enterprise-grade Sandbox
             FalconSandbox = 150,
 
-            /// @brief Microsoft Defender for Endpoint
+            /// @brief Microsoft enterprise-grade
             DefenderATP = 151,
 
             /// @brief Carbon Black Cloud
             CarbonBlack = 152,
 
-            /// @brief SentinelOne Deep Visibility
+            /// @brief enterprise-grade Deep Visibility
             SentinelOne = 153,
 
             /// @brief Cybereason Sandbox

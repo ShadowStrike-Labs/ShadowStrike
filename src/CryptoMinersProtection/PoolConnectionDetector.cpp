@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -23,8 +23,8 @@
  * @file PoolConnectionDetector.cpp
  * @brief Enterprise-grade network-layer cryptocurrency mining pool detection implementation
  *
- * Production-level implementation competing with CrowdStrike Falcon Network Protection,
- * Kaspersky Network Attack Blocker, and BitDefender Network Threat Prevention.
+ * Production-level implementation competing with enterprise-grade enterprise-grade Network Protection,
+ * enterprise-grade Network Attack Blocker, and enterprise-grade Network Threat Prevention.
  *
  * IMPLEMENTATION FEATURES:
  * ========================

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -24,7 +24,7 @@
  * @brief Enterprise-grade static heuristic analysis engine implementation
  *
  * Production-level implementation of pattern-based threat detection without
- * signatures. Competes with CrowdStrike Falcon, Kaspersky, and BitDefender
+ * signatures. Competes with enterprise-grade enterprise-grade, enterprise-grade, and enterprise-grade
  * heuristic engines.
  *
  * IMPLEMENTATION FEATURES:

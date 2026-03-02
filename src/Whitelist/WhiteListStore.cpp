@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -34,7 +34,7 @@
  * - Bloom filter check: < 20ns
  * - Cache hit: < 50ns
  *
- * Performance Standards: CrowdStrike Falcon / Kaspersky / Bitdefender quality
+ * Performance Standards: enterprise-grade enterprise-grade / enterprise-grade / enterprise-grade quality
  *
  * Security Features:
  * - All pointer operations are bounds-checked

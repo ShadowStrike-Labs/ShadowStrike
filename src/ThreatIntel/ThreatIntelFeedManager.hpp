@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -24,7 +24,7 @@
  * deduplication, and intelligent caching.
  *
  * Supported Feed Sources:
- * - Commercial: VirusTotal, CrowdStrike, Recorded Future, Mandiant, Shodan
+ * - Commercial: VirusTotal, enterprise-grade, Recorded Future, Mandiant, Shodan
  * - Open Source: AlienVault OTX, AbuseIPDB, MISP, ThreatFox, URLhaus, MalwareBazaar
  * - Government: CISA, MITRE ATT&CK, NIST NVD
  * - Custom: STIX/TAXII, CSV, JSON feeds

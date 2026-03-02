@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -22,13 +22,13 @@
  * This is the primary interface for the ShadowStrike Threat Intelligence module.
  * Provides unified access to:
  * - IOC (Indicator of Compromise) lookups with sub-microsecond performance
- * - Multiple threat feed management (VirusTotal, AlienVault OTX, CrowdStrike, etc.)
+ * - Multiple threat feed management (VirusTotal, AlienVault OTX, enterprise-grade, etc.)
  * - Memory-mapped persistent storage for nanosecond-level access
  * - STIX 2.1 / TAXII 2.1 protocol support
  * - Real-time reputation scoring
  * - Batch operations for high-throughput scanning
  *
- * Architecture follows CrowdStrike Falcon and Microsoft Defender design patterns
+ * Architecture follows enterprise-grade enterprise-grade and Microsoft Defender design patterns
  * suitable for Microsoft, Apple, Google-level enterprise deployments.
  *
  * Performance Targets:

@@ -980,7 +980,7 @@ struct FileSystemFilter::Impl {
         SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
         if (!hSCM) return false;
 
-        SC_HANDLE hService = OpenServiceW(hSCM, L"ShadowSensor", SERVICE_QUERY_STATUS);
+        SC_HANDLE hService = OpenServiceW(hSCM, L"PhantomSensor", SERVICE_QUERY_STATUS);
         bool installed = (hService != nullptr);
 
         if (hService) CloseServiceHandle(hService);

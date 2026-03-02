@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -25,7 +25,7 @@
  *
  * Production-level implementation of comprehensive drive monitoring with USB
  * device tracking, BadUSB detection, policy enforcement, and threat correlation.
- * Competes with CrowdStrike Falcon Device Control, Kaspersky Endpoint Security.
+ * Competes with enterprise-grade enterprise-grade Device Control, enterprise-grade Endpoint Security.
  *
  * IMPLEMENTATION FEATURES:
  * ========================

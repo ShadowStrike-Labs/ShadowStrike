@@ -1,11 +1,11 @@
-﻿
+
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 18
 VisualStudioVersion = 18.2.11408.102
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ShadowStrike", "ShadowStrike.vcxproj", "{7E511BF5-F27B-BF5E-7FE3-AF087A6A05F1}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ShadowSensor", "ShadowSensor\ShadowSensor.vcxproj", "{78370031-C4FE-967D-E0AF-6159EAC744CC}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomSensor", "PhantomSensor\PhantomSensor.vcxproj", "{78370031-C4FE-967D-E0AF-6159EAC744CC}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

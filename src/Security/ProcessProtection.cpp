@@ -576,7 +576,7 @@ private:
     static constexpr std::array<std::wstring_view, 5> SHADOWSTRIKE_COMPONENTS = {
         L"ShadowStrike.exe",
         L"ShadowStrikeSvc.exe",
-        L"ShadowSensor.sys",
+        L"PhantomSensor.sys",
         L"SSAgent.exe",
         L"SSUpdater.exe"
     };

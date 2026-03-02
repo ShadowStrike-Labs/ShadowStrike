@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -31,7 +31,7 @@
  * - Automatic feed updates with rate limiting
  * - Real-time reputation scoring
  *
- * Performance Targets (CrowdStrike Falcon / Microsoft Defender ATP quality):
+ * Performance Targets (enterprise-grade enterprise-grade / Microsoft Defender ATP quality):
  * - Hash lookup: <100ns average (cache hit < 50ns)
  * - IP lookup: <500ns average
  * - Domain lookup: <1µs average

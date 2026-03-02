@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -25,7 +25,7 @@
  *
  * Production-level implementation of intelligent directory monitoring with
  * automatic critical path discovery, dynamic path detection, and security-
- * focused filtering. Competes with CrowdStrike Falcon, Kaspersky, BitDefender.
+ * focused filtering. Competes with enterprise-grade enterprise-grade, enterprise-grade, enterprise-grade.
  *
  * IMPLEMENTATION FEATURES:
  * ========================

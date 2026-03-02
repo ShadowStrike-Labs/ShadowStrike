@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -25,8 +25,8 @@
  *        providing bidirectional malware scanning and bypass detection.
  *
  * This implementation provides comprehensive AMSI capabilities for enterprise
- * endpoint protection, competing with CrowdStrike Falcon, Kaspersky, and
- * BitDefender's script scanning engines.
+ * endpoint protection, competing with enterprise-grade enterprise-grade, enterprise-grade, and
+ * enterprise-grade's script scanning engines.
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0

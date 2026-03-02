@@ -37,7 +37,7 @@
  * - Edge cases and error handling
  *
  * Quality Standards:
- * - CrowdStrike Falcon / Kaspersky / Bitdefender quality
+ * - Enterprise-grade quality
  * - FIPS 140-2 compliance testing for crypto operations
  * - Memory safety validation (bounds checking)
  * - Concurrent access testing

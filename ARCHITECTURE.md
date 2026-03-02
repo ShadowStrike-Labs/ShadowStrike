@@ -8,7 +8,7 @@ ShadowStrike/
 ├── Drivers/
 │   ├── Build/
 │   ├── Install/
-│   ├── ShadowSensor/
+│   ├── PhantomSensor/
 │   │   ├── cache/
 │   │   ├── callbacks/
 │   │   ├── communication/

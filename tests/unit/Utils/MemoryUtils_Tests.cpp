@@ -28,7 +28,7 @@
  * Coverage: Virtual memory, guards, large pages, write-watch, mapped views,
  *           working set, aligned alloc, secure zero, edge cases
  *
- * Test Standards: Sophos/CrowdStrike enterprise quality
+ * Test Standards: Enterprise-grade quality
  *
  * ============================================================================
  */

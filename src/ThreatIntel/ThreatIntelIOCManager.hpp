@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -26,7 +26,7 @@
  *
  * Enterprise-grade IOC (Indicator of Compromise) Manager for the ShadowStrike
  * Threat Intelligence platform. Provides unified management interface for all
- * IOC operations with CrowdStrike Falcon / Microsoft Defender ATP quality.
+ * IOC operations with enterprise-grade enterprise-grade / Microsoft Defender ATP quality.
  *
  * Key Features:
  * - Unified IOC CRUD operations with atomic transactions
@@ -77,7 +77,7 @@
  *
  * This module is designed for billion-dollar enterprise deployments at
  * Microsoft, Google, Apple, Amazon scale. Do not underestimate the
- * quality requirements. Every line must meet CrowdStrike Falcon standards.
+ * quality requirements. Every line must meet enterprise-grade enterprise-grade standards.
  *
  * ============================================================================
  */

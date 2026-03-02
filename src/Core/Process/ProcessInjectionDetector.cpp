@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -23,8 +23,8 @@
  * @file ProcessInjectionDetector.cpp
  * @brief Enterprise-grade universal code injection detection engine implementation
  *
- * Production-level implementation competing with CrowdStrike Falcon EDR,
- * Kaspersky EDR, and BitDefender GravityZone for injection detection.
+ * Production-level implementation competing with enterprise-grade enterprise-grade EDR,
+ * enterprise-grade EDR, and enterprise-grade GravityZone for injection detection.
  *
  * IMPLEMENTATION FEATURES:
  * ========================
@@ -277,10 +277,10 @@ using TimePoint = std::chrono::system_clock::time_point;
         {L"explorer.exe", L"*"},        // Windows Explorer (legitimate extensions)
         {L"MsMpEng.exe", L"*"},         // Windows Defender
         {L"AvastUI.exe", L"*"},         // Avast Antivirus
-        {L"avp.exe", L"*"},             // Kaspersky
-        {L"bdagent.exe", L"*"},         // BitDefender
-        {L"ekrn.exe", L"*"},            // ESET
-        {L"vsserv.exe", L"*"},          // BitDefender Service
+        {L"avp.exe", L"*"},             // Third-party AV agent
+        {L"bdagent.exe", L"*"},         // Third-party AV agent
+        {L"ekrn.exe", L"*"},            // Third-party AV agent
+        {L"vsserv.exe", L"*"},          // Third-party AV service
         {L"MBAMService.exe", L"*"}      // Malwarebytes
     };
 

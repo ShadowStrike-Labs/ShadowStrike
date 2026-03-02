@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -89,7 +89,7 @@
  * │ Metadata Section (Feed info, update timestamps, API configs)          │
  * └────────────────────────────────────────────────────────────────────────┘
  *
- * Performance Standards: CrowdStrike Falcon / Microsoft Defender ATP quality
+ * Performance Standards: enterprise-grade enterprise-grade / Microsoft Defender ATP quality
  *
  * ============================================================================
  */

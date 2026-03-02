@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -23,8 +23,8 @@
  * @file ThreadHijackDetector.cpp
  * @brief Enterprise-grade thread execution hijacking detection engine implementation
  *
- * Production-level implementation competing with CrowdStrike Falcon EDR,
- * Kaspersky EDR, and BitDefender GravityZone for thread hijack detection.
+ * Production-level implementation competing with enterprise-grade enterprise-grade EDR,
+ * enterprise-grade EDR, and enterprise-grade GravityZone for thread hijack detection.
  *
  * IMPLEMENTATION FEATURES:
  * ========================

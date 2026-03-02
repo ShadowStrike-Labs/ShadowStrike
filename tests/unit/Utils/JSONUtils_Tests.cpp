@@ -28,7 +28,7 @@
  * Coverage: Parse, stringify, file I/O, JSON pointer, path operations,
  *           merge patch, validation, security limits, edge cases
  *
- * Test Standards: Sophos/CrowdStrike enterprise quality
+ * Test Standards: Enterprise-grade quality
  *
  * ============================================================================
  */

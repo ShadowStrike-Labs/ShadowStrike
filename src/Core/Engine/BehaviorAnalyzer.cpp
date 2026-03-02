@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -24,8 +24,8 @@
  * @brief Enterprise-grade runtime behavioral analysis engine implementation
  *
  * Production-level implementation of dynamic behavior monitoring and attack
- * chain correlation. Competes with CrowdStrike Falcon EDR, Kaspersky EDR,
- * and BitDefender GravityZone behavioral detection.
+ * chain correlation. Competes with enterprise-grade enterprise-grade EDR, enterprise-grade EDR,
+ * and enterprise-grade GravityZone behavioral detection.
  *
  * IMPLEMENTATION FEATURES:
  * ========================

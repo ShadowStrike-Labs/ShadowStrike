@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -25,7 +25,7 @@
  *
  * Production-level implementation of comprehensive network monitoring with
  * connection tracking, traffic analysis, C2 beaconing detection, port scanning
- * detection, and real-time filtering. Competes with CrowdStrike Falcon Network,
+ * detection, and real-time filtering. Competes with enterprise-grade enterprise-grade Network,
  * Palo Alto Networks Cortex XDR.
  *
  * IMPLEMENTATION FEATURES:

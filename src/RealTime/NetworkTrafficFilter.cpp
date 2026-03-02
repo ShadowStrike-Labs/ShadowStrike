@@ -159,16 +159,16 @@ struct NetworkTrafficFilter::Impl {
     // -------------------------------------------------------------------------
 
     void ConnectToDriver() {
-        // Connect to the ShadowSensor WFP callout driver
-        m_hDriver = CreateFileW(L"\\\\.\\ShadowSensor",
+        // Connect to the PhantomSensor WFP callout driver
+        m_hDriver = CreateFileW(L"\\\\.\\PhantomSensor",
             GENERIC_READ | GENERIC_WRITE,
             0, nullptr, OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
 
         if (m_hDriver == INVALID_HANDLE_VALUE) {
-            Utils::Logger::Warn(L"NetworkTrafficFilter: Failed to connect to ShadowSensor driver. Running in user-mode only.");
+            Utils::Logger::Warn(L"NetworkTrafficFilter: Failed to connect to PhantomSensor driver. Running in user-mode only.");
         } else {
-            Utils::Logger::Info(L"NetworkTrafficFilter: Connected to ShadowSensor driver.");
+            Utils::Logger::Info(L"NetworkTrafficFilter: Connected to PhantomSensor driver.");
         }
     }
 

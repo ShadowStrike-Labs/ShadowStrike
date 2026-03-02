@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -23,8 +23,8 @@
  * @file ProcessHollowingDetector.cpp
  * @brief Enterprise-grade process hollowing detection implementation.
  *
- * Production-level implementation competing with CrowdStrike Falcon Memory
- * Protection and Kaspersky System Watcher. Detects 11 variants of process
+ * Production-level implementation competing with enterprise-grade enterprise-grade Memory
+ * Protection and enterprise-grade System Watcher. Detects 11 variants of process
  * hollowing attacks with high accuracy and low false positive rate.
  *
  * IMPLEMENTATION FEATURES:

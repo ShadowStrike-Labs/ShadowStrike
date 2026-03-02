@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -26,8 +26,8 @@
  *        certificates, and certificate chains.
  *
  * This implementation provides comprehensive certificate validation capabilities
- * for the ShadowStrike security suite, competing with CrowdStrike Falcon,
- * Kaspersky, and BitDefender's certificate validation engines.
+ * for the ShadowStrike security suite, competing with enterprise-grade enterprise-grade,
+ * enterprise-grade, and enterprise-grade's certificate validation engines.
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0

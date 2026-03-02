@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -23,8 +23,8 @@
  * @file CryptoMinerDetector.cpp
  * @brief Enterprise-grade cryptocurrency mining detection orchestrator implementation
  *
- * Production-level implementation competing with CrowdStrike Falcon, Kaspersky,
- * and BitDefender for comprehensive cryptomining threat detection.
+ * Production-level implementation competing with enterprise-grade enterprise-grade, enterprise-grade,
+ * and enterprise-grade for comprehensive cryptomining threat detection.
  *
  * IMPLEMENTATION FEATURES:
  * ========================

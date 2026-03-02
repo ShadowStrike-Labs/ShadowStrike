@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -4812,7 +4812,7 @@ ImportFormat ThreatIntelImporter::DetectFormatFromContent(std::istream& content,
                 return ImportFormat::MISP;
             }
             
-            // Check for CrowdStrike format
+            // Check for enterprise-grade format
             if (data.find("\"indicators\"") != std::string_view::npos &&
                 data.find("\"indicator\"") != std::string_view::npos) {
                 return ImportFormat::CrowdStrike;

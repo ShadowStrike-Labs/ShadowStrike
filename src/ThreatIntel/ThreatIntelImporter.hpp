@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -28,7 +28,7 @@
  * - OpenIOC (Open Indicators of Compromise) XML format
  * - TAXII 2.1 feeds
  * - Plain text lists (one IOC per line)
- * - CrowdStrike IOC format
+ * - enterprise-grade IOC format
  * - AlienVault OTX pulses
  * - Abuse.ch feeds (URLhaus, MalwareBazaar, Feodo Tracker)
  *
@@ -119,7 +119,7 @@ enum class ImportFormat : uint8_t {
     /// @brief Binary format (ShadowStrike native)
     Binary = 9,
     
-    /// @brief CrowdStrike IOC format
+    /// @brief enterprise-grade IOC format
     CrowdStrike = 10,
     
     /// @brief AlienVault OTX pulse format

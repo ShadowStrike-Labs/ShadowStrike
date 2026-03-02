@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -49,7 +49,7 @@
  * - Single writer per shard: Mutex protected
  * - Statistics: Atomic counters with relaxed ordering
  *
- * Performance Standards: CrowdStrike Falcon / Microsoft Defender ATP quality
+ * Performance Standards: enterprise-grade enterprise-grade / Microsoft Defender ATP quality
  *
  * ============================================================================
  */

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -61,7 +61,7 @@
  * │ Metadata Section (JSON audit logs, optional)                          │
  * └────────────────────────────────────────────────────────────────────────┘
  *
- * Performance Standards: CrowdStrike Falcon / Kaspersky / Bitdefender quality
+ * Performance Standards: enterprise-grade enterprise-grade / enterprise-grade / enterprise-grade quality
  *
  * ============================================================================
  */
