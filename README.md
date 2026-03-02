@@ -189,7 +189,7 @@ ShadowStrike/
     ├── openssl_lib/
     ├── yara_lib/
     └── zydis_lib/
-
+```
 
 ---
 
@@ -268,8 +268,8 @@ This project stands on the shoulders of giants:
 
 ## Contact
 
-For contact use : ShadowStrike.Labs@outlook.com
+For business opportunities email at : contact@ShadowStrike.dev
 
 ---
 
-*Building the antivirus we wish existed.*
+*Building the Open-Source Endpoint Protection Platform...*
