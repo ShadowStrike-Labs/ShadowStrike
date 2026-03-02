@@ -110,6 +110,8 @@ Detection Techniques Covered:
 //
 // Callback registration entry
 //
+#pragma warning(push)
+#pragma warning(disable:4201)   // nameless union — intentional for dual callback type
 typedef struct _INJ_CALLBACK_ENTRY {
     union {
         INJ_DETECTION_CALLBACK DetectionCallback;
@@ -119,6 +121,7 @@ typedef struct _INJ_CALLBACK_ENTRY {
     BOOLEAN Active;
     UCHAR Reserved[7];
 } INJ_CALLBACK_ENTRY, *PINJ_CALLBACK_ENTRY;
+#pragma warning(pop)
 
 //
 // Operation hash bucket
@@ -291,17 +294,14 @@ InjpFreeChain(
     _In_ PINJ_CHAIN Chain
     );
 
-static PINJ_CHAIN
-InjpFindOrCreateChain(
+//
+// Combined atomic chain correlation (I-3 FIX: no dangling chain pointer)
+//
+static NTSTATUS
+InjpCorrelateOperationWithChain(
     _In_ PINJ_DETECTOR_INTERNAL Detector,
     _In_ HANDLE SourceProcessId,
-    _In_ HANDLE TargetProcessId
-    );
-
-static NTSTATUS
-InjpAddOperationToChain(
-    _In_ PINJ_DETECTOR_INTERNAL Detector,
-    _In_ PINJ_CHAIN Chain,
+    _In_ HANDLE TargetProcessId,
     _In_ PINJ_OPERATION Operation
     );
 
@@ -696,6 +696,12 @@ Arguments:
     //
     if (Internal->CleanupTimerActive) {
         KeCancelTimer(&Internal->CleanupTimer);
+        //
+        // I-2 FIX: KeFlushQueuedDpcs ensures DPC has completed before we
+        // free the detector structure. Without this, a pending/running DPC
+        // could access freed memory → BSOD.
+        //
+        KeFlushQueuedDpcs();
         Internal->CleanupTimerActive = FALSE;
     }
 
@@ -827,7 +833,6 @@ Return Value:
 {
     PINJ_DETECTOR_INTERNAL Internal = (PINJ_DETECTOR_INTERNAL)Detector;
     PINJ_OPERATION Operation = NULL;
-    PINJ_CHAIN Chain = NULL;
     NTSTATUS Status;
     BOOLEAN IsRemote;
 
@@ -852,9 +857,10 @@ Return Value:
     }
 
     //
-    // Check if we've hit the operation limit
+    // I-7 FIX: Use the hard constant INJ_MAX_TRACKED_OPERATIONS as the global
+    // cap instead of a dynamic product that can silently change with config.
     //
-    if ((ULONG)Internal->TotalOperationCount >= Internal->Public.Config.MaxOperationsPerChain * INJ_HASH_BUCKET_COUNT) {
+    if ((ULONG)Internal->TotalOperationCount >= INJ_MAX_TRACKED_OPERATIONS) {
         InterlockedIncrement64(&Internal->Public.Stats.DroppedOperations);
         return STATUS_QUOTA_EXCEEDED;
     }
@@ -916,26 +922,31 @@ Return Value:
     InterlockedIncrement64(&Internal->Public.Stats.TotalOperations);
 
     //
-    // Find or create correlation chain
+    // Find or create correlation chain and add operation atomically.
+    // I-3 FIX: The old InjpFindOrCreateChain + InjpAddOperationToChain pair
+    // released ChainLock between find and add, allowing another thread to free
+    // the chain before the operation was added → use-after-free.
+    // The new InjpCorrelateOperationWithChain holds ChainLock across both.
     //
     if (Internal->Public.Config.EnableChainCorrelation) {
-        Chain = InjpFindOrCreateChain(Internal, SourceProcessId, TargetProcessId);
-        if (Chain != NULL) {
-            InjpAddOperationToChain(Internal, Chain, Operation);
+        InjpCorrelateOperationWithChain(Internal, SourceProcessId, TargetProcessId, Operation);
 
-            //
-            // Signal worker thread for analysis
-            //
-            KeSetEvent(&Internal->AnalysisEvent, IO_NO_INCREMENT, FALSE);
-        }
+        //
+        // Signal worker thread for analysis
+        //
+        KeSetEvent(&Internal->AnalysisEvent, IO_NO_INCREMENT, FALSE);
     }
 
     //
-    // Check for immediate blocking conditions
+    // Check for immediate blocking conditions.
+    // I-5 FIX: If the operation is blocked, roll back: remove from hash table
+    // so the tracking state is consistent with the "blocked" return code.
     //
     if (Internal->Public.Config.EnableAutoBlocking) {
         if (InjpShouldBlockInjection(Internal, Operation)) {
             InterlockedIncrement64(&Internal->Public.Stats.BlockedInjections);
+            InjpRemoveOperation(Internal, Operation);
+            InjpFreeOperation(Internal, Operation);
             return STATUS_ACCESS_DENIED;
         }
     }
@@ -1859,20 +1870,37 @@ InjpFreeChain(
     _In_ PINJ_CHAIN Chain
     )
 {
+    LIST_ENTRY OpsToFree;
     PLIST_ENTRY Entry;
     PINJ_OPERATION Operation;
+    KIRQL OldIrql;
+
+    InitializeListHead(&OpsToFree);
 
     //
-    // Free all operations in the chain
+    // I-8 FIX: Detach all operations from the chain under ChainLock.
+    // This prevents InjpCleanupStaleOperations from accessing ChainEntry
+    // on an operation that we're about to free (data race → BSOD).
+    // After detach, ChainEntry points to the local OpsToFree list.
     //
+    KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
+
     while (!IsListEmpty(&Chain->OperationList)) {
         Entry = RemoveHeadList(&Chain->OperationList);
         Operation = CONTAINING_RECORD(Entry, INJ_OPERATION, ChainEntry);
+        InsertTailList(&OpsToFree, &Operation->ChainEntry);
+    }
+
+    KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
+
+    //
+    // Phase 2: Remove from hash buckets and free — outside all locks.
+    //
+    while (!IsListEmpty(&OpsToFree)) {
+        Entry = RemoveHeadList(&OpsToFree);
+        Operation = CONTAINING_RECORD(Entry, INJ_OPERATION, ChainEntry);
         InitializeListHead(&Operation->ChainEntry);
 
-        //
-        // Remove from hash table and free
-        //
         InjpRemoveOperation(Detector, Operation);
         InjpFreeOperation(Detector, Operation);
     }
@@ -1880,19 +1908,26 @@ InjpFreeChain(
     ExFreeToNPagedLookasideList(&Detector->ChainLookaside, Chain);
 }
 
-static PINJ_CHAIN
-InjpFindOrCreateChain(
+//
+// I-3 FIX: Atomic find-or-create + add-to-chain.
+// ChainLock is held from search through insertion, eliminating the
+// use-after-free race where a chain could be freed between find and add.
+//
+static NTSTATUS
+InjpCorrelateOperationWithChain(
     _In_ PINJ_DETECTOR_INTERNAL Detector,
     _In_ HANDLE SourceProcessId,
-    _In_ HANDLE TargetProcessId
+    _In_ HANDLE TargetProcessId,
+    _In_ PINJ_OPERATION Operation
     )
 {
     PLIST_ENTRY Entry;
-    PINJ_CHAIN Chain;
+    PINJ_CHAIN Chain = NULL;
     PINJ_CHAIN StaleChain = NULL;
     KIRQL OldIrql;
     LARGE_INTEGER CurrentTime;
     LARGE_INTEGER TimeoutInterval;
+    BOOLEAN ChainCreated = FALSE;
 
     KeQuerySystemTime(&CurrentTime);
     TimeoutInterval.QuadPart = (LONGLONG)Detector->Public.Config.ChainTimeoutMs * 10000;
@@ -1906,112 +1941,95 @@ InjpFindOrCreateChain(
          Entry != &Detector->ActiveChains;
          Entry = Entry->Flink) {
 
-        Chain = CONTAINING_RECORD(Entry, INJ_CHAIN, ListEntry);
+        PINJ_CHAIN Candidate = CONTAINING_RECORD(Entry, INJ_CHAIN, ListEntry);
 
-        if (Chain->SourceProcessId == SourceProcessId &&
-            Chain->TargetProcessId == TargetProcessId) {
+        if (Candidate->SourceProcessId == SourceProcessId &&
+            Candidate->TargetProcessId == TargetProcessId) {
 
             //
             // Check if chain is still active (within timeout window)
             //
-            if ((CurrentTime.QuadPart - Chain->LastOperationTime.QuadPart) <= TimeoutInterval.QuadPart) {
-                KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
-                return Chain;
+            if ((CurrentTime.QuadPart - Candidate->LastOperationTime.QuadPart) <= TimeoutInterval.QuadPart) {
+                Chain = Candidate;
+                break;
             }
 
             //
-            // Chain has timed out - remove from list, free AFTER creating new one
-            // to avoid releasing lock in the middle (C-1 TOCTOU fix)
+            // Chain has timed out — remove from list, will free after lock release
             //
-            RemoveEntryList(&Chain->ListEntry);
+            RemoveEntryList(&Candidate->ListEntry);
             InterlockedDecrement(&Detector->ActiveChainCount);
-            StaleChain = Chain;
+            StaleChain = Candidate;
             break;
         }
     }
 
     //
-    // Create new chain (still under ChainLock — prevents duplicate creation race)
+    // Create new chain if needed (still under ChainLock — prevents duplicate creation race)
     //
-    Chain = InjpAllocateChain(Detector);
     if (Chain == NULL) {
-        //
-        // If we removed a stale chain, put it back — we can't replace it
-        //
-        if (StaleChain != NULL) {
-            InsertTailList(&Detector->ActiveChains, &StaleChain->ListEntry);
-            InterlockedIncrement(&Detector->ActiveChainCount);
+        Chain = InjpAllocateChain(Detector);
+        if (Chain == NULL) {
+            //
+            // Allocation failed — restore stale chain if we removed one
+            //
+            if (StaleChain != NULL) {
+                InsertTailList(&Detector->ActiveChains, &StaleChain->ListEntry);
+                InterlockedIncrement(&Detector->ActiveChainCount);
+                StaleChain = NULL;
+            }
+            KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
+            return STATUS_INSUFFICIENT_RESOURCES;
         }
-        KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
-        return NULL;
+
+        Chain->SourceProcessId = SourceProcessId;
+        Chain->TargetProcessId = TargetProcessId;
+        Chain->FirstOperationTime = CurrentTime;
+        Chain->LastOperationTime = CurrentTime;
+
+        InsertTailList(&Detector->ActiveChains, &Chain->ListEntry);
+        InterlockedIncrement(&Detector->ActiveChainCount);
+        ChainCreated = TRUE;
     }
 
-    Chain->SourceProcessId = SourceProcessId;
-    Chain->TargetProcessId = TargetProcessId;
-    Chain->FirstOperationTime = CurrentTime;
-    Chain->LastOperationTime = CurrentTime;
+    //
+    // Add operation to chain — still holding ChainLock (atomically safe)
+    //
+    if (Chain->OperationCount < Detector->Public.Config.MaxOperationsPerChain) {
+        InsertTailList(&Chain->OperationList, &Operation->ChainEntry);
+        Chain->OperationCount++;
+        Chain->TotalSize += Operation->Size;
+        Chain->LastOperationTime = Operation->Timestamp;
 
-    InsertTailList(&Detector->ActiveChains, &Chain->ListEntry);
-    InterlockedIncrement(&Detector->ActiveChainCount);
+        if (InjpIsExecutableProtection(Operation->Protection)) {
+            Chain->Flags |= INJ_CHAIN_FLAG_HAS_EXECUTE;
+        }
+
+        if (InjpIsWritableProtection(Operation->Protection)) {
+            Chain->Flags |= INJ_CHAIN_FLAG_HAS_WRITE;
+        }
+
+        if (Operation->Type == InjOpCreateThread) {
+            Chain->Flags |= INJ_CHAIN_FLAG_HAS_THREAD;
+        }
+
+        if (Operation->Type == InjOpQueueApc) {
+            Chain->Flags |= INJ_CHAIN_FLAG_HAS_APC;
+        }
+    }
 
     KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
 
     //
-    // Free the stale chain outside the lock
+    // Free stale chain outside the lock
     //
     if (StaleChain != NULL) {
         InjpFreeChain(Detector, StaleChain);
     }
 
-    InterlockedIncrement64(&Detector->Public.Stats.ChainsCreated);
-
-    return Chain;
-}
-
-static NTSTATUS
-InjpAddOperationToChain(
-    _In_ PINJ_DETECTOR_INTERNAL Detector,
-    _In_ PINJ_CHAIN Chain,
-    _In_ PINJ_OPERATION Operation
-    )
-{
-    KIRQL OldIrql;
-
-    KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
-
-    //
-    // Check under lock to prevent race (H-1 fix)
-    //
-    if (Chain->OperationCount >= Detector->Public.Config.MaxOperationsPerChain) {
-        KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
-        return STATUS_QUOTA_EXCEEDED;
+    if (ChainCreated) {
+        InterlockedIncrement64(&Detector->Public.Stats.ChainsCreated);
     }
-
-    InsertTailList(&Chain->OperationList, &Operation->ChainEntry);
-    Chain->OperationCount++;
-    Chain->TotalSize += Operation->Size;
-    Chain->LastOperationTime = Operation->Timestamp;
-
-    //
-    // Update chain flags based on operation
-    //
-    if (InjpIsExecutableProtection(Operation->Protection)) {
-        Chain->Flags |= INJ_CHAIN_FLAG_HAS_EXECUTE;
-    }
-
-    if (InjpIsWritableProtection(Operation->Protection)) {
-        Chain->Flags |= INJ_CHAIN_FLAG_HAS_WRITE;
-    }
-
-    if (Operation->Type == InjOpCreateThread) {
-        Chain->Flags |= INJ_CHAIN_FLAG_HAS_THREAD;
-    }
-
-    if (Operation->Type == InjOpQueueApc) {
-        Chain->Flags |= INJ_CHAIN_FLAG_HAS_APC;
-    }
-
-    KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
 
     return STATUS_SUCCESS;
 }
@@ -2062,7 +2080,17 @@ InjpCalculateOperationPatterns(
     ULONG Patterns = 0;
     PLIST_ENTRY Entry;
     PINJ_OPERATION Op;
-    PINJ_OPERATION PrevOp = NULL;
+
+    //
+    // I-6 FIX: Track operation types cumulatively instead of requiring strict
+    // adjacency. Real attack chains often interleave operations (e.g., an
+    // attacker may allocate, then query, then write). The old PrevOp check
+    // only detected Allocate→Write when they were consecutive, missing most
+    // real-world injection patterns.
+    //
+    BOOLEAN HasAllocate = FALSE;
+    BOOLEAN HasWrite = FALSE;
+    BOOLEAN HasProtect = FALSE;
 
     for (Entry = Chain->OperationList.Flink;
          Entry != &Chain->OperationList;
@@ -2072,21 +2100,19 @@ InjpCalculateOperationPatterns(
 
         switch (Op->Type) {
         case InjOpAllocate:
-            //
-            // M-5 FIX: Don't set ALLOCATE_WRITE on Allocate alone.
-            // Only set it when we see Allocate followed by Write.
-            // Just record that we saw an Allocate for the next iteration.
-            //
+            HasAllocate = TRUE;
             break;
 
         case InjOpWrite:
-            if (PrevOp != NULL && PrevOp->Type == InjOpAllocate) {
+            HasWrite = TRUE;
+            if (HasAllocate) {
                 Patterns |= INJ_PATTERN_ALLOCATE_WRITE;
             }
             break;
 
         case InjOpProtect:
-            if (PrevOp != NULL && PrevOp->Type == InjOpWrite) {
+            HasProtect = TRUE;
+            if (HasWrite) {
                 Patterns |= INJ_PATTERN_WRITE_PROTECT;
             }
             if (InjpIsExecutableProtection(Op->Protection)) {
@@ -2118,9 +2144,9 @@ InjpCalculateOperationPatterns(
         default:
             break;
         }
-
-        PrevOp = Op;
     }
+
+    UNREFERENCED_PARAMETER(HasProtect);
 
     return Patterns;
 }
@@ -2467,6 +2493,15 @@ InjpNotifyDetectionCallbacks(
     KeReleaseSpinLock(&Detector->CallbackLock, OldIrql);
 
     //
+    // I-9 FIX: Callbacks are documented as PASSIVE_LEVEL. If the caller
+    // is at DISPATCH_LEVEL (e.g., from InjAnalyzeChain), skip invocation.
+    // The worker thread will pick up detections asynchronously.
+    //
+    if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
+        return;
+    }
+
+    //
     // Invoke callbacks outside lock — caller must ensure PASSIVE_LEVEL
     //
     for (i = 0; i < Count; i++) {
@@ -2507,6 +2542,15 @@ InjpShouldBlockInjection(
     //
     if (Operation->SuspicionScore < (ULONG)Detector->Public.Config.MinConfidenceToBlock) {
         return FALSE;
+    }
+
+    //
+    // I-9 FIX: Block callbacks are documented as PASSIVE_LEVEL.
+    // If we're above PASSIVE_LEVEL, return the default decision based on
+    // the score alone (don't invoke callbacks that may not be IRQL-safe).
+    //
+    if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
+        return (Operation->SuspicionScore >= (ULONG)Detector->Public.Config.MinConfidenceToBlock);
     }
 
     //
@@ -2594,7 +2638,6 @@ InjpWorkerThread(
             // We use a local list of chain snapshots to avoid stale pointer access.
             //
             if (Detector->Public.Initialized && !Detector->ShutdownRequested) {
-                PLIST_ENTRY SafeEntry, SafeNext;
 
                 KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
 

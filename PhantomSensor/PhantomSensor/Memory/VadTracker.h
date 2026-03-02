@@ -37,6 +37,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 #include "../../Shared/MemoryTypes.h"
 
@@ -99,7 +100,7 @@ typedef enum _VAD_SUSPICION {
     VadSuspicion_SuspiciousBase     = 0x00000080,   // Unusual base address
     VadSuspicion_OverlapWithImage   = 0x00000100,   // Overlaps loaded image
     VadSuspicion_ShellcodePattern   = 0x00000200,   // Contains shellcode
-} VAD_SUSPICION;
+} VAD_SUSPICION, *PVAD_SUSPICION;
 
 //=============================================================================
 // VAD Region Entry
