@@ -91,6 +91,62 @@ ZwWriteVirtualMemory(
 #define SC_MAX_USER_ADDRESS             0x7FFFFFFFFFFFULL
 #define SC_MIN_USER_ADDRESS             0x10000ULL
 
+//
+// Known-good caller cache TTL in seconds.
+// Conservative: prevents stale entries from masking newly-injected code.
+//
+#define SC_CALLER_CACHE_TTL_SECONDS     30
+
+//
+// Minimum syscalls before process suspicion ratio is applied.
+//
+#define SC_SUSPICION_MIN_SYSCALLS       100
+#define SC_SUSPICION_RATIO_MODERATE     5   // >5% suspicious → 1.5x amplification
+#define SC_SUSPICION_RATIO_HIGH         15  // >15% suspicious → 2.0x amplification
+
+//
+// Risk level score multipliers (indexed by SST_RISK_LEVEL 0..4).
+// Higher-risk syscalls amplify detection scores multiplicatively.
+// Denominator is 100 (i.e., 150 = 1.5x).
+//
+static const UINT32 s_RiskMultiplierNum[] = { 100, 100, 150, 200, 300 };
+#define SC_RISK_MULTIPLIER_DEN          100
+
+//
+// Allowlist of Nt* functions eligible for restoration via
+// ScMonitorRestoreNtdllFunction. Only commonly-hooked security-critical
+// APIs are listed. Functions NOT on this list are rejected to prevent
+// abuse of the restoration API for arbitrary NTDLL code corruption.
+//
+static const PCSTR s_RestorableNtFunctions[] = {
+    "NtAllocateVirtualMemory",
+    "NtProtectVirtualMemory",
+    "NtWriteVirtualMemory",
+    "NtReadVirtualMemory",
+    "NtMapViewOfSection",
+    "NtUnmapViewOfSection",
+    "NtCreateThread",
+    "NtCreateThreadEx",
+    "NtResumeThread",
+    "NtSuspendThread",
+    "NtQueueApcThread",
+    "NtQueueApcThreadEx",
+    "NtSetContextThread",
+    "NtOpenProcess",
+    "NtDuplicateObject",
+    "NtSetInformationProcess",
+    "NtCreateFile",
+    "NtWriteFile",
+    "NtDeviceIoControlFile",
+    "NtCreateSection",
+    "NtOpenSection",
+    "NtCreateUserProcess",
+    "NtLoadDriver",
+    NULL
+};
+
+static LARGE_INTEGER g_ScQpcFrequency = { 0 };
+
 // ============================================================================
 // Module-Scoped Init Flags (for rollback on partial init)
 // ============================================================================
@@ -127,10 +183,30 @@ static VOID ScpAddSuspiciousCaller(_Inout_ PSC_PROCESS_CONTEXT Context, _In_ UIN
 
 static VOID ScpEmitEvasionEvent(
     _In_ UINT32 ProcessId,
+    _In_ UINT32 ThreadId,
     _In_ UINT32 SyscallNumber,
+    _In_ UINT64 ReturnAddress,
     _In_ UINT32 DetectionFlags,
     _In_ UINT32 ThreatScore,
-    _In_ BOOLEAN ShouldBlock
+    _In_ BOOLEAN ShouldBlock,
+    _In_opt_ PSYSCALL_CALL_CONTEXT AnalysisContext
+    );
+
+static BOOLEAN ScpCheckKnownGoodCaller(
+    _In_ UINT64 CallerAddress,
+    _In_ UINT64 CurrentQpc
+    );
+
+static VOID ScpCacheKnownGoodCaller(
+    _In_ UINT64 CallerAddress,
+    _In_ UINT64 ModuleBase,
+    _In_ UINT64 ModuleSize,
+    _In_opt_ PCWSTR ModuleName,
+    _In_ UINT64 CurrentQpc
+    );
+
+static BOOLEAN ScpIsFunctionRestorable(
+    _In_z_ PCSTR FunctionName
     );
 
 static VOID ScpCleanupByFlags(_In_ ULONG InitFlags);
@@ -193,6 +269,12 @@ ScMonitorInitialize(VOID)
     g_ScState.Magic = SC_MAGIC;
     g_ScState.ReferenceCount = 1;
     KeInitializeEvent(&g_ScState.ShutdownEvent, NotificationEvent, FALSE);
+
+    //
+    // Capture QPC frequency for known-good caller cache TTL.
+    // Stable for the lifetime of the system.
+    //
+    (VOID)KeQueryPerformanceCounter(&g_ScQpcFrequency);
 
     InitializeListHead(&g_ScState.ProcessContextList);
     ExInitializePushLock(&g_ScState.ProcessLock);
@@ -763,6 +845,217 @@ ScpAddSuspiciousCaller(
 
 
 // ============================================================================
+// Known-Good Caller Cache (TTL + LRU Eviction)
+// ============================================================================
+
+/*++
+    Check if a caller address is in the known-good cache and not expired.
+    Must hold CallerCacheLock SHARED.
+--*/
+static
+BOOLEAN
+ScpCheckKnownGoodCallerLocked(
+    _In_ UINT64 CallerAddress,
+    _In_ UINT64 CurrentQpc
+    )
+{
+    PLIST_ENTRY entry;
+    UINT64 ttlTicks;
+
+    if (g_ScQpcFrequency.QuadPart == 0) {
+        return FALSE;
+    }
+
+    ttlTicks = (UINT64)g_ScQpcFrequency.QuadPart * SC_CALLER_CACHE_TTL_SECONDS;
+
+    for (entry = g_ScState.KnownGoodCallers.Flink;
+         entry != &g_ScState.KnownGoodCallers;
+         entry = entry->Flink) {
+
+        PSC_KNOWN_GOOD_CALLER caller =
+            CONTAINING_RECORD(entry, SC_KNOWN_GOOD_CALLER, ListEntry);
+
+        if (caller->CallerAddress == CallerAddress) {
+            //
+            // TTL check: reject stale entries.
+            // Stale entries are NOT removed here (shared lock).
+            // They will be evicted on the next insert (exclusive lock).
+            //
+            if (CurrentQpc - caller->AddedTimestamp < ttlTicks) {
+                return TRUE;
+            }
+            return FALSE;
+        }
+    }
+
+    return FALSE;
+}
+
+
+static
+BOOLEAN
+ScpCheckKnownGoodCaller(
+    _In_ UINT64 CallerAddress,
+    _In_ UINT64 CurrentQpc
+    )
+{
+    BOOLEAN found;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_ScState.CallerCacheLock);
+    found = ScpCheckKnownGoodCallerLocked(CallerAddress, CurrentQpc);
+    ExReleasePushLockShared(&g_ScState.CallerCacheLock);
+    KeLeaveCriticalRegion();
+
+    return found;
+}
+
+
+/*++
+    Evict expired cache entries. Must hold CallerCacheLock EXCLUSIVE.
+--*/
+static
+VOID
+ScpEvictStaleCacheEntriesLocked(
+    _In_ UINT64 CurrentQpc
+    )
+{
+    PLIST_ENTRY entry;
+    PLIST_ENTRY next;
+    UINT64 ttlTicks;
+
+    if (g_ScQpcFrequency.QuadPart == 0) {
+        return;
+    }
+
+    ttlTicks = (UINT64)g_ScQpcFrequency.QuadPart * SC_CALLER_CACHE_TTL_SECONDS;
+
+    for (entry = g_ScState.KnownGoodCallers.Flink;
+         entry != &g_ScState.KnownGoodCallers;
+         entry = next) {
+
+        next = entry->Flink;
+        PSC_KNOWN_GOOD_CALLER caller =
+            CONTAINING_RECORD(entry, SC_KNOWN_GOOD_CALLER, ListEntry);
+
+        if (CurrentQpc - caller->AddedTimestamp >= ttlTicks) {
+            RemoveEntryList(entry);
+            InterlockedDecrement(&g_ScState.KnownGoodCallerCount);
+            ShadowStrikeFreePoolWithTag(caller, SC_POOL_TAG_CACHE);
+        }
+    }
+}
+
+
+/*++
+    Add a verified-clean caller to the known-good cache.
+    Handles TTL eviction and LRU overflow eviction.
+--*/
+static
+VOID
+ScpCacheKnownGoodCaller(
+    _In_ UINT64 CallerAddress,
+    _In_ UINT64 ModuleBase,
+    _In_ UINT64 ModuleSize,
+    _In_opt_ PCWSTR ModuleName,
+    _In_ UINT64 CurrentQpc
+    )
+{
+    PSC_KNOWN_GOOD_CALLER newEntry;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ScState.CallerCacheLock);
+
+    //
+    // Race check: another thread may have cached this address
+    //
+    if (ScpCheckKnownGoodCallerLocked(CallerAddress, CurrentQpc)) {
+        ExReleasePushLockExclusive(&g_ScState.CallerCacheLock);
+        KeLeaveCriticalRegion();
+        return;
+    }
+
+    //
+    // Evict stale entries to make room
+    //
+    ScpEvictStaleCacheEntriesLocked(CurrentQpc);
+
+    //
+    // If still at capacity, evict the oldest entry (list head = LRU)
+    //
+    while (g_ScState.KnownGoodCallerCount >= (LONG)SC_MAX_KNOWN_GOOD_CALLERS &&
+           !IsListEmpty(&g_ScState.KnownGoodCallers)) {
+
+        PLIST_ENTRY oldest = RemoveHeadList(&g_ScState.KnownGoodCallers);
+        PSC_KNOWN_GOOD_CALLER evicted =
+            CONTAINING_RECORD(oldest, SC_KNOWN_GOOD_CALLER, ListEntry);
+        InterlockedDecrement(&g_ScState.KnownGoodCallerCount);
+        ShadowStrikeFreePoolWithTag(evicted, SC_POOL_TAG_CACHE);
+    }
+
+    //
+    // Allocate and insert at tail (newest)
+    //
+    newEntry = (PSC_KNOWN_GOOD_CALLER)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(SC_KNOWN_GOOD_CALLER),
+        SC_POOL_TAG_CACHE
+        );
+
+    if (newEntry != NULL) {
+        RtlZeroMemory(newEntry, sizeof(SC_KNOWN_GOOD_CALLER));
+        newEntry->CallerAddress = CallerAddress;
+        newEntry->ModuleBase = ModuleBase;
+        newEntry->ModuleSize = ModuleSize;
+        newEntry->AddedTimestamp = CurrentQpc;
+
+        if (ModuleName != NULL) {
+            (VOID)RtlStringCchCopyW(
+                newEntry->ModuleName,
+                RTL_NUMBER_OF(newEntry->ModuleName),
+                ModuleName
+                );
+        }
+
+        InsertTailList(&g_ScState.KnownGoodCallers, &newEntry->ListEntry);
+        InterlockedIncrement(&g_ScState.KnownGoodCallerCount);
+    }
+
+    ExReleasePushLockExclusive(&g_ScState.CallerCacheLock);
+    KeLeaveCriticalRegion();
+}
+
+
+/*++
+    Validate a function name against the restoration allowlist.
+--*/
+static
+BOOLEAN
+ScpIsFunctionRestorable(
+    _In_z_ PCSTR FunctionName
+    )
+{
+    ULONG i;
+
+    for (i = 0; s_RestorableNtFunctions[i] != NULL; i++) {
+        PCSTR a = s_RestorableNtFunctions[i];
+        PCSTR b = FunctionName;
+
+        while (*a != '\0' && *b != '\0' && *a == *b) {
+            a++;
+            b++;
+        }
+
+        if (*a == '\0' && *b == '\0') {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+
+// ============================================================================
 // Public Process Context API
 // ============================================================================
 
@@ -936,8 +1229,11 @@ Return Value:
     PCSA_CALLSTACK csaCallstack = NULL;
     CSA_ANOMALY csaAnomalies = CsaAnomaly_None;
     ULONG csaScore = 0;
+    UINT64 currentQpc = 0;
 
     PAGED_CODE();
+
+    currentQpc = (UINT64)KeQueryPerformanceCounter(NULL).QuadPart;
 
     //
     // Initialize output
@@ -948,7 +1244,7 @@ Return Value:
         Context->ProcessId = ProcessId;
         Context->ThreadId = ThreadId;
         Context->ReturnAddress = ReturnAddress;
-        Context->Timestamp = (UINT64)KeQueryPerformanceCounter(NULL).QuadPart;
+        Context->Timestamp = currentQpc;
 
         if (Arguments != NULL && ArgumentCount > 0) {
             UINT32 count = min(ArgumentCount, 8);
@@ -989,6 +1285,28 @@ Return Value:
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
             "[ShadowStrike-SC] PID %u context failed: 0x%08X\n",
             ProcessId, status);
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Known-good caller fast-path.
+    // If this return address was recently verified as clean, skip expensive
+    // sub-module delegation. Entries expire after SC_CALLER_CACHE_TTL_SECONDS
+    // and are re-verified through the full detection pipeline.
+    //
+    if (ScpCheckKnownGoodCaller(ReturnAddress, currentQpc)) {
+        InterlockedIncrement64(&procCtx->TotalSyscalls);
+        InterlockedIncrement64(&g_ScState.TotalSyscallsMonitored);
+
+        if (Context != NULL) {
+            Context->IsFromNtdll = TRUE;
+            Context->IsFromKnownModule = TRUE;
+            Context->ThreatScore = 0;
+            Context->DetectionFlags = 0;
+        }
+
+        ScMonitorReleaseProcessContext(procCtx);
+        ScpReleaseReference();
         return STATUS_SUCCESS;
     }
 
@@ -1258,7 +1576,40 @@ Return Value:
     }
 
     //
-    // Step 8: Composite threat assessment
+    // Step 8: Risk-weighted score amplification.
+    // Critical/high-risk syscalls amplify all detection scores because
+    // direct/unbacked calls to NtWriteVirtualMemory or NtCreateThreadEx
+    // are categorically more dangerous than NtQueryInformationFile.
+    //
+    if (threatScore > 0 && NT_SUCCESS(status)) {
+        UINT32 riskIdx = (UINT32)syscallInfo.RiskLevel;
+        if (riskIdx < RTL_NUMBER_OF(s_RiskMultiplierNum)) {
+            threatScore = (UINT32)(((UINT64)threatScore * s_RiskMultiplierNum[riskIdx])
+                          / SC_RISK_MULTIPLIER_DEN);
+        }
+    }
+
+    //
+    // Step 8a: Process history amplification.
+    // A process with a high ratio of suspicious-to-total syscalls is likely
+    // running shellcode or injected code. Amplify scoring to accelerate
+    // the block threshold for repeat offenders.
+    //
+    if (threatScore > 0 && procCtx->TotalSyscalls > SC_SUSPICION_MIN_SYSCALLS) {
+        LONG64 totalSc = procCtx->TotalSyscalls;
+        LONG64 suspSc = procCtx->SuspiciousSyscalls;
+        if (totalSc > 0) {
+            LONG64 ratioPercent = (suspSc * 100) / totalSc;
+            if (ratioPercent > SC_SUSPICION_RATIO_HIGH) {
+                threatScore = threatScore * 2;
+            } else if (ratioPercent > SC_SUSPICION_RATIO_MODERATE) {
+                threatScore = (threatScore * 3) / 2;
+            }
+        }
+    }
+
+    //
+    // Step 8b: Composite threat assessment
     //
     if (threatScore >= SC_SCORE_BLOCK_THRESHOLD) {
         shouldBlock = TRUE;
@@ -1268,8 +1619,8 @@ Return Value:
     // Step 9: Emit behavioral event if suspicious
     //
     if (detectFlags != 0 && threatScore >= SC_SCORE_ALERT_THRESHOLD) {
-        ScpEmitEvasionEvent(ProcessId, SyscallNumber,
-            detectFlags, threatScore, shouldBlock);
+        ScpEmitEvasionEvent(ProcessId, ThreadId, SyscallNumber,
+            ReturnAddress, detectFlags, threatScore, shouldBlock, Context);
     }
 
     //
@@ -1314,6 +1665,25 @@ Return Value:
         Context->ThreatScore = threatScore;
         Context->DetectionFlags = detectFlags;
         Context->IsSuspiciousRegion = (detectFlags & SC_DETECT_UNBACKED_CALLER) != 0;
+    }
+
+    //
+    // Cache verified-clean callers for fast-path on subsequent syscalls.
+    // Only callers with zero detections from known modules are eligible.
+    //
+    if (detectFlags == 0 && !g_ScState.ShuttingDown) {
+        UINT64 cModBase = 0;
+        UINT64 cModSize = 0;
+        PCWSTR cModName = NULL;
+
+        if (Context != NULL && Context->IsFromKnownModule) {
+            cModBase = Context->CallerModuleBase;
+            cModSize = Context->CallerModuleSize;
+            cModName = Context->CallerModuleName;
+        }
+
+        ScpCacheKnownGoodCaller(
+            ReturnAddress, cModBase, cModSize, cModName, currentQpc);
     }
 
     ScMonitorReleaseProcessContext(procCtx);
@@ -1719,6 +2089,31 @@ ScMonitorRestoreNtdllFunction(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Validate function name length (max 63 chars + NUL).
+    // Prevents buffer overread on untrusted input.
+    //
+    {
+        SIZE_T nameLen = 0;
+        NTSTATUS lenStatus = RtlStringCbLengthA(FunctionName, 64, &nameLen);
+        if (!NT_SUCCESS(lenStatus) || nameLen == 0) {
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+
+    //
+    // Security: Validate function name against allowlist.
+    // Only Nt* functions commonly hooked by malware are eligible for
+    // restoration. This prevents abuse of the restoration API to
+    // corrupt arbitrary NTDLL code sections.
+    //
+    if (!ScpIsFunctionRestorable(FunctionName)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike-SC] Restore REJECTED: function not in allowlist "
+            "(PID %u)\n", ProcessId);
+        return STATUS_ACCESS_DENIED;
+    }
+
     if (!g_ScState.Initialized || g_ScState.NtdllIntegrityMonitor == NULL) {
         return STATUS_DEVICE_NOT_READY;
     }
@@ -1941,15 +2336,39 @@ static
 VOID
 ScpEmitEvasionEvent(
     _In_ UINT32 ProcessId,
+    _In_ UINT32 ThreadId,
     _In_ UINT32 SyscallNumber,
+    _In_ UINT64 ReturnAddress,
     _In_ UINT32 DetectionFlags,
     _In_ UINT32 ThreatScore,
-    _In_ BOOLEAN ShouldBlock
+    _In_ BOOLEAN ShouldBlock,
+    _In_opt_ PSYSCALL_CALL_CONTEXT AnalysisContext
     )
+/*++
+    Emit a rich evasion event to the BehaviorEngine pipeline.
+
+    This is the kernel→user-space telemetry bridge. The full SYSCALL_CALL_CONTEXT
+    carries the complete feature vector for user-space ML inference:
+
+      - Caller module identification (name, base, size)
+      - Stack frame addresses (up to 16 frames)
+      - Syscall arguments (up to 8)
+      - Detection flags and composite threat score
+      - WoW64/NTDLL/known-module classification
+
+    The BehaviorEngine forwards this via CommPort to the user-space service for:
+      1. ONNX Runtime ML inference on the feature vector
+      2. Telemetry / forensic logging
+      3. Adaptive threshold tuning feedback
+--*/
 {
     BEHAVIOR_EVENT_TYPE eventType = BehaviorEvent_DirectSyscall;
     BEHAVIOR_RESPONSE_ACTION response = BehaviorResponse_Allow;
 
+    //
+    // Select the most specific event type for MITRE ATT&CK mapping.
+    // Priority: Heaven's Gate > NTDLL unhooking > Direct syscall.
+    //
     if (DetectionFlags & SC_DETECT_HEAVENS_GATE) {
         eventType = BehaviorEvent_HeavensGate;
     } else if (DetectionFlags & SC_DETECT_HOOK_BYPASS) {
@@ -1958,8 +2377,7 @@ ScpEmitEvasionEvent(
 
     //
     // Allocate event payload from the EventLookaside (not stack).
-    // SYSCALL_CALL_CONTEXT is ~800 bytes — too large for kernel stack,
-    // especially in a deep call chain (hook→analysis→sub-modules→emit).
+    // SYSCALL_CALL_CONTEXT is ~800 bytes — too large for kernel stack.
     //
     PSYSCALL_CALL_CONTEXT eventData = (PSYSCALL_CALL_CONTEXT)
         ExAllocateFromNPagedLookasideList(&g_ScState.EventLookaside);
@@ -1967,9 +2385,27 @@ ScpEmitEvasionEvent(
         return;
     }
 
-    RtlZeroMemory(eventData, sizeof(SYSCALL_CALL_CONTEXT));
-    eventData->SyscallNumber = SyscallNumber;
-    eventData->ProcessId = ProcessId;
+    //
+    // Populate with full analysis context if available.
+    // This carries the complete ML feature vector to user-space.
+    //
+    if (AnalysisContext != NULL) {
+        RtlCopyMemory(eventData, AnalysisContext, sizeof(SYSCALL_CALL_CONTEXT));
+    } else {
+        //
+        // Minimal fallback when caller didn't request full context
+        //
+        RtlZeroMemory(eventData, sizeof(SYSCALL_CALL_CONTEXT));
+        eventData->SyscallNumber = SyscallNumber;
+        eventData->ProcessId = ProcessId;
+        eventData->ThreadId = ThreadId;
+        eventData->ReturnAddress = ReturnAddress;
+    }
+
+    //
+    // Always overwrite with final values (scoring may have been amplified
+    // after the Context was initially populated)
+    //
     eventData->DetectionFlags = DetectionFlags;
     eventData->ThreatScore = ThreatScore;
 
@@ -1988,7 +2424,7 @@ ScpEmitEvasionEvent(
 
     if (response == BehaviorResponse_Terminate) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-            "[ShadowStrike-SC] BehaviorEngine requests termination for PID %u "
+            "[ShadowStrike-SC] BehaviorEngine terminate for PID %u "
             "(syscall=%u, flags=0x%X, score=%u)\n",
             ProcessId, SyscallNumber, DetectionFlags, ThreatScore);
     }
