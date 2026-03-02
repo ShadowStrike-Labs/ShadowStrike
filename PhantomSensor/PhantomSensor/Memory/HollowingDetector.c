@@ -265,18 +265,190 @@ typedef struct _PH_PE_CONTEXT {
 // ============================================================================
 
 //
-// C-5 fix: Declare ShadowStrikeGetProcessImageBase if not available
-// from ProcessUtils.h. This must be implemented elsewhere.
+// PsGetProcessPeb: exported by ntoskrnl.exe; not in any WDK public header.
+// Returns the user-mode PEB address for the given EPROCESS.
+// The returned pointer lives in the target process's address space —
+// the caller MUST attach (KeStackAttachProcess) before dereferencing.
 //
-#ifndef SHADOWSTRIKE_GET_PROCESS_IMAGE_BASE_DECLARED
-NTSTATUS
-ShadowStrikeGetProcessImageBase(
-    _In_ PEPROCESS Process,
-    _Out_ PVOID* ImageBase,
-    _Out_ PSIZE_T ImageSize
+#ifndef SHADOWSTRIKE_PS_GET_PROCESS_PEB_DECLARED
+NTKERNELAPI
+PPEB
+NTAPI
+PsGetProcessPeb(
+    _In_ PEPROCESS Process
     );
-#define SHADOWSTRIKE_GET_PROCESS_IMAGE_BASE_DECLARED
+#define SHADOWSTRIKE_PS_GET_PROCESS_PEB_DECLARED
 #endif
+
+//
+// PhpGetProcessImageBase
+//
+// Retrieves the loaded image base address and the PE SizeOfImage value
+// from the target process without requiring an open process handle.
+//
+// Technique:
+//   1. Obtain the user-mode PEB pointer via PsGetProcessPeb().
+//   2. Attach to the process address space with KeStackAttachProcess().
+//   3. Probe and read PEB.ImageBaseAddress (x64 offset 0x10).
+//   4. Probe and read the DOS header to locate the NT headers.
+//   5. Detect PE format (PE32 vs. PE32+) via OptionalHeader.Magic.
+//   6. Extract SizeOfImage from the appropriate optional header.
+//   7. Detach unconditionally — even if a probe or read faults.
+//
+// All user-mode memory accesses are performed inside a structured
+// exception handler so that a hostile or crashed process cannot induce
+// a kernel BSOD.
+//
+// Supports both native 64-bit (PE32+) and WoW64 (PE32) images.
+//
+_IRQL_requires_max_(APC_LEVEL)
+static NTSTATUS
+PhpGetProcessImageBase(
+    _In_  PEPROCESS Process,
+    _Out_ PVOID*    ImageBase,
+    _Out_ PSIZE_T   ImageSize
+    )
+{
+    NTSTATUS   status   = STATUS_SUCCESS;
+    KAPC_STATE apcState = { 0 };
+    PPEB       pebPtr;
+    PVOID      base     = NULL;
+    SIZE_T     size     = 0;
+    LONG       ntOffset = 0;
+
+    *ImageBase = NULL;
+    *ImageSize = 0;
+
+    ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
+
+    pebPtr = PsGetProcessPeb(Process);
+    if (pebPtr == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+
+    KeStackAttachProcess(Process, &apcState);
+
+    __try {
+        //
+        // Read ImageBaseAddress from the PEB.
+        // PH_PEB is our minimal partial struct that matches the x64 PEB
+        // layout at stable, well-documented offsets.
+        //
+        ProbeForRead(pebPtr, sizeof(PH_PEB), sizeof(ULONG_PTR));
+        base = ((PPH_PEB)pebPtr)->ImageBaseAddress;
+
+        if (base == NULL ||
+            (ULONG_PTR)base < 0x10000 ||
+            (ULONG_PTR)base >= (ULONG_PTR)MM_HIGHEST_USER_ADDRESS) {
+            status = STATUS_INVALID_ADDRESS;
+            __leave;
+        }
+
+        //
+        // Read the DOS header and validate the signature.
+        //
+        {
+            PIMAGE_DOS_HEADER dosHdr;
+
+            ProbeForRead(base, sizeof(IMAGE_DOS_HEADER), sizeof(USHORT));
+            dosHdr = (PIMAGE_DOS_HEADER)base;
+
+            if (dosHdr->e_magic != IMAGE_DOS_SIGNATURE) {
+                status = STATUS_INVALID_IMAGE_FORMAT;
+                __leave;
+            }
+
+            ntOffset = dosHdr->e_lfanew;
+        }
+
+        if (ntOffset <= 0 || (ULONG)ntOffset > PH_NT_HEADERS_OFFSET_MAX) {
+            status = STATUS_INVALID_IMAGE_FORMAT;
+            __leave;
+        }
+
+        //
+        // Probe 26 bytes to read Signature[0..3] + FileHeader[4..23] +
+        // OptionalHeader.Magic[24..25] — the minimum needed to determine
+        // PE format without over-probing a shorter PE32 header.
+        //
+        {
+            PUCHAR baseBytes = (PUCHAR)base;
+            ULONG  rawSig;
+            USHORT magic;
+            ULONG  sizeOfImage;
+
+            ProbeForRead(baseBytes + ntOffset, 26, sizeof(USHORT));
+
+            rawSig = *(PULONG)(baseBytes + ntOffset);
+            if (rawSig != IMAGE_NT_SIGNATURE) {
+                status = STATUS_INVALID_IMAGE_FORMAT;
+                __leave;
+            }
+
+            // OptionalHeader.Magic is 2 bytes at PE-offset 24.
+            magic = *(PUSHORT)(baseBytes + ntOffset + 24);
+
+            if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+                //
+                // PE32+ (native 64-bit image).
+                //
+                ProbeForRead(baseBytes + ntOffset,
+                             sizeof(IMAGE_NT_HEADERS64),
+                             sizeof(ULONG));
+                sizeOfImage =
+                    ((PIMAGE_NT_HEADERS64)(baseBytes + ntOffset))
+                        ->OptionalHeader.SizeOfImage;
+
+            } else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+                //
+                // PE32 (32-bit / WoW64 image).
+                //
+                ProbeForRead(baseBytes + ntOffset,
+                             sizeof(IMAGE_NT_HEADERS32),
+                             sizeof(ULONG));
+                sizeOfImage =
+                    ((PIMAGE_NT_HEADERS32)(baseBytes + ntOffset))
+                        ->OptionalHeader.SizeOfImage;
+
+            } else {
+                status = STATUS_INVALID_IMAGE_FORMAT;
+                __leave;
+            }
+
+            //
+            // Sanity-check SizeOfImage:
+            //   - Must be at least PH_MIN_IMAGE_SIZE bytes (no tiny stub images).
+            //   - Must not exceed 256 MiB (no legitimate PE exceeds this).
+            //   - Must be page-aligned (Windows loader enforces this).
+            //
+            size = (SIZE_T)sizeOfImage;
+
+            if (size < (SIZE_T)PH_MIN_IMAGE_SIZE     ||
+                size > (SIZE_T)(256UL * 1024UL * 1024UL) ||
+                (size & (PAGE_SIZE - 1)) != 0) {
+                status = STATUS_INVALID_IMAGE_FORMAT;
+                __leave;
+            }
+
+            *ImageBase = base;
+            *ImageSize = size;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        //
+        // Any access violation or other exception from hostile/crashed
+        // process memory is caught here — no kernel BSOD.
+        //
+        status     = GetExceptionCode();
+        *ImageBase = NULL;
+        *ImageSize = 0;
+    }
+
+    // Unconditional detach — __leave and normal exit both reach this point.
+    KeUnstackDetachProcess(&apcState);
+
+    return status;
+}
 
 static PPH_ANALYSIS_RESULT
 PhpAllocateResult(
@@ -1031,7 +1203,7 @@ PhCompareImageWithFile(
     //
     // Get image base from PEB
     //
-    status = ShadowStrikeGetProcessImageBase(process, &imageBase, &imageSize);
+    status = PhpGetProcessImageBase(process, &imageBase, &imageSize);
     if (!NT_SUCCESS(status) || imageBase == NULL) {
         status = STATUS_NOT_FOUND;
         goto Cleanup;
@@ -1603,7 +1775,7 @@ PhpAnalyzeImageComparison(
     //
     // Get image base from process
     //
-    status = ShadowStrikeGetProcessImageBase(Process, &imageBase, &imageSize);
+    status = PhpGetProcessImageBase(Process, &imageBase, &imageSize);
     if (!NT_SUCCESS(status) || imageBase == NULL) {
         return STATUS_NOT_FOUND;
     }
@@ -1666,7 +1838,7 @@ PhpAnalyzeEntryPoint(
     //
     // Get image base
     //
-    status = ShadowStrikeGetProcessImageBase(Process, &imageBase, &imageSize);
+    status = PhpGetProcessImageBase(Process, &imageBase, &imageSize);
     if (!NT_SUCCESS(status) || imageBase == NULL) {
         return STATUS_NOT_FOUND;
     }
