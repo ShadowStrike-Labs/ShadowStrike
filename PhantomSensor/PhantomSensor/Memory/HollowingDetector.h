@@ -37,6 +37,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 #include "../../Shared/MemoryTypes.h"
 
@@ -70,7 +71,7 @@ typedef enum _PH_HOLLOWING_TYPE {
     PhHollowing_Phantom,                // Phantom DLL hollowing
     PhHollowing_ModuleStomping,         // Module stomping
     PhHollowing_TransactionHollow,      // Transacted hollowing
-} PH_HOLLOWING_TYPE;
+} PH_HOLLOWING_TYPE, *PPH_HOLLOWING_TYPE;
 
 //=============================================================================
 // Detection Indicators
