@@ -45,7 +45,84 @@
 #include "ROPDetector.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/ProcessUtils.h"
-#include "../Utilities/HashUtils.h"
+#include <ntimage.h>
+
+// ============================================================================
+// KERNEL-MODE TYPE DEFINITIONS
+// ============================================================================
+//
+// PE image types (IMAGE_DOS_HEADER, IMAGE_NT_HEADERS, IMAGE_SECTION_HEADER)
+// come from ntimage.h above. The following are kernel-mode PEB/TEB/LDR
+// definitions that are not fully exposed in WDK public headers.
+//
+
+//
+// PEB subset for module enumeration during stack analysis.
+// Only the fields we actually access are defined at their correct offsets.
+//
+typedef struct _ROP_PEB {
+    BOOLEAN         InheritedAddressSpace;      // 0x00
+    BOOLEAN         ReadImageFileExecOptions;   // 0x01
+    BOOLEAN         BeingDebugged;              // 0x02
+    BOOLEAN         BitField;                   // 0x03
+    UCHAR           Padding0[4];                // 0x04
+    HANDLE          Mutant;                     // 0x08
+    PVOID           ImageBaseAddress;            // 0x10
+    PVOID           Ldr;                         // 0x18  (-> ROP_PEB_LDR_DATA)
+} ROP_PEB, *PROP_PEB_KM;
+
+//
+// PEB_LDR_DATA subset.
+//
+typedef struct _ROP_PEB_LDR_DATA {
+    ULONG           Length;
+    BOOLEAN         Initialized;
+    PVOID           SsHandle;
+    LIST_ENTRY      InLoadOrderModuleList;
+    LIST_ENTRY      InMemoryOrderModuleList;
+    LIST_ENTRY      InInitializationOrderModuleList;
+} ROP_PEB_LDR_DATA, *PROP_PEB_LDR_DATA_KM;
+
+//
+// LDR_DATA_TABLE_ENTRY subset (InMemoryOrderLinks variant).
+//
+typedef struct _ROP_LDR_DATA_TABLE_ENTRY {
+    LIST_ENTRY      InLoadOrderLinks;
+    LIST_ENTRY      InMemoryOrderLinks;
+    LIST_ENTRY      InInitializationOrderLinks;
+    PVOID           DllBase;
+    PVOID           EntryPoint;
+    ULONG           SizeOfImage;
+    UNICODE_STRING  FullDllName;
+    UNICODE_STRING  BaseDllName;
+} ROP_LDR_DATA_TABLE_ENTRY, *PROP_LDR_DATA_TABLE_ENTRY_KM;
+
+//
+// TEB subset — only NtTib (first field) is needed for stack bounds.
+//
+typedef struct _ROP_TEB {
+    NT_TIB          NtTib;
+} ROP_TEB, *PROP_TEB_KM;
+
+//
+// PsGetProcessPeb: exported by ntoskrnl.exe; not in WDK public headers.
+//
+NTKERNELAPI
+PPEB
+NTAPI
+PsGetProcessPeb(
+    _In_ PEPROCESS Process
+    );
+
+//
+// PsGetThreadTeb: exported by ntoskrnl.exe; not in WDK public headers.
+//
+NTKERNELAPI
+PVOID
+NTAPI
+PsGetThreadTeb(
+    _In_ PETHREAD Thread
+    );
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, RopInitialize)
@@ -412,8 +489,8 @@ static
 BOOLEAN
 RoppDetectStackPivot(
     _In_ PROP_ANALYSIS_CONTEXT Context,
-    _Out_ PPVOID PivotSource,
-    _Out_ PPVOID PivotDestination
+    _Out_ PVOID* PivotSource,
+    _Out_ PVOID* PivotDestination
     );
 
 static
@@ -671,6 +748,7 @@ Arguments:
     while (!IsListEmpty(&Detector->GadgetList)) {
         entry = RemoveHeadList(&Detector->GadgetList);
         gadget = CONTAINING_RECORD(entry, ROP_GADGET, ListEntry);
+        RemoveEntryList(&gadget->HashEntry);
         RoppFreeGadget(internalDetector, gadget);
     }
 
@@ -962,11 +1040,16 @@ Routine Description:
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (!RoppAcquireRundown(Detector)) {
+        return STATUS_DELETE_PENDING;
+    }
+
     //
     // Allocate gadget from lookaside
     //
     status = RoppAllocateGadget(internalDetector, &gadget);
     if (!NT_SUCCESS(status)) {
+        RoppReleaseRundown(Detector);
         return status;
     }
 
@@ -1002,6 +1085,7 @@ Routine Description:
     ExReleasePushLockExclusive(&Detector->GadgetLock);
     KeLeaveCriticalRegion();
 
+    RoppReleaseRundown(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -1399,7 +1483,8 @@ Routine Description:
 
     PAGED_CODE();
 
-    if (RoppValidateDetector(Detector) == NULL || IsValid == NULL) {
+    if (RoppValidateDetector(Detector) == NULL ||
+        IsValid == NULL || ProcessId == NULL || ThreadId == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -2108,6 +2193,7 @@ Routine Description:
     ULONG i;
     UCHAR opcode;
     UCHAR modrm;
+    BOOLEAN hasRexW;
 
     if (Gadget == NULL || Gadget->Size == 0) {
         return;
@@ -2118,6 +2204,17 @@ Routine Description:
 
     for (i = 0; i < size; i++) {
         opcode = bytes[i];
+        hasRexW = FALSE;
+
+        //
+        // Detect REX prefix (0x40-0x4F). REX.W is bit 3 set (0x48-0x4F).
+        // Consume the prefix and adjust the opcode pointer.
+        //
+        if (opcode >= 0x40 && opcode <= 0x4F && (i + 1 < size)) {
+            hasRexW = (opcode & 0x08) != 0;
+            i++;
+            opcode = bytes[i];
+        }
 
         //
         // PUSH r64 (0x50-0x57): reads source register, modifies RSP
@@ -2145,6 +2242,23 @@ Routine Description:
                     Gadget->Semantics.WritesMemory = TRUE;
                 } else {
                     Gadget->Semantics.ReadsMemory = TRUE;
+                }
+            } else {
+                //
+                // Register-to-register MOV. Check if RSP is the destination.
+                // MOV RSP, R** = 0x89 with mod=3 and rm=4 (ESP/RSP)
+                // MOV R**, RSP = 0x8B with mod=3 and reg=4 (ESP/RSP)
+                //
+                UCHAR rm = modrm & MODRM_RM_MASK;
+                UCHAR reg = (modrm & MODRM_REG_MASK) >> MODRM_REG_SHIFT;
+
+                if (opcode == 0x89 && rm == 4) {
+                    // MOV ESP/RSP, reg — stack pivot
+                    Gadget->Semantics.ModifiesStack = TRUE;
+                    Gadget->Semantics.RegistersModified |= REG_RSP;
+                } else if (opcode == 0x8B && reg == 4) {
+                    // MOV reg, ESP/RSP — reading stack pointer
+                    Gadget->Semantics.RegistersRead |= REG_RSP;
                 }
             }
             i++;  // skip ModR/M
@@ -2240,19 +2354,36 @@ RoppInitializeDangerousPatterns(
 {
     ULONG idx = 0;
 
-    // XCHG EAX, ESP / XCHG RAX, RSP — stack pivot
+    // XCHG EAX, ESP / XCHG RAX, RSP — stack pivot (32-bit operand)
     Detector->DangerousPatterns[idx].Pattern[0] = 0x94;
     Detector->DangerousPatterns[idx].PatternSize = 1;
     Detector->DangerousPatterns[idx].DangerScore = 50;
-    Detector->DangerousPatterns[idx].Description = "Stack pivot XCHG";
+    Detector->DangerousPatterns[idx].Description = "Stack pivot XCHG (32-bit)";
     idx++;
 
-    // MOV ESP, EAX / MOV RSP, RAX — stack pivot
+    // REX.W XCHG RAX, RSP — stack pivot (64-bit operand, full width)
+    Detector->DangerousPatterns[idx].Pattern[0] = 0x48;
+    Detector->DangerousPatterns[idx].Pattern[1] = 0x94;
+    Detector->DangerousPatterns[idx].PatternSize = 2;
+    Detector->DangerousPatterns[idx].DangerScore = 50;
+    Detector->DangerousPatterns[idx].Description = "Stack pivot XCHG RAX,RSP (REX.W)";
+    idx++;
+
+    // MOV ESP, EAX — stack pivot (32-bit operand)
     Detector->DangerousPatterns[idx].Pattern[0] = 0x89;
     Detector->DangerousPatterns[idx].Pattern[1] = 0xC4;
     Detector->DangerousPatterns[idx].PatternSize = 2;
     Detector->DangerousPatterns[idx].DangerScore = 50;
-    Detector->DangerousPatterns[idx].Description = "Stack pivot MOV";
+    Detector->DangerousPatterns[idx].Description = "Stack pivot MOV ESP,EAX";
+    idx++;
+
+    // REX.W MOV RSP, RAX — stack pivot (64-bit operand)
+    Detector->DangerousPatterns[idx].Pattern[0] = 0x48;
+    Detector->DangerousPatterns[idx].Pattern[1] = 0x89;
+    Detector->DangerousPatterns[idx].Pattern[2] = 0xC4;
+    Detector->DangerousPatterns[idx].PatternSize = 3;
+    Detector->DangerousPatterns[idx].DangerScore = 50;
+    Detector->DangerousPatterns[idx].Description = "Stack pivot MOV RSP,RAX (REX.W)";
     idx++;
 
     // LEAVE; RET
@@ -2309,7 +2440,15 @@ RoppInitializeDangerousPatterns(
     Detector->DangerousPatterns[idx].Pattern[2] = 0xC4;
     Detector->DangerousPatterns[idx].PatternSize = 3;
     Detector->DangerousPatterns[idx].DangerScore = 20;
-    Detector->DangerousPatterns[idx].Description = "ADD RSP, imm8";
+    Detector->DangerousPatterns[idx].Description = "ADD RSP, imm8 (REX.W)";
+    idx++;
+
+    // ADD ESP, imm8 (no REX — zero-extends RSP on x64)
+    Detector->DangerousPatterns[idx].Pattern[0] = 0x83;
+    Detector->DangerousPatterns[idx].Pattern[1] = 0xC4;
+    Detector->DangerousPatterns[idx].PatternSize = 2;
+    Detector->DangerousPatterns[idx].DangerScore = 20;
+    Detector->DangerousPatterns[idx].Description = "ADD ESP, imm8";
     idx++;
 
     Detector->DangerousPatternCount = idx;
@@ -2341,7 +2480,7 @@ Routine Description:
     PEPROCESS process = NULL;
     PETHREAD thread = NULL;
     KAPC_STATE apcState;
-    PTEB teb = NULL;
+    PROP_TEB_KM teb = NULL;
 
     RtlZeroMemory(Context, sizeof(ROP_ANALYSIS_CONTEXT));
 
@@ -2392,14 +2531,15 @@ Routine Description:
             Context->StackBase = (PVOID)highLimit;
         } else {
             //
-            // Cannot directly read another kernel thread's stack limits.
-            // Use a conservative estimate from the initial stack.
+            // Cannot safely read another kernel thread's stack limits.
+            // IoGetInitialStack() returns the CURRENT thread's stack — NOT
+            // the target thread's. Using it here would give completely
+            // wrong stack bounds. Bail out; the caller should only analyze
+            // kernel threads from the thread's own context.
             //
-            PVOID initialStack = IoGetInitialStack();
-            if (initialStack != NULL) {
-                Context->StackBase = initialStack;
-                Context->StackLimit = (PVOID)((ULONG_PTR)initialStack - ROP_KERNEL_STACK_SIZE_ESTIMATE);
-            }
+            ObDereferenceObject(thread);
+            ObDereferenceObject(process);
+            return STATUS_NOT_SUPPORTED;
         }
     } else {
         //
@@ -2408,9 +2548,9 @@ Routine Description:
         KeStackAttachProcess(process, &apcState);
 
         __try {
-            teb = (PTEB)PsGetThreadTeb(thread);
+            teb = (PROP_TEB_KM)PsGetThreadTeb(thread);
             if (teb != NULL) {
-                ProbeForRead(teb, sizeof(TEB), sizeof(UCHAR));
+                ProbeForRead(teb, sizeof(ROP_TEB), sizeof(UCHAR));
                 Context->StackBase = teb->NtTib.StackBase;
                 Context->StackLimit = teb->NtTib.StackLimit;
             }
@@ -2579,11 +2719,11 @@ Routine Description:
     NTSTATUS status;
     PEPROCESS process = NULL;
     KAPC_STATE apcState;
-    PPEB peb = NULL;
-    PPEB_LDR_DATA ldr = NULL;
+    PROP_PEB_KM peb = NULL;
+    PROP_PEB_LDR_DATA_KM ldr = NULL;
     PLIST_ENTRY head = NULL;
     PLIST_ENTRY current = NULL;
-    PLDR_DATA_TABLE_ENTRY ldrEntry = NULL;
+    PROP_LDR_DATA_TABLE_ENTRY_KM ldrEntry = NULL;
     ULONG count = 0;
     ULONG maxModules = ARRAYSIZE(Context->ModuleCache);
 
@@ -2610,28 +2750,28 @@ Routine Description:
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        peb = PsGetProcessPeb(process);
+        peb = (PROP_PEB_KM)PsGetProcessPeb(process);
         if (peb == NULL) {
             status = STATUS_UNSUCCESSFUL;
             __leave;
         }
 
-        ProbeForRead(peb, sizeof(PEB), sizeof(UCHAR));
-        ldr = peb->Ldr;
+        ProbeForRead(peb, sizeof(ROP_PEB), sizeof(UCHAR));
+        ldr = (PROP_PEB_LDR_DATA_KM)peb->Ldr;
         if (ldr == NULL) {
             status = STATUS_UNSUCCESSFUL;
             __leave;
         }
 
-        ProbeForRead(ldr, sizeof(PEB_LDR_DATA), sizeof(UCHAR));
+        ProbeForRead(ldr, sizeof(ROP_PEB_LDR_DATA), sizeof(UCHAR));
         head = &ldr->InMemoryOrderModuleList;
         current = head->Flink;
 
         while (current != head && count < maxModules) {
             ProbeForRead(current, sizeof(LIST_ENTRY), sizeof(UCHAR));
 
-            ldrEntry = CONTAINING_RECORD(current, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-            ProbeForRead(ldrEntry, sizeof(LDR_DATA_TABLE_ENTRY), sizeof(UCHAR));
+            ldrEntry = CONTAINING_RECORD(current, ROP_LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+            ProbeForRead(ldrEntry, sizeof(ROP_LDR_DATA_TABLE_ENTRY), sizeof(UCHAR));
 
             if (ldrEntry->DllBase != NULL && ldrEntry->SizeOfImage > 0) {
                 Context->ModuleCache[count].Base = ldrEntry->DllBase;
@@ -2806,14 +2946,12 @@ Routine Description:
             // Address is in an executable module but not in our gadget DB.
             // This is a real "unknown executable address" (legitimate
             // return address or unindexed gadget).
+            // Always reset consecutive count — a legitimate return address
+            // in the middle of a gadget sequence breaks the chain.
             //
             Context->UnknownAddresses++;
-
-            if (consecutiveGadgets > 0 &&
-                consecutiveGadgets < Context->Detector->Public.Config.MinChainLength) {
-                maxConsecutive = max(maxConsecutive, consecutiveGadgets);
-                consecutiveGadgets = 0;
-            }
+            maxConsecutive = max(maxConsecutive, consecutiveGadgets);
+            consecutiveGadgets = 0;
         }
 
         if (consecutiveGadgets >= Context->Detector->Public.Config.MinChainLength) {
@@ -2837,8 +2975,8 @@ static
 BOOLEAN
 RoppDetectStackPivot(
     PROP_ANALYSIS_CONTEXT Context,
-    PPVOID PivotSource,
-    PPVOID PivotDestination
+    PVOID* PivotSource,
+    PVOID* PivotDestination
     )
 {
     ULONG_PTR currentSp;

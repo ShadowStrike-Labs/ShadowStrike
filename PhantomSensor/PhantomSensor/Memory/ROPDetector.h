@@ -37,6 +37,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 #include <ntstrsafe.h>
 #include "../../Shared/MemoryTypes.h"
