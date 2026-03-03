@@ -30,7 +30,7 @@
 
     Locking Hierarchy (acquire in this order, never invert):
       1. SEC_TRACKER.SectionLock       (push lock - protects list + hash)
-      2. SEC_ENTRY.MapListLock         (push lock - protects per-entry map list)
+      2. SECTION_ENTRY.MapListLock         (push lock - protects per-entry map list)
       3. SEC_TRACKER_INTERNAL.CallbackLock (push lock - protects callback array)
 
     All locks require KeEnterCriticalRegion before acquisition.
@@ -45,6 +45,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 #include "../../Shared/MemoryTypes.h"
 
@@ -90,7 +91,7 @@ typedef enum _SEC_SECTION_TYPE {
 // Section Flags
 //=============================================================================
 
-typedef enum _SEC_FLAGS {
+typedef enum _SEC_SECTION_FLAGS {
     SecFlag_None                = 0x00000000,
     SecFlag_Image               = 0x00000001,
     SecFlag_ImageNoExecute      = 0x00000002,
@@ -106,7 +107,7 @@ typedef enum _SEC_FLAGS {
     SecFlag_Execute             = 0x00001000,
     SecFlag_Write               = 0x00002000,
     SecFlag_Read                = 0x00004000,
-} SEC_FLAGS;
+} SEC_SECTION_FLAGS;
 
 //=============================================================================
 // Section Suspicion Indicators
@@ -152,7 +153,7 @@ typedef struct _SEC_SECTION_INFO {
     ULONG SectionId;
     HANDLE CreatorProcessId;
     SEC_SECTION_TYPE Type;
-    SEC_FLAGS Flags;
+    SEC_SECTION_FLAGS Flags;
     LARGE_INTEGER MaximumSize;
 
     struct {
@@ -204,13 +205,13 @@ typedef struct _SEC_MAP_ENTRY {
 // Internal Section Entry (opaque to callers — only used inside .c)
 //=============================================================================
 
-typedef struct _SEC_ENTRY {
+typedef struct _SECTION_ENTRY {
     PVOID SectionObject;
     HANDLE CreatorProcessId;
     ULONG SectionId;
 
     SEC_SECTION_TYPE Type;
-    SEC_FLAGS Flags;
+    SEC_SECTION_FLAGS Flags;
     LARGE_INTEGER MaximumSize;
     ULONG SectionPageProtection;
     ULONG AllocationAttributes;
@@ -253,8 +254,8 @@ typedef struct _SEC_ENTRY {
     LIST_ENTRY ListEntry;
     LIST_ENTRY HashEntry;
 
-    PSEC_TRACKER Tracker;                  // Back-pointer for ref-counted free
-} SEC_ENTRY, *PSEC_ENTRY;
+    struct _SEC_TRACKER* Tracker;          // Back-pointer for ref-counted free
+} SECTION_ENTRY, *PSECTION_ENTRY;
 
 //=============================================================================
 // Section Tracker (forward-declared; internal layout in .c)
@@ -333,7 +334,7 @@ SecTrackSectionCreate(
     _In_ PSEC_TRACKER Tracker,
     _In_ PVOID SectionObject,
     _In_ HANDLE CreatorProcessId,
-    _In_ SEC_FLAGS Flags,
+    _In_ SEC_SECTION_FLAGS Flags,
     _In_opt_ PFILE_OBJECT FileObject,
     _In_ PLARGE_INTEGER MaximumSize,
     _Out_opt_ PULONG SectionId

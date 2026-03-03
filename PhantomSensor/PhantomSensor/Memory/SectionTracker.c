@@ -49,9 +49,13 @@
  */
 
 #include "SectionTracker.h"
+#include <ntimage.h>
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/HashUtils.h"
 #include "../ETW/TelemetryEvents.h"
+
+#pragma warning(push)
+#pragma warning(disable:4201)  // nameless struct/union in SEC_CALLBACK_ENTRY
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -136,7 +140,7 @@ SecpCleanupWorkRoutine(
     _In_ PVOID Parameter
     );
 
-static PSEC_ENTRY
+static PSECTION_ENTRY
 SecpAllocateEntry(
     _In_ PSEC_TRACKER_INTERNAL Tracker
     );
@@ -144,13 +148,13 @@ SecpAllocateEntry(
 static VOID
 SecpFreeEntryResources(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     );
 
 static VOID
 SecpFreeEntryToPool(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     );
 
 static PSEC_MAP_ENTRY
@@ -170,7 +174,7 @@ SecpHashSectionObject(
     _In_ ULONG BucketCount
     );
 
-static PSEC_ENTRY
+static PSECTION_ENTRY
 SecpFindEntryLocked(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
     _In_ PVOID SectionObject
@@ -179,40 +183,40 @@ SecpFindEntryLocked(
 static VOID
 SecpInsertEntryLocked(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     );
 
 static VOID
 SecpRemoveEntryLocked(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     );
 
 static SEC_SECTION_TYPE
 SecpDetermineSectionType(
-    _In_ SEC_FLAGS Flags
+    _In_ SEC_SECTION_FLAGS Flags
     );
 
 static VOID
 SecpAnalyzePE(
-    _In_ PSEC_ENTRY Entry,
+    _In_ PSECTION_ENTRY Entry,
     _In_ PFILE_OBJECT FileObject
     );
 
 static VOID
 SecpComputeFileHash(
-    _In_ PSEC_ENTRY Entry,
+    _In_ PSECTION_ENTRY Entry,
     _In_ PFILE_OBJECT FileObject
     );
 
 static VOID
 SecpUpdateSuspicionScore(
-    _Inout_ PSEC_ENTRY Entry
+    _Inout_ PSECTION_ENTRY Entry
     );
 
 static VOID
 SecpFillSectionInfo(
-    _In_ PSEC_ENTRY Entry,
+    _In_ PSECTION_ENTRY Entry,
     _Out_ PSEC_SECTION_INFO Info
     );
 
@@ -225,13 +229,13 @@ SecpFillMapInfo(
 static VOID
 SecpInvokeCreateCallbacks(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     );
 
 static VOID
 SecpInvokeMapCallbacks(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
-    _In_ PSEC_ENTRY Entry,
+    _In_ PSECTION_ENTRY Entry,
     _In_ PSEC_MAP_ENTRY MapEntry
     );
 
@@ -267,12 +271,12 @@ SecpReleaseReference(
 
 static VOID
 SecpAddEntryRef(
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     );
 
 static VOID
 SecpReleaseEntry(
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     );
 
 static BOOLEAN
@@ -355,7 +359,7 @@ SecInitialize(
         NULL,
         NULL,
         POOL_NX_ALLOCATION,
-        sizeof(SEC_ENTRY),
+        sizeof(SECTION_ENTRY),
         SEC_POOL_TAG_ENTRY,
         0
     );
@@ -438,9 +442,8 @@ SecShutdown(
 {
     PSEC_TRACKER_INTERNAL internal;
     PLIST_ENTRY listEntry;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
     PSEC_MAP_ENTRY mapEntry;
-    LARGE_INTEGER timeout;
 
     if (Tracker == NULL || !Tracker->Initialized) {
         return;
@@ -472,16 +475,17 @@ SecShutdown(
     }
 
     //
-    // Release initial operation reference and wait for all active ops to drain
+    // Release initial operation reference and wait for all active ops to drain.
+    // MUST wait indefinitely — returning while operations are in-flight
+    // would cause use-after-free on freed structures.
     //
     SecpReleaseReference(internal);
-    timeout.QuadPart = -((LONGLONG)10000 * 10000);  // 10 second timeout
     KeWaitForSingleObject(
         &internal->ShutdownEvent,
         Executive,
         KernelMode,
         FALSE,
-        &timeout
+        NULL       // S-5 fix: INFINITE wait — cannot proceed with ops in flight
     );
 
     //
@@ -492,25 +496,21 @@ SecShutdown(
 
     while (!IsListEmpty(&Tracker->SectionList)) {
         listEntry = RemoveHeadList(&Tracker->SectionList);
-        entry = CONTAINING_RECORD(listEntry, SEC_ENTRY, ListEntry);
+        entry = CONTAINING_RECORD(listEntry, SECTION_ENTRY, ListEntry);
 
         RemoveEntryList(&entry->HashEntry);
         InterlockedDecrement(&Tracker->SectionCount);
 
         //
-        // Free all map entries for this section (under MapListLock for correctness)
+        // S-4 fix: During shutdown, no concurrent access is possible (we drained
+        // all operations and set ShuttingDown). Skip acquiring per-entry MapListLock
+        // to avoid redundant nested critical region.
         //
-        KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&entry->MapListLock);
-
         while (!IsListEmpty(&entry->MapList)) {
             PLIST_ENTRY mapListEntry = RemoveHeadList(&entry->MapList);
             mapEntry = CONTAINING_RECORD(mapListEntry, SEC_MAP_ENTRY, ListEntry);
             SecpFreeMapEntry(internal, mapEntry);
         }
-
-        ExReleasePushLockExclusive(&entry->MapListLock);
-        KeLeaveCriticalRegion();
 
         SecpFreeEntryResources(internal, entry);
         SecpFreeEntryToPool(internal, entry);
@@ -556,15 +556,15 @@ SecTrackSectionCreate(
     _In_ PSEC_TRACKER Tracker,
     _In_ PVOID SectionObject,
     _In_ HANDLE CreatorProcessId,
-    _In_ SEC_FLAGS Flags,
+    _In_ SEC_SECTION_FLAGS Flags,
     _In_opt_ PFILE_OBJECT FileObject,
     _In_ PLARGE_INTEGER MaximumSize,
     _Out_opt_ PULONG SectionId
     )
 {
     PSEC_TRACKER_INTERNAL internal;
-    PSEC_ENTRY entry = NULL;
-    PSEC_ENTRY existing;
+    PSECTION_ENTRY entry = NULL;
+    PSECTION_ENTRY existing;
     NTSTATUS status = STATUS_SUCCESS;
     POBJECT_NAME_INFORMATION nameInfo = NULL;
 
@@ -603,7 +603,7 @@ SecTrackSectionCreate(
     //
     // Initialize entry (outside lock — no contention on private data)
     //
-    RtlZeroMemory(entry, sizeof(SEC_ENTRY));
+    RtlZeroMemory(entry, sizeof(SECTION_ENTRY));
     entry->SectionObject = SectionObject;
     entry->CreatorProcessId = CreatorProcessId;
     entry->Flags = Flags;
@@ -781,7 +781,7 @@ SecTrackSectionMap(
     )
 {
     PSEC_TRACKER_INTERNAL internal;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
     PSEC_MAP_ENTRY mapEntry;
     BOOLEAN isCrossProcess;
 
@@ -888,7 +888,7 @@ SecTrackSectionUnmap(
     PSEC_TRACKER_INTERNAL internal;
     PLIST_ENTRY listEntry;
     PLIST_ENTRY mapListEntry;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
     PSEC_MAP_ENTRY mapEntry;
     BOOLEAN found = FALSE;
 
@@ -913,7 +913,7 @@ SecTrackSectionUnmap(
          listEntry != &Tracker->SectionList;
          listEntry = listEntry->Flink) {
 
-        entry = CONTAINING_RECORD(listEntry, SEC_ENTRY, ListEntry);
+        entry = CONTAINING_RECORD(listEntry, SECTION_ENTRY, ListEntry);
 
         ExAcquirePushLockExclusive(&entry->MapListLock);
 
@@ -961,7 +961,7 @@ SecUntrackSection(
     )
 {
     PSEC_TRACKER_INTERNAL internal;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
 
     if (Tracker == NULL || !Tracker->Initialized || SectionObject == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1019,7 +1019,7 @@ SecGetSectionInfo(
     )
 {
     PSEC_TRACKER_INTERNAL internal;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
 
     if (Tracker == NULL || !Tracker->Initialized ||
         SectionObject == NULL || Info == NULL) {
@@ -1060,7 +1060,7 @@ SecGetSectionById(
     )
 {
     PLIST_ENTRY listEntry;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
     PSEC_TRACKER_INTERNAL internal;
     BOOLEAN found = FALSE;
 
@@ -1083,7 +1083,7 @@ SecGetSectionById(
          listEntry != &Tracker->SectionList;
          listEntry = listEntry->Flink) {
 
-        entry = CONTAINING_RECORD(listEntry, SEC_ENTRY, ListEntry);
+        entry = CONTAINING_RECORD(listEntry, SECTION_ENTRY, ListEntry);
 
         if (entry->SectionId == SectionId) {
             SecpFillSectionInfo(entry, Info);
@@ -1109,7 +1109,7 @@ SecFindSectionByFile(
     )
 {
     PLIST_ENTRY listEntry;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
     PSEC_TRACKER_INTERNAL internal;
     BOOLEAN found = FALSE;
 
@@ -1133,7 +1133,7 @@ SecFindSectionByFile(
          listEntry != &Tracker->SectionList;
          listEntry = listEntry->Flink) {
 
-        entry = CONTAINING_RECORD(listEntry, SEC_ENTRY, ListEntry);
+        entry = CONTAINING_RECORD(listEntry, SECTION_ENTRY, ListEntry);
 
         if (entry->BackingFile.FileName.Buffer != NULL &&
             RtlEqualUnicodeString(&entry->BackingFile.FileName, FileName, TRUE)) {
@@ -1165,7 +1165,7 @@ SecAnalyzeSection(
     )
 {
     PSEC_TRACKER_INTERNAL internal;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
 
     if (Tracker == NULL || SuspicionFlags == NULL || SuspicionScore == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1218,7 +1218,7 @@ SecDetectDoppelganging(
     )
 {
     PSEC_TRACKER_INTERNAL internal;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
 
     if (Tracker == NULL || IsTransacted == NULL || FileDeleted == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1282,7 +1282,7 @@ SecGetSuspiciousSections(
     )
 {
     PLIST_ENTRY listEntry;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
     PSEC_TRACKER_INTERNAL internal;
     ULONG count = 0;
 
@@ -1306,7 +1306,7 @@ SecGetSuspiciousSections(
          listEntry != &Tracker->SectionList && count < MaxEntries;
          listEntry = listEntry->Flink) {
 
-        entry = CONTAINING_RECORD(listEntry, SEC_ENTRY, ListEntry);
+        entry = CONTAINING_RECORD(listEntry, SECTION_ENTRY, ListEntry);
 
         if ((ULONG)entry->SuspicionScore >= MinScore) {
             SecpFillSectionInfo(entry, &Entries[count]);
@@ -1339,7 +1339,7 @@ SecGetCrossProcessMaps(
     )
 {
     PSEC_TRACKER_INTERNAL internal;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
     PLIST_ENTRY mapListEntry;
     PSEC_MAP_ENTRY mapEntry;
     ULONG count = 0;
@@ -1414,7 +1414,7 @@ SecIsCrossProcessMapped(
     )
 {
     PSEC_TRACKER_INTERNAL internal;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
 
     if (Tracker == NULL || IsCrossProcess == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1667,7 +1667,7 @@ SecGetStatistics(
  */
 static VOID
 SecpAddEntryRef(
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     )
 {
     NT_ASSERT(Entry != NULL);
@@ -1682,7 +1682,7 @@ SecpAddEntryRef(
  */
 static VOID
 SecpReleaseEntry(
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     )
 {
     LONG newCount;
@@ -1780,9 +1780,9 @@ SecpCleanupWorkRoutine(
     PSEC_TRACKER_INTERNAL internal;
     PLIST_ENTRY listEntry;
     PLIST_ENTRY nextEntry;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
     LARGE_INTEGER currentTime;
-    PSEC_ENTRY staleEntries[64];
+    PSECTION_ENTRY staleEntries[64];
     ULONG staleCount = 0;
     ULONG i;
 
@@ -1810,39 +1810,39 @@ SecpCleanupWorkRoutine(
     KeQuerySystemTime(&currentTime);
 
     //
-    // Collect stale entries under exclusive lock
+    // S-8 fix: Loop until all stale entries are collected and freed.
+    // Process in batches of 64 to bound lock hold time.
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&tracker->SectionLock);
+    do {
+        staleCount = 0;
 
-    for (listEntry = tracker->SectionList.Flink;
-         listEntry != &tracker->SectionList && staleCount < ARRAYSIZE(staleEntries);
-         listEntry = nextEntry) {
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&tracker->SectionLock);
 
-        nextEntry = listEntry->Flink;
-        entry = CONTAINING_RECORD(listEntry, SEC_ENTRY, ListEntry);
+        for (listEntry = tracker->SectionList.Flink;
+             listEntry != &tracker->SectionList && staleCount < ARRAYSIZE(staleEntries);
+             listEntry = nextEntry) {
 
-        //
-        // Check if entry has no active mappings and is old enough
-        //
-        if (entry->MapCount == 0 &&
-            (currentTime.QuadPart - entry->CreateTime.QuadPart) > SEC_STALE_THRESHOLD_100NS) {
+            nextEntry = listEntry->Flink;
+            entry = CONTAINING_RECORD(listEntry, SECTION_ENTRY, ListEntry);
 
-            SecpRemoveEntryLocked(internal, entry);
-            entry->RemovedFromTracker = TRUE;
-            staleEntries[staleCount++] = entry;
+            if (entry->MapCount == 0 &&
+                (currentTime.QuadPart - entry->CreateTime.QuadPart) > SEC_STALE_THRESHOLD_100NS) {
+
+                SecpRemoveEntryLocked(internal, entry);
+                entry->RemovedFromTracker = TRUE;
+                staleEntries[staleCount++] = entry;
+            }
         }
-    }
 
-    ExReleasePushLockExclusive(&tracker->SectionLock);
-    KeLeaveCriticalRegion();
+        ExReleasePushLockExclusive(&tracker->SectionLock);
+        KeLeaveCriticalRegion();
 
-    //
-    // Release refs outside lock (may trigger free)
-    //
-    for (i = 0; i < staleCount; i++) {
-        SecpReleaseEntry(staleEntries[i]);
-    }
+        for (i = 0; i < staleCount; i++) {
+            SecpReleaseEntry(staleEntries[i]);
+        }
+
+    } while (staleCount == ARRAYSIZE(staleEntries) && !internal->ShuttingDown);
 
     SecpReleaseReference(internal);
 }
@@ -1851,7 +1851,7 @@ SecpCleanupWorkRoutine(
 // PRIVATE: ALLOCATION AND FREE
 // ============================================================================
 
-static PSEC_ENTRY
+static PSECTION_ENTRY
 SecpAllocateEntry(
     _In_ PSEC_TRACKER_INTERNAL Tracker
     )
@@ -1860,7 +1860,7 @@ SecpAllocateEntry(
         return NULL;
     }
 
-    return (PSEC_ENTRY)ExAllocateFromNPagedLookasideList(&Tracker->EntryLookaside);
+    return (PSECTION_ENTRY)ExAllocateFromNPagedLookasideList(&Tracker->EntryLookaside);
 }
 
 /**
@@ -1870,7 +1870,7 @@ SecpAllocateEntry(
 static VOID
 SecpFreeEntryResources(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     )
 {
     UNREFERENCED_PARAMETER(Tracker);
@@ -1898,7 +1898,7 @@ SecpFreeEntryResources(
 static VOID
 SecpFreeEntryToPool(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     )
 {
     if (Tracker->LookasideInitialized && Entry != NULL) {
@@ -1953,7 +1953,7 @@ SecpHashSectionObject(
     return (ULONG)(hash64 % (ULONG64)BucketCount);
 }
 
-static PSEC_ENTRY
+static PSECTION_ENTRY
 SecpFindEntryLocked(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
     _In_ PVOID SectionObject
@@ -1961,7 +1961,7 @@ SecpFindEntryLocked(
 {
     ULONG bucket;
     PLIST_ENTRY listEntry;
-    PSEC_ENTRY entry;
+    PSECTION_ENTRY entry;
 
     bucket = SecpHashSectionObject(
         SectionObject,
@@ -1972,7 +1972,7 @@ SecpFindEntryLocked(
          listEntry != &Tracker->Public.SectionHash.Buckets[bucket];
          listEntry = listEntry->Flink) {
 
-        entry = CONTAINING_RECORD(listEntry, SEC_ENTRY, HashEntry);
+        entry = CONTAINING_RECORD(listEntry, SECTION_ENTRY, HashEntry);
 
         if (entry->SectionObject == SectionObject) {
             return entry;
@@ -1985,7 +1985,7 @@ SecpFindEntryLocked(
 static VOID
 SecpInsertEntryLocked(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     )
 {
     ULONG bucket;
@@ -2004,7 +2004,7 @@ SecpInsertEntryLocked(
 static VOID
 SecpRemoveEntryLocked(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     )
 {
     RemoveEntryList(&Entry->ListEntry);
@@ -2021,7 +2021,7 @@ SecpRemoveEntryLocked(
 
 static SEC_SECTION_TYPE
 SecpDetermineSectionType(
-    _In_ SEC_FLAGS Flags
+    _In_ SEC_SECTION_FLAGS Flags
     )
 {
     if (Flags & SecFlag_Image) {
@@ -2051,7 +2051,7 @@ SecpDetermineSectionType(
 
 static VOID
 SecpAnalyzePE(
-    _In_ PSEC_ENTRY Entry,
+    _In_ PSECTION_ENTRY Entry,
     _In_ PFILE_OBJECT FileObject
     )
 {
@@ -2201,7 +2201,7 @@ CleanupPE:
 
 static VOID
 SecpComputeFileHash(
-    _In_ PSEC_ENTRY Entry,
+    _In_ PSECTION_ENTRY Entry,
     _In_ PFILE_OBJECT FileObject
     )
 {
@@ -2324,7 +2324,7 @@ CleanupHash:
 
 static VOID
 SecpUpdateSuspicionScore(
-    _Inout_ PSEC_ENTRY Entry
+    _Inout_ PSECTION_ENTRY Entry
     )
 {
     ULONG score = 0;
@@ -2367,7 +2367,7 @@ SecpUpdateSuspicionScore(
 
 static VOID
 SecpFillSectionInfo(
-    _In_ PSEC_ENTRY Entry,
+    _In_ PSECTION_ENTRY Entry,
     _Out_ PSEC_SECTION_INFO Info
     )
 {
@@ -2380,10 +2380,13 @@ SecpFillSectionInfo(
     Info->MaximumSize = Entry->MaximumSize;
 
     //
-    // Copy backing file info (UNICODE_STRING points to Entry's buffer —
-    // valid as long as we're under lock. Caller should treat as read-only snapshot.)
+    // S-6 fix: Do NOT copy FileName UNICODE_STRING pointer — the Buffer
+    // points into the internal entry's allocation and becomes a dangling
+    // pointer once the caller's lock/reference is released. Clear it to
+    // prevent use-after-free. Callers needing the filename should use
+    // SecFindSectionByFile or hold their own copy of the name.
     //
-    Info->BackingFile.FileName = Entry->BackingFile.FileName;
+    RtlZeroMemory(&Info->BackingFile.FileName, sizeof(UNICODE_STRING));
     Info->BackingFile.FileSize = Entry->BackingFile.FileSize;
     Info->BackingFile.FileCreationTime = Entry->BackingFile.FileCreationTime;
     Info->BackingFile.IsTransacted = Entry->BackingFile.IsTransacted;
@@ -2393,7 +2396,13 @@ SecpFillSectionInfo(
                    Entry->BackingFile.FileHash,
                    sizeof(Info->BackingFile.FileHash));
 
-    Info->PE = Entry->PE;
+    Info->PE.IsPE = Entry->PE.IsPE;
+    Info->PE.Machine = Entry->PE.Machine;
+    Info->PE.Characteristics = Entry->PE.Characteristics;
+    Info->PE.ImageSize = Entry->PE.ImageSize;
+    Info->PE.EntryPoint = Entry->PE.EntryPoint;
+    Info->PE.IsDotNet = Entry->PE.IsDotNet;
+    Info->PE.IsSigned = Entry->PE.IsSigned;
 
     Info->MapCount = Entry->MapCount;
     Info->CrossProcessMapCount = Entry->CrossProcessMapCount;
@@ -2428,7 +2437,7 @@ SecpFillMapInfo(
 static VOID
 SecpInvokeCreateCallbacks(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
-    _In_ PSEC_ENTRY Entry
+    _In_ PSECTION_ENTRY Entry
     )
 {
     ULONG i;
@@ -2443,10 +2452,18 @@ SecpInvokeCreateCallbacks(
         if (Tracker->CreateCallbacks[i].InUse &&
             Tracker->CreateCallbacks[i].CreateCallback != NULL) {
 
-            Tracker->CreateCallbacks[i].CreateCallback(
-                &info,
-                Tracker->CreateCallbacks[i].Context
-            );
+            __try {
+                Tracker->CreateCallbacks[i].CreateCallback(
+                    &info,
+                    Tracker->CreateCallbacks[i].Context
+                );
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                //
+                // Callback faulted — disable it to prevent repeated crashes
+                //
+                Tracker->CreateCallbacks[i].InUse = FALSE;
+                Tracker->CreateCallbacks[i].CreateCallback = NULL;
+            }
         }
     }
 
@@ -2457,7 +2474,7 @@ SecpInvokeCreateCallbacks(
 static VOID
 SecpInvokeMapCallbacks(
     _In_ PSEC_TRACKER_INTERNAL Tracker,
-    _In_ PSEC_ENTRY Entry,
+    _In_ PSECTION_ENTRY Entry,
     _In_ PSEC_MAP_ENTRY MapEntry
     )
 {
@@ -2475,11 +2492,19 @@ SecpInvokeMapCallbacks(
         if (Tracker->MapCallbacks[i].InUse &&
             Tracker->MapCallbacks[i].MapCallback != NULL) {
 
-            Tracker->MapCallbacks[i].MapCallback(
-                &sectionInfo,
-                &mapInfo,
-                Tracker->MapCallbacks[i].Context
-            );
+            __try {
+                Tracker->MapCallbacks[i].MapCallback(
+                    &sectionInfo,
+                    &mapInfo,
+                    Tracker->MapCallbacks[i].Context
+                );
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                //
+                // Callback faulted — disable it to prevent repeated crashes
+                //
+                Tracker->MapCallbacks[i].InUse = FALSE;
+                Tracker->MapCallbacks[i].MapCallback = NULL;
+            }
         }
     }
 
@@ -2519,20 +2544,12 @@ SecpIsFileDeleted(
         return FALSE;
     }
 
-    if (FileObject->DeletePending) {
-        return TRUE;
-    }
-
     //
-    // Also check SectionObjectPointer for dismounted/purged state
+    // Only DeletePending is a reliable deletion indicator.
+    // SectionObjectPointer NULL checks produce false positives on
+    // freshly created or never-mapped files.
     //
-    if (FileObject->SectionObjectPointer != NULL &&
-        FileObject->SectionObjectPointer->DataSectionObject == NULL &&
-        FileObject->SectionObjectPointer->ImageSectionObject == NULL) {
-        return TRUE;
-    }
-
-    return FALSE;
+    return FileObject->DeletePending;
 }
 
 // ============================================================================
@@ -2731,3 +2748,5 @@ SecpReleaseReference(
         KeSetEvent(&Tracker->ShutdownEvent, IO_NO_INCREMENT, FALSE);
     }
 }
+
+#pragma warning(pop)
