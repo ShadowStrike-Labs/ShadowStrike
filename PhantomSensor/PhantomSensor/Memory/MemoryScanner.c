@@ -61,10 +61,21 @@
  * ============================================================================
  */
 
+//
+// ntifs.h must precede ntddk.h to avoid PEPROCESS/PETHREAD C2371 redefinition (MS-3 fix).
+//
+#include <ntifs.h>
 #include "MemoryScanner.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
 #include <ntstrsafe.h>
+
+//
+// MEM_IMAGE is not defined in kernel-mode headers (MS-4 fix).
+//
+#ifndef MEM_IMAGE
+#define MEM_IMAGE 0x1000000
+#endif
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -541,7 +552,6 @@ MsInitialize(
     _Out_ PMS_SCANNER* Scanner
 )
 {
-    NTSTATUS status = STATUS_SUCCESS;
     PMS_SCANNER_INTERNAL scanner = NULL;
     ULONG i;
 
@@ -697,7 +707,6 @@ MsShutdown(
     PMS_PATTERN_INTERNAL pattern;
     PMS_ACTIVE_SCAN activeScan;
     KIRQL oldIrql;
-    LARGE_INTEGER timeout;
 
     PAGED_CODE();
 
@@ -732,28 +741,39 @@ MsShutdown(
     KeReleaseSpinLock(&scanner->Base.ActiveScansLock, oldIrql);
 
     //
-    // Wait for active scans to complete with a bounded retry.
-    // Total wait: up to 10 seconds (100 iterations × 100ms).
+    // Wait for active scans to complete.
+    // Signal cancellation, then wait on ShutdownEvent which is set
+    // when the last reference drains (MS-2 fix).
     //
     {
+        LARGE_INTEGER waitTimeout;
+        waitTimeout.QuadPart = -((LONGLONG)30 * 10000000);  // 30 seconds max
         ULONG retries = 0;
-        timeout.QuadPart = -((LONGLONG)100 * 10000);  // 100ms per iteration
-        while (scanner->Base.ActiveScanCount > 0 && retries < 100) {
-            KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+        while (scanner->Base.ActiveScanCount > 0 && retries < 300) {
+            LARGE_INTEGER delay;
+            delay.QuadPart = -((LONGLONG)100 * 10000);  // 100ms
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
             retries++;
         }
     }
 
     //
-    // Wait for references to drain with a bounded timeout.
-    // Total wait: up to 5 seconds (500 iterations × 10ms).
+    // Release our initial reference (from MsInitialize) and wait for
+    // all outstanding references to drain. KeWaitForSingleObject blocks
+    // until MspReleaseReference signals ShutdownEvent at RefCount==0 (MS-2 fix).
     //
     {
-        ULONG retries = 0;
-        timeout.QuadPart = -((LONGLONG)10 * 10000);  // 10ms per iteration
-        while (scanner->ReferenceCount > 1 && retries < 500) {
-            KeDelayExecutionThread(KernelMode, FALSE, &timeout);
-            retries++;
+        LONG newCount = InterlockedDecrement(&scanner->ReferenceCount);
+        if (newCount > 0) {
+            LARGE_INTEGER waitTimeout;
+            waitTimeout.QuadPart = -((LONGLONG)30 * 10000000);  // 30 seconds
+            KeWaitForSingleObject(
+                &scanner->ShutdownEvent,
+                Executive,
+                KernelMode,
+                FALSE,
+                &waitTimeout
+            );
         }
     }
 
@@ -1408,6 +1428,7 @@ MsScanProcess(
     InterlockedIncrement64(&scanner->Base.Stats.TotalScans);
     InterlockedAdd64(&scanner->Base.Stats.BytesScanned, (LONG64)result->BytesScanned);
     InterlockedAdd64(&scanner->Base.Stats.TotalMatches, result->MatchCount);
+    InterlockedAdd64(&scanner->Base.Stats.CumulativeScanTimeMs, (LONG64)result->DurationMs);
 
     ObDereferenceObject(process);
     MspReleaseReference(scanner);
@@ -1514,6 +1535,7 @@ MsScanRegion(
     //
     InterlockedIncrement64(&scanner->Base.Stats.TotalScans);
     InterlockedAdd64(&scanner->Base.Stats.BytesScanned, (LONG64)result->BytesScanned);
+    InterlockedAdd64(&scanner->Base.Stats.CumulativeScanTimeMs, (LONG64)result->DurationMs);
 
     ObDereferenceObject(process);
     MspReleaseReference(scanner);
@@ -1669,6 +1691,7 @@ MsScanBuffer(
     //
     InterlockedIncrement64(&scanner->Base.Stats.TotalScans);
     InterlockedAdd64(&scanner->Base.Stats.BytesScanned, (LONG64)Size);
+    InterlockedAdd64(&scanner->Base.Stats.CumulativeScanTimeMs, (LONG64)result->DurationMs);
 
     MspReleaseReference(scanner);
 
@@ -2067,22 +2090,24 @@ MsFindHighEntropyRegions(
             }
 
             //
-            // Check if region is worth scanning
+            // Check if region is worth scanning.
+            // For regions larger than the scan chunk, sample the first chunk (MS-7 fix).
             //
             if (memInfo.State == MEM_COMMIT &&
-                memInfo.RegionSize >= MS_MIN_REGION_SIZE &&
-                memInfo.RegionSize <= MS_SCAN_CHUNK_SIZE) {
+                memInfo.RegionSize >= MS_MIN_REGION_SIZE) {
+
+                SIZE_T sampleSize = min(memInfo.RegionSize, (SIZE_T)MS_SCAN_CHUNK_SIZE);
 
                 //
-                // Read region
+                // Read region (or first chunk of large region)
                 //
                 __try {
-                    RtlCopyMemory(buffer, memInfo.BaseAddress, memInfo.RegionSize);
+                    RtlCopyMemory(buffer, memInfo.BaseAddress, sampleSize);
 
                     //
                     // Calculate entropy (integer-only, no FP)
                     //
-                    status = MsCalculateEntropy(buffer, memInfo.RegionSize, &entropy);
+                    status = MsCalculateEntropy(buffer, sampleSize, &entropy);
 
                     if (NT_SUCCESS(status) && entropy >= EntropyThreshold) {
                         Results[count].BaseAddress = memInfo.BaseAddress;
@@ -2149,10 +2174,10 @@ MsGetStatistics(
     Stats->UpTime.QuadPart = currentTime.QuadPart - scanner->Base.Stats.StartTime.QuadPart;
 
     //
-    // Calculate average scan time (simplified)
+    // Calculate average scan time from cumulative duration (MS-8 fix).
     //
     if (Stats->TotalScans > 0) {
-        Stats->AverageScanTimeMs = (ULONG)(Stats->UpTime.QuadPart / 10000 / Stats->TotalScans);
+        Stats->AverageScanTimeMs = (ULONG)(scanner->Base.Stats.CumulativeScanTimeMs / Stats->TotalScans);
     }
 
     return STATUS_SUCCESS;
@@ -2212,10 +2237,23 @@ MspComputeBadCharTable(
     }
 
     //
-    // Set shifts for characters in pattern (except last character)
+    // Set shifts for characters in pattern (except last character).
+    // For case-insensitive patterns, populate BOTH upper and lower case
+    // entries so that shift lookup works regardless of text case (MS-5 fix).
     //
     for (i = 0; i < Pattern->PatternSize - 1; i++) {
-        Pattern->BadCharTable[Pattern->PatternData[i]] = Pattern->PatternSize - 1 - i;
+        UCHAR ch = Pattern->PatternData[i];
+        ULONG shift = Pattern->PatternSize - 1 - i;
+
+        Pattern->BadCharTable[ch] = shift;
+
+        if (!(Pattern->Flags & MsPatternFlag_CaseSensitive)) {
+            if (ch >= 'A' && ch <= 'Z') {
+                Pattern->BadCharTable[ch | 0x20] = shift;       // lowercase variant
+            } else if (ch >= 'a' && ch <= 'z') {
+                Pattern->BadCharTable[ch & ~0x20] = shift;      // uppercase variant
+            }
+        }
     }
 
     Pattern->TableComputed = TRUE;
@@ -3061,12 +3099,14 @@ MspScanProcessRegions(
     MEMORY_BASIC_INFORMATION memInfo;
     SIZE_T returnLength;
     PVOID address = NULL;
+    BOOLEAN isAttached = FALSE;
 
     //
-    // Attach to enumerate regions. MspScanSingleRegion does its own
-    // attach/detach for the actual memory read (HIGH-2 standardization).
+    // Enumerate regions while attached, detach for scanning (MS-9 fix).
+    // Track attach state to prevent double-detach BSOD on stack unwind.
     //
     KeStackAttachProcess(Process, &apcState);
+    isAttached = TRUE;
 
     __try {
         //
@@ -3098,9 +3138,10 @@ MspScanProcessRegions(
                     Flags)) {
 
                 //
-                // Detach before scanning — MspScanSingleRegion will re-attach.
+                // Detach before scanning — MspScanSingleRegion does its own attach/detach.
                 //
                 KeUnstackDetachProcess(&apcState);
+                isAttached = FALSE;
 
                 status = MspScanSingleRegion(
                     Scanner,
@@ -3116,6 +3157,7 @@ MspScanProcessRegions(
                 // Re-attach to continue enumeration.
                 //
                 KeStackAttachProcess(Process, &apcState);
+                isAttached = TRUE;
 
                 if (!NT_SUCCESS(status)) {
                     status = STATUS_SUCCESS;
@@ -3136,7 +3178,9 @@ MspScanProcessRegions(
         }
 
     } __finally {
-        KeUnstackDetachProcess(&apcState);
+        if (isAttached) {
+            KeUnstackDetachProcess(&apcState);
+        }
     }
 
     return status;
@@ -3232,10 +3276,15 @@ MspScanSingleRegion(
         }
 
         //
-        // Scan chunk with all patterns
+        // Scan chunk with all patterns.
+        // AC search requires AhoCorasickLock to prevent concurrent rebuild (MS-6 fix).
         //
         if (InterlockedCompareExchange(&Scanner->Base.AhoCorasickReady, 0, 0) &&
             Scanner->Base.PatternCount > 3) {
+
+            KeEnterCriticalRegion();
+            ExAcquirePushLockShared(&Scanner->Base.AhoCorasickLock);
+
             MspAhoCorasickSearch(
                 Scanner,
                 buffer,
@@ -3246,6 +3295,10 @@ MspScanSingleRegion(
                 RegionSize,
                 Protection
             );
+
+            ExReleasePushLockShared(&Scanner->Base.AhoCorasickLock);
+            KeLeaveCriticalRegion();
+
         } else {
             KeEnterCriticalRegion();
             ExAcquirePushLockShared(&Scanner->Base.PatternLock);
@@ -3481,31 +3534,43 @@ Complete:
     KeSetEvent(&activeScan->CompletionEvent, IO_NO_INCREMENT, FALSE);
 
     //
-    // Call completion callback.
+    // Capture statistics BEFORE callback, because callback receives ownership
+    // of Result and may free it immediately (MS-1 fix: use-after-free).
     //
-    // OWNERSHIP CONTRACT: The callback receives ownership of activeScan->Result.
-    // The callback MUST call MsFreeScanResult(Scanner, Result) to release it.
-    // If no callback is provided, we free the result here to prevent leaks.
-    //
-    if (activeScan->Callback != NULL) {
-        activeScan->Callback(activeScan->Result, activeScan->CallbackContext);
-    } else {
-        MsFreeScanResult(&scanner->Base, activeScan->Result);
+    {
+        LONG64 bytesScannedSnapshot = (LONG64)activeScan->Result->BytesScanned;
+        LONG64 matchCountSnapshot = (LONG64)activeScan->Result->MatchCount;
+        ULONG durationSnapshot = activeScan->Result->DurationMs;
+
+        //
+        // Call completion callback.
+        //
+        // OWNERSHIP CONTRACT: The callback receives ownership of activeScan->Result.
+        // The callback MUST call MsFreeScanResult(Scanner, Result) to release it.
+        // If no callback is provided, we free the result here to prevent leaks.
+        //
+        if (activeScan->Callback != NULL) {
+            activeScan->Callback(activeScan->Result, activeScan->CallbackContext);
+        } else {
+            MsFreeScanResult(&scanner->Base, activeScan->Result);
+        }
+
+        //
+        // Remove from active scans list
+        //
+        KeAcquireSpinLock(&scanner->Base.ActiveScansLock, &oldIrql);
+        RemoveEntryList(&activeScan->ListEntry);
+        InterlockedDecrement(&scanner->Base.ActiveScanCount);
+        KeReleaseSpinLock(&scanner->Base.ActiveScansLock, oldIrql);
+
+        //
+        // Update statistics from captured snapshots (MS-1 fix).
+        //
+        InterlockedIncrement64(&scanner->Base.Stats.TotalScans);
+        InterlockedAdd64(&scanner->Base.Stats.BytesScanned, bytesScannedSnapshot);
+        InterlockedAdd64(&scanner->Base.Stats.TotalMatches, matchCountSnapshot);
+        InterlockedAdd64(&scanner->Base.Stats.CumulativeScanTimeMs, (LONG64)durationSnapshot);
     }
-
-    //
-    // Remove from active scans list
-    //
-    KeAcquireSpinLock(&scanner->Base.ActiveScansLock, &oldIrql);
-    RemoveEntryList(&activeScan->ListEntry);
-    InterlockedDecrement(&scanner->Base.ActiveScanCount);
-    KeReleaseSpinLock(&scanner->Base.ActiveScansLock, oldIrql);
-
-    //
-    // Update statistics
-    //
-    InterlockedIncrement64(&scanner->Base.Stats.TotalScans);
-    InterlockedAdd64(&scanner->Base.Stats.BytesScanned, (LONG64)activeScan->Result->BytesScanned);
 
     //
     // Free work item

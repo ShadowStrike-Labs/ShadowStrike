@@ -351,6 +351,7 @@ typedef struct _MS_SCANNER {
         volatile LONG64 TotalMatches;
         volatile LONG64 BytesScanned;
         volatile LONG64 Timeouts;
+        volatile LONG64 CumulativeScanTimeMs;   // Sum of all scan durations (MS-8 fix)
         LARGE_INTEGER StartTime;
     } Stats;
     
