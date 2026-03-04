@@ -52,7 +52,7 @@
  */
 #define MM_DEFAULT_MIN_ALLOC_SIZE           4096        // 4KB minimum to track
 #define MM_DEFAULT_MAX_EVENTS_PER_SEC       10000       // Rate limit
-#define MM_DEFAULT_SHELLCODE_SCAN_THRESHOLD 6000        // Entropy * 1000
+#define MM_DEFAULT_SHELLCODE_SCAN_THRESHOLD 5000        // Entropy * 1000 (lowered from 6000 to compensate for integer log2 underestimation)
 #define MM_DEFAULT_MAX_REGION_SCAN_SIZE     (1024*1024) // 1MB max to scan
 
 /**
@@ -130,18 +130,18 @@ typedef struct _MM_PROCESS_CONTEXT {
     EX_PUSH_LOCK RegionLock;
     UINT32 TrackedRegionCount;
     
-    // Statistics
-    UINT64 TotalAllocations;
-    UINT64 TotalProtectionChanges;
-    UINT64 SuspiciousOperations;
+    // Statistics (volatile for interlocked operations from concurrent threads)
+    volatile LONG64 TotalAllocations;
+    volatile LONG64 TotalProtectionChanges;
+    volatile LONG64 SuspiciousOperations;
     
     // Risk scoring
     UINT32 MemoryRiskScore;               // 0-1000
-    UINT32 ShellcodeDetectionCount;
-    UINT32 InjectionAttemptCount;
+    volatile LONG ShellcodeDetectionCount;
+    volatile LONG InjectionAttemptCount;
     
-    // Flags
-    UINT32 Flags;
+    // Flags (volatile for InterlockedOr from concurrent threads)
+    volatile LONG Flags;
     BOOLEAN IsMonitored;
     BOOLEAN IsHighRisk;
     UINT16 Reserved;
