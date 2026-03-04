@@ -71,11 +71,24 @@ MITRE ATT&CK Coverage:
 #define VAD_MAX_CALLBACKS               16
 #define VAD_CHANGE_QUEUE_MAX            4096
 #define VAD_SNAPSHOT_BUFFER_SIZE        (64 * 1024)
+#define VAD_SNAPSHOT_MAX_ENTRIES        (VAD_SNAPSHOT_BUFFER_SIZE / sizeof(VAD_SNAPSHOT_ENTRY))
 #define VAD_PAGE_SIZE                   0x1000
 #define VAD_PAGE_SHIFT                  12
 #define VAD_LARGE_REGION_THRESHOLD      (16 * 1024 * 1024)  // 16 MB
 #define VAD_SUSPICIOUS_BASE_LOW         0x10000
 #define VAD_SHUTDOWN_DRAIN_MAX_WAIT     30000    // 30s at 1ms each
+
+//
+// User-mode constants not available in WDK kernel headers.
+// These values are stable across all Windows versions.
+//
+#ifndef MEM_IMAGE
+#define MEM_IMAGE   0x1000000
+#endif
+
+#ifndef INFINITE
+#define INFINITE    0xFFFFFFFF
+#endif
 
 //
 // Windows internal VAD types (from ntddk)
@@ -92,6 +105,19 @@ MITRE ATT&CK Coverage:
 // ============================================================================
 // PRIVATE STRUCTURES
 // ============================================================================
+
+//
+// Snapshot entry — compact representation of a region for change detection.
+// Stored contiguously in the snapshot buffer for O(n) comparison.
+//
+typedef struct _VAD_SNAPSHOT_ENTRY {
+    PVOID BaseAddress;
+    SIZE_T RegionSize;
+    ULONG Protection;
+    ULONG Type;
+    ULONG State;
+    VAD_FLAGS Flags;
+} VAD_SNAPSHOT_ENTRY, *PVAD_SNAPSHOT_ENTRY;
 
 //
 // Callback registration entry
@@ -125,6 +151,7 @@ typedef struct _VAD_TRACKER_INTERNAL {
     PETHREAD WorkerThread;
     KEVENT ShutdownEvent;
     KEVENT WorkAvailableEvent;
+    KEVENT DrainEvent;          // V-8: signaled when ActiveRefCount reaches 0
     volatile LONG ShutdownRequested;
 
     //
@@ -472,6 +499,7 @@ Return Value:
     //
     KeInitializeEvent(&Internal->ShutdownEvent, NotificationEvent, FALSE);
     KeInitializeEvent(&Internal->WorkAvailableEvent, SynchronizationEvent, FALSE);
+    KeInitializeEvent(&Internal->DrainEvent, NotificationEvent, FALSE);
 
     //
     // Create worker thread — get PETHREAD reference
@@ -573,8 +601,6 @@ Arguments:
     PVAD_PROCESS_CONTEXT Context;
     PVAD_CHANGE_EVENT ChangeEvent;
     KIRQL OldIrql;
-    LARGE_INTEGER Interval;
-    LONG DrainWait;
 
     PAGED_CODE();
 
@@ -596,6 +622,11 @@ Arguments:
     //
     if (InterlockedExchange(&Internal->Public.SnapshotTimerActive, 0) != 0) {
         KeCancelTimer(&Internal->Public.SnapshotTimer);
+        //
+        // V-4 fix: DPC may be queued or executing on another processor.
+        // KeFlushQueuedDpcs ensures it completes before we free the tracker.
+        //
+        KeFlushQueuedDpcs();
     }
 
     //
@@ -617,14 +648,18 @@ Arguments:
     }
 
     //
-    // Drain active references — wait up to 30 seconds
+    // V-8 fix: Event-based drain instead of polling loop.
+    // VadpReleaseRef signals DrainEvent when ActiveRefCount reaches 0
+    // during shutdown. Wait indefinitely — operations MUST complete.
     //
-    Interval.QuadPart = -10000;  // 1ms
-    for (DrainWait = 0; DrainWait < VAD_SHUTDOWN_DRAIN_MAX_WAIT; DrainWait++) {
-        if (InterlockedCompareExchange(&Internal->Public.ActiveRefCount, 0, 0) == 0) {
-            break;
-        }
-        KeDelayExecutionThread(KernelMode, FALSE, &Interval);
+    if (InterlockedCompareExchange(&Internal->Public.ActiveRefCount, 0, 0) != 0) {
+        KeWaitForSingleObject(
+            &Internal->DrainEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+            );
     }
 
     //
@@ -860,9 +895,6 @@ Return Value:
     VadpDereferenceProcessContext(Internal, Context);
 
     VadpReleaseRef(Internal);
-    return STATUS_SUCCESS;
-}
-
     return STATUS_SUCCESS;
 }
 
@@ -1102,8 +1134,11 @@ Return Value:
         return STATUS_NOT_FOUND;
     }
 
+    //
+    // V-5 fix: Exclusive lock because we WRITE Region->SuspicionFlags/Score
+    //
     KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Context->RegionLock);
+    ExAcquirePushLockExclusive(&Context->RegionLock);
     Region = VadpFindRegion(Context, Address);
     if (Region != NULL) {
         Region->SuspicionFlags = VadpAnalyzeRegionSuspicion(Region, Context);
@@ -1112,7 +1147,7 @@ Return Value:
         *SuspicionScore = Region->SuspicionScore;
         Status = STATUS_SUCCESS;
     }
-    ExReleasePushLockShared(&Context->RegionLock);
+    ExReleasePushLockExclusive(&Context->RegionLock);
     KeLeaveCriticalRegion();
 
     VadpDereferenceProcessContext(Internal, Context);
@@ -1469,7 +1504,14 @@ VadpReleaseRef(
     _In_ PVAD_TRACKER_INTERNAL Tracker
     )
 {
-    InterlockedDecrement(&Tracker->Public.ActiveRefCount);
+    //
+    // V-8 fix: If refcount drops to 0 and we're shutting down, signal drain.
+    //
+    if (InterlockedDecrement(&Tracker->Public.ActiveRefCount) == 0) {
+        if (InterlockedCompareExchange(&Tracker->Public.Initialized, 0, 0) == 0) {
+            KeSetEvent(&Tracker->DrainEvent, IO_NO_INCREMENT, FALSE);
+        }
+    }
 }
 
 static PVAD_PROCESS_CONTEXT
@@ -1947,7 +1989,7 @@ VadpProtectionToFlags(
         Flags |= VadFlag_Execute | VadFlag_Read | VadFlag_Write;
         break;
     case PAGE_EXECUTE_WRITECOPY:
-        Flags |= VadFlag_Execute | VadFlag_Read | VadFlag_Write;
+        Flags |= VadFlag_Execute | VadFlag_Read | VadFlag_CopyOnWrite;
         break;
     case PAGE_READONLY:
         Flags |= VadFlag_Read;
@@ -1956,7 +1998,7 @@ VadpProtectionToFlags(
         Flags |= VadFlag_Read | VadFlag_Write;
         break;
     case PAGE_WRITECOPY:
-        Flags |= VadFlag_Read | VadFlag_Write;
+        Flags |= VadFlag_Read | VadFlag_CopyOnWrite;
         break;
     case PAGE_NOACCESS:
     default:
@@ -2140,9 +2182,11 @@ VadpQueueChangeEvent(
     KeSetEvent(&Tracker->Public.ChangeAvailableEvent, IO_NO_INCREMENT, FALSE);
 
     //
-    // Notify callbacks (uses snapshot pattern)
+    // V-6 fix: Notify callbacks with the original stack Event, NOT
+    // QueuedEvent (which is in the change queue and can be dequeued
+    // + freed by concurrent VadGetNextChange → use-after-free).
     //
-    VadpNotifyCallbacks(Tracker, QueuedEvent);
+    VadpNotifyCallbacks(Tracker, Event);
 
     return STATUS_SUCCESS;
 }
@@ -2286,15 +2330,261 @@ VadpCompareSnapshots(
     )
 /*++
 Routine Description:
-    NOT YET IMPLEMENTED — snapshot comparison for drift detection.
-    This is a design placeholder for future change-detection work.
-    It currently does nothing and returns STATUS_NOT_IMPLEMENTED.
+    Compares the current region list against a previously stored snapshot
+    to detect changes (new regions, deleted regions, protection changes,
+    size changes). Queues VAD_CHANGE_EVENT for each detected difference,
+    then updates the snapshot buffer to reflect the current state.
+
+    Algorithm:
+    1. Build a sorted array of current regions under shared lock.
+    2. Merge-compare with the previous snapshot (also sorted by BaseAddress).
+    3. Emit change events for differences.
+    4. Replace old snapshot with current state.
 --*/
 {
-    UNREFERENCED_PARAMETER(Tracker);
-    UNREFERENCED_PARAMETER(Context);
+    NTSTATUS Status = STATUS_SUCCESS;
+    PVAD_SNAPSHOT_ENTRY CurrentSnap = NULL;
+    PVAD_SNAPSHOT_ENTRY OldSnap = NULL;
+    ULONG CurrentCount = 0;
+    ULONG OldCount = 0;
+    ULONG MaxEntries;
+    ULONG ci, oi;
+    PLIST_ENTRY Entry;
 
-    return STATUS_NOT_IMPLEMENTED;
+    //
+    // Allocate buffer for current snapshot
+    //
+    MaxEntries = (ULONG)min(
+        (ULONG)InterlockedCompareExchange(&Context->RegionCount, 0, 0),
+        VAD_SNAPSHOT_MAX_ENTRIES
+        );
+
+    if (MaxEntries == 0 && !Context->Snapshot.Valid) {
+        return STATUS_SUCCESS;  // Nothing to compare
+    }
+
+    CurrentSnap = (PVAD_SNAPSHOT_ENTRY)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        (SIZE_T)(MaxEntries + 1) * sizeof(VAD_SNAPSHOT_ENTRY),
+        VAD_POOL_TAG_SNAPSHOT
+        );
+
+    if (CurrentSnap == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
+    // Step 1: Snapshot current regions under shared lock
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Context->RegionLock);
+
+    for (Entry = Context->RegionList.Flink;
+         Entry != &Context->RegionList && CurrentCount < MaxEntries;
+         Entry = Entry->Flink) {
+
+        PVAD_REGION Region = CONTAINING_RECORD(Entry, VAD_REGION, ListEntry);
+        CurrentSnap[CurrentCount].BaseAddress = Region->BaseAddress;
+        CurrentSnap[CurrentCount].RegionSize  = Region->RegionSize;
+        CurrentSnap[CurrentCount].Protection  = Region->Protection;
+        CurrentSnap[CurrentCount].Type        = Region->Type;
+        CurrentSnap[CurrentCount].State       = Region->State;
+        CurrentSnap[CurrentCount].Flags       = Region->CurrentFlags;
+        CurrentCount++;
+    }
+
+    ExReleasePushLockShared(&Context->RegionLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Step 2: If no previous snapshot exists, store current and return
+    //
+    if (!Context->Snapshot.Valid || Context->Snapshot.SnapshotBuffer == NULL) {
+        goto StoreSnapshot;
+    }
+
+    OldSnap = (PVAD_SNAPSHOT_ENTRY)Context->Snapshot.SnapshotBuffer;
+    OldCount = Context->Snapshot.SnapshotSize;
+
+    //
+    // Step 3: Merge-compare both sorted arrays (both sorted by BaseAddress)
+    //
+    ci = 0;
+    oi = 0;
+
+    while (ci < CurrentCount && oi < OldCount) {
+        ULONG_PTR curBase = (ULONG_PTR)CurrentSnap[ci].BaseAddress;
+        ULONG_PTR oldBase = (ULONG_PTR)OldSnap[oi].BaseAddress;
+
+        if (curBase == oldBase) {
+            //
+            // Same region — check for changes
+            //
+            if (CurrentSnap[ci].Protection != OldSnap[oi].Protection) {
+                //
+                // Protection changed
+                //
+                VAD_CHANGE_EVENT ChangeEvent;
+                RtlZeroMemory(&ChangeEvent, sizeof(ChangeEvent));
+                ChangeEvent.ChangeType = VadChange_ProtectionChanged;
+                ChangeEvent.ProcessId = Context->ProcessId;
+                ChangeEvent.BaseAddress = CurrentSnap[ci].BaseAddress;
+                ChangeEvent.RegionSize = CurrentSnap[ci].RegionSize;
+                ChangeEvent.OldFlags = OldSnap[oi].Flags;
+                ChangeEvent.NewFlags = CurrentSnap[ci].Flags;
+                ChangeEvent.OldProtection = OldSnap[oi].Protection;
+                ChangeEvent.NewProtection = CurrentSnap[ci].Protection;
+                ChangeEvent.SuspicionFlags = VadSuspicion_None;
+                ChangeEvent.SuspicionScore = 0;
+                KeQuerySystemTime(&ChangeEvent.Timestamp);
+
+                //
+                // RW→RX transition is highly suspicious (unpacking)
+                //
+                if ((OldSnap[oi].Flags & VadFlag_Write) &&
+                    !(OldSnap[oi].Flags & VadFlag_Execute) &&
+                    (CurrentSnap[ci].Flags & VadFlag_Execute)) {
+                    ChangeEvent.SuspicionFlags |= VadSuspicion_RecentRWtoRX;
+                    ChangeEvent.SuspicionScore = 70;
+                }
+
+                //
+                // New RWX is critical
+                //
+                if ((CurrentSnap[ci].Flags & (VadFlag_Read | VadFlag_Write | VadFlag_Execute)) ==
+                    (VadFlag_Read | VadFlag_Write | VadFlag_Execute)) {
+                    ChangeEvent.SuspicionFlags |= VadSuspicion_RWX;
+                    ChangeEvent.SuspicionScore += 100;
+                }
+
+                VadpQueueChangeEvent(Tracker, &ChangeEvent);
+                InterlockedIncrement64(&Tracker->Public.Stats.ProtectionChanges);
+            }
+
+            if (CurrentSnap[ci].RegionSize != OldSnap[oi].RegionSize) {
+                //
+                // Region size changed
+                //
+                VAD_CHANGE_EVENT ChangeEvent;
+                RtlZeroMemory(&ChangeEvent, sizeof(ChangeEvent));
+                ChangeEvent.ChangeType = (CurrentSnap[ci].RegionSize > OldSnap[oi].RegionSize)
+                    ? VadChange_RegionGrew : VadChange_RegionShrunk;
+                ChangeEvent.ProcessId = Context->ProcessId;
+                ChangeEvent.BaseAddress = CurrentSnap[ci].BaseAddress;
+                ChangeEvent.RegionSize = CurrentSnap[ci].RegionSize;
+                ChangeEvent.OldFlags = OldSnap[oi].Flags;
+                ChangeEvent.NewFlags = CurrentSnap[ci].Flags;
+                ChangeEvent.OldProtection = OldSnap[oi].Protection;
+                ChangeEvent.NewProtection = CurrentSnap[ci].Protection;
+                KeQuerySystemTime(&ChangeEvent.Timestamp);
+
+                VadpQueueChangeEvent(Tracker, &ChangeEvent);
+            }
+
+            ci++;
+            oi++;
+
+        } else if (curBase < oldBase) {
+            //
+            // Region in current but not in old → newly created
+            //
+            VAD_CHANGE_EVENT ChangeEvent;
+            RtlZeroMemory(&ChangeEvent, sizeof(ChangeEvent));
+            ChangeEvent.ChangeType = VadChange_RegionCreated;
+            ChangeEvent.ProcessId = Context->ProcessId;
+            ChangeEvent.BaseAddress = CurrentSnap[ci].BaseAddress;
+            ChangeEvent.RegionSize = CurrentSnap[ci].RegionSize;
+            ChangeEvent.NewFlags = CurrentSnap[ci].Flags;
+            ChangeEvent.NewProtection = CurrentSnap[ci].Protection;
+            KeQuerySystemTime(&ChangeEvent.Timestamp);
+
+            //
+            // New unbacked executable region is suspicious
+            //
+            if ((CurrentSnap[ci].Flags & VadFlag_Private) &&
+                (CurrentSnap[ci].Flags & VadFlag_Execute)) {
+                ChangeEvent.SuspicionFlags |= VadSuspicion_UnbackedExecute;
+                ChangeEvent.SuspicionScore = 80;
+            }
+
+            VadpQueueChangeEvent(Tracker, &ChangeEvent);
+            ci++;
+
+        } else {
+            //
+            // Region in old but not in current → deleted
+            //
+            VAD_CHANGE_EVENT ChangeEvent;
+            RtlZeroMemory(&ChangeEvent, sizeof(ChangeEvent));
+            ChangeEvent.ChangeType = VadChange_RegionDeleted;
+            ChangeEvent.ProcessId = Context->ProcessId;
+            ChangeEvent.BaseAddress = OldSnap[oi].BaseAddress;
+            ChangeEvent.RegionSize = OldSnap[oi].RegionSize;
+            ChangeEvent.OldFlags = OldSnap[oi].Flags;
+            ChangeEvent.OldProtection = OldSnap[oi].Protection;
+            KeQuerySystemTime(&ChangeEvent.Timestamp);
+
+            VadpQueueChangeEvent(Tracker, &ChangeEvent);
+            oi++;
+        }
+    }
+
+    //
+    // Remaining current entries are newly created
+    //
+    while (ci < CurrentCount) {
+        VAD_CHANGE_EVENT ChangeEvent;
+        RtlZeroMemory(&ChangeEvent, sizeof(ChangeEvent));
+        ChangeEvent.ChangeType = VadChange_RegionCreated;
+        ChangeEvent.ProcessId = Context->ProcessId;
+        ChangeEvent.BaseAddress = CurrentSnap[ci].BaseAddress;
+        ChangeEvent.RegionSize = CurrentSnap[ci].RegionSize;
+        ChangeEvent.NewFlags = CurrentSnap[ci].Flags;
+        ChangeEvent.NewProtection = CurrentSnap[ci].Protection;
+        KeQuerySystemTime(&ChangeEvent.Timestamp);
+
+        if ((CurrentSnap[ci].Flags & VadFlag_Private) &&
+            (CurrentSnap[ci].Flags & VadFlag_Execute)) {
+            ChangeEvent.SuspicionFlags |= VadSuspicion_UnbackedExecute;
+            ChangeEvent.SuspicionScore = 80;
+        }
+
+        VadpQueueChangeEvent(Tracker, &ChangeEvent);
+        ci++;
+    }
+
+    //
+    // Remaining old entries were deleted
+    //
+    while (oi < OldCount) {
+        VAD_CHANGE_EVENT ChangeEvent;
+        RtlZeroMemory(&ChangeEvent, sizeof(ChangeEvent));
+        ChangeEvent.ChangeType = VadChange_RegionDeleted;
+        ChangeEvent.ProcessId = Context->ProcessId;
+        ChangeEvent.BaseAddress = OldSnap[oi].BaseAddress;
+        ChangeEvent.RegionSize = OldSnap[oi].RegionSize;
+        ChangeEvent.OldFlags = OldSnap[oi].Flags;
+        ChangeEvent.OldProtection = OldSnap[oi].Protection;
+        KeQuerySystemTime(&ChangeEvent.Timestamp);
+
+        VadpQueueChangeEvent(Tracker, &ChangeEvent);
+        oi++;
+    }
+
+StoreSnapshot:
+    //
+    // Step 4: Replace old snapshot with current
+    //
+    if (Context->Snapshot.SnapshotBuffer != NULL) {
+        ExFreePoolWithTag(Context->Snapshot.SnapshotBuffer, VAD_POOL_TAG_SNAPSHOT);
+    }
+
+    Context->Snapshot.SnapshotBuffer = CurrentSnap;
+    Context->Snapshot.SnapshotSize = CurrentCount;
+    KeQuerySystemTime(&Context->Snapshot.SnapshotTime);
+    Context->Snapshot.Valid = TRUE;
+
+    return Status;
 }
 
 static ULONG

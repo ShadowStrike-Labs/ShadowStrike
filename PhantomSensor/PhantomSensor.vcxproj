@@ -165,6 +165,9 @@
     <ClCompile Include="PhantomSensor\ETW\EventSchema.c" />
     <ClCompile Include="PhantomSensor\ETW\ManifestGenerator.c" />
     <ClCompile Include="PhantomSensor\ETW\TelemetryEvents.c" />
+    <ClCompile Include="PhantomSensor\Exclusions\ExclusionManager.c" />
+    <ClCompile Include="PhantomSensor\Exclusions\PathExclusion.c" />
+    <ClCompile Include="PhantomSensor\Exclusions\ProcessExclusion.c" />
     <ClCompile Include="PhantomSensor\Memory\HeapSpray.c" />
     <ClCompile Include="PhantomSensor\Memory\HollowingDetector.c" />
     <ClCompile Include="PhantomSensor\Memory\InjectionDetector.c" />
@@ -244,6 +247,7 @@
     <ClInclude Include="PhantomSensor\ETW\EventSchema.h" />
     <ClInclude Include="PhantomSensor\ETW\ManifestGenerator.h" />
     <ClInclude Include="PhantomSensor\ETW\TelemetryEvents.h" />
+    <ClInclude Include="PhantomSensor\Exclusions\ExclusionManager.h" />
     <ClInclude Include="PhantomSensor\Memory\HeapSpray.h" />
     <ClInclude Include="PhantomSensor\Memory\HollowingDetector.h" />
     <ClInclude Include="PhantomSensor\Memory\InjectionDetector.h" />

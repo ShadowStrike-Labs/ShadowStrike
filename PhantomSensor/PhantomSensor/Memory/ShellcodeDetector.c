@@ -466,7 +466,6 @@ Return Value:
 --*/
 {
     PSD_DETECTOR detector = NULL;
-    NTSTATUS status = STATUS_SUCCESS;
     LONG prevState;
 
     PAGED_CODE();
@@ -568,7 +567,6 @@ Routine Description:
 --*/
 {
     LONG prevState;
-    LARGE_INTEGER timeout;
 
     PAGED_CODE();
 
@@ -586,16 +584,17 @@ Routine Description:
     }
 
     //
-    // Release the init reference, then wait for active operations to drain
+    // Release the init reference, then wait for active operations to drain.
+    // SC-2 fix: MUST use INFINITE wait — cannot safely free while ops in flight.
+    // A bounded timeout would proceed to free memory that active scans still reference.
     //
     if (InterlockedDecrement(&Detector->ActiveOperations) > 0) {
-        timeout.QuadPart = SD_SHUTDOWN_TIMEOUT_100NS;
         KeWaitForSingleObject(
             &Detector->ShutdownEvent,
             Executive,
             KernelMode,
             FALSE,
-            &timeout
+            NULL
         );
     }
 
@@ -626,7 +625,10 @@ SdSetConfig(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!SdpIsReady(Detector)) {
+    //
+    // SC-5 fix: Hold reference during config update to prevent shutdown race
+    //
+    if (!SdpAcquireReference(Detector)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -639,6 +641,7 @@ SdSetConfig(
     ExReleasePushLockExclusive(&Detector->ConfigLock);
     KeLeaveCriticalRegion();
 
+    SdpReleaseReference(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -677,7 +680,6 @@ Return Value:
     PSD_DETECTION_RESULT result = NULL;
     SD_SCAN_CONTEXT context;
     SD_CONFIG config;
-    NTSTATUS status = STATUS_SUCCESS;
 
     if (Detector == NULL || Buffer == NULL || Size == 0 || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -986,8 +988,55 @@ Routine Description:
     status = SdAnalyzeBuffer(Detector, buffer, copiedSize, Result);
 
     if (NT_SUCCESS(status) && *Result != NULL) {
+        //
+        // SC-3 fix: Rebase all scan-buffer-relative pointers to process address space.
+        // SdAnalyzeBuffer stored kernel temp-buffer pointers; we must convert them
+        // to the original process addresses before freeing the temp buffer.
+        //
+        ULONG_PTR bufBase = (ULONG_PTR)buffer;
+        ULONG_PTR procBase = (ULONG_PTR)Address;
+
         (*Result)->ProcessId = ProcessId;
         (*Result)->Address = Address;
+
+        if ((*Result)->NopSled.StartAddress != NULL) {
+            (*Result)->NopSled.StartAddress = (PVOID)(procBase +
+                ((ULONG_PTR)(*Result)->NopSled.StartAddress - bufBase));
+        }
+        if ((*Result)->EggHunter.HunterAddress != NULL) {
+            (*Result)->EggHunter.HunterAddress = (PVOID)(procBase +
+                ((ULONG_PTR)(*Result)->EggHunter.HunterAddress - bufBase));
+        }
+        if ((*Result)->StackPivot.GadgetAddress != NULL) {
+            (*Result)->StackPivot.GadgetAddress = (PVOID)(procBase +
+                ((ULONG_PTR)(*Result)->StackPivot.GadgetAddress - bufBase));
+        }
+
+        //
+        // Rebase ULONG64 addresses (stored as casts of kernel buffer pointers)
+        //
+        if ((*Result)->Encoder.LoopStart != 0) {
+            (*Result)->Encoder.LoopStart = (ULONG64)(procBase +
+                ((*Result)->Encoder.LoopStart - (ULONG64)bufBase));
+        }
+        if ((*Result)->Encoder.LoopEnd != 0) {
+            (*Result)->Encoder.LoopEnd = (ULONG64)(procBase +
+                ((*Result)->Encoder.LoopEnd - (ULONG64)bufBase));
+        }
+        if ((*Result)->ApiHashing.ResolutionCodeStart != 0) {
+            (*Result)->ApiHashing.ResolutionCodeStart = (ULONG64)(procBase +
+                ((*Result)->ApiHashing.ResolutionCodeStart - (ULONG64)bufBase));
+        }
+
+        {
+            ULONG sc;
+            for (sc = 0; sc < (*Result)->Syscalls.Count && sc < 16; sc++) {
+                if ((*Result)->Syscalls.Syscalls[sc].StubAddress != 0) {
+                    (*Result)->Syscalls.Syscalls[sc].StubAddress = (ULONG64)(procBase +
+                        ((*Result)->Syscalls.Syscalls[sc].StubAddress - (ULONG64)bufBase));
+                }
+            }
+        }
     }
 
     //
@@ -1186,7 +1235,10 @@ SdDetectNopSled(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!SdpIsReady(Detector)) {
+    //
+    // SC-4 fix: Acquire reference to prevent shutdown freeing detector mid-operation
+    //
+    if (!SdpAcquireReference(Detector)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1195,6 +1247,7 @@ SdDetectNopSled(
     if (Length != NULL) *Length = 0;
 
     if (Size < SD_NOP_SLED_MIN_LENGTH) {
+        SdpReleaseReference(Detector);
         return STATUS_SUCCESS;
     }
 
@@ -1209,6 +1262,7 @@ SdDetectNopSled(
         if (Length != NULL) *Length = length;
     }
 
+    SdpReleaseReference(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -1228,13 +1282,14 @@ SdDetectEncoder(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!SdpIsReady(Detector)) {
+    if (!SdpAcquireReference(Detector)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
     RtlZeroMemory(EncoderInfo, sizeof(SD_ENCODER_INFO));
 
     if (Size < 16) {
+        SdpReleaseReference(Detector);
         return STATUS_SUCCESS;
     }
 
@@ -1245,6 +1300,7 @@ SdDetectEncoder(
 
     SdpDetectEncoderLoop(&context, EncoderInfo);
 
+    SdpReleaseReference(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -1264,13 +1320,14 @@ SdDetectApiHashing(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!SdpIsReady(Detector)) {
+    if (!SdpAcquireReference(Detector)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
     RtlZeroMemory(ApiHashInfo, sizeof(SD_API_HASH_INFO));
 
     if (Size < 16) {
+        SdpReleaseReference(Detector);
         return STATUS_SUCCESS;
     }
 
@@ -1281,6 +1338,7 @@ SdDetectApiHashing(
 
     SdpDetectApiHashing(&context, ApiHashInfo);
 
+    SdpReleaseReference(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -1304,7 +1362,7 @@ SdDetectDirectSyscall(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!SdpIsReady(Detector)) {
+    if (!SdpAcquireReference(Detector)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1312,6 +1370,7 @@ SdDetectDirectSyscall(
     RtlZeroMemory(Syscalls, MaxSyscalls * sizeof(SD_SYSCALL_INFO));
 
     if (Size < sizeof(g_SyscallPatternX64) + 4) {
+        SdpReleaseReference(Detector);
         return STATUS_SUCCESS;
     }
 
@@ -1375,6 +1434,7 @@ SdDetectDirectSyscall(
 
     *SyscallCount = count;
 
+    SdpReleaseReference(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -1529,24 +1589,259 @@ SdLoadApiHashDatabase(
     _In_ PSD_DETECTOR Detector,
     _In_ PUNICODE_STRING FilePath
     )
+/*++
+Routine Description:
+    Loads an API hash database from a binary file on disk.
+
+    File format (ShadowStrike API Hash Database v1):
+      Offset 0x00: ULONG Magic    = 'SDHB' (0x42484453)
+      Offset 0x04: ULONG Version  = 1
+      Offset 0x08: ULONG Count    = number of entries
+      Offset 0x0C: ULONG Checksum = XOR32 of all bytes after header (16..EOF)
+      Offset 0x10: Entry[0] { ULONG Hash; CHAR ApiName[64]; CHAR DllName[32]; }
+      Offset 0x74: Entry[1] ...
+
+    Security:
+      - File size validated against declared entry count
+      - Checksum validated before loading any entries
+      - All string fields validated for null-termination
+      - Entry count capped at SD_MAX_API_HASHES
+      - File opened with FILE_SHARE_READ only
+--*/
 {
+    NTSTATUS Status;
+    HANDLE FileHandle = NULL;
+    OBJECT_ATTRIBUTES ObjectAttributes;
+    IO_STATUS_BLOCK IoStatus;
+    FILE_STANDARD_INFORMATION FileInfo;
+    PVOID FileBuffer = NULL;
+    PUCHAR Data;
+    ULONG Magic, Version, Count, StoredChecksum, ComputedChecksum;
+    ULONG DataOffset, DataSize, EntrySize, i;
+    ULONG LoadedCount = 0;
+
     PAGED_CODE();
 
-    //
-    // M-1 LIMITATION: File-based API hash database loading is NOT implemented.
-    // The detector uses a hardcoded built-in database (SdpInitializeApiHashDatabase).
-    // To add custom hash entries at runtime, use SdAddApiHash() directly.
-    // A future implementation should:
-    //   1. Open FilePath with ZwCreateFile
-    //   2. Parse a structured format (JSON/binary) with hash → API name mappings
-    //   3. Call SdAddApiHash for each entry
-    //   4. Validate file integrity (signature/checksum) before loading
-    //
+    if (Detector == NULL || FilePath == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
-    UNREFERENCED_PARAMETER(Detector);
-    UNREFERENCED_PARAMETER(FilePath);
+    if (FilePath->Length == 0 || FilePath->Buffer == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
-    return STATUS_NOT_IMPLEMENTED;
+    if (!SdpAcquireReference(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Open file — kernel-handle, sequential read, share-read only
+    //
+    InitializeObjectAttributes(
+        &ObjectAttributes,
+        FilePath,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+        NULL,
+        NULL
+        );
+
+    Status = ZwCreateFile(
+        &FileHandle,
+        FILE_READ_DATA | SYNCHRONIZE,
+        &ObjectAttributes,
+        &IoStatus,
+        NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_SEQUENTIAL_ONLY,
+        NULL,
+        0
+        );
+
+    if (!NT_SUCCESS(Status)) {
+        SdpReleaseReference(Detector);
+        return Status;
+    }
+
+    //
+    // Query file size — reject empty files and files > 4MB (sanity cap)
+    //
+    Status = ZwQueryInformationFile(
+        FileHandle,
+        &IoStatus,
+        &FileInfo,
+        sizeof(FileInfo),
+        FileStandardInformation
+        );
+
+    if (!NT_SUCCESS(Status)) {
+        goto Cleanup;
+    }
+
+    #define SD_HASHDB_HEADER_SIZE   16
+    #define SD_HASHDB_ENTRY_SIZE    100  // 4 (hash) + 64 (api) + 32 (dll)
+    #define SD_HASHDB_MAGIC         0x42484453  // 'SDHB'
+    #define SD_HASHDB_VERSION       1
+    #define SD_HASHDB_MAX_FILE_SIZE (4 * 1024 * 1024)
+
+    if (FileInfo.EndOfFile.QuadPart < SD_HASHDB_HEADER_SIZE ||
+        FileInfo.EndOfFile.QuadPart > SD_HASHDB_MAX_FILE_SIZE) {
+        Status = STATUS_INVALID_IMAGE_FORMAT;
+        goto Cleanup;
+    }
+
+    //
+    // Allocate buffer and read entire file
+    //
+    FileBuffer = ShadowStrikeAllocatePoolWithTag(
+        PagedPool,
+        (SIZE_T)FileInfo.EndOfFile.QuadPart,
+        SD_POOL_TAG_BUFFER
+        );
+
+    if (FileBuffer == NULL) {
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Cleanup;
+    }
+
+    {
+        LARGE_INTEGER ByteOffset;
+        ByteOffset.QuadPart = 0;
+
+        Status = ZwReadFile(
+            FileHandle,
+            NULL,
+            NULL,
+            NULL,
+            &IoStatus,
+            FileBuffer,
+            (ULONG)FileInfo.EndOfFile.QuadPart,
+            &ByteOffset,
+            NULL
+            );
+    }
+
+    if (!NT_SUCCESS(Status)) {
+        goto Cleanup;
+    }
+
+    if (IoStatus.Information < SD_HASHDB_HEADER_SIZE) {
+        Status = STATUS_INVALID_IMAGE_FORMAT;
+        goto Cleanup;
+    }
+
+    //
+    // Parse header
+    //
+    Data = (PUCHAR)FileBuffer;
+    Magic           = *(ULONG*)&Data[0];
+    Version         = *(ULONG*)&Data[4];
+    Count           = *(ULONG*)&Data[8];
+    StoredChecksum  = *(ULONG*)&Data[12];
+
+    if (Magic != SD_HASHDB_MAGIC) {
+        Status = STATUS_INVALID_IMAGE_FORMAT;
+        goto Cleanup;
+    }
+
+    if (Version != SD_HASHDB_VERSION) {
+        Status = STATUS_REVISION_MISMATCH;
+        goto Cleanup;
+    }
+
+    //
+    // Cap entry count — never exceed our maximum
+    //
+    if (Count > SD_MAX_API_HASHES) {
+        Count = SD_MAX_API_HASHES;
+    }
+
+    if (Count == 0) {
+        Status = STATUS_SUCCESS;
+        goto Cleanup;
+    }
+
+    //
+    // Validate file size vs declared count
+    //
+    DataOffset = SD_HASHDB_HEADER_SIZE;
+    EntrySize = SD_HASHDB_ENTRY_SIZE;
+
+    if (IoStatus.Information < (SIZE_T)(DataOffset + (SIZE_T)Count * EntrySize)) {
+        Status = STATUS_INVALID_IMAGE_FORMAT;
+        goto Cleanup;
+    }
+
+    DataSize = (ULONG)(Count * EntrySize);
+
+    //
+    // Verify checksum (XOR32 over all entry data bytes)
+    //
+    ComputedChecksum = 0;
+    for (i = 0; i < DataSize; i++) {
+        ComputedChecksum ^= (ULONG)Data[DataOffset + i] << ((i & 3) * 8);
+    }
+
+    if (ComputedChecksum != StoredChecksum) {
+        Status = STATUS_IMAGE_CHECKSUM_MISMATCH;
+        goto Cleanup;
+    }
+
+    //
+    // Load each entry via SdAddApiHash (handles locking and allocation)
+    //
+    for (i = 0; i < Count; i++) {
+        PUCHAR EntryPtr = &Data[DataOffset + (SIZE_T)i * EntrySize];
+        ULONG Hash      = *(ULONG*)&EntryPtr[0];
+        PCSTR ApiName   = (PCSTR)&EntryPtr[4];
+        PCSTR DllName   = (PCSTR)&EntryPtr[68];
+
+        //
+        // Validate null-termination within field bounds.
+        // A malformed file could omit terminators → unbounded string ops.
+        //
+        BOOLEAN ApiTerminated = FALSE;
+        BOOLEAN DllTerminated = FALSE;
+        ULONG j;
+
+        for (j = 0; j < 64; j++) {
+            if (ApiName[j] == '\0') { ApiTerminated = TRUE; break; }
+        }
+        for (j = 0; j < 32; j++) {
+            if (DllName[j] == '\0') { DllTerminated = TRUE; break; }
+        }
+
+        if (!ApiTerminated || !DllTerminated) {
+            continue;  // Skip malformed entry
+        }
+
+        if (ApiName[0] == '\0' || DllName[0] == '\0') {
+            continue;  // Skip empty entries
+        }
+
+        Status = SdAddApiHash(Detector, Hash, ApiName, DllName);
+        if (NT_SUCCESS(Status)) {
+            LoadedCount++;
+        } else if (Status == STATUS_QUOTA_EXCEEDED) {
+            break;  // Hash table full
+        }
+        // Other errors (e.g., INSUFFICIENT_RESOURCES) — skip entry, continue
+    }
+
+    Status = (LoadedCount > 0) ? STATUS_SUCCESS : STATUS_NO_MORE_ENTRIES;
+
+Cleanup:
+    if (FileBuffer != NULL) {
+        ShadowStrikeFreePoolWithTag(FileBuffer, SD_POOL_TAG_BUFFER);
+    }
+
+    if (FileHandle != NULL) {
+        ZwClose(FileHandle);
+    }
+
+    SdpReleaseReference(Detector);
+    return Status;
 }
 
 
@@ -1584,7 +1879,10 @@ SdGetStatistics(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!SdpIsReady(Detector)) {
+    //
+    // SC-5 fix: Hold reference during stats read
+    //
+    if (!SdpAcquireReference(Detector)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1603,6 +1901,7 @@ SdGetStatistics(
     KeQuerySystemTime(&currentTime);
     Stats->UpTime.QuadPart = currentTime.QuadPart - Detector->Stats.StartTime.QuadPart;
 
+    SdpReleaseReference(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -1650,7 +1949,6 @@ Routine Description:
 
 --*/
 {
-    NTSTATUS status;
 
     //
     // Internal helper to add a hash entry without the SdpIsReady check.
@@ -2109,6 +2407,13 @@ Routine Description:
         size = SD_ENCODER_LOOP_MAX_SIZE * 4;
     }
 
+    //
+    // SC-8 fix: Guard against SIZE_T underflow (size - 4 wraps if size < 4)
+    //
+    if (size < 5) {
+        return FALSE;
+    }
+
     for (i = 0; i < size - 4; i++) {
         //
         // XOR encoding patterns
@@ -2223,6 +2528,8 @@ SdpDetectApiHashing(
 Routine Description:
 
     Detects API hash resolution patterns and attempts to resolve hashes.
+    SC-6 fix: Acquires hash database lock ONCE for all lookups instead of
+    per-candidate (eliminates thousands of lock acquire/release cycles per scan).
 
 --*/
 {
@@ -2230,76 +2537,83 @@ Routine Description:
     SIZE_T size = Context->Size;
     SIZE_T i;
     ULONG hashesFound = 0;
+    PSD_DETECTOR detector = Context->Detector;
+    PLIST_ENTRY hashTable;
 
     RtlZeroMemory(ApiHashInfo, sizeof(SD_API_HASH_INFO));
 
     //
-    // Look for common API hash patterns
+    // SC-8 fix: Guard against SIZE_T underflow
     //
-    for (i = 0; i < size - 4 && hashesFound < 32; i++) {
+    if (size < 5) {
+        return FALSE;
+    }
+
+    //
+    // SC-6: Acquire hash lock once for all lookups in this scan
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&detector->ApiHashes.Lock);
+
+    hashTable = (PLIST_ENTRY)detector->ApiHashes.HashTable;
+    if (hashTable == NULL) {
+        ExReleasePushLockShared(&detector->ApiHashes.Lock);
+        KeLeaveCriticalRegion();
+        return FALSE;
+    }
+
+    for (i = 0; i <= size - 5 && hashesFound < 32; i++) {
+        ULONG potentialHash = 0;
+        BOOLEAN isCandidate = FALSE;
+
         //
         // Pattern: MOV EAX/ECX/EDX, imm32 (hash value)
-        // B8 xx xx xx xx / B9 xx xx xx xx / BA xx xx xx xx
         //
         if (buffer[i] == 0xB8 || buffer[i] == 0xB9 || buffer[i] == 0xBA) {
-            if (i + 5 <= size) {
-                ULONG potentialHash = SdpReadUnalignedUlong(&buffer[i + 1]);
-                //
-                CHAR apiName[64] = {0};
-                CHAR dllName[32] = {0};
+            potentialHash = SdpReadUnalignedUlong(&buffer[i + 1]);
+            isCandidate = TRUE;
+        }
+        //
+        // Pattern: PUSH imm32 (hash value on stack)
+        //
+        else if (buffer[i] == 0x68) {
+            potentialHash = SdpReadUnalignedUlong(&buffer[i + 1]);
+            isCandidate = TRUE;
+        }
 
-                if (NT_SUCCESS(SdLookupApiHash(Context->Detector, potentialHash,
-                                               apiName, sizeof(apiName),
-                                               dllName, sizeof(dllName)))) {
-                    //
-                    // Found a known hash!
-                    //
+        if (isCandidate) {
+            //
+            // Inline hash lookup under already-held lock
+            //
+            PLIST_ENTRY entry;
+            for (entry = hashTable->Flink; entry != hashTable; entry = entry->Flink) {
+                PSD_API_HASH_ENTRY hashEntry = CONTAINING_RECORD(
+                    entry, SD_API_HASH_ENTRY, ListEntry);
+
+                if (hashEntry->Hash == potentialHash) {
                     ApiHashInfo->Algorithm = HashAlgorithm_ROR13;
                     ApiHashInfo->ResolvedApis[hashesFound].Hash = potentialHash;
-                    RtlStringCchCopyA(ApiHashInfo->ResolvedApis[hashesFound].ApiName,
-                                     sizeof(ApiHashInfo->ResolvedApis[hashesFound].ApiName),
-                                     apiName);
-                    RtlStringCchCopyA(ApiHashInfo->ResolvedApis[hashesFound].DllName,
-                                     sizeof(ApiHashInfo->ResolvedApis[hashesFound].DllName),
-                                     dllName);
+                    RtlStringCchCopyA(
+                        ApiHashInfo->ResolvedApis[hashesFound].ApiName,
+                        sizeof(ApiHashInfo->ResolvedApis[hashesFound].ApiName),
+                        hashEntry->ApiName);
+                    RtlStringCchCopyA(
+                        ApiHashInfo->ResolvedApis[hashesFound].DllName,
+                        sizeof(ApiHashInfo->ResolvedApis[hashesFound].DllName),
+                        hashEntry->DllName);
                     hashesFound++;
 
                     if (ApiHashInfo->ResolutionCodeStart == 0) {
                         ApiHashInfo->ResolutionCodeStart = (ULONG64)&buffer[i];
                     }
-                }
-            }
-        }
-
-        //
-        // Pattern: PUSH imm32 (hash value on stack)
-        // 68 xx xx xx xx
-        //
-        if (buffer[i] == 0x68 && i + 5 <= size) {
-            ULONG potentialHash = SdpReadUnalignedUlong(&buffer[i + 1]);
-
-            CHAR apiName[64] = {0};
-            CHAR dllName[32] = {0};
-
-            if (NT_SUCCESS(SdLookupApiHash(Context->Detector, potentialHash,
-                                           apiName, sizeof(apiName),
-                                           dllName, sizeof(dllName)))) {
-                ApiHashInfo->Algorithm = HashAlgorithm_ROR13;
-                ApiHashInfo->ResolvedApis[hashesFound].Hash = potentialHash;
-                RtlStringCchCopyA(ApiHashInfo->ResolvedApis[hashesFound].ApiName,
-                                 sizeof(ApiHashInfo->ResolvedApis[hashesFound].ApiName),
-                                 apiName);
-                RtlStringCchCopyA(ApiHashInfo->ResolvedApis[hashesFound].DllName,
-                                 sizeof(ApiHashInfo->ResolvedApis[hashesFound].DllName),
-                                 dllName);
-                hashesFound++;
-
-                if (ApiHashInfo->ResolutionCodeStart == 0) {
-                    ApiHashInfo->ResolutionCodeStart = (ULONG64)&buffer[i];
+                    break;
                 }
             }
         }
     }
+
+    ExReleasePushLockShared(&detector->ApiHashes.Lock);
+    KeLeaveCriticalRegion();
 
     ApiHashInfo->ResolvedCount = hashesFound;
 
@@ -2323,6 +2637,13 @@ Routine Description:
     SIZE_T size = Context->Size;
     SIZE_T i;
     ULONG syscallCount = 0;
+
+    //
+    // SC-8 fix: Guard against SIZE_T underflow
+    //
+    if (size < 9) {
+        return FALSE;
+    }
 
     for (i = 0; i < size - 8; i++) {
         //
@@ -2412,6 +2733,13 @@ Routine Description:
     SIZE_T size = Context->Size;
     SIZE_T i;
 
+    //
+    // SC-8 fix: Guard against SIZE_T underflow
+    //
+    if (size < 13) {
+        return FALSE;
+    }
+
     for (i = 0; i < size - 12; i++) {
         //
         // JMP FAR to 0x33 segment
@@ -2464,6 +2792,13 @@ Routine Description:
     SIZE_T size = Context->Size;
     SIZE_T i;
     ULONG gadgetCount = 0;
+
+    //
+    // SC-8 fix: Guard against SIZE_T underflow
+    //
+    if (size < 5) {
+        return FALSE;
+    }
 
     for (i = 0; i < size - 4; i++) {
         BOOLEAN isGadget = FALSE;
