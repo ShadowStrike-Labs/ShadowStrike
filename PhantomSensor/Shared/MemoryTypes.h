@@ -722,6 +722,10 @@ typedef struct _MEMORY_MONITOR_CONFIG {
     BOOLEAN EnableInjectionDetection;
     BOOLEAN EnableHollowingDetection;
     BOOLEAN EnableVADTracking;
+    BOOLEAN EnableHeapSprayDetection;
+    BOOLEAN EnableROPDetection;
+    BOOLEAN EnableSectionTracking;
+    UINT8 Reserved1;
     
     UINT32 MinAllocationSizeToTrack;      // Minimum size (bytes)
     UINT32 MaxEventsPerSecond;            // Rate limiting

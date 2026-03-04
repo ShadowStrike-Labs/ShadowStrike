@@ -25,7 +25,7 @@
  *
  * Provides comprehensive process introspection capabilities for threat
  * detection, behavioral analysis, and security monitoring. This module
- * is designed to handle millions of process events per day on Fortune 500
+ * is designed to handle millions of process events per day on enterprise
  * endpoints with zero tolerance for failures or security bypasses.
  *
  * Implementation Features:

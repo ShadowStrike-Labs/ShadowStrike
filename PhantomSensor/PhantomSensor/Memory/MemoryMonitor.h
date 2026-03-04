@@ -188,11 +188,27 @@ typedef struct _MEMORY_MONITOR_GLOBALS {
     NPAGED_LOOKASIDE_LIST ContextLookaside;
     NPAGED_LOOKASIDE_LIST EventLookaside;
     
+    //
+    // Sub-module detector instances.
+    // Stored as PVOID here to avoid pulling sub-module headers into the globals struct.
+    // Cast to the concrete type (PHS_DETECTOR, PROP_DETECTOR, etc.) in MemoryMonitor.c.
+    //
+    PVOID HeapSprayDetector;      // PHS_DETECTOR
+    PVOID ROPDetector;            // PROP_DETECTOR
+    PVOID SectionTracker;         // PSEC_TRACKER
+    PVOID InjectionDetector;      // PINJ_DETECTOR
+    PVOID HollowingDetector;      // PPH_DETECTOR
+    PVOID ShellcodeDetector;      // PSD_DETECTOR
+    PVOID VadTracker;             // PVAD_TRACKER
+    
     // Statistics
     volatile LONG64 TotalEventsProcessed;
     volatile LONG64 TotalShellcodeDetections;
     volatile LONG64 TotalInjectionDetections;
     volatile LONG64 TotalHollowingDetections;
+    volatile LONG64 TotalHeapSprayDetections;
+    volatile LONG64 TotalROPDetections;
+    volatile LONG64 TotalSectionAnomalies;
     volatile LONG64 EventsDropped;
     
     // Rate limiting
@@ -216,6 +232,9 @@ typedef struct _MEMORY_MONITOR_STATISTICS {
     LONG64 TotalShellcodeDetections;
     LONG64 TotalInjectionDetections;
     LONG64 TotalHollowingDetections;
+    LONG64 TotalHeapSprayDetections;
+    LONG64 TotalROPDetections;
+    LONG64 TotalSectionAnomalies;
     LONG64 EventsDropped;
     MEMORY_MONITOR_CONFIG Config;
 } MEMORY_MONITOR_STATISTICS, *PMEMORY_MONITOR_STATISTICS;
@@ -542,4 +561,3 @@ MmMonitorGetProtectionChangeSuspicion(
     _In_ MEMORY_REGION_TYPE RegionType
     );
 
-#endif // SHADOWSTRIKE_MEMORY_MONITOR_H
