@@ -657,7 +657,6 @@ MmMonitorGetProcessContext(
     ExistingContext = MmpLookupProcessContext(ProcessId);
     if (ExistingContext != NULL) {
         *Context = ExistingContext;
-        MmpReleaseRef();
         return STATUS_SUCCESS;
     }
 
@@ -671,7 +670,6 @@ MmMonitorGetProcessContext(
     }
 
     *Context = NewContext;
-    MmpReleaseRef();
 
     return STATUS_SUCCESS;
 }
@@ -686,6 +684,12 @@ MmMonitorReleaseProcessContext(
     }
 
     MmpDereferenceProcessContext(Context);
+
+    //
+    // Release the global outstanding ref that was acquired in GetProcessContext.
+    // This ensures shutdown waits until all callers have finished using contexts.
+    //
+    MmpReleaseRef();
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -819,7 +823,7 @@ MmMonitorHandleAllocation(
     //
     if (IsCrossProcess && g_MemoryMonitor.Config.EnableCrossProcessMonitoring) {
         IsSuspicious = TRUE;
-        Context->SuspiciousOperations++;
+        InterlockedIncrement64(&Context->SuspiciousOperations);
 
         //
         // Delegate to InjectionDetector for correlation-based analysis
@@ -878,7 +882,7 @@ MmMonitorHandleAllocation(
     // Update statistics
     //
     InterlockedIncrement64(&g_MemoryMonitor.TotalEventsProcessed);
-    Context->TotalAllocations++;
+    InterlockedIncrement64(&Context->TotalAllocations);
 
     if (IsSuspicious) {
         MmpUpdateProcessRisk(Context);
@@ -980,7 +984,7 @@ MmMonitorHandleProtectionChange(
         if (Region->RegionType == MemRegion_Image &&
             MmpIsRWXProtection(NewProtection) &&
             Region->ProtectionChangeCount <= 2) {
-            Context->Flags |= MM_PROCESS_FLAG_HOLLOWING_TARGET;
+            InterlockedOr((volatile LONG*)&Context->Flags, MM_PROCESS_FLAG_HOLLOWING_TARGET);
         }
 
         //
@@ -989,7 +993,7 @@ MmMonitorHandleProtectionChange(
         SuspicionType = MmpAnalyzeProtectionChange(OldProtection, NewProtection);
 
         if (SuspicionType != 0) {
-            Context->SuspiciousOperations++;
+            InterlockedIncrement64(&Context->SuspiciousOperations);
 
             if (SuspicionType == MM_SUSPICIOUS_RW_TO_RX &&
                 g_MemoryMonitor.Config.EnableShellcodeDetection) {
@@ -1005,7 +1009,7 @@ MmMonitorHandleProtectionChange(
         // Cross-process protection change is always suspicious
         //
         if (IsCrossProcess && g_MemoryMonitor.Config.EnableCrossProcessMonitoring) {
-            Context->SuspiciousOperations++;
+            InterlockedIncrement64(&Context->SuspiciousOperations);
             Region->Flags |= MM_REGION_FLAG_INJECTION_DST;
         }
 
@@ -1019,7 +1023,7 @@ MmMonitorHandleProtectionChange(
     // Update statistics
     //
     InterlockedIncrement64(&g_MemoryMonitor.TotalEventsProcessed);
-    Context->TotalProtectionChanges++;
+    InterlockedIncrement64(&Context->TotalProtectionChanges);
     MmpUpdateProcessRisk(Context);
 
     MmMonitorReleaseProcessContext(Context);
@@ -1117,8 +1121,8 @@ MmMonitorHandleCrossProcessWrite(
     // Update statistics
     //
     InterlockedIncrement64(&g_MemoryMonitor.TotalEventsProcessed);
-    TargetContext->SuspiciousOperations++;
-    TargetContext->InjectionAttemptCount++;
+    InterlockedIncrement64(&TargetContext->SuspiciousOperations);
+    InterlockedIncrement(&TargetContext->InjectionAttemptCount);
     MmpUpdateProcessRisk(TargetContext);
 
     //
@@ -1228,7 +1232,7 @@ MmMonitorHandleSectionMap(
     if (IsCrossProcess) {
         PMM_TRACKED_REGION Region;
 
-        Context->SuspiciousOperations++;
+        InterlockedIncrement64(&Context->SuspiciousOperations);
 
         KeEnterCriticalRegion();
         ExfAcquirePushLockExclusive(&Context->RegionLock);
@@ -1427,7 +1431,7 @@ MmMonitorScanForShellcode(
         if (ShellcodeDetected) {
             Status = MmMonitorGetProcessContext(ProcessId, NULL, &Context);
             if (NT_SUCCESS(Status)) {
-                Context->ShellcodeDetectionCount++;
+                InterlockedIncrement(&Context->ShellcodeDetectionCount);
                 MmpUpdateProcessRisk(Context);
                 MmMonitorReleaseProcessContext(Context);
             }
@@ -1585,8 +1589,8 @@ MmMonitorDetectInjection(
         if (InjectionDetected) {
             Status = MmMonitorGetProcessContext(TargetProcessId, NULL, &TargetContext);
             if (NT_SUCCESS(Status)) {
-                TargetContext->InjectionAttemptCount++;
-                TargetContext->Flags |= MM_PROCESS_FLAG_INJECTION_TARGET;
+                InterlockedIncrement(&TargetContext->InjectionAttemptCount);
+                InterlockedOr((volatile LONG*)&TargetContext->Flags, MM_PROCESS_FLAG_INJECTION_TARGET);
                 MmpUpdateProcessRisk(TargetContext);
                 MmMonitorReleaseProcessContext(TargetContext);
             }
@@ -2309,7 +2313,7 @@ MmpCreateProcessContext(
     // Initialize context
     //
     NewContext->ProcessId = ProcessId;
-    NewContext->RefCount = 1;
+    NewContext->RefCount = 2;  // One for data-structure ownership (hash+list), one for caller
     NewContext->IsMonitored = TRUE;
 
     if (ProcessObject != NULL) {
@@ -2341,9 +2345,17 @@ MmpCreateProcessContext(
     HashEntry->Context = NewContext;
 
     //
-    // Insert into hash table — double-check for existing entry (FIX-06: TOCTOU race)
+    // Insert into BOTH list and hash table atomically.
+    // Lock ordering: ERESOURCE first (APC_LEVEL), then spinlock (DISPATCH_LEVEL).
+    // This ensures the context is fully linked in the list BEFORE it becomes
+    // discoverable in the hash table, preventing TOCTOU where RemoveProcessContext
+    // finds a hash entry whose ListEntry is uninitialized (NULL-deref BSOD).
     //
     Hash = MmpHashProcessId(ProcessId);
+
+    KeEnterCriticalRegion();
+    ExAcquireResourceExclusiveLite(&g_MemoryMonitor.ProcessContextLock, TRUE);
+
     KeAcquireSpinLock(&g_ProcessHashTable.BucketLocks[Hash], &OldIrql);
 
     {
@@ -2359,6 +2371,8 @@ MmpCreateProcessContext(
                 *Context = Existing->Context;
 
                 KeReleaseSpinLock(&g_ProcessHashTable.BucketLocks[Hash], OldIrql);
+                ExReleaseResourceLite(&g_MemoryMonitor.ProcessContextLock);
+                KeLeaveCriticalRegion();
 
                 ExFreePoolWithTag(HashEntry, MM_POOL_TAG_CACHE);
                 if (NewContext->ProcessObject != NULL) {
@@ -2371,17 +2385,19 @@ MmpCreateProcessContext(
         }
     }
 
-    InsertTailList(&g_ProcessHashTable.Buckets[Hash], &HashEntry->ListEntry);
-    InterlockedIncrement(&g_ProcessHashTable.EntryCount);
-    KeReleaseSpinLock(&g_ProcessHashTable.BucketLocks[Hash], OldIrql);
-
     //
-    // Insert into main list
+    // Insert into list first (safe — not yet discoverable via hash table)
     //
-    KeEnterCriticalRegion();
-    ExAcquireResourceExclusiveLite(&g_MemoryMonitor.ProcessContextLock, TRUE);
     InsertTailList(&g_MemoryMonitor.ProcessContextList, &NewContext->ListEntry);
     g_MemoryMonitor.ProcessContextCount++;
+
+    //
+    // Now insert into hash table — context is fully linked, safe to discover
+    //
+    InsertTailList(&g_ProcessHashTable.Buckets[Hash], &HashEntry->ListEntry);
+    InterlockedIncrement(&g_ProcessHashTable.EntryCount);
+
+    KeReleaseSpinLock(&g_ProcessHashTable.BucketLocks[Hash], OldIrql);
     ExReleaseResourceLite(&g_MemoryMonitor.ProcessContextLock);
     KeLeaveCriticalRegion();
 
