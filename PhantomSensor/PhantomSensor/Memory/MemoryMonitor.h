@@ -17,7 +17,7 @@
  */
 /**
  * ============================================================================
- * ShadowStrike NGAV - MEMORY MONITOR
+ * ShadowStrike NGAV - MEMORY MONITORING MODULE
  * ============================================================================
  *
  * @file MemoryMonitor.h
