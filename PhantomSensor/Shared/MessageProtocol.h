@@ -175,4 +175,19 @@ typedef struct _SHADOWSTRIKE_REGISTRY_NOTIFICATION {
     // BYTE Data[DataSize]
 } SHADOWSTRIKE_REGISTRY_NOTIFICATION, *PSHADOWSTRIKE_REGISTRY_NOTIFICATION;
 
+//
+// 7. Handle Alert Notification (FilterMessageType_HandleAlert)
+//
+typedef struct _SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION {
+    UINT32 SourceProcessId;
+    UINT32 TargetProcessId;
+    UINT32 RequestedAccess;
+    UINT32 GrantedAccess;
+    UINT32 SuspicionScore;
+    UINT32 SuspiciousFlags;
+    UINT32 TargetCategory;
+    UINT32 OperationType;
+    UINT32 Verdict;
+} SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION, *PSHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION;
+
 #pragma pack(pop)

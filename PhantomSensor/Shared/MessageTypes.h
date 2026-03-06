@@ -86,6 +86,11 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     FilterMessageType_DisableFiltering,   // Disable filtering
     FilterMessageType_RegisterProtectedProcess, // Register process for protection
 
+    //
+    // Handle Alert Messages (0x50 - 0x5F)
+    //
+    FilterMessageType_HandleAlert,            // Suspicious handle operation detected
+
     FilterMessageType_Max
 } SHADOWSTRIKE_MESSAGE_TYPE;
 
@@ -129,6 +134,10 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
 #define ShadowStrikeMessageEnableFiltering          FilterMessageType_EnableFiltering
 #define ShadowStrikeMessageDisableFiltering         FilterMessageType_DisableFiltering
 #define ShadowStrikeMessageRegisterProtectedProcess FilterMessageType_RegisterProtectedProcess
+
+// Handle alert message alias
+#define ShadowStrikeMessageHandleAlert              FilterMessageType_HandleAlert
+#define SHADOWSTRIKE_MSG_PROCESS_HANDLE_ALERT        FilterMessageType_HandleAlert
 
 // ============================================================================
 // MESSAGE TYPE VALIDATION

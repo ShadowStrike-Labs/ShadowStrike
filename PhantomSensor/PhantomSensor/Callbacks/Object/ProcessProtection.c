@@ -68,6 +68,71 @@ Thread Safety:
 #include "../../Communication/CommPort.h"
 #include <ntstrsafe.h>
 
+// ============================================================================
+// SYSTEM STRUCTURES (for ZwQuerySystemInformation process enumeration)
+// ============================================================================
+
+#ifndef SystemProcessInformation
+#define SystemProcessInformation 5
+#endif
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQuerySystemInformation(
+    _In_ ULONG SystemInformationClass,
+    _Out_writes_bytes_opt_(SystemInformationLength) PVOID SystemInformation,
+    _In_ ULONG SystemInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+//
+// Minimal SYSTEM_PROCESS_INFORMATION for process enumeration.
+// Fields before NextEntryOffset/UniqueProcessId/ImageName are required
+// for correct offset calculation.
+//
+#ifndef _PP_SYSTEM_PROCESS_INFORMATION_DEFINED
+#define _PP_SYSTEM_PROCESS_INFORMATION_DEFINED
+
+typedef struct _PP_SYSTEM_PROCESS_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    LARGE_INTEGER WorkingSetPrivateSize;
+    ULONG HardFaultCount;
+    ULONG NumberOfThreadsHighWatermark;
+    ULONGLONG CycleTime;
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    UNICODE_STRING ImageName;
+    LONG BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+    ULONG HandleCount;
+    ULONG SessionId;
+    ULONG_PTR UniqueProcessKey;
+    SIZE_T PeakVirtualSize;
+    SIZE_T VirtualSize;
+    ULONG PageFaultCount;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+    SIZE_T PrivatePageCount;
+    LARGE_INTEGER ReadOperationCount;
+    LARGE_INTEGER WriteOperationCount;
+    LARGE_INTEGER OtherOperationCount;
+    LARGE_INTEGER ReadTransferCount;
+    LARGE_INTEGER WriteTransferCount;
+    LARGE_INTEGER OtherTransferCount;
+} PP_SYSTEM_PROCESS_INFORMATION, *PPP_SYSTEM_PROCESS_INFORMATION;
+
+#endif // _PP_SYSTEM_PROCESS_INFORMATION_DEFINED
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, PpInitializeProcessProtection)
 #pragma alloc_text(PAGE, PpShutdownProcessProtection)
@@ -263,7 +328,7 @@ Return Value:
 
     PAGED_CODE();
 
-    if (g_ProcessProtection.Initialized) {
+    if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) != 0) {
         return STATUS_ALREADY_REGISTERED;
     }
 
@@ -340,7 +405,7 @@ Return Value:
         //
     }
 
-    g_ProcessProtection.Initialized = TRUE;
+    InterlockedExchange(&g_ProcessProtection.Initialized, TRUE);
 
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
@@ -375,14 +440,14 @@ Routine Description:
 {
     PAGED_CODE();
 
-    if (!g_ProcessProtection.Initialized) {
+    if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
         return;
     }
 
     //
-    // Mark as not initialized to stop new operations
+    // Mark as not initialized to stop new operations (atomic)
     //
-    g_ProcessProtection.Initialized = FALSE;
+    InterlockedExchange(&g_ProcessProtection.Initialized, FALSE);
 
     //
     // Wait for all in-flight operations to complete
@@ -555,7 +620,7 @@ Return Value:
     ACCESS_MASK OriginalAccess;
     ACCESS_MASK NewAccess;
     PP_VERDICT Verdict;
-    PP_ACCESS_POLICY MatchedPolicy;
+    PP_ACCESS_POLICY MatchedPolicy = { 0 };
     ULONG ProtectionFlags = 0;
     BOOLEAN IsProtectedTarget = FALSE;
     BOOLEAN HasPolicy = FALSE;
@@ -581,7 +646,7 @@ Return Value:
     //
     // Check if we're initialized and not shutting down
     //
-    if (!g_ProcessProtection.Initialized) {
+    if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
         return OB_PREOP_SUCCESS;
     }
 
@@ -630,7 +695,7 @@ Return Value:
 
     Context.TargetProcess = TargetProcess;
     Context.TargetProcessId = PsGetProcessId(TargetProcess);
-    Context.IsKernelHandle = OperationInformation->KernelHandle;
+    Context.IsKernelHandle = (BOOLEAN)(OperationInformation->KernelHandle != 0);
 
     //
     // Determine operation type and get original access
@@ -929,7 +994,7 @@ PpAddProtectedProcess(
     LONG Count;
     LARGE_INTEGER CurrentTime;
 
-    if (!g_ProcessProtection.Initialized) {
+    if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
         return STATUS_NOT_FOUND;
     }
 
@@ -992,7 +1057,7 @@ PpRemoveProtectedProcess(
     LONG Count;
     LONG LastIndex;
 
-    if (!g_ProcessProtection.Initialized) {
+    if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
         return;
     }
 
@@ -1039,7 +1104,7 @@ PpIsProcessProtected(
     LONG Count;
     BOOLEAN Found = FALSE;
 
-    if (!g_ProcessProtection.Initialized) {
+    if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
         return FALSE;
     }
 
@@ -1400,6 +1465,7 @@ PpRemovePoliciesForCategory(
     PLIST_ENTRY Next;
     PPP_ACCESS_POLICY Policy;
     LIST_ENTRY RemoveList;
+    ULONG WalkCount = 0;
 
     PAGED_CODE();
 
@@ -1411,6 +1477,10 @@ PpRemovePoliciesForCategory(
     for (Entry = g_ProcessProtection.PolicyList.Flink;
          Entry != &g_ProcessProtection.PolicyList;
          Entry = Next) {
+
+        if (++WalkCount > PP_MAX_LIST_WALK) {
+            break;
+        }
 
         Next = Entry->Flink;
         Policy = CONTAINING_RECORD(Entry, PP_ACCESS_POLICY, ListEntry);
@@ -1465,6 +1535,7 @@ Routine Description:
     ULONG CurrentScore;
     ULONG i;
     BOOLEAN IsExempt;
+    ULONG WalkCount = 0;
 
     if (Context == NULL || OutPolicy == NULL) {
         return FALSE;
@@ -1478,6 +1549,10 @@ Routine Description:
     for (Entry = g_ProcessProtection.PolicyList.Flink;
          Entry != &g_ProcessProtection.PolicyList;
          Entry = Entry->Flink) {
+
+        if (++WalkCount > PP_MAX_LIST_WALK) {
+            break;
+        }
 
         Policy = CONTAINING_RECORD(Entry, PP_ACCESS_POLICY, ListEntry);
         CurrentScore = 0;
@@ -1872,12 +1947,17 @@ Routine Description:
     ULONG HashIndex;
     PLIST_ENTRY Entry;
     PPP_ACTIVITY_TRACKER Tracker;
+    ULONG WalkCount = 0;
 
     HashIndex = PppHashProcessId(SourceProcessId) % PP_ACTIVITY_HASH_SIZE;
 
     for (Entry = g_ProcessProtection.ActivityHashTable[HashIndex].Flink;
          Entry != &g_ProcessProtection.ActivityHashTable[HashIndex];
          Entry = Entry->Flink) {
+
+        if (++WalkCount > PP_MAX_HASH_WALK) {
+            break;
+        }
 
         Tracker = CONTAINING_RECORD(Entry, PP_ACTIVITY_TRACKER, HashEntry);
 
@@ -2126,6 +2206,7 @@ PpIsSourceRateLimited(
     PLIST_ENTRY Entry;
     PPP_ACTIVITY_TRACKER Tracker;
     BOOLEAN IsLimited = FALSE;
+    ULONG WalkCount = 0;
 
     if (!g_ProcessProtection.Config.EnableRateLimiting) {
         return FALSE;
@@ -2139,6 +2220,10 @@ PpIsSourceRateLimited(
     for (Entry = g_ProcessProtection.ActivityHashTable[HashIndex].Flink;
          Entry != &g_ProcessProtection.ActivityHashTable[HashIndex];
          Entry = Entry->Flink) {
+
+        if (++WalkCount > PP_MAX_HASH_WALK) {
+            break;
+        }
 
         Tracker = CONTAINING_RECORD(Entry, PP_ACTIVITY_TRACKER, HashEntry);
         if (Tracker->SourceProcessId == SourceProcessId) {
@@ -2176,6 +2261,8 @@ Routine Description:
 {
     ULONG HashIndex;
     PPP_ACTIVITY_TRACKER Tracker = NULL;
+
+    PAGED_CODE();
 
     HashIndex = PppHashProcessId(ProcessId) % PP_ACTIVITY_HASH_SIZE;
 
@@ -2228,21 +2315,21 @@ PpGetStatistics(
     _Out_opt_ PULONG64 InjectionAttempts
     )
 {
-    if (!g_ProcessProtection.Initialized) {
+    if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
         return STATUS_NOT_FOUND;
     }
 
     if (TotalOperations != NULL) {
-        *TotalOperations = (ULONG64)g_ProcessProtection.Stats.TotalOperations;
+        *TotalOperations = (ULONG64)ReadNoFence64((volatile LONG64*)&g_ProcessProtection.Stats.TotalOperations);
     }
     if (AccessStripped != NULL) {
-        *AccessStripped = (ULONG64)g_ProcessProtection.Stats.AccessStripped;
+        *AccessStripped = (ULONG64)ReadNoFence64((volatile LONG64*)&g_ProcessProtection.Stats.AccessStripped);
     }
     if (CredentialAccessAttempts != NULL) {
-        *CredentialAccessAttempts = (ULONG64)g_ProcessProtection.Stats.CredentialAccessAttempts;
+        *CredentialAccessAttempts = (ULONG64)ReadNoFence64((volatile LONG64*)&g_ProcessProtection.Stats.CredentialAccessAttempts);
     }
     if (InjectionAttempts != NULL) {
-        *InjectionAttempts = (ULONG64)g_ProcessProtection.Stats.InjectionAttempts;
+        *InjectionAttempts = (ULONG64)ReadNoFence64((volatile LONG64*)&g_ProcessProtection.Stats.InjectionAttempts);
     }
 
     return STATUS_SUCCESS;
@@ -2449,8 +2536,9 @@ Routine Description:
     }
 
     //
-    // Check for ShadowStrike (our EDR) - contains check is sufficient
-    // NOTE: This is weak protection. In production, use code signing verification.
+    // Check for ShadowStrike (our EDR) — image name heuristic.
+    // Full code-signing verification is performed by the SelfProtection module
+    // via ShadowStrikeIsProcessProtected() in the main callback path.
     //
     if (PppImageNameContains(ImageName, g_ShadowStrikeName)) {
         return PpCategoryAntimalware;
@@ -2593,11 +2681,15 @@ PppSendNotification(
 Routine Description:
     Sends a notification to user-mode about a suspicious handle operation.
 
-    Uses the ShadowStrike communication port infrastructure.
+    Uses the ShadowStrike communication port infrastructure via the generic
+    ShadowStrikeSendNotification API with a HANDLE_ALERT_NOTIFICATION payload.
 --*/
 {
     NTSTATUS Status;
-    SHADOWSTRIKE_PROCESS_NOTIFICATION Notification;
+    struct {
+        SHADOWSTRIKE_MESSAGE_HEADER Header;
+        SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION Alert;
+    } Message;
 
     //
     // Check if CommPort is available
@@ -2609,30 +2701,35 @@ Routine Description:
     //
     // Build notification message
     //
-    RtlZeroMemory(&Notification, sizeof(Notification));
+    RtlZeroMemory(&Message, sizeof(Message));
 
-    Notification.Header.Size = sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION);
-    Notification.Header.MessageType = SHADOWSTRIKE_MSG_PROCESS_HANDLE_ALERT;
+    Message.Header.Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
+    Message.Header.Version = SHADOWSTRIKE_PROTOCOL_VERSION;
+    Message.Header.MessageType = (UINT16)SHADOWSTRIKE_MSG_PROCESS_HANDLE_ALERT;
+    Message.Header.TotalSize = sizeof(Message);
+    Message.Header.DataSize = sizeof(SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION);
+    {
+        LARGE_INTEGER Now;
+        KeQuerySystemTime(&Now);
+        Message.Header.Timestamp = (UINT64)Now.QuadPart;
+    }
 
-    Notification.SourceProcessId = Context->SourceProcessId;
-    Notification.TargetProcessId = Context->TargetProcessId;
-    Notification.RequestedAccess = Context->OriginalDesiredAccess;
-    Notification.GrantedAccess = Context->ModifiedDesiredAccess;
-    Notification.SuspicionScore = Context->SuspicionScore;
-    Notification.SuspiciousFlags = Context->SuspiciousFlags;
-    Notification.TargetCategory = (ULONG)Context->TargetCategory;
-    Notification.OperationType = (ULONG)Context->OperationType;
-    Notification.Verdict = (ULONG)Context->Verdict;
+    Message.Alert.SourceProcessId = HandleToULong(Context->SourceProcessId);
+    Message.Alert.TargetProcessId = HandleToULong(Context->TargetProcessId);
+    Message.Alert.RequestedAccess = Context->OriginalDesiredAccess;
+    Message.Alert.GrantedAccess = Context->ModifiedDesiredAccess;
+    Message.Alert.SuspicionScore = Context->SuspicionScore;
+    Message.Alert.SuspiciousFlags = Context->SuspiciousFlags;
+    Message.Alert.TargetCategory = (UINT32)Context->TargetCategory;
+    Message.Alert.OperationType = (UINT32)Context->OperationType;
+    Message.Alert.Verdict = (UINT32)Context->Verdict;
 
     //
-    // Send notification (non-blocking, no reply needed)
+    // Send notification (non-blocking via generic send)
     //
-    Status = ShadowStrikeSendProcessNotification(
-        &Notification,
-        sizeof(Notification),
-        FALSE,      // Don't require reply
-        NULL,
-        NULL
+    Status = ShadowStrikeSendNotification(
+        &Message.Header,
+        sizeof(Message)
         );
 
     if (NT_SUCCESS(Status)) {
@@ -2729,8 +2826,8 @@ Routine Description:
 --*/
 {
     NTSTATUS Status;
-    PSYSTEM_PROCESS_INFORMATION ProcessInfo = NULL;
-    PSYSTEM_PROCESS_INFORMATION CurrentProcess;
+    PPP_SYSTEM_PROCESS_INFORMATION ProcessInfo = NULL;
+    PPP_SYSTEM_PROCESS_INFORMATION CurrentProcess;
     PVOID Buffer = NULL;
     ULONG BufferSize = 256 * 1024;  // Start with 256KB
     ULONG ReturnLength = 0;
@@ -2766,7 +2863,7 @@ Routine Description:
         //
         // Check for integer overflow
         //
-        if (ReturnLength > (ULONG_MAX - 8192)) {
+        if (ReturnLength > (MAXULONG - 8192)) {
             return STATUS_INTEGER_OVERFLOW;
         }
 
@@ -2790,30 +2887,61 @@ Routine Description:
     }
 
     //
-    // Search for ALL matching processes
+    // Search for ALL matching processes with buffer bounds checking
     //
-    ProcessInfo = (PSYSTEM_PROCESS_INFORMATION)Buffer;
+    ProcessInfo = (PPP_SYSTEM_PROCESS_INFORMATION)Buffer;
     CurrentProcess = ProcessInfo;
 
-    do {
-        if (CurrentProcess->ImageName.Buffer != NULL) {
-            if (RtlEqualUnicodeString(&CurrentProcess->ImageName, &TargetName, TRUE)) {
-                if (Count < MaxPids) {
-                    ProcessIds[Count] = CurrentProcess->UniqueProcessId;
-                    Count++;
+    {
+        PUCHAR BufferEnd = (PUCHAR)Buffer + BufferSize;
+        ULONG IterationCount = 0;
+        ULONG MaxIterations = 65536;
+
+        do {
+            //
+            // Ensure CurrentProcess is within buffer bounds
+            //
+            if ((PUCHAR)CurrentProcess < (PUCHAR)Buffer ||
+                (PUCHAR)CurrentProcess + sizeof(PP_SYSTEM_PROCESS_INFORMATION) > BufferEnd) {
+                break;
+            }
+
+            if (++IterationCount > MaxIterations) {
+                break;
+            }
+
+            if (CurrentProcess->ImageName.Buffer != NULL) {
+                //
+                // Validate ImageName buffer is within our allocation
+                //
+                if ((PUCHAR)CurrentProcess->ImageName.Buffer >= (PUCHAR)Buffer &&
+                    (PUCHAR)CurrentProcess->ImageName.Buffer + CurrentProcess->ImageName.Length <= BufferEnd) {
+                    if (RtlEqualUnicodeString(&CurrentProcess->ImageName, &TargetName, TRUE)) {
+                        if (Count < MaxPids) {
+                            ProcessIds[Count] = CurrentProcess->UniqueProcessId;
+                            Count++;
+                        }
+                    }
                 }
             }
-        }
 
-        if (CurrentProcess->NextEntryOffset == 0) {
-            break;
-        }
+            if (CurrentProcess->NextEntryOffset == 0) {
+                break;
+            }
 
-        CurrentProcess = (PSYSTEM_PROCESS_INFORMATION)(
-            (PUCHAR)CurrentProcess + CurrentProcess->NextEntryOffset
-            );
+            //
+            // Validate NextEntryOffset doesn't point backwards
+            //
+            if (CurrentProcess->NextEntryOffset < sizeof(PP_SYSTEM_PROCESS_INFORMATION)) {
+                break;
+            }
 
-    } while (TRUE);
+            CurrentProcess = (PPP_SYSTEM_PROCESS_INFORMATION)(
+                (PUCHAR)CurrentProcess + CurrentProcess->NextEntryOffset
+                );
+
+        } while (TRUE);
+    }
 
     ShadowStrikeFreePoolWithTag(Buffer, PP_POOL_TAG);
 

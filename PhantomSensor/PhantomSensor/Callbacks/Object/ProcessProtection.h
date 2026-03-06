@@ -69,6 +69,60 @@ extern "C" {
 #include <wdm.h>
 
 // ============================================================================
+// PROCESS ACCESS RIGHTS (not exported by WDK kernel headers)
+// ============================================================================
+
+#ifndef PROCESS_TERMINATE
+#define PROCESS_TERMINATE                   0x0001
+#endif
+#ifndef PROCESS_CREATE_THREAD
+#define PROCESS_CREATE_THREAD               0x0002
+#endif
+#ifndef PROCESS_SET_SESSIONID
+#define PROCESS_SET_SESSIONID               0x0004
+#endif
+#ifndef PROCESS_VM_OPERATION
+#define PROCESS_VM_OPERATION                0x0008
+#endif
+#ifndef PROCESS_VM_READ
+#define PROCESS_VM_READ                     0x0010
+#endif
+#ifndef PROCESS_VM_WRITE
+#define PROCESS_VM_WRITE                    0x0020
+#endif
+#ifndef PROCESS_DUP_HANDLE
+#define PROCESS_DUP_HANDLE                  0x0040
+#endif
+#ifndef PROCESS_CREATE_PROCESS
+#define PROCESS_CREATE_PROCESS              0x0080
+#endif
+#ifndef PROCESS_SET_QUOTA
+#define PROCESS_SET_QUOTA                   0x0100
+#endif
+#ifndef PROCESS_SET_INFORMATION
+#define PROCESS_SET_INFORMATION             0x0200
+#endif
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION           0x0400
+#endif
+#ifndef PROCESS_SUSPEND_RESUME
+#define PROCESS_SUSPEND_RESUME              0x0800
+#endif
+#ifndef PROCESS_QUERY_LIMITED_INFORMATION
+#define PROCESS_QUERY_LIMITED_INFORMATION   0x1000
+#endif
+#ifndef PROCESS_ALL_ACCESS
+#define PROCESS_ALL_ACCESS  (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0xFFFF)
+#endif
+
+// ============================================================================
+// CORRUPTION RESILIENCE
+// ============================================================================
+
+#define PP_MAX_HASH_WALK        128
+#define PP_MAX_LIST_WALK        256
+
+// ============================================================================
 // POOL TAGS
 // ============================================================================
 
@@ -418,9 +472,9 @@ typedef struct _PP_RATE_LIMITER {
  */
 typedef struct _PP_PROTECTION_STATE {
     //
-    // Initialization and shutdown
+    // Initialization and shutdown (atomic for race-free init/shutdown)
     //
-    BOOLEAN Initialized;
+    volatile LONG Initialized;
     EX_RUNDOWN_REF RundownRef;          ///< For safe shutdown
 
     //
