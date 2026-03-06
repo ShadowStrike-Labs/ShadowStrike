@@ -58,6 +58,21 @@
 #include "../../Utilities/StringUtils.h"
 #include "../../Utilities/ProcessUtils.h"
 
+//
+// Forward declarations for ntoskrnl exports not in WDK headers
+//
+NTKERNELAPI
+HANDLE
+PsGetProcessInheritedFromUniqueProcessId(
+    _In_ PEPROCESS Process
+    );
+
+NTKERNELAPI
+NTSTATUS
+PsGetProcessExitStatus(
+    _In_ PEPROCESS Process
+    );
+
 // ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
@@ -378,13 +393,6 @@ PctpSafeCompareImageNames(
     _In_ PUNICODE_STRING ImagePath,
     _In_ PCWSTR ImageName,
     _In_ USHORT ImageNameLengthBytes
-    );
-
-static BOOLEAN
-PctpSafeFindCharInString(
-    _In_ PUNICODE_STRING String,
-    _In_ WCHAR Character,
-    _Out_ PUSHORT Position
     );
 
 static BOOLEAN
@@ -1443,7 +1451,8 @@ PctpFreeChainInternal(
     //
     if (Chain->AllocSource == PctAllocSourceLookaside &&
         Tracker != NULL &&
-        Tracker->LookasideInitialized) {
+        Tracker->LookasideInitialized &&
+        !Tracker->Public.ShuttingDown) {
         ExFreeToNPagedLookasideList(&Tracker->ChainLookaside, Chain);
     } else {
         ShadowStrikeFreePoolWithTag(Chain, PCT_POOL_TAG);
@@ -1714,37 +1723,6 @@ PctpSafeCompareImageNames(
 }
 
 /**
- * @brief Safely finds a character in a UNICODE_STRING without assuming null-termination.
- */
-static BOOLEAN
-PctpSafeFindCharInString(
-    _In_ PUNICODE_STRING String,
-    _In_ WCHAR Character,
-    _Out_ PUSHORT Position
-    )
-{
-    USHORT i;
-    USHORT charCount;
-
-    *Position = 0;
-
-    if (String == NULL || String->Buffer == NULL || String->Length == 0) {
-        return FALSE;
-    }
-
-    charCount = String->Length / sizeof(WCHAR);
-
-    for (i = 0; i < charCount; i++) {
-        if (String->Buffer[i] == Character) {
-            *Position = i;
-            return TRUE;
-        }
-    }
-
-    return FALSE;
-}
-
-/**
  * @brief Safely finds the last occurrence of a character in a UNICODE_STRING.
  */
 static BOOLEAN
@@ -1974,7 +1952,10 @@ PctpAnalyzeChain(
     }
 
     //
-    // Analyze parent-child relationships in the chain
+    // Analyze parent-child relationships in the chain.
+    // This function ONLY sets flags — scoring is done separately
+    // in PctpCalculateSuspicionScore to avoid double-counting.
+    //
     // Chain is ordered: leaf -> parent -> grandparent -> ... -> root
     // So Flink moves toward root (parent), Blink moves toward leaf (child)
     //
@@ -1998,14 +1979,11 @@ PctpAnalyzeChain(
                 node->ImageName.Buffer != NULL &&
                 childNode->ImageName.Buffer != NULL) {
 
-                //
-                // Extract image names for comparison
-                //
                 PctpExtractImageNameSafe(&node->ImageName, &nodeImageName);
                 PctpExtractImageNameSafe(&childNode->ImageName, &childImageName);
 
                 //
-                // Check against built pattern list first
+                // Check against built-in pattern list
                 //
                 if (PctpMatchesSuspiciousPattern(Tracker, &nodeImageName, &childImageName, &patternScore)) {
                     childNode->IsSuspicious = TRUE;
@@ -2097,11 +2075,26 @@ PctpCalculateSuspicionScore(
     }
 
     //
-    // Analyze each node in the chain
+    // Analyze each node in the chain.
+    //
+    // IMPORTANT: PctpAnalyzeChain already set IsSuspicious flags on nodes
+    // based on parent-child pattern matching (Office→shell, Browser→shell,
+    // LOLBin chains, ScriptHost chains, custom patterns). We do NOT re-check
+    // those same parent-child patterns here to avoid double-counting.
+    //
+    // This function scores:
+    //   1. Individual node properties (is it a script host, LOLBin, etc.)
+    //   2. Parent-child custom pattern scores from the pattern list
+    //   3. Structural indicators (depth, PPID spoofing, orphan, terminated)
+    //
+    // IsSuspicious is NOT scored here — it would double-count the parent-child
+    // checks that are already scored via the specific match scores below.
     //
     for (listEntry = Chain->ChainList.Flink;
          listEntry != &Chain->ChainList;
          listEntry = listEntry->Flink) {
+
+        ULONG nodeScore = 0;
 
         node = CONTAINING_RECORD(listEntry, PCT_CHAIN_NODE, ListEntry);
 
@@ -2110,21 +2103,21 @@ PctpCalculateSuspicionScore(
         }
 
         //
-        // Check for script hosts
+        // Individual node: script host detection with per-host score
         //
         if (PctpIsScriptHost(&node->ImageName, &scriptScore)) {
-            score += scriptScore;
+            nodeScore += scriptScore;
         }
 
         //
-        // Check for LOLBins
+        // Individual node: LOLBin detection
         //
         if (PctpIsLOLBin(&node->ImageName)) {
-            score += PCT_SCORE_LOLBIN_CHAIN;
+            nodeScore += PCT_SCORE_LOLBIN_CHAIN;
         }
 
         //
-        // Get child for parent-child analysis
+        // Parent-child analysis (this node as parent, child = previous in list)
         //
         if (listEntry->Blink != &Chain->ChainList) {
             childNode = CONTAINING_RECORD(listEntry->Blink, PCT_CHAIN_NODE, ListEntry);
@@ -2137,40 +2130,35 @@ PctpCalculateSuspicionScore(
                 PctpExtractImageNameSafe(&childNode->ImageName, &childImageName);
 
                 //
-                // Check pattern list
+                // Custom pattern list scoring (user-defined + builtin patterns)
                 //
                 if (PctpMatchesSuspiciousPattern(Tracker, &nodeImageName, &childImageName, &patternScore)) {
-                    score += patternScore;
+                    nodeScore += patternScore;
                 }
 
                 //
-                // Office spawning shell
+                // Office app spawning shell (T1566 initial access → execution)
                 //
                 if (PctpIsOfficeApp(&node->ImageName) && PctpIsShell(&childNode->ImageName)) {
-                    score += PCT_SCORE_OFFICE_SPAWN_SHELL;
+                    nodeScore += PCT_SCORE_OFFICE_SPAWN_SHELL;
                 }
 
                 //
-                // Browser spawning shell
+                // Browser spawning shell (T1189 drive-by compromise)
                 //
                 if (PctpIsBrowser(&node->ImageName) && PctpIsShell(&childNode->ImageName)) {
-                    score += PCT_SCORE_BROWSER_SPAWN_SHELL;
+                    nodeScore += PCT_SCORE_BROWSER_SPAWN_SHELL;
                 }
             }
         }
 
-        //
-        // Suspicious flag from chain analysis
-        //
-        if (node->IsSuspicious) {
-            score += PCT_SCORE_SUSPICIOUS_PARENT;
-        }
+        score += nodeScore;
 
         //
-        // Track highest individual node score
+        // Track highest per-node score contribution (not cumulative total)
         //
-        if (score > Chain->HighestNodeScore) {
-            Chain->HighestNodeScore = score;
+        if (nodeScore > Chain->HighestNodeScore) {
+            Chain->HighestNodeScore = nodeScore;
         }
     }
 
@@ -2213,17 +2201,21 @@ PctpMatchesSuspiciousPattern(
         pattern = CONTAINING_RECORD(listEntry, PCT_SUSPICIOUS_PATTERN, ListEntry);
 
         //
-        // Check parent match
+        // Check parent match (wildcard = match any parent)
         //
-        if (!RtlEqualUnicodeString(ParentImageName, &pattern->ParentImageName, TRUE)) {
-            continue;
+        if (!pattern->IsWildcardParent) {
+            if (!RtlEqualUnicodeString(ParentImageName, &pattern->ParentImageName, TRUE)) {
+                continue;
+            }
         }
 
         //
-        // Check child match
+        // Check child match (wildcard = match any child)
         //
-        if (!RtlEqualUnicodeString(ChildImageName, &pattern->ChildImageName, TRUE)) {
-            continue;
+        if (!pattern->IsWildcardChild) {
+            if (!RtlEqualUnicodeString(ChildImageName, &pattern->ChildImageName, TRUE)) {
+                continue;
+            }
         }
 
         //
