@@ -48,7 +48,7 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
+#include <ntifs.h>
 
 // ============================================================================
 // POOL TAGS
@@ -95,7 +95,7 @@ typedef enum _ABD_BYPASS_TYPE {
     AbdBypass_EtwProviderDisabled,      // ETW provider disabled via registry
     AbdBypass_InlineHook,               // Generic inline hook on AMSI function
     AbdBypass_Max
-} ABD_BYPASS_TYPE;
+} ABD_BYPASS_TYPE, *PABD_BYPASS_TYPE;
 
 // ============================================================================
 // DETECTION RESULT
