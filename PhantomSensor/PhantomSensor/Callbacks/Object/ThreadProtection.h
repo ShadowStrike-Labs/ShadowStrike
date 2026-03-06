@@ -148,6 +148,28 @@ extern "C" {
 #define TP_TRACKER_LOOKASIDE_DEPTH      64
 
 // ============================================================================
+// THREAD ACCESS RIGHTS — Not always defined in WDK kernel headers
+// ============================================================================
+
+#ifndef THREAD_IMPERSONATE
+#define THREAD_IMPERSONATE              0x0100
+#endif
+
+#ifndef THREAD_DIRECT_IMPERSONATION
+#define THREAD_DIRECT_IMPERSONATION     0x0200
+#endif
+
+#ifndef THREAD_SET_THREAD_TOKEN
+#define THREAD_SET_THREAD_TOKEN         0x0080
+#endif
+
+// ============================================================================
+// HASH WALK BOUNDS — Prevents infinite loops on corruption
+// ============================================================================
+
+#define TP_MAX_HASH_WALK                128
+
+// ============================================================================
 // SCORE CONSTANTS
 // ============================================================================
 

@@ -556,18 +556,23 @@ ShadowStrikeIsProcessWow64(
     );
 
 /**
- * @brief Check if process is protected (PPL).
+ * @brief Check if process is protected.
  *
- * @param Process   EPROCESS pointer
+ * Queries the SelfProtection module's protected process list.
+ * Authoritative declaration is in SelfProtect.h.
+ *
+ * @param ProcessId  Process ID (HANDLE)
+ * @param OutFlags   Optional — receives protection flags
  *
  * @return TRUE if protected process
  *
- * @irql <= APC_LEVEL
+ * @irql <= DISPATCH_LEVEL
  */
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowStrikeIsProcessProtected(
-    _In_ PEPROCESS Process
+    _In_ HANDLE ProcessId,
+    _Out_opt_ PULONG OutFlags
     );
 
 /**

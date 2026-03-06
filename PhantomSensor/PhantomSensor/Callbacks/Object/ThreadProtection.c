@@ -70,7 +70,10 @@
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
-#include "ThreadProtection.tmh"
+//
+// WPP tracing (.tmh) requires project-level WPP configuration.
+// Using DbgPrintEx for now; will switch to WPP when Tracing subsystem is wired.
+//
 
 // ============================================================================
 // GLOBAL STATE
@@ -157,6 +160,11 @@ static VOID
 TppTakeTrackerSnapshot(
     _In_ PTP_ACTIVITY_TRACKER Tracker,
     _Out_ PTP_TRACKER_SNAPSHOT Snapshot
+);
+
+static VOID
+TppReleaseTrackerRef(
+    _In_ PTP_ACTIVITY_TRACKER Tracker
 );
 
 // ============================================================================
@@ -354,28 +362,41 @@ TpShutdownThreadProtection(
     }
 
     //
-    // Free all activity trackers
+    // Free all activity trackers using bounded free-list pattern.
+    // Collect under spinlock, free after release — avoids IRQL issues.
     //
-    KeAcquireSpinLock(&g_TpState.ActivitySpinLock, &oldIrql);
+    {
+        LIST_ENTRY freeList;
+        ULONG cleanupCount = 0;
 
-    while (!IsListEmpty(&g_TpState.ActivityList)) {
-        entry = RemoveHeadList(&g_TpState.ActivityList);
-        tracker = CONTAINING_RECORD(entry, TP_ACTIVITY_TRACKER, ListEntry);
+        InitializeListHead(&freeList);
 
-        //
-        // Remove from hash table too
-        //
-        RemoveEntryList(&tracker->HashEntry);
-
-        //
-        // Free based on allocation source
-        //
-        KeReleaseSpinLock(&g_TpState.ActivitySpinLock, oldIrql);
-        TppFreeTracker(tracker);
         KeAcquireSpinLock(&g_TpState.ActivitySpinLock, &oldIrql);
-    }
 
-    KeReleaseSpinLock(&g_TpState.ActivitySpinLock, oldIrql);
+        while (!IsListEmpty(&g_TpState.ActivityList) &&
+               cleanupCount < TP_MAX_ACTIVITY_TRACKERS + 64) {
+            entry = RemoveHeadList(&g_TpState.ActivityList);
+            tracker = CONTAINING_RECORD(entry, TP_ACTIVITY_TRACKER, ListEntry);
+            RemoveEntryList(&tracker->HashEntry);
+            InsertTailList(&freeList, &tracker->ListEntry);
+            cleanupCount++;
+        }
+
+        g_TpState.ActiveTrackers = 0;
+        KeReleaseSpinLock(&g_TpState.ActivitySpinLock, oldIrql);
+
+        //
+        // Free collected trackers outside of lock
+        //
+        cleanupCount = 0;
+        while (!IsListEmpty(&freeList) &&
+               cleanupCount < TP_MAX_ACTIVITY_TRACKERS + 64) {
+            entry = RemoveHeadList(&freeList);
+            tracker = CONTAINING_RECORD(entry, TP_ACTIVITY_TRACKER, ListEntry);
+            TppFreeTracker(tracker);
+            cleanupCount++;
+        }
+    }
 
     //
     // Delete lookaside list
@@ -652,15 +673,13 @@ TpThreadHandlePostCallback(
     // 2. Tracking handle lifetime for injection detection
     // 3. Correlating with subsequent thread operations
     //
-    if (WPP_LEVEL_ENABLED(TRACE_FLAG_SELFPROT)) {
-        TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_FLAG_SELFPROT,
-            "ThreadProtection: Post-callback - handle %s from PID %p to TID %p (PID %p), Status: 0x%08X",
-            (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) ? "CREATE" : "DUPLICATE",
-            sourceProcessId,
-            PsGetThreadId(targetThread),
-            targetProcessId,
-            status);
-    }
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+        "[ShadowStrike] ThreadProtection: Post-callback - handle %s from PID %p to TID %p (PID %p), Status: 0x%08X\n",
+        (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) ? "CREATE" : "DUPLICATE",
+        sourceProcessId,
+        PsGetThreadId(targetThread),
+        targetProcessId,
+        status);
 
     TppReleaseReference();
 }
@@ -1012,6 +1031,11 @@ TpTrackActivity(
         AccessMask,
         IsSuspicious
     );
+
+    //
+    // Release the reference acquired by TppFindOrCreateTracker
+    //
+    TppReleaseTrackerRef(tracker);
 }
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -1040,18 +1064,23 @@ TpGetTrackerSnapshot(
 
     KeAcquireSpinLock(&g_TpState.ActivitySpinLock, &oldIrql);
 
-    for (entry = hashHead->Flink; entry != hashHead; entry = entry->Flink) {
-        tracker = CONTAINING_RECORD(entry, TP_ACTIVITY_TRACKER, HashEntry);
+    {
+        ULONG walkCount = 0;
+        for (entry = hashHead->Flink;
+             entry != hashHead && walkCount < TP_MAX_HASH_WALK;
+             entry = entry->Flink, walkCount++) {
+            tracker = CONTAINING_RECORD(entry, TP_ACTIVITY_TRACKER, HashEntry);
 
-        if (tracker->Magic == TP_TRACKER_MAGIC &&
-            tracker->SourceProcessId == SourceProcessId &&
-            !tracker->Deleted) {
-            //
-            // Take snapshot while holding lock - safe copy
-            //
-            TppTakeTrackerSnapshot(tracker, OutSnapshot);
-            found = TRUE;
-            break;
+            if (tracker->Magic == TP_TRACKER_MAGIC &&
+                tracker->SourceProcessId == SourceProcessId &&
+                !tracker->Deleted) {
+                //
+                // Take snapshot while holding lock - safe copy
+                //
+                TppTakeTrackerSnapshot(tracker, OutSnapshot);
+                found = TRUE;
+                break;
+            }
         }
     }
 
@@ -1102,39 +1131,46 @@ TpCleanupExpiredTrackers(
 
     KeAcquireSpinLock(&g_TpState.ActivitySpinLock, &oldIrql);
 
-    for (entry = g_TpState.ActivityList.Flink;
-         entry != &g_TpState.ActivityList;
-         entry = nextEntry) {
+    {
+        ULONG walkCount = 0;
+        for (entry = g_TpState.ActivityList.Flink;
+             entry != &g_TpState.ActivityList && walkCount < TP_MAX_ACTIVITY_TRACKERS + 64;
+             entry = nextEntry, walkCount++) {
 
-        nextEntry = entry->Flink;
-        tracker = CONTAINING_RECORD(entry, TP_ACTIVITY_TRACKER, ListEntry);
+            nextEntry = entry->Flink;
+            tracker = CONTAINING_RECORD(entry, TP_ACTIVITY_TRACKER, ListEntry);
 
-        if (tracker->Magic == TP_TRACKER_MAGIC &&
-            tracker->LastActivity.QuadPart < expiryThreshold.QuadPart) {
-            //
-            // Mark as deleted and remove from lists
-            //
-            InterlockedExchange(&tracker->Deleted, 1);
-            RemoveEntryList(&tracker->ListEntry);
-            RemoveEntryList(&tracker->HashEntry);
-            InterlockedDecrement(&g_TpState.ActiveTrackers);
+            if (tracker->Magic == TP_TRACKER_MAGIC &&
+                tracker->LastActivity.QuadPart < expiryThreshold.QuadPart) {
+                //
+                // Mark as deleted and remove from lists
+                //
+                InterlockedExchange(&tracker->Deleted, 1);
+                RemoveEntryList(&tracker->ListEntry);
+                RemoveEntryList(&tracker->HashEntry);
+                InterlockedDecrement(&g_TpState.ActiveTrackers);
 
-            //
-            // Add to free list for deferred cleanup
-            //
-            InsertTailList(&freeList, &tracker->ListEntry);
+                //
+                // Add to free list for deferred cleanup
+                //
+                InsertTailList(&freeList, &tracker->ListEntry);
+            }
         }
     }
 
     KeReleaseSpinLock(&g_TpState.ActivitySpinLock, oldIrql);
 
     //
-    // Free trackers outside of lock
+    // Free trackers outside of lock (bounded)
     //
-    while (!IsListEmpty(&freeList)) {
-        entry = RemoveHeadList(&freeList);
-        tracker = CONTAINING_RECORD(entry, TP_ACTIVITY_TRACKER, ListEntry);
-        TppFreeTracker(tracker);
+    {
+        ULONG freeCount = 0;
+        while (!IsListEmpty(&freeList) && freeCount < TP_MAX_ACTIVITY_TRACKERS + 64) {
+            entry = RemoveHeadList(&freeList);
+            tracker = CONTAINING_RECORD(entry, TP_ACTIVITY_TRACKER, ListEntry);
+            TppReleaseTrackerRef(tracker);
+            freeCount++;
+        }
     }
 }
 
@@ -1162,31 +1198,36 @@ TpCleanupProcessTracker(
 
     KeAcquireSpinLock(&g_TpState.ActivitySpinLock, &oldIrql);
 
-    for (entry = hashHead->Flink; entry != hashHead; entry = entry->Flink) {
-        tracker = CONTAINING_RECORD(entry, TP_ACTIVITY_TRACKER, HashEntry);
+    {
+        ULONG walkCount = 0;
+        for (entry = hashHead->Flink;
+             entry != hashHead && walkCount < TP_MAX_HASH_WALK;
+             entry = entry->Flink, walkCount++) {
+            tracker = CONTAINING_RECORD(entry, TP_ACTIVITY_TRACKER, HashEntry);
 
-        if (tracker->Magic == TP_TRACKER_MAGIC &&
-            tracker->SourceProcessId == ProcessId &&
-            !tracker->Deleted) {
-            //
-            // Mark as deleted and remove from lists
-            //
-            InterlockedExchange(&tracker->Deleted, 1);
-            RemoveEntryList(&tracker->ListEntry);
-            RemoveEntryList(&tracker->HashEntry);
-            InterlockedDecrement(&g_TpState.ActiveTrackers);
-            trackerToFree = tracker;
-            break;
+            if (tracker->Magic == TP_TRACKER_MAGIC &&
+                tracker->SourceProcessId == ProcessId &&
+                !tracker->Deleted) {
+                //
+                // Mark as deleted and remove from lists
+                //
+                InterlockedExchange(&tracker->Deleted, 1);
+                RemoveEntryList(&tracker->ListEntry);
+                RemoveEntryList(&tracker->HashEntry);
+                InterlockedDecrement(&g_TpState.ActiveTrackers);
+                trackerToFree = tracker;
+                break;
+            }
         }
     }
 
     KeReleaseSpinLock(&g_TpState.ActivitySpinLock, oldIrql);
 
     //
-    // Free outside of lock
+    // Release creation reference outside of lock
     //
     if (trackerToFree != NULL) {
-        TppFreeTracker(trackerToFree);
+        TppReleaseTrackerRef(trackerToFree);
     }
 }
 
@@ -1478,11 +1519,14 @@ TppFindTrackerLocked(
     PLIST_ENTRY hashHead;
     PLIST_ENTRY entry;
     PTP_ACTIVITY_TRACKER tracker;
+    ULONG walkCount = 0;
 
     hash = TpHashProcessId(SourceProcessId);
     hashHead = &g_TpState.ActivityHashTable[hash];
 
-    for (entry = hashHead->Flink; entry != hashHead; entry = entry->Flink) {
+    for (entry = hashHead->Flink;
+         entry != hashHead && walkCount < TP_MAX_HASH_WALK;
+         entry = entry->Flink, walkCount++) {
         tracker = CONTAINING_RECORD(entry, TP_ACTIVITY_TRACKER, HashEntry);
 
         if (tracker->Magic == TP_TRACKER_MAGIC &&
@@ -1518,6 +1562,7 @@ TppFindOrCreateTracker(
 
     tracker = TppFindTrackerLocked(SourceProcessId);
     if (tracker != NULL) {
+        InterlockedIncrement(&tracker->ReferenceCount);
         KeReleaseSpinLock(&g_TpState.ActivitySpinLock, oldIrql);
         return tracker;
     }
@@ -1555,6 +1600,7 @@ TppFindOrCreateTracker(
         //
         // Another thread inserted - free our allocation and use existing
         //
+        InterlockedIncrement(&tracker->ReferenceCount);
         KeReleaseSpinLock(&g_TpState.ActivitySpinLock, oldIrql);
         TppFreeTracker(newTracker);
         return tracker;
@@ -1697,6 +1743,20 @@ TppUpdateTrackerActivity(
             InterlockedExchange(&Tracker->IsRateLimited, 1);
             InterlockedExchange(&Tracker->HasEnumerationPattern, 1);
         }
+    }
+}
+
+static VOID
+TppReleaseTrackerRef(
+    _In_ PTP_ACTIVITY_TRACKER Tracker
+)
+{
+    if (Tracker == NULL) {
+        return;
+    }
+
+    if (InterlockedDecrement(&Tracker->ReferenceCount) == 0) {
+        TppFreeTracker(Tracker);
     }
 }
 
@@ -1885,7 +1945,7 @@ TppBuildOperationContext(
         Context->OperationType = TpOperationUnknown;
     }
 
-    Context->IsKernelHandle = OperationInfo->KernelHandle;
+    Context->IsKernelHandle = (BOOLEAN)OperationInfo->KernelHandle;
 
     //
     // Source information
@@ -1933,31 +1993,27 @@ TppLogOperation(
     }
 
     //
-    // Check if WPP tracing is enabled before formatting
+    // Log operation details via DbgPrintEx
     //
-    if (WPP_LEVEL_ENABLED(TRACE_FLAG_SELFPROT)) {
-        TraceEvents(TRACE_LEVEL_WARNING, TRACE_FLAG_SELFPROT,
-            "ThreadProtection: %s THREAD access from PID %p (TID %p) to TID %p (PID %p). "
-            "Original: 0x%08X, Modified: 0x%08X, Stripped: 0x%08X, Attack: %d, Score: %u%s",
-            WasStripped ? "Stripped" : "Monitored",
-            Context->SourceProcessId,
-            Context->SourceThreadId,
-            Context->TargetThreadId,
-            Context->TargetProcessId,
-            Context->OriginalDesiredAccess,
-            Context->ModifiedDesiredAccess,
-            Context->StrippedAccess,
-            Context->DetectedAttack,
-            Context->SuspicionScore,
-            Context->TargetIsSystemThread ? " [SYSTEM THREAD]" : "");
-    }
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        "[ShadowStrike] ThreadProtection: %s THREAD access from PID %p (TID %p) to TID %p (PID %p). "
+        "Original: 0x%08X, Modified: 0x%08X, Stripped: 0x%08X, Attack: %d, Score: %u%s\n",
+        WasStripped ? "Stripped" : "Monitored",
+        Context->SourceProcessId,
+        Context->SourceThreadId,
+        Context->TargetThreadId,
+        Context->TargetProcessId,
+        Context->OriginalDesiredAccess,
+        Context->ModifiedDesiredAccess,
+        Context->StrippedAccess,
+        Context->DetectedAttack,
+        Context->SuspicionScore,
+        Context->TargetIsSystemThread ? " [SYSTEM THREAD]" : "");
 
     //
-    // Update global statistics
+    // Global self-protection stat already counted in TpThreadHandlePreCallback
+    // via SHADOWSTRIKE_INC_STAT(SelfProtectionBlocks).
     //
-    if (Context->StrippedAccess & THREAD_SET_CONTEXT) {
-        InterlockedIncrement64(&g_DriverData.Stats.ThreadInjectBlocks);
-    }
 }
 
 static BOOLEAN
