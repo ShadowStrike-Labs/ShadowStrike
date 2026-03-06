@@ -76,10 +76,14 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "WSLMonitor.h"
 #include "AppControl.h"
 #include "ClipboardMonitor.h"
+#include "../../../Shared/VerdictTypes.h"
 #include <ntstrsafe.h>
 
+static VOID PnpCleanupWorkRoutine(_In_ PDEVICE_OBJECT, _In_opt_ PVOID);
+static VOID PnpCleanupStaleContexts(VOID);
+
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, ShadowStrikeInitializeProcessMonitoring)
+#pragma alloc_text(PAGE, ShadowStrikeInitializeProcessMonitoring)
 #pragma alloc_text(PAGE, ShadowStrikeCleanupProcessMonitoring)
 #pragma alloc_text(PAGE, PnpCleanupWorkRoutine)
 #pragma alloc_text(PAGE, PnpCleanupStaleContexts)
@@ -98,6 +102,24 @@ Never acquire ProcessListLock while holding a bucket lock.
 #define PN_CONTEXT_TIMEOUT_MS           300000  // 5 minutes
 #define PN_MAX_COMMAND_LINE_CAPTURE     8192
 #define PN_MAX_IMAGE_PATH_CAPTURE       2048
+
+#ifndef PROCESS_QUERY_LIMITED_INFORMATION
+#define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
+#endif
+
+//
+// Forward declaration for undocumented but supported API (Win8.1+)
+// PsGetProcessSignatureLevel returns VOID and populates output params
+//
+#if (NTDDI_VERSION >= NTDDI_WINBLUE)
+NTKERNELAPI
+VOID
+PsGetProcessSignatureLevel(
+    _In_ PEPROCESS Process,
+    _Out_ PUCHAR SignatureLevel,
+    _Out_ PUCHAR SectionSignatureLevel
+    );
+#endif
 #define PN_USER_MODE_TIMEOUT_MS         5000    // 5 second timeout for user-mode
 #define PN_MAX_NOTIFICATIONS_PER_SECOND 1000    // Rate limit
 #define PN_RATE_LIMIT_WINDOW_MS         1000    // 1 second window
@@ -583,9 +605,11 @@ Return Value:
     RtlZeroMemory(&g_ProcessMonitor, sizeof(PN_MONITOR_STATE));
 
     //
-    // Get device object for work items
+    // Get device object for work items from driver object chain
     //
-    g_ProcessMonitor.DeviceObject = g_DriverData.DeviceObject;
+    if (g_DriverData.DriverObject != NULL) {
+        g_ProcessMonitor.DeviceObject = g_DriverData.DriverObject->DeviceObject;
+    }
     if (g_ProcessMonitor.DeviceObject == NULL) {
         return STATUS_INVALID_DEVICE_STATE;
     }
@@ -772,7 +796,6 @@ Routine Description:
     PPN_NOTIFICATION_ENTRY Notification;
     KIRQL OldIrql;
     LIST_ENTRY FreeList;
-    ULONG i;
 
     PAGED_CODE();
 
@@ -805,12 +828,24 @@ Routine Description:
 
     //
     // Wait for any pending cleanup work item to complete
-    // Spin-wait with yield - work item should complete quickly
+    // Bounded spin-wait: max 5 seconds (5000 iterations × 1ms)
     //
-    while (InterlockedCompareExchange(&g_ProcessMonitor.CleanupWorkPending, 0, 0) != 0) {
-        LARGE_INTEGER Interval;
-        Interval.QuadPart = -10000;  // 1ms
-        KeDelayExecutionThread(KernelMode, FALSE, &Interval);
+    {
+        ULONG SpinCount = 0;
+        while (InterlockedCompareExchange(&g_ProcessMonitor.CleanupWorkPending, 0, 0) != 0) {
+            LARGE_INTEGER Interval;
+            Interval.QuadPart = -10000;  // 1ms
+            KeDelayExecutionThread(KernelMode, FALSE, &Interval);
+
+            if (++SpinCount > 5000) {
+                DbgPrintEx(
+                    DPFLTR_IHVDRIVER_ID,
+                    DPFLTR_ERROR_LEVEL,
+                    "[ShadowStrike/ProcessNotify] Cleanup work item timed out after 5s, proceeding with shutdown\n"
+                    );
+                break;
+            }
+        }
     }
 
     //
@@ -991,9 +1026,11 @@ Arguments:
     }
 
     //
-    // Enter operation tracking
+    // Enter operation tracking via rundown protection
     //
-    SHADOWSTRIKE_ENTER_OPERATION();
+    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {
+        return;
+    }
 
     //
     // Handle process termination
@@ -1359,7 +1396,11 @@ Arguments:
     // WSL/Container escape detection — classify WSL processes and detect
     // host escape attempts (MITRE T1611)
     //
-    WslMonCheckProcessCreate(ProcessId, CreateInfo);
+    WslMonCheckProcessCreate(
+        ProcessId,
+        CreateInfo->ParentProcessId,
+        CreateInfo->ImageFileName
+        );
 
     //
     // Clipboard abuse detection — detect clipboard data theft patterns (T1115)
@@ -1383,11 +1424,13 @@ Arguments:
     // In Enforce mode this can block process creation (MITRE M1038)
     //
     {
-        NTSTATUS AcStatus = AcCheckProcessExecution(
+        AC_VERDICT AcVerdict = AcCheckProcessExecution(
+            CreateInfo->ImageFileName,
+            NULL,
             ProcessId,
-            CreateInfo
+            CreateInfo->ParentProcessId
             );
-        if (AcStatus == STATUS_ACCESS_DENIED && CreateInfo != NULL) {
+        if (AcVerdict == AcVerdict_Block && CreateInfo != NULL) {
             ShouldBlock = TRUE;
         }
     }
@@ -1533,7 +1576,7 @@ Cleanup:
         PnpFreeProcessContext(ProcessContext);
     }
 
-    SHADOWSTRIKE_LEAVE_OPERATION();
+    SHADOWSTRIKE_RELEASE_RUNDOWN();
 }
 
 
@@ -1703,7 +1746,6 @@ Return Value:
 {
     ULONG BucketIndex;
     PPN_HASH_BUCKET Bucket;
-    NTSTATUS Status = STATUS_SUCCESS;
 
     //
     // Verify context is not already inserted
@@ -1864,7 +1906,6 @@ PnpCaptureProcessInfo(
 {
     NTSTATUS Status = STATUS_SUCCESS;
     PWCHAR Buffer = NULL;
-    SIZE_T BufferSize;
     SIZE_T SafeBufferSize;
 
     //
@@ -2078,58 +2119,70 @@ PnpCaptureTokenInfo(
         }
 
         //
-        // Check for dangerous privileges using SeSinglePrivilegeCheck pattern
-        // Note: We check if the privilege EXISTS in the token, not if it's enabled
-        //
-
-        //
-        // SE_DEBUG_PRIVILEGE (20) - Can debug any process
+        // Check for dangerous privileges in the TARGET process's token
+        // Build a subject context from the already-captured primary token
+        // so we check the NEW process, not the calling thread's context
         //
         {
-            LUID DebugPrivilege = RtlConvertLongToLuid(SE_DEBUG_PRIVILEGE);
+            SECURITY_SUBJECT_CONTEXT SubjectContext;
             PRIVILEGE_SET PrivSet;
+
+            RtlZeroMemory(&SubjectContext, sizeof(SubjectContext));
+            SubjectContext.PrimaryToken = Token;
+            SubjectContext.ClientToken = NULL;
+            SubjectContext.ProcessAuditId = (PVOID)Process;
+
+            //
+            // SE_DEBUG_PRIVILEGE (20) - Can debug any process
+            //
             PrivSet.PrivilegeCount = 1;
             PrivSet.Control = PRIVILEGE_SET_ALL_NECESSARY;
-            PrivSet.Privilege[0].Luid = DebugPrivilege;
+            PrivSet.Privilege[0].Luid = RtlConvertLongToLuid(SE_DEBUG_PRIVILEGE);
             PrivSet.Privilege[0].Attributes = 0;
 
-            BOOLEAN Result = FALSE;
-            Status = SePrivilegeCheck(&PrivSet, &Process->Pcb, UserMode);
-            if (NT_SUCCESS(Status)) {
+            if (SePrivilegeCheck(&PrivSet, &SubjectContext, UserMode)) {
                 Context->HasDebugPrivilege = TRUE;
             }
-        }
 
-        //
-        // SE_IMPERSONATE_PRIVILEGE (29) - Can impersonate tokens
-        //
-        {
-            LUID ImpersonatePrivilege = RtlConvertLongToLuid(SE_IMPERSONATE_PRIVILEGE);
-            Context->HasImpersonatePrivilege = SeSinglePrivilegeCheck(ImpersonatePrivilege, UserMode);
-        }
+            //
+            // SE_IMPERSONATE_PRIVILEGE (29) - Can impersonate tokens
+            //
+            PrivSet.Privilege[0].Luid = RtlConvertLongToLuid(SE_IMPERSONATE_PRIVILEGE);
+            PrivSet.Privilege[0].Attributes = 0;
 
-        //
-        // SE_TCB_PRIVILEGE (7) - Act as part of OS
-        //
-        {
-            LUID TcbPrivilege = RtlConvertLongToLuid(SE_TCB_PRIVILEGE);
-            Context->HasTcbPrivilege = SeSinglePrivilegeCheck(TcbPrivilege, UserMode);
-        }
+            if (SePrivilegeCheck(&PrivSet, &SubjectContext, UserMode)) {
+                Context->HasImpersonatePrivilege = TRUE;
+            }
 
-        //
-        // SE_ASSIGNPRIMARYTOKEN_PRIVILEGE (3) - Assign process token
-        //
-        {
-            LUID AssignTokenPrivilege = RtlConvertLongToLuid(SE_ASSIGNPRIMARYTOKEN_PRIVILEGE);
-            Context->HasAssignPrimaryTokenPrivilege = SeSinglePrivilegeCheck(AssignTokenPrivilege, UserMode);
-        }
+            //
+            // SE_TCB_PRIVILEGE (7) - Act as part of OS
+            //
+            PrivSet.Privilege[0].Luid = RtlConvertLongToLuid(SE_TCB_PRIVILEGE);
+            PrivSet.Privilege[0].Attributes = 0;
 
-        //
-        // SE_LOAD_DRIVER_PRIVILEGE (10) - Load kernel drivers
-        //
-        {
-            LUID LoadDriverPrivilege = RtlConvertLongToLuid(SE_LOAD_DRIVER_PRIVILEGE);
-            Context->HasLoadDriverPrivilege = SeSinglePrivilegeCheck(LoadDriverPrivilege, UserMode);
+            if (SePrivilegeCheck(&PrivSet, &SubjectContext, UserMode)) {
+                Context->HasTcbPrivilege = TRUE;
+            }
+
+            //
+            // SE_ASSIGNPRIMARYTOKEN_PRIVILEGE (3) - Assign process token
+            //
+            PrivSet.Privilege[0].Luid = RtlConvertLongToLuid(SE_ASSIGNPRIMARYTOKEN_PRIVILEGE);
+            PrivSet.Privilege[0].Attributes = 0;
+
+            if (SePrivilegeCheck(&PrivSet, &SubjectContext, UserMode)) {
+                Context->HasAssignPrimaryTokenPrivilege = TRUE;
+            }
+
+            //
+            // SE_LOAD_DRIVER_PRIVILEGE (10) - Load kernel drivers
+            //
+            PrivSet.Privilege[0].Luid = RtlConvertLongToLuid(SE_LOAD_DRIVER_PRIVILEGE);
+            PrivSet.Privilege[0].Attributes = 0;
+
+            if (SePrivilegeCheck(&PrivSet, &SubjectContext, UserMode)) {
+                Context->HasLoadDriverPrivilege = TRUE;
+            }
         }
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -2201,6 +2254,8 @@ Routine Description:
     Detection: Compare CreateInfo->ParentProcessId with CreatingThreadId.UniqueProcess
 --*/
 {
+    UNREFERENCED_PARAMETER(CreateInfo);
+
     //
     // The creating process (from CreatingThreadId) should normally be the parent
     // If they differ, the parent was explicitly set to a different process
@@ -2705,13 +2760,12 @@ PnpSendProcessNotification(
     //
     // Send notification with timeout
     //
-    Status = ShadowStrikeSendProcessNotificationWithTimeout(
+    Status = ShadowStrikeSendProcessNotification(
         Notification,
         (ULONG)NotificationSize,
         RequireReply,
         Reply,
-        RequireReply ? (PULONG)&ReplySize : NULL,
-        g_ProcessMonitor.Config.AnalysisTimeoutMs
+        RequireReply ? (PULONG)&ReplySize : NULL
         );
 
     //
@@ -2736,7 +2790,7 @@ PnpSendProcessNotification(
     // Handle verdict
     //
     if (RequireReply && NT_SUCCESS(Status) && Reply != NULL) {
-        if (Reply->Verdict == SHADOWSTRIKE_VERDICT_BLOCK) {
+        if (Reply->Verdict == Verdict_Malicious) {
             Status = STATUS_ACCESS_DENIED;
         }
     }
@@ -3176,24 +3230,22 @@ Routine Description:
 
         //
         // PsGetProcessSignatureLevel is available on Windows 8.1+
-        // We use it if available, otherwise we can't verify
+        // Returns VOID, populates output params directly
         //
         #if (NTDDI_VERSION >= NTDDI_WINBLUE)
-        Status = PsGetProcessSignatureLevel(
+        PsGetProcessSignatureLevel(
             Context->ProcessObject,
             &SignatureLevel,
             &SectionSignatureLevel
             );
 
-        if (NT_SUCCESS(Status)) {
-            //
-            // Any signature level > 0 indicates some form of signing
-            // SE_SIGNING_LEVEL_MICROSOFT (8) or higher is MS-signed
-            // SE_SIGNING_LEVEL_AUTHENTICODE (4) is third-party signed
-            //
-            if (SignatureLevel >= SE_SIGNING_LEVEL_AUTHENTICODE) {
-                Context->IsSignatureValid = TRUE;
-            }
+        //
+        // Any signature level > 0 indicates some form of signing
+        // SE_SIGNING_LEVEL_MICROSOFT (8) or higher is MS-signed
+        // SE_SIGNING_LEVEL_AUTHENTICODE (4) is third-party signed
+        //
+        if (SignatureLevel >= SE_SIGNING_LEVEL_AUTHENTICODE) {
+            Context->IsSignatureValid = TRUE;
         }
         #else
         //
@@ -3303,7 +3355,6 @@ Routine Description:
     PLIST_ENTRY Entry, Next;
     PPN_PROCESS_CONTEXT Context;
     LIST_ENTRY StaleList;
-    NTSTATUS Status;
 
     PAGED_CODE();
 
