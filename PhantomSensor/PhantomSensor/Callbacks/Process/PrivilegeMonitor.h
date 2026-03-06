@@ -57,6 +57,7 @@ Detection Techniques Covered (MITRE ATT&CK):
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 
 //

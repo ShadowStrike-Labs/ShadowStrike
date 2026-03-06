@@ -58,8 +58,23 @@ SECURITY FIXES APPLIED (v3.0.0):
 #include "../../Utilities/ProcessUtils.h"
 #include <ntstrsafe.h>
 
+//
+// Forward declarations for ntoskrnl exports not in WDK headers
+//
+NTKERNELAPI
+HANDLE
+PsGetProcessInheritedFromUniqueProcessId(
+    _In_ PEPROCESS Process
+    );
+
+NTKERNELAPI
+NTSTATUS
+PsGetProcessExitStatus(
+    _In_ PEPROCESS Process
+    );
+
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, PmInitialize)
+#pragma alloc_text(PAGE, PmInitialize)
 #pragma alloc_text(PAGE, PmShutdown)
 #pragma alloc_text(PAGE, PmRecordBaseline)
 #pragma alloc_text(PAGE, PmRemoveBaseline)
@@ -81,28 +96,68 @@ SECURITY FIXES APPLIED (v3.0.0):
 #define PM_MONITOR_SIGNATURE_DEAD       0x44454144  // 'DEAD'
 
 //
-// Privilege LUID values (from winnt.h)
+// Privilege LUID values — guarded to avoid redefinition with WDK headers
 //
+#ifndef SE_CREATE_TOKEN_PRIVILEGE
 #define SE_CREATE_TOKEN_PRIVILEGE           2
+#endif
+#ifndef SE_ASSIGNPRIMARYTOKEN_PRIVILEGE
 #define SE_ASSIGNPRIMARYTOKEN_PRIVILEGE     3
+#endif
+#ifndef SE_LOCK_MEMORY_PRIVILEGE
 #define SE_LOCK_MEMORY_PRIVILEGE            4
+#endif
+#ifndef SE_INCREASE_QUOTA_PRIVILEGE
 #define SE_INCREASE_QUOTA_PRIVILEGE         5
+#endif
+#ifndef SE_TCB_PRIVILEGE
 #define SE_TCB_PRIVILEGE                    7
+#endif
+#ifndef SE_SECURITY_PRIVILEGE
 #define SE_SECURITY_PRIVILEGE               8
+#endif
+#ifndef SE_TAKE_OWNERSHIP_PRIVILEGE
 #define SE_TAKE_OWNERSHIP_PRIVILEGE         9
+#endif
+#ifndef SE_LOAD_DRIVER_PRIVILEGE
 #define SE_LOAD_DRIVER_PRIVILEGE            10
+#endif
+#ifndef SE_SYSTEM_PROFILE_PRIVILEGE
 #define SE_SYSTEM_PROFILE_PRIVILEGE         11
+#endif
+#ifndef SE_SYSTEMTIME_PRIVILEGE
 #define SE_SYSTEMTIME_PRIVILEGE             12
+#endif
+#ifndef SE_BACKUP_PRIVILEGE
 #define SE_BACKUP_PRIVILEGE                 17
+#endif
+#ifndef SE_RESTORE_PRIVILEGE
 #define SE_RESTORE_PRIVILEGE                18
+#endif
+#ifndef SE_SHUTDOWN_PRIVILEGE
 #define SE_SHUTDOWN_PRIVILEGE               19
+#endif
+#ifndef SE_DEBUG_PRIVILEGE
 #define SE_DEBUG_PRIVILEGE                  20
+#endif
+#ifndef SE_AUDIT_PRIVILEGE
 #define SE_AUDIT_PRIVILEGE                  21
+#endif
+#ifndef SE_SYSTEM_ENVIRONMENT_PRIVILEGE
 #define SE_SYSTEM_ENVIRONMENT_PRIVILEGE     22
+#endif
+#ifndef SE_IMPERSONATE_PRIVILEGE
 #define SE_IMPERSONATE_PRIVILEGE            29
+#endif
+#ifndef SE_MANAGE_VOLUME_PRIVILEGE
 #define SE_MANAGE_VOLUME_PRIVILEGE          28
+#endif
+#ifndef SE_CREATE_PAGEFILE_PRIVILEGE
 #define SE_CREATE_PAGEFILE_PRIVILEGE        15
+#endif
+#ifndef SE_INCREASE_BASE_PRIORITY_PRIVILEGE
 #define SE_INCREASE_BASE_PRIORITY_PRIVILEGE 14
+#endif
 
 // ============================================================================
 // INTERNAL STRUCTURES
@@ -770,9 +825,11 @@ Return Value:
     KeQuerySystemTime(&Internal->Stats.StartTime);
 
     //
-    // Get device object for work item (use global if available)
+    // Get device object for work item (from driver object's device chain)
     //
-    Internal->DeviceObject = ShadowStrikeGetDeviceObject();
+    if (g_DriverData.DriverObject != NULL) {
+        Internal->DeviceObject = g_DriverData.DriverObject->DeviceObject;
+    }
     if (Internal->DeviceObject == NULL) {
         //
         // Cannot create work items without device object
@@ -883,12 +940,18 @@ Arguments:
         KeFlushQueuedDpcs();
 
         //
-        // Wait for cleanup work item to complete if in progress
+        // Wait for cleanup work item to complete if in progress (bounded)
         //
-        while (InterlockedCompareExchange(&Internal->CleanupInProgress, 0, 0) != 0) {
-            LARGE_INTEGER Delay;
-            Delay.QuadPart = -10000; // 1ms
-            KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+        {
+            ULONG WaitIterations = 0;
+            const ULONG MaxWaitIterations = 5000;  // 5 seconds max
+            while (InterlockedCompareExchange(&Internal->CleanupInProgress, 0, 0) != 0 &&
+                   WaitIterations < MaxWaitIterations) {
+                LARGE_INTEGER Delay;
+                Delay.QuadPart = -10000; // 1ms
+                KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+                WaitIterations++;
+            }
         }
 
         Internal->CleanupTimerActive = FALSE;
@@ -2290,23 +2353,21 @@ Return Value:
 {
     NTSTATUS Status;
     ULONG IntegrityLevel = PM_INTEGRITY_MEDIUM;
-    PSID IntegritySid = NULL;
+    PTOKEN_MANDATORY_LABEL MandatoryLabel = NULL;
 
     //
-    // Get the token integrity level SID
+    // SeQueryInformationToken(TokenIntegrityLevel) returns TOKEN_MANDATORY_LABEL*
+    // which contains SID_AND_ATTRIBUTES Label — the SID is at Label.Sid.
     //
     Status = SeQueryInformationToken(
         Token,
         TokenIntegrityLevel,
-        &IntegritySid
+        (PVOID*)&MandatoryLabel
         );
 
-    if (NT_SUCCESS(Status) && IntegritySid != NULL) {
-        //
-        // The integrity level is in the last subauthority
-        //
-        PISID Sid = (PISID)IntegritySid;
-        if (Sid->SubAuthorityCount > 0) {
+    if (NT_SUCCESS(Status) && MandatoryLabel != NULL) {
+        PISID Sid = (PISID)MandatoryLabel->Label.Sid;
+        if (Sid != NULL && Sid->SubAuthorityCount > 0) {
             ULONG IntegrityRid = Sid->SubAuthority[Sid->SubAuthorityCount - 1];
 
             //
@@ -2329,7 +2390,7 @@ Return Value:
             }
         }
 
-        ExFreePool(IntegritySid);
+        ExFreePool(MandatoryLabel);
     }
 
     return IntegrityLevel;
@@ -2353,52 +2414,23 @@ Return Value:
 --*/
 {
     ULONG Flags = PM_PRIV_NONE;
-    LUID PrivilegeLuid;
-    BOOLEAN HasPrivilege;
+    PTOKEN_PRIVILEGES PrivilegesBuffer = NULL;
+    NTSTATUS Status;
 
     //
-    // Check each sensitive privilege
-    //
-
-    // SE_DEBUG_PRIVILEGE
-    PrivilegeLuid = RtlConvertLongToLuid(SE_DEBUG_PRIVILEGE);
-    if (SePrivilegeCheck(&(PRIVILEGE_SET){1, PRIVILEGE_SET_ALL_NECESSARY,
-        {{PrivilegeLuid, SE_PRIVILEGE_ENABLED}}},
-        &((SECURITY_SUBJECT_CONTEXT){0, Token, Token, 0}),
-        UserMode)) {
-        Flags |= PM_PRIV_DEBUG;
-    }
-
-    //
-    // Alternative method: Use SeCheckTokenPrivilege for common privileges
-    //
-
-    // SE_TCB_PRIVILEGE
-    PrivilegeLuid = RtlConvertLongToLuid(SE_TCB_PRIVILEGE);
-    HasPrivilege = FALSE;
-    if (SeSinglePrivilegeCheck(PrivilegeLuid, KernelMode)) {
-        // Note: This checks current token, not the passed token
-        // For accurate checking, we'd need to use SePrivilegeCheck
-    }
-
-    //
-    // Check commonly abused privileges by examining token directly
-    // This is a simplified check - full implementation would iterate TOKEN_PRIVILEGES
+    // Query all privileges from the token using SeQueryInformationToken.
+    // SeQueryInformationToken allocates the buffer; caller frees with ExFreePool.
     //
     __try {
-        PTOKEN_PRIVILEGES TokenPrivileges = NULL;
-        ULONG ReturnLength = 0;
-        NTSTATUS Status;
-
         Status = SeQueryInformationToken(
             Token,
             TokenPrivileges,
-            &TokenPrivileges
+            (PVOID*)&PrivilegesBuffer
             );
 
-        if (NT_SUCCESS(Status) && TokenPrivileges != NULL) {
-            for (ULONG i = 0; i < TokenPrivileges->PrivilegeCount; i++) {
-                PLUID_AND_ATTRIBUTES Priv = &TokenPrivileges->Privileges[i];
+        if (NT_SUCCESS(Status) && PrivilegesBuffer != NULL) {
+            for (ULONG i = 0; i < PrivilegesBuffer->PrivilegeCount; i++) {
+                PLUID_AND_ATTRIBUTES Priv = &PrivilegesBuffer->Privileges[i];
 
                 //
                 // Only count enabled or default-enabled privileges
@@ -2470,10 +2502,12 @@ Return Value:
                 }
             }
 
-            ExFreePool(TokenPrivileges);
+            ExFreePool(PrivilegesBuffer);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Ignore exceptions during privilege enumeration
+        if (PrivilegesBuffer != NULL) {
+            ExFreePool(PrivilegesBuffer);
+        }
     }
 
     return Flags;
