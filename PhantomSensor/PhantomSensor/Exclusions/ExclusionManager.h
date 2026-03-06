@@ -736,6 +736,114 @@ ShadowStrikeCleanupExpiredExclusions(
     );
 
 // ============================================================================
+// PROCESS EXCLUSION ENGINE (ProcessExclusion.c)
+// ============================================================================
+
+/**
+ * @brief Initialize the process exclusion subsystem.
+ *
+ * @return STATUS_SUCCESS on success
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ShadowStrikeProcessExclusionInitialize(
+    VOID
+    );
+
+/**
+ * @brief Shutdown the process exclusion subsystem.
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ShadowStrikeProcessExclusionShutdown(
+    VOID
+    );
+
+/**
+ * @brief Handle process creation — check and add to trusted set.
+ *
+ * @param ProcessId         New process ID
+ * @param ParentProcessId   Parent process ID
+ * @param ImagePath         Process image path (optional)
+ * @return TRUE if process is excluded
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+BOOLEAN
+ShadowStrikeOnProcessCreate(
+    _In_ HANDLE ProcessId,
+    _In_ HANDLE ParentProcessId,
+    _In_opt_ PCUNICODE_STRING ImagePath
+    );
+
+/**
+ * @brief Handle process termination — remove from trusted set.
+ *
+ * @param ProcessId     Terminating process ID
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ShadowStrikeOnProcessTerminate(
+    _In_ HANDLE ProcessId
+    );
+
+/**
+ * @brief Check if a process is in the trusted/excluded set.
+ *
+ * @param ProcessId     Process ID to check
+ * @return TRUE if excluded
+ * @irql <= APC_LEVEL
+ */
+_IRQL_requires_max_(APC_LEVEL)
+BOOLEAN
+ShadowStrikeIsProcessTrusted(
+    _In_ HANDLE ProcessId
+    );
+
+/**
+ * @brief Manually add a process to the trusted set.
+ *
+ * @param ProcessId     Process ID to exclude
+ * @param Permanent     If TRUE, cannot be removed by automatic cleanup
+ * @return STATUS_SUCCESS on success
+ * @irql <= APC_LEVEL
+ */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ShadowStrikeAddTrustedProcess(
+    _In_ HANDLE ProcessId,
+    _In_ BOOLEAN Permanent
+    );
+
+/**
+ * @brief Remove a process from the trusted set.
+ *
+ * @param ProcessId     Process ID to remove
+ * @return TRUE if removed
+ * @irql <= APC_LEVEL
+ */
+_IRQL_requires_max_(APC_LEVEL)
+BOOLEAN
+ShadowStrikeRemoveTrustedProcess(
+    _In_ HANDLE ProcessId
+    );
+
+/**
+ * @brief Get count of currently excluded processes.
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG
+ShadowStrikeGetTrustedProcessCount(
+    VOID
+    );
+
+// ============================================================================
 // PATH EXCLUSION HELPERS (PathExclusion.c)
 // ============================================================================
 

@@ -339,6 +339,81 @@ PepIsReady(
 }
 
 // ============================================================================
+// PUBLIC API FORWARD DECLARATIONS (required before alloc_text)
+// ============================================================================
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ShadowStrikeProcessExclusionInitialize(
+    VOID
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ShadowStrikeProcessExclusionShutdown(
+    VOID
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+BOOLEAN
+ShadowStrikeOnProcessCreate(
+    _In_ HANDLE ProcessId,
+    _In_ HANDLE ParentProcessId,
+    _In_opt_ PCUNICODE_STRING ImagePath
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ShadowStrikeOnProcessTerminate(
+    _In_ HANDLE ProcessId
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
+BOOLEAN
+ShadowStrikeIsProcessTrusted(
+    _In_ HANDLE ProcessId
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
+BOOLEAN
+ShadowStrikeIsProcessTrustedEx(
+    _In_ HANDLE ProcessId,
+    _Out_opt_ PE_EXCLUSION_REASON* Reason
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+ShadowStrikeAddTrustedProcess(
+    _In_ HANDLE ProcessId,
+    _In_ BOOLEAN Permanent
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
+BOOLEAN
+ShadowStrikeRemoveTrustedProcess(
+    _In_ HANDLE ProcessId
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ShadowStrikeProcessExclusionGetStats(
+    _Out_ PPE_STATISTICS Stats
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ShadowStrikeProcessExclusionResetStats(
+    VOID
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG
+ShadowStrikeGetTrustedProcessCount(
+    VOID
+    );
+
+// ============================================================================
 // PAGE ALLOCATION
 // ============================================================================
 
@@ -893,6 +968,21 @@ ShadowStrikeIsProcessTrusted(
         return FALSE;
     }
 
+    //
+    // PE-3 fix: Acquire reference to prevent use-after-free during
+    // shutdown. Without this, context teardown can race with lookups.
+    //
+    PepAcquireReference();
+
+    //
+    // Re-check state after reference acquisition — shutdown may have
+    // started between our initial PepIsReady check and the ref acquire.
+    //
+    if (!PepIsReady()) {
+        PepReleaseReference();
+        return FALSE;
+    }
+
     InterlockedIncrement64(&ctx->Stats.TotalLookups);
 
     if (pidValue < PE_BITMAP_MAX_PID) {
@@ -911,7 +1001,7 @@ ShadowStrikeIsProcessTrusted(
             InterlockedIncrement64(&ctx->Stats.BitmapHits);
 
             //
-            // Update hit count under ExtendedInfoLock (C-4 fix)
+            // Update hit count under ExtendedInfoLock
             //
             KeEnterCriticalRegion();
             ExAcquirePushLockShared(&ctx->ExtendedInfoLock);
@@ -939,6 +1029,8 @@ ShadowStrikeIsProcessTrusted(
     if (!trusted) {
         InterlockedIncrement64(&ctx->Stats.Misses);
     }
+
+    PepReleaseReference();
 
     return trusted;
 }
@@ -976,6 +1068,16 @@ ShadowStrikeIsProcessTrustedEx(
     }
 
     if (ProcessId == NULL) {
+        return FALSE;
+    }
+
+    //
+    // PE-3 fix: Acquire reference to prevent use-after-free during shutdown.
+    //
+    PepAcquireReference();
+
+    if (!PepIsReady()) {
+        PepReleaseReference();
         return FALSE;
     }
 
@@ -1029,6 +1131,8 @@ ShadowStrikeIsProcessTrustedEx(
     if (Reason != NULL) {
         *Reason = reason;
     }
+
+    PepReleaseReference();
 
     return trusted;
 }
@@ -1213,14 +1317,41 @@ ShadowStrikeRemoveTrustedProcess(
 
     } else {
         //
-        // Hash table path — check permanent and remove under single lock
+        // PE-4 fix: Atomic permanent check + remove under single exclusive lock.
+        // The original code used PepFindPidInHash (shared lock) then
+        // PepRemovePidFromHash (exclusive lock) — classic TOCTOU.
         //
-        BOOLEAN isPermanent = FALSE;
-        if (PepFindPidInHash(ProcessId, NULL, NULL, NULL, &isPermanent)) {
-            if (!isPermanent) {
-                PepRemovePidFromHash(ProcessId);
-                removed = TRUE;
+        ULONG bucket = PepPidToHashBucket(ProcessId);
+        PLIST_ENTRY listEntry;
+        PPE_PID_ENTRY pidEntry;
+        PPE_PID_ENTRY toRemove = NULL;
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&ctx->HashLock);
+
+        for (listEntry = ctx->HashBuckets[bucket].ListHead.Flink;
+             listEntry != &ctx->HashBuckets[bucket].ListHead;
+             listEntry = listEntry->Flink) {
+
+            pidEntry = CONTAINING_RECORD(listEntry, PE_PID_ENTRY, ListEntry);
+
+            if (pidEntry->ProcessId == ProcessId) {
+                if (!pidEntry->Permanent) {
+                    toRemove = pidEntry;
+                    RemoveEntryList(&pidEntry->ListEntry);
+                    InterlockedDecrement(&ctx->HashBuckets[bucket].EntryCount);
+                    InterlockedDecrement(&ctx->Stats.CurrentHashCount);
+                    removed = TRUE;
+                }
+                break;
             }
+        }
+
+        ExReleasePushLockExclusive(&ctx->HashLock);
+        KeLeaveCriticalRegion();
+
+        if (toRemove != NULL) {
+            PepFreePidEntry(toRemove);
         }
     }
 
@@ -1683,6 +1814,8 @@ PepCheckParentExclusion(
     PPE_CONTEXT ctx = &g_ProcessExclusionContext;
     ULONG_PTR parentPidValue = (ULONG_PTR)ParentProcessId;
     BOOLEAN parentExcluded = FALSE;
+
+    UNREFERENCED_PARAMETER(ProcessId);
 
     *Reason = PeReason_None;
     *InheritanceDepth = 0;
