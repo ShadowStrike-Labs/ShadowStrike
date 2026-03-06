@@ -36,6 +36,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 
 //
@@ -455,6 +456,23 @@ PrGetNode(
     _In_ PPR_GRAPH Graph,
     _In_ HANDLE ProcessId,
     _Out_ PPR_PROCESS_NODE* Node
+    );
+
+/**
+ * @brief Release a node reference acquired by PrGetNode.
+ *
+ * MUST be called for every successful PrGetNode call to prevent leaks.
+ *
+ * @param[in] Graph     The graph the node belongs to.
+ * @param[in] Node      Node pointer from PrGetNode.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+PrReleaseNode(
+    _In_ PPR_GRAPH Graph,
+    _In_ PPR_PROCESS_NODE Node
     );
 
 #ifdef __cplusplus
