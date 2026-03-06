@@ -36,6 +36,7 @@
 #include "../../Core/Globals.h"
 #include "../../Shared/BehaviorTypes.h"
 #include <ntstrsafe.h>
+#include <ntimage.h>
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -46,7 +47,8 @@
 //
 typedef struct _ABD_CRITICAL_FUNCTION {
     CHAR Name[ABD_FUNCTION_NAME_MAX];
-    ULONG RvaOffset;                    // Resolved at runtime from export table
+    ULONG RvaOffset;                    // RVA for computing in-memory function address
+    ULONG FileOffset;                   // File offset for baseline prologue comparison
     BOOLEAN Resolved;
 } ABD_CRITICAL_FUNCTION, *PABD_CRITICAL_FUNCTION;
 
@@ -227,6 +229,31 @@ AbdpRvaToFileOffset(
     _In_ ULONG Rva
     );
 
+static VOID
+AbdpReleaseProcess(
+    _In_ PABD_PROCESS_ENTRY Entry
+    );
+
+// ============================================================================
+// SECTION ASSIGNMENTS
+// ============================================================================
+
+#pragma alloc_text(PAGE, AbdInitialize)
+#pragma alloc_text(PAGE, AbdShutdown)
+#pragma alloc_text(PAGE, AbdNotifyImageLoad)
+#pragma alloc_text(PAGE, AbdScanProcess)
+#pragma alloc_text(PAGE, AbdCheckProtectionChange)
+#pragma alloc_text(PAGE, AbdpLoadCleanBaseline)
+#pragma alloc_text(PAGE, AbdpResolveExports)
+#pragma alloc_text(PAGE, AbdpFindProcess)
+#pragma alloc_text(PAGE, AbdpTrackProcess)
+#pragma alloc_text(PAGE, AbdpRemoveProcess)
+#pragma alloc_text(PAGE, AbdpIsAmsiDll)
+#pragma alloc_text(PAGE, AbdpCheckPrologueForPatch)
+#pragma alloc_text(PAGE, AbdpReadProcessMemory)
+#pragma alloc_text(PAGE, AbdpFindExportRva)
+#pragma alloc_text(PAGE, AbdpRvaToFileOffset)
+
 // ============================================================================
 // LIFECYCLE
 // ============================================================================
@@ -239,6 +266,8 @@ AbdInitialize(
 {
     NTSTATUS status;
     LONG prevState;
+
+    PAGED_CODE();
 
     prevState = InterlockedCompareExchange(
         &g_AbdState.State,
@@ -315,6 +344,9 @@ AbdShutdown(
     )
 {
     LONG prevState;
+    ULONG freed = 0;
+
+    PAGED_CODE();
 
     prevState = InterlockedCompareExchange(
         &g_AbdState.State,
@@ -333,10 +365,12 @@ AbdShutdown(
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_AbdState.ProcessLock);
-    while (!IsListEmpty(&g_AbdState.ProcessList)) {
+    while (!IsListEmpty(&g_AbdState.ProcessList) &&
+           freed < ABD_MAX_TRACKED_PROCESSES) {
         PLIST_ENTRY entry = RemoveHeadList(&g_AbdState.ProcessList);
         PABD_PROCESS_ENTRY proc = CONTAINING_RECORD(entry, ABD_PROCESS_ENTRY, ListEntry);
         ExFreeToNPagedLookasideList(&g_AbdState.ProcessLookaside, proc);
+        freed++;
     }
     g_AbdState.ProcessCount = 0;
     ExReleasePushLockExclusive(&g_AbdState.ProcessLock);
@@ -363,8 +397,8 @@ AbdShutdown(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] AMSI Bypass Detector shutdown "
                "(monitored=%lld, bypasses=%lld)\n",
-               g_AbdState.Stats.ProcessesMonitored,
-               g_AbdState.Stats.BypassesDetected);
+               ReadNoFence64(&g_AbdState.Stats.ProcessesMonitored),
+               ReadNoFence64(&g_AbdState.Stats.BypassesDetected));
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -389,6 +423,8 @@ AbdNotifyImageLoad(
     _In_ PUNICODE_STRING ImageName
     )
 {
+    PAGED_CODE();
+
     if (!AbdIsActive()) {
         return;
     }
@@ -426,6 +462,8 @@ AbdScanProcess(
     NTSTATUS status = STATUS_SUCCESS;
     PABD_PROCESS_ENTRY procEntry;
     UCHAR currentPrologue[ABD_PROLOGUE_SIZE];
+
+    PAGED_CODE();
 
     RtlZeroMemory(Detection, sizeof(ABD_DETECTION));
     Detection->BypassType = AbdBypass_None;
@@ -494,13 +532,13 @@ AbdScanProcess(
             );
 
             //
-            // Copy original bytes from clean baseline
+            // Copy original bytes from clean baseline (using file offset, not RVA)
             //
             if (g_AbdState.CleanAmsiCopy != NULL &&
-                func->RvaOffset + ABD_PROLOGUE_SIZE <= g_AbdState.CleanAmsiSize) {
+                func->FileOffset + ABD_PROLOGUE_SIZE <= g_AbdState.CleanAmsiSize) {
                 RtlCopyMemory(
                     Detection->OriginalBytes,
-                    (PUCHAR)g_AbdState.CleanAmsiCopy + func->RvaOffset,
+                    (PUCHAR)g_AbdState.CleanAmsiCopy + func->FileOffset,
                     ABD_PROLOGUE_SIZE
                 );
             }
@@ -523,13 +561,14 @@ AbdScanProcess(
         }
 
         //
-        // Method 2: Compare against clean baseline (if available)
+        // Method 2: Compare against clean baseline using file offset (not RVA)
         //
         if (g_AbdState.CleanAmsiCopy != NULL &&
-            func->RvaOffset + ABD_PROLOGUE_SIZE <= g_AbdState.CleanAmsiSize) {
+            func->FileOffset != 0 &&
+            func->FileOffset + ABD_PROLOGUE_SIZE <= g_AbdState.CleanAmsiSize) {
 
             const UCHAR *cleanPrologue =
-                (const UCHAR *)g_AbdState.CleanAmsiCopy + func->RvaOffset;
+                (const UCHAR *)g_AbdState.CleanAmsiCopy + func->FileOffset;
 
             if (RtlCompareMemory(currentPrologue, cleanPrologue, ABD_PROLOGUE_SIZE)
                 != ABD_PROLOGUE_SIZE) {
@@ -568,6 +607,7 @@ AbdScanProcess(
     }
 
     KeQuerySystemTimePrecise(&procEntry->LastScanTime);
+    AbdpReleaseProcess(procEntry);
     ExReleaseRundownProtection(&g_AbdState.RundownRef);
 
     return STATUS_SUCCESS;
@@ -592,6 +632,8 @@ AbdCheckProtectionChange(
     ULONG_PTR regionEnd;
     ULONG_PTR amsiStart;
     ULONG_PTR amsiEnd;
+
+    PAGED_CODE();
 
     if (!AbdIsActive()) {
         return FALSE;
@@ -638,11 +680,13 @@ AbdCheckProtectionChange(
                        HandleToUlong(ProcessId), BaseAddress,
                        OldProtection, NewProtection);
 
+            AbdpReleaseProcess(procEntry);
             ExReleaseRundownProtection(&g_AbdState.RundownRef);
             return TRUE;
         }
     }
 
+    AbdpReleaseProcess(procEntry);
     ExReleaseRundownProtection(&g_AbdState.RundownRef);
     return FALSE;
 }
@@ -686,6 +730,8 @@ AbdpLoadCleanBaseline(
     FILE_STANDARD_INFORMATION fileInfo;
     PVOID buffer = NULL;
     LARGE_INTEGER readOffset;
+
+    PAGED_CODE();
 
     RtlInitUnicodeString(&amsiPath, L"\\SystemRoot\\System32\\amsi.dll");
 
@@ -815,10 +861,38 @@ AbdpResolveExports(
     )
 {
     ULONG resolved = 0;
+    PIMAGE_DOS_HEADER dosHeader;
+    PIMAGE_NT_HEADERS64 ntHeaders;
+    PIMAGE_SECTION_HEADER sections;
+    ULONG numSections;
+
+    PAGED_CODE();
 
     if (g_AbdState.CleanAmsiCopy == NULL) {
         return STATUS_NOT_FOUND;
     }
+
+    //
+    // Parse PE headers for section table (needed for RVA → file offset conversion)
+    //
+    dosHeader = (PIMAGE_DOS_HEADER)g_AbdState.CleanAmsiCopy;
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    if ((ULONG)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS64) >
+        g_AbdState.CleanAmsiSize) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    ntHeaders = (PIMAGE_NT_HEADERS64)(
+        (PUCHAR)g_AbdState.CleanAmsiCopy + dosHeader->e_lfanew);
+    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    sections = IMAGE_FIRST_SECTION(ntHeaders);
+    numSections = ntHeaders->FileHeader.NumberOfSections;
 
     for (ULONG i = 0; i < ARRAYSIZE(g_CriticalExportNames); i++) {
         if (i >= ABD_MAX_CRITICAL_FUNCTIONS) {
@@ -835,12 +909,14 @@ AbdpResolveExports(
 
         RtlStringCbCopyA(func->Name, sizeof(func->Name), g_CriticalExportNames[i]);
         func->RvaOffset = rva;
-        func->Resolved = (rva != 0);
+        func->FileOffset = (rva != 0) ?
+            AbdpRvaToFileOffset(sections, numSections, rva) : 0;
+        func->Resolved = (rva != 0 && func->FileOffset != 0);
 
         if (func->Resolved) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                       "[ShadowStrike] AMSI export resolved: %s -> RVA 0x%X\n",
-                       g_CriticalExportNames[i], rva);
+                       "[ShadowStrike] AMSI export resolved: %s -> RVA 0x%X (file offset 0x%X)\n",
+                       g_CriticalExportNames[i], rva, func->FileOffset);
         }
 
         resolved++;
@@ -869,6 +945,8 @@ AbdpFindExportRva(
     PULONG addressOfNames;
     PUSHORT addressOfNameOrdinals;
     ULONG i;
+
+    PAGED_CODE();
 
     if (ImageBase == NULL || ImageSize < sizeof(IMAGE_DOS_HEADER)) {
         return 0;
@@ -980,6 +1058,8 @@ AbdpRvaToFileOffset(
     _In_ ULONG Rva
     )
 {
+    PAGED_CODE();
+
     for (ULONG i = 0; i < NumberOfSections; i++) {
         if (Rva >= Sections[i].VirtualAddress &&
             Rva < Sections[i].VirtualAddress + Sections[i].SizeOfRawData) {
@@ -1000,6 +1080,8 @@ AbdpIsAmsiDll(
 {
     USHORT nameChars;
     USHORT matchChars;
+
+    PAGED_CODE();
 
     if (ImageName == NULL || ImageName->Buffer == NULL || ImageName->Length == 0) {
         return FALSE;
@@ -1037,19 +1119,24 @@ AbdpFindProcess(
 {
     PABD_PROCESS_ENTRY entry = NULL;
     PLIST_ENTRY listEntry;
+    ULONG walkCount = 0;
+
+    PAGED_CODE();
 
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_AbdState.ProcessLock);
 
     for (listEntry = g_AbdState.ProcessList.Flink;
-         listEntry != &g_AbdState.ProcessList;
-         listEntry = listEntry->Flink) {
+         listEntry != &g_AbdState.ProcessList &&
+         walkCount < ABD_MAX_TRACKED_PROCESSES;
+         listEntry = listEntry->Flink, walkCount++) {
 
         PABD_PROCESS_ENTRY current = CONTAINING_RECORD(
             listEntry, ABD_PROCESS_ENTRY, ListEntry
         );
 
         if (current->ProcessId == ProcessId) {
+            InterlockedIncrement(&current->ReferenceCount);
             entry = current;
             break;
         }
@@ -1068,56 +1155,148 @@ AbdpTrackProcess(
     _In_ SIZE_T AmsiSize
     )
 {
-    PABD_PROCESS_ENTRY entry;
+    PABD_PROCESS_ENTRY entry = NULL;
+    PABD_PROCESS_ENTRY newEntry = NULL;
+    PLIST_ENTRY listEntry;
+    ULONG walkCount = 0;
+
+    PAGED_CODE();
 
     //
-    // Check if already tracked
+    // Pre-allocate entry before taking lock to minimize lock hold time
     //
-    entry = AbdpFindProcess(ProcessId);
-    if (entry != NULL) {
-        //
-        // Update base address (amsi.dll may be reloaded)
-        //
-        entry->AmsiBase = AmsiBase;
-        entry->AmsiSize = AmsiSize;
-        entry->IsPatched = FALSE;
-        entry->LastDetectedBypass = AbdBypass_None;
-        return entry;
+    if (ReadAcquire(&g_AbdState.ProcessCount) < ABD_MAX_TRACKED_PROCESSES) {
+        newEntry = (PABD_PROCESS_ENTRY)ExAllocateFromNPagedLookasideList(
+            &g_AbdState.ProcessLookaside
+        );
     }
-
-    //
-    // Check capacity
-    //
-    if (InterlockedCompareExchange(&g_AbdState.ProcessCount, 0, 0)
-        >= ABD_MAX_TRACKED_PROCESSES) {
-        return NULL;
-    }
-
-    entry = (PABD_PROCESS_ENTRY)ExAllocateFromNPagedLookasideList(
-        &g_AbdState.ProcessLookaside
-    );
-
-    if (entry == NULL) {
-        return NULL;
-    }
-
-    RtlZeroMemory(entry, sizeof(ABD_PROCESS_ENTRY));
-    entry->ProcessId = ProcessId;
-    entry->AmsiBase = AmsiBase;
-    entry->AmsiSize = AmsiSize;
-    entry->ReferenceCount = 1;
-    KeQuerySystemTimePrecise(&entry->LoadTime);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_AbdState.ProcessLock);
-    InsertTailList(&g_AbdState.ProcessList, &entry->ListEntry);
-    InterlockedIncrement(&g_AbdState.ProcessCount);
+
+    //
+    // Search for existing entry under exclusive lock
+    //
+    for (listEntry = g_AbdState.ProcessList.Flink;
+         listEntry != &g_AbdState.ProcessList &&
+         walkCount < ABD_MAX_TRACKED_PROCESSES;
+         listEntry = listEntry->Flink, walkCount++) {
+
+        PABD_PROCESS_ENTRY current = CONTAINING_RECORD(
+            listEntry, ABD_PROCESS_ENTRY, ListEntry
+        );
+
+        if (current->ProcessId == ProcessId) {
+            current->AmsiBase = AmsiBase;
+            current->AmsiSize = AmsiSize;
+            current->IsPatched = FALSE;
+            current->LastDetectedBypass = AbdBypass_None;
+            entry = current;
+            break;
+        }
+    }
+
+    //
+    // Insert new entry if not found and capacity allows
+    //
+    if (entry == NULL && newEntry != NULL &&
+        g_AbdState.ProcessCount < ABD_MAX_TRACKED_PROCESSES) {
+
+        RtlZeroMemory(newEntry, sizeof(ABD_PROCESS_ENTRY));
+        newEntry->ProcessId = ProcessId;
+        newEntry->AmsiBase = AmsiBase;
+        newEntry->AmsiSize = AmsiSize;
+        newEntry->ReferenceCount = 1;
+        KeQuerySystemTimePrecise(&newEntry->LoadTime);
+
+        InsertTailList(&g_AbdState.ProcessList, &newEntry->ListEntry);
+        InterlockedIncrement(&g_AbdState.ProcessCount);
+        entry = newEntry;
+        newEntry = NULL;
+    }
+
     ExReleasePushLockExclusive(&g_AbdState.ProcessLock);
     KeLeaveCriticalRegion();
 
-    InterlockedIncrement64(&g_AbdState.Stats.ProcessesMonitored);
+    //
+    // Free unused pre-allocation
+    //
+    if (newEntry != NULL) {
+        ExFreeToNPagedLookasideList(&g_AbdState.ProcessLookaside, newEntry);
+    }
+
+    if (entry != NULL) {
+        InterlockedIncrement64(&g_AbdState.Stats.ProcessesMonitored);
+    }
 
     return entry;
+}
+
+/**
+ * @brief Remove process tracking entry on process exit.
+ *        Safe for concurrent scans via reference counting.
+ */
+static VOID
+AbdpRemoveProcess(
+    _In_ HANDLE ProcessId
+    )
+{
+    PLIST_ENTRY listEntry;
+    PABD_PROCESS_ENTRY entry = NULL;
+    ULONG walkCount = 0;
+
+    PAGED_CODE();
+
+    if (!AbdIsActive()) {
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&g_AbdState.RundownRef)) {
+        return;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_AbdState.ProcessLock);
+
+    for (listEntry = g_AbdState.ProcessList.Flink;
+         listEntry != &g_AbdState.ProcessList &&
+         walkCount < ABD_MAX_TRACKED_PROCESSES;
+         listEntry = listEntry->Flink, walkCount++) {
+
+        PABD_PROCESS_ENTRY current = CONTAINING_RECORD(
+            listEntry, ABD_PROCESS_ENTRY, ListEntry
+        );
+
+        if (current->ProcessId == ProcessId) {
+            RemoveEntryList(&current->ListEntry);
+            InterlockedDecrement(&g_AbdState.ProcessCount);
+            entry = current;
+            break;
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_AbdState.ProcessLock);
+    KeLeaveCriticalRegion();
+
+    if (entry != NULL) {
+        AbdpReleaseProcess(entry);
+    }
+
+    ExReleaseRundownProtection(&g_AbdState.RundownRef);
+}
+
+/**
+ * @brief Release a reference to a process entry.
+ *        If reference count drops to 0, the entry is freed to lookaside.
+ */
+static VOID
+AbdpReleaseProcess(
+    _In_ PABD_PROCESS_ENTRY Entry
+    )
+{
+    if (InterlockedDecrement(&Entry->ReferenceCount) == 0) {
+        ExFreeToNPagedLookasideList(&g_AbdState.ProcessLookaside, Entry);
+    }
 }
 
 // ============================================================================
@@ -1131,6 +1310,8 @@ AbdpCheckPrologueForPatch(
     _Out_ PABD_BYPASS_TYPE BypassType
     )
 {
+    PAGED_CODE();
+
     *BypassType = AbdBypass_None;
 
     for (ULONG i = 0; i < ARRAYSIZE(g_PatchSignatures); i++) {
@@ -1171,6 +1352,8 @@ AbdpReadProcessMemory(
     NTSTATUS status;
     PEPROCESS process = NULL;
     KAPC_STATE apcState;
+
+    PAGED_CODE();
 
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
