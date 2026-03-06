@@ -67,7 +67,7 @@ Security Hardening (v2.1.0):
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, ClpInitialize)
+#pragma alloc_text(PAGE, ClpInitialize)
 #pragma alloc_text(PAGE, ClpShutdown)
 #pragma alloc_text(PAGE, ClpParse)
 #pragma alloc_text(PAGE, ClpAnalyze)
@@ -87,10 +87,9 @@ Security Hardening (v2.1.0):
 #define CLP_MIN_BASE64_LENGTH       8
 
 //
-// Command line length thresholds for anomaly detection
-// Rationale: Normal commands rarely exceed 2KB; malware often uses very long
-// encoded/obfuscated commands to evade simple pattern matching
+// Maximum LOLBin list iterations for corruption resilience
 //
+#define CLP_MAX_LOLBIN_WALK     128
 #define CLP_LONG_CMDLINE_THRESHOLD  2048
 #define CLP_VERY_LONG_THRESHOLD     8192
 
@@ -237,7 +236,7 @@ ClppCleanupLOLBinDatabase(
 
 static ULONG
 ClppHashStringBounded(
-    _In_reads_(Length) PCWCH Buffer,
+    _In_reads_bytes_(Length) PCWCH Buffer,
     _In_ USHORT Length,
     _In_ BOOLEAN CaseInsensitive
     );
@@ -490,10 +489,10 @@ IRQL:
     //
     // Read statistics atomically for logging
     //
-    CommandsParsed = InterlockedCompareExchange64(
-        &Parser->Stats.CommandsParsed, 0, 0);
-    SuspiciousFound = InterlockedCompareExchange64(
-        &Parser->Stats.SuspiciousFound, 0, 0);
+    CommandsParsed = ReadNoFence64(
+        &Parser->Stats.CommandsParsed);
+    SuspiciousFound = ReadNoFence64(
+        &Parser->Stats.SuspiciousFound);
 
     //
     // Cleanup databases
@@ -974,6 +973,7 @@ IRQL:
     ULONG Hash;
     USHORT LastSlashPos;
     USHORT ExeLenChars;
+    ULONG WalkCount = 0;
 
     PAGED_CODE();
 
@@ -1033,8 +1033,8 @@ IRQL:
     ExAcquirePushLockShared(&Parser->LOLBinLock);
 
     for (Entry = Parser->LOLBinList.Flink;
-         Entry != &Parser->LOLBinList;
-         Entry = Entry->Flink) {
+         Entry != &Parser->LOLBinList && WalkCount < CLP_MAX_LOLBIN_WALK;
+         Entry = Entry->Flink, WalkCount++) {
 
         LOLBin = CONTAINING_RECORD(Entry, CLP_LOLBIN_ENTRY, ListEntry);
 
@@ -1234,7 +1234,7 @@ Routine Description:
 
 static ULONG
 ClppHashStringBounded(
-    _In_reads_(Length) PCWCH Buffer,
+    _In_reads_bytes_(Length) PCWCH Buffer,
     _In_ USHORT Length,
     _In_ BOOLEAN CaseInsensitive
     )
@@ -1243,7 +1243,7 @@ Routine Description:
     Computes FNV-1a hash of a bounded wide string.
 
 Arguments:
-    Buffer          - String buffer.
+    Buffer          - String buffer (Length bytes).
     Length          - Length in BYTES (not characters).
     CaseInsensitive - If TRUE, converts to lowercase before hashing.
 --*/
@@ -1667,6 +1667,28 @@ ClppDetectEncodedCommand(
     )
 {
     ULONG i;
+    BOOLEAN IsPowerShell = FALSE;
+
+    //
+    // First determine if the executable is PowerShell (or pwsh)
+    // Short flags like -e are only meaningful in PowerShell context
+    //
+    if (Parsed->Executable.Buffer != NULL && Parsed->Executable.Length > 0) {
+        if (CLPP_CONTAINS_PATTERN(&Parsed->Executable, L"powershell") ||
+            CLPP_CONTAINS_PATTERN(&Parsed->Executable, L"pwsh")) {
+            IsPowerShell = TRUE;
+        }
+    }
+
+    //
+    // Fallback: check command line for PowerShell invocation
+    //
+    if (!IsPowerShell) {
+        if (CLPP_CONTAINS_PATTERN(&Parsed->FullCommandLine, L"powershell") ||
+            CLPP_CONTAINS_PATTERN(&Parsed->FullCommandLine, L"pwsh")) {
+            IsPowerShell = TRUE;
+        }
+    }
 
     for (i = 0; i < Parsed->ArgumentCount; i++) {
         if (Parsed->Arguments[i].IsFlag &&
@@ -1677,14 +1699,11 @@ ClppDetectEncodedCommand(
             USHORT FlagLenChars = Flag->Length / sizeof(WCHAR);
 
             //
-            // PowerShell encoded command flags - bounded comparison
+            // Long-form flags (4+ chars) are specific enough to match without
+            // PowerShell context verification. Short flags (-e, -ec) require it.
             //
             if ((FlagLenChars == 4 && ClppCompareStringBoundedCaseInsensitive(
                     Flag->Buffer, FlagLenChars, L"-enc", 4)) ||
-                (FlagLenChars == 2 && ClppCompareStringBoundedCaseInsensitive(
-                    Flag->Buffer, FlagLenChars, L"-e", 2)) ||
-                (FlagLenChars == 3 && ClppCompareStringBoundedCaseInsensitive(
-                    Flag->Buffer, FlagLenChars, L"-ec", 3)) ||
                 (FlagLenChars == 15 && ClppCompareStringBoundedCaseInsensitive(
                     Flag->Buffer, FlagLenChars, L"-encodedcommand", 15)) ||
                 (FlagLenChars == 5 && ClppCompareStringBoundedCaseInsensitive(
@@ -1697,20 +1716,28 @@ ClppDetectEncodedCommand(
                     Flag->Buffer, FlagLenChars, L"-encoded", 8))) {
                 return TRUE;
             }
+
+            //
+            // Short flags (-e, -ec) only match if PowerShell is the executable.
+            // Without this guard, -e matches flags from other programs (e.g.,
+            // grep -e, find -e, etc.) causing false positives.
+            //
+            if (IsPowerShell) {
+                if ((FlagLenChars == 2 && ClppCompareStringBoundedCaseInsensitive(
+                        Flag->Buffer, FlagLenChars, L"-e", 2)) ||
+                    (FlagLenChars == 3 && ClppCompareStringBoundedCaseInsensitive(
+                        Flag->Buffer, FlagLenChars, L"-ec", 3))) {
+                    return TRUE;
+                }
+            }
         }
     }
 
     //
     // Also check full command line for obfuscated variants
     //
-    if (CLPP_CONTAINS_PATTERN(&Parsed->FullCommandLine, L"-enc")) {
-        //
-        // Verify it's likely a PowerShell command
-        //
-        if (CLPP_CONTAINS_PATTERN(&Parsed->FullCommandLine, L"powershell") ||
-            CLPP_CONTAINS_PATTERN(&Parsed->FullCommandLine, L"pwsh")) {
-            return TRUE;
-        }
+    if (IsPowerShell && CLPP_CONTAINS_PATTERN(&Parsed->FullCommandLine, L"-enc")) {
+        return TRUE;
     }
 
     return FALSE;
@@ -1778,19 +1805,35 @@ ClppDetectObfuscation(
 
     //
     // Check for character concatenation patterns
+    // These are strong obfuscation indicators regardless of context
     //
     if (CLPP_CONTAINS_PATTERN(CommandLine, L"+[char]") ||
-        CLPP_CONTAINS_PATTERN(CommandLine, L"-join") ||
         CLPP_CONTAINS_PATTERN(CommandLine, L"[char]") ||
-        CLPP_CONTAINS_PATTERN(CommandLine, L"-f '") ||
-        CLPP_CONTAINS_PATTERN(CommandLine, L"-replace")) {
+        CLPP_CONTAINS_PATTERN(CommandLine, L"-f '")) {
         return TRUE;
     }
 
     //
-    // Check for invoke-expression variants
+    // -join and -replace are common PowerShell cmdlets but when combined
+    // with other obfuscation indicators they signal evasion
     //
-    if (CLPP_CONTAINS_PATTERN(CommandLine, L"iex") ||
+    if ((CLPP_CONTAINS_PATTERN(CommandLine, L"-join") ||
+         CLPP_CONTAINS_PATTERN(CommandLine, L"-replace")) &&
+        (CaretCount > 0 || TickCount > 0 || PercentCount > 3)) {
+        return TRUE;
+    }
+
+    //
+    // Check for invoke-expression variants.
+    // "iex" alone is too broad (matches strings like "videoIndex"),
+    // so require PowerShell context or explicit delimiters:
+    //   - "iex " (with space after = standalone command)
+    //   - "iex(" (function call form)
+    //   - "|iex" (pipe to IEX, a classic attack pattern)
+    //
+    if (CLPP_CONTAINS_PATTERN(CommandLine, L"iex ") ||
+        CLPP_CONTAINS_PATTERN(CommandLine, L"iex(") ||
+        CLPP_CONTAINS_PATTERN(CommandLine, L"|iex") ||
         CLPP_CONTAINS_PATTERN(CommandLine, L"invoke-expression") ||
         CLPP_CONTAINS_PATTERN(CommandLine, L"i`e`x") ||
         CLPP_CONTAINS_PATTERN(CommandLine, L"&(") ||
@@ -2128,17 +2171,11 @@ ClppDetectScriptExecution(
     )
 {
     ULONG i;
-    USHORT ExeLenChars;
 
     //
     // Check executable for script interpreters using bounded comparisons
     //
     if (Parsed->Executable.Buffer != NULL && Parsed->Executable.Length > 0) {
-        ExeLenChars = Parsed->Executable.Length / sizeof(WCHAR);
-
-        //
-        // Use bounded pattern search instead of wcsstr
-        //
         BOOLEAN IsScriptInterpreter = FALSE;
 
         if (CLPP_CONTAINS_PATTERN(&Parsed->Executable, L"wscript") ||
@@ -2396,7 +2433,7 @@ SECURITY:
     //
     // Integer overflow check before multiplication
     //
-    if (ValidChars > (SIZE_T_MAX / 3)) {
+    if (ValidChars > (MAXULONG_PTR / 3)) {
         return STATUS_INTEGER_OVERFLOW;
     }
 
