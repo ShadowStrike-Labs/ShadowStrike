@@ -53,6 +53,7 @@ Thread Safety:
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 
 //

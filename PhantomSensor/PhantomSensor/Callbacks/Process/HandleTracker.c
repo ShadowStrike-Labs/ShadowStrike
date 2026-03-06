@@ -63,6 +63,101 @@ SECURITY NOTES:
 #include "HandleTracker.h"
 #include <ntstrsafe.h>
 
+// ============================================================================
+// FORWARD DECLARATIONS — Kernel APIs exported but not declared in WDK headers
+// ============================================================================
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwDuplicateObject(
+    _In_ HANDLE SourceProcessHandle,
+    _In_ HANDLE SourceHandle,
+    _In_opt_ HANDLE TargetProcessHandle,
+    _Out_opt_ PHANDLE TargetHandle,
+    _In_ ACCESS_MASK DesiredAccess,
+    _In_ ULONG HandleAttributes,
+    _In_ ULONG Options
+    );
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQueryInformationProcess(
+    _In_ HANDLE ProcessHandle,
+    _In_ PROCESSINFOCLASS ProcessInformationClass,
+    _Out_writes_bytes_(ProcessInformationLength) PVOID ProcessInformation,
+    _In_ ULONG ProcessInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQueryInformationThread(
+    _In_ HANDLE ThreadHandle,
+    _In_ THREADINFOCLASS ThreadInformationClass,
+    _Out_writes_bytes_(ThreadInformationLength) PVOID ThreadInformation,
+    _In_ ULONG ThreadInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+//
+// THREAD_BASIC_INFORMATION — not declared in WDK headers
+//
+typedef struct _THREAD_BASIC_INFORMATION {
+    NTSTATUS ExitStatus;
+    PVOID TebBaseAddress;
+    CLIENT_ID ClientId;
+    KAFFINITY AffinityMask;
+    KPRIORITY Priority;
+    KPRIORITY BasePriority;
+} THREAD_BASIC_INFORMATION, *PTHREAD_BASIC_INFORMATION;
+
+//
+// Process/thread/token access mask constants — defined in user-mode winnt.h
+// but not available in kernel-mode WDK headers.
+//
+#ifndef PROCESS_VM_READ
+#define PROCESS_VM_READ             0x0010
+#endif
+#ifndef PROCESS_VM_WRITE
+#define PROCESS_VM_WRITE            0x0020
+#endif
+#ifndef PROCESS_VM_OPERATION
+#define PROCESS_VM_OPERATION        0x0008
+#endif
+#ifndef PROCESS_CREATE_THREAD
+#define PROCESS_CREATE_THREAD       0x0002
+#endif
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION   0x0400
+#endif
+#ifndef PROCESS_DUP_HANDLE
+#define PROCESS_DUP_HANDLE          0x0040
+#endif
+#ifndef TOKEN_DUPLICATE
+#define TOKEN_DUPLICATE             0x0002
+#endif
+#ifndef TOKEN_IMPERSONATE
+#define TOKEN_IMPERSONATE           0x0004
+#endif
+#ifndef TOKEN_QUERY
+#define TOKEN_QUERY                 0x0008
+#endif
+#ifndef TOKEN_ASSIGN_PRIMARY
+#define TOKEN_ASSIGN_PRIMARY        0x0001
+#endif
+#ifndef THREAD_SET_CONTEXT
+#define THREAD_SET_CONTEXT          0x0010
+#endif
+#ifndef THREAD_SUSPEND_RESUME
+#define THREAD_SUSPEND_RESUME       0x0002
+#endif
+#ifndef THREAD_GET_CONTEXT
+#define THREAD_GET_CONTEXT          0x0008
+#endif
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, HtInitialize)
 #pragma alloc_text(PAGE, HtShutdown)
@@ -129,16 +224,7 @@ ZwQuerySystemInformation(
     _Out_opt_ PULONG ReturnLength
     );
 
-NTSYSAPI
-NTSTATUS
-NTAPI
-ZwQueryObject(
-    _In_opt_ HANDLE Handle,
-    _In_ ULONG ObjectInformationClass,
-    _Out_writes_bytes_opt_(ObjectInformationLength) PVOID ObjectInformation,
-    _In_ ULONG ObjectInformationLength,
-    _Out_opt_ PULONG ReturnLength
-    );
+// ZwQueryObject is declared by ntifs.h
 
 #define ObjectTypeInformation 2
 
@@ -697,6 +783,9 @@ HtInitialize(
     if (Tracker->Config.CleanupIntervalMs < 1000) {
         Tracker->Config.CleanupIntervalMs = HT_DEFAULT_CLEANUP_INTERVAL_MS;
     }
+    if (Tracker->Config.CacheTimeoutMs < 1000) {
+        Tracker->Config.CacheTimeoutMs = HT_DEFAULT_CACHE_TIMEOUT_MS;
+    }
 
     //
     // Initialize sensitive process list
@@ -877,7 +966,7 @@ HtShutdown(
     }
 
     //
-    // Free all process handles from hash table
+    // Free all process handles from hash table and unlink from global list
     //
     for (i = 0; i < Tracker->HashBucketCount; i++) {
         KeEnterCriticalRegion();
@@ -891,6 +980,19 @@ HtShutdown(
 
             ExReleasePushLockExclusive(&Tracker->HashBuckets[i].Lock);
             KeLeaveCriticalRegion();
+
+            //
+            // Unlink from global process list to prevent dangling pointers
+            //
+            if (!IsListEmpty(&Handles->GlobalEntry)) {
+                KeEnterCriticalRegion();
+                ExAcquirePushLockExclusive(&Tracker->ProcessListLock);
+                RemoveEntryList(&Handles->GlobalEntry);
+                InitializeListHead(&Handles->GlobalEntry);
+                InterlockedDecrement(&Tracker->ProcessCount);
+                ExReleasePushLockExclusive(&Tracker->ProcessListLock);
+                KeLeaveCriticalRegion();
+            }
 
             //
             // Free all handle entries
@@ -1721,20 +1823,23 @@ HtpInsertProcessHandles(
         InterlockedIncrement(&Tracker->HashBuckets[Hash].Count);
         Handles->InHashTable = TRUE;
         HtpReferenceProcessHandles(Handles);
+
+        ExReleasePushLockExclusive(&Tracker->HashBuckets[Hash].Lock);
+        KeLeaveCriticalRegion();
+
+        //
+        // Also add to global list (only when freshly inserted into hash table)
+        //
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&Tracker->ProcessListLock);
+        InsertTailList(&Tracker->ProcessList, &Handles->GlobalEntry);
+        InterlockedIncrement(&Tracker->ProcessCount);
+        ExReleasePushLockExclusive(&Tracker->ProcessListLock);
+        KeLeaveCriticalRegion();
+    } else {
+        ExReleasePushLockExclusive(&Tracker->HashBuckets[Hash].Lock);
+        KeLeaveCriticalRegion();
     }
-
-    ExReleasePushLockExclusive(&Tracker->HashBuckets[Hash].Lock);
-    KeLeaveCriticalRegion();
-
-    //
-    // Also add to global list
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Tracker->ProcessListLock);
-    InsertTailList(&Tracker->ProcessList, &Handles->GlobalEntry);
-    InterlockedIncrement(&Tracker->ProcessCount);
-    ExReleasePushLockExclusive(&Tracker->ProcessListLock);
-    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -2589,7 +2694,8 @@ HtpCleanupStaleDuplications(
         Next = Entry->Flink;
         Record = CONTAINING_RECORD(Entry, HT_DUPLICATION_RECORD, ListEntry);
 
-        if ((CurrentTime.QuadPart - Record->Timestamp.QuadPart) > TimeoutInterval.QuadPart) {
+        if (CurrentTime.QuadPart > Record->Timestamp.QuadPart &&
+            (CurrentTime.QuadPart - Record->Timestamp.QuadPart) > TimeoutInterval.QuadPart) {
             RemoveEntryList(&Record->ListEntry);
             InterlockedDecrement(&Tracker->DuplicationCount);
             InsertTailList(&StaleList, &Record->ListEntry);
