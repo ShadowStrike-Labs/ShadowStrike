@@ -131,6 +131,21 @@ CbMonCheckFileWrite(
     _In_ PCUNICODE_STRING FileName
     );
 
+/**
+ * @brief Remove process tracking entry on process exit.
+ *
+ * Must be called from the process termination notification path to prevent
+ * resource leaks and tracking table exhaustion. Without this, the module
+ * becomes permanently deaf after CBMON_MAX_TRACKED_PROCESSES exits.
+ *
+ * @param ProcessId     Exiting process ID.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+CbMonRemoveProcess(
+    _In_ HANDLE ProcessId
+    );
+
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 CbMonGetStatistics(

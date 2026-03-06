@@ -35,6 +35,13 @@
 #include "../../Utilities/MemoryUtils.h"
 #include <ntstrsafe.h>
 
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, CbMonInitialize)
+#pragma alloc_text(PAGE, CbMonShutdown)
+#pragma alloc_text(PAGE, CbMonCheckProcessCreate)
+#pragma alloc_text(PAGE, CbMonRemoveProcess)
+#endif
+
 // ============================================================================
 // Private Constants
 // ============================================================================
@@ -51,6 +58,7 @@
 #define CBMON_MAX_TRACKED_PROCESSES 2048
 #define CBMON_TEMP_WRITE_THRESHOLD  10      // Rapid writes in window
 #define CBMON_TEMP_WRITE_WINDOW_MS  5000    // 5-second window
+#define CBMON_MAX_BUCKET_WALK       64      // Corruption resilience bound
 
 // ============================================================================
 // Private Structures
@@ -97,7 +105,7 @@ static const WCHAR* g_ClipboardCmdPatterns[] = {
     L"GetClipboardData",
     L"OpenClipboard",
     L"OleGetClipboard",
-    L"Add-Type.*Clipboard",
+    L"Add-Type",
 };
 
 #define CBMON_CMD_PATTERN_COUNT  (sizeof(g_ClipboardCmdPatterns) / sizeof(g_ClipboardCmdPatterns[0]))
@@ -138,7 +146,8 @@ static BOOLEAN CbMonpIsTempPath(
     );
 
 static PCWSTR CbMonpExtractFileName(
-    _In_ PCUNICODE_STRING FullPath
+    _In_ PCUNICODE_STRING FullPath,
+    _Out_ PUSHORT FileNameLenChars
     );
 
 // ============================================================================
@@ -150,6 +159,8 @@ NTSTATUS
 CbMonInitialize(VOID)
 {
     LONG prev;
+
+    PAGED_CODE();
 
     prev = InterlockedCompareExchange(&g_CbState.InitState,
                                        CBMON_INIT_INITIALIZING,
@@ -193,6 +204,8 @@ CbMonShutdown(VOID)
 {
     LONG prev;
 
+    PAGED_CODE();
+
     prev = InterlockedCompareExchange(&g_CbState.InitState,
                                        CBMON_INIT_SHUTDOWN,
                                        CBMON_INIT_READY);
@@ -220,8 +233,8 @@ CbMonShutdown(VOID)
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
         "[ShadowStrike/ClipboardMonitor] Shutdown complete "
         "(checked=%lld, suspicious=%lld)\n",
-        g_CbState.Stats.TotalProcessesChecked,
-        g_CbState.Stats.SuspiciousDetections);
+        ReadNoFence64(&g_CbState.Stats.TotalProcessesChecked),
+        ReadNoFence64(&g_CbState.Stats.SuspiciousDetections));
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -234,6 +247,8 @@ CbMonCheckProcessCreate(
     ULONG indicators = CbIndicator_None;
     PCUNICODE_STRING cmdLine;
     PCUNICODE_STRING imageName;
+
+    PAGED_CODE();
 
     if (g_CbState.InitState != CBMON_INIT_READY) {
         return CbIndicator_None;
@@ -268,24 +283,35 @@ CbMonCheckProcessCreate(
                 break;
             }
         }
+
+        //
+        // Additional check: "Add-Type" combined with "Clipboard" in same cmdline
+        // (previously was a broken "Add-Type.*Clipboard" regex literal)
+        //
+        if (CbMonpContainsPatternCI(cmdLine, L"Add-Type") &&
+            CbMonpContainsPatternCI(cmdLine, L"Clipboard")) {
+            indicators |= CbIndicator_ClipboardCommandLine;
+        }
     }
 
     //
     // Check image name against known clipboard stealers
     //
     if (imageName != NULL && imageName->Length > 0) {
-        PCWSTR fileName = CbMonpExtractFileName(imageName);
-        if (fileName != NULL) {
+        USHORT fileNameLenChars = 0;
+        PCWSTR fileName = CbMonpExtractFileName(imageName, &fileNameLenChars);
+
+        if (fileName != NULL && fileNameLenChars > 0) {
+            //
+            // Build a bounded UNICODE_STRING without RtlInitUnicodeString
+            // to avoid scanning past the buffer boundary (CB-1 fix)
+            //
+            UNICODE_STRING fileNameStr;
+            fileNameStr.Buffer = (PWCH)fileName;
+            fileNameStr.Length = fileNameLenChars * sizeof(WCHAR);
+            fileNameStr.MaximumLength = fileNameStr.Length;
+
             for (ULONG i = 0; i < CBMON_STEALER_NAME_COUNT; i++) {
-                UNICODE_STRING pattern;
-                RtlInitUnicodeString(&pattern, g_ClipboardStealerNames[i]);
-
-                //
-                // Case-insensitive substring check in filename
-                //
-                UNICODE_STRING fileNameStr;
-                RtlInitUnicodeString(&fileNameStr, fileName);
-
                 if (CbMonpContainsPatternCI(&fileNameStr, g_ClipboardStealerNames[i])) {
                     indicators |= CbIndicator_KnownStealerImage;
                     break;
@@ -300,7 +326,7 @@ CbMonCheckProcessCreate(
     if (indicators != CbIndicator_None) {
         PCBMON_PROCESS_ENTRY entry = CbMonpLookupProcess(ProcessId, TRUE);
         if (entry != NULL) {
-            entry->Indicators |= indicators;
+            InterlockedOr((volatile LONG*)&entry->Indicators, (LONG)indicators);
         }
 
         InterlockedIncrement64(&g_CbState.Stats.SuspiciousDetections);
@@ -369,8 +395,9 @@ CbMonCheckFileWrite(
             LONG count = InterlockedIncrement(&entry->TempFileWrites);
 
             if (count >= CBMON_TEMP_WRITE_THRESHOLD && !entry->Flagged) {
-                entry->Indicators |= CbIndicator_RapidTempFileWrites;
-                entry->Flagged = TRUE;
+                InterlockedOr((volatile LONG*)&entry->Indicators,
+                              (LONG)CbIndicator_RapidTempFileWrites);
+                InterlockedExchange((volatile LONG*)&entry->Flagged, TRUE);
                 suspicious = TRUE;
 
                 InterlockedIncrement64(&g_CbState.Stats.FileWriteMatches);
@@ -434,11 +461,14 @@ CbMonpLookupProcess(
     PLIST_ENTRY listHead = &g_CbState.ProcessBuckets[bucket];
     PLIST_ENTRY entry;
     PCBMON_PROCESS_ENTRY procEntry = NULL;
+    ULONG walkCount = 0;
 
     KeEnterCriticalRegion();
     FltAcquirePushLockShared(&g_CbState.BucketLocks[bucket]);
 
-    for (entry = listHead->Flink; entry != listHead; entry = entry->Flink) {
+    for (entry = listHead->Flink;
+         entry != listHead && walkCount < CBMON_MAX_BUCKET_WALK;
+         entry = entry->Flink, walkCount++) {
         PCBMON_PROCESS_ENTRY candidate = CONTAINING_RECORD(
             entry, CBMON_PROCESS_ENTRY, Link);
         if (candidate->ProcessId == ProcessId) {
@@ -476,7 +506,10 @@ CbMonpLookupProcess(
         //
         {
             PLIST_ENTRY check;
-            for (check = listHead->Flink; check != listHead; check = check->Flink) {
+            ULONG reCheckWalk = 0;
+            for (check = listHead->Flink;
+                 check != listHead && reCheckWalk < CBMON_MAX_BUCKET_WALK;
+                 check = check->Flink, reCheckWalk++) {
                 PCBMON_PROCESS_ENTRY existing = CONTAINING_RECORD(
                     check, CBMON_PROCESS_ENTRY, Link);
                 if (existing->ProcessId == ProcessId) {
@@ -578,20 +611,109 @@ CbMonpIsTempPath(
 
 static PCWSTR
 CbMonpExtractFileName(
-    _In_ PCUNICODE_STRING FullPath
+    _In_ PCUNICODE_STRING FullPath,
+    _Out_ PUSHORT FileNameLenChars
     )
+/*++
+Routine Description:
+    Extracts the filename portion from a full path, returning both the
+    pointer and the bounded length in characters. Does NOT rely on null
+    termination — uses the UNICODE_STRING.Length for boundary.
+--*/
 {
+    USHORT chars;
+    USHORT startIdx;
+
+    *FileNameLenChars = 0;
+
     if (FullPath == NULL || FullPath->Buffer == NULL || FullPath->Length == 0) {
         return NULL;
     }
 
-    USHORT chars = FullPath->Length / sizeof(WCHAR);
+    chars = FullPath->Length / sizeof(WCHAR);
 
     for (USHORT i = chars; i > 0; i--) {
         if (FullPath->Buffer[i - 1] == L'\\') {
-            return &FullPath->Buffer[i];
+            startIdx = i;
+            if (startIdx < chars) {
+                *FileNameLenChars = chars - startIdx;
+                return &FullPath->Buffer[startIdx];
+            }
+            return NULL;
         }
     }
 
+    *FileNameLenChars = chars;
     return FullPath->Buffer;
+}
+
+
+// ============================================================================
+// Process Exit Cleanup (CB-3 fix)
+// ============================================================================
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+CbMonRemoveProcess(
+    _In_ HANDLE ProcessId
+    )
+/*++
+Routine Description:
+    Removes a process tracking entry from the hash table when the process exits.
+    Must be called from the process termination notification path to prevent
+    resource leaks. Without cleanup, the tracking table fills to
+    CBMON_MAX_TRACKED_PROCESSES and the module becomes permanently deaf.
+
+Arguments:
+    ProcessId - PID of the exiting process.
+
+IRQL:
+    Must be called at PASSIVE_LEVEL.
+--*/
+{
+    ULONG bucket;
+    PLIST_ENTRY listHead;
+    PLIST_ENTRY entry;
+    PCBMON_PROCESS_ENTRY procEntry = NULL;
+    ULONG walkCount = 0;
+
+    PAGED_CODE();
+
+    if (g_CbState.InitState != CBMON_INIT_READY) {
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&g_CbState.RundownRef)) {
+        return;
+    }
+
+    bucket = CbMonpHashPid(ProcessId);
+    listHead = &g_CbState.ProcessBuckets[bucket];
+
+    KeEnterCriticalRegion();
+    FltAcquirePushLockExclusive(&g_CbState.BucketLocks[bucket]);
+
+    for (entry = listHead->Flink;
+         entry != listHead && walkCount < CBMON_MAX_BUCKET_WALK;
+         entry = entry->Flink, walkCount++) {
+
+        PCBMON_PROCESS_ENTRY candidate = CONTAINING_RECORD(
+            entry, CBMON_PROCESS_ENTRY, Link);
+
+        if (candidate->ProcessId == ProcessId) {
+            RemoveEntryList(&candidate->Link);
+            procEntry = candidate;
+            InterlockedDecrement(&g_CbState.TrackedCount);
+            break;
+        }
+    }
+
+    FltReleasePushLock(&g_CbState.BucketLocks[bucket]);
+    KeLeaveCriticalRegion();
+
+    if (procEntry != NULL) {
+        ExFreeToNPagedLookasideList(&g_CbState.EntryLookaside, procEntry);
+    }
+
+    ExReleaseRundownProtection(&g_CbState.RundownRef);
 }
