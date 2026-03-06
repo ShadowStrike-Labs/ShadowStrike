@@ -400,14 +400,14 @@ typedef struct _SHADOWSTRIKE_EXCLUSION_MANAGER {
     /// @brief Rundown protection for safe shutdown drain (replaces manual refcount)
     EX_RUNDOWN_REF RundownRef;
 
-    /// @brief Manager initialized flag
-    BOOLEAN Initialized;
+    /// @brief Lifecycle state (CAS-based: 0=uninit, 1=initializing, 2=ready, 3=shutting_down)
+    volatile LONG State;
 
     /// @brief Exclusions enabled flag
     BOOLEAN Enabled;
 
     /// @brief Reserved for alignment
-    UINT8 Reserved[6];
+    UINT8 Reserved[3];
 
 } SHADOWSTRIKE_EXCLUSION_MANAGER, *PSHADOWSTRIKE_EXCLUSION_MANAGER;
 

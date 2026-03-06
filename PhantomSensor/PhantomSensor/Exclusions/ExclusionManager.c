@@ -72,6 +72,23 @@
 SHADOWSTRIKE_EXCLUSION_MANAGER g_ExclusionManager = {0};
 
 // ============================================================================
+// LIFECYCLE STATE CONSTANTS
+// ============================================================================
+
+#define EM_STATE_UNINITIALIZED   0
+#define EM_STATE_INITIALIZING    1
+#define EM_STATE_READY           2
+#define EM_STATE_SHUTTING_DOWN   3
+
+static FORCEINLINE BOOLEAN
+ExclusionpIsReady(
+    VOID
+    )
+{
+    return (ReadAcquire(&g_ExclusionManager.State) == EM_STATE_READY);
+}
+
+// ============================================================================
 // INTERNAL HELPERS — RUNDOWN PROTECTION
 // ============================================================================
 
@@ -245,14 +262,35 @@ ShadowStrikeExclusionInitialize(
     )
 {
     ULONG i;
+    LONG previousState;
 
     PAGED_CODE();
 
-    if (g_ExclusionManager.Initialized) {
-        return STATUS_SUCCESS;
+    //
+    // EM-1 fix: Atomic state transition UNINITIALIZED -> INITIALIZING
+    // prevents double-init race that would destroy already-initialized state.
+    //
+    previousState = InterlockedCompareExchange(
+        &g_ExclusionManager.State,
+        EM_STATE_INITIALIZING,
+        EM_STATE_UNINITIALIZED
+        );
+
+    if (previousState == EM_STATE_READY) {
+        return STATUS_ALREADY_INITIALIZED;
     }
 
-    RtlZeroMemory(&g_ExclusionManager, sizeof(SHADOWSTRIKE_EXCLUSION_MANAGER));
+    if (previousState != EM_STATE_UNINITIALIZED) {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    //
+    // We own initialization exclusively. Zero everything except State.
+    //
+    RtlZeroMemory(
+        (PUCHAR)&g_ExclusionManager + sizeof(g_ExclusionManager.PathExclusions),
+        sizeof(SHADOWSTRIKE_EXCLUSION_MANAGER) - sizeof(g_ExclusionManager.PathExclusions)
+        );
 
     //
     // Initialize locks
@@ -290,9 +328,10 @@ ShadowStrikeExclusionInitialize(
     InterlockedExchange8((volatile CHAR*)&g_ExclusionManager.Enabled, TRUE);
 
     //
-    // Mark initialized last (after all state is set up) with release semantics
+    // Transition: INITIALIZING -> READY
     //
-    WriteBooleanRelease(&g_ExclusionManager.Initialized, TRUE);
+    MemoryBarrier();
+    InterlockedExchange(&g_ExclusionManager.State, EM_STATE_READY);
 
     //
     // Load defaults
@@ -310,9 +349,20 @@ ShadowStrikeExclusionShutdown(
     VOID
     )
 {
+    LONG previousState;
+
     PAGED_CODE();
 
-    if (!g_ExclusionManager.Initialized) {
+    //
+    // EM-1 fix: Atomic state transition READY -> SHUTTING_DOWN
+    //
+    previousState = InterlockedCompareExchange(
+        &g_ExclusionManager.State,
+        EM_STATE_SHUTTING_DOWN,
+        EM_STATE_READY
+        );
+
+    if (previousState != EM_STATE_READY) {
         return;
     }
 
@@ -338,7 +388,7 @@ ShadowStrikeExclusionShutdown(
     ShadowStrikeClearExclusions(ShadowStrikeExclusionProcessName);
     ShadowStrikeClearExclusions(ShadowStrikeExclusionProcessId);
 
-    WriteBooleanRelease(&g_ExclusionManager.Initialized, FALSE);
+    InterlockedExchange(&g_ExclusionManager.State, EM_STATE_UNINITIALIZED);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Exclusion manager shutdown complete\n");
@@ -358,7 +408,7 @@ ShadowStrikeIsPathExcluded(
     PSHADOWSTRIKE_PATH_EXCLUSION entry;
     BOOLEAN excluded = FALSE;
 
-    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized) ||
+    if (!ExclusionpIsReady() ||
         !ReadBooleanAcquire(&g_ExclusionManager.Enabled)) {
         return FALSE;
     }
@@ -493,7 +543,7 @@ ShadowStrikeIsExtensionExcluded(
     PSHADOWSTRIKE_EXTENSION_EXCLUSION entry;
     BOOLEAN excluded = FALSE;
 
-    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized) ||
+    if (!ExclusionpIsReady() ||
         !ReadBooleanAcquire(&g_ExclusionManager.Enabled)) {
         return FALSE;
     }
@@ -505,6 +555,8 @@ ShadowStrikeIsExtensionExcluded(
     if (!ExclusionpAcquireRundown()) {
         return FALSE;
     }
+
+    InterlockedIncrement64(&g_ExclusionManager.Stats.TotalChecks);
 
     bucketIndex = ShadowStrikeExtensionHash(Extension);
     bucket = &g_ExclusionManager.ExtensionBuckets[bucketIndex];
@@ -564,7 +616,7 @@ ShadowStrikeIsProcessExcluded(
     BOOLEAN excluded = FALSE;
     LARGE_INTEGER currentTime;
 
-    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized) ||
+    if (!ExclusionpIsReady() ||
         !ReadBooleanAcquire(&g_ExclusionManager.Enabled)) {
         return FALSE;
     }
@@ -572,6 +624,8 @@ ShadowStrikeIsProcessExcluded(
     if (!ExclusionpAcquireRundown()) {
         return FALSE;
     }
+
+    InterlockedIncrement64(&g_ExclusionManager.Stats.TotalChecks);
 
     //
     // Check PID exclusions first (O(N) scan over fixed-size array)
@@ -682,8 +736,17 @@ ShadowStrikeAddPathExclusion(
     }
 
     if (!ShadowStrikeValidateUnicodeString(Path) || Path->Length == 0 ||
-        !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+        !ExclusionpIsReady()) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // EM-2 fix: Reject paths exceeding maximum length instead of silently
+    // truncating. A truncated exclusion could match unintended paths.
+    //
+    pathChars = Path->Length / sizeof(WCHAR);
+    if (pathChars >= SHADOWSTRIKE_MAX_EXCLUSION_PATH_LENGTH) {
+        return STATUS_NAME_TOO_LONG;
     }
 
     //
@@ -703,8 +766,6 @@ ShadowStrikeAddPathExclusion(
     // Initialize entry — normalize path to uppercase
     //
     entry->Flags = Flags;
-    pathChars = (USHORT)min(Path->Length / sizeof(WCHAR),
-                            SHADOWSTRIKE_MAX_EXCLUSION_PATH_LENGTH - 1);
 
     {
         USHORT k;
@@ -788,8 +849,16 @@ ShadowStrikeAddExtensionExclusion(
     }
 
     if (!ShadowStrikeValidateUnicodeString(Extension) || Extension->Length == 0 ||
-        !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+        !ExclusionpIsReady()) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // EM-3 fix: Reject extensions exceeding maximum length.
+    //
+    extChars = Extension->Length / sizeof(WCHAR);
+    if (extChars >= SHADOWSTRIKE_MAX_EXTENSION_LENGTH) {
+        return STATUS_NAME_TOO_LONG;
     }
 
     entry = (PSHADOWSTRIKE_EXTENSION_EXCLUSION)ExAllocatePoolZero(
@@ -803,8 +872,6 @@ ShadowStrikeAddExtensionExclusion(
     }
 
     entry->Flags = Flags;
-    extChars = (USHORT)min(Extension->Length / sizeof(WCHAR),
-                           SHADOWSTRIKE_MAX_EXTENSION_LENGTH - 1);
 
     {
         USHORT k;
@@ -886,8 +953,16 @@ ShadowStrikeAddProcessExclusion(
     }
 
     if (!ShadowStrikeValidateUnicodeString(ProcessName) || ProcessName->Length == 0 ||
-        !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+        !ExclusionpIsReady()) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // EM-4 fix: Reject process names exceeding maximum length.
+    //
+    nameChars = ProcessName->Length / sizeof(WCHAR);
+    if (nameChars >= SHADOWSTRIKE_MAX_PROCESS_NAME_LENGTH) {
+        return STATUS_NAME_TOO_LONG;
     }
 
     entry = (PSHADOWSTRIKE_PROCESS_EXCLUSION)ExAllocatePoolZero(
@@ -901,8 +976,6 @@ ShadowStrikeAddProcessExclusion(
     }
 
     entry->Flags = Flags;
-    nameChars = (USHORT)min(ProcessName->Length / sizeof(WCHAR),
-                            SHADOWSTRIKE_MAX_PROCESS_NAME_LENGTH - 1);
 
     {
         USHORT k;
@@ -971,7 +1044,7 @@ ShadowStrikeClearExclusions(
 {
     PAGED_CODE();
 
-    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+    if (!ExclusionpIsReady()) {
         return;
     }
 
@@ -1143,7 +1216,7 @@ ShadowStrikeRemovePathExclusion(
     PAGED_CODE();
 
     if (!ShadowStrikeValidateUnicodeString(Path) || Path->Length == 0 ||
-        !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+        !ExclusionpIsReady()) {
         return FALSE;
     }
 
@@ -1200,7 +1273,7 @@ ShadowStrikeRemoveExtensionExclusion(
     PAGED_CODE();
 
     if (!ShadowStrikeValidateUnicodeString(Extension) || Extension->Length == 0 ||
-        !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+        !ExclusionpIsReady()) {
         return FALSE;
     }
 
@@ -1264,7 +1337,7 @@ ShadowStrikeRemoveProcessExclusion(
     PAGED_CODE();
 
     if (!ShadowStrikeValidateUnicodeString(ProcessName) || ProcessName->Length == 0 ||
-        !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+        !ExclusionpIsReady()) {
         return FALSE;
     }
 
@@ -1338,7 +1411,7 @@ ShadowStrikeAddPidExclusion(
         return STATUS_ACCESS_DENIED;
     }
 
-    if (ProcessId == NULL || !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+    if (ProcessId == NULL || !ExclusionpIsReady()) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1437,7 +1510,7 @@ ShadowStrikeRemovePidExclusion(
 
     PAGED_CODE();
 
-    if (ProcessId == NULL || !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+    if (ProcessId == NULL || !ExclusionpIsReady()) {
         return FALSE;
     }
 
@@ -1480,7 +1553,7 @@ ShadowStrikeExclusionGetStats(
         return;
     }
 
-    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+    if (!ExclusionpIsReady()) {
         RtlZeroMemory(Stats, sizeof(SHADOWSTRIKE_EXCLUSION_STATS));
         return;
     }
@@ -1511,7 +1584,7 @@ ShadowStrikeExclusionResetStats(
     VOID
     )
 {
-    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+    if (!ExclusionpIsReady()) {
         return;
     }
 
@@ -1553,7 +1626,7 @@ ShadowStrikeCleanupExpiredExclusions(
 
     PAGED_CODE();
 
-    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+    if (!ExclusionpIsReady()) {
         return;
     }
 
