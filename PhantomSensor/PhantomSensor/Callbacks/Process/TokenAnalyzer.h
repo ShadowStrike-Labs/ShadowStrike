@@ -34,6 +34,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 
 // ============================================================================
@@ -335,9 +336,9 @@ TaReferenceTokenInfo(
  *
  * @param[in] Info - Token info to release
  *
- * @irql <= DISPATCH_LEVEL (actual free deferred if > PASSIVE)
+ * @irql <= APC_LEVEL (push lock acquisition required for cache removal)
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 TaReleaseTokenInfo(
     _In_ PTA_TOKEN_INFO Info

@@ -55,6 +55,14 @@
 #include <ntstrsafe.h>
 
 // ============================================================================
+// KERNEL-MODE CONSTANTS NOT IN WDK HEADERS
+// ============================================================================
+
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION 0x0400
+#endif
+
+// ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
 
@@ -88,20 +96,7 @@
  */
 #define TA_MEDIUM_SUSPICION_THRESHOLD       50
 
-// ============================================================================
-// WELL-KNOWN PRIVILEGE LUIDS
-// ============================================================================
-
-#define SE_DEBUG_PRIVILEGE                  20
-#define SE_IMPERSONATE_PRIVILEGE            29
-#define SE_ASSIGNPRIMARYTOKEN_PRIVILEGE     3
-#define SE_TCB_PRIVILEGE                    7
-#define SE_LOAD_DRIVER_PRIVILEGE            10
-#define SE_TAKE_OWNERSHIP_PRIVILEGE         9
-#define SE_BACKUP_PRIVILEGE                 17
-#define SE_RESTORE_PRIVILEGE                18
-#define SE_CREATE_TOKEN_PRIVILEGE           2
-#define SE_SECURITY_PRIVILEGE               8
+// Note: SE_*_PRIVILEGE constants are defined in wdm.h (included via ntifs.h)
 
 // ============================================================================
 // PRIVATE STRUCTURES
@@ -210,11 +205,10 @@ typedef struct _TA_ANALYZER_INTERNAL {
     BOOLEAN Initialized;
 
     //
-    // Shutdown coordination
+    // Shutdown coordination (EX_RUNDOWN_REF: race-free acquire/release)
     //
+    EX_RUNDOWN_REF RundownRef;
     volatile LONG ShuttingDown;
-    volatile LONG ReferenceCount;
-    KEVENT ShutdownCompleteEvent;
 
     //
     // Token info cache
@@ -244,8 +238,23 @@ typedef struct _TA_ANALYZER_INTERNAL {
 } TA_ANALYZER_INTERNAL, *PTA_ANALYZER_INTERNAL;
 
 // ============================================================================
+// WELL-KNOWN SID CACHE (ONE-TIME INITIALIZATION)
+// ============================================================================
+
+static volatile LONG g_TapSidsInitialized = FALSE;
+static UCHAR g_TapAdminSidBuffer[SECURITY_MAX_SID_SIZE];
+static UCHAR g_TapSystemSidBuffer[SECURITY_MAX_SID_SIZE];
+static UCHAR g_TapServiceSidBuffer[SECURITY_MAX_SID_SIZE];
+static UCHAR g_TapNetServiceSidBuffer[SECURITY_MAX_SID_SIZE];
+static UCHAR g_TapLocalServiceSidBuffer[SECURITY_MAX_SID_SIZE];
+
+// ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+TapInitializeWellKnownSids(VOID);
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 static BOOLEAN
@@ -417,7 +426,7 @@ TapCompareGroups(
 // ============================================================================
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, TaInitialize)
+#pragma alloc_text(PAGE, TaInitialize)
 #pragma alloc_text(PAGE, TaShutdown)
 #pragma alloc_text(PAGE, TaAnalyzeToken)
 #pragma alloc_text(PAGE, TaDetectTokenManipulation)
@@ -431,6 +440,7 @@ TapCompareGroups(
 #pragma alloc_text(PAGE, TapQueryTokenIntegrity)
 #pragma alloc_text(PAGE, TapAllocateTokenInfo)
 #pragma alloc_text(PAGE, TapFreeTokenInfoInternal)
+#pragma alloc_text(PAGE, TapInitializeWellKnownSids)
 #pragma alloc_text(PAGE, TapIsSidAdmin)
 #pragma alloc_text(PAGE, TapIsSidSystem)
 #pragma alloc_text(PAGE, TapIsSidService)
@@ -484,7 +494,7 @@ TaInitialize(
     PTA_ANALYZER* Analyzer
 )
 {
-    NTSTATUS status = STATUS_SUCCESS;
+    NTSTATUS status;
     PTA_ANALYZER_INTERNAL analyzer = NULL;
 
     PAGED_CODE();
@@ -547,17 +557,28 @@ TaInitialize(
     analyzer->LookasideInitialized = TRUE;
 
     //
-    // Initialize reference counting and shutdown coordination
-    // Start with refcount of 1 (held by caller)
+    // Initialize rundown protection for shutdown coordination.
+    // ExAcquireRundownProtection atomically fails after
+    // ExWaitForRundownProtectionRelease is called — no TOCTOU races.
     //
-    analyzer->ReferenceCount = 1;
+    ExInitializeRundownProtection(&analyzer->RundownRef);
     analyzer->ShuttingDown = FALSE;
-    KeInitializeEvent(&analyzer->ShutdownCompleteEvent, NotificationEvent, FALSE);
 
     //
     // Initialize statistics
     //
     KeQuerySystemTime(&analyzer->Stats.StartTime);
+
+    //
+    // Initialize well-known SID cache for fast group analysis
+    //
+    status = TapInitializeWellKnownSids();
+    if (!NT_SUCCESS(status)) {
+        //
+        // Non-fatal: SID checks will use fallback stack-allocation path
+        //
+        status = STATUS_SUCCESS;
+    }
 
     //
     // Mark as initialized
@@ -579,8 +600,6 @@ TaShutdown(
     PLIST_ENTRY entry;
     PTA_TOKEN_INFO_INTERNAL tokenInfo;
     PTA_BASELINE_ENTRY baseline;
-    LARGE_INTEGER timeout;
-    NTSTATUS waitStatus;
 
     PAGED_CODE();
 
@@ -605,30 +624,13 @@ TaShutdown(
     InterlockedExchange(&analyzer->ShuttingDown, TRUE);
 
     //
-    // Release our reference (the one from TaInitialize)
+    // Wait for all in-flight operations to complete.
+    // ExWaitForRundownProtectionRelease atomically disables new acquisitions
+    // and blocks until all existing ExAcquireRundownProtection holders have
+    // called ExReleaseRundownProtection. This is unconditional — no timeout,
+    // no races. A hang here indicates a leaked reference (caller bug).
     //
-    TapReleaseAnalyzerReference(analyzer);
-
-    //
-    // Wait for all outstanding references to drain
-    // Use a reasonable timeout to avoid hanging
-    //
-    timeout.QuadPart = TA_SHUTDOWN_TIMEOUT;
-    waitStatus = KeWaitForSingleObject(
-        &analyzer->ShutdownCompleteEvent,
-        Executive,
-        KernelMode,
-        FALSE,
-        &timeout
-    );
-
-    if (waitStatus == STATUS_TIMEOUT) {
-        //
-        // Log warning - references didn't drain in time
-        // This indicates a bug in caller code (leaked references)
-        // Continue with cleanup anyway to avoid resource leaks
-        //
-    }
+    ExWaitForRundownProtectionRelease(&analyzer->RundownRef);
 
     //
     // Free all cached token info entries
@@ -1576,20 +1578,16 @@ TapAcquireAnalyzerReference(
 )
 {
     //
-    // Atomically check shutdown and acquire reference
-    // If shutting down, reject the operation
+    // Quick pre-check before the atomic operation.
+    // ExAcquireRundownProtection atomically fails once
+    // ExWaitForRundownProtectionRelease has been called,
+    // so this is an optimization, not a correctness requirement.
     //
-    InterlockedIncrement(&Analyzer->ReferenceCount);
-
     if (Analyzer->ShuttingDown) {
-        //
-        // Already shutting down - release our reference and fail
-        //
-        TapReleaseAnalyzerReference(Analyzer);
         return FALSE;
     }
 
-    return TRUE;
+    return ExAcquireRundownProtection(&Analyzer->RundownRef);
 }
 
 _Use_decl_annotations_
@@ -1598,14 +1596,7 @@ TapReleaseAnalyzerReference(
     PTA_ANALYZER_INTERNAL Analyzer
 )
 {
-    LONG newCount = InterlockedDecrement(&Analyzer->ReferenceCount);
-
-    if (newCount == 0 && Analyzer->ShuttingDown) {
-        //
-        // All references drained during shutdown
-        //
-        KeSetEvent(&Analyzer->ShutdownCompleteEvent, IO_NO_INCREMENT, FALSE);
-    }
+    ExReleaseRundownProtection(&Analyzer->RundownRef);
 }
 
 // ============================================================================
@@ -1723,8 +1714,6 @@ TapGetProcessToken(
     NTSTATUS status;
     PEPROCESS process = NULL;
     HANDLE processHandle = NULL;
-    OBJECT_ATTRIBUTES objAttr;
-    CLIENT_ID clientId;
 
     PAGED_CODE();
 
@@ -1739,24 +1728,25 @@ TapGetProcessToken(
     }
 
     //
-    // Dereference immediately - we just needed to validate
+    // Open a kernel handle to the process object directly.
+    // This eliminates the TOCTOU race where PID could be reused
+    // between ObDereferenceObject and ZwOpenProcess.
+    //
+    status = ObOpenObjectByPointer(
+        process,
+        OBJ_KERNEL_HANDLE,
+        NULL,
+        PROCESS_QUERY_INFORMATION,
+        *PsProcessType,
+        KernelMode,
+        &processHandle
+    );
+
+    //
+    // Release process reference — the handle holds its own reference
     //
     ObDereferenceObject(process);
     process = NULL;
-
-    //
-    // Open process handle
-    //
-    InitializeObjectAttributes(&objAttr, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
-    clientId.UniqueProcess = ProcessId;
-    clientId.UniqueThread = NULL;
-
-    status = ZwOpenProcess(
-        &processHandle,
-        PROCESS_QUERY_INFORMATION,
-        &objAttr,
-        &clientId
-    );
 
     if (!NT_SUCCESS(status)) {
         return status;
@@ -1880,17 +1870,53 @@ TapQueryTokenInformation(
     //
     // Query elevation status
     //
-    TOKEN_ELEVATION elevation = { 0 };
+    {
+        TOKEN_ELEVATION elevation = { 0 };
+        status = ZwQueryInformationToken(
+            TokenHandle,
+            TokenElevation,
+            &elevation,
+            sizeof(elevation),
+            &returnLength
+        );
+
+        if (NT_SUCCESS(status)) {
+            TokenInfo->Base.IsElevated = (elevation.TokenIsElevated != 0);
+        }
+    }
+
+    //
+    // Query AppContainer status
+    //
+    tempValue = 0;
     status = ZwQueryInformationToken(
         TokenHandle,
-        TokenElevation,
-        &elevation,
-        sizeof(elevation),
+        TokenIsAppContainer,
+        &tempValue,
+        sizeof(tempValue),
         &returnLength
     );
 
     if (NT_SUCCESS(status)) {
-        TokenInfo->Base.IsElevated = (elevation.TokenIsElevated != 0);
+        TokenInfo->Base.IsAppContainer = (tempValue != 0);
+    }
+
+    //
+    // Query elevation type to determine if token is filtered (UAC limited)
+    //
+    {
+        TOKEN_ELEVATION_TYPE elevationType = TokenElevationTypeDefault;
+        status = ZwQueryInformationToken(
+            TokenHandle,
+            TokenElevationType,
+            &elevationType,
+            sizeof(elevationType),
+            &returnLength
+        );
+
+        if (NT_SUCCESS(status)) {
+            TokenInfo->Base.IsFiltered = (elevationType == TokenElevationTypeLimited);
+        }
     }
 
     return STATUS_SUCCESS;
@@ -2178,6 +2204,49 @@ TapQueryTokenIntegrity(
 }
 
 // ============================================================================
+// PRIVATE - WELL-KNOWN SID INITIALIZATION
+// ============================================================================
+
+_Use_decl_annotations_
+static NTSTATUS
+TapInitializeWellKnownSids(VOID)
+{
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    // Administrators: S-1-5-32-544
+    status = RtlInitializeSid((PSID)g_TapAdminSidBuffer, &ntAuthority, 2);
+    if (!NT_SUCCESS(status)) { return status; }
+    *RtlSubAuthoritySid((PSID)g_TapAdminSidBuffer, 0) = SECURITY_BUILTIN_DOMAIN_RID;
+    *RtlSubAuthoritySid((PSID)g_TapAdminSidBuffer, 1) = DOMAIN_ALIAS_RID_ADMINS;
+
+    // LocalSystem: S-1-5-18
+    status = RtlInitializeSid((PSID)g_TapSystemSidBuffer, &ntAuthority, 1);
+    if (!NT_SUCCESS(status)) { return status; }
+    *RtlSubAuthoritySid((PSID)g_TapSystemSidBuffer, 0) = SECURITY_LOCAL_SYSTEM_RID;
+
+    // Service: S-1-5-6
+    status = RtlInitializeSid((PSID)g_TapServiceSidBuffer, &ntAuthority, 1);
+    if (!NT_SUCCESS(status)) { return status; }
+    *RtlSubAuthoritySid((PSID)g_TapServiceSidBuffer, 0) = SECURITY_SERVICE_RID;
+
+    // NetworkService: S-1-5-20
+    status = RtlInitializeSid((PSID)g_TapNetServiceSidBuffer, &ntAuthority, 1);
+    if (!NT_SUCCESS(status)) { return status; }
+    *RtlSubAuthoritySid((PSID)g_TapNetServiceSidBuffer, 0) = SECURITY_NETWORK_SERVICE_RID;
+
+    // LocalService: S-1-5-19
+    status = RtlInitializeSid((PSID)g_TapLocalServiceSidBuffer, &ntAuthority, 1);
+    if (!NT_SUCCESS(status)) { return status; }
+    *RtlSubAuthoritySid((PSID)g_TapLocalServiceSidBuffer, 0) = SECURITY_LOCAL_SERVICE_RID;
+
+    InterlockedExchange(&g_TapSidsInitialized, TRUE);
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
 // PRIVATE - SID ANALYSIS
 // ============================================================================
 
@@ -2187,26 +2256,26 @@ TapIsSidAdmin(
     PSID Sid
 )
 {
-    UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
-    PSID adminSid = (PSID)sidBuffer;
-    ULONG sidSize = sizeof(sidBuffer);
-    NTSTATUS status;
-
     PAGED_CODE();
 
     if (Sid == NULL || !RtlValidSid(Sid)) {
         return FALSE;
     }
 
-    //
-    // Build Administrators SID (S-1-5-32-544)
-    //
-    status = RtlCreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, adminSid, &sidSize);
-    if (!NT_SUCCESS(status)) {
-        return FALSE;
+    if (g_TapSidsInitialized) {
+        return RtlEqualSid(Sid, (PSID)g_TapAdminSidBuffer);
     }
 
-    return RtlEqualSid(Sid, adminSid);
+    {
+        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+        UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
+        if (!NT_SUCCESS(RtlInitializeSid((PSID)sidBuffer, &ntAuth, 2))) {
+            return FALSE;
+        }
+        *RtlSubAuthoritySid((PSID)sidBuffer, 0) = SECURITY_BUILTIN_DOMAIN_RID;
+        *RtlSubAuthoritySid((PSID)sidBuffer, 1) = DOMAIN_ALIAS_RID_ADMINS;
+        return RtlEqualSid(Sid, (PSID)sidBuffer);
+    }
 }
 
 _Use_decl_annotations_
@@ -2215,26 +2284,25 @@ TapIsSidSystem(
     PSID Sid
 )
 {
-    UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
-    PSID systemSid = (PSID)sidBuffer;
-    ULONG sidSize = sizeof(sidBuffer);
-    NTSTATUS status;
-
     PAGED_CODE();
 
     if (Sid == NULL || !RtlValidSid(Sid)) {
         return FALSE;
     }
 
-    //
-    // Build SYSTEM SID (S-1-5-18)
-    //
-    status = RtlCreateWellKnownSid(WinLocalSystemSid, NULL, systemSid, &sidSize);
-    if (!NT_SUCCESS(status)) {
-        return FALSE;
+    if (g_TapSidsInitialized) {
+        return RtlEqualSid(Sid, (PSID)g_TapSystemSidBuffer);
     }
 
-    return RtlEqualSid(Sid, systemSid);
+    {
+        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+        UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
+        if (!NT_SUCCESS(RtlInitializeSid((PSID)sidBuffer, &ntAuth, 1))) {
+            return FALSE;
+        }
+        *RtlSubAuthoritySid((PSID)sidBuffer, 0) = SECURITY_LOCAL_SYSTEM_RID;
+        return RtlEqualSid(Sid, (PSID)sidBuffer);
+    }
 }
 
 _Use_decl_annotations_
@@ -2243,26 +2311,25 @@ TapIsSidService(
     PSID Sid
 )
 {
-    UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
-    PSID serviceSid = (PSID)sidBuffer;
-    ULONG sidSize = sizeof(sidBuffer);
-    NTSTATUS status;
-
     PAGED_CODE();
 
     if (Sid == NULL || !RtlValidSid(Sid)) {
         return FALSE;
     }
 
-    //
-    // Build Service SID (S-1-5-6)
-    //
-    status = RtlCreateWellKnownSid(WinServiceSid, NULL, serviceSid, &sidSize);
-    if (!NT_SUCCESS(status)) {
-        return FALSE;
+    if (g_TapSidsInitialized) {
+        return RtlEqualSid(Sid, (PSID)g_TapServiceSidBuffer);
     }
 
-    return RtlEqualSid(Sid, serviceSid);
+    {
+        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+        UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
+        if (!NT_SUCCESS(RtlInitializeSid((PSID)sidBuffer, &ntAuth, 1))) {
+            return FALSE;
+        }
+        *RtlSubAuthoritySid((PSID)sidBuffer, 0) = SECURITY_SERVICE_RID;
+        return RtlEqualSid(Sid, (PSID)sidBuffer);
+    }
 }
 
 _Use_decl_annotations_
@@ -2271,26 +2338,25 @@ TapIsSidNetworkService(
     PSID Sid
 )
 {
-    UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
-    PSID netServiceSid = (PSID)sidBuffer;
-    ULONG sidSize = sizeof(sidBuffer);
-    NTSTATUS status;
-
     PAGED_CODE();
 
     if (Sid == NULL || !RtlValidSid(Sid)) {
         return FALSE;
     }
 
-    //
-    // Build Network Service SID (S-1-5-20)
-    //
-    status = RtlCreateWellKnownSid(WinNetworkServiceSid, NULL, netServiceSid, &sidSize);
-    if (!NT_SUCCESS(status)) {
-        return FALSE;
+    if (g_TapSidsInitialized) {
+        return RtlEqualSid(Sid, (PSID)g_TapNetServiceSidBuffer);
     }
 
-    return RtlEqualSid(Sid, netServiceSid);
+    {
+        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+        UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
+        if (!NT_SUCCESS(RtlInitializeSid((PSID)sidBuffer, &ntAuth, 1))) {
+            return FALSE;
+        }
+        *RtlSubAuthoritySid((PSID)sidBuffer, 0) = SECURITY_NETWORK_SERVICE_RID;
+        return RtlEqualSid(Sid, (PSID)sidBuffer);
+    }
 }
 
 _Use_decl_annotations_
@@ -2299,26 +2365,25 @@ TapIsSidLocalService(
     PSID Sid
 )
 {
-    UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
-    PSID localServiceSid = (PSID)sidBuffer;
-    ULONG sidSize = sizeof(sidBuffer);
-    NTSTATUS status;
-
     PAGED_CODE();
 
     if (Sid == NULL || !RtlValidSid(Sid)) {
         return FALSE;
     }
 
-    //
-    // Build Local Service SID (S-1-5-19)
-    //
-    status = RtlCreateWellKnownSid(WinLocalServiceSid, NULL, localServiceSid, &sidSize);
-    if (!NT_SUCCESS(status)) {
-        return FALSE;
+    if (g_TapSidsInitialized) {
+        return RtlEqualSid(Sid, (PSID)g_TapLocalServiceSidBuffer);
     }
 
-    return RtlEqualSid(Sid, localServiceSid);
+    {
+        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+        UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
+        if (!NT_SUCCESS(RtlInitializeSid((PSID)sidBuffer, &ntAuth, 1))) {
+            return FALSE;
+        }
+        *RtlSubAuthoritySid((PSID)sidBuffer, 0) = SECURITY_LOCAL_SERVICE_RID;
+        return RtlEqualSid(Sid, (PSID)sidBuffer);
+    }
 }
 
 // ============================================================================
