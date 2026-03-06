@@ -55,7 +55,9 @@ Thread Safety:
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
+#include <ntimage.h>
 
 //
 // Pool tags for memory tracking
@@ -387,7 +389,7 @@ _Must_inspect_result_
 NTSTATUS
 PaGetStatistics(
     _In_ PPA_ANALYZER Analyzer,
-    _Out_ PPA_STATISTICS* Statistics
+    _Out_ PPA_STATISTICS Statistics
     );
 
 /*++

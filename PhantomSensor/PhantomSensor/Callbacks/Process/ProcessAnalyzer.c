@@ -42,6 +42,80 @@ Security Hardening Applied:
 #include "ProcessAnalyzer.h"
 #include <ntstrsafe.h>
 
+//
+// Forward declarations for exported but undeclared kernel APIs
+//
+NTKERNELAPI
+HANDLE
+NTAPI
+PsGetProcessInheritedFromUniqueProcessId(
+    _In_ PEPROCESS Process
+    );
+
+NTKERNELAPI
+PVOID
+NTAPI
+PsGetProcessSectionBaseAddress(
+    _In_ PEPROCESS Process
+    );
+
+NTKERNELAPI
+PPEB
+NTAPI
+PsGetProcessPeb(
+    _In_ PEPROCESS Process
+    );
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQueryInformationProcess(
+    _In_ HANDLE ProcessHandle,
+    _In_ PROCESSINFOCLASS ProcessInformationClass,
+    _Out_writes_bytes_(ProcessInformationLength) PVOID ProcessInformation,
+    _In_ ULONG ProcessInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+#ifndef PROCESS_QUERY_LIMITED_INFORMATION
+#define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
+#endif
+
+//
+// Local PEB/RTL_USER_PROCESS_PARAMETERS definitions for kernel-mode access.
+// The WDK declares PEB as opaque. These minimal structs define only the
+// fields we access, at their documented x64 offsets.
+//
+typedef struct _PA_RTL_USER_PROCESS_PARAMETERS {
+    ULONG MaximumLength;                    // 0x00
+    ULONG Length;                           // 0x04
+    ULONG Flags;                            // 0x08
+    ULONG DebugFlags;                       // 0x0C
+    PVOID ConsoleHandle;                    // 0x10
+    ULONG ConsoleFlags;                     // 0x18
+    ULONG Padding0;                         // 0x1C (alignment)
+    PVOID StandardInput;                    // 0x20
+    PVOID StandardOutput;                   // 0x28
+    PVOID StandardError;                    // 0x30
+    UNICODE_STRING CurrentDirectoryPath;    // 0x38
+    PVOID CurrentDirectoryHandle;           // 0x48
+    UNICODE_STRING DllPath;                 // 0x50
+    UNICODE_STRING ImagePathName;           // 0x60
+    UNICODE_STRING CommandLine;             // 0x70
+} PA_RTL_USER_PROCESS_PARAMETERS, *PPA_RTL_USER_PROCESS_PARAMETERS;
+
+typedef struct _PA_PEB {
+    BOOLEAN InheritedAddressSpace;          // 0x00
+    BOOLEAN ReadImageFileExecOptions;       // 0x01
+    BOOLEAN BeingDebugged;                  // 0x02
+    BOOLEAN BitField;                       // 0x03
+    UCHAR Padding0[4];                      // 0x04 (x64 alignment)
+    PVOID Mutant;                           // 0x08
+    PVOID ImageBaseAddress;                 // 0x10
+    PVOID Ldr;                              // 0x18
+    PPA_RTL_USER_PROCESS_PARAMETERS ProcessParameters; // 0x20
+} PA_PEB, *PPA_PEB;
+
 // ============================================================================
 // COMPILE-TIME CONFIGURATION
 // ============================================================================
@@ -967,7 +1041,7 @@ _Must_inspect_result_
 NTSTATUS
 PaGetStatistics(
     _In_ PPA_ANALYZER Analyzer,
-    _Out_ PPA_STATISTICS* Statistics
+    _Out_ PPA_STATISTICS Statistics
     )
 {
     PPA_ANALYZER_INTERNAL Internal = (PPA_ANALYZER_INTERNAL)Analyzer;
@@ -1200,6 +1274,34 @@ PapDereferenceAnalysis(
     NewCount = InterlockedDecrement(&Analysis->RefCount);
 
     if (NewCount == 0) {
+        //
+        // Defense-in-depth: ensure removal from all lists before freeing.
+        // Normally cache cleanup handles this, but protect against edge cases.
+        //
+        if (Analysis->InCache) {
+            ULONG Hash = Analysis->HashBucket;
+            KeEnterCriticalRegion();
+            ExAcquirePushLockExclusive(&Analyzer->HashBuckets[Hash].Lock);
+            if (Analysis->InCache) {
+                RemoveEntryList(&Analysis->HashEntry);
+                InitializeListHead(&Analysis->HashEntry);
+                InterlockedDecrement(&Analyzer->HashBuckets[Hash].Count);
+                Analysis->InCache = FALSE;
+            }
+            ExReleasePushLockExclusive(&Analyzer->HashBuckets[Hash].Lock);
+            KeLeaveCriticalRegion();
+        }
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&Analyzer->ListLock);
+        if (!IsListEmpty(&Analysis->ListEntry)) {
+            RemoveEntryList(&Analysis->ListEntry);
+            InitializeListHead(&Analysis->ListEntry);
+            InterlockedDecrement(&Analyzer->AnalysisCount);
+        }
+        ExReleasePushLockExclusive(&Analyzer->ListLock);
+        KeLeaveCriticalRegion();
+
         PapFreeAnalysisInternal(Analyzer, Analysis);
     }
 
@@ -1278,6 +1380,13 @@ PapInsertCachedAnalysis(
 
     Hash = PapHashProcessId(Analysis->Public.ProcessId);
     Analysis->HashBucket = Hash;
+
+    //
+    // Take a reference for cache membership.
+    // Caller holds ref 1, cache holds ref 2.
+    // This prevents UAF when caller calls PaFreeAnalysis while entry is cached.
+    //
+    PapReferenceAnalysis(Analysis);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Analyzer->HashBuckets[Hash].Lock);
@@ -1408,27 +1517,7 @@ PapGetProcessCreationTime(
     _Out_ PLARGE_INTEGER CreationTime
     )
 {
-    KERNEL_USER_TIMES Times;
-    NTSTATUS Status;
-    ULONG ReturnLength;
-
-    CreationTime->QuadPart = 0;
-
-    Status = ZwQueryInformationProcess(
-        ZwCurrentProcess(),
-        ProcessTimes,
-        &Times,
-        sizeof(Times),
-        &ReturnLength
-        );
-
-    //
-    // ZwQueryInformationProcess with current process handle won't work for another process.
-    // Use the creation time from EPROCESS if available (undocumented but stable offset).
-    // For safety, we just use a hash of the EPROCESS pointer as a unique identifier.
-    //
-    CreationTime->QuadPart = (LONGLONG)(ULONG_PTR)Process;
-
+    CreationTime->QuadPart = PsGetProcessCreateTimeQuadPart(Process);
     return STATUS_SUCCESS;
 }
 
@@ -1834,20 +1923,17 @@ PapAnalyzeSecurityMitigations(
 
         if (NT_SUCCESS(Status)) {
             //
-            // Query DEP policy
+            // Query DEP policy via ProcessExecuteFlags
             //
             {
-                struct {
-                    ULONG Flags;
-                    ULONG Permanent;
-                } DepPolicy = { 0 };
+                ULONG ExecuteFlags = 0;
                 ULONG ReturnLength;
 
                 Status = ZwQueryInformationProcess(
                     ProcessHandle,
                     ProcessExecuteFlags,
-                    &DepPolicy,
-                    sizeof(DepPolicy),
+                    &ExecuteFlags,
+                    sizeof(ExecuteFlags),
                     &ReturnLength
                     );
 
@@ -1855,7 +1941,7 @@ PapAnalyzeSecurityMitigations(
                     //
                     // MEM_EXECUTE_OPTION_DISABLE = 0x1 means DEP is enabled
                     //
-                    Analysis->Public.Security.HasDEP = ((DepPolicy.Flags & 0x1) != 0);
+                    Analysis->Public.Security.HasDEP = ((ExecuteFlags & 0x1) != 0);
                 }
             }
 
@@ -1894,117 +1980,77 @@ PapAnalyzeProcessToken(
         Analysis->Public.Security.IsElevated = SeTokenIsAdmin(Token);
 
         //
-        // Check for dangerous privileges using SeSinglePrivilegeCheck
-        // Note: This checks if the calling thread has the privilege,
-        // not if the token has it. For token privilege enumeration,
-        // we need SeQueryInformationToken with TokenPrivileges.
+        // Query dangerous privileges from process token
+        // SeQueryInformationToken allocates buffer; caller frees with ExFreePool
         //
         {
-            PTOKEN_PRIVILEGES Privileges = NULL;
-            ULONG ReturnLength = 0;
+            PVOID PrivInfo = NULL;
 
             Status = SeQueryInformationToken(
                 Token,
                 TokenPrivileges,
-                NULL,
-                0,
-                &ReturnLength
+                &PrivInfo
                 );
 
-            if (Status == STATUS_BUFFER_TOO_SMALL && ReturnLength > 0 && ReturnLength < 0x10000) {
-                Privileges = (PTOKEN_PRIVILEGES)ExAllocatePool2(
-                    POOL_FLAG_NON_PAGED,
-                    ReturnLength,
-                    PA_POOL_TAG_BUFFER
-                    );
+            if (NT_SUCCESS(Status) && PrivInfo != NULL) {
+                PTOKEN_PRIVILEGES Privileges = (PTOKEN_PRIVILEGES)PrivInfo;
+                ULONG i;
 
-                if (Privileges != NULL) {
-                    Status = SeQueryInformationToken(
-                        Token,
-                        TokenPrivileges,
-                        Privileges,
-                        ReturnLength,
-                        &ReturnLength
-                        );
+                for (i = 0; i < Privileges->PrivilegeCount; i++) {
+                    LUID Luid = Privileges->Privileges[i].Luid;
+                    ULONG Attributes = Privileges->Privileges[i].Attributes;
 
-                    if (NT_SUCCESS(Status)) {
-                        ULONG i;
-                        for (i = 0; i < Privileges->PrivilegeCount; i++) {
-                            LUID Luid = Privileges->Privileges[i].Luid;
-                            ULONG Attributes = Privileges->Privileges[i].Attributes;
+                    if ((Attributes & SE_PRIVILEGE_ENABLED) ||
+                        (Attributes & SE_PRIVILEGE_ENABLED_BY_DEFAULT)) {
 
-                            //
-                            // Check if privilege is enabled
-                            //
-                            if ((Attributes & SE_PRIVILEGE_ENABLED) ||
-                                (Attributes & SE_PRIVILEGE_ENABLED_BY_DEFAULT)) {
-
-                                if (Luid.LowPart == SE_DEBUG_PRIVILEGE && Luid.HighPart == 0) {
-                                    Analysis->Public.Security.HasSeDebugPrivilege = TRUE;
-                                }
-                                if (Luid.LowPart == SE_LOAD_DRIVER_PRIVILEGE && Luid.HighPart == 0) {
-                                    Analysis->Public.Security.HasSeLoadDriverPrivilege = TRUE;
-                                }
-                                if (Luid.LowPart == SE_TCB_PRIVILEGE && Luid.HighPart == 0) {
-                                    Analysis->Public.Security.HasSeTcbPrivilege = TRUE;
-                                }
-                                if (Luid.LowPart == SE_BACKUP_PRIVILEGE && Luid.HighPart == 0) {
-                                    Analysis->Public.Security.HasSeBackupPrivilege = TRUE;
-                                }
-                                if (Luid.LowPart == SE_RESTORE_PRIVILEGE && Luid.HighPart == 0) {
-                                    Analysis->Public.Security.HasSeRestorePrivilege = TRUE;
-                                }
-                            }
+                        if (Luid.LowPart == SE_DEBUG_PRIVILEGE && Luid.HighPart == 0) {
+                            Analysis->Public.Security.HasSeDebugPrivilege = TRUE;
+                        }
+                        if (Luid.LowPart == SE_LOAD_DRIVER_PRIVILEGE && Luid.HighPart == 0) {
+                            Analysis->Public.Security.HasSeLoadDriverPrivilege = TRUE;
+                        }
+                        if (Luid.LowPart == SE_TCB_PRIVILEGE && Luid.HighPart == 0) {
+                            Analysis->Public.Security.HasSeTcbPrivilege = TRUE;
+                        }
+                        if (Luid.LowPart == SE_BACKUP_PRIVILEGE && Luid.HighPart == 0) {
+                            Analysis->Public.Security.HasSeBackupPrivilege = TRUE;
+                        }
+                        if (Luid.LowPart == SE_RESTORE_PRIVILEGE && Luid.HighPart == 0) {
+                            Analysis->Public.Security.HasSeRestorePrivilege = TRUE;
                         }
                     }
-
-                    ExFreePoolWithTag(Privileges, PA_POOL_TAG_BUFFER);
                 }
+
+                ExFreePool(PrivInfo);
             }
         }
 
         //
         // Get integrity level
+        // SeQueryInformationToken allocates buffer; caller frees with ExFreePool
         //
         {
-            PTOKEN_MANDATORY_LABEL MandatoryLabel = NULL;
-            ULONG ReturnLength = 0;
+            PVOID IntInfo = NULL;
 
             Status = SeQueryInformationToken(
                 Token,
                 TokenIntegrityLevel,
-                NULL,
-                0,
-                &ReturnLength
+                &IntInfo
                 );
 
-            if (Status == STATUS_BUFFER_TOO_SMALL && ReturnLength > 0 && ReturnLength < 0x1000) {
-                MandatoryLabel = (PTOKEN_MANDATORY_LABEL)ExAllocatePool2(
-                    POOL_FLAG_NON_PAGED,
-                    ReturnLength,
-                    PA_POOL_TAG_BUFFER
-                    );
+            if (NT_SUCCESS(Status) && IntInfo != NULL) {
+                PTOKEN_MANDATORY_LABEL MandatoryLabel = (PTOKEN_MANDATORY_LABEL)IntInfo;
 
-                if (MandatoryLabel != NULL) {
-                    Status = SeQueryInformationToken(
-                        Token,
-                        TokenIntegrityLevel,
-                        MandatoryLabel,
-                        ReturnLength,
-                        &ReturnLength
-                        );
-
-                    if (NT_SUCCESS(Status) && MandatoryLabel->Label.Sid != NULL) {
-                        PISID Sid = (PISID)MandatoryLabel->Label.Sid;
-                        if (Sid->SubAuthorityCount > 0) {
-                            Analysis->Public.Security.IntegrityLevel =
-                                Sid->SubAuthority[Sid->SubAuthorityCount - 1];
-                            Analysis->Public.Security.HasIntegrityLevel = TRUE;
-                        }
+                if (MandatoryLabel->Label.Sid != NULL) {
+                    PISID Sid = (PISID)MandatoryLabel->Label.Sid;
+                    if (Sid->SubAuthorityCount > 0) {
+                        Analysis->Public.Security.IntegrityLevel =
+                            Sid->SubAuthority[Sid->SubAuthorityCount - 1];
+                        Analysis->Public.Security.HasIntegrityLevel = TRUE;
                     }
-
-                    ExFreePoolWithTag(MandatoryLabel, PA_POOL_TAG_BUFFER);
                 }
+
+                ExFreePool(IntInfo);
             }
         }
 
@@ -2105,13 +2151,13 @@ PapAnalyzeCommandLine(
     UNREFERENCED_PARAMETER(Analyzer);
 
     __try {
-        PPEB Peb;
-        PRTL_USER_PROCESS_PARAMETERS ProcessParameters;
+        PPA_PEB Peb;
+        PPA_RTL_USER_PROCESS_PARAMETERS ProcessParameters;
 
         //
         // Get PEB
         //
-        Peb = PsGetProcessPeb(Process);
+        Peb = (PPA_PEB)PsGetProcessPeb(Process);
         if (Peb == NULL) {
             return STATUS_NOT_FOUND;
         }
@@ -2123,11 +2169,11 @@ PapAnalyzeCommandLine(
         Attached = TRUE;
 
         __try {
-            ProbeForRead(Peb, sizeof(PEB), sizeof(ULONG_PTR));
+            ProbeForRead(Peb, sizeof(PA_PEB), sizeof(ULONG_PTR));
 
             ProcessParameters = Peb->ProcessParameters;
             if (ProcessParameters != NULL) {
-                ProbeForRead(ProcessParameters, sizeof(RTL_USER_PROCESS_PARAMETERS), sizeof(ULONG_PTR));
+                ProbeForRead(ProcessParameters, sizeof(PA_RTL_USER_PROCESS_PARAMETERS), sizeof(ULONG_PTR));
 
                 if (ProcessParameters->CommandLine.Buffer != NULL &&
                     ProcessParameters->CommandLine.Length > 0 &&
