@@ -56,8 +56,25 @@
 #include "../../Utilities/StringUtils.h"
 #include "../../Utilities/ProcessUtils.h"
 
+//
+// Forward declarations for undocumented but exported ntoskrnl APIs
+//
+NTKERNELAPI
+HANDLE
+NTAPI
+PsGetProcessInheritedFromUniqueProcessId(
+    _In_ PEPROCESS Process
+    );
+
+NTKERNELAPI
+ULONG
+NTAPI
+PsGetProcessSessionId(
+    _In_ PEPROCESS Process
+    );
+
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, ImageNotifyInitialize)
+#pragma alloc_text(PAGE, ImageNotifyInitialize)
 #pragma alloc_text(PAGE, RegisterImageNotify)
 #pragma alloc_text(PAGE, UnregisterImageNotify)
 #pragma alloc_text(PAGE, ImageNotifyShutdown)
@@ -859,25 +876,27 @@ Routine Description:
     KeLeaveCriticalRegion();
 
     //
-    // Free module tracking
+    // Free module tracking — entries are stored in ProcessModuleHash buckets
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ImgNotify.ModuleTrackingLock);
 
-    while (!IsListEmpty(&g_ImgNotify.ProcessModuleList)) {
-        entry = RemoveHeadList(&g_ImgNotify.ProcessModuleList);
-        processModules = CONTAINING_RECORD(entry, IMG_PROCESS_MODULES, ListEntry);
+    for (i = 0; i < IMG_MODULE_HASH_BUCKETS; i++) {
+        while (!IsListEmpty(&g_ImgNotify.ProcessModuleHash[i])) {
+            entry = RemoveHeadList(&g_ImgNotify.ProcessModuleHash[i]);
+            processModules = CONTAINING_RECORD(entry, IMG_PROCESS_MODULES, ListEntry);
 
-        //
-        // Free all modules for this process
-        //
-        while (!IsListEmpty(&processModules->ModuleList)) {
-            PLIST_ENTRY moduleListEntry = RemoveHeadList(&processModules->ModuleList);
-            moduleEntry = CONTAINING_RECORD(moduleListEntry, IMG_MODULE_ENTRY, ListEntry);
-            ShadowStrikeLookasideFree(&g_ImgNotify.ModuleLookaside, moduleEntry);
+            //
+            // Free all modules for this process
+            //
+            while (!IsListEmpty(&processModules->ModuleList)) {
+                PLIST_ENTRY moduleListEntry = RemoveHeadList(&processModules->ModuleList);
+                moduleEntry = CONTAINING_RECORD(moduleListEntry, IMG_MODULE_ENTRY, ListEntry);
+                ShadowStrikeLookasideFree(&g_ImgNotify.ModuleLookaside, moduleEntry);
+            }
+
+            ShadowStrikeFreePoolWithTag(processModules, IMG_POOL_TAG_MODULE);
         }
-
-        ShadowStrikeFreePoolWithTag(processModules, IMG_POOL_TAG_MODULE);
     }
 
     ExReleasePushLockExclusive(&g_ImgNotify.ModuleTrackingLock);
@@ -1459,7 +1478,7 @@ BOOLEAN
 ImageNotifyIsModuleLoaded(
     HANDLE ProcessId,
     PUNICODE_STRING ModuleName,
-    PPVOID ImageBase
+    PVOID* ImageBase
     )
 {
     PIMG_PROCESS_MODULES processModules = NULL;
@@ -2006,39 +2025,17 @@ Arguments:
     //
     // Compute hashes if enabled and we have a file object
     //
-    if (config.EnableHashComputation && ImageInfo->ExtendedInfoPresent) {
-        PIMAGE_INFO_EX imageInfoEx = CONTAINING_RECORD(
-            ImageInfo, IMAGE_INFO_EX, ImageInfo);
+    if (config.EnableHashComputation && ImageInfo->ImageBase != NULL) {
+        status = ImgpComputeImageHash(
+            ImageInfo,
+            event->Sha256Hash,
+            event->Sha1Hash,
+            event->Md5Hash
+            );
 
-        if (imageInfoEx->FileObject != NULL) {
-            //
-            // Try cache first
-            //
-            FILE_INTERNAL_INFORMATION fileInfo;
-            IO_STATUS_BLOCK ioStatus;
-
-            status = ZwQueryInformationFile(
-                NULL,  // We'd need handle - skip for callback context
-                &ioStatus,
-                &fileInfo,
-                sizeof(fileInfo),
-                FileInternalInformation
-                );
-
-            //
-            // For simplicity, compute hash directly using file object
-            //
-            status = ImgpComputeImageHash(
-                ImageInfo,
-                event->Sha256Hash,
-                event->Sha1Hash,
-                event->Md5Hash
-                );
-
-            if (NT_SUCCESS(status)) {
-                event->HashesComputed = TRUE;
-                InterlockedIncrement64(&g_ImgNotify.Stats.HashesComputed);
-            }
+        if (NT_SUCCESS(status)) {
+            event->HashesComputed = TRUE;
+            InterlockedIncrement64(&g_ImgNotify.Stats.HashesComputed);
         }
     }
 
@@ -2092,14 +2089,14 @@ Arguments:
     // This can flag unauthorized DLL loads for audit or enforcement
     //
     if (ProcessId != NULL) {
-        AcCheckImageLoad(ProcessId, FullImageName, ImageInfo);
+        AcCheckImageLoad(FullImageName, ProcessId);
     }
 
     //
     // AMSI Bypass Detection — monitor amsi.dll loads and check integrity
     // Detects runtime patching of AmsiScanBuffer/AmsiOpenSession (T1562.001)
     //
-    AbdNotifyImageLoad(ProcessId, FullImageName, ImageInfo);
+    AbdNotifyImageLoad(ProcessId, ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName);
 
     //
     // Send notification to user mode if threshold met
@@ -2801,7 +2798,7 @@ ImgpIsMasqueradingName(
                 }
             }
 
-            if (matches >= minLen - 2) {
+            if (minLen >= 2 && matches >= (ULONG)(minLen - 2)) {
                 return TRUE;
             }
         }
@@ -3146,40 +3143,57 @@ ImgpComputeImageHash(
     )
 {
     NTSTATUS status;
-    PIMAGE_INFO_EX imageInfoEx;
-    PFILE_OBJECT fileObject;
     SHADOWSTRIKE_MULTI_HASH_RESULT hashResult;
+    ULONG hashSize;
 
-    if (!ImageInfo->ExtendedInfoPresent) {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    imageInfoEx = CONTAINING_RECORD(ImageInfo, IMAGE_INFO_EX, ImageInfo);
-    fileObject = imageInfoEx->FileObject;
-
-    if (fileObject == NULL) {
-        return STATUS_NO_SUCH_FILE;
+    if (ImageInfo == NULL || ImageInfo->ImageBase == NULL || Sha256Hash == NULL) {
+        return STATUS_INVALID_PARAMETER;
     }
 
     //
-    // Use existing hash utility to compute file hash
+    // Cap hash size to prevent excessive processing on huge images.
+    // ImageSize is SIZE_T; clamp to ULONG for the buffer hash API.
     //
-    status = ShadowStrikeComputeFileMultiHash(
-        fileObject,
-        &hashResult,
-        g_ImgNotify.Config.MaxFileSizeForHash,
-        0   // Default flags
-        );
+    if (ImageInfo->ImageSize == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    hashSize = (ImageInfo->ImageSize > g_ImgNotify.Config.MaxFileSizeForHash)
+        ? (ULONG)g_ImgNotify.Config.MaxFileSizeForHash
+        : (ULONG)ImageInfo->ImageSize;
+
+    if (hashSize == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(&hashResult, sizeof(hashResult));
+
+    //
+    // Hash the mapped image memory directly.
+    // The callback fires in the loading thread context, so the
+    // image mapping is valid and accessible. SEH guards against
+    // concurrent unmapping by another thread (rare but possible).
+    //
+    __try {
+        status = ShadowStrikeComputeMultiHash(
+            ImageInfo->ImageBase,
+            hashSize,
+            &hashResult
+            );
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
 
     if (NT_SUCCESS(status)) {
-        RtlCopyMemory(Sha256Hash, hashResult.Sha256.Hash, 32);
+        RtlCopyMemory(Sha256Hash, hashResult.Sha256, SHA256_HASH_SIZE);
 
         if (Sha1Hash != NULL) {
-            RtlCopyMemory(Sha1Hash, hashResult.Sha1.Hash, 20);
+            RtlCopyMemory(Sha1Hash, hashResult.Sha1, SHA1_HASH_SIZE);
         }
 
         if (Md5Hash != NULL) {
-            RtlCopyMemory(Md5Hash, hashResult.Md5.Hash, 16);
+            RtlCopyMemory(Md5Hash, hashResult.Md5, MD5_HASH_SIZE);
         }
     }
 
