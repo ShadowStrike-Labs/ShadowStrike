@@ -444,7 +444,7 @@ ShadowStrikeMatchPathPattern(
     return FALSE;
 }
 
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowStrikeExtractExtension(
     _In_ PCUNICODE_STRING FilePath,

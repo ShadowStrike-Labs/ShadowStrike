@@ -882,9 +882,9 @@ ShadowStrikeNormalizePath(
  * @param CaseSensitive  TRUE for case-sensitive match.
  * @return TRUE if the path matches the pattern.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowStrikeMatchPathPattern(
     _In_ PCUNICODE_STRING FilePath,
