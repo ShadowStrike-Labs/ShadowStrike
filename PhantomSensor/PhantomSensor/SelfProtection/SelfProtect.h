@@ -253,7 +253,7 @@ ShadowStrikeIsPathProtected(
 
 /**
  * @brief Add a protected registry key path.
- * @param KeyPath NUL-terminated registry key path.
+ * @param KeyPath Registry key path as UNICODE_STRING.
  * @param Flags Protection flags.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -265,7 +265,7 @@ ShadowStrikeAddProtectedRegistryKey(
 
 /**
  * @brief Remove a protected registry key path.
- * @param KeyPath NUL-terminated registry key path to remove.
+ * @param KeyPath Registry key path as UNICODE_STRING to remove.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
