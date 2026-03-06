@@ -55,12 +55,96 @@
 #include "ObjectCallback.h"
 #include "ProcessProtection.h"
 #include "../../Core/Globals.h"
+#include "../../SelfProtection/SelfProtect.h"
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Utilities/MemoryUtils.h"
+#include "../../Communication/CommPort.h"
 
 #ifdef WPP_TRACING
 #include "ObjectCallback.tmh"
 #endif
+
+// ============================================================================
+// KERNEL API FORWARD DECLARATIONS
+// ============================================================================
+
+//
+// PsGetProcessSessionId — returns session ID for a given EPROCESS
+//
+NTKERNELAPI
+ULONG
+PsGetProcessSessionId(
+    _In_ PEPROCESS Process
+    );
+
+//
+// PsGetProcessImageFileName — returns up to 15-char image name, IRQL-safe
+//
+NTKERNELAPI
+PCHAR
+PsGetProcessImageFileName(
+    _In_ PEPROCESS Process
+    );
+
+// ============================================================================
+// SYSTEM STRUCTURES (for ZwQuerySystemInformation process enumeration)
+// ============================================================================
+
+#ifndef SystemProcessInformation
+#define SystemProcessInformation 5
+#endif
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQuerySystemInformation(
+    _In_ ULONG SystemInformationClass,
+    _Out_writes_bytes_opt_(SystemInformationLength) PVOID SystemInformation,
+    _In_ ULONG SystemInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+#ifndef _OB_SYSTEM_PROCESS_INFORMATION_DEFINED
+#define _OB_SYSTEM_PROCESS_INFORMATION_DEFINED
+
+typedef struct _OB_SYSTEM_PROCESS_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    LARGE_INTEGER WorkingSetPrivateSize;
+    ULONG HardFaultCount;
+    ULONG NumberOfThreadsHighWatermark;
+    ULONGLONG CycleTime;
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    UNICODE_STRING ImageName;
+    LONG BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+    ULONG HandleCount;
+    ULONG SessionId;
+    ULONG_PTR UniqueProcessKey;
+    SIZE_T PeakVirtualSize;
+    SIZE_T VirtualSize;
+    ULONG PageFaultCount;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+    SIZE_T PrivatePageCount;
+    LARGE_INTEGER ReadOperationCount;
+    LARGE_INTEGER WriteOperationCount;
+    LARGE_INTEGER OtherOperationCount;
+    LARGE_INTEGER ReadTransferCount;
+    LARGE_INTEGER WriteTransferCount;
+    LARGE_INTEGER OtherTransferCount;
+} OB_SYSTEM_PROCESS_INFORMATION, *POB_SYSTEM_PROCESS_INFORMATION;
+
+#endif // _OB_SYSTEM_PROCESS_INFORMATION_DEFINED
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -298,10 +382,27 @@ ShadowStrikeRegisterObjectCallbacks(
     }
 
     //
-    // We won the race - initialize
+    // We won the race - reinitialize fields individually
+    // (do NOT RtlZeroMemory the whole struct — it clobbers InitState,
+    //  creating a window where another CPU sees 0 and CAS succeeds)
     //
-    RtlZeroMemory(&g_ObCallbackContext, sizeof(OB_CALLBACK_CONTEXT));
-    g_ObCallbackContext.InitState = OB_INIT_STATE_INITIALIZING;
+    g_ObCallbackContext.TotalProcessOperations = 0;
+    g_ObCallbackContext.TotalThreadOperations = 0;
+    g_ObCallbackContext.ProcessAccessStripped = 0;
+    g_ObCallbackContext.ThreadAccessStripped = 0;
+    g_ObCallbackContext.CredentialAccessBlocked = 0;
+    g_ObCallbackContext.InjectionBlocked = 0;
+    g_ObCallbackContext.TerminationBlocked = 0;
+    g_ObCallbackContext.SuspiciousOperations = 0;
+    g_ObCallbackContext.CurrentSecondEvents = 0;
+    g_ObCallbackContext.LsassPid = 0;
+    g_ObCallbackContext.CsrssPid = 0;
+    g_ObCallbackContext.ServicesPid = 0;
+    g_ObCallbackContext.WinlogonPid = 0;
+    g_ObCallbackContext.SmsssPid = 0;
+    g_ObCallbackContext.WellKnownPidsInitialized = 0;
+    g_ObCallbackContext.NameCacheIndex = 0;
+    RtlZeroMemory(g_ObCallbackContext.NameCache, sizeof(g_ObCallbackContext.NameCache));
 
     KeInitializeSpinLock(&g_ObCallbackContext.RateLimitSpinLock);
     KeQuerySystemTime((PLARGE_INTEGER)&g_ObCallbackContext.StartTime);
@@ -331,13 +432,8 @@ ShadowStrikeRegisterObjectCallbacks(
     //
     status = ObpInitializeWellKnownPids();
     if (!NT_SUCCESS(status)) {
-        //
-        // Non-fatal - we can still use dynamic detection
-        //
-#ifdef WPP_TRACING
-        TraceEvents(TRACE_LEVEL_WARNING, TRACE_FLAG_FILTER,
-            "ObpInitializeWellKnownPids failed: 0x%08X (continuing)", status);
-#endif
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike] ObpInitializeWellKnownPids failed: 0x%08X (continuing)\n", status);
     }
 
     //
@@ -384,24 +480,17 @@ ShadowStrikeRegisterObjectCallbacks(
     );
 
     if (NT_SUCCESS(status)) {
-#ifdef WPP_TRACING
-        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_FLAG_FILTER,
-            "ObRegisterCallbacks successful, Handle=%p",
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "[ShadowStrike] ObRegisterCallbacks successful, Handle=%p\n",
             g_DriverData.ObjectCallbackHandle);
-#endif
 
         //
         // Initialize process protection subsystem
         //
         status = PpInitializeProcessProtection();
         if (!NT_SUCCESS(status)) {
-            //
-            // Non-fatal - continue with basic protection
-            //
-#ifdef WPP_TRACING
-            TraceEvents(TRACE_LEVEL_WARNING, TRACE_FLAG_FILTER,
-                "PpInitializeProcessProtection failed: 0x%08X", status);
-#endif
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike] PpInitializeProcessProtection failed: 0x%08X\n", status);
             status = STATUS_SUCCESS;
         }
 
@@ -412,11 +501,8 @@ ShadowStrikeRegisterObjectCallbacks(
         InterlockedExchange(&g_ObCallbackContext.InitState, OB_INIT_STATE_INITIALIZED);
 
     } else {
-#ifdef WPP_TRACING
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_FLAG_FILTER,
-            "ObRegisterCallbacks failed with status 0x%08X",
-            status);
-#endif
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike] ObRegisterCallbacks failed: 0x%08X\n", status);
         g_DriverData.ObjectCallbackHandle = NULL;
         InterlockedExchange(&g_ObCallbackContext.InitState, OB_INIT_STATE_UNINITIALIZED);
     }
@@ -457,17 +543,15 @@ ShadowStrikeUnregisterObjectCallbacks(
         ObUnRegisterCallbacks(g_DriverData.ObjectCallbackHandle);
         g_DriverData.ObjectCallbackHandle = NULL;
 
-#ifdef WPP_TRACING
-        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_FLAG_FILTER,
-            "ObRegisterCallbacks unregistered - Stats: ProcessOps=%lld, ThreadOps=%lld, "
-            "ProcessStripped=%lld, ThreadStripped=%lld, CredBlocked=%lld, InjBlocked=%lld",
-            g_ObCallbackContext.TotalProcessOperations,
-            g_ObCallbackContext.TotalThreadOperations,
-            g_ObCallbackContext.ProcessAccessStripped,
-            g_ObCallbackContext.ThreadAccessStripped,
-            g_ObCallbackContext.CredentialAccessBlocked,
-            g_ObCallbackContext.InjectionBlocked);
-#endif
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "[ShadowStrike] ObjectCallbacks unregistered - ProcessOps=%lld ThreadOps=%lld "
+            "ProcStripped=%lld ThreadStripped=%lld CredBlocked=%lld InjBlocked=%lld\n",
+            ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.TotalProcessOperations),
+            ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.TotalThreadOperations),
+            ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.ProcessAccessStripped),
+            ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.ThreadAccessStripped),
+            ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.CredentialAccessBlocked),
+            ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.InjectionBlocked));
     }
 
     //
@@ -1003,6 +1087,7 @@ ObRemoveProtectedProcess(
     PLIST_ENTRY listEntry;
     POB_PROTECTED_PROCESS_ENTRY entry;
     POB_PROTECTED_PROCESS_ENTRY foundEntry = NULL;
+    ULONG walkCount = 0;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_DriverData.ProtectedProcessLock);
@@ -1010,6 +1095,10 @@ ObRemoveProtectedProcess(
     for (listEntry = g_DriverData.ProtectedProcessList.Flink;
          listEntry != &g_DriverData.ProtectedProcessList;
          listEntry = listEntry->Flink) {
+
+        if (++walkCount > OB_MAX_LIST_WALK) {
+            break;
+        }
 
         entry = CONTAINING_RECORD(listEntry, OB_PROTECTED_PROCESS_ENTRY, ListEntry);
 
@@ -1029,9 +1118,16 @@ ObRemoveProtectedProcess(
     //
     if (foundEntry != NULL) {
         //
-        // Wait for reference count to drop (shouldn't be held long)
+        // Wait for reference count to drop with bounded iteration
         //
+        ULONG spinCount = 0;
         while (InterlockedCompareExchange(&foundEntry->ReferenceCount, 0, 0) > 0) {
+            if (++spinCount > OB_MAX_REFCOUNT_SPINS) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[ShadowStrike] ObRemoveProtectedProcess: refcount drain timeout PID=%p\n",
+                    foundEntry->ProcessId);
+                break;
+            }
             LARGE_INTEGER delay;
             delay.QuadPart = -1000; // 100us
             KeDelayExecutionThread(KernelMode, FALSE, &delay);
@@ -1051,6 +1147,7 @@ ObIsInProtectedList(
     PLIST_ENTRY listEntry;
     POB_PROTECTED_PROCESS_ENTRY entry;
     BOOLEAN found = FALSE;
+    ULONG walkCount = 0;
 
     if (OutEntry != NULL) {
         *OutEntry = NULL;
@@ -1062,6 +1159,10 @@ ObIsInProtectedList(
     for (listEntry = g_DriverData.ProtectedProcessList.Flink;
          listEntry != &g_DriverData.ProtectedProcessList;
          listEntry = listEntry->Flink) {
+
+        if (++walkCount > OB_MAX_LIST_WALK) {
+            break;
+        }
 
         entry = CONTAINING_RECORD(listEntry, OB_PROTECTED_PROCESS_ENTRY, ListEntry);
 
@@ -1091,6 +1192,12 @@ ObQueueTelemetryEvent(
     _In_ POB_TELEMETRY_EVENT Event
     )
 {
+    NTSTATUS status;
+    struct {
+        SHADOWSTRIKE_MESSAGE_HEADER Header;
+        SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION Alert;
+    } Message;
+
     //
     // Check if telemetry is enabled and user-mode is connected
     //
@@ -1103,27 +1210,42 @@ ObQueueTelemetryEvent(
     }
 
     //
-    // Queue event for delivery to user-mode via filter communication port
-    // This integrates with the existing message infrastructure
+    // Build handle alert notification for user-mode delivery
     //
-    // For enterprise deployment, this would use the message queue in Globals.h
-    // Format: SHADOWSTRIKE_MESSAGE with type = MESSAGE_TYPE_TELEMETRY
-    //
+    RtlZeroMemory(&Message, sizeof(Message));
 
-#ifdef WPP_TRACING
-    TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_FLAG_FILTER,
-        "Telemetry: Src=%p->Tgt=%p Access=0x%08X->0x%08X Score=%u",
-        Event->SourceProcessId,
-        Event->TargetProcessId,
-        Event->OriginalAccess,
-        Event->AllowedAccess,
-        Event->SuspicionScore);
-#endif
+    Message.Header.Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
+    Message.Header.Version = SHADOWSTRIKE_PROTOCOL_VERSION;
+    Message.Header.MessageType = (UINT16)SHADOWSTRIKE_MSG_PROCESS_HANDLE_ALERT;
+    Message.Header.MessageId = (UINT64)InterlockedIncrement64(&g_DriverData.NextMessageId);
+    Message.Header.TotalSize = sizeof(Message);
+    Message.Header.DataSize = sizeof(SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION);
+    {
+        LARGE_INTEGER Now;
+        KeQuerySystemTime(&Now);
+        Message.Header.Timestamp = (UINT64)Now.QuadPart;
+    }
 
-    //
-    // In production: Allocate message from lookaside, populate, and send
-    // FltSendMessage or queue for async delivery
-    //
+    Message.Alert.SourceProcessId = (UINT32)(ULONG_PTR)Event->SourceProcessId;
+    Message.Alert.TargetProcessId = (UINT32)(ULONG_PTR)Event->TargetProcessId;
+    Message.Alert.RequestedAccess = Event->OriginalAccess;
+    Message.Alert.GrantedAccess = Event->AllowedAccess;
+    Message.Alert.SuspicionScore = Event->SuspicionScore;
+    Message.Alert.SuspiciousFlags = Event->SuspiciousFlags;
+    Message.Alert.TargetCategory = Event->TargetCategory;
+    Message.Alert.OperationType = Event->IsProcessHandle ? 1 : 2;
+    Message.Alert.Verdict = (Event->StrippedAccess != 0) ? 1 : 0;
+
+    status = ShadowStrikeSendNotification(
+        &Message.Header,
+        sizeof(Message)
+    );
+
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike] ObQueueTelemetryEvent: send failed 0x%08X (Src=%p Tgt=%p)\n",
+            status, Event->SourceProcessId, Event->TargetProcessId);
+    }
 }
 
 _Use_decl_annotations_
@@ -1136,17 +1258,17 @@ ObGetCallbackStatistics(
     )
 {
     if (ProcessOps != NULL) {
-        *ProcessOps = g_ObCallbackContext.TotalProcessOperations;
+        *ProcessOps = ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.TotalProcessOperations);
     }
     if (ThreadOps != NULL) {
-        *ThreadOps = g_ObCallbackContext.TotalThreadOperations;
+        *ThreadOps = ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.TotalThreadOperations);
     }
     if (AccessStripped != NULL) {
-        *AccessStripped = g_ObCallbackContext.ProcessAccessStripped +
-                          g_ObCallbackContext.ThreadAccessStripped;
+        *AccessStripped = ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.ProcessAccessStripped) +
+                          ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.ThreadAccessStripped);
     }
     if (Suspicious != NULL) {
-        *Suspicious = g_ObCallbackContext.SuspiciousOperations;
+        *Suspicious = ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.SuspiciousOperations);
     }
 }
 
@@ -1339,18 +1461,20 @@ ObpIsShadowStrikeProcess(
     PLIST_ENTRY listEntry;
     POB_PROTECTED_PROCESS_ENTRY entry;
     BOOLEAN found = FALSE;
+    ULONG walkCount = 0;
 
     processId = PsGetProcessId(Process);
 
-    //
-    // FIXED: Actually traverse the protected process list
-    //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_DriverData.ProtectedProcessLock);
 
     for (listEntry = g_DriverData.ProtectedProcessList.Flink;
          listEntry != &g_DriverData.ProtectedProcessList;
          listEntry = listEntry->Flink) {
+
+        if (++walkCount > OB_MAX_LIST_WALK) {
+            break;
+        }
 
         entry = CONTAINING_RECORD(listEntry, OB_PROTECTED_PROCESS_ENTRY, ListEntry);
 
@@ -1409,7 +1533,7 @@ ObpIsSourceTrusted(
     //
     // Windows protected processes (PPL) are trusted
     //
-    if (ShadowStrikeIsProcessProtected(SourceProcess)) {
+    if (ShadowStrikeIsProcessProtected(SourceProcessId, NULL)) {
         return TRUE;
     }
 
@@ -1491,7 +1615,7 @@ ObpCalculateAllowedProcessAccess(
                 //
                 // EDR self-protection - block everything except query
                 //
-                deniedAccess = ~(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE);
+                deniedAccess = (ACCESS_MASK)~(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE);
                 break;
 
             default:
@@ -1565,7 +1689,7 @@ ObpCalculateAllowedThreadAccess(
                 //
                 // Block almost everything
                 //
-                deniedAccess = ~OB_SAFE_THREAD_ACCESS;
+                deniedAccess = (ACCESS_MASK)~OB_SAFE_THREAD_ACCESS;
                 break;
 
             default:
@@ -1588,7 +1712,7 @@ ObpCalculateAllowedThreadAccess(
                 //
                 // EDR threads - prevent any manipulation
                 //
-                deniedAccess = ~OB_SAFE_THREAD_ACCESS;
+                deniedAccess = (ACCESS_MASK)~OB_SAFE_THREAD_ACCESS;
                 break;
 
             case PpCategorySystem:
@@ -1705,19 +1829,13 @@ ObpLogAccessStripped(
     OB_TELEMETRY_EVENT event;
     ACCESS_MASK strippedAccess = OriginalAccess & ~AllowedAccess;
 
-#ifdef WPP_TRACING
-    TraceEvents(TRACE_LEVEL_WARNING, TRACE_FLAG_PROTECTION,
-        "Access stripped: Source=%p Target=%p Type=%s Original=0x%08X Allowed=0x%08X "
-        "Stripped=0x%08X Score=%u Category=%u",
-        SourceProcessId,
-        TargetProcessId,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        "[ShadowStrike] Access stripped: Src=%p Tgt=%p Type=%s Orig=0x%08X Allowed=0x%08X "
+        "Stripped=0x%08X Score=%u Cat=%u\n",
+        SourceProcessId, TargetProcessId,
         IsProcessHandle ? "Process" : "Thread",
-        OriginalAccess,
-        AllowedAccess,
-        strippedAccess,
-        SuspicionScore,
-        (ULONG)TargetCategory);
-#endif
+        OriginalAccess, AllowedAccess, strippedAccess,
+        SuspicionScore, (ULONG)TargetCategory);
 
     //
     // Build telemetry event for user-mode delivery
@@ -1809,7 +1927,6 @@ ObpInitializeWellKnownPids(
     PVOID buffer = NULL;
     ULONG bufferSize = 0;
     ULONG returnLength = 0;
-    PSYSTEM_PROCESS_INFORMATION processInfo;
     UNICODE_STRING lsassName;
     UNICODE_STRING csrssName;
     UNICODE_STRING servicesName;
@@ -1848,6 +1965,12 @@ ObpInitializeWellKnownPids(
 
     if (status == STATUS_INFO_LENGTH_MISMATCH) {
         ShadowStrikeFreePoolWithTag(buffer, OB_POOL_TAG);
+
+        if (returnLength > (MAXULONG - 8192)) {
+            InterlockedExchange(&g_ObCallbackContext.WellKnownPidsInitialized, 0);
+            return STATUS_INTEGER_OVERFLOW;
+        }
+
         bufferSize = returnLength + 4096;
         buffer = ShadowStrikeAllocatePoolWithTag(PagedPool, bufferSize, OB_POOL_TAG);
         if (buffer == NULL) {
@@ -1871,55 +1994,87 @@ ObpInitializeWellKnownPids(
 
     //
     // Walk the process list and find well-known processes
+    // with full buffer bounds checking and iteration cap
     //
-    processInfo = (PSYSTEM_PROCESS_INFORMATION)buffer;
+    {
+        POB_SYSTEM_PROCESS_INFORMATION currentProcess;
+        PUCHAR bufferEnd = (PUCHAR)buffer + bufferSize;
+        ULONG iterationCount = 0;
 
-    while (TRUE) {
-        if (processInfo->ImageName.Buffer != NULL) {
-            if (RtlEqualUnicodeString(&processInfo->ImageName, &lsassName, TRUE)) {
-                InterlockedExchange64(
-                    (volatile LONG64*)&g_ObCallbackContext.LsassPid,
-                    (LONG64)(ULONG_PTR)processInfo->UniqueProcessId
-                );
+        currentProcess = (POB_SYSTEM_PROCESS_INFORMATION)buffer;
+
+        do {
+            //
+            // Buffer bounds validation
+            //
+            if ((PUCHAR)currentProcess < (PUCHAR)buffer ||
+                (PUCHAR)currentProcess + sizeof(OB_SYSTEM_PROCESS_INFORMATION) > bufferEnd) {
+                break;
             }
-            else if (RtlEqualUnicodeString(&processInfo->ImageName, &csrssName, TRUE)) {
+
+            if (++iterationCount > OB_MAX_PROCESS_WALK) {
+                break;
+            }
+
+            if (currentProcess->ImageName.Buffer != NULL) {
                 //
-                // There can be multiple csrss instances - cache the first (session 0)
+                // Validate ImageName buffer range
                 //
-                if (g_ObCallbackContext.CsrssPid == 0) {
-                    InterlockedExchange64(
-                        (volatile LONG64*)&g_ObCallbackContext.CsrssPid,
-                        (LONG64)(ULONG_PTR)processInfo->UniqueProcessId
-                    );
+                if ((PUCHAR)currentProcess->ImageName.Buffer >= (PUCHAR)buffer &&
+                    (PUCHAR)currentProcess->ImageName.Buffer + currentProcess->ImageName.Length <= bufferEnd) {
+
+                    if (RtlEqualUnicodeString(&currentProcess->ImageName, &lsassName, TRUE)) {
+                        InterlockedExchange64(
+                            (volatile LONG64*)&g_ObCallbackContext.LsassPid,
+                            (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId
+                        );
+                    }
+                    else if (RtlEqualUnicodeString(&currentProcess->ImageName, &csrssName, TRUE)) {
+                        if (g_ObCallbackContext.CsrssPid == 0) {
+                            InterlockedExchange64(
+                                (volatile LONG64*)&g_ObCallbackContext.CsrssPid,
+                                (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId
+                            );
+                        }
+                    }
+                    else if (RtlEqualUnicodeString(&currentProcess->ImageName, &servicesName, TRUE)) {
+                        InterlockedExchange64(
+                            (volatile LONG64*)&g_ObCallbackContext.ServicesPid,
+                            (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId
+                        );
+                    }
+                    else if (RtlEqualUnicodeString(&currentProcess->ImageName, &winlogonName, TRUE)) {
+                        if (g_ObCallbackContext.WinlogonPid == 0) {
+                            InterlockedExchange64(
+                                (volatile LONG64*)&g_ObCallbackContext.WinlogonPid,
+                                (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId
+                            );
+                        }
+                    }
+                    else if (RtlEqualUnicodeString(&currentProcess->ImageName, &smssName, TRUE)) {
+                        InterlockedExchange64(
+                            (volatile LONG64*)&g_ObCallbackContext.SmsssPid,
+                            (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId
+                        );
+                    }
                 }
             }
-            else if (RtlEqualUnicodeString(&processInfo->ImageName, &servicesName, TRUE)) {
-                InterlockedExchange64(
-                    (volatile LONG64*)&g_ObCallbackContext.ServicesPid,
-                    (LONG64)(ULONG_PTR)processInfo->UniqueProcessId
-                );
-            }
-            else if (RtlEqualUnicodeString(&processInfo->ImageName, &winlogonName, TRUE)) {
-                if (g_ObCallbackContext.WinlogonPid == 0) {
-                    InterlockedExchange64(
-                        (volatile LONG64*)&g_ObCallbackContext.WinlogonPid,
-                        (LONG64)(ULONG_PTR)processInfo->UniqueProcessId
-                    );
-                }
-            }
-            else if (RtlEqualUnicodeString(&processInfo->ImageName, &smssName, TRUE)) {
-                InterlockedExchange64(
-                    (volatile LONG64*)&g_ObCallbackContext.SmsssPid,
-                    (LONG64)(ULONG_PTR)processInfo->UniqueProcessId
-                );
-            }
-        }
 
-        if (processInfo->NextEntryOffset == 0) {
-            break;
-        }
+            if (currentProcess->NextEntryOffset == 0) {
+                break;
+            }
 
-        processInfo = (PSYSTEM_PROCESS_INFORMATION)((PUCHAR)processInfo + processInfo->NextEntryOffset);
+            //
+            // Validate NextEntryOffset doesn't point backwards
+            //
+            if (currentProcess->NextEntryOffset < sizeof(OB_SYSTEM_PROCESS_INFORMATION)) {
+                break;
+            }
+
+            currentProcess = (POB_SYSTEM_PROCESS_INFORMATION)(
+                (PUCHAR)currentProcess + currentProcess->NextEntryOffset
+            );
+        } while (TRUE);
     }
 
     ShadowStrikeFreePoolWithTag(buffer, OB_POOL_TAG);
@@ -2031,8 +2186,9 @@ ObpValidateProcessPath(
 
         case PpCategoryAntimalware:
             //
-            // ShadowStrike processes - validate against known install path
-            // In production, this would check a registry-stored path
+            // ShadowStrike processes — validate against install directory.
+            // TODO(integration): Read install path from HKLM\...\ShadowStrike\InstallPath
+            // registry key once user-mode service populates it at startup.
             //
             {
                 UNICODE_STRING shadowStrikePath;
@@ -2089,13 +2245,16 @@ ObpCacheProcessName(
     _In_reads_(16) const CHAR* ImageFileName
     )
 {
+    LONG rawIndex;
     LONG index;
     POB_NAME_CACHE_ENTRY entry;
 
     //
     // Get next cache slot using atomic increment
+    // Use bitwise AND to avoid negative modulo after INT32 overflow
     //
-    index = InterlockedIncrement(&g_ObCallbackContext.NameCacheIndex) % OB_NAME_CACHE_SIZE;
+    rawIndex = InterlockedIncrement(&g_ObCallbackContext.NameCacheIndex);
+    index = (rawIndex & 0x7FFFFFFF) % OB_NAME_CACHE_SIZE;
     entry = &g_ObCallbackContext.NameCache[index];
 
     //

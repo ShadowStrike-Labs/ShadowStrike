@@ -74,6 +74,44 @@ extern "C" {
 #define OB_NAME_CACHE_SIZE                  64
 
 //
+// Corruption resilience bounds
+//
+#define OB_MAX_LIST_WALK                    4096
+#define OB_MAX_PROCESS_WALK                 65536
+#define OB_MAX_REFCOUNT_SPINS               100000
+
+//
+// Thread access rights (not exported in WDK kernel headers)
+//
+#ifndef THREAD_TERMINATE
+#define THREAD_TERMINATE                    0x0001
+#endif
+#ifndef THREAD_SUSPEND_RESUME
+#define THREAD_SUSPEND_RESUME               0x0002
+#endif
+#ifndef THREAD_GET_CONTEXT
+#define THREAD_GET_CONTEXT                  0x0008
+#endif
+#ifndef THREAD_SET_CONTEXT
+#define THREAD_SET_CONTEXT                  0x0010
+#endif
+#ifndef THREAD_SET_INFORMATION
+#define THREAD_SET_INFORMATION              0x0020
+#endif
+#ifndef THREAD_SET_THREAD_TOKEN
+#define THREAD_SET_THREAD_TOKEN             0x0080
+#endif
+#ifndef THREAD_IMPERSONATE
+#define THREAD_IMPERSONATE                  0x0100
+#endif
+#ifndef THREAD_DIRECT_IMPERSONATION
+#define THREAD_DIRECT_IMPERSONATION         0x0200
+#endif
+#ifndef THREAD_QUERY_LIMITED_INFORMATION
+#define THREAD_QUERY_LIMITED_INFORMATION    0x0800
+#endif
+
+//
 // Thread access masks for protection
 //
 #define OB_DANGEROUS_THREAD_ACCESS          \
