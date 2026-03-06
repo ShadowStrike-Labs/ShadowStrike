@@ -24,7 +24,7 @@
              malicious module identification.
 
     Architecture:
-    - PsSetLoadImageNotifyRoutineEx integration with driver blocking
+    - PsSetLoadImageNotifyRoutineEx integration for extended image info
     - PE header validation and anomaly detection with full bounds checking
     - Unsigned/untrusted module flagging
     - DLL side-loading detection
@@ -1935,30 +1935,23 @@ Arguments:
     }
 
     //
-    // Invoke pre-load callbacks (can block driver loads)
+    // Invoke pre-load callbacks for kernel images (driver loads)
+    //
+    // NOTE: PsSetLoadImageNotifyRoutine[Ex] callbacks are notification-only
+    // (VOID return, no ExtendedFlags). The IMAGE_INFO_EX structure provides
+    // only Size, ImageInfo, and FileObject — no blocking mechanism exists.
+    // Actual prevention of malicious image loads is handled by:
+    //   1. Minifilter PreCreate callback blocking file opens (AppControl)
+    //   2. ELAM for boot-start driver classification
+    //   3. User-space agent quarantine via FilterPort communication
+    // When blockLoad is TRUE, we continue with FULL analysis and reporting
+    // so the user-space agent receives complete forensic data for response.
     //
     if (g_ImgNotify.PreLoadCallbackCount > 0 && ProcessId == NULL) {
         ImgpNotifyPreLoadCallbacks(ProcessId, FullImageName, ImageInfo, &blockLoad);
 
         if (blockLoad) {
             InterlockedIncrement64(&g_ImgNotify.Stats.BlockedImages);
-
-            //
-            // For PsSetLoadImageNotifyRoutineEx, set block flag
-            //
-            if (g_ImgNotify.UseExtendedCallback && ImageInfo->ExtendedInfoPresent) {
-                PIMAGE_INFO_EX imageInfoEx = CONTAINING_RECORD(
-                    ImageInfo, IMAGE_INFO_EX, ImageInfo);
-
-                //
-                // Note: Actual blocking requires writing to ExtendedFlags
-                // This is only available in certain Windows versions
-                //
-                UNREFERENCED_PARAMETER(imageInfoEx);
-            }
-
-            ExReleaseRundownProtection(&g_ImgNotify.SubsystemRundown);
-            return;
         }
     }
 
@@ -1980,6 +1973,13 @@ Arguments:
     // Analyze image flags
     //
     event->Flags = ImgpAnalyzeImageFlags(ImageInfo, ProcessId);
+
+    //
+    // Mark as blocked if pre-load callback flagged this image
+    //
+    if (blockLoad) {
+        event->Flags |= ImgFlag_Blocked;
+    }
 
     //
     // Perform PE analysis if enabled
@@ -2099,11 +2099,12 @@ Arguments:
     AbdNotifyImageLoad(ProcessId, ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName);
 
     //
-    // Send notification to user mode if threshold met
+    // Send notification to user mode if threshold met or image was blocked
     //
     if (event->ThreatScore >= config.MinThreatScoreToReport ||
         event->SuspiciousReasons != ImgSuspicious_None ||
-        (ProcessId == NULL && config.MonitorKernelImages)) {
+        (ProcessId == NULL && config.MonitorKernelImages) ||
+        blockLoad) {
 
         ShadowStrikeSendImageNotification(
             ProcessId,
