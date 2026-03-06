@@ -106,6 +106,12 @@ static const UNICODE_STRING g_TrustedPaths[] = {
 #define AC_TRUSTED_PATH_COUNT \
     (sizeof(g_TrustedPaths) / sizeof(g_TrustedPaths[0]))
 
+static const UNICODE_STRING g_SystemRootPrefix =
+    RTL_CONSTANT_STRING(L"\\SystemRoot\\");
+
+static const UNICODE_STRING g_DevicePrefix =
+    RTL_CONSTANT_STRING(L"\\Device\\");
+
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
@@ -115,9 +121,10 @@ AcpHashBucketIndex(
     _In_ const UCHAR* Hash
     );
 
-static PAC_HASH_RULE
+static BOOLEAN
 AcpFindHashRule(
-    _In_ const UCHAR* Hash
+    _In_ const UCHAR* Hash,
+    _Out_ AC_RULE_TYPE* FoundRuleType
     );
 
 static AC_VERDICT
@@ -135,6 +142,19 @@ AcpEnterOperation(VOID);
 
 static VOID
 AcpLeaveOperation(VOID);
+
+// ============================================================================
+// SECTION ASSIGNMENTS
+// ============================================================================
+
+#pragma alloc_text(PAGE, AcInitialize)
+#pragma alloc_text(PAGE, AcShutdown)
+#pragma alloc_text(PAGE, AcCheckProcessExecution)
+#pragma alloc_text(PAGE, AcCheckImageLoad)
+#pragma alloc_text(PAGE, AcpHashBucketIndex)
+#pragma alloc_text(PAGE, AcpFindHashRule)
+#pragma alloc_text(PAGE, AcpCheckPathRules)
+#pragma alloc_text(PAGE, AcpIsTrustedPath)
 
 // ============================================================================
 // LIFECYCLE
@@ -221,12 +241,15 @@ AcShutdown(VOID)
     // Free hash rules
     //
     for (ULONG i = 0; i < AC_HASH_BUCKET_COUNT; i++) {
+        ULONG Freed = 0;
         FltAcquirePushLockExclusive(&g_AcState.HashBuckets[i].Lock);
-        while (!IsListEmpty(&g_AcState.HashBuckets[i].Head)) {
+        while (!IsListEmpty(&g_AcState.HashBuckets[i].Head) &&
+               Freed < AC_MAX_HASH_RULES) {
             ListEntry = RemoveHeadList(&g_AcState.HashBuckets[i].Head);
             PAC_HASH_RULE Rule = CONTAINING_RECORD(
                 ListEntry, AC_HASH_RULE, Link);
             ExFreeToNPagedLookasideList(&g_AcState.HashRuleLookaside, Rule);
+            Freed++;
         }
         FltReleasePushLock(&g_AcState.HashBuckets[i].Lock);
         FltDeletePushLock(&g_AcState.HashBuckets[i].Lock);
@@ -235,18 +258,26 @@ AcShutdown(VOID)
     //
     // Free path rules
     //
-    FltAcquirePushLockExclusive(&g_AcState.PathLock);
-    while (!IsListEmpty(&g_AcState.PathAllowList)) {
-        ListEntry = RemoveHeadList(&g_AcState.PathAllowList);
-        PAC_PATH_RULE Rule = CONTAINING_RECORD(
-            ListEntry, AC_PATH_RULE, Link);
-        ExFreeToNPagedLookasideList(&g_AcState.PathRuleLookaside, Rule);
-    }
-    while (!IsListEmpty(&g_AcState.PathBlockList)) {
-        ListEntry = RemoveHeadList(&g_AcState.PathBlockList);
-        PAC_PATH_RULE Rule = CONTAINING_RECORD(
-            ListEntry, AC_PATH_RULE, Link);
-        ExFreeToNPagedLookasideList(&g_AcState.PathRuleLookaside, Rule);
+    {
+        ULONG Freed = 0;
+        FltAcquirePushLockExclusive(&g_AcState.PathLock);
+        while (!IsListEmpty(&g_AcState.PathAllowList) &&
+               Freed < AC_MAX_PATH_RULES) {
+            ListEntry = RemoveHeadList(&g_AcState.PathAllowList);
+            PAC_PATH_RULE Rule = CONTAINING_RECORD(
+                ListEntry, AC_PATH_RULE, Link);
+            ExFreeToNPagedLookasideList(&g_AcState.PathRuleLookaside, Rule);
+            Freed++;
+        }
+        Freed = 0;
+        while (!IsListEmpty(&g_AcState.PathBlockList) &&
+               Freed < AC_MAX_PATH_RULES) {
+            ListEntry = RemoveHeadList(&g_AcState.PathBlockList);
+            PAC_PATH_RULE Rule = CONTAINING_RECORD(
+                ListEntry, AC_PATH_RULE, Link);
+            ExFreeToNPagedLookasideList(&g_AcState.PathRuleLookaside, Rule);
+            Freed++;
+        }
     }
     FltReleasePushLock(&g_AcState.PathLock);
     FltDeletePushLock(&g_AcState.PathLock);
@@ -257,9 +288,9 @@ AcShutdown(VOID)
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/AC] Shutdown complete. "
                "Checked=%lld, Blocked=%lld, Audited=%lld\n",
-               g_AcState.Stats.ExecutionsChecked,
-               g_AcState.Stats.ExecutionsBlocked,
-               g_AcState.Stats.ExecutionsAudited);
+               ReadNoFence64(&g_AcState.Stats.ExecutionsChecked),
+               ReadNoFence64(&g_AcState.Stats.ExecutionsBlocked),
+               ReadNoFence64(&g_AcState.Stats.ExecutionsAudited));
 }
 
 // ============================================================================
@@ -293,10 +324,10 @@ AcCheckProcessExecution(
     // Step 1: Hash-based lookup (most specific)
     //
     if (ImageHash != NULL) {
+        AC_RULE_TYPE HashRuleType;
         InterlockedIncrement64(&g_AcState.Stats.HashLookups);
-        PAC_HASH_RULE HashRule = AcpFindHashRule(ImageHash);
-        if (HashRule != NULL) {
-            if (HashRule->RuleType == AcRule_HashBlock) {
+        if (AcpFindHashRule(ImageHash, &HashRuleType)) {
+            if (HashRuleType == AcRule_HashBlock) {
                 Verdict = (Mode == AcMode_Enforce) ? AcVerdict_Block : AcVerdict_Audit;
             } else {
                 Verdict = AcVerdict_Allow;
@@ -418,7 +449,15 @@ AcGetStatistics(
     _Out_ PAC_STATISTICS Statistics
     )
 {
-    RtlCopyMemory(Statistics, &g_AcState.Stats, sizeof(AC_STATISTICS));
+    Statistics->ExecutionsChecked = ReadNoFence64(&g_AcState.Stats.ExecutionsChecked);
+    Statistics->ExecutionsAllowed = ReadNoFence64(&g_AcState.Stats.ExecutionsAllowed);
+    Statistics->ExecutionsBlocked = ReadNoFence64(&g_AcState.Stats.ExecutionsBlocked);
+    Statistics->ExecutionsAudited = ReadNoFence64(&g_AcState.Stats.ExecutionsAudited);
+    Statistics->ImagesChecked = ReadNoFence64(&g_AcState.Stats.ImagesChecked);
+    Statistics->ImagesBlocked = ReadNoFence64(&g_AcState.Stats.ImagesBlocked);
+    Statistics->RulesLearned = ReadNoFence64(&g_AcState.Stats.RulesLearned);
+    Statistics->HashLookups = ReadNoFence64(&g_AcState.Stats.HashLookups);
+    Statistics->PathLookups = ReadNoFence64(&g_AcState.Stats.PathLookups);
 }
 
 // ============================================================================
@@ -430,40 +469,49 @@ AcpHashBucketIndex(
     _In_ const UCHAR* Hash
     )
 {
+    PAGED_CODE();
+
     //
-    // Use first 4 bytes of SHA-256 as bucket index
+    // XOR-fold first 4 bytes of SHA-256 for uniform bucket distribution.
+    // Previous: (Hash[0]|(Hash[1]<<8)) % 256 always reduced to Hash[0].
     //
-    ULONG Index = (ULONG)Hash[0] |
-                  ((ULONG)Hash[1] << 8);
+    ULONG Index = (ULONG)(Hash[0] ^ Hash[1] ^ Hash[2] ^ Hash[3]);
     return Index % AC_HASH_BUCKET_COUNT;
 }
 
 
-static PAC_HASH_RULE
+static BOOLEAN
 AcpFindHashRule(
-    _In_ const UCHAR* Hash
+    _In_ const UCHAR* Hash,
+    _Out_ AC_RULE_TYPE* FoundRuleType
     )
 {
     ULONG Bucket = AcpHashBucketIndex(Hash);
     LIST_ENTRY *ListEntry;
+    ULONG WalkCount = 0;
+    BOOLEAN Found = FALSE;
+
+    PAGED_CODE();
 
     FltAcquirePushLockShared(&g_AcState.HashBuckets[Bucket].Lock);
 
     for (ListEntry = g_AcState.HashBuckets[Bucket].Head.Flink;
-         ListEntry != &g_AcState.HashBuckets[Bucket].Head;
-         ListEntry = ListEntry->Flink) {
+         ListEntry != &g_AcState.HashBuckets[Bucket].Head &&
+         WalkCount < AC_MAX_BUCKET_WALK;
+         ListEntry = ListEntry->Flink, WalkCount++) {
 
         PAC_HASH_RULE Rule = CONTAINING_RECORD(
             ListEntry, AC_HASH_RULE, Link);
 
         if (RtlCompareMemory(Rule->Hash, Hash, AC_HASH_SIZE) == AC_HASH_SIZE) {
-            FltReleasePushLock(&g_AcState.HashBuckets[Bucket].Lock);
-            return Rule;
+            *FoundRuleType = Rule->RuleType;
+            Found = TRUE;
+            break;
         }
     }
 
     FltReleasePushLock(&g_AcState.HashBuckets[Bucket].Lock);
-    return NULL;
+    return Found;
 }
 
 // ============================================================================
@@ -476,15 +524,21 @@ AcpCheckPathRules(
     )
 {
     LIST_ENTRY *ListEntry;
+    ULONG WalkCount;
+    AC_VERDICT Verdict = AcVerdict_Unknown;
+
+    PAGED_CODE();
 
     FltAcquirePushLockShared(&g_AcState.PathLock);
 
     //
     // Check blocklist first (higher priority)
     //
+    WalkCount = 0;
     for (ListEntry = g_AcState.PathBlockList.Flink;
-         ListEntry != &g_AcState.PathBlockList;
-         ListEntry = ListEntry->Flink) {
+         ListEntry != &g_AcState.PathBlockList &&
+         WalkCount < AC_MAX_PATH_WALK;
+         ListEntry = ListEntry->Flink, WalkCount++) {
 
         PAC_PATH_RULE Rule = CONTAINING_RECORD(
             ListEntry, AC_PATH_RULE, Link);
@@ -496,38 +550,42 @@ AcpCheckPathRules(
             Prefix.MaximumLength = Rule->PathPrefix.Length;
 
             if (RtlEqualUnicodeString(&Prefix, &Rule->PathPrefix, TRUE)) {
-                FltReleasePushLock(&g_AcState.PathLock);
                 AC_POLICY_MODE Mode = (AC_POLICY_MODE)g_AcState.PolicyMode;
-                return (Mode == AcMode_Enforce) ? AcVerdict_Block : AcVerdict_Audit;
+                Verdict = (Mode == AcMode_Enforce) ? AcVerdict_Block : AcVerdict_Audit;
+                break;
             }
         }
     }
 
     //
-    // Check allowlist
+    // Check allowlist (only if blocklist didn't match)
     //
-    for (ListEntry = g_AcState.PathAllowList.Flink;
-         ListEntry != &g_AcState.PathAllowList;
-         ListEntry = ListEntry->Flink) {
+    if (Verdict == AcVerdict_Unknown) {
+        WalkCount = 0;
+        for (ListEntry = g_AcState.PathAllowList.Flink;
+             ListEntry != &g_AcState.PathAllowList &&
+             WalkCount < AC_MAX_PATH_WALK;
+             ListEntry = ListEntry->Flink, WalkCount++) {
 
-        PAC_PATH_RULE Rule = CONTAINING_RECORD(
-            ListEntry, AC_PATH_RULE, Link);
+            PAC_PATH_RULE Rule = CONTAINING_RECORD(
+                ListEntry, AC_PATH_RULE, Link);
 
-        if (ImagePath->Length >= Rule->PathPrefix.Length) {
-            UNICODE_STRING Prefix;
-            Prefix.Buffer = ImagePath->Buffer;
-            Prefix.Length = Rule->PathPrefix.Length;
-            Prefix.MaximumLength = Rule->PathPrefix.Length;
+            if (ImagePath->Length >= Rule->PathPrefix.Length) {
+                UNICODE_STRING Prefix;
+                Prefix.Buffer = ImagePath->Buffer;
+                Prefix.Length = Rule->PathPrefix.Length;
+                Prefix.MaximumLength = Rule->PathPrefix.Length;
 
-            if (RtlEqualUnicodeString(&Prefix, &Rule->PathPrefix, TRUE)) {
-                FltReleasePushLock(&g_AcState.PathLock);
-                return AcVerdict_Allow;
+                if (RtlEqualUnicodeString(&Prefix, &Rule->PathPrefix, TRUE)) {
+                    Verdict = AcVerdict_Allow;
+                    break;
+                }
             }
         }
     }
 
     FltReleasePushLock(&g_AcState.PathLock);
-    return AcVerdict_Unknown;
+    return Verdict;
 }
 
 
@@ -536,27 +594,84 @@ AcpIsTrustedPath(
     _In_ PCUNICODE_STRING ImagePath
     )
 {
-    //
-    // Check if image path contains any trusted directory prefix
-    // (case-insensitive substring match after volume prefix)
-    //
-    for (ULONG i = 0; i < AC_TRUSTED_PATH_COUNT; i++) {
-        if (ImagePath->Length >= g_TrustedPaths[i].Length) {
-            //
-            // Search for trusted path as substring
-            //
-            USHORT PathLen = ImagePath->Length / sizeof(WCHAR);
-            USHORT TrustLen = g_TrustedPaths[i].Length / sizeof(WCHAR);
+    USHORT LenChars;
+    USHORT RootOffset = MAXUSHORT;
+    USHORT RemainingBytes;
 
-            for (USHORT j = 0; j <= PathLen - TrustLen; j++) {
-                UNICODE_STRING Sub;
-                Sub.Buffer = &ImagePath->Buffer[j];
-                Sub.Length = g_TrustedPaths[i].Length;
-                Sub.MaximumLength = g_TrustedPaths[i].Length;
+    PAGED_CODE();
 
-                if (RtlEqualUnicodeString(&Sub, &g_TrustedPaths[i], TRUE)) {
-                    return TRUE;
+    if (ImagePath == NULL || ImagePath->Buffer == NULL ||
+        ImagePath->Length < 8) {
+        return FALSE;
+    }
+
+    LenChars = ImagePath->Length / sizeof(WCHAR);
+
+    //
+    // \SystemRoot\ paths are inherently trusted (always maps to %SystemRoot%)
+    //
+    if (ImagePath->Length >= g_SystemRootPrefix.Length) {
+        UNICODE_STRING Sub;
+        Sub.Buffer = ImagePath->Buffer;
+        Sub.Length = g_SystemRootPrefix.Length;
+        Sub.MaximumLength = g_SystemRootPrefix.Length;
+        if (RtlEqualUnicodeString(&Sub, &g_SystemRootPrefix, TRUE)) {
+            return TRUE;
+        }
+    }
+
+    //
+    // \??\X:\ — DOS device path, root starts after drive letter colon
+    //
+    if (LenChars > 6 &&
+        ImagePath->Buffer[0] == L'\\' &&
+        ImagePath->Buffer[1] == L'?' &&
+        ImagePath->Buffer[2] == L'?' &&
+        ImagePath->Buffer[3] == L'\\' &&
+        ImagePath->Buffer[5] == L':' &&
+        ImagePath->Buffer[6] == L'\\') {
+        RootOffset = 6;
+    }
+
+    //
+    // \Device\<name>\ — NT device path, find backslash after device name.
+    // Cap scan at 80 chars to prevent runaway on malformed paths.
+    //
+    if (RootOffset == MAXUSHORT && LenChars > 9) {
+        if (ImagePath->Length >= g_DevicePrefix.Length) {
+            UNICODE_STRING Sub;
+            Sub.Buffer = ImagePath->Buffer;
+            Sub.Length = g_DevicePrefix.Length;
+            Sub.MaximumLength = g_DevicePrefix.Length;
+            if (RtlEqualUnicodeString(&Sub, &g_DevicePrefix, TRUE)) {
+                USHORT ScanLimit = (LenChars < 80) ? LenChars : 80;
+                for (USHORT i = 8; i < ScanLimit; i++) {
+                    if (ImagePath->Buffer[i] == L'\\') {
+                        RootOffset = i;
+                        break;
+                    }
                 }
+            }
+        }
+    }
+
+    if (RootOffset == MAXUSHORT || RootOffset >= LenChars) {
+        return FALSE;
+    }
+
+    //
+    // Check if the root-relative portion starts with a trusted directory
+    //
+    RemainingBytes = (USHORT)((LenChars - RootOffset) * sizeof(WCHAR));
+    for (ULONG i = 0; i < AC_TRUSTED_PATH_COUNT; i++) {
+        if (RemainingBytes >= g_TrustedPaths[i].Length) {
+            UNICODE_STRING Sub;
+            Sub.Buffer = &ImagePath->Buffer[RootOffset];
+            Sub.Length = g_TrustedPaths[i].Length;
+            Sub.MaximumLength = g_TrustedPaths[i].Length;
+
+            if (RtlEqualUnicodeString(&Sub, &g_TrustedPaths[i], TRUE)) {
+                return TRUE;
             }
         }
     }

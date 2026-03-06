@@ -50,7 +50,7 @@ MITRE ATT&CK Coverage:
 
 #pragma once
 
-#include <ntddk.h>
+#include <ntifs.h>
 
 // ============================================================================
 // POOL TAGS
@@ -71,6 +71,8 @@ MITRE ATT&CK Coverage:
 #define AC_MAX_PATH_LENGTH          520
 #define AC_MAX_SIGNER_NAME          256
 #define AC_HASH_BUCKET_COUNT        256
+#define AC_MAX_BUCKET_WALK          128
+#define AC_MAX_PATH_WALK            64
 
 // ============================================================================
 // POLICY MODE
