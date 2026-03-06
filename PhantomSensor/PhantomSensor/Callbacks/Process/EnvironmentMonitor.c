@@ -64,6 +64,61 @@
 #include <ntstrsafe.h>
 
 // ============================================================================
+// KERNEL-MODE TYPE DEFINITIONS
+// ============================================================================
+
+//
+// MAX_PATH is a Win32 constant not available in kernel mode
+//
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
+
+//
+// Forward declarations for undocumented-but-exported ntoskrnl functions
+//
+extern PPEB NTAPI PsGetProcessPeb(_In_ PEPROCESS Process);
+
+//
+// Minimal PEB layout for environment block access (x64)
+// Only defines up to ProcessParameters at offset 0x20
+//
+typedef struct _EM_PEB {
+    BOOLEAN         InheritedAddressSpace;      // 0x00
+    BOOLEAN         ReadImageFileExecOptions;   // 0x01
+    BOOLEAN         BeingDebugged;              // 0x02
+    BOOLEAN         BitField;                   // 0x03
+    UCHAR           Padding0[4];                // 0x04 (x64 alignment)
+    PVOID           Mutant;                     // 0x08
+    PVOID           ImageBaseAddress;            // 0x10
+    PVOID           Ldr;                         // 0x18
+    PVOID           ProcessParameters;           // 0x20
+} EM_PEB, *PEM_PEB;
+
+//
+// Minimal RTL_USER_PROCESS_PARAMETERS for environment access (x64)
+// Defines up to Environment pointer at offset 0x80
+//
+typedef struct _EM_PROCESS_PARAMETERS {
+    ULONG           MaximumLength;               // 0x00
+    ULONG           Length;                      // 0x04
+    ULONG           Flags;                       // 0x08
+    ULONG           DebugFlags;                  // 0x0C
+    HANDLE          ConsoleHandle;               // 0x10
+    ULONG           ConsoleFlags;                // 0x18
+    ULONG           Padding0;                    // 0x1C (alignment)
+    HANDLE          StandardInput;               // 0x20
+    HANDLE          StandardOutput;              // 0x28
+    HANDLE          StandardError;               // 0x30
+    UNICODE_STRING  CurrentDirectoryPath;        // 0x38
+    HANDLE          CurrentDirectoryHandle;      // 0x48
+    UNICODE_STRING  DllPath;                     // 0x50
+    UNICODE_STRING  ImagePathName;               // 0x60
+    UNICODE_STRING  CommandLine;                 // 0x70
+    PVOID           Environment;                 // 0x80
+} EM_PROCESS_PARAMETERS, *PEM_PROCESS_PARAMETERS;
+
+// ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
 
@@ -362,7 +417,7 @@ EmpFindCachedEnvironmentLocked(
 // ============================================================================
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, EmInitialize)
+#pragma alloc_text(PAGE, EmInitialize)
 #pragma alloc_text(PAGE, EmShutdown)
 #pragma alloc_text(PAGE, EmCaptureEnvironment)
 #pragma alloc_text(PAGE, EmAnalyzeEnvironment)
@@ -381,7 +436,6 @@ EmInitialize(
     _Out_ PEM_MONITOR* Monitor
 )
 {
-    NTSTATUS status = STATUS_SUCCESS;
     PEM_MONITOR monitor = NULL;
 
     PAGED_CODE();
@@ -739,17 +793,25 @@ EmCaptureEnvironment(
             PEM_PROCESS_ENV oldEnv = CONTAINING_RECORD(
                 oldEntry, EM_PROCESS_ENV, CacheListEntry
             );
+            InitializeListHead(&oldEnv->CacheListEntry);
             oldEnv->IsLinkedToCache = FALSE;
             InterlockedDecrement(&Monitor->CacheCount);
 
             //
-            // Schedule for deferred cleanup if references exist
+            // Release cache reference. If no external references remain
+            // (refcount reaches 0), free the entry after releasing the lock.
             //
             if (EmpReleaseEnvReference(oldEnv) == 0) {
                 //
-                // No references - safe to free now
-                // But we hold the lock, so just mark for cleanup
+                // Release lock, free entry, re-acquire lock
                 //
+                ExReleasePushLockExclusive(&Monitor->CacheLock);
+                KeLeaveCriticalRegion();
+
+                EmpFreeProcessEnvInternal(Monitor, oldEnv);
+
+                KeEnterCriticalRegion();
+                ExAcquirePushLockExclusive(&Monitor->CacheLock);
             }
         }
     }
@@ -782,7 +844,7 @@ NTSTATUS
 EmAnalyzeEnvironment(
     _In_ PEM_MONITOR Monitor,
     _In_ PEM_PROCESS_ENV Env,
-    _Out_ PEM_SUSPICION* Flags
+    _Out_ PEM_SUSPICION Flags
 )
 {
     NTSTATUS status = STATUS_SUCCESS;
@@ -1270,7 +1332,7 @@ EmpCaptureEnvironmentBlockSafe(
     // Get process create time for epoch validation
     // This is safe to access without attachment
     //
-    *ProcessCreateTime = PsGetProcessCreateTimeQuadPart(process);
+    ProcessCreateTime->QuadPart = PsGetProcessCreateTimeQuadPart(process);
 
     //
     // Check if process is terminating
@@ -1284,13 +1346,13 @@ EmpCaptureEnvironmentBlockSafe(
         //
         // Attach to target process address space
         //
-        KeStackAttachProcess(process, &apcState);
+        KeStackAttachProcess((PRKPROCESS)process, &apcState);
         attached = TRUE;
 
         //
         // Get PEB - this is kernel memory, safe to access
         //
-        PPEB peb = PsGetProcessPeb(process);
+        PEM_PEB peb = (PEM_PEB)PsGetProcessPeb(process);
         if (peb == NULL) {
             status = STATUS_UNSUCCESSFUL;
             __leave;
@@ -1300,7 +1362,7 @@ EmpCaptureEnvironmentBlockSafe(
         // All user-mode access in single __try block with atomic capture
         //
         __try {
-            PRTL_USER_PROCESS_PARAMETERS processParams;
+            PEM_PROCESS_PARAMETERS processParams;
 
             //
             // Validate PEB is in user address range
@@ -1311,15 +1373,13 @@ EmpCaptureEnvironmentBlockSafe(
             }
 
             //
-            // Probe and capture ProcessParameters pointer atomically
+            // Probe PEB and capture ProcessParameters with single volatile read
+            // to minimize TOCTOU window (ICEP reads the target 3x, volatile is 1x)
             //
-            ProbeForRead(peb, sizeof(PEB), sizeof(ULONG));
-            processParams = (PRTL_USER_PROCESS_PARAMETERS)
-                InterlockedCompareExchangePointer(
-                    (PVOID*)&peb->ProcessParameters,
-                    peb->ProcessParameters,
-                    peb->ProcessParameters
-                );
+            ProbeForRead(peb, sizeof(EM_PEB), sizeof(ULONG_PTR));
+            processParams = (PEM_PROCESS_PARAMETERS)(
+                *(volatile PVOID*)&peb->ProcessParameters
+            );
 
             if (processParams == NULL) {
                 status = STATUS_UNSUCCESSFUL;
@@ -1339,15 +1399,22 @@ EmpCaptureEnvironmentBlockSafe(
             //
             ProbeForRead(
                 processParams,
-                sizeof(RTL_USER_PROCESS_PARAMETERS),
+                sizeof(EM_PROCESS_PARAMETERS),
                 sizeof(ULONG)
             );
 
             //
-            // Capture both values in single atomic snapshot
+            // Capture environment pointer from process parameters
             //
             envBlockAddress = processParams->Environment;
-            envBlockSize = processParams->EnvironmentSize;
+
+            //
+            // EnvironmentSize is at a high offset (0x3F0) and varies across
+            // Windows versions. We use a safe default cap instead — always
+            // limit to EM_MAX_ENV_BLOCK_SIZE (64KB) and scan for the
+            // double-null terminator during parsing.
+            //
+            envBlockSize = EM_MAX_ENV_BLOCK_SIZE;
 
             //
             // Validate captured values
@@ -1363,31 +1430,24 @@ EmpCaptureEnvironmentBlockSafe(
             }
 
             //
-            // Bound the size to prevent DoS
-            //
-            if (envBlockSize == 0) {
-                //
-                // Fallback: scan for size if EnvironmentSize is 0
-                // Limit scan to prevent DoS
-                //
-                envBlockSize = EM_MAX_ENV_BLOCK_SIZE;
-            }
-
-            if (envBlockSize > EM_MAX_ENV_BLOCK_SIZE) {
-                envBlockSize = EM_MAX_ENV_BLOCK_SIZE;
-            }
-
-            //
             // Validate entire range is in user address space
+            // Note: envBlockSize is our max cap (64KB); actual block may be smaller
             //
             if ((ULONG_PTR)envBlockAddress + envBlockSize < (ULONG_PTR)envBlockAddress ||
                 (ULONG_PTR)envBlockAddress + envBlockSize > MmUserProbeAddress) {
-                status = STATUS_ACCESS_VIOLATION;
-                __leave;
+                //
+                // Clamp to what fits in user space rather than failing outright
+                //
+                if ((ULONG_PTR)envBlockAddress < MmUserProbeAddress) {
+                    envBlockSize = MmUserProbeAddress - (ULONG_PTR)envBlockAddress;
+                } else {
+                    status = STATUS_ACCESS_VIOLATION;
+                    __leave;
+                }
             }
 
             //
-            // Allocate kernel buffer
+            // Allocate kernel buffer for captured environment
             //
             capturedBlock = ShadowStrikeAllocatePoolWithTag(
                 NonPagedPoolNx,
@@ -1401,14 +1461,73 @@ EmpCaptureEnvironmentBlockSafe(
             }
 
             //
-            // Probe and copy in single operation
-            // This minimizes TOCTOU window
+            // Copy environment block WCHAR-by-WCHAR scanning for the
+            // double-null terminator (L"\0\0") that marks the end.
+            // This avoids faulting on uncommitted pages beyond the actual
+            // environment block, since we don't know the exact size
+            // (EnvironmentSize is at offset 0x3F0, unreliable across versions).
             //
-            ProbeForRead(envBlockAddress, envBlockSize, sizeof(WCHAR));
-            RtlCopyMemory(capturedBlock, envBlockAddress, envBlockSize);
+            {
+                volatile WCHAR* src = (volatile WCHAR*)envBlockAddress;
+                WCHAR* dst = (WCHAR*)capturedBlock;
+                SIZE_T maxWchars = envBlockSize / sizeof(WCHAR);
+                SIZE_T copied = 0;
+                BOOLEAN prevNull = FALSE;
 
-            capturedSize = envBlockSize;
-            status = STATUS_SUCCESS;
+                __try {
+                    while (copied < maxWchars) {
+                        WCHAR ch = *src;
+                        *dst = ch;
+
+                        if (ch == L'\0') {
+                            copied++;
+                            if (prevNull) {
+                                //
+                                // Found double-null terminator — end of environment block
+                                //
+                                break;
+                            }
+                            prevNull = TRUE;
+                        } else {
+                            prevNull = FALSE;
+                            copied++;
+                        }
+
+                        src++;
+                        dst++;
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    //
+                    // Partial capture — use what we copied so far.
+                    // This handles the case where pages beyond the actual
+                    // environment block are uncommitted.
+                    //
+                }
+
+                capturedSize = copied * sizeof(WCHAR);
+
+                if (capturedSize < sizeof(WCHAR) * 2) {
+                    //
+                    // Too little data captured to be useful
+                    //
+                    status = STATUS_UNSUCCESSFUL;
+                    __leave;
+                }
+
+                //
+                // Ensure the buffer is double-null terminated for safe parsing
+                //
+                dst = (WCHAR*)capturedBlock;
+                SIZE_T dstWchars = capturedSize / sizeof(WCHAR);
+                if (dstWchars >= 2) {
+                    dst[dstWchars - 1] = L'\0';
+                    if (dst[dstWchars - 2] != L'\0') {
+                        dst[dstWchars - 1] = L'\0';
+                    }
+                }
+
+                status = STATUS_SUCCESS;
+            }
 
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             status = GetExceptionCode();

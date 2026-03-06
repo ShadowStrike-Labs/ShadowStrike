@@ -34,6 +34,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 
 //
@@ -70,7 +71,7 @@ typedef enum _EM_SUSPICION {
     EmSuspicion_TempOverride        = 0x00000008,
     EmSuspicion_HiddenVariable      = 0x00000010,
     EmSuspicion_EncodedValue        = 0x00000020,
-} EM_SUSPICION;
+} EM_SUSPICION, *PEM_SUSPICION;
 
 //
 // Allocation source tracking to prevent allocator mismatch
@@ -250,7 +251,7 @@ NTSTATUS
 EmAnalyzeEnvironment(
     _In_ PEM_MONITOR Monitor,
     _In_ PEM_PROCESS_ENV Env,
-    _Out_ PEM_SUSPICION* Flags
+    _Out_ PEM_SUSPICION Flags
 );
 
 _IRQL_requires_(PASSIVE_LEVEL)
