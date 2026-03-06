@@ -63,6 +63,7 @@
 #define REG_MAX_PATH_ALLOCATION         (SHADOWSTRIKE_MAX_REG_PATH_LENGTH * sizeof(WCHAR))
 #define REG_NOTIFICATION_RATE_LIMIT     100     // Max notifications per second
 #define REG_NOTIFICATION_WINDOW_MS      1000    // Rate limit window
+#define REG_MAX_BUCKET_WALK             256     // Safety cap on hash bucket iteration
 
 // ============================================================================
 // INTERNAL STRUCTURES
@@ -210,8 +211,8 @@ RegpNotifyClassToOperation(
 #pragma alloc_text(PAGE, ShadowStrikeGetRegistryProcessContext)
 #pragma alloc_text(PAGE, ShadowStrikeRegistryProcessTerminated)
 #pragma alloc_text(PAGE, ShadowStrikeUpdateRegistryConfig)
-#pragma alloc_text(PAGE, ShadowStrikeAddProtectedRegistryKey)
-#pragma alloc_text(PAGE, ShadowStrikeRemoveProtectedRegistryKey)
+#pragma alloc_text(PAGE, ShadowStrikeRegAddMonitoredKey)
+#pragma alloc_text(PAGE, ShadowStrikeRegRemoveMonitoredKey)
 #endif
 
 // ============================================================================
@@ -265,6 +266,9 @@ RegpHashProcessId(
 /**
  * @brief Check if notification should be rate-limited.
  *
+ * Uses lock-free atomics for the hot path. Only resets the window
+ * using a CAS to avoid exclusive locking.
+ *
  * @return TRUE if notification should proceed, FALSE if rate-limited.
  */
 static BOOLEAN
@@ -273,34 +277,33 @@ RegpCheckRateLimit(
     )
 {
     LARGE_INTEGER currentTime;
-    LARGE_INTEGER elapsed;
+    LONG64 windowStart;
+    LONG64 elapsed;
     LONG64 count;
 
     KeQuerySystemTime(&currentTime);
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_RegistryMonitor.RateLimitLock);
+    windowStart = ReadNoFence64((volatile LONG64*)&g_RegistryMonitor.NotificationWindowStart.QuadPart);
+    elapsed = currentTime.QuadPart - windowStart;
 
-    //
-    // Check if we're in a new window
-    //
-    elapsed.QuadPart = currentTime.QuadPart - g_RegistryMonitor.NotificationWindowStart.QuadPart;
-
-    if (elapsed.QuadPart > (REG_NOTIFICATION_WINDOW_MS * 10000LL)) {
+    if (elapsed > (REG_NOTIFICATION_WINDOW_MS * 10000LL)) {
         //
-        // New window - reset counter
+        // New window — try to reset atomically.
+        // Only one thread wins the CAS; losers fall through and count normally.
         //
-        g_RegistryMonitor.NotificationWindowStart = currentTime;
-        g_RegistryMonitor.NotificationCount = 1;
-        ExReleasePushLockExclusive(&g_RegistryMonitor.RateLimitLock);
-        KeLeaveCriticalRegion();
-        return TRUE;
+        if (InterlockedCompareExchange64(
+                (volatile LONG64*)&g_RegistryMonitor.NotificationWindowStart.QuadPart,
+                currentTime.QuadPart,
+                windowStart) == windowStart) {
+            //
+            // We won the reset — zero the counter and count ourselves as 1
+            //
+            InterlockedExchange64(&g_RegistryMonitor.NotificationCount, 1);
+            return TRUE;
+        }
     }
 
     count = InterlockedIncrement64(&g_RegistryMonitor.NotificationCount);
-
-    ExReleasePushLockExclusive(&g_RegistryMonitor.RateLimitLock);
-    KeLeaveCriticalRegion();
 
     if (count > g_RegistryMonitor.Config.NotificationRateLimitPerSec) {
         InterlockedIncrement64(&g_RegistryMonitor.Statistics.NotificationsDropped);
@@ -1031,11 +1034,9 @@ ShadowStrikeDetectDefenseEvasionRegistry(
     UNICODE_STRING testPath;
     UNICODE_STRING disableValue;
     ULONG threatIndicators = RegThreatNone;
+    ULONG dwordValue;
 
     PAGED_CODE();
-
-    UNREFERENCED_PARAMETER(Data);
-    UNREFERENCED_PARAMETER(DataSize);
 
     if (KeyPath == NULL || KeyPath->Buffer == NULL) {
         return RegThreatNone;
@@ -1046,21 +1047,96 @@ ShadowStrikeDetectDefenseEvasionRegistry(
     //
     RtlInitUnicodeString(&testPath, SHADOWSTRIKE_REG_WINDOWS_DEFENDER);
     if (RtlPrefixUnicodeString(&testPath, KeyPath, TRUE)) {
-        threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
 
         if (ValueName != NULL) {
             RtlInitUnicodeString(&disableValue, L"DisableAntiSpyware");
             if (RtlEqualUnicodeString(ValueName, &disableValue, TRUE)) {
-                threatIndicators |= RegThreatDefenseEvasion;
+                //
+                // Only flag as evasion if the value is being SET to non-zero (disabling protection).
+                // Setting to 0 means re-enabling protection — that is benign.
+                //
+                if (Data != NULL && DataSize >= sizeof(ULONG)) {
+                    __try {
+                        dwordValue = *(volatile ULONG*)Data;
+                        if (dwordValue != 0) {
+                            threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                    }
+                } else {
+                    threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                }
             }
 
             RtlInitUnicodeString(&disableValue, L"DisableRealtimeMonitoring");
             if (RtlEqualUnicodeString(ValueName, &disableValue, TRUE)) {
-                threatIndicators |= RegThreatDefenseEvasion;
+                if (Data != NULL && DataSize >= sizeof(ULONG)) {
+                    __try {
+                        dwordValue = *(volatile ULONG*)Data;
+                        if (dwordValue != 0) {
+                            threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                    }
+                } else {
+                    threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                }
+            }
+
+            RtlInitUnicodeString(&disableValue, L"DisableBehaviorMonitoring");
+            if (RtlEqualUnicodeString(ValueName, &disableValue, TRUE)) {
+                if (Data != NULL && DataSize >= sizeof(ULONG)) {
+                    __try {
+                        dwordValue = *(volatile ULONG*)Data;
+                        if (dwordValue != 0) {
+                            threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                    }
+                } else {
+                    threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                }
+            }
+
+            RtlInitUnicodeString(&disableValue, L"DisableIOAVProtection");
+            if (RtlEqualUnicodeString(ValueName, &disableValue, TRUE)) {
+                if (Data != NULL && DataSize >= sizeof(ULONG)) {
+                    __try {
+                        dwordValue = *(volatile ULONG*)Data;
+                        if (dwordValue != 0) {
+                            threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                    }
+                } else {
+                    threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                }
+            }
+
+            RtlInitUnicodeString(&disableValue, L"DisableScriptScanning");
+            if (RtlEqualUnicodeString(ValueName, &disableValue, TRUE)) {
+                if (Data != NULL && DataSize >= sizeof(ULONG)) {
+                    __try {
+                        dwordValue = *(volatile ULONG*)Data;
+                        if (dwordValue != 0) {
+                            threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                    }
+                } else {
+                    threatIndicators |= RegThreatDefenseEvasion | RegThreatTampering;
+                }
             }
         }
 
-        InterlockedIncrement64(&g_RegistryMonitor.Statistics.DefenseEvasionDetections);
+        if (threatIndicators != RegThreatNone) {
+            InterlockedIncrement64(&g_RegistryMonitor.Statistics.DefenseEvasionDetections);
+        }
     }
 
     //
@@ -1324,6 +1400,7 @@ ShadowStrikeRegistryCallbackRoutine(
     BOOLEAN blockOperation = FALSE;
     PVOID keyObject = NULL;
     ULONG keyFlags;
+    PUNICODE_STRING createCompleteName = NULL;
 
     PAGED_CODE();
 
@@ -1407,6 +1484,7 @@ ShadowStrikeRegistryCallbackRoutine(
         case RegNtPreCreateKeyEx: {
             PREG_CREATE_KEY_INFORMATION info = (PREG_CREATE_KEY_INFORMATION)Argument2;
             keyObject = info->RootObject;
+            createCompleteName = info->CompleteName;
             break;
         }
         case RegNtPreSetKeySecurity: {
@@ -1433,6 +1511,47 @@ ShadowStrikeRegistryCallbackRoutine(
         InterlockedIncrement64(&g_RegistryMonitor.Statistics.PathResolutionErrors);
         return STATUS_SUCCESS;
     }
+
+    //
+    // For CreateKeyEx: build full path = RootObject path + "\" + CompleteName
+    // This ensures we classify the actual key being created, not just the parent.
+    //
+    if (notifyClass == RegNtPreCreateKeyEx &&
+        createCompleteName != NULL &&
+        createCompleteName->Buffer != NULL &&
+        createCompleteName->Length > 0) {
+
+        USHORT separatorLen = sizeof(WCHAR);
+        USHORT totalLen = keyPath.Length + separatorLen + createCompleteName->Length;
+        PWCH fullBuffer;
+
+        if (totalLen < keyPath.Length || totalLen > REG_MAX_PATH_ALLOCATION) {
+            goto SkipCreatePathBuild;
+        }
+
+        fullBuffer = (PWCH)ExAllocatePoolZero(
+            PagedPool,
+            (SIZE_T)totalLen + sizeof(WCHAR),
+            REG_PATH_TAG
+        );
+
+        if (fullBuffer != NULL) {
+            RtlCopyMemory(fullBuffer, keyPath.Buffer, keyPath.Length);
+            fullBuffer[keyPath.Length / sizeof(WCHAR)] = L'\\';
+            RtlCopyMemory(
+                (PUCHAR)fullBuffer + keyPath.Length + separatorLen,
+                createCompleteName->Buffer,
+                createCompleteName->Length
+            );
+            fullBuffer[totalLen / sizeof(WCHAR)] = L'\0';
+
+            ExFreePoolWithTag(keyPath.Buffer, REG_PATH_TAG);
+            keyPath.Buffer = fullBuffer;
+            keyPath.Length = totalLen;
+            keyPath.MaximumLength = totalLen + sizeof(WCHAR);
+        }
+    }
+SkipCreatePathBuild:
 
     //
     // UNCONDITIONAL: Self-protection check (not configurable for security)
@@ -1552,17 +1671,21 @@ ShadowStrikeGetRegistryProcessContext(
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_RegistryMonitor.ProcessHashLock);
 
-    for (listEntry = g_RegistryMonitor.ProcessHashBuckets[bucket].Flink;
-         listEntry != &g_RegistryMonitor.ProcessHashBuckets[bucket];
-         listEntry = listEntry->Flink) {
+    {
+        ULONG walkCount = 0;
+        for (listEntry = g_RegistryMonitor.ProcessHashBuckets[bucket].Flink;
+             listEntry != &g_RegistryMonitor.ProcessHashBuckets[bucket] &&
+             walkCount < REG_MAX_BUCKET_WALK;
+             listEntry = listEntry->Flink, walkCount++) {
 
-        context = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_REG_PROCESS_CONTEXT, HashEntry);
+            context = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_REG_PROCESS_CONTEXT, HashEntry);
 
-        if (context->ProcessId == ProcessId) {
-            InterlockedIncrement(&context->RefCount);
-            ExReleasePushLockShared(&g_RegistryMonitor.ProcessHashLock);
-            KeLeaveCriticalRegion();
-            return context;
+            if (context->ProcessId == ProcessId) {
+                InterlockedIncrement(&context->RefCount);
+                ExReleasePushLockShared(&g_RegistryMonitor.ProcessHashLock);
+                KeLeaveCriticalRegion();
+                return context;
+            }
         }
     }
 
@@ -1608,27 +1731,31 @@ ShadowStrikeGetRegistryProcessContext(
     //
     // Double-check no one else added it while we were allocating
     //
-    for (listEntry = g_RegistryMonitor.ProcessHashBuckets[bucket].Flink;
-         listEntry != &g_RegistryMonitor.ProcessHashBuckets[bucket];
-         listEntry = listEntry->Flink) {
+    {
+        ULONG walkCount = 0;
+        for (listEntry = g_RegistryMonitor.ProcessHashBuckets[bucket].Flink;
+             listEntry != &g_RegistryMonitor.ProcessHashBuckets[bucket] &&
+             walkCount < REG_MAX_BUCKET_WALK;
+             listEntry = listEntry->Flink, walkCount++) {
 
-        context = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_REG_PROCESS_CONTEXT, HashEntry);
+            context = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_REG_PROCESS_CONTEXT, HashEntry);
 
-        if (context->ProcessId == ProcessId) {
-            //
-            // Someone else added it - use theirs
-            //
-            InterlockedIncrement(&context->RefCount);
-            ExReleasePushLockExclusive(&g_RegistryMonitor.ProcessHashLock);
-            KeLeaveCriticalRegion();
+            if (context->ProcessId == ProcessId) {
+                //
+                // Someone else added it - use theirs
+                //
+                InterlockedIncrement(&context->RefCount);
+                ExReleasePushLockExclusive(&g_RegistryMonitor.ProcessHashLock);
+                KeLeaveCriticalRegion();
 
-            //
-            // Free our allocation
-            //
-            ObDereferenceObject(newContext->Process);
-            ExFreePoolWithTag(newContext, REG_PROCCTX_TAG);
+                //
+                // Free our allocation
+                //
+                ObDereferenceObject(newContext->Process);
+                ExFreePoolWithTag(newContext, REG_PROCCTX_TAG);
 
-            return context;
+                return context;
+            }
         }
     }
 
@@ -1658,11 +1785,17 @@ ShadowStrikeReleaseRegistryProcessContext(
 
     refCount = InterlockedDecrement(&Context->RefCount);
 
-    //
-    // Note: We don't free on refcount=0 here because the hash table
-    // holds a reference. Cleanup happens in ProcessTerminated or module cleanup.
-    //
-    UNREFERENCED_PARAMETER(refCount);
+    if (refCount == 0) {
+        //
+        // Last reference released. This happens when ProcessTerminated already
+        // removed the entry from the hash table (dropping its ref from 2→1)
+        // and now the last caller releases (1→0). Safe to free.
+        //
+        if (Context->Process != NULL) {
+            ObDereferenceObject(Context->Process);
+        }
+        ExFreePoolWithTag(Context, REG_PROCCTX_TAG);
+    }
 }
 
 _Use_decl_annotations_
@@ -1683,17 +1816,21 @@ ShadowStrikeRegistryProcessTerminated(
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_RegistryMonitor.ProcessHashLock);
 
-    for (listEntry = g_RegistryMonitor.ProcessHashBuckets[bucket].Flink;
-         listEntry != &g_RegistryMonitor.ProcessHashBuckets[bucket];
-         listEntry = listEntry->Flink) {
+    {
+        ULONG walkCount = 0;
+        for (listEntry = g_RegistryMonitor.ProcessHashBuckets[bucket].Flink;
+             listEntry != &g_RegistryMonitor.ProcessHashBuckets[bucket] &&
+             walkCount < REG_MAX_BUCKET_WALK;
+             listEntry = listEntry->Flink, walkCount++) {
 
-        context = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_REG_PROCESS_CONTEXT, HashEntry);
+            context = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_REG_PROCESS_CONTEXT, HashEntry);
 
-        if (context->ProcessId == ProcessId) {
-            RemoveEntryList(&context->HashEntry);
-            InterlockedDecrement(&g_RegistryMonitor.ProcessContextCount);
-            found = TRUE;
-            break;
+            if (context->ProcessId == ProcessId) {
+                RemoveEntryList(&context->HashEntry);
+                InterlockedDecrement(&g_RegistryMonitor.ProcessContextCount);
+                found = TRUE;
+                break;
+            }
         }
     }
 
@@ -1784,17 +1921,18 @@ ShadowStrikeGetRegistryConfig(
 }
 
 // ============================================================================
-// PROTECTED KEY MANAGEMENT
+// MONITORED KEY MANAGEMENT (Registry-module-specific hash-table tracking)
 // ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
-ShadowStrikeAddProtectedRegistryKey(
+ShadowStrikeRegAddMonitoredKey(
     _In_ PCUNICODE_STRING KeyPath,
     _In_ ULONG Flags
     )
 {
     ULONG bucket;
+    ULONG walkCount;
     PREG_PROTECTED_KEY_ENTRY entry;
     PLIST_ENTRY listEntry;
     PREG_PROTECTED_KEY_ENTRY existingEntry;
@@ -1815,22 +1953,18 @@ ShadowStrikeAddProtectedRegistryKey(
 
     bucket = RegpHashString(KeyPath) % REG_PROTECTED_KEY_HASH_BUCKETS;
 
-    //
-    // Check for existing entry
-    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_RegistryMonitor.ProtectedKeyLock);
 
+    walkCount = 0;
     for (listEntry = g_RegistryMonitor.ProtectedKeyBuckets[bucket].Flink;
-         listEntry != &g_RegistryMonitor.ProtectedKeyBuckets[bucket];
-         listEntry = listEntry->Flink) {
+         listEntry != &g_RegistryMonitor.ProtectedKeyBuckets[bucket] &&
+         walkCount < REG_MAX_BUCKET_WALK;
+         listEntry = listEntry->Flink, walkCount++) {
 
         existingEntry = CONTAINING_RECORD(listEntry, REG_PROTECTED_KEY_ENTRY, HashLink);
 
         if (RtlEqualUnicodeString(&existingEntry->KeyPath, KeyPath, TRUE)) {
-            //
-            // Already exists - update flags
-            //
             existingEntry->Flags = Flags;
             ExReleasePushLockExclusive(&g_RegistryMonitor.ProtectedKeyLock);
             KeLeaveCriticalRegion();
@@ -1838,9 +1972,6 @@ ShadowStrikeAddProtectedRegistryKey(
         }
     }
 
-    //
-    // Allocate new entry
-    //
     entry = (PREG_PROTECTED_KEY_ENTRY)ExAllocatePoolZero(
         NonPagedPoolNx,
         sizeof(REG_PROTECTED_KEY_ENTRY),
@@ -1853,18 +1984,12 @@ ShadowStrikeAddProtectedRegistryKey(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Initialize entry
-    //
     entry->Flags = Flags;
     entry->KeyPath.Buffer = entry->PathBuffer;
     entry->KeyPath.Length = KeyPath->Length;
     entry->KeyPath.MaximumLength = sizeof(entry->PathBuffer);
     RtlCopyMemory(entry->PathBuffer, KeyPath->Buffer, KeyPath->Length);
 
-    //
-    // Insert into hash table
-    //
     InsertTailList(&g_RegistryMonitor.ProtectedKeyBuckets[bucket], &entry->HashLink);
     InterlockedIncrement(&g_RegistryMonitor.ProtectedKeyCount);
 
@@ -1876,13 +2001,14 @@ ShadowStrikeAddProtectedRegistryKey(
 
 _Use_decl_annotations_
 BOOLEAN
-ShadowStrikeRemoveProtectedRegistryKey(
+ShadowStrikeRegRemoveMonitoredKey(
     _In_ PCUNICODE_STRING KeyPath
     )
 {
     ULONG bucket;
+    ULONG walkCount;
     PLIST_ENTRY listEntry;
-    PREG_PROTECTED_KEY_ENTRY entry;
+    PREG_PROTECTED_KEY_ENTRY entry = NULL;
     BOOLEAN found = FALSE;
 
     PAGED_CODE();
@@ -1896,9 +2022,11 @@ ShadowStrikeRemoveProtectedRegistryKey(
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_RegistryMonitor.ProtectedKeyLock);
 
+    walkCount = 0;
     for (listEntry = g_RegistryMonitor.ProtectedKeyBuckets[bucket].Flink;
-         listEntry != &g_RegistryMonitor.ProtectedKeyBuckets[bucket];
-         listEntry = listEntry->Flink) {
+         listEntry != &g_RegistryMonitor.ProtectedKeyBuckets[bucket] &&
+         walkCount < REG_MAX_BUCKET_WALK;
+         listEntry = listEntry->Flink, walkCount++) {
 
         entry = CONTAINING_RECORD(listEntry, REG_PROTECTED_KEY_ENTRY, HashLink);
 
@@ -1920,46 +2048,92 @@ ShadowStrikeRemoveProtectedRegistryKey(
     return found;
 }
 
+/**
+ * @brief Check if a key is monitored, with correct prefix matching.
+ *
+ * Unlike a naive single-bucket lookup, this walks each path prefix
+ * of KeyPath (at every backslash boundary) and checks the corresponding
+ * hash bucket. This ensures that a monitored key like
+ * \REGISTRY\MACHINE\SOFTWARE\ShadowStrike is found even when queried
+ * for \REGISTRY\MACHINE\SOFTWARE\ShadowStrike\SubKey.
+ */
 _Use_decl_annotations_
 BOOLEAN
-ShadowStrikeIsRegistryKeyProtected(
+ShadowStrikeRegIsKeyMonitored(
     _In_ PCUNICODE_STRING KeyPath
     )
 {
     ULONG bucket;
+    ULONG walkCount;
     PLIST_ENTRY listEntry;
     PREG_PROTECTED_KEY_ENTRY entry;
-    BOOLEAN found = FALSE;
+    UNICODE_STRING prefix;
+    USHORT i;
+    USHORT charCount;
 
-    if (KeyPath == NULL || KeyPath->Buffer == NULL) {
+    if (KeyPath == NULL || KeyPath->Buffer == NULL || KeyPath->Length == 0) {
         return FALSE;
     }
 
+    //
+    // Step 1: Exact match in the key's own bucket
+    //
     bucket = RegpHashString(KeyPath) % REG_PROTECTED_KEY_HASH_BUCKETS;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_RegistryMonitor.ProtectedKeyLock);
 
+    walkCount = 0;
     for (listEntry = g_RegistryMonitor.ProtectedKeyBuckets[bucket].Flink;
-         listEntry != &g_RegistryMonitor.ProtectedKeyBuckets[bucket];
-         listEntry = listEntry->Flink) {
+         listEntry != &g_RegistryMonitor.ProtectedKeyBuckets[bucket] &&
+         walkCount < REG_MAX_BUCKET_WALK;
+         listEntry = listEntry->Flink, walkCount++) {
 
         entry = CONTAINING_RECORD(listEntry, REG_PROTECTED_KEY_ENTRY, HashLink);
 
-        //
-        // Check for exact match or prefix match
-        //
-        if (RtlEqualUnicodeString(&entry->KeyPath, KeyPath, TRUE) ||
-            RtlPrefixUnicodeString(&entry->KeyPath, KeyPath, TRUE)) {
-            found = TRUE;
-            break;
+        if (RtlEqualUnicodeString(&entry->KeyPath, KeyPath, TRUE)) {
+            ExReleasePushLockShared(&g_RegistryMonitor.ProtectedKeyLock);
+            KeLeaveCriticalRegion();
+            return TRUE;
+        }
+    }
+
+    //
+    // Step 2: Walk every backslash-delimited prefix of KeyPath.
+    // For each prefix, hash it, look in that bucket for an exact match.
+    // This correctly handles the case where a parent path is monitored.
+    //
+    charCount = KeyPath->Length / sizeof(WCHAR);
+    prefix.Buffer = KeyPath->Buffer;
+    prefix.MaximumLength = KeyPath->Length;
+
+    for (i = 1; i < charCount; i++) {
+        if (KeyPath->Buffer[i] == L'\\') {
+            prefix.Length = i * sizeof(WCHAR);
+
+            bucket = RegpHashString(&prefix) % REG_PROTECTED_KEY_HASH_BUCKETS;
+
+            walkCount = 0;
+            for (listEntry = g_RegistryMonitor.ProtectedKeyBuckets[bucket].Flink;
+                 listEntry != &g_RegistryMonitor.ProtectedKeyBuckets[bucket] &&
+                 walkCount < REG_MAX_BUCKET_WALK;
+                 listEntry = listEntry->Flink, walkCount++) {
+
+                entry = CONTAINING_RECORD(listEntry, REG_PROTECTED_KEY_ENTRY, HashLink);
+
+                if (RtlEqualUnicodeString(&entry->KeyPath, &prefix, TRUE)) {
+                    ExReleasePushLockShared(&g_RegistryMonitor.ProtectedKeyLock);
+                    KeLeaveCriticalRegion();
+                    return TRUE;
+                }
+            }
         }
     }
 
     ExReleasePushLockShared(&g_RegistryMonitor.ProtectedKeyLock);
     KeLeaveCriticalRegion();
 
-    return found;
+    return FALSE;
 }
 
 // ============================================================================

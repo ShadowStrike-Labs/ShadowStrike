@@ -66,6 +66,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 
 // ============================================================================
@@ -230,9 +231,8 @@ extern "C" {
 
 //
 // ShadowStrike Self-Protection
+// Note: SHADOWSTRIKE_DRIVER_NAME is defined in SharedDefs.h as L"ShadowStrikeFlt"
 //
-#define SHADOWSTRIKE_SERVICE_NAME               L"ShadowStrikeFlt"
-
 #define SHADOWSTRIKE_REG_OUR_SERVICE \
     L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikeFlt"
 
@@ -795,9 +795,12 @@ ShadowStrikeGetRegistryConfig(
 // ============================================================================
 
 /**
- * @brief Add a registry key to the protection list.
+ * @brief Add a registry key to the registry-module monitor list.
  *
- * @param KeyPath   Key path to protect.
+ * This is the registry callback module's own hash-table-based tracking,
+ * separate from SelfProtect's global protection array.
+ *
+ * @param KeyPath   Key path to monitor.
  * @param Flags     Protection flags.
  * @return STATUS_SUCCESS on success.
  *
@@ -805,36 +808,39 @@ ShadowStrikeGetRegistryConfig(
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
-ShadowStrikeAddProtectedRegistryKey(
+ShadowStrikeRegAddMonitoredKey(
     _In_ PCUNICODE_STRING KeyPath,
     _In_ ULONG Flags
     );
 
 /**
- * @brief Remove a registry key from the protection list.
+ * @brief Remove a registry key from the registry-module monitor list.
  *
- * @param KeyPath   Key path to unprotect.
+ * @param KeyPath   Key path to stop monitoring.
  * @return TRUE if removed, FALSE if not found.
  *
  * @irql PASSIVE_LEVEL
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 BOOLEAN
-ShadowStrikeRemoveProtectedRegistryKey(
+ShadowStrikeRegRemoveMonitoredKey(
     _In_ PCUNICODE_STRING KeyPath
     );
 
 /**
- * @brief Check if a registry key is in the protection list.
+ * @brief Check if a registry key is in the registry-module monitor list.
+ *
+ * Handles prefix matching correctly by walking path components and
+ * checking each prefix against its corresponding hash bucket.
  *
  * @param KeyPath   Key path to check.
- * @return TRUE if protected.
+ * @return TRUE if monitored.
  *
  * @irql <= DISPATCH_LEVEL
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
-ShadowStrikeIsRegistryKeyProtected(
+ShadowStrikeRegIsKeyMonitored(
     _In_ PCUNICODE_STRING KeyPath
     );
 
