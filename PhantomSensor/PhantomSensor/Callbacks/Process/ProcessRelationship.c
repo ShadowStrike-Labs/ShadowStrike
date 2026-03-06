@@ -53,6 +53,12 @@
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
 
+//
+// Forward declarations for kernel exports not always in WDK headers
+//
+extern ULONG PsGetProcessSessionId(_In_ PEPROCESS Process);
+extern BOOLEAN PsIsSystemProcess(_In_ PEPROCESS Process);
+
 // ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
@@ -558,7 +564,7 @@ PrInitialize(
         &internal->NodeLookaside,
         NULL,
         NULL,
-        POOL_NX_ALLOCATION,
+        0,
         sizeof(PR_PROCESS_NODE),
         PR_POOL_TAG,
         0
@@ -568,7 +574,7 @@ PrInitialize(
         &internal->RelationshipLookaside,
         NULL,
         NULL,
-        POOL_NX_ALLOCATION,
+        0,
         sizeof(PR_RELATIONSHIP),
         PR_POOL_TAG,
         0
@@ -617,7 +623,7 @@ PrShutdown(
     PLIST_ENTRY nextEntry;
     PPR_PROCESS_NODE node;
     PPR_RELATIONSHIP relationship;
-    LARGE_INTEGER timeout;
+    KLOCK_QUEUE_HANDLE lockHandle;
 
     NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
@@ -640,16 +646,16 @@ PrShutdown(
     PrpReleaseGraphReference(internal);
 
     //
-    // Wait for all active operations to complete
-    // Use a timeout to prevent indefinite hang
+    // Wait for all active operations to complete.
+    // MUST wait indefinitely — proceeding before all operations drain
+    // would cause use-after-free when we free graph structures below.
     //
-    timeout.QuadPart = -((LONGLONG)10 * 1000 * 10000);  // 10 second timeout
     KeWaitForSingleObject(
         &internal->ShutdownEvent,
         Executive,
         KernelMode,
         FALSE,
-        &timeout
+        NULL
     );
 
     //
@@ -725,8 +731,7 @@ PrShutdown(
     //
     // Free deferred nodes
     //
-    KLOCK_QUEUE_HANDLE lockHandle;
-    KeAcquireInStackQueuedSpinLock(&internal->DeferredFreeLock, &lockHandle);
+    KeAcquireInStackQueuedSpinLock((PKSPIN_LOCK)&internal->DeferredFreeLock, &lockHandle);
 
     while (!IsListEmpty(&internal->DeferredFreeList)) {
         listEntry = RemoveHeadList(&internal->DeferredFreeList);
@@ -1183,7 +1188,10 @@ PrAddRelationship(
     InitializeListHead(&relationship->GlobalListEntry);
 
     //
-    // Find source and target nodes while holding shared lock
+    // Find source and target nodes while holding shared lock.
+    // CRITICAL: We keep the shared lock held while inserting into the
+    // node's relationship list. This prevents PrRemoveProcess from
+    // freeing the node between our lookup and insertion.
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Graph->NodeLock);
@@ -1201,23 +1209,16 @@ PrAddRelationship(
         targetNode
     );
 
-    ExReleasePushLockShared(&Graph->NodeLock);
-    KeLeaveCriticalRegion();
-
     //
-    // Add to source node's relationship list (if node exists)
+    // Add to source node's relationship list while still holding NodeLock.
+    // The spin lock protects the list from concurrent modifications by
+    // other PrAddRelationship calls (which also hold NodeLock shared).
     //
     if (sourceNode != NULL && !sourceNode->Removed) {
         LONG nodeRelCount = sourceNode->RelationshipCount;
         if (nodeRelCount < PR_MAX_CONNECTIONS) {
-            //
-            // Use spin lock for node's relationship list
-            //
-            KeAcquireInStackQueuedSpinLock(&sourceNode->RelationshipSpinLock, &lockHandle);
+            KeAcquireInStackQueuedSpinLock((PKSPIN_LOCK)&sourceNode->RelationshipSpinLock, &lockHandle);
 
-            //
-            // Double-check under lock
-            //
             if (!sourceNode->Removed && sourceNode->RelationshipCount < PR_MAX_CONNECTIONS) {
                 InsertTailList(&sourceNode->RelationshipList, &relationship->NodeListEntry);
                 InterlockedIncrement(&sourceNode->RelationshipCount);
@@ -1226,6 +1227,9 @@ PrAddRelationship(
             KeReleaseInStackQueuedSpinLock(&lockHandle);
         }
     }
+
+    ExReleasePushLockShared(&Graph->NodeLock);
+    KeLeaveCriticalRegion();
 
     //
     // Add to global relationship list
@@ -1386,13 +1390,49 @@ PrGetNode(
     *Node = node;
 
     //
-    // Note: Caller is responsible for calling PrpReleaseNodeReference
-    // This is a design flaw in the legacy API
+    // IMPORTANT: Caller MUST call PrReleaseNode(Graph, Node) when done
+    // to release the reference acquired here.
     //
 
     PrpReleaseGraphReference(internal);
 
     return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Release a node reference acquired via PrGetNode.
+ *
+ * This is the public counterpart to the internal PrpReleaseNodeReference.
+ * Every successful PrGetNode call must be paired with PrReleaseNode.
+ */
+_Use_decl_annotations_
+VOID
+PrReleaseNode(
+    _In_ PPR_GRAPH Graph,
+    _In_ PPR_PROCESS_NODE Node
+    )
+{
+    PPR_GRAPH_INTERNAL internal;
+
+    if (Graph == NULL || Node == NULL) {
+        return;
+    }
+
+    if (!Graph->Initialized) {
+        return;
+    }
+
+    internal = CONTAINING_RECORD(Graph, PR_GRAPH_INTERNAL, Public);
+
+    if (internal->Signature != PR_GRAPH_SIGNATURE) {
+        return;
+    }
+
+    if (Node->Signature != PR_NODE_SIGNATURE) {
+        return;
+    }
+
+    PrpReleaseNodeReference(internal, Node);
 }
 
 _Use_decl_annotations_
@@ -1477,6 +1517,7 @@ PrGetRelationships(
     PLIST_ENTRY listEntry;
     PPR_RELATIONSHIP relationship;
     ULONG count = 0;
+    KLOCK_QUEUE_HANDLE lockHandle;
 
     NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
 
@@ -1514,8 +1555,12 @@ PrGetRelationships(
     }
 
     //
-    // Copy relationship data to caller's buffer - COPIES are SAFE
+    // Copy relationship data to caller's buffer.
+    // MUST hold RelationshipSpinLock to prevent concurrent PrAddRelationship
+    // from modifying the list while we iterate.
     //
+    KeAcquireInStackQueuedSpinLock((PKSPIN_LOCK)&node->RelationshipSpinLock, &lockHandle);
+
     for (listEntry = node->RelationshipList.Flink;
          listEntry != &node->RelationshipList && count < MaxCount;
          listEntry = listEntry->Flink) {
@@ -1529,6 +1574,8 @@ PrGetRelationships(
         Relations[count].SuspicionScore = relationship->SuspicionScore;
         count++;
     }
+
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
 
     *Count = count;
 
@@ -1658,6 +1705,8 @@ PrGetStatistics(
     _Out_ PPR_GRAPH_STATS Stats
     )
 {
+    ULONG i;
+
     if (Graph == NULL || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1677,7 +1726,7 @@ PrGetStatistics(
     Stats->LookupCount = Graph->Stats.LookupCount;
     Stats->LookupHits = Graph->Stats.LookupHits;
 
-    for (ULONG i = 0; i < PrRelation_MaxType; i++) {
+    for (i = 0; i < PrRelation_MaxType; i++) {
         Stats->RelationshipsByType[i] = Graph->Stats.RelationshipsByType[i];
     }
 
@@ -2040,21 +2089,14 @@ PrpCacheProcessInfo(
     Node->SessionId = PsGetProcessSessionId(process);
 
     //
-    // Check for system process by PID
+    // Detect system-context processes:
+    // PID 0 (Idle) and PID 4 (System) are always system processes.
+    // Session 0 non-system PIDs running as PsIsSystemProcess are also system.
     //
     if ((ULONG_PTR)ProcessId == 0 || (ULONG_PTR)ProcessId == 4) {
         Node->IsSystemProcess = TRUE;
-    }
-
-    //
-    // Check if running as SYSTEM
-    // Note: For full implementation, would check token SID
-    //
-    if (Node->SessionId == 0 && !Node->IsSystemProcess) {
-        //
-        // Session 0 processes in system context
-        // Could add token check here for more accuracy
-        //
+    } else if (Node->SessionId == 0 && PsIsSystemProcess(process)) {
+        Node->IsSystemProcess = TRUE;
     }
 
     ObDereferenceObject(process);
@@ -2062,6 +2104,9 @@ PrpCacheProcessInfo(
 
 /**
  * @brief Check if process is a system process by image name.
+ *
+ * Extracts the filename component from the image path and compares
+ * against the filename component of known system process paths.
  */
 static BOOLEAN
 PrpIsSystemProcessByName(
@@ -2070,31 +2115,48 @@ PrpIsSystemProcessByName(
 {
     const WCHAR** name;
     UNICODE_STRING compareName;
+    UNICODE_STRING imageFileName;
+    UNICODE_STRING compareFileName;
+    USHORT i;
 
-    if (ImageName == NULL || ImageName->Buffer == NULL) {
+    if (ImageName == NULL || ImageName->Buffer == NULL || ImageName->Length == 0) {
         return FALSE;
+    }
+
+    //
+    // Extract filename from input image path (after last backslash)
+    //
+    imageFileName = *ImageName;
+    for (i = ImageName->Length / sizeof(WCHAR); i > 0; i--) {
+        if (ImageName->Buffer[i - 1] == L'\\') {
+            imageFileName.Buffer = &ImageName->Buffer[i];
+            imageFileName.Length = ImageName->Length - (i * sizeof(WCHAR));
+            imageFileName.MaximumLength = imageFileName.Length;
+            break;
+        }
     }
 
     for (name = g_SystemProcessNames; *name != NULL; name++) {
         RtlInitUnicodeString(&compareName, *name);
 
-        if (RtlEqualUnicodeString(ImageName, &compareName, TRUE)) {
-            return TRUE;
+        //
+        // Extract filename from the known system process path
+        //
+        compareFileName = compareName;
+        for (i = compareName.Length / sizeof(WCHAR); i > 0; i--) {
+            if (compareName.Buffer[i - 1] == L'\\') {
+                compareFileName.Buffer = &compareName.Buffer[i];
+                compareFileName.Length = compareName.Length - (i * sizeof(WCHAR));
+                compareFileName.MaximumLength = compareFileName.Length;
+                break;
+            }
         }
 
         //
-        // Also check if image name ends with the filename
+        // Compare extracted filenames (case-insensitive)
         //
-        if (ImageName->Length >= compareName.Length) {
-            UNICODE_STRING suffix;
-            suffix.Buffer = ImageName->Buffer +
-                (ImageName->Length - compareName.Length) / sizeof(WCHAR);
-            suffix.Length = compareName.Length;
-            suffix.MaximumLength = compareName.Length;
-
-            if (RtlEqualUnicodeString(&suffix, &compareName, TRUE)) {
-                return TRUE;
-            }
+        if (RtlEqualUnicodeString(&imageFileName, &compareFileName, TRUE)) {
+            return TRUE;
         }
     }
 
@@ -2141,6 +2203,14 @@ PrpAnalyzeClusterRecursive(
     PLIST_ENTRY listEntry;
     PPR_RELATIONSHIP relationship;
     PPR_PROCESS_NODE targetNode;
+    KLOCK_QUEUE_HANDLE lockHandle;
+
+    //
+    // Temporary storage: snapshot relationship targets while holding spin lock,
+    // then recurse after releasing it to avoid recursive spin lock acquisition.
+    //
+    HANDLE targetPids[PR_CLUSTER_MAX_PROCESSES];
+    ULONG targetCount = 0;
 
     //
     // Check depth limit to prevent stack overflow
@@ -2164,8 +2234,11 @@ PrpAnalyzeClusterRecursive(
     }
 
     //
-    // Analyze all relationships from this node
+    // Snapshot relationships under spin lock to prevent data race
+    // with concurrent PrAddRelationship calls.
     //
+    KeAcquireInStackQueuedSpinLock((PKSPIN_LOCK)&Node->RelationshipSpinLock, &lockHandle);
+
     for (listEntry = Node->RelationshipList.Flink;
          listEntry != &Node->RelationshipList;
          listEntry = listEntry->Flink) {
@@ -2175,9 +2248,6 @@ PrpAnalyzeClusterRecursive(
         Context->RelationshipCount++;
         Context->TotalScore += relationship->SuspicionScore;
 
-        //
-        // Track time window
-        //
         if (Context->FirstEventTime.QuadPart == 0 ||
             relationship->Timestamp.QuadPart < Context->FirstEventTime.QuadPart) {
             Context->FirstEventTime = relationship->Timestamp;
@@ -2188,21 +2258,28 @@ PrpAnalyzeClusterRecursive(
         }
 
         //
-        // Recursively analyze target if not already in cluster
+        // Snapshot target PID for post-lock recursion
         //
-        if (!PrpIsNodeInCluster(Context, relationship->TargetProcessId)) {
-            targetNode = PrpFindNodeLocked(Graph, relationship->TargetProcessId);
-            if (targetNode != NULL && !targetNode->Removed) {
-                if (Context->ProcessCount < PR_CLUSTER_MAX_PROCESSES) {
-                    Context->ProcessIds[Context->ProcessCount++] = relationship->TargetProcessId;
+        if (!PrpIsNodeInCluster(Context, relationship->TargetProcessId) &&
+            targetCount < PR_CLUSTER_MAX_PROCESSES) {
+            targetPids[targetCount++] = relationship->TargetProcessId;
+        }
+    }
 
-                    //
-                    // Recurse into target node
-                    //
-                    Context->CurrentDepth++;
-                    PrpAnalyzeClusterRecursive(Graph, targetNode, Context);
-                    Context->CurrentDepth--;
-                }
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+
+    //
+    // Recurse into targets AFTER releasing spin lock.
+    // Recursive spin lock acquisition would deadlock.
+    //
+    for (ULONG i = 0; i < targetCount && Context->ProcessCount < PR_CLUSTER_MAX_PROCESSES; i++) {
+        if (!PrpIsNodeInCluster(Context, targetPids[i])) {
+            targetNode = PrpFindNodeLocked(Graph, targetPids[i]);
+            if (targetNode != NULL && !targetNode->Removed) {
+                Context->ProcessIds[Context->ProcessCount++] = targetPids[i];
+                Context->CurrentDepth++;
+                PrpAnalyzeClusterRecursive(Graph, targetNode, Context);
+                Context->CurrentDepth--;
             }
         }
     }
