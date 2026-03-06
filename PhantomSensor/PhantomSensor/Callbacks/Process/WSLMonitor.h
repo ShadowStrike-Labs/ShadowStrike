@@ -50,6 +50,10 @@ MITRE ATT&CK Coverage:
 
 #pragma once
 
+//
+// ntifs.h must precede ntddk.h to avoid PEPROCESS/PETHREAD C2371 (WSL-1 fix).
+//
+#include <ntifs.h>
 #include <ntddk.h>
 
 // ============================================================================
@@ -216,7 +220,7 @@ WslMonCheckFileAccess(
  *
  * @return TRUE if process is in WSL tracking table.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 WslMonIsWslProcess(
     _In_ HANDLE ProcessId
@@ -225,7 +229,7 @@ WslMonIsWslProcess(
 /**
  * @brief Get WSL monitor statistics.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 WslMonGetStatistics(
     _Out_ PWSL_STATISTICS Statistics

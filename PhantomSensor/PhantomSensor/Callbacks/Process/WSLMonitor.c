@@ -26,13 +26,22 @@ ShadowStrike NGAV - WSL/CONTAINER MONITORING IMPLEMENTATION
 
 WSL Detection Strategy:
   - Process image name matching: wsl.exe, wslhost.exe, wslservice.exe
-  - Parent chain analysis: WSL launcher → host → child processes
+  - Parent chain analysis: WSL launcher -> host -> child processes
   - Pico process identification via subsystem flags
-  - File access monitoring for /mnt/ → native drive crossings
+  - File access monitoring for /mnt/ -> native drive crossings
   - Credential file access detection (SAM, SECURITY, SYSTEM hives)
+  - Native escape target detection (cmd.exe, powershell.exe from WSL context)
+
+Security Hardening (WSL-1 through WSL-15):
+  - Lock-safe process lookups (pointer valid only while lock held)
+  - Rundown protection on all public query APIs
+  - Capacity enforcement against pool exhaustion
+  - Duplicate PID insertion guard
+  - bash.exe false positive elimination via parent-chain-only detection
+  - Case-insensitive path substring search for System32/drivers detection
 
 @author ShadowStrike Security Team
-@version 1.0.0
+@version 2.0.0
 @copyright (c) 2026 ShadowStrike Security. All rights reserved.
 ===============================================================================
 --*/
@@ -51,7 +60,7 @@ typedef struct _WSL_STATE {
     EX_RUNDOWN_REF      RundownRef;
 
     //
-    // Tracked processes: hash table by PID
+    // Tracked processes: hash table by PID (64 buckets).
     //
     struct {
         LIST_ENTRY  Head;
@@ -65,6 +74,12 @@ typedef struct _WSL_STATE {
     NPAGED_LOOKASIDE_LIST ProcessLookaside;
 
     //
+    // Global capacity tracking to prevent NonPagedPool exhaustion under
+    // attack (WSL-5). Checked against WSL_MAX_TRACKED_PROCESSES.
+    //
+    volatile LONG TotalTrackedCount;
+
+    //
     // Statistics
     //
     WSL_STATISTICS      Stats;
@@ -75,14 +90,38 @@ typedef struct _WSL_STATE {
 // KNOWN WSL PROCESS NAMES
 // ============================================================================
 
+//
+// Note: bash.exe is intentionally excluded from direct classification.
+// It appears in both WSL and non-WSL contexts (Git Bash, Cygwin, MSYS2).
+// WSL-spawned bash is detected through parent chain analysis instead (WSL-11).
+//
 static const UNICODE_STRING g_WslLauncher   = RTL_CONSTANT_STRING(L"wsl.exe");
 static const UNICODE_STRING g_WslHost       = RTL_CONSTANT_STRING(L"wslhost.exe");
 static const UNICODE_STRING g_WslService    = RTL_CONSTANT_STRING(L"wslservice.exe");
 static const UNICODE_STRING g_WslRelay      = RTL_CONSTANT_STRING(L"wslrelay.exe");
-static const UNICODE_STRING g_Bash          = RTL_CONSTANT_STRING(L"bash.exe");
 
 //
-// Credential file patterns that WSL processes should not touch
+// Native Windows executables that indicate container-to-host escape when
+// spawned from a WSL process context (T1611: Escape to Host).
+//
+static const UNICODE_STRING g_NativeEscapeTargets[] = {
+    RTL_CONSTANT_STRING(L"cmd.exe"),
+    RTL_CONSTANT_STRING(L"powershell.exe"),
+    RTL_CONSTANT_STRING(L"pwsh.exe"),
+    RTL_CONSTANT_STRING(L"mshta.exe"),
+    RTL_CONSTANT_STRING(L"wscript.exe"),
+    RTL_CONSTANT_STRING(L"cscript.exe"),
+    RTL_CONSTANT_STRING(L"regsvr32.exe"),
+    RTL_CONSTANT_STRING(L"rundll32.exe"),
+    RTL_CONSTANT_STRING(L"certutil.exe"),
+    RTL_CONSTANT_STRING(L"bitsadmin.exe"),
+};
+
+#define WSL_NATIVE_ESCAPE_TARGET_COUNT \
+    (sizeof(g_NativeEscapeTargets) / sizeof(g_NativeEscapeTargets[0]))
+
+//
+// Credential file patterns that WSL processes should not touch.
 //
 static const UNICODE_STRING g_CredentialPaths[] = {
     RTL_CONSTANT_STRING(L"\\Windows\\System32\\config\\SAM"),
@@ -94,6 +133,12 @@ static const UNICODE_STRING g_CredentialPaths[] = {
 
 #define WSL_CREDENTIAL_PATH_COUNT \
     (sizeof(g_CredentialPaths) / sizeof(g_CredentialPaths[0]))
+
+//
+// Path substrings for system directory access detection.
+//
+static const UNICODE_STRING g_DriversDir  = RTL_CONSTANT_STRING(L"\\drivers\\");
+static const UNICODE_STRING g_System32Dir = RTL_CONSTANT_STRING(L"\\System32\\");
 
 // ============================================================================
 // GLOBAL STATE
@@ -110,9 +155,14 @@ WslpBucketIndex(
     _In_ HANDLE ProcessId
     );
 
+//
+// Returns pointer valid ONLY while caller holds the bucket lock.
+// Caller MUST hold ProcessBuckets[BucketIndex].Lock (shared or exclusive).
+//
 static PWSL_TRACKED_PROCESS
-WslpFindProcess(
-    _In_ HANDLE ProcessId
+WslpFindProcessLocked(
+    _In_ HANDLE ProcessId,
+    _In_ ULONG BucketIndex
     );
 
 static WSL_PROCESS_TYPE
@@ -129,6 +179,17 @@ WslpExtractImageName(
 static BOOLEAN
 WslpIsCredentialPath(
     _In_ PCUNICODE_STRING FileName
+    );
+
+static BOOLEAN
+WslpPathContainsCI(
+    _In_ PCUNICODE_STRING Path,
+    _In_ PCUNICODE_STRING Substring
+    );
+
+static BOOLEAN
+WslpIsNativeEscapeTarget(
+    _In_ PCUNICODE_STRING ImageName
     );
 
 static BOOLEAN
@@ -173,6 +234,7 @@ WslMonInitialize(VOID)
         0
         );
 
+    g_WslState.TotalTrackedCount = 0;
     RtlZeroMemory(&g_WslState.Stats, sizeof(WSL_STATISTICS));
 
     InterlockedExchange(&g_WslState.State, 2);
@@ -188,6 +250,8 @@ _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 WslMonShutdown(VOID)
 {
+    LONG freedCount = 0;
+
     PAGED_CODE();
 
     if (InterlockedCompareExchange(&g_WslState.State, 3, 2) != 2) {
@@ -197,17 +261,17 @@ WslMonShutdown(VOID)
     ExWaitForRundownProtectionRelease(&g_WslState.RundownRef);
 
     //
-    // Free all tracked processes
+    // All operations have drained. No concurrent access is possible, so
+    // lock acquisition is unnecessary during cleanup (WSL-15).
     //
     for (ULONG i = 0; i < 64; i++) {
-        FltAcquirePushLockExclusive(&g_WslState.ProcessBuckets[i].Lock);
         while (!IsListEmpty(&g_WslState.ProcessBuckets[i].Head)) {
             LIST_ENTRY *Entry = RemoveHeadList(&g_WslState.ProcessBuckets[i].Head);
             PWSL_TRACKED_PROCESS Proc = CONTAINING_RECORD(
                 Entry, WSL_TRACKED_PROCESS, Link);
             ExFreeToNPagedLookasideList(&g_WslState.ProcessLookaside, Proc);
+            freedCount++;
         }
-        FltReleasePushLock(&g_WslState.ProcessBuckets[i].Lock);
         FltDeletePushLock(&g_WslState.ProcessBuckets[i].Lock);
     }
 
@@ -215,9 +279,10 @@ WslMonShutdown(VOID)
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/WSL] Shutdown complete. "
-               "Detected=%lld, Escapes=%lld\n",
+               "Detected=%lld, Escapes=%lld, Freed=%ld\n",
                g_WslState.Stats.WslProcessesDetected,
-               g_WslState.Stats.EscapeAttemptsDetected);
+               g_WslState.Stats.EscapeAttemptsDetected,
+               freedCount);
 }
 
 // ============================================================================
@@ -233,10 +298,12 @@ WslMonCheckProcessCreate(
     )
 {
     WSL_PROCESS_TYPE Type = WslProcess_None;
+    WSL_PROCESS_TYPE ParentType = WslProcess_None;
     PWSL_TRACKED_PROCESS NewProc;
-    PWSL_TRACKED_PROCESS ParentProc;
     ULONG Bucket;
-    UNICODE_STRING ImageNameOnly;
+    ULONG ParentBucket;
+    UNICODE_STRING ImageNameOnly = { 0 };
+    BOOLEAN hasImageName = FALSE;
 
     PAGED_CODE();
 
@@ -245,29 +312,67 @@ WslMonCheckProcessCreate(
     }
 
     //
-    // Step 1: Check if image name matches known WSL binaries
+    // Step 1: Extract and classify the image name against known WSL binaries.
     //
-    if (ImageFileName != NULL && ImageFileName->Length > 0) {
+    if (ImageFileName != NULL &&
+        ImageFileName->Buffer != NULL &&
+        ImageFileName->Length > 0) {
+
         if (WslpExtractImageName(ImageFileName, &ImageNameOnly)) {
             Type = WslpClassifyImage(&ImageNameOnly);
+            hasImageName = TRUE;
         }
     }
 
     //
-    // Step 2: If not directly classified, check if parent is WSL
+    // Step 2: If not directly classified, check if the parent is a tracked
+    // WSL process. This also detects bash.exe from WSL context (without
+    // false-positiving on Git Bash, Cygwin, etc.) and native escape targets.
+    //
+    // Lock the parent bucket to prevent use-after-free during ProcessType
+    // read (WSL-3 fix). The pointer is valid only while the lock is held.
     //
     if (Type == WslProcess_None) {
-        ParentProc = WslpFindProcess(ParentProcessId);
-        if (ParentProc != NULL) {
-            Type = WslProcess_Child;
+        ParentBucket = WslpBucketIndex(ParentProcessId);
+
+        FltAcquirePushLockShared(&g_WslState.ProcessBuckets[ParentBucket].Lock);
+        {
+            PWSL_TRACKED_PROCESS ParentProc =
+                WslpFindProcessLocked(ParentProcessId, ParentBucket);
+
+            if (ParentProc != NULL) {
+                ParentType = ParentProc->ProcessType;
+                Type = WslProcess_Child;
+            }
+        }
+        FltReleasePushLock(&g_WslState.ProcessBuckets[ParentBucket].Lock);
+
+        if (Type == WslProcess_Child) {
             InterlockedIncrement64(&g_WslState.Stats.SuspiciousSpawns);
 
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike/WSL] WSL child process spawned: "
-                       "PID=%lu, Parent=%lu (ParentType=%d)\n",
-                       HandleToULong(ProcessId),
-                       HandleToULong(ParentProcessId),
-                       ParentProc->ProcessType);
+            //
+            // Check for native Windows executable escape (T1611).
+            // A WSL-tracked parent spawning cmd.exe, powershell.exe, etc.
+            // indicates potential container-to-host breakout.
+            //
+            if (hasImageName && WslpIsNativeEscapeTarget(&ImageNameOnly)) {
+                InterlockedIncrement64(&g_WslState.Stats.EscapeAttemptsDetected);
+
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike/WSL] ESCAPE: WSL->native process creation! "
+                           "PID=%lu, Parent=%lu (ParentType=%d), Image=%wZ\n",
+                           HandleToULong(ProcessId),
+                           HandleToULong(ParentProcessId),
+                           ParentType,
+                           ImageFileName);
+            } else {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                           "[ShadowStrike/WSL] WSL child process spawned: "
+                           "PID=%lu, Parent=%lu (ParentType=%d)\n",
+                           HandleToULong(ProcessId),
+                           HandleToULong(ParentProcessId),
+                           ParentType);
+            }
         }
     }
 
@@ -277,7 +382,25 @@ WslMonCheckProcessCreate(
     }
 
     //
-    // Step 3: Track this WSL process
+    // Step 3: Enforce capacity limit to prevent NonPagedPool exhaustion
+    // under attack. An adversary spawning thousands of WSL processes would
+    // otherwise cause unbounded memory consumption (WSL-5).
+    //
+    if (InterlockedCompareExchange(
+            &g_WslState.TotalTrackedCount, 0, 0) >= WSL_MAX_TRACKED_PROCESSES) {
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/WSL] Capacity limit reached (%d). "
+                   "PID=%lu not tracked (Type=%d)\n",
+                   WSL_MAX_TRACKED_PROCESSES,
+                   HandleToULong(ProcessId), Type);
+
+        WslpLeaveOperation();
+        return Type;
+    }
+
+    //
+    // Step 4: Allocate and populate tracking entry.
     //
     NewProc = (PWSL_TRACKED_PROCESS)ExAllocateFromNPagedLookasideList(
         &g_WslState.ProcessLookaside);
@@ -294,25 +417,54 @@ WslMonCheckProcessCreate(
     NewProc->ProcessType = Type;
     KeQuerySystemTime(&NewProc->CreateTime);
 
-    if (ImageFileName != NULL && ImageFileName->Length > 0) {
+    if (ImageFileName != NULL &&
+        ImageFileName->Buffer != NULL &&
+        ImageFileName->Length > 0) {
+
         USHORT CopyLen = min(ImageFileName->Length,
                              (WSL_PROCESS_NAME_MAX - 1) * sizeof(WCHAR));
         RtlCopyMemory(NewProc->ImageName, ImageFileName->Buffer, CopyLen);
         NewProc->ImageNameLength = CopyLen / sizeof(WCHAR);
     }
 
+    //
+    // Step 5: Insert into hash table under exclusive lock.
+    // Guard against duplicate insertion from rapid PID reuse (WSL-13).
+    //
     Bucket = WslpBucketIndex(ProcessId);
 
     FltAcquirePushLockExclusive(&g_WslState.ProcessBuckets[Bucket].Lock);
-    InsertTailList(&g_WslState.ProcessBuckets[Bucket].Head, &NewProc->Link);
-    InterlockedIncrement(&g_WslState.ProcessBuckets[Bucket].Count);
+    {
+        PWSL_TRACKED_PROCESS Existing = WslpFindProcessLocked(ProcessId, Bucket);
+        if (Existing != NULL) {
+            //
+            // Duplicate PID already tracked. This can happen with rapid
+            // process creation/termination where the termination callback
+            // hasn't fired yet. Discard the new entry.
+            //
+            FltReleasePushLock(&g_WslState.ProcessBuckets[Bucket].Lock);
+            ExFreeToNPagedLookasideList(&g_WslState.ProcessLookaside, NewProc);
+
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                       "[ShadowStrike/WSL] Duplicate PID=%lu, skipping insert\n",
+                       HandleToULong(ProcessId));
+
+            WslpLeaveOperation();
+            return Type;
+        }
+
+        InsertTailList(&g_WslState.ProcessBuckets[Bucket].Head, &NewProc->Link);
+        InterlockedIncrement(&g_WslState.ProcessBuckets[Bucket].Count);
+    }
     FltReleasePushLock(&g_WslState.ProcessBuckets[Bucket].Lock);
 
+    InterlockedIncrement(&g_WslState.TotalTrackedCount);
     InterlockedIncrement64(&g_WslState.Stats.WslProcessesDetected);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike/WSL] WSL process detected: PID=%lu Type=%d\n",
-               HandleToULong(ProcessId), Type);
+               "[ShadowStrike/WSL] WSL process tracked: PID=%lu Type=%d (Total=%ld)\n",
+               HandleToULong(ProcessId), Type,
+               InterlockedCompareExchange(&g_WslState.TotalTrackedCount, 0, 0));
 
     WslpLeaveOperation();
     return Type;
@@ -327,6 +479,7 @@ WslMonProcessTerminated(
 {
     ULONG Bucket;
     LIST_ENTRY *ListEntry;
+    PWSL_TRACKED_PROCESS Found = NULL;
 
     PAGED_CODE();
 
@@ -348,15 +501,22 @@ WslMonProcessTerminated(
         if (Proc->ProcessId == ProcessId) {
             RemoveEntryList(&Proc->Link);
             InterlockedDecrement(&g_WslState.ProcessBuckets[Bucket].Count);
-            FltReleasePushLock(&g_WslState.ProcessBuckets[Bucket].Lock);
-
-            ExFreeToNPagedLookasideList(&g_WslState.ProcessLookaside, Proc);
-            WslpLeaveOperation();
-            return;
+            Found = Proc;
+            break;
         }
     }
 
     FltReleasePushLock(&g_WslState.ProcessBuckets[Bucket].Lock);
+
+    //
+    // Free the detached entry outside the lock. The entry is no longer
+    // reachable from the list, so no concurrent access is possible.
+    //
+    if (Found != NULL) {
+        InterlockedDecrement(&g_WslState.TotalTrackedCount);
+        ExFreeToNPagedLookasideList(&g_WslState.ProcessLookaside, Found);
+    }
+
     WslpLeaveOperation();
 }
 
@@ -371,102 +531,154 @@ WslMonCheckFileAccess(
     _In_ PCUNICODE_STRING FileName
     )
 {
-    PWSL_TRACKED_PROCESS Proc;
+    ULONG Bucket;
+    WSL_ESCAPE_TYPE Result = WslEscape_None;
+
+    //
+    // Defensive validation — FileName may have NULL Buffer on malformed
+    // IRP_MJ_CREATE requests or volume opens (WSL-14).
+    //
+    if (FileName == NULL || FileName->Buffer == NULL || FileName->Length == 0) {
+        return WslEscape_None;
+    }
 
     if (!WslpEnterOperation()) {
         return WslEscape_None;
     }
 
-    Proc = WslpFindProcess(ProcessId);
-    if (Proc == NULL) {
-        WslpLeaveOperation();
-        return WslEscape_None;
-    }
-
-    InterlockedIncrement(&Proc->FileAccessCount);
-    InterlockedIncrement64(&g_WslState.Stats.FileSystemCrossings);
-
     //
-    // Check credential file access
+    // Hold the bucket lock for the duration of all process field accesses
+    // to prevent use-after-free if the process terminates concurrently.
+    // InterlockedIncrement on process fields is atomic, but the pointer
+    // itself must remain valid (WSL-3 fix).
     //
-    if (WslpIsCredentialPath(FileName)) {
-        InterlockedIncrement(&Proc->EscapeAttempts);
-        InterlockedIncrement64(&g_WslState.Stats.EscapeAttemptsDetected);
-        InterlockedIncrement64(&g_WslState.Stats.CredentialAccessAttempts);
+    Bucket = WslpBucketIndex(ProcessId);
 
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike/WSL] CRITICAL: WSL credential access attempt! "
-                   "PID=%lu, File=%wZ\n",
-                   HandleToULong(ProcessId), FileName);
+    FltAcquirePushLockShared(&g_WslState.ProcessBuckets[Bucket].Lock);
+    {
+        PWSL_TRACKED_PROCESS Proc = WslpFindProcessLocked(ProcessId, Bucket);
 
-        WslpLeaveOperation();
-        return WslEscape_CredentialAccess;
-    }
+        if (Proc == NULL) {
+            FltReleasePushLock(&g_WslState.ProcessBuckets[Bucket].Lock);
+            WslpLeaveOperation();
+            return WslEscape_None;
+        }
 
-    //
-    // Check if WSL process is accessing Windows system directories
-    // This indicates potential container escape or host manipulation
-    //
-    UNICODE_STRING System32 = RTL_CONSTANT_STRING(L"\\Windows\\System32\\");
-    UNICODE_STRING Drivers  = RTL_CONSTANT_STRING(L"\\Windows\\System32\\drivers\\");
-
-    if (FileName->Length > Drivers.Length) {
         //
-        // Check for driver file access from WSL (T1611 escape indicator)
+        // Track all file accesses from WSL processes for profiling.
         //
-        UNICODE_STRING Suffix;
-        Suffix.Buffer = FileName->Buffer +
-            (FileName->Length / sizeof(WCHAR)) - (Drivers.Length / sizeof(WCHAR));
-        Suffix.Length = Drivers.Length;
-        Suffix.MaximumLength = Drivers.Length;
+        InterlockedIncrement(&Proc->FileAccessCount);
+        InterlockedIncrement64(&g_WslState.Stats.FileSystemCrossings);
 
-        // Check by searching for the substring in the path
-        for (USHORT i = 0; i < FileName->Length / sizeof(WCHAR) - Drivers.Length / sizeof(WCHAR) + 1; i++) {
-            UNICODE_STRING Candidate;
-            Candidate.Buffer = &FileName->Buffer[i];
-            Candidate.Length = Drivers.Length;
-            Candidate.MaximumLength = Drivers.Length;
+        //
+        // Priority 1: Credential file access (T1003 — OS Credential Dumping).
+        // This is the highest severity because it indicates direct credential
+        // theft attempts from WSL context.
+        //
+        if (WslpIsCredentialPath(FileName)) {
+            InterlockedIncrement(&Proc->EscapeAttempts);
+            InterlockedIncrement64(&g_WslState.Stats.EscapeAttemptsDetected);
+            InterlockedIncrement64(&g_WslState.Stats.CredentialAccessAttempts);
+            Result = WslEscape_CredentialAccess;
 
-            if (RtlEqualUnicodeString(&Candidate, &Drivers, TRUE)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike/WSL] CRITICAL: WSL credential access attempt! "
+                       "PID=%lu, File=%wZ\n",
+                       HandleToULong(ProcessId), FileName);
+        }
+
+        //
+        // Priority 2: Driver directory access (T1611 — Escape to Host).
+        // WSL processes accessing \drivers\ may be attempting to load
+        // or manipulate kernel-mode drivers.
+        //
+        if (Result == WslEscape_None) {
+            if (WslpPathContainsCI(FileName, &g_DriversDir)) {
                 InterlockedIncrement(&Proc->SuspiciousActions);
                 InterlockedIncrement64(&g_WslState.Stats.EscapeAttemptsDetected);
+                Result = WslEscape_DriverLoad;
 
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                            "[ShadowStrike/WSL] WSL driver directory access: "
                            "PID=%lu, File=%wZ\n",
                            HandleToULong(ProcessId), FileName);
+            }
+        }
 
-                WslpLeaveOperation();
-                return WslEscape_DriverLoad;
+        //
+        // Priority 3: System32 access (T1611 — general system manipulation).
+        // WSL processes accessing \System32\ may be tampering with system
+        // binaries, DLLs, or configuration files (WSL-12 fix).
+        //
+        if (Result == WslEscape_None) {
+            if (WslpPathContainsCI(FileName, &g_System32Dir)) {
+                InterlockedIncrement(&Proc->SuspiciousActions);
+                Result = WslEscape_FileSystemAccess;
+
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                           "[ShadowStrike/WSL] WSL System32 access: "
+                           "PID=%lu, File=%wZ\n",
+                           HandleToULong(ProcessId), FileName);
             }
         }
     }
+    FltReleasePushLock(&g_WslState.ProcessBuckets[Bucket].Lock);
 
     WslpLeaveOperation();
-    return WslEscape_None;
+    return Result;
 }
 
 // ============================================================================
 // QUERY
 // ============================================================================
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 WslMonIsWslProcess(
     _In_ HANDLE ProcessId
     )
 {
-    return (WslpFindProcess(ProcessId) != NULL);
+    ULONG Bucket;
+    BOOLEAN Found;
+
+    //
+    // Rundown protection ensures the hash table and push locks are valid
+    // (WSL-4 fix). Without this, a call during/after shutdown would access
+    // deleted push locks → BSOD.
+    //
+    if (!WslpEnterOperation()) {
+        return FALSE;
+    }
+
+    Bucket = WslpBucketIndex(ProcessId);
+
+    FltAcquirePushLockShared(&g_WslState.ProcessBuckets[Bucket].Lock);
+    Found = (WslpFindProcessLocked(ProcessId, Bucket) != NULL);
+    FltReleasePushLock(&g_WslState.ProcessBuckets[Bucket].Lock);
+
+    WslpLeaveOperation();
+    return Found;
 }
 
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 WslMonGetStatistics(
     _Out_ PWSL_STATISTICS Statistics
     )
 {
+    //
+    // Rundown protection ensures stats are in a consistent state (WSL-8 fix).
+    // If the module has shut down, return zeroed stats.
+    //
+    if (!WslpEnterOperation()) {
+        RtlZeroMemory(Statistics, sizeof(WSL_STATISTICS));
+        return;
+    }
+
     RtlCopyMemory(Statistics, &g_WslState.Stats, sizeof(WSL_STATISTICS));
+
+    WslpLeaveOperation();
 }
 
 // ============================================================================
@@ -482,30 +694,31 @@ WslpBucketIndex(
 }
 
 
+//
+// Searches for a tracked process within a specific bucket.
+// CALLER MUST HOLD ProcessBuckets[BucketIndex].Lock (shared or exclusive).
+// The returned pointer is valid ONLY while the lock is held.
+//
 static PWSL_TRACKED_PROCESS
-WslpFindProcess(
-    _In_ HANDLE ProcessId
+WslpFindProcessLocked(
+    _In_ HANDLE ProcessId,
+    _In_ ULONG BucketIndex
     )
 {
-    ULONG Bucket = WslpBucketIndex(ProcessId);
     LIST_ENTRY *ListEntry;
 
-    FltAcquirePushLockShared(&g_WslState.ProcessBuckets[Bucket].Lock);
-
-    for (ListEntry = g_WslState.ProcessBuckets[Bucket].Head.Flink;
-         ListEntry != &g_WslState.ProcessBuckets[Bucket].Head;
+    for (ListEntry = g_WslState.ProcessBuckets[BucketIndex].Head.Flink;
+         ListEntry != &g_WslState.ProcessBuckets[BucketIndex].Head;
          ListEntry = ListEntry->Flink) {
 
         PWSL_TRACKED_PROCESS Proc = CONTAINING_RECORD(
             ListEntry, WSL_TRACKED_PROCESS, Link);
 
         if (Proc->ProcessId == ProcessId) {
-            FltReleasePushLock(&g_WslState.ProcessBuckets[Bucket].Lock);
             return Proc;
         }
     }
 
-    FltReleasePushLock(&g_WslState.ProcessBuckets[Bucket].Lock);
     return NULL;
 }
 
@@ -530,9 +743,13 @@ WslpClassifyImage(
     if (RtlEqualUnicodeString(ImageName, &g_WslRelay, TRUE)) {
         return WslProcess_Child;
     }
-    if (RtlEqualUnicodeString(ImageName, &g_Bash, TRUE)) {
-        return WslProcess_Child;
-    }
+    //
+    // bash.exe intentionally NOT classified here. It appears in Git Bash,
+    // Cygwin, MSYS2, and other non-WSL contexts. WSL-spawned bash is
+    // detected through parent chain analysis in WslMonCheckProcessCreate
+    // step 2, which only classifies bash as WSL if its parent is already
+    // tracked as a WSL process (WSL-11 fix).
+    //
     return WslProcess_None;
 }
 
@@ -543,7 +760,16 @@ WslpExtractImageName(
     _Out_ PUNICODE_STRING NameOnly
     )
 {
-    USHORT Length = FullPath->Length / sizeof(WCHAR);
+    USHORT Length;
+
+    if (FullPath->Buffer == NULL || FullPath->Length == 0) {
+        NameOnly->Buffer = NULL;
+        NameOnly->Length = 0;
+        NameOnly->MaximumLength = 0;
+        return FALSE;
+    }
+
+    Length = FullPath->Length / sizeof(WCHAR);
 
     for (USHORT i = Length; i > 0; i--) {
         if (FullPath->Buffer[i - 1] == L'\\') {
@@ -570,7 +796,7 @@ WslpIsCredentialPath(
     for (ULONG i = 0; i < WSL_CREDENTIAL_PATH_COUNT; i++) {
         //
         // Check if the credential path is a suffix of the filename
-        // (handles volume prefix variations)
+        // (handles volume prefix variations like \Device\HarddiskVolume3\...).
         //
         if (FileName->Length >= g_CredentialPaths[i].Length) {
             UNICODE_STRING Suffix;
@@ -582,6 +808,83 @@ WslpIsCredentialPath(
             if (RtlEqualUnicodeString(&Suffix, &g_CredentialPaths[i], TRUE)) {
                 return TRUE;
             }
+        }
+    }
+    return FALSE;
+}
+
+// ============================================================================
+// PRIVATE — PATH SUBSTRING SEARCH
+// ============================================================================
+
+//
+// Case-insensitive substring search within a UNICODE_STRING path.
+// Replaces the previous O(n) loop of RtlEqualUnicodeString calls with
+// a direct character comparison approach (WSL-6 fix).
+//
+static BOOLEAN
+WslpPathContainsCI(
+    _In_ PCUNICODE_STRING Path,
+    _In_ PCUNICODE_STRING Substring
+    )
+{
+    USHORT pathChars;
+    USHORT subChars;
+    USHORT limit;
+
+    if (Path->Buffer == NULL || Substring->Buffer == NULL) {
+        return FALSE;
+    }
+
+    pathChars = Path->Length / sizeof(WCHAR);
+    subChars = Substring->Length / sizeof(WCHAR);
+
+    if (subChars == 0 || pathChars < subChars) {
+        return FALSE;
+    }
+
+    //
+    // Maximum starting position for a valid match. Since pathChars and
+    // subChars are derived from UNICODE_STRING.Length (USHORT / 2), the
+    // maximum value of limit is 32766, which fits safely in USHORT.
+    //
+    limit = pathChars - subChars;
+
+    for (USHORT i = 0; i <= limit; i++) {
+        BOOLEAN match = TRUE;
+
+        for (USHORT j = 0; j < subChars; j++) {
+            if (RtlUpcaseUnicodeChar(Path->Buffer[i + j]) !=
+                RtlUpcaseUnicodeChar(Substring->Buffer[j])) {
+                match = FALSE;
+                break;
+            }
+        }
+
+        if (match) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+// ============================================================================
+// PRIVATE — NATIVE ESCAPE TARGET DETECTION
+// ============================================================================
+
+//
+// Checks if the given image name matches a known native Windows executable
+// that would be suspicious if spawned from a WSL process context (T1611).
+//
+static BOOLEAN
+WslpIsNativeEscapeTarget(
+    _In_ PCUNICODE_STRING ImageName
+    )
+{
+    for (ULONG i = 0; i < WSL_NATIVE_ESCAPE_TARGET_COUNT; i++) {
+        if (RtlEqualUnicodeString(ImageName, &g_NativeEscapeTargets[i], TRUE)) {
+            return TRUE;
         }
     }
     return FALSE;
