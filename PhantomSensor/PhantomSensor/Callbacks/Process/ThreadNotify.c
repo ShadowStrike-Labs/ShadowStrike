@@ -60,9 +60,21 @@
 #include "../../Communication/ScanBridge.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
+#include "../../Shared/KernelProcessTypes.h"
+
+//
+// Minimal layout-compatible struct for protected process list traversal.
+// Full definition is in SelfProtect.h but cannot be included here due to
+// ShadowStrikeIsProcessProtected() signature conflict with ProcessUtils.h.
+// This struct MUST match the first two fields of SHADOWSTRIKE_PROTECTED_PROCESS_ENTRY.
+//
+typedef struct _TN_PROTECTED_PROCESS_ENTRY {
+    LIST_ENTRY ListEntry;
+    HANDLE ProcessId;
+} TN_PROTECTED_PROCESS_ENTRY;
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, RegisterThreadNotify)
+#pragma alloc_text(PAGE, RegisterThreadNotify)
 #pragma alloc_text(PAGE, UnregisterThreadNotify)
 #pragma alloc_text(PAGE, TnRegisterCallback)
 #pragma alloc_text(PAGE, TnUnregisterCallback)
@@ -70,6 +82,58 @@
 #pragma alloc_text(PAGE, TnAnalyzeStartAddress)
 #pragma alloc_text(PAGE, TnNotifyProcessTermination)
 #endif
+
+//=============================================================================
+// Kernel-mode defines not in WDK headers
+//=============================================================================
+
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION   0x0400
+#endif
+
+#ifndef THREAD_QUERY_INFORMATION
+#define THREAD_QUERY_INFORMATION    0x0040
+#endif
+
+#ifndef MEM_IMAGE
+#define MEM_IMAGE                   0x1000000
+#endif
+
+#ifndef ThreadQuerySetWin32StartAddress
+#define ThreadQuerySetWin32StartAddress ((THREADINFOCLASS)9)
+#endif
+
+//=============================================================================
+// Undocumented kernel API forward declarations
+//=============================================================================
+//
+// These are exported by ntoskrnl.exe but not declared in all WDK header
+// versions. Available on all NT 6.0+ (Vista through Windows 11).
+//
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQueryInformationThread(
+    _In_ HANDLE ThreadHandle,
+    _In_ THREADINFOCLASS ThreadInformationClass,
+    _Out_writes_bytes_(ThreadInformationLength) PVOID ThreadInformation,
+    _In_ ULONG ThreadInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+NTKERNELAPI
+ULONG
+NTAPI
+PsGetProcessSessionId(
+    _In_ PEPROCESS Process
+    );
+
+NTKERNELAPI
+BOOLEAN
+PsIsSystemProcess(
+    _In_ PEPROCESS Process
+    );
 
 //=============================================================================
 // Internal Constants
@@ -97,16 +161,9 @@
 #define TN_SCORE_SHELLCODE_PATTERN      300
 
 //
-// System process name hashes (FNV-1a) for fast comparison
+// Bounded spin-wait limit for callback reference drain
 //
-#define TN_HASH_SYSTEM                  0x6E3A8D45
-#define TN_HASH_CSRSS                   0x7C2B9F12
-#define TN_HASH_SMSS                    0x5D1A8E34
-#define TN_HASH_LSASS                   0x4F3C7D56
-#define TN_HASH_SERVICES                0x8E4B6C78
-#define TN_HASH_WININIT                 0x9F5D7E9A
-#define TN_HASH_WINLOGON                0xAE6E8FAB
-#define TN_HASH_SVCHOST                 0xBF7F9FBC
+#define TN_MAX_CALLBACK_DRAIN_SPINS     100000
 
 //=============================================================================
 // Global State
@@ -301,12 +358,6 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 TnpPruneOldEvents(
     _Inout_ PTN_PROCESS_CONTEXT Context
-    );
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static ULONG
-TnpHashProcessName(
-    _In_ PCWSTR Name
     );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -517,12 +568,13 @@ TnpInitializeMonitor(
 Routine Description:
 
     Initializes the thread monitoring infrastructure.
+    Does NOT zero the entire TN_MONITOR — InitState is already set
+    to TnStateInitializing by the caller. Zeroing it would create
+    a race where a second caller could pass the CAS check.
 
 --*/
 {
     PAGED_CODE();
-
-    RtlZeroMemory(&g_TnMonitor, sizeof(TN_MONITOR));
 
     //
     // Initialize process list
@@ -530,6 +582,7 @@ Routine Description:
     InitializeListHead(&g_TnMonitor.ProcessList);
     ExInitializePushLock(&g_TnMonitor.ProcessLock);
     g_TnMonitor.ProcessCount = 0;
+    g_TnMonitor.CallbackRegistered = FALSE;
 
     //
     // Initialize callback lock
@@ -544,7 +597,7 @@ Routine Description:
         &g_TnMonitor.EventLookaside,
         NULL,
         NULL,
-        POOL_NX_OPTIN,
+        0,
         sizeof(TN_THREAD_EVENT),
         TN_POOL_TAG_EVENT,
         0
@@ -554,7 +607,7 @@ Routine Description:
         &g_TnMonitor.ContextLookaside,
         NULL,
         NULL,
-        POOL_NX_OPTIN,
+        0,
         sizeof(TN_PROCESS_CONTEXT),
         TN_POOL_TAG_CONTEXT,
         0
@@ -706,9 +759,11 @@ Arguments:
     }
 
     //
-    // Track operation for clean shutdown
+    // Acquire rundown protection for safe shutdown coordination
     //
-    SHADOWSTRIKE_ENTER_OPERATION();
+    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {
+        return;
+    }
 
     if (Create) {
         InterlockedIncrement64(&g_TnMonitor.Stats.TotalThreadsCreated);
@@ -718,7 +773,7 @@ Arguments:
         TnpHandleThreadTermination(ProcessId, ThreadId);
     }
 
-    SHADOWSTRIKE_LEAVE_OPERATION();
+    SHADOWSTRIKE_RELEASE_RUNDOWN();
 }
 
 
@@ -1344,7 +1399,7 @@ Routine Description:
     NTSTATUS status;
     PEPROCESS process = NULL;
     PPEB peb = NULL;
-    PPEB_LDR_DATA ldrData = NULL;
+    PKM_PEB_LDR_DATA ldrData = NULL;
     PLIST_ENTRY listHead;
     PLIST_ENTRY listEntry;
     KAPC_STATE apcState;
@@ -1373,26 +1428,27 @@ Routine Description:
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        ProbeForRead(peb, sizeof(PEB), sizeof(PVOID));
-        ldrData = peb->Ldr;
+        PKM_PEB kmPeb = (PKM_PEB)peb;
+        ProbeForRead(kmPeb, KM_PEB_PROBE_SIZE, sizeof(PVOID));
+        ldrData = kmPeb->Ldr;
 
         if (ldrData == NULL) {
             status = STATUS_NOT_FOUND;
             __leave;
         }
 
-        ProbeForRead(ldrData, sizeof(PEB_LDR_DATA), sizeof(PVOID));
+        ProbeForRead(ldrData, KM_PEB_LDR_PROBE_SIZE, sizeof(PVOID));
 
         listHead = &ldrData->InMemoryOrderModuleList;
         listEntry = listHead->Flink;
 
         //
-        // SECURITY FIX: Bounded loop to prevent DoS from corrupted lists
+        // SECURITY: Bounded loop to prevent DoS from corrupted lists
         //
         while (listEntry != listHead &&
                iterationCount < TN_MAX_MODULE_WALK_ITERATIONS) {
 
-            PLDR_DATA_TABLE_ENTRY ldrEntry;
+            PKM_LDR_DATA_TABLE_ENTRY ldrEntry;
             ULONG_PTR moduleStart;
             ULONG_PTR moduleEnd;
 
@@ -1400,11 +1456,11 @@ Routine Description:
 
             ldrEntry = CONTAINING_RECORD(
                 listEntry,
-                LDR_DATA_TABLE_ENTRY,
+                KM_LDR_DATA_TABLE_ENTRY,
                 InMemoryOrderLinks
                 );
 
-            ProbeForRead(ldrEntry, sizeof(LDR_DATA_TABLE_ENTRY), sizeof(PVOID));
+            ProbeForRead(ldrEntry, KM_LDR_ENTRY_PROBE_SIZE, sizeof(PVOID));
 
             moduleStart = (ULONG_PTR)ldrEntry->DllBase;
             moduleEnd = moduleStart + ldrEntry->SizeOfImage;
@@ -1441,9 +1497,6 @@ Routine Description:
         }
 
         if (iterationCount >= TN_MAX_MODULE_WALK_ITERATIONS) {
-            //
-            // Possible corrupted list - log and return error
-            //
             status = STATUS_DATA_ERROR;
         } else {
             status = found ? STATUS_SUCCESS : STATUS_NOT_FOUND;
@@ -1557,7 +1610,6 @@ Routine Description:
     PUNICODE_STRING imageName = NULL;
     BOOLEAN isSystem = FALSE;
     WCHAR nameBuffer[64];
-    ULONG hash;
 
     //
     // System process (PID 4)
@@ -1605,9 +1657,13 @@ Routine Description:
             RtlCopyMemory(nameBuffer, fileName, (len + 1) * sizeof(WCHAR));
 
             //
-            // Convert to lowercase for comparison
+            // Kernel-safe lowercase conversion (no CRT _wcslwr)
             //
-            _wcslwr(nameBuffer);
+            for (SIZE_T i = 0; i < len; i++) {
+                if (nameBuffer[i] >= L'A' && nameBuffer[i] <= L'Z') {
+                    nameBuffer[i] = nameBuffer[i] - L'A' + L'a';
+                }
+            }
 
             //
             // Check against known system processes
@@ -1665,8 +1721,8 @@ Routine Description:
          entry != &g_DriverData.ProtectedProcessList;
          entry = entry->Flink) {
 
-        PPROTECTED_PROCESS_ENTRY protectedEntry =
-            CONTAINING_RECORD(entry, PROTECTED_PROCESS_ENTRY, ListEntry);
+        TN_PROTECTED_PROCESS_ENTRY* protectedEntry =
+            CONTAINING_RECORD(entry, TN_PROTECTED_PROCESS_ENTRY, ListEntry);
 
         if (protectedEntry->ProcessId == ProcessId) {
             found = TRUE;
@@ -2582,7 +2638,7 @@ TnRegisterCallback(
     //
     // Allocate new callback entry
     //
-    newEntry = (PTN_CALLBACK_ENTRY)ExAllocatePoolWithTag(
+    newEntry = (PTN_CALLBACK_ENTRY)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(TN_CALLBACK_ENTRY),
         TN_POOL_TAG
@@ -2609,11 +2665,13 @@ TnRegisterCallback(
     KeLeaveCriticalRegion();
 
     //
-    // Wait for old entry references to drain and free
+    // Wait for old entry references to drain with bounded spin
     //
     if (oldEntry != NULL) {
-        while (oldEntry->RefCount > 0) {
+        ULONG spins = 0;
+        while (oldEntry->RefCount > 0 && spins < TN_MAX_CALLBACK_DRAIN_SPINS) {
             YieldProcessor();
+            spins++;
         }
         ExFreePoolWithTag(oldEntry, TN_POOL_TAG);
     }
@@ -2643,10 +2701,12 @@ TnUnregisterCallback(
 
     if (oldEntry != NULL) {
         //
-        // Wait for references to drain
+        // Wait for references to drain with bounded spin
         //
-        while (oldEntry->RefCount > 0) {
+        ULONG spins = 0;
+        while (oldEntry->RefCount > 0 && spins < TN_MAX_CALLBACK_DRAIN_SPINS) {
             YieldProcessor();
+            spins++;
         }
         ExFreePoolWithTag(oldEntry, TN_POOL_TAG);
     }
