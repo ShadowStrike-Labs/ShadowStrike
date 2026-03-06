@@ -58,6 +58,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 #include <ntimage.h>
 
@@ -854,7 +855,7 @@ BOOLEAN
 ImageNotifyIsModuleLoaded(
     _In_ HANDLE ProcessId,
     _In_ PUNICODE_STRING ModuleName,
-    _Out_opt_ PPVOID ImageBase
+    _Out_opt_ PVOID* ImageBase
     );
 
 //
