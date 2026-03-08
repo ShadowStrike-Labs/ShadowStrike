@@ -289,6 +289,23 @@ typedef struct _OB_CALLBACK_CONTEXT {
     volatile LONG NameCacheIndex;
 
     //
+    // Cached install path for ShadowStrike process validation.
+    // Read from registry at init, used by ObpValidateProcessPath.
+    // If empty, falls back to default "C:\Program Files\ShadowStrike\".
+    //
+    WCHAR InstallPathBuffer[260];
+    UNICODE_STRING InstallPath;
+    volatile LONG InstallPathInitialized;
+
+    //
+    // Cached System32 device path prefix (e.g. "\Device\HarddiskVolume2\Windows\System32\")
+    // resolved at init via ZwQuerySymbolicLinkObject on \SystemRoot.
+    //
+    WCHAR System32DevicePathBuffer[260];
+    UNICODE_STRING System32DevicePath;
+    volatile LONG System32PathInitialized;
+
+    //
     // Configuration (volatile for dynamic updates)
     //
     volatile BOOLEAN EnableCredentialProtection;

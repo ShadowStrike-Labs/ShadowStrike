@@ -327,6 +327,16 @@ ObpLookupCachedName(
     _Out_writes_(16) PCHAR NameBuffer
     );
 
+static VOID
+ObpInitializeInstallPath(
+    VOID
+    );
+
+static VOID
+ObpInitializeSystem32Path(
+    VOID
+    );
+
 // ============================================================================
 // PUBLIC FUNCTIONS - REGISTRATION
 // ============================================================================
@@ -435,6 +445,12 @@ ShadowStrikeRegisterObjectCallbacks(
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
             "[ShadowStrike] ObpInitializeWellKnownPids failed: 0x%08X (continuing)\n", status);
     }
+
+    //
+    // Cache install path and System32 device path for validation
+    //
+    ObpInitializeInstallPath();
+    ObpInitializeSystem32Path();
 
     //
     // Initialize operation registrations
@@ -1446,6 +1462,35 @@ ObpIsCriticalSystemProcess(
                 return FALSE;
             }
         }
+
+        //
+        // Cache the PID for fast future lookups
+        //
+        {
+            CHAR imageName[16];
+            ObpGetProcessImageFileNameSafe(Process, imageName);
+
+            if (_stricmp(imageName, "csrss.exe") == 0 &&
+                g_ObCallbackContext.CsrssPid == 0) {
+                InterlockedExchange64(
+                    (volatile LONG64*)&g_ObCallbackContext.CsrssPid,
+                    (LONG64)(ULONG_PTR)processId);
+            } else if (_stricmp(imageName, "services.exe") == 0) {
+                InterlockedExchange64(
+                    (volatile LONG64*)&g_ObCallbackContext.ServicesPid,
+                    (LONG64)(ULONG_PTR)processId);
+            } else if (_stricmp(imageName, "winlogon.exe") == 0 &&
+                       g_ObCallbackContext.WinlogonPid == 0) {
+                InterlockedExchange64(
+                    (volatile LONG64*)&g_ObCallbackContext.WinlogonPid,
+                    (LONG64)(ULONG_PTR)processId);
+            } else if (_stricmp(imageName, "smss.exe") == 0) {
+                InterlockedExchange64(
+                    (volatile LONG64*)&g_ObCallbackContext.SmsssPid,
+                    (LONG64)(ULONG_PTR)processId);
+            }
+        }
+
         return TRUE;
     }
 
@@ -2091,15 +2136,37 @@ ObpMatchProcessNameAnsi(
 {
     CHAR imageName[16];
     ULONG i;
+    HANDLE processId;
+
+    processId = PsGetProcessId(Process);
 
     //
-    // Get image name using IRQL-safe function
+    // Try the name cache first for performance
+    //
+    if (ObpLookupCachedName(processId, imageName)) {
+        if (imageName[0] != '\0') {
+            for (i = 0; i < NameCount; i++) {
+                if (_stricmp(imageName, NameList[i]) == 0) {
+                    return TRUE;
+                }
+            }
+            return FALSE;
+        }
+    }
+
+    //
+    // Cache miss — get image name using IRQL-safe function
     //
     ObpGetProcessImageFileNameSafe(Process, imageName);
 
     if (imageName[0] == '\0') {
         return FALSE;
     }
+
+    //
+    // Cache the result for future lookups
+    //
+    ObpCacheProcessName(processId, imageName);
 
     //
     // Compare against list (case-insensitive)
@@ -2143,8 +2210,8 @@ ObpValidateProcessPath(
     NTSTATUS status;
     PUNICODE_STRING imagePath = NULL;
     BOOLEAN isValid = FALSE;
-    UNICODE_STRING systemRoot;
-    UNICODE_STRING windowsPrefix;
+    UNICODE_STRING systemRootPrefix;
+    UNICODE_STRING system32Suffix;
 
     //
     // This function must be called at PASSIVE_LEVEL for SeLocateProcessImageName
@@ -2173,42 +2240,134 @@ ObpValidateProcessPath(
         case PpCategoryLsass:
         case PpCategorySystem:
             //
-            // Must be in \SystemRoot\System32\ or \Windows\System32\
+            // Must be under a known System32 path.
+            // Check multiple possible path formats:
+            //   1. \SystemRoot\System32\  (NT symbolic link)
+            //   2. Cached device path from init (e.g. \Device\HarddiskVolume2\Windows\System32\)
+            //   3. DOS path with \??\<drive>:\Windows\System32\ for any drive letter
             //
-            RtlInitUnicodeString(&systemRoot, L"\\SystemRoot\\System32\\");
-            RtlInitUnicodeString(&windowsPrefix, L"\\??\\C:\\Windows\\System32\\");
+            RtlInitUnicodeString(&systemRootPrefix, L"\\SystemRoot\\System32\\");
 
-            if (RtlPrefixUnicodeString(&systemRoot, imagePath, TRUE) ||
-                RtlPrefixUnicodeString(&windowsPrefix, imagePath, TRUE)) {
+            if (RtlPrefixUnicodeString(&systemRootPrefix, imagePath, TRUE)) {
                 isValid = TRUE;
+            }
+
+            //
+            // Check cached device path (resolved at init from \SystemRoot symlink)
+            //
+            if (!isValid && g_ObCallbackContext.System32PathInitialized &&
+                g_ObCallbackContext.System32DevicePath.Length > 0) {
+                if (RtlPrefixUnicodeString(&g_ObCallbackContext.System32DevicePath, imagePath, TRUE)) {
+                    isValid = TRUE;
+                }
+            }
+
+            //
+            // Check DOS path format for any drive letter (\??\X:\Windows\System32\)
+            //
+            if (!isValid && imagePath->Length >= 28 * sizeof(WCHAR)) {
+                RtlInitUnicodeString(&system32Suffix, L"\\Windows\\System32\\");
+
+                if (imagePath->Buffer[0] == L'\\' &&
+                    imagePath->Buffer[1] == L'?' &&
+                    imagePath->Buffer[2] == L'?' &&
+                    imagePath->Buffer[3] == L'\\' &&
+                    imagePath->Buffer[5] == L':' &&
+                    imagePath->Buffer[6] == L'\\') {
+                    //
+                    // Looks like \??\X:\... — check the rest matches \Windows\System32\
+                    //
+                    UNICODE_STRING pathAfterDrive;
+                    pathAfterDrive.Buffer = &imagePath->Buffer[6];
+                    pathAfterDrive.Length = imagePath->Length - (6 * sizeof(WCHAR));
+                    pathAfterDrive.MaximumLength = pathAfterDrive.Length;
+
+                    if (RtlPrefixUnicodeString(&system32Suffix, &pathAfterDrive, TRUE)) {
+                        isValid = TRUE;
+                    }
+                }
             }
             break;
 
         case PpCategoryAntimalware:
             //
-            // ShadowStrike processes — validate against install directory.
-            // TODO(integration): Read install path from HKLM\...\ShadowStrike\InstallPath
-            // registry key once user-mode service populates it at startup.
+            // ShadowStrike processes — validate against cached install directory.
+            // Install path is read from registry at initialization:
+            //   HKLM\SOFTWARE\ShadowStrike\InstallPath
+            // Falls back to default path if registry key is not present.
             //
-            {
-                UNICODE_STRING shadowStrikePath;
-                RtlInitUnicodeString(&shadowStrikePath, L"\\??\\C:\\Program Files\\ShadowStrike\\");
-
-                if (RtlPrefixUnicodeString(&shadowStrikePath, imagePath, TRUE)) {
+            if (g_ObCallbackContext.InstallPathInitialized &&
+                g_ObCallbackContext.InstallPath.Length > 0) {
+                if (RtlPrefixUnicodeString(&g_ObCallbackContext.InstallPath, imagePath, TRUE)) {
                     isValid = TRUE;
+                }
+            } else {
+                //
+                // Fallback: default install location for any drive letter
+                //
+                UNICODE_STRING defaultSuffix;
+                RtlInitUnicodeString(&defaultSuffix, L"\\Program Files\\ShadowStrike\\");
+
+                if (imagePath->Length >= 30 * sizeof(WCHAR) &&
+                    imagePath->Buffer[0] == L'\\' &&
+                    imagePath->Buffer[1] == L'?' &&
+                    imagePath->Buffer[2] == L'?' &&
+                    imagePath->Buffer[3] == L'\\' &&
+                    imagePath->Buffer[5] == L':' &&
+                    imagePath->Buffer[6] == L'\\') {
+                    UNICODE_STRING pathAfterDrive;
+                    pathAfterDrive.Buffer = &imagePath->Buffer[6];
+                    pathAfterDrive.Length = imagePath->Length - (6 * sizeof(WCHAR));
+                    pathAfterDrive.MaximumLength = pathAfterDrive.Length;
+
+                    if (RtlPrefixUnicodeString(&defaultSuffix, &pathAfterDrive, TRUE)) {
+                        isValid = TRUE;
+                    }
                 }
             }
             break;
 
         case PpCategoryServices:
-            //
-            // Services can be anywhere, but validate against known service paths
-            //
-            isValid = TRUE;
-            break;
-
         default:
-            isValid = TRUE;
+            //
+            // Services and unknown categories: require the binary to be located
+            // within a known system path. This prevents spoofed service names
+            // from arbitrary directories gaining trusted status.
+            //
+            {
+                UNICODE_STRING sys32Suffix;
+                UNICODE_STRING progFilesSuffix;
+                RtlInitUnicodeString(&sys32Suffix, L"\\Windows\\System32\\");
+                RtlInitUnicodeString(&progFilesSuffix, L"\\Program Files\\");
+
+                if (imagePath->Length >= 14 * sizeof(WCHAR) &&
+                    imagePath->Buffer[0] == L'\\' &&
+                    imagePath->Buffer[1] == L'?' &&
+                    imagePath->Buffer[2] == L'?' &&
+                    imagePath->Buffer[3] == L'\\' &&
+                    imagePath->Buffer[5] == L':' &&
+                    imagePath->Buffer[6] == L'\\') {
+                    UNICODE_STRING pathAfterDrive;
+                    pathAfterDrive.Buffer = &imagePath->Buffer[6];
+                    pathAfterDrive.Length = imagePath->Length - (6 * sizeof(WCHAR));
+                    pathAfterDrive.MaximumLength = pathAfterDrive.Length;
+
+                    if (RtlPrefixUnicodeString(&sys32Suffix, &pathAfterDrive, TRUE) ||
+                        RtlPrefixUnicodeString(&progFilesSuffix, &pathAfterDrive, TRUE)) {
+                        isValid = TRUE;
+                    }
+                }
+
+                //
+                // Also accept SystemRoot prefix
+                //
+                if (!isValid) {
+                    RtlInitUnicodeString(&sys32Suffix, L"\\SystemRoot\\");
+                    if (RtlPrefixUnicodeString(&sys32Suffix, imagePath, TRUE)) {
+                        isValid = TRUE;
+                    }
+                }
+            }
             break;
     }
 
@@ -2309,4 +2468,235 @@ ObpLookupCachedName(
     }
 
     return FALSE;
+}
+
+// ============================================================================
+// Install Path Initialization
+// ============================================================================
+
+static VOID
+ObpInitializeInstallPath(
+    VOID
+    )
+{
+    NTSTATUS status;
+    OBJECT_ATTRIBUTES objAttr;
+    UNICODE_STRING keyPath;
+    UNICODE_STRING valueName;
+    HANDLE keyHandle = NULL;
+    UCHAR valueBuffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 520];
+    PKEY_VALUE_PARTIAL_INFORMATION valueInfo;
+    ULONG resultLength = 0;
+    ULONG copyLength;
+
+    //
+    // Attempt to read install path from:
+    //   HKLM\SOFTWARE\ShadowStrike\InstallPath
+    //
+    RtlInitUnicodeString(&keyPath,
+        L"\\Registry\\Machine\\SOFTWARE\\ShadowStrike");
+    RtlInitUnicodeString(&valueName, L"InstallPath");
+
+    InitializeObjectAttributes(&objAttr, &keyPath,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+        NULL, NULL);
+
+    status = ZwOpenKey(&keyHandle, KEY_READ, &objAttr);
+    if (!NT_SUCCESS(status)) {
+        goto UseDefault;
+    }
+
+    valueInfo = (PKEY_VALUE_PARTIAL_INFORMATION)valueBuffer;
+
+    status = ZwQueryValueKey(
+        keyHandle,
+        &valueName,
+        KeyValuePartialInformation,
+        valueInfo,
+        sizeof(valueBuffer),
+        &resultLength
+        );
+
+    ZwClose(keyHandle);
+    keyHandle = NULL;
+
+    if (!NT_SUCCESS(status) || valueInfo->Type != REG_SZ ||
+        valueInfo->DataLength < sizeof(WCHAR) * 2) {
+        goto UseDefault;
+    }
+
+    //
+    // Validate and copy the registry value.
+    // Cap at buffer size - 2 chars for trailing backslash + null.
+    //
+    copyLength = valueInfo->DataLength;
+    if (copyLength > (sizeof(g_ObCallbackContext.InstallPathBuffer) - 2 * sizeof(WCHAR))) {
+        copyLength = sizeof(g_ObCallbackContext.InstallPathBuffer) - 2 * sizeof(WCHAR);
+    }
+
+    RtlZeroMemory(g_ObCallbackContext.InstallPathBuffer,
+                   sizeof(g_ObCallbackContext.InstallPathBuffer));
+    RtlCopyMemory(g_ObCallbackContext.InstallPathBuffer,
+                   valueInfo->Data, copyLength);
+
+    //
+    // Ensure trailing backslash for prefix matching
+    //
+    {
+        ULONG charCount = copyLength / sizeof(WCHAR);
+        while (charCount > 0 && g_ObCallbackContext.InstallPathBuffer[charCount - 1] == L'\0') {
+            charCount--;
+        }
+        if (charCount > 0 && g_ObCallbackContext.InstallPathBuffer[charCount - 1] != L'\\') {
+            if (charCount < ARRAYSIZE(g_ObCallbackContext.InstallPathBuffer) - 1) {
+                g_ObCallbackContext.InstallPathBuffer[charCount] = L'\\';
+                charCount++;
+            }
+        }
+        g_ObCallbackContext.InstallPath.Buffer = g_ObCallbackContext.InstallPathBuffer;
+        g_ObCallbackContext.InstallPath.Length = (USHORT)(charCount * sizeof(WCHAR));
+        g_ObCallbackContext.InstallPath.MaximumLength = sizeof(g_ObCallbackContext.InstallPathBuffer);
+    }
+
+    InterlockedExchange(&g_ObCallbackContext.InstallPathInitialized, 1);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike] ObCallback: Install path from registry: %wZ\n",
+        &g_ObCallbackContext.InstallPath);
+    return;
+
+UseDefault:
+    if (keyHandle != NULL) {
+        ZwClose(keyHandle);
+    }
+
+    //
+    // Default: use standard install location with NT path prefix.
+    // Use \??\ prefix for DOS-path format matching.
+    //
+    {
+        UNICODE_STRING defaultPath;
+        RtlInitUnicodeString(&defaultPath,
+            L"\\??\\C:\\Program Files\\ShadowStrike\\");
+
+        RtlZeroMemory(g_ObCallbackContext.InstallPathBuffer,
+                       sizeof(g_ObCallbackContext.InstallPathBuffer));
+        RtlCopyMemory(g_ObCallbackContext.InstallPathBuffer,
+                       defaultPath.Buffer, defaultPath.Length);
+
+        g_ObCallbackContext.InstallPath.Buffer = g_ObCallbackContext.InstallPathBuffer;
+        g_ObCallbackContext.InstallPath.Length = defaultPath.Length;
+        g_ObCallbackContext.InstallPath.MaximumLength = sizeof(g_ObCallbackContext.InstallPathBuffer);
+    }
+
+    InterlockedExchange(&g_ObCallbackContext.InstallPathInitialized, 1);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike] ObCallback: Using default install path: %wZ\n",
+        &g_ObCallbackContext.InstallPath);
+}
+
+// ============================================================================
+// System32 Device Path Initialization
+// ============================================================================
+
+static VOID
+ObpInitializeSystem32Path(
+    VOID
+    )
+{
+    NTSTATUS status;
+    OBJECT_ATTRIBUTES objAttr;
+    UNICODE_STRING symlinkName;
+    HANDLE linkHandle = NULL;
+    UNICODE_STRING targetPath;
+    ULONG pathChars;
+
+    //
+    // Resolve \SystemRoot symbolic link to get the device path of the
+    // Windows directory (e.g. \Device\HarddiskVolume2\Windows).
+    // Then append \System32\ for System32 prefix matching.
+    //
+
+    RtlZeroMemory(g_ObCallbackContext.System32DevicePathBuffer,
+                   sizeof(g_ObCallbackContext.System32DevicePathBuffer));
+
+    RtlInitUnicodeString(&symlinkName, L"\\SystemRoot");
+    InitializeObjectAttributes(&objAttr, &symlinkName,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+        NULL, NULL);
+
+    status = ZwOpenSymbolicLinkObject(&linkHandle, GENERIC_READ, &objAttr);
+    if (!NT_SUCCESS(status)) {
+        goto Fail;
+    }
+
+    targetPath.Buffer = g_ObCallbackContext.System32DevicePathBuffer;
+    targetPath.Length = 0;
+    targetPath.MaximumLength = (USHORT)(sizeof(g_ObCallbackContext.System32DevicePathBuffer)
+                                        - 20 * sizeof(WCHAR));
+
+    status = ZwQuerySymbolicLinkObject(linkHandle, &targetPath, NULL);
+    ZwClose(linkHandle);
+    linkHandle = NULL;
+
+    if (!NT_SUCCESS(status) || targetPath.Length == 0) {
+        goto Fail;
+    }
+
+    //
+    // targetPath is something like \Device\HarddiskVolume2\Windows
+    // Append \System32\ for prefix matching
+    //
+    pathChars = targetPath.Length / sizeof(WCHAR);
+
+    //
+    // Ensure trailing backslash before appending System32
+    //
+    if (pathChars > 0 && g_ObCallbackContext.System32DevicePathBuffer[pathChars - 1] != L'\\') {
+        if (pathChars < ARRAYSIZE(g_ObCallbackContext.System32DevicePathBuffer) - 10) {
+            g_ObCallbackContext.System32DevicePathBuffer[pathChars++] = L'\\';
+        }
+    }
+
+    //
+    // Append "System32\"
+    //
+    if (pathChars + 9 < ARRAYSIZE(g_ObCallbackContext.System32DevicePathBuffer)) {
+        g_ObCallbackContext.System32DevicePathBuffer[pathChars++] = L'S';
+        g_ObCallbackContext.System32DevicePathBuffer[pathChars++] = L'y';
+        g_ObCallbackContext.System32DevicePathBuffer[pathChars++] = L's';
+        g_ObCallbackContext.System32DevicePathBuffer[pathChars++] = L't';
+        g_ObCallbackContext.System32DevicePathBuffer[pathChars++] = L'e';
+        g_ObCallbackContext.System32DevicePathBuffer[pathChars++] = L'm';
+        g_ObCallbackContext.System32DevicePathBuffer[pathChars++] = L'3';
+        g_ObCallbackContext.System32DevicePathBuffer[pathChars++] = L'2';
+        g_ObCallbackContext.System32DevicePathBuffer[pathChars++] = L'\\';
+        g_ObCallbackContext.System32DevicePathBuffer[pathChars] = L'\0';
+    }
+
+    g_ObCallbackContext.System32DevicePath.Buffer = g_ObCallbackContext.System32DevicePathBuffer;
+    g_ObCallbackContext.System32DevicePath.Length = (USHORT)(pathChars * sizeof(WCHAR));
+    g_ObCallbackContext.System32DevicePath.MaximumLength =
+        sizeof(g_ObCallbackContext.System32DevicePathBuffer);
+
+    InterlockedExchange(&g_ObCallbackContext.System32PathInitialized, 1);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike] ObCallback: System32 device path resolved: %wZ\n",
+        &g_ObCallbackContext.System32DevicePath);
+    return;
+
+Fail:
+    if (linkHandle != NULL) {
+        ZwClose(linkHandle);
+    }
+
+    //
+    // Failed to resolve — the function will still work via
+    // \SystemRoot\System32\ prefix and \??\X:\Windows\System32\ DOS path checks
+    //
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        "[ShadowStrike] ObCallback: Could not resolve \\SystemRoot symlink (0x%08X), "
+        "using fallback path validation\n", status);
 }
