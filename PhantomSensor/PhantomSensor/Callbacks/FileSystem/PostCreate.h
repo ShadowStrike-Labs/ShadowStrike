@@ -76,7 +76,10 @@
 extern "C" {
 #endif
 
+#pragma warning(push)
+#pragma warning(disable:4324)  // structure was padded due to alignment specifier
 #include <fltKernel.h>
+#pragma warning(pop)
 #include <ntifs.h>
 
 // ============================================================================
@@ -224,6 +227,12 @@ typedef enum _POC_FILE_CLASS {
 // ============================================================================
 // STREAM CONTEXT STRUCTURE
 // ============================================================================
+
+//
+// Prevent SharedDefs.h lightweight definition from conflicting.
+// PostCreate.h defines the canonical, full-featured stream context.
+//
+#define _SHADOWSTRIKE_STREAM_CONTEXT_DEFINED_
 
 /**
  * @brief Enterprise stream context for file tracking.
