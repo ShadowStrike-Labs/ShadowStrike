@@ -84,11 +84,16 @@ REVISION HISTORY:
 ===============================================================================
 --*/
 
+#pragma warning(push)
+#pragma warning(disable: 4324)
+#include <ntifs.h>
 #include "FileSystemCallbacks.h"
+#pragma warning(pop)
 #include "../../Core/Globals.h"
 #include "../../Shared/SharedDefs.h"
+#include "../../Shared/VerdictTypes.h"
 #include "../../Cache/ScanCache.h"
-#include "../../Communication/ScanBridge.h"
+#include "../../Communication/CommPort.h"
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../Utilities/MemoryUtils.h"
@@ -112,6 +117,67 @@ ZwQuerySystemInformation(
     _In_ ULONG SystemInformationLength,
     _Out_opt_ PULONG ReturnLength
     );
+
+//
+// Kernel-mode definitions for SYSTEM_PROCESS_INFORMATION and
+// SYSTEM_THREAD_INFORMATION (not exported from standard WDK headers).
+//
+#ifndef _PAS_SYSTEM_INFO_DEFINED
+#define _PAS_SYSTEM_INFO_DEFINED
+
+typedef struct _PAS_SYSTEM_THREAD_INFORMATION {
+    LARGE_INTEGER KernelTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER CreateTime;
+    ULONG WaitTime;
+    PVOID StartAddress;
+    CLIENT_ID ClientId;
+    KPRIORITY Priority;
+    LONG BasePriority;
+    ULONG ContextSwitches;
+    ULONG ThreadState;
+    ULONG WaitReason;
+} PAS_SYSTEM_THREAD_INFORMATION, *PPAS_SYSTEM_THREAD_INFORMATION;
+
+typedef struct _PAS_SYSTEM_PROCESS_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    LARGE_INTEGER WorkingSetPrivateSize;
+    ULONG HardFaultCount;
+    ULONG NumberOfThreadsHighWatermark;
+    ULONGLONG CycleTime;
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    UNICODE_STRING ImageName;
+    KPRIORITY BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+    ULONG HandleCount;
+    ULONG SessionId;
+    ULONG_PTR UniqueProcessKey;
+    SIZE_T PeakVirtualSize;
+    SIZE_T VirtualSize;
+    ULONG PageFaultCount;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+    SIZE_T PrivatePageCount;
+    LARGE_INTEGER ReadOperationCount;
+    LARGE_INTEGER WriteOperationCount;
+    LARGE_INTEGER OtherOperationCount;
+    LARGE_INTEGER ReadTransferCount;
+    LARGE_INTEGER WriteTransferCount;
+    LARGE_INTEGER OtherTransferCount;
+    PAS_SYSTEM_THREAD_INFORMATION Threads[1];
+} PAS_SYSTEM_PROCESS_INFORMATION, *PPAS_SYSTEM_PROCESS_INFORMATION;
+
+#endif // _PAS_SYSTEM_INFO_DEFINED
 
 //
 // Thread wait state — matches kernel KTHREAD_STATE
@@ -245,7 +311,7 @@ typedef struct _PAS_MAPPING_RECORD {
     //
     // Verdict
     //
-    SHADOWSTRIKE_VERDICT Verdict;
+    SHADOWSTRIKE_SCAN_VERDICT Verdict;
     BOOLEAN WasCacheHit;
     BOOLEAN WasBlocked;
 
@@ -433,6 +499,7 @@ typedef struct _PAS_GLOBAL_STATE {
     WORK_QUEUE_ITEM CleanupWorkItem;
     volatile BOOLEAN CleanupWorkItemQueued;
     volatile BOOLEAN CleanupTimerActive;
+    KEVENT CleanupWorkDoneEvent;
 
     //
     // Shutdown synchronization
@@ -741,7 +808,7 @@ PaspIsProcessSuspended(
     PVOID buffer = NULL;
     ULONG bufferSize = PAS_SYSINFO_INITIAL_BUFFER;
     ULONG returnLength = 0;
-    PSYSTEM_PROCESS_INFORMATION processInfo;
+    PPAS_SYSTEM_PROCESS_INFORMATION processInfo;
     BOOLEAN hasSuspendedThreads = FALSE;
 
     if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
@@ -799,7 +866,7 @@ PaspIsProcessSuspended(
     //
     // Walk the process list to find our target PID
     //
-    processInfo = (PSYSTEM_PROCESS_INFORMATION)buffer;
+    processInfo = (PPAS_SYSTEM_PROCESS_INFORMATION)buffer;
 
     for (;;) {
         if (processInfo->UniqueProcessId == ProcessId) {
@@ -810,16 +877,16 @@ PaspIsProcessSuspended(
             //
             ULONG threadCount = processInfo->NumberOfThreads;
             ULONG suspendedCount = 0;
-            PSYSTEM_THREAD_INFORMATION threadInfo;
+            PPAS_SYSTEM_THREAD_INFORMATION threadInfo;
 
             if (threadCount == 0) {
                 break;
             }
 
             //
-            // Threads array starts immediately after the SYSTEM_PROCESS_INFORMATION
+            // Threads array is the flexible member at end of PAS_SYSTEM_PROCESS_INFORMATION
             //
-            threadInfo = (PSYSTEM_THREAD_INFORMATION)(processInfo + 1);
+            threadInfo = processInfo->Threads;
 
             for (ULONG i = 0; i < threadCount; i++) {
                 //
@@ -847,7 +914,7 @@ PaspIsProcessSuspended(
             break;
         }
 
-        processInfo = (PSYSTEM_PROCESS_INFORMATION)(
+        processInfo = (PPAS_SYSTEM_PROCESS_INFORMATION)(
             (PUCHAR)processInfo + processInfo->NextEntryOffset
         );
     }
@@ -1045,13 +1112,19 @@ PaspInitialize(
 
     //
     // Initialize cleanup work item (runs at PASSIVE_LEVEL)
+    // Note: ExInitializeWorkItem/ExQueueWorkItem are deprecated but are the
+    // correct API for minifilter drivers without a device object. Suppress C4996.
     //
+#pragma warning(push)
+#pragma warning(disable: 4996)
     ExInitializeWorkItem(
         &g_PasState.CleanupWorkItem,
         PaspCleanupWorkRoutine,
         NULL
         );
+#pragma warning(pop)
     InterlockedExchange((PLONG)&g_PasState.CleanupWorkItemQueued, FALSE);
+    KeInitializeEvent(&g_PasState.CleanupWorkDoneEvent, NotificationEvent, TRUE);
 
     //
     // Initialize cleanup timer and DPC
@@ -1139,14 +1212,18 @@ PaspShutdown(
     }
 
     //
-    // Wait for any queued work item to complete
-    // Note: There's no direct API to wait for work items, so we use a short delay
-    // In production, consider using a dedicated worker thread with proper signaling
+    // Wait for any queued work item to complete using completion event
     //
     if (g_PasState.CleanupWorkItemQueued) {
-        LARGE_INTEGER Delay;
-        Delay.QuadPart = -500000;  // 50ms
-        KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+        LARGE_INTEGER Timeout;
+        Timeout.QuadPart = -50000000LL;  // 5 seconds max safety timeout
+        KeWaitForSingleObject(
+            &g_PasState.CleanupWorkDoneEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &Timeout
+            );
     }
 
     //
@@ -1313,10 +1390,6 @@ IRQL:
     //
     // Validate external dependencies before use
     //
-    if (SHADOWSTRIKE_IS_READY == NULL) {
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
     if (!SHADOWSTRIKE_IS_READY()) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
@@ -1374,20 +1447,16 @@ IRQL:
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    //
-    // Validate ShadowStrikeIsProcessProtected before calling
-    //
-    if (ShadowStrikeIsProcessProtected != NULL &&
-        ShadowStrikeIsProcessProtected(CurrentProcessId)) {
+    if (ShadowStrikeIsProcessProtected(CurrentProcessId, NULL)) {
         InterlockedIncrement64((PLONG64)&g_PasState.Stats.Allowed);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     //
-    // Enter operation tracking
+    // Acquire rundown protection for this operation
     //
-    if (SHADOWSTRIKE_ENTER_OPERATION != NULL) {
-        SHADOWSTRIKE_ENTER_OPERATION();
+    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     //
@@ -1413,7 +1482,7 @@ IRQL:
                 IsCacheHit = TRUE;
                 InterlockedIncrement64((PLONG64)&g_PasState.Stats.CacheHits);
 
-                if (CacheResult.Verdict == ShadowStrikeVerdictBlock) {
+                if (CacheResult.Verdict == Verdict_Malicious) {
                     //
                     // Known malware - BLOCK immediately
                     //
@@ -1653,23 +1722,14 @@ IRQL:
         Data->IoStatus.Information = 0;
 
         InterlockedIncrement64((PLONG64)&g_PasState.Stats.Blocked);
-
-        if (SHADOWSTRIKE_INC_STAT != NULL) {
-            SHADOWSTRIKE_INC_STAT(FilesBlocked);
-        }
-
-        if (SHADOWSTRIKE_LEAVE_OPERATION != NULL) {
-            SHADOWSTRIKE_LEAVE_OPERATION();
-        }
+        SHADOWSTRIKE_INC_STAT(FilesBlocked);
+        SHADOWSTRIKE_RELEASE_RUNDOWN();
 
         return FLT_PREOP_COMPLETE;
     }
 
     InterlockedIncrement64((PLONG64)&g_PasState.Stats.Allowed);
-
-    if (SHADOWSTRIKE_LEAVE_OPERATION != NULL) {
-        SHADOWSTRIKE_LEAVE_OPERATION();
-    }
+    SHADOWSTRIKE_RELEASE_RUNDOWN();
 
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
@@ -1855,8 +1915,8 @@ Arguments:
     Context - Process context to dereference.
 
 Thread Safety:
-    Holds exclusive lock before decrementing to zero to prevent
-    use-after-free race conditions.
+    Always uses a single atomic decrement. If refcount reaches zero,
+    acquires exclusive lock to safely remove from list before freeing.
 --*/
 static VOID
 PaspDereferenceProcessContext(
@@ -1867,30 +1927,21 @@ PaspDereferenceProcessContext(
     BOOLEAN ShouldFree = FALSE;
 
     //
-    // Fast path: if RefCount > 1, just decrement
+    // Single atomic decrement — never double-decrement
     //
-    if (Context->RefCount > 1) {
-        NewRef = InterlockedDecrement(&Context->RefCount);
-        if (NewRef > 0) {
-            return;
-        }
-        //
-        // Race: someone else decremented too, fall through to locked path
-        //
+    NewRef = InterlockedDecrement(&Context->RefCount);
+
+    if (NewRef > 0) {
+        return;
     }
 
     //
-    // Slow path: acquire lock before final decrement
+    // RefCount reached zero — acquire lock to safely remove from list
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PasState.ProcessContextLock);
 
-    NewRef = InterlockedDecrement(&Context->RefCount);
-
-    if (NewRef == 0) {
-        //
-        // We're the last reference - remove from list if present
-        //
+    if (Context->RefCount == 0) {
         if (!IsListEmpty(&Context->ListEntry)) {
             RemoveEntryList(&Context->ListEntry);
             InitializeListHead(&Context->ListEntry);
@@ -2606,7 +2657,10 @@ PaspCleanupTimerDpc(
     // Work items run at PASSIVE_LEVEL where push locks are safe
     //
     if (!InterlockedCompareExchange((PLONG)&g_PasState.CleanupWorkItemQueued, TRUE, FALSE)) {
+#pragma warning(push)
+#pragma warning(disable: 4996)
         ExQueueWorkItem(&g_PasState.CleanupWorkItem, DelayedWorkQueue);
+#pragma warning(pop)
     }
 }
 
@@ -2629,21 +2683,29 @@ PaspCleanupWorkRoutine(
     UNREFERENCED_PARAMETER(Parameter);
 
     //
-    // Mark as no longer queued
+    // Reset the completion event (unsignaled while working)
     //
-    InterlockedExchange((PLONG)&g_PasState.CleanupWorkItemQueued, FALSE);
+    KeClearEvent(&g_PasState.CleanupWorkDoneEvent);
 
     //
     // Check shutdown flag
     //
     if (InterlockedCompareExchange(&g_PasState.ShutdownRequested, 0, 0)) {
-        return;
+        goto Done;
     }
 
     //
     // Perform cleanup at PASSIVE_LEVEL
     //
     PaspCleanupStaleRecords();
+
+Done:
+    //
+    // Mark as no longer queued AFTER work completes
+    // (prevents DPC from re-queuing same WORK_QUEUE_ITEM while executing)
+    //
+    InterlockedExchange((PLONG)&g_PasState.CleanupWorkItemQueued, FALSE);
+    KeSetEvent(&g_PasState.CleanupWorkDoneEvent, 0, FALSE);
 }
 
 
