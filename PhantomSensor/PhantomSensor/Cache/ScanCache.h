@@ -53,8 +53,8 @@ extern "C" {
 #endif
 
 #include <fltKernel.h>
-#include "../Shared/SharedDefs.h"
-#include "../Shared/VerdictTypes.h"
+#include "../../Shared/SharedDefs.h"
+#include "../../Shared/VerdictTypes.h"
 
 // ============================================================================
 // CONSTANTS

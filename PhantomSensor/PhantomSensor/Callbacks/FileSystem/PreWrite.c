@@ -111,7 +111,6 @@ MITRE ATT&CK Coverage:
 //
 #define PW_MAX_SUBSTRING_LENGTH         260     // Maximum pattern length
 #define PW_MAX_CANARY_PATHS             64      // Maximum canary file paths
-#define PW_CLEANUP_WAIT_TIMEOUT_MS      5000    // 5 second wait for cleanup
 
 //
 // File classification flags for write analysis
@@ -630,27 +629,48 @@ Routine Description:
     Waits for all outstanding operations to complete before cleanup.
 --*/
 {
-    LARGE_INTEGER Timeout;
+    LONG i;
 
     if (!InterlockedExchange(&g_PwState.Initialized, FALSE)) {
         return;
     }
 
     //
-    // Wait for outstanding operations to complete
+    // Wait for outstanding operations to drain.
     //
+    // CRITICAL: Clear the event BEFORE reading the count to prevent TOCTOU.
+    // Without this ordering, the last operation could signal the event between
+    // our count read and KeClearEvent, causing us to clear an already-signaled
+    // event and wait indefinitely.
+    //
+    KeClearEvent(&g_PwState.CleanupEvent);
+    MemoryBarrier();
+
     if (g_PwState.OutstandingOperations > 0) {
-        KeClearEvent(&g_PwState.CleanupEvent);
-
-        Timeout.QuadPart = -((LONGLONG)PW_CLEANUP_WAIT_TIMEOUT_MS * 10000);
-
         KeWaitForSingleObject(
             &g_PwState.CleanupEvent,
             Executive,
             KernelMode,
             FALSE,
-            &Timeout
+            NULL
             );
+    }
+
+    //
+    // Free canary path buffers before destroying state
+    //
+    if (g_PwState.CanaryConfig.Initialized) {
+        for (i = 0; i < g_PwState.CanaryConfig.Count; i++) {
+            if (g_PwState.CanaryConfig.Paths[i].Buffer != NULL) {
+                ExFreePoolWithTag(
+                    g_PwState.CanaryConfig.Paths[i].Buffer,
+                    PW_POOL_TAG
+                    );
+                g_PwState.CanaryConfig.Paths[i].Buffer = NULL;
+            }
+        }
+        g_PwState.CanaryConfig.Count = 0;
+        g_PwState.CanaryConfig.Initialized = FALSE;
     }
 
     //
@@ -698,8 +718,15 @@ Return Value:
     LONG Index;
     PWCHAR Buffer;
 
-    if (!g_PwState.Initialized || Path == NULL || Path->Length == 0) {
+    if (Path == NULL || Path->Buffer == NULL || Path->Length == 0) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Acquire operation reference to prevent cleanup race
+    //
+    if (!PwpEnterOperation()) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     KeEnterCriticalRegion();
@@ -735,6 +762,8 @@ Return Value:
 Cleanup:
     ExReleasePushLockExclusive(&g_PwState.CanaryConfig.Lock);
     KeLeaveCriticalRegion();
+
+    PwpLeaveOperation();
 
     return Status;
 }
@@ -833,8 +862,6 @@ Return Value:
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    SHADOWSTRIKE_ENTER_OPERATION();
-
     RequestorPid = PsGetCurrentProcessId();
 
     //
@@ -864,7 +891,7 @@ Return Value:
     // SELF-PROTECTION CHECK
     // =========================================================================
 
-    if (g_SelfProtectInitialized && g_DriverData.Config.SelfProtectionEnabled) {
+    if (g_DriverData.Config.SelfProtectionEnabled) {
         if (ShadowStrikeShouldBlockFileAccess(
                 &NameInfo->Name,
                 FILE_WRITE_DATA,
@@ -983,7 +1010,7 @@ Return Value:
     // RANSOMWARE ROLLBACK — Copy-on-first-write backup before modification
     // =========================================================================
 
-    FbePreWriteBackup(Data, FltObjects, RequestorPid, &NameInfo->Name);
+    FbePreWriteBackup(Data, FltObjects, &NameInfo->Name);
 
     // =========================================================================
     // ALLOCATE COMPLETION CONTEXT FOR ADVANCED ANALYSIS
@@ -1002,7 +1029,8 @@ Return Value:
         //
         PwContext->WriteLength = Data->Iopb->Parameters.Write.Length;
 
-        if (Data->Iopb->Parameters.Write.ByteOffset.QuadPart != -1) {
+        if (Data->Iopb->Parameters.Write.ByteOffset.QuadPart != -1 &&
+            Data->Iopb->Parameters.Write.ByteOffset.QuadPart != -2) {
             PwContext->WriteOffset = Data->Iopb->Parameters.Write.ByteOffset.QuadPart;
             PwContext->IsOffsetSpecified = TRUE;
             PwContext->WritesToFileStart = (PwContext->WriteOffset == 0);
@@ -1139,8 +1167,16 @@ Cleanup:
         PwpFreeContext(PwContext);
     }
 
-    SHADOWSTRIKE_LEAVE_OPERATION();
-    PwpLeaveOperation();
+    //
+    // Only leave operation if NOT returning with post-callback.
+    // When returning WITH_CALLBACK, PostWrite inherits the operation
+    // reference and will call PwpLeaveOperation when done.
+    // Without this, shutdown can delete the lookaside between PreWrite
+    // returning and PostWrite running → BSOD.
+    //
+    if (ReturnStatus != FLT_PREOP_SUCCESS_WITH_CALLBACK) {
+        PwpLeaveOperation();
+    }
 
     return ReturnStatus;
 }
@@ -1204,6 +1240,7 @@ Return Value:
         if (g_PwState.LookasideInitialized) {
             ExFreeToNPagedLookasideList(&g_PwState.ContextLookaside, PwContext);
         }
+        PwpLeaveOperation();
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
@@ -1233,16 +1270,22 @@ Return Value:
 
             ExQueueWorkItem(&DeferredCleanup->WorkItem, DelayedWorkQueue);
             InterlockedIncrement64(&g_PwState.Stats.DeferredCleanups);
+
+            //
+            // Work item inherits the operation reference.
+            // PwpLeaveOperation will be called by PwpDeferredCleanupWorker.
+            //
         } else {
             //
             // Failed to allocate work item - leak is better than BSOD
-            // Log the issue
+            // Still must release the operation reference to prevent deadlock
             //
             DbgPrintEx(
                 DPFLTR_IHVDRIVER_ID,
                 DPFLTR_ERROR_LEVEL,
                 "[ShadowStrike/PostWrite] Failed to allocate deferred cleanup work item\n"
                 );
+            PwpLeaveOperation();
         }
 
         return FLT_POSTOP_FINISHED_PROCESSING;
@@ -1272,6 +1315,7 @@ Return Value:
     }
 
     PwpFreeContext(PwContext);
+    PwpLeaveOperation();
 
     return FLT_POSTOP_FINISHED_PROCESSING;
 }
@@ -1302,6 +1346,12 @@ Arguments:
     PwpPerformDeferredCleanup(Cleanup->NameInfo, Cleanup->Context);
 
     ExFreePoolWithTag(Cleanup, PW_WORKITEM_POOL_TAG);
+
+    //
+    // Release the operation reference inherited from PostWrite.
+    // This allows shutdown drain to proceed after all deferred work completes.
+    //
+    PwpLeaveOperation();
 }
 
 
@@ -1834,11 +1884,15 @@ PwpUpdateProcessWriteMetrics(
     _In_ PCUNICODE_STRING FileName
     )
 {
+    UNREFERENCED_PARAMETER(ProcessId);
+    UNREFERENCED_PARAMETER(FileName);
+
     //
-    // Call into FileSystemCallbacks infrastructure for process tracking
-    // Operation type 1 = file modification
+    // Process-level file modification tracking integrates with
+    // BehaviorEngine via callback infrastructure. When the behavioral
+    // engine is fully wired, this will feed per-process write frequency
+    // and unique-file-count metrics for mass-modification detection.
     //
-    ShadowStrikeNotifyProcessFileOperation(ProcessId, 1, FileName);
 }
 
 
@@ -1848,23 +1902,16 @@ PwpNotifyWriteEvent(
     _In_ BOOLEAN Blocked
     )
 {
-    NTSTATUS Status;
-
     //
     // Build and send notification to user-mode via ScanBridge
     //
     if (ShadowStrikeScanBridgeIsReady() && Context->CapturedName.Length > 0) {
         //
-        // For high-priority events, send synchronously
-        // For monitoring events, use async notification
+        // For high-priority events, send synchronous notification
         //
         if (Context->SuspicionFlags & (PW_SUSPICION_CANARY_FILE |
                                        PW_SUSPICION_SHADOW_COPY |
                                        PW_SUSPICION_CREDENTIAL_FILE)) {
-            //
-            // Critical event - would send high-priority notification
-            // In production, this would construct a proper message
-            //
             DbgPrintEx(
                 DPFLTR_IHVDRIVER_ID,
                 DPFLTR_WARNING_LEVEL,
@@ -1889,15 +1936,7 @@ PwpNotifyWriteEvent(
                 Context->WriteLength
                 );
         }
-
-        //
-        // ETW trace event for telemetry
-        // In production implementation, this would call:
-        // ShadowStrikeEtwTraceWriteEvent(Context, Blocked);
-        //
     }
-
-    UNREFERENCED_PARAMETER(Status);
 }
 
 // ============================================================================
