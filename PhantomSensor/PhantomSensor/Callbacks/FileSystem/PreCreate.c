@@ -64,7 +64,6 @@ Performance Characteristics:
 #include "USBDeviceControl.h"
 #include "../../Core/Globals.h"
 #include "../../Communication/CommPort.h"
-#include "../../Communication/ScanBridge.h"
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../SelfProtection/FirmwareIntegrity.h"
 #include "../../Cache/ScanCache.h"
@@ -73,6 +72,24 @@ Performance Characteristics:
 #include "../../Utilities/StringUtils.h"
 #include <ntstrsafe.h>
 #include <wchar.h>
+
+//
+// Forward declarations for cross-module APIs defined in FileSystemCallbacks.c
+//
+NTSTATUS
+ShadowStrikeQueryProcessFileContext(
+    _In_ HANDLE ProcessId,
+    _Out_ PBOOLEAN IsRansomwareSuspect,
+    _Out_ PULONG SuspicionScore,
+    _Out_ PULONG BehaviorFlags
+    );
+
+VOID
+ShadowStrikeNotifyProcessFileOperation(
+    _In_ HANDLE ProcessId,
+    _In_ ULONG OperationType,
+    _In_opt_ PCUNICODE_STRING FileName
+    );
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, PcInitialize)
@@ -93,8 +110,6 @@ Performance Characteristics:
 #define PC_LOOKASIDE_DEPTH              64
 #define PC_MAX_STREAM_NAME              128
 #define PC_DOUBLE_EXT_EXECUTABLES_COUNT 12
-#define PC_RESERVED_NAMES_COUNT         22
-#define PC_SUSPICIOUS_PATH_COUNT        16
 
 //
 // Suspicion score weights
@@ -724,7 +739,8 @@ Return Value:
     if (!g_PcState.Initialized ||
         InterlockedCompareExchange(&g_PcState.ShutdownRequested, 0, 0) ||
         !SHADOWSTRIKE_IS_READY() ||
-        !g_DriverData.Config.RealTimeScanEnabled) {
+        !g_DriverData.Config.FilteringEnabled ||
+        !g_DriverData.Config.ScanOnOpen) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -764,8 +780,6 @@ Return Value:
         goto CleanupAllow;
     }
 
-    SHADOWSTRIKE_ENTER_OPERATION();
-
     // ========================================================================
     // PHASE 2: PROCESS IDENTITY CHECKS
     // ========================================================================
@@ -776,14 +790,14 @@ Return Value:
     // Skip System process (PID 4) - use defined constant
     //
     if (RequestorPid == PC_SYSTEM_PROCESS_ID) {
-        goto CleanupAllowLeave;
+        goto CleanupAllow;
     }
 
     //
     // Skip our own protected processes (prevent deadlock/loops)
     //
     if (ShadowStrikeIsProcessProtected(RequestorPid, NULL)) {
-        goto CleanupAllowLeave;
+        goto CleanupAllow;
     }
 
     // ========================================================================
@@ -800,12 +814,12 @@ Return Value:
         //
         // Can't get name - fail open safely
         //
-        goto CleanupAllowLeave;
+        goto CleanupAllow;
     }
 
     Status = FltParseFileNameInformation(NameInfo);
     if (!NT_SUCCESS(Status)) {
-        goto CleanupAllowLeave;
+        goto CleanupAllow;
     }
 
     // ========================================================================
@@ -827,7 +841,7 @@ Return Value:
         if (ShadowStrikeIsPathExcluded(&NameInfo->Name, &NameInfo->Extension)) {
             SHADOWSTRIKE_INC_STAT(ExclusionMatches);
             InterlockedIncrement64(&g_PcState.Stats.OperationsExcluded);
-            goto CleanupAllowLeave;
+            goto CleanupAllow;
         }
 
         //
@@ -836,7 +850,7 @@ Return Value:
         if (ShadowStrikeIsProcessExcluded(RequestorPid, NULL)) {
             SHADOWSTRIKE_INC_STAT(ExclusionMatches);
             InterlockedIncrement64(&g_PcState.Stats.OperationsExcluded);
-            goto CleanupAllowLeave;
+            goto CleanupAllow;
         }
     }
 
@@ -867,7 +881,6 @@ Return Value:
         }
 
         FltReleaseFileNameInformation(NameInfo);
-        SHADOWSTRIKE_LEAVE_OPERATION();
         ExReleaseRundownProtection(&g_PcState.RundownRef);
         return FLT_PREOP_COMPLETE;
     }
@@ -876,7 +889,7 @@ Return Value:
     // If directory, skip malware scanning (self-protect already checked)
     //
     if (IsDirectory) {
-        goto CleanupAllowLeave;
+        goto CleanupAllow;
     }
 
     // ========================================================================
@@ -1060,7 +1073,10 @@ Return Value:
     // EFI SYSTEM PARTITION PROTECTION — Bootkit prevention
     // =========================================================================
 
-    if (FiCheckEspAccess(FltObjects, &NameInfo->Name, RequestorPid)) {
+    if (FiCheckEspAccess(
+            &NameInfo->Name,
+            Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess
+            ) != 0) {
         ThreatScore += 50;
         SuspiciousFlags |= PcSuspiciousAdsAccess; // reuse flag for ESP alert
     }
@@ -1082,7 +1098,6 @@ Return Value:
             );
 
         FltReleaseFileNameInformation(NameInfo);
-        SHADOWSTRIKE_LEAVE_OPERATION();
         ExReleaseRundownProtection(&g_PcState.RundownRef);
         return FLT_PREOP_COMPLETE;
     }
@@ -1113,7 +1128,7 @@ Return Value:
                 InterlockedIncrement64(&g_PcState.Stats.OperationsCached);
                 SHADOWSTRIKE_INC_STAT(CacheHits);
 
-                if (CacheResult.Verdict == ShadowStrikeVerdictBlock) {
+                if (CacheResult.Verdict == Verdict_Malicious) {
                     //
                     // Cache hit: BLOCK
                     //
@@ -1124,14 +1139,13 @@ Return Value:
                     InterlockedIncrement64(&g_PcState.Stats.OperationsBlocked);
 
                     FltReleaseFileNameInformation(NameInfo);
-                    SHADOWSTRIKE_LEAVE_OPERATION();
                     ExReleaseRundownProtection(&g_PcState.RundownRef);
                     return FLT_PREOP_COMPLETE;
                 } else {
                     //
                     // Cache hit: ALLOW
                     //
-                    goto CleanupAllowLeave;
+                    goto CleanupAllow;
                 }
             }
         }
@@ -1212,8 +1226,20 @@ Return Value:
                 LONG64 DurationMs = (ScanEnd.QuadPart - ScanStart.QuadPart) / 10000;
                 InterlockedAdd64(&g_PcState.Stats.TotalScanTimeMs, DurationMs);
 
-                if (DurationMs > g_PcState.Stats.MaxScanTimeMs) {
-                    InterlockedExchange64(&g_PcState.Stats.MaxScanTimeMs, DurationMs);
+                //
+                // Atomic max update using compare-exchange loop
+                //
+                {
+                    LONG64 OldMax = g_PcState.Stats.MaxScanTimeMs;
+                    while (DurationMs > OldMax) {
+                        LONG64 Prev = InterlockedCompareExchange64(
+                            &g_PcState.Stats.MaxScanTimeMs,
+                            DurationMs,
+                            OldMax
+                            );
+                        if (Prev == OldMax) break;
+                        OldMax = Prev;
+                    }
                 }
             }
 
@@ -1221,7 +1247,7 @@ Return Value:
                 //
                 // Handle scan verdict
                 //
-                if (ReplyMsg.Verdict == ShadowStrikeVerdictBlock) {
+                if (ReplyMsg.Verdict == Verdict_Malicious) {
                     ShouldBlock = TRUE;
 
                     //
@@ -1230,7 +1256,7 @@ Return Value:
                     if (CacheKeyValid) {
                         ShadowStrikeCacheInsert(
                             &CacheKey,
-                            ShadowStrikeVerdictBlock,
+                            Verdict_Malicious,
                             ReplyMsg.ThreatScore,
                             ReplyMsg.CacheTTL
                             );
@@ -1242,7 +1268,7 @@ Return Value:
                     if (CacheKeyValid) {
                         ShadowStrikeCacheInsert(
                             &CacheKey,
-                            ShadowStrikeVerdictSafe,
+                            Verdict_Clean,
                             0,
                             ReplyMsg.CacheTTL
                             );
@@ -1325,7 +1351,6 @@ Return Value:
         }
 
         FltReleaseFileNameInformation(NameInfo);
-        SHADOWSTRIKE_LEAVE_OPERATION();
         ExReleaseRundownProtection(&g_PcState.RundownRef);
         return FLT_PREOP_COMPLETE;
     }
@@ -1347,13 +1372,10 @@ Return Value:
             );
     }
 
-CleanupAllowLeave:
+CleanupAllow:
     if (NameInfo != NULL) {
         FltReleaseFileNameInformation(NameInfo);
     }
-    SHADOWSTRIKE_LEAVE_OPERATION();
-
-CleanupAllow:
     if (RundownAcquired) {
         ExReleaseRundownProtection(&g_PcState.RundownRef);
     }
@@ -1383,6 +1405,7 @@ Routine Description:
     ULONG i;
 
     PAGED_CODE();
+    UNREFERENCED_PARAMETER(Extension);
 
     if (FileName == NULL || OutFlags == NULL || OutThreatScore == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -2148,6 +2171,8 @@ PcpClassifyAccessType(
     _In_ ULONG CreateDisposition
     )
 {
+    UNREFERENCED_PARAMETER(CreateDisposition);
+
     //
     // Check for delete
     //
