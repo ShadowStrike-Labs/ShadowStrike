@@ -430,10 +430,18 @@ ShadowStrikeInstanceSetup(
     }
 
     //
-    // Notify USB Device Control of volume attachment for removable media tracking
+    // USB Device Control: check volume policy for removable media.
+    // If blocked, reject attachment. If allowed, register volume for tracking.
     //
     if (attachToVolume) {
-        UdcCheckVolumePolicy(FltObjects);
+        UDC_DEVICE_POLICY udcPolicy;
+
+        if (!UdcCheckVolumePolicy(FltObjects, &udcPolicy)) {
+            attachToVolume = FALSE;
+            status = STATUS_FLT_DO_NOT_ATTACH;
+        } else if (udcPolicy != UdcPolicy_Allow) {
+            UdcNotifyVolumeMount(FltObjects, udcPolicy);
+        }
     }
 
     return status;
@@ -495,16 +503,17 @@ ShadowStrikeInstanceTeardownStart(
     PAGED_CODE();
     NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
-    UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(Flags);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                "[ShadowStrike] InstanceTeardownStart\n");
 
     //
-    // Signal that new operations should not be started for this instance
-    // This is handled by checking g_DriverData.ShuttingDown in callbacks
+    // Notify USB Device Control to remove this volume from tracking.
+    // Must happen in TeardownStart (not Complete) so that concurrent
+    // PreWrite callbacks stop finding the volume before I/O is drained.
     //
+    UdcNotifyVolumeDismount(FltObjects);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)

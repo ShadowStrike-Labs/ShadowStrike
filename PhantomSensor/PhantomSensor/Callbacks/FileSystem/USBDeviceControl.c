@@ -28,8 +28,8 @@ blocks unauthorized writes, and detects autorun.inf abuse.
 
 Volume Detection Strategy:
   - InstanceSetup callback detects removable volumes via FltGetVolumeProperties
-  - FLT_VOLUME_PROPERTIES.DeviceCharacteristics FILE_REMOVABLE_MEDIA flag
-  - Device information queried via IoGetDeviceObjectPointer for VID/PID
+  - Device VID/PID/Serial extracted via IOCTL_STORAGE_QUERY_PROPERTY
+  - Hardware ID parsed from physical device object for USB VID_xxxx/PID_xxxx
 
 Policy Resolution Order:
   1. Blacklist (explicit deny) — highest priority
@@ -37,7 +37,7 @@ Policy Resolution Order:
   3. Default policy (configurable, default=Audit)
 
 @author ShadowStrike Security Team
-@version 1.0.0
+@version 2.0.0
 @copyright (c) 2026 ShadowStrike Security. All rights reserved.
 ===============================================================================
 --*/
@@ -45,6 +45,7 @@ Policy Resolution Order:
 #include "USBDeviceControl.h"
 #include "../../Core/Globals.h"
 #include <ntstrsafe.h>
+#include <ntddstor.h>
 
 // ============================================================================
 // PRIVATE TYPES
@@ -66,6 +67,7 @@ typedef struct _UDC_STATE {
     EX_PUSH_LOCK        RulesLock;
     volatile LONG       WhitelistCount;
     volatile LONG       BlacklistCount;
+    volatile LONG       NextRuleId;
 
     //
     // Tracked volumes
@@ -98,14 +100,14 @@ typedef struct _UDC_STATE {
 static UDC_STATE g_UdcState;
 
 // ============================================================================
-// AUTORUN FILENAME CONSTANT
+// CONSTANTS
 // ============================================================================
 
 static const UNICODE_STRING g_AutorunFileName =
     RTL_CONSTANT_STRING(L"autorun.inf");
 
-static const UNICODE_STRING g_AutorunFileNameUpper =
-    RTL_CONSTANT_STRING(L"AUTORUN.INF");
+#define UDC_STORAGE_QUERY_BUFFER_SIZE   1024
+#define UDC_HARDWARE_ID_BUFFER_SIZE     512
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -120,11 +122,12 @@ static UDC_DEVICE_POLICY
 UdcpResolvePolicy(
     _In_ USHORT VendorId,
     _In_ USHORT ProductId,
-    _In_opt_ PCWSTR SerialNumber
+    _In_opt_ PCWSTR SerialNumber,
+    _In_ UDC_DEVICE_CLASS DeviceClass
     );
 
 static PUDC_TRACKED_VOLUME
-UdcpFindVolume(
+UdcpFindVolumeUnlocked(
     _In_ PFLT_INSTANCE Instance
     );
 
@@ -133,6 +136,61 @@ UdcpEnterOperation(VOID);
 
 static VOID
 UdcpLeaveOperation(VOID);
+
+static NTSTATUS
+UdcpQueryDeviceInfo(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Out_ PUSHORT VendorId,
+    _Out_ PUSHORT ProductId,
+    _Out_writes_(UDC_SERIAL_MAX_LENGTH) PWCHAR SerialNumber,
+    _Out_ PUSHORT SerialLength,
+    _Out_ PUDC_DEVICE_CLASS DeviceClass
+    );
+
+static NTSTATUS
+UdcpSendStorageQuery(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Out_ PSTORAGE_DEVICE_DESCRIPTOR *Descriptor
+    );
+
+static PDEVICE_OBJECT
+UdcpGetPhysicalDeviceObject(
+    _In_ PDEVICE_OBJECT DeviceObject
+    );
+
+static VOID
+UdcpParseHardwareIdForVidPid(
+    _In_reads_bytes_(LengthInBytes) PCWSTR HardwareId,
+    _In_ ULONG LengthInBytes,
+    _Out_ PUSHORT VendorId,
+    _Out_ PUSHORT ProductId
+    );
+
+static USHORT
+UdcpParseHex4(
+    _In_reads_(AvailableChars) PCWSTR Str,
+    _In_ ULONG AvailableChars
+    );
+
+// ============================================================================
+// ALLOC_TEXT
+// ============================================================================
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, UdcInitialize)
+#pragma alloc_text(PAGE, UdcShutdown)
+#pragma alloc_text(PAGE, UdcCheckVolumePolicy)
+#pragma alloc_text(PAGE, UdcNotifyVolumeMount)
+#pragma alloc_text(PAGE, UdcNotifyVolumeDismount)
+#pragma alloc_text(PAGE, UdcAddRule)
+#pragma alloc_text(PAGE, UdcRemoveRule)
+#pragma alloc_text(PAGE, UdcClearRules)
+#pragma alloc_text(PAGE, UdcUpdateConfig)
+#pragma alloc_text(PAGE, UdcpIsRemovableVolume)
+#pragma alloc_text(PAGE, UdcpQueryDeviceInfo)
+#pragma alloc_text(PAGE, UdcpSendStorageQuery)
+#pragma alloc_text(PAGE, UdcpGetPhysicalDeviceObject)
+#endif
 
 // ============================================================================
 // LIFECYCLE
@@ -159,16 +217,22 @@ UdcInitialize(VOID)
     FltInitializePushLock(&g_UdcState.RulesLock);
     g_UdcState.WhitelistCount = 0;
     g_UdcState.BlacklistCount = 0;
+    g_UdcState.NextRuleId = 1;
 
     InitializeListHead(&g_UdcState.VolumeListHead);
     FltInitializePushLock(&g_UdcState.VolumeLock);
     g_UdcState.VolumeCount = 0;
 
+    //
+    // UDC-5 FIX: Use 0 for Flags — NPagedPool is already non-executable
+    // since Windows 8+. POOL_FLAG_NON_PAGED (0x40) is for ExAllocatePool2,
+    // NOT for ExInitializeNPagedLookasideList.
+    //
     ExInitializeNPagedLookasideList(
         &g_UdcState.VolumeLookaside,
         NULL,
         NULL,
-        POOL_FLAG_NON_PAGED,
+        0,
         sizeof(UDC_TRACKED_VOLUME),
         UDC_DEVICE_POOL_TAG,
         0
@@ -224,7 +288,7 @@ UdcShutdown(VOID)
     FltReleasePushLock(&g_UdcState.VolumeLock);
 
     //
-    // Free whitelist rules
+    // Free all rules
     //
     FltAcquirePushLockExclusive(&g_UdcState.RulesLock);
     while (!IsListEmpty(&g_UdcState.WhitelistHead)) {
@@ -265,6 +329,12 @@ UdcCheckVolumePolicy(
     _Out_ PUDC_DEVICE_POLICY Policy
     )
 {
+    USHORT VendorId = 0;
+    USHORT ProductId = 0;
+    WCHAR SerialNumber[UDC_SERIAL_MAX_LENGTH];
+    USHORT SerialLength = 0;
+    UDC_DEVICE_CLASS DeviceClass = UdcClass_Unknown;
+
     PAGED_CODE();
 
     *Policy = UdcPolicy_Allow;
@@ -288,26 +358,51 @@ UdcCheckVolumePolicy(
     }
 
     //
-    // Resolve policy for this device
-    // For now, use default policy since we don't have full PnP VID/PID enumeration
-    // The device rule matching will work once user-space provides device info via IOCTL
+    // UDC-4 FIX: Extract actual device information from storage stack
     //
-    *Policy = UdcpResolvePolicy(0, 0, NULL);
+    RtlZeroMemory(SerialNumber, sizeof(SerialNumber));
+
+    NTSTATUS InfoStatus = UdcpQueryDeviceInfo(
+        FltObjects,
+        &VendorId,
+        &ProductId,
+        SerialNumber,
+        &SerialLength,
+        &DeviceClass
+        );
+
+    if (!NT_SUCCESS(InfoStatus)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "[ShadowStrike/UDC] Device info query returned 0x%08X, "
+                   "applying default policy\n", InfoStatus);
+    }
+
+    //
+    // Resolve policy using device identity against whitelist/blacklist
+    //
+    *Policy = UdcpResolvePolicy(
+        VendorId,
+        ProductId,
+        (SerialLength > 0) ? SerialNumber : NULL,
+        DeviceClass
+        );
 
     if (*Policy == UdcPolicy_Block) {
         InterlockedIncrement64(&g_UdcState.Stats.VolumeAttachRejected);
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike/UDC] BLOCKED removable volume attachment "
-                   "(Policy=Block)\n");
+                   "(VID=0x%04X, PID=0x%04X, Policy=Block)\n",
+                   VendorId, ProductId);
 
         UdcpLeaveOperation();
         return FALSE;
     }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike/UDC] Removable volume detected (Policy=%d)\n",
-               *Policy);
+               "[ShadowStrike/UDC] Removable volume detected "
+               "(VID=0x%04X, PID=0x%04X, Policy=%d)\n",
+               VendorId, ProductId, *Policy);
 
     UdcpLeaveOperation();
     return TRUE;
@@ -321,6 +416,7 @@ UdcIsWriteBlocked(
     )
 {
     PUDC_TRACKED_VOLUME Volume;
+    BOOLEAN Blocked = FALSE;
 
     if (!g_UdcState.Config.Enabled || !g_UdcState.Config.EnableWriteProtection) {
         return FALSE;
@@ -330,27 +426,31 @@ UdcIsWriteBlocked(
         return FALSE;
     }
 
-    Volume = UdcpFindVolume(FltObjects->Instance);
-    if (Volume == NULL) {
-        UdcpLeaveOperation();
-        return FALSE;
+    //
+    // UDC-1 FIX: Hold VolumeLock shared for the entire operation to prevent
+    // use-after-free from concurrent UdcNotifyVolumeDismount. The old code
+    // released the lock inside UdcpFindVolume then dereferenced the returned
+    // pointer — a classic TOCTOU leading to BSOD.
+    //
+    FltAcquirePushLockShared(&g_UdcState.VolumeLock);
+
+    Volume = UdcpFindVolumeUnlocked(FltObjects->Instance);
+    if (Volume != NULL) {
+        InterlockedIncrement(&Volume->WriteAttempts);
+
+        if (Volume->EffectivePolicy == UdcPolicy_ReadOnly) {
+            InterlockedIncrement(&Volume->WriteBlocked);
+            InterlockedIncrement64(&g_UdcState.Stats.WritesBlocked);
+            Blocked = TRUE;
+        } else if (Volume->EffectivePolicy == UdcPolicy_Audit) {
+            InterlockedIncrement64(&g_UdcState.Stats.WritesAllowed);
+        }
     }
 
-    InterlockedIncrement(&Volume->WriteAttempts);
-
-    if (Volume->EffectivePolicy == UdcPolicy_ReadOnly) {
-        InterlockedIncrement(&Volume->WriteBlocked);
-        InterlockedIncrement64(&g_UdcState.Stats.WritesBlocked);
-        UdcpLeaveOperation();
-        return TRUE;
-    }
-
-    if (Volume->EffectivePolicy == UdcPolicy_Audit) {
-        InterlockedIncrement64(&g_UdcState.Stats.WritesAllowed);
-    }
+    FltReleasePushLock(&g_UdcState.VolumeLock);
 
     UdcpLeaveOperation();
-    return FALSE;
+    return Blocked;
 }
 
 
@@ -370,18 +470,41 @@ UdcIsSetInfoBlocked(
 _IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 UdcCheckAutorun(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ PCUNICODE_STRING FileName
     )
 {
     USHORT Length;
     USHORT NameStart;
+    PUDC_TRACKED_VOLUME Volume;
+    BOOLEAN Result = FALSE;
 
     if (!g_UdcState.Config.Enabled || !g_UdcState.Config.EnableAutorunBlocking) {
         return FALSE;
     }
 
-    if (FileName == NULL || FileName->Length == 0) {
+    if (FileName == NULL || FileName->Length == 0 || FileName->Buffer == NULL) {
         return FALSE;
+    }
+
+    //
+    // UDC-9 FIX: Acquire rundown protection to prevent access during shutdown
+    //
+    if (!UdcpEnterOperation()) {
+        return FALSE;
+    }
+
+    //
+    // UDC-7 FIX: Only block autorun.inf on tracked removable volumes.
+    // Hold lock for the entire check to prevent use-after-free on Volume.
+    //
+    FltAcquirePushLockShared(&g_UdcState.VolumeLock);
+
+    Volume = UdcpFindVolumeUnlocked(FltObjects->Instance);
+    if (Volume == NULL) {
+        FltReleasePushLock(&g_UdcState.VolumeLock);
+        UdcpLeaveOperation();
+        return FALSE;   // Not a tracked removable volume
     }
 
     //
@@ -397,30 +520,28 @@ UdcCheckAutorun(
         }
     }
 
-    if (NameStart >= Length) {
-        return FALSE;
+    if (NameStart < Length) {
+        UNICODE_STRING FileNameOnly;
+        FileNameOnly.Buffer = &FileName->Buffer[NameStart];
+        FileNameOnly.Length = (Length - NameStart) * sizeof(WCHAR);
+        FileNameOnly.MaximumLength = FileNameOnly.Length;
+
+        if (RtlEqualUnicodeString(&FileNameOnly, &g_AutorunFileName, TRUE)) {
+            InterlockedIncrement64(&g_UdcState.Stats.AutorunDetected);
+            InterlockedIncrement64(&g_UdcState.Stats.AutorunBlocked);
+            InterlockedIncrement(&Volume->FilesAccessed);
+
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/UDC] BLOCKED autorun.inf access: %wZ\n",
+                       FileName);
+
+            Result = TRUE;
+        }
     }
 
-    //
-    // Check if filename is "autorun.inf" (case insensitive)
-    //
-    UNICODE_STRING FileNameOnly;
-    FileNameOnly.Buffer = &FileName->Buffer[NameStart];
-    FileNameOnly.Length = (Length - NameStart) * sizeof(WCHAR);
-    FileNameOnly.MaximumLength = FileNameOnly.Length;
-
-    if (RtlEqualUnicodeString(&FileNameOnly, &g_AutorunFileName, TRUE)) {
-        InterlockedIncrement64(&g_UdcState.Stats.AutorunDetected);
-        InterlockedIncrement64(&g_UdcState.Stats.AutorunBlocked);
-
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike/UDC] BLOCKED autorun.inf access: %wZ\n",
-                   FileName);
-
-        return TRUE;
-    }
-
-    return FALSE;
+    FltReleasePushLock(&g_UdcState.VolumeLock);
+    UdcpLeaveOperation();
+    return Result;
 }
 
 // ============================================================================
@@ -472,7 +593,10 @@ UdcNotifyVolumeMount(
     ULONG NameLength = 0;
 
     Status = FltGetVolumeName(FltObjects->Volume, NULL, &NameLength);
-    if (Status == STATUS_BUFFER_TOO_SMALL && NameLength > 0) {
+    if (Status == STATUS_BUFFER_TOO_SMALL &&
+        NameLength > 0 &&
+        NameLength <= sizeof(Volume->VolumeNameBuffer)) {
+
         Volume->VolumeName.Buffer = Volume->VolumeNameBuffer;
         Volume->VolumeName.MaximumLength = sizeof(Volume->VolumeNameBuffer);
 
@@ -487,6 +611,23 @@ UdcNotifyVolumeMount(
         }
     }
 
+    //
+    // UDC-4 FIX: Query device VID/PID/Serial for the tracking record
+    //
+    USHORT SerialLength = 0;
+    UDC_DEVICE_CLASS DeviceClass = UdcClass_Unknown;
+
+    UdcpQueryDeviceInfo(
+        FltObjects,
+        &Volume->VendorId,
+        &Volume->ProductId,
+        Volume->SerialNumber,
+        &SerialLength,
+        &DeviceClass
+        );
+
+    Volume->DeviceClass = DeviceClass;
+
     FltAcquirePushLockExclusive(&g_UdcState.VolumeLock);
     InsertTailList(&g_UdcState.VolumeListHead, &Volume->Link);
     InterlockedIncrement(&g_UdcState.VolumeCount);
@@ -495,8 +636,10 @@ UdcNotifyVolumeMount(
     InterlockedIncrement64(&g_UdcState.Stats.VolumeMounts);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike/UDC] Removable volume mounted: %wZ (Policy=%d)\n",
-               &Volume->VolumeName, Policy);
+               "[ShadowStrike/UDC] Removable volume mounted: %wZ "
+               "(VID=0x%04X, PID=0x%04X, Policy=%d)\n",
+               &Volume->VolumeName,
+               Volume->VendorId, Volume->ProductId, Policy);
 
     UdcpLeaveOperation();
 }
@@ -550,6 +693,254 @@ UdcNotifyVolumeDismount(
 }
 
 // ============================================================================
+// RULE MANAGEMENT
+// ============================================================================
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+UdcAddRule(
+    _In_ BOOLEAN IsBlacklist,
+    _In_ USHORT VendorId,
+    _In_ USHORT ProductId,
+    _In_opt_ PCWSTR SerialNumber,
+    _In_ UDC_DEVICE_CLASS DeviceClass,
+    _In_ UDC_DEVICE_POLICY Policy,
+    _Out_ PULONG RuleId
+    )
+{
+    PUDC_DEVICE_RULE Rule;
+    PLIST_ENTRY TargetList;
+    volatile LONG *TargetCount;
+    LONG MaxEntries;
+
+    PAGED_CODE();
+
+    if (RuleId == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *RuleId = 0;
+
+    if (!UdcpEnterOperation()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    if (IsBlacklist) {
+        TargetList = &g_UdcState.BlacklistHead;
+        TargetCount = &g_UdcState.BlacklistCount;
+        MaxEntries = UDC_MAX_BLACKLIST_ENTRIES;
+    } else {
+        TargetList = &g_UdcState.WhitelistHead;
+        TargetCount = &g_UdcState.WhitelistCount;
+        MaxEntries = UDC_MAX_WHITELIST_ENTRIES;
+    }
+
+    if (*TargetCount >= MaxEntries) {
+        UdcpLeaveOperation();
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    Rule = (PUDC_DEVICE_RULE)ExAllocatePool2(
+        POOL_FLAG_PAGED, sizeof(UDC_DEVICE_RULE), UDC_DEVICE_POOL_TAG);
+
+    if (Rule == NULL) {
+        UdcpLeaveOperation();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(Rule, sizeof(UDC_DEVICE_RULE));
+    InitializeListHead(&Rule->Link);
+
+    Rule->VendorId = VendorId;
+    Rule->ProductId = ProductId;
+    Rule->DeviceClass = DeviceClass;
+    Rule->Policy = Policy;
+    Rule->RuleId = (ULONG)InterlockedIncrement(&g_UdcState.NextRuleId);
+    KeQuerySystemTime(&Rule->CreatedTime);
+
+    if (SerialNumber != NULL) {
+        size_t SerialLen = 0;
+
+        NTSTATUS CopyStatus = RtlStringCchLengthW(
+            SerialNumber,
+            UDC_SERIAL_MAX_LENGTH - 1,
+            &SerialLen
+            );
+
+        if (NT_SUCCESS(CopyStatus) && SerialLen > 0) {
+            RtlCopyMemory(Rule->SerialNumber, SerialNumber,
+                         SerialLen * sizeof(WCHAR));
+            Rule->SerialNumber[SerialLen] = L'\0';
+            Rule->SerialNumberLength = (USHORT)SerialLen;
+        }
+    }
+
+    FltAcquirePushLockExclusive(&g_UdcState.RulesLock);
+    InsertTailList(TargetList, &Rule->Link);
+    InterlockedIncrement(TargetCount);
+    FltReleasePushLock(&g_UdcState.RulesLock);
+
+    *RuleId = Rule->RuleId;
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike/UDC] Rule added: ID=%lu, %s, VID=0x%04X, "
+               "PID=0x%04X, Policy=%d\n",
+               Rule->RuleId,
+               IsBlacklist ? "BLACKLIST" : "WHITELIST",
+               VendorId, ProductId, Policy);
+
+    UdcpLeaveOperation();
+    return STATUS_SUCCESS;
+}
+
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+UdcRemoveRule(
+    _In_ ULONG RuleId
+    )
+{
+    LIST_ENTRY *ListEntry;
+    BOOLEAN Found = FALSE;
+
+    PAGED_CODE();
+
+    if (RuleId == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!UdcpEnterOperation()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    FltAcquirePushLockExclusive(&g_UdcState.RulesLock);
+
+    //
+    // Search blacklist
+    //
+    for (ListEntry = g_UdcState.BlacklistHead.Flink;
+         ListEntry != &g_UdcState.BlacklistHead;
+         ListEntry = ListEntry->Flink) {
+
+        PUDC_DEVICE_RULE Rule = CONTAINING_RECORD(
+            ListEntry, UDC_DEVICE_RULE, Link);
+
+        if (Rule->RuleId == RuleId) {
+            RemoveEntryList(&Rule->Link);
+            InterlockedDecrement(&g_UdcState.BlacklistCount);
+            FltReleasePushLock(&g_UdcState.RulesLock);
+            ExFreePoolWithTag(Rule, UDC_DEVICE_POOL_TAG);
+            Found = TRUE;
+            goto Done;
+        }
+    }
+
+    //
+    // Search whitelist
+    //
+    for (ListEntry = g_UdcState.WhitelistHead.Flink;
+         ListEntry != &g_UdcState.WhitelistHead;
+         ListEntry = ListEntry->Flink) {
+
+        PUDC_DEVICE_RULE Rule = CONTAINING_RECORD(
+            ListEntry, UDC_DEVICE_RULE, Link);
+
+        if (Rule->RuleId == RuleId) {
+            RemoveEntryList(&Rule->Link);
+            InterlockedDecrement(&g_UdcState.WhitelistCount);
+            FltReleasePushLock(&g_UdcState.RulesLock);
+            ExFreePoolWithTag(Rule, UDC_DEVICE_POOL_TAG);
+            Found = TRUE;
+            goto Done;
+        }
+    }
+
+    FltReleasePushLock(&g_UdcState.RulesLock);
+
+Done:
+    UdcpLeaveOperation();
+    return Found ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+}
+
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+UdcClearRules(VOID)
+{
+    LIST_ENTRY *ListEntry;
+
+    PAGED_CODE();
+
+    if (!UdcpEnterOperation()) {
+        return;
+    }
+
+    FltAcquirePushLockExclusive(&g_UdcState.RulesLock);
+
+    while (!IsListEmpty(&g_UdcState.WhitelistHead)) {
+        ListEntry = RemoveHeadList(&g_UdcState.WhitelistHead);
+        PUDC_DEVICE_RULE Rule = CONTAINING_RECORD(
+            ListEntry, UDC_DEVICE_RULE, Link);
+        ExFreePoolWithTag(Rule, UDC_DEVICE_POOL_TAG);
+    }
+    g_UdcState.WhitelistCount = 0;
+
+    while (!IsListEmpty(&g_UdcState.BlacklistHead)) {
+        ListEntry = RemoveHeadList(&g_UdcState.BlacklistHead);
+        PUDC_DEVICE_RULE Rule = CONTAINING_RECORD(
+            ListEntry, UDC_DEVICE_RULE, Link);
+        ExFreePoolWithTag(Rule, UDC_DEVICE_POOL_TAG);
+    }
+    g_UdcState.BlacklistCount = 0;
+
+    FltReleasePushLock(&g_UdcState.RulesLock);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike/UDC] All rules cleared\n");
+
+    UdcpLeaveOperation();
+}
+
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+UdcUpdateConfig(
+    _In_ PUDC_CONFIG NewConfig
+    )
+{
+    PAGED_CODE();
+
+    if (NewConfig == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!UdcpEnterOperation()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Copy config under rules lock for consistency with policy resolution.
+    // Config fields are small (BOOLEANs + enum), so the critical section
+    // is extremely short.
+    //
+    FltAcquirePushLockExclusive(&g_UdcState.RulesLock);
+    RtlCopyMemory(&g_UdcState.Config, NewConfig, sizeof(UDC_CONFIG));
+    FltReleasePushLock(&g_UdcState.RulesLock);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike/UDC] Config updated: Enabled=%d, "
+               "DefaultPolicy=%d, WriteProtect=%d, AutorunBlock=%d\n",
+               NewConfig->Enabled,
+               NewConfig->DefaultPolicy,
+               NewConfig->EnableWriteProtection,
+               NewConfig->EnableAutorunBlocking);
+
+    UdcpLeaveOperation();
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
 // QUERY
 // ============================================================================
 
@@ -559,7 +950,526 @@ UdcGetStatistics(
     _Out_ PUDC_STATISTICS Statistics
     )
 {
-    RtlCopyMemory(Statistics, &g_UdcState.Stats, sizeof(UDC_STATISTICS));
+    //
+    // On x64, aligned LONG64 reads are atomic. Snapshot each field
+    // individually rather than RtlCopyMemory to avoid torn reads on
+    // 32-bit builds.
+    //
+    Statistics->VolumeMounts = g_UdcState.Stats.VolumeMounts;
+    Statistics->VolumeDismounts = g_UdcState.Stats.VolumeDismounts;
+    Statistics->WritesBlocked = g_UdcState.Stats.WritesBlocked;
+    Statistics->WritesAllowed = g_UdcState.Stats.WritesAllowed;
+    Statistics->VolumeAttachRejected = g_UdcState.Stats.VolumeAttachRejected;
+    Statistics->AutorunDetected = g_UdcState.Stats.AutorunDetected;
+    Statistics->AutorunBlocked = g_UdcState.Stats.AutorunBlocked;
+    Statistics->PolicyChecks = g_UdcState.Stats.PolicyChecks;
+}
+
+// ============================================================================
+// PRIVATE — DEVICE INFORMATION EXTRACTION
+// ============================================================================
+
+/*++
+    Queries the storage stack for USB device identity information.
+
+    Step 1: FltGetDiskDeviceObject → disk device for this volume
+    Step 2: IOCTL_STORAGE_QUERY_PROPERTY → STORAGE_DEVICE_DESCRIPTOR
+            → BusType, serial number (ASCII → Unicode)
+    Step 3: Walk device stack to PDO → IoGetDeviceProperty(HardwareID)
+            → Parse VID_xxxx&PID_xxxx for numeric USB VID/PID
+
+    All steps are best-effort: failure at any stage leaves the
+    corresponding output fields at zero/empty. This ensures devices
+    that don't support certain queries still get the default policy.
+--*/
+static NTSTATUS
+UdcpQueryDeviceInfo(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Out_ PUSHORT VendorId,
+    _Out_ PUSHORT ProductId,
+    _Out_writes_(UDC_SERIAL_MAX_LENGTH) PWCHAR SerialNumber,
+    _Out_ PUSHORT SerialLength,
+    _Out_ PUDC_DEVICE_CLASS DeviceClass
+    )
+{
+    NTSTATUS Status;
+    PDEVICE_OBJECT DiskDevice = NULL;
+    PSTORAGE_DEVICE_DESCRIPTOR Descriptor = NULL;
+    PDEVICE_OBJECT PhysicalDevice = NULL;
+
+    PAGED_CODE();
+
+    *VendorId = 0;
+    *ProductId = 0;
+    *SerialLength = 0;
+    *DeviceClass = UdcClass_MassStorage;    // Default for removable
+
+    Status = FltGetDiskDeviceObject(FltObjects->Volume, &DiskDevice);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    //
+    // Step 1: Query STORAGE_DEVICE_DESCRIPTOR for bus type and serial
+    //
+    Status = UdcpSendStorageQuery(DiskDevice, &Descriptor);
+    if (NT_SUCCESS(Status) && Descriptor != NULL) {
+
+        //
+        // Classify device by bus type
+        //
+        switch (Descriptor->BusType) {
+            case BusTypeUsb:
+                *DeviceClass = UdcClass_MassStorage;
+                break;
+
+            case BusTypeScsi:
+            case BusTypeAta:
+            case BusTypeSata:
+                *DeviceClass = UdcClass_MassStorage;
+                break;
+
+            default:
+                if (Descriptor->RemovableMedia) {
+                    *DeviceClass = UdcClass_MassStorage;
+                } else {
+                    *DeviceClass = UdcClass_Other;
+                }
+                break;
+        }
+
+        //
+        // Extract serial number (ASCII → Unicode)
+        // Storage firmware often pads serial strings with whitespace
+        //
+        if (Descriptor->SerialNumberOffset != 0 &&
+            Descriptor->SerialNumberOffset < Descriptor->Size) {
+
+            PCSTR AsciiSerial = (PCSTR)((PUCHAR)Descriptor +
+                                        Descriptor->SerialNumberOffset);
+
+            //
+            // Validate the ASCII string stays within descriptor bounds
+            //
+            ULONG MaxLen = Descriptor->Size - Descriptor->SerialNumberOffset;
+            ULONG AsciiLen = 0;
+
+            while (AsciiLen < MaxLen && AsciiSerial[AsciiLen] != '\0') {
+                AsciiLen++;
+            }
+
+            //
+            // Trim leading and trailing whitespace
+            //
+            ULONG Start = 0;
+            while (Start < AsciiLen && AsciiSerial[Start] == ' ') {
+                Start++;
+            }
+
+            ULONG End = AsciiLen;
+            while (End > Start && AsciiSerial[End - 1] == ' ') {
+                End--;
+            }
+
+            ULONG TrimmedLen = End - Start;
+            if (TrimmedLen > UDC_SERIAL_MAX_LENGTH - 1) {
+                TrimmedLen = UDC_SERIAL_MAX_LENGTH - 1;
+            }
+
+            //
+            // Convert ASCII to Unicode
+            //
+            for (ULONG i = 0; i < TrimmedLen; i++) {
+                SerialNumber[i] = (WCHAR)(UCHAR)AsciiSerial[Start + i];
+            }
+
+            *SerialLength = (USHORT)TrimmedLen;
+            SerialNumber[*SerialLength] = L'\0';
+        }
+
+        ExFreePoolWithTag(Descriptor, UDC_POOL_TAG);
+        Descriptor = NULL;
+    }
+
+    //
+    // Step 2: Walk device stack to PDO, query hardware ID for VID/PID
+    //
+    PhysicalDevice = UdcpGetPhysicalDeviceObject(DiskDevice);
+    if (PhysicalDevice != NULL) {
+
+        UCHAR HardwareIdBuffer[UDC_HARDWARE_ID_BUFFER_SIZE];
+        ULONG ResultLength = 0;
+
+        Status = IoGetDeviceProperty(
+            PhysicalDevice,
+            DevicePropertyHardwareID,
+            sizeof(HardwareIdBuffer),
+            HardwareIdBuffer,
+            &ResultLength
+            );
+
+        if (NT_SUCCESS(Status) && ResultLength > sizeof(WCHAR)) {
+            UdcpParseHardwareIdForVidPid(
+                (PCWSTR)HardwareIdBuffer,
+                ResultLength,
+                VendorId,
+                ProductId
+                );
+        }
+
+        ObDereferenceObject(PhysicalDevice);
+    }
+
+    ObDereferenceObject(DiskDevice);
+    return STATUS_SUCCESS;
+}
+
+
+/*++
+    Sends IOCTL_STORAGE_QUERY_PROPERTY synchronously to the given device
+    to retrieve the STORAGE_DEVICE_DESCRIPTOR.
+
+    Caller must free the returned Descriptor with ExFreePoolWithTag(, UDC_POOL_TAG).
+--*/
+static NTSTATUS
+UdcpSendStorageQuery(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Out_ PSTORAGE_DEVICE_DESCRIPTOR *Descriptor
+    )
+{
+    NTSTATUS Status;
+    STORAGE_PROPERTY_QUERY Query;
+    IO_STATUS_BLOCK IoStatus;
+    KEVENT Event;
+    PIRP Irp;
+    PSTORAGE_DEVICE_DESCRIPTOR Desc;
+
+    PAGED_CODE();
+
+    *Descriptor = NULL;
+
+    Desc = (PSTORAGE_DEVICE_DESCRIPTOR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        UDC_STORAGE_QUERY_BUFFER_SIZE,
+        UDC_POOL_TAG
+        );
+
+    if (Desc == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(&Query, sizeof(Query));
+    Query.PropertyId = StorageDeviceProperty;
+    Query.QueryType = PropertyStandardQuery;
+
+    KeInitializeEvent(&Event, NotificationEvent, FALSE);
+
+    Irp = IoBuildDeviceIoControlRequest(
+        IOCTL_STORAGE_QUERY_PROPERTY,
+        DeviceObject,
+        &Query,
+        sizeof(Query),
+        Desc,
+        UDC_STORAGE_QUERY_BUFFER_SIZE,
+        FALSE,
+        &Event,
+        &IoStatus
+        );
+
+    if (Irp == NULL) {
+        ExFreePoolWithTag(Desc, UDC_POOL_TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    Status = IoCallDriver(DeviceObject, Irp);
+    if (Status == STATUS_PENDING) {
+        KeWaitForSingleObject(
+            &Event,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+            );
+        Status = IoStatus.Status;
+    }
+
+    if (NT_SUCCESS(Status)) {
+        //
+        // Validate descriptor integrity before returning to caller
+        //
+        if (Desc->Size > UDC_STORAGE_QUERY_BUFFER_SIZE ||
+            Desc->Version == 0) {
+            ExFreePoolWithTag(Desc, UDC_POOL_TAG);
+            return STATUS_DATA_ERROR;
+        }
+        *Descriptor = Desc;
+    } else {
+        ExFreePoolWithTag(Desc, UDC_POOL_TAG);
+    }
+
+    return Status;
+}
+
+
+/*++
+    Walks the device stack from the given device object down to the
+    Physical Device Object (PDO) at the bottom of the stack.
+
+    Returns a referenced PDO — caller must call ObDereferenceObject.
+    Returns NULL if the walk fails for any reason.
+--*/
+static PDEVICE_OBJECT
+UdcpGetPhysicalDeviceObject(
+    _In_ PDEVICE_OBJECT DeviceObject
+    )
+{
+    PDEVICE_OBJECT Current;
+    PDEVICE_OBJECT Lower;
+    ULONG Depth = 0;
+
+    PAGED_CODE();
+
+    //
+    // Start from the given device, walk down via IoGetLowerDeviceObject
+    // until we hit the bottom (PDO). Cap depth to prevent infinite loops
+    // in case of corrupted device stacks.
+    //
+    Current = DeviceObject;
+    ObReferenceObject(Current);
+
+    while (Depth < 64) {
+        Lower = IoGetLowerDeviceObject(Current);
+        if (Lower == NULL) {
+            break;
+        }
+        ObDereferenceObject(Current);
+        Current = Lower;
+        Depth++;
+    }
+
+    //
+    // Current is now the PDO (bottom of stack), referenced once.
+    //
+    return Current;
+}
+
+
+/*++
+    Parses a REG_MULTI_SZ hardware ID string for USB VID_xxxx and PID_xxxx
+    patterns. USB hardware IDs look like: USB\VID_1234&PID_5678\serial
+
+    Case-insensitive search — firmware may use any case.
+--*/
+static VOID
+UdcpParseHardwareIdForVidPid(
+    _In_reads_bytes_(LengthInBytes) PCWSTR HardwareId,
+    _In_ ULONG LengthInBytes,
+    _Out_ PUSHORT VendorId,
+    _Out_ PUSHORT ProductId
+    )
+{
+    ULONG TotalChars = LengthInBytes / sizeof(WCHAR);
+    PCWSTR Current = HardwareId;
+
+    *VendorId = 0;
+    *ProductId = 0;
+
+    //
+    // REG_MULTI_SZ: multiple null-terminated strings followed by
+    // a double-null terminator. Iterate each string.
+    //
+    while (Current < HardwareId + TotalChars && *Current != L'\0') {
+
+        //
+        // Calculate string length
+        //
+        ULONG StrLen = 0;
+        while (Current + StrLen < HardwareId + TotalChars &&
+               Current[StrLen] != L'\0') {
+            StrLen++;
+        }
+
+        //
+        // Search for VID_ and PID_ patterns in this string
+        //
+        for (ULONG i = 0; i + 4 <= StrLen; i++) {
+            if ((Current[i] == L'V' || Current[i] == L'v') &&
+                (Current[i + 1] == L'I' || Current[i + 1] == L'i') &&
+                (Current[i + 2] == L'D' || Current[i + 2] == L'd') &&
+                Current[i + 3] == L'_') {
+
+                if (i + 8 <= StrLen) {
+                    *VendorId = UdcpParseHex4(
+                        &Current[i + 4], StrLen - i - 4);
+                }
+            }
+
+            if ((Current[i] == L'P' || Current[i] == L'p') &&
+                (Current[i + 1] == L'I' || Current[i + 1] == L'i') &&
+                (Current[i + 2] == L'D' || Current[i + 2] == L'd') &&
+                Current[i + 3] == L'_') {
+
+                if (i + 8 <= StrLen) {
+                    *ProductId = UdcpParseHex4(
+                        &Current[i + 4], StrLen - i - 4);
+                }
+            }
+        }
+
+        //
+        // If we found both, stop early
+        //
+        if (*VendorId != 0 && *ProductId != 0) {
+            return;
+        }
+
+        //
+        // Advance past null terminator to next string
+        //
+        Current += StrLen + 1;
+    }
+}
+
+
+static USHORT
+UdcpParseHex4(
+    _In_reads_(AvailableChars) PCWSTR Str,
+    _In_ ULONG AvailableChars
+    )
+{
+    USHORT Result = 0;
+    ULONG Count = (AvailableChars < 4) ? AvailableChars : 4;
+
+    for (ULONG i = 0; i < Count; i++) {
+        WCHAR Ch = Str[i];
+        if (Ch >= L'0' && Ch <= L'9') {
+            Result = (Result << 4) | (USHORT)(Ch - L'0');
+        } else if (Ch >= L'A' && Ch <= L'F') {
+            Result = (Result << 4) | (USHORT)(Ch - L'A' + 10);
+        } else if (Ch >= L'a' && Ch <= L'f') {
+            Result = (Result << 4) | (USHORT)(Ch - L'a' + 10);
+        } else {
+            break;
+        }
+    }
+
+    return Result;
+}
+
+// ============================================================================
+// PRIVATE — POLICY RESOLUTION
+// ============================================================================
+
+static UDC_DEVICE_POLICY
+UdcpResolvePolicy(
+    _In_ USHORT VendorId,
+    _In_ USHORT ProductId,
+    _In_opt_ PCWSTR SerialNumber,
+    _In_ UDC_DEVICE_CLASS DeviceClass
+    )
+{
+    LIST_ENTRY *ListEntry;
+
+    FltAcquirePushLockShared(&g_UdcState.RulesLock);
+
+    //
+    // Check blacklist first (highest priority)
+    //
+    for (ListEntry = g_UdcState.BlacklistHead.Flink;
+         ListEntry != &g_UdcState.BlacklistHead;
+         ListEntry = ListEntry->Flink) {
+
+        PUDC_DEVICE_RULE Rule = CONTAINING_RECORD(
+            ListEntry, UDC_DEVICE_RULE, Link);
+
+        BOOLEAN VidMatch = (Rule->VendorId == 0 || Rule->VendorId == VendorId);
+        BOOLEAN PidMatch = (Rule->ProductId == 0 || Rule->ProductId == ProductId);
+        BOOLEAN ClassMatch = (Rule->DeviceClass == UdcClass_Unknown ||
+                              Rule->DeviceClass == DeviceClass);
+        BOOLEAN SerialMatch;
+
+        //
+        // UDC-6 FIX: When a rule specifies a serial number requirement
+        // (SerialNumberLength > 0), the device MUST provide a matching
+        // serial. If the device has no serial (NULL), the rule does NOT
+        // match. Previously, SerialMatch defaulted to TRUE when
+        // SerialNumber was NULL, allowing any device to match serial-
+        // specific rules.
+        //
+        if (Rule->SerialNumberLength > 0) {
+            if (SerialNumber == NULL) {
+                SerialMatch = FALSE;
+            } else {
+                UNICODE_STRING RuleSerial;
+                RuleSerial.Buffer = Rule->SerialNumber;
+                RuleSerial.Length = Rule->SerialNumberLength * sizeof(WCHAR);
+                RuleSerial.MaximumLength = sizeof(Rule->SerialNumber);
+
+                UNICODE_STRING DeviceSerial;
+                RtlInitUnicodeString(&DeviceSerial, SerialNumber);
+
+                SerialMatch = RtlEqualUnicodeString(
+                    &RuleSerial, &DeviceSerial, TRUE);
+            }
+        } else {
+            SerialMatch = TRUE;     // Rule doesn't care about serial
+        }
+
+        if (VidMatch && PidMatch && ClassMatch && SerialMatch) {
+            UDC_DEVICE_POLICY Policy = Rule->Policy;
+            FltReleasePushLock(&g_UdcState.RulesLock);
+            return Policy;
+        }
+    }
+
+    //
+    // Check whitelist (second priority)
+    //
+    for (ListEntry = g_UdcState.WhitelistHead.Flink;
+         ListEntry != &g_UdcState.WhitelistHead;
+         ListEntry = ListEntry->Flink) {
+
+        PUDC_DEVICE_RULE Rule = CONTAINING_RECORD(
+            ListEntry, UDC_DEVICE_RULE, Link);
+
+        BOOLEAN VidMatch = (Rule->VendorId == 0 || Rule->VendorId == VendorId);
+        BOOLEAN PidMatch = (Rule->ProductId == 0 || Rule->ProductId == ProductId);
+        BOOLEAN ClassMatch = (Rule->DeviceClass == UdcClass_Unknown ||
+                              Rule->DeviceClass == DeviceClass);
+        BOOLEAN SerialMatch;
+
+        if (Rule->SerialNumberLength > 0) {
+            if (SerialNumber == NULL) {
+                SerialMatch = FALSE;
+            } else {
+                UNICODE_STRING RuleSerial;
+                RuleSerial.Buffer = Rule->SerialNumber;
+                RuleSerial.Length = Rule->SerialNumberLength * sizeof(WCHAR);
+                RuleSerial.MaximumLength = sizeof(Rule->SerialNumber);
+
+                UNICODE_STRING DeviceSerial;
+                RtlInitUnicodeString(&DeviceSerial, SerialNumber);
+
+                SerialMatch = RtlEqualUnicodeString(
+                    &RuleSerial, &DeviceSerial, TRUE);
+            }
+        } else {
+            SerialMatch = TRUE;
+        }
+
+        if (VidMatch && PidMatch && ClassMatch && SerialMatch) {
+            UDC_DEVICE_POLICY Policy = Rule->Policy;
+            FltReleasePushLock(&g_UdcState.RulesLock);
+            return Policy;
+        }
+    }
+
+    FltReleasePushLock(&g_UdcState.RulesLock);
+
+    //
+    // No matching rule — return default policy
+    //
+    return g_UdcState.Config.DefaultPolicy;
 }
 
 // ============================================================================
@@ -575,6 +1485,8 @@ UdcpIsRemovableVolume(
     ULONG BufferSize;
     PFLT_VOLUME_PROPERTIES VolumeProps = NULL;
     BOOLEAN IsRemovable = FALSE;
+
+    PAGED_CODE();
 
     //
     // Query volume properties to check device characteristics
@@ -595,19 +1507,8 @@ UdcpIsRemovableVolume(
         );
 
     if (NT_SUCCESS(Status)) {
-        //
-        // Check for removable media characteristics
-        //
         if (FlagOn(VolumeProps->DeviceCharacteristics, FILE_REMOVABLE_MEDIA) ||
             FlagOn(VolumeProps->DeviceCharacteristics, FILE_FLOPPY_DISKETTE)) {
-            IsRemovable = TRUE;
-        }
-
-        //
-        // Also check device type for USB mass storage
-        //
-        if (VolumeProps->DeviceType == FILE_DEVICE_DISK &&
-            FlagOn(VolumeProps->DeviceCharacteristics, FILE_REMOVABLE_MEDIA)) {
             IsRemovable = TRUE;
         }
     }
@@ -617,106 +1518,15 @@ UdcpIsRemovableVolume(
 }
 
 // ============================================================================
-// PRIVATE — POLICY RESOLUTION
-// ============================================================================
-
-static UDC_DEVICE_POLICY
-UdcpResolvePolicy(
-    _In_ USHORT VendorId,
-    _In_ USHORT ProductId,
-    _In_opt_ PCWSTR SerialNumber
-    )
-{
-    LIST_ENTRY *ListEntry;
-
-    FltAcquirePushLockShared(&g_UdcState.RulesLock);
-
-    //
-    // Check blacklist first (highest priority)
-    //
-    for (ListEntry = g_UdcState.BlacklistHead.Flink;
-         ListEntry != &g_UdcState.BlacklistHead;
-         ListEntry = ListEntry->Flink) {
-
-        PUDC_DEVICE_RULE Rule = CONTAINING_RECORD(
-            ListEntry, UDC_DEVICE_RULE, Link);
-
-        BOOLEAN VidMatch = (Rule->VendorId == 0 || Rule->VendorId == VendorId);
-        BOOLEAN PidMatch = (Rule->ProductId == 0 || Rule->ProductId == ProductId);
-        BOOLEAN SerialMatch = TRUE;
-
-        if (Rule->SerialNumberLength > 0 && SerialNumber != NULL) {
-            UNICODE_STRING RuleSerial;
-            RuleSerial.Buffer = Rule->SerialNumber;
-            RuleSerial.Length = Rule->SerialNumberLength * sizeof(WCHAR);
-            RuleSerial.MaximumLength = sizeof(Rule->SerialNumber);
-
-            UNICODE_STRING DeviceSerial;
-            RtlInitUnicodeString(&DeviceSerial, SerialNumber);
-
-            SerialMatch = RtlEqualUnicodeString(&RuleSerial, &DeviceSerial, TRUE);
-        }
-
-        if (VidMatch && PidMatch && SerialMatch) {
-            UDC_DEVICE_POLICY Policy = Rule->Policy;
-            FltReleasePushLock(&g_UdcState.RulesLock);
-            return Policy;
-        }
-    }
-
-    //
-    // Check whitelist (second priority)
-    //
-    for (ListEntry = g_UdcState.WhitelistHead.Flink;
-         ListEntry != &g_UdcState.WhitelistHead;
-         ListEntry = ListEntry->Flink) {
-
-        PUDC_DEVICE_RULE Rule = CONTAINING_RECORD(
-            ListEntry, UDC_DEVICE_RULE, Link);
-
-        BOOLEAN VidMatch = (Rule->VendorId == 0 || Rule->VendorId == VendorId);
-        BOOLEAN PidMatch = (Rule->ProductId == 0 || Rule->ProductId == ProductId);
-        BOOLEAN SerialMatch = TRUE;
-
-        if (Rule->SerialNumberLength > 0 && SerialNumber != NULL) {
-            UNICODE_STRING RuleSerial;
-            RuleSerial.Buffer = Rule->SerialNumber;
-            RuleSerial.Length = Rule->SerialNumberLength * sizeof(WCHAR);
-            RuleSerial.MaximumLength = sizeof(Rule->SerialNumber);
-
-            UNICODE_STRING DeviceSerial;
-            RtlInitUnicodeString(&DeviceSerial, SerialNumber);
-
-            SerialMatch = RtlEqualUnicodeString(&RuleSerial, &DeviceSerial, TRUE);
-        }
-
-        if (VidMatch && PidMatch && SerialMatch) {
-            UDC_DEVICE_POLICY Policy = Rule->Policy;
-            FltReleasePushLock(&g_UdcState.RulesLock);
-            return Policy;
-        }
-    }
-
-    FltReleasePushLock(&g_UdcState.RulesLock);
-
-    //
-    // No matching rule — return default policy
-    //
-    return g_UdcState.Config.DefaultPolicy;
-}
-
-// ============================================================================
-// PRIVATE — VOLUME LOOKUP
+// PRIVATE — VOLUME LOOKUP (CALLER MUST HOLD VolumeLock)
 // ============================================================================
 
 static PUDC_TRACKED_VOLUME
-UdcpFindVolume(
+UdcpFindVolumeUnlocked(
     _In_ PFLT_INSTANCE Instance
     )
 {
     LIST_ENTRY *ListEntry;
-
-    FltAcquirePushLockShared(&g_UdcState.VolumeLock);
 
     for (ListEntry = g_UdcState.VolumeListHead.Flink;
          ListEntry != &g_UdcState.VolumeListHead;
@@ -726,12 +1536,10 @@ UdcpFindVolume(
             ListEntry, UDC_TRACKED_VOLUME, Link);
 
         if (Volume->Instance == Instance) {
-            FltReleasePushLock(&g_UdcState.VolumeLock);
             return Volume;
         }
     }
 
-    FltReleasePushLock(&g_UdcState.VolumeLock);
     return NULL;
 }
 

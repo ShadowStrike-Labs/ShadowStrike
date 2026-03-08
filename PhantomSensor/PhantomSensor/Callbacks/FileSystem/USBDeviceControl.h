@@ -87,7 +87,7 @@ typedef enum _UDC_DEVICE_POLICY {
     UdcPolicy_ReadOnly,         // Read-only, write operations blocked
     UdcPolicy_Block,            // Volume attachment rejected entirely
     UdcPolicy_Audit             // Log only, no blocking
-} UDC_DEVICE_POLICY;
+} UDC_DEVICE_POLICY, *PUDC_DEVICE_POLICY;
 
 // ============================================================================
 // DEVICE CLASS
@@ -101,7 +101,7 @@ typedef enum _UDC_DEVICE_CLASS {
     UdcClass_Network,           // USB network adapter
     UdcClass_Printer,           // USB printer
     UdcClass_Other              // Unclassified
-} UDC_DEVICE_CLASS;
+} UDC_DEVICE_CLASS, *PUDC_DEVICE_CLASS;
 
 // ============================================================================
 // DEVICE RULE ENTRY
@@ -281,6 +281,9 @@ UdcIsSetInfoBlocked(
 /**
  * @brief Check if file access targets autorun.inf and should be blocked.
  *
+ * Only blocks autorun.inf on tracked removable volumes.
+ *
+ * @param[in] FltObjects    Filter objects identifying the volume.
  * @param[in] FileName      Normalized file path.
  *
  * @return TRUE if autorun.inf should be blocked.
@@ -288,6 +291,7 @@ UdcIsSetInfoBlocked(
 _IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 UdcCheckAutorun(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ PCUNICODE_STRING FileName
     );
 
@@ -332,4 +336,67 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 UdcGetStatistics(
     _Out_ PUDC_STATISTICS Statistics
+    );
+
+// ============================================================================
+// PUBLIC API — RULE MANAGEMENT
+// ============================================================================
+
+/**
+ * @brief Add a whitelist or blacklist rule.
+ *
+ * @param[in]  IsBlacklist   TRUE for blacklist, FALSE for whitelist.
+ * @param[in]  VendorId      USB VID to match (0 = wildcard).
+ * @param[in]  ProductId     USB PID to match (0 = wildcard).
+ * @param[in]  SerialNumber  Serial number to match (NULL = wildcard).
+ * @param[in]  DeviceClass   Device class to match (UdcClass_Unknown = wildcard).
+ * @param[in]  Policy        Policy to apply when rule matches.
+ * @param[out] RuleId        Receives assigned rule ID.
+ *
+ * @return STATUS_SUCCESS on success, STATUS_QUOTA_EXCEEDED if list is full.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+UdcAddRule(
+    _In_ BOOLEAN IsBlacklist,
+    _In_ USHORT VendorId,
+    _In_ USHORT ProductId,
+    _In_opt_ PCWSTR SerialNumber,
+    _In_ UDC_DEVICE_CLASS DeviceClass,
+    _In_ UDC_DEVICE_POLICY Policy,
+    _Out_ PULONG RuleId
+    );
+
+/**
+ * @brief Remove a rule by its unique ID.
+ *
+ * @param[in] RuleId   Rule ID returned by UdcAddRule.
+ *
+ * @return STATUS_SUCCESS on success, STATUS_NOT_FOUND if rule does not exist.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+UdcRemoveRule(
+    _In_ ULONG RuleId
+    );
+
+/**
+ * @brief Remove all whitelist and blacklist rules.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+UdcClearRules(VOID);
+
+/**
+ * @brief Update the USB device control configuration.
+ *
+ * @param[in] NewConfig   New configuration to apply.
+ *
+ * @return STATUS_SUCCESS on success.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+UdcUpdateConfig(
+    _In_ PUDC_CONFIG NewConfig
     );
