@@ -49,7 +49,12 @@
  */
 
 #include "PowerCallback.h"
+
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include "../Core/Globals.h"
+#pragma warning(pop)
+
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
@@ -191,11 +196,10 @@ typedef struct _SHADOW_POWER_GLOBALS {
     volatile LONG PendingOperations;
     KEVENT NoPendingOperationsEvent;
 
-    // Work item for deferred processing from DISPATCH_LEVEL callbacks
-    PIO_WORKITEM DeferredWorkItem;
-    PDEVICE_OBJECT DeviceObject;
-    volatile LONG WorkItemQueued;
-    KEVENT WorkItemComplete;
+    // Worker thread for deferred processing from DISPATCH_LEVEL callbacks
+    PETHREAD WorkerThread;
+    KEVENT WorkerWakeEvent;
+    volatile LONG WorkerTerminate;
 
     // Deferred events from system state callback (lock-free ring)
     PWR_DEFERRED_EVENT_CONTEXT DeferredCtx;
@@ -291,11 +295,15 @@ PwrpNotifyCallbacks(
     _In_ PSHADOW_POWER_EVENT_INTERNAL Event
     );
 
-_Function_class_(IO_WORKITEM_ROUTINE)
-static VOID NTAPI
-PwrpDeferredEventWorkRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+_Function_class_(KSTART_ROUTINE)
+static VOID
+PwrpWorkerThreadRoutine(
+    _In_ PVOID StartContext
+    );
+
+static VOID
+PwrpProcessDeferredEvents(
+    VOID
     );
 
 static VOID
@@ -313,6 +321,20 @@ PwrpPerformResumeValidation(
     VOID
     );
 
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, PwrpRegisterPowerSettingCallbacks)
+#pragma alloc_text(PAGE, PwrpUnregisterPowerSettingCallbacks)
+#pragma alloc_text(PAGE, PwrpRegisterSystemStateCallback)
+#pragma alloc_text(PAGE, PwrpUnregisterSystemStateCallback)
+#pragma alloc_text(PAGE, PwrpPowerSettingCallback)
+#pragma alloc_text(PAGE, PwrpProcessPowerEvent)
+#pragma alloc_text(PAGE, PwrpRecordEvent)
+#pragma alloc_text(PAGE, PwrpNotifyCallbacks)
+#pragma alloc_text(PAGE, PwrpUpdateStateFromEvent)
+#pragma alloc_text(PAGE, PwrpPerformResumeValidation)
+#pragma alloc_text(PAGE, PwrpWorkerThreadRoutine)
+#endif
+
 // ============================================================================
 // PUBLIC API - INITIALIZATION
 // ============================================================================
@@ -327,7 +349,7 @@ ShadowRegisterPowerCallbacks(
 
     PAGED_CODE();
 
-    if (InterlockedCompareExchange(&g_PowerState.Initialized, 0, 0) != 0) {
+    if (InterlockedCompareExchange(&g_PowerState.Initialized, -1, 0) != 0) {
         return STATUS_ALREADY_INITIALIZED;
     }
 
@@ -336,7 +358,7 @@ ShadowRegisterPowerCallbacks(
 
     RtlZeroMemory(&g_PowerState, sizeof(SHADOW_POWER_GLOBALS));
 
-    g_PowerState.DeviceObject = DeviceObject;
+    UNREFERENCED_PARAMETER(DeviceObject);
 
     //
     // Initialize synchronization primitives
@@ -351,7 +373,7 @@ ShadowRegisterPowerCallbacks(
 
     KeInitializeEvent(&g_PowerState.ResumeValidationComplete, NotificationEvent, TRUE);
     KeInitializeEvent(&g_PowerState.NoPendingOperationsEvent, NotificationEvent, TRUE);
-    KeInitializeEvent(&g_PowerState.WorkItemComplete, NotificationEvent, TRUE);
+    KeInitializeEvent(&g_PowerState.WorkerWakeEvent, SynchronizationEvent, FALSE);
 
     //
     // Initialize default state
@@ -371,13 +393,41 @@ ShadowRegisterPowerCallbacks(
     InterlockedExchange(&g_PowerState.CurrentPowerSource, (LONG)ShadowPowerSource_Unknown);
 
     //
-    // Allocate work item for deferred processing
+    // Create worker thread for DISPATCH_LEVEL → PASSIVE_LEVEL deferral.
+    // Without this thread, system state callbacks (sleep/resume/hibernate)
+    // that fire at DISPATCH_LEVEL cannot be processed.
     //
-    if (DeviceObject != NULL) {
-        g_PowerState.DeferredWorkItem = IoAllocateWorkItem(DeviceObject);
-        if (g_PowerState.DeferredWorkItem == NULL) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] Failed to allocate power work item\n");
+    {
+        HANDLE threadHandle = NULL;
+        OBJECT_ATTRIBUTES threadOa;
+
+        InitializeObjectAttributes(&threadOa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+
+        status = PsCreateSystemThread(
+            &threadHandle,
+            THREAD_ALL_ACCESS,
+            &threadOa,
+            NULL,
+            NULL,
+            PwrpWorkerThreadRoutine,
+            NULL
+            );
+
+        if (NT_SUCCESS(status)) {
+            ObReferenceObjectByHandle(
+                threadHandle,
+                THREAD_ALL_ACCESS,
+                *PsThreadType,
+                KernelMode,
+                (PVOID*)&g_PowerState.WorkerThread,
+                NULL
+                );
+            ZwClose(threadHandle);
+        } else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] Failed to create power worker thread: 0x%08X. "
+                       "DISPATCH_LEVEL power events (sleep/resume) will not be processed.\n",
+                       status);
         }
     }
 
@@ -474,26 +524,24 @@ ShadowUnregisterPowerCallbacks(
     PwrpUnregisterSystemStateCallback();
 
     //
-    // Step 4: Wait for any in-flight work item to complete.
-    // The work item sets WorkItemComplete when it finishes.
+    // Step 4: Terminate worker thread.
+    // Signal the thread to exit and wait for it to complete.
     //
-    if (InterlockedCompareExchange(&g_PowerState.WorkItemQueued, 0, 0) != 0) {
+    if (g_PowerState.WorkerThread != NULL) {
+        InterlockedExchange(&g_PowerState.WorkerTerminate, TRUE);
+        KeSetEvent(&g_PowerState.WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
+
         timeout.QuadPart = -100000000LL;  // 10 seconds
         KeWaitForSingleObject(
-            &g_PowerState.WorkItemComplete,
+            g_PowerState.WorkerThread,
             Executive,
             KernelMode,
             FALSE,
             &timeout
             );
-    }
 
-    //
-    // Step 5: Free work item (safe — work item is guaranteed not running)
-    //
-    if (g_PowerState.DeferredWorkItem != NULL) {
-        IoFreeWorkItem(g_PowerState.DeferredWorkItem);
-        g_PowerState.DeferredWorkItem = NULL;
+        ObDereferenceObject(g_PowerState.WorkerThread);
+        g_PowerState.WorkerThread = NULL;
     }
 
     //
@@ -1183,6 +1231,9 @@ PwrpRegisterPowerSettingCallbacks(
     )
 {
     NTSTATUS status;
+    ULONG successCount = 0;
+
+    PAGED_CODE();
 
     //
     // Console display state (on/off/dimmed)
@@ -1195,7 +1246,9 @@ PwrpRegisterPowerSettingCallbacks(
         &g_PowerState.ConsoleDisplayStateHandle
         );
 
-    if (!NT_SUCCESS(status)) {
+    if (NT_SUCCESS(status)) {
+        successCount++;
+    } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] Failed to register CONSOLE_DISPLAY_STATE: 0x%08X\n",
                    status);
@@ -1212,7 +1265,9 @@ PwrpRegisterPowerSettingCallbacks(
         &g_PowerState.AcDcPowerSourceHandle
         );
 
-    if (!NT_SUCCESS(status)) {
+    if (NT_SUCCESS(status)) {
+        successCount++;
+    } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] Failed to register ACDC_POWER_SOURCE: 0x%08X\n",
                    status);
@@ -1229,7 +1284,9 @@ PwrpRegisterPowerSettingCallbacks(
         &g_PowerState.LidSwitchStateHandle
         );
 
-    if (!NT_SUCCESS(status)) {
+    if (NT_SUCCESS(status)) {
+        successCount++;
+    } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] Failed to register LIDSWITCH_STATE: 0x%08X\n",
                    status);
@@ -1246,7 +1303,9 @@ PwrpRegisterPowerSettingCallbacks(
         &g_PowerState.BatteryPercentageHandle
         );
 
-    if (!NT_SUCCESS(status)) {
+    if (NT_SUCCESS(status)) {
+        successCount++;
+    } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] Failed to register BATTERY_PERCENTAGE: 0x%08X\n",
                    status);
@@ -1263,7 +1322,9 @@ PwrpRegisterPowerSettingCallbacks(
         &g_PowerState.IdleResiliencyHandle
         );
 
-    if (!NT_SUCCESS(status)) {
+    if (NT_SUCCESS(status)) {
+        successCount++;
+    } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] Failed to register IDLE_RESILIENCY: 0x%08X\n",
                    status);
@@ -1280,7 +1341,9 @@ PwrpRegisterPowerSettingCallbacks(
         &g_PowerState.UserPresenceHandle
         );
 
-    if (!NT_SUCCESS(status)) {
+    if (NT_SUCCESS(status)) {
+        successCount++;
+    } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] Failed to register USER_PRESENCE: 0x%08X\n",
                    status);
@@ -1297,11 +1360,23 @@ PwrpRegisterPowerSettingCallbacks(
         &g_PowerState.SessionDisplayStatusHandle
         );
 
-    if (!NT_SUCCESS(status)) {
+    if (NT_SUCCESS(status)) {
+        successCount++;
+    } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] Failed to register SESSION_DISPLAY_STATUS: 0x%08X\n",
                    status);
     }
+
+    if (successCount == 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] All 7 power setting callback registrations failed\n");
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike] Registered %lu of 7 power setting callbacks\n",
+               successCount);
 
     return STATUS_SUCCESS;
 }
@@ -1311,6 +1386,7 @@ PwrpUnregisterPowerSettingCallbacks(
     VOID
     )
 {
+    PAGED_CODE();
     if (g_PowerState.ConsoleDisplayStateHandle != NULL) {
         PoUnregisterPowerSettingCallback(g_PowerState.ConsoleDisplayStateHandle);
         g_PowerState.ConsoleDisplayStateHandle = NULL;
@@ -1356,6 +1432,8 @@ PwrpRegisterSystemStateCallback(
     UNICODE_STRING callbackName;
     OBJECT_ATTRIBUTES oa;
 
+    PAGED_CODE();
+
     RtlInitUnicodeString(&callbackName, L"\\Callback\\PowerState");
     InitializeObjectAttributes(&oa, &callbackName, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
@@ -1393,6 +1471,7 @@ PwrpUnregisterSystemStateCallback(
     VOID
     )
 {
+    PAGED_CODE();
     if (g_PowerState.SystemStateRegistration != NULL) {
         ExUnregisterCallback(g_PowerState.SystemStateRegistration);
         g_PowerState.SystemStateRegistration = NULL;
@@ -1425,6 +1504,8 @@ PwrpPowerSettingCallback(
 {
     ULONG_PTR callbackType = (ULONG_PTR)Context;
     ULONG valueData;
+
+    PAGED_CODE();
 
     UNREFERENCED_PARAMETER(SettingGuid);
 
@@ -1648,25 +1729,12 @@ PwrpSystemStateCallback(
     KeReleaseSpinLock(&g_PowerState.DeferredCtxLock, oldIrql);
 
     //
-    // Queue work item to process at PASSIVE_LEVEL (only if not already queued)
+    // Wake worker thread to process events at PASSIVE_LEVEL.
+    // SynchronizationEvent auto-resets; multiple signals before the thread
+    // wakes coalesce into one wake — the thread drains all queued events.
     //
-    if (g_PowerState.DeferredWorkItem != NULL &&
-        g_PowerState.DeviceObject != NULL) {
-
-        if (InterlockedCompareExchange(&g_PowerState.WorkItemQueued, 1, 0) == 0) {
-            //
-            // We won the race — queue the work item.
-            // Clear the completion event so shutdown can wait on it.
-            //
-            KeClearEvent(&g_PowerState.WorkItemComplete);
-
-            IoQueueWorkItem(
-                g_PowerState.DeferredWorkItem,
-                PwrpDeferredEventWorkRoutine,
-                DelayedWorkQueue,
-                NULL
-                );
-        }
+    if (g_PowerState.WorkerThread != NULL) {
+        KeSetEvent(&g_PowerState.WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
     }
 }
 
@@ -1690,6 +1758,8 @@ PwrpProcessPowerEvent(
 {
     PSHADOW_POWER_EVENT_INTERNAL event;
 
+    PAGED_CODE();
+
     if (!g_PowerState.Initialized || g_PowerState.ShuttingDown) {
         return;
     }
@@ -1705,7 +1775,6 @@ PwrpProcessPowerEvent(
     }
 
     event->Info.EventType = EventType;
-    event->Info.PreviousState = g_PowerState.StateInfo.CurrentState;
     KeQuerySystemTime(&event->Info.Timestamp);
     event->Info.EventSequence = (UINT64)InterlockedIncrement64(&g_PowerState.EventSequence);
 
@@ -1722,10 +1791,11 @@ PwrpProcessPowerEvent(
     }
 
     //
-    // Update state based on event
+    // Update state based on event.
+    // PreviousState and NewState are assigned inside the lock
+    // to prevent torn reads from concurrent events.
     //
     PwrpUpdateStateFromEvent(event);
-    event->Info.NewState = g_PowerState.StateInfo.CurrentState;
 
     //
     // Record in history
@@ -1754,6 +1824,8 @@ PwrpRecordEvent(
     _In_ PSHADOW_POWER_EVENT_INTERNAL Event
     )
 {
+    PAGED_CODE();
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PowerState.EventHistoryLock);
 
@@ -1784,6 +1856,8 @@ PwrpNotifyCallbacks(
     PLIST_ENTRY entry;
     PSHADOW_POWER_CALLBACK_ENTRY callbackEntry;
     ULONGLONG eventBit;
+
+    PAGED_CODE();
 
     if (g_PowerState.CallbackCount == 0) {
         return;
@@ -1834,26 +1908,65 @@ PwrpNotifyCallbacks(
 }
 
 /**
- * @brief Deferred work routine — processes events queued from DISPATCH_LEVEL.
+ * @brief Worker thread for DISPATCH_LEVEL → PASSIVE_LEVEL event deferral.
  *
- * Runs at PASSIVE_LEVEL. Drains the deferred event queue and
- * processes each event with full locking/allocation capabilities.
- * Also triggers resume validation when a resume event is present.
+ * Waits on WorkerWakeEvent (SynchronizationEvent, auto-reset).
+ * When signaled by PwrpSystemStateCallback, drains the deferred event queue
+ * and processes each event at PASSIVE_LEVEL with full locking/allocation.
+ * Exits when WorkerTerminate is set.
  */
-_Function_class_(IO_WORKITEM_ROUTINE)
-static VOID NTAPI
-PwrpDeferredEventWorkRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+_Function_class_(KSTART_ROUTINE)
+static VOID
+PwrpWorkerThreadRoutine(
+    _In_ PVOID StartContext
+    )
+{
+    PAGED_CODE();
+
+    UNREFERENCED_PARAMETER(StartContext);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+               "[ShadowStrike] Power worker thread started\n");
+
+    while (!ReadNoFence(&g_PowerState.WorkerTerminate)) {
+
+        KeWaitForSingleObject(
+            &g_PowerState.WorkerWakeEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+            );
+
+        if (ReadNoFence(&g_PowerState.WorkerTerminate)) {
+            break;
+        }
+
+        PwrpProcessDeferredEvents();
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+               "[ShadowStrike] Power worker thread exiting\n");
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+/**
+ * @brief Drain and process all deferred events from the spin-lock-protected queue.
+ *
+ * Called from the worker thread at PASSIVE_LEVEL. Briefly acquires the
+ * DeferredCtxLock spin lock to copy events, then processes at PASSIVE_LEVEL.
+ * Triggers resume validation when a resume event is present.
+ */
+static VOID
+PwrpProcessDeferredEvents(
+    VOID
     )
 {
     PWR_DEFERRED_EVENT_CONTEXT localCtx;
     ULONG i;
     BOOLEAN needsResumeValidation = FALSE;
     KIRQL oldIrql;
-
-    UNREFERENCED_PARAMETER(DeviceObject);
-    UNREFERENCED_PARAMETER(Context);
 
     //
     // Drain the deferred events under spin lock (quick copy)
@@ -1864,6 +1977,10 @@ PwrpDeferredEventWorkRoutine(
     g_PowerState.DeferredCtx.EventCount = 0;
 
     KeReleaseSpinLock(&g_PowerState.DeferredCtxLock, oldIrql);
+
+    if (localCtx.EventCount == 0) {
+        return;
+    }
 
     //
     // Process each deferred event at PASSIVE_LEVEL
@@ -1885,12 +2002,6 @@ PwrpDeferredEventWorkRoutine(
     if (needsResumeValidation && !g_PowerState.ShuttingDown) {
         ShadowPowerValidateResume();
     }
-
-    //
-    // Mark work item as no longer queued, then signal completion
-    //
-    InterlockedExchange(&g_PowerState.WorkItemQueued, 0);
-    KeSetEvent(&g_PowerState.WorkItemComplete, IO_NO_INCREMENT, FALSE);
 }
 
 /**
@@ -1902,10 +2013,13 @@ PwrpUpdateStateFromEvent(
     _In_ PSHADOW_POWER_EVENT_INTERNAL Event
     )
 {
+    PAGED_CODE();
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PowerState.StateLock);
 
     g_PowerState.StateInfo.PreviousState = g_PowerState.StateInfo.CurrentState;
+    Event->Info.PreviousState = g_PowerState.StateInfo.CurrentState;
 
     switch (Event->Info.EventType) {
         case ShadowPowerEvent_EnteringSleep:
@@ -1994,6 +2108,11 @@ PwrpUpdateStateFromEvent(
         g_PowerState.StateInfo.ConnectedStandbyExitCount++;
     }
 
+    //
+    // Capture NewState on the event record under lock for consistency
+    //
+    Event->Info.NewState = g_PowerState.StateInfo.CurrentState;
+
     KeQuerySystemTime(&g_PowerState.StateInfo.LastStateChangeTime);
 
     //
@@ -2038,6 +2157,8 @@ PwrpPerformResumeValidation(
     NTSTATUS status = STATUS_SUCCESS;
     NTSTATUS checkStatus;
     LARGE_INTEGER currentTime;
+
+    PAGED_CODE();
 
     KeQuerySystemTime(&currentTime);
 

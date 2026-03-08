@@ -183,6 +183,7 @@
     <ClCompile Include="PhantomSensor\Performance\LookasideLists.c" />
     <ClCompile Include="PhantomSensor\Performance\PerformanceMonitor.c" />
     <ClCompile Include="PhantomSensor\Performance\ResourceThrottling.c" />
+    <ClCompile Include="PhantomSensor\Power\PowerCallback.c" />
     <ClCompile Include="PhantomSensor\Sync\AsyncWorkQueue.c" />
     <ClCompile Include="PhantomSensor\Sync\DeferredProcedure.c" />
     <ClCompile Include="PhantomSensor\Sync\SpinLock.c" />
@@ -263,6 +264,7 @@
     <ClInclude Include="PhantomSensor\Performance\LookasideLists.h" />
     <ClInclude Include="PhantomSensor\Performance\PerformanceMonitor.h" />
     <ClInclude Include="PhantomSensor\Performance\ResourceThrottling.h" />
+    <ClInclude Include="PhantomSensor\Power\PowerCallback.h" />
     <ClInclude Include="PhantomSensor\Sync\AsyncWorkQueue.h" />
     <ClInclude Include="PhantomSensor\Sync\DeferredProcedure.h" />
     <ClInclude Include="PhantomSensor\Sync\SpinLock.h" />

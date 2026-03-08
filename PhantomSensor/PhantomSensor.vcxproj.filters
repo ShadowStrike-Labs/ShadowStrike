@@ -261,6 +261,18 @@
     <ClCompile Include="PhantomSensor\Callbacks\Registry\RegistryCallback.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="PhantomSensor\Exclusions\ExclusionManager.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\Exclusions\PathExclusion.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\Exclusions\ProcessExclusion.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\Power\PowerCallback.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="PhantomSensor\Context\InstanceContext.h">
@@ -528,6 +540,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PhantomSensor\Callbacks\Registry\RegistryCallback.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\Exclusions\ExclusionManager.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\Power\PowerCallback.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
