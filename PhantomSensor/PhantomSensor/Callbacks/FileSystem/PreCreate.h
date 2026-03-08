@@ -75,7 +75,10 @@
 extern "C" {
 #endif
 
+#pragma warning(push)
+#pragma warning(disable: 4324) // structure was padded due to alignment specifier (WDK headers)
 #include <fltKernel.h>
+#pragma warning(pop)
 #include <ntifs.h>
 
 // ============================================================================
@@ -569,7 +572,7 @@ PcCheckHoneypot(
  *
  * @irql <= DISPATCH_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 PcGetConfig(
     _Out_ PPC_CONFIG Config
@@ -629,7 +632,7 @@ PcClearHoneypotPatterns(
  *
  * @irql <= DISPATCH_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 PcGetStatistics(
     _Out_ PPC_STATISTICS Stats
