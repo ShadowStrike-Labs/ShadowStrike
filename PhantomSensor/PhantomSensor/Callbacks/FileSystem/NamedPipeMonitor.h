@@ -63,7 +63,10 @@
 extern "C" {
 #endif
 
+#pragma warning(push)
+#pragma warning(disable:4324)  // structure was padded due to alignment specifier
 #include <fltKernel.h>
+#pragma warning(pop)
 
 // ============================================================================
 // POOL TAGS
@@ -81,7 +84,6 @@ extern "C" {
 #define NPM_MAX_TRACKED_PIPES           2048
 #define NPM_HASH_TABLE_SIZE             128
 #define NPM_MAX_EVENT_QUEUE             256
-#define NPM_ENTROPY_THRESHOLD_HIGH      4.2f
 #define NPM_CLEANUP_INTERVAL_MS         120000
 #define NPM_PIPE_IDLE_TIMEOUT_100NS     (-(LONGLONG)300 * 10000000LL)   // 5 min
 #define NPM_MAX_CONNECTIONS_PER_PIPE    64
@@ -268,12 +270,23 @@ NpMonGetStatistics(
  * @brief Dequeue a pipe event for user-mode delivery.
  * @irql <= APC_LEVEL
  * @return STATUS_SUCCESS with event, STATUS_NO_MORE_ENTRIES if queue empty.
- *         Caller must free returned event with ExFreePoolWithTag(NPM_POOL_TAG_EVENT).
+ *         Caller must free returned event with NpMonFreeEvent().
  */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 NpMonDequeueEvent(
     _Outptr_ PNPM_PIPE_EVENT *Event
+    );
+
+/**
+ * @brief Free a pipe event returned by NpMonDequeueEvent.
+ * @param Event  Event to free. May be NULL (no-op).
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+NpMonFreeEvent(
+    _In_opt_ PNPM_PIPE_EVENT Event
     );
 
 #ifdef __cplusplus

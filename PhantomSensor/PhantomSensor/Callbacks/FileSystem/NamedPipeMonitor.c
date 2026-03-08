@@ -216,7 +216,7 @@ NpmIsSystemPipe(
     _In_ USHORT NameLengthChars
     );
 
-static float
+static ULONG
 NpmCalculateEntropy(
     _In_ PCWSTR String,
     _In_ USHORT LengthChars
@@ -272,6 +272,22 @@ NpmExtractPipeName(
     );
 
 // ============================================================================
+// PAGE ALLOCATION
+// ============================================================================
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(INIT, NpMonInitialize)
+#pragma alloc_text(PAGE, NpMonShutdown)
+#pragma alloc_text(PAGE, NpMonDequeueEvent)
+#pragma alloc_text(PAGE, NpmExtractPipeName)
+#pragma alloc_text(PAGE, NpmClassifyPipe)
+#pragma alloc_text(PAGE, NpmIsSystemPipe)
+#pragma alloc_text(PAGE, NpmCalculateEntropy)
+#pragma alloc_text(PAGE, NpmTrackPipe)
+#pragma alloc_text(PAGE, NpmEvictLruEntries)
+#endif
+
+// ============================================================================
 // LIFECYCLE
 // ============================================================================
 
@@ -282,6 +298,8 @@ NpMonInitialize(
     )
 {
     LONG prevState;
+
+    PAGED_CODE();
 
     prevState = InterlockedCompareExchange(
         &g_NpmState.State,
@@ -371,6 +389,8 @@ NpMonShutdown(
 {
     LONG prevState;
 
+    PAGED_CODE();
+
     prevState = InterlockedCompareExchange(
         &g_NpmState.State,
         NPM_STATE_SHUTTING_DOWN,
@@ -413,12 +433,14 @@ NpMonShutdown(
     }
 
     //
-    // Destroy lookaside lists
+    // Destroy lookaside lists — mark unavailable FIRST to prevent
+    // in-flight NpMonFreeEvent from using them after deletion
     //
     if (g_NpmState.LookasideInitialized) {
+        g_NpmState.LookasideInitialized = FALSE;
+        MemoryBarrier();
         ExDeleteNPagedLookasideList(&g_NpmState.EntryLookaside);
         ExDeleteNPagedLookasideList(&g_NpmState.EventLookaside);
-        g_NpmState.LookasideInitialized = FALSE;
     }
 
     InterlockedExchange(&g_NpmState.State, NPM_STATE_UNINITIALIZED);
@@ -622,6 +644,8 @@ NpMonDequeueEvent(
     KIRQL oldIrql;
     PLIST_ENTRY entry;
 
+    PAGED_CODE();
+
     *Event = NULL;
 
     KeAcquireSpinLock(&g_NpmState.EventLock, &oldIrql);
@@ -640,6 +664,22 @@ NpMonDequeueEvent(
     return STATUS_SUCCESS;
 }
 
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+NpMonFreeEvent(
+    _In_opt_ PNPM_PIPE_EVENT Event
+    )
+{
+    if (Event == NULL) {
+        return;
+    }
+
+    if (g_NpmState.LookasideInitialized) {
+        ExFreeToNPagedLookasideList(&g_NpmState.EventLookaside, Event);
+    }
+}
+
 // ============================================================================
 // PRIVATE — PIPE NAME EXTRACTION
 // ============================================================================
@@ -654,6 +694,8 @@ NpmExtractPipeName(
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     NTSTATUS status;
     USHORT copyLen;
+
+    PAGED_CODE();
 
     *NameLengthBytes = 0;
 
@@ -707,7 +749,14 @@ NpmClassifyPipe(
     )
 {
     USHORT nameChars = NameLengthBytes / sizeof(WCHAR);
-    float entropy;
+    ULONG entropy1024;
+
+    //
+    // Entropy threshold: 4.2 bits * 1024 = 4300 (fixed-point)
+    //
+    static const ULONG ENTROPY_THRESHOLD_FIXED = 4300;
+
+    PAGED_CODE();
 
     *ThreatScore = 0;
 
@@ -763,10 +812,11 @@ NpmClassifyPipe(
     // Shannon entropy analysis for randomized pipe names.
     // High-entropy names are common in C2 frameworks that generate
     // random pipe names to avoid signature-based detection.
+    // entropy1024 is in fixed-point (actual_entropy * 1024).
     //
-    entropy = NpmCalculateEntropy(PipeName, nameChars);
-    if (entropy > NPM_ENTROPY_THRESHOLD_HIGH && nameChars >= 8) {
-        *ThreatScore = 55 + (ULONG)((entropy - NPM_ENTROPY_THRESHOLD_HIGH) * 10.0f);
+    entropy1024 = NpmCalculateEntropy(PipeName, nameChars);
+    if (entropy1024 > ENTROPY_THRESHOLD_FIXED && nameChars >= 8) {
+        *ThreatScore = 55 + (entropy1024 - ENTROPY_THRESHOLD_FIXED) / 100;
         if (*ThreatScore > 85) {
             *ThreatScore = 85;
         }
@@ -782,6 +832,8 @@ NpmIsSystemPipe(
     _In_ USHORT NameLengthChars
     )
 {
+    PAGED_CODE();
+
     for (ULONG i = 0; i < ARRAYSIZE(g_SystemPipes); i++) {
         SIZE_T sysLen = wcslen(g_SystemPipes[i]);
         if (NameLengthChars == (USHORT)sysLen &&
@@ -797,30 +849,94 @@ NpmIsSystemPipe(
 // ============================================================================
 
 /**
- * @brief Calculates Shannon entropy of a wide-character string.
+ * @brief Calculates Shannon entropy of a wide-character string using integer math.
  *
- * Uses frequency analysis of printable ASCII characters.
- * Returns bits-per-character (0.0 for uniform, ~4.7 for random alphanumeric).
+ * Returns entropy in fixed-point format: result / 1024 = actual entropy in bits.
+ * Threshold comparisons should use scaled values (e.g. 4.2 * 1024 = 4300).
+ * Uses a pre-computed log2 lookup table to avoid floating-point in kernel mode.
  */
-static float
+
+//
+// Fixed-point log2 table: log2_table[n] = round(log2(n) * 1024) for n=1..256
+// log2(1)=0, log2(2)=1024, log2(3)=1623, ..., log2(256)=8192
+//
+static const USHORT g_Log2Table[257] = {
+       0,    0, 1024, 1623, 2048, 2378, 2647, 2874,
+    3072, 3247, 3402, 3542, 3671, 3789, 3898, 4001,
+    4096, 4186, 4271, 4351, 4427, 4499, 4568, 4634,
+    4697, 4757, 4815, 4871, 4925, 4977, 5027, 5075,
+    5120, 5165, 5208, 5249, 5290, 5329, 5367, 5404,
+    5440, 5475, 5509, 5542, 5574, 5606, 5637, 5667,
+    5696, 5725, 5753, 5781, 5808, 5834, 5860, 5886,
+    5910, 5935, 5959, 5982, 6006, 6028, 6051, 6073,
+    6094, 6116, 6136, 6157, 6177, 6197, 6217, 6236,
+    6255, 6274, 6293, 6311, 6329, 6347, 6365, 6382,
+    6400, 6417, 6434, 6450, 6467, 6483, 6499, 6515,
+    6531, 6546, 6562, 6577, 6592, 6607, 6621, 6636,
+    6650, 6665, 6679, 6693, 6706, 6720, 6734, 6747,
+    6760, 6773, 6786, 6799, 6812, 6824, 6837, 6849,
+    6861, 6873, 6885, 6897, 6909, 6921, 6932, 6944,
+    6955, 6966, 6977, 6989, 6999, 7010, 7021, 7032,
+    7042, 7053, 7063, 7073, 7084, 7094, 7104, 7114,
+    7124, 7134, 7143, 7153, 7163, 7172, 7182, 7191,
+    7201, 7210, 7219, 7228, 7237, 7247, 7256, 7264,
+    7273, 7282, 7291, 7300, 7308, 7317, 7325, 7334,
+    7342, 7350, 7359, 7367, 7375, 7383, 7391, 7399,
+    7407, 7415, 7423, 7431, 7438, 7446, 7454, 7461,
+    7469, 7476, 7484, 7491, 7499, 7506, 7513, 7521,
+    7528, 7535, 7542, 7549, 7556, 7563, 7570, 7577,
+    7584, 7591, 7597, 7604, 7611, 7618, 7624, 7631,
+    7637, 7644, 7650, 7657, 7663, 7669, 7676, 7682,
+    7688, 7694, 7700, 7707, 7713, 7719, 7725, 7731,
+    7737, 7743, 7749, 7754, 7760, 7766, 7772, 7778,
+    7783, 7789, 7795, 7800, 7806, 7812, 7817, 7823,
+    7828, 7834, 7839, 7844, 7850, 7855, 7861, 7866,
+    7871, 7877, 7882, 7887, 7892, 7897, 7903, 7908,
+    7913, 7918, 7923, 7928, 7933, 7938, 7943, 7948,
+    7953
+};
+
+//
+// Integer log2 for values > 256 using bit scan + table interpolation
+//
+FORCEINLINE
+ULONG
+NpmLog2Fixed(
+    _In_ ULONG Value
+    )
+{
+    ULONG shift = 0;
+    ULONG v = Value;
+
+    if (v == 0) return 0;
+    if (v <= 256) return g_Log2Table[v];
+
+    while (v > 256) {
+        v >>= 1;
+        shift++;
+    }
+
+    return g_Log2Table[v] + (shift * 1024);
+}
+
+static ULONG
 NpmCalculateEntropy(
     _In_ PCWSTR String,
     _In_ USHORT LengthChars
     )
 {
     ULONG freq[128];
-    float entropy = 0.0f;
-    float len = (float)LengthChars;
+    ULONG entropy1024 = 0;
+    ULONG logLen;
+
+    PAGED_CODE();
 
     if (LengthChars < 2) {
-        return 0.0f;
+        return 0;
     }
 
     RtlZeroMemory(freq, sizeof(freq));
 
-    //
-    // Count character frequencies (only printable ASCII range)
-    //
     for (USHORT i = 0; i < LengthChars; i++) {
         WCHAR c = String[i];
         if (c < 128) {
@@ -829,67 +945,26 @@ NpmCalculateEntropy(
     }
 
     //
-    // Calculate Shannon entropy: H = -Σ p(x) * log2(p(x))
-    // We use a lookup approximation to avoid FP division in kernel
-    // at high IRQL. Since this runs at PASSIVE_LEVEL in pre-op,
-    // floating point is safe on x64 (kernel saves FP state).
+    // Shannon entropy: H = log2(N) - (1/N) * Σ freq[i] * log2(freq[i])
+    // In fixed-point (*1024):
+    //   H*1024 = log2(N)*1024 - (1/N) * Σ freq[i] * log2(freq[i])*1024
     //
+    logLen = NpmLog2Fixed(LengthChars);
+
     for (ULONG i = 0; i < 128; i++) {
-        if (freq[i] > 0) {
-            float p = (float)freq[i] / len;
-            //
-            // log2(p) = ln(p) / ln(2)
-            // Approximation: -p * log2(p) via table or direct computation
-            // For kernel safety, we use the identity:
-            //   -p*log2(p) = p * log2(1/p) = p * (log2(len) - log2(freq[i]))
-            //
-            // Simplified: we accumulate -p * log2(p) directly
-            //
-            float log2p = 0.0f;
-            float v = p;
-
-            // Fast log2 approximation for 0 < v <= 1
-            // Using: log2(x) ≈ (x-1)/ln(2) for x near 1 isn't accurate enough.
-            // Instead, use bit manipulation on the float.
-            //
-            // For kernel driver simplicity, we use the series:
-            // log2(v) where v = freq/len
-            // -v * log2(v) = v * (log2(len) - log2(freq))
-            //
-            // We compute log2 via repeated squaring approximation:
-            {
-                // Natural log approach: ln(x) for 0 < x < 1
-                // ln(x) = -(1-x) - (1-x)^2/2 - (1-x)^3/3 ... (for x near 1)
-                // But for small p this diverges. Use ratio instead.
-                float ratio = (float)freq[i];
-                float logFreq = 0.0f, logLen = 0.0f;
-                float temp;
-
-                // log2(n) ≈ bit length - 1 + fraction
-                // Simple: count bits for integer part
-                ULONG n = freq[i];
-                while (n > 1) { logFreq += 1.0f; n >>= 1; }
-
-                n = LengthChars;
-                while (n > 1) { logLen += 1.0f; n >>= 1; }
-
-                // Fractional refinement
-                temp = (float)freq[i];
-                while (temp >= 2.0f) temp /= 2.0f;
-                logFreq += (temp - 1.0f) * 0.6f;  // Linear approx of log2 frac
-
-                temp = (float)LengthChars;
-                while (temp >= 2.0f) temp /= 2.0f;
-                logLen += (temp - 1.0f) * 0.6f;
-
-                log2p = logFreq - logLen;  // log2(freq/len) = log2(freq) - log2(len)
-            }
-
-            entropy -= p * log2p;
+        if (freq[i] > 0 && freq[i] <= 256) {
+            entropy1024 += freq[i] * g_Log2Table[freq[i]];
+        } else if (freq[i] > 256) {
+            entropy1024 += freq[i] * NpmLog2Fixed(freq[i]);
         }
     }
 
-    return entropy;
+    //
+    // H*1024 = log2(N)*1024 - entropy_sum / N
+    //
+    entropy1024 = logLen - (entropy1024 / LengthChars);
+
+    return entropy1024;
 }
 
 // ============================================================================
@@ -959,6 +1034,10 @@ NpmTrackPipe(
     ULONG bucket;
     PNPM_PIPE_ENTRY entry;
     USHORT copyLen;
+    PLIST_ENTRY listEntry;
+    BOOLEAN duplicate = FALSE;
+
+    PAGED_CODE();
 
     //
     // Check capacity — evict if needed
@@ -967,14 +1046,54 @@ NpmTrackPipe(
         NpmEvictLruEntries(64);
     }
 
-    entry = NpmAllocateEntry();
-    if (entry == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
+    bucket = NpmHashPipeName(PipeName, NameLengthBytes);
+
+    //
+    // Check for duplicate entry in the bucket before allocating.
+    // Lock ordering: bucket lock FIRST, then LRU lock (matches eviction order).
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_NpmState.HashTable[bucket].Lock);
+
+    for (listEntry = g_NpmState.HashTable[bucket].List.Flink;
+         listEntry != &g_NpmState.HashTable[bucket].List;
+         listEntry = listEntry->Flink) {
+
+        PNPM_PIPE_ENTRY existing = CONTAINING_RECORD(listEntry, NPM_PIPE_ENTRY, ListEntry);
+        if (existing->PipeNameLength == NameLengthBytes &&
+            _wcsnicmp(existing->PipeName, PipeName, NameLengthBytes / sizeof(WCHAR)) == 0) {
+            //
+            // Duplicate — update existing entry instead of inserting new one
+            //
+            InterlockedIncrement(&existing->ConnectionCount);
+            KeQuerySystemTimePrecise(&existing->LastAccessTime);
+
+            if (ThreatScore > existing->ThreatScore) {
+                existing->ThreatScore = ThreatScore;
+                existing->Classification = Classification;
+            }
+
+            duplicate = TRUE;
+            break;
+        }
+    }
+
+    if (duplicate) {
+        ExReleasePushLockExclusive(&g_NpmState.HashTable[bucket].Lock);
+        KeLeaveCriticalRegion();
+        return STATUS_SUCCESS;
     }
 
     //
-    // Populate entry
+    // Not a duplicate — allocate and insert
     //
+    entry = NpmAllocateEntry();
+    if (entry == NULL) {
+        ExReleasePushLockExclusive(&g_NpmState.HashTable[bucket].Lock);
+        KeLeaveCriticalRegion();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
     copyLen = NameLengthBytes;
     if (copyLen > (NPM_MAX_PIPE_NAME_CCH - 1) * sizeof(WCHAR)) {
         copyLen = (NPM_MAX_PIPE_NAME_CCH - 1) * sizeof(WCHAR);
@@ -998,14 +1117,6 @@ NpmTrackPipe(
     KeQuerySystemTimePrecise(&entry->CreateTime);
     entry->LastAccessTime = entry->CreateTime;
 
-    //
-    // Insert into hash table
-    //
-    bucket = NpmHashPipeName(PipeName, NameLengthBytes);
-
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_NpmState.HashTable[bucket].Lock);
-
     InsertTailList(&g_NpmState.HashTable[bucket].List, &entry->ListEntry);
     InterlockedIncrement(&g_NpmState.HashTable[bucket].Count);
     InterlockedIncrement(&g_NpmState.TotalEntries);
@@ -1014,7 +1125,7 @@ NpmTrackPipe(
     KeLeaveCriticalRegion();
 
     //
-    // Add to LRU list
+    // Add to LRU list (separate lock scope — always acquired AFTER bucket lock)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_NpmState.LruLock);
@@ -1105,27 +1216,47 @@ NpmCheckRateLimit(
     )
 {
     LARGE_INTEGER now;
-    LARGE_INTEGER elapsed;
+    LONGLONG oldStart;
+    LONGLONG elapsed;
 
     KeQuerySystemTimePrecise(&now);
 
-    elapsed.QuadPart = now.QuadPart - g_NpmState.RateWindowStart.QuadPart;
+    oldStart = InterlockedCompareExchange64(
+        &g_NpmState.RateWindowStart.QuadPart,
+        g_NpmState.RateWindowStart.QuadPart,
+        g_NpmState.RateWindowStart.QuadPart
+    );
+
+    elapsed = now.QuadPart - oldStart;
 
     //
-    // If window expired, reset
+    // If window expired, attempt atomic reset.
+    // Only one thread wins the CAS — others see the new window and proceed normally.
     //
-    if (elapsed.QuadPart > (LONGLONG)NPM_RATE_LIMIT_WINDOW_MS * 10000LL) {
-        g_NpmState.RateWindowStart = now;
-        InterlockedExchange(&g_NpmState.RateWindowCount, 1);
-        return TRUE;
+    if (elapsed > (LONGLONG)NPM_RATE_LIMIT_WINDOW_MS * 10000LL) {
+        LONGLONG swapped = InterlockedCompareExchange64(
+            &g_NpmState.RateWindowStart.QuadPart,
+            now.QuadPart,
+            oldStart
+        );
+
+        if (swapped == oldStart) {
+            InterlockedExchange(&g_NpmState.RateWindowCount, 1);
+            return TRUE;
+        }
+        //
+        // Another thread already reset — fall through to normal increment
+        //
     }
 
     //
-    // Check if within rate limit
+    // Atomic increment within current window
     //
-    LONG count = InterlockedIncrement(&g_NpmState.RateWindowCount);
-    if (count > NPM_RATE_LIMIT_MAX_CREATES) {
-        return FALSE;
+    {
+        LONG count = InterlockedIncrement(&g_NpmState.RateWindowCount);
+        if (count > NPM_RATE_LIMIT_MAX_CREATES) {
+            return FALSE;
+        }
     }
 
     return TRUE;
@@ -1141,28 +1272,51 @@ NpmEvictLruEntries(
     )
 {
     ULONG evicted = 0;
+    ULONG collected = 0;
+    PNPM_PIPE_ENTRY victims[64];
 
+    PAGED_CODE();
+
+    if (Count > 64) {
+        Count = 64;
+    }
+
+    //
+    // Phase 1: Collect victims from LRU list under LRU lock only.
+    // Do NOT acquire bucket locks here — that would violate lock ordering
+    // (NpmTrackPipe acquires bucket lock then LRU lock).
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_NpmState.LruLock);
 
-    while (!IsListEmpty(&g_NpmState.LruList) && evicted < Count) {
+    while (!IsListEmpty(&g_NpmState.LruList) && collected < Count) {
         PLIST_ENTRY lruEntry = RemoveHeadList(&g_NpmState.LruList);
-        PNPM_PIPE_ENTRY pipeEntry = CONTAINING_RECORD(lruEntry, NPM_PIPE_ENTRY, LruEntry);
-        ULONG bucket = NpmHashPipeName(pipeEntry->PipeName, pipeEntry->PipeNameLength);
-
-        //
-        // Remove from hash table
-        //
-        ExAcquirePushLockExclusive(&g_NpmState.HashTable[bucket].Lock);
-        RemoveEntryList(&pipeEntry->ListEntry);
-        InterlockedDecrement(&g_NpmState.HashTable[bucket].Count);
-        InterlockedDecrement(&g_NpmState.TotalEntries);
-        ExReleasePushLockExclusive(&g_NpmState.HashTable[bucket].Lock);
-
-        NpmFreeEntry(pipeEntry);
-        evicted++;
+        victims[collected] = CONTAINING_RECORD(lruEntry, NPM_PIPE_ENTRY, LruEntry);
+        collected++;
     }
 
     ExReleasePushLockExclusive(&g_NpmState.LruLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Phase 2: Remove collected victims from their hash buckets.
+    // Now safe to acquire bucket locks without holding LRU lock.
+    //
+    for (ULONG i = 0; i < collected; i++) {
+        PNPM_PIPE_ENTRY pipeEntry = victims[i];
+        ULONG bucket = NpmHashPipeName(pipeEntry->PipeName, pipeEntry->PipeNameLength);
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&g_NpmState.HashTable[bucket].Lock);
+
+        RemoveEntryList(&pipeEntry->ListEntry);
+        InterlockedDecrement(&g_NpmState.HashTable[bucket].Count);
+        InterlockedDecrement(&g_NpmState.TotalEntries);
+
+        ExReleasePushLockExclusive(&g_NpmState.HashTable[bucket].Lock);
+        KeLeaveCriticalRegion();
+
+        NpmFreeEntry(pipeEntry);
+        evicted++;
+    }
 }
