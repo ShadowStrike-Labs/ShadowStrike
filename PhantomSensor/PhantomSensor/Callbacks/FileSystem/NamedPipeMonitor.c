@@ -45,6 +45,12 @@
 #include "../../Shared/BehaviorTypes.h"
 #include <ntstrsafe.h>
 
+//
+// PsGetProcessImageFileName may not be declared in all WDK configurations.
+// It is exported by ntoskrnl and safe to call at any IRQL.
+//
+extern PUCHAR PsGetProcessImageFileName(_In_ PEPROCESS Process);
+
 // ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
@@ -76,64 +82,155 @@ typedef struct _NPM_KNOWN_PATTERN {
 // CobaltStrike default pipe name patterns
 //
 static const NPM_KNOWN_PATTERN g_KnownC2Patterns[] = {
-    // CobaltStrike SMB beacon defaults
+    //
+    // CobaltStrike SMB beacon defaults + common malleable C2 profiles
+    //
     { L"MSSE-",         sizeof(L"MSSE-") - sizeof(WCHAR),         1, NpmClass_C2_CobaltStrike, 90 },
     { L"msagent_",      sizeof(L"msagent_") - sizeof(WCHAR),      1, NpmClass_C2_CobaltStrike, 90 },
     { L"postex_",       sizeof(L"postex_") - sizeof(WCHAR),       1, NpmClass_C2_CobaltStrike, 95 },
     { L"postex_ssh_",   sizeof(L"postex_ssh_") - sizeof(WCHAR),   1, NpmClass_C2_CobaltStrike, 95 },
-    { L"status_",       sizeof(L"status_") - sizeof(WCHAR),       1, NpmClass_C2_CobaltStrike, 85 },
-    { L"\\interprocess_", sizeof(L"\\interprocess_") - sizeof(WCHAR), 2, NpmClass_C2_CobaltStrike, 80 },
+    { L"status_",       sizeof(L"status_") - sizeof(WCHAR),       1, NpmClass_C2_CobaltStrike, 70 },
+    { L"DserNamePipe",  sizeof(L"DserNamePipe") - sizeof(WCHAR),  1, NpmClass_C2_CobaltStrike, 85 },
+    { L"srvsvc_",       sizeof(L"srvsvc_") - sizeof(WCHAR),       1, NpmClass_C2_CobaltStrike, 80 },
+    { L"wkssvc_",       sizeof(L"wkssvc_") - sizeof(WCHAR),       1, NpmClass_C2_CobaltStrike, 80 },
+    { L"ntsvcs_",       sizeof(L"ntsvcs_") - sizeof(WCHAR),       1, NpmClass_C2_CobaltStrike, 80 },
+    { L"scerpc_",       sizeof(L"scerpc_") - sizeof(WCHAR),       1, NpmClass_C2_CobaltStrike, 80 },
+    { L"interprocess_", sizeof(L"interprocess_") - sizeof(WCHAR), 2, NpmClass_C2_CobaltStrike, 80 },
 
-    // PsExec
+    //
+    // PsExec + remote execution variants
+    //
     { L"PSEXESVC",      sizeof(L"PSEXESVC") - sizeof(WCHAR),      0, NpmClass_C2_PsExec, 70 },
     { L"psexesvc",      sizeof(L"psexesvc") - sizeof(WCHAR),      0, NpmClass_C2_PsExec, 70 },
     { L"PSEXECSVC",     sizeof(L"PSEXECSVC") - sizeof(WCHAR),     0, NpmClass_C2_PsExec, 70 },
     { L"csexec",        sizeof(L"csexec") - sizeof(WCHAR),        1, NpmClass_C2_PsExec, 65 },
     { L"PAExec",        sizeof(L"PAExec") - sizeof(WCHAR),        1, NpmClass_C2_PsExec, 65 },
     { L"remcom",        sizeof(L"remcom") - sizeof(WCHAR),        1, NpmClass_C2_PsExec, 60 },
+    { L"RemCom_comm",   sizeof(L"RemCom_comm") - sizeof(WCHAR),   1, NpmClass_C2_PsExec, 70 },
 
-    // Meterpreter
+    //
+    // Meterpreter / Metasploit
+    //
     { L"meterpreter",   sizeof(L"meterpreter") - sizeof(WCHAR),   1, NpmClass_C2_Meterpreter, 95 },
+    { L"metsrv",        sizeof(L"metsrv") - sizeof(WCHAR),        1, NpmClass_C2_Meterpreter, 90 },
 
-    // Impacket / WMIExec / SMBExec
+    //
+    // Impacket / WMIExec / SMBExec / atexec
+    //
     { L"__output",      sizeof(L"__output") - sizeof(WCHAR),      1, NpmClass_C2_Impacket, 75 },
-    { L"RemCom_comm",   sizeof(L"RemCom_comm") - sizeof(WCHAR),   1, NpmClass_C2_Impacket, 70 },
+    { L"__aexec",       sizeof(L"__aexec") - sizeof(WCHAR),       1, NpmClass_C2_Impacket, 75 },
 
-    // Covenant / Sliver / Other C2 frameworks
+    //
+    // Havoc C2 framework
+    //
+    { L"havoc",         sizeof(L"havoc") - sizeof(WCHAR),         1, NpmClass_C2_Generic, 90 },
+    { L"demon_",        sizeof(L"demon_") - sizeof(WCHAR),        1, NpmClass_C2_Generic, 85 },
+
+    //
+    // Brute Ratel C4
+    //
+    { L"demoagent_",    sizeof(L"demoagent_") - sizeof(WCHAR),    1, NpmClass_C2_Generic, 85 },
+    { L"brc4_",         sizeof(L"brc4_") - sizeof(WCHAR),         1, NpmClass_C2_Generic, 90 },
+
+    //
+    // Sliver C2
+    //
+    { L"sliver",        sizeof(L"sliver") - sizeof(WCHAR),        1, NpmClass_C2_Generic, 85 },
+
+    //
+    // Mythic C2
+    //
+    { L"mythic",        sizeof(L"mythic") - sizeof(WCHAR),        1, NpmClass_C2_Generic, 85 },
+
+    //
+    // Covenant C2
+    //
     { L"gruntsvc",      sizeof(L"gruntsvc") - sizeof(WCHAR),      1, NpmClass_C2_Generic, 85 },
-    { L"dceservice",    sizeof(L"dceservice") - sizeof(WCHAR),     1, NpmClass_C2_Generic, 80 },
 
-    // Generic suspicious patterns
-    { L"\\evil",        sizeof(L"\\evil") - sizeof(WCHAR),         2, NpmClass_Suspicious, 60 },
-    { L"\\shell",       sizeof(L"\\shell") - sizeof(WCHAR),        2, NpmClass_Suspicious, 50 },
+    //
+    // Other known offensive tools
+    //
+    { L"dceservice",    sizeof(L"dceservice") - sizeof(WCHAR),    1, NpmClass_C2_Generic, 80 },
+    { L"poshc2",        sizeof(L"poshc2") - sizeof(WCHAR),        1, NpmClass_C2_Generic, 80 },
+    { L"nimplant",      sizeof(L"nimplant") - sizeof(WCHAR),      1, NpmClass_C2_Generic, 85 },
+
+    //
+    // PrintSpoofer / Privilege escalation
+    //
+    { L"SpoolSS_LPC",   sizeof(L"SpoolSS_LPC") - sizeof(WCHAR),  1, NpmClass_Suspicious, 65 },
+
+    //
+    // Generic suspicious substrings (contains-match, no path prefixes)
+    //
+    { L"beacon",        sizeof(L"beacon") - sizeof(WCHAR),        2, NpmClass_Suspicious, 55 },
+    { L"implant",       sizeof(L"implant") - sizeof(WCHAR),       2, NpmClass_Suspicious, 55 },
+    { L"payload",       sizeof(L"payload") - sizeof(WCHAR),       2, NpmClass_Suspicious, 50 },
+    { L"backdoor",      sizeof(L"backdoor") - sizeof(WCHAR),      2, NpmClass_Suspicious, 60 },
+    { L"c2pipe",        sizeof(L"c2pipe") - sizeof(WCHAR),        2, NpmClass_Suspicious, 55 },
+    { L"evil",          sizeof(L"evil") - sizeof(WCHAR),          2, NpmClass_Suspicious, 50 },
 };
 
 // ============================================================================
-// KNOWN SYSTEM / LEGITIMATE PIPES (whitelist — reduce false positives)
+// SYSTEM PIPE → EXPECTED PROCESS MAPPING (T1036 defense)
 // ============================================================================
 
-static const PCWSTR g_SystemPipes[] = {
-    L"lsass",
-    L"ntsvcs",
-    L"scerpc",
-    L"browser",
-    L"wkssvc",
-    L"srvsvc",
-    L"winreg",
-    L"samr",
-    L"netlogon",
-    L"svcctl",
-    L"epmapper",
-    L"spoolss",
-    L"DAV RPC SERVICE",
-    L"atsvc",
-    L"eventlog",
-    L"InitShutdown",
-    L"lsarpc",
-    L"protected_storage",
-    L"MsFteWds",
-    L"msfte",
+/**
+ * @brief Maps known system pipe names to their expected creator processes.
+ *
+ * An attacker masquerading as a system pipe (e.g. creating "\Device\NamedPipe\lsass"
+ * from malware.exe instead of lsass.exe) is classified as NpmClass_SpoofedSystem
+ * and immediately blocked. This defends against MITRE T1036.004 / T1036.005.
+ *
+ * ExpectedCreators: Null-terminated list of valid image names from
+ * PsGetProcessImageFileName (max 15 chars, case-insensitive comparison).
+ */
+typedef struct _NPM_SYSTEM_PIPE_MAP {
+    PCWSTR PipeName;
+    PCSTR  ExpectedCreators[4];
+} NPM_SYSTEM_PIPE_MAP;
+
+static const NPM_SYSTEM_PIPE_MAP g_SystemPipeMappings[] = {
+    // LSASS pipes — only lsass.exe may create these
+    { L"lsass",              { "lsass.exe", NULL } },
+    { L"lsarpc",             { "lsass.exe", NULL } },
+    { L"samr",               { "lsass.exe", NULL } },
+    { L"netlogon",           { "lsass.exe", NULL } },
+    { L"protected_storage",  { "lsass.exe", NULL } },
+
+    // Service Control Manager pipes
+    { L"scerpc",             { "services.exe", NULL } },
+    { L"svcctl",             { "services.exe", NULL } },
+    { L"ntsvcs",             { "services.exe", "svchost.exe", NULL } },
+
+    // General Windows services (hosted by svchost.exe)
+    { L"browser",            { "svchost.exe", NULL } },
+    { L"wkssvc",             { "svchost.exe", NULL } },
+    { L"srvsvc",             { "svchost.exe", NULL } },
+    { L"winreg",             { "svchost.exe", "services.exe", NULL } },
+    { L"eventlog",           { "svchost.exe", NULL } },
+    { L"epmapper",           { "svchost.exe", NULL } },
+    { L"atsvc",              { "svchost.exe", NULL } },
+    { L"DAV RPC SERVICE",    { "svchost.exe", NULL } },
+
+    // Print Spooler
+    { L"spoolss",            { "spoolsv.exe", NULL } },
+
+    // System init
+    { L"InitShutdown",       { "wininit.exe", NULL } },
+
+    // Windows Search
+    { L"MsFteWds",           { "SearchIndexer", NULL } },
+    { L"msfte",              { "SearchIndexer", NULL } },
 };
+
+/**
+ * @brief Result of system pipe name + creator process validation.
+ */
+typedef enum _NPM_SYSTEM_PIPE_RESULT {
+    NpmSysPipe_NotSystem = 0,   // Not a system pipe name
+    NpmSysPipe_Validated = 1,   // System pipe + correct creator
+    NpmSysPipe_Spoofed   = 2    // System pipe name + WRONG creator
+} NPM_SYSTEM_PIPE_RESULT;
 
 // ============================================================================
 // INTERNAL STRUCTURES
@@ -210,10 +307,23 @@ NpmClassifyPipe(
     _Out_ PULONG ThreatScore
     );
 
-static BOOLEAN
-NpmIsSystemPipe(
+static NPM_SYSTEM_PIPE_RESULT
+NpmValidateSystemPipe(
     _In_ PCWSTR PipeName,
-    _In_ USHORT NameLengthChars
+    _In_ USHORT NameLengthChars,
+    _In_z_ PCSTR CreatorImageName
+    );
+
+static VOID
+NpmGetCreatorImageName(
+    _In_ PEPROCESS Process,
+    _Out_writes_(16) PCHAR ImageNameOut
+    );
+
+static BOOLEAN
+NpmImageNameEquals(
+    _In_z_ PCSTR Name1,
+    _In_z_ PCSTR Name2
     );
 
 static ULONG
@@ -237,6 +347,7 @@ NpmTrackPipe(
     _In_ PCWSTR PipeName,
     _In_ USHORT NameLengthBytes,
     _In_ HANDLE CreatorPid,
+    _In_z_ PCSTR CreatorImageName,
     _In_ NPM_PIPE_CLASS Classification,
     _In_ ULONG ThreatScore
     );
@@ -247,6 +358,7 @@ NpmQueueEvent(
     _In_ USHORT NameLengthBytes,
     _In_ HANDLE CreatorPid,
     _In_opt_ HANDLE ConnectorPid,
+    _In_z_ PCSTR CreatorImageName,
     _In_ NPM_PIPE_CLASS Classification,
     _In_ NPM_THREAT_LEVEL ThreatLevel,
     _In_ ULONG ThreatScore,
@@ -276,12 +388,12 @@ NpmExtractPipeName(
 // ============================================================================
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, NpMonInitialize)
+#pragma alloc_text(PAGE, NpMonInitialize)
 #pragma alloc_text(PAGE, NpMonShutdown)
 #pragma alloc_text(PAGE, NpMonDequeueEvent)
 #pragma alloc_text(PAGE, NpmExtractPipeName)
 #pragma alloc_text(PAGE, NpmClassifyPipe)
-#pragma alloc_text(PAGE, NpmIsSystemPipe)
+#pragma alloc_text(PAGE, NpmValidateSystemPipe)
 #pragma alloc_text(PAGE, NpmCalculateEntropy)
 #pragma alloc_text(PAGE, NpmTrackPipe)
 #pragma alloc_text(PAGE, NpmEvictLruEntries)
@@ -376,7 +488,7 @@ NpMonInitialize(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Named Pipe Monitor initialized (%u C2 patterns, %u system pipes)\n",
                (ULONG)ARRAYSIZE(g_KnownC2Patterns),
-               (ULONG)ARRAYSIZE(g_SystemPipes));
+               (ULONG)ARRAYSIZE(g_SystemPipeMappings));
 
     return STATUS_SUCCESS;
 }
@@ -463,6 +575,54 @@ NpMonIsActive(
 }
 
 // ============================================================================
+// PRIVATE — CREATOR PROCESS IDENTIFICATION
+// ============================================================================
+
+/**
+ * @brief Case-insensitive ANSI string comparison for process image names.
+ * Safe at any IRQL — no allocations, no kernel string objects.
+ */
+static BOOLEAN
+NpmImageNameEquals(
+    _In_z_ PCSTR Name1,
+    _In_z_ PCSTR Name2
+    )
+{
+    while (*Name1 != '\0' && *Name2 != '\0') {
+        CHAR c1 = *Name1;
+        CHAR c2 = *Name2;
+        if (c1 >= 'A' && c1 <= 'Z') c1 += ('a' - 'A');
+        if (c2 >= 'A' && c2 <= 'Z') c2 += ('a' - 'A');
+        if (c1 != c2) return FALSE;
+        Name1++;
+        Name2++;
+    }
+    return (*Name1 == '\0' && *Name2 == '\0');
+}
+
+/**
+ * @brief Capture the creating process's image name for validation and forensics.
+ *
+ * Uses PsGetProcessImageFileName which returns the 15-char internal
+ * EPROCESS.ImageFileName buffer — available at any IRQL, no allocation needed.
+ */
+static VOID
+NpmGetCreatorImageName(
+    _In_ PEPROCESS Process,
+    _Out_writes_(16) PCHAR ImageNameOut
+    )
+{
+    PUCHAR imageName = PsGetProcessImageFileName(Process);
+
+    if (imageName != NULL) {
+        RtlCopyMemory(ImageNameOut, imageName, 15);
+        ImageNameOut[15] = '\0';
+    } else {
+        ImageNameOut[0] = '\0';
+    }
+}
+
+// ============================================================================
 // MINIFILTER CALLBACKS
 // ============================================================================
 
@@ -478,6 +638,8 @@ NpMonPreCreateNamedPipe(
     NPM_PIPE_CLASS classification;
     ULONG threatScore = 0;
     HANDLE creatorPid;
+    CHAR creatorImage[16];
+    NPM_SYSTEM_PIPE_RESULT sysResult;
 
     UNREFERENCED_PARAMETER(FltObjects);
     *CompletionContext = NULL;
@@ -490,9 +652,6 @@ NpMonPreCreateNamedPipe(
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    //
-    // Extract pipe name from the callback data
-    //
     if (!NpmExtractPipeName(Data, pipeName, &nameLength)) {
         ExReleaseRundownProtection(&g_NpmState.RundownRef);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -501,7 +660,70 @@ NpMonPreCreateNamedPipe(
     creatorPid = PsGetCurrentProcessId();
 
     //
-    // Rate limit check — prevent DoS via pipe creation storm
+    // Capture creator process identity for validation and forensics.
+    //
+    NpmGetCreatorImageName(PsGetCurrentProcess(), creatorImage);
+
+    //
+    // ================================================================
+    // PHASE 1: System pipe validation — RATE LIMIT EXEMPT.
+    //
+    // System pipe spoofing is a CRITICAL threat (MITRE T1036).
+    // An attacker could flood pipe creations to exhaust the rate limiter,
+    // then create spoofed system pipes unmonitored. By validating system
+    // pipes BEFORE rate limiting, this bypass is impossible.
+    // ================================================================
+    //
+    sysResult = NpmValidateSystemPipe(
+        pipeName,
+        nameLength / sizeof(WCHAR),
+        creatorImage
+    );
+
+    if (sysResult == NpmSysPipe_Validated) {
+        //
+        // Legitimate system pipe from verified creator — allow immediately
+        //
+        ExReleaseRundownProtection(&g_NpmState.RundownRef);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    if (sysResult == NpmSysPipe_Spoofed) {
+        //
+        // CRITICAL: System pipe name from unauthorized process.
+        // This is pipe masquerading — block immediately regardless of rate limit.
+        //
+        InterlockedIncrement64(&g_NpmState.Stats.TotalPipesCreated);
+        InterlockedIncrement64(&g_NpmState.Stats.SpoofedSystemPipes);
+        InterlockedIncrement64(&g_NpmState.Stats.SuspiciousPipesDetected);
+        InterlockedIncrement64(&g_NpmState.Stats.TotalPipesBlocked);
+
+        NpmTrackPipe(pipeName, nameLength, creatorPid, creatorImage,
+                     NpmClass_SpoofedSystem, 95);
+
+        NpmQueueEvent(
+            pipeName, nameLength,
+            creatorPid, NULL, creatorImage,
+            NpmClass_SpoofedSystem, NpmThreat_Critical, 95,
+            TRUE, TRUE
+        );
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] SPOOFED SYSTEM PIPE BLOCKED: '%.64ws' "
+                   "creator=%hs PID=%lu\n",
+                   pipeName, creatorImage, HandleToUlong(creatorPid));
+
+        ExReleaseRundownProtection(&g_NpmState.RundownRef);
+        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
+    }
+
+    //
+    // ================================================================
+    // PHASE 2: General classification — subject to rate limiting.
+    // At this point we know the pipe is NOT a system pipe name.
+    // ================================================================
     //
     if (!NpmCheckRateLimit()) {
         ExReleaseRundownProtection(&g_NpmState.RundownRef);
@@ -510,16 +732,9 @@ NpMonPreCreateNamedPipe(
 
     InterlockedIncrement64(&g_NpmState.Stats.TotalPipesCreated);
 
-    //
-    // Classify the pipe name
-    //
     classification = NpmClassifyPipe(pipeName, nameLength, &threatScore);
 
-    if (classification == NpmClass_System ||
-        classification == NpmClass_KnownApplication) {
-        //
-        // Known benign pipe — allow without tracking
-        //
+    if (classification == NpmClass_KnownApplication) {
         ExReleaseRundownProtection(&g_NpmState.RundownRef);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
@@ -527,7 +742,8 @@ NpMonPreCreateNamedPipe(
     //
     // Track the pipe
     //
-    NpmTrackPipe(pipeName, nameLength, creatorPid, classification, threatScore);
+    NpmTrackPipe(pipeName, nameLength, creatorPid, creatorImage,
+                 classification, threatScore);
 
     //
     // Determine threat level and action
@@ -546,15 +762,17 @@ NpMonPreCreateNamedPipe(
 
         NpmQueueEvent(
             pipeName, nameLength,
-            creatorPid, NULL,
+            creatorPid, NULL, creatorImage,
             classification, level, threatScore,
-            (threatScore >= 90),    // Block critical C2 pipes
+            (threatScore >= 90),
             TRUE
         );
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] C2 Named Pipe DETECTED: class=%d score=%u creator=PID %lu\n",
-                   (int)classification, threatScore, HandleToUlong(creatorPid));
+                   "[ShadowStrike] C2 Named Pipe DETECTED: class=%d score=%u "
+                   "creator=%hs PID=%lu\n",
+                   (int)classification, threatScore,
+                   creatorImage, HandleToUlong(creatorPid));
 
         if (threatScore >= 90) {
             InterlockedIncrement64(&g_NpmState.Stats.TotalPipesBlocked);
@@ -565,15 +783,12 @@ NpMonPreCreateNamedPipe(
         }
     }
     else if (classification == NpmClass_HighEntropy) {
-        //
-        // High-entropy pipe name — potential randomized C2
-        //
         InterlockedIncrement64(&g_NpmState.Stats.HighEntropyPipesDetected);
         InterlockedIncrement64(&g_NpmState.Stats.SuspiciousPipesDetected);
 
         NpmQueueEvent(
             pipeName, nameLength,
-            creatorPid, NULL,
+            creatorPid, NULL, creatorImage,
             classification, NpmThreat_Medium, threatScore,
             FALSE, TRUE
         );
@@ -583,7 +798,7 @@ NpMonPreCreateNamedPipe(
 
         NpmQueueEvent(
             pipeName, nameLength,
-            creatorPid, NULL,
+            creatorPid, NULL, creatorImage,
             classification, NpmThreat_Low, threatScore,
             FALSE, TRUE
         );
@@ -631,6 +846,7 @@ NpMonGetStatistics(
     Stats->C2PipesDetected         = ReadNoFence64((PLONG64)&g_NpmState.Stats.C2PipesDetected);
     Stats->HighEntropyPipesDetected= ReadNoFence64((PLONG64)&g_NpmState.Stats.HighEntropyPipesDetected);
     Stats->CrossProcessConnections = ReadNoFence64((PLONG64)&g_NpmState.Stats.CrossProcessConnections);
+    Stats->SpoofedSystemPipes      = ReadNoFence64((PLONG64)&g_NpmState.Stats.SpoofedSystemPipes);
     Stats->EventsQueued            = ReadNoFence64((PLONG64)&g_NpmState.Stats.EventsQueued);
     Stats->EventsDropped           = ReadNoFence64((PLONG64)&g_NpmState.Stats.EventsDropped);
 }
@@ -765,11 +981,10 @@ NpmClassifyPipe(
     }
 
     //
-    // Check system pipe whitelist first
+    // System pipe validation is handled in Phase 1 of NpMonPreCreateNamedPipe
+    // (rate-limit exempt). By the time we reach here, the pipe is confirmed
+    // NOT a system pipe name. Proceed directly to C2 pattern matching.
     //
-    if (NpmIsSystemPipe(PipeName, nameChars)) {
-        return NpmClass_System;
-    }
 
     //
     // Match against known C2 patterns
@@ -826,22 +1041,51 @@ NpmClassifyPipe(
     return NpmClass_Unknown;
 }
 
-static BOOLEAN
-NpmIsSystemPipe(
+/**
+ * @brief Validates a pipe name against the system pipe mapping table.
+ *
+ * Returns NpmSysPipe_Validated if the name matches a known system pipe AND
+ * the creator process is one of the expected creators for that pipe.
+ * Returns NpmSysPipe_Spoofed if the name matches but the creator is WRONG.
+ * Returns NpmSysPipe_NotSystem if the name doesn't match any system pipe.
+ *
+ * This is the core defense against pipe masquerading (MITRE T1036.004/T1036.005).
+ * Without this, any malware could create "\Device\NamedPipe\lsass" and bypass
+ * all monitoring.
+ */
+static NPM_SYSTEM_PIPE_RESULT
+NpmValidateSystemPipe(
     _In_ PCWSTR PipeName,
-    _In_ USHORT NameLengthChars
+    _In_ USHORT NameLengthChars,
+    _In_z_ PCSTR CreatorImageName
     )
 {
     PAGED_CODE();
 
-    for (ULONG i = 0; i < ARRAYSIZE(g_SystemPipes); i++) {
-        SIZE_T sysLen = wcslen(g_SystemPipes[i]);
+    for (ULONG i = 0; i < ARRAYSIZE(g_SystemPipeMappings); i++) {
+        SIZE_T sysLen = wcslen(g_SystemPipeMappings[i].PipeName);
         if (NameLengthChars == (USHORT)sysLen &&
-            _wcsnicmp(PipeName, g_SystemPipes[i], sysLen) == 0) {
-            return TRUE;
+            _wcsnicmp(PipeName, g_SystemPipeMappings[i].PipeName, sysLen) == 0) {
+            //
+            // Pipe name matches a known system pipe.
+            // Now validate that the creator is one of the expected processes.
+            //
+            for (ULONG j = 0; g_SystemPipeMappings[i].ExpectedCreators[j] != NULL; j++) {
+                if (NpmImageNameEquals(CreatorImageName,
+                                       g_SystemPipeMappings[i].ExpectedCreators[j])) {
+                    return NpmSysPipe_Validated;
+                }
+            }
+
+            //
+            // System pipe name but creator doesn't match ANY expected process.
+            // Strong indicator of masquerading.
+            //
+            return NpmSysPipe_Spoofed;
         }
     }
-    return FALSE;
+
+    return NpmSysPipe_NotSystem;
 }
 
 // ============================================================================
@@ -1027,6 +1271,7 @@ NpmTrackPipe(
     _In_ PCWSTR PipeName,
     _In_ USHORT NameLengthBytes,
     _In_ HANDLE CreatorPid,
+    _In_z_ PCSTR CreatorImageName,
     _In_ NPM_PIPE_CLASS Classification,
     _In_ ULONG ThreatScore
     )
@@ -1103,6 +1348,7 @@ NpmTrackPipe(
     entry->PipeName[copyLen / sizeof(WCHAR)] = L'\0';
     entry->PipeNameLength = copyLen;
     entry->CreatorProcessId = CreatorPid;
+    RtlCopyMemory(entry->CreatorImageName, CreatorImageName, 16);
     entry->Classification = Classification;
     entry->ThreatLevel = (ThreatScore >= 90) ? NpmThreat_Critical :
                           (ThreatScore >= 70) ? NpmThreat_High :
@@ -1146,6 +1392,7 @@ NpmQueueEvent(
     _In_ USHORT NameLengthBytes,
     _In_ HANDLE CreatorPid,
     _In_opt_ HANDLE ConnectorPid,
+    _In_z_ PCSTR CreatorImageName,
     _In_ NPM_PIPE_CLASS Classification,
     _In_ NPM_THREAT_LEVEL ThreatLevel,
     _In_ ULONG ThreatScore,
@@ -1179,6 +1426,7 @@ NpmQueueEvent(
     KeQuerySystemTimePrecise(&evt->Timestamp);
     evt->CreatorProcessId = CreatorPid;
     evt->ConnectorProcessId = ConnectorPid;
+    RtlCopyMemory(evt->CreatorImageName, CreatorImageName, 16);
     evt->Classification = Classification;
     evt->ThreatLevel = ThreatLevel;
     evt->ThreatScore = ThreatScore;

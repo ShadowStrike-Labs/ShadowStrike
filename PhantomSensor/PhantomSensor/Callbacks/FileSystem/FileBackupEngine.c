@@ -245,6 +245,47 @@ _IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 FbepLeaveOperation(VOID);
 
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+FbepEnsureBackupDirectory(
+    _In_ PCUNICODE_STRING BackupPath
+    );
+
+//
+// Re-entrancy sentinel: set via IoSetTopLevelIrp during restore I/O
+// to prevent PreWrite from backing up our own restore writes.
+//
+#define FBE_ROLLBACK_SENTINEL   ((PIRP)(ULONG_PTR)0xF8E80118)
+
+// ============================================================================
+// SECTION PLACEMENT
+// ============================================================================
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, FbeInitialize)
+#pragma alloc_text(PAGE, FbeShutdown)
+#pragma alloc_text(PAGE, FbePreWriteBackup)
+#pragma alloc_text(PAGE, FbePreSetInfoBackup)
+#pragma alloc_text(PAGE, FbeRollbackProcess)
+#pragma alloc_text(PAGE, FbeCommitProcess)
+#pragma alloc_text(PAGE, FbepFindEntry)
+#pragma alloc_text(PAGE, FbepAllocateEntry)
+#pragma alloc_text(PAGE, FbepFreeEntry)
+#pragma alloc_text(PAGE, FbepFindOrCreateTracker)
+#pragma alloc_text(PAGE, FbepFindTracker)
+#pragma alloc_text(PAGE, FbepFreeTracker)
+#pragma alloc_text(PAGE, FbepCopyFileToBackup)
+#pragma alloc_text(PAGE, FbepRestoreFileFromBackup)
+#pragma alloc_text(PAGE, FbepDeleteBackupFile)
+#pragma alloc_text(PAGE, FbepGenerateBackupPath)
+#pragma alloc_text(PAGE, FbepEvictLruEntries)
+#pragma alloc_text(PAGE, FbepShouldBackup)
+#pragma alloc_text(PAGE, FbepGetFileSize)
+#pragma alloc_text(PAGE, FbepEnterOperation)
+#pragma alloc_text(PAGE, FbepLeaveOperation)
+#pragma alloc_text(PAGE, FbepEnsureBackupDirectory)
+#endif
+
 // ============================================================================
 // FILE EXTENSION CLASSIFICATION
 // ============================================================================
@@ -434,36 +475,59 @@ FbeShutdown(VOID)
     ExWaitForRundownProtectionRelease(&g_FbeState.RundownRef);
 
     //
-    // Free all process trackers and their entries
+    // Free all process trackers and their entries.
+    // Iterate ProcessBuckets (where trackers are actually stored)
+    // instead of the never-populated ProcessList.
     //
-    FltAcquirePushLockExclusive(&g_FbeState.ProcessListLock);
+    for (ULONG BucketIdx = 0; BucketIdx < 64; BucketIdx++) {
+        FltAcquirePushLockExclusive(&g_FbeState.ProcessBuckets[BucketIdx].Lock);
 
-    while (!IsListEmpty(&g_FbeState.ProcessList)) {
-        ListEntry = RemoveHeadList(&g_FbeState.ProcessList);
-        Tracker = CONTAINING_RECORD(ListEntry, FBE_PROCESS_TRACKER, Link);
-
-        //
-        // Free all entries owned by this tracker
-        //
-        while (!IsListEmpty(&Tracker->BackupEntries)) {
-            LIST_ENTRY *EntryLink = RemoveHeadList(&Tracker->BackupEntries);
-            PFBE_BACKUP_ENTRY Entry = CONTAINING_RECORD(
-                EntryLink, FBE_BACKUP_ENTRY, ProcessLink);
+        while (!IsListEmpty(&g_FbeState.ProcessBuckets[BucketIdx].Head)) {
+            ListEntry = RemoveHeadList(&g_FbeState.ProcessBuckets[BucketIdx].Head);
+            Tracker = CONTAINING_RECORD(ListEntry, FBE_PROCESS_TRACKER, Link);
 
             //
-            // Delete backup file from disk
+            // Free all entries owned by this tracker
             //
-            if (Entry->State == FbeEntryState_Valid) {
-                FbepDeleteBackupFile(&Entry->BackupPath);
+            while (!IsListEmpty(&Tracker->BackupEntries)) {
+                LIST_ENTRY *EntryLink = RemoveHeadList(&Tracker->BackupEntries);
+                PFBE_BACKUP_ENTRY Entry = CONTAINING_RECORD(
+                    EntryLink, FBE_BACKUP_ENTRY, ProcessLink);
+
+                //
+                // Remove from LRU (entry may still be linked)
+                //
+                FltAcquirePushLockExclusive(&g_FbeState.LruLock);
+                RemoveEntryList(&Entry->LruLink);
+                FltReleasePushLock(&g_FbeState.LruLock);
+
+                //
+                // Remove from hash bucket
+                //
+                ULONG HashBucket = FbepComputeBucketIndex(
+                    Entry->ProcessId, &Entry->OriginalPath);
+                FltAcquirePushLockExclusive(&g_FbeState.Buckets[HashBucket].Lock);
+                RemoveEntryList(&Entry->HashLink);
+                InterlockedDecrement(&g_FbeState.Buckets[HashBucket].Count);
+                FltReleasePushLock(&g_FbeState.Buckets[HashBucket].Lock);
+
+                //
+                // Delete backup file from disk
+                //
+                if (Entry->State == FbeEntryState_Valid) {
+                    FbepDeleteBackupFile(&Entry->BackupPath);
+                }
+
+                FbepFreeEntry(Entry);
+                InterlockedDecrement(&g_FbeState.TotalEntryCount);
             }
 
-            FbepFreeEntry(Entry);
+            FbepFreeTracker(Tracker);
         }
 
-        FbepFreeTracker(Tracker);
+        g_FbeState.ProcessBuckets[BucketIdx].Count = 0;
+        FltReleasePushLock(&g_FbeState.ProcessBuckets[BucketIdx].Lock);
     }
-
-    FltReleasePushLock(&g_FbeState.ProcessListLock);
 
     //
     // Destroy lookaside lists
@@ -514,6 +578,14 @@ FbePreWriteBackup(
 
     PAGED_CODE();
     UNREFERENCED_PARAMETER(Data);
+
+    //
+    // Re-entrancy guard: skip if this write was issued by our own
+    // restore path (prevents backing up half-restored files)
+    //
+    if (IoGetTopLevelIrp() == FBE_ROLLBACK_SENTINEL) {
+        return STATUS_FBE_SKIP;
+    }
 
     InterlockedIncrement64(&g_FbeState.Stats.TotalBackupRequests);
 
@@ -769,6 +841,13 @@ FbePreSetInfoBackup(
 
     PAGED_CODE();
     UNREFERENCED_PARAMETER(Data);
+
+    //
+    // Re-entrancy guard: skip if this I/O was issued by our restore path
+    //
+    if (IoGetTopLevelIrp() == FBE_ROLLBACK_SENTINEL) {
+        return STATUS_FBE_SKIP;
+    }
 
     InterlockedIncrement64(&g_FbeState.Stats.TotalBackupRequests);
 
@@ -1032,35 +1111,69 @@ FbeRollbackProcess(
                Tracker->TotalBytesBackedUp);
 
     //
-    // Iterate through all backup entries for this process (reverse order)
-    // Reverse order ensures rename chains are undone correctly
+    // Two-phase rollback: collect entries under lock, process without lock.
+    // This prevents use-after-free if FbeCommitProcess runs concurrently
+    // and modifies the list while we hold a captured Blink pointer.
     //
-    FltAcquirePushLockExclusive(&Tracker->Lock);
 
-    ListEntry = Tracker->BackupEntries.Blink;
-    while (ListEntry != &Tracker->BackupEntries) {
+    //
+    // Phase 1: Claim entries by CAS'ing their state to Pending.
+    // Collect pointers into a stack/pool buffer.
+    //
+    #define FBE_ROLLBACK_STACK_BATCH    64
+    PFBE_BACKUP_ENTRY StackBatch[FBE_ROLLBACK_STACK_BATCH];
+    PFBE_BACKUP_ENTRY *RollbackBatch = StackBatch;
+    ULONG BatchCapacity = FBE_ROLLBACK_STACK_BATCH;
+    ULONG ClaimedCount = 0;
+    BOOLEAN UsedPoolAlloc = FALSE;
+
+    //
+    // If the process has more entries than stack buffer, allocate from pool
+    //
+    if ((ULONG)Tracker->EntryCount > FBE_ROLLBACK_STACK_BATCH) {
+        ULONG AllocCount = min((ULONG)Tracker->EntryCount, FBE_MAX_ENTRIES_PER_PROCESS);
+        ULONG AllocSize = AllocCount * sizeof(PFBE_BACKUP_ENTRY);
+
+        if (AllocSize <= 64 * 1024) {
+            RollbackBatch = (PFBE_BACKUP_ENTRY *)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, AllocSize, FBE_ROLLBACK_POOL_TAG);
+            if (RollbackBatch != NULL) {
+                BatchCapacity = AllocCount;
+                UsedPoolAlloc = TRUE;
+            } else {
+                RollbackBatch = StackBatch;
+            }
+        }
+    }
+
+    FltAcquirePushLockShared(&Tracker->Lock);
+
+    for (ListEntry = Tracker->BackupEntries.Blink;
+         ListEntry != &Tracker->BackupEntries && ClaimedCount < BatchCapacity;
+         ListEntry = ListEntry->Blink) {
 
         PFBE_BACKUP_ENTRY Entry = CONTAINING_RECORD(
             ListEntry, FBE_BACKUP_ENTRY, ProcessLink);
 
-        //
-        // Move to previous BEFORE we potentially modify the list
-        //
-        ListEntry = ListEntry->Blink;
-
         if (InterlockedCompareExchange(&Entry->State,
-                                       FbeEntryState_RolledBack,
-                                       FbeEntryState_Valid) != FbeEntryState_Valid) {
-            continue;
+                                       FbeEntryState_Pending,
+                                       FbeEntryState_Valid) == FbeEntryState_Valid) {
+            RollbackBatch[ClaimedCount++] = Entry;
         }
+    }
 
-        //
-        // Release lock during I/O (can be slow)
-        //
-        FltReleasePushLock(&Tracker->Lock);
+    FltReleasePushLock(&Tracker->Lock);
+
+    //
+    // Phase 2: Restore files without holding any lock.
+    // Process in reverse (newest first) to undo rename chains correctly.
+    //
+    for (ULONG i = 0; i < ClaimedCount; i++) {
+        PFBE_BACKUP_ENTRY Entry = RollbackBatch[i];
 
         Status = FbepRestoreFileFromBackup(Entry);
         if (NT_SUCCESS(Status)) {
+            InterlockedExchange(&Entry->State, FbeEntryState_RolledBack);
             Restored++;
             InterlockedIncrement64(&g_FbeState.Stats.RollbackFilesRestored);
             InterlockedAdd64(&g_FbeState.Stats.TotalBytesRolledBack,
@@ -1071,24 +1184,21 @@ FbeRollbackProcess(
                        &Entry->OriginalPath,
                        Entry->BackupFileSize.QuadPart);
         } else {
-            Failed++;
             //
             // Revert state so retry is possible
             //
             InterlockedExchange(&Entry->State, FbeEntryState_Valid);
+            Failed++;
 
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "[ShadowStrike/FBE] RESTORE FAILED: %wZ (0x%08X)\n",
                        &Entry->OriginalPath, Status);
         }
-
-        //
-        // Re-acquire lock for next iteration
-        //
-        FltAcquirePushLockExclusive(&Tracker->Lock);
     }
 
-    FltReleasePushLock(&Tracker->Lock);
+    if (UsedPoolAlloc) {
+        ExFreePoolWithTag(RollbackBatch, FBE_ROLLBACK_POOL_TAG);
+    }
 
     if (FilesRestored != NULL) {
         *FilesRestored = Restored;
@@ -1190,21 +1300,13 @@ FbeCommitProcess(
     FltReleasePushLock(&Tracker->Lock);
 
     //
-    // Remove tracker from process bucket and global list
+    // Remove tracker from process bucket
     //
     ULONG ProcBucket = FbepProcessBucketIndex(ProcessId);
     FltAcquirePushLockExclusive(&g_FbeState.ProcessBuckets[ProcBucket].Lock);
     RemoveEntryList(&Tracker->Link);
     InterlockedDecrement(&g_FbeState.ProcessBuckets[ProcBucket].Count);
     FltReleasePushLock(&g_FbeState.ProcessBuckets[ProcBucket].Lock);
-
-    FltAcquirePushLockExclusive(&g_FbeState.ProcessListLock);
-    // Tracker->Link already removed from ProcessBuckets, but it's also in ProcessList
-    // No — actually we only use one link field. ProcessList is for shutdown enumeration.
-    // Let's use ProcessBuckets for lookup and ProcessList is separate. 
-    // Actually our tracker only has one Link field. We need to rethink.
-    // Since we removed it from ProcessBuckets already, just free it.
-    FltReleasePushLock(&g_FbeState.ProcessListLock);
 
     FbepFreeTracker(Tracker);
 
@@ -1317,9 +1419,7 @@ FbepFindEntry(
             Entry->OriginalPath.Length == FilePath->Length &&
             RtlEqualUnicodeString(&Entry->OriginalPath, FilePath, TRUE)) {
 
-            LONG EntryState = InterlockedCompareExchange(&Entry->State, 
-                                                         Entry->State, 
-                                                         Entry->State);
+            LONG EntryState = ReadAcquire(&Entry->State);
             if (EntryState == FbeEntryState_Valid ||
                 EntryState == FbeEntryState_Pending) {
                 return Entry;
@@ -1501,6 +1601,8 @@ FbepCopyFileToBackup(
 
     PAGED_CODE();
 
+    UNREFERENCED_PARAMETER(SourcePath);
+
     BytesCopied->QuadPart = 0;
 
     //
@@ -1552,6 +1654,35 @@ FbepCopyFileToBackup(
         );
 
     if (!NT_SUCCESS(Status)) {
+        //
+        // If directory doesn't exist, create it and retry
+        //
+        if (Status == STATUS_OBJECT_PATH_NOT_FOUND) {
+            Status = FbepEnsureBackupDirectory(BackupPath);
+            if (NT_SUCCESS(Status)) {
+                Status = FltCreateFileEx(
+                    g_DriverData.FilterHandle,
+                    FltObjects->Instance,
+                    &BackupHandle,
+                    &BackupFileObject,
+                    GENERIC_WRITE | SYNCHRONIZE,
+                    &ObjAttrs,
+                    &IoStatus,
+                    NULL,
+                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                    0,
+                    FILE_CREATE,
+                    FILE_NON_DIRECTORY_FILE |
+                        FILE_WRITE_THROUGH |
+                        FILE_SYNCHRONOUS_IO_NONALERT |
+                        FILE_NO_INTERMEDIATE_BUFFERING,
+                    NULL,
+                    0,
+                    IO_IGNORE_SHARE_ACCESS_CHECK
+                    );
+            }
+        }
+
         //
         // If FILE_CREATE fails because file exists, try SUPERSEDE
         //
@@ -1703,8 +1834,16 @@ FbepRestoreFileFromBackup(
 
     PAGED_CODE();
 
+    //
+    // Set re-entrancy sentinel to prevent PreWrite from backing up
+    // our restore writes (per-thread via TEB TopLevelIrp).
+    //
+    PIRP SavedTopLevelIrp = IoGetTopLevelIrp();
+    IoSetTopLevelIrp(FBE_ROLLBACK_SENTINEL);
+
     CopyBuffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, FBE_IO_BUFFER_SIZE, FBE_IO_POOL_TAG);
     if (CopyBuffer == NULL) {
+        IoSetTopLevelIrp(SavedTopLevelIrp);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1778,16 +1917,24 @@ FbepRestoreFileFromBackup(
     }
 
     //
-    // Copy backup content back to original location
+    // Copy backup content back to original location.
+    // Limit to OriginalFileSize to exclude non-buffered write padding.
     //
     Offset.QuadPart = 0;
 
-    while (TRUE) {
+    while (Offset.QuadPart < Entry->OriginalFileSize.QuadPart) {
+
+        ULONG ReadSize = FBE_IO_BUFFER_SIZE;
+        LONGLONG Remaining = Entry->OriginalFileSize.QuadPart - Offset.QuadPart;
+        if (Remaining < (LONGLONG)ReadSize) {
+            ReadSize = (ULONG)Remaining;
+        }
+
         Status = FltReadFile(
             NULL,
             SourceFileObject,
             &Offset,
-            FBE_IO_BUFFER_SIZE,
+            ReadSize,
             CopyBuffer,
             0,
             &BytesRead,
@@ -1802,11 +1949,19 @@ FbepRestoreFileFromBackup(
             break;
         }
 
+        //
+        // Clamp write to remaining original size
+        //
+        ULONG WriteSize = BytesRead;
+        if (Offset.QuadPart + WriteSize > Entry->OriginalFileSize.QuadPart) {
+            WriteSize = (ULONG)(Entry->OriginalFileSize.QuadPart - Offset.QuadPart);
+        }
+
         Status = FltWriteFile(
             NULL,
             TargetFileObject,
             &Offset,
-            BytesRead,
+            WriteSize,
             CopyBuffer,
             0,
             NULL,
@@ -1818,7 +1973,22 @@ FbepRestoreFileFromBackup(
             break;
         }
 
-        Offset.QuadPart += BytesRead;
+        Offset.QuadPart += WriteSize;
+    }
+
+    //
+    // Set exact file size to match original (remove any alignment padding)
+    //
+    if (NT_SUCCESS(Status) && TargetFileObject != NULL) {
+        FILE_END_OF_FILE_INFORMATION EofInfo;
+        EofInfo.EndOfFile = Entry->OriginalFileSize;
+        FltSetInformationFile(
+            NULL,
+            TargetFileObject,
+            &EofInfo,
+            sizeof(EofInfo),
+            FileEndOfFileInformation
+            );
     }
 
 Cleanup:
@@ -1837,6 +2007,11 @@ Cleanup:
     if (CopyBuffer != NULL) {
         ExFreePoolWithTag(CopyBuffer, FBE_IO_POOL_TAG);
     }
+
+    //
+    // Restore TopLevelIrp to prevent sentinel from leaking to caller
+    //
+    IoSetTopLevelIrp(SavedTopLevelIrp);
 
     return Status;
 }
@@ -1883,6 +2058,13 @@ FbepDeleteBackupFile(
         );
 
     if (!NT_SUCCESS(Status)) {
+        //
+        // File already deleted or path gone — not an error during cleanup
+        //
+        if (Status == STATUS_OBJECT_NAME_NOT_FOUND ||
+            Status == STATUS_OBJECT_PATH_NOT_FOUND) {
+            return STATUS_SUCCESS;
+        }
         return Status;
     }
 
@@ -1931,8 +2113,8 @@ FbepGenerateBackupPath(
     for (USHORT i = 0; i < OrigLen; i++) {
         if (OriginalPath->Buffer[i] == L'\\') {
             SlashCount++;
-            if (SlashCount == 4) {
-                // After \Device\HarddiskVolumeN
+            if (SlashCount == 3) {
+                // After \Device\HarddiskVolumeN (3rd slash = start of user path)
                 VolumeEnd = i;
                 break;
             }
@@ -1940,11 +2122,10 @@ FbepGenerateBackupPath(
     }
 
     //
-    // If we can't find volume prefix, use a fixed path
+    // Validate we found a proper volume prefix
     //
-    if (VolumeEnd == 0 && OrigLen > 0) {
-        // Fallback: use first 3 components or entire path if short
-        VolumeEnd = OrigLen;
+    if (VolumeEnd == 0) {
+        return STATUS_INVALID_PARAMETER;
     }
 
     BackupId = InterlockedIncrement64(&g_FbeState.NextBackupId);
@@ -2175,4 +2356,82 @@ static VOID
 FbepLeaveOperation(VOID)
 {
     ExReleaseRundownProtection(&g_FbeState.RundownRef);
+}
+
+// ============================================================================
+// PRIVATE — DIRECTORY MANAGEMENT
+// ============================================================================
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+FbepEnsureBackupDirectory(
+    _In_ PCUNICODE_STRING BackupPath
+    )
+{
+    NTSTATUS Status;
+    HANDLE DirHandle;
+    IO_STATUS_BLOCK IoStatus;
+    OBJECT_ATTRIBUTES ObjAttrs;
+    UNICODE_STRING DirPath;
+    USHORT LastSlash = 0;
+
+    PAGED_CODE();
+
+    if (BackupPath->Length == 0 || BackupPath->Buffer == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Extract directory portion from full backup path
+    // e.g., \Device\HarddiskVolume1\ShadowStrikeBackup\123.bak
+    //     → \Device\HarddiskVolume1\ShadowStrikeBackup
+    //
+    for (USHORT i = BackupPath->Length / sizeof(WCHAR); i > 0; i--) {
+        if (BackupPath->Buffer[i - 1] == L'\\') {
+            LastSlash = i - 1;
+            break;
+        }
+    }
+
+    if (LastSlash == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    DirPath.Buffer = BackupPath->Buffer;
+    DirPath.Length = LastSlash * sizeof(WCHAR);
+    DirPath.MaximumLength = DirPath.Length;
+
+    InitializeObjectAttributes(
+        &ObjAttrs,
+        &DirPath,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+        NULL,
+        NULL
+        );
+
+    //
+    // FILE_OPEN_IF: creates if missing, opens if exists
+    //
+    Status = FltCreateFile(
+        g_DriverData.FilterHandle,
+        NULL,
+        &DirHandle,
+        FILE_LIST_DIRECTORY | SYNCHRONIZE,
+        &ObjAttrs,
+        &IoStatus,
+        NULL,
+        FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OPEN_IF,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        NULL,
+        0,
+        0
+        );
+
+    if (NT_SUCCESS(Status)) {
+        FltClose(DirHandle);
+    }
+
+    return Status;
 }

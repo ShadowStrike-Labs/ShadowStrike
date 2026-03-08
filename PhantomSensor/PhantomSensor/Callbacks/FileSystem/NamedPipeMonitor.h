@@ -124,7 +124,8 @@ typedef enum _NPM_PIPE_CLASS {
     NpmClass_C2_Impacket,           // Impacket/WMIExec pipes
     NpmClass_C2_Generic,            // Generic C2 patterns
     NpmClass_HighEntropy,           // Suspicious randomized name
-    NpmClass_Suspicious             // Other suspicious patterns
+    NpmClass_Suspicious,            // Other suspicious patterns
+    NpmClass_SpoofedSystem          // System pipe name from unauthorized process (T1036)
 } NPM_PIPE_CLASS;
 
 // ============================================================================
@@ -139,6 +140,7 @@ typedef struct _NPM_STATISTICS {
     volatile LONG64 C2PipesDetected;
     volatile LONG64 HighEntropyPipesDetected;
     volatile LONG64 CrossProcessConnections;
+    volatile LONG64 SpoofedSystemPipes;
     volatile LONG64 EventsQueued;
     volatile LONG64 EventsDropped;
 } NPM_STATISTICS, *PNPM_STATISTICS;
@@ -155,6 +157,7 @@ typedef struct _NPM_PIPE_ENTRY {
     USHORT PipeNameLength;              // In bytes (not including null)
 
     HANDLE CreatorProcessId;
+    CHAR CreatorImageName[16];          // Creator process image (PsGetProcessImageFileName)
     LARGE_INTEGER CreateTime;
     LARGE_INTEGER LastAccessTime;
 
@@ -179,6 +182,7 @@ typedef struct _NPM_PIPE_EVENT {
     LARGE_INTEGER Timestamp;
     HANDLE CreatorProcessId;
     HANDLE ConnectorProcessId;
+    CHAR CreatorImageName[16];          // Creator process image for forensics
 
     WCHAR PipeName[NPM_MAX_PIPE_NAME_CCH];
     USHORT PipeNameLength;

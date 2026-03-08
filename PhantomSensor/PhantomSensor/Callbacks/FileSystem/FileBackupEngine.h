@@ -54,7 +54,10 @@ MITRE ATT&CK Coverage:
 
 #pragma once
 
+#pragma warning(push)
+#pragma warning(disable:4324)   // structure padded due to alignment specifier
 #include <fltKernel.h>
+#pragma warning(pop)
 
 // ============================================================================
 // MODULE POOL TAGS
