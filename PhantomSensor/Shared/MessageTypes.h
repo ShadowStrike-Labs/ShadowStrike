@@ -91,6 +91,11 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     //
     FilterMessageType_HandleAlert,            // Suspicious handle operation detected
 
+    //
+    // Ransomware Detection Messages (0x60 - 0x6F)
+    //
+    FilterMessageType_RansomwareAlert,        // Ransomware behavior detected (PostWrite)
+
     FilterMessageType_Max
 } SHADOWSTRIKE_MESSAGE_TYPE;
 

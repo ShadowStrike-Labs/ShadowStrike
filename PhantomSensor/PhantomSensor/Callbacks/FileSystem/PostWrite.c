@@ -55,10 +55,15 @@
  * ============================================================================
  */
 
+#pragma warning(push)
+#pragma warning(disable: 4324)  // structure was padded due to alignment specifier (fltKernel.h)
 #include "FileSystemCallbacks.h"
+#pragma warning(pop)
 #include "../../Core/Globals.h"
 #include "../../Cache/ScanCache.h"
 #include "../../Shared/SharedDefs.h"
+#include "../../Communication/CommPort.h"
+#include "../../../Shared/MessageTypes.h"
 
 //
 // WPP Tracing - conditionally include if available
@@ -608,8 +613,8 @@ ShadowStrikePostWriteShutdown(
         KeLeaveCriticalRegion();
     }
 
-    g_PostWriteState.Initialized = FALSE;
-    g_PostWriteState.InitOnce = 0;
+    InterlockedExchange(&g_PostWriteState.Initialized, FALSE);
+    InterlockedExchange(&g_PostWriteState.InitOnce, 0);
 }
 
 // ============================================================================
@@ -654,9 +659,14 @@ ShadowStrikePostWrite(
     UNREFERENCED_PARAMETER(CompletionContext);
 
     //
-    // IRQL assertion for debug builds
+    // PWR-1 (CRITICAL): Runtime IRQL safety check.
+    // Post-write callbacks CAN run at DISPATCH_LEVEL for non-cached I/O.
+    // All our analysis requires <= APC_LEVEL (push locks, PagedPool, FltGetStreamContext).
+    // Bail immediately if at elevated IRQL to prevent BSOD.
     //
-    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
+    if (KeGetCurrentIrql() > APC_LEVEL) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
 
     //
     // Lazy initialization of global state with proper synchronization
@@ -1396,15 +1406,21 @@ PwpUpdateProcessActivity(
     }
 
     //
-    // Update decayed score
+    // Update decayed score atomically using CAS loop
     //
-    LONG currentScore = Activity->SuspicionScore;
-    LONG addedScore = (LONG)WriteContext->SuspicionScore;
-    LONG newScore = currentScore + addedScore;
-    if (newScore > PW_SCORE_MAX_ACCUMULATION) {
-        newScore = PW_SCORE_MAX_ACCUMULATION;
+    {
+        LONG oldScore, desired;
+        do {
+            oldScore = Activity->SuspicionScore;
+            desired = oldScore + (LONG)WriteContext->SuspicionScore;
+            if (desired > PW_SCORE_MAX_ACCUMULATION) {
+                desired = PW_SCORE_MAX_ACCUMULATION;
+            }
+        } while (InterlockedCompareExchange(
+                     &Activity->SuspicionScore,
+                     desired,
+                     oldScore) != oldScore);
     }
-    InterlockedExchange(&Activity->SuspicionScore, newScore);
 
     //
     // Check for rapid write pattern (ransomware indicator)
@@ -1419,14 +1435,19 @@ PwpUpdateProcessActivity(
     //
     if (Activity->UniqueFileCount > PW_RANSOMWARE_FILE_THRESHOLD) {
         //
-        // Add score for rapid file modifications
+        // Add score for rapid file modifications using CAS loop
         //
-        currentScore = Activity->SuspicionScore;
-        newScore = currentScore + PW_SCORE_RAPID_FILE_MODIFICATIONS;
-        if (newScore > PW_SCORE_MAX_ACCUMULATION) {
-            newScore = PW_SCORE_MAX_ACCUMULATION;
-        }
-        InterlockedCompareExchange(&Activity->SuspicionScore, newScore, currentScore);
+        LONG oldScore, desired;
+        do {
+            oldScore = Activity->SuspicionScore;
+            desired = oldScore + PW_SCORE_RAPID_FILE_MODIFICATIONS;
+            if (desired > PW_SCORE_MAX_ACCUMULATION) {
+                desired = PW_SCORE_MAX_ACCUMULATION;
+            }
+        } while (InterlockedCompareExchange(
+                     &Activity->SuspicionScore,
+                     desired,
+                     oldScore) != oldScore);
     }
 }
 
@@ -1709,11 +1730,8 @@ PwpRaiseRansomwareAlert(
 #endif
 
     //
-    // Update global statistics - verify g_DriverData is initialized
+    // Ransomware alerts tracked locally in g_PostWriteState.RansomwareAlerts
     //
-    if (g_DriverData.Initialized) {
-        InterlockedIncrement64(&g_DriverData.Stats.SelfProtectionBlocks);
-    }
 
     //
     // Send alert to user-mode service for remediation
@@ -1722,10 +1740,27 @@ PwpRaiseRansomwareAlert(
 }
 
 /**
+ * @brief Ransomware alert notification payload sent to user-mode.
+ */
+#pragma pack(push, 1)
+typedef struct _PW_RANSOMWARE_ALERT_DATA {
+    UINT32 ProcessId;
+    UINT32 SuspicionScore;
+    UINT32 HighEntropyWrites;
+    UINT32 UniqueFileCount;
+    UINT32 WriteCount;
+    UINT32 FileNameLengthBytes;
+    // FileName WCHAR data follows immediately after this structure
+} PW_RANSOMWARE_ALERT_DATA, *PPW_RANSOMWARE_ALERT_DATA;
+#pragma pack(pop)
+
+/**
  * @brief Send ransomware detection event to user-mode service.
  *
- * This enables the user-mode service to take remediation action
- * such as process termination, quarantine, or user notification.
+ * Builds a notification message with ransomware alert data and sends it
+ * via the existing CommPort infrastructure. The user-mode service receives
+ * this as a FilterMessageType_RansomwareAlert and takes remediation action
+ * (process termination, quarantine, snapshot rollback, user notification).
  */
 static NTSTATUS
 PwpSendRansomwareEvent(
@@ -1734,59 +1769,129 @@ PwpSendRansomwareEvent(
     _In_opt_ PCUNICODE_STRING FileName
     )
 {
-    NTSTATUS status = STATUS_SUCCESS;
+    NTSTATUS status;
+    PSHADOWSTRIKE_MESSAGE_HEADER notification = NULL;
+    PPW_RANSOMWARE_ALERT_DATA alertData;
+    ULONG fileNameBytes = 0;
+    ULONG dataSize;
+    ULONG totalSize;
 
-    //
-    // Check if user-mode is connected
-    //
     if (!SHADOWSTRIKE_USER_MODE_CONNECTED()) {
         return STATUS_PORT_DISCONNECTED;
     }
 
-    //
-    // Check if driver is ready
-    //
     if (!g_DriverData.Initialized || g_DriverData.ShuttingDown) {
         return STATUS_DEVICE_NOT_READY;
     }
 
     //
-    // Build and send notification message to user-mode
-    // The user-mode service will handle process termination/quarantine
+    // Calculate payload size with optional file name
     //
-    // Note: Actual message sending would use the existing communication
-    // infrastructure. For now, we increment stats and rely on the
-    // user-mode service polling for alerts or implement a proper
-    // notification queue in the communication module.
-    //
-
-    UNREFERENCED_PARAMETER(FileName);
-
-#ifdef WPP_TRACING
-    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_FLAG_FILEOPS,
-        "Ransomware event queued for user-mode: PID=%p Score=%u",
-        ProcessId,
-        Score);
-#else
-    UNREFERENCED_PARAMETER(ProcessId);
-    UNREFERENCED_PARAMETER(Score);
-#endif
-
-    //
-    // In a complete implementation, this would:
-    // 1. Allocate a message buffer from the lookaside list
-    // 2. Fill in message header and ransomware event details
-    // 3. Queue the message for the connected client(s)
-    // 4. The user-mode service receives and takes action
-    //
-    // For production, integrate with ShadowStrike's existing
-    // FltSendMessage or async notification infrastructure.
-    //
-
-    if (g_DriverData.Initialized) {
-        InterlockedIncrement64(&g_DriverData.Stats.MessagesSent);
+    if (FileName != NULL && FileName->Buffer != NULL && FileName->Length > 0) {
+        fileNameBytes = FileName->Length;
+        if (fileNameBytes > 520) {
+            fileNameBytes = 520;
+        }
     }
 
+    dataSize = sizeof(PW_RANSOMWARE_ALERT_DATA) + fileNameBytes;
+    totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + dataSize;
+
+    //
+    // Cap total allocation to prevent abuse
+    //
+    if (totalSize > 4096) {
+        totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + sizeof(PW_RANSOMWARE_ALERT_DATA);
+        dataSize = sizeof(PW_RANSOMWARE_ALERT_DATA);
+        fileNameBytes = 0;
+    }
+
+    notification = (PSHADOWSTRIKE_MESSAGE_HEADER)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        totalSize,
+        PW_POOL_TAG
+    );
+
+    if (notification == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
+    // Initialize message header
+    //
+    ShadowStrikeInitMessageHeader(
+        notification,
+        FilterMessageType_RansomwareAlert,
+        dataSize
+    );
+
+    //
+    // Fill ransomware alert payload
+    //
+    alertData = (PPW_RANSOMWARE_ALERT_DATA)(
+        (PUCHAR)notification + sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
+    );
+
+    alertData->ProcessId = HandleToULong(ProcessId);
+    alertData->SuspicionScore = Score;
+    alertData->FileNameLengthBytes = fileNameBytes;
+
+    //
+    // Include process activity stats if available
+    //
+    {
+        PPW_PROCESS_ACTIVITY activity = NULL;
+        ULONG i;
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockShared(&g_PostWriteState.ActivityLock);
+
+        for (i = 0; i < PW_MAX_TRACKED_PROCESSES; i++) {
+            if (g_PostWriteState.ProcessActivity[i].ProcessId == ProcessId &&
+                g_PostWriteState.ProcessActivity[i].IsActive) {
+                activity = &g_PostWriteState.ProcessActivity[i];
+                break;
+            }
+        }
+
+        if (activity != NULL) {
+            alertData->HighEntropyWrites = (UINT32)activity->HighEntropyWrites;
+            alertData->UniqueFileCount = (UINT32)activity->UniqueFileCount;
+            alertData->WriteCount = (UINT32)activity->WriteCount;
+        } else {
+            alertData->HighEntropyWrites = 0;
+            alertData->UniqueFileCount = 0;
+            alertData->WriteCount = 0;
+        }
+
+        ExReleasePushLockShared(&g_PostWriteState.ActivityLock);
+        KeLeaveCriticalRegion();
+    }
+
+    //
+    // Copy file name if present
+    //
+    if (fileNameBytes > 0 && FileName != NULL && FileName->Buffer != NULL) {
+        PUCHAR dest = (PUCHAR)alertData + sizeof(PW_RANSOMWARE_ALERT_DATA);
+        RtlCopyMemory(dest, FileName->Buffer, fileNameBytes);
+    }
+
+    //
+    // Send notification to user-mode via CommPort
+    //
+    status = ShadowStrikeSendNotification(notification, totalSize);
+
+    if (NT_SUCCESS(status)) {
+        SHADOWSTRIKE_INC_STAT(MessagesSent);
+    } else {
+#ifdef WPP_TRACING
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_FLAG_FILEOPS,
+            "PostWrite: Failed to send ransomware alert for PID=%p: 0x%08X",
+            ProcessId, status);
+#endif
+    }
+
+    ExFreePoolWithTag(notification, PW_POOL_TAG);
     return status;
 }
 
@@ -1831,8 +1936,8 @@ PwpGetFileName(
     // This preserves NonPagedPool for truly non-pageable allocations
     //
     FileName->MaximumLength = nameInfo->Name.Length + sizeof(WCHAR);
-    FileName->Buffer = (PWCH)ExAllocatePoolWithTag(
-        PagedPool,
+    FileName->Buffer = (PWCH)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         FileName->MaximumLength,
         PW_POOL_TAG
     );
