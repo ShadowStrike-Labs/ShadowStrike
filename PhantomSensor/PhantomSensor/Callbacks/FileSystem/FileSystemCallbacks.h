@@ -39,7 +39,113 @@
 #ifndef SHADOWSTRIKE_FS_CALLBACKS_H
 #define SHADOWSTRIKE_FS_CALLBACKS_H
 
+#pragma warning(push)
+#pragma warning(disable:4324)  // structure padded due to alignment specifier
 #include <fltKernel.h>
+#pragma warning(pop)
+
+// ============================================================================
+// LIFECYCLE
+// ============================================================================
+
+/**
+ * @brief Initialize the filesystem callback subsystem.
+ * @return STATUS_SUCCESS on success, STATUS_ALREADY_REGISTERED if already initialized.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ShadowStrikeInitializeFileSystemCallbacks(
+    VOID
+    );
+
+/**
+ * @brief Shutdown and cleanup the filesystem callback subsystem.
+ *        Waits for all in-flight operations via rundown protection.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ShadowStrikeCleanupFileSystemCallbacks(
+    VOID
+    );
+
+// ============================================================================
+// INSTANCE CALLBACKS
+// ============================================================================
+
+/**
+ * @brief Instance setup callback — decides whether to attach to a volume.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ShadowStrikeInstanceSetup(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ FLT_INSTANCE_SETUP_FLAGS Flags,
+    _In_ DEVICE_TYPE VolumeDeviceType,
+    _In_ FLT_FILESYSTEM_TYPE VolumeFilesystemType
+    );
+
+/**
+ * @brief Instance query teardown callback — allows manual detachment.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+ShadowStrikeInstanceQueryTeardown(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ FLT_INSTANCE_QUERY_TEARDOWN_FLAGS Flags
+    );
+
+/**
+ * @brief Instance teardown start callback — marks volume as detaching.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ShadowStrikeInstanceTeardownStart(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ FLT_INSTANCE_TEARDOWN_FLAGS Reason
+    );
+
+/**
+ * @brief Instance teardown complete callback — final cleanup for volume.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ShadowStrikeInstanceTeardownComplete(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ FLT_INSTANCE_TEARDOWN_FLAGS Reason
+    );
+
+// ============================================================================
+// CONTEXT CLEANUP CALLBACKS
+// ============================================================================
+
+/**
+ * @brief Cleanup callback for stream contexts.
+ */
+VOID
+ShadowStrikeStreamContextCleanup(
+    _In_ PFLT_CONTEXT Context,
+    _In_ FLT_CONTEXT_TYPE ContextType
+    );
+
+/**
+ * @brief Cleanup callback for stream handle contexts.
+ */
+VOID
+ShadowStrikeStreamHandleContextCleanup(
+    _In_ PFLT_CONTEXT Context,
+    _In_ FLT_CONTEXT_TYPE ContextType
+    );
+
+/**
+ * @brief Cleanup callback for volume contexts.
+ */
+VOID
+ShadowStrikeVolumeContextCleanup(
+    _In_ PFLT_CONTEXT Context,
+    _In_ FLT_CONTEXT_TYPE ContextType
+    );
 
 // ============================================================================
 // CALLBACK PROTOTYPES
@@ -134,6 +240,44 @@ ShadowStrikePostCreateNamedPipe(
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_opt_ PVOID CompletionContext,
     _In_ FLT_POST_OPERATION_FLAGS Flags
+    );
+
+// ============================================================================
+// PUBLIC STATISTICS / QUERY API
+// ============================================================================
+
+/**
+ * @brief Retrieves filesystem callback statistics.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+ShadowStrikeGetFileSystemStats(
+    _Out_opt_ PULONG64 PreCreateCalls,
+    _Out_opt_ PULONG64 FilesBlocked,
+    _Out_opt_ PULONG64 RansomwareDetections,
+    _Out_opt_ PULONG VolumeCount
+    );
+
+/**
+ * @brief Queries file operation context for a process.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+ShadowStrikeQueryProcessFileContext(
+    _In_ HANDLE ProcessId,
+    _Out_opt_ PBOOLEAN IsRansomwareSuspect,
+    _Out_opt_ PULONG SuspicionScore,
+    _Out_opt_ PULONG BehaviorFlags
+    );
+
+/**
+ * @brief External API to notify of file operations (cross-module integration).
+ */
+VOID
+ShadowStrikeNotifyProcessFileOperation(
+    _In_ HANDLE ProcessId,
+    _In_ ULONG OperationType,
+    _In_opt_ PCUNICODE_STRING FileName
     );
 
 #endif // SHADOWSTRIKE_FS_CALLBACKS_H

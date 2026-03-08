@@ -60,25 +60,9 @@ Performance Characteristics:
 #include "FileSystemCallbacks.h"
 #include "../../Core/Globals.h"
 #include "../../Shared/SharedDefs.h"
-#include "../../Communication/CommPort.h"
-#include "../../Communication/ScanBridge.h"
+#include "../../Shared/VerdictTypes.h"
 #include "../../Cache/ScanCache.h"
-#include "../../SelfProtection/SelfProtect.h"
-#include "../../Exclusions/ExclusionManager.h"
-#include "../../Utilities/MemoryUtils.h"
-#include "../../Utilities/FileUtils.h"
 #include <ntstrsafe.h>
-
-#ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, ShadowStrikeInitializeFileSystemCallbacks)
-#pragma alloc_text(PAGE, ShadowStrikeCleanupFileSystemCallbacks)
-#pragma alloc_text(PAGE, ShadowStrikeInstanceSetup)
-#pragma alloc_text(PAGE, ShadowStrikeInstanceQueryTeardown)
-#pragma alloc_text(PAGE, ShadowStrikeInstanceTeardownStart)
-#pragma alloc_text(PAGE, ShadowStrikeInstanceTeardownComplete)
-#pragma alloc_text(PAGE, ShadowStrikeStreamContextCleanup)
-#pragma alloc_text(PAGE, ShadowStrikeStreamHandleContextCleanup)
-#endif
 
 // ============================================================================
 // INTERNAL CONSTANTS
@@ -89,8 +73,6 @@ Performance Characteristics:
 #define FSC_WORKITEM_POOL_TAG           'wWFS'  // SFWw - Work Item
 #define FSC_MAX_FILE_NAME_LENGTH        32768
 #define FSC_MAX_VOLUME_NAME_LENGTH      512
-#define FSC_ENTROPY_SAMPLE_SIZE         4096
-#define FSC_RANSOMWARE_ENTROPY_THRESHOLD 7.5    // High entropy threshold
 #define FSC_RANSOMWARE_RENAME_THRESHOLD  50     // Renames per second
 #define FSC_RANSOMWARE_DELETE_THRESHOLD  100    // Deletes per second
 #define FSC_MAX_TRACKED_VOLUMES         64
@@ -266,7 +248,7 @@ typedef struct _FSC_OPERATION_CONTEXT {
     SHADOWSTRIKE_CACHE_KEY CacheKey;
     BOOLEAN CacheKeyValid;
     BOOLEAN WasCacheHit;
-    SHADOWSTRIKE_VERDICT Verdict;
+    SHADOWSTRIKE_SCAN_VERDICT Verdict;
     ULONG ThreatScore;
 
 } FSC_OPERATION_CONTEXT, *PFSC_OPERATION_CONTEXT;
@@ -377,7 +359,7 @@ typedef struct _FSC_GLOBAL_STATE {
     KDPC CleanupDpc;
     BOOLEAN CleanupTimerActive;
     volatile LONG CleanupWorkItemPending;
-    PIO_WORKITEM CleanupWorkItem;
+    PFLT_GENERIC_WORKITEM CleanupWorkItem;
 
     //
     // Shutdown flag
@@ -517,12 +499,6 @@ FscpGetScanPriority(
     _In_ PCUNICODE_STRING Extension
     );
 
-static BOOLEAN
-FscpIsHighEntropyFile(
-    _In_ PFLT_CALLBACK_DATA Data,
-    _In_ PCFLT_RELATED_OBJECTS FltObjects
-    );
-
 static VOID
 FscpUpdateProcessFileMetrics(
     _In_ HANDLE ProcessId,
@@ -544,8 +520,10 @@ FscpCleanupTimerDpc(
     );
 
 static VOID
+FLTAPI
 FscpCleanupWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PFLT_GENERIC_WORKITEM FltWorkItem,
+    _In_ PVOID FltObject,
     _In_opt_ PVOID Context
     );
 
@@ -582,6 +560,25 @@ FscpCompareExtensionSafe(
     _In_ PCUNICODE_STRING Extension,
     _In_ PCWSTR CompareStr
     );
+
+// ============================================================================
+// PAGE ALLOCATION
+// ============================================================================
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, ShadowStrikeInitializeFileSystemCallbacks)
+#pragma alloc_text(PAGE, ShadowStrikeCleanupFileSystemCallbacks)
+#pragma alloc_text(PAGE, ShadowStrikeInstanceSetup)
+#pragma alloc_text(PAGE, ShadowStrikeInstanceQueryTeardown)
+#pragma alloc_text(PAGE, ShadowStrikeInstanceTeardownStart)
+#pragma alloc_text(PAGE, ShadowStrikeInstanceTeardownComplete)
+#pragma alloc_text(PAGE, ShadowStrikeStreamContextCleanup)
+#pragma alloc_text(PAGE, ShadowStrikeStreamHandleContextCleanup)
+#pragma alloc_text(PAGE, ShadowStrikeVolumeContextCleanup)
+#pragma alloc_text(PAGE, FscpCleanupWorkItemRoutine)
+#pragma alloc_text(PAGE, FscpCleanupStaleContexts)
+#pragma alloc_text(PAGE, FscpResetTimeWindowedMetrics)
+#endif
 
 // ============================================================================
 // CONTEXT CLEANUP CALLBACKS
@@ -657,6 +654,8 @@ Arguments:
 --*/
 {
     PFSC_VOLUME_CONTEXT VolumeContext = (PFSC_VOLUME_CONTEXT)Context;
+
+    PAGED_CODE();
 
     UNREFERENCED_PARAMETER(ContextType);
 
@@ -912,8 +911,8 @@ Return Value:
     {
         PFSC_VOLUME_LIST_ENTRY VolumeListEntry = NULL;
 
-        VolumeListEntry = (PFSC_VOLUME_LIST_ENTRY)ExAllocatePoolWithTag(
-            NonPagedPoolNx,
+        VolumeListEntry = (PFSC_VOLUME_LIST_ENTRY)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
             sizeof(FSC_VOLUME_LIST_ENTRY),
             FSC_POOL_TAG
             );
@@ -1064,16 +1063,49 @@ ShadowStrikeInstanceTeardownComplete(
 /*++
 Routine Description:
     Instance teardown complete callback. Called when instance detachment is complete.
+    Removes the volume tracking entry from the list to prevent leaks.
 
 Arguments:
     FltObjects - Filter objects for this volume.
     Reason - Reason for teardown.
 --*/
 {
+    PLIST_ENTRY Entry;
+    PLIST_ENTRY Next;
+    PFSC_VOLUME_LIST_ENTRY VolumeEntry;
+    PFSC_VOLUME_LIST_ENTRY FoundEntry = NULL;
+
     PAGED_CODE();
 
-    UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(Reason);
+
+    //
+    // Remove the volume list entry for this instance.
+    // Without this, entries leak on every volume detach (USB eject, network disconnect).
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_FscState.VolumeLock);
+
+    for (Entry = g_FscState.VolumeList.Flink;
+         Entry != &g_FscState.VolumeList;
+         Entry = Next) {
+
+        Next = Entry->Flink;
+        VolumeEntry = CONTAINING_RECORD(Entry, FSC_VOLUME_LIST_ENTRY, ListEntry);
+
+        if (VolumeEntry->Instance == FltObjects->Instance) {
+            RemoveEntryList(Entry);
+            FoundEntry = VolumeEntry;
+            break;
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_FscState.VolumeLock);
+    KeLeaveCriticalRegion();
+
+    if (FoundEntry != NULL) {
+        ExFreePoolWithTag(FoundEntry, FSC_POOL_TAG);
+    }
 
     InterlockedDecrement(&g_FscState.VolumeCount);
 
@@ -1102,7 +1134,6 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
-    NTSTATUS Status = STATUS_SUCCESS;
     LARGE_INTEGER DueTime;
     LARGE_INTEGER CurrentTime;
 
@@ -1171,11 +1202,19 @@ Return Value:
     KeInitializeDpc(&g_FscState.CleanupDpc, FscpCleanupTimerDpc, NULL);
 
     //
-    // Allocate work item for deferred cleanup (requires device object)
-    // Note: Work item will be allocated lazily when needed if we don't have device object yet
+    // Pre-allocate minifilter work item for deferred cleanup at PASSIVE_LEVEL.
+    // FltAllocateGenericWorkItem does not require a device object — correct for minifilters.
     //
-    g_FscState.CleanupWorkItem = NULL;
+    g_FscState.CleanupWorkItem = FltAllocateGenericWorkItem();
     g_FscState.CleanupWorkItemPending = 0;
+
+    if (g_FscState.CleanupWorkItem == NULL) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/FS] Failed to allocate cleanup work item\n"
+            );
+    }
 
     //
     // Start cleanup timer
@@ -1253,7 +1292,7 @@ Routine Description:
     // Free work item if allocated
     //
     if (g_FscState.CleanupWorkItem != NULL) {
-        IoFreeWorkItem(g_FscState.CleanupWorkItem);
+        FltFreeGenericWorkItem(g_FscState.CleanupWorkItem);
         g_FscState.CleanupWorkItem = NULL;
     }
 
@@ -1295,12 +1334,14 @@ Routine Description:
     KeLeaveCriticalRegion();
 
     //
-    // Delete lookaside lists
+    // Delete lookaside lists — set flag BEFORE deleting (ordering matters)
     //
     if (g_FscState.LookasideInitialized) {
+        g_FscState.LookasideInitialized = FALSE;
+        MemoryBarrier();
+
         ExDeleteNPagedLookasideList(&g_FscState.OperationContextLookaside);
         ExDeleteNPagedLookasideList(&g_FscState.ProcessContextLookaside);
-        g_FscState.LookasideInitialized = FALSE;
     }
 
     DbgPrintEx(
@@ -1613,7 +1654,7 @@ FscpShouldLogOperation(
 /*++
 Routine Description:
     Rate-limited logging check using atomic operations.
-    Thread-safe implementation without TOCTOU issues.
+    Only one thread wins the window reset via CAS.
 
 Return Value:
     TRUE if logging should proceed, FALSE if rate limited.
@@ -1621,31 +1662,45 @@ Return Value:
 {
     LARGE_INTEGER CurrentTime;
     LONG64 CurrentSecond;
-    LONG64 StoredSecond;
+    LONG64 OldStart;
+    LONG64 OldSecond;
     LONG CurrentLogs;
 
     KeQuerySystemTime(&CurrentTime);
-    CurrentSecond = CurrentTime.QuadPart / 10000000LL;  // Convert to seconds
-    StoredSecond = g_FscState.CurrentSecondStart100ns / 10000000LL;
+    CurrentSecond = CurrentTime.QuadPart / 10000000LL;
 
-    if (CurrentSecond != StoredSecond) {
+    //
+    // Read the stored start time ONCE into a local to avoid re-reading
+    // the volatile between CAS comparand and result check.
+    //
+    OldStart = InterlockedCompareExchange64(
+        &g_FscState.CurrentSecondStart100ns,
+        g_FscState.CurrentSecondStart100ns,
+        g_FscState.CurrentSecondStart100ns
+    );
+    OldSecond = OldStart / 10000000LL;
+
+    if (CurrentSecond != OldSecond) {
         //
-        // New second - reset atomically
-        // Use InterlockedCompareExchange64 to handle race
+        // New second — attempt atomic reset. Only the CAS winner resets the counter.
         //
-        if (InterlockedCompareExchange64(
-                &g_FscState.CurrentSecondStart100ns,
-                CurrentTime.QuadPart,
-                g_FscState.CurrentSecondStart100ns) != g_FscState.CurrentSecondStart100ns) {
-            //
-            // Another thread updated - re-read
-            //
+        LONG64 Swapped = InterlockedCompareExchange64(
+            &g_FscState.CurrentSecondStart100ns,
+            CurrentTime.QuadPart,
+            OldStart
+        );
+
+        if (Swapped == OldStart) {
+            InterlockedExchange(&g_FscState.CurrentSecondLogs, 1);
+            return TRUE;
         }
-        InterlockedExchange(&g_FscState.CurrentSecondLogs, 0);
+        //
+        // Lost the race — another thread already reset. Fall through to normal increment.
+        //
     }
 
     CurrentLogs = InterlockedIncrement(&g_FscState.CurrentSecondLogs);
-    return (CurrentLogs <= 100);  // Allow 100 logs per second
+    return (CurrentLogs <= 100);
 }
 
 
@@ -1958,21 +2013,25 @@ Return Value:
 // ============================================================================
 
 static VOID
+FLTAPI
 FscpCleanupWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PFLT_GENERIC_WORKITEM FltWorkItem,
+    _In_ PVOID FltObject,
     _In_opt_ PVOID Context
     )
 /*++
 Routine Description:
-    Work item routine that runs at PASSIVE_LEVEL for cleanup operations.
-    Called from DPC to perform operations that require PASSIVE_LEVEL.
+    Minifilter work item routine that runs at PASSIVE_LEVEL for cleanup.
+    Queued from DPC via FltQueueGenericWorkItem.
 
 Arguments:
-    DeviceObject - Device object (unused).
+    FltWorkItem - The generic work item (reused, NOT freed here).
+    FltObject - Filter handle that queued this work item.
     Context - Work item context (unused).
 --*/
 {
-    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(FltWorkItem);
+    UNREFERENCED_PARAMETER(FltObject);
     UNREFERENCED_PARAMETER(Context);
 
     PAGED_CODE();
@@ -1989,7 +2048,7 @@ Arguments:
     FscpResetTimeWindowedMetrics();
 
     //
-    // Mark work item as complete
+    // Mark work item as complete — allows DPC to re-queue
     //
     InterlockedExchange(&g_FscState.CleanupWorkItemPending, 0);
 }
@@ -2027,23 +2086,21 @@ Arguments:
     // Note: We use InterlockedCompareExchange to ensure only one work item is queued
     //
     if (InterlockedCompareExchange(&g_FscState.CleanupWorkItemPending, 1, 0) == 0) {
-        //
-        // Allocate work item if needed
-        //
-        if (g_FscState.CleanupWorkItem == NULL && g_DriverData.DeviceObject != NULL) {
-            g_FscState.CleanupWorkItem = IoAllocateWorkItem(g_DriverData.DeviceObject);
-        }
-
         if (g_FscState.CleanupWorkItem != NULL) {
-            IoQueueWorkItem(
+            NTSTATUS Status = FltQueueGenericWorkItem(
                 g_FscState.CleanupWorkItem,
+                (PVOID)g_DriverData.FilterHandle,
                 FscpCleanupWorkItemRoutine,
                 DelayedWorkQueue,
                 NULL
                 );
+
+            if (!NT_SUCCESS(Status)) {
+                InterlockedExchange(&g_FscState.CleanupWorkItemPending, 0);
+            }
         } else {
             //
-            // No work item available - clear pending flag
+            // No work item available — clear pending flag
             //
             InterlockedExchange(&g_FscState.CleanupWorkItemPending, 0);
         }
