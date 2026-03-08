@@ -91,6 +91,20 @@
 #include "../../Communication/CommPort.h"
 #include <ntstrsafe.h>
 
+//
+// Forward declaration for ScanBridge send API. Cannot include ScanBridge.h
+// directly because it has conflicting declarations with CommPort.h.
+//
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+ShadowStrikeSendMessage(
+    _In_ PVOID InputBuffer,
+    _In_ ULONG InputBufferSize,
+    _Out_opt_ PVOID OutputBuffer,
+    _Inout_opt_ PULONG OutputBufferSize,
+    _In_opt_ PLARGE_INTEGER Timeout
+);
+
 // ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
@@ -409,11 +423,6 @@ typedef struct _PSI_GLOBAL_STATE {
 
 static PSI_GLOBAL_STATE g_PsiState = { 0 };
 
-/**
- * @brief External self-protection state
- */
-extern BOOLEAN g_SelfProtectInitialized;
-
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
@@ -672,10 +681,6 @@ ShadowStrikeCleanupPreSetInfo(
 {
     PLIST_ENTRY entry;
     PPSI_PROCESS_CONTEXT context;
-    LARGE_INTEGER startTime;
-    LARGE_INTEGER currentTime;
-    LARGE_INTEGER timeout;
-    LARGE_INTEGER pollInterval;
 
     PAGED_CODE();
 
@@ -687,27 +692,39 @@ ShadowStrikeCleanupPreSetInfo(
     }
 
     //
-    // Signal shutdown
+    // Signal shutdown — PsipEnterOperation will fail after this
     //
     InterlockedExchange(&g_PsiState.ShuttingDown, 1);
     MemoryBarrier();
 
     //
-    // Wait for outstanding operations to complete
+    // Wait for ALL outstanding operations to complete.
+    // CRITICAL: Must use INFINITE wait here. A timed wait that expires and
+    // proceeds to delete the lookaside while operations are still outstanding
+    // will cause BSOD when those operations later free to the deleted lookaside.
+    // PreSetInfo callback is synchronous (FLT_PREOP_SUCCESS_NO_CALLBACK / 
+    // FLT_PREOP_COMPLETE — no post-op), so outstanding ops are actively running
+    // on other CPUs and will complete in bounded time.
     //
-    KeQuerySystemTime(&startTime);
-    timeout.QuadPart = PSI_SHUTDOWN_WAIT_TIMEOUT;
-    pollInterval.QuadPart = -(LONGLONG)PSI_SHUTDOWN_POLL_INTERVAL;
+    {
+        ULONG spinCount = 0;
+        LARGE_INTEGER pollInterval;
+        pollInterval.QuadPart = -(10 * 10000); // 10ms
 
-    while (g_PsiState.OutstandingOperations > 0) {
-        KeQuerySystemTime(&currentTime);
-        if ((currentTime.QuadPart - startTime.QuadPart) > timeout.QuadPart) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike/PreSetInfo] WARNING: Shutdown timeout with %ld outstanding ops\n",
-                       g_PsiState.OutstandingOperations);
-            break;
+        while (g_PsiState.OutstandingOperations > 0) {
+            KeDelayExecutionThread(KernelMode, FALSE, &pollInterval);
+            spinCount++;
+
+            //
+            // Log periodically so we can diagnose hangs
+            //
+            if ((spinCount % 1000) == 0) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike/PreSetInfo] Shutdown waiting: %ld outstanding ops (%.1fs)\n",
+                           g_PsiState.OutstandingOperations,
+                           (double)spinCount * 10.0 / 1000.0);
+            }
         }
-        KeDelayExecutionThread(KernelMode, FALSE, &pollInterval);
     }
 
     //
@@ -857,8 +874,6 @@ ShadowStrikePreSetInformation(
     }
     operationEntered = TRUE;
 
-    SHADOWSTRIKE_ENTER_OPERATION();
-
     //
     // Update statistics
     //
@@ -947,7 +962,7 @@ ShadowStrikePreSetInformation(
     // SELF-PROTECTION CHECK
     // ========================================================================
     //
-    if (g_SelfProtectInitialized && g_DriverData.Config.SelfProtectionEnabled) {
+    if (g_DriverData.Config.SelfProtectionEnabled) {
         BOOLEAN isDeleteOrRename = FALSE;
 
         switch (infoClass) {
@@ -1076,7 +1091,15 @@ ShadowStrikePreSetInformation(
         infoClass == FileRenameInformation ||
         infoClass == FileRenameInformationEx) {
 
-        FbePreSetInfoBackup(Data, FltObjects, requestorPid, &nameInfo->Name, infoClass);
+        FBE_OPERATION_TYPE fbeOpType;
+
+        if (infoClass == FileRenameInformation || infoClass == FileRenameInformationEx) {
+            fbeOpType = FbeOp_Rename;
+        } else {
+            fbeOpType = FbeOp_Delete;
+        }
+
+        FbePreSetInfoBackup(Data, FltObjects, &nameInfo->Name, fbeOpType);
     }
 
     //
@@ -1232,8 +1255,6 @@ AllowOperation:
     if (nameInfo != NULL) {
         FltReleaseFileNameInformation(nameInfo);
     }
-
-    SHADOWSTRIKE_LEAVE_OPERATION();
 
     if (operationEntered) {
         PsipLeaveOperation();
@@ -1808,11 +1829,22 @@ PsipIsSensitiveSystemFile(
             compareResult = RtlCompareUnicodeString(&fileSuffix, &pattern, TRUE);
             if (compareResult == 0) {
                 //
-                // Additional validation: ensure the match is at a path boundary.
-                // The character before the match should be a backslash or this
-                // should be the start of the path.
+                // Boundary validation: ensure the match is at a path boundary.
+                // If the pattern starts with '\', the leading backslash IS the
+                // boundary marker — no further check needed. Otherwise, the
+                // character before the match must be '\' or ':' (or start of path).
                 //
-                if (fileStart == FileName->Buffer || *(fileStart - 1) == L'\\' || *(fileStart - 1) == L':') {
+                BOOLEAN isBoundary = FALSE;
+
+                if (fileStart == FileName->Buffer) {
+                    isBoundary = TRUE;
+                } else if (pattern.Buffer[0] == L'\\') {
+                    isBoundary = TRUE;
+                } else if (*(fileStart - 1) == L'\\' || *(fileStart - 1) == L':') {
+                    isBoundary = TRUE;
+                }
+
+                if (isBoundary) {
                     if (BlockDelete) *BlockDelete = g_SensitivePaths[i].BlockDelete;
                     if (BlockRename) *BlockRename = g_SensitivePaths[i].BlockRename;
                     if (BlockHardLink) *BlockHardLink = g_SensitivePaths[i].BlockHardLink;
@@ -2037,8 +2069,8 @@ PsipGetRenameDestination(
         //
         // Allocate buffer
         //
-        buffer = (PWCHAR)ExAllocatePoolWithTag(
-            NonPagedPoolNx,
+        buffer = (PWCHAR)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
             bufferLength,
             PSI_POOL_TAG
             );
@@ -2099,7 +2131,6 @@ PsipSendTelemetryEvent(
     PPSI_TELEMETRY_EVENT event = NULL;
     ULONG eventSize;
     USHORT fileNameLength;
-    ULONG replyLength = 0;
 
     if (!PsipIsInitialized()) {
         return;
@@ -2119,8 +2150,8 @@ PsipSendTelemetryEvent(
     //
     // Allocate event structure
     //
-    event = (PPSI_TELEMETRY_EVENT)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    event = (PPSI_TELEMETRY_EVENT)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         eventSize,
         PSI_POOL_TAG
         );
@@ -2149,15 +2180,15 @@ PsipSendTelemetryEvent(
     event->FileName[fileNameLength / sizeof(WCHAR)] = L'\0';
 
     //
-    // Send via communication port
-    // Note: This is non-blocking; if the port is not connected, the event is dropped
+    // Send via communication port (ScanBridge).
+    // Non-blocking — if the port is not connected, the event is dropped.
     //
     status = ShadowStrikeSendMessage(
-        SHADOWSTRIKE_MSG_TYPE_PRESETINFO_TELEMETRY,
         event,
         eventSize,
         NULL,
-        &replyLength
+        NULL,
+        NULL
         );
 
     if (NT_SUCCESS(status)) {
