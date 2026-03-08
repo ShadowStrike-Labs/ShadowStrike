@@ -121,7 +121,19 @@
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="PhantomSensorELAM\BootDriverVerify.c" />
+    <ClCompile Include="PhantomSensorELAM\BootThreatDetector.c" />
+    <ClCompile Include="PhantomSensorELAM\ELAMCallbacks.c" />
+    <ClCompile Include="PhantomSensorELAM\ELAMDriver.c" />
     <ClCompile Include="PhantomSensor\ALPC\AlpcPortMonitor.c" />
+    <ClCompile Include="PhantomSensor\Behavioral\AnomalyDetector.c" />
+    <ClCompile Include="PhantomSensor\Behavioral\AttackChainTracker.c" />
+    <ClCompile Include="PhantomSensor\Behavioral\BehaviorEngine.c" />
+    <ClCompile Include="PhantomSensor\Behavioral\IOCMatcher.c" />
+    <ClCompile Include="PhantomSensor\Behavioral\MITREMapper.c" />
+    <ClCompile Include="PhantomSensor\Behavioral\PatternMatcher.c" />
+    <ClCompile Include="PhantomSensor\Behavioral\RuleEngine.c" />
+    <ClCompile Include="PhantomSensor\Behavioral\ThreatScoring.c" />
     <ClCompile Include="PhantomSensor\Callbacks\FileSystem\FileBackupEngine.c" />
     <ClCompile Include="PhantomSensor\Callbacks\FileSystem\FileSystemCallbacks.c" />
     <ClCompile Include="PhantomSensor\Callbacks\FileSystem\NamedPipeMonitor.c" />
@@ -177,6 +189,15 @@
     <ClCompile Include="PhantomSensor\Memory\SectionTracker.c" />
     <ClCompile Include="PhantomSensor\Memory\ShellcodeDetector.c" />
     <ClCompile Include="PhantomSensor\Memory\VadTracker.c" />
+    <ClCompile Include="PhantomSensor\Network\C2Detection.c" />
+    <ClCompile Include="PhantomSensor\Network\ConnectionTracker.c" />
+    <ClCompile Include="PhantomSensor\Network\DataExfiltration.c" />
+    <ClCompile Include="PhantomSensor\Network\DnsMonitor.c" />
+    <ClCompile Include="PhantomSensor\Network\NetworkFilter.c" />
+    <ClCompile Include="PhantomSensor\Network\NetworkReputation.c" />
+    <ClCompile Include="PhantomSensor\Network\PortScanner.c" />
+    <ClCompile Include="PhantomSensor\Network\ProtocolParser.c" />
+    <ClCompile Include="PhantomSensor\Network\SSLInspection.c" />
     <ClCompile Include="PhantomSensor\Objects\ObjectNamespace.c" />
     <ClCompile Include="PhantomSensor\Performance\BatchProcessing.c" />
     <ClCompile Include="PhantomSensor\Performance\CacheOptimization.c" />
@@ -184,6 +205,14 @@
     <ClCompile Include="PhantomSensor\Performance\PerformanceMonitor.c" />
     <ClCompile Include="PhantomSensor\Performance\ResourceThrottling.c" />
     <ClCompile Include="PhantomSensor\Power\PowerCallback.c" />
+    <ClCompile Include="PhantomSensor\SelfProtection\AntiDebug.c" />
+    <ClCompile Include="PhantomSensor\SelfProtection\AntiUnload.c" />
+    <ClCompile Include="PhantomSensor\SelfProtection\CallbackProtection.c" />
+    <ClCompile Include="PhantomSensor\SelfProtection\FileProtection.c" />
+    <ClCompile Include="PhantomSensor\SelfProtection\FirmwareIntegrity.c" />
+    <ClCompile Include="PhantomSensor\SelfProtection\HandleProtection.c" />
+    <ClCompile Include="PhantomSensor\SelfProtection\IntegrityMonitor.c" />
+    <ClCompile Include="PhantomSensor\SelfProtection\SelfProtect.c" />
     <ClCompile Include="PhantomSensor\Sync\AsyncWorkQueue.c" />
     <ClCompile Include="PhantomSensor\Sync\DeferredProcedure.c" />
     <ClCompile Include="PhantomSensor\Sync\SpinLock.c" />
@@ -206,8 +235,20 @@
     <ClCompile Include="PhantomSensor\Utilities\StringUtils.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="PhantomSensorELAM\BootDriverVerify.h" />
+    <ClInclude Include="PhantomSensorELAM\BootThreatDetector.h" />
+    <ClInclude Include="PhantomSensorELAM\ELAMCallbacks.h" />
+    <ClInclude Include="PhantomSensorELAM\ELAMDriver.h" />
     <ClInclude Include="PhantomSensor\ALPC\AlpcPortMonitor.h" />
     <ClInclude Include="PhantomSensor\ALPC\AlpcTypes.h" />
+    <ClInclude Include="PhantomSensor\Behavioral\AnomalyDetector.h" />
+    <ClInclude Include="PhantomSensor\Behavioral\AttackChainTracker.h" />
+    <ClInclude Include="PhantomSensor\Behavioral\BehaviorEngine.h" />
+    <ClInclude Include="PhantomSensor\Behavioral\IOCMatcher.h" />
+    <ClInclude Include="PhantomSensor\Behavioral\MITREMapper.h" />
+    <ClInclude Include="PhantomSensor\Behavioral\PatternMatcher.h" />
+    <ClInclude Include="PhantomSensor\Behavioral\RuleEngine.h" />
+    <ClInclude Include="PhantomSensor\Behavioral\ThreatScoring.h" />
     <ClInclude Include="PhantomSensor\Callbacks\FileSystem\FileBackupEngine.h" />
     <ClInclude Include="PhantomSensor\Callbacks\FileSystem\FileSystemCallbacks.h" />
     <ClInclude Include="PhantomSensor\Callbacks\FileSystem\NamedPipeMonitor.h" />
@@ -258,6 +299,15 @@
     <ClInclude Include="PhantomSensor\Memory\SectionTracker.h" />
     <ClInclude Include="PhantomSensor\Memory\ShellcodeDetector.h" />
     <ClInclude Include="PhantomSensor\Memory\VadTracker.h" />
+    <ClInclude Include="PhantomSensor\Network\C2Detection.h" />
+    <ClInclude Include="PhantomSensor\Network\ConnectionTracker.h" />
+    <ClInclude Include="PhantomSensor\Network\DataExfiltration.h" />
+    <ClInclude Include="PhantomSensor\Network\DnsMonitor.h" />
+    <ClInclude Include="PhantomSensor\Network\NetworkFilter.h" />
+    <ClInclude Include="PhantomSensor\Network\NetworkReputation.h" />
+    <ClInclude Include="PhantomSensor\Network\PortScanner.h" />
+    <ClInclude Include="PhantomSensor\Network\ProtocolParser.h" />
+    <ClInclude Include="PhantomSensor\Network\SSLInspection.h" />
     <ClInclude Include="PhantomSensor\Objects\ObjectNamespace.h" />
     <ClInclude Include="PhantomSensor\Performance\BatchProcessing.h" />
     <ClInclude Include="PhantomSensor\Performance\CacheOptimization.h" />
@@ -265,6 +315,14 @@
     <ClInclude Include="PhantomSensor\Performance\PerformanceMonitor.h" />
     <ClInclude Include="PhantomSensor\Performance\ResourceThrottling.h" />
     <ClInclude Include="PhantomSensor\Power\PowerCallback.h" />
+    <ClInclude Include="PhantomSensor\SelfProtection\AntiDebug.h" />
+    <ClInclude Include="PhantomSensor\SelfProtection\AntiUnload.h" />
+    <ClInclude Include="PhantomSensor\SelfProtection\CallbackProtection.h" />
+    <ClInclude Include="PhantomSensor\SelfProtection\FileProtection.h" />
+    <ClInclude Include="PhantomSensor\SelfProtection\FirmwareIntegrity.h" />
+    <ClInclude Include="PhantomSensor\SelfProtection\HandleProtection.h" />
+    <ClInclude Include="PhantomSensor\SelfProtection\IntegrityMonitor.h" />
+    <ClInclude Include="PhantomSensor\SelfProtection\SelfProtect.h" />
     <ClInclude Include="PhantomSensor\Sync\AsyncWorkQueue.h" />
     <ClInclude Include="PhantomSensor\Sync\DeferredProcedure.h" />
     <ClInclude Include="PhantomSensor\Sync\SpinLock.h" />
@@ -297,6 +355,12 @@
     <ClInclude Include="Shared\SharedDefs.h" />
     <ClInclude Include="Shared\TelemetryTypes.h" />
     <ClInclude Include="Shared\VerdictTypes.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="PhantomSensor\SelfProtection\FileProtection.c.bak" />
+    <None Include="PhantomSensor\SelfProtection\FileProtection.h.bak" />
+    <None Include="PhantomSensor\SelfProtection\HandleProtection.c.bak" />
+    <None Include="PhantomSensor\SelfProtection\HandleProtection.h.bak" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
