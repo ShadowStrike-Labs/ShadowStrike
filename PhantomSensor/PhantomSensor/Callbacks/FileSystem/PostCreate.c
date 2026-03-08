@@ -400,12 +400,14 @@ PocShutdown(
     InterlockedExchange(&g_PocState.ShutdownRequested, 1);
 
     //
-    // Delete lookaside lists
+    // Delete lookaside lists — mark unavailable FIRST to prevent
+    // in-flight PocFreeCompletionContext from using them after deletion
     //
     if (g_PocState.LookasideInitialized) {
+        g_PocState.LookasideInitialized = FALSE;
+        MemoryBarrier();
         ExDeleteNPagedLookasideList(&g_PocState.CompletionContextLookaside);
         ExDeleteNPagedLookasideList(&g_PocState.HandleContextLookaside);
-        g_PocState.LookasideInitialized = FALSE;
     }
 
     DbgPrintEx(
@@ -963,6 +965,7 @@ PocAllocateStreamContext(
 
     RtlZeroMemory(context, sizeof(SHADOWSTRIKE_STREAM_CONTEXT));
     context->Signature = POC_STREAM_CONTEXT_SIGNATURE;
+    context->SecurityCookie = PocComputeSecurityCookie(context);
     ExInitializePushLock(&context->Lock);
     KeQuerySystemTime(&context->ContextCreateTime);
     KeQuerySystemTime(&context->LastAccessTime);
@@ -2022,42 +2025,34 @@ PocpQueryVolumeSerial(
     )
 {
     NTSTATUS status;
-    FLT_VOLUME_PROPERTIES volumeProps;
+    UCHAR buffer[sizeof(FILE_FS_VOLUME_INFORMATION) + 256 * sizeof(WCHAR)];
+    PFILE_FS_VOLUME_INFORMATION volumeInfo;
     ULONG bytesReturned;
 
     PAGED_CODE();
 
     *OutSerial = 0;
 
-    if (FltObjects->Volume == NULL) {
+    if (FltObjects->Instance == NULL || FltObjects->FileObject == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    status = FltGetVolumeProperties(
-        FltObjects->Volume,
-        &volumeProps,
-        sizeof(volumeProps),
+    volumeInfo = (PFILE_FS_VOLUME_INFORMATION)buffer;
+
+    status = FltQueryVolumeInformationFile(
+        FltObjects->Instance,
+        FltObjects->FileObject,
+        volumeInfo,
+        sizeof(buffer),
+        FileFsVolumeInformation,
         &bytesReturned
         );
 
-    if (!NT_SUCCESS(status)) {
-        //
-        // Some volumes don't support this - not fatal
-        //
-        return status;
+    if (NT_SUCCESS(status)) {
+        *OutSerial = volumeInfo->VolumeSerialNumber;
     }
 
-    //
-    // Volume serial is not directly in FLT_VOLUME_PROPERTIES
-    // We need to query FILE_FS_VOLUME_INFORMATION for the actual serial
-    // For now, use a hash of the volume GUID or device name as a stable identifier
-    //
-    // Fallback: use volume object pointer as pseudo-serial
-    // This is stable for the duration of mount
-    //
-    *OutSerial = (ULONG)((ULONG_PTR)FltObjects->Volume & 0xFFFFFFFF);
-
-    return STATUS_SUCCESS;
+    return status;
 }
 
 

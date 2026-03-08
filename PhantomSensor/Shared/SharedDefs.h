@@ -152,6 +152,14 @@
 // STREAM CONTEXT
 // ============================================================================
 
+//
+// Guard against redefinition.
+// PostCreate.h defines a full-featured version of this struct.
+// When both headers are included, the first definition wins.
+//
+#ifndef _SHADOWSTRIKE_STREAM_CONTEXT_DEFINED_
+#define _SHADOWSTRIKE_STREAM_CONTEXT_DEFINED_
+
 /**
  * @brief Stream context structure for per-file tracking.
  */
@@ -184,6 +192,8 @@ typedef struct _SHADOWSTRIKE_STREAM_CONTEXT {
     ULONG Reserved2;
 
 } SHADOWSTRIKE_STREAM_CONTEXT, *PSHADOWSTRIKE_STREAM_CONTEXT;
+
+#endif // _SHADOWSTRIKE_STREAM_CONTEXT_DEFINED_
 
 // ============================================================================
 // TIMEOUTS AND LIMITS
