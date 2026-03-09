@@ -39,7 +39,10 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
+#include <inaddr.h>
+#include <in6addr.h>
 #include "../../Shared/NetworkTypes.h"
 
 //=============================================================================

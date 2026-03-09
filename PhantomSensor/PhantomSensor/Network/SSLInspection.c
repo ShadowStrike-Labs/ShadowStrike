@@ -46,7 +46,10 @@
     Copyright (c) ShadowStrike Team
 --*/
 
+#pragma warning(push)
+#pragma warning(disable: 4324)
 #include "SSLInspection.h"
+#pragma warning(pop)
 #include "../Utilities/HashUtils.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
@@ -54,7 +57,7 @@
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, SslInitialize)
+#pragma alloc_text(PAGE, SslInitialize)
 #pragma alloc_text(PAGE, SslShutdown)
 #pragma alloc_text(PAGE, SslInspectClientHello)
 #pragma alloc_text(PAGE, SslInspectServerHello)
@@ -286,6 +289,16 @@ SslpReadNetworkUShort(
 {
     return (USHORT)((Buffer[0] << 8) | Buffer[1]);
 }
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, SslpParseClientHello)
+#pragma alloc_text(PAGE, SslpParseServerHello)
+#pragma alloc_text(PAGE, SslpBuildJA3String)
+#pragma alloc_text(PAGE, SslpBuildJA3SString)
+#pragma alloc_text(PAGE, SslpAnalyzeSuspicion)
+#pragma alloc_text(PAGE, SslpSnapshotSession)
+#pragma alloc_text(PAGE, SslpCheckKnownJA3)
+#endif
 
 static FORCEINLINE ULONG
 SslpReadNetworkUInt24(
@@ -1202,6 +1215,8 @@ SslpParseClientHello(
     USHORT ExtLength;
     ULONG i;
 
+    PAGED_CODE();
+
     RtlZeroMemory(Parsed, sizeof(SSL_PARSED_CLIENT_HELLO));
 
     if (DataSize < sizeof(TLS_RECORD_HEADER)) {
@@ -1218,6 +1233,22 @@ SslpParseClientHello(
         RecordHeader->VersionMinor);
 
     Current = Buffer + sizeof(TLS_RECORD_HEADER);
+
+    //
+    // Validate TLS record length against actual buffer.
+    // Record header Length is network byte order and declares payload size.
+    //
+    {
+        USHORT RecordPayloadLength = SslpReadNetworkUShort(Buffer + 3);
+        if ((ULONG)sizeof(TLS_RECORD_HEADER) + RecordPayloadLength > DataSize) {
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+        //
+        // Constrain effective end to TLS record boundary — prevents
+        // parsing trailing data that is not part of this record.
+        //
+        BufferEnd = Buffer + sizeof(TLS_RECORD_HEADER) + RecordPayloadLength;
+    }
 
     // Parse handshake header
     if (Current + 4 > BufferEnd) {
@@ -1273,11 +1304,19 @@ SslpParseClientHello(
     CipherSuitesLength = SslpReadNetworkUShort(Current);
     Current += 2;
 
+    //
+    // TLS spec: cipher_suites field must be even (2 bytes per suite).
+    // Odd length indicates malformed ClientHello.
+    //
+    if (CipherSuitesLength & 1) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     if (Current + CipherSuitesLength > BufferEnd) {
         return STATUS_INVALID_BUFFER_SIZE;
     }
 
-    for (i = 0; i < CipherSuitesLength / 2 &&
+    for (i = 0; i < (ULONG)(CipherSuitesLength / 2) &&
          Parsed->CipherSuiteCount < SSL_MAX_CIPHER_SUITES; i++) {
 
         USHORT CipherSuite = SslpReadNetworkUShort(Current + i * 2);
@@ -1443,6 +1482,8 @@ SslpParseServerHello(
     USHORT ExtType;
     USHORT ExtLength;
 
+    PAGED_CODE();
+
     RtlZeroMemory(Parsed, sizeof(SSL_PARSED_SERVER_HELLO));
 
     if (DataSize < sizeof(TLS_RECORD_HEADER)) {
@@ -1459,6 +1500,17 @@ SslpParseServerHello(
         RecordHeader->VersionMinor);
 
     Current = Buffer + sizeof(TLS_RECORD_HEADER);
+
+    //
+    // Validate TLS record length against actual buffer.
+    //
+    {
+        USHORT RecordPayloadLength = SslpReadNetworkUShort(Buffer + 3);
+        if ((ULONG)sizeof(TLS_RECORD_HEADER) + RecordPayloadLength > DataSize) {
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+        BufferEnd = Buffer + sizeof(TLS_RECORD_HEADER) + RecordPayloadLength;
+    }
 
     if (Current + 4 > BufferEnd) {
         return STATUS_INVALID_BUFFER_SIZE;
@@ -1563,9 +1615,11 @@ SslpBuildJA3String(
 {
     NTSTATUS Status;
     ULONG Offset = 0;
-    ULONG Remaining = BufferSize;
+    size_t Remaining = (size_t)BufferSize;
     ULONG i;
     USHORT Version;
+
+    PAGED_CODE();
 
     if (BufferSize < 32) {
         return STATUS_BUFFER_TOO_SMALL;
@@ -1592,7 +1646,7 @@ SslpBuildJA3String(
         Buffer + Offset, Remaining, NULL, &Remaining, 0,
         "%u,", Version);
     if (!NT_SUCCESS(Status)) return Status;
-    Offset = BufferSize - Remaining;
+    Offset = BufferSize - (ULONG)Remaining;
 
     // Write cipher suites
     for (i = 0; i < Parsed->CipherSuiteCount; i++) {
@@ -1600,14 +1654,16 @@ SslpBuildJA3String(
             Buffer + Offset, Remaining, NULL, &Remaining, 0,
             i == 0 ? "%u" : "-%u", Parsed->CipherSuites[i]);
         if (!NT_SUCCESS(Status)) break;
-        Offset = BufferSize - Remaining;
+        Offset = BufferSize - (ULONG)Remaining;
     }
+
+    if (!NT_SUCCESS(Status)) return Status;
 
     // Separator
     Status = RtlStringCbPrintfExA(
         Buffer + Offset, Remaining, NULL, &Remaining, 0, ",");
     if (!NT_SUCCESS(Status)) return Status;
-    Offset = BufferSize - Remaining;
+    Offset = BufferSize - (ULONG)Remaining;
 
     // Write extensions
     for (i = 0; i < Parsed->ExtensionCount; i++) {
@@ -1615,14 +1671,16 @@ SslpBuildJA3String(
             Buffer + Offset, Remaining, NULL, &Remaining, 0,
             i == 0 ? "%u" : "-%u", Parsed->Extensions[i]);
         if (!NT_SUCCESS(Status)) break;
-        Offset = BufferSize - Remaining;
+        Offset = BufferSize - (ULONG)Remaining;
     }
+
+    if (!NT_SUCCESS(Status)) return Status;
 
     // Separator
     Status = RtlStringCbPrintfExA(
         Buffer + Offset, Remaining, NULL, &Remaining, 0, ",");
     if (!NT_SUCCESS(Status)) return Status;
-    Offset = BufferSize - Remaining;
+    Offset = BufferSize - (ULONG)Remaining;
 
     // Write supported groups
     for (i = 0; i < Parsed->SupportedGroupCount; i++) {
@@ -1630,14 +1688,16 @@ SslpBuildJA3String(
             Buffer + Offset, Remaining, NULL, &Remaining, 0,
             i == 0 ? "%u" : "-%u", Parsed->SupportedGroups[i]);
         if (!NT_SUCCESS(Status)) break;
-        Offset = BufferSize - Remaining;
+        Offset = BufferSize - (ULONG)Remaining;
     }
+
+    if (!NT_SUCCESS(Status)) return Status;
 
     // Separator
     Status = RtlStringCbPrintfExA(
         Buffer + Offset, Remaining, NULL, &Remaining, 0, ",");
     if (!NT_SUCCESS(Status)) return Status;
-    Offset = BufferSize - Remaining;
+    Offset = BufferSize - (ULONG)Remaining;
 
     // Write EC point formats
     for (i = 0; i < Parsed->ECPointFormatCount; i++) {
@@ -1645,8 +1705,10 @@ SslpBuildJA3String(
             Buffer + Offset, Remaining, NULL, &Remaining, 0,
             i == 0 ? "%u" : "-%u", Parsed->ECPointFormats[i]);
         if (!NT_SUCCESS(Status)) break;
-        Offset = BufferSize - Remaining;
+        Offset = BufferSize - (ULONG)Remaining;
     }
+
+    if (!NT_SUCCESS(Status)) return Status;
 
     return STATUS_SUCCESS;
 }
@@ -1667,9 +1729,11 @@ SslpBuildJA3SString(
 {
     NTSTATUS Status;
     ULONG Offset = 0;
-    ULONG Remaining = BufferSize;
+    size_t Remaining = (size_t)BufferSize;
     ULONG i;
     USHORT Version;
+
+    PAGED_CODE();
 
     if (BufferSize < 32) {
         return STATUS_BUFFER_TOO_SMALL;
@@ -1685,14 +1749,14 @@ SslpBuildJA3SString(
         Buffer + Offset, Remaining, NULL, &Remaining, 0,
         "%u,", Version);
     if (!NT_SUCCESS(Status)) return Status;
-    Offset = BufferSize - Remaining;
+    Offset = BufferSize - (ULONG)Remaining;
 
     // Write cipher suite
     Status = RtlStringCbPrintfExA(
         Buffer + Offset, Remaining, NULL, &Remaining, 0,
         "%u,", Parsed->CipherSuite);
     if (!NT_SUCCESS(Status)) return Status;
-    Offset = BufferSize - Remaining;
+    Offset = BufferSize - (ULONG)Remaining;
 
     // Write extensions
     for (i = 0; i < Parsed->ExtensionCount; i++) {
@@ -1700,7 +1764,7 @@ SslpBuildJA3SString(
             Buffer + Offset, Remaining, NULL, &Remaining, 0,
             i == 0 ? "%u" : "-%u", Parsed->Extensions[i]);
         if (!NT_SUCCESS(Status)) break;
-        Offset = BufferSize - Remaining;
+        Offset = BufferSize - (ULONG)Remaining;
     }
 
     return STATUS_SUCCESS;
@@ -1720,6 +1784,8 @@ SslpAnalyzeSuspicion(
     ULONG i;
     USHORT MaxVersion;
     BOOLEAN HasWeakCipher = FALSE;
+
+    PAGED_CODE();
 
     MaxVersion = (USHORT)ClientHello->Version;
 
@@ -1784,11 +1850,13 @@ SslpSnapshotSession(
     _Out_ PSSL_SESSION_INFO Info
     )
 {
+    PAGED_CODE();
+
     RtlZeroMemory(Info, sizeof(SSL_SESSION_INFO));
 
     Info->SessionId = Session->SessionId;
     Info->ProcessId = Session->ProcessId;
-    Info->RemoteAddress = Session->RemoteAddress;
+    RtlCopyMemory(&Info->RemoteAddress, &Session->RemoteAddress, sizeof(Info->RemoteAddress));
     Info->RemotePort = Session->RemotePort;
     Info->IsIPv6 = Session->IsIPv6;
     Info->Version = Session->Version;
@@ -1817,6 +1885,8 @@ SslpCheckKnownJA3(
 {
     PLIST_ENTRY Entry;
     PSSL_BAD_JA3_ENTRY BadEntry;
+
+    PAGED_CODE();
 
     *IsBad = FALSE;
     MalwareFamily[0] = '\0';
