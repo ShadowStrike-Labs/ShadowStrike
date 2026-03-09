@@ -33,9 +33,9 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
-#include <ntstrsafe.h>
 #include "../../Shared/NetworkTypes.h"
+#include <inaddr.h>
+#include <in6addr.h>
 
 //=============================================================================
 // Pool Tags

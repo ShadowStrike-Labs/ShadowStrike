@@ -53,7 +53,12 @@
     Copyright (c) ShadowStrike Team
 --*/
 
+#pragma warning(push)
+#pragma warning(disable: 4324) // structure was padded due to alignment specifier
 #include "PortScanner.h"
+#pragma warning(pop)
+
+#include <ntstrsafe.h>
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
 #include "../Tracing/Trace.h"
@@ -257,6 +262,27 @@ typedef struct _SSPS_SOURCE_CONTEXT {
 // Forward Declarations
 //=============================================================================
 
+static PSSPS_HASH_TABLE
+SspsAllocHashTable(
+    _In_ ULONG BucketCount,
+    _In_ ULONG Tag
+    );
+
+static VOID
+SspsFreePortHash(
+    _In_ PSSPS_HASH_TABLE Table
+    );
+
+static VOID
+SspsFreeHostHash(
+    _In_ PSSPS_HASH_TABLE Table
+    );
+
+static VOID
+SspsFreeSourceContext(
+    _In_ PSSPS_SOURCE_CONTEXT Source
+    );
+
 static PSSPS_SOURCE_CONTEXT
 SspsFindOrCreateSource(
     _In_ PSSPS_DETECTOR Detector,
@@ -335,6 +361,30 @@ static KDEFERRED_ROUTINE SspsCleanupTimerDpc;
 
 static IO_WORKITEM_ROUTINE SspsCleanupWorkItemRoutine;
 
+//
+// Page section for all private functions that run at PASSIVE_LEVEL.
+// EXCLUDES: SspsCleanupTimerDpc (DISPATCH_LEVEL)
+// EXCLUDES: FORCEINLINE functions (no discrete function body)
+//
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, SspsAllocHashTable)
+#pragma alloc_text(PAGE, SspsFreePortHash)
+#pragma alloc_text(PAGE, SspsFreeHostHash)
+#pragma alloc_text(PAGE, SspsFreeSourceContext)
+#pragma alloc_text(PAGE, SspsFindOrCreateSource)
+#pragma alloc_text(PAGE, SspsReleaseSource)
+#pragma alloc_text(PAGE, SspsRecordUniquePort)
+#pragma alloc_text(PAGE, SspsRecordUniqueHost)
+#pragma alloc_text(PAGE, SspsCleanupExpiredRecords)
+#pragma alloc_text(PAGE, SspsAnalyzeScanBehavior)
+#pragma alloc_text(PAGE, SspsDetermineScanType)
+#pragma alloc_text(PAGE, SspsCalculateConfidence)
+#pragma alloc_text(PAGE, SspsGetProcessInfo)
+#pragma alloc_text(PAGE, SspsClassifyTcpFlags)
+#pragma alloc_text(PAGE, SspsSnapshotWindowStats)
+#pragma alloc_text(PAGE, SspsCleanupWorkItemRoutine)
+#endif
+
 //=============================================================================
 // Hash Table Helpers
 //=============================================================================
@@ -349,6 +399,8 @@ SspsAllocHashTable(
     PSSPS_HASH_TABLE Table;
     SIZE_T Size;
     ULONG i;
+
+    PAGED_CODE();
 
     Size = FIELD_OFFSET(SSPS_HASH_TABLE, Buckets) +
            (SIZE_T)BucketCount * sizeof(LIST_ENTRY);
@@ -429,6 +481,9 @@ SspsFreePortHash(
     )
 {
     ULONG i;
+
+    PAGED_CODE();
+
     if (Table == NULL) return;
 
     for (i = 0; i < Table->BucketCount; i++) {
@@ -452,6 +507,9 @@ SspsFreeHostHash(
     )
 {
     ULONG i;
+
+    PAGED_CODE();
+
     if (Table == NULL) return;
 
     for (i = 0; i < Table->BucketCount; i++) {
@@ -475,6 +533,8 @@ SspsFreeSourceContext(
     _In_ PSSPS_SOURCE_CONTEXT Source
     )
 {
+    PAGED_CODE();
+
     // Free connection records
     while (!IsListEmpty(&Source->ConnectionList)) {
         PLIST_ENTRY Entry = RemoveHeadList(&Source->ConnectionList);
@@ -640,11 +700,14 @@ Routine Description:
     KeFlushQueuedDpcs();
 
     //
-    // Phase 3: Wait for all active operations to drain
+    // Phase 3: Wait for all active operations to drain.
+    // KeClearEvent BEFORE the check prevents a TOCTOU where the last
+    // operation's KeSetEvent fires between the check and KeClearEvent,
+    // which would lose the signal and block until timeout.
     //
+    KeClearEvent(&Detector->DrainEvent);
     Timeout.QuadPart = -((LONGLONG)SSPS_SHUTDOWN_DRAIN_TIMEOUT_MS * 10000);
     if (InterlockedCompareExchange(&Detector->ActiveOperations, 0, 0) > 0) {
-        KeClearEvent(&Detector->DrainEvent);
         KeWaitForSingleObject(
             &Detector->DrainEvent,
             Executive,
@@ -703,7 +766,6 @@ Routine Description:
     PSSPS_SOURCE_CONTEXT Source;
     PSSPS_CONNECTION_RECORD Record;
     LARGE_INTEGER CurrentTime;
-    NTSTATUS Status = STATUS_SUCCESS;
 
     PAGED_CODE();
 
@@ -1048,6 +1110,8 @@ Routine Description:
     PSSPS_SOURCE_CONTEXT NewSource = NULL;
     BOOLEAN Found = FALSE;
 
+    PAGED_CODE();
+
     //
     // Phase 1: Shared-lock lookup
     //
@@ -1164,6 +1228,8 @@ SspsReleaseSource(
     _In_ PSSPS_SOURCE_CONTEXT Source
     )
 {
+    PAGED_CODE();
+
     UNREFERENCED_PARAMETER(Detector);
 
     if (Source != NULL) {
@@ -1194,6 +1260,8 @@ Routine Description:
     PSSPS_PORT_ENTRY NewEntry = NULL;
     BOOLEAN Found = FALSE;
     LARGE_INTEGER CurrentTime;
+
+    PAGED_CODE();
 
     KeQuerySystemTime(&CurrentTime);
 
@@ -1259,6 +1327,8 @@ Routine Description:
     PSSPS_HOST_ENTRY NewEntry = NULL;
     BOOLEAN Found = FALSE;
     LARGE_INTEGER CurrentTime;
+
+    PAGED_CODE();
 
     if (Address == NULL) {
         return;
@@ -1342,6 +1412,8 @@ Routine Description:
     LONGLONG WindowTicks = (LONGLONG)WindowMs * 10000;
     LONGLONG Cutoff = CurrentTime->QuadPart - WindowTicks;
     ULONG i;
+
+    PAGED_CODE();
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Source->ConnectionLock);
@@ -1466,6 +1538,8 @@ Routine Description:
     Must be called while holding Source->ConnectionLock exclusively.
 --*/
 {
+    PAGED_CODE();
+
     //
     // NULL scan: no flags set
     //
@@ -1516,6 +1590,8 @@ Routine Description:
     This ensures the aggregate view is consistent (no torn reads between fields).
 --*/
 {
+    PAGED_CODE();
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Source->ConnectionLock);
 
@@ -1558,6 +1634,8 @@ Routine Description:
     SSPS_SCAN_TYPE ScanType;
     ULONG CommonPortHits;
     ULONG i;
+
+    PAGED_CODE();
 
     RtlZeroMemory(Result, sizeof(SSPS_DETECTION_RESULT));
 
@@ -1733,6 +1811,8 @@ SspsDetermineScanType(
     _In_ PSSPS_WINDOW_SNAPSHOT Snap
     )
 {
+    PAGED_CODE();
+
     if (Snap->TotalConnections == 0) {
         return SsPsScan_Unknown;
     }
@@ -1777,6 +1857,8 @@ SspsCalculateConfidence(
 {
     ULONG Score = 0;
     ULONG FailureRate;
+
+    PAGED_CODE();
 
     //
     // Unique ports
@@ -1866,6 +1948,8 @@ Routine Description:
     PEPROCESS Process = NULL;
     NTSTATUS Status;
     PUNICODE_STRING ImageFileName = NULL;
+
+    PAGED_CODE();
 
     ProcessName[0] = L'\0';
     ProcessPath[0] = L'\0';
@@ -1975,6 +2059,11 @@ Routine Description:
     Work item callback — runs at PASSIVE_LEVEL.
     Safely acquires push locks, walks the source list, and removes
     expired source contexts with zero reference count.
+
+    CRITICAL: Participates in the operation drain via SspsAcquireOperation/
+    SspsReleaseOperation. This ensures SsPsShutdown waits for this work item
+    to complete before freeing the Detector structure, preventing a
+    use-after-free on Detector->CleanupRunning.
 --*/
 {
     PSSPS_DETECTOR Detector = (PSSPS_DETECTOR)Context;
@@ -1985,14 +2074,19 @@ Routine Description:
     LONGLONG ExpiryTicks = (LONGLONG)SSPS_SOURCE_EXPIRY_MS * 10000;
     LIST_ENTRY ExpiredList;
 
+    PAGED_CODE();
+
     UNREFERENCED_PARAMETER(DeviceObject);
 
     if (Detector == NULL) {
         return;
     }
 
-    if (InterlockedCompareExchange(&Detector->Initialized, 0, 0) == 0 ||
-        InterlockedCompareExchange(&Detector->ShuttingDown, 0, 0) != 0) {
+    //
+    // Acquire operation guard so shutdown drain waits for us.
+    // If shutdown is already in progress, exit immediately.
+    //
+    if (!SspsAcquireOperation(Detector)) {
         InterlockedExchange(&Detector->CleanupRunning, 0);
         return;
     }
@@ -2039,4 +2133,5 @@ Routine Description:
     }
 
     InterlockedExchange(&Detector->CleanupRunning, 0);
+    SspsReleaseOperation(Detector);
 }
