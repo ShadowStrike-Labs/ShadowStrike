@@ -45,7 +45,10 @@
  * ============================================================================
  */
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include "ProtocolParser.h"
+#pragma warning(pop)
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
@@ -54,6 +57,11 @@
 #pragma alloc_text(PAGE, PpParseHTTPRequest)
 #pragma alloc_text(PAGE, PpParseHTTPResponse)
 #pragma alloc_text(PAGE, PpParseDNSPacket)
+#pragma alloc_text(PAGE, PpFreeHTTPRequest)
+#pragma alloc_text(PAGE, PpFreeHTTPResponse)
+#pragma alloc_text(PAGE, PpFreeDNSPacket)
+#pragma alloc_text(PAGE, PpExtractHostFromRequest)
+#pragma alloc_text(PAGE, PpExtractURLFromRequest)
 #endif
 
 // ============================================================================
@@ -92,13 +100,19 @@ static const ULONG g_HttpMethodLengths[] = {
 static const CHAR* g_SuspiciousUriPatterns[] = {
     "..%2f",                    // Path traversal (URL-encoded /)
     "..%5c",                    // Path traversal (URL-encoded \)
+    "../",                      // Path traversal (non-encoded)
+    "..\\",                     // Path traversal (Windows backslash)
+    "%252f",                    // Double-encoded path traversal
     "%00",                      // Null byte injection
     "<script",                  // XSS attempt
-    "UNION%20SELECT",           // SQL injection
-    "%27OR%20",                 // SQL injection (encoded ')
+    "union%20select",           // SQL injection
+    "%27or%20",                 // SQL injection (encoded ')
     "/etc/passwd",              // LFI attempt
     "cmd.exe",                  // RCE attempt
     "powershell%20",            // RCE attempt
+    "eval(",                    // Code injection
+    "/bin/sh",                  // Unix RCE
+    "/bin/bash",                // Unix RCE
     NULL
 };
 
@@ -183,7 +197,7 @@ PppSafeStrLen(
 
 static NTSTATUS
 PppParseDnsName(
-    _In_reads_bytes_(PacketSize) PCUCHAR Packet,
+    _In_reads_bytes_(PacketSize) const UCHAR* Packet,
     _In_ ULONG PacketSize,
     _In_ ULONG Offset,
     _Out_writes_z_(NameBufferSize) PSTR NameBuffer,
@@ -198,12 +212,26 @@ PppSafeBoundedSearch(
     _In_z_ PCSTR Needle
     );
 
+static BOOLEAN
+PppSafeBoundedSearchInsensitive(
+    _In_reads_bytes_(HaystackLen) PCSTR Haystack,
+    _In_ ULONG HaystackLen,
+    _In_z_ PCSTR Needle
+    );
+
 static NTSTATUS
 PppParseUlongBounded(
     _In_reads_bytes_(MaxLen) PCSTR String,
     _In_ ULONG MaxLen,
     _In_ ULONG MaxValue,
     _Out_ PULONG Result
+    );
+
+static BOOLEAN
+PppStrEqualInsensitive(
+    _In_z_ PCSTR A,
+    _In_ ULONG AMaxLen,
+    _In_z_ PCSTR B
     );
 
 // Rundown helpers
@@ -228,6 +256,33 @@ PppUntrackAllocation(
     _In_ PPP_PARSER Parser
     );
 
+// -----------------------------------------------------------------------
+// alloc_text for private functions — MUST appear AFTER forward declarations
+// (MSVC C2157: referenced before pragma alloc_text)
+// NOTE: PppIsHttpMethod, PppIsHttpResponse are called from DISPATCH_LEVEL
+//       (PpIsHTTPData) and must NOT be placed in PAGE section.
+// -----------------------------------------------------------------------
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, PppAcquireRundown)
+#pragma alloc_text(PAGE, PppReleaseRundown)
+#pragma alloc_text(PAGE, PppTrackAllocation)
+#pragma alloc_text(PAGE, PppUntrackAllocation)
+#pragma alloc_text(PAGE, PppParseRequestLine)
+#pragma alloc_text(PAGE, PppParseStatusLine)
+#pragma alloc_text(PAGE, PppParseHeaders)
+#pragma alloc_text(PAGE, PppExtractCommonRequestHeaders)
+#pragma alloc_text(PAGE, PppExtractCommonResponseHeaders)
+#pragma alloc_text(PAGE, PppCalculateSuspicionScore)
+#pragma alloc_text(PAGE, PppFindLineEnd)
+#pragma alloc_text(PAGE, PppTrimWhitespace)
+#pragma alloc_text(PAGE, PppSafeStrLen)
+#pragma alloc_text(PAGE, PppSafeBoundedSearch)
+#pragma alloc_text(PAGE, PppSafeBoundedSearchInsensitive)
+#pragma alloc_text(PAGE, PppParseUlongBounded)
+#pragma alloc_text(PAGE, PppParseDnsName)
+#pragma alloc_text(PAGE, PppStrEqualInsensitive)
+#endif
+
 // ============================================================================
 // PRIVATE - RUNDOWN + ALLOCATION TRACKING
 // ============================================================================
@@ -237,6 +292,7 @@ PppAcquireRundown(
     _In_ PPP_PARSER Parser
     )
 {
+    PAGED_CODE();
     return ExAcquireRundownProtection(&Parser->RundownRef);
 }
 
@@ -245,6 +301,7 @@ PppReleaseRundown(
     _In_ PPP_PARSER Parser
     )
 {
+    PAGED_CODE();
     ExReleaseRundownProtection(&Parser->RundownRef);
 }
 
@@ -673,6 +730,8 @@ PpFreeHTTPRequest(
     _In_opt_ _Post_invalid_ PPP_HTTP_REQUEST Request
     )
 {
+    PAGED_CODE();
+
     if (Request != NULL) {
         if (Request->Body != NULL) {
             ExFreePoolWithTag(Request->Body, PP_POOL_TAG_BODY);
@@ -691,6 +750,8 @@ PpFreeHTTPResponse(
     _In_opt_ _Post_invalid_ PPP_HTTP_RESPONSE Response
     )
 {
+    PAGED_CODE();
+
     if (Response != NULL) {
         if (Response->Body != NULL) {
             ExFreePoolWithTag(Response->Body, PP_POOL_TAG_BODY);
@@ -716,7 +777,7 @@ PpParseDNSPacket(
 {
     NTSTATUS status = STATUS_SUCCESS;
     PPP_DNS_PACKET packet = NULL;
-    PCUCHAR data = (PCUCHAR)Data;
+    const UCHAR* data = (const UCHAR*)Data;
     ULONG offset = PP_DNS_HEADER_SIZE;
     ULONG bytesConsumed = 0;
     ULONG i;
@@ -942,6 +1003,8 @@ PpFreeDNSPacket(
     _In_opt_ _Post_invalid_ PPP_DNS_PACKET Packet
     )
 {
+    PAGED_CODE();
+
     if (Packet != NULL) {
         ExFreePoolWithTag(Packet, PP_POOL_TAG_HEADER);
     }
@@ -984,7 +1047,7 @@ PpIsDNSData(
     _In_ ULONG DataSize
     )
 {
-    PCUCHAR data = (PCUCHAR)Data;
+    const UCHAR* data = (const UCHAR*)Data;
     USHORT flags;
     USHORT qdCount;
     USHORT opcode;
@@ -1021,6 +1084,8 @@ PpExtractHostFromRequest(
     _In_ ULONG HostSize
     )
 {
+    PAGED_CODE();
+
     if (Request == NULL || Host == NULL || HostSize == 0) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1044,6 +1109,8 @@ PpExtractURLFromRequest(
     )
 {
     NTSTATUS status;
+
+    PAGED_CODE();
 
     if (Request == NULL || URL == NULL || URLSize == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -1177,6 +1244,8 @@ PppFindLineEnd(
 {
     ULONG i;
 
+    PAGED_CODE();
+
     *LineLength = 0;
     *LineEnd = NULL;
 
@@ -1209,6 +1278,8 @@ PppParseRequestLine(
     ULONG uriLength;
     ULONG versionLength;
     NTSTATUS status;
+
+    PAGED_CODE();
 
     *BytesConsumed = 0;
 
@@ -1292,6 +1363,8 @@ PppParseStatusLine(
     PCSTR reasonStart;
     ULONG reasonLength;
     NTSTATUS status;
+
+    PAGED_CODE();
 
     *BytesConsumed = 0;
 
@@ -1379,6 +1452,8 @@ PppParseHeaders(
     PCSTR end = Data + DataSize;
     ULONG count = 0;
     ULONG totalConsumed = 0;
+
+    PAGED_CODE();
 
     *HeaderCount = 0;
     *BytesConsumed = 0;
@@ -1483,6 +1558,8 @@ PppStrEqualInsensitive(
     ULONG bLen = 0;
     ULONG aLen = PppSafeStrLen(A, AMaxLen);
 
+    PAGED_CODE();
+
     // Get B length (B is a compile-time constant — bounded)
     for (bLen = 0; B[bLen] != '\0'; bLen++) {}
 
@@ -1512,6 +1589,8 @@ PppExtractCommonRequestHeaders(
     )
 {
     ULONG i;
+
+    PAGED_CODE();
 
     for (i = 0; i < Request->HeaderCount; i++) {
         if (PppStrEqualInsensitive(Request->Headers[i].Name,
@@ -1567,6 +1646,8 @@ PppExtractCommonResponseHeaders(
 {
     ULONG i;
 
+    PAGED_CODE();
+
     for (i = 0; i < Response->HeaderCount; i++) {
         if (PppStrEqualInsensitive(Response->Headers[i].Name,
                                    PP_MAX_HEADER_NAME_LENGTH, "Content-Type")) {
@@ -1612,6 +1693,8 @@ PppCalculateSuspicionScore(
     ULONG uaLen;
     ULONG uriLen;
 
+    PAGED_CODE();
+
     //
     // Check User-Agent
     //
@@ -1630,7 +1713,7 @@ PppCalculateSuspicionScore(
     uriLen = PppSafeStrLen(Request->URI, sizeof(Request->URI));
     if (uriLen > 0) {
         for (i = 0; g_SuspiciousUriPatterns[i] != NULL; i++) {
-            if (PppSafeBoundedSearch(Request->URI, uriLen,
+            if (PppSafeBoundedSearchInsensitive(Request->URI, uriLen,
                                      g_SuspiciousUriPatterns[i])) {
                 score += 30;
                 break;
@@ -1676,6 +1759,8 @@ PppTrimWhitespace(
     PSTR end;
     PSTR start = String;
 
+    PAGED_CODE();
+
     if (String == NULL) {
         return;
     }
@@ -1711,6 +1796,8 @@ PppSafeStrLen(
 {
     ULONG i;
 
+    PAGED_CODE();
+
     for (i = 0; i < MaxLen; i++) {
         if (String[i] == '\0') {
             return i;
@@ -1736,6 +1823,8 @@ PppSafeBoundedSearch(
     ULONG needleLen = 0;
     ULONG i, j;
 
+    PAGED_CODE();
+
     // Get needle length
     for (needleLen = 0; Needle[needleLen] != '\0'; needleLen++) {}
 
@@ -1760,7 +1849,52 @@ PppSafeBoundedSearch(
 }
 
 /**
- * @brief Parse a decimal ULONG from a bounded string with overflow protection.
+ * @brief Case-insensitive bounded substring search.
+ *
+ * Like PppSafeBoundedSearch but compares ASCII letters case-insensitively.
+ * Essential for attack pattern detection — attackers trivially vary case
+ * to bypass exact-match filters (e.g., "union%20select" vs "UNION%20SELECT").
+ * Never reads past HaystackLen bytes.
+ */
+static BOOLEAN
+PppSafeBoundedSearchInsensitive(
+    _In_reads_bytes_(HaystackLen) PCSTR Haystack,
+    _In_ ULONG HaystackLen,
+    _In_z_ PCSTR Needle
+    )
+{
+    ULONG needleLen = 0;
+    ULONG i, j;
+
+    PAGED_CODE();
+
+    for (needleLen = 0; Needle[needleLen] != '\0'; needleLen++) {}
+
+    if (needleLen == 0 || needleLen > HaystackLen) {
+        return FALSE;
+    }
+
+    for (i = 0; i <= HaystackLen - needleLen; i++) {
+        BOOLEAN match = TRUE;
+        for (j = 0; j < needleLen; j++) {
+            CHAR h = Haystack[i + j];
+            CHAR n = Needle[j];
+            if (h >= 'A' && h <= 'Z') h += ('a' - 'A');
+            if (n >= 'A' && n <= 'Z') n += ('a' - 'A');
+            if (h != n) {
+                match = FALSE;
+                break;
+            }
+        }
+        if (match) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+/**
  *
  * Stops at first non-digit. Rejects values > MaxValue.
  * Replaces strtoul() for kernel safety.
@@ -1776,6 +1910,8 @@ PppParseUlongBounded(
     ULONG i;
     ULONG value = 0;
     ULONG digitCount = 0;
+
+    PAGED_CODE();
 
     *Result = 0;
 
@@ -1825,7 +1961,7 @@ PppParseUlongBounded(
 
 static NTSTATUS
 PppParseDnsName(
-    _In_reads_bytes_(PacketSize) PCUCHAR Packet,
+    _In_reads_bytes_(PacketSize) const UCHAR* Packet,
     _In_ ULONG PacketSize,
     _In_ ULONG Offset,
     _Out_writes_z_(NameBufferSize) PSTR NameBuffer,
@@ -1838,6 +1974,8 @@ PppParseDnsName(
     ULONG compressionDepth = 0;
     ULONG firstJumpOffset = 0;
     BOOLEAN jumped = FALSE;
+
+    PAGED_CODE();
 
     *BytesConsumed = 0;
     NameBuffer[0] = '\0';
