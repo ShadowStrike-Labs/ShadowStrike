@@ -41,9 +41,14 @@
 #ifndef SHADOWSTRIKE_NETWORK_FILTER_H
 #define SHADOWSTRIKE_NETWORK_FILTER_H
 
+#pragma warning(push)
+#pragma warning(disable:4201)   // nameless struct/union — ndis.h, fwpsk.h
+#pragma warning(disable:4324)   // structure padded due to __declspec(align())
 #include <fltKernel.h>
+#define NDIS_SUPPORT_NDIS650  1
+#include <ndis.h>
 #include <fwpsk.h>
-#include <fwpmk.h>
+#pragma warning(pop)
 #include "../../Shared/NetworkTypes.h"
 #include "../../Shared/BehaviorTypes.h"
 

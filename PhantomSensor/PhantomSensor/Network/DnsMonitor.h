@@ -115,7 +115,7 @@ typedef enum _DNS_SUSPICION {
     DnsSuspicion_KnownBad           = 0x00000200,
     DnsSuspicion_HomoglyphAttack    = 0x00000400,
     DnsSuspicion_Typosquatting      = 0x00000800,
-} DNS_SUSPICION;
+} DNS_SUSPICION, *PDNS_SUSPICION;
 
 //=============================================================================
 // Domain Reputation (named enum, not anonymous inside struct)
