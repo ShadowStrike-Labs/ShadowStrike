@@ -54,8 +54,11 @@
  * ============================================================================
  */
 
-#include <initguid.h>
+#pragma warning(push)
+#pragma warning(disable:4324)   // structure padded due to __declspec(align()) — fltKernel.h
 #include "NetworkFilter.h"
+#pragma warning(pop)
+
 #include "ConnectionTracker.h"
 #include "DnsMonitor.h"
 #include "C2Detection.h"
@@ -67,40 +70,46 @@
 #include <ip2string.h>
 
 // ============================================================================
-// GUID DEFINITIONS (INITGUID included above, so DEFINE_GUID emits storage)
+// GUID DEFINITIONS
 // ============================================================================
+//
+// Direct initialization avoids the INITGUID/DEFINE_GUID hazard: fwpmk.h has
+// NO include guard, so any re-inclusion after INITGUID creates duplicate
+// storage definitions (C2374). Using DECLSPEC_SELECTANY with direct
+// initializers is linker-safe and doesn't require INITGUID at all.
+//
 
 // {A5E8F2D1-3B4C-4D5E-9F6A-7B8C9D0E1F2A}
-DEFINE_GUID(SHADOWSTRIKE_WFP_PROVIDER_GUID,
-    0xa5e8f2d1, 0x3b4c, 0x4d5e, 0x9f, 0x6a, 0x7b, 0x8c, 0x9d, 0x0e, 0x1f, 0x2a);
+EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_WFP_PROVIDER_GUID =
+    {0xa5e8f2d1, 0x3b4c, 0x4d5e, {0x9f, 0x6a, 0x7b, 0x8c, 0x9d, 0x0e, 0x1f, 0x2a}};
 
 // {B6F9A3E2-4C5D-5E6F-A071-8C9D0E1F2A3B}
-DEFINE_GUID(SHADOWSTRIKE_WFP_SUBLAYER_GUID,
-    0xb6f9a3e2, 0x4c5d, 0x5e6f, 0xa0, 0x71, 0x8c, 0x9d, 0x0e, 0x1f, 0x2a, 0x3b);
+EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_WFP_SUBLAYER_GUID =
+    {0xb6f9a3e2, 0x4c5d, 0x5e6f, {0xa0, 0x71, 0x8c, 0x9d, 0x0e, 0x1f, 0x2a, 0x3b}};
 
 // {C7A0B4F3-5D6E-6F70-B182-9D0E1F2A3B4C}
-DEFINE_GUID(SHADOWSTRIKE_ALE_CONNECT_V4_CALLOUT_GUID,
-    0xc7a0b4f3, 0x5d6e, 0x6f70, 0xb1, 0x82, 0x9d, 0x0e, 0x1f, 0x2a, 0x3b, 0x4c);
+EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_ALE_CONNECT_V4_CALLOUT_GUID =
+    {0xc7a0b4f3, 0x5d6e, 0x6f70, {0xb1, 0x82, 0x9d, 0x0e, 0x1f, 0x2a, 0x3b, 0x4c}};
 
 // {D8B1C5A4-6E7F-7081-C293-0E1F2A3B4C5D}
-DEFINE_GUID(SHADOWSTRIKE_ALE_CONNECT_V6_CALLOUT_GUID,
-    0xd8b1c5a4, 0x6e7f, 0x7081, 0xc2, 0x93, 0x0e, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d);
+EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_ALE_CONNECT_V6_CALLOUT_GUID =
+    {0xd8b1c5a4, 0x6e7f, 0x7081, {0xc2, 0x93, 0x0e, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d}};
 
 // {E9C2D6B5-7F80-8192-D3A4-1F2A3B4C5D6E}
-DEFINE_GUID(SHADOWSTRIKE_ALE_RECV_ACCEPT_V4_CALLOUT_GUID,
-    0xe9c2d6b5, 0x7f80, 0x8192, 0xd3, 0xa4, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d, 0x6e);
+EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_ALE_RECV_ACCEPT_V4_CALLOUT_GUID =
+    {0xe9c2d6b5, 0x7f80, 0x8192, {0xd3, 0xa4, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d, 0x6e}};
 
 // {F0D3E7C6-8091-92A3-E4B5-2A3B4C5D6E7F}
-DEFINE_GUID(SHADOWSTRIKE_ALE_RECV_ACCEPT_V6_CALLOUT_GUID,
-    0xf0d3e7c6, 0x8091, 0x92a3, 0xe4, 0xb5, 0x2a, 0x3b, 0x4c, 0x5d, 0x6e, 0x7f);
+EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_ALE_RECV_ACCEPT_V6_CALLOUT_GUID =
+    {0xf0d3e7c6, 0x8091, 0x92a3, {0xe4, 0xb5, 0x2a, 0x3b, 0x4c, 0x5d, 0x6e, 0x7f}};
 
 // {01E4F8D7-91A2-A3B4-F5C6-3B4C5D6E7F80}
-DEFINE_GUID(SHADOWSTRIKE_OUTBOUND_TRANSPORT_V4_CALLOUT_GUID,
-    0x01e4f8d7, 0x91a2, 0xa3b4, 0xf5, 0xc6, 0x3b, 0x4c, 0x5d, 0x6e, 0x7f, 0x80);
+EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_OUTBOUND_TRANSPORT_V4_CALLOUT_GUID =
+    {0x01e4f8d7, 0x91a2, 0xa3b4, {0xf5, 0xc6, 0x3b, 0x4c, 0x5d, 0x6e, 0x7f, 0x80}};
 
 // {12F5A9E8-02B3-B4C5-A6D7-4C5D6E7F8091}
-DEFINE_GUID(SHADOWSTRIKE_STREAM_V4_CALLOUT_GUID,
-    0x12f5a9e8, 0x02b3, 0xb4c5, 0xa6, 0xd7, 0x4c, 0x5d, 0x6e, 0x7f, 0x80, 0x91);
+EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_STREAM_V4_CALLOUT_GUID =
+    {0x12f5a9e8, 0x02b3, 0xb4c5, {0xa6, 0xd7, 0x4c, 0x5d, 0x6e, 0x7f, 0x80, 0x91}};
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -121,6 +130,16 @@ DEFINE_GUID(SHADOWSTRIKE_STREAM_V4_CALLOUT_GUID,
 #define NF_MAX_PROCESS_PATH             512
 #define NF_MAX_PENDING_DNS              8192
 #define NF_DNS_HEADER_SIZE              12          // Minimum DNS header
+#define NF_MAX_DNS_PACKET_SIZE          65535       // Max DNS packet (TCP max)
+#define NF_FORCE_CLOSE_TIMEOUT_MS       1200000     // 20 min — force-close non-Closed stale connections
+
+#ifndef MAXUINT32
+#define MAXUINT32   ((UINT32)0xFFFFFFFF)
+#endif
+
+// Suppress C4996 for ExAllocatePoolWithTag — needed for Windows 10 1507–1903 compat.
+// ExAllocatePool2 only available from 2004 (19041) forward.
+#pragma warning(disable:4996)
 
 // ============================================================================
 // PRIVATE TYPES
@@ -335,6 +354,20 @@ static BOOLEAN
 NfpIsDomainBlocked(_In_ PCWSTR DomainName);
 
 static VOID
+NfpCreateAndInsertConnection(
+    _In_ const FWPS_INCOMING_VALUES0* InFixedValues,
+    _In_ const FWPS_INCOMING_METADATA_VALUES0* InMetaValues,
+    _In_ UINT64 FlowContext,
+    _Out_ FWPS_CLASSIFY_OUT0* ClassifyOut,
+    _In_ BOOLEAN IsV6,
+    _In_ NETWORK_DIRECTION Direction,
+    _In_ ULONG LocalAddrIdx,
+    _In_ ULONG RemoteAddrIdx,
+    _In_ ULONG LocalPortIdx,
+    _In_ ULONG RemotePortIdx,
+    _In_ ULONG ProtocolIdx);
+
+static VOID
 NfpParseDnsQueryName(
     _In_reads_bytes_(DataLength) const UCHAR* DnsData,
     _In_ ULONG DataLength,
@@ -356,6 +389,33 @@ NfpReadConfig(_Out_ PNETWORK_MONITOR_CONFIG ConfigOut)
     RtlCopyMemory(ConfigOut, &g_NfState.Config, sizeof(NETWORK_MONITOR_CONFIG));
     FltReleasePushLock(&g_NfState.ConfigLock);
 }
+
+// ============================================================================
+// PAGE SECTION DIRECTIVES
+// ============================================================================
+
+#pragma alloc_text(PAGE, NfFilterInitialize)
+#pragma alloc_text(PAGE, NfFilterShutdown)
+#pragma alloc_text(PAGE, NfFilterUpdateConfig)
+#pragma alloc_text(PAGE, NfpRegisterCallouts)
+#pragma alloc_text(PAGE, NfpUnregisterCallouts)
+#pragma alloc_text(PAGE, NfpRegisterFilters)
+#pragma alloc_text(PAGE, NfpUnregisterFilters)
+#pragma alloc_text(PAGE, NfpInitializeHashTables)
+#pragma alloc_text(PAGE, NfpCleanupHashTables)
+#pragma alloc_text(PAGE, NfpInitializeLookasideLists)
+#pragma alloc_text(PAGE, NfpCleanupLookasideLists)
+#pragma alloc_text(PAGE, NfpCleanupWorkItemRoutine)
+#pragma alloc_text(PAGE, NfpCleanupStaleConnections)
+#pragma alloc_text(PAGE, NfpCleanupStaleDnsEntries)
+#pragma alloc_text(PAGE, NfpCleanupStalePendingDns)
+#pragma alloc_text(PAGE, NfpGetProcessPath)
+#pragma alloc_text(PAGE, NfpInsertConnection)
+#pragma alloc_text(PAGE, NfpRemoveConnection)
+#pragma alloc_text(PAGE, NfpCreateAndInsertConnection)
+#pragma alloc_text(PAGE, NfpProcessOutboundConnect)
+#pragma alloc_text(PAGE, NfpProcessInboundAccept)
+#pragma alloc_text(PAGE, NfpAnalyzeConnection)
 
 // ============================================================================
 // PUBLIC API - INITIALIZATION
@@ -778,8 +838,9 @@ NfFilterShutdown(
     FltAcquirePushLockExclusive(&g_PendingDnsLock);
 
     while (!IsListEmpty(&g_PendingDnsList)) {
+        PNF_PENDING_DNS pendingDns;
         entry = RemoveHeadList(&g_PendingDnsList);
-        PNF_PENDING_DNS pendingDns = CONTAINING_RECORD(entry, NF_PENDING_DNS, ListEntry);
+        pendingDns = CONTAINING_RECORD(entry, NF_PENDING_DNS, ListEntry);
         ExFreePoolWithTag(pendingDns, NF_POOL_TAG_DNS);
     }
     g_PendingDnsCount = 0;
@@ -1096,34 +1157,7 @@ NfFilterBlockDomain(
     domainHash = NfpHashDomainName(DomainName);
 
     //
-    // Check if already blocked
-    //
-    FltAcquirePushLockShared(&g_NfState.DnsLock);
-
-    for (entry = g_NfState.BlockedDomainList.Flink;
-         entry != &g_NfState.BlockedDomainList;
-         entry = entry->Flink) {
-
-        existing = CONTAINING_RECORD(entry, NF_BLOCKED_DOMAIN, ListEntry);
-        if (existing->DomainHash == domainHash &&
-            _wcsicmp(existing->DomainName, DomainName) == 0) {
-            FltReleasePushLock(&g_NfState.DnsLock);
-            return STATUS_SUCCESS;
-        }
-    }
-
-    FltReleasePushLock(&g_NfState.DnsLock);
-
-    //
-    // Check limit
-    //
-    if ((ULONG)InterlockedCompareExchange(&g_NfState.BlockedDomainCount, 0, 0)
-            >= NF_MAX_BLOCKED_DOMAINS) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    //
-    // Allocate and insert
+    // Allocate BEFORE locking to minimize time under exclusive lock
     //
     blockedEntry = (PNF_BLOCKED_DOMAIN)ExAllocatePoolWithTag(
         NonPagedPoolNx,
@@ -1141,9 +1175,43 @@ NfFilterBlockDomain(
 
     RtlStringCchCopyW(blockedEntry->DomainName, MAX_DNS_NAME_LENGTH, DomainName);
 
+    //
+    // Atomic check-and-insert under exclusive lock to prevent TOCTOU duplicates
+    //
     FltAcquirePushLockExclusive(&g_NfState.DnsLock);
-    InsertTailList(&g_NfState.BlockedDomainList, &blockedEntry->ListEntry);
-    InterlockedIncrement(&g_NfState.BlockedDomainCount);
+
+    {
+        BOOLEAN duplicate = FALSE;
+
+        for (entry = g_NfState.BlockedDomainList.Flink;
+             entry != &g_NfState.BlockedDomainList;
+             entry = entry->Flink) {
+
+            existing = CONTAINING_RECORD(entry, NF_BLOCKED_DOMAIN, ListEntry);
+            if (existing->DomainHash == domainHash &&
+                _wcsicmp(existing->DomainName, DomainName) == 0) {
+                duplicate = TRUE;
+                break;
+            }
+        }
+
+        if (duplicate) {
+            FltReleasePushLock(&g_NfState.DnsLock);
+            ExFreePoolWithTag(blockedEntry, NF_POOL_TAG_DNS);
+            return STATUS_SUCCESS;
+        }
+
+        if ((ULONG)InterlockedCompareExchange(&g_NfState.BlockedDomainCount, 0, 0)
+                >= NF_MAX_BLOCKED_DOMAINS) {
+            FltReleasePushLock(&g_NfState.DnsLock);
+            ExFreePoolWithTag(blockedEntry, NF_POOL_TAG_DNS);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        InsertTailList(&g_NfState.BlockedDomainList, &blockedEntry->ListEntry);
+        InterlockedIncrement(&g_NfState.BlockedDomainCount);
+    }
+
     FltReleasePushLock(&g_NfState.DnsLock);
 
     return STATUS_SUCCESS;
@@ -1620,6 +1688,17 @@ NfOutboundTransportClassify(
         return;
     }
 
+    //
+    // Transport layer classify can be at DISPATCH_LEVEL for forwarded/injected
+    // packets. Our DNS processing uses push locks which require <= APC_LEVEL.
+    // For outbound UDP sends from user threads this is always PASSIVE, but
+    // guard against unexpected DISPATCH calls to prevent bugcheck.
+    //
+    if (KeGetCurrentIrql() > APC_LEVEL) {
+        classifyOut->actionType = FWP_ACTION_PERMIT;
+        return;
+    }
+
     {
         NETWORK_MONITOR_CONFIG config;
         NfpReadConfig(&config);
@@ -1660,6 +1739,7 @@ NfStreamClassify(
 
     UNREFERENCED_PARAMETER(classifyContext);
     UNREFERENCED_PARAMETER(filter);
+    UNREFERENCED_PARAMETER(flowContext);
 
     if (!NfpIsInitialized() || !NfpIsEnabled()) {
         classifyOut->actionType = FWP_ACTION_PERMIT;
@@ -1678,8 +1758,16 @@ NfStreamClassify(
     streamPacket = (FWPS_STREAM_CALLOUT_IO_PACKET0*)layerData;
 
     if (streamPacket != NULL && NfpCheckRateLimit()) {
+        //
+        // Use flow handle from metadata (not flowContext, which requires
+        // FwpsFlowAssociateContext0 at the stream layer).
+        //
+        UINT64 streamFlowHandle = 0;
+        if (FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues, FWPS_METADATA_FIELD_FLOW_HANDLE)) {
+            streamFlowHandle = inMetaValues->flowHandle;
+        }
         NfpProcessStreamData(inFixedValues, inMetaValues, streamPacket,
-                             flowContext, classifyOut);
+                             streamFlowHandle, classifyOut);
     } else {
         classifyOut->actionType = FWP_ACTION_PERMIT;
     }
@@ -1720,6 +1808,9 @@ NfCalloutNotify(
 
 /**
  * @brief Flow delete notify function.
+ *
+ * Called when a WFP flow terminates. The flowContext is the ConnectionId
+ * that we associated via FwpsFlowAssociateContext0 during ALE classify.
  */
 VOID NTAPI
 NfFlowDeleteNotify(
@@ -1734,11 +1825,14 @@ NfFlowDeleteNotify(
     UNREFERENCED_PARAMETER(layerId);
     UNREFERENCED_PARAMETER(calloutId);
 
-    if (!NfpIsInitialized()) {
+    if (!NfpIsInitialized() || flowContext == 0) {
         return;
     }
 
-    status = NfFilterFindConnectionByFlow(flowContext, &connection);
+    //
+    // flowContext is the ConnectionId we stored via FwpsFlowAssociateContext0
+    //
+    status = NfFilterFindConnection(flowContext, &connection);
     if (NT_SUCCESS(status)) {
         InterlockedExchange((LONG*)&connection->State, (LONG)ConnectionState_Closed);
         NfFilterReleaseConnection(connection);
@@ -1761,6 +1855,8 @@ NfpRegisterCallouts(
     FWPS_CALLOUT3 sCallout = {0};
     FWPM_CALLOUT0 mCallout = {0};
     FWPM_DISPLAY_DATA0 displayData = {0};
+
+    PAGED_CODE();
 
     //
     // ALE Connect v4
@@ -1893,10 +1989,13 @@ NfpRegisterCallouts(
 
     //
     // Stream v4 (TCP data)
+    // NOTE: Do NOT use FWP_CALLOUT_FLAG_CONDITIONAL_ON_FLOW here.
+    // We don't associate flow context at the stream layer, so the flag
+    // would prevent the classify from ever being invoked.
     //
     sCallout.calloutKey = SHADOWSTRIKE_STREAM_V4_CALLOUT_GUID;
     sCallout.classifyFn = NfStreamClassify;
-    sCallout.flags = FWP_CALLOUT_FLAG_CONDITIONAL_ON_FLOW;
+    sCallout.flags = 0;
 
     status = FwpsCalloutRegister3(DeviceObject, &sCallout,
                                   &g_NfState.StreamV4CalloutId);
@@ -1936,6 +2035,8 @@ CleanupV4Connect:
 static VOID
 NfpUnregisterCallouts(VOID)
 {
+    PAGED_CODE();
+
     if (g_NfState.StreamV4CalloutId != 0) {
         FwpsCalloutUnregisterById0(g_NfState.StreamV4CalloutId);
         g_NfState.StreamV4CalloutId = 0;
@@ -1970,6 +2071,8 @@ NfpRegisterFilters(VOID)
 {
     NTSTATUS status;
     FWPM_FILTER0 filter = {0};
+
+    PAGED_CODE();
 
     filter.subLayerKey = SHADOWSTRIKE_WFP_SUBLAYER_GUID;
     filter.weight.type = FWP_EMPTY;
@@ -2054,6 +2157,8 @@ CleanupV4Connect:
 static VOID
 NfpUnregisterFilters(VOID)
 {
+    PAGED_CODE();
+
     if (g_NfState.WfpEngineHandle == NULL) return;
 
     if (g_NfState.StreamV4FilterId != 0) {
@@ -2091,6 +2196,8 @@ NfpInitializeHashTables(VOID)
 {
     ULONG i;
 
+    PAGED_CODE();
+
     for (i = 0; i < NF_CONNECTION_HASH_BUCKETS; i++) {
         InitializeListHead(&g_ConnectionHashTable[i]);
         InitializeListHead(&g_FlowHashTable[i]);
@@ -2103,6 +2210,8 @@ NfpInitializeHashTables(VOID)
 static VOID
 NfpCleanupHashTables(VOID)
 {
+    PAGED_CODE();
+
     // Static arrays — no dynamic memory to free.
     // Entries are freed during connection/dns cleanup.
 }
@@ -2110,6 +2219,7 @@ NfpCleanupHashTables(VOID)
 static NTSTATUS
 NfpInitializeLookasideLists(VOID)
 {
+    PAGED_CODE();
     ExInitializeNPagedLookasideList(
         &g_NfState.ConnectionLookaside, NULL, NULL,
         POOL_NX_ALLOCATION, sizeof(NF_CONNECTION_ENTRY),
@@ -2131,6 +2241,7 @@ NfpInitializeLookasideLists(VOID)
 static VOID
 NfpCleanupLookasideLists(VOID)
 {
+    PAGED_CODE();
     ExDeleteNPagedLookasideList(&g_NfState.ConnectionLookaside);
     ExDeleteNPagedLookasideList(&g_NfState.DnsLookaside);
     ExDeleteNPagedLookasideList(&g_NfState.EventLookaside);
@@ -2272,6 +2383,8 @@ NfpInsertConnection(
     PNF_CONNECTION_HASH_ENTRY flowEntry = NULL;
     PNF_CONNECTION_HASH_ENTRY idEntry = NULL;
 
+    PAGED_CODE();
+
     //
     // Check connection limit
     //
@@ -2348,6 +2461,8 @@ NfpRemoveConnection(
     PNF_CONNECTION_HASH_ENTRY foundEp = NULL;
     PNF_CONNECTION_HASH_ENTRY foundFlow = NULL;
     PNF_CONNECTION_HASH_ENTRY foundId = NULL;
+
+    PAGED_CODE();
 
     FltAcquirePushLockExclusive(&g_NfState.ConnectionLock);
 
@@ -2467,6 +2582,8 @@ NfpCleanupWorkItemRoutine(
     _In_opt_ PVOID Context
     )
 {
+    PAGED_CODE();
+
     UNREFERENCED_PARAMETER(DeviceObject);
     UNREFERENCED_PARAMETER(Context);
 
@@ -2482,28 +2599,31 @@ NfpCleanupWorkItemRoutine(
 /**
  * @brief Cleanup stale connections.
  *
- * Collects stale connections under lock, then removes them properly
- * via NfpRemoveConnection (which cleans all hash tables).
+ * Phase 1: Collect candidate stale connections under shared lock (increment ref).
+ * Phase 2: Re-verify under exclusive lock (decrement ref, check again).
+ *          Only remove + free if ref == 0 under exclusive lock — prevents
+ *          use-after-free from concurrent FindConnection taking a reference
+ *          between Phase 1 scan and Phase 2 removal.
  */
 static VOID
 NfpCleanupStaleConnections(VOID)
 {
     PLIST_ENTRY entry;
-    PLIST_ENTRY nextEntry;
     PNF_CONNECTION_ENTRY connection;
     LARGE_INTEGER currentTime;
     UINT64 currentTimeMs;
 
-    // Temporary array to hold connections to remove (avoid nested lock)
     PNF_CONNECTION_ENTRY staleConnections[64];
     ULONG staleCount = 0;
     ULONG i;
+
+    PAGED_CODE();
 
     KeQuerySystemTime(&currentTime);
     currentTimeMs = (UINT64)(currentTime.QuadPart / 10000);
 
     //
-    // Phase 1: Identify stale connections under shared lock
+    // Phase 1: Identify candidate stale connections under shared lock
     //
     FltAcquirePushLockShared(&g_NfState.ConnectionLock);
 
@@ -2513,14 +2633,22 @@ NfpCleanupStaleConnections(VOID)
 
         connection = CONTAINING_RECORD(entry, NF_CONNECTION_ENTRY, ListEntry);
 
-        if (connection->RefCount <= 0 &&
-            connection->State == ConnectionState_Closed &&
-            (currentTimeMs - connection->LastActivityTime) > NF_CONNECTION_TIMEOUT_MS) {
+        if (connection->RefCount > 0) {
+            continue;
+        }
 
-            if (staleCount < ARRAYSIZE(staleConnections)) {
-                //
-                // Take a reference to prevent premature free
-                //
+        {
+            BOOLEAN isCandidate = FALSE;
+
+            if (connection->State == ConnectionState_Closed &&
+                (currentTimeMs - connection->LastActivityTime) > NF_CONNECTION_TIMEOUT_MS) {
+                isCandidate = TRUE;
+            } else if (connection->State != ConnectionState_Closed &&
+                       (currentTimeMs - connection->LastActivityTime) > NF_FORCE_CLOSE_TIMEOUT_MS) {
+                isCandidate = TRUE;
+            }
+
+            if (isCandidate && staleCount < ARRAYSIZE(staleConnections)) {
                 InterlockedIncrement(&connection->RefCount);
                 staleConnections[staleCount++] = connection;
             }
@@ -2530,13 +2658,91 @@ NfpCleanupStaleConnections(VOID)
     FltReleasePushLock(&g_NfState.ConnectionLock);
 
     //
-    // Phase 2: Remove and free stale connections (NfpRemoveConnection acquires exclusive lock)
+    // Phase 2: Re-verify under exclusive lock to prevent use-after-free.
+    // Under exclusive lock, no concurrent FindConnection can take a new reference.
     //
     for (i = 0; i < staleCount; i++) {
+        BOOLEAN shouldFree = FALSE;
+        PNF_CONNECTION_HASH_ENTRY foundEp = NULL;
+        PNF_CONNECTION_HASH_ENTRY foundFlow = NULL;
+        PNF_CONNECTION_HASH_ENTRY foundId = NULL;
+        UINT32 hashIdx;
+        PLIST_ENTRY hashEntry;
+        PNF_CONNECTION_HASH_ENTRY hEntry;
+
         connection = staleConnections[i];
+
+        FltAcquirePushLockExclusive(&g_NfState.ConnectionLock);
+
+        //
+        // Release our scan reference under the lock.
+        // Under exclusive lock, nobody can call FindConnection (requires shared lock).
+        //
         InterlockedDecrement(&connection->RefCount);
-        NfpRemoveConnection(connection);
-        NfpFreeConnection(connection);
+
+        if (connection->RefCount <= 0) {
+            //
+            // Safe to remove — no other thread holds a reference
+            //
+            RemoveEntryList(&connection->ListEntry);
+            InterlockedDecrement(&g_NfState.ConnectionCount);
+
+            // Remove from endpoint hash
+            hashIdx = NfpHashEndpoints(&connection->LocalAddress,
+                                        &connection->RemoteAddress,
+                                        connection->Protocol);
+            for (hashEntry = g_ConnectionHashTable[hashIdx].Flink;
+                 hashEntry != &g_ConnectionHashTable[hashIdx];
+                 hashEntry = hashEntry->Flink) {
+                hEntry = CONTAINING_RECORD(hashEntry, NF_CONNECTION_HASH_ENTRY, HashListEntry);
+                if (hEntry->Connection == connection) {
+                    RemoveEntryList(&hEntry->HashListEntry);
+                    foundEp = hEntry;
+                    break;
+                }
+            }
+
+            // Remove from flow hash
+            hashIdx = NfpHashFlowId(connection->FlowId);
+            for (hashEntry = g_FlowHashTable[hashIdx].Flink;
+                 hashEntry != &g_FlowHashTable[hashIdx];
+                 hashEntry = hashEntry->Flink) {
+                hEntry = CONTAINING_RECORD(hashEntry, NF_CONNECTION_HASH_ENTRY, HashListEntry);
+                if (hEntry->Connection == connection) {
+                    RemoveEntryList(&hEntry->HashListEntry);
+                    foundFlow = hEntry;
+                    break;
+                }
+            }
+
+            // Remove from connId hash
+            hashIdx = NfpHashConnectionId(connection->ConnectionId);
+            for (hashEntry = g_ConnIdHashTable[hashIdx].Flink;
+                 hashEntry != &g_ConnIdHashTable[hashIdx];
+                 hashEntry = hashEntry->Flink) {
+                hEntry = CONTAINING_RECORD(hashEntry, NF_CONNECTION_HASH_ENTRY, HashListEntry);
+                if (hEntry->Connection == connection) {
+                    RemoveEntryList(&hEntry->HashListEntry);
+                    foundId = hEntry;
+                    break;
+                }
+            }
+
+            shouldFree = TRUE;
+        }
+        //
+        // else: Another thread took a reference between Phase 1 and now.
+        // Leave connection in tables for next cleanup cycle.
+        //
+
+        FltReleasePushLock(&g_NfState.ConnectionLock);
+
+        if (shouldFree) {
+            if (foundEp != NULL) ExFreePoolWithTag(foundEp, NF_POOL_TAG_CONNECTION);
+            if (foundFlow != NULL) ExFreePoolWithTag(foundFlow, NF_POOL_TAG_CONNECTION);
+            if (foundId != NULL) ExFreePoolWithTag(foundId, NF_POOL_TAG_CONNECTION);
+            NfpFreeConnection(connection);
+        }
     }
 }
 
@@ -2552,6 +2758,8 @@ NfpCleanupStaleDnsEntries(VOID)
     LARGE_INTEGER currentTime;
     UINT64 currentTimeMs;
     LIST_ENTRY staleList;
+
+    PAGED_CODE();
 
     InitializeListHead(&staleList);
     KeQuerySystemTime(&currentTime);
@@ -2594,6 +2802,8 @@ NfpCleanupStalePendingDns(VOID)
     LARGE_INTEGER currentTime;
     UINT64 currentTimeMs;
     LIST_ENTRY staleList;
+
+    PAGED_CODE();
 
     InitializeListHead(&staleList);
     KeQuerySystemTime(&currentTime);
@@ -2706,6 +2916,8 @@ NfpGetProcessPath(
     NTSTATUS status;
     PUNICODE_STRING imageName = NULL;
 
+    PAGED_CODE();
+
     ProcessPath[0] = L'\0';
 
     status = PsLookupProcessByProcessId(ProcessId, &process);
@@ -2759,6 +2971,17 @@ NfpIsPrivateAddress(_In_ PSS_IP_ADDRESS Address)
         if (bytes[0] == 172 && (bytes[1] & 0xF0) == 16) return TRUE;
         if (bytes[0] == 192 && bytes[1] == 168) return TRUE;
     }
+
+    if (SS_IS_IPV6(Address)) {
+        PUCHAR bytes = Address->V6.Bytes;
+
+        // fc00::/7 — Unique Local Address (ULA)
+        if ((bytes[0] & 0xFE) == 0xFC) return TRUE;
+
+        // fe80::/10 — Link-local
+        if (bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80) return TRUE;
+    }
+
     return FALSE;
 }
 
@@ -2874,6 +3097,10 @@ NfpCreateAndInsertConnection(
     UINT8 protocol;
     UINT64 processId;
 
+    PAGED_CODE();
+
+    UNREFERENCED_PARAMETER(FlowContext);
+
     ClassifyOut->actionType = FWP_ACTION_PERMIT;
 
     //
@@ -2903,7 +3130,18 @@ NfpCreateAndInsertConnection(
     }
 
     connection->ConnectionId = (UINT64)InterlockedIncrement64(&g_NfState.NextConnectionId);
-    connection->FlowId = FlowContext;
+
+    //
+    // Use WFP flow handle for flow tracking — NOT the classify flowContext
+    // parameter, which is always 0 unless FwpsFlowAssociateContext0 is called
+    // at this layer. The flow handle uniquely identifies flows across layers.
+    //
+    if (FWPS_IS_METADATA_FIELD_PRESENT(InMetaValues, FWPS_METADATA_FIELD_FLOW_HANDLE)) {
+        connection->FlowId = InMetaValues->flowHandle;
+    } else {
+        connection->FlowId = 0;
+    }
+
     connection->Direction = Direction;
     connection->State = ConnectionState_Connecting;
 
@@ -2952,6 +3190,35 @@ NfpCreateAndInsertConnection(
         return;
     }
 
+    //
+    // Associate flow context at the ALE layer so NfFlowDeleteNotify receives
+    // our ConnectionId when the flow terminates. This enables proper connection
+    // lifecycle tracking (mark as Closed on flow end).
+    //
+    if (connection->FlowId != 0) {
+        UINT32 calloutId = 0;
+
+        switch (InFixedValues->layerId) {
+            case FWPS_LAYER_ALE_AUTH_CONNECT_V4:
+                calloutId = g_NfState.AleConnectV4CalloutId; break;
+            case FWPS_LAYER_ALE_AUTH_CONNECT_V6:
+                calloutId = g_NfState.AleConnectV6CalloutId; break;
+            case FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4:
+                calloutId = g_NfState.AleRecvAcceptV4CalloutId; break;
+            case FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6:
+                calloutId = g_NfState.AleRecvAcceptV6CalloutId; break;
+        }
+
+        if (calloutId != 0) {
+            FwpsFlowAssociateContext0(
+                connection->FlowId,
+                InFixedValues->layerId,
+                calloutId,
+                connection->ConnectionId
+                );
+        }
+    }
+
     NfpAnalyzeConnection(connection);
 
     if (InterlockedCompareExchange((LONG*)&connection->Flags, 0, 0) & NF_CONN_FLAG_BLOCKED) {
@@ -2973,6 +3240,7 @@ NfpProcessOutboundConnect(
     _In_ BOOLEAN IsV6
     )
 {
+    PAGED_CODE();
     if (IsV6) {
         NfpCreateAndInsertConnection(
             InFixedValues, InMetaValues, FlowContext, ClassifyOut, TRUE,
@@ -3006,6 +3274,7 @@ NfpProcessInboundAccept(
     _In_ BOOLEAN IsV6
     )
 {
+    PAGED_CODE();
     if (IsV6) {
         NfpCreateAndInsertConnection(
             InFixedValues, InMetaValues, FlowContext, ClassifyOut, TRUE,
@@ -3049,7 +3318,6 @@ NfpProcessDnsPacket(
     UINT32 processId;
     LARGE_INTEGER currentTime;
     PNF_DNS_ENTRY dnsEntry;
-    UINT32 domainHash;
 
     ClassifyOut->actionType = FWP_ACTION_PERMIT;
 
@@ -3064,7 +3332,7 @@ NfpProcessDnsPacket(
     }
 
     dataLength = NET_BUFFER_DATA_LENGTH(nb);
-    if (dataLength < NF_DNS_HEADER_SIZE) {
+    if (dataLength < NF_DNS_HEADER_SIZE || dataLength > NF_MAX_DNS_PACKET_SIZE) {
         goto Done;
     }
 
@@ -3307,6 +3575,8 @@ NfpAnalyzeConnection(
     )
 {
     NR_LOOKUP_RESULT reputationResult = {0};
+
+    PAGED_CODE();
 
     if (g_ReputationManager != NULL) {
         NTSTATUS status = NrLookupIP(
