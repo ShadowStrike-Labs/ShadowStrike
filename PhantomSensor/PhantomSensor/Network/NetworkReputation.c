@@ -39,16 +39,31 @@
  * ============================================================================
  */
 
+#pragma warning(push)
+#pragma warning(disable: 4324) // structure was padded due to alignment (fltKernel.h)
 #include "NetworkReputation.h"
-#include <ntstrsafe.h>
-#include <wdm.h>
+#pragma warning(pop)
 
-#ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, NrInitialize)
-#pragma alloc_text(PAGE, NrShutdown)
-#pragma alloc_text(PAGE, NrClearCache)
-#pragma alloc_text(PAGE, NrpCleanupWorkRoutine)
-#endif
+#include <ntstrsafe.h>
+
+//
+// Forward declarations needed before alloc_text (defined later in file)
+//
+static NTSTATUS
+NrpAddEntryInternal(
+    _In_ PNR_MANAGER Manager,
+    _In_ PNR_ENTRY TemplateEntry
+    );
+
+static BOOLEAN
+NrpIsPrivateIPv6(
+    _In_reads_bytes_(sizeof(IN6_ADDR)) const UCHAR* IPv6Bytes
+    );
+
+static BOOLEAN
+NrpIsLoopbackIPv6(
+    _In_reads_bytes_(sizeof(IN6_ADDR)) const UCHAR* IPv6Bytes
+    );
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -197,6 +212,49 @@ NrpSafeStringLengthA(
     _In_ ULONG MaxLength,
     _Out_ ULONG* Length
     );
+
+#ifdef ALLOC_PRAGMA
+// Public API
+#pragma alloc_text(PAGE, NrInitialize)
+#pragma alloc_text(PAGE, NrShutdown)
+#pragma alloc_text(PAGE, NrClearCache)
+#pragma alloc_text(PAGE, NrLookupIP)
+#pragma alloc_text(PAGE, NrLookupDomain)
+#pragma alloc_text(PAGE, NrAddIP)
+#pragma alloc_text(PAGE, NrAddDomain)
+#pragma alloc_text(PAGE, NrRemoveIP)
+#pragma alloc_text(PAGE, NrRemoveDomain)
+#pragma alloc_text(PAGE, NrGetStatistics)
+// Private - entry management
+#pragma alloc_text(PAGE, NrpAddEntryInternal)
+#pragma alloc_text(PAGE, NrpFindEntryByIP)
+#pragma alloc_text(PAGE, NrpFindEntryByDomain)
+#pragma alloc_text(PAGE, NrpAllocateEntry)
+#pragma alloc_text(PAGE, NrpFreeEntry)
+#pragma alloc_text(PAGE, NrpInsertEntry)
+#pragma alloc_text(PAGE, NrpRemoveEntry)
+#pragma alloc_text(PAGE, NrpUpdateEntryInPlace)
+#pragma alloc_text(PAGE, NrpIsEntryExpired)
+#pragma alloc_text(PAGE, NrpEvictOldestEntry)
+#pragma alloc_text(PAGE, NrpCleanupExpiredEntries)
+#pragma alloc_text(PAGE, NrpCleanupWorkRoutine)
+// Private - hashing
+#pragma alloc_text(PAGE, NrpHashIP)
+#pragma alloc_text(PAGE, NrpHashDomain)
+#pragma alloc_text(PAGE, NrpHashToIndex)
+// Private - string helpers
+#pragma alloc_text(PAGE, NrpSafeStringLengthA)
+#pragma alloc_text(PAGE, NrpSafeCompareStringOrdinalA)
+#pragma alloc_text(PAGE, NrpSafeFindCharA)
+// Private - IP helpers
+#pragma alloc_text(PAGE, NrpIsPrivateIP)
+#pragma alloc_text(PAGE, NrpIsLoopbackIP)
+#pragma alloc_text(PAGE, NrpIsPrivateIPv6)
+#pragma alloc_text(PAGE, NrpIsLoopbackIPv6)
+// Private - domain helpers
+#pragma alloc_text(PAGE, NrpCalculateDGAScore)
+#pragma alloc_text(PAGE, NrpNormalizeDomain)
+#endif
 
 // ============================================================================
 // PRIVATE - BIGRAM FREQUENCY TABLE FOR DGA DETECTION
@@ -398,14 +456,29 @@ NrShutdown(
     KeFlushQueuedDpcs();
 
     //
-    // 3. Wait for rundown: blocks until every thread that called
+    // 3. Wait for any in-flight cleanup work item to complete.
+    //    After KeFlushQueuedDpcs, no new DPCs will fire, but a work item
+    //    may have been queued by the last DPC. Spin-wait until it finishes.
+    //    The work item releases rundown BEFORE clearing CleanupInProgress,
+    //    so by the time we see 0, the rundown ref is already released.
+    //
+    {
+        LARGE_INTEGER spinDelay;
+        spinDelay.QuadPart = -10000; // 1ms in 100-nanosecond intervals
+        while (InterlockedCompareExchange(&Manager->CleanupInProgress, 0, 0) != 0) {
+            KeDelayExecutionThread(KernelMode, FALSE, &spinDelay);
+        }
+    }
+
+    //
+    // 4. Wait for rundown: blocks until every thread that called
     //    ExAcquireRundownProtection has released it. After this returns
     //    no new acquisitions will succeed.
     //
     ExWaitForRundownProtectionRelease(&Manager->RundownRef);
 
     //
-    // 4. Now we are the sole owner. Clear the cache (no lock needed
+    // 5. Now we are the sole owner. Clear the cache (no lock needed
     //    since rundown is complete, but we still take it for correctness
     //    because NrpClearCacheInternal expects it).
     //
@@ -436,7 +509,7 @@ NrShutdown(
                Manager->Stats.Misses);
 
     //
-    // 5. Free resources
+    // 6. Free resources
     //
     if (Manager->CleanupWorkItem != NULL) {
         IoFreeWorkItem(Manager->CleanupWorkItem);
@@ -468,6 +541,8 @@ NrLookupIP(
     ULONG hash;
     PNR_ENTRY entry;
     LARGE_INTEGER now;
+
+    PAGED_CODE();
 
     if (Manager == NULL || Address == NULL || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -502,6 +577,28 @@ NrLookupIP(
         }
 
         if (NrpIsPrivateIP(ipBytes)) {
+            Result->Found = TRUE;
+            Result->Reputation = NrReputation_Unknown;
+            Result->Score = 0;
+            Result->Flags = NR_FLAG_INTERNAL;
+            InterlockedIncrement64(&Manager->Stats.Hits);
+            ExReleaseRundownProtection(&Manager->RundownRef);
+            return STATUS_SUCCESS;
+        }
+    } else {
+        const UCHAR* ipBytes = (const UCHAR*)Address;
+
+        if (NrpIsLoopbackIPv6(ipBytes)) {
+            Result->Found = TRUE;
+            Result->Reputation = NrReputation_Unknown;
+            Result->Score = 0;
+            Result->Flags = NR_FLAG_INTERNAL | NR_FLAG_LOOPBACK;
+            InterlockedIncrement64(&Manager->Stats.Hits);
+            ExReleaseRundownProtection(&Manager->RundownRef);
+            return STATUS_SUCCESS;
+        }
+
+        if (NrpIsPrivateIPv6(ipBytes)) {
             Result->Found = TRUE;
             Result->Reputation = NrReputation_Unknown;
             Result->Score = 0;
@@ -585,6 +682,8 @@ NrLookupDomain(
     CHAR normalizedDomain[NR_MAX_DOMAIN_LENGTH + 1];
     ULONG dgaScore;
     LARGE_INTEGER now;
+
+    PAGED_CODE();
 
     if (Manager == NULL || Domain == NULL || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -700,6 +799,8 @@ NrpAddEntryInternal(
     PNR_ENTRY existingEntry = NULL;
     PNR_ENTRY newEntry = NULL;
 
+    PAGED_CODE();
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Manager->EntryLock);
 
@@ -802,6 +903,8 @@ NrAddIP(
 {
     NR_ENTRY entry;
 
+    PAGED_CODE();
+
     if (Manager == NULL || Address == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -857,6 +960,8 @@ NrAddDomain(
     NR_ENTRY entry;
     CHAR normalizedDomain[NR_MAX_DOMAIN_LENGTH + 1];
 
+    PAGED_CODE();
+
     if (Manager == NULL || Domain == NULL || Domain[0] == '\0') {
         return STATUS_INVALID_PARAMETER;
     }
@@ -908,6 +1013,8 @@ NrRemoveIP(
     ULONG hash;
     PNR_ENTRY entry;
 
+    PAGED_CODE();
+
     if (Manager == NULL || Address == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -946,6 +1053,8 @@ NrRemoveDomain(
     ULONG hash;
     PNR_ENTRY entry;
     CHAR normalizedDomain[NR_MAX_DOMAIN_LENGTH + 1];
+
+    PAGED_CODE();
 
     if (Manager == NULL || Domain == NULL || Domain[0] == '\0') {
         return STATUS_INVALID_PARAMETER;
@@ -993,10 +1102,12 @@ NrClearCache(
     }
 
     //
-    // Note: NrClearCache does NOT check rundown — it is called from
-    // NrShutdown after rundown completes, and also callable standalone
-    // while the manager is live (via rundown from the caller).
+    // Acquire rundown protection so this is safe to call while the manager
+    // is live. If shutdown is in progress, bail out cleanly.
     //
+    if (!ExAcquireRundownProtection(&Manager->RundownRef)) {
+        return;
+    }
 
     InitializeListHead(&tempList);
 
@@ -1022,6 +1133,8 @@ NrClearCache(
         entry = CONTAINING_RECORD(listEntry, NR_ENTRY, ListEntry);
         NrpFreeEntry(entry);
     }
+
+    ExReleaseRundownProtection(&Manager->RundownRef);
 }
 
 // ============================================================================
@@ -1036,6 +1149,8 @@ NrGetStatistics(
     )
 {
     LARGE_INTEGER currentTime;
+
+    PAGED_CODE();
 
     if (Manager == NULL || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1092,6 +1207,8 @@ NrpHashIP(
     ULONG length = IsIPv6 ? sizeof(IN6_ADDR) : sizeof(IN_ADDR);
     ULONG i;
 
+    PAGED_CODE();
+
     for (i = 0; i < length; i++) {
         hash ^= bytes[i];
         hash *= NR_FNV_PRIME;
@@ -1108,6 +1225,8 @@ NrpHashDomain(
 {
     ULONG hash = NR_FNV_OFFSET_BASIS;
     ULONG i;
+
+    PAGED_CODE();
 
     for (i = 0; i < MaxLength && Domain[i] != '\0'; i++) {
         CHAR ch = Domain[i];
@@ -1130,6 +1249,7 @@ NrpHashToIndex(
     //
     // BucketCount is a power of 2, so use bitmask for speed
     //
+    PAGED_CODE();
     return Hash & (Manager->Hash.BucketCount - 1);
 }
 
@@ -1148,6 +1268,9 @@ NrpSafeStringLengthA(
     )
 {
     ULONG i;
+
+    PAGED_CODE();
+
     *Length = 0;
 
     if (String == NULL) {
@@ -1176,6 +1299,8 @@ NrpSafeCompareStringOrdinalA(
     )
 {
     ULONG i;
+
+    PAGED_CODE();
 
     for (i = 0; i < MaxLength; i++) {
         CHAR c1 = String1[i];
@@ -1206,6 +1331,8 @@ NrpSafeFindCharA(
 {
     ULONG i;
 
+    PAGED_CODE();
+
     for (i = 0; i < MaxLength && String[i] != '\0'; i++) {
         if (String[i] == Ch) {
             return &String[i];
@@ -1230,6 +1357,8 @@ NrpFindEntryByIP(
     PLIST_ENTRY bucket = &Manager->Hash.Buckets[index];
     PLIST_ENTRY listEntry;
     PNR_ENTRY entry;
+
+    PAGED_CODE();
 
     for (listEntry = bucket->Flink;
          listEntry != bucket;
@@ -1274,6 +1403,8 @@ NrpFindEntryByDomain(
     PLIST_ENTRY listEntry;
     PNR_ENTRY entry;
 
+    PAGED_CODE();
+
     for (listEntry = bucket->Flink;
          listEntry != bucket;
          listEntry = listEntry->Flink) {
@@ -1300,6 +1431,8 @@ NrpAllocateEntry(
 {
     PNR_ENTRY entry;
 
+    PAGED_CODE();
+
     //
     // PagedPool: entries are only accessed at <= APC_LEVEL
     //
@@ -1322,6 +1455,8 @@ NrpFreeEntry(
     _In_ PNR_ENTRY Entry
     )
 {
+    PAGED_CODE();
+
     if (Entry != NULL) {
         //
         // Scrub threat info before freeing
@@ -1337,7 +1472,11 @@ NrpInsertEntry(
     _In_ PNR_ENTRY Entry
     )
 {
-    ULONG index = NrpHashToIndex(Manager, Entry->Hash);
+    ULONG index;
+
+    PAGED_CODE();
+
+    index = NrpHashToIndex(Manager, Entry->Hash);
 
     InsertHeadList(&Manager->EntryList, &Entry->ListEntry);
     InsertHeadList(&Manager->Hash.Buckets[index], &Entry->HashEntry);
@@ -1351,6 +1490,8 @@ NrpRemoveEntry(
     _In_ PNR_ENTRY Entry
     )
 {
+    PAGED_CODE();
+
     RemoveEntryList(&Entry->ListEntry);
     InitializeListHead(&Entry->ListEntry);
 
@@ -1372,6 +1513,8 @@ NrpUpdateEntryInPlace(
     )
 {
     LARGE_INTEGER now;
+
+    PAGED_CODE();
 
     Existing->Reputation = Source->Reputation;
     Existing->Categories = Source->Categories;
@@ -1396,6 +1539,8 @@ NrpIsEntryExpired(
     )
 {
     LARGE_INTEGER currentTime;
+
+    PAGED_CODE();
 
     if (Entry->Reputation == NrReputation_Whitelisted ||
         Entry->Reputation == NrReputation_Blacklisted) {
@@ -1423,6 +1568,8 @@ NrpEvictOldestEntry(
     PNR_ENTRY oldestEntry = NULL;
     LONGLONG oldestTime = MAXLONGLONG;
     LONGLONG accessTime;
+
+    PAGED_CODE();
 
     for (listEntry = Manager->EntryList.Flink;
          listEntry != &Manager->EntryList;
@@ -1465,6 +1612,8 @@ NrpCleanupExpiredEntries(
     LIST_ENTRY expiredList;
     ULONG cleanedCount = 0;
 
+    PAGED_CODE();
+
     InitializeListHead(&expiredList);
 
     KeEnterCriticalRegion();
@@ -1499,8 +1648,9 @@ NrpCleanupExpiredEntries(
 // ============================================================================
 
 //
-// DPC callback: runs at DISPATCH_LEVEL. Does NOT touch push locks.
-// Instead, queues a work item that runs at PASSIVE_LEVEL.
+// DPC callback: runs at DISPATCH_LEVEL. Does NOT touch push locks or
+// rundown protection (ExAcquireRundownProtection requires <= APC_LEVEL).
+// Only checks the non-reentrant guard and queues a work item.
 //
 static VOID
 NrpCleanupTimerDpc(
@@ -1524,15 +1674,9 @@ NrpCleanupTimerDpc(
     }
 
     //
-    // Attempt to acquire rundown protection. If shutdown is in progress
-    // this will fail and we simply skip the cleanup.
-    //
-    if (!ExAcquireRundownProtection(&manager->RundownRef)) {
-        return;
-    }
-
-    //
-    // Prevent overlapping work items (non-reentrant guard)
+    // Prevent overlapping work items (non-reentrant guard).
+    // Rundown protection is acquired in the work item at PASSIVE_LEVEL,
+    // not here at DISPATCH_LEVEL where it would violate the IRQL contract.
     //
     if (InterlockedCompareExchange(&manager->CleanupInProgress, 1, 0) == 0) {
         IoQueueWorkItem(
@@ -1541,16 +1685,12 @@ NrpCleanupTimerDpc(
             DelayedWorkQueue,
             manager
         );
-    } else {
-        //
-        // A cleanup is already in progress; release rundown.
-        //
-        ExReleaseRundownProtection(&manager->RundownRef);
     }
 }
 
 //
-// Work item callback: runs at PASSIVE_LEVEL. Safe to acquire push locks.
+// Work item callback: runs at PASSIVE_LEVEL. Acquires rundown protection
+// here (not in the DPC) to comply with the IRQL <= APC_LEVEL contract.
 //
 _IRQL_requires_(PASSIVE_LEVEL)
 static VOID
@@ -1568,13 +1708,25 @@ NrpCleanupWorkRoutine(
         return;
     }
 
+    //
+    // Acquire rundown at PASSIVE_LEVEL (correct IRQL). If shutdown has
+    // already started, ExWaitForRundownProtectionRelease makes the ref
+    // permanently non-acquirable, so this fails and we exit cleanly.
+    //
+    if (!ExAcquireRundownProtection(&manager->RundownRef)) {
+        InterlockedExchange(&manager->CleanupInProgress, 0);
+        return;
+    }
+
     NrpCleanupExpiredEntries(manager, NR_MAX_CLEANUP_PER_TICK);
 
     //
-    // Clear the in-progress flag and release rundown (acquired in DPC)
+    // Release rundown BEFORE clearing the in-progress flag. This ensures
+    // that when shutdown's spin-wait sees CleanupInProgress == 0, our
+    // rundown reference has already been released.
     //
-    InterlockedExchange(&manager->CleanupInProgress, 0);
     ExReleaseRundownProtection(&manager->RundownRef);
+    InterlockedExchange(&manager->CleanupInProgress, 0);
 }
 
 // ============================================================================
@@ -1586,12 +1738,17 @@ NrpIsPrivateIP(
     _In_reads_bytes_(sizeof(ULONG)) const UCHAR* IPv4Bytes
     )
 {
+    UCHAR first;
+    UCHAR second;
+
+    PAGED_CODE();
+
     //
     // IN_ADDR.S_addr is in network byte order. The first octet is
     // at offset 0 regardless of host endianness.
     //
-    UCHAR first  = IPv4Bytes[0];
-    UCHAR second = IPv4Bytes[1];
+    first  = IPv4Bytes[0];
+    second = IPv4Bytes[1];
 
     // 10.0.0.0/8
     if (first == 10) return TRUE;
@@ -1613,8 +1770,41 @@ NrpIsLoopbackIP(
     _In_reads_bytes_(sizeof(ULONG)) const UCHAR* IPv4Bytes
     )
 {
+    PAGED_CODE();
     // 127.0.0.0/8
     return (IPv4Bytes[0] == 127);
+}
+
+static BOOLEAN
+NrpIsLoopbackIPv6(
+    _In_reads_bytes_(sizeof(IN6_ADDR)) const UCHAR* IPv6Bytes
+    )
+{
+    ULONG i;
+
+    PAGED_CODE();
+
+    // ::1 — all zeros except last byte is 1
+    for (i = 0; i < 15; i++) {
+        if (IPv6Bytes[i] != 0) return FALSE;
+    }
+    return (IPv6Bytes[15] == 1);
+}
+
+static BOOLEAN
+NrpIsPrivateIPv6(
+    _In_reads_bytes_(sizeof(IN6_ADDR)) const UCHAR* IPv6Bytes
+    )
+{
+    PAGED_CODE();
+
+    // fc00::/7 — Unique Local Address (ULA): first byte fc or fd
+    if ((IPv6Bytes[0] & 0xFE) == 0xFC) return TRUE;
+
+    // fe80::/10 — Link-local: first byte fe, second byte 80-bf (top 2 bits = 10)
+    if (IPv6Bytes[0] == 0xFE && (IPv6Bytes[1] & 0xC0) == 0x80) return TRUE;
+
+    return FALSE;
 }
 
 // ============================================================================
@@ -1640,6 +1830,8 @@ NrpCalculateDGAScore(
     ULONG bigramPenalty = 0;
     ULONG bigramCount = 0;
     CHAR prevCh = 0;
+
+    PAGED_CODE();
 
     RtlZeroMemory(charCounts, sizeof(charCounts));
 
@@ -1771,6 +1963,8 @@ NrpNormalizeDomain(
 {
     ULONG i;
     ULONG len = 0;
+
+    PAGED_CODE();
 
     if (BufferSize == 0) {
         return;
