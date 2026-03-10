@@ -46,7 +46,20 @@
  * ============================================================================
  */
 
+#pragma warning(push)
+#pragma warning(disable: 4324)
 #include "PatternMatcher.h"
+#pragma warning(pop)
+
+//
+// InterlockedCompareExchange8 is a compiler intrinsic not declared in WDK km headers
+//
+#ifndef InterlockedCompareExchange8
+char _InterlockedCompareExchange8(volatile char*, char, char);
+#pragma intrinsic(_InterlockedCompareExchange8)
+#define InterlockedCompareExchange8(Destination, Exchange, Comparand) \
+    _InterlockedCompareExchange8((volatile char*)(Destination), (char)(Exchange), (char)(Comparand))
+#endif
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, PmInitialize)
@@ -163,10 +176,11 @@ typedef struct _PM_MATCHER_INTERNAL {
     volatile BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup work item
+    // Cleanup: dedicated worker thread signaled by periodic DPC
     //
-    PIO_WORKITEM CleanupWorkItem;
-    volatile BOOLEAN CleanupScheduled;
+    PVOID WorkerThread;
+    KEVENT WorkerWakeEvent;
+    volatile BOOLEAN WorkerTerminate;
     KTIMER CleanupTimer;
     KDPC CleanupDpc;
     volatile BOOLEAN CleanupTimerActive;
@@ -181,13 +195,6 @@ typedef struct _PM_MATCHER_INTERNAL {
     } Config;
 
 } PM_MATCHER_INTERNAL, *PPM_MATCHER_INTERNAL;
-
-/**
- * @brief Work item context for cleanup operations.
- */
-typedef struct _PM_CLEANUP_CONTEXT {
-    PPM_MATCHER_INTERNAL Matcher;
-} PM_CLEANUP_CONTEXT, *PPM_CLEANUP_CONTEXT;
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -233,7 +240,7 @@ _IRQL_requires_max_(PASSIVE_LEVEL)
 static BOOLEAN
 PmpCheckEventConstraint(
     _In_ PPM_MATCHER_INTERNAL Matcher,
-    _In_ PPM_EVENT_CONSTRAINT* Constraint,
+    _In_ PPM_EVENT_CONSTRAINT Constraint,
     _In_ PM_EVENT_TYPE EventType,
     _In_opt_ PCUNICODE_STRING Path,
     _In_opt_ PCSTR Value,
@@ -302,7 +309,18 @@ PmpCleanupTimerDpc(
     _In_opt_ PVOID SystemArgument2
     );
 
-IO_WORKITEM_ROUTINE PmpCleanupWorkItemRoutine;
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static VOID
+PmpWorkerThreadRoutine(
+    _In_ PVOID Context
+    );
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static VOID
+PmpDereferencePattern(
+    _In_ PPM_MATCHER_INTERNAL Matcher,
+    _In_ PPM_PATTERN Pattern
+    );
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
 static VOID
@@ -474,12 +492,67 @@ PmInitialize(
     InterlockedExchange8((CHAR*)&matcher->CleanupTimerActive, TRUE);
 
     //
+    // Create dedicated worker thread for DPC-to-PASSIVE cleanup deferral
+    //
+    KeInitializeEvent(&matcher->WorkerWakeEvent, SynchronizationEvent, FALSE);
+    matcher->WorkerTerminate = FALSE;
+    matcher->WorkerThread = NULL;
+
+    {
+        HANDLE threadHandle = NULL;
+
+        status = PsCreateSystemThread(
+            &threadHandle,
+            THREAD_ALL_ACCESS,
+            NULL,
+            NULL,
+            NULL,
+            PmpWorkerThreadRoutine,
+            matcher
+        );
+
+        if (!NT_SUCCESS(status)) {
+            goto InitFailed;
+        }
+
+        status = ObReferenceObjectByHandle(
+            threadHandle,
+            THREAD_ALL_ACCESS,
+            *PsThreadType,
+            KernelMode,
+            &matcher->WorkerThread,
+            NULL
+        );
+
+        if (!NT_SUCCESS(status)) {
+            InterlockedExchange8((CHAR*)&matcher->WorkerTerminate, TRUE);
+            KeSetEvent(&matcher->WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
+            ZwWaitForSingleObject(threadHandle, FALSE, NULL);
+            ZwClose(threadHandle);
+            goto InitFailed;
+        }
+
+        ZwClose(threadHandle);
+    }
+
+    //
     // Mark as initialized
     //
     InterlockedExchange8((CHAR*)&matcher->Public.Initialized, TRUE);
     *Matcher = &matcher->Public;
 
     return STATUS_SUCCESS;
+
+InitFailed:
+    KeCancelTimer(&matcher->CleanupTimer);
+    KeFlushQueuedDpcs();
+    if (InterlockedExchange8((CHAR*)&matcher->LookasideInitialized, FALSE)) {
+        ExDeleteNPagedLookasideList(&matcher->PatternLookaside);
+        ExDeleteNPagedLookasideList(&matcher->StateLookaside);
+        ExDeleteNPagedLookasideList(&matcher->IndexEntryLookaside);
+    }
+    ExFreePoolWithTag(matcher, PM_POOL_TAG);
+    return status;
 }
 
 _Use_decl_annotations_
@@ -536,6 +609,24 @@ PmShutdown(
     KeFlushQueuedDpcs();
 
     //
+    // Terminate worker thread
+    //
+    InterlockedExchange8((CHAR*)&matcher->WorkerTerminate, TRUE);
+    KeSetEvent(&matcher->WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
+
+    if (matcher->WorkerThread != NULL) {
+        KeWaitForSingleObject(
+            matcher->WorkerThread,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+        ObDereferenceObject(matcher->WorkerThread);
+        matcher->WorkerThread = NULL;
+    }
+
+    //
     // Initialize temporary lists for deferred freeing
     //
     InitializeListHead(&freePatternList);
@@ -572,6 +663,13 @@ PmShutdown(
     while (!IsListEmpty(&freeStateList)) {
         entry = RemoveHeadList(&freeStateList);
         state = CONTAINING_RECORD(entry, PM_MATCH_STATE_INTERNAL, Public.ListEntry);
+
+        //
+        // Release pattern reference (frees unloaded patterns when last ref drops)
+        //
+        if (state->Public.Pattern != NULL) {
+            PmpDereferencePattern(matcher, state->Public.Pattern);
+        }
 
         if (matcher->LookasideInitialized) {
             ExFreeToNPagedLookasideList(&matcher->StateLookaside, state);
@@ -759,9 +857,11 @@ PmLoadPattern(
     }
 
     //
-    // Reset match count
+    // Reset match count and initialize refcount
     //
     InterlockedExchange64(&newPattern->MatchCount, 0);
+    newPattern->InternalRefCount = 1;
+    newPattern->Unloading = FALSE;
 
     //
     // Initialize list entry
@@ -845,13 +945,37 @@ PmUnloadPattern(
     PmpUnindexPattern(matcher, pattern);
 
     //
-    // Free pattern
+    // Mark pattern as unloading
     //
-    if (matcher->LookasideInitialized) {
-        ExFreeToNPagedLookasideList(&matcher->PatternLookaside, pattern);
-    } else {
-        ExFreePoolWithTag(pattern, PM_POOL_TAG);
+    InterlockedExchange8((CHAR*)&pattern->Unloading, TRUE);
+
+    //
+    // Invalidate active states referencing this pattern
+    //
+    {
+        PLIST_ENTRY stateEntry;
+        PPM_MATCH_STATE_INTERNAL stateRef;
+
+        ExAcquirePushLockExclusive(&Matcher->StateLock);
+
+        for (stateEntry = Matcher->StateList.Flink;
+             stateEntry != &Matcher->StateList;
+             stateEntry = stateEntry->Flink) {
+
+            stateRef = CONTAINING_RECORD(stateEntry, PM_MATCH_STATE_INTERNAL, Public.ListEntry);
+
+            if (stateRef->Public.Pattern == pattern) {
+                InterlockedExchange8((CHAR*)&stateRef->IsStale, TRUE);
+            }
+        }
+
+        ExReleasePushLockExclusive(&Matcher->StateLock);
     }
+
+    //
+    // Release list reference (frees pattern when all state refs are released)
+    //
+    PmpDereferencePattern(matcher, pattern);
 
     return STATUS_SUCCESS;
 }
@@ -1518,6 +1642,7 @@ PmpCreateMatchState(
     RtlZeroMemory(state, sizeof(PM_MATCH_STATE_INTERNAL));
 
     state->Public.Pattern = Pattern;
+    InterlockedIncrement(&Pattern->InternalRefCount);
     state->Public.ProcessId = ProcessId;
     state->Public.CurrentEventIndex = 0;
     state->Public.MatchedEvents = 0;
@@ -1590,6 +1715,8 @@ PmpDereferenceState(
     // Only free if removed from all lists and refcount is zero
     //
     if (newRef == 0 && State->IsRemoved) {
+        PPM_PATTERN statePattern = State->Public.Pattern;
+
         if (Matcher->LookasideInitialized) {
             ExFreeToNPagedLookasideList(&Matcher->StateLookaside, State);
         } else {
@@ -1597,6 +1724,13 @@ PmpDereferenceState(
         }
 
         InterlockedIncrement64(&Matcher->Public.Stats.StatesCleanedUp);
+
+        //
+        // Release pattern reference (frees unloaded patterns when last ref drops)
+        //
+        if (statePattern != NULL) {
+            PmpDereferencePattern(Matcher, statePattern);
+        }
     }
 }
 
@@ -1604,7 +1738,7 @@ _IRQL_requires_max_(PASSIVE_LEVEL)
 static BOOLEAN
 PmpCheckEventConstraint(
     _In_ PPM_MATCHER_INTERNAL Matcher,
-    _In_ PPM_EVENT_CONSTRAINT* Constraint,
+    _In_ PPM_EVENT_CONSTRAINT Constraint,
     _In_ PM_EVENT_TYPE EventType,
     _In_opt_ PCUNICODE_STRING Path,
     _In_opt_ PCSTR Value,
@@ -2078,11 +2212,10 @@ PmpCleanupTimerDpc(
 /**
  * @brief DPC callback for periodic cleanup.
  *
- * Queues a work item to perform actual cleanup at PASSIVE_LEVEL.
+ * Signals the dedicated worker thread to perform cleanup at PASSIVE_LEVEL.
  */
 {
     PPM_MATCHER_INTERNAL matcher = (PPM_MATCHER_INTERNAL)DeferredContext;
-    PIO_WORKITEM workItem;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
@@ -2092,73 +2225,82 @@ PmpCleanupTimerDpc(
         return;
     }
 
-    //
-    // Skip if cleanup already scheduled
-    //
-    if (InterlockedCompareExchange8((CHAR*)&matcher->CleanupScheduled, TRUE, FALSE)) {
-        return;
-    }
-
-    //
-    // Queue work item for PASSIVE_LEVEL cleanup
-    // Note: In a real driver, we would use IoAllocateWorkItem with a device object
-    // For this implementation, we use a simplified approach with ExQueueWorkItem
-    //
-    workItem = (PIO_WORKITEM)ExAllocatePoolZero(
-        NonPagedPoolNx,
-        sizeof(WORK_QUEUE_ITEM),
-        PM_POOL_TAG_WORKITEM
-    );
-
-    if (workItem != NULL) {
-        ExInitializeWorkItem(
-            (PWORK_QUEUE_ITEM)workItem,
-            (PWORKER_THREAD_ROUTINE)PmpCleanupWorkItemRoutine,
-            matcher
-        );
-        ExQueueWorkItem((PWORK_QUEUE_ITEM)workItem, DelayedWorkQueue);
-    } else {
-        InterlockedExchange8((CHAR*)&matcher->CleanupScheduled, FALSE);
-    }
+    KeSetEvent(&matcher->WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
 }
 
-_Use_decl_annotations_
-VOID
-PmpCleanupWorkItemRoutine(
-    PDEVICE_OBJECT DeviceObject,
-    PVOID Context
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static VOID
+PmpWorkerThreadRoutine(
+    _In_ PVOID Context
     )
 /**
- * @brief Work item routine for cleanup at PASSIVE_LEVEL.
+ * @brief Dedicated worker thread for stale state cleanup.
+ *
+ * Waits on WorkerWakeEvent (signaled by DPC timer), performs
+ * PASSIVE_LEVEL cleanup, then loops. Terminates when
+ * WorkerTerminate is set during shutdown.
  */
 {
     PPM_MATCHER_INTERNAL matcher = (PPM_MATCHER_INTERNAL)Context;
-    PWORK_QUEUE_ITEM workItem;
-
-    UNREFERENCED_PARAMETER(DeviceObject);
 
     PAGED_CODE();
 
-    if (matcher == NULL || matcher->Public.ShuttingDown) {
+    for (;;) {
+        KeWaitForSingleObject(
+            &matcher->WorkerWakeEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+
+        if (matcher->WorkerTerminate) {
+            break;
+        }
+
+        if (!matcher->Public.ShuttingDown) {
+            PmpCleanupStaleStates(matcher);
+        }
+    }
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static VOID
+PmpDereferencePattern(
+    _In_ PPM_MATCHER_INTERNAL Matcher,
+    _In_ PPM_PATTERN Pattern
+    )
+/**
+ * @brief Decrement pattern reference count, free if unloading and zero.
+ *
+ * Patterns are reference-counted to prevent use-after-free when
+ * PmUnloadPattern races with active PmSubmitEvent processing.
+ * Pattern memory is freed only when Unloading=TRUE and refcount reaches 0.
+ *
+ * @param Matcher Internal matcher (for lookaside access)
+ * @param Pattern Pattern to dereference
+ */
+{
+    LONG newRef;
+
+    PAGED_CODE();
+
+    newRef = InterlockedDecrement(&Pattern->InternalRefCount);
+
+    if (newRef < 0) {
+        InterlockedExchange(&Pattern->InternalRefCount, 0);
         return;
     }
 
-    //
-    // Perform cleanup
-    //
-    PmpCleanupStaleStates(matcher);
-
-    //
-    // Clear scheduled flag
-    //
-    InterlockedExchange8((CHAR*)&matcher->CleanupScheduled, FALSE);
-
-    //
-    // Free work item (it was passed as Context in a simplified manner)
-    // In production, use proper IoFreeWorkItem
-    //
-    workItem = CONTAINING_RECORD(Context, WORK_QUEUE_ITEM, Parameter);
-    ExFreePoolWithTag(workItem, PM_POOL_TAG_WORKITEM);
+    if (newRef == 0 && Pattern->Unloading) {
+        if (Matcher->LookasideInitialized) {
+            ExFreeToNPagedLookasideList(&Matcher->PatternLookaside, Pattern);
+        } else {
+            ExFreePoolWithTag(Pattern, PM_POOL_TAG);
+        }
+    }
 }
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
