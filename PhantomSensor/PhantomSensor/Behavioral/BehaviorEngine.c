@@ -76,7 +76,11 @@
  * ============================================================================
  */
 
+#pragma warning(push)
+#pragma warning(disable: 4324)
 #include "BehaviorEngine.h"
+#pragma warning(pop)
+
 #include "AttackChainTracker.h"
 #include "RuleEngine.h"
 #include "ThreatScoring.h"
@@ -89,6 +93,13 @@
 #include "../Utilities/StringUtils.h"
 #include "../Callbacks/FileSystem/FileBackupEngine.h"
 #include <ntstrsafe.h>
+
+//
+// PROCESS_TERMINATE is not in WDK km headers
+//
+#ifndef PROCESS_TERMINATE
+#define PROCESS_TERMINATE 0x0001
+#endif
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -1305,18 +1316,30 @@ BeEngineGetProcessChains(
         PBE_ATTACK_CHAIN chain = CONTAINING_RECORD(entry, BE_ATTACK_CHAIN, ProcessListEntry);
 
         //
-        // Atomically increment refcount. If it was already 0, the chain
-        // is being freed - skip it.
+        // Safely acquire a reference. We loop with CmpXchg to atomically
+        // increment only if the refcount is > 0. If it's 0, the chain
+        // is being freed and we skip it.
         //
-        LONG oldRef = InterlockedCompareExchange(&chain->RefCount, 1, 0);
-        if (oldRef == 0) {
-            //
-            // Chain is being freed, skip
-            //
-            continue;
+        {
+            LONG oldRef;
+            BOOLEAN acquired = FALSE;
+
+            do {
+                oldRef = InterlockedCompareExchange(&chain->RefCount, 0, 0);
+                if (oldRef <= 0) {
+                    break;
+                }
+                if (InterlockedCompareExchange(&chain->RefCount, oldRef + 1, oldRef) == oldRef) {
+                    acquired = TRUE;
+                    break;
+                }
+            } while (TRUE);
+
+            if (!acquired) {
+                continue;
+            }
         }
 
-        InterlockedIncrement(&chain->RefCount);
         Chains[count++] = chain;
     }
 
@@ -1374,9 +1397,16 @@ BeEngineReleaseChain(
             PBE_CHAIN_ENTRY chainEntry;
 
             //
-            // Remove from hash table first
+            // Remove from hash table and active chain list
             //
             BepRemoveChainFromHash(Chain);
+
+            //
+            // Remove from process context's chain list
+            //
+            ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
+            RemoveEntryList(&Chain->ProcessListEntry);
+            ExReleaseResourceLite(&g_BeState.ProcessLock);
 
             //
             // Free all chain entries
@@ -1851,8 +1881,8 @@ BeEngineLoadRules(
     for (i = 0; i < RuleCount; i++) {
         PBE_LOADED_RULE loadedRule;
 
-        loadedRule = (PBE_LOADED_RULE)ExAllocatePoolWithTag(
-            NonPagedPoolNx,
+        loadedRule = (PBE_LOADED_RULE)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
             sizeof(BE_LOADED_RULE),
             BE_POOL_TAG_RULE
             );
@@ -2041,7 +2071,68 @@ BeEngineGetProcessTechniques(
 // ============================================================================
 
 /**
- * @brief Get behavioral engine statistics.
+ * @brief Get behavioral engine statistics (SAFE VERSION).
+ *
+ * Returns only safe-to-expose statistics. Use this for user-mode
+ * IOCTL responses to avoid kernel information disclosure.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+BeEngineGetStatisticsSafe(
+    _Out_ PBEHAVIOR_ENGINE_STATISTICS Stats
+    )
+{
+    LARGE_INTEGER currentTime;
+
+    if (Stats == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(Stats, sizeof(BEHAVIOR_ENGINE_STATISTICS));
+
+    if (!g_BeState.Initialized) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    Stats->Initialized = g_BeState.Initialized;
+    Stats->Enabled = g_BeState.Enabled;
+
+    Stats->ChainTimeoutMs = g_BeState.ChainTimeoutMs;
+    Stats->MaxActiveChains = g_BeState.MaxActiveChains;
+    Stats->MaxEventsPerChain = g_BeState.MaxEventsPerChain;
+    Stats->CorrelationWindowMs = g_BeState.CorrelationWindowMs;
+    Stats->HighThreatThreshold = g_BeState.HighThreatThreshold;
+    Stats->CriticalThreshold = g_BeState.CriticalThreshold;
+
+    Stats->ActiveChainCount = g_BeState.ActiveChainCount;
+    Stats->ProcessContextCount = g_BeState.ProcessContextCount;
+    Stats->LoadedRuleCount = g_BeState.LoadedRuleCount;
+    Stats->EnabledRuleCount = g_BeState.EnabledRuleCount;
+    Stats->PendingEventCount = g_BeState.PendingEventCount;
+    Stats->MaxPendingEvents = g_BeState.MaxPendingEvents;
+
+    Stats->TotalEventsProcessed = InterlockedCompareExchange64(&g_BeState.TotalEventsProcessed, 0, 0);
+    Stats->TotalEventsCorrelated = InterlockedCompareExchange64(&g_BeState.TotalEventsCorrelated, 0, 0);
+    Stats->TotalChainsCreated = InterlockedCompareExchange64(&g_BeState.TotalChainsCreated, 0, 0);
+    Stats->TotalRuleMatches = InterlockedCompareExchange64(&g_BeState.TotalRuleMatches, 0, 0);
+    Stats->TotalThreatsDetected = InterlockedCompareExchange64(&g_BeState.TotalThreatsDetected, 0, 0);
+    Stats->TotalThreatsBlocked = InterlockedCompareExchange64(&g_BeState.TotalThreatsBlocked, 0, 0);
+    Stats->EventsDropped = InterlockedCompareExchange64(&g_BeState.EventsDropped, 0, 0);
+
+    Stats->LastChainCleanupTime = g_BeState.LastChainCleanupTime;
+    Stats->LastStatisticsReportTime = g_BeState.LastStatisticsReportTime;
+
+    KeQuerySystemTime(&currentTime);
+    Stats->EngineUptimeMs = (UINT64)(currentTime.QuadPart / 10000) - g_BeState.LastStatisticsReportTime;
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Get behavioral engine statistics (INTERNAL ONLY).
+ *
+ * WARNING: Exposes internal kernel pointers and lock states.
+ * MUST NOT be exposed to user-mode. Use BeEngineGetStatisticsSafe instead.
  */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
@@ -2363,8 +2454,8 @@ BepAllocateEvent(
             &g_BeState.EventLookaside
             );
     } else {
-        event = (PBE_PENDING_EVENT)ExAllocatePoolWithTag(
-            NonPagedPoolNx,
+        event = (PBE_PENDING_EVENT)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
             totalSize,
             BE_POOL_TAG_EVENT
             );
@@ -2556,8 +2647,8 @@ BepInsertProcessContext(
     UINT32 hashIndex;
     PBE_PROCESS_HASH_ENTRY hashEntry;
 
-    hashEntry = (PBE_PROCESS_HASH_ENTRY)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    hashEntry = (PBE_PROCESS_HASH_ENTRY)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(BE_PROCESS_HASH_ENTRY),
         BE_POOL_TAG_GENERAL
         );
@@ -2649,7 +2740,6 @@ BepGetOrCreateProcessContext(
     _Out_ PBE_PROCESS_CONTEXT* Context
     )
 {
-    NTSTATUS status;
     UINT32 hashIndex;
     PLIST_ENTRY entry;
     PBE_PROCESS_HASH_ENTRY hashEntry;
@@ -2702,8 +2792,8 @@ BepGetOrCreateProcessContext(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    newHashEntry = (PBE_PROCESS_HASH_ENTRY)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    newHashEntry = (PBE_PROCESS_HASH_ENTRY)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(BE_PROCESS_HASH_ENTRY),
         BE_POOL_TAG_GENERAL
         );
@@ -2752,8 +2842,8 @@ BepInsertChain(
     UINT32 hashIndex;
     PBE_CHAIN_HASH_ENTRY hashEntry;
 
-    hashEntry = (PBE_CHAIN_HASH_ENTRY)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    hashEntry = (PBE_CHAIN_HASH_ENTRY)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(BE_CHAIN_HASH_ENTRY),
         BE_POOL_TAG_CHAIN
         );
@@ -3054,10 +3144,6 @@ BepGetOrCreateChain(
 
     BeEngineReleaseProcessContext(context);
     *Chain = newChain;
-    return STATUS_SUCCESS;
-}
-    }
-
     return STATUS_SUCCESS;
 }
 
@@ -3488,11 +3574,23 @@ BepCleanupStaleChains(
     ExReleaseResourceLite(&g_BeState.ChainLock);
 
     //
-    // Free stale chains
+    // Free stale chains — also remove from hash table and process chain list
     //
     while (!IsListEmpty(&staleList)) {
         entry = RemoveHeadList(&staleList);
         chain = CONTAINING_RECORD(entry, BE_ATTACK_CHAIN, ListEntry);
+
+        //
+        // Remove from chain hash table
+        //
+        BepRemoveChainFromHash(chain);
+
+        //
+        // Remove from process context's chain list
+        //
+        ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
+        RemoveEntryList(&chain->ProcessListEntry);
+        ExReleaseResourceLite(&g_BeState.ProcessLock);
 
         //
         // Free chain entries
@@ -3697,5 +3795,3 @@ BepGetProcessName(
     RtlCopyMemory(ProcessName, lastSlash, nameLen * sizeof(WCHAR));
     ProcessName[nameLen] = L'\0';
 }
-
-#endif // SHADOWSTRIKE_BEHAVIOR_ENGINE_C

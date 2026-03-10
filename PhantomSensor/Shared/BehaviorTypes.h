@@ -266,7 +266,7 @@ typedef enum _THREAT_SEVERITY {
     ThreatSeverity_Medium         = 3,
     ThreatSeverity_High           = 4,
     ThreatSeverity_Critical       = 5
-} THREAT_SEVERITY;
+} THREAT_SEVERITY, *PTHREAT_SEVERITY;
 
 // ============================================================================
 // ATTACK CHAIN STATE

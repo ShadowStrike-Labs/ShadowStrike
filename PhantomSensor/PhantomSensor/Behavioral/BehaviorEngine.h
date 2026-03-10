@@ -38,6 +38,8 @@
 
 #pragma once
 
+#include <ntifs.h>
+#include <ntddk.h>
 #include <fltKernel.h>
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Shared/AttackPatterns.h"
