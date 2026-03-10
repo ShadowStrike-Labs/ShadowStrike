@@ -47,7 +47,7 @@
 #include "AnomalyDetector.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, AdInitialize)
+#pragma alloc_text(PAGE, AdInitialize)
 #pragma alloc_text(PAGE, AdShutdown)
 #pragma alloc_text(PAGE, AdSetThreshold)
 #pragma alloc_text(PAGE, AdRegisterCallback)
@@ -190,16 +190,6 @@ typedef struct _AD_CALLBACK_ENTRY {
 /**
  * @brief Work item context for deferred cleanup.
  */
-typedef struct _AD_CLEANUP_WORK_CONTEXT {
-    PIO_WORKITEM WorkItem;
-    struct _AD_DETECTOR* Detector;
-} AD_CLEANUP_WORK_CONTEXT, *PAD_CLEANUP_WORK_CONTEXT;
-
-/**
- * @brief Scratch buffer for statistical calculations.
- * Allocated once per detector to avoid stack overflow.
- * [FIX: P0 - Stack overflow]
- */
 typedef struct _AD_SCRATCH_BUFFER {
     DOUBLE SortBuffer[AD_BASELINE_SAMPLES];
     DOUBLE DeviationBuffer[AD_BASELINE_SAMPLES];
@@ -283,13 +273,11 @@ typedef struct _AD_DETECTOR {
     PAD_SCRATCH_BUFFER ScratchBuffer;
 
     //
-    // Cleanup timer and work item [FIX: P0 - DPC IRQL violation]
+    // Cleanup thread (replaces KTIMER+KDPC for PASSIVE-level cleanup)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    PIO_WORKITEM CleanupWorkItem;
-    PDEVICE_OBJECT DeviceObject;
-    volatile LONG CleanupInProgress;
+    PETHREAD CleanupThread;
+    KEVENT CleanupWakeEvent;
+    volatile LONG CleanupTerminate;
 
     //
     // Statistics
@@ -307,14 +295,13 @@ typedef struct _AD_DETECTOR {
 // ============================================================================
 
 static VOID
-AdpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+AdpCleanupWorkerThread(
+    _In_ PVOID StartContext
     );
 
-IO_WORKITEM_ROUTINE AdpCleanupWorkItemRoutine;
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, AdpCleanupWorkerThread)
+#endif
 
 static NTSTATUS
 AdpInitializeHashTable(
@@ -411,24 +398,6 @@ AdpCalculateSeverityScore(
     _In_ AD_METRIC_TYPE Metric
     );
 
-static BOOLEAN
-AdpIsHighConfidenceAnomaly(
-    _In_ PAD_BASELINE_INTERNAL Baseline,
-    _In_ DOUBLE DeviationSigmas,
-    _In_ DOUBLE Value
-    );
-
-static VOID
-AdpCreateAnomalyInfo(
-    _In_opt_ HANDLE ProcessId,
-    _In_opt_z_ PCWSTR ProcessName,
-    _In_ AD_METRIC_TYPE Metric,
-    _In_ PAD_BASELINE_INTERNAL Baseline,
-    _In_ DOUBLE ObservedValue,
-    _In_ DOUBLE DeviationSigmas,
-    _Out_ PAD_ANOMALY_INFO AnomalyInfo
-    );
-
 static VOID
 AdpNotifyCallbacks(
     _In_ PAD_DETECTOR Detector,
@@ -503,7 +472,6 @@ AdInitialize(
 {
     NTSTATUS status;
     PAD_DETECTOR detector = NULL;
-    LARGE_INTEGER timerDue;
     ULONG i;
     KFLOATING_SAVE floatSave;
     BOOLEAN floatSaved = FALSE;
@@ -519,8 +487,8 @@ AdInitialize(
     //
     // Allocate detector structure from NonPagedPoolNx
     //
-    detector = (PAD_DETECTOR)ExAllocatePoolZero(
-        NonPagedPoolNx,
+    detector = (PAD_DETECTOR)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(AD_DETECTOR),
         AD_POOL_TAG
     );
@@ -571,8 +539,8 @@ AdInitialize(
     //
     // Allocate scratch buffer [FIX: P0 - Stack overflow]
     //
-    detector->ScratchBuffer = (PAD_SCRATCH_BUFFER)ExAllocatePoolZero(
-        NonPagedPoolNx,
+    detector->ScratchBuffer = (PAD_SCRATCH_BUFFER)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(AD_SCRATCH_BUFFER),
         AD_POOL_TAG
     );
@@ -635,14 +603,11 @@ AdInitialize(
     detector->MinimumSamples = AD_MIN_SAMPLES_FOR_DETECTION;
 
     //
-    // Initialize cleanup timer
+    // Initialize cleanup thread synchronization
     //
-    KeInitializeTimer(&detector->CleanupTimer);
-    KeInitializeDpc(
-        &detector->CleanupDpc,
-        AdpCleanupTimerDpc,
-        detector
-    );
+    KeInitializeEvent(&detector->CleanupWakeEvent, SynchronizationEvent, FALSE);
+    detector->CleanupTerminate = FALSE;
+    detector->CleanupThread = NULL;
 
     //
     // Create global baselines for each metric type
@@ -705,15 +670,74 @@ AdInitialize(
     KeQuerySystemTime(&detector->Stats.StartTime);
 
     //
-    // Start cleanup timer
+    // Start cleanup worker thread
     //
-    timerDue.QuadPart = -((LONGLONG)AD_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &detector->CleanupTimer,
-        timerDue,
-        AD_CLEANUP_INTERVAL_MS,
-        &detector->CleanupDpc
-    );
+    {
+        HANDLE threadHandle;
+        OBJECT_ATTRIBUTES oa;
+
+        InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+
+        status = PsCreateSystemThread(
+            &threadHandle,
+            THREAD_ALL_ACCESS,
+            &oa,
+            NULL,
+            NULL,
+            AdpCleanupWorkerThread,
+            detector
+        );
+
+        if (!NT_SUCCESS(status)) {
+            if (floatSaved) {
+                KeRestoreFloatingPointState(&floatSave);
+            }
+
+            KeEnterCriticalRegion();
+            ExAcquirePushLockExclusive(&detector->GlobalBaselineLock);
+            while (!IsListEmpty(&detector->GlobalBaselines)) {
+                PLIST_ENTRY be = RemoveHeadList(&detector->GlobalBaselines);
+                PAD_BASELINE_INTERNAL bl = CONTAINING_RECORD(
+                    be, AD_BASELINE_INTERNAL, ListEntry
+                );
+                ExFreeToNPagedLookasideList(&detector->BaselineLookaside, bl);
+            }
+            ExReleasePushLockExclusive(&detector->GlobalBaselineLock);
+            KeLeaveCriticalRegion();
+
+            if (detector->LookasideInitialized) {
+                ExDeleteNPagedLookasideList(&detector->BaselineLookaside);
+                ExDeleteNPagedLookasideList(&detector->AnomalyLookaside);
+                ExDeleteNPagedLookasideList(&detector->ProcessBaselineLookaside);
+            }
+
+            ExFreePoolWithTag(detector->ScratchBuffer, AD_POOL_TAG);
+            AdpFreeHashTable(&detector->ProcessHash.Buckets);
+            ExFreePoolWithTag(detector, AD_POOL_TAG);
+            return status;
+        }
+
+        status = ObReferenceObjectByHandle(
+            threadHandle,
+            THREAD_ALL_ACCESS,
+            *PsThreadType,
+            KernelMode,
+            (PVOID*)&detector->CleanupThread,
+            NULL
+        );
+
+        ZwClose(threadHandle);
+
+        if (!NT_SUCCESS(status)) {
+            //
+            // Thread is running but we cannot track it.
+            // Signal termination and proceed; thread will self-terminate.
+            //
+            InterlockedExchange(&detector->CleanupTerminate, TRUE);
+            KeSetEvent(&detector->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
+            detector->CleanupThread = NULL;
+        }
+    }
 
     //
     // Mark as initialized
@@ -736,7 +760,6 @@ AdShutdown(
     PAD_PROCESS_BASELINE processBaseline;
     KIRQL oldIrql;
     LARGE_INTEGER timeout;
-    NTSTATUS waitStatus;
 
     PAGED_CODE();
 
@@ -757,32 +780,24 @@ AdShutdown(
     InterlockedExchange(&Detector->Initialized, FALSE);
 
     //
-    // Cancel the cleanup timer
+    // Signal cleanup thread to terminate and wait
     //
-    KeCancelTimer(&Detector->CleanupTimer);
-    KeFlushQueuedDpcs();
+    InterlockedExchange(&Detector->CleanupTerminate, TRUE);
+    KeSetEvent(&Detector->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
 
-    //
-    // Wait for cleanup to complete with timeout [FIX: P1 - Infinite loop]
-    //
-    timeout.QuadPart = -((LONGLONG)AD_SHUTDOWN_TIMEOUT_MS * 10000);
+    if (Detector->CleanupThread != NULL) {
+        timeout.QuadPart = -((LONGLONG)AD_SHUTDOWN_TIMEOUT_MS * 10000);
 
-    while (Detector->CleanupInProgress) {
-        LARGE_INTEGER delay;
-        delay.QuadPart = -10000; // 1ms
+        KeWaitForSingleObject(
+            Detector->CleanupThread,
+            Executive,
+            KernelMode,
+            FALSE,
+            &timeout
+        );
 
-        waitStatus = KeDelayExecutionThread(KernelMode, FALSE, &delay);
-        if (waitStatus != STATUS_SUCCESS) {
-            break;
-        }
-
-        timeout.QuadPart += 10000;
-        if (timeout.QuadPart >= 0) {
-            //
-            // Timeout exceeded - proceed anyway but log
-            //
-            break;
-        }
+        ObDereferenceObject(Detector->CleanupThread);
+        Detector->CleanupThread = NULL;
     }
 
     //
@@ -792,7 +807,7 @@ AdShutdown(
     AdpDereferenceDetector(Detector);
 
     timeout.QuadPart = -((LONGLONG)AD_SHUTDOWN_TIMEOUT_MS * 10000);
-    waitStatus = KeWaitForSingleObject(
+    KeWaitForSingleObject(
         &Detector->ZeroRefEvent,
         Executive,
         KernelMode,
@@ -1570,73 +1585,113 @@ AdGetStatistics(
 // ============================================================================
 
 /**
- * @brief DPC callback for cleanup timer.
+ * @brief Cleanup worker thread.
  *
- * This DPC only queues a work item - actual cleanup happens at PASSIVE_LEVEL.
- * [FIX: P0 - DPC calling push locks at DISPATCH_LEVEL]
+ * Runs at PASSIVE_LEVEL — can safely acquire push locks for process
+ * baseline eviction. Wakes periodically or on shutdown signal.
  */
 static VOID
-AdpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+AdpCleanupWorkerThread(
+    _In_ PVOID StartContext
     )
 {
-    PAD_DETECTOR detector = (PAD_DETECTOR)DeferredContext;
-    PLIST_ENTRY entry;
-    PLIST_ENTRY next;
-    PAD_ANOMALY_INTERNAL anomaly;
+    PAD_DETECTOR detector = (PAD_DETECTOR)StartContext;
+    LARGE_INTEGER timeout;
     LARGE_INTEGER currentTime;
     LARGE_INTEGER cutoffTime;
+    LARGE_INTEGER staleTime;
+    PLIST_ENTRY entry;
+    PLIST_ENTRY next;
     KIRQL oldIrql;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    PAGED_CODE();
 
-    if (detector == NULL || !detector->Initialized || detector->ShuttingDown) {
-        return;
-    }
+    timeout.QuadPart = -((LONGLONG)AD_CLEANUP_INTERVAL_MS * 10000);
 
-    if (InterlockedCompareExchange(&detector->CleanupInProgress, 1, 0) != 0) {
-        return;
-    }
+    while (!detector->CleanupTerminate) {
 
-    KeQuerySystemTime(&currentTime);
+        KeWaitForSingleObject(
+            &detector->CleanupWakeEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &timeout
+        );
 
-    //
-    // Only cleanup anomaly list here (spinlock is safe at DISPATCH_LEVEL)
-    // Process baseline cleanup is deferred - not critical for DPC
-    //
-    cutoffTime.QuadPart = currentTime.QuadPart - ((LONGLONG)3600 * 10000000);
-
-    KeAcquireSpinLock(&detector->AnomalyLock, &oldIrql);
-
-    for (entry = detector->AnomalyList.Flink;
-         entry != &detector->AnomalyList;
-         entry = next) {
-
-        next = entry->Flink;
-        anomaly = CONTAINING_RECORD(entry, AD_ANOMALY_INTERNAL, ListEntry);
-
-        if (anomaly->Info.DetectionTime.QuadPart < cutoffTime.QuadPart) {
-            RemoveEntryList(&anomaly->ListEntry);
-            InterlockedDecrement(&detector->AnomalyCount);
-            ExFreeToNPagedLookasideList(&detector->AnomalyLookaside, anomaly);
+        if (detector->CleanupTerminate) {
+            break;
         }
+
+        KeClearEvent(&detector->CleanupWakeEvent);
+
+        KeQuerySystemTime(&currentTime);
+
+        //
+        // Phase 1: Evict stale anomalies (spinlock — safe at any IRQL)
+        //
+        cutoffTime.QuadPart = currentTime.QuadPart - ((LONGLONG)3600 * 10000000);
+
+        KeAcquireSpinLock(&detector->AnomalyLock, &oldIrql);
+
+        for (entry = detector->AnomalyList.Flink;
+             entry != &detector->AnomalyList;
+             entry = next) {
+
+            next = entry->Flink;
+            PAD_ANOMALY_INTERNAL anomaly = CONTAINING_RECORD(
+                entry, AD_ANOMALY_INTERNAL, ListEntry
+            );
+
+            if (anomaly->Info.DetectionTime.QuadPart < cutoffTime.QuadPart) {
+                RemoveEntryList(&anomaly->ListEntry);
+                InterlockedDecrement(&detector->AnomalyCount);
+                ExFreeToNPagedLookasideList(&detector->AnomalyLookaside, anomaly);
+            }
+        }
+
+        KeReleaseSpinLock(&detector->AnomalyLock, oldIrql);
+
+        //
+        // Phase 2: Evict stale process baselines (push lock at PASSIVE)
+        //
+        staleTime.QuadPart = currentTime.QuadPart -
+            ((LONGLONG)AD_STALE_BASELINE_AGE_MS * 10000);
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&detector->ProcessBaselineListLock);
+        ExAcquirePushLockExclusive(&detector->ProcessHash.Lock);
+
+        for (entry = detector->ProcessBaselineList.Flink;
+             entry != &detector->ProcessBaselineList;
+             entry = next) {
+
+            next = entry->Flink;
+            PAD_PROCESS_BASELINE pb = CONTAINING_RECORD(
+                entry, AD_PROCESS_BASELINE, ListEntry
+            );
+
+            //
+            // Only evict if nobody else holds a reference (RefCount == 1 = list ref)
+            // and the baseline is stale
+            //
+            if (pb->RefCount == 1 &&
+                pb->LastActivityTime.QuadPart < staleTime.QuadPart) {
+
+                RemoveEntryList(&pb->ListEntry);
+                RemoveEntryList(&pb->HashEntry);
+                InterlockedDecrement(&detector->ProcessBaselineCount);
+                ExFreeToNPagedLookasideList(
+                    &detector->ProcessBaselineLookaside, pb
+                );
+            }
+        }
+
+        ExReleasePushLockExclusive(&detector->ProcessHash.Lock);
+        ExReleasePushLockExclusive(&detector->ProcessBaselineListLock);
+        KeLeaveCriticalRegion();
     }
 
-    KeReleaseSpinLock(&detector->AnomalyLock, oldIrql);
-
-    //
-    // Note: Process baseline cleanup would require push locks, which cannot
-    // be acquired at DISPATCH_LEVEL. For a production implementation, we would
-    // queue a work item here. For now, stale process baselines are cleaned up
-    // during shutdown or when the hash table is accessed.
-    //
-
-    InterlockedExchange(&detector->CleanupInProgress, 0);
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 // ============================================================================
@@ -1652,8 +1707,8 @@ AdpInitializeHashTable(
     LIST_ENTRY* buckets;
     ULONG i;
 
-    buckets = (LIST_ENTRY*)ExAllocatePoolZero(
-        NonPagedPoolNx,
+    buckets = (LIST_ENTRY*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         BucketCount * sizeof(LIST_ENTRY),
         AD_POOL_TAG
     );
@@ -2063,8 +2118,8 @@ AdpCalculateZScoreLocked(
 /**
  * @brief Calculate Modified Z-score using MAD.
  *
- * Uses scratch buffer to avoid stack overflow.
- * [FIX: P0 - Stack overflow in ModifiedZScore/MAD]
+ * Lock ordering: ScratchBuffer->Lock first, then Baseline->Lock at DPC level.
+ * Samples are copied under baseline lock, all calculations use the copies.
  */
 static DOUBLE
 AdpCalculateModifiedZScore(
@@ -2077,64 +2132,76 @@ AdpCalculateModifiedZScore(
     DOUBLE mad;
     DOUBLE modifiedZScore;
     ULONG count;
+    ULONG i;
     KIRQL oldIrql;
-    KIRQL baselineIrql;
 
     //
-    // Acquire baseline lock to read samples
-    //
-    KeAcquireSpinLock(&Baseline->Lock, &baselineIrql);
-
-    count = Baseline->SampleCount;
-    if (count < 3) {
-        DOUBLE zScore = AdpCalculateZScoreLocked(Baseline, Value);
-        KeReleaseSpinLock(&Baseline->Lock, baselineIrql);
-        return zScore;
-    }
-
-    //
-    // Acquire scratch buffer lock
+    // Acquire scratch buffer lock first (establishes DISPATCH_LEVEL)
     //
     KeAcquireSpinLock(&Detector->ScratchBuffer->Lock, &oldIrql);
 
     //
-    // Copy samples to scratch buffer for sorting
+    // Acquire baseline lock at DPC level (already at DISPATCH from scratch lock)
+    //
+    KeAcquireSpinLockAtDpcLevel(&Baseline->Lock);
+
+    count = Baseline->SampleCount;
+    if (count < 3) {
+        DOUBLE zScore = AdpCalculateZScoreLocked(Baseline, Value);
+        KeReleaseSpinLockFromDpcLevel(&Baseline->Lock);
+        KeReleaseSpinLock(&Detector->ScratchBuffer->Lock, oldIrql);
+        return zScore;
+    }
+
+    //
+    // Copy samples to both scratch buffers:
+    // - SortBuffer: will be sorted in-place for median
+    // - DeviationBuffer: preserves original order for MAD calculation
     //
     RtlCopyMemory(
         Detector->ScratchBuffer->SortBuffer,
         Baseline->Samples,
         count * sizeof(DOUBLE)
     );
-
-    KeReleaseSpinLock(&Baseline->Lock, baselineIrql);
+    RtlCopyMemory(
+        Detector->ScratchBuffer->DeviationBuffer,
+        Baseline->Samples,
+        count * sizeof(DOUBLE)
+    );
 
     //
-    // Calculate median
+    // Release baseline lock (stay at DISPATCH — scratch lock still held)
+    //
+    KeReleaseSpinLockFromDpcLevel(&Baseline->Lock);
+
+    //
+    // Calculate median from SortBuffer (sorts in place)
     //
     median = AdpCalculateMedian(Detector->ScratchBuffer->SortBuffer, count);
 
     //
-    // Calculate MAD
+    // Calculate MAD: compute |x_i - median| into SortBuffer, then find median
     //
-    KeAcquireSpinLock(&Baseline->Lock, &baselineIrql);
-    mad = AdpCalculateMAD(Detector, Baseline->Samples, count, median);
-    KeReleaseSpinLock(&Baseline->Lock, baselineIrql);
+    for (i = 0; i < count; i++) {
+        DOUBLE diff = Detector->ScratchBuffer->DeviationBuffer[i] - median;
+        Detector->ScratchBuffer->SortBuffer[i] = (diff < 0.0) ? -diff : diff;
+    }
+    mad = AdpCalculateMedian(Detector->ScratchBuffer->SortBuffer, count);
 
     KeReleaseSpinLock(&Detector->ScratchBuffer->Lock, oldIrql);
 
     if (mad < 0.0001) {
         //
-        // If MAD is essentially zero, fall back to simple comparison
+        // MAD is essentially zero — fall back to standard Z-score
         //
-        KeAcquireSpinLock(&Baseline->Lock, &baselineIrql);
-        DOUBLE zScore = AdpCalculateZScoreLocked(Baseline, Value);
-        KeReleaseSpinLock(&Baseline->Lock, baselineIrql);
-        return zScore;
+        KeAcquireSpinLock(&Baseline->Lock, &oldIrql);
+        {
+            DOUBLE zScore = AdpCalculateZScoreLocked(Baseline, Value);
+            KeReleaseSpinLock(&Baseline->Lock, oldIrql);
+            return zScore;
+        }
     }
 
-    //
-    // Calculate modified Z-score
-    //
     modifiedZScore = AD_MAD_CONSTANT * (Value - median) / mad;
 
     return (modifiedZScore < 0.0) ? -modifiedZScore : modifiedZScore;
@@ -2265,19 +2332,6 @@ AdpCalculateSeverityScore(
     return finalScore;
 }
 
-static BOOLEAN
-AdpIsHighConfidenceAnomaly(
-    _In_ PAD_BASELINE_INTERNAL Baseline,
-    _In_ DOUBLE DeviationSigmas,
-    _In_ DOUBLE Value
-    )
-{
-    UNREFERENCED_PARAMETER(Baseline);
-    UNREFERENCED_PARAMETER(Value);
-
-    return (DeviationSigmas >= AD_HIGH_CONFIDENCE_SIGMA);
-}
-
 static VOID
 AdpAddAnomalyToList(
     _In_ PAD_DETECTOR Detector,
@@ -2338,11 +2392,9 @@ AdpNotifyCallbacks(
     )
 {
     ULONG i;
+    AD_ANOMALY_CALLBACK callback;
+    PVOID context;
 
-    //
-    // Callbacks are invoked without holding locks to prevent deadlock
-    // Callbacks are expected to be brief and non-blocking
-    //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Detector->CallbackLock);
 
@@ -2351,15 +2403,16 @@ AdpNotifyCallbacks(
             Detector->Callbacks[i].Callback != NULL) {
 
             //
-            // Release lock during callback to prevent deadlock
+            // Snapshot callback and context before releasing lock
+            // to prevent UAF if another thread unregisters concurrently
             //
+            callback = Detector->Callbacks[i].Callback;
+            context = Detector->Callbacks[i].Context;
+
             ExReleasePushLockShared(&Detector->CallbackLock);
             KeLeaveCriticalRegion();
 
-            Detector->Callbacks[i].Callback(
-                AnomalyInfo,
-                Detector->Callbacks[i].Context
-            );
+            callback(AnomalyInfo, context);
 
             KeEnterCriticalRegion();
             ExAcquirePushLockShared(&Detector->CallbackLock);
