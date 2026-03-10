@@ -49,6 +49,14 @@ extern "C" {
 #endif
 
 #include <ntddk.h>
+#pragma warning(push)
+#pragma warning(disable:4201)   // nameless struct/union — ndis.h
+#pragma warning(disable:4324)   // structure padded — ndis.h
+#ifndef NDIS_SUPPORT_NDIS650
+#define NDIS_SUPPORT_NDIS650 1
+#endif
+#include <ndis.h>
+#pragma warning(pop)
 #include <fwpsk.h>
 #include <fwpmk.h>
 #include "../../Shared/NetworkTypes.h"

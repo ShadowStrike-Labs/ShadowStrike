@@ -56,7 +56,11 @@ Performance Characteristics:
 ===============================================================================
 --*/
 
+#pragma warning(push)
+#pragma warning(disable:4324)   // structure padded due to __declspec(align())
 #include "DnsMonitor.h"
+#pragma warning(pop)
+
 #include "../Core/Globals.h"
 #include "NetworkReputation.h"
 #include "C2Detection.h"
@@ -235,13 +239,13 @@ struct _DNS_MONITOR {
     } TunnelHash;
 
     //
-    // Cleanup: timer fires DPC, DPC queues work item at PASSIVE_LEVEL
+    // Cleanup: timer fires DPC, DPC signals event, thread runs at PASSIVE_LEVEL
     //
     KTIMER CleanupTimer;
     KDPC CleanupDpc;
-    PIO_WORKITEM CleanupWorkItem;
-    PDEVICE_OBJECT DeviceObject;
-    volatile LONG CleanupInProgress;
+    PETHREAD CleanupThread;
+    KEVENT CleanupWakeEvent;
+    volatile LONG CleanupTerminate;
 
     //
     // Lookaside lists
@@ -439,9 +443,8 @@ DnspCleanupTimerDpc(
     );
 
 static VOID
-DnspCleanupWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+DnspCleanupThreadRoutine(
+    _In_ PVOID Context
     );
 
 static VOID
@@ -462,6 +465,24 @@ DnspPopulateProcessName(
     _In_ ULONG MaxChars,
     _Out_ PUSHORT LengthInBytes
     );
+
+//
+// Page-aligned functions — all run at IRQL <= APC_LEVEL and use push locks.
+// alloc_text must come after function prototypes to avoid C2157.
+//
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, DnsInitialize)
+#pragma alloc_text(PAGE, DnsShutdown)
+#pragma alloc_text(PAGE, DnsProcessQuery)
+#pragma alloc_text(PAGE, DnsProcessResponse)
+#pragma alloc_text(PAGE, DnsLookupDomain)
+#pragma alloc_text(PAGE, DnsSetDomainReputation)
+#pragma alloc_text(PAGE, DnsGetProcessQueries)
+#pragma alloc_text(PAGE, DnsGetProcessStats)
+#pragma alloc_text(PAGE, DnspCleanupExpiredEntries)
+#pragma alloc_text(PAGE, DnspCleanupThreadRoutine)
+#pragma alloc_text(PAGE, DnspFreeQuery)
+#endif
 
 // ============================================================================
 // CHARACTER CLASSIFICATION TABLES
@@ -629,6 +650,8 @@ DnsInitialize(
     ULONG i;
     LARGE_INTEGER dueTime;
 
+    PAGED_CODE();
+
     if (Monitor == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -748,26 +771,50 @@ DnsInitialize(
     monitor->LookasideInitialized = TRUE;
 
     //
-    // Initialize cleanup timer + work item.
-    // DPC fires at DISPATCH_LEVEL and queues a work item at PASSIVE_LEVEL.
+    // Initialize cleanup timer + system thread.
+    // DPC fires at DISPATCH_LEVEL and signals event.
+    // Thread waits at PASSIVE_LEVEL and runs cleanup.
     //
     KeInitializeTimer(&monitor->CleanupTimer);
     KeInitializeDpc(&monitor->CleanupDpc, DnspCleanupTimerDpc, monitor);
+    KeInitializeEvent(&monitor->CleanupWakeEvent, SynchronizationEvent, FALSE);
+    monitor->CleanupTerminate = 0;
 
-    //
-    // Work item requires a device object. Obtain from globals.
-    // If DeviceObject is not available, cleanup will be deferred to shutdown.
-    //
-    if (g_DriverData.DeviceObject != NULL) {
-        monitor->DeviceObject = g_DriverData.DeviceObject;
-        monitor->CleanupWorkItem = IoAllocateWorkItem(monitor->DeviceObject);
-        if (monitor->CleanupWorkItem == NULL) {
-            status = STATUS_INSUFFICIENT_RESOURCES;
+    {
+        HANDLE threadHandle = NULL;
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+
+        status = PsCreateSystemThread(
+            &threadHandle,
+            THREAD_ALL_ACCESS,
+            &oa,
+            NULL,
+            NULL,
+            DnspCleanupThreadRoutine,
+            monitor
+        );
+
+        if (!NT_SUCCESS(status)) {
+            goto Cleanup;
+        }
+
+        status = ObReferenceObjectByHandle(
+            threadHandle,
+            THREAD_ALL_ACCESS,
+            *PsThreadType,
+            KernelMode,
+            (PVOID*)&monitor->CleanupThread,
+            NULL
+        );
+
+        ZwClose(threadHandle);
+
+        if (!NT_SUCCESS(status)) {
+            monitor->CleanupThread = NULL;
             goto Cleanup;
         }
     }
-
-    monitor->CleanupInProgress = 0;
 
     dueTime.QuadPart = -((LONGLONG)DNS_CLEANUP_INTERVAL_MS * 10000);
     KeSetTimerEx(
@@ -795,8 +842,12 @@ DnsInitialize(
 
 Cleanup:
     if (monitor != NULL) {
-        if (monitor->CleanupWorkItem != NULL) {
-            IoFreeWorkItem(monitor->CleanupWorkItem);
+        if (monitor->CleanupThread != NULL) {
+            InterlockedExchange(&monitor->CleanupTerminate, 1);
+            KeSetEvent(&monitor->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
+            KeWaitForSingleObject(monitor->CleanupThread, Executive, KernelMode, FALSE, NULL);
+            ObDereferenceObject(monitor->CleanupThread);
+            monitor->CleanupThread = NULL;
         }
         if (monitor->LookasideInitialized) {
             ExDeleteNPagedLookasideList(&monitor->QueryLookaside);
@@ -835,6 +886,8 @@ DnsShutdown(
     PDNS_PROCESS_CONTEXT processCtx;
     PDNS_TUNNEL_CONTEXT tunnelCtx;
 
+    PAGED_CODE();
+
     if (Monitor == NULL || !InterlockedExchange(&Monitor->Initialized, FALSE)) {
         return;
     }
@@ -846,12 +899,21 @@ DnsShutdown(
     KeFlushQueuedDpcs();
 
     //
-    // Wait for any in-progress work item to finish.
+    // Signal cleanup thread to terminate and wait for it.
     //
-    while (InterlockedCompareExchange(&Monitor->CleanupInProgress, 0, 0) != 0) {
-        LARGE_INTEGER delay;
-        delay.QuadPart = -10000; // 1ms
-        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    InterlockedExchange(&Monitor->CleanupTerminate, 1);
+    KeSetEvent(&Monitor->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
+
+    if (Monitor->CleanupThread != NULL) {
+        KeWaitForSingleObject(
+            Monitor->CleanupThread,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+        ObDereferenceObject(Monitor->CleanupThread);
+        Monitor->CleanupThread = NULL;
     }
 
     //
@@ -942,13 +1004,6 @@ DnsShutdown(
     }
 
     //
-    // Free work item
-    //
-    if (Monitor->CleanupWorkItem != NULL) {
-        IoFreeWorkItem(Monitor->CleanupWorkItem);
-    }
-
-    //
     // Free hash tables
     //
     if (Monitor->TransactionHash.Buckets != NULL) {
@@ -992,6 +1047,8 @@ DnsProcessQuery(
     BOOLEAN shouldBlock = FALSE;
     ULONG txHashBucket;
     KIRQL oldIrql;
+
+    PAGED_CODE();
 
     if (Monitor == NULL || !Monitor->Initialized || DnsPacket == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1216,6 +1273,8 @@ DnsProcessResponse(
     _In_ BOOLEAN IsIPv6
     )
 {
+    PAGED_CODE();
+
     if (Monitor == NULL || !Monitor->Initialized || DnsPacket == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1416,6 +1475,8 @@ Routine Description:
 {
     PDNS_DOMAIN_CACHE entry;
 
+    PAGED_CODE();
+
     if (Monitor == NULL || !Monitor->Initialized ||
         DomainName == NULL || EntryCopy == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1449,6 +1510,8 @@ DnsSetDomainReputation(
     )
 {
     PDNS_DOMAIN_CACHE entry;
+
+    PAGED_CODE();
 
     if (Monitor == NULL || !Monitor->Initialized || DomainName == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1494,6 +1557,8 @@ DnsGetProcessQueries(
     ULONG count = 0;
     KIRQL oldIrql;
 
+    PAGED_CODE();
+
     if (Monitor == NULL || !Monitor->Initialized ||
         Queries == NULL || QueryCount == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1535,6 +1600,8 @@ DnsGetProcessStats(
     )
 {
     PDNS_PROCESS_CONTEXT processCtx;
+
+    PAGED_CODE();
 
     if (Monitor == NULL || !Monitor->Initialized ||
         TotalQueries == NULL || UniqueDomains == NULL ||
@@ -2049,6 +2116,16 @@ DnspParseResponse(
 
         query->Response.AddressCount = addressCount;
         query->Response.CNAMECount = cnameCount;
+
+        //
+        // Fast-flux detection: many resolved addresses with very low TTL
+        // indicates a fast-flux network used for C2, phishing, or botnets.
+        // Thresholds: >= 5 addresses AND TTL < 300 seconds (5 minutes).
+        //
+        if (addressCount >= 5 && query->Response.TTL < 300) {
+            query->SuspicionFlags |= DnsSuspicion_FastFlux;
+            query->SuspicionScore += 25;
+        }
     }
 
 DoneParsingAnswers:
@@ -2073,10 +2150,10 @@ DnspCalculateEntropy(
 Routine Description:
     Calculates Shannon entropy using fixed-point arithmetic and a log2 lookup
     table. Returns entropy * 100 (e.g., 380 = 3.80 bits per character).
-    Uses pool-allocated frequency table to reduce stack pressure.
+    Uses stack-allocated frequency table (1KB on x64 12-24KB kernel stack).
 --*/
 {
-    PULONG charCount;
+    ULONG charCount[256];
     ULONG i;
     ULONG64 entropy = 0;
 
@@ -2084,16 +2161,7 @@ Routine Description:
         return 0;
     }
 
-    // Allocate frequency table from pool to avoid 1KB stack allocation
-    charCount = (PULONG)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
-        sizeof(ULONG) * 256,
-        DNS_POOL_TAG
-    );
-
-    if (charCount == NULL) {
-        return 0;
-    }
+    RtlZeroMemory(charCount, sizeof(charCount));
 
     for (i = 0; i < Length; i++) {
         charCount[(UCHAR)String[i]]++;
@@ -2119,8 +2187,6 @@ Routine Description:
             entropy += contribution;
         }
     }
-
-    ExFreePoolWithTag(charCount, DNS_POOL_TAG);
 
     // entropy is sum(count * g_Log2Table[scaled])
     // Divide by Length (for probability) and by 256 (log table scale), multiply by 100
@@ -2410,11 +2476,6 @@ DnspGetOrCreateTunnelContext(
         return context;
     }
 
-    // Enforce limit (fix DESIGN-03)
-    if (Monitor->TunnelContextCount >= DNS_MAX_TUNNEL_CONTEXTS) {
-        return NULL;
-    }
-
     context = (PDNS_TUNNEL_CONTEXT)ExAllocateFromNPagedLookasideList(
         &Monitor->TunnelContextLookaside);
 
@@ -2450,6 +2511,13 @@ DnspGetOrCreateTunnelContext(
             InterlockedIncrement(&candidate->RefCount);
             return candidate;
         }
+    }
+
+    // Enforce limit under exclusive lock to prevent TOCTOU race
+    if (Monitor->TunnelContextCount >= DNS_MAX_TUNNEL_CONTEXTS) {
+        ExReleasePushLockExclusive(&Monitor->TunnelContextLock);
+        ExFreeToNPagedLookasideList(&Monitor->TunnelContextLookaside, context);
+        return NULL;
     }
 
     InsertTailList(&Monitor->TunnelContextList, &context->ListEntry);
@@ -2648,11 +2716,6 @@ DnspGetOrCreateProcessContext(
         return context;
     }
 
-    // Enforce limit (fix DESIGN-03)
-    if (Monitor->ProcessCount >= DNS_MAX_PROCESS_CONTEXTS) {
-        return NULL;
-    }
-
     context = (PDNS_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
         &Monitor->ProcessContextLookaside);
 
@@ -2691,6 +2754,13 @@ DnspGetOrCreateProcessContext(
             InterlockedIncrement(&candidate->RefCount);
             return candidate;
         }
+    }
+
+    // Enforce limit under exclusive lock to prevent TOCTOU race
+    if (Monitor->ProcessCount >= DNS_MAX_PROCESS_CONTEXTS) {
+        ExReleasePushLockExclusive(&Monitor->ProcessListLock);
+        ExFreeToNPagedLookasideList(&Monitor->ProcessContextLookaside, context);
+        return NULL;
     }
 
     InsertTailList(&Monitor->ProcessList, &context->ListEntry);
@@ -2776,7 +2846,6 @@ DnspAddToDomainCache(
     ULONG bucket;
     PDNS_DOMAIN_CACHE cacheEntry;
     LARGE_INTEGER currentTime;
-    PLIST_ENTRY entry;
 
     // Acquire exclusive lock for the entire check-and-insert (fix CRITICAL-05)
     ExAcquirePushLockExclusive(&Monitor->DomainCacheLock);
@@ -2838,6 +2907,16 @@ DnspAddToDomainCache(
 
     ExReleasePushLockExclusive(&Monitor->DomainCacheLock);
 
+    //
+    // Newly-seen domain heuristic: the sensor has never seen this domain before.
+    // Flag the query for additional scrutiny. Combined with other signals (high
+    // entropy, DGA, unusual type) this helps catch C2 beaconing to fresh domains.
+    //
+    if (Query->SuspicionFlags != DnsSuspicion_None) {
+        Query->SuspicionFlags |= DnsSuspicion_NewlyRegistered;
+        Query->SuspicionScore += 10;
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -2858,6 +2937,8 @@ Routine Description:
     ProcessListEntry if still linked.
 --*/
 {
+    PAGED_CODE();
+
     // Remove from process query list if still linked
     if (Query->ProcessListEntry.Flink != NULL &&
         Query->ProcessListEntry.Blink != NULL &&
@@ -2881,7 +2962,7 @@ Routine Description:
 }
 
 // ============================================================================
-// INTERNAL HELPERS - CLEANUP (RUNS AT PASSIVE_LEVEL VIA WORK ITEM)
+// INTERNAL HELPERS - CLEANUP (RUNS AT PASSIVE_LEVEL VIA SYSTEM THREAD)
 // ============================================================================
 
 static VOID NTAPI
@@ -2894,7 +2975,7 @@ DnspCleanupTimerDpc(
 /*++
 Routine Description:
     DPC callback for cleanup timer. Runs at DISPATCH_LEVEL.
-    We CANNOT acquire push locks here. Queue a work item instead.
+    Signals the cleanup thread to wake and run at PASSIVE_LEVEL.
 --*/
 {
     PDNS_MONITOR monitor = (PDNS_MONITOR)DeferredContext;
@@ -2903,51 +2984,52 @@ Routine Description:
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (monitor == NULL || !monitor->Initialized) {
+    if (monitor == NULL || !monitor->Initialized || monitor->CleanupTerminate) {
         return;
     }
 
-    if (monitor->CleanupWorkItem == NULL) {
-        return;
-    }
-
-    // Only queue if no cleanup already in progress
-    if (InterlockedCompareExchange(&monitor->CleanupInProgress, 1, 0) == 0) {
-        IoQueueWorkItem(
-            monitor->CleanupWorkItem,
-            DnspCleanupWorkItemRoutine,
-            DelayedWorkQueue,
-            monitor
-        );
-    }
+    KeSetEvent(&monitor->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
 }
 
 static VOID
-DnspCleanupWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+DnspCleanupThreadRoutine(
+    _In_ PVOID Context
     )
 /*++
 Routine Description:
-    Work item callback. Runs at PASSIVE_LEVEL — safe to acquire push locks.
+    System thread for periodic DNS entry cleanup. Waits on a
+    synchronization event signaled by the DPC timer. Runs at PASSIVE_LEVEL.
 --*/
 {
     PDNS_MONITOR monitor = (PDNS_MONITOR)Context;
 
-    UNREFERENCED_PARAMETER(DeviceObject);
+    PAGED_CODE();
 
     if (monitor == NULL) {
+        PsTerminateSystemThread(STATUS_INVALID_PARAMETER);
         return;
     }
 
-    if (!monitor->Initialized) {
-        InterlockedExchange(&monitor->CleanupInProgress, 0);
-        return;
+    while (!monitor->CleanupTerminate) {
+
+        KeWaitForSingleObject(
+            &monitor->CleanupWakeEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+
+        if (monitor->CleanupTerminate) {
+            break;
+        }
+
+        if (monitor->Initialized) {
+            DnspCleanupExpiredEntries(monitor);
+        }
     }
 
-    DnspCleanupExpiredEntries(monitor);
-
-    InterlockedExchange(&monitor->CleanupInProgress, 0);
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 static VOID
@@ -2967,6 +3049,8 @@ Routine Description:
     LIST_ENTRY expiredDomains;
     LIST_ENTRY expiredProcesses;
     LIST_ENTRY expiredTunnels;
+
+    PAGED_CODE();
 
     InitializeListHead(&expiredQueries);
     InitializeListHead(&expiredDomains);
@@ -3036,10 +3120,31 @@ Routine Description:
         PDNS_PROCESS_CONTEXT processCtx = CONTAINING_RECORD(
             entry, DNS_PROCESS_CONTEXT, ListEntry);
 
-        // Only remove if refcount is exactly 1 (list reference only) and idle
+        // Only remove if refcount is exactly 1 (list reference only) and idle.
+        // Use a longer timeout for contexts that had activity to avoid premature
+        // cleanup of processes that may resume DNS queries.
         if (processCtx->RefCount == 1) {
             LONGLONG idleMs = (currentTime.QuadPart - processCtx->CreationTime.QuadPart) / 10000;
-            if (idleMs > DNS_PROCESS_IDLE_EXPIRATION_MS && processCtx->TotalQueries == 0) {
+            LONGLONG requiredIdleMs = (processCtx->TotalQueries > 0)
+                ? (DNS_PROCESS_IDLE_EXPIRATION_MS * 3)
+                : DNS_PROCESS_IDLE_EXPIRATION_MS;
+
+            if (idleMs > requiredIdleMs) {
+                // Before freeing, unlink all queries from this context's QueryList
+                // to prevent DnspFreeQuery from touching freed memory (DNS-1 fix).
+                {
+                    KIRQL oldIrql;
+                    KeAcquireSpinLock(&processCtx->QueryLock, &oldIrql);
+
+                    while (!IsListEmpty(&processCtx->QueryList)) {
+                        PLIST_ENTRY qEntry = RemoveHeadList(&processCtx->QueryList);
+                        // Re-initialize the entry so DnspFreeQuery sees it as unlinked
+                        InitializeListHead(qEntry);
+                    }
+
+                    KeReleaseSpinLock(&processCtx->QueryLock, oldIrql);
+                }
+
                 RemoveEntryList(&processCtx->ListEntry);
                 InsertTailList(&expiredProcesses, &processCtx->ListEntry);
                 InterlockedDecrement(&Monitor->ProcessCount);
