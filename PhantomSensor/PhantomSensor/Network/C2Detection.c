@@ -61,7 +61,7 @@
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, C2Initialize)
+#pragma alloc_text(PAGE, C2Initialize)
 #pragma alloc_text(PAGE, C2Shutdown)
 #endif
 
@@ -173,6 +173,8 @@ typedef struct _C2_DETECTOR_INTERNAL {
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
+
+EXTERN_C UCHAR* PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
 static VOID C2pAnalysisTimerDpc(
     _In_ PKDPC Dpc, _In_opt_ PVOID DeferredContext,
@@ -938,12 +940,22 @@ C2CheckIOC(
             *IsKnownC2 = TRUE;
             if (MatchedIOC) {
                 //
-                // Return referenced IOC pointer. Caller must be aware the
-                // pointer is valid only while holding rundown or IOCLock.
-                // For safety, take a reference.
+                // Return a pool-allocated COPY of the IOC entry.
+                // The caller frees with ExFreePoolWithTag(ioc, C2_POOL_TAG_IOC).
+                // This avoids returning a reference to the internal structure
+                // which could be freed by C2RemoveIOC concurrently.
                 //
-                InterlockedIncrement(&ioc->RefCount);
-                *MatchedIOC = ioc;
+                PC2_IOC iocCopy = (PC2_IOC)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED,
+                    sizeof(C2_IOC),
+                    C2_POOL_TAG_IOC);
+                if (iocCopy != NULL) {
+                    RtlCopyMemory(iocCopy, ioc, sizeof(C2_IOC));
+                    iocCopy->RefCount = 0;
+                    InitializeListHead(&iocCopy->ListEntry);
+                    InitializeListHead(&iocCopy->HashEntry);
+                    *MatchedIOC = iocCopy;
+                }
             }
             InterlockedIncrement64(&Detector->Stats.IOCMatches);
             break;
@@ -2117,19 +2129,24 @@ C2pNotifyCallbacks(
     _In_ PC2_DETECTION_RESULT Result
     )
 {
+    C2_CALLBACK_ENTRY snapshot[C2_MAX_CALLBACKS];
     ULONG i;
 
+    //
+    // Snapshot callbacks under shared lock, then invoke OUTSIDE the lock.
+    // This prevents deadlock if a callback tries to unregister itself.
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Detector->CallbackLock);
-
-    for (i = 0; i < C2_MAX_CALLBACKS; i++) {
-        if (Detector->Callbacks[i].InUse && Detector->Callbacks[i].Callback != NULL) {
-            Detector->Callbacks[i].Callback(Result, Detector->Callbacks[i].Context);
-        }
-    }
-
+    RtlCopyMemory(snapshot, Detector->Callbacks, sizeof(snapshot));
     ExReleasePushLockShared(&Detector->CallbackLock);
     KeLeaveCriticalRegion();
+
+    for (i = 0; i < C2_MAX_CALLBACKS; i++) {
+        if (snapshot[i].InUse && snapshot[i].Callback != NULL) {
+            snapshot[i].Callback(Result, snapshot[i].Context);
+        }
+    }
 }
 
 // ============================================================================
@@ -2190,6 +2207,28 @@ C2pFindOrCreateProcessContext(
     InitializeListHead(&context->DestinationList);
     ExInitializePushLock(&context->DestinationLock);
     context->RefCount = 1;
+
+    //
+    // Populate process name from PEPROCESS (best-effort, non-fatal on failure).
+    // PsGetProcessImageFileName returns up to 15-char ANSI name.
+    //
+    {
+        PEPROCESS process = NULL;
+        NTSTATUS lookupStatus = PsLookupProcessByProcessId(ProcessId, &process);
+        if (NT_SUCCESS(lookupStatus)) {
+            PUCHAR imageName = PsGetProcessImageFileName(process);
+            if (imageName != NULL && imageName[0] != '\0') {
+                ANSI_STRING ansiName;
+                UNICODE_STRING unicodeName;
+                RtlInitAnsiString(&ansiName, (PCSZ)imageName);
+                unicodeName.Buffer = context->ProcessName;
+                unicodeName.MaximumLength = sizeof(context->ProcessName) - sizeof(WCHAR);
+                unicodeName.Length = 0;
+                RtlAnsiStringToUnicodeString(&unicodeName, &ansiName, FALSE);
+            }
+            ObDereferenceObject(process);
+        }
+    }
 
     InsertTailList(&Detector->ProcessList, &context->ListEntry);
     InterlockedIncrement(&Detector->ProcessCount);
