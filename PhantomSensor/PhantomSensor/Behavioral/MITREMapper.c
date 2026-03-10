@@ -47,7 +47,10 @@
  * ============================================================================
  */
 
+#pragma warning(push)
+#pragma warning(disable: 4324) // structure was padded due to alignment specifier
 #include "MITREMapper.h"
+#pragma warning(pop)
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
@@ -549,10 +552,10 @@ MmShutdown(
     }
 
     //
-    // Mark as not initialized to prevent new operations
+    // Mark as not initialized atomically to prevent new operations
     //
-    Mapper->Initialized = FALSE;
-    Mapper->TechniquesLoaded = FALSE;
+    InterlockedExchange8((volatile CHAR*)&Mapper->Initialized, FALSE);
+    InterlockedExchange8((volatile CHAR*)&Mapper->TechniquesLoaded, FALSE);
 
     //
     // Initialize temporary collection lists
@@ -1003,8 +1006,13 @@ MmReleaseDetection(
 {
     if (Detection != NULL) {
         LONG newCount = InterlockedDecrement(&Detection->RefCount);
+        if (newCount == 0) {
+            //
+            // Last reference dropped — free the detection and its resources
+            //
+            MmpFreeDetection(Detection);
+        }
         NT_ASSERT(newCount >= 0);
-        UNREFERENCED_PARAMETER(newCount);
     }
 }
 
@@ -1122,13 +1130,16 @@ MmRecordDetection(
     KeReleaseSpinLock(&Mapper->DetectionLock, oldIrql);
 
     //
-    // Now free evicted detections outside of lock
+    // Now release evicted detections outside of lock.
+    // Uses MmReleaseDetection to respect external references — if a caller
+    // holds a reference from MmGetRecentDetections, the detection stays alive
+    // until that caller releases it.
     //
     while (!IsListEmpty(&evictList)) {
         listEntry = RemoveHeadList(&evictList);
         evictDetection = CONTAINING_RECORD(listEntry, MM_DETECTION, ListEntry);
         InterlockedIncrement64(&Mapper->Stats.DetectionsEvicted);
-        MmpFreeDetection(evictDetection);
+        MmReleaseDetection(evictDetection);
     }
 
     return STATUS_SUCCESS;

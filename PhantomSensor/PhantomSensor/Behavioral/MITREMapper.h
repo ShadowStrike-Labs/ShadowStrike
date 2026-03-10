@@ -43,6 +43,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 #include "../Shared/AttackPatterns.h"
 
