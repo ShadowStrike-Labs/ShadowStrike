@@ -32,6 +32,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 #include "../Shared/AttackPatterns.h"
 
@@ -194,11 +195,11 @@ typedef struct _ACT_TRACKER {
     KSPIN_LOCK CallbackLock;
 
     //
-    // Cleanup timer for expired chains
+    // Cleanup worker thread for expired chains (runs at PASSIVE_LEVEL)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    volatile LONG CleanupRunning;
+    PETHREAD CleanupThread;
+    KEVENT CleanupWakeEvent;
+    volatile LONG CleanupStopping;
 
     //
     // Statistics
