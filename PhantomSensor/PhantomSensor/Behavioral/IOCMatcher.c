@@ -36,25 +36,10 @@
  * ============================================================================
  */
 
+#pragma warning(push)
+#pragma warning(disable: 4324)
 #include "IOCMatcher.h"
-
-#ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, IomInitialize)
-#pragma alloc_text(PAGE, IomShutdown)
-#pragma alloc_text(PAGE, IomLoadIOC)
-#pragma alloc_text(PAGE, IomLoadFromBuffer)
-#pragma alloc_text(PAGE, IomRegisterCallback)
-#pragma alloc_text(PAGE, IomMatch)
-#pragma alloc_text(PAGE, IomMatchHash)
-#pragma alloc_text(PAGE, IomRemoveIOC)
-#pragma alloc_text(PAGE, IomCleanupExpired)
-#pragma alloc_text(PAGE, IompParseIOCLine)
-#pragma alloc_text(PAGE, IompMatchWildcard)
-#pragma alloc_text(PAGE, IompMatchDomain)
-#pragma alloc_text(PAGE, IompMatchIPAddress)
-#pragma alloc_text(PAGE, IompCleanupExpiredIOCsWorker)
-#pragma alloc_text(PAGE, IompParseIPv4Address)
-#endif
+#pragma warning(pop)
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -168,6 +153,7 @@ typedef struct _IOM_IOC_INTERNAL {
     LIST_ENTRY GlobalListEntry;
     LIST_ENTRY HashBucketEntry;
     LIST_ENTRY TypeListEntry;
+    LIST_ENTRY TypeHashBucketEntry;
 
 } IOM_IOC_INTERNAL, *PIOM_IOC_INTERNAL;
 
@@ -186,14 +172,6 @@ typedef struct _IOM_TYPE_INDEX {
     ULONG BucketCount;
 
 } IOM_TYPE_INDEX, *PIOM_TYPE_INDEX;
-
-/**
- * @brief Work item context for cleanup operations.
- */
-typedef struct _IOM_CLEANUP_WORK_CONTEXT {
-    PIO_WORKITEM WorkItem;
-    struct _IOM_MATCHER_INTERNAL* Matcher;
-} IOM_CLEANUP_WORK_CONTEXT, *PIOM_CLEANUP_WORK_CONTEXT;
 
 /**
  * @brief Main matcher structure (internal).
@@ -247,13 +225,13 @@ typedef struct _IOM_MATCHER_INTERNAL {
     BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup infrastructure
+    // Cleanup infrastructure (system thread + KEVENT pattern)
     //
     KTIMER CleanupTimer;
     KDPC CleanupDpc;
-    PIO_WORKITEM CleanupWorkItem;
-    PDEVICE_OBJECT DeviceObject;
-    volatile BOOLEAN CleanupTimerActive;
+    PETHREAD CleanupThread;
+    KEVENT CleanupWakeEvent;
+    volatile BOOLEAN CleanupTerminate;
     volatile LONG CleanupInProgress;
 
     //
@@ -396,11 +374,9 @@ IompCleanupTimerDpc(
     _In_opt_ PVOID SystemArgument2
     );
 
-_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
-IompCleanupWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+IompCleanupThreadRoutine(
+    _In_ PVOID Context
     );
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -432,6 +408,25 @@ IompSafeStringLength(
     _In_reads_(MaxLength) PCSTR String,
     _In_ SIZE_T MaxLength
     );
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, IomInitialize)
+#pragma alloc_text(PAGE, IomShutdown)
+#pragma alloc_text(PAGE, IomLoadIOC)
+#pragma alloc_text(PAGE, IomLoadFromBuffer)
+#pragma alloc_text(PAGE, IomRegisterCallback)
+#pragma alloc_text(PAGE, IomMatch)
+#pragma alloc_text(PAGE, IomMatchHash)
+#pragma alloc_text(PAGE, IomRemoveIOC)
+#pragma alloc_text(PAGE, IomCleanupExpired)
+#pragma alloc_text(PAGE, IompParseIOCLine)
+#pragma alloc_text(PAGE, IompMatchWildcard)
+#pragma alloc_text(PAGE, IompMatchDomain)
+#pragma alloc_text(PAGE, IompMatchIPAddress)
+#pragma alloc_text(PAGE, IompCleanupExpiredIOCsWorker)
+#pragma alloc_text(PAGE, IompCleanupThreadRoutine)
+#pragma alloc_text(PAGE, IompParseIPv4Address)
+#endif
 
 // ============================================================================
 // INITIALIZATION AND SHUTDOWN
@@ -593,15 +588,52 @@ IomInitialize(
 
     //
     // Initialize cleanup timer and DPC
-    // NOTE: DPC queues a work item - does NOT access push locks directly
+    // DPC signals the cleanup wake event — thread runs at PASSIVE_LEVEL
     //
     KeInitializeTimer(&matcher->CleanupTimer);
     KeInitializeDpc(&matcher->CleanupDpc, IompCleanupTimerDpc, matcher);
+    KeInitializeEvent(&matcher->CleanupWakeEvent, SynchronizationEvent, FALSE);
+    matcher->CleanupTerminate = FALSE;
 
     //
-    // Start cleanup timer if expiration is enabled
+    // Create cleanup thread and start timer if expiration is enabled
     //
     if (matcher->Config.EnableExpiration) {
+        HANDLE threadHandle = NULL;
+        OBJECT_ATTRIBUTES oa;
+
+        InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+
+        status = PsCreateSystemThread(
+            &threadHandle,
+            THREAD_ALL_ACCESS,
+            &oa,
+            NULL,
+            NULL,
+            IompCleanupThreadRoutine,
+            matcher
+        );
+
+        if (!NT_SUCCESS(status)) {
+            goto Cleanup;
+        }
+
+        status = ObReferenceObjectByHandle(
+            threadHandle,
+            THREAD_ALL_ACCESS,
+            *PsThreadType,
+            KernelMode,
+            (PVOID*)&matcher->CleanupThread,
+            NULL
+        );
+        ZwClose(threadHandle);
+
+        if (!NT_SUCCESS(status)) {
+            matcher->CleanupTerminate = TRUE;
+            KeSetEvent(&matcher->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
+            goto Cleanup;
+        }
+
         dueTime.QuadPart = -((LONGLONG)IOM_CLEANUP_INTERVAL_MS * 10000);
         KeSetTimerEx(
             &matcher->CleanupTimer,
@@ -609,7 +641,6 @@ IomInitialize(
             IOM_CLEANUP_INTERVAL_MS,
             &matcher->CleanupDpc
         );
-        matcher->CleanupTimerActive = TRUE;
     }
 
     matcher->Initialized = TRUE;
@@ -619,6 +650,10 @@ IomInitialize(
 
 Cleanup:
     if (matcher != NULL) {
+        if (matcher->LookasideInitialized) {
+            ExDeleteNPagedLookasideList(&matcher->IOCLookaside);
+        }
+
         if (matcher->HashBuckets != NULL) {
             ExFreePoolWithTag(matcher->HashBuckets, IOM_POOL_TAG_HASH);
         }
@@ -669,25 +704,26 @@ IomShutdown(
     InterlockedExchange8((volatile char*)&matcher->ShuttingDown, TRUE);
 
     //
-    // Cancel cleanup timer
+    // Cancel cleanup timer and flush pending DPCs
     //
-    if (matcher->CleanupTimerActive) {
-        KeCancelTimer(&matcher->CleanupTimer);
-        matcher->CleanupTimerActive = FALSE;
-    }
-
-    //
-    // Wait for any pending DPCs to complete
-    //
+    KeCancelTimer(&matcher->CleanupTimer);
     KeFlushQueuedDpcs();
 
     //
-    // Wait for any in-progress cleanup to complete
+    // Terminate cleanup thread: signal terminate, wake thread, wait for exit
     //
-    while (InterlockedCompareExchange(&matcher->CleanupInProgress, 0, 0) != 0) {
-        LARGE_INTEGER delay;
-        delay.QuadPart = -10000;  // 1ms
-        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    if (matcher->CleanupThread != NULL) {
+        InterlockedExchange8((volatile char*)&matcher->CleanupTerminate, TRUE);
+        KeSetEvent(&matcher->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
+        KeWaitForSingleObject(
+            matcher->CleanupThread,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+        ObDereferenceObject(matcher->CleanupThread);
+        matcher->CleanupThread = NULL;
     }
 
     //
@@ -810,13 +846,6 @@ IomLoadIOC(
     //
     actualLength = IompSafeStringLength(IOC->Value, IOM_MAX_IOC_LENGTH);
     if (actualLength == 0 || actualLength >= IOM_MAX_IOC_LENGTH) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // Reject empty patterns (security: would match everything)
-    //
-    if (actualLength == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1220,17 +1249,34 @@ IomMatch(
     }
 
     //
-    // Check bloom filter for fast negative (exact matches only)
+    // Check bloom filter for fast negative — ONLY for exact-match types.
+    // Bloom filter stores IOC pattern hashes. For wildcard/CIDR/subdomain types
+    // the stored hash won't match the query value, causing false negatives.
     //
     if (matcher->BloomFilter.Enabled && matcher->BloomFilter.Filter != NULL) {
-        if (!IompBloomFilterCheck(matcher, (PCUCHAR)Value, ValueLength)) {
-            if (matcher->Config.EnableStatistics) {
-                InterlockedIncrement64(&matcher->Stats.BloomFilterMisses);
-            }
-            return STATUS_NOT_FOUND;
+        BOOLEAN canUseBloom = FALSE;
+        switch (Type) {
+            case IomType_FileHash_MD5:
+            case IomType_FileHash_SHA1:
+            case IomType_FileHash_SHA256:
+            case IomType_Mutex:
+            case IomType_JA3:
+                canUseBloom = TRUE;
+                break;
+            default:
+                break;
         }
-        if (matcher->Config.EnableStatistics) {
-            InterlockedIncrement64(&matcher->Stats.BloomFilterHits);
+
+        if (canUseBloom) {
+            if (!IompBloomFilterCheck(matcher, (PCUCHAR)Value, ValueLength)) {
+                if (matcher->Config.EnableStatistics) {
+                    InterlockedIncrement64(&matcher->Stats.BloomFilterMisses);
+                }
+                return STATUS_NOT_FOUND;
+            }
+            if (matcher->Config.EnableStatistics) {
+                InterlockedIncrement64(&matcher->Stats.BloomFilterHits);
+            }
         }
     }
 
@@ -1262,7 +1308,7 @@ IomMatch(
              entry != &typeIndex->HashBuckets[bucket];
              entry = entry->Flink) {
 
-            ioc = CONTAINING_RECORD(entry, IOM_IOC_INTERNAL, TypeListEntry);
+            ioc = CONTAINING_RECORD(entry, IOM_IOC_INTERNAL, TypeHashBucketEntry);
 
             if (ioc->IsExpired || ioc->MarkedForDeletion) {
                 continue;
@@ -2261,11 +2307,11 @@ IompInsertIOCIntoIndices(
     InterlockedIncrement(&typeIndex->Count);
 
     //
-    // Insert into type-specific hash table if available
+    // Insert into type-specific hash table using SEPARATE list entry
     //
     if (typeIndex->HashBuckets != NULL && typeIndex->BucketCount > 0) {
         bucket = IompComputeBucket(IOC->ValueHash, typeIndex->BucketCount);
-        InsertTailList(&typeIndex->HashBuckets[bucket], &IOC->TypeListEntry);
+        InsertTailList(&typeIndex->HashBuckets[bucket], &IOC->TypeHashBucketEntry);
     }
 
     ExReleasePushLockExclusive(&typeIndex->Lock);
@@ -2288,9 +2334,17 @@ IompRemoveIOCFromIndices(
     ExAcquirePushLockExclusive(&typeIndex->Lock);
 
     //
-    // Remove from type list (TypeListEntry is used for both list and hash)
+    // Remove from type list
     //
     RemoveEntryList(&IOC->TypeListEntry);
+
+    //
+    // Remove from type hash bucket if present
+    //
+    if (typeIndex->HashBuckets != NULL && typeIndex->BucketCount > 0) {
+        RemoveEntryList(&IOC->TypeHashBucketEntry);
+    }
+
     InterlockedDecrement(&typeIndex->Count);
 
     ExReleasePushLockExclusive(&typeIndex->Lock);
@@ -2426,105 +2480,54 @@ IompCleanupTimerDpc(
 /**
  * @brief DPC callback for cleanup timer.
  *
- * IMPORTANT: This DPC does NOT access push locks directly.
- * It only queues a work item to run at PASSIVE_LEVEL.
+ * Signals the cleanup thread wake event. Thread runs cleanup at PASSIVE_LEVEL.
  */
 {
     PIOM_MATCHER_INTERNAL matcher = (PIOM_MATCHER_INTERNAL)DeferredContext;
-    PIO_WORKITEM workItem;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (matcher == NULL || matcher->ShuttingDown) {
+    if (matcher == NULL || matcher->ShuttingDown || matcher->CleanupTerminate) {
         return;
     }
 
-    if (!matcher->Config.EnableExpiration) {
-        return;
-    }
-
-    //
-    // Check if cleanup already in progress (avoid stacking work items)
-    //
-    if (InterlockedCompareExchange(&matcher->CleanupInProgress, 1, 0) != 0) {
-        return;
-    }
-
-    //
-    // Queue work item to perform cleanup at PASSIVE_LEVEL
-    //
-    if (matcher->DeviceObject != NULL) {
-        workItem = IoAllocateWorkItem(matcher->DeviceObject);
-        if (workItem != NULL) {
-            IoQueueWorkItem(
-                workItem,
-                IompCleanupWorkItemRoutine,
-                DelayedWorkQueue,
-                matcher
-            );
-        } else {
-            InterlockedExchange(&matcher->CleanupInProgress, 0);
-        }
-    } else {
-        //
-        // No device object - mark expired IOCs directly (read-only operation safe at DPC)
-        //
-        PLIST_ENTRY entry;
-        PIOM_IOC_INTERNAL ioc;
-        LARGE_INTEGER currentTime;
-
-        KeQuerySystemTime(&currentTime);
-
-        //
-        // NOTE: We only READ the list here, no modifications
-        // Actual cleanup happens later at PASSIVE_LEVEL
-        //
-        for (entry = matcher->GlobalIOCList.Flink;
-             entry != &matcher->GlobalIOCList;
-             entry = entry->Flink) {
-
-            ioc = CONTAINING_RECORD(entry, IOM_IOC_INTERNAL, GlobalListEntry);
-
-            if (!ioc->IsExpired && ioc->Expiry.QuadPart > 0) {
-                if (currentTime.QuadPart > ioc->Expiry.QuadPart) {
-                    InterlockedExchange8((volatile char*)&ioc->IsExpired, TRUE);
-                }
-            }
-        }
-
-        InterlockedExchange(&matcher->CleanupInProgress, 0);
-    }
+    KeSetEvent(&matcher->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
+/**
+ * @brief System thread for cleanup operations.
+ *
+ * Waits on CleanupWakeEvent, runs expired IOC cleanup at PASSIVE_LEVEL,
+ * exits cleanly when CleanupTerminate is set.
+ */
 static VOID
-IompCleanupWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+IompCleanupThreadRoutine(
+    _In_ PVOID Context
     )
 {
     PIOM_MATCHER_INTERNAL matcher = (PIOM_MATCHER_INTERNAL)Context;
-    PIO_WORKITEM workItem;
-
-    UNREFERENCED_PARAMETER(DeviceObject);
 
     PAGED_CODE();
 
-    if (matcher == NULL) {
-        return;
+    while (!matcher->CleanupTerminate) {
+        KeWaitForSingleObject(
+            &matcher->CleanupWakeEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+
+        if (matcher->CleanupTerminate) {
+            break;
+        }
+
+        IompCleanupExpiredIOCsWorker(matcher);
     }
 
-    //
-    // Perform actual cleanup at PASSIVE_LEVEL
-    //
-    IompCleanupExpiredIOCsWorker(matcher);
-
-    //
-    // Clear in-progress flag
-    //
-    InterlockedExchange(&matcher->CleanupInProgress, 0);
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)

@@ -33,7 +33,15 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
+
+//
+// PCUCHAR is not defined in WDK headers
+//
+#ifndef PCUCHAR
+typedef const UCHAR* PCUCHAR;
+#endif
 
 //
 // Pool tags for memory tracking
@@ -43,7 +51,6 @@ extern "C" {
 #define IOM_POOL_TAG_RESULT             'rOOI'
 #define IOM_POOL_TAG_HASH               'hOOI'
 #define IOM_POOL_TAG_BLOOM              'bOOI'
-#define IOM_POOL_TAG_WORKITEM           'wOOI'
 
 //
 // Size limits
