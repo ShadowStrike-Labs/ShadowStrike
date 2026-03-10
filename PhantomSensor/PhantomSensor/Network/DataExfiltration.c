@@ -53,10 +53,23 @@
  * ============================================================================
  */
 
+#pragma warning(push)
+#pragma warning(disable: 4324)  /* fltKernel.h: structure padded due to alignment */
 #include "DataExfiltration.h"
 #include "../Core/Globals.h"
 #include "../Communication/ScanBridge.h"
 #include "../Utilities/ProcessUtils.h"
+#pragma warning(pop)
+
+//
+// PsGetProcessImageFileName — declared in ntifs.h but may be gated behind
+// specific NTDDI checks. Forward-declare for resilience.
+//
+NTKERNELAPI
+PUCHAR
+PsGetProcessImageFileName(
+    _In_ PEPROCESS Process
+    );
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, DxInitialize)
@@ -281,12 +294,13 @@ struct _DX_DETECTOR {
     BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup timer
+    // Cleanup timer + dedicated system thread (replaces ExQueueWorkItem)
     //
     KTIMER CleanupTimer;
     KDPC CleanupDpc;
-    WORK_QUEUE_ITEM CleanupWorkItem;
-    volatile LONG CleanupWorkQueued;
+    PKTHREAD CleanupThread;
+    KEVENT CleanupWakeEvent;
+    volatile LONG CleanupTerminate;
     volatile BOOLEAN ShuttingDown;
 
     //
@@ -397,6 +411,11 @@ DxpCleanupTimerDpc(
 static VOID
 DxpCleanupWorkRoutine(
     _In_ PVOID Parameter
+    );
+
+static VOID
+DxpCleanupThreadRoutine(
+    _In_ PVOID Context
     );
 
 static VOID
@@ -587,8 +606,49 @@ DxInitialize(
     KeQuerySystemTime(&detector->Stats.StartTime);
 
     //
-    // Initialize cleanup timer — DPC queues a work item at PASSIVE_LEVEL
+    // Initialize cleanup system thread + timer.
+    // The DPC signals the wake event; the thread runs cleanup at PASSIVE_LEVEL.
+    // This replaces ExQueueWorkItem which has no shutdown synchronization.
     //
+    KeInitializeEvent(&detector->CleanupWakeEvent, SynchronizationEvent, FALSE);
+    InterlockedExchange(&detector->CleanupTerminate, FALSE);
+
+    {
+        HANDLE threadHandle = NULL;
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+
+        status = PsCreateSystemThread(
+            &threadHandle,
+            THREAD_ALL_ACCESS,
+            &oa,
+            NULL,
+            NULL,
+            DxpCleanupThreadRoutine,
+            detector
+        );
+
+        if (!NT_SUCCESS(status)) {
+            if (detector->LookasideInitialized) {
+                ExDeleteNPagedLookasideList(&detector->PatternLookaside);
+                ExDeleteNPagedLookasideList(&detector->TransferLookaside);
+            }
+            ExFreePoolWithTag(detector->TransferBuckets, DX_POOL_TAG_HASH);
+            ExFreePoolWithTag(detector, DX_POOL_TAG_CONTEXT);
+            return status;
+        }
+
+        ObReferenceObjectByHandle(
+            threadHandle,
+            THREAD_ALL_ACCESS,
+            *PsThreadType,
+            KernelMode,
+            (PVOID*)&detector->CleanupThread,
+            NULL
+        );
+        ZwClose(threadHandle);
+    }
+
     KeInitializeTimer(&detector->CleanupTimer);
     KeInitializeDpc(&detector->CleanupDpc, DxpCleanupTimerDpc, detector);
 
@@ -636,10 +696,29 @@ DxShutdown(
     ExWaitForRundownProtectionRelease(&Detector->RundownRef);
 
     //
-    // Cancel cleanup timer and wait for any pending DPCs/work items
+    // Cancel cleanup timer and wait for any pending DPCs
     //
     KeCancelTimer(&Detector->CleanupTimer);
     KeFlushQueuedDpcs();
+
+    //
+    // Terminate cleanup thread: signal terminate flag, wake the thread,
+    // then wait for the thread object to exit.
+    //
+    InterlockedExchange(&Detector->CleanupTerminate, TRUE);
+    KeSetEvent(&Detector->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
+
+    if (Detector->CleanupThread != NULL) {
+        KeWaitForSingleObject(
+            Detector->CleanupThread,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+        ObDereferenceObject(Detector->CleanupThread);
+        Detector->CleanupThread = NULL;
+    }
 
     //
     // Free all patterns
@@ -824,9 +903,20 @@ DxAddPattern(
     }
 
     //
-    // Insert into pattern list
+    // Insert into pattern list (re-check limit under lock to prevent TOCTOU)
     //
     DxpAcquirePushLockExclusive(&Detector->PatternLock);
+
+    if ((ULONG)Detector->PatternCount >= DX_MAX_PATTERNS) {
+        DxpReleasePushLockExclusive(&Detector->PatternLock);
+        if (newPattern->Pattern != NULL) {
+            ExFreePoolWithTag(newPattern->Pattern, DX_POOL_TAG_PATTERN);
+        }
+        ExFreeToNPagedLookasideList(&Detector->PatternLookaside, newPattern);
+        ExReleaseRundownProtection(&Detector->RundownRef);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
     InsertTailList(&Detector->PatternList, &newPattern->ListEntry);
     InterlockedIncrement(&Detector->PatternCount);
     DxpReleasePushLockExclusive(&Detector->PatternLock);
@@ -1247,7 +1337,7 @@ DxInspectContent(
     _In_reads_bytes_(DataSize) PVOID Data,
     _In_ SIZE_T DataSize,
     _Out_ PDX_INDICATORS Indicators,
-    _Out_writes_to_(MaxMatches, *MatchCount) PDX_PATTERN* Matches,
+    _Out_writes_to_(MaxMatches, *MatchCount) PDX_PATTERN_MATCH Matches,
     _In_ ULONG MaxMatches,
     _Out_ PULONG MatchCount
     )
@@ -1260,6 +1350,7 @@ DxInspectContent(
     ULONG matchCount = 0;
     ULONG matchOffset;
     SIZE_T inspectSize;
+    SIZE_T nameLen;
 
     PAGED_CODE();
 
@@ -1310,7 +1401,8 @@ DxInspectContent(
     }
 
     //
-    // Pattern matching
+    // Pattern matching — returns value copies (DX_PATTERN_MATCH) instead of
+    // raw pointers, preventing dangling references after DxRemovePattern.
     //
     DxpAcquirePushLockShared(&Detector->PatternLock);
 
@@ -1324,7 +1416,24 @@ DxInspectContent(
             indicators |= DxIndicator_SensitivePattern;
 
             if (Matches != NULL && matchCount < MaxMatches) {
-                Matches[matchCount] = pattern;
+                Matches[matchCount].PatternId = pattern->PatternId;
+                Matches[matchCount].Sensitivity = pattern->Sensitivity;
+                Matches[matchCount].MatchOffset = matchOffset;
+
+                nameLen = strlen(pattern->PatternName);
+                if (nameLen >= sizeof(Matches[matchCount].PatternName)) {
+                    nameLen = sizeof(Matches[matchCount].PatternName) - 1;
+                }
+                RtlCopyMemory(Matches[matchCount].PatternName, pattern->PatternName, nameLen);
+                Matches[matchCount].PatternName[nameLen] = '\0';
+
+                nameLen = strlen(pattern->Category);
+                if (nameLen >= sizeof(Matches[matchCount].Category)) {
+                    nameLen = sizeof(Matches[matchCount].Category) - 1;
+                }
+                RtlCopyMemory(Matches[matchCount].Category, pattern->Category, nameLen);
+                Matches[matchCount].Category[nameLen] = '\0';
+
                 matchCount++;
             }
 
@@ -2137,9 +2246,11 @@ DxpCreateAlert(
     PDX_ALERT alert;
     LARGE_INTEGER currentTime;
     ULONG i;
+    PEPROCESS process = NULL;
+    NTSTATUS lookupStatus;
 
     //
-    // Check alert limit
+    // Early limit check (racy but avoids allocation in common case)
     //
     if ((ULONG)Detector->AlertCount >= DX_MAX_ALERTS) {
         return STATUS_QUOTA_EXCEEDED;
@@ -2169,10 +2280,31 @@ DxpCreateAlert(
     alert->WasBlocked = WasBlocked;
 
     //
-    // Populate process name (best effort, inline buffer)
+    // Populate process name from EPROCESS (best effort, 15-char kernel name).
+    // PsGetProcessImageFileName returns a pointer to an internal buffer —
+    // no allocation required.
     //
     alert->ProcessNameLength = 0;
     RtlZeroMemory(alert->ProcessNameBuffer, sizeof(alert->ProcessNameBuffer));
+
+    lookupStatus = PsLookupProcessByProcessId(Transfer->ProcessId, &process);
+    if (NT_SUCCESS(lookupStatus) && process != NULL) {
+        PUCHAR imageName = PsGetProcessImageFileName(process);
+        if (imageName != NULL) {
+            ANSI_STRING ansiName;
+            UNICODE_STRING unicodeName;
+
+            RtlInitAnsiString(&ansiName, (PCSZ)imageName);
+            unicodeName.Buffer = alert->ProcessNameBuffer;
+            unicodeName.Length = 0;
+            unicodeName.MaximumLength = sizeof(alert->ProcessNameBuffer) - sizeof(WCHAR);
+
+            if (NT_SUCCESS(RtlAnsiStringToUnicodeString(&unicodeName, &ansiName, FALSE))) {
+                alert->ProcessNameLength = unicodeName.Length;
+            }
+        }
+        ObDereferenceObject(process);
+    }
 
     //
     // Copy destination info
@@ -2214,9 +2346,16 @@ DxpCreateAlert(
     }
 
     //
-    // Queue alert
+    // Queue alert (re-check limit under lock to prevent TOCTOU overflow)
     //
     DxpAcquirePushLockExclusive(&Detector->AlertLock);
+
+    if ((ULONG)Detector->AlertCount >= DX_MAX_ALERTS) {
+        DxpReleasePushLockExclusive(&Detector->AlertLock);
+        ExFreePoolWithTag(alert, DX_POOL_TAG_ALERT);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
     InsertTailList(&Detector->AlertList, &alert->ListEntry);
     InterlockedIncrement(&Detector->AlertCount);
     DxpReleasePushLockExclusive(&Detector->AlertLock);
@@ -2349,14 +2488,14 @@ DxpClassifyExfiltration(
 }
 
 // ============================================================================
-// CLEANUP TIMER — DPC queues a passive-level work item
+// CLEANUP TIMER — DPC signals system thread for passive-level cleanup
 // ============================================================================
 
 /**
- * @brief DPC callback — queues a passive-level work item for cleanup.
+ * @brief DPC callback — signals the cleanup thread's wake event.
  *
  * We cannot acquire push locks at DISPATCH_LEVEL, so the DPC simply
- * schedules a work item that runs at PASSIVE_LEVEL.
+ * signals a KEVENT that wakes the dedicated cleanup thread.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
@@ -2377,17 +2516,11 @@ DxpCleanupTimerDpc(
         return;
     }
 
-    //
-    // Only queue if not already queued (prevent stacking)
-    //
-    if (InterlockedCompareExchange(&detector->CleanupWorkQueued, 1, 0) == 0) {
-        ExInitializeWorkItem(&detector->CleanupWorkItem, DxpCleanupWorkRoutine, detector);
-        ExQueueWorkItem(&detector->CleanupWorkItem, DelayedWorkQueue);
-    }
+    KeSetEvent(&detector->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
 }
 
 /**
- * @brief Work item callback for cleanup — runs at PASSIVE_LEVEL.
+ * @brief Perform one cleanup pass — runs at PASSIVE_LEVEL.
  *
  * Iterates hash table buckets, removing and dereferencing stale transfers.
  * Also trims old alerts if the alert queue is more than 75% full.
@@ -2402,12 +2535,16 @@ DxpCleanupWorkRoutine(
     PLIST_ENTRY entry;
     PLIST_ENTRY nextEntry;
     PDX_TRANSFER_CONTEXT transfer;
+    PDX_ALERT alert;
     LARGE_INTEGER currentTime;
     LONGLONG timeoutTicks;
     LIST_ENTRY freeList;
 
-    if (detector == NULL || detector->ShuttingDown) {
-        InterlockedExchange(&detector->CleanupWorkQueued, 0);
+    if (detector == NULL) {
+        return;
+    }
+
+    if (detector->ShuttingDown) {
         return;
     }
 
@@ -2415,7 +2552,6 @@ DxpCleanupWorkRoutine(
     // Acquire rundown protection to prevent shutdown during cleanup
     //
     if (!ExAcquireRundownProtection(&detector->RundownRef)) {
-        InterlockedExchange(&detector->CleanupWorkQueued, 0);
         return;
     }
 
@@ -2468,7 +2604,7 @@ DxpCleanupWorkRoutine(
             entry = RemoveHeadList(&detector->AlertList);
             InterlockedDecrement(&detector->AlertCount);
 
-            PDX_ALERT alert = CONTAINING_RECORD(entry, DX_ALERT, ListEntry);
+            alert = CONTAINING_RECORD(entry, DX_ALERT, ListEntry);
             ExFreePoolWithTag(alert, DX_POOL_TAG_ALERT);
         }
 
@@ -2476,5 +2612,40 @@ DxpCleanupWorkRoutine(
     }
 
     ExReleaseRundownProtection(&detector->RundownRef);
-    InterlockedExchange(&detector->CleanupWorkQueued, 0);
+}
+
+/**
+ * @brief Dedicated cleanup system thread.
+ *
+ * Waits on CleanupWakeEvent, performs one cleanup pass, and loops.
+ * On shutdown, CleanupTerminate is set and the event is signalled;
+ * DxShutdown waits on this thread object to guarantee safe teardown.
+ */
+static VOID
+DxpCleanupThreadRoutine(
+    _In_ PVOID Context
+    )
+{
+    PDX_DETECTOR detector = (PDX_DETECTOR)Context;
+    NTSTATUS waitStatus;
+
+    for (;;) {
+        waitStatus = KeWaitForSingleObject(
+            &detector->CleanupWakeEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+
+        if (detector->CleanupTerminate) {
+            break;
+        }
+
+        if (NT_SUCCESS(waitStatus)) {
+            DxpCleanupWorkRoutine(detector);
+        }
+    }
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }

@@ -45,8 +45,9 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
 #include "../../Shared/NetworkTypes.h"
+#include <inaddr.h>
+#include <in6addr.h>
 
 //=============================================================================
 // Pool Tags
@@ -98,7 +99,7 @@ typedef enum _DX_INDICATORS {
     DxIndicator_BurstTransfer       = 0x00000200,
     DxIndicator_CloudUpload         = 0x00000400,
     DxIndicator_PersonalEmail       = 0x00000800,
-} DX_INDICATORS;
+} DX_INDICATORS, *PDX_INDICATORS;
 
 //=============================================================================
 // Pattern Types
@@ -129,6 +130,18 @@ typedef struct _DX_PATTERN {
     LIST_ENTRY ListEntry;
 
 } DX_PATTERN, *PDX_PATTERN;
+
+//=============================================================================
+// Pattern Match Result (value copy — safe after release)
+//=============================================================================
+
+typedef struct _DX_PATTERN_MATCH {
+    ULONG PatternId;
+    CHAR PatternName[64];
+    CHAR Category[32];
+    ULONG Sensitivity;
+    ULONG MatchOffset;
+} DX_PATTERN_MATCH, *PDX_PATTERN_MATCH;
 
 //=============================================================================
 // Transfer Context (reference-counted)
@@ -327,7 +340,7 @@ DxInspectContent(
     _In_reads_bytes_(DataSize) PVOID Data,
     _In_ SIZE_T DataSize,
     _Out_ PDX_INDICATORS Indicators,
-    _Out_writes_to_(MaxMatches, *MatchCount) PDX_PATTERN* Matches,
+    _Out_writes_to_(MaxMatches, *MatchCount) PDX_PATTERN_MATCH Matches,
     _In_ ULONG MaxMatches,
     _Out_ PULONG MatchCount
     );
