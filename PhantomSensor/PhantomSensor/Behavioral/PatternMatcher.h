@@ -30,6 +30,7 @@
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 #include <ntstrsafe.h>
 
@@ -39,7 +40,6 @@ extern "C" {
 #define PM_POOL_TAG                     'MPMP'
 #define PM_POOL_TAG_STATE               'tSMP'
 #define PM_POOL_TAG_INDEX               'xIMP'
-#define PM_POOL_TAG_WORKITEM            'wIMP'
 
 //
 // Limits
@@ -137,6 +137,12 @@ typedef struct _PM_PATTERN {
     // Statistics (lock-free updates)
     //
     volatile LONG64 MatchCount;
+
+    //
+    // Internal reference count (managed by PatternMatcher engine)
+    //
+    volatile LONG InternalRefCount;
+    volatile BOOLEAN Unloading;
 
     //
     // List linkage (protected by PatternLock)
