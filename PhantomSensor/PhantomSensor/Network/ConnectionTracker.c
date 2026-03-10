@@ -48,25 +48,23 @@
  * ============================================================================
  */
 
+#pragma warning(push)
+#pragma warning(disable:4324)   // structure padded due to alignment — fltKernel.h
 #include "ConnectionTracker.h"
+#pragma warning(pop)
 #include "../Core/Globals.h"
 #include "../Communication/ScanBridge.h"
 #include "../Utilities/ProcessUtils.h"
 
-#ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, CtInitialize)
-#pragma alloc_text(PAGE, CtShutdown)
-#pragma alloc_text(PAGE, CtCreateConnection)
-#pragma alloc_text(PAGE, CtGetProcessConnections)
-#pragma alloc_text(PAGE, CtGetProcessNetworkStats)
-#pragma alloc_text(PAGE, CtEnumerateConnections)
-#pragma alloc_text(PAGE, CtRegisterCallback)
-#pragma alloc_text(PAGE, CtUnregisterCallback)
-#pragma alloc_text(PAGE, CtpCleanupStaleConnections)
-#pragma alloc_text(PAGE, CtpGetOrCreateProcessContext)
-#pragma alloc_text(PAGE, CtpResolveProcessInfo)
-#pragma alloc_text(PAGE, CtpCleanupWorkItemRoutine)
-#endif
+/*
+ * PsGetProcessImageFileName is exported by ntoskrnl but may be missing
+ * from ntifs.h depending on NTDDI_VERSION guard configuration.
+ */
+NTKERNELAPI
+PUCHAR
+PsGetProcessImageFileName(
+    _In_ PEPROCESS Process
+    );
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -125,12 +123,13 @@ typedef struct _CT_TRACKER_INTERNAL {
     BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup infrastructure
+    // Cleanup infrastructure — system thread woken by DPC
     //
     volatile BOOLEAN CleanupTimerActive;
     volatile BOOLEAN ShuttingDown;
-    WORK_QUEUE_ITEM CleanupWorkQueueItem;
-    volatile LONG CleanupWorkItemPending;
+    volatile BOOLEAN CleanupTerminate;
+    KEVENT CleanupWakeEvent;
+    PETHREAD CleanupThread;
 
 } CT_TRACKER_INTERNAL, *PCT_TRACKER_INTERNAL;
 
@@ -227,6 +226,26 @@ static VOID
 CtpCleanupStaleConnections(
     _In_ PCT_TRACKER_INTERNAL Tracker
     );
+
+static VOID
+CtpCleanupThreadRoutine(
+    _In_ PVOID Context
+    );
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, CtInitialize)
+#pragma alloc_text(PAGE, CtShutdown)
+#pragma alloc_text(PAGE, CtCreateConnection)
+#pragma alloc_text(PAGE, CtGetProcessConnections)
+#pragma alloc_text(PAGE, CtGetProcessNetworkStats)
+#pragma alloc_text(PAGE, CtEnumerateConnections)
+#pragma alloc_text(PAGE, CtRegisterCallback)
+#pragma alloc_text(PAGE, CtUnregisterCallback)
+#pragma alloc_text(PAGE, CtpCleanupStaleConnections)
+#pragma alloc_text(PAGE, CtpGetOrCreateProcessContext)
+#pragma alloc_text(PAGE, CtpResolveProcessInfo)
+#pragma alloc_text(PAGE, CtpCleanupThreadRoutine)
+#endif
 
 // ============================================================================
 // INITIALIZATION AND SHUTDOWN
@@ -363,18 +382,51 @@ CtInitialize(
     tracker->LookasideInitialized = TRUE;
 
     //
-    // Initialize cleanup timer and work item.
-    // The DPC only queues a work item; all real work runs at PASSIVE_LEVEL.
+    // Initialize cleanup timer and system thread.
+    // The DPC signals a KEVENT; the thread runs cleanup at PASSIVE_LEVEL.
     //
     KeInitializeTimer(&tracker->Public.CleanupTimer);
     KeInitializeDpc(&tracker->Public.CleanupDpc, CtpCleanupTimerDpc, tracker);
     tracker->Public.CleanupIntervalMs = CT_CONNECTION_TIMEOUT_MS / 2;
-    tracker->CleanupWorkItemPending = 0;
-    ExInitializeWorkItem(
-        &tracker->CleanupWorkQueueItem,
-        CtpCleanupWorkItemRoutine,
-        tracker
-    );
+    KeInitializeEvent(&tracker->CleanupWakeEvent, SynchronizationEvent, FALSE);
+    tracker->CleanupTerminate = FALSE;
+    tracker->CleanupThread = NULL;
+
+    {
+        HANDLE threadHandle = NULL;
+        NTSTATUS threadStatus;
+
+        threadStatus = PsCreateSystemThread(
+            &threadHandle,
+            THREAD_ALL_ACCESS,
+            NULL,
+            NULL,
+            NULL,
+            CtpCleanupThreadRoutine,
+            tracker
+        );
+
+        if (!NT_SUCCESS(threadStatus)) {
+            status = threadStatus;
+            goto Cleanup;
+        }
+
+        threadStatus = ObReferenceObjectByHandle(
+            threadHandle,
+            THREAD_ALL_ACCESS,
+            *PsThreadType,
+            KernelMode,
+            (PVOID*)&tracker->CleanupThread,
+            NULL
+        );
+
+        ZwClose(threadHandle);
+
+        if (!NT_SUCCESS(threadStatus)) {
+            status = threadStatus;
+            goto Cleanup;
+        }
+    }
 
     //
     // Set default configuration
@@ -445,9 +497,10 @@ CtShutdown(
     tracker = CONTAINING_RECORD(Tracker, CT_TRACKER_INTERNAL, Public);
 
     //
-    // Signal shutdown — prevents DPC/work item from doing more work
+    // Signal shutdown — prevents DPC/thread from doing more work
     //
     tracker->ShuttingDown = TRUE;
+    tracker->CleanupTerminate = TRUE;
     MemoryBarrier();
 
     //
@@ -460,18 +513,72 @@ CtShutdown(
     KeFlushQueuedDpcs();
 
     //
-    // Wait for any pending cleanup work item to drain.
-    // After KeFlushQueuedDpcs, no new DPC will fire, so the work item
-    // counter can only be 0 or actively running. We spin briefly.
+    // Wake and wait for the cleanup thread to exit
     //
-    while (InterlockedCompareExchange(&tracker->CleanupWorkItemPending, 0, 0) != 0) {
-        LARGE_INTEGER delay;
-        delay.QuadPart = -10000; // 1ms
-        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    if (tracker->CleanupThread != NULL) {
+        KeSetEvent(&tracker->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
+        KeWaitForSingleObject(
+            tracker->CleanupThread,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+        ObDereferenceObject(tracker->CleanupThread);
+        tracker->CleanupThread = NULL;
     }
 
     //
-    // Free all connections — remove from all lists first
+    // Free flow hash entries FIRST (while connections still valid)
+    //
+    {
+        ULONG i;
+        ExAcquirePushLockExclusive(&Tracker->FlowHash.Lock);
+        for (i = 0; i < Tracker->FlowHash.BucketCount; i++) {
+            while (!IsListEmpty(&Tracker->FlowHash.Buckets[i])) {
+                entry = RemoveHeadList(&Tracker->FlowHash.Buckets[i]);
+                {
+                    PCT_FLOW_HASH_ENTRY fe = CONTAINING_RECORD(
+                        entry, CT_FLOW_HASH_ENTRY, ListEntry);
+                    ExFreeToNPagedLookasideList(&tracker->FlowHashLookaside, fe);
+                }
+            }
+        }
+        ExReleasePushLockExclusive(&Tracker->FlowHash.Lock);
+    }
+
+    //
+    // Detach all connections from ConnectionHash buckets
+    //
+    {
+        ULONG i;
+        ExAcquirePushLockExclusive(&Tracker->ConnectionHash.Lock);
+        for (i = 0; i < Tracker->ConnectionHash.BucketCount; i++) {
+            InitializeListHead(&Tracker->ConnectionHash.Buckets[i]);
+        }
+        ExReleasePushLockExclusive(&Tracker->ConnectionHash.Lock);
+    }
+
+    //
+    // Detach all connections from process context lists
+    //
+    ExAcquirePushLockShared(&Tracker->ProcessListLock);
+    for (entry = Tracker->ProcessList.Flink;
+         entry != &Tracker->ProcessList;
+         entry = entry->Flink) {
+
+        KIRQL oldIrql;
+        processCtx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, GlobalListEntry);
+        KeAcquireSpinLock(&processCtx->ConnectionLock, &oldIrql);
+        InitializeListHead(&processCtx->ConnectionList);
+        processCtx->ConnectionCount = 0;
+        processCtx->ActiveConnectionCount = 0;
+        KeReleaseSpinLock(&processCtx->ConnectionLock, oldIrql);
+    }
+    ExReleasePushLockShared(&Tracker->ProcessListLock);
+
+    //
+    // Free all connections — now safely detached from all hash/process lists
     //
     ExAcquirePushLockExclusive(&Tracker->ConnectionListLock);
 
@@ -480,7 +587,7 @@ CtShutdown(
         connection = CONTAINING_RECORD(entry, CT_CONNECTION, GlobalListEntry);
 
         //
-        // Mark as removed so CtpFreeConnection doesn't try to unlink again
+        // Mark as removed — already detached from hash/process lists above
         //
         InterlockedOr(&connection->Flags, CtFlag_RemovedFromLists);
 
@@ -510,22 +617,6 @@ CtShutdown(
     }
 
     ExReleasePushLockExclusive(&Tracker->ProcessListLock);
-
-    //
-    // Free flow hash entries
-    //
-    {
-        ULONG i;
-        ExAcquirePushLockExclusive(&Tracker->FlowHash.Lock);
-        for (i = 0; i < Tracker->FlowHash.BucketCount; i++) {
-            while (!IsListEmpty(&Tracker->FlowHash.Buckets[i])) {
-                entry = RemoveHeadList(&Tracker->FlowHash.Buckets[i]);
-                PCT_FLOW_HASH_ENTRY fe = CONTAINING_RECORD(entry, CT_FLOW_HASH_ENTRY, ListEntry);
-                ExFreeToNPagedLookasideList(&tracker->FlowHashLookaside, fe);
-            }
-        }
-        ExReleasePushLockExclusive(&Tracker->FlowHash.Lock);
-    }
 
     //
     // Free hash table bucket arrays
@@ -578,7 +669,6 @@ CtCreateConnection(
     _Out_ PCT_CONNECTION* Connection
     )
 {
-    NTSTATUS status = STATUS_SUCCESS;
     PCT_TRACKER_INTERNAL tracker;
     PCT_CONNECTION connection = NULL;
     PCT_PROCESS_CONTEXT processCtx = NULL;
@@ -954,17 +1044,14 @@ CtRemoveConnection(
     }
 
     //
-    // Read current state. volatile LONG reads are atomic on all
-    // Windows-supported architectures for aligned 32-bit values.
+    // Atomically swap state to Closed and read the previous value.
+    // Only the thread that transitions from an active state decrements.
     //
-    oldState = (CT_CONNECTION_STATE)connection->State;
+    oldState = (CT_CONNECTION_STATE)InterlockedExchange(
+        &connection->State, (LONG)CtState_Closed);
 
     if (oldState != CtState_Closed && oldState != CtState_Blocked &&
         oldState != CtState_TimedOut && oldState != CtState_Error) {
-        //
-        // Transition to Closed and update stats exactly once
-        //
-        InterlockedExchange(&connection->State, (LONG)CtState_Closed);
         KeQuerySystemTime(&connection->CloseTime);
         InterlockedDecrement64(&Tracker->Stats.ActiveConnections);
     }
@@ -1511,8 +1598,8 @@ CtAddRef(
     )
 {
     if (Connection != NULL) {
-        LONG newRef = InterlockedIncrement(&Connection->RefCount);
-        NT_ASSERT(newRef > 1);  // Must not addref a zero-ref object
+        InterlockedIncrement(&Connection->RefCount);
+        NT_ASSERT(Connection->RefCount > 1);
     }
 }
 
@@ -2075,43 +2162,40 @@ CtpCleanupTimerDpc(
     }
 
     //
-    // The DPC runs at DISPATCH_LEVEL — we MUST NOT touch push locks here.
-    // Instead, queue a work item that runs at PASSIVE_LEVEL.
+    // Wake the cleanup thread — it runs at PASSIVE_LEVEL.
     //
-    if (InterlockedCompareExchange(&tracker->CleanupWorkItemPending, 1, 0) == 0) {
-        ExQueueWorkItem(&tracker->CleanupWorkQueueItem, DelayedWorkQueue);
-    }
+    KeSetEvent(&tracker->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
 }
 
 static VOID
-CtpCleanupWorkItemRoutine(
-    _In_ PVOID Parameter
+CtpCleanupThreadRoutine(
+    _In_ PVOID Context
     )
 {
-    PCT_TRACKER_INTERNAL tracker = (PCT_TRACKER_INTERNAL)Parameter;
+    PCT_TRACKER_INTERNAL tracker = (PCT_TRACKER_INTERNAL)Context;
+    NTSTATUS waitStatus;
 
     PAGED_CODE();
 
-    if (tracker == NULL || tracker->ShuttingDown) {
-        if (tracker != NULL) {
-            InterlockedExchange(&tracker->CleanupWorkItemPending, 0);
+    for (;;) {
+        waitStatus = KeWaitForSingleObject(
+            &tracker->CleanupWakeEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+
+        if (tracker->CleanupTerminate) {
+            break;
         }
-        return;
+
+        if (waitStatus == STATUS_SUCCESS && !tracker->ShuttingDown) {
+            CtpCleanupStaleConnections(tracker);
+        }
     }
 
-    CtpCleanupStaleConnections(tracker);
-
-    //
-    // Re-initialize work item for next use.
-    // ExQueueWorkItem requires the item to be re-initialized after completion.
-    //
-    ExInitializeWorkItem(
-        &tracker->CleanupWorkQueueItem,
-        CtpCleanupWorkItemRoutine,
-        tracker
-    );
-
-    InterlockedExchange(&tracker->CleanupWorkItemPending, 0);
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 static VOID
