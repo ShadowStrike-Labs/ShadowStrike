@@ -42,9 +42,12 @@
     Copyright (c) ShadowStrike Team. All rights reserved.
 --*/
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include "ThreatScoring.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
+#pragma warning(pop)
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, TsInitialize)
@@ -157,6 +160,8 @@ typedef struct _TS_HASH_BUCKET {
 typedef struct _TS_SCORING_ENGINE {
     BOOLEAN Initialized;
     volatile LONG ShuttingDown;
+
+    EX_RUNDOWN_REF RundownRef;
 
     TS_THRESHOLD_CONFIG Thresholds;
     TS_WEIGHT_CONFIG Weights;
@@ -351,6 +356,8 @@ TsInitialize(
 
     RtlZeroMemory(NewEngine, sizeof(TS_SCORING_ENGINE));
 
+    ExInitializeRundownProtection(&NewEngine->RundownRef);
+
     //
     // Initialize hash buckets
     //
@@ -412,9 +419,6 @@ TsShutdown(
 {
     PLIST_ENTRY Entry;
     PTS_PROCESS_CONTEXT Context;
-    ULONG DrainWaitMs = 0;
-    LARGE_INTEGER Delay;
-    BOOLEAN AllDrained;
     ULONG i;
 
     PAGED_CODE();
@@ -430,38 +434,11 @@ TsShutdown(
     Engine->Initialized = FALSE;
 
     //
-    // Wait for all outstanding references to drain
+    // Wait for ALL outstanding rundown references to drain.
+    // This blocks until every in-flight TspAcquireContext has called
+    // TspReleaseContext. No timeout — BSOD-safe.
     //
-    Delay.QuadPart = -((LONG64)TS_SHUTDOWN_DRAIN_POLL_MS * 10000);
-
-    while (DrainWaitMs < TS_SHUTDOWN_DRAIN_TIMEOUT_MS) {
-        AllDrained = TRUE;
-
-        KeEnterCriticalRegion();
-        ExAcquirePushLockShared(&Engine->GlobalListLock);
-
-        for (Entry = Engine->GlobalContextList.Flink;
-             Entry != &Engine->GlobalContextList;
-             Entry = Entry->Flink) {
-
-            Context = CONTAINING_RECORD(Entry, TS_PROCESS_CONTEXT, GlobalLink);
-
-            if (Context->RefCount > 0) {
-                AllDrained = FALSE;
-                break;
-            }
-        }
-
-        ExReleasePushLockShared(&Engine->GlobalListLock);
-        KeLeaveCriticalRegion();
-
-        if (AllDrained) {
-            break;
-        }
-
-        KeDelayExecutionThread(KernelMode, FALSE, &Delay);
-        DrainWaitMs += TS_SHUTDOWN_DRAIN_POLL_MS;
-    }
+    ExWaitForRundownProtectionRelease(&Engine->RundownRef);
 
     //
     // Now destroy all contexts - iterate through hash buckets
@@ -477,11 +454,9 @@ TsShutdown(
             //
             // Remove from global list too
             //
-            KeEnterCriticalRegion();
             ExAcquirePushLockExclusive(&Engine->GlobalListLock);
             RemoveEntryList(&Context->GlobalLink);
             ExReleasePushLockExclusive(&Engine->GlobalListLock);
-            KeLeaveCriticalRegion();
 
             TspDestroyContext(Engine, Context);
         }
@@ -655,15 +630,7 @@ TsAddFactor(
     }
 
     //
-    // Check factor limit
-    //
-    if (InterlockedCompareExchange(&Context->FactorCount, 0, 0) >= TS_MAX_FACTORS) {
-        TspReleaseContext(Engine, Context);
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
-    //
-    // Allocate factor
+    // Allocate factor before acquiring lock to minimize hold time
     //
     NewFactor = (PTS_INTERNAL_FACTOR)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
@@ -693,10 +660,21 @@ TsAddFactor(
     RtlStringCbCopyA(NewFactor->Reason, sizeof(NewFactor->Reason), Reason);
 
     //
-    // Add to context under exclusive lock
+    // Add to context under exclusive lock with atomic limit check
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Context->FactorLock);
+
+    //
+    // Check factor limit inside lock to prevent TOCTOU race
+    //
+    if (Context->FactorCount >= TS_MAX_FACTORS) {
+        ExReleasePushLockExclusive(&Context->FactorLock);
+        KeLeaveCriticalRegion();
+        ShadowStrikeFreePoolWithTag(NewFactor, TS_POOL_TAG_FACTOR);
+        TspReleaseContext(Engine, Context);
+        return STATUS_QUOTA_EXCEEDED;
+    }
 
     InsertTailList(&Context->FactorList, &NewFactor->ListEntry);
     InterlockedIncrement(&Context->FactorCount);
@@ -728,7 +706,6 @@ TsCalculateScore(
 {
     PTS_PROCESS_CONTEXT Context;
     PTS_THREAT_SCORE NewScore;
-    NTSTATUS Status;
 
     PAGED_CODE();
 
@@ -972,10 +949,15 @@ TsOnProcessCreate(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    if (!ExAcquireRundownProtection(&Engine->RundownRef)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     //
     // Check quota
     //
     if (InterlockedCompareExchange(&Engine->ContextCount, 0, 0) >= TS_MAX_SCORES_TRACKED) {
+        ExReleaseRundownProtection(&Engine->RundownRef);
         return STATUS_QUOTA_EXCEEDED;
     }
 
@@ -997,12 +979,10 @@ TsOnProcessCreate(
             //
             RemoveEntryList(&ExistingContext->HashLink);
 
-            KeEnterCriticalRegion();
             ExAcquirePushLockExclusive(&Engine->GlobalListLock);
             RemoveEntryList(&ExistingContext->GlobalLink);
             InterlockedDecrement(&Engine->ContextCount);
             ExReleasePushLockExclusive(&Engine->GlobalListLock);
-            KeLeaveCriticalRegion();
 
             InterlockedIncrement64(&Engine->Stats.PidReuseDetected);
             TspDestroyContext(Engine, ExistingContext);
@@ -1012,6 +992,7 @@ TsOnProcessCreate(
             //
             ExReleasePushLockExclusive(&Bucket->Lock);
             KeLeaveCriticalRegion();
+            ExReleaseRundownProtection(&Engine->RundownRef);
             return STATUS_SUCCESS;
         }
     }
@@ -1028,6 +1009,7 @@ TsOnProcessCreate(
     if (Context == NULL) {
         ExReleasePushLockExclusive(&Bucket->Lock);
         KeLeaveCriticalRegion();
+        ExReleaseRundownProtection(&Engine->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1066,6 +1048,7 @@ TsOnProcessCreate(
 
     InterlockedIncrement64(&Engine->Stats.ContextsCreated);
 
+    ExReleaseRundownProtection(&Engine->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1087,6 +1070,10 @@ TsOnProcessExit(
         return;
     }
 
+    if (!ExAcquireRundownProtection(&Engine->RundownRef)) {
+        return;
+    }
+
     BucketIndex = TspHashProcessId(ProcessId);
     Bucket = &Engine->Buckets[BucketIndex];
 
@@ -1105,12 +1092,10 @@ TsOnProcessExit(
         if (Context->RefCount == 0) {
             RemoveEntryList(&Context->HashLink);
 
-            KeEnterCriticalRegion();
             ExAcquirePushLockExclusive(&Engine->GlobalListLock);
             RemoveEntryList(&Context->GlobalLink);
             InterlockedDecrement(&Engine->ContextCount);
             ExReleasePushLockExclusive(&Engine->GlobalListLock);
-            KeLeaveCriticalRegion();
 
             CanDestroy = TRUE;
         }
@@ -1123,6 +1108,8 @@ TsOnProcessExit(
         TspDestroyContext(Engine, Context);
         InterlockedIncrement64(&Engine->Stats.ContextsDestroyed);
     }
+
+    ExReleaseRundownProtection(&Engine->RundownRef);
 }
 
 _Use_decl_annotations_
@@ -1151,7 +1138,12 @@ TsRunMaintenancePass(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    if (!ExAcquireRundownProtection(&Engine->RundownRef)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     if (!Engine->DecayConfig.EnableDecay) {
+        ExReleaseRundownProtection(&Engine->RundownRef);
         return STATUS_SUCCESS;
     }
 
@@ -1232,6 +1224,7 @@ TsRunMaintenancePass(
     ExReleasePushLockShared(&Engine->GlobalListLock);
     KeLeaveCriticalRegion();
 
+    ExReleaseRundownProtection(&Engine->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1265,6 +1258,10 @@ TsPurgeStaleContexts(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    if (!ExAcquireRundownProtection(&Engine->RundownRef)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     InitializeListHead(&ToDestroy);
 
     //
@@ -1290,12 +1287,10 @@ TsPurgeStaleContexts(
                 if (Context->RefCount == 0) {
                     RemoveEntryList(&Context->HashLink);
 
-                    KeEnterCriticalRegion();
                     ExAcquirePushLockExclusive(&Engine->GlobalListLock);
                     RemoveEntryList(&Context->GlobalLink);
                     InterlockedDecrement(&Engine->ContextCount);
                     ExReleasePushLockExclusive(&Engine->GlobalListLock);
-                    KeLeaveCriticalRegion();
 
                     //
                     // Add to destroy list
@@ -1330,6 +1325,7 @@ TsPurgeStaleContexts(
         *PurgedCount = Purged;
     }
 
+    ExReleaseRundownProtection(&Engine->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1403,6 +1399,14 @@ TspAcquireContext(
     LARGE_INTEGER CreateTime;
     LARGE_INTEGER CurrentTime;
 
+    //
+    // Acquire rundown protection to prevent shutdown from destroying
+    // engine state while we hold a context reference.
+    //
+    if (!ExAcquireRundownProtection(&Engine->RundownRef)) {
+        return NULL;
+    }
+
     BucketIndex = TspHashProcessId(ProcessId);
     Bucket = &Engine->Buckets[BucketIndex];
 
@@ -1426,6 +1430,7 @@ TspAcquireContext(
     KeLeaveCriticalRegion();
 
     if (!CreateIfNotFound) {
+        ExReleaseRundownProtection(&Engine->RundownRef);
         return NULL;
     }
 
@@ -1433,6 +1438,7 @@ TspAcquireContext(
     // Check quota
     //
     if (InterlockedCompareExchange(&Engine->ContextCount, 0, 0) >= TS_MAX_SCORES_TRACKED) {
+        ExReleaseRundownProtection(&Engine->RundownRef);
         return NULL;
     }
 
@@ -1453,6 +1459,7 @@ TspAcquireContext(
         );
 
     if (NewContext == NULL) {
+        ExReleaseRundownProtection(&Engine->RundownRef);
         return NULL;
     }
 
@@ -1553,12 +1560,10 @@ TspReleaseContext(
         if (Context->MarkedForDeletion && Context->RefCount == 0) {
             RemoveEntryList(&Context->HashLink);
 
-            KeEnterCriticalRegion();
             ExAcquirePushLockExclusive(&Engine->GlobalListLock);
             RemoveEntryList(&Context->GlobalLink);
             InterlockedDecrement(&Engine->ContextCount);
             ExReleasePushLockExclusive(&Engine->GlobalListLock);
-            KeLeaveCriticalRegion();
 
             ShouldDestroy = TRUE;
         }
@@ -1571,6 +1576,12 @@ TspReleaseContext(
             InterlockedIncrement64(&Engine->Stats.ContextsDestroyed);
         }
     }
+
+    //
+    // Release rundown protection acquired in TspAcquireContext.
+    // This allows shutdown to proceed if we were the last holder.
+    //
+    ExReleaseRundownProtection(&Engine->RundownRef);
 }
 
 _Use_decl_annotations_
