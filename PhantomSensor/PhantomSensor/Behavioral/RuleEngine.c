@@ -156,10 +156,9 @@ typedef struct _RE_ENGINE {
     LIST_ENTRY RuleHashBuckets[RE_HASH_BUCKETS];
 
     //
-    // Lookaside lists for fast allocation
+    // Lookaside list for fast rule allocation
     //
     NPAGED_LOOKASIDE_LIST RuleLookaside;
-    NPAGED_LOOKASIDE_LIST ResultLookaside;
     volatile LONG LookasideInitialized;
 
     //
@@ -256,11 +255,6 @@ RepFindRuleByIdLocked(
 static VOID
 RepInsertRuleSortedLocked(
     _In_ PRE_ENGINE Engine,
-    _In_ PRE_INTERNAL_RULE Rule
-    );
-
-static VOID
-RepReferenceRule(
     _In_ PRE_INTERNAL_RULE Rule
     );
 
@@ -370,7 +364,7 @@ Return Value:
     }
 
     //
-    // Initialize lookaside lists for fast allocation
+    // Initialize lookaside list for fast rule allocation
     //
     ExInitializeNPagedLookasideList(
         &engine->RuleLookaside,
@@ -380,16 +374,6 @@ Return Value:
         sizeof(RE_INTERNAL_RULE),
         RE_POOL_TAG_RULE,
         0                           // Depth (system default)
-    );
-
-    ExInitializeNPagedLookasideList(
-        &engine->ResultLookaside,
-        NULL,
-        NULL,
-        0,
-        sizeof(RE_EVALUATION_RESULT),
-        RE_POOL_TAG_RESULT,
-        0
     );
 
     InterlockedExchange(&engine->LookasideInitialized, TRUE);
@@ -488,7 +472,6 @@ Arguments:
     //
     if (InterlockedExchange(&Engine->LookasideInitialized, FALSE)) {
         ExDeleteNPagedLookasideList(&Engine->RuleLookaside);
-        ExDeleteNPagedLookasideList(&Engine->ResultLookaside);
     }
 
     //
@@ -826,10 +809,14 @@ Return Value:
     *Result = NULL;
 
     //
-    // Allocate result from lookaside list
+    // Allocate result from pool directly.
+    // Results outlive evaluation calls and may be freed after engine
+    // shutdown, so they must NOT depend on engine lifetime (no lookaside).
     //
-    result = (PRE_EVALUATION_RESULT)ExAllocateFromNPagedLookasideList(
-        &Engine->ResultLookaside
+    result = (PRE_EVALUATION_RESULT)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(RE_EVALUATION_RESULT),
+        RE_POOL_TAG_RESULT
     );
 
     if (result == NULL) {
@@ -838,12 +825,8 @@ Return Value:
 
     RtlZeroMemory(result, sizeof(RE_EVALUATION_RESULT));
 
-    //
-    // Store engine handle for proper deallocation
-    //
-    result->EngineHandle = Engine;
     result->RuleMatched = FALSE;
-    result->PrimaryAction = ReAction_None;  // Always initialized
+    result->PrimaryAction = ReAction_None;
 
     //
     // Evaluate rules in priority order under shared lock
@@ -899,6 +882,8 @@ Return Value:
         if (allConditionsMatch && rule->CompiledConditionCount > 0) {
             //
             // Rule matched - copy data to result (no internal pointers!)
+            // First match wins: rules are sorted by priority (lower = higher),
+            // so the first match is always the highest-priority rule.
             //
             result->RuleMatched = TRUE;
 
@@ -931,7 +916,7 @@ Return Value:
             }
 
             //
-            // Set primary action (always initialized)
+            // Set primary action
             //
             if (result->ActionCount > 0) {
                 result->PrimaryAction = result->Actions[0].Type;
@@ -962,11 +947,9 @@ Return Value:
             }
 
             //
-            // Stop if rule says so
+            // Highest-priority match found — stop evaluating.
             //
-            if (rule->Public.StopProcessing) {
-                break;
-            }
+            break;
         }
     }
 
@@ -986,35 +969,18 @@ ReFreeResult(
 Routine Description:
     Frees an evaluation result.
 
-    Uses the stored engine handle to return to the correct lookaside list.
+    Results are allocated from pool (not lookaside) so they are safe
+    to free even after the engine has been destroyed.
 
 Arguments:
     Result - Result to free. May be NULL.
 --*/
 {
-    PRE_ENGINE engine;
-
     if (Result == NULL) {
         return;
     }
 
-    engine = (PRE_ENGINE)Result->EngineHandle;
-
-    //
-    // Validate engine handle before using lookaside list
-    //
-    if (engine != NULL &&
-        engine->Signature == RE_ENGINE_SIGNATURE &&
-        engine->LookasideInitialized) {
-
-        ExFreeToNPagedLookasideList(&engine->ResultLookaside, Result);
-    } else {
-        //
-        // Fallback: engine was destroyed, use pool free
-        // This should not happen in correct usage
-        //
-        ExFreePoolWithTag(Result, RE_POOL_TAG_RESULT);
-    }
+    ExFreePoolWithTag(Result, RE_POOL_TAG_RESULT);
 }
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -1070,9 +1036,10 @@ Return Value:
     }
 
     //
-    // Copy rule data to caller's buffer
+    // Copy rule data to caller's buffer and sanitize internal fields
     //
     RtlCopyMemory(Rule, &internalRule->Public, sizeof(RE_RULE));
+    RtlZeroMemory(&Rule->ListEntry, sizeof(LIST_ENTRY));
 
     ExReleasePushLockShared(&Engine->RuleLock);
     KeLeaveCriticalRegion();
@@ -1130,6 +1097,7 @@ Return Value:
 
         if (!rule->MarkedForDeletion) {
             RtlCopyMemory(&Rules[count], &rule->Public, sizeof(RE_RULE));
+            RtlZeroMemory(&Rules[count].ListEntry, sizeof(LIST_ENTRY));
             count++;
         }
     }
@@ -1450,6 +1418,14 @@ RepCompileRule(
         dstCondition->CaseInsensitive = TRUE;
 
         //
+        // Reject unsupported operators at compile time rather than
+        // silently returning FALSE during evaluation
+        //
+        if (srcCondition->Operator == ReOp_InList) {
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        //
         // Compile based on condition type
         //
         switch (srcCondition->Type) {
@@ -1645,10 +1621,24 @@ RepCompileTimeCondition(
         return STATUS_INVALID_PARAMETER;
     }
 
-    startHour = (TimeSpec[0] - '0') * 10 + (TimeSpec[1] - '0');
-    startMinute = (TimeSpec[3] - '0') * 10 + (TimeSpec[4] - '0');
-    endHour = (TimeSpec[6] - '0') * 10 + (TimeSpec[7] - '0');
-    endMinute = (TimeSpec[9] - '0') * 10 + (TimeSpec[10] - '0');
+    //
+    // Validate all digit positions
+    //
+    if (TimeSpec[0] < '0' || TimeSpec[0] > '9' ||
+        TimeSpec[1] < '0' || TimeSpec[1] > '9' ||
+        TimeSpec[3] < '0' || TimeSpec[3] > '9' ||
+        TimeSpec[4] < '0' || TimeSpec[4] > '9' ||
+        TimeSpec[6] < '0' || TimeSpec[6] > '9' ||
+        TimeSpec[7] < '0' || TimeSpec[7] > '9' ||
+        TimeSpec[9] < '0' || TimeSpec[9] > '9' ||
+        TimeSpec[10] < '0' || TimeSpec[10] > '9') {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    startHour = (ULONG)(TimeSpec[0] - '0') * 10 + (ULONG)(TimeSpec[1] - '0');
+    startMinute = (ULONG)(TimeSpec[3] - '0') * 10 + (ULONG)(TimeSpec[4] - '0');
+    endHour = (ULONG)(TimeSpec[6] - '0') * 10 + (ULONG)(TimeSpec[7] - '0');
+    endMinute = (ULONG)(TimeSpec[9] - '0') * 10 + (ULONG)(TimeSpec[10] - '0');
 
     if (startHour >= 24 || startMinute >= 60 ||
         endHour >= 24 || endMinute >= 60) {
@@ -1810,11 +1800,13 @@ RepEvaluateCondition(
             //
             // Convert system time to minutes since midnight
             //
+            LARGE_INTEGER systemTime;
             LARGE_INTEGER localTime;
             TIME_FIELDS timeFields;
             ULONG currentMinute;
 
-            ExSystemTimeToLocalTime(&Context->CurrentTime, &localTime);
+            systemTime = Context->CurrentTime;
+            ExSystemTimeToLocalTime(&systemTime, &localTime);
             RtlTimeToTimeFields(&localTime, &timeFields);
 
             currentMinute = timeFields.Hour * 60 + timeFields.Minute;
@@ -1964,8 +1956,8 @@ RepMatchUnicodeString(
 
     case ReOp_InList:
         //
-        // InList would require additional data structure
-        // Not implemented in this version
+        // InList requires list-management infrastructure not yet wired.
+        // Reject at evaluation time with a safe FALSE.
         //
         return FALSE;
 
@@ -2113,14 +2105,6 @@ Routine Description:
 // ============================================================================
 
 static VOID
-RepReferenceRule(
-    _In_ PRE_INTERNAL_RULE Rule
-    )
-{
-    InterlockedIncrement(&Rule->RefCount);
-}
-
-static VOID
 RepDereferenceRule(
     _In_ PRE_ENGINE Engine,
     _In_ PRE_INTERNAL_RULE Rule
@@ -2147,9 +2131,11 @@ RepFreeRuleInternal(
     Rule->Signature = 0;
 
     //
-    // Return to lookaside list
+    // Return to lookaside list or pool
     //
     if (Engine->LookasideInitialized) {
         ExFreeToNPagedLookasideList(&Engine->RuleLookaside, Rule);
+    } else {
+        ExFreePoolWithTag(Rule, RE_POOL_TAG_RULE);
     }
 }

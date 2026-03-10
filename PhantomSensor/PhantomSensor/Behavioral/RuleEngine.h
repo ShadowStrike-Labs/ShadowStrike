@@ -38,6 +38,7 @@ full thread-safety, proper resource management, and no undefined behavior.
 extern "C" {
 #endif
 
+#include <ntifs.h>
 #include <ntddk.h>
 
 //
@@ -200,9 +201,6 @@ typedef struct _RE_EVALUATION_RESULT {
     // All actions to take
     RE_ACTION Actions[RE_MAX_ACTIONS];
     ULONG ActionCount;
-
-    // Opaque engine handle for proper deallocation
-    PVOID EngineHandle;
 
     LIST_ENTRY ListEntry;
 } RE_EVALUATION_RESULT, *PRE_EVALUATION_RESULT;
