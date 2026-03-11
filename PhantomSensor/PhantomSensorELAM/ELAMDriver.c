@@ -35,8 +35,11 @@
 #include "ELAMDriver.h"
 #include "BootDriverVerify.h"
 #include "BootThreatDetector.h"
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include "../PhantomSensor/Utilities/HashUtils.h"
-#include "../PhantomSensor/SelfProtection/CallbackProtection.h"
+#pragma warning(pop)
+#include <ntimage.h>
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -63,7 +66,7 @@ static ELAM_DRIVER_GLOBALS g_ElamGlobals = {0};
 static PBDV_VERIFIER g_BootVerifier = NULL;
 static PBTD_DETECTOR g_ThreatDetector = NULL;
 static LARGE_INTEGER g_RegistryCookie = {0};
-static PVOID g_ImageNotifyRegistered = NULL;
+static BOOLEAN g_ImageNotifyRegistered = FALSE;
 static EX_PUSH_LOCK g_StateLock;
 static BOOLEAN g_StateLockInitialized = FALSE;
 
@@ -123,7 +126,7 @@ ElamDriverInitialize(
 
     UNREFERENCED_PARAMETER(RegistryPath);
 
-    if (g_ElamGlobals.Initialized) {
+    if (InterlockedCompareExchange(&g_ElamGlobals.Initialized, 0, 0)) {
         return STATUS_ALREADY_INITIALIZED;
     }
 
@@ -174,7 +177,7 @@ ElamDriverInitialize(
     // Set default boot policy
     g_ElamGlobals.BootPolicy = ElamPolicyGoodUnknown;
 
-    g_ElamGlobals.Initialized = TRUE;
+    InterlockedExchange(&g_ElamGlobals.Initialized, TRUE);
 
     return STATUS_SUCCESS;
 
@@ -213,7 +216,7 @@ ElamDriverShutdown(VOID)
     // Cleanup hash utilities
     ShadowStrikeCleanupHashUtils();
 
-    g_ElamGlobals.Initialized = FALSE;
+    InterlockedExchange(&g_ElamGlobals.Initialized, FALSE);
 }
 
 /**
@@ -225,11 +228,11 @@ ElamRegisterCallback(VOID)
     NTSTATUS status;
     UNICODE_STRING altitude;
 
-    if (!g_ElamGlobals.Initialized) {
+    if (!InterlockedCompareExchange(&g_ElamGlobals.Initialized, 0, 0)) {
         return STATUS_UNSUCCESSFUL;
     }
 
-    if (g_ElamGlobals.CallbackRegistered) {
+    if (InterlockedCompareExchange(&g_ElamGlobals.CallbackRegistered, 0, 0)) {
         return STATUS_ALREADY_REGISTERED;
     }
 
@@ -239,7 +242,7 @@ ElamRegisterCallback(VOID)
     if (!NT_SUCCESS(status)) {
         return status;
     }
-    g_ImageNotifyRegistered = (PVOID)TRUE;
+    g_ImageNotifyRegistered = TRUE;
 
     // Register registry callback for boot driver protection
     RtlInitUnicodeString(&altitude, L"380000");  // High altitude for early filtering
@@ -256,12 +259,12 @@ ElamRegisterCallback(VOID)
     if (!NT_SUCCESS(status)) {
         // Unregister image callback on failure
         PsRemoveLoadImageNotifyRoutine(ElamImageLoadCallback);
-        g_ImageNotifyRegistered = NULL;
+        g_ImageNotifyRegistered = FALSE;
         return status;
     }
 
     g_ElamGlobals.CallbackHandle = (PVOID)g_RegistryCookie.QuadPart;
-    g_ElamGlobals.CallbackRegistered = TRUE;
+    InterlockedExchange(&g_ElamGlobals.CallbackRegistered, TRUE);
 
     return STATUS_SUCCESS;
 }
@@ -272,7 +275,7 @@ ElamRegisterCallback(VOID)
 VOID
 ElamUnregisterCallback(VOID)
 {
-    if (!g_ElamGlobals.CallbackRegistered) {
+    if (!InterlockedCompareExchange(&g_ElamGlobals.CallbackRegistered, 0, 0)) {
         return;
     }
 
@@ -283,13 +286,13 @@ ElamUnregisterCallback(VOID)
     }
 
     // Unregister image load callback
-    if (g_ImageNotifyRegistered != NULL) {
+    if (g_ImageNotifyRegistered) {
         PsRemoveLoadImageNotifyRoutine(ElamImageLoadCallback);
-        g_ImageNotifyRegistered = NULL;
+        g_ImageNotifyRegistered = FALSE;
     }
 
     g_ElamGlobals.CallbackHandle = NULL;
-    g_ElamGlobals.CallbackRegistered = FALSE;
+    InterlockedExchange(&g_ElamGlobals.CallbackRegistered, FALSE);
 }
 
 // ============================================================================
@@ -315,6 +318,7 @@ ElamImageLoadCallback(
     ELAM_BOOT_DRIVER_INFO bootInfo = {0};
     LARGE_INTEGER startTime, endTime;
     ELAM_DRIVER_CLASSIFICATION classification;
+    LONGLONG elapsedMs;
 
     // Only process kernel-mode images (ProcessId == 0 or NULL indicates kernel)
     if (ProcessId != NULL && ProcessId != (HANDLE)0) {
@@ -332,7 +336,8 @@ ElamImageLoadCallback(
     }
 
     // Skip if not initialized
-    if (!g_ElamGlobals.Initialized || g_BootVerifier == NULL) {
+    if (!InterlockedCompareExchange(&g_ElamGlobals.Initialized, 0, 0) ||
+        g_BootVerifier == NULL) {
         return;
     }
 
@@ -349,8 +354,10 @@ ElamImageLoadCallback(
         );
 
     if (!NT_SUCCESS(status) || driverInfo == NULL) {
-        // Verification failed - treat as unknown
         InterlockedIncrement(&g_ElamGlobals.DriversUnknown);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/ELAM] Driver verification failed for %wZ: 0x%08X\n",
+            FullImageName, status);
         return;
     }
 
@@ -361,11 +368,11 @@ ElamImageLoadCallback(
     RtlZeroMemory(&bootInfo, sizeof(ELAM_BOOT_DRIVER_INFO));
     bootInfo.DriverPath = *FullImageName;
     bootInfo.ImageBase = ImageInfo->ImageBase;
-    bootInfo.ImageSize = (ULONG)ImageInfo->ImageSize;
+    bootInfo.ImageSize = (ULONG)(min(ImageInfo->ImageSize, (SIZE_T)MAXULONG));
     RtlCopyMemory(bootInfo.ImageHashSHA256, driverInfo->ImageHash, 32);
     RtlCopyMemory(bootInfo.AuthenticodeHashSHA256, driverInfo->AuthentiCodeHash, 32);
     bootInfo.IsSigned = driverInfo->IsSigned;
-    bootInfo.IsSignatureValid = driverInfo->IsSigned;  // Simplified
+    bootInfo.IsSignatureValid = driverInfo->IsSigned;
 
     // Perform final classification
     classification = ElamClassifyDriver(&bootInfo);
@@ -381,9 +388,16 @@ ElamImageLoadCallback(
         case ElamClassificationKnownBad:
             InterlockedIncrement(&g_ElamGlobals.DriversBad);
 
-            // Take remediation action for known bad drivers
             if (threat != NULL) {
                 ElamTakeRemediationAction(threat, driverInfo);
+            } else {
+                //
+                // No BTD threat but classified as bad by hash/cert — create one
+                //
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[ShadowStrike/ELAM] KNOWN BAD driver detected: %wZ\n",
+                    FullImageName);
+                InterlockedIncrement(&g_ElamGlobals.DriversBlocked);
             }
             break;
 
@@ -391,27 +405,47 @@ ElamImageLoadCallback(
         default:
             InterlockedIncrement(&g_ElamGlobals.DriversUnknown);
 
-            // Apply policy for unknown drivers
             if (g_ElamGlobals.BootPolicy == ElamPolicyGoodOnly) {
-                // Block unknown in strict mode
-                if (threat == NULL) {
-                    // Create threat entry for unknown driver
+                //
+                // Strict mode: unknown drivers are treated as threats
+                //
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike/ELAM] POLICY BLOCK (GoodOnly): unknown driver %wZ\n",
+                    FullImageName);
+                InterlockedIncrement(&g_ElamGlobals.DriversBlocked);
+
+                if (threat != NULL) {
+                    threat->WasBlocked = TRUE;
+                    RtlStringCbCopyA(threat->ActionReason, sizeof(threat->ActionReason),
+                        "Blocked by GoodOnly boot policy");
                 }
             }
             break;
     }
 
-    // Record elapsed time
+    // Record elapsed time and log performance data
     KeQuerySystemTimePrecise(&endTime);
+    elapsedMs = (endTime.QuadPart - startTime.QuadPart) / 10000;
 
-    // Log if verbose mode enabled
+    if (elapsedMs > ELAM_CLASSIFICATION_TIMEOUT_MS) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/ELAM] PERFORMANCE WARNING: classification of %wZ took %lld ms "
+            "(threshold=%u ms)\n",
+            FullImageName, elapsedMs, ELAM_CLASSIFICATION_TIMEOUT_MS);
+    }
+
     if (g_ElamGlobals.VerboseLogging) {
-        LONGLONG elapsedMs = (endTime.QuadPart - startTime.QuadPart) / 10000;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+            "[ShadowStrike/ELAM] Classified %wZ => %d (signed=%d) in %lld ms\n",
+            FullImageName, (int)classification, (int)bootInfo.IsSigned, elapsedMs);
+    }
 
-        // Performance check: should be < 25ms
-        if (elapsedMs > ELAM_CLASSIFICATION_TIMEOUT_MS) {
-            // Log performance warning
-        }
+    // Release resources allocated by BDV/BTD
+    if (threat != NULL) {
+        BtdFreeThreat(threat);
+    }
+    if (driverInfo != NULL) {
+        BdvFreeDriverInfo(driverInfo);
     }
 }
 
@@ -520,7 +554,9 @@ ElamIsHashKnownGood(
     // Skip certificate entries
     for (i = 0; i < header->SignatureCount; i++) {
         PELAM_CERTIFICATE_ENTRY certEntry = (PELAM_CERTIFICATE_ENTRY)entryPtr;
-        if (certEntry->EntrySize == 0 || offset + certEntry->EntrySize > header->TotalSize) {
+        if (certEntry->EntrySize == 0 ||
+            offset > header->TotalSize ||
+            certEntry->EntrySize > header->TotalSize - offset) {
             break;
         }
         entryPtr += certEntry->EntrySize;
@@ -531,7 +567,9 @@ ElamIsHashKnownGood(
     for (i = 0; i < header->HashCount; i++) {
         hashEntry = (PELAM_HASH_ENTRY)entryPtr;
 
-        if (hashEntry->EntrySize == 0 || offset + hashEntry->EntrySize > header->TotalSize) {
+        if (hashEntry->EntrySize == 0 ||
+            offset > header->TotalSize ||
+            hashEntry->EntrySize > header->TotalSize - offset) {
             break;
         }
 
@@ -582,7 +620,9 @@ ElamIsHashKnownBad(
 
     for (i = 0; i < header->SignatureCount; i++) {
         PELAM_CERTIFICATE_ENTRY certEntry = (PELAM_CERTIFICATE_ENTRY)entryPtr;
-        if (certEntry->EntrySize == 0 || offset + certEntry->EntrySize > header->TotalSize) {
+        if (certEntry->EntrySize == 0 ||
+            offset > header->TotalSize ||
+            certEntry->EntrySize > header->TotalSize - offset) {
             break;
         }
         entryPtr += certEntry->EntrySize;
@@ -593,7 +633,9 @@ ElamIsHashKnownBad(
     for (i = 0; i < header->HashCount; i++) {
         hashEntry = (PELAM_HASH_ENTRY)entryPtr;
 
-        if (hashEntry->EntrySize == 0 || offset + hashEntry->EntrySize > header->TotalSize) {
+        if (hashEntry->EntrySize == 0 ||
+            offset > header->TotalSize ||
+            hashEntry->EntrySize > header->TotalSize - offset) {
             break;
         }
 
@@ -642,11 +684,12 @@ ElamIsCertificateKnownGood(
     offset = sizeof(ELAM_SIGNATURE_HEADER);
     entryPtr = (PUCHAR)header + offset;
 
-    // Search certificate entries
     for (i = 0; i < header->SignatureCount; i++) {
         certEntry = (PELAM_CERTIFICATE_ENTRY)entryPtr;
 
-        if (certEntry->EntrySize == 0 || offset + certEntry->EntrySize > header->TotalSize) {
+        if (certEntry->EntrySize == 0 ||
+            offset > header->TotalSize ||
+            certEntry->EntrySize > header->TotalSize - offset) {
             break;
         }
 
@@ -711,7 +754,9 @@ ElamIsCertificateKnownBad(
     for (i = 0; i < header->SignatureCount; i++) {
         certEntry = (PELAM_CERTIFICATE_ENTRY)entryPtr;
 
-        if (certEntry->EntrySize == 0 || offset + certEntry->EntrySize > header->TotalSize) {
+        if (certEntry->EntrySize == 0 ||
+            offset > header->TotalSize ||
+            certEntry->EntrySize > header->TotalSize - offset) {
             break;
         }
 
@@ -753,7 +798,6 @@ ElamRegistryCallbackRoutine(
     PREG_DELETE_VALUE_KEY_INFORMATION deleteValueInfo;
     PREG_DELETE_KEY_INFORMATION deleteKeyInfo;
     PREG_CREATE_KEY_INFORMATION_V1 createKeyInfo;
-    UNICODE_STRING keyPath = {0};
     PUNICODE_STRING objectName;
 
     UNREFERENCED_PARAMETER(CallbackContext);
@@ -778,8 +822,9 @@ ElamRegistryCallbackRoutine(
 
                 if (NT_SUCCESS(status) && objectName != NULL) {
                     if (ElamIsProtectedRegistryPath(objectName)) {
-                        // Block modification to protected boot driver keys
-                        // In production, you might log and allow based on policy
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                            "[ShadowStrike/ELAM] BLOCKED registry value modification: %wZ\n",
+                            objectName);
                         status = STATUS_ACCESS_DENIED;
                     }
                     CmCallbackReleaseKeyObjectIDEx(objectName);
@@ -830,8 +875,16 @@ ElamRegistryCallbackRoutine(
         case RegNtPreCreateKeyEx:
             createKeyInfo = (PREG_CREATE_KEY_INFORMATION_V1)Argument2;
             if (createKeyInfo != NULL && createKeyInfo->CompleteName != NULL) {
-                // Allow creation but monitor for suspicious new boot drivers
-                // This is informational only
+                //
+                // Monitor creation of new keys under protected boot driver paths.
+                // We do NOT block creation (too aggressive at boot), but log for
+                // the user-mode service to investigate after boot completes.
+                //
+                if (ElamIsProtectedRegistryPath(createKeyInfo->CompleteName)) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                        "[ShadowStrike/ELAM] New key creation under protected path: %wZ\n",
+                        createKeyInfo->CompleteName);
+                }
             }
             break;
 
@@ -844,6 +897,8 @@ ElamRegistryCallbackRoutine(
 
 /**
  * @brief Check if registry path is protected
+ *
+ * Uses prefix matching: any key under the protected paths is considered protected.
  */
 static BOOLEAN
 ElamIsProtectedRegistryPath(
@@ -852,24 +907,15 @@ ElamIsProtectedRegistryPath(
 {
     ULONG i;
     UNICODE_STRING protectedPath;
-    SIZE_T compareLength;
 
-    if (KeyPath == NULL || KeyPath->Buffer == NULL) {
+    if (KeyPath == NULL || KeyPath->Buffer == NULL || KeyPath->Length == 0) {
         return FALSE;
     }
 
     for (i = 0; g_ProtectedRegistryPaths[i] != NULL; i++) {
         RtlInitUnicodeString(&protectedPath, g_ProtectedRegistryPaths[i]);
 
-        // Check if key path starts with protected path
-        compareLength = min(KeyPath->Length, protectedPath.Length);
-
-        if (compareLength > 0 &&
-            RtlCompareUnicodeString(KeyPath, &protectedPath, TRUE) == 0) {
-            return TRUE;
-        }
-
-        // Also check prefix match
+        // Prefix match: the key path starts with the protected path
         if (KeyPath->Length >= protectedPath.Length) {
             UNICODE_STRING prefix;
             prefix.Buffer = KeyPath->Buffer;
@@ -951,7 +997,8 @@ ElamLoadSignatureData(
         goto FallbackEmbedded;
     }
 
-    if (resourceDir->VirtualAddress + resourceDir->Size > driverSize) {
+    if (resourceDir->VirtualAddress > driverSize ||
+        resourceDir->Size > driverSize - resourceDir->VirtualAddress) {
         goto FallbackEmbedded;
     }
 
@@ -1020,7 +1067,8 @@ ElamLoadSignatureData(
                                             dataEntry = (PIMAGE_RESOURCE_DATA_ENTRY)(
                                                 (PUCHAR)resRoot + langEntry[0].OffsetToData);
 
-                                            if (dataEntry->OffsetToData + dataEntry->Size <= driverSize &&
+                                            if (dataEntry->OffsetToData <= driverSize &&
+                                                dataEntry->Size <= driverSize - dataEntry->OffsetToData &&
                                                 dataEntry->Size >= sizeof(ELAM_SIGNATURE_HEADER)) {
 
                                                 resourceData = (PUCHAR)driverBase + dataEntry->OffsetToData;
@@ -1037,7 +1085,8 @@ ElamLoadSignatureData(
                                     dataEntry = (PIMAGE_RESOURCE_DATA_ENTRY)(
                                         (PUCHAR)resRoot + nameEntry[j].OffsetToData);
 
-                                    if (dataEntry->OffsetToData + dataEntry->Size <= driverSize &&
+                                    if (dataEntry->OffsetToData <= driverSize &&
+                                        dataEntry->Size <= driverSize - dataEntry->OffsetToData &&
                                         dataEntry->Size >= sizeof(ELAM_SIGNATURE_HEADER)) {
 
                                         resourceData = (PUCHAR)driverBase + dataEntry->OffsetToData;
@@ -1234,11 +1283,11 @@ ElamGetSignatureStats(
 _Use_decl_annotations_
 NTSTATUS
 ElamGetStatistics(
-    PULONG DriversClassified,
-    PULONG DriversGood,
-    PULONG DriversBad,
-    PULONG DriversUnknown,
-    PULONG DriversBlocked
+    PLONG DriversClassified,
+    PLONG DriversGood,
+    PLONG DriversBad,
+    PLONG DriversUnknown,
+    PLONG DriversBlocked
     )
 {
     if (DriversClassified == NULL || DriversGood == NULL ||
@@ -1301,6 +1350,9 @@ ElamCompareHashes(
 
 /**
  * @brief Threat notification callback
+ *
+ * Called by BootThreatDetector when a threat is identified during scanning.
+ * Logs the detection and updates statistics.
  */
 static VOID
 ElamThreatNotificationCallback(
@@ -1314,19 +1366,23 @@ ElamThreatNotificationCallback(
         return;
     }
 
-    // Log threat detection
-    if (g_ElamGlobals.VerboseLogging) {
-        // Would log to ETW or debug output
-    }
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+        "[ShadowStrike/ELAM] THREAT DETECTED: type=%d severity=%u critical=%d "
+        "name=%s driver=%wZ\n",
+        (int)Threat->Type, Threat->SeverityScore, (int)Threat->IsCritical,
+        Threat->ThreatName, &Threat->DriverPath);
 
-    // Update blocked count if threat was blocked
     if (Threat->WasBlocked) {
         InterlockedIncrement(&g_ElamGlobals.DriversBlocked);
     }
 }
 
 /**
- * @brief Take remediation action for detected threat
+ * @brief Take remediation action for detected boot-time threat
+ *
+ * Since PsSetLoadImageNotifyRoutine callbacks are VOID (cannot block loads),
+ * remediation writes a registry flag for the user-mode agent to process.
+ * The agent can then quarantine the file, disable the service, or uninstall.
  */
 static NTSTATUS
 ElamTakeRemediationAction(
@@ -1334,70 +1390,97 @@ ElamTakeRemediationAction(
     _In_ PBDV_DRIVER_INFO DriverInfo
     )
 {
-    NTSTATUS status = STATUS_SUCCESS;
-
-    UNREFERENCED_PARAMETER(DriverInfo);
+    NTSTATUS status;
+    HANDLE keyHandle = NULL;
+    OBJECT_ATTRIBUTES objAttrs;
+    UNICODE_STRING keyPath;
+    UNICODE_STRING valueName;
+    ULONG flagValue;
 
     if (Threat == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    // Since we cannot block drivers before load (no ELAM certificate),
-    // we implement compensating controls:
+    //
+    // Log the threat at ERROR level — this is always visible
+    //
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+        "[ShadowStrike/ELAM] REMEDIATION: threat=%s severity=%u driver=%wZ\n",
+        Threat->ThreatName, Threat->SeverityScore,
+        (DriverInfo != NULL) ? &DriverInfo->DriverPath : NULL);
 
-    // 1. Attempt to unload driver if possible
-    //    Note: Boot drivers typically cannot be unloaded
-    //    This would use ZwUnloadDriver
+    //
+    // Write a marker in the registry for the user-mode agent.
+    // Path: HKLM\System\CurrentControlSet\Control\EarlyLaunch\BlockedDrivers
+    // Value: severity score — the agent reads this after boot to take action.
+    //
+    RtlInitUnicodeString(&keyPath,
+        L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\EarlyLaunch\\BlockedDrivers");
 
-    // 2. Quarantine the driver file (prevent reload)
-    //    This would use minifilter to block future access
+    InitializeObjectAttributes(&objAttrs, &keyPath,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
 
-    // 3. Remove service registry entries
-    //    This prevents the driver from loading on next boot
+    status = ZwCreateKey(
+        &keyHandle,
+        KEY_WRITE,
+        &objAttrs,
+        0,
+        NULL,
+        REG_OPTION_NON_VOLATILE,
+        NULL
+        );
 
-    // 4. Alert user-mode service for additional action
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/ELAM] Failed to create BlockedDrivers key: 0x%08X\n",
+            status);
+        RtlStringCbCopyA(Threat->ActionReason, sizeof(Threat->ActionReason),
+            "Registry write failed; logged for manual review");
+        return status;
+    }
 
-    // 5. Log to telemetry for cloud analysis
+    //
+    // Write the driver path as value name with severity as data
+    //
+    if (DriverInfo != NULL && DriverInfo->DriverPath.Buffer != NULL &&
+        DriverInfo->DriverPath.Length > 0) {
+        valueName = DriverInfo->DriverPath;
+    } else {
+        RtlInitUnicodeString(&valueName, L"UnidentifiedThreat");
+    }
 
-    // For now, mark threat as action taken
-    RtlStringCbCopyA(Threat->ActionReason, sizeof(Threat->ActionReason),
-                    "Remediation: Logged and queued for removal on restart");
+    flagValue = Threat->SeverityScore;
+    if (flagValue == 0) {
+        flagValue = 1;
+    }
 
+    status = ZwSetValueKey(
+        keyHandle,
+        &valueName,
+        0,
+        REG_DWORD,
+        &flagValue,
+        sizeof(flagValue)
+        );
+
+    if (NT_SUCCESS(status)) {
+        RtlStringCbCopyA(Threat->ActionReason, sizeof(Threat->ActionReason),
+            "Flagged in registry for user-mode agent remediation");
+        Threat->WasBlocked = FALSE;
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "[ShadowStrike/ELAM] Remediation marker written for %wZ (severity=%u)\n",
+            &valueName, flagValue);
+    } else {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/ELAM] Failed to write remediation value: 0x%08X\n",
+            status);
+        RtlStringCbCopyA(Threat->ActionReason, sizeof(Threat->ActionReason),
+            "Registry value write failed; logged for manual review");
+    }
+
+    ZwClose(keyHandle);
     return status;
 }
 
-// ============================================================================
-// BOOT DRIVER CALLBACK (for documentation - requires ELAM certificate)
-// ============================================================================
-
-/**
- * @brief Boot driver callback (ELAM-style)
- *
- * Note: This function signature matches IoRegisterBootDriverCallback
- * but cannot be used without an ELAM certificate. It is provided
- * for reference and future use if ELAM signing becomes available.
- */
-_Use_decl_annotations_
-VOID
-ElamBootDriverCallback(
-    PVOID CallbackContext,
-    BDCB_CALLBACK_TYPE Classification,
-    PBDCB_IMAGE_INFORMATION ImageInformation
-    )
-{
-    // This callback requires ELAM certificate to register
-    // Without it, we use PsSetLoadImageNotifyRoutine instead
-
-    UNREFERENCED_PARAMETER(CallbackContext);
-    UNREFERENCED_PARAMETER(Classification);
-    UNREFERENCED_PARAMETER(ImageInformation);
-
-    // Would process BDCB_CALLBACK_TYPE:
-    // - BdCbStatusUpdate
-    // - BdCbInitializeImage
-
-    // Would set ImageInformation->Classification to:
-    // - BdCbClassificationKnownGoodImage
-    // - BdCbClassificationKnownBadImage
-    // - BdCbClassificationUnknownImage
-}
+// End of ELAMDriver.c

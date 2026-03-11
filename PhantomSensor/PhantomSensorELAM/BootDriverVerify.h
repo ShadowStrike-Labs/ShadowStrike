@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
+#include <ntifs.h>
 
 #define BDV_POOL_TAG 'VDBE'
 
@@ -37,7 +37,7 @@ typedef enum _BDV_CLASSIFICATION {
     BdvClass_KnownBad,
     BdvClass_Unknown_Good,              // Unknown but passes heuristics
     BdvClass_Unknown_Bad,               // Unknown but fails heuristics
-} BDV_CLASSIFICATION;
+} BDV_CLASSIFICATION, *PBDV_CLASSIFICATION;
 
 typedef struct _BDV_DRIVER_INFO {
     UNICODE_STRING DriverPath;

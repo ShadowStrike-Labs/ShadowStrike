@@ -44,8 +44,7 @@
 
 #pragma once
 
-#include <ntddk.h>
-#include <wdm.h>
+#include <ntifs.h>
 
 // ============================================================================
 // ELAM CONFIGURATION
@@ -213,10 +212,9 @@ typedef struct _ELAM_BOOT_DRIVER_INFO {
  * @brief ELAM driver global state.
  */
 typedef struct _ELAM_DRIVER_GLOBALS {
-    // Initialization state
-    BOOLEAN Initialized;
-    BOOLEAN CallbackRegistered;
-    UINT16 Reserved1;
+    // Initialization state (checked from multiple contexts)
+    volatile LONG Initialized;
+    volatile LONG CallbackRegistered;
     
     // Configuration
     ELAM_BOOT_POLICY BootPolicy;
@@ -229,12 +227,12 @@ typedef struct _ELAM_DRIVER_GLOBALS {
     // Callback handle
     PVOID CallbackHandle;
     
-    // Statistics
-    ULONG DriversClassified;
-    ULONG DriversGood;
-    ULONG DriversBad;
-    ULONG DriversUnknown;
-    ULONG DriversBlocked;
+    // Statistics (atomically updated via InterlockedIncrement)
+    volatile LONG DriversClassified;
+    volatile LONG DriversGood;
+    volatile LONG DriversBad;
+    volatile LONG DriversUnknown;
+    volatile LONG DriversBlocked;
     
     // Logging
     BOOLEAN VerboseLogging;
@@ -382,26 +380,11 @@ ElamGetSignatureStats(
  */
 NTSTATUS
 ElamGetStatistics(
-    _Out_ PULONG DriversClassified,
-    _Out_ PULONG DriversGood,
-    _Out_ PULONG DriversBad,
-    _Out_ PULONG DriversUnknown,
-    _Out_ PULONG DriversBlocked
-    );
-
-// ============================================================================
-// BOOT DRIVER CALLBACK (Internal)
-// ============================================================================
-
-/**
- * @brief Boot driver callback function.
- * Called by the system for each boot-start driver.
- */
-VOID
-ElamBootDriverCallback(
-    _In_ PVOID CallbackContext,
-    _In_ BDCB_CALLBACK_TYPE Classification,
-    _Inout_ PBDCB_IMAGE_INFORMATION ImageInformation
+    _Out_ PLONG DriversClassified,
+    _Out_ PLONG DriversGood,
+    _Out_ PLONG DriversBad,
+    _Out_ PLONG DriversUnknown,
+    _Out_ PLONG DriversBlocked
     );
 
 // ============================================================================
@@ -433,5 +416,3 @@ ElamCompareHashes(
     _In_reads_(32) const UINT8* Hash1,
     _In_reads_(32) const UINT8* Hash2
     );
-
-#endif // SHADOWSTRIKE_ELAM_DRIVER_H

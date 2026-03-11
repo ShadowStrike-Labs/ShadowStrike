@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
+#include <ntifs.h>
 #include "BootDriverVerify.h"
 
 #define BTD_POOL_TAG 'DTBE'
