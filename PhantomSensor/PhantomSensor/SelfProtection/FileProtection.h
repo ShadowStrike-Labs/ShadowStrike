@@ -57,7 +57,12 @@ extern "C" {
 #endif
 
 #include <ntifs.h>
+
+#pragma warning(push)
+#pragma warning(disable:4324) // structure padding due to alignment specifier
 #include <fltKernel.h>
+#pragma warning(pop)
+
 #include <ntstrsafe.h>
 
 //=============================================================================
