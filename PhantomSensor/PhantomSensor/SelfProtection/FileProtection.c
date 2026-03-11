@@ -59,6 +59,11 @@
 #include "../Utilities/StringUtils.h"
 #include "../Tracing/Trace.h"
 
+#pragma warning(push)
+#pragma warning(disable:4324)
+#include "../Core/Globals.h"
+#pragma warning(pop)
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, FpInitialize)
 #pragma alloc_text(PAGE, FpShutdown)
@@ -1470,7 +1475,7 @@ Routine Description:
         );
 
     Status = FltCreateFileEx(
-        NULL,
+        g_DriverData.FilterHandle,
         Instance,
         &FileHandle,
         &FileObject,

@@ -53,7 +53,11 @@
 --*/
 
 #include "CallbackProtection.h"
+
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include "../Core/Globals.h"
+#pragma warning(pop)
 
 // ============================================================================
 // PAGE SECTION
@@ -214,7 +218,7 @@ struct _CP_PROTECTOR {
     PVOID TamperContext;
 
     //
-    // Periodic verification via timer → DPC → work item
+    // Periodic verification via timer → DPC → system thread
     //
     KTIMER VerifyTimer;
     KDPC VerifyDpc;
@@ -223,11 +227,13 @@ struct _CP_PROTECTOR {
     volatile LONG PeriodicEnabled;
 
     //
-    // Work item for PASSIVE_LEVEL verification
+    // System thread for PASSIVE_LEVEL verification (replaces IoWorkItem
+    // which requires a DeviceObject that minifilters don't create)
     //
-    PIO_WORKITEM VerifyWorkItem;
-    volatile LONG VerifyPending;
-    KEVENT VerifyComplete;
+    HANDLE VerifyThreadHandle;
+    PETHREAD VerifyThread;
+    KEVENT VerifyWakeEvent;
+    volatile LONG TerminateThread;
 
     //
     // Enable automatic code restoration on tamper
@@ -380,9 +386,8 @@ CppVerifyTimerDpc(
     );
 
 static VOID
-CppVerifyWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+CppVerifyWorkerThread(
+    _In_ PVOID Context
     );
 
 static VOID
@@ -735,25 +740,42 @@ CpInitialize(
 
     KeInitializeTimer(&prot->VerifyTimer);
     KeInitializeDpc(&prot->VerifyDpc, CppVerifyTimerDpc, prot);
-    KeInitializeEvent(&prot->VerifyComplete, NotificationEvent, TRUE);
+    KeInitializeEvent(&prot->VerifyWakeEvent, SynchronizationEvent, FALSE);
 
     prot->VerifyIntervalMs = CP_DEFAULT_VERIFY_INTERVAL_MS;
     prot->EnableRestoration = TRUE;
 
     //
-    // Allocate work item. Requires g_DriverData.DriverObject from Globals.
-    // If DriverObject is not available yet, the work item is NULL and
-    // periodic verification will be unavailable (CpEnablePeriodicVerify
-    // will return STATUS_DEVICE_NOT_READY).
+    // Create system thread for PASSIVE_LEVEL verification.
+    // Minifilters don't create device objects, so IoAllocateWorkItem
+    // cannot be used. A dedicated system thread waits on VerifyWakeEvent
+    // and performs SHA-256 integrity checks when signaled by the DPC.
     //
-    if (g_DriverData.DriverObject != NULL) {
-        //
-        // IoAllocateWorkItem needs a device object. Use the unnamed
-        // control device from the driver object if available.
-        //
-        PDEVICE_OBJECT devObj = g_DriverData.DriverObject->DeviceObject;
-        if (devObj != NULL) {
-            prot->VerifyWorkItem = IoAllocateWorkItem(devObj);
+    {
+        HANDLE threadHandle = NULL;
+        NTSTATUS threadStatus;
+
+        threadStatus = PsCreateSystemThread(
+            &threadHandle,
+            THREAD_ALL_ACCESS,
+            NULL,
+            NULL,
+            NULL,
+            CppVerifyWorkerThread,
+            prot
+        );
+
+        if (NT_SUCCESS(threadStatus)) {
+            ObReferenceObjectByHandle(
+                threadHandle,
+                THREAD_ALL_ACCESS,
+                *PsThreadType,
+                KernelMode,
+                (PVOID*)&prot->VerifyThread,
+                NULL
+            );
+            prot->VerifyThreadHandle = threadHandle;
+            ZwClose(threadHandle);
         }
     }
 
@@ -797,29 +819,27 @@ CpShutdown(
     KeFlushQueuedDpcs();
 
     //
-    // Wait for any in-flight work item to complete.
-    // The work item sets VerifyComplete when it finishes.
+    // Signal the verification thread to terminate and wait for it.
     //
-    KeWaitForSingleObject(
-        &Protector->VerifyComplete,
-        Executive,
-        KernelMode,
-        FALSE,
-        NULL
-    );
+    InterlockedExchange(&Protector->TerminateThread, TRUE);
+    KeSetEvent(&Protector->VerifyWakeEvent, IO_NO_INCREMENT, FALSE);
+
+    if (Protector->VerifyThread != NULL) {
+        KeWaitForSingleObject(
+            Protector->VerifyThread,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+        ObDereferenceObject(Protector->VerifyThread);
+        Protector->VerifyThread = NULL;
+    }
 
     //
     // Wait for all in-flight public API calls to drain.
     //
     ExWaitForRundownProtectionRelease(&Protector->RundownRef);
-
-    //
-    // Free work item (safe now — no work item is in flight).
-    //
-    if (Protector->VerifyWorkItem != NULL) {
-        IoFreeWorkItem(Protector->VerifyWorkItem);
-        Protector->VerifyWorkItem = NULL;
-    }
 
     //
     // Free all callback entries. Nobody is iterating now.
@@ -1083,7 +1103,7 @@ CpEnablePeriodicVerify(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Protector->VerifyWorkItem == NULL) {
+    if (Protector->VerifyThread == NULL) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1482,54 +1502,58 @@ CppVerifyTimerDpc(
         return;
     }
 
-    if (prot->VerifyWorkItem == NULL) {
+    //
+    // Signal the system thread to run verification.
+    // The thread handles its own serialization — SynchronizationEvent
+    // auto-resets, so duplicate signals are harmlessly absorbed.
+    //
+    KeSetEvent(&prot->VerifyWakeEvent, IO_NO_INCREMENT, FALSE);
+}
+
+/**
+ * System thread — runs at PASSIVE_LEVEL. Waits on VerifyWakeEvent,
+ * performs SHA-256 verification when signaled by the timer DPC.
+ * Terminates cleanly when TerminateThread is set.
+ */
+static VOID
+CppVerifyWorkerThread(
+    _In_ PVOID Context
+    )
+{
+    PCP_PROTECTOR prot = (PCP_PROTECTOR)Context;
+    NTSTATUS waitStatus;
+    ULONG tamperedCount;
+    LARGE_INTEGER timeout;
+
+    if (prot == NULL) {
+        PsTerminateSystemThread(STATUS_INVALID_PARAMETER);
         return;
     }
 
     //
-    // Gate: only one work item in flight at a time.
+    // Use 10-second timeout to periodically check TerminateThread
+    // even if the event is not signaled (defense-in-depth).
     //
-    if (InterlockedCompareExchange(&prot->VerifyPending, 1, 0) == 0) {
-        //
-        // Clear the completion event so CpShutdown can wait on it.
-        //
-        KeClearEvent(&prot->VerifyComplete);
+    timeout.QuadPart = -100000000LL; // 10 seconds
 
-        IoQueueWorkItem(
-            prot->VerifyWorkItem,
-            CppVerifyWorkItemRoutine,
-            DelayedWorkQueue,
-            prot
+    for (;;) {
+        waitStatus = KeWaitForSingleObject(
+            &prot->VerifyWakeEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &timeout
         );
-    }
-}
 
-/**
- * Work item — runs at PASSIVE_LEVEL. Performs full SHA-256 verification.
- */
-static VOID
-CppVerifyWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
-    )
-{
-    PCP_PROTECTOR prot = (PCP_PROTECTOR)Context;
-    ULONG tamperedCount = 0;
+        if (prot->TerminateThread) {
+            break;
+        }
 
-    UNREFERENCED_PARAMETER(DeviceObject);
-
-    if (prot == NULL || !prot->Initialized) {
-        goto Done;
+        if (waitStatus == STATUS_SUCCESS && prot->Initialized && prot->PeriodicEnabled) {
+            tamperedCount = 0;
+            CpVerifyAll(prot, &tamperedCount);
+        }
     }
 
-    CpVerifyAll(prot, &tamperedCount);
-
-Done:
-    //
-    // Clear pending flag and signal completion event.
-    // Order matters: clear pending BEFORE signaling so that
-    // CpShutdown sees both cleared.
-    //
-    InterlockedExchange(&prot->VerifyPending, 0);
-    KeSetEvent(&prot->VerifyComplete, IO_NO_INCREMENT, FALSE);
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
