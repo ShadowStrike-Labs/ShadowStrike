@@ -43,7 +43,7 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
+#include <ntifs.h>
 
 // ============================================================================
 // Pool Tags & Limits
