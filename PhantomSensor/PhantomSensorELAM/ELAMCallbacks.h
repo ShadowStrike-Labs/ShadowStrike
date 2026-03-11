@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
+#include <ntifs.h>
 
 #define EC_POOL_TAG 'BCLE'
 
@@ -49,6 +49,7 @@ typedef struct _EC_BOOT_DRIVER {
     ULONG ImageFlags;                   // BDCB_IMAGEFLAGS
     
     // Our analysis
+    BOOLEAN IsSigned;
     BOOLEAN IsAllowed;
     CHAR BlockReason[128];
     
@@ -97,6 +98,49 @@ NTSTATUS EcUnregisterCallbacks(_In_ PEC_ELAM_CALLBACKS Callbacks);
 NTSTATUS EcSetUserCallback(_In_ PEC_ELAM_CALLBACKS Callbacks, _In_ EC_DRIVER_CALLBACK Callback, _In_opt_ PVOID Context);
 NTSTATUS EcSetPolicy(_In_ PEC_ELAM_CALLBACKS Callbacks, _In_ BOOLEAN BlockUnknown, _In_ BOOLEAN AllowUnsigned);
 NTSTATUS EcGetBootDrivers(_In_ PEC_ELAM_CALLBACKS Callbacks, _Out_writes_to_(Max, *Count) PEC_BOOT_DRIVER* Drivers, _In_ ULONG Max, _Out_ PULONG Count);
+
+// ============================================================================
+// INTERNAL API - Called by ELAMDriver.c
+// ============================================================================
+
+//
+// BDCB_CLASSIFICATION equivalents for use without ELAM headers
+//
+#define EC_BDCB_UNKNOWN_IMAGE       0
+#define EC_BDCB_KNOWN_GOOD_IMAGE    1
+#define EC_BDCB_KNOWN_BAD_IMAGE     2
+
+NTSTATUS EcProcessBootDriver(
+    _In_ PEC_ELAM_CALLBACKS Callbacks,
+    _In_ PCUNICODE_STRING DriverPath,
+    _In_opt_ PCUNICODE_STRING RegistryPath,
+    _In_ PVOID ImageBase,
+    _In_ SIZE_T ImageSize,
+    _In_ ULONG Classification,
+    _In_ BOOLEAN IsSigned,
+    _In_ EC_BOOT_PHASE Phase,
+    _Out_opt_ PBOOLEAN AllowDriver
+    );
+
+NTSTATUS EcSetBootPhase(
+    _In_ PEC_ELAM_CALLBACKS Callbacks,
+    _In_ EC_BOOT_PHASE Phase
+    );
+
+EC_BOOT_PHASE EcGetBootPhase(
+    _In_ PEC_ELAM_CALLBACKS Callbacks
+    );
+
+BOOLEAN EcIsBootComplete(
+    _In_ PEC_ELAM_CALLBACKS Callbacks
+    );
+
+NTSTATUS EcGetStatistics(
+    _In_ PEC_ELAM_CALLBACKS Callbacks,
+    _Out_ PLONG64 DriversProcessed,
+    _Out_ PLONG64 DriversAllowed,
+    _Out_ PLONG64 DriversBlocked
+    );
 
 #ifdef __cplusplus
 }
