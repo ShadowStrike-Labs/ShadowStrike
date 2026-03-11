@@ -36,7 +36,7 @@
  * - All data accessed from callbacks is protected by EX_SPIN_LOCK
  *   (ExAcquireSpinLockShared/Exclusive), safe at DISPATCH_LEVEL.
  * - Push locks are NOT used anywhere in this module.
- * - Paged functions (Init/Shutdown/Protect/Unprotect/Add*/Remove*) assert
+ * - Paged functions (Init, Shutdown, Protect, Unprotect, Add, Remove) assert
  *   PAGED_CODE() and run at PASSIVE_LEVEL.
  *
  * LIFECYCLE:
@@ -272,6 +272,61 @@ SspPrefixMatch(
     testPrefix.MaximumLength = prefixStr.Length;
 
     return (RtlCompareUnicodeString(&testPrefix, &prefixStr, TRUE) == 0);
+}
+
+/**
+ * @brief PID-reuse-safe process protection check using PEPROCESS pointer.
+ *
+ * Compares the stored PEPROCESS pointer directly against the target object.
+ * Since we hold a reference to the PEPROCESS (via ObReferenceObject), the
+ * pointer is guaranteed to be unique for the lifetime of our protection entry.
+ * A new process reusing the same PID will have a different PEPROCESS address.
+ *
+ * Used by the ObCallback where we already have the target PEPROCESS.
+ */
+static
+BOOLEAN
+SspIsProcessProtectedByObject(
+    _In_ PEPROCESS Process,
+    _Out_opt_ PULONG OutFlags
+    )
+{
+    BOOLEAN isProtected = FALSE;
+    ULONG flags = 0;
+    KIRQL oldIrql;
+
+    if (!ReadNoFence(&g_SelfProtectInitialized) || Process == NULL) {
+        if (OutFlags) *OutFlags = 0;
+        return FALSE;
+    }
+
+    oldIrql = ExAcquireSpinLockShared(&g_ProtectedProcessLock);
+
+    {
+        PLIST_ENTRY listEntry;
+
+        for (listEntry = g_ProtectedProcessList.Flink;
+             listEntry != &g_ProtectedProcessList;
+             listEntry = listEntry->Flink) {
+
+            PSHADOWSTRIKE_PROTECTED_PROCESS_ENTRY processEntry = CONTAINING_RECORD(
+                listEntry,
+                SHADOWSTRIKE_PROTECTED_PROCESS_ENTRY,
+                ListEntry
+            );
+
+            if (processEntry->Process == Process) {
+                isProtected = TRUE;
+                flags = processEntry->Flags;
+                break;
+            }
+        }
+    }
+
+    ExReleaseSpinLockShared(&g_ProtectedProcessLock, oldIrql);
+
+    if (OutFlags) *OutFlags = flags;
+    return isProtected;
 }
 
 // ============================================================================
@@ -993,8 +1048,6 @@ ShadowStrikeObjectPreCallback(
     _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
     )
 {
-    HANDLE targetProcessId = NULL;
-    HANDLE callerProcessId = NULL;
     ULONG targetFlags = 0;
 
     UNREFERENCED_PARAMETER(RegistrationContext);
@@ -1026,27 +1079,32 @@ ShadowStrikeObjectPreCallback(
         return OB_PREOP_SUCCESS;
     }
 
-    callerProcessId = PsGetCurrentProcessId();
-
     //
     // Handle process objects
     //
     if (OperationInformation->ObjectType == *PsProcessType) {
         PEPROCESS targetProcess = (PEPROCESS)OperationInformation->Object;
-        targetProcessId = PsGetProcessId(targetProcess);
+        PEPROCESS callerProcess = PsGetCurrentProcess();
 
-        if (callerProcessId == targetProcessId) {
-            goto Exit;
-        }
-
-        if (!ShadowStrikeIsProcessProtected(targetProcessId, &targetFlags)) {
+        //
+        // Self-access is always allowed
+        //
+        if (callerProcess == targetProcess) {
             goto Exit;
         }
 
         //
-        // Allow trusted (protected) callers
+        // Check if target is protected using PEPROCESS pointer comparison
+        // (PID-reuse safe — stored PEPROCESS is ref-counted and unique)
         //
-        if (ShadowStrikeIsProcessProtected(callerProcessId, NULL)) {
+        if (!SspIsProcessProtectedByObject(targetProcess, &targetFlags)) {
+            goto Exit;
+        }
+
+        //
+        // Allow trusted (protected) callers using PEPROCESS comparison
+        //
+        if (SspIsProcessProtectedByObject(callerProcess, NULL)) {
             goto Exit;
         }
 
@@ -1071,22 +1129,27 @@ ShadowStrikeObjectPreCallback(
     } else if (OperationInformation->ObjectType == *PsThreadType) {
         PETHREAD targetThread = (PETHREAD)OperationInformation->Object;
         PEPROCESS ownerProcess = IoThreadToProcess(targetThread);
+        PEPROCESS callerProcess = PsGetCurrentProcess();
 
         if (ownerProcess == NULL) {
             goto Exit;
         }
 
-        targetProcessId = PsGetProcessId(ownerProcess);
-
-        if (callerProcessId == targetProcessId) {
+        //
+        // Self-access is always allowed
+        //
+        if (callerProcess == ownerProcess) {
             goto Exit;
         }
 
-        if (!ShadowStrikeIsProcessProtected(targetProcessId, &targetFlags)) {
+        //
+        // PEPROCESS-based comparison (PID-reuse safe)
+        //
+        if (!SspIsProcessProtectedByObject(ownerProcess, &targetFlags)) {
             goto Exit;
         }
 
-        if (ShadowStrikeIsProcessProtected(callerProcessId, NULL)) {
+        if (SspIsProcessProtectedByObject(callerProcess, NULL)) {
             goto Exit;
         }
 
