@@ -362,7 +362,7 @@ ElamImageLoadCallback(
     }
 
     // Scan for threats
-    status = BtdScanDriver(g_ThreatDetector, driverInfo, &threat);
+    status = BtdScanDriver(g_ThreatDetector, driverInfo, ImageInfo->ImageBase, ImageInfo->ImageSize, &threat);
 
     // Build ELAM boot driver info structure
     RtlZeroMemory(&bootInfo, sizeof(ELAM_BOOT_DRIVER_INFO));
@@ -442,7 +442,7 @@ ElamImageLoadCallback(
 
     // Release resources allocated by BDV/BTD
     if (threat != NULL) {
-        BtdFreeThreat(threat);
+        BtdFreeThreat(g_ThreatDetector, threat);
     }
     if (driverInfo != NULL) {
         BdvFreeDriverInfo(driverInfo);

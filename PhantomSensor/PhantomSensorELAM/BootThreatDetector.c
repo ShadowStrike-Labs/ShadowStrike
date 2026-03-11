@@ -655,6 +655,9 @@ BtdpLoadEmbeddedPatterns(
 
 /**
  * @brief Initialize the boot threat detector
+ *
+ * Allocates internal state, loads embedded BYOVD database and bootkit/rootkit
+ * patterns. Caller receives an opaque detector handle.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -672,7 +675,6 @@ BtdInitialize(
 
     *Detector = NULL;
 
-    // Allocate internal structure
     internal = (PBTD_DETECTOR_INTERNAL)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         sizeof(BTD_DETECTOR_INTERNAL),
@@ -685,22 +687,18 @@ BtdInitialize(
 
     RtlZeroMemory(internal, sizeof(BTD_DETECTOR_INTERNAL));
 
-    // Store verifier reference
     internal->Public.Verifier = Verifier;
 
-    // Initialize lists
-    InitializeListHead(&internal->Public.ThreatList);
     InitializeListHead(&internal->Public.DetectedList);
     InitializeListHead(&internal->Public.VulnerableList);
     InitializeListHead(&internal->BootkitPatterns);
     InitializeListHead(&internal->RootkitPatterns);
 
-    // Initialize locks
-    ExInitializePushLock(&internal->Public.ThreatLock);
     KeInitializeSpinLock(&internal->Public.DetectedLock);
+    ExInitializePushLock(&internal->Public.VulnerableLock);
+    ExInitializePushLock(&internal->Public.CallbackLock);
     ExInitializePushLock(&internal->PatternLock);
 
-    // Initialize lookaside list
     ExInitializeNPagedLookasideList(
         &internal->ThreatLookaside,
         NULL,
@@ -712,23 +710,27 @@ BtdInitialize(
         );
     internal->LookasideInitialized = TRUE;
 
-    // Load embedded vulnerable driver database
     status = BtdpLoadEmbeddedVulnerableList(&internal->Public);
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
     }
 
-    // Load embedded patterns
     status = BtdpLoadEmbeddedPatterns(internal);
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
     }
 
-    // Record start time
     KeQuerySystemTimePrecise(&internal->Public.Stats.StartTime);
 
-    internal->Public.Initialized = TRUE;
+    InterlockedExchange(&internal->Public.Initialized, 1);
     *Detector = &internal->Public;
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike/BTD] Boot threat detector initialized: %ld BYOVD entries, "
+        "%lu bootkit + %lu rootkit patterns\n",
+        internal->Public.VulnerableCount,
+        internal->BootkitPatternCount,
+        internal->RootkitPatternCount);
 
     return STATUS_SUCCESS;
 
@@ -741,7 +743,10 @@ Cleanup:
 }
 
 /**
- * @brief Shutdown the threat detector
+ * @brief Shutdown the threat detector and release all resources
+ *
+ * Drains all lists, frees driver path buffers in detected threats,
+ * deletes the lookaside list, and frees the detector structure.
  */
 _Use_decl_annotations_
 VOID
@@ -762,18 +767,23 @@ BtdShutdown(
 
     internal = CONTAINING_RECORD(Detector, BTD_DETECTOR_INTERNAL, Public);
 
-    Detector->Initialized = FALSE;
+    InterlockedExchange(&Detector->Initialized, 0);
 
+    //
     // Free vulnerable list
-    ExAcquirePushLockExclusive(&Detector->ThreatLock);
+    //
+    ExAcquirePushLockExclusive(&Detector->VulnerableLock);
     while (!IsListEmpty(&Detector->VulnerableList)) {
         entry = RemoveHeadList(&Detector->VulnerableList);
         vulnEntry = CONTAINING_RECORD(entry, BTD_VULNERABLE_ENTRY, ListEntry);
         ExFreePoolWithTag(vulnEntry, BTD_POOL_TAG);
     }
-    ExReleasePushLockExclusive(&Detector->ThreatLock);
+    InterlockedExchange(&Detector->VulnerableCount, 0);
+    ExReleasePushLockExclusive(&Detector->VulnerableLock);
 
+    //
     // Free pattern lists
+    //
     ExAcquirePushLockExclusive(&internal->PatternLock);
     while (!IsListEmpty(&internal->BootkitPatterns)) {
         entry = RemoveHeadList(&internal->BootkitPatterns);
@@ -787,27 +797,32 @@ BtdShutdown(
     }
     ExReleasePushLockExclusive(&internal->PatternLock);
 
-    // Free detected threats
+    //
+    // Free detected threats (including deep-copied driver paths)
+    //
     KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
     while (!IsListEmpty(&Detector->DetectedList)) {
         entry = RemoveHeadList(&Detector->DetectedList);
         threat = CONTAINING_RECORD(entry, BTD_THREAT, ListEntry);
+        BtdpFreeDriverPath(&threat->DriverPath);
         ExFreeToNPagedLookasideList(&internal->ThreatLookaside, threat);
     }
+    InterlockedExchange(&Detector->DetectedCount, 0);
     KeReleaseSpinLock(&Detector->DetectedLock, oldIrql);
 
-    // Delete lookaside list
     if (internal->LookasideInitialized) {
         ExDeleteNPagedLookasideList(&internal->ThreatLookaside);
         internal->LookasideInitialized = FALSE;
     }
 
-    // Free the structure
     ExFreePoolWithTag(internal, BTD_POOL_TAG);
 }
 
 /**
- * @brief Register threat notification callback
+ * @brief Register threat notification callback with synchronization
+ *
+ * Atomically updates both callback pointer and context under CallbackLock
+ * to prevent torn reads from concurrent scan threads.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -817,24 +832,39 @@ BtdRegisterCallback(
     PVOID Context
     )
 {
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 1, 1)) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    ExAcquirePushLockExclusive(&Detector->CallbackLock);
     Detector->ThreatCallback = Callback;
     Detector->CallbackContext = Context;
+    ExReleasePushLockExclusive(&Detector->CallbackLock);
 
     return STATUS_SUCCESS;
 }
 
 /**
- * @brief Scan a driver for threats
+ * @brief Scan a driver for threats using BYOVD hash lookup, pattern matching, and heuristics
+ *
+ * Performs three-phase detection:
+ *   1. BYOVD hash lookup against known vulnerable driver database
+ *   2. Bootkit/rootkit byte pattern scanning against mapped image (if available)
+ *   3. Heuristic classification for unknown-bad drivers
+ *
+ * @param Detector    Initialized detector handle
+ * @param DriverInfo  Driver metadata from BdvVerifyDriver
+ * @param ImageBase   Mapped image base in system space (NULL if unavailable)
+ * @param ImageSize   Size of the mapped image in bytes
+ * @param Threat      Receives allocated threat on detection, NULL if clean
  */
 _Use_decl_annotations_
 NTSTATUS
 BtdScanDriver(
     PBTD_DETECTOR Detector,
     PBDV_DRIVER_INFO DriverInfo,
+    PVOID ImageBase,
+    SIZE_T ImageSize,
     PBTD_THREAT* Threat
     )
 {
@@ -842,12 +872,15 @@ BtdScanDriver(
     PBTD_DETECTOR_INTERNAL internal;
     PBTD_THREAT threat = NULL;
     BOOLEAN isVulnerable = FALSE;
-    CHAR cve[32] = {0};
+    CHAR cveBuffer[32] = {0};
     PLIST_ENTRY entry;
     PBTD_PATTERN_ENTRY patternEntry;
     KIRQL oldIrql;
+    ULONG matchOffset;
+    LONG currentDetected;
 
-    if (Detector == NULL || !Detector->Initialized ||
+    if (Detector == NULL ||
+        !InterlockedCompareExchange(&Detector->Initialized, 1, 1) ||
         DriverInfo == NULL || Threat == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -855,15 +888,28 @@ BtdScanDriver(
     internal = CONTAINING_RECORD(Detector, BTD_DETECTOR_INTERNAL, Public);
     *Threat = NULL;
 
-    // Update statistics
     InterlockedIncrement64(&Detector->Stats.ScansPerformed);
 
-    // Check BYOVD database first (fast hash lookup)
-    status = BtdIsVulnerable(Detector, DriverInfo->ImageHash, BTD_HASH_SIZE,
-                            &isVulnerable, &cve[0]);
+    //
+    // Phase 1: BYOVD hash lookup (fast path)
+    //
+    status = BtdIsVulnerable(
+        Detector,
+        DriverInfo->ImageHash,
+        BTD_HASH_SIZE,
+        &isVulnerable,
+        cveBuffer,
+        sizeof(cveBuffer)
+        );
 
     if (NT_SUCCESS(status) && isVulnerable) {
-        // Allocate threat
+
+        currentDetected = InterlockedCompareExchange(&Detector->DetectedCount, 0, 0);
+        if (currentDetected >= BTD_MAX_DETECTED_THREATS) {
+            InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
+            return STATUS_QUOTA_EXCEEDED;
+        }
+
         threat = BtdpAllocateThreat(internal);
         if (threat == NULL) {
             return STATUS_INSUFFICIENT_RESOURCES;
@@ -875,69 +921,173 @@ BtdScanDriver(
         RtlStringCbCopyA(threat->ThreatName, sizeof(threat->ThreatName),
                         "BYOVD Vulnerable Driver");
         RtlStringCbPrintfA(threat->Description, sizeof(threat->Description),
-                          "Known vulnerable driver detected: %s (CVE: %s)",
-                          DriverInfo->ClassificationReason, cve);
+                          "Known vulnerable driver detected (CVE: %s)",
+                          cveBuffer);
 
-        threat->SeverityScore = 85;
+        threat->SeverityScore = BTD_SEVERITY_CRITICAL_THRESHOLD;
         threat->IsCritical = TRUE;
         threat->WasBlocked = FALSE;
 
-        if (DriverInfo->DriverPath.Buffer != NULL) {
-            threat->DriverPath.Buffer = DriverInfo->DriverPath.Buffer;
-            threat->DriverPath.Length = DriverInfo->DriverPath.Length;
-            threat->DriverPath.MaximumLength = DriverInfo->DriverPath.MaximumLength;
-        }
-
+        BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath);
         KeQuerySystemTimePrecise(&threat->DetectionTime);
 
-        // Add to detected list
         KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
         InsertTailList(&Detector->DetectedList, &threat->ListEntry);
-        Detector->DetectedCount++;
+        InterlockedIncrement(&Detector->DetectedCount);
         KeReleaseSpinLock(&Detector->DetectedLock, oldIrql);
 
         InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
 
-        // Invoke callback if registered
-        if (Detector->ThreatCallback != NULL) {
-            Detector->ThreatCallback(threat, Detector->CallbackContext);
-        }
+        BtdpInvokeCallback(Detector, threat);
 
         *Threat = threat;
         return STATUS_SUCCESS;
     }
 
-    // Scan for bootkit patterns
-    ExAcquirePushLockShared(&internal->PatternLock);
+    //
+    // Phase 2: Byte pattern scanning against the mapped driver image
+    //
+    if (ImageBase != NULL && ImageSize > 0) {
 
-    for (entry = internal->BootkitPatterns.Flink;
-         entry != &internal->BootkitPatterns;
-         entry = entry->Flink) {
+        ExAcquirePushLockShared(&internal->PatternLock);
 
-        patternEntry = CONTAINING_RECORD(entry, BTD_PATTERN_ENTRY, ListEntry);
+        __try {
+            //
+            // Scan for bootkit patterns
+            //
+            for (entry = internal->BootkitPatterns.Flink;
+                 entry != &internal->BootkitPatterns;
+                 entry = entry->Flink) {
 
-        // Note: In a real implementation, we would scan the actual driver image bytes
-        // For this implementation, we check against the hash as a proxy
-        // Full pattern scanning would require access to the image memory
+                patternEntry = CONTAINING_RECORD(entry, BTD_PATTERN_ENTRY, ListEntry);
 
-        // Pattern matching is a placeholder for actual byte scanning
-        // which would require MapViewOfSection or similar to access image bytes
+                if (BtdpMatchPattern(
+                        (const UCHAR*)ImageBase,
+                        ImageSize,
+                        patternEntry->Pattern,
+                        patternEntry->PatternLength,
+                        patternEntry->Offset,
+                        &matchOffset)) {
+
+                    ExReleasePushLockShared(&internal->PatternLock);
+
+                    currentDetected = InterlockedCompareExchange(&Detector->DetectedCount, 0, 0);
+                    if (currentDetected >= BTD_MAX_DETECTED_THREATS) {
+                        InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
+                        return STATUS_QUOTA_EXCEEDED;
+                    }
+
+                    threat = BtdpAllocateThreat(internal);
+                    if (threat == NULL) {
+                        return STATUS_INSUFFICIENT_RESOURCES;
+                    }
+
+                    threat->Type = patternEntry->ThreatType;
+                    RtlCopyMemory(threat->Hash, DriverInfo->ImageHash, BTD_HASH_SIZE);
+                    RtlStringCbCopyA(threat->ThreatName, sizeof(threat->ThreatName),
+                                    patternEntry->ThreatName);
+                    RtlStringCbPrintfA(threat->Description, sizeof(threat->Description),
+                                      "Bootkit pattern '%s' matched at offset 0x%X in driver image",
+                                      patternEntry->ThreatName, matchOffset);
+
+                    threat->SeverityScore = patternEntry->SeverityScore;
+                    threat->IsCritical = (patternEntry->SeverityScore >= BTD_SEVERITY_CRITICAL_THRESHOLD);
+                    threat->WasBlocked = FALSE;
+
+                    BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath);
+                    KeQuerySystemTimePrecise(&threat->DetectionTime);
+
+                    KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
+                    InsertTailList(&Detector->DetectedList, &threat->ListEntry);
+                    InterlockedIncrement(&Detector->DetectedCount);
+                    KeReleaseSpinLock(&Detector->DetectedLock, oldIrql);
+
+                    InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
+                    BtdpInvokeCallback(Detector, threat);
+
+                    *Threat = threat;
+                    return STATUS_SUCCESS;
+                }
+            }
+
+            //
+            // Scan for rootkit patterns
+            //
+            for (entry = internal->RootkitPatterns.Flink;
+                 entry != &internal->RootkitPatterns;
+                 entry = entry->Flink) {
+
+                patternEntry = CONTAINING_RECORD(entry, BTD_PATTERN_ENTRY, ListEntry);
+
+                if (BtdpMatchPattern(
+                        (const UCHAR*)ImageBase,
+                        ImageSize,
+                        patternEntry->Pattern,
+                        patternEntry->PatternLength,
+                        patternEntry->Offset,
+                        &matchOffset)) {
+
+                    ExReleasePushLockShared(&internal->PatternLock);
+
+                    currentDetected = InterlockedCompareExchange(&Detector->DetectedCount, 0, 0);
+                    if (currentDetected >= BTD_MAX_DETECTED_THREATS) {
+                        InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
+                        return STATUS_QUOTA_EXCEEDED;
+                    }
+
+                    threat = BtdpAllocateThreat(internal);
+                    if (threat == NULL) {
+                        return STATUS_INSUFFICIENT_RESOURCES;
+                    }
+
+                    threat->Type = patternEntry->ThreatType;
+                    RtlCopyMemory(threat->Hash, DriverInfo->ImageHash, BTD_HASH_SIZE);
+                    RtlStringCbCopyA(threat->ThreatName, sizeof(threat->ThreatName),
+                                    patternEntry->ThreatName);
+                    RtlStringCbPrintfA(threat->Description, sizeof(threat->Description),
+                                      "Rootkit pattern '%s' matched at offset 0x%X in driver image",
+                                      patternEntry->ThreatName, matchOffset);
+
+                    threat->SeverityScore = patternEntry->SeverityScore;
+                    threat->IsCritical = (patternEntry->SeverityScore >= BTD_SEVERITY_CRITICAL_THRESHOLD);
+                    threat->WasBlocked = FALSE;
+
+                    BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath);
+                    KeQuerySystemTimePrecise(&threat->DetectionTime);
+
+                    KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
+                    InsertTailList(&Detector->DetectedList, &threat->ListEntry);
+                    InterlockedIncrement(&Detector->DetectedCount);
+                    KeReleaseSpinLock(&Detector->DetectedLock, oldIrql);
+
+                    InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
+                    BtdpInvokeCallback(Detector, threat);
+
+                    *Threat = threat;
+                    return STATUS_SUCCESS;
+                }
+            }
+
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike/BTD] Exception 0x%08X during image pattern scan at base %p (size 0x%IX)\n",
+                GetExceptionCode(), ImageBase, ImageSize);
+        }
+
+        ExReleasePushLockShared(&internal->PatternLock);
     }
 
-    // Scan for rootkit patterns
-    for (entry = internal->RootkitPatterns.Flink;
-         entry != &internal->RootkitPatterns;
-         entry = entry->Flink) {
-
-        patternEntry = CONTAINING_RECORD(entry, BTD_PATTERN_ENTRY, ListEntry);
-
-        // Same note as above for pattern matching
-    }
-
-    ExReleasePushLockShared(&internal->PatternLock);
-
-    // Heuristic analysis for unknown drivers
+    //
+    // Phase 3: Heuristic analysis for unknown-bad classified drivers
+    //
     if (DriverInfo->Classification == BdvClass_Unknown_Bad) {
+
+        currentDetected = InterlockedCompareExchange(&Detector->DetectedCount, 0, 0);
+        if (currentDetected >= BTD_MAX_DETECTED_THREATS) {
+            InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
+            return STATUS_QUOTA_EXCEEDED;
+        }
+
         threat = BtdpAllocateThreat(internal);
         if (threat != NULL) {
             threat->Type = BtdThreat_UnauthorizedDriver;
@@ -953,26 +1103,16 @@ BtdScanDriver(
             threat->IsCritical = FALSE;
             threat->WasBlocked = FALSE;
 
-            if (DriverInfo->DriverPath.Buffer != NULL) {
-                threat->DriverPath.Buffer = DriverInfo->DriverPath.Buffer;
-                threat->DriverPath.Length = DriverInfo->DriverPath.Length;
-                threat->DriverPath.MaximumLength = DriverInfo->DriverPath.MaximumLength;
-            }
-
+            BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath);
             KeQuerySystemTimePrecise(&threat->DetectionTime);
 
-            // Add to detected list
             KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
             InsertTailList(&Detector->DetectedList, &threat->ListEntry);
-            Detector->DetectedCount++;
+            InterlockedIncrement(&Detector->DetectedCount);
             KeReleaseSpinLock(&Detector->DetectedLock, oldIrql);
 
             InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
-
-            // Invoke callback if registered
-            if (Detector->ThreatCallback != NULL) {
-                Detector->ThreatCallback(threat, Detector->CallbackContext);
-            }
+            BtdpInvokeCallback(Detector, threat);
 
             *Threat = threat;
         }
@@ -982,7 +1122,13 @@ BtdScanDriver(
 }
 
 /**
- * @brief Load additional vulnerable driver list
+ * @brief Load additional vulnerable driver list from binary format
+ *
+ * Binary format:
+ *   Header (16 bytes): Magic('BVDL') + Version(1) + EntryCount + Reserved
+ *   Entries[N]: Hash(32) + DriverName(64) + CVE(32) + Vendor(64) + Severity(4) = 196 bytes each
+ *
+ * Validates all fields, enforces cap, and merges into existing VulnerableList.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -992,21 +1138,139 @@ BtdLoadVulnerableList(
     SIZE_T DataSize
     )
 {
-    // This would parse a binary format containing additional vulnerable driver hashes
-    // For now, return success as embedded list is already loaded
+    PBTD_VULN_LIST_HEADER header;
+    PBTD_VULN_LIST_RECORD records;
+    PBTD_VULNERABLE_ENTRY entry;
+    ULONG i;
+    SIZE_T expectedSize;
+    LONG currentCount;
 
-    UNREFERENCED_PARAMETER(Data);
-    UNREFERENCED_PARAMETER(DataSize);
-
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 1, 1)) {
         return STATUS_INVALID_PARAMETER;
     }
+
+    if (Data == NULL || DataSize < sizeof(BTD_VULN_LIST_HEADER)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    header = (PBTD_VULN_LIST_HEADER)Data;
+
+    //
+    // Validate header
+    //
+    if (header->Magic != BTD_VULN_LIST_MAGIC) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike/BTD] BtdLoadVulnerableList: invalid magic 0x%08X (expected 0x%08X)\n",
+            header->Magic, BTD_VULN_LIST_MAGIC);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (header->Version != BTD_VULN_LIST_VERSION) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike/BTD] BtdLoadVulnerableList: unsupported version %u\n",
+            header->Version);
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    if (header->EntryCount == 0) {
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Integer overflow check: EntryCount * sizeof(record) + header
+    //
+    if (header->EntryCount > BTD_MAX_VULNERABLE_DRIVERS) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike/BTD] BtdLoadVulnerableList: entry count %u exceeds max %u\n",
+            header->EntryCount, BTD_MAX_VULNERABLE_DRIVERS);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    expectedSize = sizeof(BTD_VULN_LIST_HEADER) +
+                   (SIZE_T)header->EntryCount * sizeof(BTD_VULN_LIST_RECORD);
+
+    if (DataSize < expectedSize) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike/BTD] BtdLoadVulnerableList: data size %IX < expected %IX\n",
+            DataSize, expectedSize);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    records = (PBTD_VULN_LIST_RECORD)((PUCHAR)Data + sizeof(BTD_VULN_LIST_HEADER));
+
+    for (i = 0; i < header->EntryCount; i++) {
+
+        //
+        // Enforce global cap
+        //
+        currentCount = InterlockedCompareExchange(&Detector->VulnerableCount, 0, 0);
+        if (currentCount >= BTD_MAX_VULNERABLE_DRIVERS) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/BTD] Vulnerable list cap reached (%u), loaded %u of %u new entries\n",
+                BTD_MAX_VULNERABLE_DRIVERS, i, header->EntryCount);
+            break;
+        }
+
+        //
+        // Validate string fields are null-terminated within their bounds
+        //
+        if (records[i].DriverName[sizeof(records[i].DriverName) - 1] != '\0' ||
+            records[i].CVE[sizeof(records[i].CVE) - 1] != '\0' ||
+            records[i].Vendor[sizeof(records[i].Vendor) - 1] != '\0') {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/BTD] Skipping entry #%u: unterminated string field\n", i);
+            continue;
+        }
+
+        if (records[i].SeverityScore > 100) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/BTD] Clamping entry #%u severity from %u to 100\n",
+                i, records[i].SeverityScore);
+        }
+
+        entry = (PBTD_VULNERABLE_ENTRY)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
+            sizeof(BTD_VULNERABLE_ENTRY),
+            BTD_POOL_TAG
+            );
+
+        if (entry == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        RtlZeroMemory(entry, sizeof(BTD_VULNERABLE_ENTRY));
+
+        RtlCopyMemory(entry->Hash, records[i].Hash, BTD_HASH_SIZE);
+        RtlStringCbCopyA(entry->DriverName, sizeof(entry->DriverName), records[i].DriverName);
+        RtlStringCbCopyA(entry->CVE, sizeof(entry->CVE), records[i].CVE);
+        RtlStringCbCopyA(entry->Vendor, sizeof(entry->Vendor), records[i].Vendor);
+        entry->SeverityScore = min(records[i].SeverityScore, 100);
+
+        RtlStringCbPrintfA(entry->Description, sizeof(entry->Description),
+                          "Vulnerable driver: %s (%s)", entry->DriverName, entry->CVE);
+
+        ExAcquirePushLockExclusive(&Detector->VulnerableLock);
+        InsertTailList(&Detector->VulnerableList, &entry->ListEntry);
+        InterlockedIncrement(&Detector->VulnerableCount);
+        ExReleasePushLockExclusive(&Detector->VulnerableLock);
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike/BTD] Loaded %u additional vulnerable driver entries (total: %ld)\n",
+        i, Detector->VulnerableCount);
 
     return STATUS_SUCCESS;
 }
 
 /**
  * @brief Check if driver hash is in vulnerable list
+ *
+ * @param Detector        Initialized detector handle
+ * @param Hash            SHA-256 hash of the driver image
+ * @param HashLength      Must be BTD_HASH_SIZE (32)
+ * @param IsVulnerable    Receives TRUE if hash matches a known vulnerable driver
+ * @param CVEBuffer       Optional buffer to receive CVE identifier string
+ * @param CVEBufferSize   Size of CVEBuffer in bytes (must be >= 32 if provided)
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -1015,25 +1279,26 @@ BtdIsVulnerable(
     PUCHAR Hash,
     SIZE_T HashLength,
     PBOOLEAN IsVulnerable,
-    PCHAR* CVE
+    PCHAR CVEBuffer,
+    SIZE_T CVEBufferSize
     )
 {
     PLIST_ENTRY entry;
     PBTD_VULNERABLE_ENTRY vulnEntry;
-    BOOLEAN found = FALSE;
 
-    if (Detector == NULL || !Detector->Initialized ||
+    if (Detector == NULL ||
+        !InterlockedCompareExchange(&Detector->Initialized, 1, 1) ||
         Hash == NULL || HashLength != BTD_HASH_SIZE ||
         IsVulnerable == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *IsVulnerable = FALSE;
-    if (CVE != NULL) {
-        *CVE = NULL;
+    if (CVEBuffer != NULL && CVEBufferSize > 0) {
+        CVEBuffer[0] = '\0';
     }
 
-    ExAcquirePushLockShared(&Detector->ThreatLock);
+    ExAcquirePushLockShared(&Detector->VulnerableLock);
 
     for (entry = Detector->VulnerableList.Flink;
          entry != &Detector->VulnerableList;
@@ -1042,25 +1307,26 @@ BtdIsVulnerable(
         vulnEntry = CONTAINING_RECORD(entry, BTD_VULNERABLE_ENTRY, ListEntry);
 
         if (ShadowStrikeCompareSha256(vulnEntry->Hash, Hash)) {
-            found = TRUE;
             *IsVulnerable = TRUE;
 
-            // Return CVE if requested (pointer to static string in entry)
-            if (CVE != NULL) {
-                // Copy CVE to provided buffer
-                RtlStringCbCopyA((PCHAR)CVE, 32, vulnEntry->CVE);
+            if (CVEBuffer != NULL && CVEBufferSize > 0) {
+                RtlStringCbCopyA(CVEBuffer, CVEBufferSize, vulnEntry->CVE);
             }
             break;
         }
     }
 
-    ExReleasePushLockShared(&Detector->ThreatLock);
+    ExReleasePushLockShared(&Detector->VulnerableLock);
 
     return STATUS_SUCCESS;
 }
 
 /**
- * @brief Get list of detected threats
+ * @brief Get list of detected threats (returns pointers, NOT copies)
+ *
+ * The returned threat pointers remain owned by the detector.
+ * Caller must NOT free them individually — use BtdFreeThreat to remove
+ * a specific threat, or let BtdShutdown clean up all.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -1076,8 +1342,9 @@ BtdGetThreats(
     ULONG index = 0;
     KIRQL oldIrql;
 
-    if (Detector == NULL || !Detector->Initialized ||
-        Threats == NULL || Count == NULL) {
+    if (Detector == NULL ||
+        !InterlockedCompareExchange(&Detector->Initialized, 1, 1) ||
+        Threats == NULL || Count == NULL || Max == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1102,16 +1369,54 @@ BtdGetThreats(
 }
 
 /**
- * @brief Free a threat structure
+ * @brief Free a threat structure — removes from DetectedList and releases to lookaside
+ *
+ * Safely unlinks the threat from the detector's DetectedList under spinlock,
+ * frees the deep-copied driver path, and returns the structure to the lookaside.
  */
 _Use_decl_annotations_
 VOID
 BtdFreeThreat(
+    PBTD_DETECTOR Detector,
     PBTD_THREAT Threat
     )
 {
-    // Threats are managed internally via lookaside lists
-    // This is provided for external callers but does nothing
-    // Actual cleanup happens in BtdShutdown
-    UNREFERENCED_PARAMETER(Threat);
+    PBTD_DETECTOR_INTERNAL internal;
+    KIRQL oldIrql;
+    BOOLEAN found = FALSE;
+    PLIST_ENTRY entry;
+
+    if (Detector == NULL || Threat == NULL) {
+        return;
+    }
+
+    internal = CONTAINING_RECORD(Detector, BTD_DETECTOR_INTERNAL, Public);
+
+    //
+    // Remove from DetectedList if present
+    //
+    KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
+
+    for (entry = Detector->DetectedList.Flink;
+         entry != &Detector->DetectedList;
+         entry = entry->Flink) {
+
+        if (entry == &Threat->ListEntry) {
+            RemoveEntryList(&Threat->ListEntry);
+            InterlockedDecrement(&Detector->DetectedCount);
+            found = TRUE;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&Detector->DetectedLock, oldIrql);
+
+    if (!found) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/BTD] BtdFreeThreat: threat %p not found in DetectedList\n",
+            Threat);
+    }
+
+    BtdpFreeDriverPath(&Threat->DriverPath);
+    ExFreeToNPagedLookasideList(&internal->ThreatLookaside, Threat);
 }
