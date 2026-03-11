@@ -175,11 +175,15 @@ EcpCopyUnicodeString(
 {
     ULONG copyLength;
 
-    if (Source == NULL || Source->Buffer == NULL || Source->Length == 0) {
-        Dest->Buffer = DestBuffer;
+    Dest->Buffer = DestBuffer;
+    Dest->MaximumLength = (USHORT)DestBufferSize;
+
+    if (Source == NULL || Source->Buffer == NULL || Source->Length == 0 ||
+        DestBufferSize < sizeof(WCHAR)) {
         Dest->Length = 0;
-        Dest->MaximumLength = (USHORT)DestBufferSize;
-        DestBuffer[0] = L'\0';
+        if (DestBufferSize >= sizeof(WCHAR)) {
+            DestBuffer[0] = L'\0';
+        }
         return;
     }
 
@@ -188,9 +192,7 @@ EcpCopyUnicodeString(
     RtlCopyMemory(DestBuffer, Source->Buffer, copyLength);
     DestBuffer[copyLength / sizeof(WCHAR)] = L'\0';
 
-    Dest->Buffer = DestBuffer;
     Dest->Length = (USHORT)copyLength;
-    Dest->MaximumLength = (USHORT)DestBufferSize;
 }
 
 /**
@@ -232,22 +234,20 @@ EcpApplyPolicy(
     _In_ PEC_BOOT_DRIVER_INTERNAL Driver
     )
 {
-    // Check classification from BDCB
     switch (Driver->Public.Classification) {
-        case 1:  // BdCbClassificationKnownGoodImage
+        case EC_BDCB_KNOWN_GOOD_IMAGE:
             Driver->Public.IsAllowed = TRUE;
             return TRUE;
 
-        case 2:  // BdCbClassificationKnownBadImage
+        case EC_BDCB_KNOWN_BAD_IMAGE:
             Driver->Public.IsAllowed = FALSE;
             RtlStringCbCopyA(Driver->Public.BlockReason,
                            sizeof(Driver->Public.BlockReason),
                            "Known malicious driver");
             return FALSE;
 
-        case 0:  // BdCbClassificationUnknownImage
+        case EC_BDCB_UNKNOWN_IMAGE:
         default:
-            // Apply policy for unknown drivers
             if (Callbacks->BlockUnknown) {
                 Driver->Public.IsAllowed = FALSE;
                 RtlStringCbCopyA(Driver->Public.BlockReason,
@@ -256,10 +256,16 @@ EcpApplyPolicy(
                 return FALSE;
             }
 
-            // Check if unsigned and policy requires signatures
-            if (!Callbacks->AllowUnsigned) {
-                // Would need signature info to enforce this
-                // For now, allow unknown signed drivers
+            //
+            // Enforce signature requirement: unsigned drivers are blocked
+            // unless the AllowUnsigned policy flag is explicitly set.
+            //
+            if (!Driver->Public.IsSigned && !Callbacks->AllowUnsigned) {
+                Driver->Public.IsAllowed = FALSE;
+                RtlStringCbCopyA(Driver->Public.BlockReason,
+                               sizeof(Driver->Public.BlockReason),
+                               "Unsigned driver blocked by signature policy");
+                return FALSE;
             }
 
             Driver->Public.IsAllowed = TRUE;
@@ -383,6 +389,11 @@ EcShutdown(
 
 /**
  * @brief Register system callbacks for boot driver monitoring
+ *
+ * Marks this subsystem as actively tracking boot drivers.
+ * Actual kernel callback registration (PsSetLoadImageNotifyRoutine,
+ * CmRegisterCallbackEx) is handled by ELAMDriver.c which calls
+ * EcProcessBootDriver for each detected driver load.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -398,22 +409,19 @@ EcRegisterCallbacks(
         return STATUS_ALREADY_REGISTERED;
     }
 
-    // The actual callback registration is done in ELAMDriver.c
-    // This module provides the tracking and policy layer on top
-    //
-    // In a real ELAM implementation, this would call:
-    // IoRegisterBootDriverCallback()
-    //
-    // Since we don't have ELAM certificate, ELAMDriver.c uses:
-    // PsSetLoadImageNotifyRoutine() instead
-
     Callbacks->Registered = TRUE;
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike/EC] Boot driver tracking callbacks registered\n");
 
     return STATUS_SUCCESS;
 }
 
 /**
  * @brief Unregister system callbacks
+ *
+ * Marks this subsystem as no longer tracking boot drivers.
+ * Actual kernel callback unregistration is handled by ELAMDriver.c.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -429,10 +437,11 @@ EcUnregisterCallbacks(
         return STATUS_SUCCESS;
     }
 
-    // Callback unregistration is handled by ELAMDriver.c
-
     Callbacks->CallbackRegistration = NULL;
     Callbacks->Registered = FALSE;
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike/EC] Boot driver tracking callbacks unregistered\n");
 
     return STATUS_SUCCESS;
 }
@@ -533,6 +542,8 @@ EcGetBootDrivers(
  * @brief Process a boot driver load event
  *
  * Called by ELAMDriver's image load callback to track boot drivers.
+ * Thread-safe: user callback is invoked outside the push lock to
+ * prevent deadlock if the callback calls EcGetBootDrivers etc.
  */
 NTSTATUS
 EcProcessBootDriver(
@@ -542,6 +553,7 @@ EcProcessBootDriver(
     _In_ PVOID ImageBase,
     _In_ SIZE_T ImageSize,
     _In_ ULONG Classification,
+    _In_ BOOLEAN IsSigned,
     _In_ EC_BOOT_PHASE Phase,
     _Out_opt_ PBOOLEAN AllowDriver
     )
@@ -549,6 +561,9 @@ EcProcessBootDriver(
     PEC_ELAM_CALLBACKS_INTERNAL internal;
     PEC_BOOT_DRIVER_INTERNAL driver;
     BOOLEAN allow = TRUE;
+    EC_DRIVER_CALLBACK savedCallback = NULL;
+    PVOID savedContext = NULL;
+    EC_BOOT_DRIVER publicCopy;
 
     if (Callbacks == NULL || !Callbacks->Initialized || DriverPath == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -556,13 +571,11 @@ EcProcessBootDriver(
 
     internal = CONTAINING_RECORD(Callbacks, EC_ELAM_CALLBACKS_INTERNAL, Public);
 
-    // Check if we already have this driver
     ExAcquirePushLockExclusive(&Callbacks->DriverLock);
 
     driver = EcpFindDriverByPath(Callbacks, DriverPath);
 
     if (driver == NULL) {
-        // New driver - allocate entry
         if (Callbacks->DriverCount >= EC_MAX_BOOT_DRIVERS) {
             ExReleasePushLockExclusive(&Callbacks->DriverLock);
             return STATUS_QUOTA_EXCEEDED;
@@ -574,7 +587,6 @@ EcProcessBootDriver(
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        // Copy driver path
         EcpCopyUnicodeString(
             &driver->Public.DriverPath,
             driver->DriverPathBuffer,
@@ -582,7 +594,6 @@ EcProcessBootDriver(
             DriverPath
             );
 
-        // Copy registry path if provided
         if (RegistryPath != NULL) {
             EcpCopyUnicodeString(
                 &driver->Public.RegistryPath,
@@ -592,17 +603,16 @@ EcProcessBootDriver(
                 );
         }
 
-        // Store image info
         driver->Public.ImageBase = ImageBase;
         driver->Public.ImageSize = ImageSize;
 
-        // Add to list
         InsertTailList(&Callbacks->DriverList, &driver->Public.ListEntry);
         Callbacks->DriverCount++;
     }
 
-    // Update classification and phase
+    // Update classification, signature status, and phase
     driver->Public.Classification = Classification;
+    driver->Public.IsSigned = IsSigned;
     driver->Public.ImageFlags = 0;
     driver->LastPhase = Phase;
     KeQuerySystemTimePrecise(&driver->LoadTime);
@@ -618,30 +628,48 @@ EcProcessBootDriver(
         InterlockedIncrement64(&Callbacks->Stats.DriversBlocked);
     }
 
-    // Invoke user callback if registered
-    if (Callbacks->UserCallback != NULL) {
+    //
+    // Capture user callback and a snapshot of the driver's public state
+    // BEFORE releasing the lock. This prevents deadlock: the user callback
+    // may call EcGetBootDrivers (which takes shared lock), and push locks
+    // are NOT re-entrant.
+    //
+    savedCallback = Callbacks->UserCallback;
+    savedContext = Callbacks->UserContext;
+    if (savedCallback != NULL) {
+        RtlCopyMemory(&publicCopy, &driver->Public, sizeof(EC_BOOT_DRIVER));
+    }
+
+    ExReleasePushLockExclusive(&Callbacks->DriverLock);
+
+    //
+    // Invoke user callback outside the lock
+    //
+    if (savedCallback != NULL) {
         BOOLEAN userAllow = allow;
 
-        Callbacks->UserCallback(
-            &driver->Public,
+        savedCallback(
+            &publicCopy,
             Phase,
             &userAllow,
-            Callbacks->UserContext
+            savedContext
             );
 
-        // User callback can only further restrict, not allow blocked drivers
+        // User callback can further restrict (block), but not unblock
         if (!userAllow && allow) {
             allow = FALSE;
+
+            ExAcquirePushLockExclusive(&Callbacks->DriverLock);
             driver->Public.IsAllowed = FALSE;
             RtlStringCbCopyA(driver->Public.BlockReason,
                            sizeof(driver->Public.BlockReason),
                            "Blocked by user callback");
+            ExReleasePushLockExclusive(&Callbacks->DriverLock);
+
             InterlockedDecrement64(&Callbacks->Stats.DriversAllowed);
             InterlockedIncrement64(&Callbacks->Stats.DriversBlocked);
         }
     }
-
-    ExReleasePushLockExclusive(&Callbacks->DriverLock);
 
     if (AllowDriver != NULL) {
         *AllowDriver = allow;
