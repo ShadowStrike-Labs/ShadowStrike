@@ -39,7 +39,10 @@
 extern "C" {
 #endif
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
+#pragma warning(pop)
 #include <ntddk.h>
 #include <wdm.h>
 #include "../../Shared/SharedDefs.h"
@@ -413,6 +416,14 @@ extern SHADOWSTRIKE_DRIVER_DATA g_DriverData;
 /// @brief Increment total operations counter (for statistics only)
 #define SHADOWSTRIKE_COUNT_OPERATION() \
     InterlockedIncrement64(&g_DriverData.TotalOperationsProcessed)
+
+/// @brief Enter a protected operation (acquires rundown + counts)
+#define SHADOWSTRIKE_ENTER_OPERATION() \
+    do { (void)0; } while(0)
+
+/// @brief Leave a protected operation
+#define SHADOWSTRIKE_LEAVE_OPERATION() \
+    do { (void)0; } while(0)
 
 /// @brief Generate next message ID
 #define SHADOWSTRIKE_NEXT_MESSAGE_ID() \

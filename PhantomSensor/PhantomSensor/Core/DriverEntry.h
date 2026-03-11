@@ -46,7 +46,10 @@
 extern "C" {
 #endif
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
+#pragma warning(pop)
 #include <ntddk.h>
 #include <wdm.h>
 #include "Globals.h"
@@ -251,7 +254,7 @@ ShadowStrikeUnregisterProcessCallbacks(
  */
 NTSTATUS
 ShadowStrikeRegisterRegistryCallback(
-    VOID
+    _In_ PDRIVER_OBJECT DriverObject
     );
 
 /**

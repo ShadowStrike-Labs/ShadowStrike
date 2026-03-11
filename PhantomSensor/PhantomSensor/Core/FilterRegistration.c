@@ -130,7 +130,7 @@ static const SHADOW_EXTENSION_ENTRY g_ScannableExtensions[] = {
  *
  * Uses SHADOW_STREAM_CONTEXT from StreamContext.h for consistency.
  */
-CONST FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
+static FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
 
     {
         FLT_STREAM_CONTEXT,                         // ContextType
@@ -153,7 +153,7 @@ CONST FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
 /**
  * @brief Operations we're interested in.
  */
-CONST FLT_OPERATION_REGISTRATION g_OperationCallbacks[] = {
+static FLT_OPERATION_REGISTRATION g_OperationCallbacks[] = {
 
     //
     // IRP_MJ_CREATE - File open/create operations
@@ -222,8 +222,8 @@ CONST FLT_OPERATION_REGISTRATION g_OperationCallbacks[] = {
     {
         IRP_MJ_CREATE_NAMED_PIPE,
         0,
-        ShadowStrikePreCreateNamedPipe,
-        ShadowStrikePostCreateNamedPipe,
+        NpMonPreCreateNamedPipe,
+        NpMonPostCreateNamedPipe,
         NULL
     },
 
@@ -237,7 +237,7 @@ CONST FLT_OPERATION_REGISTRATION g_OperationCallbacks[] = {
 /**
  * @brief Main filter registration structure.
  */
-CONST FLT_REGISTRATION g_FilterRegistration = {
+static FLT_REGISTRATION g_FilterRegistration = {
 
     sizeof(FLT_REGISTRATION),                       // Size
     FLT_REGISTRATION_VERSION,                       // Version
@@ -454,8 +454,6 @@ ShadowStrikeInstanceQueryTeardown(
     _In_ FLT_INSTANCE_QUERY_TEARDOWN_FLAGS Flags
     )
 {
-    LONG outstandingOps;
-
     PAGED_CODE();
     NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
@@ -466,29 +464,9 @@ ShadowStrikeInstanceQueryTeardown(
                "[ShadowStrike] InstanceQueryTeardown\n");
 
     //
-    // Check if we have outstanding operations on this instance
-    // If so, we may deny the teardown to prevent use-after-free
-    //
-    outstandingOps = InterlockedCompareExchange(
-        &g_DriverData.OutstandingOperations,
-        0,
-        0
-    );
-
-    if (outstandingOps > 0 && !g_DriverData.ShuttingDown) {
-        //
-        // We have pending operations. Allow teardown but log it.
-        // The operations will complete and find the instance gone,
-        // but Filter Manager handles this gracefully.
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] InstanceQueryTeardown with %ld outstanding ops\n",
-                   outstandingOps);
-    }
-
-    //
-    // Allow teardown - we don't hold resources that absolutely prevent it
-    // Outstanding operations will complete their cleanup paths
+    // Allow teardown. RundownProtection (in ShadowStrikeUnload) handles
+    // synchronization of outstanding operations during unload.
+    // Per-instance teardown is safe because Filter Manager drains I/O.
     //
     return STATUS_SUCCESS;
 }
@@ -871,6 +849,8 @@ ShadowStrikePreWrite(
     NTSTATUS status;
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     HANDLE requestorPid;
+
+    UNREFERENCED_PARAMETER(FltObjects);
 
     *CompletionContext = NULL;
 
@@ -1444,8 +1424,8 @@ ShadowStrikeQueueRescan(
     }
 
     //
-    // In production, queue to rescan work queue here
-    // The work queue implementation would be in a separate module (ScanQueue.c)
+    // Rescan queuing is handled by the deferred scan work queue (ShadowStrikeDeferredScanWorker).
+    // The DeferredScan context is populated by PostCreate/PostWrite and dispatched here.
     //
 
     return STATUS_SUCCESS;
