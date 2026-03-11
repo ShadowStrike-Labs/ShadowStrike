@@ -25,11 +25,11 @@ ShadowStrike NGAV - ENTERPRISE SELF-INTEGRITY MONITORING IMPLEMENTATION
 
 v2.1.0 Changes (Enterprise Hardened):
 ======================================
-- DPC now queues IoWorkItem instead of calling BCrypt directly (was BSOD)
+- PsCreateSystemThread replaces KTIMER+KDPC+IoWorkItem (no DeviceObject needed)
 - All push lock acquisitions wrapped with KeEnterCriticalRegion
 - ImShutdown takes PIM_MONITOR*, NULLs caller pointer, waits for rundown
 - EX_RUNDOWN_REF replaces BOOLEAN Initialized for safe shutdown
-- KeFlushQueuedDpcs() called during shutdown
+- Worker thread join on shutdown (no spin-wait, no KeFlushQueuedDpcs)
 - PE parsing fully bounds-checked (e_lfanew, section count, RVA+size)
 - CRT strlen replaced with RtlStringCbLengthA
 - ImCheckAll frees partial results on failure
@@ -41,7 +41,7 @@ v2.1.0 Changes (Enterprise Hardened):
 - ImFreeCheckResult public API for proper result lifetime
 - New IM_MODIFICATION values for IAT/EAT hooks
 - PAGED_CODE() in all PASSIVE_LEVEL functions
-- Redundant RtlZeroMemory after ExAllocatePool2 removed
+- Dead lookaside list removed (was never used)
 
 @author ShadowStrike Security Team
 @version 2.1.0 (Enterprise Edition - Hardened)
@@ -250,22 +250,15 @@ typedef struct _IM_MONITOR_INTERNAL {
     BCRYPT_ALG_HANDLE           AlgHandle;
     ULONG                       HashObjectSize;
 
-    // DPC timer
-    KTIMER                      CheckTimer;
-    KDPC                        CheckDpc;
-
-    // Work item for deferred PASSIVE_LEVEL work from DPC
-    PIO_WORKITEM                WorkItem;
-    PDEVICE_OBJECT              DeviceObject;
+    // Worker thread (replaces KTIMER+KDPC+IoWorkItem — no DeviceObject needed)
+    PETHREAD                    ThreadObject;
+    KEVENT                      WakeEvent;
+    volatile LONG               TerminateThread;
 
     // Callback list lock
     EX_PUSH_LOCK                CallbackLock;
     LIST_ENTRY                  CallbackList;
     ULONG                       CallbackCount;
-
-    // Lookaside for check results
-    LOOKASIDE_LIST_EX           ResultLookaside;
-    BOOLEAN                     LookasideInitialized;
 
 } IM_MONITOR_INTERNAL, *PIM_MONITOR_INTERNAL;
 
@@ -309,18 +302,9 @@ static VOID ImpNotifyTamper(
     _In_  PIM_CHECK_RESULT Result
 );
 
-_Function_class_(KDEFERRED_ROUTINE)
-static VOID ImpCheckTimerDpc(
-    _In_     PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-);
-
-_Function_class_(IO_WORKITEM_ROUTINE)
-static VOID ImpPeriodicCheckWorkItem(
-    _In_     PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+_Function_class_(KSTART_ROUTINE)
+static VOID ImpWorkerThreadRoutine(
+    _In_ PVOID StartContext
 );
 
 static NTSTATUS ImpVerifySectionIntegrity(
@@ -334,35 +318,6 @@ static NTSTATUS ImpComputeConfigHash(
     _In_  PIM_MONITOR_INTERNAL Monitor,
     _Out_writes_bytes_(IM_HASH_SIZE) PUCHAR HashOut
 );
-
-// ============================================================================
-// LOOKASIDE ALLOCATOR CALLBACKS
-// ============================================================================
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static PVOID NTAPI
-ImpResultAllocate(
-    _In_ POOL_TYPE PoolType,
-    _In_ SIZE_T    NumberOfBytes,
-    _In_ ULONG     Tag
-)
-{
-    UNREFERENCED_PARAMETER(PoolType);
-    return ExAllocatePool2(POOL_FLAG_NON_PAGED, NumberOfBytes, Tag);
-}
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static VOID NTAPI
-ImpResultFree(
-    _In_ __drv_freesMem(Mem) PVOID Buffer,
-    _In_ ULONG Tag
-)
-{
-    UNREFERENCED_PARAMETER(Tag);
-    if (Buffer) {
-        ExFreePoolWithTag(Buffer, IM_POOL_TAG_CHECK);
-    }
-}
 
 // ============================================================================
 // CRYPTO INITIALIZATION & OPERATIONS
@@ -1048,7 +1003,7 @@ ImpCheckComponent(
 
 // ============================================================================
 // ImInitialize — ENTERPRISE-GRADE INITIALIZATION
-// Fixes: #17 (redundant zero), #18 (volatile state), #22 (PAGED_CODE)
+// Replaces IoWorkItem+KTIMER+KDPC with PsCreateSystemThread+KEVENT
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -1056,22 +1011,21 @@ NTSTATUS
 ImInitialize(
     _Out_    PIM_MONITOR *Monitor,
     _In_     PVOID DriverBase,
-    _In_     SIZE_T DriverSize,
-    _In_     PDEVICE_OBJECT DeviceObject
+    _In_     SIZE_T DriverSize
 )
 {
     NTSTATUS Status;
     PIM_MONITOR_INTERNAL Internal = NULL;
+    HANDLE ThreadHandle = NULL;
 
     PAGED_CODE();
 
-    if (Monitor == NULL || DriverBase == NULL || DriverSize == 0 || DeviceObject == NULL) {
+    if (Monitor == NULL || DriverBase == NULL || DriverSize == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Monitor = NULL;
 
-    // FIX #17: ExAllocatePool2 without POOL_FLAG_UNINITIALIZED already zeros memory
     Internal = (PIM_MONITOR_INTERNAL)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         sizeof(IM_MONITOR_INTERNAL),
@@ -1085,8 +1039,7 @@ ImInitialize(
     ExInitializeRundownProtection(&Internal->Public.RundownProtection);
     ExInitializePushLock(&Internal->CallbackLock);
     InitializeListHead(&Internal->CallbackList);
-
-    Internal->DeviceObject = DeviceObject;
+    KeInitializeEvent(&Internal->WakeEvent, SynchronizationEvent, FALSE);
 
     // Initialize crypto (BCrypt)
     Status = ImpInitializeCrypto(Internal);
@@ -1106,47 +1059,46 @@ ImInitialize(
         goto InitFailed;
     }
 
-    // Initialize lookaside list for check results
-    Status = ExInitializeLookasideListEx(
-        &Internal->ResultLookaside,
-        ImpResultAllocate,
-        ImpResultFree,
-        NonPagedPoolNx,
-        0,
-        sizeof(IM_CHECK_RESULT),
-        IM_POOL_TAG_CHECK,
-        0
+    // Create worker thread for periodic integrity checks
+    Status = PsCreateSystemThread(
+        &ThreadHandle,
+        THREAD_ALL_ACCESS,
+        NULL,
+        NULL,
+        NULL,
+        ImpWorkerThreadRoutine,
+        Internal
     );
     if (!NT_SUCCESS(Status)) {
         goto InitFailed;
     }
-    Internal->LookasideInitialized = TRUE;
 
-    // Allocate work item for DPC → PASSIVE_LEVEL deferral
-    Internal->WorkItem = IoAllocateWorkItem(DeviceObject);
-    if (Internal->WorkItem == NULL) {
-        Status = STATUS_INSUFFICIENT_RESOURCES;
+    // Get thread object reference for shutdown join
+    Status = ObReferenceObjectByHandle(
+        ThreadHandle,
+        THREAD_ALL_ACCESS,
+        *PsThreadType,
+        KernelMode,
+        (PVOID *)&Internal->ThreadObject,
+        NULL
+    );
+    ZwClose(ThreadHandle);
+    ThreadHandle = NULL;
+
+    if (!NT_SUCCESS(Status)) {
+        // Thread is created but we can't reference it — signal termination
+        InterlockedExchange(&Internal->TerminateThread, 1);
+        KeSetEvent(&Internal->WakeEvent, IO_NO_INCREMENT, FALSE);
         goto InitFailed;
     }
 
-    // Initialize timer and DPC (but don't start yet)
-    KeInitializeTimer(&Internal->CheckTimer);
-    KeInitializeDpc(&Internal->CheckDpc, ImpCheckTimerDpc, Internal);
-
-    // FIX #18: Use InterlockedExchange for volatile state
+    // Mark active
     InterlockedExchange(&Internal->Public.State, IM_STATE_ACTIVE);
 
     *Monitor = &Internal->Public;
     return STATUS_SUCCESS;
 
 InitFailed:
-    // Cleanup on failure — reverse order of initialization
-    if (Internal->WorkItem != NULL) {
-        IoFreeWorkItem(Internal->WorkItem);
-    }
-    if (Internal->LookasideInitialized) {
-        ExDeleteLookasideListEx(&Internal->ResultLookaside);
-    }
     if (Internal->Sections != NULL) {
         ExFreePoolWithTag(Internal->Sections, IM_POOL_TAG_INTERNAL);
     }
@@ -1157,8 +1109,8 @@ InitFailed:
 }
 
 // ============================================================================
-// ImShutdown — SAFE SHUTDOWN WITH RUNDOWN PROTECTION
-// Fixes: #4 (PIM_MONITOR*), #5 (ordering, flush, rundown), #18 (volatile state)
+// ImShutdown — SAFE SHUTDOWN WITH THREAD JOIN
+// Thread-based: signal terminate, wait for thread, then cleanup.
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -1179,38 +1131,33 @@ ImShutdown(
 
     Internal = CONTAINING_RECORD(*Monitor, IM_MONITOR_INTERNAL, Public);
 
-    // FIX #4: NULL caller's pointer immediately to prevent use-after-free
+    // NULL caller's pointer immediately to prevent use-after-free
     *Monitor = NULL;
 
-    // FIX #5, #18: Signal shutdown state atomically
+    // Signal shutdown state atomically
     LONG PreviousState = InterlockedExchange(&Internal->Public.State, IM_STATE_SHUTTING_DOWN);
     if (PreviousState != IM_STATE_ACTIVE) {
-        // Already shut down or never initialized
         return;
     }
 
-    // FIX #5: Wait for all in-flight operations to complete
+    // Signal worker thread to terminate
+    InterlockedExchange(&Internal->TerminateThread, 1);
+    KeSetEvent(&Internal->WakeEvent, IO_NO_INCREMENT, FALSE);
+
+    // Wait for all in-flight operations (external API callers + thread)
     ExWaitForRundownProtectionRelease(&Internal->Public.RundownProtection);
 
-    // Cancel periodic timer
-    KeCancelTimer(&Internal->CheckTimer);
-
-    // FIX #5: Flush any queued DPCs to ensure our DPC has completed
-    KeFlushQueuedDpcs();
-
-    // FIX #1 (part of shutdown): Drain work item
-    // After KeFlushQueuedDpcs, no new DPCs can queue work items.
-    // Spin-wait if a work item is still pending (should be very brief).
-    while (InterlockedCompareExchange(&Internal->Public.WorkItemPending, 0, 0) != 0) {
-        LARGE_INTEGER SpinWait;
-        SpinWait.QuadPart = -10000; // 1ms
-        KeDelayExecutionThread(KernelMode, FALSE, &SpinWait);
-    }
-
-    // Now safe to free work item — no pending or in-flight work
-    if (Internal->WorkItem != NULL) {
-        IoFreeWorkItem(Internal->WorkItem);
-        Internal->WorkItem = NULL;
+    // Wait for worker thread to exit (should be very fast after rundown)
+    if (Internal->ThreadObject != NULL) {
+        KeWaitForSingleObject(
+            Internal->ThreadObject,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+        ObDereferenceObject(Internal->ThreadObject);
+        Internal->ThreadObject = NULL;
     }
 
     // Free callback entries
@@ -1231,12 +1178,6 @@ ImShutdown(
     if (Internal->Sections != NULL) {
         ExFreePoolWithTag(Internal->Sections, IM_POOL_TAG_INTERNAL);
         Internal->Sections = NULL;
-    }
-
-    // Cleanup lookaside
-    if (Internal->LookasideInitialized) {
-        ExDeleteLookasideListEx(&Internal->ResultLookaside);
-        Internal->LookasideInitialized = FALSE;
     }
 
     // Cleanup crypto
@@ -1304,7 +1245,7 @@ ImRegisterCallback(
 
 // ============================================================================
 // PUBLIC API: Periodic Check Enable/Disable
-// Fixes: #2 (push lock), #19 (proper work item pattern)
+// Thread-based: just set flags and signal the worker thread.
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -1315,7 +1256,6 @@ ImEnablePeriodicCheck(
 )
 {
     PIM_MONITOR_INTERNAL Internal;
-    LARGE_INTEGER DueTime;
 
     PAGED_CODE();
 
@@ -1340,14 +1280,8 @@ ImEnablePeriodicCheck(
     Internal->Public.CheckIntervalMs = IntervalMs;
     InterlockedExchange(&Internal->Public.PeriodicEnabled, 1);
 
-    // Start periodic timer
-    DueTime.QuadPart = -((LONGLONG)IntervalMs * 10000LL); // relative, in 100ns units
-    KeSetTimerEx(
-        &Internal->CheckTimer,
-        DueTime,
-        IntervalMs,    // periodic interval in ms
-        &Internal->CheckDpc
-    );
+    // Wake the worker thread so it starts periodic checks immediately
+    KeSetEvent(&Internal->WakeEvent, IO_NO_INCREMENT, FALSE);
 
     ExReleaseRundownProtection(&Internal->Public.RundownProtection);
     return STATUS_SUCCESS;
@@ -1374,7 +1308,9 @@ ImDisablePeriodicCheck(
     }
 
     InterlockedExchange(&Internal->Public.PeriodicEnabled, 0);
-    KeCancelTimer(&Internal->CheckTimer);
+
+    // Wake the thread so it transitions to idle (infinite wait)
+    KeSetEvent(&Internal->WakeEvent, IO_NO_INCREMENT, FALSE);
 
     ExReleaseRundownProtection(&Internal->Public.RundownProtection);
     return STATUS_SUCCESS;
@@ -1543,123 +1479,106 @@ ImpNotifyTamper(
 }
 
 // ============================================================================
-// DPC TIMER CALLBACK → IoWorkItem
-// FIX #1: DPC no longer calls BCrypt or push locks directly.
-//         It only queues an IoWorkItem for PASSIVE_LEVEL processing.
-// FIX #19: Removed unsafe placeholder comments
+// WORKER THREAD — Replaces KTIMER+KDPC+IoWorkItem
+// Runs at PASSIVE_LEVEL. Waits on WakeEvent with timeout = CheckIntervalMs.
+// When PeriodicEnabled is 0, waits indefinitely until signaled.
 // ============================================================================
 
-_Function_class_(KDEFERRED_ROUTINE)
-_IRQL_requires_(DISPATCH_LEVEL)
-static VOID
-ImpCheckTimerDpc(
-    _In_     PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-)
-{
-    PIM_MONITOR_INTERNAL Internal = (PIM_MONITOR_INTERNAL)DeferredContext;
-
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    if (Internal == NULL) {
-        return;
-    }
-
-    // Check state atomically — must be active
-    if (InterlockedCompareExchange(&Internal->Public.State, IM_STATE_ACTIVE, IM_STATE_ACTIVE) != IM_STATE_ACTIVE) {
-        return;
-    }
-
-    // Check if periodic checking is still enabled
-    if (InterlockedCompareExchange(&Internal->Public.PeriodicEnabled, 1, 1) != 1) {
-        return;
-    }
-
-    // Try to acquire rundown protection for the work item
-    if (!ExAcquireRundownProtection(&Internal->Public.RundownProtection)) {
-        return;
-    }
-
-    // FIX #1: Only queue work item if none is pending
-    // InterlockedCompareExchange: if WorkItemPending == 0, set to 1
-    if (InterlockedCompareExchange(&Internal->Public.WorkItemPending, 1, 0) == 0) {
-        // Successfully claimed the work item slot
-        IoQueueWorkItem(
-            Internal->WorkItem,
-            ImpPeriodicCheckWorkItem,
-            DelayedWorkQueue,
-            Internal
-        );
-    } else {
-        // Work item already pending — release rundown protection
-        ExReleaseRundownProtection(&Internal->Public.RundownProtection);
-    }
-}
-
-// ============================================================================
-// PERIODIC CHECK WORK ITEM — Runs at PASSIVE_LEVEL
-// FIX #1: All BCrypt, push lock, and callback operations happen here
-// ============================================================================
-
-_Function_class_(IO_WORKITEM_ROUTINE)
+_Function_class_(KSTART_ROUTINE)
 _IRQL_requires_(PASSIVE_LEVEL)
 static VOID
-ImpPeriodicCheckWorkItem(
-    _In_     PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+ImpWorkerThreadRoutine(
+    _In_ PVOID StartContext
 )
 {
-    PIM_MONITOR_INTERNAL Internal = (PIM_MONITOR_INTERNAL)Context;
-    IM_CHECK_RESULT Result;
+    PIM_MONITOR_INTERNAL Internal = (PIM_MONITOR_INTERNAL)StartContext;
 
     PAGED_CODE();
-    UNREFERENCED_PARAMETER(DeviceObject);
 
     if (Internal == NULL) {
+        PsTerminateSystemThread(STATUS_INVALID_PARAMETER);
         return;
     }
 
-    // Verify still active
-    if (InterlockedCompareExchange(&Internal->Public.State, IM_STATE_ACTIVE, IM_STATE_ACTIVE) != IM_STATE_ACTIVE) {
-        goto Done;
-    }
+    while (TRUE) {
+        LARGE_INTEGER Timeout;
+        PLARGE_INTEGER pTimeout;
 
-    // Perform integrity checks on critical components
-    IM_COMPONENT CheckOrder[] = {
-        ImComp_CodeSections,
-        ImComp_DriverImage,
-        ImComp_Callbacks,
-        ImComp_Handles,
-        ImComp_Configuration,
-        ImComp_DataSections
-    };
+        // Determine wait behavior based on periodic check state
+        if (ReadNoFence(&Internal->Public.PeriodicEnabled)) {
+            ULONG IntervalMs = Internal->Public.CheckIntervalMs;
+            if (IntervalMs < IM_MIN_CHECK_INTERVAL) {
+                IntervalMs = IM_DEFAULT_CHECK_INTERVAL;
+            }
+            Timeout.QuadPart = -((LONGLONG)IntervalMs * 10000LL);
+            pTimeout = &Timeout;
+        } else {
+            // Periodic disabled — wait indefinitely until signaled
+            pTimeout = NULL;
+        }
 
-    for (ULONG i = 0; i < ARRAYSIZE(CheckOrder); i++) {
-        RtlZeroMemory(&Result, sizeof(Result));
+        KeWaitForSingleObject(
+            &Internal->WakeEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            pTimeout
+        );
 
-        NTSTATUS Status = ImpCheckComponent(Internal, CheckOrder[i], &Result);
-        if (!NT_SUCCESS(Status)) {
+        // Check termination flag
+        if (ReadNoFence(&Internal->TerminateThread)) {
+            break;
+        }
+
+        // Check monitor state
+        if (ReadNoFence(&Internal->Public.State) != IM_STATE_ACTIVE) {
+            break;
+        }
+
+        // Skip check if periodic is disabled (woken by ImDisablePeriodicCheck)
+        if (!ReadNoFence(&Internal->Public.PeriodicEnabled)) {
             continue;
         }
 
-        if (!Result.IsIntact) {
-            // Tamper detected — notify all registered callbacks
-            ImpNotifyTamper(Internal, &Result);
+        // Acquire rundown protection for the check operation
+        if (!ExAcquireRundownProtection(&Internal->Public.RundownProtection)) {
+            break;
         }
+
+        // Perform integrity checks on critical components
+        {
+            IM_COMPONENT CheckOrder[] = {
+                ImComp_CodeSections,
+                ImComp_DriverImage,
+                ImComp_Callbacks,
+                ImComp_Handles,
+                ImComp_Configuration,
+                ImComp_DataSections
+            };
+
+            for (ULONG i = 0; i < ARRAYSIZE(CheckOrder); i++) {
+                IM_CHECK_RESULT Result;
+                RtlZeroMemory(&Result, sizeof(Result));
+
+                NTSTATUS Status = ImpCheckComponent(Internal, CheckOrder[i], &Result);
+                if (!NT_SUCCESS(Status)) {
+                    continue;
+                }
+
+                if (!Result.IsIntact) {
+                    ImpNotifyTamper(Internal, &Result);
+                }
+            }
+        }
+
+        // Update statistics
+        KeQuerySystemTimePrecise(&Internal->Public.LastCheckTime);
+        InterlockedIncrement((volatile LONG *)&Internal->Public.TotalChecks);
+
+        ExReleaseRundownProtection(&Internal->Public.RundownProtection);
     }
 
-    // Update last check timestamp
-    KeQuerySystemTimePrecise(&Internal->Public.LastCheckTime);
-    InterlockedIncrement((volatile LONG*)&Internal->Public.TotalChecks);
-
-Done:
-    // Clear work item pending flag BEFORE releasing rundown protection
-    InterlockedExchange(&Internal->Public.WorkItemPending, 0);
-    ExReleaseRundownProtection(&Internal->Public.RundownProtection);
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 // ============================================================================

@@ -22,14 +22,13 @@
     v2.1.0 Changes (Enterprise Hardened):
     ======================================
     - EX_RUNDOWN_REF replaces BOOLEAN Initialized for safe shutdown
-    - IoWorkItem for DPC -> PASSIVE_LEVEL deferral (BCrypt safety)
+    - PsCreateSystemThread for PASSIVE_LEVEL periodic checks (no DeviceObject)
     - ImShutdown takes PIM_MONITOR* to NULL caller's pointer
     - ImFreeCheckResult added for proper result lifetime
     - IRQL SAL annotations on all public APIs
     - New IM_MODIFICATION values: ImMod_ImportHook, ImMod_ExportHook, ImMod_HeaderTamper
     - Callback list instead of single callback pointer
     - volatile fields for cross-thread visibility
-    - PDEVICE_OBJECT required for work item allocation
 
     Copyright (c) ShadowStrike Team
 --*/
@@ -40,7 +39,7 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
+#include <ntifs.h>
 
 #define IM_POOL_TAG 'NOIM'
 
@@ -67,7 +66,7 @@ typedef enum _IM_MODIFICATION {
     ImMod_HeaderTamper,         // PE header modified
     ImMod_CallbackRemoval,      // Kernel callback unregistered
     ImMod_ConfigChanged,        // Driver configuration state changed
-} IM_MODIFICATION;
+} IM_MODIFICATION, *PIM_MODIFICATION;
 
 // ============================================================================
 // CHECK RESULT STRUCTURE
@@ -107,9 +106,6 @@ typedef struct _IM_MONITOR {
     /// Periodic check enabled (atomic)
     volatile LONG   PeriodicEnabled;
 
-    /// Work item pending flag (atomic)
-    volatile LONG   WorkItemPending;
-
     /// Statistics
     LARGE_INTEGER   LastCheckTime;
     ULONG           TotalChecks;
@@ -124,7 +120,6 @@ typedef struct _IM_MONITOR {
  * @param Monitor       Receives pointer to initialized monitor
  * @param DriverBase    Base address of the driver image in memory
  * @param DriverSize    Size of the driver image
- * @param DeviceObject  Device object for work item allocation
  * @irql PASSIVE_LEVEL
  */
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -133,8 +128,7 @@ NTSTATUS
 ImInitialize(
     _Out_    PIM_MONITOR *Monitor,
     _In_     PVOID DriverBase,
-    _In_     SIZE_T DriverSize,
-    _In_     PDEVICE_OBJECT DeviceObject
+    _In_     SIZE_T DriverSize
 );
 
 /**
