@@ -36,7 +36,12 @@ Implementation Strategy:
 --*/
 
 #include "FirmwareIntegrity.h"
+
+#pragma warning(push)
+#pragma warning(disable:4324)  // fltKernel.h: structure was padded
 #include "../Core/Globals.h"
+#pragma warning(pop)
+
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -178,6 +183,9 @@ FiCheckEspAccess(
     _In_ ACCESS_MASK DesiredAccess
     )
 {
+    UNICODE_STRING BcdPath = RTL_CONSTANT_STRING(L"\\Boot\\BCD");
+    UNICODE_STRING Suffix;
+
     if (!FipEnterOperation()) {
         return FiThreat_None;
     }
@@ -209,11 +217,9 @@ FiCheckEspAccess(
     }
 
     //
-    // Check for BCD modification specifically
+    // Check for BCD access specifically (read-only path — writes already handled above)
     //
-    UNICODE_STRING BcdPath = RTL_CONSTANT_STRING(L"\\Boot\\BCD");
     if (FileName->Length >= BcdPath.Length) {
-        UNICODE_STRING Suffix;
         Suffix.Buffer = FileName->Buffer +
             (FileName->Length - BcdPath.Length) / sizeof(WCHAR);
         Suffix.Length = BcdPath.Length;
@@ -281,7 +287,7 @@ FipQuerySecureBootState(VOID)
     NTSTATUS Status;
     UNICODE_STRING VariableName = RTL_CONSTANT_STRING(L"SecureBoot");
     UCHAR Value = 0;
-    ULONG ResultLength = 0;
+    ULONG ResultLength = sizeof(Value);
 
     //
     // Query the SecureBoot UEFI variable
