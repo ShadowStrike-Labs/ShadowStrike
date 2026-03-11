@@ -49,6 +49,44 @@
 #include "SelfProtect.h"
 #include "../Core/Globals.h"
 
+// ============================================================================
+// SYSTEM STRUCTURES (for ZwQuerySystemInformation process enumeration)
+// ============================================================================
+
+#ifndef SystemProcessInformation
+#define SystemProcessInformation 5
+#endif
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQuerySystemInformation(
+    _In_ ULONG SystemInformationClass,
+    _Out_writes_bytes_opt_(SystemInformationLength) PVOID SystemInformation,
+    _In_ ULONG SystemInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+//
+// Minimal structure for process enumeration. Prefixed HP_ to avoid
+// collisions with WDK-internal _SYSTEM_PROCESS_INFORMATION definition.
+//
+typedef struct _HP_SYSTEM_PROCESS_INFO {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    LARGE_INTEGER WorkingSetPrivateSize;
+    ULONG HardFaultCount;
+    ULONG NumberOfThreadsHighWatermark;
+    ULONGLONG CycleTime;
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    UNICODE_STRING ImageName;
+    LONG BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+} HP_SYSTEM_PROCESS_INFO, *PHP_SYSTEM_PROCESS_INFO;
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, HpInitialize)
 #pragma alloc_text(PAGE, HpShutdown)
@@ -2200,9 +2238,7 @@ HppGetProcessIntegrityLevel(
 {
     NTSTATUS status;
     PACCESS_TOKEN token = NULL;
-    UCHAR buffer[256];
     PTOKEN_MANDATORY_LABEL label = NULL;
-    ULONG returnLength = 0;
     PSID sid;
     ULONG subAuthorityCount;
     PULONG ridPtr;
@@ -2242,9 +2278,6 @@ HppGetProcessIntegrityLevel(
 
     PsDereferencePrimaryToken(token);
 
-    UNREFERENCED_PARAMETER(buffer);
-    UNREFERENCED_PARAMETER(returnLength);
-
     return NT_SUCCESS(status);
 }
 
@@ -2265,7 +2298,7 @@ HppDetectSensitiveProcesses(
     NTSTATUS status;
     ULONG bufferSize = 0;
     PVOID buffer = NULL;
-    PSYSTEM_PROCESS_INFORMATION processInfo;
+    PHP_SYSTEM_PROCESS_INFO processInfo;
     UNICODE_STRING lsassName;
     UNICODE_STRING csrssName;
     UNICODE_STRING smssName;
@@ -2347,7 +2380,7 @@ HppDetectSensitiveProcesses(
     //
     // Walk the process list and match names
     //
-    processInfo = (PSYSTEM_PROCESS_INFORMATION)buffer;
+    processInfo = (PHP_SYSTEM_PROCESS_INFO)buffer;
 
     for (;;) {
         if (processInfo->ImageName.Buffer != NULL &&
@@ -2378,7 +2411,7 @@ HppDetectSensitiveProcesses(
             break;
         }
 
-        processInfo = (PSYSTEM_PROCESS_INFORMATION)(
+        processInfo = (PHP_SYSTEM_PROCESS_INFO)(
             (PUCHAR)processInfo + processInfo->NextEntryOffset
         );
     }

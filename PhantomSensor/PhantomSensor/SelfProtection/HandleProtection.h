@@ -50,8 +50,6 @@
 #define _SHADOWSTRIKE_HANDLE_PROTECTION_H_
 
 #include <ntifs.h>
-#include <ntddk.h>
-#include <wdm.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -104,6 +102,35 @@ extern "C" {
  * @brief Maximum iterations for bounded spin-waits during shutdown.
  */
 #define HP_SHUTDOWN_SPIN_LIMIT                  1000
+
+// ============================================================================
+// PROCESS / THREAD / TOKEN ACCESS CONSTANTS (WDK km headers omit these)
+// ============================================================================
+
+#ifndef PROCESS_VM_READ
+#define PROCESS_VM_READ             0x0010
+#endif
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION   0x0400
+#endif
+#ifndef THREAD_GET_CONTEXT
+#define THREAD_GET_CONTEXT          0x0008
+#endif
+#ifndef TOKEN_ASSIGN_PRIMARY
+#define TOKEN_ASSIGN_PRIMARY        0x0001
+#endif
+#ifndef TOKEN_DUPLICATE
+#define TOKEN_DUPLICATE             0x0002
+#endif
+#ifndef TOKEN_IMPERSONATE
+#define TOKEN_IMPERSONATE           0x0004
+#endif
+#ifndef TOKEN_ADJUST_PRIVILEGES
+#define TOKEN_ADJUST_PRIVILEGES     0x0020
+#endif
+#ifndef TOKEN_ADJUST_GROUPS
+#define TOKEN_ADJUST_GROUPS         0x0040
+#endif
 
 // ============================================================================
 // DANGEROUS ACCESS MASKS
@@ -221,7 +248,7 @@ typedef enum _HP_SUSPICION_FLAGS {
     HpSuspicion_CredentialAccess        = 0x00800000,
     HpSuspicion_ServiceManipulation     = 0x01000000,
 
-} HP_SUSPICION_FLAGS;
+} HP_SUSPICION_FLAGS, *PHP_SUSPICION_FLAGS;
 
 /**
  * @brief Handle event types for history tracking.
@@ -246,7 +273,7 @@ typedef enum _HP_SENSITIVITY_LEVEL {
     HpSensitivity_Medium        = 2,
     HpSensitivity_High          = 3,
     HpSensitivity_Critical      = 4,
-} HP_SENSITIVITY_LEVEL;
+} HP_SENSITIVITY_LEVEL, *PHP_SENSITIVITY_LEVEL;
 
 // ============================================================================
 // STRUCTURES
