@@ -30,7 +30,10 @@
 --*/
 
 #include "BootThreatDetector.h"
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include "../PhantomSensor/Utilities/HashUtils.h"
+#pragma warning(pop)
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -47,6 +50,28 @@
 #define BTD_SEVERITY_MEDIUM_THRESHOLD   50
 #define BTD_SEVERITY_HIGH_THRESHOLD     75
 #define BTD_SEVERITY_CRITICAL_THRESHOLD 90
+#define BTD_MAX_HEX_STRING_LENGTH       128
+
+// Binary format for BtdLoadVulnerableList
+#define BTD_VULN_LIST_MAGIC     'BVDL'
+#define BTD_VULN_LIST_VERSION   1
+
+#pragma pack(push, 1)
+typedef struct _BTD_VULN_LIST_HEADER {
+    ULONG Magic;
+    ULONG Version;
+    ULONG EntryCount;
+    ULONG Reserved;
+} BTD_VULN_LIST_HEADER, *PBTD_VULN_LIST_HEADER;
+
+typedef struct _BTD_VULN_LIST_RECORD {
+    UCHAR Hash[32];
+    CHAR DriverName[64];
+    CHAR CVE[32];
+    CHAR Vendor[64];
+    ULONG SeverityScore;
+} BTD_VULN_LIST_RECORD, *PBTD_VULN_LIST_RECORD;
+#pragma pack(pop)
 
 // ============================================================================
 // BYOVD DATABASE - KNOWN VULNERABLE DRIVERS
@@ -237,10 +262,11 @@ BtdpLoadEmbeddedPatterns(
 
 static BOOLEAN
 BtdpMatchPattern(
-    _In_ const UCHAR* Data,
+    _In_reads_bytes_(DataSize) const UCHAR* Data,
     _In_ SIZE_T DataSize,
-    _In_ const UCHAR* Pattern,
+    _In_reads_bytes_(PatternSize) const UCHAR* Pattern,
     _In_ SIZE_T PatternSize,
+    _In_ ULONG PatternOffset,
     _Out_opt_ PULONG MatchOffset
     );
 
@@ -262,12 +288,29 @@ BtdpFreeThreatInternal(
     _In_ PBTD_THREAT Threat
     );
 
+static NTSTATUS
+BtdpDeepCopyDriverPath(
+    _In_ PUNICODE_STRING Source,
+    _Out_ PUNICODE_STRING Destination
+    );
+
+static VOID
+BtdpFreeDriverPath(
+    _Inout_ PUNICODE_STRING Path
+    );
+
+static VOID
+BtdpInvokeCallback(
+    _In_ PBTD_DETECTOR Detector,
+    _In_ PBTD_THREAT Threat
+    );
+
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
 /**
- * @brief Convert hex string to bytes
+ * @brief Convert hex string to bytes with bounded length check
  */
 static NTSTATUS
 BtdpHexStringToBytes(
@@ -284,7 +327,14 @@ BtdpHexStringToBytes(
         return STATUS_INVALID_PARAMETER;
     }
 
-    hexLen = strlen(HexString);
+    //
+    // Bounded length scan — never scan more than BTD_MAX_HEX_STRING_LENGTH
+    //
+    hexLen = 0;
+    while (hexLen < BTD_MAX_HEX_STRING_LENGTH && HexString[hexLen] != '\0') {
+        hexLen++;
+    }
+
     if (hexLen != BytesSize * 2) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -293,27 +343,15 @@ BtdpHexStringToBytes(
         CHAR c1 = HexString[i * 2];
         CHAR c2 = HexString[i * 2 + 1];
 
-        // Convert high nibble
-        if (c1 >= '0' && c1 <= '9') {
-            high = (UCHAR)(c1 - '0');
-        } else if (c1 >= 'A' && c1 <= 'F') {
-            high = (UCHAR)(c1 - 'A' + 10);
-        } else if (c1 >= 'a' && c1 <= 'f') {
-            high = (UCHAR)(c1 - 'a' + 10);
-        } else {
-            return STATUS_INVALID_PARAMETER;
-        }
+        if (c1 >= '0' && c1 <= '9')      { high = (UCHAR)(c1 - '0'); }
+        else if (c1 >= 'A' && c1 <= 'F') { high = (UCHAR)(c1 - 'A' + 10); }
+        else if (c1 >= 'a' && c1 <= 'f') { high = (UCHAR)(c1 - 'a' + 10); }
+        else { return STATUS_INVALID_PARAMETER; }
 
-        // Convert low nibble
-        if (c2 >= '0' && c2 <= '9') {
-            low = (UCHAR)(c2 - '0');
-        } else if (c2 >= 'A' && c2 <= 'F') {
-            low = (UCHAR)(c2 - 'A' + 10);
-        } else if (c2 >= 'a' && c2 <= 'f') {
-            low = (UCHAR)(c2 - 'a' + 10);
-        } else {
-            return STATUS_INVALID_PARAMETER;
-        }
+        if (c2 >= '0' && c2 <= '9')      { low = (UCHAR)(c2 - '0'); }
+        else if (c2 >= 'A' && c2 <= 'F') { low = (UCHAR)(c2 - 'A' + 10); }
+        else if (c2 >= 'a' && c2 <= 'f') { low = (UCHAR)(c2 - 'a' + 10); }
+        else { return STATUS_INVALID_PARAMETER; }
 
         Bytes[i] = (high << 4) | low;
     }
@@ -322,18 +360,26 @@ BtdpHexStringToBytes(
 }
 
 /**
- * @brief Pattern matching with wildcards (0x00 = wildcard)
+ * @brief Pattern matching with wildcards (0x00 = wildcard) and optional fixed offset
+ *
+ * @param Data          Image bytes to scan
+ * @param DataSize      Size of image bytes
+ * @param Pattern       Pattern bytes (0x00 acts as wildcard)
+ * @param PatternSize   Length of pattern
+ * @param PatternOffset If non-zero, only check at this specific offset. If zero, scan entire image.
+ * @param MatchOffset   Receives the offset where match was found
  */
 static BOOLEAN
 BtdpMatchPattern(
-    _In_ const UCHAR* Data,
+    _In_reads_bytes_(DataSize) const UCHAR* Data,
     _In_ SIZE_T DataSize,
-    _In_ const UCHAR* Pattern,
+    _In_reads_bytes_(PatternSize) const UCHAR* Pattern,
     _In_ SIZE_T PatternSize,
+    _In_ ULONG PatternOffset,
     _Out_opt_ PULONG MatchOffset
     )
 {
-    SIZE_T i, j;
+    SIZE_T scanStart, scanEnd, i, j;
     BOOLEAN match;
 
     if (Data == NULL || Pattern == NULL || PatternSize == 0) {
@@ -344,11 +390,24 @@ BtdpMatchPattern(
         return FALSE;
     }
 
-    for (i = 0; i <= DataSize - PatternSize; i++) {
+    //
+    // If a fixed offset is specified, only check at that position
+    //
+    if (PatternOffset != 0) {
+        if ((SIZE_T)PatternOffset + PatternSize > DataSize) {
+            return FALSE;
+        }
+        scanStart = PatternOffset;
+        scanEnd = PatternOffset;
+    } else {
+        scanStart = 0;
+        scanEnd = DataSize - PatternSize;
+    }
+
+    for (i = scanStart; i <= scanEnd; i++) {
         match = TRUE;
 
         for (j = 0; j < PatternSize; j++) {
-            // 0x00 in pattern acts as wildcard
             if (Pattern[j] != 0x00 && Data[i + j] != Pattern[j]) {
                 match = FALSE;
                 break;
@@ -385,7 +444,7 @@ BtdpAllocateThreat(
 }
 
 /**
- * @brief Free threat structure to lookaside
+ * @brief Free threat structure — releases deep-copied path and returns to lookaside
  */
 static VOID
 BtdpFreeThreatInternal(
@@ -394,12 +453,87 @@ BtdpFreeThreatInternal(
     )
 {
     if (Threat != NULL) {
+        BtdpFreeDriverPath(&Threat->DriverPath);
         ExFreeToNPagedLookasideList(&Internal->ThreatLookaside, Threat);
     }
 }
 
 /**
- * @brief Load embedded vulnerable driver list
+ * @brief Deep-copy a UNICODE_STRING with own buffer allocation
+ */
+static NTSTATUS
+BtdpDeepCopyDriverPath(
+    _In_ PUNICODE_STRING Source,
+    _Out_ PUNICODE_STRING Destination
+    )
+{
+    if (Source == NULL || Source->Buffer == NULL || Source->Length == 0) {
+        RtlInitUnicodeString(Destination, NULL);
+        return STATUS_SUCCESS;
+    }
+
+    Destination->Buffer = (PWCH)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        (SIZE_T)Source->Length + sizeof(WCHAR),
+        BTD_POOL_TAG
+        );
+
+    if (Destination->Buffer == NULL) {
+        RtlInitUnicodeString(Destination, NULL);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlCopyMemory(Destination->Buffer, Source->Buffer, Source->Length);
+    Destination->Buffer[Source->Length / sizeof(WCHAR)] = L'\0';
+    Destination->Length = Source->Length;
+    Destination->MaximumLength = Source->Length + sizeof(WCHAR);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Free a deep-copied driver path
+ */
+static VOID
+BtdpFreeDriverPath(
+    _Inout_ PUNICODE_STRING Path
+    )
+{
+    if (Path->Buffer != NULL) {
+        ExFreePoolWithTag(Path->Buffer, BTD_POOL_TAG);
+        Path->Buffer = NULL;
+        Path->Length = 0;
+        Path->MaximumLength = 0;
+    }
+}
+
+/**
+ * @brief Safely invoke the registered threat callback outside any lock
+ *
+ * Captures the callback pointer and context under CallbackLock,
+ * then invokes outside the lock to prevent deadlocks.
+ */
+static VOID
+BtdpInvokeCallback(
+    _In_ PBTD_DETECTOR Detector,
+    _In_ PBTD_THREAT Threat
+    )
+{
+    BTD_THREAT_CALLBACK callback;
+    PVOID context;
+
+    ExAcquirePushLockShared(&Detector->CallbackLock);
+    callback = Detector->ThreatCallback;
+    context = Detector->CallbackContext;
+    ExReleasePushLockShared(&Detector->CallbackLock);
+
+    if (callback != NULL) {
+        callback(Threat, context);
+    }
+}
+
+/**
+ * @brief Load embedded vulnerable driver list into VulnerableList
  */
 static NTSTATUS
 BtdpLoadEmbeddedVulnerableList(
@@ -411,6 +545,15 @@ BtdpLoadEmbeddedVulnerableList(
     ULONG i;
 
     for (i = 0; g_EmbeddedVulnerableDrivers[i].HashHex != NULL; i++) {
+
+        if (InterlockedCompareExchange(&Detector->VulnerableCount,
+                                       0, 0) >= BTD_MAX_VULNERABLE_DRIVERS) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/BTD] Vulnerable list cap reached (%u), skipping remaining embedded entries\n",
+                BTD_MAX_VULNERABLE_DRIVERS);
+            break;
+        }
+
         entry = (PBTD_VULNERABLE_ENTRY)ExAllocatePool2(
             POOL_FLAG_NON_PAGED,
             sizeof(BTD_VULNERABLE_ENTRY),
@@ -423,7 +566,6 @@ BtdpLoadEmbeddedVulnerableList(
 
         RtlZeroMemory(entry, sizeof(BTD_VULNERABLE_ENTRY));
 
-        // Convert hash
         status = BtdpHexStringToBytes(
             g_EmbeddedVulnerableDrivers[i].HashHex,
             entry->Hash,
@@ -432,27 +574,27 @@ BtdpLoadEmbeddedVulnerableList(
 
         if (!NT_SUCCESS(status)) {
             ExFreePoolWithTag(entry, BTD_POOL_TAG);
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/BTD] Failed to parse hash for embedded driver #%u\n", i);
             continue;
         }
 
-        // Copy metadata
         RtlStringCbCopyA(entry->DriverName, sizeof(entry->DriverName),
                         g_EmbeddedVulnerableDrivers[i].DriverName);
         RtlStringCbCopyA(entry->CVE, sizeof(entry->CVE),
                         g_EmbeddedVulnerableDrivers[i].CVE);
         RtlStringCbCopyA(entry->Vendor, sizeof(entry->Vendor),
                         g_EmbeddedVulnerableDrivers[i].Vendor);
-        entry->SeverityScore = g_EmbeddedVulnerableDrivers[i].Severity;
+        entry->SeverityScore = min(g_EmbeddedVulnerableDrivers[i].Severity, 100);
 
         RtlStringCbPrintfA(entry->Description, sizeof(entry->Description),
                           "Vulnerable driver: %s (%s)",
                           entry->DriverName, entry->CVE);
 
-        // Add to list
-        ExAcquirePushLockExclusive(&Detector->ThreatLock);
+        ExAcquirePushLockExclusive(&Detector->VulnerableLock);
         InsertTailList(&Detector->VulnerableList, &entry->ListEntry);
-        Detector->VulnerableCount++;
-        ExReleasePushLockExclusive(&Detector->ThreatLock);
+        InterlockedIncrement(&Detector->VulnerableCount);
+        ExReleasePushLockExclusive(&Detector->VulnerableLock);
     }
 
     return STATUS_SUCCESS;

@@ -68,28 +68,24 @@ typedef VOID (*BTD_THREAT_CALLBACK)(
 );
 
 typedef struct _BTD_DETECTOR {
-    BOOLEAN Initialized;
+    volatile LONG Initialized;
     
-    // Verifier reference
     PBDV_VERIFIER Verifier;
-    
-    // Threat database
-    LIST_ENTRY ThreatList;
-    EX_PUSH_LOCK ThreatLock;
-    ULONG ThreatCount;
     
     // Detected threats
     LIST_ENTRY DetectedList;
     KSPIN_LOCK DetectedLock;
-    ULONG DetectedCount;
+    volatile LONG DetectedCount;
     
-    // Callbacks
+    // Callback (protected by CallbackLock)
     BTD_THREAT_CALLBACK ThreatCallback;
     PVOID CallbackContext;
+    EX_PUSH_LOCK CallbackLock;
     
     // Vulnerable driver list (BYOVD)
     LIST_ENTRY VulnerableList;
-    ULONG VulnerableCount;
+    EX_PUSH_LOCK VulnerableLock;
+    volatile LONG VulnerableCount;
     
     struct {
         volatile LONG64 ScansPerformed;
@@ -102,11 +98,11 @@ typedef struct _BTD_DETECTOR {
 NTSTATUS BtdInitialize(_In_ PBDV_VERIFIER Verifier, _Out_ PBTD_DETECTOR* Detector);
 VOID BtdShutdown(_Inout_ PBTD_DETECTOR Detector);
 NTSTATUS BtdRegisterCallback(_In_ PBTD_DETECTOR Detector, _In_ BTD_THREAT_CALLBACK Callback, _In_opt_ PVOID Context);
-NTSTATUS BtdScanDriver(_In_ PBTD_DETECTOR Detector, _In_ PBDV_DRIVER_INFO DriverInfo, _Out_ PBTD_THREAT* Threat);
-NTSTATUS BtdLoadVulnerableList(_In_ PBTD_DETECTOR Detector, _In_ PVOID Data, _In_ SIZE_T DataSize);
-NTSTATUS BtdIsVulnerable(_In_ PBTD_DETECTOR Detector, _In_ PUCHAR Hash, _In_ SIZE_T HashLength, _Out_ PBOOLEAN IsVulnerable, _Out_opt_ PCHAR* CVE);
+NTSTATUS BtdScanDriver(_In_ PBTD_DETECTOR Detector, _In_ PBDV_DRIVER_INFO DriverInfo, _In_opt_ PVOID ImageBase, _In_ SIZE_T ImageSize, _Out_ PBTD_THREAT* Threat);
+NTSTATUS BtdLoadVulnerableList(_In_ PBTD_DETECTOR Detector, _In_reads_bytes_(DataSize) PVOID Data, _In_ SIZE_T DataSize);
+NTSTATUS BtdIsVulnerable(_In_ PBTD_DETECTOR Detector, _In_reads_bytes_(HashLength) PUCHAR Hash, _In_ SIZE_T HashLength, _Out_ PBOOLEAN IsVulnerable, _Out_writes_opt_(CVEBufferSize) PCHAR CVEBuffer, _In_ SIZE_T CVEBufferSize);
 NTSTATUS BtdGetThreats(_In_ PBTD_DETECTOR Detector, _Out_writes_to_(Max, *Count) PBTD_THREAT* Threats, _In_ ULONG Max, _Out_ PULONG Count);
-VOID BtdFreeThreat(_In_ PBTD_THREAT Threat);
+VOID BtdFreeThreat(_In_ PBTD_DETECTOR Detector, _In_ PBTD_THREAT Threat);
 
 #ifdef __cplusplus
 }
