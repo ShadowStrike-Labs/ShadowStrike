@@ -22,7 +22,7 @@
     Architecture:
     - All synchronization via EX_PUSH_LOCK (IRQL <= APC_LEVEL).
     - EX_RUNDOWN_REF drains all in-flight API calls before shutdown.
-    - Periodic detection runs in a work item (queued by a DPC timer).
+    - Periodic detection runs in a system thread (DPC signals KEVENT to wake).
     - Events are stored as internal ADB_EVENT nodes on a capped list.
     - Callers receive ADB_EVENT_INFO value-type copies (no internal pointers).
     - Detect-and-alert model only. This module does NOT and CANNOT block
@@ -32,9 +32,34 @@
 --*/
 
 #include "AntiDebug.h"
-#include <ntifs.h>       // PsGetProcessImageFileName
+#include <ntifs.h>
 #include <ntstrsafe.h>
 #include <intrin.h>
+
+// ============================================================================
+// WDK KERNEL-MODE MISSING DECLARATIONS
+// ============================================================================
+
+NTKERNELAPI
+PCHAR
+PsGetProcessImageFileName(
+    _In_ PEPROCESS Process
+    );
+
+#ifndef ProcessDebugPort
+#define ProcessDebugPort 7
+#endif
+
+NTSYSCALLAPI
+NTSTATUS
+NTAPI
+ZwQueryInformationProcess(
+    _In_ HANDLE ProcessHandle,
+    _In_ PROCESSINFOCLASS ProcessInformationClass,
+    _Out_writes_bytes_(ProcessInformationLength) PVOID ProcessInformation,
+    _In_ ULONG ProcessInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
 
 // ============================================================================
 // INTERNAL TYPES
@@ -66,8 +91,9 @@ static VOID AdbpTimerDpcRoutine(
     _In_opt_ PVOID SystemArgument2
     );
 
-static
-IO_WORKITEM_ROUTINE AdbpPeriodicCheckWorker;
+static VOID AdbpPeriodicCheckThread(
+    _In_ PVOID StartContext
+    );
 
 static BOOLEAN AdbpDetectKernelDebugger(VOID);
 static BOOLEAN AdbpDetectHypervisor(VOID);
@@ -103,13 +129,14 @@ static VOID AdbpEvictOldestEventsLocked(
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 AdbInitialize(
-    _In_ PDEVICE_OBJECT DeviceObject,
     _Out_ PADB_PROTECTOR *Protector
     )
 {
     PADB_PROTECTOR Ctx = NULL;
+    NTSTATUS Status;
+    HANDLE ThreadHandle = NULL;
 
-    if (Protector == NULL || DeviceObject == NULL) {
+    if (Protector == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -126,18 +153,11 @@ AdbInitialize(
 
     // ExAllocatePool2 zero-initializes, so all fields start at 0/NULL/FALSE.
 
-    Ctx->DeviceObject = DeviceObject;
     ExInitializeRundownProtection(&Ctx->RundownRef);
     ExInitializePushLock(&Ctx->EventLock);
     ExInitializePushLock(&Ctx->CallbackLock);
     InitializeListHead(&Ctx->EventList);
-
-    // Allocate work item for periodic checks
-    Ctx->CheckWorkItem = IoAllocateWorkItem(DeviceObject);
-    if (Ctx->CheckWorkItem == NULL) {
-        ExFreePoolWithTag(Ctx, ADB_POOL_TAG_CTX);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+    KeInitializeEvent(&Ctx->CheckWakeEvent, SynchronizationEvent, FALSE);
 
     // Initialize timer and DPC
     KeInitializeTimer(&Ctx->CheckTimer);
@@ -174,6 +194,38 @@ AdbInitialize(
     if (Ctx->CrashDumpEnabled) {
         AdbpRecordEvent(Ctx, AdbAttemptMemoryDump,
                         "Complete memory dump enabled at initialization");
+    }
+
+    // Create periodic check system thread
+    Status = PsCreateSystemThread(
+        &ThreadHandle,
+        THREAD_ALL_ACCESS,
+        NULL,
+        NULL,
+        NULL,
+        AdbpPeriodicCheckThread,
+        Ctx
+        );
+    if (!NT_SUCCESS(Status)) {
+        ExFreePoolWithTag(Ctx, ADB_POOL_TAG_CTX);
+        return Status;
+    }
+
+    Status = ObReferenceObjectByHandle(
+        ThreadHandle,
+        THREAD_ALL_ACCESS,
+        *PsThreadType,
+        KernelMode,
+        (PVOID*)&Ctx->CheckThread,
+        NULL
+        );
+    ZwClose(ThreadHandle);
+
+    if (!NT_SUCCESS(Status)) {
+        InterlockedExchange(&Ctx->ShutdownRequested, 1);
+        KeSetEvent(&Ctx->CheckWakeEvent, IO_NO_INCREMENT, FALSE);
+        ExFreePoolWithTag(Ctx, ADB_POOL_TAG_CTX);
+        return Status;
     }
 
     // Start periodic timer
@@ -222,22 +274,32 @@ AdbShutdown(
 
     //
     // KeFlushQueuedDpcs ensures the DPC has finished executing.
-    // After this, no new work items will be queued because
-    // ShutdownRequested == 1 and TimerActive == 0.
+    // After this, no new wake events will be signaled by DPCs.
     //
     KeFlushQueuedDpcs();
+
+    //
+    // Wake the check thread and wait for it to exit.
+    // The thread checks ShutdownRequested and terminates.
+    //
+    KeSetEvent(&Protector->CheckWakeEvent, IO_NO_INCREMENT, FALSE);
+    if (Protector->CheckThread != NULL) {
+        KeWaitForSingleObject(
+            Protector->CheckThread,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+            );
+        ObDereferenceObject(Protector->CheckThread);
+        Protector->CheckThread = NULL;
+    }
 
     //
     // Wait for all in-flight API calls to drain.
     // After this returns, no thread is inside any public API.
     //
     ExWaitForRundownProtectionRelease(&Protector->RundownRef);
-
-    // Free the work item
-    if (Protector->CheckWorkItem != NULL) {
-        IoFreeWorkItem(Protector->CheckWorkItem);
-        Protector->CheckWorkItem = NULL;
-    }
 
     // Drain and free all events — no lock needed, we're fully drained
     InitializeListHead(&FreeList);
@@ -556,7 +618,7 @@ AdbpRecordEvent(
     {
         PEPROCESS Process = PsGetCurrentProcess();
         if (Process != NULL) {
-            PUCHAR ImageName = PsGetProcessImageFileName(Process);
+            PCHAR ImageName = PsGetProcessImageFileName(Process);
             if (ImageName != NULL) {
                 //
                 // PsGetProcessImageFileName returns a narrow string (max 15 chars).
@@ -694,14 +756,12 @@ static BOOLEAN
 AdbpDetectKernelDebugger(VOID)
 {
     //
-    // KD_DEBUGGER_ENABLED is a kernel-exported pointer to a BOOLEAN.
-    // KD_DEBUGGER_NOT_PRESENT is also exported.
+    // KD_DEBUGGER_ENABLED expands to *KdDebuggerEnabled (already dereferenced).
+    // KD_DEBUGGER_NOT_PRESENT expands to *KdDebuggerNotPresent.
     // Both are safe to read at any IRQL.
     //
-    if (KD_DEBUGGER_ENABLED != NULL && *KD_DEBUGGER_ENABLED) {
-        if (KD_DEBUGGER_NOT_PRESENT == NULL || !(*KD_DEBUGGER_NOT_PRESENT)) {
-            return TRUE;
-        }
+    if (KD_DEBUGGER_ENABLED && !KD_DEBUGGER_NOT_PRESENT) {
+        return TRUE;
     }
 
     return FALSE;
@@ -714,20 +774,34 @@ AdbpDetectKernelDebugger(VOID)
 static BOOLEAN
 AdbpDetectUserDebugger(VOID)
 {
+    NTSTATUS Status;
+    HANDLE DebugPort = NULL;
+
     //
-    // Check if the current process has a debug port.
-    // This detects user-mode debuggers attached to a process that is
-    // calling into our driver. Not directly applicable to the driver
-    // process itself, but useful telemetry.
+    // System process (PID 4) cannot have a user-mode debugger.
+    // When called from periodic check thread, this is always PID 4.
+    // When called via IOCTL from user-mode service, this checks
+    // whether the calling process has a debugger attached.
     //
-    // We cannot call NtQueryInformationProcess from kernel mode directly
-    // for the System process. Instead check the EPROCESS debug port.
-    // However, the offset is undocumented and version-dependent, so we
-    // skip this for safety in a production driver.
+    if (PsGetProcessId(PsGetCurrentProcess()) == (HANDLE)(ULONG_PTR)4) {
+        return FALSE;
+    }
+
     //
-    // For production: use PsSetCreateProcessNotifyRoutineEx to watch
-    // for debugger attachment to protected processes.
+    // Query ProcessDebugPort (info class 7). Returns non-zero port handle
+    // if a user-mode debugger is attached to the calling process.
     //
+    Status = ZwQueryInformationProcess(
+        NtCurrentProcess(),
+        (PROCESSINFOCLASS)ProcessDebugPort,
+        &DebugPort,
+        sizeof(DebugPort),
+        NULL
+        );
+
+    if (NT_SUCCESS(Status) && DebugPort != NULL) {
+        return TRUE;
+    }
 
     return FALSE;
 }
@@ -851,7 +925,7 @@ AdbpDetectCrashDumpConfig(VOID)
 }
 
 // ============================================================================
-// TIMER DPC — only queues the work item, does NO event processing
+// TIMER DPC — signals the system thread to wake, does NO event processing
 // ============================================================================
 
 static VOID
@@ -872,101 +946,97 @@ AdbpTimerDpcRoutine(
         return;
     }
 
-    // Don't queue if shutdown is requested or timer is deactivated
     if (Protector->ShutdownRequested || !Protector->TimerActive) {
         return;
     }
 
-    //
-    // Queue the work item to run at PASSIVE_LEVEL.
-    // The work item does the actual detection work.
-    // IoQueueWorkItem is safe to call at DISPATCH_LEVEL.
-    //
-    if (Protector->CheckWorkItem != NULL) {
-        IoQueueWorkItem(
-            Protector->CheckWorkItem,
-            AdbpPeriodicCheckWorker,
-            DelayedWorkQueue,
-            Protector
-            );
-    }
+    KeSetEvent(&Protector->CheckWakeEvent, IO_NO_INCREMENT, FALSE);
 }
 
 // ============================================================================
-// PERIODIC CHECK WORKER — runs at PASSIVE_LEVEL
+// PERIODIC CHECK THREAD — runs at PASSIVE_LEVEL, waits on wake event
 // ============================================================================
 
 static VOID
-AdbpPeriodicCheckWorker(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+AdbpPeriodicCheckThread(
+    _In_ PVOID StartContext
     )
 {
-    PADB_PROTECTOR Protector = (PADB_PROTECTOR)Context;
+    PADB_PROTECTOR Protector = (PADB_PROTECTOR)StartContext;
+    LARGE_INTEGER Timeout;
     BOOLEAN PrevKd, PrevHv, PrevVf, PrevDump;
     BOOLEAN CurrKd, CurrHv, CurrVf, CurrDump;
 
-    UNREFERENCED_PARAMETER(DeviceObject);
+    Timeout.QuadPart = -(LONGLONG)ADB_CHECK_INTERVAL_SEC * 10000000LL;
 
-    if (Protector == NULL || Protector->ShutdownRequested) {
-        return;
+    while (!Protector->ShutdownRequested) {
+
+        KeWaitForSingleObject(
+            &Protector->CheckWakeEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &Timeout
+            );
+
+        if (Protector->ShutdownRequested) {
+            break;
+        }
+
+        if (!ADB_ACQUIRE_RUNDOWN(Protector)) {
+            break;
+        }
+
+        // Read previous state
+        PrevKd = (BOOLEAN)InterlockedCompareExchange(
+            &Protector->KernelDebuggerPresent, 0, 0);
+        PrevHv = (BOOLEAN)InterlockedCompareExchange(
+            &Protector->HypervisorPresent, 0, 0);
+        PrevVf = (BOOLEAN)InterlockedCompareExchange(
+            &Protector->VerifierEnabled, 0, 0);
+        PrevDump = (BOOLEAN)InterlockedCompareExchange(
+            &Protector->CrashDumpEnabled, 0, 0);
+
+        // Run detections
+        CurrKd = AdbpDetectKernelDebugger();
+        CurrHv = AdbpDetectHypervisor();
+        CurrVf = AdbpDetectDriverVerifier(Protector);
+        CurrDump = AdbpDetectCrashDumpConfig();
+
+        // Update state atomically
+        InterlockedExchange(&Protector->KernelDebuggerPresent, CurrKd ? 1 : 0);
+        InterlockedExchange(&Protector->HypervisorPresent, CurrHv ? 1 : 0);
+        InterlockedExchange(&Protector->VerifierEnabled, CurrVf ? 1 : 0);
+        InterlockedExchange(&Protector->CrashDumpEnabled, CurrDump ? 1 : 0);
+
+        // Record transition events only (FALSE -> TRUE)
+        if (CurrKd && !PrevKd) {
+            AdbpRecordEvent(Protector, AdbAttemptKernelDebugger,
+                            "Kernel debugger attached (periodic check)");
+        }
+        if (CurrHv && !PrevHv) {
+            AdbpRecordEvent(Protector, AdbAttemptHypervisor,
+                            "Hypervisor detected (periodic check)");
+        }
+        if (CurrVf && !PrevVf) {
+            AdbpRecordEvent(Protector, AdbAttemptDriverVerifier,
+                            "Driver Verifier enabled (periodic check)");
+        }
+        if (CurrDump && !PrevDump) {
+            AdbpRecordEvent(Protector, AdbAttemptMemoryDump,
+                            "Complete memory dump enabled (periodic check)");
+        }
+
+        // Update statistics snapshot
+        Protector->Stats.KernelDebuggerPresent = CurrKd;
+        Protector->Stats.HypervisorPresent = CurrHv;
+        Protector->Stats.VerifierEnabled = CurrVf;
+        KeQuerySystemTimePrecise(&Protector->Stats.LastCheckTime);
+
+        ADB_RELEASE_RUNDOWN(Protector);
     }
 
-    //
-    // Acquire rundown protection so shutdown waits for us.
-    // If shutdown has started, bail immediately.
-    //
-    if (!ADB_ACQUIRE_RUNDOWN(Protector)) {
-        return;
-    }
-
-    // Read previous state
-    PrevKd = (BOOLEAN)InterlockedCompareExchange(
-        &Protector->KernelDebuggerPresent, 0, 0);
-    PrevHv = (BOOLEAN)InterlockedCompareExchange(
-        &Protector->HypervisorPresent, 0, 0);
-    PrevVf = (BOOLEAN)InterlockedCompareExchange(
-        &Protector->VerifierEnabled, 0, 0);
-    PrevDump = (BOOLEAN)InterlockedCompareExchange(
-        &Protector->CrashDumpEnabled, 0, 0);
-
-    // Run detections
-    CurrKd = AdbpDetectKernelDebugger();
-    CurrHv = AdbpDetectHypervisor();
-    CurrVf = AdbpDetectDriverVerifier(Protector);
-    CurrDump = AdbpDetectCrashDumpConfig();
-
-    // Update state atomically
-    InterlockedExchange(&Protector->KernelDebuggerPresent, CurrKd ? 1 : 0);
-    InterlockedExchange(&Protector->HypervisorPresent, CurrHv ? 1 : 0);
-    InterlockedExchange(&Protector->VerifierEnabled, CurrVf ? 1 : 0);
-    InterlockedExchange(&Protector->CrashDumpEnabled, CurrDump ? 1 : 0);
-
-    // Record transition events only (FALSE → TRUE)
-    if (CurrKd && !PrevKd) {
-        AdbpRecordEvent(Protector, AdbAttemptKernelDebugger,
-                        "Kernel debugger attached (periodic check)");
-    }
-    if (CurrHv && !PrevHv) {
-        AdbpRecordEvent(Protector, AdbAttemptHypervisor,
-                        "Hypervisor detected (periodic check)");
-    }
-    if (CurrVf && !PrevVf) {
-        AdbpRecordEvent(Protector, AdbAttemptDriverVerifier,
-                        "Driver Verifier enabled (periodic check)");
-    }
-    if (CurrDump && !PrevDump) {
-        AdbpRecordEvent(Protector, AdbAttemptMemoryDump,
-                        "Complete memory dump enabled — security risk");
-    }
-
-    // Update statistics snapshot
-    Protector->Stats.KernelDebuggerPresent = CurrKd;
-    Protector->Stats.HypervisorPresent = CurrHv;
-    Protector->Stats.VerifierEnabled = CurrVf;
-    KeQuerySystemTimePrecise(&Protector->Stats.LastCheckTime);
-
-    ADB_RELEASE_RUNDOWN(Protector);
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 // ============================================================================

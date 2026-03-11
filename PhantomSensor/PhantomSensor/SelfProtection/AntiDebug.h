@@ -22,7 +22,7 @@
     Architecture:
     - EX_PUSH_LOCK for all synchronization (IRQL <= APC_LEVEL)
     - EX_RUNDOWN_REF for safe shutdown (all public APIs acquire rundown)
-    - Work-item based periodic checks (no raw DPC event processing)
+    - System thread for periodic checks (DPC signals KEVENT to wake thread)
     - Value-type event snapshots returned to callers (no internal pointers exposed)
     - Detect-and-alert model: detects debugging/VM/verifier presence,
       logs events, and invokes callback. Does NOT block kernel debugger
@@ -37,7 +37,7 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
+#include <ntifs.h>
 
 // ============================================================================
 // POOL TAGS
@@ -148,13 +148,14 @@ typedef struct _ADB_PROTECTOR {
     EX_PUSH_LOCK        EventLock;
     volatile LONG       EventCount;
 
-    // Periodic check — work-item based (not raw DPC)
-    PIO_WORKITEM        CheckWorkItem;
+    // Periodic check — system thread + timer DPC
+    HANDLE              CheckThreadHandle;
+    PETHREAD            CheckThread;
+    KEVENT              CheckWakeEvent;
     KTIMER              CheckTimer;
-    KDPC                CheckDpc;       // DPC just queues the work item
+    KDPC                CheckDpc;
     volatile LONG       TimerActive;
     volatile LONG       ShutdownRequested;
-    PDEVICE_OBJECT      DeviceObject;   // For IoAllocateWorkItem
 
     // Statistics
     ADB_STATISTICS      Stats;
@@ -174,7 +175,6 @@ typedef struct _ADB_PROTECTOR {
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 AdbInitialize(
-    _In_ PDEVICE_OBJECT DeviceObject,
     _Out_ PADB_PROTECTOR *Protector
     );
 
