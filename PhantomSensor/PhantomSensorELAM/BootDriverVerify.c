@@ -30,8 +30,12 @@
 --*/
 
 #include "BootDriverVerify.h"
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include "../PhantomSensor/Utilities/HashUtils.h"
+#pragma warning(pop)
 #include <ntimage.h>
+#include <ntstrsafe.h>
 
 // ============================================================================
 // CONSTANTS AND CONFIGURATION
@@ -41,11 +45,13 @@
 #define BDV_BLOOM_FILTER_SIZE_BYTES     (BDV_BLOOM_FILTER_SIZE_BITS / 8)
 #define BDV_BLOOM_HASH_COUNT            7               // Number of hash functions
 #define BDV_MAX_KNOWN_HASHES            100000          // Maximum hash entries
+#define BDV_MAX_VERIFIED_DRIVERS        10000           // Maximum verified driver cache entries
 
 #define BDV_HASH_SIZE                   32              // SHA-256
 
 #define BDV_PE_DOS_SIGNATURE            0x5A4D          // 'MZ'
 #define BDV_PE_NT_SIGNATURE             0x00004550      // 'PE\0\0'
+#define BDV_MAX_IMAGE_SIZE              (100ULL * 1024 * 1024)  // 100MB max driver
 
 // ============================================================================
 // INTERNAL STRUCTURES
@@ -152,6 +158,18 @@ BdvpMurmurHash3(
     _In_reads_(Length) const UCHAR* Data,
     _In_ ULONG Length,
     _In_ ULONG Seed
+    );
+
+static NTSTATUS
+BdvpDeepCopyDriverPath(
+    _In_ PUNICODE_STRING SourcePath,
+    _Out_ PUNICODE_STRING DestPath,
+    _Out_ PUNICODE_STRING DestName
+    );
+
+static VOID
+BdvpFreeDriverInfoPaths(
+    _Inout_ PBDV_DRIVER_INFO Info
     );
 
 // ============================================================================
@@ -363,7 +381,7 @@ BdvpCalculateImageHash(
     }
 
     // Validate image size is reasonable
-    if (ImageSize > 100 * 1024 * 1024) { // 100MB max
+    if (ImageSize > BDV_MAX_IMAGE_SIZE) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -417,8 +435,9 @@ BdvpCalculateAuthenticodeHash(
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
-    // Validate NT headers offset
-    if ((ULONG)dosHeader->e_lfanew > ImageSize - sizeof(IMAGE_NT_HEADERS)) {
+    // Validate NT headers offset (overflow-safe)
+    if (dosHeader->e_lfanew < 0 ||
+        (SIZE_T)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS) > ImageSize) {
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
@@ -459,10 +478,16 @@ BdvpCalculateAuthenticodeHash(
         headerSize = ntHeaders->OptionalHeader.SizeOfHeaders;
     }
 
-    // Get security table location
+    // Get security table location (overflow-safe)
     if (securityDir != NULL && securityDir->VirtualAddress != 0) {
         securityDirSize = securityDir->Size;
-        securityDirEnd = securityDir->VirtualAddress + securityDirSize;
+        if (securityDir->VirtualAddress > (ULONG)ImageSize ||
+            securityDirSize > (ULONG)ImageSize - securityDir->VirtualAddress) {
+            securityDirSize = 0;
+            securityDirEnd = 0;
+        } else {
+            securityDirEnd = securityDir->VirtualAddress + securityDirSize;
+        }
     } else {
         securityDirSize = 0;
         securityDirEnd = 0;
@@ -518,19 +543,19 @@ BdvpCalculateAuthenticodeHash(
     for (i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
         ULONG sectionStart = sectionHeader[i].PointerToRawData;
         ULONG sectionSize = sectionHeader[i].SizeOfRawData;
-        ULONG sectionEnd = sectionStart + sectionSize;
 
-        // Skip if section overlaps with certificate table
-        if (securityDir != NULL && securityDir->VirtualAddress != 0) {
-            if (sectionStart >= securityDir->VirtualAddress &&
-                sectionStart < securityDirEnd) {
-                continue;
-            }
+        // Overflow-safe bounds check
+        if (sectionStart > (ULONG)ImageSize ||
+            sectionSize > (ULONG)ImageSize - sectionStart) {
+            continue;
         }
 
-        // Validate section bounds
-        if (sectionStart >= ImageSize || sectionEnd > ImageSize) {
-            continue;
+        // Skip if section overlaps with certificate table
+        if (securityDir != NULL && securityDir->VirtualAddress != 0 && securityDirEnd != 0) {
+            ULONG sectionEnd = sectionStart + sectionSize;
+            if (sectionStart < securityDirEnd && sectionEnd > securityDir->VirtualAddress) {
+                continue;
+            }
         }
 
         if (sectionSize > 0) {
@@ -558,6 +583,16 @@ Cleanup:
 
 /**
  * @brief Extract certificate information from PE file
+ *
+ * Determines if the PE has an Authenticode signature by checking the
+ * IMAGE_DIRECTORY_ENTRY_SECURITY data directory. If present, computes
+ * a SHA-1 hash of the raw certificate bytes as a thumbprint proxy.
+ *
+ * @note This is a heuristic — presence of a certificate table does NOT
+ *       guarantee a valid signature. Full Authenticode verification
+ *       requires user-mode WinVerifyTrust or undocumented CiCheckSignedFile.
+ *       The thumbprint is SHA-1 of the raw PKCS#7 blob, NOT the standard
+ *       certificate thumbprint (SHA-1 of the DER-encoded certificate).
  */
 static NTSTATUS
 BdvpExtractCertificateInfo(
@@ -569,23 +604,24 @@ BdvpExtractCertificateInfo(
     PIMAGE_DOS_HEADER dosHeader;
     PIMAGE_NT_HEADERS ntHeaders;
     PIMAGE_DATA_DIRECTORY securityDir;
+    PUCHAR certTable;
 
     if (ImageBase == NULL || ImageSize < sizeof(IMAGE_DOS_HEADER) || Info == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    // Initialize to unsigned
     Info->IsSigned = FALSE;
     Info->IsWhqlSigned = FALSE;
     RtlZeroMemory(Info->ThumbPrint, sizeof(Info->ThumbPrint));
 
-    // Validate PE headers
     dosHeader = (PIMAGE_DOS_HEADER)ImageBase;
     if (dosHeader->e_magic != BDV_PE_DOS_SIGNATURE) {
-        return STATUS_SUCCESS; // Not an error, just not signed
+        return STATUS_SUCCESS;
     }
 
-    if ((ULONG)dosHeader->e_lfanew > ImageSize - sizeof(IMAGE_NT_HEADERS)) {
+    // Overflow-safe NT headers offset validation
+    if (dosHeader->e_lfanew < 0 ||
+        (SIZE_T)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS) > ImageSize) {
         return STATUS_SUCCESS;
     }
 
@@ -594,7 +630,6 @@ BdvpExtractCertificateInfo(
         return STATUS_SUCCESS;
     }
 
-    // Get security directory
     if (ntHeaders->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
         PIMAGE_NT_HEADERS64 ntHeaders64 = (PIMAGE_NT_HEADERS64)ntHeaders;
         if (ntHeaders64->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_SECURITY) {
@@ -608,29 +643,21 @@ BdvpExtractCertificateInfo(
         securityDir = &ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
     }
 
-    // Check if certificate table exists
     if (securityDir->VirtualAddress == 0 || securityDir->Size == 0) {
         return STATUS_SUCCESS;
     }
 
-    // Validate certificate table bounds
-    if (securityDir->VirtualAddress >= ImageSize ||
-        securityDir->VirtualAddress + securityDir->Size > ImageSize) {
+    // Overflow-safe certificate table bounds check
+    if (securityDir->VirtualAddress > (ULONG)ImageSize ||
+        securityDir->Size > (ULONG)ImageSize - securityDir->VirtualAddress) {
         return STATUS_SUCCESS;
     }
 
-    // Certificate table exists - mark as signed
-    // Note: Full certificate validation would require parsing WIN_CERTIFICATE structures
-    // and using Ci.dll or WinVerifyTrust, which is complex in kernel mode
     Info->IsSigned = TRUE;
 
-    // Extract certificate thumbprint (SHA-1 of certificate)
-    // This is a simplified implementation - full PKCS#7 parsing would be needed
-    // for complete certificate extraction
-    PUCHAR certTable = (PUCHAR)ImageBase + securityDir->VirtualAddress;
+    // Compute SHA-1 of raw PKCS#7 certificate blob (skip WIN_CERTIFICATE header)
+    certTable = (PUCHAR)ImageBase + securityDir->VirtualAddress;
     if (securityDir->Size >= 8) {
-        // WIN_CERTIFICATE structure starts with dwLength, wRevision, wCertificateType
-        // Hash the first portion of the certificate for a thumbprint
         ShadowStrikeComputeSha1(
             certTable + 8,
             min(securityDir->Size - 8, 4096),
@@ -669,6 +696,82 @@ BdvpIsHashInList(
     ExReleasePushLockShared(Lock);
 
     return found;
+}
+
+/**
+ * @brief Deep-copy a UNICODE_STRING driver path and derive the short name
+ *
+ * Allocates a new buffer, copies the full path, and sets DestName
+ * to point at the last path component within DestPath's buffer.
+ */
+static NTSTATUS
+BdvpDeepCopyDriverPath(
+    _In_ PUNICODE_STRING SourcePath,
+    _Out_ PUNICODE_STRING DestPath,
+    _Out_ PUNICODE_STRING DestName
+    )
+{
+    PWCH newBuffer;
+    USHORT lastSlashOffset = 0;
+    USHORT i;
+
+    RtlZeroMemory(DestPath, sizeof(UNICODE_STRING));
+    RtlZeroMemory(DestName, sizeof(UNICODE_STRING));
+
+    if (SourcePath == NULL || SourcePath->Buffer == NULL || SourcePath->Length == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    newBuffer = (PWCH)ExAllocatePool2(POOL_FLAG_NON_PAGED, SourcePath->Length, 'PvdB');
+    if (newBuffer == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlCopyMemory(newBuffer, SourcePath->Buffer, SourcePath->Length);
+
+    DestPath->Buffer = newBuffer;
+    DestPath->Length = SourcePath->Length;
+    DestPath->MaximumLength = SourcePath->Length;
+
+    // Find last backslash to derive short name
+    for (i = 0; i < SourcePath->Length / sizeof(WCHAR); i++) {
+        if (newBuffer[i] == L'\\') {
+            lastSlashOffset = (USHORT)((i + 1) * sizeof(WCHAR));
+        }
+    }
+
+    if (lastSlashOffset < SourcePath->Length) {
+        DestName->Buffer = (PWCH)((PUCHAR)newBuffer + lastSlashOffset);
+        DestName->Length = SourcePath->Length - lastSlashOffset;
+        DestName->MaximumLength = DestName->Length;
+    } else {
+        DestName->Buffer = newBuffer;
+        DestName->Length = SourcePath->Length;
+        DestName->MaximumLength = DestName->Length;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Free deep-copied path buffers from a driver info entry
+ *
+ * Only frees DriverPath.Buffer (DriverName shares the same allocation).
+ */
+static VOID
+BdvpFreeDriverInfoPaths(
+    _Inout_ PBDV_DRIVER_INFO Info
+    )
+{
+    if (Info->DriverPath.Buffer != NULL) {
+        ExFreePoolWithTag(Info->DriverPath.Buffer, 'PvdB');
+        Info->DriverPath.Buffer = NULL;
+        Info->DriverPath.Length = 0;
+        Info->DriverPath.MaximumLength = 0;
+        Info->DriverName.Buffer = NULL;
+        Info->DriverName.Length = 0;
+        Info->DriverName.MaximumLength = 0;
+    }
 }
 
 // ============================================================================
@@ -751,7 +854,7 @@ BdvInitialize(
     // Record start time
     KeQuerySystemTimePrecise(&internal->Public.Stats.StartTime);
 
-    internal->Public.Initialized = TRUE;
+    InterlockedExchange(&internal->Public.Initialized, 1);
     *Verifier = &internal->Public;
 
     return STATUS_SUCCESS;
@@ -786,13 +889,13 @@ BdvShutdown(
     PBDV_DRIVER_INFO driverInfo;
     KIRQL oldIrql;
 
-    if (Verifier == NULL || !Verifier->Initialized) {
+    if (Verifier == NULL || !InterlockedCompareExchange(&Verifier->Initialized, 0, 0)) {
         return;
     }
 
     internal = CONTAINING_RECORD(Verifier, BDV_VERIFIER_INTERNAL, Public);
 
-    Verifier->Initialized = FALSE;
+    InterlockedExchange(&Verifier->Initialized, 0);
 
     // Free known good list
     ExAcquirePushLockExclusive(&Verifier->ListLock);
@@ -810,11 +913,12 @@ BdvShutdown(
     }
     ExReleasePushLockExclusive(&Verifier->ListLock);
 
-    // Free verified driver list
+    // Free verified driver list (including deep-copied paths)
     KeAcquireSpinLock(&Verifier->VerifiedLock, &oldIrql);
     while (!IsListEmpty(&Verifier->VerifiedList)) {
         entry = RemoveHeadList(&Verifier->VerifiedList);
         driverInfo = CONTAINING_RECORD(entry, BDV_DRIVER_INFO, ListEntry);
+        BdvpFreeDriverInfoPaths(driverInfo);
         ExFreeToNPagedLookasideList(&internal->DriverInfoLookaside, driverInfo);
     }
     KeReleaseSpinLock(&Verifier->VerifiedLock, oldIrql);
@@ -850,7 +954,7 @@ BdvLoadConfiguration(
     SIZE_T ConfigSize
     )
 {
-    if (Verifier == NULL || !Verifier->Initialized) {
+    if (Verifier == NULL || !InterlockedCompareExchange(&Verifier->Initialized, 1, 1)) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -863,30 +967,44 @@ BdvLoadConfiguration(
         return STATUS_INVALID_PARAMETER;
     }
 
-    // Free existing config
-    if (Verifier->ELAMConfig != NULL) {
-        ExFreePoolWithTag(Verifier->ELAMConfig, BDV_POOL_TAG);
-    }
-
-    // Allocate and copy config
-    Verifier->ELAMConfig = ExAllocatePool2(
+    // Allocate new config before taking lock
+    PVOID newConfig = ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         ConfigSize,
         BDV_POOL_TAG
         );
 
-    if (Verifier->ELAMConfig == NULL) {
+    if (newConfig == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlCopyMemory(Verifier->ELAMConfig, ConfigData, ConfigSize);
+    RtlCopyMemory(newConfig, ConfigData, ConfigSize);
+
+    // Swap under push lock for synchronization with readers
+    ExAcquirePushLockExclusive(&Verifier->ListLock);
+
+    PVOID oldConfig = Verifier->ELAMConfig;
+    Verifier->ELAMConfig = newConfig;
     Verifier->ELAMConfigSize = ConfigSize;
+
+    ExReleasePushLockExclusive(&Verifier->ListLock);
+
+    if (oldConfig != NULL) {
+        ExFreePoolWithTag(oldConfig, BDV_POOL_TAG);
+    }
 
     return STATUS_SUCCESS;
 }
 
 /**
  * @brief Verify a boot driver
+ *
+ * Allocates a driver info entry from lookaside, deep-copies the driver path,
+ * computes SHA-256 full image hash and Authenticode hash, extracts certificate
+ * info, classifies the driver, and adds to verified cache.
+ *
+ * All image access is wrapped in __try/__except to handle corrupted or
+ * partially-mapped images without crashing the system.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -903,16 +1021,21 @@ BdvVerifyDriver(
     PBDV_DRIVER_INFO driverInfo = NULL;
     KIRQL oldIrql;
 
-    if (Verifier == NULL || !Verifier->Initialized || Info == NULL) {
+    if (Verifier == NULL || !InterlockedCompareExchange(&Verifier->Initialized, 1, 1) || Info == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (ImageBase == NULL || ImageSize == 0) {
+    if (ImageBase == NULL || ImageSize == 0 || ImageSize > BDV_MAX_IMAGE_SIZE) {
         return STATUS_INVALID_PARAMETER;
     }
 
     internal = CONTAINING_RECORD(Verifier, BDV_VERIFIER_INTERNAL, Public);
     *Info = NULL;
+
+    // Enforce verified list cap to prevent unbounded memory growth
+    if ((ULONG)InterlockedCompareExchange(&Verifier->VerifiedCount, 0, 0) >= BDV_MAX_VERIFIED_DRIVERS) {
+        return STATUS_QUOTA_EXCEEDED;
+    }
 
     // Allocate driver info from lookaside
     driverInfo = (PBDV_DRIVER_INFO)ExAllocateFromNPagedLookasideList(
@@ -925,45 +1048,41 @@ BdvVerifyDriver(
 
     RtlZeroMemory(driverInfo, sizeof(BDV_DRIVER_INFO));
 
-    // Copy driver path
-    if (DriverPath != NULL && DriverPath->Length > 0) {
-        driverInfo->DriverPath.Length = DriverPath->Length;
-        driverInfo->DriverPath.MaximumLength = DriverPath->MaximumLength;
-        driverInfo->DriverPath.Buffer = DriverPath->Buffer;
-
-        // Extract driver name from path
-        USHORT i;
-        USHORT lastSlash = 0;
-        for (i = 0; i < DriverPath->Length / sizeof(WCHAR); i++) {
-            if (DriverPath->Buffer[i] == L'\\' || DriverPath->Buffer[i] == L'/') {
-                lastSlash = i + 1;
-            }
-        }
-        if (lastSlash < DriverPath->Length / sizeof(WCHAR)) {
-            driverInfo->DriverName.Buffer = DriverPath->Buffer + lastSlash;
-            driverInfo->DriverName.Length = DriverPath->Length - (lastSlash * sizeof(WCHAR));
-            driverInfo->DriverName.MaximumLength = driverInfo->DriverName.Length;
+    // Deep-copy driver path (caller's buffer may be freed after return)
+    if (DriverPath != NULL && DriverPath->Length > 0 && DriverPath->Buffer != NULL) {
+        status = BdvpDeepCopyDriverPath(
+            DriverPath,
+            &driverInfo->DriverPath,
+            &driverInfo->DriverName
+            );
+        if (!NT_SUCCESS(status)) {
+            goto Cleanup;
         }
     }
 
-    // Calculate image hash (full file hash)
-    status = BdvpCalculateImageHash(ImageBase, ImageSize, driverInfo->ImageHash);
-    if (!NT_SUCCESS(status)) {
+    // All image access is wrapped in SEH to handle corrupted/unmapped images
+    __try {
+        // Calculate image hash (full file hash)
+        status = BdvpCalculateImageHash(ImageBase, ImageSize, driverInfo->ImageHash);
+        if (!NT_SUCCESS(status)) {
+            goto Cleanup;
+        }
+
+        // Calculate Authenticode hash
+        status = BdvpCalculateAuthenticodeHash(ImageBase, ImageSize, driverInfo->AuthentiCodeHash);
+        if (!NT_SUCCESS(status)) {
+            // Non-fatal — some drivers may not have valid Authenticode
+            RtlZeroMemory(driverInfo->AuthentiCodeHash, sizeof(driverInfo->AuthentiCodeHash));
+        }
+
+        // Extract certificate information
+        status = BdvpExtractCertificateInfo(ImageBase, ImageSize, driverInfo);
+        if (!NT_SUCCESS(status)) {
+            driverInfo->IsSigned = FALSE;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
         goto Cleanup;
-    }
-
-    // Calculate Authenticode hash
-    status = BdvpCalculateAuthenticodeHash(ImageBase, ImageSize, driverInfo->AuthentiCodeHash);
-    if (!NT_SUCCESS(status)) {
-        // Non-fatal - some drivers may not have valid Authenticode
-        RtlZeroMemory(driverInfo->AuthentiCodeHash, sizeof(driverInfo->AuthentiCodeHash));
-    }
-
-    // Extract certificate information
-    status = BdvpExtractCertificateInfo(ImageBase, ImageSize, driverInfo);
-    if (!NT_SUCCESS(status)) {
-        // Non-fatal
-        driverInfo->IsSigned = FALSE;
     }
 
     // Store file size
@@ -978,7 +1097,7 @@ BdvVerifyDriver(
     // Add to verified list
     KeAcquireSpinLock(&Verifier->VerifiedLock, &oldIrql);
     InsertTailList(&Verifier->VerifiedList, &driverInfo->ListEntry);
-    Verifier->VerifiedCount++;
+    InterlockedIncrement(&Verifier->VerifiedCount);
     KeReleaseSpinLock(&Verifier->VerifiedLock, oldIrql);
 
     // Update statistics
@@ -989,6 +1108,7 @@ BdvVerifyDriver(
 
 Cleanup:
     if (driverInfo != NULL) {
+        BdvpFreeDriverInfoPaths(driverInfo);
         ExFreeToNPagedLookasideList(&internal->DriverInfoLookaside, driverInfo);
     }
 
@@ -1135,15 +1255,37 @@ BdvAddKnownHash(
 
 /**
  * @brief Free a driver info structure
+ *
+ * Removes the entry from the VerifiedList under spinlock, frees the
+ * deep-copied path buffer, decrements the verified count, and returns
+ * the BDV_DRIVER_INFO to the lookaside list.
  */
 _Use_decl_annotations_
 VOID
 BdvFreeDriverInfo(
+    PBDV_VERIFIER Verifier,
     PBDV_DRIVER_INFO Info
     )
 {
-    // Note: Driver info is managed by lookaside lists in the verifier
-    // This function is provided for external callers who may have copied the info
-    // The actual list management is done in BdvShutdown
-    UNREFERENCED_PARAMETER(Info);
+    PBDV_VERIFIER_INTERNAL internal;
+    KIRQL oldIrql;
+
+    if (Verifier == NULL || Info == NULL) {
+        return;
+    }
+
+    internal = CONTAINING_RECORD(Verifier, BDV_VERIFIER_INTERNAL, Public);
+
+    // Remove from verified list under spinlock
+    KeAcquireSpinLock(&Verifier->VerifiedLock, &oldIrql);
+    RemoveEntryList(&Info->ListEntry);
+    InitializeListHead(&Info->ListEntry);
+    InterlockedDecrement(&Verifier->VerifiedCount);
+    KeReleaseSpinLock(&Verifier->VerifiedLock, oldIrql);
+
+    // Free deep-copied path buffer
+    BdvpFreeDriverInfoPaths(Info);
+
+    // Return to lookaside
+    ExFreeToNPagedLookasideList(&internal->DriverInfoLookaside, Info);
 }

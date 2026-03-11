@@ -66,7 +66,7 @@ typedef struct _BDV_DRIVER_INFO {
 } BDV_DRIVER_INFO, *PBDV_DRIVER_INFO;
 
 typedef struct _BDV_VERIFIER {
-    BOOLEAN Initialized;
+    volatile LONG Initialized;
     
     // Known good/bad lists
     LIST_ENTRY KnownGoodList;
@@ -76,9 +76,9 @@ typedef struct _BDV_VERIFIER {
     // Verified drivers
     LIST_ENTRY VerifiedList;
     KSPIN_LOCK VerifiedLock;
-    ULONG VerifiedCount;
+    volatile LONG VerifiedCount;
     
-    // ELAM config
+    // ELAM config (protected by ListLock)
     PVOID ELAMConfig;
     SIZE_T ELAMConfigSize;
     
@@ -98,7 +98,7 @@ NTSTATUS BdvLoadConfiguration(_In_ PBDV_VERIFIER Verifier, _In_ PVOID ConfigData
 NTSTATUS BdvVerifyDriver(_In_ PBDV_VERIFIER Verifier, _In_ PUNICODE_STRING DriverPath, _In_ PVOID ImageBase, _In_ SIZE_T ImageSize, _Out_ PBDV_DRIVER_INFO* Info);
 NTSTATUS BdvClassifyDriver(_In_ PBDV_VERIFIER Verifier, _In_ PBDV_DRIVER_INFO Info, _Out_ PBDV_CLASSIFICATION Classification);
 NTSTATUS BdvAddKnownHash(_In_ PBDV_VERIFIER Verifier, _In_ PUCHAR Hash, _In_ SIZE_T HashLength, _In_ BOOLEAN IsGood);
-VOID BdvFreeDriverInfo(_In_ PBDV_DRIVER_INFO Info);
+VOID BdvFreeDriverInfo(_In_ PBDV_VERIFIER Verifier, _In_ PBDV_DRIVER_INFO Info);
 
 #ifdef __cplusplus
 }

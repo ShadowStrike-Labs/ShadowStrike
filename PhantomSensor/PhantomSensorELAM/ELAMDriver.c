@@ -445,7 +445,7 @@ ElamImageLoadCallback(
         BtdFreeThreat(g_ThreatDetector, threat);
     }
     if (driverInfo != NULL) {
-        BdvFreeDriverInfo(driverInfo);
+        BdvFreeDriverInfo(g_BootVerifier, driverInfo);
     }
 }
 
