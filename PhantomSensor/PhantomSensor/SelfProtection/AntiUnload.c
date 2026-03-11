@@ -44,6 +44,32 @@
 #include "AntiUnload.h"
 #include <ntstrsafe.h>
 
+// ============================================================================
+// WDK KERNEL-MODE MISSING DECLARATIONS
+// ============================================================================
+
+NTKERNELAPI
+PCHAR
+PsGetProcessImageFileName(
+    _In_ PEPROCESS Process
+    );
+
+#ifndef PROCESS_TERMINATE
+#define PROCESS_TERMINATE           0x0001
+#endif
+#ifndef PROCESS_CREATE_THREAD
+#define PROCESS_CREATE_THREAD       0x0002
+#endif
+#ifndef PROCESS_VM_OPERATION
+#define PROCESS_VM_OPERATION        0x0008
+#endif
+#ifndef PROCESS_VM_WRITE
+#define PROCESS_VM_WRITE            0x0020
+#endif
+#ifndef PROCESS_SUSPEND_RESUME
+#define PROCESS_SUSPEND_RESUME      0x0800
+#endif
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, AuInitialize)
 #pragma alloc_text(PAGE, AuShutdown)
@@ -115,8 +141,8 @@ AupNotifyCallback(
 
 /**
  * Altitude for ObRegisterCallbacks.
- * NOTE: For production, register an official altitude with Microsoft.
- * This value is a placeholder that must be replaced before WHQL submission.
+ * This altitude must be registered with Microsoft before WHQL submission.
+ * See: https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/minifilter-altitude-request
  */
 static const WCHAR g_AltitudeBuffer[] = L"385201.1337";
 
@@ -984,6 +1010,8 @@ AupThreadPreCallback(
         goto done;
     }
 
+    InterlockedIncrement64(&protector->Stats.TotalAttempts);
+
     {
         ACCESS_MASK safe = originalAccess & ~stripped;
 
@@ -998,11 +1026,23 @@ AupThreadPreCallback(
 
     InterlockedIncrement64(&protector->Stats.AttemptsBlocked);
 
-    event = AupCreateEvent(
-        (stripped & THREAD_TERMINATE) ? AuAttempt_ThreadTerminate : AuAttempt_ThreadInject,
-        callerPid, ownerPid, TRUE);
-    if (event != NULL) {
-        AupAddEvent(protector, event);
+    {
+        AU_UNLOAD_ATTEMPT attemptType =
+            (stripped & THREAD_TERMINATE) ? AuAttempt_ThreadTerminate : AuAttempt_ThreadInject;
+
+#if DBG
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Blocked thread access: caller=%p owner=%p "
+                   "original=0x%X stripped=0x%X\n",
+                   callerPid, ownerPid, originalAccess, stripped);
+#endif
+
+        event = AupCreateEvent(attemptType, callerPid, ownerPid, TRUE);
+        if (event != NULL) {
+            AupAddEvent(protector, event);
+        }
+
+        AupNotifyCallback(protector, attemptType, callerPid);
     }
 
 done:
