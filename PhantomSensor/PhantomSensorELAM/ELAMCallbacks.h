@@ -91,13 +91,13 @@ typedef struct _EC_ELAM_CALLBACKS {
     } Stats;
 } EC_ELAM_CALLBACKS, *PEC_ELAM_CALLBACKS;
 
-NTSTATUS EcInitialize(_Out_ PEC_ELAM_CALLBACKS* Callbacks);
-VOID EcShutdown(_Inout_ PEC_ELAM_CALLBACKS Callbacks);
-NTSTATUS EcRegisterCallbacks(_In_ PEC_ELAM_CALLBACKS Callbacks);
-NTSTATUS EcUnregisterCallbacks(_In_ PEC_ELAM_CALLBACKS Callbacks);
-NTSTATUS EcSetUserCallback(_In_ PEC_ELAM_CALLBACKS Callbacks, _In_ EC_DRIVER_CALLBACK Callback, _In_opt_ PVOID Context);
-NTSTATUS EcSetPolicy(_In_ PEC_ELAM_CALLBACKS Callbacks, _In_ BOOLEAN BlockUnknown, _In_ BOOLEAN AllowUnsigned);
-NTSTATUS EcGetBootDrivers(_In_ PEC_ELAM_CALLBACKS Callbacks, _Out_writes_to_(Max, *Count) PEC_BOOT_DRIVER* Drivers, _In_ ULONG Max, _Out_ PULONG Count);
+NTSTATUS ElcbInitialize(_Out_ PEC_ELAM_CALLBACKS* Callbacks);
+VOID ElcbShutdown(_Inout_ PEC_ELAM_CALLBACKS Callbacks);
+NTSTATUS ElcbRegisterCallbacks(_In_ PEC_ELAM_CALLBACKS Callbacks);
+NTSTATUS ElcbUnregisterCallbacks(_In_ PEC_ELAM_CALLBACKS Callbacks);
+NTSTATUS ElcbSetUserCallback(_In_ PEC_ELAM_CALLBACKS Callbacks, _In_ EC_DRIVER_CALLBACK Callback, _In_opt_ PVOID Context);
+NTSTATUS ElcbSetPolicy(_In_ PEC_ELAM_CALLBACKS Callbacks, _In_ BOOLEAN BlockUnknown, _In_ BOOLEAN AllowUnsigned);
+NTSTATUS ElcbGetBootDrivers(_In_ PEC_ELAM_CALLBACKS Callbacks, _Out_writes_to_(Max, *Count) PEC_BOOT_DRIVER* Drivers, _In_ ULONG Max, _Out_ PULONG Count);
 
 // ============================================================================
 // INTERNAL API - Called by ELAMDriver.c
@@ -110,7 +110,7 @@ NTSTATUS EcGetBootDrivers(_In_ PEC_ELAM_CALLBACKS Callbacks, _Out_writes_to_(Max
 #define EC_BDCB_KNOWN_GOOD_IMAGE    1
 #define EC_BDCB_KNOWN_BAD_IMAGE     2
 
-NTSTATUS EcProcessBootDriver(
+NTSTATUS ElcbProcessBootDriver(
     _In_ PEC_ELAM_CALLBACKS Callbacks,
     _In_ PCUNICODE_STRING DriverPath,
     _In_opt_ PCUNICODE_STRING RegistryPath,
@@ -122,20 +122,20 @@ NTSTATUS EcProcessBootDriver(
     _Out_opt_ PBOOLEAN AllowDriver
     );
 
-NTSTATUS EcSetBootPhase(
+NTSTATUS ElcbSetBootPhase(
     _In_ PEC_ELAM_CALLBACKS Callbacks,
     _In_ EC_BOOT_PHASE Phase
     );
 
-EC_BOOT_PHASE EcGetBootPhase(
+EC_BOOT_PHASE ElcbGetBootPhase(
     _In_ PEC_ELAM_CALLBACKS Callbacks
     );
 
-BOOLEAN EcIsBootComplete(
+BOOLEAN ElcbIsBootComplete(
     _In_ PEC_ELAM_CALLBACKS Callbacks
     );
 
-NTSTATUS EcGetStatistics(
+NTSTATUS ElcbGetStatistics(
     _In_ PEC_ELAM_CALLBACKS Callbacks,
     _Out_ PLONG64 DriversProcessed,
     _Out_ PLONG64 DriversAllowed,

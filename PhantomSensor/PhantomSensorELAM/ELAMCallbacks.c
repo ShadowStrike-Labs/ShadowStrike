@@ -89,18 +89,18 @@ typedef struct _EC_ELAM_CALLBACKS_INTERNAL {
 // ============================================================================
 
 static PEC_BOOT_DRIVER_INTERNAL
-EcpAllocateBootDriver(
+ElcbpAllocateBootDriver(
     _In_ PEC_ELAM_CALLBACKS_INTERNAL Internal
     );
 
 static VOID
-EcpFreeBootDriver(
+ElcbpFreeBootDriver(
     _In_ PEC_ELAM_CALLBACKS_INTERNAL Internal,
     _In_ PEC_BOOT_DRIVER_INTERNAL Driver
     );
 
 static VOID
-EcpCopyUnicodeString(
+ElcbpCopyUnicodeString(
     _Out_ PUNICODE_STRING Dest,
     _In_ PWCHAR DestBuffer,
     _In_ ULONG DestBufferSize,
@@ -108,13 +108,13 @@ EcpCopyUnicodeString(
     );
 
 static PEC_BOOT_DRIVER_INTERNAL
-EcpFindDriverByPath(
+ElcbpFindDriverByPath(
     _In_ PEC_ELAM_CALLBACKS Callbacks,
     _In_ PCUNICODE_STRING DriverPath
     );
 
 static BOOLEAN
-EcpApplyPolicy(
+ElcbpApplyPolicy(
     _In_ PEC_ELAM_CALLBACKS Callbacks,
     _In_ PEC_BOOT_DRIVER_INTERNAL Driver
     );
@@ -127,7 +127,7 @@ EcpApplyPolicy(
  * @brief Allocate boot driver entry from lookaside
  */
 static PEC_BOOT_DRIVER_INTERNAL
-EcpAllocateBootDriver(
+ElcbpAllocateBootDriver(
     _In_ PEC_ELAM_CALLBACKS_INTERNAL Internal
     )
 {
@@ -152,7 +152,7 @@ EcpAllocateBootDriver(
  * @brief Free boot driver entry to lookaside
  */
 static VOID
-EcpFreeBootDriver(
+ElcbpFreeBootDriver(
     _In_ PEC_ELAM_CALLBACKS_INTERNAL Internal,
     _In_ PEC_BOOT_DRIVER_INTERNAL Driver
     )
@@ -166,7 +166,7 @@ EcpFreeBootDriver(
  * @brief Copy unicode string with bounds checking
  */
 static VOID
-EcpCopyUnicodeString(
+ElcbpCopyUnicodeString(
     _Out_ PUNICODE_STRING Dest,
     _In_ PWCHAR DestBuffer,
     _In_ ULONG DestBufferSize,
@@ -199,7 +199,7 @@ EcpCopyUnicodeString(
  * @brief Find driver entry by path
  */
 static PEC_BOOT_DRIVER_INTERNAL
-EcpFindDriverByPath(
+ElcbpFindDriverByPath(
     _In_ PEC_ELAM_CALLBACKS Callbacks,
     _In_ PCUNICODE_STRING DriverPath
     )
@@ -229,7 +229,7 @@ EcpFindDriverByPath(
  * @brief Apply policy to determine if driver should be allowed
  */
 static BOOLEAN
-EcpApplyPolicy(
+ElcbpApplyPolicy(
     _In_ PEC_ELAM_CALLBACKS Callbacks,
     _In_ PEC_BOOT_DRIVER_INTERNAL Driver
     )
@@ -282,7 +282,7 @@ EcpApplyPolicy(
  */
 _Use_decl_annotations_
 NTSTATUS
-EcInitialize(
+ElcbInitialize(
     PEC_ELAM_CALLBACKS* Callbacks
     )
 {
@@ -348,7 +348,7 @@ EcInitialize(
  */
 _Use_decl_annotations_
 VOID
-EcShutdown(
+ElcbShutdown(
     PEC_ELAM_CALLBACKS Callbacks
     )
 {
@@ -363,7 +363,7 @@ EcShutdown(
     internal = CONTAINING_RECORD(Callbacks, EC_ELAM_CALLBACKS_INTERNAL, Public);
 
     // Unregister callbacks first
-    EcUnregisterCallbacks(Callbacks);
+    ElcbUnregisterCallbacks(Callbacks);
 
     Callbacks->Initialized = FALSE;
 
@@ -372,7 +372,7 @@ EcShutdown(
     while (!IsListEmpty(&Callbacks->DriverList)) {
         entry = RemoveHeadList(&Callbacks->DriverList);
         driver = CONTAINING_RECORD(entry, EC_BOOT_DRIVER_INTERNAL, Public.ListEntry);
-        EcpFreeBootDriver(internal, driver);
+        ElcbpFreeBootDriver(internal, driver);
     }
     Callbacks->DriverCount = 0;
     ExReleasePushLockExclusive(&Callbacks->DriverLock);
@@ -393,11 +393,11 @@ EcShutdown(
  * Marks this subsystem as actively tracking boot drivers.
  * Actual kernel callback registration (PsSetLoadImageNotifyRoutine,
  * CmRegisterCallbackEx) is handled by ELAMDriver.c which calls
- * EcProcessBootDriver for each detected driver load.
+ * ElcbProcessBootDriver for each detected driver load.
  */
 _Use_decl_annotations_
 NTSTATUS
-EcRegisterCallbacks(
+ElcbRegisterCallbacks(
     PEC_ELAM_CALLBACKS Callbacks
     )
 {
@@ -425,7 +425,7 @@ EcRegisterCallbacks(
  */
 _Use_decl_annotations_
 NTSTATUS
-EcUnregisterCallbacks(
+ElcbUnregisterCallbacks(
     PEC_ELAM_CALLBACKS Callbacks
     )
 {
@@ -451,7 +451,7 @@ EcUnregisterCallbacks(
  */
 _Use_decl_annotations_
 NTSTATUS
-EcSetUserCallback(
+ElcbSetUserCallback(
     PEC_ELAM_CALLBACKS Callbacks,
     EC_DRIVER_CALLBACK Callback,
     PVOID Context
@@ -475,7 +475,7 @@ EcSetUserCallback(
  */
 _Use_decl_annotations_
 NTSTATUS
-EcSetPolicy(
+ElcbSetPolicy(
     PEC_ELAM_CALLBACKS Callbacks,
     BOOLEAN BlockUnknown,
     BOOLEAN AllowUnsigned
@@ -498,7 +498,7 @@ EcSetPolicy(
  */
 _Use_decl_annotations_
 NTSTATUS
-EcGetBootDrivers(
+ElcbGetBootDrivers(
     PEC_ELAM_CALLBACKS Callbacks,
     PEC_BOOT_DRIVER* Drivers,
     ULONG Max,
@@ -543,10 +543,10 @@ EcGetBootDrivers(
  *
  * Called by ELAMDriver's image load callback to track boot drivers.
  * Thread-safe: user callback is invoked outside the push lock to
- * prevent deadlock if the callback calls EcGetBootDrivers etc.
+ * prevent deadlock if the callback calls ElcbGetBootDrivers etc.
  */
 NTSTATUS
-EcProcessBootDriver(
+ElcbProcessBootDriver(
     _In_ PEC_ELAM_CALLBACKS Callbacks,
     _In_ PCUNICODE_STRING DriverPath,
     _In_opt_ PCUNICODE_STRING RegistryPath,
@@ -573,7 +573,7 @@ EcProcessBootDriver(
 
     ExAcquirePushLockExclusive(&Callbacks->DriverLock);
 
-    driver = EcpFindDriverByPath(Callbacks, DriverPath);
+    driver = ElcbpFindDriverByPath(Callbacks, DriverPath);
 
     if (driver == NULL) {
         if (Callbacks->DriverCount >= EC_MAX_BOOT_DRIVERS) {
@@ -581,13 +581,13 @@ EcProcessBootDriver(
             return STATUS_QUOTA_EXCEEDED;
         }
 
-        driver = EcpAllocateBootDriver(internal);
+        driver = ElcbpAllocateBootDriver(internal);
         if (driver == NULL) {
             ExReleasePushLockExclusive(&Callbacks->DriverLock);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        EcpCopyUnicodeString(
+        ElcbpCopyUnicodeString(
             &driver->Public.DriverPath,
             driver->DriverPathBuffer,
             sizeof(driver->DriverPathBuffer),
@@ -595,7 +595,7 @@ EcProcessBootDriver(
             );
 
         if (RegistryPath != NULL) {
-            EcpCopyUnicodeString(
+            ElcbpCopyUnicodeString(
                 &driver->Public.RegistryPath,
                 driver->RegistryPathBuffer,
                 sizeof(driver->RegistryPathBuffer),
@@ -618,7 +618,7 @@ EcProcessBootDriver(
     KeQuerySystemTimePrecise(&driver->LoadTime);
 
     // Apply policy
-    allow = EcpApplyPolicy(Callbacks, driver);
+    allow = ElcbpApplyPolicy(Callbacks, driver);
 
     // Update statistics
     InterlockedIncrement64(&Callbacks->Stats.DriversProcessed);
@@ -631,7 +631,7 @@ EcProcessBootDriver(
     //
     // Capture user callback and a snapshot of the driver's public state
     // BEFORE releasing the lock. This prevents deadlock: the user callback
-    // may call EcGetBootDrivers (which takes shared lock), and push locks
+    // may call ElcbGetBootDrivers (which takes shared lock), and push locks
     // are NOT re-entrant.
     //
     savedCallback = Callbacks->UserCallback;
@@ -682,7 +682,7 @@ EcProcessBootDriver(
  * @brief Update current boot phase
  */
 NTSTATUS
-EcSetBootPhase(
+ElcbSetBootPhase(
     _In_ PEC_ELAM_CALLBACKS Callbacks,
     _In_ EC_BOOT_PHASE Phase
     )
@@ -709,7 +709,7 @@ EcSetBootPhase(
  * @brief Get current boot phase
  */
 EC_BOOT_PHASE
-EcGetBootPhase(
+ElcbGetBootPhase(
     _In_ PEC_ELAM_CALLBACKS Callbacks
     )
 {
@@ -728,7 +728,7 @@ EcGetBootPhase(
  * @brief Check if boot is complete
  */
 BOOLEAN
-EcIsBootComplete(
+ElcbIsBootComplete(
     _In_ PEC_ELAM_CALLBACKS Callbacks
     )
 {
@@ -747,7 +747,7 @@ EcIsBootComplete(
  * @brief Get statistics
  */
 NTSTATUS
-EcGetStatistics(
+ElcbGetStatistics(
     _In_ PEC_ELAM_CALLBACKS Callbacks,
     _Out_ PLONG64 DriversProcessed,
     _Out_ PLONG64 DriversAllowed,
