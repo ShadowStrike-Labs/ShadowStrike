@@ -3747,3 +3747,31 @@ NfpDetectBeaconingPattern(
 
     return isBeaconing;
 }
+
+// ============================================================================
+// MODULE ACCESSOR FUNCTIONS
+// ============================================================================
+
+PC2_DETECTOR
+NfFilterGetC2Detector(
+    VOID
+    )
+{
+    return g_C2Detector;
+}
+
+PDNS_MONITOR
+NfFilterGetDnsMonitor(
+    VOID
+    )
+{
+    return g_DnsMonitor;
+}
+
+PNR_MANAGER
+NfFilterGetReputationManager(
+    VOID
+    )
+{
+    return g_ReputationManager;
+}

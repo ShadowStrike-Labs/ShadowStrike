@@ -646,4 +646,51 @@ NfFlowDeleteNotify(
     _In_ UINT64 flowContext
     );
 
+// ============================================================================
+// PUBLIC API - MODULE ACCESSORS
+// ============================================================================
+
+//
+// Opaque pointer forward declarations - avoids circular includes.
+//
+struct _C2_DETECTOR;
+struct _DNS_MONITOR;
+struct _NR_MANAGER;
+
+/**
+ * @brief Get the global C2 Detection instance.
+ *
+ * Returns the C2 detector initialized by NetworkFilter. May return NULL
+ * if initialization failed or NetworkFilter is not started.
+ *
+ * @return Pointer to C2 detector, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _C2_DETECTOR*
+NfFilterGetC2Detector(
+    VOID
+    );
+
+/**
+ * @brief Get the global DNS Monitor instance.
+ *
+ * @return Pointer to DNS monitor, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _DNS_MONITOR*
+NfFilterGetDnsMonitor(
+    VOID
+    );
+
+/**
+ * @brief Get the global Network Reputation Manager instance.
+ *
+ * @return Pointer to reputation manager, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _NR_MANAGER*
+NfFilterGetReputationManager(
+    VOID
+    );
+
 #endif // SHADOWSTRIKE_NETWORK_FILTER_H
