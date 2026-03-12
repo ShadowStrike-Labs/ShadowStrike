@@ -33,6 +33,7 @@
 #include "ClipboardMonitor.h"
 #include "../../Core/Globals.h"
 #include "../../Utilities/MemoryUtils.h"
+#include "../../Behavioral/BehaviorEngine.h"
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
@@ -335,6 +336,19 @@ CbMonCheckProcessCreate(
             "[ShadowStrike/ClipboardMonitor] T1115 indicator: PID=%lu, flags=0x%08X\n",
             HandleToULong(ProcessId),
             indicators);
+
+        //
+        // Submit clipboard abuse event to BehaviorEngine for kill-chain correlation.
+        //
+        (VOID)BeEngineSubmitEvent(
+            BehaviorEvent_ClipboardCommandLine,
+            BehaviorCategory_Collection,
+            HandleToULong(ProcessId),
+            NULL, 0,
+            50,
+            FALSE,
+            NULL
+            );
     }
 
     ExReleaseRundownProtection(&g_CbState.RundownRef);
@@ -408,6 +422,19 @@ CbMonCheckFileWrite(
                     HandleToULong(ProcessId),
                     count,
                     FileName);
+
+                //
+                // Submit rapid temp write event to BehaviorEngine.
+                //
+                (VOID)BeEngineSubmitEvent(
+                    BehaviorEvent_ClipboardRapidTempWrites,
+                    BehaviorCategory_Collection,
+                    HandleToULong(ProcessId),
+                    NULL, 0,
+                    65,
+                    FALSE,
+                    NULL
+                    );
             }
         }
     }

@@ -62,6 +62,7 @@
 #include "AlpcPortMonitor.h"
 #include "../Utilities/ProcessUtils.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Behavioral/BehaviorEngine.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -1252,6 +1253,19 @@ ShadowAlpcAnalyzeOperation(
             Context->SuspicionFlags |= AlpcSuspicionSandboxEscape;
             score += 40;
             InterlockedIncrement64(&state->Stats.SandboxEscapeAttempts);
+
+            //
+            // Submit sandbox escape event to BehaviorEngine.
+            //
+            (VOID)BeEngineSubmitEvent(
+                BehaviorEvent_SandboxEvasion,
+                BehaviorCategory_DefenseEvasion,
+                HandleToULong(Context->SourceProcessId),
+                NULL, 0,
+                80,
+                FALSE,
+                NULL
+                );
         }
     }
 
@@ -1721,6 +1735,19 @@ ShadowAlpcPortPreCallback(
 
             InterlockedIncrement64(&state->Stats.BlockedOperations);
             ShadowAlpcQueueEvent(AlpcEventSuspiciousAccess, &context, TRUE);
+
+            //
+            // Submit ALPC blocked operation event to BehaviorEngine.
+            //
+            (VOID)BeEngineSubmitEvent(
+                BehaviorEvent_NamedPipeBlocked,
+                BehaviorCategory_LateralMovement,
+                HandleToULong(context.SourceProcessId),
+                NULL, 0,
+                context.ThreatScore,
+                FALSE,
+                NULL
+                );
 
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                        "[ShadowStrike/ALPC] %s: PID %lu -> Port '%ws', Score=%lu\n",

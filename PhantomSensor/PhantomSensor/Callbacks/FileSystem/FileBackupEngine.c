@@ -55,6 +55,7 @@ Performance Safeguards:
 #include "FileBackupEngine.h"
 #include "../../Core/Globals.h"
 #include "../../Utilities/FileUtils.h"
+#include "../../Behavioral/BehaviorEngine.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -1109,6 +1110,19 @@ FbeRollbackProcess(
                Tracker->EntryCount,
                HandleToULong(ProcessId),
                Tracker->TotalBytesBackedUp);
+
+    //
+    // Submit ransomware rollback event to BehaviorEngine for kill-chain correlation.
+    //
+    (VOID)BeEngineSubmitEvent(
+        BehaviorEvent_FileRollbackStarted,
+        BehaviorCategory_Impact,
+        HandleToULong(ProcessId),
+        NULL, 0,
+        90,
+        FALSE,
+        NULL
+        );
 
     //
     // Two-phase rollback: collect entries under lock, process without lock.

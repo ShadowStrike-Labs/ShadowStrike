@@ -48,6 +48,7 @@ Security Hardening (WSL-1 through WSL-15):
 
 #include "WSLMonitor.h"
 #include "../../Core/Globals.h"
+#include "../../Behavioral/BehaviorEngine.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -365,6 +366,19 @@ WslMonCheckProcessCreate(
                            HandleToULong(ParentProcessId),
                            ParentType,
                            ImageFileName);
+
+                //
+                // Submit WSL container escape event to BehaviorEngine.
+                //
+                (VOID)BeEngineSubmitEvent(
+                    BehaviorEvent_WslContainerEscape,
+                    BehaviorCategory_DefenseEvasion,
+                    HandleToULong(ProcessId),
+                    NULL, 0,
+                    80,
+                    FALSE,
+                    NULL
+                    );
             } else {
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                            "[ShadowStrike/WSL] WSL child process spawned: "
@@ -585,6 +599,19 @@ WslMonCheckFileAccess(
                        "[ShadowStrike/WSL] CRITICAL: WSL credential access attempt! "
                        "PID=%lu, File=%wZ\n",
                        HandleToULong(ProcessId), FileName);
+
+            //
+            // Submit WSL credential access event to BehaviorEngine.
+            //
+            (VOID)BeEngineSubmitEvent(
+                BehaviorEvent_WslCredentialAccess,
+                BehaviorCategory_CredentialAccess,
+                HandleToULong(ProcessId),
+                NULL, 0,
+                85,
+                FALSE,
+                NULL
+                );
         }
 
         //
@@ -602,6 +629,19 @@ WslMonCheckFileAccess(
                            "[ShadowStrike/WSL] WSL driver directory access: "
                            "PID=%lu, File=%wZ\n",
                            HandleToULong(ProcessId), FileName);
+
+                //
+                // Submit WSL driver access event to BehaviorEngine.
+                //
+                (VOID)BeEngineSubmitEvent(
+                    BehaviorEvent_WslDriverAccess,
+                    BehaviorCategory_DefenseEvasion,
+                    HandleToULong(ProcessId),
+                    NULL, 0,
+                    60,
+                    FALSE,
+                    NULL
+                    );
             }
         }
 

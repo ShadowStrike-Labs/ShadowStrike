@@ -62,6 +62,7 @@ Performance Characteristics:
 #include "../../Shared/SharedDefs.h"
 #include "../../Shared/VerdictTypes.h"
 #include "../../Cache/ScanCache.h"
+#include "../../Behavioral/BehaviorEngine.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -1929,6 +1930,19 @@ Arguments:
                 ProcessContext->RecentModifications,
                 ProcessContext->RecentDeletions,
                 ProcessContext->RecentRenames
+                );
+
+            //
+            // Submit ransomware behavior event to BehaviorEngine for kill-chain correlation.
+            //
+            (VOID)BeEngineSubmitEvent(
+                BehaviorEvent_RansomwareBehavior,
+                BehaviorCategory_Impact,
+                HandleToULong(ProcessId),
+                NULL, 0,
+                90,
+                FALSE,
+                NULL
                 );
         }
     }
