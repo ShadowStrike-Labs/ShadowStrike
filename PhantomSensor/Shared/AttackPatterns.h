@@ -351,6 +351,7 @@ typedef enum _MITRE_TACTIC {
 #define MITRE_T1552_002          0x061002    // Credentials in Registry
 #define MITRE_T1552_003          0x061003    // Bash History
 #define MITRE_T1552_004          0x061004    // Private Keys
+#define MITRE_T1552_005          0x061005    // Cloud Instance Metadata API
 #define MITRE_T1552_006          0x061006    // Group Policy Preferences
 
 // ---------------------------------------------------------------------
@@ -532,6 +533,158 @@ typedef enum _MITRE_TACTIC {
 #define MITRE_T1496              0x05D8      // Resource Hijacking (Cryptomining)
 #define MITRE_T1489              0x05C9      // Service Stop
 #define MITRE_T1529              0x05F9      // System Shutdown/Reboot
+
+// ---------------------------------------------------------------------
+// Reconnaissance (TA0043)
+// ---------------------------------------------------------------------
+#define MITRE_T1595              0x063B      // Active Scanning
+#define MITRE_T1595_001          0x063B01    // Scanning IP Blocks
+#define MITRE_T1595_002          0x063B02    // Vulnerability Scanning
+#define MITRE_T1595_003          0x063B03    // Wordlist Scanning
+#define MITRE_T1592              0x0638      // Gather Victim Host Information
+#define MITRE_T1592_001          0x063801    // Hardware
+#define MITRE_T1592_002          0x063802    // Software
+#define MITRE_T1592_003          0x063803    // Firmware
+#define MITRE_T1592_004          0x063804    // Client Configurations
+#define MITRE_T1589              0x0635      // Gather Victim Identity Information
+#define MITRE_T1589_001          0x063501    // Credentials
+#define MITRE_T1589_002          0x063502    // Email Addresses
+#define MITRE_T1589_003          0x063503    // Employee Names
+#define MITRE_T1590              0x0636      // Gather Victim Network Information
+#define MITRE_T1590_001          0x063601    // Domain Properties
+#define MITRE_T1590_002          0x063602    // DNS
+#define MITRE_T1590_003          0x063603    // Network Trust Dependencies
+#define MITRE_T1590_004          0x063604    // Network Topology
+#define MITRE_T1590_005          0x063605    // IP Addresses
+#define MITRE_T1590_006          0x063606    // Network Security Appliances
+#define MITRE_T1591              0x0637      // Gather Victim Org Information
+#define MITRE_T1591_001          0x063701    // Determine Physical Locations
+#define MITRE_T1591_002          0x063702    // Business Relationships
+#define MITRE_T1591_003          0x063703    // Identify Business Tempo
+#define MITRE_T1591_004          0x063704    // Identify Roles
+#define MITRE_T1593              0x0639      // Search Open Websites/Domains
+#define MITRE_T1593_001          0x063901    // Social Media
+#define MITRE_T1593_002          0x063902    // Search Engines
+#define MITRE_T1593_003          0x063903    // Code Repositories
+#define MITRE_T1594              0x063A      // Search Victim-Owned Websites
+#define MITRE_T1596              0x063C      // Search Open Technical Databases
+#define MITRE_T1596_001          0x063C01    // DNS/Passive DNS
+#define MITRE_T1596_002          0x063C02    // WHOIS
+#define MITRE_T1596_003          0x063C03    // Digital Certificates
+#define MITRE_T1596_004          0x063C04    // CDNs
+#define MITRE_T1596_005          0x063C05    // Scan Databases
+#define MITRE_T1597              0x063D      // Search Closed Sources
+#define MITRE_T1597_001          0x063D01    // Threat Intel Vendors
+#define MITRE_T1597_002          0x063D02    // Purchase Technical Data
+#define MITRE_T1598              0x063E      // Phishing for Information
+#define MITRE_T1598_001          0x063E01    // Spearphishing Service
+#define MITRE_T1598_002          0x063E02    // Spearphishing Attachment
+#define MITRE_T1598_003          0x063E03    // Spearphishing Link
+#define MITRE_T1681              0x0691      // Search Threat Vendor Data (v18)
+
+// ---------------------------------------------------------------------
+// Resource Development (TA0042)
+// ---------------------------------------------------------------------
+#define MITRE_T1583              0x0633      // Acquire Infrastructure
+#define MITRE_T1583_001          0x063301    // Domains
+#define MITRE_T1583_002          0x063302    // DNS Server
+#define MITRE_T1583_003          0x063303    // Virtual Private Server
+#define MITRE_T1583_004          0x063304    // Server
+#define MITRE_T1583_005          0x063305    // Botnet
+#define MITRE_T1583_006          0x063306    // Web Services
+#define MITRE_T1584              0x0634      // Compromise Infrastructure
+#define MITRE_T1584_001          0x063401    // Domains
+#define MITRE_T1584_002          0x063402    // DNS Server
+#define MITRE_T1584_003          0x063403    // Virtual Private Server
+#define MITRE_T1584_004          0x063404    // Server
+#define MITRE_T1584_005          0x063405    // Botnet
+#define MITRE_T1584_006          0x063406    // Web Services
+#define MITRE_T1584_008          0x063408    // Network Devices
+#define MITRE_T1585              0x0631      // Establish Accounts
+#define MITRE_T1585_001          0x063101    // Social Media Accounts
+#define MITRE_T1585_002          0x063102    // Email Accounts
+#define MITRE_T1585_003          0x063103    // Cloud Accounts
+#define MITRE_T1586              0x0632      // Compromise Accounts
+#define MITRE_T1586_001          0x063201    // Social Media Accounts
+#define MITRE_T1586_002          0x063202    // Email Accounts
+#define MITRE_T1586_003          0x063203    // Cloud Accounts
+#define MITRE_T1587              0x062D      // Develop Capabilities
+#define MITRE_T1587_001          0x062D01    // Malware
+#define MITRE_T1587_002          0x062D02    // Code Signing Certificates
+#define MITRE_T1587_003          0x062D03    // Digital Certificates
+#define MITRE_T1587_004          0x062D04    // Exploits
+#define MITRE_T1588              0x062E      // Obtain Capabilities
+#define MITRE_T1588_001          0x062E01    // Malware
+#define MITRE_T1588_002          0x062E02    // Tool
+#define MITRE_T1588_003          0x062E03    // Code Signing Certificates
+#define MITRE_T1588_004          0x062E04    // Digital Certificates
+#define MITRE_T1588_005          0x062E05    // Exploits
+#define MITRE_T1588_006          0x062E06    // Vulnerabilities
+#define MITRE_T1608              0x0648      // Stage Capabilities
+#define MITRE_T1608_001          0x064801    // Upload Malware
+#define MITRE_T1608_002          0x064802    // Upload Tool
+#define MITRE_T1608_003          0x064803    // Install Digital Certificate
+#define MITRE_T1608_004          0x064804    // Drive-by Target
+#define MITRE_T1608_005          0x064805    // Link Target
+#define MITRE_T1608_006          0x064806    // SEO Poisoning
+#define MITRE_T1650              0x0672      // Acquire Access
+#define MITRE_T1672              0x0688      // Email Spoofing
+
+// ---------------------------------------------------------------------
+// New/Missing Techniques (ATT&CK v18 October 2025 + Coverage Gaps)
+// ---------------------------------------------------------------------
+#define MITRE_T1059_013          0x04130D    // Container CLI/API (v18)
+#define MITRE_T1213_006          0x04C506    // Databases (v18)
+#define MITRE_T1678              0x068E      // Delay Execution (v18)
+#define MITRE_T1546_018          0x060212    // Python Startup Hooks (v18)
+#define MITRE_T1562_013          0x061A0D    // Disable or Modify Network Device Firewall (v18)
+#define MITRE_T1680              0x0690      // Local Storage Discovery (v18)
+#define MITRE_T1036_012          0x03FC0C    // Browser Fingerprint (v18)
+#define MITRE_T1677              0x068D      // Poisoned Pipeline Execution (v18)
+#define MITRE_T1679              0x068F      // Selective Exclusion (v18)
+#define MITRE_T1518_002          0x05EE02    // Backup Software Discovery (v18)
+#define MITRE_T1204_005          0x04B405    // Malicious Library (v18)
+#define MITRE_T1136              0x0538      // Create Account
+#define MITRE_T1136_001          0x053801    // Local Account
+#define MITRE_T1136_002          0x053802    // Domain Account
+#define MITRE_T1136_003          0x053803    // Cloud Account
+#define MITRE_T1098_001          0x043A01    // Additional Cloud Credentials
+#define MITRE_T1098_003          0x043A03    // Additional Cloud Roles
+#define MITRE_T1098_004          0x043A04    // SSH Authorized Keys
+#define MITRE_T1098_005          0x043A05    // Device Registration
+#define MITRE_T1098_007          0x043A07    // Additional Local or Domain Groups
+#define MITRE_T1554              0x060A      // Compromise Host Software Binary
+#define MITRE_T1609              0x0649      // Container Administration Command
+#define MITRE_T1612              0x064C      // Build Image on Host
+#define MITRE_T1619              0x0653      // Cloud Storage Object Discovery
+#define MITRE_T1665              0x0681      // Hide Infrastructure
+#define MITRE_T1176              0x04A8      // Software Extensions
+#define MITRE_T1176_001          0x04A801    // Browser Extensions
+#define MITRE_T1599              0x063F      // Network Boundary Bridging
+#define MITRE_T1599_001          0x063F01    // Network Address Translation Traversal
+#define MITRE_T1016_001          0x03F001    // Internet Connection Discovery
+#define MITRE_T1016_002          0x03F002    // Wi-Fi Discovery
+#define MITRE_T1557_003          0x061503    // DHCP Spoofing
+#define MITRE_T1557_004          0x061504    // Evil Twin
+#define MITRE_T1071_005          0x030705    // Publish/Subscribe Protocols
+#define MITRE_T1204_004          0x04B404    // Malicious Copy and Paste
+#define MITRE_T1070_010          0x03060A    // Relocate Malware
+#define MITRE_T1027_011          0x03F30B    // Fileless Storage
+#define MITRE_T1547_003          0x060303    // Time Providers
+#define MITRE_T1547_007          0x060307    // Re-opened Applications
+#define MITRE_T1547_008          0x060308    // LSASS Driver
+#define MITRE_T1547_013          0x06030D    // XDG Autostart Entries
+#define MITRE_T1547_015          0x06030F    // Login Items
+#define MITRE_T1548_001          0x060401    // Setuid and Setgid
+#define MITRE_T1548_004          0x060404    // Elevated Execution with Prompt
+#define MITRE_T1059_002          0x041302    // AppleScript
+#define MITRE_T1059_004          0x041304    // Unix Shell
+#define MITRE_T1543_001          0x05FF01    // Launch Agent
+#define MITRE_T1543_004          0x05FF04    // Launch Daemon
+#define MITRE_T1037_002          0x03FD02    // Login Hook
+#define MITRE_T1037_003          0x03FD03    // Network Logon Script
+#define MITRE_T1037_004          0x03FD04    // RC Scripts
+#define MITRE_T1037_005          0x03FD05    // Startup Items
 
 // ============================================================================
 // ATTACK PATTERN STRUCTURES
