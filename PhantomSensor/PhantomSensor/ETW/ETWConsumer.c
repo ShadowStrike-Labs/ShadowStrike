@@ -44,6 +44,7 @@
  * ============================================================================
  */
 
+#include <initguid.h>
 #include "ETWConsumer.h"
 #include "TelemetryEvents.h"
 

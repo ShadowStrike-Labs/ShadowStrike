@@ -289,10 +289,10 @@ SbpSafeAddUlong(
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, ShadowStrikeScanBridgeInitialize)
 #pragma alloc_text(PAGE, ShadowStrikeScanBridgeShutdown)
-#pragma alloc_text(PAGE, ShadowStrikeBuildFileScanRequest)
-#pragma alloc_text(PAGE, ShadowStrikeBuildFileScanRequestEx)
-#pragma alloc_text(PAGE, ShadowStrikeSendScanRequest)
-#pragma alloc_text(PAGE, ShadowStrikeSendScanRequestEx)
+#pragma alloc_text(PAGE, SbBuildFileScanRequest)
+#pragma alloc_text(PAGE, SbBuildFileScanRequestEx)
+#pragma alloc_text(PAGE, SbSendScanRequest)
+#pragma alloc_text(PAGE, SbSendScanRequestEx)
 #pragma alloc_text(PAGE, ShadowStrikeSendProcessEvent)
 #pragma alloc_text(PAGE, ShadowStrikeSendThreadNotification)
 #pragma alloc_text(PAGE, ShadowStrikeSendImageNotification)
@@ -538,7 +538,7 @@ ShadowStrikeScanBridgeShutdown(
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
-ShadowStrikeBuildFileScanRequest(
+SbBuildFileScanRequest(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ SHADOWSTRIKE_ACCESS_TYPE AccessType,
@@ -548,7 +548,7 @@ ShadowStrikeBuildFileScanRequest(
 {
     PAGED_CODE();
 
-    return ShadowStrikeBuildFileScanRequestEx(
+    return SbBuildFileScanRequestEx(
         Data,
         FltObjects,
         AccessType,
@@ -561,7 +561,7 @@ ShadowStrikeBuildFileScanRequest(
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
-ShadowStrikeBuildFileScanRequestEx(
+SbBuildFileScanRequestEx(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ SHADOWSTRIKE_ACCESS_TYPE AccessType,
@@ -718,7 +718,7 @@ ShadowStrikeBuildFileScanRequestEx(
     //
     // Allocate message buffer
     //
-    header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(totalSize);
+    header = (PSHADOWSTRIKE_MESSAGE_HEADER)SbAllocateMessageBuffer(totalSize);
     if (header == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto Cleanup;
@@ -841,7 +841,7 @@ Cleanup:
     }
 
     if (!NT_SUCCESS(status) && header != NULL) {
-        ShadowStrikeFreeMessageBuffer(header);
+        SbFreeMessageBuffer(header);
     }
 
     SbpReleaseRundownProtection();
@@ -852,7 +852,7 @@ Cleanup:
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
-ShadowStrikeSendScanRequest(
+SbSendScanRequest(
     _In_ PSHADOWSTRIKE_MESSAGE_HEADER Request,
     _In_ ULONG RequestSize,
     _Out_ PSHADOWSTRIKE_SCAN_VERDICT_REPLY Reply,
@@ -889,7 +889,7 @@ ShadowStrikeSendScanRequest(
     //
     // Send with extended options
     //
-    status = ShadowStrikeSendScanRequestEx(Request, RequestSize, &options, &result);
+    status = SbSendScanRequestEx(Request, RequestSize, &options, &result);
 
     if (NT_SUCCESS(status)) {
         //
@@ -909,7 +909,7 @@ ShadowStrikeSendScanRequest(
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
-ShadowStrikeSendScanRequestEx(
+SbSendScanRequestEx(
     _In_ PSHADOWSTRIKE_MESSAGE_HEADER Request,
     _In_ ULONG RequestSize,
     _In_opt_ PSB_SCAN_OPTIONS Options,
@@ -1144,7 +1144,7 @@ ShadowStrikeSendProcessEvent(
     //
     // Allocate message buffer from lookaside list
     //
-    header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(totalSize);
+    header = (PSHADOWSTRIKE_MESSAGE_HEADER)SbAllocateMessageBuffer(totalSize);
     if (header == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1159,7 +1159,7 @@ ShadowStrikeSendProcessEvent(
     );
 
     if (!NT_SUCCESS(status)) {
-        ShadowStrikeFreeMessageBuffer(header);
+        SbFreeMessageBuffer(header);
         return status;
     }
 
@@ -1221,7 +1221,7 @@ ShadowStrikeSendProcessEvent(
     //
     // Free message buffer back to lookaside list
     //
-    ShadowStrikeFreeMessageBuffer(header);
+    SbFreeMessageBuffer(header);
 
     return status;
 }
@@ -1266,7 +1266,7 @@ ShadowStrikeSendThreadNotification(
     //
     // Allocate message buffer
     //
-    header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(totalSize);
+    header = (PSHADOWSTRIKE_MESSAGE_HEADER)SbAllocateMessageBuffer(totalSize);
     if (header == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1281,7 +1281,7 @@ ShadowStrikeSendThreadNotification(
     );
 
     if (!NT_SUCCESS(status)) {
-        ShadowStrikeFreeMessageBuffer(header);
+        SbFreeMessageBuffer(header);
         return status;
     }
 
@@ -1313,7 +1313,7 @@ ShadowStrikeSendThreadNotification(
         InterlockedIncrement64(&g_ScanBridge.Stats.ThreadNotifications);
     }
 
-    ShadowStrikeFreeMessageBuffer(header);
+    SbFreeMessageBuffer(header);
 
     return status;
 }
@@ -1387,7 +1387,7 @@ ShadowStrikeSendImageNotification(
     //
     // Allocate message buffer
     //
-    header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(totalSize);
+    header = (PSHADOWSTRIKE_MESSAGE_HEADER)SbAllocateMessageBuffer(totalSize);
     if (header == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1402,7 +1402,7 @@ ShadowStrikeSendImageNotification(
     );
 
     if (!NT_SUCCESS(status)) {
-        ShadowStrikeFreeMessageBuffer(header);
+        SbFreeMessageBuffer(header);
         return status;
     }
 
@@ -1462,7 +1462,7 @@ ShadowStrikeSendImageNotification(
         InterlockedIncrement64(&g_ScanBridge.Stats.ImageNotifications);
     }
 
-    ShadowStrikeFreeMessageBuffer(header);
+    SbFreeMessageBuffer(header);
 
     return status;
 }
@@ -1551,7 +1551,7 @@ ShadowStrikeSendRegistryNotification(
     //
     // Allocate message buffer
     //
-    header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(totalSize);
+    header = (PSHADOWSTRIKE_MESSAGE_HEADER)SbAllocateMessageBuffer(totalSize);
     if (header == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1566,7 +1566,7 @@ ShadowStrikeSendRegistryNotification(
     );
 
     if (!NT_SUCCESS(status)) {
-        ShadowStrikeFreeMessageBuffer(header);
+        SbFreeMessageBuffer(header);
         return status;
     }
 
@@ -1641,7 +1641,7 @@ ShadowStrikeSendRegistryNotification(
         InterlockedIncrement64(&g_ScanBridge.Stats.RegistryNotifications);
     }
 
-    ShadowStrikeFreeMessageBuffer(header);
+    SbFreeMessageBuffer(header);
 
     return status;
 }
@@ -1758,7 +1758,7 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
 _Ret_maybenull_
 PVOID
-ShadowStrikeAllocateMessageBuffer(
+SbAllocateMessageBuffer(
     _In_ ULONG Size
 )
 {
@@ -1868,7 +1868,7 @@ ShadowStrikeAllocateMessageBuffer(
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
-ShadowStrikeFreeMessageBuffer(
+SbFreeMessageBuffer(
     _In_opt_ PVOID Buffer
 )
 {

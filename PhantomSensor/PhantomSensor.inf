@@ -1,9 +1,14 @@
 ;
 ; PhantomSensor.inf
 ;
-; ShadowStrike NGAV Minifilter Driver Installation
+; ShadowStrike PhantomSensor - NGAV File System Minifilter Driver
 ;
-; Copyright (c) 2026 ShadowStrike Security. All rights reserved.
+; Copyright (c) ShadowStrike Security. All rights reserved.
+;
+; This INF installs PhantomSensor as a file system minifilter using the
+; driver store (DIRID 13). Compatible with Windows 10 version 1803+.
+;
+; Architecture: x64 and ARM64 (Universal driver).
 ;
 
 [Version]
@@ -12,91 +17,101 @@ Class       = "AntiVirus"
 ClassGuid   = {b1d1a169-c54f-4379-81db-bee7d88d7454}
 Provider    = %ManufacturerName%
 CatalogFile = PhantomSensor.cat
-DriverVer   = 02/13/2026,3.0.0.0
+DriverVer   = 03/12/2026,17.1.0.0
 PnpLockdown = 1
 
+; ---------------------------------------------------------------------------
+; Destination: Driver Store (DIRID 13)
+; Files are served directly from the driver store — no CopyFiles required.
+; ---------------------------------------------------------------------------
+
 [DestinationDirs]
-DefaultDestDir          = 13
-PhantomSensor.CopyFiles  = 13
+DefaultDestDir = 13
 
 [SourceDisksNames]
-1 = %DiskName%,,,""
+1 = %DiskName%
 
 [SourceDisksFiles]
-PhantomSensor.sys = 1,,
+PhantomSensor.sys = 1
 
-;*****************************************
-; Default Install Sections
-;*****************************************
+; ---------------------------------------------------------------------------
+; Install Sections (x64)
+; ---------------------------------------------------------------------------
 
 [DefaultInstall.NTAMD64]
-OptionDesc = %PhantomSensor.SVCDESC%
-CopyFiles  = PhantomSensor.CopyFiles
+OptionDesc = %ServiceDescription%
 
 [DefaultInstall.NTAMD64.Services]
 AddService = %ServiceName%,,PhantomSensor.Service
 
-;*****************************************
-; Default Uninstall Sections
-;*****************************************
+; ---------------------------------------------------------------------------
+; Install Sections (ARM64)
+; ---------------------------------------------------------------------------
+
+[DefaultInstall.NTARM64]
+OptionDesc = %ServiceDescription%
+
+[DefaultInstall.NTARM64.Services]
+AddService = %ServiceName%,,PhantomSensor.Service
+
+; ---------------------------------------------------------------------------
+; Uninstall Sections (x64)
+; ---------------------------------------------------------------------------
 
 [DefaultUninstall.NTAMD64]
-DelFiles   = PhantomSensor.CopyFiles
 LegacyUninstall = 1
 
 [DefaultUninstall.NTAMD64.Services]
 DelService = %ServiceName%,0x200
 
-;*****************************************
-; File Copy Section
-;*****************************************
+; ---------------------------------------------------------------------------
+; Uninstall Sections (ARM64)
+; ---------------------------------------------------------------------------
 
-[PhantomSensor.CopyFiles]
-PhantomSensor.sys
+[DefaultUninstall.NTARM64]
+LegacyUninstall = 1
 
-;*****************************************
-; Service Installation
-;*****************************************
+[DefaultUninstall.NTARM64.Services]
+DelService = %ServiceName%,0x200
+
+; ---------------------------------------------------------------------------
+; Service Configuration
+; ---------------------------------------------------------------------------
 
 [PhantomSensor.Service]
-DisplayName    = %PhantomSensor.SVCDESC%
-Description    = %PhantomSensor.Description%
-ServiceType    = 2                  ; SERVICE_FILE_SYSTEM_DRIVER
-StartType      = 3                  ; SERVICE_DEMAND_START
-ErrorControl   = 1                  ; SERVICE_ERROR_NORMAL
+DisplayName    = %ServiceDisplayName%
+Description    = %ServiceDescription%
+ServiceType    = 2               ; SERVICE_FILE_SYSTEM_DRIVER
+StartType      = 1               ; SERVICE_SYSTEM_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %13%\PhantomSensor.sys
-LoadOrderGroup = "FSFilter Anti-Virus"
+LoadOrderGroup = FSFilter Anti-Virus
 AddReg         = PhantomSensor.AddRegistry
 
-;*****************************************
+; ---------------------------------------------------------------------------
 ; Minifilter Instance Registration
-;*****************************************
+;
+; The altitude places PhantomSensor in the FSFilter Anti-Virus load order group.
+; NOTE: For production WHQL submission, request a dedicated altitude from
+; Microsoft via the minifilter altitude allocation process at:
+;   https://learn.microsoft.com/windows-hardware/drivers/ifs/minifilter-altitude-request
+; ---------------------------------------------------------------------------
 
 [PhantomSensor.AddRegistry]
-HKR,"Instances","DefaultInstance",0,%DefaultInstance%
-HKR,"Instances\%DefaultInstance%","Altitude",0,%Altitude%
-HKR,"Instances\%DefaultInstance%","Flags",0x00010001,%Flags%
+HKR,"Parameters\Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Parameters\Instances\%DefaultInstance%","Altitude",0x00000000,%Altitude%
+HKR,"Parameters\Instances\%DefaultInstance%","Flags",0x00010001,%Flags%
 
-;*****************************************
-; WDF Section (KMDF)
-;*****************************************
-
-[PhantomSensor.Wdf]
-KmdfService = %ServiceName%, PhantomSensor_wdfsect
-
-[PhantomSensor_wdfsect]
-KmdfLibraryVersion = $KMDFVERSION$
-
-;*****************************************
+; ---------------------------------------------------------------------------
 ; Strings
-;*****************************************
+; ---------------------------------------------------------------------------
 
 [Strings]
-ManufacturerName        = "ShadowStrike Security"
-ServiceName             = "PhantomSensor"
-DiskName                = "ShadowStrike PhantomSensor Installation Disk"
-PhantomSensor.SVCDESC    = "ShadowStrike NGAV Sensor"
-PhantomSensor.Description = "ShadowStrike Next-Generation AntiVirus kernel sensor for real-time threat detection and prevention"
-DefaultInstance         = "PhantomSensor Instance"
-Altitude                = "385210"
-Flags                   = 0x0
+ManufacturerName   = "ShadowStrike Security"
+ServiceName        = "PhantomSensor"
+ServiceDisplayName = "ShadowStrike PhantomSensor"
+ServiceDescription = "ShadowStrike Next-Generation AntiVirus kernel sensor for real-time threat detection, ransomware protection, and endpoint security"
+DiskName           = "ShadowStrike PhantomSensor Installation Disk"
+DefaultInstance    = "PhantomSensor Instance"
+Altitude           = "385210"
+Flags              = 0x0

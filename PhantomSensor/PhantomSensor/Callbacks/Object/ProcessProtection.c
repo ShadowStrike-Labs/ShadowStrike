@@ -2308,7 +2308,7 @@ Routine Description:
 
 _Use_decl_annotations_
 NTSTATUS
-PpGetStatistics(
+PpProtGetStatistics(
     _Out_opt_ PULONG64 TotalOperations,
     _Out_opt_ PULONG64 AccessStripped,
     _Out_opt_ PULONG64 CredentialAccessAttempts,
@@ -2952,18 +2952,5 @@ Routine Description:
 
 
 // ============================================================================
-// LEGACY COMPATIBILITY
-// ============================================================================
-
-/*
- * The existing ObjectCallback.c calls ShadowStrikeProcessPreCallback.
- * We provide this as a wrapper that delegates to our enterprise implementation.
- */
-OB_PREOP_CALLBACK_STATUS
-ShadowStrikeProcessPreCallback(
-    _In_ PVOID RegistrationContext,
-    _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
-    )
-{
-    return PpProcessHandlePreCallback(RegistrationContext, OperationInformation);
-}
+// Legacy wrapper ShadowStrikeProcessPreCallback removed — canonical
+// implementation is in ObjectCallback.c

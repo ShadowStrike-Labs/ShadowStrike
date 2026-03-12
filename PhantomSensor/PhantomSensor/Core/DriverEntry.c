@@ -60,6 +60,8 @@
 #include "../Callbacks/Process/AppControl.h"
 #include "../SelfProtection/FirmwareIntegrity.h"
 #include "../Callbacks/Process/ClipboardMonitor.h"
+#include "../Callbacks/Object/ObjectCallback.h"
+#include "../Callbacks/Process/ProcessNotify.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, DriverEntry)
@@ -70,10 +72,7 @@
 #pragma alloc_text(PAGE, ShadowStrikeCleanupLookasideLists)
 #pragma alloc_text(PAGE, ShadowStrikeRegisterProcessCallbacks)
 #pragma alloc_text(PAGE, ShadowStrikeUnregisterProcessCallbacks)
-#pragma alloc_text(PAGE, ShadowStrikeRegisterRegistryCallback)
-#pragma alloc_text(PAGE, ShadowStrikeUnregisterRegistryCallback)
-#pragma alloc_text(PAGE, ShadowStrikeRegisterObjectCallbacks)
-#pragma alloc_text(PAGE, ShadowStrikeUnregisterObjectCallbacks)
+
 #pragma alloc_text(PAGE, ShadowStrikeCleanupByFlags)
 #pragma alloc_text(PAGE, ShadowStrikeWaitForRundownComplete)
 #endif
@@ -971,132 +970,7 @@ ShadowStrikeUnregisterProcessCallbacks(
     }
 }
 
-// ============================================================================
-// REGISTRY CALLBACK REGISTRATION
-// ============================================================================
 
-NTSTATUS
-ShadowStrikeRegisterRegistryCallback(
-    _In_ PDRIVER_OBJECT DriverObject
-    )
-{
-    NTSTATUS status;
-    UNICODE_STRING altitude;
-
-    UNREFERENCED_PARAMETER(DriverObject);
-
-    PAGED_CODE();
-
-    RtlInitUnicodeString(&altitude, SHADOWSTRIKE_ALTITUDE_W);
-
-    status = CmRegisterCallbackEx(
-        ShadowStrikeRegistryCallbackRoutine,
-        &altitude,
-        g_DriverData.DriverObject,
-        NULL,                                   // Context
-        &g_DriverData.RegistryCallbackCookie,
-        NULL                                    // Reserved
-    );
-
-    if (NT_SUCCESS(status)) {
-        ShadowStrikeLogInitStatus("Registry Callback", status);
-    } else {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] CmRegisterCallbackEx failed: 0x%08X\n",
-                   status);
-    }
-
-    return status;
-}
-
-VOID
-ShadowStrikeUnregisterRegistryCallback(
-    VOID
-    )
-{
-    PAGED_CODE();
-
-    if (g_DriverData.RegistryCallbackCookie.QuadPart != 0) {
-        CmUnRegisterCallback(g_DriverData.RegistryCallbackCookie);
-        g_DriverData.RegistryCallbackCookie.QuadPart = 0;
-    }
-}
-
-// ============================================================================
-// OBJECT CALLBACK REGISTRATION (SELF-PROTECTION)
-// ============================================================================
-
-/**
- * @brief Object operation registrations.
- *
- * CRITICAL FIX: ObjectType pointers are initialized at RUNTIME,
- * not compile time, because PsProcessType/PsThreadType are
- * runtime-resolved pointers.
- */
-static OB_OPERATION_REGISTRATION g_ObjectOperations[2];
-
-NTSTATUS
-ShadowStrikeRegisterObjectCallbacks(
-    VOID
-    )
-{
-    NTSTATUS status;
-    OB_CALLBACK_REGISTRATION callbackReg;
-    UNICODE_STRING altitude;
-
-    PAGED_CODE();
-
-    //
-    // Initialize operation registrations at RUNTIME
-    // PsProcessType and PsThreadType are pointers resolved at runtime
-    //
-    RtlZeroMemory(g_ObjectOperations, sizeof(g_ObjectOperations));
-
-    g_ObjectOperations[0].ObjectType = PsProcessType;
-    g_ObjectOperations[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
-    g_ObjectOperations[0].PreOperation = ShadowStrikeObjectPreCallback;
-    g_ObjectOperations[0].PostOperation = NULL;
-
-    g_ObjectOperations[1].ObjectType = PsThreadType;
-    g_ObjectOperations[1].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
-    g_ObjectOperations[1].PreOperation = ShadowStrikeObjectPreCallback;
-    g_ObjectOperations[1].PostOperation = NULL;
-
-    RtlInitUnicodeString(&altitude, SHADOWSTRIKE_ALTITUDE_W);
-
-    RtlZeroMemory(&callbackReg, sizeof(callbackReg));
-    callbackReg.Version = OB_FLT_REGISTRATION_VERSION;
-    callbackReg.OperationRegistrationCount = 2;
-    callbackReg.Altitude = altitude;
-    callbackReg.RegistrationContext = NULL;
-    callbackReg.OperationRegistration = g_ObjectOperations;
-
-    status = ObRegisterCallbacks(&callbackReg, &g_DriverData.ObjectCallbackHandle);
-
-    if (NT_SUCCESS(status)) {
-        ShadowStrikeLogInitStatus("Object Callbacks", status);
-    } else {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] ObRegisterCallbacks failed: 0x%08X\n",
-                   status);
-        g_DriverData.ObjectCallbackHandle = NULL;
-    }
-
-    return status;
-}
-
-VOID
-ShadowStrikeUnregisterObjectCallbacks(
-    VOID
-    )
-{
-    PAGED_CODE();
-
-    if (g_DriverData.ObjectCallbackHandle != NULL) {
-        ObUnRegisterCallbacks(g_DriverData.ObjectCallbackHandle);
-        g_DriverData.ObjectCallbackHandle = NULL;
-    }
-}
 
 // ============================================================================
 // PROTECTED PROCESS LIST MANAGEMENT
@@ -1282,127 +1156,7 @@ ShadowStrikeCleanupByFlags(
 // CALLBACK IMPLEMENTATIONS
 // ============================================================================
 
-/**
- * @brief Process creation/termination notification callback.
- *
- * This is a FULL IMPLEMENTATION, not a stub.
- * Uses proper rundown protection for safe unload.
- */
-VOID
-ShadowStrikeProcessNotifyCallback(
-    _Inout_ PEPROCESS Process,
-    _In_ HANDLE ProcessId,
-    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
-    )
-{
-    BOOLEAN isProtectedProcess = FALSE;
-    HANDLE parentPid = NULL;
-    PCUNICODE_STRING imagePath = NULL;
-    PCUNICODE_STRING commandLine = NULL;
 
-    //
-    // Check if driver is ready and acquire rundown protection
-    //
-    if (!SHADOWSTRIKE_IS_READY()) {
-        return;
-    }
-
-    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {
-        // Driver is unloading, do not proceed
-        return;
-    }
-
-    SHADOWSTRIKE_COUNT_OPERATION();
-
-    if (CreateInfo != NULL) {
-        //
-        // Process creation
-        //
-        InterlockedIncrement64(&g_DriverData.Stats.TotalProcessCreations);
-
-        parentPid = CreateInfo->ParentProcessId;
-        imagePath = CreateInfo->ImageFileName;
-        commandLine = CreateInfo->CommandLine;
-
-        //
-        // Check if this is our own service process registering for protection
-        //
-        if (imagePath != NULL && imagePath->Buffer != NULL) {
-            //
-            // Check if this is our protected service (ShadowStrikeService)
-            //
-            if (wcsstr(imagePath->Buffer, L"ShadowStrikeService") != NULL ||
-                wcsstr(imagePath->Buffer, L"ShadowStrikeSvc") != NULL) {
-
-                //
-                // Auto-protect our own service
-                //
-                NTSTATUS protectStatus = ShadowStrikeProtectProcess(
-                    ProcessId,
-                    ProtectionFlagFull | ProtectionFlagIsPrimaryService,
-                    imagePath->Buffer
-                );
-
-                if (NT_SUCCESS(protectStatus)) {
-                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                               "[ShadowStrike] Auto-protected service process PID=%p\n",
-                               ProcessId);
-                }
-            }
-        }
-
-        //
-        // Log process creation (send to user-mode for analysis via CommPort when connected)
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                   "[ShadowStrike] Process created: PID=%p, ParentPID=%p, Image=%wZ\n",
-                   ProcessId, parentPid, imagePath);
-
-        //
-        // If user-mode agent is connected, notify for advanced analysis.
-        // The user-mode agent performs: signature verification, reputation lookup,
-        // behavioral pre-analysis, and returns a verdict via CommPort reply.
-        // Verdict-based blocking sets CreateInfo->CreationStatus = STATUS_ACCESS_DENIED.
-        //
-        if (SHADOWSTRIKE_USER_MODE_CONNECTED() && g_DriverData.Config.ProcessMonitorEnabled) {
-            //
-            // NOTE: User-mode verdict integration pending CommPort wiring.
-            // When wired, the flow is:
-            //   ShadowStrikeSendProcessNotification() -> user-mode analysis -> verdict reply
-            //   On block verdict: CreateInfo->CreationStatus = STATUS_ACCESS_DENIED
-            //
-            SHADOWSTRIKE_INC_STAT(TotalProcessCreations);
-        }
-
-    } else {
-        //
-        // Process termination
-        //
-
-        //
-        // Check if terminating process was protected
-        //
-        isProtectedProcess = ShadowStrikeIsProcessProtected(ProcessId, NULL);
-
-        if (isProtectedProcess) {
-            //
-            // Remove from protection list
-            //
-            ShadowStrikeUnprotectProcess(ProcessId);
-
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                       "[ShadowStrike] Protected process terminated: PID=%p\n",
-                       ProcessId);
-        }
-
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                   "[ShadowStrike] Process terminated: PID=%p\n", ProcessId);
-    }
-
-    SHADOWSTRIKE_RELEASE_RUNDOWN();
-
-    UNREFERENCED_PARAMETER(Process);
-}
 
 /**
  * @brief Thread creation/termination notification callback.
@@ -1533,95 +1287,7 @@ ShadowStrikeImageNotifyCallback(
     SHADOWSTRIKE_RELEASE_RUNDOWN();
 }
 
-/**
- * @brief Registry operation callback.
- *
- * Full implementation for detecting registry-based persistence and tampering.
- */
-NTSTATUS
-ShadowStrikeRegistryCallbackRoutine(
-    _In_ PVOID CallbackContext,
-    _In_opt_ PVOID Argument1,
-    _In_opt_ PVOID Argument2
-    )
-{
-    REG_NOTIFY_CLASS notifyClass;
-    NTSTATUS status = STATUS_SUCCESS;
-    HANDLE requestorPid;
 
-    UNREFERENCED_PARAMETER(CallbackContext);
-
-    //
-    // Check if driver is ready and acquire rundown protection
-    //
-    if (!SHADOWSTRIKE_IS_READY()) {
-        return STATUS_SUCCESS;
-    }
-
-    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {
-        return STATUS_SUCCESS;
-    }
-
-    SHADOWSTRIKE_COUNT_OPERATION();
-    InterlockedIncrement64(&g_DriverData.Stats.TotalRegistryOperations);
-
-    notifyClass = (REG_NOTIFY_CLASS)(ULONG_PTR)Argument1;
-    requestorPid = PsGetCurrentProcessId();
-
-    //
-    // Check for operations that modify registry (potential persistence)
-    //
-    switch (notifyClass) {
-        case RegNtPreSetValueKey: {
-            PREG_SET_VALUE_KEY_INFORMATION setInfo = (PREG_SET_VALUE_KEY_INFORMATION)Argument2;
-
-            if (setInfo != NULL && g_DriverData.Config.RegistryMonitorEnabled) {
-                //
-                // Registry value modification — self-protection and persistence detection.
-                // The detailed registry callback (RegistryCallback.c) handles:
-                //   1. Full key path resolution via CmCallbackGetKeyObjectIDEx
-                //   2. Protected key list matching (our service keys)
-                //   3. Persistence location monitoring (Run, Services, etc.)
-                //   4. Blocking unauthorized modifications to protected keys
-                // This callback is the top-level entry; RegistryCallback.c handles routing.
-                //
-                InterlockedIncrement64(&g_DriverData.Stats.TotalRegistryOperations);
-            }
-            break;
-        }
-
-        case RegNtPreDeleteKey:
-        case RegNtPreDeleteValueKey: {
-            //
-            // Key or value deletion — protected key check is handled by RegistryCallback.c
-            // which performs full path resolution and ACL enforcement.
-            //
-            if (g_DriverData.Config.RegistryMonitorEnabled) {
-                InterlockedIncrement64(&g_DriverData.Stats.TotalRegistryOperations);
-            }
-            break;
-        }
-
-        case RegNtPreCreateKeyEx:
-        case RegNtPreOpenKeyEx: {
-            //
-            // Key creation/opening - monitor for persistence locations
-            //
-            // Common persistence locations:
-            // - HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
-            // - HKLM\SYSTEM\CurrentControlSet\Services
-            // - HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
-            break;
-        }
-
-        default:
-            break;
-    }
-
-    SHADOWSTRIKE_RELEASE_RUNDOWN();
-
-    return status;
-}
 
 /**
  * @brief Object pre-operation callback for handle protection.

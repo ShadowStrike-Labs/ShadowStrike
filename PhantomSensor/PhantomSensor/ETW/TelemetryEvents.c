@@ -46,11 +46,11 @@
 #include <ntstrsafe.h>
 
 //
-// MmGetSessionId is exported by ntoskrnl.exe since Windows Vista but
-// not always declared in WDK headers depending on NTDDI_VERSION settings.
+// PsGetProcessSessionId is the documented kernel-mode API for retrieving
+// session IDs. Available in ntoskrnl.lib since Windows XP.
 //
-#ifndef MmGetSessionId
-NTKERNELAPI ULONG MmGetSessionId(_In_ PEPROCESS Process);
+#ifndef PsGetProcessSessionId
+NTKERNELAPI ULONG PsGetProcessSessionId(_In_ PEPROCESS Process);
 #endif
 
 #include <initguid.h>
@@ -925,12 +925,12 @@ TepInitializeEventHeader(
     Header->ThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
 
     //
-    // Session ID: MmGetSessionId reads the session from the current
+    // Session ID: PsGetProcessSessionId reads the session from the
     // EPROCESS. Safe at APC_LEVEL and below. At higher IRQL levels,
     // we set session ID to 0 (unknown) to avoid potential issues.
     //
     if (KeGetCurrentIrql() <= APC_LEVEL) {
-        Header->SessionId = (UINT32)MmGetSessionId(PsGetCurrentProcess());
+        Header->SessionId = (UINT32)PsGetProcessSessionId(PsGetCurrentProcess());
     } else {
         Header->SessionId = 0;
     }

@@ -34,7 +34,7 @@
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <ConfigurationType>Driver</ConfigurationType>
-    <DriverType>KMDF</DriverType>
+    <DriverType>WDM</DriverType>
     <DriverTargetPlatform>Universal</DriverTargetPlatform>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
@@ -42,7 +42,7 @@
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <ConfigurationType>Driver</ConfigurationType>
-    <DriverType>KMDF</DriverType>
+    <DriverType>WDM</DriverType>
     <DriverTargetPlatform>Universal</DriverTargetPlatform>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
@@ -50,7 +50,7 @@
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <ConfigurationType>Driver</ConfigurationType>
-    <DriverType>KMDF</DriverType>
+    <DriverType>WDM</DriverType>
     <DriverTargetPlatform>Universal</DriverTargetPlatform>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
@@ -58,7 +58,7 @@
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <ConfigurationType>Driver</ConfigurationType>
-    <DriverType>KMDF</DriverType>
+    <DriverType>WDM</DriverType>
     <DriverTargetPlatform>Universal</DriverTargetPlatform>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
@@ -87,11 +87,14 @@
     </DriverSign>
     <ClCompile>
       <LanguageStandard>stdcpp23</LanguageStandard>
-    </ClCompile>
-    <ClCompile>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.;PhantomSensor;PhantomSensor\Utilities;PhantomSensorELAM;PhantomSensor\Network;PhantomSensor\Core;PhantomSensor\Memory;PhantomSensor\Callbacks;PhantomSensor\Callbacks\Process;PhantomSensor\Callbacks\FileSystem;PhantomSensor\Callbacks\Registry;PhantomSensor\Callbacks\Object;PhantomSensor\Sync;PhantomSensor\Performance;PhantomSensor\Power;PhantomSensor\Behavioral;PhantomSensor\Telemetry;Shared;PhantomSensor\SelfProtection;PhantomSensor\Communication;PhantomSensor\Cache;PhantomSensor\Exclusions;PhantomSensor\Context;PhantomSensor\ETW;PhantomSensor\Transactions;PhantomSensor\Syscall;PhantomSensor\Objects;PhantomSensor\ALPC;PhantomSensor\Tracing;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <WarningLevel>Level4</WarningLevel>
     </ClCompile>
+    <Link>
+      <AdditionalDependencies>%(AdditionalDependencies);fltMgr.lib;cng.lib;fwpkclnt.lib;ndis.lib;ntstrsafe.lib;aux_klib.lib</AdditionalDependencies>
+    </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DriverSign>
@@ -99,20 +102,44 @@
     </DriverSign>
     <ClCompile>
       <LanguageStandard>stdcpp23</LanguageStandard>
-    </ClCompile>
-    <ClCompile>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <AdditionalIncludeDirectories>.;PhantomSensor;PhantomSensor\Utilities;PhantomSensorELAM;PhantomSensor\Network;PhantomSensor\Core;PhantomSensor\Memory;PhantomSensor\Callbacks;PhantomSensor\Callbacks\Process;PhantomSensor\Callbacks\FileSystem;PhantomSensor\Callbacks\Registry;PhantomSensor\Callbacks\Object;PhantomSensor\Sync;PhantomSensor\Performance;PhantomSensor\Power;PhantomSensor\Behavioral;PhantomSensor\Telemetry;Shared;PhantomSensor\SelfProtection;PhantomSensor\Communication;PhantomSensor\Cache;PhantomSensor\Exclusions;PhantomSensor\Context;PhantomSensor\ETW;PhantomSensor\Transactions;PhantomSensor\Syscall;PhantomSensor\Objects;PhantomSensor\ALPC;PhantomSensor\Tracing;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <WarningLevel>Level4</WarningLevel>
     </ClCompile>
+    <Link>
+      <AdditionalDependencies>%(AdditionalDependencies);fltMgr.lib;cng.lib;fwpkclnt.lib;ndis.lib;ntstrsafe.lib;aux_klib.lib</AdditionalDependencies>
+    </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
+    <ClCompile>
+      <LanguageStandard>stdcpp23</LanguageStandard>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <AdditionalIncludeDirectories>.;PhantomSensor;PhantomSensor\Utilities;PhantomSensorELAM;PhantomSensor\Network;PhantomSensor\Core;PhantomSensor\Memory;PhantomSensor\Callbacks;PhantomSensor\Callbacks\Process;PhantomSensor\Callbacks\FileSystem;PhantomSensor\Callbacks\Registry;PhantomSensor\Callbacks\Object;PhantomSensor\Sync;PhantomSensor\Performance;PhantomSensor\Power;PhantomSensor\Behavioral;PhantomSensor\Telemetry;Shared;PhantomSensor\SelfProtection;PhantomSensor\Communication;PhantomSensor\Cache;PhantomSensor\Exclusions;PhantomSensor\Context;PhantomSensor\ETW;PhantomSensor\Transactions;PhantomSensor\Syscall;PhantomSensor\Objects;PhantomSensor\ALPC;PhantomSensor\Tracing;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <WarningLevel>Level4</WarningLevel>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>%(AdditionalDependencies);fltMgr.lib;cng.lib;fwpkclnt.lib;ndis.lib;ntstrsafe.lib;aux_klib.lib</AdditionalDependencies>
+    </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
+    <ClCompile>
+      <LanguageStandard>stdcpp23</LanguageStandard>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <AdditionalIncludeDirectories>.;PhantomSensor;PhantomSensor\Utilities;PhantomSensorELAM;PhantomSensor\Network;PhantomSensor\Core;PhantomSensor\Memory;PhantomSensor\Callbacks;PhantomSensor\Callbacks\Process;PhantomSensor\Callbacks\FileSystem;PhantomSensor\Callbacks\Registry;PhantomSensor\Callbacks\Object;PhantomSensor\Sync;PhantomSensor\Performance;PhantomSensor\Power;PhantomSensor\Behavioral;PhantomSensor\Telemetry;Shared;PhantomSensor\SelfProtection;PhantomSensor\Communication;PhantomSensor\Cache;PhantomSensor\Exclusions;PhantomSensor\Context;PhantomSensor\ETW;PhantomSensor\Transactions;PhantomSensor\Syscall;PhantomSensor\Objects;PhantomSensor\ALPC;PhantomSensor\Tracing;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <WarningLevel>Level4</WarningLevel>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>%(AdditionalDependencies);fltMgr.lib;cng.lib;fwpkclnt.lib;ndis.lib;ntstrsafe.lib;aux_klib.lib</AdditionalDependencies>
+    </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <Inf Include="PhantomSensor.inf" />
@@ -126,6 +153,7 @@
     <ClCompile Include="PhantomSensorELAM\ELAMCallbacks.c" />
     <ClCompile Include="PhantomSensorELAM\ELAMDriver.c" />
     <ClCompile Include="PhantomSensor\ALPC\AlpcPortMonitor.c" />
+    <ClCompile Include="PhantomSensor\Cache\ScanCache.c" />
     <ClCompile Include="PhantomSensor\Behavioral\AnomalyDetector.c" />
     <ClCompile Include="PhantomSensor\Behavioral\AttackChainTracker.c" />
     <ClCompile Include="PhantomSensor\Behavioral\BehaviorEngine.c" />

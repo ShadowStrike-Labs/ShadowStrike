@@ -900,7 +900,7 @@ PpCleanupActivityTrackerForProcess(
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
-PpGetStatistics(
+PpProtGetStatistics(
     _Out_opt_ PULONG64 TotalOperations,
     _Out_opt_ PULONG64 AccessStripped,
     _Out_opt_ PULONG64 CredentialAccessAttempts,

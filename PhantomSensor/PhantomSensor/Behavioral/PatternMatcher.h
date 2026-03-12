@@ -257,13 +257,13 @@ typedef struct _PM_MATCHER {
 _IRQL_requires_max_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
-PmInitialize(
+PtmInitialize(
     _Out_ PPM_MATCHER* Matcher
     );
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
 VOID
-PmShutdown(
+PtmShutdown(
     _Inout_ PPM_MATCHER Matcher
     );
 

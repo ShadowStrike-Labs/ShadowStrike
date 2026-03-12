@@ -866,7 +866,7 @@ ShadowStrikeGetTrustedProcessCount(
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
-ShadowStrikeNormalizePath(
+PeNormalizePath(
     _In_ PCUNICODE_STRING InputPath,
     _Out_ PUNICODE_STRING NormalizedPath
     );

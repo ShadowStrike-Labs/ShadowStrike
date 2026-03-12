@@ -62,8 +62,8 @@ char _InterlockedCompareExchange8(volatile char*, char, char);
 #endif
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, PmInitialize)
-#pragma alloc_text(PAGE, PmShutdown)
+#pragma alloc_text(PAGE, PtmInitialize)
+#pragma alloc_text(PAGE, PtmShutdown)
 #pragma alloc_text(PAGE, PmLoadPattern)
 #pragma alloc_text(PAGE, PmUnloadPattern)
 #pragma alloc_text(PAGE, PmRegisterCallback)
@@ -342,7 +342,7 @@ PmpGetElapsedMs(
 
 _Use_decl_annotations_
 NTSTATUS
-PmInitialize(
+PtmInitialize(
     PPM_MATCHER* Matcher
     )
 /**
@@ -557,7 +557,7 @@ InitFailed:
 
 _Use_decl_annotations_
 VOID
-PmShutdown(
+PtmShutdown(
     PPM_MATCHER Matcher
     )
 /**

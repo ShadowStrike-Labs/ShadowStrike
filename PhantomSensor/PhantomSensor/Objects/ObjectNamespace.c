@@ -136,6 +136,77 @@ ShadowpVerifyDirectoryOwner(
     );
 
 // ============================================================================
+// SID HELPER (kernel RtlAllocateAndInitializeSid replacement)
+// ============================================================================
+
+#define SHADOW_SID_POOL_TAG  'dISS'
+
+/**
+ * @brief Allocate and initialize a SID using exported kernel APIs.
+ *
+ * RtlAllocateAndInitializeSid is not in the WDK import library, so we
+ * replicate its behavior using RtlLengthRequiredSid + RtlInitializeSid +
+ * RtlSubAuthoritySid which ARE exported by ntoskrnl.lib.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+ShadowpAllocateAndInitializeSid(
+    _In_ PSID_IDENTIFIER_AUTHORITY IdentifierAuthority,
+    _In_ UCHAR SubAuthorityCount,
+    _In_ ULONG SubAuthority0,
+    _In_ ULONG SubAuthority1,
+    _Outptr_ PSID* Sid
+    )
+{
+    ULONG sidLength;
+    PSID newSid;
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    *Sid = NULL;
+
+    if (SubAuthorityCount == 0 || SubAuthorityCount > SID_MAX_SUB_AUTHORITIES) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    sidLength = RtlLengthRequiredSid(SubAuthorityCount);
+
+    newSid = ExAllocatePool2(POOL_FLAG_PAGED, sidLength, SHADOW_SID_POOL_TAG);
+    if (newSid == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    status = RtlInitializeSid(newSid, IdentifierAuthority, SubAuthorityCount);
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(newSid, SHADOW_SID_POOL_TAG);
+        return status;
+    }
+
+    if (SubAuthorityCount >= 1) {
+        *RtlSubAuthoritySid(newSid, 0) = SubAuthority0;
+    }
+    if (SubAuthorityCount >= 2) {
+        *RtlSubAuthoritySid(newSid, 1) = SubAuthority1;
+    }
+
+    *Sid = newSid;
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Free a SID allocated by ShadowpAllocateAndInitializeSid.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
+ShadowpFreeSid(
+    _In_ _Post_invalid_ PSID Sid
+    )
+{
+    ExFreePoolWithTag(Sid, SHADOW_SID_POOL_TAG);
+}
+
+// ============================================================================
 // PUBLIC FUNCTIONS
 // ============================================================================
 
@@ -687,10 +758,10 @@ ShadowpBuildSecurityDescriptor(
     //
     // STEP 1: Create all required SIDs.
     //
-    status = RtlAllocateAndInitializeSid(
+    status = ShadowpAllocateAndInitializeSid(
         &ntAuthority, 1,
         SECURITY_LOCAL_SYSTEM_RID,
-        0, 0, 0, 0, 0, 0, 0,
+        0,
         &systemSid
     );
     if (!NT_SUCCESS(status)) {
@@ -699,11 +770,10 @@ ShadowpBuildSecurityDescriptor(
         goto cleanup;
     }
 
-    status = RtlAllocateAndInitializeSid(
+    status = ShadowpAllocateAndInitializeSid(
         &ntAuthority, 2,
         SECURITY_BUILTIN_DOMAIN_RID,
         DOMAIN_ALIAS_RID_ADMINS,
-        0, 0, 0, 0, 0, 0,
         &adminSid
     );
     if (!NT_SUCCESS(status)) {
@@ -712,10 +782,10 @@ ShadowpBuildSecurityDescriptor(
         goto cleanup;
     }
 
-    status = RtlAllocateAndInitializeSid(
+    status = ShadowpAllocateAndInitializeSid(
         &ntAuthority, 1,
         SECURITY_MANDATORY_HIGH_RID,
-        0, 0, 0, 0, 0, 0, 0,
+        0,
         &highILSid
     );
     if (!NT_SUCCESS(status)) {
@@ -724,10 +794,10 @@ ShadowpBuildSecurityDescriptor(
         goto cleanup;
     }
 
-    status = RtlAllocateAndInitializeSid(
+    status = ShadowpAllocateAndInitializeSid(
         &worldAuthority, 1,
         SECURITY_WORLD_RID,
-        0, 0, 0, 0, 0, 0, 0,
+        0,
         &everyoneSid
     );
     if (!NT_SUCCESS(status)) {
@@ -880,10 +950,10 @@ cleanup:
     if (dacl)          ExFreePoolWithTag(dacl, SHADOW_NAMESPACE_ACL_TAG);
     if (sacl)          ExFreePoolWithTag(sacl, SHADOW_NAMESPACE_ACL_TAG);
     if (selfRelativeSD) ExFreePoolWithTag(selfRelativeSD, SHADOW_NAMESPACE_SD_TAG);
-    if (systemSid)     RtlFreeSid(systemSid);
-    if (adminSid)      RtlFreeSid(adminSid);
-    if (highILSid)     RtlFreeSid(highILSid);
-    if (everyoneSid)   RtlFreeSid(everyoneSid);
+    if (systemSid)     ShadowpFreeSid(systemSid);
+    if (adminSid)      ShadowpFreeSid(adminSid);
+    if (highILSid)     ShadowpFreeSid(highILSid);
+    if (everyoneSid)   ShadowpFreeSid(everyoneSid);
 
     return status;
 }
@@ -960,10 +1030,10 @@ ShadowpVerifyDirectoryOwner(
     //
     // Build SYSTEM SID for comparison.
     //
-    status = RtlAllocateAndInitializeSid(
+    status = ShadowpAllocateAndInitializeSid(
         &ntAuthority, 1,
         SECURITY_LOCAL_SYSTEM_RID,
-        0, 0, 0, 0, 0, 0, 0,
+        0,
         &systemSid
     );
 
@@ -983,7 +1053,7 @@ ShadowpVerifyDirectoryOwner(
         status = STATUS_SUCCESS;
     }
 
-    RtlFreeSid(systemSid);
+    ShadowpFreeSid(systemSid);
     ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
 
     return status;

@@ -1323,7 +1323,7 @@ TpIsSystemThread(
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
-TpGetStatistics(
+TpProtGetStatistics(
     _Out_opt_ PULONG64 TotalOperations,
     _Out_opt_ PULONG64 AccessStripped,
     _Out_opt_ PULONG64 ContextAttempts,
@@ -2060,21 +2060,5 @@ TppShouldLogOperation(
 // LEGACY CALLBACK WRAPPER
 // ============================================================================
 
-/**
- * @brief Legacy callback wrapper for compatibility with ObjectCallback.h
- *
- * This function provides backward compatibility with the existing
- * ShadowStrikeThreadPreCallback interface while using the new
- * enterprise-grade implementation.
- */
-OB_PREOP_CALLBACK_STATUS
-ShadowStrikeThreadPreCallback(
-    _In_ PVOID RegistrationContext,
-    _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
-)
-{
-    //
-    // Delegate to the new enterprise-grade implementation
-    //
-    return TpThreadHandlePreCallback(RegistrationContext, OperationInformation);
-}
+// Legacy wrapper ShadowStrikeThreadPreCallback removed — canonical
+// implementation is in ObjectCallback.c

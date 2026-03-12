@@ -61,11 +61,11 @@
 #include "TelemetryBuffer.h"
 
 //
-// MmGetSessionId is exported by ntoskrnl.exe since Windows Vista but
-// not always declared in WDK headers depending on NTDDI_VERSION settings.
+// PsGetProcessSessionId is the documented kernel-mode API for retrieving
+// session IDs. Available in ntoskrnl.lib since Windows XP.
 //
-#ifndef MmGetSessionId
-NTKERNELAPI ULONG MmGetSessionId(_In_ PEPROCESS Process);
+#ifndef PsGetProcessSessionId
+NTKERNELAPI ULONG PsGetProcessSessionId(_In_ PEPROCESS Process);
 #endif
 
 // ============================================================================
@@ -258,7 +258,7 @@ TbpGetSessionId(
     ULONG sessionId = 0;
 
     if (process != NULL) {
-        sessionId = MmGetSessionId(process);
+        sessionId = PsGetProcessSessionId(process);
     }
 
     return sessionId;

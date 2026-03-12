@@ -97,6 +97,55 @@ static SHADOWSTRIKE_CLIENT_PORT_REF g_ClientPortRefs[SHADOWSTRIKE_MAX_CONNECTION
 // INTERNAL HELPER DECLARATIONS
 // ============================================================================
 
+#define COMMPORT_SID_POOL_TAG  'dISC'
+
+/**
+ * @brief Allocate and initialize a SID using exported kernel APIs.
+ *
+ * Kernel-mode replacement for RtlAllocateAndInitializeSid which is not
+ * in the WDK import library. Uses RtlLengthRequiredSid + RtlInitializeSid +
+ * RtlSubAuthoritySid.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+CppAllocateAndInitializeSid(
+    _In_ PSID_IDENTIFIER_AUTHORITY IdentifierAuthority,
+    _In_ UCHAR SubAuthorityCount,
+    _In_ ULONG SubAuthority0,
+    _Outptr_ PSID* Sid
+    )
+{
+    ULONG sidLength;
+    PSID newSid;
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    *Sid = NULL;
+
+    if (SubAuthorityCount == 0 || SubAuthorityCount > SID_MAX_SUB_AUTHORITIES) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    sidLength = RtlLengthRequiredSid(SubAuthorityCount);
+
+    newSid = ExAllocatePool2(POOL_FLAG_PAGED, sidLength, COMMPORT_SID_POOL_TAG);
+    if (newSid == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    status = RtlInitializeSid(newSid, IdentifierAuthority, SubAuthorityCount);
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(newSid, COMMPORT_SID_POOL_TAG);
+        return status;
+    }
+
+    *RtlSubAuthoritySid(newSid, 0) = SubAuthority0;
+
+    *Sid = newSid;
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS
 ShadowStrikeValidateInputBuffer(
     _In_reads_bytes_(BufferLength) PVOID Buffer,
@@ -1100,6 +1149,46 @@ ShadowStrikeHandleHeartbeat(
     }
 
     return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// PORT ACCESS HELPERS
+// ============================================================================
+
+PFLT_PORT
+ShadowStrikeGetPrimaryScannerPort(
+    VOID
+    )
+{
+    PFLT_PORT port = NULL;
+    LONG i;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_DriverData.ClientPortLock);
+
+    for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
+        if (g_ClientPortRefs[i].ClientPort != NULL &&
+            g_ClientPortRefs[i].Disconnecting == 0 &&
+            g_ClientPortRefs[i].IsPrimaryScanner) {
+            port = g_ClientPortRefs[i].ClientPort;
+            break;
+        }
+    }
+
+    if (port == NULL) {
+        for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
+            if (g_ClientPortRefs[i].ClientPort != NULL &&
+                g_ClientPortRefs[i].Disconnecting == 0) {
+                port = g_ClientPortRefs[i].ClientPort;
+                break;
+            }
+        }
+    }
+
+    ExReleasePushLockShared(&g_DriverData.ClientPortLock);
+    KeLeaveCriticalRegion();
+
+    return port;
 }
 
 // ============================================================================
@@ -2181,11 +2270,10 @@ ShadowStrikeVerifyClient(
             //
             // Build LocalSystem SID for comparison
             //
-            status = RtlAllocateAndInitializeSid(
+            status = CppAllocateAndInitializeSid(
                 &ntAuthority,
                 1,
                 SECURITY_LOCAL_SYSTEM_RID,
-                0, 0, 0, 0, 0, 0, 0,
                 &systemSid
             );
 
@@ -2193,7 +2281,7 @@ ShadowStrikeVerifyClient(
                 if (RtlEqualSid(tokenUser->User.Sid, systemSid)) {
                     isSystem = TRUE;
                 }
-                RtlFreeSid(systemSid);
+                ExFreePoolWithTag(systemSid, COMMPORT_SID_POOL_TAG);
             }
 
             ExFreePool(tokenUser);

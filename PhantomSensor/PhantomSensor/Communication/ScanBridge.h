@@ -453,12 +453,12 @@ ShadowStrikeScanBridgeShutdown(
  *
  * @irql PASSIVE_LEVEL
  *
- * @note Caller must free Request with ShadowStrikeFreeMessageBuffer
+ * @note Caller must free Request with SbFreeMessageBuffer
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
-ShadowStrikeBuildFileScanRequest(
+SbBuildFileScanRequest(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ SHADOWSTRIKE_ACCESS_TYPE AccessType,
@@ -483,7 +483,7 @@ ShadowStrikeBuildFileScanRequest(
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
-ShadowStrikeBuildFileScanRequestEx(
+SbBuildFileScanRequestEx(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ SHADOWSTRIKE_ACCESS_TYPE AccessType,
@@ -513,7 +513,7 @@ ShadowStrikeBuildFileScanRequestEx(
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
-ShadowStrikeSendScanRequest(
+SbSendScanRequest(
     _In_ PSHADOWSTRIKE_MESSAGE_HEADER Request,
     _In_ ULONG RequestSize,
     _Out_ PSHADOWSTRIKE_SCAN_VERDICT_REPLY Reply,
@@ -536,7 +536,7 @@ ShadowStrikeSendScanRequest(
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
-ShadowStrikeSendScanRequestEx(
+SbSendScanRequestEx(
     _In_ PSHADOWSTRIKE_MESSAGE_HEADER Request,
     _In_ ULONG RequestSize,
     _In_opt_ PSB_SCAN_OPTIONS Options,
@@ -724,7 +724,7 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
 _Ret_maybenull_
 PVOID
-ShadowStrikeAllocateMessageBuffer(
+SbAllocateMessageBuffer(
     _In_ ULONG Size
 );
 
@@ -740,7 +740,7 @@ ShadowStrikeAllocateMessageBuffer(
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
-ShadowStrikeFreeMessageBuffer(
+SbFreeMessageBuffer(
     _In_opt_ PVOID Buffer
 );
 

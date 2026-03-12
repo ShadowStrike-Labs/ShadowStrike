@@ -50,16 +50,15 @@ PsGetProcessWow64Process(
     _In_ PEPROCESS Process
     );
 
-NTSYSCALLAPI
-NTSTATUS
-NTAPI
-ZwWriteVirtualMemory(
+typedef NTSTATUS (NTAPI *PFN_ZW_WRITE_VIRTUAL_MEMORY)(
     _In_ HANDLE ProcessHandle,
     _In_ PVOID BaseAddress,
     _In_ PVOID Buffer,
     _In_ SIZE_T NumberOfBytesToWrite,
     _Out_opt_ PSIZE_T NumberOfBytesWritten
     );
+
+static PFN_ZW_WRITE_VIRTUAL_MEMORY g_pfnZwWriteVirtualMemory = NULL;
 
 // ============================================================================
 // Internal Constants
@@ -2169,15 +2168,26 @@ ScMonitorRestoreNtdllFunction(
         ProbeForWrite(funcState->CurrentAddress, sizeof(funcState->ExpectedPrologue), 1);
 
         //
-        // Write original prologue bytes back
+        // Write original prologue bytes back via dynamically resolved function
         //
-        status = ZwWriteVirtualMemory(
-            ZwCurrentProcess(),
-            funcState->CurrentAddress,
-            funcState->ExpectedPrologue,
-            sizeof(funcState->ExpectedPrologue),
-            &bytesWritten
-            );
+        if (g_pfnZwWriteVirtualMemory == NULL) {
+            UNICODE_STRING funcNameStr;
+            RtlInitUnicodeString(&funcNameStr, L"ZwWriteVirtualMemory");
+            g_pfnZwWriteVirtualMemory = (PFN_ZW_WRITE_VIRTUAL_MEMORY)
+                MmGetSystemRoutineAddress(&funcNameStr);
+        }
+
+        if (g_pfnZwWriteVirtualMemory != NULL) {
+            status = g_pfnZwWriteVirtualMemory(
+                ZwCurrentProcess(),
+                funcState->CurrentAddress,
+                funcState->ExpectedPrologue,
+                sizeof(funcState->ExpectedPrologue),
+                &bytesWritten
+                );
+        } else {
+            status = STATUS_NOT_IMPLEMENTED;
+        }
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();

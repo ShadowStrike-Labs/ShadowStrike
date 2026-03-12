@@ -130,19 +130,18 @@ ZwQueryInformationProcess(
     );
 
 //
-// Forward declaration: ZwReadVirtualMemory (undocumented but stable).
-// Required for cross-process memory reads during image comparison.
+// ZwReadVirtualMemory is undocumented and not in WDK import libraries.
+// Resolve dynamically via MmGetSystemRoutineAddress at call time.
 //
-NTSYSAPI
-NTSTATUS
-NTAPI
-ZwReadVirtualMemory(
+typedef NTSTATUS (NTAPI *PFN_ZW_READ_VIRTUAL_MEMORY)(
     _In_ HANDLE ProcessHandle,
     _In_opt_ PVOID BaseAddress,
     _Out_writes_bytes_(BufferSize) PVOID Buffer,
     _In_ SIZE_T BufferSize,
     _Out_opt_ PSIZE_T NumberOfBytesRead
     );
+
+static PFN_ZW_READ_VIRTUAL_MEMORY g_pfnZwReadVirtualMemory = NULL;
 
 //
 // User-mode address validation helper.
@@ -1737,7 +1736,21 @@ PhpReadProcessMemory(
         *BytesRead = 0;
     }
 
-    status = ZwReadVirtualMemory(
+    //
+    // Lazily resolve ZwReadVirtualMemory on first call.
+    //
+    if (g_pfnZwReadVirtualMemory == NULL) {
+        UNICODE_STRING funcName;
+        RtlInitUnicodeString(&funcName, L"ZwReadVirtualMemory");
+        g_pfnZwReadVirtualMemory = (PFN_ZW_READ_VIRTUAL_MEMORY)
+            MmGetSystemRoutineAddress(&funcName);
+
+        if (g_pfnZwReadVirtualMemory == NULL) {
+            return STATUS_NOT_IMPLEMENTED;
+        }
+    }
+
+    status = g_pfnZwReadVirtualMemory(
         ProcessHandle,
         BaseAddress,
         Buffer,

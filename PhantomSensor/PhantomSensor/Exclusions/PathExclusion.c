@@ -43,7 +43,7 @@
 #include "ExclusionManager.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, ShadowStrikeNormalizePath)
+#pragma alloc_text(PAGE, PeNormalizePath)
 #endif
 
 // ============================================================================
@@ -233,7 +233,7 @@ PathpWildcardMatch(
 _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
-ShadowStrikeNormalizePath(
+PeNormalizePath(
     _In_ PCUNICODE_STRING InputPath,
     _Out_ PUNICODE_STRING NormalizedPath
     )
