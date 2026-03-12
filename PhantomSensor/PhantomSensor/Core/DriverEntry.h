@@ -112,6 +112,70 @@ typedef enum _SHADOWSTRIKE_INIT_FLAGS {
                                        InitFlag_RundownInitialized)
 } SHADOWSTRIKE_INIT_FLAGS;
 
+/**
+ * @brief Subsystem initialization flags for infrastructure and detection modules.
+ *
+ * These flags track initialization of subsystem modules that were added
+ * during the integration phase. Separate from InitFlags to avoid ULONG overflow.
+ * Used by g_SubsystemFlags in DriverEntry.c.
+ */
+typedef enum _SHADOWSTRIKE_SUBSYSTEM_FLAGS {
+    SubsysFlag_None                 = 0x00000000,
+
+    // Phase 1A: Synchronization infrastructure
+    SubsysFlag_WorkQueue            = 0x00000001,
+    SubsysFlag_ThreadPool           = 0x00000002,
+    SubsysFlag_AsyncWorkQueue       = 0x00000004,
+    SubsysFlag_TimerManager         = 0x00000008,
+    SubsysFlag_DeferredProcedure    = 0x00000010,
+
+    // Phase 1B: Performance infrastructure
+    SubsysFlag_PerformanceMonitor   = 0x00000020,
+    SubsysFlag_ResourceThrottling   = 0x00000040,
+    SubsysFlag_BatchProcessing      = 0x00000080,
+    SubsysFlag_CacheOptimization    = 0x00000100,
+
+    // Phase 1C: Power management
+    SubsysFlag_PowerCallback        = 0x00000200,
+
+    // Phase 1D: Telemetry pipeline
+    SubsysFlag_ETWProvider          = 0x00000400,
+    SubsysFlag_TelemetryEvents      = 0x00000800,
+    SubsysFlag_TelemetryBuffer      = 0x00001000,
+
+    // Phase 2: Detection subsystems
+    SubsysFlag_BehaviorEngine       = 0x00002000,
+    SubsysFlag_MemoryMonitor        = 0x00004000,
+    SubsysFlag_SyscallMonitor       = 0x00008000,
+    SubsysFlag_NetworkFilter        = 0x00010000,
+
+    // Phase 3: Enrichment & communication
+    SubsysFlag_ProcessAnalyzer      = 0x00020000,
+    SubsysFlag_MessageHandler       = 0x00040000,
+    SubsysFlag_ScanBridge           = 0x00080000,
+
+    // Phase 4: Self-protection hardening
+    SubsysFlag_CallbackProtection   = 0x00100000,
+    SubsysFlag_HandleProtection     = 0x00200000,
+    SubsysFlag_IntegrityMonitor     = 0x00400000,
+
+    // Phase 5: Specialized subsystems
+    SubsysFlag_AlpcPortMonitor      = 0x00800000,
+    SubsysFlag_KtmMonitor           = 0x01000000,
+    SubsysFlag_ObjectNamespace      = 0x02000000,
+
+    // Phase 6: Scoring orchestration
+    SubsysFlag_ThreatScoring        = 0x04000000,
+
+    // Infrastructure: lock subsystem and message queue
+    SubsysFlag_SpinLockSubsystem    = 0x08000000,
+    SubsysFlag_MessageQueue         = 0x10000000,
+
+    // DeviceObject-dependent modules
+    SubsysFlag_EventSchema          = 0x40000000,
+    SubsysFlag_MemoryScanner        = 0x80000000,
+} SHADOWSTRIKE_SUBSYSTEM_FLAGS;
+
 // ============================================================================
 // DRIVER LIFECYCLE FUNCTIONS
 // ============================================================================

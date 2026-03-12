@@ -73,6 +73,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Behavioral/ThreatScoring.h"
+#include "../../Behavioral/BehaviorEngine.h"
 #include "WSLMonitor.h"
 #include "AppControl.h"
 #include "ClipboardMonitor.h"
@@ -1444,6 +1445,69 @@ Arguments:
     if (SuspicionScore >= PN_SUSPICION_MEDIUM) {
         ProcessContext->Flags |= PN_PROC_FLAG_SUSPICIOUS;
         InterlockedIncrement64(&g_ProcessMonitor.Stats.SuspiciousProcesses);
+    }
+
+    //
+    // Submit process creation event to BehaviorEngine for kill-chain correlation.
+    // BehaviorEngine internally drives AttackChainTracker → MITREMapper pipeline.
+    // We submit at PASSIVE_LEVEL after all analysis enrichment is complete.
+    //
+    if (KeGetCurrentIrql() < DISPATCH_LEVEL) {
+        BEHAVIOR_RESPONSE_ACTION beResponse = BehaviorResponse_Allow;
+
+        NTSTATUS beStatus = BeEngineSubmitEvent(
+            BehaviorEvent_ProcessCreate,
+            BehaviorCategory_ProcessExecution,
+            HandleToULong(ProcessId),
+            ProcessContext,
+            sizeof(*ProcessContext),
+            SuspicionScore,
+            g_ProcessMonitor.Config.BlockSuspiciousProcesses,
+            &beResponse
+            );
+
+        if (NT_SUCCESS(beStatus) && beResponse == BehaviorResponse_Block) {
+            ShouldBlock = TRUE;
+        }
+    }
+
+    //
+    // Submit targeted behavioral events for specific high-confidence detections
+    //
+    if (KeGetCurrentIrql() < DISPATCH_LEVEL) {
+        if (ProcessContext->IsPpidSpoofed) {
+            BeEngineSubmitEvent(
+                BehaviorEvent_SuspiciousParentChild,
+                BehaviorCategory_DefenseEvasion,
+                HandleToULong(ProcessId),
+                NULL, 0,
+                40,
+                FALSE,
+                NULL
+                );
+        }
+        if (ProcessContext->Flags & PN_PROC_FLAG_ENCODED_CMD) {
+            BeEngineSubmitEvent(
+                BehaviorEvent_ScriptExecution,
+                BehaviorCategory_ProcessExecution,
+                HandleToULong(ProcessId),
+                NULL, 0,
+                30,
+                FALSE,
+                NULL
+                );
+        }
+        if (ProcessContext->IsElevated && !ProcessContext->IsSystem) {
+            BeEngineSubmitEvent(
+                BehaviorEvent_ElevationOfPrivilege,
+                BehaviorCategory_PrivilegeOperation,
+                HandleToULong(ProcessId),
+                NULL, 0,
+                15,
+                FALSE,
+                NULL
+                );
+        }
     }
 
     //

@@ -219,12 +219,15 @@ static LIST_ENTRY g_ChainHashTable[BE_CHAIN_HASH_BUCKETS];
 static EX_PUSH_LOCK g_ChainHashLock;
 
 /**
- * @brief Subsystem pointers
+ * @brief Subsystem pointers — children initialized in BeEngineInitialize, shutdown in BeEngineShutdown.
  */
 static PACT_TRACKER g_AttackChainTracker;
 static PRE_ENGINE g_RuleEngine;
 static PTS_SCORING_ENGINE g_ScoringEngine;
 static PMM_MAPPER g_MitreMapper;
+static PPM_MATCHER g_PatternMatcher;
+static PIOM_MATCHER g_IocMatcher;
+static PAD_DETECTOR g_AnomalyDetector;
 
 // ============================================================================
 // EVENT TO MITRE MAPPING TABLE
@@ -699,6 +702,98 @@ BeEngineInitialize(
     }
 
     //
+    // Initialize child subsystems — failures are non-fatal (degrade gracefully).
+    // Each child is NULL-checked at usage sites throughout the engine.
+    //
+
+    //
+    // MITREMapper: technique classification and MITRE ATT&CK mapping
+    //
+    {
+        NTSTATUS childStatus = MmInitialize(&g_MitreMapper);
+        if (NT_SUCCESS(childStatus)) {
+            childStatus = MmLoadTechniques(g_MitreMapper);
+            if (!NT_SUCCESS(childStatus)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike:BehaviorEngine] MITREMapper technique load failed: 0x%08X\n",
+                           childStatus);
+                MmShutdown(g_MitreMapper);
+                g_MitreMapper = NULL;
+            }
+        } else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:BehaviorEngine] MITREMapper init failed: 0x%08X\n",
+                       childStatus);
+            g_MitreMapper = NULL;
+        }
+    }
+
+    //
+    // AttackChainTracker: multi-stage attack correlation
+    //
+    {
+        NTSTATUS childStatus = ActInitialize(&g_AttackChainTracker);
+        if (!NT_SUCCESS(childStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:BehaviorEngine] AttackChainTracker init failed: 0x%08X\n",
+                       childStatus);
+            g_AttackChainTracker = NULL;
+        }
+    }
+
+    //
+    // RuleEngine: behavioral detection rule evaluation
+    //
+    {
+        NTSTATUS childStatus = ReInitialize(&g_RuleEngine);
+        if (!NT_SUCCESS(childStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:BehaviorEngine] RuleEngine init failed: 0x%08X\n",
+                       childStatus);
+            g_RuleEngine = NULL;
+        }
+    }
+
+    //
+    // PatternMatcher: behavioral pattern recognition
+    //
+    {
+        NTSTATUS childStatus = PtmInitialize(&g_PatternMatcher);
+        if (!NT_SUCCESS(childStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:BehaviorEngine] PatternMatcher init failed: 0x%08X\n",
+                       childStatus);
+            g_PatternMatcher = NULL;
+        }
+    }
+
+    //
+    // IOCMatcher: indicator of compromise matching
+    //
+    {
+        NTSTATUS childStatus = IomInitialize(&g_IocMatcher, NULL);
+        if (!NT_SUCCESS(childStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:BehaviorEngine] IOCMatcher init failed: 0x%08X\n",
+                       childStatus);
+            g_IocMatcher = NULL;
+        }
+    }
+
+    //
+    // AnomalyDetector: statistical anomaly detection
+    //
+    {
+        NTSTATUS childStatus = AdInitialize(&g_AnomalyDetector);
+        if (!NT_SUCCESS(childStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:BehaviorEngine] AnomalyDetector init failed: 0x%08X\n",
+                       childStatus);
+            g_AnomalyDetector = NULL;
+        }
+    }
+
+    //
     // Mark as initialized and enabled
     //
     g_BeState.Initialized = TRUE;
@@ -707,6 +802,34 @@ BeEngineInitialize(
     return STATUS_SUCCESS;
 
 CleanupResources:
+    //
+    // Cleanup any partially-initialized children
+    //
+    if (g_AnomalyDetector != NULL) {
+        AdShutdown(g_AnomalyDetector);
+        g_AnomalyDetector = NULL;
+    }
+    if (g_IocMatcher != NULL) {
+        IomShutdown(&g_IocMatcher);
+        g_IocMatcher = NULL;
+    }
+    if (g_PatternMatcher != NULL) {
+        PtmShutdown(g_PatternMatcher);
+        g_PatternMatcher = NULL;
+    }
+    if (g_RuleEngine != NULL) {
+        ReShutdown(g_RuleEngine);
+        g_RuleEngine = NULL;
+    }
+    if (g_AttackChainTracker != NULL) {
+        ActShutdown(g_AttackChainTracker);
+        g_AttackChainTracker = NULL;
+    }
+    if (g_MitreMapper != NULL) {
+        MmShutdown(g_MitreMapper);
+        g_MitreMapper = NULL;
+    }
+
     ExDeleteResourceLite(&g_BeState.ChainLock);
     ExDeleteResourceLite(&g_BeState.ProcessLock);
     ExDeleteResourceLite(&g_BeState.RuleLock);
@@ -832,6 +955,39 @@ BeEngineShutdown(
     }
 
     ExReleaseResourceLite(&g_BeState.ProcessLock);
+
+    //
+    // Shutdown child subsystems (reverse init order)
+    //
+    if (g_AnomalyDetector != NULL) {
+        AdShutdown(g_AnomalyDetector);
+        g_AnomalyDetector = NULL;
+    }
+
+    if (g_IocMatcher != NULL) {
+        IomShutdown(&g_IocMatcher);
+        g_IocMatcher = NULL;
+    }
+
+    if (g_PatternMatcher != NULL) {
+        PtmShutdown(g_PatternMatcher);
+        g_PatternMatcher = NULL;
+    }
+
+    if (g_RuleEngine != NULL) {
+        ReShutdown(g_RuleEngine);
+        g_RuleEngine = NULL;
+    }
+
+    if (g_AttackChainTracker != NULL) {
+        ActShutdown(g_AttackChainTracker);
+        g_AttackChainTracker = NULL;
+    }
+
+    if (g_MitreMapper != NULL) {
+        MmShutdown(g_MitreMapper);
+        g_MitreMapper = NULL;
+    }
 
     //
     // Cleanup resources

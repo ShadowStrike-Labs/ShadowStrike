@@ -64,6 +64,7 @@
 #include "../../Shared/SharedDefs.h"
 #include "../../Communication/CommPort.h"
 #include "../../../Shared/MessageTypes.h"
+#include "../../Behavioral/BehaviorEngine.h"
 
 //
 // WPP Tracing - conditionally include if available
@@ -923,6 +924,21 @@ ShadowStrikePostWrite(
 
             processActivity->IsFlagged = TRUE;
             InterlockedIncrement64(&g_PostWriteState.RansomwareAlerts);
+
+            //
+            // CRITICAL: Submit ransomware behavior to BehaviorEngine.
+            // This is the primary ransomware detection signal — high-entropy
+            // overwrites with mass file modification patterns (MITRE T1486).
+            //
+            BeEngineSubmitEvent(
+                BehaviorEvent_RansomwareBehavior,
+                BehaviorCategory_Impact,
+                HandleToULong(writeContext.ProcessId),
+                NULL, 0,
+                (UINT32)processActivity->SuspicionScore,
+                TRUE,
+                NULL
+                );
 
             PwpRaiseRansomwareAlert(
                 writeContext.ProcessId,

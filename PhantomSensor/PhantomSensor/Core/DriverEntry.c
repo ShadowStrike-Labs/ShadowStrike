@@ -63,6 +63,58 @@
 #include "../Callbacks/Object/ObjectCallback.h"
 #include "../Callbacks/Process/ProcessNotify.h"
 
+// Phase 1A: Sync infrastructure
+#include "../Sync/WorkQueue.h"
+#include "../Sync/ThreadPool.h"
+#include "../Sync/AsyncWorkQueue.h"
+#include "../Sync/TimerManager.h"
+#include "../Sync/DeferredProcedure.h"
+
+// Phase 1B: Performance infrastructure
+#include "../Performance/PerformanceMonitor.h"
+#include "../Performance/ResourceThrottling.h"
+#include "../Performance/BatchProcessing.h"
+#include "../Performance/CacheOptimization.h"
+
+// Phase 1C: Power management
+#include "../Power/PowerCallback.h"
+
+// Phase 1D: Telemetry pipeline
+#include "../ETW/ETWProvider.h"
+#include "../ETW/TelemetryEvents.h"
+#include "../ETW/EventSchema.h"
+#include "../ETW/ManifestGenerator.h"
+#include "../Communication/TelemetryBuffer.h"
+
+// Phase 2: Detection subsystems
+#include "../Behavioral/BehaviorEngine.h"
+#include "../Memory/MemoryMonitor.h"
+#include "../Memory/MemoryScanner.h"
+#include "../Syscall/SyscallMonitor.h"
+#include "../Network/NetworkFilter.h"
+
+// Phase 3: Enrichment & communication
+#include "../Callbacks/Process/ProcessAnalyzer.h"
+#include "../Communication/MessageHandler.h"
+#include "../Communication/ScanBridge.h"
+
+// Phase 4: Self-protection hardening
+#include "../SelfProtection/CallbackProtection.h"
+#include "../SelfProtection/HandleProtection.h"
+#include "../SelfProtection/IntegrityMonitor.h"
+
+// Phase 5: Specialized subsystems
+#include "../ALPC/AlpcPortMonitor.h"
+#include "../Transactions/KtmMonitor.h"
+#include "../Objects/ObjectNamespace.h"
+
+// Phase 6: Scoring orchestration
+#include "../Behavioral/ThreatScoring.h"
+
+// Infrastructure: lock subsystem and message queue
+#include "../Sync/SpinLock.h"
+#include "../Communication/MessageQueue.h"
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, DriverEntry)
 #pragma alloc_text(INIT, ShadowStrikeCheckVersionCompatibility)
@@ -97,6 +149,66 @@ static ULONG g_InitFlags = InitFlag_None;
  * @brief Callback registration flags for process/thread/image.
  */
 static ULONG g_CallbackFlags = 0;
+
+/**
+ * @brief Subsystem initialization flags for infrastructure and detection modules.
+ */
+static ULONG g_SubsystemFlags = SubsysFlag_None;
+
+// ============================================================================
+// SUBSYSTEM HANDLE STORAGE
+// ============================================================================
+
+/// @brief Thread pool handle (Phase 1A)
+static PTP_THREAD_POOL g_ThreadPool = NULL;
+
+/// @brief Async work queue handle (Phase 1A)
+static HAWQ_MANAGER g_AsyncWorkQueue = NULL;
+
+/// @brief Timer manager handle (Phase 1A)
+static PTM_MANAGER g_TimerManager = NULL;
+
+/// @brief DPC manager handle (Phase 1A)
+static PDPC_MANAGER g_DpcManager = NULL;
+
+/// @brief Performance monitor handle (Phase 1B)
+static PSSPM_MONITOR g_PerformanceMonitor = NULL;
+
+/// @brief Resource throttler handle (Phase 1B)
+static PRT_THROTTLER g_ResourceThrottler = NULL;
+
+/// @brief Batch processor handle (Phase 1B)
+static PBP_PROCESSOR g_BatchProcessor = NULL;
+
+/// @brief Cache optimizer handle (Phase 1B)
+static PCO_MANAGER g_CacheOptimizer = NULL;
+
+/// @brief Telemetry buffer manager handle (Phase 1D)
+static PTB_MANAGER g_TelemetryBuffer = NULL;
+
+/// @brief Process analyzer handle (Phase 3A)
+static PPA_ANALYZER g_ProcessAnalyzer = NULL;
+
+/// @brief Callback protection handle (Phase 4A)
+static PCP_PROTECTOR g_CallbackProtector = NULL;
+
+/// @brief Handle protection engine (Phase 4B)
+static PHP_PROTECTION_ENGINE g_HandleProtection = NULL;
+
+/// @brief Integrity monitor handle (Phase 4B)
+static PIM_MONITOR g_IntegrityMonitor = NULL;
+
+/// @brief Threat scoring engine (Phase 6A)
+static PTS_SCORING_ENGINE g_ThreatScoring = NULL;
+
+/// @brief Event schema handle (Phase 1D)
+static PES_SCHEMA g_EventSchema = NULL;
+
+/// @brief Manifest generator handle (Phase 1D)
+static PMG_GENERATOR g_ManifestGenerator = NULL;
+
+/// @brief Memory scanner handle (Phase 2B)
+static PMS_SCANNER g_MemoryScanner = NULL;
 
 // ============================================================================
 // DRIVER ENTRY
@@ -154,6 +266,19 @@ DriverEntry(
     InitializeListHead(&g_DriverData.ProtectedProcessList);
 
     //
+    // Step 2.5: Initialize lock subsystem (must be before any module using enhanced locks)
+    //
+    status = ShadowStrikeLockSubsystemInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Lock subsystem init failed: 0x%08X (continuing with native locks)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_SpinLockSubsystem;
+    }
+
+    //
     // Step 3: Initialize rundown protection (CRITICAL for safe unload)
     //
     ExInitializeRundownProtection(&g_DriverData.RundownProtection);
@@ -188,6 +313,218 @@ DriverEntry(
     g_DriverData.LookasideInitialized = TRUE;
     ShadowStrikeLogInitStatus("Lookaside Lists", status);
 
+    // =========================================================================
+    // PHASE 1A: Synchronization Infrastructure
+    // =========================================================================
+
+    //
+    // Step 5.1: Initialize work queue (singleton — provides work item dispatch)
+    //
+    status = ShadowStrikeWorkQueueInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize work queue: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_WorkQueue;
+        ShadowStrikeLogInitStatus("Work Queue", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 5.2: Initialize thread pool (managed worker threads)
+    //
+    status = TpCreateDefault(
+        &g_ThreadPool,
+        2,      // MinThreads: 2 workers minimum
+        8,      // MaxThreads: 8 workers maximum (scales with load)
+        NULL    // DeviceObject: not required for WDM driver
+    );
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize thread pool: 0x%08X (continuing)\n",
+                   status);
+        g_ThreadPool = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_ThreadPool;
+        ShadowStrikeLogInitStatus("Thread Pool", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 5.3: Initialize async work queue (deferred async processing)
+    //
+    status = AwqInitialize(
+        &g_AsyncWorkQueue,
+        1,      // MinThreads: 1 worker
+        4,      // MaxThreads: 4 workers
+        4096    // MaxQueueSize: cap to prevent unbounded growth
+    );
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize async work queue: 0x%08X (continuing)\n",
+                   status);
+        g_AsyncWorkQueue = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_AsyncWorkQueue;
+        ShadowStrikeLogInitStatus("Async Work Queue", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 5.4: Initialize timer manager (centralized timer management)
+    //
+    status = TmInitialize(NULL, &g_TimerManager);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize timer manager: 0x%08X (continuing)\n",
+                   status);
+        g_TimerManager = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_TimerManager;
+        ShadowStrikeLogInitStatus("Timer Manager", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 5.5: Initialize DPC manager (deferred procedure call management)
+    //
+    status = DpcInitialize(&g_DpcManager, 64);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize DPC manager: 0x%08X (continuing)\n",
+                   status);
+        g_DpcManager = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_DeferredProcedure;
+        ShadowStrikeLogInitStatus("DPC Manager", STATUS_SUCCESS);
+    }
+
+    // =========================================================================
+    // PHASE 1B: Performance Infrastructure
+    // =========================================================================
+
+    //
+    // Step 5.6: Initialize performance monitor (health metrics)
+    //
+    status = SsPmInitialize(&g_PerformanceMonitor);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize performance monitor: 0x%08X (continuing)\n",
+                   status);
+        g_PerformanceMonitor = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_PerformanceMonitor;
+        ShadowStrikeLogInitStatus("Performance Monitor", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 5.7: Initialize resource throttling (DoS prevention)
+    //
+    status = RtInitialize(&g_ResourceThrottler);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize resource throttler: 0x%08X (continuing)\n",
+                   status);
+        g_ResourceThrottler = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_ResourceThrottling;
+        ShadowStrikeLogInitStatus("Resource Throttling", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 5.8: Initialize batch processing (efficient event batching)
+    //
+    status = BpInitialize(&g_BatchProcessor);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize batch processor: 0x%08X (continuing)\n",
+                   status);
+        g_BatchProcessor = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_BatchProcessing;
+        ShadowStrikeLogInitStatus("Batch Processing", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 5.9: Initialize cache optimization (cache management)
+    //
+    status = CoInitialize(
+        &g_CacheOptimizer,
+        64 * 1024 * 1024,   // 64MB max total cache memory
+        NULL                 // DeviceObject: not required for WDM driver
+    );
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize cache optimizer: 0x%08X (continuing)\n",
+                   status);
+        g_CacheOptimizer = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_CacheOptimization;
+        ShadowStrikeLogInitStatus("Cache Optimization", STATUS_SUCCESS);
+    }
+
+    // =========================================================================
+    // PHASE 1C: Power Management
+    // =========================================================================
+
+    //
+    // Step 5.10: Register power state callbacks
+    //
+    status = ShadowRegisterPowerCallbacks(NULL);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to register power callbacks: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_PowerCallback;
+        ShadowStrikeLogInitStatus("Power Callbacks", STATUS_SUCCESS);
+    }
+
+    // =========================================================================
+    // PHASE 1D: Telemetry Pipeline
+    // =========================================================================
+
+    //
+    // Step 5.11: Initialize ETW provider (event emission)
+    //
+    status = EtwProviderInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize ETW provider: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_ETWProvider;
+        ShadowStrikeLogInitStatus("ETW Provider", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 5.12: Initialize telemetry buffer (buffered event delivery)
+    //
+    status = TbInitialize(
+        &g_TelemetryBuffer,
+        32 * 1024,   // 32KB per-CPU buffer
+        256,         // Batch size: 256 events per flush
+        5000         // Batch timeout: 5 seconds
+    );
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize telemetry buffer: 0x%08X (continuing)\n",
+                   status);
+        g_TelemetryBuffer = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_TelemetryBuffer;
+        ShadowStrikeLogInitStatus("Telemetry Buffer", STATUS_SUCCESS);
+    }
+
     //
     // Step 6: Register the minifilter
     //
@@ -218,6 +555,62 @@ DriverEntry(
     }
     g_InitFlags |= InitFlag_CommPortCreated;
     ShadowStrikeLogInitStatus("Communication Port", status);
+
+    //
+    // Step 7.5: Initialize telemetry events (requires DeviceObject from FltRegisterFilter)
+    //
+    {
+        PDEVICE_OBJECT deviceObject = g_DriverData.DriverObject->DeviceObject;
+        if (deviceObject != NULL) {
+            status = TeInitialize(deviceObject, NULL);
+            if (!NT_SUCCESS(status)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] WARNING: Failed to initialize telemetry events: 0x%08X (continuing)\n",
+                           status);
+                status = STATUS_SUCCESS;
+            } else {
+                g_SubsystemFlags |= SubsysFlag_TelemetryEvents;
+                ShadowStrikeLogInitStatus("Telemetry Events", STATUS_SUCCESS);
+            }
+        } else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: No DeviceObject available — telemetry events skipped\n");
+        }
+    }
+
+    //
+    // Step 7.6: Initialize event schema (requires ETW provider context)
+    //
+    {
+        static const GUID ShadowStrikeProviderId = 
+            { 0xA3B5C7D9, 0xE1F2, 0x4A6B, { 0x8C, 0x0D, 0x2E, 0x4F, 0x6A, 0x8B, 0xCD, 0xEF } };
+
+        status = EsInitialize(&g_EventSchema, &ShadowStrikeProviderId, "ShadowStrike.PhantomSensor");
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to initialize event schema: 0x%08X (continuing)\n",
+                       status);
+            g_EventSchema = NULL;
+            status = STATUS_SUCCESS;
+        } else {
+            g_SubsystemFlags |= SubsysFlag_EventSchema;
+            ShadowStrikeLogInitStatus("Event Schema", STATUS_SUCCESS);
+
+            //
+            // Step 7.7: Initialize manifest generator (depends on EventSchema)
+            //
+            status = MgInitialize(g_EventSchema, &g_ManifestGenerator);
+            if (!NT_SUCCESS(status)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] WARNING: Failed to initialize manifest generator: 0x%08X (continuing)\n",
+                           status);
+                g_ManifestGenerator = NULL;
+                status = STATUS_SUCCESS;
+            } else {
+                ShadowStrikeLogInitStatus("Manifest Generator", STATUS_SUCCESS);
+            }
+        }
+    }
 
     //
     // Step 8: Initialize scan cache (non-critical - continue on failure)
@@ -259,6 +652,97 @@ DriverEntry(
     } else {
         g_InitFlags |= InitFlag_HashUtilsInitialized;
         ShadowStrikeLogInitStatus("Hash Utilities", STATUS_SUCCESS);
+    }
+
+    // =========================================================================
+    // PHASE 2: Detection Subsystems
+    // =========================================================================
+
+    //
+    // Step 10.1: Initialize behavioral engine (multi-stage attack detection)
+    // Children: AttackChainTracker, PatternMatcher, RuleEngine, IOCMatcher, MITREMapper
+    //
+    status = BeEngineInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize behavioral engine: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_BehaviorEngine;
+        ShadowStrikeLogInitStatus("Behavioral Engine", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 10.2: Initialize memory monitoring subsystem
+    // Children: HollowingDetector, InjectionDetector, HeapSpray, ShellcodeDetector,
+    //           ROPDetector, VadTracker, SectionTracker, ETWConsumer
+    //
+    status = MmMonitorInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize memory monitor: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_MemoryMonitor;
+        ShadowStrikeLogInitStatus("Memory Monitor", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 10.2b: Initialize memory scanner (full-scan engine, requires DeviceObject)
+    //
+    {
+        PDEVICE_OBJECT deviceObject = g_DriverData.DriverObject->DeviceObject;
+        if (deviceObject != NULL) {
+            status = MsInitialize(deviceObject, &g_MemoryScanner);
+            if (!NT_SUCCESS(status)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] WARNING: Failed to initialize memory scanner: 0x%08X (continuing)\n",
+                           status);
+                g_MemoryScanner = NULL;
+                status = STATUS_SUCCESS;
+            } else {
+                g_SubsystemFlags |= SubsysFlag_MemoryScanner;
+                ShadowStrikeLogInitStatus("Memory Scanner", STATUS_SUCCESS);
+            }
+        } else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: No DeviceObject — memory scanner skipped\n");
+        }
+    }
+
+    //
+    // Step 10.3: Initialize syscall monitoring subsystem
+    // Children: SyscallTable, SyscallHooks, NtdllIntegrity, DirectSyscallDetector,
+    //           HeavensGateDetector, CallstackAnalyzer
+    //
+    status = ScMonitorInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize syscall monitor: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_SyscallMonitor;
+        ShadowStrikeLogInitStatus("Syscall Monitor", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 10.4: Initialize network filter (WFP-based network detection)
+    // Children: DnsMonitor, C2Detection, DataExfiltration, ConnectionTracker,
+    //           ProtocolParser, PortScanner, NetworkReputation, SSLInspection
+    // Note: Requires a device object for WFP callout registration
+    //
+    status = NfFilterInitialize(g_DriverData.DriverObject->DeviceObject);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize network filter: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_NetworkFilter;
+        ShadowStrikeLogInitStatus("Network Filter", STATUS_SUCCESS);
     }
 
     //
@@ -430,6 +914,191 @@ DriverEntry(
     } else {
         g_InitFlags |= InitFlag_ClipboardMonitorInitialized;
         ShadowStrikeLogInitStatus("Clipboard Monitor", STATUS_SUCCESS);
+    }
+
+    // =========================================================================
+    // PHASE 3A: Process Analysis Pipeline
+    // =========================================================================
+
+    //
+    // Step 14.13: Initialize process analyzer
+    //
+    status = PaInitialize(&g_ProcessAnalyzer, NULL);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize process analyzer: 0x%08X (continuing)\n",
+                   status);
+        g_ProcessAnalyzer = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_ProcessAnalyzer;
+        ShadowStrikeLogInitStatus("Process Analyzer", STATUS_SUCCESS);
+    }
+
+    // =========================================================================
+    // PHASE 3B: Communication Pipeline
+    // =========================================================================
+
+    //
+    // Step 14.14: Initialize message handler
+    //
+    status = MhInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize message handler: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_MessageHandler;
+        ShadowStrikeLogInitStatus("Message Handler", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.15: Initialize scan bridge
+    //
+    status = ShadowStrikeScanBridgeInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize scan bridge: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_ScanBridge;
+        ShadowStrikeLogInitStatus("Scan Bridge", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.15b: Initialize message queue
+    //
+    status = MqInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize message queue: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_MessageQueue;
+        ShadowStrikeLogInitStatus("Message Queue", STATUS_SUCCESS);
+    }
+
+    // =========================================================================
+    // PHASE 4: Self-Protection Hardening
+    // Must be AFTER all callbacks are registered to protect them
+    // =========================================================================
+
+    //
+    // Step 14.16: Initialize handle protection
+    //
+    status = HpInitialize(&g_HandleProtection);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize handle protection: 0x%08X (continuing)\n",
+                   status);
+        g_HandleProtection = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_HandleProtection;
+        ShadowStrikeLogInitStatus("Handle Protection", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.17: Initialize integrity monitor
+    //
+    {
+        PVOID driverBase = g_DriverData.DriverObject->DriverStart;
+        SIZE_T driverSize = (SIZE_T)g_DriverData.DriverObject->DriverSize;
+
+        status = ImInitialize(&g_IntegrityMonitor, driverBase, driverSize);
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to initialize integrity monitor: 0x%08X (continuing)\n",
+                       status);
+            g_IntegrityMonitor = NULL;
+            status = STATUS_SUCCESS;
+        } else {
+            g_SubsystemFlags |= SubsysFlag_IntegrityMonitor;
+            ShadowStrikeLogInitStatus("Integrity Monitor", STATUS_SUCCESS);
+        }
+    }
+
+    //
+    // Step 14.18: Initialize callback protection (LAST protection init — protects all registered callbacks)
+    //
+    status = CpInitialize(&g_CallbackProtector);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize callback protection: 0x%08X (continuing)\n",
+                   status);
+        g_CallbackProtector = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_CallbackProtection;
+        ShadowStrikeLogInitStatus("Callback Protection", STATUS_SUCCESS);
+    }
+
+    // =========================================================================
+    // PHASE 5: Specialized Subsystems
+    // =========================================================================
+
+    //
+    // Step 14.19: Initialize ALPC port monitor
+    //
+    status = ShadowAlpcInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize ALPC monitor: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_AlpcPortMonitor;
+        ShadowStrikeLogInitStatus("ALPC Monitor", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.20: Initialize KTM transaction monitor
+    //
+    status = ShadowInitializeKtmMonitor(g_DriverData.FilterHandle);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize KTM monitor: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_KtmMonitor;
+        ShadowStrikeLogInitStatus("KTM Monitor", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.21: Create private object namespace
+    //
+    status = ShadowCreatePrivateNamespace();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to create private namespace: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_ObjectNamespace;
+        ShadowStrikeLogInitStatus("Object Namespace", STATUS_SUCCESS);
+    }
+
+    // =========================================================================
+    // PHASE 6A: Scoring Orchestration
+    // =========================================================================
+
+    //
+    // Step 14.22: Initialize threat scoring engine (driver-wide)
+    //
+    status = TsInitialize(&g_ThreatScoring);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize threat scoring: 0x%08X (continuing)\n",
+                   status);
+        g_ThreatScoring = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_SubsystemFlags |= SubsysFlag_ThreatScoring;
+        ShadowStrikeLogInitStatus("Threat Scoring", STATUS_SUCCESS);
     }
 
     //
@@ -635,6 +1304,189 @@ ShadowStrikeUnload(
             g_DriverData.FilterHandle = NULL;
         }
     }
+
+    // =========================================================================
+    // PHASE 6A SHUTDOWN: Scoring Orchestration
+    // =========================================================================
+
+    if (g_SubsystemFlags & SubsysFlag_ThreatScoring) {
+        TsShutdown(g_ThreatScoring);
+        g_ThreatScoring = NULL;
+    }
+
+    // =========================================================================
+    // PHASE 5 SHUTDOWN: Specialized Subsystems (reverse init order)
+    // =========================================================================
+
+    if (g_SubsystemFlags & SubsysFlag_ObjectNamespace) {
+        ShadowDestroyPrivateNamespace();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_KtmMonitor) {
+        ShadowCleanupKtmMonitor();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_AlpcPortMonitor) {
+        ShadowAlpcCleanup();
+    }
+
+    // =========================================================================
+    // PHASE 4 SHUTDOWN: Self-Protection Hardening (reverse init order)
+    // =========================================================================
+
+    if (g_SubsystemFlags & SubsysFlag_CallbackProtection) {
+        CpShutdown(g_CallbackProtector);
+        g_CallbackProtector = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_IntegrityMonitor) {
+        ImShutdown(&g_IntegrityMonitor);
+        g_IntegrityMonitor = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_HandleProtection) {
+        HpShutdown(g_HandleProtection);
+        g_HandleProtection = NULL;
+    }
+
+    // =========================================================================
+    // PHASE 3 SHUTDOWN: Enrichment & Communication (reverse init order)
+    // =========================================================================
+
+    if (g_SubsystemFlags & SubsysFlag_MessageQueue) {
+        MqShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_ScanBridge) {
+        ShadowStrikeScanBridgeShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_MessageHandler) {
+        MhShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_ProcessAnalyzer) {
+        PaShutdown(&g_ProcessAnalyzer);
+        g_ProcessAnalyzer = NULL;
+    }
+
+    // =========================================================================
+    // PHASE 2 SHUTDOWN: Detection Subsystems (reverse init order)
+    // =========================================================================
+
+    if (g_SubsystemFlags & SubsysFlag_NetworkFilter) {
+        NfFilterShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_SyscallMonitor) {
+        ScMonitorShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_MemoryScanner) {
+        MsShutdown(g_MemoryScanner);
+        g_MemoryScanner = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_MemoryMonitor) {
+        MmMonitorShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_BehaviorEngine) {
+        BeEngineShutdown();
+    }
+
+    // =========================================================================
+    // PHASE 1D SHUTDOWN: Telemetry Pipeline (reverse init order)
+    // =========================================================================
+
+    if (g_ManifestGenerator != NULL) {
+        MgShutdown(g_ManifestGenerator);
+        g_ManifestGenerator = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_EventSchema) {
+        EsShutdown(&g_EventSchema);
+        g_EventSchema = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_TelemetryEvents) {
+        TeShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_TelemetryBuffer) {
+        TbShutdown(g_TelemetryBuffer);
+        g_TelemetryBuffer = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_ETWProvider) {
+        EtwProviderShutdown();
+    }
+
+    // =========================================================================
+    // PHASE 1C SHUTDOWN: Power Management
+    // =========================================================================
+
+    if (g_SubsystemFlags & SubsysFlag_PowerCallback) {
+        ShadowUnregisterPowerCallbacks();
+    }
+
+    // =========================================================================
+    // PHASE 1B SHUTDOWN: Performance Infrastructure (reverse init order)
+    // =========================================================================
+
+    if (g_SubsystemFlags & SubsysFlag_CacheOptimization) {
+        CoShutdown(g_CacheOptimizer);
+        g_CacheOptimizer = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_BatchProcessing) {
+        BpShutdown(g_BatchProcessor);
+        g_BatchProcessor = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_ResourceThrottling) {
+        RtShutdown(&g_ResourceThrottler);
+        g_ResourceThrottler = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_PerformanceMonitor) {
+        SsPmShutdown(g_PerformanceMonitor);
+        g_PerformanceMonitor = NULL;
+    }
+
+    // =========================================================================
+    // PHASE 1A SHUTDOWN: Synchronization Infrastructure (reverse init order)
+    // =========================================================================
+
+    if (g_SubsystemFlags & SubsysFlag_DeferredProcedure) {
+        DpcShutdown(&g_DpcManager);
+        g_DpcManager = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_TimerManager) {
+        TmShutdown(g_TimerManager);
+        g_TimerManager = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_AsyncWorkQueue) {
+        AwqShutdown(g_AsyncWorkQueue);
+        g_AsyncWorkQueue = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_ThreadPool) {
+        TpDestroy(&g_ThreadPool, TRUE);
+        g_ThreadPool = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_WorkQueue) {
+        ShadowStrikeWorkQueueShutdown(TRUE);
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_SpinLockSubsystem) {
+        ShadowStrikeLockSubsystemCleanup();
+    }
+
+    g_SubsystemFlags = SubsysFlag_None;
 
     //
     // Step 10: Cleanup lookaside lists
@@ -1143,6 +1995,180 @@ ShadowStrikeCleanupByFlags(
             g_DriverData.FilterHandle = NULL;
         }
     }
+
+    //
+    // Phase 6A: Shutdown scoring orchestration
+    //
+    if (g_SubsystemFlags & SubsysFlag_ThreatScoring) {
+        TsShutdown(g_ThreatScoring);
+        g_ThreatScoring = NULL;
+    }
+
+    //
+    // Phase 5: Shutdown specialized subsystems (reverse init order)
+    //
+    if (g_SubsystemFlags & SubsysFlag_ObjectNamespace) {
+        ShadowDestroyPrivateNamespace();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_KtmMonitor) {
+        ShadowCleanupKtmMonitor();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_AlpcPortMonitor) {
+        ShadowAlpcCleanup();
+    }
+
+    //
+    // Phase 4: Shutdown self-protection (reverse init order)
+    //
+    if (g_SubsystemFlags & SubsysFlag_CallbackProtection) {
+        CpShutdown(g_CallbackProtector);
+        g_CallbackProtector = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_IntegrityMonitor) {
+        ImShutdown(&g_IntegrityMonitor);
+        g_IntegrityMonitor = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_HandleProtection) {
+        HpShutdown(g_HandleProtection);
+        g_HandleProtection = NULL;
+    }
+
+    //
+    // Phase 3: Shutdown enrichment & communication (reverse init order)
+    //
+    if (g_SubsystemFlags & SubsysFlag_MessageQueue) {
+        MqShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_ScanBridge) {
+        ShadowStrikeScanBridgeShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_MessageHandler) {
+        MhShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_ProcessAnalyzer) {
+        PaShutdown(&g_ProcessAnalyzer);
+        g_ProcessAnalyzer = NULL;
+    }
+
+    //
+    // Phase 2: Shutdown detection subsystems (reverse init order)
+    //
+    if (g_SubsystemFlags & SubsysFlag_NetworkFilter) {
+        NfFilterShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_SyscallMonitor) {
+        ScMonitorShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_MemoryScanner) {
+        MsShutdown(g_MemoryScanner);
+        g_MemoryScanner = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_MemoryMonitor) {
+        MmMonitorShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_BehaviorEngine) {
+        BeEngineShutdown();
+    }
+
+    //
+    // Phase 1D: Shutdown telemetry pipeline (reverse init order)
+    //
+    if (g_ManifestGenerator != NULL) {
+        MgShutdown(g_ManifestGenerator);
+        g_ManifestGenerator = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_EventSchema) {
+        EsShutdown(&g_EventSchema);
+        g_EventSchema = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_TelemetryEvents) {
+        TeShutdown();
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_TelemetryBuffer) {
+        TbShutdown(g_TelemetryBuffer);
+        g_TelemetryBuffer = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_ETWProvider) {
+        EtwProviderShutdown();
+    }
+
+    //
+    // Phase 1C: Shutdown power management
+    //
+    if (g_SubsystemFlags & SubsysFlag_PowerCallback) {
+        ShadowUnregisterPowerCallbacks();
+    }
+
+    //
+    // Phase 1B: Shutdown performance infrastructure (reverse init order)
+    //
+    if (g_SubsystemFlags & SubsysFlag_CacheOptimization) {
+        CoShutdown(g_CacheOptimizer);
+        g_CacheOptimizer = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_BatchProcessing) {
+        BpShutdown(g_BatchProcessor);
+        g_BatchProcessor = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_ResourceThrottling) {
+        RtShutdown(&g_ResourceThrottler);
+        g_ResourceThrottler = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_PerformanceMonitor) {
+        SsPmShutdown(g_PerformanceMonitor);
+        g_PerformanceMonitor = NULL;
+    }
+
+    //
+    // Phase 1A: Shutdown sync infrastructure (reverse init order)
+    //
+    if (g_SubsystemFlags & SubsysFlag_DeferredProcedure) {
+        DpcShutdown(&g_DpcManager);
+        g_DpcManager = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_TimerManager) {
+        TmShutdown(g_TimerManager);
+        g_TimerManager = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_AsyncWorkQueue) {
+        AwqShutdown(g_AsyncWorkQueue);
+        g_AsyncWorkQueue = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_ThreadPool) {
+        TpDestroy(&g_ThreadPool, TRUE);
+        g_ThreadPool = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_WorkQueue) {
+        ShadowStrikeWorkQueueShutdown(TRUE);
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_SpinLockSubsystem) {
+        ShadowStrikeLockSubsystemCleanup();
+    }
+
+    g_SubsystemFlags = SubsysFlag_None;
 
     if (InitFlags & InitFlag_LookasideLists) {
         ShadowStrikeCleanupLookasideLists();
