@@ -1034,6 +1034,87 @@ DriverEntry(
     } else {
         g_SubsystemFlags |= SubsysFlag_CallbackProtection;
         ShadowStrikeLogInitStatus("Callback Protection", STATUS_SUCCESS);
+
+        //
+        // Wire all registered callbacks into callback protection for tamper detection.
+        // CpProtectCallback computes SHA-256 of callback code and backs up original bytes
+        // so periodic verification can detect and restore tampered callback routines.
+        //
+
+        // Protect minifilter callback (if registered)
+        if (g_InitFlags & InitFlag_FilterRegistered) {
+            (VOID)CpProtectCallback(
+                g_CallbackProtector,
+                CpCallback_Minifilter,
+                (PVOID)g_DriverData.FilterHandle,
+                (PVOID)(ULONG_PTR)ShadowStrikeGetFilterRegistration
+            );
+        }
+
+        // Protect process creation callback
+        if (g_DriverData.ProcessNotifyRegistered) {
+            (VOID)CpProtectCallback(
+                g_CallbackProtector,
+                CpCallback_Process,
+                (PVOID)ShadowStrikeProcessNotifyCallback,
+                (PVOID)ShadowStrikeProcessNotifyCallback
+            );
+        }
+
+        // Protect thread creation callback
+        if (g_DriverData.ThreadNotifyRegistered) {
+            (VOID)CpProtectCallback(
+                g_CallbackProtector,
+                CpCallback_Thread,
+                (PVOID)ShadowStrikeThreadNotifyCallback,
+                (PVOID)ShadowStrikeThreadNotifyCallback
+            );
+        }
+
+        // Protect image load callback
+        if (g_DriverData.ImageNotifyRegistered) {
+            (VOID)CpProtectCallback(
+                g_CallbackProtector,
+                CpCallback_Image,
+                (PVOID)ShadowStrikeImageNotifyCallback,
+                (PVOID)ShadowStrikeImageNotifyCallback
+            );
+        }
+
+        // Protect registry callback
+        if (g_InitFlags & InitFlag_RegistryCallbackReg) {
+            (VOID)CpProtectCallback(
+                g_CallbackProtector,
+                CpCallback_Registry,
+                (PVOID)(ULONG_PTR)g_DriverData.RegistryCallbackCookie.QuadPart,
+                (PVOID)ShadowStrikeRegistryCallbackRoutine
+            );
+        }
+
+        // Protect object callbacks (process + thread handle protection)
+        if (g_InitFlags & InitFlag_ObjectCallbackReg) {
+            (VOID)CpProtectCallback(
+                g_CallbackProtector,
+                CpCallback_Object,
+                g_DriverData.ObjectCallbackHandle,
+                (PVOID)ShadowStrikeProcessPreCallback
+            );
+        }
+
+        //
+        // Enable periodic integrity verification (every 5 seconds)
+        // This detects callback code patching by rootkits
+        //
+        (VOID)CpEnablePeriodicVerify(g_CallbackProtector, 5000);
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "[ShadowStrike] Callback protection wired: %u callbacks protected with 5s verification\n",
+                   (g_DriverData.ProcessNotifyRegistered ? 1u : 0u) +
+                   (g_DriverData.ThreadNotifyRegistered ? 1u : 0u) +
+                   (g_DriverData.ImageNotifyRegistered ? 1u : 0u) +
+                   ((g_InitFlags & InitFlag_RegistryCallbackReg) ? 1u : 0u) +
+                   ((g_InitFlags & InitFlag_ObjectCallbackReg) ? 1u : 0u) +
+                   ((g_InitFlags & InitFlag_FilterRegistered) ? 1u : 0u));
     }
 
     // =========================================================================
@@ -1192,7 +1273,33 @@ ShadowStrikeUnload(
                "[ShadowStrike] Rundown complete, proceeding with cleanup.\n");
 
     //
-    // Step 3: Unregister callbacks in reverse order of registration
+    // Step 3: Unprotect callbacks from tamper detection before unregistering
+    //
+    if (g_SubsystemFlags & SubsysFlag_CallbackProtection) {
+        CpDisablePeriodicVerify(g_CallbackProtector);
+
+        if (g_DriverData.ProcessNotifyRegistered) {
+            CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeProcessNotifyCallback);
+        }
+        if (g_DriverData.ThreadNotifyRegistered) {
+            CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeThreadNotifyCallback);
+        }
+        if (g_DriverData.ImageNotifyRegistered) {
+            CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeImageNotifyCallback);
+        }
+        if (g_InitFlags & InitFlag_RegistryCallbackReg) {
+            CpUnprotectCallback(g_CallbackProtector, (PVOID)(ULONG_PTR)g_DriverData.RegistryCallbackCookie.QuadPart);
+        }
+        if (g_InitFlags & InitFlag_ObjectCallbackReg) {
+            CpUnprotectCallback(g_CallbackProtector, g_DriverData.ObjectCallbackHandle);
+        }
+        if (g_InitFlags & InitFlag_FilterRegistered) {
+            CpUnprotectCallback(g_CallbackProtector, (PVOID)g_DriverData.FilterHandle);
+        }
+    }
+
+    //
+    // Step 4: Unregister callbacks in reverse order of registration
     //
     if (g_InitFlags & InitFlag_ObjectCallbackReg) {
         ShadowStrikeUnregisterObjectCallbacks();
@@ -1927,6 +2034,35 @@ ShadowStrikeCleanupByFlags(
     //
     // Cleanup in reverse order based on what was actually initialized
     //
+
+    // Unprotect callbacks from tamper detection before OS unregistration
+    if (g_SubsystemFlags & SubsysFlag_CallbackProtection) {
+        CpDisablePeriodicVerify(g_CallbackProtector);
+
+        if (g_DriverData.ProcessNotifyRegistered) {
+            CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeProcessNotifyCallback);
+        }
+        if (g_DriverData.ThreadNotifyRegistered) {
+            CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeThreadNotifyCallback);
+        }
+        if (g_DriverData.ImageNotifyRegistered) {
+            CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeImageNotifyCallback);
+        }
+        if (InitFlags & InitFlag_RegistryCallbackReg) {
+            CpUnprotectCallback(g_CallbackProtector, (PVOID)(ULONG_PTR)g_DriverData.RegistryCallbackCookie.QuadPart);
+        }
+        if (InitFlags & InitFlag_ObjectCallbackReg) {
+            CpUnprotectCallback(g_CallbackProtector, g_DriverData.ObjectCallbackHandle);
+        }
+        if (InitFlags & InitFlag_FilterRegistered) {
+            CpUnprotectCallback(g_CallbackProtector, (PVOID)g_DriverData.FilterHandle);
+        }
+
+        CpShutdown(g_CallbackProtector);
+        g_CallbackProtector = NULL;
+        g_SubsystemFlags &= ~SubsysFlag_CallbackProtection;
+    }
+
     if (InitFlags & InitFlag_ObjectCallbackReg) {
         ShadowStrikeUnregisterObjectCallbacks();
     }
