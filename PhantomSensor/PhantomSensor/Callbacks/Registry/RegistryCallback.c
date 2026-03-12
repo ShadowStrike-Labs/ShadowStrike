@@ -44,6 +44,7 @@
 #include "../../Core/Globals.h"
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../Communication/ScanBridge.h"
+#include "../../Behavioral/BehaviorEngine.h"
 
 // ============================================================================
 // POOL TAGS
@@ -1344,6 +1345,47 @@ ShadowStrikeAnalyzeRegistryPersistence(
     if (ShadowStrikeDetectRansomwareRegistryBehavior(RegistryPath, ValueName, RegOpSetValue)) {
         threatIndicators |= RegThreatRansomware;
         shouldNotify = TRUE;
+    }
+
+    //
+    // Submit registry threat indicators to BehaviorEngine for kill-chain correlation.
+    // Persistence (T1547/T1543/T1546), Defense Evasion, Ransomware behavior.
+    //
+    if (shouldNotify && threatIndicators != RegThreatNone) {
+        BEHAVIOR_EVENT_TYPE beEventType = BehaviorEvent_RegistryRunKey;
+        BEHAVIOR_EVENT_CATEGORY beCategory = BehaviorCategory_PersistenceOperation;
+        UINT32 beScore = 20;
+
+        if (threatIndicators & RegThreatRansomware) {
+            beEventType = BehaviorEvent_RansomwareBehavior;
+            beCategory = BehaviorCategory_Impact;
+            beScore = 50;
+        } else if (threatIndicators & RegThreatPrivilegeEsc) {
+            beEventType = BehaviorEvent_PrivilegeEscalation;
+            beCategory = BehaviorCategory_PrivilegeOperation;
+            beScore = 35;
+        } else if (threatIndicators & RegThreatDefenseEvasion) {
+            beEventType = BehaviorEvent_DisableWindowsDefender;
+            beCategory = BehaviorCategory_DefenseEvasion;
+            beScore = 40;
+        } else if (keyFlags & RegFlagServiceKey) {
+            beEventType = BehaviorEvent_ServicePersistence;
+            beScore = 30;
+        } else if (keyFlags & RegFlagIFEOKey) {
+            beEventType = BehaviorEvent_ImageFilePersistence;
+            beScore = 35;
+        }
+
+        BeEngineSubmitEvent(
+            beEventType,
+            beCategory,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL,
+            0,
+            beScore,
+            FALSE,
+            NULL
+            );
     }
 
     //

@@ -59,6 +59,7 @@
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Communication/CommPort.h"
+#include "../../Behavioral/BehaviorEngine.h"
 
 #ifdef WPP_TRACING
 #include "ObjectCallback.tmh"
@@ -763,6 +764,34 @@ ShadowStrikeProcessPreCallback(
 
         if (suspicionScore >= OB_SUSPICIOUS_SCORE_THRESHOLD) {
             InterlockedIncrement64(&context->SuspiciousOperations);
+
+            //
+            // Submit handle manipulation events to BehaviorEngine for kill-chain
+            // correlation. LSASS credential access (T1003), injection (T1055),
+            // process termination attacks all manifest through handle requests.
+            //
+            {
+                BEHAVIOR_EVENT_TYPE beType = BehaviorEvent_CrossProcessWrite;
+                BEHAVIOR_EVENT_CATEGORY beCat = BehaviorCategory_CodeInjection;
+
+                if (targetCategory == PpCategoryLsass) {
+                    beType = BehaviorEvent_LSASSAccess;
+                    beCat = BehaviorCategory_CredentialAccess;
+                } else if (strippedAccess & PROCESS_TERMINATE) {
+                    beType = BehaviorEvent_ProcessTerminate;
+                    beCat = BehaviorCategory_Impact;
+                }
+
+                BeEngineSubmitEvent(
+                    beType,
+                    beCat,
+                    HandleToULong(sourceProcessId),
+                    NULL, 0,
+                    (UINT32)suspicionScore,
+                    FALSE,
+                    NULL
+                    );
+            }
         }
 
         //
@@ -971,6 +1000,19 @@ ShadowStrikeThreadPreCallback(
 
         if (suspicionScore >= OB_SUSPICIOUS_SCORE_THRESHOLD) {
             InterlockedIncrement64(&context->SuspiciousOperations);
+
+            //
+            // Thread handle injection pattern → BehaviorEngine (T1055)
+            //
+            BeEngineSubmitEvent(
+                BehaviorEvent_ThreadExecutionHijack,
+                BehaviorCategory_CodeInjection,
+                HandleToULong(sourceProcessId),
+                NULL, 0,
+                (UINT32)suspicionScore,
+                FALSE,
+                NULL
+                );
         }
 
         //

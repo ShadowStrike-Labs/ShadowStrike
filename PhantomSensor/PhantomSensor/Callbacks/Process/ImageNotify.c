@@ -55,6 +55,7 @@
 #include "../../Utilities/HashUtils.h"
 #include "../../Utilities/StringUtils.h"
 #include "../../Utilities/ProcessUtils.h"
+#include "../../Behavioral/BehaviorEngine.h"
 
 //
 // Forward declarations for undocumented but exported ntoskrnl APIs
@@ -2097,6 +2098,35 @@ Arguments:
     // Detects runtime patching of AmsiScanBuffer/AmsiOpenSession (T1562.001)
     //
     AbdNotifyImageLoad(ProcessId, ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName);
+
+    //
+    // Submit suspicious image loads to BehaviorEngine for kill-chain correlation.
+    // Covers DLL injection (T1055.001), sideloading (T1574.002), BYOVD (T1068).
+    //
+    if (event->SuspiciousReasons != ImgSuspicious_None || event->ThreatScore >= 30) {
+        BEHAVIOR_EVENT_TYPE beType = BehaviorEvent_DriverLoad;
+
+        if (ProcessId != NULL) {
+            if (event->SuspiciousReasons & ImgSuspicious_KnownMalware) {
+                beType = BehaviorEvent_ReflectiveDLLLoad;
+            } else if (event->Flags & ImgFlag_Unsigned) {
+                beType = BehaviorEvent_ModuleStomping;
+            } else {
+                beType = BehaviorEvent_DLLHijacking;
+            }
+        }
+
+        BeEngineSubmitEvent(
+            beType,
+            (ProcessId == NULL) ? BehaviorCategory_DefenseEvasion : BehaviorCategory_CodeInjection,
+            HandleToULong(ProcessId),
+            event,
+            sizeof(*event),
+            (UINT32)event->ThreatScore,
+            FALSE,
+            NULL
+            );
+    }
 
     //
     // Send notification to user mode if threshold met or image was blocked

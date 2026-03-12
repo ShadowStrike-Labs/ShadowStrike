@@ -61,6 +61,7 @@
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Shared/KernelProcessTypes.h"
+#include "../../Behavioral/BehaviorEngine.h"
 
 //
 // Minimal layout-compatible struct for protected process list traversal.
@@ -895,6 +896,27 @@ Routine Description:
             //
             TnpSendNotification(event);
             TnpInvokeUserCallback(event);
+
+            //
+            // Submit injection events to BehaviorEngine for kill-chain correlation.
+            // Remote thread creation is a primary injection vector (MITRE T1055).
+            //
+            if (event->IsRemote && event->InjectionScore > 0) {
+                BEHAVIOR_EVENT_TYPE beEventType = BehaviorEvent_RemoteThreadCreate;
+
+                if (event->InjectionScore >= g_TnMonitor.Config.InjectionScoreThreshold) {
+                    BeEngineSubmitEvent(
+                        beEventType,
+                        BehaviorCategory_CodeInjection,
+                        HandleToULong(event->TargetProcessId),
+                        event,
+                        sizeof(*event),
+                        (UINT32)event->InjectionScore,
+                        FALSE,
+                        NULL
+                        );
+                }
+            }
 
             //
             // Add to recent events if tracking history

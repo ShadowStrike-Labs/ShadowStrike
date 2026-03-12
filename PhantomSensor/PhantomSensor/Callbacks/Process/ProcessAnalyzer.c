@@ -40,6 +40,11 @@ Security Hardening Applied:
 --*/
 
 #include "ProcessAnalyzer.h"
+#include "CommandLineParser.h"
+#include "ParentChainTracker.h"
+#include "ProcessRelationship.h"
+#include "TokenAnalyzer.h"
+#include "HandleTracker.h"
 #include <ntstrsafe.h>
 
 //
@@ -424,6 +429,17 @@ static NTSTATUS PapSafeStringCopy(_Out_ PUNICODE_STRING Dest, _In_ PCUNICODE_STR
 static NTSTATUS PapGetProcessCreationTime(_In_ PEPROCESS Process, _Out_ PLARGE_INTEGER CreationTime);
 
 // ============================================================================
+// CHILD SUBSYSTEM GLOBALS
+// Initialized in PaInitialize, shutdown in PaShutdown.
+// ============================================================================
+
+static PCLP_PARSER g_CmdLineParser;
+static PPCT_TRACKER g_ParentChainTracker;
+static PPR_GRAPH g_ProcessRelationship;
+static PTA_ANALYZER g_TokenAnalyzer;
+static PHT_TRACKER g_HandleTracker;
+
+// ============================================================================
 // PUBLIC API IMPLEMENTATION
 // ============================================================================
 
@@ -612,6 +628,53 @@ PaInitialize(
     Internal->CleanupTimerActive = TRUE;
 
     //
+    // Initialize child subsystems — failures are non-fatal.
+    //
+    {
+        NTSTATUS childStatus;
+
+        childStatus = ClpInitialize(&g_CmdLineParser);
+        if (!NT_SUCCESS(childStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:ProcessAnalyzer] CommandLineParser init failed: 0x%08X\n",
+                       childStatus);
+            g_CmdLineParser = NULL;
+        }
+
+        childStatus = PctInitialize(&g_ParentChainTracker);
+        if (!NT_SUCCESS(childStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:ProcessAnalyzer] ParentChainTracker init failed: 0x%08X\n",
+                       childStatus);
+            g_ParentChainTracker = NULL;
+        }
+
+        childStatus = PrInitialize(&g_ProcessRelationship);
+        if (!NT_SUCCESS(childStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:ProcessAnalyzer] ProcessRelationship init failed: 0x%08X\n",
+                       childStatus);
+            g_ProcessRelationship = NULL;
+        }
+
+        childStatus = TaInitialize(&g_TokenAnalyzer);
+        if (!NT_SUCCESS(childStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:ProcessAnalyzer] TokenAnalyzer init failed: 0x%08X\n",
+                       childStatus);
+            g_TokenAnalyzer = NULL;
+        }
+
+        childStatus = HtInitialize(&g_HandleTracker, NULL);
+        if (!NT_SUCCESS(childStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:ProcessAnalyzer] HandleTracker init failed: 0x%08X\n",
+                       childStatus);
+            g_HandleTracker = NULL;
+        }
+    }
+
+    //
     // Mark as initialized
     //
     Internal->Initialized = TRUE;
@@ -738,6 +801,30 @@ PaShutdown(
         Entry = RemoveHeadList(&FreeList);
         Analysis = CONTAINING_RECORD(Entry, PA_ANALYSIS_INTERNAL, HashEntry);
         PapFreeAnalysisInternal(Internal, Analysis);
+    }
+
+    //
+    // Shutdown child subsystems (reverse init order)
+    //
+    if (g_HandleTracker != NULL) {
+        HtShutdown(&g_HandleTracker);
+        g_HandleTracker = NULL;
+    }
+    if (g_TokenAnalyzer != NULL) {
+        TaShutdown(g_TokenAnalyzer);
+        g_TokenAnalyzer = NULL;
+    }
+    if (g_ProcessRelationship != NULL) {
+        PrShutdown(g_ProcessRelationship);
+        g_ProcessRelationship = NULL;
+    }
+    if (g_ParentChainTracker != NULL) {
+        PctShutdown(g_ParentChainTracker);
+        g_ParentChainTracker = NULL;
+    }
+    if (g_CmdLineParser != NULL) {
+        ClpShutdown(g_CmdLineParser);
+        g_CmdLineParser = NULL;
     }
 
     //
