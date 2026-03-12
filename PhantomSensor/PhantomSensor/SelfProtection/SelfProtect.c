@@ -54,6 +54,7 @@
 #include "../Core/Globals.h"
 #include "../Shared/SharedDefs.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Behavioral/BehaviorEngine.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeInitializeSelfProtection)
@@ -1219,6 +1220,17 @@ ShadowStrikeShouldBlockFileAccess(
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] BLOCKED delete of protected file by PID %p: %wZ\n",
                    RequestorPid, FilePath);
+
+        (VOID)BeEngineSubmitEvent(
+            BehaviorEvent_DisableWindowsDefender,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(RequestorPid),
+            NULL, 0,
+            85,
+            FALSE,
+            NULL
+            );
+
         return TRUE;
     }
 
@@ -1229,6 +1241,17 @@ ShadowStrikeShouldBlockFileAccess(
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] BLOCKED write to protected file by PID %p: %wZ\n",
                    RequestorPid, FilePath);
+
+        (VOID)BeEngineSubmitEvent(
+            BehaviorEvent_DisableWindowsDefender,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(RequestorPid),
+            NULL, 0,
+            85,
+            FALSE,
+            NULL
+            );
+
         return TRUE;
     }
 
@@ -1287,6 +1310,17 @@ ShadowStrikeShouldBlockRegistryAccess(
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                        "[ShadowStrike] BLOCKED registry change by PID %p: %wZ (op=%d)\n",
                        RequestorPid, KeyPath, Operation);
+
+            (VOID)BeEngineSubmitEvent(
+                BehaviorEvent_DisableWindowsDefender,
+                BehaviorCategory_DefenseEvasion,
+                HandleToULong(RequestorPid),
+                NULL, 0,
+                85,
+                FALSE,
+                NULL
+                );
+
             return TRUE;
 
         default:

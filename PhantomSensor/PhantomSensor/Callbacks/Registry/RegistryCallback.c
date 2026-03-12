@@ -45,6 +45,7 @@
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../Communication/ScanBridge.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Exclusions/ExclusionManager.h"
 
 // ============================================================================
 // POOL TAGS
@@ -1498,6 +1499,13 @@ ShadowStrikeRegistryCallbackRoutine(
     }
 
     processId = PsGetCurrentProcessId();
+
+    //
+    // Skip analysis if the requesting process is excluded
+    //
+    if (ShadowStrikeIsProcessExcluded(processId, NULL)) {
+        return STATUS_SUCCESS;
+    }
 
     //
     // Extract key object based on operation type

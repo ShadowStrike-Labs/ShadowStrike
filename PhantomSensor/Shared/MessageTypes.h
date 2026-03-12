@@ -96,6 +96,31 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     //
     FilterMessageType_RansomwareAlert,        // Ransomware behavior detected (PostWrite)
 
+    //
+    // User-Mode → Kernel Data Push Messages (0x70 - 0x8F)
+    // These enable the user-mode agent to push updated threat intelligence,
+    // behavioral rules, and configuration to the kernel driver at runtime.
+    //
+    FilterMessageType_PushHashDatabase,       // Updated hash DB (good/bad hashes)
+    FilterMessageType_PushPatternDatabase,    // Updated pattern matching rules
+    FilterMessageType_PushSignatureDatabase,  // Updated file signatures
+    FilterMessageType_PushIoCFeed,            // IoC feed injection (hashes, IPs, domains)
+    FilterMessageType_PushWhitelist,          // Whitelist/allowlist updates
+    FilterMessageType_UpdateBehavioralRules,  // Runtime behavioral rule updates
+    FilterMessageType_PushNetworkIoC,         // Network IoC (C2 IPs, malicious domains)
+    FilterMessageType_ExclusionUpdate,        // Exclusion list add/remove/clear
+
+    //
+    // Telemetry & Status Messages (0x90 - 0x9F)
+    //
+    FilterMessageType_BehavioralAlert,        // Behavioral detection event
+    FilterMessageType_MemoryAlert,            // Memory anomaly detection
+    FilterMessageType_NetworkAlert,           // Network threat detection
+    FilterMessageType_SyscallAlert,           // Suspicious syscall pattern
+    FilterMessageType_SelfProtectAlert,       // Tamper attempt detected
+    FilterMessageType_ExclusionQuery,         // Query current exclusion state
+    FilterMessageType_ThreatScoreNotify,      // Composite threat score update
+
     FilterMessageType_Max
 } SHADOWSTRIKE_MESSAGE_TYPE;
 
@@ -144,6 +169,28 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
 #define ShadowStrikeMessageHandleAlert              FilterMessageType_HandleAlert
 #define SHADOWSTRIKE_MSG_PROCESS_HANDLE_ALERT        FilterMessageType_HandleAlert
 
+// Ransomware alert alias
+#define ShadowStrikeMessageRansomwareAlert          FilterMessageType_RansomwareAlert
+
+// Data push aliases (user-mode → kernel)
+#define ShadowStrikeMessagePushHashDB               FilterMessageType_PushHashDatabase
+#define ShadowStrikeMessagePushPatternDB            FilterMessageType_PushPatternDatabase
+#define ShadowStrikeMessagePushSignatureDB          FilterMessageType_PushSignatureDatabase
+#define ShadowStrikeMessagePushIoCFeed              FilterMessageType_PushIoCFeed
+#define ShadowStrikeMessagePushWhitelist            FilterMessageType_PushWhitelist
+#define ShadowStrikeMessageUpdateBehavioralRules    FilterMessageType_UpdateBehavioralRules
+#define ShadowStrikeMessagePushNetworkIoC           FilterMessageType_PushNetworkIoC
+#define ShadowStrikeMessageExclusionUpdate          FilterMessageType_ExclusionUpdate
+
+// Telemetry/alert aliases
+#define ShadowStrikeMessageBehavioralAlert          FilterMessageType_BehavioralAlert
+#define ShadowStrikeMessageMemoryAlert              FilterMessageType_MemoryAlert
+#define ShadowStrikeMessageNetworkAlert             FilterMessageType_NetworkAlert
+#define ShadowStrikeMessageSyscallAlert             FilterMessageType_SyscallAlert
+#define ShadowStrikeMessageSelfProtectAlert         FilterMessageType_SelfProtectAlert
+#define ShadowStrikeMessageExclusionQuery           FilterMessageType_ExclusionQuery
+#define ShadowStrikeMessageThreatScoreNotify        FilterMessageType_ThreatScoreNotify
+
 // ============================================================================
 // MESSAGE TYPE VALIDATION
 // ============================================================================
@@ -167,7 +214,20 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     ((type) == FilterMessageType_ProcessNotify || \
      (type) == FilterMessageType_ThreadNotify || \
      (type) == FilterMessageType_ImageLoad || \
-     (type) == FilterMessageType_RegistryNotify)
+     (type) == FilterMessageType_RegistryNotify || \
+     (type) == FilterMessageType_BehavioralAlert || \
+     (type) == FilterMessageType_MemoryAlert || \
+     (type) == FilterMessageType_NetworkAlert || \
+     (type) == FilterMessageType_SyscallAlert || \
+     (type) == FilterMessageType_SelfProtectAlert || \
+     (type) == FilterMessageType_ThreatScoreNotify)
+
+/**
+ * @brief Check if message type is a user-mode → kernel data push.
+ */
+#define SHADOWSTRIKE_IS_DATA_PUSH_MESSAGE(type) \
+    ((type) >= FilterMessageType_PushHashDatabase && \
+     (type) <= FilterMessageType_ExclusionUpdate)
 
 /**
  * @brief Check if message type requires a reply.

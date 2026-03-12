@@ -44,6 +44,7 @@
 #include "../../Shared/SharedDefs.h"
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Exclusions/ExclusionManager.h"
 #include <ntstrsafe.h>
 
 //
@@ -659,6 +660,14 @@ NpMonPreCreateNamedPipe(
     }
 
     creatorPid = PsGetCurrentProcessId();
+
+    //
+    // Skip analysis if the pipe creator process is excluded
+    //
+    if (ShadowStrikeIsProcessExcluded(creatorPid, NULL)) {
+        ExReleaseRundownProtection(&g_NpmState.RundownRef);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
 
     //
     // Capture creator process identity for validation and forensics.

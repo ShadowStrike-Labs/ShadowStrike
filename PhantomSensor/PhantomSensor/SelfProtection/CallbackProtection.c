@@ -53,6 +53,7 @@
 --*/
 
 #include "CallbackProtection.h"
+#include "../Behavioral/BehaviorEngine.h"
 
 #pragma warning(push)
 #pragma warning(disable:4324)
@@ -1232,6 +1233,16 @@ CpVerifyAll(
             tampered++;
 
             InterlockedIncrement64(&Protector->Stats.TamperAttempts);
+
+            (VOID)BeEngineSubmitEvent(
+                BehaviorEvent_CallbackRemoval,
+                BehaviorCategory_DefenseEvasion,
+                HandleToULong(PsGetCurrentProcessId()),
+                NULL, 0,
+                95,
+                FALSE,
+                NULL
+                );
 
             if (Protector->EnableRestoration && cbEntry->HasBackup) {
                 if (CppRestoreCallback(cbEntry)) {

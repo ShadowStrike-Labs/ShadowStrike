@@ -32,6 +32,7 @@
 --*/
 
 #include "AntiDebug.h"
+#include "../Behavioral/BehaviorEngine.h"
 #include <ntifs.h>
 #include <ntstrsafe.h>
 #include <intrin.h>
@@ -182,10 +183,28 @@ AdbInitialize(
     if (Ctx->KernelDebuggerPresent) {
         AdbpRecordEvent(Ctx, AdbAttemptKernelDebugger,
                         "Kernel debugger detected at initialization");
+        (VOID)BeEngineSubmitEvent(
+            BehaviorEvent_DebuggerEvasion,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL, 0,
+            70,
+            FALSE,
+            NULL
+            );
     }
     if (Ctx->HypervisorPresent) {
         AdbpRecordEvent(Ctx, AdbAttemptHypervisor,
                         "Hypervisor detected at initialization");
+        (VOID)BeEngineSubmitEvent(
+            BehaviorEvent_VirtualizationEvasion,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL, 0,
+            50,
+            FALSE,
+            NULL
+            );
     }
     if (Ctx->VerifierEnabled) {
         AdbpRecordEvent(Ctx, AdbAttemptDriverVerifier,
@@ -382,6 +401,15 @@ AdbCheckForDebugger(
     if (CurrentState && !PreviousState) {
         AdbpRecordEvent(Protector, AdbAttemptKernelDebugger,
                         "Kernel debugger newly detected");
+        (VOID)BeEngineSubmitEvent(
+            BehaviorEvent_DebuggerEvasion,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL, 0,
+            70,
+            FALSE,
+            NULL
+            );
     }
 
     // Also check for user-mode debugger on our process
@@ -390,6 +418,15 @@ AdbCheckForDebugger(
             // Only log if kernel debugger wasn't already the trigger
             AdbpRecordEvent(Protector, AdbAttemptUserDebugger,
                             "User-mode debugger detected on driver process");
+            (VOID)BeEngineSubmitEvent(
+                BehaviorEvent_DebuggerEvasion,
+                BehaviorCategory_DefenseEvasion,
+                HandleToULong(PsGetCurrentProcessId()),
+                NULL, 0,
+                60,
+                FALSE,
+                NULL
+                );
         }
         CurrentState = TRUE;
     }
@@ -434,6 +471,15 @@ AdbCheckForHypervisor(
     if (CurrentState && !PreviousState) {
         AdbpRecordEvent(Protector, AdbAttemptHypervisor,
                         "Hypervisor newly detected");
+        (VOID)BeEngineSubmitEvent(
+            BehaviorEvent_VirtualizationEvasion,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL, 0,
+            50,
+            FALSE,
+            NULL
+            );
     }
 
     *HypervisorPresent = CurrentState;

@@ -53,6 +53,7 @@ v2.1.0 Changes (Enterprise Hardened):
 #include "SelfProtect.h"
 #include "CallbackProtection.h"
 #include "../Core/Globals.h"
+#include "../Behavioral/BehaviorEngine.h"
 #include <ntstrsafe.h>
 #include <bcrypt.h>
 
@@ -859,6 +860,17 @@ ImpCheckComponent(
                     Monitor->Sections[i].Name,
                     (ULONG)ModType
                 );
+
+                (VOID)BeEngineSubmitEvent(
+                    BehaviorEvent_ETWPatching,
+                    BehaviorCategory_DefenseEvasion,
+                    HandleToULong(PsGetCurrentProcessId()),
+                    NULL, 0,
+                    90,
+                    FALSE,
+                    NULL
+                    );
+
                 break;
             }
         }
@@ -919,6 +931,16 @@ ImpCheckComponent(
                         sizeof(Result->Details),
                         "PE header tampered"
                     );
+
+                    (VOID)BeEngineSubmitEvent(
+                        BehaviorEvent_ETWPatching,
+                        BehaviorCategory_DefenseEvasion,
+                        HandleToULong(PsGetCurrentProcessId()),
+                        NULL, 0,
+                        95,
+                        FALSE,
+                        NULL
+                        );
                 }
                 RtlSecureZeroMemory(CurrentHeaderHash, IM_HASH_SIZE);
             } else {

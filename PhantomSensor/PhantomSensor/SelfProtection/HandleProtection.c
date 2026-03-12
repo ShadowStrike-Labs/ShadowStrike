@@ -48,6 +48,7 @@
 #include "HandleProtection.h"
 #include "SelfProtect.h"
 #include "../Core/Globals.h"
+#include "../Behavioral/BehaviorEngine.h"
 
 // ============================================================================
 // SYSTEM STRUCTURES (for ZwQuerySystemInformation process enumeration)
@@ -820,6 +821,16 @@ HpAnalyzeHandleOperation(
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                        "[ShadowStrike] HANDLE ALERT: PID %p -> PID %p, Score=%u, Flags=0x%08X\n",
                        callerProcessId, targetProcessId, suspicionScore, flags);
+
+            (VOID)BeEngineSubmitEvent(
+                BehaviorEvent_PPLBypass,
+                BehaviorCategory_DefenseEvasion,
+                HandleToULong(callerProcessId),
+                NULL, 0,
+                (UINT32)suspicionScore,
+                FALSE,
+                NULL
+                );
         }
     }
 

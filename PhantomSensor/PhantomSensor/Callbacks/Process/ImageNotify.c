@@ -56,6 +56,7 @@
 #include "../../Utilities/StringUtils.h"
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Exclusions/ExclusionManager.h"
 
 //
 // Forward declarations for undocumented but exported ntoskrnl APIs
@@ -1920,6 +1921,22 @@ Arguments:
     //
     if (!ImgpCheckRateLimit()) {
         InterlockedIncrement64(&g_ImgNotify.Stats.EventsDropped);
+        ExReleaseRundownProtection(&g_ImgNotify.SubsystemRundown);
+        return;
+    }
+
+    //
+    // Check if the loading process is excluded from analysis
+    //
+    if (ProcessId != NULL && ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        ExReleaseRundownProtection(&g_ImgNotify.SubsystemRundown);
+        return;
+    }
+
+    //
+    // Check if the image path is excluded from analysis
+    //
+    if (FullImageName != NULL && ShadowStrikeIsPathExcluded(FullImageName, NULL)) {
         ExReleaseRundownProtection(&g_ImgNotify.SubsystemRundown);
         return;
     }

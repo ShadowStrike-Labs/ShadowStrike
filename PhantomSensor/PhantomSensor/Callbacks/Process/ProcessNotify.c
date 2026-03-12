@@ -78,6 +78,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "AppControl.h"
 #include "ClipboardMonitor.h"
 #include "../../../Shared/VerdictTypes.h"
+#include "../../Exclusions/ExclusionManager.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupWorkRoutine(_In_ PDEVICE_OBJECT, _In_opt_ PVOID);
@@ -1049,6 +1050,19 @@ Arguments:
     // Check for known system process (skip detailed analysis for performance)
     //
     if (PnpIsKnownSystemProcess(ProcessId, Process)) {
+        goto Cleanup;
+    }
+
+    //
+    // Check if process is excluded from behavioral analysis
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_TRACE_LEVEL,
+            "[ShadowStrike/ProcessNotify] PID %lu excluded — skipping analysis\n",
+            HandleToULong(ProcessId)
+            );
         goto Cleanup;
     }
 

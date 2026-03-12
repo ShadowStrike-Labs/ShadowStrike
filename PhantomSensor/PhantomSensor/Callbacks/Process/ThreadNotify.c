@@ -62,6 +62,7 @@
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Shared/KernelProcessTypes.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Exclusions/ExclusionManager.h"
 
 //
 // Minimal layout-compatible struct for protected process list traversal.
@@ -763,6 +764,15 @@ Arguments:
     // Acquire rundown protection for safe shutdown coordination
     //
     if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {
+        return;
+    }
+
+    //
+    // Skip analysis if both the target and source processes are excluded
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL) &&
+        ShadowStrikeIsProcessExcluded(PsGetCurrentProcessId(), NULL)) {
+        SHADOWSTRIKE_RELEASE_RUNDOWN();
         return;
     }
 

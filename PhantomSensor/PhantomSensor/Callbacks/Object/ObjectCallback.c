@@ -60,6 +60,7 @@
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Communication/CommPort.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Exclusions/ExclusionManager.h"
 
 #ifdef WPP_TRACING
 #include "ObjectCallback.tmh"
@@ -649,6 +650,13 @@ ShadowStrikeProcessPreCallback(
     //
     isSelf = (sourceProcessId == targetProcessId);
     if (isSelf) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    //
+    // Skip analysis if the requesting process is excluded
+    //
+    if (ShadowStrikeIsProcessExcluded(sourceProcessId, NULL)) {
         return OB_PREOP_SUCCESS;
     }
 

@@ -810,6 +810,14 @@ MhpIsPrivilegedOperation(
         case FilterMessageType_UpdatePolicy:
         case FilterMessageType_ConfigUpdate:
         case FilterMessageType_RegisterProtectedProcess:
+        case FilterMessageType_PushHashDatabase:
+        case FilterMessageType_PushPatternDatabase:
+        case FilterMessageType_PushSignatureDatabase:
+        case FilterMessageType_PushIoCFeed:
+        case FilterMessageType_PushWhitelist:
+        case FilterMessageType_UpdateBehavioralRules:
+        case FilterMessageType_PushNetworkIoC:
+        case FilterMessageType_ExclusionUpdate:
             return TRUE;
         default:
             return FALSE;
