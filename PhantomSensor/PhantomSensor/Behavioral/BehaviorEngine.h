@@ -40,7 +40,10 @@
 
 #include <ntifs.h>
 #include <ntddk.h>
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
+#pragma warning(pop)
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Shared/AttackPatterns.h"
 

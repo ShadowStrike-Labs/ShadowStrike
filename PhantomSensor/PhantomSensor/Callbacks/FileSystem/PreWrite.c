@@ -1262,6 +1262,8 @@ Return Value:
             DeferredCleanup->NameInfo = PwContext->NameInfo;
             DeferredCleanup->Context = PwContext;
 
+#pragma warning(push)
+#pragma warning(disable:4996) /* ExInitializeWorkItem/ExQueueWorkItem deprecated */
             ExInitializeWorkItem(
                 &DeferredCleanup->WorkItem,
                 PwpDeferredCleanupWorker,
@@ -1269,6 +1271,7 @@ Return Value:
                 );
 
             ExQueueWorkItem(&DeferredCleanup->WorkItem, DelayedWorkQueue);
+#pragma warning(pop)
             InterlockedIncrement64(&g_PwState.Stats.DeferredCleanups);
 
             //

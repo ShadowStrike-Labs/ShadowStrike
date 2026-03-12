@@ -487,8 +487,8 @@ BpQueueEvent(
         return STATUS_INTEGER_OVERFLOW;
     }
 
-    event = (PBP_EVENT)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    event = (PBP_EVENT)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         allocSize,
         BP_POOL_TAG_EVENT
     );

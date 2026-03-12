@@ -56,6 +56,7 @@
 #include "ExclusionManager.h"
 #include "../Utilities/ProcessUtils.h"
 #include "../Utilities/StringUtils.h"
+#include "../SelfProtection/SelfProtect.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -785,14 +786,9 @@ ShadowStrikeOnProcessCreate(
     // Step 3: Check for protected process
     //
     if (!excluded && ctx->ExcludeProtectedProcesses) {
-        PEPROCESS process = NULL;
-        status = PsLookupProcessByProcessId(ProcessId, &process);
-        if (NT_SUCCESS(status)) {
-            if (ShadowStrikeIsProcessProtected(process)) {
-                excluded = TRUE;
-                reason = PeReason_ProtectedProcess;
-            }
-            ObDereferenceObject(process);
+        if (ShadowStrikeIsProcessProtected(ProcessId, NULL)) {
+            excluded = TRUE;
+            reason = PeReason_ProtectedProcess;
         }
     }
 

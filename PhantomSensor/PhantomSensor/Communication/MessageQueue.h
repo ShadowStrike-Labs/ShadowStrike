@@ -55,7 +55,10 @@
 #ifndef SHADOWSTRIKE_MESSAGE_QUEUE_H
 #define SHADOWSTRIKE_MESSAGE_QUEUE_H
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
+#pragma warning(pop)
 #include "../../Shared/MessageTypes.h"
 #include "../../Shared/BehaviorTypes.h"
 

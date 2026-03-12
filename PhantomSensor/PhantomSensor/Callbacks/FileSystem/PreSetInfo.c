@@ -2053,7 +2053,7 @@ PsipGetRenameDestination(
         //
         // USHORT truncation protection for UNICODE_STRING
         //
-        if (fileNameLength > UNICODE_STRING_MAX_BYTES) {
+        if (fileNameLength > MAXUSHORT) {
             return STATUS_NAME_TOO_LONG;
         }
 

@@ -57,6 +57,9 @@
 #ifndef SHADOWSTRIKE_SYSCALL_MONITOR_H
 #define SHADOWSTRIKE_SYSCALL_MONITOR_H
 
+#pragma warning(push)
+#pragma warning(disable:4324)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -740,4 +743,5 @@ ScMonitorGetProcessStats(
 }
 #endif
 
+#pragma warning(pop)
 #endif // SHADOWSTRIKE_SYSCALL_MONITOR_H

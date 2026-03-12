@@ -49,7 +49,10 @@
 #ifndef _SHADOWSTRIKE_MESSAGE_HANDLER_H_
 #define _SHADOWSTRIKE_MESSAGE_HANDLER_H_
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
+#pragma warning(pop)
 #include "../Core/Globals.h"
 #include "../../Shared/MessageTypes.h"
 #include "../../Shared/MessageProtocol.h"

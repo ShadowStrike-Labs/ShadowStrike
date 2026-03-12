@@ -1762,8 +1762,11 @@ SecpCleanupDpcRoutine(
     }
 
     workItem->Tracker = &internal->Public;
+#pragma warning(push)
+#pragma warning(disable:4996) /* ExInitializeWorkItem/ExQueueWorkItem deprecated */
     ExInitializeWorkItem(&workItem->WorkItem, SecpCleanupWorkRoutine, workItem);
     ExQueueWorkItem(&workItem->WorkItem, DelayedWorkQueue);
+#pragma warning(pop)
 }
 
 /**

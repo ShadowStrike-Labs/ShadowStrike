@@ -68,7 +68,10 @@
 extern "C" {
 #endif
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
+#pragma warning(pop)
 #include "../../Shared/MessageProtocol.h"
 #include "../../Shared/VerdictTypes.h"
 #include "../../Shared/MessageTypes.h"
@@ -561,7 +564,7 @@ ShadowStrikeSendScanRequestEx(
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
-ShadowStrikeSendProcessNotification(
+ShadowStrikeSendProcessEvent(
     _In_ HANDLE ProcessId,
     _In_ HANDLE ParentId,
     _In_ BOOLEAN Create,
@@ -758,7 +761,7 @@ ShadowStrikeFreeMessageBuffer(
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
-ShadowStrikeInitMessageHeader(
+SbInitMessageHeader(
     _Out_ PSHADOWSTRIKE_MESSAGE_HEADER Header,
     _In_ SHADOWSTRIKE_MESSAGE_TYPE MessageType,
     _In_ ULONG DataSize

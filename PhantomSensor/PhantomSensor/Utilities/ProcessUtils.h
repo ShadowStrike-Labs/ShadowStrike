@@ -63,7 +63,10 @@
 extern "C" {
 #endif
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
+#pragma warning(pop)
 #include <ntifs.h>
 
 // ============================================================================
@@ -556,23 +559,21 @@ ShadowStrikeIsProcessWow64(
     );
 
 /**
- * @brief Check if process is protected.
+ * @brief Check if process is an OS-level protected process.
  *
- * Queries the SelfProtection module's protected process list.
- * Authoritative declaration is in SelfProtect.h.
+ * Queries the Windows kernel PsIsProtectedProcess status — distinct from
+ * ShadowStrike's own protection list (SelfProtect.h).
  *
- * @param ProcessId  Process ID (HANDLE)
- * @param OutFlags   Optional — receives protection flags
+ * @param Process  EPROCESS pointer
  *
- * @return TRUE if protected process
+ * @return TRUE if OS-level protected
  *
  * @irql <= DISPATCH_LEVEL
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
-ShadowStrikeIsProcessProtected(
-    _In_ HANDLE ProcessId,
-    _Out_opt_ PULONG OutFlags
+ShadowStrikeIsOsProtectedProcess(
+    _In_ PEPROCESS Process
     );
 
 /**

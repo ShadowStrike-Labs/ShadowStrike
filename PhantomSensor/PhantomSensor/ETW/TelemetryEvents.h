@@ -63,7 +63,10 @@
 extern "C" {
 #endif
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
+#pragma warning(pop)
 #include <evntrace.h>
 #include <evntprov.h>
 #include <ntstrsafe.h>

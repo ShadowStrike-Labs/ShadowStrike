@@ -360,6 +360,12 @@
     <ClCompile Include="PhantomSensorELAM\ELAMDriver.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="PhantomSensor\Core\DriverEntry.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\Core\FilterRegistration.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="PhantomSensor\Context\InstanceContext.h">
@@ -722,11 +728,14 @@
     <ClInclude Include="PhantomSensorELAM\ELAMDriver.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="PhantomSensor\SelfProtection\FileProtection.c.bak" />
-    <None Include="PhantomSensor\SelfProtection\FileProtection.h.bak" />
-    <None Include="PhantomSensor\SelfProtection\HandleProtection.c.bak" />
-    <None Include="PhantomSensor\SelfProtection\HandleProtection.h.bak" />
+    <ClInclude Include="PhantomSensor\Core\DriverEntry.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\Core\FilterRegistration.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PhantomSensor\Core\Globals.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

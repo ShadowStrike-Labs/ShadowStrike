@@ -73,6 +73,10 @@ extern "C" {
 
 #include <ntifs.h>
 
+#ifndef MAXULONG64
+#define MAXULONG64  ((ULONG64)0xFFFFFFFFFFFFFFFFULL)
+#endif
+
 // ============================================================================
 // POOL TAGS
 // ============================================================================

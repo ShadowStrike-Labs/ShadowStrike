@@ -50,6 +50,9 @@
 #ifndef _SHADOWSTRIKE_LOOKASIDE_LISTS_H_
 #define _SHADOWSTRIKE_LOOKASIDE_LISTS_H_
 
+#pragma warning(push)
+#pragma warning(disable:4324)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -645,4 +648,5 @@ LlSafeMultiply(
 }
 #endif
 
+#pragma warning(pop)
 #endif // _SHADOWSTRIKE_LOOKASIDE_LISTS_H_

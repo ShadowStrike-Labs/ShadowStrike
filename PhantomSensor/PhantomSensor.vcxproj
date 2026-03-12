@@ -172,6 +172,8 @@
     <ClCompile Include="PhantomSensor\Communication\TelemetryBuffer.c" />
     <ClCompile Include="PhantomSensor\Context\InstanceContext.c" />
     <ClCompile Include="PhantomSensor\Context\StreamContext.c" />
+    <ClCompile Include="PhantomSensor\Core\DriverEntry.c" />
+    <ClCompile Include="PhantomSensor\Core\FilterRegistration.c" />
     <ClCompile Include="PhantomSensor\ETW\ETWConsumer.c" />
     <ClCompile Include="PhantomSensor\ETW\ETWProvider.c" />
     <ClCompile Include="PhantomSensor\ETW\EventSchema.c" />
@@ -284,6 +286,9 @@
     <ClInclude Include="PhantomSensor\Communication\TelemetryBuffer.h" />
     <ClInclude Include="PhantomSensor\Context\InstanceContext.h" />
     <ClInclude Include="PhantomSensor\Context\StreamContext.h" />
+    <ClInclude Include="PhantomSensor\Core\DriverEntry.h" />
+    <ClInclude Include="PhantomSensor\Core\FilterRegistration.h" />
+    <ClInclude Include="PhantomSensor\Core\Globals.h" />
     <ClInclude Include="PhantomSensor\ETW\ETWConsumer.h" />
     <ClInclude Include="PhantomSensor\ETW\ETWProvider.h" />
     <ClInclude Include="PhantomSensor\ETW\EventSchema.h" />
@@ -355,12 +360,6 @@
     <ClInclude Include="Shared\SharedDefs.h" />
     <ClInclude Include="Shared\TelemetryTypes.h" />
     <ClInclude Include="Shared\VerdictTypes.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="PhantomSensor\SelfProtection\FileProtection.c.bak" />
-    <None Include="PhantomSensor\SelfProtection\FileProtection.h.bak" />
-    <None Include="PhantomSensor\SelfProtection\HandleProtection.c.bak" />
-    <None Include="PhantomSensor\SelfProtection\HandleProtection.h.bak" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

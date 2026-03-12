@@ -47,11 +47,27 @@
 #ifndef SHADOWSTRIKE_ETW_PROVIDER_H
 #define SHADOWSTRIKE_ETW_PROVIDER_H
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
+#pragma warning(pop)
 #include <evntrace.h>
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Shared/TelemetryTypes.h"
 #include "../../Shared/NetworkTypes.h"
+
+//
+// ETW control codes — not exported by evntrace.h in kernel partition
+//
+#ifndef EVENT_CONTROL_CODE_DISABLE_PROVIDER
+#define EVENT_CONTROL_CODE_DISABLE_PROVIDER  0
+#endif
+#ifndef EVENT_CONTROL_CODE_ENABLE_PROVIDER
+#define EVENT_CONTROL_CODE_ENABLE_PROVIDER   1
+#endif
+#ifndef EVENT_CONTROL_CODE_CAPTURE_STATE
+#define EVENT_CONTROL_CODE_CAPTURE_STATE     2
+#endif
 
 // ============================================================================
 // ETW PROVIDER CONFIGURATION

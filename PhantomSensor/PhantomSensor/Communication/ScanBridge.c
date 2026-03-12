@@ -293,7 +293,7 @@ SbpSafeAddUlong(
 #pragma alloc_text(PAGE, ShadowStrikeBuildFileScanRequestEx)
 #pragma alloc_text(PAGE, ShadowStrikeSendScanRequest)
 #pragma alloc_text(PAGE, ShadowStrikeSendScanRequestEx)
-#pragma alloc_text(PAGE, ShadowStrikeSendProcessNotification)
+#pragma alloc_text(PAGE, ShadowStrikeSendProcessEvent)
 #pragma alloc_text(PAGE, ShadowStrikeSendThreadNotification)
 #pragma alloc_text(PAGE, ShadowStrikeSendImageNotification)
 #pragma alloc_text(PAGE, ShadowStrikeSendRegistryNotification)
@@ -448,7 +448,7 @@ ShadowStrikeScanBridgeInitialize(
     // Initialize statistics
     //
     KeQuerySystemTime(&g_ScanBridge.Stats.StartTime);
-    g_ScanBridge.Stats.MinLatencyMs = MAXLONG64;
+    g_ScanBridge.Stats.MinLatencyMs = MAXLONGLONG;
 
     return STATUS_SUCCESS;
 }
@@ -727,7 +727,7 @@ ShadowStrikeBuildFileScanRequestEx(
     //
     // Initialize message header
     //
-    status = ShadowStrikeInitMessageHeader(
+    status = SbInitMessageHeader(
         header,
         ShadowStrikeMessageFileScanOnOpen,
         totalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
@@ -1078,7 +1078,7 @@ ShadowStrikeSendScanRequestEx(
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
-ShadowStrikeSendProcessNotification(
+ShadowStrikeSendProcessEvent(
     _In_ HANDLE ProcessId,
     _In_ HANDLE ParentId,
     _In_ BOOLEAN Create,
@@ -1152,7 +1152,7 @@ ShadowStrikeSendProcessNotification(
     //
     // Initialize header
     //
-    status = ShadowStrikeInitMessageHeader(
+    status = SbInitMessageHeader(
         header,
         ShadowStrikeMessageProcessNotify,
         totalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
@@ -1274,7 +1274,7 @@ ShadowStrikeSendThreadNotification(
     //
     // Initialize header
     //
-    status = ShadowStrikeInitMessageHeader(
+    status = SbInitMessageHeader(
         header,
         ShadowStrikeMessageThreadNotify,
         sizeof(SHADOWSTRIKE_THREAD_NOTIFICATION)
@@ -1395,7 +1395,7 @@ ShadowStrikeSendImageNotification(
     //
     // Initialize header
     //
-    status = ShadowStrikeInitMessageHeader(
+    status = SbInitMessageHeader(
         header,
         ShadowStrikeMessageImageLoad,
         totalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
@@ -1559,7 +1559,7 @@ ShadowStrikeSendRegistryNotification(
     //
     // Initialize header
     //
-    status = ShadowStrikeInitMessageHeader(
+    status = SbInitMessageHeader(
         header,
         ShadowStrikeMessageRegistryNotify,
         totalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
@@ -1937,7 +1937,7 @@ ShadowStrikeFreeMessageBuffer(
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
-ShadowStrikeInitMessageHeader(
+SbInitMessageHeader(
     _Out_ PSHADOWSTRIKE_MESSAGE_HEADER Header,
     _In_ SHADOWSTRIKE_MESSAGE_TYPE MessageType,
     _In_ ULONG DataSize
@@ -2045,7 +2045,7 @@ ShadowStrikeResetScanBridgeStatistics(
     InterlockedExchange64(&g_ScanBridge.Stats.ImageNotifications, 0);
     InterlockedExchange64(&g_ScanBridge.Stats.RegistryNotifications, 0);
     InterlockedExchange64(&g_ScanBridge.Stats.TotalLatencyMs, 0);
-    InterlockedExchange64(&g_ScanBridge.Stats.MinLatencyMs, MAXLONG64);
+    InterlockedExchange64(&g_ScanBridge.Stats.MinLatencyMs, MAXLONGLONG);
     InterlockedExchange64(&g_ScanBridge.Stats.MaxLatencyMs, 0);
     InterlockedExchange64(&g_ScanBridge.Stats.ConnectionErrors, 0);
     InterlockedExchange64(&g_ScanBridge.Stats.MessageErrors, 0);
@@ -2401,7 +2401,7 @@ SbpUpdateLatencyStats(
     //
     do {
         currentMin = g_ScanBridge.Stats.MinLatencyMs;
-        if (latencyMs >= currentMin && currentMin != MAXLONG64) {
+        if (latencyMs >= currentMin && currentMin != MAXLONGLONG) {
             break;
         }
     } while (InterlockedCompareExchange64(

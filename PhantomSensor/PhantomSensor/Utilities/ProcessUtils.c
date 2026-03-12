@@ -1479,7 +1479,7 @@ ShadowStrikeGetProcessInfo(
     // Process flags
     //
     ProcessInfo->IsWow64 = ShadowStrikeIsProcessWow64(Process);
-    ProcessInfo->IsProtectedProcess = ShadowStrikeIsProcessProtected(Process);
+    ProcessInfo->IsProtectedProcess = ShadowStrikeIsOsProtectedProcess(Process);
     ProcessInfo->IsDebugged = ShadowStrikeIsProcessDebugged(Process);
 
     //
@@ -2016,7 +2016,7 @@ ShadowStrikeIsProcessWow64(
 
 _Use_decl_annotations_
 BOOLEAN
-ShadowStrikeIsProcessProtected(
+ShadowStrikeIsOsProtectedProcess(
     _In_ PEPROCESS Process
 )
 {
@@ -3082,7 +3082,7 @@ ShadowStrikeClassifyProcess(
     // Check process attributes
     //
     IsWow64 = ShadowStrikeIsProcessWow64(Process);
-    IsProtected = ShadowStrikeIsProcessProtected(Process);
+    IsProtected = ShadowStrikeIsOsProtectedProcess(Process);
 
     ObDereferenceObject(Process);
 

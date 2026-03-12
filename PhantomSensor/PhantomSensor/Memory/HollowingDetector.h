@@ -33,6 +33,9 @@
 
 #pragma once
 
+
+#pragma warning(push)
+#pragma warning(disable:4324) /* aligned struct padding */
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -373,3 +376,5 @@ PhGetStatistics(
 #ifdef __cplusplus
 }
 #endif
+
+#pragma warning(pop) /* 4324 */

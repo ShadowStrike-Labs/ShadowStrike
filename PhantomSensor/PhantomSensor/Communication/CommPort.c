@@ -2028,10 +2028,10 @@ ShadowStrikepFnv1aHashW(
 {
     ULONG hash = 0x811C9DC5u;  // FNV-1a offset basis
     USHORT i;
-    PCUCHAR bytes;
+    PUCHAR bytes;
     ULONG byteLen;
 
-    bytes = (PCUCHAR)Buffer;
+    bytes = (PUCHAR)Buffer;
     byteLen = (ULONG)LengthChars * sizeof(WCHAR);
 
     for (i = 0; i < byteLen; i++) {

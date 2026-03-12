@@ -41,7 +41,10 @@
 #ifndef _SHADOWSTRIKE_PRESETINFO_H_
 #define _SHADOWSTRIKE_PRESETINFO_H_
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
+#pragma warning(pop)
 
 #ifdef __cplusplus
 extern "C" {

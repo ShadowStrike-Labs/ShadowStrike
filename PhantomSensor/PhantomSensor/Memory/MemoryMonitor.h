@@ -39,7 +39,10 @@
 
 #pragma once
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
+#pragma warning(pop)
 #include "../../Shared/MemoryTypes.h"
 #include "../../Shared/BehaviorTypes.h"
 

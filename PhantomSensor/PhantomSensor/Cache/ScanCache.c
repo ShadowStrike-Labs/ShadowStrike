@@ -1091,8 +1091,7 @@ ShadowStrikeCacheBuildKey(
             // Combined with SectorSize for better uniqueness
             //
             Key->VolumeSerial = volumeProps.DeviceCharacteristics ^
-                               (volumeProps.SectorSize << 16) ^
-                               (volumeProps.AllocatedLength.LowPart);
+                               (volumeProps.SectorSize << 16);
             haveVolumeSerial = TRUE;
         } else {
             //

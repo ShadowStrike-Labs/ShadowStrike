@@ -60,7 +60,10 @@ extern "C" {
 #include <ntddk.h>
 #include <wdm.h>
 #include <ntstrsafe.h>
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
+#pragma warning(pop)
 
 // ============================================================================
 // POOL TAGS

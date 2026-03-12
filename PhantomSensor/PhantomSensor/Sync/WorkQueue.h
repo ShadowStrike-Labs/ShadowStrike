@@ -61,6 +61,8 @@
 extern "C" {
 #endif
 
+#pragma warning(push)
+#pragma warning(disable:4324)
 #include <fltKernel.h>
 #include <ntddk.h>
 #include <wdm.h>
@@ -614,6 +616,8 @@ ShadowStrikeWqGetElapsedUs(
     if (End->QuadPart <= Start->QuadPart) return 0;
     return (ULONG64)((End->QuadPart - Start->QuadPart) / 10);
 }
+
+#pragma warning(pop) // 4324
 
 #ifdef __cplusplus
 }
