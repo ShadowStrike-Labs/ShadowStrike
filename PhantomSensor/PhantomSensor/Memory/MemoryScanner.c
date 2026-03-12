@@ -69,6 +69,8 @@
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
 #include <ntstrsafe.h>
+#include "../../Shared/BehaviorTypes.h"
+#include "../Behavioral/BehaviorEngine.h"
 
 //
 // MEM_IMAGE is not defined in kernel-mode headers (MS-4 fix).
@@ -1429,6 +1431,19 @@ MsScanProcess(
     InterlockedAdd64(&scanner->Base.Stats.BytesScanned, (LONG64)result->BytesScanned);
     InterlockedAdd64(&scanner->Base.Stats.TotalMatches, result->MatchCount);
     InterlockedAdd64(&scanner->Base.Stats.CumulativeScanTimeMs, (LONG64)result->DurationMs);
+
+    if (result->MatchCount > 0) {
+        BeEngineSubmitEvent(
+            BehaviorEvent_ShellcodeDetected,
+            BehaviorCategory_MemoryOperation,
+            HandleToULong(ProcessId),
+            NULL,
+            0,
+            (UINT32)min(result->MatchCount * 25, 100),
+            FALSE,
+            NULL
+        );
+    }
 
     ObDereferenceObject(process);
     MspReleaseReference(scanner);

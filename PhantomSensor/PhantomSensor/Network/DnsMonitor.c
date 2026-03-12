@@ -65,6 +65,8 @@ Performance Characteristics:
 #include "NetworkReputation.h"
 #include "C2Detection.h"
 #include <ntstrsafe.h>
+#include "../../Shared/BehaviorTypes.h"
+#include "../Behavioral/BehaviorEngine.h"
 
 // ============================================================================
 // INTERNAL CONSTANTS
@@ -1217,6 +1219,17 @@ DnsProcessQuery(
 
     if (query->SuspicionFlags != DnsSuspicion_None) {
         InterlockedIncrement64(&Monitor->Stats.SuspiciousQueries);
+
+        BeEngineSubmitEvent(
+            BehaviorEvent_DNSTunneling,
+            BehaviorCategory_NetworkOperation,
+            HandleToULong(ProcessId),
+            NULL,
+            0,
+            (UINT32)min(query->SuspicionScore, 100),
+            FALSE,
+            NULL
+        );
     }
 
     //

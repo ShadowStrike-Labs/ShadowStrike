@@ -59,6 +59,8 @@
 #include "../Core/Globals.h"
 #include "../../Shared/NetworkTypes.h"
 #include <ntstrsafe.h>
+#include "../../Shared/BehaviorTypes.h"
+#include "../Behavioral/BehaviorEngine.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, C2Initialize)
@@ -797,6 +799,17 @@ C2AnalyzeDestination(
         if (destination->SuspicionScore >= C2_CONFIRMED_THRESHOLD) {
             destination->IsConfirmedC2 = TRUE;
         }
+
+        BeEngineSubmitEvent(
+            BehaviorEvent_C2Communication,
+            BehaviorCategory_NetworkOperation,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL,
+            0,
+            (UINT32)min(destination->SuspicionScore, 100),
+            FALSE,
+            NULL
+        );
     }
 
     C2pDereferenceDestination(detector, destination);

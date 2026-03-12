@@ -68,6 +68,7 @@
 #include "../Utilities/StringUtils.h"
 #include <ntstrsafe.h>
 #include <ip2string.h>
+#include "../Behavioral/BehaviorEngine.h"
 
 // ============================================================================
 // GUID DEFINITIONS
@@ -3225,6 +3226,17 @@ NfpCreateAndInsertConnection(
         ClassifyOut->actionType = FWP_ACTION_BLOCK;
         ClassifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
         InterlockedIncrement64(&g_NfState.TotalConnectionsBlocked);
+
+        BeEngineSubmitEvent(
+            BehaviorEvent_C2Communication,
+            BehaviorCategory_NetworkOperation,
+            connection->ProcessId,
+            NULL,
+            0,
+            80,
+            TRUE,
+            NULL
+        );
     }
 }
 

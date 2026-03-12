@@ -62,6 +62,7 @@
 #include "ROPDetector.h"
 #include "SectionTracker.h"
 #include "../Sync/SpinLock.h"
+#include "../Behavioral/BehaviorEngine.h"
 
 // ============================================================================
 // KERNEL-MODE COMPATIBILITY
@@ -1437,6 +1438,17 @@ MmMonitorScanForShellcode(
             }
 
             InterlockedIncrement64(&g_MemoryMonitor.TotalShellcodeDetections);
+
+            BeEngineSubmitEvent(
+                BehaviorEvent_ShellcodeDetected,
+                BehaviorCategory_MemoryOperation,
+                ProcessId,
+                NULL,
+                0,
+                80,
+                FALSE,
+                NULL
+            );
         }
     }
 

@@ -37,6 +37,7 @@
 #include "../../Shared/BehaviorTypes.h"
 #include <ntstrsafe.h>
 #include <ntimage.h>
+#include "../../Behavioral/BehaviorEngine.h"
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -606,6 +607,19 @@ AbdScanProcess(
         }
     }
 
+    if (Detection->BypassType != AbdBypass_None) {
+        BeEngineSubmitEvent(
+            BehaviorEvent_AMSIBypass,
+            BehaviorCategory_DefenseEvasion,
+            HandleToUlong(ProcessId),
+            NULL,
+            0,
+            90,
+            FALSE,
+            NULL
+        );
+    }
+
     KeQuerySystemTimePrecise(&procEntry->LastScanTime);
     AbdpReleaseProcess(procEntry);
     ExReleaseRundownProtection(&g_AbdState.RundownRef);
@@ -673,6 +687,17 @@ AbdCheckProtectionChange(
             //
             InterlockedIncrement64(&g_AbdState.Stats.BypassesDetected);
             InterlockedIncrement64(&g_AbdState.Stats.ProtectionChangeDetections);
+
+            BeEngineSubmitEvent(
+                BehaviorEvent_AMSIBypass,
+                BehaviorCategory_DefenseEvasion,
+                HandleToUlong(ProcessId),
+                NULL,
+                0,
+                85,
+                FALSE,
+                NULL
+            );
 
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                        "[ShadowStrike] AMSI BYPASS INDICATOR in PID %lu: "
