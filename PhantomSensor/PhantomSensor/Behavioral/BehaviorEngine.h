@@ -735,3 +735,42 @@ NTSTATUS
 BeEngineGetStatistics(
     _Out_ PBEHAVIOR_ENGINE_GLOBALS Stats
     );
+
+// ============================================================================
+// PUBLIC API - MODULE ACCESSORS
+// ============================================================================
+
+//
+// Opaque pointer forward declarations - avoids circular includes.
+// The actual typedefs live in IOCMatcher.h and RuleEngine.h respectively.
+//
+struct _IOM_MATCHER;
+struct _RE_ENGINE;
+
+/**
+ * @brief Get the global IOC Matcher instance.
+ *
+ * Returns the IOC matcher initialized by BehaviorEngine. May return NULL
+ * if the matcher failed to initialize or BehaviorEngine is not yet started.
+ *
+ * @return Pointer to IOC matcher, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _IOM_MATCHER*
+BeGetIocMatcher(
+    VOID
+    );
+
+/**
+ * @brief Get the global Rule Engine instance.
+ *
+ * Returns the rule engine initialized by BehaviorEngine. May return NULL
+ * if the engine failed to initialize or BehaviorEngine is not yet started.
+ *
+ * @return Pointer to rule engine, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _RE_ENGINE*
+BeGetRuleEngine(
+    VOID
+    );

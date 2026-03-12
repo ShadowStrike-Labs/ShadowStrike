@@ -68,6 +68,18 @@
 #include "../../Shared/ErrorCodes.h"
 #include "../Core/Globals.h"
 
+// Detection module headers for data push handlers
+#include <ntstrsafe.h>
+#include "../Behavioral/IOCMatcher.h"
+#include "../Behavioral/RuleEngine.h"
+#include "../Behavioral/BehaviorEngine.h"
+#include "../Network/C2Detection.h"
+#include "../Network/DnsMonitor.h"
+#include "../Network/NetworkReputation.h"
+#include "../Network/NetworkFilter.h"
+#include "../Network/SSLInspection.h"
+#include "../Exclusions/ExclusionManager.h"
+
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -303,6 +315,95 @@ MhpHandleDisableFiltering(
     _Out_ PULONG ReturnOutputBufferLength
     );
 
+// Data push handlers (user-mode → kernel threat intel)
+static NTSTATUS
+MhpHandlePushHashDatabase(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    );
+
+static NTSTATUS
+MhpHandlePushPatternDatabase(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    );
+
+static NTSTATUS
+MhpHandlePushSignatureDatabase(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    );
+
+static NTSTATUS
+MhpHandlePushIoCFeed(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    );
+
+static NTSTATUS
+MhpHandlePushWhitelist(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    );
+
+static NTSTATUS
+MhpHandleUpdateBehavioralRules(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    );
+
+static NTSTATUS
+MhpHandlePushNetworkIoC(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    );
+
+static NTSTATUS
+MhpHandleExclusionUpdate(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    );
+
 // ============================================================================
 // PAGE ALLOCATION
 // ============================================================================
@@ -324,6 +425,14 @@ MhpHandleDisableFiltering(
 #pragma alloc_text(PAGE, MhpHandleScanVerdict)
 #pragma alloc_text(PAGE, MhpHandleEnableFiltering)
 #pragma alloc_text(PAGE, MhpHandleDisableFiltering)
+#pragma alloc_text(PAGE, MhpHandlePushHashDatabase)
+#pragma alloc_text(PAGE, MhpHandlePushPatternDatabase)
+#pragma alloc_text(PAGE, MhpHandlePushSignatureDatabase)
+#pragma alloc_text(PAGE, MhpHandlePushIoCFeed)
+#pragma alloc_text(PAGE, MhpHandlePushWhitelist)
+#pragma alloc_text(PAGE, MhpHandleUpdateBehavioralRules)
+#pragma alloc_text(PAGE, MhpHandlePushNetworkIoC)
+#pragma alloc_text(PAGE, MhpHandleExclusionUpdate)
 #endif
 
 // ============================================================================
@@ -447,6 +556,49 @@ MhInitialize(
     }
 
     status = MhRegisterHandler(FilterMessageType_DisableFiltering, MhpHandleDisableFiltering, NULL);
+    if (!NT_SUCCESS(status)) {
+        goto CleanupOnError;
+    }
+
+    //
+    // Register data push handlers (user-mode → kernel threat intel)
+    //
+    status = MhRegisterHandler(FilterMessageType_PushHashDatabase, MhpHandlePushHashDatabase, NULL);
+    if (!NT_SUCCESS(status)) {
+        goto CleanupOnError;
+    }
+
+    status = MhRegisterHandler(FilterMessageType_PushPatternDatabase, MhpHandlePushPatternDatabase, NULL);
+    if (!NT_SUCCESS(status)) {
+        goto CleanupOnError;
+    }
+
+    status = MhRegisterHandler(FilterMessageType_PushSignatureDatabase, MhpHandlePushSignatureDatabase, NULL);
+    if (!NT_SUCCESS(status)) {
+        goto CleanupOnError;
+    }
+
+    status = MhRegisterHandler(FilterMessageType_PushIoCFeed, MhpHandlePushIoCFeed, NULL);
+    if (!NT_SUCCESS(status)) {
+        goto CleanupOnError;
+    }
+
+    status = MhRegisterHandler(FilterMessageType_PushWhitelist, MhpHandlePushWhitelist, NULL);
+    if (!NT_SUCCESS(status)) {
+        goto CleanupOnError;
+    }
+
+    status = MhRegisterHandler(FilterMessageType_UpdateBehavioralRules, MhpHandleUpdateBehavioralRules, NULL);
+    if (!NT_SUCCESS(status)) {
+        goto CleanupOnError;
+    }
+
+    status = MhRegisterHandler(FilterMessageType_PushNetworkIoC, MhpHandlePushNetworkIoC, NULL);
+    if (!NT_SUCCESS(status)) {
+        goto CleanupOnError;
+    }
+
+    status = MhRegisterHandler(FilterMessageType_ExclusionUpdate, MhpHandleExclusionUpdate, NULL);
     if (!NT_SUCCESS(status)) {
         goto CleanupOnError;
     }
@@ -1938,4 +2090,1352 @@ MhUnprotectProcess(
     KeLeaveCriticalRegion();
 
     return status;
+}
+
+// ============================================================================
+// DATA PUSH HANDLER IMPLEMENTATIONS
+// ============================================================================
+//
+// These handlers receive batched threat intelligence data from the user-mode
+// agent and route entries to the appropriate kernel detection modules.
+//
+// Wire format: SHADOWSTRIKE_PUSH_BATCH_HEADER + N * entry structs
+//
+// All handlers follow this pattern:
+//   1. Validate payload >= sizeof(batch header)
+//   2. Validate batch header (entry count, sizes, flags)
+//   3. Get target module instance via accessor
+//   4. Iterate entries, convert wire format → module API, call loading API
+//   5. Build push reply with accepted/rejected counts
+//
+
+C_ASSERT(sizeof(SHADOWSTRIKE_PUSH_REPLY) <= MH_MAX_LOCAL_OUTPUT_SIZE);
+
+/**
+ * @brief Common batch header validation.
+ *
+ * Validates the batch header fields and calculates expected payload size.
+ *
+ * @return STATUS_SUCCESS if valid, error status otherwise.
+ */
+static NTSTATUS
+MhpValidateBatchHeader(
+    _In_reads_bytes_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _In_ ULONG FixedEntrySize,
+    _Out_ PSHADOWSTRIKE_PUSH_BATCH_HEADER* BatchHeader,
+    _Out_ PVOID* EntriesStart,
+    _Out_ PULONG EntryCount
+    )
+{
+    PSHADOWSTRIKE_PUSH_BATCH_HEADER header;
+    ULONG expectedSize;
+    ULONG entriesOffset;
+
+    PAGED_CODE();
+
+    if (PayloadBuffer == NULL || PayloadSize < sizeof(SHADOWSTRIKE_PUSH_BATCH_HEADER)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    header = (PSHADOWSTRIKE_PUSH_BATCH_HEADER)PayloadBuffer;
+
+    //
+    // Validate entry count bounds
+    //
+    if (header->EntryCount == 0) {
+        if (header->Flags & SHADOWSTRIKE_PUSH_FLAG_CLEAR) {
+            // Clear operation with zero entries is valid
+            *BatchHeader = header;
+            *EntriesStart = NULL;
+            *EntryCount = 0;
+            return STATUS_SUCCESS;
+        }
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (header->EntryCount > SHADOWSTRIKE_PUSH_MAX_BATCH_ENTRIES) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/MH] Push batch too large: %u entries (max %u)\n",
+                   header->EntryCount, SHADOWSTRIKE_PUSH_MAX_BATCH_ENTRIES);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // For fixed-size entries, validate total payload size
+    //
+    entriesOffset = sizeof(SHADOWSTRIKE_PUSH_BATCH_HEADER);
+
+    if (FixedEntrySize > 0) {
+        //
+        // Check for multiplication overflow
+        //
+        if (header->EntryCount > (MAXULONG - entriesOffset) / FixedEntrySize) {
+            return STATUS_INTEGER_OVERFLOW;
+        }
+        expectedSize = entriesOffset + (header->EntryCount * FixedEntrySize);
+        if (PayloadSize < expectedSize) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/MH] Push payload too small: %u bytes, need %u\n",
+                       PayloadSize, expectedSize);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+    } else {
+        //
+        // Variable-size entries: validate TotalDataSize
+        //
+        if (header->TotalDataSize == 0) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (header->TotalDataSize > (MAXULONG - entriesOffset)) {
+            return STATUS_INTEGER_OVERFLOW;
+        }
+        expectedSize = entriesOffset + header->TotalDataSize;
+        if (PayloadSize < expectedSize) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/MH] Push payload too small: %u bytes, need %u\n",
+                       PayloadSize, expectedSize);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+    }
+
+    *BatchHeader = header;
+    *EntriesStart = (PUCHAR)PayloadBuffer + entriesOffset;
+    *EntryCount = header->EntryCount;
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Build and write push reply to output buffer.
+ */
+static VOID
+MhpBuildPushReply(
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_ NTSTATUS Status,
+    _In_ ULONG Accepted,
+    _In_ ULONG Rejected,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    )
+{
+    PSHADOWSTRIKE_PUSH_REPLY reply;
+
+    if (OutputBuffer != NULL && OutputBufferSize >= sizeof(SHADOWSTRIKE_PUSH_REPLY)) {
+        reply = (PSHADOWSTRIKE_PUSH_REPLY)OutputBuffer;
+        reply->MessageId = Header->MessageId;
+        reply->Status = (UINT32)Status;
+        reply->EntriesAccepted = Accepted;
+        reply->EntriesRejected = Rejected;
+        reply->Reserved = 0;
+        *ReturnOutputBufferLength = sizeof(SHADOWSTRIKE_PUSH_REPLY);
+    } else {
+        *ReturnOutputBufferLength = 0;
+    }
+}
+
+/**
+ * @brief Handle hash database push (FilterMessageType_PushHashDatabase).
+ *
+ * Converts SHADOWSTRIKE_PUSH_HASH_ENTRY to IOM_IOC_INPUT and loads
+ * each entry into the IOCMatcher via IomLoadIOC().
+ */
+static NTSTATUS
+MhpHandlePushHashDatabase(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    )
+{
+    NTSTATUS status;
+    PSHADOWSTRIKE_PUSH_BATCH_HEADER batchHeader;
+    PVOID entriesStart;
+    ULONG entryCount;
+    ULONG accepted = 0;
+    ULONG rejected = 0;
+    PIOM_MATCHER matcher;
+    PSHADOWSTRIKE_PUSH_HASH_ENTRY entry;
+    IOM_IOC_INPUT iocInput;
+    ULONG i;
+    ULONG hashLen;
+
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(ClientContext);
+
+    *ReturnOutputBufferLength = 0;
+
+    status = MhpValidateBatchHeader(
+        PayloadBuffer, PayloadSize,
+        sizeof(SHADOWSTRIKE_PUSH_HASH_ENTRY),
+        &batchHeader, &entriesStart, &entryCount
+    );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    matcher = BeGetIocMatcher();
+    if (matcher == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/MH] PushHashDatabase: IOCMatcher not available\n");
+        MhpBuildPushReply(Header, STATUS_DEVICE_NOT_READY, 0, entryCount,
+                         OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    entry = (PSHADOWSTRIKE_PUSH_HASH_ENTRY)entriesStart;
+
+    for (i = 0; i < entryCount; i++) {
+        RtlZeroMemory(&iocInput, sizeof(iocInput));
+
+        //
+        // Convert hash type to hex string representation for IOCMatcher value
+        //
+        switch (entry->HashType) {
+            case 0: hashLen = 16; break;  // MD5
+            case 1: hashLen = 20; break;  // SHA1
+            case 2: hashLen = 32; break;  // SHA256
+            default:
+                rejected++;
+                entry++;
+                continue;
+        }
+
+        //
+        // Build hex string from hash bytes
+        //
+        iocInput.ValueLength = hashLen * 2;
+        if (iocInput.ValueLength >= IOM_MAX_IOC_LENGTH) {
+            rejected++;
+            entry++;
+            continue;
+        }
+
+        for (ULONG b = 0; b < hashLen; b++) {
+            UCHAR hi = (entry->Hash[b] >> 4) & 0x0F;
+            UCHAR lo = entry->Hash[b] & 0x0F;
+            iocInput.Value[b * 2]     = (CHAR)(hi < 10 ? '0' + hi : 'a' + hi - 10);
+            iocInput.Value[b * 2 + 1] = (CHAR)(lo < 10 ? '0' + lo : 'a' + lo - 10);
+        }
+        iocInput.Value[iocInput.ValueLength] = '\0';
+
+        //
+        // Map hash type to IOC type
+        //
+        switch (entry->HashType) {
+            case 0: iocInput.Type = (IOM_IOC_TYPE)10; break;  // MD5 hash
+            case 1: iocInput.Type = (IOM_IOC_TYPE)11; break;  // SHA1 hash
+            case 2: iocInput.Type = (IOM_IOC_TYPE)12; break;  // SHA256 hash
+            default: iocInput.Type = (IOM_IOC_TYPE)12; break;
+        }
+
+        iocInput.Severity = (IOM_SEVERITY)entry->Severity;
+        iocInput.MatchMode = (IOM_MATCH_MODE)0;  // Exact match
+        iocInput.CaseSensitive = FALSE;  // Hex hashes are case-insensitive
+        iocInput.Expiry = entry->Expiry;
+
+        //
+        // Copy threat name (ensure null termination)
+        //
+        RtlCopyMemory(iocInput.ThreatName, entry->ThreatName,
+                       min(sizeof(entry->ThreatName), IOM_MAX_THREAT_NAME_LENGTH - 1));
+        iocInput.ThreatName[IOM_MAX_THREAT_NAME_LENGTH - 1] = '\0';
+
+        RtlStringCbCopyA(iocInput.Source, sizeof(iocInput.Source), "UserModeAgent");
+
+        status = IomLoadIOC(matcher, &iocInput);
+        if (NT_SUCCESS(status)) {
+            accepted++;
+        } else {
+            rejected++;
+        }
+
+        entry++;
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike/MH] PushHashDatabase: %u accepted, %u rejected\n",
+               accepted, rejected);
+
+    MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
+                     OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Handle pattern database push (FilterMessageType_PushPatternDatabase).
+ *
+ * Same wire format as hash push. Patterns are loaded via IOCMatcher
+ * with a pattern-type IOC classification.
+ */
+static NTSTATUS
+MhpHandlePushPatternDatabase(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    )
+{
+    //
+    // Pattern database uses same wire format and loading path as hash database.
+    // The IOCMatcher handles both hash and pattern type IOCs.
+    //
+    return MhpHandlePushHashDatabase(
+        ClientContext, Header, PayloadBuffer, PayloadSize,
+        OutputBuffer, OutputBufferSize, ReturnOutputBufferLength
+    );
+}
+
+/**
+ * @brief Handle signature database push (FilterMessageType_PushSignatureDatabase).
+ *
+ * Same wire format as hash push. Signatures loaded via IOCMatcher.
+ */
+static NTSTATUS
+MhpHandlePushSignatureDatabase(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    )
+{
+    return MhpHandlePushHashDatabase(
+        ClientContext, Header, PayloadBuffer, PayloadSize,
+        OutputBuffer, OutputBufferSize, ReturnOutputBufferLength
+    );
+}
+
+/**
+ * @brief Handle IoC feed push (FilterMessageType_PushIoCFeed).
+ *
+ * Variable-length entries containing IoC indicators of any type.
+ * Each entry is converted to IOM_IOC_INPUT and loaded via IomLoadIOC().
+ */
+static NTSTATUS
+MhpHandlePushIoCFeed(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    )
+{
+    NTSTATUS status;
+    PSHADOWSTRIKE_PUSH_BATCH_HEADER batchHeader;
+    PVOID entriesStart;
+    ULONG entryCount;
+    ULONG accepted = 0;
+    ULONG rejected = 0;
+    PIOM_MATCHER matcher;
+    PSHADOWSTRIKE_PUSH_IOC_ENTRY entry;
+    IOM_IOC_INPUT iocInput;
+    ULONG i;
+    PUCHAR cursor;
+    PUCHAR payloadEnd;
+    ULONG entryTotalSize;
+
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(ClientContext);
+
+    *ReturnOutputBufferLength = 0;
+
+    //
+    // Variable-size entries: pass 0 for fixed entry size
+    //
+    status = MhpValidateBatchHeader(
+        PayloadBuffer, PayloadSize, 0,
+        &batchHeader, &entriesStart, &entryCount
+    );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    matcher = BeGetIocMatcher();
+    if (matcher == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/MH] PushIoCFeed: IOCMatcher not available\n");
+        MhpBuildPushReply(Header, STATUS_DEVICE_NOT_READY, 0, entryCount,
+                         OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    cursor = (PUCHAR)entriesStart;
+    payloadEnd = (PUCHAR)PayloadBuffer + PayloadSize;
+
+    for (i = 0; i < entryCount; i++) {
+        //
+        // Validate we have at least the fixed header portion
+        //
+        if (cursor + sizeof(SHADOWSTRIKE_PUSH_IOC_ENTRY) > payloadEnd) {
+            rejected += (entryCount - i);
+            break;
+        }
+
+        entry = (PSHADOWSTRIKE_PUSH_IOC_ENTRY)cursor;
+
+        //
+        // Validate value length doesn't exceed maximum
+        //
+        if (entry->ValueLength == 0 || entry->ValueLength >= IOM_MAX_IOC_LENGTH) {
+            rejected++;
+            //
+            // Calculate entry total size to advance cursor
+            //
+            entryTotalSize = sizeof(SHADOWSTRIKE_PUSH_IOC_ENTRY) + entry->ValueLength;
+            if (cursor + entryTotalSize > payloadEnd) {
+                rejected += (entryCount - i - 1);
+                break;
+            }
+            cursor += entryTotalSize;
+            continue;
+        }
+
+        entryTotalSize = sizeof(SHADOWSTRIKE_PUSH_IOC_ENTRY) + entry->ValueLength;
+
+        //
+        // Validate variable data fits
+        //
+        if (cursor + entryTotalSize > payloadEnd) {
+            rejected += (entryCount - i);
+            break;
+        }
+
+        //
+        // Convert to IOM_IOC_INPUT
+        //
+        RtlZeroMemory(&iocInput, sizeof(iocInput));
+
+        iocInput.Type = (IOM_IOC_TYPE)entry->Type;
+        iocInput.Severity = (IOM_SEVERITY)entry->Severity;
+        iocInput.MatchMode = (IOM_MATCH_MODE)entry->MatchMode;
+        iocInput.CaseSensitive = (BOOLEAN)entry->CaseSensitive;
+        iocInput.Expiry = entry->Expiry;
+
+        //
+        // Copy value from variable portion
+        //
+        iocInput.ValueLength = entry->ValueLength;
+        RtlCopyMemory(iocInput.Value,
+                       (PUCHAR)entry + sizeof(SHADOWSTRIKE_PUSH_IOC_ENTRY),
+                       entry->ValueLength);
+        iocInput.Value[entry->ValueLength] = '\0';
+
+        //
+        // Copy threat name and source (ensure null termination)
+        //
+        RtlCopyMemory(iocInput.ThreatName, entry->ThreatName,
+                       min(sizeof(entry->ThreatName), IOM_MAX_THREAT_NAME_LENGTH - 1));
+        iocInput.ThreatName[IOM_MAX_THREAT_NAME_LENGTH - 1] = '\0';
+
+        RtlCopyMemory(iocInput.Source, entry->Source,
+                       min(sizeof(entry->Source), IOM_MAX_SOURCE_LENGTH - 1));
+        iocInput.Source[IOM_MAX_SOURCE_LENGTH - 1] = '\0';
+
+        status = IomLoadIOC(matcher, &iocInput);
+        if (NT_SUCCESS(status)) {
+            accepted++;
+        } else {
+            rejected++;
+        }
+
+        cursor += entryTotalSize;
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike/MH] PushIoCFeed: %u accepted, %u rejected\n",
+               accepted, rejected);
+
+    MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
+                     OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Handle whitelist push (FilterMessageType_PushWhitelist).
+ *
+ * Adds whitelisted entries to the ExclusionManager with system-level flags.
+ * Hash-based entries add process exclusions; path entries add path exclusions.
+ */
+static NTSTATUS
+MhpHandlePushWhitelist(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    )
+{
+    NTSTATUS status;
+    PSHADOWSTRIKE_PUSH_BATCH_HEADER batchHeader;
+    PVOID entriesStart;
+    ULONG entryCount;
+    ULONG accepted = 0;
+    ULONG rejected = 0;
+    PSHADOWSTRIKE_PUSH_WHITELIST_ENTRY entry;
+    ULONG i;
+    PUCHAR cursor;
+    PUCHAR payloadEnd;
+    ULONG entryTotalSize;
+    UNICODE_STRING valueString;
+    WCHAR localBuffer[260];
+
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(ClientContext);
+
+    *ReturnOutputBufferLength = 0;
+
+    //
+    // Variable-size entries (path/name entries have trailing WCHARs)
+    //
+    status = MhpValidateBatchHeader(
+        PayloadBuffer, PayloadSize, 0,
+        &batchHeader, &entriesStart, &entryCount
+    );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    //
+    // Handle clear flag
+    //
+    if (batchHeader->Flags & SHADOWSTRIKE_PUSH_FLAG_CLEAR) {
+        ShadowStrikeClearExclusions(ShadowStrikeExclusionPath);
+        ShadowStrikeClearExclusions(ShadowStrikeExclusionExtension);
+        ShadowStrikeClearExclusions(ShadowStrikeExclusionProcessName);
+    }
+
+    if (entryCount == 0) {
+        MhpBuildPushReply(Header, STATUS_SUCCESS, 0, 0,
+                         OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+        return STATUS_SUCCESS;
+    }
+
+    cursor = (PUCHAR)entriesStart;
+    payloadEnd = (PUCHAR)PayloadBuffer + PayloadSize;
+
+    for (i = 0; i < entryCount; i++) {
+        if (cursor + sizeof(SHADOWSTRIKE_PUSH_WHITELIST_ENTRY) > payloadEnd) {
+            rejected += (entryCount - i);
+            break;
+        }
+
+        entry = (PSHADOWSTRIKE_PUSH_WHITELIST_ENTRY)cursor;
+
+        //
+        // Calculate total entry size
+        //
+        entryTotalSize = sizeof(SHADOWSTRIKE_PUSH_WHITELIST_ENTRY);
+        if (entry->EntryType != SHADOWSTRIKE_WL_TYPE_HASH) {
+            if (entry->ValueLength > 0 && entry->ValueLength <= 259) {
+                entryTotalSize += entry->ValueLength * sizeof(WCHAR);
+            } else if (entry->ValueLength > 259) {
+                rejected++;
+                cursor += sizeof(SHADOWSTRIKE_PUSH_WHITELIST_ENTRY) + entry->ValueLength * sizeof(WCHAR);
+                continue;
+            }
+        }
+
+        if (cursor + entryTotalSize > payloadEnd) {
+            rejected += (entryCount - i);
+            break;
+        }
+
+        switch (entry->EntryType) {
+            case SHADOWSTRIKE_WL_TYPE_PATH:
+            {
+                if (entry->ValueLength == 0 || entry->ValueLength > 259) {
+                    rejected++;
+                    break;
+                }
+                PWCHAR valueData = (PWCHAR)((PUCHAR)entry + sizeof(SHADOWSTRIKE_PUSH_WHITELIST_ENTRY));
+                RtlCopyMemory(localBuffer, valueData, entry->ValueLength * sizeof(WCHAR));
+                localBuffer[entry->ValueLength] = L'\0';
+                valueString.Buffer = localBuffer;
+                valueString.Length = entry->ValueLength * sizeof(WCHAR);
+                valueString.MaximumLength = (entry->ValueLength + 1) * sizeof(WCHAR);
+
+                status = ShadowStrikeAddPathExclusion(
+                    &valueString,
+                    entry->Flags | (UINT8)ShadowStrikeExclusionFlagSystem,
+                    0  // Permanent
+                );
+                if (NT_SUCCESS(status)) {
+                    accepted++;
+                } else {
+                    rejected++;
+                }
+                break;
+            }
+
+            case SHADOWSTRIKE_WL_TYPE_PROCESS:
+            {
+                if (entry->ValueLength == 0 || entry->ValueLength > 259) {
+                    rejected++;
+                    break;
+                }
+                PWCHAR valueData = (PWCHAR)((PUCHAR)entry + sizeof(SHADOWSTRIKE_PUSH_WHITELIST_ENTRY));
+                RtlCopyMemory(localBuffer, valueData, entry->ValueLength * sizeof(WCHAR));
+                localBuffer[entry->ValueLength] = L'\0';
+                valueString.Buffer = localBuffer;
+                valueString.Length = entry->ValueLength * sizeof(WCHAR);
+                valueString.MaximumLength = (entry->ValueLength + 1) * sizeof(WCHAR);
+
+                status = ShadowStrikeAddProcessExclusion(
+                    &valueString,
+                    entry->Flags | (UINT8)ShadowStrikeExclusionFlagSystem
+                );
+                if (NT_SUCCESS(status)) {
+                    accepted++;
+                } else {
+                    rejected++;
+                }
+                break;
+            }
+
+            case SHADOWSTRIKE_WL_TYPE_HASH:
+            case SHADOWSTRIKE_WL_TYPE_CERTIFICATE:
+            {
+                //
+                // Hash and certificate whitelisting require IOCMatcher integration
+                // with a "clean" verdict. Use IomLoadIOC with severity=Safe.
+                //
+                PIOM_MATCHER matcher = BeGetIocMatcher();
+                if (matcher != NULL) {
+                    IOM_IOC_INPUT iocInput;
+                    ULONG hashLen;
+
+                    RtlZeroMemory(&iocInput, sizeof(iocInput));
+
+                    switch (entry->HashType) {
+                        case 0: hashLen = 16; break;
+                        case 1: hashLen = 20; break;
+                        case 2: hashLen = 32; break;
+                        default: hashLen = 0; break;
+                    }
+
+                    if (hashLen > 0) {
+                        for (ULONG b = 0; b < hashLen; b++) {
+                            UCHAR hi = (entry->Hash[b] >> 4) & 0x0F;
+                            UCHAR lo = entry->Hash[b] & 0x0F;
+                            iocInput.Value[b * 2]     = (CHAR)(hi < 10 ? '0' + hi : 'a' + hi - 10);
+                            iocInput.Value[b * 2 + 1] = (CHAR)(lo < 10 ? '0' + lo : 'a' + lo - 10);
+                        }
+                        iocInput.ValueLength = hashLen * 2;
+
+                        iocInput.Type = (IOM_IOC_TYPE)(10 + entry->HashType);
+                        iocInput.Severity = (IOM_SEVERITY)0;  // Safe/whitelisted
+                        RtlStringCbCopyA(iocInput.Source, sizeof(iocInput.Source), "Whitelist");
+
+                        status = IomLoadIOC(matcher, &iocInput);
+                        if (NT_SUCCESS(status)) {
+                            accepted++;
+                        } else {
+                            rejected++;
+                        }
+                    } else {
+                        rejected++;
+                    }
+                } else {
+                    rejected++;
+                }
+                break;
+            }
+
+            default:
+                rejected++;
+                break;
+        }
+
+        cursor += entryTotalSize;
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike/MH] PushWhitelist: %u accepted, %u rejected\n",
+               accepted, rejected);
+
+    MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
+                     OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Handle behavioral rules push (FilterMessageType_UpdateBehavioralRules).
+ *
+ * Supports Add, Remove, Enable, and Disable operations on behavioral rules.
+ * Add operations convert wire format to RE_RULE and call ReLoadRule().
+ */
+static NTSTATUS
+MhpHandleUpdateBehavioralRules(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    )
+{
+    NTSTATUS status;
+    PSHADOWSTRIKE_PUSH_BATCH_HEADER batchHeader;
+    PVOID entriesStart;
+    ULONG entryCount;
+    ULONG accepted = 0;
+    ULONG rejected = 0;
+    PRE_ENGINE engine;
+    PSHADOWSTRIKE_PUSH_BEHAVIORAL_RULE ruleEntry;
+    ULONG i;
+    PUCHAR cursor;
+    PUCHAR payloadEnd;
+    ULONG entryTotalSize;
+
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(ClientContext);
+
+    *ReturnOutputBufferLength = 0;
+
+    //
+    // Variable-size entries (Add operations have trailing conditions/actions)
+    //
+    status = MhpValidateBatchHeader(
+        PayloadBuffer, PayloadSize, 0,
+        &batchHeader, &entriesStart, &entryCount
+    );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    engine = BeGetRuleEngine();
+    if (engine == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/MH] UpdateBehavioralRules: RuleEngine not available\n");
+        MhpBuildPushReply(Header, STATUS_DEVICE_NOT_READY, 0, entryCount,
+                         OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    cursor = (PUCHAR)entriesStart;
+    payloadEnd = (PUCHAR)PayloadBuffer + PayloadSize;
+
+    for (i = 0; i < entryCount; i++) {
+        if (cursor + sizeof(SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE) > payloadEnd) {
+            rejected += (entryCount - i);
+            break;
+        }
+
+        ruleEntry = (PSHADOWSTRIKE_PUSH_BEHAVIORAL_RULE)cursor;
+
+        //
+        // Ensure null termination of RuleId
+        //
+        ruleEntry->RuleId[sizeof(ruleEntry->RuleId) - 1] = '\0';
+
+        switch (ruleEntry->Operation) {
+            case SHADOWSTRIKE_RULE_OP_ADD:
+            {
+                RE_RULE rule;
+                ULONG condSize, actSize;
+
+                //
+                // Validate condition/action counts
+                //
+                if (ruleEntry->ConditionCount > RE_MAX_CONDITIONS ||
+                    ruleEntry->ActionCount > RE_MAX_ACTIONS) {
+                    rejected++;
+                    //
+                    // Skip past variable data
+                    //
+                    condSize = ruleEntry->ConditionCount * sizeof(RE_CONDITION);
+                    actSize = ruleEntry->ActionCount * sizeof(RE_ACTION);
+                    entryTotalSize = sizeof(SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE) + condSize + actSize;
+                    cursor += entryTotalSize;
+                    continue;
+                }
+
+                condSize = ruleEntry->ConditionCount * sizeof(RE_CONDITION);
+                actSize = ruleEntry->ActionCount * sizeof(RE_ACTION);
+                entryTotalSize = sizeof(SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE) + condSize + actSize;
+
+                if (cursor + entryTotalSize > payloadEnd) {
+                    rejected += (entryCount - i);
+                    goto Done;
+                }
+
+                //
+                // Build RE_RULE from wire format
+                //
+                RtlZeroMemory(&rule, sizeof(rule));
+
+                RtlCopyMemory(rule.RuleId, ruleEntry->RuleId,
+                               min(sizeof(ruleEntry->RuleId), RE_MAX_RULE_ID_LEN));
+                rule.RuleId[RE_MAX_RULE_ID_LEN] = '\0';
+
+                ruleEntry->RuleName[sizeof(ruleEntry->RuleName) - 1] = '\0';
+                RtlCopyMemory(rule.RuleName, ruleEntry->RuleName,
+                               min(sizeof(ruleEntry->RuleName), RE_MAX_RULE_NAME_LEN));
+                rule.RuleName[RE_MAX_RULE_NAME_LEN] = '\0';
+
+                ruleEntry->Description[sizeof(ruleEntry->Description) - 1] = '\0';
+                RtlCopyMemory(rule.Description, ruleEntry->Description,
+                               min(sizeof(ruleEntry->Description), RE_MAX_DESCRIPTION_LEN));
+                rule.Description[RE_MAX_DESCRIPTION_LEN] = '\0';
+
+                rule.Priority = ruleEntry->Priority;
+                rule.Enabled = TRUE;
+                rule.StopProcessing = (BOOLEAN)ruleEntry->StopProcessing;
+                rule.ConditionCount = ruleEntry->ConditionCount;
+                rule.ActionCount = ruleEntry->ActionCount;
+
+                //
+                // Copy conditions and actions from variable data
+                //
+                if (ruleEntry->ConditionCount > 0) {
+                    RtlCopyMemory(rule.Conditions,
+                                   cursor + sizeof(SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE),
+                                   condSize);
+                }
+                if (ruleEntry->ActionCount > 0) {
+                    RtlCopyMemory(rule.Actions,
+                                   cursor + sizeof(SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE) + condSize,
+                                   actSize);
+                }
+
+                status = ReLoadRule(engine, &rule);
+                if (NT_SUCCESS(status)) {
+                    accepted++;
+                } else {
+                    rejected++;
+                }
+
+                cursor += entryTotalSize;
+                continue;
+            }
+
+            case SHADOWSTRIKE_RULE_OP_REMOVE:
+            {
+                status = ReRemoveRule(engine, ruleEntry->RuleId);
+                if (NT_SUCCESS(status)) {
+                    accepted++;
+                } else {
+                    rejected++;
+                }
+                cursor += sizeof(SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE);
+                continue;
+            }
+
+            case SHADOWSTRIKE_RULE_OP_ENABLE:
+            {
+                status = ReEnableRule(engine, ruleEntry->RuleId, TRUE);
+                if (NT_SUCCESS(status)) {
+                    accepted++;
+                } else {
+                    rejected++;
+                }
+                cursor += sizeof(SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE);
+                continue;
+            }
+
+            case SHADOWSTRIKE_RULE_OP_DISABLE:
+            {
+                status = ReEnableRule(engine, ruleEntry->RuleId, FALSE);
+                if (NT_SUCCESS(status)) {
+                    accepted++;
+                } else {
+                    rejected++;
+                }
+                cursor += sizeof(SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE);
+                continue;
+            }
+
+            default:
+                rejected++;
+                cursor += sizeof(SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE);
+                continue;
+        }
+    }
+
+Done:
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike/MH] UpdateBehavioralRules: %u accepted, %u rejected\n",
+               accepted, rejected);
+
+    MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
+                     OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Handle network IoC push (FilterMessageType_PushNetworkIoC).
+ *
+ * Routes network threat indicators to the appropriate subsystem:
+ * - IPv4/IPv6 → C2Detection + NetworkReputation
+ * - Domain → C2Detection + DnsMonitor + NetworkReputation
+ * - JA3 → C2Detection + SSLInspection
+ * - URL → C2Detection
+ */
+static NTSTATUS
+MhpHandlePushNetworkIoC(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    )
+{
+    NTSTATUS status;
+    PSHADOWSTRIKE_PUSH_BATCH_HEADER batchHeader;
+    PVOID entriesStart;
+    ULONG entryCount;
+    ULONG accepted = 0;
+    ULONG rejected = 0;
+    PC2_DETECTOR c2Detector;
+    PDNS_MONITOR dnsMonitor;
+    PNR_MANAGER repManager;
+    PSHADOWSTRIKE_PUSH_NETWORK_IOC_ENTRY entry;
+    ULONG i;
+
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(ClientContext);
+
+    *ReturnOutputBufferLength = 0;
+
+    status = MhpValidateBatchHeader(
+        PayloadBuffer, PayloadSize,
+        sizeof(SHADOWSTRIKE_PUSH_NETWORK_IOC_ENTRY),
+        &batchHeader, &entriesStart, &entryCount
+    );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    c2Detector = NfFilterGetC2Detector();
+    dnsMonitor = NfFilterGetDnsMonitor();
+    repManager = NfFilterGetReputationManager();
+
+    if (c2Detector == NULL && dnsMonitor == NULL && repManager == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/MH] PushNetworkIoC: No network modules available\n");
+        MhpBuildPushReply(Header, STATUS_DEVICE_NOT_READY, 0, entryCount,
+                         OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    entry = (PSHADOWSTRIKE_PUSH_NETWORK_IOC_ENTRY)entriesStart;
+
+    for (i = 0; i < entryCount; i++) {
+        BOOLEAN entryAccepted = FALSE;
+
+        //
+        // Ensure null termination of string fields
+        //
+        entry->ThreatName[sizeof(entry->ThreatName) - 1] = '\0';
+        entry->MalwareFamily[sizeof(entry->MalwareFamily) - 1] = '\0';
+
+        switch (entry->Type) {
+            case SHADOWSTRIKE_NET_IOC_IPV4:
+            {
+                //
+                // Add to C2Detection
+                //
+                if (c2Detector != NULL) {
+                    C2_IOC c2Ioc;
+                    RtlZeroMemory(&c2Ioc, sizeof(c2Ioc));
+                    c2Ioc.Type = IOCType_IP;
+                    c2Ioc.Value.IP.Address.S_un.S_addr = entry->Value.IPv4;
+                    c2Ioc.Value.IP.IsIPv6 = FALSE;
+                    RtlCopyMemory(c2Ioc.MalwareFamily, entry->MalwareFamily,
+                                   min(sizeof(entry->MalwareFamily), sizeof(c2Ioc.MalwareFamily) - 1));
+                    KeQuerySystemTimePrecise(&c2Ioc.AddedTime);
+                    c2Ioc.ExpirationTime = entry->Expiry;
+
+                    status = C2AddIOC(c2Detector, &c2Ioc);
+                    if (NT_SUCCESS(status)) {
+                        entryAccepted = TRUE;
+                    }
+                }
+
+                //
+                // Add to NetworkReputation
+                //
+                if (repManager != NULL) {
+                    status = NrAddIP(
+                        repManager,
+                        &entry->Value.IPv4,
+                        FALSE,
+                        (NR_REPUTATION)entry->Reputation,
+                        (NR_CATEGORY)entry->Categories,
+                        entry->Score,
+                        entry->ThreatName[0] ? entry->ThreatName : NULL
+                    );
+                    if (NT_SUCCESS(status)) {
+                        entryAccepted = TRUE;
+                    }
+                }
+                break;
+            }
+
+            case SHADOWSTRIKE_NET_IOC_IPV6:
+            {
+                if (c2Detector != NULL) {
+                    C2_IOC c2Ioc;
+                    RtlZeroMemory(&c2Ioc, sizeof(c2Ioc));
+                    c2Ioc.Type = IOCType_IP;
+                    c2Ioc.Value.IP.IsIPv6 = TRUE;
+                    RtlCopyMemory(&c2Ioc.Value.IP.Address6, entry->Value.IPv6, sizeof(IN6_ADDR));
+                    RtlCopyMemory(c2Ioc.MalwareFamily, entry->MalwareFamily,
+                                   min(sizeof(entry->MalwareFamily), sizeof(c2Ioc.MalwareFamily) - 1));
+                    KeQuerySystemTimePrecise(&c2Ioc.AddedTime);
+                    c2Ioc.ExpirationTime = entry->Expiry;
+
+                    status = C2AddIOC(c2Detector, &c2Ioc);
+                    if (NT_SUCCESS(status)) {
+                        entryAccepted = TRUE;
+                    }
+                }
+
+                if (repManager != NULL) {
+                    status = NrAddIP(
+                        repManager,
+                        entry->Value.IPv6,
+                        TRUE,
+                        (NR_REPUTATION)entry->Reputation,
+                        (NR_CATEGORY)entry->Categories,
+                        entry->Score,
+                        entry->ThreatName[0] ? entry->ThreatName : NULL
+                    );
+                    if (NT_SUCCESS(status)) {
+                        entryAccepted = TRUE;
+                    }
+                }
+                break;
+            }
+
+            case SHADOWSTRIKE_NET_IOC_DOMAIN:
+            {
+                //
+                // Ensure domain is null-terminated
+                //
+                entry->Value.Domain[sizeof(entry->Value.Domain) - 1] = '\0';
+
+                if (c2Detector != NULL) {
+                    C2_IOC c2Ioc;
+                    RtlZeroMemory(&c2Ioc, sizeof(c2Ioc));
+                    c2Ioc.Type = IOCType_Domain;
+                    RtlCopyMemory(c2Ioc.Value.Domain, entry->Value.Domain,
+                                   sizeof(c2Ioc.Value.Domain) - 1);
+                    c2Ioc.Value.Domain[sizeof(c2Ioc.Value.Domain) - 1] = '\0';
+                    RtlCopyMemory(c2Ioc.MalwareFamily, entry->MalwareFamily,
+                                   min(sizeof(entry->MalwareFamily), sizeof(c2Ioc.MalwareFamily) - 1));
+                    KeQuerySystemTimePrecise(&c2Ioc.AddedTime);
+                    c2Ioc.ExpirationTime = entry->Expiry;
+
+                    status = C2AddIOC(c2Detector, &c2Ioc);
+                    if (NT_SUCCESS(status)) {
+                        entryAccepted = TRUE;
+                    }
+                }
+
+                //
+                // Set domain reputation
+                //
+                if (dnsMonitor != NULL) {
+                    status = DnsSetDomainReputation(
+                        dnsMonitor,
+                        entry->Value.Domain,
+                        (DNS_REPUTATION)entry->Reputation,
+                        entry->Score
+                    );
+                    if (NT_SUCCESS(status)) {
+                        entryAccepted = TRUE;
+                    }
+                }
+
+                //
+                // Add to NetworkReputation
+                //
+                if (repManager != NULL) {
+                    status = NrAddDomain(
+                        repManager,
+                        entry->Value.Domain,
+                        (NR_REPUTATION)entry->Reputation,
+                        (NR_CATEGORY)entry->Categories,
+                        entry->Score,
+                        entry->ThreatName[0] ? entry->ThreatName : NULL
+                    );
+                    if (NT_SUCCESS(status)) {
+                        entryAccepted = TRUE;
+                    }
+                }
+                break;
+            }
+
+            case SHADOWSTRIKE_NET_IOC_JA3:
+            {
+                if (c2Detector != NULL) {
+                    status = C2AddKnownJA3(
+                        c2Detector,
+                        entry->Value.JA3Hash,
+                        entry->MalwareFamily[0] ? entry->MalwareFamily : NULL
+                    );
+                    if (NT_SUCCESS(status)) {
+                        entryAccepted = TRUE;
+                    }
+                }
+                break;
+            }
+
+            case SHADOWSTRIKE_NET_IOC_URL:
+            {
+                entry->Value.URL[sizeof(entry->Value.URL) - 1] = '\0';
+
+                if (c2Detector != NULL) {
+                    C2_IOC c2Ioc;
+                    RtlZeroMemory(&c2Ioc, sizeof(c2Ioc));
+                    c2Ioc.Type = IOCType_URL;
+                    RtlCopyMemory(c2Ioc.Value.URL, entry->Value.URL,
+                                   sizeof(c2Ioc.Value.URL) - 1);
+                    c2Ioc.Value.URL[sizeof(c2Ioc.Value.URL) - 1] = '\0';
+                    RtlCopyMemory(c2Ioc.MalwareFamily, entry->MalwareFamily,
+                                   min(sizeof(entry->MalwareFamily), sizeof(c2Ioc.MalwareFamily) - 1));
+                    KeQuerySystemTimePrecise(&c2Ioc.AddedTime);
+                    c2Ioc.ExpirationTime = entry->Expiry;
+
+                    status = C2AddIOC(c2Detector, &c2Ioc);
+                    if (NT_SUCCESS(status)) {
+                        entryAccepted = TRUE;
+                    }
+                }
+                break;
+            }
+
+            default:
+                break;
+        }
+
+        if (entryAccepted) {
+            accepted++;
+        } else {
+            rejected++;
+        }
+
+        entry++;
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike/MH] PushNetworkIoC: %u accepted, %u rejected\n",
+               accepted, rejected);
+
+    MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
+                     OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Handle exclusion update (FilterMessageType_ExclusionUpdate).
+ *
+ * Add, remove, or clear exclusions in the ExclusionManager.
+ * Supports path, extension, process name, and PID exclusion types.
+ */
+static NTSTATUS
+MhpHandleExclusionUpdate(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    )
+{
+    NTSTATUS status;
+    PSHADOWSTRIKE_PUSH_BATCH_HEADER batchHeader;
+    PVOID entriesStart;
+    ULONG entryCount;
+    ULONG accepted = 0;
+    ULONG rejected = 0;
+    PSHADOWSTRIKE_PUSH_EXCLUSION_ENTRY entry;
+    ULONG i;
+    PUCHAR cursor;
+    PUCHAR payloadEnd;
+    ULONG entryTotalSize;
+    UNICODE_STRING valueString;
+    WCHAR localBuffer[260];
+
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(ClientContext);
+
+    *ReturnOutputBufferLength = 0;
+
+    //
+    // Variable-size entries (trailing WCHAR value)
+    //
+    status = MhpValidateBatchHeader(
+        PayloadBuffer, PayloadSize, 0,
+        &batchHeader, &entriesStart, &entryCount
+    );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (entryCount == 0) {
+        MhpBuildPushReply(Header, STATUS_SUCCESS, 0, 0,
+                         OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+        return STATUS_SUCCESS;
+    }
+
+    cursor = (PUCHAR)entriesStart;
+    payloadEnd = (PUCHAR)PayloadBuffer + PayloadSize;
+
+    for (i = 0; i < entryCount; i++) {
+        if (cursor + sizeof(SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY) > payloadEnd) {
+            rejected += (entryCount - i);
+            break;
+        }
+
+        entry = (PSHADOWSTRIKE_PUSH_EXCLUSION_ENTRY)cursor;
+
+        //
+        // Handle clear operation (no value needed)
+        //
+        if (entry->Operation == SHADOWSTRIKE_EXCL_OP_CLEAR) {
+            if (entry->ExclusionType < ShadowStrikeExclusionTypeMax) {
+                ShadowStrikeClearExclusions((SHADOWSTRIKE_EXCLUSION_TYPE)entry->ExclusionType);
+                accepted++;
+            } else {
+                rejected++;
+            }
+            cursor += sizeof(SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY);
+            continue;
+        }
+
+        //
+        // For PID exclusions, value is UINT64 (no WCHAR string)
+        //
+        if (entry->ExclusionType == (UINT8)ShadowStrikeExclusionProcessId) {
+            entryTotalSize = sizeof(SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY) + sizeof(UINT64);
+            if (cursor + entryTotalSize > payloadEnd) {
+                rejected += (entryCount - i);
+                break;
+            }
+
+            UINT64 pidValue = *(PUINT64)((PUCHAR)entry + sizeof(SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY));
+
+            if (entry->Operation == SHADOWSTRIKE_EXCL_OP_ADD) {
+                status = ShadowStrikeAddPidExclusion((HANDLE)(ULONG_PTR)pidValue, entry->TTLSeconds);
+            } else {
+                BOOLEAN removed = ShadowStrikeRemovePidExclusion((HANDLE)(ULONG_PTR)pidValue);
+                status = removed ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+            }
+
+            if (NT_SUCCESS(status)) {
+                accepted++;
+            } else {
+                rejected++;
+            }
+
+            cursor += entryTotalSize;
+            continue;
+        }
+
+        //
+        // String-based exclusions (path, extension, process name)
+        //
+        if (entry->ValueLength == 0 || entry->ValueLength > 259) {
+            rejected++;
+            entryTotalSize = sizeof(SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY) + entry->ValueLength * sizeof(WCHAR);
+            if (cursor + entryTotalSize <= payloadEnd) {
+                cursor += entryTotalSize;
+            } else {
+                rejected += (entryCount - i - 1);
+                break;
+            }
+            continue;
+        }
+
+        entryTotalSize = sizeof(SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY) + entry->ValueLength * sizeof(WCHAR);
+        if (cursor + entryTotalSize > payloadEnd) {
+            rejected += (entryCount - i);
+            break;
+        }
+
+        //
+        // Build UNICODE_STRING from value data
+        //
+        PWCHAR valueData = (PWCHAR)((PUCHAR)entry + sizeof(SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY));
+        RtlCopyMemory(localBuffer, valueData, entry->ValueLength * sizeof(WCHAR));
+        localBuffer[entry->ValueLength] = L'\0';
+        valueString.Buffer = localBuffer;
+        valueString.Length = entry->ValueLength * sizeof(WCHAR);
+        valueString.MaximumLength = (entry->ValueLength + 1) * sizeof(WCHAR);
+
+        switch (entry->ExclusionType) {
+            case (UINT8)ShadowStrikeExclusionPath:
+                if (entry->Operation == SHADOWSTRIKE_EXCL_OP_ADD) {
+                    status = ShadowStrikeAddPathExclusion(&valueString, entry->Flags, entry->TTLSeconds);
+                } else {
+                    BOOLEAN removed = ShadowStrikeRemovePathExclusion(&valueString);
+                    status = removed ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+                }
+                break;
+
+            case (UINT8)ShadowStrikeExclusionExtension:
+                if (entry->Operation == SHADOWSTRIKE_EXCL_OP_ADD) {
+                    status = ShadowStrikeAddExtensionExclusion(&valueString, entry->Flags);
+                } else {
+                    BOOLEAN removed = ShadowStrikeRemoveExtensionExclusion(&valueString);
+                    status = removed ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+                }
+                break;
+
+            case (UINT8)ShadowStrikeExclusionProcessName:
+                if (entry->Operation == SHADOWSTRIKE_EXCL_OP_ADD) {
+                    status = ShadowStrikeAddProcessExclusion(&valueString, entry->Flags);
+                } else {
+                    BOOLEAN removed = ShadowStrikeRemoveProcessExclusion(&valueString);
+                    status = removed ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+                }
+                break;
+
+            default:
+                status = STATUS_INVALID_PARAMETER;
+                break;
+        }
+
+        if (NT_SUCCESS(status)) {
+            accepted++;
+        } else {
+            rejected++;
+        }
+
+        cursor += entryTotalSize;
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike/MH] ExclusionUpdate: %u accepted, %u rejected\n",
+               accepted, rejected);
+
+    MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
+                     OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+
+    return STATUS_SUCCESS;
 }

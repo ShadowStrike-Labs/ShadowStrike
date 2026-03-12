@@ -3951,3 +3951,28 @@ BepGetProcessName(
     RtlCopyMemory(ProcessName, lastSlash, nameLen * sizeof(WCHAR));
     ProcessName[nameLen] = L'\0';
 }
+
+// ============================================================================
+// MODULE ACCESSOR FUNCTIONS
+// ============================================================================
+//
+// These accessors expose internal module instances to the MessageHandler
+// data push layer. The instances are initialized during BeEngineInitialize()
+// and remain valid until BeEngineShutdown().
+//
+
+PIOM_MATCHER
+BeGetIocMatcher(
+    VOID
+    )
+{
+    return g_IocMatcher;
+}
+
+PRE_ENGINE
+BeGetRuleEngine(
+    VOID
+    )
+{
+    return g_RuleEngine;
+}
