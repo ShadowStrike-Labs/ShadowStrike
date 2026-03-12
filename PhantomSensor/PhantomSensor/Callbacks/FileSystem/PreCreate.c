@@ -72,6 +72,8 @@ Performance Characteristics:
 #include "../../Utilities/StringUtils.h"
 #include <ntstrsafe.h>
 #include <wchar.h>
+#include "../../Behavioral/BehaviorEngine.h"
+#include "../../Shared/BehaviorTypes.h"
 
 //
 // Forward declarations for cross-module APIs defined in FileSystemCallbacks.c
@@ -1337,6 +1339,16 @@ Return Value:
 
         SHADOWSTRIKE_INC_STAT(FilesBlocked);
         InterlockedIncrement64(&g_PcState.Stats.OperationsBlocked);
+
+        BeEngineSubmitEvent(
+            BehaviorEvent_FileSignatureSpoofing,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(RequestorPid),
+            NULL, 0,
+            ThreatScore,
+            TRUE,
+            NULL
+            );
 
         if (PcpShouldLogOperation()) {
             DbgPrintEx(

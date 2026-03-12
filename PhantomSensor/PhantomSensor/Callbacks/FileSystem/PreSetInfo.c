@@ -89,6 +89,9 @@
 #include "../../Utilities/FileUtils.h"
 #include "../../Utilities/StringUtils.h"
 #include "../../Communication/CommPort.h"
+#include "../../Cache/ScanCache.h"
+#include "../../Behavioral/BehaviorEngine.h"
+#include "../../Shared/BehaviorTypes.h"
 #include <ntstrsafe.h>
 
 //
@@ -401,6 +404,7 @@ typedef struct _PSI_GLOBAL_STATE {
         volatile LONG64 KernelModeSkips;
         volatile LONG64 TelemetryEventsSent;
         volatile LONG64 TelemetryEventsFailed;
+        volatile LONG64 CacheInvalidations;
         LARGE_INTEGER StartTime;
     } Stats;
 
@@ -1104,6 +1108,25 @@ ShadowStrikePreSetInformation(
 
     //
     // ========================================================================
+    // SCAN CACHE INVALIDATION
+    // ========================================================================
+    // Rename/delete/truncation changes file content or removes the file.
+    // Stale cached scan verdicts must be evicted to prevent bypass.
+    //
+    if (FltObjects->FileObject != NULL) {
+        SHADOWSTRIKE_CACHE_KEY cacheKey;
+        NTSTATUS cacheStatus;
+
+        cacheStatus = ShadowStrikeCacheBuildKey(FltObjects, &cacheKey);
+        if (NT_SUCCESS(cacheStatus)) {
+            if (ShadowStrikeCacheRemove(&cacheKey)) {
+                InterlockedIncrement64(&g_PsiState.Stats.CacheInvalidations);
+            }
+        }
+    }
+
+    //
+    // ========================================================================
     // BEHAVIORAL ANALYSIS
     // ========================================================================
     //
@@ -1232,6 +1255,20 @@ CompleteOperation:
             score = (ULONG)processContext->SuspicionScore;
             PsipDereferenceProcessContext(processContext);
         }
+
+        BeEngineSubmitEvent(
+            (blockReason & PSI_BEHAVIOR_EXTENSION_CHANGE)
+                ? BehaviorEvent_RansomwareBehavior
+                : (blockReason & PSI_BEHAVIOR_MASS_DELETE)
+                    ? BehaviorEvent_DataDestruction
+                    : BehaviorEvent_RansomwareBehavior,
+            BehaviorCategory_Impact,
+            HandleToULong(requestorPid),
+            NULL, 0,
+            score,
+            shouldBlock,
+            NULL
+            );
 
         PsipSendTelemetryEvent(
             requestorPid,

@@ -43,6 +43,7 @@
 #include "../../Core/Globals.h"
 #include "../../Shared/SharedDefs.h"
 #include "../../Shared/BehaviorTypes.h"
+#include "../../Behavioral/BehaviorEngine.h"
 #include <ntstrsafe.h>
 
 //
@@ -708,6 +709,16 @@ NpMonPreCreateNamedPipe(
             TRUE, TRUE
         );
 
+        BeEngineSubmitEvent(
+            BehaviorEvent_NamedPipeBlocked,
+            BehaviorCategory_LateralMovement,
+            HandleToUlong(creatorPid),
+            NULL, 0,
+            95,
+            TRUE,
+            NULL
+            );
+
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "[ShadowStrike] SPOOFED SYSTEM PIPE BLOCKED: '%.64ws' "
                    "creator=%hs PID=%lu\n",
@@ -776,6 +787,17 @@ NpMonPreCreateNamedPipe(
 
         if (threatScore >= 90) {
             InterlockedIncrement64(&g_NpmState.Stats.TotalPipesBlocked);
+
+            BeEngineSubmitEvent(
+                BehaviorEvent_NamedPipeC2Detected,
+                BehaviorCategory_LateralMovement,
+                HandleToUlong(creatorPid),
+                NULL, 0,
+                threatScore,
+                TRUE,
+                NULL
+                );
+
             ExReleaseRundownProtection(&g_NpmState.RundownRef);
             Data->IoStatus.Status = STATUS_ACCESS_DENIED;
             Data->IoStatus.Information = 0;

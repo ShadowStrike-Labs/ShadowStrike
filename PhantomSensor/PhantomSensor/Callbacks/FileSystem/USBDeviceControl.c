@@ -46,6 +46,8 @@ Policy Resolution Order:
 #include "../../Core/Globals.h"
 #include <ntstrsafe.h>
 #include <ntddstor.h>
+#include "../../Behavioral/BehaviorEngine.h"
+#include "../../Shared/BehaviorTypes.h"
 
 // ============================================================================
 // PRIVATE TYPES
@@ -442,6 +444,16 @@ UdcIsWriteBlocked(
             InterlockedIncrement(&Volume->WriteBlocked);
             InterlockedIncrement64(&g_UdcState.Stats.WritesBlocked);
             Blocked = TRUE;
+
+            BeEngineSubmitEvent(
+                BehaviorEvent_USBWriteBlocked,
+                BehaviorCategory_Exfiltration,
+                HandleToULong(PsGetCurrentProcessId()),
+                NULL, 0,
+                50,
+                TRUE,
+                NULL
+                );
         } else if (Volume->EffectivePolicy == UdcPolicy_Audit) {
             InterlockedIncrement64(&g_UdcState.Stats.WritesAllowed);
         }
@@ -534,6 +546,16 @@ UdcCheckAutorun(
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                        "[ShadowStrike/UDC] BLOCKED autorun.inf access: %wZ\n",
                        FileName);
+
+            BeEngineSubmitEvent(
+                BehaviorEvent_USBAutorunBlocked,
+                BehaviorCategory_Exfiltration,
+                HandleToULong(PsGetCurrentProcessId()),
+                NULL, 0,
+                80,
+                TRUE,
+                NULL
+                );
 
             Result = TRUE;
         }

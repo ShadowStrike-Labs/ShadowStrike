@@ -98,6 +98,7 @@ REVISION HISTORY:
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
+#include "../../Behavioral/BehaviorEngine.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -1723,6 +1724,17 @@ IRQL:
 
         InterlockedIncrement64((PLONG64)&g_PasState.Stats.Blocked);
         SHADOWSTRIKE_INC_STAT(FilesBlocked);
+
+        BeEngineSubmitEvent(
+            BehaviorEvent_NtMapViewInjection,
+            BehaviorCategory_CodeInjection,
+            HandleToULong(CurrentProcessId),
+            NULL, 0,
+            SuspicionScore,
+            TRUE,
+            NULL
+            );
+
         SHADOWSTRIKE_RELEASE_RUNDOWN();
 
         return FLT_PREOP_COMPLETE;

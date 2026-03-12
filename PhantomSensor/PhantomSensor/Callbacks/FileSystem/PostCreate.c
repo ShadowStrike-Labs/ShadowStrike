@@ -76,6 +76,8 @@
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/StringUtils.h"
+#include "../../Behavioral/BehaviorEngine.h"
+#include "../../Shared/BehaviorTypes.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -756,6 +758,18 @@ Return Value:
         streamContext->TrackingFlags |= PocTrackingScanned;
 
         InterlockedIncrement64(&g_PocState.Stats.ScannedFiles);
+
+        if (completionCtx->ThreatScore > 0) {
+            BeEngineSubmitEvent(
+                BehaviorEvent_HiddenFileCreation,
+                BehaviorCategory_FileOperation,
+                HandleToULong(PsGetCurrentProcessId()),
+                NULL, 0,
+                completionCtx->ThreatScore,
+                FALSE,
+                NULL
+                );
+        }
 
         if (g_PocState.Config.LogContextCreation && PocpShouldLogOperation()) {
             DbgPrintEx(
