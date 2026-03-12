@@ -102,6 +102,9 @@
 #include "../SelfProtection/CallbackProtection.h"
 #include "../SelfProtection/HandleProtection.h"
 #include "../SelfProtection/IntegrityMonitor.h"
+#include "../SelfProtection/AntiDebug.h"
+#include "../SelfProtection/AntiUnload.h"
+#include "../SelfProtection/FileProtection.h"
 
 // Phase 5: Specialized subsystems
 #include "../ALPC/AlpcPortMonitor.h"
@@ -197,6 +200,15 @@ static PHP_PROTECTION_ENGINE g_HandleProtection = NULL;
 
 /// @brief Integrity monitor handle (Phase 4B)
 static PIM_MONITOR g_IntegrityMonitor = NULL;
+
+/// @brief Anti-debug protector handle (Phase 4C)
+static PADB_PROTECTOR g_AntiDebugProtector = NULL;
+
+/// @brief Anti-unload protector handle (Phase 4C)
+static PAU_PROTECTOR g_AntiUnloadProtector = NULL;
+
+/// @brief File protection engine handle (Phase 4C)
+static PFP_ENGINE g_FileProtectionEngine = NULL;
 
 /// @brief Threat scoring engine (Phase 6A)
 static PTS_SCORING_ENGINE g_ThreatScoring = NULL;
@@ -1022,7 +1034,55 @@ DriverEntry(
     }
 
     //
-    // Step 14.18: Initialize callback protection (LAST protection init — protects all registered callbacks)
+    // Step 14.18a: Initialize anti-debug protector
+    // Detects kernel debugger attachment and debug port abuse (T1622)
+    //
+    status = AdbInitialize(&g_AntiDebugProtector);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize anti-debug protector: 0x%08X (continuing)\n",
+                   status);
+        g_AntiDebugProtector = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_AntiDebugInitialized;
+        ShadowStrikeLogInitStatus("Anti-Debug Protector", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.18b: Initialize anti-unload protector
+    // Prevents malicious driver unload via OB callbacks and DriverUnload nullification
+    //
+    status = AuInitialize(g_DriverData.DriverObject, &g_AntiUnloadProtector);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize anti-unload protector: 0x%08X (continuing)\n",
+                   status);
+        g_AntiUnloadProtector = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_AntiUnloadInitialized;
+        ShadowStrikeLogInitStatus("Anti-Unload Protector", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.18c: Initialize file protection engine
+    // Protects driver files on disk from deletion/modification (T1562.001)
+    //
+    status = FpInitialize(&g_FileProtectionEngine);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize file protection: 0x%08X (continuing)\n",
+                   status);
+        g_FileProtectionEngine = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_FileProtectionInitialized;
+        ShadowStrikeLogInitStatus("File Protection Engine", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 14.19: Initialize callback protection (LAST protection init — protects all registered callbacks)
     //
     status = CpInitialize(&g_CallbackProtector);
     if (!NT_SUCCESS(status)) {
@@ -1449,6 +1509,21 @@ ShadowStrikeUnload(
     if (g_SubsystemFlags & SubsysFlag_IntegrityMonitor) {
         ImShutdown(&g_IntegrityMonitor);
         g_IntegrityMonitor = NULL;
+    }
+
+    if (g_InitFlags & InitFlag_FileProtectionInitialized) {
+        FpShutdown(g_FileProtectionEngine);
+        g_FileProtectionEngine = NULL;
+    }
+
+    if (g_InitFlags & InitFlag_AntiUnloadInitialized) {
+        AuShutdown(g_AntiUnloadProtector);
+        g_AntiUnloadProtector = NULL;
+    }
+
+    if (g_InitFlags & InitFlag_AntiDebugInitialized) {
+        AdbShutdown(g_AntiDebugProtector);
+        g_AntiDebugProtector = NULL;
     }
 
     if (g_SubsystemFlags & SubsysFlag_HandleProtection) {
@@ -2166,6 +2241,21 @@ ShadowStrikeCleanupByFlags(
     if (g_SubsystemFlags & SubsysFlag_IntegrityMonitor) {
         ImShutdown(&g_IntegrityMonitor);
         g_IntegrityMonitor = NULL;
+    }
+
+    if (g_InitFlags & InitFlag_FileProtectionInitialized) {
+        FpShutdown(g_FileProtectionEngine);
+        g_FileProtectionEngine = NULL;
+    }
+
+    if (g_InitFlags & InitFlag_AntiUnloadInitialized) {
+        AuShutdown(g_AntiUnloadProtector);
+        g_AntiUnloadProtector = NULL;
+    }
+
+    if (g_InitFlags & InitFlag_AntiDebugInitialized) {
+        AdbShutdown(g_AntiDebugProtector);
+        g_AntiDebugProtector = NULL;
     }
 
     if (g_SubsystemFlags & SubsysFlag_HandleProtection) {

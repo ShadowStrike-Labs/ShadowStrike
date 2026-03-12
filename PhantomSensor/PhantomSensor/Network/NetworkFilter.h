@@ -656,6 +656,8 @@ NfFlowDeleteNotify(
 struct _C2_DETECTOR;
 struct _DNS_MONITOR;
 struct _NR_MANAGER;
+struct _SSL_INSPECTOR;
+struct _DX_DETECTOR;
 
 /**
  * @brief Get the global C2 Detection instance.
@@ -690,6 +692,28 @@ NfFilterGetDnsMonitor(
  */
 struct _NR_MANAGER*
 NfFilterGetReputationManager(
+    VOID
+    );
+
+/**
+ * @brief Get the global SSL Inspector instance.
+ *
+ * @return Pointer to SSL inspector, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _SSL_INSPECTOR*
+NfFilterGetSslInspector(
+    VOID
+    );
+
+/**
+ * @brief Get the global Data Exfiltration Detector instance.
+ *
+ * @return Pointer to DX detector, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _DX_DETECTOR*
+NfFilterGetDxDetector(
     VOID
     );
 

@@ -1454,6 +1454,14 @@ IRQL:
     }
 
     //
+    // Exclusion check — skip analysis for excluded processes
+    //
+    if (ShadowStrikeIsProcessExcluded(CurrentProcessId, NULL)) {
+        InterlockedIncrement64((PLONG64)&g_PasState.Stats.Allowed);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    //
     // Acquire rundown protection for this operation
     //
     if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {

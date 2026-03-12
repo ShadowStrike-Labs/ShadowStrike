@@ -65,6 +65,7 @@
 #include "../../Communication/CommPort.h"
 #include "../../../Shared/MessageTypes.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Transactions/KtmMonitor.h"
 
 //
 // WPP Tracing - conditionally include if available
@@ -882,6 +883,39 @@ ShadowStrikePostWrite(
         }
         if (writeContext.IsHoneypotFile) {
             InterlockedIncrement64(&g_PostWriteState.HoneypotAccesses);
+        }
+    }
+
+    //
+    // KTM Transaction Tracking: If this write is within a TxF transaction,
+    // record the file operation for ransomware pattern detection.
+    // Transacted writes that are later rolled back are a known evasion
+    // technique (T1055.013 Process Doppelganging, T1486 ransomware).
+    //
+    {
+        PTXN_PARAMETER_BLOCK txnBlock = IoGetTransactionParameterBlock(FltObjects->FileObject);
+        if (txnBlock != NULL && txnBlock->TransactionObject != NULL) {
+            PSHADOW_KTM_TRANSACTION ktmTxn = NULL;
+            NTSTATUS ktmStatus;
+            GUID txnGuid;
+
+            TmGetTransactionId(
+                (PKTRANSACTION)txnBlock->TransactionObject,
+                &txnGuid
+            );
+
+            ktmStatus = ShadowTrackTransaction(
+                txnGuid,
+                writeContext.ProcessId,
+                &ktmTxn
+            );
+
+            if (NT_SUCCESS(ktmStatus) && ktmTxn != NULL) {
+                if (fileNameAcquired) {
+                    ShadowRecordTransactedFileOperation(ktmTxn, &fileName);
+                }
+                ShadowReleaseKtmTransaction(ktmTxn);
+            }
         }
     }
 

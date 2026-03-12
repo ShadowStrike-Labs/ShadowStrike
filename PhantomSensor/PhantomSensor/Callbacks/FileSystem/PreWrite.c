@@ -76,6 +76,7 @@ MITRE ATT&CK Coverage:
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../Cache/ScanCache.h"
 #include "../../Exclusions/ExclusionManager.h"
+#include "../../Behavioral/BehaviorEngine.h"
 #include "../../Utilities/FileUtils.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Communication/ScanBridge.h"
@@ -920,6 +921,26 @@ Return Value:
     }
 
     // =========================================================================
+    // EXCLUSION CHECK — Skip analysis for excluded processes and paths
+    // =========================================================================
+
+    if (ShadowStrikeIsProcessExcluded(RequestorPid, NULL)) {
+        InterlockedIncrement64(&g_PwState.Stats.SkippedKernelMode);
+        FltReleaseFileNameInformation(NameInfo);
+        NameInfo = NULL;
+        PwpLeaveOperation();
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    if (ShadowStrikeIsPathExcluded(&NameInfo->Name, NULL)) {
+        InterlockedIncrement64(&g_PwState.Stats.SkippedKernelMode);
+        FltReleaseFileNameInformation(NameInfo);
+        NameInfo = NULL;
+        PwpLeaveOperation();
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    // =========================================================================
     // USB DEVICE CONTROL — Block writes to restricted removable media
     // =========================================================================
 
@@ -1129,6 +1150,38 @@ CacheInvalidation:
     }
 
 Cleanup:
+    //
+    // Submit suspicious writes to behavioral engine for attack chain correlation
+    //
+    if (SuspicionFlags != PW_SUSPICION_NONE) {
+        UINT32 threatScore = 0;
+        BEHAVIOR_EVENT_TYPE eventType = BehaviorEvent_MassFileEncryption;
+
+        if (SuspicionFlags & PW_SUSPICION_HIGH_ENTROPY) {
+            threatScore = 85;
+            eventType = BehaviorEvent_RansomwareBehavior;
+        } else if (SuspicionFlags & PW_SUSPICION_MASS_WRITE) {
+            threatScore = 70;
+            eventType = BehaviorEvent_MassFileEncryption;
+        } else if (SuspicionFlags & PW_SUSPICION_CANARY_FILE) {
+            threatScore = 95;
+            eventType = BehaviorEvent_RansomwareBehavior;
+        } else {
+            threatScore = 50;
+        }
+
+        BeEngineSubmitEvent(
+            eventType,
+            BehaviorCategory_Impact,
+            HandleToULong(RequestorPid),
+            NULL,
+            0,
+            threatScore,
+            FALSE,
+            NULL
+            );
+    }
+
     //
     // Determine return status
     //

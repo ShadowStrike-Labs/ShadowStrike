@@ -63,6 +63,8 @@
 #include "DnsMonitor.h"
 #include "C2Detection.h"
 #include "NetworkReputation.h"
+#include "SSLInspection.h"
+#include "DataExfiltration.h"
 #include "../Core/Globals.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
@@ -196,6 +198,8 @@ static PCT_TRACKER g_ConnectionTracker;
 static PDNS_MONITOR g_DnsMonitor;
 static PC2_DETECTOR g_C2Detector;
 static PNR_MANAGER g_ReputationManager;
+static PSSL_INSPECTOR g_SslInspector;
+static PDX_DETECTOR g_DxDetector;
 
 // Rate limiting state (all atomic)
 static volatile LONG g_EventsThisSecond;
@@ -656,6 +660,64 @@ NfFilterInitialize(
     InterlockedExchange64(&g_TotalEventsDropped, 0);
 
     //
+    // Initialize network detection sub-modules (non-fatal — graceful degradation)
+    // Order: ConnectionTracker → DnsMonitor → C2Detection → NetworkReputation →
+    //        SSLInspection → DataExfiltration
+    //
+    status = CtInitialize(&g_ConnectionTracker);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/NF] WARNING: ConnectionTracker init failed: 0x%08X (continuing)\n",
+                   status);
+        g_ConnectionTracker = NULL;
+    }
+
+    status = DnsInitialize(&g_DnsMonitor);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/NF] WARNING: DnsMonitor init failed: 0x%08X (continuing)\n",
+                   status);
+        g_DnsMonitor = NULL;
+    }
+
+    status = C2Initialize(DeviceObject, &g_C2Detector);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/NF] WARNING: C2Detection init failed: 0x%08X (continuing)\n",
+                   status);
+        g_C2Detector = NULL;
+    }
+
+    status = NrInitialize(DeviceObject, &g_ReputationManager);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/NF] WARNING: NetworkReputation init failed: 0x%08X (continuing)\n",
+                   status);
+        g_ReputationManager = NULL;
+    }
+
+    status = SslInitialize(&g_SslInspector);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/NF] WARNING: SSLInspection init failed: 0x%08X (continuing)\n",
+                   status);
+        g_SslInspector = NULL;
+    }
+
+    status = DxInitialize(&g_DxDetector);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/NF] WARNING: DataExfiltration init failed: 0x%08X (continuing)\n",
+                   status);
+        g_DxDetector = NULL;
+    }
+
+    //
+    // Reset status — sub-module failures are non-fatal
+    //
+    status = STATUS_SUCCESS;
+
+    //
     // Mark as initialized and enabled (atomic)
     //
     InterlockedExchange(&g_NfState.Enabled, 1);
@@ -715,6 +777,39 @@ NfFilterShutdown(
     timeout.QuadPart = -10000000LL;  // 1 second
     while (InterlockedCompareExchange(&g_CleanupInProgress, 0, 0) != 0) {
         KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+    }
+
+    //
+    // Shutdown network detection sub-modules (reverse init order)
+    //
+    if (g_DxDetector != NULL) {
+        DxShutdown(g_DxDetector);
+        g_DxDetector = NULL;
+    }
+
+    if (g_SslInspector != NULL) {
+        SslShutdown(g_SslInspector);
+        g_SslInspector = NULL;
+    }
+
+    if (g_ReputationManager != NULL) {
+        NrShutdown(g_ReputationManager);
+        g_ReputationManager = NULL;
+    }
+
+    if (g_C2Detector != NULL) {
+        C2Shutdown(g_C2Detector);
+        g_C2Detector = NULL;
+    }
+
+    if (g_DnsMonitor != NULL) {
+        DnsShutdown(g_DnsMonitor);
+        g_DnsMonitor = NULL;
+    }
+
+    if (g_ConnectionTracker != NULL) {
+        CtShutdown(g_ConnectionTracker);
+        g_ConnectionTracker = NULL;
     }
 
     //
@@ -3774,4 +3869,20 @@ NfFilterGetReputationManager(
     )
 {
     return g_ReputationManager;
+}
+
+PSSL_INSPECTOR
+NfFilterGetSslInspector(
+    VOID
+    )
+{
+    return g_SslInspector;
+}
+
+PDX_DETECTOR
+NfFilterGetDxDetector(
+    VOID
+    )
+{
+    return g_DxDetector;
 }

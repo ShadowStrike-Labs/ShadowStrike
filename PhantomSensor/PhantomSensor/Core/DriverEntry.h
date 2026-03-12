@@ -102,6 +102,9 @@ typedef enum _SHADOWSTRIKE_INIT_FLAGS {
     InitFlag_AppControlInitialized     = 0x00080000,
     InitFlag_FirmwareIntegrityInitialized = 0x00100000,
     InitFlag_ClipboardMonitorInitialized  = 0x00200000,
+    InitFlag_AntiDebugInitialized         = 0x00400000,
+    InitFlag_AntiUnloadInitialized        = 0x00800000,
+    InitFlag_FileProtectionInitialized    = 0x01000000,
 
     // Combined flags for critical security components
     InitFlag_AllSecurityCallbacks   = (InitFlag_ProcessCallbackReg |

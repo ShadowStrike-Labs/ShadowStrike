@@ -916,7 +916,8 @@ ShadowStrikePreSetInformation(
     //
     // Check process exclusion
     //
-    if (ShadowStrikeIsProcessTrusted(requestorPid)) {
+    if (ShadowStrikeIsProcessTrusted(requestorPid) ||
+        ShadowStrikeIsProcessExcluded(requestorPid, NULL)) {
         InterlockedIncrement64(&g_PsiState.Stats.ExclusionSkips);
         goto AllowOperation;
     }

@@ -74,6 +74,7 @@ Performance Characteristics:
 #include <wchar.h>
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Shared/BehaviorTypes.h"
+#include "../../Transactions/KtmMonitor.h"
 
 //
 // Forward declarations for cross-module APIs defined in FileSystemCallbacks.c
@@ -1067,6 +1068,45 @@ Return Value:
                     HandleToULong(RequestorPid),
                     ThreatScore
                     );
+            }
+        }
+    }
+
+    //
+    // KTM Transaction Tracking: Detect transacted file creates which
+    // are used in Process Doppelganging (T1055.013) and transacted
+    // ransomware (T1486). PreCreate sees the intent before the file
+    // is actually opened, so we can flag transaction participants early.
+    //
+    if (PcIsWriteAccess(Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess) ||
+        PcIsOverwriteDisposition((Data->Iopb->Parameters.Create.Options >> 24) & 0xFF)) {
+
+        PTXN_PARAMETER_BLOCK txnBlock = IoGetTransactionParameterBlock(FltObjects->FileObject);
+        if (txnBlock != NULL && txnBlock->TransactionObject != NULL) {
+            PSHADOW_KTM_TRANSACTION ktmTxn = NULL;
+            NTSTATUS ktmStatus;
+            GUID txnGuid;
+
+            TmGetTransactionId(
+                (PKTRANSACTION)txnBlock->TransactionObject,
+                &txnGuid
+            );
+
+            ktmStatus = ShadowTrackTransaction(
+                txnGuid,
+                RequestorPid,
+                &ktmTxn
+            );
+
+            if (NT_SUCCESS(ktmStatus) && ktmTxn != NULL) {
+                ShadowRecordTransactedFileOperation(ktmTxn, &NameInfo->Name);
+
+                //
+                // Transacted write creates are inherently suspicious —
+                // legitimate apps rarely use TxF for file creation.
+                //
+                ThreatScore += PC_SCORE_DELETE_ON_CLOSE;
+                ShadowReleaseKtmTransaction(ktmTxn);
             }
         }
     }

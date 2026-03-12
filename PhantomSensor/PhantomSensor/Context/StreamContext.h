@@ -23,10 +23,11 @@
  * @file StreamContext.h
  * @brief Stream context definitions and management for per-file state tracking.
  *
- * Provides a robust, thread-safe stream context management system for tracking
- * file state (scan verdicts, modification status, FileID) across I/O operations.
- * Handles race conditions during context creation and ensures proper resource
- * cleanup to prevent BSOD and memory leaks.
+ * @deprecated This module is superseded by PostCreate.c's built-in stream context
+ * management (PocGetOrCreateStreamContext / PocAllocateStreamContext / PocUpdateStreamContext)
+ * which uses SHADOWSTRIKE_STREAM_CONTEXT from SharedDefs.h. The PostCreate.c implementation
+ * is the active stream context owner in the driver. This module remains for potential future
+ * refactoring into a centralized context API.
  *
  * Thread Safety Model:
  * --------------------

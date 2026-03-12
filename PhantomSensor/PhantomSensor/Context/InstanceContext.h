@@ -23,9 +23,10 @@
  * @file InstanceContext.h
  * @brief Instance context definitions and management for per-volume state tracking.
  *
- * Provides instance context management for tracking per-volume configuration,
- * statistics, and state. Instance contexts are attached to each volume that
- * the minifilter attaches to and persist for the lifetime of the attachment.
+ * @deprecated This module is superseded by FileSystemCallbacks.c's FSC_VOLUME_CONTEXT
+ * which provides per-volume state tracking via the minifilter instance setup callbacks.
+ * FSC_VOLUME_CONTEXT is the active per-volume context in the driver. This module
+ * remains for potential future consolidation into a centralized context API.
  *
  * Use Cases:
  * - Per-volume scan statistics (files scanned, blocked, etc.)

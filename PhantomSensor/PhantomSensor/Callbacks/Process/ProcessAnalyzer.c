@@ -45,6 +45,8 @@ Security Hardening Applied:
 #include "ProcessRelationship.h"
 #include "TokenAnalyzer.h"
 #include "HandleTracker.h"
+#include "PrivilegeMonitor.h"
+#include "EnvironmentMonitor.h"
 #include <ntstrsafe.h>
 
 //
@@ -438,6 +440,8 @@ static PPCT_TRACKER g_ParentChainTracker;
 static PPR_GRAPH g_ProcessRelationship;
 static PTA_ANALYZER g_TokenAnalyzer;
 static PHT_TRACKER g_HandleTracker;
+static PPM_MONITOR g_PrivilegeMonitor;
+static PEM_MONITOR g_EnvironmentMonitor;
 
 // ============================================================================
 // PUBLIC API IMPLEMENTATION
@@ -672,6 +676,22 @@ PaInitialize(
                        childStatus);
             g_HandleTracker = NULL;
         }
+
+        childStatus = PmInitialize(&g_PrivilegeMonitor);
+        if (!NT_SUCCESS(childStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:ProcessAnalyzer] PrivilegeMonitor init failed: 0x%08X\n",
+                       childStatus);
+            g_PrivilegeMonitor = NULL;
+        }
+
+        childStatus = EmInitialize(&g_EnvironmentMonitor);
+        if (!NT_SUCCESS(childStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike:ProcessAnalyzer] EnvironmentMonitor init failed: 0x%08X\n",
+                       childStatus);
+            g_EnvironmentMonitor = NULL;
+        }
     }
 
     //
@@ -806,6 +826,14 @@ PaShutdown(
     //
     // Shutdown child subsystems (reverse init order)
     //
+    if (g_EnvironmentMonitor != NULL) {
+        EmShutdown(g_EnvironmentMonitor);
+        g_EnvironmentMonitor = NULL;
+    }
+    if (g_PrivilegeMonitor != NULL) {
+        PmShutdown(g_PrivilegeMonitor);
+        g_PrivilegeMonitor = NULL;
+    }
     if (g_HandleTracker != NULL) {
         HtShutdown(&g_HandleTracker);
         g_HandleTracker = NULL;

@@ -59,6 +59,7 @@
 #include "../Core/Globals.h"
 #include "../Communication/ScanBridge.h"
 #include "../Utilities/ProcessUtils.h"
+#include "../Behavioral/BehaviorEngine.h"
 #pragma warning(pop)
 
 //
@@ -2361,6 +2362,20 @@ DxpCreateAlert(
     DxpReleasePushLockExclusive(&Detector->AlertLock);
 
     InterlockedIncrement64(&Detector->Stats.AlertsGenerated);
+
+    //
+    // Submit to behavioral engine for attack chain correlation (T1567/T1537)
+    //
+    BeEngineSubmitEvent(
+        BehaviorEvent_DataExfiltration,
+        BehaviorCategory_Exfiltration,
+        HandleToULong(alert->ProcessId),
+        NULL,
+        0,
+        80,
+        FALSE,
+        NULL
+        );
 
     //
     // Notify callback (under push lock to prevent unload race)
