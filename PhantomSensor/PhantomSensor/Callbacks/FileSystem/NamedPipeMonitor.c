@@ -392,7 +392,6 @@ NpmExtractPipeName(
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, NpMonInitialize)
 #pragma alloc_text(PAGE, NpMonShutdown)
-#pragma alloc_text(PAGE, NpMonDequeueEvent)
 #pragma alloc_text(PAGE, NpmExtractPipeName)
 #pragma alloc_text(PAGE, NpmClassifyPipe)
 #pragma alloc_text(PAGE, NpmValidateSystemPipe)
@@ -811,6 +810,20 @@ NpMonPreCreateNamedPipe(
             Data->IoStatus.Status = STATUS_ACCESS_DENIED;
             Data->IoStatus.Information = 0;
             return FLT_PREOP_COMPLETE;
+        } else {
+            //
+            // C2 pattern detected but score below blocking threshold.
+            // Still submit to behavioral engine for attack chain correlation.
+            //
+            BeEngineSubmitEvent(
+                BehaviorEvent_NamedPipeC2Detected,
+                BehaviorCategory_LateralMovement,
+                HandleToUlong(creatorPid),
+                NULL, 0,
+                threatScore,
+                FALSE,
+                NULL
+                );
         }
     }
     else if (classification == NpmClass_HighEntropy) {
@@ -823,6 +836,16 @@ NpMonPreCreateNamedPipe(
             classification, NpmThreat_Medium, threatScore,
             FALSE, TRUE
         );
+
+        BeEngineSubmitEvent(
+            BehaviorEvent_NamedPipeHighEntropy,
+            BehaviorCategory_LateralMovement,
+            HandleToUlong(creatorPid),
+            NULL, 0,
+            threatScore,
+            FALSE,
+            NULL
+            );
     }
     else if (classification == NpmClass_Suspicious) {
         InterlockedIncrement64(&g_NpmState.Stats.SuspiciousPipesDetected);
@@ -833,6 +856,16 @@ NpMonPreCreateNamedPipe(
             classification, NpmThreat_Low, threatScore,
             FALSE, TRUE
         );
+
+        BeEngineSubmitEvent(
+            BehaviorEvent_NamedPipeCreated,
+            BehaviorCategory_LateralMovement,
+            HandleToUlong(creatorPid),
+            NULL, 0,
+            threatScore,
+            FALSE,
+            NULL
+            );
     }
 
     ExReleaseRundownProtection(&g_NpmState.RundownRef);
@@ -1500,11 +1533,11 @@ NpmCheckRateLimit(
 
     KeQuerySystemTimePrecise(&now);
 
-    oldStart = InterlockedCompareExchange64(
-        &g_NpmState.RateWindowStart.QuadPart,
-        g_NpmState.RateWindowStart.QuadPart,
-        g_NpmState.RateWindowStart.QuadPart
-    );
+    //
+    // Read the rate window start ONCE atomically. On x64, aligned 64-bit reads
+    // are naturally atomic — avoids the CAS-to-self triple-read antipattern.
+    //
+    oldStart = *(volatile LONGLONG*)&g_NpmState.RateWindowStart.QuadPart;
 
     elapsed = now.QuadPart - oldStart;
 
