@@ -505,6 +505,14 @@ PaGetParentChainTracker(
     return (PPCT_TRACKER_FWD)g_ParentChainTracker;
 }
 
+PPM_MONITOR_FWD
+PaGetPrivilegeMonitor(
+    VOID
+    )
+{
+    return (PPM_MONITOR_FWD)g_PrivilegeMonitor;
+}
+
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS

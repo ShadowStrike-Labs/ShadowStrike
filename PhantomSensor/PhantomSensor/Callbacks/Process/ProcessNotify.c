@@ -89,6 +89,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "EnvironmentMonitor.h"
 #include "HandleTracker.h"
 #include "ImageNotify.h"
+#include "PrivilegeMonitor.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -313,6 +314,7 @@ typedef struct _PN_CONFIG {
     BOOLEAN EnableCommandLineAnalysis;
     BOOLEAN EnableTokenAnalysis;
     BOOLEAN EnableParentChainTracking;
+    BOOLEAN EnablePrivilegeMonitoring;
     BOOLEAN EnableSignatureVerification;
     BOOLEAN BlockSuspiciousProcesses;
     ULONG MinBlockScore;
@@ -380,6 +382,7 @@ typedef struct _PN_MONITOR_STATE {
     //
     PVOID ProcessAnalyzer;      // PPA_ANALYZER
     PVOID ParentChainTracker;   // PPCT_TRACKER
+    PVOID PrivilegeMonitor;     // PPM_MONITOR
     PVOID CommandLineParser;    // PCLP_PARSER
     PVOID TokenAnalyzer;        // PTA_ANALYZER
 
@@ -674,6 +677,8 @@ Return Value:
     // Acquire reference to ParentChainTracker from ProcessAnalyzer
     //
     g_ProcessMonitor.ParentChainTracker = (PVOID)PaGetParentChainTracker();
+    g_ProcessMonitor.PrivilegeMonitor = (PVOID)PaGetPrivilegeMonitor();
+    g_ProcessMonitor.Config.EnablePrivilegeMonitoring = TRUE;
     g_ProcessMonitor.Config.EnableSignatureVerification = TRUE;
     g_ProcessMonitor.Config.BlockSuspiciousProcesses = FALSE;  // Audit mode by default
     g_ProcessMonitor.Config.MinBlockScore = PN_SUSPICION_CRITICAL;
@@ -1096,6 +1101,29 @@ Arguments:
                 "[ShadowStrike/ProcessNotify] Token capture failed for PID %lu: 0x%08X\n",
                 HandleToULong(ProcessId),
                 Status
+                );
+        }
+    }
+
+    //
+    // Privilege Escalation Monitoring — record baseline privilege state
+    // for the new process so we can detect privilege changes over its lifetime.
+    // Baselines are captured once at creation; PmCheckForEscalation compares
+    // current token state against baseline when triggered externally.
+    //
+    if (g_ProcessMonitor.Config.EnablePrivilegeMonitoring &&
+        g_ProcessMonitor.PrivilegeMonitor != NULL) {
+
+        PPM_MONITOR pmMon = (PPM_MONITOR)g_ProcessMonitor.PrivilegeMonitor;
+        NTSTATUS pmStatus = PmRecordBaseline(pmMon, ProcessId);
+        if (!NT_SUCCESS(pmStatus) && pmStatus != STATUS_ALREADY_REGISTERED &&
+            pmStatus != STATUS_QUOTA_EXCEEDED) {
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_TRACE_LEVEL,
+                "[ShadowStrike/ProcessNotify] PrivilegeMonitor baseline failed for PID %lu: 0x%08X\n",
+                HandleToULong(ProcessId),
+                pmStatus
                 );
         }
     }
@@ -3274,6 +3302,17 @@ PnpHandleProcessTermination(
     // Without cleanup, loaded DLL lists accumulate in NonPaged pool permanently.
     //
     ImageNotifyProcessTerminated(ProcessId);
+
+    //
+    // Mark process as terminated in PrivilegeMonitor for deferred baseline cleanup.
+    // The monitor's periodic timer will garbage-collect the baseline after timeout.
+    //
+    if (g_ProcessMonitor.PrivilegeMonitor != NULL) {
+        PmMarkProcessTerminated(
+            (PPM_MONITOR)g_ProcessMonitor.PrivilegeMonitor,
+            ProcessId
+            );
+    }
 
     //
     // Remove from tracking

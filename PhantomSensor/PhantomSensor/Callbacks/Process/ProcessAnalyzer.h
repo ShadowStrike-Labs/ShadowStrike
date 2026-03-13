@@ -66,6 +66,7 @@ typedef struct _CLP_PARSER* PCLP_PARSER;
 typedef struct _EM_MONITOR* PEM_MONITOR;
 typedef struct _HT_TRACKER* PHT_TRACKER;
 typedef struct _PCT_TRACKER* PPCT_TRACKER_FWD;
+typedef struct _PM_MONITOR* PPM_MONITOR_FWD;
 
 //
 // Pool tags for memory tracking
@@ -494,6 +495,19 @@ IRQL:
 --*/
 PPCT_TRACKER_FWD
 PaGetParentChainTracker(
+    VOID
+    );
+
+/*++
+Description:
+    Returns the PrivilegeMonitor handle owned by ProcessAnalyzer.
+    Returns PPM_MONITOR_FWD if initialized, NULL otherwise.
+
+IRQL:
+    Can be called at any IRQL (returns pointer only).
+--*/
+PPM_MONITOR_FWD
+PaGetPrivilegeMonitor(
     VOID
     );
 

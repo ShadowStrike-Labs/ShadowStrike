@@ -58,6 +58,8 @@ SECURITY FIXES APPLIED (v3.0.0):
 #include "../../Sync/TimerManager.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
+#include "../../Behavioral/BehaviorEngine.h"
+#include "../../Behavioral/ThreatScoring.h"
 #include <ntstrsafe.h>
 
 //
@@ -299,7 +301,6 @@ typedef struct _PM_MONITOR_INTERNAL {
     // Lookaside lists
     //
     NPAGED_LOOKASIDE_LIST BaselineLookaside;
-    NPAGED_LOOKASIDE_LIST EventLookaside;
     BOOLEAN LookasideInitialized;
 
     //
@@ -778,6 +779,8 @@ Return Value:
 
     //
     // Initialize lookaside lists
+    // Note: Events use direct pool allocation (not lookaside) because they
+    // can outlive the monitor via reference counting. Only baselines use lookaside.
     //
     ExInitializeNPagedLookasideList(
         &Internal->BaselineLookaside,
@@ -786,16 +789,6 @@ Return Value:
         POOL_NX_ALLOCATION,
         sizeof(PM_PROCESS_BASELINE),
         PM_BASELINE_POOL_TAG,
-        0
-        );
-
-    ExInitializeNPagedLookasideList(
-        &Internal->EventLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(PM_ESCALATION_EVENT),
-        PM_EVENT_POOL_TAG,
         0
         );
 
@@ -876,7 +869,6 @@ Cleanup:
     if (Internal != NULL) {
         if (Internal->LookasideInitialized) {
             ExDeleteNPagedLookasideList(&Internal->BaselineLookaside);
-            ExDeleteNPagedLookasideList(&Internal->EventLookaside);
         }
         Internal->Signature = PM_MONITOR_SIGNATURE_DEAD;
         ShadowStrikeFreePoolWithTag(Internal, PM_POOL_TAG);
@@ -1017,7 +1009,6 @@ Arguments:
     //
     if (Internal->LookasideInitialized) {
         ExDeleteNPagedLookasideList(&Internal->BaselineLookaside);
-        ExDeleteNPagedLookasideList(&Internal->EventLookaside);
         Internal->LookasideInitialized = FALSE;
     }
 
@@ -1646,6 +1637,88 @@ Return Value:
     // Update statistics
     //
     InterlockedIncrement64(&Internal->Stats.EscalationsDetected);
+
+    //
+    // Submit to BehaviorEngine — map escalation type to behavioral event
+    //
+    {
+        BEHAVIOR_EVENT_TYPE beEvent = BehaviorEvent_PrivilegeEscalation;
+        BEHAVIOR_EVENT_CATEGORY beCat = BehaviorCategory_PrivilegeOperation;
+
+        switch (EscalationType) {
+            case PmEscalation_TokenManipulation:
+                beEvent = BehaviorEvent_TokenManipulation;
+                break;
+            case PmEscalation_UACBypass:
+                beEvent = BehaviorEvent_ElevationOfPrivilege;
+                beCat = BehaviorCategory_DefenseEvasion;
+                break;
+            case PmEscalation_TokenElevation:
+                beEvent = BehaviorEvent_ElevationOfPrivilege;
+                break;
+            case PmEscalation_ExploitKernel:
+                beEvent = BehaviorEvent_PrivilegeEscalation;
+                break;
+            case PmEscalation_CrossSession:
+                beEvent = BehaviorEvent_TokenStealing;
+                break;
+            case PmEscalation_DriverLoad:
+                beEvent = BehaviorEvent_PrivilegeEscalation;
+                break;
+            default:
+                break;
+        }
+
+        BeEngineSubmitEvent(
+            beEvent,
+            beCat,
+            HandleToULong(ProcessId),
+            NULL, 0,
+            NewEvent->SuspicionScore,
+            (NewEvent->Flags & PM_EVENT_FLAG_BLOCKED) ? TRUE : FALSE,
+            NULL
+            );
+    }
+
+    //
+    // Feed centralized ThreatScoring engine (MITRE T1548/T1134/T1068)
+    //
+    {
+        PTS_SCORING_ENGINE tsEngine = ShadowStrikeGetThreatScoringEngine();
+        if (tsEngine != NULL) {
+            PCSTR mitreTechnique = "T1548-PrivilegeEscalation";
+            ULONG tsFactor = NewEvent->SuspicionScore;
+
+            switch (EscalationType) {
+                case PmEscalation_UACBypass:
+                    mitreTechnique = "T1548.002-UAC-Bypass";
+                    break;
+                case PmEscalation_TokenManipulation:
+                    mitreTechnique = "T1134-Token-Manipulation";
+                    break;
+                case PmEscalation_ExploitKernel:
+                    mitreTechnique = "T1068-Kernel-Exploit";
+                    break;
+                case PmEscalation_CrossSession:
+                    mitreTechnique = "T1134.003-Cross-Session-Token";
+                    break;
+                case PmEscalation_DriverLoad:
+                    mitreTechnique = "T1543.003-Driver-Load-Priv";
+                    break;
+                default:
+                    break;
+            }
+
+            TsAddFactor(
+                tsEngine,
+                ProcessId,
+                TsFactor_MITRE,
+                mitreTechnique,
+                tsFactor,
+                "Privilege escalation detected by PrivilegeMonitor"
+                );
+        }
+    }
 
     //
     // Insert event into list
