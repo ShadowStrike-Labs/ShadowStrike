@@ -65,6 +65,7 @@ extern "C" {
 typedef struct _CLP_PARSER* PCLP_PARSER;
 typedef struct _EM_MONITOR* PEM_MONITOR;
 typedef struct _HT_TRACKER* PHT_TRACKER;
+typedef struct _PCT_TRACKER* PPCT_TRACKER_FWD;
 
 //
 // Pool tags for memory tracking
@@ -476,6 +477,23 @@ IRQL:
 --*/
 PHT_TRACKER
 PaGetHandleTracker(
+    VOID
+    );
+
+/*++
+Routine Description:
+    Returns the ParentChainTracker instance managed by ProcessAnalyzer.
+    Used by ProcessNotify for process ancestry chain analysis and
+    PPID spoofing detection.
+
+Return Value:
+    PPCT_TRACKER_FWD if initialized, NULL otherwise.
+
+IRQL:
+    Can be called at any IRQL (returns pointer only).
+--*/
+PPCT_TRACKER_FWD
+PaGetParentChainTracker(
     VOID
     );
 

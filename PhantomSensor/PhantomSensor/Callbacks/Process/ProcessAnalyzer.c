@@ -497,6 +497,14 @@ PaGetHandleTracker(
     return g_HandleTracker;
 }
 
+PPCT_TRACKER_FWD
+PaGetParentChainTracker(
+    VOID
+    )
+{
+    return (PPCT_TRACKER_FWD)g_ParentChainTracker;
+}
+
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
