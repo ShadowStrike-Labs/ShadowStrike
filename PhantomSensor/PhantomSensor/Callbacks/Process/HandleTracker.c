@@ -61,6 +61,8 @@ SECURITY NOTES:
 --*/
 
 #include "HandleTracker.h"
+#include "../../Sync/TimerManager.h"
+#include "../../Core/DriverEntry.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -420,11 +422,9 @@ typedef struct _HT_TRACKER {
     HT_STATISTICS Stats;
 
     //
-    // Cleanup timer
+    // Cleanup timer (managed by TimerManager)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    volatile LONG CleanupTimerActive;
+    ULONG CleanupTimerId;
 
     //
     // Worker thread
@@ -571,11 +571,9 @@ HtpExtractFileName(
     );
 
 static VOID
-HtpCleanupDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+HtpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static VOID
@@ -651,7 +649,6 @@ HtInitialize(
     PHT_TRACKER Tracker = NULL;
     HANDLE ThreadHandle = NULL;
     OBJECT_ATTRIBUTES ObjectAttributes;
-    LARGE_INTEGER DueTime;
     ULONG i;
     SIZE_T HashTableSize;
 
@@ -847,22 +844,24 @@ HtInitialize(
     }
 
     //
-    // Initialize cleanup timer
+    // Create periodic cleanup timer via TimerManager
     //
-    KeInitializeTimer(&Tracker->CleanupTimer);
-    KeInitializeDpc(&Tracker->CleanupDpc, HtpCleanupDpcRoutine, Tracker);
-
-    //
-    // Start cleanup timer
-    //
-    DueTime.QuadPart = -((LONGLONG)Tracker->Config.CleanupIntervalMs * 10000);
-    KeSetTimerEx(
-        &Tracker->CleanupTimer,
-        DueTime,
-        Tracker->Config.CleanupIntervalMs,
-        &Tracker->CleanupDpc
-        );
-    InterlockedExchange(&Tracker->CleanupTimerActive, 1);
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 5000;
+            TmCreatePeriodic(
+                tmMgr,
+                Tracker->Config.CleanupIntervalMs,
+                HtpCleanupTimerCallback,
+                Tracker,
+                &opts,
+                &Tracker->CleanupTimerId
+                );
+        }
+    }
 
     //
     // Mark as initialized
@@ -940,11 +939,14 @@ HtShutdown(
     ExWaitForRundownProtectionRelease(&Tracker->RundownRef);
 
     //
-    // Cancel cleanup timer
+    // Cancel cleanup timer via TimerManager
     //
-    if (InterlockedExchange(&Tracker->CleanupTimerActive, 0)) {
-        KeCancelTimer(&Tracker->CleanupTimer);
-        KeFlushQueuedDpcs();
+    if (Tracker->CleanupTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Tracker->CleanupTimerId, TRUE);
+        }
+        Tracker->CleanupTimerId = 0;
     }
 
     //
@@ -2604,18 +2606,14 @@ HtpExtractFileName(
 }
 
 static VOID
-HtpCleanupDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+HtpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PHT_TRACKER Tracker = (PHT_TRACKER)DeferredContext;
+    PHT_TRACKER Tracker = (PHT_TRACKER)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (Tracker == NULL || Tracker->ShutdownRequested) {
         return;
