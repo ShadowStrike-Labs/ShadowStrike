@@ -46,7 +46,7 @@
  * - FIXED: Integrity level detection now uses ProcessUtils properly
  * - FIXED: Added rundown protection (EX_RUNDOWN_REF) for safe shutdown
  * - FIXED: Lock hierarchy violations corrected
- * - FIXED: Added KeFlushQueuedDpcs() during cleanup
+ * - MIGRATED: Cleanup timer uses TimerManager API instead of raw KTIMER+KDPC
  * - FIXED: LRU eviction race conditions eliminated
  * - FIXED: Reference count underflow now triggers bugcheck in release
  * - FIXED: Removed deprecated ExAllocatePoolWithTag
@@ -63,7 +63,11 @@
 #include "../Utilities/ProcessUtils.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 #include <ntstrsafe.h>
+
+#define SHADOW_ALPC_CLEANUP_INTERVAL_MS 60000
 
 // ============================================================================
 // UNDOCUMENTED STRUCTURES FOR OBJECT TYPE ENUMERATION
@@ -203,11 +207,9 @@ ShadowAlpcpWorkerThread(
     );
 
 static VOID
-ShadowAlpcpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+ShadowAlpcpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static VOID
@@ -304,7 +306,6 @@ ShadowAlpcInitialize(
     UNICODE_STRING altitude;
     OBJECT_ATTRIBUTES objectAttributes;
     HANDLE threadHandle = NULL;
-    LARGE_INTEGER dueTime;
     LONG previousState;
     ULONG i;
 
@@ -528,14 +529,19 @@ ShadowAlpcInitialize(
     }
 
     //
-    // Initialize cleanup timer
+    // Initialize cleanup timer via TimerManager
     //
-    KeInitializeTimer(&state->CleanupTimer);
-    KeInitializeDpc(&state->CleanupDpc, ShadowAlpcpCleanupTimerDpc, state);
-
-    dueTime.QuadPart = -((LONGLONG)60000 * 10000);  // 60 seconds
-    KeSetTimerEx(&state->CleanupTimer, dueTime, 60000, &state->CleanupDpc);
-    state->CleanupTimerActive = TRUE;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 10000;
+            TmCreatePeriodic(tmMgr, SHADOW_ALPC_CLEANUP_INTERVAL_MS,
+                             ShadowAlpcpCleanupTimerCallback, state,
+                             &opts, &state->CleanupTimerId);
+        }
+    }
 
     //
     // Mark as initialized
@@ -595,17 +601,15 @@ ShadowAlpcCleanup(
     }
 
     //
-    // Cancel cleanup timer and wait for any pending DPCs
+    // Cancel cleanup timer via TimerManager
     //
-    if (state->CleanupTimerActive) {
-        KeCancelTimer(&state->CleanupTimer);
-        state->CleanupTimerActive = FALSE;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && state->CleanupTimerId) {
+            TmCancel(tmMgr, state->CleanupTimerId, TRUE);
+            state->CleanupTimerId = 0;
+        }
     }
-
-    //
-    // CRITICAL FIX: Flush any queued DPCs to ensure timer DPC is not running
-    //
-    KeFlushQueuedDpcs();
 
     //
     // Signal worker thread to exit and wait
@@ -2316,23 +2320,15 @@ ShadowAlpcpWorkerThread(
 }
 
 static VOID
-ShadowAlpcpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+ShadowAlpcpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PSHADOW_ALPC_MONITOR_STATE state = (PSHADOW_ALPC_MONITOR_STATE)DeferredContext;
+    UNREFERENCED_PARAMETER(TimerId);
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    //
-    // CRITICAL FIX: Check shutdown state atomically
-    //
-    if (state != NULL && !state->ShuttingDown && state->Initialized) {
+    PSHADOW_ALPC_MONITOR_STATE state = (PSHADOW_ALPC_MONITOR_STATE)Context;
+    if (state && !state->ShuttingDown) {
         KeSetEvent(&state->WorkAvailableEvent, IO_NO_INCREMENT, FALSE);
     }
 }
