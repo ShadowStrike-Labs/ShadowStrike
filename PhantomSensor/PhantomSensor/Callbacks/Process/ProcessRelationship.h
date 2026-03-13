@@ -148,7 +148,7 @@ typedef struct _PR_PROCESS_NODE {
     //
     LIST_ENTRY RelationshipList;
     volatile LONG RelationshipCount;
-    EX_SPIN_LOCK RelationshipSpinLock;  // Protects RelationshipList
+    KSPIN_LOCK RelationshipSpinLock;  // Protects RelationshipList
 
     //
     // Graph metrics

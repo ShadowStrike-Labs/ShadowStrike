@@ -149,7 +149,7 @@ typedef struct _PR_GRAPH_INTERNAL {
     // Deferred node free list (nodes with RefCount > 0 at removal time)
     //
     LIST_ENTRY DeferredFreeList;
-    EX_SPIN_LOCK DeferredFreeLock;
+    KSPIN_LOCK DeferredFreeLock;
 
 } PR_GRAPH_INTERNAL, *PPR_GRAPH_INTERNAL;
 
@@ -525,7 +525,7 @@ PrInitialize(
     // Initialize deferred free list
     //
     InitializeListHead(&internal->DeferredFreeList);
-    internal->DeferredFreeLock = 0;
+    KeInitializeSpinLock(&internal->DeferredFreeLock);
 
     //
     // Initialize shutdown synchronization
@@ -731,7 +731,7 @@ PrShutdown(
     //
     // Free deferred nodes
     //
-    KeAcquireInStackQueuedSpinLock((PKSPIN_LOCK)&internal->DeferredFreeLock, &lockHandle);
+    KeAcquireInStackQueuedSpinLock(&internal->DeferredFreeLock, &lockHandle);
 
     while (!IsListEmpty(&internal->DeferredFreeList)) {
         listEntry = RemoveHeadList(&internal->DeferredFreeList);
@@ -841,7 +841,7 @@ PrAddProcess(
     node->Removed = FALSE;
     node->ProcessId = ProcessId;
     node->ParentId = ParentId;
-    node->RelationshipSpinLock = 0;
+    KeInitializeSpinLock(&node->RelationshipSpinLock);
     InitializeListHead(&node->RelationshipList);
     KeQuerySystemTime(&node->CreateTime);
 
@@ -1217,7 +1217,7 @@ PrAddRelationship(
     if (sourceNode != NULL && !sourceNode->Removed) {
         LONG nodeRelCount = sourceNode->RelationshipCount;
         if (nodeRelCount < PR_MAX_CONNECTIONS) {
-            KeAcquireInStackQueuedSpinLock((PKSPIN_LOCK)&sourceNode->RelationshipSpinLock, &lockHandle);
+            KeAcquireInStackQueuedSpinLock(&sourceNode->RelationshipSpinLock, &lockHandle);
 
             if (!sourceNode->Removed && sourceNode->RelationshipCount < PR_MAX_CONNECTIONS) {
                 InsertTailList(&sourceNode->RelationshipList, &relationship->NodeListEntry);
@@ -1391,10 +1391,10 @@ PrGetNode(
 
     //
     // IMPORTANT: Caller MUST call PrReleaseNode(Graph, Node) when done
-    // to release the reference acquired here.
+    // to release BOTH the node reference AND the graph reference held here.
+    // We intentionally keep the graph reference alive to prevent PrShutdown
+    // from freeing the node while the caller still holds a pointer.
     //
-
-    PrpReleaseGraphReference(internal);
 
     return STATUS_SUCCESS;
 }
@@ -1433,6 +1433,12 @@ PrReleaseNode(
     }
 
     PrpReleaseNodeReference(internal, Node);
+
+    //
+    // Release the graph reference held since PrGetNode.
+    // This keeps the graph alive while the caller holds the node pointer.
+    //
+    PrpReleaseGraphReference(internal);
 }
 
 _Use_decl_annotations_
@@ -1559,7 +1565,7 @@ PrGetRelationships(
     // MUST hold RelationshipSpinLock to prevent concurrent PrAddRelationship
     // from modifying the list while we iterate.
     //
-    KeAcquireInStackQueuedSpinLock((PKSPIN_LOCK)&node->RelationshipSpinLock, &lockHandle);
+    KeAcquireInStackQueuedSpinLock(&node->RelationshipSpinLock, &lockHandle);
 
     for (listEntry = node->RelationshipList.Flink;
          listEntry != &node->RelationshipList && count < MaxCount;
@@ -2237,7 +2243,7 @@ PrpAnalyzeClusterRecursive(
     // Snapshot relationships under spin lock to prevent data race
     // with concurrent PrAddRelationship calls.
     //
-    KeAcquireInStackQueuedSpinLock((PKSPIN_LOCK)&Node->RelationshipSpinLock, &lockHandle);
+    KeAcquireInStackQueuedSpinLock(&Node->RelationshipSpinLock, &lockHandle);
 
     for (listEntry = Node->RelationshipList.Flink;
          listEntry != &Node->RelationshipList;
