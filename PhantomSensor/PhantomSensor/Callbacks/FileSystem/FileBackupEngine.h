@@ -82,7 +82,8 @@ MITRE ATT&CK Coverage:
 #define FBE_IO_BUFFER_SIZE              (64 * 1024)     // 64 KB copy buffer
 #define FBE_BACKUP_DIR_NAME             L"\\ShadowStrikeBackup"
 #define FBE_BACKUP_DIR_NAME_LEN         (sizeof(FBE_BACKUP_DIR_NAME) - sizeof(WCHAR))
-#define FBE_MAX_PATH_LENGTH             520             // chars
+#define FBE_MAX_PATH_LENGTH             300             // chars (covers 99.9% of real paths)
+#define FBE_BACKUP_PATH_LENGTH          128             // chars (backup paths are short and deterministic)
 
 // ============================================================================
 // BACKUP ENTRY STATES
@@ -155,17 +156,11 @@ typedef struct _FBE_BACKUP_ENTRY {
     LARGE_INTEGER OriginalFileSize;
 
     //
-    // Backup file information
+    // Backup file information (paths are short: \Device\...\ShadowStrikeBackup\<id>.bak)
     //
     UNICODE_STRING BackupPath;      // Path to backup copy
-    WCHAR BackupPathBuffer[FBE_MAX_PATH_LENGTH];
+    WCHAR BackupPathBuffer[FBE_BACKUP_PATH_LENGTH];
     LARGE_INTEGER BackupFileSize;
-
-    //
-    // Rename tracking (for FbeOp_Rename)
-    //
-    UNICODE_STRING NewName;
-    WCHAR NewNameBuffer[FBE_MAX_PATH_LENGTH];
 
     //
     // Volume information
@@ -361,7 +356,7 @@ FbeCommitProcess(
  *
  * @param[out] Statistics   Receives current statistics snapshot.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 FbeGetStatistics(
     _Out_ PFBE_STATISTICS Statistics
@@ -374,7 +369,7 @@ FbeGetStatistics(
  *
  * @return TRUE if process has one or more backup entries.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 FbeHasBackups(
     _In_ HANDLE ProcessId
