@@ -207,6 +207,11 @@ typedef enum _BEHAVIOR_EVENT_TYPE {
     BehaviorEvent_NamedPipeLateralMovement      = 0x0904,
     BehaviorEvent_NamedPipeBlocked              = 0x0905,
 
+    // ALPC Port Monitoring (0x0906 - 0x090F)
+    BehaviorEvent_AlpcBlocked                   = 0x0906,
+    BehaviorEvent_AlpcSuspicious                = 0x0907,
+    BehaviorEvent_AlpcCrossSession              = 0x0908,
+
     // File Backup/Rollback Events (0x0A00 - 0x0A05)
     BehaviorEvent_FileBackupCreated             = 0x0A00,
     BehaviorEvent_FileBackupFailed              = 0x0A01,

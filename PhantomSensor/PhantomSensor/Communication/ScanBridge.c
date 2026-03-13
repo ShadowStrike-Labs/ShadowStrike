@@ -997,19 +997,66 @@ SbSendScanRequestEx(
     KeQuerySystemTime(&startTime);
 
     //
-    // Send request with retry
+    // Send request via CommPort's ShadowStrikeSendScanRequest, which
+    // handles HMAC-SHA256 authentication, pending request tracking
+    // against MaxPendingRequests, and reference-counted port access.
+    // ScanBridge provides the retry loop with exponential backoff.
     //
     replySize = sizeof(reply);
     RtlZeroMemory(&reply, sizeof(reply));
+    status = STATUS_UNSUCCESSFUL;
 
-    status = SbpSendWithRetry(
-        Request,
-        RequestSize,
-        &reply,
-        &replySize,
-        timeoutMs,
-        maxRetries
-    );
+    {
+        ULONG attempt;
+        ULONG retryDelayMs = SB_RETRY_DELAY_BASE_MS;
+        LARGE_INTEGER retryInterval;
+
+        for (attempt = 0; attempt <= maxRetries; attempt++) {
+            replySize = sizeof(reply);
+
+            status = ShadowStrikeSendScanRequest(
+                Request,
+                RequestSize,
+                &reply,
+                &replySize,
+                timeoutMs
+            );
+
+            if (NT_SUCCESS(status)) {
+                break;
+            }
+
+            //
+            // Check if the error is retriable
+            //
+            if (status == STATUS_TIMEOUT ||
+                status == STATUS_PORT_DISCONNECTED ||
+                status == SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED ||
+                status == SHADOWSTRIKE_ERROR_CLIENT_DISCONNECTED ||
+                status == SHADOWSTRIKE_ERROR_QUEUE_FULL ||
+                status == STATUS_DEVICE_NOT_READY) {
+
+                if (attempt < maxRetries) {
+                    InterlockedIncrement64(&g_ScanBridge.Stats.RetryCount);
+
+                    retryInterval.QuadPart = -((LONGLONG)retryDelayMs * 10000);
+                    KeDelayExecutionThread(KernelMode, FALSE, &retryInterval);
+
+                    retryDelayMs = retryDelayMs * 2;
+                    if (retryDelayMs > SB_MAX_RETRY_DELAY_MS) {
+                        retryDelayMs = SB_MAX_RETRY_DELAY_MS;
+                    }
+
+                    continue;
+                }
+            }
+
+            //
+            // Non-retriable error or max retries exhausted
+            //
+            break;
+        }
+    }
 
     //
     // Record end time and calculate latency
@@ -1811,7 +1858,6 @@ ShadowStrikeSendMessageEx(
 )
 {
     NTSTATUS status;
-    PFLT_PORT clientPort;
 
     PAGED_CODE();
 
@@ -1832,22 +1878,15 @@ ShadowStrikeSendMessageEx(
     }
 
     //
-    // Check connection
+    // Check connection before entering retry logic
     //
     if (!ShadowStrikeIsUserModeConnected()) {
         return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
     }
 
     //
-    // Get scanner port
-    //
-    clientPort = ShadowStrikeGetPrimaryScannerPort();
-    if (clientPort == NULL) {
-        return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
-    }
-
-    //
-    // Send with retry logic
+    // Send with retry logic (SbpSendWithRetry handles
+    // reference-counted port acquisition internally)
     //
     status = SbpSendWithRetry(
         InputBuffer,
@@ -2385,6 +2424,7 @@ SbpSendWithRetry(
 )
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
+    PSHADOWSTRIKE_CLIENT_PORT_REF clientRef = NULL;
     PFLT_PORT clientPort;
     LARGE_INTEGER timeout;
     ULONG attempt;
@@ -2392,12 +2432,17 @@ SbpSendWithRetry(
     LARGE_INTEGER delayInterval;
 
     //
-    // Get scanner port
+    // Acquire reference-counted scanner port.  This prevents
+    // use-after-free if the client disconnects between acquire
+    // and FltSendMessage — the reference keeps the slot alive.
     //
-    clientPort = ShadowStrikeGetPrimaryScannerPort();
-    if (clientPort == NULL) {
+    status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
+    if (!NT_SUCCESS(status)) {
+        InterlockedIncrement64(&g_ScanBridge.Stats.ConnectionErrors);
         return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
     }
+
+    clientPort = clientRef->ClientPort;
 
     //
     // Set up timeout
@@ -2426,6 +2471,7 @@ SbpSendWithRetry(
         );
 
         if (NT_SUCCESS(status)) {
+            ShadowStrikeReleaseClientPort(clientRef);
             return status;
         }
 
@@ -2437,6 +2483,13 @@ SbpSendWithRetry(
             status == STATUS_DEVICE_NOT_READY) {
 
             if (attempt < MaxRetries) {
+                //
+                // Release reference before delay — holding a reference
+                // across a long sleep blocks port cleanup on disconnect.
+                //
+                ShadowStrikeReleaseClientPort(clientRef);
+                clientRef = NULL;
+
                 //
                 // Exponential backoff delay
                 //
@@ -2454,13 +2507,14 @@ SbpSendWithRetry(
                 }
 
                 //
-                // Refresh port in case of reconnection
+                // Re-acquire port with reference count for next attempt
                 //
-                clientPort = ShadowStrikeGetPrimaryScannerPort();
-                if (clientPort == NULL) {
+                status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
+                if (!NT_SUCCESS(status)) {
                     InterlockedIncrement64(&g_ScanBridge.Stats.ConnectionErrors);
                     return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
                 }
+                clientPort = clientRef->ClientPort;
 
                 continue;
             }
@@ -2470,6 +2524,10 @@ SbpSendWithRetry(
         // Non-retriable error or max retries reached
         //
         break;
+    }
+
+    if (clientRef != NULL) {
+        ShadowStrikeReleaseClientPort(clientRef);
     }
 
     InterlockedIncrement64(&g_ScanBridge.Stats.MessageErrors);

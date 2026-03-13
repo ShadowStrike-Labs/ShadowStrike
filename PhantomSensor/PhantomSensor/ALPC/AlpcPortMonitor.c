@@ -72,13 +72,10 @@
 
 //
 // ALPC-specific behavior event types in the IPC range (0x0906-0x090B).
-// NOTE: These MUST be moved to BehaviorTypes.h when consolidating
-// the event enum. Using local defines to avoid modifying shared headers
-// while other agents are active on this project.
-//
-#define BEHAVIOR_EVENT_ALPC_BLOCKED         ((BEHAVIOR_EVENT_TYPE)0x0906)
-#define BEHAVIOR_EVENT_ALPC_SUSPICIOUS      ((BEHAVIOR_EVENT_TYPE)0x0907)
-#define BEHAVIOR_EVENT_ALPC_CROSS_SESSION   ((BEHAVIOR_EVENT_TYPE)0x0908)
+// ALPC behavior event types — canonical definitions in BehaviorTypes.h
+#define BEHAVIOR_EVENT_ALPC_BLOCKED         ((BEHAVIOR_EVENT_TYPE)BehaviorEvent_AlpcBlocked)
+#define BEHAVIOR_EVENT_ALPC_SUSPICIOUS      ((BEHAVIOR_EVENT_TYPE)BehaviorEvent_AlpcSuspicious)
+#define BEHAVIOR_EVENT_ALPC_CROSS_SESSION   ((BEHAVIOR_EVENT_TYPE)BehaviorEvent_AlpcCrossSession)
 
 // ============================================================================
 // UNDOCUMENTED STRUCTURES FOR OBJECT TYPE ENUMERATION

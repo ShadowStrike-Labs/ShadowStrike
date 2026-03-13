@@ -1458,8 +1458,15 @@ ShadowStrikeSendScanRequest(
     // Check pending request limit before acquiring port
     //
     pendingCount = InterlockedIncrement(&g_DriverData.Stats.PendingRequests);
-    if (pendingCount > g_DriverData.Stats.PeakPendingRequests) {
-        InterlockedExchange(&g_DriverData.Stats.PeakPendingRequests, pendingCount);
+    {
+        LONG currentPeak = g_DriverData.Stats.PeakPendingRequests;
+        while (pendingCount > currentPeak) {
+            LONG prev = InterlockedCompareExchange(
+                &g_DriverData.Stats.PeakPendingRequests,
+                pendingCount, currentPeak);
+            if (prev == currentPeak) break;
+            currentPeak = prev;
+        }
     }
 
     if ((ULONG)pendingCount > g_DriverData.Config.MaxPendingRequests) {
@@ -1751,6 +1758,35 @@ ShadowStrikeSendProcessNotification(
     //
     status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
     if (!NT_SUCCESS(status)) {
+        //
+        // No connected client.  For fire-and-forget notifications,
+        // buffer to MessageQueue for delivery on reconnect so that
+        // process-create/terminate events are not lost during agent
+        // restart windows.  Reply-required messages cannot be buffered
+        // (caller needs a synchronous verdict).
+        //
+        if (!RequireReply) {
+            ULONG mqSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + Size;
+            PSHADOWSTRIKE_MESSAGE_HEADER mqHeader =
+                (PSHADOWSTRIKE_MESSAGE_HEADER)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED, mqSize, 'mqCP');
+            if (mqHeader != NULL) {
+                ShadowStrikeInitMessageHeader(
+                    mqHeader, ShadowStrikeMessageProcessNotify, Size);
+                RtlCopyMemory(
+                    (PUCHAR)mqHeader + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+                    Notification, Size);
+                MqEnqueueMessage(
+                    ShadowStrikeMessageProcessNotify,
+                    mqHeader,
+                    mqSize,
+                    MessagePriority_Normal,
+                    MQ_MSG_FLAG_NOTIFY_ONLY,
+                    NULL
+                );
+                ExFreePoolWithTag(mqHeader, 'mqCP');
+            }
+        }
         return status;
     }
 
@@ -1781,8 +1817,15 @@ ShadowStrikeSendProcessNotification(
         // Track pending requests
         //
         pendingCount = InterlockedIncrement(&g_DriverData.Stats.PendingRequests);
-        if (pendingCount > g_DriverData.Stats.PeakPendingRequests) {
-            InterlockedExchange(&g_DriverData.Stats.PeakPendingRequests, pendingCount);
+        {
+            LONG currentPeak = g_DriverData.Stats.PeakPendingRequests;
+            while (pendingCount > currentPeak) {
+                LONG prev = InterlockedCompareExchange(
+                    &g_DriverData.Stats.PeakPendingRequests,
+                    pendingCount, currentPeak);
+                if (prev == currentPeak) break;
+                currentPeak = prev;
+            }
         }
 
         if ((ULONG)pendingCount > g_DriverData.Config.MaxPendingRequests) {
