@@ -37,6 +37,7 @@
  */
 
 #include "CommPort.h"
+#include "MessageHandler.h"
 #include "../Core/Globals.h"
 #include "../../Shared/SharedDefs.h"
 #include "../../Shared/MessageTypes.h"
@@ -879,9 +880,39 @@ ShadowStrikeMessageNotify(
             break;
 
         default:
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] Unknown message type: %u\n", header->MessageType);
-            status = STATUS_INVALID_PARAMETER;
+            //
+            // Route extended message types (data push, telemetry, etc.)
+            // through MessageHandler's registered handler table.
+            // This bridges CommPort's transport layer with MessageHandler's
+            // extensible dispatch framework for push messages, behavioral
+            // rule updates, exclusion syncs, and network IoC injection.
+            //
+            {
+                SHADOWSTRIKE_CLIENT_PORT clientPortContext;
+
+                RtlZeroMemory(&clientPortContext, sizeof(clientPortContext));
+                clientPortContext.ClientPort = g_ClientPortRefs[slotIndex].ClientPort;
+                clientPortContext.ClientProcessId = g_ClientPortRefs[slotIndex].ClientProcessId;
+                clientPortContext.ConnectedTime = g_ClientPortRefs[slotIndex].ConnectedTime;
+                clientPortContext.MessagesSent = g_ClientPortRefs[slotIndex].MessagesSent;
+                clientPortContext.RepliesReceived = g_ClientPortRefs[slotIndex].RepliesReceived;
+                clientPortContext.IsPrimaryScanner = g_ClientPortRefs[slotIndex].IsPrimaryScanner;
+
+                status = ShadowStrikeProcessUserMessage(
+                    &clientPortContext,
+                    InputBuffer,
+                    InputBufferLength,
+                    OutputBuffer,
+                    OutputBufferLength,
+                    ReturnOutputBufferLength
+                );
+
+                if (!NT_SUCCESS(status)) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                               "[ShadowStrike] MessageHandler dispatch failed: type=%u, status=0x%08X\n",
+                               header->MessageType, status);
+                }
+            }
             break;
     }
 

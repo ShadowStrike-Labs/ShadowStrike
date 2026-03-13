@@ -48,6 +48,11 @@
  */
 
 #ifndef _SHADOWSTRIKE_LOOKASIDE_LISTS_H_
+/**
+ * @deprecated This module is excluded from the build. Centralized lookaside
+ * list manager is fully implemented but DriverEntry uses its own inline
+ * lookaside initialization. Pending future refactor to consolidate.
+ */
 #define _SHADOWSTRIKE_LOOKASIDE_LISTS_H_
 
 #pragma warning(push)
