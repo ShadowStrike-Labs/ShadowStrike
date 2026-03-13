@@ -372,7 +372,7 @@ typedef struct _SHADOW_ALPC_PORT_ENTRY {
     //
     LARGE_INTEGER RateLimitWindowStart;
     volatile LONG ConnectionsInWindow;
-    BOOLEAN IsRateLimited;
+    volatile LONG IsRateLimited;       // LONG for InterlockedExchange compatibility
 
     //
     // Statistics
@@ -646,11 +646,17 @@ ShadowAlpcHashPortObject(
 {
     ULONG_PTR value = (ULONG_PTR)PortObject;
 
-    value ^= (value >> 16);
-    value *= 0x85EBCA6B;
-    value ^= (value >> 13);
-    value *= 0xC2B2AE35;
-    value ^= (value >> 16);
+    //
+    // Proper 64-bit → 32-bit hash for kernel pointers.
+    // Kernel addresses cluster in 0xFFFF8xxx'xxxxxxxx range where the
+    // top 32 bits have minimal entropy. We fold high bits into low bits
+    // first via XOR shift, then apply finalization mixing.
+    //
+    value ^= (value >> 33);
+    value *= 0xFF51AFD7ED558CCDULL;
+    value ^= (value >> 33);
+    value *= 0xC4CEB9FE1A85EC53ULL;
+    value ^= (value >> 33);
 
     return (ULONG)(value & SHADOW_ALPC_HASH_MASK);
 }
