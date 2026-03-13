@@ -36,7 +36,7 @@
     - SsPmRegisterAlertCallback:<= APC_LEVEL
     - SsPmEnableCollection:     PASSIVE_LEVEL only
     - SsPmDisableCollection:    PASSIVE_LEVEL only
-    - Alert callbacks:          Invoked at DISPATCH_LEVEL (from DPC context)
+    - Alert callbacks:          Invoked at PASSIVE_LEVEL (from TimerManager work item)
 
     All statistics are integer-based (no floating point in kernel).
     Percentages are stored as parts-per-10000 (basis points) for precision
@@ -125,8 +125,7 @@ typedef struct _SSPM_THRESHOLD_ALERT {
 } SSPM_THRESHOLD_ALERT, *PSSPM_THRESHOLD_ALERT;
 
 //
-// Alert callback — invoked at DISPATCH_LEVEL from DPC context.
-// Implementations MUST NOT block, allocate paged pool, or lower IRQL.
+// Alert callback — invoked at PASSIVE_LEVEL from TimerManager work item context.
 //
 typedef VOID (*SSPM_ALERT_CALLBACK)(
     _In_ PSSPM_THRESHOLD_ALERT Alert,

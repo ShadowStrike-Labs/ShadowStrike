@@ -25,7 +25,7 @@
     - Per-metric ring buffers (fixed-size arrays, lock-free-friendly)
     - KSPIN_LOCK per ring buffer for DISPATCH_LEVEL safety
     - Integer-only statistics (no floating point in kernel)
-    - DPC-based periodic collection with threshold checking
+    - TimerManager-based periodic collection with threshold checking
     - Proper lifecycle with drain on shutdown
 
     Lock Ordering:
@@ -42,6 +42,8 @@
 
 #include "PerformanceMonitor.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, SsPmInitialize)
@@ -109,10 +111,9 @@ struct _SSPM_MONITOR {
     KSPIN_LOCK CallbackLock;
 
     //
-    // Periodic collection timer + DPC
+    // Periodic collection timer (managed by TimerManager)
     //
-    KTIMER CollectionTimer;
-    KDPC CollectionDpc;
+    ULONG CollectionTimerId;
     ULONG CollectionIntervalMs;
     volatile LONG CollectionEnabled;
 
@@ -131,7 +132,11 @@ struct _SSPM_MONITOR {
 // Forward Declarations
 //=============================================================================
 
-static KDEFERRED_ROUTINE SspmiCollectionDpc;
+static VOID
+SspmiCollectionTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
+    );
 
 static VOID
 SspmiCheckThresholds(
@@ -285,10 +290,9 @@ SsPmInitialize(
     }
 
     //
-    // Initialize timer + DPC (but don't start yet)
+    // Timer ID is already zeroed by RtlZeroMemory; no init needed until
+    // SsPmEnableCollection creates a periodic timer via TimerManager.
     //
-    KeInitializeTimer(&Mon->CollectionTimer);
-    KeInitializeDpc(&Mon->CollectionDpc, SspmiCollectionDpc, Mon);
 
     KeQuerySystemTime(&Mon->Stats.StartTime);
 
@@ -326,10 +330,15 @@ SsPmShutdown(
     InterlockedExchange(&Monitor->Initialized, 0);
 
     //
-    // Phase 2: Stop collection timer and flush DPCs
+    // Phase 2: Stop collection timer via TimerManager
     //
-    KeCancelTimer(&Monitor->CollectionTimer);
-    KeFlushQueuedDpcs();
+    if (Monitor->CollectionTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Monitor->CollectionTimerId, TRUE);
+        }
+        Monitor->CollectionTimerId = 0;
+    }
 
     //
     // Phase 3: Wait for in-flight operations to drain.
@@ -708,8 +717,6 @@ SsPmEnableCollection(
     _In_ ULONG IntervalMs
     )
 {
-    LARGE_INTEGER DueTime;
-
     PAGED_CODE();
 
     if (Monitor == NULL) {
@@ -728,17 +735,31 @@ SsPmEnableCollection(
     //
     // Cancel any existing timer first
     //
-    KeCancelTimer(&Monitor->CollectionTimer);
-    KeFlushQueuedDpcs();
+    if (Monitor->CollectionTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Monitor->CollectionTimerId, TRUE);
+        }
+        Monitor->CollectionTimerId = 0;
+    }
 
     Monitor->CollectionIntervalMs = IntervalMs;
 
-    DueTime.QuadPart = -((LONGLONG)IntervalMs * 10000);
-    KeSetTimerEx(
-        &Monitor->CollectionTimer,
-        DueTime,
-        IntervalMs,
-        &Monitor->CollectionDpc);
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = IntervalMs / 10;  // 10% coalescing tolerance
+            TmCreatePeriodic(
+                tmMgr,
+                IntervalMs,
+                SspmiCollectionTimerCallback,
+                Monitor,
+                &opts,
+                &Monitor->CollectionTimerId);
+        }
+    }
 
     InterlockedExchange(&Monitor->CollectionEnabled, 1);
 
@@ -763,8 +784,13 @@ SsPmDisableCollection(
 
     InterlockedExchange(&Monitor->CollectionEnabled, 0);
 
-    KeCancelTimer(&Monitor->CollectionTimer);
-    KeFlushQueuedDpcs();
+    if (Monitor->CollectionTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Monitor->CollectionTimerId, TRUE);
+        }
+        Monitor->CollectionTimerId = 0;
+    }
 
     return STATUS_SUCCESS;
 }
@@ -839,29 +865,25 @@ Routine Description:
 }
 
 //=============================================================================
-// Internal: Collection DPC
+// Internal: Collection Timer Callback (via TimerManager work item, PASSIVE_LEVEL)
 //=============================================================================
 
 static
 VOID
-SspmiCollectionDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+SspmiCollectionTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 /*++
 Routine Description:
-    Periodic DPC that collects system-level performance metrics.
-    Runs at DISPATCH_LEVEL — only uses spin-lock-safe operations.
-    Does NOT allocate paged pool, acquire push locks, or block.
+    Periodic callback that collects system-level performance metrics.
+    Runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback — all spin-lock
+    operations remain valid, and paged access is also permitted.
 --*/
 {
-    PSSPM_MONITOR Monitor = (PSSPM_MONITOR)DeferredContext;
+    PSSPM_MONITOR Monitor = (PSSPM_MONITOR)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (Monitor == NULL) {
         return;
@@ -876,24 +898,17 @@ Routine Description:
     //
     // Self-monitor: record that a collection cycle occurred.
     // Individual subsystems (memory, cache, etc.) should call
-    // SsPmRecordSample from their own periodic routines. The DPC
-    // here serves as the heartbeat and can record DPC-safe system
-    // metrics like pool usage via MmQuerySystemMemoryInfo or
-    // KeQueryActiveProcessorCountEx, but those APIs require careful
-    // IRQL handling. The DPC records a collection heartbeat.
+    // SsPmRecordSample from their own periodic routines. The callback
+    // here serves as the heartbeat and can record system metrics.
     //
-    // Subsystem-specific metric collection should be wired up by
-    // the caller (e.g., DriverMain registers per-subsystem collection
-    // callbacks that call SsPmRecordSample).
-    //
-    // The DPC heartbeat ensures the timer is alive and detectable.
+    // The heartbeat ensures the timer is alive and detectable.
     //
     {
         LARGE_INTEGER Now;
         KeQuerySystemTime(&Now);
 
         //
-        // Record a 1-event-per-tick value for EventsPerSecond tracking
+        // Record a 1-event-per-tick value for EventsPerSecond tracking.
         // This acts as a "I am alive" signal that can be checked by
         // the user-mode service.
         //
