@@ -25,6 +25,14 @@
 #define SHADOWSTRIKE_MESSAGE_MAGIC 0x53534653
 #define SHADOWSTRIKE_PROTOCOL_VERSION 2
 
+//
+// Message flags (SHADOWSTRIKE_MESSAGE_HEADER.Flags)
+//
+#define SHADOWSTRIKE_MSG_FLAG_COMPRESSED        0x00000001  // Payload compressed (original size in Reserved)
+#define SHADOWSTRIKE_MSG_FLAG_HMAC              0x00000002  // HMAC-SHA256 appended after data (32 bytes)
+#define SHADOWSTRIKE_MSG_FLAG_PRIORITY_HIGH     0x00000004  // High-priority delivery
+#define SHADOWSTRIKE_MSG_FLAG_NO_ACK            0x00000008  // Fire-and-forget, no acknowledgment needed
+
 // Ensure structure packing is consistent
 #pragma pack(push, 1)
 
