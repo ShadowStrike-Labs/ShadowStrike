@@ -67,6 +67,13 @@ NTSTATUS PocInitialize(VOID);
 
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID PocShutdown(VOID);
+
+// Forward declarations for PostWrite subsystem (no separate header)
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS ShadowStrikePostWriteInitialize(VOID);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID ShadowStrikePostWriteShutdown(VOID);
 #include "../Callbacks/Process/WSLMonitor.h"
 #include "../Callbacks/Process/AppControl.h"
 #include "../SelfProtection/FirmwareIntegrity.h"
@@ -1629,6 +1636,22 @@ DriverEntry(
     }
 
     //
+    // Step 14.28: Initialize PostWrite subsystem (process notify callback for
+    // cleanup on process termination, prevents stale PID entries and PID reuse issues)
+    // MUST be before FltStartFiltering — PostWrite callback needs process tracking
+    //
+    status = ShadowStrikePostWriteInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize PostWrite subsystem: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_PwInitialized;
+        ShadowStrikeLogInitStatus("PostWrite Subsystem", STATUS_SUCCESS);
+    }
+
+    //
     // Step 15: Start filtering
     //
     status = FltStartFiltering(g_DriverData.FilterHandle);
@@ -1850,6 +1873,15 @@ ShadowStrikeUnload(
     //
     if (g_InitFlags & InitFlag_CommPortCreated) {
         ShadowStrikeCloseCommunicationPort();
+    }
+
+    //
+    // Step 8.4: Shutdown PostWrite subsystem (BEFORE PostCreate —
+    // PostWrite has its own PsSetCreateProcessNotifyRoutineEx that must
+    // be unregistered before filter teardown)
+    //
+    if (g_InitFlags & InitFlag_PwInitialized) {
+        ShadowStrikePostWriteShutdown();
     }
 
     //
@@ -2689,6 +2721,10 @@ ShadowStrikeCleanupByFlags(
 
     if (InitFlags & InitFlag_CommPortCreated) {
         ShadowStrikeCloseCommunicationPort();
+    }
+
+    if (InitFlags & InitFlag_PwInitialized) {
+        ShadowStrikePostWriteShutdown();
     }
 
     if (InitFlags & InitFlag_PocInitialized) {

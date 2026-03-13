@@ -65,6 +65,7 @@
 #include "../../Communication/CommPort.h"
 #include "../../../Shared/MessageTypes.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Exclusions/ExclusionManager.h"
 #include "../../Transactions/KtmMonitor.h"
 
 //
@@ -133,32 +134,35 @@ C_ASSERT(sizeof(SHADOWSTRIKE_STREAM_CONTEXT) % 8 == 0);
 #define PW_STALE_ENTRY_TIMEOUT_100NS        (60LL * 10000000LL)  // 60 seconds
 
 // ============================================================================
-// ENTROPY LOOKUP TABLE (Pre-computed -p*log2(p) * 256 for integer math)
+// ENTROPY LOOKUP TABLE (Pre-computed -log2(p) * 100 for Shannon entropy)
 // ============================================================================
 
 //
 // This table contains pre-computed values for Shannon entropy calculation.
-// Entry i = -((i/256) * log2(i/256)) * 256 * 100, scaled for integer math.
-// The result is entropy * 100 (e.g., 750 = 7.50 bits/byte).
+// Entry i = round(100 * (8 - log2(i))) for i > 0, entry 0 = 0.
+// Used as: entropy += (table[scaledCount] * count) / Length
+// where scaledCount = (count * 256) / Length.
+// This yields SUM(-p*log2(p)*100) = H * 100 (Shannon entropy * 100).
+// Result range: 0 (single byte value) to ~800 (perfectly uniform).
 //
 static const UINT16 g_EntropyTable[257] = {
-    0, 0, 200, 325, 400, 464, 519, 567, 610, 650, 686, 719, 750, 779, 806, 832,
-    856, 879, 901, 922, 942, 961, 979, 997, 1014, 1030, 1046, 1061, 1076, 1090, 1104, 1117,
-    1130, 1143, 1155, 1167, 1179, 1190, 1201, 1212, 1222, 1232, 1242, 1252, 1262, 1271, 1280, 1289,
-    1298, 1306, 1315, 1323, 1331, 1339, 1347, 1354, 1362, 1369, 1376, 1383, 1390, 1397, 1404, 1410,
-    1417, 1423, 1429, 1435, 1441, 1447, 1453, 1459, 1464, 1470, 1475, 1481, 1486, 1491, 1496, 1501,
-    1506, 1511, 1516, 1521, 1526, 1530, 1535, 1539, 1544, 1548, 1552, 1557, 1561, 1565, 1569, 1573,
-    1577, 1581, 1585, 1589, 1593, 1596, 1600, 1604, 1607, 1611, 1614, 1618, 1621, 1624, 1628, 1631,
-    1634, 1637, 1640, 1643, 1646, 1649, 1652, 1655, 1658, 1661, 1664, 1666, 1669, 1672, 1674, 1677,
-    1680, 1682, 1685, 1687, 1690, 1692, 1694, 1697, 1699, 1701, 1704, 1706, 1708, 1710, 1712, 1715,
-    1717, 1719, 1721, 1723, 1725, 1727, 1729, 1731, 1733, 1735, 1737, 1738, 1740, 1742, 1744, 1746,
-    1747, 1749, 1751, 1752, 1754, 1756, 1757, 1759, 1760, 1762, 1763, 1765, 1766, 1768, 1769, 1771,
-    1772, 1774, 1775, 1776, 1778, 1779, 1780, 1782, 1783, 1784, 1786, 1787, 1788, 1789, 1790, 1792,
-    1793, 1794, 1795, 1796, 1797, 1798, 1800, 1801, 1802, 1803, 1804, 1805, 1806, 1807, 1808, 1809,
-    1810, 1811, 1812, 1812, 1813, 1814, 1815, 1816, 1817, 1818, 1818, 1819, 1820, 1821, 1822, 1822,
-    1823, 1824, 1824, 1825, 1826, 1826, 1827, 1828, 1828, 1829, 1830, 1830, 1831, 1831, 1832, 1832,
-    1833, 1833, 1834, 1834, 1835, 1835, 1836, 1836, 1837, 1837, 1838, 1838, 1838, 1839, 1839, 1839,
-    1840
+    0, 800, 700, 642, 600, 568, 542, 519, 500, 483, 468, 454, 442, 430, 419, 409,
+    400, 391, 383, 375, 368, 361, 354, 348, 342, 336, 330, 325, 319, 314, 309, 305,
+    300, 296, 291, 287, 283, 279, 275, 271, 268, 264, 261, 257, 254, 251, 248, 245,
+    242, 239, 236, 233, 230, 227, 225, 222, 219, 217, 214, 212, 209, 207, 205, 202,
+    200, 198, 196, 193, 191, 189, 187, 185, 183, 181, 179, 177, 175, 173, 171, 170,
+    168, 166, 164, 162, 161, 159, 157, 156, 154, 152, 151, 149, 148, 146, 145, 143,
+    142, 140, 139, 137, 136, 134, 133, 131, 130, 129, 127, 126, 125, 123, 122, 121,
+    119, 118, 117, 115, 114, 113, 112, 111, 109, 108, 107, 106, 105, 103, 102, 101,
+    100, 99, 98, 97, 96, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85, 84,
+    83, 82, 81, 80, 79, 78, 77, 76, 75, 74, 73, 72, 71, 71, 70, 69,
+    68, 67, 66, 65, 64, 63, 62, 62, 61, 60, 59, 58, 57, 57, 56, 55,
+    54, 53, 52, 52, 51, 50, 49, 48, 48, 47, 46, 45, 45, 44, 43, 42,
+    42, 41, 40, 39, 39, 38, 37, 36, 36, 35, 34, 33, 33, 32, 31, 31,
+    30, 29, 29, 28, 27, 27, 26, 25, 25, 24, 23, 23, 22, 21, 21, 20,
+    19, 19, 18, 17, 17, 16, 15, 15, 14, 14, 13, 12, 12, 11, 11, 10,
+    9, 9, 8, 8, 7, 6, 6, 5, 5, 4, 3, 3, 2, 2, 1, 1,
+    0
 };
 
 // ============================================================================
@@ -287,7 +291,7 @@ typedef struct _PW_WRITE_CONTEXT {
     //
     // Detection results
     //
-    ULONG SuspicionScore;
+    LONG SuspicionScore;
     ULONG EntropyX100;              // Entropy * 100 for integer math
     BOOLEAN IsHighEntropy;
     BOOLEAN IsDoubleExtension;
@@ -721,6 +725,14 @@ ShadowStrikePostWrite(
     }
 
     //
+    // Skip excluded processes (AV engines, backup software, system utilities)
+    // This prevents false positives and saves CPU on trusted write paths
+    //
+    if (ShadowStrikeIsProcessExcluded(PsGetCurrentProcessId(), NULL)) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    //
     // Update global statistics
     //
     InterlockedIncrement64(&g_PostWriteState.TotalPostWriteOperations);
@@ -930,53 +942,76 @@ ShadowStrikePostWrite(
     PwpCalculateSuspicionScore(&writeContext);
 
     //
-    // Track per-process activity with proper synchronization
+    // Track per-process activity with proper synchronization.
+    // The activity pointer is into the global array — hold the shared lock
+    // during access to prevent PwpCleanupProcessActivity from zeroing the
+    // entry concurrently (race between process termination and pending I/O).
     //
     processActivity = PwpGetOrCreateProcessActivity(writeContext.ProcessId);
     if (processActivity != NULL) {
+        BOOLEAN shouldAlert = FALSE;
+        ULONG alertScore = 0;
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockShared(&g_PostWriteState.ActivityLock);
+
         //
-        // Track unique file modifications
+        // Re-validate: entry may have been cleaned up between
+        // PwpGetOrCreateProcessActivity and this lock acquisition
         //
-        if (writeContext.FileId != 0) {
-            writeContext.IsNewUniqueFile = PwpTrackUniqueFile(
-                processActivity,
-                writeContext.FileId,
-                writeContext.VolumeSerial
-            );
-            if (writeContext.IsNewUniqueFile) {
-                InterlockedIncrement64(&g_PostWriteState.UniqueFileModifications);
+        if (processActivity->IsActive &&
+            processActivity->ProcessId == writeContext.ProcessId) {
+
+            //
+            // Track unique file modifications
+            //
+            if (writeContext.FileId != 0) {
+                writeContext.IsNewUniqueFile = PwpTrackUniqueFile(
+                    processActivity,
+                    writeContext.FileId,
+                    writeContext.VolumeSerial
+                );
+                if (writeContext.IsNewUniqueFile) {
+                    InterlockedIncrement64(&g_PostWriteState.UniqueFileModifications);
+                }
+            }
+
+            PwpUpdateProcessActivity(processActivity, &writeContext);
+
+            //
+            // Check for ransomware-like behavior at process level
+            //
+            if (processActivity->SuspicionScore >= PW_ALERT_THRESHOLD &&
+                !processActivity->IsFlagged) {
+
+                processActivity->IsFlagged = TRUE;
+                alertScore = (ULONG)processActivity->SuspicionScore;
+                shouldAlert = TRUE;
+                InterlockedIncrement64(&g_PostWriteState.RansomwareAlerts);
             }
         }
 
-        PwpUpdateProcessActivity(processActivity, &writeContext);
+        ExReleasePushLockShared(&g_PostWriteState.ActivityLock);
+        KeLeaveCriticalRegion();
 
         //
-        // Check for ransomware-like behavior at process level
+        // Alert and telemetry OUTSIDE the lock to avoid holding it during
+        // CommPort send (which can block on user-mode client).
         //
-        if (processActivity->SuspicionScore >= PW_ALERT_THRESHOLD &&
-            !processActivity->IsFlagged) {
-
-            processActivity->IsFlagged = TRUE;
-            InterlockedIncrement64(&g_PostWriteState.RansomwareAlerts);
-
-            //
-            // CRITICAL: Submit ransomware behavior to BehaviorEngine.
-            // This is the primary ransomware detection signal — high-entropy
-            // overwrites with mass file modification patterns (MITRE T1486).
-            //
+        if (shouldAlert) {
             BeEngineSubmitEvent(
                 BehaviorEvent_RansomwareBehavior,
                 BehaviorCategory_Impact,
                 HandleToULong(writeContext.ProcessId),
                 NULL, 0,
-                (UINT32)processActivity->SuspicionScore,
+                (UINT32)alertScore,
                 TRUE,
                 NULL
                 );
 
             PwpRaiseRansomwareAlert(
                 writeContext.ProcessId,
-                processActivity->SuspicionScore,
+                alertScore,
                 fileNameAcquired ? &fileName : NULL
             );
         }
@@ -1563,7 +1598,7 @@ PwpCalculateEntropy(
     }
 
     //
-    // Result is entropy * 100 (max 800 for 8.0 bits/byte)
+    // Result is entropy * 100 (max ~800 for 8.0 bits/byte, 0 for single-value data)
     //
     return entropy;
 }
@@ -1745,7 +1780,7 @@ PwpLogSuspiciousWrite(
 {
 #ifdef WPP_TRACING
     TraceEvents(TRACE_LEVEL_WARNING, TRACE_FLAG_FILEOPS,
-        "Suspicious write: PID=%p Score=%u Bytes=%Iu Offset=%I64d "
+        "Suspicious write: PID=%p Score=%d Bytes=%Iu Offset=%I64d "
         "Entropy=%u DoubleExt=%d RansomExt=%d Honeypot=%d HighEntropy=%d File=%wZ",
         WriteContext->ProcessId,
         WriteContext->SuspicionScore,
