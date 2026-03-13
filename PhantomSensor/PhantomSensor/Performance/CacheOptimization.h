@@ -322,11 +322,7 @@ typedef struct _CO_MANAGER {
     PVOID MemoryCallbackContext;
     EX_PUSH_LOCK CallbackLock;
 
-    KTIMER MaintenanceTimer;
-    KDPC MaintenanceDpc;
-    PIO_WORKITEM MaintenanceWorkItem;
-    PDEVICE_OBJECT DeviceObject;
-    volatile LONG MaintenanceRunning;
+    ULONG MaintenanceTimerId;
     ULONG MaintenanceIntervalMs;
 
     volatile LONG64 TotalOperations;
@@ -363,8 +359,7 @@ typedef struct _CO_LOOKUP_RESULT {
 NTSTATUS
 CoInitialize(
     _Out_ PCO_MANAGER* Manager,
-    _In_ SIZE_T MaxTotalMemory,
-    _In_opt_ PDEVICE_OBJECT DeviceObject
+    _In_ SIZE_T MaxTotalMemory
     );
 
 /**

@@ -44,6 +44,8 @@
 
 #include "CacheOptimization.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, CoInitialize)
@@ -59,7 +61,6 @@
 #define CO_DEFAULT_MAX_MEMORY       (256 * 1024 * 1024)  /* 256 MB */
 
 #define CO_100NS_PER_SECOND         10000000LL
-#define CO_100NS_PER_MS             10000LL
 
 /* ========================================================================= */
 /* INTERNAL FUNCTION PROTOTYPES                                               */
@@ -147,17 +148,9 @@ CopEvictLRUEntries(
     );
 
 static VOID
-CopMaintenanceWorker(
-    _In_ PDEVICE_OBJECT DeviceObject,
+CopMaintenanceTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
-    );
-
-static VOID
-CopMaintenanceDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
     );
 
 static VOID
@@ -241,13 +234,10 @@ _Use_decl_annotations_
 NTSTATUS
 CoInitialize(
     PCO_MANAGER* Manager,
-    SIZE_T MaxTotalMemory,
-    PDEVICE_OBJECT DeviceObject
+    SIZE_T MaxTotalMemory
     )
 {
-    NTSTATUS status = STATUS_SUCCESS;
     PCO_MANAGER manager = NULL;
-    LARGE_INTEGER dueTime;
 
     PAGED_CODE();
 
@@ -271,7 +261,6 @@ CoInitialize(
 
     manager->MaxTotalMemory = (MaxTotalMemory != 0) ?
                               MaxTotalMemory : CO_DEFAULT_MAX_MEMORY;
-    manager->DeviceObject = DeviceObject;
     manager->MaintenanceIntervalMs = CO_MAINTENANCE_INTERVAL_MS;
     manager->NextCacheId = 1;
 
@@ -279,45 +268,33 @@ CoInitialize(
     ExInitializePushLock(&manager->CacheListLock);
     ExInitializePushLock(&manager->CallbackLock);
 
-    KeInitializeTimer(&manager->MaintenanceTimer);
-    KeInitializeDpc(&manager->MaintenanceDpc, CopMaintenanceDpcRoutine, manager);
-
-    if (DeviceObject != NULL) {
-        manager->MaintenanceWorkItem = IoAllocateWorkItem(DeviceObject);
-        if (manager->MaintenanceWorkItem == NULL) {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-            goto Cleanup;
-        }
-    }
-
     KeQuerySystemTime(&manager->StartTime);
 
-    /*
-     * Mark initialized BEFORE starting the timer so the DPC
-     * sees a fully-initialized manager. (Fix #6)
-     */
     InterlockedExchange(&manager->Initialized, TRUE);
 
-    dueTime.QuadPart = -((LONGLONG)manager->MaintenanceIntervalMs * CO_100NS_PER_MS);
-    KeSetTimerEx(
-        &manager->MaintenanceTimer,
-        dueTime,
-        manager->MaintenanceIntervalMs,
-        &manager->MaintenanceDpc
-    );
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 5000;
+            opts.Name = "CacheOptMaint";
+            NTSTATUS tmStatus = TmCreatePeriodic(
+                tmMgr,
+                CO_MAINTENANCE_INTERVAL_MS,
+                CopMaintenanceTimerCallback,
+                manager,
+                &opts,
+                &manager->MaintenanceTimerId
+            );
+            if (!NT_SUCCESS(tmStatus)) {
+                manager->MaintenanceTimerId = 0;
+            }
+        }
+    }
 
     *Manager = manager;
     return STATUS_SUCCESS;
-
-Cleanup:
-    if (manager != NULL) {
-        if (manager->MaintenanceWorkItem != NULL) {
-            IoFreeWorkItem(manager->MaintenanceWorkItem);
-        }
-        ShadowStrikeFreePoolWithTag(manager, CO_POOL_TAG);
-    }
-
-    return status;
 }
 
 _Use_decl_annotations_
@@ -339,32 +316,16 @@ CoShutdown(
     InterlockedExchange(&Manager->ShuttingDown, TRUE);
 
     /*
-     * Cancel the periodic timer. KeCancelTimer guarantees no future DPCs
-     * will be queued from this timer.
+     * Cancel the maintenance timer via TimerManager.
+     * TmCancel with Wait=TRUE blocks until any in-flight callback completes,
+     * replacing the old KeCancelTimer + KeFlushQueuedDpcs + spin-wait pattern.
      */
-    KeCancelTimer(&Manager->MaintenanceTimer);
-
-    /*
-     * Flush all queued DPCs system-wide so we know CopMaintenanceDpcRoutine
-     * has finished. After this, no new work items can be queued because
-     * ShuttingDown == TRUE. (Fix #9)
-     */
-    KeFlushQueuedDpcs();
-
-    /*
-     * Wait for any in-flight maintenance work item to complete.
-     * After KeFlushQueuedDpcs, no new work items will be queued.
-     * This is bounded: the maintenance worker checks ShuttingDown.
-     */
-    if (Manager->MaintenanceRunning) {
-        LARGE_INTEGER delay;
-        ULONG spinCount = 0;
-        delay.QuadPart = -10 * CO_100NS_PER_MS;
-        while (Manager->MaintenanceRunning && spinCount < 1000) {
-            KeDelayExecutionThread(KernelMode, FALSE, &delay);
-            spinCount++;
+    if (Manager->MaintenanceTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Manager->MaintenanceTimerId, TRUE);
         }
-        NT_ASSERT(!Manager->MaintenanceRunning);
+        Manager->MaintenanceTimerId = 0;
     }
 
     /*
@@ -388,11 +349,6 @@ CoShutdown(
     }
 
     ExReleasePushLockExclusive(&Manager->CacheListLock);
-
-    if (Manager->MaintenanceWorkItem != NULL) {
-        IoFreeWorkItem(Manager->MaintenanceWorkItem);
-        Manager->MaintenanceWorkItem = NULL;
-    }
 
     ShadowStrikeFreePoolWithTag(Manager, CO_POOL_TAG);
 }
@@ -2074,8 +2030,8 @@ CopEvictLRUEntries(
 }
 
 static VOID
-CopMaintenanceWorker(
-    _In_ PDEVICE_OBJECT DeviceObject,
+CopMaintenanceTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     )
 {
@@ -2083,12 +2039,9 @@ CopMaintenanceWorker(
     PLIST_ENTRY listEntry;
     PCO_CACHE cache;
 
-    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (manager == NULL || manager->ShuttingDown) {
-        if (manager != NULL) {
-            InterlockedExchange(&manager->MaintenanceRunning, FALSE);
-        }
         return;
     }
 
@@ -2108,42 +2061,6 @@ CopMaintenanceWorker(
     ExReleasePushLockShared(&manager->CacheListLock);
 
     CopUpdateMemoryPressure(manager);
-
-    InterlockedExchange(&manager->MaintenanceRunning, FALSE);
-}
-
-static VOID
-CopMaintenanceDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    )
-{
-    PCO_MANAGER manager = (PCO_MANAGER)DeferredContext;
-
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    if (manager == NULL || manager->ShuttingDown || !manager->Initialized) {
-        return;
-    }
-
-    if (InterlockedCompareExchange(&manager->MaintenanceRunning, TRUE, FALSE) != FALSE) {
-        return;
-    }
-
-    if (manager->MaintenanceWorkItem != NULL) {
-        IoQueueWorkItem(
-            manager->MaintenanceWorkItem,
-            CopMaintenanceWorker,
-            DelayedWorkQueue,
-            manager
-        );
-    } else {
-        InterlockedExchange(&manager->MaintenanceRunning, FALSE);
-    }
 }
 
 static VOID
