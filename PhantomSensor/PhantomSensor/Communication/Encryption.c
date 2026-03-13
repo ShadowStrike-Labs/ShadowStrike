@@ -423,15 +423,38 @@ Routine Description:
     KeLeaveCriticalRegion();
 
     //
-    // Destroy all keys outside of lock
+    // Destroy all keys outside of lock.
+    // CRITICAL: Must drain in-flight references before freeing to prevent
+    // use-after-free from concurrent EncEncrypt/EncDecrypt operations that
+    // obtained a key ref before Manager->Initialized was set to FALSE.
     //
     while (!IsListEmpty(&keysToFree)) {
         entry = RemoveHeadList(&keysToFree);
         key = CONTAINING_RECORD(entry, ENC_KEY, ListEntry);
 
         //
-        // Direct cleanup since key is already removed from list
+        // Mark as being destroyed to prevent new AddRefs
         //
+        key->IsBeingDestroyed = TRUE;
+        key->IsActive = FALSE;
+
+        //
+        // Drain in-flight references. After IsBeingDestroyed is set,
+        // EncKeyAddRef will fail, so no new refs can be acquired.
+        //
+        {
+            LARGE_INTEGER drainDelay;
+            ULONG drainWaitCount = 0;
+            drainDelay.QuadPart = -10000LL;  // 1ms
+            while (ReadNoFence(&key->RefCount) > 0) {
+                if (++drainWaitCount > 5000) {
+                    // 5 second timeout per key — break to avoid hang
+                    break;
+                }
+                KeDelayExecutionThread(KernelMode, FALSE, &drainDelay);
+            }
+        }
+
         EncpCleanupBCryptKey(key);
 
         EncSecureClear(key->KeyMaterial, sizeof(key->KeyMaterial));
@@ -2202,14 +2225,20 @@ EncEncryptWithContext(
     )
 {
     ENC_OPTIONS options;
+    NTSTATUS status;
 
     PAGED_CODE();
 
-    if (Context == NULL || Context->CurrentKey == NULL || Manager == NULL) {
+    if (Context == NULL || Manager == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     ExAcquireFastMutex(&Context->ContextMutex);
+
+    if (Context->CurrentKey == NULL) {
+        ExReleaseFastMutex(&Context->ContextMutex);
+        return STATUS_INVALID_PARAMETER;
+    }
 
     RtlZeroMemory(&options, sizeof(options));
     options.Flags = Context->Flags;
@@ -2218,11 +2247,20 @@ EncEncryptWithContext(
     options.AADSize = Context->AADSize;
     options.TagSize = Context->TagSize;
 
+    //
+    // Pre-AddRef key while under mutex to prevent use-after-free
+    // between mutex release and EncEncrypt's internal AddRef.
+    //
+    if (!EncKeyAddRef(options.Key)) {
+        ExReleaseFastMutex(&Context->ContextMutex);
+        return STATUS_UNSUCCESSFUL;
+    }
+
     ExReleaseFastMutex(&Context->ContextMutex);
 
-    return EncEncrypt(
+    status = EncEncrypt(
         Manager,
-        Context->CurrentKey->KeyType,
+        options.Key->KeyType,
         Plaintext,
         PlaintextSize,
         Output,
@@ -2230,6 +2268,13 @@ EncEncryptWithContext(
         CiphertextSize,
         &options
         );
+
+    //
+    // Release pre-AddRef (EncEncrypt manages its own ref internally)
+    //
+    EncKeyRelease(options.Key);
+
+    return status;
 }
 
 
@@ -2246,14 +2291,20 @@ EncDecryptWithContext(
     )
 {
     ENC_OPTIONS options;
+    NTSTATUS status;
 
     PAGED_CODE();
 
-    if (Context == NULL || Context->CurrentKey == NULL || Manager == NULL) {
+    if (Context == NULL || Manager == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     ExAcquireFastMutex(&Context->ContextMutex);
+
+    if (Context->CurrentKey == NULL) {
+        ExReleaseFastMutex(&Context->ContextMutex);
+        return STATUS_INVALID_PARAMETER;
+    }
 
     RtlZeroMemory(&options, sizeof(options));
     options.Flags = Context->Flags;
@@ -2262,9 +2313,18 @@ EncDecryptWithContext(
     options.AADSize = Context->AADSize;
     options.TagSize = Context->TagSize;
 
+    //
+    // Pre-AddRef key while under mutex to prevent use-after-free
+    // between mutex release and EncDecrypt's internal AddRef.
+    //
+    if (!EncKeyAddRef(options.Key)) {
+        ExReleaseFastMutex(&Context->ContextMutex);
+        return STATUS_UNSUCCESSFUL;
+    }
+
     ExReleaseFastMutex(&Context->ContextMutex);
 
-    return EncDecrypt(
+    status = EncDecrypt(
         Manager,
         Ciphertext,
         CiphertextSize,
@@ -2273,6 +2333,13 @@ EncDecryptWithContext(
         PlaintextSize,
         &options
         );
+
+    //
+    // Release pre-AddRef (EncDecrypt manages its own ref internally)
+    //
+    EncKeyRelease(options.Key);
+
+    return status;
 }
 
 
@@ -2400,11 +2467,12 @@ EncSetAutoRotation(
     }
 
     //
-    // Validate IntervalSeconds to prevent overflow in ms conversion
-    // ULONG max is 4294967295 ms ≈ 49.7 days; limit to ~24.8 days for safety
+    // Validate IntervalSeconds range:
+    // - Minimum 60 seconds to prevent resource exhaustion from rapid-fire rotation
+    // - Maximum ~24.8 days to prevent overflow in ms conversion (ULONG)
     //
-    if (Enable && IntervalSeconds > 2147483) {
-        return STATUS_INTEGER_OVERFLOW;
+    if (Enable && (IntervalSeconds < 60 || IntervalSeconds > 2147483)) {
+        return STATUS_INVALID_PARAMETER;
     }
 
     Manager->RotationIntervalSeconds = IntervalSeconds;
@@ -2730,6 +2798,14 @@ Routine Description:
     }
 
     if (OKMSize > 255 * ENC_HMAC_SHA256_SIZE) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // SECURITY: Cap InfoSize to prevent stack buffer overflow in hmacInput.
+    // Buffer is sized for ENC_HMAC_SHA256_SIZE + ENC_HKDF_INFO_SIZE + 1.
+    //
+    if (InfoSize > ENC_HKDF_INFO_SIZE) {
         return STATUS_INVALID_PARAMETER;
     }
 
