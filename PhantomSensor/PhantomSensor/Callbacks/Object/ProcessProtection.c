@@ -66,6 +66,7 @@ Thread Safety:
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Communication/CommPort.h"
+#include "ThreadProtection.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -576,6 +577,11 @@ Arguments:
         // Process is terminating - clean up its activity tracker
         //
         PpCleanupActivityTrackerForProcess(ProcessId);
+
+        //
+        // Clean up thread protection activity tracker for this process
+        //
+        TpCleanupProcessTracker(ProcessId);
 
         //
         // Also remove from protected process cache if present

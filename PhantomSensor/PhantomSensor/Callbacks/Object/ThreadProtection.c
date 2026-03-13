@@ -1936,11 +1936,11 @@ TppBuildOperationContext(
     if (OperationInfo->Operation == OB_OPERATION_HANDLE_CREATE) {
         Context->OperationType = TpOperationCreate;
         Context->OriginalDesiredAccess =
-            OperationInfo->Parameters->CreateHandleInformation.DesiredAccess;
+            OperationInfo->Parameters->CreateHandleInformation.OriginalDesiredAccess;
     } else if (OperationInfo->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
         Context->OperationType = TpOperationDuplicate;
         Context->OriginalDesiredAccess =
-            OperationInfo->Parameters->DuplicateHandleInformation.DesiredAccess;
+            OperationInfo->Parameters->DuplicateHandleInformation.OriginalDesiredAccess;
     } else {
         Context->OperationType = TpOperationUnknown;
     }

@@ -61,6 +61,7 @@
 #include "../../Communication/CommPort.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Exclusions/ExclusionManager.h"
+#include "ThreadProtection.h"
 
 #ifdef WPP_TRACING
 #include "ObjectCallback.tmh"
@@ -513,6 +514,16 @@ ShadowStrikeRegisterObjectCallbacks(
         }
 
         //
+        // Initialize thread protection subsystem (activity tracking, pattern detection)
+        //
+        status = TpInitializeThreadProtection();
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike] TpInitializeThreadProtection failed: 0x%08X\n", status);
+            status = STATUS_SUCCESS;
+        }
+
+        //
         // Mark as fully initialized with memory barrier
         //
         MemoryBarrier();
@@ -571,6 +582,11 @@ ShadowStrikeUnregisterObjectCallbacks(
             ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.CredentialAccessBlocked),
             ReadNoFence64((volatile LONG64*)&g_ObCallbackContext.InjectionBlocked));
     }
+
+    //
+    // Shutdown thread protection subsystem first (depends on activity tracking)
+    //
+    TpShutdownThreadProtection();
 
     //
     // Shutdown process protection subsystem
@@ -1027,6 +1043,16 @@ ShadowStrikeThreadPreCallback(
         }
 
         //
+        // Thread-specific rate limiting boost (thread activity tracker)
+        //
+        if (TpIsSourceRateLimited(sourceProcessId)) {
+            suspicionScore += 15;
+            if (suspicionScore > 100) {
+                suspicionScore = 100;
+            }
+        }
+
+        //
         // Strip dangerous access
         //
         if (isDuplicate) {
@@ -1093,6 +1119,17 @@ ShadowStrikeThreadPreCallback(
     PpTrackActivity(
         sourceProcessId,
         targetProcessId,
+        (strippedAccess != 0)
+        );
+
+    //
+    // Track thread-specific activity patterns (APC injection, hijack, enumeration)
+    //
+    TpTrackActivity(
+        sourceProcessId,
+        PsGetThreadId(targetThread),
+        targetProcessId,
+        originalAccess,
         (strippedAccess != 0)
         );
 
