@@ -60,7 +60,7 @@
 // GLOBAL CACHE INSTANCE
 // ============================================================================
 
-SHADOWSTRIKE_SCAN_CACHE g_ScanCache = {0};
+static SHADOWSTRIKE_SCAN_CACHE g_ScanCache = {0};
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -303,9 +303,12 @@ ShadowStrikeCacheShutdown(
                "[ShadowStrike] Shutting down scan cache\n");
 
     //
-    // Step 1: Set shutdown flag to prevent new operations
+    // Step 1: Set shutdown flag to prevent new operations.
+    // Use MemoryBarrier to ensure cross-CPU visibility before we cancel
+    // timers and wait for references.
     //
-    g_ScanCache.ShutdownInProgress = TRUE;
+    InterlockedExchange8((volatile CHAR*)&g_ScanCache.ShutdownInProgress, TRUE);
+    MemoryBarrier();
 
     //
     // Step 2: Cancel the cleanup timer via TimerManager.
@@ -324,19 +327,28 @@ ShadowStrikeCacheShutdown(
     // Step 4: Wait for any active references (work item or operations in progress)
     //
     if (g_ScanCache.ActiveReferences > 0) {
+        NTSTATUS waitStatus;
+
         //
-        // Wait with timeout to prevent infinite hang
-        // 30 seconds should be more than enough for any operation
+        // Wait with timeout to prevent infinite hang.
+        // 30 seconds should be more than enough for any operation.
         //
         timeout.QuadPart = -300000000LL;  // 30 seconds in 100-ns units
 
-        KeWaitForSingleObject(
+        waitStatus = KeWaitForSingleObject(
             &g_ScanCache.ShutdownEvent,
             Executive,
             KernelMode,
             FALSE,
             &timeout
         );
+
+        if (waitStatus == STATUS_TIMEOUT) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] ScanCache: CRITICAL — shutdown wait timed out "
+                       "(ActiveReferences=%ld). Possible reference leak.\n",
+                       g_ScanCache.ActiveReferences);
+        }
     }
 
     //
@@ -444,6 +456,15 @@ ShadowStrikeCacheLookup(
     }
 
     //
+    // Acquire shutdown reference to prevent cache teardown while we hold
+    // a bucket lock. Without this, shutdown can proceed and free entries
+    // underneath us (TOCTOU between ShutdownInProgress check and lock).
+    //
+    if (!ShadowStrikeCacheAcquireReference()) {
+        return FALSE;
+    }
+
+    //
     // Calculate bucket index
     //
     bucketIndex = ShadowStrikeCacheHash(Key) & SHADOWSTRIKE_CACHE_BUCKET_MASK;
@@ -497,6 +518,7 @@ ShadowStrikeCacheLookup(
         InterlockedIncrement64(&g_ScanCache.Stats.Misses);
     }
 
+    ShadowStrikeCacheReleaseReference();
     return found;
 }
 
@@ -556,12 +578,20 @@ ShadowStrikeCacheInsert(
     }
 
     //
+    // Acquire shutdown reference
+    //
+    if (!ShadowStrikeCacheAcquireReference()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
     // Check entry limit
     //
     currentEntries = g_ScanCache.Stats.CurrentEntries;
     if (currentEntries >= SHADOWSTRIKE_CACHE_MAX_ENTRIES) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] Cache full, not inserting new entry\n");
+        ShadowStrikeCacheReleaseReference();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -614,6 +644,7 @@ ShadowStrikeCacheInsert(
         ExReleasePushLockExclusive(&bucket->Lock);
         KeLeaveCriticalRegion();
 
+        ShadowStrikeCacheReleaseReference();
         return STATUS_SUCCESS;
     }
 
@@ -627,6 +658,7 @@ ShadowStrikeCacheInsert(
     if (entry == NULL) {
         ExReleasePushLockExclusive(&bucket->Lock);
         KeLeaveCriticalRegion();
+        ShadowStrikeCacheReleaseReference();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -658,6 +690,7 @@ ShadowStrikeCacheInsert(
     ShadowStrikeCacheUpdatePeak(&g_ScanCache.Stats.PeakEntries, currentEntries);
     InterlockedIncrement64(&g_ScanCache.Stats.Inserts);
 
+    ShadowStrikeCacheReleaseReference();
     return STATUS_SUCCESS;
 }
 
@@ -672,6 +705,10 @@ ShadowStrikeCacheRemove(
     BOOLEAN removed = FALSE;
 
     if (Key == NULL || !g_ScanCache.Initialized) {
+        return FALSE;
+    }
+
+    if (!ShadowStrikeCacheAcquireReference()) {
         return FALSE;
     }
 
@@ -691,9 +728,9 @@ ShadowStrikeCacheRemove(
         InterlockedDecrement(&bucket->EntryCount);
 
         //
-        // CRITICAL FIX: Free entry WHILE holding lock to prevent use-after-free
-        // Another thread cannot access this entry once it's removed from the list
-        // and we're still holding the exclusive lock
+        // Free entry WHILE holding lock to prevent use-after-free.
+        // Another thread cannot access this entry once removed from list
+        // and we still hold the exclusive lock.
         //
         ShadowStrikeCacheFreeEntry(entry);
         removed = TRUE;
@@ -707,6 +744,7 @@ ShadowStrikeCacheRemove(
         InterlockedIncrement64(&g_ScanCache.Stats.Evictions);
     }
 
+    ShadowStrikeCacheReleaseReference();
     return removed;
 }
 
@@ -723,6 +761,10 @@ ShadowStrikeCacheInvalidateVolume(
     LIST_ENTRY removeList;
 
     if (!g_ScanCache.Initialized) {
+        return 0;
+    }
+
+    if (!ShadowStrikeCacheAcquireReference()) {
         return 0;
     }
 
@@ -781,6 +823,7 @@ ShadowStrikeCacheInvalidateVolume(
                    removedCount, VolumeSerial);
     }
 
+    ShadowStrikeCacheReleaseReference();
     return removedCount;
 }
 

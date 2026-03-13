@@ -423,6 +423,7 @@ BdvpCalculateAuthenticodeHash(
     ULONG bytesToHash;
     USHORT i;
     BOOLEAN contextInitialized = FALSE;
+    UNREFERENCED_PARAMETER(i);
 
     if (ImageBase == NULL || ImageSize < sizeof(IMAGE_DOS_HEADER) || Hash == NULL) {
         return STATUS_INVALID_PARAMETER;

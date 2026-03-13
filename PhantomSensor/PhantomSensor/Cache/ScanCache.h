@@ -126,6 +126,12 @@ typedef struct _SHADOWSTRIKE_CACHE_KEY {
 
 } SHADOWSTRIKE_CACHE_KEY, *PSHADOWSTRIKE_CACHE_KEY;
 
+//
+// Compile-time verification: hash function casts CACHE_KEY to PULONG,
+// so the struct size must be evenly divisible by sizeof(ULONG).
+//
+C_ASSERT(sizeof(SHADOWSTRIKE_CACHE_KEY) % sizeof(ULONG) == 0);
+
 /**
  * @brief Cached verdict entry.
  */
@@ -276,8 +282,10 @@ typedef struct _SHADOWSTRIKE_CACHE_RESULT {
 
 /**
  * @brief Global scan cache instance.
+ *
+ * Opaque to external consumers. Access only through the public API
+ * functions declared in ScanCache.h.
  */
-extern SHADOWSTRIKE_SCAN_CACHE g_ScanCache;
 
 // ============================================================================
 // FUNCTION PROTOTYPES
