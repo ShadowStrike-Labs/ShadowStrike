@@ -34,6 +34,7 @@
 #include "../../Core/Globals.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Exclusions/ExclusionManager.h"
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
@@ -260,6 +261,15 @@ CbMonCheckProcessCreate(
     }
 
     InterlockedIncrement64(&g_CbState.Stats.TotalProcessesChecked);
+
+    //
+    // Exclusion check — exempt excluded processes from clipboard monitoring.
+    // Prevents false positives on management tools that legitimately access clipboard.
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        ExReleaseRundownProtection(&g_CbState.RundownRef);
+        return CbIndicator_None;
+    }
 
     cmdLine = CreateInfo->CommandLine;
     imageName = CreateInfo->ImageFileName;
