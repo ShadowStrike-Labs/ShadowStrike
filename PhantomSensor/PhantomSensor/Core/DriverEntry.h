@@ -181,6 +181,9 @@ typedef enum _SHADOWSTRIKE_SUBSYSTEM_FLAGS {
     SubsysFlag_SpinLockSubsystem    = 0x08000000,
     SubsysFlag_MessageQueue         = 0x10000000,
 
+    // Phase 7: Filesystem callback subsystems (InitFlags exhausted)
+    SubsysFlag_PreCreate            = 0x20000000,
+
     // DeviceObject-dependent modules
     SubsysFlag_EventSchema          = 0x40000000,
     SubsysFlag_MemoryScanner        = 0x80000000,

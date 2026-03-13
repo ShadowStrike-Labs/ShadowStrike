@@ -1136,13 +1136,28 @@ Return Value:
         Data->IoStatus.Status = STATUS_ACCESS_DENIED;
         Data->IoStatus.Information = 0;
 
-        DbgPrintEx(
-            DPFLTR_IHVDRIVER_ID,
-            DPFLTR_WARNING_LEVEL,
-            "[ShadowStrike/PreCreate] BLOCKED: Autorun on removable media: %wZ (PID=%lu)\n",
-            &NameInfo->Name,
-            HandleToULong(RequestorPid)
+        SHADOWSTRIKE_INC_STAT(FilesBlocked);
+        InterlockedIncrement64(&g_PcState.Stats.OperationsBlocked);
+
+        BeEngineSubmitEvent(
+            BehaviorEvent_HiddenFileCreation,
+            BehaviorCategory_ProcessExecution,
+            HandleToULong(RequestorPid),
+            NULL, 0,
+            80,
+            TRUE,
+            NULL
             );
+
+        if (PcpShouldLogOperation()) {
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/PreCreate] BLOCKED: Autorun on removable media: %wZ (PID=%lu)\n",
+                &NameInfo->Name,
+                HandleToULong(RequestorPid)
+                );
+        }
 
         FltReleaseFileNameInformation(NameInfo);
         ExReleaseRundownProtection(&g_PcState.RundownRef);
@@ -1184,6 +1199,16 @@ Return Value:
 
                     SHADOWSTRIKE_INC_STAT(FilesBlocked);
                     InterlockedIncrement64(&g_PcState.Stats.OperationsBlocked);
+
+                    BeEngineSubmitEvent(
+                        BehaviorEvent_FileSignatureSpoofing,
+                        BehaviorCategory_DefenseEvasion,
+                        HandleToULong(RequestorPid),
+                        NULL, 0,
+                        CacheResult.ThreatScore,
+                        TRUE,
+                        NULL
+                        );
 
                     FltReleaseFileNameInformation(NameInfo);
                     ExReleaseRundownProtection(&g_PcState.RundownRef);
@@ -1825,11 +1850,19 @@ Routine Description:
         if (g_PcState.Honeypot.Patterns[i].Buffer != NULL &&
             g_PcState.Honeypot.Patterns[i].Length > 0) {
             //
-            // Check for wildcard match
+            // SAFETY: PcpMatchWildcard requires null-terminated strings.
+            // UNICODE_STRING buffers are NOT guaranteed null-terminated.
+            // FltGetFileNameInformation typically null-terminates, but
+            // verify defensively: if MaximumLength > Length, the byte
+            // at Length position should be a null terminator.
             //
-            if (PcpMatchWildcard(FileName->Buffer, g_PcState.Honeypot.Patterns[i].Buffer)) {
-                *IsHoneypot = TRUE;
-                break;
+            USHORT CharPos = FileName->Length / sizeof(WCHAR);
+            if (FileName->MaximumLength > FileName->Length &&
+                FileName->Buffer[CharPos] == L'\0') {
+                if (PcpMatchWildcard(FileName->Buffer, g_PcState.Honeypot.Patterns[i].Buffer)) {
+                    *IsHoneypot = TRUE;
+                    break;
+                }
             }
         }
     }
@@ -2022,15 +2055,19 @@ Routine Description:
     g_PcState.Honeypot.Patterns[g_PcState.Honeypot.PatternCount].MaximumLength = Pattern->Length + sizeof(WCHAR);
     g_PcState.Honeypot.PatternCount++;
 
-    ExReleasePushLockExclusive(&g_PcState.HoneypotLock);
-    KeLeaveCriticalRegion();
+    {
+        ULONG CurrentCount = g_PcState.Honeypot.PatternCount;
 
-    DbgPrintEx(
-        DPFLTR_IHVDRIVER_ID,
-        DPFLTR_INFO_LEVEL,
-        "[ShadowStrike/PreCreate] Added honeypot pattern #%lu\n",
-        g_PcState.Honeypot.PatternCount
-        );
+        ExReleasePushLockExclusive(&g_PcState.HoneypotLock);
+        KeLeaveCriticalRegion();
+
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_INFO_LEVEL,
+            "[ShadowStrike/PreCreate] Added honeypot pattern #%lu\n",
+            CurrentCount
+            );
+    }
 
     return STATUS_SUCCESS;
 }
@@ -2073,6 +2110,8 @@ PcGetStatistics(
     _Out_ PPC_STATISTICS Stats
     )
 {
+    PAGED_CODE();
+
     if (Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -2090,13 +2129,19 @@ PcResetStatistics(
     )
 {
     LARGE_INTEGER CurrentTime;
-
-    PAGED_CODE();
+    KIRQL OldIrql;
 
     KeQuerySystemTime(&CurrentTime);
 
+    //
+    // Acquire StatsLock to prevent torn reads/writes while
+    // InterlockedIncrement64 calls race with our bulk zero.
+    // This is a rare admin operation so spinlock overhead is acceptable.
+    //
+    KeAcquireSpinLock(&g_PcState.StatsLock, &OldIrql);
     RtlZeroMemory(&g_PcState.Stats, sizeof(PC_STATISTICS));
     g_PcState.Stats.StartTime = CurrentTime;
+    KeReleaseSpinLock(&g_PcState.StatsLock, OldIrql);
 }
 
 
@@ -2173,6 +2218,15 @@ Routine Description:
 // ============================================================================
 // INTERNAL HELPERS
 // ============================================================================
+
+//
+// NOTE: PcpAllocateOperationContext, PcpFreeOperationContext, and
+// PcpLogSuspiciousAccess are reserved for future per-operation context
+// tracking (e.g., passing scan results from PreCreate to PostCreate via
+// CompletionContext). The lookaside list is initialized in PcInitialize
+// and destroyed in PcShutdown. These functions are currently unused but
+// intentionally retained for the CompletionContext integration phase.
+//
 
 static PPC_OPERATION_CONTEXT
 PcpAllocateOperationContext(
