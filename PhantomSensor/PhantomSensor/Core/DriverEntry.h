@@ -108,6 +108,7 @@ typedef enum _SHADOWSTRIKE_INIT_FLAGS {
     InitFlag_WppTracing                   = 0x02000000,
     InitFlag_ElamInitialized              = 0x04000000,
     InitFlag_RegistryMonitorInit          = 0x08000000,
+    InitFlag_FscInitialized               = 0x10000000,
 
     // Combined flags for critical security components
     InitFlag_AllSecurityCallbacks   = (InitFlag_ProcessCallbackReg |

@@ -182,6 +182,17 @@ static FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
         NULL                                        // Reserved
     },
 
+    {
+        FLT_VOLUME_CONTEXT,                         // ContextType
+        0,                                          // Flags
+        ShadowStrikeVolumeContextCleanup,           // ContextCleanupCallback
+        FLT_VARIABLE_SIZED_CONTEXTS,                // Size — FSC specifies exact size
+        'xCVS',                                     // PoolTag — SVCx (Volume Context)
+        NULL,                                       // ContextAllocateCallback
+        NULL,                                       // ContextFreeCallback
+        NULL                                        // Reserved
+    },
+
     { FLT_CONTEXT_END }
 };
 

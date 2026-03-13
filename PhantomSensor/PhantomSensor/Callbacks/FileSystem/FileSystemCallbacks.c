@@ -511,6 +511,7 @@ FscpDetectRansomwareBehavior(
     _In_ PFSC_PROCESS_FILE_CONTEXT ProcessContext
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 FscpCleanupTimerCallback(
     _In_ ULONG TimerId,
@@ -1607,43 +1608,50 @@ Arguments:
 --*/
 {
     LONG NewRefCount;
-    BOOLEAN ShouldFree = FALSE;
 
     if (Context == NULL) {
         return;
     }
 
     //
-    // CRITICAL: Acquire lock BEFORE decrementing to prevent race where
-    // another thread could reference this context between our decrement
-    // and our removal from the list.
+    // LOCKLESS FAST PATH: If refcount > 1, we know context is not being removed.
+    // InterlockedDecrement is atomic and sufficient when result > 0.
+    // Only take the expensive exclusive lock when refcount reaches 0 (removal path).
+    //
+    NewRefCount = InterlockedDecrement(&Context->RefCount);
+
+    if (NewRefCount > 0) {
+        return;
+    }
+
+    //
+    // Refcount reached zero — need exclusive lock to safely remove from list.
+    // Another thread may have incremented refcount between our decrement and
+    // lock acquisition, so re-check after acquiring.
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_FscState.ProcessContextLock);
 
-    NewRefCount = InterlockedDecrement(&Context->RefCount);
-
-    if (NewRefCount == 0) {
-        //
-        // Last reference - remove from list under lock
-        //
+    //
+    // Re-check: another thread may have referenced this context after our
+    // decrement but before we acquired the lock.
+    //
+    if (Context->RefCount == 0) {
         if (!IsListEmpty(&Context->ListEntry)) {
             RemoveEntryList(&Context->ListEntry);
             InitializeListHead(&Context->ListEntry);
             InterlockedDecrement(&g_FscState.ProcessContextCount);
         }
-        ShouldFree = TRUE;
+
+        ExReleasePushLockExclusive(&g_FscState.ProcessContextLock);
+        KeLeaveCriticalRegion();
+
+        ExFreeToNPagedLookasideList(&g_FscState.ProcessContextLookaside, Context);
+        return;
     }
 
     ExReleasePushLockExclusive(&g_FscState.ProcessContextLock);
     KeLeaveCriticalRegion();
-
-    //
-    // Free outside lock
-    //
-    if (ShouldFree) {
-        ExFreeToNPagedLookasideList(&g_FscState.ProcessContextLookaside, Context);
-    }
 }
 
 // ============================================================================
@@ -1709,14 +1717,11 @@ Return Value:
     CurrentSecond = CurrentTime.QuadPart / 10000000LL;
 
     //
-    // Read the stored start time ONCE into a local to avoid re-reading
-    // the volatile between CAS comparand and result check.
+    // Read the stored start time ONCE atomically. On x64, aligned 64-bit reads
+    // are atomic for volatile fields. Avoids the previous CAS-to-self antipattern
+    // which read the volatile 3 times (Value, Comparand, Exchange all from same field).
     //
-    OldStart = InterlockedCompareExchange64(
-        &g_FscState.CurrentSecondStart100ns,
-        g_FscState.CurrentSecondStart100ns,
-        g_FscState.CurrentSecondStart100ns
-    );
+    OldStart = *(volatile LONG64*)&g_FscState.CurrentSecondStart100ns;
     OldSecond = OldStart / 10000000LL;
 
     if (CurrentSecond != OldSecond) {
@@ -1904,19 +1909,29 @@ Arguments:
     ProcessContext->LastActivityTime = CurrentTime;
 
     //
-    // Reset time window if expired (1 second window)
+    // Reset time window if expired (1 second window).
+    // Use CAS on WindowStartTime so only one thread resets counters — prevents
+    // multiple threads zeroing counts and losing data.
     //
-    TimeDiff.QuadPart = CurrentTime.QuadPart - ProcessContext->WindowStartTime.QuadPart;
-    if (TimeDiff.QuadPart > (10000000LL)) {  // 1 second in 100ns units
-        //
-        // Check for ransomware before resetting
-        //
-        CheckRansomware = TRUE;
-
-        ProcessContext->RecentModifications = 0;
-        ProcessContext->RecentDeletions = 0;
-        ProcessContext->RecentRenames = 0;
-        ProcessContext->WindowStartTime = CurrentTime;
+    {
+        LONG64 OldWindowStart = *(volatile LONG64*)&ProcessContext->WindowStartTime.QuadPart;
+        TimeDiff.QuadPart = CurrentTime.QuadPart - OldWindowStart;
+        if (TimeDiff.QuadPart > (10000000LL)) {  // 1 second in 100ns units
+            //
+            // Attempt atomic swap — only the CAS winner resets counters
+            //
+            LONG64 Swapped = InterlockedCompareExchange64(
+                &ProcessContext->WindowStartTime.QuadPart,
+                CurrentTime.QuadPart,
+                OldWindowStart
+            );
+            if (Swapped == OldWindowStart) {
+                CheckRansomware = TRUE;
+                InterlockedExchange(&ProcessContext->RecentModifications, 0);
+                InterlockedExchange(&ProcessContext->RecentDeletions, 0);
+                InterlockedExchange(&ProcessContext->RecentRenames, 0);
+            }
+        }
     }
 
     //
@@ -2191,7 +2206,7 @@ Routine Description:
         InterlockedExchange(&Context->RecentModifications, 0);
         InterlockedExchange(&Context->RecentDeletions, 0);
         InterlockedExchange(&Context->RecentRenames, 0);
-        Context->WindowStartTime = CurrentTime;
+        InterlockedExchange64(&Context->WindowStartTime.QuadPart, CurrentTime.QuadPart);
     }
 
     ExReleasePushLockShared(&g_FscState.ProcessContextLock);
@@ -2204,10 +2219,10 @@ Routine Description:
 
 NTSTATUS
 ShadowStrikeGetFileSystemStats(
-    _Out_ PULONG64 PreCreateCalls,
-    _Out_ PULONG64 FilesBlocked,
-    _Out_ PULONG64 RansomwareDetections,
-    _Out_ PULONG VolumeCount
+    _Out_opt_ PULONG64 PreCreateCalls,
+    _Out_opt_ PULONG64 FilesBlocked,
+    _Out_opt_ PULONG64 RansomwareDetections,
+    _Out_opt_ PULONG VolumeCount
     )
 /*++
 Routine Description:

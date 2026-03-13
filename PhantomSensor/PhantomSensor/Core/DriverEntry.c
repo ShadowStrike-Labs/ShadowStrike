@@ -56,6 +56,7 @@
 #include "../Callbacks/Process/AmsiBypassDetector.h"
 #include "../Callbacks/FileSystem/FileBackupEngine.h"
 #include "../Callbacks/FileSystem/USBDeviceControl.h"
+#include "../Callbacks/FileSystem/FileSystemCallbacks.h"
 #include "../Callbacks/Process/WSLMonitor.h"
 #include "../Callbacks/Process/AppControl.h"
 #include "../SelfProtection/FirmwareIntegrity.h"
@@ -1586,6 +1587,22 @@ DriverEntry(
     }
 
     //
+    // Step 14.26: Initialize filesystem callback subsystem (MUST be before FltStartFiltering)
+    // InstanceSetup is called during FltStartFiltering and accesses FSC global state
+    // (VolumeList, ProcessContextList, lookaside lists). Without this init, BSOD occurs.
+    //
+    status = ShadowStrikeInitializeFileSystemCallbacks();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize filesystem callbacks: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_FscInitialized;
+        ShadowStrikeLogInitStatus("Filesystem Callbacks", STATUS_SUCCESS);
+    }
+
+    //
     // Step 15: Start filtering
     //
     status = FltStartFiltering(g_DriverData.FilterHandle);
@@ -1817,6 +1834,14 @@ ShadowStrikeUnload(
             FltUnregisterFilter(g_DriverData.FilterHandle);
             g_DriverData.FilterHandle = NULL;
         }
+    }
+
+    //
+    // Step 9.5: Cleanup filesystem callbacks (AFTER FltUnregisterFilter — 
+    // InstanceTeardownComplete accesses FSC state during filter teardown)
+    //
+    if (g_InitFlags & InitFlag_FscInitialized) {
+        ShadowStrikeCleanupFileSystemCallbacks();
     }
 
     // =========================================================================
@@ -2637,6 +2662,10 @@ ShadowStrikeCleanupByFlags(
             FltUnregisterFilter(g_DriverData.FilterHandle);
             g_DriverData.FilterHandle = NULL;
         }
+    }
+
+    if (InitFlags & InitFlag_FscInitialized) {
+        ShadowStrikeCleanupFileSystemCallbacks();
     }
 
     //
