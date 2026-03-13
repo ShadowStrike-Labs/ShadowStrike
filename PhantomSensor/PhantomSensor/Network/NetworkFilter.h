@@ -658,6 +658,8 @@ struct _DNS_MONITOR;
 struct _NR_MANAGER;
 struct _SSL_INSPECTOR;
 struct _DX_DETECTOR;
+struct _SSPS_DETECTOR;
+struct _PP_PARSER;
 
 /**
  * @brief Get the global C2 Detection instance.
@@ -714,6 +716,28 @@ NfFilterGetSslInspector(
  */
 struct _DX_DETECTOR*
 NfFilterGetDxDetector(
+    VOID
+    );
+
+/**
+ * @brief Get the global Port Scanner Detector instance.
+ *
+ * @return Pointer to port scanner, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _SSPS_DETECTOR*
+NfFilterGetPortScanner(
+    VOID
+    );
+
+/**
+ * @brief Get the global Protocol Parser instance.
+ *
+ * @return Pointer to protocol parser, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _PP_PARSER*
+NfFilterGetProtocolParser(
     VOID
     );
 

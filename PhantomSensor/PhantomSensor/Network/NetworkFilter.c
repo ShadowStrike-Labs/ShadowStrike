@@ -65,6 +65,8 @@
 #include "NetworkReputation.h"
 #include "SSLInspection.h"
 #include "DataExfiltration.h"
+#include "PortScanner.h"
+#include "ProtocolParser.h"
 #include "../Core/Globals.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
@@ -200,6 +202,8 @@ static PC2_DETECTOR g_C2Detector;
 static PNR_MANAGER g_ReputationManager;
 static PSSL_INSPECTOR g_SslInspector;
 static PDX_DETECTOR g_DxDetector;
+static PSSPS_DETECTOR g_PortScanner;
+static PPP_PARSER g_ProtocolParser;
 
 // Rate limiting state (all atomic)
 static volatile LONG g_EventsThisSecond;
@@ -712,6 +716,22 @@ NfFilterInitialize(
         g_DxDetector = NULL;
     }
 
+    status = SsPsInitialize(DeviceObject, &g_PortScanner);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/NF] WARNING: PortScanner init failed: 0x%08X (continuing)\n",
+                   status);
+        g_PortScanner = NULL;
+    }
+
+    status = PpInitialize(&g_ProtocolParser);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/NF] WARNING: ProtocolParser init failed: 0x%08X (continuing)\n",
+                   status);
+        g_ProtocolParser = NULL;
+    }
+
     //
     // Reset status — sub-module failures are non-fatal
     //
@@ -782,6 +802,16 @@ NfFilterShutdown(
     //
     // Shutdown network detection sub-modules (reverse init order)
     //
+    if (g_ProtocolParser != NULL) {
+        PpShutdown(&g_ProtocolParser);
+        g_ProtocolParser = NULL;
+    }
+
+    if (g_PortScanner != NULL) {
+        SsPsShutdown(g_PortScanner);
+        g_PortScanner = NULL;
+    }
+
     if (g_DxDetector != NULL) {
         DxShutdown(g_DxDetector);
         g_DxDetector = NULL;
@@ -3317,6 +3347,24 @@ NfpCreateAndInsertConnection(
 
     NfpAnalyzeConnection(connection);
 
+    //
+    // Feed connection to PortScanner for reconnaissance detection (T1046)
+    //
+    if (g_PortScanner != NULL) {
+        LARGE_INTEGER processCreateTime = {0};
+        SsPsRecordConnection(
+            g_PortScanner,
+            (HANDLE)(ULONG_PTR)processId,
+            processCreateTime,
+            IsV6 ? (PVOID)remoteIp6 : (PVOID)&remoteIp,
+            remotePort,
+            IsV6,
+            protocol,
+            (protocol == IPPROTO_TCP) ? SSPS_TCP_FLAG_SYN : 0,
+            TRUE
+        );
+    }
+
     if (InterlockedCompareExchange((LONG*)&connection->Flags, 0, 0) & NF_CONN_FLAG_BLOCKED) {
         ClassifyOut->actionType = FWP_ACTION_BLOCK;
         ClassifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
@@ -3651,6 +3699,77 @@ NfpProcessStreamData(
         InterlockedIncrement((LONG*)&connection->PacketsSent);
 
         NfpUpdateBeaconingState(connection, (UINT64)(currentTime.QuadPart / 10000));
+
+        //
+        // Attempt HTTP protocol parsing on outbound sends for C2 detection (T1071.001).
+        // Only parse if ProtocolParser is available and data is plausible HTTP size.
+        // KeGetCurrentIrql() must be PASSIVE_LEVEL for PpParseHTTPRequest.
+        //
+        if (g_ProtocolParser != NULL && dataSize >= 16 && dataSize <= 65536 &&
+            KeGetCurrentIrql() == PASSIVE_LEVEL) {
+
+            PVOID contiguousData = NULL;
+            BOOLEAN ppAllocated = FALSE;
+            UCHAR ppLocalBuf[2048];
+
+            //
+            // Get contiguous view of stream data
+            //
+            if (dataSize <= sizeof(ppLocalBuf)) {
+                SIZE_T bytesCopied = 0;
+                FwpsCopyStreamDataToBuffer0(
+                    StreamPacket->streamData, ppLocalBuf, (SIZE_T)sizeof(ppLocalBuf), &bytesCopied);
+                if (bytesCopied > 0) {
+                    contiguousData = ppLocalBuf;
+                }
+            } else {
+                contiguousData = ExAllocatePool2(
+                    POOL_FLAG_PAGED, (SIZE_T)dataSize, 'pPfN');
+                if (contiguousData != NULL) {
+                    SIZE_T bytesCopied = 0;
+                    FwpsCopyStreamDataToBuffer0(
+                        StreamPacket->streamData, contiguousData, (SIZE_T)dataSize, &bytesCopied);
+                    ppAllocated = TRUE;
+                    if (bytesCopied == 0) {
+                        ExFreePoolWithTag(contiguousData, 'pPfN');
+                        contiguousData = NULL;
+                        ppAllocated = FALSE;
+                    }
+                }
+            }
+
+            if (contiguousData != NULL) {
+                //
+                // Quick check: does data look like HTTP? (GET, POST, PUT, HEAD, etc.)
+                //
+                UCHAR firstByte = *(UCHAR*)contiguousData;
+                if (firstByte == 'G' || firstByte == 'P' || firstByte == 'H' ||
+                    firstByte == 'D' || firstByte == 'O' || firstByte == 'C' ||
+                    firstByte == 'T') {
+
+                    PPP_HTTP_REQUEST httpRequest = NULL;
+                    NTSTATUS parseStatus = PpParseHTTPRequest(
+                        g_ProtocolParser, contiguousData, (ULONG)dataSize, &httpRequest);
+
+                    if (NT_SUCCESS(parseStatus) && httpRequest != NULL) {
+                        if (httpRequest->SuspicionScore > 50) {
+                            BeEngineSubmitEvent(
+                                BehaviorEvent_C2Communication,
+                                BehaviorCategory_NetworkOperation,
+                                connection->ProcessId,
+                                NULL, 0,
+                                httpRequest->SuspicionScore,
+                                TRUE, NULL);
+                        }
+                        PpFreeHTTPRequest(httpRequest);
+                    }
+                }
+
+                if (ppAllocated) {
+                    ExFreePoolWithTag(contiguousData, 'pPfN');
+                }
+            }
+        }
     } else {
         InterlockedAdd64((LONG64*)&connection->BytesReceived, (LONG64)dataSize);
         InterlockedIncrement((LONG*)&connection->PacketsReceived);
@@ -3885,4 +4004,20 @@ NfFilterGetDxDetector(
     )
 {
     return g_DxDetector;
+}
+
+PSSPS_DETECTOR
+NfFilterGetPortScanner(
+    VOID
+    )
+{
+    return g_PortScanner;
+}
+
+PPP_PARSER
+NfFilterGetProtocolParser(
+    VOID
+    )
+{
+    return g_ProtocolParser;
 }
