@@ -220,6 +220,26 @@ ShadowStrikePreAcquireSection(
     );
 
 /**
+ * @brief Initialize PreAcquireSection subsystem (lookaside, hash table, timers).
+ */
+NTSTATUS
+ShadowStrikePreAcquireSectionInitialize(VOID);
+
+/**
+ * @brief Shutdown PreAcquireSection subsystem (drain resources, cancel timers).
+ */
+VOID
+ShadowStrikePreAcquireSectionShutdown(VOID);
+
+/**
+ * @brief Remove mapping context on process exit (call from ProcessNotify).
+ */
+VOID
+ShadowStrikeRemoveProcessMappingContext(
+    _In_ HANDLE ProcessId
+    );
+
+/**
  * @brief Pre-operation callback for IRP_MJ_CREATE_NAMED_PIPE.
  *        Detects C2 channel and lateral movement pipe creation.
  */

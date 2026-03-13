@@ -1652,6 +1652,21 @@ DriverEntry(
     }
 
     //
+    // Step 14.29: Initialize PreAcquireSection subsystem (behavioral detection for
+    // process hollowing, DLL injection, reflective loading via section mapping patterns)
+    //
+    status = ShadowStrikePreAcquireSectionInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize PreAcquireSection subsystem: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_PasInitialized;
+        ShadowStrikeLogInitStatus("PreAcquireSection Subsystem", STATUS_SUCCESS);
+    }
+
+    //
     // Step 15: Start filtering
     //
     status = FltStartFiltering(g_DriverData.FilterHandle);
@@ -1882,6 +1897,14 @@ ShadowStrikeUnload(
     //
     if (g_InitFlags & InitFlag_PwInitialized) {
         ShadowStrikePostWriteShutdown();
+    }
+
+    //
+    // Step 8.4a: Shutdown PreAcquireSection subsystem (cancel cleanup timer,
+    // drain process contexts and mapping records)
+    //
+    if (g_InitFlags & InitFlag_PasInitialized) {
+        ShadowStrikePreAcquireSectionShutdown();
     }
 
     //
@@ -2725,6 +2748,10 @@ ShadowStrikeCleanupByFlags(
 
     if (InitFlags & InitFlag_PwInitialized) {
         ShadowStrikePostWriteShutdown();
+    }
+
+    if (InitFlags & InitFlag_PasInitialized) {
+        ShadowStrikePreAcquireSectionShutdown();
     }
 
     if (InitFlags & InitFlag_PocInitialized) {

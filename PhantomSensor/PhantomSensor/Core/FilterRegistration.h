@@ -434,6 +434,9 @@ ShadowStrikePreCleanup(
  * @return FLT_PREOP_SUCCESS_NO_CALLBACK or FLT_PREOP_COMPLETE.
  *
  * @irql <= APC_LEVEL
+ *
+ * @deprecated Replaced by ShadowStrikePreAcquireSection in PreAcquireSection.c
+ *             which provides full behavioral detection. Retained for reference only.
  */
 _IRQL_requires_max_(APC_LEVEL)
 FLT_PREOP_CALLBACK_STATUS

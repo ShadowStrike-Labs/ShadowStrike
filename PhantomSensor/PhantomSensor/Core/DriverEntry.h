@@ -111,6 +111,7 @@ typedef enum _SHADOWSTRIKE_INIT_FLAGS {
     InitFlag_FscInitialized               = 0x10000000,
     InitFlag_PocInitialized               = 0x20000000,
     InitFlag_PwInitialized                = 0x40000000,
+    InitFlag_PasInitialized               = (LONG)0x80000000,
 
     // Combined flags for critical security components
     InitFlag_AllSecurityCallbacks   = (InitFlag_ProcessCallbackReg |

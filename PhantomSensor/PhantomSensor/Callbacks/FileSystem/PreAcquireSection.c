@@ -807,7 +807,7 @@ PaspIsProcessSuspended(
     }
 
     buffer = ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
+        POOL_FLAG_PAGED,
         bufferSize,
         PAS_POOL_TAG_QUERY
     );
@@ -832,7 +832,7 @@ PaspIsProcessSuspended(
         }
 
         buffer = ExAllocatePool2(
-            POOL_FLAG_NON_PAGED,
+            POOL_FLAG_PAGED,
             bufferSize,
             PAS_POOL_TAG_QUERY
         );
@@ -1415,6 +1415,46 @@ IRQL:
     }
 
     //
+    // Self-protection: block unauthorized execution mapping of ShadowStrike files.
+    // Uses CACHE_ONLY to avoid deadlock during section acquisition.
+    //
+    if (g_DriverData.Config.SelfProtectionEnabled) {
+        PFLT_FILE_NAME_INFORMATION SelfProtNameInfo = NULL;
+        NTSTATUS SelfProtStatus;
+
+        SelfProtStatus = FltGetFileNameInformation(
+            Data,
+            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_CACHE_ONLY,
+            &SelfProtNameInfo
+            );
+
+        if (NT_SUCCESS(SelfProtStatus) && SelfProtNameInfo != NULL) {
+            SelfProtStatus = FltParseFileNameInformation(SelfProtNameInfo);
+            if (NT_SUCCESS(SelfProtStatus)) {
+                if (ShadowStrikeShouldBlockFileAccess(
+                        &SelfProtNameInfo->Name,
+                        SECTION_MAP_EXECUTE,
+                        CurrentProcessId,
+                        FALSE)) {
+
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                               "[ShadowStrike/PreAcquireSection] BLOCKED execute mapping of "
+                               "protected file: %wZ (PID=%lu)\n",
+                               &SelfProtNameInfo->Name,
+                               HandleToULong(CurrentProcessId));
+
+                    SHADOWSTRIKE_INC_STAT(SelfProtectionBlocks);
+                    FltReleaseFileNameInformation(SelfProtNameInfo);
+
+                    Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                    return FLT_PREOP_COMPLETE;
+                }
+            }
+            FltReleaseFileNameInformation(SelfProtNameInfo);
+        }
+    }
+
+    //
     // Exclusion check — skip analysis for excluded processes
     //
     if (ShadowStrikeIsProcessExcluded(CurrentProcessId, NULL)) {
@@ -1591,6 +1631,21 @@ IRQL:
                     InterlockedIncrement64((PLONG64)&g_PasState.Stats.Allowed);
                     FltReleaseFileNameInformation(NameInfo);
                     NameInfo = NULL;
+
+                    //
+                    // CRITICAL: Clean up allocated resources before early return.
+                    // ProcessContext (referenced at lookup) and MappingRecord (allocated
+                    // from lookaside) would leak without this cleanup.
+                    //
+                    if (MappingRecord != NULL) {
+                        PaspFreeRecord(MappingRecord);
+                        MappingRecord = NULL;
+                    }
+                    if (ProcessContext != NULL) {
+                        PaspDereferenceProcessContext(ProcessContext);
+                        ProcessContext = NULL;
+                    }
+
                     SHADOWSTRIKE_RELEASE_RUNDOWN();
                     return FLT_PREOP_SUCCESS_NO_CALLBACK;
                 }
@@ -3013,5 +3068,42 @@ ShadowStrikeGetPreAcquireSectionExtendedStats(
     *Stats = g_PasState.Stats;
 
     return STATUS_SUCCESS;
+}
+
+
+// ============================================================================
+// PUBLIC INITIALIZATION / SHUTDOWN
+// ============================================================================
+
+/*++
+Routine Description:
+    Public entry point for PreAcquireSection subsystem initialization.
+    Called from DriverEntry before FltStartFiltering.
+
+Return Value:
+    STATUS_SUCCESS on success.
+    STATUS_ALREADY_REGISTERED if already initialized.
+    Error status on failure.
+--*/
+NTSTATUS
+ShadowStrikePreAcquireSectionInitialize(
+    VOID
+    )
+{
+    return PaspInitialize();
+}
+
+
+/*++
+Routine Description:
+    Public entry point for PreAcquireSection subsystem shutdown.
+    Called from DriverEntry unload paths.
+--*/
+VOID
+ShadowStrikePreAcquireSectionShutdown(
+    VOID
+    )
+{
+    PaspShutdown();
 }
 

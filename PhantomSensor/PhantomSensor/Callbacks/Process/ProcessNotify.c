@@ -82,6 +82,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../Core/DriverEntry.h"
 #include "../../Sync/TimerManager.h"
 #include "../FileSystem/FileBackupEngine.h"
+#include "../FileSystem/FileSystemCallbacks.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -2892,6 +2893,12 @@ PnpHandleProcessTermination(
     // its backed-up files are no longer needed and disk space can be reclaimed.
     //
     FbeCommitProcess(ProcessId);
+
+    //
+    // Clean up PreAcquireSection behavioral context for this process.
+    // Prevents stale mapping data and PID recycling issues.
+    //
+    ShadowStrikeRemoveProcessMappingContext(ProcessId);
 
     //
     // Remove from tracking

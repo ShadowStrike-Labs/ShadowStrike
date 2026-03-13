@@ -270,12 +270,13 @@ static FLT_OPERATION_REGISTRATION g_OperationCallbacks[] = {
 
     //
     // IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION - Execute/Map
-    // Critical for catching code execution
+    // Critical for catching code execution, DLL injection, process hollowing,
+    // reflective loading detection via behavioral analysis in PreAcquireSection.c
     //
     {
         IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION,
         0,
-        ShadowStrikePreAcquireForSectionSync,
+        ShadowStrikePreAcquireSection,
         NULL,
         NULL
     },
