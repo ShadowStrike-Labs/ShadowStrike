@@ -1633,8 +1633,13 @@ Arguments:
 
     //
     // Calculate local suspicion score (legacy compatibility)
+    // Use max of flag-based score and accumulated sub-analyzer score
+    // (CLP, EM, HT already boosted Context->SuspicionScore in PnpAnalyzeProcess)
     //
     SuspicionScore = PnpCalculateSuspicionScore(ProcessContext);
+    if (ProcessContext->SuspicionScore > SuspicionScore) {
+        SuspicionScore = ProcessContext->SuspicionScore;
+    }
     ProcessContext->SuspicionScore = SuspicionScore;
 
     if (SuspicionScore >= PN_SUSPICION_MEDIUM) {
@@ -1844,8 +1849,12 @@ Arguments:
     }
 
     //
-    // Don't free context - it's now in the tracking list
+    // Release caller's reference — the tracking list holds its own ref
+    // (taken by PnpInsertProcessContext). Without this deref, every
+    // context leaks with RefCount stuck at 1, leaking the EPROCESS
+    // reference and pool memory until PoolTracker hits 4MB → self-DoS.
     //
+    PnpDereferenceContext(ProcessContext);
     ProcessContext = NULL;
 
 Cleanup:
@@ -2977,7 +2986,6 @@ Routine Description:
             L"mavinject.exe",
             L"msdeploy.exe",
             L"msdt.exe",
-            L"msiexec.exe",
             L"odbcconf.exe",
             L"pcwrun.exe",
             L"rcsi.exe",
@@ -4010,10 +4018,10 @@ Routine Description:
 
 NTSTATUS
 ShadowStrikeGetProcessMonitorStats(
-    _Out_ PULONG64 ProcessCreations,
-    _Out_ PULONG64 ProcessesBlocked,
-    _Out_ PULONG64 PpidSpoofingDetected,
-    _Out_ PULONG64 SuspiciousProcesses
+    _Out_opt_ PULONG64 ProcessCreations,
+    _Out_opt_ PULONG64 ProcessesBlocked,
+    _Out_opt_ PULONG64 PpidSpoofingDetected,
+    _Out_opt_ PULONG64 SuspiciousProcesses
     )
 {
     if (!g_ProcessMonitor.Initialized) {
@@ -4047,8 +4055,8 @@ ShadowStrikeGetProcessMonitorStats(
 NTSTATUS
 ShadowStrikeQueryProcessContext(
     _In_ HANDLE ProcessId,
-    _Out_ PULONG Flags,
-    _Out_ PULONG SuspicionScore
+    _Out_opt_ PULONG Flags,
+    _Out_opt_ PULONG SuspicionScore
     )
 {
     PPN_PROCESS_CONTEXT Context;
@@ -4078,11 +4086,11 @@ ShadowStrikeQueryProcessContext(
 
 NTSTATUS
 ShadowStrikeGetProcessMonitorExtendedStats(
-    _Out_ PULONG64 RateLimitDrops,
-    _Out_ PULONG64 PoolLimitDrops,
-    _Out_ PULONG64 UserModeTimeouts,
-    _Out_ PULONG64 CurrentPoolUsage,
-    _Out_ PULONG64 PeakPoolUsage
+    _Out_opt_ PULONG64 RateLimitDrops,
+    _Out_opt_ PULONG64 PoolLimitDrops,
+    _Out_opt_ PULONG64 UserModeTimeouts,
+    _Out_opt_ PULONG64 CurrentPoolUsage,
+    _Out_opt_ PULONG64 PeakPoolUsage
     )
 {
     if (!g_ProcessMonitor.Initialized) {
