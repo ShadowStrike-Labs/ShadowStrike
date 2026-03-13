@@ -29,7 +29,7 @@
  * - Adaptive rate limiting and throttling with interlocked operations
  * - Bounded string operations (wcsnlen/strnlen) for safety
  * - Kernel-safe string formatting via ntstrsafe.h
- * - Proper DPC draining on shutdown (KeFlushQueuedDpcs)
+ * - Centralized timer management via TimerManager API
  * - Atomic state machine for init/shutdown/pause/resume
  * - RW spinlock-protected configuration for DISPATCH_LEVEL safety
  *
@@ -43,6 +43,8 @@
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
 #include "../Sync/SpinLock.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 #include <ntstrsafe.h>
 
 //
@@ -97,25 +99,15 @@ TepEnableCallback(
     );
 
 static VOID
-TepFlushDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    );
-
-static VOID
-TepFlushWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
+TepFlushTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     );
 
 static VOID
-TepHeartbeatDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+TepHeartbeatTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static NTSTATUS
@@ -340,10 +332,8 @@ TeInitialize(
     )
 {
     NTSTATUS status = STATUS_SUCCESS;
-    LARGE_INTEGER dueTime;
     BOOLEAN lookasideInitialized = FALSE;
     BOOLEAN etwRegistered = FALSE;
-    BOOLEAN workItemAllocated = FALSE;
 
     PAGED_CODE();
 
@@ -459,25 +449,6 @@ TeInitialize(
     etwRegistered = TRUE;
 
     //
-    // Allocate flush work item
-    //
-    g_TeProvider.FlushWorkItem = IoAllocateWorkItem(DeviceObject);
-    if (g_TeProvider.FlushWorkItem == NULL) {
-        status = STATUS_INSUFFICIENT_RESOURCES;
-        goto Cleanup;
-    }
-    workItemAllocated = TRUE;
-
-    //
-    // Initialize timers and DPCs
-    //
-    KeInitializeTimer(&g_TeProvider.FlushTimer);
-    KeInitializeDpc(&g_TeProvider.FlushDpc, TepFlushDpcRoutine, &g_TeProvider);
-
-    KeInitializeTimer(&g_TeProvider.HeartbeatTimer);
-    KeInitializeDpc(&g_TeProvider.HeartbeatDpc, TepHeartbeatDpcRoutine, &g_TeProvider);
-
-    //
     // Record start time
     //
     {
@@ -491,28 +462,48 @@ TeInitialize(
     }
 
     //
-    // Start flush timer
+    // Create flush and heartbeat timers via TimerManager.
+    // TmFlag_WorkItemCallback ensures callbacks run at PASSIVE_LEVEL.
     //
-    dueTime.QuadPart = -((LONGLONG)g_TeProvider.Config.MaxBatchAgeMs * 10000);
-    KeSetTimerEx(
-        &g_TeProvider.FlushTimer,
-        dueTime,
-        g_TeProvider.Config.MaxBatchAgeMs,
-        &g_TeProvider.FlushDpc
-    );
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
 
-    //
-    // Start heartbeat timer
-    //
-    if (g_TeProvider.Config.HeartbeatIntervalMs > 0) {
-        dueTime.QuadPart = -((LONGLONG)g_TeProvider.Config.HeartbeatIntervalMs * 10000);
-        KeSetTimerEx(
-            &g_TeProvider.HeartbeatTimer,
-            dueTime,
-            g_TeProvider.Config.HeartbeatIntervalMs,
-            &g_TeProvider.HeartbeatDpc
-        );
-        InterlockedExchange(&g_TeProvider.HeartbeatRunning, 1);
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 1000;
+
+            status = TmCreatePeriodic(
+                tmMgr,
+                g_TeProvider.Config.MaxBatchAgeMs,
+                TepFlushTimerCallback,
+                &g_TeProvider,
+                &opts,
+                &g_TeProvider.FlushTimerId
+            );
+            if (!NT_SUCCESS(status)) {
+                goto Cleanup;
+            }
+        }
+
+        if (tmMgr && g_TeProvider.Config.HeartbeatIntervalMs > 0) {
+            TM_TIMER_OPTIONS opts2 = { 0 };
+            opts2.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts2.ToleranceMs = 5000;
+
+            status = TmCreatePeriodic(
+                tmMgr,
+                g_TeProvider.Config.HeartbeatIntervalMs,
+                TepHeartbeatTimerCallback,
+                &g_TeProvider,
+                &opts2,
+                &g_TeProvider.HeartbeatTimerId
+            );
+            if (!NT_SUCCESS(status)) {
+                goto Cleanup;
+            }
+            InterlockedExchange(&g_TeProvider.HeartbeatRunning, 1);
+        }
     }
 
     //
@@ -534,11 +525,6 @@ Cleanup:
     if (etwRegistered) {
         EtwUnregister(g_TeProvider.RegistrationHandle);
         g_TeProvider.RegistrationHandle = 0;
-    }
-
-    if (workItemAllocated) {
-        IoFreeWorkItem(g_TeProvider.FlushWorkItem);
-        g_TeProvider.FlushWorkItem = NULL;
     }
 
     if (lookasideInitialized) {
@@ -585,17 +571,16 @@ TeShutdown(
     );
 
     //
-    // Cancel timers
+    // Cancel timers via TimerManager (Wait=TRUE ensures callbacks complete)
     //
-    KeCancelTimer(&g_TeProvider.FlushTimer);
-    KeCancelTimer(&g_TeProvider.HeartbeatTimer);
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, g_TeProvider.FlushTimerId, TRUE);
+            TmCancel(tmMgr, g_TeProvider.HeartbeatTimerId, TRUE);
+        }
+    }
     InterlockedExchange(&g_TeProvider.HeartbeatRunning, 0);
-
-    //
-    // CRITICAL: Wait for any queued DPCs to complete before freeing resources.
-    // Without this, a DPC could fire and access freed work items/state.
-    //
-    KeFlushQueuedDpcs();
 
     //
     // Flush remaining events (synchronous write, updates timestamp)
@@ -614,14 +599,6 @@ TeShutdown(
         FALSE,
         &timeout
     );
-
-    //
-    // Free work item (safe now — DPCs are drained)
-    //
-    if (g_TeProvider.FlushWorkItem != NULL) {
-        IoFreeWorkItem(g_TeProvider.FlushWorkItem);
-        g_TeProvider.FlushWorkItem = NULL;
-    }
 
     //
     // Unregister ETW provider
@@ -793,31 +770,36 @@ TeGetConfig(
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 TePause(
     VOID
     )
 {
+    PAGED_CODE();
+
     if (InterlockedCompareExchange(
             &g_TeProvider.State,
             (LONG)TeState_Paused,
             (LONG)TeState_Running) == (LONG)TeState_Running) {
         //
-        // Cancel heartbeat timer to avoid wasted DPC firings while paused.
+        // Cancel heartbeat timer to avoid wasted firings while paused.
         //
-        KeCancelTimer(&g_TeProvider.HeartbeatTimer);
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, g_TeProvider.HeartbeatTimerId, TRUE);
+        }
         InterlockedExchange(&g_TeProvider.HeartbeatRunning, 0);
     }
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 TeResume(
     VOID
     )
 {
-    LARGE_INTEGER dueTime;
+    PAGED_CODE();
 
     if (InterlockedCompareExchange(
             &g_TeProvider.State,
@@ -828,13 +810,22 @@ TeResume(
         //
         if (g_TeProvider.Config.HeartbeatIntervalMs > 0 &&
             InterlockedCompareExchange(&g_TeProvider.HeartbeatRunning, 1, 0) == 0) {
-            dueTime.QuadPart = -((LONGLONG)g_TeProvider.Config.HeartbeatIntervalMs * 10000);
-            KeSetTimerEx(
-                &g_TeProvider.HeartbeatTimer,
-                dueTime,
-                g_TeProvider.Config.HeartbeatIntervalMs,
-                &g_TeProvider.HeartbeatDpc
-            );
+
+            PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+            if (tmMgr) {
+                TM_TIMER_OPTIONS opts = { 0 };
+                opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+                opts.ToleranceMs = 5000;
+
+                TmCreatePeriodic(
+                    tmMgr,
+                    g_TeProvider.Config.HeartbeatIntervalMs,
+                    TepHeartbeatTimerCallback,
+                    &g_TeProvider,
+                    &opts,
+                    &g_TeProvider.HeartbeatTimerId
+                );
+            }
         }
     }
 }
@@ -1166,66 +1157,44 @@ TepReleaseReference(
 }
 
 // ============================================================================
-// TIMER AND WORK ITEM ROUTINES
+// TIMER CALLBACKS (TimerManager)
 // ============================================================================
 
 static VOID
-TepFlushDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    )
-{
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(DeferredContext);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    if (g_TeProvider.FlushWorkItem != NULL &&
-        g_TeProvider.State == (LONG)TeState_Running &&
-        InterlockedCompareExchange(&g_TeProvider.FlushPending, 1, 0) == 0) {
-
-        IoQueueWorkItem(
-            g_TeProvider.FlushWorkItem,
-            TepFlushWorkItemRoutine,
-            DelayedWorkQueue,
-            NULL
-        );
-    }
-}
-
-static VOID
-TepFlushWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
+TepFlushTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     )
 {
-    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(TimerId);
     UNREFERENCED_PARAMETER(Context);
 
-    TeFlush();
-    InterlockedExchange(&g_TeProvider.FlushPending, 0);
-    {
-        LARGE_INTEGER flushTime;
-        KeQuerySystemTime(&flushTime);
-        InterlockedExchange64(&g_TeProvider.Stats.LastFlushTime, flushTime.QuadPart);
+    //
+    // TmFlag_WorkItemCallback runs at PASSIVE_LEVEL, so we can
+    // call the flush logic directly without IoQueueWorkItem.
+    //
+    if (g_TeProvider.State == (LONG)TeState_Running &&
+        InterlockedCompareExchange(&g_TeProvider.FlushPending, 1, 0) == 0) {
+
+        TeFlush();
+        InterlockedExchange(&g_TeProvider.FlushPending, 0);
+        {
+            LARGE_INTEGER flushTime;
+            KeQuerySystemTime(&flushTime);
+            InterlockedExchange64(&g_TeProvider.Stats.LastFlushTime, flushTime.QuadPart);
+        }
+        InterlockedIncrement64(&g_TeProvider.Stats.BatchFlushes);
     }
-    InterlockedIncrement64(&g_TeProvider.Stats.BatchFlushes);
 }
 
 static VOID
-TepHeartbeatDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+TepHeartbeatTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(DeferredContext);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
+    UNREFERENCED_PARAMETER(Context);
 
     if (g_TeProvider.State == (LONG)TeState_Running) {
         TeLogOperational(

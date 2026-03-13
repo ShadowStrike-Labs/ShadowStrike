@@ -47,7 +47,7 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
+#include <fltKernel.h>
 
 //=============================================================================
 // Pool Tags & Limits
