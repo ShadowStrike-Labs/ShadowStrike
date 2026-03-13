@@ -33,6 +33,8 @@
 
 #include "AntiDebug.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 #include <ntifs.h>
 #include <ntstrsafe.h>
 #include <intrin.h>
@@ -85,11 +87,9 @@ typedef struct _ADB_EVENT {
 // FORWARD DECLARATIONS
 // ============================================================================
 
-static VOID AdbpTimerDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+static VOID AdbpCheckTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static VOID AdbpPeriodicCheckThread(
@@ -160,9 +160,7 @@ AdbInitialize(
     InitializeListHead(&Ctx->EventList);
     KeInitializeEvent(&Ctx->CheckWakeEvent, SynchronizationEvent, FALSE);
 
-    // Initialize timer and DPC
-    KeInitializeTimer(&Ctx->CheckTimer);
-    KeInitializeDpc(&Ctx->CheckDpc, AdbpTimerDpcRoutine, Ctx);
+    // CheckTimerId initialized to 0 (TM_INVALID_TIMER_ID) by ExAllocatePool2
 
     // Run initial detection synchronously
     InterlockedExchange(&Ctx->KernelDebuggerPresent,
@@ -247,13 +245,20 @@ AdbInitialize(
         return Status;
     }
 
-    // Start periodic timer
-    InterlockedExchange(&Ctx->TimerActive, 1);
+    // Start periodic timer via TimerManager
     {
-        LARGE_INTEGER DueTime;
-        DueTime.QuadPart = -(LONGLONG)ADB_CHECK_INTERVAL_SEC * 10000000LL;
-        KeSetTimerEx(&Ctx->CheckTimer, DueTime,
-                     ADB_CHECK_INTERVAL_SEC * 1000, &Ctx->CheckDpc);
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 5000;
+            Status = TmCreatePeriodic(tmMgr, ADB_CHECK_INTERVAL_SEC * 1000,
+                                      AdbpCheckTimerCallback, Ctx,
+                                      &opts, &Ctx->CheckTimerId);
+            if (NT_SUCCESS(Status)) {
+                InterlockedExchange(&Ctx->TimerActive, 1);
+            }
+        }
     }
 
     // Mark initialized last — after all fields are set
@@ -287,15 +292,15 @@ AdbShutdown(
     // Signal shutdown to the periodic worker
     InterlockedExchange(&Protector->ShutdownRequested, 1);
 
-    // Cancel the periodic timer
+    // Cancel the periodic timer via TimerManager
     InterlockedExchange(&Protector->TimerActive, 0);
-    KeCancelTimer(&Protector->CheckTimer);
-
-    //
-    // KeFlushQueuedDpcs ensures the DPC has finished executing.
-    // After this, no new wake events will be signaled by DPCs.
-    //
-    KeFlushQueuedDpcs();
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && Protector->CheckTimerId != TM_INVALID_TIMER_ID) {
+            TmCancel(tmMgr, Protector->CheckTimerId, TRUE);
+            Protector->CheckTimerId = TM_INVALID_TIMER_ID;
+        }
+    }
 
     //
     // Wake the check thread and wait for it to exit.
@@ -971,32 +976,22 @@ AdbpDetectCrashDumpConfig(VOID)
 }
 
 // ============================================================================
-// TIMER DPC — signals the system thread to wake, does NO event processing
+// TIMER CALLBACK — signals the system thread to wake, does NO event processing
 // ============================================================================
 
 static VOID
-AdbpTimerDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+AdbpCheckTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PADB_PROTECTOR Protector = (PADB_PROTECTOR)DeferredContext;
+    PADB_PROTECTOR Protector = (PADB_PROTECTOR)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
-    if (Protector == NULL) {
-        return;
+    if (Protector && !Protector->ShutdownRequested) {
+        KeSetEvent(&Protector->CheckWakeEvent, IO_NO_INCREMENT, FALSE);
     }
-
-    if (Protector->ShutdownRequested || !Protector->TimerActive) {
-        return;
-    }
-
-    KeSetEvent(&Protector->CheckWakeEvent, IO_NO_INCREMENT, FALSE);
 }
 
 // ============================================================================

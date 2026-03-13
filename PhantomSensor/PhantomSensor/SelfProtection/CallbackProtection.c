@@ -32,8 +32,8 @@
       deadlock).
     - EX_RUNDOWN_REF on all public APIs. CpShutdown waits for rundown
       completion before tearing down.
-    - Timer DPC does ZERO lock acquisition — it only queues a work item.
-      All verification runs at PASSIVE_LEVEL on the work item thread.
+    - Timer callback (via TimerManager) only signals the system thread.
+      All verification runs at PASSIVE_LEVEL on the dedicated thread.
     - Tamper notification callback invoked only at PASSIVE_LEVEL.
 
     Safety Guarantees:
@@ -54,6 +54,8 @@
 
 #include "CallbackProtection.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 #pragma warning(push)
 #pragma warning(disable:4324)
@@ -219,10 +221,9 @@ struct _CP_PROTECTOR {
     PVOID TamperContext;
 
     //
-    // Periodic verification via timer → DPC → system thread
+    // Periodic verification via TimerManager → system thread
     //
-    KTIMER VerifyTimer;
-    KDPC VerifyDpc;
+    ULONG VerifyTimerId;
     ULONG VerifyIntervalMs;
     volatile LONG TimerActive;
     volatile LONG PeriodicEnabled;
@@ -377,23 +378,15 @@ CppNotifyTamper(
     _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-CppVerifyTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+CppVerifyTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static VOID
 CppVerifyWorkerThread(
     _In_ PVOID Context
-    );
-
-static VOID
-CppArmTimer(
-    _In_ PCP_PROTECTOR Protector
     );
 
 // ============================================================================
@@ -739,18 +732,32 @@ CpInitialize(
     );
     prot->LookasideInitialized = TRUE;
 
-    KeInitializeTimer(&prot->VerifyTimer);
-    KeInitializeDpc(&prot->VerifyDpc, CppVerifyTimerDpc, prot);
     KeInitializeEvent(&prot->VerifyWakeEvent, SynchronizationEvent, FALSE);
 
     prot->VerifyIntervalMs = CP_DEFAULT_VERIFY_INTERVAL_MS;
+
+    //
+    // Create periodic timer via TimerManager. The callback signals
+    // the system thread which performs SHA-256 verification at PASSIVE_LEVEL.
+    //
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 1000;
+            TmCreatePeriodic(tmMgr, prot->VerifyIntervalMs,
+                             CppVerifyTimerCallback, prot,
+                             &opts, &prot->VerifyTimerId);
+        }
+    }
     prot->EnableRestoration = TRUE;
 
     //
     // Create system thread for PASSIVE_LEVEL verification.
     // Minifilters don't create device objects, so IoAllocateWorkItem
     // cannot be used. A dedicated system thread waits on VerifyWakeEvent
-    // and performs SHA-256 integrity checks when signaled by the DPC.
+    // and performs SHA-256 integrity checks when signaled by the timer callback.
     //
     {
         HANDLE threadHandle = NULL;
@@ -808,16 +815,15 @@ CpShutdown(
     InterlockedExchange(&Protector->Initialized, FALSE);
 
     //
-    // Cancel timer. After KeCancelTimer, no new DPCs fire.
+    // Cancel timer via TimerManager. Wait=TRUE ensures the callback
+    // has fully returned before we proceed with thread shutdown.
     //
     if (InterlockedExchange(&Protector->TimerActive, FALSE)) {
-        KeCancelTimer(&Protector->VerifyTimer);
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Protector->VerifyTimerId, TRUE);
+        }
     }
-
-    //
-    // Flush all queued DPCs so CppVerifyTimerDpc has fully returned.
-    //
-    KeFlushQueuedDpcs();
 
     //
     // Signal the verification thread to terminate and wait for it.
@@ -1116,13 +1122,30 @@ CpEnablePeriodicVerify(
     // Cancel existing timer if active.
     //
     if (InterlockedExchange(&Protector->TimerActive, FALSE)) {
-        KeCancelTimer(&Protector->VerifyTimer);
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Protector->VerifyTimerId, TRUE);
+        }
     }
 
     Protector->VerifyIntervalMs = IntervalMs;
     InterlockedExchange(&Protector->PeriodicEnabled, TRUE);
 
-    CppArmTimer(Protector);
+    //
+    // Create new periodic timer with the updated interval.
+    //
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 1000;
+            TmCreatePeriodic(tmMgr, Protector->VerifyIntervalMs,
+                             CppVerifyTimerCallback, Protector,
+                             &opts, &Protector->VerifyTimerId);
+            InterlockedExchange(&Protector->TimerActive, TRUE);
+        }
+    }
 
     ExReleaseRundownProtection(&Protector->RundownRef);
     return STATUS_SUCCESS;
@@ -1147,7 +1170,10 @@ CpDisablePeriodicVerify(
     InterlockedExchange(&Protector->PeriodicEnabled, FALSE);
 
     if (InterlockedExchange(&Protector->TimerActive, FALSE)) {
-        KeCancelTimer(&Protector->VerifyTimer);
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Protector->VerifyTimerId, TRUE);
+        }
     }
 
     ExReleaseRundownProtection(&Protector->RundownRef);
@@ -1463,51 +1489,24 @@ CppNotifyTamper(
 }
 
 // ============================================================================
-// PRIVATE — TIMER / DPC / WORK ITEM
+// PRIVATE — TIMER CALLBACK / WORKER THREAD
 // ============================================================================
 
-static VOID
-CppArmTimer(
-    _In_ PCP_PROTECTOR Protector
-    )
-{
-    LARGE_INTEGER dueTime;
-
-    if (Protector->VerifyIntervalMs == 0) {
-        return;
-    }
-
-    dueTime.QuadPart = -((LONGLONG)Protector->VerifyIntervalMs * 10000);
-
-    KeSetTimerEx(
-        &Protector->VerifyTimer,
-        dueTime,
-        Protector->VerifyIntervalMs,
-        &Protector->VerifyDpc
-    );
-
-    InterlockedExchange(&Protector->TimerActive, TRUE);
-}
-
 /**
- * Timer DPC — runs at DISPATCH_LEVEL.
- * Does ZERO lock acquisition. Only queues a work item for PASSIVE_LEVEL
- * verification. InterlockedCompareExchange prevents stacking.
+ * TimerManager callback — signals the system thread to perform
+ * PASSIVE_LEVEL verification. TmFlag_WorkItemCallback ensures this
+ * runs at PASSIVE_LEVEL via work item, but we keep it lightweight
+ * and delegate the real work to the dedicated thread.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-CppVerifyTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+CppVerifyTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PCP_PROTECTOR prot = (PCP_PROTECTOR)DeferredContext;
+    PCP_PROTECTOR prot = (PCP_PROTECTOR)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (prot == NULL || !prot->Initialized || !prot->PeriodicEnabled) {
         return;
@@ -1523,7 +1522,7 @@ CppVerifyTimerDpc(
 
 /**
  * System thread — runs at PASSIVE_LEVEL. Waits on VerifyWakeEvent,
- * performs SHA-256 verification when signaled by the timer DPC.
+ * performs SHA-256 verification when signaled by the timer callback.
  * Terminates cleanly when TerminateThread is set.
  */
 static VOID
