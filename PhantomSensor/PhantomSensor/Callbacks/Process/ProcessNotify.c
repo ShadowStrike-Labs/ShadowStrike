@@ -3396,6 +3396,13 @@ PnpHandleProcessTermination(
     TnNotifyProcessTermination(ProcessId);
 
     //
+    // Notify WSLMonitor to remove the WSL tracking entry for this process.
+    // Without this, every WSL process leaks its NonPagedPool tracking
+    // structure and consumes a slot toward the 512 capacity limit.
+    //
+    WslMonProcessTerminated(ProcessId);
+
+    //
     // Notify TokenAnalyzer to clean up baseline + cached token entries
     // for this process. Prevents unbounded memory growth.
     //

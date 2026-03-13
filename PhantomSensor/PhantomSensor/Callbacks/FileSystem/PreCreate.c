@@ -76,6 +76,7 @@ Performance Characteristics:
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Transactions/KtmMonitor.h"
+#include "../Process/WSLMonitor.h"
 
 //
 // Forward declarations for cross-module APIs defined in FileSystemCallbacks.c
@@ -903,6 +904,19 @@ Return Value:
     // ========================================================================
     // PHASE 7: THREAT DETECTION ANALYSIS
     // ========================================================================
+
+    //
+    // WSL/Container escape file access monitoring (MITRE T1611, T1003).
+    // Detect WSL processes accessing host credential files, driver
+    // directories, and System32 — indicators of container-to-host breakout.
+    // BehaviorEngine events are submitted inside WslMonCheckFileAccess.
+    //
+    {
+        WSL_ESCAPE_TYPE wslEscape = WslMonCheckFileAccess(RequestorPid, &NameInfo->Name);
+        if (wslEscape != WslEscape_None) {
+            ThreatScore += (wslEscape == WslEscape_CredentialAccess) ? 85 : 60;
+        }
+    }
 
     //
     // Classify access type
