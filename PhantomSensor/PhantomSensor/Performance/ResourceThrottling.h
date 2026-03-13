@@ -27,7 +27,7 @@
  * - Multi-dimensional resource tracking (CPU, Memory, I/O, Network, Callbacks)
  * - Adaptive throttling with configurable soft/hard limits
  * - Per-process and global resource quotas with per-process limit enforcement
- * - Real-time usage monitoring with DPC-based sampling
+ * - Real-time usage monitoring via TimerManager callbacks
  * - Exponential backoff for sustained overload conditions
  * - Priority-based operation scheduling during throttling
  * - Work queue management for deferred operations
@@ -45,7 +45,7 @@
  * Performance:
  * - Lock-free Interlocked* counters for hot-path usage reporting
  * - Tiered throttling to minimize impact on normal operations
- * - Lazy evaluation of expensive metrics (rate calc only in DPC)
+ * - Lazy evaluation of expensive metrics (rate calc only in timer callback)
  *
  * Memory Budget:
  * - RT_THROTTLER is allocated from NonPagedPoolNx (~25KB base)
@@ -345,7 +345,7 @@ typedef struct _RT_STATISTICS {
 /**
  * @brief Callback type for throttle notifications.
  *
- * Called at DISPATCH_LEVEL from DPC context.
+ * Called at PASSIVE_LEVEL from TimerManager work-item context.
  */
 typedef VOID (*PRT_THROTTLE_CALLBACK)(
     _In_ PRT_THROTTLE_EVENT Event,
@@ -398,14 +398,12 @@ typedef struct _RT_THROTTLER {
         KSPIN_LOCK Lock;
         volatile LONG Depth;
         LONG MaxDepth;
-        KTIMER ProcessTimer;
-        KDPC ProcessDpc;
+        ULONG ProcessTimerId;
         BOOLEAN ProcessingEnabled;
     } DeferredWork;
 
-    /// Monitoring timer and DPC
-    KTIMER MonitorTimer;
-    KDPC MonitorDpc;
+    /// Monitoring timer (managed by TimerManager)
+    ULONG MonitorTimerId;
     ULONG MonitorIntervalMs;
 
     /// System worker thread for PASSIVE_LEVEL deferred work
