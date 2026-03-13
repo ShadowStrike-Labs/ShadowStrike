@@ -898,6 +898,15 @@ Cleanup:
         ExFreePoolWithTag(Tracker->HashBuckets, HT_POOL_TAG);
     }
 
+    // Cancel timer if it was created before failure
+    if (Tracker->CleanupTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Tracker->CleanupTimerId, TRUE);
+        }
+        Tracker->CleanupTimerId = 0;
+    }
+
     ExFreePoolWithTag(Tracker, HT_POOL_TAG);
     return Status;
 }
