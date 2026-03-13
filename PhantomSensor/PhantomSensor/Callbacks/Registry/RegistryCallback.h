@@ -838,7 +838,7 @@ ShadowStrikeRegRemoveMonitoredKey(
  *
  * @irql <= DISPATCH_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowStrikeRegIsKeyMonitored(
     _In_ PCUNICODE_STRING KeyPath

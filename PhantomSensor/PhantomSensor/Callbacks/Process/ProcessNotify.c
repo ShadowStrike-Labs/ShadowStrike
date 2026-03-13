@@ -92,6 +92,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "HandleTracker.h"
 #include "ImageNotify.h"
 #include "PrivilegeMonitor.h"
+#include "../Registry/RegistryCallback.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -3401,6 +3402,13 @@ PnpHandleProcessTermination(
     // structure and consumes a slot toward the 512 capacity limit.
     //
     WslMonProcessTerminated(ProcessId);
+
+    //
+    // Notify RegistryCallback to clean up per-process registry context.
+    // Without this, the EPROCESS reference and NonPagedPool tracking
+    // entry leak for every process that performed registry operations.
+    //
+    ShadowStrikeRegistryProcessTerminated(ProcessId);
 
     //
     // Notify TokenAnalyzer to clean up baseline + cached token entries
