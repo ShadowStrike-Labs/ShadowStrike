@@ -1097,6 +1097,87 @@ ShadowAlpcRemovePort(
     }
 }
 
+/**
+ * @brief Clean up ALPC port entries owned by a terminated process.
+ *
+ * FIX (ALPC-B): Without this, port entries for terminated processes remain in
+ * the hash table with stale OwnerProcessId until TTL expiry (5 minutes).
+ * During that window, PID reuse can cause a new process to inherit the old
+ * security context (session ID, integrity level), breaking cross-session
+ * and low-to-high integrity detection.
+ *
+ * Called from PnpHandleProcessTermination in ProcessNotify.c.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+VOID
+ShadowAlpcProcessTerminated(
+    _In_ HANDLE ProcessId
+    )
+{
+    PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcPortMonitorState;
+    PLIST_ENTRY listEntry;
+    PLIST_ENTRY nextEntry;
+    PSHADOW_ALPC_PORT_ENTRY portEntry;
+    LIST_ENTRY entriesToRemove;
+    ULONG i;
+    ULONG removedCount = 0;
+
+    if (!state->Initialized || state->ShuttingDown) {
+        return;
+    }
+
+    InitializeListHead(&entriesToRemove);
+
+    //
+    // Scan all hash buckets for ports owned by the terminated process.
+    // Lock hierarchy: hash bucket → global list (same as cleanup path).
+    //
+    for (i = 0; i < SHADOW_ALPC_HASH_BUCKETS; i++) {
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&state->HashBuckets[i].Lock);
+
+        for (listEntry = state->HashBuckets[i].PortList.Flink;
+             listEntry != &state->HashBuckets[i].PortList;
+             listEntry = nextEntry) {
+
+            nextEntry = listEntry->Flink;
+            portEntry = CONTAINING_RECORD(listEntry, SHADOW_ALPC_PORT_ENTRY, HashEntry);
+
+            if (portEntry->OwnerProcessId == ProcessId) {
+                InterlockedExchange(&portEntry->RemovedFromList, TRUE);
+                RemoveEntryList(&portEntry->HashEntry);
+                InterlockedDecrement(&state->HashBuckets[i].Count);
+                InsertTailList(&entriesToRemove, &portEntry->HashEntry);
+            }
+        }
+
+        ExReleasePushLockExclusive(&state->HashBuckets[i].Lock);
+        KeLeaveCriticalRegion();
+    }
+
+    //
+    // Remove from global list and release outside hash bucket locks.
+    //
+    while (!IsListEmpty(&entriesToRemove)) {
+        listEntry = RemoveHeadList(&entriesToRemove);
+        portEntry = CONTAINING_RECORD(listEntry, SHADOW_ALPC_PORT_ENTRY, HashEntry);
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&state->PortListLock);
+        RemoveEntryList(&portEntry->GlobalEntry);
+        InterlockedDecrement(&state->PortCount);
+        ExReleasePushLockExclusive(&state->PortListLock);
+        KeLeaveCriticalRegion();
+
+        ShadowAlpcReleasePortEntry(portEntry);
+        removedCount++;
+    }
+
+    if (removedCount > 0) {
+        InterlockedAdd64(&state->Stats.PortsClosed, removedCount);
+    }
+}
+
 // ============================================================================
 // CONNECTION TRACKING
 // ============================================================================
@@ -1264,44 +1345,70 @@ ShadowAlpcAnalyzeOperation(
     }
 
     //
-    // Check cross-session access
+    // CRITICAL FIX (ALPC-C): Cross-session and integrity checks require
+    // valid target context. When PortEntry is NULL (port not yet cached),
+    // TargetSessionId/TargetIntegrityLevel are zero from RtlZeroMemory.
+    // Without this guard, every non-session-0 process triggers false
+    // positive cross-session alerts, and integrity checks never fire.
     //
-    if (Context->SourceSessionId != Context->TargetSessionId) {
-        Context->SuspicionFlags |= AlpcSuspicionCrossSession;
-        score += 20;
-        InterlockedIncrement64(&state->Stats.CrossSessionConnections);
-    }
-
-    //
-    // Check integrity level violation (using RID values for comparison)
-    //
-    if (Context->SourceIntegrityLevel < Context->TargetIntegrityLevel) {
-        Context->SuspicionFlags |= AlpcSuspicionLowToHigh;
-        score += 35;
-        InterlockedIncrement64(&state->Stats.LowToHighConnections);
+    if (Context->PortEntry != NULL) {
 
         //
-        // Potential sandbox escape
+        // Check cross-session access (ALPC-D: submit to BehaviorEngine)
         //
-        if (Context->SourceIntegrityLevel <= SECURITY_MANDATORY_LOW_RID) {
-            Context->SuspicionFlags |= AlpcSuspicionSandboxEscape;
-            score += 40;
-            InterlockedIncrement64(&state->Stats.SandboxEscapeAttempts);
+        if (Context->SourceSessionId != Context->TargetSessionId) {
+            Context->SuspicionFlags |= AlpcSuspicionCrossSession;
+            score += 20;
+            InterlockedIncrement64(&state->Stats.CrossSessionConnections);
 
             //
-            // Submit sandbox escape event to BehaviorEngine.
+            // FIX (ALPC-D): Cross-session ALPC is a lateral movement indicator
+            // (MITRE T1021). Submit to BehaviorEngine for correlation — previously
+            // only sandbox escape reached the engine.
             //
             (VOID)BeEngineSubmitEvent(
-                BehaviorEvent_SandboxEvasion,
-                BehaviorCategory_DefenseEvasion,
+                BEHAVIOR_EVENT_ALPC_CROSS_SESSION,
+                BehaviorCategory_LateralMovement,
                 HandleToULong(Context->SourceProcessId),
                 NULL, 0,
-                80,
+                50,
                 FALSE,
                 NULL
                 );
         }
-    }
+
+        //
+        // Check integrity level violation (using RID values for comparison)
+        //
+        if (Context->SourceIntegrityLevel < Context->TargetIntegrityLevel) {
+            Context->SuspicionFlags |= AlpcSuspicionLowToHigh;
+            score += 35;
+            InterlockedIncrement64(&state->Stats.LowToHighConnections);
+
+            //
+            // Potential sandbox escape
+            //
+            if (Context->SourceIntegrityLevel <= SECURITY_MANDATORY_LOW_RID) {
+                Context->SuspicionFlags |= AlpcSuspicionSandboxEscape;
+                score += 40;
+                InterlockedIncrement64(&state->Stats.SandboxEscapeAttempts);
+
+                //
+                // Submit sandbox escape event to BehaviorEngine.
+                //
+                (VOID)BeEngineSubmitEvent(
+                    BehaviorEvent_SandboxEvasion,
+                    BehaviorCategory_DefenseEvasion,
+                    HandleToULong(Context->SourceProcessId),
+                    NULL, 0,
+                    80,
+                    FALSE,
+                    NULL
+                    );
+            }
+        }
+
+    } // end PortEntry != NULL guard
 
     //
     // Check rate limiting (only if we have a port entry)
@@ -1815,6 +1922,21 @@ ShadowAlpcPortPreCallback(
         case AlpcVerdictMonitor:
             if (context.ThreatScore >= state->Config.ThreatThreshold) {
                 ShadowAlpcQueueEvent(AlpcEventSuspiciousAccess, &context, FALSE);
+
+                //
+                // FIX (ALPC-D): Submit high-threat monitor events to BehaviorEngine.
+                // Previously only Block/Strip verdicts reached the engine — monitor-
+                // only mode was invisible to behavioral correlation.
+                //
+                (VOID)BeEngineSubmitEvent(
+                    BEHAVIOR_EVENT_ALPC_SUSPICIOUS,
+                    BehaviorCategory_LateralMovement,
+                    HandleToULong(context.SourceProcessId),
+                    NULL, 0,
+                    context.ThreatScore,
+                    FALSE,
+                    NULL
+                    );
             }
             break;
 
@@ -1858,11 +1980,44 @@ ShadowAlpcPortPostCallback(
     }
 
     //
-    // Track post-op statistics for completed operations.
+    // CRITICAL FIX (ALPC-A): Populate port tracking cache on successful
+    // handle CREATE. Without this, the hash table is permanently empty and
+    // PreCallback's ShadowAlpcFindPort never finds entries — making
+    // cross-session, integrity, and rate-limit analysis impossible.
+    //
+    // The first handle create for any ALPC port object is typically from
+    // the port's creator (server). Subsequent creates are from connectors.
+    // We track on first sight so future PreCallbacks have target context.
     //
     if (NT_SUCCESS(OperationInformation->ReturnStatus)) {
         if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
-            InterlockedIncrement64(&state->Stats.PortsCreated);
+            PSHADOW_ALPC_PORT_ENTRY portEntry = NULL;
+            NTSTATUS findStatus = ShadowAlpcFindPort(
+                OperationInformation->Object, &portEntry);
+
+            if (NT_SUCCESS(findStatus)) {
+                //
+                // Already tracked — release reference.
+                //
+                ShadowAlpcReleasePortEntry(portEntry);
+            } else {
+                //
+                // First observation of this port object — create tracking entry.
+                // OwnerPid = current process (correct for server-side port creation,
+                // approximate for client connections — updated on next access).
+                //
+                NTSTATUS trackStatus = ShadowAlpcTrackPort(
+                    OperationInformation->Object,
+                    PsGetCurrentProcessId(),
+                    AlpcPortTypeUnknown,
+                    NULL,
+                    &portEntry
+                );
+                if (NT_SUCCESS(trackStatus) && portEntry != NULL) {
+                    ShadowAlpcReleasePortEntry(portEntry);
+                    InterlockedIncrement64(&state->Stats.PortsCreated);
+                }
+            }
         } else if (OperationInformation->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
             InterlockedIncrement64(&state->Stats.ConnectionsEstablished);
         }
