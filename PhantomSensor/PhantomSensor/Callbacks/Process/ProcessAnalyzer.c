@@ -489,6 +489,14 @@ PaGetEnvironmentMonitor(
     return g_EnvironmentMonitor;
 }
 
+PHT_TRACKER
+PaGetHandleTracker(
+    VOID
+    )
+{
+    return g_HandleTracker;
+}
+
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
