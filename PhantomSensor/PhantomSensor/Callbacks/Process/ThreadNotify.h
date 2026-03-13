@@ -519,9 +519,9 @@ TnGetProcessContext(
  *
  * @param Context   Context to dereference.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql PASSIVE_LEVEL (destruction path requires PASSIVE)
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 TnReleaseProcessContext(
     _In_ PTN_PROCESS_CONTEXT Context
@@ -630,6 +630,22 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 PCWSTR
 TnGetIndicatorName(
     _In_ TN_INJECTION_INDICATOR Indicator
+    );
+
+/**
+ * @brief Get the registered thread notify callback function pointer.
+ *
+ * Used by callback protection (CpProtectCallback) to protect the
+ * thread notification callback from tampering.
+ *
+ * @return Pointer to the internal thread notify callback function,
+ *         or NULL if not registered.
+ *
+ * @irql Any
+ */
+PVOID
+TnGetNotifyCallbackPointer(
+    VOID
     );
 
 #ifdef __cplusplus
