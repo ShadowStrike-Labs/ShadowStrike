@@ -47,6 +47,8 @@
 #include <initguid.h>
 #include "ETWConsumer.h"
 #include "TelemetryEvents.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 // ============================================================================
 // PRAGMA DIRECTIVES
@@ -83,12 +85,6 @@
 #define EC_MAX_CONSECUTIVE_ERRORS   10
 #define EC_THREAD_WAIT_TIMEOUT_MS   1000
 
-/**
- * @brief Health check timer period in 100-nanosecond units (negative = relative).
- *        EC_HEALTH_CHECK_INTERVAL_SEC seconds.
- */
-#define EC_HEALTH_TIMER_PERIOD_100NS  (-(LONGLONG)EC_HEALTH_CHECK_INTERVAL_SEC * 10LL * 1000 * 1000)
-
 // ============================================================================
 // INTERNAL HELPER FUNCTIONS - FORWARD DECLARATIONS
 // ============================================================================
@@ -109,7 +105,7 @@ static VOID EcpMarkSubscriptionUnregistered(_Inout_ PEC_SUBSCRIPTION Subscriptio
 static VOID EcpUpdateSubscriptionState(_Inout_ PEC_SUBSCRIPTION Subscription, _In_ EC_SUBSCRIPTION_STATE NewState);
 static BOOLEAN EcpCheckRateLimit(_Inout_ PEC_CONSUMER Consumer);
 static VOID EcpUpdateFlowControl(_Inout_ PEC_CONSUMER Consumer);
-static VOID EcpHealthCheckDpcRoutine(_In_ PKDPC Dpc, _In_opt_ PVOID Context, _In_opt_ PVOID Arg1, _In_opt_ PVOID Arg2);
+static VOID EcpHealthCheckTimerCallback(_In_ ULONG TimerId, _In_opt_ PVOID Context);
 static EC_EVENT_SOURCE EcpDetermineEventSource(_In_ LPCGUID ProviderId);
 static VOID EcpFreeExtendedData(_In_ PEC_CONSUMER Consumer, _Inout_ PEC_EVENT_RECORD Record);
 static VOID EcpReferenceSubscription(_Inout_ PEC_SUBSCRIPTION Subscription);
@@ -310,11 +306,9 @@ EcInitialize(
     EcpInitializeLookasideLists(NewConsumer);
 
     //
-    // Initialize health check timer and DPC (proper KTIMER, not HANDLE)
+    // Health check timer ID — created later in EcStart via TimerManager
     //
-    KeInitializeTimer(&NewConsumer->HealthCheckTimer);
-    KeInitializeDpc(&NewConsumer->HealthCheckDpc, EcpHealthCheckDpcRoutine, NewConsumer);
-    NewConsumer->HealthTimerActive = FALSE;
+    NewConsumer->HealthCheckTimerId = 0;
 
     //
     // Initialize round-robin thread signal counter
@@ -389,12 +383,14 @@ EcShutdown(
     InterlockedExchange(&Ctx->State, (LONG)EcState_Stopping);
 
     //
-    // Cancel health check timer and flush any pending DPC
+    // Cancel health check timer via TimerManager
     //
-    if (Ctx->HealthTimerActive) {
-        KeCancelTimer(&Ctx->HealthCheckTimer);
-        KeFlushQueuedDpcs();
-        Ctx->HealthTimerActive = FALSE;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && Ctx->HealthCheckTimerId) {
+            TmCancel(tmMgr, Ctx->HealthCheckTimerId, TRUE);
+            Ctx->HealthCheckTimerId = 0;
+        }
     }
 
     //
@@ -439,7 +435,6 @@ EcStart(
     NTSTATUS Status = STATUS_SUCCESS;
     PLIST_ENTRY Entry;
     PEC_SUBSCRIPTION Subscription;
-    LARGE_INTEGER DueTime;
     KIRQL OldIrql;
     LONG State;
 
@@ -514,16 +509,24 @@ EcStart(
     KeReleaseSpinLock(&Consumer->SubscriptionLock, OldIrql);
 
     //
-    // Start health check timer (periodic, using KTIMER)
+    // Start health check timer via TimerManager (runs at PASSIVE_LEVEL)
     //
-    DueTime.QuadPart = EC_HEALTH_TIMER_PERIOD_100NS;
-    KeSetTimerEx(
-        &Consumer->HealthCheckTimer,
-        DueTime,
-        EC_HEALTH_CHECK_INTERVAL_SEC * 1000,  // Period in ms
-        &Consumer->HealthCheckDpc
-    );
-    Consumer->HealthTimerActive = TRUE;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 5000;
+            TmCreatePeriodic(
+                tmMgr,
+                EC_HEALTH_CHECK_INTERVAL_SEC * 1000,
+                EcpHealthCheckTimerCallback,
+                Consumer,
+                &opts,
+                &Consumer->HealthCheckTimerId
+            );
+        }
+    }
 
     InterlockedExchange(&Consumer->State, (LONG)EcState_Running);
     Consumer->Stats.IsHealthy = TRUE;
@@ -559,12 +562,14 @@ EcStop(
     InterlockedExchange(&Consumer->State, (LONG)EcState_Stopping);
 
     //
-    // Cancel health check timer and flush any pending DPC before thread teardown
+    // Cancel health check timer via TimerManager
     //
-    if (Consumer->HealthTimerActive) {
-        KeCancelTimer(&Consumer->HealthCheckTimer);
-        KeFlushQueuedDpcs();
-        Consumer->HealthTimerActive = FALSE;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && Consumer->HealthCheckTimerId) {
+            TmCancel(tmMgr, Consumer->HealthCheckTimerId, TRUE);
+            Consumer->HealthCheckTimerId = 0;
+        }
     }
 
     //
@@ -2468,20 +2473,16 @@ EcpUpdateFlowControl(
 
 static
 VOID
-EcpHealthCheckDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+EcpHealthCheckTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PEC_CONSUMER Consumer = (PEC_CONSUMER)DeferredContext;
+    PEC_CONSUMER Consumer = (PEC_CONSUMER)Context;
     BOOLEAN IsHealthy = TRUE;
     LARGE_INTEGER Now;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (Consumer == NULL || !Consumer->Initialized) {
         return;

@@ -541,10 +541,8 @@ typedef struct _EC_CONSUMER {
     // Correlation engine reference
     PVOID CorrelationEngine;
 
-    // Health monitoring - proper KTIMER (not HANDLE)
-    KTIMER HealthCheckTimer;
-    KDPC HealthCheckDpc;
-    BOOLEAN HealthTimerActive;
+    // Health monitoring — managed by TimerManager
+    ULONG HealthCheckTimerId;
 
     // Round-robin thread signaling index — overflow-safe by unsigned modulo
     volatile LONG NextThreadSignal;
