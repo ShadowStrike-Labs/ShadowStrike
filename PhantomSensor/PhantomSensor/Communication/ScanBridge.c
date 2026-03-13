@@ -1110,35 +1110,68 @@ ShadowStrikeSendProcessEvent(
     }
 
     //
+    // Acquire rundown protection for shutdown safety
+    //
+    if (!SbpAcquireRundownProtection()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Cap string lengths to prevent oversized messages
+    //
+    if (imageNameLen > SB_MAX_PATH_LENGTH) {
+        imageNameLen = SB_MAX_PATH_LENGTH;
+    }
+    if (cmdLineLen > SB_MAX_PATH_LENGTH) {
+        cmdLineLen = SB_MAX_PATH_LENGTH;
+    }
+
+    //
     // Calculate total message size with overflow protection
     //
     status = SbpSafeAddUlong(sizeof(SHADOWSTRIKE_MESSAGE_HEADER), sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION), &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto ProcessEventCleanup;
     }
 
     status = SbpSafeAddUlong(totalSize, imageNameLen, &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto ProcessEventCleanup;
     }
 
     status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto ProcessEventCleanup;
     }
 
     status = SbpSafeAddUlong(totalSize, cmdLineLen, &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto ProcessEventCleanup;
     }
 
     status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto ProcessEventCleanup;
     }
 
     if (totalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
-        totalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
+        //
+        // Clamp to max and adjust string lengths to match available space
+        //
+        ULONG fixedOverhead = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
+                              sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION) +
+                              2 * sizeof(WCHAR);
+        ULONG available = (SHADOWSTRIKE_MAX_MESSAGE_SIZE > fixedOverhead) ?
+                          SHADOWSTRIKE_MAX_MESSAGE_SIZE - fixedOverhead : 0;
+
+        if (imageNameLen > available) {
+            imageNameLen = available & ~1UL;
+        }
+        available -= imageNameLen;
+        if (cmdLineLen > available) {
+            cmdLineLen = available & ~1UL;
+        }
+        totalSize = fixedOverhead + imageNameLen + cmdLineLen;
     }
 
     //
@@ -1146,7 +1179,8 @@ ShadowStrikeSendProcessEvent(
     //
     header = (PSHADOWSTRIKE_MESSAGE_HEADER)SbAllocateMessageBuffer(totalSize);
     if (header == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto ProcessEventCleanup;
     }
 
     //
@@ -1159,8 +1193,7 @@ ShadowStrikeSendProcessEvent(
     );
 
     if (!NT_SUCCESS(status)) {
-        SbFreeMessageBuffer(header);
-        return status;
+        goto ProcessEventCleanup;
     }
 
     //
@@ -1218,10 +1251,11 @@ ShadowStrikeSendProcessEvent(
         InterlockedIncrement64(&g_ScanBridge.Stats.ProcessNotifications);
     }
 
-    //
-    // Free message buffer back to lookaside list
-    //
-    SbFreeMessageBuffer(header);
+ProcessEventCleanup:
+    if (header != NULL) {
+        SbFreeMessageBuffer(header);
+    }
+    SbpReleaseRundownProtection();
 
     return status;
 }
@@ -1264,11 +1298,19 @@ ShadowStrikeSendThreadNotification(
     }
 
     //
+    // Acquire rundown protection for shutdown safety
+    //
+    if (!SbpAcquireRundownProtection()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
     // Allocate message buffer
     //
     header = (PSHADOWSTRIKE_MESSAGE_HEADER)SbAllocateMessageBuffer(totalSize);
     if (header == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto ThreadCleanup;
     }
 
     //
@@ -1281,8 +1323,7 @@ ShadowStrikeSendThreadNotification(
     );
 
     if (!NT_SUCCESS(status)) {
-        SbFreeMessageBuffer(header);
-        return status;
+        goto ThreadCleanup;
     }
 
     //
@@ -1313,7 +1354,11 @@ ShadowStrikeSendThreadNotification(
         InterlockedIncrement64(&g_ScanBridge.Stats.ThreadNotifications);
     }
 
-    SbFreeMessageBuffer(header);
+ThreadCleanup:
+    if (header != NULL) {
+        SbFreeMessageBuffer(header);
+    }
+    SbpReleaseRundownProtection();
 
     return status;
 }
@@ -1356,10 +1401,20 @@ ShadowStrikeSendImageNotification(
     }
 
     //
-    // Get image name length
+    // Acquire rundown protection for shutdown safety
+    //
+    if (!SbpAcquireRundownProtection()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Get image name length with safety cap
     //
     if (FullImageName != NULL && FullImageName->Buffer != NULL) {
         imageNameLen = FullImageName->Length;
+        if (imageNameLen > SB_MAX_PATH_LENGTH) {
+            imageNameLen = SB_MAX_PATH_LENGTH;
+        }
     }
 
     //
@@ -1367,21 +1422,32 @@ ShadowStrikeSendImageNotification(
     //
     status = SbpSafeAddUlong(sizeof(SHADOWSTRIKE_MESSAGE_HEADER), sizeof(SHADOWSTRIKE_IMAGE_NOTIFICATION), &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto ImageCleanup;
     }
 
     status = SbpSafeAddUlong(totalSize, imageNameLen, &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto ImageCleanup;
     }
 
     status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto ImageCleanup;
     }
 
     if (totalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
-        totalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
+        //
+        // Clamp to max and adjust image name length
+        //
+        ULONG fixedOverhead = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
+                              sizeof(SHADOWSTRIKE_IMAGE_NOTIFICATION) +
+                              sizeof(WCHAR);
+        ULONG available = (SHADOWSTRIKE_MAX_MESSAGE_SIZE > fixedOverhead) ?
+                          SHADOWSTRIKE_MAX_MESSAGE_SIZE - fixedOverhead : 0;
+        if (imageNameLen > available) {
+            imageNameLen = available & ~1UL;
+        }
+        totalSize = fixedOverhead + imageNameLen;
     }
 
     //
@@ -1389,7 +1455,8 @@ ShadowStrikeSendImageNotification(
     //
     header = (PSHADOWSTRIKE_MESSAGE_HEADER)SbAllocateMessageBuffer(totalSize);
     if (header == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto ImageCleanup;
     }
 
     //
@@ -1402,8 +1469,7 @@ ShadowStrikeSendImageNotification(
     );
 
     if (!NT_SUCCESS(status)) {
-        SbFreeMessageBuffer(header);
-        return status;
+        goto ImageCleanup;
     }
 
     //
@@ -1462,7 +1528,11 @@ ShadowStrikeSendImageNotification(
         InterlockedIncrement64(&g_ScanBridge.Stats.ImageNotifications);
     }
 
-    SbFreeMessageBuffer(header);
+ImageCleanup:
+    if (header != NULL) {
+        SbFreeMessageBuffer(header);
+    }
+    SbpReleaseRundownProtection();
 
     return status;
 }
@@ -1504,6 +1574,23 @@ ShadowStrikeSendRegistryNotification(
     }
 
     //
+    // Acquire rundown protection for shutdown safety
+    //
+    if (!SbpAcquireRundownProtection()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Cap string and data lengths
+    //
+    if (keyPathLen > SB_MAX_PATH_LENGTH) {
+        keyPathLen = SB_MAX_PATH_LENGTH;
+    }
+    if (valueNameLen > SB_MAX_PATH_LENGTH) {
+        valueNameLen = SB_MAX_PATH_LENGTH;
+    }
+
+    //
     // Limit captured data size to prevent huge messages
     //
     ULONG safeDataSize = (Data != NULL && DataSize > 0) ? DataSize : 0;
@@ -1516,36 +1603,56 @@ ShadowStrikeSendRegistryNotification(
     //
     status = SbpSafeAddUlong(sizeof(SHADOWSTRIKE_MESSAGE_HEADER), sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION), &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto RegistryCleanup;
     }
 
     status = SbpSafeAddUlong(totalSize, keyPathLen, &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto RegistryCleanup;
     }
 
     status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto RegistryCleanup;
     }
 
     status = SbpSafeAddUlong(totalSize, valueNameLen, &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto RegistryCleanup;
     }
 
     status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto RegistryCleanup;
     }
 
     status = SbpSafeAddUlong(totalSize, safeDataSize, &totalSize);
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto RegistryCleanup;
     }
 
     if (totalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
-        totalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
+        //
+        // Clamp to max and adjust variable-length fields
+        //
+        ULONG fixedOverhead = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
+                              sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION) +
+                              2 * sizeof(WCHAR);
+        ULONG available = (SHADOWSTRIKE_MAX_MESSAGE_SIZE > fixedOverhead) ?
+                          SHADOWSTRIKE_MAX_MESSAGE_SIZE - fixedOverhead : 0;
+
+        if (keyPathLen > available) {
+            keyPathLen = available & ~1UL;
+        }
+        available -= keyPathLen;
+        if (valueNameLen > available) {
+            valueNameLen = available & ~1UL;
+        }
+        available -= valueNameLen;
+        if (safeDataSize > available) {
+            safeDataSize = available;
+        }
+        totalSize = fixedOverhead + keyPathLen + valueNameLen + safeDataSize;
     }
 
     //
@@ -1553,7 +1660,8 @@ ShadowStrikeSendRegistryNotification(
     //
     header = (PSHADOWSTRIKE_MESSAGE_HEADER)SbAllocateMessageBuffer(totalSize);
     if (header == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto RegistryCleanup;
     }
 
     //
@@ -1566,8 +1674,7 @@ ShadowStrikeSendRegistryNotification(
     );
 
     if (!NT_SUCCESS(status)) {
-        SbFreeMessageBuffer(header);
-        return status;
+        goto RegistryCleanup;
     }
 
     //
@@ -1641,7 +1748,11 @@ ShadowStrikeSendRegistryNotification(
         InterlockedIncrement64(&g_ScanBridge.Stats.RegistryNotifications);
     }
 
-    SbFreeMessageBuffer(header);
+RegistryCleanup:
+    if (header != NULL) {
+        SbFreeMessageBuffer(header);
+    }
+    SbpReleaseRundownProtection();
 
     return status;
 }
@@ -2109,11 +2220,7 @@ SbpCheckCircuitBreaker(
     LARGE_INTEGER currentTime;
     LONG64 timeSinceOpen;
 
-    state = (SB_CIRCUIT_STATE)InterlockedCompareExchange(
-        &CircuitBreaker->State,
-        CircuitBreaker->State,
-        CircuitBreaker->State
-    );
+    state = (SB_CIRCUIT_STATE)CircuitBreaker->State;
 
     if (state == SbCircuitClosed) {
         return TRUE;

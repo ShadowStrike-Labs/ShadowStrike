@@ -42,6 +42,7 @@
 #include "Encryption.h"
 #include "MessageQueue.h"
 #include "../Core/Globals.h"
+#include "../Core/DriverEntry.h"
 #include "../../Shared/SharedDefs.h"
 #include "../../Shared/MessageTypes.h"
 #include "../../Shared/ErrorCodes.h"
