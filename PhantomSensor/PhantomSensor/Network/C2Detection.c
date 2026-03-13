@@ -383,17 +383,27 @@ C2Initialize(
     //
     detector->Public.AnalysisIntervalMs = C2_ANALYSIS_TIMER_INTERVAL_MS;
     {
-        TM_TIMER_OPTIONS opts = {0};
-        opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
-        opts.Name = "C2Analysis";
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = {0};
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.Name = "C2Analysis";
 
-        status = TmCreatePeriodic(
-            ShadowStrikeGetTimerManager(),
-            C2_ANALYSIS_TIMER_INTERVAL_MS,
-            C2pAnalysisTimerCallback,
-            detector,
-            &opts,
-            &detector->Public.AnalysisTimerId);
+            status = TmCreatePeriodic(
+                tmMgr,
+                C2_ANALYSIS_TIMER_INTERVAL_MS,
+                C2pAnalysisTimerCallback,
+                detector,
+                &opts,
+                &detector->Public.AnalysisTimerId);
+            if (!NT_SUCCESS(status)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike] WARNING: C2Detection timer creation failed: 0x%08X\n", status);
+            }
+        } else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike] WARNING: C2Detection timer creation failed: TimerManager unavailable\n");
+        }
     }
 
     if (!NT_SUCCESS(status)) {
@@ -448,7 +458,10 @@ C2Shutdown(
     // Cancel analysis timer and wait for in-flight callback to complete.
     //
     if (Detector->AnalysisTimerId != 0) {
-        TmCancel(ShadowStrikeGetTimerManager(), Detector->AnalysisTimerId, TRUE);
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Detector->AnalysisTimerId, TRUE);
+        }
         Detector->AnalysisTimerId = 0;
     }
     ExWaitForRundownProtectionRelease(&Detector->RundownRef);

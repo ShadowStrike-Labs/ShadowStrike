@@ -746,9 +746,14 @@ CpInitialize(
             TM_TIMER_OPTIONS opts = { 0 };
             opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
             opts.ToleranceMs = 1000;
-            TmCreatePeriodic(tmMgr, prot->VerifyIntervalMs,
+            NTSTATUS tmStatus = TmCreatePeriodic(tmMgr, prot->VerifyIntervalMs,
                              CppVerifyTimerCallback, prot,
                              &opts, &prot->VerifyTimerId);
+            if (!NT_SUCCESS(tmStatus)) {
+                prot->VerifyTimerId = 0;
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike] WARNING: CallbackProtection timer creation failed: 0x%08X\n", tmStatus);
+            }
         }
     }
     prot->EnableRestoration = TRUE;
@@ -1140,10 +1145,16 @@ CpEnablePeriodicVerify(
             TM_TIMER_OPTIONS opts = { 0 };
             opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
             opts.ToleranceMs = 1000;
-            TmCreatePeriodic(tmMgr, Protector->VerifyIntervalMs,
+            NTSTATUS tmStatus = TmCreatePeriodic(tmMgr, Protector->VerifyIntervalMs,
                              CppVerifyTimerCallback, Protector,
                              &opts, &Protector->VerifyTimerId);
-            InterlockedExchange(&Protector->TimerActive, TRUE);
+            if (NT_SUCCESS(tmStatus)) {
+                InterlockedExchange(&Protector->TimerActive, TRUE);
+            } else {
+                Protector->VerifyTimerId = 0;
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike] WARNING: CallbackProtection periodic verify timer creation failed: 0x%08X\n", tmStatus);
+            }
         }
     }
 

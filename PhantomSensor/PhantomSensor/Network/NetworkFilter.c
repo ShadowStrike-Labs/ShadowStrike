@@ -604,22 +604,28 @@ NfFilterInitialize(
     //
     g_CleanupInProgress = 0;
     {
-        TM_TIMER_OPTIONS opts = {0};
-        opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
-        opts.Name = "NfCleanup";
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = {0};
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.Name = "NfCleanup";
 
-        status = TmCreatePeriodic(
-            ShadowStrikeGetTimerManager(),
-            NF_CLEANUP_INTERVAL_MS,
-            NfpCleanupTimerCallback,
-            NULL,
-            &opts,
-            &g_CleanupTimerId
-            );
-        if (!NT_SUCCESS(status)) {
-            NfpUnregisterFilters();
-            NfpUnregisterCallouts();
-            goto CleanupEngine;
+            status = TmCreatePeriodic(
+                tmMgr,
+                NF_CLEANUP_INTERVAL_MS,
+                NfpCleanupTimerCallback,
+                NULL,
+                &opts,
+                &g_CleanupTimerId
+                );
+            if (!NT_SUCCESS(status)) {
+                NfpUnregisterFilters();
+                NfpUnregisterCallouts();
+                goto CleanupEngine;
+            }
+        } else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike] WARNING: NetworkFilter timer creation failed: TimerManager unavailable\n");
         }
     }
 
@@ -778,7 +784,12 @@ NfFilterShutdown(
     //
     // Cancel cleanup timer and wait for in-flight callback
     //
-    TmCancel(ShadowStrikeGetTimerManager(), g_CleanupTimerId, TRUE);
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && g_CleanupTimerId != 0) {
+            TmCancel(tmMgr, g_CleanupTimerId, TRUE);
+        }
+    }
 
     //
     // Safety: wait for any in-progress cleanup to complete

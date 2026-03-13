@@ -621,9 +621,14 @@ PaInitialize(
             TM_TIMER_OPTIONS opts = { 0 };
             opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
             opts.ToleranceMs = 5000;
-            TmCreatePeriodic(tmMgr, PA_CLEANUP_TIMER_PERIOD_MS,
+            NTSTATUS tmStatus = TmCreatePeriodic(tmMgr, PA_CLEANUP_TIMER_PERIOD_MS,
                              PapCleanupTimerCallback, Internal,
                              &opts, &Internal->CleanupTimerId);
+            if (!NT_SUCCESS(tmStatus)) {
+                Internal->CleanupTimerId = 0;
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike] WARNING: ProcessAnalyzer timer creation failed: 0x%08X\n", tmStatus);
+            }
         }
     }
 

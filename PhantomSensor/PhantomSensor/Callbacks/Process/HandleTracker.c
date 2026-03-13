@@ -852,7 +852,7 @@ HtInitialize(
             TM_TIMER_OPTIONS opts = { 0 };
             opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
             opts.ToleranceMs = 5000;
-            TmCreatePeriodic(
+            NTSTATUS tmStatus = TmCreatePeriodic(
                 tmMgr,
                 Tracker->Config.CleanupIntervalMs,
                 HtpCleanupTimerCallback,
@@ -860,6 +860,11 @@ HtInitialize(
                 &opts,
                 &Tracker->CleanupTimerId
                 );
+            if (!NT_SUCCESS(tmStatus)) {
+                Tracker->CleanupTimerId = 0;
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike] WARNING: HandleTracker timer creation failed: 0x%08X\n", tmStatus);
+            }
         }
     }
 
