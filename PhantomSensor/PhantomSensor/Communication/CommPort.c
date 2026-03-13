@@ -40,6 +40,7 @@
 #include "MessageHandler.h"
 #include "Compression.h"
 #include "Encryption.h"
+#include "MessageQueue.h"
 #include "../Core/Globals.h"
 #include "../../Shared/SharedDefs.h"
 #include "../../Shared/MessageTypes.h"
@@ -533,6 +534,70 @@ ShadowStrikeCloseCommunicationPort(
 // CONNECTION CALLBACKS
 // ============================================================================
 
+//
+// ShadowStrikeDrainMessageQueue
+//
+// Drains messages buffered in MessageQueue while no user-mode client was
+// connected.  Called at PASSIVE_LEVEL after a new client registers.
+// Sends directly via FltSendMessage to avoid recursive enqueue.
+//
+static
+VOID
+ShadowStrikeDrainMessageQueue(
+    _In_ PFLT_PORT ClientPort
+    )
+{
+    PQUEUED_MESSAGE messages[32];
+    UINT32 count = 0;
+    UINT32 totalDrained = 0;
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    //
+    // Cap at 512 messages per drain to avoid monopolising the connect path
+    //
+    timeout.QuadPart = 0;  // fire-and-forget
+
+    while (totalDrained < 512) {
+        status = MqDequeueBatch(messages, 32, &count, 0);
+        if (!NT_SUCCESS(status) || count == 0) {
+            break;
+        }
+
+        for (UINT32 i = 0; i < count; i++) {
+            //
+            // Send directly via FltSendMessage (not ShadowStrikeSendNotification)
+            // to prevent recursive re-enqueue on transient failure.
+            //
+            FltSendMessage(
+                g_DriverData.FilterHandle,
+                &ClientPort,
+                messages[i]->Data,
+                messages[i]->MessageSize,
+                NULL,
+                NULL,
+                &timeout
+            );
+
+            MqFreeMessage(messages[i]);
+        }
+
+        totalDrained += count;
+
+        if (count < 32) {
+            break;  // queue drained
+        }
+    }
+
+    if (totalDrained > 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "[ShadowStrike] Drained %lu queued messages on client connect\n",
+                   totalDrained);
+    }
+}
+
 NTSTATUS
 ShadowStrikeConnectNotify(
     _In_ PFLT_PORT ClientPort,
@@ -679,6 +744,13 @@ ShadowStrikeConnectNotify(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Client connected: slot=%ld, primary=%d, caps=0x%08X, total=%ld\n",
                slotIndex, isPrimaryScanner, capabilities, g_DriverData.ConnectedClients);
+
+    //
+    // Drain any messages queued while no client was connected.
+    // Must happen AFTER the slot is published so concurrent senders
+    // can also reach the new port.
+    //
+    ShadowStrikeDrainMessageQueue(ClientPort);
 
     return status;
 }
@@ -1558,6 +1630,20 @@ ShadowStrikeSendNotification(
     //
     status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
     if (!NT_SUCCESS(status)) {
+        //
+        // No connected user-mode client — buffer the message in MessageQueue
+        // for delivery when a client reconnects.  This prevents telemetry
+        // loss during user-mode agent restart / reconnect windows.
+        //
+        MqEnqueueMessage(
+            (SHADOWSTRIKE_MESSAGE_TYPE)Notification->MessageType,
+            sendBuffer,
+            sendSize,
+            MessagePriority_Normal,
+            MQ_MSG_FLAG_NOTIFY_ONLY,
+            NULL
+        );
+
         if (usedCompression) {
             ExFreePoolWithTag(sendBuffer, 'cmCP');
         }

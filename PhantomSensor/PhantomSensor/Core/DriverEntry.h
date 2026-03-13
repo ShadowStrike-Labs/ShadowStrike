@@ -106,6 +106,7 @@ typedef enum _SHADOWSTRIKE_INIT_FLAGS {
     InitFlag_AntiUnloadInitialized        = 0x00800000,
     InitFlag_FileProtectionInitialized    = 0x01000000,
     InitFlag_WppTracing                   = 0x02000000,
+    InitFlag_ElamInitialized              = 0x04000000,
 
     // Combined flags for critical security components
     InitFlag_AllSecurityCallbacks   = (InitFlag_ProcessCallbackReg |
@@ -179,6 +180,11 @@ typedef enum _SHADOWSTRIKE_SUBSYSTEM_FLAGS {
     SubsysFlag_EventSchema          = 0x40000000,
     SubsysFlag_MemoryScanner        = 0x80000000,
 } SHADOWSTRIKE_SUBSYSTEM_FLAGS;
+
+//
+// Forward declarations for opaque types exposed by accessor functions
+//
+typedef struct _BP_PROCESSOR BP_PROCESSOR, *PBP_PROCESSOR;
 
 // ============================================================================
 // DRIVER LIFECYCLE FUNCTIONS
@@ -473,6 +479,14 @@ ShadowStrikeRegistryCallbackRoutine(
 _IRQL_requires_max_(PASSIVE_LEVEL)
 PVOID
 ShadowStrikeGetThreatScoringEngine(VOID);
+
+/**
+ * @brief Get the batch processing engine for telemetry event aggregation.
+ * @return PBP_PROCESSOR or NULL if not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PBP_PROCESSOR
+ShadowStrikeGetBatchProcessor(VOID);
 
 #ifdef __cplusplus
 }

@@ -109,6 +109,7 @@
 #include "../SelfProtection/AntiDebug.h"
 #include "../SelfProtection/AntiUnload.h"
 #include "../SelfProtection/FileProtection.h"
+#include "../../PhantomSensorELAM/ELAMDriver.h"
 
 // Phase 5: Specialized subsystems
 #include "../ALPC/AlpcPortMonitor.h"
@@ -300,6 +301,62 @@ ShadowStrikePowerBehaviorBridge(
         FALSE,
         NULL
         );
+}
+
+// ============================================================================
+// BATCH PROCESSING CALLBACK
+// ============================================================================
+
+//
+// ShadowStrikeBatchFlushCallback
+//
+// Invoked by BatchProcessing worker thread at PASSIVE_LEVEL when a batch
+// of telemetry events is ready.  Forwards each event to the user-mode
+// agent via CommPort.
+//
+static
+VOID
+ShadowStrikeBatchFlushCallback(
+    _In_reads_(EventCount) PBP_EVENT* Events,
+    _In_ ULONG EventCount,
+    _In_opt_ PVOID Context
+    )
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    for (ULONG i = 0; i < EventCount; i++) {
+        PBP_EVENT evt = Events[i];
+        ULONG totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + (ULONG)evt->DataSize;
+
+        if (totalSize < sizeof(SHADOWSTRIKE_MESSAGE_HEADER) || evt->DataSize > 65536) {
+            continue;
+        }
+
+        PSHADOWSTRIKE_MESSAGE_HEADER msg =
+            (PSHADOWSTRIKE_MESSAGE_HEADER)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, totalSize, 'btCP');
+        if (msg == NULL) {
+            continue;
+        }
+
+        RtlZeroMemory(msg, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+        msg->Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
+        msg->Version = SHADOWSTRIKE_PROTOCOL_VERSION;
+        msg->MessageType = (UINT16)evt->Type;
+        msg->TotalSize = totalSize;
+        msg->DataSize = (UINT32)evt->DataSize;
+        KeQuerySystemTime((PLARGE_INTEGER)&msg->Timestamp);
+
+        RtlCopyMemory(
+            (PUCHAR)msg + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+            evt->Data,
+            evt->DataSize
+        );
+
+        ShadowStrikeSendNotification(msg, totalSize);
+
+        ExFreePoolWithTag(msg, 'btCP');
+    }
 }
 
 // ============================================================================
@@ -541,10 +598,29 @@ DriverEntry(
     }
 
     //
-    // Step 5.8: Batch processing — DEFERRED
-    // BpInitialize ready but no BpRegisterCallback consumers yet.
-    // Enable when telemetry batching pipeline is wired (user-mode agent).
+    // Step 5.8: Batch processing — telemetry event aggregator
     //
+    status = BpInitialize(&g_BatchProcessor);
+    if (NT_SUCCESS(status)) {
+        status = BpRegisterCallback(
+            g_BatchProcessor,
+            ShadowStrikeBatchFlushCallback,
+            NULL
+        );
+        if (NT_SUCCESS(status)) {
+            status = BpStart(g_BatchProcessor);
+        }
+        if (NT_SUCCESS(status)) {
+            g_SubsystemFlags |= SubsysFlag_BatchProcessing;
+            ShadowStrikeLogInitStatus("Batch Processing", STATUS_SUCCESS);
+        } else {
+            BpShutdown(g_BatchProcessor);
+            g_BatchProcessor = NULL;
+            ShadowStrikeLogInitStatus("Batch Processing", status);
+        }
+    } else {
+        ShadowStrikeLogInitStatus("Batch Processing (init)", status);
+    }
 
     //
     // Step 5.9: Cache optimization — DEFERRED
@@ -1122,6 +1198,39 @@ DriverEntry(
     } else {
         g_SubsystemFlags |= SubsysFlag_MessageQueue;
         ShadowStrikeLogInitStatus("Message Queue", STATUS_SUCCESS);
+    }
+
+    // =========================================================================
+    // PHASE 4A: Boot-Time Protection (ELAM Alternative)
+    // Initialize early-launch driver classification before self-protection
+    // so boot drivers are monitored as soon as possible.
+    // =========================================================================
+
+    //
+    // Step 14.15a: Initialize ELAM driver subsystem
+    //
+    status = ElamDriverInitialize(DriverObject, RegistryPath);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize ELAM driver: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_ElamInitialized;
+        ShadowStrikeLogInitStatus("ELAM Driver", STATUS_SUCCESS);
+
+        //
+        // Step 14.15b: Register ELAM image load + registry callbacks
+        //
+        status = ElamRegisterCallback();
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to register ELAM callbacks: 0x%08X (continuing)\n",
+                       status);
+            status = STATUS_SUCCESS;
+        } else {
+            ShadowStrikeLogInitStatus("ELAM Callbacks", STATUS_SUCCESS);
+        }
     }
 
     // =========================================================================
@@ -1724,6 +1833,14 @@ ShadowStrikeUnload(
         g_HandleProtection = NULL;
     }
 
+    //
+    // Phase 4A shutdown: ELAM boot-time protection
+    //
+    if (g_InitFlags & InitFlag_ElamInitialized) {
+        ElamUnregisterCallback();
+        ElamDriverShutdown();
+    }
+
     // =========================================================================
     // PHASE 3 SHUTDOWN: Enrichment & Communication (reverse init order)
     // =========================================================================
@@ -1837,6 +1954,7 @@ ShadowStrikeUnload(
     }
 
     if (g_SubsystemFlags & SubsysFlag_BatchProcessing) {
+        BpStop(g_BatchProcessor);
         BpShutdown(g_BatchProcessor);
         g_BatchProcessor = NULL;
     }
@@ -1938,6 +2056,12 @@ PVOID
 ShadowStrikeGetThreatScoringEngine(VOID)
 {
     return (PVOID)g_ThreatScoring;
+}
+
+PBP_PROCESSOR
+ShadowStrikeGetBatchProcessor(VOID)
+{
+    return g_BatchProcessor;
 }
 
 // ============================================================================
@@ -2502,6 +2626,14 @@ ShadowStrikeCleanupByFlags(
     }
 
     //
+    // Phase 4A: ELAM shutdown
+    //
+    if (g_InitFlags & InitFlag_ElamInitialized) {
+        ElamUnregisterCallback();
+        ElamDriverShutdown();
+    }
+
+    //
     // Phase 3: Shutdown enrichment & communication (reverse init order)
     //
     if (g_SubsystemFlags & SubsysFlag_MessageQueue) {
@@ -2609,6 +2741,7 @@ ShadowStrikeCleanupByFlags(
     }
 
     if (g_SubsystemFlags & SubsysFlag_BatchProcessing) {
+        BpStop(g_BatchProcessor);
         BpShutdown(g_BatchProcessor);
         g_BatchProcessor = NULL;
     }
