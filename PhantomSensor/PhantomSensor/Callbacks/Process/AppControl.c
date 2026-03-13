@@ -39,6 +39,8 @@ Policies are managed via user-space service IOCTL commands.
 
 #include "AppControl.h"
 #include "../../Core/Globals.h"
+#include "../../Behavioral/BehaviorEngine.h"
+#include "../../Exclusions/ExclusionManager.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -143,6 +145,11 @@ AcpEnterOperation(VOID);
 static VOID
 AcpLeaveOperation(VOID);
 
+static VOID
+AcpLearnHashRule(
+    _In_ const UCHAR* Hash
+    );
+
 // ============================================================================
 // SECTION ASSIGNMENTS
 // ============================================================================
@@ -155,6 +162,7 @@ AcpLeaveOperation(VOID);
 #pragma alloc_text(PAGE, AcpFindHashRule)
 #pragma alloc_text(PAGE, AcpCheckPathRules)
 #pragma alloc_text(PAGE, AcpIsTrustedPath)
+#pragma alloc_text(PAGE, AcpLearnHashRule)
 
 // ============================================================================
 // LIFECYCLE
@@ -317,6 +325,17 @@ AcCheckProcessExecution(
         return AcVerdict_Allow;
     }
 
+    //
+    // Exclusion check — exempt excluded processes from app control policy.
+    // Excluded processes are typically trusted management tools that must
+    // never be blocked by allowlisting policies.
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL) ||
+        ShadowStrikeIsPathExcluded(ImageFileName, NULL)) {
+        AcpLeaveOperation();
+        return AcVerdict_Allow;
+    }
+
     InterlockedIncrement64(&g_AcState.Stats.ExecutionsChecked);
     Mode = (AC_POLICY_MODE)g_AcState.PolicyMode;
 
@@ -365,6 +384,13 @@ AcCheckProcessExecution(
             break;
         case AcMode_Learning:
             Verdict = AcVerdict_Allow;
+            //
+            // Auto-learn: add hash-allow rule for observed executable.
+            // Only learns when a hash is available (caller computed it).
+            //
+            if (ImageHash != NULL) {
+                AcpLearnHashRule(ImageHash);
+            }
             InterlockedIncrement64(&g_AcState.Stats.RulesLearned);
             break;
         }
@@ -382,12 +408,34 @@ AcCheckProcessExecution(
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike/AC] BLOCKED execution: %wZ (PID=%lu)\n",
                    ImageFileName, HandleToULong(ProcessId));
+
+        BeEngineSubmitEvent(
+            BehaviorEvent_AppControlBlocked,
+            BehaviorCategory_ProcessExecution,
+            HandleToULong(ProcessId),
+            ImageFileName->Buffer,
+            (ImageFileName->Length < 512) ? ImageFileName->Length : 512,
+            90,     // High suspicion — actively blocked
+            FALSE,
+            NULL
+        );
         break;
     case AcVerdict_Audit:
         InterlockedIncrement64(&g_AcState.Stats.ExecutionsAudited);
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                    "[ShadowStrike/AC] AUDIT: Unauthorized execution: %wZ (PID=%lu)\n",
                    ImageFileName, HandleToULong(ProcessId));
+
+        BeEngineSubmitEvent(
+            BehaviorEvent_AppControlAudited,
+            BehaviorCategory_ProcessExecution,
+            HandleToULong(ProcessId),
+            ImageFileName->Buffer,
+            (ImageFileName->Length < 512) ? ImageFileName->Length : 512,
+            40,     // Medium suspicion — audit only
+            FALSE,
+            NULL
+        );
         break;
     default:
         break;
@@ -409,9 +457,17 @@ AcCheckImageLoad(
     AC_VERDICT Verdict;
 
     PAGED_CODE();
-    UNREFERENCED_PARAMETER(ProcessId);
 
     if (!AcpEnterOperation()) {
+        return AcVerdict_Allow;
+    }
+
+    //
+    // Exclusion check — exempt excluded processes from DLL load control
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL) ||
+        ShadowStrikeIsPathExcluded(ImageFileName, NULL)) {
+        AcpLeaveOperation();
         return AcVerdict_Allow;
     }
 
@@ -677,6 +733,73 @@ AcpIsTrustedPath(
     }
 
     return FALSE;
+}
+
+// ============================================================================
+// PRIVATE — LEARNING MODE
+// ============================================================================
+
+static VOID
+AcpLearnHashRule(
+    _In_ const UCHAR* Hash
+    )
+{
+    ULONG Bucket;
+    PAC_HASH_RULE NewRule;
+    LIST_ENTRY *ListEntry;
+    ULONG WalkCount = 0;
+
+    PAGED_CODE();
+
+    //
+    // Cap total hash rules to prevent unbounded growth during learning
+    //
+    if ((ULONG)g_AcState.HashRuleCount >= AC_MAX_HASH_RULES) {
+        return;
+    }
+
+    Bucket = AcpHashBucketIndex(Hash);
+
+    //
+    // Check if hash already exists (avoid duplicates)
+    //
+    FltAcquirePushLockShared(&g_AcState.HashBuckets[Bucket].Lock);
+    for (ListEntry = g_AcState.HashBuckets[Bucket].Head.Flink;
+         ListEntry != &g_AcState.HashBuckets[Bucket].Head &&
+         WalkCount < AC_MAX_BUCKET_WALK;
+         ListEntry = ListEntry->Flink, WalkCount++) {
+
+        PAC_HASH_RULE Existing = CONTAINING_RECORD(
+            ListEntry, AC_HASH_RULE, Link);
+        if (RtlCompareMemory(Existing->Hash, Hash, AC_HASH_SIZE) == AC_HASH_SIZE) {
+            FltReleasePushLock(&g_AcState.HashBuckets[Bucket].Lock);
+            return;  // Already known
+        }
+    }
+    FltReleasePushLock(&g_AcState.HashBuckets[Bucket].Lock);
+
+    //
+    // Allocate and insert new allow rule
+    //
+    NewRule = (PAC_HASH_RULE)ExAllocateFromNPagedLookasideList(
+        &g_AcState.HashRuleLookaside);
+    if (NewRule == NULL) {
+        return;
+    }
+
+    RtlZeroMemory(NewRule, sizeof(AC_HASH_RULE));
+    NewRule->RuleType = AcRule_HashAllow;
+    RtlCopyMemory(NewRule->Hash, Hash, AC_HASH_SIZE);
+    NewRule->RuleId = (ULONG)InterlockedIncrement(&g_AcState.HashRuleCount);
+    KeQuerySystemTimePrecise(&NewRule->CreatedTime);
+
+    FltAcquirePushLockExclusive(&g_AcState.HashBuckets[Bucket].Lock);
+    InsertTailList(&g_AcState.HashBuckets[Bucket].Head, &NewRule->Link);
+    FltReleasePushLock(&g_AcState.HashBuckets[Bucket].Lock);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+               "[ShadowStrike/AC] LEARNED: Added hash-allow rule #%lu (bucket=%lu)\n",
+               NewRule->RuleId, Bucket);
 }
 
 // ============================================================================
