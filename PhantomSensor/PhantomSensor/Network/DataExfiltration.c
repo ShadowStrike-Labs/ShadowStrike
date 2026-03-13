@@ -62,6 +62,7 @@
 #include "../Communication/ScanBridge.h"
 #include "../Utilities/ProcessUtils.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Exclusions/ExclusionManager.h"
 #pragma warning(pop)
 
 //
@@ -1050,6 +1051,15 @@ DxAnalyzeTraffic(
     }
 
     //
+    // Skip excluded processes — enterprise policy override.
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        *IsSuspicious = FALSE;
+        ExReleaseRundownProtection(&Detector->RundownRef);
+        return STATUS_SUCCESS;
+    }
+
+    //
     // Cap the inspection size to prevent DoS via large buffers
     //
     inspectSize = DataSize;
@@ -1269,6 +1279,14 @@ DxRecordTransfer(
 
     if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
         return STATUS_DELETE_PENDING;
+    }
+
+    //
+    // Skip excluded processes — enterprise policy override.
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        ExReleaseRundownProtection(&Detector->RundownRef);
+        return STATUS_SUCCESS;
     }
 
     transfer = DxpGetOrCreateTransfer(

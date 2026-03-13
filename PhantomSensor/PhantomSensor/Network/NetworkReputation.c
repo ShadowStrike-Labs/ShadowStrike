@@ -47,6 +47,8 @@
 #include <ntstrsafe.h>
 #include "../../Sync/TimerManager.h"
 #include "../../Core/DriverEntry.h"
+#include "../../Behavioral/BehaviorEngine.h"
+#include "../../Exclusions/ExclusionManager.h"
 
 //
 // Forward declarations needed before alloc_text (defined later in file)
@@ -444,7 +446,12 @@ NrShutdown(
     //    blocks until any in-flight callback completes, replacing the
     //    old KeCancelTimer + KeFlushQueuedDpcs + spin-wait pattern.
     //
-    TmCancel(ShadowStrikeGetTimerManager(), Manager->CleanupTimerId, TRUE);
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr != NULL && Manager->CleanupTimerId != 0) {
+            TmCancel(tmMgr, Manager->CleanupTimerId, TRUE);
+        }
+    }
 
     //
     // 2. Wait for rundown: blocks until every thread that called
@@ -616,6 +623,22 @@ NrLookupIP(
             RtlStringCchCopyA(Result->MalwareFamily,
                               sizeof(Result->MalwareFamily),
                               entry->MalwareFamily);
+        }
+
+        //
+        // Submit known-bad reputation to behavioral engine (MITRE T1071)
+        //
+        if (entry->Reputation >= NrReputation_Malicious) {
+            BeEngineSubmitEvent(
+                BehaviorEvent_C2Communication,
+                BehaviorCategory_NetworkOperation,
+                0,  // ProcessId not available at lookup layer
+                NULL,
+                0,
+                (UINT32)entry->Score,
+                FALSE,
+                NULL
+                );
         }
 
         //
