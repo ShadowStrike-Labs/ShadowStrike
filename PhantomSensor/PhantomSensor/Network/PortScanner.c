@@ -63,6 +63,8 @@
 #include "../Tracing/Trace.h"
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
+#include "../Exclusions/ExclusionManager.h"
+#include "../Behavioral/BehaviorEngine.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, SsPsInitialize)
@@ -945,6 +947,13 @@ Routine Description:
 
     *Result = NULL;
 
+    //
+    // Skip excluded processes — enterprise policy override.
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        return STATUS_SUCCESS;
+    }
+
     if (!SspsAcquireOperation(Detector)) {
         return STATUS_DEVICE_NOT_READY;
     }
@@ -1029,6 +1038,20 @@ Routine Description:
         Source->ScanDetected = TRUE;
         Source->DetectedScanType = NewResult->Type;
         Source->ConfidenceScore = NewResult->ConfidenceScore;
+
+        //
+        // Submit to behavioral engine for attack chain correlation (T1046)
+        //
+        BeEngineSubmitEvent(
+            BehaviorEvent_PortScanning,
+            BehaviorCategory_Discovery,
+            HandleToULong(ProcessId),
+            NULL,
+            0,
+            (UINT32)NewResult->ConfidenceScore,
+            FALSE,
+            NULL
+            );
     }
 
     SspsReleaseSource(Detector, Source);

@@ -56,6 +56,7 @@
 #include "../Tracing/Trace.h"
 #include "../Exclusions/ExclusionManager.h"
 #include <ntstrsafe.h>
+#include "../Behavioral/BehaviorEngine.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, SslInitialize)
@@ -649,6 +650,20 @@ SslInspectClientHello(
 
     if (NewSession->SuspicionFlags != SslSuspicion_None) {
         InterlockedIncrement64(&Inspector->Stats.SuspiciousDetected);
+
+        //
+        // Submit suspicious TLS handshake to behavioral engine (T1573.002)
+        //
+        BeEngineSubmitEvent(
+            BehaviorEvent_EncryptedChannel,
+            BehaviorCategory_NetworkOperation,
+            0,  // ProcessId unavailable at TLS layer
+            NULL,
+            0,
+            (UINT32)(NewSession->SuspicionScore > 100 ? 100 : NewSession->SuspicionScore),
+            FALSE,
+            NULL
+            );
     }
 
     *SessionInfo = Snapshot;
