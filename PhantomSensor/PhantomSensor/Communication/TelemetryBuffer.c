@@ -853,6 +853,15 @@ TbShutdown(
     }
 
     //
+    // Release consumer FILE_OBJECT reference if still registered
+    //
+    if (Manager->ConsumerConnected && Manager->ConsumerFileObject != NULL) {
+        ObDereferenceObject(Manager->ConsumerFileObject);
+        Manager->ConsumerFileObject = NULL;
+        Manager->ConsumerConnected = FALSE;
+    }
+
+    //
     // Log final stats
     //
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
