@@ -522,6 +522,23 @@ TeInitialize(
     return STATUS_SUCCESS;
 
 Cleanup:
+    //
+    // Cancel any timers created before failure
+    //
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            if (g_TeProvider.FlushTimerId != 0) {
+                TmCancel(tmMgr, g_TeProvider.FlushTimerId, TRUE);
+                g_TeProvider.FlushTimerId = 0;
+            }
+            if (g_TeProvider.HeartbeatTimerId != 0) {
+                TmCancel(tmMgr, g_TeProvider.HeartbeatTimerId, TRUE);
+                g_TeProvider.HeartbeatTimerId = 0;
+            }
+        }
+    }
+
     if (etwRegistered) {
         EtwUnregister(g_TeProvider.RegistrationHandle);
         g_TeProvider.RegistrationHandle = 0;
@@ -788,6 +805,7 @@ TePause(
         PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
         if (tmMgr) {
             TmCancel(tmMgr, g_TeProvider.HeartbeatTimerId, TRUE);
+            g_TeProvider.HeartbeatTimerId = 0;
         }
         InterlockedExchange(&g_TeProvider.HeartbeatRunning, 0);
     }
@@ -812,7 +830,7 @@ TeResume(
             InterlockedCompareExchange(&g_TeProvider.HeartbeatRunning, 1, 0) == 0) {
 
             PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
-            if (tmMgr) {
+            if (tmMgr && g_TeProvider.HeartbeatTimerId == 0) {
                 TM_TIMER_OPTIONS opts = { 0 };
                 opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
                 opts.ToleranceMs = 5000;

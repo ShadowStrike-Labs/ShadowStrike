@@ -178,6 +178,7 @@ static HAWQ_MANAGER g_AsyncWorkQueue = NULL;
 
 /// @brief Timer manager handle (Phase 1A)
 static PTM_MANAGER g_TimerManager = NULL;
+static PDEVICE_OBJECT g_TimerControlDevice = NULL;  // Control device for TimerManager work items
 
 /// @brief DPC manager handle (Phase 1A)
 static PDPC_MANAGER g_DpcManager = NULL;
@@ -534,9 +535,38 @@ DriverEntry(
     }
 
     //
-    // Step 5.4: Initialize timer manager (centralized timer management)
+    // Step 5.4: Create control device for TimerManager work items.
+    // IoAllocateWorkItem (used by TmFlag_WorkItemCallback) requires a valid
+    // DEVICE_OBJECT. FltRegisterFilter hasn't happened yet, so we create a
+    // lightweight control device here. This must happen BEFORE TmInitialize
+    // so all subsequent TmCreatePeriodic calls in Phase 5.x work correctly.
     //
-    status = TmInitialize(NULL, &g_TimerManager);
+    {
+        PDEVICE_OBJECT controlDevice = NULL;
+        NTSTATUS devStatus = IoCreateDevice(
+            DriverObject,
+            0,                          // No device extension
+            NULL,                       // No device name (internal use only)
+            FILE_DEVICE_UNKNOWN,
+            FILE_DEVICE_SECURE_OPEN,
+            FALSE,                      // Not exclusive
+            &controlDevice
+        );
+        if (NT_SUCCESS(devStatus)) {
+            g_TimerControlDevice = controlDevice;
+        } else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to create timer control device: 0x%08X\n"
+                       "    TimerManager work-item callbacks will be unavailable.\n",
+                       devStatus);
+            g_TimerControlDevice = NULL;
+        }
+    }
+
+    //
+    // Step 5.5: Initialize timer manager (centralized timer management)
+    //
+    status = TmInitialize(g_TimerControlDevice, &g_TimerManager);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] WARNING: Failed to initialize timer manager: 0x%08X (continuing)\n",
@@ -745,13 +775,8 @@ DriverEntry(
     g_InitFlags |= InitFlag_FilterRegistered;
     ShadowStrikeLogInitStatus("FltRegisterFilter", status);
 
-    //
-    // Step 6.1: Provide DeviceObject to TimerManager so TmFlag_WorkItemCallback
-    // can allocate IoWorkItems for PASSIVE_LEVEL timer callbacks.
-    //
-    if (g_TimerManager != NULL && DriverObject->DeviceObject != NULL) {
-        g_TimerManager->DeviceObject = DriverObject->DeviceObject;
-    }
+    // Step 6.1: DeviceObject for TimerManager is provided via g_TimerControlDevice
+    // (created at Step 5.4, before any module initialization).
 
     //
     // Step 6.5: Initialize encryption engine (AES-256-GCM for secure CommPort + HMAC auth)
@@ -1997,6 +2022,12 @@ ShadowStrikeUnload(
         g_TimerManager = NULL;
     }
 
+    // Delete control device created for TimerManager work items
+    if (g_TimerControlDevice != NULL) {
+        IoDeleteDevice(g_TimerControlDevice);
+        g_TimerControlDevice = NULL;
+    }
+
     if (g_SubsystemFlags & SubsysFlag_AsyncWorkQueue) {
         AwqShutdown(g_AsyncWorkQueue);
         g_AsyncWorkQueue = NULL;
@@ -2787,6 +2818,12 @@ ShadowStrikeCleanupByFlags(
     if (g_SubsystemFlags & SubsysFlag_TimerManager) {
         TmShutdown(g_TimerManager);
         g_TimerManager = NULL;
+    }
+
+    // Delete control device created for TimerManager work items
+    if (g_TimerControlDevice != NULL) {
+        IoDeleteDevice(g_TimerControlDevice);
+        g_TimerControlDevice = NULL;
     }
 
     if (g_SubsystemFlags & SubsysFlag_AsyncWorkQueue) {
