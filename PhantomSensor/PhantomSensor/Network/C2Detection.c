@@ -61,6 +61,7 @@
 #include <ntstrsafe.h>
 #include "../../Shared/BehaviorTypes.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Exclusions/ExclusionManager.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, C2Initialize)
@@ -623,10 +624,15 @@ C2RecordTraffic(
     PC2_DETECTOR_INTERNAL detector;
     PC2_DESTINATION destination;
 
-    UNREFERENCED_PARAMETER(ProcessId);
-
     if (Detector == NULL || RemoteAddress == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Check if originating process is excluded from monitoring
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        return STATUS_SUCCESS;
     }
 
     if (!C2_ACQUIRE_RUNDOWN(Detector)) {
@@ -667,10 +673,15 @@ C2RecordTLSHandshake(
     PC2_DESTINATION destination;
     CHAR malwareFamily[64] = { 0 };
 
-    UNREFERENCED_PARAMETER(ProcessId);
-
     if (Detector == NULL || RemoteAddress == NULL || JA3 == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Check if originating process is excluded from monitoring
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        return STATUS_SUCCESS;
     }
 
     if (!C2_ACQUIRE_RUNDOWN(Detector)) {

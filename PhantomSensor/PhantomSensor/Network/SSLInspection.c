@@ -54,6 +54,7 @@
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
 #include "../Tracing/Trace.h"
+#include "../Exclusions/ExclusionManager.h"
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
@@ -485,6 +486,13 @@ SslInspectClientHello(
     }
 
     *SessionInfo = NULL;
+
+    //
+    // Check if originating process is excluded from monitoring
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        return STATUS_SUCCESS;
+    }
 
     if (!SSL_ACQUIRE_RUNDOWN(Inspector)) {
         return STATUS_DELETE_PENDING;

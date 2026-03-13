@@ -55,6 +55,7 @@
 #include "../Core/Globals.h"
 #include "../Communication/ScanBridge.h"
 #include "../Utilities/ProcessUtils.h"
+#include "../Exclusions/ExclusionManager.h"
 
 /*
  * PsGetProcessImageFileName is exported by ntoskrnl but may be missing
@@ -687,6 +688,13 @@ CtCreateConnection(
 
     if (LocalAddress == NULL || RemoteAddress == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Check if originating process is excluded from monitoring
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        return STATUS_SUCCESS;
     }
 
     *Connection = NULL;

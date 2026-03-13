@@ -79,6 +79,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "ClipboardMonitor.h"
 #include "../../../Shared/VerdictTypes.h"
 #include "../../Exclusions/ExclusionManager.h"
+#include "../../Core/DriverEntry.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupWorkRoutine(_In_ PDEVICE_OBJECT, _In_opt_ PVOID);
@@ -1466,8 +1467,26 @@ Arguments:
     // BehaviorEngine internally drives AttackChainTracker → MITREMapper pipeline.
     // We submit at PASSIVE_LEVEL after all analysis enrichment is complete.
     //
+    // Enhance the suspicion score with ThreatScoring engine's aggregated
+    // per-process risk assessment (reputation, IoC matches, behavioral factors).
+    //
     if (KeGetCurrentIrql() < DISPATCH_LEVEL) {
         BEHAVIOR_RESPONSE_ACTION beResponse = BehaviorResponse_Allow;
+        UINT32 finalThreatScore = SuspicionScore;
+
+        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+        if (tsEngine != NULL) {
+            PTS_THREAT_SCORE tsResult = (PTS_THREAT_SCORE)ExAllocatePool2(
+                POOL_FLAG_PAGED, sizeof(TS_THREAT_SCORE), 'sTsS');
+            if (tsResult != NULL) {
+                RtlZeroMemory(tsResult, sizeof(TS_THREAT_SCORE));
+                NTSTATUS tsStatus = TsCalculateScoreInPlace(tsEngine, ProcessId, tsResult);
+                if (NT_SUCCESS(tsStatus) && tsResult->NormalizedScore > finalThreatScore) {
+                    finalThreatScore = tsResult->NormalizedScore;
+                }
+                ExFreePoolWithTag(tsResult, 'sTsS');
+            }
+        }
 
         NTSTATUS beStatus = BeEngineSubmitEvent(
             BehaviorEvent_ProcessCreate,
@@ -1475,7 +1494,7 @@ Arguments:
             HandleToULong(ProcessId),
             ProcessContext,
             sizeof(*ProcessContext),
-            SuspicionScore,
+            finalThreatScore,
             g_ProcessMonitor.Config.BlockSuspiciousProcesses,
             &beResponse
             );

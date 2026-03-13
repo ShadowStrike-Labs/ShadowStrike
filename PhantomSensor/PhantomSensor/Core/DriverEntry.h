@@ -105,6 +105,7 @@ typedef enum _SHADOWSTRIKE_INIT_FLAGS {
     InitFlag_AntiDebugInitialized         = 0x00400000,
     InitFlag_AntiUnloadInitialized        = 0x00800000,
     InitFlag_FileProtectionInitialized    = 0x01000000,
+    InitFlag_WppTracing                   = 0x02000000,
 
     // Combined flags for critical security components
     InitFlag_AllSecurityCallbacks   = (InitFlag_ProcessCallbackReg |
@@ -463,6 +464,15 @@ ShadowStrikeRegistryCallbackRoutine(
     _In_opt_ PVOID Argument1,
     _In_opt_ PVOID Argument2
     );
+
+/**
+ * @brief Returns the driver-owned ThreatScoring engine instance.
+ *
+ * @return PTS_SCORING_ENGINE, or NULL if ThreatScoring is not initialized.
+ */
+_IRQL_requires_max_(PASSIVE_LEVEL)
+PVOID
+ShadowStrikeGetThreatScoringEngine(VOID);
 
 #ifdef __cplusplus
 }

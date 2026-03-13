@@ -67,6 +67,7 @@ Performance Characteristics:
 #include <ntstrsafe.h>
 #include "../../Shared/BehaviorTypes.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Exclusions/ExclusionManager.h"
 
 // ============================================================================
 // INTERNAL CONSTANTS
@@ -1058,6 +1059,13 @@ DnsProcessQuery(
 
     if (PacketSize < DNS_MIN_PACKET_SIZE || PacketSize > DNS_MAX_PACKET_SIZE) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Check if originating process is excluded from monitoring
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        return STATUS_SUCCESS;
     }
 
     //

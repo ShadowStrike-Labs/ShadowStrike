@@ -46,7 +46,6 @@
 #include "FilterRegistration.h"
 #include "Globals.h"
 #include "DriverEntry.h"
-#include "../Context/StreamContext.h"
 #include "../Communication/CommPort.h"
 #include "../SelfProtection/SelfProtect.h"
 #include "../Shared/SharedDefs.h"
@@ -157,16 +156,27 @@ static const SHADOW_EXTENSION_ENTRY g_ScannableExtensions[] = {
 /**
  * @brief Context registration array.
  *
- * Uses SHADOW_STREAM_CONTEXT from StreamContext.h for consistency.
+ * Uses FLT_VARIABLE_SIZED_CONTEXTS because the canonical stream context
+ * (SHADOWSTRIKE_STREAM_CONTEXT in PostCreate.h) is ~780 bytes and evolves
+ * independently. FltAllocateContext in PostCreate.c specifies the exact
+ * size at allocation time.
+ *
+ * Cleanup callback: ShadowStrikeStreamContextCleanup in FileSystemCallbacks.c
  */
+
+//
+// Pool tag for stream contexts
+//
+#define SHADOWSTRIKE_STREAM_CTX_TAG  'xCSS'
+
 static FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
 
     {
         FLT_STREAM_CONTEXT,                         // ContextType
         0,                                          // Flags
-        ShadowCleanupStreamContext,                 // ContextCleanupCallback
-        sizeof(SHADOW_STREAM_CONTEXT),              // Size
-        SHADOW_STREAM_CONTEXT_TAG,                  // PoolTag
+        ShadowStrikeStreamContextCleanup,           // ContextCleanupCallback
+        FLT_VARIABLE_SIZED_CONTEXTS,                // Size — PostCreate specifies exact size
+        SHADOWSTRIKE_STREAM_CTX_TAG,                // PoolTag
         NULL,                                       // ContextAllocateCallback
         NULL,                                       // ContextFreeCallback
         NULL                                        // Reserved

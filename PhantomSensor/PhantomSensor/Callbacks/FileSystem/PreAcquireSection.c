@@ -1624,6 +1624,17 @@ IRQL:
             Status = FltParseFileNameInformation(NameInfo);
             if (NT_SUCCESS(Status)) {
                 //
+                // Check path exclusion — skip further analysis for excluded paths
+                //
+                if (ShadowStrikeIsPathExcluded(&NameInfo->Name, &NameInfo->Extension)) {
+                    InterlockedIncrement64((PLONG64)&g_PasState.Stats.Allowed);
+                    FltReleaseFileNameInformation(NameInfo);
+                    NameInfo = NULL;
+                    SHADOWSTRIKE_RELEASE_RUNDOWN();
+                    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+                }
+
+                //
                 // Check for suspicious path (using safe substring search)
                 //
                 if (PaspIsSuspiciousPath(&NameInfo->Name)) {

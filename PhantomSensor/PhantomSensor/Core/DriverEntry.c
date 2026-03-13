@@ -114,6 +114,9 @@
 // Phase 6: Scoring orchestration
 #include "../Behavioral/ThreatScoring.h"
 
+// Tracing infrastructure
+#include "../Tracing/WppConfig.h"
+
 // Infrastructure: lock subsystem and message queue
 #include "../Sync/SpinLock.h"
 #include "../Communication/MessageQueue.h"
@@ -222,6 +225,67 @@ static PMG_GENERATOR g_ManifestGenerator = NULL;
 /// @brief Memory scanner handle (Phase 2B)
 static PMS_SCANNER g_MemoryScanner = NULL;
 
+/// @brief Power-to-BehaviorEngine bridge callback handle
+static PVOID g_PowerBehaviorBridgeHandle = NULL;
+
+/**
+ * @brief Power callback bridge — forwards sleep/resume events to BehaviorEngine.
+ *
+ * Detects T1497.003 (Time Based Evasion) by making power transitions visible
+ * in the behavioral event stream. Attack chain tracker correlates sleep/resume
+ * with process activity to detect sandbox evasion and timing attacks.
+ */
+static VOID
+ShadowStrikePowerBehaviorBridge(
+    _In_ SHADOW_POWER_EVENT_TYPE EventType,
+    _In_ PSHADOW_POWER_EVENT_INFO Event,
+    _In_opt_ PVOID Context
+    )
+{
+    UNREFERENCED_PARAMETER(Context);
+    UNREFERENCED_PARAMETER(Event);
+
+    if (!(g_SubsystemFlags & SubsysFlag_BehaviorEngine)) {
+        return;
+    }
+
+    //
+    // Map power events to behavioral event types.
+    // Sleep/resume transitions are Defense Evasion indicators (T1497.003)
+    // because attackers use NtDelayExecution + sleep-based sandbox evasion.
+    //
+    UINT32 threatScore;
+
+    switch (EventType) {
+    case ShadowPowerEvent_EnteringSleep:
+    case ShadowPowerEvent_EnteringHibernate:
+        threatScore = 0;  // Entering sleep is benign
+        break;
+
+    case ShadowPowerEvent_ResumingFromSleep:
+    case ShadowPowerEvent_ResumingFromHibernate:
+        threatScore = 5;  // Mild baseline — chain tracker evaluates context
+        break;
+
+    case ShadowPowerEvent_BatteryCritical:
+        threatScore = 0;
+        break;
+
+    default:
+        return;
+    }
+
+    BeEngineSubmitEvent(
+        BehaviorEvent_SandboxEvasion,
+        BehaviorCategory_DefenseEvasion,
+        0,          // System-level event, no specific process
+        NULL, 0,
+        threatScore,
+        FALSE,
+        NULL
+        );
+}
+
 // ============================================================================
 // DRIVER ENTRY
 // ============================================================================
@@ -276,6 +340,19 @@ DriverEntry(
     ExInitializePushLock(&g_DriverData.ProtectedProcessLock);
 
     InitializeListHead(&g_DriverData.ProtectedProcessList);
+
+    //
+    // Step 2.4: Initialize WPP tracing (earliest possible, before any trace calls)
+    //
+    status = WppTraceInitialize(DriverObject, RegistryPath);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: WPP tracing init failed: 0x%08X (continuing without tracing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_WppTracing;
+    }
 
     //
     // Step 2.5: Initialize lock subsystem (must be before any module using enhanced locks)
@@ -448,38 +525,16 @@ DriverEntry(
     }
 
     //
-    // Step 5.8: Initialize batch processing (efficient event batching)
+    // Step 5.8: Batch processing — DEFERRED
+    // BpInitialize ready but no BpRegisterCallback consumers yet.
+    // Enable when telemetry batching pipeline is wired (user-mode agent).
     //
-    status = BpInitialize(&g_BatchProcessor);
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] WARNING: Failed to initialize batch processor: 0x%08X (continuing)\n",
-                   status);
-        g_BatchProcessor = NULL;
-        status = STATUS_SUCCESS;
-    } else {
-        g_SubsystemFlags |= SubsysFlag_BatchProcessing;
-        ShadowStrikeLogInitStatus("Batch Processing", STATUS_SUCCESS);
-    }
 
     //
-    // Step 5.9: Initialize cache optimization (cache management)
+    // Step 5.9: Cache optimization — DEFERRED
+    // CoInitialize reserves 64MB. ScanCache already handles verdict caching
+    // independently. Enable when additional cache types are integrated.
     //
-    status = CoInitialize(
-        &g_CacheOptimizer,
-        64 * 1024 * 1024,   // 64MB max total cache memory
-        NULL                 // DeviceObject: not required for WDM driver
-    );
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] WARNING: Failed to initialize cache optimizer: 0x%08X (continuing)\n",
-                   status);
-        g_CacheOptimizer = NULL;
-        status = STATUS_SUCCESS;
-    } else {
-        g_SubsystemFlags |= SubsysFlag_CacheOptimization;
-        ShadowStrikeLogInitStatus("Cache Optimization", STATUS_SUCCESS);
-    }
 
     // =========================================================================
     // PHASE 1C: Power Management
@@ -1243,6 +1298,68 @@ DriverEntry(
     }
 
     //
+    // Step 14.23: Enable performance monitoring collection
+    //
+    if (g_SubsystemFlags & SubsysFlag_PerformanceMonitor) {
+        status = SsPmEnableCollection(g_PerformanceMonitor, 5000);
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to enable performance collection: 0x%08X (continuing)\n",
+                       status);
+        } else {
+            ShadowStrikeLogInitStatus("Performance Collection", STATUS_SUCCESS);
+        }
+        status = STATUS_SUCCESS;
+    }
+
+    //
+    // Step 14.24: Start resource throttling monitoring
+    //
+    if (g_SubsystemFlags & SubsysFlag_ResourceThrottling) {
+        status = RtStartMonitoring(g_ResourceThrottler, 10000);
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to start resource throttling: 0x%08X (continuing)\n",
+                       status);
+        } else {
+            ShadowStrikeLogInitStatus("Resource Throttling Monitor", STATUS_SUCCESS);
+        }
+        status = STATUS_SUCCESS;
+    }
+
+    //
+    // Step 14.25: Register power-to-behavior bridge callback
+    // Forwards sleep/resume events to BehaviorEngine for time-based evasion detection
+    //
+    if ((g_SubsystemFlags & SubsysFlag_PowerCallback) &&
+        (g_SubsystemFlags & SubsysFlag_BehaviorEngine))
+    {
+        ULONGLONG powerEventMask =
+            (1ULL << ShadowPowerEvent_EnteringSleep) |
+            (1ULL << ShadowPowerEvent_ResumingFromSleep) |
+            (1ULL << ShadowPowerEvent_EnteringHibernate) |
+            (1ULL << ShadowPowerEvent_ResumingFromHibernate) |
+            (1ULL << ShadowPowerEvent_BatteryCritical);
+
+        status = ShadowPowerRegisterCallback(
+            ShadowStrikePowerBehaviorBridge,
+            NULL,
+            ShadowPowerPriority_Normal,
+            powerEventMask,
+            &g_PowerBehaviorBridgeHandle
+            );
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to register power-behavior bridge: 0x%08X (continuing)\n",
+                       status);
+            g_PowerBehaviorBridgeHandle = NULL;
+        } else {
+            ShadowStrikeLogInitStatus("Power-Behavior Bridge", STATUS_SUCCESS);
+        }
+        status = STATUS_SUCCESS;
+    }
+
+    //
     // Step 15: Start filtering
     //
     status = FltStartFiltering(g_DriverData.FilterHandle);
@@ -1609,6 +1726,10 @@ ShadowStrikeUnload(
     // =========================================================================
 
     if (g_SubsystemFlags & SubsysFlag_PowerCallback) {
+        if (g_PowerBehaviorBridgeHandle != NULL) {
+            ShadowPowerUnregisterCallback(g_PowerBehaviorBridgeHandle);
+            g_PowerBehaviorBridgeHandle = NULL;
+        }
         ShadowUnregisterPowerCallbacks();
     }
 
@@ -1696,10 +1817,25 @@ ShadowStrikeUnload(
     WriteBooleanRelease(&g_DriverData.Initialized, FALSE);
     g_InitFlags = InitFlag_None;
 
+    //
+    // FINAL: Shutdown WPP tracing (must be last — after all trace-emitting code)
+    //
+    WppTraceShutdown(g_DriverData.DriverObject);
+
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Driver unloaded successfully\n");
 
     return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// SUBSYSTEM ACCESSORS
+// ============================================================================
+
+PVOID
+ShadowStrikeGetThreatScoringEngine(VOID)
+{
+    return (PVOID)g_ThreatScoring;
 }
 
 // ============================================================================
@@ -2337,6 +2473,10 @@ ShadowStrikeCleanupByFlags(
     // Phase 1C: Shutdown power management
     //
     if (g_SubsystemFlags & SubsysFlag_PowerCallback) {
+        if (g_PowerBehaviorBridgeHandle != NULL) {
+            ShadowPowerUnregisterCallback(g_PowerBehaviorBridgeHandle);
+            g_PowerBehaviorBridgeHandle = NULL;
+        }
         ShadowUnregisterPowerCallbacks();
     }
 
@@ -2402,6 +2542,13 @@ ShadowStrikeCleanupByFlags(
     }
 
     ShadowStrikeCleanupProtectedProcessList();
+
+    //
+    // Shutdown WPP tracing last (after all trace-emitting modules)
+    //
+    if (InitFlags & InitFlag_WppTracing) {
+        WppTraceShutdown(g_DriverData.DriverObject);
+    }
 }
 
 // ============================================================================

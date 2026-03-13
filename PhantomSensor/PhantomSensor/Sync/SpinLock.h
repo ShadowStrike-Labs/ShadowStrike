@@ -586,19 +586,6 @@ ShadowStrikeDumpHeldLocks(
 #endif
 
 // ============================================================================
-// LEGACY COMPATIBILITY MACROS
-// ============================================================================
-
-#define ShadowStrikeInitializeLock(Lock) \
-    ShadowStrikeInitializeSpinLock(Lock)
-
-#define ShadowStrikeAcquireLock(Lock) \
-    ShadowStrikeAcquireSpinLock(Lock)
-
-#define ShadowStrikeReleaseLock(Lock) \
-    ShadowStrikeReleaseSpinLock(Lock)
-
-// ============================================================================
 // INLINE UTILITY FUNCTIONS
 // ============================================================================
 
