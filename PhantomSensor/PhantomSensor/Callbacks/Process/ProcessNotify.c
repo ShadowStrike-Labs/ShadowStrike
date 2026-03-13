@@ -85,6 +85,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../FileSystem/FileSystemCallbacks.h"
 #include "../FileSystem/PreSetInfo.h"
 #include "../Object/ObjectCallback.h"
+#include "AmsiBypassDetector.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -2913,6 +2914,12 @@ PnpHandleProcessTermination(
     // This is a no-op if the PID was never added — safe to call unconditionally.
     //
     ObRemoveProtectedProcess(ProcessId);
+
+    //
+    // Remove AMSI bypass detector tracking for this process.
+    // Prevents tracker leaks and stale entries after PID recycle.
+    //
+    AbdRemoveProcessTracking(ProcessId);
 
     //
     // Remove from tracking

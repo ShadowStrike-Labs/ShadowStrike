@@ -249,6 +249,7 @@ AbdpReleaseProcess(
 #pragma alloc_text(PAGE, AbdpFindProcess)
 #pragma alloc_text(PAGE, AbdpTrackProcess)
 #pragma alloc_text(PAGE, AbdpRemoveProcess)
+#pragma alloc_text(PAGE, AbdRemoveProcessTracking)
 #pragma alloc_text(PAGE, AbdpIsAmsiDll)
 #pragma alloc_text(PAGE, AbdpCheckPrologueForPatch)
 #pragma alloc_text(PAGE, AbdpReadProcessMemory)
@@ -517,13 +518,44 @@ AbdScanProcess(
         }
 
         //
-        // Method 1: Check against known patch signatures
+        // Step 1: If baseline available, check if prologue matches clean copy.
+        //         If it matches baseline → function is unmodified → skip to next.
+        //         This prevents false positives from signature matching on clean code.
         //
-        if (AbdpCheckPrologueForPatch(currentPrologue, ABD_PROLOGUE_SIZE, &bypassType)) {
+        if (g_AbdState.CleanAmsiCopy != NULL &&
+            func->FileOffset != 0 &&
+            func->FileOffset + ABD_PROLOGUE_SIZE <= g_AbdState.CleanAmsiSize) {
+
+            const UCHAR *cleanPrologue =
+                (const UCHAR *)g_AbdState.CleanAmsiCopy + func->FileOffset;
+
+            if (RtlCompareMemory(currentPrologue, cleanPrologue, ABD_PROLOGUE_SIZE)
+                == ABD_PROLOGUE_SIZE) {
+                //
+                // Prologue matches clean baseline — not patched, skip
+                //
+                continue;
+            }
+
+            //
+            // Prologue differs from baseline — classify the patch type
+            //
+            if (AbdpCheckPrologueForPatch(currentPrologue, ABD_PROLOGUE_SIZE, &bypassType)) {
+                //
+                // Known patch signature matched
+                //
+            } else {
+                //
+                // Unknown modification (inline hook or unknown patch)
+                //
+                bypassType = AbdBypass_InlineHook;
+            }
+
             Detection->BypassType = bypassType;
             Detection->ProcessId = ProcessId;
             Detection->TargetAddress = functionAddress;
             RtlCopyMemory(Detection->CurrentBytes, currentPrologue, ABD_PROLOGUE_SIZE);
+            RtlCopyMemory(Detection->OriginalBytes, cleanPrologue, ABD_PROLOGUE_SIZE);
             KeQuerySystemTimePrecise(&Detection->DetectionTime);
 
             RtlStringCbCopyA(
@@ -531,18 +563,6 @@ AbdScanProcess(
                 sizeof(Detection->FunctionName),
                 func->Name
             );
-
-            //
-            // Copy original bytes from clean baseline (using file offset, not RVA)
-            //
-            if (g_AbdState.CleanAmsiCopy != NULL &&
-                func->FileOffset + ABD_PROLOGUE_SIZE <= g_AbdState.CleanAmsiSize) {
-                RtlCopyMemory(
-                    Detection->OriginalBytes,
-                    (PUCHAR)g_AbdState.CleanAmsiCopy + func->FileOffset,
-                    ABD_PROLOGUE_SIZE
-                );
-            }
 
             procEntry->IsPatched = TRUE;
             procEntry->LastDetectedBypass = bypassType;
@@ -562,48 +582,37 @@ AbdScanProcess(
         }
 
         //
-        // Method 2: Compare against clean baseline using file offset (not RVA)
+        // Step 2: No baseline available — signature-only mode (lower fidelity).
+        //         Check against known patch patterns.
         //
-        if (g_AbdState.CleanAmsiCopy != NULL &&
-            func->FileOffset != 0 &&
-            func->FileOffset + ABD_PROLOGUE_SIZE <= g_AbdState.CleanAmsiSize) {
+        if (AbdpCheckPrologueForPatch(currentPrologue, ABD_PROLOGUE_SIZE, &bypassType)) {
+            Detection->BypassType = bypassType;
+            Detection->ProcessId = ProcessId;
+            Detection->TargetAddress = functionAddress;
+            RtlCopyMemory(Detection->CurrentBytes, currentPrologue, ABD_PROLOGUE_SIZE);
+            KeQuerySystemTimePrecise(&Detection->DetectionTime);
 
-            const UCHAR *cleanPrologue =
-                (const UCHAR *)g_AbdState.CleanAmsiCopy + func->FileOffset;
+            RtlStringCbCopyA(
+                Detection->FunctionName,
+                sizeof(Detection->FunctionName),
+                func->Name
+            );
 
-            if (RtlCompareMemory(currentPrologue, cleanPrologue, ABD_PROLOGUE_SIZE)
-                != ABD_PROLOGUE_SIZE) {
-                //
-                // Prologue differs from clean baseline — may be hooked
-                //
-                Detection->BypassType = AbdBypass_InlineHook;
-                Detection->ProcessId = ProcessId;
-                Detection->TargetAddress = functionAddress;
-                RtlCopyMemory(Detection->CurrentBytes, currentPrologue, ABD_PROLOGUE_SIZE);
-                RtlCopyMemory(Detection->OriginalBytes, cleanPrologue, ABD_PROLOGUE_SIZE);
-                KeQuerySystemTimePrecise(&Detection->DetectionTime);
+            procEntry->IsPatched = TRUE;
+            procEntry->LastDetectedBypass = bypassType;
 
-                RtlStringCbCopyA(
-                    Detection->FunctionName,
-                    sizeof(Detection->FunctionName),
-                    func->Name
-                );
+            InterlockedIncrement64(&g_AbdState.Stats.BypassesDetected);
+            InterlockedIncrement64(&g_AbdState.Stats.PatchDetections);
 
-                procEntry->IsPatched = TRUE;
-                procEntry->LastDetectedBypass = AbdBypass_InlineHook;
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] AMSI BYPASS DETECTED in PID %lu: "
+                       "%s patched (type=%d) at %p (sig-only mode)\n",
+                       HandleToUlong(ProcessId),
+                       func->Name,
+                       (int)bypassType,
+                       functionAddress);
 
-                InterlockedIncrement64(&g_AbdState.Stats.BypassesDetected);
-                InterlockedIncrement64(&g_AbdState.Stats.PatchDetections);
-
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                           "[ShadowStrike] AMSI HOOK DETECTED in PID %lu: "
-                           "%s modified at %p (baseline mismatch)\n",
-                           HandleToUlong(ProcessId),
-                           func->Name,
-                           functionAddress);
-
-                break;
-            }
+            break;
         }
     }
 
@@ -664,11 +673,23 @@ AbdCheckProtectionChange(
     }
 
     //
-    // Check if the protection change overlaps with amsi.dll memory range
+    // Check if the protection change overlaps with amsi.dll memory range.
+    // Use subtraction-based checks to avoid ULONG_PTR overflow on large regions.
     //
     regionStart = (ULONG_PTR)BaseAddress;
-    regionEnd = regionStart + RegionSize;
     amsiStart = (ULONG_PTR)procEntry->AmsiBase;
+
+    //
+    // Validate region arithmetic to prevent overflow
+    //
+    if (RegionSize > (ULONG_PTR)-1 - regionStart ||
+        procEntry->AmsiSize > (ULONG_PTR)-1 - amsiStart) {
+        AbdpReleaseProcess(procEntry);
+        ExReleaseRundownProtection(&g_AbdState.RundownRef);
+        return FALSE;
+    }
+
+    regionEnd = regionStart + RegionSize;
     amsiEnd = amsiStart + procEntry->AmsiSize;
 
     if (regionStart < amsiEnd && regionEnd > amsiStart) {
@@ -733,6 +754,20 @@ AbdGetStatistics(
     Stats->ProtectionChangeDetections = ReadNoFence64((PLONG64)&g_AbdState.Stats.ProtectionChangeDetections);
     Stats->EtwPatchDetections     = ReadNoFence64((PLONG64)&g_AbdState.Stats.EtwPatchDetections);
     Stats->ScansPerformed         = ReadNoFence64((PLONG64)&g_AbdState.Stats.ScansPerformed);
+}
+
+// ============================================================================
+// PROCESS CLEANUP (PUBLIC WRAPPER)
+// ============================================================================
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+AbdRemoveProcessTracking(
+    _In_ HANDLE ProcessId
+    )
+{
+    PAGED_CODE();
+    AbdpRemoveProcess(ProcessId);
 }
 
 // ============================================================================

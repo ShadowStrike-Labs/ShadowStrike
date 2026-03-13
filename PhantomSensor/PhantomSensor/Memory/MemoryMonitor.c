@@ -63,6 +63,7 @@
 #include "SectionTracker.h"
 #include "../Sync/SpinLock.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Callbacks/Process/AmsiBypassDetector.h"
 
 // ============================================================================
 // KERNEL-MODE COMPATIBILITY
@@ -1028,6 +1029,18 @@ MmMonitorHandleProtectionChange(
     MmpUpdateProcessRisk(Context);
 
     MmMonitorReleaseProcessContext(Context);
+
+    //
+    // Check if protection change targets amsi.dll (AMSI bypass indicator T1562.001).
+    // Done outside process context lock to avoid nesting.
+    //
+    AbdCheckProtectionChange(
+        UlongToHandle(ProcessId),
+        (PVOID)BaseAddress,
+        (SIZE_T)RegionSize,
+        OldProtection,
+        NewProtection
+    );
 
     return STATUS_SUCCESS;
 }
