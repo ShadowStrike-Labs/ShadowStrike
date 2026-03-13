@@ -92,6 +92,7 @@
 #include "../../Cache/ScanCache.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Shared/BehaviorTypes.h"
+#include "USBDeviceControl.h"
 #include <ntstrsafe.h>
 
 //
@@ -961,6 +962,23 @@ ShadowStrikePreSetInformation(
     //
     if (ShadowStrikeIsPathExcluded(&nameInfo->Name, NULL)) {
         InterlockedIncrement64(&g_PsiState.Stats.ExclusionSkips);
+        goto AllowOperation;
+    }
+
+    //
+    // USB Device Control: Block rename/delete on read-only removable volumes
+    //
+    if (UdcIsSetInfoBlocked(FltObjects)) {
+        shouldBlock = TRUE;
+
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/PreSetInfo] BLOCKED: USB read-only policy denied set-info: %wZ (PID=%lu)\n",
+            &nameInfo->Name,
+            HandleToULong(requestorPid)
+            );
+
         goto AllowOperation;
     }
 

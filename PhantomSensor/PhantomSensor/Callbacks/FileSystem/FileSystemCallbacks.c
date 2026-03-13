@@ -65,6 +65,7 @@ Performance Characteristics:
 #include "../../Cache/ScanCache.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Sync/TimerManager.h"
+#include "USBDeviceControl.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -854,6 +855,35 @@ Return Value:
     }
 
     //
+    // USB Device Control: Check policy for removable volumes.
+    // UdcCheckVolumePolicy returns FALSE if the volume should be rejected
+    // (Block policy). UdcNotifyVolumeMount registers the volume for
+    // write-protection enforcement by PreWrite/PreSetInfo callbacks.
+    //
+    if (IsRemovable) {
+        UDC_DEVICE_POLICY UdcPolicy = UdcPolicy_Allow;
+
+        if (!UdcCheckVolumePolicy(FltObjects, &UdcPolicy)) {
+            //
+            // Policy is Block — reject the volume attachment entirely
+            //
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/FS] Rejecting removable volume per USB Device Control policy\n"
+                );
+
+            FltReleaseContext((PFLT_CONTEXT)VolumeContext);
+            return STATUS_FLT_DO_NOT_ATTACH;
+        }
+
+        //
+        // Register volume for write-protection tracking
+        //
+        UdcNotifyVolumeMount(FltObjects, UdcPolicy);
+    }
+
+    //
     // Populate volume context
     //
     VolumeContext->FileSystemType = VolumeFilesystemType;
@@ -1114,6 +1144,12 @@ Arguments:
     PAGED_CODE();
 
     UNREFERENCED_PARAMETER(Reason);
+
+    //
+    // Notify USB Device Control of volume dismount so it can remove
+    // its tracking entry. Must happen before we free our own entry.
+    //
+    UdcNotifyVolumeDismount(FltObjects);
 
     //
     // Remove the volume list entry for this instance.
