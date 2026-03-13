@@ -1639,7 +1639,219 @@ SkipCreatePathBuild:
         }
 
         //
-        // Update statistics based on operation
+        // ================================================================
+        // PER-PROCESS BEHAVIORAL CORRELATION
+        // ================================================================
+        //
+        // Enterprise EDR sensors (CrowdStrike Falcon, SentinelOne) track
+        // per-process registry activity to detect multi-technique attacks.
+        // A single Run key write may be benign (installer), but a process
+        // that modifies Run keys + disables Defender + touches VSS in one
+        // session is almost certainly malicious. This section:
+        //
+        //   1. Gets or creates the per-process registry context
+        //   2. Updates operation counters and category-specific counters
+        //   3. Records operation in the temporal ring buffer
+        //   4. Detects multi-technique behavioral patterns
+        //   5. Submits high-confidence BehaviorEngine events on threshold
+        //
+        // Only for write-class operations to avoid overhead on reads.
+        //
+        if (keyFlags != RegFlagNone &&
+            (operation == RegOpSetValue  || operation == RegOpDeleteKey ||
+             operation == RegOpDeleteValue || operation == RegOpCreateKey ||
+             operation == RegOpRenameKey || operation == RegOpSetKeySecurity)) {
+
+            PSHADOWSTRIKE_REG_PROCESS_CONTEXT procCtx =
+                ShadowStrikeGetRegistryProcessContext(processId);
+
+            if (procCtx != NULL) {
+                ULONG ringIdx;
+                ULONG distinctCategories = 0;
+                ULONG combinedScore = 0;
+
+                //
+                // (1) Update operation counters
+                //
+                InterlockedIncrement64(&procCtx->TotalOperations);
+
+                switch (operation) {
+                    case RegOpCreateKey:
+                        InterlockedIncrement64(&procCtx->CreateKeyCount);
+                        break;
+                    case RegOpSetValue:
+                        InterlockedIncrement64(&procCtx->SetValueCount);
+                        break;
+                    case RegOpDeleteKey:
+                        InterlockedIncrement64(&procCtx->DeleteKeyCount);
+                        break;
+                    case RegOpDeleteValue:
+                        InterlockedIncrement64(&procCtx->DeleteValueCount);
+                        break;
+                    default:
+                        break;
+                }
+
+                //
+                // (2) Update category-specific counters from key classification
+                //
+                if (keyFlags & RegFlagPersistenceKey) {
+                    InterlockedIncrement64(&procCtx->PersistenceAttempts);
+                }
+                if (keyFlags & RegFlagSecurityKey) {
+                    InterlockedIncrement64(&procCtx->SecurityKeyAccesses);
+                }
+                if (keyFlags & RegFlagRunKey) {
+                    InterlockedIncrement((volatile LONG*)&procCtx->RunKeyModifications);
+                }
+                if (keyFlags & RegFlagServiceKey) {
+                    InterlockedIncrement((volatile LONG*)&procCtx->ServiceModifications);
+                }
+                if (keyFlags & RegFlagIFEOKey) {
+                    InterlockedIncrement((volatile LONG*)&procCtx->IFEOModifications);
+                }
+                if (keyFlags & (RegFlagDefenderKey | RegFlagFirewallKey | RegFlagSecurityKey)) {
+                    InterlockedIncrement((volatile LONG*)&procCtx->SecurityPolicyModifications);
+                }
+
+                //
+                // Accumulate threat indicators across the process lifetime
+                //
+                if (keyFlags & RegFlagPersistenceKey)
+                    InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, RegThreatPersistence);
+                if (keyFlags & RegFlagVSSKey)
+                    InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, RegThreatRansomware);
+                if (keyFlags & (RegFlagDefenderKey | RegFlagFirewallKey))
+                    InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, RegThreatDefenseEvasion);
+                if (keyFlags & RegFlagCertificateKey)
+                    InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, RegThreatPrivilegeEsc);
+
+                //
+                // (3) Record in temporal ring buffer for pattern analysis
+                //
+                ringIdx = (ULONG)InterlockedIncrement((volatile LONG*)&procCtx->RecentOpIndex) & 31;
+                procCtx->RecentOps[ringIdx] = operation;
+                KeQuerySystemTime(&procCtx->RecentOpTimes[ringIdx]);
+
+                //
+                // (4) Multi-technique behavioral pattern detection
+                //
+                // Count distinct persistence categories this process has touched.
+                // Each category is a different MITRE technique — touching 2+ in
+                // a single process session is highly anomalous.
+                //
+                if (procCtx->RunKeyModifications > 0)   distinctCategories++;
+                if (procCtx->ServiceModifications > 0)   distinctCategories++;
+                if (procCtx->IFEOModifications > 0)      distinctCategories++;
+                if (procCtx->ThreatIndicators & RegThreatRansomware)      distinctCategories++;
+                if (procCtx->ThreatIndicators & RegThreatDefenseEvasion)  distinctCategories++;
+
+                //
+                // PATTERN: Multi-persistence spray (T1547+T1543+T1546)
+                // A process modifying 3+ distinct persistence categories is
+                // almost certainly malicious — legitimate installers rarely
+                // touch more than one category.
+                //
+                if (distinctCategories >= 3 &&
+                    !(procCtx->ThreatIndicators & 0x80000000)) {
+
+                    InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, (LONG)0x80000000);
+
+                    combinedScore = 85;
+
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "[ShadowStrike/Reg] BEHAVIORAL: Multi-technique registry attack! "
+                               "PID=%lu, Categories=%lu (Run=%lu, Svc=%lu, IFEO=%lu, "
+                               "Ransomware=%d, DefEvasion=%d)\n",
+                               HandleToULong(processId), distinctCategories,
+                               procCtx->RunKeyModifications,
+                               procCtx->ServiceModifications,
+                               procCtx->IFEOModifications,
+                               !!(procCtx->ThreatIndicators & RegThreatRansomware),
+                               !!(procCtx->ThreatIndicators & RegThreatDefenseEvasion));
+
+                    //
+                    // Submit high-confidence multi-technique event.
+                    // Use BehaviorEvent_RegistryRunKey with elevated score
+                    // as the primary indicator — the BehaviorEngine's
+                    // kill-chain correlation will connect this with other
+                    // events from the same process.
+                    //
+                    BeEngineSubmitEvent(
+                        BehaviorEvent_RegistryRunKey,
+                        BehaviorCategory_PersistenceOperation,
+                        HandleToULong(processId),
+                        NULL, 0,
+                        combinedScore,
+                        FALSE,
+                        NULL
+                    );
+                }
+
+                //
+                // PATTERN: Defense evasion + persistence combo
+                // Process disables security AND installs persistence = high
+                // confidence malware performing installation phase.
+                //
+                if (distinctCategories >= 2 &&
+                    (procCtx->ThreatIndicators & RegThreatDefenseEvasion) &&
+                    (procCtx->ThreatIndicators & RegThreatPersistence) &&
+                    !(procCtx->ThreatIndicators & 0x40000000)) {
+
+                    InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, 0x40000000);
+
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                               "[ShadowStrike/Reg] BEHAVIORAL: Defense evasion + persistence "
+                               "combo detected! PID=%lu, SecPolicy=%lu, Persistence=%lld\n",
+                               HandleToULong(processId),
+                               procCtx->SecurityPolicyModifications,
+                               procCtx->PersistenceAttempts);
+
+                    BeEngineSubmitEvent(
+                        BehaviorEvent_DisableWindowsDefender,
+                        BehaviorCategory_DefenseEvasion,
+                        HandleToULong(processId),
+                        NULL, 0,
+                        75,
+                        FALSE,
+                        NULL
+                    );
+                }
+
+                //
+                // PATTERN: Ransomware preparation (T1490 + T1547/T1543)
+                // Process touches VSS/backup keys AND persistence = ransomware
+                // preparing for encryption by disabling recovery and ensuring
+                // post-reboot persistence.
+                //
+                if ((procCtx->ThreatIndicators & RegThreatRansomware) &&
+                    (procCtx->ThreatIndicators & RegThreatPersistence) &&
+                    !(procCtx->ThreatIndicators & 0x20000000)) {
+
+                    InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, 0x20000000);
+
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "[ShadowStrike/Reg] CRITICAL: Ransomware preparation pattern! "
+                               "PID=%lu, VSS+Persistence combo detected\n",
+                               HandleToULong(processId));
+
+                    BeEngineSubmitEvent(
+                        BehaviorEvent_RansomwareBehavior,
+                        BehaviorCategory_Impact,
+                        HandleToULong(processId),
+                        NULL, 0,
+                        90,
+                        FALSE,
+                        NULL
+                    );
+                }
+
+                ShadowStrikeReleaseRegistryProcessContext(procCtx);
+            }
+        }
+
+        //
+        // Update global statistics based on operation
         //
         switch (operation) {
             case RegOpCreateKey:
