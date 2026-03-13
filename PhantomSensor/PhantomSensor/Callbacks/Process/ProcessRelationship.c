@@ -52,6 +52,7 @@
 #include "ProcessRelationship.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
+#include "../../Behavioral/BehaviorEngine.h"
 
 //
 // Forward declarations for kernel exports not always in WDK headers
@@ -80,6 +81,12 @@ extern BOOLEAN PsIsSystemProcess(_In_ PEPROCESS Process);
 #define PR_SCORE_RAPID_RELATIONSHIPS    90
 #define PR_SCORE_ORPHANED_INJECTOR      200
 #define PR_SCORE_UNUSUAL_PARENT         70
+
+//
+// Minimum suspicion score to submit a relationship event to BehaviorEngine.
+// Remote thread (150) is the lowest dangerous relationship type.
+//
+#define PR_BE_SUBMISSION_THRESHOLD      150
 
 //
 // Cluster detection thresholds
@@ -1249,6 +1256,46 @@ PrAddRelationship(
     InterlockedIncrement64(&Graph->Stats.RelationshipsTracked);
     if (Type < PrRelation_MaxType) {
         InterlockedIncrement64(&Graph->Stats.RelationshipsByType[Type]);
+    }
+
+    //
+    // Submit high-scoring relationships to BehaviorEngine for attack-chain
+    // correlation. The relationship graph's unique value is ENRICHED scoring:
+    // cross-session, system-target, orphaned-injector modifiers are layered
+    // on top of the raw type score. Only submit when the enriched score
+    // meets the threshold — low-noise signal for kill-chain detection.
+    //
+    if (relationship->SuspicionScore >= PR_BE_SUBMISSION_THRESHOLD) {
+        BEHAVIOR_EVENT_TYPE beType;
+
+        switch (Type) {
+        case PrRelation_RemoteThread:
+            beType = BehaviorEvent_RemoteThreadCreate;
+            break;
+        case PrRelation_Injected:
+            beType = BehaviorEvent_ProcessHollowing;
+            break;
+        case PrRelation_HandleDuplication:
+            beType = BehaviorEvent_CrossProcessRead;
+            break;
+        case PrRelation_DebugRelation:
+            beType = BehaviorEvent_DebuggerEvasion;
+            break;
+        default:
+            beType = BehaviorEvent_SuspiciousParentChild;
+            break;
+        }
+
+        BeEngineSubmitEvent(
+            beType,
+            BehaviorCategory_CodeInjection,
+            HandleToULong(SourceId),
+            relationship,
+            sizeof(PR_RELATIONSHIP),
+            (UINT32)relationship->SuspicionScore,
+            FALSE,
+            NULL
+            );
     }
 
     relationship = NULL;

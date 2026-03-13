@@ -513,6 +513,14 @@ PaGetPrivilegeMonitor(
     return (PPM_MONITOR_FWD)g_PrivilegeMonitor;
 }
 
+PPR_GRAPH
+PaGetProcessRelationshipGraph(
+    VOID
+    )
+{
+    return g_ProcessRelationship;
+}
+
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS

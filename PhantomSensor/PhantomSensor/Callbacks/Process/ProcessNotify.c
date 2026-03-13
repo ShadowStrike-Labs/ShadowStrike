@@ -65,6 +65,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 
 #include "ProcessNotify.h"
 #include "ProcessAnalyzer.h"
+#include "ProcessRelationship.h"
 #include "ParentChainTracker.h"
 #include "CommandLineParser.h"
 #include "TokenAnalyzer.h"
@@ -1816,6 +1817,23 @@ Arguments:
     }
 
     //
+    // Add process to relationship graph for cross-process activity tracking.
+    // Enables injection chain detection, suspicious cluster analysis, and
+    // parent-child graph correlation (MITRE T1055, T1134).
+    //
+    {
+        PPR_GRAPH prGraph = PaGetProcessRelationshipGraph();
+        if (prGraph != NULL) {
+            (VOID)PrAddProcess(
+                prGraph,
+                ProcessId,
+                CreateInfo->ParentProcessId,
+                (PUNICODE_STRING)CreateInfo->ImageFileName
+                );
+        }
+    }
+
+    //
     // Send notification to user-mode
     //
     Status = PnpSendProcessNotification(ProcessContext, TRUE, CreateInfo);
@@ -3367,6 +3385,18 @@ PnpHandleProcessTermination(
     //
     if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
         TsOnProcessExit(g_ProcessMonitor.ThreatScoringEngine, ProcessId);
+    }
+
+    //
+    // Remove process from relationship graph before context teardown.
+    // Must happen while process context is still accessible — enables
+    // final cluster scoring and relationship cleanup.
+    //
+    {
+        PPR_GRAPH prGraph = PaGetProcessRelationshipGraph();
+        if (prGraph != NULL) {
+            PrRemoveProcess(prGraph, ProcessId);
+        }
     }
 
     //

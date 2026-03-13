@@ -63,6 +63,7 @@
 #include "../../Exclusions/ExclusionManager.h"
 #include "../Process/HandleTracker.h"
 #include "../Process/ProcessAnalyzer.h"
+#include "../Process/ProcessRelationship.h"
 #include "ThreadProtection.h"
 
 #ifdef WPP_TRACING
@@ -884,6 +885,23 @@ ShadowStrikeProcessPreCallback(
                 HtType_Process
                 );
         }
+
+        //
+        // Record handle duplication in process relationship graph.
+        // Cross-process handle dup is a key indicator for injection chains,
+        // token theft, and privilege escalation (MITRE T1134, T1055).
+        //
+        {
+            PPR_GRAPH prGraph = PaGetProcessRelationshipGraph();
+            if (prGraph != NULL) {
+                (VOID)PrAddRelationship(
+                    prGraph,
+                    PrRelation_HandleDuplication,
+                    sourceProcessId,
+                    targetProcessId
+                    );
+            }
+        }
     }
 
     return OB_PREOP_SUCCESS;
@@ -1170,6 +1188,23 @@ ShadowStrikeThreadPreCallback(
                 originalAccess,
                 HtType_Thread
                 );
+        }
+
+        //
+        // Record thread handle duplication in process relationship graph.
+        // Thread handle dup across process boundaries is a prerequisite for
+        // APC injection, thread hijack, and context manipulation (T1055.003/004).
+        //
+        {
+            PPR_GRAPH prGraph = PaGetProcessRelationshipGraph();
+            if (prGraph != NULL) {
+                (VOID)PrAddRelationship(
+                    prGraph,
+                    PrRelation_HandleDuplication,
+                    sourceProcessId,
+                    targetProcessId
+                    );
+            }
         }
     }
 

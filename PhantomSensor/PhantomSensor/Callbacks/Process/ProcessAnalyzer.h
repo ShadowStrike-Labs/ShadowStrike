@@ -67,6 +67,7 @@ typedef struct _EM_MONITOR* PEM_MONITOR;
 typedef struct _HT_TRACKER* PHT_TRACKER;
 typedef struct _PCT_TRACKER* PPCT_TRACKER_FWD;
 typedef struct _PM_MONITOR* PPM_MONITOR_FWD;
+typedef struct _PR_GRAPH* PPR_GRAPH;
 
 //
 // Pool tags for memory tracking
@@ -508,6 +509,23 @@ IRQL:
 --*/
 PPM_MONITOR_FWD
 PaGetPrivilegeMonitor(
+    VOID
+    );
+
+/*++
+Description:
+    Returns the ProcessRelationship graph instance managed by ProcessAnalyzer.
+    Used by ProcessNotify, ThreadNotify, and ObjectCallback for building
+    and querying the process relationship graph.
+
+Return Value:
+    PPR_GRAPH if initialized, NULL otherwise.
+
+IRQL:
+    Can be called at any IRQL (returns pointer only).
+--*/
+PPR_GRAPH
+PaGetProcessRelationshipGraph(
     VOID
     );
 

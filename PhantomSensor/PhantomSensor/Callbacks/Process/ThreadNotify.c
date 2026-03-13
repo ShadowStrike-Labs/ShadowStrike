@@ -63,6 +63,8 @@
 #include "../../Shared/KernelProcessTypes.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Exclusions/ExclusionManager.h"
+#include "ProcessRelationship.h"
+#include "ProcessAnalyzer.h"
 
 //
 // Minimal layout-compatible struct for protected process list traversal.
@@ -924,6 +926,23 @@ Routine Description:
                         (UINT32)event->InjectionScore,
                         FALSE,
                         NULL
+                        );
+                }
+            }
+
+            //
+            // Record remote thread relationship in process graph.
+            // Enables cross-process injection chain detection and
+            // suspicious cluster analysis across PID boundaries.
+            //
+            {
+                PPR_GRAPH prGraph = PaGetProcessRelationshipGraph();
+                if (prGraph != NULL) {
+                    (VOID)PrAddRelationship(
+                        prGraph,
+                        PrRelation_RemoteThread,
+                        creatorProcessId,
+                        ProcessId
                         );
                 }
             }
