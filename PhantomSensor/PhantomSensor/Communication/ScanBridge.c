@@ -59,6 +59,8 @@
 #include "../Utilities/FileUtils.h"
 #include "../Utilities/ProcessUtils.h"
 #include "../Utilities/StringUtils.h"
+#include "../Behavioral/BehaviorEngine.h"
+#include "../../Shared/BehaviorTypes.h"
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -360,18 +362,27 @@ ShadowStrikeScanBridgeInitialize(
     PAGED_CODE();
 
     //
-    // Atomically check and set initialization flag to prevent races
+    // Zero-initialize BEFORE setting flag — avoids a window where
+    // Initialized=1 but the struct is being cleared.
     //
     if (InterlockedCompareExchange(&g_ScanBridge.Initialized, 1, 0) != 0) {
         return STATUS_ALREADY_REGISTERED;
     }
 
     //
-    // Zero-initialize context (except Initialized which is already set)
+    // We own init now. Zero everything except the Initialized flag
+    // which we just set. Use field-by-field zeroing to avoid clearing
+    // the atomic flag and re-creating a race window.
     //
-    LONG savedInit = g_ScanBridge.Initialized;
-    RtlZeroMemory(&g_ScanBridge, sizeof(SB_CONTEXT));
-    g_ScanBridge.Initialized = savedInit;
+    g_ScanBridge.Magic = 0;
+    g_ScanBridge.ShuttingDown = 0;
+    g_ScanBridge.NextMessageId = 0;
+    g_ScanBridge.LookasideInitialized = FALSE;
+    g_ScanBridge.Requests.PendingCount = 0;
+    g_ScanBridge.Requests.PeakPending = 0;
+    g_ScanBridge.ActiveOperations = 0;
+    RtlZeroMemory(&g_ScanBridge.CircuitBreaker, sizeof(SB_CIRCUIT_BREAKER));
+    RtlZeroMemory(&g_ScanBridge.Stats, sizeof(SB_STATISTICS));
 
     //
     // Set magic value
@@ -1081,6 +1092,16 @@ SbSendScanRequestEx(
         Result->ThreatScore = reply.ThreatScore;
 
         //
+        // Log threat detections for diagnostic visibility
+        //
+        if (Result->ThreatDetected) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "ScanBridge: Threat detected — verdict=%ls score=%u\n",
+                ShadowStrikeGetVerdictName(Result->Verdict),
+                Result->ThreatScore);
+        }
+
+        //
         // Record success with circuit breaker
         //
         SbpRecordSuccess(&g_ScanBridge.CircuitBreaker);
@@ -1100,9 +1121,20 @@ SbSendScanRequestEx(
         InterlockedIncrement64(&g_ScanBridge.Stats.TimeoutScans);
         InterlockedIncrement64(&g_ScanBridge.Stats.FailedScans);
 
+        BeEngineSubmitEvent(
+            BehaviorEvent_ScanTimeout,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL,
+            0,
+            25,
+            FALSE,
+            NULL
+        );
+
     } else {
         //
-        // Other error
+        // Other error (connection lost, etc.)
         //
         Result->Status = status;
         Result->Verdict = Verdict_Error;
@@ -1112,6 +1144,17 @@ SbSendScanRequestEx(
         //
         SbpRecordFailure(&g_ScanBridge.CircuitBreaker);
         InterlockedIncrement64(&g_ScanBridge.Stats.FailedScans);
+
+        BeEngineSubmitEvent(
+            BehaviorEvent_ScanConnectionLost,
+            BehaviorCategory_Collection,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL,
+            0,
+            15,
+            FALSE,
+            NULL
+        );
     }
 
     SbpReleaseRundownProtection();
@@ -2305,6 +2348,16 @@ SbpRecordSuccess(
         //
         SbpTransitionCircuitState(CircuitBreaker, SbCircuitClosed);
         InterlockedIncrement64(&CircuitBreaker->TotalRecoveries);
+        BeEngineSubmitEvent(
+            BehaviorEvent_CircuitBreakerRecovered,
+            BehaviorCategory_Collection,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL,
+            0,
+            0,
+            FALSE,
+            NULL
+        );
     }
 }
 
@@ -2325,6 +2378,16 @@ SbpRecordFailure(
         // Failure in half-open - re-open the circuit
         //
         SbpTransitionCircuitState(CircuitBreaker, SbCircuitOpen);
+        BeEngineSubmitEvent(
+            BehaviorEvent_CircuitBreakerTripped,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL,
+            0,
+            30,
+            FALSE,
+            NULL
+        );
 
     } else if (state == SbCircuitClosed && failures >= SB_CIRCUIT_BREAKER_THRESHOLD) {
         //
@@ -2333,6 +2396,16 @@ SbpRecordFailure(
         SbpTransitionCircuitState(CircuitBreaker, SbCircuitOpen);
         InterlockedIncrement64(&CircuitBreaker->TotalTrips);
         InterlockedIncrement(&g_ScanBridge.Stats.CircuitBreakerTrips);
+        BeEngineSubmitEvent(
+            BehaviorEvent_CircuitBreakerTripped,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL,
+            0,
+            50,
+            FALSE,
+            NULL
+        );
     }
 }
 

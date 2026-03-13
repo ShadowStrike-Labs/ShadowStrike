@@ -270,6 +270,12 @@ typedef enum _BEHAVIOR_EVENT_TYPE {
     BehaviorEvent_QueueHighWaterMark            = 0x1010,
     BehaviorEvent_QueueMessageDropped           = 0x1011,
 
+    // Scan Bridge Health (0x1020)
+    BehaviorEvent_CircuitBreakerTripped         = 0x1020,
+    BehaviorEvent_CircuitBreakerRecovered       = 0x1021,
+    BehaviorEvent_ScanTimeout                   = 0x1022,
+    BehaviorEvent_ScanConnectionLost            = 0x1023,
+
     BehaviorEvent_Max                           = 0xFFFF
 } BEHAVIOR_EVENT_TYPE;
 

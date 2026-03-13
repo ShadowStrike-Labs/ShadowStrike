@@ -94,6 +94,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "PrivilegeMonitor.h"
 #include "../Registry/RegistryCallback.h"
 #include "../../Communication/MessageHandler.h"
+#include "../../Communication/ScanBridge.h"
 #include "../../ALPC/AlpcPortMonitor.h"
 #include <ntstrsafe.h>
 
@@ -1851,6 +1852,19 @@ Arguments:
     }
 
     //
+    // Also send through ScanBridge for telemetry statistics consistency.
+    // Thread/Image/Registry all go through ScanBridge; process creation
+    // should too for circuit breaker and stats tracking (fire-and-forget).
+    //
+    ShadowStrikeSendProcessEvent(
+        ProcessContext->ProcessId,
+        ProcessContext->ParentProcessId,
+        TRUE,
+        &ProcessContext->ImagePath,
+        &ProcessContext->CommandLine
+    );
+
+    //
     // Apply blocking decision
     // CRITICAL: Verify CreateInfo is not NULL before dereferencing
     //
@@ -3459,6 +3473,19 @@ PnpHandleProcessTermination(
     // Send termination notification (fire-and-forget)
     //
     PnpSendProcessNotification(Context, FALSE, NULL);
+
+    //
+    // Also notify via ScanBridge for consistent telemetry pipeline coverage.
+    // Thread/Image/Registry notifications all go through ScanBridge;
+    // process termination should too for circuit breaker + stats tracking.
+    //
+    ShadowStrikeSendProcessEvent(
+        Context->ProcessId,
+        Context->ParentProcessId,
+        FALSE,
+        &Context->ImagePath,
+        NULL
+    );
 
     //
     // Commit (discard) any pending file backup entries for this process.

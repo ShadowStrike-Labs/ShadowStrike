@@ -84,6 +84,7 @@
 #include "../Callbacks/Object/ObjectCallback.h"
 #include "../Callbacks/Object/ProcessProtection.h"
 #include "Compression.h"
+#include "ScanBridge.h"
 
 // ============================================================================
 // CONSTANTS
@@ -1722,6 +1723,25 @@ MhpHandleDriverStatusQuery(
             driverStatus.MqPeakDepth = mqPeak;
             driverStatus.MqFlowControlActive = MqIsHighWaterMark();
         }
+    }
+
+    //
+    // ScanBridge health telemetry
+    //
+    {
+        SB_STATISTICS sbStats;
+        NTSTATUS sbStatus = ShadowStrikeGetScanBridgeStatistics(&sbStats);
+        if (NT_SUCCESS(sbStatus)) {
+            driverStatus.SbTotalScans = sbStats.TotalScanRequests;
+            driverStatus.SbSuccessfulScans = sbStats.SuccessfulScans;
+            driverStatus.SbFailedScans = sbStats.FailedScans;
+            driverStatus.SbTimeoutScans = sbStats.TimeoutScans;
+            driverStatus.SbCircuitBreakerTrips = (LONG64)sbStats.CircuitBreakerTrips;
+            driverStatus.SbAvgLatencyMs = (sbStats.TotalScanRequests > 0)
+                ? (ULONG)(sbStats.TotalLatencyMs / sbStats.TotalScanRequests)
+                : 0;
+        }
+        driverStatus.SbCircuitState = (ULONG)ShadowStrikeGetCircuitState();
     }
 
     //

@@ -320,6 +320,15 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     BOOLEAN MqFlowControlActive;
     UINT8  MqReserved[3];
 
+    // ScanBridge health
+    LONG64 SbTotalScans;
+    LONG64 SbSuccessfulScans;
+    LONG64 SbFailedScans;
+    LONG64 SbTimeoutScans;
+    LONG64 SbCircuitBreakerTrips;
+    ULONG  SbAvgLatencyMs;
+    ULONG  SbCircuitState;      // 0=Closed, 1=Open, 2=HalfOpen
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================

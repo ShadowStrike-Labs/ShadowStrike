@@ -1336,6 +1336,13 @@ Return Value:
                 if (ReplyMsg.Verdict == Verdict_Malicious) {
                     ShouldBlock = TRUE;
 
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                        "[ShadowStrike/PreCreate] BLOCKED: access=%ls verdict=%ls score=%u path=%wZ\n",
+                        ShadowStrikeGetAccessTypeName(ScanAccessType),
+                        ShadowStrikeGetVerdictName(Verdict_Malicious),
+                        ReplyMsg.ThreatScore,
+                        &NameInfo->Name);
+
                     //
                     // Update cache only if key was successfully built
                     //
