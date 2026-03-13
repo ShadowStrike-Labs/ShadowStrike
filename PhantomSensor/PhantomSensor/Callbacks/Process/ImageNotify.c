@@ -2117,6 +2117,17 @@ Arguments:
     AbdNotifyImageLoad(ProcessId, ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName);
 
     //
+    // Deferred AMSI bypass scan — on non-amsi.dll loads, check if process is
+    // being tracked (has amsi.dll) and scan for prologue patches. Bypasses are
+    // typically applied between amsi.dll load and subsequent DLL/script loads.
+    // AbdScanProcess returns STATUS_NOT_FOUND fast for untracked processes.
+    //
+    if (ProcessId != NULL && AbdIsActive()) {
+        ABD_DETECTION abdDetection;
+        AbdScanProcess(ProcessId, &abdDetection);
+    }
+
+    //
     // Submit suspicious image loads to BehaviorEngine for kill-chain correlation.
     // Covers DLL injection (T1055.001), sideloading (T1574.002), BYOVD (T1068).
     //

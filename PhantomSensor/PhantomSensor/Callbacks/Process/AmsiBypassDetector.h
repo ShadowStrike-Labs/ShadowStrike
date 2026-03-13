@@ -232,6 +232,24 @@ AbdCheckProtectionChange(
     );
 
 // ============================================================================
+// PUBLIC API — PROCESS CLEANUP
+// ============================================================================
+
+/**
+ * @brief Remove process tracking entry on process termination.
+ *        Must be called from ProcessNotify to prevent tracker leaks.
+ *
+ * @param ProcessId     Terminating process ID.
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+AbdRemoveProcessTracking(
+    _In_ HANDLE ProcessId
+    );
+
+// ============================================================================
 // PUBLIC API — STATISTICS
 // ============================================================================
 
