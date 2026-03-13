@@ -1011,16 +1011,26 @@ DriverEntry(
     // Flags are set inside the function based on what succeeded
 
     //
-    // Step 12: Register registry callback (non-critical but important)
+    // Step 12: Initialize registry monitoring subsystem, then register callback
     //
-    status = ShadowStrikeRegisterRegistryCallback(DriverObject);
+    status = ShadowStrikeInitializeRegistryMonitoring();
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] WARNING: Failed to register registry callback: 0x%08X\n",
+                   "[ShadowStrike] WARNING: Failed to initialize registry monitoring: 0x%08X\n",
                    status);
         status = STATUS_SUCCESS;
     } else {
-        g_InitFlags |= InitFlag_RegistryCallbackReg;
+        g_InitFlags |= InitFlag_RegistryMonitorInit;
+
+        status = ShadowStrikeRegisterRegistryCallback(DriverObject);
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to register registry callback: 0x%08X\n",
+                       status);
+            status = STATUS_SUCCESS;
+        } else {
+            g_InitFlags |= InitFlag_RegistryCallbackReg;
+        }
     }
 
     //
@@ -1700,6 +1710,10 @@ ShadowStrikeUnload(
 
     if (g_InitFlags & InitFlag_RegistryCallbackReg) {
         ShadowStrikeUnregisterRegistryCallback();
+    }
+
+    if (g_InitFlags & InitFlag_RegistryMonitorInit) {
+        ShadowStrikeCleanupRegistryMonitoring();
     }
 
     ShadowStrikeUnregisterProcessCallbacks(g_CallbackFlags);
@@ -2549,6 +2563,10 @@ ShadowStrikeCleanupByFlags(
 
     if (InitFlags & InitFlag_RegistryCallbackReg) {
         ShadowStrikeUnregisterRegistryCallback();
+    }
+
+    if (InitFlags & InitFlag_RegistryMonitorInit) {
+        ShadowStrikeCleanupRegistryMonitoring();
     }
 
     ShadowStrikeUnregisterProcessCallbacks(g_CallbackFlags);

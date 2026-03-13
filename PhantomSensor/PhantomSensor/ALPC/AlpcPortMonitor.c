@@ -63,6 +63,7 @@
 #include "../Utilities/ProcessUtils.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Exclusions/ExclusionManager.h"
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
 #include <ntstrsafe.h>
@@ -1634,6 +1635,14 @@ ShadowAlpcPortPreCallback(
     // Skip kernel handles
     //
     if (OperationInformation->KernelHandle) {
+        ExReleaseRundownProtection(&state->RundownProtection);
+        return OB_PREOP_SUCCESS;
+    }
+
+    //
+    // Skip excluded processes — respect administrator whitelist
+    //
+    if (ShadowStrikeIsProcessExcluded(PsGetCurrentProcessId(), NULL)) {
         ExReleaseRundownProtection(&state->RundownProtection);
         return OB_PREOP_SUCCESS;
     }
