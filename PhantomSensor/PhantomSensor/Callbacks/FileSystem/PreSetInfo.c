@@ -831,8 +831,6 @@ ShadowStrikePreSetInformation(
     BOOLEAN blockRename = FALSE;
     BOOLEAN blockHardLink = FALSE;
 
-    UNREFERENCED_PARAMETER(FltObjects);
-
     //
     // SAL: _Flt_CompletionContext_Outptr_ requires explicit write
     //

@@ -796,7 +796,7 @@ ShadowStrikeProcessPreCallback(
                     HandleToULong(sourceProcessId),
                     NULL, 0,
                     (UINT32)suspicionScore,
-                    FALSE,
+                    TRUE,
                     NULL
                     );
             }
@@ -902,6 +902,13 @@ ShadowStrikeThreadPreCallback(
     //
     isSelf = (sourceProcessId == targetProcessId);
     if (isSelf) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    //
+    // Skip analysis if the requesting process is excluded
+    //
+    if (ShadowStrikeIsProcessExcluded(sourceProcessId, NULL)) {
         return OB_PREOP_SUCCESS;
     }
 
@@ -1018,7 +1025,7 @@ ShadowStrikeThreadPreCallback(
                 HandleToULong(sourceProcessId),
                 NULL, 0,
                 (UINT32)suspicionScore,
-                FALSE,
+                TRUE,
                 NULL
                 );
         }
@@ -1180,18 +1187,15 @@ ObRemoveProtectedProcess(
     KeLeaveCriticalRegion();
 
     //
-    // Free outside lock
+    // Free outside lock — but ONLY if refcount drained to zero.
+    // Freeing with outstanding references causes use-after-free → BSOD.
     //
     if (foundEntry != NULL) {
-        //
-        // Wait for reference count to drop with bounded iteration
-        //
         ULONG spinCount = 0;
+        BOOLEAN drained = FALSE;
+
         while (InterlockedCompareExchange(&foundEntry->ReferenceCount, 0, 0) > 0) {
             if (++spinCount > OB_MAX_REFCOUNT_SPINS) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                    "[ShadowStrike] ObRemoveProtectedProcess: refcount drain timeout PID=%p\n",
-                    foundEntry->ProcessId);
                 break;
             }
             LARGE_INTEGER delay;
@@ -1199,7 +1203,22 @@ ObRemoveProtectedProcess(
             KeDelayExecutionThread(KernelMode, FALSE, &delay);
         }
 
-        ShadowStrikeFreePoolWithTag(foundEntry, OB_PROTECTED_ENTRY_TAG);
+        drained = (InterlockedCompareExchange(&foundEntry->ReferenceCount, 0, 0) == 0);
+
+        if (drained) {
+            ShadowStrikeFreePoolWithTag(foundEntry, OB_PROTECTED_ENTRY_TAG);
+        } else {
+            //
+            // Refcount did not drain — leak the entry rather than cause UAF.
+            // This is a defensive choice: a small leak is infinitely better
+            // than a BSOD from use-after-free on a hot callback path.
+            //
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike] ObRemoveProtectedProcess: refcount drain timeout PID=%p "
+                "refcount=%ld — entry leaked to prevent UAF\n",
+                foundEntry->ProcessId,
+                InterlockedCompareExchange(&foundEntry->ReferenceCount, 0, 0));
+        }
     }
 }
 
@@ -2467,12 +2486,16 @@ ObpCacheProcessName(
     entry = &g_ObCallbackContext.NameCache[index];
 
     //
-    // Update entry atomically
+    // Update entry with proper memory ordering.
+    // Mark invalid first, write fields, barrier, then mark valid.
+    // The MemoryBarrier ensures all field writes are visible to
+    // other CPUs before the Valid flag transitions to 1.
     //
     InterlockedExchange(&entry->Valid, 0);
     entry->ProcessId = ProcessId;
     RtlCopyMemory(entry->ImageFileName, ImageFileName, 16);
     KeQuerySystemTime(&entry->CacheTime);
+    MemoryBarrier();
     InterlockedExchange(&entry->Valid, 1);
 }
 
@@ -2496,6 +2519,11 @@ ObpLookupCachedName(
         if (InterlockedCompareExchange(&entry->Valid, 1, 1) != 1) {
             continue;
         }
+
+        //
+        // Ensure we see the fields that were written before Valid was set to 1
+        //
+        MemoryBarrier();
 
         if (entry->ProcessId != ProcessId) {
             continue;
