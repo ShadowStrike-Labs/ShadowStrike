@@ -82,6 +82,13 @@ NTSTATUS PcInitialize(VOID);
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID PcShutdown(VOID);
 
+// Forward declarations for PreSetInfo subsystem
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS ShadowStrikeInitializePreSetInfo(VOID);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID ShadowStrikeCleanupPreSetInfo(VOID);
+
 #include "../Callbacks/Process/WSLMonitor.h"
 #include "../Callbacks/Process/AppControl.h"
 #include "../SelfProtection/FirmwareIntegrity.h"
@@ -191,6 +198,14 @@ static ULONG g_CallbackFlags = 0;
  * @brief Subsystem initialization flags for infrastructure and detection modules.
  */
 static ULONG g_SubsystemFlags = SubsysFlag_None;
+
+/**
+ * @brief PreSetInfo subsystem initialized flag.
+ *
+ * All 32 bits in both g_InitFlags and g_SubsystemFlags are exhausted.
+ * PreSetInfo uses its own init guard rather than consuming a flag bit.
+ */
+static BOOLEAN g_PreSetInfoInitialized = FALSE;
 
 // ============================================================================
 // SUBSYSTEM HANDLE STORAGE
@@ -1691,6 +1706,22 @@ DriverEntry(
     }
 
     //
+    // Step 14.31: Initialize PreSetInfo subsystem (ransomware behavioral detection,
+    // data destruction prevention, credential access monitoring, self-protection
+    // for delete/rename/hardlink operations)
+    //
+    status = ShadowStrikeInitializePreSetInfo();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize PreSetInfo subsystem: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_PreSetInfoInitialized = TRUE;
+        ShadowStrikeLogInitStatus("PreSetInfo Subsystem", STATUS_SUCCESS);
+    }
+
+    //
     // Step 15: Start filtering
     //
     status = FltStartFiltering(g_DriverData.FilterHandle);
@@ -1935,6 +1966,11 @@ ShadowStrikeUnload(
     // Step 8.4b: Shutdown PreCreate subsystem (rundown protection drain,
     // honeypot pattern cleanup, lookaside list deletion)
     //
+    if (g_PreSetInfoInitialized) {
+        ShadowStrikeCleanupPreSetInfo();
+        g_PreSetInfoInitialized = FALSE;
+    }
+
     if (g_SubsystemFlags & SubsysFlag_PreCreate) {
         PcShutdown();
         g_SubsystemFlags &= ~SubsysFlag_PreCreate;
@@ -2785,6 +2821,11 @@ ShadowStrikeCleanupByFlags(
 
     if (InitFlags & InitFlag_PasInitialized) {
         ShadowStrikePreAcquireSectionShutdown();
+    }
+
+    if (g_PreSetInfoInitialized) {
+        ShadowStrikeCleanupPreSetInfo();
+        g_PreSetInfoInitialized = FALSE;
     }
 
     if (g_SubsystemFlags & SubsysFlag_PreCreate) {

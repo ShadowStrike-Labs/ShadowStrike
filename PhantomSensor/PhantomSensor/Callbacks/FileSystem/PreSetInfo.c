@@ -187,62 +187,71 @@ ShadowStrikeSendMessage(
 // ============================================================================
 
 /**
- * @brief Sensitive system file paths (exact suffix match)
+ * @brief Sensitive system file paths for protection matching.
+ *
+ * MatchMode:
+ *   0 = suffix match (path ends with pattern, e.g., \config\SAM)
+ *   1 = contains match (path contains pattern, e.g., \drivers\ anywhere in path)
+ *
+ * Contains-match is used for directory patterns instead of prefix-match because
+ * normalized paths from FltGetFileNameInformation start with \Device\HarddiskVolumeN\,
+ * so prefix matching against \Windows\ would NEVER succeed.
  */
 typedef struct _PSI_SENSITIVE_PATH {
     PCWSTR Pattern;
-    BOOLEAN IsPrefix;       // TRUE = prefix match, FALSE = suffix match
+    UCHAR MatchMode;        // 0 = suffix, 1 = contains
     BOOLEAN BlockDelete;
     BOOLEAN BlockRename;
     BOOLEAN BlockHardLink;
 } PSI_SENSITIVE_PATH, *PPSI_SENSITIVE_PATH;
 
 static const PSI_SENSITIVE_PATH g_SensitivePaths[] = {
-    // Registry hives - exact suffix match
-    { L"\\Windows\\System32\\config\\SAM",       FALSE, TRUE, TRUE, TRUE },
-    { L"\\Windows\\System32\\config\\SECURITY",  FALSE, TRUE, TRUE, TRUE },
-    { L"\\Windows\\System32\\config\\SYSTEM",    FALSE, TRUE, TRUE, TRUE },
-    { L"\\Windows\\System32\\config\\SOFTWARE",  FALSE, TRUE, TRUE, TRUE },
-    { L"\\Windows\\System32\\config\\DEFAULT",   FALSE, TRUE, TRUE, TRUE },
+    // Registry hives - suffix match
+    { L"\\Windows\\System32\\config\\SAM",       0, TRUE, TRUE, TRUE },
+    { L"\\Windows\\System32\\config\\SECURITY",  0, TRUE, TRUE, TRUE },
+    { L"\\Windows\\System32\\config\\SYSTEM",    0, TRUE, TRUE, TRUE },
+    { L"\\Windows\\System32\\config\\SOFTWARE",  0, TRUE, TRUE, TRUE },
+    { L"\\Windows\\System32\\config\\DEFAULT",   0, TRUE, TRUE, TRUE },
 
-    // Critical system executables - exact suffix match
-    { L"\\Windows\\System32\\lsass.exe",         FALSE, TRUE, TRUE, FALSE },
-    { L"\\Windows\\System32\\csrss.exe",         FALSE, TRUE, TRUE, FALSE },
-    { L"\\Windows\\System32\\smss.exe",          FALSE, TRUE, TRUE, FALSE },
-    { L"\\Windows\\System32\\wininit.exe",       FALSE, TRUE, TRUE, FALSE },
-    { L"\\Windows\\System32\\winlogon.exe",      FALSE, TRUE, TRUE, FALSE },
-    { L"\\Windows\\System32\\services.exe",      FALSE, TRUE, TRUE, FALSE },
-    { L"\\Windows\\System32\\ntoskrnl.exe",      FALSE, TRUE, TRUE, FALSE },
-    { L"\\Windows\\System32\\hal.dll",           FALSE, TRUE, TRUE, FALSE },
-    { L"\\Windows\\System32\\ntdll.dll",         FALSE, TRUE, TRUE, FALSE },
-    { L"\\Windows\\System32\\kernel32.dll",      FALSE, TRUE, TRUE, FALSE },
+    // Critical system executables - suffix match
+    { L"\\Windows\\System32\\lsass.exe",         0, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\csrss.exe",         0, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\smss.exe",          0, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\wininit.exe",       0, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\winlogon.exe",      0, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\services.exe",      0, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\ntoskrnl.exe",      0, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\hal.dll",           0, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\ntdll.dll",         0, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\kernel32.dll",      0, TRUE, TRUE, FALSE },
 
-    // Driver directory - prefix match (block operations within)
-    { L"\\Windows\\System32\\drivers\\",         TRUE,  TRUE, TRUE, FALSE },
+    // Driver directory - contains match (block any file within \drivers\)
+    // Contains-match because normalized paths have device prefix that breaks prefix matching
+    { L"\\Windows\\System32\\drivers\\",         1, TRUE, TRUE, FALSE },
 
-    // Boot files - prefix match
-    { L"\\Windows\\Boot\\",                      TRUE,  TRUE, TRUE, FALSE },
-    { L"\\EFI\\Microsoft\\Boot\\",               TRUE,  TRUE, TRUE, FALSE },
+    // Boot files - contains match
+    { L"\\Windows\\Boot\\",                      1, TRUE, TRUE, FALSE },
+    { L"\\EFI\\Microsoft\\Boot\\",               1, TRUE, TRUE, FALSE },
 
-    // Boot manager - exact suffix match
-    { L"\\bootmgr",                              FALSE, TRUE, TRUE, FALSE },
-    { L"\\BOOTMGR",                              FALSE, TRUE, TRUE, FALSE },
+    // Boot manager - suffix match
+    { L"\\bootmgr",                              0, TRUE, TRUE, FALSE },
+    { L"\\BOOTMGR",                              0, TRUE, TRUE, FALSE },
 
-    // NTFS metadata files - exact match (case sensitive for NTFS internals)
-    { L"\\$MFT",                                 FALSE, TRUE, TRUE, FALSE },
-    { L"\\$MFTMirr",                             FALSE, TRUE, TRUE, FALSE },
-    { L"\\$LogFile",                             FALSE, TRUE, TRUE, FALSE },
-    { L"\\$Volume",                              FALSE, TRUE, TRUE, FALSE },
-    { L"\\$AttrDef",                             FALSE, TRUE, TRUE, FALSE },
-    { L"\\$Bitmap",                              FALSE, TRUE, TRUE, FALSE },
-    { L"\\$Boot",                                FALSE, TRUE, TRUE, FALSE },
-    { L"\\$BadClus",                             FALSE, TRUE, TRUE, FALSE },
-    { L"\\$Secure",                              FALSE, TRUE, TRUE, FALSE },
-    { L"\\$UpCase",                              FALSE, TRUE, TRUE, FALSE },
-    { L"\\$Extend",                              FALSE, TRUE, TRUE, FALSE },
+    // NTFS metadata files - suffix match (case sensitive for NTFS internals)
+    { L"\\$MFT",                                 0, TRUE, TRUE, FALSE },
+    { L"\\$MFTMirr",                             0, TRUE, TRUE, FALSE },
+    { L"\\$LogFile",                             0, TRUE, TRUE, FALSE },
+    { L"\\$Volume",                              0, TRUE, TRUE, FALSE },
+    { L"\\$AttrDef",                             0, TRUE, TRUE, FALSE },
+    { L"\\$Bitmap",                              0, TRUE, TRUE, FALSE },
+    { L"\\$Boot",                                0, TRUE, TRUE, FALSE },
+    { L"\\$BadClus",                             0, TRUE, TRUE, FALSE },
+    { L"\\$Secure",                              0, TRUE, TRUE, FALSE },
+    { L"\\$UpCase",                              0, TRUE, TRUE, FALSE },
+    { L"\\$Extend",                              0, TRUE, TRUE, FALSE },
 
     // Sentinel
-    { NULL, FALSE, FALSE, FALSE, FALSE }
+    { NULL, 0, FALSE, FALSE, FALSE }
 };
 
 /**
@@ -723,10 +732,13 @@ ShadowStrikeCleanupPreSetInfo(
             // Log periodically so we can diagnose hangs
             //
             if ((spinCount % 1000) == 0) {
+                ULONG waitSeconds = (spinCount * 10) / 1000;
+                ULONG waitFracMs = (spinCount * 10) % 1000;
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                           "[ShadowStrike/PreSetInfo] Shutdown waiting: %ld outstanding ops (%.1fs)\n",
+                           "[ShadowStrike/PreSetInfo] Shutdown waiting: %ld outstanding ops (%lu.%lus)\n",
                            g_PsiState.OutstandingOperations,
-                           (double)spinCount * 10.0 / 1000.0);
+                           waitSeconds,
+                           waitFracMs / 100);
             }
         }
     }
@@ -819,7 +831,11 @@ ShadowStrikePreSetInformation(
     BOOLEAN blockHardLink = FALSE;
 
     UNREFERENCED_PARAMETER(FltObjects);
-    UNREFERENCED_PARAMETER(CompletionContext);
+
+    //
+    // SAL: _Flt_CompletionContext_Outptr_ requires explicit write
+    //
+    *CompletionContext = NULL;
 
     //
     // Fast path: Check if driver is ready
@@ -1461,8 +1477,9 @@ PsipReferenceProcessContext(
 /**
  * @brief Release a reference to a process context.
  *
- * FIXED: Reference counting is now atomic under the lock to prevent
- * use-after-free race conditions.
+ * FIXED: Two-phase approach — interlocked decrement first (fast path),
+ * only acquire exclusive lock if refcount reaches zero (slow path).
+ * This avoids serializing all derefs through a single exclusive lock.
  */
 static VOID
 PsipDereferenceProcessContext(
@@ -1473,18 +1490,35 @@ PsipDereferenceProcessContext(
     BOOLEAN shouldFree = FALSE;
 
     //
-    // CRITICAL FIX: Perform decrement and removal atomically under lock.
-    // This prevents the race where another thread finds this context
-    // in the list after we've decremented but before we've removed it.
+    // Fast path: decrement without lock. If result > 0, we're done.
+    //
+    newRefCount = InterlockedDecrement(&Context->RefCount);
+
+    if (newRefCount > 0) {
+        return;
+    }
+
+    if (newRefCount < 0) {
+        //
+        // BUG: Over-release detected — attempt recovery
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike/PreSetInfo] BUG: RefCount went negative for PID=%lu\n",
+                   HandleToULong(Context->ProcessId));
+        InterlockedExchange(&Context->RefCount, 0);
+        return;
+    }
+
+    //
+    // Slow path: RefCount reached 0. Take exclusive lock and verify
+    // no one incremented it back while we were acquiring the lock.
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PsiState.ProcessContextLock);
 
-    newRefCount = InterlockedDecrement(&Context->RefCount);
-
-    if (newRefCount == 0) {
+    if (Context->RefCount == 0) {
         //
-        // No more references - remove from list
+        // Still zero under lock — safe to remove from list
         //
         if (!IsListEmpty(&Context->ListEntry)) {
             RemoveEntryList(&Context->ListEntry);
@@ -1493,24 +1527,11 @@ PsipDereferenceProcessContext(
         }
         shouldFree = TRUE;
     }
-    else if (newRefCount < 0) {
-        //
-        // BUG: Over-release detected
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike/PreSetInfo] BUG: RefCount went negative for PID=%lu\n",
-                   HandleToULong(Context->ProcessId));
-
-        // Attempt recovery
-        InterlockedExchange(&Context->RefCount, 0);
-    }
+    // else: someone re-referenced it while we waited for the lock — leave it
 
     ExReleasePushLockExclusive(&g_PsiState.ProcessContextLock);
     KeLeaveCriticalRegion();
 
-    //
-    // Free outside the lock
-    //
     if (shouldFree) {
         ExFreeToNPagedLookasideList(&g_PsiState.ProcessContextLookaside, Context);
     }
@@ -1796,8 +1817,13 @@ PsipDetectCredentialAccess(
 /**
  * @brief Check if a file path matches sensitive system files.
  *
- * FIXED: Uses proper suffix/prefix matching instead of substring matching
- * to prevent false positives and bypass attempts.
+ * FIXED: Replaced broken prefix-match with contains-match for directory
+ * patterns. Normalized paths start with \Device\HarddiskVolumeN\ so
+ * prefix matching against \Windows\ never succeeded — leaving drivers,
+ * boot files, and EFI partition completely unprotected.
+ *
+ * MatchMode 0 (suffix): path ENDS with pattern (boundary-validated)
+ * MatchMode 1 (contains): pattern appears ANYWHERE in path (case-insensitive)
  */
 static BOOLEAN
 PsipIsSensitiveSystemFile(
@@ -1832,19 +1858,38 @@ PsipIsSensitiveSystemFile(
             continue;
         }
 
-        if (g_SensitivePaths[i].IsPrefix) {
+        if (g_SensitivePaths[i].MatchMode == 1) {
             //
-            // Prefix match: check if file path STARTS with pattern
-            // This handles directory patterns like "\Windows\System32\drivers\"
+            // Contains match: scan for pattern anywhere within the path.
+            // Slide a window of pattern.Length across FileName and compare
+            // case-insensitively at each path-separator boundary.
             //
-            UNICODE_STRING filePrefix;
-            filePrefix.Buffer = FileName->Buffer;
-            filePrefix.Length = pattern.Length;
-            filePrefix.MaximumLength = pattern.Length;
+            USHORT maxOffset = fileChars - patternChars;
+            USHORT offset;
+            BOOLEAN found = FALSE;
 
-            // Case-insensitive comparison
-            compareResult = RtlCompareUnicodeString(&filePrefix, &pattern, TRUE);
-            if (compareResult == 0) {
+            for (offset = 0; offset <= maxOffset; offset++) {
+                //
+                // Only compare at path-separator boundaries to prevent
+                // false positives (e.g., "C:\notWindows\System32\drivers\")
+                //
+                if (offset > 0 && FileName->Buffer[offset - 1] != L'\\' &&
+                    FileName->Buffer[offset - 1] != L':') {
+                    continue;
+                }
+
+                UNICODE_STRING candidate;
+                candidate.Buffer = FileName->Buffer + offset;
+                candidate.Length = pattern.Length;
+                candidate.MaximumLength = pattern.Length;
+
+                if (RtlCompareUnicodeString(&candidate, &pattern, TRUE) == 0) {
+                    found = TRUE;
+                    break;
+                }
+            }
+
+            if (found) {
                 if (BlockDelete) *BlockDelete = g_SensitivePaths[i].BlockDelete;
                 if (BlockRename) *BlockRename = g_SensitivePaths[i].BlockRename;
                 if (BlockHardLink) *BlockHardLink = g_SensitivePaths[i].BlockHardLink;
@@ -1863,7 +1908,6 @@ PsipIsSensitiveSystemFile(
             fileSuffix.Length = pattern.Length;
             fileSuffix.MaximumLength = pattern.Length;
 
-            // Case-insensitive comparison
             compareResult = RtlCompareUnicodeString(&fileSuffix, &pattern, TRUE);
             if (compareResult == 0) {
                 //
@@ -2105,10 +2149,10 @@ PsipGetRenameDestination(
         }
 
         //
-        // Allocate buffer
+        // Allocate buffer (paged — callback runs at PASSIVE_LEVEL to APC_LEVEL)
         //
         buffer = (PWCHAR)ExAllocatePool2(
-            POOL_FLAG_NON_PAGED,
+            POOL_FLAG_PAGED,
             bufferLength,
             PSI_POOL_TAG
             );
@@ -2186,10 +2230,10 @@ PsipSendTelemetryEvent(
     eventSize = FIELD_OFFSET(PSI_TELEMETRY_EVENT, FileName) + fileNameLength + sizeof(WCHAR);
 
     //
-    // Allocate event structure
+    // Allocate event structure (paged — runs at PASSIVE_LEVEL context)
     //
     event = (PPSI_TELEMETRY_EVENT)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
+        POOL_FLAG_PAGED,
         eventSize,
         PSI_POOL_TAG
         );
@@ -2447,4 +2491,63 @@ ShadowStrikeClearPreSetInfoProcessContext(
     PsipDereferenceProcessContext(context);
 
     return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Remove process context on process termination.
+ *
+ * Drops the list reference for the specified process. The context will
+ * be freed once all in-flight operations release their references.
+ * This prevents stale behavioral scores persisting after PID recycle.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+VOID
+ShadowStrikeRemovePreSetInfoProcessContext(
+    _In_ HANDLE ProcessId
+    )
+{
+    PLIST_ENTRY entry;
+    PPSI_PROCESS_CONTEXT context = NULL;
+
+    if (g_PsiState.InitState != 2) {
+        return;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_PsiState.ProcessContextLock);
+
+    for (entry = g_PsiState.ProcessContextList.Flink;
+         entry != &g_PsiState.ProcessContextList;
+         entry = entry->Flink) {
+
+        PPSI_PROCESS_CONTEXT candidate = CONTAINING_RECORD(entry, PSI_PROCESS_CONTEXT, ListEntry);
+        if (candidate->ProcessId == ProcessId) {
+            context = candidate;
+            break;
+        }
+    }
+
+    if (context != NULL) {
+        //
+        // Remove from list and drop list reference.
+        // The context may still have in-flight operation references;
+        // it will be freed when the last PsipDereferenceProcessContext
+        // drops the refcount to zero (the re-check under lock in deref
+        // will see it already removed from the list).
+        //
+        RemoveEntryList(&context->ListEntry);
+        InitializeListHead(&context->ListEntry);
+        InterlockedDecrement(&g_PsiState.ProcessContextCount);
+    }
+
+    ExReleasePushLockExclusive(&g_PsiState.ProcessContextLock);
+    KeLeaveCriticalRegion();
+
+    if (context != NULL) {
+        //
+        // Drop the list reference (RefCount was initialized to 2: 1 for list + 1 for caller).
+        // If no in-flight operations hold a reference, this will free the context.
+        //
+        PsipDereferenceProcessContext(context);
+    }
 }

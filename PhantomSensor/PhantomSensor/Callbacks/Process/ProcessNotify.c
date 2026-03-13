@@ -83,6 +83,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../Sync/TimerManager.h"
 #include "../FileSystem/FileBackupEngine.h"
 #include "../FileSystem/FileSystemCallbacks.h"
+#include "../FileSystem/PreSetInfo.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -2899,6 +2900,12 @@ PnpHandleProcessTermination(
     // Prevents stale mapping data and PID recycling issues.
     //
     ShadowStrikeRemoveProcessMappingContext(ProcessId);
+
+    //
+    // Clean up PreSetInfo behavioral context for this process.
+    // Prevents stale ransomware/destruction scores persisting after PID recycle.
+    //
+    ShadowStrikeRemovePreSetInfoProcessContext(ProcessId);
 
     //
     // Remove from tracking
