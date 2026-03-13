@@ -1569,6 +1569,25 @@ MhpHandlePolicyUpdate(
     ExReleasePushLockExclusive(&g_DriverData.ConfigLock);
     KeLeaveCriticalRegion();
 
+    //
+    // Apply message queue tuning if any values are non-zero.
+    // Zero fields mean "keep current value" — MqConfigure handles this internally.
+    //
+    if (policy->MqMaxQueueDepth != 0 || policy->MqMaxMessageSize != 0 ||
+        policy->MqBatchSize != 0 || policy->MqBatchTimeoutMs != 0) {
+
+        NTSTATUS mqStatus = MqConfigure(
+            policy->MqMaxQueueDepth,
+            policy->MqMaxMessageSize,
+            policy->MqBatchSize,
+            policy->MqBatchTimeoutMs
+        );
+        if (!NT_SUCCESS(mqStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/MH] MqConfigure failed: 0x%08X\n", mqStatus);
+        }
+    }
+
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/MH] Policy updated: ScanOnOpen=%d, ScanOnExec=%d, Timeout=%u\n",
                policy->ScanOnOpen, policy->ScanOnExecute, policy->ScanTimeoutMs);
@@ -1681,6 +1700,27 @@ MhpHandleDriverStatusQuery(
                 driverStatus.CompressionAvgRatio = compStats.AverageRatio;
                 driverStatus.CompressionErrors = (ULONG)compStats.Errors;
             }
+        }
+    }
+
+    //
+    // Message queue health statistics
+    //
+    {
+        UINT64 mqEnqueued, mqDequeued, mqDropped;
+        UINT32 mqDepth, mqPeak;
+
+        NTSTATUS mqStatus = MqGetStatistics(
+            &mqEnqueued, &mqDequeued, &mqDropped,
+            &mqDepth, &mqPeak
+        );
+        if (NT_SUCCESS(mqStatus)) {
+            driverStatus.MqTotalEnqueued = mqEnqueued;
+            driverStatus.MqTotalDequeued = mqDequeued;
+            driverStatus.MqTotalDropped = mqDropped;
+            driverStatus.MqCurrentDepth = mqDepth;
+            driverStatus.MqPeakDepth = mqPeak;
+            driverStatus.MqFlowControlActive = MqIsHighWaterMark();
         }
     }
 

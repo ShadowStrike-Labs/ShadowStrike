@@ -1682,6 +1682,14 @@ ShadowStrikeSendNotification(
         // for delivery when a client reconnects.  This prevents telemetry
         // loss during user-mode agent restart / reconnect windows.
         //
+        // Backpressure check: log if queue is at high water mark
+        //
+        if (MqIsHighWaterMark()) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/CommPort] Queue at high water mark (depth=%u), "
+                       "enqueue may be dropped. Consider client reconnect.\n",
+                       MqGetQueueDepth());
+        }
         MqEnqueueMessage(
             (SHADOWSTRIKE_MESSAGE_TYPE)Notification->MessageType,
             sendBuffer,
