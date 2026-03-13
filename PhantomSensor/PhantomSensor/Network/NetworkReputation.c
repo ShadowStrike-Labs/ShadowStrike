@@ -26,7 +26,7 @@
  * Architecture:
  * - EX_RUNDOWN_REF protects manager lifetime (all operations acquire it).
  * - EX_PUSH_LOCK (shared/exclusive) guards cache data structures.
- * - Periodic cleanup runs at PASSIVE_LEVEL via IoWorkItem queued from DPC.
+ * - Periodic cleanup runs at PASSIVE_LEVEL via TimerManager (WorkItemCallback).
  * - Entries allocated from PagedPool (only accessed at <= APC_LEVEL).
  * - Duplicate entries detected and updated in-place on re-add.
  * - Private/loopback IPs return NrReputation_Unknown with NR_FLAG_INTERNAL,
@@ -45,6 +45,8 @@
 #pragma warning(pop)
 
 #include <ntstrsafe.h>
+#include "../../Sync/TimerManager.h"
+#include "../../Core/DriverEntry.h"
 
 //
 // Forward declarations needed before alloc_text (defined later in file)
@@ -159,12 +161,9 @@ NrpCleanupExpiredEntries(
     _In_ ULONG MaxToClean
     );
 
-static KDEFERRED_ROUTINE NrpCleanupTimerDpc;
-
-_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
-NrpCleanupWorkRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
+NrpCleanupTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     );
 
@@ -237,7 +236,7 @@ NrpSafeStringLengthA(
 #pragma alloc_text(PAGE, NrpIsEntryExpired)
 #pragma alloc_text(PAGE, NrpEvictOldestEntry)
 #pragma alloc_text(PAGE, NrpCleanupExpiredEntries)
-#pragma alloc_text(PAGE, NrpCleanupWorkRoutine)
+#pragma alloc_text(PAGE, NrpCleanupTimerCallback)
 // Private - hashing
 #pragma alloc_text(PAGE, NrpHashIP)
 #pragma alloc_text(PAGE, NrpHashDomain)
@@ -303,25 +302,25 @@ _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 NrInitialize(
-    _In_ PDEVICE_OBJECT DeviceObject,
     _Out_ PNR_MANAGER* Manager
     )
 {
     NTSTATUS status = STATUS_SUCCESS;
     PNR_MANAGER manager = NULL;
     ULONG i;
-    LARGE_INTEGER dueTime;
+    PTM_MANAGER timerManager = NULL;
+    TM_TIMER_OPTIONS opts = {0};
 
     PAGED_CODE();
 
-    if (DeviceObject == NULL || Manager == NULL) {
+    if (Manager == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Manager = NULL;
 
     //
-    // Allocate manager structure from NonPagedPool (contains KTIMER, KDPC,
+    // Allocate manager structure from NonPagedPool (contains
     // EX_RUNDOWN_REF which must be non-paged).
     //
     manager = (PNR_MANAGER)ExAllocatePoolZero(
@@ -332,8 +331,6 @@ NrInitialize(
     if (manager == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-
-    manager->DeviceObject = DeviceObject;
 
     //
     // Initialize rundown protection. All public operations acquire this
@@ -380,31 +377,31 @@ NrInitialize(
     KeQuerySystemTime(&manager->Stats.StartTime);
 
     //
-    // Allocate work item for periodic cleanup (runs at PASSIVE_LEVEL)
+    // Create periodic cleanup timer via centralized TimerManager.
+    // TmFlag_WorkItemCallback ensures the callback runs at PASSIVE_LEVEL.
     //
-    manager->CleanupWorkItem = IoAllocateWorkItem(DeviceObject);
-    if (manager->CleanupWorkItem == NULL) {
-        status = STATUS_INSUFFICIENT_RESOURCES;
-        goto Cleanup;
-    }
     manager->CleanupInProgress = 0;
 
-    //
-    // Initialize cleanup timer + DPC (DPC only queues the work item)
-    //
-    KeInitializeTimer(&manager->CleanupTimer);
-    KeInitializeDpc(&manager->CleanupDpc, NrpCleanupTimerDpc, manager);
+    timerManager = ShadowStrikeGetTimerManager();
+    if (timerManager == NULL) {
+        status = STATUS_DEVICE_NOT_READY;
+        goto Cleanup;
+    }
 
-    //
-    // Start cleanup timer (periodic)
-    //
-    dueTime.QuadPart = -((LONGLONG)NR_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &manager->CleanupTimer,
-        dueTime,
+    opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+    opts.Name = "NrCleanup";
+
+    status = TmCreatePeriodic(
+        timerManager,
         NR_CLEANUP_INTERVAL_MS,
-        &manager->CleanupDpc
+        NrpCleanupTimerCallback,
+        manager,
+        &opts,
+        &manager->CleanupTimerId
     );
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
 
     *Manager = manager;
 
@@ -418,9 +415,6 @@ NrInitialize(
 
 Cleanup:
     if (manager != NULL) {
-        if (manager->CleanupWorkItem != NULL) {
-            IoFreeWorkItem(manager->CleanupWorkItem);
-        }
         if (manager->Hash.Buckets != NULL) {
             ExFreePoolWithTag(manager->Hash.Buckets, NR_POOL_TAG_CACHE);
         }
@@ -446,39 +440,21 @@ NrShutdown(
     }
 
     //
-    // 1. Cancel the periodic timer so no new DPCs fire.
+    // 1. Cancel the periodic cleanup timer. TmCancel with Wait=TRUE
+    //    blocks until any in-flight callback completes, replacing the
+    //    old KeCancelTimer + KeFlushQueuedDpcs + spin-wait pattern.
     //
-    KeCancelTimer(&Manager->CleanupTimer);
+    TmCancel(ShadowStrikeGetTimerManager(), Manager->CleanupTimerId, TRUE);
 
     //
-    // 2. Flush any DPC that is already queued/running.
-    //
-    KeFlushQueuedDpcs();
-
-    //
-    // 3. Wait for any in-flight cleanup work item to complete.
-    //    After KeFlushQueuedDpcs, no new DPCs will fire, but a work item
-    //    may have been queued by the last DPC. Spin-wait until it finishes.
-    //    The work item releases rundown BEFORE clearing CleanupInProgress,
-    //    so by the time we see 0, the rundown ref is already released.
-    //
-    {
-        LARGE_INTEGER spinDelay;
-        spinDelay.QuadPart = -10000; // 1ms in 100-nanosecond intervals
-        while (InterlockedCompareExchange(&Manager->CleanupInProgress, 0, 0) != 0) {
-            KeDelayExecutionThread(KernelMode, FALSE, &spinDelay);
-        }
-    }
-
-    //
-    // 4. Wait for rundown: blocks until every thread that called
+    // 2. Wait for rundown: blocks until every thread that called
     //    ExAcquireRundownProtection has released it. After this returns
     //    no new acquisitions will succeed.
     //
     ExWaitForRundownProtectionRelease(&Manager->RundownRef);
 
     //
-    // 5. Now we are the sole owner. Clear the cache (no lock needed
+    // 3. Now we are the sole owner. Clear the cache (no lock needed
     //    since rundown is complete, but we still take it for correctness
     //    because NrpClearCacheInternal expects it).
     //
@@ -509,13 +485,8 @@ NrShutdown(
                Manager->Stats.Misses);
 
     //
-    // 6. Free resources
+    // 4. Free resources
     //
-    if (Manager->CleanupWorkItem != NULL) {
-        IoFreeWorkItem(Manager->CleanupWorkItem);
-        Manager->CleanupWorkItem = NULL;
-    }
-
     if (Manager->Hash.Buckets != NULL) {
         ExFreePoolWithTag(Manager->Hash.Buckets, NR_POOL_TAG_CACHE);
         Manager->Hash.Buckets = NULL;
@@ -1644,27 +1615,23 @@ NrpCleanupExpiredEntries(
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - TIMER DPC + WORK ITEM
+// PRIVATE IMPLEMENTATION - TIMER CALLBACK (VIA TimerManager)
 // ============================================================================
 
 //
-// DPC callback: runs at DISPATCH_LEVEL. Does NOT touch push locks or
-// rundown protection (ExAcquireRundownProtection requires <= APC_LEVEL).
-// Only checks the non-reentrant guard and queues a work item.
+// TimerManager callback: runs at PASSIVE_LEVEL (TmFlag_WorkItemCallback).
+// Replaces the old DPC + IoWorkItem two-stage pattern.
 //
 static VOID
-NrpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+NrpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PNR_MANAGER manager = (PNR_MANAGER)DeferredContext;
+    PNR_MANAGER manager = (PNR_MANAGER)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (manager == NULL) {
         return;
@@ -1674,44 +1641,16 @@ NrpCleanupTimerDpc(
     }
 
     //
-    // Prevent overlapping work items (non-reentrant guard).
-    // Rundown protection is acquired in the work item at PASSIVE_LEVEL,
-    // not here at DISPATCH_LEVEL where it would violate the IRQL contract.
+    // Prevent overlapping callbacks (non-reentrant guard).
     //
-    if (InterlockedCompareExchange(&manager->CleanupInProgress, 1, 0) == 0) {
-        IoQueueWorkItem(
-            manager->CleanupWorkItem,
-            NrpCleanupWorkRoutine,
-            DelayedWorkQueue,
-            manager
-        );
-    }
-}
-
-//
-// Work item callback: runs at PASSIVE_LEVEL. Acquires rundown protection
-// here (not in the DPC) to comply with the IRQL <= APC_LEVEL contract.
-//
-_IRQL_requires_(PASSIVE_LEVEL)
-static VOID
-NrpCleanupWorkRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
-    )
-{
-    PNR_MANAGER manager = (PNR_MANAGER)Context;
-
-    PAGED_CODE();
-    UNREFERENCED_PARAMETER(DeviceObject);
-
-    if (manager == NULL) {
+    if (InterlockedCompareExchange(&manager->CleanupInProgress, 1, 0) != 0) {
         return;
     }
 
     //
-    // Acquire rundown at PASSIVE_LEVEL (correct IRQL). If shutdown has
-    // already started, ExWaitForRundownProtectionRelease makes the ref
-    // permanently non-acquirable, so this fails and we exit cleanly.
+    // Acquire rundown at PASSIVE_LEVEL. If shutdown has already started,
+    // ExWaitForRundownProtectionRelease makes the ref permanently
+    // non-acquirable, so this fails and we exit cleanly.
     //
     if (!ExAcquireRundownProtection(&manager->RundownRef)) {
         InterlockedExchange(&manager->CleanupInProgress, 0);
@@ -1721,9 +1660,7 @@ NrpCleanupWorkRoutine(
     NrpCleanupExpiredEntries(manager, NR_MAX_CLEANUP_PER_TICK);
 
     //
-    // Release rundown BEFORE clearing the in-progress flag. This ensures
-    // that when shutdown's spin-wait sees CleanupInProgress == 0, our
-    // rundown reference has already been released.
+    // Release rundown BEFORE clearing the in-progress flag.
     //
     ExReleaseRundownProtection(&manager->RundownRef);
     InterlockedExchange(&manager->CleanupInProgress, 0);

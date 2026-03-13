@@ -43,7 +43,7 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
+#include <fltKernel.h>
 #include <ntintsafe.h>
 #include <bcrypt.h>
 #include <ntstrsafe.h>

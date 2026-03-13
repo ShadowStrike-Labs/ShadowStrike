@@ -62,6 +62,8 @@
 #include "../../Shared/BehaviorTypes.h"
 #include "../Behavioral/BehaviorEngine.h"
 #include "../Exclusions/ExclusionManager.h"
+#include "../../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, C2Initialize)
@@ -167,10 +169,7 @@ typedef struct _C2_DETECTOR_INTERNAL {
     NPAGED_LOOKASIDE_LIST IOCLookaside;
     BOOLEAN LookasideInitialized;
 
-    PIO_WORKITEM AnalysisWorkItem;
-    volatile LONG AnalysisWorkItemQueued;
 
-    PDEVICE_OBJECT DeviceObject;
 } C2_DETECTOR_INTERNAL, *PC2_DETECTOR_INTERNAL;
 
 // ============================================================================
@@ -179,12 +178,8 @@ typedef struct _C2_DETECTOR_INTERNAL {
 
 EXTERN_C UCHAR* PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
-static VOID C2pAnalysisTimerDpc(
-    _In_ PKDPC Dpc, _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID Arg1, _In_opt_ PVOID Arg2);
-
-static VOID C2pAnalysisWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Context);
+static VOID C2pAnalysisTimerCallback(
+    _In_ ULONG TimerId, _In_opt_ PVOID Context);
 
 static VOID C2pCleanupStaleEntries(
     _In_ PC2_DETECTOR_INTERNAL Detector);
@@ -298,7 +293,6 @@ C2Initialize(
 {
     NTSTATUS status;
     PC2_DETECTOR_INTERNAL detector = NULL;
-    LARGE_INTEGER timerDue;
     ULONG i;
 
     PAGED_CODE();
@@ -385,33 +379,31 @@ C2Initialize(
     detector->Public.Config.EnableBeaconDetection = TRUE;
 
     //
-    // Allocate work item for PASSIVE_LEVEL analysis.
-    // Must be done before starting the timer/DPC.
+    // Create periodic analysis timer via TimerManager (PASSIVE_LEVEL callback).
     //
-    detector->DeviceObject = DeviceObject;
-    detector->AnalysisWorkItem = IoAllocateWorkItem(DeviceObject);
-    if (detector->AnalysisWorkItem == NULL) {
+    detector->Public.AnalysisIntervalMs = C2_ANALYSIS_TIMER_INTERVAL_MS;
+    {
+        TM_TIMER_OPTIONS opts = {0};
+        opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+        opts.Name = "C2Analysis";
+
+        status = TmCreatePeriodic(
+            ShadowStrikeGetTimerManager(),
+            C2_ANALYSIS_TIMER_INTERVAL_MS,
+            C2pAnalysisTimerCallback,
+            detector,
+            &opts,
+            &detector->Public.AnalysisTimerId);
+    }
+
+    if (!NT_SUCCESS(status)) {
         ExDeleteNPagedLookasideList(&detector->IOCLookaside);
         ExDeleteNPagedLookasideList(&detector->SampleLookaside);
         ExDeleteNPagedLookasideList(&detector->DestinationLookaside);
         ExFreePoolWithTag(detector->Public.DestinationHash.Buckets, C2_POOL_TAG_CONTEXT);
         ExFreePoolWithTag(detector, C2_POOL_TAG_CONTEXT);
-        return STATUS_INSUFFICIENT_RESOURCES;
+        return status;
     }
-
-    //
-    // Timer + DPC → work item architecture.
-    // DPC runs at DISPATCH_LEVEL but only queues a PASSIVE_LEVEL work item.
-    //
-    KeInitializeTimer(&detector->Public.AnalysisTimer);
-    KeInitializeDpc(&detector->Public.AnalysisDpc,
-                    C2pAnalysisTimerDpc, detector);
-    detector->Public.AnalysisIntervalMs = C2_ANALYSIS_TIMER_INTERVAL_MS;
-
-    timerDue.QuadPart = -((LONGLONG)detector->Public.AnalysisIntervalMs * 10000);
-    KeSetTimerEx(&detector->Public.AnalysisTimer, timerDue,
-                 detector->Public.AnalysisIntervalMs,
-                 &detector->Public.AnalysisDpc);
 
     KeQuerySystemTime(&detector->Public.Stats.StartTime);
 
@@ -453,10 +445,12 @@ C2Shutdown(
     detector = CONTAINING_RECORD(Detector, C2_DETECTOR_INTERNAL, Public);
 
     //
-    // Cancel timer, flush DPCs, then wait for all in-flight rundown refs.
+    // Cancel analysis timer and wait for in-flight callback to complete.
     //
-    KeCancelTimer(&Detector->AnalysisTimer);
-    KeFlushQueuedDpcs();
+    if (Detector->AnalysisTimerId != 0) {
+        TmCancel(ShadowStrikeGetTimerManager(), Detector->AnalysisTimerId, TRUE);
+        Detector->AnalysisTimerId = 0;
+    }
     ExWaitForRundownProtectionRelease(&Detector->RundownRef);
 
     //
@@ -513,14 +507,6 @@ C2Shutdown(
         ExDeleteNPagedLookasideList(&detector->DestinationLookaside);
         ExDeleteNPagedLookasideList(&detector->SampleLookaside);
         ExDeleteNPagedLookasideList(&detector->IOCLookaside);
-    }
-
-    //
-    // Free work item if allocated
-    //
-    if (detector->AnalysisWorkItem != NULL) {
-        IoFreeWorkItem(detector->AnalysisWorkItem);
-        detector->AnalysisWorkItem = NULL;
     }
 
     ExFreePoolWithTag(detector, C2_POOL_TAG_CONTEXT);
@@ -1333,52 +1319,12 @@ C2GetStatistics(
 }
 
 // ============================================================================
-// PRIVATE — TIMER DPC (DISPATCH_LEVEL)
-//
-// Only queues a work item. Does NO list traversal, lock acquisition, or
-// allocation beyond IoQueueWorkItemEx.
+// PRIVATE — PERIODIC ANALYSIS CALLBACK (PASSIVE_LEVEL via TimerManager)
 // ============================================================================
 
 static VOID
-C2pAnalysisTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID Arg1,
-    _In_opt_ PVOID Arg2
-    )
-{
-    PC2_DETECTOR_INTERNAL detector = (PC2_DETECTOR_INTERNAL)DeferredContext;
-
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(Arg1);
-    UNREFERENCED_PARAMETER(Arg2);
-
-    if (detector == NULL || !detector->Public.Initialized) {
-        return;
-    }
-
-    //
-    // Avoid queuing multiple concurrent work items
-    //
-    if (InterlockedCompareExchange(&detector->AnalysisWorkItemQueued, 1, 0) == 0) {
-        if (detector->AnalysisWorkItem != NULL) {
-            IoQueueWorkItem(detector->AnalysisWorkItem,
-                            C2pAnalysisWorkItemRoutine,
-                            DelayedWorkQueue,
-                            detector);
-        } else {
-            InterlockedExchange(&detector->AnalysisWorkItemQueued, 0);
-        }
-    }
-}
-
-// ============================================================================
-// PRIVATE — ANALYSIS WORK ITEM (PASSIVE_LEVEL)
-// ============================================================================
-
-static VOID
-C2pAnalysisWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
+C2pAnalysisTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     )
 {
@@ -1390,7 +1336,7 @@ C2pAnalysisWorkItemRoutine(
     LARGE_INTEGER cutoffTime;
     PULONG intervalBuffer = NULL;
 
-    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (detector == NULL) {
         return;
@@ -1399,7 +1345,6 @@ C2pAnalysisWorkItemRoutine(
     pub = &detector->Public;
 
     if (!C2_ACQUIRE_RUNDOWN(pub)) {
-        InterlockedExchange(&detector->AnalysisWorkItemQueued, 0);
         return;
     }
 
@@ -1412,7 +1357,6 @@ C2pAnalysisWorkItemRoutine(
         C2_POOL_TAG_WORK);
 
     if (intervalBuffer == NULL) {
-        InterlockedExchange(&detector->AnalysisWorkItemQueued, 0);
         C2_RELEASE_RUNDOWN(pub);
         return;
     }
@@ -1500,7 +1444,6 @@ C2pAnalysisWorkItemRoutine(
     //
     C2pCleanupStaleEntries(detector);
 
-    InterlockedExchange(&detector->AnalysisWorkItemQueued, 0);
     C2_RELEASE_RUNDOWN(pub);
 }
 

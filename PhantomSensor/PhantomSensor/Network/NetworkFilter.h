@@ -360,8 +360,6 @@ typedef struct _NETWORK_FILTER_GLOBALS {
     // Device object for WFP
     PDEVICE_OBJECT WfpDeviceObject;
     
-    // Cleanup work item
-    PIO_WORKITEM CleanupWorkItem;
 } NETWORK_FILTER_GLOBALS, *PNETWORK_FILTER_GLOBALS;
 
 // Init state constants

@@ -73,6 +73,8 @@
 #include <ntstrsafe.h>
 #include <ip2string.h>
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 // ============================================================================
 // GUID DEFINITIONS
@@ -190,9 +192,8 @@ static LIST_ENTRY g_PendingDnsList;
 static EX_PUSH_LOCK g_PendingDnsLock;
 static volatile LONG g_PendingDnsCount;
 
-// Cleanup timer and DPC
-static KTIMER g_CleanupTimer;
-static KDPC g_CleanupDpc;
+// Cleanup timer (managed by TimerManager)
+static ULONG g_CleanupTimerId;
 static volatile LONG g_CleanupInProgress;
 
 // Subsystem pointers (from other Network modules)
@@ -273,14 +274,7 @@ NfpRemoveConnection(_In_ PNF_CONNECTION_ENTRY Connection);
 
 static VOID
 NfpCleanupTimerCallback(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2);
-
-static VOID
-NfpCleanupWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context);
 
 static VOID
@@ -414,7 +408,7 @@ NfpReadConfig(_Out_ PNETWORK_MONITOR_CONFIG ConfigOut)
 #pragma alloc_text(PAGE, NfpCleanupHashTables)
 #pragma alloc_text(PAGE, NfpInitializeLookasideLists)
 #pragma alloc_text(PAGE, NfpCleanupLookasideLists)
-#pragma alloc_text(PAGE, NfpCleanupWorkItemRoutine)
+#pragma alloc_text(PAGE, NfpCleanupTimerCallback)
 #pragma alloc_text(PAGE, NfpCleanupStaleConnections)
 #pragma alloc_text(PAGE, NfpCleanupStaleDnsEntries)
 #pragma alloc_text(PAGE, NfpCleanupStalePendingDns)
@@ -446,8 +440,6 @@ NfFilterInitialize(
     FWPM_SESSION0 session = {0};
     FWPM_PROVIDER0 provider = {0};
     FWPM_SUBLAYER0 sublayer = {0};
-    LARGE_INTEGER dueTime;
-
     PAGED_CODE();
 
     if (DeviceObject == NULL) {
@@ -608,30 +600,28 @@ NfFilterInitialize(
     }
 
     //
-    // Allocate cleanup work item (must be done before starting timer)
+    // Create periodic cleanup timer via TimerManager (auto-starts)
     //
-    g_NfState.CleanupWorkItem = IoAllocateWorkItem(DeviceObject);
-    if (g_NfState.CleanupWorkItem == NULL) {
-        NfpUnregisterFilters();
-        NfpUnregisterCallouts();
-        status = STATUS_INSUFFICIENT_RESOURCES;
-        goto CleanupEngine;
-    }
-
-    //
-    // Initialize and start cleanup timer
-    //
-    KeInitializeTimer(&g_CleanupTimer);
-    KeInitializeDpc(&g_CleanupDpc, NfpCleanupTimerCallback, NULL);
     g_CleanupInProgress = 0;
+    {
+        TM_TIMER_OPTIONS opts = {0};
+        opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+        opts.Name = "NfCleanup";
 
-    dueTime.QuadPart = -((LONGLONG)NF_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &g_CleanupTimer,
-        dueTime,
-        NF_CLEANUP_INTERVAL_MS,
-        &g_CleanupDpc
-        );
+        status = TmCreatePeriodic(
+            ShadowStrikeGetTimerManager(),
+            NF_CLEANUP_INTERVAL_MS,
+            NfpCleanupTimerCallback,
+            NULL,
+            &opts,
+            &g_CleanupTimerId
+            );
+        if (!NT_SUCCESS(status)) {
+            NfpUnregisterFilters();
+            NfpUnregisterCallouts();
+            goto CleanupEngine;
+        }
+    }
 
     //
     // Initialize default configuration under lock
@@ -692,7 +682,7 @@ NfFilterInitialize(
         g_C2Detector = NULL;
     }
 
-    status = NrInitialize(DeviceObject, &g_ReputationManager);
+    status = NrInitialize(&g_ReputationManager);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike/NF] WARNING: NetworkReputation init failed: 0x%08X (continuing)\n",
@@ -786,13 +776,12 @@ NfFilterShutdown(
     InterlockedExchange(&g_NfState.Enabled, 0);
 
     //
-    // Cancel and wait for cleanup timer
+    // Cancel cleanup timer and wait for in-flight callback
     //
-    KeCancelTimer(&g_CleanupTimer);
-    KeFlushQueuedDpcs();
+    TmCancel(ShadowStrikeGetTimerManager(), g_CleanupTimerId, TRUE);
 
     //
-    // Wait for any in-progress cleanup work item to complete
+    // Safety: wait for any in-progress cleanup to complete
     //
     timeout.QuadPart = -10000000LL;  // 1 second
     while (InterlockedCompareExchange(&g_CleanupInProgress, 0, 0) != 0) {
@@ -840,14 +829,6 @@ NfFilterShutdown(
     if (g_ConnectionTracker != NULL) {
         CtShutdown(g_ConnectionTracker);
         g_ConnectionTracker = NULL;
-    }
-
-    //
-    // Free cleanup work item
-    //
-    if (g_NfState.CleanupWorkItem != NULL) {
-        IoFreeWorkItem(g_NfState.CleanupWorkItem);
-        g_NfState.CleanupWorkItem = NULL;
     }
 
     //
@@ -2660,58 +2641,22 @@ NfpRemoveConnection(
 // ============================================================================
 
 /**
- * @brief DPC callback — queues a work item for cleanup at PASSIVE_LEVEL.
- *
- * DPCs run at DISPATCH_LEVEL. Push locks can be acquired at DISPATCH
- * via KeAcquireInStackQueuedSpinLock, but for simplicity and to allow
- * process path lookups, we defer to a work item.
+ * @brief Periodic cleanup callback — runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback.
  */
 static VOID
 NfpCleanupTimerCallback(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    )
-{
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(DeferredContext);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    //
-    // Only queue if not already in progress and we are still initialized
-    //
-    if (InterlockedCompareExchange(&g_CleanupInProgress, 1, 0) != 0) {
-        return;
-    }
-
-    if (!NfpIsInitialized() || g_NfState.CleanupWorkItem == NULL) {
-        InterlockedExchange(&g_CleanupInProgress, 0);
-        return;
-    }
-
-    IoQueueWorkItem(
-        g_NfState.CleanupWorkItem,
-        NfpCleanupWorkItemRoutine,
-        DelayedWorkQueue,
-        NULL
-        );
-}
-
-/**
- * @brief Work item routine — runs cleanup at PASSIVE_LEVEL.
- */
-static VOID
-NfpCleanupWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     )
 {
     PAGED_CODE();
 
-    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(TimerId);
     UNREFERENCED_PARAMETER(Context);
+
+    if (InterlockedCompareExchange(&g_CleanupInProgress, 1, 0) != 0) {
+        return;
+    }
 
     if (NfpIsInitialized()) {
         NfpCleanupStaleConnections();

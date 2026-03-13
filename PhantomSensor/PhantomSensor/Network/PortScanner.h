@@ -33,7 +33,8 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
+#include <fltKernel.h>
+#include <inaddr.h>
 #include <in6addr.h>
 
 //=============================================================================
