@@ -301,6 +301,14 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     LONG ConnectedClients;
     LONG Reserved3;
 
+    //
+    // Compression transport statistics (v2 extension)
+    //
+    UINT64 CompressedMessages;
+    UINT64 CompressionBytesSaved;
+    ULONG  CompressionAvgRatio;          // 0-100 percentage (35 = compressed to 35% of original)
+    ULONG  CompressionErrors;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================

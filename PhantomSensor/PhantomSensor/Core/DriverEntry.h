@@ -195,6 +195,7 @@ typedef enum _SHADOWSTRIKE_SUBSYSTEM_FLAGS {
 typedef struct _BP_PROCESSOR BP_PROCESSOR, *PBP_PROCESSOR;
 typedef struct _TM_MANAGER TM_MANAGER, *PTM_MANAGER;
 typedef struct _ENC_MANAGER ENC_MANAGER, *PENC_MANAGER;
+typedef struct _COMP_MANAGER COMP_MANAGER, *PCOMP_MANAGER;
 typedef struct _PA_ANALYZER *PPA_ANALYZER;
 
 // ============================================================================
@@ -503,6 +504,14 @@ ShadowStrikeGetTimerManager(VOID);
 _IRQL_requires_max_(DISPATCH_LEVEL)
 PENC_MANAGER
 ShadowStrikeGetEncryptionManager(VOID);
+
+/**
+ * @brief Returns the global CompressionManager for transport stats/verification.
+ * @return PCOMP_MANAGER or NULL if not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PCOMP_MANAGER
+ShadowStrikeGetCompressionManager(VOID);
 
 /**
  * @brief Returns the global ProcessAnalyzer instance for deep process analysis.

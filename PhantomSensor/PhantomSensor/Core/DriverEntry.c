@@ -2350,6 +2350,15 @@ ShadowStrikeGetEncryptionManager(VOID)
     return &g_EncryptionManager;
 }
 
+PCOMP_MANAGER
+ShadowStrikeGetCompressionManager(VOID)
+{
+    if (!g_CompressionManager.Initialized) {
+        return NULL;
+    }
+    return &g_CompressionManager;
+}
+
 PPA_ANALYZER
 ShadowStrikeGetProcessAnalyzer(VOID)
 {

@@ -67,6 +67,7 @@ typedef enum _BEHAVIOR_EVENT_CATEGORY {
     BehaviorCategory_Exfiltration,
     BehaviorCategory_Impact,
     BehaviorCategory_DefenseEvasion,
+    BehaviorCategory_ManagementAudit,
     BehaviorCategory_Max
 } BEHAVIOR_EVENT_CATEGORY;
 
@@ -256,6 +257,14 @@ typedef enum _BEHAVIOR_EVENT_TYPE {
     BehaviorEvent_ClipboardRapidTempWrites      = 0x0F02,
     BehaviorEvent_ClipboardEncodedCommand       = 0x0F03,
     BehaviorEvent_ClipboardCrossProcess         = 0x0F04,
+
+    // Management / Audit Trail (0x1000)
+    BehaviorEvent_FilteringDisabled             = 0x1000,
+    BehaviorEvent_FilteringEnabled              = 0x1001,
+    BehaviorEvent_PolicyUpdated                 = 0x1002,
+    BehaviorEvent_ExclusionModified             = 0x1003,
+    BehaviorEvent_WhitelistModified             = 0x1004,
+    BehaviorEvent_ThreatIntelPushed             = 0x1005,
 
     BehaviorEvent_Max                           = 0xFFFF
 } BEHAVIOR_EVENT_TYPE;

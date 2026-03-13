@@ -93,6 +93,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "ImageNotify.h"
 #include "PrivilegeMonitor.h"
 #include "../Registry/RegistryCallback.h"
+#include "../../Communication/MessageHandler.h"
 #include "../../ALPC/AlpcPortMonitor.h"
 #include <ntstrsafe.h>
 
@@ -3477,6 +3478,14 @@ PnpHandleProcessTermination(
     // Prevents stale ransomware/destruction scores persisting after PID recycle.
     //
     ShadowStrikeRemovePreSetInfoProcessContext(ProcessId);
+
+    //
+    // Remove from MessageHandler protected process list (if registered).
+    // Without this, PID reuse inherits privileged message authorization —
+    // a new process with the recycled PID can send push/whitelist/exclusion
+    // commands that require protected-process auth. CRITICAL security fix.
+    //
+    MhUnprotectProcess((UINT32)(ULONG_PTR)ProcessId);
 
     //
     // Remove from ObjectCallback protected process list (if registered).

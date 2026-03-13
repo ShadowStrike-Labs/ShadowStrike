@@ -67,12 +67,14 @@
 #include "../../Shared/MessageProtocol.h"
 #include "../../Shared/ErrorCodes.h"
 #include "../Core/Globals.h"
+#include "../Core/DriverEntry.h"
 
 // Detection module headers for data push handlers
 #include <ntstrsafe.h>
 #include "../Behavioral/IOCMatcher.h"
 #include "../Behavioral/RuleEngine.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../../Shared/BehaviorTypes.h"
 #include "../Network/C2Detection.h"
 #include "../Network/DnsMonitor.h"
 #include "../Network/NetworkReputation.h"
@@ -81,6 +83,7 @@
 #include "../Exclusions/ExclusionManager.h"
 #include "../Callbacks/Object/ObjectCallback.h"
 #include "../Callbacks/Object/ProcessProtection.h"
+#include "Compression.h"
 
 // ============================================================================
 // CONSTANTS
@@ -1571,6 +1574,20 @@ MhpHandlePolicyUpdate(
                policy->ScanOnOpen, policy->ScanOnExecute, policy->ScanTimeoutMs);
 
     //
+    // Audit trail: policy change affects entire protection posture
+    //
+    {
+        UINT32 callerPid = (ClientContext != NULL && ClientContext->ClientProcessId != NULL) ?
+                           (UINT32)(ULONG_PTR)ClientContext->ClientProcessId : 0;
+        BeEngineSubmitEvent(
+            BehaviorEvent_PolicyUpdated,
+            BehaviorCategory_ManagementAudit,
+            callerPid,
+            NULL, 0, 0, FALSE, NULL
+        );
+    }
+
+    //
     // Send reply
     //
     if (OutputBuffer != NULL && OutputBufferSize >= sizeof(SHADOWSTRIKE_GENERIC_REPLY)) {
@@ -1649,6 +1666,23 @@ MhpHandleDriverStatusQuery(
     driverStatus.PendingRequests = g_DriverData.Stats.PendingRequests;
     driverStatus.PeakPendingRequests = g_DriverData.Stats.PeakPendingRequests;
     driverStatus.ConnectedClients = g_DriverData.ConnectedClients;
+
+    //
+    // Compression transport statistics
+    //
+    {
+        PCOMP_MANAGER compMgr = ShadowStrikeGetCompressionManager();
+        if (compMgr != NULL) {
+            COMP_STATISTICS compStats;
+            NTSTATUS compStatus = CompGetStatistics(compMgr, &compStats);
+            if (NT_SUCCESS(compStatus)) {
+                driverStatus.CompressedMessages = compStats.TotalCompressed;
+                driverStatus.CompressionBytesSaved = compStats.BytesSaved;
+                driverStatus.CompressionAvgRatio = compStats.AverageRatio;
+                driverStatus.CompressionErrors = (ULONG)compStats.Errors;
+            }
+        }
+    }
 
     //
     // Copy to output buffer (already validated as kernel memory by caller)
@@ -1918,6 +1952,20 @@ MhpHandleEnableFiltering(
                "[ShadowStrike/MH] Filtering enabled\n");
 
     //
+    // Audit trail: filtering state change
+    //
+    {
+        UINT32 callerPid = (ClientContext != NULL && ClientContext->ClientProcessId != NULL) ?
+                           (UINT32)(ULONG_PTR)ClientContext->ClientProcessId : 0;
+        BeEngineSubmitEvent(
+            BehaviorEvent_FilteringEnabled,
+            BehaviorCategory_ManagementAudit,
+            callerPid,
+            NULL, 0, 0, FALSE, NULL
+        );
+    }
+
+    //
     // Send reply
     //
     if (OutputBuffer != NULL && OutputBufferSize >= sizeof(SHADOWSTRIKE_GENERIC_REPLY)) {
@@ -1967,6 +2015,22 @@ MhpHandleDisableFiltering(
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/MH] Filtering disabled\n");
+
+    //
+    // Audit trail: filtering disabled is a defense-critical event.
+    // Submit to BehaviorEngine so attack chain tracker can correlate
+    // with subsequent evasion attempts if the agent was compromised.
+    //
+    {
+        UINT32 callerPid = (ClientContext != NULL && ClientContext->ClientProcessId != NULL) ?
+                           (UINT32)(ULONG_PTR)ClientContext->ClientProcessId : 0;
+        BeEngineSubmitEvent(
+            BehaviorEvent_FilteringDisabled,
+            BehaviorCategory_ManagementAudit,
+            callerPid,
+            NULL, 0, 0, FALSE, NULL
+        );
+    }
 
     //
     // Send reply
@@ -2363,13 +2427,13 @@ MhpHandlePushHashDatabase(
         iocInput.Value[iocInput.ValueLength] = '\0';
 
         //
-        // Map hash type to IOC type
+        // Map hash type to IOC type using proper enum values
         //
         switch (entry->HashType) {
-            case 0: iocInput.Type = (IOM_IOC_TYPE)10; break;  // MD5 hash
-            case 1: iocInput.Type = (IOM_IOC_TYPE)11; break;  // SHA1 hash
-            case 2: iocInput.Type = (IOM_IOC_TYPE)12; break;  // SHA256 hash
-            default: iocInput.Type = (IOM_IOC_TYPE)12; break;
+            case 0: iocInput.Type = IomType_FileHash_MD5; break;
+            case 1: iocInput.Type = IomType_FileHash_SHA1; break;
+            case 2: iocInput.Type = IomType_FileHash_SHA256; break;
+            default: iocInput.Type = IomType_FileHash_SHA256; break;
         }
 
         iocInput.Severity = (IOM_SEVERITY)entry->Severity;
@@ -2400,6 +2464,20 @@ MhpHandlePushHashDatabase(
                "[ShadowStrike/MH] PushHashDatabase: %u accepted, %u rejected\n",
                accepted, rejected);
 
+    //
+    // Audit trail: threat intel modification changes detection capability
+    //
+    if (accepted > 0) {
+        UINT32 callerPid = (ClientContext != NULL && ClientContext->ClientProcessId != NULL) ?
+                           (UINT32)(ULONG_PTR)ClientContext->ClientProcessId : 0;
+        BeEngineSubmitEvent(
+            BehaviorEvent_ThreatIntelPushed,
+            BehaviorCategory_ManagementAudit,
+            callerPid,
+            NULL, 0, 0, FALSE, NULL
+        );
+    }
+
     MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
                      OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
 
@@ -2409,8 +2487,9 @@ MhpHandlePushHashDatabase(
 /**
  * @brief Handle pattern database push (FilterMessageType_PushPatternDatabase).
  *
- * Same wire format as hash push. Patterns are loaded via IOCMatcher
- * with a pattern-type IOC classification.
+ * Patterns are loaded into IOCMatcher with pattern-appropriate IOC types
+ * (YARA for binary patterns) and wildcard/regex match modes.
+ * Unlike hash push which uses exact matching, patterns use content-based matching.
  */
 static NTSTATUS
 MhpHandlePushPatternDatabase(
@@ -2423,20 +2502,125 @@ MhpHandlePushPatternDatabase(
     _Out_ PULONG ReturnOutputBufferLength
     )
 {
-    //
-    // Pattern database uses same wire format and loading path as hash database.
-    // The IOCMatcher handles both hash and pattern type IOCs.
-    //
-    return MhpHandlePushHashDatabase(
-        ClientContext, Header, PayloadBuffer, PayloadSize,
-        OutputBuffer, OutputBufferSize, ReturnOutputBufferLength
+    NTSTATUS status;
+    PSHADOWSTRIKE_PUSH_BATCH_HEADER batchHeader;
+    PVOID entriesStart;
+    ULONG entryCount;
+    ULONG accepted = 0;
+    ULONG rejected = 0;
+    PIOM_MATCHER matcher;
+    PSHADOWSTRIKE_PUSH_HASH_ENTRY entry;
+    IOM_IOC_INPUT iocInput;
+    ULONG i;
+    ULONG hashLen;
+
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(ClientContext);
+
+    *ReturnOutputBufferLength = 0;
+
+    status = MhpValidateBatchHeader(
+        PayloadBuffer, PayloadSize,
+        sizeof(SHADOWSTRIKE_PUSH_HASH_ENTRY),
+        &batchHeader, &entriesStart, &entryCount
     );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    matcher = BeGetIocMatcher();
+    if (matcher == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/MH] PushPatternDatabase: IOCMatcher not available\n");
+        MhpBuildPushReply(Header, STATUS_DEVICE_NOT_READY, 0, entryCount,
+                         OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    entry = (PSHADOWSTRIKE_PUSH_HASH_ENTRY)entriesStart;
+
+    for (i = 0; i < entryCount; i++) {
+        RtlZeroMemory(&iocInput, sizeof(iocInput));
+
+        switch (entry->HashType) {
+            case 0: hashLen = 16; break;
+            case 1: hashLen = 20; break;
+            case 2: hashLen = 32; break;
+            default:
+                rejected++;
+                entry++;
+                continue;
+        }
+
+        iocInput.ValueLength = hashLen * 2;
+        if (iocInput.ValueLength >= IOM_MAX_IOC_LENGTH) {
+            rejected++;
+            entry++;
+            continue;
+        }
+
+        for (ULONG b = 0; b < hashLen; b++) {
+            UCHAR hi = (entry->Hash[b] >> 4) & 0x0F;
+            UCHAR lo = entry->Hash[b] & 0x0F;
+            iocInput.Value[b * 2]     = (CHAR)(hi < 10 ? '0' + hi : 'a' + hi - 10);
+            iocInput.Value[b * 2 + 1] = (CHAR)(lo < 10 ? '0' + lo : 'a' + lo - 10);
+        }
+        iocInput.Value[iocInput.ValueLength] = '\0';
+
+        //
+        // Patterns use YARA type with wildcard matching mode.
+        // This distinguishes them from exact hash matches and
+        // enables the IOCMatcher to use pattern-aware comparison.
+        //
+        iocInput.Type = IomType_YARA;
+        iocInput.Severity = (IOM_SEVERITY)entry->Severity;
+        iocInput.MatchMode = IomMatchMode_Wildcard;
+        iocInput.CaseSensitive = FALSE;
+        iocInput.Expiry = entry->Expiry;
+
+        RtlCopyMemory(iocInput.ThreatName, entry->ThreatName,
+                       min(sizeof(entry->ThreatName), IOM_MAX_THREAT_NAME_LENGTH - 1));
+        iocInput.ThreatName[IOM_MAX_THREAT_NAME_LENGTH - 1] = '\0';
+
+        RtlStringCbCopyA(iocInput.Source, sizeof(iocInput.Source), "PatternDB");
+
+        status = IomLoadIOC(matcher, &iocInput);
+        if (NT_SUCCESS(status)) {
+            accepted++;
+        } else {
+            rejected++;
+        }
+
+        entry++;
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike/MH] PushPatternDatabase: %u accepted, %u rejected\n",
+               accepted, rejected);
+
+    if (accepted > 0) {
+        UINT32 callerPid = (ClientContext != NULL && ClientContext->ClientProcessId != NULL) ?
+                           (UINT32)(ULONG_PTR)ClientContext->ClientProcessId : 0;
+        BeEngineSubmitEvent(
+            BehaviorEvent_ThreatIntelPushed,
+            BehaviorCategory_ManagementAudit,
+            callerPid,
+            NULL, 0, 0, FALSE, NULL
+        );
+    }
+
+    MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
+                     OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+
+    return STATUS_SUCCESS;
 }
 
 /**
  * @brief Handle signature database push (FilterMessageType_PushSignatureDatabase).
  *
- * Same wire format as hash push. Signatures loaded via IOCMatcher.
+ * Signatures are loaded into IOCMatcher with file-name type and exact
+ * matching. This enables signature-based file identification by name/path.
+ * Distinguished from hash push (binary content match) and pattern push (YARA/wildcard).
  */
 static NTSTATUS
 MhpHandlePushSignatureDatabase(
@@ -2449,10 +2633,117 @@ MhpHandlePushSignatureDatabase(
     _Out_ PULONG ReturnOutputBufferLength
     )
 {
-    return MhpHandlePushHashDatabase(
-        ClientContext, Header, PayloadBuffer, PayloadSize,
-        OutputBuffer, OutputBufferSize, ReturnOutputBufferLength
+    NTSTATUS status;
+    PSHADOWSTRIKE_PUSH_BATCH_HEADER batchHeader;
+    PVOID entriesStart;
+    ULONG entryCount;
+    ULONG accepted = 0;
+    ULONG rejected = 0;
+    PIOM_MATCHER matcher;
+    PSHADOWSTRIKE_PUSH_HASH_ENTRY entry;
+    IOM_IOC_INPUT iocInput;
+    ULONG i;
+    ULONG hashLen;
+
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(ClientContext);
+
+    *ReturnOutputBufferLength = 0;
+
+    status = MhpValidateBatchHeader(
+        PayloadBuffer, PayloadSize,
+        sizeof(SHADOWSTRIKE_PUSH_HASH_ENTRY),
+        &batchHeader, &entriesStart, &entryCount
     );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    matcher = BeGetIocMatcher();
+    if (matcher == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/MH] PushSignatureDatabase: IOCMatcher not available\n");
+        MhpBuildPushReply(Header, STATUS_DEVICE_NOT_READY, 0, entryCount,
+                         OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    entry = (PSHADOWSTRIKE_PUSH_HASH_ENTRY)entriesStart;
+
+    for (i = 0; i < entryCount; i++) {
+        RtlZeroMemory(&iocInput, sizeof(iocInput));
+
+        switch (entry->HashType) {
+            case 0: hashLen = 16; break;
+            case 1: hashLen = 20; break;
+            case 2: hashLen = 32; break;
+            default:
+                rejected++;
+                entry++;
+                continue;
+        }
+
+        iocInput.ValueLength = hashLen * 2;
+        if (iocInput.ValueLength >= IOM_MAX_IOC_LENGTH) {
+            rejected++;
+            entry++;
+            continue;
+        }
+
+        for (ULONG b = 0; b < hashLen; b++) {
+            UCHAR hi = (entry->Hash[b] >> 4) & 0x0F;
+            UCHAR lo = entry->Hash[b] & 0x0F;
+            iocInput.Value[b * 2]     = (CHAR)(hi < 10 ? '0' + hi : 'a' + hi - 10);
+            iocInput.Value[b * 2 + 1] = (CHAR)(lo < 10 ? '0' + lo : 'a' + lo - 10);
+        }
+        iocInput.Value[iocInput.ValueLength] = '\0';
+
+        //
+        // Signatures use Custom type with exact matching.
+        // Custom type distinguishes signature-database entries from
+        // file hash IOCs and pattern IOCs in the matcher's type buckets.
+        //
+        iocInput.Type = IomType_Custom;
+        iocInput.Severity = (IOM_SEVERITY)entry->Severity;
+        iocInput.MatchMode = IomMatchMode_Exact;
+        iocInput.CaseSensitive = FALSE;
+        iocInput.Expiry = entry->Expiry;
+
+        RtlCopyMemory(iocInput.ThreatName, entry->ThreatName,
+                       min(sizeof(entry->ThreatName), IOM_MAX_THREAT_NAME_LENGTH - 1));
+        iocInput.ThreatName[IOM_MAX_THREAT_NAME_LENGTH - 1] = '\0';
+
+        RtlStringCbCopyA(iocInput.Source, sizeof(iocInput.Source), "SignatureDB");
+
+        status = IomLoadIOC(matcher, &iocInput);
+        if (NT_SUCCESS(status)) {
+            accepted++;
+        } else {
+            rejected++;
+        }
+
+        entry++;
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike/MH] PushSignatureDatabase: %u accepted, %u rejected\n",
+               accepted, rejected);
+
+    if (accepted > 0) {
+        UINT32 callerPid = (ClientContext != NULL && ClientContext->ClientProcessId != NULL) ?
+                           (UINT32)(ULONG_PTR)ClientContext->ClientProcessId : 0;
+        BeEngineSubmitEvent(
+            BehaviorEvent_ThreatIntelPushed,
+            BehaviorCategory_ManagementAudit,
+            callerPid,
+            NULL, 0, 0, FALSE, NULL
+        );
+    }
+
+    MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
+                     OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
+
+    return STATUS_SUCCESS;
 }
 
 /**
@@ -2596,6 +2887,20 @@ MhpHandlePushIoCFeed(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/MH] PushIoCFeed: %u accepted, %u rejected\n",
                accepted, rejected);
+
+    //
+    // Audit trail: IOC feed updates are critical threat intel changes
+    //
+    if (accepted > 0) {
+        UINT32 callerPid = (ClientContext != NULL && ClientContext->ClientProcessId != NULL) ?
+                           (UINT32)(ULONG_PTR)ClientContext->ClientProcessId : 0;
+        BeEngineSubmitEvent(
+            BehaviorEvent_ThreatIntelPushed,
+            BehaviorCategory_ManagementAudit,
+            callerPid,
+            NULL, 0, 0, FALSE, NULL
+        );
+    }
 
     MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
                      OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
@@ -2783,8 +3088,16 @@ MhpHandlePushWhitelist(
                         }
                         iocInput.ValueLength = hashLen * 2;
 
-                        iocInput.Type = (IOM_IOC_TYPE)(10 + entry->HashType);
-                        iocInput.Severity = (IOM_SEVERITY)0;  // Safe/whitelisted
+                        //
+                        // Map hash type to proper IOC enum values
+                        //
+                        switch (entry->HashType) {
+                            case 0: iocInput.Type = IomType_FileHash_MD5; break;
+                            case 1: iocInput.Type = IomType_FileHash_SHA1; break;
+                            case 2: iocInput.Type = IomType_FileHash_SHA256; break;
+                            default: iocInput.Type = IomType_FileHash_SHA256; break;
+                        }
+                        iocInput.Severity = IomSeverity_Unknown;  // Safe/whitelisted
                         RtlStringCbCopyA(iocInput.Source, sizeof(iocInput.Source), "Whitelist");
 
                         status = IomLoadIOC(matcher, &iocInput);
@@ -2813,6 +3126,20 @@ MhpHandlePushWhitelist(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/MH] PushWhitelist: %u accepted, %u rejected\n",
                accepted, rejected);
+
+    //
+    // Audit trail: whitelist modifications reduce detection surface
+    //
+    if (accepted > 0) {
+        UINT32 callerPid = (ClientContext != NULL && ClientContext->ClientProcessId != NULL) ?
+                           (UINT32)(ULONG_PTR)ClientContext->ClientProcessId : 0;
+        BeEngineSubmitEvent(
+            BehaviorEvent_WhitelistModified,
+            BehaviorCategory_ManagementAudit,
+            callerPid,
+            NULL, 0, 0, FALSE, NULL
+        );
+    }
 
     MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
                      OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
@@ -3018,6 +3345,17 @@ Done:
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/MH] UpdateBehavioralRules: %u accepted, %u rejected\n",
                accepted, rejected);
+
+    if (accepted > 0) {
+        UINT32 callerPid = (ClientContext != NULL && ClientContext->ClientProcessId != NULL) ?
+                           (UINT32)(ULONG_PTR)ClientContext->ClientProcessId : 0;
+        BeEngineSubmitEvent(
+            BehaviorEvent_ThreatIntelPushed,
+            BehaviorCategory_ManagementAudit,
+            callerPid,
+            NULL, 0, 0, FALSE, NULL
+        );
+    }
 
     MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
                      OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
@@ -3305,6 +3643,20 @@ MhpHandlePushNetworkIoC(
                "[ShadowStrike/MH] PushNetworkIoC: %u accepted, %u rejected\n",
                accepted, rejected);
 
+    //
+    // Audit trail: network IOC updates affect network threat detection
+    //
+    if (accepted > 0) {
+        UINT32 callerPid = (ClientContext != NULL && ClientContext->ClientProcessId != NULL) ?
+                           (UINT32)(ULONG_PTR)ClientContext->ClientProcessId : 0;
+        BeEngineSubmitEvent(
+            BehaviorEvent_ThreatIntelPushed,
+            BehaviorCategory_ManagementAudit,
+            callerPid,
+            NULL, 0, 0, FALSE, NULL
+        );
+    }
+
     MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
                      OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);
 
@@ -3494,6 +3846,20 @@ MhpHandleExclusionUpdate(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/MH] ExclusionUpdate: %u accepted, %u rejected\n",
                accepted, rejected);
+
+    //
+    // Audit trail: exclusion modifications directly affect detection coverage
+    //
+    if (accepted > 0) {
+        UINT32 callerPid = (ClientContext != NULL && ClientContext->ClientProcessId != NULL) ?
+                           (UINT32)(ULONG_PTR)ClientContext->ClientProcessId : 0;
+        BeEngineSubmitEvent(
+            BehaviorEvent_ExclusionModified,
+            BehaviorCategory_ManagementAudit,
+            callerPid,
+            NULL, 0, 0, FALSE, NULL
+        );
+    }
 
     MhpBuildPushReply(Header, STATUS_SUCCESS, accepted, rejected,
                      OutputBuffer, OutputBufferSize, ReturnOutputBufferLength);

@@ -1626,6 +1626,20 @@ ShadowStrikeSendNotification(
             );
 
             //
+            // Verify compressed data integrity before sending.
+            // Catches silent LZ4 corruption from memory errors or bugs.
+            //
+            if (NT_SUCCESS(status) && compressedSize > 0) {
+                NTSTATUS verifyStatus = CompVerify(compressedPayload, compressedSize);
+                if (!NT_SUCCESS(verifyStatus)) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                               "[ShadowStrike/CommPort] Compressed data verification failed: 0x%08X, sending uncompressed\n",
+                               verifyStatus);
+                    status = verifyStatus;  // fall through to send uncompressed
+                }
+            }
+
+            //
             // Only use compressed form if it saves at least 10% space
             //
             if (NT_SUCCESS(status) &&
