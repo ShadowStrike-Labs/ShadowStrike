@@ -148,12 +148,11 @@ typedef struct _ADB_PROTECTOR {
     EX_PUSH_LOCK        EventLock;
     volatile LONG       EventCount;
 
-    // Periodic check — system thread + timer DPC
+    // Periodic check — system thread + TimerManager periodic timer
     HANDLE              CheckThreadHandle;
     PETHREAD            CheckThread;
     KEVENT              CheckWakeEvent;
-    KTIMER              CheckTimer;
-    KDPC                CheckDpc;
+    ULONG               CheckTimerId;
     volatile LONG       TimerActive;
     volatile LONG       ShutdownRequested;
 
