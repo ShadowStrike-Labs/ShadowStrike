@@ -2343,6 +2343,12 @@ ShadowStrikeGetEncryptionManager(VOID)
     return &g_EncryptionManager;
 }
 
+PPA_ANALYZER
+ShadowStrikeGetProcessAnalyzer(VOID)
+{
+    return g_ProcessAnalyzer;
+}
+
 // ============================================================================
 // VERSION COMPATIBILITY CHECK
 // ============================================================================

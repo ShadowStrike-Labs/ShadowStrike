@@ -634,6 +634,9 @@ PaInitialize(
 
     //
     // Get thread object pointer (not handle)
+    // CRITICAL: Do NOT close ThreadHandle before the error check.
+    // If ObReferenceObjectByHandle fails, we still need the handle
+    // to signal and wait for the running thread before cleanup.
     //
     Status = ObReferenceObjectByHandle(
         ThreadHandle,
@@ -644,12 +647,23 @@ PaInitialize(
         NULL
         );
 
-    ZwClose(ThreadHandle);
-    ThreadHandle = NULL;
-
     if (!NT_SUCCESS(Status)) {
+        //
+        // Thread is running but we couldn't get object reference.
+        // Signal shutdown via event and wait via handle to prevent
+        // use-after-free when we free Internal in the cleanup path.
+        //
+        Internal->ShutdownRequested = TRUE;
+        KeSetEvent(&Internal->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+        ZwWaitForSingleObject(ThreadHandle, FALSE, NULL);
+        ZwClose(ThreadHandle);
+        ThreadHandle = NULL;
+        Internal->WorkerThread = NULL;
         goto Cleanup;
     }
+
+    ZwClose(ThreadHandle);
+    ThreadHandle = NULL;
 
     Internal->WorkerActive = TRUE;
 

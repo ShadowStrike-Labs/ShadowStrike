@@ -678,6 +678,7 @@ Return Value:
     //
     g_ProcessMonitor.ParentChainTracker = (PVOID)PaGetParentChainTracker();
     g_ProcessMonitor.PrivilegeMonitor = (PVOID)PaGetPrivilegeMonitor();
+    g_ProcessMonitor.ProcessAnalyzer = (PVOID)ShadowStrikeGetProcessAnalyzer();
     g_ProcessMonitor.Config.EnablePrivilegeMonitoring = TRUE;
     g_ProcessMonitor.Config.EnableSignatureVerification = TRUE;
     g_ProcessMonitor.Config.BlockSuspiciousProcesses = FALSE;  // Audit mode by default
@@ -1394,6 +1395,113 @@ Arguments:
     Status = PnpAnalyzeProcess(ProcessContext);
     if (NT_SUCCESS(Status)) {
         ProcessContext->Flags |= PN_PROC_FLAG_ANALYZED;
+    }
+
+    //
+    // Deep Process Analysis via ProcessAnalyzer — PE header inspection,
+    // entropy-based packing detection, security mitigation verification,
+    // LOLBin classification, and unified suspicion scoring.
+    // Complements the shallow PnpAnalyzeProcess with PE-level forensics.
+    //
+    if (g_ProcessMonitor.ProcessAnalyzer != NULL) {
+        PPA_ANALYZER paAnalyzer = (PPA_ANALYZER)g_ProcessMonitor.ProcessAnalyzer;
+        PPA_ANALYSIS_RESULT paResult = NULL;
+
+        NTSTATUS paStatus = PaAnalyzeProcess(paAnalyzer, ProcessId, &paResult);
+        if (NT_SUCCESS(paStatus) && paResult != NULL) {
+            //
+            // Packed PE detection → BehaviorEngine (T1027.002 Software Packing)
+            //
+            if (paResult->PE.IsPacked) {
+                BeEngineSubmitEvent(
+                    BehaviorEvent_ProcessMasquerading,
+                    BehaviorCategory_DefenseEvasion,
+                    HandleToULong(ProcessId),
+                    &paResult->PE.Entropy,
+                    sizeof(ULONG),
+                    35,
+                    FALSE,
+                    NULL
+                    );
+
+                if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+                    TsAddFactor(
+                        g_ProcessMonitor.ThreatScoringEngine,
+                        ProcessId,
+                        TsFactor_MITRE,
+                        "T1027.002-SoftwarePacking",
+                        30,
+                        "PE entropy indicates packed/encrypted executable"
+                        );
+                }
+            }
+
+            //
+            // Unsigned binary without DEP → high exploitation risk
+            //
+            if (!paResult->PE.IsSigned && !paResult->Security.HasDEP) {
+                if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+                    TsAddFactor(
+                        g_ProcessMonitor.ThreatScoringEngine,
+                        ProcessId,
+                        TsFactor_Reputation,
+                        "UnsignedNoDEP",
+                        20,
+                        "Unsigned binary without DEP - high exploitation risk"
+                        );
+                }
+            }
+
+            //
+            // Missing critical mitigations (no ASLR + no CFG)
+            //
+            if (!paResult->Security.HasASLR && !paResult->Security.HasCFG) {
+                if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+                    TsAddFactor(
+                        g_ProcessMonitor.ThreatScoringEngine,
+                        ProcessId,
+                        TsFactor_Context,
+                        "MissingMitigations-ASLR-CFG",
+                        15,
+                        "Process lacks ASLR and CFG - vulnerable to exploitation"
+                        );
+                }
+            }
+
+            //
+            // LOLBin detection from deep analysis
+            //
+            if (paResult->BehaviorFlags & PA_BEHAVIOR_LOL_BINARY) {
+                BeEngineSubmitEvent(
+                    BehaviorEvent_LOLBinExecution,
+                    BehaviorCategory_ProcessExecution,
+                    HandleToULong(ProcessId),
+                    &paResult->SuspicionScore,
+                    sizeof(ULONG),
+                    min(paResult->SuspicionScore, 60),
+                    FALSE,
+                    NULL
+                    );
+            }
+
+            //
+            // High suspicion from deep analysis → behavioral event
+            //
+            if (paResult->SuspicionScore >= PA_SUSPICION_THRESHOLD_HIGH) {
+                BeEngineSubmitEvent(
+                    BehaviorEvent_ProcessCreate,
+                    BehaviorCategory_ProcessExecution,
+                    HandleToULong(ProcessId),
+                    &paResult->SuspicionScore,
+                    sizeof(ULONG),
+                    min(paResult->SuspicionScore, 80),
+                    FALSE,
+                    NULL
+                    );
+            }
+
+            PaFreeAnalysis(paAnalyzer, &paResult);
+        }
     }
 
     //
@@ -3233,6 +3341,17 @@ PnpHandleProcessTermination(
     )
 {
     PPN_PROCESS_CONTEXT Context;
+
+    //
+    // Invalidate ProcessAnalyzer cache entry for this PID to prevent
+    // stale analysis results on PID reuse.
+    //
+    if (g_ProcessMonitor.ProcessAnalyzer != NULL) {
+        PaInvalidateProcess(
+            (PPA_ANALYZER)g_ProcessMonitor.ProcessAnalyzer,
+            ProcessId
+            );
+    }
 
     //
     // Notify centralized threat scoring engine of process exit
