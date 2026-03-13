@@ -385,10 +385,9 @@ typedef struct _C2_DETECTOR {
     volatile LONG KnownJA3Count;
 
     //
-    // Analysis timer — DPC queues a work item at PASSIVE_LEVEL
+    // Analysis timer — managed by TimerManager at PASSIVE_LEVEL
     //
-    KTIMER AnalysisTimer;
-    KDPC AnalysisDpc;
+    ULONG AnalysisTimerId;
     ULONG AnalysisIntervalMs;
 
     //

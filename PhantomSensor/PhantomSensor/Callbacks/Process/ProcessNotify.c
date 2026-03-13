@@ -80,15 +80,14 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../../Shared/VerdictTypes.h"
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../Core/DriverEntry.h"
+#include "../../Sync/TimerManager.h"
 #include <ntstrsafe.h>
 
-static VOID PnpCleanupWorkRoutine(_In_ PDEVICE_OBJECT, _In_opt_ PVOID);
 static VOID PnpCleanupStaleContexts(VOID);
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeInitializeProcessMonitoring)
 #pragma alloc_text(PAGE, ShadowStrikeCleanupProcessMonitoring)
-#pragma alloc_text(PAGE, PnpCleanupWorkRoutine)
 #pragma alloc_text(PAGE, PnpCleanupStaleContexts)
 #endif
 
@@ -348,12 +347,9 @@ typedef struct _PN_MONITOR_STATE {
     volatile BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup timer and work item
+    // Cleanup timer (managed by TimerManager)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    PIO_WORKITEM CleanupWorkItem;
-    volatile BOOLEAN CleanupTimerActive;
+    ULONG CleanupTimerId;
     volatile LONG CleanupWorkPending;
 
     //
@@ -411,11 +407,6 @@ typedef struct _PN_MONITOR_STATE {
     // Shutdown flag
     //
     volatile BOOLEAN ShutdownRequested;
-
-    //
-    // Device object for work items
-    //
-    PDEVICE_OBJECT DeviceObject;
 
 } PN_MONITOR_STATE, *PPN_MONITOR_STATE;
 
@@ -506,16 +497,8 @@ PnpHandleProcessTermination(
     );
 
 static VOID
-PnpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    );
-
-static VOID
-PnpCleanupWorkRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
+PnpCleanupTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     );
 
@@ -596,7 +579,6 @@ Return Value:
 --*/
 {
     NTSTATUS Status = STATUS_SUCCESS;
-    LARGE_INTEGER DueTime;
     ULONG i;
 
     PAGED_CODE();
@@ -606,16 +588,6 @@ Return Value:
     }
 
     RtlZeroMemory(&g_ProcessMonitor, sizeof(PN_MONITOR_STATE));
-
-    //
-    // Get device object for work items from driver object chain
-    //
-    if (g_DriverData.DriverObject != NULL) {
-        g_ProcessMonitor.DeviceObject = g_DriverData.DriverObject->DeviceObject;
-    }
-    if (g_ProcessMonitor.DeviceObject == NULL) {
-        return STATUS_INVALID_DEVICE_STATE;
-    }
 
     //
     // Initialize process list
@@ -702,16 +674,6 @@ Return Value:
     KeQuerySystemTime(&g_ProcessMonitor.Stats.StartTime);
 
     //
-    // Allocate cleanup work item
-    //
-    g_ProcessMonitor.CleanupWorkItem = IoAllocateWorkItem(g_ProcessMonitor.DeviceObject);
-    if (g_ProcessMonitor.CleanupWorkItem == NULL) {
-        ExDeleteNPagedLookasideList(&g_ProcessMonitor.ContextLookaside);
-        ExDeleteNPagedLookasideList(&g_ProcessMonitor.NotificationLookaside);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    //
     // Initialize centralized threat scoring engine
     // This provides unified multi-factor threat assessment with:
     // - O(1) process lookup via hash table
@@ -727,8 +689,6 @@ Return Value:
             "[ShadowStrike/ProcessNotify] Failed to initialize ThreatScoring engine: 0x%08X\n",
             Status
             );
-        IoFreeWorkItem(g_ProcessMonitor.CleanupWorkItem);
-        g_ProcessMonitor.CleanupWorkItem = NULL;
         ExDeleteNPagedLookasideList(&g_ProcessMonitor.ContextLookaside);
         ExDeleteNPagedLookasideList(&g_ProcessMonitor.NotificationLookaside);
         return Status;
@@ -748,22 +708,34 @@ Return Value:
         );
 
     //
-    // Initialize cleanup timer
+    // Initialize cleanup timer via centralized TimerManager
     //
-    KeInitializeTimer(&g_ProcessMonitor.CleanupTimer);
-    KeInitializeDpc(&g_ProcessMonitor.CleanupDpc, PnpCleanupTimerDpc, NULL);
+    {
+        PTM_MANAGER timerManager = ShadowStrikeGetTimerManager();
+        if (timerManager != NULL) {
+            TM_TIMER_OPTIONS opts = {0};
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 5000;
+            opts.Name = "ProcessNotifyCleanup";
 
-    //
-    // Start cleanup timer (every 1 minute)
-    //
-    DueTime.QuadPart = -((LONGLONG)PN_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &g_ProcessMonitor.CleanupTimer,
-        DueTime,
-        PN_CLEANUP_INTERVAL_MS,
-        &g_ProcessMonitor.CleanupDpc
-        );
-    g_ProcessMonitor.CleanupTimerActive = TRUE;
+            NTSTATUS tmStatus = TmCreatePeriodic(
+                timerManager,
+                PN_CLEANUP_INTERVAL_MS,
+                PnpCleanupTimerCallback,
+                NULL,
+                &opts,
+                &g_ProcessMonitor.CleanupTimerId
+            );
+            if (!NT_SUCCESS(tmStatus)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike/ProcessNotify] Failed to create cleanup timer: 0x%08X\n",
+                           tmStatus);
+                g_ProcessMonitor.CleanupTimerId = 0;
+            }
+        } else {
+            g_ProcessMonitor.CleanupTimerId = 0;
+        }
+    }
 
     //
     // Mark as initialized with memory barrier
@@ -815,48 +787,15 @@ Routine Description:
     MemoryBarrier();
 
     //
-    // Cancel cleanup timer and wait for any DPC to complete
+    // Cancel cleanup timer via TimerManager.
+    // TmCancel(Wait=TRUE) blocks until any in-flight callback completes.
     //
-    if (g_ProcessMonitor.CleanupTimerActive) {
-        KeCancelTimer(&g_ProcessMonitor.CleanupTimer);
-
-        //
-        // CRITICAL: Wait for any queued/running DPC to complete
-        // This prevents use-after-free when DPC accesses freed resources
-        //
-        KeFlushQueuedDpcs();
-
-        g_ProcessMonitor.CleanupTimerActive = FALSE;
-    }
-
-    //
-    // Wait for any pending cleanup work item to complete
-    // Bounded spin-wait: max 5 seconds (5000 iterations × 1ms)
-    //
-    {
-        ULONG SpinCount = 0;
-        while (InterlockedCompareExchange(&g_ProcessMonitor.CleanupWorkPending, 0, 0) != 0) {
-            LARGE_INTEGER Interval;
-            Interval.QuadPart = -10000;  // 1ms
-            KeDelayExecutionThread(KernelMode, FALSE, &Interval);
-
-            if (++SpinCount > 5000) {
-                DbgPrintEx(
-                    DPFLTR_IHVDRIVER_ID,
-                    DPFLTR_ERROR_LEVEL,
-                    "[ShadowStrike/ProcessNotify] Cleanup work item timed out after 5s, proceeding with shutdown\n"
-                    );
-                break;
-            }
+    if (g_ProcessMonitor.CleanupTimerId != 0) {
+        PTM_MANAGER timerManager = ShadowStrikeGetTimerManager();
+        if (timerManager != NULL) {
+            TmCancel(timerManager, g_ProcessMonitor.CleanupTimerId, TRUE);
         }
-    }
-
-    //
-    // Free cleanup work item
-    //
-    if (g_ProcessMonitor.CleanupWorkItem != NULL) {
-        IoFreeWorkItem(g_ProcessMonitor.CleanupWorkItem);
-        g_ProcessMonitor.CleanupWorkItem = NULL;
+        g_ProcessMonitor.CleanupTimerId = 0;
     }
 
     //
@@ -3361,75 +3300,35 @@ Routine Description:
 // ============================================================================
 
 static VOID
-PnpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+PnpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 /*++
 Routine Description:
-    DPC callback for cleanup timer.
+    TimerManager callback for periodic process context cleanup.
+    Runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback.
 
-    CRITICAL: This runs at DISPATCH_LEVEL. Cannot call paged code
-    or acquire push locks. Must queue a work item.
+    Re-entrancy guard: CleanupWorkPending prevents overlapping
+    cleanup cycles if the previous one hasn't finished.
 --*/
 {
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(DeferredContext);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
+    UNREFERENCED_PARAMETER(Context);
 
     if (g_ProcessMonitor.ShutdownRequested) {
         return;
     }
 
     //
-    // Don't queue if work is already pending
+    // Prevent overlapping cleanup
     //
-    if (InterlockedCompareExchange(&g_ProcessMonitor.CleanupWorkPending, TRUE, FALSE) == FALSE) {
-        //
-        // Queue work item for cleanup (runs at PASSIVE_LEVEL)
-        //
-        if (g_ProcessMonitor.CleanupWorkItem != NULL) {
-            IoQueueWorkItem(
-                g_ProcessMonitor.CleanupWorkItem,
-                PnpCleanupWorkRoutine,
-                DelayedWorkQueue,
-                NULL
-                );
-        } else {
-            //
-            // No work item - clear pending flag
-            //
-            InterlockedExchange(&g_ProcessMonitor.CleanupWorkPending, FALSE);
-        }
-    }
-}
-
-
-static VOID
-PnpCleanupWorkRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
-    )
-/*++
-Routine Description:
-    Work item routine for cleanup. Runs at PASSIVE_LEVEL.
---*/
-{
-    UNREFERENCED_PARAMETER(DeviceObject);
-    UNREFERENCED_PARAMETER(Context);
-
-    PAGED_CODE();
-
-    if (!g_ProcessMonitor.ShutdownRequested) {
-        PnpCleanupStaleContexts();
+    if (InterlockedCompareExchange(&g_ProcessMonitor.CleanupWorkPending, TRUE, FALSE) != FALSE) {
+        return;
     }
 
-    //
-    // Clear pending flag
-    //
+    PnpCleanupStaleContexts();
+
     InterlockedExchange(&g_ProcessMonitor.CleanupWorkPending, FALSE);
 }
 

@@ -235,17 +235,8 @@ typedef struct _SHADOWSTRIKE_SCAN_CACHE {
     /// @brief Statistics
     SHADOWSTRIKE_CACHE_STATS Stats;
 
-    /// @brief Cleanup timer
-    KTIMER CleanupTimer;
-
-    /// @brief Cleanup DPC
-    KDPC CleanupDpc;
-
-    /// @brief Work item for cleanup (allocated dynamically for proper lifecycle)
-    PIO_WORKITEM CleanupWorkItem;
-
-    /// @brief Work item queued flag (prevents double-queue)
-    volatile LONG WorkItemQueued;
+    /// @brief Cleanup timer ID (managed by TimerManager)
+    ULONG CleanupTimerId;
 
     /// @brief Cleanup in progress flag
     volatile LONG CleanupInProgress;

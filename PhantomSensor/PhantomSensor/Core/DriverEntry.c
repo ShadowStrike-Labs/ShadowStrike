@@ -747,6 +747,14 @@ DriverEntry(
     ShadowStrikeLogInitStatus("FltRegisterFilter", status);
 
     //
+    // Step 6.1: Provide DeviceObject to TimerManager so TmFlag_WorkItemCallback
+    // can allocate IoWorkItems for PASSIVE_LEVEL timer callbacks.
+    //
+    if (g_TimerManager != NULL && DriverObject->DeviceObject != NULL) {
+        g_TimerManager->DeviceObject = DriverObject->DeviceObject;
+    }
+
+    //
     // Step 6.5: Initialize encryption engine (AES-256-GCM for secure CommPort + HMAC auth)
     //
     {
@@ -2062,6 +2070,12 @@ PBP_PROCESSOR
 ShadowStrikeGetBatchProcessor(VOID)
 {
     return g_BatchProcessor;
+}
+
+PTM_MANAGER
+ShadowStrikeGetTimerManager(VOID)
+{
+    return g_TimerManager;
 }
 
 // ============================================================================

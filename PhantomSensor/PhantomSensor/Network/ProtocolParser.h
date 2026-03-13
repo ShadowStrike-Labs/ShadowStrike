@@ -41,7 +41,8 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
+#include <fltKernel.h>
+#include <inaddr.h>
 #include <in6addr.h>
 
 //=============================================================================
@@ -160,6 +161,26 @@ typedef struct _PP_HTTP_RESPONSE {
 
 #define PP_MAX_DNS_QUESTIONS    8
 #define PP_MAX_DNS_ANSWERS      16
+
+// DNS record type constants (RFC 1035 / RFC 3596)
+#ifndef DNS_TYPE_A
+#define DNS_TYPE_A      0x0001
+#endif
+#ifndef DNS_TYPE_NS
+#define DNS_TYPE_NS     0x0002
+#endif
+#ifndef DNS_TYPE_CNAME
+#define DNS_TYPE_CNAME  0x0005
+#endif
+#ifndef DNS_TYPE_PTR
+#define DNS_TYPE_PTR    0x000C
+#endif
+#ifndef DNS_TYPE_TXT
+#define DNS_TYPE_TXT    0x0010
+#endif
+#ifndef DNS_TYPE_AAAA
+#define DNS_TYPE_AAAA   0x001C
+#endif
 
 typedef struct _PP_DNS_PACKET {
     // Raw header counts (as received on the wire)

@@ -37,8 +37,7 @@
 extern "C" {
 #endif
 
-#include <ntifs.h>
-#include <ntddk.h>
+#include <fltKernel.h>
 
 //=============================================================================
 // Pool Tags

@@ -185,6 +185,7 @@ typedef enum _SHADOWSTRIKE_SUBSYSTEM_FLAGS {
 // Forward declarations for opaque types exposed by accessor functions
 //
 typedef struct _BP_PROCESSOR BP_PROCESSOR, *PBP_PROCESSOR;
+typedef struct _TM_MANAGER TM_MANAGER, *PTM_MANAGER;
 
 // ============================================================================
 // DRIVER LIFECYCLE FUNCTIONS
@@ -487,6 +488,16 @@ ShadowStrikeGetThreatScoringEngine(VOID);
 _IRQL_requires_max_(DISPATCH_LEVEL)
 PBP_PROCESSOR
 ShadowStrikeGetBatchProcessor(VOID);
+
+/**
+ * @brief Get the centralized timer manager for periodic/one-shot timers.
+ * @return PTM_MANAGER or NULL if not initialized.
+ * @note DeviceObject is set after FltRegisterFilter; TmFlag_WorkItemCallback
+ *       requires DeviceObject, so only use after Phase 2 completes.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PTM_MANAGER
+ShadowStrikeGetTimerManager(VOID);
 
 #ifdef __cplusplus
 }

@@ -24,7 +24,7 @@
     Design:
     - EX_RUNDOWN_REF protects manager lifetime during concurrent operations.
     - EX_PUSH_LOCK (shared/exclusive) guards the cache data structures.
-    - Periodic cleanup runs at PASSIVE_LEVEL via IoWorkItem (NOT DPC).
+    - Periodic cleanup runs at PASSIVE_LEVEL via TimerManager (TmFlag_WorkItemCallback).
     - Entries are allocated from PagedPool (accessed only at <= APC_LEVEL).
     - Duplicate entries are detected and updated in-place on re-add.
     - No hardcoded safe-IP whitelist; private/loopback return Unknown
@@ -169,11 +169,9 @@ typedef struct _NR_MANAGER {
         ULONG BucketCount;
     } Hash;
 
-    // Periodic cleanup (work item, runs at PASSIVE_LEVEL)
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    PIO_WORKITEM CleanupWorkItem;
-    volatile LONG CleanupInProgress;    // Prevent overlapping work items
+    // Periodic cleanup (via centralized TimerManager, runs at PASSIVE_LEVEL)
+    ULONG CleanupTimerId;
+    volatile LONG CleanupInProgress;    // Prevent overlapping callbacks
 
     // Statistics
     struct {
@@ -189,9 +187,6 @@ typedef struct _NR_MANAGER {
         ULONG TTLSeconds;
         BOOLEAN EnableExpirations;
     } Config;
-
-    // Back-pointer to device object (needed for IoAllocateWorkItem)
-    PDEVICE_OBJECT DeviceObject;
 
 } NR_MANAGER, *PNR_MANAGER;
 
@@ -217,7 +212,6 @@ _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 NrInitialize(
-    _In_ PDEVICE_OBJECT DeviceObject,
     _Out_ PNR_MANAGER* Manager
     );
 

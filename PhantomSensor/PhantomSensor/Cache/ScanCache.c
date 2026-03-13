@@ -45,6 +45,8 @@
 
 #include "ScanCache.h"
 #include "../Core/Globals.h"
+#include "../Core/DriverEntry.h"
+#include "../Sync/TimerManager.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeCacheInitialize)
@@ -66,15 +68,10 @@ SHADOWSTRIKE_SCAN_CACHE g_ScanCache = {0};
 
 static
 VOID
-ShadowStrikeCacheCleanupDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+ShadowStrikeCacheCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
-
-static
-IO_WORKITEM_ROUTINE ShadowStrikeCacheCleanupWorker;
 
 static
 BOOLEAN
@@ -177,19 +174,15 @@ ShadowStrikeCacheInitialize(
     )
 {
     ULONG i;
-    LARGE_INTEGER dueTime;
     ULONG clampedTTL;
 
     PAGED_CODE();
 
     //
-    // Validate parameters
+    // DeviceObject parameter retained for ABI compatibility but no longer required
+    // (TimerManager handles work item allocation internally)
     //
-    if (DeviceObject == NULL) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] ScanCache: DeviceObject is required\n");
-        return STATUS_INVALID_PARAMETER;
-    }
+    UNREFERENCED_PARAMETER(DeviceObject);
 
     if (g_ScanCache.Initialized) {
         return STATUS_SUCCESS;
@@ -251,36 +244,38 @@ ShadowStrikeCacheInitialize(
     g_ScanCache.TTLInterval.QuadPart = (LONGLONG)clampedTTL * 10000000LL;
 
     //
-    // Initialize cleanup timer and DPC
+    // Initialize cleanup timer via centralized TimerManager.
+    // TmFlag_WorkItemCallback ensures the callback runs at PASSIVE_LEVEL,
+    // eliminating the need for a separate DPC→WorkItem indirection.
     //
-    KeInitializeTimer(&g_ScanCache.CleanupTimer);
-    KeInitializeDpc(&g_ScanCache.CleanupDpc, ShadowStrikeCacheCleanupDpc, NULL);
+    {
+        PTM_MANAGER timerManager = ShadowStrikeGetTimerManager();
+        if (timerManager != NULL) {
+            TM_TIMER_OPTIONS opts = {0};
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 5000;
+            opts.Name = "ScanCacheCleanup";
 
-    //
-    // Allocate work item using IoAllocateWorkItem for proper lifecycle management
-    // This is the correct API for kernel work items (not deprecated ExInitializeWorkItem)
-    //
-    g_ScanCache.CleanupWorkItem = IoAllocateWorkItem(DeviceObject);
-    if (g_ScanCache.CleanupWorkItem == NULL) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] ScanCache: Failed to allocate cleanup work item\n");
-
-        ExDeleteNPagedLookasideList(&g_ScanCache.EntryLookaside);
-        g_ScanCache.LookasideInitialized = FALSE;
-
-        return STATUS_INSUFFICIENT_RESOURCES;
+            NTSTATUS tmStatus = TmCreatePeriodic(
+                timerManager,
+                SHADOWSTRIKE_CACHE_CLEANUP_INTERVAL * 1000,
+                ShadowStrikeCacheCleanupTimerCallback,
+                NULL,
+                &opts,
+                &g_ScanCache.CleanupTimerId
+            );
+            if (!NT_SUCCESS(tmStatus)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] ScanCache: Failed to create cleanup timer: 0x%08X\n",
+                           tmStatus);
+                g_ScanCache.CleanupTimerId = 0;
+            }
+        } else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] ScanCache: TimerManager not available — periodic cleanup disabled\n");
+            g_ScanCache.CleanupTimerId = 0;
+        }
     }
-
-    //
-    // Start cleanup timer (periodic)
-    //
-    dueTime.QuadPart = -(LONGLONG)SHADOWSTRIKE_CACHE_CLEANUP_INTERVAL * 10000000LL;
-    KeSetTimerEx(
-        &g_ScanCache.CleanupTimer,
-        dueTime,
-        SHADOWSTRIKE_CACHE_CLEANUP_INTERVAL * 1000,  // Period in ms
-        &g_ScanCache.CleanupDpc
-    );
 
     g_ScanCache.Initialized = TRUE;
 
@@ -313,15 +308,17 @@ ShadowStrikeCacheShutdown(
     g_ScanCache.ShutdownInProgress = TRUE;
 
     //
-    // Step 2: Cancel the cleanup timer
+    // Step 2: Cancel the cleanup timer via TimerManager.
+    // TmCancel with Wait=TRUE blocks until any in-flight callback completes,
+    // replacing the old KeCancelTimer + KeFlushQueuedDpcs + spin-wait pattern.
     //
-    KeCancelTimer(&g_ScanCache.CleanupTimer);
-
-    //
-    // Step 3: CRITICAL - Flush queued DPCs to ensure our DPC has completed
-    // This prevents the DPC from queueing a work item after we think we're done
-    //
-    KeFlushQueuedDpcs();
+    if (g_ScanCache.CleanupTimerId != 0) {
+        PTM_MANAGER timerManager = ShadowStrikeGetTimerManager();
+        if (timerManager != NULL) {
+            TmCancel(timerManager, g_ScanCache.CleanupTimerId, TRUE);
+        }
+        g_ScanCache.CleanupTimerId = 0;
+    }
 
     //
     // Step 4: Wait for any active references (work item or operations in progress)
@@ -352,15 +349,7 @@ ShadowStrikeCacheShutdown(
     }
 
     //
-    // Step 6: Free the work item
-    //
-    if (g_ScanCache.CleanupWorkItem != NULL) {
-        IoFreeWorkItem(g_ScanCache.CleanupWorkItem);
-        g_ScanCache.CleanupWorkItem = NULL;
-    }
-
-    //
-    // Step 7: Clear all entries
+    // Step 6: Clear all entries
     //
     ShadowStrikeCacheClear();
 
@@ -1185,84 +1174,60 @@ ShadowStrikeCacheFreeEntry(
 
 static
 VOID
-ShadowStrikeCacheCleanupDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+ShadowStrikeCacheCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
+/*++
+
+Routine Description:
+
+    TimerManager callback for periodic cache cleanup. Runs at PASSIVE_LEVEL
+    via TmFlag_WorkItemCallback. Replaces the old DPC→IoWorkItem pattern.
+
+    Re-entrancy guard: CleanupInProgress prevents overlapping cleanup cycles
+    if the previous one hasn't finished when the next timer fires.
+
+--*/
 {
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(DeferredContext);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
+    UNREFERENCED_PARAMETER(Context);
 
     //
-    // Check shutdown flag and acquire reference atomically
+    // Check shutdown flag
     //
     if (g_ScanCache.ShutdownInProgress) {
         return;
     }
 
     //
-    // Check if work item is already queued (prevents double-queue)
+    // Prevent overlapping cleanup cycles
     //
-    if (InterlockedCompareExchange(&g_ScanCache.WorkItemQueued, 1, 0) != 0) {
-        //
-        // Work item already queued, skip this cycle
-        //
+    if (InterlockedCompareExchange(&g_ScanCache.CleanupInProgress, 1, 0) != 0) {
+        return;
+    }
+
+    if (!g_ScanCache.Initialized) {
+        InterlockedExchange(&g_ScanCache.CleanupInProgress, 0);
         return;
     }
 
     //
-    // Verify work item is valid
-    //
-    if (g_ScanCache.CleanupWorkItem == NULL || !g_ScanCache.Initialized) {
-        InterlockedExchange(&g_ScanCache.WorkItemQueued, 0);
-        return;
-    }
-
-    //
-    // Acquire reference for the work item
+    // Acquire reference for shutdown synchronization
     //
     if (!ShadowStrikeCacheAcquireReference()) {
-        InterlockedExchange(&g_ScanCache.WorkItemQueued, 0);
+        InterlockedExchange(&g_ScanCache.CleanupInProgress, 0);
         return;
     }
 
     //
-    // Queue work item (IoQueueWorkItem is the correct API for IoAllocateWorkItem)
-    //
-    IoQueueWorkItem(
-        g_ScanCache.CleanupWorkItem,
-        ShadowStrikeCacheCleanupWorker,
-        DelayedWorkQueue,
-        NULL
-    );
-}
-
-static
-VOID
-ShadowStrikeCacheCleanupWorker(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
-    )
-{
-    UNREFERENCED_PARAMETER(DeviceObject);
-    UNREFERENCED_PARAMETER(Context);
-
-    //
-    // Perform cleanup
+    // Perform cleanup at PASSIVE_LEVEL (guaranteed by TmFlag_WorkItemCallback)
     //
     ShadowStrikeCacheCleanup();
 
     //
-    // Clear the queued flag so next DPC can queue again
+    // Release reference and cleanup guard
     //
-    InterlockedExchange(&g_ScanCache.WorkItemQueued, 0);
-
-    //
-    // Release reference acquired in DPC
-    //
+    InterlockedExchange(&g_ScanCache.CleanupInProgress, 0);
     ShadowStrikeCacheReleaseReference();
 }
