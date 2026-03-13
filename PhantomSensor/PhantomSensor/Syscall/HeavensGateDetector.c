@@ -57,6 +57,8 @@ Detection Techniques Covered:
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/ProcessUtils.h"
 #include "../Sync/WorkQueue.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 #include "../Tracing/WppConfig.h"
 #include "../../Shared/KernelProcessTypes.h"
 #include <ntstrsafe.h>
@@ -287,18 +289,14 @@ struct _HGD_DETECTOR {
     SIZE_T SystemWow64CpuSize;
 
     //
-    // Cleanup timer
+    // Cleanup timer (managed by TimerManager)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    BOOLEAN CleanupTimerActive;
+    ULONG CleanupTimerId;
 
     //
     // Shutdown synchronization
     //
     volatile BOOLEAN ShutdownRequested;
-    KEVENT ShutdownComplete;
-    volatile LONG PendingWorkItems;
 };
 
 // ============================================================================
@@ -432,15 +430,8 @@ HgdpNotifyCallbacks(
     );
 
 static VOID
-HgdpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    );
-
-static VOID
-HgdpCleanupWorkRoutine(
+HgdpCleanupTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     );
 
@@ -486,7 +477,6 @@ Return Value:
 {
     PHGD_DETECTOR Internal = NULL;
     NTSTATUS Status;
-    LARGE_INTEGER DueTime;
 
     PAGED_CODE();
 
@@ -538,11 +528,6 @@ Return Value:
     ExInitializePushLock(&Internal->CallbackLock);
 
     //
-    // Initialize shutdown synchronization
-    //
-    KeInitializeEvent(&Internal->ShutdownComplete, NotificationEvent, TRUE);
-
-    //
     // Initialize lookaside lists
     //
     ExInitializeNPagedLookasideList(
@@ -578,22 +563,28 @@ Return Value:
     KeQuerySystemTime(&Internal->Stats.StartTime);
 
     //
-    // Initialize cleanup timer
+    // Start periodic cleanup timer via TimerManager
     //
-    KeInitializeTimer(&Internal->CleanupTimer);
-    KeInitializeDpc(&Internal->CleanupDpc, HgdpCleanupTimerDpc, Internal);
-
-    //
-    // Start periodic cleanup timer
-    //
-    DueTime.QuadPart = -((LONGLONG)HGD_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &Internal->CleanupTimer,
-        DueTime,
-        HGD_CLEANUP_INTERVAL_MS,
-        &Internal->CleanupDpc
-        );
-    Internal->CleanupTimerActive = TRUE;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 10000;
+            Status = TmCreatePeriodic(
+                tmMgr,
+                HGD_CLEANUP_INTERVAL_MS,
+                HgdpCleanupTimerCallback,
+                Internal,
+                &opts,
+                &Internal->CleanupTimerId
+                );
+            if (!NT_SUCCESS(Status)) {
+                TraceEvents(TRACE_LEVEL_ERROR, TRACE_FLAG_INIT,
+                    "HgdInitialize: Failed to create cleanup timer: %!STATUS!", Status);
+            }
+        }
+    }
 
     //
     // Try to resolve system WoW64 addresses (non-fatal if fails)
@@ -651,32 +642,15 @@ Arguments:
     InterlockedExchange8((volatile CHAR*)&Detector->ShutdownRequested, TRUE);
 
     //
-    // Cancel cleanup timer and flush any in-flight DPCs.
-    // KeFlushQueuedDpcs must be called at PASSIVE_LEVEL.
+    // Cancel cleanup timer.  TmCancel with Wait=TRUE blocks until any
+    // in-flight callback completes, replacing KeCancelTimer+KeFlushQueuedDpcs.
     //
-    if (Detector->CleanupTimerActive) {
-        KeCancelTimer(&Detector->CleanupTimer);
-        KeFlushQueuedDpcs();
-        Detector->CleanupTimerActive = FALSE;
-    }
-
-    //
-    // Wait for any in-flight work items to complete.
-    // Clear the event BEFORE checking the count to avoid the race where
-    // the last work item completes between our check and the wait.
-    //
-    KeClearEvent(&Detector->ShutdownComplete);
-    if (InterlockedCompareExchange(&Detector->PendingWorkItems, 0, 0) > 0) {
-        LARGE_INTEGER Timeout;
-        Timeout.QuadPart = -10LL * 1000 * 1000 * 10;  // 10 seconds
-
-        KeWaitForSingleObject(
-            &Detector->ShutdownComplete,
-            Executive,
-            KernelMode,
-            FALSE,
-            &Timeout
-            );
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && Detector->CleanupTimerId != 0) {
+            TmCancel(tmMgr, Detector->CleanupTimerId, TRUE);
+            Detector->CleanupTimerId = 0;
+        }
     }
 
     //
@@ -2644,63 +2618,23 @@ Routine Description:
 
 
 static VOID
-HgdpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    )
-/*++
-Routine Description:
-    Timer DPC callback. Runs at DISPATCH_LEVEL.
-    Queues a work item to perform actual cleanup at PASSIVE_LEVEL.
-    Push locks and PEB walking cannot be done at DISPATCH_LEVEL.
---*/
-{
-    PHGD_DETECTOR Detector = (PHGD_DETECTOR)DeferredContext;
-    NTSTATUS Status;
-
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    if (Detector == NULL || Detector->ShutdownRequested) {
-        return;
-    }
-
-    //
-    // Queue a work item for cleanup at PASSIVE_LEVEL.
-    // Track pending work items for shutdown synchronization.
-    //
-    InterlockedIncrement(&Detector->PendingWorkItems);
-    KeClearEvent(&Detector->ShutdownComplete);
-
-    Status = ShadowStrikeQueueWorkItem(HgdpCleanupWorkRoutine, Detector);
-    if (!NT_SUCCESS(Status)) {
-        //
-        // Failed to queue - decrement counter and signal if zero
-        //
-        if (InterlockedDecrement(&Detector->PendingWorkItems) == 0) {
-            KeSetEvent(&Detector->ShutdownComplete, IO_NO_INCREMENT, FALSE);
-        }
-    }
-}
-
-
-static VOID
-HgdpCleanupWorkRoutine(
+HgdpCleanupTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     )
 /*++
 Routine Description:
-    Work queue callback for periodic cleanup.
-    Runs at PASSIVE_LEVEL. Safe to use push locks and PEB walking.
+    TimerManager periodic callback.
+    Runs at PASSIVE_LEVEL (TmFlag_WorkItemCallback), so push locks
+    and PEB walking are safe — no intermediate work-item needed.
 --*/
 {
     PHGD_DETECTOR Detector = (PHGD_DETECTOR)Context;
 
+    UNREFERENCED_PARAMETER(TimerId);
+
     if (Detector == NULL || Detector->ShutdownRequested) {
-        goto Done;
+        return;
     }
 
     //
@@ -2712,13 +2646,6 @@ Routine Description:
     // Clean up process contexts for dead processes
     //
     HgdpCleanupStaleProcessContexts(Detector);
-
-Done:
-    if (Detector != NULL) {
-        if (InterlockedDecrement(&Detector->PendingWorkItems) == 0) {
-            KeSetEvent(&Detector->ShutdownComplete, IO_NO_INCREMENT, FALSE);
-        }
-    }
 }
 
 

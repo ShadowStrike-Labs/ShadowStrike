@@ -61,6 +61,8 @@ Detection Techniques Covered:
 #include "VadTracker.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/ProcessUtils.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -76,6 +78,7 @@ Detection Techniques Covered:
 #define INJ_SUSPICION_THRESHOLD_MEDIUM  50
 #define INJ_SUSPICION_THRESHOLD_HIGH    75
 #define INJ_SUSPICION_THRESHOLD_CRITICAL 90
+#define INJ_CLEANUP_INTERVAL_MS         30000
 
 //
 // L-2: Maximum iterations for cleanup loops to prevent unbounded
@@ -200,11 +203,9 @@ typedef struct _INJ_DETECTOR_INTERNAL {
     BOOLEAN ShutdownRequested;
 
     //
-    // Timer for stale operation cleanup
+    // Timer for stale operation cleanup (managed by TimerManager)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    BOOLEAN CleanupTimerActive;
+    ULONG CleanupTimerId;
 
 } INJ_DETECTOR_INTERNAL, *PINJ_DETECTOR_INTERNAL;
 
@@ -388,11 +389,9 @@ InjpWorkerThread(
     );
 
 static VOID
-InjpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+InjpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static VOID
@@ -466,7 +465,6 @@ Return Value:
     PINJ_DETECTOR_INTERNAL Internal = NULL;
     HANDLE ThreadHandle = NULL;
     OBJECT_ATTRIBUTES ObjectAttributes;
-    LARGE_INTEGER DueTime;
     ULONG i;
 
     if (Detector == NULL) {
@@ -627,22 +625,24 @@ Return Value:
     }
 
     //
-    // Initialize cleanup timer
+    // Create periodic cleanup timer via TimerManager
     //
-    KeInitializeTimer(&Internal->CleanupTimer);
-    KeInitializeDpc(&Internal->CleanupDpc, InjpCleanupTimerDpc, Internal);
-
-    //
-    // Start cleanup timer (every 30 seconds)
-    //
-    DueTime.QuadPart = -((LONGLONG)30000 * 10000);
-    KeSetTimerEx(
-        &Internal->CleanupTimer,
-        DueTime,
-        30000,
-        &Internal->CleanupDpc
-        );
-    Internal->CleanupTimerActive = TRUE;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 5000;
+            TmCreatePeriodic(
+                tmMgr,
+                INJ_CLEANUP_INTERVAL_MS,
+                InjpCleanupTimerCallback,
+                Internal,
+                &opts,
+                &Internal->CleanupTimerId
+                );
+        }
+    }
 
     //
     // Mark as initialized
@@ -692,17 +692,14 @@ Arguments:
     Internal->ShutdownRequested = TRUE;
 
     //
-    // Cancel cleanup timer
+    // Cancel cleanup timer via TimerManager
     //
-    if (Internal->CleanupTimerActive) {
-        KeCancelTimer(&Internal->CleanupTimer);
-        //
-        // I-2 FIX: KeFlushQueuedDpcs ensures DPC has completed before we
-        // free the detector structure. Without this, a pending/running DPC
-        // could access freed memory → BSOD.
-        //
-        KeFlushQueuedDpcs();
-        Internal->CleanupTimerActive = FALSE;
+    if (Internal->CleanupTimerId != TM_INVALID_TIMER_ID) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Internal->CleanupTimerId, TRUE);
+        }
+        Internal->CleanupTimerId = TM_INVALID_TIMER_ID;
     }
 
     //
@@ -2716,18 +2713,14 @@ InjpWorkerThread(
 }
 
 static VOID
-InjpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+InjpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PINJ_DETECTOR_INTERNAL Detector = (PINJ_DETECTOR_INTERNAL)DeferredContext;
+    PINJ_DETECTOR_INTERNAL Detector = (PINJ_DETECTOR_INTERNAL)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (Detector == NULL || Detector->ShutdownRequested) {
         return;

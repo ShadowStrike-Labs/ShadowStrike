@@ -846,16 +846,14 @@ typedef struct _TE_PROVIDER {
     // Memory management
     SHADOWSTRIKE_LOOKASIDE EventLookaside;
 
-    // Batching/Flush
-    KTIMER FlushTimer;
-    KDPC FlushDpc;
+    // Batching/Flush (managed by TimerManager)
+    ULONG FlushTimerId;
     PIO_WORKITEM FlushWorkItem;
     PDEVICE_OBJECT DeviceObject;
     volatile LONG FlushPending;
 
-    // Heartbeat
-    KTIMER HeartbeatTimer;
-    KDPC HeartbeatDpc;
+    // Heartbeat (managed by TimerManager)
+    ULONG HeartbeatTimerId;
 
     // Throttling
     volatile LONG ThrottleAction;
@@ -996,9 +994,9 @@ TeGetConfig(
  *
  * Uses atomic state transition. Will not override a shutdown in progress.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql PASSIVE_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 TePause(
     VOID
@@ -1009,9 +1007,9 @@ TePause(
  *
  * Uses atomic state transition. Only resumes from Paused state.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql PASSIVE_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 TeResume(
     VOID
