@@ -3396,6 +3396,17 @@ PnpHandleProcessTermination(
     TnNotifyProcessTermination(ProcessId);
 
     //
+    // Notify TokenAnalyzer to clean up baseline + cached token entries
+    // for this process. Prevents unbounded memory growth.
+    //
+    {
+        PTA_ANALYZER tokenAnalyzer = PaGetTokenAnalyzer();
+        if (tokenAnalyzer != NULL) {
+            TaOnProcessTerminated(tokenAnalyzer, ProcessId);
+        }
+    }
+
+    //
     // Remove process from relationship graph before context teardown.
     // Must happen while process context is still accessible — enables
     // final cluster scoring and relationship cleanup.

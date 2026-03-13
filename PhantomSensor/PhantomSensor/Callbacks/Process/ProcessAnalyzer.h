@@ -68,6 +68,7 @@ typedef struct _HT_TRACKER* PHT_TRACKER;
 typedef struct _PCT_TRACKER* PPCT_TRACKER_FWD;
 typedef struct _PM_MONITOR* PPM_MONITOR_FWD;
 typedef struct _PR_GRAPH* PPR_GRAPH;
+typedef struct _TA_ANALYZER* PTA_ANALYZER;
 
 //
 // Pool tags for memory tracking
@@ -526,6 +527,16 @@ IRQL:
 --*/
 PPR_GRAPH
 PaGetProcessRelationshipGraph(
+    VOID
+    );
+
+/*++
+Routine Description:
+    Returns the global TokenAnalyzer handle owned by ProcessAnalyzer.
+    Can be called at any IRQL (returns pointer only).
+--*/
+PTA_ANALYZER
+PaGetTokenAnalyzer(
     VOID
     );
 
