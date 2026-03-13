@@ -49,6 +49,8 @@
 #pragma warning(push)
 #pragma warning(disable: 4324)
 #include "PatternMatcher.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 #pragma warning(pop)
 
 //
@@ -176,14 +178,12 @@ typedef struct _PM_MATCHER_INTERNAL {
     volatile BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup: dedicated worker thread signaled by periodic DPC
+    // Cleanup: dedicated worker thread signaled by periodic TimerManager callback
     //
     PVOID WorkerThread;
     KEVENT WorkerWakeEvent;
     volatile BOOLEAN WorkerTerminate;
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    volatile BOOLEAN CleanupTimerActive;
+    ULONG CleanupTimerId;
 
     //
     // Configuration
@@ -300,13 +300,10 @@ PmpUnindexPattern(
     _In_ PPM_PATTERN Pattern
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-PmpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+PmpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
@@ -358,7 +355,6 @@ PtmInitialize(
     NTSTATUS status = STATUS_SUCCESS;
     PPM_MATCHER_INTERNAL matcher = NULL;
     ULONG i;
-    LARGE_INTEGER dueTime;
 
     PAGED_CODE();
 
@@ -474,25 +470,21 @@ PtmInitialize(
     matcher->Public.Stats.StartTime = KeQueryPerformanceCounter(NULL);
 
     //
-    // Initialize cleanup timer and DPC
+    // Create periodic cleanup timer via TimerManager
     //
-    KeInitializeTimer(&matcher->CleanupTimer);
-    KeInitializeDpc(&matcher->CleanupDpc, PmpCleanupTimerDpc, matcher);
+    matcher->CleanupTimerId = 0;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 10000;
+            TmCreatePeriodic(tmMgr, PM_CLEANUP_INTERVAL_MS, PmpCleanupTimerCallback, matcher, &opts, &matcher->CleanupTimerId);
+        }
+    }
 
     //
-    // Start cleanup timer (periodic)
-    //
-    dueTime.QuadPart = -((LONGLONG)PM_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &matcher->CleanupTimer,
-        dueTime,
-        PM_CLEANUP_INTERVAL_MS,
-        &matcher->CleanupDpc
-    );
-    InterlockedExchange8((CHAR*)&matcher->CleanupTimerActive, TRUE);
-
-    //
-    // Create dedicated worker thread for DPC-to-PASSIVE cleanup deferral
+    // Create dedicated worker thread for PASSIVE_LEVEL cleanup deferral
     //
     KeInitializeEvent(&matcher->WorkerWakeEvent, SynchronizationEvent, FALSE);
     matcher->WorkerTerminate = FALSE;
@@ -544,8 +536,12 @@ PtmInitialize(
     return STATUS_SUCCESS;
 
 InitFailed:
-    KeCancelTimer(&matcher->CleanupTimer);
-    KeFlushQueuedDpcs();
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && matcher->CleanupTimerId) {
+            TmCancel(tmMgr, matcher->CleanupTimerId, TRUE);
+        }
+    }
     if (InterlockedExchange8((CHAR*)&matcher->LookasideInitialized, FALSE)) {
         ExDeleteNPagedLookasideList(&matcher->PatternLookaside);
         ExDeleteNPagedLookasideList(&matcher->StateLookaside);
@@ -597,16 +593,15 @@ PtmShutdown(
     InterlockedExchange8((CHAR*)&Matcher->ShuttingDown, TRUE);
 
     //
-    // Cancel cleanup timer first
+    // Cancel cleanup timer via TimerManager
     //
-    if (InterlockedExchange8((CHAR*)&matcher->CleanupTimerActive, FALSE)) {
-        KeCancelTimer(&matcher->CleanupTimer);
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && matcher->CleanupTimerId) {
+            TmCancel(tmMgr, matcher->CleanupTimerId, TRUE);
+            matcher->CleanupTimerId = 0;
+        }
     }
-
-    //
-    // Wait for any queued DPCs to complete
-    //
-    KeFlushQueuedDpcs();
 
     //
     // Terminate worker thread
@@ -2201,31 +2196,23 @@ PmpRemoveStateFromProcessHash(
     ExReleasePushLockExclusive(&Matcher->ProcessStateHash.Lock);
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-PmpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+PmpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 /**
- * @brief DPC callback for periodic cleanup.
+ * @brief TimerManager callback for periodic cleanup.
  *
  * Signals the dedicated worker thread to perform cleanup at PASSIVE_LEVEL.
  */
 {
-    PPM_MATCHER_INTERNAL matcher = (PPM_MATCHER_INTERNAL)DeferredContext;
+    PPM_MATCHER_INTERNAL matcher = (PPM_MATCHER_INTERNAL)Context;
+    UNREFERENCED_PARAMETER(TimerId);
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    if (matcher == NULL || matcher->Public.ShuttingDown) {
-        return;
+    if (matcher && !matcher->Public.ShuttingDown) {
+        KeSetEvent(&matcher->WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
     }
-
-    KeSetEvent(&matcher->WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
 }
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
@@ -2236,7 +2223,7 @@ PmpWorkerThreadRoutine(
 /**
  * @brief Dedicated worker thread for stale state cleanup.
  *
- * Waits on WorkerWakeEvent (signaled by DPC timer), performs
+ * Waits on WorkerWakeEvent (signaled by TimerManager callback), performs
  * PASSIVE_LEVEL cleanup, then loops. Terminates when
  * WorkerTerminate is set during shutdown.
  */

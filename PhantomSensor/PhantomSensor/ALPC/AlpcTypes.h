@@ -625,16 +625,9 @@ typedef struct _SHADOW_ALPC_MONITOR_STATE {
     KEVENT WorkAvailableEvent;
 
     //
-    // Timer for periodic cleanup
+    // Timer for periodic cleanup (via TimerManager)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    BOOLEAN CleanupTimerActive;
-
-    //
-    // DPC completion tracking for safe shutdown
-    //
-    volatile LONG DpcOutstanding;
+    ULONG CleanupTimerId;
 
 } SHADOW_ALPC_MONITOR_STATE, *PSHADOW_ALPC_MONITOR_STATE;
 

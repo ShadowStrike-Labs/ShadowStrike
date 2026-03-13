@@ -41,6 +41,9 @@
 #include "IOCMatcher.h"
 #pragma warning(pop)
 
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
+
 // ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
@@ -225,10 +228,9 @@ typedef struct _IOM_MATCHER_INTERNAL {
     BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup infrastructure (system thread + KEVENT pattern)
+    // Cleanup infrastructure (system thread + TimerManager pattern)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
+    ULONG CleanupTimerId;
     PETHREAD CleanupThread;
     KEVENT CleanupWakeEvent;
     volatile BOOLEAN CleanupTerminate;
@@ -365,13 +367,10 @@ IompNotifyCallback(
     _In_ PIOM_MATCH_RESULT_DATA Result
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-IompCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+IompCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static VOID
@@ -443,7 +442,6 @@ IomInitialize(
     PIOM_MATCHER_INTERNAL matcher = NULL;
     ULONG i;
     ULONG bucketCount;
-    LARGE_INTEGER dueTime;
 
     PAGED_CODE();
 
@@ -587,13 +585,11 @@ IomInitialize(
     KeQuerySystemTime(&matcher->Stats.StartTime);
 
     //
-    // Initialize cleanup timer and DPC
-    // DPC signals the cleanup wake event — thread runs at PASSIVE_LEVEL
+    // Initialize cleanup event and state
     //
-    KeInitializeTimer(&matcher->CleanupTimer);
-    KeInitializeDpc(&matcher->CleanupDpc, IompCleanupTimerDpc, matcher);
     KeInitializeEvent(&matcher->CleanupWakeEvent, SynchronizationEvent, FALSE);
     matcher->CleanupTerminate = FALSE;
+    matcher->CleanupTimerId = 0;
 
     //
     // Create cleanup thread and start timer if expiration is enabled
@@ -634,13 +630,18 @@ IomInitialize(
             goto Cleanup;
         }
 
-        dueTime.QuadPart = -((LONGLONG)IOM_CLEANUP_INTERVAL_MS * 10000);
-        KeSetTimerEx(
-            &matcher->CleanupTimer,
-            dueTime,
-            IOM_CLEANUP_INTERVAL_MS,
-            &matcher->CleanupDpc
-        );
+        //
+        // Create periodic timer via TimerManager
+        //
+        {
+            PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+            if (tmMgr) {
+                TM_TIMER_OPTIONS opts = { 0 };
+                opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+                opts.ToleranceMs = 30000;
+                TmCreatePeriodic(tmMgr, IOM_CLEANUP_INTERVAL_MS, IompCleanupTimerCallback, matcher, &opts, &matcher->CleanupTimerId);
+            }
+        }
     }
 
     matcher->Initialized = TRUE;
@@ -704,10 +705,14 @@ IomShutdown(
     InterlockedExchange8((volatile char*)&matcher->ShuttingDown, TRUE);
 
     //
-    // Cancel cleanup timer and flush pending DPCs
+    // Cancel cleanup timer via TimerManager
     //
-    KeCancelTimer(&matcher->CleanupTimer);
-    KeFlushQueuedDpcs();
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && matcher->CleanupTimerId) {
+            TmCancel(tmMgr, matcher->CleanupTimerId, TRUE);
+        }
+    }
 
     //
     // Terminate cleanup thread: signal terminate, wake thread, wait for exit
@@ -2469,31 +2474,22 @@ IompNotifyCallback(
     }
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-IompCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+IompCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 /**
- * @brief DPC callback for cleanup timer.
+ * @brief TimerManager callback for cleanup timer.
  *
  * Signals the cleanup thread wake event. Thread runs cleanup at PASSIVE_LEVEL.
  */
 {
-    PIOM_MATCHER_INTERNAL matcher = (PIOM_MATCHER_INTERNAL)DeferredContext;
-
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    if (matcher == NULL || matcher->ShuttingDown || matcher->CleanupTerminate) {
-        return;
+    UNREFERENCED_PARAMETER(TimerId);
+    PIOM_MATCHER_INTERNAL matcher = (PIOM_MATCHER_INTERNAL)Context;
+    if (matcher && !matcher->CleanupTerminate) {
+        KeSetEvent(&matcher->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
     }
-
-    KeSetEvent(&matcher->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
 }
 
 /**
