@@ -429,6 +429,15 @@ Cleanup:
             ExDeleteNPagedLookasideList(&internal->MapLookaside);
         }
 
+        // Cancel timer if it was created before failure
+        if (internal->CleanupTimerId != 0) {
+            PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+            if (tmMgr) {
+                TmCancel(tmMgr, internal->CleanupTimerId, TRUE);
+            }
+            internal->CleanupTimerId = 0;
+        }
+
         ShadowStrikeFreePoolWithTag(internal, SEC_POOL_TAG_CONTEXT);
     }
 

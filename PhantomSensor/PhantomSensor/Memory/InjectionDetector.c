@@ -660,6 +660,15 @@ Cleanup:
         ExDeleteNPagedLookasideList(&Internal->ResultLookaside);
     }
 
+    // Cancel timer if it was created before failure
+    if (Internal->CleanupTimerId != TM_INVALID_TIMER_ID) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Internal->CleanupTimerId, TRUE);
+        }
+        Internal->CleanupTimerId = TM_INVALID_TIMER_ID;
+    }
+
     ExFreePoolWithTag(Internal, INJ_POOL_TAG);
     return Status;
 }

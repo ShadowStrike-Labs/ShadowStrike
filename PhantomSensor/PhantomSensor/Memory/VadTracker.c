@@ -581,6 +581,15 @@ Cleanup:
         ExFreePoolWithTag(Internal->Public.ProcessHash.Buckets, VAD_POOL_TAG_HASH);
     }
 
+    // Cancel timer if it was created before failure
+    if (Internal->Public.SnapshotTimerId != TM_INVALID_TIMER_ID) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Internal->Public.SnapshotTimerId, TRUE);
+        }
+        Internal->Public.SnapshotTimerId = TM_INVALID_TIMER_ID;
+    }
+
     ExFreePoolWithTag(Internal, VAD_POOL_TAG_TREE);
     return Status;
 }
