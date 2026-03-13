@@ -38,6 +38,8 @@
 
 #include "CommPort.h"
 #include "MessageHandler.h"
+#include "Compression.h"
+#include "Encryption.h"
 #include "../Core/Globals.h"
 #include "../../Shared/SharedDefs.h"
 #include "../../Shared/MessageTypes.h"
@@ -93,6 +95,15 @@ typedef struct _SHADOWSTRIKE_PROTECTED_PROCESS_ENTRY {
  * the reference-counted version.
  */
 static SHADOWSTRIKE_CLIENT_PORT_REF g_ClientPortRefs[SHADOWSTRIKE_MAX_CONNECTIONS];
+
+//
+// HMAC-SHA256 transport authentication key (32 bytes, generated per boot)
+//
+#define SHADOWSTRIKE_HMAC_KEY_SIZE     32
+#define SHADOWSTRIKE_HMAC_OUTPUT_SIZE  32
+
+static UCHAR   g_CommHmacKey[SHADOWSTRIKE_HMAC_KEY_SIZE] = {0};
+static BOOLEAN  g_CommHmacKeyReady = FALSE;
 
 // ============================================================================
 // INTERNAL HELPER DECLARATIONS
@@ -411,6 +422,24 @@ ShadowStrikeCreateCommunicationPort(
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Communication port created successfully\n");
+
+    //
+    // Generate per-boot HMAC key for transport message authentication.
+    // Uses system CSPRNG; non-fatal if unavailable (HMAC is gracefully skipped).
+    //
+    {
+        NTSTATUS keyStatus = BCryptGenRandom(
+            NULL,
+            g_CommHmacKey,
+            SHADOWSTRIKE_HMAC_KEY_SIZE,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG
+        );
+        if (NT_SUCCESS(keyStatus)) {
+            g_CommHmacKeyReady = TRUE;
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                       "[ShadowStrike] HMAC transport key generated\n");
+        }
+    }
 
     return STATUS_SUCCESS;
 }
@@ -1326,6 +1355,9 @@ ShadowStrikeSendScanRequest(
     LARGE_INTEGER timeout;
     LONG pendingCount;
     ULONG replySize;
+    PVOID sendBuffer = Request;
+    ULONG sendSize = RequestSize;
+    BOOLEAN hmacAllocated = FALSE;
 
     //
     // Validate parameters
@@ -1349,11 +1381,45 @@ ShadowStrikeSendScanRequest(
     }
 
     //
+    // Compute HMAC-SHA256 for message integrity authentication.
+    // The HMAC is appended after the original message payload so user-mode
+    // can verify the message was not tampered with in transit.
+    //
+    if (g_CommHmacKeyReady) {
+        ULONG authenticatedSize = RequestSize + SHADOWSTRIKE_HMAC_OUTPUT_SIZE;
+        PVOID authBuffer = ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, authenticatedSize, 'hmCP');
+        if (authBuffer != NULL) {
+            RtlCopyMemory(authBuffer, Request, RequestSize);
+            NTSTATUS hmacStatus = EncHmacSha256(
+                NULL,
+                g_CommHmacKey,
+                SHADOWSTRIKE_HMAC_KEY_SIZE,
+                authBuffer,
+                RequestSize,
+                (PUCHAR)authBuffer + RequestSize
+            );
+            if (NT_SUCCESS(hmacStatus)) {
+                ((PSHADOWSTRIKE_MESSAGE_HEADER)authBuffer)->Flags |=
+                    SHADOWSTRIKE_MSG_FLAG_HMAC;
+                sendBuffer = authBuffer;
+                sendSize = authenticatedSize;
+                hmacAllocated = TRUE;
+            } else {
+                ExFreePoolWithTag(authBuffer, 'hmCP');
+            }
+        }
+    }
+
+    //
     // Acquire reference to client port
     //
     status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
     if (!NT_SUCCESS(status)) {
         InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
+        if (hmacAllocated) {
+            ExFreePoolWithTag(sendBuffer, 'hmCP');
+        }
         return status;
     }
 
@@ -1371,8 +1437,8 @@ ShadowStrikeSendScanRequest(
     status = FltSendMessage(
         g_DriverData.FilterHandle,
         &clientPort,
-        Request,
-        RequestSize,
+        sendBuffer,
+        sendSize,
         Reply,
         &replySize,
         &timeout
@@ -1392,6 +1458,10 @@ ShadowStrikeSendScanRequest(
     ShadowStrikeReleaseClientPort(clientRef);
 
     InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
+
+    if (hmacAllocated) {
+        ExFreePoolWithTag(sendBuffer, 'hmCP');
+    }
 
     if (NT_SUCCESS(status)) {
         SHADOWSTRIKE_INC_STAT(MessagesSent);
@@ -1420,9 +1490,67 @@ ShadowStrikeSendNotification(
     PSHADOWSTRIKE_CLIENT_PORT_REF clientRef = NULL;
     PFLT_PORT clientPort;
     LARGE_INTEGER timeout;
+    PVOID sendBuffer = Notification;
+    ULONG sendSize = Size;
+    PVOID compressedPayload = NULL;
+    BOOLEAN usedCompression = FALSE;
 
     if (!g_DriverData.Config.NotificationsEnabled) {
         return STATUS_SUCCESS;
+    }
+
+    //
+    // Attempt payload compression for messages exceeding threshold.
+    // Data portion starts after the header; compress only the data.
+    //
+    if (Notification->DataSize > COMP_MIN_INPUT_SIZE) {
+        PVOID dataStart = (PUCHAR)Notification + sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+        ULONG dataSize = Notification->DataSize;
+        ULONG compBufSize = dataSize;  // worst case = same size
+        ULONG compressedSize = 0;
+
+        compressedPayload = ExAllocatePool2(POOL_FLAG_NON_PAGED, compBufSize, 'cmCP');
+        if (compressedPayload != NULL) {
+            status = CompCompress(
+                dataStart,
+                dataSize,
+                compressedPayload,
+                compBufSize,
+                &compressedSize,
+                NULL
+            );
+
+            //
+            // Only use compressed form if it saves at least 10% space
+            //
+            if (NT_SUCCESS(status) &&
+                compressedSize > 0 &&
+                compressedSize < (dataSize - dataSize / 10))
+            {
+                ULONG newTotal = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + compressedSize;
+                PSHADOWSTRIKE_MESSAGE_HEADER compMsg =
+                    (PSHADOWSTRIKE_MESSAGE_HEADER)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED, newTotal, 'cmCP');
+                if (compMsg != NULL) {
+                    RtlCopyMemory(compMsg, Notification, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+                    RtlCopyMemory(
+                        (PUCHAR)compMsg + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+                        compressedPayload,
+                        compressedSize
+                    );
+                    compMsg->Flags |= SHADOWSTRIKE_MSG_FLAG_COMPRESSED;
+                    compMsg->Reserved = dataSize;   // original uncompressed size
+                    compMsg->DataSize = compressedSize;
+                    compMsg->TotalSize = newTotal;
+                    sendBuffer = compMsg;
+                    sendSize = newTotal;
+                    usedCompression = TRUE;
+                }
+            }
+
+            ExFreePoolWithTag(compressedPayload, 'cmCP');
+            compressedPayload = NULL;
+        }
     }
 
     //
@@ -1430,6 +1558,9 @@ ShadowStrikeSendNotification(
     //
     status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
     if (!NT_SUCCESS(status)) {
+        if (usedCompression) {
+            ExFreePoolWithTag(sendBuffer, 'cmCP');
+        }
         return status;
     }
 
@@ -1443,8 +1574,8 @@ ShadowStrikeSendNotification(
     status = FltSendMessage(
         g_DriverData.FilterHandle,
         &clientPort,
-        Notification,
-        Size,
+        sendBuffer,
+        sendSize,
         NULL,
         NULL,
         &timeout
@@ -1458,6 +1589,10 @@ ShadowStrikeSendNotification(
     }
 
     ShadowStrikeReleaseClientPort(clientRef);
+
+    if (usedCompression) {
+        ExFreePoolWithTag(sendBuffer, 'cmCP');
+    }
 
     if (NT_SUCCESS(status)) {
         SHADOWSTRIKE_INC_STAT(MessagesSent);
