@@ -64,6 +64,7 @@ Performance Characteristics:
 #include "USBDeviceControl.h"
 #include "../../Core/Globals.h"
 #include "../../Communication/CommPort.h"
+#include "../../Communication/ScanBridge.h"
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../SelfProtection/FirmwareIntegrity.h"
 #include "../../Cache/ScanCache.h"
@@ -1208,7 +1209,7 @@ Return Value:
             ScanAccessType = ShadowStrikeAccessExecute;
         }
 
-        Status = ShadowStrikeBuildFileScanRequest(
+        Status = SbBuildFileScanRequest(
             Data,
             FltObjects,
             ScanAccessType,
@@ -1251,7 +1252,7 @@ Return Value:
             LARGE_INTEGER ScanStart, ScanEnd;
             KeQuerySystemTime(&ScanStart);
 
-            Status = ShadowStrikeSendScanRequest(
+            Status = SbSendScanRequest(
                 RequestMsg,
                 RequestSize,
                 &ReplyMsg,
@@ -1354,7 +1355,7 @@ Return Value:
                 }
             }
 
-            ShadowStrikeFreeMessageBuffer(RequestMsg);
+            SbFreeMessageBuffer(RequestMsg);
             RequestMsg = NULL;
         }
     }
