@@ -100,12 +100,6 @@ typedef struct _FBE_ENGINE_STATE {
     FBE_HASH_BUCKET     ProcessBuckets[64];
 
     //
-    // Process tracker list for iteration
-    //
-    LIST_ENTRY          ProcessList;
-    EX_PUSH_LOCK        ProcessListLock;
-
-    //
     // Allocation
     //
     NPAGED_LOOKASIDE_LIST EntryLookaside;
@@ -295,47 +289,51 @@ FbepEnsureBackupDirectory(
 // Extensions worth backing up (user data — ransomware targets)
 //
 static const UNICODE_STRING g_BackupExtensions[] = {
+    //
+    // SORTED ALPHABETICALLY (case-insensitive) for binary search.
+    // Do NOT reorder — FbepShouldBackup depends on sorted order.
+    //
+    RTL_CONSTANT_STRING(L".7z"),    RTL_CONSTANT_STRING(L".accdb"),
+    RTL_CONSTANT_STRING(L".ai"),    RTL_CONSTANT_STRING(L".avi"),
+    RTL_CONSTANT_STRING(L".bak"),   RTL_CONSTANT_STRING(L".bmp"),
+    RTL_CONSTANT_STRING(L".c"),     RTL_CONSTANT_STRING(L".cfg"),
+    RTL_CONSTANT_STRING(L".conf"),  RTL_CONSTANT_STRING(L".cpp"),
+    RTL_CONSTANT_STRING(L".crt"),   RTL_CONSTANT_STRING(L".cs"),
+    RTL_CONSTANT_STRING(L".css"),   RTL_CONSTANT_STRING(L".csv"),
+    RTL_CONSTANT_STRING(L".db"),    RTL_CONSTANT_STRING(L".dbf"),
     RTL_CONSTANT_STRING(L".doc"),   RTL_CONSTANT_STRING(L".docx"),
-    RTL_CONSTANT_STRING(L".xls"),   RTL_CONSTANT_STRING(L".xlsx"),
-    RTL_CONSTANT_STRING(L".ppt"),   RTL_CONSTANT_STRING(L".pptx"),
-    RTL_CONSTANT_STRING(L".pdf"),   RTL_CONSTANT_STRING(L".txt"),
-    RTL_CONSTANT_STRING(L".csv"),   RTL_CONSTANT_STRING(L".rtf"),
-    RTL_CONSTANT_STRING(L".odt"),   RTL_CONSTANT_STRING(L".ods"),
-    RTL_CONSTANT_STRING(L".odp"),   RTL_CONSTANT_STRING(L".jpg"),
-    RTL_CONSTANT_STRING(L".jpeg"),  RTL_CONSTANT_STRING(L".png"),
-    RTL_CONSTANT_STRING(L".gif"),   RTL_CONSTANT_STRING(L".bmp"),
-    RTL_CONSTANT_STRING(L".tif"),   RTL_CONSTANT_STRING(L".tiff"),
-    RTL_CONSTANT_STRING(L".svg"),   RTL_CONSTANT_STRING(L".psd"),
-    RTL_CONSTANT_STRING(L".ai"),    RTL_CONSTANT_STRING(L".mp3"),
-    RTL_CONSTANT_STRING(L".mp4"),   RTL_CONSTANT_STRING(L".avi"),
-    RTL_CONSTANT_STRING(L".mkv"),   RTL_CONSTANT_STRING(L".wav"),
-    RTL_CONSTANT_STRING(L".flac"),  RTL_CONSTANT_STRING(L".zip"),
-    RTL_CONSTANT_STRING(L".rar"),   RTL_CONSTANT_STRING(L".7z"),
-    RTL_CONSTANT_STRING(L".tar"),   RTL_CONSTANT_STRING(L".gz"),
-    RTL_CONSTANT_STRING(L".sql"),   RTL_CONSTANT_STRING(L".db"),
-    RTL_CONSTANT_STRING(L".mdb"),   RTL_CONSTANT_STRING(L".accdb"),
-    RTL_CONSTANT_STRING(L".dbf"),   RTL_CONSTANT_STRING(L".sqlite"),
-    RTL_CONSTANT_STRING(L".c"),     RTL_CONSTANT_STRING(L".cpp"),
-    RTL_CONSTANT_STRING(L".h"),     RTL_CONSTANT_STRING(L".hpp"),
-    RTL_CONSTANT_STRING(L".cs"),    RTL_CONSTANT_STRING(L".java"),
-    RTL_CONSTANT_STRING(L".py"),    RTL_CONSTANT_STRING(L".js"),
-    RTL_CONSTANT_STRING(L".ts"),    RTL_CONSTANT_STRING(L".rb"),
-    RTL_CONSTANT_STRING(L".go"),    RTL_CONSTANT_STRING(L".rs"),
-    RTL_CONSTANT_STRING(L".swift"), RTL_CONSTANT_STRING(L".kt"),
-    RTL_CONSTANT_STRING(L".json"),  RTL_CONSTANT_STRING(L".xml"),
-    RTL_CONSTANT_STRING(L".yaml"),  RTL_CONSTANT_STRING(L".yml"),
-    RTL_CONSTANT_STRING(L".html"),  RTL_CONSTANT_STRING(L".htm"),
-    RTL_CONSTANT_STRING(L".css"),   RTL_CONSTANT_STRING(L".php"),
-    RTL_CONSTANT_STRING(L".ini"),   RTL_CONSTANT_STRING(L".cfg"),
-    RTL_CONSTANT_STRING(L".conf"),  RTL_CONSTANT_STRING(L".log"),
-    RTL_CONSTANT_STRING(L".bak"),   RTL_CONSTANT_STRING(L".pem"),
-    RTL_CONSTANT_STRING(L".key"),   RTL_CONSTANT_STRING(L".crt"),
-    RTL_CONSTANT_STRING(L".pfx"),   RTL_CONSTANT_STRING(L".p12"),
-    RTL_CONSTANT_STRING(L".vmdk"),  RTL_CONSTANT_STRING(L".vhd"),
-    RTL_CONSTANT_STRING(L".vhdx"),  RTL_CONSTANT_STRING(L".iso"),
     RTL_CONSTANT_STRING(L".dwg"),   RTL_CONSTANT_STRING(L".dxf"),
-    RTL_CONSTANT_STRING(L".sldprt"),RTL_CONSTANT_STRING(L".sldasm"),
-    RTL_CONSTANT_STRING(L".step"), RTL_CONSTANT_STRING(L".stl"),
+    RTL_CONSTANT_STRING(L".flac"),  RTL_CONSTANT_STRING(L".gif"),
+    RTL_CONSTANT_STRING(L".go"),    RTL_CONSTANT_STRING(L".gz"),
+    RTL_CONSTANT_STRING(L".h"),     RTL_CONSTANT_STRING(L".hpp"),
+    RTL_CONSTANT_STRING(L".htm"),   RTL_CONSTANT_STRING(L".html"),
+    RTL_CONSTANT_STRING(L".ini"),   RTL_CONSTANT_STRING(L".iso"),
+    RTL_CONSTANT_STRING(L".java"),  RTL_CONSTANT_STRING(L".jpeg"),
+    RTL_CONSTANT_STRING(L".jpg"),   RTL_CONSTANT_STRING(L".js"),
+    RTL_CONSTANT_STRING(L".json"),  RTL_CONSTANT_STRING(L".key"),
+    RTL_CONSTANT_STRING(L".kt"),    RTL_CONSTANT_STRING(L".log"),
+    RTL_CONSTANT_STRING(L".mdb"),   RTL_CONSTANT_STRING(L".mkv"),
+    RTL_CONSTANT_STRING(L".mp3"),   RTL_CONSTANT_STRING(L".mp4"),
+    RTL_CONSTANT_STRING(L".odp"),   RTL_CONSTANT_STRING(L".ods"),
+    RTL_CONSTANT_STRING(L".odt"),   RTL_CONSTANT_STRING(L".p12"),
+    RTL_CONSTANT_STRING(L".pdf"),   RTL_CONSTANT_STRING(L".pem"),
+    RTL_CONSTANT_STRING(L".pfx"),   RTL_CONSTANT_STRING(L".php"),
+    RTL_CONSTANT_STRING(L".png"),   RTL_CONSTANT_STRING(L".ppt"),
+    RTL_CONSTANT_STRING(L".pptx"),  RTL_CONSTANT_STRING(L".psd"),
+    RTL_CONSTANT_STRING(L".py"),    RTL_CONSTANT_STRING(L".rar"),
+    RTL_CONSTANT_STRING(L".rb"),    RTL_CONSTANT_STRING(L".rs"),
+    RTL_CONSTANT_STRING(L".rtf"),   RTL_CONSTANT_STRING(L".sldasm"),
+    RTL_CONSTANT_STRING(L".sldprt"),RTL_CONSTANT_STRING(L".sql"),
+    RTL_CONSTANT_STRING(L".sqlite"),RTL_CONSTANT_STRING(L".step"),
+    RTL_CONSTANT_STRING(L".stl"),   RTL_CONSTANT_STRING(L".svg"),
+    RTL_CONSTANT_STRING(L".swift"), RTL_CONSTANT_STRING(L".tar"),
+    RTL_CONSTANT_STRING(L".tif"),   RTL_CONSTANT_STRING(L".tiff"),
+    RTL_CONSTANT_STRING(L".ts"),    RTL_CONSTANT_STRING(L".txt"),
+    RTL_CONSTANT_STRING(L".vhd"),   RTL_CONSTANT_STRING(L".vhdx"),
+    RTL_CONSTANT_STRING(L".vmdk"),  RTL_CONSTANT_STRING(L".wav"),
+    RTL_CONSTANT_STRING(L".xls"),   RTL_CONSTANT_STRING(L".xlsx"),
+    RTL_CONSTANT_STRING(L".xml"),   RTL_CONSTANT_STRING(L".yaml"),
+    RTL_CONSTANT_STRING(L".yml"),   RTL_CONSTANT_STRING(L".zip"),
 };
 
 #define FBE_BACKUP_EXTENSION_COUNT \
@@ -388,12 +386,6 @@ FbeInitialize(VOID)
     InitializeListHead(&g_FbeState.LruHead);
     FltInitializePushLock(&g_FbeState.LruLock);
     g_FbeState.TotalEntryCount = 0;
-
-    //
-    // Initialize process list
-    //
-    InitializeListHead(&g_FbeState.ProcessList);
-    FltInitializePushLock(&g_FbeState.ProcessListLock);
 
     //
     // Initialize lookaside lists
@@ -546,7 +538,6 @@ FbeShutdown(VOID)
         FltDeletePushLock(&g_FbeState.ProcessBuckets[i].Lock);
     }
     FltDeletePushLock(&g_FbeState.LruLock);
-    FltDeletePushLock(&g_FbeState.ProcessListLock);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/FBE] Shutdown complete. "
@@ -1331,7 +1322,7 @@ FbeCommitProcess(
 // QUERY OPERATIONS
 // ============================================================================
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 FbeGetStatistics(
     _Out_ PFBE_STATISTICS Statistics
@@ -1341,7 +1332,7 @@ FbeGetStatistics(
 }
 
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 FbeHasBackups(
     _In_ HANDLE ProcessId
@@ -1805,7 +1796,12 @@ FbepCopyFileToBackup(
         Offset.QuadPart += BytesRead;
     }
 
-    BytesCopied->QuadPart = Offset.QuadPart;
+    //
+    // Report actual file bytes backed up, not aligned I/O offset.
+    // Non-buffered writes pad to sector boundary; Offset may exceed FileSize.
+    // Using FileSize ensures CurrentBackupDiskUsage is accurate.
+    //
+    BytesCopied->QuadPart = min(Offset.QuadPart, FileSize.QuadPart);
     Status = STATUS_SUCCESS;
 
 Cleanup:
@@ -1893,6 +1889,7 @@ FbepRestoreFileFromBackup(
 
     if (!NT_SUCCESS(Status)) {
         ExFreePoolWithTag(CopyBuffer, FBE_IO_POOL_TAG);
+        IoSetTopLevelIrp(SavedTopLevelIrp);
         return Status;
     }
 
@@ -1918,7 +1915,7 @@ FbepRestoreFileFromBackup(
         NULL,
         FILE_ATTRIBUTE_NORMAL,
         0,
-        FILE_SUPERSEDE,     // Replace/create file
+        FILE_OVERWRITE_IF,  // Overwrite (preserves ACLs) if exists, create if deleted
         FILE_NON_DIRECTORY_FILE |
             FILE_SYNCHRONOUS_IO_NONALERT,
         NULL,
@@ -2115,20 +2112,33 @@ FbepGenerateBackupPath(
     PAGED_CODE();
 
     //
-    // Extract volume prefix from original path
-    // Format: \Device\HarddiskVolume1\ShadowStrikeBackup\<BackupId>.bak
+    // Extract volume prefix from original path.
+    // Expected formats from FltGetFileNameInformation (normalized):
+    //   \Device\HarddiskVolume1\path  (standard local)
+    //   \Device\CdRom0\path           (optical)
+    //   \Device\Mup\server\share\path (network redirector — NOT supported)
+    //   \Device\LanmanRedirector\...  (network — NOT supported)
     //
-    // Find the volume prefix (e.g., \Device\HarddiskVolume1)
+    // Strategy: find the 3rd backslash to isolate the volume device name.
+    // Reject network paths (Mup, LanmanRedirector) where local backup
+    // is nonsensical and the 3rd slash wouldn't give a correct volume.
     //
     USHORT OrigLen = OriginalPath->Length / sizeof(WCHAR);
     USHORT SlashCount = 0;
     USHORT VolumeEnd = 0;
 
+    //
+    // Reject paths that are too short to contain a valid volume prefix
+    // (minimum: \Device\X\ = 10 chars)
+    //
+    if (OrigLen < 10) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     for (USHORT i = 0; i < OrigLen; i++) {
         if (OriginalPath->Buffer[i] == L'\\') {
             SlashCount++;
             if (SlashCount == 3) {
-                // After \Device\HarddiskVolumeN (3rd slash = start of user path)
                 VolumeEnd = i;
                 break;
             }
@@ -2138,8 +2148,27 @@ FbepGenerateBackupPath(
     //
     // Validate we found a proper volume prefix
     //
-    if (VolumeEnd == 0) {
+    if (VolumeEnd == 0 || VolumeEnd < 8) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Reject network redirector paths where local backup doesn't make sense.
+    // \Device\Mup\...  or \Device\LanmanRedirector\...
+    //
+    {
+        UNICODE_STRING VolumePrefix;
+        VolumePrefix.Buffer = OriginalPath->Buffer;
+        VolumePrefix.Length = VolumeEnd * sizeof(WCHAR);
+        VolumePrefix.MaximumLength = VolumePrefix.Length;
+
+        UNICODE_STRING MupPrefix = RTL_CONSTANT_STRING(L"\\Device\\Mup");
+        UNICODE_STRING LanmanPrefix = RTL_CONSTANT_STRING(L"\\Device\\LanmanRedirector");
+
+        if (RtlEqualUnicodeString(&VolumePrefix, &MupPrefix, TRUE) ||
+            RtlEqualUnicodeString(&VolumePrefix, &LanmanPrefix, TRUE)) {
+            return STATUS_NOT_SUPPORTED;
+        }
     }
 
     BackupId = InterlockedIncrement64(&g_FbeState.NextBackupId);
@@ -2243,11 +2272,21 @@ FbepShouldBackup(
     Extension.MaximumLength = Extension.Length;
 
     //
-    // Check against known backup-worthy extensions
+    // Binary search over sorted g_BackupExtensions array.
+    // O(log n) instead of O(n) — critical for hot PreWrite path.
     //
-    for (ULONG i = 0; i < FBE_BACKUP_EXTENSION_COUNT; i++) {
-        if (RtlEqualUnicodeString(&Extension, &g_BackupExtensions[i], TRUE)) {
+    LONG Lo = 0;
+    LONG Hi = (LONG)FBE_BACKUP_EXTENSION_COUNT - 1;
+
+    while (Lo <= Hi) {
+        LONG Mid = Lo + (Hi - Lo) / 2;
+        LONG Cmp = RtlCompareUnicodeString(&Extension, &g_BackupExtensions[Mid], TRUE);
+        if (Cmp == 0) {
             return TRUE;
+        } else if (Cmp < 0) {
+            Hi = Mid - 1;
+        } else {
+            Lo = Mid + 1;
         }
     }
 
@@ -2276,7 +2315,9 @@ FbepEvictLruEntries(
     while (!IsListEmpty(&g_FbeState.LruHead) && Evicted < MaxEvict) {
 
         //
-        // Check if we've freed enough space
+        // Check if we've freed enough space.
+        // Re-checked EVERY iteration (including after lock reacquire) to
+        // prevent over-eviction when concurrent inserts/commits change counts.
         //
         if (BytesNeeded > 0 &&
             g_FbeState.Stats.CurrentBackupDiskUsage + BytesNeeded <=
@@ -2293,7 +2334,13 @@ FbepEvictLruEntries(
         Entry = CONTAINING_RECORD(ListEntry, FBE_BACKUP_ENTRY, LruLink);
 
         //
-        // Release LRU lock during I/O
+        // Mark as evicted under LRU lock to prevent concurrent rollback
+        // from claiming this entry via CAS on State.
+        //
+        LONG PrevState = InterlockedExchange(&Entry->State, FbeEntryState_Evicted);
+
+        //
+        // Release LRU lock during I/O (file delete may block)
         //
         FltReleasePushLock(&g_FbeState.LruLock);
 
@@ -2320,22 +2367,22 @@ FbepEvictLruEntries(
         InterlockedDecrement(&g_FbeState.TotalEntryCount);
 
         //
-        // Delete backup file
+        // Delete backup file and update accounting
         //
-        if (Entry->State == FbeEntryState_Valid) {
+        if (PrevState == FbeEntryState_Valid) {
             InterlockedAdd64(&g_FbeState.Stats.CurrentBackupDiskUsage,
                              -Entry->BackupFileSize.QuadPart);
             FbepDeleteBackupFile(&Entry->BackupPath);
         }
 
-        InterlockedExchange(&Entry->State, FbeEntryState_Evicted);
         InterlockedIncrement64(&g_FbeState.Stats.EntriesEvicted);
 
         FbepFreeEntry(Entry);
         Evicted++;
 
         //
-        // Re-acquire LRU lock for next iteration
+        // Re-acquire LRU lock for next iteration.
+        // Capacity is re-checked at loop top to prevent over-eviction.
         //
         FltAcquirePushLockExclusive(&g_FbeState.LruLock);
     }
@@ -2388,6 +2435,7 @@ FbepEnsureBackupDirectory(
     OBJECT_ATTRIBUTES ObjAttrs;
     UNICODE_STRING DirPath;
     USHORT LastSlash = 0;
+    PACL Dacl = NULL;
 
     PAGED_CODE();
 
@@ -2415,16 +2463,84 @@ FbepEnsureBackupDirectory(
     DirPath.Length = LastSlash * sizeof(WCHAR);
     DirPath.MaximumLength = DirPath.Length;
 
+    //
+    // Build a restrictive security descriptor for the backup directory.
+    // Only LOCAL_SYSTEM has access — this prevents ransomware running as
+    // user/admin from enumerating or encrypting backup files.
+    //
+    // SD layout: absolute SD on stack, ACL from pool
+    //   - Protected DACL (SE_DACL_PROTECTED) — no parent inheritance
+    //   - Single ACE: SYSTEM gets FILE_ALL_ACCESS with inheritance
+    //
+    SECURITY_DESCRIPTOR Sd;
+    BOOLEAN SdValid = FALSE;
+
+    {
+        SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
+        UCHAR SystemSidBuf[SECURITY_MAX_SID_SIZE];
+        PSID SystemSid = (PSID)SystemSidBuf;
+
+        RtlInitializeSid(SystemSid, &NtAuthority, 1);
+        *RtlSubAuthoritySid(SystemSid, 0) = SECURITY_LOCAL_SYSTEM_RID;
+
+        ULONG SidLength = RtlLengthSid(SystemSid);
+        ULONG AceSize = FIELD_OFFSET(ACCESS_ALLOWED_ACE, SidStart) + SidLength;
+        ULONG AclSize = sizeof(ACL) + AceSize;
+
+        //
+        // Align ACL to ULONG boundary (required by ACL structure)
+        //
+        AclSize = (AclSize + sizeof(ULONG) - 1) & ~(sizeof(ULONG) - 1);
+
+        Dacl = (PACL)ExAllocatePool2(POOL_FLAG_PAGED, AclSize, FBE_POOL_TAG);
+        if (Dacl != NULL) {
+            Status = RtlCreateAcl(Dacl, AclSize, ACL_REVISION);
+            if (NT_SUCCESS(Status)) {
+                Status = RtlAddAccessAllowedAceEx(
+                    Dacl,
+                    ACL_REVISION,
+                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+                    FILE_ALL_ACCESS,
+                    SystemSid
+                    );
+            }
+
+            if (NT_SUCCESS(Status)) {
+                Status = RtlCreateSecurityDescriptor(
+                    &Sd, SECURITY_DESCRIPTOR_REVISION);
+            }
+
+            if (NT_SUCCESS(Status)) {
+                Status = RtlSetDaclSecurityDescriptor(
+                    &Sd, TRUE, Dacl, FALSE);
+            }
+
+            if (NT_SUCCESS(Status)) {
+                //
+                // SE_DACL_PROTECTED prevents ACL inheritance from parent dir.
+                // Without this, parent dir ACEs get merged and users may gain access.
+                //
+                Sd.Control |= SE_DACL_PROTECTED;
+                SdValid = TRUE;
+            } else {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike/FBE] Failed to build backup dir SD: 0x%08X\n",
+                           Status);
+            }
+        }
+    }
+
     InitializeObjectAttributes(
         &ObjAttrs,
         &DirPath,
         OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
         NULL,
-        NULL
+        SdValid ? &Sd : NULL
         );
 
     //
-    // FILE_OPEN_IF: creates if missing, opens if exists
+    // FILE_OPEN_IF: creates if missing, opens if exists.
+    // Security descriptor is applied only on creation (FILE_CREATED).
     //
     Status = FltCreateFile(
         g_DriverData.FilterHandle,
@@ -2445,6 +2561,10 @@ FbepEnsureBackupDirectory(
 
     if (NT_SUCCESS(Status)) {
         FltClose(DirHandle);
+    }
+
+    if (Dacl != NULL) {
+        ExFreePoolWithTag(Dacl, FBE_POOL_TAG);
     }
 
     return Status;

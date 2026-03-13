@@ -81,6 +81,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../Core/DriverEntry.h"
 #include "../../Sync/TimerManager.h"
+#include "../FileSystem/FileBackupEngine.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -2884,6 +2885,13 @@ PnpHandleProcessTermination(
     // Send termination notification (fire-and-forget)
     //
     PnpSendProcessNotification(Context, FALSE, NULL);
+
+    //
+    // Commit (discard) any pending file backup entries for this process.
+    // If the process exited normally without triggering a ransomware verdict,
+    // its backed-up files are no longer needed and disk space can be reclaimed.
+    //
+    FbeCommitProcess(ProcessId);
 
     //
     // Remove from tracking
