@@ -75,6 +75,7 @@ NTKERNELAPI ULONG PsGetProcessSessionId(_In_ PEPROCESS Process);
 #define TB_FLUSH_INTERVAL_MS    100
 #define TB_MAX_BATCH_WAIT_MS    1000
 #define TB_FLUSH_LOG_INTERVAL   100     // Log every 10 seconds (100 * 100ms)
+#define TB_MAX_DEQUEUE_PER_LOCK 256     // Cap dequeue iterations per spin lock hold
 
 // ============================================================================
 // GLOBAL STATE (Atomic access only)
@@ -233,6 +234,13 @@ TbpRoundDownToPowerOf2(
     );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID
+TbpNotifyOverflow(
+    _In_ PTB_MANAGER Manager,
+    _In_ PTB_RING_BUFFER RingBuffer
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 FORCEINLINE
 ULONG64
 TbpGetCurrentTimestamp(
@@ -309,6 +317,39 @@ TbpRoundDownToPowerOf2(
     // Subtract to get power of 2
     //
     return Value - (Value >> 1);
+}
+
+// ============================================================================
+// OVERFLOW NOTIFICATION HELPER
+// ============================================================================
+
+/**
+ * @brief Notify registered overflow callback at DISPATCH_LEVEL.
+ *
+ * Reads callback/context with acquire semantics to pair with the
+ * release-store order in TbRegisterOverflowCallback (context first,
+ * then callback pointer with barrier). Safe to call without locks.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID
+TbpNotifyOverflow(
+    _In_ PTB_MANAGER Manager,
+    _In_ PTB_RING_BUFFER RingBuffer
+    )
+{
+    TB_OVERFLOW_CALLBACK callback;
+    PVOID context;
+
+    //
+    // TbRegisterOverflowCallback writes context BEFORE callback pointer
+    // with a KeMemoryBarrier in between. Reading callback first ensures
+    // that if we see a non-NULL callback, the context is already visible.
+    //
+    callback = (TB_OVERFLOW_CALLBACK)(*(volatile PVOID *)&Manager->OverflowCallback);
+    if (callback != NULL) {
+        context = *(volatile PVOID *)&Manager->OverflowCallbackContext;
+        callback(Manager, (ULONG)RingBuffer->DropCount, context);
+    }
 }
 
 // ============================================================================
@@ -2143,6 +2184,12 @@ TbRegisterConsumer(
         return STATUS_ALREADY_REGISTERED;
     }
 
+    //
+    // Take a reference on the file object to prevent dangling pointer
+    // if the handle is closed before TbUnregisterConsumer is called.
+    //
+    ObReferenceObject(FileObject);
+
     Manager->ConsumerFileObject = FileObject;
     Manager->ConsumerReadyEvent = ReadyEvent;
     Manager->ConsumerConnected = TRUE;
@@ -2169,9 +2216,17 @@ TbUnregisterConsumer(
     ExAcquirePushLockExclusive(&Manager->ConsumerLock);
 
     if (Manager->ConsumerFileObject == FileObject) {
+        PFILE_OBJECT oldFileObj = Manager->ConsumerFileObject;
+
         Manager->ConsumerFileObject = NULL;
         Manager->ConsumerReadyEvent = NULL;
         Manager->ConsumerConnected = FALSE;
+
+        //
+        // Release the reference taken in TbRegisterConsumer.
+        // Done inside lock to prevent double-deref races.
+        //
+        ObDereferenceObject(oldFileObj);
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                    "[ShadowStrike/TB] Consumer unregistered: FileObject=%p\n", FileObject);
@@ -2238,8 +2293,15 @@ TbRegisterOverflowCallback(
 
     ExAcquirePushLockExclusive(&Manager->OverflowCallbackLock);
 
-    Manager->OverflowCallback = (PVOID)Callback;
+    //
+    // Write context BEFORE callback pointer. Pairs with the volatile
+    // read order in TbpNotifyOverflow (callback first, then context).
+    // KeMemoryBarrier ensures the context store is globally visible
+    // before the callback pointer becomes non-NULL to readers.
+    //
     Manager->OverflowCallbackContext = Context;
+    KeMemoryBarrier();
+    Manager->OverflowCallback = (PVOID)Callback;
 
     ExReleasePushLockExclusive(&Manager->OverflowCallbackLock);
 
@@ -2381,8 +2443,12 @@ TbResize(
     }
 
     //
-    // Swap buffers under lock
+    // Swap buffers under lock.
+    // KeFlushQueuedDpcs ensures all in-flight DISPATCH_LEVEL enqueue
+    // operations (which read PerCpuBuffers[] without ManagerLock) have
+    // completed before we swap the pointers and free old buffers.
     //
+    KeFlushQueuedDpcs();
     ExAcquirePushLockExclusive(&Manager->ManagerLock);
 
     for (i = 0; i < Manager->ActiveCpuCount; i++) {
@@ -2797,8 +2863,6 @@ TbpEnqueueToRingBuffer(
     ULONG usage;
     LONG expectedState;
 
-    UNREFERENCED_PARAMETER(Manager);
-
     if (RingBuffer->State != TbBufferState_Active) {
         return STATUS_DEVICE_NOT_READY;
     }
@@ -2820,6 +2884,7 @@ TbpEnqueueToRingBuffer(
         if (AllowDrop) {
             InterlockedIncrement(&RingBuffer->DropCount);
             InterlockedIncrement(&RingBuffer->OverflowCount);
+            TbpNotifyOverflow(Manager, RingBuffer);
             return STATUS_DEVICE_BUSY;
         }
     }
@@ -2840,6 +2905,7 @@ TbpEnqueueToRingBuffer(
 
         if (AllowDrop) {
             InterlockedIncrement(&RingBuffer->DropCount);
+            TbpNotifyOverflow(Manager, RingBuffer);
             return STATUS_DEVICE_BUSY;
         }
 
@@ -2865,6 +2931,7 @@ TbpEnqueueToRingBuffer(
         KeReleaseSpinLock(&RingBuffer->ProducerLock, oldIrql);
         if (AllowDrop) {
             InterlockedIncrement(&RingBuffer->DropCount);
+            TbpNotifyOverflow(Manager, RingBuffer);
             return STATUS_DEVICE_BUSY;
         }
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -2933,6 +3000,7 @@ TbpDequeueFromRingBuffer(
     ULONG totalEntries = 0;
     ULONG entrySize;
     LONG slotState;
+    ULONG iterationCount = 0;
 
     *BytesReturned = 0;
     *EntriesReturned = 0;
@@ -2944,7 +3012,7 @@ TbpDequeueFromRingBuffer(
     //
     KeAcquireSpinLock(&RingBuffer->ConsumerLock, &oldIrql);
 
-    while (totalBytes < BufferSize) {
+    while (totalBytes < BufferSize && iterationCount < TB_MAX_DEQUEUE_PER_LOCK) {
         producerIdx = RingBuffer->ProducerIndex;
         consumerIdx = RingBuffer->ConsumerIndex;
 
@@ -2982,6 +3050,7 @@ TbpDequeueFromRingBuffer(
             //
             InterlockedExchange(&RingBuffer->SlotStates[slotIndex], TbSlotState_Free);
             InterlockedIncrement64(&RingBuffer->ConsumerIndex);
+            iterationCount++;
             continue;
         }
 
@@ -2990,6 +3059,7 @@ TbpDequeueFromRingBuffer(
             // Unexpected state - skip
             //
             InterlockedIncrement64(&RingBuffer->ConsumerIndex);
+            iterationCount++;
             continue;
         }
 
@@ -3036,6 +3106,7 @@ TbpDequeueFromRingBuffer(
         destPtr += entrySize;
         totalBytes += entrySize;
         totalEntries++;
+        iterationCount++;
 
         //
         // Advance consumer index

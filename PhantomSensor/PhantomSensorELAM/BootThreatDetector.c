@@ -952,7 +952,14 @@ BtdScanDriver(
     //
     // Phase 2: Byte pattern scanning against the mapped driver image
     //
+    // Lock discipline: capture match data UNDER PatternLock, release lock
+    // exactly ONCE after the __try/__except, then build threat OUTSIDE lock.
+    // This prevents (a) double PushLock release on exception and
+    // (b) use-after-free on patternEntry fields after lock release.
+    //
     if (ImageBase != NULL && ImageSize > 0) {
+
+        patternMatched = FALSE;
 
         ExAcquirePushLockShared(&internal->PatternLock);
 
@@ -974,138 +981,87 @@ BtdScanDriver(
                         patternEntry->Offset,
                         &matchOffset)) {
 
-                    ExReleasePushLockShared(&internal->PatternLock);
-
-                    currentDetected = InterlockedCompareExchange(&Detector->DetectedCount, 0, 0);
-                    if (currentDetected >= BTD_MAX_DETECTED_THREATS) {
-                        InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
-                        return STATUS_QUOTA_EXCEEDED;
-                    }
-
-                    threat = BtdpAllocateThreat(internal);
-                    if (threat == NULL) {
-                        return STATUS_INSUFFICIENT_RESOURCES;
-                    }
-
-                    threat->Type = patternEntry->ThreatType;
-                    RtlCopyMemory(threat->Hash, DriverInfo->ImageHash, BTD_HASH_SIZE);
-                    RtlStringCbCopyA(threat->ThreatName, sizeof(threat->ThreatName),
+                    matchedThreatType = patternEntry->ThreatType;
+                    RtlStringCbCopyA(matchedThreatName, sizeof(matchedThreatName),
                                     patternEntry->ThreatName);
-                    RtlStringCbPrintfA(threat->Description, sizeof(threat->Description),
-                                      "Bootkit pattern '%s' matched at offset 0x%X in driver image",
-                                      patternEntry->ThreatName, matchOffset);
-
-                    threat->SeverityScore = patternEntry->SeverityScore;
-                    threat->IsCritical = (patternEntry->SeverityScore >= BTD_SEVERITY_CRITICAL_THRESHOLD);
-                    threat->WasBlocked = FALSE;
-
-                    BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath);
-                    KeQuerySystemTimePrecise(&threat->DetectionTime);
-
-                    KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
-                    InsertTailList(&Detector->DetectedList, &threat->ListEntry);
-                    InterlockedIncrement(&Detector->DetectedCount);
-                    KeReleaseSpinLock(&Detector->DetectedLock, oldIrql);
-
-                    InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
-                    BtdpInvokeCallback(Detector, threat);
-
-                    *Threat = threat;
-                    return STATUS_SUCCESS;
+                    matchedSeverity = patternEntry->SeverityScore;
+                    matchedOffset = matchOffset;
+                    patternMatched = TRUE;
+                    break;
                 }
             }
 
             //
-            // Scan for rootkit patterns
+            // Scan for rootkit patterns (only if bootkit scan found nothing)
             //
-            for (entry = internal->RootkitPatterns.Flink;
-                 entry != &internal->RootkitPatterns;
-                 entry = entry->Flink) {
+            if (!patternMatched) {
+                for (entry = internal->RootkitPatterns.Flink;
+                     entry != &internal->RootkitPatterns;
+                     entry = entry->Flink) {
 
-                patternEntry = CONTAINING_RECORD(entry, BTD_PATTERN_ENTRY, ListEntry);
+                    patternEntry = CONTAINING_RECORD(entry, BTD_PATTERN_ENTRY, ListEntry);
 
-                if (BtdpMatchPattern(
-                        (const UCHAR*)ImageBase,
-                        ImageSize,
-                        patternEntry->Pattern,
-                        patternEntry->PatternLength,
-                        patternEntry->Offset,
-                        &matchOffset)) {
+                    if (BtdpMatchPattern(
+                            (const UCHAR*)ImageBase,
+                            ImageSize,
+                            patternEntry->Pattern,
+                            patternEntry->PatternLength,
+                            patternEntry->Offset,
+                            &matchOffset)) {
 
-                    ExReleasePushLockShared(&internal->PatternLock);
-
-                    currentDetected = InterlockedCompareExchange(&Detector->DetectedCount, 0, 0);
-                    if (currentDetected >= BTD_MAX_DETECTED_THREATS) {
-                        InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
-                        return STATUS_QUOTA_EXCEEDED;
+                        matchedThreatType = patternEntry->ThreatType;
+                        RtlStringCbCopyA(matchedThreatName, sizeof(matchedThreatName),
+                                        patternEntry->ThreatName);
+                        matchedSeverity = patternEntry->SeverityScore;
+                        matchedOffset = matchOffset;
+                        patternMatched = TRUE;
+                        break;
                     }
-
-                    threat = BtdpAllocateThreat(internal);
-                    if (threat == NULL) {
-                        return STATUS_INSUFFICIENT_RESOURCES;
-                    }
-
-                    threat->Type = patternEntry->ThreatType;
-                    RtlCopyMemory(threat->Hash, DriverInfo->ImageHash, BTD_HASH_SIZE);
-                    RtlStringCbCopyA(threat->ThreatName, sizeof(threat->ThreatName),
-                                    patternEntry->ThreatName);
-                    RtlStringCbPrintfA(threat->Description, sizeof(threat->Description),
-                                      "Rootkit pattern '%s' matched at offset 0x%X in driver image",
-                                      patternEntry->ThreatName, matchOffset);
-
-                    threat->SeverityScore = patternEntry->SeverityScore;
-                    threat->IsCritical = (patternEntry->SeverityScore >= BTD_SEVERITY_CRITICAL_THRESHOLD);
-                    threat->WasBlocked = FALSE;
-
-                    BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath);
-                    KeQuerySystemTimePrecise(&threat->DetectionTime);
-
-                    KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
-                    InsertTailList(&Detector->DetectedList, &threat->ListEntry);
-                    InterlockedIncrement(&Detector->DetectedCount);
-                    KeReleaseSpinLock(&Detector->DetectedLock, oldIrql);
-
-                    InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
-                    BtdpInvokeCallback(Detector, threat);
-
-                    *Threat = threat;
-                    return STATUS_SUCCESS;
                 }
             }
 
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            patternMatched = FALSE;
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                 "[ShadowStrike/BTD] Exception 0x%08X during image pattern scan at base %p (size 0x%IX)\n",
                 GetExceptionCode(), ImageBase, ImageSize);
         }
 
         ExReleasePushLockShared(&internal->PatternLock);
-    }
 
-    //
-    // Phase 3: Heuristic analysis for unknown-bad classified drivers
-    //
-    if (DriverInfo->Classification == BdvClass_Unknown_Bad) {
+        //
+        // Build threat structure OUTSIDE lock using captured data
+        //
+        if (patternMatched) {
 
-        currentDetected = InterlockedCompareExchange(&Detector->DetectedCount, 0, 0);
-        if (currentDetected >= BTD_MAX_DETECTED_THREATS) {
-            InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
-            return STATUS_QUOTA_EXCEEDED;
-        }
+            currentDetected = InterlockedCompareExchange(&Detector->DetectedCount, 0, 0);
+            if (currentDetected >= BTD_MAX_DETECTED_THREATS) {
+                InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
+                return STATUS_QUOTA_EXCEEDED;
+            }
 
-        threat = BtdpAllocateThreat(internal);
-        if (threat != NULL) {
-            threat->Type = BtdThreat_UnauthorizedDriver;
+            threat = BtdpAllocateThreat(internal);
+            if (threat == NULL) {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+
+            threat->Type = matchedThreatType;
             RtlCopyMemory(threat->Hash, DriverInfo->ImageHash, BTD_HASH_SIZE);
-
             RtlStringCbCopyA(threat->ThreatName, sizeof(threat->ThreatName),
-                            "Unauthorized Boot Driver");
-            RtlStringCbPrintfA(threat->Description, sizeof(threat->Description),
-                              "Unsigned/unknown driver loading at boot: %s",
-                              DriverInfo->ClassificationReason);
+                            matchedThreatName);
 
-            threat->SeverityScore = 60;
-            threat->IsCritical = FALSE;
+            if (matchedThreatType == BtdThreat_Bootkit) {
+                RtlStringCbPrintfA(threat->Description, sizeof(threat->Description),
+                                  "Bootkit pattern '%s' matched at offset 0x%X in driver image",
+                                  matchedThreatName, matchedOffset);
+            } else {
+                RtlStringCbPrintfA(threat->Description, sizeof(threat->Description),
+                                  "Rootkit pattern '%s' matched at offset 0x%X in driver image",
+                                  matchedThreatName, matchedOffset);
+            }
+
+            threat->SeverityScore = matchedSeverity;
+            threat->IsCritical = (matchedSeverity >= BTD_SEVERITY_CRITICAL_THRESHOLD);
             threat->WasBlocked = FALSE;
 
             BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath);
@@ -1120,7 +1076,51 @@ BtdScanDriver(
             BtdpInvokeCallback(Detector, threat);
 
             *Threat = threat;
+            return STATUS_SUCCESS;
         }
+    }
+
+    //
+    // Phase 3: Heuristic analysis for unknown-bad classified drivers
+    //
+    if (DriverInfo->Classification == BdvClass_Unknown_Bad) {
+
+        currentDetected = InterlockedCompareExchange(&Detector->DetectedCount, 0, 0);
+        if (currentDetected >= BTD_MAX_DETECTED_THREATS) {
+            InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
+            return STATUS_QUOTA_EXCEEDED;
+        }
+
+        threat = BtdpAllocateThreat(internal);
+        if (threat == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        threat->Type = BtdThreat_UnauthorizedDriver;
+        RtlCopyMemory(threat->Hash, DriverInfo->ImageHash, BTD_HASH_SIZE);
+
+        RtlStringCbCopyA(threat->ThreatName, sizeof(threat->ThreatName),
+                        "Unauthorized Boot Driver");
+        RtlStringCbPrintfA(threat->Description, sizeof(threat->Description),
+                          "Unsigned/unknown driver loading at boot: %s",
+                          DriverInfo->ClassificationReason);
+
+        threat->SeverityScore = 60;
+        threat->IsCritical = FALSE;
+        threat->WasBlocked = FALSE;
+
+        BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath);
+        KeQuerySystemTimePrecise(&threat->DetectionTime);
+
+        KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
+        InsertTailList(&Detector->DetectedList, &threat->ListEntry);
+        InterlockedIncrement(&Detector->DetectedCount);
+        KeReleaseSpinLock(&Detector->DetectedLock, oldIrql);
+
+        InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
+        BtdpInvokeCallback(Detector, threat);
+
+        *Threat = threat;
     }
 
     return STATUS_SUCCESS;
@@ -1392,6 +1392,16 @@ BtdFreeThreat(
     PLIST_ENTRY entry;
 
     if (Detector == NULL || Threat == NULL) {
+        return;
+    }
+
+    //
+    // Guard against calls after BtdShutdown has destroyed the lookaside.
+    // The caller MUST ensure all scan threads have quiesced before shutdown.
+    //
+    if (!InterlockedCompareExchange(&Detector->Initialized, 1, 1)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike/BTD] BtdFreeThreat called on shut-down detector — leak preferred over pool corruption\n");
         return;
     }
 

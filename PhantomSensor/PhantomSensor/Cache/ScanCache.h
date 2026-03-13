@@ -220,11 +220,11 @@ typedef struct _SHADOWSTRIKE_SCAN_CACHE {
     /// @brief Lookaside initialized
     BOOLEAN LookasideInitialized;
 
-    /// @brief Cache is initialized
-    BOOLEAN Initialized;
+    /// @brief Cache is initialized (volatile: read by concurrent threads)
+    volatile BOOLEAN Initialized;
 
-    /// @brief Shutdown in progress - prevents new work item queuing
-    BOOLEAN ShutdownInProgress;
+    /// @brief Shutdown in progress - prevents new work item queuing (volatile: cross-thread signal)
+    volatile BOOLEAN ShutdownInProgress;
 
     /// @brief Reserved
     BOOLEAN Reserved[5];

@@ -1471,6 +1471,8 @@ ShadowStrikeSendScanRequest(
     // Compute HMAC-SHA256 for message integrity authentication.
     // The HMAC is appended after the original message payload so user-mode
     // can verify the message was not tampered with in transit.
+    // Use pre-opened HMAC handle via EncGetHmacAlgHandle to avoid
+    // per-call BCryptOpenAlgorithmProvider overhead.
     //
     if (g_CommHmacKeyReady) {
         ULONG authenticatedSize = RequestSize + SHADOWSTRIKE_HMAC_OUTPUT_SIZE;
@@ -1478,8 +1480,11 @@ ShadowStrikeSendScanRequest(
             POOL_FLAG_NON_PAGED, authenticatedSize, 'hmCP');
         if (authBuffer != NULL) {
             RtlCopyMemory(authBuffer, Request, RequestSize);
+            PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
+            BCRYPT_ALG_HANDLE hmacHandle = (encMgr != NULL) ?
+                EncGetHmacAlgHandle(encMgr) : NULL;
             NTSTATUS hmacStatus = EncHmacSha256(
-                NULL,
+                hmacHandle,
                 g_CommHmacKey,
                 SHADOWSTRIKE_HMAC_KEY_SIZE,
                 authBuffer,
