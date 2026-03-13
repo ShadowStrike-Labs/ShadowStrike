@@ -702,10 +702,10 @@ Return Value:
     //
     if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
         Context.OperationType = PpOperationCreate;
-        OriginalAccess = OperationInformation->Parameters->CreateHandleInformation.DesiredAccess;
+        OriginalAccess = OperationInformation->Parameters->CreateHandleInformation.OriginalDesiredAccess;
     } else if (OperationInformation->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
         Context.OperationType = PpOperationDuplicate;
-        OriginalAccess = OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess;
+        OriginalAccess = OperationInformation->Parameters->DuplicateHandleInformation.OriginalDesiredAccess;
     } else {
         goto Cleanup;
     }
@@ -807,6 +807,7 @@ Return Value:
                 SeQuerySessionIdToken(SourceToken, &SourceSession);
                 Context.SourceSessionId = SourceSession;
                 PsDereferencePrimaryToken(SourceToken);
+                SourceToken = NULL;
             }
 
             TargetToken = PsReferencePrimaryToken(TargetProcess);
@@ -814,12 +815,19 @@ Return Value:
                 SeQuerySessionIdToken(TargetToken, &TargetSession);
                 Context.TargetSessionId = TargetSession;
                 PsDereferencePrimaryToken(TargetToken);
+                TargetToken = NULL;
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             //
-            // Token access failed - process may be exiting
-            // Continue with default session values (0)
+            // Token access failed - process may be exiting.
+            // Release any partially acquired references.
             //
+            if (SourceToken != NULL) {
+                PsDereferencePrimaryToken(SourceToken);
+            }
+            if (TargetToken != NULL) {
+                PsDereferencePrimaryToken(TargetToken);
+            }
         }
     }
 

@@ -744,6 +744,16 @@ ShadowStrikeProcessPreCallback(
         );
 
         //
+        // Boost suspicion score if source is rate-limited (rapid enumeration)
+        //
+        if (PpIsSourceRateLimited(sourceProcessId)) {
+            suspicionScore += 20;
+            if (suspicionScore > 100) {
+                suspicionScore = 100;
+            }
+        }
+
+        //
         // Strip dangerous access
         //
         if (isDuplicate) {
@@ -827,6 +837,17 @@ ShadowStrikeProcessPreCallback(
         //
         InterlockedIncrement64(&g_DriverData.Stats.SelfProtectionBlocks);
     }
+
+    //
+    // Track handle activity for enumeration detection and analytics.
+    // Called for ALL operations where target is protected, regardless of
+    // whether access was stripped. IsSuspicious is TRUE when we stripped.
+    //
+    PpTrackActivity(
+        sourceProcessId,
+        targetProcessId,
+        (strippedAccess != 0)
+        );
 
     return OB_PREOP_SUCCESS;
 }
@@ -996,6 +1017,16 @@ ShadowStrikeThreadPreCallback(
         }
 
         //
+        // Boost suspicion score if source is rate-limited (rapid enumeration)
+        //
+        if (PpIsSourceRateLimited(sourceProcessId)) {
+            suspicionScore += 20;
+            if (suspicionScore > 100) {
+                suspicionScore = 100;
+            }
+        }
+
+        //
         // Strip dangerous access
         //
         if (isDuplicate) {
@@ -1055,6 +1086,15 @@ ShadowStrikeThreadPreCallback(
         //
         InterlockedIncrement64(&g_DriverData.Stats.SelfProtectionBlocks);
     }
+
+    //
+    // Track thread handle activity for enumeration detection
+    //
+    PpTrackActivity(
+        sourceProcessId,
+        targetProcessId,
+        (strippedAccess != 0)
+        );
 
     return OB_PREOP_SUCCESS;
 }

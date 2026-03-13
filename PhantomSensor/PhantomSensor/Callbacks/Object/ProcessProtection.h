@@ -666,9 +666,9 @@ PpRemoveProtectedProcess(
  *
  * @return TRUE if protected.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (uses push locks internally)
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 PpIsProcessProtected(
     _In_ HANDLE ProcessId,
