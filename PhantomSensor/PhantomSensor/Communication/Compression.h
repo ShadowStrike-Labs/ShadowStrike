@@ -32,6 +32,11 @@
 --*/
 
 #pragma once
+/**
+ * @deprecated This module is excluded from the build. LZ4 compression
+ * infrastructure is fully implemented but no communication module uses it.
+ * Pending future activation for telemetry bandwidth optimization.
+ */
 
 #ifdef __cplusplus
 extern "C" {

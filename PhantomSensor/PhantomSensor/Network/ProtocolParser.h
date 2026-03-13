@@ -36,13 +36,16 @@
 --*/
 
 #pragma once
+/**
+ * @deprecated This module is excluded from the build. Protocol parsing
+ * (HTTP, DNS) is fully implemented but never wired into NetworkFilter.
+ * DnsMonitor handles DNS parsing directly. Pending future activation.
+ */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "../../Shared/NetworkTypes.h"
-#include <inaddr.h>
 #include <in6addr.h>
 
 //=============================================================================

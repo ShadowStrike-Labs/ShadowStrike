@@ -192,8 +192,12 @@
     <ClCompile Include="PhantomSensor\Callbacks\Process\WSLMonitor.c" />
     <ClCompile Include="PhantomSensor\Callbacks\Registry\RegistryCallback.c" />
     <ClCompile Include="PhantomSensor\Communication\CommPort.c" />
-    <ClCompile Include="PhantomSensor\Communication\Compression.c" />
-    <ClCompile Include="PhantomSensor\Communication\Encryption.c" />
+    <ClCompile Include="PhantomSensor\Communication\Compression.c">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\Communication\Encryption.c">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="PhantomSensor\Communication\MessageHandler.c" />
     <ClCompile Include="PhantomSensor\Communication\MessageQueue.c" />
     <ClCompile Include="PhantomSensor\Communication\ScanBridge.c" />
@@ -202,7 +206,9 @@
     <ClCompile Include="PhantomSensor\Context\StreamContext.c" />
     <ClCompile Include="PhantomSensor\Core\DriverEntry.c" />
     <ClCompile Include="PhantomSensor\Core\FilterRegistration.c" />
-    <ClCompile Include="PhantomSensor\ETW\ETWConsumer.c" />
+    <ClCompile Include="PhantomSensor\ETW\ETWConsumer.c">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="PhantomSensor\ETW\ETWProvider.c" />
     <ClCompile Include="PhantomSensor\ETW\EventSchema.c" />
     <ClCompile Include="PhantomSensor\ETW\ManifestGenerator.c" />
@@ -225,13 +231,19 @@
     <ClCompile Include="PhantomSensor\Network\DnsMonitor.c" />
     <ClCompile Include="PhantomSensor\Network\NetworkFilter.c" />
     <ClCompile Include="PhantomSensor\Network\NetworkReputation.c" />
-    <ClCompile Include="PhantomSensor\Network\PortScanner.c" />
-    <ClCompile Include="PhantomSensor\Network\ProtocolParser.c" />
+    <ClCompile Include="PhantomSensor\Network\PortScanner.c">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="PhantomSensor\Network\ProtocolParser.c">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="PhantomSensor\Network\SSLInspection.c" />
     <ClCompile Include="PhantomSensor\Objects\ObjectNamespace.c" />
     <ClCompile Include="PhantomSensor\Performance\BatchProcessing.c" />
     <ClCompile Include="PhantomSensor\Performance\CacheOptimization.c" />
-    <ClCompile Include="PhantomSensor\Performance\LookasideLists.c" />
+    <ClCompile Include="PhantomSensor\Performance\LookasideLists.c">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="PhantomSensor\Performance\PerformanceMonitor.c" />
     <ClCompile Include="PhantomSensor\Performance\ResourceThrottling.c" />
     <ClCompile Include="PhantomSensor\Power\PowerCallback.c" />

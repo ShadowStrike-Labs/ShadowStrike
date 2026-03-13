@@ -28,13 +28,16 @@
 --*/
 
 #pragma once
+/**
+ * @deprecated This module is excluded from the build. Port scan detection
+ * is fully implemented but never wired into NetworkFilter. Pending future
+ * activation when network reconnaissance detection is prioritized.
+ */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "../../Shared/NetworkTypes.h"
-#include <inaddr.h>
 #include <in6addr.h>
 
 //=============================================================================

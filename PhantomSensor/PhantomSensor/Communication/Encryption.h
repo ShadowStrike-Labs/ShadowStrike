@@ -38,13 +38,16 @@
 --*/
 
 #pragma once
+/**
+ * @deprecated This module is excluded from the build. AES-GCM encryption
+ * infrastructure is fully implemented but no communication module uses it.
+ * Pending future activation for secure kernel-to-user channel encryption.
+ */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include <ntifs.h>
-#include <ntddk.h>
 #include <ntintsafe.h>
 #include <bcrypt.h>
 #include <ntstrsafe.h>

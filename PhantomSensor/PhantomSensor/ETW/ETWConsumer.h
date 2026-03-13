@@ -70,6 +70,11 @@
  */
 
 #ifndef _SHADOWSTRIKE_ETW_CONSUMER_H_
+/**
+ * @deprecated This module is excluded from the build. ETWConsumer infrastructure
+ * is fully implemented but never initialized. Pending future activation when
+ * user-mode ETW subscription callbacks are implemented.
+ */
 #define _SHADOWSTRIKE_ETW_CONSUMER_H_
 
 #ifdef __cplusplus
