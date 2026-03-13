@@ -669,6 +669,11 @@ Return Value:
     g_ProcessMonitor.Config.EnableCommandLineAnalysis = TRUE;
     g_ProcessMonitor.Config.EnableTokenAnalysis = TRUE;
     g_ProcessMonitor.Config.EnableParentChainTracking = TRUE;
+
+    //
+    // Acquire reference to ParentChainTracker from ProcessAnalyzer
+    //
+    g_ProcessMonitor.ParentChainTracker = (PVOID)PaGetParentChainTracker();
     g_ProcessMonitor.Config.EnableSignatureVerification = TRUE;
     g_ProcessMonitor.Config.BlockSuspiciousProcesses = FALSE;  // Audit mode by default
     g_ProcessMonitor.Config.MinBlockScore = PN_SUSPICION_CRITICAL;
@@ -1128,6 +1133,79 @@ Arguments:
                 HandleToULong(ProcessContext->ParentProcessId),
                 HandleToULong(ProcessContext->RealParentProcessId)
                 );
+        }
+    }
+
+    //
+    // Parent Chain Analysis — build process ancestry chain and detect
+    // suspicious parent-child patterns (T1218 LOLBins, T1059 script hosts,
+    // Office→shell, Browser→shell, chain depth anomalies)
+    //
+    if (g_ProcessMonitor.Config.EnableParentChainTracking &&
+        g_ProcessMonitor.ParentChainTracker != NULL) {
+
+        PPCT_TRACKER pctTracker = (PPCT_TRACKER)g_ProcessMonitor.ParentChainTracker;
+        PPCT_PROCESS_CHAIN pctChain = NULL;
+
+        NTSTATUS pctStatus = PctBuildChain(pctTracker, ProcessId, &pctChain);
+        if (NT_SUCCESS(pctStatus) && pctChain != NULL) {
+            //
+            // Suspicious ancestry pattern detected — report to BehaviorEngine
+            //
+            if (pctChain->HasSuspiciousAncestor && pctChain->SuspicionScore > 0) {
+                BeEngineSubmitEvent(
+                    BehaviorEvent_SuspiciousParentChild,
+                    BehaviorCategory_ProcessExecution,
+                    HandleToULong(ProcessId),
+                    &pctChain->SuspicionScore,
+                    sizeof(ULONG),
+                    min(pctChain->SuspicionScore / 10, 80),
+                    FALSE,
+                    NULL
+                );
+            }
+
+            //
+            // PPID spoofing detected via creation time analysis (independent of
+            // the PnpDetectPpidSpoofing check above, which uses creating thread)
+            //
+            if (pctChain->IsParentSpoofed) {
+                BeEngineSubmitEvent(
+                    BehaviorEvent_SuspiciousParentChild,
+                    BehaviorCategory_DefenseEvasion,
+                    HandleToULong(ProcessId),
+                    &pctChain->SuspicionScore,
+                    sizeof(ULONG),
+                    75,
+                    FALSE,
+                    NULL
+                );
+
+                //
+                // Augment the flag if PnpDetectPpidSpoofing didn't catch it
+                //
+                if (!ProcessContext->IsPpidSpoofed) {
+                    ProcessContext->IsPpidSpoofed = TRUE;
+                    ProcessContext->Flags |= PN_PROC_FLAG_PPID_SPOOFED;
+                    InterlockedIncrement64(&g_ProcessMonitor.Stats.PpidSpoofingDetected);
+                }
+            }
+
+            //
+            // Feed chain suspicion score to centralized threat scoring
+            //
+            if (pctChain->SuspicionScore > 100 && g_ProcessMonitor.ThreatScoringEngine != NULL) {
+                TsAddFactor(
+                    g_ProcessMonitor.ThreatScoringEngine,
+                    ProcessId,
+                    TsFactor_Behavioral,
+                    "ParentChain-SuspiciousAncestry",
+                    (ULONG)(pctChain->SuspicionScore / 10),
+                    "Suspicious process ancestry chain detected"
+                );
+            }
+
+            PctFreeChain(pctChain);
         }
     }
 
