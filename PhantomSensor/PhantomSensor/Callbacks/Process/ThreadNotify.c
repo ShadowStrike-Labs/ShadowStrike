@@ -218,7 +218,7 @@ TnpReferenceProcessContext(
     _Inout_ PTN_PROCESS_CONTEXT Context
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 TnpDereferenceProcessContext(
     _Inout_ PTN_PROCESS_CONTEXT Context
@@ -2716,13 +2716,17 @@ TnRegisterCallback(
     KeLeaveCriticalRegion();
 
     //
-    // Wait for old entry references to drain with bounded spin
+    // Wait for old entry references to drain safely.
+    // Use KeDelayExecutionThread instead of YieldProcessor spin to avoid
+    // BSOD if the bounded spin exhausts — old approach freed memory
+    // while another thread could still reference it (use-after-free).
     //
     if (oldEntry != NULL) {
-        ULONG spins = 0;
-        while (oldEntry->RefCount > 0 && spins < TN_MAX_CALLBACK_DRAIN_SPINS) {
-            YieldProcessor();
-            spins++;
+        LARGE_INTEGER delay;
+        delay.QuadPart = -10000;    // 1ms intervals
+
+        while (oldEntry->RefCount > 0) {
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
         }
         ExFreePoolWithTag(oldEntry, TN_POOL_TAG);
     }
@@ -2752,12 +2756,14 @@ TnUnregisterCallback(
 
     if (oldEntry != NULL) {
         //
-        // Wait for references to drain with bounded spin
+        // Wait for references to drain safely.
+        // Must not free while another thread holds a reference.
         //
-        ULONG spins = 0;
-        while (oldEntry->RefCount > 0 && spins < TN_MAX_CALLBACK_DRAIN_SPINS) {
-            YieldProcessor();
-            spins++;
+        LARGE_INTEGER delay;
+        delay.QuadPart = -10000;    // 1ms intervals
+
+        while (oldEntry->RefCount > 0) {
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
         }
         ExFreePoolWithTag(oldEntry, TN_POOL_TAG);
     }
@@ -3007,4 +3013,16 @@ TnGetIndicatorName(
         case TnIndicator_ShellcodePattern:  return L"Shellcode Pattern";
         default:                            return L"Unknown";
     }
+}
+
+
+PVOID
+TnGetNotifyCallbackPointer(
+    VOID
+    )
+{
+    if (g_TnMonitor.CallbackRegistered) {
+        return (PVOID)TnpThreadNotifyCallback;
+    }
+    return NULL;
 }

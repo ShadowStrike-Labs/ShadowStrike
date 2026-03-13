@@ -66,6 +66,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "ProcessNotify.h"
 #include "ProcessAnalyzer.h"
 #include "ProcessRelationship.h"
+#include "ThreadNotify.h"
 #include "ParentChainTracker.h"
 #include "CommandLineParser.h"
 #include "TokenAnalyzer.h"
@@ -3386,6 +3387,13 @@ PnpHandleProcessTermination(
     if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
         TsOnProcessExit(g_ProcessMonitor.ThreatScoringEngine, ProcessId);
     }
+
+    //
+    // Notify ThreadNotify module to clean up per-process thread tracking.
+    // Must happen before context teardown to release EPROCESS references
+    // and free thread event history for this process.
+    //
+    TnNotifyProcessTermination(ProcessId);
 
     //
     // Remove process from relationship graph before context teardown.

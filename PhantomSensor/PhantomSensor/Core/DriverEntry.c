@@ -103,6 +103,7 @@ VOID ShadowStrikeCleanupPreWrite(VOID);
 #include "../Callbacks/Object/ObjectCallback.h"
 #include "../Callbacks/Process/ProcessNotify.h"
 #include "../Callbacks/Process/ImageNotify.h"
+#include "../Callbacks/Process/ThreadNotify.h"
 
 // Phase 1A: Sync infrastructure
 #include "../Sync/WorkQueue.h"
@@ -1454,12 +1455,15 @@ DriverEntry(
 
         // Protect thread creation callback
         if (g_DriverData.ThreadNotifyRegistered) {
-            (VOID)CpProtectCallback(
-                g_CallbackProtector,
-                CpCallback_Thread,
-                (PVOID)ShadowStrikeThreadNotifyCallback,
-                (PVOID)ShadowStrikeThreadNotifyCallback
-            );
+            PVOID threadCbPtr = TnGetNotifyCallbackPointer();
+            if (threadCbPtr != NULL) {
+                (VOID)CpProtectCallback(
+                    g_CallbackProtector,
+                    CpCallback_Thread,
+                    threadCbPtr,
+                    threadCbPtr
+                );
+            }
         }
 
         // Protect image load callback
@@ -1846,7 +1850,10 @@ ShadowStrikeUnload(
             CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeProcessNotifyCallback);
         }
         if (g_DriverData.ThreadNotifyRegistered) {
-            CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeThreadNotifyCallback);
+            PVOID threadCbPtr = TnGetNotifyCallbackPointer();
+            if (threadCbPtr != NULL) {
+                CpUnprotectCallback(g_CallbackProtector, threadCbPtr);
+            }
         }
         if (g_DriverData.ImageNotifyRegistered) {
             CpUnprotectCallback(g_CallbackProtector, (PVOID)ImageLoadNotifyRoutine);
@@ -2587,17 +2594,18 @@ ShadowStrikeRegisterProcessCallbacks(
     ShadowStrikeLogInitStatus("Process Notify", status);
 
     //
-    // Register thread creation callback (optional enhancement)
+    // Register thread creation callback via ThreadNotify module
+    // (injection detection, shellcode analysis, cross-process monitoring, BehaviorEngine)
     //
-    status = PsSetCreateThreadNotifyRoutine(ShadowStrikeThreadNotifyCallback);
+    status = RegisterThreadNotify();
     if (NT_SUCCESS(status)) {
-        g_DriverData.ThreadNotifyRegistered = TRUE;
+        // RegisterThreadNotify already sets g_DriverData.ThreadNotifyRegistered = TRUE
         *OutFlags |= InitFlag_ThreadCallbackReg;
         g_InitFlags |= InitFlag_ThreadCallbackReg;
         ShadowStrikeLogInitStatus("Thread Notify", status);
     } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] WARNING: PsSetCreateThreadNotifyRoutine failed: 0x%08X\n",
+                   "[ShadowStrike] WARNING: RegisterThreadNotify failed: 0x%08X\n",
                    status);
     }
 
@@ -2639,8 +2647,8 @@ ShadowStrikeUnregisterProcessCallbacks(
 
     if (Flags & InitFlag_ThreadCallbackReg) {
         if (g_DriverData.ThreadNotifyRegistered) {
-            PsRemoveCreateThreadNotifyRoutine(ShadowStrikeThreadNotifyCallback);
-            g_DriverData.ThreadNotifyRegistered = FALSE;
+            UnregisterThreadNotify();
+            // UnregisterThreadNotify already sets g_DriverData.ThreadNotifyRegistered = FALSE
         }
     }
 
@@ -2769,7 +2777,10 @@ ShadowStrikeCleanupByFlags(
             CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeProcessNotifyCallback);
         }
         if (g_DriverData.ThreadNotifyRegistered) {
-            CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeThreadNotifyCallback);
+            PVOID threadCbPtr = TnGetNotifyCallbackPointer();
+            if (threadCbPtr != NULL) {
+                CpUnprotectCallback(g_CallbackProtector, threadCbPtr);
+            }
         }
         if (g_DriverData.ImageNotifyRegistered) {
             CpUnprotectCallback(g_CallbackProtector, (PVOID)ImageLoadNotifyRoutine);
@@ -3146,71 +3157,13 @@ ShadowStrikeCleanupByFlags(
 // CALLBACK IMPLEMENTATIONS
 // ============================================================================
 
-
-
-/**
- * @brief Thread creation/termination notification callback.
- *
- * Full implementation for detecting suspicious thread injection patterns.
- */
-VOID
-ShadowStrikeThreadNotifyCallback(
-    _In_ HANDLE ProcessId,
-    _In_ HANDLE ThreadId,
-    _In_ BOOLEAN Create
-    )
-{
-    HANDLE currentProcessId;
-    BOOLEAN isCrossProcess = FALSE;
-
-    //
-    // Check if driver is ready and acquire rundown protection
-    //
-    if (!SHADOWSTRIKE_IS_READY()) {
-        return;
-    }
-
-    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {
-        return;
-    }
-
-    SHADOWSTRIKE_COUNT_OPERATION();
-
-    if (Create) {
-        //
-        // Thread creation - check for cross-process thread injection
-        //
-        currentProcessId = PsGetCurrentProcessId();
-        isCrossProcess = (currentProcessId != ProcessId);
-
-        if (isCrossProcess) {
-            //
-            // This is a cross-process thread creation (potential injection)
-            //
-            BOOLEAN targetIsProtected = ShadowStrikeIsProcessProtected(ProcessId, NULL);
-
-            if (targetIsProtected) {
-                //
-                // Remote thread into protected process - this is suspicious
-                //
-                InterlockedIncrement64(&g_DriverData.Stats.SelfProtectionBlocks);
-
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                           "[ShadowStrike] ALERT: Remote thread injection into protected process! "
-                           "SourcePID=%p, TargetPID=%p, TID=%p\n",
-                           currentProcessId, ProcessId, ThreadId);
-
-                // Alert sent via telemetry subsystem; user-mode notified via CommPort
-            }
-
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                       "[ShadowStrike] Cross-process thread created: SourcePID=%p, TargetPID=%p, TID=%p\n",
-                       currentProcessId, ProcessId, ThreadId);
-        }
-    }
-
-    SHADOWSTRIKE_RELEASE_RUNDOWN();
-}
+//
+// ShadowStrikeThreadNotifyCallback — REMOVED.
+// Thread notification is now handled by the ThreadNotify module via
+// RegisterThreadNotify()/UnregisterThreadNotify() which registers
+// TnpThreadNotifyCallback with full injection detection, shellcode
+// analysis, cross-process monitoring, and BehaviorEngine integration.
+//
 
 
 
