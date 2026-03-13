@@ -662,22 +662,11 @@ PocReleaseStreamContext(
 // FUNCTION PROTOTYPES - HANDLE CONTEXT MANAGEMENT
 // ============================================================================
 
-/**
- * @brief Allocate and initialize a handle context.
- *
- * @param Data              Callback data for access info.
- * @param OutContext        Receives allocated context.
- *
- * @return STATUS_SUCCESS on success.
- *
- * @irql <= APC_LEVEL
- */
-_IRQL_requires_max_(APC_LEVEL)
-NTSTATUS
-PocAllocateHandleContext(
-    _In_ PFLT_CALLBACK_DATA Data,
-    _Out_ PSHADOWSTRIKE_HANDLE_CONTEXT* OutContext
-    );
+//
+// NOTE: PocAllocateHandleContext has been removed — it allocated from
+// NPAGED_LOOKASIDE_LIST (raw pool), incompatible with FltSetStreamHandleContext.
+// Use PocGetOrCreateHandleContext instead (uses FltAllocateContext correctly).
+//
 
 /**
  * @brief Get or create handle context for a file open.

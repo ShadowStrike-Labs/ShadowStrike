@@ -57,6 +57,16 @@
 #include "../Callbacks/FileSystem/FileBackupEngine.h"
 #include "../Callbacks/FileSystem/USBDeviceControl.h"
 #include "../Callbacks/FileSystem/FileSystemCallbacks.h"
+
+//
+// Forward declarations for PostCreate subsystem (PostCreate.h redefines
+// SHADOWSTRIKE_STREAM_CONTEXT — cannot include alongside SharedDefs.h)
+//
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS PocInitialize(VOID);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID PocShutdown(VOID);
 #include "../Callbacks/Process/WSLMonitor.h"
 #include "../Callbacks/Process/AppControl.h"
 #include "../SelfProtection/FirmwareIntegrity.h"
@@ -1603,6 +1613,22 @@ DriverEntry(
     }
 
     //
+    // Step 14.27: Initialize PostCreate subsystem (stream context management,
+    // file classification, ransomware monitoring baselines, handle contexts)
+    // MUST be before FltStartFiltering — PostCreate callback needs lookaside lists
+    //
+    status = PocInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize PostCreate subsystem: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_InitFlags |= InitFlag_PocInitialized;
+        ShadowStrikeLogInitStatus("PostCreate Subsystem", STATUS_SUCCESS);
+    }
+
+    //
     // Step 15: Start filtering
     //
     status = FltStartFiltering(g_DriverData.FilterHandle);
@@ -1824,6 +1850,14 @@ ShadowStrikeUnload(
     //
     if (g_InitFlags & InitFlag_CommPortCreated) {
         ShadowStrikeCloseCommunicationPort();
+    }
+
+    //
+    // Step 8.5: Shutdown PostCreate subsystem (BEFORE FltUnregisterFilter —
+    // marks ShutdownRequested so in-flight post-creates drain cleanly)
+    //
+    if (g_InitFlags & InitFlag_PocInitialized) {
+        PocShutdown();
     }
 
     //
@@ -2655,6 +2689,10 @@ ShadowStrikeCleanupByFlags(
 
     if (InitFlags & InitFlag_CommPortCreated) {
         ShadowStrikeCloseCommunicationPort();
+    }
+
+    if (InitFlags & InitFlag_PocInitialized) {
+        PocShutdown();
     }
 
     if (InitFlags & InitFlag_FilterRegistered) {

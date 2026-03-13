@@ -285,7 +285,6 @@ PocpCompareExtensionSafe(
 #pragma alloc_text(PAGE, PocMarkFileModified)
 #pragma alloc_text(PAGE, PocInvalidateScanResult)
 #pragma alloc_text(PAGE, PocAllocateCompletionContext)
-#pragma alloc_text(PAGE, PocAllocateHandleContext)
 #pragma alloc_text(PAGE, PocGetOrCreateHandleContext)
 #pragma alloc_text(PAGE, ShadowStrikePostCreate)
 #pragma alloc_text(PAGE, PocpQueryFileInformation)
@@ -509,13 +508,13 @@ Return Value:
     }
 
     //
-    // Check if driver is ready (atomic reads)
+    // Check if driver is ready (volatile reads — aligned LONG on x64 is atomic)
     //
-    if (InterlockedCompareExchange(&g_PocState.Initialized, 1, 1) != 1) {
+    if (*(volatile LONG*)&g_PocState.Initialized != 1) {
         goto Cleanup;
     }
 
-    if (InterlockedCompareExchange(&g_PocState.ShutdownRequested, 0, 0) != 0) {
+    if (*(volatile LONG*)&g_PocState.ShutdownRequested != 0) {
         goto Cleanup;
     }
 
@@ -761,7 +760,7 @@ Return Value:
 
         if (completionCtx->ThreatScore > 0) {
             BeEngineSubmitEvent(
-                BehaviorEvent_HiddenFileCreation,
+                BehaviorEvent_FileSignatureSpoofing,
                 BehaviorCategory_FileOperation,
                 HandleToULong(PsGetCurrentProcessId()),
                 NULL, 0,
@@ -1235,61 +1234,12 @@ PocReleaseStreamContext(
 // PUBLIC API - HANDLE CONTEXT MANAGEMENT
 // ============================================================================
 
-_IRQL_requires_max_(APC_LEVEL)
-NTSTATUS
-PocAllocateHandleContext(
-    _In_ PFLT_CALLBACK_DATA Data,
-    _Out_ PSHADOWSTRIKE_HANDLE_CONTEXT* OutContext
-    )
-{
-    PSHADOWSTRIKE_HANDLE_CONTEXT context = NULL;
-
-    PAGED_CODE();
-
-    if (Data == NULL || OutContext == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    *OutContext = NULL;
-
-    //
-    // Check if lookaside is ready
-    //
-    if (!g_PocState.LookasideInitialized) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    //
-    // Allocate from lookaside list
-    //
-    context = (PSHADOWSTRIKE_HANDLE_CONTEXT)ExAllocateFromNPagedLookasideList(
-        &g_PocState.HandleContextLookaside
-        );
-
-    if (context == NULL) {
-        InterlockedIncrement64(&g_PocState.Stats.HandleContextsFailed);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    RtlZeroMemory(context, sizeof(SHADOWSTRIKE_HANDLE_CONTEXT));
-    context->Signature = POC_HANDLE_CONTEXT_SIGNATURE;
-    context->SecurityCookie = PocComputeSecurityCookie(context);
-    ExInitializePushLock(&context->Lock);
-    context->ProcessId = PsGetCurrentProcessId();
-    context->ThreadId = PsGetCurrentThreadId();
-    context->DesiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
-    context->CreateOptions = Data->Iopb->Parameters.Create.Options & FILE_VALID_OPTION_FLAGS;
-    context->ShareAccess = Data->Iopb->Parameters.Create.ShareAccess;
-    KeQuerySystemTime(&context->OpenTime);
-    KeQuerySystemTime(&context->LastOperationTime);
-
-    InterlockedIncrement64(&g_PocState.Stats.HandleContextsCreated);
-
-    *OutContext = context;
-
-    return STATUS_SUCCESS;
-}
-
+//
+// NOTE: PocAllocateHandleContext removed — it allocated from NPAGED_LOOKASIDE_LIST
+// which produces raw pool, incompatible with FltSetStreamHandleContext (requires
+// FltAllocateContext). Use PocGetOrCreateHandleContext instead, which correctly
+// uses FltAllocateContext for filter-managed handle contexts.
+//
 
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS

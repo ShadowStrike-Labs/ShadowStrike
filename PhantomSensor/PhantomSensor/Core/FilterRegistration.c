@@ -193,6 +193,21 @@ static FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
         NULL                                        // Reserved
     },
 
+    //
+    // Stream Handle Context — per-open-handle tracking (PostCreate.c)
+    // Used for per-handle write/delete/rename tracking
+    //
+    {
+        FLT_STREAMHANDLE_CONTEXT,                   // ContextType
+        0,                                          // Flags
+        NULL,                                       // ContextCleanupCallback (no special cleanup needed)
+        FLT_VARIABLE_SIZED_CONTEXTS,                // Size — PostCreate specifies exact size
+        'hHCP',                                     // PoolTag — PCHh (Handle Context)
+        NULL,                                       // ContextAllocateCallback
+        NULL,                                       // ContextFreeCallback
+        NULL                                        // Reserved
+    },
+
     { FLT_CONTEXT_END }
 };
 

@@ -669,7 +669,7 @@ Arguments:
     CompletionContext   - Context to pass to post-operation (unused).
 
 Return Value:
-    FLT_PREOP_SUCCESS_NO_CALLBACK - Allow operation, no post-op needed.
+    FLT_PREOP_SUCCESS_WITH_CALLBACK - Allow operation, PostCreate will track.
     FLT_PREOP_COMPLETE            - Block operation.
 --*/
 {
@@ -694,7 +694,11 @@ Return Value:
     SHADOWSTRIKE_SCAN_VERDICT_REPLY ReplyMsg = {0};
     ULONG ReplySize = sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY);
 
-    UNREFERENCED_PARAMETER(CompletionContext);
+    //
+    // CompletionContext is set to NULL for non-blocking allows (PostCreate
+    // handles the NULL case gracefully). Future: populate with scan results.
+    //
+    *CompletionContext = NULL;
 
     //
     // Zero-initialize CacheKey to prevent use of uninitialized data
@@ -1432,7 +1436,7 @@ CleanupAllow:
     if (RundownAcquired) {
         ExReleaseRundownProtection(&g_PcState.RundownRef);
     }
-    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
 
 
