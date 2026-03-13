@@ -109,13 +109,6 @@ EncpGetDeobfuscatedKeyMaterial(
     );
 
 _IRQL_requires_(PASSIVE_LEVEL)
-static NTSTATUS
-EncpInitializeBCryptKey(
-    _In_ PENC_MANAGER Manager,
-    _Inout_ PENC_KEY Key
-    );
-
-_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 EncpCleanupBCryptKey(
     _Inout_ PENC_KEY Key
@@ -144,8 +137,12 @@ EncpRotationTimerCallback(
 //=============================================================================
 
 static ULONG g_Crc32Table[256];
-static BOOLEAN g_Crc32TableInitialized = FALSE;
+static volatile LONG g_Crc32TableInitialized = FALSE;
 
+//
+// Called exactly once from EncInitialize (INIT section, single-threaded).
+// No external callers may invoke this concurrently.
+//
 static VOID
 EncpInitializeCrc32Table(
     VOID
@@ -153,7 +150,11 @@ EncpInitializeCrc32Table(
 {
     ULONG i, j, crc;
 
-    if (g_Crc32TableInitialized) {
+    //
+    // Atomic check: EncInitialize runs single-threaded in DriverEntry,
+    // but guard against accidental double-init defensively.
+    //
+    if (InterlockedCompareExchange(&g_Crc32TableInitialized, TRUE, FALSE) == TRUE) {
         return;
     }
 
@@ -168,8 +169,6 @@ EncpInitializeCrc32Table(
         }
         g_Crc32Table[i] = crc;
     }
-
-    g_Crc32TableInitialized = TRUE;
 }
 
 static ULONG
@@ -216,6 +215,7 @@ Return Value:
 --*/
 {
     NTSTATUS status;
+    BOOLEAN resourceInitialized = FALSE;
 
     PAGED_CODE();
 
@@ -295,6 +295,7 @@ Return Value:
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
     }
+    resourceInitialized = TRUE;
 
     Manager->KeyCount = 0;
     Manager->NextKeyId = 1;
@@ -343,6 +344,9 @@ Return Value:
     return STATUS_SUCCESS;
 
 Cleanup:
+    if (resourceInitialized) {
+        ExDeleteResourceLite(&Manager->KeyListLock);
+    }
     if (Manager->RngAlgHandle != NULL) {
         BCryptCloseAlgorithmProvider(Manager->RngAlgHandle, 0);
         Manager->RngAlgHandle = NULL;
@@ -1463,18 +1467,19 @@ EncSetActiveKey(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // AddRef the new key BEFORE acquiring the lock and publishing it.
+    // This prevents a TOCTOU where another thread sees the pointer
+    // in ActiveKeys but the reference was never incremented.
+    //
+    if (!EncKeyAddRef(Key)) {
+        return STATUS_UNSUCCESSFUL;
+    }
+
     KeAcquireSpinLock(&Manager->ActiveKeysLock, &oldIrql);
 
     oldKey = Manager->ActiveKeys[KeyType];
     Manager->ActiveKeys[KeyType] = Key;
-    if (!EncKeyAddRef(Key)) {
-        //
-        // Key is being destroyed — cannot set as active
-        //
-        Manager->ActiveKeys[KeyType] = oldKey;
-        KeReleaseSpinLock(&Manager->ActiveKeysLock, oldIrql);
-        return STATUS_UNSUCCESSFUL;
-    }
 
     KeReleaseSpinLock(&Manager->ActiveKeysLock, oldIrql);
 
@@ -1504,13 +1509,17 @@ EncKeyAddRef(
 
     //
     // CAS loop: atomically check IsBeingDestroyed and increment RefCount.
-    // This eliminates the TOCTOU window between checking the flag and
-    // modifying the counter.
+    // Use ReadAcquire for proper memory ordering — ensures we see the
+    // latest value of IsBeingDestroyed published by EncDestroyKey.
     //
     do {
-        oldRef = ReadNoFence(&Key->RefCount);
+        if (ReadAcquire((volatile LONG*)&Key->IsBeingDestroyed)) {
+            return FALSE;
+        }
 
-        if (oldRef <= 0 || Key->IsBeingDestroyed) {
+        oldRef = ReadAcquire(&Key->RefCount);
+
+        if (oldRef <= 0) {
             return FALSE;
         }
 
@@ -2497,6 +2506,20 @@ Routine Description:
 //=============================================================================
 
 _Use_decl_annotations_
+BCRYPT_ALG_HANDLE
+EncGetHmacAlgHandle(
+    _In_ PENC_MANAGER Manager
+    )
+{
+    if (Manager == NULL || !Manager->Initialized) {
+        return NULL;
+    }
+
+    return Manager->HmacAlgHandle;
+}
+
+
+_Use_decl_annotations_
 NTSTATUS
 EncRandomBytes(
     _In_ PENC_MANAGER Manager,
@@ -3041,48 +3064,6 @@ Routine Description:
     ExReleaseFastMutex(&Key->ObfuscationMutex);
 
     return STATUS_SUCCESS;
-}
-
-
-static
-_Use_decl_annotations_
-NTSTATUS
-EncpInitializeBCryptKey(
-    _In_ PENC_MANAGER Manager,
-    _Inout_ PENC_KEY Key
-    )
-/*++
-
-Routine Description:
-
-    Initializes BCrypt key handle for the encryption key.
-
---*/
-{
-    NTSTATUS status;
-
-    PAGED_CODE();
-
-    Key->AlgHandle = Manager->AesGcmAlgHandle;
-
-    //
-    // Generate key object using raw key material (not yet obfuscated at this point)
-    //
-    status = BCryptGenerateSymmetricKey(
-        Manager->AesGcmAlgHandle,
-        &Key->KeyHandle,
-        NULL,
-        0,
-        Key->KeyMaterial,
-        Key->KeySize,
-        0
-        );
-
-    if (NT_SUCCESS(status)) {
-        Key->HandlesInitialized = TRUE;
-    }
-
-    return status;
 }
 
 

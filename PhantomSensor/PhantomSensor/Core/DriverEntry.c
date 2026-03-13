@@ -2121,6 +2121,15 @@ ShadowStrikeGetTimerManager(VOID)
     return g_TimerManager;
 }
 
+PENC_MANAGER
+ShadowStrikeGetEncryptionManager(VOID)
+{
+    if (!g_EncryptionManager.Initialized) {
+        return NULL;
+    }
+    return &g_EncryptionManager;
+}
+
 // ============================================================================
 // VERSION COMPATIBILITY CHECK
 // ============================================================================

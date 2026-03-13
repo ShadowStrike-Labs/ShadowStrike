@@ -199,6 +199,11 @@ MqpDetachPendingCompletion(
     );
 
 static VOID
+MqpFreeUnregisteredCompletion(
+    _In_ PMQ_PENDING_COMPLETION Completion
+    );
+
+static VOID
 MqpCleanupExpiredCompletions(
     VOID
     );
@@ -974,8 +979,7 @@ MqEnqueueMessageAndWait(
         do {
             currentDepth = g_MqGlobals.TotalMessageCount;
             if (currentDepth >= maxDepth) {
-                MqpReleasePendingCompletion(pendingCompletion);
-                MqpReleasePendingCompletion(pendingCompletion);  // Release both refs
+                MqpFreeUnregisteredCompletion(pendingCompletion);
                 InterlockedIncrement64(&g_MqGlobals.TotalMessagesDropped);
                 return STATUS_DEVICE_BUSY;
             }
@@ -989,8 +993,7 @@ MqEnqueueMessageAndWait(
     message = MqpAllocateMessage(MessageSize);
     if (message == NULL) {
         InterlockedDecrement(&g_MqGlobals.TotalMessageCount);
-        MqpReleasePendingCompletion(pendingCompletion);
-        MqpReleasePendingCompletion(pendingCompletion);
+        MqpFreeUnregisteredCompletion(pendingCompletion);
         InterlockedIncrement64(&g_MqGlobals.TotalMessagesDropped);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1096,7 +1099,7 @@ MqEnqueueMessageAndWait(
         // Safe because we still hold our reference
         //
         UINT32 copySize = min(pendingCompletion->ResponseSize, ResponseBufferSize);
-        if (copySize > 0) {
+        if (copySize > 0 && pendingCompletion->ResponseData != NULL) {
             RtlCopyMemory(ResponseBuffer, pendingCompletion->ResponseData, copySize);
         }
         *ResponseSize = copySize;
@@ -2116,6 +2119,39 @@ MqpDetachPendingCompletion(
     //
     if (wasInList) {
         MqpReleasePendingCompletion(Completion);
+    }
+}
+
+/**
+ * @brief Free a pending completion that was never registered.
+ *
+ * Used for early-exit paths in MqEnqueueMessageAndWait where the
+ * completion was allocated but never inserted into g_PendingCompletionList
+ * and never had OutstandingCompletions incremented.
+ *
+ * MUST NOT call MqpReleasePendingCompletion here — that would decrement
+ * OutstandingCompletions which was never incremented, corrupting the
+ * counter and potentially causing shutdown to skip waiting for real
+ * outstanding completions (use-after-free risk).
+ */
+static VOID
+MqpFreeUnregisteredCompletion(
+    _In_ PMQ_PENDING_COMPLETION Completion
+    )
+{
+    if (Completion == NULL) {
+        return;
+    }
+
+    Completion->Magic = 0;
+
+    //
+    // No ResponseData (never completed), no list removal (never inserted),
+    // no OutstandingCompletions decrement (never registered).
+    //
+
+    if (g_PendingCompletionLookasideInitialized) {
+        ExFreeToNPagedLookasideList(&g_PendingCompletionLookaside, Completion);
     }
 }
 

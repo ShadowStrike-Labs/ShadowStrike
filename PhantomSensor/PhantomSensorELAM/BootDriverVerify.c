@@ -52,6 +52,7 @@
 #define BDV_PE_DOS_SIGNATURE            0x5A4D          // 'MZ'
 #define BDV_PE_NT_SIGNATURE             0x00004550      // 'PE\0\0'
 #define BDV_MAX_IMAGE_SIZE              (100ULL * 1024 * 1024)  // 100MB max driver
+#define BDV_MAX_PE_SECTIONS             96              // Stack-safe section sort limit
 
 // ============================================================================
 // INTERNAL STRUCTURES
@@ -533,39 +534,74 @@ BdvpCalculateAuthenticodeHash(
         }
     }
 
-    // Hash sections in order (excluding certificate table)
+    // Hash sections sorted by PointerToRawData (Authenticode spec requirement)
     sectionTableOffset = dosHeader->e_lfanew + sizeof(ULONG) +
                          sizeof(IMAGE_FILE_HEADER) +
                          ntHeaders->FileHeader.SizeOfOptionalHeader;
 
+    // Validate section table fits within image
+    {
+        USHORT numSections = ntHeaders->FileHeader.NumberOfSections;
+        SIZE_T tableEnd = (SIZE_T)sectionTableOffset +
+                          (SIZE_T)numSections * sizeof(IMAGE_SECTION_HEADER);
+        if (sectionTableOffset > ImageSize || tableEnd > ImageSize) {
+            status = STATUS_INVALID_IMAGE_FORMAT;
+            goto Cleanup;
+        }
+    }
+
     sectionHeader = (PIMAGE_SECTION_HEADER)((PUCHAR)ImageBase + sectionTableOffset);
 
-    for (i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
-        ULONG sectionStart = sectionHeader[i].PointerToRawData;
-        ULONG sectionSize = sectionHeader[i].SizeOfRawData;
+    // Sort sections by ascending PointerToRawData (insertion sort, stack-safe)
+    {
+        typedef struct { USHORT Index; ULONG Offset; } SECTION_SORT;
+        SECTION_SORT sorted[BDV_MAX_PE_SECTIONS];
+        USHORT sectionCount = min(ntHeaders->FileHeader.NumberOfSections,
+                                  BDV_MAX_PE_SECTIONS);
+        USHORT j, k;
+        SECTION_SORT key;
 
-        // Overflow-safe bounds check
-        if (sectionStart > (ULONG)ImageSize ||
-            sectionSize > (ULONG)ImageSize - sectionStart) {
-            continue;
+        for (j = 0; j < sectionCount; j++) {
+            sorted[j].Index = j;
+            sorted[j].Offset = sectionHeader[j].PointerToRawData;
         }
 
-        // Skip if section overlaps with certificate table
-        if (securityDir != NULL && securityDir->VirtualAddress != 0 && securityDirEnd != 0) {
-            ULONG sectionEnd = sectionStart + sectionSize;
-            if (sectionStart < securityDirEnd && sectionEnd > securityDir->VirtualAddress) {
+        for (j = 1; j < sectionCount; j++) {
+            key = sorted[j];
+            k = j;
+            while (k > 0 && sorted[k - 1].Offset > key.Offset) {
+                sorted[k] = sorted[k - 1];
+                k--;
+            }
+            sorted[k] = key;
+        }
+
+        for (j = 0; j < sectionCount; j++) {
+            USHORT idx = sorted[j].Index;
+            ULONG sectionStart = sectionHeader[idx].PointerToRawData;
+            ULONG sectionSize = sectionHeader[idx].SizeOfRawData;
+
+            if (sectionStart > (ULONG)ImageSize ||
+                sectionSize > (ULONG)ImageSize - sectionStart) {
                 continue;
             }
-        }
 
-        if (sectionSize > 0) {
-            status = ShadowStrikeHashContextUpdate(
-                &hashContext,
-                (PUCHAR)ImageBase + sectionStart,
-                sectionSize
-                );
-            if (!NT_SUCCESS(status)) {
-                goto Cleanup;
+            if (securityDir != NULL && securityDir->VirtualAddress != 0 && securityDirEnd != 0) {
+                ULONG sectionEnd = sectionStart + sectionSize;
+                if (sectionStart < securityDirEnd && sectionEnd > securityDir->VirtualAddress) {
+                    continue;
+                }
+            }
+
+            if (sectionSize > 0) {
+                status = ShadowStrikeHashContextUpdate(
+                    &hashContext,
+                    (PUCHAR)ImageBase + sectionStart,
+                    sectionSize
+                    );
+                if (!NT_SUCCESS(status)) {
+                    goto Cleanup;
+                }
             }
         }
     }
@@ -682,6 +718,7 @@ BdvpIsHashInList(
     PBDV_HASH_ENTRY hashEntry;
     BOOLEAN found = FALSE;
 
+    KeEnterCriticalRegion();
     ExAcquirePushLockShared(Lock);
 
     for (entry = ListHead->Flink; entry != ListHead; entry = entry->Flink) {
@@ -694,6 +731,7 @@ BdvpIsHashInList(
     }
 
     ExReleasePushLockShared(Lock);
+    KeLeaveCriticalRegion();
 
     return found;
 }
@@ -889,15 +927,20 @@ BdvShutdown(
     PBDV_DRIVER_INFO driverInfo;
     KIRQL oldIrql;
 
-    if (Verifier == NULL || !InterlockedCompareExchange(&Verifier->Initialized, 0, 0)) {
+    if (Verifier == NULL) {
+        return;
+    }
+
+    // Atomically clear Initialized: returns previous value.
+    // If it was already 0, another shutdown raced us — bail.
+    if (!InterlockedCompareExchange(&Verifier->Initialized, 0, 1)) {
         return;
     }
 
     internal = CONTAINING_RECORD(Verifier, BDV_VERIFIER_INTERNAL, Public);
 
-    InterlockedExchange(&Verifier->Initialized, 0);
-
     // Free known good list
+    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Verifier->ListLock);
     while (!IsListEmpty(&Verifier->KnownGoodList)) {
         entry = RemoveHeadList(&Verifier->KnownGoodList);
@@ -912,6 +955,7 @@ BdvShutdown(
         ExFreePoolWithTag(hashEntry, BDV_POOL_TAG);
     }
     ExReleasePushLockExclusive(&Verifier->ListLock);
+    KeLeaveCriticalRegion();
 
     // Free verified driver list (including deep-copied paths)
     KeAcquireSpinLock(&Verifier->VerifiedLock, &oldIrql);
@@ -967,9 +1011,9 @@ BdvLoadConfiguration(
         return STATUS_INVALID_PARAMETER;
     }
 
-    // Allocate new config before taking lock
+    // Allocate new config before taking lock (paged — accessed only at < DISPATCH)
     PVOID newConfig = ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
+        POOL_FLAG_PAGED,
         ConfigSize,
         BDV_POOL_TAG
         );
@@ -981,6 +1025,7 @@ BdvLoadConfiguration(
     RtlCopyMemory(newConfig, ConfigData, ConfigSize);
 
     // Swap under push lock for synchronization with readers
+    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Verifier->ListLock);
 
     PVOID oldConfig = Verifier->ELAMConfig;
@@ -988,6 +1033,7 @@ BdvLoadConfiguration(
     Verifier->ELAMConfigSize = ConfigSize;
 
     ExReleasePushLockExclusive(&Verifier->ListLock);
+    KeLeaveCriticalRegion();
 
     if (oldConfig != NULL) {
         ExFreePoolWithTag(oldConfig, BDV_POOL_TAG);
@@ -1130,7 +1176,8 @@ BdvClassifyDriver(
     BOOLEAN mayBeGood;
     BOOLEAN mayBeBad;
 
-    if (Verifier == NULL || !Verifier->Initialized ||
+    if (Verifier == NULL ||
+        !InterlockedCompareExchange(&Verifier->Initialized, 1, 1) ||
         Info == NULL || Classification == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1202,7 +1249,8 @@ BdvAddKnownHash(
     PBDV_VERIFIER_INTERNAL internal;
     PBDV_HASH_ENTRY entry;
 
-    if (Verifier == NULL || !Verifier->Initialized) {
+    if (Verifier == NULL ||
+        !InterlockedCompareExchange(&Verifier->Initialized, 1, 1)) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1212,15 +1260,7 @@ BdvAddKnownHash(
 
     internal = CONTAINING_RECORD(Verifier, BDV_VERIFIER_INTERNAL, Public);
 
-    // Check limits
-    if (IsGood && internal->KnownGoodCount >= BDV_MAX_KNOWN_HASHES) {
-        return STATUS_QUOTA_EXCEEDED;
-    }
-    if (!IsGood && internal->KnownBadCount >= BDV_MAX_KNOWN_HASHES) {
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
-    // Allocate entry
+    // Allocate entry before lock (allocation may block)
     entry = (PBDV_HASH_ENTRY)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         sizeof(BDV_HASH_ENTRY),
@@ -1235,8 +1275,38 @@ BdvAddKnownHash(
     entry->Classification = IsGood ? BdvClass_KnownGood : BdvClass_KnownBad;
     entry->Description[0] = '\0';
 
-    // Add to appropriate list and bloom filter
+    // All quota checks and insertion under exclusive lock to prevent races
+    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Verifier->ListLock);
+
+    // Re-check quota under lock to prevent concurrent overcommit
+    if (IsGood && internal->KnownGoodCount >= BDV_MAX_KNOWN_HASHES) {
+        ExReleasePushLockExclusive(&Verifier->ListLock);
+        KeLeaveCriticalRegion();
+        ExFreePoolWithTag(entry, BDV_POOL_TAG);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+    if (!IsGood && internal->KnownBadCount >= BDV_MAX_KNOWN_HASHES) {
+        ExReleasePushLockExclusive(&Verifier->ListLock);
+        KeLeaveCriticalRegion();
+        ExFreePoolWithTag(entry, BDV_POOL_TAG);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    // Check for duplicate before inserting
+    {
+        PLIST_ENTRY listHead = IsGood ? &Verifier->KnownGoodList : &Verifier->KnownBadList;
+        PLIST_ENTRY cur;
+        for (cur = listHead->Flink; cur != listHead; cur = cur->Flink) {
+            PBDV_HASH_ENTRY existing = CONTAINING_RECORD(cur, BDV_HASH_ENTRY, ListEntry);
+            if (ShadowStrikeCompareSha256(existing->Hash, Hash)) {
+                ExReleasePushLockExclusive(&Verifier->ListLock);
+                KeLeaveCriticalRegion();
+                ExFreePoolWithTag(entry, BDV_POOL_TAG);
+                return STATUS_DUPLICATE_OBJECTID;
+            }
+        }
+    }
 
     if (IsGood) {
         InsertTailList(&Verifier->KnownGoodList, &entry->ListEntry);
@@ -1249,6 +1319,7 @@ BdvAddKnownHash(
     }
 
     ExReleasePushLockExclusive(&Verifier->ListLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }

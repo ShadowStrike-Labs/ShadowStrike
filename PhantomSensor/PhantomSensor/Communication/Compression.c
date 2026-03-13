@@ -181,24 +181,22 @@ static EX_SPIN_LOCK g_ManagerLock = 0;
 //=============================================================================
 
 typedef struct _COMP_DEFERRED_CLEANUP {
-    PIO_WORKITEM WorkItem;
+    WORK_QUEUE_ITEM WorkItem;
     PCOMP_DICTIONARY Dictionary;
 } COMP_DEFERRED_CLEANUP, *PCOMP_DEFERRED_CLEANUP;
 
-static PDEVICE_OBJECT g_CompressionDeviceObject = NULL;
-
 /**
  * @brief Work item callback for deferred dictionary cleanup.
+ *
+ * Uses WORK_QUEUE_ITEM + ExQueueWorkItem which does NOT require
+ * a device object, unlike IoAllocateWorkItem/IoQueueWorkItem.
  */
 static VOID
-ComppDeferredDictionaryCleanup(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+ComppDeferredDictionaryCleanupWorker(
+    _In_ PVOID Parameter
     )
 {
-    PCOMP_DEFERRED_CLEANUP Cleanup = (PCOMP_DEFERRED_CLEANUP)Context;
-
-    UNREFERENCED_PARAMETER(DeviceObject);
+    PCOMP_DEFERRED_CLEANUP Cleanup = (PCOMP_DEFERRED_CLEANUP)Parameter;
 
     if (Cleanup == NULL) {
         return;
@@ -212,17 +210,18 @@ ComppDeferredDictionaryCleanup(
     }
 
     //
-    // Free work item and cleanup structure
+    // Free cleanup structure (WORK_QUEUE_ITEM is embedded, no separate free)
     //
-    if (Cleanup->WorkItem != NULL) {
-        IoFreeWorkItem(Cleanup->WorkItem);
-    }
-
     ExFreePoolWithTag(Cleanup, COMP_POOL_TAG_CONTEXT);
 }
 
 /**
  * @brief Queue deferred dictionary cleanup for elevated IRQL.
+ *
+ * FIXED: Uses ExQueueWorkItem instead of IoQueueWorkItem.
+ * IoQueueWorkItem requires a PDEVICE_OBJECT which was never provided
+ * to the compression module, causing the deferred path to always fail.
+ * ExQueueWorkItem works without a device object.
  */
 static BOOLEAN
 ComppQueueDeferredDictionaryCleanup(
@@ -230,15 +229,6 @@ ComppQueueDeferredDictionaryCleanup(
     )
 {
     PCOMP_DEFERRED_CLEANUP Cleanup;
-    PIO_WORKITEM WorkItem;
-
-    //
-    // Need a device object to queue work items
-    // If not available, we cannot defer - caller must handle
-    //
-    if (g_CompressionDeviceObject == NULL) {
-        return FALSE;
-    }
 
     //
     // Allocate cleanup structure from NonPaged pool (we're at elevated IRQL)
@@ -253,27 +243,18 @@ ComppQueueDeferredDictionaryCleanup(
         return FALSE;
     }
 
-    //
-    // Allocate work item
-    //
-    WorkItem = IoAllocateWorkItem(g_CompressionDeviceObject);
-    if (WorkItem == NULL) {
-        ExFreePoolWithTag(Cleanup, COMP_POOL_TAG_CONTEXT);
-        return FALSE;
-    }
-
-    Cleanup->WorkItem = WorkItem;
     Cleanup->Dictionary = Dictionary;
 
     //
-    // Queue for deferred execution at PASSIVE_LEVEL
+    // Initialize and queue the work item for deferred execution
     //
-    IoQueueWorkItem(
-        WorkItem,
-        ComppDeferredDictionaryCleanup,
-        DelayedWorkQueue,
+    ExInitializeWorkItem(
+        &Cleanup->WorkItem,
+        ComppDeferredDictionaryCleanupWorker,
         Cleanup
     );
+
+    ExQueueWorkItem(&Cleanup->WorkItem, DelayedWorkQueue);
 
     return TRUE;
 }
@@ -765,7 +746,7 @@ ComppCompressGeneric(
         LiteralLength = (ULONG)(Ip - Anchor);
         TokenPtr = Op++;
 
-        if ((ULONG)(OLimit - Op) < LiteralLength + (2 + 1 + LZ4_LASTLITERALS)) {
+        if ((ULONG)(OLimit - Op) < LiteralLength + (LiteralLength / 255) + (2 + 1 + LZ4_LASTLITERALS)) {
             return 0;  // Output too small
         }
 
@@ -2063,8 +2044,12 @@ CompCompress(
         case CompAlgorithm_RLE:
         case CompAlgorithm_Delta:
             //
-            // Fallback to LZ4 for unsupported algorithms
+            // These algorithms are not implemented - fall back to LZ4 fast.
+            // CRITICAL: Update header to reflect actual algorithm used,
+            // otherwise CompDecompress will reject with STATUS_NOT_SUPPORTED.
             //
+            Algorithm = CompAlgorithm_LZ4_Fast;
+            Header->Algorithm = Algorithm;
             Result = LZ4_compress_default(
                 (const CHAR*)Input,
                 (CHAR*)CompressedData,
@@ -2107,6 +2092,9 @@ CompCompress(
             InterlockedIncrement64((volatile LONG64*)&Mgr->Stats.TotalCompressed);
             InterlockedAdd64((volatile LONG64*)&Mgr->Stats.BytesSaved,
                              (LONG64)InputSize - (LONG64)*CompressedSize);
+            InterlockedAdd64(&Mgr->DefaultContext.TotalBytesIn, (LONG64)InputSize);
+            InterlockedAdd64(&Mgr->DefaultContext.TotalBytesOut, (LONG64)*CompressedSize);
+            InterlockedIncrement64(&Mgr->DefaultContext.TotalOperations);
             ComppReleaseManager(Mgr);
         }
     }
@@ -2353,6 +2341,8 @@ CompCreateContext(
         Ctx->InternalStateSize = sizeof(LZ4HC_STREAM_INTERNAL);
     }
 
+    InterlockedExchange(&Ctx->Initialized, TRUE);
+
     *Context = Ctx;
     return STATUS_SUCCESS;
 
@@ -2493,6 +2483,14 @@ CompStreamBegin(
     }
 
     //
+    // Cap block size to prevent LZ4_COMPRESSBOUND integer overflow
+    // and unreasonably large kernel allocations.
+    //
+    if (BlockSize > COMP_MAX_INPUT_SIZE) {
+        BlockSize = COMP_MAX_INPUT_SIZE;
+    }
+
+    //
     // Allocate stream
     //
     Strm = (PCOMP_STREAM)ShadowStrikeAllocatePoolWithTag(
@@ -2621,6 +2619,12 @@ CompStreamCompress(
 
     *CompressedSize = 0;
 
+    //
+    // Safe bound calculation with overflow check
+    //
+    if (InputSize > COMP_MAX_INPUT_SIZE) {
+        return STATUS_INVALID_PARAMETER;
+    }
     MaxCompressedSize = LZ4_COMPRESSBOUND(InputSize);
     if (OutputSize < MaxCompressedSize) {
         return STATUS_BUFFER_TOO_SMALL;

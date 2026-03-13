@@ -878,6 +878,11 @@ BtdScanDriver(
     KIRQL oldIrql;
     ULONG matchOffset;
     LONG currentDetected;
+    BOOLEAN patternMatched = FALSE;
+    BTD_THREAT_TYPE matchedThreatType = BtdThreat_None;
+    CHAR matchedThreatName[64] = {0};
+    ULONG matchedSeverity = 0;
+    ULONG matchedOffset = 0;
 
     if (Detector == NULL ||
         !InterlockedCompareExchange(&Detector->Initialized, 1, 1) ||

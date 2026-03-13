@@ -484,6 +484,7 @@ ShadowStrikeCloseCommunicationPort(
     waitCount = 0;
 
     for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
+        waitCount = 0;  // Reset per slot to give each client full drain window
         while (g_ClientPortRefs[i].ReferenceCount > 0 && waitCount < 50) {
             KeDelayExecutionThread(KernelMode, FALSE, &waitInterval);
             waitCount++;
@@ -525,6 +526,12 @@ ShadowStrikeCloseCommunicationPort(
         FltCloseCommunicationPort(g_DriverData.ServerPort);
         g_DriverData.ServerPort = NULL;
     }
+
+    //
+    // Scrub HMAC key material from memory (crypto hygiene)
+    //
+    RtlSecureZeroMemory(g_CommHmacKey, sizeof(g_CommHmacKey));
+    g_CommHmacKeyReady = FALSE;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Communication port closed\n");
@@ -1067,12 +1074,21 @@ ShadowStrikeHandleQueryDriverStatus(
     driverStatus.ScanOnExecuteEnabled = g_DriverData.Config.ScanOnExecute;
     driverStatus.ScanOnWriteEnabled = g_DriverData.Config.ScanOnWrite;
     driverStatus.NotificationsEnabled = g_DriverData.Config.NotificationsEnabled;
-    driverStatus.TotalFilesScanned = g_DriverData.Stats.TotalFilesScanned;
-    driverStatus.FilesBlocked = g_DriverData.Stats.FilesBlocked;
-    driverStatus.PendingRequests = g_DriverData.Stats.PendingRequests;
-    driverStatus.PeakPendingRequests = g_DriverData.Stats.PeakPendingRequests;
-    driverStatus.CacheHits = g_DriverData.Stats.CacheHits;
-    driverStatus.CacheMisses = g_DriverData.Stats.CacheMisses;
+    //
+    // Read 64-bit volatile counters atomically (LONG64 reads are NOT atomic on x86)
+    //
+    driverStatus.TotalFilesScanned = (UINT64)InterlockedOr64(
+        (volatile LONG64*)&g_DriverData.Stats.TotalFilesScanned, 0);
+    driverStatus.FilesBlocked = (UINT64)InterlockedOr64(
+        (volatile LONG64*)&g_DriverData.Stats.FilesBlocked, 0);
+    driverStatus.PendingRequests = InterlockedCompareExchange(
+        &g_DriverData.Stats.PendingRequests, 0, 0);
+    driverStatus.PeakPendingRequests = InterlockedCompareExchange(
+        &g_DriverData.Stats.PeakPendingRequests, 0, 0);
+    driverStatus.CacheHits = (UINT64)InterlockedOr64(
+        (volatile LONG64*)&g_DriverData.Stats.CacheHits, 0);
+    driverStatus.CacheMisses = (UINT64)InterlockedOr64(
+        (volatile LONG64*)&g_DriverData.Stats.CacheMisses, 0);
     driverStatus.ConnectedClients = g_DriverData.ConnectedClients;
 
     //
@@ -1373,18 +1389,17 @@ ShadowStrikeAcquirePrimaryScannerPort(
     }
 
     //
-    // Atomically increment reference count if not disconnecting
+    // Atomically increment reference count only if not disconnecting.
+    // We must re-check Disconnecting AFTER incrementing to close the
+    // TOCTOU window where disconnect can race between our check and
+    // the increment.
     //
-    if (g_ClientPortRefs[targetSlot].Disconnecting != 0) {
-        ExReleasePushLockShared(&g_DriverData.ClientPortLock);
-        KeLeaveCriticalRegion();
-        return SHADOWSTRIKE_ERROR_CLIENT_DISCONNECTED;
-    }
-
     oldRefCount = InterlockedIncrement(&g_ClientPortRefs[targetSlot].ReferenceCount);
-    if (oldRefCount <= 0) {
+    if (oldRefCount <= 0 ||
+        InterlockedCompareExchange(&g_ClientPortRefs[targetSlot].Disconnecting, 0, 0) != 0) {
         //
-        // Reference count was already at 0 or negative - undo and fail
+        // Either ref count was invalid or client started disconnecting
+        // between our scan and the increment — undo and fail.
         //
         InterlockedDecrement(&g_ClientPortRefs[targetSlot].ReferenceCount);
         ExReleasePushLockShared(&g_DriverData.ClientPortLock);
@@ -1578,7 +1593,12 @@ ShadowStrikeSendNotification(
     if (Notification->DataSize > COMP_MIN_INPUT_SIZE) {
         PVOID dataStart = (PUCHAR)Notification + sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
         ULONG dataSize = Notification->DataSize;
-        ULONG compBufSize = dataSize;  // worst case = same size
+        //
+        // Compression can expand incompressible data; allocate margin.
+        // LZ4 worst case is input + input/255 + 16; we use input + input/128 + 64
+        // as a conservative upper bound for any algorithm.
+        //
+        ULONG compBufSize = dataSize + (dataSize >> 7) + 64;
         ULONG compressedSize = 0;
 
         compressedPayload = ExAllocatePool2(POOL_FLAG_NON_PAGED, compBufSize, 'cmCP');
@@ -1966,8 +1986,8 @@ ShadowStrikeAllocateMessageBuffer(
     //
     // Allocate from pool (either too large or lookaside failed)
     //
-    header = (PSHADOWSTRIKE_MESSAGE_BUFFER_HEADER)ExAllocatePoolZero(
-        NonPagedPoolNx,
+    header = (PSHADOWSTRIKE_MESSAGE_BUFFER_HEADER)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         totalSize,
         SHADOWSTRIKE_POOL_TAG
     );
@@ -2368,7 +2388,7 @@ ShadowStrikepFnv1aHashW(
     )
 {
     ULONG hash = 0x811C9DC5u;  // FNV-1a offset basis
-    USHORT i;
+    ULONG i;
     PUCHAR bytes;
     ULONG byteLen;
 
@@ -2612,7 +2632,7 @@ ShadowStrikeRegisterProtectedProcess(
     entry->ProtectionFlags = ProtectionFlags;
 
     if (ProcessName != NULL) {
-        SIZE_T nameLen = wcslen(ProcessName);
+        SIZE_T nameLen = wcsnlen(ProcessName, MAX_PROCESS_NAME_LENGTH);
         if (nameLen >= MAX_PROCESS_NAME_LENGTH) {
             nameLen = MAX_PROCESS_NAME_LENGTH - 1;
         }

@@ -84,9 +84,17 @@ extern "C" {
 #endif
 #endif
 
-#if MQ_DEBUG_OUTPUT
+/**
+ * @brief Error-level logging is ALWAYS active, even in release builds.
+ *
+ * Critical failures (OOM, counter corruption, shutdown errors) must
+ * be visible in production for diagnosis. Only info/trace/warning
+ * levels are gated by MQ_DEBUG_OUTPUT.
+ */
 #define MQ_LOG_ERROR(fmt, ...) \
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[ShadowStrike/MQ] " fmt "\n", ##__VA_ARGS__)
+
+#if MQ_DEBUG_OUTPUT
 #define MQ_LOG_WARNING(fmt, ...) \
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL, "[ShadowStrike/MQ] " fmt "\n", ##__VA_ARGS__)
 #define MQ_LOG_INFO(fmt, ...) \
@@ -94,7 +102,6 @@ extern "C" {
 #define MQ_LOG_TRACE(fmt, ...) \
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL, "[ShadowStrike/MQ] " fmt "\n", ##__VA_ARGS__)
 #else
-#define MQ_LOG_ERROR(fmt, ...)   ((void)0)
 #define MQ_LOG_WARNING(fmt, ...) ((void)0)
 #define MQ_LOG_INFO(fmt, ...)    ((void)0)
 #define MQ_LOG_TRACE(fmt, ...)   ((void)0)

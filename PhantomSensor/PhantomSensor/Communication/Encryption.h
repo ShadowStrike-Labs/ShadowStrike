@@ -642,6 +642,17 @@ EncSetAutoRotation(
 //=============================================================================
 
 //
+// Get the pre-opened HMAC-SHA256 algorithm handle for fast-path HMAC operations.
+// Avoids per-call BCryptOpenAlgorithmProvider overhead for callers like CommPort.
+// Returns NULL if manager is not initialized.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BCRYPT_ALG_HANDLE
+EncGetHmacAlgHandle(
+    _In_ PENC_MANAGER Manager
+    );
+
+//
 // Generate cryptographically secure random bytes
 //
 _IRQL_requires_(PASSIVE_LEVEL)
