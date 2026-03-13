@@ -88,6 +88,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "AmsiBypassDetector.h"
 #include "EnvironmentMonitor.h"
 #include "HandleTracker.h"
+#include "ImageNotify.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -3189,6 +3190,12 @@ PnpHandleProcessTermination(
     // Without cleanup, tracking table fills to 2048 and module goes deaf.
     //
     CbMonRemoveProcess(ProcessId);
+
+    //
+    // Release per-process module tracking in ImageNotify.
+    // Without cleanup, loaded DLL lists accumulate in NonPaged pool permanently.
+    //
+    ImageNotifyProcessTerminated(ProcessId);
 
     //
     // Remove from tracking

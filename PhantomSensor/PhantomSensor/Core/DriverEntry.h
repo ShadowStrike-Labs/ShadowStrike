@@ -456,19 +456,6 @@ ShadowStrikeThreadNotifyCallback(
     );
 
 /**
- * @brief Image load notification callback.
- *
- * Called by the kernel for every image (EXE/DLL) load.
- * Used for detecting malicious DLL injection and suspicious modules.
- */
-VOID
-ShadowStrikeImageNotifyCallback(
-    _In_opt_ PUNICODE_STRING FullImageName,
-    _In_ HANDLE ProcessId,
-    _In_ PIMAGE_INFO ImageInfo
-    );
-
-/**
  * @brief Registry operation callback.
  *
  * Called by the configuration manager for registry operations.
