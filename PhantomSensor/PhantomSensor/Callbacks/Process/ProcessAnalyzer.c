@@ -521,6 +521,14 @@ PaGetProcessRelationshipGraph(
     return g_ProcessRelationship;
 }
 
+PTA_ANALYZER
+PaGetTokenAnalyzer(
+    VOID
+    )
+{
+    return g_TokenAnalyzer;
+}
+
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS

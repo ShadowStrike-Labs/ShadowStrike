@@ -336,9 +336,9 @@ TaReferenceTokenInfo(
  *
  * @param[in] Info - Token info to release
  *
- * @irql <= APC_LEVEL (push lock acquisition required for cache removal)
+ * @irql PASSIVE_LEVEL (destruction path uses PAGED_CODE)
  */
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 TaReleaseTokenInfo(
     _In_ PTA_TOKEN_INFO Info

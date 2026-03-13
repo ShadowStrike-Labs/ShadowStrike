@@ -52,6 +52,7 @@
 #include "TokenAnalyzer.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/StringUtils.h"
+#include "../../Behavioral/BehaviorEngine.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -916,6 +917,53 @@ TaAnalyzeToken(
     //
     if (detectedAttack != TaAttack_None) {
         InterlockedIncrement64(&analyzer->Stats.AttacksDetected);
+
+        //
+        // Submit to BehaviorEngine for correlated threat assessment.
+        // Map TA_TOKEN_ATTACK to BEHAVIOR_EVENT_TYPE for telemetry pipeline.
+        //
+        {
+            BEHAVIOR_EVENT_TYPE beEventType;
+            BEHAVIOR_EVENT_CATEGORY beCategory = BehaviorCategory_PrivilegeOperation;
+
+            switch (detectedAttack) {
+                case TaAttack_Impersonation:
+                    beEventType = BehaviorEvent_TokenImpersonation;
+                    break;
+                case TaAttack_TokenStealing:
+                    beEventType = BehaviorEvent_TokenStealing;
+                    break;
+                case TaAttack_PrivilegeEscalation:
+                    beEventType = BehaviorEvent_PrivilegeEscalation;
+                    break;
+                case TaAttack_SIDInjection:
+                    beEventType = BehaviorEvent_TokenManipulation;
+                    break;
+                case TaAttack_IntegrityDowngrade:
+                    beEventType = BehaviorEvent_TokenManipulation;
+                    break;
+                case TaAttack_GroupModification:
+                    beEventType = BehaviorEvent_TokenManipulation;
+                    break;
+                case TaAttack_PrimaryTokenReplace:
+                    beEventType = BehaviorEvent_TokenStealing;
+                    break;
+                default:
+                    beEventType = BehaviorEvent_TokenManipulation;
+                    break;
+            }
+
+            (VOID)BeEngineSubmitEvent(
+                beEventType,
+                beCategory,
+                (UINT32)(ULONG_PTR)ProcessId,
+                &tokenInfo->Base,
+                (UINT32)sizeof(TA_TOKEN_INFO),
+                tokenInfo->Base.SuspicionScore,
+                FALSE,
+                NULL
+            );
+        }
     }
 
     //
