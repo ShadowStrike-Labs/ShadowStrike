@@ -2471,6 +2471,95 @@ Routine Description:
         if (CmdLenChars > 2048) {
             Context->BehaviorFlags |= PN_BEHAVIOR_LONG_CMDLINE;
         }
+
+        //
+        // Deep command-line analysis via CommandLineParser.
+        // CLP provides: LOLBin DB lookup, Base64 decoding, obfuscation scoring,
+        // download cradle detection, execution bypass detection, combo scoring.
+        // Results are merged into existing PN flags and forwarded to BehaviorEngine.
+        //
+        {
+            PCLP_PARSER ClpParser = PaGetCommandLineParser();
+            if (ClpParser != NULL) {
+                PCLP_PARSED_COMMAND ClpParsed = NULL;
+                NTSTATUS ClpStatus;
+
+                ClpStatus = ClpParse(ClpParser, &Context->CommandLine, &ClpParsed);
+                if (NT_SUCCESS(ClpStatus) && ClpParsed != NULL) {
+                    CLP_SUSPICION ClpFlags = ClpSuspicion_None;
+                    ULONG ClpScore = 0;
+
+                    ClpStatus = ClpAnalyze(ClpParser, ClpParsed, &ClpFlags, &ClpScore);
+                    if (NT_SUCCESS(ClpStatus) && ClpScore > 0) {
+                        //
+                        // Map CLP suspicion flags to PN behavioral flags
+                        //
+                        if (ClpFlags & ClpSuspicion_EncodedCommand) {
+                            Context->Flags |= PN_PROC_FLAG_ENCODED_CMD;
+                            Context->BehaviorFlags |= PN_BEHAVIOR_BASE64_ENCODED;
+                        }
+                        if (ClpFlags & ClpSuspicion_DownloadCradle) {
+                            Context->BehaviorFlags |= PN_BEHAVIOR_DOWNLOAD_CRADLE;
+                        }
+                        if (ClpFlags & ClpSuspicion_HiddenWindow) {
+                            Context->BehaviorFlags |= PN_BEHAVIOR_SUSPICIOUS_PS;
+                        }
+                        if (ClpFlags & ClpSuspicion_LongCommand) {
+                            Context->BehaviorFlags |= PN_BEHAVIOR_LONG_CMDLINE;
+                        }
+                        if (ClpFlags & ClpSuspicion_LOLBinAbuse) {
+                            Context->Flags |= PN_PROC_FLAG_LOLBIN;
+                        }
+
+                        //
+                        // Forward high-confidence CLP detections to BehaviorEngine.
+                        // Use graduated event types based on what was found.
+                        //
+                        if (ClpFlags & ClpSuspicion_LOLBinAbuse) {
+                            BeEngineSubmitEvent(
+                                BehaviorEvent_LOLBinExecution,
+                                BehaviorCategory_DefenseEvasion,
+                                HandleToULong(Context->ProcessId),
+                                ClpParsed, sizeof(CLP_PARSED_COMMAND),
+                                ClpScore, FALSE, NULL);
+                        }
+                        if (ClpFlags & (ClpSuspicion_EncodedCommand | ClpSuspicion_ObfuscatedArgs)) {
+                            BeEngineSubmitEvent(
+                                BehaviorEvent_PowerShellExecution,
+                                BehaviorCategory_ProcessExecution,
+                                HandleToULong(Context->ProcessId),
+                                ClpParsed, sizeof(CLP_PARSED_COMMAND),
+                                ClpScore, FALSE, NULL);
+                        }
+                        if (ClpFlags & ClpSuspicion_DownloadCradle) {
+                            BeEngineSubmitEvent(
+                                BehaviorEvent_CommandLineExecution,
+                                BehaviorCategory_ProcessExecution,
+                                HandleToULong(Context->ProcessId),
+                                ClpParsed, sizeof(CLP_PARSED_COMMAND),
+                                ClpScore, FALSE, NULL);
+                        }
+                        if (ClpFlags & ClpSuspicion_ScriptExecution) {
+                            BeEngineSubmitEvent(
+                                BehaviorEvent_ScriptExecution,
+                                BehaviorCategory_ProcessExecution,
+                                HandleToULong(Context->ProcessId),
+                                ClpParsed, sizeof(CLP_PARSED_COMMAND),
+                                ClpScore, FALSE, NULL);
+                        }
+
+                        //
+                        // Boost PN suspicion with CLP's superior score if higher
+                        //
+                        if (ClpScore > Context->SuspicionScore) {
+                            Context->SuspicionScore = ClpScore;
+                        }
+                    }
+
+                    ClpFreeParsed(ClpParsed);
+                }
+            }
+        }
     }
 
     //

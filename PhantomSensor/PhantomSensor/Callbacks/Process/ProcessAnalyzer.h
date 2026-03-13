@@ -60,6 +60,11 @@ extern "C" {
 #include <ntimage.h>
 
 //
+// Forward declaration for CommandLineParser integration
+//
+typedef struct _CLP_PARSER* PCLP_PARSER;
+
+//
 // Pool tags for memory tracking
 //
 #define PA_POOL_TAG             'APSS'
@@ -419,6 +424,23 @@ Return Value:
 --*/
 ULONG
 PaGetVersion(
+    VOID
+    );
+
+
+/*++
+Routine Description:
+    Returns the CommandLineParser instance managed by ProcessAnalyzer.
+    Used by ProcessNotify and other callers to perform deep command-line analysis.
+
+Return Value:
+    PCLP_PARSER if initialized, NULL otherwise.
+
+IRQL:
+    Can be called at any IRQL (returns pointer only).
+--*/
+PCLP_PARSER
+PaGetCommandLineParser(
     VOID
     );
 

@@ -472,6 +472,15 @@ PaGetVersion(
     return PA_VERSION;
 }
 
+
+PCLP_PARSER
+PaGetCommandLineParser(
+    VOID
+    )
+{
+    return g_CmdLineParser;
+}
+
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
