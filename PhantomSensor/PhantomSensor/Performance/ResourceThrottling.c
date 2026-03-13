@@ -29,7 +29,7 @@
  * - Per-process quota enforcement with per-process limits
  * - Token bucket rate limiting (CAS-safe)
  * - Deferred work queue processing via system worker thread
- * - Real-time monitoring via DPC
+ * - Real-time monitoring via TimerManager callbacks
  *
  * Safety v3.0.0:
  * - EX_RUNDOWN_REF for lifecycle management
@@ -48,6 +48,8 @@
 
 #include "ResourceThrottling.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 // ============================================================================
 // COMPILE-TIME ASSERTIONS
@@ -73,8 +75,8 @@ static VOID RtpInitializeResourceStates(_Inout_ PRT_THROTTLER Throttler);
 static VOID RtpInitializeProcessQuotas(_Inout_ PRT_THROTTLER Throttler);
 static VOID RtpInitializeDeferredWork(_Inout_ PRT_THROTTLER Throttler);
 
-static KDEFERRED_ROUTINE RtpMonitorDpcRoutine;
-static KDEFERRED_ROUTINE RtpDeferredWorkDpcRoutine;
+static VOID RtpMonitorTimerCallback(_In_ ULONG TimerId, _In_opt_ PVOID Context);
+static VOID RtpDeferredWorkTimerCallback(_In_ ULONG TimerId, _In_opt_ PVOID Context);
 
 static VOID RtpWorkerThreadRoutine(_In_ PVOID Context);
 
@@ -234,10 +236,9 @@ RtInitialize(
     RtpInitializeDeferredWork(throttler);
 
     //
-    // Monitoring timer and DPC
+    // Monitoring timer ID (created lazily in RtStartMonitoring)
     //
-    KeInitializeTimer(&throttler->MonitorTimer);
-    KeInitializeDpc(&throttler->MonitorDpc, RtpMonitorDpcRoutine, throttler);
+    throttler->MonitorTimerId = 0;
 
     //
     // Worker thread wake event
@@ -344,24 +345,31 @@ RtShutdown(
     ExWaitForRundownProtectionRelease(&throttler->RundownRef);
 
     //
-    // 3. Stop monitoring timer + DPC
+    // 3. Stop monitoring timer
     //
     throttler->MonitoringActive = FALSE;
-    KeCancelTimer(&throttler->MonitorTimer);
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && throttler->MonitorTimerId != 0) {
+            TmCancel(tmMgr, throttler->MonitorTimerId, TRUE);
+            throttler->MonitorTimerId = 0;
+        }
+    }
 
     //
-    // 4. Stop deferred work timer + DPC
+    // 4. Stop deferred work timer
     //
     throttler->DeferredWork.ProcessingEnabled = FALSE;
-    KeCancelTimer(&throttler->DeferredWork.ProcessTimer);
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && throttler->DeferredWork.ProcessTimerId != 0) {
+            TmCancel(tmMgr, throttler->DeferredWork.ProcessTimerId, TRUE);
+            throttler->DeferredWork.ProcessTimerId = 0;
+        }
+    }
 
     //
-    // 5. Flush all DPCs across all processors
-    //
-    KeFlushQueuedDpcs();
-
-    //
-    // 6. Signal worker thread to exit and wait
+    // 5. Signal worker thread to exit and wait
     //
     InterlockedExchange(&throttler->WorkerShouldExit, 1);
     KeSetEvent(&throttler->WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
@@ -379,17 +387,17 @@ RtShutdown(
     }
 
     //
-    // 7. Drain deferred work queue (free without executing)
+    // 6. Drain deferred work queue (free without executing)
     //
     RtpDrainDeferredWorkQueue(throttler);
 
     //
-    // 8. Free all dynamically allocated process quotas
+    // 7. Free all dynamically allocated process quotas
     //
     RtpDrainProcessQuotas(throttler);
 
     //
-    // 9. Invalidate and free
+    // 8. Invalidate and free
     //
     throttler->Magic = 0;
     throttler->Initialized = FALSE;
@@ -649,7 +657,8 @@ RtStartMonitoring(
     _In_ ULONG IntervalMs
 )
 {
-    LARGE_INTEGER dueTime;
+    PTM_MANAGER tmMgr;
+    NTSTATUS status;
 
     PAGED_CODE();
 
@@ -670,14 +679,32 @@ RtStartMonitoring(
 
     Throttler->MonitorIntervalMs = IntervalMs;
 
-    dueTime.QuadPart = -((LONGLONG)IntervalMs * 10000);
+    tmMgr = ShadowStrikeGetTimerManager();
+    if (tmMgr == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
 
-    KeSetTimerEx(
-        &Throttler->MonitorTimer,
-        dueTime,
-        IntervalMs,
-        &Throttler->MonitorDpc
-    );
+    //
+    // Create monitor timer via TimerManager
+    //
+    {
+        TM_TIMER_OPTIONS opts = { 0 };
+        opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+        opts.ToleranceMs = 2000;
+
+        status = TmCreatePeriodic(
+            tmMgr,
+            IntervalMs,
+            RtpMonitorTimerCallback,
+            Throttler,
+            &opts,
+            &Throttler->MonitorTimerId
+        );
+
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+    }
 
     Throttler->MonitoringActive = TRUE;
 
@@ -685,14 +712,25 @@ RtStartMonitoring(
     // Also start deferred work processing timer
     //
     if (!Throttler->DeferredWork.ProcessingEnabled) {
-        dueTime.QuadPart = -((LONGLONG)RT_DEFERRED_PROCESS_INTERVAL_MS * 10000);
+        TM_TIMER_OPTIONS opts2 = { 0 };
+        opts2.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+        opts2.ToleranceMs = 10;
 
-        KeSetTimerEx(
-            &Throttler->DeferredWork.ProcessTimer,
-            dueTime,
+        status = TmCreatePeriodic(
+            tmMgr,
             RT_DEFERRED_PROCESS_INTERVAL_MS,
-            &Throttler->DeferredWork.ProcessDpc
+            RtpDeferredWorkTimerCallback,
+            Throttler,
+            &opts2,
+            &Throttler->DeferredWork.ProcessTimerId
         );
+
+        if (!NT_SUCCESS(status)) {
+            TmCancel(tmMgr, Throttler->MonitorTimerId, TRUE);
+            Throttler->MonitorTimerId = 0;
+            Throttler->MonitoringActive = FALSE;
+            return status;
+        }
 
         Throttler->DeferredWork.ProcessingEnabled = TRUE;
     }
@@ -706,6 +744,8 @@ RtStopMonitoring(
     _In_ PRT_THROTTLER Throttler
 )
 {
+    PTM_MANAGER tmMgr;
+
     PAGED_CODE();
 
     if (!RtIsValidThrottler(Throttler)) {
@@ -718,8 +758,11 @@ RtStopMonitoring(
 
     Throttler->MonitoringActive = FALSE;
 
-    KeCancelTimer(&Throttler->MonitorTimer);
-    KeFlushQueuedDpcs();
+    tmMgr = ShadowStrikeGetTimerManager();
+    if (tmMgr && Throttler->MonitorTimerId != 0) {
+        TmCancel(tmMgr, Throttler->MonitorTimerId, TRUE);
+        Throttler->MonitorTimerId = 0;
+    }
 }
 
 // ============================================================================
@@ -1487,28 +1530,20 @@ RtpInitializeDeferredWork(
     KeInitializeSpinLock(&Throttler->DeferredWork.Lock);
     Throttler->DeferredWork.Depth = 0;
     Throttler->DeferredWork.MaxDepth = RT_MAX_DEFERRED_QUEUE_DEPTH;
+    Throttler->DeferredWork.ProcessTimerId = 0;
     Throttler->DeferredWork.ProcessingEnabled = FALSE;
-
-    KeInitializeTimer(&Throttler->DeferredWork.ProcessTimer);
-    KeInitializeDpc(&Throttler->DeferredWork.ProcessDpc,
-                    RtpDeferredWorkDpcRoutine, Throttler);
 }
 
-_Function_class_(KDEFERRED_ROUTINE)
 static VOID
-RtpMonitorDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+RtpMonitorTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
 )
 {
-    PRT_THROTTLER throttler = (PRT_THROTTLER)DeferredContext;
+    PRT_THROTTLER throttler = (PRT_THROTTLER)Context;
     ULONG i;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (throttler == NULL || !RtIsValidThrottler(throttler)) {
         return;
@@ -1527,20 +1562,15 @@ RtpMonitorDpcRoutine(
     ExReleaseRundownProtection(&throttler->RundownRef);
 }
 
-_Function_class_(KDEFERRED_ROUTINE)
 static VOID
-RtpDeferredWorkDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+RtpDeferredWorkTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
 )
 {
-    PRT_THROTTLER throttler = (PRT_THROTTLER)DeferredContext;
+    PRT_THROTTLER throttler = (PRT_THROTTLER)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (throttler == NULL || !RtIsValidThrottler(throttler)) {
         return;
