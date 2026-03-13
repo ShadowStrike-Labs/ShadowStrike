@@ -50,6 +50,8 @@
  */
 
 #include "LookasideLists.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -133,26 +135,16 @@
 // INTERNAL FORWARD DECLARATIONS
 // ============================================================================
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-LlpMaintenanceDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    );
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static VOID
-LlpCheckMemoryPressure(
-    _In_ PLL_MANAGER Manager
+LlpMaintenanceTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 _IRQL_requires_(PASSIVE_LEVEL)
 static VOID
-LlpPressureWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+LlpCheckMemoryPressure(
+    _In_ PLL_MANAGER Manager
     );
 
 // ============================================================================
@@ -276,15 +268,14 @@ _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 LlInitialize(
-    _Out_ PLL_MANAGER* Manager,
-    _In_ PDEVICE_OBJECT DeviceObject
+    _Out_ PLL_MANAGER* Manager
     )
 {
     PLL_MANAGER NewManager = NULL;
 
     PAGED_CODE();
 
-    if (Manager == NULL || DeviceObject == NULL) {
+    if (Manager == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -308,20 +299,7 @@ LlInitialize(
     InitializeListHead(&NewManager->LookasideListHead);
     ExInitializePushLock(&NewManager->LookasideListLock);
 
-    KeInitializeTimer(&NewManager->MaintenanceTimer);
-    KeInitializeDpc(&NewManager->MaintenanceDpc, LlpMaintenanceDpcRoutine, NewManager);
-
-    NewManager->DeviceObject = DeviceObject;
-    NewManager->PressureWorkItem = IoAllocateWorkItem(DeviceObject);
-    if (NewManager->PressureWorkItem == NULL) {
-#if DBG
-        DbgPrintEx(
-            DPFLTR_IHVDRIVER_ID,
-            DPFLTR_WARNING_LEVEL,
-            "[ShadowStrike] WARNING: IoAllocateWorkItem failed for pressure callbacks\n"
-        );
-#endif
-    }
+    NewManager->MaintenanceTimerId = 0;
 
     KeQuerySystemTimePrecise(&NewManager->GlobalStats.StartTime);
     NewManager->GlobalStats.LastResetTime = NewManager->GlobalStats.StartTime;
@@ -376,36 +354,21 @@ LlShutdown(
     ExWaitForRundownProtectionRelease(&Manager->RundownRef);
 
     //
-    // Step 2: Cancel maintenance timer, flush DPCs
+    // Step 2: Cancel maintenance timer via TimerManager
     //
     if (Manager->MaintenanceEnabled) {
-        KeCancelTimer(&Manager->MaintenanceTimer);
-        KeFlushQueuedDpcs();
+        if (Manager->MaintenanceTimerId != 0) {
+            PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+            if (tmMgr) {
+                TmCancel(tmMgr, Manager->MaintenanceTimerId, TRUE);
+            }
+            Manager->MaintenanceTimerId = 0;
+        }
         Manager->MaintenanceEnabled = FALSE;
     }
 
     //
-    // Step 3: Wait for any pending pressure work item to complete.
-    // We spin until PressureWorkPending is 0 — the work item
-    // clears this AFTER completing the callback.
-    //
-    if (Manager->PressureWorkItem != NULL) {
-        LARGE_INTEGER SpinWait;
-        SpinWait.QuadPart = -10000LL; // 1ms
-        ULONG DrainIter = 0;
-
-        while (InterlockedCompareExchange(&Manager->PressureWorkPending, 0, 0) != 0 &&
-               DrainIter < LL_REFCOUNT_DRAIN_MAX_ITERATIONS) {
-            KeDelayExecutionThread(KernelMode, FALSE, &SpinWait);
-            DrainIter++;
-        }
-
-        IoFreeWorkItem(Manager->PressureWorkItem);
-        Manager->PressureWorkItem = NULL;
-    }
-
-    //
-    // Step 4: Collect all lookasides under lock
+    // Step 3: Collect all lookasides under lock
     //
     InitializeListHead(&TempList);
 
@@ -1519,8 +1482,6 @@ LlEnableMaintenance(
     _In_ ULONG IntervalMs
     )
 {
-    LARGE_INTEGER DueTime;
-
     PAGED_CODE();
 
     if (!LlManagerIsValid(Manager)) {
@@ -1535,17 +1496,17 @@ LlEnableMaintenance(
         IntervalMs = 100;
     }
 
-    Manager->MaintenanceIntervalMs = IntervalMs;
     Manager->MaintenanceEnabled = TRUE;
 
-    DueTime.QuadPart = -((LONGLONG)IntervalMs * 10000);
-
-    KeSetTimerEx(
-        &Manager->MaintenanceTimer,
-        DueTime,
-        IntervalMs,
-        &Manager->MaintenanceDpc
-    );
+    if (Manager->MaintenanceTimerId == 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 500;
+            TmCreatePeriodic(tmMgr, IntervalMs, LlpMaintenanceTimerCallback, Manager, &opts, &Manager->MaintenanceTimerId);
+        }
+    }
 
     ExReleaseRundownProtection(&Manager->RundownRef);
     return STATUS_SUCCESS;
@@ -1568,8 +1529,13 @@ LlDisableMaintenance(
     }
 
     if (Manager->MaintenanceEnabled) {
-        KeCancelTimer(&Manager->MaintenanceTimer);
-        KeFlushQueuedDpcs();
+        if (Manager->MaintenanceTimerId != 0) {
+            PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+            if (tmMgr) {
+                TmCancel(tmMgr, Manager->MaintenanceTimerId, TRUE);
+            }
+            Manager->MaintenanceTimerId = 0;
+        }
         Manager->MaintenanceEnabled = FALSE;
     }
 
@@ -1910,41 +1876,9 @@ LlDumpDiagnostics(
 }
 
 // ============================================================================
-// INTERNAL: MAINTENANCE DPC ROUTINE
-// ============================================================================
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static VOID
-LlpMaintenanceDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    )
-{
-    PLL_MANAGER Manager = (PLL_MANAGER)DeferredContext;
-
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    if (Manager == NULL) {
-        return;
-    }
-
-    if ((LL_STATE)InterlockedCompareExchange(
-            (volatile LONG*)&Manager->State, 0, 0) != LlStateActive) {
-        return;
-    }
-
-    LlpCheckMemoryPressure(Manager);
-}
-
-// ============================================================================
 // INTERNAL: MEMORY PRESSURE CHECK
 // ============================================================================
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 LlpCheckMemoryPressure(
     _In_ PLL_MANAGER Manager
@@ -1997,68 +1931,43 @@ LlpCheckMemoryPressure(
         InterlockedExchange((volatile LONG*)&Manager->PressureLevel, (LONG)NewPressure);
         InterlockedIncrement64(&Manager->GlobalStats.MemoryPressureEvents);
 
-        if (Manager->PressureCallback != NULL && Manager->PressureWorkItem != NULL) {
-            InterlockedExchange((volatile LONG*)&Manager->PendingPressureLevel, (LONG)NewPressure);
-            InterlockedExchange64(&Manager->PendingCurrentMemory, CurrentUsage);
-            InterlockedExchange64(&Manager->PendingMemoryLimit, Limit);
-
-            if (InterlockedCompareExchange(&Manager->PressureWorkPending, 1, 0) == 0) {
-                IoQueueWorkItem(
-                    Manager->PressureWorkItem,
-                    LlpPressureWorkItemRoutine,
-                    DelayedWorkQueue,
-                    Manager
-                );
-            }
+        //
+        // Invoke pressure callback directly — callers are already at PASSIVE_LEVEL
+        // (TimerManager uses TmFlag_WorkItemCallback; LlSetMemoryLimit is PASSIVE).
+        //
+        if (Manager->PressureCallback != NULL && LlManagerIsValid(Manager)) {
+            Manager->PressureCallback(
+                NewPressure,
+                CurrentUsage,
+                Limit,
+                Manager->PressureCallbackContext
+            );
         }
     }
 }
 
 // ============================================================================
-// INTERNAL: PRESSURE WORK ITEM ROUTINE
+// INTERNAL: MAINTENANCE TIMER CALLBACK (TimerManager, PASSIVE_LEVEL)
 // ============================================================================
 
-_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
-LlpPressureWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
+LlpMaintenanceTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     )
 {
     PLL_MANAGER Manager = (PLL_MANAGER)Context;
-    LL_MEMORY_PRESSURE PressureLevel;
-    LONG64 CurrentMemory;
-    LONG64 MemoryLimit;
 
-    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (Manager == NULL) {
         return;
     }
 
-    PressureLevel = (LL_MEMORY_PRESSURE)InterlockedCompareExchange(
-        (volatile LONG*)&Manager->PendingPressureLevel, 0, 0
-    );
-    CurrentMemory = InterlockedCompareExchange64(&Manager->PendingCurrentMemory, 0, 0);
-    MemoryLimit = InterlockedCompareExchange64(&Manager->PendingMemoryLimit, 0, 0);
-
-    //
-    // Invoke callback BEFORE clearing the pending flag.
-    // This prevents the race where a new work item is queued
-    // while this one is still running, which could cause
-    // IoQueueWorkItem on an already-queued item.
-    //
-    if (Manager->PressureCallback != NULL && LlManagerIsValid(Manager)) {
-        Manager->PressureCallback(
-            PressureLevel,
-            CurrentMemory,
-            MemoryLimit,
-            Manager->PressureCallbackContext
-        );
+    if ((LL_STATE)InterlockedCompareExchange(
+            (volatile LONG*)&Manager->State, 0, 0) != LlStateActive) {
+        return;
     }
 
-    //
-    // Clear pending AFTER callback completes — shutdown drains this flag
-    //
-    InterlockedExchange(&Manager->PressureWorkPending, 0);
+    LlpCheckMemoryPressure(Manager);
 }

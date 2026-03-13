@@ -99,6 +99,8 @@ REVISION HISTORY:
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Sync/TimerManager.h"
+#include "../../Core/DriverEntry.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -493,14 +495,9 @@ typedef struct _PAS_GLOBAL_STATE {
     PAS_CONFIGURATION Config;
 
     //
-    // Cleanup timer and work item
+    // Cleanup timer (managed by TimerManager)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    WORK_QUEUE_ITEM CleanupWorkItem;
-    volatile BOOLEAN CleanupWorkItemQueued;
-    volatile BOOLEAN CleanupTimerActive;
-    KEVENT CleanupWorkDoneEvent;
+    ULONG CleanupTimerId;
 
     //
     // Shutdown synchronization
@@ -640,16 +637,9 @@ PaspUpdateProcessMetrics(
     );
 
 static VOID
-PaspCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    );
-
-static VOID
-PaspCleanupWorkRoutine(
-    _In_ PVOID Parameter
+PaspCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static VOID
@@ -984,7 +974,6 @@ PaspInitialize(
     VOID
     )
 {
-    LARGE_INTEGER DueTime;
     ULONG i;
     LONG PreviousState;
 
@@ -1112,38 +1101,28 @@ PaspInitialize(
     KeQuerySystemTime(&g_PasState.Stats.StartTime);
 
     //
-    // Initialize cleanup work item (runs at PASSIVE_LEVEL)
-    // Note: ExInitializeWorkItem/ExQueueWorkItem are deprecated but are the
-    // correct API for minifilter drivers without a device object. Suppress C4996.
+    // Initialize cleanup timer via TimerManager (runs at PASSIVE_LEVEL)
     //
-#pragma warning(push)
-#pragma warning(disable: 4996)
-    ExInitializeWorkItem(
-        &g_PasState.CleanupWorkItem,
-        PaspCleanupWorkRoutine,
-        NULL
-        );
-#pragma warning(pop)
-    InterlockedExchange((PLONG)&g_PasState.CleanupWorkItemQueued, FALSE);
-    KeInitializeEvent(&g_PasState.CleanupWorkDoneEvent, NotificationEvent, TRUE);
-
-    //
-    // Initialize cleanup timer and DPC
-    //
-    KeInitializeTimer(&g_PasState.CleanupTimer);
-    KeInitializeDpc(&g_PasState.CleanupDpc, PaspCleanupTimerDpc, NULL);
-
-    //
-    // Start cleanup timer
-    //
-    DueTime.QuadPart = -((LONGLONG)PAS_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &g_PasState.CleanupTimer,
-        DueTime,
-        PAS_CLEANUP_INTERVAL_MS,
-        &g_PasState.CleanupDpc
-        );
-    InterlockedExchange((PLONG)&g_PasState.CleanupTimerActive, TRUE);
+    g_PasState.CleanupTimerId = 0;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 10000;
+            NTSTATUS tmStatus = TmCreatePeriodic(
+                tmMgr,
+                PAS_CLEANUP_INTERVAL_MS,
+                PaspCleanupTimerCallback,
+                NULL,
+                &opts,
+                &g_PasState.CleanupTimerId
+                );
+            if (!NT_SUCCESS(tmStatus)) {
+                g_PasState.CleanupTimerId = 0;
+            }
+        }
+    }
 
     //
     // Mark as initialized (with memory barrier)
@@ -1199,32 +1178,14 @@ PaspShutdown(
     KeSetEvent(&g_PasState.ShutdownEvent, 0, FALSE);
 
     //
-    // Cancel cleanup timer and wait for DPC completion
+    // Cancel cleanup timer via TimerManager (waits for callback completion)
     //
-    if (g_PasState.CleanupTimerActive) {
-        if (!KeCancelTimer(&g_PasState.CleanupTimer)) {
-            //
-            // Timer already fired - DPC may be running or work item queued
-            // Wait for DPC completion
-            //
-            KeFlushQueuedDpcs();
+    if (g_PasState.CleanupTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, g_PasState.CleanupTimerId, TRUE);
         }
-        InterlockedExchange((PLONG)&g_PasState.CleanupTimerActive, FALSE);
-    }
-
-    //
-    // Wait for any queued work item to complete using completion event
-    //
-    if (g_PasState.CleanupWorkItemQueued) {
-        LARGE_INTEGER Timeout;
-        Timeout.QuadPart = -50000000LL;  // 5 seconds max safety timeout
-        KeWaitForSingleObject(
-            &g_PasState.CleanupWorkDoneEvent,
-            Executive,
-            KernelMode,
-            FALSE,
-            &Timeout
-            );
+        g_PasState.CleanupTimerId = 0;
     }
 
     //
@@ -2646,35 +2607,24 @@ PaspDetectReflectiveLoading(
 
 /*++
 Routine Description:
-    DPC routine for cleanup timer.
-    Queues a work item instead of directly calling cleanup (IRQL safety).
+    TimerManager callback for periodic cleanup.
+    Runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback, so push locks are safe.
 
 Arguments:
-    Dpc - DPC object.
-    DeferredContext - Not used.
-    SystemArgument1 - Not used.
-    SystemArgument2 - Not used.
+    TimerId - Timer identifier (unused).
+    Context - Not used.
 
 IRQL:
-    DISPATCH_LEVEL
-
-Note:
-    Push locks require IRQL < DISPATCH_LEVEL, so we cannot call
-    PaspCleanupStaleRecords directly from this DPC. Instead, we
-    queue a work item that runs at PASSIVE_LEVEL.
+    PASSIVE_LEVEL (guaranteed by TmFlag_WorkItemCallback)
 --*/
 static VOID
-PaspCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+PaspCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(DeferredContext);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
+    UNREFERENCED_PARAMETER(Context);
 
     //
     // Check shutdown flag
@@ -2684,59 +2634,9 @@ PaspCleanupTimerDpc(
     }
 
     //
-    // Queue work item if not already queued
-    // Work items run at PASSIVE_LEVEL where push locks are safe
-    //
-    if (!InterlockedCompareExchange((PLONG)&g_PasState.CleanupWorkItemQueued, TRUE, FALSE)) {
-#pragma warning(push)
-#pragma warning(disable: 4996)
-        ExQueueWorkItem(&g_PasState.CleanupWorkItem, DelayedWorkQueue);
-#pragma warning(pop)
-    }
-}
-
-
-/*++
-Routine Description:
-    Work routine for cleanup (runs at PASSIVE_LEVEL).
-
-Arguments:
-    Parameter - Not used.
-
-IRQL:
-    PASSIVE_LEVEL
---*/
-static VOID
-PaspCleanupWorkRoutine(
-    _In_ PVOID Parameter
-    )
-{
-    UNREFERENCED_PARAMETER(Parameter);
-
-    //
-    // Reset the completion event (unsignaled while working)
-    //
-    KeClearEvent(&g_PasState.CleanupWorkDoneEvent);
-
-    //
-    // Check shutdown flag
-    //
-    if (InterlockedCompareExchange(&g_PasState.ShutdownRequested, 0, 0)) {
-        goto Done;
-    }
-
-    //
     // Perform cleanup at PASSIVE_LEVEL
     //
     PaspCleanupStaleRecords();
-
-Done:
-    //
-    // Mark as no longer queued AFTER work completes
-    // (prevents DPC from re-queuing same WORK_QUEUE_ITEM while executing)
-    //
-    InterlockedExchange((PLONG)&g_PasState.CleanupWorkItemQueued, FALSE);
-    KeSetEvent(&g_PasState.CleanupWorkDoneEvent, 0, FALSE);
 }
 
 

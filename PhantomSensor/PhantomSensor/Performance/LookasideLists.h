@@ -57,8 +57,7 @@
 extern "C" {
 #endif
 
-#include <ntddk.h>
-#include <wdm.h>
+#include <fltKernel.h>
 
 // ============================================================================
 // POOL TAGS
@@ -67,7 +66,6 @@ extern "C" {
 #define LL_POOL_TAG                     'SSLL'
 #define LL_ENTRY_TAG                    'ELSS'
 #define LL_META_TAG                     'MLSS'
-#define LL_WORKITEM_TAG                 'WLSS'
 
 // ============================================================================
 // CONSTANTS
@@ -255,19 +253,8 @@ typedef struct _LL_MANAGER {
     LL_PRESSURE_CALLBACK PressureCallback;
     PVOID PressureCallbackContext;
 
-    KTIMER MaintenanceTimer;
-    KDPC MaintenanceDpc;
-    ULONG MaintenanceIntervalMs;
+    ULONG MaintenanceTimerId;
     BOOLEAN MaintenanceEnabled;
-
-    /// Work item for deferred pressure callback
-    PIO_WORKITEM PressureWorkItem;
-    PDEVICE_OBJECT DeviceObject;
-
-    volatile LL_MEMORY_PRESSURE PendingPressureLevel;
-    volatile LONG64 PendingCurrentMemory;
-    volatile LONG64 PendingMemoryLimit;
-    volatile LONG PressureWorkPending;
 
     BOOLEAN SelfTuningEnabled;
     BOOLEAN DebugMode;
@@ -282,7 +269,6 @@ typedef struct _LL_MANAGER {
  * @brief Initialize the lookaside list manager.
  *
  * @param Manager       Receives pointer to initialized manager
- * @param DeviceObject  Device object for work item operations
  *
  * @return STATUS_SUCCESS on success
  *
@@ -294,8 +280,7 @@ _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 LlInitialize(
-    _Out_ PLL_MANAGER* Manager,
-    _In_ PDEVICE_OBJECT DeviceObject
+    _Out_ PLL_MANAGER* Manager
     );
 
 /**

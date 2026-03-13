@@ -632,8 +632,7 @@ DriverEntry(
     // Step 5.10: Centralized lookaside list manager (memory pressure awareness)
     //
     {
-        PDEVICE_OBJECT deviceObject = DriverObject->DeviceObject;
-        status = LlInitialize(&g_LookasideManager, deviceObject);
+        status = LlInitialize(&g_LookasideManager);
         if (!NT_SUCCESS(status)) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                        "[ShadowStrike] WARNING: Failed to initialize centralized lookaside manager: 0x%08X (continuing)\n",
