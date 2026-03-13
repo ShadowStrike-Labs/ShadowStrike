@@ -40,6 +40,8 @@
 --*/
 
 #include "BatchProcessing.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 // ============================================================================
 // CONSTANTS
@@ -103,11 +105,9 @@ struct _BP_PROCESSOR {
     KEVENT NewBatchEvent;
 
     //
-    // Age timer fires DPC → moves aged batch to ready queue
+    // Age timer — managed by TimerManager
     //
-    KTIMER AgeTimer;
-    KDPC AgeDpc;
-    volatile LONG AgeTimerArmed;
+    ULONG AgeTimerId;
 
     //
     // Callback
@@ -173,13 +173,10 @@ BppArmAgeTimer(
     _In_ PBP_PROCESSOR Processor
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-BppAgeDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+BppAgeTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 //
@@ -287,8 +284,7 @@ BpInitialize(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    KeInitializeTimer(&proc->AgeTimer);
-    KeInitializeDpc(&proc->AgeDpc, BppAgeDpcRoutine, proc);
+    proc->AgeTimerId = TM_INVALID_TIMER_ID;
     KeQuerySystemTime(&proc->Stats.StartTime);
 
     InterlockedExchange(&proc->Initialized, TRUE);
@@ -332,12 +328,15 @@ BpShutdown(
     ExWaitForRundownProtectionRelease(&Processor->RundownRef);
 
     //
-    // Cancel age timer and flush any pending DPCs to ensure BppAgeDpcRoutine
-    // has fully returned. The DPC checks Initialized/Running so it will
-    // bail out, but we must wait for it to finish accessing the Processor.
+    // Cancel age timer via TimerManager and wait for any in-flight callback.
     //
-    KeCancelTimer(&Processor->AgeTimer);
-    KeFlushQueuedDpcs();
+    if (Processor->AgeTimerId != TM_INVALID_TIMER_ID) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Processor->AgeTimerId, TRUE);
+        }
+        Processor->AgeTimerId = TM_INVALID_TIMER_ID;
+    }
 
     //
     // Free current batch (with events — they were not delivered)
@@ -400,7 +399,7 @@ BpSetBatchParameters(
 
     //
     // Use Interlocked to guarantee atomic 32-bit writes visible to
-    // BpQueueEvent and the DPC which read these at DISPATCH_LEVEL.
+    // BpQueueEvent and the timer callback which read these at DISPATCH_LEVEL.
     //
     InterlockedExchange(&Processor->MaxBatchSize, (LONG)MaxSize);
     InterlockedExchange(&Processor->MaxBatchAgeMs, (LONG)MaxAgeMs);
@@ -636,7 +635,7 @@ BpStart(
 
     //
     // Set Running=TRUE BEFORE creating the thread. This way the thread
-    // (and the DPC, and BpStop) see a consistent state from the moment
+    // (and the timer callback, and BpStop) see a consistent state from the moment
     // they start. If thread creation fails, we revert.
     //
     InterlockedExchange(&Processor->Running, TRUE);
@@ -721,12 +720,15 @@ BpStop(
     }
 
     //
-    // Cancel age timer first. KeFlushQueuedDpcs ensures the DPC has
-    // finished executing and won't touch Processor after this point.
+    // Cancel age timer via TimerManager and wait for any in-flight callback.
     //
-    KeCancelTimer(&Processor->AgeTimer);
-    KeFlushQueuedDpcs();
-    InterlockedExchange(&Processor->AgeTimerArmed, FALSE);
+    if (Processor->AgeTimerId != TM_INVALID_TIMER_ID) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Processor->AgeTimerId, TRUE);
+        }
+        Processor->AgeTimerId = TM_INVALID_TIMER_ID;
+    }
 
     //
     // Flush the current batch so no events are silently lost.
@@ -1019,7 +1021,7 @@ BppDrainReadyQueue(
 
     //
     // Replenish spare batch if consumed. We must acquire BatchLock because
-    // SpareBatch is also accessed by BpQueueEvent and the DPC.
+    // SpareBatch is also accessed by BpQueueEvent and the timer callback.
     //
     if (Processor->SpareBatch == NULL && Processor->LookasideInitialized) {
         KIRQL spareIrql;
@@ -1104,42 +1106,35 @@ BppArmAgeTimer(
     _In_ PBP_PROCESSOR Processor
     )
 {
-    LARGE_INTEGER dueTime;
     LONG ageMs;
+    PTM_MANAGER tmMgr;
 
     ageMs = Processor->MaxBatchAgeMs;
     if (ageMs == 0) {
         return;
     }
 
-    dueTime.QuadPart = -((LONGLONG)ageMs * 10000);
-
-    KeSetTimerEx(
-        &Processor->AgeTimer,
-        dueTime,
-        (LONG)ageMs,
-        &Processor->AgeDpc
-    );
-
-    InterlockedExchange(&Processor->AgeTimerArmed, TRUE);
+    tmMgr = ShadowStrikeGetTimerManager();
+    if (tmMgr) {
+        TM_TIMER_OPTIONS opts = { 0 };
+        opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+        opts.ToleranceMs = 500;
+        TmCreatePeriodic(tmMgr, (ULONG)ageMs, BppAgeTimerCallback,
+                         Processor, &opts, &Processor->AgeTimerId);
+    }
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-BppAgeDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+BppAgeTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PBP_PROCESSOR proc = (PBP_PROCESSOR)DeferredContext;
+    PBP_PROCESSOR proc = (PBP_PROCESSOR)Context;
     KIRQL oldIrql;
     PBP_BATCH agedBatch = NULL;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (proc == NULL || !proc->Initialized || !proc->Running) {
         return;
