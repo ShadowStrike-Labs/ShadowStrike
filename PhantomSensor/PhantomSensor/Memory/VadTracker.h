@@ -315,11 +315,9 @@ typedef struct _VAD_TRACKER {
     KEVENT ChangeAvailableEvent;
     
     //
-    // Snapshot timer
+    // Snapshot timer (managed by TimerManager)
     //
-    KTIMER SnapshotTimer;
-    KDPC SnapshotDpc;
-    volatile LONG SnapshotTimerActive;
+    ULONG SnapshotTimerId;
     
     //
     // Statistics

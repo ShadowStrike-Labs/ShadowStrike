@@ -57,6 +57,8 @@
 #pragma warning(disable: 4324)  /* fltKernel.h: structure padded due to alignment */
 #include "DataExfiltration.h"
 #include "../Core/Globals.h"
+#include "../Core/DriverEntry.h"
+#include "../Sync/TimerManager.h"
 #include "../Communication/ScanBridge.h"
 #include "../Utilities/ProcessUtils.h"
 #include "../Behavioral/BehaviorEngine.h"
@@ -295,10 +297,9 @@ struct _DX_DETECTOR {
     BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup timer + dedicated system thread (replaces ExQueueWorkItem)
+    // Cleanup timer (TimerManager) + dedicated system thread
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
+    ULONG CleanupTimerId;
     PKTHREAD CleanupThread;
     KEVENT CleanupWakeEvent;
     volatile LONG CleanupTerminate;
@@ -400,13 +401,10 @@ DxpShouldBlock(
     _In_ PDX_TRANSFER_CONTEXT Transfer
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-DxpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+DxpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static VOID
@@ -497,7 +495,6 @@ DxInitialize(
 {
     NTSTATUS status = STATUS_SUCCESS;
     PDX_DETECTOR detector = NULL;
-    LARGE_INTEGER dueTime;
     ULONG i;
 
     PAGED_CODE();
@@ -650,16 +647,17 @@ DxInitialize(
         ZwClose(threadHandle);
     }
 
-    KeInitializeTimer(&detector->CleanupTimer);
-    KeInitializeDpc(&detector->CleanupDpc, DxpCleanupTimerDpc, detector);
-
-    dueTime.QuadPart = -((LONGLONG)DX_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &detector->CleanupTimer,
-        dueTime,
-        DX_CLEANUP_INTERVAL_MS,
-        &detector->CleanupDpc
-    );
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 10000;
+            TmCreatePeriodic(tmMgr, DX_CLEANUP_INTERVAL_MS,
+                             DxpCleanupTimerCallback, detector,
+                             &opts, &detector->CleanupTimerId);
+        }
+    }
 
     InterlockedExchange(&detector->Initialized, TRUE);
     *Detector = detector;
@@ -697,10 +695,14 @@ DxShutdown(
     ExWaitForRundownProtectionRelease(&Detector->RundownRef);
 
     //
-    // Cancel cleanup timer and wait for any pending DPCs
+    // Cancel cleanup timer via TimerManager
     //
-    KeCancelTimer(&Detector->CleanupTimer);
-    KeFlushQueuedDpcs();
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && Detector->CleanupTimerId != 0) {
+            TmCancel(tmMgr, Detector->CleanupTimerId, TRUE);
+        }
+    }
 
     //
     // Terminate cleanup thread: signal terminate flag, wake the thread,
@@ -2503,29 +2505,24 @@ DxpClassifyExfiltration(
 }
 
 // ============================================================================
-// CLEANUP TIMER — DPC signals system thread for passive-level cleanup
+// CLEANUP TIMER — TimerManager callback signals system thread
 // ============================================================================
 
 /**
- * @brief DPC callback — signals the cleanup thread's wake event.
+ * @brief TimerManager periodic callback — signals the cleanup thread's wake event.
  *
- * We cannot acquire push locks at DISPATCH_LEVEL, so the DPC simply
- * signals a KEVENT that wakes the dedicated cleanup thread.
+ * Runs at PASSIVE_LEVEL (TmFlag_WorkItemCallback). Signals a KEVENT that
+ * wakes the dedicated cleanup thread to perform the actual work.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-DxpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+DxpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PDX_DETECTOR detector = (PDX_DETECTOR)DeferredContext;
+    PDX_DETECTOR detector = (PDX_DETECTOR)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (detector == NULL || detector->ShuttingDown) {
         return;

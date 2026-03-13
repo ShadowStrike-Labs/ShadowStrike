@@ -60,6 +60,8 @@ MITRE ATT&CK Coverage:
 #include "VadTracker.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/ProcessUtils.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -316,14 +318,12 @@ VadpFreeChangeEvent(
     );
 
 //
-// Snapshot and comparison
+// Snapshot timer callback (invoked by TimerManager)
 //
 static VOID
-VadpSnapshotTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+VadpSnapshotTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static VOID
@@ -380,7 +380,6 @@ Return Value:
 {
     NTSTATUS Status;
     PVAD_TRACKER_INTERNAL Internal = NULL;
-    LARGE_INTEGER DueTime;
     HANDLE ThreadHandle = NULL;
     OBJECT_ATTRIBUTES ObjectAttributes;
     ULONG i;
@@ -543,22 +542,24 @@ Return Value:
     }
 
     //
-    // Initialize snapshot timer
+    // Create periodic snapshot timer via TimerManager
     //
-    KeInitializeTimer(&Internal->Public.SnapshotTimer);
-    KeInitializeDpc(&Internal->Public.SnapshotDpc, VadpSnapshotTimerDpc, Internal);
-
-    //
-    // Start snapshot timer
-    //
-    DueTime.QuadPart = -((LONGLONG)Internal->Public.Config.SnapshotIntervalMs * 10000);
-    KeSetTimerEx(
-        &Internal->Public.SnapshotTimer,
-        DueTime,
-        Internal->Public.Config.SnapshotIntervalMs,
-        &Internal->Public.SnapshotDpc
-        );
-    InterlockedExchange(&Internal->Public.SnapshotTimerActive, 1);
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 1000;
+            TmCreatePeriodic(
+                tmMgr,
+                Internal->Public.Config.SnapshotIntervalMs,
+                VadpSnapshotTimerCallback,
+                Internal,
+                &opts,
+                &Internal->Public.SnapshotTimerId
+                );
+        }
+    }
 
     //
     // Initialize ref count and mark initialized (interlocked)
@@ -618,15 +619,14 @@ Arguments:
     InterlockedExchange(&Internal->ShutdownRequested, 1);
 
     //
-    // Cancel snapshot timer
+    // Cancel snapshot timer via TimerManager
     //
-    if (InterlockedExchange(&Internal->Public.SnapshotTimerActive, 0) != 0) {
-        KeCancelTimer(&Internal->Public.SnapshotTimer);
-        //
-        // V-4 fix: DPC may be queued or executing on another processor.
-        // KeFlushQueuedDpcs ensures it completes before we free the tracker.
-        //
-        KeFlushQueuedDpcs();
+    if (Internal->Public.SnapshotTimerId != TM_INVALID_TIMER_ID) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Internal->Public.SnapshotTimerId, TRUE);
+        }
+        Internal->Public.SnapshotTimerId = TM_INVALID_TIMER_ID;
     }
 
     //
@@ -2262,18 +2262,14 @@ VadpFreeChangeEvent(
 }
 
 static VOID
-VadpSnapshotTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+VadpSnapshotTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PVAD_TRACKER_INTERNAL Tracker = (PVAD_TRACKER_INTERNAL)DeferredContext;
+    PVAD_TRACKER_INTERNAL Tracker = (PVAD_TRACKER_INTERNAL)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (Tracker == NULL ||
         InterlockedCompareExchange(&Tracker->ShutdownRequested, 0, 0) != 0) {

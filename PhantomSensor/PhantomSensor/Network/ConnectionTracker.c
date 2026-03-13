@@ -53,6 +53,8 @@
 #include "ConnectionTracker.h"
 #pragma warning(pop)
 #include "../Core/Globals.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 #include "../Communication/ScanBridge.h"
 #include "../Utilities/ProcessUtils.h"
 #include "../Exclusions/ExclusionManager.h"
@@ -124,9 +126,8 @@ typedef struct _CT_TRACKER_INTERNAL {
     BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup infrastructure — system thread woken by DPC
+    // Cleanup infrastructure — system thread woken by TimerManager callback
     //
-    volatile BOOLEAN CleanupTimerActive;
     volatile BOOLEAN ShuttingDown;
     volatile BOOLEAN CleanupTerminate;
     KEVENT CleanupWakeEvent;
@@ -209,13 +210,10 @@ CtpFreeConnection(
     _In_ PCT_CONNECTION Connection
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-CtpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+CtpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static VOID
@@ -261,8 +259,6 @@ CtInitialize(
     NTSTATUS status = STATUS_SUCCESS;
     PCT_TRACKER_INTERNAL tracker = NULL;
     ULONG i;
-    LARGE_INTEGER dueTime;
-
     PAGED_CODE();
 
     if (Tracker == NULL) {
@@ -383,12 +379,11 @@ CtInitialize(
     tracker->LookasideInitialized = TRUE;
 
     //
-    // Initialize cleanup timer and system thread.
-    // The DPC signals a KEVENT; the thread runs cleanup at PASSIVE_LEVEL.
+    // Initialize cleanup timer (via TimerManager) and system thread.
+    // The timer callback signals a KEVENT; the thread runs cleanup at PASSIVE_LEVEL.
     //
-    KeInitializeTimer(&tracker->Public.CleanupTimer);
-    KeInitializeDpc(&tracker->Public.CleanupDpc, CtpCleanupTimerDpc, tracker);
     tracker->Public.CleanupIntervalMs = CT_CONNECTION_TIMEOUT_MS / 2;
+    tracker->Public.CleanupTimerId = 0;
     KeInitializeEvent(&tracker->CleanupWakeEvent, SynchronizationEvent, FALSE);
     tracker->CleanupTerminate = FALSE;
     tracker->CleanupThread = NULL;
@@ -443,16 +438,24 @@ CtInitialize(
     KeQuerySystemTime(&tracker->Public.Stats.StartTime);
 
     //
-    // Start cleanup timer
+    // Start cleanup timer via TimerManager
     //
-    dueTime.QuadPart = -((LONGLONG)tracker->Public.CleanupIntervalMs * 10000);
-    KeSetTimerEx(
-        &tracker->Public.CleanupTimer,
-        dueTime,
-        tracker->Public.CleanupIntervalMs,
-        &tracker->Public.CleanupDpc
-    );
-    tracker->CleanupTimerActive = TRUE;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 15000;
+            TmCreatePeriodic(
+                tmMgr,
+                tracker->Public.CleanupIntervalMs,
+                CtpCleanupTimerCallback,
+                tracker,
+                &opts,
+                &tracker->Public.CleanupTimerId
+            );
+        }
+    }
 
     tracker->Public.Initialized = TRUE;
     *Tracker = &tracker->Public;
@@ -505,13 +508,15 @@ CtShutdown(
     MemoryBarrier();
 
     //
-    // Cancel cleanup timer and flush pending DPCs
+    // Cancel cleanup timer via TimerManager
     //
-    if (tracker->CleanupTimerActive) {
-        KeCancelTimer(&Tracker->CleanupTimer);
-        tracker->CleanupTimerActive = FALSE;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && tracker->Public.CleanupTimerId != 0) {
+            TmCancel(tmMgr, tracker->Public.CleanupTimerId, TRUE);
+            tracker->Public.CleanupTimerId = 0;
+        }
     }
-    KeFlushQueuedDpcs();
 
     //
     // Wake and wait for the cleanup thread to exit
@@ -2147,23 +2152,18 @@ CtpFreeConnection(
 }
 
 // ============================================================================
-// CLEANUP TIMER AND WORK ITEM
+// CLEANUP TIMER CALLBACK (via TimerManager — runs at PASSIVE_LEVEL)
 // ============================================================================
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-CtpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+CtpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PCT_TRACKER_INTERNAL tracker = (PCT_TRACKER_INTERNAL)DeferredContext;
+    PCT_TRACKER_INTERNAL tracker = (PCT_TRACKER_INTERNAL)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (tracker == NULL || tracker->ShuttingDown) {
         return;

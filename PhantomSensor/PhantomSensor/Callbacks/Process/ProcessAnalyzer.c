@@ -47,6 +47,8 @@ Security Hardening Applied:
 #include "HandleTracker.h"
 #include "PrivilegeMonitor.h"
 #include "EnvironmentMonitor.h"
+#include "../../Sync/TimerManager.h"
+#include "../../Core/DriverEntry.h"
 #include <ntstrsafe.h>
 
 //
@@ -341,11 +343,9 @@ typedef struct _PA_ANALYZER_INTERNAL {
     ULONG ParentChildRuleCount;
 
     //
-    // Cleanup timer
+    // Cleanup timer (managed by TimerManager)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    BOOLEAN CleanupTimerActive;
+    ULONG CleanupTimerId;
 
     //
     // Worker thread for async operations
@@ -415,7 +415,7 @@ static VOID PapInitializeParentChildRules(_Inout_ PPA_ANALYZER_INTERNAL Analyzer
 //
 // Timer and worker
 //
-static KDEFERRED_ROUTINE PapCleanupTimerDpc;
+static VOID PapCleanupTimerCallback(_In_ ULONG TimerId, _In_opt_ PVOID Context);
 static KSTART_ROUTINE PapWorkerThread;
 
 //
@@ -484,7 +484,6 @@ PaInitialize(
     PPA_ANALYZER_INTERNAL Internal = NULL;
     OBJECT_ATTRIBUTES ObjectAttributes;
     HANDLE ThreadHandle = NULL;
-    LARGE_INTEGER DueTime;
     ULONG i;
 
     PAGED_CODE();
@@ -614,22 +613,19 @@ PaInitialize(
     Internal->WorkerActive = TRUE;
 
     //
-    // Initialize cleanup timer
+    // Create cleanup timer via TimerManager
     //
-    KeInitializeTimer(&Internal->CleanupTimer);
-    KeInitializeDpc(&Internal->CleanupDpc, PapCleanupTimerDpc, Internal);
-
-    //
-    // Start cleanup timer
-    //
-    DueTime.QuadPart = -((LONGLONG)PA_CLEANUP_TIMER_PERIOD_MS * 10000);
-    KeSetTimerEx(
-        &Internal->CleanupTimer,
-        DueTime,
-        PA_CLEANUP_TIMER_PERIOD_MS,
-        &Internal->CleanupDpc
-        );
-    Internal->CleanupTimerActive = TRUE;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 5000;
+            TmCreatePeriodic(tmMgr, PA_CLEANUP_TIMER_PERIOD_MS,
+                             PapCleanupTimerCallback, Internal,
+                             &opts, &Internal->CleanupTimerId);
+        }
+    }
 
     //
     // Initialize child subsystems — failures are non-fatal.
@@ -751,12 +747,14 @@ PaShutdown(
     Internal->ShutdownRequested = TRUE;
 
     //
-    // Cancel cleanup timer first
+    // Cancel cleanup timer via TimerManager
     //
-    if (Internal->CleanupTimerActive) {
-        KeCancelTimer(&Internal->CleanupTimer);
-        KeFlushQueuedDpcs();
-        Internal->CleanupTimerActive = FALSE;
+    if (Internal->CleanupTimerId != TM_INVALID_TIMER_ID) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Internal->CleanupTimerId, TRUE);
+        }
+        Internal->CleanupTimerId = TM_INVALID_TIMER_ID;
     }
 
     //
@@ -3005,18 +3003,14 @@ PapInitializeParentChildRules(
 }
 
 static VOID
-PapCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+PapCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PPA_ANALYZER_INTERNAL Analyzer = (PPA_ANALYZER_INTERNAL)DeferredContext;
+    PPA_ANALYZER_INTERNAL Analyzer = (PPA_ANALYZER_INTERNAL)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (Analyzer == NULL || Analyzer->ShutdownRequested) {
         return;
@@ -3024,8 +3018,6 @@ PapCleanupTimerDpc(
 
     //
     // Signal worker thread to perform cleanup
-    // IMPORTANT: DPC runs at DISPATCH_LEVEL, cannot acquire push locks here
-    // Worker thread runs at PASSIVE_LEVEL and can safely perform cleanup
     //
     KeSetEvent(&Analyzer->WorkAvailableEvent, IO_NO_INCREMENT, FALSE);
 }

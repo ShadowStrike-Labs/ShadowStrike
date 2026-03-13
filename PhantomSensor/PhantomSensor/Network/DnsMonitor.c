@@ -62,6 +62,8 @@ Performance Characteristics:
 #pragma warning(pop)
 
 #include "../Core/Globals.h"
+#include "../Core/DriverEntry.h"
+#include "../Sync/TimerManager.h"
 #include "NetworkReputation.h"
 #include "C2Detection.h"
 #include <ntstrsafe.h>
@@ -242,10 +244,9 @@ struct _DNS_MONITOR {
     } TunnelHash;
 
     //
-    // Cleanup: timer fires DPC, DPC signals event, thread runs at PASSIVE_LEVEL
+    // Cleanup: TimerManager fires callback, callback signals event, thread runs at PASSIVE_LEVEL
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
+    ULONG CleanupTimerId;
     PETHREAD CleanupThread;
     KEVENT CleanupWakeEvent;
     volatile LONG CleanupTerminate;
@@ -437,12 +438,10 @@ DnspAddToDomainCache(
     _In_ PDNS_QUERY Query
     );
 
-static VOID NTAPI
-DnspCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+static VOID
+DnspCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static VOID
@@ -651,8 +650,6 @@ DnsInitialize(
     NTSTATUS status;
     PDNS_MONITOR monitor = NULL;
     ULONG i;
-    LARGE_INTEGER dueTime;
-
     PAGED_CODE();
 
     if (Monitor == NULL) {
@@ -774,12 +771,10 @@ DnsInitialize(
     monitor->LookasideInitialized = TRUE;
 
     //
-    // Initialize cleanup timer + system thread.
-    // DPC fires at DISPATCH_LEVEL and signals event.
+    // Initialize cleanup event + system thread.
+    // TimerManager callback signals event.
     // Thread waits at PASSIVE_LEVEL and runs cleanup.
     //
-    KeInitializeTimer(&monitor->CleanupTimer);
-    KeInitializeDpc(&monitor->CleanupDpc, DnspCleanupTimerDpc, monitor);
     KeInitializeEvent(&monitor->CleanupWakeEvent, SynchronizationEvent, FALSE);
     monitor->CleanupTerminate = 0;
 
@@ -819,13 +814,25 @@ DnsInitialize(
         }
     }
 
-    dueTime.QuadPart = -((LONGLONG)DNS_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &monitor->CleanupTimer,
-        dueTime,
-        DNS_CLEANUP_INTERVAL_MS,
-        &monitor->CleanupDpc
-    );
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 10000;
+            status = TmCreatePeriodic(
+                tmMgr,
+                DNS_CLEANUP_INTERVAL_MS,
+                DnspCleanupTimerCallback,
+                monitor,
+                &opts,
+                &monitor->CleanupTimerId
+            );
+            if (!NT_SUCCESS(status)) {
+                goto Cleanup;
+            }
+        }
+    }
 
     //
     // Set default configuration
@@ -896,10 +903,15 @@ DnsShutdown(
     }
 
     //
-    // Cancel cleanup timer and wait for any in-flight DPC to complete.
+    // Cancel cleanup timer via TimerManager.
     //
-    KeCancelTimer(&Monitor->CleanupTimer);
-    KeFlushQueuedDpcs();
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr && Monitor->CleanupTimerId != 0) {
+            TmCancel(tmMgr, Monitor->CleanupTimerId, TRUE);
+            Monitor->CleanupTimerId = 0;
+        }
+    }
 
     //
     // Signal cleanup thread to terminate and wait for it.
@@ -2986,24 +2998,20 @@ Routine Description:
 // INTERNAL HELPERS - CLEANUP (RUNS AT PASSIVE_LEVEL VIA SYSTEM THREAD)
 // ============================================================================
 
-static VOID NTAPI
-DnspCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+static VOID
+DnspCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 /*++
 Routine Description:
-    DPC callback for cleanup timer. Runs at DISPATCH_LEVEL.
+    TimerManager callback for periodic cleanup.
     Signals the cleanup thread to wake and run at PASSIVE_LEVEL.
 --*/
 {
-    PDNS_MONITOR monitor = (PDNS_MONITOR)DeferredContext;
+    PDNS_MONITOR monitor = (PDNS_MONITOR)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (monitor == NULL || !monitor->Initialized || monitor->CleanupTerminate) {
         return;

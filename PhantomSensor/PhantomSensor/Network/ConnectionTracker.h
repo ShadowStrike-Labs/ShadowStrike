@@ -374,10 +374,9 @@ typedef struct _CT_TRACKER {
     volatile LONG64 NextConnectionId;
 
     //
-    // Cleanup timer
+    // Cleanup timer (managed by TimerManager)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
+    ULONG CleanupTimerId;
     ULONG CleanupIntervalMs;
 
     //
