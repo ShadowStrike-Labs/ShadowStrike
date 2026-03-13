@@ -75,16 +75,20 @@
 #include "../Performance/ResourceThrottling.h"
 #include "../Performance/BatchProcessing.h"
 #include "../Performance/CacheOptimization.h"
+#include "../Performance/LookasideLists.h"
 
 // Phase 1C: Power management
 #include "../Power/PowerCallback.h"
 
 // Phase 1D: Telemetry pipeline
 #include "../ETW/ETWProvider.h"
+#include "../ETW/ETWConsumer.h"
 #include "../ETW/TelemetryEvents.h"
 #include "../ETW/EventSchema.h"
 #include "../ETW/ManifestGenerator.h"
 #include "../Communication/TelemetryBuffer.h"
+#include "../Communication/Compression.h"
+#include "../Communication/Encryption.h"
 
 // Phase 2: Detection subsystems
 #include "../Behavioral/BehaviorEngine.h"
@@ -227,6 +231,18 @@ static PMS_SCANNER g_MemoryScanner = NULL;
 
 /// @brief Power-to-BehaviorEngine bridge callback handle
 static PVOID g_PowerBehaviorBridgeHandle = NULL;
+
+/// @brief ETW Consumer event pipeline (centralized event broker)
+static PEC_CONSUMER g_EtwConsumer = NULL;
+
+/// @brief Centralized lookaside list manager (memory pool management)
+static PLL_MANAGER g_LookasideManager = NULL;
+
+/// @brief Compression manager (telemetry bandwidth optimization)
+static COMP_MANAGER g_CompressionManager = {0};
+
+/// @brief Encryption manager (secure kernel-to-user communication)
+static ENC_MANAGER g_EncryptionManager = {0};
 
 /**
  * @brief Power callback bridge — forwards sleep/resume events to BehaviorEngine.
@@ -536,6 +552,23 @@ DriverEntry(
     // independently. Enable when additional cache types are integrated.
     //
 
+    //
+    // Step 5.10: Centralized lookaside list manager (memory pressure awareness)
+    //
+    {
+        PDEVICE_OBJECT deviceObject = DriverObject->DeviceObject;
+        status = LlInitialize(&g_LookasideManager, deviceObject);
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to initialize centralized lookaside manager: 0x%08X (continuing)\n",
+                       status);
+            g_LookasideManager = NULL;
+            status = STATUS_SUCCESS;
+        } else {
+            ShadowStrikeLogInitStatus("Centralized Lookaside Manager", STATUS_SUCCESS);
+        }
+    }
+
     // =========================================================================
     // PHASE 1C: Power Management
     // =========================================================================
@@ -593,6 +626,33 @@ DriverEntry(
     }
 
     //
+    // Step 5.13: Initialize ETW consumer event pipeline (centralized event broker)
+    //
+    status = EcInitialize(NULL, &g_EtwConsumer);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize ETW consumer: 0x%08X (continuing)\n",
+                   status);
+        g_EtwConsumer = NULL;
+        status = STATUS_SUCCESS;
+    } else {
+        ShadowStrikeLogInitStatus("ETW Consumer", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 5.14: Initialize compression engine (telemetry bandwidth optimization)
+    //
+    status = CompInitialize(&g_CompressionManager);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize compression engine: 0x%08X (continuing)\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        ShadowStrikeLogInitStatus("Compression Engine", STATUS_SUCCESS);
+    }
+
+    //
     // Step 6: Register the minifilter
     //
     status = FltRegisterFilter(
@@ -609,6 +669,22 @@ DriverEntry(
     }
     g_InitFlags |= InitFlag_FilterRegistered;
     ShadowStrikeLogInitStatus("FltRegisterFilter", status);
+
+    //
+    // Step 6.5: Initialize encryption engine (AES-256-GCM for secure CommPort + HMAC auth)
+    //
+    {
+        PDEVICE_OBJECT deviceObject = DriverObject->DeviceObject;
+        status = EncInitialize(&g_EncryptionManager, deviceObject);
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to initialize encryption engine: 0x%08X (continuing)\n",
+                       status);
+            status = STATUS_SUCCESS;
+        } else {
+            ShadowStrikeLogInitStatus("Encryption Engine (AES-256-GCM)", STATUS_SUCCESS);
+        }
+    }
 
     //
     // Step 7: Create communication port
@@ -1717,9 +1793,27 @@ ShadowStrikeUnload(
         g_TelemetryBuffer = NULL;
     }
 
+    //
+    // Shutdown compression engine
+    //
+    CompShutdown(&g_CompressionManager);
+
+    //
+    // Shutdown ETW consumer event pipeline
+    //
+    if (g_EtwConsumer != NULL) {
+        EcShutdown(&g_EtwConsumer);
+        g_EtwConsumer = NULL;
+    }
+
     if (g_SubsystemFlags & SubsysFlag_ETWProvider) {
         EtwProviderShutdown();
     }
+
+    //
+    // Shutdown encryption engine
+    //
+    EncShutdown(&g_EncryptionManager);
 
     // =========================================================================
     // PHASE 1C SHUTDOWN: Power Management
@@ -1755,6 +1849,14 @@ ShadowStrikeUnload(
     if (g_SubsystemFlags & SubsysFlag_PerformanceMonitor) {
         SsPmShutdown(g_PerformanceMonitor);
         g_PerformanceMonitor = NULL;
+    }
+
+    //
+    // Shutdown centralized lookaside manager
+    //
+    if (g_LookasideManager != NULL) {
+        LlShutdown(&g_LookasideManager);
+        g_LookasideManager = NULL;
     }
 
     // =========================================================================
@@ -2465,9 +2567,27 @@ ShadowStrikeCleanupByFlags(
         g_TelemetryBuffer = NULL;
     }
 
+    //
+    // Shutdown compression engine
+    //
+    CompShutdown(&g_CompressionManager);
+
+    //
+    // Shutdown ETW consumer event pipeline
+    //
+    if (g_EtwConsumer != NULL) {
+        EcShutdown(&g_EtwConsumer);
+        g_EtwConsumer = NULL;
+    }
+
     if (g_SubsystemFlags & SubsysFlag_ETWProvider) {
         EtwProviderShutdown();
     }
+
+    //
+    // Shutdown encryption engine
+    //
+    EncShutdown(&g_EncryptionManager);
 
     //
     // Phase 1C: Shutdown power management
@@ -2501,6 +2621,14 @@ ShadowStrikeCleanupByFlags(
     if (g_SubsystemFlags & SubsysFlag_PerformanceMonitor) {
         SsPmShutdown(g_PerformanceMonitor);
         g_PerformanceMonitor = NULL;
+    }
+
+    //
+    // Shutdown centralized lookaside manager
+    //
+    if (g_LookasideManager != NULL) {
+        LlShutdown(&g_LookasideManager);
+        g_LookasideManager = NULL;
     }
 
     //
