@@ -481,6 +481,14 @@ PaGetCommandLineParser(
     return g_CmdLineParser;
 }
 
+PEM_MONITOR
+PaGetEnvironmentMonitor(
+    VOID
+    )
+{
+    return g_EnvironmentMonitor;
+}
+
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS

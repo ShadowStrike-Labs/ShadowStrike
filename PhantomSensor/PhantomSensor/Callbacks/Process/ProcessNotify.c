@@ -86,6 +86,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../FileSystem/PreSetInfo.h"
 #include "../Object/ObjectCallback.h"
 #include "AmsiBypassDetector.h"
+#include "EnvironmentMonitor.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -171,6 +172,8 @@ PsGetProcessSignatureLevel(
 #define PN_BEHAVIOR_LONG_CMDLINE        0x00000008
 #define PN_BEHAVIOR_BASE64_ENCODED      0x00000010
 #define PN_BEHAVIOR_REFLECTION_LOAD     0x00000020
+#define PN_BEHAVIOR_ENV_DLL_HIJACK      0x00000040
+#define PN_BEHAVIOR_ENV_ENCODED_VALUE   0x00000080
 
 // ============================================================================
 // INTERNAL STRUCTURES
@@ -2558,6 +2561,84 @@ Routine Description:
 
                     ClpFreeParsed(ClpParsed);
                 }
+            }
+        }
+    }
+
+    //
+    // Environment variable analysis via EnvironmentMonitor.
+    // Detects: PATH hijacking (T1574.007), DLL search order hijacking (T1574.008),
+    // proxy manipulation (T1090.001), TEMP overrides, encoded payloads (T1027),
+    // anomalous variable counts.
+    //
+    {
+        PEM_MONITOR EmMonitor = PaGetEnvironmentMonitor();
+        if (EmMonitor != NULL) {
+            PEM_PROCESS_ENV EmEnv = NULL;
+            NTSTATUS EmStatus;
+
+            EmStatus = EmCaptureEnvironment(EmMonitor, Context->ProcessId, &EmEnv);
+            if (NT_SUCCESS(EmStatus) && EmEnv != NULL) {
+                EM_SUSPICION EmFlags = EmSuspicion_None;
+
+                EmStatus = EmAnalyzeEnvironment(EmMonitor, EmEnv, &EmFlags);
+                if (NT_SUCCESS(EmStatus) && EmFlags != EmSuspicion_None) {
+                    //
+                    // Map EM suspicion flags to PN behavior flags
+                    //
+                    if (EmFlags & EmSuspicion_DLLSearchOrder) {
+                        Context->BehaviorFlags |= PN_BEHAVIOR_ENV_DLL_HIJACK;
+                    }
+                    if (EmFlags & EmSuspicion_EncodedValue) {
+                        Context->BehaviorFlags |= PN_BEHAVIOR_ENV_ENCODED_VALUE;
+                    }
+
+                    //
+                    // Forward high-confidence findings to BehaviorEngine
+                    //
+                    if (EmFlags & EmSuspicion_DLLSearchOrder) {
+                        BeEngineSubmitEvent(
+                            BehaviorEvent_DLLHijacking,
+                            BehaviorCategory_PersistenceOperation,
+                            (ULONG)(ULONG_PTR)Context->ProcessId,
+                            &EmFlags, sizeof(EM_SUSPICION),
+                            40, FALSE, NULL);
+                    }
+                    if (EmFlags & EmSuspicion_ProxySettings) {
+                        BeEngineSubmitEvent(
+                            BehaviorEvent_SandboxEvasion,
+                            BehaviorCategory_DefenseEvasion,
+                            (ULONG)(ULONG_PTR)Context->ProcessId,
+                            &EmFlags, sizeof(EM_SUSPICION),
+                            35, FALSE, NULL);
+                    }
+                    if (EmFlags & EmSuspicion_EncodedValue) {
+                        BeEngineSubmitEvent(
+                            BehaviorEvent_ProcessMasquerading,
+                            BehaviorCategory_DefenseEvasion,
+                            (ULONG)(ULONG_PTR)Context->ProcessId,
+                            &EmFlags, sizeof(EM_SUSPICION),
+                            30, FALSE, NULL);
+                    }
+
+                    //
+                    // Boost suspicion score proportionally to finding count
+                    //
+                    ULONG EmBoost = 0;
+                    if (EmFlags & EmSuspicion_ModifiedPath) EmBoost += 10;
+                    if (EmFlags & EmSuspicion_DLLSearchOrder) EmBoost += 20;
+                    if (EmFlags & EmSuspicion_ProxySettings) EmBoost += 15;
+                    if (EmFlags & EmSuspicion_TempOverride) EmBoost += 10;
+                    if (EmFlags & EmSuspicion_HiddenVariable) EmBoost += 5;
+                    if (EmFlags & EmSuspicion_EncodedValue) EmBoost += 15;
+                    if (Context->SuspicionScore + EmBoost <= 100) {
+                        Context->SuspicionScore += EmBoost;
+                    } else {
+                        Context->SuspicionScore = 100;
+                    }
+                }
+
+                EmReleaseEnvironment(EmEnv);
             }
         }
     }

@@ -60,9 +60,10 @@ extern "C" {
 #include <ntimage.h>
 
 //
-// Forward declaration for CommandLineParser integration
+// Forward declarations for sub-analyzer integration
 //
 typedef struct _CLP_PARSER* PCLP_PARSER;
+typedef struct _EM_MONITOR* PEM_MONITOR;
 
 //
 // Pool tags for memory tracking
@@ -441,6 +442,22 @@ IRQL:
 --*/
 PCLP_PARSER
 PaGetCommandLineParser(
+    VOID
+    );
+
+/*++
+Routine Description:
+    Returns the EnvironmentMonitor instance managed by ProcessAnalyzer.
+    Used by ProcessNotify to perform process environment analysis.
+
+Return Value:
+    PEM_MONITOR if initialized, NULL otherwise.
+
+IRQL:
+    Can be called at any IRQL (returns pointer only).
+--*/
+PEM_MONITOR
+PaGetEnvironmentMonitor(
     VOID
     );
 
