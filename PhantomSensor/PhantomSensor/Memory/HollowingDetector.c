@@ -676,6 +676,25 @@ PhInitialize(
     internal->Public.Config.MinConfidenceToReport = 50;
 
     //
+    // Pre-cache ZwReadVirtualMemory for PhpReadProcessMemory.
+    // This API is undocumented but present on all supported NT versions (10/11).
+    // Resolving at init time eliminates the lazy-resolution race and logs a
+    // clear warning if the API is unavailable.
+    //
+    if (g_pfnZwReadVirtualMemory == NULL) {
+        UNICODE_STRING funcName;
+        RtlInitUnicodeString(&funcName, L"ZwReadVirtualMemory");
+        g_pfnZwReadVirtualMemory = (PFN_ZW_READ_VIRTUAL_MEMORY)
+            MmGetSystemRoutineAddress(&funcName);
+
+        if (g_pfnZwReadVirtualMemory == NULL) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/PH] WARNING: ZwReadVirtualMemory not available — "
+                "process hollowing detection will be limited\n");
+        }
+    }
+
+    //
     // Initialize statistics
     //
     KeQuerySystemTime(&internal->Public.Stats.StartTime);

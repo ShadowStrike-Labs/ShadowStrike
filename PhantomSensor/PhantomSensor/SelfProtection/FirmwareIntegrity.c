@@ -44,6 +44,8 @@ Implementation Strategy:
 
 #include <ntstrsafe.h>
 
+#include "../Behavioral/BehaviorEngine.h"
+
 // ============================================================================
 // UEFI GUIDS
 // ============================================================================
@@ -204,6 +206,20 @@ FiCheckEspAccess(
 
         InterlockedIncrement64(&g_FiState.Stats.ThreatsDetected);
         InterlockedIncrement64(&g_FiState.Stats.EspAccessBlocked);
+
+        //
+        // Submit ESP write attempt to behavioral engine (T1542.003)
+        //
+        BeEngineSubmitEvent(
+            BehaviorEvent_FirmwareEspWrite,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL,
+            0,
+            95,
+            FALSE,
+            NULL
+            );
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "[ShadowStrike/FI] CRITICAL: Write access to EFI partition detected! "

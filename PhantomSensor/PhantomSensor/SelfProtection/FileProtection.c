@@ -64,6 +64,8 @@
 #include "../Core/Globals.h"
 #pragma warning(pop)
 
+#include "../Behavioral/BehaviorEngine.h"
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, FpInitialize)
 #pragma alloc_text(PAGE, FpShutdown)
@@ -1054,6 +1056,20 @@ FpCheckAccess(
         if (HaveMatchedPath) {
             if (Result == FpAccess_Block) {
                 InterlockedIncrement64(MatchedBlockedOps);
+
+                //
+                // Submit tamper attempt to behavioral engine (T1562.001)
+                //
+                BeEngineSubmitEvent(
+                    BehaviorEvent_CallbackRemoval,
+                    BehaviorCategory_DefenseEvasion,
+                    HandleToULong(PsGetCurrentProcessId()),
+                    NULL,
+                    0,
+                    90,
+                    FALSE,
+                    NULL
+                    );
             } else if (Result == FpAccess_AuditOnly) {
                 InterlockedIncrement64(MatchedAuditedOps);
             }

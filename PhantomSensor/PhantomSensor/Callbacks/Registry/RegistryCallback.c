@@ -178,17 +178,6 @@ RegpCheckRateLimit(
     VOID
     );
 
-static NTSTATUS
-RegpAllocateProcessContext(
-    _In_ HANDLE ProcessId,
-    _Out_ PSHADOWSTRIKE_REG_PROCESS_CONTEXT* Context
-    );
-
-static VOID
-RegpFreeProcessContext(
-    _In_ PSHADOWSTRIKE_REG_PROCESS_CONTEXT Context
-    );
-
 static SHADOWSTRIKE_REG_OPERATION
 RegpNotifyClassToOperation(
     _In_ REG_NOTIFY_CLASS NotifyClass
