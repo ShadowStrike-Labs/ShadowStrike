@@ -280,6 +280,24 @@ ShadowStrikeClearPreSetInfoProcessContext(
     _In_ HANDLE ProcessId
     );
 
+/**
+ * @brief Remove process context on process termination.
+ *
+ * Drops the list reference for the process, allowing the context
+ * to be freed once all in-flight operations complete. This prevents
+ * stale behavioral data persisting after PID recycle.
+ *
+ * @param ProcessId Process ID to remove.
+ *
+ * @irql <= APC_LEVEL
+ * @threadsafety Thread-safe.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+VOID
+ShadowStrikeRemovePreSetInfoProcessContext(
+    _In_ HANDLE ProcessId
+    );
+
 #ifdef __cplusplus
 }
 #endif
