@@ -79,6 +79,8 @@
 #include "../Network/NetworkFilter.h"
 #include "../Network/SSLInspection.h"
 #include "../Exclusions/ExclusionManager.h"
+#include "../Callbacks/Object/ObjectCallback.h"
+#include "../Callbacks/Object/ProcessProtection.h"
 
 // ============================================================================
 // CONSTANTS
@@ -1779,6 +1781,26 @@ MhpHandleProtectedProcessRegister(
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                        "[ShadowStrike/MH] Protected process registered: PID=%u, Flags=0x%08X\n",
                        request->ProcessId, request->ProtectionFlags);
+
+            //
+            // Forward registration to ObjectCallback for handle access protection.
+            // Map ProtectionFlags to Category/ProtectionLevel with safe defaults.
+            //
+            {
+                NTSTATUS obStatus;
+                obStatus = ObAddProtectedProcess(
+                    ULongToHandle(request->ProcessId),
+                    PpCategoryUserDefined,
+                    PpProtectionMedium,
+                    NULL
+                );
+
+                if (!NT_SUCCESS(obStatus)) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                        "[ShadowStrike/MH] ObAddProtectedProcess failed for PID=%u: 0x%08X\n",
+                        request->ProcessId, obStatus);
+                }
+            }
         }
     }
 
@@ -2093,6 +2115,12 @@ MhUnprotectProcess(
 
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                        "[ShadowStrike/MH] Protected process removed: PID=%u\n", ProcessId);
+
+            //
+            // Also remove from ObjectCallback's protected process list
+            //
+            ObRemoveProtectedProcess(ULongToHandle(ProcessId));
+
             break;
         }
     }

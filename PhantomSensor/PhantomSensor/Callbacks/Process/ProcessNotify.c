@@ -84,6 +84,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../FileSystem/FileBackupEngine.h"
 #include "../FileSystem/FileSystemCallbacks.h"
 #include "../FileSystem/PreSetInfo.h"
+#include "../Object/ObjectCallback.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -2906,6 +2907,12 @@ PnpHandleProcessTermination(
     // Prevents stale ransomware/destruction scores persisting after PID recycle.
     //
     ShadowStrikeRemovePreSetInfoProcessContext(ProcessId);
+
+    //
+    // Remove from ObjectCallback protected process list (if registered).
+    // This is a no-op if the PID was never added — safe to call unconditionally.
+    //
+    ObRemoveProtectedProcess(ProcessId);
 
     //
     // Remove from tracking

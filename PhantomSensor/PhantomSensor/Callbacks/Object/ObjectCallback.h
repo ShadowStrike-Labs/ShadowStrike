@@ -438,9 +438,9 @@ ObRemoveProtectedProcess(
  *
  * @return TRUE if protected.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (uses push lock which requires <= APC_LEVEL)
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ObIsInProtectedList(
     _In_ HANDLE ProcessId,
@@ -456,9 +456,9 @@ ObIsInProtectedList(
  *
  * @param Event Telemetry event to queue.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (calls ShadowStrikeSendNotification which uses FltSendMessage)
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 ObQueueTelemetryEvent(
     _In_ POB_TELEMETRY_EVENT Event
