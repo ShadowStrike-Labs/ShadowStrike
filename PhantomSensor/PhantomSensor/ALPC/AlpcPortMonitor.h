@@ -239,6 +239,25 @@ ShadowAlpcRemovePort(
     _In_ PVOID PortObject
     );
 
+/**
+ * @brief Clean up ALPC port entries owned by a terminated process.
+ *
+ * Scans all hash buckets and removes port entries whose OwnerProcessId
+ * matches the terminated process. Prevents stale entries from surviving
+ * past process lifetime (PID reuse safety).
+ *
+ * Must be called from PnpHandleProcessTermination.
+ *
+ * @param ProcessId     Process ID of the terminated process
+ *
+ * @irql <= APC_LEVEL
+ */
+_IRQL_requires_max_(APC_LEVEL)
+VOID
+ShadowAlpcProcessTerminated(
+    _In_ HANDLE ProcessId
+    );
+
 // ============================================================================
 // CONNECTION TRACKING
 // ============================================================================

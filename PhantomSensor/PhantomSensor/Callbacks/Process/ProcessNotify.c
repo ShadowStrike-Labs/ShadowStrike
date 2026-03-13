@@ -93,6 +93,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "ImageNotify.h"
 #include "PrivilegeMonitor.h"
 #include "../Registry/RegistryCallback.h"
+#include "../../ALPC/AlpcPortMonitor.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -3409,6 +3410,13 @@ PnpHandleProcessTermination(
     // entry leak for every process that performed registry operations.
     //
     ShadowStrikeRegistryProcessTerminated(ProcessId);
+
+    //
+    // Notify ALPC port monitor to remove port entries owned by this process.
+    // Without this, stale entries survive until TTL expiry (5 minutes),
+    // during which PID reuse inherits the wrong security context.
+    //
+    ShadowAlpcProcessTerminated(ProcessId);
 
     //
     // Notify TokenAnalyzer to clean up baseline + cached token entries
