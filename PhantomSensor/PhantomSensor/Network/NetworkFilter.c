@@ -706,7 +706,7 @@ NfFilterInitialize(
         g_DxDetector = NULL;
     }
 
-    status = SsPsInitialize(DeviceObject, &g_PortScanner);
+    status = SsPsInitialize(&g_PortScanner);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike/NF] WARNING: PortScanner init failed: 0x%08X (continuing)\n",

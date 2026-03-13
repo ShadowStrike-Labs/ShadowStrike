@@ -516,10 +516,9 @@ typedef struct _HP_PROTECTION_ENGINE {
     UINT8 Reserved2[7];
 
     //
-    // Timer for periodic analysis
+    // Timer for periodic analysis (managed by TimerManager)
     //
-    KTIMER AnalysisTimer;
-    KDPC AnalysisDpc;
+    ULONG AnalysisTimerId;
     volatile LONG AnalysisInProgress;
 
     //

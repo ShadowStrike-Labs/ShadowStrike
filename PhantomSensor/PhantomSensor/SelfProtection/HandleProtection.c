@@ -49,6 +49,8 @@
 #include "SelfProtect.h"
 #include "../Core/Globals.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 // ============================================================================
 // SYSTEM STRUCTURES (for ZwQuerySystemInformation process enumeration)
@@ -131,11 +133,9 @@ typedef struct _HP_SYSTEM_PROCESS_INFO {
 // ============================================================================
 
 static VOID
-HppAnalysisTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+HppAnalysisTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static NTSTATUS
@@ -268,7 +268,6 @@ HpInitialize(
 {
     NTSTATUS status;
     PHP_PROTECTION_ENGINE engine = NULL;
-    LARGE_INTEGER timerDue;
 
     PAGED_CODE();
 
@@ -390,22 +389,27 @@ HpInitialize(
     InterlockedExchange(&engine->Initialized, 1);
 
     //
-    // Initialize analysis timer — AFTER Initialized is set
+    // Initialize analysis timer via TimerManager — AFTER Initialized is set
     //
-    KeInitializeTimer(&engine->AnalysisTimer);
-    KeInitializeDpc(
-        &engine->AnalysisDpc,
-        HppAnalysisTimerDpc,
-        engine
-    );
-
-    timerDue.QuadPart = -((LONGLONG)engine->Config.AnalysisIntervalMs * 10000);
-    KeSetTimerEx(
-        &engine->AnalysisTimer,
-        timerDue,
-        engine->Config.AnalysisIntervalMs,
-        &engine->AnalysisDpc
-    );
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 1000;
+            NTSTATUS tmStatus = TmCreatePeriodic(
+                tmMgr,
+                engine->Config.AnalysisIntervalMs,
+                HppAnalysisTimerCallback,
+                engine,
+                &opts,
+                &engine->AnalysisTimerId
+            );
+            if (!NT_SUCCESS(tmStatus)) {
+                engine->AnalysisTimerId = 0;
+            }
+        }
+    }
 
     *Engine = engine;
 
@@ -441,10 +445,15 @@ HpShutdown(
     }
 
     //
-    // Cancel analysis timer and flush DPCs
+    // Cancel analysis timer via TimerManager
     //
-    KeCancelTimer(&Engine->AnalysisTimer);
-    KeFlushQueuedDpcs();
+    if (Engine->AnalysisTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Engine->AnalysisTimerId, TRUE);
+        }
+        Engine->AnalysisTimerId = 0;
+    }
 
     //
     // Bounded wait for in-progress analysis
@@ -1590,19 +1599,21 @@ HpFlushAllTracking(
 // PRIVATE FUNCTIONS - TIMER
 // ============================================================================
 
+/**
+ * @brief Periodic analysis callback — runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback.
+ *
+ * Replaces the old HppAnalysisTimerDpc which ran at DISPATCH_LEVEL.
+ * PASSIVE_LEVEL execution is safe for push locks and other pageable work.
+ */
 static VOID
-HppAnalysisTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+HppAnalysisTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PHP_PROTECTION_ENGINE engine = (PHP_PROTECTION_ENGINE)DeferredContext;
+    PHP_PROTECTION_ENGINE engine = (PHP_PROTECTION_ENGINE)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (engine == NULL) {
         return;
@@ -1617,7 +1628,7 @@ HppAnalysisTimerDpc(
     }
 
     //
-    // HppCleanupStaleEntries only touches EventHistoryLock (spin lock, DISPATCH safe)
+    // Now running at PASSIVE_LEVEL — safe to use push locks if needed.
     //
     HppCleanupStaleEntries(engine);
 

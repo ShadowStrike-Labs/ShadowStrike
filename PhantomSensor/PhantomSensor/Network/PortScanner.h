@@ -128,12 +128,9 @@ typedef struct _SSPS_DETECTOR {
     volatile LONG ActiveOperations;
     KEVENT DrainEvent;               // Signaled when ActiveOperations == 0
 
-    // Cleanup work item (runs at PASSIVE_LEVEL, not DPC)
-    PIO_WORKITEM CleanupWorkItem;
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
+    // Cleanup timer (managed by TimerManager, fires at PASSIVE_LEVEL)
+    ULONG CleanupTimerId;
     volatile LONG CleanupRunning;    // Prevents concurrent cleanup runs
-    PDEVICE_OBJECT DeviceObject;     // For IoAllocateWorkItem
 
     // Configuration
     struct {
@@ -157,7 +154,6 @@ typedef struct _SSPS_DETECTOR {
 
 NTSTATUS
 SsPsInitialize(
-    _In_ PDEVICE_OBJECT DeviceObject,
     _Out_ PSSPS_DETECTOR* Detector
     );
 

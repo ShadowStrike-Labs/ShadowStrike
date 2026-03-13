@@ -59,10 +59,12 @@ Performance Characteristics:
 
 #include "FileSystemCallbacks.h"
 #include "../../Core/Globals.h"
+#include "../../Core/DriverEntry.h"
 #include "../../Shared/SharedDefs.h"
 #include "../../Shared/VerdictTypes.h"
 #include "../../Cache/ScanCache.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Sync/TimerManager.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -354,13 +356,9 @@ typedef struct _FSC_GLOBAL_STATE {
     volatile LONG CurrentSecondLogs;
 
     //
-    // Cleanup timer and work item
+    // Cleanup timer (managed by TimerManager)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    BOOLEAN CleanupTimerActive;
-    volatile LONG CleanupWorkItemPending;
-    PFLT_GENERIC_WORKITEM CleanupWorkItem;
+    ULONG CleanupTimerId;
 
     //
     // Shutdown flag
@@ -513,18 +511,8 @@ FscpDetectRansomwareBehavior(
     );
 
 static VOID
-FscpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    );
-
-static VOID
-FLTAPI
-FscpCleanupWorkItemRoutine(
-    _In_ PFLT_GENERIC_WORKITEM FltWorkItem,
-    _In_ PVOID FltObject,
+FscpCleanupTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     );
 
@@ -576,7 +564,7 @@ FscpCompareExtensionSafe(
 #pragma alloc_text(PAGE, ShadowStrikeStreamContextCleanup)
 #pragma alloc_text(PAGE, ShadowStrikeStreamHandleContextCleanup)
 #pragma alloc_text(PAGE, ShadowStrikeVolumeContextCleanup)
-#pragma alloc_text(PAGE, FscpCleanupWorkItemRoutine)
+#pragma alloc_text(PAGE, FscpCleanupTimerCallback)
 #pragma alloc_text(PAGE, FscpCleanupStaleContexts)
 #pragma alloc_text(PAGE, FscpResetTimeWindowedMetrics)
 #endif
@@ -1135,7 +1123,6 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
-    LARGE_INTEGER DueTime;
     LARGE_INTEGER CurrentTime;
 
     PAGED_CODE();
@@ -1197,37 +1184,33 @@ Return Value:
     g_FscState.CurrentSecondStart100ns = CurrentTime.QuadPart;
 
     //
-    // Initialize cleanup timer
+    // Initialize cleanup timer via TimerManager
     //
-    KeInitializeTimer(&g_FscState.CleanupTimer);
-    KeInitializeDpc(&g_FscState.CleanupDpc, FscpCleanupTimerDpc, NULL);
-
-    //
-    // Pre-allocate minifilter work item for deferred cleanup at PASSIVE_LEVEL.
-    // FltAllocateGenericWorkItem does not require a device object — correct for minifilters.
-    //
-    g_FscState.CleanupWorkItem = FltAllocateGenericWorkItem();
-    g_FscState.CleanupWorkItemPending = 0;
-
-    if (g_FscState.CleanupWorkItem == NULL) {
-        DbgPrintEx(
-            DPFLTR_IHVDRIVER_ID,
-            DPFLTR_WARNING_LEVEL,
-            "[ShadowStrike/FS] Failed to allocate cleanup work item\n"
-            );
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 10000;
+            NTSTATUS tmStatus = TmCreatePeriodic(
+                tmMgr,
+                FSC_CLEANUP_INTERVAL_MS,
+                FscpCleanupTimerCallback,
+                NULL,
+                &opts,
+                &g_FscState.CleanupTimerId
+                );
+            if (!NT_SUCCESS(tmStatus)) {
+                g_FscState.CleanupTimerId = 0;
+                DbgPrintEx(
+                    DPFLTR_IHVDRIVER_ID,
+                    DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike/FS] Failed to create cleanup timer: 0x%08X\n",
+                    tmStatus
+                    );
+            }
+        }
     }
-
-    //
-    // Start cleanup timer
-    //
-    DueTime.QuadPart = -((LONGLONG)FSC_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &g_FscState.CleanupTimer,
-        DueTime,
-        FSC_CLEANUP_INTERVAL_MS,
-        &g_FscState.CleanupDpc
-        );
-    g_FscState.CleanupTimerActive = TRUE;
 
     g_FscState.Initialized = TRUE;
 
@@ -1276,25 +1259,14 @@ Routine Description:
     }
 
     //
-    // Cancel cleanup timer and wait for DPC to complete
+    // Cancel cleanup timer via TimerManager (waits for in-flight callback)
     //
-    if (g_FscState.CleanupTimerActive) {
-        KeCancelTimer(&g_FscState.CleanupTimer);
-
-        //
-        // CRITICAL: Flush queued DPCs to ensure our DPC is not running
-        //
-        KeFlushQueuedDpcs();
-
-        g_FscState.CleanupTimerActive = FALSE;
-    }
-
-    //
-    // Free work item if allocated
-    //
-    if (g_FscState.CleanupWorkItem != NULL) {
-        FltFreeGenericWorkItem(g_FscState.CleanupWorkItem);
-        g_FscState.CleanupWorkItem = NULL;
+    if (g_FscState.CleanupTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, g_FscState.CleanupTimerId, TRUE);
+        }
+        g_FscState.CleanupTimerId = 0;
     }
 
     //
@@ -2027,31 +1999,27 @@ Return Value:
 // ============================================================================
 
 static VOID
-FLTAPI
-FscpCleanupWorkItemRoutine(
-    _In_ PFLT_GENERIC_WORKITEM FltWorkItem,
-    _In_ PVOID FltObject,
+FscpCleanupTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     )
 /*++
 Routine Description:
-    Minifilter work item routine that runs at PASSIVE_LEVEL for cleanup.
-    Queued from DPC via FltQueueGenericWorkItem.
+    TimerManager callback for periodic cleanup.
+    Runs at PASSIVE_LEVEL (TmFlag_WorkItemCallback).
+    Replaces the former DPC + FltGenericWorkItem two-stage pattern.
 
 Arguments:
-    FltWorkItem - The generic work item (reused, NOT freed here).
-    FltObject - Filter handle that queued this work item.
-    Context - Work item context (unused).
+    TimerId - Timer identifier (unused).
+    Context - Callback context (unused — uses g_FscState directly).
 --*/
 {
-    UNREFERENCED_PARAMETER(FltWorkItem);
-    UNREFERENCED_PARAMETER(FltObject);
+    UNREFERENCED_PARAMETER(TimerId);
     UNREFERENCED_PARAMETER(Context);
 
     PAGED_CODE();
 
     if (g_FscState.ShutdownRequested) {
-        InterlockedExchange(&g_FscState.CleanupWorkItemPending, 0);
         return;
     }
 
@@ -2060,65 +2028,6 @@ Arguments:
     //
     FscpCleanupStaleContexts();
     FscpResetTimeWindowedMetrics();
-
-    //
-    // Mark work item as complete — allows DPC to re-queue
-    //
-    InterlockedExchange(&g_FscState.CleanupWorkItemPending, 0);
-}
-
-
-static VOID
-FscpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    )
-/*++
-Routine Description:
-    Timer DPC callback - runs at DISPATCH_LEVEL.
-    Queues a work item for operations requiring PASSIVE_LEVEL.
-
-Arguments:
-    Dpc - DPC object.
-    DeferredContext - Deferred context.
-    SystemArgument1/2 - System arguments.
---*/
-{
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(DeferredContext);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    if (g_FscState.ShutdownRequested) {
-        return;
-    }
-
-    //
-    // Queue work item for PASSIVE_LEVEL cleanup if not already pending
-    // Note: We use InterlockedCompareExchange to ensure only one work item is queued
-    //
-    if (InterlockedCompareExchange(&g_FscState.CleanupWorkItemPending, 1, 0) == 0) {
-        if (g_FscState.CleanupWorkItem != NULL) {
-            NTSTATUS Status = FltQueueGenericWorkItem(
-                g_FscState.CleanupWorkItem,
-                (PVOID)g_DriverData.FilterHandle,
-                FscpCleanupWorkItemRoutine,
-                DelayedWorkQueue,
-                NULL
-                );
-
-            if (!NT_SUCCESS(Status)) {
-                InterlockedExchange(&g_FscState.CleanupWorkItemPending, 0);
-            }
-        } else {
-            //
-            // No work item available — clear pending flag
-            //
-            InterlockedExchange(&g_FscState.CleanupWorkItemPending, 0);
-        }
-    }
 }
 
 

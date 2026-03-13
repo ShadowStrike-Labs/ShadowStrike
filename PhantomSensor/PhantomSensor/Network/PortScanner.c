@@ -42,8 +42,7 @@
 
     IRQL Contract:
     All public APIs require IRQL <= APC_LEVEL (PASSIVE_LEVEL preferred).
-    Cleanup runs at PASSIVE_LEVEL via IoQueueWorkItem.
-    The DPC only queues a work item; it never touches push locks.
+    Cleanup runs at PASSIVE_LEVEL via TimerManager (TmFlag_WorkItemCallback).
 
     MITRE ATT&CK Coverage:
     - T1046: Network Service Discovery
@@ -62,6 +61,8 @@
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
 #include "../Tracing/Trace.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, SsPsInitialize)
@@ -355,15 +356,15 @@ SspsSnapshotWindowStats(
     );
 
 //
-// Cleanup: DPC queues a work item, work item does actual cleanup at PASSIVE_LEVEL
+// Cleanup: TimerManager callback fires at PASSIVE_LEVEL via TmFlag_WorkItemCallback
 //
-static KDEFERRED_ROUTINE SspsCleanupTimerDpc;
-
-static IO_WORKITEM_ROUTINE SspsCleanupWorkItemRoutine;
+static VOID SspsCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
+    );
 
 //
 // Page section for all private functions that run at PASSIVE_LEVEL.
-// EXCLUDES: SspsCleanupTimerDpc (DISPATCH_LEVEL)
 // EXCLUDES: FORCEINLINE functions (no discrete function body)
 //
 #ifdef ALLOC_PRAGMA
@@ -382,7 +383,7 @@ static IO_WORKITEM_ROUTINE SspsCleanupWorkItemRoutine;
 #pragma alloc_text(PAGE, SspsGetProcessInfo)
 #pragma alloc_text(PAGE, SspsClassifyTcpFlags)
 #pragma alloc_text(PAGE, SspsSnapshotWindowStats)
-#pragma alloc_text(PAGE, SspsCleanupWorkItemRoutine)
+#pragma alloc_text(PAGE, SspsCleanupTimerCallback)
 #endif
 
 //=============================================================================
@@ -600,7 +601,6 @@ SspsReleaseOperation(
 _Use_decl_annotations_
 NTSTATUS
 SsPsInitialize(
-    _In_ PDEVICE_OBJECT DeviceObject,
     _Out_ PSSPS_DETECTOR* Detector
     )
 /*++
@@ -610,11 +610,10 @@ Routine Description:
 --*/
 {
     PSSPS_DETECTOR Det = NULL;
-    LARGE_INTEGER DueTime;
 
     PAGED_CODE();
 
-    if (DeviceObject == NULL || Detector == NULL) {
+    if (Detector == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -632,7 +631,6 @@ Routine Description:
     ExInitializePushLock(&Det->SourceListLock);
     KeInitializeEvent(&Det->DrainEvent, NotificationEvent, TRUE);
 
-    Det->DeviceObject = DeviceObject;
     Det->Config.WindowMs = SSPS_SCAN_WINDOW_MS;
     Det->Config.MinPortsForScan = SSPS_MIN_PORTS_FOR_SCAN;
     Det->Config.MinHostsForSweep = SSPS_MIN_HOSTS_FOR_SWEEP;
@@ -640,23 +638,27 @@ Routine Description:
     KeQuerySystemTime(&Det->Stats.StartTime);
 
     //
-    // Allocate work item for PASSIVE_LEVEL cleanup
+    // Register periodic cleanup timer via TimerManager.
+    // The callback fires at PASSIVE_LEVEL (TmFlag_WorkItemCallback).
     //
-    Det->CleanupWorkItem = IoAllocateWorkItem(DeviceObject);
-    if (Det->CleanupWorkItem == NULL) {
-        ShadowStrikeFreePoolWithTag(Det, SSPS_POOL_TAG_CONTEXT);
-        return STATUS_INSUFFICIENT_RESOURCES;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 5000;
+            NTSTATUS tmStatus = TmCreatePeriodic(
+                tmMgr,
+                SSPS_CLEANUP_INTERVAL_MS,
+                SspsCleanupTimerCallback,
+                Det,
+                &opts,
+                &Det->CleanupTimerId);
+            if (!NT_SUCCESS(tmStatus)) {
+                Det->CleanupTimerId = 0;
+            }
+        }
     }
-
-    //
-    // Initialize cleanup timer + DPC.
-    // The DPC ONLY queues the work item; it never touches locks or frees memory.
-    //
-    KeInitializeTimer(&Det->CleanupTimer);
-    KeInitializeDpc(&Det->CleanupDpc, SspsCleanupTimerDpc, Det);
-
-    DueTime.QuadPart = -((LONGLONG)SSPS_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(&Det->CleanupTimer, DueTime, SSPS_CLEANUP_INTERVAL_MS, &Det->CleanupDpc);
 
     InterlockedExchange(&Det->Initialized, 1);
 
@@ -694,10 +696,15 @@ Routine Description:
     InterlockedExchange(&Detector->Initialized, 0);
 
     //
-    // Phase 2: Stop timer and flush any queued DPCs
+    // Phase 2: Cancel TimerManager timer (synchronous — waits for in-flight callback)
     //
-    KeCancelTimer(&Detector->CleanupTimer);
-    KeFlushQueuedDpcs();
+    if (Detector->CleanupTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Detector->CleanupTimerId, TRUE);
+        }
+        Detector->CleanupTimerId = 0;
+    }
 
     //
     // Phase 3: Wait for all active operations to drain.
@@ -733,13 +740,8 @@ Routine Description:
     KeLeaveCriticalRegion();
 
     //
-    // Phase 5: Free work item and detector
+    // Phase 5: Free detector
     //
-    if (Detector->CleanupWorkItem != NULL) {
-        IoFreeWorkItem(Detector->CleanupWorkItem);
-        Detector->CleanupWorkItem = NULL;
-    }
-
     ShadowStrikeFreePoolWithTag(Detector, SSPS_POOL_TAG_CONTEXT);
 }
 
@@ -1984,86 +1986,30 @@ Routine Description:
 }
 
 //=============================================================================
-// Internal: Cleanup Timer & Work Item (PASSIVE_LEVEL)
+// Internal: Cleanup Timer Callback (PASSIVE_LEVEL via TimerManager)
 //=============================================================================
 //
 // Architecture:
-//   Timer fires periodically -> DPC runs at DISPATCH_LEVEL -> DPC queues
-//   a work item -> Work item runs at PASSIVE_LEVEL -> acquires push locks,
-//   frees memory.
-//
-//   This avoids the critical IRQL violation of the original design where
-//   the DPC directly used push locks at DISPATCH_LEVEL.
+//   TimerManager fires periodically with TmFlag_WorkItemCallback, so the
+//   callback runs at PASSIVE_LEVEL directly.  No DPC-to-work-item trampoline
+//   is needed.
 //
 
 static
 VOID
-SspsCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    )
-/*++
-Routine Description:
-    DPC callback — runs at DISPATCH_LEVEL.
-    Does NOT touch any push locks, lists, or pool memory.
-    Only queues a work item for PASSIVE_LEVEL processing.
---*/
-{
-    PSSPS_DETECTOR Detector = (PSSPS_DETECTOR)DeferredContext;
-
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    if (Detector == NULL) {
-        return;
-    }
-
-    if (InterlockedCompareExchange(&Detector->Initialized, 0, 0) == 0) {
-        return;
-    }
-
-    if (InterlockedCompareExchange(&Detector->ShuttingDown, 0, 0) != 0) {
-        return;
-    }
-
-    //
-    // Prevent overlapping cleanup runs
-    //
-    if (InterlockedCompareExchange(&Detector->CleanupRunning, 1, 0) != 0) {
-        return;  // Previous cleanup still running
-    }
-
-    if (Detector->CleanupWorkItem != NULL) {
-        IoQueueWorkItem(
-            Detector->CleanupWorkItem,
-            SspsCleanupWorkItemRoutine,
-            DelayedWorkQueue,
-            Detector
-            );
-    } else {
-        InterlockedExchange(&Detector->CleanupRunning, 0);
-    }
-}
-
-static
-VOID
-SspsCleanupWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
+SspsCleanupTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     )
 /*++
 Routine Description:
-    Work item callback — runs at PASSIVE_LEVEL.
+    TimerManager callback — runs at PASSIVE_LEVEL.
     Safely acquires push locks, walks the source list, and removes
     expired source contexts with zero reference count.
 
     CRITICAL: Participates in the operation drain via SspsAcquireOperation/
-    SspsReleaseOperation. This ensures SsPsShutdown waits for this work item
-    to complete before freeing the Detector structure, preventing a
-    use-after-free on Detector->CleanupRunning.
+    SspsReleaseOperation. This ensures SsPsShutdown waits for this callback
+    to complete before freeing the Detector structure.
 --*/
 {
     PSSPS_DETECTOR Detector = (PSSPS_DETECTOR)Context;
@@ -2076,10 +2022,21 @@ Routine Description:
 
     PAGED_CODE();
 
-    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (Detector == NULL) {
         return;
+    }
+
+    if (InterlockedCompareExchange(&Detector->ShuttingDown, 0, 0) != 0) {
+        return;
+    }
+
+    //
+    // Prevent overlapping cleanup runs
+    //
+    if (InterlockedCompareExchange(&Detector->CleanupRunning, 1, 0) != 0) {
+        return;  // Previous cleanup still running
     }
 
     //

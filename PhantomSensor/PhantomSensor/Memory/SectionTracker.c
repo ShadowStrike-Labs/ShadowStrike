@@ -53,6 +53,8 @@
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/HashUtils.h"
 #include "../ETW/TelemetryEvents.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 #pragma warning(push)
 #pragma warning(disable:4201)  // nameless struct/union in SEC_CALLBACK_ENTRY
@@ -102,11 +104,6 @@ typedef struct _SEC_CALLBACK_ENTRY {
     ULONG              SlotIndex;
 } SEC_CALLBACK_ENTRY, *PSEC_CALLBACK_ENTRY;
 
-typedef struct _SEC_CLEANUP_WORK_ITEM {
-    WORK_QUEUE_ITEM     WorkItem;
-    PSEC_TRACKER        Tracker;
-} SEC_CLEANUP_WORK_ITEM, *PSEC_CLEANUP_WORK_ITEM;
-
 typedef struct _SEC_TRACKER_INTERNAL {
     SEC_TRACKER Public;
 
@@ -116,9 +113,7 @@ typedef struct _SEC_TRACKER_INTERNAL {
     SEC_CALLBACK_ENTRY MapCallbacks[SEC_MAX_CALLBACKS];
     EX_PUSH_LOCK CallbackLock;
 
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    BOOLEAN CleanupTimerActive;
+    ULONG CleanupTimerId;
 
     NPAGED_LOOKASIDE_LIST EntryLookaside;
     NPAGED_LOOKASIDE_LIST MapLookaside;
@@ -133,11 +128,10 @@ typedef struct _SEC_TRACKER_INTERNAL {
 // FORWARD DECLARATIONS
 // ============================================================================
 
-static KDEFERRED_ROUTINE SecpCleanupDpcRoutine;
-
 static VOID
-SecpCleanupWorkRoutine(
-    _In_ PVOID Parameter
+SecpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     );
 
 static PSECTION_ENTRY
@@ -304,7 +298,6 @@ SecInitialize(
     NTSTATUS status = STATUS_SUCCESS;
     PSEC_TRACKER_INTERNAL internal = NULL;
     ULONG i;
-    LARGE_INTEGER dueTime;
 
     if (Tracker == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -394,19 +387,27 @@ SecInitialize(
     KeQuerySystemTime(&internal->Public.Stats.StartTime);
 
     //
-    // Initialize cleanup timer — DPC queues a work item for PASSIVE_LEVEL cleanup
+    // Initialize periodic cleanup via TimerManager (PASSIVE_LEVEL callback)
     //
-    KeInitializeTimer(&internal->CleanupTimer);
-    KeInitializeDpc(&internal->CleanupDpc, SecpCleanupDpcRoutine, internal);
-
-    dueTime.QuadPart = -((LONGLONG)SEC_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &internal->CleanupTimer,
-        dueTime,
-        SEC_CLEANUP_INTERVAL_MS,
-        &internal->CleanupDpc
-    );
-    internal->CleanupTimerActive = TRUE;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 10000;
+            NTSTATUS tmStatus = TmCreatePeriodic(
+                tmMgr,
+                SEC_CLEANUP_INTERVAL_MS,
+                SecpCleanupTimerCallback,
+                internal,
+                &opts,
+                &internal->CleanupTimerId
+            );
+            if (!NT_SUCCESS(tmStatus)) {
+                internal->CleanupTimerId = 0;
+            }
+        }
+    }
 
     internal->Public.Initialized = TRUE;
 
@@ -466,12 +467,14 @@ SecShutdown(
     Tracker->Initialized = FALSE;
 
     //
-    // Cancel cleanup timer and wait for any in-flight DPC to complete
+    // Cancel cleanup timer and wait for any in-flight callback to complete
     //
-    if (internal->CleanupTimerActive) {
-        KeCancelTimer(&internal->CleanupTimer);
-        internal->CleanupTimerActive = FALSE;
-        KeFlushQueuedDpcs();
+    if (internal->CleanupTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, internal->CleanupTimerId, TRUE);
+        }
+        internal->CleanupTimerId = 0;
     }
 
     //
@@ -1722,65 +1725,21 @@ SecpReleaseEntry(
 }
 
 // ============================================================================
-// PRIVATE: CLEANUP DPC AND WORK ITEM (HIGH-3 fix)
+// PRIVATE: CLEANUP TIMER CALLBACK
 // ============================================================================
 
 /**
- * DPC routine: runs at DISPATCH_LEVEL.
- * Queues a work item for PASSIVE_LEVEL cleanup.
- */
-static VOID
-SecpCleanupDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    )
-{
-    PSEC_TRACKER_INTERNAL internal = (PSEC_TRACKER_INTERNAL)DeferredContext;
-    PSEC_CLEANUP_WORK_ITEM workItem;
-
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    if (internal == NULL || internal->ShuttingDown) {
-        return;
-    }
-
-    //
-    // Allocate work item from NonPaged pool (we're at DISPATCH_LEVEL)
-    //
-    workItem = (PSEC_CLEANUP_WORK_ITEM)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(SEC_CLEANUP_WORK_ITEM),
-        SEC_POOL_TAG_CONTEXT
-    );
-
-    if (workItem == NULL) {
-        return;
-    }
-
-    workItem->Tracker = &internal->Public;
-#pragma warning(push)
-#pragma warning(disable:4996) /* ExInitializeWorkItem/ExQueueWorkItem deprecated */
-    ExInitializeWorkItem(&workItem->WorkItem, SecpCleanupWorkRoutine, workItem);
-    ExQueueWorkItem(&workItem->WorkItem, DelayedWorkQueue);
-#pragma warning(pop)
-}
-
-/**
- * Work item routine: runs at PASSIVE_LEVEL.
+ * TimerManager callback: runs at PASSIVE_LEVEL (TmFlag_WorkItemCallback).
  * Removes stale unmapped entries that have been inactive for SEC_STALE_THRESHOLD.
  */
 static VOID
-SecpCleanupWorkRoutine(
-    _In_ PVOID Parameter
+SecpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 {
-    PSEC_CLEANUP_WORK_ITEM workItem = (PSEC_CLEANUP_WORK_ITEM)Parameter;
+    PSEC_TRACKER_INTERNAL internal = (PSEC_TRACKER_INTERNAL)Context;
     PSEC_TRACKER tracker;
-    PSEC_TRACKER_INTERNAL internal;
     PLIST_ENTRY listEntry;
     PLIST_ENTRY nextEntry;
     PSECTION_ENTRY entry;
@@ -1789,20 +1748,15 @@ SecpCleanupWorkRoutine(
     ULONG staleCount = 0;
     ULONG i;
 
-    if (workItem == NULL) {
+    UNREFERENCED_PARAMETER(TimerId);
+
+    if (internal == NULL || internal->ShuttingDown) {
         return;
     }
 
-    tracker = workItem->Tracker;
-    ShadowStrikeFreePoolWithTag(workItem, SEC_POOL_TAG_CONTEXT);
+    tracker = &internal->Public;
 
-    if (tracker == NULL || !tracker->Initialized) {
-        return;
-    }
-
-    internal = CONTAINING_RECORD(tracker, SEC_TRACKER_INTERNAL, Public);
-
-    if (internal->ShuttingDown) {
+    if (!tracker->Initialized) {
         return;
     }
 

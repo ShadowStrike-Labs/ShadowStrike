@@ -54,6 +54,8 @@ SECURITY FIXES APPLIED (v3.0.0):
 
 #include "PrivilegeMonitor.h"
 #include "../../Core/Globals.h"
+#include "../../Core/DriverEntry.h"
+#include "../../Sync/TimerManager.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
 #include <ntstrsafe.h>
@@ -301,13 +303,9 @@ typedef struct _PM_MONITOR_INTERNAL {
     BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup timer and work item
+    // Cleanup timer (managed by TimerManager)
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
-    PIO_WORKITEM CleanupWorkItem;
-    PDEVICE_OBJECT DeviceObject;
-    BOOLEAN CleanupTimerActive;
+    ULONG CleanupTimerId;
     volatile LONG CleanupInProgress;
 
     //
@@ -590,9 +588,11 @@ PmpDetectUACBypass(
     _Out_ PULONG PatternScore
     );
 
-static KDEFERRED_ROUTINE PmpCleanupTimerDpc;
-
-IO_WORKITEM_ROUTINE PmpCleanupWorkRoutine;
+static VOID
+PmpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
+    );
 
 static VOID
 PmpCleanupStaleBaselines(
@@ -724,7 +724,6 @@ Return Value:
 {
     PPM_MONITOR_INTERNAL Internal = NULL;
     NTSTATUS Status = STATUS_SUCCESS;
-    LARGE_INTEGER DueTime;
     ULONG i;
 
     PAGED_CODE();
@@ -745,7 +744,8 @@ Return Value:
         );
 
     if (Internal == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Cleanup;
     }
 
     RtlZeroMemory(Internal, sizeof(PM_MONITOR_INTERNAL));
@@ -825,49 +825,40 @@ Return Value:
     KeQuerySystemTime(&Internal->Stats.StartTime);
 
     //
-    // Get device object for work item (from driver object's device chain)
+    // Create periodic cleanup timer via TimerManager
     //
-    if (g_DriverData.DriverObject != NULL) {
-        Internal->DeviceObject = g_DriverData.DriverObject->DeviceObject;
-    }
-    if (Internal->DeviceObject == NULL) {
-        //
-        // Cannot create work items without device object
-        // Fall back to not using timer-based cleanup
-        //
-        DbgPrintEx(
-            DPFLTR_IHVDRIVER_ID,
-            DPFLTR_WARNING_LEVEL,
-            "[ShadowStrike/PrivilegeMonitor] No device object available, "
-            "timer-based cleanup disabled\n"
-            );
-    } else {
-        //
-        // Allocate cleanup work item
-        //
-        Internal->CleanupWorkItem = IoAllocateWorkItem(Internal->DeviceObject);
-        if (Internal->CleanupWorkItem == NULL) {
-            Status = STATUS_INSUFFICIENT_RESOURCES;
-            goto Cleanup;
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 10000;
+            NTSTATUS tmStatus = TmCreatePeriodic(
+                tmMgr,
+                PM_CLEANUP_INTERVAL_MS,
+                PmpCleanupTimerCallback,
+                Internal,
+                &opts,
+                &Internal->CleanupTimerId
+                );
+            if (!NT_SUCCESS(tmStatus)) {
+                Internal->CleanupTimerId = 0;
+                DbgPrintEx(
+                    DPFLTR_IHVDRIVER_ID,
+                    DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike/PrivilegeMonitor] TimerManager periodic timer "
+                    "creation failed: 0x%08X, cleanup disabled\n",
+                    tmStatus
+                    );
+            }
+        } else {
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/PrivilegeMonitor] TimerManager unavailable, "
+                "timer-based cleanup disabled\n"
+                );
         }
-
-        //
-        // Initialize cleanup timer and DPC
-        //
-        KeInitializeTimer(&Internal->CleanupTimer);
-        KeInitializeDpc(&Internal->CleanupDpc, PmpCleanupTimerDpc, Internal);
-
-        //
-        // Start cleanup timer (every 1 minute)
-        //
-        DueTime.QuadPart = -((LONGLONG)PM_CLEANUP_INTERVAL_MS * 10000);
-        KeSetTimerEx(
-            &Internal->CleanupTimer,
-            DueTime,
-            PM_CLEANUP_INTERVAL_MS,
-            &Internal->CleanupDpc
-            );
-        Internal->CleanupTimerActive = TRUE;
     }
 
     Internal->Initialized = TRUE;
@@ -929,40 +920,29 @@ Arguments:
     Internal->ShutdownRequested = TRUE;
 
     //
-    // Cancel cleanup timer and WAIT for DPC completion
+    // Cancel cleanup timer via TimerManager
     //
-    if (Internal->CleanupTimerActive) {
-        KeCancelTimer(&Internal->CleanupTimer);
-
-        //
-        // CRITICAL: Wait for any running DPC to complete
-        //
-        KeFlushQueuedDpcs();
-
-        //
-        // Wait for cleanup work item to complete if in progress (bounded)
-        //
-        {
-            ULONG WaitIterations = 0;
-            const ULONG MaxWaitIterations = 5000;  // 5 seconds max
-            while (InterlockedCompareExchange(&Internal->CleanupInProgress, 0, 0) != 0 &&
-                   WaitIterations < MaxWaitIterations) {
-                LARGE_INTEGER Delay;
-                Delay.QuadPart = -10000; // 1ms
-                KeDelayExecutionThread(KernelMode, FALSE, &Delay);
-                WaitIterations++;
-            }
+    if (Internal->CleanupTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Internal->CleanupTimerId, TRUE);
         }
-
-        Internal->CleanupTimerActive = FALSE;
+        Internal->CleanupTimerId = 0;
     }
 
     //
-    // Free cleanup work item
+    // Wait for cleanup to complete if in progress (bounded)
     //
-    if (Internal->CleanupWorkItem != NULL) {
-        IoFreeWorkItem(Internal->CleanupWorkItem);
-        Internal->CleanupWorkItem = NULL;
+    {
+        ULONG WaitIterations = 0;
+        const ULONG MaxWaitIterations = 5000;  // 5 seconds max
+        while (InterlockedCompareExchange(&Internal->CleanupInProgress, 0, 0) != 0 &&
+               WaitIterations < MaxWaitIterations) {
+            LARGE_INTEGER Delay;
+            Delay.QuadPart = -10000; // 1ms
+            KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+            WaitIterations++;
+        }
     }
 
     //
@@ -2818,33 +2798,28 @@ PmpDetectUACBypass(
 // ============================================================================
 
 static VOID
-PmpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+PmpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
     )
 /*++
 Routine Description:
-    DPC callback for cleanup timer.
-    Runs at DISPATCH_LEVEL so cannot perform cleanup directly.
-    Queues a work item to run at PASSIVE_LEVEL.
+    TimerManager callback for periodic cleanup.
+    Runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback.
 
 Arguments:
-    Standard DPC arguments.
+    TimerId - Timer identifier (unused).
+    Context - Monitor pointer.
 --*/
 {
-    PPM_MONITOR_INTERNAL Monitor = (PPM_MONITOR_INTERNAL)DeferredContext;
+    PPM_MONITOR_INTERNAL Monitor = (PPM_MONITOR_INTERNAL)Context;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    UNREFERENCED_PARAMETER(TimerId);
 
     if (Monitor == NULL || Monitor->ShutdownRequested) {
-        return;
-    }
-
-    if (Monitor->CleanupWorkItem == NULL) {
+        if (Monitor != NULL) {
+            InterlockedExchange(&Monitor->CleanupInProgress, 0);
+        }
         return;
     }
 
@@ -2855,43 +2830,6 @@ Arguments:
         //
         // Cleanup already in progress
         //
-        return;
-    }
-
-    //
-    // Queue work item to run at PASSIVE_LEVEL
-    //
-    IoQueueWorkItem(
-        Monitor->CleanupWorkItem,
-        PmpCleanupWorkRoutine,
-        DelayedWorkQueue,
-        Monitor
-        );
-}
-
-
-VOID
-PmpCleanupWorkRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
-    )
-/*++
-Routine Description:
-    Work routine for cleanup. Runs at PASSIVE_LEVEL.
-
-Arguments:
-    DeviceObject - Device object (unused).
-    Context - Monitor pointer.
---*/
-{
-    PPM_MONITOR_INTERNAL Monitor = (PPM_MONITOR_INTERNAL)Context;
-
-    UNREFERENCED_PARAMETER(DeviceObject);
-
-    if (Monitor == NULL || Monitor->ShutdownRequested) {
-        if (Monitor != NULL) {
-            InterlockedExchange(&Monitor->CleanupInProgress, 0);
-        }
         return;
     }
 
