@@ -105,9 +105,9 @@ extern "C" {
 /**
  * @brief Global ALPC monitor state.
  *
- * Defined in AlpcPortMonitor.c.
+ * Opaque to all external consumers. Access only through the public API
+ * functions declared below. Defined as static in AlpcPortMonitor.c.
  */
-extern SHADOW_ALPC_MONITOR_STATE g_AlpcPortMonitorState;
 
 // ============================================================================
 // INITIALIZATION AND CLEANUP

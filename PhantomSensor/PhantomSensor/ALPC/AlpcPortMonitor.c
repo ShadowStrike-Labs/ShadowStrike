@@ -70,6 +70,16 @@
 
 #define SHADOW_ALPC_CLEANUP_INTERVAL_MS 60000
 
+//
+// ALPC-specific behavior event types in the IPC range (0x0906-0x090B).
+// NOTE: These MUST be moved to BehaviorTypes.h when consolidating
+// the event enum. Using local defines to avoid modifying shared headers
+// while other agents are active on this project.
+//
+#define BEHAVIOR_EVENT_ALPC_BLOCKED         ((BEHAVIOR_EVENT_TYPE)0x0906)
+#define BEHAVIOR_EVENT_ALPC_SUSPICIOUS      ((BEHAVIOR_EVENT_TYPE)0x0907)
+#define BEHAVIOR_EVENT_ALPC_CROSS_SESSION   ((BEHAVIOR_EVENT_TYPE)0x0908)
+
 // ============================================================================
 // UNDOCUMENTED STRUCTURES FOR OBJECT TYPE ENUMERATION
 // ============================================================================
@@ -165,7 +175,7 @@ ZwQueryObject(
 // GLOBAL STATE
 // ============================================================================
 
-SHADOW_ALPC_MONITOR_STATE g_AlpcPortMonitorState = { 0 };
+static SHADOW_ALPC_MONITOR_STATE g_AlpcPortMonitorState = { 0 };
 
 /**
  * @brief Resolved ALPC Port object type.
@@ -347,7 +357,14 @@ ShadowAlpcInitialize(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/ALPC] Initializing ALPC Port Monitor v2.0.0\n");
 
+    //
+    // Zero the structure, then restore InitializationState=1 (INITIALIZING).
+    // A concurrent thread may be spinning on state->InitializationState in the
+    // loop above. RtlZeroMemory clears it to 0, which the spin loop interprets
+    // as "failed" (line 340). We must restore it immediately.
+    //
     RtlZeroMemory(state, sizeof(SHADOW_ALPC_MONITOR_STATE));
+    InterlockedExchange(&state->InitializationState, 1);
 
     //
     // Initialize rundown protection for safe shutdown
@@ -521,9 +538,11 @@ ShadowAlpcInitialize(
 
         if (!NT_SUCCESS(status)) {
             //
-            // Thread created but we couldn't get a reference
-            // Signal shutdown to terminate the orphaned thread
+            // Thread created but we couldn't get a reference.
+            // Set ShuttingDown BEFORE signaling ShutdownEvent so the
+            // worker thread's wait loop terminates cleanly.
             //
+            InterlockedExchange(&state->ShuttingDown, TRUE);
             KeSetEvent(&state->ShutdownEvent, IO_NO_INCREMENT, FALSE);
             state->WorkerThread = NULL;
         }
@@ -949,9 +968,15 @@ ShadowAlpcFindPort(
             found = TRUE;
 
             //
-            // Update access time
+            // Update access time atomically. LARGE_INTEGER writes are not
+            // guaranteed atomic on x64 (compiler may emit two 32-bit stores).
+            // Multiple concurrent shared-lock holders call KeQuerySystemTime
+            // into the same location, creating torn-write risk. Use
+            // InterlockedExchange64 for an atomic 64-bit store.
             //
-            KeQuerySystemTime(&portEntry->LastAccessTime);
+            LARGE_INTEGER now;
+            KeQuerySystemTime(&now);
+            InterlockedExchange64(&portEntry->LastAccessTime.QuadPart, now.QuadPart);
 
             InterlockedIncrement64(&state->Stats.CacheHits);
             break;
@@ -990,16 +1015,20 @@ ShadowAlpcReleasePortEntry(
         ShadowAlpcpFreePortEntry(state, Entry);
     } else if (newRefCount < 0) {
         //
-        // CRITICAL FIX: Reference underflow is a fatal error
-        // Bugcheck to prevent use-after-free corruption
+        // CRITICAL: Reference underflow is a fatal error.
+        // Bugcheck to prevent use-after-free corruption.
+        // Uses custom bugcheck code in IHV driver range (0x000000F6
+        // DRIVER_VERIFIER_DETECTED_VIOLATION alternative for driver-detected
+        // internal invariant violation).
         //
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike/ALPC] CRITICAL: Port entry reference underflow!\n");
+                   "[ShadowStrike/ALPC] CRITICAL: Port entry reference underflow! "
+                   "Entry=%p RefCount=%ld\n", Entry, newRefCount);
         KeBugCheckEx(
-            DRIVER_IRQL_NOT_LESS_OR_EQUAL,
+            DRIVER_VERIFIER_DETECTED_VIOLATION,
             (ULONG_PTR)Entry,
             (ULONG_PTR)newRefCount,
-            0,
+            (ULONG_PTR)0x414C5043,  // 'ALPC' identifier
             0x5348414C  // 'SHAL' - ShadowStrike ALPC
         );
     }
@@ -1393,21 +1422,30 @@ ShadowAlpcCheckRateLimit(
     }
 
     KeQuerySystemTime(&currentTime);
-    timeDelta = currentTime.QuadPart - PortEntry->RateLimitWindowStart.QuadPart;
+
+    //
+    // Atomic read of RateLimitWindowStart to prevent torn reads.
+    // Concurrent callers may be resetting the window simultaneously.
+    //
+    LONGLONG windowStart = InterlockedCompareExchange64(
+        &PortEntry->RateLimitWindowStart.QuadPart,
+        0, 0);  // Atomic read (CAS with expected=0 only reads)
+    timeDelta = currentTime.QuadPart - windowStart;
 
     if (timeDelta > SHADOW_ALPC_RATE_LIMIT_WINDOW) {
         //
-        // Reset window
+        // Reset window atomically. Another thread may also be resetting,
+        // which is acceptable — the worst case is a minor counting skew.
         //
-        PortEntry->RateLimitWindowStart = currentTime;
+        InterlockedExchange64(&PortEntry->RateLimitWindowStart.QuadPart, currentTime.QuadPart);
         InterlockedExchange(&PortEntry->ConnectionsInWindow, 1);
-        PortEntry->IsRateLimited = FALSE;
+        InterlockedExchange(&PortEntry->IsRateLimited, FALSE);
         return FALSE;
     }
 
     LONG count = InterlockedIncrement(&PortEntry->ConnectionsInWindow);
     if ((ULONG)count > state->Config.MaxConnectionsPerSecond) {
-        PortEntry->IsRateLimited = TRUE;
+        InterlockedExchange(&PortEntry->IsRateLimited, TRUE);
         InterlockedIncrement64(&state->Stats.RateLimitViolations);
         return TRUE;
     }
@@ -1656,7 +1694,11 @@ ShadowAlpcPortPreCallback(
     context.PortObject = OperationInformation->Object;
     context.SourceProcessId = PsGetCurrentProcessId();
     context.SourceProcess = PsGetCurrentProcess();
-    context.IsKernelHandle = (BOOLEAN)(OperationInformation->KernelHandle != 0);
+    //
+    // IsKernelHandle is always FALSE here — kernel handles return early
+    // at line 1659. Set explicitly for clarity.
+    //
+    context.IsKernelHandle = FALSE;
 
     if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
         context.Operation = AlpcOperationCreatePort;
@@ -1753,7 +1795,7 @@ ShadowAlpcPortPreCallback(
             // Submit ALPC blocked operation event to BehaviorEngine.
             //
             (VOID)BeEngineSubmitEvent(
-                BehaviorEvent_NamedPipeBlocked,
+                BEHAVIOR_EVENT_ALPC_BLOCKED,
                 BehaviorCategory_LateralMovement,
                 HandleToULong(context.SourceProcessId),
                 NULL, 0,
@@ -2373,33 +2415,30 @@ ShadowAlpcpCleanupStaleEntries(
             portEntry = CONTAINING_RECORD(entry, SHADOW_ALPC_PORT_ENTRY, HashEntry);
 
             //
-            // Check if entry is stale and has no active references
-            // CRITICAL FIX: Use InterlockedCompareExchange to atomically check
-            // and claim the entry for removal (preventing TOCTOU race)
+            // Check if entry is stale and has no active references.
+            // We hold the hash bucket exclusive lock, so no new FindPort (shared
+            // lock) or TrackPort (exclusive lock) can race on this bucket.
+            // The only concern is a thread that already holds a reference.
+            // Check refcount FIRST: if it's 1 (our tracking ref), the entry is
+            // reclaimable. Only then mark RemovedFromList to prevent late refs.
             //
             if ((currentTime.QuadPart - portEntry->LastAccessTime.QuadPart) > SHADOW_ALPC_PORT_TTL) {
                 //
-                // Atomically try to set RemovedFromList from FALSE to TRUE
-                // This prevents race where another thread references between our check and removal
+                // Under exclusive bucket lock, no new references can be acquired
+                // through FindPort or TrackPort. Check if refcount is exactly 1
+                // (the initial tracking reference from TrackPort insertion).
                 //
-                LONG wasRemoved = InterlockedCompareExchange(&portEntry->RemovedFromList, TRUE, FALSE);
-                if (wasRemoved == FALSE && InterlockedCompareExchange(&portEntry->ReferenceCount, 1, 1) == 1) {
-                    //
-                    // Successfully claimed - now safe to remove
-                    //
+                if (portEntry->ReferenceCount == 1) {
+                    InterlockedExchange(&portEntry->RemovedFromList, TRUE);
                     RemoveEntryList(&portEntry->HashEntry);
                     InterlockedDecrement(&State->HashBuckets[i].Count);
-
-                    //
-                    // Add to stale list for deferred cleanup
-                    //
                     InsertTailList(&staleList, &portEntry->HashEntry);
-                } else if (wasRemoved == FALSE) {
-                    //
-                    // Reference count wasn't 1, revert RemovedFromList flag
-                    //
-                    InterlockedExchange(&portEntry->RemovedFromList, FALSE);
                 }
+                //
+                // If refcount > 1, another thread holds a reference. Skip this
+                // entry — it will be cleaned up on a future pass or when the
+                // reference holder releases it.
+                //
             }
         }
 
