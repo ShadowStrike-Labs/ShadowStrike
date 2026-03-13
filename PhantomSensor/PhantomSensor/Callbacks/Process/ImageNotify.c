@@ -2103,11 +2103,26 @@ Arguments:
     }
 
     //
-    // Application Control — check DLL/image against allowlist/blocklist
-    // This can flag unauthorized DLL loads for audit or enforcement
+    // Application Control — check DLL/image against allowlist/blocklist.
+    // ImageNotify is notification-only (cannot block loads), so we boost
+    // the threat score and emit telemetry for enforcement-layer correlation.
     //
     if (ProcessId != NULL) {
-        AcCheckImageLoad(FullImageName, ProcessId);
+        AC_VERDICT acVerdict = AcCheckImageLoad(FullImageName, ProcessId);
+        if (acVerdict == AcVerdict_Block || acVerdict == AcVerdict_Audit) {
+            event->ThreatScore += (acVerdict == AcVerdict_Block) ? 40 : 15;
+
+            BeEngineSubmitEvent(
+                BehaviorEvent_AppControlDllBlocked,
+                BehaviorCategory_ProcessExecution,
+                HandleToULong(ProcessId),
+                FullImageName->Buffer,
+                (FullImageName->Length < 512) ? FullImageName->Length : 512,
+                (acVerdict == AcVerdict_Block) ? 75 : 30,
+                FALSE,
+                NULL
+            );
+        }
     }
 
     //

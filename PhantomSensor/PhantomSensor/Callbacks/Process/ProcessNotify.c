@@ -1380,8 +1380,11 @@ Arguments:
     }
 
     //
-    // Application Control — enforce allowlist/blocklist policy
-    // In Enforce mode this can block process creation (MITRE M1038)
+    // Application Control — enforce allowlist/blocklist policy.
+    // In Enforce mode this can block process creation (MITRE M1038).
+    // Note: ImageHash is NULL here because SHA-256 computation happens
+    // asynchronously in the scan pipeline (ScanBridge → user-mode).
+    // Hash-based rules activate when scan results flow back via CommPort.
     //
     {
         AC_VERDICT AcVerdict = AcCheckProcessExecution(
