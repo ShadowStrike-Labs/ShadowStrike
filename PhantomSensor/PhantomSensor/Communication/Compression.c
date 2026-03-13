@@ -1141,7 +1141,6 @@ ComppDecompressSafe(
 
     UCHAR* Op = (UCHAR*)Dest;
     UCHAR* OEnd = Op + MaxDecompressedSize;
-    UCHAR* CopyEnd;
 
     const UCHAR* DictEnd = DictStart ? (const UCHAR*)DictStart + DictSize : NULL;
 
@@ -1154,28 +1153,6 @@ ComppDecompressSafe(
 
     if (CompressedSize <= 0 || MaxDecompressedSize <= 0) {
         return -1;
-    }
-
-    //
-    // Handle zero-size inputs
-    //
-    if (CompressedSize == 0) {
-        return 0;
-    }
-
-    //
-    // Calculate copy end with underflow protection
-    // For partial decode, we can fill to the very end
-    // For full decode, we need 8 bytes safety margin
-    //
-    if (PartialDecode) {
-        CopyEnd = OEnd;
-    } else {
-        if (MaxDecompressedSize < 8) {
-            CopyEnd = Op;  // No room for fast copy
-        } else {
-            CopyEnd = OEnd - 8;
-        }
     }
 
     //
@@ -1236,8 +1213,11 @@ ComppDecompressSafe(
             }
 
             if (OutputRemaining < Length) {
-                if (PartialDecode && Op + Length <= OEnd) {
-                    // Partial decode allows filling to end
+                if (PartialDecode) {
+                    //
+                    // Partial decode: truncate literals to available output space
+                    //
+                    Length = OutputRemaining;
                 } else {
                     return -1;  // Output overflow
                 }
@@ -1246,12 +1226,16 @@ ComppDecompressSafe(
             //
             // Check if we're at the end of input (last literals)
             //
-            if (Ip + Length == IEnd) {
+            if (Ip + Length >= IEnd) {
                 //
                 // This is the last block - just copy literals and exit
                 //
                 if (Op + Length > OEnd) {
-                    return -1;
+                    if (PartialDecode) {
+                        Length = (ULONG)(OEnd - Op);
+                    } else {
+                        return -1;
+                    }
                 }
                 RtlCopyMemory(Op, Ip, Length);
                 Op += Length;
@@ -1349,7 +1333,14 @@ ComppDecompressSafe(
         // Validate output space for match
         //
         if (Op + Length > OEnd) {
-            return -1;  // Output overflow
+            if (PartialDecode) {
+                Length = (ULONG)(OEnd - Op);
+                if (Length == 0) {
+                    break;
+                }
+            } else {
+                return -1;  // Output overflow
+            }
         }
 
         //
@@ -2173,6 +2164,15 @@ CompDecompress(
     // Handle uncompressed data
     //
     if (Header->Algorithm == CompAlgorithm_None) {
+        //
+        // SECURITY: For uncompressed storage, OriginalSize bytes are copied
+        // directly from the compressed buffer. Validate that the source buffer
+        // actually contains that many bytes. A malformed header with
+        // OriginalSize > (CompressedSize - header) causes kernel pool read overflow.
+        //
+        if (Header->OriginalSize > CompressedSize - sizeof(COMP_HEADER)) {
+            return STATUS_DATA_ERROR;
+        }
         RtlCopyMemory(Output, CompressedData, Header->OriginalSize);
         *DecompressedSize = Header->OriginalSize;
         goto VerifyChecksum;
