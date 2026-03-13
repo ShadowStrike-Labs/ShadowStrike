@@ -286,6 +286,7 @@ typedef struct _FSC_VOLUME_LIST_ENTRY {
     FLT_FILESYSTEM_TYPE FileSystemType;
     BOOLEAN IsNetworkVolume;
     BOOLEAN IsRemovableVolume;
+    ULONG VolumeSerial;
     WCHAR VolumeNameBuffer[FSC_MAX_VOLUME_NAME_LENGTH];
     USHORT VolumeNameLength;
 } FSC_VOLUME_LIST_ENTRY, *PFSC_VOLUME_LIST_ENTRY;
@@ -915,6 +916,51 @@ Return Value:
             VolumeListEntry->IsRemovableVolume = IsRemovable;
 
             //
+            // Query volume serial number for ScanCache invalidation on teardown.
+            // Uses same FltQueryVolumeInformation approach as ScanCache BuildKey.
+            // STATUS_BUFFER_OVERFLOW is acceptable — fixed fields are populated.
+            //
+            {
+                FILE_FS_VOLUME_INFORMATION fsVolInfo;
+                IO_STATUS_BLOCK ioStatus;
+                NTSTATUS serialStatus;
+
+                serialStatus = FltQueryVolumeInformation(
+                    FltObjects->Instance,
+                    &ioStatus,
+                    &fsVolInfo,
+                    sizeof(fsVolInfo),
+                    FileFsVolumeInformation
+                );
+
+                if (NT_SUCCESS(serialStatus) || serialStatus == STATUS_BUFFER_OVERFLOW) {
+                    VolumeListEntry->VolumeSerial = fsVolInfo.VolumeSerialNumber;
+                } else {
+                    //
+                    // Fallback: derive from volume properties (weak but usable)
+                    //
+                    FLT_VOLUME_PROPERTIES fallbackProps = {0};
+                    ULONG fallbackBytes = 0;
+
+                    serialStatus = FltGetVolumeProperties(
+                        FltObjects->Volume,
+                        &fallbackProps,
+                        sizeof(fallbackProps),
+                        &fallbackBytes
+                    );
+
+                    if (NT_SUCCESS(serialStatus) || serialStatus == STATUS_BUFFER_OVERFLOW) {
+                        VolumeListEntry->VolumeSerial =
+                            fallbackProps.DeviceCharacteristics ^ (fallbackProps.SectorSize << 16);
+                    }
+
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                               "[ShadowStrike/FS] Volume serial fallback 0x%08X for instance %p\n",
+                               VolumeListEntry->VolumeSerial, FltObjects->Instance);
+                }
+            }
+
+            //
             // Copy volume name before releasing context
             //
             if (VolumeContext->VolumeName.Length > 0 &&
@@ -1093,6 +1139,26 @@ Arguments:
     KeLeaveCriticalRegion();
 
     if (FoundEntry != NULL) {
+        //
+        // Invalidate all ScanCache entries for this volume.
+        // Must be done BEFORE freeing the entry (we need VolumeSerial).
+        // On USB eject or network disconnect, stale verdicts could allow
+        // malware on a re-plugged volume to bypass scanning.
+        //
+        if (FoundEntry->VolumeSerial != 0) {
+            ULONG invalidated = ShadowStrikeCacheInvalidateVolume(FoundEntry->VolumeSerial);
+
+            if (invalidated > 0) {
+                DbgPrintEx(
+                    DPFLTR_IHVDRIVER_ID,
+                    DPFLTR_INFO_LEVEL,
+                    "[ShadowStrike/FS] Cache: Invalidated %lu entries for volume serial 0x%08X\n",
+                    invalidated,
+                    FoundEntry->VolumeSerial
+                    );
+            }
+        }
+
         ExFreePoolWithTag(FoundEntry, FSC_POOL_TAG);
     }
 
