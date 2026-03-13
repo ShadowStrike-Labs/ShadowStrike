@@ -1347,11 +1347,14 @@ BdvFreeDriverInfo(
 
     internal = CONTAINING_RECORD(Verifier, BDV_VERIFIER_INTERNAL, Public);
 
-    // Remove from verified list under spinlock
+    // Remove from verified list under spinlock (guard against double-free)
     KeAcquireSpinLock(&Verifier->VerifiedLock, &oldIrql);
-    RemoveEntryList(&Info->ListEntry);
-    InitializeListHead(&Info->ListEntry);
-    InterlockedDecrement(&Verifier->VerifiedCount);
+    if (Info->ListEntry.Flink != NULL &&
+        Info->ListEntry.Flink != &Info->ListEntry) {
+        RemoveEntryList(&Info->ListEntry);
+        InitializeListHead(&Info->ListEntry);
+        InterlockedDecrement(&Verifier->VerifiedCount);
+    }
     KeReleaseSpinLock(&Verifier->VerifiedLock, oldIrql);
 
     // Free deep-copied path buffer

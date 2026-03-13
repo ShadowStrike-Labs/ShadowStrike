@@ -187,6 +187,7 @@ typedef enum _SHADOWSTRIKE_SUBSYSTEM_FLAGS {
 //
 typedef struct _BP_PROCESSOR BP_PROCESSOR, *PBP_PROCESSOR;
 typedef struct _TM_MANAGER TM_MANAGER, *PTM_MANAGER;
+typedef struct _ENC_MANAGER ENC_MANAGER, *PENC_MANAGER;
 
 // ============================================================================
 // DRIVER LIFECYCLE FUNCTIONS
@@ -499,6 +500,14 @@ ShadowStrikeGetBatchProcessor(VOID);
 _IRQL_requires_max_(DISPATCH_LEVEL)
 PTM_MANAGER
 ShadowStrikeGetTimerManager(VOID);
+
+/**
+ * @brief Returns the global encryption manager for fast-path crypto operations.
+ * @return PENC_MANAGER or NULL if not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PENC_MANAGER
+ShadowStrikeGetEncryptionManager(VOID);
 
 #ifdef __cplusplus
 }

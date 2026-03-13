@@ -340,12 +340,20 @@ ShadowStrikeCacheShutdown(
     }
 
     //
-    // Step 5: Wait for cleanup to complete if it's in progress
+    // Step 5: Wait for cleanup to complete if it's in progress (bounded)
     //
-    while (InterlockedCompareExchange(&g_ScanCache.CleanupInProgress, 0, 0) != 0) {
-        LARGE_INTEGER interval;
-        interval.QuadPart = -100000;  // 10ms
-        KeDelayExecutionThread(KernelMode, FALSE, &interval);
+    {
+        ULONG spinCount = 0;
+        while (InterlockedCompareExchange(&g_ScanCache.CleanupInProgress, 0, 0) != 0) {
+            LARGE_INTEGER interval;
+            interval.QuadPart = -100000;  // 10ms
+            KeDelayExecutionThread(KernelMode, FALSE, &interval);
+            if (++spinCount > 3000) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] ScanCache: Cleanup spin-wait exceeded 30s, forcing shutdown\n");
+                break;
+            }
+        }
     }
 
     //
@@ -403,16 +411,16 @@ ShadowStrikeCacheLookup(
     BOOLEAN found = FALSE;
 
     //
+    // Validate parameters (before any dereference)
+    //
+    if (Key == NULL || Result == NULL) {
+        return FALSE;
+    }
+
+    //
     // Initialize result
     //
     RtlZeroMemory(Result, sizeof(SHADOWSTRIKE_CACHE_RESULT));
-
-    //
-    // Validate parameters
-    //
-    if (Key == NULL) {
-        return FALSE;
-    }
 
     //
     // Check if cache is ready
@@ -442,9 +450,11 @@ ShadowStrikeCacheLookup(
     bucket = &g_ScanCache.Buckets[bucketIndex];
 
     //
-    // Get current time for expiration check
+    // Get current monotonic time for expiration check.
+    // KeQueryInterruptTime is boot-relative and immune to NTP / clock adjustments,
+    // preventing TTL bypass via wall-clock manipulation.
     //
-    KeQuerySystemTime(&currentTime);
+    currentTime.QuadPart = (LONGLONG)KeQueryInterruptTime();
 
     //
     // Acquire bucket lock (shared for read)
@@ -570,9 +580,9 @@ ShadowStrikeCacheInsert(
     }
 
     //
-    // Get current time
+    // Get current monotonic time (boot-relative, immune to clock adjustments)
     //
-    KeQuerySystemTime(&currentTime);
+    currentTime.QuadPart = (LONGLONG)KeQueryInterruptTime();
 
     //
     // Calculate bucket index
@@ -812,7 +822,7 @@ ShadowStrikeCacheClear(
         KeLeaveCriticalRegion();
     }
 
-    g_ScanCache.Stats.CurrentEntries = 0;
+    InterlockedExchange(&g_ScanCache.Stats.CurrentEntries, 0);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Cache cleared (%lu entries removed)\n", totalRemoved);
@@ -844,7 +854,7 @@ ShadowStrikeCacheCleanup(
         return;
     }
 
-    KeQuerySystemTime(&currentTime);
+    currentTime.QuadPart = (LONGLONG)KeQueryInterruptTime();
     InitializeListHead(&removeList);
 
     //
@@ -1060,32 +1070,14 @@ ShadowStrikeCacheBuildKey(
 
     //
     // Get proper volume serial number (REQUIRED)
-    // Using FltGetVolumeProperties to get actual volume information
+    // Primary: FltQueryVolumeInformation gets the real NTFS/FAT volume serial.
+    // Fallback: Derive from volume properties (weak but usable).
     //
     if (FltObjects->Volume != NULL) {
-        FLT_VOLUME_PROPERTIES volumeProps;
-        ULONG bytesReturned = 0;
-
-        status = FltGetVolumeProperties(
-            FltObjects->Volume,
-            &volumeProps,
-            sizeof(volumeProps),
-            &bytesReturned
-        );
-
-        if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
-            //
-            // STATUS_BUFFER_OVERFLOW is acceptable - we got the fixed fields
-            // Use DeviceCharacteristics as a volume identifier component
-            // Combined with SectorSize for better uniqueness
-            //
-            Key->VolumeSerial = volumeProps.DeviceCharacteristics ^
-                               (volumeProps.SectorSize << 16);
-            haveVolumeSerial = TRUE;
-        } else {
-            //
-            // Fallback: Query volume information via file object
-            //
+        //
+        // Primary: Get actual volume serial number from filesystem metadata
+        //
+        {
             FILE_FS_VOLUME_INFORMATION volumeInfo;
             IO_STATUS_BLOCK ioStatus;
 
@@ -1098,8 +1090,41 @@ ShadowStrikeCacheBuildKey(
             );
 
             if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
+                //
+                // STATUS_BUFFER_OVERFLOW is acceptable — the fixed-size fields
+                // (including VolumeSerialNumber) are populated before the
+                // variable-length VolumeLabel.
+                //
                 Key->VolumeSerial = volumeInfo.VolumeSerialNumber;
                 haveVolumeSerial = TRUE;
+            }
+        }
+
+        //
+        // Fallback: Derive identifier from volume properties.
+        // DeviceCharacteristics XOR SectorSize is NOT unique across volumes
+        // but is better than failing entirely. Log a warning.
+        //
+        if (!haveVolumeSerial) {
+            FLT_VOLUME_PROPERTIES volumeProps;
+            ULONG bytesReturned = 0;
+
+            status = FltGetVolumeProperties(
+                FltObjects->Volume,
+                &volumeProps,
+                sizeof(volumeProps),
+                &bytesReturned
+            );
+
+            if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
+                Key->VolumeSerial = volumeProps.DeviceCharacteristics ^
+                                   (volumeProps.SectorSize << 16);
+                haveVolumeSerial = TRUE;
+
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] ScanCache: Using fallback volume serial 0x%08X "
+                           "(real serial unavailable)\n",
+                           Key->VolumeSerial);
             }
         }
     }
@@ -1183,10 +1208,12 @@ ShadowStrikeCacheCleanupTimerCallback(
 Routine Description:
 
     TimerManager callback for periodic cache cleanup. Runs at PASSIVE_LEVEL
-    via TmFlag_WorkItemCallback. Replaces the old DPC→IoWorkItem pattern.
+    via TmFlag_WorkItemCallback. Replaces the old DPC->IoWorkItem pattern.
 
-    Re-entrancy guard: CleanupInProgress prevents overlapping cleanup cycles
-    if the previous one hasn't finished when the next timer fires.
+    NOTE: This function must NOT touch CleanupInProgress — that guard is
+    owned exclusively by ShadowStrikeCacheCleanup(). Previous code set it
+    here, causing ShadowStrikeCacheCleanup to see it as 1 and return
+    immediately, making periodic cleanup a no-op.
 
 --*/
 {
@@ -1200,15 +1227,7 @@ Routine Description:
         return;
     }
 
-    //
-    // Prevent overlapping cleanup cycles
-    //
-    if (InterlockedCompareExchange(&g_ScanCache.CleanupInProgress, 1, 0) != 0) {
-        return;
-    }
-
     if (!g_ScanCache.Initialized) {
-        InterlockedExchange(&g_ScanCache.CleanupInProgress, 0);
         return;
     }
 
@@ -1216,18 +1235,14 @@ Routine Description:
     // Acquire reference for shutdown synchronization
     //
     if (!ShadowStrikeCacheAcquireReference()) {
-        InterlockedExchange(&g_ScanCache.CleanupInProgress, 0);
         return;
     }
 
     //
-    // Perform cleanup at PASSIVE_LEVEL (guaranteed by TmFlag_WorkItemCallback)
+    // Perform cleanup at PASSIVE_LEVEL (guaranteed by TmFlag_WorkItemCallback).
+    // ShadowStrikeCacheCleanup owns the CleanupInProgress re-entrancy guard.
     //
     ShadowStrikeCacheCleanup();
 
-    //
-    // Release reference and cleanup guard
-    //
-    InterlockedExchange(&g_ScanCache.CleanupInProgress, 0);
     ShadowStrikeCacheReleaseReference();
 }

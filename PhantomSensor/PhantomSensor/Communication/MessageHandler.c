@@ -682,8 +682,19 @@ MhShutdown(
         } while (!allDrained && ++drainAttempts < maxDrainAttempts);
 
         if (!allDrained) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike/MH] Shutdown: timeout waiting for active handlers to drain\n");
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike/MH] CRITICAL: Shutdown drain timeout - "
+                       "handlers still active after %u attempts, "
+                       "skipping resource cleanup to prevent BSOD\n",
+                       drainAttempts);
+
+            //
+            // Active handlers may be traversing the protected process list
+            // or allocating from the lookaside. Destroying these resources
+            // now would cause pool corruption / use-after-free / BSOD.
+            // Accept the pool leak — OS reclaims on driver unload.
+            //
+            return;
         }
     }
 
@@ -1033,7 +1044,7 @@ MhpValidateAndCopyMessage(
     // Allocate kernel buffer
     //
     kernelBuf = ExAllocatePool2(
-        POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED,
+        POOL_FLAG_PAGED | POOL_FLAG_UNINITIALIZED,
         UserBufferSize,
         MH_KERNEL_BUFFER_TAG
     );
@@ -2646,7 +2657,13 @@ MhpHandlePushWhitelist(
                 entryTotalSize += entry->ValueLength * sizeof(WCHAR);
             } else if (entry->ValueLength > 259) {
                 rejected++;
-                cursor += sizeof(SHADOWSTRIKE_PUSH_WHITELIST_ENTRY) + entry->ValueLength * sizeof(WCHAR);
+                entryTotalSize = sizeof(SHADOWSTRIKE_PUSH_WHITELIST_ENTRY) + entry->ValueLength * sizeof(WCHAR);
+                if (cursor + entryTotalSize <= payloadEnd) {
+                    cursor += entryTotalSize;
+                } else {
+                    rejected += (entryCount - i - 1);
+                    break;
+                }
                 continue;
             }
         }
@@ -2857,15 +2874,14 @@ MhpHandleUpdateBehavioralRules(
                 //
                 if (ruleEntry->ConditionCount > RE_MAX_CONDITIONS ||
                     ruleEntry->ActionCount > RE_MAX_ACTIONS) {
-                    rejected++;
                     //
-                    // Skip past variable data
+                    // Cannot trust condition/action counts for cursor advancement.
+                    // The multiplication (count * sizeof(struct)) would overflow,
+                    // corrupting cursor position and enabling out-of-bounds reads.
+                    // Reject all remaining entries and bail out safely.
                     //
-                    condSize = ruleEntry->ConditionCount * sizeof(RE_CONDITION);
-                    actSize = ruleEntry->ActionCount * sizeof(RE_ACTION);
-                    entryTotalSize = sizeof(SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE) + condSize + actSize;
-                    cursor += entryTotalSize;
-                    continue;
+                    rejected += (entryCount - i);
+                    goto Done;
                 }
 
                 condSize = ruleEntry->ConditionCount * sizeof(RE_CONDITION);
@@ -3198,6 +3214,23 @@ MhpHandlePushNetworkIoC(
                     );
                     if (NT_SUCCESS(status)) {
                         entryAccepted = TRUE;
+                    }
+                }
+
+                //
+                // Route to SSLInspection bad-JA3 list for TLS handshake matching
+                //
+                {
+                    PSSL_INSPECTOR sslInspector = NfFilterGetSslInspector();
+                    if (sslInspector != NULL) {
+                        status = SslAddBadJA3(
+                            sslInspector,
+                            entry->Value.JA3Hash,
+                            entry->MalwareFamily[0] ? entry->MalwareFamily : NULL
+                        );
+                        if (NT_SUCCESS(status)) {
+                            entryAccepted = TRUE;
+                        }
                     }
                 }
                 break;
