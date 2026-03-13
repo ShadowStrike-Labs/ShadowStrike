@@ -85,6 +85,7 @@
 #include "../Callbacks/Object/ProcessProtection.h"
 #include "Compression.h"
 #include "ScanBridge.h"
+#include "TelemetryBuffer.h"
 
 // ============================================================================
 // CONSTANTS
@@ -1742,6 +1743,27 @@ MhpHandleDriverStatusQuery(
                 : 0;
         }
         driverStatus.SbCircuitState = (ULONG)ShadowStrikeGetCircuitState();
+    }
+
+    //
+    // Telemetry Buffer health
+    //
+    {
+        PTB_MANAGER tbMgr = ShadowStrikeGetTelemetryBuffer();
+        if (tbMgr != NULL) {
+            TB_STATISTICS tbStats;
+            NTSTATUS tbStatus = TbGetStatistics(tbMgr, &tbStats);
+            if (NT_SUCCESS(tbStatus)) {
+                driverStatus.TbTotalEnqueued = (LONG64)tbStats.TotalEnqueued;
+                driverStatus.TbTotalDequeued = (LONG64)tbStats.TotalDequeued;
+                driverStatus.TbTotalDropped = (LONG64)tbStats.TotalDropped;
+                driverStatus.TbTotalBytes = (LONG64)tbStats.TotalBytes;
+                driverStatus.TbBatchesSent = (LONG64)tbStats.BatchesSent;
+                driverStatus.TbUtilizationPercent = tbStats.UtilizationPercent;
+                driverStatus.TbActiveCpuCount = tbStats.ActiveCpuCount;
+            }
+            driverStatus.TbBufferState = (ULONG)tbMgr->State;
+        }
     }
 
     //

@@ -59,6 +59,8 @@
  */
 
 #include "TelemetryBuffer.h"
+#include "../Behavioral/BehaviorEngine.h"
+#include "../../Shared/BehaviorTypes.h"
 
 //
 // PsGetProcessSessionId is the documented kernel-mode API for retrieving
@@ -339,6 +341,22 @@ TbpNotifyOverflow(
 {
     TB_OVERFLOW_CALLBACK callback;
     PVOID context;
+
+    //
+    // Emit behavioral event for telemetry buffer overflow.
+    // This is critical health telemetry — if the buffer is dropping events,
+    // the BehaviorEngine and user-mode must know about it.
+    //
+    BeEngineSubmitEvent(
+        BehaviorEvent_TelemetryBufferOverflow,
+        BehaviorCategory_ManagementAudit,
+        HandleToULong(PsGetCurrentProcessId()),
+        NULL,
+        0,
+        20,     // Low threat score — operational health, not attack
+        FALSE,
+        NULL
+    );
 
     //
     // TbRegisterOverflowCallback writes context BEFORE callback pointer
@@ -1290,7 +1308,11 @@ TbEnqueueWithHeader(
     KeLowerIrql(oldIrql);
 
     if (NT_SUCCESS(status)) {
+        InterlockedIncrement64(&Manager->Stats.TotalEnqueued);
+        InterlockedAdd64(&Manager->Stats.TotalBytes, Header->EntrySize);
         KeSetEvent(&Manager->GlobalConsumerEvent, IO_NO_INCREMENT, FALSE);
+    } else if (status == STATUS_DEVICE_BUSY) {
+        InterlockedIncrement64(&Manager->Stats.TotalDropped);
     }
 
     return status;
@@ -3236,6 +3258,17 @@ TbpFlushThreadRoutine(
                            utilization,
                            manager->Stats.TotalEnqueued,
                            manager->Stats.TotalDropped);
+
+                BeEngineSubmitEvent(
+                    BehaviorEvent_TelemetryHighUtilization,
+                    BehaviorCategory_ManagementAudit,
+                    HandleToULong(PsGetCurrentProcessId()),
+                    NULL,
+                    0,
+                    15,     // Low threat score — capacity warning
+                    FALSE,
+                    NULL
+                );
             }
         }
     }

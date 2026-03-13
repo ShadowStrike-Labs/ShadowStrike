@@ -779,6 +779,19 @@ DriverEntry(
     } else {
         g_SubsystemFlags |= SubsysFlag_TelemetryBuffer;
         ShadowStrikeLogInitStatus("Telemetry Buffer", STATUS_SUCCESS);
+
+        //
+        // Start telemetry buffering — transitions state to Active,
+        // creates flush thread, enables TbEnqueue from detection modules.
+        //
+        status = TbStart(g_TelemetryBuffer);
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to start telemetry buffer: 0x%08X (continuing)\n",
+                       status);
+        } else {
+            ShadowStrikeLogInitStatus("Telemetry Buffer Start", STATUS_SUCCESS);
+        }
     }
 
     //
@@ -2171,6 +2184,7 @@ ShadowStrikeUnload(
     }
 
     if (g_SubsystemFlags & SubsysFlag_TelemetryBuffer) {
+        TbStop(g_TelemetryBuffer, TRUE);
         TbShutdown(g_TelemetryBuffer);
         g_TelemetryBuffer = NULL;
     }
@@ -2363,6 +2377,12 @@ PPA_ANALYZER
 ShadowStrikeGetProcessAnalyzer(VOID)
 {
     return g_ProcessAnalyzer;
+}
+
+PTB_MANAGER
+ShadowStrikeGetTelemetryBuffer(VOID)
+{
+    return g_TelemetryBuffer;
 }
 
 // ============================================================================
@@ -3039,6 +3059,7 @@ ShadowStrikeCleanupByFlags(
     }
 
     if (g_SubsystemFlags & SubsysFlag_TelemetryBuffer) {
+        TbStop(g_TelemetryBuffer, TRUE);
         TbShutdown(g_TelemetryBuffer);
         g_TelemetryBuffer = NULL;
     }

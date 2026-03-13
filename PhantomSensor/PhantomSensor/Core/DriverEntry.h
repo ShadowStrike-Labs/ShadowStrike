@@ -197,6 +197,7 @@ typedef struct _TM_MANAGER TM_MANAGER, *PTM_MANAGER;
 typedef struct _ENC_MANAGER ENC_MANAGER, *PENC_MANAGER;
 typedef struct _COMP_MANAGER COMP_MANAGER, *PCOMP_MANAGER;
 typedef struct _PA_ANALYZER *PPA_ANALYZER;
+typedef struct _TB_MANAGER TB_MANAGER, *PTB_MANAGER;
 
 // ============================================================================
 // DRIVER LIFECYCLE FUNCTIONS
@@ -520,6 +521,14 @@ ShadowStrikeGetCompressionManager(VOID);
 _IRQL_requires_max_(DISPATCH_LEVEL)
 PPA_ANALYZER
 ShadowStrikeGetProcessAnalyzer(VOID);
+
+/**
+ * @brief Get the global telemetry buffer manager.
+ * @return PTB_MANAGER or NULL if not initialized/started.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PTB_MANAGER
+ShadowStrikeGetTelemetryBuffer(VOID);
 
 #ifdef __cplusplus
 }

@@ -329,6 +329,18 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     ULONG  SbAvgLatencyMs;
     ULONG  SbCircuitState;      // 0=Closed, 1=Open, 2=HalfOpen
 
+    //
+    // TelemetryBuffer health
+    //
+    LONG64 TbTotalEnqueued;
+    LONG64 TbTotalDequeued;
+    LONG64 TbTotalDropped;
+    LONG64 TbTotalBytes;
+    LONG64 TbBatchesSent;
+    ULONG  TbUtilizationPercent;
+    ULONG  TbActiveCpuCount;
+    ULONG  TbBufferState;       // TB_BUFFER_STATE enum
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================

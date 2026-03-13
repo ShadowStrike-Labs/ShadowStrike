@@ -95,6 +95,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../Registry/RegistryCallback.h"
 #include "../../Communication/MessageHandler.h"
 #include "../../Communication/ScanBridge.h"
+#include "../../Communication/TelemetryBuffer.h"
 #include "../../ALPC/AlpcPortMonitor.h"
 #include <ntstrsafe.h>
 
@@ -1865,6 +1866,29 @@ Arguments:
     );
 
     //
+    // Stream process creation event to high-performance telemetry buffer.
+    // TelemetryBuffer provides per-CPU ring buffer delivery to user-mode
+    // at < 100ns latency — complementary to CommPort synchronous path.
+    //
+    {
+        PTB_MANAGER tbMgr = ShadowStrikeGetTelemetryBuffer();
+        if (tbMgr != NULL) {
+            struct {
+                ULONG ProcessId;
+                ULONG ParentProcessId;
+                ULONG SessionId;
+                ULONG Flags;
+            } tbPayload;
+            tbPayload.ProcessId = HandleToULong(ProcessContext->ProcessId);
+            tbPayload.ParentProcessId = HandleToULong(ProcessContext->ParentProcessId);
+            tbPayload.SessionId = ProcessContext->SessionId;
+            tbPayload.Flags = ProcessContext->Flags;
+            TbEnqueue(tbMgr, TbEntryType_ProcessCreate,
+                      &tbPayload, sizeof(tbPayload), NULL);
+        }
+    }
+
+    //
     // Apply blocking decision
     // CRITICAL: Verify CreateInfo is not NULL before dereferencing
     //
@@ -3486,6 +3510,27 @@ PnpHandleProcessTermination(
         &Context->ImagePath,
         NULL
     );
+
+    //
+    // Stream process termination event to telemetry buffer.
+    //
+    {
+        PTB_MANAGER tbMgr = ShadowStrikeGetTelemetryBuffer();
+        if (tbMgr != NULL) {
+            struct {
+                ULONG ProcessId;
+                ULONG ParentProcessId;
+                ULONG SessionId;
+                ULONG ExitCode;
+            } tbPayload;
+            tbPayload.ProcessId = HandleToULong(Context->ProcessId);
+            tbPayload.ParentProcessId = HandleToULong(Context->ParentProcessId);
+            tbPayload.SessionId = Context->SessionId;
+            tbPayload.ExitCode = 0;
+            TbEnqueue(tbMgr, TbEntryType_ProcessTerminate,
+                      &tbPayload, sizeof(tbPayload), NULL);
+        }
+    }
 
     //
     // Commit (discard) any pending file backup entries for this process.

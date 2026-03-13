@@ -276,6 +276,10 @@ typedef enum _BEHAVIOR_EVENT_TYPE {
     BehaviorEvent_ScanTimeout                   = 0x1022,
     BehaviorEvent_ScanConnectionLost            = 0x1023,
 
+    // Telemetry Buffer Health (0x1030)
+    BehaviorEvent_TelemetryBufferOverflow       = 0x1030,
+    BehaviorEvent_TelemetryHighUtilization      = 0x1031,
+
     BehaviorEvent_Max                           = 0xFFFF
 } BEHAVIOR_EVENT_TYPE;
 
