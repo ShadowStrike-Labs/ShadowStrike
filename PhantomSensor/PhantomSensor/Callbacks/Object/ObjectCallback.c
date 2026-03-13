@@ -61,6 +61,8 @@
 #include "../../Communication/CommPort.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Exclusions/ExclusionManager.h"
+#include "../Process/HandleTracker.h"
+#include "../Process/ProcessAnalyzer.h"
 #include "ThreadProtection.h"
 
 #ifdef WPP_TRACING
@@ -865,6 +867,25 @@ ShadowStrikeProcessPreCallback(
         (strippedAccess != 0)
         );
 
+    //
+    // Record handle duplication in HandleTracker for cross-process forensics.
+    // Only duplicate operations are recorded — not creates, which are expected.
+    //
+    if (isDuplicate) {
+        PHT_TRACKER htTracker = PaGetHandleTracker();
+        if (htTracker != NULL) {
+            HtRecordDuplication(
+                htTracker,
+                sourceProcessId,
+                targetProcessId,
+                NULL,   // SourceHandle not available in OB callback
+                NULL,   // TargetHandle not available in OB callback
+                originalAccess,
+                HtType_Process
+                );
+        }
+    }
+
     return OB_PREOP_SUCCESS;
 }
 
@@ -1132,6 +1153,25 @@ ShadowStrikeThreadPreCallback(
         originalAccess,
         (strippedAccess != 0)
         );
+
+    //
+    // Record thread handle duplication in HandleTracker for cross-process
+    // injection forensics (T1055 — thread handle duplicate is injection precursor).
+    //
+    if (isDuplicate) {
+        PHT_TRACKER htTracker = PaGetHandleTracker();
+        if (htTracker != NULL) {
+            HtRecordDuplication(
+                htTracker,
+                sourceProcessId,
+                targetProcessId,
+                NULL,   // SourceHandle not available in OB callback
+                NULL,   // TargetHandle not available in OB callback
+                originalAccess,
+                HtType_Thread
+                );
+        }
+    }
 
     return OB_PREOP_SUCCESS;
 }

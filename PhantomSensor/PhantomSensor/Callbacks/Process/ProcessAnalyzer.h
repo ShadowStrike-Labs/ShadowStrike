@@ -64,6 +64,7 @@ extern "C" {
 //
 typedef struct _CLP_PARSER* PCLP_PARSER;
 typedef struct _EM_MONITOR* PEM_MONITOR;
+typedef struct _HT_TRACKER* PHT_TRACKER;
 
 //
 // Pool tags for memory tracking
@@ -458,6 +459,23 @@ IRQL:
 --*/
 PEM_MONITOR
 PaGetEnvironmentMonitor(
+    VOID
+    );
+
+/*++
+Routine Description:
+    Returns the HandleTracker instance managed by ProcessAnalyzer.
+    Used by ProcessNotify for handle forensics and ObjectCallback for
+    duplication recording.
+
+Return Value:
+    PHT_TRACKER if initialized, NULL otherwise.
+
+IRQL:
+    Can be called at any IRQL (returns pointer only).
+--*/
+PHT_TRACKER
+PaGetHandleTracker(
     VOID
     );
 

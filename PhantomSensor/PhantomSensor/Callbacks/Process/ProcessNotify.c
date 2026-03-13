@@ -87,6 +87,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../Object/ObjectCallback.h"
 #include "AmsiBypassDetector.h"
 #include "EnvironmentMonitor.h"
+#include "HandleTracker.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -174,6 +175,9 @@ PsGetProcessSignatureLevel(
 #define PN_BEHAVIOR_REFLECTION_LOAD     0x00000020
 #define PN_BEHAVIOR_ENV_DLL_HIJACK      0x00000040
 #define PN_BEHAVIOR_ENV_ENCODED_VALUE   0x00000080
+#define PN_BEHAVIOR_HANDLE_INJECTION    0x00000100
+#define PN_BEHAVIOR_HANDLE_CRED_ACCESS  0x00000200
+#define PN_BEHAVIOR_HANDLE_TOKEN_STEAL  0x00000400
 
 // ============================================================================
 // INTERNAL STRUCTURES
@@ -2639,6 +2643,81 @@ Routine Description:
                 }
 
                 EmReleaseEnvironment(EmEnv);
+            }
+        }
+    }
+
+    //
+    // Handle forensics via HandleTracker.
+    // Detects: cross-process injection handles (T1055), LSASS credential dumping
+    // (T1003.001), token theft (T1134), high-privilege handle abuse, system handle
+    // manipulation. Snapshots are transient — captured and released per-process.
+    //
+    {
+        PHT_TRACKER HtTracker = PaGetHandleTracker();
+        if (HtTracker != NULL) {
+            PHT_PROCESS_HANDLES HtHandles = NULL;
+            NTSTATUS HtStatus;
+
+            HtStatus = HtSnapshotHandles(HtTracker, Context->ProcessId, &HtHandles);
+            if (NT_SUCCESS(HtStatus) && HtHandles != NULL) {
+                HT_SUSPICION HtFlags = HtSuspicion_None;
+                ULONG HtScore = 0;
+
+                HtStatus = HtAnalyzeHandles(HtTracker, HtHandles, &HtFlags, &HtScore);
+                if (NT_SUCCESS(HtStatus) && HtFlags != HtSuspicion_None) {
+                    //
+                    // Map HT suspicion flags to PN behavior flags
+                    //
+                    if (HtFlags & HtSuspicion_InjectionCapable) {
+                        Context->BehaviorFlags |= PN_BEHAVIOR_HANDLE_INJECTION;
+                    }
+                    if (HtFlags & HtSuspicion_CredentialAccess) {
+                        Context->BehaviorFlags |= PN_BEHAVIOR_HANDLE_CRED_ACCESS;
+                    }
+                    if (HtFlags & HtSuspicion_TokenSteal) {
+                        Context->BehaviorFlags |= PN_BEHAVIOR_HANDLE_TOKEN_STEAL;
+                    }
+
+                    //
+                    // Forward high-confidence findings to BehaviorEngine
+                    //
+                    if (HtFlags & HtSuspicion_CredentialAccess) {
+                        BeEngineSubmitEvent(
+                            BehaviorEvent_CredentialDumping,
+                            BehaviorCategory_CredentialAccess,
+                            (ULONG)(ULONG_PTR)Context->ProcessId,
+                            &HtFlags, sizeof(HT_SUSPICION),
+                            40, FALSE, NULL);
+                    }
+                    if (HtFlags & HtSuspicion_InjectionCapable) {
+                        BeEngineSubmitEvent(
+                            BehaviorEvent_RemoteThreadCreate,
+                            BehaviorCategory_CodeInjection,
+                            (ULONG)(ULONG_PTR)Context->ProcessId,
+                            &HtFlags, sizeof(HT_SUSPICION),
+                            25, FALSE, NULL);
+                    }
+                    if (HtFlags & HtSuspicion_TokenSteal) {
+                        BeEngineSubmitEvent(
+                            BehaviorEvent_LSASSAccess,
+                            BehaviorCategory_CredentialAccess,
+                            (ULONG)(ULONG_PTR)Context->ProcessId,
+                            &HtFlags, sizeof(HT_SUSPICION),
+                            30, FALSE, NULL);
+                    }
+
+                    //
+                    // Boost suspicion score
+                    //
+                    if (Context->SuspicionScore + HtScore <= 100) {
+                        Context->SuspicionScore += HtScore;
+                    } else {
+                        Context->SuspicionScore = 100;
+                    }
+                }
+
+                HtReleaseHandles(HtTracker, HtHandles);
             }
         }
     }
