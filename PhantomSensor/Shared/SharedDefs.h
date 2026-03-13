@@ -309,6 +309,17 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     ULONG  CompressionAvgRatio;          // 0-100 percentage (35 = compressed to 35% of original)
     ULONG  CompressionErrors;
 
+    //
+    // Message queue health statistics (v3 extension)
+    //
+    UINT64 MqTotalEnqueued;
+    UINT64 MqTotalDequeued;
+    UINT64 MqTotalDropped;
+    ULONG  MqCurrentDepth;
+    ULONG  MqPeakDepth;
+    BOOLEAN MqFlowControlActive;
+    UINT8  MqReserved[3];
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================
@@ -329,7 +340,15 @@ typedef struct _SHADOWSTRIKE_POLICY_UPDATE {
     ULONG ScanTimeoutMs;
     ULONG CacheTTLSeconds;
     ULONG MaxPendingRequests;
-    ULONG Reserved;
+
+    //
+    // Message queue tuning (v3 extension).
+    // Set to 0 to leave current values unchanged.
+    //
+    ULONG MqMaxQueueDepth;
+    ULONG MqMaxMessageSize;
+    ULONG MqBatchSize;
+    ULONG MqBatchTimeoutMs;
 
 } SHADOWSTRIKE_POLICY_UPDATE, *PSHADOWSTRIKE_POLICY_UPDATE;
 

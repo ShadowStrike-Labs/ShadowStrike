@@ -52,6 +52,7 @@
  */
 
 #include "MessageQueue.h"
+#include "../Behavioral/BehaviorEngine.h"
 
 // ============================================================================
 // INTERNAL CONSTANTS
@@ -581,23 +582,39 @@ MqShutdown(
     }
 
     //
-    // Wait for all outstanding completions to be released
-    // This ensures waiters have finished copying response data
+    // Wait for all outstanding completions to be released.
+    // Waiters have been signaled (STATUS_CANCELLED) — they MUST complete.
+    // We wait indefinitely because deleting the lookaside while completions
+    // are outstanding would cause pool corruption / BSOD.
     //
     if (g_MqGlobals.OutstandingCompletions > 0) {
-        timeout.QuadPart = -(LONGLONG)MQ_SHUTDOWN_COMPLETION_WAIT_MS * 10000LL;
-        waitStatus = KeWaitForSingleObject(
-            &g_MqGlobals.AllCompletionsReleasedEvent,
-            Executive,
-            KernelMode,
-            FALSE,
-            &timeout
-        );
+        ULONG waitAttempts = 0;
+        do {
+            timeout.QuadPart = -(LONGLONG)MQ_SHUTDOWN_COMPLETION_WAIT_MS * 10000LL;
+            waitStatus = KeWaitForSingleObject(
+                &g_MqGlobals.AllCompletionsReleasedEvent,
+                Executive,
+                KernelMode,
+                FALSE,
+                &timeout
+            );
 
-        if (waitStatus == STATUS_TIMEOUT) {
-            MQ_LOG_WARNING("Timeout waiting for %d outstanding completions",
-                          g_MqGlobals.OutstandingCompletions);
-        }
+            if (waitStatus == STATUS_TIMEOUT) {
+                waitAttempts++;
+                MQ_LOG_ERROR("Still waiting for %d outstanding completions (attempt %u)",
+                              g_MqGlobals.OutstandingCompletions, waitAttempts);
+                //
+                // Safety: after 6 attempts (60 seconds total), something is
+                // fundamentally broken. Log loudly but keep waiting — BSOD from
+                // lookaside deletion is worse than a slow shutdown.
+                //
+                if (waitAttempts >= 6) {
+                    MQ_LOG_ERROR("WARNING: Completion drain stalled — potential deadlock. "
+                                 "Still %d outstanding. Continuing to wait.",
+                                 g_MqGlobals.OutstandingCompletions);
+                }
+            }
+        } while (waitStatus == STATUS_TIMEOUT && g_MqGlobals.OutstandingCompletions > 0);
     }
 
     //
@@ -644,17 +661,21 @@ MqShutdown(
     }
 
     //
-    // Delete lookaside lists
-    // Safe now because all references have been released
+    // Delete lookaside lists.
+    // Set flags FALSE first to prevent concurrent frees to deleted lists.
+    // Safe because all outstanding references are released (waited above)
+    // and no new allocations can occur (state is ShuttingDown).
     //
     if (g_MqGlobals.MessageLookasideInitialized) {
-        ExDeleteNPagedLookasideList(&g_MqGlobals.MessageLookaside);
         g_MqGlobals.MessageLookasideInitialized = FALSE;
+        KeMemoryBarrier();
+        ExDeleteNPagedLookasideList(&g_MqGlobals.MessageLookaside);
     }
 
     if (g_PendingCompletionLookasideInitialized) {
-        ExDeleteNPagedLookasideList(&g_PendingCompletionLookaside);
         g_PendingCompletionLookasideInitialized = FALSE;
+        KeMemoryBarrier();
+        ExDeleteNPagedLookasideList(&g_PendingCompletionLookaside);
     }
 
     MQ_LOG_INFO("Final stats: Enqueued=%llu, Dequeued=%llu, Dropped=%llu",
@@ -684,13 +705,21 @@ MqConfigure(
     )
 {
     //
-    // Validate parameters
+    // Treat 0 as "keep current value" for runtime reconfiguration.
     //
-    if (MaxQueueDepth == 0 || MaxQueueDepth > MQ_MAX_QUEUE_DEPTH_LIMIT) {
+    if (MaxQueueDepth == 0)   MaxQueueDepth = (UINT32)g_MqGlobals.MaxQueueDepth;
+    if (MaxMessageSize == 0)  MaxMessageSize = (UINT32)g_MqGlobals.MaxMessageSize;
+    if (BatchSize == 0)       BatchSize = (UINT32)g_MqGlobals.BatchSize;
+    if (BatchTimeoutMs == 0)  BatchTimeoutMs = (UINT32)g_MqGlobals.BatchTimeoutMs;
+
+    //
+    // Validate parameters against hard limits
+    //
+    if (MaxQueueDepth > MQ_MAX_QUEUE_DEPTH_LIMIT) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (MaxMessageSize == 0 || MaxMessageSize > MQ_MAX_MESSAGE_SIZE_LIMIT) {
+    if (MaxMessageSize > MQ_MAX_MESSAGE_SIZE_LIMIT) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -794,6 +823,15 @@ MqEnqueueMessage(
             currentDepth = g_MqGlobals.TotalMessageCount;
             if (currentDepth >= maxDepth) {
                 InterlockedIncrement64(&g_MqGlobals.TotalMessagesDropped);
+                //
+                // Behavioral telemetry: message drop due to queue saturation.
+                // Repeated drops may indicate a deliberate telemetry flood attack.
+                //
+                BeEngineSubmitEvent(
+                    BehaviorEvent_QueueMessageDropped,
+                    BehaviorCategory_ManagementAudit,
+                    0, NULL, 0, 0, FALSE, NULL
+                );
                 return STATUS_DEVICE_BUSY;
             }
             newDepth = currentDepth + 1;
@@ -981,6 +1019,11 @@ MqEnqueueMessageAndWait(
             if (currentDepth >= maxDepth) {
                 MqpFreeUnregisteredCompletion(pendingCompletion);
                 InterlockedIncrement64(&g_MqGlobals.TotalMessagesDropped);
+                BeEngineSubmitEvent(
+                    BehaviorEvent_QueueMessageDropped,
+                    BehaviorCategory_ManagementAudit,
+                    0, NULL, 0, 0, FALSE, NULL
+                );
                 return STATUS_DEVICE_BUSY;
             }
             newDepth = currentDepth + 1;
@@ -1469,6 +1512,16 @@ MqpUpdateFlowControl(
             KeSetEvent(&g_MqGlobals.HighWaterMarkEvent, IO_NO_INCREMENT, FALSE);
             KeClearEvent(&g_MqGlobals.SpaceAvailableEvent);
             MQ_LOG_WARNING("High water mark reached: %d messages", CurrentDepth);
+
+            //
+            // Behavioral telemetry: queue pressure may indicate
+            // telemetry flood attack (blind spot creation)
+            //
+            BeEngineSubmitEvent(
+                BehaviorEvent_QueueHighWaterMark,
+                BehaviorCategory_ManagementAudit,
+                0, NULL, 0, 0, FALSE, NULL
+            );
         }
     } else if (CurrentDepth <= lowWaterMark) {
         //

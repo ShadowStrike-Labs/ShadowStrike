@@ -266,6 +266,10 @@ typedef enum _BEHAVIOR_EVENT_TYPE {
     BehaviorEvent_WhitelistModified             = 0x1004,
     BehaviorEvent_ThreatIntelPushed             = 0x1005,
 
+    // Queue Pressure / Telemetry Health (0x1010)
+    BehaviorEvent_QueueHighWaterMark            = 0x1010,
+    BehaviorEvent_QueueMessageDropped           = 0x1011,
+
     BehaviorEvent_Max                           = 0xFFFF
 } BEHAVIOR_EVENT_TYPE;
 
