@@ -80,6 +80,7 @@ MITRE ATT&CK Coverage:
 #include "../../Utilities/FileUtils.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Communication/ScanBridge.h"
+#include "../../Callbacks/Process/ClipboardMonitor.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -1112,6 +1113,15 @@ CacheInvalidation:
                 }
             }
         }
+    }
+
+    //
+    // Clipboard exfiltration detection — check if this write matches
+    // rapid temp file dump pattern from a clipboard-indicator process (T1115).
+    // CbMonCheckFileWrite returns quickly for untracked processes.
+    //
+    if (NameInfo != NULL && RequestorPid != NULL) {
+        CbMonCheckFileWrite(RequestorPid, &NameInfo->Name);
     }
 
 Cleanup:

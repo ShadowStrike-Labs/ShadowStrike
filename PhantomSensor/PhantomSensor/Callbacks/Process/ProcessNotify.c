@@ -1363,17 +1363,28 @@ Arguments:
         );
 
     //
-    // Clipboard abuse detection — detect clipboard data theft patterns (T1115)
+    // Clipboard abuse detection — detect clipboard data theft patterns (T1115).
+    // Score graduates based on indicator combination: encoded commands + known
+    // stealer image warrants a higher score than a simple clipboard command line.
     //
     {
         ULONG cbIndicators = CbMonCheckProcessCreate(ProcessId, CreateInfo);
         if (cbIndicators != 0 && g_ProcessMonitor.ThreatScoringEngine != NULL) {
+            UINT32 cbScore = 15;
+
+            if (cbIndicators & CbIndicator_KnownStealerImage) {
+                cbScore += 25;
+            }
+            if (cbIndicators & CbIndicator_EncodedClipboardCmd) {
+                cbScore += 20;
+            }
+
             TsAddFactor(
                 g_ProcessMonitor.ThreatScoringEngine,
                 ProcessId,
                 TsFactor_MITRE,
                 "T1115-ClipboardAbuse",
-                15,
+                cbScore,
                 "Clipboard data access/theft indicators detected"
                 );
         }
@@ -2923,6 +2934,12 @@ PnpHandleProcessTermination(
     // Prevents tracker leaks and stale entries after PID recycle.
     //
     AbdRemoveProcessTracking(ProcessId);
+
+    //
+    // Remove clipboard monitor tracking for this process.
+    // Without cleanup, tracking table fills to 2048 and module goes deaf.
+    //
+    CbMonRemoveProcess(ProcessId);
 
     //
     // Remove from tracking
