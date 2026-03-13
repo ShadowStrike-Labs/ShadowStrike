@@ -757,8 +757,7 @@ DriverEntry(
     // Step 6.5: Initialize encryption engine (AES-256-GCM for secure CommPort + HMAC auth)
     //
     {
-        PDEVICE_OBJECT deviceObject = DriverObject->DeviceObject;
-        status = EncInitialize(&g_EncryptionManager, deviceObject);
+        status = EncInitialize(&g_EncryptionManager);
         if (!NT_SUCCESS(status)) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                        "[ShadowStrike] WARNING: Failed to initialize encryption engine: 0x%08X (continuing)\n",

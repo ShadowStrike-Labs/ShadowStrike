@@ -289,15 +289,11 @@ typedef struct _ENC_MANAGER {
     KSPIN_LOCK ActiveKeysLock;
 
     //
-    // Key rotation
+    // Key rotation (via TimerManager)
     //
-    KTIMER RotationTimer;
-    KDPC RotationDpc;
-    PIO_WORKITEM RotationWorkItem;
-    PDEVICE_OBJECT DeviceObject;
+    ULONG RotationTimerId;
     ULONG RotationIntervalSeconds;
     BOOLEAN AutoRotationEnabled;
-    volatile BOOLEAN RotationInProgress;
 
     //
     // Master key (derived from boot key or TPM)
@@ -353,8 +349,7 @@ _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 EncInitialize(
-    _Out_ PENC_MANAGER Manager,
-    _In_opt_ PDEVICE_OBJECT DeviceObject
+    _Out_ PENC_MANAGER Manager
     );
 
 //

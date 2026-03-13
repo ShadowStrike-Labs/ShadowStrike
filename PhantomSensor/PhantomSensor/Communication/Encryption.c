@@ -42,6 +42,8 @@
 
 #include "Encryption.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, EncInitialize)
@@ -88,11 +90,6 @@ typedef struct _ENC_KEY_INTERNAL {
     volatile BOOLEAN Destroying;
 } ENC_KEY_INTERNAL, *PENC_KEY_INTERNAL;
 
-typedef struct _ENC_ROTATION_CONTEXT {
-    PENC_MANAGER Manager;
-    WORK_QUEUE_ITEM WorkItem;
-} ENC_ROTATION_CONTEXT, *PENC_ROTATION_CONTEXT;
-
 //=============================================================================
 // Forward Declarations
 //=============================================================================
@@ -136,8 +133,11 @@ EncpCalculateCrc32(
     _In_ ULONG Size
     );
 
-IO_WORKITEM_ROUTINE EncpRotationWorkItemRoutine;
-KDEFERRED_ROUTINE EncpRotationDpcRoutine;
+static VOID
+EncpRotationTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
+    );
 
 //=============================================================================
 // CRC32 Table (for header integrity)
@@ -196,8 +196,7 @@ EncpCalculateCrc32(
 _Use_decl_annotations_
 NTSTATUS
 EncInitialize(
-    _Out_ PENC_MANAGER Manager,
-    _In_opt_ PDEVICE_OBJECT DeviceObject
+    _Out_ PENC_MANAGER Manager
     )
 /*++
 
@@ -209,7 +208,6 @@ Routine Description:
 Arguments:
 
     Manager - Encryption manager to initialize.
-    DeviceObject - Device object for work item allocation (optional).
 
 Return Value:
 
@@ -308,25 +306,11 @@ Return Value:
     RtlZeroMemory(Manager->ActiveKeys, sizeof(Manager->ActiveKeys));
 
     //
-    // Initialize rotation timer and DPC
+    // Initialize rotation timer ID (zero = no timer)
     //
-    KeInitializeTimer(&Manager->RotationTimer);
-    KeInitializeDpc(&Manager->RotationDpc, EncpRotationDpcRoutine, Manager);
+    Manager->RotationTimerId = 0;
     Manager->RotationIntervalSeconds = ENC_KEY_ROTATION_INTERVAL;
     Manager->AutoRotationEnabled = FALSE;
-    Manager->RotationInProgress = FALSE;
-
-    //
-    // Store device object and allocate work item if provided
-    //
-    Manager->DeviceObject = DeviceObject;
-    if (DeviceObject != NULL) {
-        Manager->RotationWorkItem = IoAllocateWorkItem(DeviceObject);
-        if (Manager->RotationWorkItem == NULL) {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-            goto Cleanup;
-        }
-    }
 
     //
     // Initialize master key mutex
@@ -359,10 +343,6 @@ Return Value:
     return STATUS_SUCCESS;
 
 Cleanup:
-    if (Manager->RotationWorkItem != NULL) {
-        IoFreeWorkItem(Manager->RotationWorkItem);
-        Manager->RotationWorkItem = NULL;
-    }
     if (Manager->RngAlgHandle != NULL) {
         BCryptCloseAlgorithmProvider(Manager->RngAlgHandle, 0);
         Manager->RngAlgHandle = NULL;
@@ -407,17 +387,14 @@ Routine Description:
     Manager->Initialized = FALSE;
 
     //
-    // Cancel rotation timer and wait for DPC to complete
+    // Cancel rotation timer via TimerManager
     //
-    KeCancelTimer(&Manager->RotationTimer);
-    KeFlushQueuedDpcs();
-
-    //
-    // Free work item
-    //
-    if (Manager->RotationWorkItem != NULL) {
-        IoFreeWorkItem(Manager->RotationWorkItem);
-        Manager->RotationWorkItem = NULL;
+    if (Manager->RotationTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr) {
+            TmCancel(tmMgr, Manager->RotationTimerId, TRUE);
+        }
+        Manager->RotationTimerId = 0;
     }
 
     //
@@ -2407,24 +2384,15 @@ EncSetAutoRotation(
     _In_ ULONG IntervalSeconds
     )
 {
-    LARGE_INTEGER dueTime;
-
     PAGED_CODE();
 
     if (Manager == NULL || !Manager->Initialized) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Enable && Manager->RotationWorkItem == NULL) {
-        //
-        // Cannot enable auto rotation without work item
-        //
-        return STATUS_INVALID_DEVICE_STATE;
-    }
-
     //
     // Validate IntervalSeconds to prevent overflow in ms conversion
-    // KeSetTimerEx period is LONG (max 2147483647 ms ≈ 24.8 days)
+    // ULONG max is 4294967295 ms ≈ 49.7 days; limit to ~24.8 days for safety
     //
     if (Enable && IntervalSeconds > 2147483) {
         return STATUS_INTEGER_OVERFLOW;
@@ -2433,23 +2401,55 @@ EncSetAutoRotation(
     Manager->RotationIntervalSeconds = IntervalSeconds;
     Manager->Config.KeyExpirationSeconds = IntervalSeconds;
 
-    if (Enable && !Manager->AutoRotationEnabled) {
+    if (Enable) {
         //
-        // Start rotation timer
+        // Cancel any existing rotation timer
         //
-        dueTime.QuadPart = -((LONGLONG)IntervalSeconds * 10000000LL);
-        KeSetTimerEx(
-            &Manager->RotationTimer,
-            dueTime,
-            IntervalSeconds * 1000,  // Period in ms (validated above)
-            &Manager->RotationDpc
-            );
+        if (Manager->RotationTimerId != 0) {
+            PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+            if (tmMgr) {
+                TmCancel(tmMgr, Manager->RotationTimerId, TRUE);
+            }
+            Manager->RotationTimerId = 0;
+        }
+
+        //
+        // Create periodic rotation timer via TimerManager
+        //
+        {
+            PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+            if (tmMgr) {
+                TM_TIMER_OPTIONS opts = { 0 };
+                opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+                opts.ToleranceMs = 60000;
+                ULONG intervalMs = IntervalSeconds * 1000;
+                NTSTATUS status = TmCreatePeriodic(
+                    tmMgr,
+                    intervalMs,
+                    EncpRotationTimerCallback,
+                    Manager,
+                    &opts,
+                    &Manager->RotationTimerId
+                    );
+                if (!NT_SUCCESS(status)) {
+                    return status;
+                }
+            } else {
+                return STATUS_INVALID_DEVICE_STATE;
+            }
+        }
         Manager->AutoRotationEnabled = TRUE;
     } else if (!Enable && Manager->AutoRotationEnabled) {
         //
         // Cancel rotation timer
         //
-        KeCancelTimer(&Manager->RotationTimer);
+        if (Manager->RotationTimerId != 0) {
+            PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+            if (tmMgr) {
+                TmCancel(tmMgr, Manager->RotationTimerId, TRUE);
+            }
+            Manager->RotationTimerId = 0;
+        }
         Manager->AutoRotationEnabled = FALSE;
     }
 
@@ -2458,71 +2458,26 @@ EncSetAutoRotation(
 
 
 //=============================================================================
-// Rotation DPC and Work Item
+// Rotation Timer Callback (via TimerManager, runs at PASSIVE_LEVEL)
 //=============================================================================
 
-VOID
-EncpRotationDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    )
-/*++
-
-Routine Description:
-
-    DPC routine for automatic key rotation timer.
-    Queues a work item to perform actual rotation at PASSIVE_LEVEL.
-
---*/
-{
-    PENC_MANAGER manager;
-
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    manager = (PENC_MANAGER)DeferredContext;
-
-    if (manager == NULL || !manager->Initialized) {
-        return;
-    }
-
-    //
-    // Only queue if not already rotating
-    //
-    if (InterlockedCompareExchange((LONG*)&manager->RotationInProgress, TRUE, FALSE) == FALSE) {
-        if (manager->RotationWorkItem != NULL && manager->DeviceObject != NULL) {
-            IoQueueWorkItem(
-                manager->RotationWorkItem,
-                EncpRotationWorkItemRoutine,
-                DelayedWorkQueue,
-                manager
-                );
-        } else {
-            manager->RotationInProgress = FALSE;
-        }
-    }
-}
-
-
-VOID
-EncpRotationWorkItemRoutine(
-    _In_ PDEVICE_OBJECT DeviceObject,
+static VOID
+EncpRotationTimerCallback(
+    _In_ ULONG TimerId,
     _In_opt_ PVOID Context
     )
 /*++
 
 Routine Description:
 
-    Work item routine that performs actual key rotation at PASSIVE_LEVEL.
+    TimerManager callback for automatic key rotation.
+    Runs at PASSIVE_LEVEL (TmFlag_WorkItemCallback).
 
 --*/
 {
     PENC_MANAGER manager = (PENC_MANAGER)Context;
 
-    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(TimerId);
 
     PAGED_CODE();
 
@@ -2534,11 +2489,6 @@ Routine Description:
     // Perform rotation of all active keys
     //
     EncRotateAllKeys(manager);
-
-    //
-    // Clear rotation in progress flag
-    //
-    InterlockedExchange((LONG*)&manager->RotationInProgress, FALSE);
 }
 
 
