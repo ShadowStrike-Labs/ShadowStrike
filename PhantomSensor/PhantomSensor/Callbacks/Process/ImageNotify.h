@@ -942,6 +942,26 @@ ImageNotifyPurgeHashCache(
     VOID
     );
 
+//=============================================================================
+// Callback Function Pointer (for CallbackProtection integration)
+//=============================================================================
+
+//
+// Routine Description:
+//    The actual image load notification callback registered with the kernel
+//    via PsSetLoadImageNotifyRoutine. Exposed for CpProtectCallback usage.
+//
+// IRQL:
+//    <= APC_LEVEL (called by kernel)
+//
+_IRQL_requires_max_(APC_LEVEL)
+VOID
+ImageLoadNotifyRoutine(
+    _In_opt_ PUNICODE_STRING FullImageName,
+    _In_ HANDLE ProcessId,
+    _In_ PIMAGE_INFO ImageInfo
+    );
+
 #ifdef __cplusplus
 }
 #endif

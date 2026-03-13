@@ -102,6 +102,7 @@ VOID ShadowStrikeCleanupPreWrite(VOID);
 #include "../Callbacks/Process/ClipboardMonitor.h"
 #include "../Callbacks/Object/ObjectCallback.h"
 #include "../Callbacks/Process/ProcessNotify.h"
+#include "../Callbacks/Process/ImageNotify.h"
 
 // Phase 1A: Sync infrastructure
 #include "../Sync/WorkQueue.h"
@@ -1466,8 +1467,8 @@ DriverEntry(
             (VOID)CpProtectCallback(
                 g_CallbackProtector,
                 CpCallback_Image,
-                (PVOID)ShadowStrikeImageNotifyCallback,
-                (PVOID)ShadowStrikeImageNotifyCallback
+                (PVOID)ImageLoadNotifyRoutine,
+                (PVOID)ImageLoadNotifyRoutine
             );
         }
 
@@ -1848,7 +1849,7 @@ ShadowStrikeUnload(
             CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeThreadNotifyCallback);
         }
         if (g_DriverData.ImageNotifyRegistered) {
-            CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeImageNotifyCallback);
+            CpUnprotectCallback(g_CallbackProtector, (PVOID)ImageLoadNotifyRoutine);
         }
         if (g_InitFlags & InitFlag_RegistryCallbackReg) {
             CpUnprotectCallback(g_CallbackProtector, (PVOID)(ULONG_PTR)g_DriverData.RegistryCallbackCookie.QuadPart);
@@ -2595,9 +2596,13 @@ ShadowStrikeRegisterProcessCallbacks(
     }
 
     //
-    // Register image load callback (optional enhancement)
+    // Register image load callback via ImageNotify module
+    // (PE analysis, hash computation, BYOVD, module tracking, BehaviorEngine)
     //
-    status = PsSetLoadImageNotifyRoutine(ShadowStrikeImageNotifyCallback);
+    status = ImageNotifyInitialize(NULL);
+    if (NT_SUCCESS(status)) {
+        status = RegisterImageNotify();
+    }
     if (NT_SUCCESS(status)) {
         g_DriverData.ImageNotifyRegistered = TRUE;
         *OutFlags |= InitFlag_ImageCallbackReg;
@@ -2605,7 +2610,7 @@ ShadowStrikeRegisterProcessCallbacks(
         ShadowStrikeLogInitStatus("Image Notify", status);
     } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] WARNING: PsSetLoadImageNotifyRoutine failed: 0x%08X\n",
+                   "[ShadowStrike] WARNING: ImageNotify initialization failed: 0x%08X\n",
                    status);
     }
 
@@ -2621,7 +2626,7 @@ ShadowStrikeUnregisterProcessCallbacks(
 
     if (Flags & InitFlag_ImageCallbackReg) {
         if (g_DriverData.ImageNotifyRegistered) {
-            PsRemoveLoadImageNotifyRoutine(ShadowStrikeImageNotifyCallback);
+            ImageNotifyShutdown();
             g_DriverData.ImageNotifyRegistered = FALSE;
         }
     }
@@ -2761,7 +2766,7 @@ ShadowStrikeCleanupByFlags(
             CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeThreadNotifyCallback);
         }
         if (g_DriverData.ImageNotifyRegistered) {
-            CpUnprotectCallback(g_CallbackProtector, (PVOID)ShadowStrikeImageNotifyCallback);
+            CpUnprotectCallback(g_CallbackProtector, (PVOID)ImageLoadNotifyRoutine);
         }
         if (InitFlags & InitFlag_RegistryCallbackReg) {
             CpUnprotectCallback(g_CallbackProtector, (PVOID)(ULONG_PTR)g_DriverData.RegistryCallbackCookie.QuadPart);
@@ -3195,71 +3200,6 @@ ShadowStrikeThreadNotifyCallback(
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                        "[ShadowStrike] Cross-process thread created: SourcePID=%p, TargetPID=%p, TID=%p\n",
                        currentProcessId, ProcessId, ThreadId);
-        }
-    }
-
-    SHADOWSTRIKE_RELEASE_RUNDOWN();
-}
-
-/**
- * @brief Image load notification callback.
- *
- * Full implementation for detecting malicious DLL injection.
- */
-VOID
-ShadowStrikeImageNotifyCallback(
-    _In_opt_ PUNICODE_STRING FullImageName,
-    _In_ HANDLE ProcessId,
-    _In_ PIMAGE_INFO ImageInfo
-    )
-{
-    BOOLEAN isKernelImage;
-    BOOLEAN isSystemProcess;
-
-    //
-    // Check if driver is ready and acquire rundown protection
-    //
-    if (!SHADOWSTRIKE_IS_READY()) {
-        return;
-    }
-
-    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {
-        return;
-    }
-
-    SHADOWSTRIKE_COUNT_OPERATION();
-
-    isKernelImage = (ImageInfo->SystemModeImage != 0);
-    isSystemProcess = (ProcessId == (HANDLE)4);  // System process
-
-    //
-    // Log kernel module loads (potential rootkit detection)
-    //
-    if (isKernelImage) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                   "[ShadowStrike] Kernel module loaded: %wZ (Base=%p, Size=%lu)\n",
-                   FullImageName,
-                   ImageInfo->ImageBase,
-                   (ULONG)ImageInfo->ImageSize);
-    }
-
-    //
-    // Check for DLL injection into protected processes
-    //
-    if (!isSystemProcess && !isKernelImage && FullImageName != NULL) {
-        BOOLEAN isProtected = ShadowStrikeIsProcessProtected(ProcessId, NULL);
-
-        if (isProtected) {
-            //
-            // DLL loading into protected process — verify legitimacy.
-            // Signature and whitelist checks are delegated to ImageNotify.c
-            // (PsSetLoadImageNotifyRoutineEx). This callback serves as the
-            // orchestrator's logging point. Actual blocking is handled by
-            // the ImageNotify module or via user-mode quarantine.
-            //
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                       "[ShadowStrike] DLL loaded into protected process PID=%p: %wZ\n",
-                       ProcessId, FullImageName);
         }
     }
 

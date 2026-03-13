@@ -805,13 +805,9 @@ Routine Description:
 
     //
     // Unregister callback first - this waits for in-flight callbacks
+    // and marks subsystem rundown as inactive
     //
     UnregisterImageNotify();
-
-    //
-    // Wait for subsystem rundown
-    //
-    ExWaitForRundownProtectionRelease(&g_ImgNotify.SubsystemRundown);
 
     //
     // Free all callback registrations
@@ -2107,7 +2103,7 @@ Arguments:
     // ImageNotify is notification-only (cannot block loads), so we boost
     // the threat score and emit telemetry for enforcement-layer correlation.
     //
-    if (ProcessId != NULL) {
+    if (ProcessId != NULL && FullImageName != NULL && FullImageName->Buffer != NULL) {
         AC_VERDICT acVerdict = AcCheckImageLoad(FullImageName, ProcessId);
         if (acVerdict == AcVerdict_Block || acVerdict == AcVerdict_Audit) {
             event->ThreatScore += (acVerdict == AcVerdict_Block) ? 40 : 15;
