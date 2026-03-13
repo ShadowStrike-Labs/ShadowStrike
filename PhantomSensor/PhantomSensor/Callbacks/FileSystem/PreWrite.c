@@ -206,7 +206,6 @@ typedef struct _PW_COMPLETION_CONTEXT {
     //
     // Flags
     //
-    BOOLEAN RequiresPostProcessing;
     BOOLEAN WasBlocked;
     BOOLEAN CacheInvalidated;
 
@@ -214,15 +213,6 @@ typedef struct _PW_COMPLETION_CONTEXT {
 
 #define PW_CONTEXT_SIGNATURE            'xWpS'
 #define PW_CONTEXT_SIGNATURE_FREED      'dWpS'
-
-//
-// Deferred cleanup work item for elevated IRQL scenarios
-//
-typedef struct _PW_DEFERRED_CLEANUP {
-    WORK_QUEUE_ITEM WorkItem;
-    PFLT_FILE_NAME_INFORMATION NameInfo;
-    PPW_COMPLETION_CONTEXT Context;
-} PW_DEFERRED_CLEANUP, *PPW_DEFERRED_CLEANUP;
 
 //
 // Sensitive file patterns
@@ -289,7 +279,7 @@ typedef struct _PW_GLOBAL_STATE {
         volatile LONG64 ContextFrees;
         volatile LONG64 CanaryFileHits;
         volatile LONG64 DocumentEncryptionBlocks;
-        volatile LONG64 DeferredCleanups;
+        volatile LONG64 SkippedExcluded;
     } Stats;
 
     //
@@ -322,7 +312,7 @@ static const PW_SENSITIVE_PATTERN g_SensitivePatterns[] = {
     //
     // Shadow copy and backup files
     //
-    { L"\\System Volume Information\\", 28, PW_FILE_SHADOW_COPY },
+    { L"\\System Volume Information\\", 27, PW_FILE_SHADOW_COPY },
     { L"@GMT-", 5, PW_FILE_SHADOW_COPY },
     { L".bak", 4, PW_FILE_BACKUP },
     { L".backup", 7, PW_FILE_BACKUP },
@@ -447,27 +437,9 @@ PwpShouldBlockWrite(
     );
 
 static VOID
-PwpUpdateProcessWriteMetrics(
-    _In_ HANDLE ProcessId,
-    _In_ PCUNICODE_STRING FileName
-    );
-
-static VOID
 PwpNotifyWriteEvent(
     _In_ PPW_COMPLETION_CONTEXT Context,
     _In_ BOOLEAN Blocked
-    );
-
-static VOID
-PwpDeferredCleanupWorker(
-    _In_ PVOID Parameter
-    );
-
-_IRQL_requires_(PASSIVE_LEVEL)
-static VOID
-PwpPerformDeferredCleanup(
-    _In_ PFLT_FILE_NAME_INFORMATION NameInfo,
-    _In_ PPW_COMPLETION_CONTEXT Context
     );
 
 // ============================================================================
@@ -741,7 +713,7 @@ Return Value:
     }
 
     Buffer = (PWCHAR)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
+        POOL_FLAG_PAGED,
         Path->Length + sizeof(WCHAR),
         PW_POOL_TAG
         );
@@ -810,7 +782,6 @@ Return Value:
     ULONG FileClassification = 0;
     ULONG SuspicionFlags = PW_SUSPICION_NONE;
     BOOLEAN BlockWrite = FALSE;
-    BOOLEAN RequiresPostProcessing = FALSE;
     FLT_PREOP_CALLBACK_STATUS ReturnStatus = FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     *CompletionContext = NULL;
@@ -925,7 +896,7 @@ Return Value:
     // =========================================================================
 
     if (ShadowStrikeIsProcessExcluded(RequestorPid, NULL)) {
-        InterlockedIncrement64(&g_PwState.Stats.SkippedKernelMode);
+        InterlockedIncrement64(&g_PwState.Stats.SkippedExcluded);
         FltReleaseFileNameInformation(NameInfo);
         NameInfo = NULL;
         PwpLeaveOperation();
@@ -933,7 +904,7 @@ Return Value:
     }
 
     if (ShadowStrikeIsPathExcluded(&NameInfo->Name, NULL)) {
-        InterlockedIncrement64(&g_PwState.Stats.SkippedKernelMode);
+        InterlockedIncrement64(&g_PwState.Stats.SkippedExcluded);
         FltReleaseFileNameInformation(NameInfo);
         NameInfo = NULL;
         PwpLeaveOperation();
@@ -1107,11 +1078,13 @@ Return Value:
         }
 
         //
-        // If write is allowed but suspicious, track for post-processing
+        // If write is allowed but suspicious, notify inline.
+        // PreWrite's post-callback is not dispatched (PostWrite.c owns the
+        // registered post-op and has its own independent analytics), so all
+        // notification must happen in the pre-op path.
         //
         if (!BlockWrite && SuspicionFlags != PW_SUSPICION_NONE) {
-            RequiresPostProcessing = TRUE;
-            PwContext->RequiresPostProcessing = TRUE;
+            PwpNotifyWriteEvent(PwContext, FALSE);
         }
     }
 
@@ -1139,14 +1112,6 @@ CacheInvalidation:
                 }
             }
         }
-    }
-
-    // =========================================================================
-    // UPDATE PROCESS METRICS
-    // =========================================================================
-
-    if (NameInfo != NULL && g_PwState.Config.EnableMassWriteDetection) {
-        PwpUpdateProcessWriteMetrics(RequestorPid, &NameInfo->Name);
     }
 
 Cleanup:
@@ -1177,7 +1142,7 @@ Cleanup:
             NULL,
             0,
             threatScore,
-            FALSE,
+            BlockWrite,
             NULL
             );
     }
@@ -1194,16 +1159,6 @@ Cleanup:
         if (PwContext != NULL) {
             PwpNotifyWriteEvent(PwContext, TRUE);
         }
-    } else if (RequiresPostProcessing && PwContext != NULL) {
-        //
-        // Keep context for post-operation callback
-        //
-        *CompletionContext = PwContext;
-        PwContext = NULL;  // Don't free
-        NameInfo = NULL;   // Will be released in post-callback
-
-        InterlockedIncrement64(&g_PwState.Stats.PostCallbacksQueued);
-        ReturnStatus = FLT_PREOP_SUCCESS_WITH_CALLBACK;
     } else {
         ReturnStatus = FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
@@ -1221,215 +1176,15 @@ Cleanup:
     }
 
     //
-    // Only leave operation if NOT returning with post-callback.
-    // When returning WITH_CALLBACK, PostWrite inherits the operation
-    // reference and will call PwpLeaveOperation when done.
-    // Without this, shutdown can delete the lookaside between PreWrite
-    // returning and PostWrite running → BSOD.
+    // Always release the operation reference in the pre-op path.
+    // PreWrite never returns WITH_CALLBACK — PostWrite.c owns the
+    // registered post-op independently.
     //
-    if (ReturnStatus != FLT_PREOP_SUCCESS_WITH_CALLBACK) {
-        PwpLeaveOperation();
-    }
+    PwpLeaveOperation();
 
     return ReturnStatus;
 }
 
-
-FLT_POSTOP_CALLBACK_STATUS
-PwpPostWriteCompletion(
-    _Inout_ PFLT_CALLBACK_DATA Data,
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _In_opt_ PVOID CompletionContext,
-    _In_ FLT_POST_OPERATION_FLAGS Flags
-    )
-/*++
-Routine Description:
-    Post-operation callback for IRP_MJ_WRITE.
-
-    Called after write completes to:
-    - Track successful suspicious writes
-    - Update behavioral analysis
-    - Generate telemetry events
-
-    Handles elevated IRQL scenarios (draining) by deferring cleanup
-    to a work item.
-
-Arguments:
-    Data - Callback data with operation result.
-    FltObjects - Filter objects.
-    CompletionContext - Context from pre-operation.
-    Flags - Post-operation flags.
-
-Return Value:
-    FLT_POSTOP_FINISHED_PROCESSING.
---*/
-{
-    PPW_COMPLETION_CONTEXT PwContext;
-    PPW_DEFERRED_CLEANUP DeferredCleanup;
-
-    UNREFERENCED_PARAMETER(FltObjects);
-
-    if (CompletionContext == NULL) {
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-
-    PwContext = (PPW_COMPLETION_CONTEXT)CompletionContext;
-
-    //
-    // Validate context signature
-    //
-    if (PwContext->Signature != PW_CONTEXT_SIGNATURE) {
-        DbgPrintEx(
-            DPFLTR_IHVDRIVER_ID,
-            DPFLTR_ERROR_LEVEL,
-            "[ShadowStrike/PostWrite] CRITICAL: Invalid context signature 0x%08X!\n",
-            PwContext->Signature
-            );
-
-        //
-        // Memory corruption detected - attempt safe cleanup anyway
-        // to prevent leak, but log the error
-        //
-        if (g_PwState.LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&g_PwState.ContextLookaside, PwContext);
-        }
-        PwpLeaveOperation();
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-
-    //
-    // Check if we're at elevated IRQL (draining scenario)
-    //
-    if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING)) {
-        //
-        // Cannot safely release NameInfo at elevated IRQL
-        // Queue a work item for deferred cleanup
-        //
-        DeferredCleanup = (PPW_DEFERRED_CLEANUP)ExAllocatePool2(
-            POOL_FLAG_NON_PAGED,
-            sizeof(PW_DEFERRED_CLEANUP),
-            PW_WORKITEM_POOL_TAG
-            );
-
-        if (DeferredCleanup != NULL) {
-            DeferredCleanup->NameInfo = PwContext->NameInfo;
-            DeferredCleanup->Context = PwContext;
-
-#pragma warning(push)
-#pragma warning(disable:4996) /* ExInitializeWorkItem/ExQueueWorkItem deprecated */
-            ExInitializeWorkItem(
-                &DeferredCleanup->WorkItem,
-                PwpDeferredCleanupWorker,
-                DeferredCleanup
-                );
-
-            ExQueueWorkItem(&DeferredCleanup->WorkItem, DelayedWorkQueue);
-#pragma warning(pop)
-            InterlockedIncrement64(&g_PwState.Stats.DeferredCleanups);
-
-            //
-            // Work item inherits the operation reference.
-            // PwpLeaveOperation will be called by PwpDeferredCleanupWorker.
-            //
-        } else {
-            //
-            // Failed to allocate work item - leak is better than BSOD
-            // Still must release the operation reference to prevent deadlock
-            //
-            DbgPrintEx(
-                DPFLTR_IHVDRIVER_ID,
-                DPFLTR_ERROR_LEVEL,
-                "[ShadowStrike/PostWrite] Failed to allocate deferred cleanup work item\n"
-                );
-            PwpLeaveOperation();
-        }
-
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-
-    //
-    // Normal IRQL - process inline
-    //
-
-    //
-    // Check if write succeeded
-    //
-    if (NT_SUCCESS(Data->IoStatus.Status)) {
-        //
-        // Notify of successful suspicious write
-        //
-        if (PwContext->SuspicionFlags != PW_SUSPICION_NONE) {
-            PwpNotifyWriteEvent(PwContext, FALSE);
-        }
-    }
-
-    //
-    // Cleanup
-    //
-    if (PwContext->NameInfo != NULL) {
-        FltReleaseFileNameInformation(PwContext->NameInfo);
-    }
-
-    PwpFreeContext(PwContext);
-    PwpLeaveOperation();
-
-    return FLT_POSTOP_FINISHED_PROCESSING;
-}
-
-// ============================================================================
-// DEFERRED CLEANUP
-// ============================================================================
-
-static VOID
-PwpDeferredCleanupWorker(
-    _In_ PVOID Parameter
-    )
-/*++
-Routine Description:
-    Work item routine for deferred cleanup when post-callback
-    was invoked at elevated IRQL.
-
-Arguments:
-    Parameter - Pointer to PW_DEFERRED_CLEANUP structure.
---*/
-{
-    PPW_DEFERRED_CLEANUP Cleanup = (PPW_DEFERRED_CLEANUP)Parameter;
-
-    if (Cleanup == NULL) {
-        return;
-    }
-
-    PwpPerformDeferredCleanup(Cleanup->NameInfo, Cleanup->Context);
-
-    ExFreePoolWithTag(Cleanup, PW_WORKITEM_POOL_TAG);
-
-    //
-    // Release the operation reference inherited from PostWrite.
-    // This allows shutdown drain to proceed after all deferred work completes.
-    //
-    PwpLeaveOperation();
-}
-
-
-_IRQL_requires_(PASSIVE_LEVEL)
-static VOID
-PwpPerformDeferredCleanup(
-    _In_ PFLT_FILE_NAME_INFORMATION NameInfo,
-    _In_ PPW_COMPLETION_CONTEXT Context
-    )
-/*++
-Routine Description:
-    Performs cleanup that must happen at PASSIVE_LEVEL.
---*/
-{
-    if (NameInfo != NULL) {
-        FltReleaseFileNameInformation(NameInfo);
-    }
-
-    if (Context != NULL) {
-        PwpFreeContext(Context);
-    }
-}
 
 // ============================================================================
 // PRIVATE FUNCTION IMPLEMENTATIONS
@@ -1931,24 +1686,6 @@ PwpShouldBlockWrite(
     // By default, allow and monitor
     //
     return FALSE;
-}
-
-
-static VOID
-PwpUpdateProcessWriteMetrics(
-    _In_ HANDLE ProcessId,
-    _In_ PCUNICODE_STRING FileName
-    )
-{
-    UNREFERENCED_PARAMETER(ProcessId);
-    UNREFERENCED_PARAMETER(FileName);
-
-    //
-    // Process-level file modification tracking integrates with
-    // BehaviorEngine via callback infrastructure. When the behavioral
-    // engine is fully wired, this will feed per-process write frequency
-    // and unique-file-count metrics for mass-modification detection.
-    //
 }
 
 

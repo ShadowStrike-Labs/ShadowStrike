@@ -89,6 +89,13 @@ NTSTATUS ShadowStrikeInitializePreSetInfo(VOID);
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID ShadowStrikeCleanupPreSetInfo(VOID);
 
+// Forward declarations for PreWrite subsystem
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS ShadowStrikeInitializePreWrite(VOID);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID ShadowStrikeCleanupPreWrite(VOID);
+
 #include "../Callbacks/Process/WSLMonitor.h"
 #include "../Callbacks/Process/AppControl.h"
 #include "../SelfProtection/FirmwareIntegrity.h"
@@ -206,6 +213,7 @@ static ULONG g_SubsystemFlags = SubsysFlag_None;
  * PreSetInfo uses its own init guard rather than consuming a flag bit.
  */
 static BOOLEAN g_PreSetInfoInitialized = FALSE;
+static BOOLEAN g_PreWriteInitialized = FALSE;
 
 // ============================================================================
 // SUBSYSTEM HANDLE STORAGE
@@ -1722,6 +1730,22 @@ DriverEntry(
     }
 
     //
+    // Step 14.32: Initialize PreWrite subsystem (ransomware detection via
+    // entropy analysis, canary file protection, shadow copy/credential file
+    // write monitoring, self-protection for write operations)
+    //
+    status = ShadowStrikeInitializePreWrite();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize PreWrite subsystem: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_PreWriteInitialized = TRUE;
+        ShadowStrikeLogInitStatus("PreWrite Subsystem", STATUS_SUCCESS);
+    }
+
+    //
     // Step 15: Start filtering
     //
     status = FltStartFiltering(g_DriverData.FilterHandle);
@@ -1969,6 +1993,11 @@ ShadowStrikeUnload(
     if (g_PreSetInfoInitialized) {
         ShadowStrikeCleanupPreSetInfo();
         g_PreSetInfoInitialized = FALSE;
+    }
+
+    if (g_PreWriteInitialized) {
+        ShadowStrikeCleanupPreWrite();
+        g_PreWriteInitialized = FALSE;
     }
 
     if (g_SubsystemFlags & SubsysFlag_PreCreate) {
@@ -2826,6 +2855,11 @@ ShadowStrikeCleanupByFlags(
     if (g_PreSetInfoInitialized) {
         ShadowStrikeCleanupPreSetInfo();
         g_PreSetInfoInitialized = FALSE;
+    }
+
+    if (g_PreWriteInitialized) {
+        ShadowStrikeCleanupPreWrite();
+        g_PreWriteInitialized = FALSE;
     }
 
     if (g_SubsystemFlags & SubsysFlag_PreCreate) {
