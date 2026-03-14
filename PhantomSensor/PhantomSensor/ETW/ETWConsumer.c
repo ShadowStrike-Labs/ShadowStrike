@@ -631,6 +631,8 @@ EcPause(
     // Clear the resume event BEFORE setting state to prevent the race
     // where a thread sees Paused but the event is still signaled.
     //
+    KeClearEvent(&Consumer->FlowResumeEvent);
+
     OldState = InterlockedCompareExchange(
         &Consumer->State,
         (LONG)EcState_Paused,
@@ -638,10 +640,13 @@ EcPause(
     );
 
     if (OldState != (LONG)EcState_Running) {
+        //
+        // CAS failed — state wasn't Running. Restore the event we cleared.
+        // No thread can be blocked on this event since state was never Paused.
+        //
+        KeSetEvent(&Consumer->FlowResumeEvent, IO_NO_INCREMENT, FALSE);
         return STATUS_INVALID_DEVICE_STATE;
     }
-
-    KeClearEvent(&Consumer->FlowResumeEvent);
 
     TE_LOG_INFO(Component_ETWProvider, L"ETW consumer paused");
 
@@ -2073,6 +2078,11 @@ EcpProcessEventBatch(
         if (Record->Subscription != NULL &&
             Record->Subscription->Config.EventCallback != NULL) {
 
+            LARGE_INTEGER SubStart, SubEnd;
+            LONG64 SubTimeUs;
+
+            KeQuerySystemTimePrecise(&SubStart);
+
             __try {
                 Result = Record->Subscription->Config.EventCallback(
                     Record,
@@ -2086,6 +2096,26 @@ EcpProcessEventBatch(
                 Result = EcResult_Error;
                 InterlockedIncrement64(&Record->Subscription->Stats.CallbackErrors);
                 InterlockedIncrement(&Consumer->ConsecutiveErrors);
+            }
+
+            //
+            // Track per-subscription processing time
+            //
+            KeQuerySystemTimePrecise(&SubEnd);
+            SubTimeUs = (SubEnd.QuadPart - SubStart.QuadPart) / 10;
+            InterlockedAdd64(&Record->Subscription->Stats.TotalProcessingTimeUs, SubTimeUs);
+
+            //
+            // Update max processing time via CAS loop
+            //
+            {
+                LONG64 CurrentMax;
+                do {
+                    CurrentMax = Record->Subscription->Stats.MaxProcessingTimeUs;
+                    if (SubTimeUs <= CurrentMax) break;
+                } while (InterlockedCompareExchange64(
+                             &Record->Subscription->Stats.MaxProcessingTimeUs,
+                             SubTimeUs, CurrentMax) != CurrentMax);
             }
 
             if (Result == EcResult_Error) {
@@ -2573,6 +2603,103 @@ EcpFreeExtendedData(
     }
 
     Record->ExtendedDataCount = 0;
+}
+
+// ============================================================================
+// CONVENIENCE EVENT EMISSION
+// ============================================================================
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+EcEmitKernelEvent(
+    _In_ PEC_CONSUMER Consumer,
+    _In_ LPCGUID ProviderId,
+    _In_ USHORT EventId,
+    _In_ UCHAR Level,
+    _In_ ULONGLONG Keywords,
+    _In_ ULONG ProcessId,
+    _In_ ULONG ThreadId,
+    _In_reads_bytes_opt_(UserDataLength) PVOID UserData,
+    _In_ ULONG UserDataLength
+    )
+{
+    PEC_EVENT_RECORD Record;
+    NTSTATUS Status;
+
+    if (Consumer == NULL || ProviderId == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Fast-path: skip entirely if consumer isn't running
+    //
+    if (InterlockedCompareExchange(&Consumer->State, 0, 0) != (LONG)EcState_Running) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    Record = EcAllocateEventRecord(Consumer);
+    if (Record == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
+    // Populate event header
+    //
+    RtlCopyMemory(&Record->Header.ProviderId, ProviderId, sizeof(GUID));
+    Record->Header.EventId = EventId;
+    Record->Header.Level = Level;
+    Record->Header.Keywords = Keywords;
+    Record->Header.ProcessId = ProcessId;
+    Record->Header.ThreadId = ThreadId;
+    KeQuerySystemTimePrecise(&Record->Header.Timestamp);
+
+    //
+    // Copy user data if provided (caller retains ownership of source)
+    //
+    if (UserData != NULL && UserDataLength > 0) {
+        if (UserDataLength > EC_MAX_EVENT_DATA_SIZE) {
+            EcFreeEventRecord(Consumer, Record);
+            return STATUS_BUFFER_OVERFLOW;
+        }
+
+        Record->UserData = ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
+            UserDataLength,
+            EC_BUFFER_TAG
+        );
+
+        if (Record->UserData == NULL) {
+            EcFreeEventRecord(Consumer, Record);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        RtlCopyMemory(Record->UserData, UserData, UserDataLength);
+        Record->UserDataLength = UserDataLength;
+        Record->IsAllocated = TRUE;
+    }
+
+    //
+    // Ingest into pipeline — ownership transfers on success
+    //
+    Status = EcIngestEvent(Consumer, Record);
+    if (!NT_SUCCESS(Status) && Status != STATUS_NOT_FOUND) {
+        //
+        // STATUS_NOT_FOUND means no matching subscription — expected when
+        // no subscription covers this provider. Free the record.
+        // All other errors also require cleanup.
+        //
+        EcFreeEventRecord(Consumer, Record);
+    } else if (Status == STATUS_NOT_FOUND) {
+        //
+        // No matching subscription — free record, return success to
+        // avoid caller treating this as a hard error.
+        //
+        EcFreeEventRecord(Consumer, Record);
+        Status = STATUS_SUCCESS;
+    }
+
+    return Status;
 }
 
 // ============================================================================

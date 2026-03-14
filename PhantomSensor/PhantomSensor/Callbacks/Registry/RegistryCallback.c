@@ -46,6 +46,8 @@
 #include "../../Communication/ScanBridge.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Exclusions/ExclusionManager.h"
+#include "../../ETW/ETWConsumer.h"
+#include "../../Core/DriverEntry.h"
 
 // ============================================================================
 // POOL TAGS
@@ -1494,6 +1496,25 @@ ShadowStrikeRegistryCallbackRoutine(
     //
     if (ShadowStrikeIsProcessExcluded(processId, NULL)) {
         return STATUS_SUCCESS;
+    }
+
+    //
+    // Emit registry write event into ETW consumer pipeline for centralized
+    // telemetry and cross-source correlation
+    //
+    {
+        PEC_CONSUMER EtwConsumer = ShadowStrikeGetETWConsumer();
+        if (EtwConsumer != NULL) {
+            EcEmitKernelEvent(
+                EtwConsumer,
+                &GUID_KERNEL_REGISTRY_PROVIDER,
+                EC_EVENTID_REGISTRY_WRITE,
+                4, // Information
+                0xFFFFFFFFFFFFFFFFULL,
+                HandleToULong(processId),
+                HandleToULong(PsGetCurrentThreadId()),
+                NULL, 0);
+        }
     }
 
     //

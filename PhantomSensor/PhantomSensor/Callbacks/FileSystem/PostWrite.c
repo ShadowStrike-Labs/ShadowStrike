@@ -67,6 +67,8 @@
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../Transactions/KtmMonitor.h"
+#include "../../ETW/ETWConsumer.h"
+#include "../../Core/DriverEntry.h"
 
 //
 // WPP Tracing - conditionally include if available
@@ -736,6 +738,25 @@ ShadowStrikePostWrite(
     // Update global statistics
     //
     InterlockedIncrement64(&g_PostWriteState.TotalPostWriteOperations);
+
+    //
+    // Emit file write event into ETW consumer pipeline for centralized
+    // telemetry and cross-source correlation
+    //
+    {
+        PEC_CONSUMER EtwConsumer = ShadowStrikeGetETWConsumer();
+        if (EtwConsumer != NULL) {
+            EcEmitKernelEvent(
+                EtwConsumer,
+                &GUID_KERNEL_FILE_PROVIDER,
+                EC_EVENTID_FILE_WRITE,
+                4, // Information
+                0xFFFFFFFFFFFFFFFFULL,
+                HandleToULong(PsGetCurrentProcessId()),
+                HandleToULong(PsGetCurrentThreadId()),
+                NULL, 0);
+        }
+    }
 
     //
     // Initialize write context

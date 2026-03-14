@@ -403,6 +403,66 @@ ShadowStrikeBatchFlushCallback(
 }
 
 // ============================================================================
+// ETW CONSUMER EVENT CALLBACK
+// ============================================================================
+
+/**
+ * @brief Unified event callback for all ETWConsumer subscriptions.
+ *
+ * This callback runs on ETWConsumer processing threads (system threads at
+ * PASSIVE_LEVEL). It receives events from all kernel callbacks that emit
+ * into the pipeline via EcEmitKernelEvent, providing:
+ *   - Centralized telemetry streaming to user-mode via CommPort
+ *   - Unified event rate limiting and priority ordering
+ *   - Cross-source event correlation via AttackChainTracker
+ *
+ * @irql PASSIVE_LEVEL (processing threads)
+ */
+static
+EC_PROCESS_RESULT
+NTAPI
+ShadowStrikeEtwEventCallback(
+    _In_ PEC_EVENT_RECORD Record,
+    _In_opt_ PVOID Context
+    )
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    if (Record == NULL) {
+        return EcResult_Continue;
+    }
+
+    //
+    // Stream processed events to TelemetryEvents ETW provider.
+    // NOTE: We do NOT log every individual event — that would flood the
+    // telemetry channel at thousands of events/second. Instead, stats
+    // are aggregated and logged periodically in the health check timer.
+    // Individual event forwarding to CommPort (below) handles real-time
+    // delivery of high-priority events to the user-mode agent.
+    //
+
+    //
+    // Forward high-priority events to CommPort for real-time user-mode delivery.
+    // Low/Background priority events are only streamed via ETW telemetry
+    // to avoid flooding the communication channel.
+    //
+    if (Record->Priority <= EcPriority_Normal) {
+        SHADOWSTRIKE_MESSAGE_HEADER hdr = { 0 };
+        hdr.Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
+        hdr.Version = SHADOWSTRIKE_PROTOCOL_VERSION;
+        hdr.MessageType = (UINT16)FilterMessageType_BehavioralAlert;
+        hdr.TotalSize = sizeof(hdr);
+        hdr.DataSize = 0;
+        hdr.MessageId = (UINT64)Record->Header.ProcessId;
+        KeQuerySystemTime((PLARGE_INTEGER)&hdr.Timestamp);
+
+        ShadowStrikeSendNotification(&hdr, sizeof(hdr));
+    }
+
+    return EcResult_Continue;
+}
+
+// ============================================================================
 // DRIVER ENTRY
 // ============================================================================
 
@@ -796,6 +856,39 @@ DriverEntry(
         g_EtwConsumer = NULL;
         status = STATUS_SUCCESS;
     } else {
+        //
+        // Start the consumer (spawns processing threads, health timer)
+        //
+        NTSTATUS ecStatus = EcStart(g_EtwConsumer);
+        if (!NT_SUCCESS(ecStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to start ETW consumer: 0x%08X (continuing)\n",
+                       ecStatus);
+        } else {
+            //
+            // Register subscriptions for all kernel event domains.
+            // Each subscription uses the unified event callback that
+            // streams events to telemetry and CommPort.
+            //
+            PEC_SUBSCRIPTION subTemp = NULL;
+
+            EcSubscribeKernelProcess(g_EtwConsumer, ShadowStrikeEtwEventCallback, NULL, &subTemp);
+            subTemp = NULL;
+            EcSubscribeKernelFile(g_EtwConsumer, ShadowStrikeEtwEventCallback, NULL, &subTemp);
+            subTemp = NULL;
+            EcSubscribeKernelNetwork(g_EtwConsumer, ShadowStrikeEtwEventCallback, NULL, &subTemp);
+            subTemp = NULL;
+            EcSubscribeKernelRegistry(g_EtwConsumer, ShadowStrikeEtwEventCallback, NULL, &subTemp);
+            subTemp = NULL;
+            EcSubscribeSecurityAuditing(g_EtwConsumer, ShadowStrikeEtwEventCallback, NULL, &subTemp);
+            subTemp = NULL;
+            EcSubscribeThreatIntelligence(g_EtwConsumer, ShadowStrikeEtwEventCallback, NULL, &subTemp);
+
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                       "[ShadowStrike] ETW consumer started with %ld subscriptions\n",
+                       InterlockedCompareExchange(&g_EtwConsumer->SubscriptionCount, 0, 0));
+        }
+
         ShadowStrikeLogInitStatus("ETW Consumer", STATUS_SUCCESS);
     }
 
@@ -2374,6 +2467,12 @@ PTB_MANAGER
 ShadowStrikeGetTelemetryBuffer(VOID)
 {
     return g_TelemetryBuffer;
+}
+
+PEC_CONSUMER
+ShadowStrikeGetETWConsumer(VOID)
+{
+    return g_EtwConsumer;
 }
 
 // ============================================================================

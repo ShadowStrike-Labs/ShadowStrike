@@ -57,6 +57,8 @@
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Exclusions/ExclusionManager.h"
+#include "../../ETW/ETWConsumer.h"
+#include "../../Core/DriverEntry.h"
 
 //
 // Forward declarations for undocumented but exported ntoskrnl APIs
@@ -1946,6 +1948,25 @@ Arguments:
         InterlockedIncrement64(&g_ImgNotify.Stats.KernelModeImages);
     } else {
         InterlockedIncrement64(&g_ImgNotify.Stats.UserModeImages);
+    }
+
+    //
+    // Emit image load event into ETW consumer pipeline for centralized
+    // telemetry streaming and cross-source correlation
+    //
+    {
+        PEC_CONSUMER EtwConsumer = ShadowStrikeGetETWConsumer();
+        if (EtwConsumer != NULL) {
+            EcEmitKernelEvent(
+                EtwConsumer,
+                &GUID_KERNEL_PROCESS_PROVIDER,
+                EC_EVENTID_IMAGE_LOAD,
+                4, // Information
+                0xFFFFFFFFFFFFFFFFULL,
+                HandleToULong(ProcessId),
+                HandleToULong(PsGetCurrentThreadId()),
+                NULL, 0);
+        }
     }
 
     //

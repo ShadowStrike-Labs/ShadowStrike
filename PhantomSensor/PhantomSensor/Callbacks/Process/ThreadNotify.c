@@ -63,6 +63,8 @@
 #include "../../Shared/KernelProcessTypes.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Exclusions/ExclusionManager.h"
+#include "../../ETW/ETWConsumer.h"
+#include "../../Core/DriverEntry.h"
 #include "ProcessRelationship.h"
 #include "ProcessAnalyzer.h"
 
@@ -780,9 +782,47 @@ Arguments:
 
     if (Create) {
         InterlockedIncrement64(&g_TnMonitor.Stats.TotalThreadsCreated);
+
+        //
+        // Emit thread creation event into ETW consumer pipeline
+        //
+        {
+            PEC_CONSUMER EtwConsumer = ShadowStrikeGetETWConsumer();
+            if (EtwConsumer != NULL) {
+                EcEmitKernelEvent(
+                    EtwConsumer,
+                    &GUID_KERNEL_PROCESS_PROVIDER,
+                    EC_EVENTID_THREAD_CREATE,
+                    4, // Information
+                    0xFFFFFFFFFFFFFFFFULL,
+                    HandleToULong(ProcessId),
+                    HandleToULong(ThreadId),
+                    NULL, 0);
+            }
+        }
+
         TnpHandleThreadCreation(ProcessId, ThreadId);
     } else {
         InterlockedIncrement64(&g_TnMonitor.Stats.TotalThreadsTerminated);
+
+        //
+        // Emit thread exit event into ETW consumer pipeline
+        //
+        {
+            PEC_CONSUMER EtwConsumer = ShadowStrikeGetETWConsumer();
+            if (EtwConsumer != NULL) {
+                EcEmitKernelEvent(
+                    EtwConsumer,
+                    &GUID_KERNEL_PROCESS_PROVIDER,
+                    EC_EVENTID_THREAD_EXIT,
+                    4, // Information
+                    0xFFFFFFFFFFFFFFFFULL,
+                    HandleToULong(ProcessId),
+                    HandleToULong(ThreadId),
+                    NULL, 0);
+            }
+        }
+
         TnpHandleThreadTermination(ProcessId, ThreadId);
     }
 

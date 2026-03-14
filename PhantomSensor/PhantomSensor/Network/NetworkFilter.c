@@ -73,6 +73,8 @@
 #include <ntstrsafe.h>
 #include <ip2string.h>
 #include "../Behavioral/BehaviorEngine.h"
+#include "../ETW/ETWConsumer.h"
+#include "../Core/DriverEntry.h"
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
 
@@ -3204,6 +3206,24 @@ NfpCreateAndInsertConnection(
         processId = InMetaValues->processId;
     } else {
         processId = 0;
+    }
+
+    //
+    // Emit network connect event into ETW consumer pipeline
+    //
+    {
+        PEC_CONSUMER EtwConsumer = ShadowStrikeGetETWConsumer();
+        if (EtwConsumer != NULL) {
+            EcEmitKernelEvent(
+                EtwConsumer,
+                &GUID_KERNEL_NETWORK_PROVIDER,
+                EC_EVENTID_NETWORK_CONNECT,
+                4, // Information
+                0xFFFFFFFFFFFFFFFFULL,
+                (ULONG)processId,
+                HandleToULong(PsGetCurrentThreadId()),
+                NULL, 0);
+        }
     }
 
     connection = NfpAllocateConnection();

@@ -74,6 +74,8 @@ Performance Characteristics:
 #include <ntstrsafe.h>
 #include <wchar.h>
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../ETW/ETWConsumer.h"
+#include "../../Core/DriverEntry.h"
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Transactions/KtmMonitor.h"
 #include "../Process/WSLMonitor.h"
@@ -918,6 +920,26 @@ Return Value:
     // ========================================================================
     // PHASE 7: THREAT DETECTION ANALYSIS
     // ========================================================================
+
+    //
+    // Emit file create event into ETW consumer pipeline for centralized
+    // telemetry and cross-source correlation (files reaching this point
+    // passed exclusion checks and are non-directory)
+    //
+    {
+        PEC_CONSUMER EtwConsumer = ShadowStrikeGetETWConsumer();
+        if (EtwConsumer != NULL) {
+            EcEmitKernelEvent(
+                EtwConsumer,
+                &GUID_KERNEL_FILE_PROVIDER,
+                EC_EVENTID_FILE_CREATE,
+                4, // Information
+                0xFFFFFFFFFFFFFFFFULL,
+                HandleToULong(RequestorPid),
+                HandleToULong(PsGetCurrentThreadId()),
+                NULL, 0);
+        }
+    }
 
     //
     // WSL/Container escape file access monitoring (MITRE T1611, T1003).

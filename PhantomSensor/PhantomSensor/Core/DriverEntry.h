@@ -198,6 +198,7 @@ typedef struct _ENC_MANAGER ENC_MANAGER, *PENC_MANAGER;
 typedef struct _COMP_MANAGER COMP_MANAGER, *PCOMP_MANAGER;
 typedef struct _PA_ANALYZER *PPA_ANALYZER;
 typedef struct _TB_MANAGER TB_MANAGER, *PTB_MANAGER;
+typedef struct _EC_CONSUMER EC_CONSUMER, *PEC_CONSUMER;
 
 // ============================================================================
 // DRIVER LIFECYCLE FUNCTIONS
@@ -529,6 +530,14 @@ ShadowStrikeGetProcessAnalyzer(VOID);
 _IRQL_requires_max_(DISPATCH_LEVEL)
 PTB_MANAGER
 ShadowStrikeGetTelemetryBuffer(VOID);
+
+/**
+ * @brief Get the global ETW consumer event pipeline.
+ * @return PEC_CONSUMER or NULL if not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PEC_CONSUMER
+ShadowStrikeGetETWConsumer(VOID);
 
 #ifdef __cplusplus
 }

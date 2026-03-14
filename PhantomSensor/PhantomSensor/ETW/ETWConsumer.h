@@ -146,6 +146,21 @@ extern "C" {
 #define EC_PRIORITY_QUEUE_COUNT         5
 
 // ============================================================================
+// WELL-KNOWN EVENT IDS (for EcEmitKernelEvent from kernel callbacks)
+// ============================================================================
+
+#define EC_EVENTID_PROCESS_CREATE       1
+#define EC_EVENTID_PROCESS_EXIT         2
+#define EC_EVENTID_THREAD_CREATE        3
+#define EC_EVENTID_THREAD_EXIT          4
+#define EC_EVENTID_IMAGE_LOAD           5
+#define EC_EVENTID_REGISTRY_WRITE       6
+#define EC_EVENTID_FILE_CREATE          7
+#define EC_EVENTID_FILE_WRITE           8
+#define EC_EVENTID_NETWORK_CONNECT      9
+#define EC_EVENTID_NETWORK_DISCONNECT   10
+
+// ============================================================================
 // WELL-KNOWN ETW PROVIDER GUIDs
 // ============================================================================
 
@@ -757,6 +772,42 @@ EcCloneEventRecord(
     _In_ PEC_CONSUMER Consumer,
     _In_ PEC_EVENT_RECORD Source,
     _Out_ PEC_EVENT_RECORD* Clone
+    );
+
+/**
+ * @brief Emit a kernel event into the processing pipeline (convenience API).
+ *
+ * Allocates an EC_EVENT_RECORD, populates the header from parameters,
+ * optionally copies user data, and calls EcIngestEvent. On success,
+ * ownership of the record transfers to the consumer. On failure, the
+ * record is freed and caller retains ownership of UserData.
+ *
+ * @param Consumer      Consumer instance
+ * @param ProviderId    Well-known provider GUID (e.g., GUID_KERNEL_PROCESS_PROVIDER)
+ * @param EventId       Event identifier (e.g., EC_EVENTID_PROCESS_CREATE)
+ * @param Level         Event severity level (1=Critical..5=Verbose)
+ * @param Keywords      Event keyword bitmask
+ * @param ProcessId     Source process ID
+ * @param ThreadId      Source thread ID
+ * @param UserData      Optional event payload (copied; caller retains ownership)
+ * @param UserDataLength Size of UserData in bytes
+ *
+ * @return STATUS_SUCCESS or error status
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+EcEmitKernelEvent(
+    _In_ PEC_CONSUMER Consumer,
+    _In_ LPCGUID ProviderId,
+    _In_ USHORT EventId,
+    _In_ UCHAR Level,
+    _In_ ULONGLONG Keywords,
+    _In_ ULONG ProcessId,
+    _In_ ULONG ThreadId,
+    _In_reads_bytes_opt_(UserDataLength) PVOID UserData,
+    _In_ ULONG UserDataLength
     );
 
 // ============================================================================

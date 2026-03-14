@@ -97,6 +97,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../Communication/ScanBridge.h"
 #include "../../Communication/TelemetryBuffer.h"
 #include "../../ALPC/AlpcPortMonitor.h"
+#include "../../ETW/ETWConsumer.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -1009,6 +1010,23 @@ Arguments:
     // Handle process termination
     //
     if (!IsCreation) {
+        //
+        // Emit process exit event into ETW consumer pipeline
+        //
+        {
+            PEC_CONSUMER EtwConsumer = ShadowStrikeGetETWConsumer();
+            if (EtwConsumer != NULL) {
+                EcEmitKernelEvent(
+                    EtwConsumer,
+                    &GUID_KERNEL_PROCESS_PROVIDER,
+                    EC_EVENTID_PROCESS_EXIT,
+                    4, // Information
+                    0xFFFFFFFFFFFFFFFFULL,
+                    HandleToULong(ProcessId),
+                    HandleToULong(PsGetCurrentThreadId()),
+                    NULL, 0);
+            }
+        }
         PnpHandleProcessTermination(ProcessId);
         goto Cleanup;
     }
@@ -1016,6 +1034,24 @@ Arguments:
     //
     // === PROCESS CREATION HANDLING ===
     //
+
+    //
+    // Emit process creation event into ETW consumer pipeline
+    //
+    {
+        PEC_CONSUMER EtwConsumer = ShadowStrikeGetETWConsumer();
+        if (EtwConsumer != NULL) {
+            EcEmitKernelEvent(
+                EtwConsumer,
+                &GUID_KERNEL_PROCESS_PROVIDER,
+                EC_EVENTID_PROCESS_CREATE,
+                4, // Information
+                0xFFFFFFFFFFFFFFFFULL,
+                HandleToULong(ProcessId),
+                HandleToULong(PsGetCurrentThreadId()),
+                NULL, 0);
+        }
+    }
 
     //
     // Check for known system process (skip detailed analysis for performance)
