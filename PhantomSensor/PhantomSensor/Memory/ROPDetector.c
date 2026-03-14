@@ -661,7 +661,11 @@ Return Value:
     // Initialize rate limiting
     //
     internalDetector->MaxAnalysesPerSecond = 1000;
-    KeQuerySystemTime((PLARGE_INTEGER)&internalDetector->LastResetTime);
+    {
+        LARGE_INTEGER resetTime;
+        KeQuerySystemTime(&resetTime);
+        InterlockedExchange64(&internalDetector->LastResetTime, resetTime.QuadPart);
+    }
 
     //
     // Initialize dangerous gadget patterns
@@ -981,6 +985,8 @@ Routine Description:
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrint("ROPDetector: Exception 0x%08X scanning section %u of module at %p\n",
+                     GetExceptionCode(), sectionIndex, ModuleBase);
             continue;
         }
     }
@@ -1611,11 +1617,6 @@ Routine Description:
         return STATUS_DELETE_PENDING;
     }
 
-    if (internalDetector->CallbackCount >= ROP_MAX_CALLBACKS) {
-        RoppReleaseRundown(Detector);
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
     callbackEntry = (PROP_CALLBACK_ENTRY)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(ROP_CALLBACK_ENTRY),
@@ -1635,6 +1636,18 @@ Routine Description:
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&internalDetector->CallbackLock);
+
+    //
+    // Quota check INSIDE lock to prevent TOCTOU race where two threads
+    // both pass the check and both insert, exceeding ROP_MAX_CALLBACKS.
+    //
+    if (internalDetector->CallbackCount >= ROP_MAX_CALLBACKS) {
+        ExReleasePushLockExclusive(&internalDetector->CallbackLock);
+        KeLeaveCriticalRegion();
+        ShadowStrikeFreePoolWithTag(callbackEntry, ROP_POOL_TAG_CONTEXT);
+        RoppReleaseRundown(Detector);
+        return STATUS_QUOTA_EXCEEDED;
+    }
 
     InsertTailList(&internalDetector->CallbackList, &callbackEntry->ListEntry);
     InterlockedIncrement(&internalDetector->CallbackCount);
@@ -1740,9 +1753,18 @@ Routine Description:
         return STATUS_DELETE_PENDING;
     }
 
+    //
+    // Read all stats under GadgetLock for mutual consistency.
+    // Individual reads are atomic on x64 but without a lock the values
+    // can be from different points in time relative to each other.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Detector->GadgetLock);
     Stats->GadgetCount = (ULONG)Detector->GadgetCount;
     Stats->StacksAnalyzed = Detector->Stats.StacksAnalyzed;
     Stats->ChainsDetected = Detector->Stats.ChainsDetected;
+    ExReleasePushLockShared(&Detector->GadgetLock);
+    KeLeaveCriticalRegion();
 
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Detector->ModuleLock);
