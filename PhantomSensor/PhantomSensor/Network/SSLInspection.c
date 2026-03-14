@@ -657,7 +657,7 @@ SslInspectClientHello(
         BeEngineSubmitEvent(
             BehaviorEvent_EncryptedChannel,
             BehaviorCategory_NetworkOperation,
-            0,  // ProcessId unavailable at TLS layer
+            (UINT32)(ULONG_PTR)NewSession->ProcessId,
             NULL,
             0,
             (UINT32)(NewSession->SuspicionScore > 100 ? 100 : NewSession->SuspicionScore),
