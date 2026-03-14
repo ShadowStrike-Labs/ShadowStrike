@@ -277,6 +277,13 @@ PeNormalizePath(
     //
     allocLen = ((ULONG)inputChars + 1) * sizeof(WCHAR);
 
+    //
+    // Compile-time guard: allocLen must fit in USHORT for MaximumLength.
+    // If SHADOWSTRIKE_MAX_EXCLUSION_PATH_LENGTH grows beyond ~32765 chars,
+    // this will fail to compile instead of silently truncating.
+    //
+    C_ASSERT(((ULONG)(SHADOWSTRIKE_MAX_EXCLUSION_PATH_LENGTH) + 1) * sizeof(WCHAR) <= MAXUSHORT);
+
     buffer = (PWCHAR)ExAllocatePool2(
         POOL_FLAG_PAGED,
         allocLen,

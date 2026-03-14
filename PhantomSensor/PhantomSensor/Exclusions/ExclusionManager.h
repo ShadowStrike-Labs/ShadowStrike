@@ -849,6 +849,36 @@ ShadowStrikeGetTrustedProcessCount(
     VOID
     );
 
+/**
+ * @brief Process exclusion subsystem statistics (snapshot).
+ *
+ * Exposed publicly so MessageHandler can populate DRIVER_STATUS.
+ */
+typedef struct _PE_EXCLUSION_STATS {
+    LONG64 TotalLookups;
+    LONG64 BitmapHits;
+    LONG64 HashHits;
+    LONG64 Misses;
+    LONG64 ProcessesExcluded;
+    LONG64 InheritedExclusions;
+    LONG64 PathMatchExclusions;
+    LONG64 ManualExclusions;
+    LONG   CurrentBitmapCount;
+    LONG   CurrentHashCount;
+} PE_EXCLUSION_STATS, *PPE_EXCLUSION_STATS;
+
+/**
+ * @brief Get process exclusion statistics.
+ *
+ * @param Stats     Receives the statistics snapshot.
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ShadowStrikeProcessExclusionGetStats(
+    _Out_ PPE_EXCLUSION_STATS Stats
+    );
+
 // ============================================================================
 // PATH EXCLUSION HELPERS (PathExclusion.c)
 // ============================================================================

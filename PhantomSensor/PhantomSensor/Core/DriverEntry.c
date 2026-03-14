@@ -1603,6 +1603,22 @@ DriverEntry(
     }
 
     //
+    // Step 9.1: Initialize process exclusion engine (trusted PID bitmap + hash)
+    // Depends on ExclusionManager for path/process name matching.
+    //
+    if (g_InitFlags & InitFlag_ExclusionsInitialized) {
+        status = ShadowStrikeProcessExclusionInitialize();
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to initialize process exclusion engine: 0x%08X\n",
+                       status);
+            status = STATUS_SUCCESS;
+        } else {
+            ShadowStrikeLogInitStatus("Process Exclusion Engine", STATUS_SUCCESS);
+        }
+    }
+
+    //
     // Step 10: Initialize hash utilities (non-critical)
     //
     status = ShadowStrikeInitializeHashUtils();
@@ -2631,7 +2647,13 @@ ShadowStrikeUnload(
     }
 
     //
-    // Step 5: Shutdown exclusion manager
+    // Step 5: Shutdown process exclusion engine (BEFORE ExclusionManager)
+    // ProcessExclusion depends on ExclusionManager — shut down dependent first.
+    //
+    ShadowStrikeProcessExclusionShutdown();
+
+    //
+    // Step 5.1: Shutdown exclusion manager
     //
     if (g_InitFlags & InitFlag_ExclusionsInitialized) {
         ShadowStrikeExclusionShutdown();
@@ -3580,6 +3602,7 @@ ShadowStrikeCleanupByFlags(
     }
 
     if (InitFlags & InitFlag_ExclusionsInitialized) {
+        ShadowStrikeProcessExclusionShutdown();
         ShadowStrikeExclusionShutdown();
     }
 

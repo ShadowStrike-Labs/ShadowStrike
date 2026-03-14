@@ -1886,6 +1886,22 @@ MhpHandleDriverStatusQuery(
     }
 
     //
+    // Process Exclusion Engine statistics (trusted PID bitmap/hash)
+    //
+    {
+        PE_EXCLUSION_STATS peStats;
+        ShadowStrikeProcessExclusionGetStats(&peStats);
+        driverStatus.ProcExclTotalLookups       = peStats.TotalLookups;
+        driverStatus.ProcExclBitmapHits         = peStats.BitmapHits;
+        driverStatus.ProcExclHashHits           = peStats.HashHits;
+        driverStatus.ProcExclMisses             = peStats.Misses;
+        driverStatus.ProcExclProcessesExcluded  = peStats.ProcessesExcluded;
+        driverStatus.ProcExclInheritedExclusions= peStats.InheritedExclusions;
+        driverStatus.ProcExclCurrentBitmapCount = peStats.CurrentBitmapCount;
+        driverStatus.ProcExclCurrentHashCount   = peStats.CurrentHashCount;
+    }
+
+    //
     // Copy to output buffer (already validated as kernel memory by caller)
     //
     RtlCopyMemory(OutputBuffer, &driverStatus, sizeof(driverStatus));

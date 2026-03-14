@@ -871,9 +871,18 @@ Return Value:
         }
 
         //
-        // Check process exclusion
+        // Check process exclusion (ExclusionManager — user-configured)
         //
         if (ShadowStrikeIsProcessExcluded(RequestorPid, NULL)) {
+            SHADOWSTRIKE_INC_STAT(ExclusionMatches);
+            InterlockedIncrement64(&g_PcState.Stats.OperationsExcluded);
+            goto CleanupAllow;
+        }
+
+        //
+        // Check process trust (ProcessExclusion — pattern-matched at creation)
+        //
+        if (ShadowStrikeIsProcessTrusted(RequestorPid)) {
             SHADOWSTRIKE_INC_STAT(ExclusionMatches);
             InterlockedIncrement64(&g_PcState.Stats.OperationsExcluded);
             goto CleanupAllow;

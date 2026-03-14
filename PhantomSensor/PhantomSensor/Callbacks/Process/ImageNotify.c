@@ -1933,6 +1933,14 @@ Arguments:
     }
 
     //
+    // Check if the process is in the trusted PID set (ProcessExclusion engine)
+    //
+    if (ProcessId != NULL && ShadowStrikeIsProcessTrusted(ProcessId)) {
+        ExReleaseRundownProtection(&g_ImgNotify.SubsystemRundown);
+        return;
+    }
+
+    //
     // Check if the image path is excluded from analysis
     //
     if (FullImageName != NULL && ShadowStrikeIsPathExcluded(FullImageName, NULL)) {

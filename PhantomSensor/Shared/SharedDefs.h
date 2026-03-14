@@ -395,6 +395,18 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     LONG  ExclProcessCount;
     LONG  ExclPidCount;
 
+    //
+    // Process Exclusion Engine stats (ProcessExclusion.c)
+    //
+    LONG64 ProcExclTotalLookups;
+    LONG64 ProcExclBitmapHits;
+    LONG64 ProcExclHashHits;
+    LONG64 ProcExclMisses;
+    LONG64 ProcExclProcessesExcluded;
+    LONG64 ProcExclInheritedExclusions;
+    LONG   ProcExclCurrentBitmapCount;
+    LONG   ProcExclCurrentHashCount;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================

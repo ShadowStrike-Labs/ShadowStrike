@@ -242,7 +242,7 @@ static PE_CONTEXT g_ProcessExclusionContext = { 0 };
 // FORWARD DECLARATIONS
 // ============================================================================
 
-static VOID
+static BOOLEAN
 PepAcquireReference(
     VOID
     );
@@ -399,7 +399,7 @@ ShadowStrikeRemoveTrustedProcess(
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowStrikeProcessExclusionGetStats(
-    _Out_ PPE_STATISTICS Stats
+    _Out_ PPE_EXCLUSION_STATS Stats
     );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -737,7 +737,9 @@ ShadowStrikeOnProcessCreate(
         return FALSE;
     }
 
-    PepAcquireReference();
+    if (!PepAcquireReference()) {
+        return FALSE;
+    }
 
     //
     // Step 1: Check if path matches exclusion patterns
@@ -888,7 +890,9 @@ ShadowStrikeOnProcessTerminate(
         return;
     }
 
-    PepAcquireReference();
+    if (!PepAcquireReference()) {
+        return;
+    }
 
     if (pidValue < PE_BITMAP_MAX_PID) {
         //
@@ -966,16 +970,9 @@ ShadowStrikeIsProcessTrusted(
 
     //
     // PE-3 fix: Acquire reference to prevent use-after-free during
-    // shutdown. Without this, context teardown can race with lookups.
+    // shutdown. PepAcquireReference returns FALSE if shutting down.
     //
-    PepAcquireReference();
-
-    //
-    // Re-check state after reference acquisition — shutdown may have
-    // started between our initial PepIsReady check and the ref acquire.
-    //
-    if (!PepIsReady()) {
-        PepReleaseReference();
+    if (!PepAcquireReference()) {
         return FALSE;
     }
 
@@ -1070,10 +1067,7 @@ ShadowStrikeIsProcessTrustedEx(
     //
     // PE-3 fix: Acquire reference to prevent use-after-free during shutdown.
     //
-    PepAcquireReference();
-
-    if (!PepIsReady()) {
-        PepReleaseReference();
+    if (!PepAcquireReference()) {
         return FALSE;
     }
 
@@ -1166,7 +1160,9 @@ ShadowStrikeAddTrustedProcess(
         return STATUS_INVALID_PARAMETER;
     }
 
-    PepAcquireReference();
+    if (!PepAcquireReference()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
 
     if (pidValue < PE_BITMAP_MAX_PID) {
         //
@@ -1263,7 +1259,9 @@ ShadowStrikeRemoveTrustedProcess(
         return FALSE;
     }
 
-    PepAcquireReference();
+    if (!PepAcquireReference()) {
+        return FALSE;
+    }
 
     if (pidValue < PE_BITMAP_MAX_PID) {
         //
@@ -1374,7 +1372,7 @@ ShadowStrikeRemoveTrustedProcess(
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowStrikeProcessExclusionGetStats(
-    _Out_ PPE_STATISTICS Stats
+    _Out_ PPE_EXCLUSION_STATS Stats
     )
 {
     PPE_CONTEXT ctx = &g_ProcessExclusionContext;
@@ -1384,10 +1382,21 @@ ShadowStrikeProcessExclusionGetStats(
     }
 
     //
-    // Each field is atomically consistent, but the snapshot
-    // as a whole is not (no cross-field lock).
+    // Copy each field individually — internal struct uses volatile
+    // qualifiers which differ from the public struct. Each read is
+    // atomically consistent but the snapshot as a whole is not
+    // (no cross-field lock, intentional for performance).
     //
-    RtlCopyMemory(Stats, &ctx->Stats, sizeof(PE_STATISTICS));
+    Stats->TotalLookups       = ReadNoFence64((PLONG64)&ctx->Stats.TotalLookups);
+    Stats->BitmapHits         = ReadNoFence64((PLONG64)&ctx->Stats.BitmapHits);
+    Stats->HashHits           = ReadNoFence64((PLONG64)&ctx->Stats.HashHits);
+    Stats->Misses             = ReadNoFence64((PLONG64)&ctx->Stats.Misses);
+    Stats->ProcessesExcluded  = ReadNoFence64((PLONG64)&ctx->Stats.ProcessesExcluded);
+    Stats->InheritedExclusions= ReadNoFence64((PLONG64)&ctx->Stats.InheritedExclusions);
+    Stats->PathMatchExclusions= ReadNoFence64((PLONG64)&ctx->Stats.PathMatchExclusions);
+    Stats->ManualExclusions   = ReadNoFence64((PLONG64)&ctx->Stats.ManualExclusions);
+    Stats->CurrentBitmapCount = ReadAcquire(&ctx->Stats.CurrentBitmapCount);
+    Stats->CurrentHashCount   = ReadAcquire(&ctx->Stats.CurrentHashCount);
 }
 
 /**
@@ -1447,13 +1456,34 @@ ShadowStrikeGetTrustedProcessCount(
 // PRIVATE IMPLEMENTATION - REFERENCE COUNTING
 // ============================================================================
 
-static VOID
+/**
+ * @brief Acquire reference — returns FALSE if shutdown is in progress.
+ *
+ * Callers MUST check the return value and NOT proceed if FALSE is returned.
+ * The acquire-then-recheck pattern prevents the window where a caller
+ * increments the refcount after shutdown has released its init reference
+ * but before KeWaitForSingleObject, which would cause the wait to timeout
+ * and teardown to race with the still-active caller.
+ */
+static BOOLEAN
 PepAcquireReference(
     VOID
     )
 {
     PPE_CONTEXT ctx = &g_ProcessExclusionContext;
     InterlockedIncrement(&ctx->ReferenceCount);
+
+    //
+    // After incrementing, re-check state. If shutting down, undo
+    // the increment immediately. This closes the race window between
+    // PepIsReady() returning TRUE and the ref increment completing.
+    //
+    if (ReadAcquire(&ctx->State) != PE_STATE_READY) {
+        PepReleaseReference();
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 static VOID

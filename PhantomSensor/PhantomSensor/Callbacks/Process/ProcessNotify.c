@@ -1087,6 +1087,18 @@ Arguments:
     }
 
     //
+    // Evaluate process against exclusion patterns and register in
+    // trusted PID bitmap/hash if matched. This must happen BEFORE
+    // the ShadowStrikeIsProcessExcluded check below so that newly
+    // created processes are immediately recognized as trusted.
+    //
+    ShadowStrikeOnProcessCreate(
+        ProcessId,
+        CreateInfo->ParentProcessId,
+        CreateInfo->ImageFileName
+    );
+
+    //
     // Check if process is excluded from behavioral analysis
     //
     if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
@@ -3564,6 +3576,13 @@ PnpHandleProcessTermination(
             PrRemoveProcess(prGraph, ProcessId);
         }
     }
+
+    //
+    // Remove process from trusted PID set (bitmap or hash table).
+    // Must happen on termination to prevent stale entries and PID reuse
+    // inheriting wrong trust state.
+    //
+    ShadowStrikeOnProcessTerminate(ProcessId);
 
     //
     // Look up process context
