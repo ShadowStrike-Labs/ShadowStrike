@@ -674,6 +674,17 @@ NfFilterGetC2Detector(
     );
 
 /**
+ * @brief Get the global ConnectionTracker instance.
+ *
+ * @return Pointer to connection tracker, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _CT_TRACKER*
+NfFilterGetConnectionTracker(
+    VOID
+    );
+
+/**
  * @brief Get the global DNS Monitor instance.
  *
  * @return Pointer to DNS monitor, or NULL if unavailable.

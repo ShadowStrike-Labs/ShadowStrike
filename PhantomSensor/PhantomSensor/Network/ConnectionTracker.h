@@ -401,7 +401,7 @@ typedef struct _CT_TRACKER {
         BOOLEAN EnableTLSInspection;
     } Config;
 
-} CT_TRACKER, *PCT_TRACKER;
+} CT_TRACKER, *PCONNECTION_TRACKER;
 
 //=============================================================================
 // Callback Types
@@ -421,12 +421,12 @@ typedef VOID (*CT_CONNECTION_CALLBACK)(
 
 NTSTATUS
 CtInitialize(
-    _Out_ PCT_TRACKER* Tracker
+    _Out_ PCONNECTION_TRACKER* Tracker
     );
 
 VOID
 CtShutdown(
-    _Inout_ PCT_TRACKER Tracker
+    _Inout_ PCONNECTION_TRACKER Tracker
     );
 
 //=============================================================================
@@ -435,7 +435,7 @@ CtShutdown(
 
 NTSTATUS
 CtCreateConnection(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ UINT64 FlowId,
     _In_ HANDLE ProcessId,
     _In_ CT_DIRECTION Direction,
@@ -450,14 +450,14 @@ CtCreateConnection(
 
 NTSTATUS
 CtUpdateConnectionState(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ UINT64 FlowId,
     _In_ CT_CONNECTION_STATE NewState
     );
 
 NTSTATUS
 CtRemoveConnection(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ UINT64 FlowId
     );
 
@@ -467,14 +467,14 @@ CtRemoveConnection(
 
 NTSTATUS
 CtFindByFlowId(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ UINT64 FlowId,
     _Out_ PCT_CONNECTION* Connection
     );
 
 NTSTATUS
 CtFindByEndpoints(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ PVOID LocalAddress,
     _In_ USHORT LocalPort,
     _In_ PVOID RemoteAddress,
@@ -490,7 +490,7 @@ CtFindByEndpoints(
 
 NTSTATUS
 CtUpdateStats(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ UINT64 FlowId,
     _In_ SIZE_T BytesSent,
     _In_ SIZE_T BytesReceived,
@@ -504,7 +504,7 @@ CtUpdateStats(
 
 NTSTATUS
 CtGetProcessConnections(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ HANDLE ProcessId,
     _Out_writes_to_(MaxConnections, *ConnectionCount) PCT_CONNECTION* Connections,
     _In_ ULONG MaxConnections,
@@ -513,7 +513,7 @@ CtGetProcessConnections(
 
 NTSTATUS
 CtGetProcessNetworkStats(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ HANDLE ProcessId,
     _Out_ PULONG64 BytesSent,
     _Out_ PULONG64 BytesReceived,
@@ -532,7 +532,7 @@ typedef BOOLEAN (*CT_ENUM_CALLBACK)(
 
 NTSTATUS
 CtEnumerateConnections(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ CT_ENUM_CALLBACK Callback,
     _In_opt_ PVOID Context
     );
@@ -543,14 +543,14 @@ CtEnumerateConnections(
 
 NTSTATUS
 CtRegisterCallback(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ CT_CONNECTION_CALLBACK Callback,
     _In_opt_ PVOID Context
     );
 
 VOID
 CtUnregisterCallback(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ CT_CONNECTION_CALLBACK Callback
     );
 
@@ -580,12 +580,22 @@ typedef struct _CT_STATISTICS {
     ULONG64 TotalBytesReceived;
     ULONG TrackedProcesses;
     LARGE_INTEGER UpTime;
-} CT_STATISTICS, *PCT_STATISTICS;
+} CT_STATISTICS, *PCONNECTION_STATISTICS;
 
 NTSTATUS
 CtGetStatistics(
-    _In_ PCT_TRACKER Tracker,
-    _Out_ PCT_STATISTICS Stats
+    _In_ PCONNECTION_TRACKER Tracker,
+    _Out_ PCONNECTION_STATISTICS Stats
+    );
+
+//=============================================================================
+// Public API - Process Lifecycle
+//=============================================================================
+
+VOID
+CtProcessTerminated(
+    _In_ PCONNECTION_TRACKER Tracker,
+    _In_ HANDLE ProcessId
     );
 
 #ifdef __cplusplus

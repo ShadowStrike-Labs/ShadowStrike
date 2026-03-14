@@ -105,12 +105,17 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include <ntstrsafe.h>
 
 //
-// Forward-declare C2Detection APIs to avoid including NetworkFilter.h
-// (which pulls ConnectionTracker.h — PCT_TRACKER collides with ParentChainTracker).
+// Forward-declare C2Detection and ConnectionTracker APIs to avoid
+// including NetworkFilter.h (which pulls ConnectionTracker.h —
+// PCT_TRACKER/PCT_STATISTICS collide with ParentChainTracker.h).
 //
 typedef struct _C2_DETECTOR C2_DETECTOR, *PC2_DETECTOR;
 VOID C2ProcessTerminated(_In_ PC2_DETECTOR Detector, _In_ HANDLE ProcessId);
 PC2_DETECTOR NfFilterGetC2Detector(VOID);
+
+typedef struct _CT_TRACKER CT_TRACKER, *PCONNECTION_TRACKER;
+VOID CtProcessTerminated(_In_ PCONNECTION_TRACKER Tracker, _In_ HANDLE ProcessId);
+struct _CT_TRACKER* NfFilterGetConnectionTracker(VOID);
 
 static VOID PnpCleanupStaleContexts(VOID);
 
@@ -3764,6 +3769,17 @@ PnpHandleProcessTermination(
         PC2_DETECTOR c2det = NfFilterGetC2Detector();
         if (c2det != NULL) {
             C2ProcessTerminated(c2det, ProcessId);
+        }
+    }
+
+    //
+    // Remove ConnectionTracker process context for this process.
+    // Prevents CT_PROCESS_CONTEXT accumulation with stale EPROCESS refs.
+    //
+    {
+        PCONNECTION_TRACKER ctTracker = (PCONNECTION_TRACKER)NfFilterGetConnectionTracker();
+        if (ctTracker != NULL) {
+            CtProcessTerminated(ctTracker, ProcessId);
         }
     }
 

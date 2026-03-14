@@ -200,7 +200,7 @@ static ULONG g_CleanupTimerId;
 static volatile LONG g_CleanupInProgress;
 
 // Subsystem pointers (from other Network modules)
-static PCT_TRACKER g_ConnectionTracker;
+static PCONNECTION_TRACKER g_ConnectionTracker;
 static PDNS_MONITOR g_DnsMonitor;
 static PC2_DETECTOR g_C2Detector;
 static PNR_MANAGER g_ReputationManager;
@@ -1956,6 +1956,15 @@ NfFlowDeleteNotify(
     status = NfFilterFindConnection(flowContext, &connection);
     if (NT_SUCCESS(status)) {
         InterlockedExchange((LONG*)&connection->State, (LONG)ConnectionState_Closed);
+
+        //
+        // Transition connection in ConnectionTracker to Closed.
+        // Uses WFP FlowId which was stored at NfpCreateAndInsertConnection time.
+        //
+        if (g_ConnectionTracker != NULL && connection->FlowId != 0) {
+            CtRemoveConnection(g_ConnectionTracker, connection->FlowId);
+        }
+
         NfFilterReleaseConnection(connection);
     }
 }
@@ -3341,6 +3350,36 @@ NfpCreateAndInsertConnection(
     NfpAnalyzeConnection(connection);
 
     //
+    // Feed connection into ConnectionTracker for per-process network context,
+    // 5-tuple lookup, state machine, and bandwidth monitoring.
+    //
+    if (g_ConnectionTracker != NULL) {
+        PVOID ctLocalAddr = IsV6 ? (PVOID)localIp6 : (PVOID)&localIp;
+        PVOID ctRemoteAddr = IsV6 ? (PVOID)remoteIp6 : (PVOID)&remoteIp;
+        CT_DIRECTION ctDir = (Direction == NetworkDirection_Outbound)
+            ? CtDirection_Outbound : CtDirection_Inbound;
+        PCT_CONNECTION ctConn = NULL;
+
+        NTSTATUS ctStatus = CtCreateConnection(
+            g_ConnectionTracker,
+            connection->FlowId,
+            (HANDLE)(ULONG_PTR)processId,
+            ctDir,
+            protocol,
+            ctLocalAddr,
+            localPort,
+            ctRemoteAddr,
+            remotePort,
+            IsV6,
+            &ctConn
+        );
+
+        if (NT_SUCCESS(ctStatus) && ctConn != NULL) {
+            CtRelease(ctConn);
+        }
+    }
+
+    //
     // Feed connection to C2Detection for beaconing/IOC analysis (T1071/T1573).
     // Passes the raw remote address pointer — C2RecordConnection copies it.
     //
@@ -3879,6 +3918,22 @@ NfpProcessStreamData(
     InterlockedAdd64(&g_NfState.TotalBytesMonitored, (LONG64)dataSize);
 
     //
+    // Update ConnectionTracker per-connection and per-process byte/packet stats.
+    // Uses flow context (NF ConnectionId) — ConnectionTracker keyed by WFP FlowId.
+    //
+    if (g_ConnectionTracker != NULL && connection->FlowId != 0) {
+        BOOLEAN isSend = !!(StreamPacket->streamData->flags & FWPS_STREAM_FLAG_SEND);
+        CtUpdateStats(
+            g_ConnectionTracker,
+            connection->FlowId,
+            isSend ? dataSize : 0,
+            isSend ? 0 : dataSize,
+            isSend ? 1 : 0,
+            isSend ? 0 : 1
+        );
+    }
+
+    //
     // Feed traffic to C2Detection for beacon interval analysis (T1071/T1573).
     // Uses the connection's remote address which is stable for the connection lifetime.
     //
@@ -4096,6 +4151,14 @@ NfFilterGetC2Detector(
     )
 {
     return g_C2Detector;
+}
+
+PCONNECTION_TRACKER
+NfFilterGetConnectionTracker(
+    VOID
+    )
+{
+    return g_ConnectionTracker;
 }
 
 PDNS_MONITOR

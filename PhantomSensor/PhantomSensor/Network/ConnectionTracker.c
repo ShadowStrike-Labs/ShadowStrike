@@ -253,7 +253,7 @@ CtpCleanupThreadRoutine(
 _Use_decl_annotations_
 NTSTATUS
 CtInitialize(
-    _Out_ PCT_TRACKER* Tracker
+    _Out_ PCONNECTION_TRACKER* Tracker
     )
 {
     NTSTATUS status = STATUS_SUCCESS;
@@ -484,7 +484,7 @@ Cleanup:
 _Use_decl_annotations_
 VOID
 CtShutdown(
-    _Inout_ PCT_TRACKER Tracker
+    _Inout_ PCONNECTION_TRACKER Tracker
     )
 {
     PCT_TRACKER_INTERNAL tracker;
@@ -662,7 +662,7 @@ CtShutdown(
 _Use_decl_annotations_
 NTSTATUS
 CtCreateConnection(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ UINT64 FlowId,
     _In_ HANDLE ProcessId,
     _In_ CT_DIRECTION Direction,
@@ -699,6 +699,7 @@ CtCreateConnection(
     // Check if originating process is excluded from monitoring
     //
     if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        *Connection = NULL;
         return STATUS_SUCCESS;
     }
 
@@ -945,7 +946,7 @@ CtCreateConnection(
 _Use_decl_annotations_
 NTSTATUS
 CtUpdateConnectionState(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ UINT64 FlowId,
     _In_ CT_CONNECTION_STATE NewState
     )
@@ -1033,7 +1034,7 @@ CtUpdateConnectionState(
 _Use_decl_annotations_
 NTSTATUS
 CtRemoveConnection(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ UINT64 FlowId
     )
 {
@@ -1095,7 +1096,7 @@ CtRemoveConnection(
 _Use_decl_annotations_
 NTSTATUS
 CtFindByFlowId(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ UINT64 FlowId,
     _Out_ PCT_CONNECTION* Connection
     )
@@ -1141,7 +1142,7 @@ CtFindByFlowId(
 _Use_decl_annotations_
 NTSTATUS
 CtFindByEndpoints(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ PVOID LocalAddress,
     _In_ USHORT LocalPort,
     _In_ PVOID RemoteAddress,
@@ -1217,7 +1218,7 @@ CtFindByEndpoints(
 _Use_decl_annotations_
 NTSTATUS
 CtUpdateStats(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ UINT64 FlowId,
     _In_ SIZE_T BytesSent,
     _In_ SIZE_T BytesReceived,
@@ -1297,7 +1298,7 @@ CtUpdateStats(
 _Use_decl_annotations_
 NTSTATUS
 CtGetProcessConnections(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ HANDLE ProcessId,
     _Out_writes_to_(MaxConnections, *ConnectionCount) PCT_CONNECTION* Connections,
     _In_ ULONG MaxConnections,
@@ -1375,7 +1376,7 @@ CtGetProcessConnections(
 _Use_decl_annotations_
 NTSTATUS
 CtGetProcessNetworkStats(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ HANDLE ProcessId,
     _Out_ PULONG64 BytesSent,
     _Out_ PULONG64 BytesReceived,
@@ -1440,7 +1441,7 @@ CtGetProcessNetworkStats(
 _Use_decl_annotations_
 NTSTATUS
 CtEnumerateConnections(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ CT_ENUM_CALLBACK Callback,
     _In_opt_ PVOID Context
     )
@@ -1530,7 +1531,7 @@ CtEnumerateConnections(
 _Use_decl_annotations_
 NTSTATUS
 CtRegisterCallback(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ CT_CONNECTION_CALLBACK Callback,
     _In_opt_ PVOID Context
     )
@@ -1568,7 +1569,7 @@ CtRegisterCallback(
 _Use_decl_annotations_
 VOID
 CtUnregisterCallback(
-    _In_ PCT_TRACKER Tracker,
+    _In_ PCONNECTION_TRACKER Tracker,
     _In_ CT_CONNECTION_CALLBACK Callback
     )
 {
@@ -1653,8 +1654,8 @@ CtRelease(
 _Use_decl_annotations_
 NTSTATUS
 CtGetStatistics(
-    _In_ PCT_TRACKER Tracker,
-    _Out_ PCT_STATISTICS Stats
+    _In_ PCONNECTION_TRACKER Tracker,
+    _Out_ PCONNECTION_STATISTICS Stats
     )
 {
     LARGE_INTEGER currentTime;
@@ -1676,6 +1677,77 @@ CtGetStatistics(
     Stats->UpTime.QuadPart = currentTime.QuadPart - Tracker->Stats.StartTime.QuadPart;
 
     return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// PROCESS LIFECYCLE
+// ============================================================================
+
+/**
+ * @brief Remove a process context when the process terminates.
+ *
+ * Removes the CT_PROCESS_CONTEXT from hash and global lists and releases
+ * the hash table's reference.  If the process had active connections they
+ * retain their own references and will release the context when they are
+ * freed (stale cleanup or CtRemoveConnection).
+ */
+_Use_decl_annotations_
+VOID
+CtProcessTerminated(
+    _In_ PCONNECTION_TRACKER Tracker,
+    _In_ HANDLE ProcessId
+    )
+{
+    PCT_TRACKER_INTERNAL tracker;
+    PCT_PROCESS_CONTEXT processCtx = NULL;
+    PLIST_ENTRY entry;
+    ULONG bucket;
+
+    if (Tracker == NULL || !Tracker->Initialized) {
+        return;
+    }
+
+    tracker = CONTAINING_RECORD(Tracker, CT_TRACKER_INTERNAL, Public);
+    bucket = CtpHashProcessId(ProcessId);
+
+    //
+    // Acquire both locks in hierarchy order: ProcessListLock first, then ProcessHash.Lock.
+    //
+    ExAcquirePushLockExclusive(&Tracker->ProcessListLock);
+    ExAcquirePushLockExclusive(&tracker->ProcessHash.Lock);
+
+    for (entry = tracker->ProcessHash.Buckets[bucket].Flink;
+         entry != &tracker->ProcessHash.Buckets[bucket];
+         entry = entry->Flink) {
+
+        PCT_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, HashListEntry);
+        if (ctx->ProcessId == ProcessId) {
+            processCtx = ctx;
+            break;
+        }
+    }
+
+    if (processCtx != NULL) {
+        //
+        // Remove from hash and global list while under both locks.
+        //
+        RemoveEntryList(&processCtx->HashListEntry);
+        InitializeListHead(&processCtx->HashListEntry);
+        RemoveEntryList(&processCtx->GlobalListEntry);
+        InitializeListHead(&processCtx->GlobalListEntry);
+        InterlockedDecrement(&Tracker->ProcessCount);
+    }
+
+    ExReleasePushLockExclusive(&tracker->ProcessHash.Lock);
+    ExReleasePushLockExclusive(&Tracker->ProcessListLock);
+
+    if (processCtx != NULL) {
+        //
+        // Release the hash table reference.  If connections still hold
+        // references, the context stays alive until they release.
+        //
+        CtpReleaseProcessContext(tracker, processCtx);
+    }
 }
 
 // ============================================================================
