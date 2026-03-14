@@ -135,6 +135,42 @@ ShadowpVerifyDirectoryOwner(
     _In_ HANDLE DirectoryHandle
     );
 
+static NTSTATUS
+ShadowpVerifyDirectoryDacl(
+    _In_ HANDLE DirectoryHandle
+    );
+
+static NTSTATUS
+ShadowpAllocateAndInitializeSid(
+    _In_ PSID_IDENTIFIER_AUTHORITY IdentifierAuthority,
+    _In_ UCHAR SubAuthorityCount,
+    _In_ ULONG SubAuthority0,
+    _In_ ULONG SubAuthority1,
+    _Outptr_ PSID* Sid
+    );
+
+static VOID
+ShadowpFreeSid(
+    _In_ _Post_invalid_ PSID Sid
+    );
+
+// ============================================================================
+// ALLOC_TEXT — place paged functions in PAGE section
+// ============================================================================
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, ShadowCreatePrivateNamespace)
+#pragma alloc_text(PAGE, ShadowDestroyPrivateNamespace)
+#pragma alloc_text(PAGE, ShadowCreateNamespaceObject)
+#pragma alloc_text(PAGE, ShadowIsNamespaceInitialized)
+#pragma alloc_text(PAGE, ShadowpBuildSecurityDescriptor)
+#pragma alloc_text(PAGE, ShadowpCleanupState)
+#pragma alloc_text(PAGE, ShadowpVerifyDirectoryOwner)
+#pragma alloc_text(PAGE, ShadowpVerifyDirectoryDacl)
+#pragma alloc_text(PAGE, ShadowpAllocateAndInitializeSid)
+#pragma alloc_text(PAGE, ShadowpFreeSid)
+#endif
+
 // ============================================================================
 // SID HELPER (kernel RtlAllocateAndInitializeSid replacement)
 // ============================================================================
@@ -281,9 +317,12 @@ ShadowCreatePrivateNamespace(
 
     //
     // STEP 2: Initialize rundown protection.
+    // NOTE: RundownInitialized is set to TRUE only AFTER all state is valid
+    // (right before NAMESPACE_STATE_INITIALIZED). This prevents a concurrent
+    // ShadowReferenceNamespace from acquiring rundown protection against
+    // partially-initialized state that the failure cleanup path would tear down.
     //
     ExInitializeRundownProtection(&state->RundownRef);
-    state->RundownInitialized = TRUE;
 
     //
     // STEP 3: Build self-relative security descriptor (NonPagedPoolNx).
@@ -366,6 +405,22 @@ ShadowCreatePrivateNamespace(
             status = STATUS_ACCESS_DENIED;
             goto cleanup;
         }
+
+        //
+        // Anti-squatting: verify the DACL is not overly permissive.
+        // A SYSTEM-owned directory with Everyone:GENERIC_ALL DACL would
+        // let lower-privilege processes create objects inside our namespace.
+        //
+        status = ShadowpVerifyDirectoryDacl(state->DirectoryHandle);
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] SECURITY: Directory DACL verification failed "
+                       "(possible hijacking): 0x%X\n", status);
+            ZwClose(state->DirectoryHandle);
+            state->DirectoryHandle = NULL;
+            status = STATUS_ACCESS_DENIED;
+            goto cleanup;
+        }
     } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "[ShadowStrike] Failed to create directory: 0x%X\n", status);
@@ -397,10 +452,13 @@ ShadowCreatePrivateNamespace(
 
     //
     // STEP 6: Mark namespace as initialized.
+    // RundownInitialized is set HERE — after all state is valid — so that
+    // ShadowReferenceNamespace cannot acquire protection against incomplete state.
     //
     KeQuerySystemTime(&state->CreationTime);
     state->Initialized = TRUE;
     state->Destroying = FALSE;
+    state->RundownInitialized = TRUE;
 
     InterlockedExchange(&state->InitializationState, NAMESPACE_STATE_INITIALIZED);
 
@@ -842,7 +900,7 @@ ShadowpBuildSecurityDescriptor(
     //
     // STEP 4: Allocate and initialize DACL (temporary, PagedPool, zeroed).
     //
-    dacl = (PACL)ExAllocatePoolZero(PagedPool, daclSize, SHADOW_NAMESPACE_ACL_TAG);
+    dacl = (PACL)ExAllocatePool2(POOL_FLAG_PAGED, daclSize, SHADOW_NAMESPACE_ACL_TAG);
     if (dacl == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto cleanup;
@@ -860,7 +918,7 @@ ShadowpBuildSecurityDescriptor(
     //
     // STEP 5: Allocate and initialize SACL (temporary, PagedPool, zeroed).
     //
-    sacl = (PACL)ExAllocatePoolZero(PagedPool, saclSize, SHADOW_NAMESPACE_ACL_TAG);
+    sacl = (PACL)ExAllocatePool2(POOL_FLAG_PAGED, saclSize, SHADOW_NAMESPACE_ACL_TAG);
     if (sacl == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto cleanup;
@@ -923,8 +981,8 @@ ShadowpBuildSecurityDescriptor(
         goto cleanup;
     }
 
-    selfRelativeSD = (PSECURITY_DESCRIPTOR)ExAllocatePoolZero(
-        NonPagedPoolNx, selfRelativeSize, SHADOW_NAMESPACE_SD_TAG);
+    selfRelativeSD = (PSECURITY_DESCRIPTOR)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, selfRelativeSize, SHADOW_NAMESPACE_SD_TAG);
     if (selfRelativeSD == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto cleanup;
@@ -1057,6 +1115,152 @@ ShadowpVerifyDirectoryOwner(
     ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
 
     return status;
+}
+
+/**
+ * @brief Verify the DACL on a pre-existing directory restricts access to
+ *        SYSTEM and Administrators only.
+ *
+ * When STATUS_OBJECT_NAME_COLLISION occurs, we must verify that the pre-existing
+ * directory does not have an overly permissive DACL. A SYSTEM-owned directory
+ * with Everyone:GENERIC_ALL would allow lower-privileged processes to create
+ * objects inside our namespace, enabling denial-of-service or object squatting.
+ *
+ * Strategy: query the DACL, walk each ACE, and reject if any ACE grants
+ * access to a SID other than SYSTEM or BUILTIN\Administrators.
+ *
+ * @param[in] DirectoryHandle Open handle to the directory object
+ * @return STATUS_SUCCESS if DACL is sufficiently restrictive, 
+ *         STATUS_ACCESS_DENIED if a dangerous DACL is detected
+ */
+static NTSTATUS
+ShadowpVerifyDirectoryDacl(
+    _In_ HANDLE DirectoryHandle
+    )
+{
+    NTSTATUS status;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    ULONG sdSize = 0;
+    PACL dacl = NULL;
+    BOOLEAN daclPresent = FALSE;
+    BOOLEAN daclDefaulted = FALSE;
+    PSID systemSid = NULL;
+    PSID adminsSid = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    BOOLEAN acceptable = TRUE;
+
+    PAGED_CODE();
+
+    //
+    // Query DACL_SECURITY_INFORMATION.
+    //
+    status = ZwQuerySecurityObject(
+        DirectoryHandle,
+        DACL_SECURITY_INFORMATION,
+        NULL,
+        0,
+        &sdSize
+    );
+
+    if (status != STATUS_BUFFER_TOO_SMALL || sdSize == 0 || sdSize > 16384) {
+        return STATUS_ACCESS_DENIED;
+    }
+
+    sd = (PSECURITY_DESCRIPTOR)ExAllocatePool2(
+        POOL_FLAG_PAGED, sdSize, SHADOW_NAMESPACE_TAG);
+    if (sd == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    status = ZwQuerySecurityObject(
+        DirectoryHandle,
+        DACL_SECURITY_INFORMATION,
+        sd,
+        sdSize,
+        &sdSize
+    );
+
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
+        return status;
+    }
+
+    //
+    // Extract DACL.
+    //
+    status = RtlGetDaclSecurityDescriptor(sd, &daclPresent, &dacl, &daclDefaulted);
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    //
+    // NULL DACL means full access to everyone — reject immediately.
+    //
+    if (!daclPresent || dacl == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Directory has NULL DACL (unrestricted access) — rejecting\n");
+        ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    //
+    // Build trusted SIDs: SYSTEM and BUILTIN\Administrators.
+    //
+    status = ShadowpAllocateAndInitializeSid(
+        &ntAuthority, 1,
+        SECURITY_LOCAL_SYSTEM_RID, 0,
+        &systemSid
+    );
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
+        return status;
+    }
+
+    status = ShadowpAllocateAndInitializeSid(
+        &ntAuthority, 2,
+        SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+        &adminsSid
+    );
+    if (!NT_SUCCESS(status)) {
+        ShadowpFreeSid(systemSid);
+        ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
+        return status;
+    }
+
+    //
+    // Walk each ACE. Reject if any ACCESS_ALLOWED_ACE grants to a SID
+    // that is neither SYSTEM nor BUILTIN\Administrators.
+    //
+    for (ULONG i = 0; i < dacl->AceCount; i++) {
+        PACE_HEADER aceHeader = NULL;
+
+        status = RtlGetAce(dacl, i, (PVOID*)&aceHeader);
+        if (!NT_SUCCESS(status)) {
+            acceptable = FALSE;
+            break;
+        }
+
+        if (aceHeader->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+            PACCESS_ALLOWED_ACE allowedAce = (PACCESS_ALLOWED_ACE)aceHeader;
+            PSID aceSid = (PSID)&allowedAce->SidStart;
+
+            if (!RtlEqualSid(aceSid, systemSid) &&
+                !RtlEqualSid(aceSid, adminsSid)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] Directory DACL contains non-privileged "
+                           "ACCESS_ALLOWED ACE (index %u) — rejecting\n", i);
+                acceptable = FALSE;
+                break;
+            }
+        }
+    }
+
+    ShadowpFreeSid(adminsSid);
+    ShadowpFreeSid(systemSid);
+    ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
+
+    return acceptable ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
 }
 
 /**
