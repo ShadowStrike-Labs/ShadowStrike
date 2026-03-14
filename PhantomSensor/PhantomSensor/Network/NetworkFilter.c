@@ -2513,6 +2513,21 @@ static VOID
 NfpFreeConnection(_In_ PNF_CONNECTION_ENTRY Connection)
 {
     if (Connection != NULL) {
+        //
+        // If this connection had a TLS session tracked by SSLInspection,
+        // remove it to prevent NonPaged pool leaks (SSL2-02).
+        //
+        if (Connection->TlsHandshakeComplete && g_SslInspector != NULL &&
+            KeGetCurrentIrql() <= APC_LEVEL) {
+            BOOLEAN isV6 = (Connection->RemoteAddress.Address.Family == 23);
+            SslRemoveSession(
+                g_SslInspector,
+                isV6 ? (PVOID)&Connection->RemoteAddress.Address.V6
+                      : (PVOID)&Connection->RemoteAddress.Address.V4,
+                Connection->RemoteAddress.Port,
+                isV6);
+        }
+
         ExFreeToNPagedLookasideList(&g_NfState.ConnectionLookaside, Connection);
     }
 }
@@ -2817,6 +2832,14 @@ NfpCleanupTimerCallback(
         NfpCleanupStaleConnections();
         NfpCleanupStaleDnsEntries();
         NfpCleanupStalePendingDns();
+
+        //
+        // Evict stale SSL sessions — prevents NonPaged pool exhaustion
+        // and STATUS_QUOTA_EXCEEDED after 65536 accumulated sessions.
+        //
+        if (g_SslInspector != NULL) {
+            SslCleanupStaleSessions(g_SslInspector);
+        }
     }
 
     InterlockedExchange(&g_CleanupInProgress, 0);
@@ -4215,6 +4238,73 @@ NfpProcessStreamData(
     } else {
         InterlockedAdd64((LONG64*)&connection->BytesReceived, (LONG64)dataSize);
         InterlockedIncrement((LONG*)&connection->PacketsReceived);
+
+        //
+        // Detect TLS ServerHello on inbound data and feed to SSLInspection (SSL2-02).
+        // Only after ClientHello has been processed and ServerHello not yet seen.
+        // ServerHello: byte[0]=0x16 (Handshake), byte[5]=0x02.
+        //
+        if (g_SslInspector != NULL &&
+            connection->TlsHandshakeComplete &&
+            !connection->TlsServerHelloComplete &&
+            dataSize >= 6 && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+
+            UCHAR shPeek[6];
+            SIZE_T shPeekCopied = 0;
+            FwpsCopyStreamDataToBuffer0(
+                StreamPacket->streamData, shPeek, sizeof(shPeek), &shPeekCopied);
+
+            if (shPeekCopied >= 6 &&
+                shPeek[0] == 0x16 &&
+                shPeek[1] == 0x03 &&
+                (shPeek[2] >= 0x01 && shPeek[2] <= 0x03) &&
+                shPeek[5] == 0x02) {
+
+                PVOID shData = NULL;
+                BOOLEAN shAllocated = FALSE;
+                UCHAR shLocalBuf[2048];
+                SIZE_T shCopied = 0;
+
+                if (dataSize <= sizeof(shLocalBuf)) {
+                    FwpsCopyStreamDataToBuffer0(
+                        StreamPacket->streamData, shLocalBuf, sizeof(shLocalBuf), &shCopied);
+                    if (shCopied > 0) {
+                        shData = shLocalBuf;
+                    }
+                } else if (dataSize <= 16384) {
+                    shData = ExAllocatePool2(POOL_FLAG_PAGED, (SIZE_T)dataSize, 'hSfN');
+                    if (shData != NULL) {
+                        FwpsCopyStreamDataToBuffer0(
+                            StreamPacket->streamData, shData, (SIZE_T)dataSize, &shCopied);
+                        shAllocated = TRUE;
+                        if (shCopied == 0) {
+                            ExFreePoolWithTag(shData, 'hSfN');
+                            shData = NULL;
+                            shAllocated = FALSE;
+                        }
+                    }
+                }
+
+                if (shData != NULL && shCopied >= 6) {
+                    BOOLEAN isV6 = (connection->RemoteAddress.Address.Family == 23);
+
+                    SslInspectServerHello(
+                        g_SslInspector,
+                        isV6 ? (PVOID)&connection->RemoteAddress.Address.V6
+                              : (PVOID)&connection->RemoteAddress.Address.V4,
+                        connection->RemoteAddress.Port,
+                        isV6,
+                        shData,
+                        (ULONG)shCopied);
+
+                    connection->TlsServerHelloComplete = TRUE;
+                }
+
+                if (shAllocated && shData != NULL) {
+                    ExFreePoolWithTag(shData, 'hSfN');
+                }
+            }
+        }
     }
 
     InterlockedAdd64(&g_NfState.TotalBytesMonitored, (LONG64)dataSize);

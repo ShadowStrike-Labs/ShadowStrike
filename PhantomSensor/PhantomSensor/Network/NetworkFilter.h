@@ -142,9 +142,10 @@ typedef struct _NF_CONNECTION_ENTRY {
     UINT16 TlsVersion;
     UINT16 CipherSuite;
     CHAR JA3Fingerprint[MAX_JA3_FINGERPRINT_LENGTH];
-    BOOLEAN TlsHandshakeComplete;
+    BOOLEAN TlsHandshakeComplete;       // ClientHello processed
     BOOLEAN IsMaliciousJA3;
-    UINT8 Reserved2[2];
+    BOOLEAN TlsServerHelloComplete;     // ServerHello processed
+    UINT8 Reserved2[1];
     
     // Threat assessment
     UINT32 ThreatScore;
