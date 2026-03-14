@@ -23,11 +23,12 @@
  * @file CacheOptimization.c
  * @brief High-performance, lock-optimized caching infrastructure for kernel EDR.
  *
- * Lock Ordering (strictly enforced throughout):
+ * Lock Ordering (strictly enforced — always acquire in ascending order):
  *   1. Bucket lock (per-bucket EX_PUSH_LOCK)
  *   2. Shard LRU lock (per-shard EX_PUSH_LOCK)
  *   3. Global list lock (per-cache EX_PUSH_LOCK)
  *   4. Manager CacheListLock
+ *   Never acquire a lower-numbered lock while holding a higher-numbered lock.
  *
  * Reference counting:
  *   - Entries are born with RefCount = 1 (the hash bucket reference).
@@ -59,6 +60,7 @@
 /* ========================================================================= */
 
 #define CO_DEFAULT_MAX_MEMORY       (256 * 1024 * 1024)  /* 256 MB */
+#define CO_MAX_DATA_SIZE            (1 * 1024 * 1024)    /* 1 MB per entry — prevents unbounded alloc */
 
 #define CO_100NS_PER_SECOND         10000000LL
 
@@ -777,6 +779,11 @@ CoPutEx(
         return STATUS_INVALID_PARAMETER;
     }
 
+    /* Cap per-entry data size to prevent unbounded pool allocations (CO-03) */
+    if (DataSize > CO_MAX_DATA_SIZE) {
+        return STATUS_INVALID_BUFFER_SIZE;
+    }
+
     if (TTLSeconds == 0) {
         TTLSeconds = Cache->Config.DefaultTTLSeconds;
     }
@@ -1063,7 +1070,14 @@ CoGet(
         if (DataBuffer != NULL) {
             if (*DataSize < entry->DataSize) {
                 *DataSize = entry->DataSize;
+                /* Entry was found — count as hit even though buffer too small (CO-04) */
+                InterlockedExchange64(&entry->LastAccessTimeQpc, currentTime.QuadPart);
+                InterlockedIncrement(&entry->AccessCount);
                 ExReleasePushLockShared(&bucket->Lock);
+                InterlockedIncrement64(&Cache->Stats.Hits);
+                if (Cache->Manager != NULL) {
+                    InterlockedIncrement64(&Cache->Manager->TotalHits);
+                }
                 return STATUS_BUFFER_TOO_SMALL;
             }
             if (entry->Data != NULL && entry->DataSize > 0) {

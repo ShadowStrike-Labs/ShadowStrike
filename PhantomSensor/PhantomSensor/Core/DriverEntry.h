@@ -198,6 +198,7 @@ typedef struct _ENC_MANAGER ENC_MANAGER, *PENC_MANAGER;
 typedef struct _COMP_MANAGER COMP_MANAGER, *PCOMP_MANAGER;
 typedef struct _PA_ANALYZER *PPA_ANALYZER;
 typedef struct _TB_MANAGER TB_MANAGER, *PTB_MANAGER;
+typedef struct _CO_MANAGER CO_MANAGER, *PCO_MANAGER;
 typedef struct _EC_CONSUMER EC_CONSUMER, *PEC_CONSUMER;
 typedef struct _ES_SCHEMA ES_SCHEMA, *PES_SCHEMA;
 
@@ -489,6 +490,15 @@ ShadowStrikeGetThreatScoringEngine(VOID);
 _IRQL_requires_max_(DISPATCH_LEVEL)
 PBP_PROCESSOR
 ShadowStrikeGetBatchProcessor(VOID);
+
+/**
+ * @brief Get the global cache optimization manager.
+ * @return PCO_MANAGER or NULL if not initialized.
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PCO_MANAGER
+ShadowStrikeGetCacheManager(VOID);
 
 /**
  * @brief Send a notification to user-mode via batch processing.
