@@ -143,7 +143,7 @@ BpQueueEvent(
     _In_ SIZE_T DataSize
     );
 
-_IRQL_requires_(PASSIVE_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 BpFlush(
     _In_ PBP_PROCESSOR Processor

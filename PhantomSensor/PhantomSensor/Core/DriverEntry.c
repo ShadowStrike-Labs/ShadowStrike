@@ -369,10 +369,15 @@ ShadowStrikeBatchFlushCallback(
 
     for (ULONG i = 0; i < EventCount; i++) {
         PBP_EVENT evt = Events[i];
-        ULONG totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + (ULONG)evt->DataSize;
+        ULONG totalSize;
 
-        if (totalSize < sizeof(SHADOWSTRIKE_MESSAGE_HEADER) || evt->DataSize > 65536) {
+        if (evt == NULL || evt->DataSize > BP_MAX_EVENT_DATA_SIZE) {
             continue;
+        }
+
+        totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + (ULONG)evt->DataSize;
+        if (totalSize < sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+            continue;  // overflow guard
         }
 
         PSHADOWSTRIKE_MESSAGE_HEADER msg =

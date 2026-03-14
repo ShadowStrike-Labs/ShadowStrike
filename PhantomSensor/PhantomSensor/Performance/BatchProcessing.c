@@ -235,8 +235,8 @@ BpInitialize(
 
     *Processor = NULL;
 
-    proc = (PBP_PROCESSOR)ExAllocatePoolZero(
-        NonPagedPoolNx,
+    proc = (PBP_PROCESSOR)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(BP_PROCESSOR),
         BP_POOL_TAG
     );
@@ -715,7 +715,12 @@ BpStop(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!Processor->Running) {
+    //
+    // Atomically clear Running. If it was already FALSE, nothing to do.
+    // This also prevents concurrent BpStop calls from both trying to
+    // wait on the thread.
+    //
+    if (!InterlockedCompareExchange(&Processor->Running, FALSE, TRUE)) {
         return STATUS_SUCCESS;
     }
 
@@ -762,7 +767,8 @@ BpStop(
         Processor->ProcessingThread = NULL;
     }
 
-    InterlockedExchange(&Processor->Running, FALSE);
+    //
+    // Running was already cleared by InterlockedCompareExchange at entry.
 
     return STATUS_SUCCESS;
 }
@@ -1020,10 +1026,12 @@ BppDrainReadyQueue(
     }
 
     //
-    // Replenish spare batch if consumed. We must acquire BatchLock because
+    // Replenish spare batch if consumed. We acquire BatchLock because
     // SpareBatch is also accessed by BpQueueEvent and the timer callback.
+    // The NULL check is inside the lock to avoid racing with concurrent
+    // BpQueueEvent which can consume SpareBatch at DISPATCH_LEVEL.
     //
-    if (Processor->SpareBatch == NULL && Processor->LookasideInitialized) {
+    if (Processor->LookasideInitialized) {
         KIRQL spareIrql;
         KeAcquireSpinLock(&Processor->BatchLock, &spareIrql);
         if (Processor->SpareBatch == NULL) {
