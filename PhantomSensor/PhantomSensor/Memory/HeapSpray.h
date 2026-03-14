@@ -251,7 +251,7 @@ typedef struct _HS_DETECTOR {
     //
     struct {
         LIST_ENTRY FreeList;
-        KSPIN_LOCK Lock;
+        EX_PUSH_LOCK Lock;
         volatile LONG FreeCount;
         PHS_ALLOCATION_RECORD PoolMemory;
         ULONG PoolSize;

@@ -375,7 +375,7 @@ Return Value:
     // Build free list from pool
     //
     InitializeListHead(&detector->AllocationPool.FreeList);
-    KeInitializeSpinLock(&detector->AllocationPool.Lock);
+    ExInitializePushLock(&detector->AllocationPool.Lock);
 
     for (i = 0; i < HS_ALLOCATION_POOL_SIZE; i++) {
         InsertTailList(
@@ -575,6 +575,7 @@ Return Value:
 
 --*/
 {
+    PHS_DETECTOR_INTERNAL detectorInternal;
     PHS_PROCESS_CONTEXT context;
 
     PAGED_CODE();
@@ -587,21 +588,26 @@ Return Value:
         return STATUS_INVALID_PARAMETER;
     }
 
+    detectorInternal = CONTAINING_RECORD(Detector, HS_DETECTOR_INTERNAL, Detector);
+
+    if (!HspAcquireDetectorRef(Detector, detectorInternal)) {
+        return STATUS_SHUTDOWN_IN_PROGRESS;
+    }
+
     //
     // Create context if it doesn't exist
     //
     context = HspFindProcessContext(Detector, ProcessId, TRUE);
     if (context == NULL) {
+        HspReleaseDetectorRef(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
     // Release the reference from find
     //
-    HspDereferenceProcessContext(
-        CONTAINING_RECORD(Detector, HS_DETECTOR_INTERNAL, Detector),
-        context
-        );
+    HspDereferenceProcessContext(detectorInternal, context);
+    HspReleaseDetectorRef(Detector);
 
     return STATUS_SUCCESS;
 }
@@ -643,6 +649,10 @@ Return Value:
 
     detectorInternal = CONTAINING_RECORD(Detector, HS_DETECTOR_INTERNAL, Detector);
 
+    if (!HspAcquireDetectorRef(Detector, detectorInternal)) {
+        return STATUS_SHUTDOWN_IN_PROGRESS;
+    }
+
     //
     // Find and remove the process context
     //
@@ -674,6 +684,8 @@ Return Value:
         //
         HspDereferenceProcessContext(detectorInternal, context);
     }
+
+    HspReleaseDetectorRef(Detector);
 
     return found ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
@@ -1776,9 +1788,9 @@ HspAllocateRecord(
 {
     PHS_ALLOCATION_RECORD record = NULL;
     PLIST_ENTRY entry;
-    KIRQL oldIrql;
 
-    KeAcquireSpinLock(&Detector->AllocationPool.Lock, &oldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Detector->AllocationPool.Lock);
 
     if (!IsListEmpty(&Detector->AllocationPool.FreeList)) {
         entry = RemoveHeadList(&Detector->AllocationPool.FreeList);
@@ -1786,7 +1798,8 @@ HspAllocateRecord(
         Detector->AllocationPool.FreeCount--;
     }
 
-    KeReleaseSpinLock(&Detector->AllocationPool.Lock, oldIrql);
+    ExReleasePushLockExclusive(&Detector->AllocationPool.Lock);
+    KeLeaveCriticalRegion();
 
     if (record != NULL) {
         RtlZeroMemory(record, sizeof(HS_ALLOCATION_RECORD));
@@ -1806,14 +1819,14 @@ HspFreeRecord(
     _Inout_ PHS_ALLOCATION_RECORD Record
     )
 {
-    KIRQL oldIrql;
-
-    KeAcquireSpinLock(&Detector->AllocationPool.Lock, &oldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Detector->AllocationPool.Lock);
 
     InsertTailList(&Detector->AllocationPool.FreeList, &Record->ListEntry);
     Detector->AllocationPool.FreeCount++;
 
-    KeReleaseSpinLock(&Detector->AllocationPool.Lock, oldIrql);
+    ExReleasePushLockExclusive(&Detector->AllocationPool.Lock);
+    KeLeaveCriticalRegion();
 }
 
 

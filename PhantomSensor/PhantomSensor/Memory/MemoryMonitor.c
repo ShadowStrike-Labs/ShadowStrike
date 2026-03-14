@@ -256,6 +256,52 @@ static NTSTATUS MmpReadProcessMemory(_In_ PEPROCESS Process, _In_ PVOID SourceAd
 static NTSTATUS MmpQueryVirtualMemory(_In_ PEPROCESS Process, _In_ PVOID Address, _Out_ PMEMORY_BASIC_INFORMATION MemInfo);
 
 // ============================================================================
+// HEAP SPRAY CALLBACK (feeds detections into BehaviorEngine)
+// ============================================================================
+
+/**
+ * @brief HeapSpray detection callback — invoked when spray pattern is confirmed.
+ *
+ * Routes the detection into BehaviorEngine for threat scoring and response
+ * decision. Invoked at <= APC_LEVEL under HeapSpray's shared callback lock.
+ * Must complete quickly — no blocking or heavy allocation.
+ */
+static VOID
+MmpHeapSprayDetectionCallback(
+    _In_ PHS_SPRAY_RESULT Result,
+    _In_opt_ PVOID Context
+    )
+{
+    UINT32 threatScore;
+
+    UNREFERENCED_PARAMETER(Context);
+
+    if (Result == NULL || !Result->SprayDetected) {
+        return;
+    }
+
+    //
+    // Map confidence score (0-1000) to threat score (0-100).
+    // HeapSpray with score >= 700 is HIGH confidence (map to 75+).
+    //
+    threatScore = (UINT32)((Result->ConfidenceScore * 100) / 1000);
+    if (threatScore < 50) {
+        threatScore = 50;   // Minimum — spray was confirmed
+    }
+
+    BeEngineSubmitEvent(
+        BehaviorEvent_HeapSprayDetected,
+        BehaviorCategory_MemoryOperation,
+        HandleToULong(Result->ProcessId),
+        NULL,
+        0,
+        threatScore,
+        FALSE,
+        NULL
+    );
+}
+
+// ============================================================================
 // INITIALIZATION AND LIFECYCLE
 // ============================================================================
 
@@ -349,6 +395,19 @@ MmMonitorInitialize(
             DbgPrint("MemoryMonitor: HeapSpray init failed: 0x%08X — continuing without heap spray detection", Status);
             g_MemoryMonitor.Config.EnableHeapSprayDetection = FALSE;
             g_MemoryMonitor.HeapSprayDetector = NULL;
+        } else {
+            //
+            // Register BehaviorEngine callback so spray detections feed into
+            // the threat scoring pipeline. Without this, detections are lost.
+            //
+            Status = HsRegisterCallback(
+                (PHS_DETECTOR)g_MemoryMonitor.HeapSprayDetector,
+                MmpHeapSprayDetectionCallback,
+                NULL
+            );
+            if (!NT_SUCCESS(Status)) {
+                DbgPrint("MemoryMonitor: HeapSpray callback registration failed: 0x%08X\n", Status);
+            }
         }
     }
 
@@ -754,6 +813,19 @@ MmMonitorRemoveProcessContext(
     //
     if (Found && Context != NULL) {
         MmpDereferenceProcessContext(Context);
+    }
+
+    //
+    // Stop heap spray tracking for this process. This releases the
+    // EPROCESS reference and frees allocation records tracked by the
+    // HeapSpray detector for this PID.
+    //
+    if (g_MemoryMonitor.Config.EnableHeapSprayDetection &&
+        g_MemoryMonitor.HeapSprayDetector != NULL) {
+        HsStopTracking(
+            (PHS_DETECTOR)g_MemoryMonitor.HeapSprayDetector,
+            ULongToHandle(ProcessId)
+        );
     }
 }
 
