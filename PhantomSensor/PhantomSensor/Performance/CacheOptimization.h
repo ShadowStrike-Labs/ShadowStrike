@@ -34,11 +34,12 @@
  * - Automatic background maintenance
  * - Reference-counted entry access for safe concurrent reads
  *
- * Lock Ordering (MUST be followed everywhere):
+ * Lock Ordering (MUST be followed — always acquire in ascending order):
  *   1. Bucket lock (per-bucket)
  *   2. Shard LRU lock (per-shard)
  *   3. Global list lock (per-cache)
- *   Never acquire a higher-numbered lock while holding a lower-numbered lock.
+ *   4. Manager CacheListLock
+ *   Never acquire a lower-numbered lock while holding a higher-numbered lock.
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0 (Enterprise Edition)
@@ -371,7 +372,7 @@ CoShutdown(
     );
 
 /**
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (uses push locks internally)
  */
 NTSTATUS
 CoSetMemoryLimit(
@@ -380,7 +381,7 @@ CoSetMemoryLimit(
     );
 
 /**
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (uses push locks internally)
  */
 NTSTATUS
 CoRegisterMemoryCallback(
@@ -395,7 +396,7 @@ CoRegisterMemoryCallback(
  * @param HitRatePermille  Receives hit rate as permille (0-1000).
  *                         e.g., 750 = 75.0% hit rate.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (TotalEntries path acquires push lock)
  */
 NTSTATUS
 CoGetManagerStats(
@@ -426,7 +427,7 @@ CoDestroyCache(
     _In_ PCO_CACHE Cache
     );
 
-/** @irql <= DISPATCH_LEVEL */
+/** @irql <= APC_LEVEL (acquires push locks) */
 NTSTATUS
 CoFlush(
     _In_ PCO_CACHE Cache
@@ -436,7 +437,7 @@ CoFlush(
 /* CACHE OPERATIONS                                                           */
 /* ========================================================================= */
 
-/** @irql <= DISPATCH_LEVEL */
+/** @irql <= APC_LEVEL (acquires push locks) */
 NTSTATUS
 CoPut(
     _In_ PCO_CACHE Cache,
@@ -446,7 +447,7 @@ CoPut(
     _In_ ULONG TTLSeconds
     );
 
-/** @irql <= DISPATCH_LEVEL */
+/** @irql <= APC_LEVEL (acquires push locks) */
 NTSTATUS
 CoPutEx(
     _In_ PCO_CACHE Cache,
@@ -466,7 +467,7 @@ CoPutEx(
  * On return, *DataSize contains the actual data size.
  * If DataBuffer is NULL, only checks existence and returns size.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (acquires push locks)
  */
 NTSTATUS
 CoGet(
@@ -481,7 +482,7 @@ CoGet(
  *
  * Caller MUST call CoFreeLookupResult() to free Result->Data.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (acquires push locks)
  */
 NTSTATUS
 CoGetEx(
@@ -500,35 +501,35 @@ CoFreeLookupResult(
     _Inout_ PCO_LOOKUP_RESULT Result
     );
 
-/** @irql <= DISPATCH_LEVEL */
+/** @irql <= APC_LEVEL (acquires push locks) */
 BOOLEAN
 CoContains(
     _In_ PCO_CACHE Cache,
     _In_ ULONG64 Key
     );
 
-/** @irql <= DISPATCH_LEVEL */
+/** @irql <= APC_LEVEL (acquires push locks) */
 NTSTATUS
 CoInvalidate(
     _In_ PCO_CACHE Cache,
     _In_ ULONG64 Key
     );
 
-/** @irql <= DISPATCH_LEVEL */
+/** @irql <= APC_LEVEL (acquires push locks) */
 NTSTATUS
 CoTouch(
     _In_ PCO_CACHE Cache,
     _In_ ULONG64 Key
     );
 
-/** @irql <= DISPATCH_LEVEL */
+/** @irql <= APC_LEVEL (acquires push locks) */
 NTSTATUS
 CoPin(
     _In_ PCO_CACHE Cache,
     _In_ ULONG64 Key
     );
 
-/** @irql <= DISPATCH_LEVEL */
+/** @irql <= APC_LEVEL (acquires push locks) */
 NTSTATUS
 CoUnpin(
     _In_ PCO_CACHE Cache,
@@ -554,20 +555,20 @@ CoResetStats(
 
 /**
  * @brief Get cache hit rate as permille (0-1000). No floating-point.
- * @irql <= DISPATCH_LEVEL
+ * @irql <= DISPATCH_LEVEL (pure interlocked reads, no locks)
  */
 ULONG
 CoGetHitRate(
     _In_ PCO_CACHE Cache
     );
 
-/** @irql <= DISPATCH_LEVEL */
+/** @irql <= DISPATCH_LEVEL (pure interlocked reads, no locks) */
 ULONG
 CoGetEntryCount(
     _In_ PCO_CACHE Cache
     );
 
-/** @irql <= DISPATCH_LEVEL */
+/** @irql <= DISPATCH_LEVEL (pure interlocked reads, no locks) */
 SIZE_T
 CoGetMemoryUsage(
     _In_ PCO_CACHE Cache
@@ -577,13 +578,13 @@ CoGetMemoryUsage(
 /* MAINTENANCE FUNCTIONS                                                      */
 /* ========================================================================= */
 
-/** @irql <= DISPATCH_LEVEL */
+/** @irql <= APC_LEVEL (acquires push locks) */
 ULONG
 CoRunMaintenance(
     _In_ PCO_CACHE Cache
     );
 
-/** @irql <= DISPATCH_LEVEL */
+/** @irql <= APC_LEVEL (acquires push locks) */
 SIZE_T
 CoEvictToSize(
     _In_ PCO_CACHE Cache,

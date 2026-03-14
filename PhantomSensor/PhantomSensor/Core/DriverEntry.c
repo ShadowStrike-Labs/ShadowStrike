@@ -1273,10 +1273,22 @@ DriverEntry(
     }
 
     //
-    // Step 5.9: Cache optimization — DEFERRED
-    // CoInitialize reserves 64MB. ScanCache already handles verdict caching
-    // independently. Enable when additional cache types are integrated.
+    // Step 5.9: Cache optimization manager
+    // Init cost: sizeof(CO_MANAGER) + timer — memory limit is a ceiling, not a reservation.
     //
+    {
+        status = CoInitialize(&g_CacheOptimizer, 16 * 1024 * 1024);  /* 16 MB ceiling */
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Failed to initialize cache optimization: 0x%08X (continuing)\n",
+                       status);
+            g_CacheOptimizer = NULL;
+            status = STATUS_SUCCESS;
+        } else {
+            g_SubsystemFlags |= SubsysFlag_CacheOptimization;
+            ShadowStrikeLogInitStatus("Cache Optimization", STATUS_SUCCESS);
+        }
+    }
 
     //
     // Step 5.10: Centralized lookaside list manager (memory pressure awareness)
@@ -3042,6 +3054,12 @@ PBP_PROCESSOR
 ShadowStrikeGetBatchProcessor(VOID)
 {
     return g_BatchProcessor;
+}
+
+PCO_MANAGER
+ShadowStrikeGetCacheManager(VOID)
+{
+    return g_CacheOptimizer;
 }
 
 _Use_decl_annotations_
