@@ -99,6 +99,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../ALPC/AlpcPortMonitor.h"
 #include "../../ETW/ETWConsumer.h"
 #include "../../ETW/ETWProvider.h"
+#include "../../ETW/TelemetryEvents.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -1967,6 +1968,29 @@ Arguments:
             SuspicionScore,
             ProcessContext->Flags
             );
+
+        //
+        // Emit ETW telemetry for blocked process (CRITICAL security event — never throttled)
+        //
+        TeLogProcessBlocked(
+            HandleToULong(ProcessId),
+            HandleToULong(ProcessContext->ParentProcessId),
+            &ProcessContext->ImagePath,
+            SuspicionScore,
+            L"Behavioral analysis block"
+        );
+    } else {
+        //
+        // Emit ETW telemetry for process creation (informational)
+        //
+        TeLogProcessCreate(
+            HandleToULong(ProcessId),
+            HandleToULong(ProcessContext->ParentProcessId),
+            &ProcessContext->ImagePath,
+            &ProcessContext->CommandLine,
+            SuspicionScore,
+            ProcessContext->Flags
+        );
     }
 
     //
@@ -3592,6 +3616,14 @@ PnpHandleProcessTermination(
                       &tbPayload, sizeof(tbPayload), NULL);
         }
     }
+
+    //
+    // Emit ETW telemetry for process termination
+    //
+    TeLogProcessTerminate(
+        HandleToULong(Context->ProcessId),
+        0  // ExitCode not reliably available at PASSIVE_LEVEL cleanup
+    );
 
     //
     // Commit (discard) any pending file backup entries for this process.

@@ -65,6 +65,7 @@
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../ETW/ETWConsumer.h"
 #include "../../ETW/ETWProvider.h"
+#include "../../ETW/TelemetryEvents.h"
 #include "../../Core/DriverEntry.h"
 #include "ProcessRelationship.h"
 #include "ProcessAnalyzer.h"
@@ -978,6 +979,26 @@ Routine Description:
                         NULL
                         );
                 }
+
+                //
+                // Emit ETW telemetry for remote thread (security-relevant, never throttled)
+                //
+                TeLogRemoteThread(
+                    HandleToULong(creatorProcessId),
+                    HandleToULong(event->TargetProcessId),
+                    HandleToULong(event->TargetThreadId),
+                    (UINT64)(ULONG_PTR)event->StartAddress,
+                    (UINT32)event->InjectionScore
+                );
+            } else {
+                //
+                // Emit ETW telemetry for normal thread creation
+                //
+                TeLogThreadCreate(
+                    HandleToULong(event->TargetProcessId),
+                    HandleToULong(event->TargetThreadId),
+                    (UINT64)(ULONG_PTR)event->StartAddress
+                );
             }
 
             //
