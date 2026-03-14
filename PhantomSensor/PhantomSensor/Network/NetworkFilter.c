@@ -117,6 +117,10 @@ EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_ALE_RECV_ACCEPT_V6_CALLOU
 EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_OUTBOUND_TRANSPORT_V4_CALLOUT_GUID =
     {0x01e4f8d7, 0x91a2, 0xa3b4, {0xf5, 0xc6, 0x3b, 0x4c, 0x5d, 0x6e, 0x7f, 0x80}};
 
+// {23A6BAF9-B2C3-C4D5-D6E7-5D6E7F809102}
+EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_INBOUND_TRANSPORT_V4_CALLOUT_GUID =
+    {0x23a6baf9, 0xb2c3, 0xc4d5, {0xd6, 0xe7, 0x5d, 0x6e, 0x7f, 0x80, 0x91, 0x02}};
+
 // {12F5A9E8-02B3-B4C5-A6D7-4C5D6E7F8091}
 EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_STREAM_V4_CALLOUT_GUID =
     {0x12f5a9e8, 0x02b3, 0xb4c5, {0xa6, 0xd7, 0x4c, 0x5d, 0x6e, 0x7f, 0x80, 0x91}};
@@ -332,6 +336,12 @@ static VOID
 NfpProcessDnsPacket(
     _In_ const FWPS_INCOMING_VALUES0* InFixedValues,
     _In_ const FWPS_INCOMING_METADATA_VALUES0* InMetaValues,
+    _In_opt_ void* LayerData,
+    _Out_ FWPS_CLASSIFY_OUT0* ClassifyOut);
+
+static VOID
+NfpProcessInboundDnsResponse(
+    _In_ const FWPS_INCOMING_VALUES0* InFixedValues,
     _In_opt_ void* LayerData,
     _Out_ FWPS_CLASSIFY_OUT0* ClassifyOut);
 
@@ -1843,6 +1853,63 @@ NfOutboundTransportClassify(
 }
 
 /**
+ * @brief Inbound transport classify for DNS responses (source port 53).
+ *
+ * Captures DNS response packets from recursive resolvers so DnsProcessResponse
+ * can correlate answers with pending queries and detect fast-flux, DGA with
+ * NXDOMAIN ratios, and response-based tunneling.
+ */
+VOID NTAPI
+NfInboundTransportClassify(
+    _In_ const FWPS_INCOMING_VALUES0* inFixedValues,
+    _In_ const FWPS_INCOMING_METADATA_VALUES0* inMetaValues,
+    _Inout_opt_ void* layerData,
+    _In_opt_ const void* classifyContext,
+    _In_ const FWPS_FILTER3* filter,
+    _In_ UINT64 flowContext,
+    _Inout_ FWPS_CLASSIFY_OUT0* classifyOut
+    )
+{
+    UINT16 sourcePort;
+
+    UNREFERENCED_PARAMETER(inMetaValues);
+    UNREFERENCED_PARAMETER(classifyContext);
+    UNREFERENCED_PARAMETER(filter);
+    UNREFERENCED_PARAMETER(flowContext);
+
+    if (!NfpIsInitialized() || !NfpIsEnabled()) {
+        classifyOut->actionType = FWP_ACTION_PERMIT;
+        return;
+    }
+
+    if (KeGetCurrentIrql() > APC_LEVEL) {
+        classifyOut->actionType = FWP_ACTION_PERMIT;
+        return;
+    }
+
+    {
+        NETWORK_MONITOR_CONFIG config;
+        NfpReadConfig(&config);
+        if (!config.EnableDnsMonitoring) {
+            classifyOut->actionType = FWP_ACTION_PERMIT;
+            return;
+        }
+    }
+
+    sourcePort = inFixedValues->incomingValue[
+        FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_REMOTE_PORT].value.uint16;
+
+    if (sourcePort == NF_DNS_PORT) {
+        if (NfpCheckRateLimit()) {
+            NfpProcessInboundDnsResponse(inFixedValues, layerData, classifyOut);
+            return;
+        }
+    }
+
+    classifyOut->actionType = FWP_ACTION_PERMIT;
+}
+
+/**
  * @brief Stream data classify function (TCP inspection).
  */
 VOID NTAPI
@@ -2118,6 +2185,33 @@ NfpRegisterCallouts(
     }
 
     //
+    // Inbound Transport v4 (DNS responses)
+    //
+    sCallout.calloutKey = SHADOWSTRIKE_INBOUND_TRANSPORT_V4_CALLOUT_GUID;
+    sCallout.classifyFn = NfInboundTransportClassify;
+    sCallout.flowDeleteFn = NULL;
+    sCallout.flags = 0;
+
+    status = FwpsCalloutRegister3(DeviceObject, &sCallout,
+                                  &g_NfState.InboundTransportV4CalloutId);
+    if (!NT_SUCCESS(status)) {
+        goto CleanupOutboundTransport;
+    }
+
+    displayData.name = L"ShadowStrike Inbound Transport v4";
+    displayData.description = L"Captures DNS response packets";
+
+    mCallout.calloutKey = SHADOWSTRIKE_INBOUND_TRANSPORT_V4_CALLOUT_GUID;
+    mCallout.displayData = displayData;
+    mCallout.applicableLayer = FWPM_LAYER_INBOUND_TRANSPORT_V4;
+
+    status = FwpmCalloutAdd0(g_NfState.WfpEngineHandle, &mCallout, NULL, NULL);
+    if (!NT_SUCCESS(status) && status != STATUS_FWP_ALREADY_EXISTS) {
+        FwpsCalloutUnregisterById0(g_NfState.InboundTransportV4CalloutId);
+        goto CleanupOutboundTransport;
+    }
+
+    //
     // Stream v4 (TCP data)
     // NOTE: Do NOT use FWP_CALLOUT_FLAG_CONDITIONAL_ON_FLOW here.
     // We don't associate flow context at the stream layer, so the flag
@@ -2130,7 +2224,7 @@ NfpRegisterCallouts(
     status = FwpsCalloutRegister3(DeviceObject, &sCallout,
                                   &g_NfState.StreamV4CalloutId);
     if (!NT_SUCCESS(status)) {
-        goto CleanupTransport;
+        goto CleanupInboundTransport;
     }
 
     displayData.name = L"ShadowStrike Stream v4";
@@ -2143,12 +2237,14 @@ NfpRegisterCallouts(
     status = FwpmCalloutAdd0(g_NfState.WfpEngineHandle, &mCallout, NULL, NULL);
     if (!NT_SUCCESS(status) && status != STATUS_FWP_ALREADY_EXISTS) {
         FwpsCalloutUnregisterById0(g_NfState.StreamV4CalloutId);
-        goto CleanupTransport;
+        goto CleanupInboundTransport;
     }
 
     return STATUS_SUCCESS;
 
-CleanupTransport:
+CleanupInboundTransport:
+    FwpsCalloutUnregisterById0(g_NfState.InboundTransportV4CalloutId);
+CleanupOutboundTransport:
     FwpsCalloutUnregisterById0(g_NfState.OutboundTransportV4CalloutId);
 CleanupV6Accept:
     FwpsCalloutUnregisterById0(g_NfState.AleRecvAcceptV6CalloutId);
@@ -2170,6 +2266,10 @@ NfpUnregisterCallouts(VOID)
     if (g_NfState.StreamV4CalloutId != 0) {
         FwpsCalloutUnregisterById0(g_NfState.StreamV4CalloutId);
         g_NfState.StreamV4CalloutId = 0;
+    }
+    if (g_NfState.InboundTransportV4CalloutId != 0) {
+        FwpsCalloutUnregisterById0(g_NfState.InboundTransportV4CalloutId);
+        g_NfState.InboundTransportV4CalloutId = 0;
     }
     if (g_NfState.OutboundTransportV4CalloutId != 0) {
         FwpsCalloutUnregisterById0(g_NfState.OutboundTransportV4CalloutId);
@@ -2258,6 +2358,16 @@ NfpRegisterFilters(VOID)
                             &g_NfState.OutboundTransportV4FilterId);
     if (!NT_SUCCESS(status)) goto CleanupV6Accept;
 
+    // Inbound Transport v4 (DNS responses)
+    filter.displayData.name = L"ShadowStrike Inbound Transport v4 Filter";
+    filter.displayData.description = L"Capture DNS response packets";
+    filter.layerKey = FWPM_LAYER_INBOUND_TRANSPORT_V4;
+    filter.action.calloutKey = SHADOWSTRIKE_INBOUND_TRANSPORT_V4_CALLOUT_GUID;
+
+    status = FwpmFilterAdd0(g_NfState.WfpEngineHandle, &filter, NULL,
+                            &g_NfState.InboundTransportV4FilterId);
+    if (!NT_SUCCESS(status)) goto CleanupOutboundTransport;
+
     // Stream v4
     filter.displayData.name = L"ShadowStrike Stream v4 Filter";
     filter.displayData.description = L"Inspect TCP stream data";
@@ -2266,11 +2376,13 @@ NfpRegisterFilters(VOID)
 
     status = FwpmFilterAdd0(g_NfState.WfpEngineHandle, &filter, NULL,
                             &g_NfState.StreamV4FilterId);
-    if (!NT_SUCCESS(status)) goto CleanupTransport;
+    if (!NT_SUCCESS(status)) goto CleanupInboundTransport;
 
     return STATUS_SUCCESS;
 
-CleanupTransport:
+CleanupInboundTransport:
+    FwpmFilterDeleteById0(g_NfState.WfpEngineHandle, g_NfState.InboundTransportV4FilterId);
+CleanupOutboundTransport:
     FwpmFilterDeleteById0(g_NfState.WfpEngineHandle, g_NfState.OutboundTransportV4FilterId);
 CleanupV6Accept:
     FwpmFilterDeleteById0(g_NfState.WfpEngineHandle, g_NfState.AleRecvAcceptV6FilterId);
@@ -2294,6 +2406,10 @@ NfpUnregisterFilters(VOID)
     if (g_NfState.StreamV4FilterId != 0) {
         FwpmFilterDeleteById0(g_NfState.WfpEngineHandle, g_NfState.StreamV4FilterId);
         g_NfState.StreamV4FilterId = 0;
+    }
+    if (g_NfState.InboundTransportV4FilterId != 0) {
+        FwpmFilterDeleteById0(g_NfState.WfpEngineHandle, g_NfState.InboundTransportV4FilterId);
+        g_NfState.InboundTransportV4FilterId = 0;
     }
     if (g_NfState.OutboundTransportV4FilterId != 0) {
         FwpmFilterDeleteById0(g_NfState.WfpEngineHandle, g_NfState.OutboundTransportV4FilterId);
@@ -3605,6 +3721,41 @@ NfpProcessDnsPacket(
     }
 
     //
+    // Route through DnsMonitor's sophisticated analysis pipeline.
+    // This provides tunneling detection, DGA (bigram+consonant), process
+    // context tracking, domain caching, and BehaviorEngine integration.
+    //
+    if (g_DnsMonitor != NULL) {
+        NTSTATUS dnsStatus;
+        UINT32 srcAddr = InFixedValues->incomingValue[
+            FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_LOCAL_ADDRESS].value.uint32;
+        UINT16 srcPort = InFixedValues->incomingValue[
+            FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_LOCAL_PORT].value.uint16;
+        UINT32 srvAddr = InFixedValues->incomingValue[
+            FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_REMOTE_ADDRESS].value.uint32;
+
+        dnsStatus = DnsProcessQuery(
+            g_DnsMonitor,
+            ULongToHandle(processId),
+            dnsData,
+            dataLength,
+            &srcAddr,
+            srcPort,
+            &srvAddr,
+            NF_DNS_PORT,
+            FALSE,
+            NULL
+            );
+
+        if (dnsStatus == STATUS_ACCESS_DENIED) {
+            ClassifyOut->actionType = FWP_ACTION_BLOCK;
+            ClassifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+            InterlockedIncrement64(&g_NfState.TotalDnsQueriesBlocked);
+            goto Done;
+        }
+    }
+
+    //
     // Create DNS entry
     //
     dnsEntry = NfpAllocateDnsEntry();
@@ -3696,8 +3847,91 @@ Done:
     if (allocated && dnsData != NULL) {
         ExFreePoolWithTag(dnsData, NF_POOL_TAG_DNS);
     }
+}
 
-    UNREFERENCED_PARAMETER(InFixedValues);
+/**
+ * @brief Process inbound DNS response from recursive resolver.
+ *
+ * Called from NfInboundTransportClassify when source port == 53.
+ * Routes the raw response packet to DnsProcessResponse for correlation
+ * with pending queries and answer analysis.
+ */
+static VOID
+NfpProcessInboundDnsResponse(
+    _In_ const FWPS_INCOMING_VALUES0* InFixedValues,
+    _In_opt_ void* LayerData,
+    _Out_ FWPS_CLASSIFY_OUT0* ClassifyOut
+    )
+{
+    NET_BUFFER_LIST* nbl;
+    NET_BUFFER* nb;
+    ULONG dataLength;
+    UCHAR* dnsData = NULL;
+    UCHAR localBuffer[512];
+    BOOLEAN allocated = FALSE;
+    UINT32 serverAddr;
+
+    ClassifyOut->actionType = FWP_ACTION_PERMIT;
+
+    if (LayerData == NULL || g_DnsMonitor == NULL) {
+        return;
+    }
+
+    nbl = (NET_BUFFER_LIST*)LayerData;
+    nb = NET_BUFFER_LIST_FIRST_NB(nbl);
+    if (nb == NULL) {
+        return;
+    }
+
+    dataLength = NET_BUFFER_DATA_LENGTH(nb);
+    if (dataLength < NF_DNS_HEADER_SIZE || dataLength > NF_MAX_DNS_PACKET_SIZE) {
+        return;
+    }
+
+    //
+    // Verify QR bit indicates response (bit 7 of byte 2 == 1)
+    //
+    if (dataLength <= sizeof(localBuffer)) {
+        dnsData = (UCHAR*)NdisGetDataBuffer(nb, dataLength, localBuffer, 1, 0);
+    } else {
+        dnsData = (UCHAR*)ExAllocatePoolWithTag(
+            NonPagedPoolNx, dataLength, NF_POOL_TAG_DNS);
+        if (dnsData == NULL) {
+            return;
+        }
+        allocated = TRUE;
+
+        if (NdisGetDataBuffer(nb, dataLength, dnsData, 1, 0) == NULL) {
+            goto Cleanup;
+        }
+    }
+
+    if (dnsData == NULL) {
+        goto Cleanup;
+    }
+
+    //
+    // Only process DNS responses (QR bit set)
+    //
+    if ((dnsData[2] & 0x80) == 0) {
+        goto Cleanup;
+    }
+
+    serverAddr = InFixedValues->incomingValue[
+        FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_REMOTE_ADDRESS].value.uint32;
+
+    DnsProcessResponse(
+        g_DnsMonitor,
+        dnsData,
+        dataLength,
+        &serverAddr,
+        FALSE
+        );
+
+Cleanup:
+    if (allocated && dnsData != NULL) {
+        ExFreePoolWithTag(dnsData, NF_POOL_TAG_DNS);
+    }
 }
 
 /**

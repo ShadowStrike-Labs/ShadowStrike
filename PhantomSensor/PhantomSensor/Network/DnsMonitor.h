@@ -65,6 +65,11 @@ extern "C" {
 #define DNS_MAX_CNAMES                  4
 #define DNS_MAX_CACHED_ADDRESSES        8
 
+//
+// Suspicion score threshold for blocking (distinct from entropy thresholds)
+//
+#define DNS_SUSPICION_BLOCK_THRESHOLD   75
+
 //=============================================================================
 // DNS Record Types
 //=============================================================================
@@ -291,7 +296,7 @@ typedef struct _DNS_PROCESS_CONTEXT {
     // Query tracking
     //
     LIST_ENTRY QueryList;
-    KSPIN_LOCK QueryLock;
+    EX_PUSH_LOCK QueryLock;
     volatile LONG QueryCount;
     
     //
@@ -354,6 +359,23 @@ DnsInitialize(
 VOID
 DnsShutdown(
     _Inout_ PDNS_MONITOR Monitor
+    );
+
+/**
+ * @brief Clean up DNS process context on process termination.
+ *
+ * Removes the process context immediately, unlinking all queries from
+ * the per-process list. Prevents context accumulation for exited processes.
+ *
+ * @param Monitor   DNS monitor instance.
+ * @param ProcessId Handle of the terminating process.
+ *
+ * @irql IRQL <= APC_LEVEL
+ */
+VOID
+DnsProcessTerminated(
+    _In_ PDNS_MONITOR Monitor,
+    _In_ HANDLE ProcessId
     );
 
 //=============================================================================

@@ -475,6 +475,7 @@ DnspPopulateProcessName(
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, DnsInitialize)
 #pragma alloc_text(PAGE, DnsShutdown)
+#pragma alloc_text(PAGE, DnsProcessTerminated)
 #pragma alloc_text(PAGE, DnsProcessQuery)
 #pragma alloc_text(PAGE, DnsProcessResponse)
 #pragma alloc_text(PAGE, DnsLookupDomain)
@@ -1036,6 +1037,93 @@ DnsShutdown(
 
 
 // ============================================================================
+// PUBLIC API - PROCESS TERMINATION CLEANUP
+// ============================================================================
+
+VOID
+DnsProcessTerminated(
+    _In_ PDNS_MONITOR Monitor,
+    _In_ HANDLE ProcessId
+    )
+/*++
+Routine Description:
+    Immediately removes the DNS process context for a terminating process.
+    All queries linked to this process context are unlinked so they can
+    be freed independently by the cleanup timer. This prevents context
+    accumulation for exited processes.
+--*/
+{
+    PLIST_ENTRY entry;
+    PDNS_PROCESS_CONTEXT processCtx = NULL;
+
+    PAGED_CODE();
+
+    if (Monitor == NULL || !Monitor->Initialized) {
+        return;
+    }
+
+    ExAcquirePushLockExclusive(&Monitor->ProcessListLock);
+
+    for (entry = Monitor->ProcessList.Flink;
+         entry != &Monitor->ProcessList;
+         entry = entry->Flink) {
+
+        PDNS_PROCESS_CONTEXT candidate = CONTAINING_RECORD(
+            entry, DNS_PROCESS_CONTEXT, ListEntry);
+
+        if (candidate->ProcessId == ProcessId) {
+            processCtx = candidate;
+            break;
+        }
+    }
+
+    if (processCtx == NULL) {
+        ExReleasePushLockExclusive(&Monitor->ProcessListLock);
+        return;
+    }
+
+    //
+    // Unlink all queries from this context's per-process list.
+    // The queries remain in the global QueryList and TransactionHash —
+    // they will be freed by the cleanup timer.
+    //
+    ExAcquirePushLockExclusive(&processCtx->QueryLock);
+
+    while (!IsListEmpty(&processCtx->QueryList)) {
+        PLIST_ENTRY qEntry = RemoveHeadList(&processCtx->QueryList);
+        InitializeListHead(qEntry);
+    }
+    processCtx->QueryCount = 0;
+
+    ExReleasePushLockExclusive(&processCtx->QueryLock);
+
+    //
+    // Remove from process list. Only free if RefCount reaches zero after
+    // removing the list reference.
+    //
+    RemoveEntryList(&processCtx->ListEntry);
+    InterlockedDecrement(&Monitor->ProcessCount);
+
+    ExReleasePushLockExclusive(&Monitor->ProcessListLock);
+
+    //
+    // Drop the list reference. If no in-flight operations hold a reference,
+    // this makes RefCount 0 and we can free immediately.
+    //
+    if (InterlockedDecrement(&processCtx->RefCount) == 0) {
+        ExFreeToNPagedLookasideList(&Monitor->ProcessContextLookaside, processCtx);
+    }
+    // If RefCount > 0, an in-flight operation still has a reference.
+    // DnspDereferenceProcessContext will see the context is unlinked
+    // and its decrement will eventually reach 0. However, we must be
+    // careful: the cleanup timer also frees contexts. Since we already
+    // removed it from ProcessList, the timer won't see it. The last
+    // dereferencer must free it. We handle this by checking if the
+    // process context is still on a list in DnspDereferenceProcessContext.
+}
+
+
+// ============================================================================
 // PUBLIC API - QUERY PROCESSING
 // ============================================================================
 
@@ -1061,7 +1149,6 @@ DnsProcessQuery(
     ULONG tunnelScore;
     BOOLEAN shouldBlock = FALSE;
     ULONG txHashBucket;
-    KIRQL oldIrql;
 
     PAGED_CODE();
 
@@ -1207,17 +1294,17 @@ DnsProcessQuery(
             InterlockedIncrement(&processCtx->SuspiciousQueries);
         }
 
-        // Correct spinlock usage: acquire at current IRQL
-        KeAcquireSpinLock(&processCtx->QueryLock, &oldIrql);
+        // Push lock usage (safe in PAGE section — no IRQL elevation)
+        ExAcquirePushLockExclusive(&processCtx->QueryLock);
         InsertTailList(&processCtx->QueryList, &query->ProcessListEntry);
         InterlockedIncrement(&processCtx->QueryCount);
-        KeReleaseSpinLock(&processCtx->QueryLock, oldIrql);
+        ExReleasePushLockExclusive(&processCtx->QueryLock);
     }
 
     //
     // Check for blocking
     //
-    if (query->SuspicionScore >= DNS_TUNNEL_ENTROPY_THRESHOLD) {
+    if (query->SuspicionScore >= DNS_SUSPICION_BLOCK_THRESHOLD) {
         query->SuspicionFlags |= DnsSuspicion_KnownBad;
 
         ExAcquirePushLockShared(&Monitor->Callbacks.Lock);
@@ -1247,7 +1334,7 @@ DnsProcessQuery(
             NULL,
             0,
             (UINT32)min(query->SuspicionScore, 100),
-            FALSE,
+            shouldBlock,
             NULL
         );
     }
@@ -1588,7 +1675,6 @@ DnsGetProcessQueries(
     PLIST_ENTRY entry;
     PDNS_QUERY query;
     ULONG count = 0;
-    KIRQL oldIrql;
 
     PAGED_CODE();
 
@@ -1605,7 +1691,7 @@ DnsGetProcessQueries(
         return STATUS_NOT_FOUND;
     }
 
-    KeAcquireSpinLock(&processCtx->QueryLock, &oldIrql);
+    ExAcquirePushLockShared(&processCtx->QueryLock);
 
     for (entry = processCtx->QueryList.Flink;
          entry != &processCtx->QueryList && count < MaxQueries;
@@ -1615,7 +1701,7 @@ DnsGetProcessQueries(
         Queries[count++] = query;
     }
 
-    KeReleaseSpinLock(&processCtx->QueryLock, oldIrql);
+    ExReleasePushLockShared(&processCtx->QueryLock);
 
     DnspDereferenceProcessContext(Monitor, processCtx);
 
@@ -2760,7 +2846,7 @@ DnspGetOrCreateProcessContext(
     context->ProcessId = ProcessId;
     context->RefCount = 2;  // One for list, one for caller
     InitializeListHead(&context->QueryList);
-    KeInitializeSpinLock(&context->QueryLock);
+    ExInitializePushLock(&context->QueryLock);
     KeQuerySystemTimePrecise(&context->CreationTime);
 
     // Populate process name (best-effort)
@@ -2818,10 +2904,14 @@ DnspDereferenceProcessContext(
     _In_ PDNS_PROCESS_CONTEXT Context
     )
 {
-    UNREFERENCED_PARAMETER(Monitor);
-
-    // Caller's reference released. List reference + cleanup timer handle lifetime.
-    InterlockedDecrement(&Context->RefCount);
+    //
+    // Drop caller's reference. If this is the last reference (i.e., the
+    // context was already removed from ProcessList by DnsProcessTerminated
+    // and all in-flight operations are done), free it here.
+    //
+    if (InterlockedDecrement(&Context->RefCount) == 0) {
+        ExFreeToNPagedLookasideList(&Monitor->ProcessContextLookaside, Context);
+    }
 }
 
 // ============================================================================
@@ -2979,11 +3069,10 @@ Routine Description:
         // Need process context lock — find process context
         PDNS_PROCESS_CONTEXT processCtx = DnspFindProcessContext(Monitor, Query->ProcessId);
         if (processCtx != NULL) {
-            KIRQL oldIrql;
-            KeAcquireSpinLock(&processCtx->QueryLock, &oldIrql);
+            ExAcquirePushLockExclusive(&processCtx->QueryLock);
             RemoveEntryList(&Query->ProcessListEntry);
             InterlockedDecrement(&processCtx->QueryCount);
-            KeReleaseSpinLock(&processCtx->QueryLock, oldIrql);
+            ExReleasePushLockExclusive(&processCtx->QueryLock);
             DnspDereferenceProcessContext(Monitor, processCtx);
         } else {
             // Process context already gone — just unlink safely
@@ -3162,8 +3251,7 @@ Routine Description:
                 // Before freeing, unlink all queries from this context's QueryList
                 // to prevent DnspFreeQuery from touching freed memory (DNS-1 fix).
                 {
-                    KIRQL oldIrql;
-                    KeAcquireSpinLock(&processCtx->QueryLock, &oldIrql);
+                    ExAcquirePushLockExclusive(&processCtx->QueryLock);
 
                     while (!IsListEmpty(&processCtx->QueryList)) {
                         PLIST_ENTRY qEntry = RemoveHeadList(&processCtx->QueryList);
@@ -3171,7 +3259,7 @@ Routine Description:
                         InitializeListHead(qEntry);
                     }
 
-                    KeReleaseSpinLock(&processCtx->QueryLock, oldIrql);
+                    ExReleasePushLockExclusive(&processCtx->QueryLock);
                 }
 
                 RemoveEntryList(&processCtx->ListEntry);

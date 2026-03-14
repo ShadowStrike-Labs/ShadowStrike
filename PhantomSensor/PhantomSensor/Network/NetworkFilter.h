@@ -64,6 +64,7 @@ EXTERN_C const GUID SHADOWSTRIKE_ALE_CONNECT_V6_CALLOUT_GUID;
 EXTERN_C const GUID SHADOWSTRIKE_ALE_RECV_ACCEPT_V4_CALLOUT_GUID;
 EXTERN_C const GUID SHADOWSTRIKE_ALE_RECV_ACCEPT_V6_CALLOUT_GUID;
 EXTERN_C const GUID SHADOWSTRIKE_OUTBOUND_TRANSPORT_V4_CALLOUT_GUID;
+EXTERN_C const GUID SHADOWSTRIKE_INBOUND_TRANSPORT_V4_CALLOUT_GUID;
 EXTERN_C const GUID SHADOWSTRIKE_STREAM_V4_CALLOUT_GUID;
 
 /**
@@ -308,6 +309,7 @@ typedef struct _NETWORK_FILTER_GLOBALS {
     UINT32 AleRecvAcceptV4CalloutId;
     UINT32 AleRecvAcceptV6CalloutId;
     UINT32 OutboundTransportV4CalloutId;
+    UINT32 InboundTransportV4CalloutId;
     UINT32 StreamV4CalloutId;
     
     // Filter IDs
@@ -316,6 +318,7 @@ typedef struct _NETWORK_FILTER_GLOBALS {
     UINT64 AleRecvAcceptV4FilterId;
     UINT64 AleRecvAcceptV6FilterId;
     UINT64 OutboundTransportV4FilterId;
+    UINT64 InboundTransportV4FilterId;
     UINT64 StreamV4FilterId;
     
     // Connection tracking (protected by ConnectionLock)

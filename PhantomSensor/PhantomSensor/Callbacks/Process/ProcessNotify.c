@@ -121,6 +121,10 @@ typedef struct _DX_DETECTOR DX_DETECTOR, *PDX_DETECTOR;
 VOID DxProcessTerminated(_In_ PDX_DETECTOR Detector, _In_ HANDLE ProcessId);
 struct _DX_DETECTOR* NfFilterGetDxDetector(VOID);
 
+typedef struct _DNS_MONITOR DNS_MONITOR, *PDNS_MONITOR;
+VOID DnsProcessTerminated(_In_ PDNS_MONITOR Monitor, _In_ HANDLE ProcessId);
+struct _DNS_MONITOR* NfFilterGetDnsMonitor(VOID);
+
 static VOID PnpCleanupStaleContexts(VOID);
 
 #ifdef ALLOC_PRAGMA
@@ -3796,6 +3800,17 @@ PnpHandleProcessTermination(
         PDX_DETECTOR dxDet = NfFilterGetDxDetector();
         if (dxDet != NULL) {
             DxProcessTerminated(dxDet, ProcessId);
+        }
+    }
+
+    //
+    // Remove DnsMonitor process context for this process.
+    // Prevents DNS_PROCESS_CONTEXT accumulation and stale tunneling state.
+    //
+    {
+        PDNS_MONITOR dnsMon = NfFilterGetDnsMonitor();
+        if (dnsMon != NULL) {
+            DnsProcessTerminated(dnsMon, ProcessId);
         }
     }
 
