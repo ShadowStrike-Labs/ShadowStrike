@@ -334,6 +334,8 @@ typedef struct _SD_CONFIG {
     BOOLEAN EnableStackPivotDetection;
     BOOLEAN EnableEntropyAnalysis;
     BOOLEAN EnableSignatureMatching;
+    BOOLEAN EnablePICDetection;
+    BOOLEAN EnableSuspiciousCallDetection;
     
     //
     // Thresholds

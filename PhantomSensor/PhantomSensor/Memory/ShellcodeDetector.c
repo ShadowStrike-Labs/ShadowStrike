@@ -308,6 +308,16 @@ SdpMatchSignatures(
     _In_ PSD_SCAN_CONTEXT Context
     );
 
+static BOOLEAN
+SdpDetectPositionIndependentCode(
+    _In_ PSD_SCAN_CONTEXT Context
+    );
+
+static BOOLEAN
+SdpDetectSuspiciousCalls(
+    _In_ PSD_SCAN_CONTEXT Context
+    );
+
 static ULONG
 SdpCalculateConfidenceScore(
     _In_ PSD_DETECTION_RESULT Result
@@ -332,12 +342,9 @@ SdpIsTimeout(
 // L-1: Removed dead SdpRor13Hash forward declaration (function removed below)
 //
 
-static FORCEINLINE BOOLEAN
-SdpSafeMemoryCompare(
-    _In_reads_bytes_(Size) const VOID* Buffer1,
-    _In_reads_bytes_(Size) const VOID* Buffer2,
-    _In_ SIZE_T Size
-    );
+//
+// SC2-L1: Dead SdpSafeMemoryCompare removed (never called; callers use RtlCompareMemory directly)
+//
 
 /**
  * @brief C-2: Lifecycle helpers — increment-then-check reference pattern.
@@ -855,6 +862,33 @@ Return Value:
     }
 
     //
+    // 10. Position-independent code detection
+    //
+    if (config.EnablePICDetection && !SdpIsTimeout(&context)) {
+        if (SdpDetectPositionIndependentCode(&context)) {
+            result->Flags |= SdFlag_PIC;
+        }
+    }
+
+    //
+    // 11. Suspicious call pattern detection
+    //
+    if (config.EnableSuspiciousCallDetection && !SdpIsTimeout(&context)) {
+        if (SdpDetectSuspiciousCalls(&context)) {
+            result->Flags |= SdFlag_SuspiciousCall;
+        }
+    }
+
+    //
+    // 12. Polymorphic composite detection
+    // Encoder + high entropy = runtime-decoded payload → polymorphic shellcode.
+    // This is always derived from prior stages — no config toggle needed.
+    //
+    if ((result->Flags & SdFlag_Encoder) && (result->Flags & SdFlag_HighEntropy)) {
+        result->Flags |= SdFlag_Polymorphic;
+    }
+
+    //
     // Calculate final scores
     //
     result->ConfidenceScore = SdpCalculateConfidenceScore(result);
@@ -920,9 +954,12 @@ Routine Description:
     *Result = NULL;
 
     //
-    // C-2: Lifecycle check (SdAnalyzeBuffer also acquires its own reference)
+    // SC2-H1 fix: Acquire reference during cross-process copy phase.
+    // SdpIsReady was insufficient — if SdShutdown races between the ready check
+    // and SdAnalyzeBuffer (which acquires its own ref), the detector is freed
+    // and SdAnalyzeBuffer dereferences freed memory → BSOD.
     //
-    if (!SdpIsReady(Detector)) {
+    if (!SdpAcquireReference(Detector)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -938,6 +975,7 @@ Routine Description:
     //
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
+        SdpReleaseReference(Detector);
         return status;
     }
 
@@ -953,6 +991,7 @@ Routine Description:
 
     if (buffer == NULL) {
         ObDereferenceObject(process);
+        SdpReleaseReference(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -979,8 +1018,15 @@ Routine Description:
 
     if (!NT_SUCCESS(status)) {
         ShadowStrikeFreePoolWithTag(buffer, SD_POOL_TAG_BUFFER);
+        SdpReleaseReference(Detector);
         return status;
     }
+
+    //
+    // SC2-H1: Release outer reference before SdAnalyzeBuffer (it acquires its own).
+    // Detector is guaranteed alive until we release — SdShutdown waits for drain.
+    //
+    SdpReleaseReference(Detector);
 
     //
     // Analyze the copied buffer
@@ -1925,6 +1971,8 @@ SdpInitializeDefaultConfig(
     Config->EnableStackPivotDetection = TRUE;
     Config->EnableEntropyAnalysis = TRUE;
     Config->EnableSignatureMatching = TRUE;
+    Config->EnablePICDetection = TRUE;
+    Config->EnableSuspiciousCallDetection = TRUE;
 
     Config->NopSledMinLength = SD_NOP_SLED_MIN_LENGTH;
     Config->EntropyThreshold = SD_ENTROPY_THRESHOLD_DEFAULT;
@@ -2960,6 +3008,189 @@ Routine Description:
 }
 
 
+static BOOLEAN
+SdpDetectPositionIndependentCode(
+    _In_ PSD_SCAN_CONTEXT Context
+    )
+/*++
+
+Routine Description:
+
+    Detects position-independent code (PIC) patterns used by shellcode
+    to determine its own runtime address. Covers x86 GetPC idioms,
+    FPU-based address recovery, and x64 RIP-relative addressing.
+
+    MITRE ATT&CK: T1620 (Reflective Code Loading)
+
+--*/
+{
+    PUCHAR buffer = Context->Buffer;
+    SIZE_T size = Context->Size;
+    SIZE_T i;
+    ULONG picPatterns = 0;
+
+    if (size < 6) {
+        return FALSE;
+    }
+
+    for (i = 0; i < size - 5; i++) {
+        //
+        // Pattern 1: CALL $+5; POP reg (E8 00 00 00 00 58-5F)
+        // Classic x86 GetPC idiom — CALL pushes next IP, POP captures it.
+        //
+        if (buffer[i] == 0xE8 &&
+            buffer[i + 1] == 0x00 && buffer[i + 2] == 0x00 &&
+            buffer[i + 3] == 0x00 && buffer[i + 4] == 0x00 &&
+            (buffer[i + 5] >= 0x58 && buffer[i + 5] <= 0x5F)) {
+            picPatterns++;
+            i += 5;
+            continue;
+        }
+
+        //
+        // Pattern 2: FNSTENV [ESP-0xC] (D9 74 24 F4)
+        // FPU-based GetPC — stores FPU environment which includes
+        // the EIP of the last FPU instruction executed.
+        //
+        if (i + 3 < size &&
+            buffer[i] == 0xD9 && buffer[i + 1] == 0x74 &&
+            buffer[i + 2] == 0x24 && buffer[i + 3] == 0xF4) {
+            picPatterns++;
+            i += 3;
+            continue;
+        }
+
+        //
+        // Pattern 3: FSTENV [ESP-0xC] with FWAIT prefix (9B D9 74 24 F4)
+        //
+        if (i + 4 < size &&
+            buffer[i] == 0x9B && buffer[i + 1] == 0xD9 &&
+            buffer[i + 2] == 0x74 && buffer[i + 3] == 0x24 &&
+            buffer[i + 4] == 0xF4) {
+            picPatterns++;
+            i += 4;
+            continue;
+        }
+
+        //
+        // Pattern 4: LEA reg, [RIP+disp32] on x64
+        // REX.W (48) + LEA (8D) + ModRM with RIP-relative mode (mod=00, r/m=101)
+        // Used by x64 shellcode for PC-relative data references.
+        //
+        if (i + 6 < size &&
+            buffer[i] == 0x48 && buffer[i + 1] == 0x8D &&
+            (buffer[i + 2] & 0xC7) == 0x05) {
+            picPatterns++;
+            i += 6;
+            continue;
+        }
+
+        //
+        // Pattern 5: CALL near + POP with small negative offset
+        // Variant GetPC: CALL to a few bytes backward, POP to capture EIP.
+        //
+        if (buffer[i] == 0xE8 && i + 5 < size &&
+            (buffer[i + 5] >= 0x58 && buffer[i + 5] <= 0x5F)) {
+            LONG relOffset;
+            RtlCopyMemory(&relOffset, &buffer[i + 1], sizeof(LONG));
+            if (relOffset < 0 && relOffset > -256) {
+                picPatterns++;
+                i += 5;
+                continue;
+            }
+        }
+
+        if (picPatterns >= 2) {
+            break;
+        }
+    }
+
+    return (picPatterns > 0);
+}
+
+
+static BOOLEAN
+SdpDetectSuspiciousCalls(
+    _In_ PSD_SCAN_CONTEXT Context
+    )
+/*++
+
+Routine Description:
+
+    Detects suspicious CALL/JMP patterns indicative of dynamically-resolved
+    API invocation. Shellcode that resolves APIs via hash tables will
+    contain clusters of indirect CALL/JMP through registers — a pattern
+    rarely seen in legitimate compiled code at this density.
+
+    MITRE ATT&CK: T1106 (Native API), T1055 (Process Injection)
+
+--*/
+{
+    PUCHAR buffer = Context->Buffer;
+    SIZE_T size = Context->Size;
+    SIZE_T i;
+    ULONG indirectCalls = 0;
+
+    if (size < 3) {
+        return FALSE;
+    }
+
+    for (i = 0; i < size - 2; i++) {
+        //
+        // CALL reg (FF D0-D7) — indirect register call
+        // Shellcode pattern: resolve API address into register, CALL through it.
+        //
+        if (buffer[i] == 0xFF &&
+            (buffer[i + 1] >= 0xD0 && buffer[i + 1] <= 0xD7)) {
+            indirectCalls++;
+        }
+
+        //
+        // CALL [reg] (FF /2 with memory operand, mod != 11)
+        // Indirect call through memory pointer — vtable-like but in raw shellcode
+        // context indicates resolved function pointer table.
+        //
+        else if (buffer[i] == 0xFF &&
+                 (buffer[i + 1] & 0x38) == 0x10 &&
+                 (buffer[i + 1] & 0xC0) != 0xC0) {
+            indirectCalls++;
+        }
+
+        //
+        // JMP reg (FF E0-E7) — indirect register jump
+        // Common in tail-call resolved API dispatch.
+        //
+        else if (buffer[i] == 0xFF &&
+                 (buffer[i + 1] >= 0xE0 && buffer[i + 1] <= 0xE7)) {
+            indirectCalls++;
+        }
+
+        //
+        // JMP [reg] (FF /4 with memory operand, mod != 11)
+        // Indirect jump through memory — IAT-style dispatch in shellcode.
+        //
+        else if (buffer[i] == 0xFF &&
+                 (buffer[i + 1] & 0x38) == 0x20 &&
+                 (buffer[i + 1] & 0xC0) != 0xC0) {
+            indirectCalls++;
+        }
+
+        //
+        // Early exit: high density already established
+        //
+        if (indirectCalls >= 5) {
+            break;
+        }
+    }
+
+    //
+    // Threshold: 3+ indirect calls/jumps in a single buffer indicates
+    // dynamic API resolution — legitimate compiled code uses direct CALLs.
+    //
+    return (indirectCalls >= 3);
+}
+
+
 static ULONG
 SdpCalculateConfidenceScore(
     _In_ PSD_DETECTION_RESULT Result
@@ -3016,6 +3247,18 @@ Routine Description:
         score += 40;  // Known bad
     }
 
+    if (Result->Flags & SdFlag_PIC) {
+        score += 15;  // GetPC idiom is strong shellcode indicator
+    }
+
+    if (Result->Flags & SdFlag_SuspiciousCall) {
+        score += 15;  // Indirect call clusters indicate dynamic dispatch
+    }
+
+    if (Result->Flags & SdFlag_Polymorphic) {
+        score += 10;  // Encoder + high entropy = runtime decoded
+    }
+
     //
     // Combination bonuses
     //
@@ -3029,6 +3272,14 @@ Routine Description:
 
     if ((Result->Flags & SdFlag_HighEntropy) && (Result->Flags & SdFlag_Encoder)) {
         score += 10;  // Packed/encoded
+    }
+
+    if ((Result->Flags & SdFlag_PIC) && (Result->Flags & SdFlag_SuspiciousCall)) {
+        score += 15;  // Self-locating code with dynamic API calls
+    }
+
+    if ((Result->Flags & SdFlag_PIC) && (Result->Flags & SdFlag_APIHashing)) {
+        score += 15;  // PIC + hash-based API resolution = high-confidence shellcode
     }
 
     //
@@ -3215,13 +3466,7 @@ SdpIsTimeout(
 //
 
 
-static FORCEINLINE BOOLEAN
-SdpSafeMemoryCompare(
-    _In_reads_bytes_(Size) const VOID* Buffer1,
-    _In_reads_bytes_(Size) const VOID* Buffer2,
-    _In_ SIZE_T Size
-    )
-{
-    return (RtlCompareMemory(Buffer1, Buffer2, Size) == Size);
-}
+//
+// SC2-L1: Dead SdpSafeMemoryCompare removed (never called; callers use RtlCompareMemory directly)
+//
 
