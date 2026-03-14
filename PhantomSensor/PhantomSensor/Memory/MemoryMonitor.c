@@ -1229,8 +1229,6 @@ MmMonitorHandleProtectionChange(
     BOOLEAN RegionFound = FALSE;
     BOOLEAN RegionWasWritten = FALSE;
 
-    UNREFERENCED_PARAMETER(SourceProcessId);
-
     if (!MmpIsActive() || !g_MemoryMonitor.Enabled) {
         return STATUS_SUCCESS;
     }
@@ -1396,8 +1394,6 @@ MmMonitorHandleCrossProcessWrite(
     PMM_PROCESS_CONTEXT TargetContext = NULL;
     PMM_TRACKED_REGION Region;
     UINT32 Entropy = 0;
-
-    UNREFERENCED_PARAMETER(SourceProcessId);
 
     if (!MmpIsActive() || !g_MemoryMonitor.Enabled) {
         return STATUS_SUCCESS;
@@ -2873,7 +2869,17 @@ MmpDereferenceProcessContext(
 {
     LONG NewRef = InterlockedDecrement(&Context->RefCount);
 
-    if (NewRef == 0) {
+    NT_ASSERT(NewRef >= 0);
+
+    if (NewRef <= 0) {
+        if (NewRef < 0) {
+            //
+            // Underflow — double-deref bug. Increment back to prevent
+            // double-free and log. Do NOT free the context.
+            //
+            InterlockedIncrement(&Context->RefCount);
+            return;
+        }
         MmpFreeProcessContext(Context);
     }
 }
