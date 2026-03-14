@@ -199,6 +199,7 @@ typedef struct _COMP_MANAGER COMP_MANAGER, *PCOMP_MANAGER;
 typedef struct _PA_ANALYZER *PPA_ANALYZER;
 typedef struct _TB_MANAGER TB_MANAGER, *PTB_MANAGER;
 typedef struct _EC_CONSUMER EC_CONSUMER, *PEC_CONSUMER;
+typedef struct _ES_SCHEMA ES_SCHEMA, *PES_SCHEMA;
 
 // ============================================================================
 // DRIVER LIFECYCLE FUNCTIONS
@@ -538,6 +539,14 @@ ShadowStrikeGetTelemetryBuffer(VOID);
 _IRQL_requires_max_(DISPATCH_LEVEL)
 PEC_CONSUMER
 ShadowStrikeGetETWConsumer(VOID);
+
+/**
+ * @brief Get the global event schema instance.
+ * @return PES_SCHEMA or NULL if not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PES_SCHEMA
+ShadowStrikeGetEventSchema(VOID);
 
 #ifdef __cplusplus
 }

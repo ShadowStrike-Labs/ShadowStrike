@@ -809,12 +809,21 @@ EsReleaseReference(
 )
 {
     if (Schema != NULL && Schema->Magic == ES_SCHEMA_MAGIC) {
-        LONG newVal = InterlockedDecrement(&Schema->ReferenceCount);
-        if (newVal < 0) {
+        LONG oldVal = InterlockedDecrement(&Schema->ReferenceCount);
+        if (oldVal < 0) {
             //
-            // Underflow detected — restore and do not go negative
+            // Underflow detected — use CompareExchange to atomically restore
+            // ONLY if still negative, preventing double-restore race.
             //
-            InterlockedIncrement(&Schema->ReferenceCount);
+            LONG current = Schema->ReferenceCount;
+            while (current < 0) {
+                LONG prev = InterlockedCompareExchange(
+                    &Schema->ReferenceCount, 0, current);
+                if (prev == current) {
+                    break;
+                }
+                current = prev;
+            }
         }
     }
 }
@@ -3641,14 +3650,44 @@ EspXmlAppendEscaped(
     _In_ PCSTR Str
 )
 {
-    CHAR escaped[1024];
+    CHAR stackBuf[1024];
+    SIZE_T needed;
+    PCHAR dynBuf = NULL;
+    PCHAR dest;
+    NTSTATUS status;
 
     if (Str == NULL || *Str == '\0') {
         return STATUS_SUCCESS;
     }
 
-    EspXmlEscapeString(escaped, sizeof(escaped), Str);
-    return EspXmlAppend(Context, "%s", escaped);
+    //
+    // Query required size first, then escape into appropriate buffer.
+    // Stack buffer handles common case; pool alloc for large strings.
+    //
+    needed = EspXmlEscapeString(NULL, 0, Str);
+    if (needed + 1 <= sizeof(stackBuf)) {
+        dest = stackBuf;
+        EspXmlEscapeString(dest, sizeof(stackBuf), Str);
+    } else {
+        if (needed > ES_MAX_MANIFEST_SIZE) {
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        dynBuf = (PCHAR)ShadowStrikeAllocatePoolWithTag(
+            PagedPool, needed + 1, ES_MANIFEST_TAG);
+        if (dynBuf == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        dest = dynBuf;
+        EspXmlEscapeString(dest, needed + 1, Str);
+    }
+
+    status = EspXmlAppend(Context, "%s", dest);
+
+    if (dynBuf != NULL) {
+        ShadowStrikeFreePoolWithTag(dynBuf, ES_MANIFEST_TAG);
+    }
+
+    return status;
 }
 
 static NTSTATUS

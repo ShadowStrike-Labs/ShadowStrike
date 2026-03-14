@@ -88,6 +88,7 @@
 #include "TelemetryBuffer.h"
 #include "../Context/InstanceContext.h"
 #include "../ETW/ETWProvider.h"
+#include "../ETW/EventSchema.h"
 
 // ============================================================================
 // CONSTANTS
@@ -1818,6 +1819,16 @@ MhpHandleDriverStatusQuery(
             driverStatus.EtwEventsWritten = etwWritten;
             driverStatus.EtwEventsDropped = etwDropped;
             driverStatus.EtwBytesWritten = etwBytes;
+        }
+    }
+
+    //
+    // Event schema statistics
+    //
+    {
+        PES_SCHEMA schema = ShadowStrikeGetEventSchema();
+        if (schema != NULL) {
+            driverStatus.EventSchemaEventCount = (UINT32)EsGetEventCount(schema);
         }
     }
 

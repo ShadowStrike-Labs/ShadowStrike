@@ -362,6 +362,10 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     UINT64 EtwEventsDropped;
     UINT64 EtwBytesWritten;
 
+    // Event schema registered event count
+    UINT32 EventSchemaEventCount;
+    UINT32 Reserved4;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================

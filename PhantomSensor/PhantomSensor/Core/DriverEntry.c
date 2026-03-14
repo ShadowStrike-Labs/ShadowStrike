@@ -463,6 +463,519 @@ ShadowStrikeEtwEventCallback(
 }
 
 // ============================================================================
+// EVENT SCHEMA POPULATION
+// ============================================================================
+
+/**
+ * @brief Populate the event schema with all ETW event definitions.
+ *
+ * Called once during DriverEntry after EsInitialize succeeds. Registers all
+ * ETW event types, keywords, tasks, and channels so that the schema engine
+ * is fully populated for manifest generation, event validation, and
+ * serialization.
+ *
+ * @param Schema  Initialized event schema to populate.
+ * @return STATUS_SUCCESS on success, or the first failure status.
+ * @irql PASSIVE_LEVEL
+ */
+static NTSTATUS
+ShadowStrikePopulateEventSchema(
+    _In_ PES_SCHEMA Schema
+    )
+{
+    NTSTATUS status;
+    ES_FIELD_DEFINITION fields[16];
+    ULONG registered = 0;
+    ULONG failed = 0;
+
+#define ES_REG_KEYWORD(name, mask, desc) \
+    do { \
+        status = EsRegisterKeyword(Schema, (name), (mask), (desc)); \
+        if (!NT_SUCCESS(status) && status != STATUS_OBJECT_NAME_COLLISION) { \
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL, \
+                "[ShadowStrike] EventSchema: keyword '%s' reg failed: 0x%08X\n", (name), status); \
+            failed++; \
+        } \
+    } while (0)
+
+#define ES_REG_TASK(name, val, desc) \
+    do { \
+        status = EsRegisterTask(Schema, (name), (val), (desc)); \
+        if (!NT_SUCCESS(status) && status != STATUS_OBJECT_NAME_COLLISION) { \
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL, \
+                "[ShadowStrike] EventSchema: task '%s' reg failed: 0x%08X\n", (name), status); \
+            failed++; \
+        } \
+    } while (0)
+
+#define ES_REG_CHANNEL(name, type, val, enabled, desc) \
+    do { \
+        status = EsRegisterChannel(Schema, (name), (type), (val), (enabled), (desc)); \
+        if (!NT_SUCCESS(status) && status != STATUS_OBJECT_NAME_COLLISION) { \
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL, \
+                "[ShadowStrike] EventSchema: channel '%s' reg failed: 0x%08X\n", (name), status); \
+            failed++; \
+        } \
+    } while (0)
+
+    //
+    // Register keywords
+    //
+    ES_REG_KEYWORD("Process",    ETW_KEYWORD_PROCESS,    "Process lifecycle events");
+    ES_REG_KEYWORD("Thread",     ETW_KEYWORD_THREAD,     "Thread lifecycle events");
+    ES_REG_KEYWORD("Image",      ETW_KEYWORD_IMAGE,      "Image/module load events");
+    ES_REG_KEYWORD("File",       ETW_KEYWORD_FILE,       "File system events");
+    ES_REG_KEYWORD("Registry",   ETW_KEYWORD_REGISTRY,   "Registry events");
+    ES_REG_KEYWORD("Memory",     ETW_KEYWORD_MEMORY,     "Memory and injection events");
+    ES_REG_KEYWORD("Network",    ETW_KEYWORD_NETWORK,    "Network events");
+    ES_REG_KEYWORD("Behavior",   ETW_KEYWORD_BEHAVIOR,   "Behavioral analysis events");
+    ES_REG_KEYWORD("Security",   ETW_KEYWORD_SECURITY,   "Security alert events");
+    ES_REG_KEYWORD("Diagnostic", ETW_KEYWORD_DIAGNOSTIC, "Diagnostic and health events");
+    ES_REG_KEYWORD("Threat",     ETW_KEYWORD_THREAT,     "Threat detection events");
+    ES_REG_KEYWORD("Telemetry",  ETW_KEYWORD_TELEMETRY,  "Telemetry events");
+
+    //
+    // Register tasks
+    //
+    ES_REG_TASK("ProcessLifecycle",  1,  "Process create/terminate");
+    ES_REG_TASK("ThreadLifecycle",   2,  "Thread create/terminate");
+    ES_REG_TASK("ImageLoad",         3,  "Image/module load");
+    ES_REG_TASK("FileOperation",     4,  "File I/O operations");
+    ES_REG_TASK("RegistryOperation", 5,  "Registry operations");
+    ES_REG_TASK("MemoryProtection",  6,  "Memory and injection detection");
+    ES_REG_TASK("NetworkActivity",   7,  "Network connections and DNS");
+    ES_REG_TASK("BehavioralAnalysis",8,  "Behavioral analysis and attack chains");
+    ES_REG_TASK("DriverDiagnostic",  9,  "Driver health and diagnostics");
+
+    //
+    // Register channels
+    //
+    ES_REG_CHANNEL("Operational", EsChannel_Operational, 1, TRUE,
+                   "Primary operational event channel");
+    ES_REG_CHANNEL("Analytic",    EsChannel_Analytic,    2, FALSE,
+                   "High-volume analytic event channel");
+    ES_REG_CHANNEL("Security",    EsChannel_Admin,       3, TRUE,
+                   "Security alerts and threat detections");
+
+    //
+    // ── Process Events ──
+    //
+
+    // EtwEventId_ProcessCreate (1)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",      EsType_UINT64,        0,  8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",      EsType_UINT32,        8,  4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "ThreadId",       EsType_UINT32,       12,  4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "SessionId",      EsType_UINT32,       16,  4, EsFieldFlag_None);
+    EsInitField(&fields[4],  "ParentProcessId",EsType_UINT32,       24,  4, EsFieldFlag_None);
+    EsInitField(&fields[5],  "Flags",          EsType_HEXINT32,     28,  4, EsFieldFlag_None);
+    EsInitField(&fields[6],  "ThreatScore",    EsType_UINT32,       36,  4, EsFieldFlag_None);
+    EsInitField(&fields[7],  "ImagePath",      EsType_UNICODESTRING, 0,  0, EsFieldFlag_VariableLength);
+    EsInitField(&fields[8],  "CommandLine",    EsType_UNICODESTRING, 0,  0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_ProcessCreate, "ProcessCreate",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_PROCESS, 9, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_ProcessTerminate (2)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",      EsType_UINT64,  0,  8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",      EsType_UINT32,  8,  4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "ExitCode",       EsType_UINT32, 32,  4, EsFieldFlag_None);
+    status = EsRegisterEventEx(Schema, EtwEventId_ProcessTerminate, "ProcessTerminate",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_PROCESS, 3, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_ProcessSuspicious (3)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",   EsType_UINT64,  0, 8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",   EsType_UINT32,  8, 4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "ThreatScore", EsType_UINT32, 36, 4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "ImagePath",   EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_ProcessSuspicious, "ProcessSuspicious",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_PROCESS | ETW_KEYWORD_THREAT, 4, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_ProcessBlocked (4)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",   EsType_UINT64,  0, 8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",   EsType_UINT32,  8, 4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "ThreatScore", EsType_UINT32, 36, 4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "ImagePath",   EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_ProcessBlocked, "ProcessBlocked",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_PROCESS | ETW_KEYWORD_SECURITY, 4, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    //
+    // ── Thread Events ──
+    //
+
+    // EtwEventId_ThreadCreate (100)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",       EsType_UINT64,  0,  8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",       EsType_UINT32,  8,  4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "ThreadId",        EsType_UINT32, 12,  4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "TargetProcessId", EsType_UINT32, 24,  4, EsFieldFlag_None);
+    EsInitField(&fields[4],  "TargetThreadId",  EsType_UINT32, 28,  4, EsFieldFlag_None);
+    EsInitField(&fields[5],  "StartAddress",    EsType_HEXINT64,32,  8, EsFieldFlag_None);
+    status = EsRegisterEventEx(Schema, EtwEventId_ThreadCreate, "ThreadCreate",
+                               ETW_LEVEL_VERBOSE, ETW_KEYWORD_THREAD, 6, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_RemoteThreadCreate (101)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",       EsType_UINT64,  0,  8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",       EsType_UINT32,  8,  4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "TargetProcessId", EsType_UINT32, 24,  4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "StartAddress",    EsType_HEXINT64,32,  8, EsFieldFlag_None);
+    EsInitField(&fields[4],  "ThreatScore",     EsType_UINT32, 40,  4, EsFieldFlag_None);
+    status = EsRegisterEventEx(Schema, EtwEventId_RemoteThreadCreate, "RemoteThreadCreate",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_THREAD | ETW_KEYWORD_THREAT, 5, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_ThreadSuspicious (102)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",   EsType_UINT64,  0, 8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",   EsType_UINT32,  8, 4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "ThreatScore", EsType_UINT32, 40, 4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "ProcessPath", EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_ThreadSuspicious, "ThreadSuspicious",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_THREAD | ETW_KEYWORD_THREAT, 4, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    //
+    // ── Image Events ──
+    //
+
+    // EtwEventId_ImageLoad (200)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",   EsType_UINT64,  0,  8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",   EsType_UINT32,  8,  4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "ImageBase",   EsType_HEXINT64,24,  8, EsFieldFlag_None);
+    EsInitField(&fields[3],  "ImageSize",   EsType_UINT64,  32,  8, EsFieldFlag_None);
+    EsInitField(&fields[4],  "ThreatScore", EsType_UINT32,  40,  4, EsFieldFlag_None);
+    EsInitField(&fields[5],  "Flags",       EsType_HEXINT32,44,  4, EsFieldFlag_None);
+    EsInitField(&fields[6],  "ImagePath",   EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_ImageLoad, "ImageLoad",
+                               ETW_LEVEL_VERBOSE, ETW_KEYWORD_IMAGE, 7, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_ImageSuspicious (201)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",   EsType_UINT64,  0, 8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",   EsType_UINT32,  8, 4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "ThreatScore", EsType_UINT32, 40, 4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "ImagePath",   EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_ImageSuspicious, "ImageSuspicious",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_IMAGE | ETW_KEYWORD_THREAT, 4, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_ImageBlocked (202)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",   EsType_UINT64,  0, 8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",   EsType_UINT32,  8, 4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "ThreatScore", EsType_UINT32, 40, 4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "ImagePath",   EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_ImageBlocked, "ImageBlocked",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_IMAGE | ETW_KEYWORD_SECURITY, 4, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    //
+    // ── File Events ──
+    //
+
+    // EtwEventId_FileCreate (300)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",   EsType_UINT64,  0, 8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",   EsType_UINT32,  8, 4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "Operation",   EsType_UINT32, 24, 4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "Disposition",  EsType_UINT32, 28, 4, EsFieldFlag_None);
+    EsInitField(&fields[4],  "FileSize",    EsType_UINT64, 32, 8, EsFieldFlag_None);
+    EsInitField(&fields[5],  "ThreatScore", EsType_UINT32, 40, 4, EsFieldFlag_None);
+    EsInitField(&fields[6],  "Verdict",     EsType_UINT32, 44, 4, EsFieldFlag_None);
+    EsInitField(&fields[7],  "FilePath",    EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_FileCreate, "FileCreate",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_FILE, 8, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_FileWrite (301) — same struct as FileCreate
+    status = EsRegisterEventEx(Schema, EtwEventId_FileWrite, "FileWrite",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_FILE, 8, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_FileScanResult (302)
+    status = EsRegisterEventEx(Schema, EtwEventId_FileScanResult, "FileScanResult",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_FILE | ETW_KEYWORD_THREAT, 8, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_FileBlocked (303)
+    status = EsRegisterEventEx(Schema, EtwEventId_FileBlocked, "FileBlocked",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_FILE | ETW_KEYWORD_SECURITY, 8, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_FileQuarantined (304)
+    status = EsRegisterEventEx(Schema, EtwEventId_FileQuarantined, "FileQuarantined",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_FILE | ETW_KEYWORD_SECURITY, 8, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    //
+    // ── Registry Events ──
+    //
+
+    // EtwEventId_RegistrySetValue (400)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",   EsType_UINT64,  0, 8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",   EsType_UINT32,  8, 4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "Operation",   EsType_UINT32, 24, 4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "ThreatScore", EsType_UINT32, 28, 4, EsFieldFlag_None);
+    EsInitField(&fields[4],  "KeyPath",     EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    EsInitField(&fields[5],  "ValueName",   EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_RegistrySetValue, "RegistrySetValue",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_REGISTRY, 6, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_RegistryDeleteValue (401)
+    status = EsRegisterEventEx(Schema, EtwEventId_RegistryDeleteValue, "RegistryDeleteValue",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_REGISTRY, 6, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_RegistrySuspicious (402)
+    status = EsRegisterEventEx(Schema, EtwEventId_RegistrySuspicious, "RegistrySuspicious",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_REGISTRY | ETW_KEYWORD_THREAT, 6, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_RegistryBlocked (403)
+    status = EsRegisterEventEx(Schema, EtwEventId_RegistryBlocked, "RegistryBlocked",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_REGISTRY | ETW_KEYWORD_SECURITY, 6, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    //
+    // ── Memory Events ──
+    //
+
+    // EtwEventId_MemoryAllocation (500)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",       EsType_UINT64,   0,  8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",       EsType_UINT32,   8,  4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "TargetProcessId", EsType_UINT32,  24,  4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "AlertType",       EsType_UINT32,  28,  4, EsFieldFlag_None);
+    EsInitField(&fields[4],  "BaseAddress",     EsType_HEXINT64,32,  8, EsFieldFlag_None);
+    EsInitField(&fields[5],  "RegionSize",      EsType_UINT64,  40,  8, EsFieldFlag_None);
+    EsInitField(&fields[6],  "Protection",      EsType_HEXINT32,48,  4, EsFieldFlag_None);
+    EsInitField(&fields[7],  "ThreatScore",     EsType_UINT32,  52,  4, EsFieldFlag_None);
+    EsInitField(&fields[8],  "ProcessPath",     EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_MemoryAllocation, "MemoryAllocation",
+                               ETW_LEVEL_VERBOSE, ETW_KEYWORD_MEMORY, 9, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_MemoryProtectionChange (501)
+    status = EsRegisterEventEx(Schema, EtwEventId_MemoryProtectionChange, "MemoryProtectionChange",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_MEMORY, 9, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_ShellcodeDetected (502)
+    status = EsRegisterEventEx(Schema, EtwEventId_ShellcodeDetected, "ShellcodeDetected",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_MEMORY | ETW_KEYWORD_THREAT, 9, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_InjectionDetected (503)
+    status = EsRegisterEventEx(Schema, EtwEventId_InjectionDetected, "InjectionDetected",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_MEMORY | ETW_KEYWORD_THREAT, 9, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_HollowingDetected (504)
+    status = EsRegisterEventEx(Schema, EtwEventId_HollowingDetected, "HollowingDetected",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_MEMORY | ETW_KEYWORD_THREAT, 9, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    //
+    // ── Network Events ──
+    //
+
+    // EtwEventId_NetworkConnect (600)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",      EsType_UINT64,   0,   8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",      EsType_UINT32,   8,   4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "Protocol",       EsType_UINT32,  24,   4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "Direction",      EsType_UINT32,  28,   4, EsFieldFlag_None);
+    EsInitField(&fields[4],  "LocalPort",      EsType_UINT16,  32,   2, EsFieldFlag_None);
+    EsInitField(&fields[5],  "RemotePort",     EsType_UINT16,  34,   2, EsFieldFlag_None);
+    EsInitField(&fields[6],  "LocalIpV4",      EsType_IPV4,    36,   4, EsFieldFlag_None);
+    EsInitField(&fields[7],  "RemoteIpV4",     EsType_IPV4,    40,   4, EsFieldFlag_None);
+    EsInitField(&fields[8],  "LocalIpV6",      EsType_IPV6,    44,  16, EsFieldFlag_FixedCount);
+    EsInitField(&fields[9],  "RemoteIpV6",     EsType_IPV6,    60,  16, EsFieldFlag_FixedCount);
+    EsInitField(&fields[10], "BytesSent",      EsType_UINT64,  76,   8, EsFieldFlag_None);
+    EsInitField(&fields[11], "BytesReceived",  EsType_UINT64,  84,   8, EsFieldFlag_None);
+    EsInitField(&fields[12], "ThreatScore",    EsType_UINT32,  92,   4, EsFieldFlag_None);
+    EsInitField(&fields[13], "ThreatType",     EsType_UINT32,  96,   4, EsFieldFlag_None);
+    EsInitField(&fields[14], "RemoteHostname", EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_NetworkConnect, "NetworkConnect",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_NETWORK, 15, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_NetworkListen (601) — same layout
+    status = EsRegisterEventEx(Schema, EtwEventId_NetworkListen, "NetworkListen",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_NETWORK, 15, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_DnsQuery (602)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",    EsType_UINT64,  0, 8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",    EsType_UINT32,  8, 4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "RemoteIpV4",   EsType_IPV4,   40, 4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "ThreatScore",  EsType_UINT32, 92, 4, EsFieldFlag_None);
+    EsInitField(&fields[4],  "Hostname",     EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_DnsQuery, "DnsQuery",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_NETWORK, 5, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_C2Detected (603)
+    status = EsRegisterEventEx(Schema, EtwEventId_C2Detected, "C2Detected",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_NETWORK | ETW_KEYWORD_THREAT, 15, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_ExfiltrationDetected (604)
+    status = EsRegisterEventEx(Schema, EtwEventId_ExfiltrationDetected, "ExfiltrationDetected",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_NETWORK | ETW_KEYWORD_THREAT, 15, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_NetworkBlocked (605)
+    status = EsRegisterEventEx(Schema, EtwEventId_NetworkBlocked, "NetworkBlocked",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_NETWORK | ETW_KEYWORD_SECURITY, 15, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    //
+    // ── Behavior Events ──
+    //
+
+    // EtwEventId_BehaviorAlert (700)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",       EsType_UINT64,  0,  8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",       EsType_UINT32,  8,  4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "BehaviorType",    EsType_UINT32, 24,  4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "Category",        EsType_UINT32, 28,  4, EsFieldFlag_None);
+    EsInitField(&fields[4],  "ThreatScore",     EsType_UINT32, 32,  4, EsFieldFlag_None);
+    EsInitField(&fields[5],  "Confidence",      EsType_UINT32, 36,  4, EsFieldFlag_None);
+    EsInitField(&fields[6],  "ChainId",         EsType_UINT64, 40,  8, EsFieldFlag_None);
+    EsInitField(&fields[7],  "MitreTechnique",  EsType_UINT32, 48,  4, EsFieldFlag_None);
+    EsInitField(&fields[8],  "MitreTactic",     EsType_UINT32, 52,  4, EsFieldFlag_None);
+    EsInitField(&fields[9],  "ProcessPath",     EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    EsInitField(&fields[10], "Description",     EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_BehaviorAlert, "BehaviorAlert",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_BEHAVIOR, 11, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_AttackChainStarted (701)
+    status = EsRegisterEventEx(Schema, EtwEventId_AttackChainStarted, "AttackChainStarted",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_BEHAVIOR | ETW_KEYWORD_THREAT, 11, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_AttackChainUpdated (702)
+    status = EsRegisterEventEx(Schema, EtwEventId_AttackChainUpdated, "AttackChainUpdated",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_BEHAVIOR | ETW_KEYWORD_THREAT, 11, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_AttackChainCompleted (703)
+    status = EsRegisterEventEx(Schema, EtwEventId_AttackChainCompleted, "AttackChainCompleted",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_BEHAVIOR | ETW_KEYWORD_THREAT, 11, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_MitreDetection (704)
+    status = EsRegisterEventEx(Schema, EtwEventId_MitreDetection, "MitreDetection",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_BEHAVIOR | ETW_KEYWORD_THREAT, 11, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    //
+    // ── Security Alert Events ──
+    //
+
+    // EtwEventId_TamperAttempt (800)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",        EsType_UINT64,  0,  8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",        EsType_UINT32,  8,  4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "AlertType",        EsType_UINT32, 24,  4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "Severity",         EsType_UINT32, 28,  4, EsFieldFlag_None);
+    EsInitField(&fields[4],  "ThreatScore",      EsType_UINT32, 32,  4, EsFieldFlag_None);
+    EsInitField(&fields[5],  "ResponseAction",   EsType_UINT32, 36,  4, EsFieldFlag_None);
+    EsInitField(&fields[6],  "ChainId",          EsType_UINT64, 40,  8, EsFieldFlag_None);
+    EsInitField(&fields[7],  "AlertTitle",       EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    EsInitField(&fields[8],  "AlertDescription", EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    EsInitField(&fields[9],  "ProcessPath",      EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    EsInitField(&fields[10], "TargetPath",       EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
+    status = EsRegisterEventEx(Schema, EtwEventId_TamperAttempt, "TamperAttempt",
+                               ETW_LEVEL_CRITICAL, ETW_KEYWORD_SECURITY, 11, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_EvasionAttempt (801)
+    status = EsRegisterEventEx(Schema, EtwEventId_EvasionAttempt, "EvasionAttempt",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_SECURITY | ETW_KEYWORD_THREAT, 11, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_DirectSyscall (802)
+    status = EsRegisterEventEx(Schema, EtwEventId_DirectSyscall, "DirectSyscall",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_SECURITY | ETW_KEYWORD_THREAT, 11, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_PrivilegeEscalation (803)
+    status = EsRegisterEventEx(Schema, EtwEventId_PrivilegeEscalation, "PrivilegeEscalation",
+                               ETW_LEVEL_CRITICAL, ETW_KEYWORD_SECURITY | ETW_KEYWORD_THREAT, 11, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_CredentialAccess (804)
+    status = EsRegisterEventEx(Schema, EtwEventId_CredentialAccess, "CredentialAccess",
+                               ETW_LEVEL_CRITICAL, ETW_KEYWORD_SECURITY | ETW_KEYWORD_THREAT, 11, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    //
+    // ── Diagnostic Events ──
+    //
+
+    // EtwEventId_DriverStarted (900)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",   EsType_UINT64,  0, 8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ComponentId", EsType_UINT32, 24, 4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "ErrorCode",   EsType_HEXINT32,28, 4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "Message",     EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength | EsFieldFlag_Optional);
+    status = EsRegisterEventEx(Schema, EtwEventId_DriverStarted, "DriverStarted",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_DIAGNOSTIC, 4, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_DriverStopping (901)
+    status = EsRegisterEventEx(Schema, EtwEventId_DriverStopping, "DriverStopping",
+                               ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_DIAGNOSTIC, 4, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_Heartbeat (902)
+    status = EsRegisterEventEx(Schema, EtwEventId_Heartbeat, "Heartbeat",
+                               ETW_LEVEL_VERBOSE, ETW_KEYWORD_DIAGNOSTIC | ETW_KEYWORD_TELEMETRY, 4, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_PerformanceStats (903)
+    status = EsRegisterEventEx(Schema, EtwEventId_PerformanceStats, "PerformanceStats",
+                               ETW_LEVEL_VERBOSE, ETW_KEYWORD_DIAGNOSTIC | ETW_KEYWORD_TELEMETRY, 4, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_ComponentHealth (904)
+    status = EsRegisterEventEx(Schema, EtwEventId_ComponentHealth, "ComponentHealth",
+                               ETW_LEVEL_WARNING, ETW_KEYWORD_DIAGNOSTIC, 4, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+    // EtwEventId_Error (905)
+    status = EsRegisterEventEx(Schema, EtwEventId_Error, "Error",
+                               ETW_LEVEL_ERROR, ETW_KEYWORD_DIAGNOSTIC, 4, fields);
+    if (NT_SUCCESS(status)) registered++; else failed++;
+
+#undef ES_REG_KEYWORD
+#undef ES_REG_TASK
+#undef ES_REG_CHANNEL
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike] EventSchema: Registered %lu events, %lu failures\n",
+               registered, failed);
+
+    return (registered > 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+// ============================================================================
 // DRIVER ENTRY
 // ============================================================================
 
@@ -993,6 +1506,21 @@ DriverEntry(
         } else {
             g_SubsystemFlags |= SubsysFlag_EventSchema;
             ShadowStrikeLogInitStatus("Event Schema", STATUS_SUCCESS);
+
+            //
+            // Step 7.6a: Populate event schema with all ETW event definitions
+            //
+            status = ShadowStrikePopulateEventSchema(g_EventSchema);
+            if (!NT_SUCCESS(status)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] WARNING: Failed to populate event schema: 0x%08X (continuing)\n",
+                           status);
+            } else {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                           "[ShadowStrike] Event schema populated with %lu events\n",
+                           (ULONG)EsGetEventCount(g_EventSchema));
+            }
+            status = STATUS_SUCCESS;
 
             //
             // Step 7.7: Initialize manifest generator (depends on EventSchema)
@@ -2493,6 +3021,12 @@ PEC_CONSUMER
 ShadowStrikeGetETWConsumer(VOID)
 {
     return g_EtwConsumer;
+}
+
+PES_SCHEMA
+ShadowStrikeGetEventSchema(VOID)
+{
+    return g_EventSchema;
 }
 
 // ============================================================================
