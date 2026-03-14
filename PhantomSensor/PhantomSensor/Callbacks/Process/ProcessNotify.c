@@ -100,6 +100,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../ETW/ETWConsumer.h"
 #include "../../ETW/ETWProvider.h"
 #include "../../ETW/TelemetryEvents.h"
+#include "../../Memory/MemoryMonitor.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -3583,6 +3584,12 @@ PnpHandleProcessTermination(
     // inheriting wrong trust state.
     //
     ShadowStrikeOnProcessTerminate(ProcessId);
+
+    //
+    // Clean up MemoryMonitor process context and stop HeapSpray tracking.
+    // Releases EPROCESS ref held by HeapSpray detector for this PID.
+    //
+    MmMonitorRemoveProcessContext(HandleToULong(ProcessId));
 
     //
     // Look up process context
