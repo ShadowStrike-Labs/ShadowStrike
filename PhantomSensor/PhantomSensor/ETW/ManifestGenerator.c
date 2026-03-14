@@ -1927,6 +1927,149 @@ Return Value:
         }
     }
 
+    //
+    // Check for duplicate task values
+    //
+    {
+        PLIST_ENTRY TaskEntry, TaskEntry2;
+        PMG_TASK_DEFINITION Task1, Task2;
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockShared(&Generator->TaskLock);
+
+        for (TaskEntry = Generator->TaskList.Flink;
+             TaskEntry != &Generator->TaskList;
+             TaskEntry = TaskEntry->Flink) {
+
+            Task1 = CONTAINING_RECORD(TaskEntry, MG_TASK_DEFINITION, ListEntry);
+
+            for (TaskEntry2 = TaskEntry->Flink;
+                 TaskEntry2 != &Generator->TaskList;
+                 TaskEntry2 = TaskEntry2->Flink) {
+
+                Task2 = CONTAINING_RECORD(TaskEntry2, MG_TASK_DEFINITION, ListEntry);
+
+                if (Task1->Value == Task2->Value) {
+                    Errors++;
+                    if (BuilderInitialized) {
+                        MgpStringBuilderAppendFormat(&ErrorBuilder,
+                            "ERROR: Duplicate task value %u: '%s' and '%s'\r\n",
+                            Task1->Value, Task1->Name, Task2->Name);
+                    }
+                }
+            }
+        }
+
+        ExReleasePushLockShared(&Generator->TaskLock);
+        KeLeaveCriticalRegion();
+    }
+
+    //
+    // Check for duplicate keyword masks
+    //
+    {
+        PLIST_ENTRY KwEntry, KwEntry2;
+        PMG_KEYWORD_DEFINITION Kw1, Kw2;
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockShared(&Generator->KeywordLock);
+
+        for (KwEntry = Generator->KeywordList.Flink;
+             KwEntry != &Generator->KeywordList;
+             KwEntry = KwEntry->Flink) {
+
+            Kw1 = CONTAINING_RECORD(KwEntry, MG_KEYWORD_DEFINITION, ListEntry);
+
+            for (KwEntry2 = KwEntry->Flink;
+                 KwEntry2 != &Generator->KeywordList;
+                 KwEntry2 = KwEntry2->Flink) {
+
+                Kw2 = CONTAINING_RECORD(KwEntry2, MG_KEYWORD_DEFINITION, ListEntry);
+
+                if (Kw1->Mask == Kw2->Mask) {
+                    Errors++;
+                    if (BuilderInitialized) {
+                        MgpStringBuilderAppendFormat(&ErrorBuilder,
+                            "ERROR: Duplicate keyword mask 0x%016llX: '%s' and '%s'\r\n",
+                            Kw1->Mask, Kw1->Name, Kw2->Name);
+                    }
+                }
+            }
+        }
+
+        ExReleasePushLockShared(&Generator->KeywordLock);
+        KeLeaveCriticalRegion();
+    }
+
+    //
+    // Check for duplicate channel values
+    //
+    {
+        PLIST_ENTRY ChEntry, ChEntry2;
+        PMG_CHANNEL_DEFINITION Ch1, Ch2;
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockShared(&Generator->ChannelLock);
+
+        for (ChEntry = Generator->ChannelList.Flink;
+             ChEntry != &Generator->ChannelList;
+             ChEntry = ChEntry->Flink) {
+
+            Ch1 = CONTAINING_RECORD(ChEntry, MG_CHANNEL_DEFINITION, ListEntry);
+
+            for (ChEntry2 = ChEntry->Flink;
+                 ChEntry2 != &Generator->ChannelList;
+                 ChEntry2 = ChEntry2->Flink) {
+
+                Ch2 = CONTAINING_RECORD(ChEntry2, MG_CHANNEL_DEFINITION, ListEntry);
+
+                if (Ch1->Value == Ch2->Value) {
+                    Errors++;
+                    if (BuilderInitialized) {
+                        MgpStringBuilderAppendFormat(&ErrorBuilder,
+                            "ERROR: Duplicate channel value %u: '%s' and '%s'\r\n",
+                            (ULONG)Ch1->Value, Ch1->Name, Ch2->Name);
+                    }
+                }
+            }
+        }
+
+        ExReleasePushLockShared(&Generator->ChannelLock);
+        KeLeaveCriticalRegion();
+    }
+
+    //
+    // Check for out-of-bounds field types in events
+    //
+    if (Generator->Schema != NULL) {
+        KeEnterCriticalRegion();
+        ExAcquirePushLockShared(&Generator->Schema->EventLock);
+
+        for (Entry = Generator->Schema->EventList.Flink;
+             Entry != &Generator->Schema->EventList;
+             Entry = Entry->Flink) {
+
+            PES_EVENT_DEFINITION FieldEvent = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, ListEntry);
+
+            for (ULONG fi = 0; fi < FieldEvent->FieldCount; fi++) {
+                if (FieldEvent->Fields[fi].Type >= MG_FIELD_TYPE_COUNT) {
+                    Errors++;
+                    if (BuilderInitialized) {
+                        MgpStringBuilderAppendFormat(&ErrorBuilder,
+                            "ERROR: Event '%s' field %lu has invalid type %u (max %u)\r\n",
+                            FieldEvent->EventName,
+                            (ULONG)fi,
+                            (ULONG)FieldEvent->Fields[fi].Type,
+                            (ULONG)(MG_FIELD_TYPE_COUNT - 1));
+                    }
+                }
+            }
+        }
+
+        ExReleasePushLockShared(&Generator->Schema->EventLock);
+        KeLeaveCriticalRegion();
+    }
+
     *ErrorCount = Errors;
     Generator->Stats.ValidationErrors = Errors;
 
@@ -2425,10 +2568,12 @@ MgpStringBuilderAppendFormatV(
 Routine Description:
     Appends a formatted string using va_list.
     Uses pool-allocated temp buffer to avoid consuming kernel stack.
+    Retries with larger buffer if initial 2KB buffer is insufficient.
 --*/
 {
     NTSTATUS Status;
     PCHAR TempBuffer;
+    SIZE_T TempSize = MG_FORMAT_TEMP_BUFFER_SIZE;
 
     if (Builder->Overflow) {
         return STATUS_BUFFER_OVERFLOW;
@@ -2436,7 +2581,7 @@ Routine Description:
 
     TempBuffer = (PCHAR)ExAllocatePool2(
         POOL_FLAG_PAGED,
-        MG_FORMAT_TEMP_BUFFER_SIZE,
+        TempSize,
         Builder->PoolTag
         );
 
@@ -2446,10 +2591,39 @@ Routine Description:
 
     Status = RtlStringCchVPrintfA(
         TempBuffer,
-        MG_FORMAT_TEMP_BUFFER_SIZE,
+        TempSize,
         Format,
         Args
         );
+
+    //
+    // If truncated, retry with progressively larger buffers (up to 32KB cap)
+    //
+    if (Status == STATUS_BUFFER_OVERFLOW) {
+        ExFreePoolWithTag(TempBuffer, Builder->PoolTag);
+
+        TempSize = MG_FORMAT_TEMP_BUFFER_SIZE * 4;     // 8KB
+        if (TempSize > 32768) {
+            TempSize = 32768;
+        }
+
+        TempBuffer = (PCHAR)ExAllocatePool2(
+            POOL_FLAG_PAGED,
+            TempSize,
+            Builder->PoolTag
+            );
+
+        if (TempBuffer == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        Status = RtlStringCchVPrintfA(
+            TempBuffer,
+            TempSize,
+            Format,
+            Args
+            );
+    }
 
     if (NT_SUCCESS(Status)) {
         Status = MgpStringBuilderAppend(Builder, TempBuffer);
@@ -3176,18 +3350,39 @@ Routine Description:
 
         Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, ListEntry);
 
-        Status = MgpStringBuilderAppendFormat(Builder,
-            "                    <event\r\n"
-            "                        value=\"%u\"\r\n"
-            "                        symbol=\"%s_EVENT_%s\"\r\n"
-            "                        level=\"win:Level%u\"\r\n"
-            "                        keywords=\"0x%016llX\"\r\n",
-            Event->EventId,
-            Generator->ProviderSymbol,
-            Event->EventName,
-            Event->Level,
-            Event->Keywords
-            );
+        //
+        // Map event level to standard ETW level name
+        //
+        {
+            static const CHAR* StandardLevelNames[] = {
+                "win:LogAlways",        // 0
+                "win:Critical",         // 1
+                "win:Error",            // 2
+                "win:Warning",          // 3
+                "win:Informational",    // 4
+                "win:Verbose"           // 5
+            };
+
+            PCSTR LevelRef;
+            if (Event->Level <= 5) {
+                LevelRef = StandardLevelNames[Event->Level];
+            } else {
+                LevelRef = "win:Verbose";
+            }
+
+            Status = MgpStringBuilderAppendFormat(Builder,
+                "                    <event\r\n"
+                "                        value=\"%u\"\r\n"
+                "                        symbol=\"%s_EVENT_%s\"\r\n"
+                "                        level=\"%s\"\r\n"
+                "                        keywords=\"0x%016llX\"\r\n",
+                Event->EventId,
+                Generator->ProviderSymbol,
+                Event->EventName,
+                LevelRef,
+                Event->Keywords
+                );
+        }
 
         if (!NT_SUCCESS(Status)) {
             break;
