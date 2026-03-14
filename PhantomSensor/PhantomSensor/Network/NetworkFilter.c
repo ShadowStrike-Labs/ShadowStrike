@@ -77,7 +77,6 @@
 #include "../ETW/ETWProvider.h"
 #include "../Core/DriverEntry.h"
 #include "../Sync/TimerManager.h"
-#include "../Core/DriverEntry.h"
 
 // ============================================================================
 // GUID DEFINITIONS
@@ -143,6 +142,7 @@ EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_STREAM_V4_CALLOUT_GUID =
 #define NF_DNS_PORT                     53
 #define NF_MAX_PROCESS_PATH             512
 #define NF_MAX_PENDING_DNS              8192
+#define NF_MAX_DNS_ENTRIES              32768       // Cap DNS tracking to prevent pool exhaustion
 #define NF_DNS_HEADER_SIZE              12          // Minimum DNS header
 #define NF_MAX_DNS_PACKET_SIZE          65535       // Max DNS packet (TCP max)
 #define NF_FORCE_CLOSE_TIMEOUT_MS       1200000     // 20 min — force-close non-Closed stale connections
@@ -2556,9 +2556,18 @@ NfpHashEndpoints(
     ULONG i;
     ULONG addrLen;
 
-    addrLen = (Local->Address.Family == AF_INET) ? 4 : 16;
+    //
+    // Hash the actual address bytes (V4.Bytes or V6.Bytes), NOT the
+    // SS_IP_ADDRESS header (Family+Reserved precede the address union).
+    //
+    if (Local->Address.Family == AF_INET) {
+        addrLen = 4;
+        bytes = Local->Address.V4.Bytes;
+    } else {
+        addrLen = 16;
+        bytes = Local->Address.V6.Bytes;
+    }
 
-    bytes = (PUCHAR)&Local->Address;
     for (i = 0; i < addrLen; i++) {
         hash = ((hash << 5) + hash) + bytes[i];
     }
@@ -2566,7 +2575,14 @@ NfpHashEndpoints(
     hash = ((hash << 5) + hash) + (Local->Port & 0xFF);
     hash = ((hash << 5) + hash) + ((Local->Port >> 8) & 0xFF);
 
-    bytes = (PUCHAR)&Remote->Address;
+    if (Remote->Address.Family == AF_INET) {
+        addrLen = 4;
+        bytes = Remote->Address.V4.Bytes;
+    } else {
+        addrLen = 16;
+        bytes = Remote->Address.V6.Bytes;
+    }
+
     for (i = 0; i < addrLen; i++) {
         hash = ((hash << 5) + hash) + bytes[i];
     }
@@ -3788,13 +3804,30 @@ NfpProcessDnsPacket(
     }
 
     //
-    // Compute domain entropy for DGA detection
+    // Compute domain entropy for DGA detection.
+    //
+    // Shannon entropy approximation using integer arithmetic:
+    //   H = -Σ (p_i * log2(p_i))
+    // We use: H * 100 = Σ (count_i * log2(totalChars/count_i) * 100 / totalChars)
+    // Approximation via lookup table for log2(n) * 100 for n in [1..32].
     //
     {
         UINT32 charCounts[36] = {0};
         ULONG totalChars = 0;
-        UINT64 entropy = 0;
+        UINT32 entropyX100 = 0;
         ULONG i;
+
+        //
+        // log2(n) * 100, indexed by n (1-based). log2(1)=0, log2(2)=100, etc.
+        // Used for integer Shannon entropy: H = Σ count[i]/total * log2(total/count[i])
+        //
+        static const UINT16 log2x100[] = {
+            0,    0,  100, 158, 200, 232, 258, 280, 300, 317,   // 0-9
+            332, 346, 358, 370, 381, 391, 400, 409, 417, 424,   // 10-19
+            432, 439, 446, 452, 458, 464, 470, 475, 481, 486,   // 20-29
+            491, 496, 500                                         // 30-32
+        };
+        #define LOG2X100_MAX_IDX 32
 
         for (i = 0; queryName[i] != L'\0'; i++) {
             WCHAR c = queryName[i];
@@ -3805,27 +3838,57 @@ NfpProcessDnsPacket(
             totalChars++;
         }
 
-        if (totalChars > 0) {
+        if (totalChars > 1 && totalChars <= LOG2X100_MAX_IDX) {
+            //
+            // H * 100 = Σ (count_i / totalChars) * log2(totalChars / count_i) * 100
+            //         = Σ count_i * (log2(totalChars) - log2(count_i)) * 100 / totalChars
+            //
+            UINT32 log2Total = log2x100[totalChars];
+
             for (i = 0; i < 36; i++) {
-                if (charCounts[i] > 0) {
-                    UINT32 freq = (charCounts[i] * 1000) / totalChars;
-                    if (freq > 0) {
-                        // Simplified entropy: sum of freq * log2(freq) approximation
-                        entropy += freq;
+                if (charCounts[i] > 0 && charCounts[i] <= LOG2X100_MAX_IDX) {
+                    UINT32 log2Count = log2x100[charCounts[i]];
+                    if (log2Total > log2Count) {
+                        entropyX100 += charCounts[i] * (log2Total - log2Count);
                     }
                 }
             }
-            dnsEntry->DomainEntropy = (UINT32)((entropy * 100) / 1000);
+            entropyX100 = entropyX100 / totalChars;
+        } else if (totalChars > LOG2X100_MAX_IDX) {
+            //
+            // For very long names (>32 chars), use unique-char ratio as proxy.
+            // Ratio = uniqueChars * 100 / min(totalChars, 36).
+            // Random strings → high ratio, dictionary → low ratio.
+            //
+            UINT32 uniqueChars = 0;
+            for (i = 0; i < 36; i++) {
+                if (charCounts[i] > 0) uniqueChars++;
+            }
+            entropyX100 = (uniqueChars * 100) / min(totalChars, 36);
+            //
+            // Scale: 36 unique in 36 chars → 100.
+            // True Shannon entropy for uniform 36-char → ~514.
+            // Map ratio to entropy-like scale: ratio * 5 approximates H*100.
+            //
+            entropyX100 = entropyX100 * 5;
         }
 
-        // High entropy with long subdomain suggests DGA
-        ULONG dotCount = 0;
-        ULONG lastDotPos = 0;
-        for (i = 0; queryName[i] != L'\0'; i++) {
-            if (queryName[i] == L'.') { dotCount++; lastDotPos = i; }
-        }
-        dnsEntry->SubdomainLength = (dotCount > 1) ? lastDotPos : 0;
+        dnsEntry->DomainEntropy = entropyX100;
 
+        // Compute subdomain length
+        {
+            ULONG dotCount = 0;
+            ULONG lastDotPos = 0;
+            for (i = 0; queryName[i] != L'\0'; i++) {
+                if (queryName[i] == L'.') { dotCount++; lastDotPos = i; }
+            }
+            dnsEntry->SubdomainLength = (dotCount > 1) ? lastDotPos : 0;
+        }
+
+        //
+        // High entropy (>350 ≈ 3.5 bits/char) with long name suggests DGA.
+        // Typical DGA domains: 400-500. Legitimate domains: 200-350.
+        //
         if (dnsEntry->DomainEntropy > 350 && totalChars > 20) {
             dnsEntry->IsDGA = TRUE;
             dnsEntry->IsSuspicious = TRUE;
@@ -3834,8 +3897,14 @@ NfpProcessDnsPacket(
     }
 
     //
-    // Insert into DNS tracking list
+    // Insert into DNS tracking list (with cap to prevent pool exhaustion)
     //
+    if ((ULONG)InterlockedCompareExchange(&g_NfState.DnsQueryCount, 0, 0)
+            >= NF_MAX_DNS_ENTRIES) {
+        NfpFreeDnsEntry(dnsEntry);
+        goto Done;
+    }
+
     FltAcquirePushLockExclusive(&g_NfState.DnsLock);
     InsertTailList(&g_NfState.DnsQueryList, &dnsEntry->ListEntry);
     InterlockedIncrement(&g_NfState.DnsQueryCount);
