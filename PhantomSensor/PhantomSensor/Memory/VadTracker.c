@@ -838,7 +838,6 @@ Return Value:
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
     PVAD_PROCESS_CONTEXT Context = NULL;
     PLIST_ENTRY Entry;
-    ULONG Bucket;
 
     PAGED_CODE();
 
@@ -884,11 +883,9 @@ Return Value:
     InterlockedDecrement(&Internal->Public.ProcessCount);
 
     //
-    // Remove from hash chain
+    // Remove from hash chain via VadpRemoveProcessHash (VAD2-H2 fix)
     //
-    Bucket = VadpHashProcessId(Context->ProcessId);
-    RemoveEntryList(&Context->HashEntry);
-    UNREFERENCED_PARAMETER(Bucket);
+    VadpRemoveProcessHash(Internal, Context);
 
     ExReleasePushLockExclusive(&Internal->Public.ProcessListLock);
     KeLeaveCriticalRegion();
@@ -1285,6 +1282,15 @@ VadUnregisterChangeCallback(
         return;
     }
 
+    //
+    // VAD2-M1 fix: Acquire ref to prevent shutdown from freeing the tracker
+    // while we hold the callback lock. During shutdown teardown, the ref
+    // acquire fails harmlessly and we return without touching freed memory.
+    //
+    if (!VadpAcquireRef(Internal)) {
+        return;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Internal->CallbackLock);
 
@@ -1301,6 +1307,7 @@ VadUnregisterChangeCallback(
 
     ExReleasePushLockExclusive(&Internal->CallbackLock);
     KeLeaveCriticalRegion();
+    VadpReleaseRef(Internal);
 }
 
 NTSTATUS
@@ -1785,6 +1792,16 @@ VadpScanProcessVad(
     }
 
     //
+    // VAD2-H3 fix: Verify the process hasn't exited before attaching.
+    // PEPROCESS is ref-held so it won't be freed, but the address space
+    // may already be torn down. KeStackAttachProcess to a zombie process
+    // can hang or produce unpredictable behavior.
+    //
+    if (PsGetProcessExitStatus(Context->Process) != STATUS_PENDING) {
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
+
+    //
     // Attach to process context
     //
     __try {
@@ -1799,6 +1816,16 @@ VadpScanProcessVad(
 
     if (Attached) {
         KeUnstackDetachProcess(&ApcState);
+    }
+
+    //
+    // VAD2-H1 fix: Compare against previous snapshot AFTER rebuilding regions
+    // to detect protection changes, new regions, deleted regions, and RW→RX
+    // unpacking transitions. Without this call, the entire change-detection
+    // pipeline (callbacks, change events) was dead.
+    //
+    if (NT_SUCCESS(Status) && Tracker->Public.Config.EnableChangeNotification) {
+        VadpCompareSnapshots(Tracker, Context);
     }
 
     return Status;
@@ -2093,13 +2120,12 @@ VadpAnalyzeRegionSuspicion(
     }
 
     //
-    // Check for protection mismatch
+    // VAD2-L1 fix: Check for protection mismatch without mutating region state.
+    // Current protection differs from allocation protection → VirtualProtect was used.
+    // This is a pure read-only analysis — no side effects.
     //
     if (Region->Protection != Region->OriginalProtection) {
-        Region->ProtectionChangeCount++;
-        if (Region->ProtectionChangeCount > 3) {
-            Suspicion |= VadSuspicion_ProtectionMismatch;
-        }
+        Suspicion |= VadSuspicion_ProtectionMismatch;
     }
 
     return Suspicion;
@@ -2318,9 +2344,15 @@ VadpWorkerThread(
         }
 
         if (Status == STATUS_WAIT_1) {
-            if (InterlockedCompareExchange(&Tracker->Public.Initialized, 0, 0) != 0 &&
-                InterlockedCompareExchange(&Tracker->ShutdownRequested, 0, 0) == 0) {
+            //
+            // VAD2-L2 fix: Use VadpAcquireRef to guarantee the tracker
+            // stays alive for the duration of the scan. VadScanAllProcesses
+            // acquires its own ref internally, but the outer ref prevents
+            // a shutdown race between our Initialized check and the call.
+            //
+            if (VadpAcquireRef(Tracker)) {
                 VadScanAllProcesses((PVAD_TRACKER)Tracker);
+                VadpReleaseRef(Tracker);
             }
         }
     }

@@ -553,8 +553,23 @@ MmMonitorInitialize(
         }
     }
 
+    //
+    // VAD2-M3 fix: Initialize VadTracker BEFORE InjectionDetector so
+    // the VadTracker pointer can be passed to InjInitialize for region queries.
+    //
+    if (g_MemoryMonitor.Config.EnableVADTracking) {
+        Status = VadInitialize((PVAD_TRACKER*)&g_MemoryMonitor.VadTracker);
+        if (!NT_SUCCESS(Status)) {
+            DbgPrint("MemoryMonitor: VadTracker init failed: 0x%08X — continuing without VAD tracking", Status);
+            g_MemoryMonitor.Config.EnableVADTracking = FALSE;
+            g_MemoryMonitor.VadTracker = NULL;
+        }
+    }
+
     if (g_MemoryMonitor.Config.EnableInjectionDetection) {
-        Status = InjInitialize(NULL, (PINJ_DETECTOR*)&g_MemoryMonitor.InjectionDetector);
+        Status = InjInitialize(
+            (PVAD_TRACKER)g_MemoryMonitor.VadTracker,
+            (PINJ_DETECTOR*)&g_MemoryMonitor.InjectionDetector);
         if (!NT_SUCCESS(Status)) {
             DbgPrint("MemoryMonitor: InjectionDetector init failed: 0x%08X — continuing without injection detection", Status);
             g_MemoryMonitor.Config.EnableInjectionDetection = FALSE;
@@ -604,15 +619,6 @@ MmMonitorInitialize(
             DbgPrint("MemoryMonitor: ShellcodeDetector init failed: 0x%08X — continuing without shellcode detection", Status);
             g_MemoryMonitor.Config.EnableShellcodeDetection = FALSE;
             g_MemoryMonitor.ShellcodeDetector = NULL;
-        }
-    }
-
-    if (g_MemoryMonitor.Config.EnableVADTracking) {
-        Status = VadInitialize((PVAD_TRACKER*)&g_MemoryMonitor.VadTracker);
-        if (!NT_SUCCESS(Status)) {
-            DbgPrint("MemoryMonitor: VadTracker init failed: 0x%08X — continuing without VAD tracking", Status);
-            g_MemoryMonitor.Config.EnableVADTracking = FALSE;
-            g_MemoryMonitor.VadTracker = NULL;
         }
     }
 
@@ -666,13 +672,10 @@ MmMonitorShutdown(
 
     //
     // Shut down sub-module detectors (reverse init order).
-    // Must happen before context cleanup since sub-modules may hold
-    // references to process-level structures.
+    // Init order: VadTracker → InjectionDetector → HollowingDetector → ShellcodeDetector
+    // Shutdown must be reverse: ShellcodeDetector → HollowingDetector → InjectionDetector → VadTracker
+    // This ensures InjectionDetector releases its VadTracker reference before VadTracker shuts down.
     //
-    if (g_MemoryMonitor.VadTracker != NULL) {
-        VadShutdown((PVAD_TRACKER)g_MemoryMonitor.VadTracker);
-        g_MemoryMonitor.VadTracker = NULL;
-    }
     if (g_MemoryMonitor.ShellcodeDetector != NULL) {
         SdShutdown((PSD_DETECTOR)g_MemoryMonitor.ShellcodeDetector);
         g_MemoryMonitor.ShellcodeDetector = NULL;
@@ -684,6 +687,10 @@ MmMonitorShutdown(
     if (g_MemoryMonitor.InjectionDetector != NULL) {
         InjShutdown((PINJ_DETECTOR)g_MemoryMonitor.InjectionDetector);
         g_MemoryMonitor.InjectionDetector = NULL;
+    }
+    if (g_MemoryMonitor.VadTracker != NULL) {
+        VadShutdown((PVAD_TRACKER)g_MemoryMonitor.VadTracker);
+        g_MemoryMonitor.VadTracker = NULL;
     }
     if (g_MemoryMonitor.SectionTracker != NULL) {
         SecShutdown((PSEC_TRACKER)g_MemoryMonitor.SectionTracker);
