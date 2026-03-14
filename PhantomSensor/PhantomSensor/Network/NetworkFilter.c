@@ -3716,7 +3716,6 @@ NfpProcessStreamData(
     NTSTATUS status;
     SIZE_T dataSize;
     LARGE_INTEGER currentTime;
-    NETWORK_MONITOR_CONFIG config;
 
     ClassifyOut->actionType = FWP_ACTION_PERMIT;
 
@@ -3956,11 +3955,131 @@ NfpProcessStreamData(
         );
     }
 
-    NfpReadConfig(&config);
-    if (config.EnableExfiltrationDetection) {
-        UINT64 thresholdBytes = (UINT64)config.ExfiltrationThresholdMB * 1024ULL * 1024ULL;
-        if (connection->BytesSent > thresholdBytes) {
-            InterlockedOr((LONG*)&connection->Flags, NF_CONN_FLAG_EXFIL_SUSPECT);
+    //
+    // Feed outbound data to DataExfiltration DLP engine for content inspection,
+    // entropy analysis, cloud storage detection, and sensitive pattern matching.
+    // Only on outbound sends at PASSIVE_LEVEL (DxAnalyzeTraffic requires PASSIVE).
+    //
+    if (g_DxDetector != NULL &&
+        (StreamPacket->streamData->flags & FWPS_STREAM_FLAG_SEND) &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL) {
+
+        PVOID dxContiguousData = NULL;
+        BOOLEAN dxAllocated = FALSE;
+        UCHAR dxLocalBuf[2048];
+        SIZE_T dxInspectSize = min(dataSize, DX_MAX_INSPECT_SIZE);
+
+        //
+        // Get contiguous view of stream data for DLP inspection
+        //
+        if (dxInspectSize <= sizeof(dxLocalBuf)) {
+            SIZE_T dxCopied = 0;
+            FwpsCopyStreamDataToBuffer0(
+                StreamPacket->streamData, dxLocalBuf, sizeof(dxLocalBuf), &dxCopied);
+            if (dxCopied > 0) {
+                dxContiguousData = dxLocalBuf;
+                dxInspectSize = dxCopied;
+            }
+        } else {
+            dxContiguousData = ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, dxInspectSize, 'xDfN');
+            if (dxContiguousData != NULL) {
+                SIZE_T dxCopied = 0;
+                FwpsCopyStreamDataToBuffer0(
+                    StreamPacket->streamData, dxContiguousData, dxInspectSize, &dxCopied);
+                dxAllocated = TRUE;
+                if (dxCopied == 0) {
+                    ExFreePoolWithTag(dxContiguousData, 'xDfN');
+                    dxContiguousData = NULL;
+                    dxAllocated = FALSE;
+                } else {
+                    dxInspectSize = dxCopied;
+                }
+            }
+        }
+
+        if (dxContiguousData != NULL && dxInspectSize > 0) {
+            BOOLEAN isSuspicious = FALSE;
+            BOOLEAN wasBlocked = FALSE;
+            ULONG suspicionScore = 0;
+            BOOLEAN isV6 = (connection->RemoteAddress.Address.Family == 23); // AF_INET6
+            PVOID remoteAddr = isV6
+                ? (PVOID)&connection->RemoteAddress.Address.V6
+                : (PVOID)&connection->RemoteAddress.Address.V4;
+            ULONG addrSize = isV6 ? sizeof(IN6_ADDR) : sizeof(IN_ADDR);
+
+            //
+            // Convert WCHAR hostname to ANSI for DxAnalyzeTraffic.
+            // Stack buffer is sufficient — hostnames are at most 255 chars.
+            //
+            CHAR ansiHostname[256] = { 0 };
+            PCSTR hostnamePtr = NULL;
+            if (connection->RemoteHostname[0] != L'\0') {
+                UNICODE_STRING uniHost;
+                ANSI_STRING ansiHost;
+                RtlInitUnicodeString(&uniHost, connection->RemoteHostname);
+                ansiHost.Buffer = ansiHostname;
+                ansiHost.Length = 0;
+                ansiHost.MaximumLength = sizeof(ansiHostname) - 1;
+                if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiHost, &uniHost, FALSE))) {
+                    ansiHostname[ansiHost.Length] = '\0';
+                    hostnamePtr = ansiHostname;
+                }
+            }
+
+            NTSTATUS dxStatus = DxAnalyzeTraffic(
+                g_DxDetector,
+                (HANDLE)(ULONG_PTR)connection->ProcessId,
+                remoteAddr,
+                addrSize,
+                connection->RemoteAddress.Port,
+                isV6,
+                hostnamePtr,
+                dxContiguousData,
+                dxInspectSize,
+                &isSuspicious,
+                &wasBlocked,
+                &suspicionScore
+            );
+
+            if (NT_SUCCESS(dxStatus) && isSuspicious) {
+                InterlockedOr((LONG*)&connection->Flags, NF_CONN_FLAG_EXFIL_SUSPECT);
+
+                if (suspicionScore >= 70) {
+                    InterlockedOr((LONG*)&connection->Flags, NF_CONN_FLAG_SUSPICIOUS);
+                }
+            }
+        }
+
+        if (dxAllocated && dxContiguousData != NULL) {
+            ExFreePoolWithTag(dxContiguousData, 'xDfN');
+        }
+    }
+
+    //
+    // Also record volume-only transfer stats for burst/threshold detection.
+    // This works independently of content inspection — records byte counts
+    // even when content copy was not possible.
+    //
+    if (g_DxDetector != NULL &&
+        (StreamPacket->streamData->flags & FWPS_STREAM_FLAG_SEND)) {
+
+        BOOLEAN isV6 = (connection->RemoteAddress.Address.Family == 23);
+        PVOID remoteAddr = isV6
+            ? (PVOID)&connection->RemoteAddress.Address.V6
+            : (PVOID)&connection->RemoteAddress.Address.V4;
+        ULONG addrSize = isV6 ? sizeof(IN6_ADDR) : sizeof(IN_ADDR);
+
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            DxRecordTransfer(
+                g_DxDetector,
+                (HANDLE)(ULONG_PTR)connection->ProcessId,
+                remoteAddr,
+                addrSize,
+                connection->RemoteAddress.Port,
+                isV6,
+                dataSize
+            );
         }
     }
 

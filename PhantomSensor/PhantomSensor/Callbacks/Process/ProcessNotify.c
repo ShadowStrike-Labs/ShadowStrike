@@ -117,6 +117,10 @@ typedef struct _CT_TRACKER CT_TRACKER, *PCONNECTION_TRACKER;
 VOID CtProcessTerminated(_In_ PCONNECTION_TRACKER Tracker, _In_ HANDLE ProcessId);
 struct _CT_TRACKER* NfFilterGetConnectionTracker(VOID);
 
+typedef struct _DX_DETECTOR DX_DETECTOR, *PDX_DETECTOR;
+VOID DxProcessTerminated(_In_ PDX_DETECTOR Detector, _In_ HANDLE ProcessId);
+struct _DX_DETECTOR* NfFilterGetDxDetector(VOID);
+
 static VOID PnpCleanupStaleContexts(VOID);
 
 #ifdef ALLOC_PRAGMA
@@ -3780,6 +3784,18 @@ PnpHandleProcessTermination(
         PCONNECTION_TRACKER ctTracker = (PCONNECTION_TRACKER)NfFilterGetConnectionTracker();
         if (ctTracker != NULL) {
             CtProcessTerminated(ctTracker, ProcessId);
+        }
+    }
+
+    //
+    // Remove DataExfiltration transfer contexts for this process.
+    // Prevents DX_TRANSFER_CONTEXT accumulation for short-lived processes
+    // and ensures stale per-process DLP data doesn't skew detection.
+    //
+    {
+        PDX_DETECTOR dxDet = NfFilterGetDxDetector();
+        if (dxDet != NULL) {
+            DxProcessTerminated(dxDet, ProcessId);
         }
     }
 

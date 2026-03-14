@@ -274,6 +274,24 @@ DxShutdown(
     _Inout_ PDX_DETECTOR Detector
     );
 
+/**
+ * @brief Clean up all transfer contexts for a terminated process.
+ *
+ * Called from ProcessNotify on process exit to prevent transfer context
+ * accumulation. Walks the entire hash table and removes/dereferences
+ * all transfers matching the given PID.
+ *
+ * @param Detector  Opaque detector handle.
+ * @param ProcessId PID of the terminated process.
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+DxProcessTerminated(
+    _In_ PDX_DETECTOR Detector,
+    _In_ HANDLE ProcessId
+    );
+
 //=============================================================================
 // Public API - Pattern Management (PASSIVE_LEVEL only)
 //=============================================================================
@@ -310,6 +328,7 @@ DxAnalyzeTraffic(
     _In_ ULONG RemoteAddressSize,
     _In_ USHORT RemotePort,
     _In_ BOOLEAN IsIPv6,
+    _In_opt_ PCSTR Hostname,
     _In_reads_bytes_(DataSize) PVOID Data,
     _In_ SIZE_T DataSize,
     _Out_ PBOOLEAN IsSuspicious,

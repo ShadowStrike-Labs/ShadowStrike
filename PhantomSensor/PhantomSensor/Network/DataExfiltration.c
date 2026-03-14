@@ -78,6 +78,7 @@ PsGetProcessImageFileName(
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, DxInitialize)
 #pragma alloc_text(PAGE, DxShutdown)
+#pragma alloc_text(PAGE, DxProcessTerminated)
 #pragma alloc_text(PAGE, DxAddPattern)
 #pragma alloc_text(PAGE, DxRemovePattern)
 #pragma alloc_text(PAGE, DxAnalyzeTraffic)
@@ -796,6 +797,82 @@ DxShutdown(
 }
 
 // ============================================================================
+// PROCESS TERMINATION CLEANUP
+// ============================================================================
+
+/**
+ * @brief Remove all transfer contexts for a terminated process.
+ *
+ * Walks every hash bucket, removes entries matching ProcessId, and
+ * dereferences them. Collected stale entries are freed outside the
+ * bucket lock to minimize hold time.
+ *
+ * Called from ProcessNotify on process exit to prevent transfer context
+ * accumulation for short-lived processes and stale detection data.
+ */
+_Use_decl_annotations_
+VOID
+DxProcessTerminated(
+    _In_ PDX_DETECTOR Detector,
+    _In_ HANDLE ProcessId
+    )
+{
+    ULONG i;
+    PLIST_ENTRY entry;
+    PLIST_ENTRY nextEntry;
+    PDX_TRANSFER_CONTEXT transfer;
+    LIST_ENTRY freeList;
+    ULONG removedCount = 0;
+
+    PAGED_CODE();
+
+    if (Detector == NULL || !Detector->Initialized) {
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return;
+    }
+
+    InitializeListHead(&freeList);
+
+    //
+    // Walk every bucket, collect entries matching ProcessId
+    //
+    for (i = 0; i < DX_TRANSFER_HASH_BUCKETS; i++) {
+        DxpAcquirePushLockExclusive(&Detector->TransferBuckets[i].Lock);
+
+        for (entry = Detector->TransferBuckets[i].Head.Flink;
+             entry != &Detector->TransferBuckets[i].Head;
+             entry = nextEntry) {
+
+            nextEntry = entry->Flink;
+            transfer = CONTAINING_RECORD(entry, DX_TRANSFER_CONTEXT, HashEntry);
+
+            if (transfer->ProcessId == ProcessId) {
+                RemoveEntryList(&transfer->HashEntry);
+                InterlockedDecrement(&Detector->TransferCount);
+                InsertTailList(&freeList, &transfer->HashEntry);
+                removedCount++;
+            }
+        }
+
+        DxpReleasePushLockExclusive(&Detector->TransferBuckets[i].Lock);
+    }
+
+    //
+    // Dereference collected transfers outside bucket locks
+    //
+    while (!IsListEmpty(&freeList)) {
+        entry = RemoveHeadList(&freeList);
+        transfer = CONTAINING_RECORD(entry, DX_TRANSFER_CONTEXT, HashEntry);
+        DxpDereferenceTransfer(Detector, transfer);
+    }
+
+    ExReleaseRundownProtection(&Detector->RundownRef);
+}
+
+// ============================================================================
 // PATTERN MANAGEMENT
 // ============================================================================
 
@@ -1001,6 +1078,7 @@ DxAnalyzeTraffic(
     _In_ ULONG RemoteAddressSize,
     _In_ USHORT RemotePort,
     _In_ BOOLEAN IsIPv6,
+    _In_opt_ PCSTR Hostname,
     _In_reads_bytes_(DataSize) PVOID Data,
     _In_ SIZE_T DataSize,
     _Out_ PBOOLEAN IsSuspicious,
@@ -1082,6 +1160,20 @@ DxAnalyzeTraffic(
     if (transfer == NULL) {
         ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
+    // Propagate hostname into transfer context if provided and not yet set.
+    // Hostname originates from DNS resolution or HTTP Host header and is
+    // critical for cloud storage / personal email destination classification.
+    //
+    if (Hostname != NULL && Hostname[0] != '\0' && transfer->Hostname[0] == '\0') {
+        SIZE_T hostLen = strlen(Hostname);
+        if (hostLen >= sizeof(transfer->Hostname)) {
+            hostLen = sizeof(transfer->Hostname) - 1;
+        }
+        RtlCopyMemory(transfer->Hostname, Hostname, hostLen);
+        transfer->Hostname[hostLen] = '\0';
     }
 
     //
@@ -1171,19 +1263,27 @@ DxAnalyzeTraffic(
                 indicators |= DxIndicator_SensitivePattern;
 
                 //
-                // Snapshot match info as values (not pointers)
+                // Snapshot match info as values (not pointers).
+                // Use atomic compare-exchange to safely claim a slot,
+                // preventing concurrent callers from overflowing Matches[16].
                 //
-                if (transfer->MatchCount < ARRAYSIZE(transfer->Matches)) {
-                    ULONG idx = transfer->MatchCount;
-                    RtlCopyMemory(
-                        transfer->Matches[idx].Category,
-                        pattern->Category,
-                        sizeof(transfer->Matches[idx].Category) - 1
-                    );
-                    transfer->Matches[idx].Category[sizeof(transfer->Matches[idx].Category) - 1] = '\0';
-                    transfer->Matches[idx].Sensitivity = pattern->Sensitivity;
-                    transfer->Matches[idx].MatchCount = 1;
-                    transfer->MatchCount++;
+                {
+                    LONG slot = InterlockedIncrement((volatile LONG*)&transfer->MatchCount) - 1;
+                    if (slot < (LONG)ARRAYSIZE(transfer->Matches)) {
+                        RtlCopyMemory(
+                            transfer->Matches[slot].Category,
+                            pattern->Category,
+                            sizeof(transfer->Matches[slot].Category) - 1
+                        );
+                        transfer->Matches[slot].Category[sizeof(transfer->Matches[slot].Category) - 1] = '\0';
+                        transfer->Matches[slot].Sensitivity = pattern->Sensitivity;
+                        transfer->Matches[slot].MatchCount = 1;
+                    } else {
+                        //
+                        // Slot beyond array bounds — roll back to cap at array size.
+                        //
+                        InterlockedDecrement((volatile LONG*)&transfer->MatchCount);
+                    }
                 }
 
                 //
@@ -1305,13 +1405,13 @@ DxRecordTransfer(
     transfer->LastActivityTime = currentTime;
 
     //
-    // Calculate bytes per second
+    // Calculate bytes per second (atomic write for thread safety)
     //
     if (transfer->StartTime.QuadPart > 0) {
         LONGLONG elapsedMs = (currentTime.QuadPart - transfer->StartTime.QuadPart) / 10000;
         if (elapsedMs > 0) {
-            transfer->BytesPerSecond =
-                (SIZE_T)(((LONG64)transfer->BytesTransferred * 1000) / elapsedMs);
+            LONG64 bps = ((LONG64)transfer->BytesTransferred * 1000) / elapsedMs;
+            InterlockedExchange64((volatile LONG64*)&transfer->BytesPerSecond, bps);
         }
     }
 
@@ -2392,8 +2492,8 @@ DxpCreateAlert(
         HandleToULong(alert->ProcessId),
         NULL,
         0,
-        80,
-        FALSE,
+        alert->SeverityScore,
+        WasBlocked,
         NULL
         );
 
