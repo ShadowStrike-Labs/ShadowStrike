@@ -104,6 +104,14 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../Memory/HollowingDetector.h"
 #include <ntstrsafe.h>
 
+//
+// Forward-declare C2Detection APIs to avoid including NetworkFilter.h
+// (which pulls ConnectionTracker.h — PCT_TRACKER collides with ParentChainTracker).
+//
+typedef struct _C2_DETECTOR C2_DETECTOR, *PC2_DETECTOR;
+VOID C2ProcessTerminated(_In_ PC2_DETECTOR Detector, _In_ HANDLE ProcessId);
+PC2_DETECTOR NfFilterGetC2Detector(VOID);
+
 static VOID PnpCleanupStaleContexts(VOID);
 
 #ifdef ALLOC_PRAGMA
@@ -3747,6 +3755,17 @@ PnpHandleProcessTermination(
     // Prevents tracker leaks and stale entries after PID recycle.
     //
     AbdRemoveProcessTracking(ProcessId);
+
+    //
+    // Remove C2Detection process context for this process.
+    // Prevents process context accumulation (capped at 4096).
+    //
+    {
+        PC2_DETECTOR c2det = NfFilterGetC2Detector();
+        if (c2det != NULL) {
+            C2ProcessTerminated(c2det, ProcessId);
+        }
+    }
 
     //
     // Remove clipboard monitor tracking for this process.
