@@ -45,6 +45,7 @@
 #pragma warning(pop)
 #include "../../Shared/MemoryTypes.h"
 #include "../../Shared/BehaviorTypes.h"
+#include "HollowingDetector.h"
 
 // ============================================================================
 // MEMORY MONITOR CONFIGURATION
@@ -287,6 +288,27 @@ MmMonitorUpdateConfig(
 NTSTATUS
 MmMonitorGetStatistics(
     _Out_ PMEMORY_MONITOR_STATISTICS Stats
+    );
+
+/**
+ * @brief Get hollowing detector statistics for DRIVER_STATUS reporting.
+ * @param Stats Output PH_STATISTICS filled from the hollowing detector.
+ * @return STATUS_SUCCESS, or STATUS_DEVICE_NOT_READY if detector not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+MmMonitorGetHollowingStats(
+    _Out_ PPH_STATISTICS Stats
+    );
+
+/**
+ * @brief Get the HollowingDetector instance for creation-time analysis.
+ * @return PPH_DETECTOR pointer (opaque to caller), or NULL if not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PPH_DETECTOR
+MmMonitorGetHollowingDetector(
+    VOID
     );
 
 // ============================================================================

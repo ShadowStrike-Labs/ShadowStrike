@@ -1756,17 +1756,11 @@ PhpReadProcessMemory(
     }
 
     //
-    // Lazily resolve ZwReadVirtualMemory on first call.
+    // g_pfnZwReadVirtualMemory is pre-cached in PhInitialize.
+    // If it's still NULL, the API is unavailable on this OS version.
     //
     if (g_pfnZwReadVirtualMemory == NULL) {
-        UNICODE_STRING funcName;
-        RtlInitUnicodeString(&funcName, L"ZwReadVirtualMemory");
-        g_pfnZwReadVirtualMemory = (PFN_ZW_READ_VIRTUAL_MEMORY)
-            MmGetSystemRoutineAddress(&funcName);
-
-        if (g_pfnZwReadVirtualMemory == NULL) {
-            return STATUS_NOT_IMPLEMENTED;
-        }
+        return STATUS_NOT_IMPLEMENTED;
     }
 
     status = g_pfnZwReadVirtualMemory(

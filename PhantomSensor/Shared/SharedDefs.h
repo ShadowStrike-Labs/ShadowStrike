@@ -407,6 +407,14 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     LONG   ProcExclCurrentBitmapCount;
     LONG   ProcExclCurrentHashCount;
 
+    //
+    // Hollowing Detector stats (HollowingDetector.c)
+    //
+    LONG64 HollowProcessesAnalyzed;
+    LONG64 HollowDetections;
+    LONG64 HollowDoppelgangingDetected;
+    LONG64 HollowGhostingDetected;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================

@@ -101,6 +101,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../ETW/ETWProvider.h"
 #include "../../ETW/TelemetryEvents.h"
 #include "../../Memory/MemoryMonitor.h"
+#include "../../Memory/HollowingDetector.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -176,6 +177,7 @@ PsGetProcessSignatureLevel(
 #define PN_PROC_FLAG_HAS_TCB            0x00008000
 #define PN_PROC_FLAG_HAS_ASSIGN_TOKEN   0x00010000
 #define PN_PROC_FLAG_SIGNATURE_VALID    0x00020000
+#define PN_PROC_FLAG_HOLLOWED           0x00040000
 
 //
 // Behavior flags for command-line analysis
@@ -1807,6 +1809,62 @@ Arguments:
                 FALSE,
                 NULL
                 );
+        }
+    }
+
+    //
+    // Creation-time process hollowing / ghosting / doppelganging detection.
+    // PhAnalyzeAtCreation inspects the new process's PEB and in-memory image
+    // against the on-disk file BEFORE the process has a chance to execute.
+    // The callback registered via PhRegisterCallback (MmpHollowingDetectionCallback)
+    // routes confirmed detections to BehaviorEngine automatically.
+    //
+    {
+        PPH_DETECTOR HollowDetector = MmMonitorGetHollowingDetector();
+        if (HollowDetector != NULL && !ProcessContext->IsSystem) {
+            PPH_ANALYSIS_RESULT HollowResult = NULL;
+            NTSTATUS HollowStatus = PhAnalyzeAtCreation(
+                HollowDetector,
+                ProcessId,
+                CreateInfo->ParentProcessId,
+                Process,
+                &HollowResult
+                );
+
+            if (NT_SUCCESS(HollowStatus) && HollowResult != NULL) {
+                if (HollowResult->HollowingDetected) {
+                    ProcessContext->Flags |= PN_PROC_FLAG_HOLLOWED;
+
+                    //
+                    // Contribute to threat scoring — hollowed process is strong indicator
+                    //
+                    if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+                        TsAddFactor(
+                            g_ProcessMonitor.ThreatScoringEngine,
+                            ProcessId,
+                            TsFactor_MITRE,
+                            "T1055.012-ProcessHollowing",
+                            (ULONG)min(HollowResult->ConfidenceScore, 100),
+                            "Process hollowing detected at creation time"
+                            );
+                    }
+
+                    SuspicionScore += (ULONG)min(HollowResult->ConfidenceScore, 100);
+                    ProcessContext->SuspicionScore = SuspicionScore;
+
+                    DbgPrintEx(
+                        DPFLTR_IHVDRIVER_ID,
+                        DPFLTR_WARNING_LEVEL,
+                        "[ShadowStrike/ProcessNotify] HOLLOWING DETECTED at creation: "
+                        "PID=%lu, Type=%u, Confidence=%u\n",
+                        HandleToULong(ProcessId),
+                        HollowResult->Type,
+                        HollowResult->ConfidenceScore
+                        );
+                }
+
+                PhFreeResult(HollowResult);
+            }
         }
     }
 

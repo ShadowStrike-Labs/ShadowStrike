@@ -91,6 +91,8 @@
 #include "../ETW/EventSchema.h"
 #include "../ETW/ManifestGenerator.h"
 #include "../ETW/TelemetryEvents.h"
+#include "../Memory/MemoryMonitor.h"
+#include "../Memory/HollowingDetector.h"
 
 // ============================================================================
 // CONSTANTS
@@ -110,7 +112,7 @@
 // Handlers write into this, then it's copied to user-mode under SEH.
 // Must accommodate the largest response struct (SHADOWSTRIKE_DRIVER_STATUS).
 //
-#define MH_MAX_LOCAL_OUTPUT_SIZE        512
+#define MH_MAX_LOCAL_OUTPUT_SIZE        1024
 
 // ============================================================================
 // COMPILE-TIME VALIDATIONS
@@ -1899,6 +1901,19 @@ MhpHandleDriverStatusQuery(
         driverStatus.ProcExclInheritedExclusions= peStats.InheritedExclusions;
         driverStatus.ProcExclCurrentBitmapCount = peStats.CurrentBitmapCount;
         driverStatus.ProcExclCurrentHashCount   = peStats.CurrentHashCount;
+    }
+
+    //
+    // Hollowing Detector stats
+    //
+    {
+        PH_STATISTICS phStats;
+        if (NT_SUCCESS(MmMonitorGetHollowingStats(&phStats))) {
+            driverStatus.HollowProcessesAnalyzed     = (LONG64)phStats.ProcessesAnalyzed;
+            driverStatus.HollowDetections            = (LONG64)phStats.HollowingDetected;
+            driverStatus.HollowDoppelgangingDetected = (LONG64)phStats.DoppelgangingDetected;
+            driverStatus.HollowGhostingDetected      = (LONG64)phStats.GhostingDetected;
+        }
     }
 
     //
