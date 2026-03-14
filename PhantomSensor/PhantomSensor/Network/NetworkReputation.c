@@ -48,6 +48,7 @@
 #include "../../Sync/TimerManager.h"
 #include "../../Core/DriverEntry.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Performance/CacheOptimization.h"
 
 //
 // Forward declarations needed before alloc_text (defined later in file)
@@ -299,6 +300,12 @@ static const UCHAR g_BigramFrequency[26][26] = {
 // PUBLIC API - INITIALIZATION
 // ============================================================================
 
+/*
+ * Centralized cache for IP/domain reputation results.
+ * Managed by CacheOptimization framework for centralized memory management.
+ */
+static PCO_CACHE g_NrReputationCoCache = NULL;
+
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
@@ -406,6 +413,22 @@ NrInitialize(
 
     *Manager = manager;
 
+    //
+    // Create centralized cache for reputation results.
+    // Non-critical: failure does not block init.
+    //
+    {
+        PCO_MANAGER coMgr = ShadowStrikeGetCacheManager();
+        if (coMgr != NULL) {
+            CO_CACHE_CONFIG coConfig;
+            CoInitDefaultConfig(&coConfig);
+            coConfig.MaxEntries = 4096;
+            coConfig.DefaultTTLSeconds = 1800;  /* 30 min — reputation is relatively stable */
+            coConfig.BucketCount = 1024;
+            CoCreateCache(coMgr, CoCacheTypeNetworkConnection, "NrReputation", &coConfig, &g_NrReputationCoCache);
+        }
+    }
+
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Network reputation manager initialized "
                "(buckets=%u, maxEntries=%u)\n",
@@ -441,7 +464,15 @@ NrShutdown(
     }
 
     //
-    // 1. Cancel the periodic cleanup timer. TmCancel with Wait=TRUE
+    // Destroy centralized reputation cache first
+    //
+    if (g_NrReputationCoCache != NULL) {
+        CoDestroyCache(g_NrReputationCoCache);
+        g_NrReputationCoCache = NULL;
+    }
+
+    //
+    // 1. Cancel the periodic cleanup timer.TmCancel with Wait=TRUE
     //    blocks until any in-flight callback completes, replacing the
     //    old KeCancelTimer + KeFlushQueuedDpcs + spin-wait pattern.
     //

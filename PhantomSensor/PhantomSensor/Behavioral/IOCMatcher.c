@@ -43,6 +43,7 @@
 
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
+#include "../Performance/CacheOptimization.h"
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -431,6 +432,12 @@ IompSafeStringLength(
 // INITIALIZATION AND SHUTDOWN
 // ============================================================================
 
+/*
+ * Centralized cache for IOC match results.
+ * Avoids expensive re-matching (Bloom + hash + pattern) for recently seen values.
+ */
+static PCO_CACHE g_IomMatchCoCache = NULL;
+
 _Use_decl_annotations_
 NTSTATUS
 IomInitialize(
@@ -644,6 +651,22 @@ IomInitialize(
         }
     }
 
+    //
+    // Create centralized cache for IOC match results.
+    // Non-critical: failure does not block init.
+    //
+    {
+        PCO_MANAGER coMgr = ShadowStrikeGetCacheManager();
+        if (coMgr != NULL) {
+            CO_CACHE_CONFIG coConfig;
+            CoInitDefaultConfig(&coConfig);
+            coConfig.MaxEntries = 16384;
+            coConfig.DefaultTTLSeconds = 900;  /* 15 min — IOC results change on feed updates */
+            coConfig.BucketCount = 4096;
+            CoCreateCache(coMgr, CoCacheTypeIOC, "IomMatch", &coConfig, &g_IomMatchCoCache);
+        }
+    }
+
     matcher->Initialized = TRUE;
     *Matcher = (PIOM_MATCHER)matcher;
 
@@ -697,6 +720,14 @@ IomShutdown(
 
     if (!matcher->Initialized) {
         return;
+    }
+
+    //
+    // Destroy centralized match cache (before freeing module resources)
+    //
+    if (g_IomMatchCoCache != NULL) {
+        CoDestroyCache(g_IomMatchCoCache);
+        g_IomMatchCoCache = NULL;
     }
 
     //

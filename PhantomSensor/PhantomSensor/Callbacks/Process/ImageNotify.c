@@ -60,6 +60,7 @@
 #include "../../ETW/ETWConsumer.h"
 #include "../../ETW/ETWProvider.h"
 #include "../../Core/DriverEntry.h"
+#include "../../Performance/CacheOptimization.h"
 
 //
 // Forward declarations for undocumented but exported ntoskrnl APIs
@@ -278,6 +279,12 @@ typedef struct _IMG_NOTIFY_GLOBALS {
 // Global instance
 //
 static IMG_NOTIFY_GLOBALS g_ImgNotify = { 0 };
+
+/*
+ * Centralized cache for file hash results (FileId → SHA256/SHA1/MD5).
+ * Managed by CacheOptimization framework for centralized memory management.
+ */
+static PCO_CACHE g_ImgHashCoCache = NULL;
 
 //=============================================================================
 // Forward Declarations
@@ -661,6 +668,22 @@ Return Value:
     KeQuerySystemTime(&g_ImgNotify.Stats.StartTime);
 
     //
+    // Create centralized cache for file hash results.
+    // Non-critical: failure does not block init.
+    //
+    {
+        PCO_MANAGER coMgr = ShadowStrikeGetCacheManager();
+        if (coMgr != NULL) {
+            CO_CACHE_CONFIG coConfig;
+            CoInitDefaultConfig(&coConfig);
+            coConfig.MaxEntries = 8192;
+            coConfig.DefaultTTLSeconds = 3600;  /* 1 hour — matches IMG_CACHE_TTL_SECONDS */
+            coConfig.BucketCount = 2048;
+            CoCreateCache(coMgr, CoCacheTypeFileHash, "ImgHash", &coConfig, &g_ImgHashCoCache);
+        }
+    }
+
+    //
     // Mark initialization complete
     //
     MemoryBarrier();
@@ -807,7 +830,12 @@ Routine Description:
     }
 
     //
-    // Unregister callback first - this waits for in-flight callbacks
+    // Destroy centralized hash cache (before freeing module-specific resources)
+    //
+    if (g_ImgHashCoCache != NULL) {
+        CoDestroyCache(g_ImgHashCoCache);
+        g_ImgHashCoCache = NULL;
+    }
     // and marks subsystem rundown as inactive
     //
     UnregisterImageNotify();

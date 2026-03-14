@@ -70,6 +70,7 @@ Performance Characteristics:
 #include "../../Shared/BehaviorTypes.h"
 #include "../Behavioral/BehaviorEngine.h"
 #include "../Exclusions/ExclusionManager.h"
+#include "../Performance/CacheOptimization.h"
 
 // ============================================================================
 // INTERNAL CONSTANTS
@@ -643,6 +644,12 @@ Routine Description:
 // PUBLIC API - INITIALIZATION
 // ============================================================================
 
+/*
+ * Centralized cache for DNS domain reputation results.
+ * Managed by CacheOptimization framework for centralized memory management.
+ */
+static PCO_CACHE g_DnsDomainCoCache = NULL;
+
 NTSTATUS
 DnsInitialize(
     _Out_ PDNS_MONITOR* Monitor
@@ -846,6 +853,22 @@ DnsInitialize(
 
     KeQuerySystemTimePrecise(&monitor->Stats.StartTime);
 
+    //
+    // Create centralized cache for DNS domain reputation results.
+    // Non-critical: failure does not block init.
+    //
+    {
+        PCO_MANAGER coMgr = ShadowStrikeGetCacheManager();
+        if (coMgr != NULL) {
+            CO_CACHE_CONFIG coConfig;
+            CoInitDefaultConfig(&coConfig);
+            coConfig.MaxEntries = 4096;
+            coConfig.DefaultTTLSeconds = 600;  /* 10 min — DNS results change */
+            coConfig.BucketCount = 1024;
+            CoCreateCache(coMgr, CoCacheTypeDNS, "DnsDomain", &coConfig, &g_DnsDomainCoCache);
+        }
+    }
+
     InterlockedExchange(&monitor->Initialized, TRUE);
     *Monitor = monitor;
 
@@ -901,6 +924,14 @@ DnsShutdown(
 
     if (Monitor == NULL || !InterlockedExchange(&Monitor->Initialized, FALSE)) {
         return;
+    }
+
+    //
+    // Destroy centralized domain cache first (before freeing module resources)
+    //
+    if (g_DnsDomainCoCache != NULL) {
+        CoDestroyCache(g_DnsDomainCoCache);
+        g_DnsDomainCoCache = NULL;
     }
 
     //
