@@ -558,6 +558,16 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 PMG_GENERATOR
 ShadowStrikeGetManifestGenerator(VOID);
 
+typedef struct _MS_SCANNER MS_SCANNER, *PMS_SCANNER;
+
+/**
+ * @brief Get the global memory scanner instance for pattern-based memory scanning.
+ * @return PMS_SCANNER or NULL if not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PMS_SCANNER
+ShadowStrikeGetMemoryScanner(VOID);
+
 #ifdef __cplusplus
 }
 #endif

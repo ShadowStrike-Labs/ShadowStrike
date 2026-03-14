@@ -621,7 +621,7 @@ MsInitialize(
     // Initialize active scans tracking
     //
     InitializeListHead(&scanner->Base.ActiveScans);
-    KeInitializeSpinLock(&scanner->Base.ActiveScansLock);
+    ExInitializePushLock(&scanner->Base.ActiveScansLock);
 
     //
     // Initialize lookaside lists
@@ -708,7 +708,6 @@ MsShutdown(
     PLIST_ENTRY entry;
     PMS_PATTERN_INTERNAL pattern;
     PMS_ACTIVE_SCAN activeScan;
-    KIRQL oldIrql;
 
     PAGED_CODE();
 
@@ -727,9 +726,10 @@ MsShutdown(
     InterlockedExchange(&scanner->Base.Initialized, 0);
 
     //
-    // Cancel all active scans
+    // Cancel all active scans (MS-H5 fix: push lock instead of spinlock)
     //
-    KeAcquireSpinLock(&scanner->Base.ActiveScansLock, &oldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&scanner->Base.ActiveScansLock);
 
     for (entry = scanner->Base.ActiveScans.Flink;
          entry != &scanner->Base.ActiveScans;
@@ -740,7 +740,8 @@ MsShutdown(
         KeSetEvent(&activeScan->CompletionEvent, IO_NO_INCREMENT, FALSE);
     }
 
-    KeReleaseSpinLock(&scanner->Base.ActiveScansLock, oldIrql);
+    ExReleasePushLockExclusive(&scanner->Base.ActiveScansLock);
+    KeLeaveCriticalRegion();
 
     //
     // Wait for active scans to complete.
@@ -1313,7 +1314,7 @@ MsRebuildSearchTables(
         MspDestroyAhoCorasickAutomaton(&scanner->AhoCorasick);
         status = MspBuildAhoCorasickAutomaton(scanner);
         if (NT_SUCCESS(status)) {
-            scanner->Base.AhoCorasickReady = TRUE;
+            InterlockedExchange(&scanner->Base.AhoCorasickReady, TRUE);
         }
     }
 
@@ -1731,7 +1732,6 @@ MsScanAsync(
     PMS_ACTIVE_SCAN activeScan = NULL;
     PIO_WORKITEM workItem = NULL;
     PMS_ASYNC_WORK_CONTEXT workContext = NULL;
-    KIRQL oldIrql;
 
     PAGED_CODE();
 
@@ -1852,12 +1852,14 @@ MsScanAsync(
     workContext->ActiveScan = activeScan;
 
     //
-    // Add to active scans list
+    // Add to active scans list (MS-H2 fix: push lock instead of spinlock)
     //
-    KeAcquireSpinLock(&scanner->Base.ActiveScansLock, &oldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&scanner->Base.ActiveScansLock);
     InsertTailList(&scanner->Base.ActiveScans, &activeScan->ListEntry);
     InterlockedIncrement(&scanner->Base.ActiveScanCount);
-    KeReleaseSpinLock(&scanner->Base.ActiveScansLock, oldIrql);
+    ExReleasePushLockExclusive(&scanner->Base.ActiveScansLock);
+    KeLeaveCriticalRegion();
 
     //
     // Queue the work item for async execution.
@@ -1885,7 +1887,6 @@ MsCancelScan(
     PMS_SCANNER_INTERNAL scanner = (PMS_SCANNER_INTERNAL)Scanner;
     PLIST_ENTRY entry;
     PMS_ACTIVE_SCAN activeScan;
-    KIRQL oldIrql;
 
     PAGED_CODE();
 
@@ -1893,7 +1894,8 @@ MsCancelScan(
         return STATUS_INVALID_PARAMETER_1;
     }
 
-    KeAcquireSpinLock(&scanner->Base.ActiveScansLock, &oldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&scanner->Base.ActiveScansLock);
 
     for (entry = scanner->Base.ActiveScans.Flink;
          entry != &scanner->Base.ActiveScans;
@@ -1909,7 +1911,8 @@ MsCancelScan(
         }
     }
 
-    KeReleaseSpinLock(&scanner->Base.ActiveScansLock, oldIrql);
+    ExReleasePushLockExclusive(&scanner->Base.ActiveScansLock);
+    KeLeaveCriticalRegion();
 
     return status;
 }
@@ -3479,7 +3482,6 @@ MspAsyncScanWorker(
     PMS_ACTIVE_SCAN activeScan;
     PEPROCESS process = NULL;
     NTSTATUS status;
-    KIRQL oldIrql;
 
     UNREFERENCED_PARAMETER(DeviceObject);
 
@@ -3571,12 +3573,14 @@ Complete:
         }
 
         //
-        // Remove from active scans list
+        // Remove from active scans list (push lock, consistent with all callers)
         //
-        KeAcquireSpinLock(&scanner->Base.ActiveScansLock, &oldIrql);
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&scanner->Base.ActiveScansLock);
         RemoveEntryList(&activeScan->ListEntry);
         InterlockedDecrement(&scanner->Base.ActiveScanCount);
-        KeReleaseSpinLock(&scanner->Base.ActiveScansLock, oldIrql);
+        ExReleasePushLockExclusive(&scanner->Base.ActiveScansLock);
+        KeLeaveCriticalRegion();
 
         //
         // Update statistics from captured snapshots (MS-1 fix).

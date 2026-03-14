@@ -92,6 +92,7 @@
 #include "../ETW/ManifestGenerator.h"
 #include "../ETW/TelemetryEvents.h"
 #include "../Memory/MemoryMonitor.h"
+#include "../Memory/MemoryScanner.h"
 #include "../Memory/HollowingDetector.h"
 
 // ============================================================================
@@ -1943,6 +1944,25 @@ MhpHandleDriverStatusQuery(
             driverStatus.MemMonEventsDropped        = mmStats.EventsDropped;
             driverStatus.MemMonProcessContexts      = (LONG)mmStats.ProcessContextCount;
             driverStatus.MemMonEnabled              = mmStats.Enabled;
+        }
+    }
+
+    //
+    // Memory Scanner stats (MS-H4 fix)
+    //
+    {
+        PMS_SCANNER msScanner = ShadowStrikeGetMemoryScanner();
+        if (msScanner != NULL) {
+            MS_STATISTICS msStats;
+            if (NT_SUCCESS(MsGetStatistics(msScanner, &msStats))) {
+                driverStatus.MsScannerTotalScans     = (LONG64)msStats.TotalScans;
+                driverStatus.MsScannerTotalMatches   = (LONG64)msStats.TotalMatches;
+                driverStatus.MsScannerBytesScanned   = (LONG64)msStats.BytesScanned;
+                driverStatus.MsScannerTimeouts       = (LONG64)msStats.Timeouts;
+                driverStatus.MsScannerPatternCount   = msStats.PatternCount;
+                driverStatus.MsScannerActiveScans    = msStats.ActiveScans;
+                driverStatus.MsScannerAvgScanTimeMs  = msStats.AverageScanTimeMs;
+            }
         }
     }
 

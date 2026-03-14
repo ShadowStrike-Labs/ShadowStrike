@@ -335,10 +335,10 @@ typedef struct _MS_SCANNER {
     EX_PUSH_LOCK AhoCorasickLock;
     
     //
-    // Active scans
+    // Active scans (EX_PUSH_LOCK — all callers at PASSIVE_LEVEL)
     //
     LIST_ENTRY ActiveScans;
-    KSPIN_LOCK ActiveScansLock;
+    EX_PUSH_LOCK ActiveScansLock;
     volatile LONG ActiveScanCount;
     
     //

@@ -3093,6 +3093,13 @@ ShadowStrikeGetManifestGenerator(VOID)
     return g_ManifestGenerator;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PMS_SCANNER
+ShadowStrikeGetMemoryScanner(VOID)
+{
+    return g_MemoryScanner;
+}
+
 // ============================================================================
 // VERSION COMPATIBILITY CHECK
 // ============================================================================

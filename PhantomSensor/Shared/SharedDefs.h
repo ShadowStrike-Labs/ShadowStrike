@@ -436,6 +436,18 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     BOOLEAN MemMonEnabled;
     UCHAR  MemMonReserved[3];
 
+    //
+    // Memory Scanner stats (MemoryScanner.c)
+    //
+    LONG64 MsScannerTotalScans;
+    LONG64 MsScannerTotalMatches;
+    LONG64 MsScannerBytesScanned;
+    LONG64 MsScannerTimeouts;
+    ULONG  MsScannerPatternCount;
+    ULONG  MsScannerActiveScans;
+    ULONG  MsScannerAvgScanTimeMs;
+    ULONG  MsScannerReserved;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================
