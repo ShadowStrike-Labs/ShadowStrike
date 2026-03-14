@@ -3772,6 +3772,13 @@ PnpHandleProcessTermination(
     }
 
     //
+    // Notify InjectionDetector of process exit so it can clean up the
+    // per-process injection context. Without this, injection chain contexts
+    // accumulate indefinitely in NonPaged pool — a memory leak per-process.
+    //
+    MmMonitorNotifyInjectionProcessExit(ProcessId);
+
+    //
     // Remove from tracking
     //
     PnpRemoveProcessContext(Context);

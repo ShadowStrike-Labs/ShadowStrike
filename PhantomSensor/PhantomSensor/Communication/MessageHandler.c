@@ -1917,6 +1917,19 @@ MhpHandleDriverStatusQuery(
     }
 
     //
+    // Injection Detector stats
+    //
+    {
+        INJ_STATISTICS injStats;
+        if (NT_SUCCESS(MmMonitorGetInjectionStats(&injStats))) {
+            driverStatus.InjTotalOperations   = (LONG64)injStats.TotalOperations;
+            driverStatus.InjDetectedInjections = (LONG64)injStats.DetectedInjections;
+            driverStatus.InjBlockedInjections  = (LONG64)injStats.BlockedInjections;
+            driverStatus.InjActiveChains       = (LONG64)injStats.ActiveChains;
+        }
+    }
+
+    //
     // Copy to output buffer (already validated as kernel memory by caller)
     //
     RtlCopyMemory(OutputBuffer, &driverStatus, sizeof(driverStatus));

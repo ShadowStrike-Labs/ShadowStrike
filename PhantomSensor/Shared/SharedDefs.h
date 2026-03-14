@@ -415,6 +415,14 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     LONG64 HollowDoppelgangingDetected;
     LONG64 HollowGhostingDetected;
 
+    //
+    // Injection Detector stats (InjectionDetector.c)
+    //
+    LONG64 InjTotalOperations;
+    LONG64 InjDetectedInjections;
+    LONG64 InjBlockedInjections;
+    LONG64 InjActiveChains;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================
