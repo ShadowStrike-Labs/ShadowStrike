@@ -381,6 +381,20 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     LONG  TeThrottleAction;         // Current throttle level (TeThrottle_*)
     LONG64 TeThrottleActivations;
 
+    //
+    // ExclusionManager statistics
+    //
+    LONG64 ExclTotalChecks;
+    LONG64 ExclPathMatches;
+    LONG64 ExclExtensionMatches;
+    LONG64 ExclProcessMatches;
+    LONG64 ExclPidMatches;
+    LONG64 ExclTotalBypassed;
+    LONG  ExclPathCount;
+    LONG  ExclExtensionCount;
+    LONG  ExclProcessCount;
+    LONG  ExclPidCount;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================

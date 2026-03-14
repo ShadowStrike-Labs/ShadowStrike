@@ -1868,6 +1868,24 @@ MhpHandleDriverStatusQuery(
     }
 
     //
+    // ExclusionManager statistics
+    //
+    {
+        SHADOWSTRIKE_EXCLUSION_STATS exclStats;
+        ShadowStrikeExclusionGetStats(&exclStats);
+        driverStatus.ExclTotalChecks = exclStats.TotalChecks;
+        driverStatus.ExclPathMatches = exclStats.PathMatches;
+        driverStatus.ExclExtensionMatches = exclStats.ExtensionMatches;
+        driverStatus.ExclProcessMatches = exclStats.ProcessNameMatches;
+        driverStatus.ExclPidMatches = exclStats.PidMatches;
+        driverStatus.ExclTotalBypassed = exclStats.TotalBypassed;
+        driverStatus.ExclPathCount = exclStats.PathExclusionCount;
+        driverStatus.ExclExtensionCount = exclStats.ExtensionExclusionCount;
+        driverStatus.ExclProcessCount = exclStats.ProcessExclusionCount;
+        driverStatus.ExclPidCount = exclStats.PidExclusionCount;
+    }
+
+    //
     // Copy to output buffer (already validated as kernel memory by caller)
     //
     RtlCopyMemory(OutputBuffer, &driverStatus, sizeof(driverStatus));

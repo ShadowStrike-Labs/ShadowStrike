@@ -412,6 +412,9 @@ typedef struct _SHADOWSTRIKE_EXCLUSION_MANAGER {
     /// @brief Reserved for alignment
     UINT8 Reserved[3];
 
+    /// @brief TimerManager timer ID for periodic expired-entry cleanup
+    ULONG CleanupTimerId;
+
 } SHADOWSTRIKE_EXCLUSION_MANAGER, *PSHADOWSTRIKE_EXCLUSION_MANAGER;
 
 // ============================================================================

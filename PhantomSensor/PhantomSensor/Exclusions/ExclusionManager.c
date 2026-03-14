@@ -48,6 +48,8 @@
 
 #include "ExclusionManager.h"
 #include "../Core/Globals.h"
+#include "../Core/DriverEntry.h"
+#include "../Sync/TimerManager.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeExclusionInitialize)
@@ -253,6 +255,122 @@ ExclusionpProcessExistLocked(
 }
 
 // ============================================================================
+// TIMER CALLBACK — EXPIRED ENTRY CLEANUP
+// ============================================================================
+
+/**
+ * @brief Periodic timer callback that purges expired exclusion entries.
+ *
+ * Runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback. Called every 60 seconds
+ * by TimerManager. Delegates to ShadowStrikeCleanupExpiredExclusions.
+ */
+static VOID
+ExclusionpCleanupTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
+    )
+{
+    UNREFERENCED_PARAMETER(TimerId);
+    UNREFERENCED_PARAMETER(Context);
+
+    PAGED_CODE();
+
+    ShadowStrikeCleanupExpiredExclusions();
+}
+
+// ============================================================================
+// SHUTDOWN HELPERS — STATE-GATE-FREE ENTRY FREEING
+// ============================================================================
+// These helpers free all entries WITHOUT checking ExclusionpIsReady().
+// They are called ONLY from ShadowStrikeExclusionShutdown after rundown
+// drain completes. No lock is needed because:
+// 1. State is SHUTTING_DOWN — no new rundown acquisitions succeed.
+// 2. ExWaitForRundownProtectionRelease returned — all active users drained.
+// 3. The cleanup timer is cancelled — no concurrent timer callbacks.
+// Locks are still acquired defensively for correctness under code evolution.
+
+static VOID
+ExclusionpFreeAllPathEntries(VOID)
+{
+    PLIST_ENTRY listEntry;
+    PSHADOWSTRIKE_PATH_EXCLUSION entry;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ExclusionManager.PathLock);
+
+    while (!IsListEmpty(&g_ExclusionManager.PathExclusions)) {
+        listEntry = RemoveHeadList(&g_ExclusionManager.PathExclusions);
+        entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PATH_EXCLUSION, ListEntry);
+        ExFreePoolWithTag(entry, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+    }
+    g_ExclusionManager.Stats.PathExclusionCount = 0;
+
+    ExReleasePushLockExclusive(&g_ExclusionManager.PathLock);
+    KeLeaveCriticalRegion();
+}
+
+static VOID
+ExclusionpFreeAllExtensionEntries(VOID)
+{
+    ULONG i;
+    PLIST_ENTRY listEntry;
+    PSHADOWSTRIKE_EXTENSION_EXCLUSION entry;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ExclusionManager.ExtensionLock);
+
+    for (i = 0; i < SHADOWSTRIKE_EXTENSION_HASH_BUCKETS; i++) {
+        while (!IsListEmpty(&g_ExclusionManager.ExtensionBuckets[i].ListHead)) {
+            listEntry = RemoveHeadList(&g_ExclusionManager.ExtensionBuckets[i].ListHead);
+            entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_EXTENSION_EXCLUSION, ListEntry);
+            ExFreePoolWithTag(entry, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+        }
+        g_ExclusionManager.ExtensionBuckets[i].EntryCount = 0;
+    }
+    g_ExclusionManager.Stats.ExtensionExclusionCount = 0;
+
+    ExReleasePushLockExclusive(&g_ExclusionManager.ExtensionLock);
+    KeLeaveCriticalRegion();
+}
+
+static VOID
+ExclusionpFreeAllProcessEntries(VOID)
+{
+    ULONG i;
+    PLIST_ENTRY listEntry;
+    PSHADOWSTRIKE_PROCESS_EXCLUSION entry;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ExclusionManager.ProcessLock);
+
+    for (i = 0; i < SHADOWSTRIKE_PROCESS_HASH_BUCKETS; i++) {
+        while (!IsListEmpty(&g_ExclusionManager.ProcessBuckets[i].ListHead)) {
+            listEntry = RemoveHeadList(&g_ExclusionManager.ProcessBuckets[i].ListHead);
+            entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PROCESS_EXCLUSION, ListEntry);
+            ExFreePoolWithTag(entry, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+        }
+        g_ExclusionManager.ProcessBuckets[i].EntryCount = 0;
+    }
+    g_ExclusionManager.Stats.ProcessExclusionCount = 0;
+
+    ExReleasePushLockExclusive(&g_ExclusionManager.ProcessLock);
+    KeLeaveCriticalRegion();
+}
+
+static VOID
+ExclusionpFreeAllPidEntries(VOID)
+{
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ExclusionManager.PidLock);
+
+    RtlZeroMemory(g_ExclusionManager.PidExclusions, sizeof(g_ExclusionManager.PidExclusions));
+    g_ExclusionManager.Stats.PidExclusionCount = 0;
+
+    ExReleasePushLockExclusive(&g_ExclusionManager.PidLock);
+    KeLeaveCriticalRegion();
+}
+
+// ============================================================================
 // INITIALIZATION / SHUTDOWN
 // ============================================================================
 
@@ -285,11 +403,15 @@ ShadowStrikeExclusionInitialize(
     }
 
     //
-    // We own initialization exclusively. Zero everything except State.
+    // We own initialization exclusively. Zero everything EXCEPT State
+    // (which holds EM_STATE_INITIALIZING from the CAS above). Use
+    // FIELD_OFFSET to calculate the exact byte range to zero, preventing
+    // a race where State is momentarily reset to 0 (UNINITIALIZED) and
+    // a concurrent initializer's CAS could succeed.
     //
     RtlZeroMemory(
-        (PUCHAR)&g_ExclusionManager + sizeof(g_ExclusionManager.PathExclusions),
-        sizeof(SHADOWSTRIKE_EXCLUSION_MANAGER) - sizeof(g_ExclusionManager.PathExclusions)
+        &g_ExclusionManager,
+        FIELD_OFFSET(SHADOWSTRIKE_EXCLUSION_MANAGER, State)
         );
 
     //
@@ -326,6 +448,7 @@ ShadowStrikeExclusionInitialize(
     // Use InterlockedExchange8 for atomic store with full barrier.
     //
     InterlockedExchange8((volatile CHAR*)&g_ExclusionManager.Enabled, TRUE);
+    g_ExclusionManager.CleanupTimerId = 0;
 
     //
     // Transition: INITIALIZING -> READY
@@ -337,6 +460,33 @@ ShadowStrikeExclusionInitialize(
     // Load defaults
     //
     ShadowStrikeLoadDefaultExclusions();
+
+    //
+    // Register periodic timer for expired-entry cleanup (60s interval).
+    // Coalescable with 5s tolerance for power efficiency.
+    //
+    {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr != NULL) {
+            TM_TIMER_OPTIONS opts = { 0 };
+            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            opts.ToleranceMs = 5000;
+
+            NTSTATUS tmStatus = TmCreatePeriodic(
+                tmMgr,
+                60000,
+                ExclusionpCleanupTimerCallback,
+                NULL,
+                &opts,
+                &g_ExclusionManager.CleanupTimerId
+            );
+            if (!NT_SUCCESS(tmStatus)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] ExclusionManager: cleanup timer creation failed: 0x%08X\n",
+                           tmStatus);
+            }
+        }
+    }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Exclusion manager initialized\n");
@@ -372,6 +522,20 @@ ShadowStrikeExclusionShutdown(
     InterlockedExchange8((volatile CHAR*)&g_ExclusionManager.Enabled, FALSE);
 
     //
+    // Cancel cleanup timer BEFORE rundown drain. TmCancel(Wait=TRUE) ensures
+    // the callback is not running and will not fire again. This prevents
+    // timer-callback-after-free where the callback tries to access the
+    // exclusion state that shutdown is about to destroy.
+    //
+    if (g_ExclusionManager.CleanupTimerId != 0) {
+        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
+        if (tmMgr != NULL) {
+            TmCancel(tmMgr, g_ExclusionManager.CleanupTimerId, TRUE);
+        }
+        g_ExclusionManager.CleanupTimerId = 0;
+    }
+
+    //
     // Wait for all active users to drain. ExWaitForRundownProtectionRelease
     // blocks until every ExAcquireRundownProtection holder has called
     // ExReleaseRundownProtection. After this returns, no new acquisitions
@@ -381,12 +545,15 @@ ShadowStrikeExclusionShutdown(
     ExWaitForRundownProtectionRelease(&g_ExclusionManager.RundownRef);
 
     //
-    // All users have drained — safe to free all entries
+    // All users have drained — free all entries directly. We CANNOT use
+    // ShadowStrikeClearExclusions here because it checks ExclusionpIsReady()
+    // which requires State==READY, but we've already transitioned to
+    // SHUTTING_DOWN. Inline the freeing to avoid the state-gate leak.
     //
-    ShadowStrikeClearExclusions(ShadowStrikeExclusionPath);
-    ShadowStrikeClearExclusions(ShadowStrikeExclusionExtension);
-    ShadowStrikeClearExclusions(ShadowStrikeExclusionProcessName);
-    ShadowStrikeClearExclusions(ShadowStrikeExclusionProcessId);
+    ExclusionpFreeAllPathEntries();
+    ExclusionpFreeAllExtensionEntries();
+    ExclusionpFreeAllProcessEntries();
+    ExclusionpFreeAllPidEntries();
 
     InterlockedExchange(&g_ExclusionManager.State, EM_STATE_UNINITIALIZED);
 
