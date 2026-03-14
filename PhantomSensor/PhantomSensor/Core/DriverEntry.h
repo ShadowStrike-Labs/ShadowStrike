@@ -548,6 +548,16 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 PES_SCHEMA
 ShadowStrikeGetEventSchema(VOID);
 
+typedef struct _MG_GENERATOR MG_GENERATOR, *PMG_GENERATOR;
+
+/**
+ * @brief Get the global manifest generator instance.
+ * @return PMG_GENERATOR or NULL if not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PMG_GENERATOR
+ShadowStrikeGetManifestGenerator(VOID);
+
 #ifdef __cplusplus
 }
 #endif

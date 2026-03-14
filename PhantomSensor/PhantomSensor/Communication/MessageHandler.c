@@ -89,6 +89,7 @@
 #include "../Context/InstanceContext.h"
 #include "../ETW/ETWProvider.h"
 #include "../ETW/EventSchema.h"
+#include "../ETW/ManifestGenerator.h"
 
 // ============================================================================
 // CONSTANTS
@@ -1829,6 +1830,23 @@ MhpHandleDriverStatusQuery(
         PES_SCHEMA schema = ShadowStrikeGetEventSchema();
         if (schema != NULL) {
             driverStatus.EventSchemaEventCount = (UINT32)EsGetEventCount(schema);
+        }
+    }
+
+    //
+    // Manifest generator statistics
+    //
+    {
+        PMG_GENERATOR mg = ShadowStrikeGetManifestGenerator();
+        if (mg != NULL) {
+            MG_GENERATION_STATS mgStats;
+            NTSTATUS mgStatStatus = MgGetStatistics(mg, &mgStats);
+            if (NT_SUCCESS(mgStatStatus)) {
+                driverStatus.ManifestChannelCount = mgStats.ChannelCount;
+                driverStatus.ManifestKeywordCount = mgStats.KeywordCount;
+                driverStatus.ManifestTaskCount = mgStats.TaskCount;
+                driverStatus.ManifestValidationErrors = mgStats.ValidationErrors;
+            }
         }
     }
 

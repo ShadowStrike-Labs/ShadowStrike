@@ -1533,6 +1533,42 @@ DriverEntry(
                 g_ManifestGenerator = NULL;
                 status = STATUS_SUCCESS;
             } else {
+                //
+                // Step 7.7a: Populate manifest generator with default channels, keywords, and tasks
+                //
+                NTSTATUS mgStatus;
+
+                mgStatus = MgRegisterDefaultChannels(g_ManifestGenerator);
+                if (!NT_SUCCESS(mgStatus)) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                               "[ShadowStrike] WARNING: MgRegisterDefaultChannels failed: 0x%08X\n", mgStatus);
+                }
+
+                mgStatus = MgRegisterDefaultKeywords(g_ManifestGenerator);
+                if (!NT_SUCCESS(mgStatus)) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                               "[ShadowStrike] WARNING: MgRegisterDefaultKeywords failed: 0x%08X\n", mgStatus);
+                }
+
+                mgStatus = MgRegisterDefaultTasks(g_ManifestGenerator);
+                if (!NT_SUCCESS(mgStatus)) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                               "[ShadowStrike] WARNING: MgRegisterDefaultTasks failed: 0x%08X\n", mgStatus);
+                }
+
+                //
+                // Step 7.7b: Validate schema integrity at init time
+                //
+                {
+                    ULONG validationErrors = 0;
+                    mgStatus = MgValidateSchema(g_ManifestGenerator, &validationErrors, NULL, NULL);
+                    if (validationErrors > 0) {
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                                   "[ShadowStrike] ManifestGenerator schema validation: %lu error(s)\n",
+                                   validationErrors);
+                    }
+                }
+
                 ShadowStrikeLogInitStatus("Manifest Generator", STATUS_SUCCESS);
             }
         }
@@ -3027,6 +3063,12 @@ PES_SCHEMA
 ShadowStrikeGetEventSchema(VOID)
 {
     return g_EventSchema;
+}
+
+PMG_GENERATOR
+ShadowStrikeGetManifestGenerator(VOID)
+{
+    return g_ManifestGenerator;
 }
 
 // ============================================================================
