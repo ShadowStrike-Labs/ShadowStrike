@@ -598,11 +598,6 @@ SecTrackSectionCreate(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    if ((ULONG)Tracker->SectionCount >= Tracker->Config.MaxSections) {
-        SecpReleaseReference(internal);
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
     //
     // Allocate entry BEFORE taking lock to minimize hold time
     //
@@ -725,10 +720,22 @@ SecTrackSectionCreate(
     SecpUpdateSuspicionScore(entry);
 
     //
-    // CRITICAL-2 fix: Atomic check-and-insert under EXCLUSIVE lock
+    // CRITICAL-2 fix: Atomic check-and-insert under EXCLUSIVE lock.
+    // SEC-M1 fix: Quota check moved inside lock to prevent TOCTOU race
+    // where two threads both pass the check and both insert.
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Tracker->SectionLock);
+
+    if ((ULONG)Tracker->SectionCount >= Tracker->Config.MaxSections) {
+        ExReleasePushLockExclusive(&Tracker->SectionLock);
+        KeLeaveCriticalRegion();
+
+        SecpFreeEntryResources(internal, entry);
+        SecpFreeEntryToPool(internal, entry);
+        SecpReleaseReference(internal);
+        return STATUS_QUOTA_EXCEEDED;
+    }
 
     existing = SecpFindEntryLocked(internal, SectionObject);
 
@@ -1646,10 +1653,22 @@ SecGetStatistics(
     _Out_ PSEC_STATISTICS Stats
     )
 {
+    PSEC_TRACKER_INTERNAL internal;
     LARGE_INTEGER currentTime;
 
     if (Tracker == NULL || !Tracker->Initialized || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    internal = CONTAINING_RECORD(Tracker, SEC_TRACKER_INTERNAL, Public);
+
+    //
+    // Acquire tracker reference to prevent use-after-free if shutdown
+    // races with this call. Without this, the tracker could be freed
+    // between the Initialized check and the stats reads.
+    //
+    if (!SecpAcquireReference(internal)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     RtlZeroMemory(Stats, sizeof(SEC_STATISTICS));
@@ -1664,6 +1683,8 @@ SecGetStatistics(
 
     KeQuerySystemTime(&currentTime);
     Stats->UpTime.QuadPart = currentTime.QuadPart - Tracker->Stats.StartTime.QuadPart;
+
+    SecpReleaseReference(internal);
 
     return STATUS_SUCCESS;
 }
@@ -2425,10 +2446,11 @@ SecpInvokeCreateCallbacks(
                 );
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 //
-                // Callback faulted — disable it to prevent repeated crashes
+                // Callback faulted — disable it to prevent repeated crashes.
+                // Use interlocked writes because we hold CallbackLock SHARED.
                 //
-                Tracker->CreateCallbacks[i].InUse = FALSE;
-                Tracker->CreateCallbacks[i].CreateCallback = NULL;
+                InterlockedExchange8((volatile CHAR*)&Tracker->CreateCallbacks[i].InUse, FALSE);
+                InterlockedExchangePointer((PVOID*)&Tracker->CreateCallbacks[i].CreateCallback, NULL);
             }
         }
     }
@@ -2466,10 +2488,11 @@ SecpInvokeMapCallbacks(
                 );
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 //
-                // Callback faulted — disable it to prevent repeated crashes
+                // Callback faulted — disable it to prevent repeated crashes.
+                // Use interlocked writes because we hold CallbackLock SHARED.
                 //
-                Tracker->MapCallbacks[i].InUse = FALSE;
-                Tracker->MapCallbacks[i].MapCallback = NULL;
+                InterlockedExchange8((volatile CHAR*)&Tracker->MapCallbacks[i].InUse, FALSE);
+                InterlockedExchangePointer((PVOID*)&Tracker->MapCallbacks[i].MapCallback, NULL);
             }
         }
     }
