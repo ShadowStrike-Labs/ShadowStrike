@@ -347,7 +347,7 @@ PhUnregisterCallback(
 // Public API - Results
 //=============================================================================
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 PhFreeResult(
     _In_ PPH_ANALYSIS_RESULT Result

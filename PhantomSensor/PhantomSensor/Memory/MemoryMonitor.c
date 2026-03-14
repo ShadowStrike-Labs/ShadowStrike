@@ -302,6 +302,51 @@ MmpHeapSprayDetectionCallback(
 }
 
 // ============================================================================
+// HOLLOWING DETECTION CALLBACK (feeds detections into BehaviorEngine)
+// ============================================================================
+
+/**
+ * @brief HollowingDetector detection callback — invoked when hollowing is confirmed.
+ *
+ * Routes the detection into BehaviorEngine for threat scoring and response.
+ * Invoked at PASSIVE_LEVEL under HollowingDetector's shared callback lock.
+ */
+static VOID
+MmpHollowingDetectionCallback(
+    _In_ PPH_ANALYSIS_RESULT Result,
+    _In_opt_ PVOID Context
+    )
+{
+    UINT32 threatScore;
+
+    UNREFERENCED_PARAMETER(Context);
+
+    if (Result == NULL || !Result->HollowingDetected) {
+        return;
+    }
+
+    //
+    // Map confidence (0-100) and severity (0-100) to a combined threat score.
+    // Use the higher of the two, capped at 100.
+    //
+    threatScore = max(Result->ConfidenceScore, Result->SeverityScore);
+    if (threatScore < 60) {
+        threatScore = 60;   // Minimum — hollowing was confirmed
+    }
+
+    BeEngineSubmitEvent(
+        BehaviorEvent_ProcessHollowing,
+        BehaviorCategory_ProcessExecution,
+        HandleToULong(Result->ProcessId),
+        NULL,
+        0,
+        threatScore,
+        FALSE,
+        NULL
+    );
+}
+
+// ============================================================================
 // INITIALIZATION AND LIFECYCLE
 // ============================================================================
 
@@ -444,6 +489,19 @@ MmMonitorInitialize(
             DbgPrint("MemoryMonitor: HollowingDetector init failed: 0x%08X — continuing without hollowing detection", Status);
             g_MemoryMonitor.Config.EnableHollowingDetection = FALSE;
             g_MemoryMonitor.HollowingDetector = NULL;
+        } else {
+            //
+            // Register BehaviorEngine callback so hollowing detections feed into
+            // the threat scoring pipeline. Without this, detections are silent.
+            //
+            Status = PhRegisterCallback(
+                (PPH_DETECTOR)g_MemoryMonitor.HollowingDetector,
+                MmpHollowingDetectionCallback,
+                NULL
+            );
+            if (!NT_SUCCESS(Status)) {
+                DbgPrint("MemoryMonitor: HollowingDetector callback registration failed: 0x%08X\n", Status);
+            }
         }
     }
 
@@ -678,6 +736,43 @@ MmMonitorGetStatistics(
     RtlCopyMemory(&Stats->Config, &g_MemoryMonitor.Config, sizeof(MEMORY_MONITOR_CONFIG));
 
     return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+MmMonitorGetHollowingStats(
+    _Out_ PPH_STATISTICS Stats
+    )
+{
+    if (Stats == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(Stats, sizeof(PH_STATISTICS));
+
+    if (g_MemoryMonitor.InitState != MM_INIT_DONE ||
+        g_MemoryMonitor.HollowingDetector == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    return PhGetStatistics(
+        (PPH_DETECTOR)g_MemoryMonitor.HollowingDetector,
+        Stats
+    );
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PPH_DETECTOR
+MmMonitorGetHollowingDetector(
+    VOID
+    )
+{
+    if (g_MemoryMonitor.InitState != MM_INIT_DONE ||
+        g_MemoryMonitor.HollowingDetector == NULL) {
+        return NULL;
+    }
+
+    return (PPH_DETECTOR)g_MemoryMonitor.HollowingDetector;
 }
 
 // ============================================================================
@@ -1789,6 +1884,30 @@ MmMonitorDetectHollowing(
 
     if (HollowingDetected) {
         InterlockedIncrement64(&g_MemoryMonitor.TotalHollowingDetections);
+
+        //
+        // HD-H4: Submit to BehaviorEngine so hollowing detections reach the
+        // threat scoring pipeline. The PhRegisterCallback path fires when
+        // PhAnalyzeProcess triggers a detection internally, but this
+        // secondary heuristic (MM_PROCESS_FLAG_HOLLOWING_TARGET) bypasses
+        // the HollowingDetector callback. Submit directly.
+        //
+        {
+            UINT32 score = 70;  // Default for heuristic-based detection
+            if (Event != NULL) {
+                score = Event->ThreatScore;
+            }
+            BeEngineSubmitEvent(
+                BehaviorEvent_ProcessHollowing,
+                BehaviorCategory_ProcessExecution,
+                ProcessId,
+                NULL,
+                0,
+                score,
+                FALSE,
+                NULL
+            );
+        }
     }
 
     MmMonitorReleaseProcessContext(Context);
