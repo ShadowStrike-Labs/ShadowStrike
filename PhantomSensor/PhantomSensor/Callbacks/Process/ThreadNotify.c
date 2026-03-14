@@ -64,6 +64,7 @@
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../ETW/ETWConsumer.h"
+#include "../../ETW/ETWProvider.h"
 #include "../../Core/DriverEntry.h"
 #include "ProcessRelationship.h"
 #include "ProcessAnalyzer.h"
@@ -800,6 +801,15 @@ Arguments:
                     NULL, 0);
             }
         }
+
+        //
+        // Emit thread creation to external ETW provider
+        //
+        EtwWriteThreadEvent(
+            EtwEventId_ThreadCreate,
+            HandleToULong(ProcessId),
+            HandleToULong(ThreadId),
+            0, 0, 0, NULL);
 
         TnpHandleThreadCreation(ProcessId, ThreadId);
     } else {

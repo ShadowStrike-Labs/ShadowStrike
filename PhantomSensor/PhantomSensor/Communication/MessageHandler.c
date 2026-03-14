@@ -87,6 +87,7 @@
 #include "ScanBridge.h"
 #include "TelemetryBuffer.h"
 #include "../Context/InstanceContext.h"
+#include "../ETW/ETWProvider.h"
 
 // ============================================================================
 // CONSTANTS
@@ -1805,6 +1806,18 @@ MhpHandleDriverStatusQuery(
 
                 FltObjectDereference(instanceBuffer[i]);
             }
+        }
+    }
+
+    //
+    // ETW Provider statistics
+    //
+    {
+        UINT64 etwWritten = 0, etwDropped = 0, etwBytes = 0;
+        if (NT_SUCCESS(EtwProviderGetStatistics(&etwWritten, &etwDropped, &etwBytes))) {
+            driverStatus.EtwEventsWritten = etwWritten;
+            driverStatus.EtwEventsDropped = etwDropped;
+            driverStatus.EtwBytesWritten = etwBytes;
         }
     }
 

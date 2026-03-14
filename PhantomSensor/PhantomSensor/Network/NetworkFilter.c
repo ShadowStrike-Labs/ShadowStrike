@@ -74,6 +74,7 @@
 #include <ip2string.h>
 #include "../Behavioral/BehaviorEngine.h"
 #include "../ETW/ETWConsumer.h"
+#include "../ETW/ETWProvider.h"
 #include "../Core/DriverEntry.h"
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
@@ -3224,6 +3225,22 @@ NfpCreateAndInsertConnection(
                 HandleToULong(PsGetCurrentThreadId()),
                 NULL, 0);
         }
+    }
+
+    //
+    // Emit network connect to external ETW provider for SIEM consumers.
+    // Full ETW_NETWORK_EVENT populated downstream after connection setup;
+    // here we emit a lightweight notification for immediate visibility.
+    //
+    {
+        ETW_NETWORK_EVENT nfEtwEvent;
+        RtlZeroMemory(&nfEtwEvent, sizeof(nfEtwEvent));
+        nfEtwEvent.Common.ProcessId = (UINT32)processId;
+        nfEtwEvent.Protocol = (UINT32)protocol;
+        nfEtwEvent.Direction = (UINT32)Direction;
+        nfEtwEvent.RemotePort = remotePort;
+        nfEtwEvent.LocalPort = localPort;
+        EtwWriteNetworkEvent(EtwEventId_NetworkConnect, &nfEtwEvent);
     }
 
     connection = NfpAllocateConnection();

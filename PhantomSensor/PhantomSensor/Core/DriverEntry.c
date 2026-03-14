@@ -1872,6 +1872,16 @@ DriverEntry(
                g_InitFlags);
 
     //
+    // Emit ETW diagnostic event: driver started successfully
+    //
+    EtwWriteDiagnosticEvent(
+        EtwEventId_DriverStarted,
+        TRACE_LEVEL_INFORMATION,
+        0,  // ComponentId: 0 = core driver
+        L"Driver initialized successfully",
+        STATUS_SUCCESS);
+
+    //
     // Log security status
     //
     if ((g_InitFlags & InitFlag_ObjectCallbackReg) == 0) {
@@ -1917,6 +1927,16 @@ ShadowStrikeUnload(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Unload: Starting driver unload (InitFlags=0x%08X)\n",
                g_InitFlags);
+
+    //
+    // Emit ETW diagnostic event: driver shutting down (Unload path)
+    //
+    EtwWriteDiagnosticEvent(
+        EtwEventId_DriverStopping,
+        TRACE_LEVEL_WARNING,
+        0,
+        L"Driver unloading",
+        STATUS_SUCCESS);
 
     //
     // Step 1: Signal shutdown - stop accepting new work
@@ -2883,6 +2903,16 @@ ShadowStrikeCleanupByFlags(
     )
 {
     PAGED_CODE();
+
+    //
+    // Emit ETW diagnostic event: driver cleanup starting (failure path)
+    //
+    EtwWriteDiagnosticEvent(
+        EtwEventId_DriverStopping,
+        TRACE_LEVEL_WARNING,
+        0,
+        L"Driver cleanup by flags",
+        (UINT32)STATUS_UNSUCCESSFUL);
 
     //
     // Cleanup in reverse order based on what was actually initialized

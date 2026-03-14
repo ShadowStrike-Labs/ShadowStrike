@@ -98,6 +98,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../Communication/TelemetryBuffer.h"
 #include "../../ALPC/AlpcPortMonitor.h"
 #include "../../ETW/ETWConsumer.h"
+#include "../../ETW/ETWProvider.h"
 #include <ntstrsafe.h>
 
 static VOID PnpCleanupStaleContexts(VOID);
@@ -1027,6 +1028,18 @@ Arguments:
                     NULL, 0);
             }
         }
+
+        //
+        // Emit process terminate event to external ETW provider
+        //
+        EtwWriteProcessEvent(
+            EtwEventId_ProcessTerminate,
+            HandleToULong(ProcessId),
+            0,      // ParentProcessId not available at exit
+            NULL,   // ImagePath not readily available at exit
+            NULL,   // CommandLine not available at exit
+            0, 0, 0);
+
         PnpHandleProcessTermination(ProcessId);
         goto Cleanup;
     }
@@ -1052,6 +1065,18 @@ Arguments:
                 NULL, 0);
         }
     }
+
+    //
+    // Emit process creation event to external ETW provider for
+    // SIEM/WPA/Event Log consumers
+    //
+    EtwWriteProcessEvent(
+        EtwEventId_ProcessCreate,
+        HandleToULong(ProcessId),
+        HandleToULong(CreateInfo->ParentProcessId),
+        CreateInfo->ImageFileName,
+        CreateInfo->CommandLine,
+        0, 0, 0);
 
     //
     // Check for known system process (skip detailed analysis for performance)

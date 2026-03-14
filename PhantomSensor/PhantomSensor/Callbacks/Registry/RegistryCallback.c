@@ -47,6 +47,7 @@
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../ETW/ETWConsumer.h"
+#include "../../ETW/ETWProvider.h"
 #include "../../Core/DriverEntry.h"
 
 // ============================================================================
@@ -1516,6 +1517,17 @@ ShadowStrikeRegistryCallbackRoutine(
                 NULL, 0);
         }
     }
+
+    //
+    // Emit registry event to external ETW provider for SIEM consumers
+    //
+    EtwWriteRegistryEvent(
+        EtwEventId_RegistrySetValue,
+        HandleToULong(PsGetCurrentProcessId()),
+        (UINT32)notifyClass,
+        NULL,   // Key path resolved after keyObject extraction
+        NULL,
+        0);
 
     //
     // Extract key object based on operation type

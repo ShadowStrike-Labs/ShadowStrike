@@ -68,6 +68,7 @@
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../Transactions/KtmMonitor.h"
 #include "../../ETW/ETWConsumer.h"
+#include "../../ETW/ETWProvider.h"
 #include "../../Core/DriverEntry.h"
 
 //
@@ -757,6 +758,17 @@ ShadowStrikePostWrite(
                 NULL, 0);
         }
     }
+
+    //
+    // Emit file write event to external ETW provider
+    //
+    EtwWriteFileEvent(
+        EtwEventId_FileWrite,
+        HandleToULong(PsGetCurrentProcessId()),
+        NULL,   // File path resolved later via stream context
+        301,    // Write operation
+        (UINT64)Data->IoStatus.Information,
+        0, NULL, 0);
 
     //
     // Initialize write context

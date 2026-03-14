@@ -215,6 +215,7 @@ typedef enum _SHADOWSTRIKE_ETW_EVENT_ID {
 #define ETW_MAX_DESCRIPTION_CHARS       256
 #define ETW_MAX_ALERT_TITLE_CHARS       128
 #define ETW_MAX_ALERT_DESC_CHARS        256
+#define ETW_MAX_VALUE_NAME_CHARS        256
 
 /**
  * @brief Common ETW event header.
@@ -315,6 +316,56 @@ typedef struct _ETW_SECURITY_ALERT {
     WCHAR TargetPath[ETW_MAX_PATH_CHARS];
 } ETW_SECURITY_ALERT, *PETW_SECURITY_ALERT;
 
+/**
+ * @brief Thread ETW event.
+ */
+typedef struct _ETW_THREAD_EVENT {
+    ETW_EVENT_COMMON Common;
+    UINT32 TargetProcessId;
+    UINT32 TargetThreadId;
+    UINT64 StartAddress;
+    UINT32 ThreatScore;
+    UINT32 Flags;
+    WCHAR ProcessPath[ETW_MAX_PATH_CHARS];
+} ETW_THREAD_EVENT, *PETW_THREAD_EVENT;
+
+/**
+ * @brief Image load ETW event.
+ */
+typedef struct _ETW_IMAGE_EVENT {
+    ETW_EVENT_COMMON Common;
+    UINT64 ImageBase;
+    UINT64 ImageSize;
+    UINT32 ThreatScore;
+    UINT32 Flags;
+    WCHAR ImagePath[ETW_MAX_PATH_CHARS];
+} ETW_IMAGE_EVENT, *PETW_IMAGE_EVENT;
+
+/**
+ * @brief Registry ETW event.
+ */
+typedef struct _ETW_REGISTRY_EVENT {
+    ETW_EVENT_COMMON Common;
+    UINT32 Operation;
+    UINT32 ThreatScore;
+    WCHAR KeyPath[ETW_MAX_PATH_CHARS];
+    WCHAR ValueName[ETW_MAX_VALUE_NAME_CHARS];
+} ETW_REGISTRY_EVENT, *PETW_REGISTRY_EVENT;
+
+/**
+ * @brief Memory/injection ETW event.
+ */
+typedef struct _ETW_MEMORY_EVENT {
+    ETW_EVENT_COMMON Common;
+    UINT32 TargetProcessId;
+    UINT32 AlertType;
+    UINT64 BaseAddress;
+    UINT64 RegionSize;
+    UINT32 Protection;
+    UINT32 ThreatScore;
+    WCHAR ProcessPath[ETW_MAX_PATH_CHARS];
+} ETW_MEMORY_EVENT, *PETW_MEMORY_EVENT;
+
 // ============================================================================
 // ETW PROVIDER LIFECYCLE STATES
 // ============================================================================
@@ -406,6 +457,10 @@ C_ASSERT(sizeof(ETW_FILE_EVENT) <= ETW_EVENT_BUFFER_SIZE);
 C_ASSERT(sizeof(ETW_NETWORK_EVENT) <= ETW_EVENT_BUFFER_SIZE);
 C_ASSERT(sizeof(ETW_BEHAVIOR_EVENT) <= ETW_EVENT_BUFFER_SIZE);
 C_ASSERT(sizeof(ETW_SECURITY_ALERT) <= ETW_EVENT_BUFFER_SIZE);
+C_ASSERT(sizeof(ETW_THREAD_EVENT) <= ETW_EVENT_BUFFER_SIZE);
+C_ASSERT(sizeof(ETW_IMAGE_EVENT) <= ETW_EVENT_BUFFER_SIZE);
+C_ASSERT(sizeof(ETW_REGISTRY_EVENT) <= ETW_EVENT_BUFFER_SIZE);
+C_ASSERT(sizeof(ETW_MEMORY_EVENT) <= ETW_EVENT_BUFFER_SIZE);
 
 // ============================================================================
 // PUBLIC API - INITIALIZATION
@@ -608,6 +663,102 @@ EtwWritePerformanceStats(
     _In_ PTELEMETRY_PERFORMANCE Stats
     );
 
+/**
+ * @brief Write thread event.
+ * @param EventId Event ID (must be a thread event ID).
+ * @param TargetProcessId Target process ID.
+ * @param TargetThreadId Target thread ID.
+ * @param StartAddress Thread start address.
+ * @param ThreatScore Threat score.
+ * @param Flags Event flags.
+ * @param ProcessPath Process image path (optional). Bounded internally.
+ * @return STATUS_SUCCESS on success.
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+EtwWriteThreadEvent(
+    _In_ SHADOWSTRIKE_ETW_EVENT_ID EventId,
+    _In_ UINT32 TargetProcessId,
+    _In_ UINT32 TargetThreadId,
+    _In_ UINT64 StartAddress,
+    _In_ UINT32 ThreatScore,
+    _In_ UINT32 Flags,
+    _In_opt_ PCUNICODE_STRING ProcessPath
+    );
+
+/**
+ * @brief Write image load event.
+ * @param EventId Event ID (must be an image event ID).
+ * @param ProcessId Loading process ID.
+ * @param ImageBase Image base address.
+ * @param ImageSize Image size in bytes.
+ * @param ImagePath Image file path. Bounded internally.
+ * @param ThreatScore Threat score.
+ * @param Flags Event flags.
+ * @return STATUS_SUCCESS on success.
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+EtwWriteImageEvent(
+    _In_ SHADOWSTRIKE_ETW_EVENT_ID EventId,
+    _In_ UINT32 ProcessId,
+    _In_ UINT64 ImageBase,
+    _In_ UINT64 ImageSize,
+    _In_opt_ PCUNICODE_STRING ImagePath,
+    _In_ UINT32 ThreatScore,
+    _In_ UINT32 Flags
+    );
+
+/**
+ * @brief Write registry event.
+ * @param EventId Event ID (must be a registry event ID).
+ * @param ProcessId Process ID.
+ * @param Operation Registry operation type.
+ * @param KeyPath Registry key path (optional). Bounded internally.
+ * @param ValueName Registry value name (optional). Bounded internally.
+ * @param ThreatScore Threat score.
+ * @return STATUS_SUCCESS on success.
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+EtwWriteRegistryEvent(
+    _In_ SHADOWSTRIKE_ETW_EVENT_ID EventId,
+    _In_ UINT32 ProcessId,
+    _In_ UINT32 Operation,
+    _In_opt_ PCUNICODE_STRING KeyPath,
+    _In_opt_ PCUNICODE_STRING ValueName,
+    _In_ UINT32 ThreatScore
+    );
+
+/**
+ * @brief Write memory/injection event.
+ * @param EventId Event ID (must be a memory event ID).
+ * @param ProcessId Source process ID.
+ * @param TargetProcessId Target process ID.
+ * @param BaseAddress Memory base address.
+ * @param RegionSize Memory region size.
+ * @param Protection Memory protection flags.
+ * @param ThreatScore Threat score.
+ * @param ProcessPath Source process path (optional). Bounded internally.
+ * @return STATUS_SUCCESS on success.
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+EtwWriteMemoryEvent(
+    _In_ SHADOWSTRIKE_ETW_EVENT_ID EventId,
+    _In_ UINT32 ProcessId,
+    _In_ UINT32 TargetProcessId,
+    _In_ UINT64 BaseAddress,
+    _In_ UINT64 RegionSize,
+    _In_ UINT32 Protection,
+    _In_ UINT32 ThreatScore,
+    _In_opt_ PCUNICODE_STRING ProcessPath
+    );
+
 // ============================================================================
 // PUBLIC API - STATISTICS
 // ============================================================================
@@ -661,11 +812,60 @@ EtwProviderGetStatistics(
 
 /**
  * @brief Log diagnostic event if enabled.
+ *
+ * Maps level to appropriate diagnostic event ID:
+ *   CRITICAL/ERROR -> EtwEventId_Error
+ *   WARNING        -> EtwEventId_ComponentHealth
+ *   INFO/VERBOSE   -> EtwEventId_Heartbeat
  */
 #define ETW_LOG_DIAGNOSTIC(level, component, message) \
     do { \
         if (EtwProviderIsEnabled(level, ETW_KEYWORD_DIAGNOSTIC)) { \
-            EtwWriteDiagnosticEvent(EtwEventId_Error, level, component, message, 0); \
+            SHADOWSTRIKE_ETW_EVENT_ID _etwDiagId = \
+                ((level) <= ETW_LEVEL_ERROR) ? EtwEventId_Error : \
+                ((level) <= ETW_LEVEL_WARNING) ? EtwEventId_ComponentHealth : \
+                EtwEventId_Heartbeat; \
+            EtwWriteDiagnosticEvent(_etwDiagId, level, component, message, 0); \
+        } \
+    } while(0)
+
+/**
+ * @brief Log file event if enabled.
+ */
+#define ETW_LOG_FILE(eventId, pid, filePath, op, fileSize, verdict, threatName, score) \
+    do { \
+        if (EtwProviderIsEnabled(ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_FILE)) { \
+            EtwWriteFileEvent(eventId, pid, filePath, op, fileSize, verdict, threatName, score); \
+        } \
+    } while(0)
+
+/**
+ * @brief Log network event if enabled.
+ */
+#define ETW_LOG_NETWORK(eventId, networkEvent) \
+    do { \
+        if (EtwProviderIsEnabled(ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_NETWORK)) { \
+            EtwWriteNetworkEvent(eventId, networkEvent); \
+        } \
+    } while(0)
+
+/**
+ * @brief Log behavioral event if enabled.
+ */
+#define ETW_LOG_BEHAVIOR(eventId, pid, behType, cat, chainId, mitreTech, mitreTac, score, conf, desc) \
+    do { \
+        if (EtwProviderIsEnabled(ETW_LEVEL_WARNING, ETW_KEYWORD_BEHAVIOR)) { \
+            EtwWriteBehaviorEvent(eventId, pid, behType, cat, chainId, mitreTech, mitreTac, score, conf, desc); \
+        } \
+    } while(0)
+
+/**
+ * @brief Log security alert if enabled. CRITICAL events always pass.
+ */
+#define ETW_LOG_SECURITY(alertType, sev, pid, chainId, title, desc, procPath, targPath, score, action) \
+    do { \
+        if (EtwProviderIsEnabled(ETW_LEVEL_WARNING, ETW_KEYWORD_SECURITY)) { \
+            EtwWriteSecurityAlert(alertType, sev, pid, chainId, title, desc, procPath, targPath, score, action); \
         } \
     } while(0)
 

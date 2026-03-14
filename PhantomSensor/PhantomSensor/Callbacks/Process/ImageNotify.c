@@ -58,6 +58,7 @@
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../ETW/ETWConsumer.h"
+#include "../../ETW/ETWProvider.h"
 #include "../../Core/DriverEntry.h"
 
 //
@@ -1968,6 +1969,17 @@ Arguments:
                 NULL, 0);
         }
     }
+
+    //
+    // Emit image load event to external ETW provider for SIEM/WPA consumers
+    //
+    EtwWriteImageEvent(
+        EtwEventId_ImageLoad,
+        HandleToULong(ProcessId),
+        (UINT64)ImageInfo->ImageBase,
+        ImageInfo->ImageSize,
+        FullImageName,
+        0, 0);
 
     //
     // Invoke pre-load callbacks for kernel images (driver loads)

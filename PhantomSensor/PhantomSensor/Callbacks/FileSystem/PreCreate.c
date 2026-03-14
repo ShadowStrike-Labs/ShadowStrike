@@ -75,6 +75,7 @@ Performance Characteristics:
 #include <wchar.h>
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../ETW/ETWConsumer.h"
+#include "../../ETW/ETWProvider.h"
 #include "../../Core/DriverEntry.h"
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Transactions/KtmMonitor.h"
@@ -942,7 +943,17 @@ Return Value:
     }
 
     //
-    // WSL/Container escape file access monitoring (MITRE T1611, T1003).
+    // Emit file create event to external ETW provider for SIEM/WPA consumers
+    //
+    EtwWriteFileEvent(
+        EtwEventId_FileCreate,
+        HandleToULong(RequestorPid),
+        &NameInfo->Name,
+        Data->Iopb->Parameters.Create.Options >> 24,
+        0, 0, NULL, 0);
+
+    //
+    // WSL/Container escape file access monitoring(MITRE T1611, T1003).
     // Detect WSL processes accessing host credential files, driver
     // directories, and System32 — indicators of container-to-host breakout.
     // BehaviorEngine events are submitted inside WslMonCheckFileAccess.

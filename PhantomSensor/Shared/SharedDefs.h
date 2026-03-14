@@ -355,6 +355,13 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     ULONG  IcActiveInstances;
     ULONG  IcReserved;
 
+    //
+    // ETW Provider statistics
+    //
+    UINT64 EtwEventsWritten;
+    UINT64 EtwEventsDropped;
+    UINT64 EtwBytesWritten;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================

@@ -342,6 +342,93 @@ static const EVENT_DESCRIPTOR EtwDescriptor_Error = {
     0, 0, ETW_LEVEL_ERROR, 0, 0, ETW_KEYWORD_DIAGNOSTIC
 };
 
+//
+// Thread Events
+//
+static const EVENT_DESCRIPTOR EtwDescriptor_ThreadCreate = {
+    EtwEventId_ThreadCreate,
+    0, 0, ETW_LEVEL_INFORMATIONAL, 0, 0, ETW_KEYWORD_THREAD
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_RemoteThreadCreate = {
+    EtwEventId_RemoteThreadCreate,
+    0, 0, ETW_LEVEL_WARNING, 0, 0, ETW_KEYWORD_THREAD | ETW_KEYWORD_THREAT
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_ThreadSuspicious = {
+    EtwEventId_ThreadSuspicious,
+    0, 0, ETW_LEVEL_WARNING, 0, 0, ETW_KEYWORD_THREAD | ETW_KEYWORD_THREAT
+};
+
+//
+// Image Events
+//
+static const EVENT_DESCRIPTOR EtwDescriptor_ImageLoad = {
+    EtwEventId_ImageLoad,
+    0, 0, ETW_LEVEL_VERBOSE, 0, 0, ETW_KEYWORD_IMAGE
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_ImageSuspicious = {
+    EtwEventId_ImageSuspicious,
+    0, 0, ETW_LEVEL_WARNING, 0, 0, ETW_KEYWORD_IMAGE | ETW_KEYWORD_THREAT
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_ImageBlocked = {
+    EtwEventId_ImageBlocked,
+    0, 0, ETW_LEVEL_WARNING, 0, 0, ETW_KEYWORD_IMAGE | ETW_KEYWORD_THREAT
+};
+
+//
+// Registry Events
+//
+static const EVENT_DESCRIPTOR EtwDescriptor_RegistrySetValue = {
+    EtwEventId_RegistrySetValue,
+    0, 0, ETW_LEVEL_INFORMATIONAL, 0, 0, ETW_KEYWORD_REGISTRY
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_RegistryDeleteValue = {
+    EtwEventId_RegistryDeleteValue,
+    0, 0, ETW_LEVEL_INFORMATIONAL, 0, 0, ETW_KEYWORD_REGISTRY
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_RegistrySuspicious = {
+    EtwEventId_RegistrySuspicious,
+    0, 0, ETW_LEVEL_WARNING, 0, 0, ETW_KEYWORD_REGISTRY | ETW_KEYWORD_THREAT
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_RegistryBlocked = {
+    EtwEventId_RegistryBlocked,
+    0, 0, ETW_LEVEL_WARNING, 0, 0, ETW_KEYWORD_REGISTRY | ETW_KEYWORD_THREAT
+};
+
+//
+// Memory Events
+//
+static const EVENT_DESCRIPTOR EtwDescriptor_MemoryAllocation = {
+    EtwEventId_MemoryAllocation,
+    0, 0, ETW_LEVEL_VERBOSE, 0, 0, ETW_KEYWORD_MEMORY
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_MemoryProtectionChange = {
+    EtwEventId_MemoryProtectionChange,
+    0, 0, ETW_LEVEL_INFORMATIONAL, 0, 0, ETW_KEYWORD_MEMORY
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_ShellcodeDetected = {
+    EtwEventId_ShellcodeDetected,
+    0, 0, ETW_LEVEL_CRITICAL, 0, 0, ETW_KEYWORD_MEMORY | ETW_KEYWORD_THREAT | ETW_KEYWORD_SECURITY
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_InjectionDetected = {
+    EtwEventId_InjectionDetected,
+    0, 0, ETW_LEVEL_CRITICAL, 0, 0, ETW_KEYWORD_MEMORY | ETW_KEYWORD_THREAT | ETW_KEYWORD_SECURITY
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_HollowingDetected = {
+    EtwEventId_HollowingDetected,
+    0, 0, ETW_LEVEL_CRITICAL, 0, 0, ETW_KEYWORD_MEMORY | ETW_KEYWORD_THREAT | ETW_KEYWORD_SECURITY
+};
+
 // ============================================================================
 // Initialization / Shutdown
 // ============================================================================
@@ -1494,7 +1581,17 @@ EtwWriteDiagnosticEvent(
     EventDataDescCreate(&dataDescriptors[2], &ErrorCode, sizeof(UINT32));
     EventDataDescCreate(&dataDescriptors[3], Message, messageSizeBytes);
 
-    status = EtwpWriteEvent(descriptor, 4, dataDescriptors);
+    //
+    // Construct a stack-local copy of the descriptor with the caller's
+    // actual Level so the ETW event metadata reflects the true severity.
+    // The base descriptor provides EventId and Keywords; Level is overridden.
+    //
+    {
+        EVENT_DESCRIPTOR localDesc = *descriptor;
+        localDesc.Level = Level;
+
+        status = EtwpWriteEvent(&localDesc, 4, dataDescriptors);
+    }
 
     EtwpUpdateStatistics(
         sizeof(UINT64) + sizeof(UINT32) * 2 + messageSizeBytes,
@@ -1546,6 +1643,412 @@ EtwWritePerformanceStats(
     status = EtwpWriteEvent(&EtwDescriptor_PerformanceStats, 1, &dataDescriptor);
 
     EtwpUpdateStatistics(sizeof(TELEMETRY_PERFORMANCE), NT_SUCCESS(status));
+
+    EtwpReleaseWriterRef();
+
+    return status;
+}
+
+
+// ============================================================================
+// Event Writing - Thread Events
+// ============================================================================
+
+_Use_decl_annotations_
+NTSTATUS
+EtwWriteThreadEvent(
+    _In_ SHADOWSTRIKE_ETW_EVENT_ID EventId,
+    _In_ UINT32 TargetProcessId,
+    _In_ UINT32 TargetThreadId,
+    _In_ UINT64 StartAddress,
+    _In_ UINT32 ThreatScore,
+    _In_ UINT32 Flags,
+    _In_opt_ PCUNICODE_STRING ProcessPath
+    )
+{
+    NTSTATUS status;
+    PETW_THREAD_EVENT event = NULL;
+    PCEVENT_DESCRIPTOR descriptor;
+    EVENT_DATA_DESCRIPTOR dataDescriptor;
+
+    if (!EtwpAcquireWriterRef()) {
+        return STATUS_SUCCESS;
+    }
+
+    if (!g_EtwGlobals.Enabled) {
+        EtwpReleaseWriterRef();
+        return STATUS_SUCCESS;
+    }
+
+    switch (EventId) {
+        case EtwEventId_ThreadCreate:
+            descriptor = &EtwDescriptor_ThreadCreate;
+            break;
+        case EtwEventId_RemoteThreadCreate:
+            descriptor = &EtwDescriptor_RemoteThreadCreate;
+            break;
+        case EtwEventId_ThreadSuspicious:
+            descriptor = &EtwDescriptor_ThreadSuspicious;
+            break;
+        default:
+            EtwpReleaseWriterRef();
+            return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!EtwProviderIsEnabled(descriptor->Level, descriptor->Keyword)) {
+        EtwpReleaseWriterRef();
+        return STATUS_SUCCESS;
+    }
+
+    if (!EtwpCheckRateLimit(descriptor->Level)) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    event = (PETW_THREAD_EVENT)ExAllocateFromNPagedLookasideList(
+        &g_EtwGlobals.EventBufferLookaside
+        );
+
+    if (event == NULL) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(event, sizeof(ETW_THREAD_EVENT));
+
+    EtwpFillCommonHeader(&event->Common, (UINT32)(ULONG_PTR)PsGetCurrentProcessId());
+
+    event->TargetProcessId = TargetProcessId;
+    event->TargetThreadId = TargetThreadId;
+    event->StartAddress = StartAddress;
+    event->ThreatScore = ThreatScore;
+    event->Flags = Flags;
+
+    if (ProcessPath != NULL) {
+        EtwpCopyUnicodeStringBounded(
+            event->ProcessPath,
+            ETW_MAX_PATH_CHARS,
+            ProcessPath
+            );
+    }
+
+    EventDataDescCreate(&dataDescriptor, event, sizeof(ETW_THREAD_EVENT));
+
+    status = EtwpWriteEvent(descriptor, 1, &dataDescriptor);
+
+    EtwpUpdateStatistics(sizeof(ETW_THREAD_EVENT), NT_SUCCESS(status));
+
+    ExFreeToNPagedLookasideList(&g_EtwGlobals.EventBufferLookaside, event);
+
+    EtwpReleaseWriterRef();
+
+    return status;
+}
+
+
+// ============================================================================
+// Event Writing - Image Events
+// ============================================================================
+
+_Use_decl_annotations_
+NTSTATUS
+EtwWriteImageEvent(
+    _In_ SHADOWSTRIKE_ETW_EVENT_ID EventId,
+    _In_ UINT32 ProcessId,
+    _In_ UINT64 ImageBase,
+    _In_ UINT64 ImageSize,
+    _In_opt_ PCUNICODE_STRING ImagePath,
+    _In_ UINT32 ThreatScore,
+    _In_ UINT32 Flags
+    )
+{
+    NTSTATUS status;
+    PETW_IMAGE_EVENT event = NULL;
+    PCEVENT_DESCRIPTOR descriptor;
+    EVENT_DATA_DESCRIPTOR dataDescriptor;
+
+    if (!EtwpAcquireWriterRef()) {
+        return STATUS_SUCCESS;
+    }
+
+    if (!g_EtwGlobals.Enabled) {
+        EtwpReleaseWriterRef();
+        return STATUS_SUCCESS;
+    }
+
+    switch (EventId) {
+        case EtwEventId_ImageLoad:
+            descriptor = &EtwDescriptor_ImageLoad;
+            break;
+        case EtwEventId_ImageSuspicious:
+            descriptor = &EtwDescriptor_ImageSuspicious;
+            break;
+        case EtwEventId_ImageBlocked:
+            descriptor = &EtwDescriptor_ImageBlocked;
+            break;
+        default:
+            EtwpReleaseWriterRef();
+            return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!EtwProviderIsEnabled(descriptor->Level, descriptor->Keyword)) {
+        EtwpReleaseWriterRef();
+        return STATUS_SUCCESS;
+    }
+
+    if (!EtwpCheckRateLimit(descriptor->Level)) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    event = (PETW_IMAGE_EVENT)ExAllocateFromNPagedLookasideList(
+        &g_EtwGlobals.EventBufferLookaside
+        );
+
+    if (event == NULL) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(event, sizeof(ETW_IMAGE_EVENT));
+
+    EtwpFillCommonHeader(&event->Common, ProcessId);
+
+    event->ImageBase = ImageBase;
+    event->ImageSize = ImageSize;
+    event->ThreatScore = ThreatScore;
+    event->Flags = Flags;
+
+    if (ImagePath != NULL) {
+        EtwpCopyUnicodeStringBounded(
+            event->ImagePath,
+            ETW_MAX_PATH_CHARS,
+            ImagePath
+            );
+    }
+
+    EventDataDescCreate(&dataDescriptor, event, sizeof(ETW_IMAGE_EVENT));
+
+    status = EtwpWriteEvent(descriptor, 1, &dataDescriptor);
+
+    EtwpUpdateStatistics(sizeof(ETW_IMAGE_EVENT), NT_SUCCESS(status));
+
+    ExFreeToNPagedLookasideList(&g_EtwGlobals.EventBufferLookaside, event);
+
+    EtwpReleaseWriterRef();
+
+    return status;
+}
+
+
+// ============================================================================
+// Event Writing - Registry Events
+// ============================================================================
+
+_Use_decl_annotations_
+NTSTATUS
+EtwWriteRegistryEvent(
+    _In_ SHADOWSTRIKE_ETW_EVENT_ID EventId,
+    _In_ UINT32 ProcessId,
+    _In_ UINT32 Operation,
+    _In_opt_ PCUNICODE_STRING KeyPath,
+    _In_opt_ PCUNICODE_STRING ValueName,
+    _In_ UINT32 ThreatScore
+    )
+{
+    NTSTATUS status;
+    PETW_REGISTRY_EVENT event = NULL;
+    PCEVENT_DESCRIPTOR descriptor;
+    EVENT_DATA_DESCRIPTOR dataDescriptor;
+
+    if (!EtwpAcquireWriterRef()) {
+        return STATUS_SUCCESS;
+    }
+
+    if (!g_EtwGlobals.Enabled) {
+        EtwpReleaseWriterRef();
+        return STATUS_SUCCESS;
+    }
+
+    switch (EventId) {
+        case EtwEventId_RegistrySetValue:
+            descriptor = &EtwDescriptor_RegistrySetValue;
+            break;
+        case EtwEventId_RegistryDeleteValue:
+            descriptor = &EtwDescriptor_RegistryDeleteValue;
+            break;
+        case EtwEventId_RegistrySuspicious:
+            descriptor = &EtwDescriptor_RegistrySuspicious;
+            break;
+        case EtwEventId_RegistryBlocked:
+            descriptor = &EtwDescriptor_RegistryBlocked;
+            break;
+        default:
+            EtwpReleaseWriterRef();
+            return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!EtwProviderIsEnabled(descriptor->Level, descriptor->Keyword)) {
+        EtwpReleaseWriterRef();
+        return STATUS_SUCCESS;
+    }
+
+    if (!EtwpCheckRateLimit(descriptor->Level)) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    event = (PETW_REGISTRY_EVENT)ExAllocateFromNPagedLookasideList(
+        &g_EtwGlobals.EventBufferLookaside
+        );
+
+    if (event == NULL) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(event, sizeof(ETW_REGISTRY_EVENT));
+
+    EtwpFillCommonHeader(&event->Common, ProcessId);
+
+    event->Operation = Operation;
+    event->ThreatScore = ThreatScore;
+
+    if (KeyPath != NULL) {
+        EtwpCopyUnicodeStringBounded(
+            event->KeyPath,
+            ETW_MAX_PATH_CHARS,
+            KeyPath
+            );
+    }
+
+    if (ValueName != NULL) {
+        EtwpCopyUnicodeStringBounded(
+            event->ValueName,
+            ETW_MAX_VALUE_NAME_CHARS,
+            ValueName
+            );
+    }
+
+    EventDataDescCreate(&dataDescriptor, event, sizeof(ETW_REGISTRY_EVENT));
+
+    status = EtwpWriteEvent(descriptor, 1, &dataDescriptor);
+
+    EtwpUpdateStatistics(sizeof(ETW_REGISTRY_EVENT), NT_SUCCESS(status));
+
+    ExFreeToNPagedLookasideList(&g_EtwGlobals.EventBufferLookaside, event);
+
+    EtwpReleaseWriterRef();
+
+    return status;
+}
+
+
+// ============================================================================
+// Event Writing - Memory Events
+// ============================================================================
+
+_Use_decl_annotations_
+NTSTATUS
+EtwWriteMemoryEvent(
+    _In_ SHADOWSTRIKE_ETW_EVENT_ID EventId,
+    _In_ UINT32 ProcessId,
+    _In_ UINT32 TargetProcessId,
+    _In_ UINT64 BaseAddress,
+    _In_ UINT64 RegionSize,
+    _In_ UINT32 Protection,
+    _In_ UINT32 ThreatScore,
+    _In_opt_ PCUNICODE_STRING ProcessPath
+    )
+{
+    NTSTATUS status;
+    PETW_MEMORY_EVENT event = NULL;
+    PCEVENT_DESCRIPTOR descriptor;
+    EVENT_DATA_DESCRIPTOR dataDescriptor;
+
+    if (!EtwpAcquireWriterRef()) {
+        return STATUS_SUCCESS;
+    }
+
+    if (!g_EtwGlobals.Enabled) {
+        EtwpReleaseWriterRef();
+        return STATUS_SUCCESS;
+    }
+
+    switch (EventId) {
+        case EtwEventId_MemoryAllocation:
+            descriptor = &EtwDescriptor_MemoryAllocation;
+            break;
+        case EtwEventId_MemoryProtectionChange:
+            descriptor = &EtwDescriptor_MemoryProtectionChange;
+            break;
+        case EtwEventId_ShellcodeDetected:
+            descriptor = &EtwDescriptor_ShellcodeDetected;
+            break;
+        case EtwEventId_InjectionDetected:
+            descriptor = &EtwDescriptor_InjectionDetected;
+            break;
+        case EtwEventId_HollowingDetected:
+            descriptor = &EtwDescriptor_HollowingDetected;
+            break;
+        default:
+            EtwpReleaseWriterRef();
+            return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!EtwProviderIsEnabled(descriptor->Level, descriptor->Keyword)) {
+        EtwpReleaseWriterRef();
+        return STATUS_SUCCESS;
+    }
+
+    if (!EtwpCheckRateLimit(descriptor->Level)) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    event = (PETW_MEMORY_EVENT)ExAllocateFromNPagedLookasideList(
+        &g_EtwGlobals.EventBufferLookaside
+        );
+
+    if (event == NULL) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(event, sizeof(ETW_MEMORY_EVENT));
+
+    EtwpFillCommonHeader(&event->Common, ProcessId);
+
+    event->TargetProcessId = TargetProcessId;
+    event->AlertType = (UINT32)EventId;
+    event->BaseAddress = BaseAddress;
+    event->RegionSize = RegionSize;
+    event->Protection = Protection;
+    event->ThreatScore = ThreatScore;
+
+    if (ProcessPath != NULL) {
+        EtwpCopyUnicodeStringBounded(
+            event->ProcessPath,
+            ETW_MAX_PATH_CHARS,
+            ProcessPath
+            );
+    }
+
+    EventDataDescCreate(&dataDescriptor, event, sizeof(ETW_MEMORY_EVENT));
+
+    status = EtwpWriteEvent(descriptor, 1, &dataDescriptor);
+
+    EtwpUpdateStatistics(sizeof(ETW_MEMORY_EVENT), NT_SUCCESS(status));
+
+    ExFreeToNPagedLookasideList(&g_EtwGlobals.EventBufferLookaside, event);
 
     EtwpReleaseWriterRef();
 
