@@ -55,6 +55,7 @@
 #include "ObjectCallback.h"
 #include "ProcessProtection.h"
 #include "../../Core/Globals.h"
+#include "../../Core/DriverEntry.h"
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Utilities/MemoryUtils.h"
@@ -1430,10 +1431,7 @@ ObQueueTelemetryEvent(
     )
 {
     NTSTATUS status;
-    struct {
-        SHADOWSTRIKE_MESSAGE_HEADER Header;
-        SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION Alert;
-    } Message;
+    SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION Alert;
 
     //
     // Check if telemetry is enabled and user-mode is connected
@@ -1447,40 +1445,32 @@ ObQueueTelemetryEvent(
     }
 
     //
-    // Build handle alert notification for user-mode delivery
+    // Build alert payload (no header — batch callback adds it)
     //
-    RtlZeroMemory(&Message, sizeof(Message));
+    RtlZeroMemory(&Alert, sizeof(Alert));
 
-    Message.Header.Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
-    Message.Header.Version = SHADOWSTRIKE_PROTOCOL_VERSION;
-    Message.Header.MessageType = (UINT16)SHADOWSTRIKE_MSG_PROCESS_HANDLE_ALERT;
-    Message.Header.MessageId = (UINT64)InterlockedIncrement64(&g_DriverData.NextMessageId);
-    Message.Header.TotalSize = sizeof(Message);
-    Message.Header.DataSize = sizeof(SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION);
-    {
-        LARGE_INTEGER Now;
-        KeQuerySystemTime(&Now);
-        Message.Header.Timestamp = (UINT64)Now.QuadPart;
-    }
+    Alert.SourceProcessId = (UINT32)(ULONG_PTR)Event->SourceProcessId;
+    Alert.TargetProcessId = (UINT32)(ULONG_PTR)Event->TargetProcessId;
+    Alert.RequestedAccess = Event->OriginalAccess;
+    Alert.GrantedAccess = Event->AllowedAccess;
+    Alert.SuspicionScore = Event->SuspicionScore;
+    Alert.SuspiciousFlags = Event->SuspiciousFlags;
+    Alert.TargetCategory = Event->TargetCategory;
+    Alert.OperationType = Event->IsProcessHandle ? 1 : 2;
+    Alert.Verdict = (Event->StrippedAccess != 0) ? 1 : 0;
 
-    Message.Alert.SourceProcessId = (UINT32)(ULONG_PTR)Event->SourceProcessId;
-    Message.Alert.TargetProcessId = (UINT32)(ULONG_PTR)Event->TargetProcessId;
-    Message.Alert.RequestedAccess = Event->OriginalAccess;
-    Message.Alert.GrantedAccess = Event->AllowedAccess;
-    Message.Alert.SuspicionScore = Event->SuspicionScore;
-    Message.Alert.SuspiciousFlags = Event->SuspiciousFlags;
-    Message.Alert.TargetCategory = Event->TargetCategory;
-    Message.Alert.OperationType = Event->IsProcessHandle ? 1 : 2;
-    Message.Alert.Verdict = (Event->StrippedAccess != 0) ? 1 : 0;
-
-    status = ShadowStrikeSendNotification(
-        &Message.Header,
-        sizeof(Message)
+    //
+    // Route through batch processor for aggregated delivery.
+    //
+    status = ShadowStrikeBatchSendNotification(
+        (UINT16)SHADOWSTRIKE_MSG_PROCESS_HANDLE_ALERT,
+        &Alert,
+        sizeof(Alert)
     );
 
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-            "[ShadowStrike] ObQueueTelemetryEvent: send failed 0x%08X (Src=%p Tgt=%p)\n",
+            "[ShadowStrike] ObQueueTelemetryEvent: batch send failed 0x%08X (Src=%p Tgt=%p)\n",
             status, Event->SourceProcessId, Event->TargetProcessId);
     }
 }

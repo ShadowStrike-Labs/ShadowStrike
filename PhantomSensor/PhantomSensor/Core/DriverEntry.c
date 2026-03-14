@@ -3044,6 +3044,73 @@ ShadowStrikeGetBatchProcessor(VOID)
     return g_BatchProcessor;
 }
 
+_Use_decl_annotations_
+NTSTATUS
+ShadowStrikeBatchSendNotification(
+    _In_ UINT16 MessageType,
+    _In_reads_bytes_(DataSize) PVOID Data,
+    _In_ ULONG DataSize
+    )
+{
+    PBP_PROCESSOR proc = g_BatchProcessor;
+
+    //
+    // Try batch path first — routes through BpQueueEvent, which is safe up
+    // to DISPATCH_LEVEL. The batch processing thread will deliver via CommPort.
+    //
+    if (proc != NULL) {
+        NTSTATUS status = BpQueueEvent(proc, (ULONG)MessageType, Data, (SIZE_T)DataSize);
+        if (NT_SUCCESS(status)) {
+            return status;
+        }
+        //
+        // Batch enqueue failed (shutting down, full, or OOM).
+        // Fall through to direct send.
+        //
+    }
+
+    //
+    // Fallback: build a full message header and send directly via CommPort.
+    // This path allocates NonPaged pool, so must be at IRQL <= DISPATCH_LEVEL.
+    //
+    {
+        ULONG totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + DataSize;
+        PSHADOWSTRIKE_MESSAGE_HEADER msg;
+
+        if (totalSize < sizeof(SHADOWSTRIKE_MESSAGE_HEADER) ||
+            DataSize > BP_MAX_EVENT_DATA_SIZE) {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        msg = (PSHADOWSTRIKE_MESSAGE_HEADER)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, totalSize, 'btCP');
+        if (msg == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        RtlZeroMemory(msg, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+        msg->Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
+        msg->Version = SHADOWSTRIKE_PROTOCOL_VERSION;
+        msg->MessageType = MessageType;
+        msg->TotalSize = totalSize;
+        msg->DataSize = DataSize;
+        KeQuerySystemTime((PLARGE_INTEGER)&msg->Timestamp);
+
+        if (DataSize > 0 && Data != NULL) {
+            RtlCopyMemory(
+                (PUCHAR)msg + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+                Data,
+                DataSize
+            );
+        }
+
+        ShadowStrikeSendNotification(msg, totalSize);
+        ExFreePoolWithTag(msg, 'btCP');
+    }
+
+    return STATUS_SUCCESS;
+}
+
 PTM_MANAGER
 ShadowStrikeGetTimerManager(VOID)
 {

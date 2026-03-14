@@ -62,6 +62,7 @@ Thread Safety:
 #include "ProcessProtection.h"
 #include "ObjectCallback.h"
 #include "../../Core/Globals.h"
+#include "../../Core/DriverEntry.h"
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
@@ -2695,15 +2696,13 @@ PppSendNotification(
 Routine Description:
     Sends a notification to user-mode about a suspicious handle operation.
 
-    Uses the ShadowStrike communication port infrastructure via the generic
-    ShadowStrikeSendNotification API with a HANDLE_ALERT_NOTIFICATION payload.
+    Routes through BatchProcessing for high-throughput delivery during
+    attack storms. Falls back to direct CommPort send if batch processor
+    is unavailable.
 --*/
 {
     NTSTATUS Status;
-    struct {
-        SHADOWSTRIKE_MESSAGE_HEADER Header;
-        SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION Alert;
-    } Message;
+    SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION Alert;
 
     //
     // Check if CommPort is available
@@ -2713,37 +2712,29 @@ Routine Description:
     }
 
     //
-    // Build notification message
+    // Build alert payload (no header — batch callback adds it)
     //
-    RtlZeroMemory(&Message, sizeof(Message));
+    RtlZeroMemory(&Alert, sizeof(Alert));
 
-    Message.Header.Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
-    Message.Header.Version = SHADOWSTRIKE_PROTOCOL_VERSION;
-    Message.Header.MessageType = (UINT16)SHADOWSTRIKE_MSG_PROCESS_HANDLE_ALERT;
-    Message.Header.TotalSize = sizeof(Message);
-    Message.Header.DataSize = sizeof(SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION);
-    {
-        LARGE_INTEGER Now;
-        KeQuerySystemTime(&Now);
-        Message.Header.Timestamp = (UINT64)Now.QuadPart;
-    }
-
-    Message.Alert.SourceProcessId = HandleToULong(Context->SourceProcessId);
-    Message.Alert.TargetProcessId = HandleToULong(Context->TargetProcessId);
-    Message.Alert.RequestedAccess = Context->OriginalDesiredAccess;
-    Message.Alert.GrantedAccess = Context->ModifiedDesiredAccess;
-    Message.Alert.SuspicionScore = Context->SuspicionScore;
-    Message.Alert.SuspiciousFlags = Context->SuspiciousFlags;
-    Message.Alert.TargetCategory = (UINT32)Context->TargetCategory;
-    Message.Alert.OperationType = (UINT32)Context->OperationType;
-    Message.Alert.Verdict = (UINT32)Context->Verdict;
+    Alert.SourceProcessId = HandleToULong(Context->SourceProcessId);
+    Alert.TargetProcessId = HandleToULong(Context->TargetProcessId);
+    Alert.RequestedAccess = Context->OriginalDesiredAccess;
+    Alert.GrantedAccess = Context->ModifiedDesiredAccess;
+    Alert.SuspicionScore = Context->SuspicionScore;
+    Alert.SuspiciousFlags = Context->SuspiciousFlags;
+    Alert.TargetCategory = (UINT32)Context->TargetCategory;
+    Alert.OperationType = (UINT32)Context->OperationType;
+    Alert.Verdict = (UINT32)Context->Verdict;
 
     //
-    // Send notification (non-blocking via generic send)
+    // Route through batch processor for aggregated delivery.
+    // ShadowStrikeBatchSendNotification falls back to direct send
+    // if batch processor is unavailable or full.
     //
-    Status = ShadowStrikeSendNotification(
-        &Message.Header,
-        sizeof(Message)
+    Status = ShadowStrikeBatchSendNotification(
+        (UINT16)SHADOWSTRIKE_MSG_PROCESS_HANDLE_ALERT,
+        &Alert,
+        sizeof(Alert)
         );
 
     if (NT_SUCCESS(Status)) {

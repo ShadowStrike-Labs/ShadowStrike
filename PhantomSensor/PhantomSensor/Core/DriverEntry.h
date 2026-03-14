@@ -491,6 +491,29 @@ PBP_PROCESSOR
 ShadowStrikeGetBatchProcessor(VOID);
 
 /**
+ * @brief Send a notification to user-mode via batch processing.
+ *
+ * Routes through the batch processor (BpQueueEvent) for high-throughput
+ * delivery. Falls back to direct ShadowStrikeSendNotification if the
+ * batch processor is not available or not running.
+ *
+ * Callers pass only the payload data (without SHADOWSTRIKE_MESSAGE_HEADER).
+ * The batch flush callback builds the header and sends via CommPort.
+ *
+ * @param[in] MessageType  SHADOWSTRIKE_MESSAGE_TYPE value (e.g. SHADOWSTRIKE_MSG_PROCESS_HANDLE_ALERT)
+ * @param[in] Data         Payload data to include after the header
+ * @param[in] DataSize     Size in bytes of the payload data (max BP_MAX_EVENT_DATA_SIZE)
+ * @return STATUS_SUCCESS, STATUS_INSUFFICIENT_RESOURCES, or STATUS_DELETE_PENDING
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+ShadowStrikeBatchSendNotification(
+    _In_ UINT16 MessageType,
+    _In_reads_bytes_(DataSize) PVOID Data,
+    _In_ ULONG DataSize
+    );
+
+/**
  * @brief Get the centralized timer manager for periodic/one-shot timers.
  * @return PTM_MANAGER or NULL if not initialized.
  * @note DeviceObject is set after FltRegisterFilter; TmFlag_WorkItemCallback
