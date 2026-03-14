@@ -1930,6 +1930,23 @@ MhpHandleDriverStatusQuery(
     }
 
     //
+    // Memory Monitor aggregate stats
+    //
+    {
+        MEMORY_MONITOR_STATISTICS mmStats;
+        if (NT_SUCCESS(MmMonitorGetStatistics(&mmStats))) {
+            driverStatus.MemMonEventsProcessed     = mmStats.TotalEventsProcessed;
+            driverStatus.MemMonShellcodeDetections  = mmStats.TotalShellcodeDetections;
+            driverStatus.MemMonHeapSprayDetections  = mmStats.TotalHeapSprayDetections;
+            driverStatus.MemMonROPDetections        = mmStats.TotalROPDetections;
+            driverStatus.MemMonSectionAnomalies     = mmStats.TotalSectionAnomalies;
+            driverStatus.MemMonEventsDropped        = mmStats.EventsDropped;
+            driverStatus.MemMonProcessContexts      = (LONG)mmStats.ProcessContextCount;
+            driverStatus.MemMonEnabled              = mmStats.Enabled;
+        }
+    }
+
+    //
     // Copy to output buffer (already validated as kernel memory by caller)
     //
     RtlCopyMemory(OutputBuffer, &driverStatus, sizeof(driverStatus));

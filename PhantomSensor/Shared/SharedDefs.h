@@ -423,6 +423,19 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     LONG64 InjBlockedInjections;
     LONG64 InjActiveChains;
 
+    //
+    // Memory Monitor aggregate stats (MemoryMonitor.c)
+    //
+    LONG64 MemMonEventsProcessed;
+    LONG64 MemMonShellcodeDetections;
+    LONG64 MemMonHeapSprayDetections;
+    LONG64 MemMonROPDetections;
+    LONG64 MemMonSectionAnomalies;
+    LONG64 MemMonEventsDropped;
+    LONG   MemMonProcessContexts;
+    BOOLEAN MemMonEnabled;
+    UCHAR  MemMonReserved[3];
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================

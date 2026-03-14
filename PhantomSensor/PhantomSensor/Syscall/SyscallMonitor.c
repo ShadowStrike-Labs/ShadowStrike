@@ -39,6 +39,7 @@
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/ProcessUtils.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Memory/MemoryMonitor.h"
 
 //
 // WDK-exported but not declared in public headers
@@ -209,6 +210,13 @@ static BOOLEAN ScpIsFunctionRestorable(
     );
 
 static VOID ScpCleanupByFlags(_In_ ULONG InitFlags);
+
+static VOID ScpDispatchToMemoryMonitor(
+    _In_ UINT32 CallerProcessId,
+    _In_ PSST_ENTRY_INFO SyscallInfo,
+    _In_reads_opt_(ArgumentCount) PUINT64 Arguments,
+    _In_ UINT32 ArgumentCount
+    );
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ScMonitorInitialize)
@@ -1575,6 +1583,18 @@ Return Value:
     }
 
     //
+    // Step 7a: Memory operation forwarding to MemoryMonitor.
+    // Memory-category syscalls (NtAllocateVirtualMemory, NtProtectVirtualMemory,
+    // NtWriteVirtualMemory, NtMapViewOfSection) carry injection-relevant data.
+    // Forward to MemoryMonitor for region tracking, chain correlation, and
+    // sub-detector feeding (HeapSpray, Injection, Section, Shellcode).
+    //
+    if (NT_SUCCESS(status) && syscallInfo.Category == SstCategory_Memory &&
+        Arguments != NULL && ArgumentCount > 0) {
+        ScpDispatchToMemoryMonitor(ProcessId, &syscallInfo, Arguments, ArgumentCount);
+    }
+
+    //
     // Step 8: Risk-weighted score amplification.
     // Critical/high-risk syscalls amplify all detection scores because
     // direct/unbacked calls to NtWriteVirtualMemory or NtCreateThreadEx
@@ -2518,4 +2538,208 @@ ScMonitorGetProcessStats(
     ScMonitorReleaseProcessContext(ctx);
 
     return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Memory Operation Dispatch to MemoryMonitor
+// ============================================================================
+
+//
+// Safely read a pointer-sized value from a user-mode address.
+// Returns 0 on any failure (NULL pointer, invalid page, etc.).
+//
+static
+UINT64
+ScpSafeReadUserPtr(
+    _In_ ULONG64 UserPtr
+    )
+{
+    UINT64 Value = 0;
+
+    if (UserPtr == 0 || UserPtr > SC_MAX_USER_ADDRESS) {
+        return 0;
+    }
+
+    __try {
+        ProbeForRead((PVOID)(ULONG_PTR)UserPtr, sizeof(PVOID), sizeof(ULONG));
+        Value = *(volatile ULONG_PTR*)(ULONG_PTR)UserPtr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Value = 0;
+    }
+
+    return Value;
+}
+
+//
+// Resolve a process handle to PID for cross-process detection.
+// Returns CallerPid for NtCurrentProcess()/NULL handles.
+//
+static
+UINT32
+ScpResolvePidFromHandle(
+    _In_ ULONG64 ProcessHandle,
+    _In_ UINT32 CallerPid
+    )
+{
+    NTSTATUS status;
+    PEPROCESS process;
+    UINT32 targetPid;
+
+    //
+    // NtCurrentProcess() = (HANDLE)(LONG_PTR)(-1) = 0xFFFFFFFFFFFFFFFF
+    // Some callers also use 0 or the pseudo-handle value.
+    //
+    if (ProcessHandle == (ULONG64)(LONG_PTR)(-1) || ProcessHandle == 0) {
+        return CallerPid;
+    }
+
+    status = ObReferenceObjectByHandle(
+        (HANDLE)(ULONG_PTR)ProcessHandle,
+        0,
+        *PsProcessType,
+        UserMode,
+        (PVOID*)&process,
+        NULL
+    );
+
+    if (!NT_SUCCESS(status)) {
+        return CallerPid;
+    }
+
+    targetPid = HandleToULong(PsGetProcessId(process));
+    ObDereferenceObject(process);
+
+    return targetPid;
+}
+
+/**
+ * @brief Dispatch memory-category syscalls to the MemoryMonitor subsystem.
+ *
+ * Extracts syscall-specific arguments and routes to the appropriate
+ * MmMonitorHandle* function for region tracking and injection chain
+ * correlation. Called from ScMonitorAnalyzeSyscall for SstCategory_Memory.
+ *
+ * Argument extraction uses __try/__except for user-mode pointer-to-pointer
+ * arguments. On failure, defaults to 0 (the MemoryMonitor still gets the
+ * event for process-context creation and rate-limit accounting).
+ */
+static
+VOID
+ScpDispatchToMemoryMonitor(
+    _In_ UINT32 CallerProcessId,
+    _In_ PSST_ENTRY_INFO SyscallInfo,
+    _In_reads_(ArgumentCount) PUINT64 Arguments,
+    _In_ UINT32 ArgumentCount
+    )
+{
+    PAGED_CODE();
+
+    //
+    // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits,
+    //                         *RegionSize, AllocationType, Protect)
+    //
+    if (strcmp(SyscallInfo->Name, "NtAllocateVirtualMemory") == 0 &&
+        ArgumentCount >= 6) {
+
+        UINT32 targetPid = ScpResolvePidFromHandle(Arguments[0], CallerProcessId);
+        UINT64 baseAddr = ScpSafeReadUserPtr(Arguments[1]);
+        UINT64 regionSize = ScpSafeReadUserPtr(Arguments[3]);
+        UINT32 allocType = (UINT32)Arguments[4];
+        UINT32 protection = (UINT32)Arguments[5];
+        BOOLEAN isCross = (targetPid != CallerProcessId);
+
+        MmMonitorHandleAllocation(
+            targetPid,
+            baseAddr,
+            regionSize,
+            allocType,
+            protection,
+            isCross,
+            isCross ? CallerProcessId : targetPid
+        );
+        return;
+    }
+
+    //
+    // NtProtectVirtualMemory(ProcessHandle, *BaseAddress, *RegionSize,
+    //                        NewProtect, *OldProtect)
+    //
+    if (strcmp(SyscallInfo->Name, "NtProtectVirtualMemory") == 0 &&
+        ArgumentCount >= 4) {
+
+        UINT32 targetPid = ScpResolvePidFromHandle(Arguments[0], CallerProcessId);
+        UINT64 baseAddr = (ArgumentCount >= 2) ? ScpSafeReadUserPtr(Arguments[1]) : 0;
+        UINT64 regionSize = (ArgumentCount >= 3) ? ScpSafeReadUserPtr(Arguments[2]) : 0;
+        UINT32 newProtect = (UINT32)Arguments[3];
+        UINT32 oldProtect = 0;  // Not available in pre-call (output param)
+        BOOLEAN isCross = (targetPid != CallerProcessId);
+
+        MmMonitorHandleProtectionChange(
+            targetPid,
+            baseAddr,
+            regionSize,
+            oldProtect,
+            newProtect,
+            isCross,
+            isCross ? CallerProcessId : targetPid
+        );
+        return;
+    }
+
+    //
+    // NtWriteVirtualMemory(ProcessHandle, BaseAddress, Buffer,
+    //                      NumberOfBytesToWrite, *NumberOfBytesWritten)
+    //
+    if (strcmp(SyscallInfo->Name, "NtWriteVirtualMemory") == 0 &&
+        ArgumentCount >= 4) {
+
+        UINT32 targetPid = ScpResolvePidFromHandle(Arguments[0], CallerProcessId);
+
+        //
+        // NtWriteVirtualMemory is inherently cross-process — there's no
+        // reason to call it on yourself (you'd just use RtlCopyMemory).
+        // Even self-writes indicate suspicious behavior.
+        //
+        BOOLEAN isCross = (targetPid != CallerProcessId);
+        if (!isCross) {
+            return;  // Self-write is not interesting for injection detection
+        }
+
+        MmMonitorHandleCrossProcessWrite(
+            CallerProcessId,
+            targetPid,
+            Arguments[1],          // BaseAddress (direct value, not pointer-to-pointer)
+            Arguments[3],          // NumberOfBytesToWrite
+            NULL                   // SourceBuffer — user-mode, not safe to pass
+        );
+        return;
+    }
+
+    //
+    // NtMapViewOfSection(SectionHandle, ProcessHandle, *BaseAddress,
+    //                    ZeroBits, CommitSize, *SectionOffset, *ViewSize,
+    //                    InheritDisposition, AllocationType, Win32Protect)
+    // Note: Only 8 args captured (SH_MAX_ARGUMENTS=8), so AllocationType
+    // and Win32Protect at Args[8..9] are unavailable.
+    //
+    if (strcmp(SyscallInfo->Name, "NtMapViewOfSection") == 0 &&
+        ArgumentCount >= 7) {
+
+        HANDLE sectionHandle = (HANDLE)(ULONG_PTR)Arguments[0];
+        UINT32 targetPid = ScpResolvePidFromHandle(Arguments[1], CallerProcessId);
+        UINT64 baseAddr = ScpSafeReadUserPtr(Arguments[2]);
+        UINT64 viewSize = ScpSafeReadUserPtr(Arguments[6]);
+        BOOLEAN isCross = (targetPid != CallerProcessId);
+
+        MmMonitorHandleSectionMap(
+            CallerProcessId,
+            sectionHandle,
+            baseAddr,
+            viewSize,
+            0,             // Protection unavailable (Args[9] beyond SH_MAX_ARGUMENTS)
+            isCross,
+            targetPid
+        );
+        return;
+    }
 }
