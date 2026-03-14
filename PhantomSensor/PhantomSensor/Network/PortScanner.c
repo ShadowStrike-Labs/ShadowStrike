@@ -98,11 +98,15 @@
 //
 // Confidence score weights
 //
-#define SSPS_WEIGHT_UNIQUE_PORTS          3
-#define SSPS_WEIGHT_UNIQUE_HOSTS          4
-#define SSPS_WEIGHT_FAILURE_RATE          2
-#define SSPS_WEIGHT_RAPID_CONNECTIONS     2
-#define SSPS_WEIGHT_STEALTH_TECHNIQUE     5
+//
+// Confidence scoring weights — each factor normalized to [0..30] range
+// so no single factor can saturate the 0–100 confidence score alone.
+//
+#define SSPS_WEIGHT_UNIQUE_PORTS          1
+#define SSPS_WEIGHT_UNIQUE_HOSTS          1
+#define SSPS_WEIGHT_FAILURE_RATE          1
+#define SSPS_WEIGHT_RAPID_CONNECTIONS     1
+#define SSPS_WEIGHT_STEALTH_TECHNIQUE     1
 
 //
 // Hash table bucket counts (power of 2 for fast modulo)
@@ -333,7 +337,8 @@ SspsDetermineScanType(
 static ULONG
 SspsCalculateConfidence(
     _In_ PSSPS_WINDOW_SNAPSHOT Snap,
-    _In_ SSPS_SCAN_TYPE ScanType
+    _In_ SSPS_SCAN_TYPE ScanType,
+    _In_ ULONG CommonPortHits
     );
 
 static VOID
@@ -347,6 +352,12 @@ SspsGetProcessInfo(
 
 static VOID
 SspsClassifyTcpFlags(
+    _In_ UCHAR TcpFlags,
+    _Inout_ PSSPS_SOURCE_CONTEXT Source
+    );
+
+static VOID
+SspsReverseClassifyTcpFlags(
     _In_ UCHAR TcpFlags,
     _Inout_ PSSPS_SOURCE_CONTEXT Source
     );
@@ -384,6 +395,7 @@ static VOID SspsCleanupTimerCallback(
 #pragma alloc_text(PAGE, SspsCalculateConfidence)
 #pragma alloc_text(PAGE, SspsGetProcessInfo)
 #pragma alloc_text(PAGE, SspsClassifyTcpFlags)
+#pragma alloc_text(PAGE, SspsReverseClassifyTcpFlags)
 #pragma alloc_text(PAGE, SspsSnapshotWindowStats)
 #pragma alloc_text(PAGE, SspsCleanupTimerCallback)
 #endif
@@ -820,6 +832,7 @@ Routine Description:
             //
             BOOLEAN OldSuccessful = OldRecord->Successful;
             UCHAR OldProtocol = OldRecord->Protocol;
+            UCHAR OldTcpFlags = OldRecord->TcpFlags;
 
             ShadowStrikeFreePoolWithTag(OldRecord, SSPS_POOL_TAG_CONTEXT);
             InterlockedDecrement(&Source->ConnectionCount);
@@ -833,6 +846,10 @@ Routine Description:
 
             if (OldProtocol == 17) {
                 InterlockedDecrement(&Source->WindowStats.UdpConnections);
+            }
+
+            if (OldProtocol == 6) {
+                SspsReverseClassifyTcpFlags(OldTcpFlags, Source);
             }
         }
 
@@ -1459,6 +1476,7 @@ Routine Description:
             //
             BOOLEAN WasSuccessful = Record->Successful;
             UCHAR RecProtocol = Record->Protocol;
+            UCHAR RecTcpFlags = Record->TcpFlags;
 
             RemoveEntryList(Entry);
             ShadowStrikeFreePoolWithTag(Record, SSPS_POOL_TAG_CONTEXT);
@@ -1473,6 +1491,10 @@ Routine Description:
 
             if (RecProtocol == 17) {
                 InterlockedDecrement(&Source->WindowStats.UdpConnections);
+            }
+
+            if (RecProtocol == 6) {
+                SspsReverseClassifyTcpFlags(RecTcpFlags, Source);
             }
         }
     }
@@ -1599,6 +1621,42 @@ Routine Description:
     }
 }
 
+//
+// Reverse of SspsClassifyTcpFlags — decrements the counter that was
+// incremented when the record was inserted.  Called during eviction and
+// time-window expiry so that sliding-window TCP-flag ratios stay accurate.
+//
+static
+VOID
+SspsReverseClassifyTcpFlags(
+    _In_ UCHAR TcpFlags,
+    _Inout_ PSSPS_SOURCE_CONTEXT Source
+    )
+{
+    PAGED_CODE();
+
+    if (TcpFlags == 0) {
+        InterlockedDecrement(&Source->WindowStats.TcpNull);
+        return;
+    }
+
+    if ((TcpFlags & (SSPS_TCP_FLAG_FIN | SSPS_TCP_FLAG_PSH | SSPS_TCP_FLAG_URG)) ==
+        (SSPS_TCP_FLAG_FIN | SSPS_TCP_FLAG_PSH | SSPS_TCP_FLAG_URG)) {
+        InterlockedDecrement(&Source->WindowStats.TcpXmas);
+        return;
+    }
+
+    if (TcpFlags == SSPS_TCP_FLAG_FIN) {
+        InterlockedDecrement(&Source->WindowStats.TcpFinOnly);
+        return;
+    }
+
+    if ((TcpFlags & (SSPS_TCP_FLAG_SYN | SSPS_TCP_FLAG_ACK)) == SSPS_TCP_FLAG_SYN) {
+        InterlockedDecrement(&Source->WindowStats.TcpSynOnly);
+        return;
+    }
+}
+
 //=============================================================================
 // Internal: Window Statistics Snapshot
 //=============================================================================
@@ -1657,7 +1715,7 @@ Routine Description:
     SSPS_WINDOW_SNAPSHOT Snap;
     ULONG FailureRate;
     SSPS_SCAN_TYPE ScanType;
-    ULONG CommonPortHits;
+    ULONG CommonPortHits = 0;
     ULONG i;
 
     PAGED_CODE();
@@ -1772,20 +1830,13 @@ Routine Description:
 
         ExReleasePushLockShared(&Source->ConnectionLock);
         KeLeaveCriticalRegion();
-
-        //
-        // If >50% of common scan ports are hit, this looks like a scanner tool
-        //
-        if (CommonPortHits > SSPS_COMMON_SCAN_PORTS_COUNT / 2) {
-            // Will be reflected in confidence score via higher port count
-        }
     }
 
     //
-    // Calculate confidence score
+    // Calculate confidence score (includes scanner fingerprint bonus)
     //
     if (Result->ScanDetected) {
-        Result->ConfidenceScore = SspsCalculateConfidence(&Snap, Result->Type);
+        Result->ConfidenceScore = SspsCalculateConfidence(&Snap, Result->Type, CommonPortHits);
     }
 
     //
@@ -1877,7 +1928,8 @@ static
 ULONG
 SspsCalculateConfidence(
     _In_ PSSPS_WINDOW_SNAPSHOT Snap,
-    _In_ SSPS_SCAN_TYPE ScanType
+    _In_ SSPS_SCAN_TYPE ScanType,
+    _In_ ULONG CommonPortHits
     )
 {
     ULONG Score = 0;
@@ -1946,6 +1998,15 @@ SspsCalculateConfidence(
     default:
         Score += 10 * SSPS_WEIGHT_STEALTH_TECHNIQUE;
         break;
+    }
+
+    //
+    // Scanner fingerprint bonus: common scan ports matched
+    //
+    if (CommonPortHits > SSPS_COMMON_SCAN_PORTS_COUNT / 2) {
+        Score += 15;
+    } else if (CommonPortHits > SSPS_COMMON_SCAN_PORTS_COUNT / 4) {
+        Score += 8;
     }
 
     return min(Score, 100);
