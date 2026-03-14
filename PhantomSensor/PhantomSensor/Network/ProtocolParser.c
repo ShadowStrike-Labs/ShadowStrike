@@ -347,8 +347,14 @@ PpInitialize(
 
     *Parser = NULL;
 
+    //
+    // NonPagedPoolNx: PP_PARSER contains a KSPIN_LOCK which must reside
+    // in non-paged memory. KeAcquireSpinLock raises IRQL to DISPATCH_LEVEL;
+    // if the lock page were swapped out → IRQL_NOT_LESS_OR_EQUAL BSOD.
+    // The structure is small (~80 bytes) so NP pool cost is negligible.
+    //
     parser = (PPP_PARSER)ExAllocatePoolZero(
-        PagedPool,
+        NonPagedPoolNx,
         sizeof(PP_PARSER),
         PP_POOL_TAG_PARSER
     );
@@ -568,6 +574,7 @@ PpParseHTTPRequest(
     InterlockedIncrement64(&Parser->Stats.HTTPRequestsParsed);
     *Request = request;
 
+    PppUntrackAllocation(Parser);
     PppReleaseRundown(Parser);
     return STATUS_SUCCESS;
 
@@ -702,6 +709,7 @@ PpParseHTTPResponse(
     InterlockedIncrement64(&Parser->Stats.HTTPResponsesParsed);
     *Response = response;
 
+    PppUntrackAllocation(Parser);
     PppReleaseRundown(Parser);
     return STATUS_SUCCESS;
 
@@ -880,6 +888,33 @@ PpParseDNSPacket(
     }
 
     //
+    // Skip remaining wire questions beyond our array bounds so that the
+    // offset is correct for answer parsing.  Without this, if the wire
+    // reports more questions than PP_MAX_DNS_QUESTIONS, the answer loop
+    // would start at the wrong offset and misparse data.
+    //
+    {
+        CHAR skipBuf[PP_MAX_DNS_NAME];
+        for (i = packet->QuestionCount; i < packet->RawQuestionCount && offset < DataSize; i++) {
+            status = PppParseDnsName(
+                data, DataSize, offset,
+                skipBuf, sizeof(skipBuf),
+                &bytesConsumed
+            );
+            if (!NT_SUCCESS(status)) {
+                goto Cleanup;
+            }
+            offset += bytesConsumed;
+
+            if (offset + 4 > DataSize) {
+                status = STATUS_BUFFER_TOO_SMALL;
+                goto Cleanup;
+            }
+            offset += 4;  // Skip QTYPE + QCLASS
+        }
+    }
+
+    //
     // Parse answers
     //
     for (i = 0; i < packet->AnswerCount && offset < DataSize; i++) {
@@ -978,6 +1013,7 @@ PpParseDNSPacket(
     InterlockedIncrement64(&Parser->Stats.DNSPacketsParsed);
     *Packet = packet;
 
+    PppUntrackAllocation(Parser);
     PppReleaseRundown(Parser);
     return STATUS_SUCCESS;
 
