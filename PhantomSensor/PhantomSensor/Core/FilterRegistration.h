@@ -53,7 +53,6 @@ extern "C" {
 #pragma warning(disable:4324)
 #include <fltKernel.h>
 #pragma warning(pop)
-#include "../Context/StreamContext.h"
 
 // ============================================================================
 // POOL TAGS

@@ -65,6 +65,7 @@ Performance Characteristics:
 #include "../../Cache/ScanCache.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Sync/TimerManager.h"
+#include "../../Context/InstanceContext.h"
 #include "USBDeviceControl.h"
 #include <ntstrsafe.h>
 
@@ -1036,9 +1037,67 @@ Return Value:
     InterlockedIncrement64(&g_FscState.Stats.ContextAllocations);
 
     //
-    // Release context AFTER all accesses are complete
+    // Release volume context AFTER all accesses are complete
     //
     FltReleaseContext((PFLT_CONTEXT)VolumeContext);
+
+    //
+    // Allocate and attach per-instance context (SHADOW_INSTANCE_CONTEXT).
+    // This provides per-instance scan statistics, verdict counters,
+    // policy flags, filesystem capabilities, and activity tracking.
+    // Coexists with FSC_VOLUME_CONTEXT (which handles ransomware windowed metrics).
+    //
+    {
+        PSHADOW_INSTANCE_CONTEXT InstanceCtx = NULL;
+        NTSTATUS icStatus;
+
+        icStatus = ShadowCreateInstanceContext(
+            g_DriverData.FilterHandle,
+            &InstanceCtx
+        );
+
+        if (NT_SUCCESS(icStatus) && InstanceCtx != NULL) {
+            //
+            // Set instance context — keep existing if race
+            //
+            icStatus = FltSetInstanceContext(
+                FltObjects->Instance,
+                FLT_SET_CONTEXT_KEEP_IF_EXISTS,
+                (PFLT_CONTEXT)InstanceCtx,
+                NULL
+            );
+
+            if (NT_SUCCESS(icStatus) || icStatus == STATUS_FLT_CONTEXT_ALREADY_DEFINED) {
+                //
+                // Initialize volume information (name, GUID, serial, capabilities)
+                //
+                ShadowInitializeInstanceVolumeInfo(
+                    InstanceCtx,
+                    FltObjects->Instance,
+                    FltObjects->Volume
+                );
+            } else {
+                DbgPrintEx(
+                    DPFLTR_IHVDRIVER_ID,
+                    DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike/FS] Failed to set instance context: 0x%08X\n",
+                    icStatus
+                );
+            }
+
+            //
+            // Release our reference — Filter Manager holds its own
+            //
+            FltReleaseContext((PFLT_CONTEXT)InstanceCtx);
+        } else {
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/FS] Failed to create instance context: 0x%08X\n",
+                icStatus
+            );
+        }
+    }
 
     return STATUS_SUCCESS;
 }

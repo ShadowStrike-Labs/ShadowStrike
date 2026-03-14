@@ -77,6 +77,7 @@ Performance Characteristics:
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Transactions/KtmMonitor.h"
 #include "../Process/WSLMonitor.h"
+#include "../../Context/InstanceContext.h"
 
 //
 // Forward declarations for cross-module APIs defined in FileSystemCallbacks.c
@@ -711,6 +712,19 @@ Return Value:
     //
     InterlockedIncrement64(&g_PcState.Stats.TotalOperations);
 
+    //
+    // Track per-volume create count on instance context (fire-and-forget)
+    //
+    {
+        PSHADOW_INSTANCE_CONTEXT pcInstCtx = NULL;
+        if (FltObjects != NULL && FltObjects->Instance != NULL) {
+            if (NT_SUCCESS(FltGetInstanceContext(FltObjects->Instance, (PFLT_CONTEXT*)&pcInstCtx))) {
+                ShadowInstanceIncrementCreateCount(pcInstCtx);
+                FltReleaseContext((PFLT_CONTEXT)pcInstCtx);
+            }
+        }
+    }
+
     // ========================================================================
     // PHASE 0: CRITICAL PARAMETER VALIDATION
     // ========================================================================
@@ -1204,6 +1218,17 @@ Return Value:
                 InterlockedIncrement64(&g_PcState.Stats.OperationsCached);
                 SHADOWSTRIKE_INC_STAT(CacheHits);
 
+                //
+                // Track per-volume cache hit
+                //
+                {
+                    PSHADOW_INSTANCE_CONTEXT chInstCtx = NULL;
+                    if (NT_SUCCESS(FltGetInstanceContext(FltObjects->Instance, (PFLT_CONTEXT*)&chInstCtx))) {
+                        ShadowInstanceRecordCacheHit(chInstCtx);
+                        FltReleaseContext((PFLT_CONTEXT)chInstCtx);
+                    }
+                }
+
                 if (CacheResult.Verdict == Verdict_Malicious) {
                     //
                     // Cache hit: BLOCK
@@ -1389,6 +1414,17 @@ Return Value:
                 } else {
                     InterlockedIncrement64(&g_PcState.Stats.ScanErrors);
 
+                    //
+                    // Track per-volume scan error
+                    //
+                    {
+                        PSHADOW_INSTANCE_CONTEXT errInstCtx = NULL;
+                        if (NT_SUCCESS(FltGetInstanceContext(FltObjects->Instance, (PFLT_CONTEXT*)&errInstCtx))) {
+                            ShadowInstanceRecordScanError(errInstCtx);
+                            FltReleaseContext((PFLT_CONTEXT)errInstCtx);
+                        }
+                    }
+
                     if (PcpShouldLogOperation()) {
                         DbgPrintEx(
                             DPFLTR_IHVDRIVER_ID,
@@ -1430,6 +1466,17 @@ Return Value:
 
         SHADOWSTRIKE_INC_STAT(FilesBlocked);
         InterlockedIncrement64(&g_PcState.Stats.OperationsBlocked);
+
+        //
+        // Track per-volume block count on instance context
+        //
+        {
+            PSHADOW_INSTANCE_CONTEXT blkInstCtx = NULL;
+            if (NT_SUCCESS(FltGetInstanceContext(FltObjects->Instance, (PFLT_CONTEXT*)&blkInstCtx))) {
+                ShadowInstanceIncrementBlockCount(blkInstCtx);
+                FltReleaseContext((PFLT_CONTEXT)blkInstCtx);
+            }
+        }
 
         BeEngineSubmitEvent(
             BehaviorEvent_FileSignatureSpoofing,

@@ -86,6 +86,7 @@
 #include "Compression.h"
 #include "ScanBridge.h"
 #include "TelemetryBuffer.h"
+#include "../Context/InstanceContext.h"
 
 // ============================================================================
 // CONSTANTS
@@ -1763,6 +1764,47 @@ MhpHandleDriverStatusQuery(
                 driverStatus.TbActiveCpuCount = tbStats.ActiveCpuCount;
             }
             driverStatus.TbBufferState = (ULONG)tbMgr->State;
+        }
+    }
+
+    //
+    // Instance context aggregate statistics (summed across all volumes)
+    //
+    {
+        PFLT_INSTANCE instanceBuffer[32];
+        ULONG actualCount = 0;
+        NTSTATUS icStatus;
+
+        icStatus = FltEnumerateInstances(
+            NULL,
+            g_DriverData.FilterHandle,
+            instanceBuffer,
+            ARRAYSIZE(instanceBuffer),
+            &actualCount
+        );
+
+        if (NT_SUCCESS(icStatus)) {
+            driverStatus.IcActiveInstances = actualCount;
+
+            for (ULONG i = 0; i < actualCount; i++) {
+                PSHADOW_INSTANCE_CONTEXT instCtx = NULL;
+
+                if (NT_SUCCESS(FltGetInstanceContext(instanceBuffer[i], (PFLT_CONTEXT*)&instCtx))
+                    && instCtx != NULL)
+                {
+                    driverStatus.IcTotalCreateOps += instCtx->TotalCreateOperations;
+                    driverStatus.IcTotalScans += instCtx->TotalFilesScanned;
+                    driverStatus.IcTotalBlocks += instCtx->TotalFilesBlocked;
+                    driverStatus.IcTotalWrites += instCtx->TotalWriteOperations;
+                    driverStatus.IcCleanVerdicts += instCtx->TotalCleanVerdicts;
+                    driverStatus.IcMalwareVerdicts += instCtx->TotalMalwareVerdicts;
+                    driverStatus.IcScanErrors += instCtx->TotalScanErrors;
+                    driverStatus.IcCacheHits += instCtx->TotalCacheHits;
+                    FltReleaseContext((PFLT_CONTEXT)instCtx);
+                }
+
+                FltObjectDereference(instanceBuffer[i]);
+            }
         }
     }
 

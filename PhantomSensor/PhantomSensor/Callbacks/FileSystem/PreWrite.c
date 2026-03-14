@@ -81,6 +81,7 @@ MITRE ATT&CK Coverage:
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Communication/ScanBridge.h"
 #include "../../Callbacks/Process/ClipboardMonitor.h"
+#include "../../Context/InstanceContext.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -788,6 +789,19 @@ Return Value:
     *CompletionContext = NULL;
 
     InterlockedIncrement64(&g_PwState.Stats.TotalPreWriteCalls);
+
+    //
+    // Track per-volume write count on instance context
+    //
+    {
+        PSHADOW_INSTANCE_CONTEXT pwInstCtx = NULL;
+        if (FltObjects != NULL && FltObjects->Instance != NULL) {
+            if (NT_SUCCESS(FltGetInstanceContext(FltObjects->Instance, (PFLT_CONTEXT*)&pwInstCtx))) {
+                ShadowInstanceIncrementWriteCount(pwInstCtx);
+                FltReleaseContext((PFLT_CONTEXT)pwInstCtx);
+            }
+        }
+    }
 
     //
     // Fast path: Check if driver is ready

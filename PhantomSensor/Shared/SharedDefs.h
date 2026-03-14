@@ -341,6 +341,20 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     ULONG  TbActiveCpuCount;
     ULONG  TbBufferState;       // TB_BUFFER_STATE enum
 
+    //
+    // Per-instance aggregate stats (summed across all volumes)
+    //
+    LONG64 IcTotalCreateOps;
+    LONG64 IcTotalScans;
+    LONG64 IcTotalBlocks;
+    LONG64 IcTotalWrites;
+    LONG64 IcCleanVerdicts;
+    LONG64 IcMalwareVerdicts;
+    LONG64 IcScanErrors;
+    LONG64 IcCacheHits;
+    ULONG  IcActiveInstances;
+    ULONG  IcReserved;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================

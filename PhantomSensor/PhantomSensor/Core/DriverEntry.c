@@ -42,6 +42,7 @@
  * ============================================================================
  */
 
+#include "../Callbacks/FileSystem/PostCreate.h"
 #include "DriverEntry.h"
 #include "FilterRegistration.h"
 #include "../Communication/CommPort.h"
@@ -57,16 +58,6 @@
 #include "../Callbacks/FileSystem/FileBackupEngine.h"
 #include "../Callbacks/FileSystem/USBDeviceControl.h"
 #include "../Callbacks/FileSystem/FileSystemCallbacks.h"
-
-//
-// Forward declarations for PostCreate subsystem (PostCreate.h redefines
-// SHADOWSTRIKE_STREAM_CONTEXT — cannot include alongside SharedDefs.h)
-//
-_IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS PocInitialize(VOID);
-
-_IRQL_requires_(PASSIVE_LEVEL)
-VOID PocShutdown(VOID);
 
 // Forward declarations for PostWrite subsystem (no separate header)
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -2568,7 +2559,7 @@ ShadowStrikeInitializeLookasideLists(
         NULL,
         NULL,
         POOL_NX_ALLOCATION,
-        sizeof(SHADOW_STREAM_CONTEXT),
+        sizeof(SHADOWSTRIKE_STREAM_CONTEXT),
         SHADOWSTRIKE_POOL_TAG,
         0
     );
