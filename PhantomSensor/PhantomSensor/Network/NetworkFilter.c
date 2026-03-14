@@ -4406,10 +4406,19 @@ NfpAnalyzeConnection(
     PAGED_CODE();
 
     if (g_ReputationManager != NULL) {
+        //
+        // NrLookupIP expects raw IN_ADDR* / IN6_ADDR*, NOT SS_IP_ADDRESS*
+        // (which starts with Family+Reserved before the address union).
+        //
+        BOOLEAN isIpv6 = SS_IS_IPV6(&Connection->RemoteAddress.Address);
+        const VOID* rawAddr = isIpv6
+            ? (const VOID*)&Connection->RemoteAddress.Address.V6
+            : (const VOID*)&Connection->RemoteAddress.Address.V4;
+
         NTSTATUS status = NrLookupIP(
             g_ReputationManager,
-            &Connection->RemoteAddress.Address,
-            SS_IS_IPV6(&Connection->RemoteAddress.Address),
+            rawAddr,
+            isIpv6,
             &reputationResult
             );
 

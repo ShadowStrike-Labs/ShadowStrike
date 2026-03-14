@@ -48,7 +48,6 @@
 #include "../../Sync/TimerManager.h"
 #include "../../Core/DriverEntry.h"
 #include "../../Behavioral/BehaviorEngine.h"
-#include "../../Exclusions/ExclusionManager.h"
 
 //
 // Forward declarations needed before alloc_text (defined later in file)
@@ -725,6 +724,17 @@ NrLookupDomain(
                 RtlStringCchCopyA(Result->ThreatName,
                                   sizeof(Result->ThreatName),
                                   "Suspicious DGA-like domain");
+
+                BeEngineSubmitEvent(
+                    BehaviorEvent_DGADomain,
+                    BehaviorCategory_NetworkOperation,
+                    0,
+                    NULL,
+                    0,
+                    (UINT32)dgaScore,
+                    FALSE,
+                    NULL
+                    );
             }
 
             ExReleaseRundownProtection(&Manager->RundownRef);
@@ -748,6 +758,22 @@ NrLookupDomain(
                               entry->MalwareFamily);
         }
 
+        //
+        // Submit known-bad domain reputation to behavioral engine (MITRE T1071)
+        //
+        if (entry->Reputation >= NrReputation_Malicious) {
+            BeEngineSubmitEvent(
+                BehaviorEvent_C2Communication,
+                BehaviorCategory_NetworkOperation,
+                0,
+                NULL,
+                0,
+                (UINT32)entry->Score,
+                FALSE,
+                NULL
+                );
+        }
+
         KeQuerySystemTime(&now);
         InterlockedExchange64(&entry->LastAccessTime, now.QuadPart);
         InterlockedIncrement(&entry->HitCount);
@@ -766,6 +792,17 @@ NrLookupDomain(
             RtlStringCchCopyA(Result->ThreatName,
                               sizeof(Result->ThreatName),
                               "Suspicious DGA-like domain");
+
+            BeEngineSubmitEvent(
+                BehaviorEvent_DGADomain,
+                BehaviorCategory_NetworkOperation,
+                0,
+                NULL,
+                0,
+                (UINT32)dgaScore,
+                FALSE,
+                NULL
+                );
         }
     }
 
