@@ -302,6 +302,85 @@ MmpHeapSprayDetectionCallback(
 }
 
 // ============================================================================
+// INJECTION DETECTION CALLBACK (feeds detections into BehaviorEngine)
+// ============================================================================
+
+/**
+ * @brief InjectionDetector detection callback — invoked when injection chain confirmed.
+ *
+ * Maps injection technique to BehaviorEngine event types for threat scoring.
+ * Invoked at PASSIVE_LEVEL from the InjectionDetector's analysis worker thread.
+ */
+static VOID
+MmpInjectionDetectionCallback(
+    _In_ PINJ_DETECTION_RESULT Result,
+    _In_opt_ PVOID Context
+    )
+{
+    BEHAVIOR_EVENT_TYPE beEventType;
+    UINT32 threatScore;
+
+    UNREFERENCED_PARAMETER(Context);
+
+    if (Result == NULL || Result->Technique == InjTechNone) {
+        return;
+    }
+
+    //
+    // Map injection technique to BehaviorEngine event type
+    //
+    switch (Result->Technique) {
+    case InjTechCreateRemoteThread:
+        beEventType = BehaviorEvent_RemoteThreadCreate;
+        break;
+    case InjTechApcInjection:
+        beEventType = BehaviorEvent_APCQueueInjection;
+        break;
+    case InjTechProcessHollowing:
+        beEventType = BehaviorEvent_ProcessHollowing;
+        break;
+    case InjTechProcessDoppelganging:
+    case InjTechMapViewOfSection:
+        beEventType = BehaviorEvent_NtMapViewInjection;
+        break;
+    case InjTechCallbackInjection:
+        beEventType = BehaviorEvent_CallbackInjection;
+        break;
+    case InjTechThreadHijacking:
+    case InjTechReflectiveDll:
+    case InjTechPeInjection:
+    case InjTechTlsCallback:
+    case InjTechExtraWindowMemory:
+    case InjTechAtomBombing:
+    default:
+        //
+        // Fallback for uncommon injection subtypes
+        //
+        beEventType = BehaviorEvent_EarlyBirdInjection;
+        break;
+    }
+
+    //
+    // Enforce minimum score of 60 — detector has already confirmed the chain
+    //
+    threatScore = Result->ConfidenceScore;
+    if (threatScore < 60) {
+        threatScore = 60;
+    }
+
+    BeEngineSubmitEvent(
+        beEventType,
+        BehaviorCategory_CodeInjection,
+        HandleToULong(Result->TargetProcessId),
+        Result,
+        sizeof(*Result),
+        threatScore,
+        FALSE,
+        NULL
+    );
+}
+
+// ============================================================================
 // HOLLOWING DETECTION CALLBACK (feeds detections into BehaviorEngine)
 // ============================================================================
 
@@ -480,6 +559,20 @@ MmMonitorInitialize(
             DbgPrint("MemoryMonitor: InjectionDetector init failed: 0x%08X — continuing without injection detection", Status);
             g_MemoryMonitor.Config.EnableInjectionDetection = FALSE;
             g_MemoryMonitor.InjectionDetector = NULL;
+        } else {
+            //
+            // Register BehaviorEngine callback so injection chain detections feed
+            // into the threat scoring pipeline. Without this, chain-correlated
+            // detections (Alloc→Write→Protect→Thread) are silent.
+            //
+            Status = InjRegisterDetectionCallback(
+                (PINJ_DETECTOR)g_MemoryMonitor.InjectionDetector,
+                MmpInjectionDetectionCallback,
+                NULL
+            );
+            if (!NT_SUCCESS(Status)) {
+                DbgPrint("MemoryMonitor: InjectionDetector callback registration failed: 0x%08X\n", Status);
+            }
         }
     }
 
@@ -773,6 +866,61 @@ MmMonitorGetHollowingDetector(
     }
 
     return (PPH_DETECTOR)g_MemoryMonitor.HollowingDetector;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PINJ_DETECTOR
+MmMonitorGetInjectionDetector(
+    VOID
+    )
+{
+    if (g_MemoryMonitor.InitState != MM_INIT_DONE ||
+        g_MemoryMonitor.InjectionDetector == NULL) {
+        return NULL;
+    }
+
+    return (PINJ_DETECTOR)g_MemoryMonitor.InjectionDetector;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+MmMonitorGetInjectionStats(
+    _Out_ PINJ_STATISTICS Stats
+    )
+{
+    if (Stats == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(Stats, sizeof(*Stats));
+
+    if (g_MemoryMonitor.InitState != MM_INIT_DONE ||
+        g_MemoryMonitor.InjectionDetector == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+
+    return InjGetStatistics(
+        (PINJ_DETECTOR)g_MemoryMonitor.InjectionDetector,
+        Stats
+    );
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+MmMonitorNotifyInjectionProcessExit(
+    _In_ HANDLE ProcessId
+    )
+{
+    if (g_MemoryMonitor.InitState != MM_INIT_DONE ||
+        g_MemoryMonitor.InjectionDetector == NULL) {
+        return;
+    }
+
+    InjNotifyProcessExit(
+        (PINJ_DETECTOR)g_MemoryMonitor.InjectionDetector,
+        ProcessId
+    );
 }
 
 // ============================================================================
@@ -1189,6 +1337,28 @@ MmMonitorHandleProtectionChange(
     KeLeaveCriticalRegion();
 
     //
+    // Feed cross-process protection changes to InjectionDetector for chain
+    // correlation. Protection changes (especially W→X, RW→RX) are critical
+    // steps in injection chains (alloc→write→protect→thread).
+    //
+    if (IsCrossProcess && g_MemoryMonitor.Config.EnableInjectionDetection &&
+        g_MemoryMonitor.InjectionDetector != NULL) {
+        InjRecordOperation(
+            (PINJ_DETECTOR)g_MemoryMonitor.InjectionDetector,
+            InjOpProtect,
+            ULongToHandle(SourceProcessId),
+            ULongToHandle(ProcessId),
+            NULL,     // SourceThreadId
+            NULL,     // TargetThreadId
+            (PVOID)(ULONG_PTR)BaseAddress,
+            (SIZE_T)RegionSize,
+            NewProtection,
+            NULL,     // SourceAddress
+            0         // Flags
+        );
+    }
+
+    //
     // Update statistics
     //
     InterlockedIncrement64(&g_MemoryMonitor.TotalEventsProcessed);
@@ -1428,6 +1598,28 @@ MmMonitorHandleSectionMap(
         KeLeaveCriticalRegion();
 
         MmpUpdateProcessRisk(Context);
+    }
+
+    //
+    // Feed cross-process section mappings to InjectionDetector for chain
+    // correlation. NtMapViewOfSection is used in doppelganging and section-based
+    // injection techniques (T1055.013, T1055).
+    //
+    if (IsCrossProcess && g_MemoryMonitor.Config.EnableInjectionDetection &&
+        g_MemoryMonitor.InjectionDetector != NULL) {
+        InjRecordOperation(
+            (PINJ_DETECTOR)g_MemoryMonitor.InjectionDetector,
+            InjOpMapSection,
+            ULongToHandle(ProcessId),
+            ULongToHandle(ActualTargetPid),
+            NULL,     // SourceThreadId
+            NULL,     // TargetThreadId
+            (PVOID)(ULONG_PTR)BaseAddress,
+            (SIZE_T)ViewSize,
+            Protection,
+            NULL,     // SourceAddress
+            0         // Flags
+        );
     }
 
     InterlockedIncrement64(&g_MemoryMonitor.TotalEventsProcessed);

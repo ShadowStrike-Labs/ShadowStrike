@@ -46,6 +46,7 @@
 #include "../../Shared/MemoryTypes.h"
 #include "../../Shared/BehaviorTypes.h"
 #include "HollowingDetector.h"
+#include "InjectionDetector.h"
 
 // ============================================================================
 // MEMORY MONITOR CONFIGURATION
@@ -309,6 +310,39 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 PPH_DETECTOR
 MmMonitorGetHollowingDetector(
     VOID
+    );
+
+/**
+ * @brief Get the InjectionDetector instance pointer.
+ * @return PINJ_DETECTOR opaque pointer, or NULL if not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PINJ_DETECTOR
+MmMonitorGetInjectionDetector(
+    VOID
+    );
+
+/**
+ * @brief Get aggregated injection detection statistics.
+ * @param Stats Output buffer for INJ_STATISTICS.
+ * @return STATUS_SUCCESS or STATUS_NOT_FOUND if detector not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+MmMonitorGetInjectionStats(
+    _Out_ PINJ_STATISTICS Stats
+    );
+
+/**
+ * @brief Notify InjectionDetector of process exit for context cleanup.
+ * Must be called from process termination path to prevent context leaks.
+ * @param ProcessId Exiting process handle.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+MmMonitorNotifyInjectionProcessExit(
+    _In_ HANDLE ProcessId
     );
 
 // ============================================================================

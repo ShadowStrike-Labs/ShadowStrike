@@ -59,6 +59,7 @@
 #include "../../Core/Globals.h"
 #include "../../Communication/ScanBridge.h"
 #include "../../Utilities/MemoryUtils.h"
+#include "../../Memory/MemoryMonitor.h"
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Shared/KernelProcessTypes.h"
 #include "../../Behavioral/BehaviorEngine.h"
@@ -1014,6 +1015,31 @@ Routine Description:
                         PrRelation_RemoteThread,
                         creatorProcessId,
                         ProcessId
+                        );
+                }
+            }
+
+            //
+            // Feed remote thread creation into InjectionDetector for chain
+            // correlation. CreateRemoteThread is the final step in classic
+            // injection (Alloc→Write→Thread, T1055.001). Without this,
+            // InjOpCreateThread never fires and chain signatures never match.
+            //
+            if (event->IsRemote) {
+                PINJ_DETECTOR injDet = MmMonitorGetInjectionDetector();
+                if (injDet != NULL) {
+                    (VOID)InjRecordOperation(
+                        injDet,
+                        InjOpCreateThread,
+                        creatorProcessId,
+                        event->TargetProcessId,
+                        NULL,                     // SourceThreadId
+                        event->TargetThreadId,
+                        event->StartAddress,      // TargetAddress
+                        0,                        // Size (N/A for threads)
+                        0,                        // Protection (N/A)
+                        NULL,                     // SourceAddress
+                        0                         // Flags
                         );
                 }
             }
