@@ -564,6 +564,19 @@ TeShutdown(
     PAGED_CODE();
 
     //
+    // Log shutdown message BEFORE state transition so TeLogOperational
+    // succeeds (it checks state == Running). After CAS to ShuttingDown,
+    // all logging APIs bail out on TepTryAcquireReference.
+    //
+    TeLogOperational(
+        TeEvent_DriverUnloading,
+        TeLevel_Informational,
+        Component_Telemetry,
+        L"Telemetry subsystem shutting down",
+        0
+    );
+
+    //
     // Atomic transition to ShuttingDown. Only proceed from Running or Paused.
     //
     if (InterlockedCompareExchange(
@@ -578,14 +591,6 @@ TeShutdown(
             return;
         }
     }
-
-    TeLogOperational(
-        TeEvent_DriverUnloading,
-        TeLevel_Informational,
-        Component_Telemetry,
-        L"Telemetry subsystem shutting down",
-        0
-    );
 
     //
     // Cancel timers via TimerManager (Wait=TRUE ensures callbacks complete)
@@ -825,12 +830,20 @@ TeResume(
             (LONG)TeState_Paused) == (LONG)TeState_Paused) {
         //
         // Restart heartbeat timer if configured.
+        // Always cancel-then-create for robustness: TePause may still be
+        // cleaning up the old timer when TeResume runs on another thread.
         //
-        if (g_TeProvider.Config.HeartbeatIntervalMs > 0 &&
-            InterlockedCompareExchange(&g_TeProvider.HeartbeatRunning, 1, 0) == 0) {
-
+        if (g_TeProvider.Config.HeartbeatIntervalMs > 0) {
             PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
-            if (tmMgr && g_TeProvider.HeartbeatTimerId == 0) {
+            if (tmMgr != NULL) {
+                //
+                // Idempotent cancel — safe even if TePause already cancelled.
+                //
+                if (g_TeProvider.HeartbeatTimerId != 0) {
+                    TmCancel(tmMgr, g_TeProvider.HeartbeatTimerId, TRUE);
+                    g_TeProvider.HeartbeatTimerId = 0;
+                }
+
                 TM_TIMER_OPTIONS opts = { 0 };
                 opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
                 opts.ToleranceMs = 5000;
@@ -843,6 +856,7 @@ TeResume(
                     &opts,
                     &g_TeProvider.HeartbeatTimerId
                 );
+                InterlockedExchange(&g_TeProvider.HeartbeatRunning, 1);
             }
         }
     }
@@ -2713,10 +2727,20 @@ TeResetStatistics(
 {
     ULONG i;
     LARGE_INTEGER now;
+    KIRQL oldIrql;
 
     if (g_TeProvider.State == (LONG)TeState_Uninitialized) {
         return;
     }
+
+    //
+    // Acquire exclusive StatsLock so that concurrent TeGetStatistics (shared)
+    // cannot observe a partially-reset snapshot. Individual fields still use
+    // interlocked ops for correctness against concurrent event writers.
+    //
+    ShadowStrikeAcquireRWSpinLockExclusive(&g_TeProvider.StatsLock, &oldIrql);
+
+    KeQuerySystemTime(&now);
 
     // Event counters
     InterlockedExchange64(&g_TeProvider.Stats.EventsGenerated, 0);
@@ -2751,7 +2775,6 @@ TeResetStatistics(
     InterlockedExchange64(&g_TeProvider.Stats.SequenceGaps, 0);
 
     // Timing
-    KeQuerySystemTime(&now);
     InterlockedExchange64(&g_TeProvider.Stats.StartTime, now.QuadPart);
     InterlockedExchange64(&g_TeProvider.Stats.LastEventTime, 0);
     InterlockedExchange64(&g_TeProvider.Stats.LastFlushTime, 0);
@@ -2761,6 +2784,8 @@ TeResetStatistics(
     for (i = 0; i < TE_MAX_EVENT_LEVELS; i++) {
         InterlockedExchange64(&g_TeProvider.Stats.EventsByLevel[i], 0);
     }
+
+    ShadowStrikeReleaseRWSpinLockExclusive(&g_TeProvider.StatsLock, oldIrql);
 }
 
 // ============================================================================

@@ -90,6 +90,7 @@
 #include "../ETW/ETWProvider.h"
 #include "../ETW/EventSchema.h"
 #include "../ETW/ManifestGenerator.h"
+#include "../ETW/TelemetryEvents.h"
 
 // ============================================================================
 // CONSTANTS
@@ -1848,6 +1849,22 @@ MhpHandleDriverStatusQuery(
                 driverStatus.ManifestValidationErrors = mgStats.ValidationErrors;
             }
         }
+    }
+
+    //
+    // TelemetryEvents engine statistics
+    //
+    {
+        TE_STATISTICS teStats;
+        NTSTATUS teStatus = TeGetStatistics(&teStats);
+        if (NT_SUCCESS(teStatus)) {
+            driverStatus.TeEventsGenerated = teStats.EventsGenerated;
+            driverStatus.TeEventsThrottled = teStats.EventsThrottled;
+            driverStatus.TeAllocationFailures = teStats.AllocationFailures;
+            driverStatus.TePeakEventsPerSecond = teStats.PeakEventsPerSecond;
+            driverStatus.TeThrottleActivations = teStats.ThrottleActivations;
+        }
+        driverStatus.TeThrottleAction = (LONG)TeGetState();
     }
 
     //

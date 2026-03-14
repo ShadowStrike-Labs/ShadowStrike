@@ -371,6 +371,16 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     UINT32 ManifestTaskCount;
     UINT32 ManifestValidationErrors;
 
+    //
+    // TelemetryEvents engine statistics
+    //
+    LONG64 TeEventsGenerated;
+    LONG64 TeEventsThrottled;
+    LONG64 TeAllocationFailures;
+    LONG  TePeakEventsPerSecond;
+    LONG  TeThrottleAction;         // Current throttle level (TeThrottle_*)
+    LONG64 TeThrottleActivations;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 // ============================================================================
