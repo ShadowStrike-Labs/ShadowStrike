@@ -199,7 +199,10 @@
     <ClCompile Include="PhantomSensor\Communication\ScanBridge.c" />
     <ClCompile Include="PhantomSensor\Communication\TelemetryBuffer.c" />
     <ClCompile Include="PhantomSensor\Context\InstanceContext.c" />
-    <ClCompile Include="PhantomSensor\Context\StreamContext.c" />
+    <ClCompile Include="PhantomSensor\Context\StreamContext.c">
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="PhantomSensor\Core\DriverEntry.c" />
     <ClCompile Include="PhantomSensor\Core\FilterRegistration.c" />
     <ClCompile Include="PhantomSensor\ETW\ETWConsumer.c" />

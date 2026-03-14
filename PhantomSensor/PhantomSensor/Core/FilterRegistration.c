@@ -43,6 +43,7 @@
  * ============================================================================
  */
 
+#include "../Callbacks/FileSystem/PostCreate.h"
 #include "FilterRegistration.h"
 #include "Globals.h"
 #include "DriverEntry.h"
@@ -56,6 +57,7 @@
 #include "../Callbacks/FileSystem/FileSystemCallbacks.h"
 #include "../Callbacks/FileSystem/PreCreate.h"
 #include "../Callbacks/FileSystem/PreSetInfo.h"
+#include "../Context/InstanceContext.h"
 
 //
 // Forward declarations for callback functions defined in dedicated modules.
@@ -203,6 +205,22 @@ static FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
         NULL,                                       // ContextCleanupCallback (no special cleanup needed)
         FLT_VARIABLE_SIZED_CONTEXTS,                // Size — PostCreate specifies exact size
         'hHCP',                                     // PoolTag — PCHh (Handle Context)
+        NULL,                                       // ContextAllocateCallback
+        NULL,                                       // ContextFreeCallback
+        NULL                                        // Reserved
+    },
+
+    //
+    // Instance Context — per-instance scan stats, policy, and volume capabilities
+    // SHADOW_INSTANCE_CONTEXT: signature validation, ERESOURCE sync,
+    // detailed verdict counters, avg scan time, activity timestamps
+    //
+    {
+        FLT_INSTANCE_CONTEXT,                       // ContextType
+        0,                                          // Flags
+        ShadowCleanupInstanceContext,               // ContextCleanupCallback
+        sizeof(SHADOW_INSTANCE_CONTEXT),            // Size — fixed size allocation
+        SHADOW_INSTANCE_TAG,                        // PoolTag — 'iSSx'
         NULL,                                       // ContextAllocateCallback
         NULL,                                       // ContextFreeCallback
         NULL                                        // Reserved
@@ -498,7 +516,7 @@ ShadowStrikePreCleanup(
     _Flt_CompletionContext_Outptr_ PVOID* CompletionContext
     )
 {
-    PSHADOW_STREAM_CONTEXT streamContext = NULL;
+    PSHADOWSTRIKE_STREAM_CONTEXT streamContext = NULL;
     NTSTATUS status;
     BOOLEAN needsRescan = FALSE;
 
@@ -516,30 +534,44 @@ ShadowStrikePreCleanup(
     // Check if file was modified - trigger rescan if needed
     //
     if (g_DriverData.Config.ScanOnWrite && FltObjects->FileObject != NULL) {
-        status = ShadowGetStreamContext(
+        status = FltGetStreamContext(
             FltObjects->Instance,
             FltObjects->FileObject,
-            &streamContext
+            (PFLT_CONTEXT*)&streamContext
         );
 
         if (NT_SUCCESS(status) && streamContext != NULL) {
             //
-            // Check if rescan is needed using the proper API
+            // Check if rescan is needed:
+            // 1. File was modified (Dirty) since last scan, OR
+            // 2. File was never scanned, OR
+            // 3. Verdict TTL expired
             //
-            needsRescan = ShadowShouldRescan(
-                streamContext,
-                g_DriverData.Config.CacheTTLSeconds
-            );
+            if (streamContext->Dirty || !streamContext->Scanned) {
+                needsRescan = TRUE;
+            } else if (streamContext->ScanVerdictTTL > 0) {
+                LARGE_INTEGER now;
+                KeQuerySystemTimePrecise(&now);
+                LONGLONG elapsedSec = (now.QuadPart - streamContext->ScanTime.QuadPart) / 10000000LL;
+                if (elapsedSec > (LONGLONG)streamContext->ScanVerdictTTL) {
+                    needsRescan = TRUE;
+                }
+            }
 
             if (needsRescan) {
                 //
                 // Queue asynchronous rescan
                 // We cannot block here as cleanup must complete
                 //
+                UNICODE_STRING cachedName;
+                cachedName.Buffer = streamContext->CachedFileName;
+                cachedName.Length = streamContext->CachedFileNameLength * sizeof(WCHAR);
+                cachedName.MaximumLength = cachedName.Length;
+
                 status = ShadowStrikeQueueRescan(
                     FltObjects->Instance,
                     FltObjects->FileObject,
-                    streamContext->FileName.Buffer != NULL ? &streamContext->FileName : NULL
+                    (streamContext->CachedFileNameLength > 0) ? &cachedName : NULL
                 );
 
                 if (NT_SUCCESS(status)) {
@@ -570,7 +602,7 @@ ShadowStrikePreAcquireForSectionSync(
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     NTSTATUS status;
     SHADOWSTRIKE_SCAN_VERDICT cachedVerdict = Verdict_Unknown;
-    PSHADOW_STREAM_CONTEXT streamContext = NULL;
+    PSHADOWSTRIKE_STREAM_CONTEXT streamContext = NULL;
     ULONG pageProtection;
     BOOLEAN isExecuteMapping = FALSE;
     HANDLE requestorPid;
@@ -674,22 +706,34 @@ ShadowStrikePreAcquireForSectionSync(
     // Use cached verdicts only.
     //
     if (FltObjects->FileObject != NULL) {
-        status = ShadowGetStreamContext(
+        status = FltGetStreamContext(
             FltObjects->Instance,
             FltObjects->FileObject,
-            &streamContext
+            (PFLT_CONTEXT*)&streamContext
         );
 
         if (NT_SUCCESS(status) && streamContext != NULL) {
             //
             // Use cached verdict if available and valid
+            // Use push lock for read access
             //
-            if (ShadowAcquireStreamContextShared(streamContext)) {
-                if (streamContext->IsScanned && !streamContext->IsModified) {
-                    cachedVerdict = streamContext->Verdict;
+            KeEnterCriticalRegion();
+            ExAcquirePushLockShared(&streamContext->Lock);
+
+            if (streamContext->Scanned && !streamContext->Dirty) {
+                //
+                // Map PostCreate's boolean ScanResult to verdict enum
+                //
+                if (streamContext->ScanResult) {
+                    cachedVerdict = Verdict_Clean;
+                } else {
+                    cachedVerdict = Verdict_Malicious;
                 }
-                ShadowReleaseStreamContext(streamContext);
             }
+
+            ExReleasePushLockShared(&streamContext->Lock);
+            KeLeaveCriticalRegion();
+
             FltReleaseContext(streamContext);
         }
     }

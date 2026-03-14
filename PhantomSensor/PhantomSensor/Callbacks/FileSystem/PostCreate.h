@@ -232,6 +232,7 @@ typedef enum _POC_FILE_CLASS {
 // Prevent SharedDefs.h lightweight definition from conflicting.
 // PostCreate.h defines the canonical, full-featured stream context.
 //
+#ifndef _SHADOWSTRIKE_STREAM_CONTEXT_DEFINED_
 #define _SHADOWSTRIKE_STREAM_CONTEXT_DEFINED_
 
 /**
@@ -333,6 +334,8 @@ typedef struct _SHADOWSTRIKE_STREAM_CONTEXT {
     EX_PUSH_LOCK Lock;                  ///< Context lock
 
 } SHADOWSTRIKE_STREAM_CONTEXT, *PSHADOWSTRIKE_STREAM_CONTEXT;
+
+#endif // _SHADOWSTRIKE_STREAM_CONTEXT_DEFINED_
 
 // ============================================================================
 // STREAM HANDLE CONTEXT STRUCTURE

@@ -101,7 +101,7 @@ ShadowpQueryVolumeSerialNumber(
 
 _IRQL_requires_max_(APC_LEVEL)
 static
-SHADOW_VOLUME_TYPE
+SHADOW_INSTANCE_VOLUME_TYPE
 ShadowpDetermineVolumeType(
     _In_ DEVICE_TYPE DeviceType,
     _In_ ULONG DeviceCharacteristics,
@@ -153,7 +153,9 @@ ShadowpValidateInstanceContext(
 #pragma alloc_text(PAGE, ShadowpQueryVolumeSerialNumber)
 #pragma alloc_text(PAGE, ShadowpDetermineVolumeType)
 #pragma alloc_text(PAGE, ShadowpAllocateAndCopyString)
-#pragma alloc_text(PAGE, ShadowpValidateInstanceContext)
+// NOTE: ShadowpValidateInstanceContext is NOT paged — called from DISPATCH_LEVEL
+// stat increment functions (InterlockedIncrement64 callers). It only does
+// NULL check + ULONG signature compare, safe at any IRQL.
 #endif
 
 // ============================================================================
@@ -408,7 +410,7 @@ ShadowInitializeInstanceVolumeInfo(
     ULONG deviceCharacteristics = 0;
     FLT_FILESYSTEM_TYPE fsType = FLT_FSTYPE_UNKNOWN;
     SHADOW_FS_CAPABILITIES capabilities = { 0 };
-    SHADOW_VOLUME_TYPE volumeType = VolumeTypeUnknown;
+    SHADOW_INSTANCE_VOLUME_TYPE volumeType = InstanceVolumeTypeUnknown;
     ULONG serialNumber = 0;
     ULONG returnedLength = 0;
     WCHAR volumeNameBuffer[SHADOW_MAX_VOLUME_NAME_LENGTH / sizeof(WCHAR)];
@@ -759,7 +761,7 @@ ShadowInstanceIsNetworkVolume(
     //
     MemoryBarrier();
     if (Context->Initialized) {
-        return BooleanFlagOn(Context->VolumeType, VolumeTypeNetwork);
+        return BooleanFlagOn(Context->VolumeType, InstanceVolumeTypeNetwork);
     }
 
     //
@@ -774,7 +776,7 @@ ShadowInstanceIsNetworkVolume(
     KeEnterCriticalRegion();
     ExAcquireResourceSharedLite(&Context->Resource, TRUE);
 
-    isNetwork = BooleanFlagOn(Context->VolumeType, VolumeTypeNetwork);
+    isNetwork = BooleanFlagOn(Context->VolumeType, InstanceVolumeTypeNetwork);
 
     ExReleaseResourceLite(&Context->Resource);
     KeLeaveCriticalRegion();
@@ -804,7 +806,7 @@ ShadowInstanceIsRemovableMedia(
     //
     MemoryBarrier();
     if (Context->Initialized) {
-        return BooleanFlagOn(Context->VolumeType, VolumeTypeRemovable);
+        return BooleanFlagOn(Context->VolumeType, InstanceVolumeTypeRemovable);
     }
 
     //
@@ -819,7 +821,7 @@ ShadowInstanceIsRemovableMedia(
     KeEnterCriticalRegion();
     ExAcquireResourceSharedLite(&Context->Resource, TRUE);
 
-    isRemovable = BooleanFlagOn(Context->VolumeType, VolumeTypeRemovable);
+    isRemovable = BooleanFlagOn(Context->VolumeType, InstanceVolumeTypeRemovable);
 
     ExReleaseResourceLite(&Context->Resource);
     KeLeaveCriticalRegion();
@@ -1114,7 +1116,10 @@ ShadowpValidateInstanceContext(
     BOOLEAN RequireInitialized
     )
 {
-    PAGED_CODE();
+    //
+    // No PAGED_CODE() — this function is called from DISPATCH_LEVEL
+    // stat increment paths. Only does NULL + signature checks (safe at any IRQL).
+    //
 
     //
     // NULL check
@@ -1321,14 +1326,14 @@ ShadowpQueryVolumeSerialNumber(
  */
 _Use_decl_annotations_
 static
-SHADOW_VOLUME_TYPE
+SHADOW_INSTANCE_VOLUME_TYPE
 ShadowpDetermineVolumeType(
     DEVICE_TYPE DeviceType,
     ULONG DeviceCharacteristics,
     FLT_FILESYSTEM_TYPE FilesystemType
     )
 {
-    SHADOW_VOLUME_TYPE volumeType = VolumeTypeUnknown;
+    SHADOW_INSTANCE_VOLUME_TYPE volumeType = InstanceVolumeTypeUnknown;
 
     PAGED_CODE();
     UNREFERENCED_PARAMETER(FilesystemType);
@@ -1341,17 +1346,17 @@ ShadowpDetermineVolumeType(
         case FILE_DEVICE_NETWORK_FILE_SYSTEM:
         case FILE_DEVICE_DFS:
         case FILE_DEVICE_DFS_FILE_SYSTEM:
-            volumeType = VolumeTypeNetwork;
+            volumeType = InstanceVolumeTypeNetwork;
             break;
 
         case FILE_DEVICE_CD_ROM:
         case FILE_DEVICE_CD_ROM_FILE_SYSTEM:
         case FILE_DEVICE_DVD:
-            volumeType = VolumeTypeCDROM;
+            volumeType = InstanceVolumeTypeCDROM;
             break;
 
         case FILE_DEVICE_VIRTUAL_DISK:
-            volumeType = VolumeTypeVirtual;
+            volumeType = InstanceVolumeTypeVirtual;
             break;
 
         case FILE_DEVICE_DISK:
@@ -1360,11 +1365,11 @@ ShadowpDetermineVolumeType(
             // Could be fixed or removable - check characteristics
             //
             if (BooleanFlagOn(DeviceCharacteristics, FILE_REMOVABLE_MEDIA)) {
-                volumeType = VolumeTypeRemovable;
+                volumeType = InstanceVolumeTypeRemovable;
             } else if (BooleanFlagOn(DeviceCharacteristics, FILE_FLOPPY_DISKETTE)) {
-                volumeType = VolumeTypeRemovable;
+                volumeType = InstanceVolumeTypeRemovable;
             } else {
-                volumeType = VolumeTypeFixed;
+                volumeType = InstanceVolumeTypeFixed;
             }
             break;
 
@@ -1373,9 +1378,9 @@ ShadowpDetermineVolumeType(
             // Check if removable via characteristics for unknown types
             //
             if (BooleanFlagOn(DeviceCharacteristics, FILE_REMOVABLE_MEDIA)) {
-                volumeType = VolumeTypeRemovable;
+                volumeType = InstanceVolumeTypeRemovable;
             } else {
-                volumeType = VolumeTypeUnknown;
+                volumeType = InstanceVolumeTypeUnknown;
             }
             break;
     }
@@ -1388,7 +1393,7 @@ ShadowpDetermineVolumeType(
         // Add RAM disk flag if it looks like a virtual volume
         //
         if (DeviceType != FILE_DEVICE_VIRTUAL_DISK) {
-            volumeType = (SHADOW_VOLUME_TYPE)(volumeType | VolumeTypeRAMDisk);
+            volumeType = (SHADOW_INSTANCE_VOLUME_TYPE)(volumeType | InstanceVolumeTypeRAMDisk);
         }
     }
 

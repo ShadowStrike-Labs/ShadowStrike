@@ -78,6 +78,7 @@
 #include "../../Utilities/StringUtils.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Shared/BehaviorTypes.h"
+#include "../../Context/InstanceContext.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -757,6 +758,24 @@ Return Value:
         streamContext->TrackingFlags |= PocTrackingScanned;
 
         InterlockedIncrement64(&g_PocState.Stats.ScannedFiles);
+
+        //
+        // Record per-volume scan verdict on instance context
+        //
+        {
+            PSHADOW_INSTANCE_CONTEXT pocInstCtx = NULL;
+            if (NT_SUCCESS(FltGetInstanceContext(FltObjects->Instance, (PFLT_CONTEXT*)&pocInstCtx))) {
+                LARGE_INTEGER scanDuration;
+                scanDuration.QuadPart = 0;
+                ShadowInstanceIncrementScanCount(pocInstCtx);
+                ShadowInstanceRecordScanVerdict(
+                    pocInstCtx,
+                    (BOOLEAN)(completionCtx->ScanResult),
+                    scanDuration
+                );
+                FltReleaseContext((PFLT_CONTEXT)pocInstCtx);
+            }
+        }
 
         if (completionCtx->ThreatScore > 0) {
             BeEngineSubmitEvent(

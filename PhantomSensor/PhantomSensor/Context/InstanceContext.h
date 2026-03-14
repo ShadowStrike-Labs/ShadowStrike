@@ -23,10 +23,10 @@
  * @file InstanceContext.h
  * @brief Instance context definitions and management for per-volume state tracking.
  *
- * @deprecated This module is superseded by FileSystemCallbacks.c's FSC_VOLUME_CONTEXT
- * which provides per-volume state tracking via the minifilter instance setup callbacks.
- * FSC_VOLUME_CONTEXT is the active per-volume context in the driver. This module
- * remains for potential future consolidation into a centralized context API.
+ * Provides per-minifilter-instance context for detailed volume-specific state:
+ * scan statistics, verdict tracking, policy flags, filesystem capabilities,
+ * and activity monitoring. Registered as FLT_INSTANCE_CONTEXT alongside
+ * FSC_VOLUME_CONTEXT (which handles ransomware windowed metrics).
  *
  * Use Cases:
  * - Per-volume scan statistics (files scanned, blocked, etc.)
@@ -139,16 +139,25 @@ extern "C" {
 
 /**
  * @brief Volume type classification flags (can be combined).
+ *
+ * NOTE: Guarded to avoid redefinition — FileUtils.h defines a sequential
+ * SHADOW_VOLUME_TYPE enum for different purposes. This instance context
+ * version uses bitmask flags that can be combined (e.g., network + virtual).
  */
-typedef enum _SHADOW_VOLUME_TYPE {
-    VolumeTypeUnknown       = 0x00000000,
-    VolumeTypeFixed         = 0x00000001,  ///< Fixed local disk (C:, D:)
-    VolumeTypeRemovable     = 0x00000002,  ///< USB, external HDD
-    VolumeTypeNetwork       = 0x00000004,  ///< Network share (SMB/CIFS)
-    VolumeTypeCDROM         = 0x00000008,  ///< CD/DVD drive
-    VolumeTypeRAMDisk       = 0x00000010,  ///< RAM disk
-    VolumeTypeVirtual       = 0x00000020,  ///< Virtual disk (VHD, VHDX)
-} SHADOW_VOLUME_TYPE;
+#ifndef SHADOW_INSTANCE_VOLUME_TYPE_DEFINED
+#define SHADOW_INSTANCE_VOLUME_TYPE_DEFINED
+
+typedef enum _SHADOW_INSTANCE_VOLUME_TYPE {
+    InstanceVolumeTypeUnknown       = 0x00000000,
+    InstanceVolumeTypeFixed         = 0x00000001,  ///< Fixed local disk (C:, D:)
+    InstanceVolumeTypeRemovable     = 0x00000002,  ///< USB, external HDD
+    InstanceVolumeTypeNetwork       = 0x00000004,  ///< Network share (SMB/CIFS)
+    InstanceVolumeTypeCDROM         = 0x00000008,  ///< CD/DVD drive
+    InstanceVolumeTypeRAMDisk       = 0x00000010,  ///< RAM disk
+    InstanceVolumeTypeVirtual       = 0x00000020,  ///< Virtual disk (VHD, VHDX)
+} SHADOW_INSTANCE_VOLUME_TYPE;
+
+#endif // SHADOW_INSTANCE_VOLUME_TYPE_DEFINED
 
 // ============================================================================
 // FILESYSTEM CAPABILITIES
@@ -229,7 +238,7 @@ typedef struct _SHADOW_INSTANCE_CONTEXT {
     ULONG VolumeSerialNumber;
 
     /// @brief Volume type classification flags
-    SHADOW_VOLUME_TYPE VolumeType;
+    SHADOW_INSTANCE_VOLUME_TYPE VolumeType;
 
     /// @brief File system type (FLT_FSTYPE_NTFS, FLT_FSTYPE_REFS, etc.)
     FLT_FILESYSTEM_TYPE FilesystemType;
