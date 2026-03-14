@@ -548,6 +548,13 @@ C2RecordConnection(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Check if originating process is excluded from monitoring
+    //
+    if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
+        return STATUS_SUCCESS;
+    }
+
     if (!C2_ACQUIRE_RUNDOWN(Detector)) {
         return STATUS_DELETE_PENDING;
     }
@@ -782,33 +789,45 @@ C2AnalyzeDestination(
         C2_MAX_BEACON_SAMPLES * sizeof(ULONG),
         C2_POOL_TAG_WORK);
 
-    if (intervalBuffer != NULL) {
-        KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&Detector->DestinationLock);
-
-        C2pAnalyzeBeaconing(destination, intervalBuffer, C2_MAX_BEACON_SAMPLES);
-        C2pCalculateSuspicionScore(destination);
-
-        ExReleasePushLockExclusive(&Detector->DestinationLock);
-        KeLeaveCriticalRegion();
-
-        ExFreePoolWithTag(intervalBuffer, C2_POOL_TAG_WORK);
-    }
-
     result = C2pAllocateResult();
     if (result == NULL) {
+        if (intervalBuffer != NULL) {
+            ExFreePoolWithTag(intervalBuffer, C2_POOL_TAG_WORK);
+        }
         C2pDereferenceDestination(detector, destination);
         C2_RELEASE_RUNDOWN(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    //
+    // Analyze and snapshot under lock to prevent torn reads of
+    // BeaconAnalysis/JA3Fingerprint if the timer callback fires concurrently.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Detector->DestinationLock);
+
+    if (intervalBuffer != NULL) {
+        C2pAnalyzeBeaconing(destination, intervalBuffer, C2_MAX_BEACON_SAMPLES);
+        C2pCalculateSuspicionScore(destination);
+    }
+
     C2pFillResultFromDestination(result, destination);
 
     if (result->C2Detected) {
-        InterlockedIncrement64(&Detector->Stats.C2Detected);
         if (destination->SuspicionScore >= C2_CONFIRMED_THRESHOLD) {
             destination->IsConfirmedC2 = TRUE;
         }
+    }
+
+    ExReleasePushLockExclusive(&Detector->DestinationLock);
+    KeLeaveCriticalRegion();
+
+    if (intervalBuffer != NULL) {
+        ExFreePoolWithTag(intervalBuffer, C2_POOL_TAG_WORK);
+    }
+
+    if (result->C2Detected) {
+        InterlockedIncrement64(&Detector->Stats.C2Detected);
 
         BeEngineSubmitEvent(
             BehaviorEvent_C2Communication,
@@ -816,7 +835,7 @@ C2AnalyzeDestination(
             HandleToULong(PsGetCurrentProcessId()),
             NULL,
             0,
-            (UINT32)min(destination->SuspicionScore, 100),
+            (UINT32)min(result->SeverityScore, 100),
             FALSE,
             NULL
         );
@@ -1329,6 +1348,56 @@ C2GetStatistics(
 
     C2_RELEASE_RUNDOWN(Detector);
     return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// PUBLIC API — PROCESS LIFECYCLE
+//
+// Must be called from ProcessNotify on process termination to prevent
+// C2_PROCESS_CONTEXT accumulation (capped at 4096).
+// ============================================================================
+
+VOID
+C2ProcessTerminated(
+    _In_ PC2_DETECTOR Detector,
+    _In_ HANDLE ProcessId
+    )
+{
+    PLIST_ENTRY entry;
+    PC2_PROCESS_CONTEXT found = NULL;
+
+    if (Detector == NULL) {
+        return;
+    }
+
+    if (!C2_ACQUIRE_RUNDOWN(Detector)) {
+        return;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Detector->ProcessListLock);
+
+    for (entry = Detector->ProcessList.Flink;
+         entry != &Detector->ProcessList;
+         entry = entry->Flink) {
+
+        PC2_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, C2_PROCESS_CONTEXT, ListEntry);
+        if (ctx->ProcessId == ProcessId) {
+            RemoveEntryList(&ctx->ListEntry);
+            InterlockedDecrement(&Detector->ProcessCount);
+            found = ctx;
+            break;
+        }
+    }
+
+    ExReleasePushLockExclusive(&Detector->ProcessListLock);
+    KeLeaveCriticalRegion();
+
+    if (found != NULL) {
+        C2pFreeProcessContext(found);
+    }
+
+    C2_RELEASE_RUNDOWN(Detector);
 }
 
 // ============================================================================

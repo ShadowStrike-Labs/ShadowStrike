@@ -3341,6 +3341,22 @@ NfpCreateAndInsertConnection(
     NfpAnalyzeConnection(connection);
 
     //
+    // Feed connection to C2Detection for beaconing/IOC analysis (T1071/T1573).
+    // Passes the raw remote address pointer — C2RecordConnection copies it.
+    //
+    if (g_C2Detector != NULL) {
+        PVOID remoteAddr = IsV6 ? (PVOID)remoteIp6 : (PVOID)&remoteIp;
+        C2RecordConnection(
+            g_C2Detector,
+            (HANDLE)(ULONG_PTR)processId,
+            remoteAddr,
+            remotePort,
+            IsV6,
+            NULL
+        );
+    }
+
+    //
     // Feed connection to PortScanner for reconnaissance detection (T1046)
     //
     if (g_PortScanner != NULL) {
@@ -3763,12 +3779,127 @@ NfpProcessStreamData(
                 }
             }
         }
+
+        //
+        // Detect TLS ClientHello and feed JA3 to C2Detection (T1573).
+        // Only on first handshake for this connection, at PASSIVE_LEVEL.
+        // TLS record: byte[0]=0x16 (Handshake), byte[5]=0x01 (ClientHello).
+        //
+        if (g_SslInspector != NULL && g_C2Detector != NULL &&
+            !connection->TlsHandshakeComplete &&
+            dataSize >= 6 && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+
+            UCHAR tlsPeek[6];
+            SIZE_T peekCopied = 0;
+            FwpsCopyStreamDataToBuffer0(
+                StreamPacket->streamData, tlsPeek, sizeof(tlsPeek), &peekCopied);
+
+            if (peekCopied >= 6 &&
+                tlsPeek[0] == 0x16 &&
+                tlsPeek[1] == 0x03 &&
+                (tlsPeek[2] >= 0x01 && tlsPeek[2] <= 0x03) &&
+                tlsPeek[5] == 0x01) {
+
+                PVOID tlsData = NULL;
+                BOOLEAN tlsAllocated = FALSE;
+                UCHAR tlsLocalBuf[2048];
+                SIZE_T tlsCopied = 0;
+
+                if (dataSize <= sizeof(tlsLocalBuf)) {
+                    FwpsCopyStreamDataToBuffer0(
+                        StreamPacket->streamData, tlsLocalBuf, sizeof(tlsLocalBuf), &tlsCopied);
+                    if (tlsCopied > 0) {
+                        tlsData = tlsLocalBuf;
+                    }
+                } else if (dataSize <= 16384) {
+                    tlsData = ExAllocatePool2(POOL_FLAG_PAGED, (SIZE_T)dataSize, 'lTfN');
+                    if (tlsData != NULL) {
+                        FwpsCopyStreamDataToBuffer0(
+                            StreamPacket->streamData, tlsData, (SIZE_T)dataSize, &tlsCopied);
+                        tlsAllocated = TRUE;
+                        if (tlsCopied == 0) {
+                            ExFreePoolWithTag(tlsData, 'lTfN');
+                            tlsData = NULL;
+                            tlsAllocated = FALSE;
+                        }
+                    }
+                }
+
+                if (tlsData != NULL && tlsCopied >= 6) {
+                    PSSL_SESSION_INFO sessionInfo = NULL;
+                    BOOLEAN isV6 = (connection->RemoteAddress.Address.Family == 23);
+
+                    NTSTATUS sslStatus = SslInspectClientHello(
+                        g_SslInspector,
+                        (HANDLE)(ULONG_PTR)connection->ProcessId,
+                        isV6 ? (PVOID)&connection->RemoteAddress.Address.V6
+                              : (PVOID)&connection->RemoteAddress.Address.V4,
+                        connection->RemoteAddress.Port,
+                        isV6,
+                        tlsData,
+                        (ULONG)tlsCopied,
+                        &sessionInfo);
+
+                    if (NT_SUCCESS(sslStatus) && sessionInfo != NULL) {
+                        C2_JA3_FINGERPRINT ja3fp;
+                        RtlZeroMemory(&ja3fp, sizeof(ja3fp));
+                        RtlCopyMemory(ja3fp.JA3String, sessionInfo->JA3.JA3String,
+                                      sizeof(ja3fp.JA3String));
+                        RtlCopyMemory(ja3fp.JA3Hash, sessionInfo->JA3.JA3Hash,
+                                      sizeof(ja3fp.JA3Hash));
+                        RtlCopyMemory(ja3fp.JA3SString, sessionInfo->JA3.JA3SString,
+                                      sizeof(ja3fp.JA3SString));
+                        RtlCopyMemory(ja3fp.JA3SHash, sessionInfo->JA3.JA3SHash,
+                                      sizeof(ja3fp.JA3SHash));
+
+                        C2RecordTLSHandshake(
+                            g_C2Detector,
+                            (HANDLE)(ULONG_PTR)connection->ProcessId,
+                            isV6 ? (PVOID)&connection->RemoteAddress.Address.V6
+                                  : (PVOID)&connection->RemoteAddress.Address.V4,
+                            connection->RemoteAddress.Port,
+                            isV6,
+                            &ja3fp);
+
+                        connection->TlsHandshakeComplete = TRUE;
+                        SslFreeSessionInfo(sessionInfo);
+                    }
+                }
+
+                if (tlsAllocated && tlsData != NULL) {
+                    ExFreePoolWithTag(tlsData, 'lTfN');
+                }
+            }
+        }
     } else {
         InterlockedAdd64((LONG64*)&connection->BytesReceived, (LONG64)dataSize);
         InterlockedIncrement((LONG*)&connection->PacketsReceived);
     }
 
     InterlockedAdd64(&g_NfState.TotalBytesMonitored, (LONG64)dataSize);
+
+    //
+    // Feed traffic to C2Detection for beacon interval analysis (T1071/T1573).
+    // Uses the connection's remote address which is stable for the connection lifetime.
+    //
+    if (g_C2Detector != NULL) {
+        BOOLEAN isV6 = (connection->RemoteAddress.Address.Family == 23); // AF_INET6
+        PVOID remoteAddr = isV6
+            ? (PVOID)&connection->RemoteAddress.Address.V6
+            : (PVOID)&connection->RemoteAddress.Address.V4;
+        CT_DIRECTION dir = (StreamPacket->streamData->flags & FWPS_STREAM_FLAG_SEND)
+            ? CtDirection_Outbound : CtDirection_Inbound;
+
+        C2RecordTraffic(
+            g_C2Detector,
+            (HANDLE)(ULONG_PTR)connection->ProcessId,
+            remoteAddr,
+            connection->RemoteAddress.Port,
+            isV6,
+            (ULONG)dataSize,
+            dir
+        );
+    }
 
     NfpReadConfig(&config);
     if (config.EnableExfiltrationDetection) {
