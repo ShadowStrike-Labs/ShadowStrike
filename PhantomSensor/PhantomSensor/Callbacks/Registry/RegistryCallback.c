@@ -50,6 +50,7 @@
 #include "../../ETW/ETWProvider.h"
 #include "../../Core/DriverEntry.h"
 #include "../../Performance/LookasideLists.h"
+#include "../../Performance/PerformanceMonitor.h"
 
 // ============================================================================
 // POOL TAGS
@@ -1581,6 +1582,8 @@ ShadowStrikeRegistryCallbackRoutine(
         return STATUS_SUCCESS;
     }
 
+    SSPM_LATENCY_BEGIN(reg);
+
     //
     // Only process Pre-operations for blocking, Post for logging
     //
@@ -2056,9 +2059,13 @@ SkipCreatePathBuild:
     if (blockOperation) {
         InterlockedIncrement64(&g_RegistryMonitor.Statistics.TotalOperations);
         SHADOWSTRIKE_INC_STAT(RegistryOperationsBlocked);
+        SSPM_LATENCY_END(ShadowStrikeGetPerformanceMonitor(),
+                         SsPmMetric_CallbackLatencyUs, reg);
         return STATUS_ACCESS_DENIED;
     }
 
+    SSPM_LATENCY_END(ShadowStrikeGetPerformanceMonitor(),
+                     SsPmMetric_CallbackLatencyUs, reg);
     return STATUS_SUCCESS;
 }
 

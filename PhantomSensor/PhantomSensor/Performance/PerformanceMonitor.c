@@ -76,11 +76,14 @@ typedef struct _SSPM_RING_BUFFER {
 } SSPM_RING_BUFFER, *PSSPM_RING_BUFFER;
 
 //
-// Per-metric threshold
+// Per-metric threshold with alert cooldown
 //
+#define SSPM_ALERT_COOLDOWN_100NS  (10LL * 10000000LL)   // 10 seconds between alerts per metric
+
 typedef struct _SSPM_THRESHOLD {
     BOOLEAN Enabled;
     ULONG64 Value;
+    LARGE_INTEGER LastAlertTime;   // Cooldown: suppress duplicate alerts within window
 } SSPM_THRESHOLD, *PSSPM_THRESHOLD;
 
 //
@@ -197,32 +200,53 @@ SspmiIsValidMetric(
 
 
 //=============================================================================
-// Integer-Only Sort for Percentile Computation
+// Integer-Only Partition + Quickselect for Percentile Computation
 //=============================================================================
 
 //
-// Simple insertion sort for small arrays (used on snapshot copies only).
-// Called at <= APC_LEVEL with a bounded-size stack/heap buffer.
+// Quickselect (Hoare partition) — O(n) average for kth smallest.
+// Called at <= APC_LEVEL with a bounded-size heap buffer.
+// Used instead of insertion sort to avoid O(n²) on 1024 elements.
 //
 static
-VOID
-SspmiSortValues(
+ULONG64
+SspmiQuickSelect(
     _Inout_updates_(Count) ULONG64* Values,
-    _In_ ULONG Count
+    _In_ ULONG Count,
+    _In_ ULONG K
     )
 {
-    ULONG i, j;
-    ULONG64 Key;
+    ULONG Left = 0;
+    ULONG Right = Count - 1;
+    ULONG64 Temp;
 
-    for (i = 1; i < Count; i++) {
-        Key = Values[i];
-        j = i;
-        while (j > 0 && Values[j - 1] > Key) {
-            Values[j] = Values[j - 1];
-            j--;
+    while (Left < Right) {
+        ULONG64 Pivot = Values[Right];
+        ULONG StoreIdx = Left;
+        ULONG i;
+
+        for (i = Left; i < Right; i++) {
+            if (Values[i] <= Pivot) {
+                Temp = Values[StoreIdx];
+                Values[StoreIdx] = Values[i];
+                Values[i] = Temp;
+                StoreIdx++;
+            }
         }
-        Values[j] = Key;
+        Temp = Values[StoreIdx];
+        Values[StoreIdx] = Values[Right];
+        Values[Right] = Temp;
+
+        if (StoreIdx == K) {
+            return Values[K];
+        } else if (StoreIdx < K) {
+            Left = StoreIdx + 1;
+        } else {
+            Right = StoreIdx - 1;
+        }
     }
+
+    return Values[Left];
 }
 
 //=============================================================================
@@ -526,7 +550,7 @@ Routine Description:
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (InterlockedCompareExchange(&Monitor->Initialized, 0, 0) == 0) {
+    if (!SspmiAcquireOperation(Monitor)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -543,11 +567,12 @@ Routine Description:
 
     if (SnapCount == 0) {
         KeReleaseSpinLock(&Ring->Lock, OldIrql);
+        SspmiReleaseOperation(Monitor);
         return STATUS_SUCCESS;
     }
 
     //
-    // Release lock to allocate scratch buffer at PASSIVE_LEVEL,
+    // Release lock to allocate scratch buffer at lower IRQL,
     // then re-acquire. Allocate based on Capacity (upper bound).
     //
     KeReleaseSpinLock(&Ring->Lock, OldIrql);
@@ -562,6 +587,7 @@ Routine Description:
         (SIZE_T)AllocCount * sizeof(ULONG64),
         SSPM_POOL_TAG);
     if (SortBuf == NULL) {
+        SspmiReleaseOperation(Monitor);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -574,6 +600,7 @@ Routine Description:
     if (SnapCount == 0) {
         KeReleaseSpinLock(&Ring->Lock, OldIrql);
         ShadowStrikeFreePoolWithTag(SortBuf, SSPM_POOL_TAG);
+        SspmiReleaseOperation(Monitor);
         return STATUS_SUCCESS;
     }
 
@@ -623,14 +650,18 @@ Routine Description:
     Stats->Mean = Sum / (ULONG64)SnapCount;
 
     //
-    // Sort for percentiles
+    // Compute percentiles using O(n) quickselect instead of O(n²) sort
     //
-    SspmiSortValues(SortBuf, SnapCount);
-
     if (SnapCount >= 20) {
-        // p95 = value at index floor(0.95 * count)
-        Stats->Percentile95 = SortBuf[(ULONG)((ULONG64)SnapCount * 95 / 100)];
-        Stats->Percentile99 = SortBuf[(ULONG)((ULONG64)SnapCount * 99 / 100)];
+        ULONG P95Idx = (ULONG)((ULONG64)SnapCount * 95 / 100);
+        ULONG P99Idx = (ULONG)((ULONG64)SnapCount * 99 / 100);
+
+        //
+        // Find P99 first (higher index), then P95 on the left partition.
+        // Quickselect partially partitions, so P99 first doesn't harm P95.
+        //
+        Stats->Percentile99 = SspmiQuickSelect(SortBuf, SnapCount, P99Idx);
+        Stats->Percentile95 = SspmiQuickSelect(SortBuf, SnapCount, P95Idx);
     } else {
         // Too few samples for meaningful percentiles; use max
         Stats->Percentile95 = Stats->Max;
@@ -638,6 +669,7 @@ Routine Description:
     }
 
     ShadowStrikeFreePoolWithTag(SortBuf, SSPM_POOL_TAG);
+    SspmiReleaseOperation(Monitor);
     return STATUS_SUCCESS;
 }
 
@@ -811,7 +843,15 @@ SspmiCheckThresholds(
 Routine Description:
     Checks whether the recorded value exceeds the threshold for this metric.
     If so, invokes the alert callback (if registered).
-    Safe at DISPATCH_LEVEL — uses spin locks only.
+    
+    IRQL safety: This function may be called at DISPATCH_LEVEL (from
+    SsPmRecordSample). The alert callback contract says PASSIVE_LEVEL.
+    If current IRQL > PASSIVE_LEVEL, we skip the callback invocation.
+    The timer-based collection callback at PASSIVE_LEVEL will catch it
+    on the next cycle.
+    
+    Alert cooldown: Suppresses duplicate alerts within SSPM_ALERT_COOLDOWN_100NS
+    per metric to prevent alert storms from bursty threshold breaches.
 --*/
 {
     KIRQL OldIrql;
@@ -820,6 +860,7 @@ Routine Description:
     SSPM_ALERT_CALLBACK Cb = NULL;
     PVOID CbCtx = NULL;
     SSPM_THRESHOLD_ALERT Alert;
+    LARGE_INTEGER Now;
 
     //
     // Read threshold (under spin lock)
@@ -828,13 +869,33 @@ Routine Description:
 
     if (Monitor->Thresholds[(ULONG)Metric].Enabled &&
         Value > Monitor->Thresholds[(ULONG)Metric].Value) {
-        Exceeded = TRUE;
-        Threshold = Monitor->Thresholds[(ULONG)Metric].Value;
+        
+        //
+        // Cooldown check: suppress if last alert was too recent
+        //
+        KeQuerySystemTime(&Now);
+        if ((Now.QuadPart - Monitor->Thresholds[(ULONG)Metric].LastAlertTime.QuadPart)
+                >= SSPM_ALERT_COOLDOWN_100NS) {
+            Exceeded = TRUE;
+            Threshold = Monitor->Thresholds[(ULONG)Metric].Value;
+            Monitor->Thresholds[(ULONG)Metric].LastAlertTime = Now;
+        }
     }
 
     KeReleaseSpinLock(&Monitor->ThresholdLock, OldIrql);
 
     if (!Exceeded) {
+        return;
+    }
+
+    //
+    // IRQL guard: alert callbacks may touch paged memory or block.
+    // Only invoke at PASSIVE_LEVEL. At elevated IRQL, the threshold
+    // breach is still counted but callback is skipped — the periodic
+    // collection timer at PASSIVE will re-evaluate.
+    //
+    if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
+        InterlockedIncrement64(&Monitor->Stats.AlertsTriggered);
         return;
     }
 
@@ -851,7 +912,7 @@ Routine Description:
     }
 
     //
-    // Build alert on stack and invoke callback
+    // Build alert on stack and invoke callback at PASSIVE_LEVEL
     //
     RtlZeroMemory(&Alert, sizeof(Alert));
     Alert.Metric = Metric;

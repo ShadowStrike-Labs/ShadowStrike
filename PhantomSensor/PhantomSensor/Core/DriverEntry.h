@@ -202,6 +202,7 @@ typedef struct _CO_MANAGER CO_MANAGER, *PCO_MANAGER;
 typedef struct _EC_CONSUMER EC_CONSUMER, *PEC_CONSUMER;
 typedef struct _ES_SCHEMA ES_SCHEMA, *PES_SCHEMA;
 typedef struct _LL_MANAGER LL_MANAGER, *PLL_MANAGER;
+typedef struct _SSPM_MONITOR SSPM_MONITOR, *PSSPM_MONITOR;
 
 // ============================================================================
 // DRIVER LIFECYCLE FUNCTIONS
@@ -540,6 +541,15 @@ ShadowStrikeBatchSendNotification(
     _In_reads_bytes_(DataSize) PVOID Data,
     _In_ ULONG DataSize
     );
+
+/**
+ * @brief Get the global performance monitor for metric recording.
+ * @return PSSPM_MONITOR or NULL if not initialized.
+ * @note Callers use SsPmRecordSample/SsPmRecordLatency at <= DISPATCH_LEVEL.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PSSPM_MONITOR
+ShadowStrikeGetPerformanceMonitor(VOID);
 
 /**
  * @brief Get the centralized timer manager for periodic/one-shot timers.
