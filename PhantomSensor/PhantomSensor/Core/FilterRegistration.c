@@ -58,6 +58,7 @@
 #include "../Callbacks/FileSystem/PreCreate.h"
 #include "../Callbacks/FileSystem/PreSetInfo.h"
 #include "../Context/InstanceContext.h"
+#include "../Transactions/KtmMonitor.h"
 
 //
 // Forward declarations for callback functions defined in dedicated modules.
@@ -339,7 +340,7 @@ static FLT_REGISTRATION g_FilterRegistration = {
     NULL,                                           // GenerateFileName
     NULL,                                           // NormalizeNameComponent
     NULL,                                           // NormalizeContextCleanup
-    NULL,                                           // TransactionNotification
+    ShadowKtmNotificationCallback,                  // TransactionNotification
     NULL,                                           // NormalizeNameComponentEx
     NULL                                            // SectionNotification
 };

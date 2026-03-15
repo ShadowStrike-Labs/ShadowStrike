@@ -89,10 +89,10 @@ ShadowCreateKtmCommunicationPort(
  * Returns FALSE if refcount is <= 0 or is the DESTROYING sentinel,
  * meaning the transaction is being freed and must not be touched.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_Use_decl_annotations_
 BOOLEAN
 ShadowReferenceKtmTransaction(
-    _In_ PSHADOW_KTM_TRANSACTION Transaction
+    PSHADOW_KTM_TRANSACTION Transaction
     )
 {
     LONG oldRefCount;
@@ -131,10 +131,10 @@ ShadowReferenceKtmTransaction(
  * On detected underflow or double-free, logs and leaks rather than
  * crashing the customer's machine.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_Use_decl_annotations_
 VOID
 ShadowReleaseKtmTransaction(
-    _In_ PSHADOW_KTM_TRANSACTION Transaction
+    PSHADOW_KTM_TRANSACTION Transaction
     )
 {
     LONG newRefCount;
@@ -206,10 +206,10 @@ ShadowReleaseKtmTransaction(
 /**
  * @brief Validate transaction structure integrity.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_Use_decl_annotations_
 BOOLEAN
 ShadowValidateKtmTransaction(
-    _In_ PSHADOW_KTM_TRANSACTION Transaction
+    PSHADOW_KTM_TRANSACTION Transaction
     )
 {
     if (Transaction == NULL) {
@@ -244,11 +244,11 @@ ShadowValidateKtmTransaction(
  *        returned buffer is safe to use at any IRQL for reads.
  *        Caller frees ImageName->Buffer with SHADOW_KTM_STRING_TAG.
  */
-_IRQL_requires_(PASSIVE_LEVEL)
+_Use_decl_annotations_
 NTSTATUS
 ShadowGetProcessImageName(
-    _In_ HANDLE ProcessId,
-    _Out_ PUNICODE_STRING ImageName
+    HANDLE ProcessId,
+    PUNICODE_STRING ImageName
     )
 {
     NTSTATUS status;
@@ -428,12 +428,18 @@ ShadowKtmPortMessageNotify(
     }
 
     //
-    // Handle statistics query — probe the user-mode output buffer first.
+    // Handle statistics query. Copy to kernel stack first, THEN to
+    // user-mode buffer — ShadowGetKtmStatistics acquires a spinlock
+    // (DISPATCH_LEVEL), so writing directly to user-mode would BSOD
+    // if the page is paged out (IRQL_NOT_LESS_OR_EQUAL).
     //
     if (OutputBuffer != NULL && OutputBufferLength >= sizeof(SHADOW_KTM_STATISTICS)) {
+        SHADOW_KTM_STATISTICS localStats;
+        ShadowGetKtmStatistics(&localStats);
+
         __try {
             ProbeForWrite(OutputBuffer, sizeof(SHADOW_KTM_STATISTICS), sizeof(ULONG));
-            ShadowGetKtmStatistics((PSHADOW_KTM_STATISTICS)OutputBuffer);
+            RtlCopyMemory(OutputBuffer, &localStats, sizeof(SHADOW_KTM_STATISTICS));
             *ReturnOutputBufferLength = sizeof(SHADOW_KTM_STATISTICS);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -522,10 +528,10 @@ ShadowCreateKtmCommunicationPort(
 // PUBLIC FUNCTIONS
 // ============================================================================
 
-_IRQL_requires_(PASSIVE_LEVEL)
+_Use_decl_annotations_
 NTSTATUS
 ShadowInitializeKtmMonitor(
-    _In_ PFLT_FILTER FilterHandle
+    PFLT_FILTER FilterHandle
     )
 {
     NTSTATUS status;
@@ -664,7 +670,7 @@ cleanup:
     return status;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
+_Use_decl_annotations_
 VOID
 ShadowCleanupKtmMonitor(
     VOID
@@ -742,7 +748,7 @@ ShadowCleanupKtmMonitor(
 // CALLBACK REGISTRATION
 // ============================================================================
 
-_IRQL_requires_(PASSIVE_LEVEL)
+_Use_decl_annotations_
 NTSTATUS
 ShadowRegisterTransactionCallbacks(
     VOID
@@ -827,7 +833,7 @@ ShadowRegisterTransactionCallbacks(
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
+_Use_decl_annotations_
 VOID
 ShadowUnregisterTransactionCallbacks(
     VOID
@@ -857,12 +863,12 @@ ShadowUnregisterTransactionCallbacks(
  * Allocates via lookaside list, sets magic, captures process name at
  * PASSIVE_LEVEL, inserts into LRU list.
  */
-_IRQL_requires_(PASSIVE_LEVEL)
+_Use_decl_annotations_
 NTSTATUS
 ShadowTrackTransaction(
-    _In_ GUID TransactionGuid,
-    _In_ HANDLE ProcessId,
-    _Outptr_ PSHADOW_KTM_TRANSACTION* Transaction
+    GUID TransactionGuid,
+    HANDLE ProcessId,
+    PSHADOW_KTM_TRANSACTION* Transaction
     )
 {
     PSHADOW_KTM_TRANSACTION transaction = NULL;
@@ -953,11 +959,11 @@ ShadowTrackTransaction(
  * Uses CAS-based reference increment under exclusive lock to prevent
  * use-after-free.
  */
-_IRQL_requires_max_(APC_LEVEL)
+_Use_decl_annotations_
 NTSTATUS
 ShadowFindKtmTransaction(
-    _In_ GUID TransactionGuid,
-    _Outptr_ PSHADOW_KTM_TRANSACTION* Transaction
+    GUID TransactionGuid,
+    PSHADOW_KTM_TRANSACTION* Transaction
     )
 {
     PSHADOW_KTM_MONITOR_STATE state = &g_KtmMonitorState;
@@ -1031,12 +1037,12 @@ ShadowFindKtmTransaction(
 /**
  * @brief Calculate threat score using cached process name (no IRQL issues).
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_Use_decl_annotations_
 NTSTATUS
 ShadowCalculateKtmThreatScore(
-    _In_ PSHADOW_KTM_TRANSACTION Transaction,
-    _In_ SHADOW_KTM_OPERATION Operation,
-    _Out_ PULONG ThreatScore
+    PSHADOW_KTM_TRANSACTION Transaction,
+    SHADOW_KTM_OPERATION Operation,
+    PULONG ThreatScore
     )
 {
     ULONG score = 0;
@@ -1125,10 +1131,10 @@ ShadowCalculateKtmThreatScore(
  * large stack buffer. Uses RtlDowncaseUnicodeChar for kernel-safe
  * lowercasing.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_Use_decl_annotations_
 BOOLEAN
 ShadowIsRansomwareTargetFile(
-    _In_ PUNICODE_STRING FilePath
+    PUNICODE_STRING FilePath
     )
 {
     ULONG i;
@@ -1203,10 +1209,10 @@ ShadowIsRansomwareTargetFile(
 /**
  * @brief Detect ransomware file modification pattern.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_Use_decl_annotations_
 BOOLEAN
 ShadowDetectRansomwarePattern(
-    _In_ PSHADOW_KTM_TRANSACTION Transaction
+    PSHADOW_KTM_TRANSACTION Transaction
     )
 {
     LARGE_INTEGER currentTime;
@@ -1267,11 +1273,11 @@ ShadowDetectRansomwarePattern(
  * Must be called at PASSIVE_LEVEL because ShadowQueueKtmAlert captures
  * process name via ShadowGetProcessImageName (PsLookupProcessByProcessId).
  */
-_IRQL_requires_(PASSIVE_LEVEL)
+_Use_decl_annotations_
 NTSTATUS
 ShadowRecordTransactedFileOperation(
-    _In_ PSHADOW_KTM_TRANSACTION Transaction,
-    _In_ PUNICODE_STRING FilePath
+    PSHADOW_KTM_TRANSACTION Transaction,
+    PUNICODE_STRING FilePath
     )
 {
     LARGE_INTEGER currentTime;
@@ -1314,10 +1320,10 @@ ShadowRecordTransactedFileOperation(
 /**
  * @brief Mark transaction as committed.
  */
-_IRQL_requires_(PASSIVE_LEVEL)
+_Use_decl_annotations_
 NTSTATUS
 ShadowMarkTransactionCommitted(
-    _In_ PSHADOW_KTM_TRANSACTION Transaction
+    PSHADOW_KTM_TRANSACTION Transaction
     )
 {
     ULONG threatScore = 0;
@@ -1361,10 +1367,10 @@ ShadowMarkTransactionCommitted(
 /**
  * @brief Get atomic snapshot of statistics under spinlock.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_Use_decl_annotations_
 VOID
 ShadowGetKtmStatistics(
-    _Out_ PSHADOW_KTM_STATISTICS Stats
+    PSHADOW_KTM_STATISTICS Stats
     )
 {
     PSHADOW_KTM_MONITOR_STATE state = &g_KtmMonitorState;
@@ -1387,16 +1393,16 @@ ShadowGetKtmStatistics(
  * @brief Queue a KTM threat alert. ProcessName is used from the caller's
  *        pre-captured buffer (safe at any IRQL). If NULL, we leave it blank.
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_Use_decl_annotations_
 NTSTATUS
 ShadowQueueKtmAlert(
-    _In_ SHADOW_KTM_ALERT_TYPE AlertType,
-    _In_ HANDLE ProcessId,
-    _In_opt_ PCWSTR ProcessName,
-    _In_ GUID TransactionGuid,
-    _In_ ULONG FilesAffected,
-    _In_ ULONG ThreatScore,
-    _In_ BOOLEAN WasBlocked
+    SHADOW_KTM_ALERT_TYPE AlertType,
+    HANDLE ProcessId,
+    PCWSTR ProcessName,
+    GUID TransactionGuid,
+    ULONG FilesAffected,
+    ULONG ThreatScore,
+    BOOLEAN WasBlocked
     )
 {
     PSHADOW_KTM_MONITOR_STATE state = &g_KtmMonitorState;
@@ -1532,6 +1538,8 @@ ShadowTransactionPreOperationCallback(
     POBJECT_NAME_INFORMATION objectNameInfo = NULL;
     ULONG returnLength = 0;
 
+    PAGED_CODE();
+
     if (OperationInformation == NULL || OperationInformation->Object == NULL) {
         return OB_PREOP_SUCCESS;
     }
@@ -1580,32 +1588,37 @@ ShadowTransactionPreOperationCallback(
     }
 
     //
-    // Cap allocation to prevent abuse via inflated returnLength
+    // Cap allocation to prevent abuse via inflated returnLength.
+    // Allocate +sizeof(WCHAR) to guarantee room for null terminator.
     //
     if (returnLength > 4096) {
         return OB_PREOP_SUCCESS;
     }
 
-    objectNameInfo = (POBJECT_NAME_INFORMATION)ExAllocatePool2(
-        POOL_FLAG_PAGED,
-        returnLength,
-        SHADOW_KTM_STRING_TAG
-    );
+    {
+        ULONG allocSize = returnLength + sizeof(WCHAR);
 
-    if (objectNameInfo == NULL) {
-        return OB_PREOP_SUCCESS;
-    }
-
-    __try {
-        status = ObQueryNameString(
-            OperationInformation->Object,
-            objectNameInfo,
-            returnLength,
-            &returnLength
+        objectNameInfo = (POBJECT_NAME_INFORMATION)ExAllocatePool2(
+            POOL_FLAG_PAGED,
+            (SIZE_T)allocSize,
+            SHADOW_KTM_STRING_TAG
         );
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        ExFreePoolWithTag(objectNameInfo, SHADOW_KTM_STRING_TAG);
-        return OB_PREOP_SUCCESS;
+
+        if (objectNameInfo == NULL) {
+            return OB_PREOP_SUCCESS;
+        }
+
+        __try {
+            status = ObQueryNameString(
+                OperationInformation->Object,
+                objectNameInfo,
+                allocSize,
+                &returnLength
+            );
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            ExFreePoolWithTag(objectNameInfo, SHADOW_KTM_STRING_TAG);
+            return OB_PREOP_SUCCESS;
+        }
     }
 
     if (!NT_SUCCESS(status) || objectNameInfo->Name.Buffer == NULL) {
@@ -1614,11 +1627,10 @@ ShadowTransactionPreOperationCallback(
     }
 
     //
-    // Ensure the name buffer is null-terminated for safe RtlInitUnicodeString usage
+    // Always null-terminate — we allocated extra sizeof(WCHAR) above
+    // to guarantee this is within bounds even when Length == MaximumLength.
     //
-    if (objectNameInfo->Name.Length < objectNameInfo->Name.MaximumLength) {
-        objectNameInfo->Name.Buffer[objectNameInfo->Name.Length / sizeof(WCHAR)] = L'\0';
-    }
+    objectNameInfo->Name.Buffer[objectNameInfo->Name.Length / sizeof(WCHAR)] = L'\0';
 
     //
     // Find GUID in the object name
@@ -1721,19 +1733,21 @@ ShadowTransactionPostOperationCallback(
 
     //
     // Record the status of the completed operation for telemetry.
-    // A failed handle creation from a previously-blocked process is
-    // an indicator that our pre-op access stripping is effective.
     //
-    if (!NT_SUCCESS(OperationInformation->ReturnStatus)) {
-        InterlockedIncrement64(&state->Stats.BlockedTransactions);
-    }
+    // NOTE: We intentionally do NOT increment BlockedTransactions here.
+    // The pre-op callback already counts actual blocks when it strips
+    // TRANSACTION_COMMIT/ROLLBACK access bits. Failed handle creations
+    // in post-op can be caused by other security products, access checks,
+    // or unrelated reasons — counting them here would inflate the metric.
+    //
+    UNREFERENCED_PARAMETER(OperationInformation);
 }
 
 // ============================================================================
 // INTERNAL CLEANUP
 // ============================================================================
 
-_IRQL_requires_max_(APC_LEVEL)
+_Use_decl_annotations_
 VOID
 ShadowEvictLruTransaction(
     VOID
@@ -1764,7 +1778,7 @@ ShadowEvictLruTransaction(
  * Called after ObUnRegisterCallbacks returns, so no new callbacks can fire.
  * Marks each entry as removed from list, then drains references.
  */
-_IRQL_requires_(PASSIVE_LEVEL)
+_Use_decl_annotations_
 VOID
 ShadowCleanupTransactionEntries(
     VOID
@@ -1829,7 +1843,7 @@ ShadowCleanupTransactionEntries(
     }
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
+_Use_decl_annotations_
 VOID
 ShadowCleanupKtmAlertQueue(
     VOID
