@@ -69,6 +69,7 @@ Performance Characteristics:
 #include <ntstrsafe.h>
 #include "../../Shared/BehaviorTypes.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Behavioral/IOCMatcher.h"
 #include "../Exclusions/ExclusionManager.h"
 #include "../Performance/CacheOptimization.h"
 
@@ -1304,6 +1305,36 @@ DnsProcessQuery(
 
             DnspDereferenceTunnelContext(Monitor, tunnelCtx);
             tunnelCtx = NULL;
+        }
+    }
+
+    //
+    // === IOC Domain Matching ===
+    // Check the queried domain against the threat-intel IOC database.
+    // IomMatch requires PASSIVE_LEVEL — DnsProcessQuery is in PAGED section.
+    //
+    {
+        PIOM_MATCHER iocMatcher = BeGetIocMatcher();
+
+        if (iocMatcher != NULL) {
+            IOM_MATCH_RESULT_DATA iocResult;
+            SIZE_T domainLen = strlen(query->DomainName);
+
+            RtlZeroMemory(&iocResult, sizeof(iocResult));
+
+            if (domainLen > 0 &&
+                IomMatch(
+                    iocMatcher,
+                    IomType_Domain,
+                    query->DomainName,
+                    domainLen,
+                    &iocResult
+                    ) == STATUS_SUCCESS) {
+
+                query->SuspicionFlags |= DnsSuspicion_KnownBad;
+                query->SuspicionScore += 60;
+                InterlockedIncrement64(&Monitor->Stats.SuspiciousQueries);
+            }
         }
     }
 

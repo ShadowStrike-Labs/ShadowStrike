@@ -2561,6 +2561,58 @@ BepProcessSingleEvent(
     BepUpdateProcessContext(processContext, Event, threatScore);
 
     //
+    // === MITRE ATT&CK Detection Recording ===
+    // Record every event with a mapped technique ID into the MITRE mapper.
+    // This enables: MITRE coverage dashboards, detection-to-technique attribution,
+    // recent-detections queries, and SE Labs / MITRE Eval scoring.
+    //
+    if (Event->MitreAttackId != 0 && g_MitreMapper != NULL) {
+        UNICODE_STRING procName;
+
+        processContext->ImagePath[MAX_FILE_PATH_LENGTH - 1] = L'\0';
+        RtlInitUnicodeString(&procName, processContext->ImagePath);
+
+        (VOID)MmRecordDetection(
+            g_MitreMapper,
+            Event->MitreAttackId,
+            ULongToHandle(Event->ProcessId),
+            &procName,
+            (threatScore > 100) ? 100 : threatScore / 10
+        );
+    }
+
+    //
+    // === Attack Chain Tracker Submission ===
+    // Feed technique-level detections into the multi-stage attack chain tracker
+    // when threat score meets medium threshold. This enables:
+    // - Multi-technique correlation (e.g., recon + execution + persistence)
+    // - Combo bonus detection from g_DangerousCombos table
+    // - Chain-level scoring that exceeds individual event scores
+    //
+    // IRQL: BepProcessSingleEvent runs at PASSIVE_LEVEL (worker thread or sync path).
+    // ActSubmitEvent requires <= APC_LEVEL — always satisfied here.
+    //
+    if (Event->MitreAttackId != 0 &&
+        g_AttackChainTracker != NULL &&
+        (threatScore >= BE_SEVERITY_MEDIUM_THRESHOLD ||
+         (Event->Flags & BE_EVENT_FLAG_REQUIRES_CHAIN))) {
+
+        UNICODE_STRING procName;
+
+        processContext->ImagePath[MAX_FILE_PATH_LENGTH - 1] = L'\0';
+        RtlInitUnicodeString(&procName, processContext->ImagePath);
+
+        (VOID)ActSubmitEvent(
+            g_AttackChainTracker,
+            Event->MitreAttackId,
+            ULongToHandle(Event->ProcessId),
+            &procName,
+            Event->EventData,
+            Event->EventDataSize
+        );
+    }
+
+    //
     // Check if event should be correlated to attack chain
     //
     if (threatScore >= BE_SEVERITY_MEDIUM_THRESHOLD ||
@@ -3975,4 +4027,20 @@ BeGetRuleEngine(
     )
 {
     return g_RuleEngine;
+}
+
+PMM_MAPPER
+BeGetMitreMapper(
+    VOID
+    )
+{
+    return g_MitreMapper;
+}
+
+PACT_TRACKER
+BeGetAttackChainTracker(
+    VOID
+    )
+{
+    return g_AttackChainTracker;
 }

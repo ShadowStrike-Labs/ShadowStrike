@@ -1462,10 +1462,10 @@ MmRecordDetection(
     }
 
     //
-    // Add new detection
+    // Add new detection (under spinlock — direct access is safe and consistent)
     //
     InsertTailList(&Mapper->DetectionList, &detection->ListEntry);
-    InterlockedIncrement(&Mapper->DetectionCount);
+    Mapper->DetectionCount++;
     InterlockedIncrement64(&Mapper->Stats.DetectionsMade);
 
     KeReleaseSpinLock(&Mapper->DetectionLock, oldIrql);
