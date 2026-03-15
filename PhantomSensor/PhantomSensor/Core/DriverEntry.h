@@ -732,6 +732,21 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 struct _DPC_MANAGER*
 ShadowStrikeGetDpcManager(VOID);
 
+/**
+ * @brief Get the global thread pool handle.
+ *
+ * @details
+ *        Returns the driver-wide managed thread pool for background work.
+ *        Modules needing dedicated worker threads with scaling, priority,
+ *        and affinity control use this pool instead of raw PsCreateSystemThread.
+ * @return PTP_THREAD_POOL or NULL if not initialized.
+ */
+struct _TP_THREAD_POOL;
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+struct _TP_THREAD_POOL*
+ShadowStrikeGetThreadPool(VOID);
+
 #ifdef __cplusplus
 }
 #endif

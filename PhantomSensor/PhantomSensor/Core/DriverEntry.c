@@ -3333,6 +3333,13 @@ ShadowStrikeGetDpcManager(VOID)
     return g_DpcManager;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PTP_THREAD_POOL
+ShadowStrikeGetThreadPool(VOID)
+{
+    return g_ThreadPool;
+}
+
 // ============================================================================
 // VERSION COMPATIBILITY CHECK
 // ============================================================================

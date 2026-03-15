@@ -58,9 +58,11 @@
  * ============================================================================
  */
 
+#include "../Core/DriverEntry.h"
 #include "ThreadPool.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Core/Globals.h"
+#include "../Performance/PerformanceMonitor.h"
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -224,6 +226,7 @@ TppDestroyThread(
     _In_ BOOLEAN Wait
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 TppSignalThreadStop(
     _Inout_ PTP_THREAD_INFO ThreadInfo
@@ -260,7 +263,7 @@ TppEvaluateScaling(
 static VOID
 TppDefaultWorkExecutor(
     _In_ PTP_THREAD_INFO ThreadInfo,
-    _In_ PKEVENT WorkEvent,
+    _In_ PKSEMAPHORE WorkSemaphore,
     _In_ PKEVENT ShutdownEvent,
     _In_opt_ PVOID ExecutorContext
     );
@@ -380,8 +383,8 @@ TpCreate(
         pool->ScaleWorkItem = IoAllocateWorkItem(pool->DeviceObject);
         if (pool->ScaleWorkItem == NULL) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike:TP] WARNING: No DeviceObject for scale work item. "
-                       "Scaling will be disabled.\n");
+                       "[ShadowStrike:TP] WARNING: IoAllocateWorkItem failed. "
+                       "Automatic scaling will be disabled.\n");
         }
     }
 
@@ -1003,47 +1006,8 @@ TpSetAffinity(
     Pool->AffinityMask = AffinityMask;
 
     //
-    // Apply immediately to all existing threads via ZwSetInformationThread.
-    // KeSetSystemAffinityThread only affects the CALLING thread, so it cannot
-    // be used here. ZwSetInformationThread with ThreadAffinityMask properly
-    // sets the affinity of any thread given its handle.
-    //
-    KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
-
-    for (entry = Pool->ThreadList.Flink;
-         entry != &Pool->ThreadList;
-         entry = entry->Flink) {
-
-        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
-
-        if (threadInfo->ThreadHandle != NULL &&
-            threadInfo->State != TpThreadState_Stopping &&
-            threadInfo->State != TpThreadState_Stopped) {
-
-            //
-            // ZwSetInformationThread requires PASSIVE_LEVEL and cannot be
-            // called under a spinlock. Collect info and apply outside.
-            // But we need the handle to stay valid. Since we hold the list
-            // lock, the thread can't be destroyed, and the handle is valid.
-            // Use a two-pass approach: mark threads, then apply.
-            //
-            // Actually, we can't call Zw* under spinlock. Break approach:
-            // We'll iterate, ref the thread object, release lock, apply, re-lock.
-            // Simpler: since shutdown is checked and pool ref protects pool,
-            // collect handles in a local array and apply after releasing the lock.
-            //
-            // For simplicity and IRQL-safety, defer to signaling approach.
-            //
-            break;
-        }
-    }
-
-    KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
-
-    //
-    // Apply affinity to each thread outside the spinlock.
-    // We iterate the list, reference each thread's handle, and call
-    // ZwSetInformationThread at PASSIVE_LEVEL.
+    // Collect handles under spinlock, then apply at PASSIVE_LEVEL.
+    // ZwSetInformationThread requires PASSIVE_LEVEL — cannot call under spinlock.
     //
     {
         HANDLE threadHandles[TP_MAX_THREADS];
@@ -1344,6 +1308,15 @@ TppCreateThread(
         info
     );
     if (!NT_SUCCESS(status)) {
+        //
+        // Record thread creation failure for performance monitoring
+        //
+        {
+            PSSPM_MONITOR pm = ShadowStrikeGetPerformanceMonitor();
+            if (pm != NULL) {
+                SsPmRecordSample(pm, SsPmMetric_DroppedEvents, 1);
+            }
+        }
         TppReleasePoolReference(Pool);
         ShadowStrikeFreePoolWithTag(info, TP_POOL_TAG_THREAD);
         return status;
@@ -1476,6 +1449,7 @@ TppDestroyThread(
     ShadowStrikeFreePoolWithTag(ThreadInfo, TP_POOL_TAG_THREAD);
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 TppSignalThreadStop(
     _Inout_ PTP_THREAD_INFO ThreadInfo
@@ -1652,12 +1626,12 @@ TppWorkerThreadRoutine(
 
                 //
                 // Execute work.
-                // The executor is called with the semaphore (as PKEVENT-compatible)
+                // The executor receives the work semaphore (auto-decrementing)
                 // and shutdown event so it can implement its own wait loop.
                 //
                 executor(
                     threadInfo,
-                    (PKEVENT)&pool->WorkAvailableSemaphore,
+                    &pool->WorkAvailableSemaphore,
                     &pool->ShutdownEvent,
                     executorContext
                 );
@@ -1766,9 +1740,9 @@ ExitCleanup:
         }
 
         threadInfo->Magic = 0;
+        InterlockedIncrement64(&pool->Stats.ThreadsDestroyed);
         TppReleasePoolReference(pool);
         ShadowStrikeFreePoolWithTag(threadInfo, TP_POOL_TAG_THREAD);
-        InterlockedIncrement64(&pool->Stats.ThreadsDestroyed);
     }
 
     PsTerminateSystemThread(STATUS_SUCCESS);
@@ -2005,13 +1979,13 @@ TppEvaluateScaling(
 static VOID
 TppDefaultWorkExecutor(
     _In_ PTP_THREAD_INFO ThreadInfo,
-    _In_ PKEVENT WorkEvent,
+    _In_ PKSEMAPHORE WorkSemaphore,
     _In_ PKEVENT ShutdownEvent,
     _In_opt_ PVOID ExecutorContext
 )
 {
     UNREFERENCED_PARAMETER(ThreadInfo);
-    UNREFERENCED_PARAMETER(WorkEvent);
+    UNREFERENCED_PARAMETER(WorkSemaphore);
     UNREFERENCED_PARAMETER(ShutdownEvent);
     UNREFERENCED_PARAMETER(ExecutorContext);
 

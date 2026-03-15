@@ -129,13 +129,15 @@ typedef struct _TP_THREAD_INFO TP_THREAD_INFO, *PTP_THREAD_INFO;
 //
 // Parameters:
 //   ThreadInfo      - Opaque per-thread info (for TpGetThreadIndex)
-//   WorkEvent       - Signals when work is available (auto-reset)
+//   WorkSemaphore   - Auto-decrementing semaphore signaled when work is available.
+//                     Use with KeWaitForSingleObject/KeWaitForMultipleObjects.
+//                     Do NOT call KeSetEvent on this — it is a KSEMAPHORE, not a KEVENT.
 //   ShutdownEvent   - Signals when pool is shutting down (manual-reset)
 //   ExecutorContext  - Caller-supplied context from TpSetWorkExecutor
 //
 typedef VOID (*TP_WORK_EXECUTOR)(
     _In_ PTP_THREAD_INFO ThreadInfo,
-    _In_ PKEVENT WorkEvent,
+    _In_ PKSEMAPHORE WorkSemaphore,
     _In_ PKEVENT ShutdownEvent,
     _In_opt_ PVOID ExecutorContext
     );
