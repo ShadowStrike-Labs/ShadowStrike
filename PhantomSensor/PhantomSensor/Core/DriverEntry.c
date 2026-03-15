@@ -1244,6 +1244,47 @@ DriverEntry(
         status = STATUS_SUCCESS;
     } else {
         g_SubsystemFlags |= SubsysFlag_ResourceThrottling;
+
+        //
+        // Configure resource limits for enterprise DoS mitigation.
+        // Limits are absolute usage thresholds per monitor interval (10s).
+        // BurstCapacity controls per-check token bucket rate limiting.
+        //
+        // Process creation: moderate rate, strict limits
+        RtSetLimits(g_ResourceThrottler, RtResourceProcessCreation,
+                    500, 1000, 2000);
+        RtSetRateConfig(g_ResourceThrottler, RtResourceProcessCreation,
+                        1000, 500);
+        RtEnableResource(g_ResourceThrottler, RtResourceProcessCreation, TRUE);
+
+        // Registry operations: high-volume callback
+        RtSetLimits(g_ResourceThrottler, RtResourceRegOps,
+                    50000, 100000, 200000);
+        RtSetRateConfig(g_ResourceThrottler, RtResourceRegOps,
+                        1000, 50000);
+        RtEnableResource(g_ResourceThrottler, RtResourceRegOps, TRUE);
+
+        // Filesystem operations: highest volume
+        RtSetLimits(g_ResourceThrottler, RtResourceFsOps,
+                    100000, 200000, 500000);
+        RtSetRateConfig(g_ResourceThrottler, RtResourceFsOps,
+                        1000, 100000);
+        RtEnableResource(g_ResourceThrottler, RtResourceFsOps, TRUE);
+
+        // Callback rate (image load notifications)
+        RtSetLimits(g_ResourceThrottler, RtResourceCallbackRate,
+                    50000, 100000, 200000);
+        RtSetRateConfig(g_ResourceThrottler, RtResourceCallbackRate,
+                        1000, 50000);
+        RtEnableResource(g_ResourceThrottler, RtResourceCallbackRate, TRUE);
+
+        // Handle operations (object callback rate)
+        RtSetLimits(g_ResourceThrottler, RtResourceHandleOps,
+                    50000, 100000, 200000);
+        RtSetRateConfig(g_ResourceThrottler, RtResourceHandleOps,
+                        1000, 50000);
+        RtEnableResource(g_ResourceThrottler, RtResourceHandleOps, TRUE);
+
         ShadowStrikeLogInitStatus("Resource Throttling", STATUS_SUCCESS);
     }
 
@@ -3200,6 +3241,13 @@ PSSPM_MONITOR
 ShadowStrikeGetPerformanceMonitor(VOID)
 {
     return g_PerformanceMonitor;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PRT_THROTTLER
+ShadowStrikeGetResourceThrottler(VOID)
+{
+    return g_ResourceThrottler;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

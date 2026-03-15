@@ -203,6 +203,7 @@ typedef struct _EC_CONSUMER EC_CONSUMER, *PEC_CONSUMER;
 typedef struct _ES_SCHEMA ES_SCHEMA, *PES_SCHEMA;
 typedef struct _LL_MANAGER LL_MANAGER, *PLL_MANAGER;
 typedef struct _SSPM_MONITOR SSPM_MONITOR, *PSSPM_MONITOR;
+typedef struct _RT_THROTTLER RT_THROTTLER, *PRT_THROTTLER;
 
 // ============================================================================
 // DRIVER LIFECYCLE FUNCTIONS
@@ -550,6 +551,15 @@ ShadowStrikeBatchSendNotification(
 _IRQL_requires_max_(DISPATCH_LEVEL)
 PSSPM_MONITOR
 ShadowStrikeGetPerformanceMonitor(VOID);
+
+/**
+ * @brief Get the global resource throttler for DoS mitigation.
+ * @return PRT_THROTTLER or NULL if not initialized.
+ * @note Consumers call RtReportUsage/RtShouldProceed at <= DISPATCH_LEVEL.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PRT_THROTTLER
+ShadowStrikeGetResourceThrottler(VOID);
 
 /**
  * @brief Get the centralized timer manager for periodic/one-shot timers.

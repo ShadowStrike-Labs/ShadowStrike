@@ -83,6 +83,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../Core/DriverEntry.h"
 #include "../../Performance/PerformanceMonitor.h"
+#include "../../Performance/ResourceThrottling.h"
 #include "../../Sync/TimerManager.h"
 #include "../FileSystem/FileBackupEngine.h"
 #include "../FileSystem/FileSystemCallbacks.h"
@@ -1034,6 +1035,18 @@ Arguments:
     }
 
     SSPM_LATENCY_BEGIN(proc);
+
+    //
+    // Report process lifecycle to ResourceThrottling for DoS mitigation.
+    // +1 on creation, -1 on termination tracks concurrent process load.
+    //
+    {
+        PRT_THROTTLER rtThrottler = ShadowStrikeGetResourceThrottler();
+        if (rtThrottler != NULL) {
+            RtReportUsage(rtThrottler, RtResourceProcessCreation,
+                          IsCreation ? 1 : -1);
+        }
+    }
 
     //
     // Handle process termination
@@ -3813,6 +3826,18 @@ PnpHandleProcessTermination(
     // Prevents DNS_PROCESS_CONTEXT accumulation and stale tunneling state.
     //
     {
+
+    //
+    // Remove ResourceThrottling per-process quota for this process.
+    // Prevents RT_PROCESS_QUOTA accumulation (~310 bytes each) and
+    // stale throttle state surviving PID recycle.
+    //
+    {
+        PRT_THROTTLER rtThrottler = ShadowStrikeGetResourceThrottler();
+        if (rtThrottler != NULL) {
+            RtRemoveProcess(rtThrottler, ProcessId);
+        }
+    }
         PDNS_MONITOR dnsMon = NfFilterGetDnsMonitor();
         if (dnsMon != NULL) {
             DnsProcessTerminated(dnsMon, ProcessId);

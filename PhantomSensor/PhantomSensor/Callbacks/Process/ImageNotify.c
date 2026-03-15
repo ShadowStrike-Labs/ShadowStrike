@@ -62,6 +62,7 @@
 #include "../../Core/DriverEntry.h"
 #include "../../Performance/CacheOptimization.h"
 #include "../../Performance/PerformanceMonitor.h"
+#include "../../Performance/ResourceThrottling.h"
 
 //
 // Forward declarations for undocumented but exported ntoskrnl APIs
@@ -1989,6 +1990,16 @@ Arguments:
     }
 
     SSPM_LATENCY_BEGIN(img);
+
+    //
+    // Track image load callback rate for DoS mitigation
+    //
+    {
+        PRT_THROTTLER rtThrottler = ShadowStrikeGetResourceThrottler();
+        if (rtThrottler != NULL) {
+            RtReportUsage(rtThrottler, RtResourceCallbackRate, 1);
+        }
+    }
 
     //
     // Emit image load event into ETW consumer pipeline for centralized

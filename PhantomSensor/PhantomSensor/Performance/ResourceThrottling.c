@@ -130,6 +130,19 @@ static VOID RtpProcessDeferredWorkQueue(_Inout_ PRT_THROTTLER Throttler);
 static VOID RtpDrainDeferredWorkQueue(_Inout_ PRT_THROTTLER Throttler);
 static VOID RtpDrainProcessQuotas(_Inout_ PRT_THROTTLER Throttler);
 
+//
+// Locked lookup: returns quota with ProcessQuotas.Lock HELD.
+// Caller MUST release via KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, OldIrql).
+// Returns NULL with lock RELEASED if not found.
+//
+_IRQL_raises_(DISPATCH_LEVEL)
+static PRT_PROCESS_QUOTA
+RtpLookupProcessQuotaLocked(
+    _In_ PRT_THROTTLER Throttler,
+    _In_ HANDLE ProcessId,
+    _Out_ PKIRQL OldIrql
+);
+
 // ============================================================================
 // STATIC STRING TABLES (bounds checked via C_ASSERT)
 // ============================================================================
@@ -637,12 +650,17 @@ RtUnregisterCallback(
     KeReleaseSpinLock(&Throttler->CallbackSpinLock, oldIrql);
 
     //
-    // Wait for any in-flight callback invocations to complete
+    // Wait for any in-flight callback invocations to complete.
+    // Timeout after 5 seconds to prevent infinite hang on stuck callbacks.
     //
-    while (Throttler->CallbackActiveCount > 0) {
-        LARGE_INTEGER delay;
-        delay.QuadPart = -10000; // 1ms
-        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    {
+        ULONG waitAttempts = 0;
+        while (Throttler->CallbackActiveCount > 0 && waitAttempts < 5000) {
+            LARGE_INTEGER delay;
+            delay.QuadPart = -10000; // 1ms
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            waitAttempts++;
+        }
     }
 }
 
@@ -1028,6 +1046,7 @@ RtReportProcessUsage(
 {
     PRT_PROCESS_QUOTA quota;
     LARGE_INTEGER currentTime;
+    KIRQL oldIrql;
 
     if (!RtIsValidThrottler(Throttler)) {
         return STATUS_INVALID_PARAMETER;
@@ -1039,15 +1058,35 @@ RtReportProcessUsage(
 
     RtReportUsage(Throttler, Resource, Delta);
 
-    quota = RtpFindOrCreateProcessQuota(Throttler, ProcessId, TRUE);
+    //
+    // Use locked lookup to prevent UAF: if RtRemoveProcess runs
+    // concurrently, it cannot free the quota while we hold the lock.
+    //
+    quota = RtpLookupProcessQuotaLocked(Throttler, ProcessId, &oldIrql);
     if (quota == NULL) {
-        return STATUS_SUCCESS;
+        //
+        // No existing quota — try create via the full lookup path.
+        // RtpFindOrCreateProcessQuota allocates under the lock, which is safe.
+        //
+        quota = RtpFindOrCreateProcessQuota(Throttler, ProcessId, TRUE);
+        if (quota == NULL) {
+            return STATUS_SUCCESS;
+        }
+        //
+        // RtpFindOrCreateProcessQuota released the lock. Re-acquire
+        // for the update. The quota is either found (existing) or just
+        // inserted — RtRemoveProcess cannot race here because the process
+        // is still running if it's reporting usage.
+        //
+        KeAcquireSpinLock(&Throttler->ProcessQuotas.Lock, &oldIrql);
     }
 
     InterlockedAdd64(&quota->ResourceUsage[Resource], Delta);
 
     KeQuerySystemTime(&currentTime);
     quota->LastActivity = currentTime;
+
+    KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
 
     return STATUS_SUCCESS;
 }
@@ -1063,6 +1102,10 @@ RtCheckProcessThrottle(
 )
 {
     PRT_PROCESS_QUOTA quota;
+    KIRQL oldIrql;
+    BOOLEAN exempt;
+    ULONG64 softLimit;
+    LONG64 usage;
 
     if (Action == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1078,25 +1121,35 @@ RtCheckProcessThrottle(
         return STATUS_INVALID_PARAMETER;
     }
 
-    quota = RtpFindProcessQuota(Throttler, ProcessId);
+    //
+    // Use locked lookup to prevent UAF: snapshot all needed quota
+    // fields while holding ProcessQuotas.Lock, then release.
+    //
+    quota = RtpLookupProcessQuotaLocked(Throttler, ProcessId, &oldIrql);
     if (quota == NULL) {
         return RtCheckThrottle(Throttler, Resource, RtPriorityNormal, Action);
     }
 
-    if (quota->Exempt) {
+    exempt = quota->Exempt;
+    softLimit = quota->ProcessSoftLimit[Resource];
+    usage = quota->ResourceUsage[Resource];
+
+    if (!exempt && softLimit != 0 && (ULONG64)usage >= softLimit) {
+        InterlockedIncrement64(&quota->ThrottleHits);
+    }
+
+    KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
+
+    //
+    // Process snapshotted data outside lock
+    //
+    if (exempt) {
         return STATUS_SUCCESS;
     }
 
-    //
-    // Check per-process limits if configured
-    //
-    if (quota->ProcessSoftLimit[Resource] != 0) {
-        LONG64 usage = quota->ResourceUsage[Resource];
-
-        if ((ULONG64)usage >= quota->ProcessSoftLimit[Resource]) {
-            InterlockedIncrement64(&quota->ThrottleHits);
-
-            if ((ULONG64)usage >= quota->ProcessSoftLimit[Resource] * 2) {
+    if (softLimit != 0) {
+        if ((ULONG64)usage >= softLimit) {
+            if ((ULONG64)usage >= softLimit * 2) {
                 *Action = RtActionAbort;
                 return STATUS_QUOTA_EXCEEDED;
             }
@@ -1121,6 +1174,7 @@ RtSetProcessExemption(
 )
 {
     PRT_PROCESS_QUOTA quota;
+    KIRQL oldIrql;
 
     PAGED_CODE();
 
@@ -1128,11 +1182,28 @@ RtSetProcessExemption(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Use locked lookup first. If not found, create via the full path
+    // (which allocates under lock and returns with lock released).
+    //
+    quota = RtpLookupProcessQuotaLocked(Throttler, ProcessId, &oldIrql);
+    if (quota != NULL) {
+        quota->Exempt = Exempt;
+        KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Not found — create. RtpFindOrCreateProcessQuota handles its own locking.
+    //
     quota = RtpFindOrCreateProcessQuota(Throttler, ProcessId, TRUE);
     if (quota == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    //
+    // Just created — no concurrent free possible yet. Safe to write.
+    //
     quota->Exempt = Exempt;
 
     return STATUS_SUCCESS;
@@ -1376,22 +1447,26 @@ RtResetStatistics(
 
     KeAcquireSpinLock(&Throttler->StatsLock, &oldIrql);
 
-    InterlockedExchange64(&Throttler->Stats.TotalOperations, 0);
-    InterlockedExchange64(&Throttler->Stats.ThrottledOperations, 0);
-    InterlockedExchange64(&Throttler->Stats.DelayedOperations, 0);
-    InterlockedExchange64(&Throttler->Stats.QueuedOperations, 0);
-    InterlockedExchange64(&Throttler->Stats.SkippedOperations, 0);
-    InterlockedExchange64(&Throttler->Stats.AbortedOperations, 0);
-    InterlockedExchange64(&Throttler->Stats.TotalDelayMs, 0);
-    InterlockedExchange64(&Throttler->Stats.StateTransitions, 0);
-    InterlockedExchange64(&Throttler->Stats.AlertsSent, 0);
-    InterlockedExchange64(&Throttler->Stats.DeferredWorkProcessed, 0);
-    InterlockedExchange64(&Throttler->Stats.DeferredWorkExpired, 0);
+    //
+    // Under exclusive spin lock — plain stores are safe and cheaper
+    // than Interlocked* (no bus-lock overhead on multi-core).
+    //
+    Throttler->Stats.TotalOperations = 0;
+    Throttler->Stats.ThrottledOperations = 0;
+    Throttler->Stats.DelayedOperations = 0;
+    Throttler->Stats.QueuedOperations = 0;
+    Throttler->Stats.SkippedOperations = 0;
+    Throttler->Stats.AbortedOperations = 0;
+    Throttler->Stats.TotalDelayMs = 0;
+    Throttler->Stats.StateTransitions = 0;
+    Throttler->Stats.AlertsSent = 0;
+    Throttler->Stats.DeferredWorkProcessed = 0;
+    Throttler->Stats.DeferredWorkExpired = 0;
 
     for (i = 0; i < RT_MAX_RESOURCE_TYPES; i++) {
-        InterlockedExchange64(&Throttler->Stats.PerResource[i].Checks, 0);
-        InterlockedExchange64(&Throttler->Stats.PerResource[i].Throttles, 0);
-        InterlockedExchange64(&Throttler->Stats.PerResource[i].PeakUsage, 0);
+        Throttler->Stats.PerResource[i].Checks = 0;
+        Throttler->Stats.PerResource[i].Throttles = 0;
+        Throttler->Stats.PerResource[i].PeakUsage = 0;
     }
 
     KeQuerySystemTime(&Throttler->Stats.StartTime);
@@ -1976,6 +2051,48 @@ RtpNotifyCallback(
         InterlockedIncrement64(&Throttler->Stats.AlertsSent);
         InterlockedDecrement(&Throttler->CallbackActiveCount);
     }
+}
+
+/**
+ * @brief Locked lookup: find process quota and return with lock HELD.
+ *
+ * The caller MUST release the lock via:
+ *   KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, OldIrql);
+ *
+ * This prevents use-after-free if RtRemoveProcess runs concurrently
+ * (the quota cannot be freed while we hold the lock).
+ *
+ * Returns NULL with lock RELEASED if entry is not found.
+ */
+_IRQL_raises_(DISPATCH_LEVEL)
+static PRT_PROCESS_QUOTA
+RtpLookupProcessQuotaLocked(
+    _In_ PRT_THROTTLER Throttler,
+    _In_ HANDLE ProcessId,
+    _Out_ PKIRQL OldIrql
+)
+{
+    ULONG bucket;
+    PLIST_ENTRY entry;
+    PRT_PROCESS_QUOTA quota;
+
+    bucket = RtpHashProcessId(ProcessId);
+
+    KeAcquireSpinLock(&Throttler->ProcessQuotas.Lock, OldIrql);
+
+    for (entry = Throttler->ProcessQuotas.HashBuckets[bucket].Flink;
+         entry != &Throttler->ProcessQuotas.HashBuckets[bucket];
+         entry = entry->Flink) {
+
+        quota = CONTAINING_RECORD(entry, RT_PROCESS_QUOTA, HashLink);
+
+        if (quota->ProcessId == ProcessId && quota->InUse) {
+            return quota;  // Lock still held — caller MUST release
+        }
+    }
+
+    KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, *OldIrql);
+    return NULL;
 }
 
 /**
