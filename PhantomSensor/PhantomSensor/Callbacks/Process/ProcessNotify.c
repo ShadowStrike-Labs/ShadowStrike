@@ -76,6 +76,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Behavioral/ThreatScoring.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Behavioral/PatternMatcher.h"
 #include "WSLMonitor.h"
 #include "AppControl.h"
 #include "ClipboardMonitor.h"
@@ -3854,6 +3855,19 @@ PnpHandleProcessTermination(
         PDNS_MONITOR dnsMon = NfFilterGetDnsMonitor();
         if (dnsMon != NULL) {
             DnsProcessTerminated(dnsMon, ProcessId);
+        }
+    }
+
+    //
+    // Clean up PatternMatcher per-process match states for this process.
+    // Without cleanup, partial match states (PM_MATCH_STATE_INTERNAL) accumulate
+    // in NonPaged pool indefinitely — each ~600 bytes with event tracking arrays.
+    // Also prevents stale PIDs from producing false behavioral matches after recycle.
+    //
+    {
+        PPM_MATCHER pmMatcher = BeGetPatternMatcher();
+        if (pmMatcher != NULL) {
+            PmCleanupProcessStates(pmMatcher, ProcessId);
         }
     }
 

@@ -35,11 +35,11 @@ extern "C" {
 #include <ntstrsafe.h>
 
 //
-// Pool tags
+// Pool tags (PTM_ prefix to avoid collision with PrivilegeMonitor PM_POOL_TAG)
 //
-#define PM_POOL_TAG                     'MPMP'
-#define PM_POOL_TAG_STATE               'tSMP'
-#define PM_POOL_TAG_INDEX               'xIMP'
+#define PTM_POOL_TAG                    'MPMP'
+#define PTM_POOL_TAG_STATE              'tSMP'
+#define PTM_POOL_TAG_INDEX              'xIMP'
 
 //
 // Limits

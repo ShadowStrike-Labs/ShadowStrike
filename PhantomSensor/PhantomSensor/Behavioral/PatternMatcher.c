@@ -300,6 +300,7 @@ PmpUnindexPattern(
     _In_ PPM_PATTERN Pattern
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 PmpCleanupTimerCallback(
     _In_ ULONG TimerId,
@@ -370,7 +371,7 @@ PtmInitialize(
     matcher = (PPM_MATCHER_INTERNAL)ExAllocatePoolZero(
         NonPagedPoolNx,
         sizeof(PM_MATCHER_INTERNAL),
-        PM_POOL_TAG
+        PTM_POOL_TAG
     );
 
     if (matcher == NULL) {
@@ -431,7 +432,7 @@ PtmInitialize(
         NULL,
         POOL_NX_ALLOCATION,
         sizeof(PM_PATTERN),
-        PM_POOL_TAG,
+        PTM_POOL_TAG,
         PM_LOOKASIDE_DEPTH
     );
 
@@ -441,7 +442,7 @@ PtmInitialize(
         NULL,
         POOL_NX_ALLOCATION,
         sizeof(PM_MATCH_STATE_INTERNAL),
-        PM_POOL_TAG_STATE,
+        PTM_POOL_TAG_STATE,
         PM_LOOKASIDE_DEPTH
     );
 
@@ -451,7 +452,7 @@ PtmInitialize(
         NULL,
         POOL_NX_ALLOCATION,
         sizeof(PM_PATTERN_INDEX_ENTRY),
-        PM_POOL_TAG_INDEX,
+        PTM_POOL_TAG_INDEX,
         PM_LOOKASIDE_DEPTH
     );
 
@@ -547,7 +548,7 @@ InitFailed:
         ExDeleteNPagedLookasideList(&matcher->StateLookaside);
         ExDeleteNPagedLookasideList(&matcher->IndexEntryLookaside);
     }
-    ExFreePoolWithTag(matcher, PM_POOL_TAG);
+    ExFreePoolWithTag(matcher, PTM_POOL_TAG);
     return status;
 }
 
@@ -669,7 +670,7 @@ PtmShutdown(
         if (matcher->LookasideInitialized) {
             ExFreeToNPagedLookasideList(&matcher->StateLookaside, state);
         } else {
-            ExFreePoolWithTag(state, PM_POOL_TAG_STATE);
+            ExFreePoolWithTag(state, PTM_POOL_TAG_STATE);
         }
     }
 
@@ -698,7 +699,7 @@ PtmShutdown(
         if (matcher->LookasideInitialized) {
             ExFreeToNPagedLookasideList(&matcher->IndexEntryLookaside, indexEntry);
         } else {
-            ExFreePoolWithTag(indexEntry, PM_POOL_TAG_INDEX);
+            ExFreePoolWithTag(indexEntry, PTM_POOL_TAG_INDEX);
         }
     }
 
@@ -725,7 +726,7 @@ PtmShutdown(
         if (matcher->LookasideInitialized) {
             ExFreeToNPagedLookasideList(&matcher->PatternLookaside, pattern);
         } else {
-            ExFreePoolWithTag(pattern, PM_POOL_TAG);
+            ExFreePoolWithTag(pattern, PTM_POOL_TAG);
         }
     }
 
@@ -741,7 +742,7 @@ PtmShutdown(
     //
     // Free matcher structure
     //
-    ExFreePoolWithTag(matcher, PM_POOL_TAG);
+    ExFreePoolWithTag(matcher, PTM_POOL_TAG);
 }
 
 // ============================================================================
@@ -1106,86 +1107,78 @@ PmSubmitEvent(
     ExReleasePushLockShared(&matcher->ProcessStateHash.Lock);
 
     //
-    // Phase 1: Check existing active states for this process
+    // Phase 1: Collect active states for this process under shared lock,
+    // then process outside lock. This replaces the prior lock-drop-restart
+    // pattern that caused O(n²) re-scanning and potential double-processing.
     //
-    ExAcquirePushLockShared(&Matcher->StateLock);
+    {
+        PPM_MATCH_STATE_INTERNAL collectedStates[PM_MAX_STATES_PER_PROCESS];
+        ULONG collectedCount = 0;
+        ULONG ci;
 
-    for (stateEntry = Matcher->StateList.Flink;
-         stateEntry != &Matcher->StateList;
-         stateEntry = stateEntry->Flink) {
+        ExAcquirePushLockShared(&Matcher->StateLock);
 
-        state = CONTAINING_RECORD(stateEntry, PM_MATCH_STATE_INTERNAL, Public.ListEntry);
+        for (stateEntry = Matcher->StateList.Flink;
+             stateEntry != &Matcher->StateList;
+             stateEntry = stateEntry->Flink) {
 
-        if (state->Public.ProcessId != ProcessId) {
-            continue;
-        }
+            state = CONTAINING_RECORD(stateEntry, PM_MATCH_STATE_INTERNAL, Public.ListEntry);
 
-        if (state->Public.IsComplete || state->IsStale || state->IsRemoved) {
-            continue;
-        }
-
-        //
-        // Reference state while we work with it
-        //
-        PmpReferenceState(state);
-
-        //
-        // Release lock while checking constraints (may be expensive)
-        //
-        ExReleasePushLockShared(&Matcher->StateLock);
-
-        pattern = state->Public.Pattern;
-
-        //
-        // Try to match against expected events
-        //
-        for (i = state->Public.CurrentEventIndex;
-             i < pattern->EventCount && i < PM_MAX_EVENTS_PER_PATTERN;
-             i++) {
-
-            if (state->EventMatched[i]) {
+            if (state->Public.ProcessId != ProcessId) {
                 continue;
             }
 
-            if (PmpCheckEventConstraint(
-                    matcher,
-                    &pattern->Events[i],
-                    Type,
-                    Path,
-                    Value,
-                    state,
-                    &currentTime)) {
-
-                //
-                // Event matches - advance state
-                //
-                PmpAdvanceMatchState(state, i, &currentTime);
-                PmpCheckPatternComplete(matcher, state, &currentTime);
-                break;
+            if (state->Public.IsComplete || state->IsStale || state->IsRemoved) {
+                continue;
             }
 
-            //
-            // If exact order required and not optional, stop checking
-            //
-            if (pattern->RequireExactOrder && !pattern->Events[i].Optional) {
+            PmpReferenceState(state);
+            collectedStates[collectedCount++] = state;
+
+            if (collectedCount >= PM_MAX_STATES_PER_PROCESS) {
                 break;
             }
         }
 
-        //
-        // Release our reference
-        //
-        PmpDereferenceState(matcher, state);
+        ExReleasePushLockShared(&Matcher->StateLock);
 
         //
-        // Re-acquire lock and restart iteration
-        // (list may have changed while lock was released)
+        // Process all collected states outside lock — each state is ref-held
         //
-        ExAcquirePushLockShared(&Matcher->StateLock);
-        stateEntry = &Matcher->StateList;  // Restart from beginning
+        for (ci = 0; ci < collectedCount; ci++) {
+            state = collectedStates[ci];
+            pattern = state->Public.Pattern;
+
+            for (i = state->Public.CurrentEventIndex;
+                 i < pattern->EventCount && i < PM_MAX_EVENTS_PER_PATTERN;
+                 i++) {
+
+                if (state->EventMatched[i]) {
+                    continue;
+                }
+
+                if (PmpCheckEventConstraint(
+                        matcher,
+                        &pattern->Events[i],
+                        Type,
+                        Path,
+                        Value,
+                        state,
+                        &currentTime)) {
+
+                    PmpAdvanceMatchState(state, i, &currentTime);
+                    PmpCheckPatternComplete(matcher, state, &currentTime);
+                    break;
+                }
+
+                if (pattern->RequireExactOrder && !pattern->Events[i].Optional) {
+                    break;
+                }
+            }
+
+            PmpDereferenceState(matcher, state);
+        }
     }
-
-    ExReleasePushLockShared(&Matcher->StateLock);
 
     //
     // Phase 2: Check if this event starts any new patterns
@@ -1715,7 +1708,7 @@ PmpDereferenceState(
         if (Matcher->LookasideInitialized) {
             ExFreeToNPagedLookasideList(&Matcher->StateLookaside, State);
         } else {
-            ExFreePoolWithTag(State, PM_POOL_TAG_STATE);
+            ExFreePoolWithTag(State, PTM_POOL_TAG_STATE);
         }
 
         InterlockedIncrement64(&Matcher->Public.Stats.StatesCleanedUp);
@@ -2087,6 +2080,10 @@ PmpIndexPattern(
                     &indexEntry->ListEntry
                 );
                 Matcher->PatternIndex[eventType].Count++;
+            } else {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[ShadowStrike:PatternMatcher] Index entry alloc failed for pattern '%s' event %lu — detection gap\n",
+                    Pattern->PatternId, i);
             }
         }
     }
@@ -2144,7 +2141,7 @@ PmpUnindexPattern(
         if (Matcher->LookasideInitialized) {
             ExFreeToNPagedLookasideList(&Matcher->IndexEntryLookaside, indexEntry);
         } else {
-            ExFreePoolWithTag(indexEntry, PM_POOL_TAG_INDEX);
+            ExFreePoolWithTag(indexEntry, PTM_POOL_TAG_INDEX);
         }
     }
 }
@@ -2196,6 +2193,7 @@ PmpRemoveStateFromProcessHash(
     ExReleasePushLockExclusive(&Matcher->ProcessStateHash.Lock);
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 PmpCleanupTimerCallback(
     _In_ ULONG TimerId,
@@ -2204,7 +2202,8 @@ PmpCleanupTimerCallback(
 /**
  * @brief TimerManager callback for periodic cleanup.
  *
- * Signals the dedicated worker thread to perform cleanup at PASSIVE_LEVEL.
+ * Runs at DISPATCH_LEVEL (DPC context from TimerManager).
+ * Only signals the worker event — actual cleanup at PASSIVE_LEVEL in worker thread.
  */
 {
     PPM_MATCHER_INTERNAL matcher = (PPM_MATCHER_INTERNAL)Context;
@@ -2285,7 +2284,7 @@ PmpDereferencePattern(
         if (Matcher->LookasideInitialized) {
             ExFreeToNPagedLookasideList(&Matcher->PatternLookaside, Pattern);
         } else {
-            ExFreePoolWithTag(Pattern, PM_POOL_TAG);
+            ExFreePoolWithTag(Pattern, PTM_POOL_TAG);
         }
     }
 }
@@ -2405,7 +2404,12 @@ PmpGetElapsedMs(
 
     //
     // Convert to milliseconds: (elapsed * 1000) / frequency
-    // Use careful ordering to avoid overflow
+    // For large elapsed values (overflow risk), divide first with reduced precision.
+    // For normal values, multiply first for full precision.
     //
-    return (elapsed / (frequency / 1000));
+    if (elapsed > (MAXLONGLONG / 1000)) {
+        return (elapsed / frequency) * 1000;
+    }
+
+    return (elapsed * 1000) / frequency;
 }

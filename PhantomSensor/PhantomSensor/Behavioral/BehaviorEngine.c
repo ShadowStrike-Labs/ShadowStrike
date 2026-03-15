@@ -560,6 +560,9 @@ BepGetProcessName(
 // PUBLIC API - INITIALIZATION
 // ============================================================================
 
+// Forward declaration for pattern match callback (defined after BepProcessSingleEvent)
+static VOID BepPatternMatchCallback(_In_ PPM_PATTERN, _In_ PPM_MATCH_STATE, _In_opt_ PVOID);
+
 /**
  * @brief Initialize the behavioral engine.
  *
@@ -764,6 +767,12 @@ BeEngineInitialize(
                        "[ShadowStrike:BehaviorEngine] PatternMatcher init failed: 0x%08X\n",
                        childStatus);
             g_PatternMatcher = NULL;
+        } else {
+            //
+            // Register completion callback — routes pattern matches into
+            // BehaviorEngine stats and logging.
+            //
+            (VOID)PmRegisterCallback(g_PatternMatcher, BepPatternMatchCallback, NULL);
         }
     }
 
@@ -2530,6 +2539,126 @@ BepProcessEventBatch(
 }
 
 /**
+ * @brief Map BehaviorEngine event type to PatternMatcher event type.
+ *
+ * Translates the sparse BEHAVIOR_EVENT_TYPE enum (hex ranges) to the dense
+ * PM_EVENT_TYPE enum for pattern index lookup. Returns PmEvent_Custom for
+ * events that have no specific behavioral pattern mapping (indexed and
+ * processed normally as custom events).
+ */
+static PM_EVENT_TYPE
+BepMapToPmEventType(
+    _In_ BEHAVIOR_EVENT_TYPE BeType
+    )
+{
+    switch (BeType) {
+    case BehaviorEvent_ProcessCreate:
+    case BehaviorEvent_ChildProcessSpawn:
+        return PmEvent_ProcessCreate;
+
+    case BehaviorEvent_ProcessTerminate:
+        return PmEvent_ProcessTerminate;
+
+    case BehaviorEvent_RemoteThreadCreate:
+    case BehaviorEvent_ThreadExecutionHijack:
+    case BehaviorEvent_EarlyBirdInjection:
+        return PmEvent_ThreadCreate;
+
+    case BehaviorEvent_DriverLoad:
+    case BehaviorEvent_ReflectiveDLLLoad:
+    case BehaviorEvent_ModuleStomping:
+        return PmEvent_ImageLoad;
+
+    case BehaviorEvent_RansomwareBehavior:
+    case BehaviorEvent_MassFileEncryption:
+    case BehaviorEvent_HiddenFileCreation:
+    case BehaviorEvent_StartupFolderDrop:
+    case BehaviorEvent_AlternateDataStream:
+        return PmEvent_FileCreate;
+
+    case BehaviorEvent_MassFileDeletion:
+    case BehaviorEvent_BackupDeletion:
+    case BehaviorEvent_VSSDestruction:
+    case BehaviorEvent_LogDeletion:
+        return PmEvent_FileDelete;
+
+    case BehaviorEvent_RegistryRunKey:
+    case BehaviorEvent_ServicePersistence:
+    case BehaviorEvent_WMISubscription:
+    case BehaviorEvent_ImageFilePersistence:
+    case BehaviorEvent_COMHijacking:
+        return PmEvent_RegistryWrite;
+
+    case BehaviorEvent_ScheduledTaskPersistence:
+    case BehaviorEvent_ScheduledTaskCreate:
+        return PmEvent_RegistryCreate;
+
+    case BehaviorEvent_C2Communication:
+    case BehaviorEvent_DNSTunneling:
+    case BehaviorEvent_DGADomain:
+    case BehaviorEvent_Beaconing:
+    case BehaviorEvent_ReverseShell:
+    case BehaviorEvent_DataExfiltration:
+    case BehaviorEvent_TorConnection:
+        return PmEvent_NetworkConnect;
+
+    case BehaviorEvent_PortScanning:
+        return PmEvent_NetworkListen;
+
+    case BehaviorEvent_SuspiciousAllocation:
+    case BehaviorEvent_RWXMemory:
+    case BehaviorEvent_UnbackedExecutable:
+    case BehaviorEvent_HeapSprayDetected:
+        return PmEvent_MemoryAllocate;
+
+    case BehaviorEvent_MemoryProtectionChange:
+    case BehaviorEvent_DEPViolation:
+        return PmEvent_MemoryProtect;
+
+    case BehaviorEvent_ProcessHollowing:
+    case BehaviorEvent_ProcessDoppelganging:
+        return PmEvent_HandleDuplicate;
+
+    default:
+        return PmEvent_Custom;
+    }
+}
+
+/**
+ * @brief Pattern match completion callback.
+ *
+ * Routes completed behavioral pattern matches into the logging and stats pipeline.
+ * Runs at PASSIVE_LEVEL from PmpCheckPatternComplete → PmpNotifyCallback.
+ */
+static VOID
+BepPatternMatchCallback(
+    _In_ PPM_PATTERN Pattern,
+    _In_ PPM_MATCH_STATE State,
+    _In_opt_ PVOID Context
+    )
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    if (Pattern == NULL || State == NULL) {
+        return;
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike:BehaviorEngine] PatternMatch: id='%s' name='%s' PID=%p score=%lu events=%lu/%lu MITRE=%s\n",
+        Pattern->PatternId,
+        Pattern->PatternName,
+        State->ProcessId,
+        Pattern->ThreatScore,
+        State->MatchedEvents,
+        Pattern->EventCount,
+        Pattern->MITRETechnique);
+
+    InterlockedIncrement64(&Pattern->MatchCount);
+    InterlockedIncrement64(&g_BeState.TotalThreatsDetected);
+    InterlockedIncrement64(&g_BeState.TotalRuleMatches);
+}
+
+/**
  * @brief Process a single event.
  */
 static NTSTATUS
@@ -2610,6 +2739,34 @@ BepProcessSingleEvent(
             Event->EventData,
             Event->EventDataSize
         );
+    }
+
+    //
+    // === Behavioral Pattern Matcher Submission ===
+    // Feed every event to the PatternMatcher for multi-event behavioral sequence
+    // detection. PatternMatcher correlates temporal event chains (e.g., create →
+    // inject → execute → encrypt) into high-confidence attack patterns with
+    // configurable time windows and per-process state tracking.
+    //
+    // IRQL: PASSIVE_LEVEL (worker thread) — PmSubmitEvent requires <= PASSIVE_LEVEL.
+    //
+    if (g_PatternMatcher != NULL) {
+        PM_EVENT_TYPE pmType = BepMapToPmEventType(Event->EventType);
+
+        if (pmType < PmEvent_MaxType) {
+            UNICODE_STRING procName;
+
+            processContext->ImagePath[MAX_FILE_PATH_LENGTH - 1] = L'\0';
+            RtlInitUnicodeString(&procName, processContext->ImagePath);
+
+            (VOID)PmSubmitEvent(
+                g_PatternMatcher,
+                pmType,
+                ULongToHandle(Event->ProcessId),
+                &procName,
+                NULL
+            );
+        }
     }
 
     //
@@ -4043,4 +4200,12 @@ BeGetAttackChainTracker(
     )
 {
     return g_AttackChainTracker;
+}
+
+PPM_MATCHER
+BeGetPatternMatcher(
+    VOID
+    )
+{
+    return g_PatternMatcher;
 }
