@@ -2136,6 +2136,19 @@ DriverEntry(
     } else {
         g_InitFlags |= InitFlag_AntiUnloadInitialized;
         ShadowStrikeLogInitStatus("Anti-Unload Protector", STATUS_SUCCESS);
+
+        //
+        // Upgrade to Full protection — registers OB callbacks for handle
+        // stripping on protected PIDs. Basic only nulls DriverUnload.
+        //
+        {
+            NTSTATUS levelStatus = AuSetLevel(g_AntiUnloadProtector, AuLevel_Full);
+            if (!NT_SUCCESS(levelStatus)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] WARNING: AuSetLevel(Full) failed: 0x%08X "
+                           "(continuing at Basic)\n", levelStatus);
+            }
+        }
     }
 
     //
@@ -3262,6 +3275,13 @@ PADB_PROTECTOR
 ShadowStrikeGetAntiDebugProtector(VOID)
 {
     return g_AntiDebugProtector;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PAU_PROTECTOR
+ShadowStrikeGetAntiUnloadProtector(VOID)
+{
+    return g_AntiUnloadProtector;
 }
 
 // ============================================================================

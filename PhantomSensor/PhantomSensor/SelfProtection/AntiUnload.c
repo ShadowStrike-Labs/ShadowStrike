@@ -43,6 +43,8 @@
 
 #include "AntiUnload.h"
 #include <ntstrsafe.h>
+#include "../Behavioral/BehaviorEngine.h"
+#include "../ETW/TelemetryEvents.h"
 
 // ============================================================================
 // WDK KERNEL-MODE MISSING DECLARATIONS
@@ -932,6 +934,33 @@ AupProcessPreCallback(
     }
 
     //
+    // Report to behavioral engine — tamper resistance is defense evasion.
+    // Score higher for terminate (90) vs inject (75).
+    //
+    (VOID)BeEngineSubmitEvent(
+        BehaviorEvent_DisableWindowsDefender,
+        BehaviorCategory_DefenseEvasion,
+        HandleToULong(callerPid),
+        NULL, 0,
+        (attemptType == AuAttempt_ProcessTerminate) ? 90 : 75,
+        FALSE, NULL);
+
+    //
+    // Report to telemetry pipeline for SOC visibility.
+    //
+    (VOID)TeLogTamperAttempt(
+        (attemptType == AuAttempt_ProcessTerminate)
+            ? Tamper_ProcessTerminate
+            : Tamper_HandleAccess,
+        HandleToULong(callerPid),
+        Component_SelfProtection,
+        (UINT64)HandleToULong(targetPid),
+        TRUE,
+        (attemptType == AuAttempt_ProcessTerminate)
+            ? L"Process terminate blocked on protected PID"
+            : L"Process injection access blocked on protected PID");
+
+    //
     // Notify registered callback.
     //
     AupNotifyCallback(protector, attemptType, callerPid);
@@ -1041,6 +1070,30 @@ AupThreadPreCallback(
         if (event != NULL) {
             AupAddEvent(protector, event);
         }
+
+        //
+        // Report to behavioral engine — thread tamper is defense evasion.
+        //
+        (VOID)BeEngineSubmitEvent(
+            BehaviorEvent_DisableWindowsDefender,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(callerPid),
+            NULL, 0,
+            (attemptType == AuAttempt_ThreadTerminate) ? 85 : 70,
+            FALSE, NULL);
+
+        //
+        // Report to telemetry pipeline.
+        //
+        (VOID)TeLogTamperAttempt(
+            Tamper_HandleAccess,
+            HandleToULong(callerPid),
+            Component_SelfProtection,
+            (UINT64)HandleToULong(ownerPid),
+            TRUE,
+            (attemptType == AuAttempt_ThreadTerminate)
+                ? L"Thread terminate blocked on protected PID"
+                : L"Thread injection access blocked on protected PID");
 
         AupNotifyCallback(protector, attemptType, callerPid);
     }

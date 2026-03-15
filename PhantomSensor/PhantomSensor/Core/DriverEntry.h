@@ -650,6 +650,17 @@ _IRQL_requires_max_(APC_LEVEL)
 PADB_PROTECTOR
 ShadowStrikeGetAntiDebugProtector(VOID);
 
+/**
+ * @brief Get the global anti-unload protector instance.
+ * @return PAU_PROTECTOR or NULL if not initialized.
+ * @note Used by ProcessNotify for cleanup on process termination.
+ */
+typedef struct _AU_PROTECTOR AU_PROTECTOR, *PAU_PROTECTOR;
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PAU_PROTECTOR
+ShadowStrikeGetAntiUnloadProtector(VOID);
+
 #ifdef __cplusplus
 }
 #endif

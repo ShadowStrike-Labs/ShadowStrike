@@ -127,6 +127,10 @@ typedef struct _DNS_MONITOR DNS_MONITOR, *PDNS_MONITOR;
 VOID DnsProcessTerminated(_In_ PDNS_MONITOR Monitor, _In_ HANDLE ProcessId);
 struct _DNS_MONITOR* NfFilterGetDnsMonitor(VOID);
 
+typedef struct _AU_PROTECTOR AU_PROTECTOR, *PAU_PROTECTOR;
+VOID AuUnprotectProcess(_In_ PAU_PROTECTOR Protector, _In_ HANDLE ProcessId);
+PAU_PROTECTOR ShadowStrikeGetAntiUnloadProtector(VOID);
+
 static VOID PnpCleanupStaleContexts(VOID);
 
 #ifdef ALLOC_PRAGMA
@@ -3826,6 +3830,11 @@ PnpHandleProcessTermination(
     // Prevents DNS_PROCESS_CONTEXT accumulation and stale tunneling state.
     //
     {
+        PDNS_MONITOR dnsMon = NfFilterGetDnsMonitor();
+        if (dnsMon != NULL) {
+            DnsProcessTerminated(dnsMon, ProcessId);
+        }
+    }
 
     //
     // Remove ResourceThrottling per-process quota for this process.
@@ -3838,9 +3847,17 @@ PnpHandleProcessTermination(
             RtRemoveProcess(rtThrottler, ProcessId);
         }
     }
-        PDNS_MONITOR dnsMon = NfFilterGetDnsMonitor();
-        if (dnsMon != NULL) {
-            DnsProcessTerminated(dnsMon, ProcessId);
+
+    //
+    // Remove protected PID from AntiUnload on process termination.
+    // Without this, terminated processes remain in the 32-slot protected
+    // PID table forever — after 32 registrations the table is permanently
+    // full and AuProtectProcess returns STATUS_INSUFFICIENT_RESOURCES.
+    //
+    {
+        PAU_PROTECTOR auProtector = ShadowStrikeGetAntiUnloadProtector();
+        if (auProtector != NULL) {
+            AuUnprotectProcess(auProtector, ProcessId);
         }
     }
 
