@@ -774,3 +774,31 @@ struct _RE_ENGINE*
 BeGetRuleEngine(
     VOID
     );
+
+/**
+ * @brief Get the global MITRE ATT&CK Mapper instance.
+ *
+ * Returns the mapper initialized by BehaviorEngine. May return NULL
+ * if the mapper failed to initialize or BehaviorEngine is not yet started.
+ *
+ * @return Pointer to MITRE mapper, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _MM_MAPPER*
+BeGetMitreMapper(
+    VOID
+    );
+
+/**
+ * @brief Get the global Attack Chain Tracker instance.
+ *
+ * Returns the tracker initialized by BehaviorEngine. May return NULL
+ * if the tracker failed to initialize or BehaviorEngine is not yet started.
+ *
+ * @return Pointer to attack chain tracker, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _ACT_TRACKER*
+BeGetAttackChainTracker(
+    VOID
+    );

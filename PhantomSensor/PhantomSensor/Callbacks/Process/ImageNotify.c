@@ -56,6 +56,7 @@
 #include "../../Utilities/StringUtils.h"
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Behavioral/IOCMatcher.h"
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../ETW/ETWConsumer.h"
 #include "../../ETW/ETWProvider.h"
@@ -2157,6 +2158,36 @@ Arguments:
         if (ImageNotifyIsVulnerableDriver(event->Sha256Hash)) {
             event->Flags |= ImgFlag_KnownVulnerable;
             event->SuspiciousReasons |= ImgSuspicious_KnownMalware;
+        }
+    }
+
+    //
+    // === IOC Hash Matching ===
+    // Check computed SHA256 against threat intelligence IOC hash database.
+    // IomMatchHash requires PASSIVE_LEVEL — PsLoadImageNotifyRoutine always
+    // runs at PASSIVE_LEVEL inside a critical region.  Guard defensively.
+    // Placed after suspicious-indicator detection so |= does not get overwritten.
+    //
+    if (event->HashesComputed && currentIrql == PASSIVE_LEVEL) {
+        PIOM_MATCHER iocMatcher = BeGetIocMatcher();
+
+        if (iocMatcher != NULL) {
+            IOM_MATCH_RESULT_DATA iocResult;
+
+            RtlZeroMemory(&iocResult, sizeof(iocResult));
+
+            if (IomMatchHash(
+                    iocMatcher,
+                    event->Sha256Hash,
+                    32,
+                    IomType_FileHash_SHA256,
+                    &iocResult
+                    ) == STATUS_SUCCESS) {
+
+                event->Flags |= ImgFlag_KnownVulnerable;
+                event->SuspiciousReasons |= ImgSuspicious_KnownMalware;
+                InterlockedIncrement64(&g_ImgNotify.Stats.SuspiciousImages);
+            }
         }
     }
 
