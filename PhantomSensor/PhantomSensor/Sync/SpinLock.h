@@ -481,16 +481,31 @@ ShadowStrikeInitializeInterruptSpinLock(
     _In_opt_ PKINTERRUPT Interrupt
     );
 
+/**
+ * @brief Acquire interrupt spinlock.
+ *
+ * If Interrupt is non-NULL, raises IRQL to device IRQL via
+ * KeAcquireInterruptSpinLock. Otherwise falls back to
+ * KeAcquireSpinLock (raises to DISPATCH_LEVEL).
+ *
+ * Caller IRQL: any <= device IRQL (interrupt path) or
+ *              any <= DISPATCH_LEVEL (fallback path).
+ */
+_IRQL_raises_(DISPATCH_LEVEL)
+_IRQL_saves_global_(InterruptSpinLock, Lock)
 VOID
 ShadowStrikeAcquireInterruptSpinLock(
     _Inout_ PSHADOWSTRIKE_INTERRUPT_SPINLOCK Lock
     );
 
+_IRQL_requires_min_(DISPATCH_LEVEL)
+_IRQL_restores_global_(InterruptSpinLock, Lock)
 VOID
 ShadowStrikeReleaseInterruptSpinLock(
     _Inout_ PSHADOWSTRIKE_INTERRUPT_SPINLOCK Lock
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
 BOOLEAN
 ShadowStrikeSynchronizeWithInterrupt(

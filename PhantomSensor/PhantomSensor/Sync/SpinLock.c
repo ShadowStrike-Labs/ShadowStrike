@@ -1069,6 +1069,8 @@ ShadowStrikeInitializeInterruptSpinLock(
 #endif
 }
 
+_IRQL_raises_(DISPATCH_LEVEL)
+_IRQL_saves_global_(InterruptSpinLock, Lock)
 VOID
 ShadowStrikeAcquireInterruptSpinLock(
     _Inout_ PSHADOWSTRIKE_INTERRUPT_SPINLOCK Lock
@@ -1085,6 +1087,8 @@ ShadowStrikeAcquireInterruptSpinLock(
 #endif
 }
 
+_IRQL_requires_min_(DISPATCH_LEVEL)
+_IRQL_restores_global_(InterruptSpinLock, Lock)
 VOID
 ShadowStrikeReleaseInterruptSpinLock(
     _Inout_ PSHADOWSTRIKE_INTERRUPT_SPINLOCK Lock
@@ -1101,6 +1105,7 @@ ShadowStrikeReleaseInterruptSpinLock(
     }
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowStrikeSynchronizeWithInterrupt(
     _In_ PSHADOWSTRIKE_INTERRUPT_SPINLOCK Lock,

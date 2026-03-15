@@ -61,7 +61,6 @@
 #include "HeapSpray.h"
 #include "ROPDetector.h"
 #include "SectionTracker.h"
-#include "../Sync/SpinLock.h"
 #include "../Behavioral/BehaviorEngine.h"
 #include "../Callbacks/Process/AmsiBypassDetector.h"
 
