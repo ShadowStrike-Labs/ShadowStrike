@@ -457,8 +457,9 @@ ShadowStrikePreAcquireForSectionSync(
  *
  * @return TRUE if file should be scanned.
  *
- * @irql Any
+ * @irql <= DISPATCH_LEVEL (reads static const data only)
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowStrikeIsScannable(
     _In_ PCUNICODE_STRING Extension,

@@ -91,7 +91,6 @@ ShadowStrikePostWrite(
     );
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, ShadowStrikeIsScannable)
 #pragma alloc_text(PAGE, ShadowStrikeQueueRescan)
 #endif
 
@@ -147,6 +146,23 @@ static const SHADOW_EXTENSION_ENTRY g_ScannableExtensions[] = {
 
     // Shortcuts (can redirect to malware)
     { L"lnk",  6,  FALSE, FALSE },
+
+    // System/driver files (can install rootkits)
+    { L"inf",  6,  FALSE, FALSE },
+    { L"reg",  6,  FALSE, FALSE },
+
+    // Scriptlets and advanced scripting
+    { L"sct",  6,  FALSE, TRUE  },
+    { L"wsc",  6,  FALSE, TRUE  },
+    { L"py",   4,  FALSE, TRUE  },
+
+    // Office add-ins (code execution vectors)
+    { L"xll",  6,  TRUE,  FALSE },
+    { L"wll",  6,  TRUE,  FALSE },
+
+    // Compiled help / ClickOnce (execution vectors)
+    { L"chm",  6,  FALSE, FALSE },
+    { L"application", 22, TRUE, FALSE },
 
     // Sentinel - must be last
     { NULL, 0, FALSE, FALSE }
@@ -303,12 +319,13 @@ static FLT_OPERATION_REGISTRATION g_OperationCallbacks[] = {
     //
     // IRP_MJ_CREATE_NAMED_PIPE - Named pipe creation
     // Critical for C2 channel and lateral movement detection
+    // Uses wrapper functions that enforce ShadowStrikeIsDriverReady() guard
     //
     {
         IRP_MJ_CREATE_NAMED_PIPE,
         0,
-        NpMonPreCreateNamedPipe,
-        NpMonPostCreateNamedPipe,
+        ShadowStrikePreCreateNamedPipe,
+        ShadowStrikePostCreateNamedPipe,
         NULL
     },
 
@@ -390,7 +407,13 @@ ShadowStrikeIsScannable(
     )
 {
     ULONG i;
-    UNICODE_STRING extToCompare;
+    ULONG extLenBytes;
+    ULONG tblLenBytes;
+    const WCHAR* extBuf;
+    const WCHAR* tblBuf;
+    ULONG charCount;
+    ULONG c;
+    BOOLEAN match;
 
     if (IsExecutable != NULL) {
         *IsExecutable = FALSE;
@@ -400,13 +423,49 @@ ShadowStrikeIsScannable(
         return FALSE;
     }
 
+    extLenBytes = Extension->Length;
+    extBuf = Extension->Buffer;
+
     //
-    // Check against our extension table
+    // DISPATCH-safe comparison: RtlCompareUnicodeString requires <= APC_LEVEL
+    // due to pageable NLS tables. Our extension table is pure ASCII, so we use
+    // inline case-insensitive comparison that is safe at any IRQL.
     //
     for (i = 0; g_ScannableExtensions[i].Extension != NULL; i++) {
-        RtlInitUnicodeString(&extToCompare, g_ScannableExtensions[i].Extension);
 
-        if (RtlCompareUnicodeString(Extension, &extToCompare, TRUE) == 0) {
+        //
+        // Compute table entry length manually (avoid RtlInitUnicodeString
+        // which is PASSIVE_LEVEL in some WDK annotations).
+        //
+        tblBuf = g_ScannableExtensions[i].Extension;
+        tblLenBytes = 0;
+        while (tblBuf[tblLenBytes / sizeof(WCHAR)] != L'\0') {
+            tblLenBytes += sizeof(WCHAR);
+        }
+
+        if (extLenBytes != tblLenBytes) {
+            continue;
+        }
+
+        //
+        // Case-insensitive ASCII comparison. All table entries are pure ASCII
+        // so upcasing A-Z range is sufficient. Non-ASCII input extensions
+        // will never match table entries and correctly return FALSE.
+        //
+        charCount = extLenBytes / sizeof(WCHAR);
+        match = TRUE;
+        for (c = 0; c < charCount; c++) {
+            WCHAR a = extBuf[c];
+            WCHAR b = tblBuf[c];
+            if (a >= L'a' && a <= L'z') a -= (L'a' - L'A');
+            if (b >= L'a' && b <= L'z') b -= (L'a' - L'A');
+            if (a != b) {
+                match = FALSE;
+                break;
+            }
+        }
+
+        if (match) {
             if (IsExecutable != NULL) {
                 *IsExecutable = g_ScannableExtensions[i].IsExecutable;
             }
@@ -788,35 +847,80 @@ ShadowStrikeQueueRescan(
     _In_opt_ PCUNICODE_STRING FileName
     )
 {
-    //
-    // In a full implementation, this would:
-    // 1. Allocate a work item from lookaside list
-    // 2. Copy necessary context (instance, file ID, name)
-    // 3. Queue to a driver work queue for async processing
-    // 4. Worker thread sends scan request to user-mode
-    //
-    // For now, we log and return success to indicate the mechanism exists
-    //
+    PFILE_SCAN_REQUEST req = NULL;
+    ULONG reqSize;
+    USHORT copyLen;
+    USHORT pathChars;
+    NTSTATUS status;
 
     PAGED_CODE();
 
     UNREFERENCED_PARAMETER(Instance);
     UNREFERENCED_PARAMETER(FileObject);
 
-    if (FileName != NULL && FileName->Buffer != NULL) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                   "[ShadowStrike] Rescan queued for: %wZ\n", FileName);
-    } else {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                   "[ShadowStrike] Rescan queued (name unavailable)\n");
+    //
+    // Validate: must have a connected user-mode agent to receive the request
+    //
+    if (!SHADOWSTRIKE_USER_MODE_CONNECTED()) {
+        return STATUS_PORT_DISCONNECTED;
+    }
+
+    if (FileName == NULL || FileName->Buffer == NULL || FileName->Length == 0) {
+        return STATUS_INVALID_PARAMETER;
     }
 
     //
-    // Rescan queuing is handled by the deferred scan work queue (ShadowStrikeDeferredScanWorker).
-    // The DeferredScan context is populated by PostCreate/PostWrite and dispatched here.
+    // Cap path length to MAX_PATH (260 WCHARs = 520 bytes) to prevent
+    // excessive allocation from untrusted file names.
     //
+    copyLen = (FileName->Length > 520) ? 520 : FileName->Length;
+    pathChars = copyLen / sizeof(WCHAR);
 
-    return STATUS_SUCCESS;
+    //
+    // Build a FILE_SCAN_REQUEST with the variable-length file path appended.
+    // This is the standard scan request protocol — user-mode opens and scans
+    // the file independently based on the path we provide.
+    //
+    reqSize = sizeof(FILE_SCAN_REQUEST) + copyLen;
+    req = (PFILE_SCAN_REQUEST)ExAllocatePool2(
+        POOL_FLAG_PAGED, reqSize, 'rsQS');
+    if (req == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(req, sizeof(FILE_SCAN_REQUEST));
+    req->MessageId = SHADOWSTRIKE_NEXT_MESSAGE_ID();
+    req->AccessType = (UINT8)ShadowStrikeAccessRead;
+    req->Priority = 1;
+    req->RequiresReply = 0;
+    req->ProcessId = HandleToULong(PsGetCurrentProcessId());
+    req->PathLength = pathChars;
+
+    RtlCopyMemory(
+        (PUCHAR)req + sizeof(FILE_SCAN_REQUEST),
+        FileName->Buffer,
+        copyLen);
+
+    //
+    // Send via batch processor (fire-and-forget).
+    // ShadowStrikeBatchSendNotification routes through BpQueueEvent
+    // which is safe and non-blocking. User-mode agent dequeues and
+    // performs the actual file scan asynchronously.
+    //
+    status = ShadowStrikeBatchSendNotification(
+        (UINT16)FilterMessageType_ScanRequest,
+        req,
+        reqSize);
+
+    ExFreePoolWithTag(req, 'rsQS');
+
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Rescan notification failed: 0x%08X for: %wZ\n",
+                   status, FileName);
+    }
+
+    return status;
 }
 
 // ============================================================================
@@ -832,6 +936,7 @@ ShadowStrikeDeferredScanWorker(
     )
 {
     PSHADOW_DEFERRED_SCAN_CONTEXT scanContext = (PSHADOW_DEFERRED_SCAN_CONTEXT)Context;
+    NTSTATUS status;
 
     NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
@@ -843,15 +948,52 @@ ShadowStrikeDeferredScanWorker(
     }
 
     //
-    // Perform the actual scan at PASSIVE_LEVEL
-    // This would call ShadowStrikeSendScanRequest with the context data
+    // At PASSIVE_LEVEL we can safely send a scan request to user-mode.
+    // Build a lightweight rescan notification using the cached context.
     //
+    if (scanContext->FileName.Buffer != NULL &&
+        scanContext->FileName.Length > 0 &&
+        SHADOWSTRIKE_USER_MODE_CONNECTED()) {
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Deferred scan worker executing\n");
+        USHORT copyLen = (scanContext->FileName.Length > 520) ?
+                         520 : scanContext->FileName.Length;
+        USHORT pathChars = copyLen / sizeof(WCHAR);
+        ULONG reqSize = sizeof(FILE_SCAN_REQUEST) + copyLen;
+
+        PFILE_SCAN_REQUEST req = (PFILE_SCAN_REQUEST)ExAllocatePool2(
+            POOL_FLAG_PAGED, reqSize, 'dsQS');
+
+        if (req != NULL) {
+            RtlZeroMemory(req, sizeof(FILE_SCAN_REQUEST));
+            req->MessageId = SHADOWSTRIKE_NEXT_MESSAGE_ID();
+            req->AccessType = (UINT8)scanContext->AccessType;
+            req->Priority = scanContext->IsExecute ? 0 : 1;
+            req->RequiresReply = 0;
+            req->ProcessId = HandleToULong(scanContext->ProcessId);
+            req->FileSize = (UINT64)scanContext->FileSize.QuadPart;
+            req->PathLength = pathChars;
+
+            RtlCopyMemory(
+                (PUCHAR)req + sizeof(FILE_SCAN_REQUEST),
+                scanContext->FileName.Buffer,
+                copyLen);
+
+            status = ShadowStrikeBatchSendNotification(
+                (UINT16)FilterMessageType_ScanRequest,
+                req,
+                reqSize);
+
+            if (!NT_SUCCESS(status)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] Deferred scan send failed: 0x%08X\n", status);
+            }
+
+            ExFreePoolWithTag(req, 'dsQS');
+        }
+    }
 
     //
-    // Cleanup
+    // Cleanup context resources
     //
     if (scanContext->FileName.Buffer != NULL) {
         ExFreePoolWithTag(scanContext->FileName.Buffer, SHADOW_WORK_ITEM_TAG);

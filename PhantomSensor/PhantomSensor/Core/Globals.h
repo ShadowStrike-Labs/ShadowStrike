@@ -338,9 +338,6 @@ typedef struct _SHADOWSTRIKE_DRIVER_DATA {
     /// @brief Lookaside list for message allocations
     NPAGED_LOOKASIDE_LIST MessageLookaside;
 
-    /// @brief Lookaside list for file context allocations
-    NPAGED_LOOKASIDE_LIST FileContextLookaside;
-
     /// @brief Lookaside list for stream context allocations
     NPAGED_LOOKASIDE_LIST StreamContextLookaside;
 
@@ -417,11 +414,14 @@ extern SHADOWSTRIKE_DRIVER_DATA g_DriverData;
 #define SHADOWSTRIKE_COUNT_OPERATION() \
     InterlockedIncrement64(&g_DriverData.TotalOperationsProcessed)
 
-/// @brief Enter a protected operation (acquires rundown + counts)
+/// @brief Enter a protected operation (DEPRECATED — use SHADOWSTRIKE_ACQUIRE_RUNDOWN directly)
+/// @note These no-ops are retained for backward compat in deprecated code paths
+/// (e.g. ShadowStrikePreAcquireForSectionSync in FilterRegistration.c).
+/// All active callbacks use SHADOWSTRIKE_ACQUIRE_RUNDOWN/RELEASE_RUNDOWN instead.
 #define SHADOWSTRIKE_ENTER_OPERATION() \
     do { (void)0; } while(0)
 
-/// @brief Leave a protected operation
+/// @brief Leave a protected operation (DEPRECATED — use SHADOWSTRIKE_RELEASE_RUNDOWN directly)
 #define SHADOWSTRIKE_LEAVE_OPERATION() \
     do { (void)0; } while(0)
 
