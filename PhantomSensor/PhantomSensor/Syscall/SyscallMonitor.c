@@ -1398,6 +1398,35 @@ Return Value:
             DsdFreeDetection(dsdDetection);
             dsdDetection = NULL;
         }
+
+        //
+        // Step 3b: Supplementary call-stack validation via DSD.
+        // When DSD detected a technique, cross-validate the user-mode
+        // call stack for missing ntdll frames and unbacked return addresses.
+        // This provides an independent signal beyond the instruction-level
+        // analysis and complements CallstackAnalyzer's structural checks.
+        //
+        if (detectFlags & (SC_DETECT_DIRECT_SYSCALL | SC_DETECT_HOOK_BYPASS)) {
+            BOOLEAN dsdStackValid = TRUE;
+            DSD_TECHNIQUE dsdStackTechnique = DsdTechnique_None;
+
+            NTSTATUS dsvStatus = DsdValidateCallstack(
+                g_ScState.DirectSyscallDetector,
+                (HANDLE)(ULONG_PTR)ProcessId,
+                (HANDLE)(ULONG_PTR)ThreadId,
+                &dsdStackValid,
+                &dsdStackTechnique
+            );
+
+            if (NT_SUCCESS(dsvStatus) && !dsdStackValid) {
+                threatScore += 50;
+
+                if (dsdStackTechnique == DsdTechnique_Manual) {
+                    detectFlags |= SC_DETECT_UNBACKED_CALLER;
+                    threatScore += 100;
+                }
+            }
+        }
     }
 
     //

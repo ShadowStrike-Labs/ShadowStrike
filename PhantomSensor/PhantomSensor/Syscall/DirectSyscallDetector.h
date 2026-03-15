@@ -156,6 +156,21 @@ DsdFreeDetection(
     _In_ _Post_ptr_invalid_ PDSD_DETECTION Detection
     );
 
+//
+// Adds a whitelist entry to exempt a module from syscall analysis.
+// Entries can match by module name, address range, or both.
+// At least one of ModuleName or (BaseAddress + Size) must be provided.
+//
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+DsdAddWhitelistEntry(
+    _In_ PDSD_DETECTOR Detector,
+    _In_opt_ PCUNICODE_STRING ModuleName,
+    _In_ ULONG64 BaseAddress,
+    _In_ SIZE_T Size
+    );
+
 #ifdef __cplusplus
 }
 #endif
