@@ -689,9 +689,9 @@ AdInitialize(
         );
 
         if (!NT_SUCCESS(status)) {
-            if (floatSaved) {
-                KeRestoreFloatingPointState(&floatSave);
-            }
+            //
+            // FP state already restored at line 663 — do NOT double-restore.
+            //
 
             KeEnterCriticalRegion();
             ExAcquirePushLockExclusive(&detector->GlobalBaselineLock);
@@ -1124,9 +1124,9 @@ AdRecordSample(
         if (processBaseline != NULL) {
             KeAcquireSpinLock(&processBaseline->Baselines[Metric].Lock, &oldIrql);
             AdpUpdateBaselineLocked(&processBaseline->Baselines[Metric], Value);
+            AdpUpdateEMA(processBaseline, Metric, Value);
             KeReleaseSpinLock(&processBaseline->Baselines[Metric].Lock, oldIrql);
 
-            AdpUpdateEMA(processBaseline, Metric, Value);
             KeQuerySystemTime(&processBaseline->LastActivityTime);
 
             AdpDereferenceProcessBaseline(Detector, processBaseline);
@@ -2456,22 +2456,23 @@ AdpQueryProcessName(
     status = SeLocateProcessImageName(process, &imageName);
     if (NT_SUCCESS(status) && imageName != NULL && imageName->Buffer != NULL) {
         //
-        // Extract just the filename from the full path
+        // Extract just the filename from the full path.
+        // Use Length-based bounds, not null-terminator assumption.
         //
+        USHORT lengthChars = imageName->Length / sizeof(WCHAR);
         PWSTR lastSlash = imageName->Buffer;
-        PWSTR current = imageName->Buffer;
+        USHORT i;
 
-        while (*current != L'\0') {
-            if (*current == L'\\' || *current == L'/') {
-                lastSlash = current + 1;
+        for (i = 0; i < lengthChars; i++) {
+            if (imageName->Buffer[i] == L'\\' || imageName->Buffer[i] == L'/') {
+                lastSlash = &imageName->Buffer[i + 1];
             }
-            current++;
         }
 
         //
         // Copy filename, respecting buffer size
         //
-        ULONG copyLen = (ULONG)(current - lastSlash);
+        ULONG copyLen = (ULONG)(&imageName->Buffer[lengthChars] - lastSlash);
         if (copyLen >= MaxCch) {
             copyLen = MaxCch - 1;
         }

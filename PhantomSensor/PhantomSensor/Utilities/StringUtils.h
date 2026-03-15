@@ -567,6 +567,46 @@ ShadowStrikeHashUnicodeString64(
     _In_ BOOLEAN CaseInsensitive
     );
 
+/**
+ * @brief Compute FNV-1a hash of raw byte buffer.
+ *
+ * Centralized byte-level FNV-1a hash. Replaces per-module
+ * duplicates (HeapSpray, NetworkReputation IP hash).
+ *
+ * @param Data      Pointer to byte buffer
+ * @param Size      Size of buffer in bytes
+ *
+ * @return 32-bit hash value
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+ULONG
+ShadowStrikeHashBytes(
+    _In_reads_bytes_(Size) const VOID* Data,
+    _In_ ULONG Size
+    );
+
+/**
+ * @brief Compute FNV-1a hash of ANSI string with optional case folding.
+ *
+ * Centralized ANSI FNV-1a hash. Replaces per-module duplicates
+ * (NetworkReputation domain hash, SyscallTable name hash).
+ *
+ * @param String            Null-terminated ANSI string
+ * @param MaxLength         Maximum characters to hash (prevents overrun)
+ * @param CaseInsensitive   TRUE to fold A-Z → a-z before hashing
+ *
+ * @return 32-bit hash value
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+ULONG
+ShadowStrikeHashAnsiString(
+    _In_z_ PCSTR String,
+    _In_ ULONG MaxLength,
+    _In_ BOOLEAN CaseInsensitive
+    );
+
 // ============================================================================
 // STRING BUILDER
 // ============================================================================

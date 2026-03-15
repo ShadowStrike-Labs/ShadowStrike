@@ -51,6 +51,7 @@
 
 #include "SyscallTable.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Utilities/StringUtils.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -59,12 +60,6 @@
 
 /** @brief Hash bucket for number lookup */
 #define SST_NUM_HASH_MASK                   (SST_HASH_BUCKET_COUNT - 1)
-
-/** @brief FNV-1a offset basis for name hashing */
-#define SST_FNV_OFFSET_BASIS                2166136261u
-
-/** @brief FNV-1a prime for name hashing */
-#define SST_FNV_PRIME                       16777619u
 
 // ============================================================================
 // STATIC SYSCALL DEFINITION (BUILD-TIME DATA)
@@ -413,7 +408,7 @@ SstpHashNumber(
 
 /**
  * @brief Hash a syscall name to a bucket index (case-insensitive).
- * Uses FNV-1a with lowercase folding.
+ * Delegates to centralized ShadowStrikeHashAnsiString, then masks.
  */
 _Must_inspect_result_
 static ULONG
@@ -421,20 +416,7 @@ SstpHashName(
     _In_ PCSTR Name
     )
 {
-    ULONG hash = SST_FNV_OFFSET_BASIS;
-    const CHAR *p;
-
-    for (p = Name; *p != '\0' && (p - Name) < SST_MAX_NAME_LENGTH; p++) {
-        CHAR c = *p;
-        /* ASCII lowercase fold */
-        if (c >= 'A' && c <= 'Z') {
-            c = c + ('a' - 'A');
-        }
-        hash ^= (ULONG)(UCHAR)c;
-        hash *= SST_FNV_PRIME;
-    }
-
-    return hash & SST_NUM_HASH_MASK;
+    return ShadowStrikeHashAnsiString(Name, SST_MAX_NAME_LENGTH, TRUE) & SST_NUM_HASH_MASK;
 }
 
 /**

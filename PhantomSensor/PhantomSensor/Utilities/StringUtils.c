@@ -1626,6 +1626,66 @@ ShadowStrikeHashUnicodeString64(
     return hash;
 }
 
+/**
+ * @brief Compute FNV-1a hash of raw byte buffer.
+ *
+ * Canonical byte-level FNV-1a. Centralizes per-module duplicates
+ * (HeapSpray HspCalculatePatternHash, NetworkReputation NrpHashIP).
+ */
+ULONG
+ShadowStrikeHashBytes(
+    _In_reads_bytes_(Size) const VOID* Data,
+    _In_ ULONG Size
+    )
+{
+    ULONG hash = SHADOW_FNV1A_SEED;
+    const UCHAR* bytes = (const UCHAR*)Data;
+    ULONG i;
+
+    if (Data == NULL || Size == 0) {
+        return hash;
+    }
+
+    for (i = 0; i < Size; i++) {
+        hash ^= bytes[i];
+        hash *= SHADOW_FNV1A_PRIME;
+    }
+
+    return hash;
+}
+
+/**
+ * @brief Compute FNV-1a hash of ANSI string with optional case folding.
+ *
+ * Canonical ANSI FNV-1a. Centralizes per-module duplicates
+ * (NetworkReputation NrpHashDomain, SyscallTable SstpHashName).
+ */
+ULONG
+ShadowStrikeHashAnsiString(
+    _In_z_ PCSTR String,
+    _In_ ULONG MaxLength,
+    _In_ BOOLEAN CaseInsensitive
+    )
+{
+    ULONG hash = SHADOW_FNV1A_SEED;
+    ULONG i;
+
+    if (String == NULL) {
+        return hash;
+    }
+
+    for (i = 0; i < MaxLength && String[i] != '\0'; i++) {
+        CHAR ch = String[i];
+        if (CaseInsensitive && ch >= 'A' && ch <= 'Z') {
+            ch = ch - 'A' + 'a';
+        }
+        hash ^= (UCHAR)ch;
+        hash *= SHADOW_FNV1A_PRIME;
+    }
+
+    return hash;
+}
+
 // ============================================================================
 // STRING BUILDER
 // ============================================================================

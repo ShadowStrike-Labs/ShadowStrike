@@ -49,6 +49,7 @@
 
 #include "HeapSpray.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Utilities/StringUtils.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, HsInitialize)
@@ -72,9 +73,6 @@
 #define HS_ALLOCATION_POOL_SIZE         4096
 #define HS_SHUTDOWN_DRAIN_MAX_WAIT      30000   // 30s at 1ms each
 #define HS_POOL_TAG_RESULT              'RSHI'  // Heap Spray - Result
-
-#define HS_FNV_OFFSET_BASIS             0x811C9DC5
-#define HS_FNV_PRIME                    0x01000193
 
 #define HS_REPETITION_THRESHOLD         80      // 80% repetition = suspicious
 #define HS_MIN_SCORE_FOR_SPRAY          500     // Score threshold for detection
@@ -1842,18 +1840,11 @@ HspCalculatePatternHash(
 Routine Description:
 
     Calculates FNV-1a hash of pattern data.
+    Delegates to centralized ShadowStrikeHashBytes.
 
 --*/
 {
-    ULONG hash = HS_FNV_OFFSET_BASIS;
-    ULONG i;
-
-    for (i = 0; i < Size; i++) {
-        hash ^= Data[i];
-        hash *= HS_FNV_PRIME;
-    }
-
-    return hash;
+    return ShadowStrikeHashBytes(Data, Size);
 }
 
 

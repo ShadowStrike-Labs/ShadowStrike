@@ -2022,8 +2022,32 @@ RepWildcardMatch(
     ULONG starPIdx = (ULONG)-1;
     ULONG starSIdx = 0;
     WCHAR patternChar, stringChar;
+    ULONG iterations = 0;
+
+    //
+    // Iteration cap to prevent ReDoS from adversarial patterns.
+    // Overflow-safe calculation with hard ceiling at 1M iterations.
+    //
+    ULONG maxIterations;
+    if (PatternLengthChars > 0x3FFFFFFFUL ||
+        StringLengthChars > 0x3FFFFFFFUL ||
+        (PatternLengthChars + StringLengthChars) > 0x3FFFFFFFUL) {
+        maxIterations = 1000000;
+    } else {
+        maxIterations = (PatternLengthChars + StringLengthChars) * 4;
+        if (maxIterations < 4096) {
+            maxIterations = 4096;
+        }
+        if (maxIterations > 1000000) {
+            maxIterations = 1000000;
+        }
+    }
 
     while (sIdx < StringLengthChars) {
+        if (++iterations > maxIterations) {
+            return FALSE;
+        }
+
         if (pIdx < PatternLengthChars) {
             patternChar = Pattern[pIdx];
 

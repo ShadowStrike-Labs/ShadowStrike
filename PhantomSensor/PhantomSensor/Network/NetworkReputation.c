@@ -49,6 +49,7 @@
 #include "../../Core/DriverEntry.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Performance/CacheOptimization.h"
+#include "../../Utilities/StringUtils.h"
 
 //
 // Forward declarations needed before alloc_text (defined later in file)
@@ -76,10 +77,6 @@ NrpIsLoopbackIPv6(
 #define NR_HASH_BUCKET_COUNT            4096
 #define NR_CLEANUP_INTERVAL_MS          60000
 #define NR_MAX_CLEANUP_PER_TICK         256
-
-// FNV-1a hash constants
-#define NR_FNV_OFFSET_BASIS             2166136261UL
-#define NR_FNV_PRIME                    16777619UL
 
 // ============================================================================
 // PRIVATE FUNCTION PROTOTYPES
@@ -1264,19 +1261,11 @@ NrpHashIP(
     _In_ BOOLEAN IsIPv6
     )
 {
-    ULONG hash = NR_FNV_OFFSET_BASIS;
-    const UCHAR* bytes = (const UCHAR*)Address;
     ULONG length = IsIPv6 ? sizeof(IN6_ADDR) : sizeof(IN_ADDR);
-    ULONG i;
 
     PAGED_CODE();
 
-    for (i = 0; i < length; i++) {
-        hash ^= bytes[i];
-        hash *= NR_FNV_PRIME;
-    }
-
-    return hash;
+    return ShadowStrikeHashBytes(Address, length);
 }
 
 static ULONG
@@ -1285,21 +1274,9 @@ NrpHashDomain(
     _In_ ULONG MaxLength
     )
 {
-    ULONG hash = NR_FNV_OFFSET_BASIS;
-    ULONG i;
-
     PAGED_CODE();
 
-    for (i = 0; i < MaxLength && Domain[i] != '\0'; i++) {
-        CHAR ch = Domain[i];
-        if (ch >= 'A' && ch <= 'Z') {
-            ch = ch - 'A' + 'a';
-        }
-        hash ^= (UCHAR)ch;
-        hash *= NR_FNV_PRIME;
-    }
-
-    return hash;
+    return ShadowStrikeHashAnsiString(Domain, MaxLength, TRUE);
 }
 
 static ULONG
