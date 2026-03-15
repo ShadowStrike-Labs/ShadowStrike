@@ -416,6 +416,7 @@ typedef enum _TAMPER_ATTEMPT_TYPE {
     Tamper_HandleAccess,                  // Suspicious handle access
     Tamper_MemoryModify,                  // Attempt to modify our memory
     Tamper_HookInstall,                   // Attempt to hook our code
+    Tamper_FirmwareModification,          // Firmware/UEFI integrity violation (T1542)
     Tamper_Max
 } TAMPER_ATTEMPT_TYPE;
 

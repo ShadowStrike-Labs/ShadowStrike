@@ -45,6 +45,9 @@ Implementation Strategy:
 #include <ntstrsafe.h>
 
 #include "../Behavioral/BehaviorEngine.h"
+#include "../ETW/TelemetryEvents.h"
+#include "../Sync/TimerManager.h"
+#include "../Core/DriverEntry.h"
 
 // ============================================================================
 // UEFI GUIDS
@@ -81,6 +84,7 @@ typedef struct _FI_STATE {
     EX_RUNDOWN_REF      RundownRef;
     FI_BOOT_STATUS      BootStatus;
     FI_STATISTICS       Stats;
+    ULONG               VerifyTimerId;
 } FI_STATE;
 
 static FI_STATE g_FiState;
@@ -102,6 +106,12 @@ FipEnterOperation(VOID);
 
 static VOID
 FipLeaveOperation(VOID);
+
+static VOID
+FipVerifyTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
+    );
 
 // ============================================================================
 // LIFECYCLE
@@ -136,6 +146,29 @@ FiInitialize(VOID)
                    "[ShadowStrike/FI] WARNING: Secure Boot is DISABLED! "
                    "System is vulnerable to firmware-level attacks.\n");
         InterlockedIncrement64(&g_FiState.Stats.ThreatsDetected);
+
+        //
+        // Report Secure Boot disabled to behavioral engine (T1542.003)
+        //
+        BeEngineSubmitEvent(
+            BehaviorEvent_FirmwareSecureBootDisabled,
+            BehaviorCategory_DefenseEvasion,
+            0,
+            NULL,
+            0,
+            85,
+            FALSE,
+            NULL
+            );
+
+        TeLogTamperAttempt(
+            Tamper_FirmwareModification,
+            0,
+            Component_SelfProtection,
+            0,
+            FALSE,
+            L"Secure Boot disabled at system startup"
+            );
     } else if (g_FiState.BootStatus == FiBoot_SecureBootEnabled) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                    "[ShadowStrike/FI] Secure Boot: ENABLED (Verified)\n");
@@ -146,6 +179,36 @@ FiInitialize(VOID)
     }
 
     InterlockedExchange(&g_FiState.State, 2);
+
+    //
+    // Create periodic boot integrity verification timer.
+    // Checks every 5 minutes — firmware changes are rare.
+    // Uses WorkItem callback for PASSIVE_LEVEL (ExGetFirmwareEnvironmentVariable).
+    //
+    {
+        PTM_MANAGER TimerMgr = ShadowStrikeGetTimerManager();
+        if (TimerMgr != NULL) {
+            TM_TIMER_OPTIONS Opts = { 0 };
+            Opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+            Opts.ToleranceMs = 30000;
+
+            NTSTATUS TmStatus = TmCreatePeriodic(
+                TimerMgr,
+                300000,
+                FipVerifyTimerCallback,
+                NULL,
+                &Opts,
+                &g_FiState.VerifyTimerId
+                );
+
+            if (!NT_SUCCESS(TmStatus)) {
+                g_FiState.VerifyTimerId = 0;
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike/FI] WARNING: Periodic verify timer failed: 0x%08X\n",
+                    TmStatus);
+            }
+        }
+    }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/FI] Firmware Integrity monitor initialized\n");
@@ -162,6 +225,18 @@ FiShutdown(VOID)
 
     if (InterlockedCompareExchange(&g_FiState.State, 3, 2) != 2) {
         return;
+    }
+
+    //
+    // Cancel periodic verification timer before waiting for rundown.
+    // TmCancel with Wait=TRUE ensures no in-flight callback remains.
+    //
+    if (g_FiState.VerifyTimerId != 0) {
+        PTM_MANAGER TimerMgr = ShadowStrikeGetTimerManager();
+        if (TimerMgr != NULL) {
+            TmCancel(TimerMgr, g_FiState.VerifyTimerId, TRUE);
+        }
+        g_FiState.VerifyTimerId = 0;
     }
 
     ExWaitForRundownProtectionRelease(&g_FiState.RundownRef);
@@ -219,6 +294,18 @@ FiCheckEspAccess(
             95,
             FALSE,
             NULL
+            );
+
+        //
+        // Emit structured telemetry for ESP write (T1542.003 Bootkit)
+        //
+        TeLogTamperAttempt(
+            Tamper_FirmwareModification,
+            HandleToULong(PsGetCurrentProcessId()),
+            Component_SelfProtection,
+            0,
+            FALSE,
+            L"Write access to EFI System Partition detected"
             );
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -388,4 +475,60 @@ static VOID
 FipLeaveOperation(VOID)
 {
     ExReleaseRundownProtection(&g_FiState.RundownRef);
+}
+
+// ============================================================================
+// PRIVATE — PERIODIC VERIFICATION TIMER
+// ============================================================================
+
+static VOID
+FipVerifyTimerCallback(
+    _In_ ULONG TimerId,
+    _In_opt_ PVOID Context
+    )
+{
+    UNREFERENCED_PARAMETER(TimerId);
+    UNREFERENCED_PARAMETER(Context);
+
+    FI_BOOT_STATUS Previous = g_FiState.BootStatus;
+    FI_BOOT_STATUS Current = FiVerifyBootIntegrity();
+
+    //
+    // Detect runtime Secure Boot state transitions.
+    // A change from Enabled → Disabled indicates potential firmware attack.
+    //
+    if (Current != Previous &&
+        Current != FiBoot_Unknown &&
+        Previous != FiBoot_Unknown) {
+
+        if (Current == FiBoot_SecureBootDisabled &&
+            Previous == FiBoot_SecureBootEnabled) {
+
+            InterlockedIncrement64(&g_FiState.Stats.ThreatsDetected);
+
+            BeEngineSubmitEvent(
+                BehaviorEvent_FirmwareSecureBootDisabled,
+                BehaviorCategory_DefenseEvasion,
+                0,
+                NULL,
+                0,
+                95,
+                FALSE,
+                NULL
+                );
+
+            TeLogTamperAttempt(
+                Tamper_FirmwareModification,
+                0,
+                Component_SelfProtection,
+                0,
+                FALSE,
+                L"Secure Boot changed from Enabled to Disabled at runtime"
+                );
+
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike/FI] CRITICAL: Secure Boot state changed from "
+                "ENABLED to DISABLED at runtime! Possible firmware attack.\n");
+        }
+    }
 }
