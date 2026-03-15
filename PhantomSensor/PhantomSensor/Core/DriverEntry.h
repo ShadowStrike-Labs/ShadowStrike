@@ -707,6 +707,19 @@ _IRQL_requires_max_(APC_LEVEL)
 PIM_MONITOR
 ShadowStrikeGetIntegrityMonitor(VOID);
 
+/**
+ * @brief Get async work queue handle for deferred task submission.
+ *        Modules that need non-blocking work dispatch (deferred scans,
+ *        async telemetry, background analysis) submit via this handle.
+ * @return HAWQ_MANAGER or NULL if not initialized.
+ */
+struct HAWQ_MANAGER__;
+typedef struct HAWQ_MANAGER__ *HAWQ_MANAGER;
+
+_IRQL_requires_max_(APC_LEVEL)
+HAWQ_MANAGER
+ShadowStrikeGetAsyncWorkQueue(VOID);
+
 #ifdef __cplusplus
 }
 #endif
