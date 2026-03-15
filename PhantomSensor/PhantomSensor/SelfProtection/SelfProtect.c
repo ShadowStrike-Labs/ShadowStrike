@@ -55,6 +55,7 @@
 #include "../Shared/SharedDefs.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../ETW/TelemetryEvents.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeInitializeSelfProtection)
@@ -219,6 +220,15 @@ SspStripProcessAccess(
         if ((original & PROCESS_VM_WRITE) && !(stripped & PROCESS_VM_WRITE)) {
             InterlockedIncrement64(&g_SelfProtectStats.VMWriteBlocks);
         }
+
+        TeLogTamperAttempt(
+            Tamper_HandleAccess,
+            HandleToULong(PsGetCurrentProcessId()),
+            Component_SelfProtection,
+            (UINT64)original,
+            TRUE,
+            L"Dangerous process handle access stripped"
+            );
     }
 }
 
@@ -238,6 +248,15 @@ SspStripThreadAccess(
         *DesiredAccess = stripped;
         InterlockedIncrement64(&g_SelfProtectStats.HandleStrips);
         InterlockedIncrement64(&g_SelfProtectStats.ThreadInjectBlocks);
+
+        TeLogTamperAttempt(
+            Tamper_HandleAccess,
+            HandleToULong(PsGetCurrentProcessId()),
+            Component_SelfProtection,
+            (UINT64)original,
+            TRUE,
+            L"Dangerous thread handle access stripped"
+            );
     }
 }
 
@@ -607,8 +626,17 @@ ShadowStrikeProtectProcess(
         }
 
         if (!duplicate) {
-            InsertTailList(&g_ProtectedProcessList, &newEntry->ListEntry);
-            g_ProtectedProcessCount++;
+            //
+            // Re-verify count under lock to prevent TOCTOU race
+            // where two concurrent callers both pass the pre-check.
+            //
+            if (g_ProtectedProcessCount >= SHADOWSTRIKE_MAX_PROTECTED_PROCESSES) {
+                duplicate = FALSE;
+                status = STATUS_INSUFFICIENT_RESOURCES;
+            } else {
+                InsertTailList(&g_ProtectedProcessList, &newEntry->ListEntry);
+                g_ProtectedProcessCount++;
+            }
         }
     }
 
@@ -618,6 +646,12 @@ ShadowStrikeProtectProcess(
         ObDereferenceObject(process);
         ShadowStrikeFreePoolWithTag(newEntry, SSSP_POOL_TAG_PROCESS);
         return STATUS_OBJECT_NAME_COLLISION;
+    }
+
+    if (!NT_SUCCESS(status)) {
+        ObDereferenceObject(process);
+        ShadowStrikeFreePoolWithTag(newEntry, SSSP_POOL_TAG_PROCESS);
+        return status;
     }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -1231,6 +1265,15 @@ ShadowStrikeShouldBlockFileAccess(
             NULL
             );
 
+        TeLogTamperAttempt(
+            Tamper_FileDelete,
+            HandleToULong(RequestorPid),
+            Component_SelfProtection,
+            0,
+            TRUE,
+            L"Blocked delete of protected file"
+            );
+
         return TRUE;
     }
 
@@ -1250,6 +1293,15 @@ ShadowStrikeShouldBlockFileAccess(
             85,
             FALSE,
             NULL
+            );
+
+        TeLogTamperAttempt(
+            Tamper_MemoryModify,
+            HandleToULong(RequestorPid),
+            Component_SelfProtection,
+            (UINT64)DesiredAccess,
+            TRUE,
+            L"Blocked write to protected file"
             );
 
         return TRUE;
@@ -1319,6 +1371,15 @@ ShadowStrikeShouldBlockRegistryAccess(
                 85,
                 FALSE,
                 NULL
+                );
+
+            TeLogTamperAttempt(
+                Tamper_RegistryModify,
+                HandleToULong(RequestorPid),
+                Component_SelfProtection,
+                (UINT64)Operation,
+                TRUE,
+                L"Blocked registry change to protected key"
                 );
 
             return TRUE;

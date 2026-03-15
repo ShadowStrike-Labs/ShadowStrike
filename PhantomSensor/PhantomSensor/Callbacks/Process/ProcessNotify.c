@@ -123,6 +123,10 @@ struct _CT_TRACKER* NfFilterGetConnectionTracker(VOID);
 // which would introduce cross-subsystem header coupling)
 VOID HpProcessTerminated(_In_ PHP_PROTECTION_ENGINE Engine, _In_ HANDLE ProcessId);
 
+// SelfProtect forward-declare: cleanup protected process entry on termination.
+// Without this call, PEPROCESS reference leaks and PID slot stays occupied.
+VOID ShadowStrikeUnprotectProcess(_In_ HANDLE ProcessId);
+
 typedef struct _DX_DETECTOR DX_DETECTOR, *PDX_DETECTOR;
 VOID DxProcessTerminated(_In_ PDX_DETECTOR Detector, _In_ HANDLE ProcessId);
 struct _DX_DETECTOR* NfFilterGetDxDetector(VOID);
@@ -3851,6 +3855,14 @@ PnpHandleProcessTermination(
             HpProcessTerminated(hpEngine, ProcessId);
         }
     }
+
+    //
+    // Remove SelfProtect protection entry for this process.
+    // Without this, the PEPROCESS reference leaks (ObReferenceObject held
+    // indefinitely) and the PID slot cannot be reused — new protected process
+    // registrations will hit the 16-entry cap and fail.
+    //
+    ShadowStrikeUnprotectProcess(ProcessId);
 
     //
     // Remove ResourceThrottling per-process quota for this process.
