@@ -50,6 +50,7 @@
 #include "../Utilities/MemoryUtils.h"
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
+#include "../Power/PowerCallback.h"
 
 // ============================================================================
 // COMPILE-TIME ASSERTIONS
@@ -1631,6 +1632,25 @@ RtpMonitorTimerCallback(
     for (i = 0; i < RT_MAX_RESOURCE_TYPES; i++) {
         if (throttler->Configs[i].Enabled) {
             RtpUpdateResourceState(throttler, (RT_RESOURCE_TYPE)i);
+        }
+    }
+
+    //
+    // On battery power, refill burst tokens at 2× rate to reduce
+    // CPU overhead from throttle-induced retries. Protection is
+    // still active (limits unchanged), but throttling is less aggressive.
+    //
+    if (ShadowPowerIsOnBattery()) {
+        LARGE_INTEGER now;
+        KeQuerySystemTime(&now);
+
+        for (i = 0; i < RT_MAX_RESOURCE_TYPES; i++) {
+            if (throttler->Configs[i].Enabled) {
+                RtpRefillBurstTokens(
+                    &throttler->States[i],
+                    &throttler->Configs[i],
+                    now);
+            }
         }
     }
 
