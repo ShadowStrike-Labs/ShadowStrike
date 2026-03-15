@@ -65,6 +65,7 @@
 #pragma warning(pop)
 
 #include "../Behavioral/BehaviorEngine.h"
+#include "../ETW/TelemetryEvents.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, FpInitialize)
@@ -1061,14 +1062,26 @@ FpCheckAccess(
                 // Submit tamper attempt to behavioral engine (T1562.001)
                 //
                 BeEngineSubmitEvent(
-                    BehaviorEvent_CallbackRemoval,
+                    BehaviorEvent_LogDeletion,
                     BehaviorCategory_DefenseEvasion,
-                    HandleToULong(PsGetCurrentProcessId()),
+                    HandleToULong(RequestorPid),
                     NULL,
                     0,
                     90,
-                    FALSE,
+                    TRUE,
                     NULL
+                    );
+
+                //
+                // Emit structured telemetry for the blocked file operation.
+                // T1070.004 Indicator Removal: File Deletion / T1564.004 ADS
+                //
+                TeLogFileBlocked(
+                    HandleToULong(RequestorPid),
+                    FilePath,
+                    L"FileProtection:SelfDefense",
+                    90,
+                    FALSE
                     );
             } else if (Result == FpAccess_AuditOnly) {
                 InterlockedIncrement64(MatchedAuditedOps);

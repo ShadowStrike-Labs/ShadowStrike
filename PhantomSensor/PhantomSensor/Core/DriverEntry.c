@@ -3291,6 +3291,13 @@ ShadowStrikeGetCallbackProtector(VOID)
     return g_CallbackProtector;
 }
 
+_IRQL_requires_max_(APC_LEVEL)
+PFP_ENGINE
+ShadowStrikeGetFileProtectionEngine(VOID)
+{
+    return g_FileProtectionEngine;
+}
+
 // ============================================================================
 // VERSION COMPATIBILITY CHECK
 // ============================================================================

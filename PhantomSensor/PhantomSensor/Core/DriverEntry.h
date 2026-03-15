@@ -673,6 +673,18 @@ _IRQL_requires_max_(PASSIVE_LEVEL)
 PCP_PROTECTOR
 ShadowStrikeGetCallbackProtector(VOID);
 
+/**
+ * @brief Get the global file protection engine instance.
+ * @return PFP_ENGINE or NULL if not initialized.
+ * @note All Fp* public APIs require <= APC_LEVEL.
+ *       Used by minifilter callbacks (PreCreate) for file access control.
+ */
+typedef struct _FP_ENGINE FP_ENGINE, *PFP_ENGINE;
+
+_IRQL_requires_max_(APC_LEVEL)
+PFP_ENGINE
+ShadowStrikeGetFileProtectionEngine(VOID);
+
 #ifdef __cplusplus
 }
 #endif

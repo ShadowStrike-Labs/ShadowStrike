@@ -66,6 +66,7 @@ Performance Characteristics:
 #include "../../Communication/CommPort.h"
 #include "../../Communication/ScanBridge.h"
 #include "../../SelfProtection/SelfProtect.h"
+#include "../../SelfProtection/FileProtection.h"
 #include "../../SelfProtection/FirmwareIntegrity.h"
 #include "../../Cache/ScanCache.h"
 #include "../../Exclusions/ExclusionManager.h"
@@ -932,6 +933,59 @@ Return Value:
         FltReleaseFileNameInformation(NameInfo);
         ExReleaseRundownProtection(&g_PcState.RundownRef);
         return FLT_PREOP_COMPLETE;
+    }
+
+    // ========================================================================
+    // PHASE 6b: FILE PROTECTION ENGINE
+    // Enhanced ADS-aware file protection with audit logging and
+    // extension-based rules (T1070.004, T1564.004, T1036)
+    // ========================================================================
+    {
+        ACCESS_MASK DesiredAccess =
+            Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+
+        //
+        // Only consult file protection engine for write/delete/execute.
+        // Pure read opens have no self-defense impact.
+        //
+        if (DesiredAccess & (DELETE | FILE_WRITE_DATA | FILE_APPEND_DATA |
+                             WRITE_DAC | WRITE_OWNER | FILE_EXECUTE)) {
+
+            PFP_ENGINE FpEngine = ShadowStrikeGetFileProtectionEngine();
+
+            if (FpEngine != NULL) {
+                FP_OPERATION_TYPE FpOp;
+
+                if (DesiredAccess & DELETE) {
+                    FpOp = FpOperation_Delete;
+                } else if (DesiredAccess & FILE_EXECUTE) {
+                    FpOp = FpOperation_Execute;
+                } else {
+                    FpOp = FpOperation_Write;
+                }
+
+                FP_ACCESS_RESULT FpResult = FpCheckAccess(
+                    FpEngine,
+                    &NameInfo->Name,
+                    FpOp,
+                    RequestorPid,
+                    DesiredAccess,
+                    NULL
+                    );
+
+                if (FpResult == FpAccess_Block) {
+                    Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                    Data->IoStatus.Information = 0;
+
+                    SHADOWSTRIKE_INC_STAT(FilesBlocked);
+                    InterlockedIncrement64(&g_PcState.Stats.SelfProtectBlocks);
+
+                    FltReleaseFileNameInformation(NameInfo);
+                    ExReleaseRundownProtection(&g_PcState.RundownRef);
+                    return FLT_PREOP_COMPLETE;
+                }
+            }
+        }
     }
 
     //
