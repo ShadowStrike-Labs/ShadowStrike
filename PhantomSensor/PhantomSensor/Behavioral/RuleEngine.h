@@ -282,6 +282,19 @@ ReEvaluate(
     _Out_ PRE_EVALUATION_RESULT* Result
     );
 
+//
+// Evaluate rules using a caller-provided result buffer (zero-allocation hot path).
+// Result buffer must be at least sizeof(RE_EVALUATION_RESULT).
+//
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ReEvaluateInPlace(
+    _In_ PRE_ENGINE Engine,
+    _In_ const RE_EVALUATION_CONTEXT* Context,
+    _Out_ PRE_EVALUATION_RESULT Result
+    );
+
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ReFreeResult(

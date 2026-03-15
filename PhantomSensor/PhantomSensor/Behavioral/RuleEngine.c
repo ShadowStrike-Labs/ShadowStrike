@@ -781,21 +781,18 @@ Return Value:
     }
 
     KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Engine->RuleLock);
+    ExAcquirePushLockExclusive(&Engine->RuleLock);
 
     rule = RepFindRuleByIdLocked(Engine, RuleId);
     if (rule == NULL) {
-        ExReleasePushLockShared(&Engine->RuleLock);
+        ExReleasePushLockExclusive(&Engine->RuleLock);
         KeLeaveCriticalRegion();
         return STATUS_NOT_FOUND;
     }
 
-    //
-    // Simple boolean write is atomic on all platforms
-    //
     rule->Public.Enabled = Enable;
 
-    ExReleasePushLockShared(&Engine->RuleLock);
+    ExReleasePushLockExclusive(&Engine->RuleLock);
     KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
@@ -1023,6 +1020,148 @@ Arguments:
     }
 
     ExFreePoolWithTag(Result, RE_POOL_TAG_RESULT);
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ReEvaluateInPlace(
+    _In_ PRE_ENGINE Engine,
+    _In_ const RE_EVALUATION_CONTEXT* Context,
+    _Out_ PRE_EVALUATION_RESULT Result
+    )
+/*++
+Routine Description:
+    Evaluates all rules against the provided context using a caller-provided
+    result buffer.  Zero heap allocations on the hot path — ideal for
+    per-event evaluation in BepProcessSingleEvent.
+
+    Returns a COPY of matched rule data (no internal pointers exposed).
+
+Arguments:
+    Engine  - Rule engine instance.
+    Context - Evaluation context.
+    Result  - Caller-provided buffer filled with result. No free required.
+
+Return Value:
+    STATUS_SUCCESS on success (even if no rule matched).
+--*/
+{
+    PLIST_ENTRY entry;
+    PRE_INTERNAL_RULE rule;
+    BOOLEAN allConditionsMatch;
+    ULONG i;
+
+    PAGED_CODE();
+
+    if (!RepValidateEngine(Engine)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!RepValidateContext(Context)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (Result == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(Result, sizeof(RE_EVALUATION_RESULT));
+    Result->RuleMatched = FALSE;
+    Result->PrimaryAction = ReAction_None;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Engine->RuleLock);
+
+    for (entry = Engine->RuleList.Flink;
+         entry != &Engine->RuleList;
+         entry = entry->Flink) {
+
+        rule = CONTAINING_RECORD(entry, RE_INTERNAL_RULE, Public.ListEntry);
+
+        if (!rule->Public.Enabled ||
+            rule->MarkedForDeletion ||
+            !rule->IsCompiled) {
+            continue;
+        }
+
+        InterlockedIncrement64(&rule->Public.EvaluationCount);
+        InterlockedIncrement64(&Engine->Stats.Evaluations);
+
+        allConditionsMatch = TRUE;
+
+        for (i = 0; i < rule->CompiledConditionCount; i++) {
+            BOOLEAN conditionResult = RepEvaluateCondition(
+                &rule->CompiledConditions[i],
+                Context
+            );
+
+            if (rule->CompiledConditions[i].Negate) {
+                conditionResult = !conditionResult;
+            }
+
+            if (!conditionResult) {
+                allConditionsMatch = FALSE;
+                break;
+            }
+        }
+
+        if (allConditionsMatch && rule->CompiledConditionCount > 0) {
+            Result->RuleMatched = TRUE;
+
+            RtlCopyMemory(
+                Result->MatchedRuleId,
+                rule->Public.RuleId,
+                sizeof(Result->MatchedRuleId)
+            );
+            Result->MatchedRuleId[RE_MAX_RULE_ID_LEN] = '\0';
+
+            RtlCopyMemory(
+                Result->MatchedRuleName,
+                rule->Public.RuleName,
+                sizeof(Result->MatchedRuleName)
+            );
+            Result->MatchedRuleName[RE_MAX_RULE_NAME_LEN] = '\0';
+
+            Result->MatchedRulePriority = rule->Public.Priority;
+
+            Result->ActionCount = min(rule->Public.ActionCount, RE_MAX_ACTIONS);
+            for (i = 0; i < Result->ActionCount; i++) {
+                RtlCopyMemory(
+                    &Result->Actions[i],
+                    &rule->Public.Actions[i],
+                    sizeof(RE_ACTION)
+                );
+            }
+
+            if (Result->ActionCount > 0) {
+                Result->PrimaryAction = Result->Actions[0].Type;
+            }
+
+            InterlockedIncrement64(&rule->Public.MatchCount);
+            InterlockedIncrement64(&Engine->Stats.Matches);
+
+            if (Result->PrimaryAction == ReAction_Block) {
+                InterlockedIncrement64(&Engine->Stats.Blocks);
+            }
+
+            {
+                LARGE_INTEGER currentTime;
+                KeQuerySystemTimePrecise(&currentTime);
+                InterlockedExchange64(
+                    &rule->Public.LastMatchTime,
+                    currentTime.QuadPart
+                );
+            }
+
+            break;
+        }
+    }
+
+    ExReleasePushLockShared(&Engine->RuleLock);
+    KeLeaveCriticalRegion();
+
+    return STATUS_SUCCESS;
 }
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -1872,8 +2011,9 @@ RepEvaluateCondition(
 
     case ReCondition_Custom:
         //
-        // Custom conditions require external handler
-        // For now, always return FALSE (safe default)
+        // Custom conditions are extensible placeholders that require
+        // an external evaluation handler registered at runtime.
+        // No handler is registered in kernel mode — safe FALSE default.
         //
         result = FALSE;
         break;

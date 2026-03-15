@@ -2770,6 +2770,55 @@ BepProcessSingleEvent(
     }
 
     //
+    // === Rule Engine Evaluation ===
+    // Evaluate user-configured detection rules (loaded via MessageHandler from
+    // user-mode). Rules match on process name, command line, file path, registry
+    // path, threat score, MITRE technique, etc. and produce actions (Block,
+    // Alert, Quarantine, Log). Stack-allocated result avoids pool pressure.
+    //
+    // IRQL: PASSIVE_LEVEL — ReEvaluateInPlace requires <= APC_LEVEL.
+    //
+    if (g_RuleEngine != NULL) {
+        RE_EVALUATION_CONTEXT ruleCtx;
+        RE_EVALUATION_RESULT ruleResult;
+        UNICODE_STRING procNameStr;
+        UNICODE_STRING cmdLineStr;
+
+        RtlZeroMemory(&ruleCtx, sizeof(ruleCtx));
+
+        ruleCtx.ProcessId = ULongToHandle(Event->ProcessId);
+        ruleCtx.ParentProcessId = ULongToHandle(Event->ParentProcessId);
+        ruleCtx.ThreatScore = threatScore;
+        ruleCtx.BehaviorFlags = processContext->Flags;
+        KeQuerySystemTimePrecise(&ruleCtx.CurrentTime);
+
+        processContext->ImagePath[MAX_FILE_PATH_LENGTH - 1] = L'\0';
+        RtlInitUnicodeString(&procNameStr, processContext->ImagePath);
+        ruleCtx.ProcessName = &procNameStr;
+
+        if (processContext->CommandLine[0] != L'\0') {
+            processContext->CommandLine[MAX_COMMAND_LINE_LENGTH - 1] = L'\0';
+            RtlInitUnicodeString(&cmdLineStr, processContext->CommandLine);
+            ruleCtx.CommandLine = &cmdLineStr;
+        }
+
+        if (NT_SUCCESS(ReEvaluateInPlace(g_RuleEngine, &ruleCtx, &ruleResult)) &&
+            ruleResult.RuleMatched) {
+
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                "[ShadowStrike:BehaviorEngine] Rule matched: '%s' (action=%u) for PID %u\n",
+                ruleResult.MatchedRuleId,
+                (ULONG)ruleResult.PrimaryAction,
+                Event->ProcessId);
+
+            if (ruleResult.PrimaryAction == ReAction_Block) {
+                Event->Flags |= BE_EVENT_FLAG_BLOCKING;
+                InterlockedIncrement64(&g_BeState.TotalThreatsDetected);
+            }
+        }
+    }
+
+    //
     // Check if event should be correlated to attack chain
     //
     if (threatScore >= BE_SEVERITY_MEDIUM_THRESHOLD ||
