@@ -3319,6 +3319,13 @@ ShadowStrikeGetIntegrityMonitor(VOID)
     return g_IntegrityMonitor;
 }
 
+_IRQL_requires_max_(APC_LEVEL)
+HAWQ_MANAGER
+ShadowStrikeGetAsyncWorkQueue(VOID)
+{
+    return g_AsyncWorkQueue;
+}
+
 // ============================================================================
 // VERSION COMPATIBILITY CHECK
 // ============================================================================

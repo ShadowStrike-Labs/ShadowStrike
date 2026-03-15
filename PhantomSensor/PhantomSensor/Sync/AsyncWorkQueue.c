@@ -38,7 +38,9 @@
  * ============================================================================
  */
 
+#include "../Core/DriverEntry.h"
 #include "AsyncWorkQueue.h"
+#include "../Performance/PerformanceMonitor.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -832,6 +834,12 @@ AwqSubmit(
     //
     if ((ULONG)Mgr->Queues[Priority].ItemCount >= Mgr->Config.MaxQueueSize) {
         InterlockedIncrement64(&Mgr->Queues[Priority].TotalDropped);
+        {
+            PSSPM_MONITOR pm = ShadowStrikeGetPerformanceMonitor();
+            if (pm != NULL) {
+                SsPmRecordSample(pm, SsPmMetric_DroppedEvents, 1);
+            }
+        }
         ExReleaseRundownProtection(&Mgr->RundownRef);
         return STATUS_QUOTA_EXCEEDED;
     }
@@ -2016,6 +2024,12 @@ AwqpExecuteItem(
     if (NT_SUCCESS(Status)) {
         InterlockedExchange(&Item->State, (LONG)AwqItemState_Completed);
         InterlockedIncrement64(&Mgr->Stats.TotalCompleted);
+        {
+            PSSPM_MONITOR pm = ShadowStrikeGetPerformanceMonitor();
+            if (pm != NULL) {
+                SsPmRecordSample(pm, SsPmMetric_EventsPerSecond, 1);
+            }
+        }
     } else {
         InterlockedExchange(&Item->State, (LONG)AwqItemState_Failed);
         InterlockedIncrement64(&Mgr->Stats.TotalFailed);
@@ -2178,7 +2192,9 @@ AwqpCreateWorker(
         // Thread was created but we can't reference it.
         // Signal it to stop; it will exit and free itself.
         // ThreadObject remains NULL → worker self-frees on exit.
+        // Must balance the WorkerCount increment from ThreadId assignment.
         //
+        InterlockedDecrement(&Mgr->WorkerCount);
         InterlockedExchange(&W->Running, 0);
         return Status;
     }
@@ -2263,33 +2279,38 @@ AwqpWorkerThread(
             }
 
             //
-            // Dynamic scaling: exit if idle too long and above minimum
+            // Dynamic scaling: exit if idle too long and above minimum.
+            // CRITICAL: The MinWorkers check MUST be under the WorkerLock
+            // to prevent a TOCTOU where multiple idle workers all see
+            // WorkerCount > MinWorkers and all exit, leaving zero workers.
             //
-            if (Mgr->Config.EnableDynamicThreads &&
-                (ULONG)Mgr->WorkerCount > Mgr->MinWorkers) {
+            if (Mgr->Config.EnableDynamicThreads) {
 
                 LARGE_INTEGER Now;
                 KeQuerySystemTimePrecise(&Now);
                 LONG64 IdleMs = (Now.QuadPart - Worker->IdleStartTime.QuadPart) / 10000;
 
                 if (IdleMs > AWQ_IDLE_TIMEOUT_MS) {
-                    //
-                    // Remove ourselves from the worker list and exit
-                    //
+                    BOOLEAN ShouldExit = FALSE;
+
                     AWQ_LOCK_EXCLUSIVE(&Mgr->WorkerLock);
-                    RemoveEntryList(&Worker->ListEntry);
+                    if ((ULONG)Mgr->WorkerCount > Mgr->MinWorkers) {
+                        RemoveEntryList(&Worker->ListEntry);
+                        InterlockedDecrement(&Mgr->WorkerCount);
+                        InterlockedDecrement(&Mgr->IdleWorkerCount);
+                        ShouldExit = TRUE;
+                    }
                     AWQ_UNLOCK_EXCLUSIVE(&Mgr->WorkerLock);
 
-                    InterlockedDecrement(&Mgr->WorkerCount);
-                    InterlockedDecrement(&Mgr->IdleWorkerCount);
+                    if (ShouldExit) {
+                        if (Worker->ThreadObject != NULL) {
+                            ObDereferenceObject(Worker->ThreadObject);
+                        }
+                        ExFreePoolWithTag(Worker, AWQ_POOL_TAG_THREAD);
 
-                    if (Worker->ThreadObject != NULL) {
-                        ObDereferenceObject(Worker->ThreadObject);
+                        PsTerminateSystemThread(STATUS_SUCCESS);
+                        // No return
                     }
-                    ExFreePoolWithTag(Worker, AWQ_POOL_TAG_THREAD);
-
-                    PsTerminateSystemThread(STATUS_SUCCESS);
-                    // No return
                 }
             }
         }
