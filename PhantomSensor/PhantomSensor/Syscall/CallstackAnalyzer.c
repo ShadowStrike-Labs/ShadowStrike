@@ -154,6 +154,7 @@ typedef struct _CSA_MODULE_CACHE_ENTRY {
     BOOLEAN IsKernel32;
     BOOLEAN IsKnownGood;
     BOOLEAN IsSystemModule;
+    BOOLEAN PendingEvict;  // Set by CsapEvictProcessEntries when RefCount > 1
 
     LARGE_INTEGER CacheTime;
 } CSA_MODULE_CACHE_ENTRY, *PCSA_MODULE_CACHE_ENTRY;
@@ -257,6 +258,14 @@ CsapGetThreadStackBounds(
     );
 
 _IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+CsapReadThreadStackBoundsAttached(
+    _In_ PETHREAD Thread,
+    _Out_ PVOID* StackBase,
+    _Out_ PVOID* StackLimit
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
 static BOOLEAN
 CsapIsReturnAddressValid(
     _In_ PVOID ReturnAddress,
@@ -270,8 +279,11 @@ CsapAnalyzeUnbackedCode(
     _In_ PVOID Address
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static VOID CsapReferenceModuleEntry(_Inout_ PCSA_MODULE_CACHE_ENTRY Entry);
-static VOID CsapDereferenceModuleEntry(_Inout_ PCSA_MODULE_CACHE_ENTRY Entry);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID CsapDereferenceModuleEntry(_In_ PCSA_ANALYZER_INTERNAL Analyzer, _Inout_ PCSA_MODULE_CACHE_ENTRY Entry);
 
 _IRQL_requires_(PASSIVE_LEVEL)
 static VOID
@@ -286,14 +298,22 @@ CsapEvictProcessEntries(
     _In_ HANDLE ProcessId
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static ULONG
 CsapCalculateSuspicionScore(
     _In_ PCSA_CALLSTACK Callstack
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 CsapPopulateTextSection(
     _In_ PEPROCESS Process,
+    _Inout_ PCSA_MODULE_CACHE_ENTRY CacheEntry
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
+CsapPopulateTextSectionInline(
     _Inout_ PCSA_MODULE_CACHE_ENTRY CacheEntry
     );
 
@@ -718,6 +738,44 @@ CsaDetectStackPivot(
     }
 
     //
+    // Heuristic 0: TEB stack bounds sanity check.
+    // Read the thread's StackBase/StackLimit from TEB. If the bounds
+    // are invalid, corrupted, or abnormally sized, flag as suspicious.
+    // A tampered TEB is a strong evasion indicator.
+    // Uses CsapReadThreadStackBoundsAttached to avoid redundant
+    // PsLookup calls — we already hold process and thread references.
+    //
+    {
+        PVOID stackBase = NULL;
+        PVOID stackLimit = NULL;
+
+        KeStackAttachProcess(process, &apcState);
+        status = CsapReadThreadStackBoundsAttached(thread, &stackBase, &stackLimit);
+        KeUnstackDetachProcess(&apcState);
+
+        if (NT_SUCCESS(status) && stackBase != NULL && stackLimit != NULL) {
+            SIZE_T stackSize = (ULONG_PTR)stackBase - (ULONG_PTR)stackLimit;
+
+            //
+            // Normal thread stacks: 4KB (guard) to 64MB (max commit).
+            // Anything outside this range is suspicious — either the
+            // TEB is corrupted or the stack was manipulated.
+            //
+            if (stackSize < 0x1000 || stackSize > 0x4000000) {
+                pivoted = TRUE;
+                ObDereferenceObject(process);
+                ObDereferenceObject(thread);
+                *IsPivoted = TRUE;
+                return STATUS_SUCCESS;
+            }
+        }
+        //
+        // If bounds retrieval failed (e.g., system thread with no TEB),
+        // skip this heuristic — proceed to frame-based checks.
+        //
+    }
+
+    //
     // Walk up to 16 user-mode frames. RtlWalkFrameChain with flag=1
     // traverses user-mode frames only.
     //
@@ -947,6 +1005,17 @@ CsapThrottleCheck(
     LONGLONG windowStart;
     LONG count;
 
+    //
+    // NOTE: Intentional benign race condition.
+    // The window reset (InterlockedExchange64 on CaptureWindowStart) and
+    // the counter increment (InterlockedIncrement on CapturesInWindow)
+    // are not atomic together. Two threads may both see an expired window
+    // and both reset, or a thread may increment a stale counter during
+    // a window reset. This is acceptable because:
+    //   - The throttle is a soft rate limiter, not a security boundary
+    //   - Worst case: ~2× captures in the first 100ms of a new window
+    //   - No memory safety or correctness issue
+    //
     KeQuerySystemTimePrecise(&now);
     windowStart = InterlockedCompareExchange64(
         &AnalyzerInternal->CaptureWindowStart,
@@ -1120,7 +1189,7 @@ CsapAnalyzeFrames(
                 frame->AnomalyFlags |= CsaAnomaly_SpoofedFrames;
             }
 
-            CsapDereferenceModuleEntry(moduleEntry);
+            CsapDereferenceModuleEntry(AnalyzerInternal, moduleEntry);
         } else {
             //
             // No module found — unbacked code
@@ -1382,17 +1451,27 @@ CsapPopulateModuleCache(
     KeUnstackDetachProcess(&apcState);
 
     //
-    // Phase 2: Process the snapshot under lock — no user-mode access here.
-    // This eliminates the lock-inside-__try bug entirely.
+    // Phase 2: Allocate cache entries for new modules, populate text sections
+    // with a SINGLE re-attach (instead of N separate attaches), then insert
+    // under lock with dedup check.
     //
     if (NT_SUCCESS(status) || snapshotCount > 0) {
+        LIST_ENTRY newEntries;
+        ULONG newEntryCount = 0;
+
+        InitializeListHead(&newEntries);
+
+        //
+        // Phase 2a: Allocate and populate basic fields for new modules.
+        // No locks, no process attach needed.
+        //
         for (i = 0; i < snapshotCount; i++) {
             if (!snapshot[i].Valid) {
                 continue;
             }
 
             //
-            // Check if already cached
+            // Quick check if already cached (shared lock, fast path)
             //
             PCSA_MODULE_CACHE_ENTRY existing = NULL;
             NTSTATUS lookupStatus = CsapLookupModule(
@@ -1404,13 +1483,10 @@ CsapPopulateModuleCache(
                 );
 
             if (NT_SUCCESS(lookupStatus) && existing != NULL) {
-                CsapDereferenceModuleEntry(existing);
+                CsapDereferenceModuleEntry(AnalyzerInternal, existing);
                 continue;
             }
 
-            //
-            // Allocate and populate cache entry
-            //
             PCSA_MODULE_CACHE_ENTRY cacheEntry =
                 (PCSA_MODULE_CACHE_ENTRY)ExAllocateFromNPagedLookasideList(
                     &AnalyzerInternal->ModuleCacheLookaside
@@ -1457,26 +1533,72 @@ CsapPopulateModuleCache(
 
             KeQuerySystemTimePrecise(&cacheEntry->CacheTime);
 
-            //
-            // Populate .text section info while attached to process
-            //
-            CsapPopulateTextSection(process, cacheEntry);
+            InsertTailList(&newEntries, &cacheEntry->ListEntry);
+            newEntryCount++;
+        }
 
-            //
-            // Insert under exclusive lock — enforce cache size limit
-            //
+        //
+        // Phase 2b: Single process attach for ALL text section lookups.
+        // This replaces N individual KeStackAttachProcess/Detach calls.
+        //
+        if (newEntryCount > 0 && !ShadowStrikeIsProcessTerminating(process)) {
+            PLIST_ENTRY textEntry;
+
+            KeStackAttachProcess(process, &apcState);
+
+            for (textEntry = newEntries.Flink;
+                 textEntry != &newEntries;
+                 textEntry = textEntry->Flink) {
+
+                PCSA_MODULE_CACHE_ENTRY cacheEntry = CONTAINING_RECORD(
+                    textEntry, CSA_MODULE_CACHE_ENTRY, ListEntry);
+
+                CsapPopulateTextSectionInline(cacheEntry);
+            }
+
+            KeUnstackDetachProcess(&apcState);
+        }
+
+        //
+        // Phase 2c: Insert under exclusive lock with dedup check.
+        //
+        while (!IsListEmpty(&newEntries)) {
+            PLIST_ENTRY listEntry = RemoveHeadList(&newEntries);
+            PCSA_MODULE_CACHE_ENTRY cacheEntry = CONTAINING_RECORD(
+                listEntry, CSA_MODULE_CACHE_ENTRY, ListEntry);
+
+            InitializeListHead(&cacheEntry->ListEntry);
+
             KeEnterCriticalRegion();
             ExAcquirePushLockExclusive(&AnalyzerInternal->Public.ModuleLock);
 
-            if (AnalyzerInternal->CachedModuleCount < CSA_MAX_CACHED_MODULES) {
-                InsertTailList(&AnalyzerInternal->Public.ModuleCache, &cacheEntry->ListEntry);
-                InterlockedIncrement(&AnalyzerInternal->CachedModuleCount);
-            } else {
-                //
-                // Cache full — free the entry we just allocated
-                //
-                ExFreeToNPagedLookasideList(
-                    &AnalyzerInternal->ModuleCacheLookaside, cacheEntry);
+            {
+                BOOLEAN alreadyExists = FALSE;
+                PLIST_ENTRY dupEntry;
+
+                for (dupEntry = AnalyzerInternal->Public.ModuleCache.Flink;
+                     dupEntry != &AnalyzerInternal->Public.ModuleCache;
+                     dupEntry = dupEntry->Flink) {
+
+                    PCSA_MODULE_CACHE_ENTRY dupCheck = CONTAINING_RECORD(
+                        dupEntry, CSA_MODULE_CACHE_ENTRY, ListEntry);
+
+                    if (dupCheck->ProcessId == ProcessId &&
+                        dupCheck->ProcessCreateTime == ProcessCreateTime &&
+                        dupCheck->ModuleBase == cacheEntry->ModuleBase) {
+                        alreadyExists = TRUE;
+                        break;
+                    }
+                }
+
+                if (!alreadyExists &&
+                    AnalyzerInternal->CachedModuleCount < CSA_MAX_CACHED_MODULES) {
+                    InsertTailList(&AnalyzerInternal->Public.ModuleCache, &cacheEntry->ListEntry);
+                    InterlockedIncrement(&AnalyzerInternal->CachedModuleCount);
+                } else {
+                    ExFreeToNPagedLookasideList(
+                        &AnalyzerInternal->ModuleCacheLookaside, cacheEntry);
+                }
             }
 
             ExReleasePushLockExclusive(&AnalyzerInternal->Public.ModuleLock);
@@ -1509,6 +1631,24 @@ CsapPopulateTextSection(
     }
 
     KeStackAttachProcess(Process, &apcState);
+    CsapPopulateTextSectionInline(CacheEntry);
+    KeUnstackDetachProcess(&apcState);
+}
+
+//
+// Inline variant: caller MUST already be attached to the target process.
+// Used by CsapPopulateModuleCache to batch all text section lookups into
+// a single KeStackAttachProcess call instead of N separate attaches.
+//
+static
+VOID
+CsapPopulateTextSectionInline(
+    _Inout_ PCSA_MODULE_CACHE_ENTRY CacheEntry
+    )
+{
+    if (CacheEntry->ModuleBase == NULL) {
+        return;
+    }
 
     __try {
         PUCHAR base = (PUCHAR)CacheEntry->ModuleBase;
@@ -1571,8 +1711,6 @@ CsapPopulateTextSection(
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         // PE parsing failed — leave TextSection fields as NULL/0
     }
-
-    KeUnstackDetachProcess(&apcState);
 }
 
 
@@ -1595,6 +1733,7 @@ CsapReferenceModuleEntry(
 static
 VOID
 CsapDereferenceModuleEntry(
+    _In_ PCSA_ANALYZER_INTERNAL Analyzer,
     _Inout_ PCSA_MODULE_CACHE_ENTRY Entry
     )
 {
@@ -1602,12 +1741,40 @@ CsapDereferenceModuleEntry(
         return;
     }
 
-    InterlockedDecrement(&Entry->RefCount);
+    LONG newRef = InterlockedDecrement(&Entry->RefCount);
 
     //
-    // Entries are freed during cache eviction or cleanup, not inline.
-    // The eviction path checks RefCount before freeing.
+    // Deferred eviction: if the process has exited (PendingEvict == TRUE)
+    // and this was the last operational reference (RefCount now 1 = cache ref),
+    // remove from cache and free. This prevents orphan entries from processes
+    // that exited while a callstack analysis held a module reference.
     //
+    if (newRef == 1 && Entry->PendingEvict && Analyzer != NULL) {
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&Analyzer->Public.ModuleLock);
+
+        //
+        // Re-check under lock: RefCount may have been incremented by
+        // another thread's CsapLookupModule between our check and lock.
+        //
+        if (Entry->RefCount == 1 && Entry->PendingEvict) {
+            RemoveEntryList(&Entry->ListEntry);
+            InterlockedDecrement(&Analyzer->CachedModuleCount);
+
+            ExReleasePushLockExclusive(&Analyzer->Public.ModuleLock);
+            KeLeaveCriticalRegion();
+
+            Entry->Signature = 0;
+            ExFreeToNPagedLookasideList(
+                &Analyzer->ModuleCacheLookaside,
+                Entry
+                );
+            return;
+        }
+
+        ExReleasePushLockExclusive(&Analyzer->Public.ModuleLock);
+        KeLeaveCriticalRegion();
+    }
 }
 
 
@@ -1692,13 +1859,15 @@ CsapEvictProcessEntries(
             //
             // Only evict if no outstanding references (RefCount == 1 means
             // only the cache itself holds a ref). If RefCount > 1, a lookup
-            // is in progress; the entry will be evicted on the next pass or
-            // at shutdown.
+            // is in progress; mark PendingEvict so the entry is freed when
+            // the last reference is released in CsapDereferenceModuleEntry.
             //
             if (cacheEntry->RefCount <= 1) {
                 RemoveEntryList(entry);
                 InterlockedDecrement(&AnalyzerInternal->CachedModuleCount);
                 InsertTailList(&entriesToFree, entry);
+            } else {
+                cacheEntry->PendingEvict = TRUE;
             }
         }
     }
@@ -1796,8 +1965,6 @@ CsapGetThreadStackBounds(
     NTSTATUS status;
     PEPROCESS process = NULL;
     PETHREAD thread = NULL;
-    PVOID tebRaw = NULL;
-    PNT_TIB tib = NULL;
     KAPC_STATE apcState;
 
     *StackBase = NULL;
@@ -1814,25 +1981,6 @@ CsapGetThreadStackBounds(
         return status;
     }
 
-    tebRaw = PsGetThreadTeb(thread);
-    if (tebRaw == NULL) {
-        ObDereferenceObject(thread);
-        ObDereferenceObject(process);
-        return STATUS_NOT_FOUND;
-    }
-
-    //
-    // Validate TEB is in user-mode range
-    //
-    if ((ULONG_PTR)tebRaw < CSA_MIN_VALID_USER_ADDRESS ||
-        (ULONG_PTR)tebRaw > CSA_MAX_USER_ADDRESS) {
-        ObDereferenceObject(thread);
-        ObDereferenceObject(process);
-        return STATUS_INVALID_ADDRESS;
-    }
-
-    tib = (PNT_TIB)tebRaw;
-
     if (ShadowStrikeIsProcessTerminating(process)) {
         ObDereferenceObject(thread);
         ObDereferenceObject(process);
@@ -1840,6 +1988,46 @@ CsapGetThreadStackBounds(
     }
 
     KeStackAttachProcess(process, &apcState);
+    status = CsapReadThreadStackBoundsAttached(thread, StackBase, StackLimit);
+    KeUnstackDetachProcess(&apcState);
+
+    ObDereferenceObject(thread);
+    ObDereferenceObject(process);
+
+    return status;
+}
+
+//
+// Internal variant: caller MUST already hold process/thread references
+// AND be attached to the target process. Avoids redundant PsLookup calls
+// when CsaDetectStackPivot already has both references.
+//
+static
+NTSTATUS
+CsapReadThreadStackBoundsAttached(
+    _In_ PETHREAD Thread,
+    _Out_ PVOID* StackBase,
+    _Out_ PVOID* StackLimit
+    )
+{
+    NTSTATUS status = STATUS_NOT_FOUND;
+    PVOID tebRaw;
+    PNT_TIB tib;
+
+    *StackBase = NULL;
+    *StackLimit = NULL;
+
+    tebRaw = PsGetThreadTeb(Thread);
+    if (tebRaw == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+
+    if ((ULONG_PTR)tebRaw < CSA_MIN_VALID_USER_ADDRESS ||
+        (ULONG_PTR)tebRaw > CSA_MAX_USER_ADDRESS) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    tib = (PNT_TIB)tebRaw;
 
     __try {
         ProbeForRead(tib, sizeof(NT_TIB), sizeof(PVOID));
@@ -1847,9 +2035,6 @@ CsapGetThreadStackBounds(
         PVOID base = tib->StackBase;
         PVOID limit = tib->StackLimit;
 
-        //
-        // Validate stack bounds are in user space and ordered correctly
-        //
         if ((ULONG_PTR)base > CSA_MAX_USER_ADDRESS ||
             (ULONG_PTR)limit < CSA_MIN_VALID_USER_ADDRESS ||
             (ULONG_PTR)limit >= (ULONG_PTR)base) {
@@ -1863,11 +2048,6 @@ CsapGetThreadStackBounds(
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();
     }
-
-    KeUnstackDetachProcess(&apcState);
-
-    ObDereferenceObject(thread);
-    ObDereferenceObject(process);
 
     return status;
 }

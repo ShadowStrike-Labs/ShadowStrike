@@ -1502,8 +1502,47 @@ Return Value:
                 }
             }
 
+            //
+            // Supplementary: validate return addresses against module .text sections.
+            // Must run BEFORE CsaFreeCallstack (needs the callstack).
+            //
+            if (csaAnomalies != 0 || threatScore >= 200) {
+                BOOLEAN allValid = TRUE;
+                NTSTATUS valStatus = CsaValidateReturnAddresses(
+                    g_ScState.CallstackAnalyzer,
+                    csaCallstack,
+                    &allValid
+                    );
+
+                if (NT_SUCCESS(valStatus) && !allValid) {
+                    detectFlags |= SC_DETECT_UNBACKED_CALLER;
+                    threatScore += 150;
+                }
+            }
+
             CsaFreeCallstack(csaCallstack);
             csaCallstack = NULL;
+        }
+
+        //
+        // CsaDetectStackPivot: TEB bounds + CALL instruction heuristics.
+        // Does NOT need a captured callstack — it does its own frame walk.
+        // NOTE: RtlWalkFrameChain(flags=1) captures the CURRENT thread's
+        // user stack — correct in syscall hook context because we ARE the
+        // target thread. Would need redesign for async scanning.
+        //
+        if (csaAnomalies != 0 || threatScore >= 200) {
+            BOOLEAN isPivoted = FALSE;
+            NTSTATUS pivotStatus = CsaDetectStackPivot(
+                g_ScState.CallstackAnalyzer,
+                (HANDLE)(ULONG_PTR)ThreadId,
+                &isPivoted
+                );
+
+            if (NT_SUCCESS(pivotStatus) && isPivoted) {
+                detectFlags |= SC_DETECT_STACK_ANOMALY;
+                threatScore += 500;
+            }
         }
     }
 
@@ -1882,7 +1921,34 @@ ScMonitorAnalyzeCallStack(
         }
     }
 
+    //
+    // Supplementary: validate return addresses (needs callstack, before free).
+    //
+    if (anomalies != 0 || score >= 200) {
+        BOOLEAN allValid = TRUE;
+        if (NT_SUCCESS(CsaValidateReturnAddresses(
+                g_ScState.CallstackAnalyzer,
+                callstack,
+                &allValid)) && !allValid) {
+            *AnomalyFlags |= SC_STACK_ANOMALY_UNBACKED;
+        }
+    }
+
     CsaFreeCallstack(callstack);
+
+    //
+    // Stack pivot detection (independent of callstack — does own frame walk).
+    //
+    if (anomalies != 0 || score >= 200) {
+        BOOLEAN isPivoted = FALSE;
+        if (NT_SUCCESS(CsaDetectStackPivot(
+                g_ScState.CallstackAnalyzer,
+                (HANDLE)(ULONG_PTR)ThreadId,
+                &isPivoted)) && isPivoted) {
+            *AnomalyFlags |= SC_STACK_ANOMALY_PIVOT;
+        }
+    }
+
     return status;
 }
 
