@@ -802,3 +802,17 @@ struct _ACT_TRACKER*
 BeGetAttackChainTracker(
     VOID
     );
+
+/**
+ * @brief Get the global Pattern Matcher instance.
+ *
+ * Returns the pattern matcher initialized by BehaviorEngine. May return NULL
+ * if the matcher failed to initialize or BehaviorEngine is not yet started.
+ *
+ * @return Pointer to pattern matcher, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+struct _PM_MATCHER*
+BeGetPatternMatcher(
+    VOID
+    );
