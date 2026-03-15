@@ -285,6 +285,7 @@ typedef struct _BE_PROCESS_CONTEXT {
 #define BE_PROC_FLAG_TERMINATED           0x00000080
 #define BE_PROC_FLAG_LOLBIN               0x00000100
 #define BE_PROC_FLAG_SCRIPT_HOST          0x00000200
+#define BE_PROC_FLAG_ANOMALOUS            0x00000400
 
 // ============================================================================
 // BEHAVIORAL RULES

@@ -163,6 +163,11 @@
 #define BE_SEVERITY_CRITICAL_THRESHOLD  900
 
 /**
+ * @brief Anomaly detection score boost when statistical deviation detected
+ */
+#define BE_ANOMALY_SCORE_BOOST          200
+
+/**
  * @brief Maximum process name length
  */
 #define BE_MAX_PROCESS_NAME             260
@@ -2801,6 +2806,53 @@ BepProcessSingleEvent(
     }
 
     //
+    // === Anomaly Detector Statistical Analysis ===
+    // Feed every event to the AnomalyDetector for per-process statistical
+    // baseline building and deviation detection. Each event type maps to
+    // an AD metric category. The detector builds Z-score + MAD baselines
+    // per process and flags statistically anomalous activity bursts.
+    //
+    // IRQL: PASSIVE_LEVEL — AdCheckForAnomaly requires <= APC_LEVEL.
+    //
+    if (g_AnomalyDetector != NULL) {
+        AD_METRIC_TYPE adMetric;
+        BOOLEAN isAnomaly = FALSE;
+        UINT16 eventCategory = (UINT16)(Event->EventType >> 8);
+
+        switch (eventCategory) {
+            case 0x00: adMetric = AdMetric_ProcessCreation; break;
+            case 0x01: adMetric = AdMetric_ThreadCreation;  break;
+            case 0x02: adMetric = AdMetric_MemoryUsage;     break;
+            case 0x03: adMetric = AdMetric_PrivilegeUse;    break;
+            case 0x04: adMetric = AdMetric_RegistryOperations; break;
+            case 0x05: adMetric = AdMetric_DLLLoads;        break;
+            case 0x06: adMetric = AdMetric_HandleCount;     break;
+            case 0x07: adMetric = AdMetric_NetworkConnections; break;
+            case 0x08: adMetric = AdMetric_FileOperations;  break;
+            default:   adMetric = AdMetric_Custom;          break;
+        }
+
+        (VOID)AdCheckForAnomaly(
+            g_AnomalyDetector,
+            ULongToHandle(Event->ProcessId),
+            adMetric,
+            (DOUBLE)threatScore,
+            &isAnomaly,
+            NULL
+        );
+
+        if (isAnomaly) {
+            //
+            // Anomalous behavior burst detected — boost threat score
+            // to reflect statistical deviation from baseline.
+            //
+            threatScore += BE_ANOMALY_SCORE_BOOST;
+            processContext->Flags |= BE_PROC_FLAG_ANOMALOUS;
+            InterlockedIncrement64(&g_BeState.TotalThreatsDetected);
+        }
+    }
+
+    //
     // === Rule Engine Evaluation ===
     // Evaluate user-configured detection rules (loaded via MessageHandler from
     // user-mode). Rules match on process name, command line, file path, registry
@@ -3992,31 +4044,35 @@ BepCleanupStaleChains(
              chain->RefCount <= 1)) {
 
             RemoveEntryList(&chain->ListEntry);
-            InsertTailList(&staleList, &chain->ListEntry);
             g_BeState.ActiveChainCount--;
+
+            //
+            // Remove from hash table while still holding ChainLock.
+            // This prevents concurrent hash lookups from acquiring
+            // a reference to a chain we're about to free.
+            //
+            BepRemoveChainFromHash(chain);
+
+            //
+            // Remove from process context's chain list
+            //
+            ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
+            RemoveEntryList(&chain->ProcessListEntry);
+            ExReleaseResourceLite(&g_BeState.ProcessLock);
+
+            InsertTailList(&staleList, &chain->ListEntry);
         }
     }
 
     ExReleaseResourceLite(&g_BeState.ChainLock);
 
     //
-    // Free stale chains — also remove from hash table and process chain list
+    // Free stale chains — already removed from all lists and hash tables,
+    // so no concurrent access is possible.
     //
     while (!IsListEmpty(&staleList)) {
         entry = RemoveHeadList(&staleList);
         chain = CONTAINING_RECORD(entry, BE_ATTACK_CHAIN, ListEntry);
-
-        //
-        // Remove from chain hash table
-        //
-        BepRemoveChainFromHash(chain);
-
-        //
-        // Remove from process context's chain list
-        //
-        ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
-        RemoveEntryList(&chain->ProcessListEntry);
-        ExReleaseResourceLite(&g_BeState.ProcessLock);
 
         //
         // Free chain entries
@@ -4060,21 +4116,28 @@ BepCleanupStaleProcessContexts(
         //
         if ((context->Flags & BE_PROC_FLAG_TERMINATED) && context->RefCount <= 1) {
             RemoveEntryList(&context->ListEntry);
-            InsertTailList(&staleList, &context->ListEntry);
             g_BeState.ProcessContextCount--;
+
+            //
+            // Remove from hash table while still holding ProcessLock.
+            // This prevents a concurrent hash lookup from acquiring a
+            // reference to a context we're about to free.
+            //
+            BepRemoveProcessContextFromHash(context);
+
+            InsertTailList(&staleList, &context->ListEntry);
         }
     }
 
     ExReleaseResourceLite(&g_BeState.ProcessLock);
 
     //
-    // Free stale contexts — also remove from hash table to prevent
-    // use-after-free on subsequent hash lookups.
+    // Free stale contexts — already removed from both main list and
+    // hash table, so no concurrent access is possible.
     //
     while (!IsListEmpty(&staleList)) {
         entry = RemoveHeadList(&staleList);
         context = CONTAINING_RECORD(entry, BE_PROCESS_CONTEXT, ListEntry);
-        BepRemoveProcessContextFromHash(context);
         BepFreeProcessContext(context);
     }
 }
