@@ -53,6 +53,7 @@
 #include "../Utilities/HashUtils.h"
 #include "../Utilities/FileUtils.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Utilities/ProcessUtils.h"
 #include "../Shared/SharedDefs.h"
 #include "../Shared/PortName.h"
 #include "../Callbacks/FileSystem/NamedPipeMonitor.h"
@@ -210,6 +211,7 @@ static ULONG g_SubsystemFlags = SubsysFlag_None;
 static BOOLEAN g_PreSetInfoInitialized = FALSE;
 static BOOLEAN g_PreWriteInitialized = FALSE;
 static BOOLEAN g_FileUtilsInitialized = FALSE;
+static BOOLEAN g_ProcessUtilsInitialized = FALSE;
 
 // ============================================================================
 // SUBSYSTEM HANDLE STORAGE
@@ -1096,6 +1098,22 @@ DriverEntry(
         goto Cleanup;
     }
     status = STATUS_SUCCESS;
+
+    //
+    // Step 4.6: Initialize process utilities (creating context table, function
+    // pointer resolution). Must precede ProcessNotify registration so the
+    // context hash table is ready to receive Store calls at process creation.
+    //
+    status = ShadowProcessUtilsInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize process utilities: 0x%08X\n",
+                   status);
+        // Non-fatal: lazy init will retry on first use. Continue.
+        status = STATUS_SUCCESS;
+    } else {
+        g_ProcessUtilsInitialized = TRUE;
+    }
 
     //
     // Step 5: Initialize lookaside lists for memory allocation
@@ -3151,6 +3169,15 @@ ShadowStrikeUnload(
     g_InitFlags = InitFlag_None;
 
     //
+    // Step 11.5: Cleanup process utilities (creating context table drain).
+    // Must happen before MemoryUtils cleanup since it frees pool memory.
+    //
+    if (g_ProcessUtilsInitialized) {
+        ShadowProcessUtilsCleanup();
+        g_ProcessUtilsInitialized = FALSE;
+    }
+
+    //
     // Step 12: Cleanup memory utilities (foundational — must be after all other
     // module cleanups that may free memory; logs leak stats in debug builds)
     //
@@ -4209,6 +4236,14 @@ ShadowStrikeCleanupByFlags(
     }
 
     ShadowStrikeCleanupProtectedProcessList();
+
+    //
+    // Cleanup process utilities (creating context table drain)
+    //
+    if (g_ProcessUtilsInitialized) {
+        ShadowProcessUtilsCleanup();
+        g_ProcessUtilsInitialized = FALSE;
+    }
 
     //
     // Cleanup memory utilities (foundational — after all module cleanups)

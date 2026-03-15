@@ -2475,6 +2475,19 @@ PnpCaptureProcessInfo(
     Context->RealParentProcessId = CreateInfo->CreatingThreadId.UniqueProcess;
 
     //
+    // Store creating process context in ProcessUtils hash table.
+    // This enables anti-parent-spoofing detection (T1134.004) via
+    // ShadowStrikeValidateParentChild — compares captured creating PID
+    // against the (potentially spoofed) InheritedFromUniqueProcessId.
+    // Best-effort: failure here is non-fatal (fallback to inherited PID).
+    //
+    ShadowStrikeStoreCreatingProcessContext(
+        ProcessId,
+        CreateInfo->CreatingThreadId.UniqueProcess,
+        CreateInfo->CreatingThreadId.UniqueThread
+    );
+
+    //
     // Timing
     //
     KeQuerySystemTime(&Context->CreateTime);
@@ -3894,6 +3907,13 @@ PnpHandleProcessTermination(
     // Without cleanup, tracking table fills to 2048 and module goes deaf.
     //
     CbMonRemoveProcess(ProcessId);
+
+    //
+    // Remove creating process context from ProcessUtils hash table.
+    // Must happen before context teardown — frees the entry that was
+    // stored at process creation time for anti-PPID-spoofing detection.
+    //
+    ShadowStrikeRemoveCreatingProcessContext(ProcessId);
 
     //
     // Release per-process module tracking in ImageNotify.

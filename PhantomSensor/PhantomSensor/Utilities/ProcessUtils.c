@@ -1806,6 +1806,13 @@ ShadowStrikeStoreCreatingProcessContext(
     }
 
     //
+    // Guard: reject if module is not initialized (push lock + list heads invalid)
+    //
+    if (g_ProcessUtilsState.InitializationState != PROCUTILS_STATE_INITIALIZED) {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    //
     // Limit table size to prevent unbounded growth
     //
     if (g_ProcessUtilsState.CreatingContextCount >= SHADOW_CREATING_CONTEXT_TABLE_SIZE * 4) {
