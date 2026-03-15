@@ -1888,11 +1888,10 @@ PwpSendRansomwareEvent(
     )
 {
     NTSTATUS status;
-    PSHADOWSTRIKE_MESSAGE_HEADER notification = NULL;
+    PUCHAR payloadBuf = NULL;
     PPW_RANSOMWARE_ALERT_DATA alertData;
     ULONG fileNameBytes = 0;
     ULONG dataSize;
-    ULONG totalSize;
 
     if (!SHADOWSTRIKE_USER_MODE_CONNECTED()) {
         return STATUS_PORT_DISCONNECTED;
@@ -1913,42 +1912,29 @@ PwpSendRansomwareEvent(
     }
 
     dataSize = sizeof(PW_RANSOMWARE_ALERT_DATA) + fileNameBytes;
-    totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + dataSize;
 
     //
-    // Cap total allocation to prevent abuse
+    // Cap payload to prevent abuse
     //
-    if (totalSize > 4096) {
-        totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + sizeof(PW_RANSOMWARE_ALERT_DATA);
+    if (dataSize > 4096) {
         dataSize = sizeof(PW_RANSOMWARE_ALERT_DATA);
         fileNameBytes = 0;
     }
 
-    notification = (PSHADOWSTRIKE_MESSAGE_HEADER)ExAllocatePool2(
+    payloadBuf = (PUCHAR)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
-        totalSize,
+        dataSize,
         PW_POOL_TAG
     );
 
-    if (notification == NULL) {
+    if (payloadBuf == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Initialize message header
+    // Fill ransomware alert payload (header built by batch flush callback)
     //
-    ShadowStrikeInitMessageHeader(
-        notification,
-        FilterMessageType_RansomwareAlert,
-        dataSize
-    );
-
-    //
-    // Fill ransomware alert payload
-    //
-    alertData = (PPW_RANSOMWARE_ALERT_DATA)(
-        (PUCHAR)notification + sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
-    );
+    alertData = (PPW_RANSOMWARE_ALERT_DATA)payloadBuf;
 
     alertData->ProcessId = HandleToULong(ProcessId);
     alertData->SuspicionScore = Score;
@@ -1990,14 +1976,20 @@ PwpSendRansomwareEvent(
     // Copy file name if present
     //
     if (fileNameBytes > 0 && FileName != NULL && FileName->Buffer != NULL) {
-        PUCHAR dest = (PUCHAR)alertData + sizeof(PW_RANSOMWARE_ALERT_DATA);
+        PUCHAR dest = payloadBuf + sizeof(PW_RANSOMWARE_ALERT_DATA);
         RtlCopyMemory(dest, FileName->Buffer, fileNameBytes);
     }
 
     //
-    // Send notification to user-mode via CommPort
+    // Route through batch processor for high-throughput delivery.
+    // Batch callback builds SHADOWSTRIKE_MESSAGE_HEADER and sends via CommPort.
+    // Falls back to direct send if batch processor is unavailable.
     //
-    status = ShadowStrikeSendNotification(notification, totalSize);
+    status = ShadowStrikeBatchSendNotification(
+        (UINT16)FilterMessageType_RansomwareAlert,
+        payloadBuf,
+        dataSize
+    );
 
     if (NT_SUCCESS(status)) {
         SHADOWSTRIKE_INC_STAT(MessagesSent);
@@ -2009,7 +2001,7 @@ PwpSendRansomwareEvent(
 #endif
     }
 
-    ExFreePoolWithTag(notification, PW_POOL_TAG);
+    ExFreePoolWithTag(payloadBuf, PW_POOL_TAG);
     return status;
 }
 

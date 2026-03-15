@@ -49,6 +49,7 @@
 #include "../../ETW/ETWConsumer.h"
 #include "../../ETW/ETWProvider.h"
 #include "../../Core/DriverEntry.h"
+#include "../../Performance/LookasideLists.h"
 
 // ============================================================================
 // POOL TAGS
@@ -126,10 +127,12 @@ typedef struct _SHADOWSTRIKE_REGISTRY_MONITOR {
     volatile LONG ProtectedKeyCount;
 
     //
-    // Lookaside list for context allocations
+    // Lookaside list for process context allocations (centralized if available)
     //
-    NPAGED_LOOKASIDE_LIST ContextLookaside;
+    PLL_LOOKASIDE ProcessCtxLookaside;
+    NPAGED_LOOKASIDE_LIST ProcessCtxLookasideFallback;
     BOOLEAN LookasideInitialized;
+    BOOLEAN UseManagedLookaside;
 
     //
     // Statistics
@@ -156,11 +159,88 @@ typedef struct _SHADOWSTRIKE_REGISTRY_MONITOR {
 
 } SHADOWSTRIKE_REGISTRY_MONITOR, *PSHADOWSTRIKE_REGISTRY_MONITOR;
 
+/**
+ * @brief Compact telemetry structure for registry behavioral alerts.
+ *
+ * Sent via BatchProcessing to user-mode for SOC visibility.
+ * Covers multi-persistence spray, defense-evasion combo, and ransomware prep.
+ */
+#pragma pack(push, 1)
+typedef struct _REG_BEHAVIORAL_ALERT {
+    ULONG ProcessId;
+    ULONG Score;
+    ULONG PatternFlags;          // Bitmask: 0x1=MultiPersistence, 0x2=DefEvasion+Persist, 0x4=RansomwarePrep
+    ULONG DistinctCategories;
+    ULONG RunKeyMods;
+    ULONG ServiceMods;
+    ULONG IFEOMods;
+    ULONG SecurityPolicyMods;
+    ULONG ThreatIndicators;
+    LARGE_INTEGER Timestamp;
+} REG_BEHAVIORAL_ALERT, *PREG_BEHAVIORAL_ALERT;
+#pragma pack(pop)
+
+#define REG_PATTERN_MULTI_PERSISTENCE     0x1
+#define REG_PATTERN_DEFEVASION_PERSIST    0x2
+#define REG_PATTERN_RANSOMWARE_PREP       0x4
+
 // ============================================================================
 // GLOBAL STATE
 // ============================================================================
 
 static SHADOWSTRIKE_REGISTRY_MONITOR g_RegistryMonitor = {0};
+
+//
+// Helper: Free a process context back to managed lookaside or pool.
+//
+static __forceinline VOID
+RegpFreeProcessContext(
+    _In_ PSHADOWSTRIKE_REG_PROCESS_CONTEXT Ctx
+    )
+{
+    if (g_RegistryMonitor.UseManagedLookaside && g_RegistryMonitor.ProcessCtxLookaside != NULL) {
+        LlFree(g_RegistryMonitor.ProcessCtxLookaside, Ctx);
+    } else if (g_RegistryMonitor.LookasideInitialized) {
+        ExFreeToNPagedLookasideList(&g_RegistryMonitor.ProcessCtxLookasideFallback, Ctx);
+    } else {
+        ExFreePoolWithTag(Ctx, REG_PROCCTX_TAG);
+    }
+}
+
+/**
+ * @brief Send a registry behavioral alert via batch processing.
+ *
+ * Builds a compact REG_BEHAVIORAL_ALERT and routes through the batch processor
+ * for high-throughput delivery. Falls back to direct send if batch is unavailable.
+ */
+static VOID
+RegpSendBehavioralAlert(
+    _In_ HANDLE ProcessId,
+    _In_ ULONG Score,
+    _In_ ULONG PatternFlags,
+    _In_ PSHADOWSTRIKE_REG_PROCESS_CONTEXT ProcCtx,
+    _In_ ULONG DistinctCategories
+    )
+{
+    REG_BEHAVIORAL_ALERT alert;
+
+    alert.ProcessId = HandleToULong(ProcessId);
+    alert.Score = Score;
+    alert.PatternFlags = PatternFlags;
+    alert.DistinctCategories = DistinctCategories;
+    alert.RunKeyMods = ProcCtx->RunKeyModifications;
+    alert.ServiceMods = ProcCtx->ServiceModifications;
+    alert.IFEOMods = ProcCtx->IFEOModifications;
+    alert.SecurityPolicyMods = ProcCtx->SecurityPolicyModifications;
+    alert.ThreatIndicators = ProcCtx->ThreatIndicators;
+    KeQuerySystemTime(&alert.Timestamp);
+
+    ShadowStrikeBatchSendNotification(
+        (UINT16)FilterMessageType_RegistryNotify,
+        &alert,
+        sizeof(alert)
+    );
+}
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -357,17 +437,45 @@ ShadowStrikeInitializeRegistryMonitoring(
     ExInitializePushLock(&g_RegistryMonitor.RateLimitLock);
 
     //
-    // Initialize lookaside list for context allocations
+    // Initialize lookaside for SHADOWSTRIKE_REG_PROCESS_CONTEXT allocations.
+    // The old ContextLookaside for SHADOWSTRIKE_REG_OP_CONTEXT was dead code
+    // (never allocated from). This replaces it with actual process-context
+    // pooling via the centralized manager.
     //
-    ExInitializeNPagedLookasideList(
-        &g_RegistryMonitor.ContextLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(SHADOWSTRIKE_REG_OP_CONTEXT),
-        REG_CONTEXT_TAG,
-        0
-    );
+    {
+        PLL_MANAGER llMgr = ShadowStrikeGetLookasideManager();
+        if (llMgr != NULL) {
+            NTSTATUS llStatus = LlCreateLookaside(
+                llMgr,
+                "RegistryCallback",
+                REG_PROCCTX_TAG,
+                sizeof(SHADOWSTRIKE_REG_PROCESS_CONTEXT),
+                FALSE,
+                &g_RegistryMonitor.ProcessCtxLookaside
+            );
+            if (NT_SUCCESS(llStatus)) {
+                g_RegistryMonitor.UseManagedLookaside = TRUE;
+            } else {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] RegistryCallback: LlCreateLookaside failed 0x%08X, raw fallback\n",
+                           llStatus);
+                g_RegistryMonitor.ProcessCtxLookaside = NULL;
+                g_RegistryMonitor.UseManagedLookaside = FALSE;
+            }
+        } else {
+            g_RegistryMonitor.ProcessCtxLookaside = NULL;
+            g_RegistryMonitor.UseManagedLookaside = FALSE;
+        }
+
+        if (!g_RegistryMonitor.UseManagedLookaside) {
+            ExInitializeNPagedLookasideList(
+                &g_RegistryMonitor.ProcessCtxLookasideFallback,
+                NULL, NULL, POOL_NX_ALLOCATION,
+                sizeof(SHADOWSTRIKE_REG_PROCESS_CONTEXT),
+                REG_PROCCTX_TAG, 0
+            );
+        }
+    }
     g_RegistryMonitor.LookasideInitialized = TRUE;
 
     //
@@ -459,7 +567,7 @@ ShadowStrikeCleanupRegistryMonitoring(
             if (procContext->Process != NULL) {
                 ObDereferenceObject(procContext->Process);
             }
-            ExFreePoolWithTag(procContext, REG_PROCCTX_TAG);
+            RegpFreeProcessContext(procContext);
         }
     }
 
@@ -470,7 +578,15 @@ ShadowStrikeCleanupRegistryMonitoring(
     // Delete lookaside list
     //
     if (g_RegistryMonitor.LookasideInitialized) {
-        ExDeleteNPagedLookasideList(&g_RegistryMonitor.ContextLookaside);
+        if (g_RegistryMonitor.UseManagedLookaside && g_RegistryMonitor.ProcessCtxLookaside != NULL) {
+            PLL_MANAGER llMgr = ShadowStrikeGetLookasideManager();
+            if (llMgr != NULL) {
+                LlDestroyLookaside(llMgr, g_RegistryMonitor.ProcessCtxLookaside);
+            }
+            g_RegistryMonitor.ProcessCtxLookaside = NULL;
+        } else {
+            ExDeleteNPagedLookasideList(&g_RegistryMonitor.ProcessCtxLookasideFallback);
+        }
         g_RegistryMonitor.LookasideInitialized = FALSE;
     }
 
@@ -1819,6 +1935,12 @@ SkipCreatePathBuild:
                         FALSE,
                         NULL
                     );
+
+                    RegpSendBehavioralAlert(
+                        processId, combinedScore,
+                        REG_PATTERN_MULTI_PERSISTENCE,
+                        procCtx, distinctCategories
+                    );
                 }
 
                 //
@@ -1849,6 +1971,12 @@ SkipCreatePathBuild:
                         FALSE,
                         NULL
                     );
+
+                    RegpSendBehavioralAlert(
+                        processId, 75,
+                        REG_PATTERN_DEFEVASION_PERSIST,
+                        procCtx, distinctCategories
+                    );
                 }
 
                 //
@@ -1876,6 +2004,12 @@ SkipCreatePathBuild:
                         90,
                         FALSE,
                         NULL
+                    );
+
+                    RegpSendBehavioralAlert(
+                        processId, 90,
+                        REG_PATTERN_RANSOMWARE_PREP,
+                        procCtx, distinctCategories
                     );
                 }
 
@@ -1984,17 +2118,27 @@ ShadowStrikeGetRegistryProcessContext(
         return NULL;
     }
 
-    newContext = (PSHADOWSTRIKE_REG_PROCESS_CONTEXT)ExAllocatePoolZero(
-        NonPagedPoolNx,
-        sizeof(SHADOWSTRIKE_REG_PROCESS_CONTEXT),
-        REG_PROCCTX_TAG
-    );
+    if (g_RegistryMonitor.UseManagedLookaside && g_RegistryMonitor.ProcessCtxLookaside != NULL) {
+        newContext = (PSHADOWSTRIKE_REG_PROCESS_CONTEXT)LlAllocate(g_RegistryMonitor.ProcessCtxLookaside);
+    } else if (g_RegistryMonitor.LookasideInitialized) {
+        newContext = (PSHADOWSTRIKE_REG_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
+            &g_RegistryMonitor.ProcessCtxLookasideFallback
+        );
+    } else {
+        newContext = (PSHADOWSTRIKE_REG_PROCESS_CONTEXT)ExAllocatePoolZero(
+            NonPagedPoolNx,
+            sizeof(SHADOWSTRIKE_REG_PROCESS_CONTEXT),
+            REG_PROCCTX_TAG
+        );
+    }
 
     if (newContext == NULL) {
         ObDereferenceObject(process);
         InterlockedIncrement64(&g_RegistryMonitor.Statistics.ContextAllocationErrors);
         return NULL;
     }
+
+    RtlZeroMemory(newContext, sizeof(SHADOWSTRIKE_REG_PROCESS_CONTEXT));
 
     //
     // Initialize new context
@@ -2036,7 +2180,7 @@ ShadowStrikeGetRegistryProcessContext(
                 // Free our allocation
                 //
                 ObDereferenceObject(newContext->Process);
-                ExFreePoolWithTag(newContext, REG_PROCCTX_TAG);
+                RegpFreeProcessContext(newContext);
 
                 return context;
             }
@@ -2078,7 +2222,7 @@ ShadowStrikeReleaseRegistryProcessContext(
         if (Context->Process != NULL) {
             ObDereferenceObject(Context->Process);
         }
-        ExFreePoolWithTag(Context, REG_PROCCTX_TAG);
+        RegpFreeProcessContext(Context);
     }
 }
 
@@ -2129,7 +2273,7 @@ ShadowStrikeRegistryProcessTerminated(
             if (context->Process != NULL) {
                 ObDereferenceObject(context->Process);
             }
-            ExFreePoolWithTag(context, REG_PROCCTX_TAG);
+            RegpFreeProcessContext(context);
         }
     }
 }

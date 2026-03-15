@@ -1302,6 +1302,12 @@ DriverEntry(
             g_LookasideManager = NULL;
             status = STATUS_SUCCESS;
         } else {
+            //
+            // Set 32MB memory ceiling and enable periodic maintenance (30s).
+            // Maintenance checks memory pressure and invokes callbacks.
+            //
+            LlSetMemoryLimit(g_LookasideManager, 32 * 1024 * 1024);
+            LlEnableMaintenance(g_LookasideManager, 30000);
             ShadowStrikeLogInitStatus("Centralized Lookaside Manager", STATUS_SUCCESS);
         }
     }
