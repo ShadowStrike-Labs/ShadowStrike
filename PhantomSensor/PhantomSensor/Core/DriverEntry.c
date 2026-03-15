@@ -3249,11 +3249,19 @@ ShadowStrikeBatchSendNotification(
 
     //
     // Fallback: build a full message header and send directly via CommPort.
-    // This path allocates NonPaged pool, so must be at IRQL <= DISPATCH_LEVEL.
+    // IRQL SAFETY: ShadowStrikeSendNotification uses FltSendMessage which
+    // requires IRQL <= APC_LEVEL. If we're above APC_LEVEL (e.g. called from
+    // a DPC or spinlock-holding context after batch processor teardown),
+    // we must drop the event rather than BSOD.
     //
+    if (KeGetCurrentIrql() > APC_LEVEL) {
+        return STATUS_UNSUCCESSFUL;
+    }
+
     {
         ULONG totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + DataSize;
         PSHADOWSTRIKE_MESSAGE_HEADER msg;
+        NTSTATUS sendStatus;
 
         if (totalSize < sizeof(SHADOWSTRIKE_MESSAGE_HEADER) ||
             DataSize > BP_MAX_EVENT_DATA_SIZE) {
@@ -3282,11 +3290,11 @@ ShadowStrikeBatchSendNotification(
             );
         }
 
-        ShadowStrikeSendNotification(msg, totalSize);
+        sendStatus = ShadowStrikeSendNotification(msg, totalSize);
         ExFreePoolWithTag(msg, 'btCP');
-    }
 
-    return STATUS_SUCCESS;
+        return sendStatus;
+    }
 }
 
 PTM_MANAGER
@@ -4020,11 +4028,8 @@ ShadowStrikeCleanupByFlags(
 
     //
     // Phase 4: Shutdown self-protection (reverse init order)
+    // NOTE: CallbackProtection already shut down + flag cleared above (lines 3854-3881).
     //
-    if (g_SubsystemFlags & SubsysFlag_CallbackProtection) {
-        CpShutdown(g_CallbackProtector);
-        g_CallbackProtector = NULL;
-    }
 
     if (g_SubsystemFlags & SubsysFlag_IntegrityMonitor) {
         ImShutdown(&g_IntegrityMonitor);
