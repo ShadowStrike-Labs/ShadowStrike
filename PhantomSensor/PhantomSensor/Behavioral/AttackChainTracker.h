@@ -253,7 +253,7 @@ ActUnregisterCallback(
 // Public API - Event Submission
 //
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 ActSubmitEvent(

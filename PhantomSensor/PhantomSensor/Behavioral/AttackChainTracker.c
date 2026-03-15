@@ -530,7 +530,7 @@ ActInitialize(
         );
 
         if (NT_SUCCESS(threadStatus)) {
-            ObReferenceObjectByHandle(
+            NTSTATUS refStatus = ObReferenceObjectByHandle(
                 threadHandle,
                 THREAD_ALL_ACCESS,
                 *PsThreadType,
@@ -538,6 +538,23 @@ ActInitialize(
                 (PVOID*)&tracker->CleanupThread,
                 NULL
             );
+
+            if (!NT_SUCCESS(refStatus)) {
+                //
+                // Thread is running but ObRef failed.
+                // Signal termination and wait via handle before closing.
+                //
+                InterlockedExchange(&tracker->CleanupStopping, TRUE);
+                KeSetEvent(&tracker->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
+
+                ZwWaitForSingleObject(threadHandle, FALSE, NULL);
+                tracker->CleanupThread = NULL;
+
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] AttackChainTracker: ObReferenceObjectByHandle failed (0x%08X)\n",
+                           refStatus);
+            }
+
             ZwClose(threadHandle);
         } else {
             //
@@ -779,7 +796,7 @@ ActUnregisterCallback(
  *
  * @irql <= DISPATCH_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 ActSubmitEvent(
@@ -1696,19 +1713,23 @@ ActpAddEventToChainLocked(
             *EvictedEvent = oldEvent;
         } else {
             //
-            // Caller didn't provide eviction output — we must record this
-            // for the caller to handle. Since we can't free under spinlock,
-            // repurpose the old entry's list linkage as a sentinel.
-            // Defensive: this path should not be reached with proper usage.
+            // Caller didn't provide eviction output.
+            // Cannot free under spinlock (ExFreePoolWithTag at DISPATCH is
+            // safe for NonPaged, but keep consistent with the intended pattern).
+            // Free directly since NonPaged pool free is IRQL-safe.
             //
             NT_ASSERT(FALSE);
-            InitializeListHead(&oldEvent->ListEntry);
+            ActpFreeEvent(oldEvent);
         }
     }
 }
 
 /**
  * @brief Update chain scores. Caller must hold EventLock.
+ *
+ * Recalculates ThreatScore from all event scores plus applied combo bonuses.
+ * Combo bonuses are tracked via AppliedComboMask and reconstructed from
+ * the g_DangerousCombos table to prevent overwrite of bonus scores.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
@@ -1721,6 +1742,8 @@ ActpUpdateChainScoreLocked(
     ULONG totalScore = 0;
     ULONG eventCount = 0;
     ULONG phaseCount;
+    ULONG i;
+    ULONG comboBonus = 0;
 
     for (listEntry = Chain->EventList.Flink;
          listEntry != &Chain->EventList;
@@ -1731,7 +1754,16 @@ ActpUpdateChainScoreLocked(
         eventCount++;
     }
 
-    Chain->ThreatScore = totalScore;
+    //
+    // Reconstruct combo bonus from applied combo bitmask
+    //
+    for (i = 0; g_DangerousCombos[i].Technique1 != 0; i++) {
+        if (Chain->AppliedComboMask & (1 << g_DangerousCombos[i].ComboIndex)) {
+            comboBonus = ActpSaturatingAdd(comboBonus, g_DangerousCombos[i].BonusScore);
+        }
+    }
+
+    Chain->ThreatScore = ActpSaturatingAdd(totalScore, comboBonus);
 
     //
     // Confidence based on event count and phase progression
@@ -1923,7 +1955,11 @@ ActpCheckDangerousCombosLocked(
 }
 
 /**
- * @brief Generate a unique chain ID using ExUuidCreate.
+ * @brief Generate a unique chain ID using IRQL-safe primitives.
+ *
+ * Uses KeQueryPerformanceCounter + KeQuerySystemTime + atomic counter.
+ * ExUuidCreate requires PASSIVE_LEVEL, which is not guaranteed here
+ * since this may be called under push lock (APC_LEVEL).
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
@@ -1931,31 +1967,24 @@ ActpGenerateChainId(
     _Out_ PGUID ChainId
     )
 {
-    NTSTATUS status;
+    static volatile LONG s_ChainSequence = 0;
+    LARGE_INTEGER timestamp;
+    LARGE_INTEGER perfCounter;
+    LONG sequence;
 
-    status = ExUuidCreate(ChainId);
+    KeQuerySystemTime(&timestamp);
+    perfCounter = KeQueryPerformanceCounter(NULL);
+    sequence = InterlockedIncrement(&s_ChainSequence);
 
-    if (!NT_SUCCESS(status)) {
-        //
-        // Fallback to pseudo-random generation if ExUuidCreate fails
-        // (Should only happen if system UUID generator is exhausted)
-        //
-        LARGE_INTEGER timestamp;
-        LARGE_INTEGER perfCounter;
-
-        KeQuerySystemTime(&timestamp);
-        perfCounter = KeQueryPerformanceCounter(NULL);
-
-        ChainId->Data1 = (ULONG)(timestamp.LowPart ^ perfCounter.LowPart);
-        ChainId->Data2 = (USHORT)(perfCounter.LowPart & 0xFFFF);
-        ChainId->Data3 = (USHORT)((perfCounter.LowPart >> 16) & 0xFFFF);
-        ChainId->Data4[0] = (UCHAR)(timestamp.HighPart & 0xFF);
-        ChainId->Data4[1] = (UCHAR)((timestamp.HighPart >> 8) & 0xFF);
-        ChainId->Data4[2] = (UCHAR)((perfCounter.HighPart) & 0xFF);
-        ChainId->Data4[3] = (UCHAR)((perfCounter.HighPart >> 8) & 0xFF);
-        ChainId->Data4[4] = (UCHAR)((perfCounter.HighPart >> 16) & 0xFF);
-        ChainId->Data4[5] = (UCHAR)((perfCounter.HighPart >> 24) & 0xFF);
-        ChainId->Data4[6] = 0x4A;   // Version marker
-        ChainId->Data4[7] = 0xAC;   // "ACT" marker
-    }
+    ChainId->Data1 = (ULONG)(timestamp.LowPart ^ perfCounter.LowPart);
+    ChainId->Data2 = (USHORT)(sequence & 0xFFFF);
+    ChainId->Data3 = (USHORT)((perfCounter.LowPart >> 16) & 0xFFFF);
+    ChainId->Data4[0] = (UCHAR)(timestamp.HighPart & 0xFF);
+    ChainId->Data4[1] = (UCHAR)((timestamp.HighPart >> 8) & 0xFF);
+    ChainId->Data4[2] = (UCHAR)((perfCounter.HighPart) & 0xFF);
+    ChainId->Data4[3] = (UCHAR)((perfCounter.HighPart >> 8) & 0xFF);
+    ChainId->Data4[4] = (UCHAR)((perfCounter.HighPart >> 16) & 0xFF);
+    ChainId->Data4[5] = (UCHAR)((sequence >> 16) & 0xFF);
+    ChainId->Data4[6] = 0x4A;   // Version marker
+    ChainId->Data4[7] = 0xAC;   // "ACT" marker
 }
