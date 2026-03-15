@@ -57,6 +57,8 @@
 #include "../Utilities/ProcessUtils.h"
 #include "../Utilities/StringUtils.h"
 #include "../SelfProtection/SelfProtect.h"
+#include "../Core/DriverEntry.h"
+#include "../Performance/LookasideLists.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -206,10 +208,12 @@ typedef struct _PE_CONTEXT {
     EX_PUSH_LOCK HashLock;
 
     //
-    // Lookaside lists
+    // Lookaside lists (centralized if available, raw fallback)
     //
-    NPAGED_LOOKASIDE_LIST PidEntryLookaside;
+    PLL_LOOKASIDE PidEntryLookaside;
+    NPAGED_LOOKASIDE_LIST PidEntryLookasideFallback;
     BOOLEAN LookasideInitialized;
+    BOOLEAN UseManagedLookaside;
 
     //
     // Configuration
@@ -522,17 +526,42 @@ ShadowStrikeProcessExclusionInitialize(
     }
 
     //
-    // Initialize lookaside list
+    // Initialize lookaside list (centralized manager preferred)
     //
-    ExInitializeNPagedLookasideList(
-        &ctx->PidEntryLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(PE_PID_ENTRY),
-        PE_PID_TAG,
-        0
-    );
+    {
+        PLL_MANAGER llMgr = ShadowStrikeGetLookasideManager();
+        if (llMgr != NULL) {
+            NTSTATUS llStatus = LlCreateLookaside(
+                llMgr,
+                "ProcessExclusion",
+                PE_PID_TAG,
+                sizeof(PE_PID_ENTRY),
+                FALSE,              // NonPaged
+                &ctx->PidEntryLookaside
+            );
+            if (NT_SUCCESS(llStatus)) {
+                ctx->UseManagedLookaside = TRUE;
+            } else {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] ProcessExclusion: LlCreateLookaside failed 0x%08X, raw fallback\n",
+                           llStatus);
+                ctx->PidEntryLookaside = NULL;
+                ctx->UseManagedLookaside = FALSE;
+            }
+        } else {
+            ctx->PidEntryLookaside = NULL;
+            ctx->UseManagedLookaside = FALSE;
+        }
+
+        if (!ctx->UseManagedLookaside) {
+            ExInitializeNPagedLookasideList(
+                &ctx->PidEntryLookasideFallback,
+                NULL, NULL, POOL_NX_ALLOCATION,
+                sizeof(PE_PID_ENTRY),
+                PE_PID_TAG, 0
+            );
+        }
+    }
 
     ctx->LookasideInitialized = TRUE;
 
@@ -675,7 +704,15 @@ ShadowStrikeProcessExclusionShutdown(
     // Delete lookaside list
     //
     if (ctx->LookasideInitialized) {
-        ExDeleteNPagedLookasideList(&ctx->PidEntryLookaside);
+        if (ctx->UseManagedLookaside && ctx->PidEntryLookaside != NULL) {
+            PLL_MANAGER llMgr = ShadowStrikeGetLookasideManager();
+            if (llMgr != NULL) {
+                LlDestroyLookaside(llMgr, ctx->PidEntryLookaside);
+            }
+            ctx->PidEntryLookaside = NULL;
+        } else {
+            ExDeleteNPagedLookasideList(&ctx->PidEntryLookasideFallback);
+        }
         ctx->LookasideInitialized = FALSE;
     }
 
@@ -1782,9 +1819,13 @@ PepAllocatePidEntry(
     *Entry = NULL;
 
     if (ctx->LookasideInitialized) {
-        entry = (PPE_PID_ENTRY)ExAllocateFromNPagedLookasideList(
-            &ctx->PidEntryLookaside
-        );
+        if (ctx->UseManagedLookaside && ctx->PidEntryLookaside != NULL) {
+            entry = (PPE_PID_ENTRY)LlAllocate(ctx->PidEntryLookaside);
+        } else {
+            entry = (PPE_PID_ENTRY)ExAllocateFromNPagedLookasideList(
+                &ctx->PidEntryLookasideFallback
+            );
+        }
     }
 
     if (entry == NULL) {
@@ -1819,7 +1860,11 @@ PepFreePidEntry(
     }
 
     if (ctx->LookasideInitialized) {
-        ExFreeToNPagedLookasideList(&ctx->PidEntryLookaside, Entry);
+        if (ctx->UseManagedLookaside && ctx->PidEntryLookaside != NULL) {
+            LlFree(ctx->PidEntryLookaside, Entry);
+        } else {
+            ExFreeToNPagedLookasideList(&ctx->PidEntryLookasideFallback, Entry);
+        }
     } else {
         ExFreePoolWithTag(Entry, PE_PID_TAG);
     }

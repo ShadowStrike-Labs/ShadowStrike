@@ -44,6 +44,7 @@
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
 #include "../Performance/CacheOptimization.h"
+#include "../Performance/LookasideLists.h"
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -223,10 +224,12 @@ typedef struct _IOM_MATCHER_INTERNAL {
     EX_PUSH_LOCK CallbackLock;
 
     //
-    // Lookaside lists for allocation
+    // Lookaside lists for allocation (centralized if available)
     //
-    NPAGED_LOOKASIDE_LIST IOCLookaside;
+    PLL_LOOKASIDE IOCLookaside;
+    NPAGED_LOOKASIDE_LIST IOCLookasideFallback;
     BOOLEAN LookasideInitialized;
+    BOOLEAN UseManagedLookaside;
 
     //
     // Cleanup infrastructure (system thread + TimerManager pattern)
@@ -573,17 +576,42 @@ IomInitialize(
     matcher->CallbackReg = NULL;
 
     //
-    // Initialize lookaside list for IOC allocations
+    // Initialize lookaside list for IOC allocations (centralized manager preferred)
     //
-    ExInitializeNPagedLookasideList(
-        &matcher->IOCLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(IOM_IOC_INTERNAL),
-        IOM_POOL_TAG_IOC,
-        IOM_LOOKASIDE_DEPTH
-    );
+    {
+        PLL_MANAGER llMgr = ShadowStrikeGetLookasideManager();
+        if (llMgr != NULL) {
+            NTSTATUS llStatus = LlCreateLookaside(
+                llMgr,
+                "IOCMatcher",
+                IOM_POOL_TAG_IOC,
+                sizeof(IOM_IOC_INTERNAL),
+                FALSE,
+                &matcher->IOCLookaside
+            );
+            if (NT_SUCCESS(llStatus)) {
+                matcher->UseManagedLookaside = TRUE;
+            } else {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] IOCMatcher: LlCreateLookaside failed 0x%08X, raw fallback\n",
+                           llStatus);
+                matcher->IOCLookaside = NULL;
+                matcher->UseManagedLookaside = FALSE;
+            }
+        } else {
+            matcher->IOCLookaside = NULL;
+            matcher->UseManagedLookaside = FALSE;
+        }
+
+        if (!matcher->UseManagedLookaside) {
+            ExInitializeNPagedLookasideList(
+                &matcher->IOCLookasideFallback,
+                NULL, NULL, POOL_NX_ALLOCATION,
+                sizeof(IOM_IOC_INTERNAL),
+                IOM_POOL_TAG_IOC, IOM_LOOKASIDE_DEPTH
+            );
+        }
+    }
     matcher->LookasideInitialized = TRUE;
 
     //
@@ -675,7 +703,15 @@ IomInitialize(
 Cleanup:
     if (matcher != NULL) {
         if (matcher->LookasideInitialized) {
-            ExDeleteNPagedLookasideList(&matcher->IOCLookaside);
+            if (matcher->UseManagedLookaside && matcher->IOCLookaside != NULL) {
+                PLL_MANAGER llMgr = ShadowStrikeGetLookasideManager();
+                if (llMgr != NULL) {
+                    LlDestroyLookaside(llMgr, matcher->IOCLookaside);
+                }
+                matcher->IOCLookaside = NULL;
+            } else {
+                ExDeleteNPagedLookasideList(&matcher->IOCLookasideFallback);
+            }
         }
 
         if (matcher->HashBuckets != NULL) {
@@ -791,7 +827,11 @@ IomShutdown(
         RemoveEntryList(&ioc->HashBucketEntry);
 
         if (matcher->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&matcher->IOCLookaside, ioc);
+            if (matcher->UseManagedLookaside && matcher->IOCLookaside != NULL) {
+                LlFree(matcher->IOCLookaside, ioc);
+            } else {
+                ExFreeToNPagedLookasideList(&matcher->IOCLookasideFallback, ioc);
+            }
         } else {
             ExFreePoolWithTag(ioc, IOM_POOL_TAG_IOC);
         }
@@ -829,7 +869,15 @@ IomShutdown(
     // Delete lookaside list
     //
     if (matcher->LookasideInitialized) {
-        ExDeleteNPagedLookasideList(&matcher->IOCLookaside);
+        if (matcher->UseManagedLookaside && matcher->IOCLookaside != NULL) {
+            PLL_MANAGER llMgr = ShadowStrikeGetLookasideManager();
+            if (llMgr != NULL) {
+                LlDestroyLookaside(llMgr, matcher->IOCLookaside);
+            }
+            matcher->IOCLookaside = NULL;
+        } else {
+            ExDeleteNPagedLookasideList(&matcher->IOCLookasideFallback);
+        }
         matcher->LookasideInitialized = FALSE;
     }
 
@@ -915,9 +963,13 @@ IomLoadIOC(
     //
     // Allocate IOC from lookaside list
     //
-    newIOC = (PIOM_IOC_INTERNAL)ExAllocateFromNPagedLookasideList(
-        &matcher->IOCLookaside
-    );
+    if (matcher->UseManagedLookaside && matcher->IOCLookaside != NULL) {
+        newIOC = (PIOM_IOC_INTERNAL)LlAllocate(matcher->IOCLookaside);
+    } else {
+        newIOC = (PIOM_IOC_INTERNAL)ExAllocateFromNPagedLookasideList(
+            &matcher->IOCLookasideFallback
+        );
+    }
 
     if (newIOC == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -2642,7 +2694,11 @@ IompCleanupExpiredIOCsWorker(
         ioc = CONTAINING_RECORD(entry, IOM_IOC_INTERNAL, GlobalListEntry);
 
         if (Matcher->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&Matcher->IOCLookaside, ioc);
+            if (Matcher->UseManagedLookaside && Matcher->IOCLookaside != NULL) {
+                LlFree(Matcher->IOCLookaside, ioc);
+            } else {
+                ExFreeToNPagedLookasideList(&Matcher->IOCLookasideFallback, ioc);
+            }
         } else {
             ExFreePoolWithTag(ioc, IOM_POOL_TAG_IOC);
         }

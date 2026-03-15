@@ -45,6 +45,8 @@ LOCK HIERARCHY (always acquire in this order):
 #include "RuleEngine.h"
 #include <ntstrsafe.h>
 #include <wdm.h>
+#include "../Core/DriverEntry.h"
+#include "../Performance/LookasideLists.h"
 
 // ============================================================================
 // INTERNAL CONSTANTS
@@ -156,10 +158,12 @@ typedef struct _RE_ENGINE {
     LIST_ENTRY RuleHashBuckets[RE_HASH_BUCKETS];
 
     //
-    // Lookaside list for fast rule allocation
+    // Lookaside list for fast rule allocation (via centralized manager)
     //
-    NPAGED_LOOKASIDE_LIST RuleLookaside;
+    PLL_LOOKASIDE RuleLookaside;
+    NPAGED_LOOKASIDE_LIST RuleLookasideFallback;
     volatile LONG LookasideInitialized;
+    BOOLEAN UseManagedLookaside;
 
     //
     // Statistics
@@ -364,17 +368,43 @@ Return Value:
     }
 
     //
-    // Initialize lookaside list for fast rule allocation
+    // Initialize lookaside list for fast rule allocation.
+    // Prefer centralized manager for memory pressure awareness and stats.
     //
-    ExInitializeNPagedLookasideList(
-        &engine->RuleLookaside,
-        NULL,                       // Default allocate
-        NULL,                       // Default free
-        0,                          // Flags
-        sizeof(RE_INTERNAL_RULE),
-        RE_POOL_TAG_RULE,
-        0                           // Depth (system default)
-    );
+    {
+        PLL_MANAGER llMgr = ShadowStrikeGetLookasideManager();
+        if (llMgr != NULL) {
+            NTSTATUS llStatus = LlCreateLookaside(
+                llMgr,
+                "RuleEngine",
+                RE_POOL_TAG_RULE,
+                sizeof(RE_INTERNAL_RULE),
+                FALSE,              // NonPaged
+                &engine->RuleLookaside
+            );
+            if (NT_SUCCESS(llStatus)) {
+                engine->UseManagedLookaside = TRUE;
+            } else {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike] RuleEngine: LlCreateLookaside failed 0x%08X, falling back to raw\n",
+                           llStatus);
+                engine->RuleLookaside = NULL;
+                engine->UseManagedLookaside = FALSE;
+            }
+        } else {
+            engine->RuleLookaside = NULL;
+            engine->UseManagedLookaside = FALSE;
+        }
+
+        if (!engine->UseManagedLookaside) {
+            ExInitializeNPagedLookasideList(
+                &engine->RuleLookasideFallback,
+                NULL, NULL, 0,
+                sizeof(RE_INTERNAL_RULE),
+                RE_POOL_TAG_RULE, 0
+            );
+        }
+    }
 
     InterlockedExchange(&engine->LookasideInitialized, TRUE);
 
@@ -471,7 +501,15 @@ Arguments:
     // Delete lookaside lists
     //
     if (InterlockedExchange(&Engine->LookasideInitialized, FALSE)) {
-        ExDeleteNPagedLookasideList(&Engine->RuleLookaside);
+        if (Engine->UseManagedLookaside && Engine->RuleLookaside != NULL) {
+            PLL_MANAGER llMgr = ShadowStrikeGetLookasideManager();
+            if (llMgr != NULL) {
+                LlDestroyLookaside(llMgr, Engine->RuleLookaside);
+            }
+            Engine->RuleLookaside = NULL;
+        } else {
+            ExDeleteNPagedLookasideList(&Engine->RuleLookasideFallback);
+        }
     }
 
     //
@@ -539,9 +577,13 @@ Return Value:
     //
     // Allocate new internal rule BEFORE acquiring lock
     //
-    internalRule = (PRE_INTERNAL_RULE)ExAllocateFromNPagedLookasideList(
-        &Engine->RuleLookaside
-    );
+    if (Engine->UseManagedLookaside && Engine->RuleLookaside != NULL) {
+        internalRule = (PRE_INTERNAL_RULE)LlAllocate(Engine->RuleLookaside);
+    } else {
+        internalRule = (PRE_INTERNAL_RULE)ExAllocateFromNPagedLookasideList(
+            &Engine->RuleLookasideFallback
+        );
+    }
 
     if (internalRule == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -573,7 +615,7 @@ Return Value:
     //
     status = RepCompileRule(internalRule);
     if (!NT_SUCCESS(status)) {
-        ExFreeToNPagedLookasideList(&Engine->RuleLookaside, internalRule);
+        RepFreeRuleInternal(Engine, internalRule);
         return status;
     }
 
@@ -610,7 +652,7 @@ Return Value:
     if (Engine->RuleCount >= RE_MAX_RULES) {
         ExReleasePushLockExclusive(&Engine->RuleLock);
         KeLeaveCriticalRegion();
-        ExFreeToNPagedLookasideList(&Engine->RuleLookaside, internalRule);
+        RepFreeRuleInternal(Engine, internalRule);
         return STATUS_QUOTA_EXCEEDED;
     }
 
@@ -2134,7 +2176,11 @@ RepFreeRuleInternal(
     // Return to lookaside list or pool
     //
     if (Engine->LookasideInitialized) {
-        ExFreeToNPagedLookasideList(&Engine->RuleLookaside, Rule);
+        if (Engine->UseManagedLookaside && Engine->RuleLookaside != NULL) {
+            LlFree(Engine->RuleLookaside, Rule);
+        } else {
+            ExFreeToNPagedLookasideList(&Engine->RuleLookasideFallback, Rule);
+        }
     } else {
         ExFreePoolWithTag(Rule, RE_POOL_TAG_RULE);
     }
