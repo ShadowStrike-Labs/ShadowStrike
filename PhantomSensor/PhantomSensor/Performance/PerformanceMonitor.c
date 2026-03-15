@@ -217,8 +217,17 @@ SspmiQuickSelect(
     )
 {
     ULONG Left = 0;
-    ULONG Right = Count - 1;
+    ULONG Right;
     ULONG64 Temp;
+
+    if (Count == 0) {
+        return 0;
+    }
+    if (Count == 1) {
+        return Values[0];
+    }
+
+    Right = Count - 1;
 
     while (Left < Right) {
         ULONG64 Pivot = Values[Right];

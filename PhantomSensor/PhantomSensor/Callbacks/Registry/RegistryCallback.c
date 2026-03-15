@@ -51,6 +51,7 @@
 #include "../../Core/DriverEntry.h"
 #include "../../Performance/LookasideLists.h"
 #include "../../Performance/PerformanceMonitor.h"
+#include "../../Performance/ResourceThrottling.h"
 
 // ============================================================================
 // POOL TAGS
@@ -1583,6 +1584,16 @@ ShadowStrikeRegistryCallbackRoutine(
     }
 
     SSPM_LATENCY_BEGIN(reg);
+
+    //
+    // Track registry operation rate for DoS mitigation
+    //
+    {
+        PRT_THROTTLER rtThrottler = ShadowStrikeGetResourceThrottler();
+        if (rtThrottler != NULL) {
+            RtReportUsage(rtThrottler, RtResourceRegOps, 1);
+        }
+    }
 
     //
     // Only process Pre-operations for blocking, Post for logging

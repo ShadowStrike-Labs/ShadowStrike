@@ -66,6 +66,7 @@
 #include "../Process/ProcessAnalyzer.h"
 #include "../Process/ProcessRelationship.h"
 #include "ThreadProtection.h"
+#include "../../Performance/ResourceThrottling.h"
 
 #ifdef WPP_TRACING
 #include "ObjectCallback.tmh"
@@ -648,6 +649,16 @@ ShadowStrikeProcessPreCallback(
     // Update statistics (lock-free)
     //
     InterlockedIncrement64(&context->TotalProcessOperations);
+
+    //
+    // Track handle operation rate for DoS mitigation
+    //
+    {
+        PRT_THROTTLER rtThrottler = ShadowStrikeGetResourceThrottler();
+        if (rtThrottler != NULL) {
+            RtReportUsage(rtThrottler, RtResourceHandleOps, 1);
+        }
+    }
 
     //
     // Get target process - validated by the object manager

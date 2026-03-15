@@ -78,6 +78,7 @@ Performance Characteristics:
 #include "../../ETW/ETWProvider.h"
 #include "../../Core/DriverEntry.h"
 #include "../../Performance/PerformanceMonitor.h"
+#include "../../Performance/ResourceThrottling.h"
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Transactions/KtmMonitor.h"
 #include "../Process/WSLMonitor.h"
@@ -782,6 +783,16 @@ Return Value:
     RundownAcquired = TRUE;
 
     SSPM_LATENCY_BEGIN(pc);
+
+    //
+    // Track filesystem create operation rate for DoS mitigation
+    //
+    {
+        PRT_THROTTLER rtThrottler = ShadowStrikeGetResourceThrottler();
+        if (rtThrottler != NULL) {
+            RtReportUsage(rtThrottler, RtResourceFsOps, 1);
+        }
+    }
 
     //
     // Skip paging files
