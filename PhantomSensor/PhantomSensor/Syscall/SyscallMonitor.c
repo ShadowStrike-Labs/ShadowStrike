@@ -380,6 +380,18 @@ ScMonitorInitialize(VOID)
     }
     initFlags |= SC_INIT_CALLSTACK_ANALYZER;
 
+    //
+    // Pre-resolve ZwWriteVirtualMemory for ScMonitorRestoreNtdllFunction.
+    // This avoids lazy resolution while KeStackAttachProcess'd to a target.
+    // Non-fatal: restoration API will return STATUS_NOT_IMPLEMENTED if absent.
+    //
+    {
+        UNICODE_STRING zwWriteName;
+        RtlInitUnicodeString(&zwWriteName, L"ZwWriteVirtualMemory");
+        g_pfnZwWriteVirtualMemory = (PFN_ZW_WRITE_VIRTUAL_MEMORY)
+            MmGetSystemRoutineAddress(&zwWriteName);
+    }
+
     g_ScState.Initialized = TRUE;
     g_ScState.Enabled = FALSE;
 
@@ -462,7 +474,12 @@ ScMonitorShutdown(VOID)
     }
 
     //
-    // Free all process contexts
+    // Free all process contexts using deferred-deletion pattern.
+    // Contexts with outstanding references (RefCount > 1) are marked Removed
+    // and their list reference is dropped — the last ScMonitorReleaseProcessContext
+    // call will perform the actual free. This prevents UAF if any code holds a
+    // context reference during shutdown (defense-in-depth; normally impossible due
+    // to callback unregistration ordering, but enterprise code must be paranoid).
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ScState.ProcessLock);
@@ -474,13 +491,22 @@ ScMonitorShutdown(VOID)
         next = entry->Flink;
         PSC_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, SC_PROCESS_CONTEXT, ListEntry);
         RemoveEntryList(entry);
+        InitializeListHead(entry);
+        InterlockedDecrement(&g_ScState.ProcessContextCount);
+        ctx->Removed = TRUE;
 
-        if (ctx->ProcessObject != NULL) {
-            ObDereferenceObject(ctx->ProcessObject);
-            ctx->ProcessObject = NULL;
+        //
+        // Drop list reference. If this context has no other holders
+        // (RefCount was 1 — the list ref), free it immediately.
+        // Otherwise the last ScMonitorReleaseProcessContext will free it.
+        //
+        if (InterlockedDecrement(&ctx->RefCount) == 0) {
+            if (ctx->ProcessObject != NULL) {
+                ObDereferenceObject(ctx->ProcessObject);
+                ctx->ProcessObject = NULL;
+            }
+            ExFreeToNPagedLookasideList(&g_ScState.ContextLookaside, ctx);
         }
-
-        ExFreeToNPagedLookasideList(&g_ScState.ContextLookaside, ctx);
     }
 
     ExReleasePushLockExclusive(&g_ScState.ProcessLock);
@@ -642,7 +668,16 @@ ScpFreeProcessContext(
         Context->ProcessObject = NULL;
     }
 
-    ExFreeToNPagedLookasideList(&g_ScState.ContextLookaside, Context);
+    //
+    // If the ContextLookaside has already been deleted (during shutdown),
+    // fall back to direct pool free. This handles the deferred-deletion
+    // case where a context outlives the lookaside via outstanding references.
+    //
+    if (g_ScState.ContextLookasideInitialized) {
+        ExFreeToNPagedLookasideList(&g_ScState.ContextLookaside, Context);
+    } else {
+        ShadowStrikeFreePoolWithTag(Context, SC_POOL_TAG_GENERAL);
+    }
 }
 
 
@@ -1128,7 +1163,19 @@ ScMonitorRemoveProcessContext(
 
     PAGED_CODE();
 
-    if (!g_ScState.Initialized) {
+    if (!g_ScState.Initialized || g_ScState.ShuttingDown) {
+        return;
+    }
+
+    //
+    // Acquire framework reference so sub-module handles remain valid
+    // for the duration of our CsaOnProcessExit / HgdRemoveProcessContext calls.
+    // Without this, ScMonitorShutdown could free the sub-modules mid-call.
+    //
+    ScpAcquireReference();
+
+    if (g_ScState.ShuttingDown) {
+        ScpReleaseReference();
         return;
     }
 
@@ -1169,12 +1216,16 @@ ScMonitorRemoveProcessContext(
             if (InterlockedDecrement(&ctx->RefCount) == 0) {
                 ScpFreeProcessContext(ctx);
             }
+
+            ScpReleaseReference();
             return;
         }
     }
 
     ExReleasePushLockExclusive(&g_ScState.ProcessLock);
     KeLeaveCriticalRegion();
+
+    ScpReleaseReference();
 }
 
 // ============================================================================
@@ -2280,19 +2331,21 @@ ScMonitorRestoreNtdllFunction(
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        ProbeForWrite(funcState->CurrentAddress, sizeof(funcState->ExpectedPrologue), 1);
-
         //
-        // Write original prologue bytes back via dynamically resolved function
+        // Security: Verify the target address is in user-mode range.
+        // ZwWriteVirtualMemory with KernelMode PreviousMode can write to
+        // kernel memory — we MUST NOT allow that even if NtdllIntegrity
+        // returns a corrupt address. Defense-in-depth against data corruption.
         //
-        if (g_pfnZwWriteVirtualMemory == NULL) {
-            UNICODE_STRING funcNameStr;
-            RtlInitUnicodeString(&funcNameStr, L"ZwWriteVirtualMemory");
-            g_pfnZwWriteVirtualMemory = (PFN_ZW_WRITE_VIRTUAL_MEMORY)
-                MmGetSystemRoutineAddress(&funcNameStr);
-        }
-
-        if (g_pfnZwWriteVirtualMemory != NULL) {
+        if ((ULONG_PTR)funcState->CurrentAddress >= (ULONG_PTR)MmHighestUserAddress) {
+            status = STATUS_INVALID_ADDRESS;
+        } else if (g_pfnZwWriteVirtualMemory != NULL) {
+            //
+            // ZwWriteVirtualMemory handles page protection internally
+            // (changes PAGE_EXECUTE_READ → writable, writes, restores).
+            // DO NOT use ProbeForWrite here — .text sections are read-only
+            // and ProbeForWrite would fault, making restoration always fail.
+            //
             status = g_pfnZwWriteVirtualMemory(
                 ZwCurrentProcess(),
                 funcState->CurrentAddress,
@@ -2728,6 +2781,15 @@ ScpDispatchToMemoryMonitor(
     )
 {
     PAGED_CODE();
+
+    //
+    // Defensive NULL check — SstLookupByNumber should always populate Name
+    // on success, but a buggy SyscallTable entry could have Name=NULL.
+    // strcmp on NULL → BSOD.
+    //
+    if (SyscallInfo->Name == NULL) {
+        return;
+    }
 
     //
     // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits,
