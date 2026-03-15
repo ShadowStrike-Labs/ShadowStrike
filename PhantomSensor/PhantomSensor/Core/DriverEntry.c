@@ -1500,7 +1500,20 @@ DriverEntry(
     g_InitFlags |= InitFlag_FilterRegistered;
     ShadowStrikeLogInitStatus("FltRegisterFilter", status);
 
-    // Step 6.1: DeviceObject for TimerManager is provided via g_TimerControlDevice
+    //
+    // Step 6.1: Wire WorkQueue with FilterHandle + DeviceObject now available.
+    // WorkQueue was initialized at Step 5.1 with NULL handles; it becomes
+    // fully functional only after receiving at least one dispatch target.
+    //
+    {
+        PDEVICE_OBJECT wqDeviceObject = g_DriverData.DriverObject->DeviceObject;
+        if (wqDeviceObject != NULL) {
+            ShadowStrikeWorkQueueSetDeviceObject(wqDeviceObject);
+        }
+        ShadowStrikeWorkQueueSetFilterHandle(g_DriverData.FilterHandle);
+    }
+
+    // Step 6.1a: DeviceObject for TimerManager is provided via g_TimerControlDevice
     // (created at Step 5.4, before any module initialization).
 
     //

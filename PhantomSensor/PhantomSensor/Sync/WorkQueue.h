@@ -508,7 +508,7 @@ ShadowStrikeQueueFilterWorkItem(
 // ----- Work item management -----
 
 /// Cancel a work item by ID
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 ShadowStrikeCancelWorkItem(
     _In_ ULONG64 ItemId
@@ -542,7 +542,7 @@ NTSTATUS ShadowStrikeWorkQueueResume(VOID);
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS ShadowStrikeWorkQueueDrain(_In_ ULONG TimeoutMs);
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 ULONG ShadowStrikeWorkQueueFlush(VOID);
 
 // ----- Statistics -----

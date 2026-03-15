@@ -29,7 +29,9 @@
  * - PAGE segment (not INIT) for init functions — safe for ref-counted re-init
  * - DPC fallback REMOVED: if no DeviceObject, fail submission (don't execute
  *   at DISPATCH_LEVEL)
- * - Shutdown: cancel all delayed timers, KeFlushQueuedDpcs, proper SLIST drain
+ * - Shutdown: cancel all delayed timers, ExWaitForRundownProtectionRelease, proper SLIST drain
+ * - Cancel/Flush: KeRemoveQueueDpc as sole gate — no KeFlushQueuedDpcs
+ *   (WorkQueue DPCs dispatch to IoWorkItem, so flushing DPCs doesn't wait for work)
  * - Retry path re-acquires rundown protection before re-queue
  * - Single ListEntry (ActiveListEntry) — no per-priority queue lists
  * - Legacy callback uses wrapper function, no UB cast
@@ -48,6 +50,8 @@
 
 #include "WorkQueue.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Core/DriverEntry.h"
+#include "../Performance/PerformanceMonitor.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeWorkQueueInitialize)
@@ -102,11 +106,6 @@ static NTSTATUS WqiDispatchItem(_Inout_ PSHADOWSTRIKE_WORK_ITEM Item);
 static NTSTATUS WqiDispatchFilterItem(
     _Inout_ PSHADOWSTRIKE_WORK_ITEM Item,
     _In_ PFLT_INSTANCE Instance);
-
-/// Legacy wrapper that adapts VOID(*)(PVOID) to NTSTATUS(*)(PVOID, ULONG)
-static NTSTATUS WqiLegacyRoutineWrapper(
-    _In_opt_ PVOID Context,
-    _In_ ULONG ContextSize);
 
 static VOID WqiRemoveFromActiveList(_Inout_ PSHADOWSTRIKE_WORK_ITEM Item);
 static VOID WqiAddToActiveList(_Inout_ PSHADOWSTRIKE_WORK_ITEM Item);
@@ -219,7 +218,7 @@ ShadowStrikeWorkQueueInitializeEx(
 // FIX #1: Push lock with critical region
 // FIX #4: SLIST items actually freed
 // FIX #10: IoFreeWorkItem only after item is idle
-// FIX #15: Cancel timers, KeFlushQueuedDpcs
+// FIX #15: Cancel timers, ExWaitForRundownProtectionRelease
 // ============================================================================
 
 _Use_decl_annotations_
@@ -413,8 +412,9 @@ WqiFreeWorkItem(
 
     // FIX #10: IoFreeWorkItem is safe here because the item has completed
     // or been removed from dispatch. We only call WqiFreeWorkItem after
-    // the IoWorkItem callback has returned (via WqiCompleteWorkItem path)
-    // or during shutdown after KeFlushQueuedDpcs.
+    // the IoWorkItem callback has returned (via WqiCompleteWorkItem path),
+    // after KeRemoveQueueDpc succeeded (IoWorkItem was never queued),
+    // or during shutdown after ExWaitForRundownProtectionRelease.
     if (Item->IoWorkItem != NULL) {
         IoFreeWorkItem(Item->IoWorkItem);
         Item->IoWorkItem = NULL;
@@ -505,7 +505,7 @@ WqiSetupContext(
 {
     if (Context == NULL || ContextSize == 0) {
         Item->Context = Context;
-        Item->ContextSize = (Context != NULL) ? 0 : ContextSize;
+        Item->ContextSize = (Context != NULL) ? ContextSize : 0;
         Item->UsingInlineContext = FALSE;
         return STATUS_SUCCESS;
     }
@@ -632,32 +632,6 @@ WqiDispatchFilterItem(
 }
 
 // ============================================================================
-// INTERNAL: LEGACY ROUTINE WRAPPER
-// FIX #8: Proper wrapper instead of UB function pointer cast
-// ============================================================================
-
-static NTSTATUS
-WqiLegacyRoutineWrapper(
-    _In_opt_ PVOID Context,
-    _In_ ULONG ContextSize)
-{
-    PSHADOWSTRIKE_WORK_ITEM Item;
-
-    UNREFERENCED_PARAMETER(ContextSize);
-
-    // The Context for legacy items is the WORK_ITEM itself,
-    // which stores the original legacy callback and original context.
-    Item = (PSHADOWSTRIKE_WORK_ITEM)Context;
-    if (Item == NULL || Item->LegacyRoutine == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    // Call the original void-returning callback with the real context
-    Item->LegacyRoutine(Item->Options.CompletionContext);
-    return STATUS_SUCCESS;
-}
-
-// ============================================================================
 // INTERNAL: EXECUTION AND COMPLETION
 // FIX #5: Retry re-acquires rundown protection
 // FIX #6: Clean completion path
@@ -672,6 +646,16 @@ WqiExecuteWorkItem(
 
     // Check cancellation
     if (InterlockedCompareExchange(&Item->CancelRequested, 0, 0) != 0) {
+        // Invoke cancel callback before completing (deferred cancellation path).
+        // This ensures CancelCallback fires for items cancelled by Flush or
+        // CancelWorkItem where the DPC was already in-flight.
+        if (Item->Options.CancelCallback != NULL) {
+            __try {
+                Item->Options.CancelCallback(Item->Context, Item->ContextSize);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // Don't crash on bad callback
+            }
+        }
         WqiCompleteWorkItem(Item, STATUS_CANCELLED);
         return;
     }
@@ -682,6 +666,17 @@ WqiExecuteWorkItem(
     Item->StartTime = StartTime;
 
     InterlockedIncrement(&g_WqManager.Stats.CurrentExecuting);
+
+    // Update executing peak atomically at increment point (not completion)
+    {
+        LONG ExecCurrent = g_WqManager.Stats.CurrentExecuting;
+        LONG ExecPeak;
+        do {
+            ExecPeak = g_WqManager.Stats.PeakExecuting;
+            if (ExecCurrent <= ExecPeak) break;
+        } while (InterlockedCompareExchange(
+            &g_WqManager.Stats.PeakExecuting, ExecCurrent, ExecPeak) != ExecPeak);
+    }
 
     // Execute work routine with SEH protection
     __try {
@@ -904,8 +899,17 @@ WqiDelayTimerDpcCallback(
             ShadowStrikeWqPriorityToWorkQueueType(Item->Priority),
             Item);
     } else {
-        // No IoWorkItem available — complete as failed
-        WqiCompleteWorkItem(Item, STATUS_DEVICE_NOT_READY);
+        // No IoWorkItem — complete with manual cleanup at DISPATCH_LEVEL.
+        // Cannot call WqiCompleteWorkItem here because user-provided
+        // CompletionCallback/CleanupCallback may require PASSIVE_LEVEL.
+        InterlockedExchange(&Item->State, (LONG)ShadowWqItemStateFailed);
+        Item->CompletionStatus = STATUS_DEVICE_NOT_READY;
+        WqiRemoveFromActiveList(Item);
+        InterlockedDecrement(&g_WqManager.PendingCount);
+        InterlockedDecrement(&g_WqManager.Stats.CurrentPending);
+        InterlockedIncrement64(&g_WqManager.Stats.TotalFailed);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        WqiDereferenceWorkItem(Item);
     }
 }
 
@@ -947,15 +951,6 @@ WqiTrackComplete(
     } else {
         InterlockedIncrement64(&g_WqManager.Stats.TotalFailed);
     }
-
-    // Update executing peak
-    LONG ExecCurrent = g_WqManager.Stats.CurrentExecuting;
-    LONG ExecPeak;
-    do {
-        ExecPeak = g_WqManager.Stats.PeakExecuting;
-        if (ExecCurrent <= ExecPeak) break;
-    } while (InterlockedCompareExchange(
-        &g_WqManager.Stats.PeakExecuting, ExecCurrent, ExecPeak) != ExecPeak);
 }
 
 static PSHADOWSTRIKE_WORK_ITEM
@@ -1034,12 +1029,16 @@ ShadowStrikeQueueWorkItemWithPriority(
     // Check capacity
     if (g_WqManager.PendingCount >= g_WqManager.MaxPending) {
         InterlockedIncrement64(&g_WqManager.Stats.TotalDropped);
+        SsPmRecordSample(ShadowStrikeGetPerformanceMonitor(),
+                         SsPmMetric_DroppedEvents, 1);
         ExReleaseRundownProtection(&g_WqManager.RundownProtection);
         return STATUS_QUOTA_EXCEEDED;
     }
 
     Item = WqiAllocateWorkItem();
     if (Item == NULL) {
+        SsPmRecordSample(ShadowStrikeGetPerformanceMonitor(),
+                         SsPmMetric_DroppedEvents, 1);
         ExReleaseRundownProtection(&g_WqManager.RundownProtection);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1132,6 +1131,8 @@ ShadowStrikeQueueWorkItemEx(
     // Capacity check
     if (g_WqManager.PendingCount >= g_WqManager.MaxPending) {
         InterlockedIncrement64(&g_WqManager.Stats.TotalDropped);
+        SsPmRecordSample(ShadowStrikeGetPerformanceMonitor(),
+                         SsPmMetric_DroppedEvents, 1);
         ExReleaseRundownProtection(&g_WqManager.RundownProtection);
         return STATUS_QUOTA_EXCEEDED;
     }
@@ -1147,6 +1148,8 @@ ShadowStrikeQueueWorkItemEx(
 
     Item = WqiAllocateWorkItem();
     if (Item == NULL) {
+        SsPmRecordSample(ShadowStrikeGetPerformanceMonitor(),
+                         SsPmMetric_DroppedEvents, 1);
         ExReleaseRundownProtection(&g_WqManager.RundownProtection);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1377,24 +1380,45 @@ ShadowStrikeCancelWorkItem(
         (LONG)ShadowWqItemStateQueued);
 
     if (OldState == (LONG)ShadowWqItemStateQueued) {
-        // Successfully cancelled before execution
+        // Successfully marked for cancellation
         InterlockedExchange(&Item->CancelRequested, 1);
 
-        // Cancel timer if delayed
+        //
+        // For delayed items: try to dequeue the pending DPC.
+        // WorkQueue DPCs don't do work inline — they dispatch to IoWorkItem.
+        // So KeFlushQueuedDpcs is NOT sufficient (IoWorkItem still pending).
+        // KeRemoveQueueDpc is the sole gate:
+        //   TRUE  → DPC dequeued, IoWorkItem never queued → immediate cleanup
+        //   FALSE → DPC ran/running, IoWorkItem in system queue → delegate
+        //
+        BOOLEAN canCleanNow = TRUE;
+
         if (Item->Type == ShadowWqTypeDelayed) {
             KeCancelTimer(&Item->DelayTimer);
-        }
-
-        // Call cancel callback
-        if (Item->Options.CancelCallback != NULL) {
-            __try {
-                Item->Options.CancelCallback(Item->Context, Item->ContextSize);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Don't crash
+            if (!KeRemoveQueueDpc(&Item->DelayDpc)) {
+                // DPC already ran → IoWorkItem pending → let completion path handle.
+                // WqiExecuteWorkItem will see CancelRequested → CancelCallback → complete.
+                canCleanNow = FALSE;
             }
+        } else {
+            // Non-delayed: IoWorkItem was queued at submission → will fire.
+            // WqiExecuteWorkItem will see CancelRequested → CancelCallback → complete.
+            canCleanNow = FALSE;
         }
 
-        WqiCompleteWorkItem(Item, STATUS_CANCELLED);
+        if (canCleanNow) {
+            // Immediate cleanup — DPC dequeued, no pending dispatch
+            if (Item->Options.CancelCallback != NULL) {
+                __try {
+                    Item->Options.CancelCallback(Item->Context, Item->ContextSize);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    // Don't crash
+                }
+            }
+            WqiCompleteWorkItem(Item, STATUS_CANCELLED);
+        }
+        // else: IoWorkItem completion path handles cancel callback + cleanup
+
         WqiDereferenceWorkItem(Item); // release FindById ref
         return STATUS_SUCCESS;
     }
@@ -1610,11 +1634,17 @@ ShadowStrikeWorkQueueFlush(VOID)
     PLIST_ENTRY Entry, NextEntry;
     PSHADOWSTRIKE_WORK_ITEM Item;
     ULONG FlushedCount = 0;
-    LIST_ENTRY ToCancelList;
+    LIST_ENTRY ImmediateCleanupList;
 
-    InitializeListHead(&ToCancelList);
+    InitializeListHead(&ImmediateCleanupList);
 
-    // FIX #11: Collect queued items under lock, then cancel them outside lock
+    //
+    // Phase 1 (under spinlock): Mark all Queued items as Cancelled.
+    // Only items where the DPC was successfully dequeued can be cleaned
+    // immediately. For non-delayed items (IoWorkItem already in system queue)
+    // and delayed items whose DPC already ran (IoWorkItem pending), we leave
+    // them in the active list — the IoWorkItem completion path handles cleanup.
+    //
     KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
 
     for (Entry = g_WqManager.ActiveList.Flink;
@@ -1625,41 +1655,60 @@ ShadowStrikeWorkQueueFlush(VOID)
         Item = CONTAINING_RECORD(Entry, SHADOWSTRIKE_WORK_ITEM, ActiveListEntry);
 
         LONG State = InterlockedCompareExchange(&Item->State, 0, 0);
-        if (State == (LONG)ShadowWqItemStateQueued) {
-            // Atomically transition to cancelled
-            LONG Was = InterlockedCompareExchange(
-                &Item->State,
-                (LONG)ShadowWqItemStateCancelled,
-                (LONG)ShadowWqItemStateQueued);
-
-            if (Was == (LONG)ShadowWqItemStateQueued) {
-                InterlockedExchange(&Item->CancelRequested, 1);
-
-                // Cancel timer if delayed
-                if (Item->Type == ShadowWqTypeDelayed) {
-                    KeCancelTimer(&Item->DelayTimer);
-                }
-
-                // Remove from active list
-                RemoveEntryList(&Item->ActiveListEntry);
-                InterlockedDecrement(&g_WqManager.ActiveCount);
-
-                // Move to local cancel list
-                InsertTailList(&ToCancelList, &Item->ActiveListEntry);
-                FlushedCount++;
-            }
+        if (State != (LONG)ShadowWqItemStateQueued) {
+            continue;
         }
+
+        LONG Was = InterlockedCompareExchange(
+            &Item->State,
+            (LONG)ShadowWqItemStateCancelled,
+            (LONG)ShadowWqItemStateQueued);
+
+        if (Was != (LONG)ShadowWqItemStateQueued) {
+            continue;
+        }
+
+        InterlockedExchange(&Item->CancelRequested, 1);
+        FlushedCount++;
+
+        //
+        // Determine if we can clean this item immediately.
+        // KeRemoveQueueDpc is safe at DISPATCH_LEVEL (under spinlock).
+        //
+        BOOLEAN canCleanNow = FALSE;
+
+        if (Item->Type == ShadowWqTypeDelayed) {
+            KeCancelTimer(&Item->DelayTimer);
+            if (KeRemoveQueueDpc(&Item->DelayDpc)) {
+                // DPC successfully dequeued — IoWorkItem was never queued.
+                canCleanNow = TRUE;
+            }
+            // else: DPC ran → IoWorkItem pending → leave in active list
+        }
+        // Non-delayed: IoWorkItem queued at submission → leave in active list
+
+        if (canCleanNow) {
+            RemoveEntryList(&Item->ActiveListEntry);
+            InterlockedDecrement(&g_WqManager.ActiveCount);
+            InsertTailList(&ImmediateCleanupList, &Item->ActiveListEntry);
+        }
+        // else: Item stays in active list. IoWorkItem fires →
+        // WqiExecuteWorkItem sees CancelRequested → CancelCallback → complete.
     }
 
     KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
 
-    // Complete cancelled items outside spin lock
-    while (!IsListEmpty(&ToCancelList)) {
-        Entry = RemoveHeadList(&ToCancelList);
+    //
+    // Phase 2 (outside spinlock): Full cleanup for dequeued delayed items.
+    // These items have no pending DPC or IoWorkItem — safe to free.
+    // Use WqiCompleteWorkItem for proper lifecycle (stats, rundown, deref).
+    //
+    while (!IsListEmpty(&ImmediateCleanupList)) {
+        Entry = RemoveHeadList(&ImmediateCleanupList);
         Item = CONTAINING_RECORD(Entry, SHADOWSTRIKE_WORK_ITEM, ActiveListEntry);
         InitializeListHead(&Item->ActiveListEntry);
 
-        // Cancel callback
+        // Cancel callback (not handled by WqiCompleteWorkItem)
         if (Item->Options.CancelCallback != NULL) {
             __try {
                 Item->Options.CancelCallback(Item->Context, Item->ContextSize);
@@ -1668,32 +1717,8 @@ ShadowStrikeWorkQueueFlush(VOID)
             }
         }
 
-        Item->CompletionStatus = STATUS_CANCELLED;
-
-        // Completion callback
-        if (Item->Options.CompletionCallback != NULL) {
-            __try {
-                Item->Options.CompletionCallback(
-                    STATUS_CANCELLED, Item->Context, Item->Options.CompletionContext);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Don't crash
-            }
-        }
-
-        // Signal completion event
-        if ((Item->Flags & ShadowWqFlagSignalCompletion) &&
-            Item->Options.CompletionEvent != NULL) {
-            KeSetEvent(Item->Options.CompletionEvent, IO_NO_INCREMENT, FALSE);
-        }
-
-        // Update stats
-        InterlockedDecrement(&g_WqManager.PendingCount);
-        InterlockedDecrement(&g_WqManager.Stats.CurrentPending);
-        InterlockedIncrement64(&g_WqManager.Stats.TotalCancelled);
-
-        // Release rundown + free
-        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
-        WqiDereferenceWorkItem(Item);
+        // Complete lifecycle: callbacks, stats, rundown release, deref
+        WqiCompleteWorkItem(Item, STATUS_CANCELLED);
     }
 
     return FlushedCount;
