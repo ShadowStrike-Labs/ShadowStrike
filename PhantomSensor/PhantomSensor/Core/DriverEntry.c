@@ -3326,6 +3326,13 @@ ShadowStrikeGetAsyncWorkQueue(VOID)
     return g_AsyncWorkQueue;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PDPC_MANAGER
+ShadowStrikeGetDpcManager(VOID)
+{
+    return g_DpcManager;
+}
+
 // ============================================================================
 // VERSION COMPATIBILITY CHECK
 // ============================================================================

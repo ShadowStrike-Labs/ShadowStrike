@@ -235,6 +235,8 @@ typedef struct _DPC_OPTIONS {
  *
  * IRQL: PASSIVE_LEVEL (INIT section).
  */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 DpcInitialize(
     _Out_ PDPC_MANAGER* Manager,
@@ -247,6 +249,7 @@ DpcInitialize(
  *
  * IRQL: PASSIVE_LEVEL.
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 DpcShutdown(
     _Inout_ PDPC_MANAGER* Manager
@@ -261,6 +264,8 @@ DpcShutdown(
  * ContextSize must be <= DPC_MAX_CONTEXT_SIZE.
  * Safe to call at any IRQL <= DISPATCH_LEVEL.
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 DpcQueue(
     _In_ PDPC_MANAGER Manager,
@@ -275,6 +280,8 @@ DpcQueue(
  * The caller must keep Context valid until the DPC completes.
  * ContextSize is passed through to the callback for convenience.
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 DpcQueueExternal(
     _In_ PDPC_MANAGER Manager,
@@ -288,6 +295,8 @@ DpcQueueExternal(
  * Queue a DPC targeted at a specific processor.
  * ProcessorGroup/ProcessorNumber identify the logical CPU.
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 DpcQueueOnProcessor(
     _In_ PDPC_MANAGER Manager,
@@ -301,6 +310,8 @@ DpcQueueOnProcessor(
 /**
  * Queue a threaded DPC (may execute at PASSIVE_LEVEL).
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 DpcQueueThreaded(
     _In_ PDPC_MANAGER Manager,
@@ -317,6 +328,7 @@ typedef struct _DPC_STATISTICS {
     ULONG PoolSize;
     ULONG FreeCount;
     ULONG AllocatedCount;
+    ULONG ActiveCount;          // DPC callbacks currently in-flight
     ULONG64 TotalQueued;
     ULONG64 TotalExecuted;
     ULONG64 TotalCancelled;
@@ -328,6 +340,8 @@ typedef struct _DPC_STATISTICS {
  * Snapshot current statistics.  Not collectively atomic — individual
  * counters are read atomically but the snapshot may be slightly skewed.
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 DpcGetStatistics(
     _In_ PDPC_MANAGER Manager,

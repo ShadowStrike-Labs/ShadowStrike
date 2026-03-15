@@ -219,6 +219,9 @@ typedef struct _AWQ_STATISTICS {
     LARGE_INTEGER UpTime;
     ULONG64 ItemsPerSecond;
 
+    ULONG64 TotalTimeouts;      // Items that exceeded their execution timeout
+    ULONG   StuckWorkers;       // Workers currently executing beyond timeout
+
     struct {
         ULONG64 Enqueued;
         ULONG64 Dequeued;

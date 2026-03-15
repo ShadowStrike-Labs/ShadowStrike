@@ -720,6 +720,18 @@ _IRQL_requires_max_(APC_LEVEL)
 HAWQ_MANAGER
 ShadowStrikeGetAsyncWorkQueue(VOID);
 
+/**
+ * @brief Get DPC manager for deferred procedure call dispatch.
+ *        Modules needing fire-and-forget DPC work at <= DISPATCH_LEVEL
+ *        use this pooled DPC infrastructure instead of raw KeInitializeDpc.
+ * @return PDPC_MANAGER or NULL if not initialized.
+ */
+struct _DPC_MANAGER;
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+struct _DPC_MANAGER*
+ShadowStrikeGetDpcManager(VOID);
+
 #ifdef __cplusplus
 }
 #endif

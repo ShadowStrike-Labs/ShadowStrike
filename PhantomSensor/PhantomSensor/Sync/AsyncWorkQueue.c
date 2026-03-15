@@ -121,6 +121,7 @@ typedef struct _AWQ_WORK_ITEM_I {
     struct _AWQ_MANAGER_I   *Manager;
 
     LARGE_INTEGER           SubmitTime;
+    LARGE_INTEGER           ExecutionStartTime; // Set when callback begins
 
 } AWQ_WORK_ITEM_I, *PAWQ_WORK_ITEM_I;
 
@@ -239,6 +240,7 @@ typedef struct _AWQ_MANAGER_I {
         volatile LONG64     TotalCancelled;
         volatile LONG64     TotalFailed;
         volatile LONG64     TotalRetries;
+        volatile LONG64     TotalTimeouts;
         LARGE_INTEGER       StartTime;
     } Stats;
 
@@ -1434,8 +1436,48 @@ AwqGetStatistics(
     Stats->WorkerCount = (ULONG)Mgr->WorkerCount;
     Stats->IdleWorkers = (ULONG)Mgr->IdleWorkerCount;
     Stats->ActiveWorkers = (ULONG)Mgr->ActiveWorkerCount;
+    Stats->TotalTimeouts = (ULONG64)Mgr->Stats.TotalTimeouts;
 
+    //
+    // Query time once for both stuck-worker scan and uptime calculation.
+    //
     KeQuerySystemTimePrecise(&Now);
+
+    //
+    // Walk active items under shared lock to count stuck workers.
+    // A stuck worker is one executing a callback beyond its configured
+    // timeout. This provides real-time observability for operators.
+    //
+    Stats->StuckWorkers = 0;
+    {
+        PLIST_ENTRY Entry;
+
+        KeEnterCriticalRegion();
+        AWQ_LOCK_SHARED(&Mgr->ActiveItems.Lock);
+
+        for (Entry = Mgr->ActiveItems.List.Flink;
+             Entry != &Mgr->ActiveItems.List;
+             Entry = Entry->Flink) {
+
+            PAWQ_WORK_ITEM_I Item = CONTAINING_RECORD(
+                Entry, AWQ_WORK_ITEM_I, TrackLink);
+
+            if (Item->State == (LONG)AwqItemState_Running &&
+                Item->TimeoutMs > 0 &&
+                Item->ExecutionStartTime.QuadPart != 0) {
+
+                LONG64 ElapsedMs = (Now.QuadPart -
+                                    Item->ExecutionStartTime.QuadPart) / 10000;
+                if (ElapsedMs > (LONG64)Item->TimeoutMs) {
+                    Stats->StuckWorkers++;
+                }
+            }
+        }
+
+        AWQ_UNLOCK_SHARED(&Mgr->ActiveItems.Lock);
+        KeLeaveCriticalRegion();
+    }
+
     Stats->UpTime.QuadPart = Now.QuadPart - Mgr->Stats.StartTime.QuadPart;
     {
         LONG64 Sec = Stats->UpTime.QuadPart / 10000000;
@@ -1470,6 +1512,7 @@ AwqResetStatistics(
     InterlockedExchange64(&Mgr->Stats.TotalCancelled, 0);
     InterlockedExchange64(&Mgr->Stats.TotalFailed, 0);
     InterlockedExchange64(&Mgr->Stats.TotalRetries, 0);
+    InterlockedExchange64(&Mgr->Stats.TotalTimeouts, 0);
     KeQuerySystemTimePrecise(&Mgr->Stats.StartTime);
 
     for (i = 0; i < AwqPriority_Count; i++) {
@@ -1973,6 +2016,8 @@ AwqpExecuteItem(
     //
     // Execute callback (SEH-protected)
     //
+    KeQuerySystemTimePrecise(&Item->ExecutionStartTime);
+
     __try {
         Status = Item->WorkCallback(Item->Context, Item->ContextSize);
     }
@@ -1983,6 +2028,47 @@ AwqpExecuteItem(
             "[ShadowStrike] AWQ: Callback exception 0x%08X for item %llu\n",
             Status, Item->ItemId);
 #endif
+    }
+
+    //
+    // Timeout enforcement: if callback exceeded its timeout, override
+    // the result to STATUS_TIMEOUT. This provides observability for
+    // runaway callbacks on millions of endpoints — operators see
+    // TotalTimeouts climbing and can identify which callbacks are slow.
+    //
+    if (Item->TimeoutMs > 0) {
+        LARGE_INTEGER EndTime;
+        KeQuerySystemTimePrecise(&EndTime);
+        LONG64 ElapsedMs = (EndTime.QuadPart - Item->ExecutionStartTime.QuadPart) / 10000;
+
+        if (ElapsedMs > (LONG64)Item->TimeoutMs) {
+            InterlockedIncrement64(&Mgr->Stats.TotalTimeouts);
+#if DBG
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike] AWQ: Item %llu exceeded timeout (%lldms > %ums)\n",
+                Item->ItemId, ElapsedMs, Item->TimeoutMs);
+#endif
+            {
+                PSSPM_MONITOR pm = ShadowStrikeGetPerformanceMonitor();
+                if (pm != NULL) {
+                    ULONG64 LatencyUs;
+                    if (ElapsedMs > (LONG64)(MAXULONG64 / 1000)) {
+                        LatencyUs = MAXULONG64;
+                    } else {
+                        LatencyUs = (ULONG64)ElapsedMs * 1000;
+                    }
+                    SsPmRecordSample(pm, SsPmMetric_CallbackLatencyUs, LatencyUs);
+                }
+            }
+
+            //
+            // Only override to timeout if callback reported success.
+            // If callback already failed, preserve the original failure code.
+            //
+            if (NT_SUCCESS(Status)) {
+                Status = STATUS_TIMEOUT;
+            }
+        }
     }
 
     //

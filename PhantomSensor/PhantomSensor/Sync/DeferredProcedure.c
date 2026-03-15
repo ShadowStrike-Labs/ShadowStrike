@@ -62,7 +62,9 @@
  * ============================================================================
  */
 
+#include "../Core/DriverEntry.h"
 #include "DeferredProcedure.h"
+#include "../Performance/PerformanceMonitor.h"
 #include "../Utilities/MemoryUtils.h"
 
 #ifdef ALLOC_PRAGMA
@@ -327,6 +329,12 @@ DpcQueue(
     obj = DpcpAllocateObject(Manager);
     if (obj == NULL) {
         InterlockedIncrement64(&Manager->PoolExhausted);
+        {
+            PSSPM_MONITOR pm = ShadowStrikeGetPerformanceMonitor();
+            if (pm != NULL) {
+                SsPmRecordSample(pm, SsPmMetric_DroppedEvents, 1);
+            }
+        }
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -435,6 +443,12 @@ DpcQueueExternal(
     obj = DpcpAllocateObject(Manager);
     if (obj == NULL) {
         InterlockedIncrement64(&Manager->PoolExhausted);
+        {
+            PSSPM_MONITOR pm = ShadowStrikeGetPerformanceMonitor();
+            if (pm != NULL) {
+                SsPmRecordSample(pm, SsPmMetric_DroppedEvents, 1);
+            }
+        }
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -475,6 +489,7 @@ DpcQueueExternal(
     if (obj->ProcessorTargeted) {
         status = KeSetTargetProcessorDpcEx(&obj->Dpc, &obj->TargetProcessor);
         if (!NT_SUCCESS(status)) {
+            DpcpClearContext(obj);
             DpcpFreeObject(Manager, obj);
             return status;
         }
@@ -485,6 +500,7 @@ DpcQueueExternal(
 
     if (!KeInsertQueueDpc(&obj->Dpc, Manager, NULL)) {
         InterlockedExchange((PLONG)&obj->State, DpcState_Free);
+        DpcpClearContext(obj);
         DpcpFreeObject(Manager, obj);
         return STATUS_UNSUCCESSFUL;
     }
@@ -558,6 +574,7 @@ DpcGetStatistics(
     Stats->PoolSize       = Manager->PoolSize;
     Stats->FreeCount      = (ULONG)Manager->FreeCount;
     Stats->AllocatedCount = (ULONG)Manager->AllocatedCount;
+    Stats->ActiveCount    = (ULONG)Manager->ActiveCount;
     Stats->TotalQueued    = (ULONG64)Manager->TotalQueued;
     Stats->TotalExecuted  = (ULONG64)Manager->TotalExecuted;
     Stats->TotalCancelled = (ULONG64)Manager->TotalCancelled;
@@ -597,10 +614,8 @@ DpcpAllocateObject(
     InterlockedIncrement(&Manager->AllocatedCount);
 
     //
-    // Selective reset — clear only the mutable fields, not the
-    // entire 200+ byte struct (avoids wasting cycles at DISPATCH).
+    // Object was already reset in DpcpFreeObject. Only transition state.
     //
-    DpcpResetObject(obj);
     obj->State = DpcState_Allocated;
 
     return obj;
