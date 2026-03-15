@@ -44,6 +44,7 @@
 #include "../Utilities/MemoryUtils.h"
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
+#include "../Power/PowerCallback.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, SsPmInitialize)
@@ -963,6 +964,18 @@ Routine Description:
         InterlockedCompareExchange(&Monitor->ShuttingDown, 0, 0) != 0 ||
         InterlockedCompareExchange(&Monitor->CollectionEnabled, 0, 0) == 0) {
         return;
+    }
+
+    //
+    // On battery, skip every other collection cycle to reduce CPU overhead.
+    // The heartbeat still fires (timer alive detection), but full metric
+    // collection frequency is halved — CrowdStrike-style power conservation.
+    //
+    if (ShadowPowerIsOnBattery()) {
+        static volatile LONG s_BatterySkipTick = 0;
+        if (InterlockedIncrement(&s_BatterySkipTick) & 1) {
+            return;
+        }
     }
 
     //

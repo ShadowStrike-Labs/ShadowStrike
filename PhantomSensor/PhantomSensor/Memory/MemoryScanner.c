@@ -71,6 +71,7 @@
 #include <ntstrsafe.h>
 #include "../../Shared/BehaviorTypes.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../Power/PowerCallback.h"
 
 //
 // MEM_IMAGE is not defined in kernel-mode headers (MS-4 fix).
@@ -1366,6 +1367,16 @@ MsScanProcess(
     }
 
     *Result = NULL;
+
+    //
+    // On battery power, downgrade Full/Standard scans to Quick (executable
+    // regions only). Preserves shellcode/injection detection while halving
+    // CPU time. Targeted scans (event-driven) are never downgraded.
+    //
+    if (ShadowPowerIsOnBattery() &&
+        (Type == MsScanType_Full || Type == MsScanType_Standard)) {
+        Type = MsScanType_Quick;
+    }
 
     //
     // Acquire reference first, then check shutdown (CRIT-3 fix).

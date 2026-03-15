@@ -356,7 +356,13 @@ ShadowRegisterPowerCallbacks(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Initializing power management subsystem\n");
 
+    //
+    // Zero the struct for clean re-init, then restore the -1 sentinel
+    // that guards against concurrent initializers. RtlZeroMemory destroys
+    // the CAS value set above — restore it immediately.
+    //
     RtlZeroMemory(&g_PowerState, sizeof(SHADOW_POWER_GLOBALS));
+    WriteNoFence(&g_PowerState.Initialized, -1);
 
     UNREFERENCED_PARAMETER(DeviceObject);
 
@@ -708,19 +714,26 @@ ShadowPowerGetBatteryPercentage(
     VOID
     )
 {
+    BOOLEAN present;
+    ULONG pct;
+
     if (!g_PowerState.Initialized) {
         return 0;
     }
 
     //
-    // BatteryPercentage is a single ULONG — naturally atomic on all
-    // supported architectures. Read without lock.
+    // Snapshot both fields with a compiler barrier between them.
+    // Individual reads are naturally atomic (BOOLEAN + ULONG), and
+    // the volatile qualifier prevents reordering.  Worst case on a
+    // stale read is returning 0 briefly after battery insertion.
     //
-    if (!g_PowerState.StateInfo.BatteryPresent) {
+    present = *(volatile BOOLEAN*)&g_PowerState.StateInfo.BatteryPresent;
+    if (!present) {
         return 0;
     }
 
-    return g_PowerState.StateInfo.BatteryPercentage;
+    pct = *(volatile ULONG*)&g_PowerState.StateInfo.BatteryPercentage;
+    return (pct <= 100) ? pct : 100;
 }
 
 // ============================================================================
@@ -1765,7 +1778,7 @@ PwrpProcessPowerEvent(
     }
 
     event = (PSHADOW_POWER_EVENT_INTERNAL)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
+        POOL_FLAG_PAGED,
         sizeof(SHADOW_POWER_EVENT_INTERNAL),
         PWR_POOL_TAG_EVENT
         );
