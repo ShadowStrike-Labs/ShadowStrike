@@ -391,6 +391,16 @@ ShadowpParsePEHeaders(
     _Out_opt_ PULONG Checksum
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+static
+NTSTATUS
+ShadowpReadZoneIdentifierContent(
+    _In_ PFLT_INSTANCE Instance,
+    _In_ PFILE_OBJECT FileObject,
+    _Out_ PUCHAR ZoneId
+    );
+
 // ============================================================================
 // INITIALIZATION / CLEANUP
 // ============================================================================
@@ -690,6 +700,8 @@ ShadowStrikeFreeFileName(
     PUNICODE_STRING FileName
     )
 {
+    PAGED_CODE();
+
     if (FileName == NULL) {
         return;
     }
@@ -1325,15 +1337,13 @@ ShadowStrikeGetFileInfo(
             if (foundZoneStream) {
                 FileInfo->HasZoneId = TRUE;
                 //
-                // Attempt to read zone ID value. Use the dedicated function
-                // which handles the stream open/read/parse sequence.
+                // Read zone ID directly without re-enumerating streams.
+                // ShadowpReadZoneIdentifierContent opens the ADS and parses content.
                 //
-                ShadowStrikeGetZoneIdentifier(
-                    Instance,
-                    FileObject,
-                    &FileInfo->HasZoneId,
-                    &FileInfo->ZoneId
-                );
+                if (!NT_SUCCESS(ShadowpReadZoneIdentifierContent(
+                        Instance, FileObject, &FileInfo->ZoneId))) {
+                    FileInfo->ZoneId = 3;
+                }
             }
         }
     }
@@ -1385,7 +1395,7 @@ ShadowStrikeDetectFileType(
     ULONG bytesRead = 0;
     const SHADOW_FILE_SIGNATURE* sig;
     const SHADOW_DOS_HEADER* dosHeader;
-    const ULONG headerSize = 256;
+    const ULONG headerSize = SHADOW_PE_HEADER_READ_SIZE;
 
     PAGED_CODE();
 
@@ -1396,7 +1406,8 @@ ShadowStrikeDetectFileType(
     }
 
     //
-    // Allocate header buffer from pool (avoid stack pressure in deep call chains)
+    // Allocate header buffer from pool — use PE_HEADER_READ_SIZE (4096)
+    // to ensure we can reach the NT headers for proper PE32/PE64 classification
     //
     headerBuffer = (PUCHAR)ExAllocatePool2(
         POOL_FLAG_PAGED,
@@ -1426,11 +1437,42 @@ ShadowStrikeDetectFileType(
 
     //
     // Check for PE first (most common for security)
+    // Use ShadowpParsePEHeaders for accurate PE32/PE64/DLL/Driver classification
     //
     dosHeader = (const SHADOW_DOS_HEADER*)headerBuffer;
     if (bytesRead >= sizeof(SHADOW_DOS_HEADER) &&
         dosHeader->e_magic == SHADOW_MZ_SIGNATURE) {
-        *FileType = ShadowFileTypePE32;
+
+        BOOLEAN isPE = FALSE;
+        BOOLEAN is64Bit = FALSE;
+        BOOLEAN isDLL = FALSE;
+        BOOLEAN isDriver = FALSE;
+
+        ShadowpParsePEHeaders(
+            headerBuffer,
+            bytesRead,
+            &isPE,
+            &is64Bit,
+            &isDLL,
+            &isDriver,
+            NULL,   // Subsystem
+            NULL,   // Characteristics
+            NULL,   // Timestamp
+            NULL    // Checksum
+        );
+
+        if (isPE) {
+            if (isDriver) {
+                *FileType = ShadowFileTypeDriver;
+            } else if (isDLL) {
+                *FileType = ShadowFileTypeDLL;
+            } else {
+                *FileType = is64Bit ? ShadowFileTypePE64 : ShadowFileTypePE32;
+            }
+        } else {
+            *FileType = ShadowFileTypeData;
+        }
+
         ExFreePoolWithTag(headerBuffer, SHADOW_FILEBUF_TAG);
         return STATUS_SUCCESS;
     }
@@ -2094,6 +2136,171 @@ ShadowpParseZoneIdentifierContent(
     return STATUS_NOT_FOUND;
 }
 
+/**
+ * @brief Open and read Zone.Identifier ADS content, extract ZoneId value.
+ *
+ * This helper is called when the caller already knows the Zone.Identifier
+ * stream exists (e.g., from a prior stream enumeration). It skips the
+ * redundant stream re-enumeration and goes directly to open/read/parse.
+ *
+ * @param Instance  Filter instance for the file's volume.
+ * @param FileObject  The file object whose Zone.Identifier ADS to read.
+ * @param ZoneId  [out] Receives the parsed ZoneId value (0-4).
+ *
+ * @return STATUS_SUCCESS on success; error status if ADS cannot be read.
+ *         On failure, ZoneId is left unchanged (caller sets conservative default).
+ */
+static
+NTSTATUS
+ShadowpReadZoneIdentifierContent(
+    _In_ PFLT_INSTANCE Instance,
+    _In_ PFILE_OBJECT FileObject,
+    _Out_ PUCHAR ZoneId
+    )
+{
+    NTSTATUS status;
+    UNICODE_STRING fileName;
+    UNICODE_STRING adsPath;
+    OBJECT_ATTRIBUTES objAttrs;
+    IO_STATUS_BLOCK ioStatus;
+    HANDLE streamHandle = NULL;
+    PFILE_OBJECT streamFileObject = NULL;
+    PUCHAR streamContent = NULL;
+    ULONG bytesRead = 0;
+    SIZE_T totalPathSize;
+    const ULONG streamContentSize = SHADOW_ZONE_ID_MAX_CONTENT_SIZE;
+
+    *ZoneId = 0;
+
+    if (g_FileUtilsFilterHandle == NULL) {
+        return STATUS_FLT_NOT_INITIALIZED;
+    }
+
+    status = ShadowStrikeGetFileNameFromFileObject(Instance, FileObject, &fileName);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    //
+    // Build ADS path: filename + :Zone.Identifier
+    // Use SIZE_T arithmetic to prevent USHORT overflow
+    //
+    totalPathSize = (SIZE_T)fileName.Length +
+                    (sizeof(SHADOW_ZONE_IDENTIFIER_STREAM) - sizeof(WCHAR));
+
+    if (totalPathSize > MAXUSHORT || totalPathSize > SHADOW_MAX_PATH_BYTES) {
+        ShadowStrikeFreeFileName(&fileName);
+        return STATUS_NAME_TOO_LONG;
+    }
+
+    adsPath.MaximumLength = (USHORT)totalPathSize + sizeof(WCHAR);
+    adsPath.Buffer = (PWCH)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        adsPath.MaximumLength,
+        SHADOW_FILEPATH_TAG
+    );
+
+    if (adsPath.Buffer == NULL) {
+        ShadowStrikeFreeFileName(&fileName);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlCopyMemory(adsPath.Buffer, fileName.Buffer, fileName.Length);
+    RtlCopyMemory(
+        (PUCHAR)adsPath.Buffer + fileName.Length,
+        SHADOW_ZONE_IDENTIFIER_STREAM,
+        sizeof(SHADOW_ZONE_IDENTIFIER_STREAM) - sizeof(WCHAR)
+    );
+    adsPath.Length = (USHORT)totalPathSize;
+
+    ShadowStrikeFreeFileName(&fileName);
+
+    InitializeObjectAttributes(
+        &objAttrs,
+        &adsPath,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+        NULL,
+        NULL
+    );
+
+    status = FltCreateFileEx(
+        g_FileUtilsFilterHandle,
+        Instance,
+        &streamHandle,
+        &streamFileObject,
+        FILE_GENERIC_READ,
+        &objAttrs,
+        &ioStatus,
+        NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        NULL,
+        0,
+        IO_IGNORE_SHARE_ACCESS_CHECK
+    );
+
+    ExFreePoolWithTag(adsPath.Buffer, SHADOW_FILEPATH_TAG);
+
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    //
+    // Allocate buffer and read stream content
+    //
+    streamContent = (PUCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        streamContentSize,
+        SHADOW_STREAM_TAG
+    );
+
+    if (streamContent == NULL) {
+        FltClose(streamHandle);
+        ObDereferenceObject(streamFileObject);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    {
+        LARGE_INTEGER offset;
+        offset.QuadPart = 0;
+
+        status = FltReadFile(
+            Instance,
+            streamFileObject,
+            &offset,
+            streamContentSize - 1,
+            streamContent,
+            FLTFL_IO_OPERATION_DO_NOT_UPDATE_BYTE_OFFSET,
+            &bytesRead,
+            NULL,
+            NULL
+        );
+    }
+
+    if ((NT_SUCCESS(status) || status == STATUS_END_OF_FILE) &&
+        bytesRead > 0) {
+        streamContent[bytesRead] = '\0';
+
+        status = ShadowpParseZoneIdentifierContent(
+            streamContent,
+            bytesRead,
+            ZoneId
+        );
+    } else if (!NT_SUCCESS(status)) {
+        // status already set
+    } else {
+        status = STATUS_NOT_FOUND;
+    }
+
+    ExFreePoolWithTag(streamContent, SHADOW_STREAM_TAG);
+    FltClose(streamHandle);
+    ObDereferenceObject(streamFileObject);
+
+    return status;
+}
+
 _Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetZoneIdentifier(
@@ -2188,174 +2395,26 @@ ShadowStrikeGetZoneIdentifier(
     if (!foundStream) {
         //
         // No Zone.Identifier stream — file has no Mark-of-the-Web.
-        // Do NOT default to zone 3 here; the stream genuinely does not exist.
         //
         return STATUS_SUCCESS;
     }
 
     //
-    // Zone.Identifier stream exists — read its content to extract zone value
+    // Zone.Identifier stream exists — delegate to helper for open/read/parse
     //
     *HasZoneId = TRUE;
 
-    {
-        UNICODE_STRING fileName;
-        UNICODE_STRING adsPath;
-        OBJECT_ATTRIBUTES objAttrs;
-        IO_STATUS_BLOCK ioStatus;
-        HANDLE streamHandle = NULL;
-        PFILE_OBJECT streamFileObject = NULL;
-        PUCHAR streamContent = NULL;
-        ULONG bytesRead = 0;
-        SIZE_T totalPathSize;
-        const ULONG streamContentSize = SHADOW_ZONE_ID_MAX_CONTENT_SIZE;
-
-        status = ShadowStrikeGetFileNameFromFileObject(Instance, FileObject, &fileName);
-        if (!NT_SUCCESS(status)) {
-            //
-            // Stream exists but we can't build the path to read it.
-            // Default to zone 3 (Internet) as conservative assumption.
-            //
-            *ZoneId = 3;
-            return STATUS_SUCCESS;
-        }
-
+    status = ShadowpReadZoneIdentifierContent(Instance, FileObject, ZoneId);
+    if (!NT_SUCCESS(status)) {
         //
-        // Build ADS path: filename + :Zone.Identifier
-        // Use SIZE_T arithmetic to prevent USHORT overflow (CRITICAL-03 fix)
+        // Stream exists but cannot be read — default to zone 3 (Internet)
+        // as conservative security assumption
         //
-        totalPathSize = (SIZE_T)fileName.Length +
-                        (sizeof(SHADOW_ZONE_IDENTIFIER_STREAM) - sizeof(WCHAR));
-
-        if (totalPathSize > MAXUSHORT || totalPathSize > SHADOW_MAX_PATH_BYTES) {
-            ShadowStrikeFreeFileName(&fileName);
-            *ZoneId = 3;
-            return STATUS_SUCCESS;
-        }
-
-        adsPath.MaximumLength = (USHORT)totalPathSize + sizeof(WCHAR);
-        adsPath.Buffer = (PWCH)ExAllocatePool2(
-            POOL_FLAG_PAGED,
-            adsPath.MaximumLength,
-            SHADOW_FILEPATH_TAG
-        );
-
-        if (adsPath.Buffer == NULL) {
-            ShadowStrikeFreeFileName(&fileName);
-            *ZoneId = 3;
-            return STATUS_SUCCESS;
-        }
-
-        RtlCopyMemory(adsPath.Buffer, fileName.Buffer, fileName.Length);
-        RtlCopyMemory(
-            (PUCHAR)adsPath.Buffer + fileName.Length,
-            SHADOW_ZONE_IDENTIFIER_STREAM,
-            sizeof(SHADOW_ZONE_IDENTIFIER_STREAM) - sizeof(WCHAR)
-        );
-        adsPath.Length = (USHORT)totalPathSize;
-
-        ShadowStrikeFreeFileName(&fileName);
-
-        //
-        // Open the Zone.Identifier stream using the stored filter handle
-        //
-        if (g_FileUtilsFilterHandle == NULL) {
-            ExFreePoolWithTag(adsPath.Buffer, SHADOW_FILEPATH_TAG);
-            *ZoneId = 3;
-            return STATUS_SUCCESS;
-        }
-
-        InitializeObjectAttributes(
-            &objAttrs,
-            &adsPath,
-            OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
-            NULL,
-            NULL
-        );
-
-        status = FltCreateFileEx(
-            g_FileUtilsFilterHandle,
-            Instance,
-            &streamHandle,
-            &streamFileObject,
-            FILE_GENERIC_READ,
-            &objAttrs,
-            &ioStatus,
-            NULL,
-            FILE_ATTRIBUTE_NORMAL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_OPEN,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-            NULL,
-            0,
-            IO_IGNORE_SHARE_ACCESS_CHECK
-        );
-
-        ExFreePoolWithTag(adsPath.Buffer, SHADOW_FILEPATH_TAG);
-
-        if (!NT_SUCCESS(status)) {
-            //
-            // Stream exists but we can't open it — default to zone 3
-            //
-            *ZoneId = 3;
-            return STATUS_SUCCESS;
-        }
-
-        //
-        // Allocate buffer and read stream content
-        //
-        streamContent = (PUCHAR)ExAllocatePool2(
-            POOL_FLAG_PAGED,
-            streamContentSize,
-            SHADOW_STREAM_TAG
-        );
-
-        if (streamContent != NULL) {
-            LARGE_INTEGER offset;
-            offset.QuadPart = 0;
-
-            status = FltReadFile(
-                Instance,
-                streamFileObject,
-                &offset,
-                streamContentSize - 1,
-                streamContent,
-                FLTFL_IO_OPERATION_DO_NOT_UPDATE_BYTE_OFFSET,
-                &bytesRead,
-                NULL,
-                NULL
-            );
-
-            if ((NT_SUCCESS(status) || status == STATUS_END_OF_FILE) &&
-                bytesRead > 0) {
-                streamContent[bytesRead] = '\0';
-
-                status = ShadowpParseZoneIdentifierContent(
-                    streamContent,
-                    bytesRead,
-                    ZoneId
-                );
-
-                if (!NT_SUCCESS(status)) {
-                    *ZoneId = 3;
-                }
-            } else {
-                *ZoneId = 3;
-            }
-
-            ExFreePoolWithTag(streamContent, SHADOW_STREAM_TAG);
-        } else {
-            *ZoneId = 3;
-        }
-
-        //
-        // Cleanup — close handle before dereferencing file object
-        //
-        FltClose(streamHandle);
-        ObDereferenceObject(streamFileObject);
+        *ZoneId = 3;
+        status = STATUS_SUCCESS;
     }
 
-    return STATUS_SUCCESS;
+    return status;
 }
 
 // ============================================================================

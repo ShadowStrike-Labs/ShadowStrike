@@ -51,6 +51,7 @@
 #include "../SelfProtection/SelfProtect.h"
 #include "../Callbacks/Registry/RegistryCallback.h"
 #include "../Utilities/HashUtils.h"
+#include "../Utilities/FileUtils.h"
 #include "../Shared/SharedDefs.h"
 #include "../Shared/PortName.h"
 #include "../Callbacks/FileSystem/NamedPipeMonitor.h"
@@ -207,6 +208,7 @@ static ULONG g_SubsystemFlags = SubsysFlag_None;
  */
 static BOOLEAN g_PreSetInfoInitialized = FALSE;
 static BOOLEAN g_PreWriteInitialized = FALSE;
+static BOOLEAN g_FileUtilsInitialized = FALSE;
 
 // ============================================================================
 // SUBSYSTEM HANDLE STORAGE
@@ -1709,6 +1711,23 @@ DriverEntry(
         ShadowStrikeLogInitStatus("Hash Utilities", STATUS_SUCCESS);
     }
 
+    //
+    // Step 10.5: Initialize file utilities (non-critical)
+    // Provides file type detection, ADS detection, volume info, PE parsing,
+    // Zone.Identifier extraction, and secure file reading infrastructure.
+    // Requires FilterHandle from FltRegisterFilter (Step 6).
+    //
+    status = ShadowStrikeInitializeFileUtils(g_DriverData.FilterHandle);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Failed to initialize file utilities: 0x%08X\n",
+                   status);
+        status = STATUS_SUCCESS;
+    } else {
+        g_FileUtilsInitialized = TRUE;
+        ShadowStrikeLogInitStatus("File Utilities", STATUS_SUCCESS);
+    }
+
     // =========================================================================
     // PHASE 2: Detection Subsystems
     // =========================================================================
@@ -2839,6 +2858,15 @@ ShadowStrikeUnload(
         ShadowStrikeCleanupFileSystemCallbacks();
     }
 
+    //
+    // Step 9.6: Cleanup file utilities (AFTER FltUnregisterFilter —
+    // filter callbacks may call FileUtils functions; must drain first)
+    //
+    if (g_FileUtilsInitialized) {
+        ShadowStrikeCleanupFileUtils();
+        g_FileUtilsInitialized = FALSE;
+    }
+
     // =========================================================================
     // PHASE 6A SHUTDOWN: Scoring Orchestration
     // =========================================================================
@@ -3910,6 +3938,15 @@ ShadowStrikeCleanupByFlags(
 
     if (InitFlags & InitFlag_FscInitialized) {
         ShadowStrikeCleanupFileSystemCallbacks();
+    }
+
+    //
+    // Cleanup file utilities AFTER FltUnregisterFilter —
+    // filter callbacks may call FileUtils functions; must drain first
+    //
+    if (g_FileUtilsInitialized) {
+        ShadowStrikeCleanupFileUtils();
+        g_FileUtilsInitialized = FALSE;
     }
 
     //
