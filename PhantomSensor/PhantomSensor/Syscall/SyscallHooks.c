@@ -161,13 +161,21 @@ typedef struct _SH_FRAMEWORK_INTERNAL {
     /** Number of currently enabled hooks */
     volatile LONG EnabledHookCount;
 
-    /** Number of dispatch calls currently in-flight */
+    /**
+     * @brief Rundown protection for dispatch lifecycle.
+     * Replaces the former ActiveDispatchCount + ShuttingDown + polling drain.
+     * ExWaitForRundownProtectionRelease atomically rejects new dispatches
+     * AND waits for in-flight ones — no race window, no spin-polling.
+     */
+    EX_RUNDOWN_REF DispatchRundownRef;
+
+    /** Dispatch count for statistics (peak tracking) — NOT used for shutdown */
     volatile LONG ActiveDispatchCount;
 
     /** Peak concurrent dispatches (high-water mark) */
     volatile LONG PeakConcurrentDispatches;
 
-    /** Shutdown flag — once set, no new dispatches are accepted */
+    /** Shutdown flag — quick reject for registration APIs (ShRegisterHook, ShEnableHook) */
     volatile LONG ShuttingDown;
 
     /** Lookaside list for hook entry allocations */
@@ -226,7 +234,7 @@ ShpFindHookInBucket(
     _In_ ULONG SyscallNumber
     );
 
-static VOID
+static BOOLEAN
 ShpAcquireDispatchRef(
     _Inout_ PSH_FRAMEWORK_INTERNAL Fw
     );
@@ -249,11 +257,6 @@ ShpReleaseHookRef(
 static VOID
 ShpDrainHookCallbacks(
     _In_ PSH_HOOK_INTERNAL Hook
-    );
-
-static VOID
-ShpDrainAllDispatches(
-    _In_ PSH_FRAMEWORK_INTERNAL Fw
     );
 
 static VOID
@@ -395,19 +398,30 @@ ShpFindHookInBucket(
 }
 
 /**
- * @brief Increment framework active dispatch count.
+ * @brief Acquire dispatch reference via EX_RUNDOWN_REF.
+ * @return TRUE if acquired (dispatch may proceed), FALSE if shutdown in progress.
+ *
+ * After ExWaitForRundownProtectionRelease is called in ShShutdown,
+ * ExAcquireRundownProtection atomically returns FALSE — no race window.
  */
-static VOID
+static BOOLEAN
 ShpAcquireDispatchRef(
     _Inout_ PSH_FRAMEWORK_INTERNAL Fw
     )
 {
-    LONG count = InterlockedIncrement(&Fw->ActiveDispatchCount);
+    LONG count;
+
+    if (!ExAcquireRundownProtection(&Fw->DispatchRundownRef)) {
+        return FALSE;
+    }
+
+    count = InterlockedIncrement(&Fw->ActiveDispatchCount);
     ShpUpdatePeakConcurrent(Fw, count);
+    return TRUE;
 }
 
 /**
- * @brief Decrement framework active dispatch count.
+ * @brief Release dispatch reference.
  */
 static VOID
 ShpReleaseDispatchRef(
@@ -415,6 +429,7 @@ ShpReleaseDispatchRef(
     )
 {
     InterlockedDecrement(&Fw->ActiveDispatchCount);
+    ExReleaseRundownProtection(&Fw->DispatchRundownRef);
 }
 
 /**
@@ -460,37 +475,6 @@ ShpDrainHookCallbacks(
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                 "[ShadowStrike] SyscallHooks: Hook drain taking long, %ld callbacks remain\n",
                 Hook->ActiveCallbackCount);
-        }
-    }
-}
-
-/**
- * @brief Wait for all active dispatches in the framework to drain.
- */
-static VOID
-ShpDrainAllDispatches(
-    _In_ PSH_FRAMEWORK_INTERNAL Fw
-    )
-{
-    LARGE_INTEGER interval;
-    ULONG iterations = 0;
-
-    interval.QuadPart = SH_DRAIN_POLL_INTERVAL_100NS;
-
-    while (Fw->ActiveDispatchCount > 0)
-    {
-        KeDelayExecutionThread(KernelMode, FALSE, &interval);
-        iterations++;
-
-        //
-        // Safety diagnostic: if draining takes unusually long, log it
-        // but do NOT give up — we MUST wait for all dispatches to complete
-        // to prevent use-after-free on teardown.
-        //
-        if (iterations == SH_MAX_DRAIN_ITERATIONS) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                "[ShadowStrike] SyscallHooks: Drain taking long, %ld dispatches remain\n",
-                Fw->ActiveDispatchCount);
         }
     }
 }
@@ -629,6 +613,7 @@ ShInitialize(
 
     /* Initialize synchronization */
     ExInitializePushLock(&fw->HookLock);
+    ExInitializeRundownProtection(&fw->DispatchRundownRef);
 
     /* Initialize lookaside list for hook allocations */
     ExInitializeNPagedLookasideList(
@@ -677,47 +662,70 @@ ShShutdown(
 
     /*
      * Phase 1: Signal shutdown.
-     * After this, ShDispatchSyscall will reject new dispatches.
+     * After this, ShRegisterHook/ShEnableHook will reject new operations.
      */
     InterlockedExchange(&fw->ShuttingDown, 1);
 
     /*
-     * Phase 2: Drain all active dispatches.
-     * Any ShDispatchSyscall call already past the shutdown check will
-     * be holding an ActiveDispatchCount reference. We wait for all
-     * of them to complete.
+     * Phase 2: Drain all active dispatches via rundown protection.
+     * ExWaitForRundownProtectionRelease atomically:
+     *   (a) Prevents any new ExAcquireRundownProtection from succeeding
+     *   (b) Blocks until all outstanding references are released
+     * This replaces the former spin-poll drain loop and eliminates the
+     * validate-then-increment race window entirely.
      */
-    ShpDrainAllDispatches(fw);
+    ExWaitForRundownProtectionRelease(&fw->DispatchRundownRef);
 
     /*
-     * Phase 3: Remove and free all hooks.
-     * No dispatches should be active. Verify defensively —
-     * if drain timed out, log but proceed to avoid driver unload hang.
+     * Phase 3: Remove all hooks from lists under exclusive lock,
+     * then drain and free OUTSIDE the lock.
+     *
+     * We must NOT call ShpDrainHookCallbacks while holding the exclusive
+     * push lock — if drain needs to sleep (KeDelayExecutionThread), any
+     * thread trying to acquire the lock would be blocked. By moving the
+     * drain outside the lock, we avoid this deadlock-prone pattern.
+     *
+     * Since all dispatches have been drained (Phase 2), no new callbacks
+     * can start, so ShpDrainHookCallbacks should be a no-op. The drain
+     * call is a defensive safety net.
      */
-    if (fw->ActiveDispatchCount > 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] SyscallHooks: Shutdown drain incomplete, "
-                   "%ld dispatches still active\n",
-                   fw->ActiveDispatchCount);
+    {
+        LIST_ENTRY toFreeList;
+        PLIST_ENTRY freeEntry;
+        PSH_HOOK_INTERNAL freeHook;
+
+        InitializeListHead(&toFreeList);
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&fw->HookLock);
+
+        while (!IsListEmpty(&fw->AllHooksList)) {
+            entry = RemoveHeadList(&fw->AllHooksList);
+            hook = CONTAINING_RECORD(entry, SH_HOOK_INTERNAL, AllHooksListEntry);
+
+            /* Unlink from hash bucket */
+            RemoveEntryList(&hook->HashListEntry);
+            InitializeListHead(&hook->HashListEntry);
+
+            /* Move to local free list */
+            InsertTailList(&toFreeList, entry);
+        }
+
+        fw->RegisteredHookCount = 0;
+        fw->EnabledHookCount = 0;
+
+        ExReleasePushLockExclusive(&fw->HookLock);
+        KeLeaveCriticalRegion();
+
+        /* Drain and free hooks outside the lock */
+        while (!IsListEmpty(&toFreeList)) {
+            freeEntry = RemoveHeadList(&toFreeList);
+            freeHook = CONTAINING_RECORD(freeEntry, SH_HOOK_INTERNAL, AllHooksListEntry);
+
+            ShpDrainHookCallbacks(freeHook);
+            ShpFreeHookEntry(fw, freeHook);
+        }
     }
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&fw->HookLock);
-
-    while (!IsListEmpty(&fw->AllHooksList)) {
-        entry = RemoveHeadList(&fw->AllHooksList);
-        hook = CONTAINING_RECORD(entry, SH_HOOK_INTERNAL, AllHooksListEntry);
-
-        /* Unlink from hash bucket */
-        RemoveEntryList(&hook->HashListEntry);
-
-        /* Drain any (theoretically impossible) active callbacks */
-        ShpDrainHookCallbacks(hook);
-
-        ShpFreeHookEntry(fw, hook);
-    }
-
-    ExReleasePushLockExclusive(&fw->HookLock);
-    KeLeaveCriticalRegion();
 
     /*
      * Phase 4: Destroy lookaside list.
@@ -883,23 +891,37 @@ ShUnregisterHook(
      * This prevents a TOCTOU race where two threads call ShUnregisterHook
      * concurrently — the first frees the hook, the second accesses freed memory.
      * Under exclusive lock, only one thread can operate on the hook at a time.
+     *
+     * SEH wraps the magic check because hook is a raw user-supplied handle.
+     * If the pointer is dangling (freed pool page decommitted), the dereference
+     * would BSOD while holding the exclusive lock — lock never released.
      */
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&fw->HookLock);
 
     /* Validate hook magic under lock — safe from concurrent free */
-    if (hook->Magic != SH_HOOK_MAGIC) {
-        ExReleasePushLockExclusive(&fw->HookLock);
-        KeLeaveCriticalRegion();
-        return STATUS_INVALID_PARAMETER;
-    }
+    __try {
+        if (hook->Magic != SH_HOOK_MAGIC) {
+            ExReleasePushLockExclusive(&fw->HookLock);
+            KeLeaveCriticalRegion();
+            return STATUS_INVALID_PARAMETER;
+        }
 
-    /* Verify hook is still in a valid list (guards against double-unregister) */
-    if (hook->HashListEntry.Flink == NULL ||
-        hook->HashListEntry.Flink == &hook->HashListEntry)
-    {
+        /* Verify hook is still in a valid list (guards against double-unregister) */
+        if (hook->HashListEntry.Flink == NULL ||
+            hook->HashListEntry.Flink == &hook->HashListEntry)
+        {
+            ExReleasePushLockExclusive(&fw->HookLock);
+            KeLeaveCriticalRegion();
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
         ExReleasePushLockExclusive(&fw->HookLock);
         KeLeaveCriticalRegion();
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike] SyscallHooks: ShUnregisterHook faulted validating hook %p (0x%08X)\n",
+            hook, GetExceptionCode());
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1076,15 +1098,13 @@ ShDispatchSyscall(
     }
 
     /*
-     * Acquire dispatch reference FIRST — before ANY access to fw fields.
-     * This ensures ShShutdown's drain sees our reference and waits,
-     * preventing UAF if shutdown frees fw while we're in rate limit check.
+     * Acquire dispatch reference via EX_RUNDOWN_REF.
+     * If shutdown has started (ExWaitForRundownProtectionRelease called),
+     * ExAcquireRundownProtection atomically returns FALSE — no race window
+     * between validate and acquire. This replaces the former pattern of
+     * InterlockedIncrement + ShuttingDown check.
      */
-    ShpAcquireDispatchRef(fw);
-
-    /* Reject if shutting down */
-    if (fw->ShuttingDown) {
-        ShpReleaseDispatchRef(fw);
+    if (!ShpAcquireDispatchRef(fw)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1199,7 +1219,9 @@ ShDispatchSyscall(
          * Callback faulted — allow the syscall through and log.
          * The critical path below still releases references correctly.
          */
-        NOTHING;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike] SyscallHooks: Callback exception 0x%08X for syscall %u\n",
+            GetExceptionCode(), Context->SyscallNumber);
     }
 
     ShpReleaseHookRef(hook);
