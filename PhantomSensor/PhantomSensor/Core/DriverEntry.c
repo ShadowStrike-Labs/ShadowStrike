@@ -2103,6 +2103,13 @@ DriverEntry(
         } else {
             g_SubsystemFlags |= SubsysFlag_IntegrityMonitor;
             ShadowStrikeLogInitStatus("Integrity Monitor", STATUS_SUCCESS);
+
+            //
+            // Enable periodic integrity checks (30-second interval).
+            // Without this call, the worker thread waits indefinitely
+            // and never performs any integrity verification.
+            //
+            ImEnablePeriodicCheck(g_IntegrityMonitor, 30000);
         }
     }
 
@@ -3303,6 +3310,13 @@ PHP_PROTECTION_ENGINE
 ShadowStrikeGetHandleProtection(VOID)
 {
     return g_HandleProtection;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+PIM_MONITOR
+ShadowStrikeGetIntegrityMonitor(VOID)
+{
+    return g_IntegrityMonitor;
 }
 
 // ============================================================================

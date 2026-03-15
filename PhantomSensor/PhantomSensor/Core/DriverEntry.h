@@ -696,6 +696,17 @@ _IRQL_requires_max_(APC_LEVEL)
 PHP_PROTECTION_ENGINE
 ShadowStrikeGetHandleProtection(VOID);
 
+/**
+ * @brief Get integrity monitor instance.
+ *        Used by other modules to register tamper callbacks
+ *        or trigger on-demand integrity checks.
+ */
+typedef struct _IM_MONITOR IM_MONITOR, *PIM_MONITOR;
+
+_IRQL_requires_max_(APC_LEVEL)
+PIM_MONITOR
+ShadowStrikeGetIntegrityMonitor(VOID);
+
 #ifdef __cplusplus
 }
 #endif

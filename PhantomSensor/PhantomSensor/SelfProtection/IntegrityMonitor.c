@@ -54,6 +54,8 @@ v2.1.0 Changes (Enterprise Hardened):
 #include "CallbackProtection.h"
 #include "../Core/Globals.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../ETW/TelemetryEvents.h"
+#include "../Core/DriverEntry.h"
 #include <ntstrsafe.h>
 #include <bcrypt.h>
 
@@ -871,6 +873,19 @@ ImpCheckComponent(
                     NULL
                     );
 
+                //
+                // Structured telemetry: code section tamper attempt.
+                // TargetAddress = section RVA for SOC correlation.
+                //
+                TeLogTamperAttempt(
+                    Tamper_MemoryModify,
+                    HandleToULong(PsGetCurrentProcessId()),
+                    Component_SelfProtection,
+                    (UINT64)Monitor->Sections[i].VirtualAddress,
+                    FALSE,
+                    L"Driver code section integrity violation"
+                    );
+
                 break;
             }
         }
@@ -941,6 +956,18 @@ ImpCheckComponent(
                         FALSE,
                         NULL
                         );
+
+                    //
+                    // Structured telemetry: PE header tamper attempt.
+                    //
+                    TeLogTamperAttempt(
+                        Tamper_MemoryModify,
+                        HandleToULong(PsGetCurrentProcessId()),
+                        Component_SelfProtection,
+                        (UINT64)(ULONG_PTR)Monitor->DriverBase,
+                        FALSE,
+                        L"Driver PE header integrity violation"
+                        );
                 }
                 RtlSecureZeroMemory(CurrentHeaderHash, IM_HASH_SIZE);
             } else {
@@ -952,13 +979,22 @@ ImpCheckComponent(
 
     case ImComp_Callbacks:
     {
-        // FIX #6: Real callback verification using CallbackProtection module
-        // Check if our process/thread/image callbacks are still registered
+        // Real callback verification: check g_DriverData flags AND use
+        // CallbackProtection's kernel-level verification via CpVerifyAll.
         if (!g_DriverData.ProcessNotifyRegistered) {
             Result->IsIntact = FALSE;
             Result->ModificationType = ImMod_CallbackRemoval;
             RtlStringCbPrintfA(Result->Details, sizeof(Result->Details),
                 "Process creation callback unregistered");
+
+            TeLogTamperAttempt(
+                Tamper_CallbackRemoval,
+                0,
+                Component_SelfProtection,
+                0,
+                FALSE,
+                L"Process notify callback removed"
+                );
             break;
         }
         if (!g_DriverData.ThreadNotifyRegistered) {
@@ -966,6 +1002,15 @@ ImpCheckComponent(
             Result->ModificationType = ImMod_CallbackRemoval;
             RtlStringCbPrintfA(Result->Details, sizeof(Result->Details),
                 "Thread creation callback unregistered");
+
+            TeLogTamperAttempt(
+                Tamper_CallbackRemoval,
+                0,
+                Component_SelfProtection,
+                0,
+                FALSE,
+                L"Thread notify callback removed"
+                );
             break;
         }
         if (!g_DriverData.ImageNotifyRegistered) {
@@ -973,7 +1018,45 @@ ImpCheckComponent(
             Result->ModificationType = ImMod_CallbackRemoval;
             RtlStringCbPrintfA(Result->Details, sizeof(Result->Details),
                 "Image load callback unregistered");
+
+            TeLogTamperAttempt(
+                Tamper_CallbackRemoval,
+                0,
+                Component_SelfProtection,
+                0,
+                FALSE,
+                L"Image load callback removed"
+                );
             break;
+        }
+
+        //
+        // Deep verification: use CallbackProtection kernel-level check.
+        // CpVerifyAll inspects actual kernel callback arrays, not just
+        // our boolean flags which could be stale or tampered.
+        //
+        {
+            PCP_PROTECTOR cpProtector = ShadowStrikeGetCallbackProtector();
+            if (cpProtector != NULL) {
+                ULONG tamperedCount = 0;
+                NTSTATUS cpStatus = CpVerifyAll(cpProtector, &tamperedCount);
+                if (NT_SUCCESS(cpStatus) && tamperedCount > 0) {
+                    Result->IsIntact = FALSE;
+                    Result->ModificationType = ImMod_CallbackRemoval;
+                    RtlStringCbPrintfA(Result->Details, sizeof(Result->Details),
+                        "CallbackProtection detected %u tampered callbacks",
+                        tamperedCount);
+
+                    TeLogTamperAttempt(
+                        Tamper_CallbackRemoval,
+                        0,
+                        Component_SelfProtection,
+                        (UINT64)tamperedCount,
+                        FALSE,
+                        L"Kernel callback array tampered"
+                        );
+                }
+            }
         }
         break;
     }
@@ -1005,7 +1088,7 @@ ImpCheckComponent(
         if (NT_SUCCESS(Status)) {
             if (RtlCompareMemory(CurrentConfigHash, Monitor->ConfigBaselineHash, IM_HASH_SIZE) != IM_HASH_SIZE) {
                 Result->IsIntact = FALSE;
-                Result->ModificationType = ImMod_DataCorruption;
+                Result->ModificationType = ImMod_ConfigChanged;
                 RtlStringCbPrintfA(Result->Details, sizeof(Result->Details),
                     "Driver configuration state modified");
             }
@@ -1104,15 +1187,21 @@ ImInitialize(
         (PVOID *)&Internal->ThreadObject,
         NULL
     );
-    ZwClose(ThreadHandle);
-    ThreadHandle = NULL;
 
     if (!NT_SUCCESS(Status)) {
-        // Thread is created but we can't reference it — signal termination
+        //
+        // Thread is running but we can't reference it. Signal termination
+        // and wait via the still-open handle to avoid use-after-free.
+        //
         InterlockedExchange(&Internal->TerminateThread, 1);
         KeSetEvent(&Internal->WakeEvent, IO_NO_INCREMENT, FALSE);
+        ZwWaitForSingleObject(ThreadHandle, FALSE, NULL);
+        ZwClose(ThreadHandle);
         goto InitFailed;
     }
+
+    ZwClose(ThreadHandle);
+    ThreadHandle = NULL;
 
     // Mark active
     InterlockedExchange(&Internal->Public.State, IM_STATE_ACTIVE);
