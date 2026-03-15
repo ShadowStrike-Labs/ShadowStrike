@@ -3257,6 +3257,13 @@ ShadowStrikeGetMemoryScanner(VOID)
     return g_MemoryScanner;
 }
 
+_IRQL_requires_max_(APC_LEVEL)
+PADB_PROTECTOR
+ShadowStrikeGetAntiDebugProtector(VOID)
+{
+    return g_AntiDebugProtector;
+}
+
 // ============================================================================
 // VERSION COMPATIBILITY CHECK
 // ============================================================================

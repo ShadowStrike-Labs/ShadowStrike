@@ -35,6 +35,7 @@
 #include "../Behavioral/BehaviorEngine.h"
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
+#include "../ETW/TelemetryEvents.h"
 #include <ntifs.h>
 #include <ntstrsafe.h>
 #include <intrin.h>
@@ -185,11 +186,11 @@ AdbInitialize(
             BehaviorEvent_DebuggerEvasion,
             BehaviorCategory_DefenseEvasion,
             HandleToULong(PsGetCurrentProcessId()),
-            NULL, 0,
-            70,
-            FALSE,
-            NULL
-            );
+            NULL, 0, 70, FALSE, NULL);
+        (VOID)TeLogEvasionAttempt(
+            Evasion_DebugEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            L"PhantomSensor", "KernelDebugger", 70);
     }
     if (Ctx->HypervisorPresent) {
         AdbpRecordEvent(Ctx, AdbAttemptHypervisor,
@@ -198,19 +199,37 @@ AdbInitialize(
             BehaviorEvent_VirtualizationEvasion,
             BehaviorCategory_DefenseEvasion,
             HandleToULong(PsGetCurrentProcessId()),
-            NULL, 0,
-            50,
-            FALSE,
-            NULL
-            );
+            NULL, 0, 50, FALSE, NULL);
+        (VOID)TeLogEvasionAttempt(
+            Evasion_VMEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            L"PhantomSensor", "Hypervisor", 50);
     }
     if (Ctx->VerifierEnabled) {
         AdbpRecordEvent(Ctx, AdbAttemptDriverVerifier,
                         "Driver Verifier enabled at initialization");
+        (VOID)BeEngineSubmitEvent(
+            BehaviorEvent_DebuggerEvasion,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL, 0, 40, FALSE, NULL);
+        (VOID)TeLogEvasionAttempt(
+            Evasion_DebugEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            L"PhantomSensor", "DriverVerifier", 40);
     }
     if (Ctx->CrashDumpEnabled) {
         AdbpRecordEvent(Ctx, AdbAttemptMemoryDump,
                         "Complete memory dump enabled at initialization");
+        (VOID)BeEngineSubmitEvent(
+            BehaviorEvent_DebuggerEvasion,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL, 0, 55, FALSE, NULL);
+        (VOID)TeLogEvasionAttempt(
+            Evasion_DebugEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            L"CrashControl", "CrashDumpEnabled", 55);
     }
 
     // Create periodic check system thread
@@ -236,14 +255,21 @@ AdbInitialize(
         (PVOID*)&Ctx->CheckThread,
         NULL
         );
-    ZwClose(ThreadHandle);
 
     if (!NT_SUCCESS(Status)) {
+        //
+        // Thread is already running but we have no PETHREAD to wait on.
+        // Signal shutdown, wait on the handle (still valid), then clean up.
+        //
         InterlockedExchange(&Ctx->ShutdownRequested, 1);
         KeSetEvent(&Ctx->CheckWakeEvent, IO_NO_INCREMENT, FALSE);
+        ZwWaitForSingleObject(ThreadHandle, FALSE, NULL);
+        ZwClose(ThreadHandle);
         ExFreePoolWithTag(Ctx, ADB_POOL_TAG_CTX);
         return Status;
     }
+
+    ZwClose(ThreadHandle);
 
     // Start periodic timer via TimerManager
     {
@@ -410,11 +436,11 @@ AdbCheckForDebugger(
             BehaviorEvent_DebuggerEvasion,
             BehaviorCategory_DefenseEvasion,
             HandleToULong(PsGetCurrentProcessId()),
-            NULL, 0,
-            70,
-            FALSE,
-            NULL
-            );
+            NULL, 0, 70, FALSE, NULL);
+        (VOID)TeLogEvasionAttempt(
+            Evasion_DebugEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            L"PhantomSensor", "KernelDebugger", 70);
     }
 
     // Also check for user-mode debugger on our process
@@ -427,11 +453,11 @@ AdbCheckForDebugger(
                 BehaviorEvent_DebuggerEvasion,
                 BehaviorCategory_DefenseEvasion,
                 HandleToULong(PsGetCurrentProcessId()),
-                NULL, 0,
-                60,
-                FALSE,
-                NULL
-                );
+                NULL, 0, 60, FALSE, NULL);
+            (VOID)TeLogEvasionAttempt(
+                Evasion_DebugEvasion,
+                HandleToULong(PsGetCurrentProcessId()),
+                L"PhantomSensor", "UserDebugger", 60);
         }
         CurrentState = TRUE;
     }
@@ -480,11 +506,11 @@ AdbCheckForHypervisor(
             BehaviorEvent_VirtualizationEvasion,
             BehaviorCategory_DefenseEvasion,
             HandleToULong(PsGetCurrentProcessId()),
-            NULL, 0,
-            50,
-            FALSE,
-            NULL
-            );
+            NULL, 0, 50, FALSE, NULL);
+        (VOID)TeLogEvasionAttempt(
+            Evasion_VMEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            L"PhantomSensor", "Hypervisor", 50);
     }
 
     *HypervisorPresent = CurrentState;
@@ -641,7 +667,7 @@ AdbpRecordEvent(
 
     // Pre-allocate before taking any locks
     Evt = (PADB_EVENT)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
+        POOL_FLAG_PAGED,
         sizeof(ADB_EVENT),
         ADB_POOL_TAG_EVENT
         );
@@ -1051,21 +1077,58 @@ AdbpPeriodicCheckThread(
         InterlockedExchange(&Protector->CrashDumpEnabled, CurrDump ? 1 : 0);
 
         // Record transition events only (FALSE -> TRUE)
+        // Report to BehaviorEngine + TelemetryEvents for full pipeline coverage
         if (CurrKd && !PrevKd) {
             AdbpRecordEvent(Protector, AdbAttemptKernelDebugger,
                             "Kernel debugger attached (periodic check)");
+            (VOID)BeEngineSubmitEvent(
+                BehaviorEvent_DebuggerEvasion,
+                BehaviorCategory_DefenseEvasion,
+                HandleToULong(PsGetCurrentProcessId()),
+                NULL, 0, 70, FALSE, NULL);
+            (VOID)TeLogEvasionAttempt(
+                Evasion_DebugEvasion,
+                HandleToULong(PsGetCurrentProcessId()),
+                L"PhantomSensor", "KernelDebugger", 70);
         }
         if (CurrHv && !PrevHv) {
             AdbpRecordEvent(Protector, AdbAttemptHypervisor,
                             "Hypervisor detected (periodic check)");
+            (VOID)BeEngineSubmitEvent(
+                BehaviorEvent_VirtualizationEvasion,
+                BehaviorCategory_DefenseEvasion,
+                HandleToULong(PsGetCurrentProcessId()),
+                NULL, 0, 50, FALSE, NULL);
+            (VOID)TeLogEvasionAttempt(
+                Evasion_VMEvasion,
+                HandleToULong(PsGetCurrentProcessId()),
+                L"PhantomSensor", "Hypervisor", 50);
         }
         if (CurrVf && !PrevVf) {
             AdbpRecordEvent(Protector, AdbAttemptDriverVerifier,
                             "Driver Verifier enabled (periodic check)");
+            (VOID)BeEngineSubmitEvent(
+                BehaviorEvent_DebuggerEvasion,
+                BehaviorCategory_DefenseEvasion,
+                HandleToULong(PsGetCurrentProcessId()),
+                NULL, 0, 40, FALSE, NULL);
+            (VOID)TeLogEvasionAttempt(
+                Evasion_DebugEvasion,
+                HandleToULong(PsGetCurrentProcessId()),
+                L"PhantomSensor", "DriverVerifier", 40);
         }
         if (CurrDump && !PrevDump) {
             AdbpRecordEvent(Protector, AdbAttemptMemoryDump,
                             "Complete memory dump enabled (periodic check)");
+            (VOID)BeEngineSubmitEvent(
+                BehaviorEvent_DebuggerEvasion,
+                BehaviorCategory_DefenseEvasion,
+                HandleToULong(PsGetCurrentProcessId()),
+                NULL, 0, 55, FALSE, NULL);
+            (VOID)TeLogEvasionAttempt(
+                Evasion_DebugEvasion,
+                HandleToULong(PsGetCurrentProcessId()),
+                L"CrashControl", "CrashDumpEnabled", 55);
         }
 
         // Update statistics snapshot
