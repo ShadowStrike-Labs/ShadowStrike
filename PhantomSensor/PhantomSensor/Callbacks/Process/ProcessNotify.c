@@ -82,6 +82,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../../Shared/VerdictTypes.h"
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../Core/DriverEntry.h"
+#include "../../Performance/PerformanceMonitor.h"
 #include "../../Sync/TimerManager.h"
 #include "../FileSystem/FileBackupEngine.h"
 #include "../FileSystem/FileSystemCallbacks.h"
@@ -1031,6 +1032,8 @@ Arguments:
     if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {
         return;
     }
+
+    SSPM_LATENCY_BEGIN(proc);
 
     //
     // Handle process termination
@@ -2099,6 +2102,8 @@ Cleanup:
         PnpFreeProcessContext(ProcessContext);
     }
 
+    SSPM_LATENCY_END(ShadowStrikeGetPerformanceMonitor(),
+                     SsPmMetric_CallbackLatencyUs, proc);
     SHADOWSTRIKE_RELEASE_RUNDOWN();
 }
 

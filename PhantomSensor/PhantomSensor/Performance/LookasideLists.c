@@ -50,6 +50,7 @@
  */
 
 #include "LookasideLists.h"
+#include "PerformanceMonitor.h"
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
 #include <ntstrsafe.h>
@@ -2031,4 +2032,20 @@ LlpMaintenanceTimerCallback(
     }
 
     LlpCheckMemoryPressure(Manager);
+
+    //
+    // Report lookaside memory stats to PerformanceMonitor.
+    // CurrentMemoryUsage and TotalAllocations are global manager stats.
+    //
+    {
+        PSSPM_MONITOR pm = ShadowStrikeGetPerformanceMonitor();
+        if (pm != NULL) {
+            SsPmRecordSample(pm, SsPmMetric_MemoryBytes,
+                             (ULONG64)Manager->GlobalStats.CurrentMemoryUsage);
+            SsPmRecordSample(pm, SsPmMetric_LookasideHits,
+                             (ULONG64)Manager->GlobalStats.TotalCacheHits);
+            SsPmRecordSample(pm, SsPmMetric_LookasideMisses,
+                             (ULONG64)Manager->GlobalStats.TotalCacheMisses);
+        }
+    }
 }

@@ -207,6 +207,30 @@ SsPmDisableCollection(
     _In_ PSSPM_MONITOR Monitor
     );
 
+//=============================================================================
+// Convenience Macros for Callback Latency Instrumentation
+//=============================================================================
+//
+// Usage:
+//   SSPM_LATENCY_BEGIN(tag);
+//   ... callback body ...
+//   SSPM_LATENCY_END(monitor, metric, tag);
+//
+// Cost: one KeQueryPerformanceCounter (< 100ns) per callback invocation.
+// The END macro is safe to call with NULL monitor (no-ops gracefully).
+//
+
+#define SSPM_LATENCY_BEGIN(tag) \
+    LARGE_INTEGER _sspmStart_##tag = KeQueryPerformanceCounter(NULL)
+
+#define SSPM_LATENCY_END(monitor, metric, tag) \
+    do { \
+        PSSPM_MONITOR _m = (monitor); \
+        if (_m != NULL) { \
+            SsPmRecordLatency(_m, (metric), _sspmStart_##tag); \
+        } \
+    } while (0)
+
 #ifdef __cplusplus
 }
 #endif

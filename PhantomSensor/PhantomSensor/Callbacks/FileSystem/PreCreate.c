@@ -77,6 +77,7 @@ Performance Characteristics:
 #include "../../ETW/ETWConsumer.h"
 #include "../../ETW/ETWProvider.h"
 #include "../../Core/DriverEntry.h"
+#include "../../Performance/PerformanceMonitor.h"
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Transactions/KtmMonitor.h"
 #include "../Process/WSLMonitor.h"
@@ -779,6 +780,8 @@ Return Value:
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
     RundownAcquired = TRUE;
+
+    SSPM_LATENCY_BEGIN(pc);
 
     //
     // Skip paging files
@@ -1565,6 +1568,8 @@ Return Value:
     }
 
 CleanupAllow:
+    SSPM_LATENCY_END(ShadowStrikeGetPerformanceMonitor(),
+                     SsPmMetric_CallbackLatencyUs, pc);
     if (NameInfo != NULL) {
         FltReleaseFileNameInformation(NameInfo);
     }

@@ -61,6 +61,7 @@
 #include "../../ETW/ETWProvider.h"
 #include "../../Core/DriverEntry.h"
 #include "../../Performance/CacheOptimization.h"
+#include "../../Performance/PerformanceMonitor.h"
 
 //
 // Forward declarations for undocumented but exported ntoskrnl APIs
@@ -1987,6 +1988,8 @@ Arguments:
         InterlockedIncrement64(&g_ImgNotify.Stats.UserModeImages);
     }
 
+    SSPM_LATENCY_BEGIN(img);
+
     //
     // Emit image load event into ETW consumer pipeline for centralized
     // telemetry streaming and cross-source correlation
@@ -2263,6 +2266,8 @@ Arguments:
     //
     ImgpFreeEvent(event);
 
+    SSPM_LATENCY_END(ShadowStrikeGetPerformanceMonitor(),
+                     SsPmMetric_CallbackLatencyUs, img);
     ExReleaseRundownProtection(&g_ImgNotify.SubsystemRundown);
 }
 

@@ -3196,6 +3196,13 @@ ShadowStrikeGetManifestGenerator(VOID)
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+PSSPM_MONITOR
+ShadowStrikeGetPerformanceMonitor(VOID)
+{
+    return g_PerformanceMonitor;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 PMS_SCANNER
 ShadowStrikeGetMemoryScanner(VOID)
 {
