@@ -69,7 +69,6 @@
 
 #define DSD_MAX_MODULE_WALK_ITERATIONS      512
 #define DSD_NTDLL_NAME                      L"ntdll.dll"
-#define DSD_SHUTDOWN_TIMEOUT_MS             5000
 #define DSD_RATE_LIMIT_WINDOW_100NS         10000000LL  // 1 second in 100ns units
 #define DSD_MAX_MODULE_NAME_CHARS           260
 #define DSD_TARTARUS_EXTENDED_SCAN_BYTES    256
@@ -114,14 +113,9 @@ struct _DSD_DETECTOR {
     BOOLEAN Initialized;
 
     //
-    // Detection record history (internal ring buffer)
-    //
-    LIST_ENTRY DetectionList;
-    EX_PUSH_LOCK DetectionLock;
-    volatile LONG DetectionCount;
-
-    //
-    // Whitelist — separate lock to avoid contention with detection list
+    // Whitelist — push-lock protected for reader-writer concurrency.
+    // Population via DsdAddWhitelistEntry; checked early in DsdAnalyzeSyscall
+    // to short-circuit heavy analysis for known-safe modules.
     //
     LIST_ENTRY WhitelistPatterns;
     EX_PUSH_LOCK WhitelistLock;
@@ -150,11 +144,13 @@ typedef struct _DSD_DETECTOR_INTERNAL {
     //
 
     //
-    // Reference counting for safe shutdown
+    // Rundown protection for safe shutdown.
+    // EX_RUNDOWN_REF is the NT kernel primitive designed for exactly this
+    // pattern: ExAcquireRundownProtection fails atomically once rundown
+    // starts, and ExWaitForRundownProtectionRelease blocks until all
+    // acquired references are released — no manual drain races possible.
     //
-    volatile LONG ReferenceCount;
-    volatile LONG ShuttingDown;
-    KEVENT ShutdownEvent;
+    EX_RUNDOWN_REF RundownRef;
 
     //
     // Rate limiting
@@ -372,6 +368,7 @@ DsdpCheckRateLimit(
 #pragma alloc_text(PAGE, DsdDetectTechnique)
 #pragma alloc_text(PAGE, DsdValidateCallstack)
 #pragma alloc_text(PAGE, DsdFreeDetection)
+#pragma alloc_text(PAGE, DsdAddWhitelistEntry)
 #endif
 
 // ============================================================================
@@ -410,9 +407,6 @@ DsdInitialize(
 
     detector->Magic = DSD_DETECTOR_MAGIC;
 
-    InitializeListHead(&detector->Base.DetectionList);
-    ExInitializePushLock(&detector->Base.DetectionLock);
-
     InitializeListHead(&detector->Base.WhitelistPatterns);
     ExInitializePushLock(&detector->Base.WhitelistLock);
 
@@ -427,9 +421,7 @@ DsdInitialize(
     );
     detector->LookasideInitialized = TRUE;
 
-    detector->ReferenceCount = 1;
-    detector->ShuttingDown = FALSE;
-    KeInitializeEvent(&detector->ShutdownEvent, NotificationEvent, FALSE);
+    ExInitializeRundownProtection(&detector->RundownRef);
 
     detector->RateLimitPerSecond = 10000;
 
@@ -452,7 +444,6 @@ DsdShutdown(
 {
     PDSD_DETECTOR_INTERNAL detector;
     PLIST_ENTRY entry;
-    PDSD_DETECTION_INTERNAL detection;
     PDSD_WHITELIST_ENTRY whitelist;
 
     PAGED_CODE();
@@ -468,45 +459,17 @@ DsdShutdown(
     }
 
     //
-    // Signal shutdown — all new TryAcquireReference calls will fail
+    // Initiate rundown — all new ExAcquireRundownProtection calls will fail.
+    // ExWaitForRundownProtectionRelease atomically disables acquisition AND
+    // waits for all outstanding references to drain. This eliminates the
+    // manual refcount drain race that existed with the prior KeClearEvent +
+    // InterlockedCompareExchange pattern.
     //
-    InterlockedExchange(&detector->ShuttingDown, 1);
+    ExWaitForRundownProtectionRelease(&detector->RundownRef);
 
     //
-    // Release the initial reference (set in DsdInitialize)
+    // All outstanding references are drained. Safe to tear down.
     //
-    DsdpReleaseReference(detector);
-
-    //
-    // Wait INDEFINITELY for all outstanding references to drain.
-    // A timeout here leads to use-after-free when we free detections,
-    // whitelists, and the detector itself below.
-    //
-    KeClearEvent(&detector->ShutdownEvent);
-    if (InterlockedCompareExchange(&detector->ReferenceCount, 0, 0) > 0) {
-        KeWaitForSingleObject(
-            &detector->ShutdownEvent,
-            Executive,
-            KernelMode,
-            FALSE,
-            NULL
-        );
-    }
-
-    //
-    // Free all detection records under lock
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Detector->DetectionLock);
-
-    while (!IsListEmpty(&Detector->DetectionList)) {
-        entry = RemoveHeadList(&Detector->DetectionList);
-        detection = CONTAINING_RECORD(entry, DSD_DETECTION_INTERNAL, ListEntry);
-        DsdpFreeDetectionInternal(detector, detection);
-    }
-
-    ExReleasePushLockExclusive(&Detector->DetectionLock);
-    KeLeaveCriticalRegion();
 
     //
     // Free whitelist entries under whitelist lock
@@ -1156,34 +1119,139 @@ DsdFreeDetection(
     }
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+DsdAddWhitelistEntry(
+    _In_ PDSD_DETECTOR Detector,
+    _In_opt_ PCUNICODE_STRING ModuleName,
+    _In_ ULONG64 BaseAddress,
+    _In_ SIZE_T Size
+)
+{
+    PDSD_DETECTOR_INTERNAL detector;
+    PDSD_WHITELIST_ENTRY entry = NULL;
+
+    PAGED_CODE();
+
+    if (Detector == NULL || !Detector->Initialized) {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+
+    detector = CONTAINING_RECORD(Detector, DSD_DETECTOR_INTERNAL, Base);
+
+    if (detector->Magic != DSD_DETECTOR_MAGIC) {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+
+    //
+    // At least one match criterion must be provided
+    //
+    if (ModuleName == NULL && (BaseAddress == 0 || Size == 0)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Validate module name length to prevent USHORT overflow in allocation
+    // and cap at DSD_MAX_MODULE_NAME_CHARS for consistency with internal usage.
+    //
+    if (ModuleName != NULL && ModuleName->Length > 0) {
+        if (ModuleName->Length > (DSD_MAX_MODULE_NAME_CHARS * sizeof(WCHAR))) {
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+
+    entry = (PDSD_WHITELIST_ENTRY)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(DSD_WHITELIST_ENTRY),
+        DSD_WHITELIST_TAG
+    );
+
+    if (entry == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(entry, sizeof(DSD_WHITELIST_ENTRY));
+    InitializeListHead(&entry->ListEntry);
+
+    if (ModuleName != NULL && ModuleName->Length > 0 && ModuleName->Buffer != NULL) {
+        USHORT allocLen = ModuleName->Length + sizeof(WCHAR);
+        entry->ModuleName.Buffer = (PWCH)ShadowStrikeAllocatePoolWithTag(
+            NonPagedPoolNx,
+            allocLen,
+            DSD_WHITELIST_TAG
+        );
+
+        if (entry->ModuleName.Buffer == NULL) {
+            ShadowStrikeFreePoolWithTag(entry, DSD_WHITELIST_TAG);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        RtlCopyMemory(entry->ModuleName.Buffer, ModuleName->Buffer, ModuleName->Length);
+        entry->ModuleName.Buffer[ModuleName->Length / sizeof(WCHAR)] = L'\0';
+        entry->ModuleName.Length = ModuleName->Length;
+        entry->ModuleName.MaximumLength = allocLen;
+        entry->MatchByName = TRUE;
+    }
+
+    if (BaseAddress != 0 && Size != 0) {
+        entry->BaseAddress = BaseAddress;
+        entry->Size = Size;
+        entry->MatchByAddress = TRUE;
+    }
+
+    //
+    // Insert under exclusive lock with re-validation of capacity.
+    // The count check and insert must be atomic to prevent TOCTOU:
+    // multiple threads passing a preliminary check then all inserting.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Detector->WhitelistLock);
+
+    {
+        LONG currentCount = 0;
+        PLIST_ENTRY listEntry;
+
+        for (listEntry = Detector->WhitelistPatterns.Flink;
+             listEntry != &Detector->WhitelistPatterns;
+             listEntry = listEntry->Flink) {
+            currentCount++;
+        }
+
+        if (currentCount >= DSD_MAX_WHITELIST_PATTERNS) {
+            ExReleasePushLockExclusive(&Detector->WhitelistLock);
+            KeLeaveCriticalRegion();
+
+            if (entry->ModuleName.Buffer != NULL) {
+                ShadowStrikeFreePoolWithTag(entry->ModuleName.Buffer, DSD_WHITELIST_TAG);
+            }
+            ShadowStrikeFreePoolWithTag(entry, DSD_WHITELIST_TAG);
+            return STATUS_QUOTA_EXCEEDED;
+        }
+
+        InsertTailList(&Detector->WhitelistPatterns, &entry->ListEntry);
+    }
+
+    ExReleasePushLockExclusive(&Detector->WhitelistLock);
+    KeLeaveCriticalRegion();
+
+    return STATUS_SUCCESS;
+}
+
 // ============================================================================
-// PRIVATE IMPLEMENTATION - REFERENCE COUNTING
+// PRIVATE IMPLEMENTATION - REFERENCE COUNTING / RUNDOWN
 // ============================================================================
 
 /**
- * @brief Atomically increments reference count if not shutting down.
- * @return TRUE if reference was acquired, FALSE if shutting down.
+ * @brief Atomically acquires rundown protection if not shutting down.
+ * @return TRUE if protection was acquired, FALSE if rundown in progress.
  */
 static BOOLEAN
 DsdpTryAcquireReference(
     _Inout_ PDSD_DETECTOR_INTERNAL Detector
 )
 {
-    //
-    // InterlockedIncrement then check ShuttingDown. If shutting down,
-    // undo the increment. This prevents the shutdown race:
-    // - Caller sees ShuttingDown == FALSE
-    // - Shutdown starts between check and increment
-    // - Caller bumps refcount after shutdown started draining
-    //
-    InterlockedIncrement(&Detector->ReferenceCount);
-
-    if (Detector->ShuttingDown) {
-        DsdpReleaseReference(Detector);
-        return FALSE;
-    }
-
-    return TRUE;
+    return ExAcquireRundownProtection(&Detector->RundownRef);
 }
 
 static VOID
@@ -1191,11 +1259,7 @@ DsdpReleaseReference(
     _Inout_ PDSD_DETECTOR_INTERNAL Detector
 )
 {
-    LONG newCount = InterlockedDecrement(&Detector->ReferenceCount);
-
-    if (newCount == 0 && Detector->ShuttingDown) {
-        KeSetEvent(&Detector->ShutdownEvent, IO_NO_INCREMENT, FALSE);
-    }
+    ExReleaseRundownProtection(&Detector->RundownRef);
 }
 
 // ============================================================================
@@ -1589,6 +1653,15 @@ DsdpCaptureUserCallStack(
     KAPC_STATE apcState;
     ULONG capturedCount = 0;
 
+    //
+    // ThreadId is accepted for API symmetry but unused:
+    // RtlWalkFrameChain(flags=1) captures user-mode frames of the
+    // CURRENT thread only. To walk another thread's stack, we would
+    // need NtQueryInformationThread(ThreadBasicInformation) + manual
+    // frame walk — not available at this IRQL/context. Callers should
+    // only invoke this from the target thread's context (e.g., syscall
+    // callback where the calling thread IS the target thread).
+    //
     UNREFERENCED_PARAMETER(ThreadId);
 
     *CapturedFrames = 0;
@@ -1643,6 +1716,13 @@ DsdpCheckRateLimit(
     //
     // If more than 1 second since last reset, reset the window.
     // Use CAS on LastRateLimitReset so only one thread wins the reset.
+    //
+    // BENIGN RACE: The CAS on LastRateLimitReset and the Exchange on
+    // AnalysisCountInWindow are not atomic together. A thread may read
+    // the old count after another thread resets it, or increment the
+    // new window's count before the reset completes. This is acceptable
+    // for a soft rate limiter — the window may be ±1 second and the
+    // count may be off by a few. Hard enforcement is not needed here.
     //
     if ((now.QuadPart - lastReset) >= DSD_RATE_LIMIT_WINDOW_100NS) {
         if (InterlockedCompareExchange64(&Detector->LastRateLimitReset,
