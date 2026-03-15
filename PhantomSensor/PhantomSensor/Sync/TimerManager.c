@@ -34,10 +34,9 @@
     Reference Counting Model:
       - Timer starts with RefCount=2: 1 for the TimerList, 1 for creation.
       - TmpFindTimerById adds +1 (caller must TmpDereferenceTimer).
-      - TmCancel removes from TimerList (releases the list reference),
-        then releases the find reference. The creation reference is released
-        separately: if auto-start failed we call TmCancel internally, otherwise
-        the caller is responsible via explicit TmCancel.
+      - TmCancel releases all three references (list + creation + find).
+        If a DPC/WorkItem is in-flight, its ref keeps RefCount ≥ 1 until
+        the DPC/WorkItem routine completes and releases its own ref.
       - Auto-delete one-shot: TmpFireTimer releases both the list reference
         and the creation reference (2 derefs). The DPC/WorkItem caller
         still holds its own ref, so neither deref hits 0. The caller's
@@ -59,6 +58,8 @@
 
 #include "TimerManager.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Core/DriverEntry.h"
+#include "../Performance/PerformanceMonitor.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, TmInitialize)
@@ -751,11 +752,24 @@ Routine Description:
     Wait=TRUE: If the timer is currently in Firing state, wait at
     PASSIVE_LEVEL for the callback to complete before returning.
 
+    DPC Safety:
+    - After KeCancelTimer, the timer's DPC may be queued or running.
+    - KeRemoveQueueDpc removes a pending DPC (fast path, any IRQL).
+    - If the DPC is running, KeFlushQueuedDpcs waits for completion.
+    - Only after both calls can we safely release all references.
+
     Reference counting:
-    - TmpFindTimerById adds +1 (find ref).
-    - We remove from TimerList (releases the list ref via deref).
-    - We release the find ref.
-    - When refcount hits 0, TmpDestroyTimer frees the memory.
+    - Timer starts with RefCount=2 (list ref + creation ref).
+    - TmpFindTimerById adds +1 → RefCount=3.
+    - We remove from TimerList and release the list ref (deref #1).
+    - We release the creation ref (deref #2).
+    - We release the find ref (deref #3).
+    - When RefCount hits 0, TmpDestroyTimer frees the memory.
+
+    Auto-delete race prevention:
+    - DeletionPending uses CAS in both TmCancel and TmpFireTimer.
+    - Only one winner performs list removal and ref releases.
+    - The loser skips cleanup (releases only its own find/DPC ref).
 
 --*/
 {
@@ -804,6 +818,19 @@ Routine Description:
     KeCancelTimer(&timerInternal->Timer.KernelTimer);
 
     //
+    // Ensure no DPC is in-flight or pending for this timer.
+    // Race: if a DPC is queued but hasn't called TmpReferenceTimer yet,
+    // our 3 derefs below could free the timer → DPC hits freed memory.
+    //
+    // KeRemoveQueueDpc dequeues a pending DPC (fast path, any IRQL).
+    // If it returns FALSE, the DPC is either running or was never queued;
+    // KeFlushQueuedDpcs ensures any running DPC completes (<= APC_LEVEL).
+    //
+    if (!KeRemoveQueueDpc(&timerInternal->Timer.TimerDpc)) {
+        KeFlushQueuedDpcs();
+    }
+
+    //
     // Remove from wheel
     //
     TmpRemoveTimerFromWheel(Manager, timerInternal);
@@ -845,11 +872,21 @@ Routine Description:
 
     //
     // Release list reference (timer was in list, now removed)
+    // RefCount: N → N-1
     //
     TmpDereferenceTimer(timerInternal);
 
     //
-    // Release find reference
+    // Release creation reference (cancel is the ownership release mechanism;
+    // mirrors the 2nd ref added at TmpCreateTimerInternal line 1412).
+    // RefCount: N-1 → N-2. If a DPC/WorkItem is in-flight, its ref
+    // keeps RefCount ≥ 1, so this won't trigger destroy prematurely.
+    //
+    TmpDereferenceTimer(timerInternal);
+
+    //
+    // Release find reference (from TmpFindTimerById).
+    // If no DPC/WorkItem is in-flight, this hits 0 → TmpDestroyTimer.
     //
     TmpDereferenceTimer(timerInternal);
 
@@ -1278,6 +1315,8 @@ Routine Description:
     do {
         currentCount = Manager->TimerCount;
         if (currentCount >= TM_MAX_TIMERS) {
+            SsPmRecordSample(ShadowStrikeGetPerformanceMonitor(),
+                             SsPmMetric_DroppedEvents, 1);
             return STATUS_QUOTA_EXCEEDED;
         }
     } while (InterlockedCompareExchange(&Manager->TimerCount,
@@ -1294,15 +1333,25 @@ Routine Description:
 
     if (timerInternal == NULL) {
         InterlockedDecrement(&Manager->TimerCount);
+        SsPmRecordSample(ShadowStrikeGetPerformanceMonitor(),
+                         SsPmMetric_DroppedEvents, 1);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlZeroMemory(timerInternal, sizeof(TM_TIMER_INTERNAL));
 
     //
-    // Copy context if provided and size specified (we take ownership)
+    // Copy context if provided and size specified (we take ownership).
+    // Cap at TM_MAX_CONTEXT_SIZE to prevent unbounded pool allocation
+    // from buggy callers.
     //
     if (Options != NULL && Options->Context != NULL && Options->ContextSize > 0) {
+        if (Options->ContextSize > TM_MAX_CONTEXT_SIZE) {
+            ShadowStrikeFreePoolWithTag(timerInternal, TM_POOL_TAG_TIMER);
+            InterlockedDecrement(&Manager->TimerCount);
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+
         contextCopy = ShadowStrikeAllocatePoolWithTag(
             NonPagedPoolNx,
             Options->ContextSize,
@@ -1857,10 +1906,13 @@ Routine Description:
 
         //
         // Auto-delete: remove from list, release list ref + creation ref.
-        // Caller (DPC/WorkItem) still holds a ref, so these won't hit 0.
+        // Use CAS on DeletionPending to prevent double-cleanup race with
+        // TmCancel — only one path (auto-delete OR TmCancel) performs
+        // list removal and ref releases.
         //
-        if (TimerInternal->Timer.Flags & TmFlag_AutoDelete) {
-            InterlockedExchange(&TimerInternal->DeletionPending, 1);
+        if ((TimerInternal->Timer.Flags & TmFlag_AutoDelete) &&
+            InterlockedCompareExchange(&TimerInternal->DeletionPending,
+                                       1, 0) == 0) {
 
             // Remove from TimerList
             KeAcquireSpinLock(&manager->TimerListLock, &oldIrql);

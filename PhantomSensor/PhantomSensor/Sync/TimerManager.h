@@ -75,6 +75,9 @@ extern "C" {
 // Name field max length (including NUL)
 #define TM_TIMER_NAME_MAX           32
 
+// Maximum context copy size (prevent unbounded NonPagedPoolNx allocation)
+#define TM_MAX_CONTEXT_SIZE         4096
+
 // Shutdown spin limit to avoid livelock
 #define TM_SHUTDOWN_SPIN_LIMIT      5000
 
@@ -288,12 +291,14 @@ typedef struct _TM_TIMER_OPTIONS {
 // Public API - Initialization
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 TmInitialize(
     _In_opt_ PDEVICE_OBJECT DeviceObject,
     _Out_ PTM_MANAGER* Manager
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 TmShutdown(
     _Inout_ PTM_MANAGER Manager
@@ -303,6 +308,7 @@ TmShutdown(
 // Public API - Timer Creation
 //=============================================================================
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TmCreateOneShot(
     _In_ PTM_MANAGER Manager,
@@ -313,6 +319,7 @@ TmCreateOneShot(
     _Out_ PULONG TimerId
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TmCreatePeriodic(
     _In_ PTM_MANAGER Manager,
@@ -323,6 +330,7 @@ TmCreatePeriodic(
     _Out_ PULONG TimerId
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TmCreateAbsolute(
     _In_ PTM_MANAGER Manager,
@@ -338,18 +346,21 @@ TmCreateAbsolute(
 // Public API - Timer Control
 //=============================================================================
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TmStart(
     _In_ PTM_MANAGER Manager,
     _In_ ULONG TimerId
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TmStop(
     _In_ PTM_MANAGER Manager,
     _In_ ULONG TimerId
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 TmCancel(
     _In_ PTM_MANAGER Manager,
@@ -357,12 +368,14 @@ TmCancel(
     _In_ BOOLEAN Wait
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TmReset(
     _In_ PTM_MANAGER Manager,
     _In_ ULONG TimerId
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TmSetPeriod(
     _In_ PTM_MANAGER Manager,
@@ -374,6 +387,7 @@ TmSetPeriod(
 // Public API - Timer Query
 //=============================================================================
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TmGetState(
     _In_ PTM_MANAGER Manager,
@@ -381,6 +395,7 @@ TmGetState(
     _Out_ PLONG State
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TmGetRemaining(
     _In_ PTM_MANAGER Manager,
@@ -388,6 +403,7 @@ TmGetRemaining(
     _Out_ PLARGE_INTEGER Remaining
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 TmIsActive(
     _In_ PTM_MANAGER Manager,
@@ -398,12 +414,14 @@ TmIsActive(
 // Public API - Bulk Operations
 //=============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 TmCancelAll(
     _In_ PTM_MANAGER Manager,
     _In_ BOOLEAN Wait
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 TmCancelGroup(
     _In_ PTM_MANAGER Manager,
@@ -425,12 +443,14 @@ typedef struct _TM_STATISTICS {
     LARGE_INTEGER UpTime;
 } TM_STATISTICS, *PTM_STATISTICS;
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TmGetStatistics(
     _In_ PTM_MANAGER Manager,
     _Out_ PTM_STATISTICS Stats
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 TmResetStatistics(
     _Inout_ PTM_MANAGER Manager
