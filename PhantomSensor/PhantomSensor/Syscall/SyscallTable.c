@@ -546,11 +546,11 @@ SstpPopulateFromBuildRange(
     ULONG entryIndex;
     ULONG bucketIdx;
 
-    if (Range->DefinitionCount > SST_MAX_ENTRIES) {
+    if (Table->EntryCount + Range->DefinitionCount > SST_MAX_ENTRIES) {
         return STATUS_BUFFER_OVERFLOW;
     }
 
-    entryIndex = 0;
+    entryIndex = Table->EntryCount;
 
     for (i = 0; i < Range->DefinitionCount; i++) {
         const SST_STATIC_DEFINITION *def = &Range->Definitions[i];
