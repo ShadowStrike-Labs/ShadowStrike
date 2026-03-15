@@ -904,9 +904,13 @@ ShadowStrikeSecureFree(
     }
 
     //
-    // Free the memory
+    // Free the memory with byte-accurate tracking.
+    // We bypass ShadowStrikeFreePoolWithTag here to use MEMORY_TRACK_FREE
+    // instead of MEMORY_TRACK_FREE_COUNT_ONLY, since we know the exact
+    // allocation size from the caller.
     //
-    ShadowStrikeFreePoolWithTag(P, Tag);
+    MEMORY_TRACK_FREE(Size);
+    ExFreePoolWithTag(P, Tag);
 }
 
 // ============================================================================
@@ -1683,11 +1687,13 @@ ShadowStrikeSecureWipeMemory(
     }
 
     //
-    // At high IRQL with large buffers, just do a single zero pass
-    // to avoid DPC timeout
+    // At high IRQL with large buffers, do a single zero pass capped to
+    // SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE to avoid DPC timeout BSOD.
+    // Remaining bytes beyond the cap are NOT wiped — callers handling
+    // sensitive data should wipe at <= APC_LEVEL for full coverage.
     //
     if (KeGetCurrentIrql() >= DISPATCH_LEVEL && Length > SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE) {
-        ShadowStrikeSecureZeroMemory(Destination, Length);
+        ShadowStrikeSecureZeroMemory(Destination, SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE);
         return;
     }
 
