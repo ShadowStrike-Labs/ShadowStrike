@@ -52,6 +52,7 @@
 #include "NtdllIntegrity.h"
 #include "../../Shared/KernelProcessTypes.h"
 #include "../Utilities/MemoryUtils.h"
+#include "../Utilities/ProcessUtils.h"
 #include "../Utilities/HashUtils.h"
 #include <ntimage.h>
 
@@ -210,50 +211,35 @@ typedef struct _NI_MONITOR_INTERNAL {
     PAGED_LOOKASIDE_LIST ProcessLookaside;
     PAGED_LOOKASIDE_LIST FunctionLookaside;
 
-    //
-    // Shutdown flag (interlocked access only)
-    //
-    volatile LONG ShuttingDown;
-
 } NI_MONITOR_INTERNAL, *PNI_MONITOR_INTERNAL;
 
 //
-// Helpers: acquire/release active operation count for safe shutdown drain
+// Helpers: acquire/release rundown protection for safe shutdown.
+// ExAcquireRundownProtection is atomic — no window between check and increment.
+// This replaces the manual ActiveOperations+DrainEvent pattern which had a UAF
+// race where shutdown could free the monitor between Initialized check and
+// InterlockedIncrement.
 //
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static __forceinline BOOLEAN
 NipAcquireOperation(
     _In_ PNI_MONITOR Monitor
     )
 {
-    if (!InterlockedCompareExchange(&Monitor->Initialized, 1, 1)) {
+    if (!Monitor->Initialized) {
         return FALSE;
     }
 
-    InterlockedIncrement(&Monitor->ActiveOperations);
-
-    //
-    // Re-check after increment: if shutdown raced in, undo and fail
-    //
-    if (!InterlockedCompareExchange(&Monitor->Initialized, 1, 1)) {
-        if (InterlockedDecrement(&Monitor->ActiveOperations) == 0) {
-            KeSetEvent(&Monitor->DrainEvent, IO_NO_INCREMENT, FALSE);
-        }
-        return FALSE;
-    }
-
-    return TRUE;
+    return ExAcquireRundownProtection(&Monitor->RundownRef);
 }
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static __forceinline VOID
 NipReleaseOperation(
     _In_ PNI_MONITOR Monitor
     )
 {
-    if (InterlockedDecrement(&Monitor->ActiveOperations) == 0) {
-        KeSetEvent(&Monitor->DrainEvent, IO_NO_INCREMENT, FALSE);
-    }
+    ExReleaseRundownProtection(&Monitor->RundownRef);
 }
 
 //=============================================================================
@@ -370,6 +356,15 @@ NipReadNtdllFromDisk(
     _Out_ PSIZE_T BufferSize
     );
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static NTSTATUS
+NipRemapFileToImage(
+    _In_ PVOID FileBuffer,
+    _In_ SIZE_T FileSize,
+    _Out_ PVOID* ImageBuffer,
+    _Out_ PSIZE_T ImageSize
+    );
+
 //=============================================================================
 // Initialization / Shutdown
 //=============================================================================
@@ -433,8 +428,7 @@ Return Value:
     InitializeListHead(&monitor->ProcessList);
     FltInitializePushLock(&monitor->ProcessLock);
     monitor->ProcessCount = 0;
-    monitor->ActiveOperations = 0;
-    KeInitializeEvent(&monitor->DrainEvent, NotificationEvent, TRUE);
+    ExInitializeRundownProtection(&monitor->RundownRef);
 
     //
     // Initialize lookaside lists (paged — all callers at PASSIVE_LEVEL)
@@ -479,7 +473,6 @@ Return Value:
     monitor->Stats.HooksDetected = 0;
 
     InterlockedExchange(&monitor->Initialized, TRUE);
-    InterlockedExchange(&monitorInternal->ShuttingDown, FALSE);
 
     *Monitor = monitor;
 
@@ -529,35 +522,12 @@ Arguments:
         return;
     }
 
-    InterlockedExchange(&monitorInternal->ShuttingDown, TRUE);
-    KeMemoryBarrier();
-
     //
-    // Wait for all in-flight operations to complete (drain).
-    // Clear event BEFORE checking count to prevent race: an operation
-    // completing between check and clear would set the event, then
-    // we'd clear it and wait forever (deadlock).
+    // Atomically reject new operations AND wait for all in-flight operations
+    // to complete. ExWaitForRundownProtectionRelease is safe at PASSIVE_LEVEL
+    // and eliminates all races in the manual ActiveOperations+DrainEvent pattern.
     //
-    KeClearEvent(&Monitor->DrainEvent);
-
-    if (Monitor->ActiveOperations > 0) {
-        NTSTATUS waitStatus;
-
-        //
-        // Wait INDEFINITELY for all in-flight operations to drain.
-        // A timeout here leads to use-after-free when we free process states
-        // and the monitor structure below.
-        //
-        waitStatus = KeWaitForSingleObject(
-            &Monitor->DrainEvent,
-            Executive,
-            KernelMode,
-            FALSE,
-            NULL
-            );
-
-        UNREFERENCED_PARAMETER(waitStatus);
-    }
+    ExWaitForRundownProtectionRelease(&Monitor->RundownRef);
 
     //
     // All operations drained — collect process states for cleanup
@@ -1335,6 +1305,200 @@ Arguments:
 
 
 //=============================================================================
+// Internal Functions - PE File-to-Image Remapping
+//=============================================================================
+
+static
+_Use_decl_annotations_
+NTSTATUS
+NipRemapFileToImage(
+    _In_ PVOID FileBuffer,
+    _In_ SIZE_T FileSize,
+    _Out_ PVOID* ImageBuffer,
+    _Out_ PSIZE_T ImageSize
+    )
+/*++
+
+Routine Description:
+
+    Converts a PE file read from disk (file layout) into a properly
+    section-aligned image buffer (memory layout).
+
+    PE files on disk use PointerToRawData offsets for section data.
+    In-memory images use VirtualAddress (RVA) offsets. For ntdll.dll,
+    SectionAlignment (0x1000) != FileAlignment (0x200), so these differ.
+
+    Without this remapping, ALL RVA-based operations (export table parsing,
+    function prologue lookup, .text section location) would read from wrong
+    offsets in the file buffer, producing invalid baselines for comparison.
+
+Arguments:
+
+    FileBuffer - Raw file contents read from disk.
+    FileSize   - Size of file buffer.
+    ImageBuffer - Receives pointer to properly-laid-out image.
+    ImageSize   - Receives SizeOfImage from PE header.
+
+Return Value:
+
+    STATUS_SUCCESS if the image was remapped correctly.
+    STATUS_INVALID_IMAGE_FORMAT on PE parse or validation failure.
+    STATUS_INSUFFICIENT_RESOURCES on allocation failure.
+
+--*/
+{
+    PIMAGE_DOS_HEADER dosHeader;
+    PIMAGE_NT_HEADERS64 ntHeaders;
+    PIMAGE_SECTION_HEADER sectionHeader;
+    SIZE_T sizeOfImage;
+    SIZE_T headersSize;
+    PVOID imageBuffer;
+    ULONG i;
+
+    *ImageBuffer = NULL;
+    *ImageSize = 0;
+
+    if (FileSize < sizeof(IMAGE_DOS_HEADER)) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    dosHeader = (PIMAGE_DOS_HEADER)FileBuffer;
+
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    if (dosHeader->e_lfanew < (LONG)sizeof(IMAGE_DOS_HEADER)) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    if ((SIZE_T)(ULONG)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > FileSize) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    ntHeaders = (PIMAGE_NT_HEADERS64)((PUCHAR)FileBuffer + dosHeader->e_lfanew);
+
+    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    if (ntHeaders->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    sizeOfImage = (SIZE_T)ntHeaders->OptionalHeader.SizeOfImage;
+
+    //
+    // Validate SizeOfImage is sane (ntdll is ~2MB, cap at NI_MAX_NTDLL_SIZE)
+    //
+    if (sizeOfImage == 0 || sizeOfImage > NI_MAX_NTDLL_SIZE) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    //
+    // Allocate image buffer from paged pool — zero-initialized so BSS
+    // sections and padding regions contain zeroes (matches loader behavior)
+    //
+    imageBuffer = ShadowStrikeAllocatePoolWithTag(
+        PagedPool,
+        sizeOfImage,
+        NI_POOL_TAG_NTDLL
+        );
+
+    if (imageBuffer == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(imageBuffer, sizeOfImage);
+
+    //
+    // Copy PE headers (SizeOfHeaders includes DOS header, NT headers,
+    // section table — bounded by both file size and image size)
+    //
+    headersSize = (SIZE_T)ntHeaders->OptionalHeader.SizeOfHeaders;
+    if (headersSize > FileSize) {
+        headersSize = FileSize;
+    }
+    if (headersSize > sizeOfImage) {
+        headersSize = sizeOfImage;
+    }
+
+    RtlCopyMemory(imageBuffer, FileBuffer, headersSize);
+
+    //
+    // Copy each section from file offset (PointerToRawData) to
+    // memory offset (VirtualAddress). This transforms file layout
+    // into the in-memory layout that all RVA-based lookups expect.
+    //
+    sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
+
+    for (i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+        ULONG virtualAddress;
+        ULONG sizeOfRawData;
+        ULONG pointerToRawData;
+        SIZE_T copySize;
+
+        //
+        // Validate section header is within file bounds
+        //
+        if ((PUCHAR)&sectionHeader[i] + sizeof(IMAGE_SECTION_HEADER) >
+            (PUCHAR)FileBuffer + FileSize) {
+            break;
+        }
+
+        virtualAddress = sectionHeader[i].VirtualAddress;
+        sizeOfRawData = sectionHeader[i].SizeOfRawData;
+        pointerToRawData = sectionHeader[i].PointerToRawData;
+
+        //
+        // Skip sections with no raw data (BSS, uninitialized data)
+        //
+        if (sizeOfRawData == 0 || pointerToRawData == 0) {
+            continue;
+        }
+
+        //
+        // Validate raw data fits within file
+        //
+        if ((SIZE_T)pointerToRawData + sizeOfRawData > FileSize) {
+            continue;
+        }
+
+        //
+        // Validate virtual address is within image bounds and does not
+        // overlap PE headers (defense-in-depth against corrupted ntdll)
+        //
+        if ((SIZE_T)virtualAddress >= sizeOfImage) {
+            continue;
+        }
+
+        if ((SIZE_T)virtualAddress < headersSize) {
+            continue;
+        }
+
+        //
+        // Cap copy to what fits in the image buffer
+        //
+        copySize = (SIZE_T)sizeOfRawData;
+        if ((SIZE_T)virtualAddress + copySize > sizeOfImage) {
+            copySize = sizeOfImage - (SIZE_T)virtualAddress;
+        }
+
+        RtlCopyMemory(
+            (PUCHAR)imageBuffer + virtualAddress,
+            (PUCHAR)FileBuffer + pointerToRawData,
+            copySize
+            );
+    }
+
+    *ImageBuffer = imageBuffer;
+    *ImageSize = sizeOfImage;
+
+    return STATUS_SUCCESS;
+}
+
+
+//=============================================================================
 // Internal Functions - NTDLL Capture
 //=============================================================================
 
@@ -1356,6 +1520,8 @@ Routine Description:
 --*/
 {
     NTSTATUS status;
+    PVOID rawFile = NULL;
+    SIZE_T rawSize = 0;
     PVOID cleanCopy = NULL;
     SIZE_T cleanSize = 0;
     PVOID textBase = NULL;
@@ -1363,9 +1529,27 @@ Routine Description:
     ULONG_PTR textRva = 0;
 
     //
-    // Read ntdll.dll from disk — trusted baseline
+    // Read raw ntdll.dll from disk — trusted baseline
     //
-    status = NipReadNtdllFromDisk(&cleanCopy, &cleanSize);
+    status = NipReadNtdllFromDisk(&rawFile, &rawSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    //
+    // Remap from file layout (PointerToRawData offsets) to memory layout
+    // (VirtualAddress offsets). ntdll.dll has SectionAlignment=0x1000 and
+    // FileAlignment=0x200, so these differ. Without remapping, ALL RVA-based
+    // operations (export table, function lookup, .text section) would read
+    // from wrong offsets in the file buffer.
+    //
+    status = NipRemapFileToImage(rawFile, rawSize, &cleanCopy, &cleanSize);
+
+    //
+    // Free the raw file immediately — only the remapped image is needed
+    //
+    ShadowStrikeFreePoolWithTag(rawFile, NI_POOL_TAG_NTDLL);
+
     if (!NT_SUCCESS(status)) {
         return status;
     }
@@ -1489,6 +1673,16 @@ Routine Description:
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
         return status;
+    }
+
+    //
+    // Reject terminated processes — PEB/LDR structures may be torn down.
+    // KeStackAttachProcess on a terminating process risks accessing
+    // partially-freed loader data (even with SEH, early rejection is cleaner).
+    //
+    if (ShadowStrikeIsProcessTerminating(process)) {
+        ObDereferenceObject(process);
+        return STATUS_PROCESS_IS_TERMINATING;
     }
 
     peb = PsGetProcessPeb(process);
@@ -1630,6 +1824,14 @@ Routine Description:
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
         return status;
+    }
+
+    //
+    // Reject terminated processes — address space may be partially torn down
+    //
+    if (ShadowStrikeIsProcessTerminating(process)) {
+        ObDereferenceObject(process);
+        return STATUS_PROCESS_IS_TERMINATING;
     }
 
     KeStackAttachProcess(process, &apcState);

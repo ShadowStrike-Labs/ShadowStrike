@@ -99,9 +99,9 @@ typedef struct _NI_MONITOR {
     EX_PUSH_LOCK ProcessLock;
     volatile LONG ProcessCount;
     
-    // Active operation count for safe shutdown drain
-    volatile LONG ActiveOperations;
-    KEVENT DrainEvent;
+    // Rundown protection for safe shutdown drain (replaces manual
+    // ActiveOperations counter which had UAF race window)
+    EX_RUNDOWN_REF RundownRef;
     
     struct {
         volatile LONG64 ProcessesMonitored;
