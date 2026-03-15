@@ -54,6 +54,7 @@
 
 #include "CallbackProtection.h"
 #include "../Behavioral/BehaviorEngine.h"
+#include "../ETW/TelemetryEvents.h"
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
 
@@ -1274,17 +1275,35 @@ CpVerifyAll(
             (VOID)BeEngineSubmitEvent(
                 BehaviorEvent_CallbackRemoval,
                 BehaviorCategory_DefenseEvasion,
-                HandleToULong(PsGetCurrentProcessId()),
+                0,
                 NULL, 0,
                 95,
                 FALSE,
                 NULL
                 );
 
-            if (Protector->EnableRestoration && cbEntry->HasBackup) {
-                if (CppRestoreCallback(cbEntry)) {
-                    InterlockedIncrement64(&Protector->Stats.CallbacksRestored);
+            //
+            // Attempt code restoration from backup before telemetry so
+            // the Blocked field reflects whether the attack was neutralized.
+            //
+            {
+                BOOLEAN restored = FALSE;
+
+                if (Protector->EnableRestoration && cbEntry->HasBackup) {
+                    if (CppRestoreCallback(cbEntry)) {
+                        InterlockedIncrement64(&Protector->Stats.CallbacksRestored);
+                        restored = TRUE;
+                    }
                 }
+
+                (VOID)TeLogTamperAttempt(
+                    Tamper_CallbackRemoval,
+                    0,
+                    Component_SelfProtection,
+                    (UINT64)(ULONG_PTR)cbEntry->Callback,
+                    restored,
+                    L"Callback code integrity tamper detected"
+                    );
             }
 
             CppNotifyTamper(Protector, cbEntry);

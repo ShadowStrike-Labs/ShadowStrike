@@ -661,6 +661,18 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 PAU_PROTECTOR
 ShadowStrikeGetAntiUnloadProtector(VOID);
 
+/**
+ * @brief Get the global callback protection instance.
+ * @return PCP_PROTECTOR or NULL if not initialized.
+ * @note Used by PerformanceMonitor for stats collection.
+ *       All CP public APIs require PASSIVE_LEVEL.
+ */
+typedef struct _CP_PROTECTOR CP_PROTECTOR, *PCP_PROTECTOR;
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+PCP_PROTECTOR
+ShadowStrikeGetCallbackProtector(VOID);
+
 #ifdef __cplusplus
 }
 #endif

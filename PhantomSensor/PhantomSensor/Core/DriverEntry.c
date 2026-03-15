@@ -3284,6 +3284,13 @@ ShadowStrikeGetAntiUnloadProtector(VOID)
     return g_AntiUnloadProtector;
 }
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
+PCP_PROTECTOR
+ShadowStrikeGetCallbackProtector(VOID)
+{
+    return g_CallbackProtector;
+}
+
 // ============================================================================
 // VERSION COMPATIBILITY CHECK
 // ============================================================================
