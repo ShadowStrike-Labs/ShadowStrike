@@ -657,13 +657,22 @@ IomInitialize(
             (PVOID*)&matcher->CleanupThread,
             NULL
         );
-        ZwClose(threadHandle);
 
         if (!NT_SUCCESS(status)) {
+            //
+            // Thread is running but we cannot reference it.
+            // Signal termination and wait via handle before freeing matcher.
+            //
             matcher->CleanupTerminate = TRUE;
             KeSetEvent(&matcher->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
+            ZwWaitForSingleObject(threadHandle, FALSE, NULL);
+            matcher->CleanupThread = NULL;
+
+            ZwClose(threadHandle);
             goto Cleanup;
         }
+
+        ZwClose(threadHandle);
 
         //
         // Create periodic timer via TimerManager
@@ -1379,10 +1388,27 @@ IomMatch(
     typeIndex = &matcher->TypeIndices[Type];
 
     //
-    // Determine lookup strategy based on type
-    // Pattern-matching types must iterate all IOCs; exact match can use hash
+    // Determine lookup strategy based on type.
+    // Pattern-matching types (Domain, IP, paths, etc.) CANNOT use hash-based
+    // lookup because the IOC pattern hash differs from the query value hash.
+    // e.g., hash("*.example.com") != hash("sub.example.com")
     //
     useHashLookup = (typeIndex->HashBuckets != NULL && typeIndex->BucketCount > 0);
+
+    switch (Type) {
+        case IomType_Domain:
+        case IomType_IPAddress:
+        case IomType_FilePath:
+        case IomType_FileName:
+        case IomType_Registry:
+        case IomType_URL:
+        case IomType_CommandLine:
+        case IomType_ProcessName:
+            useHashLookup = FALSE;
+            break;
+        default:
+            break;
+    }
 
     ExAcquirePushLockShared(&typeIndex->Lock);
 
@@ -2534,25 +2560,29 @@ IompNotifyCallback(
     )
 {
     PIOM_CALLBACK_REGISTRATION reg;
-    IOM_MATCH_CALLBACK callback;
-    PVOID context;
+    IOM_MATCH_CALLBACK callback = NULL;
+    PVOID context = NULL;
 
     //
-    // Read callback atomically
+    // Read callback registration under shared lock to prevent use-after-free.
+    // IomRegisterCallback swaps and frees the old registration — without the
+    // lock, the pointer could be freed between our read and invocation.
     //
-    reg = (PIOM_CALLBACK_REGISTRATION)InterlockedCompareExchangePointer(
-        (PVOID*)&Matcher->CallbackReg,
-        NULL,
-        NULL
-    );
+    ExAcquirePushLockShared(&Matcher->CallbackLock);
 
+    reg = Matcher->CallbackReg;
     if (reg != NULL && reg->Callback != NULL) {
         callback = reg->Callback;
         context = reg->Context;
+    }
 
-        //
-        // Invoke callback outside any locks
-        //
+    ExReleasePushLockShared(&Matcher->CallbackLock);
+
+    //
+    // Invoke callback outside lock (safe — reg stays valid because
+    // IomRegisterCallback holds CallbackLock exclusive during swap)
+    //
+    if (callback != NULL) {
         callback(Result, context);
     }
 }
