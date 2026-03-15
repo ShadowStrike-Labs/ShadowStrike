@@ -52,6 +52,7 @@
 #include "../Callbacks/Registry/RegistryCallback.h"
 #include "../Utilities/HashUtils.h"
 #include "../Utilities/FileUtils.h"
+#include "../Utilities/MemoryUtils.h"
 #include "../Shared/SharedDefs.h"
 #include "../Shared/PortName.h"
 #include "../Callbacks/FileSystem/NamedPipeMonitor.h"
@@ -1083,6 +1084,18 @@ DriverEntry(
 
     // Record start time
     KeQuerySystemTime(&g_DriverData.Stats.StartTime);
+
+    //
+    // Step 4.5: Initialize memory utilities (foundational — must precede all allocations)
+    //
+    status = ShadowStrikeInitializeMemoryUtils();
+    if (!NT_SUCCESS(status) && status != STATUS_ALREADY_INITIALIZED) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] CRITICAL: Failed to initialize memory utilities: 0x%08X\n",
+                   status);
+        goto Cleanup;
+    }
+    status = STATUS_SUCCESS;
 
     //
     // Step 5: Initialize lookaside lists for memory allocation
@@ -3138,6 +3151,12 @@ ShadowStrikeUnload(
     g_InitFlags = InitFlag_None;
 
     //
+    // Step 12: Cleanup memory utilities (foundational — must be after all other
+    // module cleanups that may free memory; logs leak stats in debug builds)
+    //
+    ShadowStrikeCleanupMemoryUtils();
+
+    //
     // FINAL: Shutdown WPP tracing (must be last — after all trace-emitting code)
     //
     WppTraceShutdown(g_DriverData.DriverObject);
@@ -4190,6 +4209,11 @@ ShadowStrikeCleanupByFlags(
     }
 
     ShadowStrikeCleanupProtectedProcessList();
+
+    //
+    // Cleanup memory utilities (foundational — after all module cleanups)
+    //
+    ShadowStrikeCleanupMemoryUtils();
 
     //
     // Shutdown WPP tracing last (after all trace-emitting modules)
