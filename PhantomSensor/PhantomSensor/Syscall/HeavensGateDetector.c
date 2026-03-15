@@ -92,6 +92,12 @@ Detection Techniques Covered:
 // INTERNAL CONSTANTS
 // ============================================================================
 
+//
+// Static assert: InterlockedCompareExchange64 is used on SIZE_T fields.
+// This guarantees SIZE_T == 8 bytes on our target platforms (x64/ARM64).
+//
+C_ASSERT(sizeof(SIZE_T) == sizeof(LONG64));
+
 #define HGD_SIGNATURE                   'DGHH'
 #define HGD_MAX_TRANSITIONS             4096
 #define HGD_MAX_PROCESS_CONTEXTS        1024
@@ -230,6 +236,12 @@ typedef struct _HGD_PROCESS_CONTEXT {
 //
 struct _HGD_DETECTOR {
     BOOLEAN Initialized;
+
+    //
+    // Rundown protection: ensures no concurrent callers are inside
+    // HGD public functions when shutdown frees resources.
+    //
+    EX_RUNDOWN_REF RundownRef;
 
     //
     // WoW64 system addresses
@@ -505,6 +517,11 @@ Return Value:
     RtlZeroMemory(Internal, sizeof(HGD_DETECTOR));
 
     //
+    // Initialize rundown protection (active state — acquisitions succeed)
+    //
+    ExInitializeRundownProtection(&Internal->RundownRef);
+
+    //
     // Initialize process context list
     //
     InitializeListHead(&Internal->ProcessContextList);
@@ -618,6 +635,12 @@ Routine Description:
     Shuts down the Heaven's Gate detector subsystem.
     Blocks until all pending work items complete, then frees all resources.
 
+    Shutdown sequence:
+    1. Signal intent (ShutdownRequested — timer callback fast-exit)
+    2. Cancel cleanup timer (TmCancel Wait=TRUE drains in-flight callback)
+    3. ExWaitForRundownProtectionRelease — drains all public API callers
+    4. Free all resources (no concurrent access possible)
+
 Arguments:
     Detector - Detector instance to shutdown.
 --*/
@@ -628,7 +651,7 @@ Arguments:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL) {
         return;
     }
 
@@ -636,14 +659,13 @@ Arguments:
         "HgdShutdown: Shutting down Heaven's Gate detector");
 
     //
-    // Signal shutdown - prevents new work items from being queued
+    // Step 1: Signal shutdown intent — timer callback checks this for fast exit
     //
-    Detector->Initialized = FALSE;
     InterlockedExchange8((volatile CHAR*)&Detector->ShutdownRequested, TRUE);
 
     //
-    // Cancel cleanup timer.  TmCancel with Wait=TRUE blocks until any
-    // in-flight callback completes, replacing KeCancelTimer+KeFlushQueuedDpcs.
+    // Step 2: Cancel cleanup timer.  TmCancel with Wait=TRUE blocks until
+    // any in-flight callback completes.
     //
     {
         PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
@@ -654,40 +676,37 @@ Arguments:
     }
 
     //
+    // Step 3: Drain all in-flight public API callers.
+    // ExWaitForRundownProtectionRelease atomically prevents new
+    // acquisitions AND blocks until all outstanding holders release.
+    // After this returns, no caller is inside any HGD public function.
+    //
+    ExWaitForRundownProtectionRelease(&Detector->RundownRef);
+
+    //
+    // Step 4: All callers drained, timer stopped — safe to free everything.
+    // No locks needed since no concurrent access is possible.
+    //
+
+    //
     // Free all transitions
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Detector->TransitionLock);
-
     while (!IsListEmpty(&Detector->TransitionList)) {
         Entry = RemoveHeadList(&Detector->TransitionList);
         Transition = CONTAINING_RECORD(Entry, HGD_TRANSITION_INTERNAL, ListEntry);
-        InterlockedDecrement(&Detector->TransitionCount);
-
-        //
-        // Free inline - we hold exclusive lock and are shutting down
-        //
         ExFreeToNPagedLookasideList(&Detector->TransitionLookaside, Transition);
     }
-
-    ExReleasePushLockExclusive(&Detector->TransitionLock);
-    KeLeaveCriticalRegion();
+    Detector->TransitionCount = 0;
 
     //
     // Free all process contexts
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Detector->ProcessLock);
-
     while (!IsListEmpty(&Detector->ProcessContextList)) {
         Entry = RemoveHeadList(&Detector->ProcessContextList);
         Context = CONTAINING_RECORD(Entry, HGD_PROCESS_CONTEXT, ListEntry);
-        InterlockedDecrement(&Detector->ProcessContextCount);
         ExFreeToNPagedLookasideList(&Detector->ContextLookaside, Context);
     }
-
-    ExReleasePushLockExclusive(&Detector->ProcessLock);
-    KeLeaveCriticalRegion();
+    Detector->ProcessContextCount = 0;
 
     //
     // Cleanup patterns
@@ -702,13 +721,13 @@ Arguments:
         ExDeleteNPagedLookasideList(&Detector->ContextLookaside);
     }
 
-    //
-    // Free detector structure
-    //
-    ShadowStrikeFreePoolWithTag(Detector, HGD_POOL_TAG);
-
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_FLAG_INIT,
         "HgdShutdown: Heaven's Gate detector shutdown complete");
+
+    //
+    // Free detector structure (must be last — no field access after this)
+    //
+    ShadowStrikeFreePoolWithTag(Detector, HGD_POOL_TAG);
 }
 
 
@@ -753,11 +772,16 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || Transition == NULL) {
+    if (Detector == NULL || Transition == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+
     if (CodeSnapshot == NULL || CodeSnapshotSize == 0) {
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -776,6 +800,7 @@ Return Value:
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_FLAG_BEHAVIOR,
             "HgdAnalyzeTransition: Failed to allocate process context for PID %Iu",
             (ULONG_PTR)ProcessId);
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -784,6 +809,7 @@ Return Value:
     //
     if (!ProcessContext->IsWow64Process) {
         HgdpDereferenceProcessContext(Detector, ProcessContext);
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_NOT_SUPPORTED;
     }
 
@@ -808,6 +834,7 @@ Return Value:
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_FLAG_BEHAVIOR,
             "HgdAnalyzeTransition: Failed to allocate transition record for PID %Iu",
             (ULONG_PTR)ProcessId);
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -862,6 +889,8 @@ Return Value:
                 InterlockedOr(&ProcessContext->Flags, HGD_PROC_FLAG_HEAVENS_GATE);
             } else if (GateType == HgdGate_HellsGate) {
                 InterlockedOr(&ProcessContext->Flags, HGD_PROC_FLAG_HELLS_GATE);
+            } else if (GateType == HgdGate_HalosGate) {
+                InterlockedOr(&ProcessContext->Flags, HGD_PROC_FLAG_HALOS_GATE);
             }
 
             TraceEvents(TRACE_LEVEL_WARNING, TRACE_FLAG_THREAT,
@@ -880,6 +909,7 @@ Return Value:
     if (Result == NULL) {
         HgdpFreeTransitionInternal(Detector, InternalTransition);
         HgdpDereferenceProcessContext(Detector, ProcessContext);
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -901,6 +931,7 @@ Return Value:
 
     *Transition = Result;
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -931,8 +962,12 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || IsLegitimate == NULL) {
+    if (Detector == NULL || IsLegitimate == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
     //
@@ -949,13 +984,29 @@ Return Value:
         // No context = not monitored. Return FALSE (suspicious)
         // to force the caller to create monitoring context.
         //
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_SUCCESS;
     }
 
     *IsLegitimate = HgdpIsKnownWow64Address(Detector, ProcessContext, Address);
 
+    //
+    // Also check system-level WoW64 addresses (populated from first
+    // per-process resolution, see HgdpAllocateProcessContext)
+    //
+    if (!*IsLegitimate && Detector->SystemWow64CpuBase != NULL &&
+        Detector->SystemWow64CpuSize != 0) {
+        ULONG_PTR Addr = (ULONG_PTR)Address;
+        ULONG_PTR Base = (ULONG_PTR)Detector->SystemWow64CpuBase;
+
+        if (Addr >= Base && (Addr - Base) < Detector->SystemWow64CpuSize) {
+            *IsLegitimate = TRUE;
+        }
+    }
+
     HgdpDereferenceProcessContext(Detector, ProcessContext);
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -993,9 +1044,13 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized ||
+    if (Detector == NULL ||
         Transitions == NULL || Count == NULL || Max == 0) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
     *Count = 0;
@@ -1033,6 +1088,7 @@ Return Value:
     // Caller is responsible for freeing the ones we returned.
     //
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1066,8 +1122,9 @@ HgdRefreshWow64Addresses(
     )
 /*++
 Routine Description:
-    Refreshes system WoW64 module addresses by locating wow64cpu.dll
-    in a WoW64 system process and extracting the transition address.
+    Refreshes system-level WoW64 module addresses by walking tracked
+    process contexts and extracting resolved wow64cpu.dll base/size.
+    Updates Detector->SystemWow64CpuBase/Size for HgdIsLegitimateWow64.
 
 Arguments:
     Detector - Detector instance.
@@ -1076,24 +1133,67 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
+    PLIST_ENTRY Entry;
+    PHGD_PROCESS_CONTEXT Context;
+    BOOLEAN Found = FALSE;
+
     PAGED_CODE();
 
     if (Detector == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // System-level wow64cpu.dll resolution is deferred to per-process
-    // context creation (HgdpResolveWow64Addresses). Each WoW64 process
-    // gets its addresses resolved when first observed.
-    //
-    // This function provides a hook point for future system-wide
-    // resolution (e.g., on WoW64 subsystem load notification).
-    //
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
 
-    TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_FLAG_BEHAVIOR,
-        "HgdRefreshWow64Addresses: WoW64 resolution deferred to per-process");
+    //
+    // Walk tracked process contexts to find a WoW64 process with
+    // resolved wow64cpu.dll addresses. Use the first match to update
+    // system-level addresses (wow64cpu.dll is mapped at the same
+    // base in all WoW64 processes within a single boot).
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Detector->ProcessLock);
 
+    for (Entry = Detector->ProcessContextList.Flink;
+         Entry != &Detector->ProcessContextList;
+         Entry = Entry->Flink) {
+
+        Context = CONTAINING_RECORD(Entry, HGD_PROCESS_CONTEXT, ListEntry);
+
+        if (Context->IsWow64Process && !Context->MarkedForRemoval &&
+            Context->Wow64CpuBase != NULL && Context->Wow64CpuSize != 0) {
+
+            //
+            // Use interlocked operations for consistency with concurrent
+            // readers in HgdIsLegitimateWow64 (which reads without locks).
+            // CAS ensures no torn Base/Size pair is observed.
+            //
+            InterlockedCompareExchangePointer(
+                (PVOID volatile *)&Detector->SystemWow64CpuBase,
+                Context->Wow64CpuBase, NULL);
+            InterlockedCompareExchange64(
+                (volatile LONG64*)&Detector->SystemWow64CpuSize,
+                (LONG64)Context->Wow64CpuSize, 0);
+            Found = TRUE;
+            break;
+        }
+    }
+
+    ExReleasePushLockShared(&Detector->ProcessLock);
+    KeLeaveCriticalRegion();
+
+    if (Found) {
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_FLAG_BEHAVIOR,
+            "HgdRefreshWow64Addresses: System wow64cpu.dll at %p (size %Iu)",
+            Detector->SystemWow64CpuBase, Detector->SystemWow64CpuSize);
+    } else {
+        TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_FLAG_BEHAVIOR,
+            "HgdRefreshWow64Addresses: No WoW64 process contexts with resolved addresses");
+    }
+
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1123,8 +1223,12 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || Callback == NULL) {
+    if (Detector == NULL || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
     KeEnterCriticalRegion();
@@ -1144,6 +1248,7 @@ Return Value:
                 "HgdRegisterCallback: Registered callback %p, slot %lu",
                 Callback, i);
 
+            ExReleaseRundownProtection(&Detector->RundownRef);
             return STATUS_SUCCESS;
         }
     }
@@ -1155,6 +1260,7 @@ Return Value:
         "HgdRegisterCallback: All %d callback slots exhausted",
         HGD_MAX_CALLBACKS);
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_QUOTA_EXCEEDED;
 }
 
@@ -1182,6 +1288,10 @@ Arguments:
         return;
     }
 
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Detector->CallbackLock);
 
@@ -1198,6 +1308,8 @@ Arguments:
 
     ExReleasePushLockExclusive(&Detector->CallbackLock);
     KeLeaveCriticalRegion();
+
+    ExReleaseRundownProtection(&Detector->RundownRef);
 }
 
 
@@ -1223,6 +1335,10 @@ Return Value:
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+
     Statistics->TransitionsDetected =
         InterlockedCompareExchange64(&Detector->Stats.TransitionsDetected, 0, 0);
     Statistics->LegitimateTransitions =
@@ -1231,6 +1347,7 @@ Return Value:
         InterlockedCompareExchange64(&Detector->Stats.SuspiciousTransitions, 0, 0);
     Statistics->StartTime = Detector->Stats.StartTime;
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1272,9 +1389,13 @@ Return Value:
 
     UNREFERENCED_PARAMETER(SyscallNumber);
 
-    if (Detector == NULL || !Detector->Initialized ||
+    if (Detector == NULL ||
         IsSuspicious == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
     *IsSuspicious = FALSE;
@@ -1284,6 +1405,7 @@ Return Value:
 
     ProcessContext = HgdpLookupProcessContext(Detector, ProcessId, FALSE);
     if (ProcessContext == NULL) {
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_SUCCESS;
     }
 
@@ -1300,13 +1422,15 @@ Return Value:
 
     if (!NT_SUCCESS(Status)) {
         //
-        // Cannot read return address - suspicious
+        // Cannot read return address — security-conservative: treat as suspicious.
+        // This catches memory evasion techniques (guard pages, unmapped code).
         //
         *IsSuspicious = TRUE;
         if (GateType != NULL) {
             *GateType = HgdGate_ManualTransition;
         }
         HgdpDereferenceProcessContext(Detector, ProcessContext);
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_SUCCESS;
     }
 
@@ -1327,6 +1451,7 @@ Return Value:
         *GateType = DetectedType;
     }
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1357,12 +1482,17 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
     ProcessContext = HgdpLookupProcessContext(Detector, ProcessId, TRUE);
     if (ProcessContext == NULL) {
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1402,6 +1532,7 @@ Return Value:
 
     HgdpDereferenceProcessContext(Detector, ProcessContext);
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return Status;
 }
 
@@ -1432,8 +1563,12 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || Flags == NULL) {
+    if (Detector == NULL || Flags == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
     *Flags = 0;
@@ -1443,6 +1578,7 @@ Return Value:
 
     ProcessContext = HgdpLookupProcessContext(Detector, ProcessId, FALSE);
     if (ProcessContext == NULL) {
+        ExReleaseRundownProtection(&Detector->RundownRef);
         return STATUS_NOT_FOUND;
     }
 
@@ -1458,6 +1594,7 @@ Return Value:
 
     HgdpDereferenceProcessContext(Detector, ProcessContext);
 
+    ExReleaseRundownProtection(&Detector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1484,7 +1621,11 @@ Arguments:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL) {
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
         return;
     }
 
@@ -1529,6 +1670,8 @@ Arguments:
         //
         HgdpDereferenceProcessContext(Detector, Context);
     }
+
+    ExReleaseRundownProtection(&Detector->RundownRef);
 }
 
 
@@ -1582,6 +1725,25 @@ HgdpAllocateProcessContext(
             if (Context->IsWow64Process) {
                 HgdpResolveWow64Addresses(Detector, Context);
                 InterlockedOr(&Context->Flags, HGD_PROC_FLAG_MONITORED);
+
+                //
+                // Opportunistically populate system-level WoW64 addresses.
+                // wow64cpu.dll is mapped at the same base in all WoW64 processes
+                // within a single boot (shared section), so the first resolution
+                // provides valid system-wide addresses for HgdIsLegitimateWow64.
+                //
+                if (Context->Wow64CpuBase != NULL &&
+                    Detector->SystemWow64CpuBase == NULL) {
+                    InterlockedCompareExchangePointer(
+                        (PVOID volatile *)&Detector->SystemWow64CpuBase,
+                        Context->Wow64CpuBase, NULL);
+                }
+                if (Context->Wow64CpuSize != 0 &&
+                    Detector->SystemWow64CpuSize == 0) {
+                    InterlockedCompareExchange64(
+                        (volatile LONG64*)&Detector->SystemWow64CpuSize,
+                        (LONG64)Context->Wow64CpuSize, 0);
+                }
             }
         }
 
@@ -1896,7 +2058,7 @@ Routine Description:
     //
     if (HgdpDetectHalosGatePattern(CodeBuffer, CodeSize)) {
         *SuspicionScore = HGD_SUSPICION_HIGH;
-        return HgdGate_HellsGate;
+        return HgdGate_HalosGate;
     }
 
     //
@@ -2627,13 +2789,20 @@ Routine Description:
     TimerManager periodic callback.
     Runs at PASSIVE_LEVEL (TmFlag_WorkItemCallback), so push locks
     and PEB walking are safe — no intermediate work-item needed.
+    
+    Acquires rundown protection for defense-in-depth: if TmCancel
+    ever races with resource freeing, rundown prevents UAF.
 --*/
 {
     PHGD_DETECTOR Detector = (PHGD_DETECTOR)Context;
 
     UNREFERENCED_PARAMETER(TimerId);
 
-    if (Detector == NULL || Detector->ShutdownRequested) {
+    if (Detector == NULL) {
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&Detector->RundownRef)) {
         return;
     }
 
@@ -2646,6 +2815,8 @@ Routine Description:
     // Clean up process contexts for dead processes
     //
     HgdpCleanupStaleProcessContexts(Detector);
+
+    ExReleaseRundownProtection(&Detector->RundownRef);
 }
 
 

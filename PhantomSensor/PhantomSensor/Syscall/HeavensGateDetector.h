@@ -62,6 +62,7 @@ typedef enum _HGD_GATE_TYPE {
     HgdGate_None = 0,
     HgdGate_HeavensGate,                // 32 -> 64 bit manual transition
     HgdGate_HellsGate,                  // Dynamic SSN from unhook
+    HgdGate_HalosGate,                  // Neighbor syscall walking variant
     HgdGate_WoW64Transition,            // Legitimate wow64cpu.dll
     HgdGate_ManualTransition,           // Handcrafted far call / RETF
 } HGD_GATE_TYPE;
@@ -395,6 +396,7 @@ HgdUnregisterCallback(
 #define HGD_PROC_FLAG_HEAVENS_GATE      0x00000004
 #define HGD_PROC_FLAG_HELLS_GATE        0x00000008
 #define HGD_PROC_FLAG_BLOCKED           0x00000010
+#define HGD_PROC_FLAG_HALOS_GATE        0x00000020
 
 #ifdef __cplusplus
 }
