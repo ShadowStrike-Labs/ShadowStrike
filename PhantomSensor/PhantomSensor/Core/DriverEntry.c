@@ -3062,6 +3062,12 @@ ShadowStrikeGetCacheManager(VOID)
     return g_CacheOptimizer;
 }
 
+PLL_MANAGER
+ShadowStrikeGetLookasideManager(VOID)
+{
+    return g_LookasideManager;
+}
+
 _Use_decl_annotations_
 NTSTATUS
 ShadowStrikeBatchSendNotification(

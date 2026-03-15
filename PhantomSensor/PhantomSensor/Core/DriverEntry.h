@@ -201,6 +201,7 @@ typedef struct _TB_MANAGER TB_MANAGER, *PTB_MANAGER;
 typedef struct _CO_MANAGER CO_MANAGER, *PCO_MANAGER;
 typedef struct _EC_CONSUMER EC_CONSUMER, *PEC_CONSUMER;
 typedef struct _ES_SCHEMA ES_SCHEMA, *PES_SCHEMA;
+typedef struct _LL_MANAGER LL_MANAGER, *PLL_MANAGER;
 
 // ============================================================================
 // DRIVER LIFECYCLE FUNCTIONS
@@ -303,6 +304,23 @@ ShadowStrikeInitializeLookasideLists(
  */
 VOID
 ShadowStrikeCleanupLookasideLists(
+    VOID
+    );
+
+/**
+ * @brief Get the global lookaside list manager.
+ *
+ * Returns NULL if LlInitialize has not been called or failed.
+ * Callers should use this to create managed lookaside lists via
+ * LlCreateLookaside/LlAllocate/LlFree instead of raw ExInitialize*LookasideList.
+ *
+ * @return PLL_MANAGER or NULL
+ *
+ * @irql Any (no lock acquisition, returns a stable pointer)
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PLL_MANAGER
+ShadowStrikeGetLookasideManager(
     VOID
     );
 
