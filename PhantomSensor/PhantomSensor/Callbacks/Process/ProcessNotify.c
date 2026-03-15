@@ -1793,7 +1793,7 @@ Arguments:
         BEHAVIOR_RESPONSE_ACTION beResponse = BehaviorResponse_Allow;
         UINT32 finalThreatScore = SuspicionScore;
 
-        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+        PTS_SCORING_ENGINE tsEngine = g_ProcessMonitor.ThreatScoringEngine;
         if (tsEngine != NULL) {
             PTS_THREAT_SCORE tsResult = (PTS_THREAT_SCORE)ExAllocatePool2(
                 POOL_FLAG_PAGED, sizeof(TS_THREAT_SCORE), 'sTsS');
@@ -4396,6 +4396,17 @@ Routine Description:
     }
 
     PnpCleanupStaleContexts();
+
+    //
+    // Run ThreatScoring maintenance on the ProcessMonitor's engine.
+    // This decays factor scores over time and purges contexts for
+    // terminated processes, preventing unbounded memory growth.
+    // Timer runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback. ✓
+    //
+    if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+        TsRunMaintenancePass(g_ProcessMonitor.ThreatScoringEngine);
+        TsPurgeStaleContexts(g_ProcessMonitor.ThreatScoringEngine, NULL);
+    }
 
     InterlockedExchange(&g_ProcessMonitor.CleanupWorkPending, FALSE);
 }

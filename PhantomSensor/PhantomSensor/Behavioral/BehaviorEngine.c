@@ -89,6 +89,7 @@
 #include "IOCMatcher.h"
 #include "PatternMatcher.h"
 #include "../Core/Globals.h"
+#include "../Core/DriverEntry.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
 #include "../Callbacks/FileSystem/FileBackupEngine.h"
@@ -223,7 +224,6 @@ static EX_PUSH_LOCK g_ChainHashLock;
  */
 static PACT_TRACKER g_AttackChainTracker;
 static PRE_ENGINE g_RuleEngine;
-static PTS_SCORING_ENGINE g_ScoringEngine;
 static PMM_MAPPER g_MitreMapper;
 static PPM_MATCHER g_PatternMatcher;
 static PIOM_MATCHER g_IocMatcher;
@@ -1562,7 +1562,15 @@ BeEngineReleaseChain(
             PBE_CHAIN_ENTRY chainEntry;
 
             //
-            // Remove from hash table and active chain list
+            // Remove from active chain list (main list)
+            //
+            ExAcquireResourceExclusiveLite(&g_BeState.ChainLock, TRUE);
+            RemoveEntryList(&Chain->ListEntry);
+            g_BeState.ActiveChainCount--;
+            ExReleaseResourceLite(&g_BeState.ChainLock);
+
+            //
+            // Remove from hash table
             //
             BepRemoveChainFromHash(Chain);
 
@@ -1964,6 +1972,14 @@ BeEngineReleaseProcessContext(
         // If we're at PASSIVE_LEVEL, we can clean up immediately
         //
         if (KeGetCurrentIrql() <= APC_LEVEL) {
+            //
+            // Remove from main process list
+            //
+            ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
+            RemoveEntryList(&Context->ListEntry);
+            g_BeState.ProcessContextCount--;
+            ExReleaseResourceLite(&g_BeState.ProcessLock);
+
             //
             // Remove from hash table
             //
@@ -2489,6 +2505,21 @@ BepWorkerThread(
         if (currentTimeMs - g_BeState.LastChainCleanupTime > BE_CHAIN_CLEANUP_INTERVAL_MS) {
             BepCleanupStaleChains();
             BepCleanupStaleProcessContexts();
+
+            //
+            // Run ThreatScoring maintenance on the driver-wide engine.
+            // This handles factor decay (scores age over time) and purging
+            // contexts for processes that have terminated, preventing
+            // unbounded memory growth on long-running systems.
+            //
+            {
+                PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                if (tsEngine != NULL) {
+                    TsRunMaintenancePass(tsEngine);
+                    TsPurgeStaleContexts(tsEngine, NULL);
+                }
+            }
+
             g_BeState.LastChainCleanupTime = currentTimeMs;
         }
     }
@@ -2842,7 +2873,6 @@ BepProcessSingleEvent(
     }
 
     Event->Flags |= BE_EVENT_FLAG_PROCESSED;
-    InterlockedIncrement64(&g_BeState.TotalRuleMatches);
 
     BeEngineReleaseProcessContext(processContext);
     return STATUS_SUCCESS;
@@ -3293,7 +3323,8 @@ BepInsertChain(
  * @brief Remove chain from hash table only.
  *
  * Used by reference counting cleanup when chain refcount hits zero.
- * This is separate from BepRemoveChain to allow cleanup at different IRQLs.
+ * Only removes from the hash table — caller is responsible for main list removal
+ * to prevent double-RemoveEntryList corruption.
  */
 static VOID
 BepRemoveChainFromHash(
@@ -3325,22 +3356,13 @@ BepRemoveChainFromHash(
     if (hashEntry != NULL) {
         ExFreePoolWithTag(hashEntry, BE_POOL_TAG_CHAIN);
     }
-
-    //
-    // Also remove from main list if at appropriate IRQL
-    //
-    if (KeGetCurrentIrql() <= APC_LEVEL) {
-        ExAcquireResourceExclusiveLite(&g_BeState.ChainLock, TRUE);
-        RemoveEntryList(&Chain->ListEntry);
-        g_BeState.ActiveChainCount--;
-        ExReleaseResourceLite(&g_BeState.ChainLock);
-    }
 }
 
 /**
  * @brief Remove process context from hash table only.
  *
- * Used by reference counting cleanup when context refcount hits zero.
+ * Only removes from the hash table — caller is responsible for main list
+ * removal to prevent double-RemoveEntryList corruption.
  */
 static VOID
 BepRemoveProcessContextFromHash(
@@ -3371,16 +3393,6 @@ BepRemoveProcessContextFromHash(
 
     if (hashEntry != NULL) {
         ExFreePoolWithTag(hashEntry, BE_POOL_TAG_GENERAL);
-    }
-
-    //
-    // Also remove from main list if at appropriate IRQL
-    //
-    if (KeGetCurrentIrql() <= APC_LEVEL) {
-        ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
-        RemoveEntryList(&Context->ListEntry);
-        g_BeState.ProcessContextCount--;
-        ExReleaseResourceLite(&g_BeState.ProcessLock);
     }
 }
 
@@ -4056,11 +4068,13 @@ BepCleanupStaleProcessContexts(
     ExReleaseResourceLite(&g_BeState.ProcessLock);
 
     //
-    // Free stale contexts
+    // Free stale contexts — also remove from hash table to prevent
+    // use-after-free on subsequent hash lookups.
     //
     while (!IsListEmpty(&staleList)) {
         entry = RemoveHeadList(&staleList);
         context = CONTAINING_RECORD(entry, BE_PROCESS_CONTEXT, ListEntry);
+        BepRemoveProcessContextFromHash(context);
         BepFreeProcessContext(context);
     }
 }
@@ -4109,7 +4123,6 @@ BepIsLolBin(
         L"\\msconfig.exe",
         L"\\msdeploy.exe",
         L"\\msdt.exe",
-        L"\\msiexec.exe",
         L"\\odbcconf.exe",
         L"\\pcalua.exe",
         L"\\pcwrun.exe",
@@ -4129,9 +4142,15 @@ BepIsLolBin(
         return FALSE;
     }
 
-    for (UINT32 i = 0; lolbins[i] != NULL; i++) {
-        if (wcsstr(ImagePath, lolbins[i]) != NULL) {
-            return TRUE;
+    {
+        const SIZE_T pathLen = wcslen(ImagePath);
+
+        for (UINT32 i = 0; lolbins[i] != NULL; i++) {
+            SIZE_T patLen = wcslen(lolbins[i]);
+            if (pathLen >= patLen &&
+                _wcsnicmp(ImagePath + pathLen - patLen, lolbins[i], patLen) == 0) {
+                return TRUE;
+            }
         }
     }
 
@@ -4166,9 +4185,15 @@ BepIsScriptHost(
         return FALSE;
     }
 
-    for (UINT32 i = 0; scriptHosts[i] != NULL; i++) {
-        if (wcsstr(ImagePath, scriptHosts[i]) != NULL) {
-            return TRUE;
+    {
+        const SIZE_T pathLen = wcslen(ImagePath);
+
+        for (UINT32 i = 0; scriptHosts[i] != NULL; i++) {
+            SIZE_T patLen = wcslen(scriptHosts[i]);
+            if (pathLen >= patLen &&
+                _wcsnicmp(ImagePath + pathLen - patLen, scriptHosts[i], patLen) == 0) {
+                return TRUE;
+            }
         }
     }
 
