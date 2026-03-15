@@ -639,6 +639,17 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 PMS_SCANNER
 ShadowStrikeGetMemoryScanner(VOID);
 
+typedef struct _ADB_PROTECTOR ADB_PROTECTOR, *PADB_PROTECTOR;
+
+/**
+ * @brief Get the global anti-debug protector instance.
+ * @return PADB_PROTECTOR or NULL if not initialized.
+ * @note Callers use AdbCheckForDebugger/AdbCheckForHypervisor/AdbGetStatistics.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+PADB_PROTECTOR
+ShadowStrikeGetAntiDebugProtector(VOID);
+
 #ifdef __cplusplus
 }
 #endif
