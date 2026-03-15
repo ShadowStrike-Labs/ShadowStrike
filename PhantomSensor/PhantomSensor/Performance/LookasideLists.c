@@ -147,6 +147,10 @@ LlpCheckMemoryPressure(
     _In_ PLL_MANAGER Manager
     );
 
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, LlpCheckMemoryPressure)
+#endif
+
 // ============================================================================
 // INTERNAL LOCK-FREE REFERENCE COUNTING HELPERS
 // ============================================================================
@@ -1031,6 +1035,24 @@ LlFree(
     );
 
     if (State == LlStateDestroyed || State == LlStateUninitialized) {
+        //
+        // Native list is gone — free directly to pool to prevent leak.
+        //
+        ExFreePoolWithTag(Block, Lookaside->Tag);
+        return;
+    }
+
+    //
+    // If the list is suspended (LlTrimCaches reiniting the native list)
+    // or destroying, free directly to pool to avoid touching the native
+    // SLIST which may be in an intermediate state.
+    //
+    if (State != LlStateActive) {
+        ExFreePoolWithTag(Block, Lookaside->Tag);
+        LL_STATS_FREE(Lookaside);
+        if (Lookaside->Manager) {
+            LL_TRACK_FREE(Lookaside->Manager, Lookaside->EntrySize);
+        }
         return;
     }
 
@@ -1076,12 +1098,29 @@ LlSecureFree(
     );
 
     if (State == LlStateDestroyed || State == LlStateUninitialized) {
+        //
+        // Native list is gone — securely wipe and free to pool.
+        //
+        RtlSecureZeroMemory(Block, Lookaside->EntrySize);
+        ExFreePoolWithTag(Block, Lookaside->Tag);
         return;
     }
 
     RtlSecureZeroMemory(Block, Lookaside->EntrySize);
 
     InterlockedIncrement64(&Lookaside->Stats.SecureFrees);
+
+    //
+    // If the list is suspended or destroying, free directly to pool.
+    //
+    if (State != LlStateActive) {
+        ExFreePoolWithTag(Block, Lookaside->Tag);
+        LL_STATS_FREE(Lookaside);
+        if (Lookaside->Manager) {
+            LL_TRACK_FREE(Lookaside->Manager, Lookaside->EntrySize);
+        }
+        return;
+    }
 
     if (Lookaside->IsPaged) {
         ExFreeToPagedLookasideList(&Lookaside->NativeList.Paged, Block);
@@ -1294,9 +1333,12 @@ LlRegisterPressureCallback(
     }
 
     //
-    // Write callback pointer atomically to prevent torn reads from DPC
+    // Write context FIRST with an interlocked store, then the callback pointer.
+    // The reader (LlpCheckMemoryPressure) reads callback first — if it sees the
+    // new callback, the context store is already globally visible due to the
+    // release semantics of InterlockedExchangePointer.
     //
-    Manager->PressureCallbackContext = Context;
+    InterlockedExchangePointer((PVOID*)&Manager->PressureCallbackContext, (PVOID)Context);
     InterlockedExchangePointer((PVOID*)&Manager->PressureCallback, (PVOID)Callback);
 
     ExReleaseRundownProtection(&Manager->RundownRef);
@@ -1423,10 +1465,20 @@ LlTrimCaches(
         }
 
         //
-        // Suspend the list to prevent racing allocations during reinit.
-        // Any allocation attempt seeing LlStateSuspended will fail gracefully.
+        // Suspend the list to prevent NEW allocations during reinit.
+        // LlFree/LlSecureFree will free directly to pool when Suspended.
+        // LlAllocateEx will return NULL when State != Active.
         //
         InterlockedExchange((volatile LONG*)&Lookaside->State, LlStateSuspended);
+
+        //
+        // Full memory barrier: ensure the Suspended write is globally visible.
+        // In-flight LlAllocate that already passed State==Active are in a
+        // fast SLIST pop (nanoseconds). LlFree paths that already passed
+        // Active check will push to the SLIST which is safe — ExDelete
+        // will drain them. The barrier ensures no new operations start.
+        //
+        KeMemoryBarrier();
 
         //
         // Delete and reinitialize the native lookaside list.
@@ -1890,6 +1942,8 @@ LlpCheckMemoryPressure(
     LONG64 Limit;
     ULONG UsagePercent;
 
+    PAGED_CODE();
+
     Limit = InterlockedCompareExchange64(&Manager->MemoryLimit, 0, 0);
 
     if (Limit <= 0) {
@@ -1928,19 +1982,26 @@ LlpCheckMemoryPressure(
     }
 
     if (NewPressure != OldPressure) {
+        LL_PRESSURE_CALLBACK Callback;
+        PVOID CallbackContext;
+
         InterlockedExchange((volatile LONG*)&Manager->PressureLevel, (LONG)NewPressure);
         InterlockedIncrement64(&Manager->GlobalStats.MemoryPressureEvents);
 
         //
-        // Invoke pressure callback directly — callers are already at PASSIVE_LEVEL
-        // (TimerManager uses TmFlag_WorkItemCallback; LlSetMemoryLimit is PASSIVE).
+        // Read callback pointer atomically — must pair with the
+        // InterlockedExchangePointer writes in LlRegisterPressureCallback.
+        // Read callback FIRST (if non-NULL, context is already visible).
         //
-        if (Manager->PressureCallback != NULL && LlManagerIsValid(Manager)) {
-            Manager->PressureCallback(
+        Callback = (LL_PRESSURE_CALLBACK)ReadPointerNoFence((PVOID*)&Manager->PressureCallback);
+        CallbackContext = ReadPointerNoFence((PVOID*)&Manager->PressureCallbackContext);
+
+        if (Callback != NULL && LlManagerIsValid(Manager)) {
+            Callback(
                 NewPressure,
                 CurrentUsage,
                 Limit,
-                Manager->PressureCallbackContext
+                CallbackContext
             );
         }
     }
