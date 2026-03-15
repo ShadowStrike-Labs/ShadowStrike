@@ -685,6 +685,17 @@ _IRQL_requires_max_(APC_LEVEL)
 PFP_ENGINE
 ShadowStrikeGetFileProtectionEngine(VOID);
 
+/**
+ * @brief Get handle protection engine instance.
+ *        Used by ObjectCallback for deep handle abuse analysis,
+ *        and ProcessNotify for per-process context cleanup.
+ */
+typedef struct _HP_PROTECTION_ENGINE HP_PROTECTION_ENGINE, *PHP_PROTECTION_ENGINE;
+
+_IRQL_requires_max_(APC_LEVEL)
+PHP_PROTECTION_ENGINE
+ShadowStrikeGetHandleProtection(VOID);
+
 #ifdef __cplusplus
 }
 #endif

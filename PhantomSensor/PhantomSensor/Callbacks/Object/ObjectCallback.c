@@ -67,6 +67,7 @@
 #include "../Process/ProcessRelationship.h"
 #include "ThreadProtection.h"
 #include "../../Performance/ResourceThrottling.h"
+#include "../../SelfProtection/HandleProtection.h"
 
 #ifdef WPP_TRACING
 #include "ObjectCallback.tmh"
@@ -881,6 +882,19 @@ ShadowStrikeProcessPreCallback(
         );
 
     //
+    // HandleProtection deep analysis — per-process forensic tracking, event
+    // history recording, suspicion scoring, and detection callback notification.
+    // Uses OriginalDesiredAccess internally for callback-order-independent detection.
+    //
+    {
+        PHP_PROTECTION_ENGINE hpEngine = ShadowStrikeGetHandleProtection();
+        if (hpEngine != NULL) {
+            HP_DETECTION_RESULT hpResult;
+            (VOID)HpAnalyzeHandleOperation(hpEngine, OperationInformation, &hpResult);
+        }
+    }
+
+    //
     // Record handle duplication in HandleTracker for cross-process forensics.
     // Only duplicate operations are recorded — not creates, which are expected.
     //
@@ -1183,6 +1197,19 @@ ShadowStrikeThreadPreCallback(
         originalAccess,
         (strippedAccess != 0)
         );
+
+    //
+    // HandleProtection deep analysis — per-process forensic tracking, event
+    // history recording, and detection callback notification for thread handles.
+    // Thread handle operations are analyzed for injection precursors (T1055).
+    //
+    {
+        PHP_PROTECTION_ENGINE hpEngine = ShadowStrikeGetHandleProtection();
+        if (hpEngine != NULL) {
+            HP_DETECTION_RESULT hpResult;
+            (VOID)HpAnalyzeHandleOperation(hpEngine, OperationInformation, &hpResult);
+        }
+    }
 
     //
     // Record thread handle duplication in HandleTracker for cross-process

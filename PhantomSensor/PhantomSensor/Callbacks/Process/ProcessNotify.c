@@ -119,6 +119,10 @@ typedef struct _CT_TRACKER CT_TRACKER, *PCONNECTION_TRACKER;
 VOID CtProcessTerminated(_In_ PCONNECTION_TRACKER Tracker, _In_ HANDLE ProcessId);
 struct _CT_TRACKER* NfFilterGetConnectionTracker(VOID);
 
+// HandleProtection forward-declare (avoid pulling SelfProtection headers
+// which would introduce cross-subsystem header coupling)
+VOID HpProcessTerminated(_In_ PHP_PROTECTION_ENGINE Engine, _In_ HANDLE ProcessId);
+
 typedef struct _DX_DETECTOR DX_DETECTOR, *PDX_DETECTOR;
 VOID DxProcessTerminated(_In_ PDX_DETECTOR Detector, _In_ HANDLE ProcessId);
 struct _DX_DETECTOR* NfFilterGetDxDetector(VOID);
@@ -3833,6 +3837,18 @@ PnpHandleProcessTermination(
         PDNS_MONITOR dnsMon = NfFilterGetDnsMonitor();
         if (dnsMon != NULL) {
             DnsProcessTerminated(dnsMon, ProcessId);
+        }
+    }
+
+    //
+    // Remove HandleProtection per-process tracking for this process.
+    // Prevents HP_PROCESS_CONTEXT accumulation (~256 bytes + handle entries each)
+    // and ensures stale EPROCESS refs don't survive PID recycle.
+    //
+    {
+        PHP_PROTECTION_ENGINE hpEngine = ShadowStrikeGetHandleProtection();
+        if (hpEngine != NULL) {
+            HpProcessTerminated(hpEngine, ProcessId);
         }
     }
 

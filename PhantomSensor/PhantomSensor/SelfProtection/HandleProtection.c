@@ -51,6 +51,7 @@
 #include "../Behavioral/BehaviorEngine.h"
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
+#include "../ETW/TelemetryEvents.h"
 
 // ============================================================================
 // SYSTEM STRUCTURES (for ZwQuerySystemInformation process enumeration)
@@ -670,15 +671,22 @@ HpAnalyzeHandleOperation(
     //
     // Get requested access
     //
+    //
+    // Read OriginalDesiredAccess for analysis (immutable, callback-order-independent).
+    // Read DesiredAccess for stripping baseline (reflects prior callbacks' stripping).
+    // This ensures HandleProtection detects the original attack pattern regardless of
+    // callback registration order, while only further restricting — never widening — access.
+    //
     if (OperationInfo->Operation == OB_OPERATION_HANDLE_CREATE) {
-        requestedAccess = OperationInfo->Parameters->CreateHandleInformation.DesiredAccess;
+        requestedAccess = OperationInfo->Parameters->CreateHandleInformation.OriginalDesiredAccess;
+        modifiedAccess = OperationInfo->Parameters->CreateHandleInformation.DesiredAccess;
     } else {
-        requestedAccess = OperationInfo->Parameters->DuplicateHandleInformation.DesiredAccess;
+        requestedAccess = OperationInfo->Parameters->DuplicateHandleInformation.OriginalDesiredAccess;
+        modifiedAccess = OperationInfo->Parameters->DuplicateHandleInformation.DesiredAccess;
         flags |= HpSuspicion_DuplicatedHandle;
     }
 
     Result->OriginalAccess = requestedAccess;
-    modifiedAccess = requestedAccess;
 
     //
     // Skip self-access
@@ -840,6 +848,35 @@ HpAnalyzeHandleOperation(
                 FALSE,
                 NULL
                 );
+
+            //
+            // Structured telemetry: handle abuse tamper attempt.
+            // TargetAddress carries the target PID for SOC correlation.
+            //
+            TeLogTamperAttempt(
+                Tamper_HandleAccess,
+                HandleToULong(callerProcessId),
+                Component_SelfProtection,
+                (UINT64)(ULONG_PTR)targetProcessId,
+                Result->AccessModified,
+                L"Suspicious cross-process handle operation"
+                );
+
+            //
+            // If targeting LSASS, emit credential access telemetry (T1003).
+            // LSASS memory read is the primary vector for credential dumping
+            // tools like Mimikatz, comsvcs.dll MiniDump, and PPLdump.
+            //
+            if (flags & HpSuspicion_CredentialAccess) {
+                TeLogCredentialAccess(
+                    HandleToULong(callerProcessId),
+                    HandleToULong(targetProcessId),
+                    CredAccess_LSASSRead,
+                    requestedAccess,
+                    (UINT32)suspicionScore,
+                    Result->AccessModified
+                    );
+            }
         }
     }
 

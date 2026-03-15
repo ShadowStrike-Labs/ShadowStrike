@@ -3298,6 +3298,13 @@ ShadowStrikeGetFileProtectionEngine(VOID)
     return g_FileProtectionEngine;
 }
 
+_IRQL_requires_max_(APC_LEVEL)
+PHP_PROTECTION_ENGINE
+ShadowStrikeGetHandleProtection(VOID)
+{
+    return g_HandleProtection;
+}
+
 // ============================================================================
 // VERSION COMPATIBILITY CHECK
 // ============================================================================
