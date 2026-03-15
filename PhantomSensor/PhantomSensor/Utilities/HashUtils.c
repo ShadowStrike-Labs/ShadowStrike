@@ -2147,12 +2147,18 @@ ShadowStrikeHashContextInit(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED) {
+    //
+    // Enter operation to prevent shutdown from closing provider handles
+    // while we call BCryptCreateHash. Once the hash object is created,
+    // it is self-contained and does not reference the provider.
+    //
+    if (!HashiEnterOperation()) {
         return STATUS_UNSUCCESSFUL;
     }
 
     hAlgorithm = HashiGetAlgorithmHandle(Algorithm);
     if (hAlgorithm == NULL) {
+        HashiLeaveOperation(FALSE, Algorithm, 0, FALSE);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -2160,6 +2166,7 @@ ShadowStrikeHashContextInit(
 
     Context->HashObject = (PUCHAR)ShadowStrikeAllocateWithTag(cbHashObject, SHADOWSTRIKE_HASH_OBJ_TAG);
     if (Context->HashObject == NULL) {
+        HashiLeaveOperation(FALSE, Algorithm, 0, FALSE);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -2172,6 +2179,12 @@ ShadowStrikeHashContextInit(
         0,
         0
     );
+
+    //
+    // Provider access complete — leave operation immediately.
+    // The hash object is now self-contained.
+    //
+    HashiLeaveOperation(NT_SUCCESS(Status), Algorithm, 0, FALSE);
 
     if (!NT_SUCCESS(Status)) {
         ShadowStrikeFreePoolWithTag(Context->HashObject, SHADOWSTRIKE_HASH_OBJ_TAG);
@@ -2564,8 +2577,12 @@ ShadowStrikeComputeHmacSha256(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED ||
-        g_HashGlobals.HmacSha256Handle == NULL) {
+    if (!HashiEnterOperation()) {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    if (g_HashGlobals.HmacSha256Handle == NULL) {
+        HashiLeaveOperation(FALSE, ShadowHashAlgorithmSha256, 0, FALSE);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -2575,6 +2592,7 @@ ShadowStrikeComputeHmacSha256(
     );
 
     if (pbHashObject == NULL) {
+        HashiLeaveOperation(FALSE, ShadowHashAlgorithmSha256, 0, FALSE);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -2608,6 +2626,8 @@ Cleanup:
         ShadowStrikeSecureZeroMemory(pbHashObject, g_HashGlobals.HmacSha256ObjectSize);
         ShadowStrikeFreePoolWithTag(pbHashObject, SHADOWSTRIKE_HASH_OBJ_TAG);
     }
+
+    HashiLeaveOperation(NT_SUCCESS(Status), ShadowHashAlgorithmSha256, DataLength, FALSE);
 
     return Status;
 }
