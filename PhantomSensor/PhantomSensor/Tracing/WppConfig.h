@@ -576,8 +576,10 @@ WppGetLevelName(
         LARGE_INTEGER _wppEndTime, _wppFreq; \
         UINT64 _wppElapsedUs; \
         _wppEndTime = KeQueryPerformanceCounter(&_wppFreq); \
-        _wppElapsedUs = (((UINT64)(_wppEndTime.QuadPart - (pLargeInt)->QuadPart)) * 1000000) \
-                        / (UINT64)_wppFreq.QuadPart; \
+        _wppElapsedUs = (_wppFreq.QuadPart > 0) \
+            ? (((UINT64)(_wppEndTime.QuadPart - (pLargeInt)->QuadPart)) * 1000000) \
+              / (UINT64)_wppFreq.QuadPart \
+            : 0; \
         TracePerf(flags, "%s completed in %I64u us", operation, _wppElapsedUs); \
     } while (0)
 

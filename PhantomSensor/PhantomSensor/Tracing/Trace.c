@@ -110,7 +110,6 @@ C_ASSERT(ARRAYSIZE(g_LevelNames) == WPP_LEVEL_NAME_COUNT);
 
 static WPP_TRACE_CONFIG g_TraceConfig = {0};
 static volatile LONG g_TraceInitialized = 0;
-static PDRIVER_OBJECT g_DriverObject = NULL;
 static volatile LONG64 g_CorrelationCounter = 0;
 
 // ============================================================================
@@ -119,6 +118,11 @@ static volatile LONG64 g_CorrelationCounter = 0;
 
 static BOOLEAN
 TracepCheckRateLimit(
+    VOID
+    );
+
+static UCHAR
+TracepComputeMaxLevel(
     VOID
     );
 
@@ -153,8 +157,6 @@ WppTraceInitialize(
         return STATUS_ALREADY_REGISTERED;
     }
 
-    g_DriverObject = DriverObject;
-
     //
     // Initialize WPP infrastructure.
     //
@@ -174,8 +176,8 @@ WppTraceInitialize(
     g_TraceConfig.PerfTracingEnabled      = FALSE;
     g_TraceConfig.SecurityTracingEnabled  = TRUE;
 
-    g_TraceConfig.MinimumLevel = TRACE_LEVEL_INFORMATION;
-    g_TraceConfig.MaximumLevel = TRACE_LEVEL_VERBOSE;
+    g_TraceConfig.MinimumLevel = TRACE_LEVEL_CRITICAL;
+    g_TraceConfig.MaximumLevel = TRACE_LEVEL_AUDIT;
 
     g_TraceConfig.EnabledFlags  = TRACE_FLAG_ALL;
     g_TraceConfig.DisabledFlags = 0;
@@ -252,7 +254,6 @@ WppTraceShutdown(
     UNREFERENCED_PARAMETER(DriverObject);
 #endif
 
-    g_DriverObject = NULL;
     RtlZeroMemory(&g_TraceConfig, sizeof(WPP_TRACE_CONFIG));
 }
 
@@ -491,10 +492,11 @@ WppResetStatistics(
 // EXTENDED TRACING API
 // ============================================================================
 
+_Use_decl_annotations_
 BOOLEAN
 WppShouldTrace(
-    _In_ UCHAR Level,
-    _In_ ULONG Flags
+    UCHAR Level,
+    ULONG Flags
     )
 {
     ULONG EffectiveFlags;
@@ -524,6 +526,7 @@ WppShouldTrace(
     return TRUE;
 }
 
+_Use_decl_annotations_
 VOID
 WppRecordTrace(
     VOID
@@ -535,6 +538,7 @@ WppRecordTrace(
     }
 }
 
+_Use_decl_annotations_
 VOID
 WppRecordError(
     VOID
@@ -545,6 +549,7 @@ WppRecordError(
     }
 }
 
+_Use_decl_annotations_
 UINT64
 WppGetSequenceNumber(
     VOID
@@ -557,9 +562,10 @@ WppGetSequenceNumber(
         &g_TraceConfig.SequenceNumber, 0, 0);
 }
 
+_Use_decl_annotations_
 NTSTATUS
 WppGetSessionGuid(
-    _Out_ PGUID SessionGuid
+    PGUID SessionGuid
     )
 {
     if (SessionGuid == NULL) {
@@ -579,9 +585,41 @@ WppGetSessionGuid(
 // CONDITIONAL TRACING HELPERS
 // ============================================================================
 
+/**
+ * @brief Compute the correct MaximumLevel based on current tracing settings.
+ *
+ * Production base is TRACE_LEVEL_AUDIT — always admits security/audit events
+ * regardless of SecurityTracingEnabled (which controls via FLAGS, not levels).
+ * This ensures audit trail events from non-security components remain visible.
+ *
+ * Debug and perf tracing raise the ceiling when explicitly enabled.
+ *
+ * Note: Concurrent setter calls may produce transiently stale MaximumLevel.
+ * This is acceptable — setters are management-path, not hot-path, and the
+ * worst outcome is one extra or missed trace during a configuration change.
+ */
+static UCHAR
+TracepComputeMaxLevel(
+    VOID
+    )
+{
+    UCHAR Max = TRACE_LEVEL_AUDIT;
+
+    if (g_TraceConfig.DebugTracingEnabled && TRACE_LEVEL_DEBUG > Max) {
+        Max = TRACE_LEVEL_DEBUG;
+    }
+
+    if (g_TraceConfig.PerfTracingEnabled && TRACE_LEVEL_PERF > Max) {
+        Max = TRACE_LEVEL_PERF;
+    }
+
+    return Max;
+}
+
+_Use_decl_annotations_
 VOID
 WppSetDebugTracing(
-    _In_ BOOLEAN Enable
+    BOOLEAN Enable
     )
 {
     if (!g_TraceInitialized) {
@@ -589,12 +627,13 @@ WppSetDebugTracing(
     }
 
     g_TraceConfig.DebugTracingEnabled = Enable;
-    g_TraceConfig.MaximumLevel = Enable ? TRACE_LEVEL_DEBUG : TRACE_LEVEL_VERBOSE;
+    g_TraceConfig.MaximumLevel = TracepComputeMaxLevel();
 }
 
+_Use_decl_annotations_
 VOID
 WppSetPerfTracing(
-    _In_ BOOLEAN Enable
+    BOOLEAN Enable
     )
 {
     if (!g_TraceInitialized) {
@@ -603,11 +642,13 @@ WppSetPerfTracing(
 
     g_TraceConfig.PerfTracingEnabled = Enable;
     WppSetTraceFlags(TRACE_FLAG_PERF, Enable);
+    g_TraceConfig.MaximumLevel = TracepComputeMaxLevel();
 }
 
+_Use_decl_annotations_
 VOID
 WppSetSecurityTracing(
-    _In_ BOOLEAN Enable
+    BOOLEAN Enable
     )
 {
     if (!g_TraceInitialized) {
@@ -616,8 +657,10 @@ WppSetSecurityTracing(
 
     g_TraceConfig.SecurityTracingEnabled = Enable;
     WppSetTraceFlags(TRACE_FLAG_SECURITY_ALL, Enable);
+    g_TraceConfig.MaximumLevel = TracepComputeMaxLevel();
 }
 
+_Use_decl_annotations_
 BOOLEAN
 WppIsDebugTracingEnabled(
     VOID
@@ -626,6 +669,7 @@ WppIsDebugTracingEnabled(
     return g_TraceInitialized ? g_TraceConfig.DebugTracingEnabled : FALSE;
 }
 
+_Use_decl_annotations_
 BOOLEAN
 WppIsPerfTracingEnabled(
     VOID
@@ -634,6 +678,7 @@ WppIsPerfTracingEnabled(
     return g_TraceInitialized ? g_TraceConfig.PerfTracingEnabled : FALSE;
 }
 
+_Use_decl_annotations_
 BOOLEAN
 WppIsSecurityTracingEnabled(
     VOID
@@ -646,9 +691,10 @@ WppIsSecurityTracingEnabled(
 // FUNCTIONS ABSORBED FROM WppConfig.c
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 WppGetConfiguration(
-    _Out_ PWPP_TRACE_CONFIG Config
+    PWPP_TRACE_CONFIG Config
     )
 {
     if (Config == NULL) {
@@ -669,9 +715,10 @@ WppGetConfiguration(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 UINT64
 WppGetElapsedMicroseconds(
-    _In_ PWPP_TRACE_CONTEXT Context
+    PWPP_TRACE_CONTEXT Context
     )
 {
     if (Context == NULL) {
@@ -689,11 +736,12 @@ WppGetElapsedMicroseconds(
     return (Context->EndTimestamp - Context->StartTimestamp) / 10;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 WppFormatCorrelationId(
-    _In_ UINT64 CorrelationId,
-    _Out_writes_(BufferSize) PWCHAR Buffer,
-    _In_ SIZE_T BufferSize
+    UINT64 CorrelationId,
+    PWCHAR Buffer,
+    SIZE_T BufferSize
     )
 {
     if (Buffer == NULL || BufferSize < 20) {
@@ -723,11 +771,12 @@ TracepSafeStrLenA(
     return (ULONG)Length;
 }
 
+_Use_decl_annotations_
 ULONG
 WppFormatStatus(
-    _In_ NTSTATUS Status,
-    _Out_writes_(BufferSize) PCHAR Buffer,
-    _In_ ULONG BufferSize
+    NTSTATUS Status,
+    PCHAR Buffer,
+    ULONG BufferSize
     )
 {
     NTSTATUS FormatStatus;
@@ -745,11 +794,12 @@ WppFormatStatus(
     return TracepSafeStrLenA(Buffer, BufferSize);
 }
 
+_Use_decl_annotations_
 ULONG
 WppFormatGuid(
-    _In_ PGUID Guid,
-    _Out_writes_(BufferSize) PCHAR Buffer,
-    _In_ ULONG BufferSize
+    PGUID Guid,
+    PCHAR Buffer,
+    ULONG BufferSize
     )
 {
     NTSTATUS Status;
@@ -776,12 +826,13 @@ WppFormatGuid(
     return TracepSafeStrLenA(Buffer, BufferSize);
 }
 
+_Use_decl_annotations_
 ULONG
 WppFormatHexDump(
-    _In_reads_bytes_(DataSize) PVOID Data,
-    _In_ ULONG DataSize,
-    _Out_writes_(BufferSize) PCHAR Buffer,
-    _In_ ULONG BufferSize
+    PVOID Data,
+    ULONG DataSize,
+    PCHAR Buffer,
+    ULONG BufferSize
     )
 {
     PUCHAR Bytes;
@@ -825,11 +876,12 @@ WppFormatHexDump(
     return Offset;
 }
 
+_Use_decl_annotations_
 ULONG
 WppFormatTimestamp(
-    _In_ UINT64 Timestamp,
-    _Out_writes_(BufferSize) PCHAR Buffer,
-    _In_ ULONG BufferSize
+    UINT64 Timestamp,
+    PCHAR Buffer,
+    ULONG BufferSize
     )
 {
     LARGE_INTEGER Time;
@@ -863,9 +915,10 @@ WppFormatTimestamp(
 // NAME LOOKUP FUNCTIONS (moved from inline to avoid array duplication)
 // ============================================================================
 
+_Use_decl_annotations_
 PCSTR
 WppGetComponentName(
-    _In_ WPP_COMPONENT_ID ComponentId
+    WPP_COMPONENT_ID ComponentId
     )
 {
     if ((ULONG)ComponentId >= WppComponent_Max) {
@@ -875,9 +928,10 @@ WppGetComponentName(
     return g_ComponentNames[ComponentId];
 }
 
+_Use_decl_annotations_
 PCSTR
 WppGetLevelName(
-    _In_ UCHAR Level
+    UCHAR Level
     )
 {
     if (Level >= ARRAYSIZE(g_LevelNames)) {
@@ -970,6 +1024,7 @@ TracepGenerateSessionGuid(
 // DIAGNOSTIC DUMP
 // ============================================================================
 
+_Use_decl_annotations_
 VOID
 WppDumpConfiguration(
     VOID
