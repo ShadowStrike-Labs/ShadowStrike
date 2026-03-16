@@ -452,6 +452,22 @@ ObIsInProtectedList(
 // ============================================================================
 
 /**
+ * @brief Invalidate cached well-known PID on process termination.
+ *
+ * Atomically clears cached PIDs (LSASS, CSRSS, Services, Winlogon, SMSS)
+ * matching the given PID to prevent stale PID reuse attacks.
+ *
+ * @param ProcessId PID of the terminated process.
+ *
+ * @irql <= DISPATCH_LEVEL (lock-free atomic operations)
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ObInvalidateCachedPid(
+    _In_ HANDLE ProcessId
+    );
+
+/**
  * @brief Queue telemetry event for delivery to user-mode.
  *
  * @param Event Telemetry event to queue.

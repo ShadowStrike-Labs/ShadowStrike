@@ -1013,6 +1013,10 @@ PpAddProtectedProcess(
         return STATUS_NOT_FOUND;
     }
 
+    if (!ExAcquireRundownProtection(&g_ProcessProtection.RundownRef)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     KeQuerySystemTime(&CurrentTime);
 
     KeEnterCriticalRegion();
@@ -1034,6 +1038,7 @@ PpAddProtectedProcess(
 
             ExReleasePushLockExclusive(&g_ProcessProtection.CacheLock);
             KeLeaveCriticalRegion();
+            ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
             return STATUS_SUCCESS;
         }
     }
@@ -1044,6 +1049,7 @@ PpAddProtectedProcess(
     if (Count >= PP_MAX_CACHED_PROTECTED) {
         ExReleasePushLockExclusive(&g_ProcessProtection.CacheLock);
         KeLeaveCriticalRegion();
+        ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1057,6 +1063,7 @@ PpAddProtectedProcess(
 
     ExReleasePushLockExclusive(&g_ProcessProtection.CacheLock);
     KeLeaveCriticalRegion();
+    ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
 
     return STATUS_SUCCESS;
 }
@@ -1073,6 +1080,10 @@ PpRemoveProtectedProcess(
     LONG LastIndex;
 
     if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&g_ProcessProtection.RundownRef)) {
         return;
     }
 
@@ -1104,6 +1115,7 @@ PpRemoveProtectedProcess(
 
     ExReleasePushLockExclusive(&g_ProcessProtection.CacheLock);
     KeLeaveCriticalRegion();
+    ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
 }
 
 
@@ -1120,6 +1132,10 @@ PpIsProcessProtected(
     BOOLEAN Found = FALSE;
 
     if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
+        return FALSE;
+    }
+
+    if (!ExAcquireRundownProtection(&g_ProcessProtection.RundownRef)) {
         return FALSE;
     }
 
@@ -1144,6 +1160,7 @@ PpIsProcessProtected(
 
     ExReleasePushLockShared(&g_ProcessProtection.CacheLock);
     KeLeaveCriticalRegion();
+    ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
 
     return Found;
 }
@@ -1409,6 +1426,14 @@ PpAddAccessPolicy(
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    if (!ExAcquireRundownProtection(&g_ProcessProtection.RundownRef)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     NewPolicy = (PPP_ACCESS_POLICY)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(PP_ACCESS_POLICY),
@@ -1416,6 +1441,7 @@ PpAddAccessPolicy(
         );
 
     if (NewPolicy == NULL) {
+        ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1432,6 +1458,7 @@ PpAddAccessPolicy(
         if (Policy->ImageName.MaximumLength < Policy->ImageName.Length ||
             Policy->ImageName.MaximumLength > 32768) {  // Reasonable max
             ShadowStrikeFreePoolWithTag(NewPolicy, PP_POLICY_TAG);
+            ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
             return STATUS_INVALID_PARAMETER;
         }
 
@@ -1443,6 +1470,7 @@ PpAddAccessPolicy(
 
         if (NewPolicy->ImageName.Buffer == NULL) {
             ShadowStrikeFreePoolWithTag(NewPolicy, PP_POLICY_TAG);
+            ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -1465,6 +1493,7 @@ PpAddAccessPolicy(
 
     ExReleasePushLockExclusive(&g_ProcessProtection.PolicyLock);
     KeLeaveCriticalRegion();
+    ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
 
     return STATUS_SUCCESS;
 }
@@ -1483,6 +1512,14 @@ PpRemovePoliciesForCategory(
     ULONG WalkCount = 0;
 
     PAGED_CODE();
+
+    if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&g_ProcessProtection.RundownRef)) {
+        return;
+    }
 
     InitializeListHead(&RemoveList);
 
@@ -1522,6 +1559,8 @@ PpRemovePoliciesForCategory(
         }
         ShadowStrikeFreePoolWithTag(Policy, PP_POLICY_TAG);
     }
+
+    ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
 }
 
 
@@ -1553,6 +1592,14 @@ Routine Description:
     ULONG WalkCount = 0;
 
     if (Context == NULL || OutPolicy == NULL) {
+        return FALSE;
+    }
+
+    if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
+        return FALSE;
+    }
+
+    if (!ExAcquireRundownProtection(&g_ProcessProtection.RundownRef)) {
         return FALSE;
     }
 
@@ -1634,6 +1681,7 @@ Routine Description:
 
     ExReleasePushLockShared(&g_ProcessProtection.PolicyLock);
     KeLeaveCriticalRegion();
+    ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
 
     return (BestMatch != NULL);
 }
@@ -2199,6 +2247,10 @@ PpTrackActivity(
         return;
     }
 
+    if (!ExAcquireRundownProtection(&g_ProcessProtection.RundownRef)) {
+        return;
+    }
+
     Tracker = PppFindOrCreateActivityTracker(SourceProcessId);
     if (Tracker != NULL) {
         PppUpdateActivityTracker(Tracker, TargetProcessId, IsSuspicious);
@@ -2208,6 +2260,8 @@ PpTrackActivity(
         //
         PppDereferenceTracker(Tracker);
     }
+
+    ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
 }
 
 
@@ -2224,6 +2278,10 @@ PpIsSourceRateLimited(
     ULONG WalkCount = 0;
 
     if (!g_ProcessProtection.Config.EnableRateLimiting) {
+        return FALSE;
+    }
+
+    if (!ExAcquireRundownProtection(&g_ProcessProtection.RundownRef)) {
         return FALSE;
     }
 
@@ -2252,6 +2310,7 @@ PpIsSourceRateLimited(
 
     ExReleasePushLockShared(&g_ProcessProtection.ActivityLock);
     KeLeaveCriticalRegion();
+    ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
 
     return IsLimited;
 }
@@ -2278,6 +2337,14 @@ Routine Description:
     PPP_ACTIVITY_TRACKER Tracker = NULL;
 
     PAGED_CODE();
+
+    if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&g_ProcessProtection.RundownRef)) {
+        return;
+    }
 
     HashIndex = PppHashProcessId(ProcessId) % PP_ACTIVITY_HASH_SIZE;
 
@@ -2314,6 +2381,8 @@ Routine Description:
     if (Tracker != NULL) {
         PppDereferenceTracker(Tracker);
     }
+
+    ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
 }
 
 
@@ -2334,6 +2403,10 @@ PpProtGetStatistics(
         return STATUS_NOT_FOUND;
     }
 
+    if (!ExAcquireRundownProtection(&g_ProcessProtection.RundownRef)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     if (TotalOperations != NULL) {
         *TotalOperations = (ULONG64)ReadNoFence64((volatile LONG64*)&g_ProcessProtection.Stats.TotalOperations);
     }
@@ -2346,6 +2419,8 @@ PpProtGetStatistics(
     if (InjectionAttempts != NULL) {
         *InjectionAttempts = (ULONG64)ReadNoFence64((volatile LONG64*)&g_ProcessProtection.Stats.InjectionAttempts);
     }
+
+    ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
 
     return STATUS_SUCCESS;
 }

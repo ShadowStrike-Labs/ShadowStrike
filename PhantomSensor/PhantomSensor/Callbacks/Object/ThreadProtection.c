@@ -320,6 +320,7 @@ TpShutdownThreadProtection(
     LARGE_INTEGER timeout;
     KIRQL oldIrql;
     LONG refCount;
+    BOOLEAN lookasideWasActive;
 
     PAGED_CODE();
 
@@ -362,6 +363,15 @@ TpShutdownThreadProtection(
     }
 
     //
+    // Disable lookaside BEFORE freeing trackers.
+    // This ensures TppFreeTracker uses pool free instead of returning to
+    // a lookaside list that is about to be deleted — prevents BSOD if
+    // shutdown drain timed out and in-flight threads call TppAllocateTracker.
+    //
+    lookasideWasActive =
+        (InterlockedCompareExchange(&g_TpState.LookasideInitialized, 0, 1) == 1);
+
+    //
     // Free all activity trackers using bounded free-list pattern.
     // Collect under spinlock, free after release — avoids IRQL issues.
     //
@@ -399,9 +409,9 @@ TpShutdownThreadProtection(
     }
 
     //
-    // Delete lookaside list
+    // Delete lookaside list (already disabled above)
     //
-    if (InterlockedCompareExchange(&g_TpState.LookasideInitialized, 0, 1) == 1) {
+    if (lookasideWasActive) {
         ExDeleteNPagedLookasideList(&g_TpState.TrackerLookaside);
     }
 

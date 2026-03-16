@@ -958,9 +958,12 @@ ShadowStrikeThreadPreCallback(
     BOOLEAN isSourceTrusted = FALSE;
     BOOLEAN isSelf = FALSE;
     BOOLEAN isCrossProcess = FALSE;
+    BOOLEAN isCrossSession = FALSE;
     BOOLEAN isKernelHandle = FALSE;
     BOOLEAN isDuplicate = FALSE;
     ULONG suspicionScore = 0;
+    ULONG sourceSessionId = 0;
+    ULONG targetSessionId = 0;
 
     //
     // Validate initialization state atomically
@@ -1018,6 +1021,17 @@ ShadowStrikeThreadPreCallback(
     // Cross-process thread access
     //
     isCrossProcess = TRUE;
+
+    //
+    // Cross-session detection for threads (mirrors process callback logic).
+    // Cross-session thread handle access is suspicious — indicates lateral
+    // movement or session-hopping attacks (e.g., Session 0 → Session 1).
+    //
+    if (context->EnableCrossSessionMonitoring && !isKernelHandle) {
+        sourceSessionId = PsGetProcessSessionId(sourceProcess);
+        targetSessionId = PsGetProcessSessionId(targetProcess);
+        isCrossSession = (sourceSessionId != targetSessionId);
+    }
 
     //
     // Determine operation type
@@ -1086,7 +1100,7 @@ ShadowStrikeThreadPreCallback(
             originalAccess,
             strippedAccess,
             targetCategory,
-            FALSE,  // Cross-session not applicable for threads
+            isCrossSession,
             isDuplicate
         );
 
@@ -1459,6 +1473,46 @@ ObIsInProtectedList(
 }
 
 // ============================================================================
+// PUBLIC FUNCTIONS - PID CACHE INVALIDATION
+// ============================================================================
+
+_Use_decl_annotations_
+VOID
+ObInvalidateCachedPid(
+    _In_ HANDLE ProcessId
+    )
+/*++
+Routine Description:
+    Atomically clears any cached well-known PID matching the given process ID.
+
+    Called on process termination to prevent stale PID reuse attacks where
+    an attacker creates a process that reuses a terminated system process PID
+    (e.g., LSASS) and gains protected status from the cached PID fast path.
+
+    Uses InterlockedCompareExchange64 so only the matching PID is cleared.
+
+    Thread Safety: Lock-free (all operations are atomic CAS).
+
+Arguments:
+    ProcessId - PID of the terminated process.
+
+--*/
+{
+    LONG64 pid = (LONG64)(ULONG_PTR)ProcessId;
+
+    InterlockedCompareExchange64(
+        (volatile LONG64*)&g_ObCallbackContext.LsassPid, 0, pid);
+    InterlockedCompareExchange64(
+        (volatile LONG64*)&g_ObCallbackContext.CsrssPid, 0, pid);
+    InterlockedCompareExchange64(
+        (volatile LONG64*)&g_ObCallbackContext.ServicesPid, 0, pid);
+    InterlockedCompareExchange64(
+        (volatile LONG64*)&g_ObCallbackContext.WinlogonPid, 0, pid);
+    InterlockedCompareExchange64(
+        (volatile LONG64*)&g_ObCallbackContext.SmsssPid, 0, pid);
+}
+
+// ============================================================================
 // PUBLIC FUNCTIONS - TELEMETRY
 // ============================================================================
 
@@ -1719,24 +1773,22 @@ ObpIsCriticalSystemProcess(
             CHAR imageName[16];
             ObpGetProcessImageFileNameSafe(Process, imageName);
 
-            if (_stricmp(imageName, "csrss.exe") == 0 &&
-                g_ObCallbackContext.CsrssPid == 0) {
-                InterlockedExchange64(
+            if (_stricmp(imageName, "csrss.exe") == 0) {
+                InterlockedCompareExchange64(
                     (volatile LONG64*)&g_ObCallbackContext.CsrssPid,
-                    (LONG64)(ULONG_PTR)processId);
+                    (LONG64)(ULONG_PTR)processId, 0);
             } else if (_stricmp(imageName, "services.exe") == 0) {
-                InterlockedExchange64(
+                InterlockedCompareExchange64(
                     (volatile LONG64*)&g_ObCallbackContext.ServicesPid,
-                    (LONG64)(ULONG_PTR)processId);
-            } else if (_stricmp(imageName, "winlogon.exe") == 0 &&
-                       g_ObCallbackContext.WinlogonPid == 0) {
-                InterlockedExchange64(
+                    (LONG64)(ULONG_PTR)processId, 0);
+            } else if (_stricmp(imageName, "winlogon.exe") == 0) {
+                InterlockedCompareExchange64(
                     (volatile LONG64*)&g_ObCallbackContext.WinlogonPid,
-                    (LONG64)(ULONG_PTR)processId);
+                    (LONG64)(ULONG_PTR)processId, 0);
             } else if (_stricmp(imageName, "smss.exe") == 0) {
-                InterlockedExchange64(
+                InterlockedCompareExchange64(
                     (volatile LONG64*)&g_ObCallbackContext.SmsssPid,
-                    (LONG64)(ULONG_PTR)processId);
+                    (LONG64)(ULONG_PTR)processId, 0);
             }
         }
 
@@ -2318,37 +2370,38 @@ ObpInitializeWellKnownPids(
                     (PUCHAR)currentProcess->ImageName.Buffer + currentProcess->ImageName.Length <= bufferEnd) {
 
                     if (RtlEqualUnicodeString(&currentProcess->ImageName, &lsassName, TRUE)) {
-                        InterlockedExchange64(
+                        InterlockedCompareExchange64(
                             (volatile LONG64*)&g_ObCallbackContext.LsassPid,
-                            (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId
+                            (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId,
+                            0
                         );
                     }
                     else if (RtlEqualUnicodeString(&currentProcess->ImageName, &csrssName, TRUE)) {
-                        if (g_ObCallbackContext.CsrssPid == 0) {
-                            InterlockedExchange64(
-                                (volatile LONG64*)&g_ObCallbackContext.CsrssPid,
-                                (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId
-                            );
-                        }
+                        InterlockedCompareExchange64(
+                            (volatile LONG64*)&g_ObCallbackContext.CsrssPid,
+                            (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId,
+                            0
+                        );
                     }
                     else if (RtlEqualUnicodeString(&currentProcess->ImageName, &servicesName, TRUE)) {
-                        InterlockedExchange64(
+                        InterlockedCompareExchange64(
                             (volatile LONG64*)&g_ObCallbackContext.ServicesPid,
-                            (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId
+                            (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId,
+                            0
                         );
                     }
                     else if (RtlEqualUnicodeString(&currentProcess->ImageName, &winlogonName, TRUE)) {
-                        if (g_ObCallbackContext.WinlogonPid == 0) {
-                            InterlockedExchange64(
-                                (volatile LONG64*)&g_ObCallbackContext.WinlogonPid,
-                                (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId
-                            );
-                        }
+                        InterlockedCompareExchange64(
+                            (volatile LONG64*)&g_ObCallbackContext.WinlogonPid,
+                            (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId,
+                            0
+                        );
                     }
                     else if (RtlEqualUnicodeString(&currentProcess->ImageName, &smssName, TRUE)) {
-                        InterlockedExchange64(
+                        InterlockedCompareExchange64(
                             (volatile LONG64*)&g_ObCallbackContext.SmsssPid,
-                            (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId
+                            (LONG64)(ULONG_PTR)currentProcess->UniqueProcessId,
+                            0
                         );
                     }
                 }
@@ -2468,10 +2521,11 @@ ObpValidateProcessPath(
     //
     if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
         //
-        // Cannot validate at elevated IRQL - allow by default
-        // This is safe because we've already matched by name
+        // Cannot validate at elevated IRQL — fail closed.
+        // A name-matched process without path validation is NOT trusted;
+        // the explicit protected process list provides coverage at all IRQLs.
         //
-        return TRUE;
+        return FALSE;
     }
 
     status = SeLocateProcessImageName(Process, &imagePath);

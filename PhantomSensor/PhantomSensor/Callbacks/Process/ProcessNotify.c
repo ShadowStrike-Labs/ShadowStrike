@@ -3808,6 +3808,13 @@ PnpHandleProcessTermination(
     ObRemoveProtectedProcess(ProcessId);
 
     //
+    // Invalidate cached well-known PIDs for this process.
+    // Prevents PID reuse attacks where a new process inherits LSASS/CSRSS
+    // protected status from the terminated process's cached PID.
+    //
+    ObInvalidateCachedPid(ProcessId);
+
+    //
     // Remove AMSI bypass detector tracking for this process.
     // Prevents tracker leaks and stale entries after PID recycle.
     //
