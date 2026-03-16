@@ -113,14 +113,14 @@ typedef enum _FP_PROTECTION_FLAGS {
     // Protection scope
     //
     FpProtect_Recursive         = 0x00000100,
-    FpProtect_IncludeStreams    = 0x00000200,
-    FpProtect_FollowLinks       = 0x00000400,
+    FpProtect_IncludeStreams    = 0x00000200,   // Evaluated in FpCheckAccess stream path
+    FpProtect_FollowLinks       = 0x00000400,  // Reserved — reparse point traversal (future)
 
     //
     // Audit flags
     //
     FpProtect_AuditOnly         = 0x00001000,
-    FpProtect_AlertOnAccess     = 0x00002000,
+    FpProtect_AlertOnAccess     = 0x00002000,  // Reserved — read-access telemetry (future)
 
     //
     // Convenience combinations
@@ -131,8 +131,8 @@ typedef enum _FP_PROTECTION_FLAGS {
     FpProtect_Full              = FpProtect_BlockWrite | FpProtect_BlockDelete |
                                   FpProtect_BlockRename | FpProtect_BlockSetInfo |
                                   FpProtect_BlockSetSecurity | FpProtect_BlockHardlink |
-                                  FpProtect_BlockStreams | FpProtect_Recursive |
-                                  FpProtect_IncludeStreams
+                                  FpProtect_BlockStreams | FpProtect_BlockExecute |
+                                  FpProtect_Recursive | FpProtect_IncludeStreams
 
 } FP_PROTECTION_FLAGS;
 
@@ -213,6 +213,7 @@ typedef struct _FP_STATISTICS {
     volatile LONG64 BlockedSetSecurity;
     volatile LONG64 BlockedHardlinks;
     volatile LONG64 BlockedStreams;
+    volatile LONG64 BlockedExecutes;
 
     volatile LONG64 AuditEvents;
     volatile LONG64 BypassAttempts;

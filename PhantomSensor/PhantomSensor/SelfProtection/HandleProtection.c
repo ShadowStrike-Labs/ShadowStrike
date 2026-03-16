@@ -479,7 +479,13 @@ HpShutdown(
         entry = RemoveHeadList(&Engine->ProcessList);
         processContext = CONTAINING_RECORD(entry, HP_PROCESS_CONTEXT, ListEntry);
         RemoveEntryList(&processContext->HashEntry);
-        HppFreeProcessContext(Engine, processContext);
+        //
+        // Release list-membership reference. During shutdown, RefCount should
+        // be 1 (no in-flight callers after Initialized=0 + spin drain), so
+        // this frees immediately. If a straggler still holds a ref, the memory
+        // is freed when they release — preventing UAF.
+        //
+        HppReleaseProcessContext(Engine, processContext);
     }
 
     ExReleasePushLockExclusive(&Engine->ProcessHash.Lock);
@@ -749,6 +755,8 @@ HpAnalyzeHandleOperation(
     //
     // Determine if we should modify access
     //
+    ACCESS_MASK preStripAccess = modifiedAccess;
+
     if (localConfig.StripDangerousAccess && targetSensitivity >= HpSensitivity_High) {
         if (isProcess) {
             if (flags & HpSuspicion_TargetLSASS) {
@@ -770,9 +778,11 @@ HpAnalyzeHandleOperation(
     }
 
     //
-    // Apply modifications
+    // Apply modifications — compare against pre-strip baseline, not
+    // OriginalDesiredAccess, to avoid false positives when prior
+    // ObCallbacks already stripped rights before HandleProtection ran.
     //
-    if (modifiedAccess != requestedAccess) {
+    if (modifiedAccess != preStripAccess) {
         if (OperationInfo->Operation == OB_OPERATION_HANDLE_CREATE) {
             OperationInfo->Parameters->CreateHandleInformation.DesiredAccess = modifiedAccess;
         } else {
@@ -1562,7 +1572,11 @@ HpProcessTerminated(
     KeLeaveCriticalRegion();
 
     if (processContext != NULL) {
-        HppFreeProcessContext(Engine, processContext);
+        //
+        // Release the list-membership reference. Actual freeing is deferred
+        // until the last holder (e.g., concurrent ObCallback) releases.
+        //
+        HppReleaseProcessContext(Engine, processContext);
     }
 
     //
@@ -1606,7 +1620,7 @@ HpFlushAllTracking(
         entry = RemoveHeadList(&Engine->ProcessList);
         processContext = CONTAINING_RECORD(entry, HP_PROCESS_CONTEXT, ListEntry);
         RemoveEntryList(&processContext->HashEntry);
-        HppFreeProcessContext(Engine, processContext);
+        HppReleaseProcessContext(Engine, processContext);
     }
 
     Engine->Stats.TrackedProcesses = 0;

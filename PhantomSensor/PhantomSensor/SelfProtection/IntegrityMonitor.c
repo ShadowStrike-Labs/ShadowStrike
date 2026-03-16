@@ -59,6 +59,10 @@ v2.1.0 Changes (Enterprise Hardened):
 #include <ntstrsafe.h>
 #include <bcrypt.h>
 
+#ifndef IMAGE_SCN_MEM_DISCARDABLE
+#define IMAGE_SCN_MEM_DISCARDABLE 0x02000000
+#endif
+
 // ============================================================================
 // PAGED CODE SEGMENT DECLARATIONS
 // ============================================================================
@@ -222,6 +226,7 @@ typedef struct _IM_SECTION_BASELINE {
     UCHAR   Hash[IM_HASH_SIZE];
     BOOLEAN IsExecutable;
     BOOLEAN IsWritable;
+    BOOLEAN IsDiscardable;
 } IM_SECTION_BASELINE, *PIM_SECTION_BASELINE;
 
 // Internal monitor structure (extends public IM_MONITOR)
@@ -571,6 +576,15 @@ ImpParseDriverImage(
             (Section->Characteristics & IMAGE_SCN_MEM_WRITE) != 0
         );
 
+        //
+        // Skip INIT and other discardable sections — the OS frees their
+        // physical pages after DriverEntry returns (MmFreeDriverInitialization).
+        // Hashing freed memory causes BSOD or perpetual false positives.
+        //
+        Baseline->IsDiscardable = (BOOLEAN)(
+            (Section->Characteristics & IMAGE_SCN_MEM_DISCARDABLE) != 0
+        );
+
         // FIX #12: Validate section RVA + size doesn't exceed image bounds
         SIZE_T SectionEnd = (SIZE_T)Section->VirtualAddress + (SIZE_T)Section->Misc.VirtualSize;
         if (SectionEnd > DriverSize || SectionEnd < (SIZE_T)Section->VirtualAddress) {
@@ -626,7 +640,7 @@ ImpComputeBaseline(
         PIM_SECTION_BASELINE Baseline = &Monitor->Sections[i];
 
         // Skip writable sections (they change at runtime)
-        if (Baseline->IsWritable) {
+        if (Baseline->IsWritable || Baseline->IsDiscardable) {
             continue;
         }
 
@@ -692,8 +706,8 @@ ImpVerifySectionIntegrity(
 
     Baseline = &Monitor->Sections[SectionIndex];
 
-    // Skip writable sections
-    if (Baseline->IsWritable || Baseline->VirtualSize == 0) {
+    // Skip writable or discardable sections (INIT pages freed after DriverEntry)
+    if (Baseline->IsWritable || Baseline->IsDiscardable || Baseline->VirtualSize == 0) {
         return STATUS_SUCCESS;
     }
 
@@ -840,7 +854,8 @@ ImpCheckComponent(
     {
         // Verify all non-writable, executable sections
         for (ULONG i = 0; i < Monitor->NumberOfSections; i++) {
-            if (!Monitor->Sections[i].IsExecutable || Monitor->Sections[i].IsWritable) {
+            if (!Monitor->Sections[i].IsExecutable || Monitor->Sections[i].IsWritable ||
+                Monitor->Sections[i].IsDiscardable) {
                 continue;
             }
 
@@ -896,7 +911,8 @@ ImpCheckComponent(
     {
         // Verify non-writable, non-executable sections
         for (ULONG i = 0; i < Monitor->NumberOfSections; i++) {
-            if (Monitor->Sections[i].IsExecutable || Monitor->Sections[i].IsWritable) {
+            if (Monitor->Sections[i].IsExecutable || Monitor->Sections[i].IsWritable ||
+                Monitor->Sections[i].IsDiscardable) {
                 continue;
             }
             if (Monitor->Sections[i].VirtualSize == 0) {

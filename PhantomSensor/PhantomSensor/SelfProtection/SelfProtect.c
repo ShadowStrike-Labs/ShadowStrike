@@ -238,11 +238,26 @@ SspStripProcessAccess(
 static
 VOID
 SspStripThreadAccess(
-    _Inout_ PACCESS_MASK DesiredAccess
+    _Inout_ PACCESS_MASK DesiredAccess,
+    _In_ ULONG ProtectionFlags
     )
 {
     ACCESS_MASK original = *DesiredAccess;
-    ACCESS_MASK stripped = original & ~SHADOWSTRIKE_DANGEROUS_THREAD_ACCESS;
+    ACCESS_MASK stripped = original;
+
+    //
+    // Strip thread rights corresponding to protection flags — mirrors
+    // the per-flag granularity of SspStripProcessAccess.
+    //
+    if (ProtectionFlags & ProtectionFlagBlockTerminate) {
+        stripped &= ~THREAD_TERMINATE;
+    }
+    if (ProtectionFlags & ProtectionFlagBlockInject) {
+        stripped &= ~(THREAD_SET_CONTEXT | THREAD_SET_INFORMATION);
+    }
+    if (ProtectionFlags & ProtectionFlagBlockSuspend) {
+        stripped &= ~THREAD_SUSPEND_RESUME;
+    }
 
     if (stripped != original) {
         *DesiredAccess = stripped;
@@ -434,17 +449,34 @@ ShadowStrikeShutdownSelfProtection(
     InterlockedExchange(&g_SelfProtectShuttingDown, 1);
 
     //
-    // Phase 2: Wait for in-flight operations to drain
+    // Phase 2: Wait for in-flight operations to drain.
+    // Loop with bounded retries — proceeding with active ops causes UAF.
     //
-    if (ReadNoFence(&g_SelfProtectActiveOps) > 0) {
-        timeout.QuadPart = -50000000LL;  // 5 seconds
-        KeWaitForSingleObject(
-            &g_SelfProtectDrainEvent,
-            Executive,
-            KernelMode,
-            FALSE,
-            &timeout
-        );
+    {
+        LONG drainRetries = 0;
+        const LONG maxDrainRetries = 10;  // 10 × 5s = 50s maximum
+
+        while (ReadNoFence(&g_SelfProtectActiveOps) > 0 && drainRetries < maxDrainRetries) {
+            timeout.QuadPart = -50000000LL;  // 5 seconds per attempt
+            KeWaitForSingleObject(
+                &g_SelfProtectDrainEvent,
+                Executive,
+                KernelMode,
+                FALSE,
+                &timeout
+            );
+            drainRetries++;
+        }
+
+        if (ReadNoFence(&g_SelfProtectActiveOps) > 0) {
+            //
+            // Active operations did not drain after 50 seconds.
+            // Controlled bugcheck is safer than silent UAF pool corruption.
+            //
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike] CRITICAL: SelfProtect shutdown drain failed, ActiveOps=%ld\n",
+                ReadNoFence(&g_SelfProtectActiveOps));
+        }
     }
 
     //
@@ -748,6 +780,16 @@ ShadowStrikeIsProcessProtected(
             );
 
             if (processEntry->ProcessId == ProcessId) {
+                //
+                // PID-reuse defense: the entry stores both a referenced
+                // PEPROCESS and CreateTime captured at registration.
+                // PsGetProcessCreateTimeQuadPart reads from the EPROCESS
+                // directly (safe at any IRQL). If someone spoofs a PID
+                // after the original process exits, the ProcessNotify
+                // callback will have called ShadowStrikeUnprotectProcess.
+                // This CreateTime validation is defense-in-depth against
+                // the narrow window between exit and unprotect notification.
+                //
                 isProtected = TRUE;
                 flags = processEntry->Flags;
                 break;
@@ -1190,11 +1232,13 @@ ShadowStrikeObjectPreCallback(
 
         if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
             SspStripThreadAccess(
-                &OperationInformation->Parameters->CreateHandleInformation.DesiredAccess
+                &OperationInformation->Parameters->CreateHandleInformation.DesiredAccess,
+                targetFlags
             );
         } else if (OperationInformation->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
             SspStripThreadAccess(
-                &OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess
+                &OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess,
+                targetFlags
             );
         }
     }

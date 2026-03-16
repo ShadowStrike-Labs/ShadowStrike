@@ -69,11 +69,16 @@ static const UNICODE_STRING g_EspPaths[] = {
     RTL_CONSTANT_STRING(L"\\EFI\\"),
     RTL_CONSTANT_STRING(L"\\EFI\\Microsoft\\Boot\\"),
     RTL_CONSTANT_STRING(L"\\EFI\\Boot\\"),
-    RTL_CONSTANT_STRING(L"\\Boot\\BCD"),
 };
 
 #define FI_ESP_PATH_COUNT \
     (sizeof(g_EspPaths) / sizeof(g_EspPaths[0]))
+
+//
+// BCD path — only matched on volume roots, not substring (see FipIsBcdPath)
+//
+static const UNICODE_STRING g_BcdSuffix =
+    RTL_CONSTANT_STRING(L"\\Boot\\BCD");
 
 // ============================================================================
 // STATE
@@ -274,10 +279,12 @@ FiCheckEspAccess(
 
     //
     // Read access to ESP is acceptable (for backup tools, etc.)
-    // Write access is suspicious and may indicate bootkit installation
+    // Only flag actual content modification — FILE_WRITE_ATTRIBUTES is excluded
+    // because it's commonly requested in standard access masks even for
+    // non-modifying operations and causes widespread false positives.
     //
     if (FlagOn(DesiredAccess, FILE_WRITE_DATA | FILE_APPEND_DATA |
-               FILE_WRITE_ATTRIBUTES | DELETE | FILE_WRITE_EA)) {
+               DELETE | FILE_WRITE_EA)) {
 
         InterlockedIncrement64(&g_FiState.Stats.ThreatsDetected);
         InterlockedIncrement64(&g_FiState.Stats.EspAccessBlocked);
@@ -424,7 +431,36 @@ FipQuerySecureBootState(VOID)
         return FiBoot_Unknown;
     }
 
-    return (Value != 0) ? FiBoot_SecureBootEnabled : FiBoot_SecureBootDisabled;
+    if (Value == 0) {
+        return FiBoot_SecureBootDisabled;
+    }
+
+    //
+    // SecureBoot is enabled — check if we're in Setup Mode
+    // (Setup Mode allows unsigned binaries even with SecureBoot "on")
+    //
+    {
+        UNICODE_STRING SetupModeName = RTL_CONSTANT_STRING(L"SetupMode");
+        UCHAR SetupValue = 0;
+        ULONG SetupLen = sizeof(SetupValue);
+
+        Status = ExGetFirmwareEnvironmentVariable(
+            &SetupModeName,
+            (LPGUID)&EFI_GLOBAL_VARIABLE_GUID,
+            &SetupValue,
+            &SetupLen,
+            NULL
+            );
+
+        if (NT_SUCCESS(Status) && SetupValue != 0) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/FI] WARNING: UEFI Setup Mode active — "
+                       "Secure Boot enforcement bypassed!\n");
+            return FiBoot_SecureBootSetupMode;
+        }
+    }
+
+    return FiBoot_SecureBootEnabled;
 }
 
 // ============================================================================
@@ -436,15 +472,20 @@ FipIsEspPath(
     _In_ PCUNICODE_STRING FileName
     )
 {
+    //
+    // ESP paths appear as \Device\HarddiskVolumeN\EFI\...
+    // We require \EFI\ to appear near the start (within first 40 chars)
+    // to avoid false positives on C:\Program Files\EFI\ etc.
+    // The volume prefix \Device\HarddiskVolumeNN\ is typically 25-30 chars.
+    //
+    USHORT PathLen = FileName->Length / sizeof(WCHAR);
+    USHORT SearchLimit = (PathLen > 40) ? 40 : PathLen;
+
     for (ULONG i = 0; i < FI_ESP_PATH_COUNT; i++) {
-        //
-        // Check if ESP path pattern appears anywhere in the filename
-        //
-        USHORT PathLen = FileName->Length / sizeof(WCHAR);
         USHORT PatternLen = g_EspPaths[i].Length / sizeof(WCHAR);
 
-        if (PathLen >= PatternLen) {
-            for (USHORT j = 0; j <= PathLen - PatternLen; j++) {
+        if (SearchLimit >= PatternLen) {
+            for (USHORT j = 0; j <= SearchLimit - PatternLen; j++) {
                 UNICODE_STRING Sub;
                 Sub.Buffer = &FileName->Buffer[j];
                 Sub.Length = g_EspPaths[i].Length;

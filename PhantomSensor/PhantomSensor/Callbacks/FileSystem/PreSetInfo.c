@@ -1111,13 +1111,41 @@ ShadowStrikePreSetInformation(
                 InterlockedIncrement64(&g_PsiState.Stats.SelfProtectionBlocks);
 
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                           "[ShadowStrike/PreSetInfo] BLOCKED: Self-protection "
+                           "[ShadowStrike/PreSetInfo] BLOCKED: Self-protection (source) "
                            "PID=%lu, File=%wZ, Class=%d\n",
                            HandleToULong(requestorPid),
                            &nameInfo->Name,
                            infoClass);
 
                 goto CompleteOperation;
+            }
+
+            //
+            // FP-C1 FIX: Also check DESTINATION path for rename/hardlink.
+            // Without this, an attacker can overwrite a protected file by
+            // renaming an unprotected file to the protected path.
+            //
+            if (newFileNameAllocated && newFileName.Buffer != NULL && newFileName.Length > 0) {
+                if (ShadowStrikeShouldBlockFileAccess(
+                        &newFileName,
+                        0,
+                        requestorPid,
+                        TRUE)) {
+
+                    shouldBlock = TRUE;
+                    blockReason = PSI_BEHAVIOR_AV_TAMPERING;
+                    InterlockedIncrement64(&g_PsiState.Stats.SelfProtectionBlocks);
+
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                               "[ShadowStrike/PreSetInfo] BLOCKED: Self-protection (dest) "
+                               "PID=%lu, Source=%wZ, Dest=%wZ, Class=%d\n",
+                               HandleToULong(requestorPid),
+                               &nameInfo->Name,
+                               &newFileName,
+                               infoClass);
+
+                    goto CompleteOperation;
+                }
             }
         }
     }

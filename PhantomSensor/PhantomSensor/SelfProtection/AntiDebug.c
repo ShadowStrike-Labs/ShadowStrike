@@ -243,6 +243,14 @@ AdbInitialize(
         Ctx
         );
     if (!NT_SUCCESS(Status)) {
+        //
+        // Drain event list before freeing context to prevent pool leak.
+        //
+        while (!IsListEmpty(&Ctx->EventList)) {
+            PLIST_ENTRY Entry = RemoveHeadList(&Ctx->EventList);
+            PADB_EVENT Evt = CONTAINING_RECORD(Entry, ADB_EVENT, ListEntry);
+            ExFreePoolWithTag(Evt, ADB_POOL_TAG_EVENT);
+        }
         ExFreePoolWithTag(Ctx, ADB_POOL_TAG_CTX);
         return Status;
     }
@@ -265,6 +273,14 @@ AdbInitialize(
         KeSetEvent(&Ctx->CheckWakeEvent, IO_NO_INCREMENT, FALSE);
         ZwWaitForSingleObject(ThreadHandle, FALSE, NULL);
         ZwClose(ThreadHandle);
+        //
+        // Thread has exited — drain event list before freeing context.
+        //
+        while (!IsListEmpty(&Ctx->EventList)) {
+            PLIST_ENTRY Entry = RemoveHeadList(&Ctx->EventList);
+            PADB_EVENT Evt = CONTAINING_RECORD(Entry, ADB_EVENT, ListEntry);
+            ExFreePoolWithTag(Evt, ADB_POOL_TAG_EVENT);
+        }
         ExFreePoolWithTag(Ctx, ADB_POOL_TAG_CTX);
         return Status;
     }

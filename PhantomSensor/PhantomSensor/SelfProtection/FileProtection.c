@@ -792,6 +792,7 @@ FpCheckAccess(
     PLIST_ENTRY Entry;
     FP_ACCESS_RESULT Result = FpAccess_NotProtected;
     PWCHAR NormalizedPath = NULL;
+    PWCHAR MatchedRulePath = NULL;
     WCHAR FileName[260];
     WCHAR Extension[FP_MAX_EXTENSION_LENGTH];
     USHORT PathLength;
@@ -803,7 +804,6 @@ FpCheckAccess(
     // Captured data from matched path (copied while under lock)
     //
     BOOLEAN HaveMatchedPath = FALSE;
-    WCHAR MatchedRulePath[FP_MAX_PATH_LENGTH];
     ULONG MatchedFlags = 0;
     volatile LONG64 *MatchedBlockedOps = NULL;
     volatile LONG64 *MatchedAuditedOps = NULL;
@@ -851,7 +851,8 @@ FpCheckAccess(
     KeLeaveCriticalRegion();
 
     //
-    // Allocate normalization buffer from pool (not stack — was 2KB)
+    // Allocate normalization + matched-rule buffers from pool
+    // (not stack — avoids 2KB+ kernel stack consumption on deep call chains)
     //
     NormalizedPath = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
@@ -860,6 +861,17 @@ FpCheckAccess(
         );
 
     if (NormalizedPath == NULL) {
+        return FpAccess_Allow;
+    }
+
+    MatchedRulePath = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        FP_MAX_PATH_LENGTH * sizeof(WCHAR),
+        FP_POOL_TAG_WORK
+        );
+
+    if (MatchedRulePath == NULL) {
+        ShadowStrikeFreePoolWithTag(NormalizedPath, FP_POOL_TAG_WORK);
         return FpAccess_Allow;
     }
 
@@ -1043,6 +1055,10 @@ FpCheckAccess(
                 ShouldBlock = (ProtectionFlags & FpProtect_BlockStreams) != 0;
                 if (ShouldBlock) InterlockedIncrement64(&Engine->Stats.BlockedStreams);
                 break;
+            case FpOperation_Execute:
+                ShouldBlock = (ProtectionFlags & FpProtect_BlockExecute) != 0;
+                if (ShouldBlock) InterlockedIncrement64(&Engine->Stats.BlockedExecutes);
+                break;
             default:
                 break;
             }
@@ -1127,6 +1143,7 @@ FpCheckAccess(
     }
 
     ShadowStrikeFreePoolWithTag(NormalizedPath, FP_POOL_TAG_WORK);
+    ShadowStrikeFreePoolWithTag(MatchedRulePath, FP_POOL_TAG_WORK);
 
     return Result;
 }

@@ -352,12 +352,12 @@ AuSetLevel(
                        "[ShadowStrike] OB callback registration failed: 0x%X "
                        "(continuing at Basic level)\n", status);
             //
-            // Don't fail the overall call — Basic protection remains.
+            // Return the actual failure status so callers can detect degradation.
             //
             InterlockedExchange(&Protector->Level, (LONG)AuLevel_Basic);
             ExReleasePushLockExclusive(&Protector->ConfigLock);
             KeLeaveCriticalRegion();
-            return STATUS_SUCCESS;
+            return status;
         }
     } else if ((LONG)Level < (LONG)AuLevel_Full && oldLevel >= (LONG)AuLevel_Full) {
         AupUnregisterObCallbacks(Protector);
@@ -749,9 +749,13 @@ AupUnregisterObCallbacks(
     _In_ PAU_PROTECTOR Protector
     )
 {
-    if (Protector->ObCallbackHandle != NULL) {
-        ObUnRegisterCallbacks(Protector->ObCallbackHandle);
-        Protector->ObCallbackHandle = NULL;
+    //
+    // Atomic swap prevents double-unregister race between AuShutdown
+    // (which may not hold ConfigLock) and AuSetLevel (which does).
+    //
+    PVOID handle = InterlockedExchangePointer(&Protector->ObCallbackHandle, NULL);
+    if (handle != NULL) {
+        ObUnRegisterCallbacks(handle);
 
 #if DBG
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,

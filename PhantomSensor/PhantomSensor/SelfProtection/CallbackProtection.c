@@ -750,7 +750,9 @@ CpInitialize(
             NTSTATUS tmStatus = TmCreatePeriodic(tmMgr, prot->VerifyIntervalMs,
                              CppVerifyTimerCallback, prot,
                              &opts, &prot->VerifyTimerId);
-            if (!NT_SUCCESS(tmStatus)) {
+            if (NT_SUCCESS(tmStatus)) {
+                InterlockedExchange(&prot->TimerActive, TRUE);
+            } else {
                 prot->VerifyTimerId = 0;
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                     "[ShadowStrike] WARNING: CallbackProtection timer creation failed: 0x%08X\n", tmStatus);
@@ -1350,8 +1352,17 @@ CpGetStatistics(
 
     PAGED_CODE();
 
-    if (Protector == NULL || !Protector->Initialized || Stats == NULL) {
+    if (Protector == NULL || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+
+    if (!Protector->Initialized) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     RtlZeroMemory(Stats, sizeof(CP_STATISTICS));
@@ -1364,6 +1375,8 @@ CpGetStatistics(
 
     KeQuerySystemTime(&now);
     Stats->UpTime.QuadPart = now.QuadPart - Protector->Stats.StartTime.QuadPart;
+
+    ExReleaseRundownProtection(&Protector->RundownRef);
 
     return STATUS_SUCCESS;
 }

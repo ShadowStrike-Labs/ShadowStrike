@@ -349,20 +349,19 @@ ShadowRegisterPowerCallbacks(
 
     PAGED_CODE();
 
+    //
+    // Zero the struct first, then attempt the CAS. This prevents a window
+    // where RtlZeroMemory resets the CAS sentinel back to 0, allowing
+    // a concurrent initializer through.
+    //
+    RtlZeroMemory(&g_PowerState, sizeof(SHADOW_POWER_GLOBALS));
+
     if (InterlockedCompareExchange(&g_PowerState.Initialized, -1, 0) != 0) {
         return STATUS_ALREADY_INITIALIZED;
     }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Initializing power management subsystem\n");
-
-    //
-    // Zero the struct for clean re-init, then restore the -1 sentinel
-    // that guards against concurrent initializers. RtlZeroMemory destroys
-    // the CAS value set above — restore it immediately.
-    //
-    RtlZeroMemory(&g_PowerState, sizeof(SHADOW_POWER_GLOBALS));
-    WriteNoFence(&g_PowerState.Initialized, -1);
 
     UNREFERENCED_PARAMETER(DeviceObject);
 
@@ -459,13 +458,20 @@ ShadowRegisterPowerCallbacks(
     }
 
     //
-    // Register system state callback (sleep/resume)
+    // Register system state callback (sleep/resume).
+    // Don't register if no worker thread — callbacks fire at DISPATCH_LEVEL
+    // and need the worker thread to drain the deferred event queue.
     //
-    status = PwrpRegisterSystemStateCallback();
-    if (!NT_SUCCESS(status)) {
+    if (g_PowerState.WorkerThread != NULL) {
+        status = PwrpRegisterSystemStateCallback();
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] Failed to register system state callback: 0x%08X\n",
+                       status);
+        }
+    } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Failed to register system state callback: 0x%08X\n",
-                   status);
+                   "[ShadowStrike] Skipping system state callback — no worker thread to process events\n");
     }
 
     //
@@ -875,6 +881,13 @@ ShadowPowerUnregisterCallback(
     if (Handle == NULL || !g_PowerState.Initialized) {
         return;
     }
+
+    //
+    // WARNING: Must NOT be called from within a power callback invocation.
+    // PwrpNotifyCallbacks holds CallbackLock shared; acquiring exclusive
+    // here would self-deadlock. Use deferred unregistration if needed.
+    //
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PowerState.CallbackLock);

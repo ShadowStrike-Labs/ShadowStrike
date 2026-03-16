@@ -2927,14 +2927,18 @@ ShadowStrikeUnload(
     // PHASE 4 SHUTDOWN: Self-Protection Hardening (reverse init order)
     // =========================================================================
 
-    if (g_SubsystemFlags & SubsysFlag_CallbackProtection) {
-        CpShutdown(g_CallbackProtector);
-        g_CallbackProtector = NULL;
-    }
-
+    //
+    // IntegrityMonitor depends on CallbackProtection (calls CpVerifyAll),
+    // so it MUST be shut down first to prevent UAF during unload.
+    //
     if (g_SubsystemFlags & SubsysFlag_IntegrityMonitor) {
         ImShutdown(&g_IntegrityMonitor);
         g_IntegrityMonitor = NULL;
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_CallbackProtection) {
+        CpShutdown(g_CallbackProtector);
+        g_CallbackProtector = NULL;
     }
 
     if (g_InitFlags & InitFlag_FileProtectionInitialized) {
@@ -3882,6 +3886,15 @@ ShadowStrikeCleanupByFlags(
         }
         if (InitFlags & InitFlag_FilterRegistered) {
             CpUnprotectCallback(g_CallbackProtector, (PVOID)g_DriverData.FilterHandle);
+        }
+
+        //
+        // ImShutdown BEFORE CpShutdown: IM worker thread calls CpVerifyAll.
+        //
+        if (g_SubsystemFlags & SubsysFlag_IntegrityMonitor) {
+            ImShutdown(&g_IntegrityMonitor);
+            g_IntegrityMonitor = NULL;
+            g_SubsystemFlags &= ~SubsysFlag_IntegrityMonitor;
         }
 
         CpShutdown(g_CallbackProtector);
