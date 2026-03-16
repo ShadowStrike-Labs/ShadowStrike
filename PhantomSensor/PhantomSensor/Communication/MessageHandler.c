@@ -2772,6 +2772,10 @@ MhpHandlePushHashDatabase(
  * Patterns are loaded into IOCMatcher with pattern-appropriate IOC types
  * (YARA for binary patterns) and wildcard/regex match modes.
  * Unlike hash push which uses exact matching, patterns use content-based matching.
+ *
+ * NOTE: Wire format intentionally shares SHADOWSTRIKE_PUSH_HASH_ENTRY with
+ * hash and signature handlers. Differentiation is via IomType + MatchMode
+ * fields set in the IOC input (IomType_YARA / IomMatchMode_Wildcard).
  */
 static NTSTATUS
 MhpHandlePushPatternDatabase(
@@ -2900,9 +2904,12 @@ MhpHandlePushPatternDatabase(
 /**
  * @brief Handle signature database push (FilterMessageType_PushSignatureDatabase).
  *
- * Signatures are loaded into IOCMatcher with file-name type and exact
- * matching. This enables signature-based file identification by name/path.
- * Distinguished from hash push (binary content match) and pattern push (YARA/wildcard).
+ * Signatures are loaded into IOCMatcher with Custom type and exact matching.
+ * Distinguished from hash push (FileHash type) and pattern push (YARA type).
+ *
+ * NOTE: Wire format intentionally shares SHADOWSTRIKE_PUSH_HASH_ENTRY with
+ * hash and pattern handlers. Differentiation is via IomType + MatchMode
+ * fields set in the IOC input (IomType_Custom / IomMatchMode_Exact).
  */
 static NTSTATUS
 MhpHandlePushSignatureDatabase(

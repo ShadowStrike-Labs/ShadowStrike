@@ -1346,6 +1346,11 @@ ShadowStrikeHandleHeartbeat(
 // PORT ACCESS HELPERS
 // ============================================================================
 
+//
+// DEPRECATED: Returns raw PFLT_PORT without reference increment.
+// Use ShadowStrikeAcquirePrimaryScannerPort() for safe, ref-counted access.
+// Retained only for backward compatibility — zero external callers.
+//
 PFLT_PORT
 ShadowStrikeGetPrimaryScannerPort(
     VOID

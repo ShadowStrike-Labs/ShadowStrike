@@ -383,11 +383,12 @@ ShadowStrikeGetConnectedClientCount(
 // ============================================================================
 
 /**
- * @brief Get the primary scanner port handle.
+ * @brief [DEPRECATED] Get the primary scanner port handle.
  *
- * Returns the raw PFLT_PORT for the primary scanner connection.
- * Caller should use ShadowStrikeAcquirePrimaryScannerPort for
- * reference-counted access in most cases.
+ * Returns the raw PFLT_PORT without reference increment.
+ * DEPRECATED: Use ShadowStrikeAcquirePrimaryScannerPort() for safe,
+ * reference-counted access. This function exists only for backward
+ * compatibility and has zero external callers.
  *
  * @return PFLT_PORT if connected, NULL otherwise.
  *

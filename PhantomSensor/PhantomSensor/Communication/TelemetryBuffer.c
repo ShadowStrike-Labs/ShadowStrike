@@ -509,6 +509,27 @@ TbpValidateEntry(
         return FALSE;
     }
 
+    //
+    // Verify CRC32 integrity if checksum is present.
+    // CRC32 is computed at enqueue time over header + payload,
+    // excluding the ChecksumCRC32 field itself.
+    //
+    if (Entry->ChecksumCRC32 != 0) {
+        PVOID payload = NULL;
+        if (Entry->PayloadOffset != 0 && Entry->PayloadSize > 0) {
+            payload = (PUCHAR)Entry + Entry->PayloadOffset;
+        }
+
+        ULONG computedCrc = TbpComputeEntryCRC32(Entry, payload);
+        if (computedCrc != Entry->ChecksumCRC32) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike/TB] CRC32 mismatch: stored=0x%08X computed=0x%08X type=%u size=%u\n",
+                       Entry->ChecksumCRC32, computedCrc,
+                       Entry->EntryType, Entry->EntrySize);
+            return FALSE;
+        }
+    }
+
     return TRUE;
 }
 
@@ -1326,6 +1347,10 @@ TbEnqueueWithHeader(
  * @brief Reserve space in the ring buffer for a large entry.
  *
  * Implements proper two-phase commit with slot state tracking.
+ *
+ * CALLER CONTRACT: Every successful TbReserve MUST be followed by
+ * exactly one call to TbCommit or TbAbort. Failing to do so will
+ * permanently leak the reservation context and occupy the ring slot.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
@@ -2359,11 +2384,13 @@ TbSetCompression(
     }
 
     //
-    // Compression is not implemented - return NOT_IMPLEMENTED if trying to enable
+    // Compression is deferred to user-mode pipeline.
+    // Kernel telemetry buffers are delivered uncompressed;
+    // the user-mode agent applies Compression module on the receive path.
     //
     if (Enable) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike/TB] Compression not implemented\n");
+                   "[ShadowStrike/TB] Compression not implemented — deferred to user-mode pipeline\n");
         return STATUS_NOT_IMPLEMENTED;
     }
 
@@ -2392,11 +2419,13 @@ TbSetEncryption(
     }
 
     //
-    // Encryption is not implemented - return NOT_IMPLEMENTED if trying to enable
+    // Encryption is deferred to user-mode pipeline.
+    // Kernel telemetry buffers are delivered unencrypted over the
+    // CommPort secure channel; user-mode applies at-rest encryption.
     //
     if (Enable) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike/TB] Encryption not implemented\n");
+                   "[ShadowStrike/TB] Encryption not implemented — deferred to user-mode pipeline\n");
         return STATUS_NOT_IMPLEMENTED;
     }
 
@@ -3198,6 +3227,11 @@ TbpFlushTimerDpc(
     UNREFERENCED_PARAMETER(SystemArgument2);
 
     if (perCpuBuffer != NULL) {
+        //
+        // Increment per-CPU flush count.
+        // This serves as a diagnostic counter read by TbGetStatistics
+        // to report how many periodic DPC ticks have fired per CPU.
+        //
         InterlockedIncrement64(&perCpuBuffer->FlushCount);
     }
 }

@@ -800,6 +800,8 @@ SbBuildFileScanRequestEx(
         __try {
             RtlCopyMemory(dataPtr, nameInfo->Name.Buffer, filePathLen);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/SB] Exception copying file path (len=%u)\n", filePathLen);
             scanRequest->PathLength = 0;
             filePathLen = 0;
         }
@@ -819,6 +821,8 @@ SbBuildFileScanRequestEx(
         __try {
             RtlCopyMemory(dataPtr, processName.Buffer, processNameLen);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/SB] Exception copying process name (len=%u)\n", processNameLen);
             scanRequest->ProcessNameLength = 0;
             processNameLen = 0;
         }
@@ -1308,6 +1312,8 @@ ShadowStrikeSendProcessEvent(
         __try {
             RtlCopyMemory(stringPtr, ImageName->Buffer, imageNameLen);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/SB] Exception copying image path (len=%u)\n", imageNameLen);
             notification->ImagePathLength = 0;
             imageNameLen = 0;
         }
@@ -1319,6 +1325,8 @@ ShadowStrikeSendProcessEvent(
         __try {
             RtlCopyMemory(stringPtr, CommandLine->Buffer, cmdLineLen);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/SB] Exception copying command line (len=%u)\n", cmdLineLen);
             notification->CommandLineLength = 0;
         }
     }
@@ -1596,6 +1604,8 @@ ShadowStrikeSendImageNotification(
         __try {
             RtlCopyMemory(stringPtr, FullImageName->Buffer, imageNameLen);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/SB] Exception copying full image name (len=%u)\n", imageNameLen);
             notification->ImageNameLength = 0;
         }
     }
@@ -1790,6 +1800,8 @@ ShadowStrikeSendRegistryNotification(
         __try {
             RtlCopyMemory(stringPtr, KeyPath->Buffer, keyPathLen);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/SB] Exception copying registry key path (len=%u)\n", keyPathLen);
             notification->KeyPathLength = 0;
             keyPathLen = 0;
         }
@@ -1802,6 +1814,8 @@ ShadowStrikeSendRegistryNotification(
         __try {
             RtlCopyMemory(stringPtr, ValueName->Buffer, valueNameLen);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/SB] Exception copying value name (len=%u)\n", valueNameLen);
             notification->ValueNameLength = 0;
             valueNameLen = 0;
         }
@@ -1814,7 +1828,8 @@ ShadowStrikeSendRegistryNotification(
         __try {
             RtlCopyMemory(stringPtr, Data, safeDataSize);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            // Failed to copy data, zero it out
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/SB] Exception copying registry data (size=%u)\n", safeDataSize);
             RtlZeroMemory(stringPtr, safeDataSize);
             notification->DataSize = 0;
         }
@@ -2317,9 +2332,19 @@ SbpCheckCircuitBreaker(
 
         if (timeSinceOpen >= SB_CIRCUIT_BREAKER_RECOVERY_MS) {
             //
-            // Transition to half-open to test
+            // Transition to half-open to test.
+            // Use CAS to ensure only one thread wins the Open→HalfOpen
+            // transition; losers see the updated state and still proceed.
             //
-            SbpTransitionCircuitState(CircuitBreaker, SbCircuitHalfOpen);
+            LONG prev = InterlockedCompareExchange(
+                &CircuitBreaker->State, SbCircuitHalfOpen, SbCircuitOpen);
+            if (prev == SbCircuitOpen) {
+                LARGE_INTEGER now;
+                KeQuerySystemTime(&now);
+                CircuitBreaker->LastStateTransition = now;
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                           "[ShadowStrike/SB] Circuit breaker: Open -> HalfOpen\n");
+            }
             return TRUE;
         }
 
