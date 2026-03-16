@@ -73,6 +73,7 @@ extern "C" {
 #define SHADOW_KTM_TRANSACTION_TAG  'tSSk'
 #define SHADOW_KTM_STRING_TAG       'sSSk'
 #define SHADOW_KTM_ALERT_TAG        'aSSk'
+#define SHADOW_KTM_TXN_CTX_TAG     'cTSk'
 
 // ============================================================================
 // CONSTANTS
@@ -249,6 +250,29 @@ typedef struct _SHADOW_KTM_ALERT {
     BOOLEAN WasBlocked;
 
 } SHADOW_KTM_ALERT, *PSHADOW_KTM_ALERT;
+
+// ============================================================================
+// MINIFILTER TRANSACTION CONTEXT
+// ============================================================================
+
+/**
+ * @brief Minifilter transaction context set on PKTRANSACTION objects.
+ *
+ * Set by ShadowKtmEnlistInTransaction when the minifilter first observes
+ * a transacted file operation. Filter Manager passes this context back in
+ * ShadowKtmNotificationCallback on commit/rollback.
+ *
+ * No dynamic allocations — NULL cleanup callback is correct.
+ */
+typedef struct _SHADOW_KTM_TRANSACTION_CONTEXT {
+
+    /// @brief Transaction GUID for looking up the tracked SHADOW_KTM_TRANSACTION
+    GUID   TransactionGuid;
+
+    /// @brief Originating process ID (for fallback alerting if LRU evicted)
+    HANDLE ProcessId;
+
+} SHADOW_KTM_TRANSACTION_CONTEXT, *PSHADOW_KTM_TRANSACTION_CONTEXT;
 
 // ============================================================================
 // GLOBAL STATE STRUCTURE
@@ -547,6 +571,30 @@ ShadowKtmNotificationCallback(
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ PFLT_CONTEXT TransactionContext,
     _In_ ULONG NotificationMask
+    );
+
+/**
+ * @brief Enlist the minifilter in a kernel transaction for commit/rollback
+ *        notifications. Idempotent — safe to call multiple times for the
+ *        same instance+transaction pair (subsequent calls are no-ops).
+ *
+ * Must be called at PASSIVE_LEVEL from PreCreate/PostWrite callbacks when
+ * a transacted file operation is detected.
+ *
+ * @param Instance          Minifilter instance
+ * @param Transaction       Kernel transaction object (from TXN_PARAMETER_BLOCK)
+ * @param TransactionGuid   GUID of the transaction (from TmGetTransactionId)
+ * @param ProcessId         Originating process ID
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+ShadowKtmEnlistInTransaction(
+    _In_ PFLT_INSTANCE Instance,
+    _In_ PKTRANSACTION Transaction,
+    _In_ GUID TransactionGuid,
+    _In_ HANDLE ProcessId
     );
 
 // ============================================================================

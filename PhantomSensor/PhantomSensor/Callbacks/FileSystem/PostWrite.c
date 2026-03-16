@@ -965,6 +965,18 @@ ShadowStrikePostWrite(
                 if (fileNameAcquired) {
                     ShadowRecordTransactedFileOperation(ktmTxn, &fileName);
                 }
+
+                //
+                // Enlist in the transaction for commit/rollback notifications.
+                // Idempotent — no-op if already enlisted from PreCreate.
+                //
+                ShadowKtmEnlistInTransaction(
+                    FltObjects->Instance,
+                    (PKTRANSACTION)txnBlock->TransactionObject,
+                    txnGuid,
+                    writeContext.ProcessId
+                );
+
                 ShadowReleaseKtmTransaction(ktmTxn);
             }
         }

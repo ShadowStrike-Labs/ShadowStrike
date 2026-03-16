@@ -1245,6 +1245,18 @@ Return Value:
                 ShadowRecordTransactedFileOperation(ktmTxn, &NameInfo->Name);
 
                 //
+                // Enlist in the transaction for commit/rollback notifications.
+                // Enables detection of suspicious rollbacks (Process Doppelganging
+                // T1055.013) and mass-commit ransomware patterns at commit time.
+                //
+                ShadowKtmEnlistInTransaction(
+                    FltObjects->Instance,
+                    (PKTRANSACTION)txnBlock->TransactionObject,
+                    txnGuid,
+                    RequestorPid
+                );
+
+                //
                 // Transacted write creates are inherently suspicious —
                 // legitimate apps rarely use TxF for file creation.
                 //

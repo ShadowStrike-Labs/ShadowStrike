@@ -243,6 +243,22 @@ static FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
         NULL                                        // Reserved
     },
 
+    //
+    // Transaction Context — per-transaction tracking for KTM commit/rollback
+    // SHADOW_KTM_TRANSACTION_CONTEXT: stores transaction GUID + originating PID
+    // Set by ShadowKtmEnlistInTransaction, used by ShadowKtmNotificationCallback
+    //
+    {
+        FLT_TRANSACTION_CONTEXT,                    // ContextType
+        0,                                          // Flags
+        NULL,                                       // ContextCleanupCallback (no dynamic allocs)
+        sizeof(SHADOW_KTM_TRANSACTION_CONTEXT),     // Size — fixed size
+        SHADOW_KTM_TXN_CTX_TAG,                     // PoolTag — 'kSTc'
+        NULL,                                       // ContextAllocateCallback
+        NULL,                                       // ContextFreeCallback
+        NULL                                        // Reserved
+    },
+
     { FLT_CONTEXT_END }
 };
 

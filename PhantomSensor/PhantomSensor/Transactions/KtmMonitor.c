@@ -30,6 +30,7 @@
  */
 
 #include "KtmMonitor.h"
+#include "../Core/Globals.h"
 #include <limits.h>
 
 // ============================================================================
@@ -1492,14 +1493,150 @@ ShadowQueueKtmAlert(
 }
 
 // ============================================================================
+// MINIFILTER TRANSACTION ENLISTMENT
+// ============================================================================
+
+/**
+ * @brief Enlist the minifilter in a kernel transaction.
+ *
+ * Allocates a FLT_TRANSACTION_CONTEXT containing the transaction GUID and
+ * originating process ID, sets it on the transaction, then enlists for
+ * COMMIT + ROLLBACK notifications. Idempotent — if a context already exists
+ * on this instance+transaction pair, returns STATUS_SUCCESS without re-enlisting.
+ *
+ * On enlistment success, Filter Manager will invoke ShadowKtmNotificationCallback
+ * when the transaction commits or rolls back.
+ */
+_Use_decl_annotations_
+NTSTATUS
+ShadowKtmEnlistInTransaction(
+    PFLT_INSTANCE Instance,
+    PKTRANSACTION Transaction,
+    GUID TransactionGuid,
+    HANDLE ProcessId
+    )
+{
+    NTSTATUS status;
+    PFLT_CONTEXT existingContext = NULL;
+    PSHADOW_KTM_TRANSACTION_CONTEXT txnCtx = NULL;
+
+    PAGED_CODE();
+
+    if (Instance == NULL || Transaction == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!g_KtmMonitorState.Initialized || g_KtmMonitorState.ShuttingDown) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    if (g_DriverData.FilterHandle == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Check if we already enlisted for this instance+transaction pair.
+    // FltGetTransactionContext returns STATUS_NOT_FOUND if no context is set.
+    //
+    status = FltGetTransactionContext(
+        Instance,
+        Transaction,
+        &existingContext
+    );
+
+    if (NT_SUCCESS(status)) {
+        FltReleaseContext(existingContext);
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Allocate a transaction context. NonPagedPoolNx because the context
+    // structure is small (GUID + HANDLE) and Filter Manager may access it
+    // at elevated IRQL during teardown.
+    //
+    status = FltAllocateContext(
+        g_DriverData.FilterHandle,
+        FLT_TRANSACTION_CONTEXT,
+        sizeof(SHADOW_KTM_TRANSACTION_CONTEXT),
+        NonPagedPoolNx,
+        (PFLT_CONTEXT*)&txnCtx
+    );
+
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    RtlZeroMemory(txnCtx, sizeof(SHADOW_KTM_TRANSACTION_CONTEXT));
+    RtlCopyMemory(&txnCtx->TransactionGuid, &TransactionGuid, sizeof(GUID));
+    txnCtx->ProcessId = ProcessId;
+
+    //
+    // Set the context on the transaction. KEEP_IF_EXISTS handles the race
+    // where two threads detect the same transaction simultaneously — the
+    // loser gets STATUS_FLT_CONTEXT_ALREADY_DEFINED and skips enlistment.
+    //
+    status = FltSetTransactionContext(
+        Instance,
+        Transaction,
+        FLT_SET_CONTEXT_KEEP_IF_EXISTS,
+        (PFLT_CONTEXT)txnCtx,
+        NULL
+    );
+
+    if (status == STATUS_FLT_CONTEXT_ALREADY_DEFINED) {
+        FltReleaseContext((PFLT_CONTEXT)txnCtx);
+        return STATUS_SUCCESS;
+    }
+
+    if (!NT_SUCCESS(status)) {
+        FltReleaseContext((PFLT_CONTEXT)txnCtx);
+        return status;
+    }
+
+    //
+    // Enlist in the transaction. Filter Manager will invoke
+    // ShadowKtmNotificationCallback on commit or rollback.
+    //
+    status = FltEnlistInTransaction(
+        Instance,
+        Transaction,
+        (PFLT_CONTEXT)txnCtx,
+        TRANSACTION_NOTIFY_COMMIT | TRANSACTION_NOTIFY_ROLLBACK
+    );
+
+    if (!NT_SUCCESS(status)) {
+        //
+        // Enlistment failed — remove the context we just set.
+        // FltDeleteTransactionContext will trigger context teardown.
+        //
+        FltDeleteTransactionContext(Instance, Transaction, NULL);
+    }
+
+    //
+    // Release our allocate reference. Filter Manager holds its own.
+    //
+    FltReleaseContext((PFLT_CONTEXT)txnCtx);
+
+    return status;
+}
+
+// ============================================================================
 // MINIFILTER TRANSACTION NOTIFICATION
 // ============================================================================
 
 /**
  * @brief Minifilter transaction notification callback.
  *
- * Handles commit/rollback notifications from Filter Manager for transactions
- * the minifilter has enlisted in.
+ * Invoked by Filter Manager when a transaction the minifilter has enlisted
+ * in commits or rolls back. Uses the transaction context GUID to look up
+ * the tracked SHADOW_KTM_TRANSACTION and update its state.
+ *
+ * On COMMIT: calls ShadowMarkTransactionCommitted (threat evaluation + alert
+ * queuing for mass-commit patterns).
+ *
+ * On ROLLBACK: sets IsRolledBack, queues KtmAlertSuspiciousRollback if the
+ * transaction modified files (detects Process Doppelganging T1055.013 and
+ * transacted ransomware evasion).
  */
 NTSTATUS
 ShadowKtmNotificationCallback(
@@ -1508,17 +1645,90 @@ ShadowKtmNotificationCallback(
     _In_ ULONG NotificationMask
     )
 {
+    PSHADOW_KTM_TRANSACTION_CONTEXT txnCtx =
+        (PSHADOW_KTM_TRANSACTION_CONTEXT)TransactionContext;
+    PSHADOW_KTM_TRANSACTION trackedTxn = NULL;
+    NTSTATUS findStatus;
+
     UNREFERENCED_PARAMETER(FltObjects);
-    UNREFERENCED_PARAMETER(TransactionContext);
 
+    PAGED_CODE();
+
+    //
+    // Guard: no context means we cannot look up the transaction.
+    //
+    if (txnCtx == NULL) {
+        return STATUS_SUCCESS;
+    }
+
+    if (!g_KtmMonitorState.Initialized || g_KtmMonitorState.ShuttingDown) {
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Look up the tracked transaction by GUID. It may have been evicted
+    // from the LRU cache if the transaction was long-lived. In that case,
+    // we still count the event but cannot perform behavioral analysis.
+    //
+    findStatus = ShadowFindKtmTransaction(txnCtx->TransactionGuid, &trackedTxn);
+
+    if (!NT_SUCCESS(findStatus) || trackedTxn == NULL) {
+        //
+        // Transaction evicted from LRU — count the event for statistics.
+        //
+        if (NotificationMask & TRANSACTION_NOTIFY_COMMIT) {
+            InterlockedIncrement64(&g_KtmMonitorState.Stats.TotalCommits);
+        }
+        if (NotificationMask & TRANSACTION_NOTIFY_ROLLBACK) {
+            InterlockedIncrement64(&g_KtmMonitorState.Stats.TotalRollbacks);
+        }
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // COMMIT: Mark committed and evaluate threat (mass-commit detection).
+    // ShadowMarkTransactionCommitted increments TotalCommits internally.
+    //
     if (NotificationMask & TRANSACTION_NOTIFY_COMMIT) {
-        InterlockedIncrement64(&g_KtmMonitorState.Stats.TotalCommits);
+        ShadowMarkTransactionCommitted(trackedTxn);
     }
 
+    //
+    // ROLLBACK: Flag the transaction and alert on suspicious rollbacks.
+    // Legitimate applications rarely roll back transactions that modify files.
+    // Rollback after file modification is a strong indicator of:
+    //   - Process Doppelganging (T1055.013)
+    //   - Transacted ransomware evasion
+    //   - Payload staging via TxF
+    //
     if (NotificationMask & TRANSACTION_NOTIFY_ROLLBACK) {
+        ULONG threatScore = 0;
+
+        trackedTxn->IsRolledBack = TRUE;
         InterlockedIncrement64(&g_KtmMonitorState.Stats.TotalRollbacks);
+
+        ShadowCalculateKtmThreatScore(
+            trackedTxn,
+            KtmOperationRollback,
+            &threatScore
+        );
+
+        if (trackedTxn->FilesModified > 0) {
+            InterlockedIncrement64(&g_KtmMonitorState.Stats.SuspiciousTransactions);
+
+            ShadowQueueKtmAlert(
+                KtmAlertSuspiciousRollback,
+                trackedTxn->ProcessId,
+                trackedTxn->ProcessName,
+                trackedTxn->TransactionGuid,
+                (ULONG)trackedTxn->FilesModified,
+                threatScore,
+                trackedTxn->IsBlocked
+            );
+        }
     }
 
+    ShadowReleaseKtmTransaction(trackedTxn);
     return STATUS_SUCCESS;
 }
 
