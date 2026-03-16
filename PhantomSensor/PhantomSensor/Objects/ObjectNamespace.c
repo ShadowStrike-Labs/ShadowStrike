@@ -259,7 +259,6 @@ ShadowCreatePrivateNamespace(
     OBJECT_ATTRIBUTES objectAttributes;
     PSHADOW_NAMESPACE_STATE state = &g_NamespaceState;
     LONG previousState;
-    BOOLEAN created = FALSE;
 
     PAGED_CODE();
 
@@ -360,7 +359,7 @@ ShadowCreatePrivateNamespace(
     );
 
     if (NT_SUCCESS(status)) {
-        created = TRUE;
+        // Directory created by us — proceed.
     } else if (status == STATUS_OBJECT_NAME_COLLISION) {
         //
         // Directory already exists. Open it, then verify ownership
@@ -1057,8 +1056,8 @@ ShadowpVerifyDirectoryOwner(
         return STATUS_ACCESS_DENIED;
     }
 
-    sd = (PSECURITY_DESCRIPTOR)ExAllocatePoolZero(
-        PagedPool, sdSize, SHADOW_NAMESPACE_TAG);
+    sd = (PSECURITY_DESCRIPTOR)ExAllocatePool2(
+        POOL_FLAG_PAGED, sdSize, SHADOW_NAMESPACE_TAG);
     if (sd == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
