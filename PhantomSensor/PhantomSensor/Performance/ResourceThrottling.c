@@ -310,14 +310,21 @@ RtInitialize(
         NULL
     );
 
-    ZwClose(threadHandle);
-
     if (!NT_SUCCESS(status)) {
+        //
+        // Thread is running with a pointer to throttler. We must wait
+        // for it to exit BEFORE freeing the structure. The handle is
+        // still open, so use it to wait. (RT-C1 fix)
+        //
         InterlockedExchange(&throttler->WorkerShouldExit, 1);
         KeSetEvent(&throttler->WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
+        ZwWaitForSingleObject(threadHandle, FALSE, NULL);
+        ZwClose(threadHandle);
         ShadowStrikeFreePoolWithTag(throttler, RT_POOL_TAG);
         return status;
     }
+
+    ZwClose(threadHandle);
 
     throttler->Enabled = TRUE;
     throttler->Initialized = TRUE;
