@@ -460,6 +460,7 @@ typedef struct _PN_MONITOR_STATE {
         volatile LONG64 RateLimitDrops;
         volatile LONG64 PoolLimitDrops;
         volatile LONG64 UserModeTimeouts;
+        volatile LONG64 SecurityChecksTriggered;
         LARGE_INTEGER StartTime;
     } Stats;
 
@@ -727,6 +728,7 @@ Return Value:
     //
     g_ProcessMonitor.ParentChainTracker = (PVOID)PaGetParentChainTracker();
     g_ProcessMonitor.PrivilegeMonitor = (PVOID)PaGetPrivilegeMonitor();
+    g_ProcessMonitor.TokenAnalyzer = (PVOID)PaGetTokenAnalyzer();
     g_ProcessMonitor.ProcessAnalyzer = (PVOID)ShadowStrikeGetProcessAnalyzer();
     g_ProcessMonitor.Config.EnablePrivilegeMonitoring = TRUE;
     g_ProcessMonitor.Config.EnableSignatureVerification = TRUE;
@@ -4371,6 +4373,172 @@ Routine Description:
 
 
 // ============================================================================
+// PERIODIC SECURITY CHECKS (Privilege Escalation + Token Manipulation)
+// ============================================================================
+
+//
+// Maximum number of active processes to check per timer cycle.
+// Prevents the timer callback from monopolizing CPU.
+//
+#define PN_MAX_SECURITY_CHECKS_PER_CYCLE    64
+
+static VOID
+PnpPeriodicSecurityChecks(
+    VOID
+    )
+/*++
+Routine Description:
+    Iterates active (non-terminated) process contexts and performs
+    runtime privilege escalation detection (PmCheckForEscalation)
+    and token manipulation detection (TaDetectTokenManipulation).
+
+    This is the sole consumer of these detection APIs, activating
+    privilege/token monitoring that was previously dormant.
+
+    MITRE Coverage:
+    - T1134: Access Token Manipulation
+    - T1134.001: Token Impersonation/Theft
+    - T1134.002: Create Process with Token
+    - T1548: Abuse Elevation Control Mechanism
+    - T1068: Exploitation for Privilege Escalation
+
+    Runs at PASSIVE_LEVEL from timer WorkItem callback.
+--*/
+{
+    PLIST_ENTRY Entry;
+    PPN_PROCESS_CONTEXT Context;
+    PPM_MONITOR PrivMonitor;
+    PTA_ANALYZER TokenAnalyzer;
+    ULONG CheckCount = 0;
+
+    PAGED_CODE();
+
+    PrivMonitor = (PPM_MONITOR)g_ProcessMonitor.PrivilegeMonitor;
+    TokenAnalyzer = (PTA_ANALYZER)g_ProcessMonitor.TokenAnalyzer;
+
+    //
+    // Both modules must be available
+    //
+    if (PrivMonitor == NULL && TokenAnalyzer == NULL) {
+        return;
+    }
+
+    //
+    // Walk the active process list under shared lock.
+    // We only collect PIDs here; actual detection calls happen
+    // outside the lock to minimize hold time.
+    //
+    HANDLE ProcessIds[PN_MAX_SECURITY_CHECKS_PER_CYCLE];
+    ULONG PidCount = 0;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_ProcessMonitor.ProcessListLock);
+
+    for (Entry = g_ProcessMonitor.ProcessList.Flink;
+         Entry != &g_ProcessMonitor.ProcessList && PidCount < PN_MAX_SECURITY_CHECKS_PER_CYCLE;
+         Entry = Entry->Flink) {
+
+        Context = CONTAINING_RECORD(Entry, PN_PROCESS_CONTEXT, ListEntry);
+
+        //
+        // Skip terminated processes — no point checking dead contexts
+        //
+        if (Context->TerminateTime.QuadPart != 0) {
+            continue;
+        }
+
+        //
+        // Skip system/idle/low-PID processes
+        //
+        if ((ULONG_PTR)Context->ProcessId <= 4) {
+            continue;
+        }
+
+        ProcessIds[PidCount++] = Context->ProcessId;
+    }
+
+    ExReleasePushLockShared(&g_ProcessMonitor.ProcessListLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Now run detection checks outside the lock
+    //
+    for (ULONG i = 0; i < PidCount; i++) {
+        HANDLE Pid = ProcessIds[i];
+
+        if (g_ProcessMonitor.ShutdownRequested) {
+            break;
+        }
+
+        //
+        // Privilege escalation check (T1548, T1068)
+        //
+        if (PrivMonitor != NULL) {
+            PPM_ESCALATION_EVENT EscEvent = NULL;
+            NTSTATUS pmStatus = PmCheckForEscalation(
+                PrivMonitor,
+                Pid,
+                &EscEvent
+                );
+
+            if (pmStatus == STATUS_SUCCESS && EscEvent != NULL) {
+                //
+                // Escalation detected — submit to BehaviorEngine
+                //
+                BeEngineSubmitEvent(
+                    BehaviorEvent_PrivilegeEscalation,
+                    BehaviorCategory_PrivilegeOperation,
+                    HandleToULong(Pid),
+                    &EscEvent->Type,
+                    sizeof(PM_ESCALATION_TYPE),
+                    EscEvent->SuspicionScore,
+                    FALSE,
+                    NULL
+                    );
+
+                InterlockedIncrement64(&g_ProcessMonitor.Stats.SecurityChecksTriggered);
+                PmDereferenceEvent(EscEvent);
+            }
+        }
+
+        //
+        // Token manipulation check (T1134)
+        //
+        if (TokenAnalyzer != NULL) {
+            TA_TOKEN_ATTACK Attack = TaAttack_None;
+            ULONG TokenScore = 0;
+            NTSTATUS taStatus = TaDetectTokenManipulation(
+                TokenAnalyzer,
+                Pid,
+                &Attack,
+                &TokenScore
+                );
+
+            if (NT_SUCCESS(taStatus) && Attack != TaAttack_None && TokenScore > 0) {
+                //
+                // Token attack detected — submit to BehaviorEngine
+                //
+                BeEngineSubmitEvent(
+                    BehaviorEvent_TokenManipulation,
+                    BehaviorCategory_PrivilegeOperation,
+                    HandleToULong(Pid),
+                    &Attack,
+                    sizeof(TA_TOKEN_ATTACK),
+                    TokenScore,
+                    FALSE,
+                    NULL
+                    );
+
+                InterlockedIncrement64(&g_ProcessMonitor.Stats.SecurityChecksTriggered);
+            }
+        }
+
+        CheckCount++;
+    }
+}
+
+
+// ============================================================================
 // TIMER AND CLEANUP
 // ============================================================================
 
@@ -4403,6 +4571,14 @@ Routine Description:
     }
 
     PnpCleanupStaleContexts();
+
+    //
+    // Periodic privilege escalation and token manipulation detection.
+    // Iterate active (non-terminated) contexts and check for runtime
+    // privilege changes and token attacks (T1134, T1548).
+    // PASSIVE_LEVEL guaranteed by TmFlag_WorkItemCallback.
+    //
+    PnpPeriodicSecurityChecks();
 
     //
     // Run ThreatScoring maintenance on the ProcessMonitor's engine.

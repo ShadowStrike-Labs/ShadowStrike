@@ -2427,7 +2427,13 @@ Routine Description:
     KIRQL oldIrql;
     LIST_ENTRY eventsToFree;
 
-    PAGED_CODE();
+    //
+    // NOTE: No PAGED_CODE() assertion here. This function acquires
+    // a SpinLock (EventLock) which raises IRQL to DISPATCH_LEVEL.
+    // The function is NOT in a PAGE section, so this is safe.
+    // Entry IRQL must be <= DISPATCH_LEVEL.
+    //
+    NT_ASSERT(KeGetCurrentIrql() <= DISPATCH_LEVEL);
 
     if (Context == NULL) {
         return;
