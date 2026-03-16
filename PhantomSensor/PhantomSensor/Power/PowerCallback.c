@@ -420,7 +420,7 @@ ShadowRegisterPowerCallbacks(
             );
 
         if (NT_SUCCESS(status)) {
-            ObReferenceObjectByHandle(
+            NTSTATUS obStatus = ObReferenceObjectByHandle(
                 threadHandle,
                 THREAD_ALL_ACCESS,
                 *PsThreadType,
@@ -428,6 +428,27 @@ ShadowRegisterPowerCallbacks(
                 (PVOID*)&g_PowerState.WorkerThread,
                 NULL
                 );
+
+            if (!NT_SUCCESS(obStatus)) {
+                //
+                // Thread is alive but we cannot reference it.
+                // Signal it to exit and wait via the handle before closing.
+                //
+                LARGE_INTEGER obTimeout;
+
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] ObReferenceObjectByHandle for power worker failed: 0x%08X\n",
+                           obStatus);
+
+                InterlockedExchange(&g_PowerState.WorkerTerminate, TRUE);
+                KeSetEvent(&g_PowerState.WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
+
+                obTimeout.QuadPart = -100000000LL;  // 10 seconds
+                ZwWaitForSingleObject(threadHandle, FALSE, &obTimeout);
+
+                g_PowerState.WorkerThread = NULL;
+            }
+
             ZwClose(threadHandle);
         } else {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
