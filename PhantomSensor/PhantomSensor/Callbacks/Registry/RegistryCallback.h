@@ -633,7 +633,7 @@ ShadowStrikeAnalyzeRegistryPersistence(
  *
  * @irql <= DISPATCH_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 ULONG
 ShadowStrikeClassifyRegistryKey(
     _In_ PCUNICODE_STRING KeyPath

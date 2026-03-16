@@ -877,7 +877,7 @@ ShadowStrikeClassifyRegistryKey(
     }
 
     //
-    // Run Keys (T1547.001)
+    // Run Keys — HKLM (T1547.001)
     //
     RtlInitUnicodeString(&testPath, SHADOWSTRIKE_REG_RUN_KEY);
     if (RtlPrefixUnicodeString(&testPath, KeyPath, TRUE)) {
@@ -892,6 +892,52 @@ ShadowStrikeClassifyRegistryKey(
     RtlInitUnicodeString(&testPath, SHADOWSTRIKE_REG_RUNONCEEX_KEY);
     if (RtlPrefixUnicodeString(&testPath, KeyPath, TRUE)) {
         flags |= RegFlagRunKey | RegFlagPersistenceKey;
+    }
+
+    //
+    // Run Keys — HKCU (T1547.001)
+    //
+    // User hives appear as \REGISTRY\USER\<SID>\...
+    // We cannot use the wildcard constants directly with RtlPrefixUnicodeString,
+    // so we check for the \REGISTRY\USER\ prefix and then look for the
+    // Run/RunOnce suffix after the SID component.
+    //
+    {
+        static const UNICODE_STRING UserHivePrefix = RTL_CONSTANT_STRING(L"\\REGISTRY\\USER\\");
+        if (RtlPrefixUnicodeString(&UserHivePrefix, KeyPath, TRUE)) {
+            //
+            // Skip past \REGISTRY\USER\ and the SID to find the subkey path.
+            // Walk forward past the SID (next backslash after the prefix).
+            //
+            USHORT prefixChars = UserHivePrefix.Length / sizeof(WCHAR);
+            USHORT pathChars = KeyPath->Length / sizeof(WCHAR);
+            USHORT sidEnd = prefixChars;
+
+            while (sidEnd < pathChars && KeyPath->Buffer[sidEnd] != L'\\') {
+                sidEnd++;
+            }
+
+            if (sidEnd < pathChars) {
+                //
+                // sidEnd points to the backslash after the SID.
+                // Build a UNICODE_STRING for the remainder (e.g., \SOFTWARE\...\Run).
+                //
+                UNICODE_STRING remainder;
+                remainder.Buffer = &KeyPath->Buffer[sidEnd];
+                remainder.Length = (pathChars - sidEnd) * sizeof(WCHAR);
+                remainder.MaximumLength = remainder.Length;
+
+                RtlInitUnicodeString(&testPath, L"\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run");
+                if (RtlPrefixUnicodeString(&testPath, &remainder, TRUE)) {
+                    flags |= RegFlagRunKey | RegFlagPersistenceKey;
+                }
+
+                RtlInitUnicodeString(&testPath, L"\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
+                if (RtlPrefixUnicodeString(&testPath, &remainder, TRUE)) {
+                    flags |= RegFlagRunKey | RegFlagPersistenceKey;
+                }
+            }
+        }
     }
 
     //
@@ -1724,10 +1770,10 @@ ShadowStrikeRegistryCallbackRoutine(
         createCompleteName->Length > 0) {
 
         USHORT separatorLen = sizeof(WCHAR);
-        USHORT totalLen = keyPath.Length + separatorLen + createCompleteName->Length;
+        ULONG totalLen = (ULONG)keyPath.Length + (ULONG)separatorLen + (ULONG)createCompleteName->Length;
         PWCH fullBuffer;
 
-        if (totalLen < keyPath.Length || totalLen > REG_MAX_PATH_ALLOCATION) {
+        if (totalLen > REG_MAX_PATH_ALLOCATION || totalLen > MAXUSHORT) {
             goto SkipCreatePathBuild;
         }
 
@@ -1749,8 +1795,8 @@ ShadowStrikeRegistryCallbackRoutine(
 
             ExFreePoolWithTag(keyPath.Buffer, REG_PATH_TAG);
             keyPath.Buffer = fullBuffer;
-            keyPath.Length = totalLen;
-            keyPath.MaximumLength = totalLen + sizeof(WCHAR);
+            keyPath.Length = (USHORT)totalLen;
+            keyPath.MaximumLength = (USHORT)totalLen + sizeof(WCHAR);
         }
     }
 SkipCreatePathBuild:
@@ -2393,14 +2439,19 @@ ShadowStrikeRegAddMonitoredKey(
         return STATUS_NAME_TOO_LONG;
     }
 
-    if (g_RegistryMonitor.ProtectedKeyCount >= REG_MAX_PROTECTED_KEYS) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
     bucket = RegpHashString(KeyPath) % REG_PROTECTED_KEY_HASH_BUCKETS;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_RegistryMonitor.ProtectedKeyLock);
+
+    //
+    // Re-check count under lock to prevent TOCTOU race with concurrent callers
+    //
+    if (g_RegistryMonitor.ProtectedKeyCount >= REG_MAX_PROTECTED_KEYS) {
+        ExReleasePushLockExclusive(&g_RegistryMonitor.ProtectedKeyLock);
+        KeLeaveCriticalRegion();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     walkCount = 0;
     for (listEntry = g_RegistryMonitor.ProtectedKeyBuckets[bucket].Flink;
