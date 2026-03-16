@@ -138,6 +138,25 @@ extern "C" {
  * Non-volatile scalar fields (MinimumLevel, MaximumLevel, BOOLEAN enables)
  * are naturally atomic on x86/x64 for aligned reads/writes; concurrent
  * updates use InterlockedOr/InterlockedAnd for flag bitmasks.
+ *
+ * LEVEL SEMANTICS (band-pass, NOT standard WPP low-pass):
+ *
+ *   WppShouldTrace admits events in [MinimumLevel, MaximumLevel] inclusive.
+ *
+ *   Standard WPP uses a LOW-PASS filter: configured_level >= trace_level,
+ *   where lower numbers are more severe (CRITICAL=1 always passes).
+ *
+ *   ShadowStrike uses a BAND-PASS filter because it extends levels beyond
+ *   VERBOSE (Security=6, Audit=7, Debug=8, Perf=9). The band-pass lets
+ *   production configs admit levels 1–7 while excluding 8–9 (debug/perf).
+ *
+ *   Default: MinimumLevel=TRACE_LEVEL_CRITICAL(1), MaximumLevel=TRACE_LEVEL_AUDIT(7).
+ *   This admits ALL production-relevant levels, excluding debug/perf.
+ *
+ *   WARNING: Do NOT set MinimumLevel above TRACE_LEVEL_CRITICAL unless you
+ *   intend to suppress critical/error events. The standard WPP notion of
+ *   "set level = WARNING to see CRITICAL+ERROR+WARNING" does NOT apply here.
+ *   Instead, MinimumLevel is the FLOOR of the admitted band.
  */
 typedef struct _WPP_TRACE_CONFIG {
     BOOLEAN TracingEnabled;
@@ -145,8 +164,8 @@ typedef struct _WPP_TRACE_CONFIG {
     BOOLEAN PerfTracingEnabled;
     BOOLEAN SecurityTracingEnabled;
 
-    UCHAR   MinimumLevel;
-    UCHAR   MaximumLevel;
+    UCHAR   MinimumLevel;           ///< Floor of admitted level band (default: 1=CRITICAL)
+    UCHAR   MaximumLevel;           ///< Ceiling of admitted level band (default: 7=AUDIT)
     UCHAR   Reserved[2];
 
     ULONG   EnabledFlags;           ///< Updated via InterlockedOr/And
@@ -267,7 +286,15 @@ WppTraceIsEnabled(
 // RUNTIME CONFIGURATION API
 // ============================================================================
 
-/** @irql <= DISPATCH_LEVEL */
+/**
+ * @brief Set the minimum trace level (floor of band-pass filter).
+ *
+ * CAUTION: This is NOT standard WPP semantics. Setting MinimumLevel to
+ * TRACE_LEVEL_WARNING(3) will SUPPRESS CRITICAL(1) and ERROR(2) events.
+ * To see all production events, keep this at TRACE_LEVEL_CRITICAL(1).
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 WppSetMinimumLevel(

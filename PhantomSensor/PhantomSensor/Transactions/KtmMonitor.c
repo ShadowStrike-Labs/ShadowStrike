@@ -184,7 +184,16 @@ ShadowReleaseKtmTransaction(
         //
         Transaction->Magic = 0xDEADBEEF;
 
-        ExFreePoolWithTag(Transaction, SHADOW_KTM_TRANSACTION_TAG);
+        //
+        // Free via lookaside if still initialized (fast path),
+        // otherwise fall back to direct pool free (shutdown path).
+        //
+        if (g_KtmMonitorState.TransactionLookasideInitialized) {
+            ExFreeToNPagedLookasideList(
+                &g_KtmMonitorState.TransactionLookaside, Transaction);
+        } else {
+            ExFreePoolWithTag(Transaction, SHADOW_KTM_TRANSACTION_TAG);
+        }
     }
     else if (newRefCount < 0) {
         //
@@ -717,16 +726,18 @@ ShadowCleanupKtmMonitor(
     state->CommunicationPortOpen = FALSE;
 
     //
-    // Delete lookaside lists
+    // Delete lookaside lists.
+    // Set flags FALSE BEFORE deletion so concurrent paths (if any) fall
+    // back to direct pool free instead of accessing a deleted lookaside.
     //
     if (state->TransactionLookasideInitialized) {
-        ExDeleteNPagedLookasideList(&state->TransactionLookaside);
         state->TransactionLookasideInitialized = FALSE;
+        ExDeleteNPagedLookasideList(&state->TransactionLookaside);
     }
 
     if (state->AlertLookasideInitialized) {
-        ExDeleteNPagedLookasideList(&state->AlertLookaside);
         state->AlertLookasideInitialized = FALSE;
+        ExDeleteNPagedLookasideList(&state->AlertLookaside);
     }
 
     //
