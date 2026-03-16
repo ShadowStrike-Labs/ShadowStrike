@@ -416,12 +416,21 @@ CtInitialize(
             NULL
         );
 
-        ZwClose(threadHandle);
-
         if (!NT_SUCCESS(threadStatus)) {
+            //
+            // Thread is running but we have no PETHREAD.  Signal it to
+            // self-terminate, wait via handle, then clean up.
+            //
+            tracker->CleanupTerminate = TRUE;
+            MemoryBarrier();
+            KeSetEvent(&tracker->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
+            ZwWaitForSingleObject(threadHandle, FALSE, NULL);
+            ZwClose(threadHandle);
             status = threadStatus;
             goto Cleanup;
         }
+
+        ZwClose(threadHandle);
     }
 
     //
@@ -2373,14 +2382,16 @@ CtpCleanupStaleConnections(
 
         if ((state == CtState_Closed || state == CtState_TimedOut ||
              state == CtState_Blocked || state == CtState_Error) &&
-            connection->RefCount == 1 &&
             staleCount < staleCapacity) {
 
             //
-            // Add ref to prevent free while we still hold a pointer
+            // Atomically try to increment from 1 → 2.  This guarantees no
+            // concurrent CtFindByFlowId has taken a reference (which would
+            // make RefCount > 1), and the object won't be freed under us.
             //
-            CtAddRef(connection);
-            staleList[staleCount++] = connection;
+            if (InterlockedCompareExchange(&connection->RefCount, 2, 1) == 1) {
+                staleList[staleCount++] = connection;
+            }
         }
     }
 

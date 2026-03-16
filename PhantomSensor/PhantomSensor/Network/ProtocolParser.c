@@ -310,11 +310,22 @@ PppTrackAllocation(
     _In_ PPP_PARSER Parser
     )
 {
-    LONG current = InterlockedIncrement(&Parser->ActiveAllocations);
-    if (current > PP_MAX_CONCURRENT_ALLOCS) {
-        InterlockedDecrement(&Parser->ActiveAllocations);
-        return FALSE;
-    }
+    LONG current;
+    LONG desired;
+
+    //
+    // Atomic check-and-increment via CAS loop.  Prevents exceeding
+    // PP_MAX_CONCURRENT_ALLOCS under concurrent allocation bursts.
+    //
+    do {
+        current = Parser->ActiveAllocations;  // volatile LONG read
+        if (current >= PP_MAX_CONCURRENT_ALLOCS) {
+            return FALSE;
+        }
+        desired = current + 1;
+    } while (InterlockedCompareExchange(&Parser->ActiveAllocations,
+                                        desired, current) != current);
+
     return TRUE;
 }
 

@@ -753,7 +753,13 @@ DxShutdown(
             entry = RemoveHeadList(&Detector->TransferBuckets[i].Head);
             transfer = CONTAINING_RECORD(entry, DX_TRANSFER_CONTEXT, HashEntry);
             InterlockedDecrement(&Detector->TransferCount);
-            ExFreeToNPagedLookasideList(&Detector->TransferLookaside, transfer);
+
+            //
+            // Release the hash-table reference through the proper refcount
+            // path.  DxpDereferenceTransfer only frees when RefCount hits 0,
+            // keeping the contract consistent with the cleanup codepath.
+            //
+            DxpDereferenceTransfer(Detector, transfer);
         }
 
         DxpReleasePushLockExclusive(&Detector->TransferBuckets[i].Lock);

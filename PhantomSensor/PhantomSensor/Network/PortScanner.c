@@ -1894,30 +1894,31 @@ SspsDetermineScanType(
     }
 
     //
-    // Check stealth types first (most suspicious)
+    // Check stealth types first (most suspicious).
+    // Cast to LONGLONG before multiplication to prevent 32-bit overflow.
     //
     if (Snap->TcpNull > 0 &&
-        (Snap->TcpNull * 100 / Snap->TotalConnections) > 50) {
+        ((LONGLONG)Snap->TcpNull * 100 / Snap->TotalConnections) > 50) {
         return SsPsScan_TCPNULL;
     }
 
     if (Snap->TcpXmas > 0 &&
-        (Snap->TcpXmas * 100 / Snap->TotalConnections) > 50) {
+        ((LONGLONG)Snap->TcpXmas * 100 / Snap->TotalConnections) > 50) {
         return SsPsScan_TCPXMAS;
     }
 
     if (Snap->TcpFinOnly > 0 &&
-        (Snap->TcpFinOnly * 100 / Snap->TotalConnections) > 50) {
+        ((LONGLONG)Snap->TcpFinOnly * 100 / Snap->TotalConnections) > 50) {
         return SsPsScan_TCPFIN;
     }
 
     if (Snap->TcpSynOnly > 0 &&
-        (Snap->TcpSynOnly * 100 / Snap->TotalConnections) > 50) {
+        ((LONGLONG)Snap->TcpSynOnly * 100 / Snap->TotalConnections) > 50) {
         return SsPsScan_TCPSYN;
     }
 
     if (Snap->UdpConnections > 0 &&
-        (Snap->UdpConnections * 100 / Snap->TotalConnections) > 80) {
+        ((LONGLONG)Snap->UdpConnections * 100 / Snap->TotalConnections) > 80) {
         return SsPsScan_UDPScan;
     }
 

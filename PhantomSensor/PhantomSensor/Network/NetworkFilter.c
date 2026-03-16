@@ -813,7 +813,16 @@ NfFilterShutdown(
     }
 
     //
-    // Shutdown network detection sub-modules (reverse init order)
+    // Unregister WFP filters and callouts FIRST — this drains in-flight
+    // classify callbacks so sub-module pointers are no longer accessed
+    // from WFP context.  Only then is it safe to destroy sub-modules.
+    //
+    NfpUnregisterFilters();
+    NfpUnregisterCallouts();
+
+    //
+    // Shutdown network detection sub-modules (reverse init order).
+    // WFP callouts are fully drained at this point — no UAF risk.
     //
     if (g_ProtocolParser != NULL) {
         PpShutdown(&g_ProtocolParser);
@@ -854,12 +863,6 @@ NfFilterShutdown(
         CtShutdown(g_ConnectionTracker);
         g_ConnectionTracker = NULL;
     }
-
-    //
-    // Unregister filters and callouts
-    //
-    NfpUnregisterFilters();
-    NfpUnregisterCallouts();
 
     //
     // Close WFP engine
@@ -3920,15 +3923,17 @@ NfpProcessDnsPacket(
     }
 
     //
-    // Insert into DNS tracking list (with cap to prevent pool exhaustion)
+    // Insert into DNS tracking list (with cap to prevent pool exhaustion).
+    // Double-check count under exclusive lock to close TOCTOU window.
     //
-    if ((ULONG)InterlockedCompareExchange(&g_NfState.DnsQueryCount, 0, 0)
-            >= NF_MAX_DNS_ENTRIES) {
+    FltAcquirePushLockExclusive(&g_NfState.DnsLock);
+
+    if ((ULONG)g_NfState.DnsQueryCount >= NF_MAX_DNS_ENTRIES) {
+        FltReleasePushLock(&g_NfState.DnsLock);
         NfpFreeDnsEntry(dnsEntry);
         goto Done;
     }
 
-    FltAcquirePushLockExclusive(&g_NfState.DnsLock);
     InsertTailList(&g_NfState.DnsQueryList, &dnsEntry->ListEntry);
     InterlockedIncrement(&g_NfState.DnsQueryCount);
     FltReleasePushLock(&g_NfState.DnsLock);
@@ -4047,6 +4052,14 @@ NfpProcessStreamData(
 
     UNREFERENCED_PARAMETER(InFixedValues);
     UNREFERENCED_PARAMETER(InMetaValues);
+
+    //
+    // Stream callouts can fire at DISPATCH_LEVEL. NfFilterFindConnectionByFlow
+    // acquires a push lock (requires IRQL <= APC_LEVEL). Bail early if elevated.
+    //
+    if (KeGetCurrentIrql() > APC_LEVEL) {
+        return;
+    }
 
     if (StreamPacket == NULL || StreamPacket->streamData == NULL) {
         return;
