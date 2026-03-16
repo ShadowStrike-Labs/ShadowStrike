@@ -499,6 +499,13 @@ ShadowStrikeAcquireSpinLockAtDpcLevel(
 
     KeAcquireSpinLockAtDpcLevel(&Lock->Lock);
 
+    //
+    // FIX SL-M1: Defensively set OldIrql to DISPATCH_LEVEL so that a
+    // mismatched ShadowStrikeReleaseSpinLock (instead of the correct
+    // ReleaseSpinLockFromDpcLevel) at least won't corrupt IRQL.
+    //
+    Lock->OldIrql = DISPATCH_LEVEL;
+
 #if SHADOWSTRIKE_LOCK_STATISTICS
     ShadowRecordAcquisition(&Lock->Stats, FALSE);
 #endif
@@ -724,7 +731,16 @@ ShadowStrikeReleaseQueuedSpinLockFromDpcLevel(
     }
 #endif
 
-    KeReleaseInStackQueuedSpinLockFromDpcLevel(&LockHandle->LockHandle);
+    //
+    // FIX SL-M2: Handle from TryAcquire has LockQueue.Lock == NULL (used
+    // KeTryToAcquireSpinLockAtDpcLevel, not in-stack queued API). Passing
+    // such a handle to KeReleaseInStackQueuedSpinLockFromDpcLevel is UB.
+    //
+    if (LockHandle->LockHandle.LockQueue.Lock == NULL && LockHandle->ParentLock != NULL) {
+        KeReleaseSpinLockFromDpcLevel(&LockHandle->ParentLock->Lock);
+    } else {
+        KeReleaseInStackQueuedSpinLockFromDpcLevel(&LockHandle->LockHandle);
+    }
 }
 
 // ============================================================================

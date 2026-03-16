@@ -207,7 +207,9 @@ DpcInitialize(
 
     //
     // Publish — Initialized is the gate for all queue operations.
+    // FIX DPC-M1: Init rundown protection for TOCTOU-safe queue/shutdown.
     //
+    ExInitializeRundownProtection(&mgr->RundownRef);
     InterlockedExchange(&mgr->Initialized, 1);
 
     *Manager = mgr;
@@ -256,15 +258,13 @@ DpcShutdown(
         if (obj->State == DpcState_Queued) {
             if (KeRemoveQueueDpc(&obj->Dpc)) {
                 //
-                // Successfully dequeued — dec ActiveCount (was incremented
-                // when we called KeInsertQueueDpc successfully).
-                // Note: ActiveCount is incremented in the DPC *routine*
-                // entry, not at queue time, so we do NOT decrement here.
-                // Just reset the object.
+                // Successfully dequeued — release rundown ref that was
+                // acquired in DpcQueue (won't reach DpcpCompleteObject).
                 //
                 DpcpClearContext(obj);
                 DpcpResetObject(obj);
                 InterlockedIncrement64(&mgr->TotalCancelled);
+                ExReleaseRundownProtection(&mgr->RundownRef);
             }
         }
     }
@@ -284,10 +284,32 @@ DpcShutdown(
     //
     if (InterlockedCompareExchange(&mgr->ActiveCount, 0, 0) > 0) {
         LARGE_INTEGER timeout;
+        NTSTATUS waitStatus;
         timeout.QuadPart = -30LL * 10000000LL;   // 30 seconds
-        KeWaitForSingleObject(&mgr->DrainEvent, Executive,
+        waitStatus = KeWaitForSingleObject(&mgr->DrainEvent, Executive,
                               KernelMode, FALSE, &timeout);
+        if (waitStatus == STATUS_TIMEOUT) {
+            //
+            // FIX DPC-H1: DPC callbacks still in-flight after 30s.
+            // Do NOT free — UAF from active DPC callbacks is worse
+            // than a small pool leak. Log and bail.
+            //
+#if DBG
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike:DPC] DpcShutdown: %ld callbacks still active after 30s timeout, "
+                "leaking %p to prevent UAF\n",
+                InterlockedCompareExchange(&mgr->ActiveCount, 0, 0), mgr);
+#endif
+            return;
+        }
     }
+
+    //
+    // STEP 4b (FIX DPC-M1): Wait for all rundown refs to be released.
+    // This ensures no DpcQueue caller is between the ExAcquire and
+    // KeInsertQueueDpc when we free the pool memory.
+    //
+    ExWaitForRundownProtectionRelease(&mgr->RundownRef);
 
     //
     // STEP 5: Free resources.
@@ -324,6 +346,15 @@ DpcQueue(
     }
 
     //
+    // FIX DPC-M1: Acquire rundown protection to prevent TOCTOU with DpcShutdown.
+    // Without this, DpcShutdown can free PoolMemory between our Initialized check
+    // and KeInsertQueueDpc, causing DPC to reference freed memory.
+    //
+    if (!ExAcquireRundownProtection(&Manager->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+
+    //
     // Allocate from free pool.
     //
     obj = DpcpAllocateObject(Manager);
@@ -335,6 +366,7 @@ DpcQueue(
                 SsPmRecordSample(pm, SsPmMetric_DroppedEvents, 1);
             }
         }
+        ExReleaseRundownProtection(&Manager->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -361,6 +393,7 @@ DpcQueue(
         status = DpcpCopyContext(obj, Context, ContextSize);
         if (!NT_SUCCESS(status)) {
             DpcpFreeObject(Manager, obj);
+            ExReleaseRundownProtection(&Manager->RundownRef);
             return status;
         }
     }
@@ -393,6 +426,7 @@ DpcQueue(
         if (!NT_SUCCESS(status)) {
             DpcpClearContext(obj);
             DpcpFreeObject(Manager, obj);
+            ExReleaseRundownProtection(&Manager->RundownRef);
             return status;
         }
     }
@@ -411,6 +445,7 @@ DpcQueue(
         InterlockedExchange((PLONG)&obj->State, DpcState_Free);
         DpcpClearContext(obj);
         DpcpFreeObject(Manager, obj);
+        ExReleaseRundownProtection(&Manager->RundownRef);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -440,6 +475,11 @@ DpcQueueExternal(
         return STATUS_INVALID_PARAMETER;
     }
 
+    // FIX DPC-M1: Rundown protection for DpcQueueExternal (same as DpcQueue)
+    if (!ExAcquireRundownProtection(&Manager->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+
     obj = DpcpAllocateObject(Manager);
     if (obj == NULL) {
         InterlockedIncrement64(&Manager->PoolExhausted);
@@ -449,6 +489,7 @@ DpcQueueExternal(
                 SsPmRecordSample(pm, SsPmMetric_DroppedEvents, 1);
             }
         }
+        ExReleaseRundownProtection(&Manager->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -491,6 +532,7 @@ DpcQueueExternal(
         if (!NT_SUCCESS(status)) {
             DpcpClearContext(obj);
             DpcpFreeObject(Manager, obj);
+            ExReleaseRundownProtection(&Manager->RundownRef);
             return status;
         }
     }
@@ -502,6 +544,7 @@ DpcQueueExternal(
         InterlockedExchange((PLONG)&obj->State, DpcState_Free);
         DpcpClearContext(obj);
         DpcpFreeObject(Manager, obj);
+        ExReleaseRundownProtection(&Manager->RundownRef);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -786,6 +829,11 @@ DpcpCompleteObject(
         InterlockedCompareExchange(&Manager->Initialized, 0, 0) == 0) {
         KeSetEvent(&Manager->DrainEvent, IO_NO_INCREMENT, FALSE);
     }
+
+    //
+    // FIX DPC-M1: Release rundown protection acquired in DpcQueue/DpcQueueExternal.
+    //
+    ExReleaseRundownProtection(&Manager->RundownRef);
 }
 
 // ============================================================================

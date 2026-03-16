@@ -245,31 +245,67 @@ ShadowStrikeWorkQueueShutdown(
     InterlockedExchange(&g_WqManager.Stats.State, (LONG)ShadowWqStateShutdown);
     KeSetEvent(&g_WqManager.ShutdownEvent, IO_NO_INCREMENT, FALSE);
 
-    // Wait for all in-flight operations to release rundown protection
-    ExWaitForRundownProtectionRelease(&g_WqManager.RundownProtection);
-
-    // FIX #15: Cancel all delayed timers on active items, then flush DPCs
+    //
+    // FIX WQ-H1: Cancel delayed timers and release their rundown refs BEFORE
+    // ExWaitForRundownProtectionRelease. Otherwise, timers that haven't fired
+    // yet hold rundown refs → infinite wait → driver unload hang.
+    //
     {
         KIRQL OldIrql;
-        PLIST_ENTRY Entry;
+        PLIST_ENTRY Entry, NextEntry;
+        LIST_ENTRY CancelledList;
+        InitializeListHead(&CancelledList);
 
         KeAcquireSpinLock(&g_WqManager.ActiveListLock, &OldIrql);
         for (Entry = g_WqManager.ActiveList.Flink;
              Entry != &g_WqManager.ActiveList;
-             Entry = Entry->Flink) {
+             Entry = NextEntry) {
 
+            NextEntry = Entry->Flink;
             PSHADOWSTRIKE_WORK_ITEM Item = CONTAINING_RECORD(
                 Entry, SHADOWSTRIKE_WORK_ITEM, ActiveListEntry);
 
             if (Item->Type == ShadowWqTypeDelayed) {
-                KeCancelTimer(&Item->DelayTimer);
+                BOOLEAN timerWasPending = KeCancelTimer(&Item->DelayTimer);
+                BOOLEAN canClean;
+                if (timerWasPending) {
+                    canClean = TRUE;
+                } else if (KeRemoveQueueDpc(&Item->DelayDpc)) {
+                    canClean = TRUE;
+                } else {
+                    canClean = FALSE;  // DPC ran → IoWorkItem will release rundown
+                }
+                if (canClean) {
+                    InterlockedExchange(&Item->CancelRequested, 1);
+                    RemoveEntryList(&Item->ActiveListEntry);
+                    InterlockedDecrement(&g_WqManager.ActiveCount);
+                    InsertTailList(&CancelledList, &Item->ActiveListEntry);
+                }
             }
         }
         KeReleaseSpinLock(&g_WqManager.ActiveListLock, OldIrql);
+
+        // Release rundown and cleanup cancelled delayed items outside spinlock
+        while (!IsListEmpty(&CancelledList)) {
+            Entry = RemoveHeadList(&CancelledList);
+            PSHADOWSTRIKE_WORK_ITEM Item = CONTAINING_RECORD(
+                Entry, SHADOWSTRIKE_WORK_ITEM, ActiveListEntry);
+            if (Item->Options.CancelCallback != NULL) {
+                __try {
+                    Item->Options.CancelCallback(Item->Context, Item->ContextSize);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    // Don't crash
+                }
+            }
+            WqiCompleteWorkItem(Item, STATUS_CANCELLED);
+        }
     }
 
-    // FIX #15: Flush all queued DPCs to ensure timer DPCs have completed
+    // Flush all queued DPCs to ensure timer DPCs have completed
     KeFlushQueuedDpcs();
+
+    // Wait for all in-flight operations to release rundown protection
+    ExWaitForRundownProtectionRelease(&g_WqManager.RundownProtection);
 
     // Wait for pending items if requested
     if (WaitForCompletion) {
@@ -1384,21 +1420,25 @@ ShadowStrikeCancelWorkItem(
         InterlockedExchange(&Item->CancelRequested, 1);
 
         //
-        // For delayed items: try to dequeue the pending DPC.
-        // WorkQueue DPCs don't do work inline — they dispatch to IoWorkItem.
-        // So KeFlushQueuedDpcs is NOT sufficient (IoWorkItem still pending).
-        // KeRemoveQueueDpc is the sole gate:
-        //   TRUE  → DPC dequeued, IoWorkItem never queued → immediate cleanup
-        //   FALSE → DPC ran/running, IoWorkItem in system queue → delegate
+        // For delayed items: determine cleanup path.
+        // FIX WQ-C1: Use KeCancelTimer return value as primary gate.
+        // When KeCancelTimer returns TRUE, DPC was never queued, so
+        // KeRemoveQueueDpc returns FALSE misleadingly. Must check both.
         //
         BOOLEAN canCleanNow = TRUE;
 
         if (Item->Type == ShadowWqTypeDelayed) {
-            KeCancelTimer(&Item->DelayTimer);
-            if (!KeRemoveQueueDpc(&Item->DelayDpc)) {
-                // DPC already ran → IoWorkItem pending → let completion path handle.
-                // WqiExecuteWorkItem will see CancelRequested → CancelCallback → complete.
-                canCleanNow = FALSE;
+            BOOLEAN timerWasPending = KeCancelTimer(&Item->DelayTimer);
+            if (timerWasPending) {
+                // Timer cancelled before expiry → DPC never queued → immediate cleanup
+                canCleanNow = TRUE;
+            } else {
+                // Timer already expired → DPC was queued or ran
+                if (KeRemoveQueueDpc(&Item->DelayDpc)) {
+                    canCleanNow = TRUE;   // DPC dequeued before it ran
+                } else {
+                    canCleanNow = FALSE;  // DPC ran → IoWorkItem pending
+                }
             }
         } else {
             // Non-delayed: IoWorkItem was queued at submission → will fire.
@@ -1675,12 +1715,16 @@ ShadowStrikeWorkQueueFlush(VOID)
         // Determine if we can clean this item immediately.
         // KeRemoveQueueDpc is safe at DISPATCH_LEVEL (under spinlock).
         //
+        //
+        // FIX WQ-C1 (Flush): Same KeCancelTimer gate fix as CancelWorkItem.
+        //
         BOOLEAN canCleanNow = FALSE;
 
         if (Item->Type == ShadowWqTypeDelayed) {
-            KeCancelTimer(&Item->DelayTimer);
-            if (KeRemoveQueueDpc(&Item->DelayDpc)) {
-                // DPC successfully dequeued — IoWorkItem was never queued.
+            BOOLEAN timerWasPending = KeCancelTimer(&Item->DelayTimer);
+            if (timerWasPending) {
+                canCleanNow = TRUE;
+            } else if (KeRemoveQueueDpc(&Item->DelayDpc)) {
                 canCleanNow = TRUE;
             }
             // else: DPC ran → IoWorkItem pending → leave in active list

@@ -177,6 +177,9 @@ typedef struct DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT) _DPC_MANAGER {
     /** Set TRUE after successful init; cleared at start of shutdown. */
     volatile LONG Initialized;
 
+    /** FIX DPC-M1: Rundown protection for TOCTOU between DpcQueue and DpcShutdown. */
+    EX_RUNDOWN_REF RundownRef;
+
     // ---- Lock-free object pool ----
 
     SLIST_HEADER FreePool;

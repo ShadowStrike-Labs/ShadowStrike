@@ -550,7 +550,16 @@ AwqShutdown(
         InterlockedExchange(&W->Running, 0);
 
         if (W->ThreadObject != NULL) {
-            KeWaitForSingleObject(W->ThreadObject, Executive, KernelMode, FALSE, &Timeout);
+            NTSTATUS waitStatus = KeWaitForSingleObject(
+                W->ThreadObject, Executive, KernelMode, FALSE, &Timeout);
+            if (waitStatus == STATUS_TIMEOUT) {
+                //
+                // FIX AWQ-H3: Thread still running — do NOT free W.
+                // UAF worse than small pool leak. Thread will eventually exit.
+                //
+                ObDereferenceObject(W->ThreadObject);
+                continue;  // leak W — do NOT free
+            }
             ObDereferenceObject(W->ThreadObject);
         }
         ExFreePoolWithTag(W, AWQ_POOL_TAG_THREAD);
@@ -1049,6 +1058,7 @@ AwqSubmitChain(
         It->ChainIndex = i;
         It->ChainLength = Count;
         It->Manager = Mgr;
+        InitializeListHead(&It->QueueLink);  // FIX AWQ-C1: safe for RemoveEntryList if cancelled before enqueue
         KeInitializeEvent(&It->CompletionEvent, NotificationEvent, FALSE);
         KeQuerySystemTimePrecise(&It->SubmitTime);
 
@@ -2098,10 +2108,26 @@ AwqpExecuteItem(
     }
 
     //
-    // Save chain info BEFORE completing (which may free the item)
+    // Save chain info BEFORE completing (which may free the item).
+    // FIX AWQ-H1: On failure, cancel+complete all successors to prevent orphaned
+    // items (permanent pool leak + rundown ref leak → shutdown hang).
     //
-    if (Item->NextInChain != NULL && NT_SUCCESS(Status)) {
-        NextChainItem = Item->NextInChain;
+    if (Item->NextInChain != NULL) {
+        if (NT_SUCCESS(Status)) {
+            NextChainItem = Item->NextInChain;
+        } else {
+            //
+            // Walk chain successors and cancel each one
+            //
+            PAWQ_WORK_ITEM_I Orphan = Item->NextInChain;
+            while (Orphan != NULL) {
+                PAWQ_WORK_ITEM_I NextOrphan = Orphan->NextInChain;
+                InterlockedExchange(&Orphan->State, (LONG)AwqItemState_Cancelled);
+                InterlockedIncrement64(&Mgr->Stats.TotalCancelled);
+                AwqpCompleteItem(Mgr, Orphan, STATUS_CANCELLED);
+                Orphan = NextOrphan;
+            }
+        }
     }
 
     //
@@ -2260,7 +2286,9 @@ AwqpCreateWorker(
     }
 
     //
-    // Get thread object (referenced), then close handle
+    // Get thread object (referenced).
+    // FIX AWQ-H2: Must keep handle open until ObRef check so we can wait for
+    // thread on failure (known pattern: wait before freeing context).
     //
     Status = ObReferenceObjectByHandle(
         ThreadHandle,
@@ -2270,20 +2298,20 @@ AwqpCreateWorker(
         (PVOID *)&W->ThreadObject,
         NULL);
 
-    ZwClose(ThreadHandle);
-    // Do NOT store the now-invalid handle
-
     if (!NT_SUCCESS(Status)) {
         //
         // Thread was created but we can't reference it.
-        // Signal it to stop; it will exit and free itself.
-        // ThreadObject remains NULL → worker self-frees on exit.
-        // Must balance the WorkerCount increment from ThreadId assignment.
+        // Signal it to stop, wait for termination, then cleanup.
         //
-        InterlockedDecrement(&Mgr->WorkerCount);
         InterlockedExchange(&W->Running, 0);
+        ZwWaitForSingleObject(ThreadHandle, FALSE, NULL);
+        ZwClose(ThreadHandle);
+        InterlockedDecrement(&Mgr->WorkerCount);
         return Status;
     }
+
+    ZwClose(ThreadHandle);
+    // Do NOT store the now-invalid handle
 
     //
     // Add to worker list

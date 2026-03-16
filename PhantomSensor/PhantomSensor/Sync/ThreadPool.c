@@ -1006,10 +1006,13 @@ TpSetAffinity(
     Pool->AffinityMask = AffinityMask;
 
     //
-    // Collect handles under spinlock, then apply at PASSIVE_LEVEL.
-    // ZwSetInformationThread requires PASSIVE_LEVEL — cannot call under spinlock.
+    // Collect thread objects under spinlock with extra references, then
+    // apply at PASSIVE_LEVEL using handles.
+    // FIX TP-M1: Use thread objects instead of raw handles. Handles can become
+    // stale if auto-scaling closes them between spinlock release and use.
     //
     {
+        PVOID threadObjects[TP_MAX_THREADS];
         HANDLE threadHandles[TP_MAX_THREADS];
         ULONG handleCount = 0;
         ULONG i;
@@ -1020,21 +1023,21 @@ TpSetAffinity(
              entry = entry->Flink) {
 
             threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
-            if (threadInfo->ThreadHandle != NULL &&
+            if (threadInfo->ThreadObject != NULL &&
+                threadInfo->ThreadHandle != NULL &&
                 threadInfo->State != TpThreadState_Stopping &&
                 threadInfo->State != TpThreadState_Stopped) {
-                threadHandles[handleCount++] = threadInfo->ThreadHandle;
+                ObReferenceObject(threadInfo->ThreadObject);
+                threadObjects[handleCount] = threadInfo->ThreadObject;
+                threadHandles[handleCount] = threadInfo->ThreadHandle;
+                handleCount++;
             }
         }
         KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
 
         //
-        // Apply at PASSIVE_LEVEL. Handles remain valid because:
-        // - Pool is not shutting down (checked by TppIsValidPool)
-        // - Threads don't close their own handles unless stop-requested AND
-        //   pool is not shutting down (self-cleanup path)
-        // - We're at PASSIVE_LEVEL, so no concurrent TpDestroy can proceed
-        //   past the thread list collection phase
+        // Apply at PASSIVE_LEVEL. Thread objects are referenced — safe even
+        // if auto-scaling concurrently destroys the thread.
         //
         for (i = 0; i < handleCount; i++) {
             NTSTATUS status = ZwSetInformationThread(
@@ -1054,6 +1057,7 @@ TpSetAffinity(
                     threadHandles[i], status);
 #endif
             }
+            ObDereferenceObject(threadObjects[i]);
         }
     }
 
@@ -1152,12 +1156,13 @@ TpGetStatistics(
     Stats->IdleThreads = (ULONG)InterlockedCompareExchange(&Pool->IdleThreadCount, 0, 0);
     Stats->RunningThreads = (ULONG)InterlockedCompareExchange(&Pool->RunningThreadCount, 0, 0);
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Pool->ConfigLock);
-    Stats->MinThreads = Pool->MinThreads;
-    Stats->MaxThreads = Pool->MaxThreads;
-    ExReleasePushLockShared(&Pool->ConfigLock);
-    KeLeaveCriticalRegion();
+    //
+    // FIX TP-H1: Read MinThreads/MaxThreads with volatile reads instead of
+    // push lock. Push lock requires <= APC_LEVEL, but this function is
+    // declared DISPATCH_LEVEL safe. ULONG reads are atomic on x86/x64.
+    //
+    Stats->MinThreads = *(volatile ULONG *)&Pool->MinThreads;
+    Stats->MaxThreads = *(volatile ULONG *)&Pool->MaxThreads;
 
     totalWorkItems = InterlockedCompareExchange64(&Pool->Stats.TotalWorkItems, 0, 0);
     Stats->TotalWorkItems = (ULONG64)totalWorkItems;
@@ -1335,12 +1340,13 @@ TppCreateThread(
     );
     if (!NT_SUCCESS(status)) {
         //
-        // Thread is already created but we can't get the object.
-        // Signal it to stop immediately and close the handle.
-        // DO NOT release pool ref here — the thread owns it and will release on exit.
+        // FIX TP-C2: Thread is already created but we can't get the object.
+        // Signal it to stop, then WAIT for termination before closing handle.
+        // Without the wait, driver unload can free code pages while thread runs.
         //
         info->StopRequested = 1;
         KeSetEvent(&info->StartEvent, IO_NO_INCREMENT, FALSE);
+        ZwWaitForSingleObject(threadHandle, FALSE, NULL);
         ZwClose(threadHandle);
         return status;
     }
@@ -1396,16 +1402,34 @@ TppDestroyThread(
 
     //
     // Wait for thread to terminate
+    // FIX TP-C1: If Wait=FALSE or timeout fires, do NOT free threadInfo.
+    // The thread's ExitCleanup path is still accessing it. Let the thread
+    // self-cleanup instead (clear OwnerWillDestroy so thread handles it).
     //
     if (Wait && ThreadInfo->ThreadObject != NULL) {
+        NTSTATUS waitStatus;
         timeout.QuadPart = -((LONGLONG)TP_THREAD_TERMINATE_TIMEOUT_MS * 10000);
-        KeWaitForSingleObject(
+        waitStatus = KeWaitForSingleObject(
             ThreadInfo->ThreadObject,
             Executive,
             KernelMode,
             FALSE,
             &timeout
         );
+        if (waitStatus == STATUS_TIMEOUT) {
+            //
+            // Thread still running — revert to self-cleanup to prevent UAF.
+            // Thread's exit path will handle ObDeref + ZwClose + free.
+            //
+            InterlockedExchange(&ThreadInfo->OwnerWillDestroy, 0);
+            return;
+        }
+    } else if (!Wait) {
+        //
+        // Caller doesn't want to wait — let thread self-cleanup.
+        //
+        InterlockedExchange(&ThreadInfo->OwnerWillDestroy, 0);
+        return;
     }
 
     //

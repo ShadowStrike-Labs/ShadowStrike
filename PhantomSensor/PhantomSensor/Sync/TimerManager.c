@@ -474,16 +474,32 @@ IRQL:
     // decrements and signals AllWorkItemsDrained when it reaches 0.
     // Without this, IoFreeWorkItem on an active work item → BSOD.
     //
+    {
+    BOOLEAN workItemsDrained = TRUE;
     if (Manager->PendingWorkItems > 0) {
         LARGE_INTEGER drainTimeout;
+        NTSTATUS drainStatus;
         drainTimeout.QuadPart = TM_SEC_TO_RELATIVE(10);
-        KeWaitForSingleObject(
+        drainStatus = KeWaitForSingleObject(
             &Manager->AllWorkItemsDrained,
             Executive,
             KernelMode,
             FALSE,
             &drainTimeout
             );
+        //
+        // FIX TM-M1: If timeout fires, work items are still active.
+        // IoFreeWorkItem on active item → BSOD. Skip IoFreeWorkItem for
+        // timers with active work items — leak is better than bugcheck.
+        //
+        if (drainStatus == STATUS_TIMEOUT) {
+            workItemsDrained = FALSE;
+#if DBG
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike:TM] TmShutdown: %ld work items still pending after 10s drain\n",
+                Manager->PendingWorkItems);
+#endif
+        }
     }
 
     //
@@ -499,9 +515,9 @@ IRQL:
         KeSetEvent(&timerInternal->Timer.CancelEvent, IO_NO_INCREMENT, FALSE);
 
         //
-        // Free work item if allocated
+        // Free work item if allocated — but ONLY if drain completed
         //
-        if (timerInternal->WorkItem != NULL) {
+        if (timerInternal->WorkItem != NULL && workItemsDrained) {
             IoFreeWorkItem(timerInternal->WorkItem);
             timerInternal->WorkItem = NULL;
         }
@@ -523,6 +539,7 @@ IRQL:
         timerInternal->Signature = 0;
         ShadowStrikeFreePoolWithTag(timerInternal, TM_POOL_TAG_TIMER);
     }
+    }  // end workItemsDrained scope
 
     //
     // Free the manager
@@ -1731,6 +1748,13 @@ Routine Description:
     KeCancelTimer(&TimerInternal->Timer.KernelTimer);
 
     //
+    // FIX TM-H1: Dequeue any pending DPC. KeCancelTimer only prevents
+    // future expirations — a DPC already queued from a recent fire
+    // would still execute and resurrect a "stopped" timer as a zombie.
+    //
+    KeRemoveQueueDpc(&TimerInternal->Timer.TimerDpc);
+
+    //
     // Remove from wheel
     //
     TmpRemoveTimerFromWheel(Manager, TimerInternal);
@@ -1868,10 +1892,19 @@ Routine Description:
     }
 
     //
-    // Transition to firing state
+    // Transition to firing state.
+    // FIX TM-H1 defense-in-depth: Use CAS instead of unconditional exchange.
+    // If timer was stopped/cancelled between DPC queue and DPC execution,
+    // state won't be Active → stale DPC bails instead of invoking callback.
     //
-    InterlockedExchange(&TimerInternal->Timer.State,
-                        (LONG)TmTimerState_Firing);
+    if (InterlockedCompareExchange(&TimerInternal->Timer.State,
+            (LONG)TmTimerState_Firing,
+            (LONG)TmTimerState_Active) != (LONG)TmTimerState_Active) {
+        //
+        // Timer was stopped/cancelled — stale DPC, bail
+        //
+        return;
+    }
 
     //
     // Update statistics
