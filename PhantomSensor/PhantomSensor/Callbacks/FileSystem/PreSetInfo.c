@@ -466,7 +466,8 @@ PsipUpdateProcessMetrics(
     _In_ HANDLE ProcessId,
     _In_ FILE_INFORMATION_CLASS InfoClass,
     _In_opt_ PCUNICODE_STRING FileName,
-    _In_opt_ PCUNICODE_STRING NewFileName
+    _In_opt_ PCUNICODE_STRING NewFileName,
+    _In_ BOOLEAN IsConfirmedDeletion
     );
 
 static BOOLEAN
@@ -868,6 +869,7 @@ ShadowStrikePreSetInformation(
     BOOLEAN newFileNameAllocated = FALSE;
     PPSI_PROCESS_CONTEXT processContext = NULL;
     BOOLEAN operationEntered = FALSE;
+    BOOLEAN isActualDeletion = FALSE;
     BOOLEAN blockDelete = FALSE;
     BOOLEAN blockRename = FALSE;
     BOOLEAN blockHardLink = FALSE;
@@ -941,9 +943,50 @@ ShadowStrikePreSetInformation(
 
     switch (infoClass) {
         case FileDispositionInformation:
-        case FileDispositionInformationEx:
-            InterlockedIncrement64(&g_PsiState.Stats.DeleteOperations);
+        {
+            //
+            // FSC-3 (CRITICAL): Inspect DeleteFile flag before counting as deletion.
+            // DeleteFile=FALSE means "clear deletion mark" (undelete), not delete.
+            // Counting undeletes as deletions causes false ransomware alerts.
+            //
+            PFILE_DISPOSITION_INFORMATION dispInfo =
+                (PFILE_DISPOSITION_INFORMATION)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+            if (Data->Iopb->Parameters.SetFileInformation.Length >=
+                sizeof(FILE_DISPOSITION_INFORMATION) &&
+                dispInfo != NULL) {
+                __try {
+                    if (dispInfo->DeleteFile) {
+                        InterlockedIncrement64(&g_PsiState.Stats.DeleteOperations);
+                        isActualDeletion = TRUE;
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    // Buffer access failed — treat as non-deletion (fail-safe)
+                }
+            }
             break;
+        }
+        case FileDispositionInformationEx:
+        {
+            //
+            // FSC-3: For Ex variant, check FILE_DISPOSITION_DELETE flag (bit 0).
+            // Also detect POSIX semantics (bit 1).
+            //
+            PFILE_DISPOSITION_INFORMATION_EX dispInfoEx =
+                (PFILE_DISPOSITION_INFORMATION_EX)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+            if (Data->Iopb->Parameters.SetFileInformation.Length >=
+                sizeof(FILE_DISPOSITION_INFORMATION_EX) &&
+                dispInfoEx != NULL) {
+                __try {
+                    if (dispInfoEx->Flags & FILE_DISPOSITION_DELETE) {
+                        InterlockedIncrement64(&g_PsiState.Stats.DeleteOperations);
+                        isActualDeletion = TRUE;
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    // Buffer access failed — treat as non-deletion (fail-safe)
+                }
+            }
+            break;
+        }
         case FileRenameInformation:
         case FileRenameInformationEx:
             InterlockedIncrement64(&g_PsiState.Stats.RenameOperations);
@@ -1212,7 +1255,8 @@ ShadowStrikePreSetInformation(
             requestorPid,
             infoClass,
             &nameInfo->Name,
-            newFileNameAllocated ? &newFileName : NULL
+            newFileNameAllocated ? &newFileName : NULL,
+            isActualDeletion
             );
 
         //
@@ -1707,7 +1751,8 @@ PsipUpdateProcessMetrics(
     _In_ HANDLE ProcessId,
     _In_ FILE_INFORMATION_CLASS InfoClass,
     _In_opt_ PCUNICODE_STRING FileName,
-    _In_opt_ PCUNICODE_STRING NewFileName
+    _In_opt_ PCUNICODE_STRING NewFileName,
+    _In_ BOOLEAN IsConfirmedDeletion
     )
 {
     PPSI_PROCESS_CONTEXT context;
@@ -1727,8 +1772,14 @@ PsipUpdateProcessMetrics(
     switch (InfoClass) {
         case FileDispositionInformation:
         case FileDispositionInformationEx:
-            InterlockedIncrement(&context->RecentDeletes);
-            InterlockedIncrement64(&context->TotalDeletes);
+            //
+            // FSC-3: Only count confirmed deletions (DeleteFile=TRUE / FILE_DISPOSITION_DELETE).
+            // Undelete operations (clearing delete flag) must NOT inflate ransomware counters.
+            //
+            if (IsConfirmedDeletion) {
+                InterlockedIncrement(&context->RecentDeletes);
+                InterlockedIncrement64(&context->TotalDeletes);
+            }
             break;
 
         case FileRenameInformation:

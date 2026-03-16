@@ -287,7 +287,10 @@ PocpCompareExtensionSafe(
 #pragma alloc_text(PAGE, PocInvalidateScanResult)
 #pragma alloc_text(PAGE, PocAllocateCompletionContext)
 #pragma alloc_text(PAGE, PocGetOrCreateHandleContext)
-#pragma alloc_text(PAGE, ShadowStrikePostCreate)
+// ShadowStrikePostCreate intentionally NOT in PAGE section:
+// Post-op callbacks can run at DISPATCH_LEVEL when FLTFL_POST_OPERATION_DRAINING
+// is set. The IRQL guard bails before any paged operations, but the function
+// entry point itself must be in non-paged memory to prevent page-fault BSOD.
 #pragma alloc_text(PAGE, PocpQueryFileInformation)
 #pragma alloc_text(PAGE, PocpSetTrackingFlags)
 #pragma alloc_text(PAGE, PocpQueryVolumeSerial)
@@ -489,24 +492,26 @@ Return Value:
     POC_FILE_CLASS fileClass = PocFileClassUnknown;
     ULONG volumeSerial = 0;
 
+    //
+    // FSC-1 (CRITICAL): IRQL guard MUST come BEFORE PAGED_CODE().
+    // Post-op callbacks can run at DISPATCH_LEVEL when draining.
+    // PAGED_CODE() would bugcheck at DISPATCH; paged memory would fault.
+    // Check draining + IRQL first, then assert paged safety.
+    //
+    if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING)) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    if (KeGetCurrentIrql() > APC_LEVEL) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
     PAGED_CODE();
 
     //
     // Always increment total operations (atomic)
     //
     InterlockedIncrement64(&g_PocState.Stats.TotalPostCreates);
-
-    // ========================================================================
-    // PHASE 1: FAST-FAIL CHECKS
-    // ========================================================================
-
-    //
-    // Check if we're draining - don't do any work during unload
-    //
-    if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING)) {
-        InterlockedIncrement64(&g_PocState.Stats.DrainingSkipped);
-        goto Cleanup;
-    }
 
     //
     // Check if driver is ready (volatile reads — aligned LONG on x64 is atomic)

@@ -878,7 +878,13 @@ ShadowStrikePostWrite(
                 NormalPagePriority | MdlMappingNoExecute
             );
         } else {
-            writeBuffer = Data->Iopb->Parameters.Write.WriteBuffer;
+            //
+            // FSC-4: In post-op callbacks, the user-mode WriteBuffer may be
+            // invalid (freed, paged out, or unmapped). Only MDL-backed buffers
+            // are safely accessible. Skip entropy for non-MDL writes rather
+            // than relying on __try as a silent failure mechanism.
+            //
+            writeBuffer = NULL;
         }
 
         if (writeBuffer != NULL) {

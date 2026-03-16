@@ -563,9 +563,9 @@ PocShutdown(
  *
  * @return FLT_POSTOP_FINISHED_PROCESSING.
  *
- * @irql PASSIVE_LEVEL (post-create is always at PASSIVE)
+ * @irql <= DISPATCH_LEVEL (PASSIVE normally; DISPATCH when draining)
  */
-_IRQL_requires_(PASSIVE_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
 FLT_POSTOP_CALLBACK_STATUS
 ShadowStrikePostCreate(
     _Inout_ PFLT_CALLBACK_DATA Data,

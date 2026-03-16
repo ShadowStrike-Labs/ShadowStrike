@@ -2337,6 +2337,13 @@ FbepEvictLruEntries(
         // Mark as evicted under LRU lock to prevent concurrent rollback
         // from claiming this entry via CAS on State.
         //
+        // FSC-6: Lock ordering note — we release LruLock before acquiring
+        // BucketLock/TrackerLock, which is the opposite of the insert path.
+        // This is safe because:
+        // 1. State=Evicted prevents concurrent rollback (CAS check)
+        // 2. Hash lookup finds entry but State=Evicted causes skip
+        // 3. EntryCount decrement is eventually consistent
+        //
         LONG PrevState = InterlockedExchange(&Entry->State, FbeEntryState_Evicted);
 
         //

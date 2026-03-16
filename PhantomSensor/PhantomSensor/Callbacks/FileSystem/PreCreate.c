@@ -1553,6 +1553,16 @@ Return Value:
 
             SbFreeMessageBuffer(RequestMsg);
             RequestMsg = NULL;
+        } else {
+            //
+            // FSC-5: SbBuildFileScanRequest failed (e.g., memory allocation).
+            // Apply FailOpenOnError policy — if fail-closed, block access.
+            //
+            InterlockedIncrement64(&g_PcState.Stats.ScanErrors);
+
+            if (!g_PcState.Config.FailOpenOnError) {
+                ShouldBlock = TRUE;
+            }
         }
     }
 

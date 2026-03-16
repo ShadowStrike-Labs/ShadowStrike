@@ -1314,6 +1314,7 @@ IRQL:
     ULONG SuspicionScore = 0;
     BOOLEAN ShouldBlock = FALSE;
     BOOLEAN IsExecuteMapping = FALSE;
+    BOOLEAN IsImageMapping = FALSE;
     BOOLEAN IsCacheHit = FALSE;
     PFLT_FILE_NAME_INFORMATION NameInfo = NULL;
     LONG InitState;
@@ -1357,9 +1358,16 @@ IRQL:
     }
 
     //
-    // Get page protection from parameters
+    // FSC-2 (CRITICAL): Check SyncType BEFORE reading PageProtection.
+    // PageProtection is only valid when SyncType == SyncTypeCreateSection.
+    // For SyncTypeOther, PageProtection is zero/undefined per MS docs.
     //
     if (Data == NULL || Data->Iopb == NULL) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    if (Data->Iopb->Parameters.AcquireForSectionSynchronization.SyncType !=
+        SyncTypeCreateSection) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -1375,10 +1383,20 @@ IRQL:
     IsExecuteMapping = TRUE;
 
     //
+    // Detect SEC_IMAGE mappings (executable image loads vs data+execute)
+    //
+    if (PageProtection & SEC_IMAGE) {
+        IsImageMapping = TRUE;
+    }
+
+    //
     // Update statistics (unsigned, no overflow UB)
     //
     InterlockedIncrement64((PLONG64)&g_PasState.Stats.TotalCalls);
     InterlockedIncrement64((PLONG64)&g_PasState.Stats.ExecuteMappings);
+    if (IsImageMapping) {
+        InterlockedIncrement64((PLONG64)&g_PasState.Stats.ImageMappings);
+    }
 
     //
     // Skip kernel-mode requests (trust the kernel)
@@ -2270,6 +2288,14 @@ PaspClassifyMapping(
     if ((PageProtection & PAGE_EXECUTE_READWRITE) ||
         (PageProtection & PAGE_EXECUTE_WRITECOPY)) {
         Flags |= PAS_MAP_FLAG_WRITABLE;
+    }
+
+    //
+    // FSC-2: Detect SEC_IMAGE mappings (executable image loads).
+    // SEC_IMAGE indicates a PE image load vs a data section with execute perms.
+    //
+    if (PageProtection & SEC_IMAGE) {
+        Flags |= PAS_MAP_FLAG_IMAGE;
     }
 
     return Flags;

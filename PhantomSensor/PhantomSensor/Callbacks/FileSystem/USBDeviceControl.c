@@ -1486,12 +1486,17 @@ UdcpResolvePolicy(
         }
     }
 
+    //
+    // FSC-7: Capture DefaultPolicy under lock to ensure consistency
+    // with the rule check we just performed.
+    //
+    UDC_DEVICE_POLICY DefaultPolicy = g_UdcState.Config.DefaultPolicy;
     FltReleasePushLock(&g_UdcState.RulesLock);
 
     //
     // No matching rule — return default policy
     //
-    return g_UdcState.Config.DefaultPolicy;
+    return DefaultPolicy;
 }
 
 // ============================================================================
