@@ -368,11 +368,14 @@ ShadowStrikeAllocatePoolWithTag(
     }
 
     //
-    // Convert legacy NonPagedPool to NonPagedPoolNx for security
-    // This prevents execution from pool memory (DEP)
+    // Convert legacy NonPagedPool to NonPagedPoolNx for security.
+    // This prevents execution from pool memory (DEP).
+    // Also convert NonPagedPoolCacheAligned to its NX variant.
     //
     if (PoolType == NonPagedPool) {
         PoolType = NonPagedPoolNx;
+    } else if (PoolType == NonPagedPoolCacheAligned) {
+        PoolType = NonPagedPoolNxCacheAligned;
     }
 
     //
@@ -493,14 +496,45 @@ ShadowStrikeAllocatePoolWithFlags(
     }
 
     //
-    // Standard allocation
+    // Standard allocation.
+    // If ChargeQuota is requested, use ExAllocatePool2 with POOL_FLAG_USE_QUOTA
+    // directly (ExAllocatePool2 returns NULL on failure, safe without __try).
     //
-    Buffer = ShadowStrikeAllocatePoolWithTag(PoolType, NumberOfBytes, Tag);
+    if (Flags & ShadowAllocChargeQuota) {
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+        POOL_FLAGS QuotaFlags = POOL_FLAG_USE_QUOTA;
+        if (PoolType == PagedPool || PoolType == PagedPoolCacheAligned) {
+            QuotaFlags |= POOL_FLAG_PAGED;
+        } else {
+            QuotaFlags |= POOL_FLAG_NON_PAGED;
+        }
+        Buffer = ExAllocatePool2(QuotaFlags, NumberOfBytes, Tag);
+#else
+        //
+        // Legacy path: ExAllocatePoolWithQuotaTag raises on failure,
+        // so wrap in SEH and convert to NULL return.
+        //
+        __try {
+            Buffer = ExAllocatePoolWithQuotaTag(PoolType, NumberOfBytes, Tag);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Buffer = NULL;
+        }
+        if (Buffer != NULL) {
+            RtlZeroMemory(Buffer, NumberOfBytes);
+        }
+#endif
+    } else {
+        Buffer = ShadowStrikeAllocatePoolWithTag(PoolType, NumberOfBytes, Tag);
+    }
+
+HandlePostAllocationFlags:
 
     //
     // Handle must-succeed flag (retry logic).
     // Only retry at <= APC_LEVEL where we can sleep. At DISPATCH_LEVEL,
     // retrying without delay is a pointless busy-wait that will not help.
+    // NOTE: For aligned/contiguous paths that jump here, retry uses standard
+    // pool allocation — the original path already exhausted its allocator.
     //
     if (Buffer == NULL && (Flags & ShadowAllocMustSucceed)) {
         if (KeGetCurrentIrql() <= APC_LEVEL) {
@@ -513,8 +547,6 @@ ShadowStrikeAllocatePoolWithFlags(
             }
         }
     }
-
-HandlePostAllocationFlags:
 
     //
     // Handle raise-on-failure flag
@@ -622,7 +654,8 @@ ShadowStrikeAllocateAligned(
     Header = (PSHADOWSTRIKE_ALIGNED_HEADER)((ULONG_PTR)AlignedBuffer - sizeof(SHADOWSTRIKE_ALIGNED_HEADER));
     Header->OriginalPointer = RawBuffer;
     Header->Alignment = Alignment;
-    Header->AllocationSize = NumberOfBytes;
+    Header->AllocationSize = TotalSize;
+    Header->UserSize = NumberOfBytes;
     Header->Magic = SHADOWSTRIKE_ALIGNED_MAGIC;
     Header->PoolTag = Tag;
 
@@ -805,6 +838,8 @@ ShadowStrikeFreeAligned(
     AllocationSize = Header->AllocationSize;
     OriginalPointer = Header->OriginalPointer;
 
+    SIZE_T UserSize = Header->UserSize;
+
     //
     // Validate OriginalPointer is a kernel address and precedes P.
     // The raw allocation starts at OriginalPointer, and the aligned buffer
@@ -829,42 +864,40 @@ ShadowStrikeFreeAligned(
     }
 
     //
-    // Validate AllocationSize against maximum.
+    // Validate UserSize against maximum.
     // A corrupted header could have an enormous size, causing
     // ShadowStrikeSecureZeroMemory to wipe past the buffer boundary.
     //
-    if (AllocationSize > SHADOWSTRIKE_MAX_ALLOCATION_SIZE) {
+    if (UserSize > SHADOWSTRIKE_MAX_ALLOCATION_SIZE) {
         MEMORY_TRACK_CORRUPTION();
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_ERROR_LEVEL,
             "[ShadowStrike] CORRUPTION: Aligned header at %p has "
-            "AllocationSize=%llu exceeding maximum %llu — refusing to free\n",
+            "UserSize=%llu exceeding maximum %llu — refusing to free\n",
             Header,
-            (ULONGLONG)AllocationSize,
+            (ULONGLONG)UserSize,
             (ULONGLONG)SHADOWSTRIKE_MAX_ALLOCATION_SIZE
         );
         return;
     }
 
     //
-    // Secure wipe the user data portion.
+    // Secure wipe the user data portion only (UserSize, not AllocationSize).
     // Apply DISPATCH_LEVEL size cap to avoid DPC timeout on large buffers.
     //
-    if (AllocationSize > 0) {
+    if (UserSize > 0) {
         if (KeGetCurrentIrql() >= DISPATCH_LEVEL &&
-            AllocationSize > SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE) {
+            UserSize > SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE) {
             ShadowStrikeSecureZeroMemory(P, SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE);
         } else {
-            ShadowStrikeSecureZeroMemory(P, AllocationSize);
+            ShadowStrikeSecureZeroMemory(P, UserSize);
         }
     }
 
     //
-    // Track the free with byte-accurate statistics.
-    // We bypass ShadowStrikeFreePoolWithTag here to use MEMORY_TRACK_FREE
-    // instead of MEMORY_TRACK_FREE_COUNT_ONLY, since we know the exact
-    // allocation size from the header.
+    // Track the free with the total pool allocation size (AllocationSize)
+    // to match what ShadowStrikeAllocatePoolWithTag tracked on alloc.
     //
     MEMORY_TRACK_FREE(AllocationSize);
     ExFreePoolWithTag(OriginalPointer, SHADOWSTRIKE_ALIGNED_TAG);

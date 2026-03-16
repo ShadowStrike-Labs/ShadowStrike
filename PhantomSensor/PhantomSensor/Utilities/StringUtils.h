@@ -448,7 +448,7 @@ ShadowStrikeIsPathUnderDirectory(
  *
  * @return Match result enumeration
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql PASSIVE_LEVEL (function is in paged code section)
  */
 SHADOW_MATCH_RESULT
 ShadowStrikeMatchWildcard(

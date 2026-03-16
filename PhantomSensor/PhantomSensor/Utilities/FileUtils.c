@@ -1276,9 +1276,11 @@ ShadowStrikeGetFileInfo(
             BOOLEAN foundZoneStream = FALSE;
             const ULONG streamBufSize = 4096;
             UNICODE_STRING zoneIdStream;
+            UNICODE_STRING zoneIdStreamData;
             UNICODE_STRING streamName;
 
             RtlInitUnicodeString(&zoneIdStream, SHADOW_ZONE_IDENTIFIER_STREAM);
+            RtlInitUnicodeString(&zoneIdStreamData, SHADOW_ZONE_IDENTIFIER_STREAM_DATA);
 
             streamBuffer = (PUCHAR)ExAllocatePool2(
                 POOL_FLAG_PAGED,
@@ -1307,13 +1309,16 @@ ShadowStrikeGetFileInfo(
                         streamCount++;
 
                         //
-                        // Check for Zone.Identifier stream
+                        // Check for Zone.Identifier stream.
+                        // NTFS returns stream names as ":Name:$DATA" but we
+                        // also check the short form for robustness.
                         //
                         streamName.Buffer = streamInfo->StreamName;
                         streamName.Length = (USHORT)min(streamInfo->StreamNameLength, MAXUSHORT);
                         streamName.MaximumLength = streamName.Length;
 
-                        if (RtlEqualUnicodeString(&streamName, &zoneIdStream, TRUE)) {
+                        if (RtlEqualUnicodeString(&streamName, &zoneIdStreamData, TRUE) ||
+                            RtlEqualUnicodeString(&streamName, &zoneIdStream, TRUE)) {
                             foundZoneStream = TRUE;
                         }
 
@@ -2188,12 +2193,12 @@ ShadowpReadZoneIdentifierContent(
     totalPathSize = (SIZE_T)fileName.Length +
                     (sizeof(SHADOW_ZONE_IDENTIFIER_STREAM) - sizeof(WCHAR));
 
-    if (totalPathSize > MAXUSHORT || totalPathSize > SHADOW_MAX_PATH_BYTES) {
+    if (totalPathSize + sizeof(WCHAR) > MAXUSHORT || totalPathSize > SHADOW_MAX_PATH_BYTES) {
         ShadowStrikeFreeFileName(&fileName);
         return STATUS_NAME_TOO_LONG;
     }
 
-    adsPath.MaximumLength = (USHORT)totalPathSize + sizeof(WCHAR);
+    adsPath.MaximumLength = (USHORT)(totalPathSize + sizeof(WCHAR));
     adsPath.Buffer = (PWCH)ExAllocatePool2(
         POOL_FLAG_PAGED,
         adsPath.MaximumLength,
@@ -2315,6 +2320,7 @@ ShadowStrikeGetZoneIdentifier(
     PFILE_STREAM_INFORMATION streamInfo;
     ULONG returnLength;
     UNICODE_STRING zoneIdStream;
+    UNICODE_STRING zoneIdStreamData;
     UNICODE_STRING streamName;
     ULONG currentOffset = 0;
     BOOLEAN foundStream = FALSE;
@@ -2330,6 +2336,7 @@ ShadowStrikeGetZoneIdentifier(
     }
 
     RtlInitUnicodeString(&zoneIdStream, SHADOW_ZONE_IDENTIFIER_STREAM);
+    RtlInitUnicodeString(&zoneIdStreamData, SHADOW_ZONE_IDENTIFIER_STREAM_DATA);
 
     //
     // Allocate buffer from pool
@@ -2377,7 +2384,12 @@ ShadowStrikeGetZoneIdentifier(
         streamName.Length = (USHORT)min(streamInfo->StreamNameLength, MAXUSHORT);
         streamName.MaximumLength = streamName.Length;
 
-        if (RtlEqualUnicodeString(&streamName, &zoneIdStream, TRUE)) {
+        //
+        // Match against both NTFS full format (:Zone.Identifier:$DATA)
+        // and short format (:Zone.Identifier) for robustness
+        //
+        if (RtlEqualUnicodeString(&streamName, &zoneIdStreamData, TRUE) ||
+            RtlEqualUnicodeString(&streamName, &zoneIdStream, TRUE)) {
             foundStream = TRUE;
             break;
         }
@@ -2987,9 +2999,19 @@ ShadowpValidateReparseBuffer(
         }
 
         //
-        // Calculate actual data area available for path strings
+        // Calculate data area available for path strings.
+        // ReparseDataLength includes the fixed fields (4×USHORT + Flags ULONG = 12 bytes)
+        // before PathBuffer. SubstituteNameOffset/PrintNameOffset are relative to
+        // PathBuffer[0], so subtract the fixed-field size.
         //
-        dataAreaSize = ReparseData->ReparseDataLength;
+        {
+            ULONG fixedSize = FIELD_OFFSET(REPARSE_DATA_BUFFER, SymbolicLinkReparseBuffer.PathBuffer) -
+                              FIELD_OFFSET(REPARSE_DATA_BUFFER, SymbolicLinkReparseBuffer);
+            if (ReparseData->ReparseDataLength < fixedSize) {
+                return FALSE;
+            }
+            dataAreaSize = ReparseData->ReparseDataLength - fixedSize;
+        }
 
         if ((ULONG)ReparseData->SymbolicLinkReparseBuffer.SubstituteNameOffset +
             ReparseData->SymbolicLinkReparseBuffer.SubstituteNameLength > dataAreaSize) {
@@ -3006,7 +3028,14 @@ ShadowpValidateReparseBuffer(
             return FALSE;
         }
 
-        dataAreaSize = ReparseData->ReparseDataLength;
+        {
+            ULONG fixedSize = FIELD_OFFSET(REPARSE_DATA_BUFFER, MountPointReparseBuffer.PathBuffer) -
+                              FIELD_OFFSET(REPARSE_DATA_BUFFER, MountPointReparseBuffer);
+            if (ReparseData->ReparseDataLength < fixedSize) {
+                return FALSE;
+            }
+            dataAreaSize = ReparseData->ReparseDataLength - fixedSize;
+        }
 
         if ((ULONG)ReparseData->MountPointReparseBuffer.SubstituteNameOffset +
             ReparseData->MountPointReparseBuffer.SubstituteNameLength > dataAreaSize) {

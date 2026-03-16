@@ -85,6 +85,7 @@ extern "C" {
 #define SHADOW_MZ_SIGNATURE             0x5A4D
 #define SHADOW_PE_SIGNATURE             0x00004550
 #define SHADOW_ZONE_IDENTIFIER_STREAM   L":Zone.Identifier"
+#define SHADOW_ZONE_IDENTIFIER_STREAM_DATA  L":Zone.Identifier:$DATA"
 #define SHADOW_MAX_STACK_BUFFER         512
 
 // ============================================================================

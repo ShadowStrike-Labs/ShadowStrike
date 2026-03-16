@@ -649,7 +649,7 @@ ShadowStrikeInitializeHashUtils(
     );
 
     if (NT_SUCCESS(ProviderStatus)) {
-        BCryptGetProperty(
+        ProviderStatus = BCryptGetProperty(
             g_HashGlobals.HmacSha256Handle,
             BCRYPT_OBJECT_LENGTH,
             (PUCHAR)&g_HashGlobals.HmacSha256ObjectSize,
@@ -657,6 +657,15 @@ ShadowStrikeInitializeHashUtils(
             &ResultLength,
             0
         );
+
+        if (!NT_SUCCESS(ProviderStatus)) {
+            BCryptCloseAlgorithmProvider(
+                g_HashGlobals.HmacSha256Handle,
+                0
+            );
+            g_HashGlobals.HmacSha256Handle = NULL;
+            g_HashGlobals.HmacSha256ObjectSize = 0;
+        }
     }
 
     //

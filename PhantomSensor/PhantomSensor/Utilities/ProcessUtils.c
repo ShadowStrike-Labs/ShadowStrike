@@ -822,8 +822,19 @@ ShadowProcessUtilsInitialize(
         for (i = 0; i < 500; i++) { // 5 second timeout
             KeDelayExecutionThread(KernelMode, FALSE, &SleepInterval);
 
-            if (g_ProcessUtilsState.InitializationState == PROCUTILS_STATE_INITIALIZED) {
+            LONG CurrentState = g_ProcessUtilsState.InitializationState;
+            if (CurrentState == PROCUTILS_STATE_INITIALIZED) {
                 return STATUS_SUCCESS;
+            }
+            //
+            // If the first initializer failed and reset to UNINITIALIZED,
+            // break immediately rather than waiting the full 5 seconds.
+            //
+            if (CurrentState == PROCUTILS_STATE_UNINITIALIZED) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] ProcessUtils: peer initializer failed, "
+                           "state reverted to UNINITIALIZED\n");
+                return STATUS_UNSUCCESSFUL;
             }
         }
 
@@ -935,6 +946,25 @@ ShadowProcessUtilsCleanup(
     }
 
     //
+    // Mark as shutting down FIRST to prevent new callers from entering.
+    // In-flight callers already captured their function pointer copies.
+    //
+    InterlockedExchange(&g_ProcessUtilsState.InitializationState, PROCUTILS_STATE_UNINITIALIZED);
+
+    //
+    // Brief drain window: allow in-flight callers that already checked
+    // InitializationState == INITIALIZED to finish their current call.
+    // ProcessUtils APIs are very fast (simple lookups/queries), so 50ms
+    // is generous. Without this, nulling pointers could race with callers
+    // who passed the state check but haven't read their pointer yet.
+    //
+    {
+        LARGE_INTEGER DrainDelay;
+        DrainDelay.QuadPart = -((LONGLONG)50 * 10000LL); // 50ms
+        KeDelayExecutionThread(KernelMode, FALSE, &DrainDelay);
+    }
+
+    //
     // Cleanup creating context table
     //
     KeEnterCriticalRegion();
@@ -956,7 +986,7 @@ ShadowProcessUtilsCleanup(
     KeLeaveCriticalRegion();
 
     //
-    // Clear function pointers
+    // Clear function pointers — safe now, all in-flight callers have drained
     //
     g_ProcessUtilsState.ZwQueryInformationProcess = NULL;
     g_ProcessUtilsState.ZwQueryInformationThread = NULL;
@@ -966,11 +996,6 @@ ShadowProcessUtilsCleanup(
     g_ProcessUtilsState.PsIsProtectedProcess = NULL;
     g_ProcessUtilsState.PsIsSecureProcess = NULL;
     g_ProcessUtilsState.SystemProcess = NULL;
-
-    //
-    // NOW mark as fully uninitialized — cleanup is complete
-    //
-    InterlockedExchange(&g_ProcessUtilsState.InitializationState, PROCUTILS_STATE_UNINITIALIZED);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] ProcessUtils cleaned up\n");

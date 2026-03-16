@@ -673,12 +673,19 @@ ShadowStrikeGetDirectoryPath(
     dirLength = (USHORT)((i + 1) * sizeof(WCHAR));
 
     //
+    // Validate MaximumLength won't overflow USHORT
+    //
+    if ((SIZE_T)dirLength + sizeof(WCHAR) > MAXUSHORT) {
+        return STATUS_NAME_TOO_LONG;
+    }
+
+    //
     // Allocate and copy
     //
     Directory->Buffer = (PWCH)ExAllocatePool2(
         POOL_FLAG_PAGED,
         dirLength + sizeof(WCHAR),
-        SHADOW_PATH_TAG
+        SHADOW_STRING_TAG
     );
 
     if (Directory->Buffer == NULL) {
@@ -688,7 +695,7 @@ ShadowStrikeGetDirectoryPath(
     RtlCopyMemory(Directory->Buffer, FullPath->Buffer, dirLength);
     Directory->Buffer[dirLength / sizeof(WCHAR)] = L'\0';
     Directory->Length = dirLength;
-    Directory->MaximumLength = dirLength + sizeof(WCHAR);
+    Directory->MaximumLength = (USHORT)(dirLength + sizeof(WCHAR));
 
     return STATUS_SUCCESS;
 }
@@ -738,7 +745,7 @@ ShadowStrikeNormalizePath(
     outputBuffer = (PWCHAR)ExAllocatePool2(
         POOL_FLAG_PAGED,
         allocationSize,
-        SHADOW_PATH_TAG
+        SHADOW_STRING_TAG
     );
 #else
 #pragma warning(push)
@@ -746,7 +753,7 @@ ShadowStrikeNormalizePath(
     outputBuffer = (PWCHAR)ExAllocatePoolWithTag(
         PagedPool,
         allocationSize,
-        SHADOW_PATH_TAG
+        SHADOW_STRING_TAG
     );
 #pragma warning(pop)
     if (outputBuffer != NULL) {
@@ -786,7 +793,7 @@ ShadowStrikeNormalizePath(
                 // CRITICAL: Check for array overflow and return error
                 //
                 if (componentCount >= ARRAYSIZE(components)) {
-                    ExFreePoolWithTag(outputBuffer, SHADOW_PATH_TAG);
+                    ExFreePoolWithTag(outputBuffer, SHADOW_STRING_TAG);
                     return STATUS_NAME_TOO_LONG;
                 }
                 components[componentCount++] = componentStart;
@@ -807,7 +814,7 @@ ShadowStrikeNormalizePath(
         // SECURITY: Validate component pointer is within input buffer bounds
         //
         if (comp < InputPath->Buffer || comp >= (InputPath->Buffer + inputLengthChars)) {
-            ExFreePoolWithTag(outputBuffer, SHADOW_PATH_TAG);
+            ExFreePoolWithTag(outputBuffer, SHADOW_STRING_TAG);
             return STATUS_INVALID_PARAMETER;
         }
 
@@ -837,7 +844,7 @@ ShadowStrikeNormalizePath(
         // Verify we won't overflow output buffer
         //
         if (outputIndex + compLen >= allocationSize / sizeof(WCHAR)) {
-            ExFreePoolWithTag(outputBuffer, SHADOW_PATH_TAG);
+            ExFreePoolWithTag(outputBuffer, SHADOW_STRING_TAG);
             return STATUS_BUFFER_OVERFLOW;
         }
 
@@ -857,7 +864,7 @@ ShadowStrikeNormalizePath(
     // Validate final length fits in USHORT
     //
     if (outputIndex * sizeof(WCHAR) > MAXUSHORT || allocationSize > MAXUSHORT) {
-        ExFreePoolWithTag(outputBuffer, SHADOW_PATH_TAG);
+        ExFreePoolWithTag(outputBuffer, SHADOW_STRING_TAG);
         return STATUS_NAME_TOO_LONG;
     }
 
@@ -1017,7 +1024,7 @@ ShadowStrikeDosPathToNtPath(
     NtPath->Buffer = (PWCH)ExAllocatePool2(
         POOL_FLAG_PAGED,
         allocationSize,
-        SHADOW_PATH_TAG
+        SHADOW_STRING_TAG
     );
 #else
 #pragma warning(push)
@@ -1025,7 +1032,7 @@ ShadowStrikeDosPathToNtPath(
     NtPath->Buffer = (PWCH)ExAllocatePoolWithTag(
         PagedPool,
         allocationSize,
-        SHADOW_PATH_TAG
+        SHADOW_STRING_TAG
     );
 #pragma warning(pop)
     if (NtPath->Buffer != NULL) {
@@ -1202,7 +1209,7 @@ ShadowStrikeNtPathToDosPath(
             DosPath->Buffer = (PWCH)ExAllocatePool2(
                 POOL_FLAG_PAGED,
                 allocationSize,
-                SHADOW_PATH_TAG
+                SHADOW_STRING_TAG
             );
 #else
 #pragma warning(push)
@@ -1210,7 +1217,7 @@ ShadowStrikeNtPathToDosPath(
             DosPath->Buffer = (PWCH)ExAllocatePoolWithTag(
                 PagedPool,
                 allocationSize,
-                SHADOW_PATH_TAG
+                SHADOW_STRING_TAG
             );
 #pragma warning(pop)
             if (DosPath->Buffer != NULL) {
@@ -2166,6 +2173,41 @@ ShadowStrikeParseCommandLine(
         } else if (!inArg) {
             inArg = TRUE;
             argStart = i;
+        }
+    }
+
+    //
+    // SECURITY FIX: Handle unclosed quote — emit pending argument.
+    // Without this, an attacker can craft "cmd.exe /c "malicious_command
+    // and the final argument is silently dropped, evading argument-level detection.
+    //
+    if (inArg && inQuotes) {
+        if (argCount < maxArgs) {
+            USHORT argLen = (USHORT)(cmdLen - argStart);
+
+            if (argLen > 0) {
+                argArray[argCount] = (PUNICODE_STRING)ExAllocatePool2(
+                    POOL_FLAG_PAGED,
+                    sizeof(UNICODE_STRING),
+                    SHADOW_STRING_TAG
+                );
+
+                if (argArray[argCount] != NULL) {
+                    UNICODE_STRING tempArg;
+                    tempArg.Buffer = &CommandLine->Buffer[argStart];
+                    tempArg.Length = argLen * sizeof(WCHAR);
+                    tempArg.MaximumLength = tempArg.Length;
+
+                    status = ShadowStrikeCloneUnicodeString(argArray[argCount], &tempArg);
+                    if (NT_SUCCESS(status)) {
+                        argCount++;
+                    } else {
+                        ExFreePoolWithTag(argArray[argCount], SHADOW_STRING_TAG);
+                        argArray[argCount] = NULL;
+                        goto cleanup;
+                    }
+                }
+            }
         }
     }
 

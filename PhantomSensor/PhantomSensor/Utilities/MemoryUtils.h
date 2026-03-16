@@ -414,8 +414,11 @@ typedef struct _SHADOWSTRIKE_ALIGNED_HEADER {
     /// Requested alignment
     SIZE_T Alignment;
 
-    /// Allocation size (for tracking)
+    /// Total allocation size from pool (for stats tracking)
     SIZE_T AllocationSize;
+
+    /// User-requested size (for secure wipe bounds)
+    SIZE_T UserSize;
 
     /// Magic value for validation
     ULONG Magic;
