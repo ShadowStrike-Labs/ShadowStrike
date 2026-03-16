@@ -756,11 +756,12 @@ ShadowInstanceIsNetworkVolume(
     }
 
     //
-    // If initialized, VolumeType is immutable - no lock needed
-    // Use acquire semantics to ensure we see the latest Initialized value
+    // If initialized, VolumeType is immutable - no lock needed.
+    // Acquire barrier AFTER reading the flag ensures subsequent data reads
+    // see all writes that preceded the Initialized store (ARM64 correctness).
     //
-    MemoryBarrier();
     if (Context->Initialized) {
+        MemoryBarrier();
         return BooleanFlagOn(Context->VolumeType, InstanceVolumeTypeNetwork);
     }
 
@@ -802,10 +803,12 @@ ShadowInstanceIsRemovableMedia(
     }
 
     //
-    // If initialized, VolumeType is immutable - no lock needed
+    // If initialized, VolumeType is immutable - no lock needed.
+    // Acquire barrier AFTER reading the flag ensures subsequent data reads
+    // see all writes that preceded the Initialized store (ARM64 correctness).
     //
-    MemoryBarrier();
     if (Context->Initialized) {
+        MemoryBarrier();
         return BooleanFlagOn(Context->VolumeType, InstanceVolumeTypeRemovable);
     }
 
@@ -847,10 +850,11 @@ ShadowInstanceSupportsFileIds(
     }
 
     //
-    // If initialized, Capabilities is immutable - no lock needed
+    // If initialized, Capabilities is immutable - no lock needed.
+    // Acquire barrier AFTER reading the flag (ARM64 correctness).
     //
-    MemoryBarrier();
     if (Context->Initialized) {
+        MemoryBarrier();
         return Context->Capabilities.SupportsFileIds;
     }
 
@@ -892,10 +896,11 @@ ShadowInstanceSupportsStreams(
     }
 
     //
-    // If initialized, Capabilities is immutable - no lock needed
+    // If initialized, Capabilities is immutable - no lock needed.
+    // Acquire barrier AFTER reading the flag (ARM64 correctness).
     //
-    MemoryBarrier();
     if (Context->Initialized) {
+        MemoryBarrier();
         return Context->Capabilities.SupportsStreams;
     }
 
@@ -937,10 +942,11 @@ ShadowInstanceGetFilesystemType(
     }
 
     //
-    // If initialized, FilesystemType is immutable - no lock needed
+    // If initialized, FilesystemType is immutable - no lock needed.
+    // Acquire barrier AFTER reading the flag (ARM64 correctness).
     //
-    MemoryBarrier();
     if (Context->Initialized) {
+        MemoryBarrier();
         return Context->FilesystemType;
     }
 
