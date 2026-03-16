@@ -137,7 +137,12 @@ ShadowStrikeCacheAcquireReference(
     // (prevents race with shutdown)
     //
     if (g_ScanCache.ShutdownInProgress) {
-        InterlockedDecrement(&g_ScanCache.ActiveReferences);
+        //
+        // CRITICAL FIX: Must use ReleaseReference (not bare InterlockedDecrement)
+        // so the shutdown event is signaled if this was the last reference.
+        // Without this, shutdown hangs for 30s on the ShutdownEvent timeout.
+        //
+        ShadowStrikeCacheReleaseReference();
         return FALSE;
     }
 
@@ -324,7 +329,7 @@ ShadowStrikeCacheShutdown(
     }
 
     //
-    // Step 4: Wait for any active references (work item or operations in progress)
+    // Step 3: Wait for any active references (work item or operations in progress)
     //
     if (g_ScanCache.ActiveReferences > 0) {
         NTSTATUS waitStatus;
@@ -352,7 +357,7 @@ ShadowStrikeCacheShutdown(
     }
 
     //
-    // Step 5: Wait for cleanup to complete if it's in progress (bounded)
+    // Step 4: Wait for cleanup to complete if it's in progress (bounded)
     //
     {
         ULONG spinCount = 0;
@@ -369,12 +374,12 @@ ShadowStrikeCacheShutdown(
     }
 
     //
-    // Step 6: Clear all entries
+    // Step 5: Clear all entries
     //
     ShadowStrikeCacheClear();
 
     //
-    // Step 8: Delete lookaside list
+    // Step 6: Delete lookaside list
     //
     if (g_ScanCache.LookasideInitialized) {
         ExDeleteNPagedLookasideList(&g_ScanCache.EntryLookaside);
@@ -585,7 +590,11 @@ ShadowStrikeCacheInsert(
     }
 
     //
-    // Check entry limit
+    // Check entry limit (soft cap — read is outside bucket lock for performance).
+    // Multiple threads may pass this check simultaneously when near the limit,
+    // allowing a bounded overshoot of at most (concurrent_insert_threads - 1)
+    // entries. This is acceptable: the limit is a memory budget guard, not a
+    // security boundary. Overshoot is bounded by CPU count (~64 max).
     //
     currentEntries = g_ScanCache.Stats.CurrentEntries;
     if (currentEntries >= SHADOWSTRIKE_CACHE_MAX_ENTRIES) {
@@ -836,6 +845,7 @@ ShadowStrikeCacheClear(
     ULONG totalRemoved = 0;
     PLIST_ENTRY listEntry;
     PSHADOWSTRIKE_CACHE_ENTRY entry;
+    LIST_ENTRY removeList;
 
     PAGED_CODE();
 
@@ -849,13 +859,26 @@ ShadowStrikeCacheClear(
     for (i = 0; i < SHADOWSTRIKE_CACHE_BUCKET_COUNT; i++) {
         PSHADOWSTRIKE_CACHE_BUCKET bucket = &g_ScanCache.Buckets[i];
 
+        //
+        // Skip empty buckets (quick check without lock)
+        //
+        if (bucket->EntryCount == 0) {
+            continue;
+        }
+
+        InitializeListHead(&removeList);
+
+        //
+        // Collect entries under exclusive lock, then free outside lock.
+        // This matches the pattern in Cleanup/InvalidateVolume and
+        // minimizes exclusive lock hold time.
+        //
         KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&bucket->Lock);
 
         while (!IsListEmpty(&bucket->ListHead)) {
             listEntry = RemoveHeadList(&bucket->ListHead);
-            entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_CACHE_ENTRY, ListEntry);
-            ShadowStrikeCacheFreeEntry(entry);
+            InsertTailList(&removeList, listEntry);
             totalRemoved++;
         }
 
@@ -863,6 +886,15 @@ ShadowStrikeCacheClear(
 
         ExReleasePushLockExclusive(&bucket->Lock);
         KeLeaveCriticalRegion();
+
+        //
+        // Free entries outside lock
+        //
+        while (!IsListEmpty(&removeList)) {
+            listEntry = RemoveHeadList(&removeList);
+            entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_CACHE_ENTRY, ListEntry);
+            ShadowStrikeCacheFreeEntry(entry);
+        }
     }
 
     InterlockedExchange(&g_ScanCache.Stats.CurrentEntries, 0);
@@ -1144,31 +1176,16 @@ ShadowStrikeCacheBuildKey(
         }
 
         //
-        // Fallback: Derive identifier from volume properties.
-        // DeviceCharacteristics XOR SectorSize is NOT unique across volumes
-        // but is better than failing entirely. Log a warning.
+        // SECURITY FIX: No fallback. If the real volume serial is unavailable,
+        // caching is disabled for this file. The previous fallback derived a
+        // pseudo-serial from DeviceCharacteristics XOR SectorSize, which is
+        // NOT unique across volumes and enables cache poisoning via key collision.
+        // For an NGAV product, fail-secure: no unique ID → no caching.
         //
         if (!haveVolumeSerial) {
-            FLT_VOLUME_PROPERTIES volumeProps;
-            ULONG bytesReturned = 0;
-
-            status = FltGetVolumeProperties(
-                FltObjects->Volume,
-                &volumeProps,
-                sizeof(volumeProps),
-                &bytesReturned
-            );
-
-            if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
-                Key->VolumeSerial = volumeProps.DeviceCharacteristics ^
-                                   (volumeProps.SectorSize << 16);
-                haveVolumeSerial = TRUE;
-
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                           "[ShadowStrike] ScanCache: Using fallback volume serial 0x%08X "
-                           "(real serial unavailable)\n",
-                           Key->VolumeSerial);
-            }
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] ScanCache: Real volume serial unavailable — "
+                       "caching disabled for this file (fail-secure)\n");
         }
     }
 
