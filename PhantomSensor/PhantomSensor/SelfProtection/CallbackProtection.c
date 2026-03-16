@@ -780,7 +780,7 @@ CpInitialize(
         );
 
         if (NT_SUCCESS(threadStatus)) {
-            ObReferenceObjectByHandle(
+            NTSTATUS obStatus = ObReferenceObjectByHandle(
                 threadHandle,
                 THREAD_ALL_ACCESS,
                 *PsThreadType,
@@ -788,8 +788,21 @@ CpInitialize(
                 (PVOID*)&prot->VerifyThread,
                 NULL
             );
-            prot->VerifyThreadHandle = threadHandle;
-            ZwClose(threadHandle);
+
+            if (!NT_SUCCESS(obStatus)) {
+                //
+                // Thread is running but we have no PETHREAD to wait on.
+                // Signal shutdown, wait via the still-valid handle, then
+                // close. The module operates without periodic verification.
+                //
+                InterlockedExchange(&prot->TerminateThread, TRUE);
+                KeSetEvent(&prot->VerifyWakeEvent, IO_NO_INCREMENT, FALSE);
+                ZwWaitForSingleObject(threadHandle, FALSE, NULL);
+                ZwClose(threadHandle);
+                prot->VerifyThread = NULL;
+            } else {
+                ZwClose(threadHandle);
+            }
         }
     }
 
