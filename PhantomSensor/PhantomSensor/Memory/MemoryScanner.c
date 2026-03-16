@@ -2151,9 +2151,13 @@ MsFindHighEntropyRegions(
             }
 
             //
-            // Move to next region
+            // Move to next region — FIX MS-H1: check for address overflow at end
+            // of address space to prevent infinite loop.
             //
             address = (PVOID)((ULONG_PTR)memInfo.BaseAddress + memInfo.RegionSize);
+            if ((ULONG_PTR)address < (ULONG_PTR)memInfo.BaseAddress) {
+                break;
+            }
         }
 
     } __finally {
@@ -3201,9 +3205,13 @@ MspScanProcessRegions(
             }
 
             //
-            // Move to next region
+            // Move to next region — FIX MS-H1: check for address overflow at end
+            // of address space to prevent infinite loop.
             //
             address = (PVOID)((ULONG_PTR)memInfo.BaseAddress + memInfo.RegionSize);
+            if ((ULONG_PTR)address < (ULONG_PTR)memInfo.BaseAddress) {
+                break;
+            }
         }
 
     } __finally {

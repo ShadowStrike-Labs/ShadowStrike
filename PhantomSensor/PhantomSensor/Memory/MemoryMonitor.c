@@ -1873,15 +1873,24 @@ MmMonitorDetectInjection(
 
         //
         // Check if source is elevated/protected (legitimate tools like debuggers)
+        // FIX MM-C2: Wrap with MmpAcquireRef to prevent shutdown UAF.
         //
         {
-            PMM_PROCESS_CONTEXT SourceContext = MmpLookupProcessContext(SourceProcessId);
-            if (SourceContext != NULL) {
-                if (SourceContext->Flags & MM_PROCESS_FLAG_PROTECTED) {
+            BOOLEAN SourceProtected = FALSE;
+
+            if (MmpAcquireRef()) {
+                PMM_PROCESS_CONTEXT SourceContext = MmpLookupProcessContext(SourceProcessId);
+                if (SourceContext != NULL) {
+                    if (SourceContext->Flags & MM_PROCESS_FLAG_PROTECTED) {
+                        SourceProtected = TRUE;
+                    }
                     MmpDereferenceProcessContext(SourceContext);
-                    return FALSE;
                 }
-                MmpDereferenceProcessContext(SourceContext);
+                MmpReleaseRef();
+            }
+
+            if (SourceProtected) {
+                return FALSE;
             }
         }
 
@@ -2404,10 +2413,21 @@ MmMonitorIsAddressExecutable(
     BOOLEAN IsExecutable = FALSE;
 
     //
-    // MmpLookupProcessContext now returns a referenced context (FIX-17)
+    // FIX MM-C1: Must check MmpIsActive AND acquire global ref to prevent
+    // shutdown UAF. Without MmpAcquireRef, shutdown's MmpFreeProcessContext
+    // force-frees contexts regardless of per-context RefCount.
     //
+    if (!MmpIsActive()) {
+        return FALSE;
+    }
+
+    if (!MmpAcquireRef()) {
+        return FALSE;
+    }
+
     Context = MmpLookupProcessContext(ProcessId);
     if (Context == NULL) {
+        MmpReleaseRef();
         return FALSE;
     }
 
@@ -2421,6 +2441,7 @@ MmMonitorIsAddressExecutable(
     KeLeaveCriticalRegion();
 
     MmpDereferenceProcessContext(Context);
+    MmpReleaseRef();
 
     return IsExecutable;
 }
@@ -2446,8 +2467,21 @@ MmMonitorGetBackingFile(
 
     FileName[0] = L'\0';
 
+    //
+    // FIX MM-C3: Acquire global ref to prevent shutdown UAF.
+    // Without this, shutdown can force-free contexts while we hold a per-context ref.
+    //
+    if (!MmpIsActive()) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    if (!MmpAcquireRef()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     Context = MmpLookupProcessContext(ProcessId);
     if (Context == NULL) {
+        MmpReleaseRef();
         return STATUS_NOT_FOUND;
     }
 
@@ -2464,6 +2498,7 @@ MmMonitorGetBackingFile(
     KeLeaveCriticalRegion();
 
     MmpDereferenceProcessContext(Context);
+    MmpReleaseRef();
 
     return Status;
 }
@@ -3045,10 +3080,30 @@ MmpAddRegion(
     }
 
     //
-    // Insert into list
+    // Insert into list — re-check count under lock to close TOCTOU window (FIX MM-M1).
+    // The pre-checks above (lines 2967/2970) are optimistic fast-path filters.
+    // This definitive check under lock prevents concurrent threads from exceeding the limit.
+    //
+    // FIX MM-L1: Also check for duplicate BaseAddress to prevent concurrent callers
+    // from inserting two regions for the same address (wastes memory, inflates count).
     //
     KeEnterCriticalRegion();
     ExfAcquirePushLockExclusive(&Context->RegionLock);
+
+    if (MmpFindRegion(Context, BaseAddress) != NULL) {
+        ExfReleasePushLockExclusive(&Context->RegionLock);
+        KeLeaveCriticalRegion();
+        MmpFreeRegion(Region);
+        return STATUS_OBJECT_NAME_COLLISION;
+    }
+
+    if (Context->TrackedRegionCount >= MM_MAX_REGIONS_PER_PROCESS) {
+        ExfReleasePushLockExclusive(&Context->RegionLock);
+        KeLeaveCriticalRegion();
+        MmpFreeRegion(Region);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
     InsertTailList(&Context->TrackedRegions, &Region->ListEntry);
     Context->TrackedRegionCount++;
     ExfReleasePushLockExclusive(&Context->RegionLock);

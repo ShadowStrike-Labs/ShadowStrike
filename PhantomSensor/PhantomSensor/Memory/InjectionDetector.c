@@ -866,9 +866,17 @@ Return Value:
     // I-7 FIX: Use the hard constant INJ_MAX_TRACKED_OPERATIONS as the global
     // cap instead of a dynamic product that can silently change with config.
     //
-    if ((ULONG)Internal->TotalOperationCount >= INJ_MAX_TRACKED_OPERATIONS) {
-        InterlockedIncrement64(&Internal->Public.Stats.DroppedOperations);
-        return STATUS_QUOTA_EXCEEDED;
+    // FIX INJ-M1: Pre-increment atomically to close TOCTOU window. If over limit,
+    // decrement and return. This prevents concurrent threads from all passing the
+    // check simultaneously and exceeding the cap.
+    //
+    {
+        LONG NewCount = InterlockedIncrement(&Internal->TotalOperationCount);
+        if ((ULONG)NewCount > INJ_MAX_TRACKED_OPERATIONS) {
+            InterlockedDecrement(&Internal->TotalOperationCount);
+            InterlockedIncrement64(&Internal->Public.Stats.DroppedOperations);
+            return STATUS_QUOTA_EXCEEDED;
+        }
     }
 
     //
@@ -876,6 +884,7 @@ Return Value:
     //
     Operation = InjpAllocateOperation(Internal);
     if (Operation == NULL) {
+        InterlockedDecrement(&Internal->TotalOperationCount);
         InterlockedIncrement64(&Internal->Public.Stats.DroppedOperations);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1715,7 +1724,10 @@ InjpInsertOperation(
 
     KeReleaseSpinLock(&Detector->OperationBuckets[Hash].Lock, OldIrql);
 
-    InterlockedIncrement(&Detector->TotalOperationCount);
+    //
+    // FIX INJ-M1: TotalOperationCount was already pre-incremented in InjRecordOperation
+    // before allocation. No increment here — the slot was reserved upfront.
+    //
 
     return STATUS_SUCCESS;
 }
@@ -2758,7 +2770,17 @@ InjpCleanupStaleOperations(
         PLIST_ENTRY Entry, Next;
         PINJ_OPERATION Operation;
         ULONG Iterations = 0;
+        LIST_ENTRY StaleList;
 
+        InitializeListHead(&StaleList);
+
+        //
+        // FIX INJ-H1: Phase 1 — Collect all stale operations under lock WITHOUT
+        // dropping it. The previous pattern released BucketLock to do chain cleanup,
+        // then re-acquired it. Between release and re-acquire, another thread could
+        // remove+free the element that 'Next' pointed to → UAF on loop continuation.
+        // Batch-collect avoids this by holding the lock for the entire scan.
+        //
         KeAcquireSpinLock(&Detector->OperationBuckets[i].Lock, &OldIrql);
 
         for (Entry = Detector->OperationBuckets[i].OperationList.Flink;
@@ -2770,61 +2792,62 @@ InjpCleanupStaleOperations(
 
             if ((CurrentTime.QuadPart - Operation->Timestamp.QuadPart) > TimeoutInterval.QuadPart) {
                 //
-                // Operation is stale - remove from hash bucket
+                // Operation is stale — unlink from bucket and move to deferred list
                 //
                 RemoveEntryList(&Operation->HashEntry);
-                InitializeListHead(&Operation->HashEntry);
                 Detector->OperationBuckets[i].Count--;
                 InterlockedDecrement(&Detector->TotalOperationCount);
 
-                KeReleaseSpinLock(&Detector->OperationBuckets[i].Lock, OldIrql);
-
-                //
-                // H-7 FIX: Also remove from chain's OperationList to prevent
-                // dangling ChainEntry pointer. If the operation is linked into
-                // a chain, we must unlink it (under ChainLock).
-                //
-                if (!IsListEmpty(&Operation->ChainEntry)) {
-                    KIRQL ChainIrql;
-                    KeAcquireSpinLock(&Detector->ChainLock, &ChainIrql);
-                    if (!IsListEmpty(&Operation->ChainEntry)) {
-                        RemoveEntryList(&Operation->ChainEntry);
-                        InitializeListHead(&Operation->ChainEntry);
-
-                        //
-                        // Find parent chain and decrement its operation count.
-                        // We iterate the chain list since the operation doesn't
-                        // store a back-pointer to its parent chain.
-                        //
-                        {
-                            PLIST_ENTRY ChainEntry;
-                            for (ChainEntry = Detector->ActiveChains.Flink;
-                                 ChainEntry != &Detector->ActiveChains;
-                                 ChainEntry = ChainEntry->Flink) {
-
-                                PINJ_CHAIN ParentChain = CONTAINING_RECORD(ChainEntry, INJ_CHAIN, ListEntry);
-                                if (ParentChain->SourceProcessId == Operation->SourceProcessId &&
-                                    ParentChain->TargetProcessId == Operation->TargetProcessId) {
-                                    if (ParentChain->OperationCount > 0) {
-                                        ParentChain->OperationCount--;
-                                    }
-                                    if (Operation->Size <= ParentChain->TotalSize) {
-                                        ParentChain->TotalSize -= Operation->Size;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    KeReleaseSpinLock(&Detector->ChainLock, ChainIrql);
-                }
-
-                InjpFreeOperation(Detector, Operation);
-                KeAcquireSpinLock(&Detector->OperationBuckets[i].Lock, &OldIrql);
+                InsertTailList(&StaleList, &Operation->HashEntry);
             }
         }
 
         KeReleaseSpinLock(&Detector->OperationBuckets[i].Lock, OldIrql);
+
+        //
+        // FIX INJ-H1: Phase 2 — Process stale operations outside bucket lock.
+        // Chain cleanup happens under ChainLock (correct ordering: no bucket lock held).
+        //
+        while (!IsListEmpty(&StaleList)) {
+            Entry = RemoveHeadList(&StaleList);
+            Operation = CONTAINING_RECORD(Entry, INJ_OPERATION, HashEntry);
+            InitializeListHead(&Operation->HashEntry);
+
+            if (!IsListEmpty(&Operation->ChainEntry)) {
+                KIRQL ChainIrql;
+                KeAcquireSpinLock(&Detector->ChainLock, &ChainIrql);
+                if (!IsListEmpty(&Operation->ChainEntry)) {
+                    RemoveEntryList(&Operation->ChainEntry);
+                    InitializeListHead(&Operation->ChainEntry);
+
+                    //
+                    // Find parent chain and decrement its operation count.
+                    //
+                    {
+                        PLIST_ENTRY ChainEntry;
+                        for (ChainEntry = Detector->ActiveChains.Flink;
+                             ChainEntry != &Detector->ActiveChains;
+                             ChainEntry = ChainEntry->Flink) {
+
+                            PINJ_CHAIN ParentChain = CONTAINING_RECORD(ChainEntry, INJ_CHAIN, ListEntry);
+                            if (ParentChain->SourceProcessId == Operation->SourceProcessId &&
+                                ParentChain->TargetProcessId == Operation->TargetProcessId) {
+                                if (ParentChain->OperationCount > 0) {
+                                    ParentChain->OperationCount--;
+                                }
+                                if (Operation->Size <= ParentChain->TotalSize) {
+                                    ParentChain->TotalSize -= Operation->Size;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                KeReleaseSpinLock(&Detector->ChainLock, ChainIrql);
+            }
+
+            InjpFreeOperation(Detector, Operation);
+        }
     }
 }
 
