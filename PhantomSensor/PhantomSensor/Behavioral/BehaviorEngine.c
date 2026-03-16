@@ -341,6 +341,11 @@ static const BE_EVENT_MITRE_MAP g_EventMitreMap[] = {
     { BehaviorEvent_DiskWipe,               MITRE_T1561, Tactic_Impact, 1000, ThreatSeverity_Critical },
     { BehaviorEvent_ServiceStopping,        MITRE_T1489, Tactic_Impact, 600, ThreatSeverity_High },
 
+    // ALPC Inter-Process Communication (T1559)
+    { BehaviorEvent_AlpcBlocked,            MITRE_T1559, Tactic_Execution, 800, ThreatSeverity_High },
+    { BehaviorEvent_AlpcSuspicious,         MITRE_T1559, Tactic_Execution, 600, ThreatSeverity_Medium },
+    { BehaviorEvent_AlpcCrossSession,       MITRE_T1559, Tactic_LateralMovement, 700, ThreatSeverity_High },
+
     // Terminator
     { 0, 0, Tactic_None, 0, ThreatSeverity_None }
 };

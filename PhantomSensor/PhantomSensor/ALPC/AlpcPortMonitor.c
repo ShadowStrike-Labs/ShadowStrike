@@ -164,7 +164,7 @@ ZwQueryObject(
 #endif
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, ShadowAlpcInitialize)
+#pragma alloc_text(PAGE, ShadowAlpcInitialize)
 #pragma alloc_text(PAGE, ShadowAlpcCleanup)
 #endif
 
@@ -853,6 +853,21 @@ ShadowAlpcTrackPort(
         }
 
         ObDereferenceObject(process);
+    } else {
+        //
+        // SECURITY FIX: PsLookupProcessByProcessId failure (e.g. process
+        // terminated during tracking). Default to SYSTEM integrity and
+        // session 0 (fail-secure). Without this, RtlZeroMemory leaves
+        // OwnerIntegrityLevel=0 (UNTRUSTED) which suppresses cross-integrity
+        // detection — a privilege escalation vector.
+        //
+        portEntry->OwnerIntegrityLevel = SECURITY_MANDATORY_SYSTEM_RID;
+        portEntry->OwnerSessionId = 0;
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/ALPC] PsLookupProcessByProcessId failed for PID %p "
+                   "(0x%08X), defaulting to SYSTEM integrity (fail-secure)\n",
+                   OwnerPid, status);
     }
 
     //
@@ -1690,6 +1705,15 @@ ShadowAlpcResetStatistics(
     )
 {
     PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcPortMonitorState;
+
+    //
+    // NOTE: Statistics reset is inherently racy with concurrent readers
+    // via ShadowAlpcGetStatistics, which may observe torn 64-bit values
+    // during the zeroing operation. This is ACCEPTABLE for diagnostic
+    // statistics — callers should not reset during active monitoring
+    // in production. A generation-counter approach would eliminate torn
+    // reads but adds unjustified complexity for diagnostic counters.
+    //
     RtlZeroMemory(&state->Stats, sizeof(SHADOW_ALPC_STATISTICS));
     KeQuerySystemTime(&state->Stats.StartTime);
 }
@@ -2012,7 +2036,10 @@ ShadowAlpcPortPostCallback(
                 );
                 if (NT_SUCCESS(trackStatus) && portEntry != NULL) {
                     ShadowAlpcReleasePortEntry(portEntry);
-                    InterlockedIncrement64(&state->Stats.PortsCreated);
+                    //
+                    // NOTE: PortsCreated is incremented inside ShadowAlpcTrackPort
+                    // (line 918). Do NOT increment here — that caused double-counting.
+                    //
                 }
             }
         } else if (OperationInformation->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
@@ -2138,9 +2165,9 @@ ShadowAlpcpResolveAlpcPortType(
             // Found it - now get the actual OBJECT_TYPE pointer
             // The TypeIndex in the info structure corresponds to the ObTypeIndexTable index
             //
-            // On Windows 10+, we can use ObGetObjectType on a known ALPC port object
-            // For now, we use a different approach: create a temporary ALPC port
-            // and extract its type.
+            // On Windows 10+, we can use ObGetObjectType on a known ALPC port object.
+            // We resolve the type by creating a temporary ALPC port via
+            // ShadowAlpcpGetPortTypeViaCreation and extracting its object type.
             //
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                        "[ShadowStrike/ALPC] Found ALPC Port type at index %u\n",
@@ -2205,7 +2232,7 @@ ShadowAlpcpGetPortTypeViaCreation(
     status = RtlStringCchPrintfW(
         portNameBuffer,
         RTL_NUMBER_OF(portNameBuffer),
-        L"\\BaseNamedObjects\\ShadowStrike_TypeProbe_%p",
+        L"\\KernelObjects\\ShadowStrike_TypeProbe_%p",
         PsGetCurrentProcessId()
     );
 

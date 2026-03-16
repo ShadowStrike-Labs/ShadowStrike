@@ -342,7 +342,7 @@ ShadowAlpcDetermineVerdict(
  *
  * @return TRUE if sensitive, FALSE otherwise
  *
- * @irql Any
+ * @irql <= APC_LEVEL (uses _wcsicmp / _wcsnicmp which are pageable CRT)
  */
 BOOLEAN
 ShadowAlpcIsSensitivePort(
