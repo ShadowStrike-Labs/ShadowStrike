@@ -2455,11 +2455,20 @@ Routine Description:
     }
 
     //
-    // Calculate new capacity with growth factor
+    // Calculate new capacity with growth factor (overflow-safe)
     //
-    NewCapacity = Builder->Capacity * MG_STRING_BUILDER_GROWTH_FACTOR;
+    if (Builder->Capacity > (SIZE_T)-1 / MG_STRING_BUILDER_GROWTH_FACTOR) {
+        NewCapacity = RequiredCapacity;
+    } else {
+        NewCapacity = Builder->Capacity * MG_STRING_BUILDER_GROWTH_FACTOR;
+    }
+
     if (NewCapacity < RequiredCapacity) {
-        NewCapacity = RequiredCapacity + MG_MIN_BUFFER_GROWTH;
+        if (RequiredCapacity > (SIZE_T)-1 - MG_MIN_BUFFER_GROWTH) {
+            NewCapacity = RequiredCapacity;
+        } else {
+            NewCapacity = RequiredCapacity + MG_MIN_BUFFER_GROWTH;
+        }
     }
 
     //
@@ -2524,6 +2533,14 @@ Routine Description:
     }
 
     StringLength = strlen(String);
+
+    //
+    // Overflow-safe capacity calculation
+    //
+    if (Builder->Length > (SIZE_T)-1 - StringLength - 1) {
+        Builder->Overflow = TRUE;
+        return STATUS_BUFFER_OVERFLOW;
+    }
     RequiredCapacity = Builder->Length + StringLength + 1;
 
     Status = MgpStringBuilderEnsureCapacity(Builder, RequiredCapacity);

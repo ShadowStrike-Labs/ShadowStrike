@@ -38,7 +38,8 @@
  * - Count limits are checked under exclusive lock (no TOCTOU).
  * - Duplicate detection is performed under exclusive lock.
  * - Statistics counters are approximate (documented).
- * - All mutation APIs enforce kernel-mode caller via ExGetPreviousMode().
+ * - All mutation APIs are reachable only from kernel-internal code or
+ * - CommPort HMAC-authenticated message handlers (trust boundary).
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0
@@ -896,11 +897,11 @@ ShadowStrikeAddPathExclusion(
     PAGED_CODE();
 
     //
-    // Access control: only kernel-mode callers may add exclusions
+    // Access control: CommPort HMAC-SHA256 authentication is the trust boundary.
+    // ExGetPreviousMode() cannot be used here because MessageHandler dispatches
+    // CommPort messages in user-mode thread context (PreviousMode == UserMode),
+    // which would block all user-mode agent exclusion management.
     //
-    if (!ExclusionpValidateCallerIsKernel()) {
-        return STATUS_ACCESS_DENIED;
-    }
 
     if (!ShadowStrikeValidateUnicodeString(Path) || Path->Length == 0 ||
         !ExclusionpIsReady()) {
@@ -1009,11 +1010,8 @@ ShadowStrikeAddExtensionExclusion(
     PAGED_CODE();
 
     //
-    // Access control: only kernel-mode callers may add exclusions
+    // Access control: CommPort HMAC-SHA256 authentication is the trust boundary.
     //
-    if (!ExclusionpValidateCallerIsKernel()) {
-        return STATUS_ACCESS_DENIED;
-    }
 
     if (!ShadowStrikeValidateUnicodeString(Extension) || Extension->Length == 0 ||
         !ExclusionpIsReady()) {
@@ -1113,11 +1111,8 @@ ShadowStrikeAddProcessExclusion(
     PAGED_CODE();
 
     //
-    // Access control: only kernel-mode callers may add exclusions
+    // Access control: CommPort HMAC-SHA256 authentication is the trust boundary.
     //
-    if (!ExclusionpValidateCallerIsKernel()) {
-        return STATUS_ACCESS_DENIED;
-    }
 
     if (!ShadowStrikeValidateUnicodeString(ProcessName) || ProcessName->Length == 0 ||
         !ExclusionpIsReady()) {
@@ -1572,11 +1567,8 @@ ShadowStrikeAddPidExclusion(
     PAGED_CODE();
 
     //
-    // Access control: only kernel-mode callers may add exclusions
+    // Access control: CommPort HMAC-SHA256 authentication is the trust boundary.
     //
-    if (!ExclusionpValidateCallerIsKernel()) {
-        return STATUS_ACCESS_DENIED;
-    }
 
     if (ProcessId == NULL || !ExclusionpIsReady()) {
         return STATUS_INVALID_PARAMETER;

@@ -1,0 +1,167 @@
+ANALYSIS OF ShadowStrikeExtractExtension
+=========================================
+
+ZERO-COPY CORRECTNESS
+---------------------
+
+Line 512: Extension->Buffer = &FilePath->Buffer[lastDot + 1];
+
+This creates a pointer into the original buffer. The returned UNICODE_STRING
+does NOT own the memory. Caller must ensure FilePath remains valid.
+
+Edge cases to check:
+
+1. No dot: lastDot stays (USHORT)-1
+   - Line 494-496: Returns with Extension zeroed. ✓
+
+2. Multiple dots: "file.tar.gz"
+   - Loop finds LAST dot (line 482: only sets lastDot if still -1)
+   - Extension is "gz". ✓
+
+3. Dot at end: "file."
+   - lastDot = charCount - 1
+   - Line 505: lastDot + 1 >= charCount is TRUE
+   - Returns with Extension zeroed. ✓
+
+4. Dot at start: ".gitignore"
+   - lastDot = 0
+   - Line 505: lastDot + 1 >= charCount is FALSE (1 < charCount)
+   - Line 512: &FilePath->Buffer[1]
+   - Line 513: Length = (charCount - 0 - 1) * sizeof(WCHAR)
+   - Extension is "gitignore". ✓ (This is correct behavior)
+
+5. Dot in directory: "C:\some.dir\file"
+   - lastDot found first (pointing to '.' in "some.dir")
+   - lastSep found next (pointing to '\' after "some.dir")
+   - Line 498: lastDot < lastSep is TRUE
+   - Returns with Extension zeroed. ✓
+
+BUFFER OVERRUN CHECK
+--------------------
+
+Line 480: FilePath->Buffer[i - 1]
+
+Loop: for (i = charCount; i > 0; i--)
+- First iteration: i = charCount, access [charCount - 1] ✓
+- Last iteration: i = 1, access [0] ✓
+- Loop exits when i == 0, so never accesses [-1] ✓
+
+Line 512: &FilePath->Buffer[lastDot + 1]
+
+We reach this line only if:
+- Line 505: lastDot + 1 < charCount
+
+So lastDot + 1 is in range [0, charCount - 1]. ✓
+
+Line 513: Length = (charCount - lastDot - 1) * sizeof(WCHAR)
+
+Since lastDot + 1 < charCount (from line 505):
+    charCount > lastDot + 1
+    charCount - lastDot - 1 > 0
+
+This is a positive value. ✓
+
+Maximum value:
+    charCount = 65535 (max USHORT)
+    lastDot = 0 (dot at start)
+    charCount - lastDot - 1 = 65534
+    (65534) * 2 = 131068
+
+But this is stored in USHORT Length field!
+    131068 > 65535 = MAXUSHORT
+
+POTENTIAL OVERFLOW!
+
+Wait, let's re-check:
+    Line 513: Extension->Length = (USHORT)((charCount - lastDot - 1) * sizeof(WCHAR));
+
+The multiplication happens before the cast:
+    (charCount - lastDot - 1) is USHORT
+    sizeof(WCHAR) is size_t (essentially int)
+    
+In C, USHORT * int promotes to int:
+    (int)(charCount - lastDot - 1) * 2
+    
+Maximum: (int)65534 * 2 = 131068 (as int)
+
+Then cast to USHORT:
+    (USHORT)131068 = 131068 & 0xFFFF = 0x0000FFFC = 65532
+
+TRUNCATION OCCURS!
+
+But wait, this would mean Extension->Length is incorrect.
+Let me check if there's protection...
+
+Looking at FilePath->Length:
+    charCount = FilePath->Length / sizeof(WCHAR)
+    
+UNICODE_STRING.Length is USHORT with max value 65535.
+So FilePath->Length ≤ 65535.
+    charCount ≤ 65535 / 2 = 32767.5
+    charCount ≤ 32767 (since it's integer division)
+
+Wait, no! USHORT can hold 65535, so:
+    charCount = FilePath->Length / sizeof(WCHAR)
+    
+If FilePath->Length = 65534 (even number, max for UNICODE_STRING):
+    charCount = 65534 / 2 = 32767
+
+So charCount ≤ 32767.
+
+Then:
+    (charCount - lastDot - 1) * sizeof(WCHAR)
+    ≤ (32767 - 0 - 1) * 2
+    = 32766 * 2
+    = 65532
+
+This fits in USHORT! ✓
+
+So the maximum Length is 65532, which is < 65535. No truncation. ✓
+
+RESULT: NO BUGS in ShadowStrikeExtractExtension
+
+
+ANALYSIS OF ShadowStrikeExtensionHash
+======================================
+
+Line 1012-1017 (from ExclusionManager.h):
+    for (i = 0; i < charCount; i++) {
+        WCHAR ch = RtlUpcaseUnicodeChar(Extension->Buffer[i]);
+        hash = hash * 31 + ch;
+    }
+    
+    return hash % SHADOWSTRIKE_EXTENSION_HASH_BUCKETS;
+
+OVERFLOW CHECK
+--------------
+
+hash is ULONG (32-bit unsigned).
+Line 1014: hash = hash * 31 + ch
+
+Can this overflow?
+- hash starts at 0
+- Each iteration: hash = hash * 31 + ch
+- ch is WCHAR (16-bit), max value 65535
+
+Worst case for overflow:
+    hash_max = 0xFFFFFFFF (max ULONG)
+    hash_max * 31 + 65535 = overflow
+
+This WILL overflow. But in C, unsigned overflow wraps around (well-defined).
+So overflow is not a bug for a hash function. ✓
+
+MODULO CHECK
+------------
+
+Line 1017: return hash % SHADOWSTRIKE_EXTENSION_HASH_BUCKETS;
+
+SHADOWSTRIKE_EXTENSION_HASH_BUCKETS = 32 (from line 115 of ExclusionManager.h)
+
+hash % 32 always returns [0, 31]. ✓
+
+DIVIDE BY ZERO CHECK
+--------------------
+
+32 is a compile-time constant, so no divide by zero. ✓
+
+RESULT: NO BUGS in ShadowStrikeExtensionHash

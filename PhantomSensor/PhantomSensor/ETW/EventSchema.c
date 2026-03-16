@@ -2922,6 +2922,19 @@ EsDeserializeSchema(
     }
 
     //
+    // Validate header counts against schema maximums BEFORE size arithmetic.
+    // Prevents DoS from malicious schemas with absurdly high counts that
+    // would cause billions of loop iterations or massive allocations.
+    //
+    if (header->EventCount > ES_MAX_EVENTS_PER_SCHEMA ||
+        header->KeywordCount > ES_MAX_KEYWORDS ||
+        header->TaskCount > ES_MAX_TASKS ||
+        header->OpcodeCount > ES_MAX_OPCODES ||
+        header->ChannelCount > ES_MAX_CHANNELS) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
     // Cross-validate header counts against buffer size
     //
     expectedSize = sizeof(ES_BINARY_HEADER);

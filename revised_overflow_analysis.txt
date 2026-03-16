@@ -1,0 +1,75 @@
+REVISED OVERFLOW ANALYSIS
+=========================
+
+QUESTION: Can USHORT overflow occur in PathpWildcardMatch?
+
+Key facts:
+1. StringLen and PatternLen are USHORT parameters
+2. starSi is USHORT, initialized to (USHORT)-1 = 0xFFFF = 65535
+3. starSi is set to si (line 177, 194)
+4. starSi is incremented (line 163, 194)
+5. si is a loop variable: while (si < StringLen)
+
+ANALYSIS:
+
+Maximum StringLen from UNICODE_STRING:
+- UNICODE_STRING.Length is USHORT (max 65535)
+- Length must be WCHAR-aligned (even), so max is 65534
+- charCount = Length / sizeof(WCHAR) = 65534 / 2 = 32767
+- Therefore, StringLen parameter can be at most 32767
+
+Loop behavior:
+- while (si < StringLen)
+- If StringLen = 32767, loop runs while si < 32767
+- Maximum si value inside loop: 32766
+
+starSi assignment:
+- Line 177: starSi = si (si can be 0 to 32766)
+- So starSi can be 0 to 32766
+
+starSi increment:
+- Line 163: starSi++ (when starSi is 0 to 32766)
+- Result: starSi becomes 1 to 32767
+- Line 194: starSi++ (when starSi is 0 to 32766)  
+- Result: starSi becomes 1 to 32767
+
+Maximum starSi value after increment: 32767
+
+Does 32767 fit in USHORT?
+- Yes! USHORT max is 65535
+- 32767 << 65535
+
+CONCLUSION: NO OVERFLOW POSSIBLE
+
+The constraint that UNICODE_STRING.Length is in BYTES (max 65535 bytes)
+means the maximum character count is 32767, which gives enough headroom
+for starSi++ to never wrap around.
+
+WAIT - WHAT ABOUT LINE 205?
+----------------------------
+
+Line 194: starSi++;
+Line 205: if (!Recursive && starSi < StringLen && String[starSi] == PATH_SEPARATOR)
+
+If starSi = 32767 after increment, and StringLen = 32767:
+- starSi < StringLen is FALSE (32767 < 32767 is false)
+- So String[starSi] is NOT accessed
+- No out-of-bounds
+
+But what if starSi wraps to 0 somehow?
+- That would require starSi = 65535 before increment
+- But starSi is assigned from si (line 177, 194)
+- And si < StringLen < 32768
+- So starSi < 32767 before assignment
+- Therefore starSi cannot be 65535 before increment
+
+FINAL CONCLUSION: NO BUG
+
+The comment at line 136-138 is MISLEADING or OUTDATED.
+It suggests StringLen could be 65535, but that's impossible because:
+1. StringLen comes from UNICODE_STRING.Length / sizeof(WCHAR)
+2. Max UNICODE_STRING.Length = 65535 bytes (but must be even)
+3. Max charCount = 65534 / 2 = 32767
+4. Therefore StringLen <= 32767, not 65535
+
+The check at line 139 is SUFFICIENT as-is.

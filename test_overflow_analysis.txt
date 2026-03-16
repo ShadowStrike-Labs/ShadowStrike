@@ -1,0 +1,89 @@
+OVERFLOW ANALYSIS FOR PathpWildcardMatch
+==========================================
+
+ISSUE 1: starSi overflow at USHORT boundary
+--------------------------------------------
+
+Line 163-164:
+    if (starPi != (USHORT)-1) {
+        pi = starPi + 1;
+        starSi++;              // <-- OVERFLOW HERE
+        si = starSi;
+        continue;
+    }
+
+Line 194:
+    starSi++;                  // <-- OVERFLOW HERE
+
+Scenario:
+- StringLen = 65535 (max USHORT)
+- Pattern = "?\" causes backtrack at line 163
+- starSi starts at some value close to 65535
+- starSi++ increments it
+- If starSi was 65535, starSi++ wraps to 0
+- si = starSi sets si = 0
+- Loop continues with si = 0, reading String[0] again
+- This creates an infinite loop (or very long loop until MAX_WILDCARD_ITERATIONS)
+
+VERIFICATION:
+The comment at line 136-138 says "reject strings at the USHORT boundary to prevent overflow when starSi is incremented during backtracking."
+
+But line 139-141 only checks:
+    if (StringLen == 0 || PatternLen == 0) {
+        return FALSE;
+    }
+
+This does NOT reject StringLen == 65535! It only rejects StringLen == 0.
+
+ACTUAL BUG: The guard at line 139 should be:
+    if (StringLen == 0 || PatternLen == 0 || StringLen == 65535) {
+        return FALSE;
+    }
+
+But it's missing the StringLen == 65535 check!
+
+
+ISSUE 2: Line 205 - bounds check on starSi
+-------------------------------------------
+
+Line 194-195:
+    starSi++;
+    if (!Recursive && starSi < StringLen && String[starSi] == PATH_SEPARATOR) {
+                      ^^^^^^^^^^^^^^^^^^^
+This check happens AFTER starSi++. If starSi was 65535 before increment:
+- starSi++ wraps to 0
+- starSi < StringLen is (0 < 65535) = TRUE
+- String[starSi] accesses String[0]
+- This is valid memory but logically incorrect behavior
+
+
+ISSUE 3: Line 147 - iteration count check
+------------------------------------------
+
+Line 147:
+    if (++iterations > MAX_WILDCARD_ITERATIONS) {
+        return FALSE;
+    }
+
+MAX_WILDCARD_ITERATIONS = 520 * 520 = 270400
+
+Question: What if iterations == MAX_WILDCARD_ITERATIONS exactly?
+- ++iterations increments first, so iterations becomes MAX_WILDCARD_ITERATIONS + 1
+- Then it checks (MAX_WILDCARD_ITERATIONS + 1) > MAX_WILDCARD_ITERATIONS
+- This is TRUE, so it returns FALSE
+
+This is CORRECT - no off-by-one error. If iterations reaches the cap, it stops.
+
+
+SUMMARY OF BUGS FOUND
+----------------------
+
+1. CRITICAL: Missing check for StringLen == 65535 (or == MAXUSHORT)
+   - Comment at line 136 says this should be rejected
+   - Code at line 139 doesn't implement this check
+   - Results in potential wraparound and infinite loop
+
+2. CRITICAL: starSi overflow at line 163 and 194
+   - When starSi == 65535, starSi++ wraps to 0
+   - si = starSi causes si to jump back to 0
+   - Loop may continue for up to MAX_WILDCARD_ITERATIONS with incorrect logic
