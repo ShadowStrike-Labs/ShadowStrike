@@ -728,12 +728,12 @@ SstLookupByNumber(
         return STATUS_INVALID_PARAMETER;
     }
 
+    InterlockedIncrement64(&tbl->TotalLookupsByNumber);
+
     if (Number >= SST_MAX_SYSCALL_NUMBER) {
         InterlockedIncrement64(&tbl->TotalLookupMisses);
         return STATUS_NOT_FOUND;
     }
-
-    InterlockedIncrement64(&tbl->TotalLookupsByNumber);
 
     entry = SstpFindByNumber(tbl, Number);
     if (entry == NULL) {

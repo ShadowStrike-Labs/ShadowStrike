@@ -1699,14 +1699,35 @@ CsapPopulateTextSectionInline(
                      numberOfSections * sizeof(IMAGE_SECTION_HEADER),
                      sizeof(ULONG));
 
+        ULONG_PTR textRangeMin = (ULONG_PTR)-1;
+        ULONG_PTR textRangeMax = 0;
+
         for (ULONG s = 0; s < numberOfSections; s++) {
             if ((sectionHdr[s].Characteristics & IMAGE_SCN_CNT_CODE) &&
                 (sectionHdr[s].Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
 
-                CacheEntry->TextSectionBase = base + sectionHdr[s].VirtualAddress;
-                CacheEntry->TextSectionSize = sectionHdr[s].Misc.VirtualSize;
-                break;
+                ULONG_PTR secStart = (ULONG_PTR)base + sectionHdr[s].VirtualAddress;
+                ULONG_PTR secEnd = secStart + sectionHdr[s].Misc.VirtualSize;
+
+                if (secStart < textRangeMin) {
+                    textRangeMin = secStart;
+                }
+                if (secEnd > textRangeMax) {
+                    textRangeMax = secEnd;
+                }
             }
+        }
+
+        //
+        // Use bounding range across ALL executable sections.
+        // Modules with LTCG, delay-load trampolines, or split .text sections
+        // may have multiple CODE|EXECUTE sections. Taking only the first one
+        // would cause false CsaAnomaly_SpoofedFrames for return addresses
+        // in the second+ sections.
+        //
+        if (textRangeMax > textRangeMin) {
+            CacheEntry->TextSectionBase = (PVOID)textRangeMin;
+            CacheEntry->TextSectionSize = (SIZE_T)(textRangeMax - textRangeMin);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         // PE parsing failed — leave TextSection fields as NULL/0
@@ -1744,12 +1765,13 @@ CsapDereferenceModuleEntry(
     LONG newRef = InterlockedDecrement(&Entry->RefCount);
 
     //
-    // Deferred eviction: if the process has exited (PendingEvict == TRUE)
-    // and this was the last operational reference (RefCount now 1 = cache ref),
-    // remove from cache and free. This prevents orphan entries from processes
-    // that exited while a callstack analysis held a module reference.
+    // Deferred eviction: if RefCount reaches 0, this was the last reference
+    // (cache ref dropped by CsapEvictProcessEntries, lookup ref dropped here).
+    // Remove from cache and free under lock. This eliminates the UAF race
+    // where the old RefCount==1 trigger could read PendingEvict from an entry
+    // concurrently freed by CsapEvictProcessEntries.
     //
-    if (newRef == 1 && Entry->PendingEvict && Analyzer != NULL) {
+    if (newRef == 0 && Analyzer != NULL) {
         KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&Analyzer->Public.ModuleLock);
 
@@ -1757,7 +1779,7 @@ CsapDereferenceModuleEntry(
         // Re-check under lock: RefCount may have been incremented by
         // another thread's CsapLookupModule between our check and lock.
         //
-        if (Entry->RefCount == 1 && Entry->PendingEvict) {
+        if (Entry->RefCount == 0) {
             RemoveEntryList(&Entry->ListEntry);
             InterlockedDecrement(&Analyzer->CachedModuleCount);
 
@@ -1857,17 +1879,23 @@ CsapEvictProcessEntries(
 
         if (cacheEntry->ProcessId == ProcessId) {
             //
-            // Only evict if no outstanding references (RefCount == 1 means
-            // only the cache itself holds a ref). If RefCount > 1, a lookup
-            // is in progress; mark PendingEvict so the entry is freed when
-            // the last reference is released in CsapDereferenceModuleEntry.
+            // Mark for eviction and drop the cache's reference.
+            // If RefCount reaches 0, no outstanding lookups — safe to
+            // remove from list and free immediately. Otherwise, leave
+            // in list; CsapDereferenceModuleEntry will handle cleanup
+            // when the last lookup releases (RefCount→0).
             //
-            if (cacheEntry->RefCount <= 1) {
+            // Always set PendingEvict BEFORE decrementing to eliminate
+            // the UAF race where a concurrent CsapDereferenceModuleEntry
+            // reads PendingEvict from freed memory.
+            //
+            cacheEntry->PendingEvict = TRUE;
+            LONG newRef = InterlockedDecrement(&cacheEntry->RefCount);
+
+            if (newRef == 0) {
                 RemoveEntryList(entry);
                 InterlockedDecrement(&AnalyzerInternal->CachedModuleCount);
                 InsertTailList(&entriesToFree, entry);
-            } else {
-                cacheEntry->PendingEvict = TRUE;
             }
         }
     }

@@ -2595,8 +2595,40 @@ Routine Description:
 
                 if (RtlCompareUnicodeString(
                         &LdrEntry->BaseDllName, ModuleName, TRUE) == 0) {
+
+                    ULONG_PTR base = (ULONG_PTR)LdrEntry->DllBase;
+                    ULONG size = LdrEntry->SizeOfImage;
+
+                    //
+                    // Validate PEB-sourced base/size against user-mode bounds.
+                    // A malicious process can set arbitrary values in its PEB.
+                    // Without validation, inflated SizeOfImage would poison the
+                    // global SystemWow64CpuBase/Size via CAS and bypass all
+                    // HeavensGate detection for every WoW64 process.
+                    //
+                    #define HGD_MIN_VALID_USER_ADDRESS   0x10000ULL
+                    #define HGD_MAX_USER_ADDRESS         0x7FFFFFFFFFFFULL
+                    #define HGD_MAX_WOW64_MODULE_SIZE    (16 * 1024 * 1024)  // 16 MB cap
+
+                    if (base < HGD_MIN_VALID_USER_ADDRESS ||
+                        base > HGD_MAX_USER_ADDRESS) {
+                        Status = STATUS_INVALID_ADDRESS;
+                        __leave;
+                    }
+
+                    if (size == 0 || size > HGD_MAX_WOW64_MODULE_SIZE) {
+                        Status = STATUS_INVALID_PARAMETER;
+                        __leave;
+                    }
+
+                    if (base + size < base ||
+                        base + size > HGD_MAX_USER_ADDRESS) {
+                        Status = STATUS_INTEGER_OVERFLOW;
+                        __leave;
+                    }
+
                     *ModuleBase = LdrEntry->DllBase;
-                    *ModuleSize = LdrEntry->SizeOfImage;
+                    *ModuleSize = size;
                     Found = TRUE;
                     break;
                 }

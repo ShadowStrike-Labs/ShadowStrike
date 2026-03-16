@@ -105,6 +105,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../ETW/TelemetryEvents.h"
 #include "../../Memory/MemoryMonitor.h"
 #include "../../Memory/HollowingDetector.h"
+#include "../../Syscall/SyscallMonitor.h"
 #include <ntstrsafe.h>
 
 //
@@ -3715,6 +3716,13 @@ PnpHandleProcessTermination(
     // Releases EPROCESS ref held by HeapSpray detector for this PID.
     //
     MmMonitorRemoveProcessContext(HandleToULong(ProcessId));
+
+    //
+    // Clean up SyscallMonitor per-process state (NTDLL ranges, call caches).
+    // Also cascades to CallstackAnalyzer and HeavensGateDetector sub-module cleanup.
+    // Must happen on termination to prevent context leak (max 8192 tracked).
+    //
+    ScMonitorRemoveProcessContext(HandleToULong(ProcessId));
 
     //
     // Look up process context

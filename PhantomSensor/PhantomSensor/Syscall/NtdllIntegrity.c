@@ -1040,6 +1040,7 @@ Return Value:
     NTSTATUS status;
     ULONG hookIndex = 0;
     ULONG totalHooks = 0;
+    ULONG allocFailures = 0;
 
     PAGED_CODE();
 
@@ -1102,6 +1103,8 @@ Return Value:
                         RtlCopyMemory(hookCopy, funcState, sizeof(NI_FUNCTION_STATE));
                         InitializeListHead(&hookCopy->ListEntry);
                         Hooks[hookIndex++] = hookCopy;
+                    } else {
+                        allocFailures++;
                     }
                 }
             }
@@ -1119,6 +1122,16 @@ Return Value:
     //
     if (totalHooks > Max) {
         return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    //
+    // Report partial results when allocation failures dropped hooks
+    //
+    if (allocFailures > 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "NtdllIntegrity: NiDetectHooks dropped %lu hooks due to allocation failures (PID %lu)\n",
+            allocFailures, HandleToULong(ProcessId));
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     return STATUS_SUCCESS;

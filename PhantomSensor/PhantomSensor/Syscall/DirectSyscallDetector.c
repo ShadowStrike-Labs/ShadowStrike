@@ -774,6 +774,18 @@ DsdAnalyzeSyscall(
     }
 
     //
+    // Second whitelist check after module resolution: name-only whitelist
+    // entries can only match once we know the caller's module name.
+    // The first check at line 580 only matched address-based entries.
+    //
+    if (detection->Base.CallFromKnownModule &&
+        DsdpIsWhitelisted(detector, CallerAddress, detection->Base.CallerModuleName)) {
+        DsdpFreeDetectionInternal(detector, detection);
+        DsdpReleaseReference(detector);
+        return STATUS_NO_MORE_ENTRIES;
+    }
+
+    //
     // Capture user-mode call stack (properly attached to target process)
     //
     status = DsdpCaptureUserCallStack(
@@ -1145,9 +1157,18 @@ DsdAddWhitelistEntry(
     }
 
     //
+    // Acquire rundown protection to prevent DsdShutdown from freeing
+    // the detector while we're inserting a whitelist entry.
+    //
+    if (!DsdpTryAcquireReference(detector)) {
+        return STATUS_SHUTDOWN_IN_PROGRESS;
+    }
+
+    //
     // At least one match criterion must be provided
     //
     if (ModuleName == NULL && (BaseAddress == 0 || Size == 0)) {
+        DsdpReleaseReference(detector);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1157,6 +1178,7 @@ DsdAddWhitelistEntry(
     //
     if (ModuleName != NULL && ModuleName->Length > 0) {
         if (ModuleName->Length > (DSD_MAX_MODULE_NAME_CHARS * sizeof(WCHAR))) {
+            DsdpReleaseReference(detector);
             return STATUS_INVALID_PARAMETER;
         }
     }
@@ -1168,6 +1190,7 @@ DsdAddWhitelistEntry(
     );
 
     if (entry == NULL) {
+        DsdpReleaseReference(detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1184,6 +1207,7 @@ DsdAddWhitelistEntry(
 
         if (entry->ModuleName.Buffer == NULL) {
             ShadowStrikeFreePoolWithTag(entry, DSD_WHITELIST_TAG);
+            DsdpReleaseReference(detector);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -1226,6 +1250,7 @@ DsdAddWhitelistEntry(
                 ShadowStrikeFreePoolWithTag(entry->ModuleName.Buffer, DSD_WHITELIST_TAG);
             }
             ShadowStrikeFreePoolWithTag(entry, DSD_WHITELIST_TAG);
+            DsdpReleaseReference(detector);
             return STATUS_QUOTA_EXCEEDED;
         }
 
@@ -1235,6 +1260,7 @@ DsdAddWhitelistEntry(
     ExReleasePushLockExclusive(&Detector->WhitelistLock);
     KeLeaveCriticalRegion();
 
+    DsdpReleaseReference(detector);
     return STATUS_SUCCESS;
 }
 

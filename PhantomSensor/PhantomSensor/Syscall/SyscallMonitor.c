@@ -536,13 +536,13 @@ ScMonitorShutdown(VOID)
     // Delete lookaside lists
     //
     if (g_ScState.EventLookasideInitialized) {
-        ExDeleteNPagedLookasideList(&g_ScState.EventLookaside);
         g_ScState.EventLookasideInitialized = FALSE;
+        ExDeleteNPagedLookasideList(&g_ScState.EventLookaside);
     }
 
     if (g_ScState.ContextLookasideInitialized) {
-        ExDeleteNPagedLookasideList(&g_ScState.ContextLookaside);
         g_ScState.ContextLookasideInitialized = FALSE;
+        ExDeleteNPagedLookasideList(&g_ScState.ContextLookaside);
     }
 
     g_ScState.Magic = 0;
@@ -1849,6 +1849,17 @@ ScMonitorIsFromNtdll(
         return FALSE;
     }
 
+    //
+    // Acquire framework reference to prevent shutdown from freeing
+    // process contexts while we traverse the list.
+    //
+    ScpAcquireReference();
+
+    if (g_ScState.ShuttingDown) {
+        ScpReleaseReference();
+        return FALSE;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_ScState.ProcessLock);
     ctx = ScpFindProcessContextLocked(ProcessId);
@@ -1866,6 +1877,7 @@ ScMonitorIsFromNtdll(
         ScMonitorReleaseProcessContext(ctx);
     }
 
+    ScpReleaseReference();
     return result;
 }
 
@@ -1887,6 +1899,16 @@ ScMonitorDetectHeavensGate(
     }
 
     if (!g_ScState.Initialized || g_ScState.HeavensGateDetector == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Framework ref: prevent shutdown from freeing HeavensGateDetector mid-call
+    //
+    ScpAcquireReference();
+
+    if (g_ScState.ShuttingDown) {
+        ScpReleaseReference();
         return FALSE;
     }
 
@@ -1913,10 +1935,12 @@ ScMonitorDetectHeavensGate(
         if (!isLegitimate) {
             Context->IsFromWoW64 = TRUE;
             Context->DetectionFlags |= SC_DETECT_HEAVENS_GATE;
+            ScpReleaseReference();
             return TRUE;
         }
     }
 
+    ScpReleaseReference();
     return FALSE;
 }
 
@@ -1952,6 +1976,16 @@ ScMonitorAnalyzeCallStack(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    //
+    // Framework ref: prevent shutdown from freeing CallstackAnalyzer mid-call
+    //
+    ScpAcquireReference();
+
+    if (g_ScState.ShuttingDown) {
+        ScpReleaseReference();
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     status = CsaCaptureCallstack(
         g_ScState.CallstackAnalyzer,
         (HANDLE)(ULONG_PTR)ProcessId,
@@ -1960,6 +1994,7 @@ ScMonitorAnalyzeCallStack(
         );
 
     if (!NT_SUCCESS(status) || callstack == NULL) {
+        ScpReleaseReference();
         return status;
     }
 
@@ -2029,6 +2064,7 @@ ScMonitorAnalyzeCallStack(
         }
     }
 
+    ScpReleaseReference();
     return status;
 }
 
@@ -2056,6 +2092,16 @@ ScMonitorVerifyNtdllIntegrity(
     }
 
     //
+    // Framework ref: prevent shutdown from freeing NtdllIntegrityMonitor mid-call
+    //
+    ScpAcquireReference();
+
+    if (g_ScState.ShuttingDown) {
+        ScpReleaseReference();
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
     // Get NTDLL baseline info
     //
     status = NiScanProcess(
@@ -2065,6 +2111,7 @@ ScMonitorVerifyNtdllIntegrity(
         );
 
     if (!NT_SUCCESS(status) || ntdllState == NULL) {
+        ScpReleaseReference();
         return status;
     }
 
@@ -2135,6 +2182,7 @@ ScMonitorVerifyNtdllIntegrity(
 
     NiFreeState(g_ScState.NtdllIntegrityMonitor, ntdllState);
 
+    ScpReleaseReference();
     return STATUS_SUCCESS;
 }
 
@@ -2166,6 +2214,16 @@ ScMonitorGetNtdllHooks(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    //
+    // Framework ref: prevent shutdown from freeing NtdllIntegrityMonitor mid-call
+    //
+    ScpAcquireReference();
+
+    if (g_ScState.ShuttingDown) {
+        ScpReleaseReference();
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     niHooks = (PNI_FUNCTION_STATE*)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         MaxFunctions * sizeof(PNI_FUNCTION_STATE),
@@ -2173,6 +2231,7 @@ ScMonitorGetNtdllHooks(
         );
 
     if (niHooks == NULL) {
+        ScpReleaseReference();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -2224,6 +2283,7 @@ ScMonitorGetNtdllHooks(
     }
 
     ShadowStrikeFreePoolWithTag(niHooks, SC_POOL_TAG_GENERAL);
+    ScpReleaseReference();
     return status;
 }
 
@@ -2284,6 +2344,17 @@ ScMonitorRestoreNtdllFunction(
     }
 
     //
+    // Framework ref: prevent shutdown from freeing NtdllIntegrityMonitor mid-call.
+    // This function writes to target process memory — must complete atomically.
+    //
+    ScpAcquireReference();
+
+    if (g_ScState.ShuttingDown) {
+        ScpReleaseReference();
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
     // Verify the function is actually hooked
     //
     status = NiCheckFunction(
@@ -2294,11 +2365,13 @@ ScMonitorRestoreNtdllFunction(
         );
 
     if (!NT_SUCCESS(status) || funcState == NULL) {
+        ScpReleaseReference();
         return status;
     }
 
     if (!funcState->IsModified) {
         NiFreeFunctionState(g_ScState.NtdllIntegrityMonitor, funcState);
+        ScpReleaseReference();
         return STATUS_SUCCESS;
     }
 
@@ -2319,12 +2392,14 @@ ScMonitorRestoreNtdllFunction(
         (HANDLE)(ULONG_PTR)ProcessId, &process);
     if (!NT_SUCCESS(status)) {
         NiFreeFunctionState(g_ScState.NtdllIntegrityMonitor, funcState);
+        ScpReleaseReference();
         return status;
     }
 
     if (ShadowStrikeIsProcessTerminating(process)) {
         ObDereferenceObject(process);
         NiFreeFunctionState(g_ScState.NtdllIntegrityMonitor, funcState);
+        ScpReleaseReference();
         return STATUS_PROCESS_IS_TERMINATING;
     }
 
@@ -2375,6 +2450,7 @@ ScMonitorRestoreNtdllFunction(
     }
 
     NiFreeFunctionState(g_ScState.NtdllIntegrityMonitor, funcState);
+    ScpReleaseReference();
     return status;
 }
 
@@ -2403,12 +2479,20 @@ ScMonitorGetSyscallName(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    ScpAcquireReference();
+
+    if (g_ScState.ShuttingDown) {
+        ScpReleaseReference();
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     status = SstLookupByNumber(
         g_ScState.SyscallTableHandle, SyscallNumber, &info);
     if (NT_SUCCESS(status) && info.Name != NULL) {
         RtlStringCchCopyA(Name, NameSize, info.Name);
     }
 
+    ScpReleaseReference();
     return status;
 }
 
@@ -2433,12 +2517,20 @@ ScMonitorGetSyscallNumber(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    ScpAcquireReference();
+
+    if (g_ScState.ShuttingDown) {
+        ScpReleaseReference();
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     status = SstLookupByName(
         g_ScState.SyscallTableHandle, Name, &info);
     if (NT_SUCCESS(status)) {
         *SyscallNumber = info.Number;
     }
 
+    ScpReleaseReference();
     return status;
 }
 
@@ -2460,6 +2552,13 @@ ScMonitorGetSyscallDefinition(
     RtlZeroMemory(Definition, sizeof(SYSCALL_DEFINITION));
 
     if (!g_ScState.Initialized || g_ScState.SyscallTableHandle == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    ScpAcquireReference();
+
+    if (g_ScState.ShuttingDown) {
+        ScpReleaseReference();
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -2502,6 +2601,7 @@ ScMonitorGetSyscallDefinition(
         Definition->Flags = info.Flags;
     }
 
+    ScpReleaseReference();
     return status;
 }
 
@@ -2669,6 +2769,16 @@ ScMonitorGetProcessStats(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    //
+    // Framework ref: prevent shutdown from freeing process context structures
+    //
+    ScpAcquireReference();
+
+    if (g_ScState.ShuttingDown) {
+        ScpReleaseReference();
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_ScState.ProcessLock);
     ctx = ScpFindProcessContextLocked(ProcessId);
@@ -2676,6 +2786,7 @@ ScMonitorGetProcessStats(
     KeLeaveCriticalRegion();
 
     if (ctx == NULL) {
+        ScpReleaseReference();
         return STATUS_NOT_FOUND;
     }
 
@@ -2685,6 +2796,7 @@ ScMonitorGetProcessStats(
 
     ScMonitorReleaseProcessContext(ctx);
 
+    ScpReleaseReference();
     return STATUS_SUCCESS;
 }
 
