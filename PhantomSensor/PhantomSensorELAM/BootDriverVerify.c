@@ -41,7 +41,7 @@
 // CONSTANTS AND CONFIGURATION
 // ============================================================================
 
-#define BDV_BLOOM_FILTER_SIZE_BITS      (512 * 1024)    // 64KB = 512K bits
+#define BDV_BLOOM_FILTER_SIZE_BITS      (1024 * 1024)   // 128KB = 1M bits (~1.4% FPR at 100K entries)
 #define BDV_BLOOM_FILTER_SIZE_BYTES     (BDV_BLOOM_FILTER_SIZE_BITS / 8)
 #define BDV_BLOOM_HASH_COUNT            7               // Number of hash functions
 #define BDV_MAX_KNOWN_HASHES            100000          // Maximum hash entries
@@ -258,12 +258,11 @@ BdvpMurmurHash3(
     ULONG k;
     ULONG i;
     const ULONG numBlocks = Length / 4;
-    const ULONG* blocks = (const ULONG*)Data;
     const UCHAR* tail = Data + (numBlocks * 4);
 
-    // Body
+    // Body — use RtlCopyMemory to avoid unaligned ULONG access (ARM64 safe)
     for (i = 0; i < numBlocks; i++) {
-        k = blocks[i];
+        RtlCopyMemory(&k, Data + (i * 4), sizeof(ULONG));
         k *= c1;
         k = (k << r1) | (k >> (32 - r1));
         k *= c2;
@@ -421,9 +420,7 @@ BdvpCalculateAuthenticodeHash(
     ULONG headerSize;
     ULONG currentOffset;
     ULONG bytesToHash;
-    USHORT i;
     BOOLEAN contextInitialized = FALSE;
-    UNREFERENCED_PARAMETER(i);
 
     if (ImageBase == NULL || ImageSize < sizeof(IMAGE_DOS_HEADER) || Hash == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -470,14 +467,23 @@ BdvpCalculateAuthenticodeHash(
         }
         headerSize = ntHeaders64->OptionalHeader.SizeOfHeaders;
     } else {
-        if (ntHeaders->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_SECURITY) {
-            securityDir = &ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+        // 32-bit PE: must cast to IMAGE_NT_HEADERS32 for correct field offsets
+        // (IMAGE_NT_HEADERS on x64 builds is IMAGE_NT_HEADERS64 — DataDirectory
+        // and NumberOfRvaAndSizes are at different offsets in 32-bit layout)
+        PIMAGE_NT_HEADERS32 ntHeaders32 = (PIMAGE_NT_HEADERS32)ntHeaders;
+        if (ntHeaders32->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_SECURITY) {
+            securityDir = &ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
             securityDirOffset = (ULONG)((PUCHAR)securityDir - (PUCHAR)ImageBase);
         } else {
             securityDir = NULL;
             securityDirOffset = 0;
         }
-        headerSize = ntHeaders->OptionalHeader.SizeOfHeaders;
+        headerSize = ntHeaders32->OptionalHeader.SizeOfHeaders;
+    }
+
+    // Validate headerSize against actual image bounds
+    if (headerSize > (ULONG)ImageSize) {
+        headerSize = (ULONG)ImageSize;
     }
 
     // Get security table location (overflow-safe)
@@ -561,6 +567,7 @@ BdvpCalculateAuthenticodeHash(
                                   BDV_MAX_PE_SECTIONS);
         USHORT j, k;
         SECTION_SORT key;
+        ULONG lastSectionEnd = 0;
 
         for (j = 0; j < sectionCount; j++) {
             sorted[j].Index = j;
@@ -602,6 +609,42 @@ BdvpCalculateAuthenticodeHash(
                     );
                 if (!NT_SUCCESS(status)) {
                     goto Cleanup;
+                }
+
+                // Track highest section end for trailing data calculation
+                if (sectionStart + sectionSize > lastSectionEnd) {
+                    lastSectionEnd = sectionStart + sectionSize;
+                }
+            }
+        }
+
+        //
+        // Authenticode spec step 5: Hash trailing data between last section
+        // end and the certificate table (or end of file if no cert table).
+        // This covers overlay data, debug directory data outside sections, etc.
+        //
+        {
+            ULONG trailingStart = lastSectionEnd;
+            ULONG trailingEnd;
+
+            if (securityDir != NULL && securityDir->VirtualAddress != 0 &&
+                securityDir->VirtualAddress <= (ULONG)ImageSize) {
+                trailingEnd = securityDir->VirtualAddress;
+            } else {
+                trailingEnd = (ULONG)ImageSize;
+            }
+
+            if (trailingEnd > trailingStart && trailingStart <= (ULONG)ImageSize) {
+                ULONG trailingSize = trailingEnd - trailingStart;
+                if (trailingSize <= (ULONG)ImageSize - trailingStart) {
+                    status = ShadowStrikeHashContextUpdate(
+                        &hashContext,
+                        (PUCHAR)ImageBase + trailingStart,
+                        trailingSize
+                        );
+                    if (!NT_SUCCESS(status)) {
+                        goto Cleanup;
+                    }
                 }
             }
         }
@@ -674,10 +717,12 @@ BdvpExtractCertificateInfo(
         }
         securityDir = &ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
     } else {
-        if (ntHeaders->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_SECURITY) {
+        // 32-bit PE: use IMAGE_NT_HEADERS32 for correct DataDirectory offset
+        PIMAGE_NT_HEADERS32 ntHeaders32 = (PIMAGE_NT_HEADERS32)ntHeaders;
+        if (ntHeaders32->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_SECURITY) {
             return STATUS_SUCCESS;
         }
-        securityDir = &ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+        securityDir = &ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
     }
 
     if (securityDir->VirtualAddress == 0 || securityDir->Size == 0) {
