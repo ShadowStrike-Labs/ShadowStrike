@@ -76,30 +76,40 @@ jobs:
       - name: Build PhantomSensor with Coverity
         shell: powershell
         run: |
-          # Find Coverity directory
+          # Find Coverity Build Tool directory
           $covDir = Get-ChildItem -Filter "cov-analysis-win64*" -Directory | Select-Object -First 1
-          Write-Host "Found Coverity at: $($covDir.FullName)"
-          
-          # Set PATH
-          $env:PATH = "$($covDir.FullName)\bin;$env:PATH"
-          
-          # Create cov-int directory
-          New-Item -ItemType Directory -Path "cov-int" -Force | Out-Null
-          
-          # Build with Coverity instrumentation
-          # InfVerif_NoError: skip INF verification on CI (no stampinf)
-          Write-Host "Building with Coverity..."
-          cov-build --dir cov-int msbuild PhantomSensor\PhantomSensor.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64 /p:InfVerif_NoError=true
-          
-          # Verify build succeeded
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "Build failed with exit code $LASTEXITCODE"
-              exit $LASTEXITCODE
+          if ($null -eq $covDir) {
+              Write-Error "Coverity Build Tool directory not found"
+              exit 1
           }
-          
-          # Analyze
-          Write-Host "Running Coverity analysis..."
-          cov-analyze --dir cov-int --strip-path $PWD --all --enable-constraint-fpp --enable-fnptr --enable-virtual
+          Write-Host "Found Coverity at: $($covDir.FullName)"
+          $env:PATH = "$($covDir.FullName)\bin;$env:PATH"
+
+          New-Item -ItemType Directory -Path "cov-int" -Force | Out-Null
+
+          # InfVerif_Enable=false: fully skip the InfVerif MSBuild target on CI
+          # (InfVerif.dll cannot load on GitHub Actions runners).
+          # InfVerif_NoError=true is a secondary guard in case the target still runs.
+          # NOTE: scan.coverity.com free tier does NOT ship cov-analyze.
+          #       Analysis runs on Coverity's servers after we upload cov-int/.
+          Write-Host "Running cov-build..."
+          cov-build --dir cov-int `
+              msbuild PhantomSensor\PhantomSensor.vcxproj `
+              /t:Build `
+              /p:Configuration=Release `
+              /p:Platform=x64 `
+              /p:InfVerif_Enable=false `
+              /p:InfVerif_NoError=true
+
+          # cov-build exits 0 as long as it captured compilation units,
+          # even when MSBuild reports non-fatal target errors (InfVerif).
+          # Verify we actually captured something before uploading.
+          $tuCount = (Get-ChildItem -Path "cov-int\emit" -Recurse -File -ErrorAction SilentlyContinue).Count
+          if ($tuCount -eq 0) {
+              Write-Error "cov-build emitted 0 translation units — build may have failed"
+              exit 1
+          }
+          Write-Host "cov-build captured $tuCount emit file(s) — ready for upload"
       
       - name: Submit to Coverity
         shell: powershell
