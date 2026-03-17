@@ -51,6 +51,7 @@
 #include "AttackChainTracker.h"
 #pragma warning(pop)
 #include <ntstrsafe.h>
+#include "../ETW/TelemetryEvents.h"
 
 static VOID ActpCleanupWorkerThread(_In_ PVOID StartContext);
 
@@ -987,6 +988,20 @@ ActSubmitEvent(
             chain->IsConfirmedAttack = TRUE;
             confirmedAttack = TRUE;
             InterlockedIncrement64(&Tracker->Stats.AttacksConfirmed);
+
+            //
+            // Emit attack chain confirmation telemetry.
+            // This is a HIGH-VALUE event — confirmed multi-stage attacks
+            // are rare and critical for SOC correlation.
+            //
+            TeLogAttackChain(
+                *(UINT64*)&chain->ChainId,
+                (ATTACK_CHAIN_STAGE)chain->CurrentState,
+                (UINT32)(ULONG_PTR)event->ProcessId,
+                (BEHAVIOR_EVENT_TYPE)0,     // ACT_CHAIN_EVENT carries no EventType
+                chain->ThreatScore,
+                event->Technique
+            );
 
             //
             // Snapshot event data while under EventLock to prevent

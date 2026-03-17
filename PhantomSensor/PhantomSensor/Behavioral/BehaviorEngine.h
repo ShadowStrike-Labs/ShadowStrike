@@ -821,3 +821,17 @@ struct _PM_MATCHER*
 BeGetPatternMatcher(
     VOID
     );
+
+/**
+ * @brief Get an opaque pointer to the global BehaviorEngine instance.
+ *
+ * Returns NULL if BehaviorEngine has not been initialized.
+ * Callers must not dereference the pointer directly.
+ *
+ * @return Opaque PVOID to engine state, or NULL if unavailable.
+ * @irql Any IRQL (returns cached pointer)
+ */
+PVOID
+BeEngineGetInstance(
+    VOID
+    );

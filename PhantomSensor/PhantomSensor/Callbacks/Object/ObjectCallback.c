@@ -68,6 +68,7 @@
 #include "ThreadProtection.h"
 #include "../../Performance/ResourceThrottling.h"
 #include "../../SelfProtection/HandleProtection.h"
+#include "../../Behavioral/ThreatScoring.h"
 
 #ifdef WPP_TRACING
 #include "ObjectCallback.tmh"
@@ -841,6 +842,42 @@ ShadowStrikeProcessPreCallback(
                     TRUE,
                     NULL
                     );
+
+                //
+                // Feed ThreatScoring — handle-based attacks contribute to
+                // per-process score (LSASS credential theft, injection, termination).
+                //
+                if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                    PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                    if (tsEngine != NULL) {
+                        PCSTR factorName;
+                        PCSTR reason;
+                        LONG tsScore;
+
+                        if (targetCategory == PpCategoryLsass) {
+                            factorName = "T1003-HandleAccess";
+                            reason = "Suspicious handle access to LSASS process (credential theft)";
+                            tsScore = 75;
+                        } else if (strippedAccess & PROCESS_TERMINATE) {
+                            factorName = "T1489-ProcTermination";
+                            reason = "Process termination handle access to protected process";
+                            tsScore = 40;
+                        } else {
+                            factorName = "T1055-HandleAccess";
+                            reason = "Cross-process handle access with injection-capable rights";
+                            tsScore = (LONG)(suspicionScore / 2);
+                        }
+
+                        TsAddFactor(
+                            tsEngine,
+                            sourceProcessId,
+                            TsFactor_Behavioral,
+                            factorName,
+                            tsScore,
+                            reason
+                            );
+                    }
+                }
             }
         }
 
@@ -891,6 +928,32 @@ ShadowStrikeProcessPreCallback(
         if (hpEngine != NULL) {
             HP_DETECTION_RESULT hpResult;
             (VOID)HpAnalyzeHandleOperation(hpEngine, OperationInformation, &hpResult);
+
+            //
+            // Record handle operation in HandleProtection audit trail.
+            // Handle values are not available in OB PreOperation callbacks.
+            // NOTE: HpRecordHandleClose cannot be wired here — PostOperation
+            // is NULL (see operationRegistration[0] setup). Close tracking
+            // would require adding a PostOperation callback.
+            //
+            if (isDuplicate) {
+                (VOID)HpRecordDuplication(
+                    hpEngine,
+                    sourceProcessId,
+                    targetProcessId,
+                    NULL,   // SourceHandle not available in PreOperation
+                    NULL,   // TargetHandle not available in PreOperation
+                    allowedAccess
+                    );
+            } else {
+                (VOID)HpRecordHandle(
+                    hpEngine,
+                    sourceProcessId,
+                    NULL,   // Handle not available in PreOperation
+                    HpObjectType_Process,
+                    allowedAccess
+                    );
+            }
         }
     }
 
@@ -1164,6 +1227,23 @@ ShadowStrikeThreadPreCallback(
                 TRUE,
                 NULL
                 );
+
+            //
+            // Feed ThreatScoring — thread handle injection pattern (T1055)
+            //
+            if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                if (tsEngine != NULL) {
+                    TsAddFactor(
+                        tsEngine,
+                        sourceProcessId,
+                        TsFactor_Behavioral,
+                        "T1055-ThreadHijack",
+                        (LONG)(suspicionScore / 2),
+                        "Thread handle access with injection-capable rights (execution hijack)"
+                        );
+                }
+            }
         }
 
         //
@@ -1222,6 +1302,32 @@ ShadowStrikeThreadPreCallback(
         if (hpEngine != NULL) {
             HP_DETECTION_RESULT hpResult;
             (VOID)HpAnalyzeHandleOperation(hpEngine, OperationInformation, &hpResult);
+
+            //
+            // Record thread handle operation in HandleProtection audit trail.
+            // Handle values are not available in OB PreOperation callbacks.
+            // NOTE: HpRecordHandleClose cannot be wired here — PostOperation
+            // is NULL (see operationRegistration[1] setup). Close tracking
+            // would require adding a PostOperation callback.
+            //
+            if (isDuplicate) {
+                (VOID)HpRecordDuplication(
+                    hpEngine,
+                    sourceProcessId,
+                    targetProcessId,
+                    NULL,   // SourceHandle not available in PreOperation
+                    NULL,   // TargetHandle not available in PreOperation
+                    allowedAccess
+                    );
+            } else {
+                (VOID)HpRecordHandle(
+                    hpEngine,
+                    sourceProcessId,
+                    NULL,   // Handle not available in PreOperation
+                    HpObjectType_Thread,
+                    allowedAccess
+                    );
+            }
         }
     }
 

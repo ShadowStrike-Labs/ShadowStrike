@@ -633,7 +633,7 @@ Return Value:
         KeQuerySystemTime(&existingContext->LastAccessTime);
         InterlockedIncrement(&existingContext->OpenCount);
 
-        FltReleaseContext((PFLT_CONTEXT)existingContext);
+        PocReleaseStreamContext(existingContext);
         existingContext = NULL;
 
         //
@@ -875,7 +875,7 @@ Return Value:
                 KeLeaveCriticalRegion();
             }
 
-            FltReleaseContext((PFLT_CONTEXT)existingContext);
+            PocReleaseStreamContext(existingContext);
             existingContext = NULL;
         }
 
@@ -922,7 +922,7 @@ CreateHandleContext:
             //
             // Handle context created/found - release our reference
             //
-            FltReleaseContext((PFLT_CONTEXT)handleContext);
+            PocReleaseHandleContext(handleContext);
             handleContext = NULL;
         }
     }
@@ -945,7 +945,7 @@ Cleanup:
     // (FltSetStreamContext adds its own if successful)
     //
     if (streamContext != NULL) {
-        FltReleaseContext((PFLT_CONTEXT)streamContext);
+        PocReleaseStreamContext(streamContext);
         streamContext = NULL;
     }
 
@@ -1067,7 +1067,7 @@ PocGetOrCreateStreamContext(
         // Invalid context - release and create new
         //
         InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
-        FltReleaseContext((PFLT_CONTEXT)context);
+        PocReleaseStreamContext(context);
         context = NULL;
     }
 
@@ -1094,7 +1094,7 @@ PocGetOrCreateStreamContext(
         //
         // Use existing context
         //
-        FltReleaseContext((PFLT_CONTEXT)context);
+        PocReleaseStreamContext(context);
         context = NULL;
 
         if (existingContext != NULL && PocIsValidStreamContext(existingContext)) {
@@ -1104,14 +1104,14 @@ PocGetOrCreateStreamContext(
 
         if (existingContext != NULL) {
             InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
-            FltReleaseContext((PFLT_CONTEXT)existingContext);
+            PocReleaseStreamContext(existingContext);
         }
 
         return STATUS_UNSUCCESSFUL;
     }
 
     if (!NT_SUCCESS(status)) {
-        FltReleaseContext((PFLT_CONTEXT)context);
+        PocReleaseStreamContext(context);
         return status;
     }
 
@@ -1317,7 +1317,7 @@ PocGetOrCreateHandleContext(
         }
 
         InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
-        FltReleaseContext((PFLT_CONTEXT)context);
+        PocReleaseHandleContext(context);
         context = NULL;
     }
 
@@ -1364,7 +1364,7 @@ PocGetOrCreateHandleContext(
         );
 
     if (status == STATUS_FLT_CONTEXT_ALREADY_DEFINED) {
-        FltReleaseContext((PFLT_CONTEXT)context);
+        PocReleaseHandleContext(context);
         context = NULL;
 
         if (existingContext != NULL && PocIsValidHandleContext(existingContext)) {
@@ -1374,14 +1374,14 @@ PocGetOrCreateHandleContext(
 
         if (existingContext != NULL) {
             InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
-            FltReleaseContext((PFLT_CONTEXT)existingContext);
+            PocReleaseHandleContext(existingContext);
         }
 
         return STATUS_UNSUCCESSFUL;
     }
 
     if (!NT_SUCCESS(status)) {
-        FltReleaseContext((PFLT_CONTEXT)context);
+        PocReleaseHandleContext(context);
         InterlockedIncrement64(&g_PocState.Stats.HandleContextsFailed);
         return status;
     }

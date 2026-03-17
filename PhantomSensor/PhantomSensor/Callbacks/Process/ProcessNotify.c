@@ -90,6 +90,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../FileSystem/FileSystemCallbacks.h"
 #include "../FileSystem/PreSetInfo.h"
 #include "../Object/ObjectCallback.h"
+#include "../Object/ProcessProtection.h"
 #include "AmsiBypassDetector.h"
 #include "EnvironmentMonitor.h"
 #include "HandleTracker.h"
@@ -1096,6 +1097,13 @@ Arguments:
             NULL,   // CommandLine not available at exit
             0, 0, 0);
 
+        //
+        // Notify BehaviorEngine of process termination so it can finalize
+        // attack chain analysis, flush pending behavioral events, and
+        // release the per-process context entry.
+        //
+        BeEngineProcessTerminate(HandleToULong(ProcessId));
+
         PnpHandleProcessTermination(ProcessId);
         goto Cleanup;
     }
@@ -1133,6 +1141,36 @@ Arguments:
         CreateInfo->ImageFileName,
         CreateInfo->CommandLine,
         0, 0, 0);
+
+    //
+    // Notify BehaviorEngine of process creation to populate full
+    // per-process context (ImagePath, CommandLine, ParentPID, PEPROCESS).
+    // This must precede behavioral analysis so BepGetOrCreateProcessContext
+    // has complete data for threat scoring and attack chain correlation.
+    //
+    BeEngineProcessCreate(
+        HandleToULong(ProcessId),
+        HandleToULong(CreateInfo->ParentProcessId),
+        CreateInfo->ImageFileName,
+        CreateInfo->CommandLine
+    );
+
+    //
+    // Classify the new process for automatic protection. Critical system
+    // processes (LSASS, CSRSS, services.exe) and EDR/AV processes get
+    // registered in the protection cache for handle-access enforcement
+    // by the ObjectCallback pre-operation handlers.
+    //
+    {
+        PP_PROCESS_CATEGORY ppCategory = PpCategoryUnknown;
+        PP_PROTECTION_LEVEL ppLevel = PpProtectionNone;
+
+        if (NT_SUCCESS(PpClassifyProcess(Process, &ppCategory, &ppLevel)) &&
+            ppCategory != PpCategoryUnknown &&
+            ppLevel != PpProtectionNone) {
+            PpAddProtectedProcess(ProcessId, ppCategory, ppLevel);
+        }
+    }
 
     //
     // Check for known system process (skip detailed analysis for performance)

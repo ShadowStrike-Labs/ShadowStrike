@@ -49,6 +49,7 @@
 #include "InjectionDetector.h"
 #include "ROPDetector.h"
 #include "ShellcodeDetector.h"
+#include "SectionTracker.h"
 
 // ============================================================================
 // MEMORY MONITOR CONFIGURATION
@@ -341,6 +342,16 @@ MmMonitorGetROPDetector(
 _IRQL_requires_max_(DISPATCH_LEVEL)
 PSD_DETECTOR
 MmMonitorGetShellcodeDetector(
+    VOID
+    );
+
+/**
+ * @brief Get the SectionTracker instance for cross-process section analysis.
+ * @return PSEC_TRACKER opaque pointer, or NULL if not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PSEC_TRACKER
+MmMonitorGetSectionTracker(
     VOID
     );
 

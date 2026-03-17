@@ -65,6 +65,7 @@
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Shared/KernelProcessTypes.h"
 #include "../../Behavioral/BehaviorEngine.h"
+#include "../../Behavioral/ThreatScoring.h"
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../ETW/ETWConsumer.h"
 #include "../../ETW/ETWProvider.h"
@@ -994,6 +995,15 @@ Routine Description:
                             FALSE,
                             NULL
                             );
+
+                        {
+                            PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                            if (tsEngine != NULL) {
+                                TsAddFactor(tsEngine, event->TargetProcessId,
+                                    TsFactor_Behavioral, "ThreadShellcode",
+                                    85, "Shellcode pattern detected at thread start address");
+                            }
+                        }
                     }
                 }
 
@@ -1025,6 +1035,15 @@ Routine Description:
                             FALSE,
                             NULL
                             );
+
+                        {
+                            PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                            if (tsEngine != NULL) {
+                                TsAddFactor(tsEngine, event->TargetProcessId,
+                                    TsFactor_Behavioral, "CrossProcessThread",
+                                    90, "Cross-process thread injection detected (T1055)");
+                            }
+                        }
                     }
                 }
 
@@ -1061,6 +1080,15 @@ Routine Description:
                                     (ropResult->ConfidenceScore >= 80),
                                     NULL
                                 );
+
+                                {
+                                    PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                                    if (tsEngine != NULL) {
+                                        TsAddFactor(tsEngine, event->TargetProcessId,
+                                            TsFactor_Behavioral, "ROPChain",
+                                            (LONG)ropResult->ConfidenceScore, "ROP chain detected in thread stack (T1055)");
+                                    }
+                                }
                             }
                             RopFreeResult(ropResult);
                         }
@@ -1098,6 +1126,16 @@ Routine Description:
                         FALSE,
                         NULL
                         );
+
+                    {
+                        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                        if (tsEngine != NULL) {
+                            TsAddFactor(tsEngine, event->TargetProcessId,
+                                TsFactor_Behavioral, "RemoteThread",
+                                (LONG)event->InjectionScore,
+                                "Remote thread creation with high injection score (T1055)");
+                        }
+                    }
                 }
 
                 //

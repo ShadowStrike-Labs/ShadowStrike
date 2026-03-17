@@ -75,6 +75,8 @@
 #include "../Behavioral/BehaviorEngine.h"
 #include "../ETW/ETWConsumer.h"
 #include "../ETW/ETWProvider.h"
+#include "../ETW/TelemetryEvents.h"
+#include "../Behavioral/ThreatScoring.h"
 #include "../Core/DriverEntry.h"
 #include "../Sync/TimerManager.h"
 
@@ -1706,6 +1708,72 @@ NfFilterGetProcessNetworkStats(
 }
 
 // ============================================================================
+// TELEMETRY HELPERS
+// ============================================================================
+
+/**
+ * @brief Emit a TE_NETWORK_EVENT for a detected network threat.
+ *
+ * Allocates from NonPagedPool because TE_NETWORK_EVENT is ~1.2KB,
+ * too large for the stack at DISPATCH_LEVEL (WFP classify context).
+ */
+static
+VOID
+NfpEmitNetworkTelemetry(
+    _In_ TE_EVENT_ID EventId,
+    _In_ PNF_CONNECTION_ENTRY Connection,
+    _In_ UINT32 ThreatScore,
+    _In_ UINT32 TeNetFlags
+    )
+{
+    PTE_NETWORK_EVENT netEvent;
+
+    netEvent = (PTE_NETWORK_EVENT)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(TE_NETWORK_EVENT), 'tENF');
+    if (netEvent == NULL) {
+        return;
+    }
+
+    RtlZeroMemory(netEvent, sizeof(TE_NETWORK_EVENT));
+
+    netEvent->Header.Size = sizeof(TE_NETWORK_EVENT);
+    netEvent->Header.EventId = (UINT32)EventId;
+    netEvent->Header.ProcessId = Connection->ProcessId;
+
+    netEvent->Protocol = (UINT32)Connection->Protocol;
+    netEvent->Direction = (UINT32)Connection->Direction;
+    netEvent->LocalPort = Connection->LocalAddress.Port;
+    netEvent->RemotePort = Connection->RemoteAddress.Port;
+
+    if (Connection->RemoteAddress.Address.Family == AF_INET) {
+        netEvent->LocalAddressV4 = Connection->LocalAddress.Address.V4.Address;
+        netEvent->RemoteAddressV4 = Connection->RemoteAddress.Address.V4.Address;
+    } else if (Connection->RemoteAddress.Address.Family == AF_INET6) {
+        RtlCopyMemory(netEvent->LocalAddressV6,
+                       Connection->LocalAddress.Address.V6.Bytes, 16);
+        RtlCopyMemory(netEvent->RemoteAddressV6,
+                       Connection->RemoteAddress.Address.V6.Bytes, 16);
+    }
+
+    netEvent->BytesSent = Connection->BytesSent;
+    netEvent->BytesReceived = Connection->BytesReceived;
+    netEvent->ThreatScore = ThreatScore;
+    netEvent->ThreatType = (UINT32)Connection->ThreatType;
+    netEvent->Flags = TeNetFlags;
+
+    RtlStringCchCopyW(netEvent->RemoteHostname,
+                       RTL_NUMBER_OF(netEvent->RemoteHostname),
+                       Connection->RemoteHostname);
+    RtlStringCchCopyW(netEvent->ProcessPath,
+                       RTL_NUMBER_OF(netEvent->ProcessPath),
+                       Connection->ProcessImagePath);
+
+    TeLogNetworkEvent(EventId, netEvent);
+
+    ExFreePoolWithTag(netEvent, 'tENF');
+}
+
+// ============================================================================
 // WFP CALLOUT FUNCTIONS
 // ============================================================================
 
@@ -2053,6 +2121,28 @@ NfFlowDeleteNotify(
                     NULL
                 );
 
+                if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                    PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                    if (tsEngine != NULL) {
+                        TsAddFactor(tsEngine, (HANDLE)(ULONG_PTR)connection->ProcessId,
+                            TsFactor_Behavioral, "NetworkBeaconing",
+                            75, "Beaconing pattern detected (T1071)");
+                    }
+                }
+
+                TeLogThreatDetection(
+                    connection->ProcessId,
+                    L"Network.Beaconing",
+                    75,
+                    ThreatSeverity_Medium,
+                    0x042F,
+                    L"Beaconing pattern detected (T1071)",
+                    0
+                );
+
+                NfpEmitNetworkTelemetry(TeEvent_NetBeaconing, connection,
+                                        75, TE_NET_FLAG_BEACONING);
+
                 InterlockedIncrement64(&g_NfState.TotalC2Detections);
             }
         }
@@ -2077,6 +2167,68 @@ NfFlowDeleteNotify(
                     FALSE,
                     NULL
                 );
+
+                if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                    PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                    if (tsEngine != NULL) {
+                        TsAddFactor(tsEngine, (HANDLE)(ULONG_PTR)connection->ProcessId,
+                            TsFactor_Behavioral, "DataExfiltration",
+                            65, "Data exfiltration detected (T1041)");
+                    }
+                }
+
+                TeLogThreatDetection(
+                    connection->ProcessId,
+                    L"Network.Exfiltration",
+                    65,
+                    ThreatSeverity_Medium,
+                    0x0411,
+                    L"Data exfiltration pattern detected (T1041)",
+                    0
+                );
+            }
+        }
+
+        //
+        // C2 process-level analysis on connection close (T1071) — aggregate
+        // all connection data for this process to detect C2 patterns.
+        //
+        if (g_C2Detector != NULL) {
+            PC2_DETECTION_RESULT c2ProcResult = NULL;
+            NTSTATUS c2ProcStatus = C2AnalyzeProcess(
+                g_C2Detector,
+                (HANDLE)(ULONG_PTR)connection->ProcessId,
+                &c2ProcResult
+            );
+
+            if (NT_SUCCESS(c2ProcStatus) && c2ProcResult != NULL) {
+                if (c2ProcResult->C2Detected) {
+                    InterlockedOr(
+                        (LONG*)&connection->Flags,
+                        NF_CONN_FLAG_C2_SUSPECT);
+
+                    if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                        if (tsEngine != NULL) {
+                            TsAddFactor(tsEngine, (HANDLE)(ULONG_PTR)connection->ProcessId,
+                                TsFactor_Behavioral, "C2ProcessAnalysis",
+                                (LONG)c2ProcResult->ConfidenceScore,
+                                "Process-level C2 analysis detection (T1071)");
+                        }
+                    }
+
+                    TeLogThreatDetection(
+                        connection->ProcessId,
+                        L"Network.C2ProcessAnalysis",
+                        c2ProcResult->ConfidenceScore,
+                        (c2ProcResult->ConfidenceScore >= 80)
+                            ? ThreatSeverity_High : ThreatSeverity_Medium,
+                        0x042F,
+                        L"Process-level C2 communication detected (T1071)",
+                        (c2ProcResult->ConfidenceScore >= 80) ? 1 : 0
+                    );
+                }
+                C2FreeResult(c2ProcResult);
             }
         }
 
@@ -3603,6 +3755,62 @@ NfpCreateAndInsertConnection(
     //
     if (g_C2Detector != NULL) {
         PVOID remoteAddr = IsV6 ? (PVOID)remoteIp6 : (PVOID)&remoteIp;
+
+        //
+        // C2 IOC check (T1071) — check if the destination is a known C2
+        // indicator of compromise before recording the connection.
+        //
+        {
+            BOOLEAN isKnownC2 = FALSE;
+            NTSTATUS iocStatus = C2CheckIOC(
+                g_C2Detector,
+                remoteAddr,
+                IsV6,
+                NULL,
+                &isKnownC2,
+                NULL
+            );
+
+            if (NT_SUCCESS(iocStatus) && isKnownC2) {
+                InterlockedOr(
+                    (LONG*)&connection->Flags,
+                    NF_CONN_FLAG_C2_SUSPECT | NF_CONN_FLAG_SUSPICIOUS);
+
+                BeEngineSubmitEvent(
+                    BehaviorEvent_C2Communication,
+                    BehaviorCategory_NetworkOperation,
+                    connection->ProcessId,
+                    NULL,
+                    0,
+                    90,
+                    TRUE,
+                    NULL
+                );
+
+                if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                    PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                    if (tsEngine != NULL) {
+                        TsAddFactor(tsEngine, (HANDLE)(ULONG_PTR)connection->ProcessId,
+                            TsFactor_IOC, "KnownC2IOC",
+                            90, "Connection to known C2 IOC detected");
+                    }
+                }
+
+                TeLogThreatDetection(
+                    connection->ProcessId,
+                    L"Network.KnownC2IOC",
+                    90,
+                    ThreatSeverity_High,
+                    0x042F,
+                    L"Connection to known C2 indicator of compromise",
+                    1
+                );
+
+                NfpEmitNetworkTelemetry(TeEvent_NetC2Detected, connection,
+                                        90, TE_NET_FLAG_C2);
+            }
+        }
+
         C2RecordConnection(
             g_C2Detector,
             (HANDLE)(ULONG_PTR)processId,
@@ -3646,6 +3854,27 @@ NfpCreateAndInsertConnection(
                         c2Result->ConfidenceScore,
                         (c2Result->ConfidenceScore >= 80),
                         NULL
+                    );
+
+                    if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                        if (tsEngine != NULL) {
+                            TsAddFactor(tsEngine, (HANDLE)(ULONG_PTR)connection->ProcessId,
+                                TsFactor_Behavioral, "C2Communication",
+                                (LONG)c2Result->ConfidenceScore,
+                                "C2 destination detected (T1071)");
+                        }
+                    }
+
+                    TeLogThreatDetection(
+                        connection->ProcessId,
+                        L"Network.C2Detected",
+                        c2Result->ConfidenceScore,
+                        (c2Result->ConfidenceScore >= 80)
+                            ? ThreatSeverity_High : ThreatSeverity_Medium,
+                        0x042F,
+                        L"C2 communication detected (T1071)",
+                        (c2Result->ConfidenceScore >= 80) ? 1 : 0
                     );
                 }
                 C2FreeResult(c2Result);
@@ -3701,6 +3930,25 @@ NfpCreateAndInsertConnection(
                     NULL
                 );
 
+                if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                    PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                    if (tsEngine != NULL) {
+                        TsAddFactor(tsEngine, (HANDLE)(ULONG_PTR)connection->ProcessId,
+                            TsFactor_Behavioral, "PortScanning",
+                            70, "Port scanning detected (T1046)");
+                    }
+                }
+
+                TeLogThreatDetection(
+                    connection->ProcessId,
+                    L"Network.PortScan",
+                    70,
+                    ThreatSeverity_Medium,
+                    0x0416,
+                    L"Port scanning activity detected (T1046)",
+                    0
+                );
+
                 SsPsFreeResult(psResult);
             }
         }
@@ -3721,6 +3969,28 @@ NfpCreateAndInsertConnection(
             TRUE,
             NULL
         );
+
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+            if (tsEngine != NULL) {
+                TsAddFactor(tsEngine, (HANDLE)(ULONG_PTR)connection->ProcessId,
+                    TsFactor_Behavioral, "BlockedConnection",
+                    80, "Blocked suspicious connection");
+            }
+        }
+
+        TeLogThreatDetection(
+            connection->ProcessId,
+            L"Network.ConnectionBlocked",
+            80,
+            ThreatSeverity_High,
+            0x042F,
+            L"Suspicious connection blocked",
+            1
+        );
+
+        NfpEmitNetworkTelemetry(TeEvent_NetBlocked, connection,
+                                80, TE_NET_FLAG_BLOCKED);
     }
 }
 
@@ -4281,6 +4551,26 @@ NfpProcessStreamData(
                                 NULL, 0,
                                 httpRequest->SuspicionScore,
                                 TRUE, NULL);
+
+                            if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                                PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                                if (tsEngine != NULL) {
+                                    TsAddFactor(tsEngine, (HANDLE)(ULONG_PTR)connection->ProcessId,
+                                        TsFactor_Behavioral, "SuspiciousHTTP",
+                                        (LONG)httpRequest->SuspicionScore,
+                                        "Suspicious HTTP request detected (T1071)");
+                                }
+                            }
+
+                            TeLogThreatDetection(
+                                connection->ProcessId,
+                                L"Network.SuspiciousHTTP",
+                                httpRequest->SuspicionScore,
+                                ThreatSeverity_Medium,
+                                0x042F,
+                                L"Suspicious HTTP request detected (T1071)",
+                                1
+                            );
                         }
                         PpFreeHTTPRequest(httpRequest);
                     }
@@ -4403,6 +4693,25 @@ NfpProcessStreamData(
                                     85,
                                     TRUE,
                                     NULL
+                                );
+
+                                if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                                    PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                                    if (tsEngine != NULL) {
+                                        TsAddFactor(tsEngine, (HANDLE)(ULONG_PTR)connection->ProcessId,
+                                            TsFactor_IOC, "MaliciousJA3",
+                                            85, "Known-bad JA3 fingerprint detected (T1573)");
+                                    }
+                                }
+
+                                TeLogThreatDetection(
+                                    connection->ProcessId,
+                                    L"Network.MaliciousJA3",
+                                    85,
+                                    ThreatSeverity_High,
+                                    0x0625,
+                                    L"Known-bad JA3 fingerprint detected (T1573)",
+                                    1
                                 );
                             }
                         }

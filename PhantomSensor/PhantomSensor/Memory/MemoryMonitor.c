@@ -63,6 +63,10 @@
 #include "SectionTracker.h"
 #include "../Behavioral/BehaviorEngine.h"
 #include "../Callbacks/Process/AmsiBypassDetector.h"
+#include "../ETW/TelemetryEvents.h"
+#include "../Behavioral/ThreatScoring.h"
+#include "MemoryScanner.h"
+#include "../Core/DriverEntry.h"
 
 // ============================================================================
 // KERNEL-MODE COMPATIBILITY
@@ -298,6 +302,32 @@ MmpHeapSprayDetectionCallback(
         FALSE,
         NULL
     );
+
+    //
+    // Emit telemetry for heap spray detection
+    //
+    TeLogMemoryEvent(
+        TeEvent_HeapSpray,
+        HandleToULong(Result->ProcessId),
+        HandleToULong(Result->ProcessId),
+        0,
+        0,
+        0,
+        threatScore,
+        0
+    );
+
+    //
+    // Report to ThreatScoring engine (requires PASSIVE_LEVEL)
+    //
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+        if (tsEngine != NULL) {
+            TsAddFactor(tsEngine, Result->ProcessId, TsFactor_Behavioral,
+                        "HeapSprayDetected", (LONG)threatScore,
+                        "Heap spray pattern confirmed by detector");
+        }
+    }
 }
 
 // ============================================================================
@@ -377,6 +407,30 @@ MmpInjectionDetectionCallback(
         FALSE,
         NULL
     );
+
+    //
+    // Emit injection telemetry
+    //
+    TeLogInjection(
+        HandleToULong(Result->SourceProcessId),
+        HandleToULong(Result->TargetProcessId),
+        (UINT32)Result->Technique,
+        (UINT64)(ULONG_PTR)Result->TargetAddress,
+        (UINT64)Result->Size,
+        threatScore
+    );
+
+    //
+    // Report to ThreatScoring engine (callback runs at PASSIVE_LEVEL)
+    //
+    {
+        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+        if (tsEngine != NULL) {
+            TsAddFactor(tsEngine, Result->TargetProcessId, TsFactor_Behavioral,
+                        "InjectionDetected", (LONG)threatScore,
+                        "Code injection chain confirmed by InjectionDetector");
+        }
+    }
 }
 
 // ============================================================================
@@ -422,6 +476,32 @@ MmpHollowingDetectionCallback(
         FALSE,
         NULL
     );
+
+    //
+    // Emit hollowing telemetry
+    //
+    TeLogMemoryEvent(
+        TeEvent_HollowingDetected,
+        HandleToULong(Result->ProcessId),
+        HandleToULong(Result->ProcessId),
+        0,
+        0,
+        0,
+        threatScore,
+        0
+    );
+
+    //
+    // Report to ThreatScoring engine (callback runs at PASSIVE_LEVEL)
+    //
+    {
+        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+        if (tsEngine != NULL) {
+            TsAddFactor(tsEngine, Result->ProcessId, TsFactor_Behavioral,
+                        "ProcessHollowing", (LONG)threatScore,
+                        "Process hollowing confirmed by HollowingDetector");
+        }
+    }
 }
 
 // ============================================================================
@@ -917,6 +997,20 @@ MmMonitorGetShellcodeDetector(
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+PSEC_TRACKER
+MmMonitorGetSectionTracker(
+    VOID
+    )
+{
+    if (g_MemoryMonitor.InitState != MM_INIT_DONE ||
+        g_MemoryMonitor.SectionTracker == NULL) {
+        return NULL;
+    }
+
+    return (PSEC_TRACKER)g_MemoryMonitor.SectionTracker;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 MmMonitorGetInjectionStats(
@@ -1214,6 +1308,39 @@ MmMonitorHandleAllocation(
     }
 
     //
+    // Trigger pattern-based memory scan for RWX allocations
+    //
+    if (MmpIsRWXProtection(Protection) && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        PMS_SCANNER memScanner = ShadowStrikeGetMemoryScanner();
+        if (memScanner != NULL) {
+            PMS_SCAN_RESULT scanResult = NULL;
+            NTSTATUS scanStatus = MsScanRegion(
+                memScanner,
+                ULongToHandle(ProcessId),
+                (PVOID)(ULONG_PTR)BaseAddress,
+                (SIZE_T)RegionSize,
+                MsScanFlag_None,
+                &scanResult
+            );
+            if (NT_SUCCESS(scanStatus) && scanResult != NULL) {
+                if (scanResult->ThreatCount > 0) {
+                    BeEngineSubmitEvent(
+                        BehaviorEvent_RWXMemory,
+                        BehaviorCategory_MemoryOperation,
+                        ProcessId,
+                        NULL,
+                        0,
+                        scanResult->MaxSeverity * 25,
+                        FALSE,
+                        NULL
+                    );
+                }
+                MsFreeScanResult(memScanner, scanResult);
+            }
+        }
+    }
+
+    //
     // Delegate to HeapSpray detector for allocation pattern analysis.
     // HeapSpray detection feeds on every tracked allocation to build
     // per-process allocation histograms and detect NOP-sled/repeated-pattern sprays.
@@ -1237,6 +1364,30 @@ MmMonitorHandleAllocation(
 
     if (IsSuspicious) {
         MmpUpdateProcessRisk(Context);
+
+        //
+        // Run VAD scan for process-wide anomaly detection
+        //
+        if (g_MemoryMonitor.VadTracker != NULL && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            ULONG vadSuspicionScore = 0;
+            NTSTATUS vadStatus = VadScanProcess(
+                (PVAD_TRACKER)g_MemoryMonitor.VadTracker,
+                ULongToHandle(ProcessId),
+                &vadSuspicionScore
+            );
+            if (NT_SUCCESS(vadStatus) && vadSuspicionScore > 50) {
+                BeEngineSubmitEvent(
+                    BehaviorEvent_SuspiciousAllocation,
+                    BehaviorCategory_MemoryOperation,
+                    ProcessId,
+                    NULL,
+                    0,
+                    (UINT32)vadSuspicionScore,
+                    FALSE,
+                    NULL
+                );
+            }
+        }
     }
 
     MmMonitorReleaseProcessContext(Context);
@@ -1367,6 +1518,40 @@ MmMonitorHandleProtectionChange(
 
     ExfReleasePushLockExclusive(&Context->RegionLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Trigger memory scanner for W→X transitions (classic unpacking/shellcode)
+    //
+    if (RegionFound && RegionWasWritten && MmpIsExecutableProtection(NewProtection) &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        PMS_SCANNER memScanner = ShadowStrikeGetMemoryScanner();
+        if (memScanner != NULL) {
+            PMS_SCAN_RESULT scanResult = NULL;
+            NTSTATUS scanStatus = MsScanRegion(
+                memScanner,
+                ULongToHandle(ProcessId),
+                (PVOID)(ULONG_PTR)BaseAddress,
+                (SIZE_T)RegionSize,
+                MsScanFlag_None,
+                &scanResult
+            );
+            if (NT_SUCCESS(scanStatus) && scanResult != NULL) {
+                if (scanResult->ThreatCount > 0) {
+                    BeEngineSubmitEvent(
+                        BehaviorEvent_ShellcodeDetected,
+                        BehaviorCategory_MemoryOperation,
+                        ProcessId,
+                        NULL,
+                        0,
+                        scanResult->MaxSeverity * 25,
+                        FALSE,
+                        NULL
+                    );
+                }
+                MsFreeScanResult(memScanner, scanResult);
+            }
+        }
+    }
 
     //
     // Feed cross-process protection changes to InjectionDetector for chain
@@ -1758,6 +1943,44 @@ MmMonitorScanForShellcode(
                 //
                 ShellcodeDetected = TRUE;
 
+                //
+                // Deep analysis: detect API hashing and direct syscall patterns
+                //
+                if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                    SD_API_HASH_INFO apiHashInfo = {0};
+                    SD_SYSCALL_INFO syscallInfos[8];
+                    ULONG syscallCount = 0;
+
+                    SdDetectApiHashing(
+                        (PSD_DETECTOR)g_MemoryMonitor.ShellcodeDetector,
+                        Buffer,
+                        ScanSize,
+                        &apiHashInfo
+                    );
+
+                    SdDetectDirectSyscall(
+                        (PSD_DETECTOR)g_MemoryMonitor.ShellcodeDetector,
+                        Buffer,
+                        ScanSize,
+                        syscallInfos,
+                        RTL_NUMBER_OF(syscallInfos),
+                        &syscallCount
+                    );
+
+                    if (syscallCount > 0) {
+                        TeLogMemoryEvent(
+                            TeEvent_DirectSyscall,
+                            ProcessId,
+                            ProcessId,
+                            BaseAddress,
+                            Size,
+                            0,
+                            90,
+                            0
+                        );
+                    }
+                }
+
                 if (Event != NULL) {
                     Event->Size = sizeof(SHELLCODE_DETECTION_EVENT);
                     Event->Version = 1;
@@ -1851,6 +2074,32 @@ MmMonitorScanForShellcode(
                 FALSE,
                 NULL
             );
+
+            //
+            // Emit shellcode telemetry
+            //
+            TeLogMemoryEvent(
+                TeEvent_ShellcodeDetected,
+                ProcessId,
+                ProcessId,
+                BaseAddress,
+                Size,
+                0,
+                80,
+                0
+            );
+
+            //
+            // Report to ThreatScoring engine (requires PASSIVE_LEVEL)
+            //
+            if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                if (tsEngine != NULL) {
+                    TsAddFactor(tsEngine, ULongToHandle(ProcessId), TsFactor_Behavioral,
+                                "ShellcodeDetected", 80,
+                                "Shellcode detected in executable memory region");
+                }
+            }
         }
     }
 
@@ -2138,6 +2387,32 @@ MmMonitorDetectHollowing(
                 FALSE,
                 NULL
             );
+
+            //
+            // Emit hollowing telemetry for secondary heuristic
+            //
+            TeLogMemoryEvent(
+                TeEvent_HollowingDetected,
+                ProcessId,
+                ProcessId,
+                0,
+                0,
+                0,
+                score,
+                0
+            );
+
+            //
+            // Report to ThreatScoring engine (requires PASSIVE_LEVEL)
+            //
+            if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                if (tsEngine != NULL) {
+                    TsAddFactor(tsEngine, ULongToHandle(ProcessId), TsFactor_Behavioral,
+                                "ProcessHollowing", (LONG)score,
+                                "Process hollowing detected via secondary heuristic");
+                }
+            }
         }
     }
 

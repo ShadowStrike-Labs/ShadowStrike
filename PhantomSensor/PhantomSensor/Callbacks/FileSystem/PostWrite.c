@@ -70,6 +70,7 @@
 #include "../../Transactions/KtmMonitor.h"
 #include "../../ETW/ETWConsumer.h"
 #include "../../ETW/ETWProvider.h"
+#include "../../ETW/TelemetryEvents.h"
 #include "../../Core/DriverEntry.h"
 
 //
@@ -1066,6 +1067,17 @@ ShadowStrikePostWrite(
                 alertScore,
                 fileNameAcquired ? &fileName : NULL
             );
+
+            TeLogFileEvent(
+                TeEvent_FileEncrypted,
+                HandleToULong(writeContext.ProcessId),
+                fileNameAcquired ? &fileName : NULL,
+                TeEvent_FileWrite,
+                (UINT64)writeContext.FileSize.QuadPart,
+                1,  // blocked
+                L"Ransomware.Behavioral",
+                (UINT32)alertScore
+                );
         }
     }
 
@@ -1081,6 +1093,17 @@ ShadowStrikePostWrite(
             &writeContext,
             fileNameAcquired ? &fileName : NULL
         );
+
+        TeLogFileEvent(
+            writeContext.IsHighEntropy ? TeEvent_FileEncrypted : TeEvent_FileWrite,
+            HandleToULong(writeContext.ProcessId),
+            fileNameAcquired ? &fileName : NULL,
+            TeEvent_FileWrite,
+            (UINT64)writeContext.FileSize.QuadPart,
+            0,  // allowed (post-op cannot block)
+            writeContext.IsHighEntropy ? L"HighEntropy.Write" : L"Suspicious.Write",
+            (UINT32)writeContext.SuspicionScore
+            );
     }
 
     //
@@ -1091,7 +1114,7 @@ ShadowStrikePostWrite(
     }
 
     if (contextAcquired) {
-        FltReleaseContext((PFLT_CONTEXT)streamContext);
+        PocReleaseStreamContext(streamContext);
     }
 
     return FLT_POSTOP_FINISHED_PROCESSING;

@@ -3231,6 +3231,14 @@ ShadowStrikeGetThreatScoringEngine(VOID)
     return (PVOID)g_ThreatScoring;
 }
 
+_Use_decl_annotations_
+PVOID
+ShadowStrikeGetBehaviorEngine(VOID)
+{
+    return (g_SubsystemFlags & SubsysFlag_BehaviorEngine) ?
+           BeEngineGetInstance() : NULL;
+}
+
 PBP_PROCESSOR
 ShadowStrikeGetBatchProcessor(VOID)
 {

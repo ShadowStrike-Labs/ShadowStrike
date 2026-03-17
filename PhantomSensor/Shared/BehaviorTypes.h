@@ -664,13 +664,25 @@ typedef struct _ATTACK_CHAIN_SUMMARY {
     // Variable: ATTACK_CHAIN_ENTRY entries follow
 } ATTACK_CHAIN_SUMMARY, *PATTACK_CHAIN_SUMMARY;
 
-// Attack chain flags
+// Attack chain flags (guarded — canonical definitions in AttackPatterns.h)
+#ifndef CHAIN_FLAG_ACTIVE
 #define CHAIN_FLAG_ACTIVE                 0x00000001  // Chain is still active
+#endif
+#ifndef CHAIN_FLAG_REMEDIATED
 #define CHAIN_FLAG_REMEDIATED             0x00000002  // Threat was remediated
+#endif
+#ifndef CHAIN_FLAG_FALSE_POSITIVE
 #define CHAIN_FLAG_FALSE_POSITIVE         0x00000004  // Marked as FP
+#endif
+#ifndef CHAIN_FLAG_BLOCKED
 #define CHAIN_FLAG_BLOCKED                0x00000008  // Attack was blocked
+#endif
+#ifndef CHAIN_FLAG_USER_ALLOWED
 #define CHAIN_FLAG_USER_ALLOWED           0x00000010  // User allowed action
+#endif
+#ifndef CHAIN_FLAG_CRITICAL
 #define CHAIN_FLAG_CRITICAL               0x00000020  // Critical severity reached
+#endif
 
 // ============================================================================
 // BEHAVIORAL RESPONSE STRUCTURES
@@ -724,15 +736,31 @@ typedef struct _BEHAVIOR_RULE {
     // Variable: Rule conditions follow
 } BEHAVIOR_RULE, *PBEHAVIOR_RULE;
 
-// Rule flags
+// Rule flags (guarded — canonical definitions in AttackPatterns.h)
+#ifndef RULE_FLAG_ENABLED
 #define RULE_FLAG_ENABLED                 0x00000001
+#endif
+#ifndef RULE_FLAG_BLOCKING
 #define RULE_FLAG_BLOCKING                0x00000002
+#endif
+#ifndef RULE_FLAG_ALERTING
 #define RULE_FLAG_ALERTING                0x00000004
+#endif
+#ifndef RULE_FLAG_REQUIRES_CORRELATION
 #define RULE_FLAG_REQUIRES_CORRELATION    0x00000008
+#endif
+#ifndef RULE_FLAG_KERNEL_ONLY
 #define RULE_FLAG_KERNEL_ONLY             0x00000010
+#endif
+#ifndef RULE_FLAG_USER_MODE_ONLY
 #define RULE_FLAG_USER_MODE_ONLY          0x00000020
+#endif
+#ifndef RULE_FLAG_HIGH_CONFIDENCE
 #define RULE_FLAG_HIGH_CONFIDENCE         0x00000040
+#endif
+#ifndef RULE_FLAG_EXPERIMENTAL
 #define RULE_FLAG_EXPERIMENTAL            0x00000080
+#endif
 
 #pragma pack(pop)
 

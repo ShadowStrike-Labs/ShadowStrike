@@ -504,6 +504,15 @@ PVOID
 ShadowStrikeGetThreatScoringEngine(VOID);
 
 /**
+ * @brief Returns the driver-owned BehaviorEngine instance.
+ *
+ * @return PVOID (PBEHAVIOR_ENGINE_GLOBALS), or NULL if BehaviorEngine is not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PVOID
+ShadowStrikeGetBehaviorEngine(VOID);
+
+/**
  * @brief Get the batch processing engine for telemetry event aggregation.
  * @return PBP_PROCESSOR or NULL if not initialized.
  */

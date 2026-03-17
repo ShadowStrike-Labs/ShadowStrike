@@ -93,6 +93,7 @@
 #include "../../Cache/ScanCache.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Shared/BehaviorTypes.h"
+#include "../../ETW/TelemetryEvents.h"
 #include "../../Performance/LookasideLists.h"
 #include "USBDeviceControl.h"
 #include <ntstrsafe.h>
@@ -1424,6 +1425,46 @@ CompleteOperation:
             score,
             shouldBlock
             );
+
+        {
+            TE_EVENT_ID teEventId;
+            PCWSTR teThreatName;
+            UINT32 teVerdict = shouldBlock ? 1 : 0;
+            UINT32 teOperation;
+
+            if (blockReason & (PSI_BEHAVIOR_MASS_RENAME | PSI_BEHAVIOR_EXTENSION_CHANGE)) {
+                teEventId = TeEvent_FileEncrypted;
+                teThreatName = L"Ransomware.SetInfo";
+            } else if (blockReason & PSI_BEHAVIOR_MASS_DELETE) {
+                teEventId = TeEvent_FileDelete;
+                teThreatName = L"DataDestruction.MassDelete";
+            } else if (blockReason & PSI_BEHAVIOR_CREDENTIAL_ACCESS) {
+                teEventId = TeEvent_FileBlocked;
+                teThreatName = L"CredentialAccess.HardLink";
+            } else {
+                teEventId = TeEvent_FileBlocked;
+                teThreatName = L"Suspicious.SetInfo";
+            }
+
+            if (infoClass == FileRenameInformation || infoClass == FileRenameInformationEx) {
+                teOperation = TeEvent_FileRename;
+            } else if (infoClass == FileDispositionInformation || infoClass == FileDispositionInformationEx) {
+                teOperation = TeEvent_FileDelete;
+            } else {
+                teOperation = TeEvent_FileWrite;
+            }
+
+            TeLogFileEvent(
+                teEventId,
+                HandleToULong(requestorPid),
+                &nameInfo->Name,
+                teOperation,
+                0,
+                teVerdict,
+                teThreatName,
+                score
+                );
+        }
     }
 
 AllowOperation:

@@ -73,6 +73,8 @@ Performance Characteristics:
 #include "../Behavioral/IOCMatcher.h"
 #include "../Exclusions/ExclusionManager.h"
 #include "../Performance/CacheOptimization.h"
+#include "../ETW/TelemetryEvents.h"
+#include "../Behavioral/ThreatScoring.h"
 
 // ============================================================================
 // INTERNAL CONSTANTS
@@ -1310,6 +1312,106 @@ DnsProcessQuery(
     }
 
     //
+    // Advanced DGA detection through the public API for deeper
+    // entropy analysis and per-process DGA domain correlation.
+    //
+    if (Monitor->Config.EnableDGADetection) {
+        BOOLEAN isDGA = FALSE;
+        ULONG dgaFullConfidence = 0;
+        NTSTATUS dgaStatus = DnsDetectDGA(
+            Monitor,
+            query->DomainName,
+            &isDGA,
+            &dgaFullConfidence
+        );
+        if (NT_SUCCESS(dgaStatus) && isDGA && dgaFullConfidence > 50) {
+            query->SuspicionFlags |= DnsSuspicion_DGA;
+            query->SuspicionScore += dgaFullConfidence;
+        }
+    }
+
+    //
+    // Process-level tunneling analysis through the public API.
+    // Complements per-domain DnspCheckTunneling with per-process
+    // behavioral signals: query rate, suspicious ratio, unique domains.
+    //
+    if (Monitor->Config.EnableTunnelingDetection) {
+        BOOLEAN tunnelingDetected = FALSE;
+        ULONG tunnelingScore = 0;
+        NTSTATUS tunStatus = DnsDetectTunneling(
+            Monitor,
+            ProcessId,
+            &tunnelingDetected,
+            &tunnelingScore
+        );
+        if (NT_SUCCESS(tunStatus) && tunnelingDetected) {
+            query->SuspicionFlags |= DnsSuspicion_HighVolume;
+            query->SuspicionScore += tunnelingScore;
+            InterlockedIncrement64(&Monitor->Stats.TunnelDetections);
+        }
+    }
+
+    //
+    // === ThreatScoring Integration ===
+    // Feed DGA/tunneling detections into per-process threat scoring.
+    // ObRegisterCallbacks and WFP both do this; DNS was the missing link.
+    //
+    if ((query->SuspicionFlags & (DnsSuspicion_DGA | DnsSuspicion_TunnelPattern | DnsSuspicion_HighVolume)) != 0) {
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+            if (tsEngine != NULL) {
+                if (query->SuspicionFlags & DnsSuspicion_DGA) {
+                    TsAddFactor(
+                        tsEngine,
+                        ProcessId,
+                        TsFactor_MITRE,
+                        "T1568.002-DGA",
+                        (LONG)(query->SuspicionScore > 100 ? 60 : query->SuspicionScore / 2),
+                        "DGA domain pattern detected in DNS query"
+                        );
+                }
+                if (query->SuspicionFlags & (DnsSuspicion_TunnelPattern | DnsSuspicion_HighVolume)) {
+                    TsAddFactor(
+                        tsEngine,
+                        ProcessId,
+                        TsFactor_MITRE,
+                        "T1572-DNSTunnel",
+                        (LONG)(query->SuspicionScore > 100 ? 70 : query->SuspicionScore / 2),
+                        "DNS tunneling behavior detected (high entropy/volume)"
+                        );
+                }
+            }
+        }
+    }
+
+    //
+    // === DNS Telemetry ===
+    // Log DNS query event to ETW for SIEM integration and forensic analysis.
+    // Includes threat score accumulated from DGA + tunneling detection above.
+    //
+    if (query->SuspicionScore > 0) {
+        WCHAR domainNameW[DNS_MAX_NAME_LENGTH + 1];
+        ANSI_STRING ansiDomain;
+        UNICODE_STRING unicodeDomain;
+
+        RtlInitAnsiString(&ansiDomain, query->DomainName);
+        unicodeDomain.Buffer = domainNameW;
+        unicodeDomain.MaximumLength = sizeof(domainNameW) - sizeof(WCHAR);
+        unicodeDomain.Length = 0;
+
+        if (NT_SUCCESS(RtlAnsiStringToUnicodeString(&unicodeDomain, &ansiDomain, FALSE))) {
+            domainNameW[unicodeDomain.Length / sizeof(WCHAR)] = L'\0';
+            TeLogDnsQuery(
+                HandleToULong(ProcessId),
+                domainNameW,
+                (UINT16)query->RecordType,
+                FALSE,
+                (UINT32)query->SuspicionScore
+            );
+        }
+    }
+
+    //
     // === IOC Domain Matching ===
     // Check the queried domain against the threat-intel IOC database.
     // IomMatch requires PASSIVE_LEVEL — DnsProcessQuery is in PAGED section.
@@ -1413,6 +1515,31 @@ DnsProcessQuery(
             InterlockedIncrement64(&Monitor->Stats.BlockedQueries);
             if (processCtx != NULL) {
                 InterlockedIncrement(&processCtx->BlockedQueries);
+            }
+
+            //
+            // Log blocked DNS query to ETW for SIEM alerting.
+            //
+            {
+                WCHAR blockedDomainW[DNS_MAX_NAME_LENGTH + 1];
+                ANSI_STRING ansiBlocked;
+                UNICODE_STRING unicodeBlocked;
+
+                RtlInitAnsiString(&ansiBlocked, query->DomainName);
+                unicodeBlocked.Buffer = blockedDomainW;
+                unicodeBlocked.MaximumLength = sizeof(blockedDomainW) - sizeof(WCHAR);
+                unicodeBlocked.Length = 0;
+
+                if (NT_SUCCESS(RtlAnsiStringToUnicodeString(&unicodeBlocked, &ansiBlocked, FALSE))) {
+                    blockedDomainW[unicodeBlocked.Length / sizeof(WCHAR)] = L'\0';
+                    TeLogDnsQuery(
+                        HandleToULong(ProcessId),
+                        blockedDomainW,
+                        (UINT16)query->RecordType,
+                        TRUE,
+                        (UINT32)query->SuspicionScore
+                    );
+                }
             }
         }
     }

@@ -48,6 +48,8 @@
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../ETW/ETWConsumer.h"
 #include "../../ETW/ETWProvider.h"
+#include "../../ETW/TelemetryEvents.h"
+#include "../../Behavioral/ThreatScoring.h"
 #include "../../Core/DriverEntry.h"
 #include "../../Performance/LookasideLists.h"
 #include "../../Performance/PerformanceMonitor.h"
@@ -1543,6 +1545,29 @@ ShadowStrikeAnalyzeRegistryPersistence(
             FALSE,
             NULL
             );
+
+        //
+        // Threat scoring: flag suspicious registry persistence
+        //
+        {
+            PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+            if (tsEngine != NULL) {
+                TsAddFactor(tsEngine, PsGetCurrentProcessId(),
+                    TsFactor_Behavioral, "RegistryPersistence",
+                    70, "Suspicious registry key modification for persistence");
+            }
+        }
+
+        TeLogRegistryEvent(
+            TeEvent_RegPersistence,
+            HandleToULong(PsGetCurrentProcessId()),
+            RegistryPath,
+            ValueName,
+            DataType,
+            Data,
+            DataSize,
+            beScore
+            );
     }
 
     //
@@ -1996,6 +2021,29 @@ SkipCreatePathBuild:
                         NULL
                     );
 
+                    //
+                    // Threat scoring: multi-technique persistence pattern
+                    //
+                    {
+                        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                        if (tsEngine != NULL) {
+                            TsAddFactor(tsEngine, processId,
+                                TsFactor_Behavioral, "MultiPersistence",
+                                85, "Multi-technique persistence pattern detected (T1547)");
+                        }
+                    }
+
+                    TeLogRegistryEvent(
+                        TeEvent_RegPersistence,
+                        HandleToULong(processId),
+                        &keyPath,
+                        NULL,
+                        REG_NONE,
+                        NULL,
+                        0,
+                        combinedScore
+                        );
+
                     RegpSendBehavioralAlert(
                         processId, combinedScore,
                         REG_PATTERN_MULTI_PERSISTENCE,
@@ -2032,6 +2080,29 @@ SkipCreatePathBuild:
                         NULL
                     );
 
+                    //
+                    // Threat scoring: defense evasion via registry
+                    //
+                    {
+                        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                        if (tsEngine != NULL) {
+                            TsAddFactor(tsEngine, processId,
+                                TsFactor_Behavioral, "DefenseEvasion",
+                                80, "Windows Defender disabled via registry (T1562)");
+                        }
+                    }
+
+                    TeLogRegistryEvent(
+                        TeEvent_RegSuspicious,
+                        HandleToULong(processId),
+                        &keyPath,
+                        NULL,
+                        REG_NONE,
+                        NULL,
+                        0,
+                        75
+                        );
+
                     RegpSendBehavioralAlert(
                         processId, 75,
                         REG_PATTERN_DEFEVASION_PERSIST,
@@ -2065,6 +2136,29 @@ SkipCreatePathBuild:
                         FALSE,
                         NULL
                     );
+
+                    //
+                    // Threat scoring: ransomware preparation pattern
+                    //
+                    {
+                        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                        if (tsEngine != NULL) {
+                            TsAddFactor(tsEngine, processId,
+                                TsFactor_Behavioral, "RansomwarePrep",
+                                95, "Ransomware preparation pattern: VSS + persistence (T1490)");
+                        }
+                    }
+
+                    TeLogRegistryEvent(
+                        TeEvent_RegSuspicious,
+                        HandleToULong(processId),
+                        &keyPath,
+                        NULL,
+                        REG_NONE,
+                        NULL,
+                        0,
+                        90
+                        );
 
                     RegpSendBehavioralAlert(
                         processId, 90,

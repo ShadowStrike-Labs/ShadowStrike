@@ -94,6 +94,7 @@
 #include "../Utilities/StringUtils.h"
 #include "../Callbacks/FileSystem/FileBackupEngine.h"
 #include "../ETW/ETWProvider.h"
+#include "../ETW/TelemetryEvents.h"
 #include <ntstrsafe.h>
 
 //
@@ -3062,6 +3063,39 @@ BepProcessSingleEvent(
     //
     if (threatScore >= g_BeState.HighThreatThreshold) {
         InterlockedIncrement64(&g_BeState.TotalThreatsDetected);
+
+        //
+        // Emit behavioral alert telemetry for SIEM consumers.
+        // Only fires for high-threat detections to avoid telemetry flood.
+        //
+        TeLogBehaviorAlert(
+            Event->ProcessId,
+            Event->EventType,
+            Event->Category,
+            threatScore,
+            0,
+            NULL
+        );
+
+        //
+        // Propagate behavioral engine's correlated verdict to composite
+        // ThreatScoring. Individual callbacks feed technique-level signals;
+        // this feeds the engine's AGGREGATE assessment after pattern matching,
+        // anomaly detection, and attack chain correlation.
+        //
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+            if (tsEngine != NULL) {
+                TsAddFactor(
+                    tsEngine,
+                    (HANDLE)(ULONG_PTR)Event->ProcessId,
+                    TsFactor_Behavioral,
+                    "BehavioralEngineVerdict",
+                    (LONG)(threatScore / 10),
+                    "Behavioral engine correlated high-threat detection"
+                    );
+            }
+        }
     }
 
     //
@@ -4592,4 +4626,12 @@ BeGetPatternMatcher(
     )
 {
     return g_PatternMatcher;
+}
+
+PVOID
+BeEngineGetInstance(
+    VOID
+    )
+{
+    return g_BeState.Initialized ? (PVOID)&g_BeState : NULL;
 }

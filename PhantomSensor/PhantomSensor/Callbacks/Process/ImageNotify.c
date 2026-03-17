@@ -60,6 +60,8 @@
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../ETW/ETWConsumer.h"
 #include "../../ETW/ETWProvider.h"
+#include "../../ETW/TelemetryEvents.h"
+#include "../../Behavioral/ThreatScoring.h"
 #include "../../Core/DriverEntry.h"
 #include "../../Performance/CacheOptimization.h"
 #include "../../Performance/PerformanceMonitor.h"
@@ -2235,6 +2237,25 @@ Arguments:
                 FALSE,
                 NULL
             );
+
+            {
+                PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                if (tsEngine != NULL) {
+                    TsAddFactor(tsEngine, ProcessId,
+                        TsFactor_Behavioral, "AppControlBlock",
+                        75, "App control blocked suspicious DLL load");
+                }
+            }
+
+            TeLogThreatDetection(
+                HandleToULong(ProcessId),
+                L"AppControl.DLLBlocked",
+                (acVerdict == AcVerdict_Block) ? 75 : 30,
+                ThreatSeverity_Medium,
+                0x04C2,
+                L"App control blocked suspicious DLL load",
+                (acVerdict == AcVerdict_Block) ? 1 : 0
+            );
         }
     }
 
@@ -2295,6 +2316,25 @@ Arguments:
                             (phResult->ConfidenceScore >= 80),
                             NULL
                         );
+
+                        {
+                            PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                            if (tsEngine != NULL) {
+                                TsAddFactor(tsEngine, ProcessId,
+                                    TsFactor_Behavioral, "ProcessHollowing",
+                                    95, "Process hollowing detected at creation (T1055.012)");
+                            }
+                        }
+
+                        TeLogThreatDetection(
+                            HandleToULong(ProcessId),
+                            L"Memory.ProcessHollowing",
+                            phResult->ConfidenceScore,
+                            ThreatSeverity_High,
+                            0x041F,
+                            L"Process hollowing detected at creation (T1055.012)",
+                            (phResult->ConfidenceScore >= 80) ? 1 : 0
+                        );
                     }
                     PhFreeResult(phResult);
                 }
@@ -2326,6 +2366,132 @@ Arguments:
                         FALSE,
                         NULL
                     );
+
+                    {
+                        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                        if (tsEngine != NULL) {
+                            TsAddFactor(tsEngine, ProcessId,
+                                TsFactor_Behavioral, "HollowingHeuristic",
+                                80, "Secondary hollowing heuristic detected memory modification");
+                        }
+                    }
+
+                    TeLogThreatDetection(
+                        HandleToULong(ProcessId),
+                        L"Memory.HollowingHeuristic",
+                        60,
+                        ThreatSeverity_Medium,
+                        0x041F,
+                        L"Secondary hollowing heuristic detected memory modification",
+                        0
+                    );
+                }
+            }
+        }
+
+        //
+        // Advanced evasion detection: Doppelgänging (T1055.013) and Ghosting
+        //
+        if (phDetector != NULL) {
+                BOOLEAN isDoppelganging = FALSE;
+                BOOLEAN isGhosting = FALSE;
+
+                PhCheckForDoppelganging(phDetector, ProcessId, &isDoppelganging);
+                if (isDoppelganging) {
+                    BeEngineSubmitEvent(
+                        BehaviorEvent_ProcessHollowing,
+                        BehaviorCategory_DefenseEvasion,
+                        HandleToULong(ProcessId),
+                        NULL, 0, 95, FALSE, NULL);
+
+                    TeLogThreatDetection(
+                        HandleToULong(ProcessId),
+                        L"Evasion.Doppelganging",
+                        95, ThreatSeverity_High,
+                        0x041F, L"Process Doppelganging detected (T1055.013)", 0);
+                }
+
+                PhCheckForGhosting(phDetector, ProcessId, &isGhosting);
+                if (isGhosting) {
+                    BeEngineSubmitEvent(
+                        BehaviorEvent_ProcessHollowing,
+                        BehaviorCategory_DefenseEvasion,
+                        HandleToULong(ProcessId),
+                        NULL, 0, 90, FALSE, NULL);
+
+                    TeLogThreatDetection(
+                        HandleToULong(ProcessId),
+                        L"Evasion.ProcessGhosting",
+                        90, ThreatSeverity_High,
+                        0x041F, L"Process Ghosting detected", 0);
+                }
+
+                //
+                // Entry point validation — detect tampered entry points
+                //
+                {
+                    BOOLEAN entryPointValid = TRUE;
+                    PhValidateEntryPoint(phDetector, ProcessId, &entryPointValid);
+                    if (!entryPointValid) {
+                        BeEngineSubmitEvent(
+                            BehaviorEvent_ProcessHollowing,
+                            BehaviorCategory_DefenseEvasion,
+                            HandleToULong(ProcessId),
+                            NULL, 0, 70, FALSE, NULL);
+                    }
+                }
+            }
+
+        //
+        // Section tracking — record image load as section creation for
+        // cross-process mapping analysis.
+        //
+        {
+            PSEC_TRACKER secTracker = MmMonitorGetSectionTracker();
+            if (secTracker != NULL) {
+                PFILE_OBJECT fileObject = NULL;
+                LARGE_INTEGER imageSize;
+
+                imageSize.QuadPart = (LONGLONG)ImageInfo->ImageSize;
+
+                if (ImageInfo->ExtendedInfoPresent) {
+                    PIMAGE_INFO_EX imageInfoEx = CONTAINING_RECORD(
+                        ImageInfo, IMAGE_INFO_EX, ImageInfo);
+                    fileObject = imageInfoEx->FileObject;
+                }
+
+                SecTrackSectionCreate(
+                    secTracker,
+                    ImageInfo->ImageBase,
+                    ProcessId,
+                    SecFlag_Image,
+                    fileObject,
+                    &imageSize,
+                    NULL);
+
+                //
+                // Analyze the section for suspicious characteristics (transacted file,
+                // deleted backing file, unusual section attributes). This complements
+                // SecTrackSectionCreate which only records — SecAnalyzeSection evaluates.
+                //
+                {
+                    SEC_SUSPICION suspicionFlags = 0;
+                    ULONG suspicionScore = 0;
+
+                    if (NT_SUCCESS(SecAnalyzeSection(secTracker, ImageInfo->ImageBase, &suspicionFlags, &suspicionScore)) &&
+                        suspicionScore > 0) {
+
+                        BeEngineSubmitEvent(
+                            BehaviorEvent_ProcessDoppelganging,
+                            BehaviorCategory_DefenseEvasion,
+                            HandleToULong(ProcessId),
+                            NULL,
+                            0,
+                            suspicionScore,
+                            FALSE,
+                            NULL
+                        );
+                    }
                 }
             }
         }
@@ -2358,6 +2524,26 @@ Arguments:
             FALSE,
             NULL
             );
+
+        {
+            PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+            if (tsEngine != NULL) {
+                TsAddFactor(tsEngine, ProcessId,
+                    TsFactor_Behavioral, "SuspiciousImage",
+                    (LONG)event->ThreatScore, "Suspicious image load detected");
+            }
+        }
+
+        TeLogThreatDetection(
+            HandleToULong(ProcessId),
+            L"Image.SuspiciousLoad",
+            (UINT32)event->ThreatScore,
+            ThreatSeverity_Medium,
+            (beType == BehaviorEvent_ReflectiveDLLLoad) ? 0x041F :
+            (beType == BehaviorEvent_ModuleStomping)    ? 0x042C : 0x047E,
+            L"Suspicious image load detected",
+            0
+        );
     }
 
     //
