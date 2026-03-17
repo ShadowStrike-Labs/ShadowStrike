@@ -69,8 +69,8 @@ typedef struct _EC_BOOT_DRIVER_INTERNAL {
 typedef struct _EC_ELAM_CALLBACKS_INTERNAL {
     EC_ELAM_CALLBACKS Public;
 
-    // Current boot phase
-    EC_BOOT_PHASE CurrentPhase;
+    // Current boot phase (accessed via InterlockedExchange/CompareExchange)
+    volatile LONG CurrentPhase;
 
     // Lookaside for driver allocations
     NPAGED_LOOKASIDE_LIST DriverLookaside;
@@ -79,8 +79,8 @@ typedef struct _EC_ELAM_CALLBACKS_INTERNAL {
     // Phase completion events
     KEVENT PhaseCompleteEvent;
 
-    // Boot complete flag
-    BOOLEAN BootComplete;
+    // Boot complete flag (accessed via InterlockedExchange/CompareExchange)
+    volatile LONG BootComplete;
 
 } EC_ELAM_CALLBACKS_INTERNAL, *PEC_ELAM_CALLBACKS_INTERNAL;
 
@@ -334,10 +334,13 @@ ElcbInitialize(
     internal->Public.BlockUnknown = FALSE;
     internal->Public.AllowUnsigned = FALSE;
 
+    // Initialize rundown protection for shutdown safety
+    ExInitializeRundownProtection(&internal->Public.RundownRef);
+
     // Record start time
     KeQuerySystemTimePrecise(&internal->Public.Stats.StartTime);
 
-    internal->Public.Initialized = TRUE;
+    InterlockedExchange(&internal->Public.Initialized, TRUE);
     *Callbacks = &internal->Public;
 
     return STATUS_SUCCESS;
@@ -345,6 +348,9 @@ ElcbInitialize(
 
 /**
  * @brief Shutdown the ELAM callbacks subsystem
+ *
+ * Uses CAS on Initialized to prevent double-shutdown, then waits for
+ * all in-flight API calls to drain via EX_RUNDOWN_REF before freeing.
  */
 _Use_decl_annotations_
 VOID
@@ -360,14 +366,21 @@ ElcbShutdown(
         return;
     }
 
+    // CAS guard: only one thread proceeds past this point
+    if (InterlockedCompareExchange(&Callbacks->Initialized, 0, 1) != 1) {
+        return;
+    }
+
     internal = CONTAINING_RECORD(Callbacks, EC_ELAM_CALLBACKS_INTERNAL, Public);
 
     // Unregister callbacks first
     ElcbUnregisterCallbacks(Callbacks);
 
-    Callbacks->Initialized = FALSE;
+    // Wait for all in-flight public API calls to complete.
+    // After this returns, no new ExAcquireRundownProtection can succeed.
+    ExWaitForRundownProtectionRelease(&Callbacks->RundownRef);
 
-    // Free all driver entries
+    // All in-flight calls have drained — safe to tear down
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Callbacks->DriverLock);
     while (!IsListEmpty(&Callbacks->DriverList)) {
@@ -403,15 +416,13 @@ ElcbRegisterCallbacks(
     PEC_ELAM_CALLBACKS Callbacks
     )
 {
-    if (Callbacks == NULL || !Callbacks->Initialized) {
+    if (Callbacks == NULL || !InterlockedCompareExchange(&Callbacks->Initialized, 1, 1)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Callbacks->Registered) {
+    if (InterlockedCompareExchange(&Callbacks->Registered, 1, 0) != 0) {
         return STATUS_ALREADY_REGISTERED;
     }
-
-    Callbacks->Registered = TRUE;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
         "[ShadowStrike/EC] Boot driver tracking callbacks registered\n");
@@ -435,12 +446,11 @@ ElcbUnregisterCallbacks(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!Callbacks->Registered) {
+    if (InterlockedCompareExchange(&Callbacks->Registered, 0, 1) != 1) {
         return STATUS_SUCCESS;
     }
 
     Callbacks->CallbackRegistration = NULL;
-    Callbacks->Registered = FALSE;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
         "[ShadowStrike/EC] Boot driver tracking callbacks unregistered\n");
@@ -459,11 +469,14 @@ ElcbSetUserCallback(
     PVOID Context
     )
 {
-    if (Callbacks == NULL || !Callbacks->Initialized) {
+    if (Callbacks == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    // Thread-safe update of callback
+    if (!ExAcquireRundownProtection(&Callbacks->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Callbacks->DriverLock);
     Callbacks->UserCallback = Callback;
@@ -471,6 +484,7 @@ ElcbSetUserCallback(
     ExReleasePushLockExclusive(&Callbacks->DriverLock);
     KeLeaveCriticalRegion();
 
+    ExReleaseRundownProtection(&Callbacks->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -485,8 +499,12 @@ ElcbSetPolicy(
     BOOLEAN AllowUnsigned
     )
 {
-    if (Callbacks == NULL || !Callbacks->Initialized) {
+    if (Callbacks == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Callbacks->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
     KeEnterCriticalRegion();
@@ -496,11 +514,21 @@ ElcbSetPolicy(
     ExReleasePushLockExclusive(&Callbacks->DriverLock);
     KeLeaveCriticalRegion();
 
+    ExReleaseRundownProtection(&Callbacks->RundownRef);
     return STATUS_SUCCESS;
 }
 
 /**
  * @brief Get list of processed boot drivers
+ *
+ * Returns pointers to internal EC_BOOT_DRIVER structures. These pointers
+ * are valid only while the caller holds rundown protection (which this
+ * function acquires and releases). Callers must copy data they need
+ * before calling any function that could trigger shutdown.
+ *
+ * NOTE: Rundown protection ensures the structure cannot be freed while
+ * this function is executing, making the returned pointers safe for the
+ * duration of the call. Caller must not cache them across calls.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -515,12 +543,15 @@ ElcbGetBootDrivers(
     PEC_BOOT_DRIVER_INTERNAL driver;
     ULONG index = 0;
 
-    if (Callbacks == NULL || !Callbacks->Initialized ||
-        Drivers == NULL || Count == NULL) {
+    if (Callbacks == NULL || Drivers == NULL || Count == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Count = 0;
+
+    if (!ExAcquireRundownProtection(&Callbacks->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
 
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Callbacks->DriverLock);
@@ -539,6 +570,7 @@ ElcbGetBootDrivers(
 
     *Count = index;
 
+    ExReleaseRundownProtection(&Callbacks->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -552,6 +584,12 @@ ElcbGetBootDrivers(
  * Called by ELAMDriver's image load callback to track boot drivers.
  * Thread-safe: user callback is invoked outside the push lock to
  * prevent deadlock if the callback calls ElcbGetBootDrivers etc.
+ *
+ * Deep-copies the public snapshot (including string data) to stack
+ * buffers before releasing the lock, so the user callback never
+ * dereferences internal allocations. After re-acquiring the lock
+ * for the user-callback-block path, re-looks up the driver entry
+ * to guard against concurrent ElcbShutdown.
  */
 NTSTATUS
 ElcbProcessBootDriver(
@@ -571,10 +609,18 @@ ElcbProcessBootDriver(
     BOOLEAN allow = TRUE;
     EC_DRIVER_CALLBACK savedCallback = NULL;
     PVOID savedContext = NULL;
-    EC_BOOT_DRIVER publicCopy;
 
-    if (Callbacks == NULL || !Callbacks->Initialized || DriverPath == NULL) {
+    // Deep-copy snapshot for user callback — stack buffers for string data
+    EC_BOOT_DRIVER publicCopy;
+    WCHAR copyDriverPathBuf[EC_MAX_PATH_LENGTH];
+    WCHAR copyRegistryPathBuf[EC_MAX_PATH_LENGTH];
+
+    if (Callbacks == NULL || DriverPath == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Callbacks->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
     internal = CONTAINING_RECORD(Callbacks, EC_ELAM_CALLBACKS_INTERNAL, Public);
@@ -588,6 +634,7 @@ ElcbProcessBootDriver(
         if (Callbacks->DriverCount >= EC_MAX_BOOT_DRIVERS) {
             ExReleasePushLockExclusive(&Callbacks->DriverLock);
             KeLeaveCriticalRegion();
+            ExReleaseRundownProtection(&Callbacks->RundownRef);
             return STATUS_QUOTA_EXCEEDED;
         }
 
@@ -595,6 +642,7 @@ ElcbProcessBootDriver(
         if (driver == NULL) {
             ExReleasePushLockExclusive(&Callbacks->DriverLock);
             KeLeaveCriticalRegion();
+            ExReleaseRundownProtection(&Callbacks->RundownRef);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -640,22 +688,54 @@ ElcbProcessBootDriver(
     }
 
     //
-    // Capture user callback and a snapshot of the driver's public state
-    // BEFORE releasing the lock. This prevents deadlock: the user callback
-    // may call ElcbGetBootDrivers (which takes shared lock), and push locks
-    // are NOT re-entrant.
+    // Capture user callback and DEEP-COPY the driver's public state
+    // including string data to stack buffers. This prevents UAF: after
+    // lock release, the internal driver entry could be freed by shutdown,
+    // so the callback must never dereference internal pointers.
     //
     savedCallback = Callbacks->UserCallback;
     savedContext = Callbacks->UserContext;
     if (savedCallback != NULL) {
         RtlCopyMemory(&publicCopy, &driver->Public, sizeof(EC_BOOT_DRIVER));
+
+        // Deep-copy DriverPath string data to stack buffer
+        if (driver->Public.DriverPath.Buffer != NULL && driver->Public.DriverPath.Length > 0) {
+            ULONG copyLen = min(driver->Public.DriverPath.Length,
+                               (ULONG)(sizeof(copyDriverPathBuf) - sizeof(WCHAR)));
+            RtlCopyMemory(copyDriverPathBuf, driver->Public.DriverPath.Buffer, copyLen);
+            copyDriverPathBuf[copyLen / sizeof(WCHAR)] = L'\0';
+            publicCopy.DriverPath.Buffer = copyDriverPathBuf;
+            publicCopy.DriverPath.Length = (USHORT)copyLen;
+            publicCopy.DriverPath.MaximumLength = (USHORT)sizeof(copyDriverPathBuf);
+        } else {
+            copyDriverPathBuf[0] = L'\0';
+            publicCopy.DriverPath.Buffer = copyDriverPathBuf;
+            publicCopy.DriverPath.Length = 0;
+            publicCopy.DriverPath.MaximumLength = (USHORT)sizeof(copyDriverPathBuf);
+        }
+
+        // Deep-copy RegistryPath string data to stack buffer
+        if (driver->Public.RegistryPath.Buffer != NULL && driver->Public.RegistryPath.Length > 0) {
+            ULONG copyLen = min(driver->Public.RegistryPath.Length,
+                               (ULONG)(sizeof(copyRegistryPathBuf) - sizeof(WCHAR)));
+            RtlCopyMemory(copyRegistryPathBuf, driver->Public.RegistryPath.Buffer, copyLen);
+            copyRegistryPathBuf[copyLen / sizeof(WCHAR)] = L'\0';
+            publicCopy.RegistryPath.Buffer = copyRegistryPathBuf;
+            publicCopy.RegistryPath.Length = (USHORT)copyLen;
+            publicCopy.RegistryPath.MaximumLength = (USHORT)sizeof(copyRegistryPathBuf);
+        } else {
+            copyRegistryPathBuf[0] = L'\0';
+            publicCopy.RegistryPath.Buffer = copyRegistryPathBuf;
+            publicCopy.RegistryPath.Length = 0;
+            publicCopy.RegistryPath.MaximumLength = (USHORT)sizeof(copyRegistryPathBuf);
+        }
     }
 
     ExReleasePushLockExclusive(&Callbacks->DriverLock);
     KeLeaveCriticalRegion();
 
     //
-    // Invoke user callback outside the lock
+    // Invoke user callback outside the lock — publicCopy is fully self-contained
     //
     if (savedCallback != NULL) {
         BOOLEAN userAllow = allow;
@@ -671,12 +751,21 @@ ElcbProcessBootDriver(
         if (!userAllow && allow) {
             allow = FALSE;
 
+            //
+            // Re-acquire lock and RE-LOOKUP the driver. Between lock release
+            // above and re-acquire here, ElcbShutdown could have freed the entry.
+            //
             KeEnterCriticalRegion();
             ExAcquirePushLockExclusive(&Callbacks->DriverLock);
-            driver->Public.IsAllowed = FALSE;
-            RtlStringCbCopyA(driver->Public.BlockReason,
-                           sizeof(driver->Public.BlockReason),
-                           "Blocked by user callback");
+
+            driver = ElcbpFindDriverByPath(Callbacks, DriverPath);
+            if (driver != NULL) {
+                driver->Public.IsAllowed = FALSE;
+                RtlStringCbCopyA(driver->Public.BlockReason,
+                               sizeof(driver->Public.BlockReason),
+                               "Blocked by user callback");
+            }
+
             ExReleasePushLockExclusive(&Callbacks->DriverLock);
             KeLeaveCriticalRegion();
 
@@ -689,6 +778,7 @@ ElcbProcessBootDriver(
         *AllowDriver = allow;
     }
 
+    ExReleaseRundownProtection(&Callbacks->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -703,19 +793,24 @@ ElcbSetBootPhase(
 {
     PEC_ELAM_CALLBACKS_INTERNAL internal;
 
-    if (Callbacks == NULL || !Callbacks->Initialized) {
+    if (Callbacks == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Callbacks->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
     internal = CONTAINING_RECORD(Callbacks, EC_ELAM_CALLBACKS_INTERNAL, Public);
 
-    internal->CurrentPhase = Phase;
+    InterlockedExchange((volatile LONG*)&internal->CurrentPhase, (LONG)Phase);
 
     if (Phase == EcPhase_Complete) {
-        internal->BootComplete = TRUE;
+        InterlockedExchange((volatile LONG*)&internal->BootComplete, TRUE);
         KeSetEvent(&internal->PhaseCompleteEvent, IO_NO_INCREMENT, FALSE);
     }
 
+    ExReleaseRundownProtection(&Callbacks->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -728,14 +823,22 @@ ElcbGetBootPhase(
     )
 {
     PEC_ELAM_CALLBACKS_INTERNAL internal;
+    EC_BOOT_PHASE phase;
 
-    if (Callbacks == NULL || !Callbacks->Initialized) {
-        return EcPhase_Complete;  // Assume boot complete if invalid
+    if (Callbacks == NULL) {
+        return EcPhase_Complete;
+    }
+
+    if (!ExAcquireRundownProtection(&Callbacks->RundownRef)) {
+        return EcPhase_Complete;
     }
 
     internal = CONTAINING_RECORD(Callbacks, EC_ELAM_CALLBACKS_INTERNAL, Public);
+    phase = (EC_BOOT_PHASE)InterlockedCompareExchange(
+        (volatile LONG*)&internal->CurrentPhase, 0, 0);
 
-    return internal->CurrentPhase;
+    ExReleaseRundownProtection(&Callbacks->RundownRef);
+    return phase;
 }
 
 /**
@@ -747,14 +850,22 @@ ElcbIsBootComplete(
     )
 {
     PEC_ELAM_CALLBACKS_INTERNAL internal;
+    BOOLEAN complete;
 
-    if (Callbacks == NULL || !Callbacks->Initialized) {
+    if (Callbacks == NULL) {
+        return TRUE;
+    }
+
+    if (!ExAcquireRundownProtection(&Callbacks->RundownRef)) {
         return TRUE;
     }
 
     internal = CONTAINING_RECORD(Callbacks, EC_ELAM_CALLBACKS_INTERNAL, Public);
+    complete = (BOOLEAN)InterlockedCompareExchange(
+        (volatile LONG*)&internal->BootComplete, 0, 0);
 
-    return internal->BootComplete;
+    ExReleaseRundownProtection(&Callbacks->RundownRef);
+    return complete;
 }
 
 /**
@@ -768,15 +879,20 @@ ElcbGetStatistics(
     _Out_ PLONG64 DriversBlocked
     )
 {
-    if (Callbacks == NULL || !Callbacks->Initialized ||
+    if (Callbacks == NULL ||
         DriversProcessed == NULL || DriversAllowed == NULL ||
         DriversBlocked == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Callbacks->RundownRef)) {
+        return STATUS_DELETE_PENDING;
     }
 
     *DriversProcessed = Callbacks->Stats.DriversProcessed;
     *DriversAllowed = Callbacks->Stats.DriversAllowed;
     *DriversBlocked = Callbacks->Stats.DriversBlocked;
 
+    ExReleaseRundownProtection(&Callbacks->RundownRef);
     return STATUS_SUCCESS;
 }

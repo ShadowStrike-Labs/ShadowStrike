@@ -33,6 +33,7 @@
 --*/
 
 #include "ELAMDriver.h"
+#include "ELAMCallbacks.h"
 #include "BootDriverVerify.h"
 #include "BootThreatDetector.h"
 #pragma warning(push)
@@ -65,6 +66,7 @@ static const WCHAR* g_ProtectedRegistryPaths[] = {
 static ELAM_DRIVER_GLOBALS g_ElamGlobals = {0};
 static PBDV_VERIFIER g_BootVerifier = NULL;
 static PBTD_DETECTOR g_ThreatDetector = NULL;
+static PEC_ELAM_CALLBACKS g_ElamCallbacks = NULL;
 static LARGE_INTEGER g_RegistryCookie = {0};
 static BOOLEAN g_ImageNotifyRegistered = FALSE;
 static EX_PUSH_LOCK g_StateLock;
@@ -182,6 +184,20 @@ ElamDriverInitialize(
     // If present, merges into BTD's runtime BYOVD database.
     ElamTryLoadVulnerableDriverList();
 
+    // Initialize boot driver callbacks subsystem (tracking, policy, user notifications)
+    status = ElcbInitialize(&g_ElamCallbacks);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/ELAM] ElcbInitialize failed: 0x%08X (non-fatal)\n", status);
+        // Non-fatal: core classification still works without tracking
+        g_ElamCallbacks = NULL;
+    } else {
+        // Register callbacks and set initial policy
+        ElcbRegisterCallbacks(g_ElamCallbacks);
+        ElcbSetPolicy(g_ElamCallbacks, FALSE, FALSE);
+        ElcbSetBootPhase(g_ElamCallbacks, EcPhase_Early);
+    }
+
     // Set default boot policy
     g_ElamGlobals.BootPolicy = ElamPolicyGoodUnknown;
 
@@ -202,6 +218,17 @@ ElamDriverShutdown(VOID)
 {
     // Unregister callbacks first
     ElamUnregisterCallback();
+
+    // Signal boot complete phase before shutdown
+    if (g_ElamCallbacks != NULL) {
+        ElcbSetBootPhase(g_ElamCallbacks, EcPhase_Complete);
+    }
+
+    // Shutdown boot driver callbacks subsystem
+    if (g_ElamCallbacks != NULL) {
+        ElcbShutdown(g_ElamCallbacks);
+        g_ElamCallbacks = NULL;
+    }
 
     // Shutdown threat detector
     if (g_ThreatDetector != NULL) {
@@ -429,6 +456,39 @@ ElamImageLoadCallback(
                 }
             }
             break;
+    }
+
+    //
+    // Feed classification results into the ELAMCallbacks tracking subsystem.
+    // Maps ELAM classification → BDCB classification constants for the
+    // callback layer's policy engine and user notification pipeline.
+    //
+    if (g_ElamCallbacks != NULL) {
+        ULONG bdcbClass;
+        BOOLEAN callbackAllow = TRUE;
+
+        switch (classification) {
+            case ElamClassificationKnownGood: bdcbClass = EC_BDCB_KNOWN_GOOD_IMAGE; break;
+            case ElamClassificationKnownBad:  bdcbClass = EC_BDCB_KNOWN_BAD_IMAGE;  break;
+            default:                          bdcbClass = EC_BDCB_UNKNOWN_IMAGE;     break;
+        }
+
+        ElcbProcessBootDriver(
+            g_ElamCallbacks,
+            FullImageName,
+            NULL,               // RegistryPath not available in image load callback
+            ImageInfo->ImageBase,
+            ImageInfo->ImageSize,
+            bdcbClass,
+            driverInfo->IsSigned,
+            EcPhase_BeforeDriverInit,
+            &callbackAllow
+            );
+
+        // If the callback subsystem blocked the driver, update our stats
+        if (!callbackAllow && classification != ElamClassificationKnownBad) {
+            InterlockedIncrement(&g_ElamGlobals.DriversBlocked);
+        }
     }
 
     // Record elapsed time and log performance data

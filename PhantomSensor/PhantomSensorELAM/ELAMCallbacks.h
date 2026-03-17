@@ -64,8 +64,8 @@ typedef VOID (*EC_DRIVER_CALLBACK)(
 );
 
 typedef struct _EC_ELAM_CALLBACKS {
-    BOOLEAN Initialized;
-    BOOLEAN Registered;
+    volatile LONG Initialized;
+    volatile LONG Registered;
     
     // Callback registration
     PVOID CallbackRegistration;
@@ -78,6 +78,10 @@ typedef struct _EC_ELAM_CALLBACKS {
     LIST_ENTRY DriverList;
     EX_PUSH_LOCK DriverLock;
     ULONG DriverCount;
+    
+    // Rundown protection: all public APIs acquire before proceeding,
+    // ElcbShutdown waits for all in-flight calls to drain before freeing.
+    EX_RUNDOWN_REF RundownRef;
     
     // Policy
     BOOLEAN BlockUnknown;
