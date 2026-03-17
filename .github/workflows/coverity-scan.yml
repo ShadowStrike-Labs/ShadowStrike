@@ -1,0 +1,48 @@
+﻿name: Coverity Scan
+
+on:
+  push:
+    branches: [ master, main ]
+  schedule:
+    - cron: '0 0 * * 0'
+
+jobs:
+  coverity:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Download Coverity Build Tool
+        run: |
+          wget -q https://scan.coverity.com/download/cxx/linux64 \
+            --post-data "token=${{ secrets.COVERITY_SCAN_TOKEN }}&project=ShadowStrike-Labs%2FShadowStrike" \
+            -O cov-analysis-linux64.tar.gz
+          mkdir cov-analysis-linux64
+          tar xzf cov-analysis-linux64.tar.gz --strip 1 -C cov-analysis-linux64
+      
+      - name: Build with Coverity
+        run: |
+          export PATH=`pwd`/cov-analysis-linux64/bin:$PATH
+          cov-build --dir cov-int msbuild ShadowStrike.sln /t:Build || true
+          cov-analyze --dir cov-int --strip-path `pwd` || true
+      
+      - name: Submit results to Coverity Scan
+        run: |
+          tar czf cov-int.tar.gz cov-int
+          curl --form token=${{ secrets.COVERITY_SCAN_TOKEN }} \
+               --form email=${{ secrets.COVERITY_SCAN_EMAIL }} \
+               --form file=@cov-int.tar.gz \
+               --form version="${{ github.sha }}" \
+               --form description="GitHub ${{ github.repository }} / ${{ github.ref_name }}" \
+               https://scan.coverity.com/builds
+      
+      - name: Save Coverity report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverity-cov-int
+          path: cov-int/
