@@ -45,6 +45,7 @@
 #pragma once
 
 #include <ntifs.h>
+#include "BootThreatDetector.h"
 
 // ============================================================================
 // ELAM CONFIGURATION
@@ -385,6 +386,28 @@ ElamGetStatistics(
     _Out_ PLONG DriversBad,
     _Out_ PLONG DriversUnknown,
     _Out_ PLONG DriversBlocked
+    );
+
+// ============================================================================
+// PUBLIC API - BOOT THREAT QUERY
+// ============================================================================
+
+/**
+ * @brief Query boot-time threat detections for telemetry/reporting.
+ *
+ * Returns up to MaxThreats pointers to active BTD_THREAT entries detected
+ * during the current boot cycle. Each pointer remains valid until BtdFreeThreat.
+ *
+ * @param Threats Output array of threat pointers.
+ * @param MaxThreats Maximum entries in the output array.
+ * @param ThreatCount Output: actual count of threats returned.
+ * @return STATUS_SUCCESS on success, STATUS_BUFFER_TOO_SMALL if more threats exist.
+ */
+NTSTATUS
+ElamGetBootThreats(
+    _Out_writes_to_(MaxThreats, *ThreatCount) PBTD_THREAT* Threats,
+    _In_ ULONG MaxThreats,
+    _Out_ PULONG ThreatCount
     );
 
 // ============================================================================

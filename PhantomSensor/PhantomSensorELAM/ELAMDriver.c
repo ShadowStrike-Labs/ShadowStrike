@@ -97,6 +97,9 @@ static NTSTATUS
 ElamLoadEmbeddedSignatures(VOID);
 
 static VOID
+ElamTryLoadVulnerableDriverList(VOID);
+
+static VOID
 ElamThreatNotificationCallback(
     _In_ PBTD_THREAT Threat,
     _In_opt_ PVOID Context
@@ -173,6 +176,11 @@ ElamDriverInitialize(
             goto Cleanup;
         }
     }
+
+    // After loading signature data, check for a BVDL (vulnerable driver list)
+    // trailer section appended after the ELAM signature block in the PE resource.
+    // If present, merges into BTD's runtime BYOVD database.
+    ElamTryLoadVulnerableDriverList();
 
     // Set default boot policy
     g_ElamGlobals.BootPolicy = ElamPolicyGoodUnknown;
@@ -1206,6 +1214,48 @@ ElamLoadEmbeddedSignatures(VOID)
 }
 
 /**
+ * @brief Try to load a BVDL vulnerable driver list from the signature resource
+ *
+ * After ElamLoadSignatureData, the PE resource buffer may contain a trailing
+ * BVDL section appended after the ELAM signature block (at offset TotalSize).
+ * If present, BtdLoadVulnerableList validates the format and merges entries
+ * into the BTD runtime BYOVD database. If absent or invalid, this is a no-op.
+ */
+static VOID
+ElamTryLoadVulnerableDriverList(VOID)
+{
+    PELAM_SIGNATURE_HEADER header;
+    SIZE_T dataSize;
+    PUCHAR trailingData;
+    SIZE_T trailingSize;
+    NTSTATUS status;
+
+    if (g_ThreatDetector == NULL || g_ElamGlobals.SignatureData == NULL) {
+        return;
+    }
+
+    header = g_ElamGlobals.SignatureData;
+    dataSize = g_ElamGlobals.SignatureDataSize;
+
+    // Check if there's data after the ELAM signature block
+    if (header->TotalSize >= dataSize || header->TotalSize < sizeof(ELAM_SIGNATURE_HEADER)) {
+        return;
+    }
+
+    trailingData = (PUCHAR)header + header->TotalSize;
+    trailingSize = dataSize - header->TotalSize;
+
+    // BtdLoadVulnerableList validates BVDL magic/version/size internally.
+    // If the trailing data isn't a valid BVDL section, it returns an error
+    // and we silently ignore it.
+    status = BtdLoadVulnerableList(g_ThreatDetector, trailingData, trailingSize);
+    if (NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "[ShadowStrike/ELAM] Loaded BVDL vulnerable driver list from PE resource trailer\n");
+    }
+}
+
+/**
  * @brief Validate signature data integrity
  */
 BOOLEAN
@@ -1481,6 +1531,37 @@ ElamTakeRemediationAction(
 
     ZwClose(keyHandle);
     return status;
+}
+
+/**
+ * @brief Query boot-time threat detections for telemetry/reporting
+ *
+ * Wraps BtdGetThreats so the main sensor can query ELAM detections without
+ * directly accessing the BTD_DETECTOR pointer. Returns threat pointers that
+ * must be freed with BtdFreeThreat(g_ThreatDetector, threat).
+ */
+NTSTATUS
+ElamGetBootThreats(
+    _Out_writes_to_(MaxThreats, *ThreatCount) PBTD_THREAT* Threats,
+    _In_ ULONG MaxThreats,
+    _Out_ PULONG ThreatCount
+    )
+{
+    if (Threats == NULL || ThreatCount == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *ThreatCount = 0;
+
+    if (MaxThreats == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!g_ElamGlobals.Initialized || g_ThreatDetector == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+
+    return BtdGetThreats(g_ThreatDetector, Threats, MaxThreats, ThreatCount);
 }
 
 // End of ELAMDriver.c

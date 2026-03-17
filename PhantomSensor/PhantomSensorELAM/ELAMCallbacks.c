@@ -368,6 +368,7 @@ ElcbShutdown(
     Callbacks->Initialized = FALSE;
 
     // Free all driver entries
+    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Callbacks->DriverLock);
     while (!IsListEmpty(&Callbacks->DriverList)) {
         entry = RemoveHeadList(&Callbacks->DriverList);
@@ -376,6 +377,7 @@ ElcbShutdown(
     }
     Callbacks->DriverCount = 0;
     ExReleasePushLockExclusive(&Callbacks->DriverLock);
+    KeLeaveCriticalRegion();
 
     // Delete lookaside list
     if (internal->LookasideInitialized) {
@@ -462,10 +464,12 @@ ElcbSetUserCallback(
     }
 
     // Thread-safe update of callback
+    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Callbacks->DriverLock);
     Callbacks->UserCallback = Callback;
     Callbacks->UserContext = Context;
     ExReleasePushLockExclusive(&Callbacks->DriverLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -485,10 +489,12 @@ ElcbSetPolicy(
         return STATUS_INVALID_PARAMETER;
     }
 
+    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Callbacks->DriverLock);
     Callbacks->BlockUnknown = BlockUnknown;
     Callbacks->AllowUnsigned = AllowUnsigned;
     ExReleasePushLockExclusive(&Callbacks->DriverLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -516,6 +522,7 @@ ElcbGetBootDrivers(
 
     *Count = 0;
 
+    KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Callbacks->DriverLock);
 
     for (entry = Callbacks->DriverList.Flink;
@@ -528,6 +535,7 @@ ElcbGetBootDrivers(
     }
 
     ExReleasePushLockShared(&Callbacks->DriverLock);
+    KeLeaveCriticalRegion();
 
     *Count = index;
 
@@ -571,6 +579,7 @@ ElcbProcessBootDriver(
 
     internal = CONTAINING_RECORD(Callbacks, EC_ELAM_CALLBACKS_INTERNAL, Public);
 
+    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Callbacks->DriverLock);
 
     driver = ElcbpFindDriverByPath(Callbacks, DriverPath);
@@ -578,12 +587,14 @@ ElcbProcessBootDriver(
     if (driver == NULL) {
         if (Callbacks->DriverCount >= EC_MAX_BOOT_DRIVERS) {
             ExReleasePushLockExclusive(&Callbacks->DriverLock);
+            KeLeaveCriticalRegion();
             return STATUS_QUOTA_EXCEEDED;
         }
 
         driver = ElcbpAllocateBootDriver(internal);
         if (driver == NULL) {
             ExReleasePushLockExclusive(&Callbacks->DriverLock);
+            KeLeaveCriticalRegion();
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -641,6 +652,7 @@ ElcbProcessBootDriver(
     }
 
     ExReleasePushLockExclusive(&Callbacks->DriverLock);
+    KeLeaveCriticalRegion();
 
     //
     // Invoke user callback outside the lock
@@ -659,12 +671,14 @@ ElcbProcessBootDriver(
         if (!userAllow && allow) {
             allow = FALSE;
 
+            KeEnterCriticalRegion();
             ExAcquirePushLockExclusive(&Callbacks->DriverLock);
             driver->Public.IsAllowed = FALSE;
             RtlStringCbCopyA(driver->Public.BlockReason,
                            sizeof(driver->Public.BlockReason),
                            "Blocked by user callback");
             ExReleasePushLockExclusive(&Callbacks->DriverLock);
+            KeLeaveCriticalRegion();
 
             InterlockedDecrement64(&Callbacks->Stats.DriversAllowed);
             InterlockedIncrement64(&Callbacks->Stats.DriversBlocked);

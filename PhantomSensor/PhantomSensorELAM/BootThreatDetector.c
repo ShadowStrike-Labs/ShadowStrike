@@ -522,10 +522,12 @@ BtdpInvokeCallback(
     BTD_THREAT_CALLBACK callback;
     PVOID context;
 
+    KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Detector->CallbackLock);
     callback = Detector->ThreatCallback;
     context = Detector->CallbackContext;
     ExReleasePushLockShared(&Detector->CallbackLock);
+    KeLeaveCriticalRegion();
 
     if (callback != NULL) {
         callback(Threat, context);
@@ -591,10 +593,12 @@ BtdpLoadEmbeddedVulnerableList(
                           "Vulnerable driver: %s (%s)",
                           entry->DriverName, entry->CVE);
 
+        KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&Detector->VulnerableLock);
         InsertTailList(&Detector->VulnerableList, &entry->ListEntry);
         InterlockedIncrement(&Detector->VulnerableCount);
         ExReleasePushLockExclusive(&Detector->VulnerableLock);
+        KeLeaveCriticalRegion();
     }
 
     return STATUS_SUCCESS;
@@ -635,6 +639,7 @@ BtdpLoadEmbeddedPatterns(
                         g_EmbeddedPatterns[i].ThreatName);
 
         // Add to appropriate list
+        KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&Internal->PatternLock);
         if (entry->ThreatType == BtdThreat_Bootkit) {
             InsertTailList(&Internal->BootkitPatterns, &entry->ListEntry);
@@ -644,6 +649,7 @@ BtdpLoadEmbeddedPatterns(
             Internal->RootkitPatternCount++;
         }
         ExReleasePushLockExclusive(&Internal->PatternLock);
+        KeLeaveCriticalRegion();
     }
 
     return STATUS_SUCCESS;
@@ -710,6 +716,11 @@ BtdInitialize(
         );
     internal->LookasideInitialized = TRUE;
 
+    // Mark initialized early so BtdShutdown CAS guard works for both
+    // normal shutdown and init-error cleanup paths. The detector pointer
+    // is not exposed to callers until *Detector is set on success.
+    InterlockedExchange(&internal->Public.Initialized, 1);
+
     status = BtdpLoadEmbeddedVulnerableList(&internal->Public);
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
@@ -722,7 +733,6 @@ BtdInitialize(
 
     KeQuerySystemTimePrecise(&internal->Public.Stats.StartTime);
 
-    InterlockedExchange(&internal->Public.Initialized, 1);
     *Detector = &internal->Public;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -767,11 +777,16 @@ BtdShutdown(
 
     internal = CONTAINING_RECORD(Detector, BTD_DETECTOR_INTERNAL, Public);
 
-    InterlockedExchange(&Detector->Initialized, 0);
+    // CAS guard: prevent double-shutdown. Init sets Initialized=1 early,
+    // so this works for both normal shutdown and init-error cleanup.
+    if (InterlockedCompareExchange(&Detector->Initialized, 0, 1) != 1) {
+        return;
+    }
 
     //
     // Free vulnerable list
     //
+    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Detector->VulnerableLock);
     while (!IsListEmpty(&Detector->VulnerableList)) {
         entry = RemoveHeadList(&Detector->VulnerableList);
@@ -780,10 +795,12 @@ BtdShutdown(
     }
     InterlockedExchange(&Detector->VulnerableCount, 0);
     ExReleasePushLockExclusive(&Detector->VulnerableLock);
+    KeLeaveCriticalRegion();
 
     //
     // Free pattern lists
     //
+    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&internal->PatternLock);
     while (!IsListEmpty(&internal->BootkitPatterns)) {
         entry = RemoveHeadList(&internal->BootkitPatterns);
@@ -796,6 +813,7 @@ BtdShutdown(
         ExFreePoolWithTag(patternEntry, BTD_POOL_TAG);
     }
     ExReleasePushLockExclusive(&internal->PatternLock);
+    KeLeaveCriticalRegion();
 
     //
     // Free detected threats (including deep-copied driver paths)
@@ -836,10 +854,12 @@ BtdRegisterCallback(
         return STATUS_INVALID_PARAMETER;
     }
 
+    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Detector->CallbackLock);
     Detector->ThreatCallback = Callback;
     Detector->CallbackContext = Context;
     ExReleasePushLockExclusive(&Detector->CallbackLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -933,7 +953,10 @@ BtdScanDriver(
         threat->IsCritical = TRUE;
         threat->WasBlocked = FALSE;
 
-        BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath);
+        if (!NT_SUCCESS(BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath))) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/BTD] Failed to copy driver path for BYOVD threat\n");
+        }
         KeQuerySystemTimePrecise(&threat->DetectionTime);
 
         KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
@@ -961,6 +984,7 @@ BtdScanDriver(
 
         patternMatched = FALSE;
 
+        KeEnterCriticalRegion();
         ExAcquirePushLockShared(&internal->PatternLock);
 
         __try {
@@ -1028,6 +1052,7 @@ BtdScanDriver(
         }
 
         ExReleasePushLockShared(&internal->PatternLock);
+        KeLeaveCriticalRegion();
 
         //
         // Build threat structure OUTSIDE lock using captured data
@@ -1064,7 +1089,10 @@ BtdScanDriver(
             threat->IsCritical = (matchedSeverity >= BTD_SEVERITY_CRITICAL_THRESHOLD);
             threat->WasBlocked = FALSE;
 
-            BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath);
+            if (!NT_SUCCESS(BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath))) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike/BTD] Failed to copy driver path for pattern threat\n");
+            }
             KeQuerySystemTimePrecise(&threat->DetectionTime);
 
             KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
@@ -1109,7 +1137,10 @@ BtdScanDriver(
         threat->IsCritical = FALSE;
         threat->WasBlocked = FALSE;
 
-        BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath);
+        if (!NT_SUCCESS(BtdpDeepCopyDriverPath(&DriverInfo->DriverPath, &threat->DriverPath))) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                "[ShadowStrike/BTD] Failed to copy driver path for unauthorized threat\n");
+        }
         KeQuerySystemTimePrecise(&threat->DetectionTime);
 
         KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
@@ -1254,10 +1285,12 @@ BtdLoadVulnerableList(
         RtlStringCbPrintfA(entry->Description, sizeof(entry->Description),
                           "Vulnerable driver: %s (%s)", entry->DriverName, entry->CVE);
 
+        KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&Detector->VulnerableLock);
         InsertTailList(&Detector->VulnerableList, &entry->ListEntry);
         InterlockedIncrement(&Detector->VulnerableCount);
         ExReleasePushLockExclusive(&Detector->VulnerableLock);
+        KeLeaveCriticalRegion();
     }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -1303,6 +1336,7 @@ BtdIsVulnerable(
         CVEBuffer[0] = '\0';
     }
 
+    KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Detector->VulnerableLock);
 
     for (entry = Detector->VulnerableList.Flink;
@@ -1322,6 +1356,7 @@ BtdIsVulnerable(
     }
 
     ExReleasePushLockShared(&Detector->VulnerableLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -1428,8 +1463,10 @@ BtdFreeThreat(
 
     if (!found) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-            "[ShadowStrike/BTD] BtdFreeThreat: threat %p not found in DetectedList\n",
+            "[ShadowStrike/BTD] BtdFreeThreat: threat %p not found in DetectedList — "
+            "possible double-free or stale pointer, leak preferred over corruption\n",
             Threat);
+        return;
     }
 
     BtdpFreeDriverPath(&Threat->DriverPath);
