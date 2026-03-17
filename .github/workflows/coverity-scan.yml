@@ -8,7 +8,7 @@ on:
 
 jobs:
   coverity:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     
     steps:
       - name: Checkout code
@@ -16,33 +16,40 @@ jobs:
         with:
           fetch-depth: 0
       
-      - name: Download Coverity Build Tool
+      - name: Download Coverity Build Tool (Windows)
+        shell: powershell
         run: |
-          wget -q https://scan.coverity.com/download/cxx/linux64 \
-            --post-data "token=${{ secrets.COVERITY_SCAN_TOKEN }}&project=ShadowStrike-Labs%2FShadowStrike" \
-            -O cov-analysis-linux64.tar.gz
-          mkdir cov-analysis-linux64
-          tar xzf cov-analysis-linux64.tar.gz --strip 1 -C cov-analysis-linux64
+          $ProgressPreference = 'SilentlyContinue'
+          wget -Uri "https://scan.coverity.com/download/cxx/win64" `
+               -OutFile "cov-analysis-win64.zip" `
+               -Headers @{"token"="${{ secrets.COVERITY_SCAN_TOKEN }}";"project"="ShadowStrike-Labs/ShadowStrike"}
+          Expand-Archive -Path "cov-analysis-win64.zip" -DestinationPath "."
       
-      - name: Build with Coverity
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1
+      
+      - name: Build PhantomSensor with Coverity
+        shell: cmd
         run: |
-          export PATH=`pwd`/cov-analysis-linux64/bin:$PATH
-          cov-build --dir cov-int msbuild ShadowStrike.sln /t:Build || true
-          cov-analyze --dir cov-int --strip-path `pwd` || true
+          set PATH=%CD%\cov-analysis-win64\bin;%PATH%
+          cov-build --dir cov-int msbuild PhantomSensor\PhantomSensor.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64 || exit /b 0
+          cov-analyze --dir cov-int --strip-path %CD% --enable-virtual-functions || exit /b 0
       
       - name: Submit results to Coverity Scan
+        shell: powershell
         run: |
-          tar czf cov-int.tar.gz cov-int
-          curl --form token=${{ secrets.COVERITY_SCAN_TOKEN }} \
-               --form email=${{ secrets.COVERITY_SCAN_EMAIL }} \
-               --form file=@cov-int.tar.gz \
-               --form version="${{ github.sha }}" \
-               --form description="GitHub ${{ github.repository }} / ${{ github.ref_name }}" \
-               https://scan.coverity.com/builds
+          $file = Get-Item "cov-int"
+          tar -czf cov-int.tar.gz cov-int
+          curl.exe --form "token=${{ secrets.COVERITY_SCAN_TOKEN }}" `
+                   --form "email=${{ secrets.COVERITY_SCAN_EMAIL }}" `
+                   --form "file=@cov-int.tar.gz" `
+                   --form "version=${{ github.sha }}" `
+                   --form "description=PhantomSensor Kernel Driver" `
+                   https://scan.coverity.com/builds
       
       - name: Save Coverity report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverity-cov-int
+          name: coverity-phantom-sensor
           path: cov-int/
