@@ -366,6 +366,7 @@ FodyWeavers.xsd
 .vscode/
 .claude/
 .gemini/
+.github/
 !.github/workflows/
 !.github/FUNDING.yml
 .pvs-studio/
