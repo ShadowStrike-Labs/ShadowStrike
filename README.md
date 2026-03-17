@@ -18,6 +18,13 @@
 [Website](https://www.shadowstrike.dev) · [Architecture](https://www.shadowstrike.dev/architecture) · [Roadmap](https://www.shadowstrike.dev/roadmap) · [Join Beta](https://www.shadowstrike.dev/beta) · [Research](https://www.shadowstrike.dev/research)
 
 </div>
+### Support This Project
+
+If you believe in open-source security, consider supporting our development:
+
+[![Sponsor ShadowStrike](https://img.shields.io/badge/💝%20Sponsor%20on%20GitHub-ea4aaa?style=for-the-badge)](https://github.com/sponsors/ShadowStrike-Labs)
+
+Your support helps us build transparent, auditable endpoint protection for everyone.
 
 ---
 
