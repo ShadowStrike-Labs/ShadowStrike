@@ -194,6 +194,7 @@ TbpGetRingBufferUsage(
     _In_ PTB_RING_BUFFER RingBuffer
     );
 
+_Function_class_(KDEFERRED_ROUTINE)
 _IRQL_requires_(DISPATCH_LEVEL)
 static VOID
 TbpFlushTimerDpc(
@@ -3213,6 +3214,7 @@ TbpGetRingBufferUsage(
 // INTERNAL: FLUSH THREAD
 // ============================================================================
 
+_Function_class_(KDEFERRED_ROUTINE)
 _IRQL_requires_(DISPATCH_LEVEL)
 static VOID
 TbpFlushTimerDpc(

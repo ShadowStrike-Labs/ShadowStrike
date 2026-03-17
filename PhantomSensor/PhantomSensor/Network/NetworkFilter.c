@@ -1,4 +1,4 @@
-﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// This is a personal academic project. Dear PVS-Studio, please check it.
 // PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
@@ -155,9 +155,7 @@ EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_STREAM_V4_CALLOUT_GUID =
 #define MAXUINT32   ((UINT32)0xFFFFFFFF)
 #endif
 
-// Suppress C4996 for ExAllocatePoolWithTag â€” needed for Windows 10 1507â€“1903 compat.
-// ExAllocatePool2 only available from 2004 (19041) forward.
-#pragma warning(disable:4996)
+// ExAllocatePool2 requires Windows 10 2004+ (19041). Zero-initialized, NX by default.
 
 // ============================================================================
 // PRIVATE TYPES
@@ -1297,8 +1295,8 @@ NfFilterBlockDomain(
     //
     // Allocate BEFORE locking to minimize time under exclusive lock
     //
-    blockedEntry = (PNF_BLOCKED_DOMAIN)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    blockedEntry = (PNF_BLOCKED_DOMAIN)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(NF_BLOCKED_DOMAIN),
         NF_POOL_TAG_DNS
         );
@@ -1307,7 +1305,7 @@ NfFilterBlockDomain(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(blockedEntry, sizeof(NF_BLOCKED_DOMAIN));
+    // ExAllocatePool2 zero-initializes; no RtlZeroMemory needed
     blockedEntry->DomainHash = domainHash;
     blockedEntry->Reason = Reason;
 
@@ -2890,16 +2888,16 @@ NfpInsertConnection(
     //
     // Allocate all hash entries BEFORE locking
     //
-    epEntry = (PNF_CONNECTION_HASH_ENTRY)ExAllocatePoolWithTag(
-        NonPagedPoolNx, sizeof(NF_CONNECTION_HASH_ENTRY), NF_POOL_TAG_CONNECTION);
+    epEntry = (PNF_CONNECTION_HASH_ENTRY)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(NF_CONNECTION_HASH_ENTRY), NF_POOL_TAG_CONNECTION);
     if (epEntry == NULL) goto AllocFail;
 
-    flowEntry = (PNF_CONNECTION_HASH_ENTRY)ExAllocatePoolWithTag(
-        NonPagedPoolNx, sizeof(NF_CONNECTION_HASH_ENTRY), NF_POOL_TAG_CONNECTION);
+    flowEntry = (PNF_CONNECTION_HASH_ENTRY)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(NF_CONNECTION_HASH_ENTRY), NF_POOL_TAG_CONNECTION);
     if (flowEntry == NULL) goto AllocFail;
 
-    idEntry = (PNF_CONNECTION_HASH_ENTRY)ExAllocatePoolWithTag(
-        NonPagedPoolNx, sizeof(NF_CONNECTION_HASH_ENTRY), NF_POOL_TAG_CONNECTION);
+    idEntry = (PNF_CONNECTION_HASH_ENTRY)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(NF_CONNECTION_HASH_ENTRY), NF_POOL_TAG_CONNECTION);
     if (idEntry == NULL) goto AllocFail;
 
     epEntry->Connection = Connection;
@@ -4113,8 +4111,8 @@ NfpProcessDnsPacket(
         //
         // For large packets, allocate from pool
         //
-        dnsData = (UCHAR*)ExAllocatePoolWithTag(
-            NonPagedPoolNx, dataLength, NF_POOL_TAG_DNS);
+        dnsData = (UCHAR*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, dataLength, NF_POOL_TAG_DNS);
         if (dnsData == NULL) {
             goto Done;
         }
@@ -4398,8 +4396,8 @@ NfpProcessInboundDnsResponse(
     if (dataLength <= sizeof(localBuffer)) {
         dnsData = (UCHAR*)NdisGetDataBuffer(nb, dataLength, localBuffer, 1, 0);
     } else {
-        dnsData = (UCHAR*)ExAllocatePoolWithTag(
-            NonPagedPoolNx, dataLength, NF_POOL_TAG_DNS);
+        dnsData = (UCHAR*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, dataLength, NF_POOL_TAG_DNS);
         if (dnsData == NULL) {
             return;
         }

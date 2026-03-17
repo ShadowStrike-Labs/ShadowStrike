@@ -368,6 +368,7 @@ FodyWeavers.xsd
 .gemini/
 .github/
 !.github/workflows/
+!.github/FUNDING.yml
 .pvs-studio/
 NUL
 CLAUDE.md

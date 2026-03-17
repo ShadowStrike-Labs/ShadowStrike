@@ -582,7 +582,8 @@ ShadowStrikeDrainMessageQueue(
             // Send directly via FltSendMessage (not ShadowStrikeSendNotification)
             // to prevent recursive re-enqueue on transient failure.
             //
-            FltSendMessage(
+            // Best-effort drain — failures are expected during reconnect
+            (void)FltSendMessage(
                 g_DriverData.FilterHandle,
                 &ClientPort,
                 messages[i]->Data,

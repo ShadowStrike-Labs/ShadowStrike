@@ -193,6 +193,7 @@ typedef struct _COMP_DEFERRED_CLEANUP {
  * Uses WORK_QUEUE_ITEM + ExQueueWorkItem which does NOT require
  * a device object, unlike IoAllocateWorkItem/IoQueueWorkItem.
  */
+_Function_class_(WORKER_THREAD_ROUTINE)
 static VOID
 ComppDeferredDictionaryCleanupWorker(
     _In_ PVOID Parameter

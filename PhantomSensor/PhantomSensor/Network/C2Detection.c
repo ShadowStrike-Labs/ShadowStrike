@@ -2282,7 +2282,10 @@ C2pFindOrCreateProcessContext(
                 unicodeName.Buffer = context->ProcessName;
                 unicodeName.MaximumLength = sizeof(context->ProcessName) - sizeof(WCHAR);
                 unicodeName.Length = 0;
-                RtlAnsiStringToUnicodeString(&unicodeName, &ansiName, FALSE);
+                NTSTATUS convStatus = RtlAnsiStringToUnicodeString(&unicodeName, &ansiName, FALSE);
+                if (!NT_SUCCESS(convStatus)) {
+                    unicodeName.Length = 0;
+                }
             }
             ObDereferenceObject(process);
         }

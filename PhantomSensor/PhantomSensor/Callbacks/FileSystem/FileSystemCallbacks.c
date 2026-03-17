@@ -832,11 +832,15 @@ Return Value:
                 &VolumeContext->VolumeName,
                 NULL
                 );
+
+            if (!NT_SUCCESS(Status)) {
+                VolumeContext->VolumeName.Length = 0;
+            }
         }
     }
 
     //
-    // Get volume properties
+    // Get volume properties (Status reused — volume name failure is non-fatal)
     //
     {
         FLT_VOLUME_PROPERTIES VolumeProps = {0};
