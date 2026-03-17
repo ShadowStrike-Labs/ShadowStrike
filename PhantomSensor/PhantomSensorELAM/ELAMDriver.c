@@ -69,8 +69,7 @@ static PBTD_DETECTOR g_ThreatDetector = NULL;
 static PEC_ELAM_CALLBACKS g_ElamCallbacks = NULL;
 static LARGE_INTEGER g_RegistryCookie = {0};
 static BOOLEAN g_ImageNotifyRegistered = FALSE;
-static EX_PUSH_LOCK g_StateLock;
-static BOOLEAN g_StateLockInitialized = FALSE;
+static volatile LONG g_SelfModifyingRegistry = 0;  // Self-exclusion for remediation writes
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -131,15 +130,17 @@ ElamDriverInitialize(
 
     UNREFERENCED_PARAMETER(RegistryPath);
 
-    if (InterlockedCompareExchange(&g_ElamGlobals.Initialized, 0, 0)) {
+    //
+    // Atomically claim initialization (0→1). Prevents double-init race
+    // where two threads both read 0, then both zero + initialize.
+    //
+    if (InterlockedCompareExchange(&g_ElamGlobals.Initialized, 1, 0) != 0) {
         return STATUS_ALREADY_INITIALIZED;
     }
 
+    // Zero all fields then re-set our "initializing" sentinel
     RtlZeroMemory(&g_ElamGlobals, sizeof(ELAM_DRIVER_GLOBALS));
-
-    // Initialize state lock
-    ExInitializePushLock(&g_StateLock);
-    g_StateLockInitialized = TRUE;
+    InterlockedExchange(&g_ElamGlobals.Initialized, 1);
 
     // Initialize hash utilities (required for all hash operations)
     status = ShadowStrikeInitializeHashUtils();
@@ -216,6 +217,14 @@ Cleanup:
 VOID
 ElamDriverShutdown(VOID)
 {
+    //
+    // CAS double-shutdown guard: atomically clear Initialized (1→0).
+    // If not initialized or already shutdown, nothing to do.
+    //
+    if (InterlockedCompareExchange(&g_ElamGlobals.Initialized, 0, 1) != 1) {
+        return;
+    }
+
     // Unregister callbacks first
     ElamUnregisterCallback();
 
@@ -250,8 +259,6 @@ ElamDriverShutdown(VOID)
 
     // Cleanup hash utilities
     ShadowStrikeCleanupHashUtils();
-
-    InterlockedExchange(&g_ElamGlobals.Initialized, FALSE);
 }
 
 /**
@@ -642,7 +649,8 @@ ElamIsHashKnownGood(
         }
 
         if (hashEntry->Classification == ElamClassificationKnownGood &&
-            hashEntry->HashSize == 32) {
+            hashEntry->HashSize == 32 &&
+            hashEntry->EntrySize >= sizeof(ELAM_HASH_ENTRY) + 32) {
             PUCHAR storedHash = entryPtr + sizeof(ELAM_HASH_ENTRY);
 
             if (ElamCompareHashes(Hash, storedHash)) {
@@ -708,7 +716,8 @@ ElamIsHashKnownBad(
         }
 
         if (hashEntry->Classification == ElamClassificationKnownBad &&
-            hashEntry->HashSize == 32) {
+            hashEntry->HashSize == 32 &&
+            hashEntry->EntrySize >= sizeof(ELAM_HASH_ENTRY) + 32) {
             PUCHAR storedHash = entryPtr + sizeof(ELAM_HASH_ENTRY);
 
             if (ElamCompareHashes(Hash, storedHash)) {
@@ -762,6 +771,14 @@ ElamIsCertificateKnownGood(
         }
 
         if (certEntry->Classification == ElamClassificationKnownGood) {
+            // Validate hash data fits within entry (overflow-safe subtraction)
+            if (certEntry->EntrySize < sizeof(ELAM_CERTIFICATE_ENTRY) ||
+                certEntry->IssuerHashSize > certEntry->EntrySize - sizeof(ELAM_CERTIFICATE_ENTRY) ||
+                certEntry->PublisherHashSize > certEntry->EntrySize - sizeof(ELAM_CERTIFICATE_ENTRY) - certEntry->IssuerHashSize) {
+                entryPtr += certEntry->EntrySize;
+                offset += certEntry->EntrySize;
+                continue;
+            }
             PUCHAR issuerData = entryPtr + sizeof(ELAM_CERTIFICATE_ENTRY);
             PUCHAR publisherData = issuerData + certEntry->IssuerHashSize;
 
@@ -829,6 +846,13 @@ ElamIsCertificateKnownBad(
         }
 
         if (certEntry->Classification == ElamClassificationKnownBad) {
+            // Validate issuer hash fits within entry
+            if (certEntry->EntrySize < sizeof(ELAM_CERTIFICATE_ENTRY) ||
+                certEntry->IssuerHashSize > certEntry->EntrySize - sizeof(ELAM_CERTIFICATE_ENTRY)) {
+                entryPtr += certEntry->EntrySize;
+                offset += certEntry->EntrySize;
+                continue;
+            }
             PUCHAR issuerData = entryPtr + sizeof(ELAM_CERTIFICATE_ENTRY);
 
             if (certEntry->IssuerHashSize == 32 &&
@@ -874,13 +898,23 @@ ElamRegistryCallbackRoutine(
         return STATUS_SUCCESS;
     }
 
+    //
+    // Self-exclusion: allow our own remediation writes through.
+    // ElamTakeRemediationAction sets g_SelfModifyingRegistry before Zw* calls
+    // to prevent the callback from blocking our own registry operations.
+    //
+    if (InterlockedCompareExchange(&g_SelfModifyingRegistry, 0, 0)) {
+        return STATUS_SUCCESS;
+    }
+
     notifyClass = (REG_NOTIFY_CLASS)(ULONG_PTR)Argument1;
 
     switch (notifyClass) {
         case RegNtPreSetValueKey:
             setValueInfo = (PREG_SET_VALUE_KEY_INFORMATION)Argument2;
             if (setValueInfo != NULL && setValueInfo->Object != NULL) {
-                status = CmCallbackGetKeyObjectIDEx(
+                NTSTATUS lookupStatus;
+                lookupStatus = CmCallbackGetKeyObjectIDEx(
                     &g_RegistryCookie,
                     setValueInfo->Object,
                     NULL,
@@ -888,7 +922,7 @@ ElamRegistryCallbackRoutine(
                     0
                     );
 
-                if (NT_SUCCESS(status) && objectName != NULL) {
+                if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
                     if (ElamIsProtectedRegistryPath(objectName)) {
                         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                             "[ShadowStrike/ELAM] BLOCKED registry value modification: %wZ\n",
@@ -903,7 +937,8 @@ ElamRegistryCallbackRoutine(
         case RegNtPreDeleteValueKey:
             deleteValueInfo = (PREG_DELETE_VALUE_KEY_INFORMATION)Argument2;
             if (deleteValueInfo != NULL && deleteValueInfo->Object != NULL) {
-                status = CmCallbackGetKeyObjectIDEx(
+                NTSTATUS lookupStatus;
+                lookupStatus = CmCallbackGetKeyObjectIDEx(
                     &g_RegistryCookie,
                     deleteValueInfo->Object,
                     NULL,
@@ -911,7 +946,7 @@ ElamRegistryCallbackRoutine(
                     0
                     );
 
-                if (NT_SUCCESS(status) && objectName != NULL) {
+                if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
                     if (ElamIsProtectedRegistryPath(objectName)) {
                         status = STATUS_ACCESS_DENIED;
                     }
@@ -923,7 +958,8 @@ ElamRegistryCallbackRoutine(
         case RegNtPreDeleteKey:
             deleteKeyInfo = (PREG_DELETE_KEY_INFORMATION)Argument2;
             if (deleteKeyInfo != NULL && deleteKeyInfo->Object != NULL) {
-                status = CmCallbackGetKeyObjectIDEx(
+                NTSTATUS lookupStatus;
+                lookupStatus = CmCallbackGetKeyObjectIDEx(
                     &g_RegistryCookie,
                     deleteKeyInfo->Object,
                     NULL,
@@ -931,7 +967,7 @@ ElamRegistryCallbackRoutine(
                     0
                     );
 
-                if (NT_SUCCESS(status) && objectName != NULL) {
+                if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
                     if (ElamIsProtectedRegistryPath(objectName)) {
                         status = STATUS_ACCESS_DENIED;
                     }
@@ -942,16 +978,29 @@ ElamRegistryCallbackRoutine(
 
         case RegNtPreCreateKeyEx:
             createKeyInfo = (PREG_CREATE_KEY_INFORMATION_V1)Argument2;
-            if (createKeyInfo != NULL && createKeyInfo->CompleteName != NULL) {
+            if (createKeyInfo != NULL && createKeyInfo->RootObject != NULL) {
                 //
                 // Monitor creation of new keys under protected boot driver paths.
-                // We do NOT block creation (too aggressive at boot), but log for
-                // the user-mode service to investigate after boot completes.
+                // Use CmCallbackGetKeyObjectIDEx on RootObject to get the absolute
+                // parent path — CompleteName is relative and would never match our
+                // absolute protected paths.
                 //
-                if (ElamIsProtectedRegistryPath(createKeyInfo->CompleteName)) {
-                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                        "[ShadowStrike/ELAM] New key creation under protected path: %wZ\n",
-                        createKeyInfo->CompleteName);
+                NTSTATUS lookupStatus;
+                lookupStatus = CmCallbackGetKeyObjectIDEx(
+                    &g_RegistryCookie,
+                    createKeyInfo->RootObject,
+                    NULL,
+                    &objectName,
+                    0
+                    );
+
+                if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
+                    if (ElamIsProtectedRegistryPath(objectName)) {
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                            "[ShadowStrike/ELAM] New key creation under protected path: %wZ\\%wZ\n",
+                            objectName, createKeyInfo->CompleteName);
+                    }
+                    CmCallbackReleaseKeyObjectIDEx(objectName);
                 }
             }
             break;
@@ -1077,8 +1126,13 @@ ElamLoadSignatureData(
     resRoot = (PIMAGE_RESOURCE_DIRECTORY)((PUCHAR)driverBase + resourceDir->VirtualAddress);
 
     {
-        USHORT numEntries = resRoot->NumberOfNamedEntries + resRoot->NumberOfIdEntries;
-        USHORT i;
+        ULONG numEntries = (ULONG)resRoot->NumberOfNamedEntries + resRoot->NumberOfIdEntries;
+        ULONG i;
+
+        // Bounds: entry array must fit within resource directory
+        if (sizeof(IMAGE_RESOURCE_DIRECTORY) + numEntries * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY) > resourceDir->Size) {
+            goto FallbackEmbedded;
+        }
 
         resEntry = (PIMAGE_RESOURCE_DIRECTORY_ENTRY)(resRoot + 1);
 
@@ -1099,7 +1153,13 @@ ElamLoadSignatureData(
                     }
 
                     nameDir = (PIMAGE_RESOURCE_DIRECTORY)((PUCHAR)resRoot + nameDirOffset);
-                    USHORT nameCount = nameDir->NumberOfNamedEntries + nameDir->NumberOfIdEntries;
+                    ULONG nameCount = (ULONG)nameDir->NumberOfNamedEntries + nameDir->NumberOfIdEntries;
+
+                    // Bounds: name entry array must fit
+                    if (nameDirOffset + sizeof(IMAGE_RESOURCE_DIRECTORY) +
+                        nameCount * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY) > resourceDir->Size) {
+                        continue;
+                    }
 
                     if (nameCount > 0) {
                         PIMAGE_RESOURCE_DIRECTORY_ENTRY nameEntry;
@@ -1108,7 +1168,7 @@ ElamLoadSignatureData(
                         //
                         // Look for our specific resource ID (ELAM_RESOURCE_SIGNATURE_TYPE = 1)
                         //
-                        for (USHORT j = 0; j < nameCount; j++) {
+                        for (ULONG j = 0; j < nameCount; j++) {
                             if (!nameEntry[j].NameIsString &&
                                 nameEntry[j].Id == ELAM_RESOURCE_SIGNATURE_TYPE) {
 
@@ -1124,13 +1184,23 @@ ElamLoadSignatureData(
                                     }
 
                                     langDir = (PIMAGE_RESOURCE_DIRECTORY)((PUCHAR)resRoot + langOffset);
-                                    USHORT langCount = langDir->NumberOfNamedEntries + langDir->NumberOfIdEntries;
+                                    ULONG langCount = (ULONG)langDir->NumberOfNamedEntries + langDir->NumberOfIdEntries;
+
+                                    // Bounds: lang entry array must fit
+                                    if (langOffset + sizeof(IMAGE_RESOURCE_DIRECTORY) +
+                                        langCount * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY) > resourceDir->Size) {
+                                        continue;
+                                    }
 
                                     if (langCount > 0) {
                                         PIMAGE_RESOURCE_DIRECTORY_ENTRY langEntry;
                                         langEntry = (PIMAGE_RESOURCE_DIRECTORY_ENTRY)(langDir + 1);
 
                                         if (!langEntry[0].DataIsDirectory) {
+                                            // Bounds: data entry must fit
+                                            if (langEntry[0].OffsetToData + sizeof(IMAGE_RESOURCE_DATA_ENTRY) > resourceDir->Size) {
+                                                continue;
+                                            }
                                             PIMAGE_RESOURCE_DATA_ENTRY dataEntry;
                                             dataEntry = (PIMAGE_RESOURCE_DATA_ENTRY)(
                                                 (PUCHAR)resRoot + langEntry[0].OffsetToData);
@@ -1149,6 +1219,9 @@ ElamLoadSignatureData(
                                     //
                                     // Direct data entry (no language subdirectory)
                                     //
+                                    if (nameEntry[j].OffsetToData + sizeof(IMAGE_RESOURCE_DATA_ENTRY) > resourceDir->Size) {
+                                        break;
+                                    }
                                     PIMAGE_RESOURCE_DATA_ENTRY dataEntry;
                                     dataEntry = (PIMAGE_RESOURCE_DATA_ENTRY)(
                                         (PUCHAR)resRoot + nameEntry[j].OffsetToData);
@@ -1339,8 +1412,8 @@ ElamValidateSignatureData(VOID)
         return FALSE;
     }
 
-    // Validate size
-    if (header->TotalSize != g_ElamGlobals.SignatureDataSize) {
+    // Validate size (TotalSize may be < SignatureDataSize when BVDL trailer present)
+    if (header->TotalSize > g_ElamGlobals.SignatureDataSize) {
         return FALSE;
     }
 
@@ -1524,6 +1597,11 @@ ElamTakeRemediationAction(
     // Path: HKLM\System\CurrentControlSet\Control\EarlyLaunch\BlockedDrivers
     // Value: severity score — the agent reads this after boot to take action.
     //
+    // Set self-exclusion flag so our registry callback allows these writes
+    // through — the BlockedDrivers path is under the protected EarlyLaunch prefix.
+    //
+    InterlockedExchange(&g_SelfModifyingRegistry, 1);
+
     RtlInitUnicodeString(&keyPath,
         L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\EarlyLaunch\\BlockedDrivers");
 
@@ -1546,6 +1624,7 @@ ElamTakeRemediationAction(
             status);
         RtlStringCbCopyA(Threat->ActionReason, sizeof(Threat->ActionReason),
             "Registry write failed; logged for manual review");
+        InterlockedExchange(&g_SelfModifyingRegistry, 0);
         return status;
     }
 
@@ -1590,6 +1669,7 @@ ElamTakeRemediationAction(
     }
 
     ZwClose(keyHandle);
+    InterlockedExchange(&g_SelfModifyingRegistry, 0);
     return status;
 }
 
@@ -1617,7 +1697,7 @@ ElamGetBootThreats(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!g_ElamGlobals.Initialized || g_ThreatDetector == NULL) {
+    if (!InterlockedCompareExchange(&g_ElamGlobals.Initialized, 0, 0) || g_ThreatDetector == NULL) {
         return STATUS_NOT_FOUND;
     }
 
