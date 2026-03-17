@@ -35,19 +35,9 @@ jobs:
       - name: Verify WDK Installation
         shell: powershell
         run: |
-          # windows-2022 runner comes with WDK pre-installed
           $wdkRoot = "C:\Program Files (x86)\Windows Kits\10"
           $includeDir = Join-Path $wdkRoot "Include"
 
-          Write-Host "Available WDK include directories:"
-          foreach ($v in Get-ChildItem $includeDir -Directory) {
-              $hasNtifs = Test-Path (Join-Path $v.FullName "km\ntifs.h")
-              Write-Host "  $($v.Name) - km headers: $hasNtifs"
-          }
-
-          # Find the newest directory that actually has kernel-mode headers.
-          # Filter on ntifs.h presence (excludes 'wdf' and SDK-only dirs),
-          # then sort numerically descending by the version string.
           $kmVersions = Get-ChildItem $includeDir -Directory |
               Where-Object { Test-Path (Join-Path $_.FullName "km\ntifs.h") } |
               Sort-Object { [Version]($_.Name -replace '[^0-9.]','') } -Descending
@@ -59,16 +49,6 @@ jobs:
 
           $selectedVer = $kmVersions[0].Name
           Write-Host "Selected WDK version: $selectedVer"
-
-          $ntifs     = Join-Path $includeDir "$selectedVer\km\ntifs.h"
-          $fltKernel = Join-Path $includeDir "$selectedVer\km\fltKernel.h"
-
-          if (-not (Test-Path $fltKernel)) {
-              Write-Error "FATAL: fltKernel.h not found at $fltKernel"
-              exit 1
-          }
-
-          Write-Host "WDK verified: ntifs.h and fltKernel.h present in $selectedVer"
       
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -78,31 +58,39 @@ jobs:
         run: |
           $covDir = Get-ChildItem -Filter "cov-analysis-win64*" -Directory | Select-Object -First 1
           if ($null -eq $covDir) { Write-Error "Coverity Build Tool directory not found"; exit 1 }
-          Write-Host "Found Coverity at: $($covDir.FullName)"
           $env:PATH = "$($covDir.FullName)\bin;$env:PATH"
+          
+          # Derleyiciyi Coverity'ye tanıt (MSVC için kritik)
+          cov-configure --msvc
+          
           New-Item -ItemType Directory -Path "cov-int" -Force | Out-Null
           Write-Host "Running cov-build..."
           cov-build --dir cov-int msbuild PhantomSensor\PhantomSensor.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64 /p:InfVerif_Enable=false /p:InfVerif_NoError=true
+          
           $tuCount = (Get-ChildItem -Path "cov-int\emit" -Recurse -File -ErrorAction SilentlyContinue).Count
           if ($tuCount -eq 0) { Write-Error "cov-build emitted 0 translation units - build failed"; exit 1 }
-          Write-Host "cov-build captured $tuCount emit files - ready for upload"
+          Write-Host "cov-build captured $tuCount emit files"
       
       - name: Submit to Coverity
         shell: powershell
         run: |
-          Write-Host "Creating archive..."
-          tar -czf cov-int.tar.gz cov-int
+          Write-Host "Creating ZIP archive..."
+          # Klasörü düzgünce zipleyelim
+          Compress-Archive -Path "cov-int" -DestinationPath "cov-int.zip" -Force
           
-          $fileSize = (Get-Item "cov-int.tar.gz").Length / 1MB
+          $fileSize = (Get-Item "cov-int.zip").Length / 1MB
           Write-Host "Archive size: $([math]::Round($fileSize, 2)) MB"
           
           Write-Host "Submitting to Coverity Scan..."
           $token = "${{ secrets.COVERITY_SCAN_TOKEN }}"
           $email = "${{ secrets.COVERITY_SCAN_EMAIL }}"
           
-          curl.exe --form "token=${token}" `
+          # Project parametresi eklendi ve dosya formatı ZIP olarak güncellendi
+          curl.exe --fail --show-error `
+                   --form "token=${token}" `
                    --form "email=${email}" `
-                   --form "file=@cov-int.tar.gz" `
+                   --form "project=ShadowStrike-Labs/ShadowStrike" `
+                   --form "file=@cov-int.zip" `
                    --form "version=${{ github.sha }}" `
                    --form "description=PhantomSensor Kernel Driver - ${{ github.ref_name }}" `
                    https://scan.coverity.com/builds
