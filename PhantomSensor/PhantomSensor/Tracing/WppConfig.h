@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -34,7 +36,7 @@
  * - Convenience macros for common trace patterns
  *
  * WPP preprocessor directives (control GUIDs, WPP_DEFINE_BIT,
- * FUNC definitions, CUSTOM_TYPE) belong in Trace.h — not here.
+ * FUNC definitions, CUSTOM_TYPE) belong in Trace.h â€” not here.
  *
  * Implementation is in Trace.c (sole implementation file).
  *
@@ -56,7 +58,7 @@ extern "C" {
 #include <ntddk.h>
 
 // ============================================================================
-// TRACE LEVELS — Extended beyond standard WPP levels
+// TRACE LEVELS â€” Extended beyond standard WPP levels
 // ============================================================================
 
 #ifndef TRACE_LEVEL_NONE
@@ -78,7 +80,7 @@ extern "C" {
 #define TRACE_LEVEL_VERBOSE     5   ///< Detailed diagnostic information
 #endif
 
-/// Extended levels (6–10) for security/EDR use.
+/// Extended levels (6â€“10) for security/EDR use.
 #define TRACE_LEVEL_SECURITY    6   ///< Security-relevant events
 #define TRACE_LEVEL_AUDIT       7   ///< Audit trail events
 #define TRACE_LEVEL_DEBUG       8   ///< Debug-only messages
@@ -86,10 +88,10 @@ extern "C" {
 #define TRACE_LEVEL_RESERVED    10  ///< Maximum valid level
 
 // ============================================================================
-// TRACE FLAGS — Component-specific filtering
+// TRACE FLAGS â€” Component-specific filtering
 // ============================================================================
 
-/// Core component flags (bits 0–8 match Trace.h WPP_DEFINE_BIT order).
+/// Core component flags (bits 0â€“8 match Trace.h WPP_DEFINE_BIT order).
 #define TRACE_FLAG_GENERAL      0x00000001
 #define TRACE_FLAG_FILTER       0x00000002
 #define TRACE_FLAG_SCAN         0x00000004
@@ -100,7 +102,7 @@ extern "C" {
 #define TRACE_FLAG_SELFPROT     0x00000080
 #define TRACE_FLAG_CACHE        0x00000100
 
-/// Extended flags (bits 9–19).
+/// Extended flags (bits 9â€“19).
 #define TRACE_FLAG_MEMORY       0x00000200
 #define TRACE_FLAG_THREAD       0x00000400
 #define TRACE_FLAG_IMAGE        0x00000800
@@ -123,9 +125,9 @@ extern "C" {
 // POOL TAGS
 // ============================================================================
 
-#define WPP_POOL_TAG_TRACE      'rTsS'  ///< SsTr — Trace buffer
-#define WPP_POOL_TAG_FORMAT     'fTsS'  ///< SsTf — Format string
-#define WPP_POOL_TAG_CONTEXT    'cTsS'  ///< SsTc — Trace context
+#define WPP_POOL_TAG_TRACE      'rTsS'  ///< SsTr â€” Trace buffer
+#define WPP_POOL_TAG_FORMAT     'fTsS'  ///< SsTf â€” Format string
+#define WPP_POOL_TAG_CONTEXT    'cTsS'  ///< SsTc â€” Trace context
 
 // ============================================================================
 // RUNTIME CONFIGURATION STRUCTURES
@@ -148,7 +150,7 @@ extern "C" {
  *
  *   ShadowStrike uses a BAND-PASS filter because it extends levels beyond
  *   VERBOSE (Security=6, Audit=7, Debug=8, Perf=9). The band-pass lets
- *   production configs admit levels 1–7 while excluding 8–9 (debug/perf).
+ *   production configs admit levels 1â€“7 while excluding 8â€“9 (debug/perf).
  *
  *   Default: MinimumLevel=TRACE_LEVEL_CRITICAL(1), MaximumLevel=TRACE_LEVEL_AUDIT(7).
  *   This admits ALL production-relevant levels, excluding debug/perf.
@@ -233,7 +235,7 @@ typedef enum _WPP_COMPONENT_ID {
 } WPP_COMPONENT_ID;
 
 // ============================================================================
-// LEVEL NAME COUNT — compile-time sync guard
+// LEVEL NAME COUNT â€” compile-time sync guard
 // ============================================================================
 
 #define WPP_LEVEL_NAME_COUNT    10  ///< Must match LevelNames[] in Trace.c
@@ -248,7 +250,7 @@ typedef enum _WPP_COMPONENT_ID {
  * Calls WPP_INIT_TRACING internally. Must be called during DriverEntry
  * before any trace macros are invoked.
  *
- * NOTE: Placed in INIT section — do NOT call after DriverEntry returns.
+ * NOTE: Placed in INIT section â€” do NOT call after DriverEntry returns.
  *
  * @irql PASSIVE_LEVEL
  */
@@ -531,7 +533,7 @@ WppFormatTimestamp(
     );
 
 // ============================================================================
-// NAME LOOKUP (regular functions — avoid inline static array duplication)
+// NAME LOOKUP (regular functions â€” avoid inline static array duplication)
 // ============================================================================
 
 /** @irql <= DISPATCH_LEVEL */

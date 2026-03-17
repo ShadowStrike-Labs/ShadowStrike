@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -38,9 +40,9 @@
  *
  * Thread Safety:
  * - Level/callback changes: EX_PUSH_LOCK (PASSIVE_LEVEL)
- * - Event list: KSPIN_LOCK (≤ DISPATCH_LEVEL)
+ * - Event list: KSPIN_LOCK (â‰¤ DISPATCH_LEVEL)
  * - OB callback lifetime: EX_RUNDOWN_REF
- * - Protected PID table: KSPIN_LOCK (≤ DISPATCH_LEVEL)
+ * - Protected PID table: KSPIN_LOCK (â‰¤ DISPATCH_LEVEL)
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0 (Enterprise Edition)
@@ -74,7 +76,7 @@ extern "C" {
 /** @brief Maximum simultaneously protected PIDs. */
 #define AU_MAX_PROTECTED_PIDS 32
 
-/** @brief Process image name max length (PsGetProcessImageFileName returns ≤ 15). */
+/** @brief Process image name max length (PsGetProcessImageFileName returns â‰¤ 15). */
 #define AU_PROCESS_NAME_LEN 16
 
 // ============================================================================
@@ -85,7 +87,7 @@ extern "C" {
  * @brief Protection levels.
  *
  * Only two real levels: Basic (DriverUnload = NULL) and Full (+ OB callbacks).
- * No unimplemented levels — every value has concrete behavior.
+ * No unimplemented levels â€” every value has concrete behavior.
  */
 typedef enum _AU_PROTECTION_LEVEL {
     AuLevel_None  = 0,  /**< No protection active. */
@@ -108,7 +110,7 @@ typedef enum _AU_UNLOAD_ATTEMPT {
 /**
  * @brief Unload attempt event.
  *
- * Flat structure with no pointers — safe for deep copy and for
+ * Flat structure with no pointers â€” safe for deep copy and for
  * return from AuGetEvents. ProcessName uses fixed CHAR buffer
  * from PsGetProcessImageFileName (max 15 chars + NUL).
  */
@@ -120,7 +122,7 @@ typedef struct _AU_UNLOAD_EVENT {
     LARGE_INTEGER     Timestamp;
     BOOLEAN           WasBlocked;
 
-    LIST_ENTRY        ListEntry; /**< Internal — not valid after AuGetEvents copy. */
+    LIST_ENTRY        ListEntry; /**< Internal â€” not valid after AuGetEvents copy. */
 } AU_UNLOAD_EVENT, *PAU_UNLOAD_EVENT;
 
 /**
@@ -158,7 +160,7 @@ typedef BOOLEAN (*AU_UNLOAD_CALLBACK)(
  * - RundownRef (EX_RUNDOWN_REF): acquired in OB callbacks, waited on in AuShutdown.
  *   Ensures no in-flight callbacks when protector is freed.
  *
- * Lock ordering: ConfigLock → PidLock → EventLock
+ * Lock ordering: ConfigLock â†’ PidLock â†’ EventLock
  */
 typedef struct _AU_PROTECTOR {
     /** @brief TRUE after AuInitialize succeeds. */
@@ -332,7 +334,7 @@ VOID AuUnprotectProcess(
  *
  * Copies up to Max events into the caller-provided buffer.
  * Events are ordered newest-first. The returned events are
- * independent copies — no lifetime dependency on the protector.
+ * independent copies â€” no lifetime dependency on the protector.
  *
  * @param Protector  Protector handle.
  * @param Events     Caller-allocated array of AU_UNLOAD_EVENT.

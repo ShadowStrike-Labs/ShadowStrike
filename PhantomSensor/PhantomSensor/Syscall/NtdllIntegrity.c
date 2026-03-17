@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -215,7 +217,7 @@ typedef struct _NI_MONITOR_INTERNAL {
 
 //
 // Helpers: acquire/release rundown protection for safe shutdown.
-// ExAcquireRundownProtection is atomic — no window between check and increment.
+// ExAcquireRundownProtection is atomic â€” no window between check and increment.
 // This replaces the manual ActiveOperations+DrainEvent pattern which had a UAF
 // race where shutdown could free the monitor between Initialized check and
 // InterlockedIncrement.
@@ -404,7 +406,7 @@ Return Value:
     *Monitor = NULL;
 
     //
-    // Allocate internal monitor structure from paged pool — all access is
+    // Allocate internal monitor structure from paged pool â€” all access is
     // at PASSIVE_LEVEL so no need to consume precious non-paged pool.
     //
     monitorInternal = (PNI_MONITOR_INTERNAL)ShadowStrikeAllocatePoolWithTag(
@@ -431,7 +433,7 @@ Return Value:
     ExInitializeRundownProtection(&monitor->RundownRef);
 
     //
-    // Initialize lookaside lists (paged — all callers at PASSIVE_LEVEL)
+    // Initialize lookaside lists (paged â€” all callers at PASSIVE_LEVEL)
     //
     ExInitializePagedLookasideList(
         &monitorInternal->ProcessLookaside,
@@ -530,7 +532,7 @@ Arguments:
     ExWaitForRundownProtectionRelease(&Monitor->RundownRef);
 
     //
-    // All operations drained — collect process states for cleanup
+    // All operations drained â€” collect process states for cleanup
     //
     InitializeListHead(&statesToFree);
 
@@ -1409,7 +1411,7 @@ Return Value:
     }
 
     //
-    // Allocate image buffer from paged pool — zero-initialized so BSS
+    // Allocate image buffer from paged pool â€” zero-initialized so BSS
     // sections and padding regions contain zeroes (matches loader behavior)
     //
     imageBuffer = ShadowStrikeAllocatePoolWithTag(
@@ -1426,7 +1428,7 @@ Return Value:
 
     //
     // Copy PE headers (SizeOfHeaders includes DOS header, NT headers,
-    // section table — bounded by both file size and image size)
+    // section table â€” bounded by both file size and image size)
     //
     headersSize = (SIZE_T)ntHeaders->OptionalHeader.SizeOfHeaders;
     if (headersSize > FileSize) {
@@ -1542,7 +1544,7 @@ Routine Description:
     ULONG_PTR textRva = 0;
 
     //
-    // Read raw ntdll.dll from disk — trusted baseline
+    // Read raw ntdll.dll from disk â€” trusted baseline
     //
     status = NipReadNtdllFromDisk(&rawFile, &rawSize);
     if (!NT_SUCCESS(status)) {
@@ -1559,7 +1561,7 @@ Routine Description:
     status = NipRemapFileToImage(rawFile, rawSize, &cleanCopy, &cleanSize);
 
     //
-    // Free the raw file immediately — only the remapped image is needed
+    // Free the raw file immediately â€” only the remapped image is needed
     //
     ShadowStrikeFreePoolWithTag(rawFile, NI_POOL_TAG_NTDLL);
 
@@ -1607,7 +1609,7 @@ Routine Description:
 
     if (!NT_SUCCESS(status)) {
         //
-        // Hash failure is tracked — NiCompareToClean will check this flag
+        // Hash failure is tracked â€” NiCompareToClean will check this flag
         //
         RtlZeroMemory(MonitorInternal->CleanTextHash, sizeof(MonitorInternal->CleanTextHash));
         MonitorInternal->Monitor.CleanHashValid = FALSE;
@@ -1631,7 +1633,7 @@ Routine Description:
 
     if (!NT_SUCCESS(status)) {
         //
-        // Export parsing failure is critical — cannot monitor functions
+        // Export parsing failure is critical â€” cannot monitor functions
         //
         ShadowStrikeFreePoolWithTag(cleanCopy, NI_POOL_TAG_NTDLL);
         MonitorInternal->Monitor.CleanNtdllCopy = NULL;
@@ -1689,7 +1691,7 @@ Routine Description:
     }
 
     //
-    // Reject terminated processes — PEB/LDR structures may be torn down.
+    // Reject terminated processes â€” PEB/LDR structures may be torn down.
     // KeStackAttachProcess on a terminating process risks accessing
     // partially-freed loader data (even with SEH, early rejection is cleaner).
     //
@@ -1809,7 +1811,7 @@ NipReadProcessMemory(
 Routine Description:
 
     Safely reads memory from a process's address space.
-    Uses SEH to handle faults — MmIsAddressValid is NOT used as it
+    Uses SEH to handle faults â€” MmIsAddressValid is NOT used as it
     is fundamentally racy (TOCTOU) and cannot protect multi-page reads.
 
 --*/
@@ -1840,7 +1842,7 @@ Routine Description:
     }
 
     //
-    // Reject terminated processes — address space may be partially torn down
+    // Reject terminated processes â€” address space may be partially torn down
     //
     if (ShadowStrikeIsProcessTerminating(process)) {
         ObDereferenceObject(process);
@@ -2173,7 +2175,7 @@ Routine Description:
 
         if (RtlCompareMemory(exportName, FunctionName, nameLen + 1) == nameLen + 1) {
             //
-            // Found it — validate ordinal is within functions array
+            // Found it â€” validate ordinal is within functions array
             //
             ordinal = addressOfOrdinals[i];
 
@@ -2243,14 +2245,14 @@ Routine Description:
     }
 
     //
-    // Check for JMP rel32 (E9 xx xx xx xx) — most common inline hook
+    // Check for JMP rel32 (E9 xx xx xx xx) â€” most common inline hook
     //
     if (CurrentPrologue[0] == NI_JMP_REL32_OPCODE) {
         return NiMod_HookInstalled;
     }
 
     //
-    // Check for CALL rel32 (E8 xx xx xx xx) — used to evade JMP-only detection.
+    // Check for CALL rel32 (E8 xx xx xx xx) â€” used to evade JMP-only detection.
     // A CALL redirects execution identically for hooking purposes; the return
     // address pushed on the stack is consumed by the trampoline.
     //
@@ -2259,7 +2261,7 @@ Routine Description:
     }
 
     //
-    // Check for JMP short (EB xx) — 2-byte near jump used in hotpatch hooks
+    // Check for JMP short (EB xx) â€” 2-byte near jump used in hotpatch hooks
     //
     if (CurrentPrologue[0] == 0xEB) {
         return NiMod_HookInstalled;
@@ -2292,7 +2294,7 @@ Routine Description:
     }
 
     //
-    // Check for PUSH imm64 + RET pattern — only flag as hook if the expected
+    // Check for PUSH imm64 + RET pattern â€” only flag as hook if the expected
     // prologue does NOT start with the same PUSH register (reduces false
     // positives from ICF / tail-call optimizations)
     //
@@ -2326,7 +2328,7 @@ Routine Description:
         }
 
         //
-        // Syscall stub exists but bytes differ — instruction patch
+        // Syscall stub exists but bytes differ â€” instruction patch
         //
         if (!NipValidateSyscallStub(CurrentPrologue, ExpectedPrologue, Size)) {
             return NiMod_InstructionPatch;
@@ -2580,7 +2582,7 @@ Routine Description:
     }
 
     //
-    // ShadowStrikeComputeSha256 takes ULONG Length — validate no truncation
+    // ShadowStrikeComputeSha256 takes ULONG Length â€” validate no truncation
     //
     if (TextSize > MAXULONG) {
         return STATUS_INTEGER_OVERFLOW;
@@ -2712,7 +2714,7 @@ Routine Description:
     }
 
     //
-    // Allocate buffer (paged pool — only accessed at PASSIVE_LEVEL)
+    // Allocate buffer (paged pool â€” only accessed at PASSIVE_LEVEL)
     //
     buffer = ShadowStrikeAllocatePoolWithTag(
         PagedPool,

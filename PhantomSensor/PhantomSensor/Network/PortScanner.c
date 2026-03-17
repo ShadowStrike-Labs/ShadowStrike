@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -99,8 +101,8 @@
 // Confidence score weights
 //
 //
-// Confidence scoring weights — each factor normalized to [0..30] range
-// so no single factor can saturate the 0–100 confidence score alone.
+// Confidence scoring weights â€” each factor normalized to [0..30] range
+// so no single factor can saturate the 0â€“100 confidence score alone.
 //
 #define SSPS_WEIGHT_UNIQUE_PORTS          1
 #define SSPS_WEIGHT_UNIQUE_HOSTS          1
@@ -704,13 +706,13 @@ Routine Description:
     }
 
     //
-    // Phase 1: Signal shutdown — reject new operations
+    // Phase 1: Signal shutdown â€” reject new operations
     //
     InterlockedExchange(&Detector->ShuttingDown, 1);
     InterlockedExchange(&Detector->Initialized, 0);
 
     //
-    // Phase 2: Cancel TimerManager timer (synchronous — waits for in-flight callback)
+    // Phase 2: Cancel TimerManager timer (synchronous â€” waits for in-flight callback)
     //
     if (Detector->CleanupTimerId != 0) {
         PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
@@ -965,7 +967,7 @@ Routine Description:
     *Result = NULL;
 
     //
-    // Skip excluded processes — enterprise policy override.
+    // Skip excluded processes â€” enterprise policy override.
     //
     if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
         return STATUS_SUCCESS;
@@ -1293,7 +1295,7 @@ SspsRecordUniquePort(
 /*++
 Routine Description:
     Records a unique port. Uses hash table for O(1) lookup.
-    All writes happen under exclusive lock — no shared-lock writes.
+    All writes happen under exclusive lock â€” no shared-lock writes.
 --*/
 {
     PLIST_ENTRY Bucket;
@@ -1622,7 +1624,7 @@ Routine Description:
 }
 
 //
-// Reverse of SspsClassifyTcpFlags — decrements the counter that was
+// Reverse of SspsClassifyTcpFlags â€” decrements the counter that was
 // incremented when the record was inserted.  Called during eviction and
 // time-window expiry so that sliding-window TCP-flag ratios stay accurate.
 //
@@ -2088,7 +2090,7 @@ SspsCleanupTimerCallback(
     )
 /*++
 Routine Description:
-    TimerManager callback — runs at PASSIVE_LEVEL.
+    TimerManager callback â€” runs at PASSIVE_LEVEL.
     Safely acquires push locks, walks the source list, and removes
     expired source contexts with zero reference count.
 

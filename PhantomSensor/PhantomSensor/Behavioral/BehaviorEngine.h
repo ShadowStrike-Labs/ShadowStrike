@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -329,7 +331,7 @@ typedef struct _BEHAVIOR_ENGINE_GLOBALS {
     BOOLEAN Enabled;
     UINT16 Reserved1;
     
-    // Rundown protection — prevents shutdown from freeing resources
+    // Rundown protection â€” prevents shutdown from freeing resources
     // while in-flight operations are still using them
     EX_RUNDOWN_REF RundownRef;
     

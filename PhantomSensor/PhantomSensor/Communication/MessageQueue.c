@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -244,7 +246,7 @@ MqpIsRunning(
     )
 {
     //
-    // Simple volatile read — a CAS-as-read here would interfere with
+    // Simple volatile read â€” a CAS-as-read here would interfere with
     // shutdown transitions by rewriting MqState_Running back.
     //
     return (ReadNoFence((volatile LONG*)&g_MqGlobals.State) == MqState_Running);
@@ -542,7 +544,7 @@ MqShutdown(
 
             //
             // Release list's reference (waiter still has one).
-            // If refcount hits 0, waiter already released — collect for deferred free.
+            // If refcount hits 0, waiter already released â€” collect for deferred free.
             //
             if (InterlockedDecrement(&completion->RefCount) == 0) {
                 completion->Magic = 0;
@@ -583,7 +585,7 @@ MqShutdown(
 
     //
     // Wait for all outstanding completions to be released.
-    // Waiters have been signaled (STATUS_CANCELLED) — they MUST complete.
+    // Waiters have been signaled (STATUS_CANCELLED) â€” they MUST complete.
     // We wait indefinitely because deleting the lookaside while completions
     // are outstanding would cause pool corruption / BSOD.
     //
@@ -605,11 +607,11 @@ MqShutdown(
                               g_MqGlobals.OutstandingCompletions, waitAttempts);
                 //
                 // Safety: after 6 attempts (60 seconds total), something is
-                // fundamentally broken. Log loudly but keep waiting — BSOD from
+                // fundamentally broken. Log loudly but keep waiting â€” BSOD from
                 // lookaside deletion is worse than a slow shutdown.
                 //
                 if (waitAttempts >= 6) {
-                    MQ_LOG_ERROR("WARNING: Completion drain stalled — potential deadlock. "
+                    MQ_LOG_ERROR("WARNING: Completion drain stalled â€” potential deadlock. "
                                  "Still %d outstanding. Continuing to wait.",
                                  g_MqGlobals.OutstandingCompletions);
                 }
@@ -1131,7 +1133,7 @@ MqEnqueueMessageAndWait(
     //
     // Handle wait result.
     // Read the completion state atomically. Using ReadNoFence on the
-    // volatile LONG is sufficient here — the KeWaitForSingleObject
+    // volatile LONG is sufficient here â€” the KeWaitForSingleObject
     // return already provides the acquire barrier.
     //
     completionState = (MQ_COMPLETION_STATE)ReadNoFence(&pendingCompletion->State);
@@ -1456,7 +1458,7 @@ MqCompleteMessage(
             KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
         } else {
             //
-            // Allocation failed — complete with error status but no response data
+            // Allocation failed â€” complete with error status but no response data
             //
             MQ_LOG_ERROR("Failed to allocate %u byte response buffer for message %llu",
                          copySize, (unsigned long long)MessageId);
@@ -2182,7 +2184,7 @@ MqpDetachPendingCompletion(
  * completion was allocated but never inserted into g_PendingCompletionList
  * and never had OutstandingCompletions incremented.
  *
- * MUST NOT call MqpReleasePendingCompletion here — that would decrement
+ * MUST NOT call MqpReleasePendingCompletion here â€” that would decrement
  * OutstandingCompletions which was never incremented, corrupting the
  * counter and potentially causing shutdown to skip waiting for real
  * outstanding completions (use-after-free risk).
@@ -2255,7 +2257,7 @@ MqpCleanupExpiredCompletions(
 
             if (previousState == MqCompletionState_Pending) {
                 //
-                // Successfully transitioned — signal timeout, then remove from
+                // Successfully transitioned â€” signal timeout, then remove from
                 // the global list and collect for deferred reference release.
                 //
                 completion->CompletionStatus = STATUS_TIMEOUT;

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -51,8 +53,8 @@ extern "C" {
 #include <ntifs.h>
 #include <ntddk.h>
 #pragma warning(push)
-#pragma warning(disable:4201)   // nameless struct/union — ndis.h
-#pragma warning(disable:4324)   // structure padded — ndis.h / fltKernel.h
+#pragma warning(disable:4201)   // nameless struct/union â€” ndis.h
+#pragma warning(disable:4324)   // structure padded â€” ndis.h / fltKernel.h
 #ifndef NDIS_SUPPORT_NDIS650
 #define NDIS_SUPPORT_NDIS650 1
 #endif
@@ -60,7 +62,7 @@ extern "C" {
 #pragma warning(pop)
 #include <fwpsk.h>
 #pragma warning(push)
-#pragma warning(disable:4324)   // structure padded — fltKernel.h via NetworkTypes.h
+#pragma warning(disable:4324)   // structure padded â€” fltKernel.h via NetworkTypes.h
 #include <fwpmk.h>
 #include "../../Shared/NetworkTypes.h"
 #pragma warning(pop)
@@ -159,7 +161,7 @@ typedef struct _CT_FLOW_STATS {
     ULONG PeakRecvRate;
 
     //
-    // Timing — use InterlockedExchange64 for LastPacketTime
+    // Timing â€” use InterlockedExchange64 for LastPacketTime
     //
     LARGE_INTEGER FirstPacketTime;
     volatile LONG64 LastPacketTime;      // 100ns ticks, atomic
@@ -180,7 +182,7 @@ typedef struct _CT_CONNECTION {
     UINT16 LayerId;                     // WFP layer
 
     //
-    // Connection details — State and Flags are volatile for atomic access
+    // Connection details â€” State and Flags are volatile for atomic access
     //
     volatile LONG State;                // CT_CONNECTION_STATE via InterlockedExchange
     CT_DIRECTION Direction;
@@ -208,7 +210,7 @@ typedef struct _CT_CONNECTION {
     CHAR RemoteHostname[256];           // If resolved
 
     //
-    // Process context — ProcessId is immutable after creation.
+    // Process context â€” ProcessId is immutable after creation.
     // ProcessContextRef is a referenced pointer; holds a refcount
     // on the CT_PROCESS_CONTEXT it points to. Only accessed/cleared
     // under the global connection list lock or during final free.
@@ -224,7 +226,7 @@ typedef struct _CT_CONNECTION {
     CT_FLOW_STATS Stats;
 
     //
-    // TLS information (allocated on demand — NULL if no TLS)
+    // TLS information (allocated on demand â€” NULL if no TLS)
     //
     struct _CT_TLS_INFO* TlsInfo;
 
@@ -242,7 +244,7 @@ typedef struct _CT_CONNECTION {
     ULONG SuspicionFlags;
 
     //
-    // Reference counting — free on drop to zero
+    // Reference counting â€” free on drop to zero
     //
     volatile LONG RefCount;
 
@@ -252,7 +254,7 @@ typedef struct _CT_CONNECTION {
     struct _CT_TRACKER* OwnerTracker;
 
     //
-    // List linkage — each entry is for exactly one list
+    // List linkage â€” each entry is for exactly one list
     //
     LIST_ENTRY GlobalListEntry;
     LIST_ENTRY ProcessListEntry;
@@ -319,7 +321,7 @@ typedef struct _CT_PROCESS_CONTEXT {
     volatile LONG RefCount;
 
     //
-    // List linkage — separate entries for hash and global list
+    // List linkage â€” separate entries for hash and global list
     //
     LIST_ENTRY HashListEntry;           // ProcessHash bucket
     LIST_ENTRY GlobalListEntry;         // Public.ProcessList
@@ -407,7 +409,7 @@ typedef struct _CT_TRACKER {
 // Callback Types
 //=============================================================================
 
-// WARNING: Callbacks MUST NOT call back into any Ct* API — deadlock will result.
+// WARNING: Callbacks MUST NOT call back into any Ct* API â€” deadlock will result.
 typedef VOID (*CT_CONNECTION_CALLBACK)(
     _In_ PCT_CONNECTION Connection,
     _In_ CT_CONNECTION_STATE OldState,

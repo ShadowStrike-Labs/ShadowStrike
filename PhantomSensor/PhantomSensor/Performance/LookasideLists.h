@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -228,7 +230,7 @@ typedef BOOLEAN (*LL_ENUM_CALLBACK)(
 /**
  * @brief Central lookaside list manager
  *
- * Uses EX_RUNDOWN_REF for safe shutdown — all public APIs acquire
+ * Uses EX_RUNDOWN_REF for safe shutdown â€” all public APIs acquire
  * rundown protection; shutdown waits for all ops to complete.
  */
 typedef struct _LL_MANAGER {
@@ -274,7 +276,7 @@ typedef struct _LL_MANAGER {
  *
  * @irql PASSIVE_LEVEL
  *
- * @note NOT placed in INIT segment — safe to call after DriverEntry.
+ * @note NOT placed in INIT segment â€” safe to call after DriverEntry.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_

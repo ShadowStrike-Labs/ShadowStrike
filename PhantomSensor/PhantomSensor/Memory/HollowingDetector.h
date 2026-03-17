@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -208,7 +210,7 @@ typedef struct _PH_DETECTOR {
     } Config;
     
     //
-    // Statistics (approximate — individual fields are atomic,
+    // Statistics (approximate â€” individual fields are atomic,
     // but cross-field consistency is NOT guaranteed)
     //
     struct {

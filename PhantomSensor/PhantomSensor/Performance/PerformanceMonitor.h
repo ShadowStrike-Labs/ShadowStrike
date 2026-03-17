@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -80,7 +82,7 @@ typedef enum _SSPM_METRIC_TYPE {
     SsPmMetric_DroppedEvents,           // Dropped event counter
     SsPmMetric_CpuTimeBps,             // CPU time in basis points (0-10000)
     SsPmMetric_IOOperations,            // I/O operation counter
-    SsPmMetric_Count                    // Sentinel — MUST be last
+    SsPmMetric_Count                    // Sentinel â€” MUST be last
 } SSPM_METRIC_TYPE;
 
 //
@@ -125,7 +127,7 @@ typedef struct _SSPM_THRESHOLD_ALERT {
 } SSPM_THRESHOLD_ALERT, *PSSPM_THRESHOLD_ALERT;
 
 //
-// Alert callback — invoked at PASSIVE_LEVEL from TimerManager work item context.
+// Alert callback â€” invoked at PASSIVE_LEVEL from TimerManager work item context.
 //
 typedef VOID (*SSPM_ALERT_CALLBACK)(
     _In_ PSSPM_THRESHOLD_ALERT Alert,

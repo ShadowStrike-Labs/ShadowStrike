@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -580,7 +582,7 @@ TnpInitializeMonitor(
 Routine Description:
 
     Initializes the thread monitoring infrastructure.
-    Does NOT zero the entire TN_MONITOR — InitState is already set
+    Does NOT zero the entire TN_MONITOR â€” InitState is already set
     to TnStateInitializing by the caller. Zeroing it would create
     a race where a second caller could pass the CAS check.
 
@@ -953,10 +955,10 @@ Routine Description:
             }
 
             //
-            // Deep Memory Analysis — when injection indicators are present,
+            // Deep Memory Analysis â€” when injection indicators are present,
             // trigger the full memory detection pipeline:
             //   1. Shellcode scan at thread start address
-            //   2. Injection detection across source→target
+            //   2. Injection detection across sourceâ†’target
             //   3. VAD suspicious region enumeration
             // These APIs are the analysis layer atop the recording layer
             // (InjRecordOperation wired below). PASSIVE_LEVEL required.
@@ -1048,7 +1050,7 @@ Routine Description:
                 }
 
                 //
-                // MEM-ROP: ROP chain detection (T1055/T1574) — analyze the
+                // MEM-ROP: ROP chain detection (T1055/T1574) â€” analyze the
                 // thread's call stack for ROP gadget chains, stack pivots,
                 // and return-oriented programming indicators.
                 //
@@ -1179,7 +1181,7 @@ Routine Description:
             //
             // Feed remote thread creation into InjectionDetector for chain
             // correlation. CreateRemoteThread is the final step in classic
-            // injection (Alloc→Write→Thread, T1055.001). Without this,
+            // injection (Allocâ†’Writeâ†’Thread, T1055.001). Without this,
             // InjOpCreateThread never fires and chain signatures never match.
             //
             if (event->IsRemote) {
@@ -2978,15 +2980,21 @@ TnRegisterCallback(
     //
     // Wait for old entry references to drain safely.
     // Use KeDelayExecutionThread instead of YieldProcessor spin to avoid
-    // BSOD if the bounded spin exhausts — old approach freed memory
+    // BSOD if the bounded spin exhausts â€” old approach freed memory
     // while another thread could still reference it (use-after-free).
     //
     if (oldEntry != NULL) {
         LARGE_INTEGER delay;
+        ULONG drainIterations = 0;
         delay.QuadPart = -10000;    // 1ms intervals
 
         while (oldEntry->RefCount > 0) {
             KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            if (++drainIterations >= 5000) {    // 5s safety cap
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] TnRegisterCallback: refcount drain timeout\n");
+                break;
+            }
         }
         ExFreePoolWithTag(oldEntry, TN_POOL_TAG);
     }
@@ -3020,10 +3028,16 @@ TnUnregisterCallback(
         // Must not free while another thread holds a reference.
         //
         LARGE_INTEGER delay;
+        ULONG drainIterations = 0;
         delay.QuadPart = -10000;    // 1ms intervals
 
         while (oldEntry->RefCount > 0) {
             KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            if (++drainIterations >= 5000) {    // 5s safety cap
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] TnUnregisterCallback: refcount drain timeout\n");
+                break;
+            }
         }
         ExFreePoolWithTag(oldEntry, TN_POOL_TAG);
     }

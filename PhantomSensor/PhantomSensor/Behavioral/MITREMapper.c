@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -1349,7 +1351,7 @@ MmReleaseDetection(
         LONG newCount = InterlockedDecrement(&Detection->RefCount);
         if (newCount == 0) {
             //
-            // Last reference dropped — free the detection and its resources
+            // Last reference dropped â€” free the detection and its resources
             //
             MmpFreeDetection(Detection);
         }
@@ -1462,7 +1464,7 @@ MmRecordDetection(
     }
 
     //
-    // Add new detection (under spinlock — direct access is safe and consistent)
+    // Add new detection (under spinlock â€” direct access is safe and consistent)
     //
     InsertTailList(&Mapper->DetectionList, &detection->ListEntry);
     Mapper->DetectionCount++;
@@ -1472,7 +1474,7 @@ MmRecordDetection(
 
     //
     // Now release evicted detections outside of lock.
-    // Uses MmReleaseDetection to respect external references — if a caller
+    // Uses MmReleaseDetection to respect external references â€” if a caller
     // holds a reference from MmGetRecentDetections, the detection stays alive
     // until that caller releases it.
     //

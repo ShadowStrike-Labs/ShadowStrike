@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -369,7 +371,7 @@ typedef struct _SHADOWSTRIKE_EXCLUSION_STATS {
  * Shutdown safety: callers of matching functions acquire rundown
  * protection via ExAcquireRundownProtection(&RundownRef) and release
  * via ExReleaseRundownProtection(&RundownRef). Shutdown blocks in
- * ExWaitForRundownProtectionRelease until all callers drain — no
+ * ExWaitForRundownProtectionRelease until all callers drain â€” no
  * timeout, no forced free, no use-after-free.
  */
 typedef struct _SHADOWSTRIKE_EXCLUSION_MANAGER {
@@ -669,7 +671,7 @@ ShadowStrikeClearExclusions(
 /**
  * @brief Get exclusion statistics snapshot.
  *
- * The snapshot is approximate — individual fields are consistent but
+ * The snapshot is approximate â€” individual fields are consistent but
  * cross-field relationships may show slight inconsistencies due to
  * concurrent updates.
  *
@@ -694,7 +696,7 @@ ShadowStrikeExclusionResetStats(
  * @brief Load default system exclusions.
  *
  * Adds exclusions for NTFS metafiles (pagefile.sys, $Mft, etc.).
- * Does NOT add extension exclusions — no file extension is inherently safe.
+ * Does NOT add extension exclusions â€” no file extension is inherently safe.
  *
  * @irql PASSIVE_LEVEL
  */
@@ -769,7 +771,7 @@ ShadowStrikeProcessExclusionShutdown(
     );
 
 /**
- * @brief Handle process creation — check and add to trusted set.
+ * @brief Handle process creation â€” check and add to trusted set.
  *
  * @param ProcessId         New process ID
  * @param ParentProcessId   Parent process ID
@@ -786,7 +788,7 @@ ShadowStrikeOnProcessCreate(
     );
 
 /**
- * @brief Handle process termination — remove from trusted set.
+ * @brief Handle process termination â€” remove from trusted set.
  *
  * @param ProcessId     Terminating process ID
  * @irql PASSIVE_LEVEL

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -251,7 +253,7 @@ ShadowStrikeCacheInitialize(
     //
     // Initialize cleanup timer via centralized TimerManager.
     // TmFlag_WorkItemCallback ensures the callback runs at PASSIVE_LEVEL,
-    // eliminating the need for a separate DPC→WorkItem indirection.
+    // eliminating the need for a separate DPCâ†’WorkItem indirection.
     //
     {
         PTM_MANAGER timerManager = ShadowStrikeGetTimerManager();
@@ -277,7 +279,7 @@ ShadowStrikeCacheInitialize(
             }
         } else {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] ScanCache: TimerManager not available — periodic cleanup disabled\n");
+                       "[ShadowStrike] ScanCache: TimerManager not available â€” periodic cleanup disabled\n");
             g_ScanCache.CleanupTimerId = 0;
         }
     }
@@ -350,7 +352,7 @@ ShadowStrikeCacheShutdown(
 
         if (waitStatus == STATUS_TIMEOUT) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "[ShadowStrike] ScanCache: CRITICAL — shutdown wait timed out "
+                       "[ShadowStrike] ScanCache: CRITICAL â€” shutdown wait timed out "
                        "(ActiveReferences=%ld). Possible reference leak.\n",
                        g_ScanCache.ActiveReferences);
         }
@@ -590,7 +592,7 @@ ShadowStrikeCacheInsert(
     }
 
     //
-    // Check entry limit (soft cap — read is outside bucket lock for performance).
+    // Check entry limit (soft cap â€” read is outside bucket lock for performance).
     // Multiple threads may pass this check simultaneously when near the limit,
     // allowing a bounded overshoot of at most (concurrent_insert_threads - 1)
     // entries. This is acceptable: the limit is a memory budget guard, not a
@@ -1166,7 +1168,7 @@ ShadowStrikeCacheBuildKey(
 
             if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
                 //
-                // STATUS_BUFFER_OVERFLOW is acceptable — the fixed-size fields
+                // STATUS_BUFFER_OVERFLOW is acceptable â€” the fixed-size fields
                 // (including VolumeSerialNumber) are populated before the
                 // variable-length VolumeLabel.
                 //
@@ -1180,11 +1182,11 @@ ShadowStrikeCacheBuildKey(
         // caching is disabled for this file. The previous fallback derived a
         // pseudo-serial from DeviceCharacteristics XOR SectorSize, which is
         // NOT unique across volumes and enables cache poisoning via key collision.
-        // For an NGAV product, fail-secure: no unique ID → no caching.
+        // For an NGAV product, fail-secure: no unique ID â†’ no caching.
         //
         if (!haveVolumeSerial) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] ScanCache: Real volume serial unavailable — "
+                       "[ShadowStrike] ScanCache: Real volume serial unavailable â€” "
                        "caching disabled for this file (fail-secure)\n");
         }
     }
@@ -1270,7 +1272,7 @@ Routine Description:
     TimerManager callback for periodic cache cleanup. Runs at PASSIVE_LEVEL
     via TmFlag_WorkItemCallback. Replaces the old DPC->IoWorkItem pattern.
 
-    NOTE: This function must NOT touch CleanupInProgress — that guard is
+    NOTE: This function must NOT touch CleanupInProgress â€” that guard is
     owned exclusively by ShadowStrikeCacheCleanup(). Previous code set it
     here, causing ShadowStrikeCacheCleanup to see it as 1 and return
     immediately, making periodic cleanup a no-op.

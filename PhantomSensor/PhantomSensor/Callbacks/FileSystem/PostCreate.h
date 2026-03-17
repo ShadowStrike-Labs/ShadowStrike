@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -666,7 +668,7 @@ PocReleaseStreamContext(
 // ============================================================================
 
 //
-// NOTE: PocAllocateHandleContext has been removed — it allocated from
+// NOTE: PocAllocateHandleContext has been removed â€” it allocated from
 // NPAGED_LOOKASIDE_LIST (raw pool), incompatible with FltSetStreamHandleContext.
 // Use PocGetOrCreateHandleContext instead (uses FltAllocateContext correctly).
 //

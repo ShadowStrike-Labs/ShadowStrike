@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -58,7 +60,7 @@
  *    consistently WCHAR count (matching SAL annotations)
  *
  * 9. OVERFLOW SAFETY: HashiGetTimestampMicroseconds uses split arithmetic;
- *    InterlockedAdd64 caps ULONG64→LONG64 conversion
+ *    InterlockedAdd64 caps ULONG64â†’LONG64 conversion
  *
  * 10. DEAD CODE REMOVED: EX_PUSH_LOCK (never used), empty if-block, stale comments
  *
@@ -257,7 +259,7 @@ HashiEnterOperation(
     Current = InterlockedIncrement(&g_HashGlobals.Statistics.CurrentOperations);
 
     //
-    // Re-check after increment — if shutdown raced in, back out
+    // Re-check after increment â€” if shutdown raced in, back out
     //
     if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED) {
         InterlockedDecrement(&g_HashGlobals.Statistics.CurrentOperations);
@@ -299,7 +301,7 @@ HashiLeaveOperation(
 
         //
         // Cap BytesHashed to LONGLONG_MAX to avoid signed overflow in InterlockedAdd64.
-        // Cumulative counter — individual values are bounded by HASH_MAX_FILE_SIZE_LIMIT.
+        // Cumulative counter â€” individual values are bounded by HASH_MAX_FILE_SIZE_LIMIT.
         //
         if (BytesHashed > (ULONG64)MAXLONGLONG) {
             BytesHashed = (ULONG64)MAXLONGLONG;
@@ -524,7 +526,7 @@ ShadowStrikeInitializeHashUtils(
 
     if (PreviousState == HASH_STATE_SHUTTING_DOWN) {
         //
-        // Subsystem is shutting down — cannot re-initialize during teardown
+        // Subsystem is shutting down â€” cannot re-initialize during teardown
         //
         return STATUS_UNSUCCESSFUL;
     }
@@ -786,7 +788,7 @@ ShadowStrikeCleanupHashUtils(
     }
 
     //
-    // All operations drained — safe to close provider handles
+    // All operations drained â€” safe to close provider handles
     //
     for (Algorithm = ShadowHashAlgorithmSha256;
          Algorithm < ShadowHashAlgorithmCount;
@@ -810,7 +812,7 @@ ShadowStrikeCleanupHashUtils(
     }
 
     //
-    // Mark as uninitialized — re-initialization is now possible
+    // Mark as uninitialized â€” re-initialization is now possible
     //
     InterlockedExchange(&g_HashGlobals.InitializationState, HASH_STATE_UNINITIALIZED);
 }
@@ -1083,7 +1085,7 @@ ShadowStrikeComputeMultiHash(
     //
     // Compute all three hashes independently.
     // Buffer hashing is CPU-bound, not I/O-bound, so separate passes
-    // are acceptable — the data is already in memory.
+    // are acceptable â€” the data is already in memory.
     //
 
     Sha256Status = HashiComputeBufferHashInternal(
@@ -1652,7 +1654,7 @@ ShadowStrikeComputeFileMultiHash(
     );
 
     //
-    // Allocate read buffer — use aligned allocation for non-cached I/O
+    // Allocate read buffer â€” use aligned allocation for non-cached I/O
     //
     if (Flags & ShadowHashFlagNonCached) {
         pbReadBuffer = (PUCHAR)FltAllocatePoolAlignedWithTag(
@@ -1746,7 +1748,7 @@ ShadowStrikeComputeFileMultiHash(
         if (BytesRead == 0) break;
 
         //
-        // Feed data to all three hash contexts — check each return value.
+        // Feed data to all three hash contexts â€” check each return value.
         // A silent failure here would produce an incorrect hash, which for
         // a security product is worse than returning an error.
         //
@@ -2073,7 +2075,7 @@ ShadowStrikeComputeFileHashByPath(
         if (IoStatusBlock.Information == 0) break;
 
         //
-        // Check BCryptHashData return value — a silent failure here
+        // Check BCryptHashData return value â€” a silent failure here
         // would produce an incorrect hash
         //
         HashStatus = BCryptHashData(hHash, pbBuffer, (ULONG)IoStatusBlock.Information, 0);
@@ -2190,7 +2192,7 @@ ShadowStrikeHashContextInit(
     );
 
     //
-    // Provider access complete — leave operation immediately.
+    // Provider access complete â€” leave operation immediately.
     // The hash object is now self-contained.
     //
     HashiLeaveOperation(NT_SUCCESS(Status), Algorithm, 0, FALSE);
@@ -2464,7 +2466,7 @@ ShadowStrikeStringToHash(
     }
 
     //
-    // Bounded string length scan — prevent unbounded reads on malformed input.
+    // Bounded string length scan â€” prevent unbounded reads on malformed input.
     // Maximum valid hex string for MAX_HASH_SIZE is MAX_HASH_SIZE*2 chars.
     //
     StringLength = wcsnlen(String, (SIZE_T)MAX_HASH_SIZE * 2 + 1);
@@ -2481,7 +2483,7 @@ ShadowStrikeStringToHash(
     //
     // Reject input that doesn't exactly match expected hash size.
     // Silently truncating would produce a prefix-only hash, which is
-    // a security-relevant parsing bug — an attacker could craft
+    // a security-relevant parsing bug â€” an attacker could craft
     // prefix-colliding hash strings to bypass comparison.
     //
     if (BytesToWrite != HashSize) {

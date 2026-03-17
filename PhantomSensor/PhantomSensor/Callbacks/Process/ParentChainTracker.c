@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -1662,7 +1664,7 @@ PctpIsSystemProcess(
                         if (!pathValid) {
                             //
                             // Name matches a system process but path is NOT
-                            // in System32 — do not classify as system process.
+                            // in System32 â€” do not classify as system process.
                             // Caller will treat this as masquerading.
                             //
                             continue;
@@ -1953,7 +1955,7 @@ PctpAnalyzeChain(
 
     //
     // Analyze parent-child relationships in the chain.
-    // This function ONLY sets flags — scoring is done separately
+    // This function ONLY sets flags â€” scoring is done separately
     // in PctpCalculateSuspicionScore to avoid double-counting.
     //
     // Chain is ordered: leaf -> parent -> grandparent -> ... -> root
@@ -2078,7 +2080,7 @@ PctpCalculateSuspicionScore(
     // Analyze each node in the chain.
     //
     // IMPORTANT: PctpAnalyzeChain already set IsSuspicious flags on nodes
-    // based on parent-child pattern matching (Office→shell, Browser→shell,
+    // based on parent-child pattern matching (Officeâ†’shell, Browserâ†’shell,
     // LOLBin chains, ScriptHost chains, custom patterns). We do NOT re-check
     // those same parent-child patterns here to avoid double-counting.
     //
@@ -2087,7 +2089,7 @@ PctpCalculateSuspicionScore(
     //   2. Parent-child custom pattern scores from the pattern list
     //   3. Structural indicators (depth, PPID spoofing, orphan, terminated)
     //
-    // IsSuspicious is NOT scored here — it would double-count the parent-child
+    // IsSuspicious is NOT scored here â€” it would double-count the parent-child
     // checks that are already scored via the specific match scores below.
     //
     for (listEntry = Chain->ChainList.Flink;
@@ -2137,7 +2139,7 @@ PctpCalculateSuspicionScore(
                 }
 
                 //
-                // Office app spawning shell (T1566 initial access → execution)
+                // Office app spawning shell (T1566 initial access â†’ execution)
                 //
                 if (PctpIsOfficeApp(&node->ImageName) && PctpIsShell(&childNode->ImageName)) {
                     nodeScore += PCT_SCORE_OFFICE_SPAWN_SHELL;

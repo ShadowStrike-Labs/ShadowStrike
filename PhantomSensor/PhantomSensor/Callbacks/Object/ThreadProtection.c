@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -365,7 +367,7 @@ TpShutdownThreadProtection(
     //
     // Disable lookaside BEFORE freeing trackers.
     // This ensures TppFreeTracker uses pool free instead of returning to
-    // a lookaside list that is about to be deleted — prevents BSOD if
+    // a lookaside list that is about to be deleted â€” prevents BSOD if
     // shutdown drain timed out and in-flight threads call TppAllocateTracker.
     //
     lookasideWasActive =
@@ -373,7 +375,7 @@ TpShutdownThreadProtection(
 
     //
     // Free all activity trackers using bounded free-list pattern.
-    // Collect under spinlock, free after release — avoids IRQL issues.
+    // Collect under spinlock, free after release â€” avoids IRQL issues.
     //
     {
         LIST_ENTRY freeList;
@@ -1787,12 +1789,12 @@ TppTakeTrackerSnapshot(
     Snapshot->SuspendAccessCount = Tracker->SuspendAccessCount;
     Snapshot->UniqueThreadCount = (ULONG)Tracker->UniqueThreadCount;
     Snapshot->UniqueProcessCount = (ULONG)Tracker->UniqueProcessCount;
-    Snapshot->HasSuspendPattern = (BOOLEAN)Tracker->HasSuspendPattern;
-    Snapshot->HasContextPattern = (BOOLEAN)Tracker->HasContextPattern;
-    Snapshot->HasAPCPattern = (BOOLEAN)Tracker->HasAPCPattern;
-    Snapshot->HasEnumerationPattern = (BOOLEAN)Tracker->HasEnumerationPattern;
-    Snapshot->IsRateLimited = (BOOLEAN)Tracker->IsRateLimited;
-    Snapshot->IsBlacklisted = (BOOLEAN)Tracker->IsBlacklisted;
+    Snapshot->HasSuspendPattern = (Tracker->HasSuspendPattern != 0);
+    Snapshot->HasContextPattern = (Tracker->HasContextPattern != 0);
+    Snapshot->HasAPCPattern = (Tracker->HasAPCPattern != 0);
+    Snapshot->HasEnumerationPattern = (Tracker->HasEnumerationPattern != 0);
+    Snapshot->IsRateLimited = (Tracker->IsRateLimited != 0);
+    Snapshot->IsBlacklisted = (Tracker->IsBlacklisted != 0);
 }
 
 // ============================================================================
@@ -1955,7 +1957,7 @@ TppBuildOperationContext(
         Context->OperationType = TpOperationUnknown;
     }
 
-    Context->IsKernelHandle = (BOOLEAN)OperationInfo->KernelHandle;
+    Context->IsKernelHandle = (OperationInfo->KernelHandle != 0);
 
     //
     // Source information
@@ -2070,5 +2072,5 @@ TppShouldLogOperation(
 // LEGACY CALLBACK WRAPPER
 // ============================================================================
 
-// Legacy wrapper ShadowStrikeThreadPreCallback removed — canonical
+// Legacy wrapper ShadowStrikeThreadPreCallback removed â€” canonical
 // implementation is in ObjectCallback.c

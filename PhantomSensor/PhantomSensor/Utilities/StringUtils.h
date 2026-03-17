@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -594,7 +596,7 @@ ShadowStrikeHashBytes(
  *
  * @param String            Null-terminated ANSI string
  * @param MaxLength         Maximum characters to hash (prevents overrun)
- * @param CaseInsensitive   TRUE to fold A-Z → a-z before hashing
+ * @param CaseInsensitive   TRUE to fold A-Z â†’ a-z before hashing
  *
  * @return 32-bit hash value
  *

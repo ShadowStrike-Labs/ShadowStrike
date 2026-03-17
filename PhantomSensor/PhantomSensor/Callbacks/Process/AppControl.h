@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -32,9 +34,9 @@ Provides enterprise application allowlisting/blocklisting:
   - Parent-child chain validation
 
 Integration Points:
-  - ProcessNotify (create) → AcCheckProcessExecution()
-  - ImageNotify → AcCheckImageLoad()
-  - DriverEntry → AcInitialize() / AcShutdown()
+  - ProcessNotify (create) â†’ AcCheckProcessExecution()
+  - ImageNotify â†’ AcCheckImageLoad()
+  - DriverEntry â†’ AcInitialize() / AcShutdown()
 
 MITRE ATT&CK Coverage:
   - M1038: Execution Prevention
@@ -160,7 +162,7 @@ typedef struct _AC_STATISTICS {
 } AC_STATISTICS, *PAC_STATISTICS;
 
 // ============================================================================
-// PUBLIC API — LIFECYCLE
+// PUBLIC API â€” LIFECYCLE
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -173,7 +175,7 @@ VOID
 AcShutdown(VOID);
 
 // ============================================================================
-// PUBLIC API — EXECUTION CHECKS
+// PUBLIC API â€” EXECUTION CHECKS
 // ============================================================================
 
 /**
@@ -217,7 +219,7 @@ AcCheckImageLoad(
     );
 
 // ============================================================================
-// PUBLIC API — QUERY
+// PUBLIC API â€” QUERY
 // ============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

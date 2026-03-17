@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -72,7 +74,7 @@
 
 //
 // ALPC-specific behavior event types in the IPC range (0x0906-0x090B).
-// ALPC behavior event types — canonical definitions in BehaviorTypes.h
+// ALPC behavior event types â€” canonical definitions in BehaviorTypes.h
 #define BEHAVIOR_EVENT_ALPC_BLOCKED         ((BEHAVIOR_EVENT_TYPE)BehaviorEvent_AlpcBlocked)
 #define BEHAVIOR_EVENT_ALPC_SUSPICIOUS      ((BEHAVIOR_EVENT_TYPE)BehaviorEvent_AlpcSuspicious)
 #define BEHAVIOR_EVENT_ALPC_CROSS_SESSION   ((BEHAVIOR_EVENT_TYPE)BehaviorEvent_AlpcCrossSession)
@@ -859,7 +861,7 @@ ShadowAlpcTrackPort(
         // terminated during tracking). Default to SYSTEM integrity and
         // session 0 (fail-secure). Without this, RtlZeroMemory leaves
         // OwnerIntegrityLevel=0 (UNTRUSTED) which suppresses cross-integrity
-        // detection — a privilege escalation vector.
+        // detection â€” a privilege escalation vector.
         //
         portEntry->OwnerIntegrityLevel = SECURITY_MANDATORY_SYSTEM_RID;
         portEntry->OwnerSessionId = 0;
@@ -1142,7 +1144,7 @@ ShadowAlpcProcessTerminated(
 
     //
     // Scan all hash buckets for ports owned by the terminated process.
-    // Lock hierarchy: hash bucket → global list (same as cleanup path).
+    // Lock hierarchy: hash bucket â†’ global list (same as cleanup path).
     //
     for (i = 0; i < SHADOW_ALPC_HASH_BUCKETS; i++) {
         KeEnterCriticalRegion();
@@ -1375,7 +1377,7 @@ ShadowAlpcAnalyzeOperation(
 
             //
             // FIX (ALPC-D): Cross-session ALPC is a lateral movement indicator
-            // (MITRE T1021). Submit to BehaviorEngine for correlation — previously
+            // (MITRE T1021). Submit to BehaviorEngine for correlation â€” previously
             // only sandbox escape reached the engine.
             //
             (VOID)BeEngineSubmitEvent(
@@ -1554,7 +1556,7 @@ ShadowAlpcCheckRateLimit(
     if (timeDelta > SHADOW_ALPC_RATE_LIMIT_WINDOW) {
         //
         // Reset window atomically. Another thread may also be resetting,
-        // which is acceptable — the worst case is a minor counting skew.
+        // which is acceptable â€” the worst case is a minor counting skew.
         //
         InterlockedExchange64(&PortEntry->RateLimitWindowStart.QuadPart, currentTime.QuadPart);
         InterlockedExchange(&PortEntry->ConnectionsInWindow, 1);
@@ -1710,7 +1712,7 @@ ShadowAlpcResetStatistics(
     // NOTE: Statistics reset is inherently racy with concurrent readers
     // via ShadowAlpcGetStatistics, which may observe torn 64-bit values
     // during the zeroing operation. This is ACCEPTABLE for diagnostic
-    // statistics — callers should not reset during active monitoring
+    // statistics â€” callers should not reset during active monitoring
     // in production. A generation-counter approach would eliminate torn
     // reads but adds unjustified complexity for diagnostic counters.
     //
@@ -1806,7 +1808,7 @@ ShadowAlpcPortPreCallback(
     }
 
     //
-    // Skip excluded processes — respect administrator whitelist
+    // Skip excluded processes â€” respect administrator whitelist
     //
     if (ShadowStrikeIsProcessExcluded(PsGetCurrentProcessId(), NULL)) {
         ExReleaseRundownProtection(&state->RundownProtection);
@@ -1823,7 +1825,7 @@ ShadowAlpcPortPreCallback(
     context.SourceProcessId = PsGetCurrentProcessId();
     context.SourceProcess = PsGetCurrentProcess();
     //
-    // IsKernelHandle is always FALSE here — kernel handles return early
+    // IsKernelHandle is always FALSE here â€” kernel handles return early
     // at line 1659. Set explicitly for clarity.
     //
     context.IsKernelHandle = FALSE;
@@ -1946,7 +1948,7 @@ ShadowAlpcPortPreCallback(
 
                 //
                 // FIX (ALPC-D): Submit high-threat monitor events to BehaviorEngine.
-                // Previously only Block/Strip verdicts reached the engine — monitor-
+                // Previously only Block/Strip verdicts reached the engine â€” monitor-
                 // only mode was invisible to behavioral correlation.
                 //
                 (VOID)BeEngineSubmitEvent(
@@ -1994,7 +1996,7 @@ ShadowAlpcPortPostCallback(
     }
 
     //
-    // Skip kernel handles — no telemetry value.
+    // Skip kernel handles â€” no telemetry value.
     //
     if (OperationInformation->KernelHandle) {
         return;
@@ -2003,7 +2005,7 @@ ShadowAlpcPortPostCallback(
     //
     // CRITICAL FIX (ALPC-A): Populate port tracking cache on successful
     // handle CREATE. Without this, the hash table is permanently empty and
-    // PreCallback's ShadowAlpcFindPort never finds entries — making
+    // PreCallback's ShadowAlpcFindPort never finds entries â€” making
     // cross-session, integrity, and rate-limit analysis impossible.
     //
     // The first handle create for any ALPC port object is typically from
@@ -2018,14 +2020,14 @@ ShadowAlpcPortPostCallback(
 
             if (NT_SUCCESS(findStatus)) {
                 //
-                // Already tracked — release reference.
+                // Already tracked â€” release reference.
                 //
                 ShadowAlpcReleasePortEntry(portEntry);
             } else {
                 //
-                // First observation of this port object — create tracking entry.
+                // First observation of this port object â€” create tracking entry.
                 // OwnerPid = current process (correct for server-side port creation,
-                // approximate for client connections — updated on next access).
+                // approximate for client connections â€” updated on next access).
                 //
                 NTSTATUS trackStatus = ShadowAlpcTrackPort(
                     OperationInformation->Object,
@@ -2038,7 +2040,7 @@ ShadowAlpcPortPostCallback(
                     ShadowAlpcReleasePortEntry(portEntry);
                     //
                     // NOTE: PortsCreated is incremented inside ShadowAlpcTrackPort
-                    // (line 918). Do NOT increment here — that caused double-counting.
+                    // (line 918). Do NOT increment here â€” that caused double-counting.
                     //
                 }
             }
@@ -2615,7 +2617,7 @@ ShadowAlpcpCleanupStaleEntries(
                 }
                 //
                 // If refcount > 1, another thread holds a reference. Skip this
-                // entry — it will be cleaned up on a future pass or when the
+                // entry â€” it will be cleaned up on a future pass or when the
                 // reference holder releases it.
                 //
             }

@@ -1,3 +1,5 @@
+// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -113,7 +115,7 @@ struct _DSD_DETECTOR {
     BOOLEAN Initialized;
 
     //
-    // Whitelist — push-lock protected for reader-writer concurrency.
+    // Whitelist â€” push-lock protected for reader-writer concurrency.
     // Population via DsdAddWhitelistEntry; checked early in DsdAnalyzeSyscall
     // to short-circuit heavy analysis for known-safe modules.
     //
@@ -148,7 +150,7 @@ typedef struct _DSD_DETECTOR_INTERNAL {
     // EX_RUNDOWN_REF is the NT kernel primitive designed for exactly this
     // pattern: ExAcquireRundownProtection fails atomically once rundown
     // starts, and ExWaitForRundownProtectionRelease blocks until all
-    // acquired references are released — no manual drain races possible.
+    // acquired references are released â€” no manual drain races possible.
     //
     EX_RUNDOWN_REF RundownRef;
 
@@ -176,7 +178,7 @@ typedef struct _DSD_DETECTION_INTERNAL {
     DSD_DETECTION Base;
 
     //
-    // Internal list linkage — NOT exposed to callers
+    // Internal list linkage â€” NOT exposed to callers
     //
     LIST_ENTRY ListEntry;
 
@@ -217,7 +219,7 @@ typedef struct _DSD_WHITELIST_ENTRY {
 } DSD_WHITELIST_ENTRY, *PDSD_WHITELIST_ENTRY;
 
 //
-// Resolved NTDLL info for a specific process — stack-allocated per call
+// Resolved NTDLL info for a specific process â€” stack-allocated per call
 //
 typedef struct _DSD_NTDLL_INFO {
     ULONG_PTR Base;
@@ -226,7 +228,7 @@ typedef struct _DSD_NTDLL_INFO {
 } DSD_NTDLL_INFO, *PDSD_NTDLL_INFO;
 
 //
-// Resolved module info — stack-allocated per call
+// Resolved module info â€” stack-allocated per call
 //
 typedef struct _DSD_MODULE_INFO {
     ULONG_PTR Base;
@@ -459,7 +461,7 @@ DsdShutdown(
     }
 
     //
-    // Initiate rundown — all new ExAcquireRundownProtection calls will fail.
+    // Initiate rundown â€” all new ExAcquireRundownProtection calls will fail.
     // ExWaitForRundownProtectionRelease atomically disables acquisition AND
     // waits for all outstanding references to drain. This eliminates the
     // manual refcount drain race that existed with the prior KeClearEvent +
@@ -557,7 +559,7 @@ DsdAnalyzeSyscall(
     }
 
     //
-    // Try-acquire reference — fails atomically if shutting down
+    // Try-acquire reference â€” fails atomically if shutting down
     //
     if (!DsdpTryAcquireReference(detector)) {
         return STATUS_DEVICE_NOT_READY;
@@ -636,7 +638,7 @@ DsdAnalyzeSyscall(
     detection->InstructionLength = capturedLength;
 
     //
-    // Pattern analysis — ordered by specificity (most specific first)
+    // Pattern analysis â€” ordered by specificity (most specific first)
     //
 
     ULONG detectedSsn = 0;
@@ -1115,20 +1117,11 @@ DsdFreeDetection(
     }
 
     //
-    // Detections returned to callers are NOT on any list. Just free.
+    // Detections returned to callers are detached from any list.
+    // Pool free works regardless of original allocator (pool or lookaside).
     //
     detection->Magic = 0;
-
-    if (detection->AllocSource == DsdAllocSource_Pool) {
-        ShadowStrikeFreePoolWithTag(detection, DSD_DETECTION_TAG);
-    } else {
-        //
-        // Cannot safely return to lookaside without the detector pointer.
-        // The detection was detached — use pool free with the detection tag.
-        // This is safe: ExFreePoolWithTag works regardless of original allocator.
-        //
-        ShadowStrikeFreePoolWithTag(detection, DSD_DETECTION_TAG);
-    }
+    ShadowStrikeFreePoolWithTag(detection, DSD_DETECTION_TAG);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -1349,7 +1342,7 @@ DsdpFreeDetectionInternal(
     Detection->Magic = 0;
 
     //
-    // Free based on actual allocation source — no cross-free between
+    // Free based on actual allocation source â€” no cross-free between
     // lookaside and pool.
     //
     if (Detection->AllocSource == DsdAllocSource_Lookaside &&
@@ -1684,7 +1677,7 @@ DsdpCaptureUserCallStack(
     // RtlWalkFrameChain(flags=1) captures user-mode frames of the
     // CURRENT thread only. To walk another thread's stack, we would
     // need NtQueryInformationThread(ThreadBasicInformation) + manual
-    // frame walk — not available at this IRQL/context. Callers should
+    // frame walk â€” not available at this IRQL/context. Callers should
     // only invoke this from the target thread's context (e.g., syscall
     // callback where the calling thread IS the target thread).
     //
@@ -1747,7 +1740,7 @@ DsdpCheckRateLimit(
     // AnalysisCountInWindow are not atomic together. A thread may read
     // the old count after another thread resets it, or increment the
     // new window's count before the reset completes. This is acceptable
-    // for a soft rate limiter — the window may be ±1 second and the
+    // for a soft rate limiter â€” the window may be Â±1 second and the
     // count may be off by a few. Hard enforcement is not needed here.
     //
     if ((now.QuadPart - lastReset) >= DSD_RATE_LIMIT_WINDOW_100NS) {
@@ -1790,7 +1783,7 @@ DsdpIsDirectSyscallPattern(
 
     for (ULONG i = 0; i < Length - 1; i++) {
 
-        // mov eax, imm32 (B8 XX XX XX XX) — must precede syscall
+        // mov eax, imm32 (B8 XX XX XX XX) â€” must precede syscall
         if (!foundSyscall && Instructions[i] == DSD_MOV_EAX_IMM32 && i + 4 < Length) {
             ssn = *(PULONG)(&Instructions[i + 1]);
             //
@@ -1803,7 +1796,7 @@ DsdpIsDirectSyscallPattern(
             continue;
         }
 
-        // mov r10, rcx (4C 8B D1) — optional, skip
+        // mov r10, rcx (4C 8B D1) â€” optional, skip
         if (i + 2 < Length &&
             Instructions[i] == DSD_MOV_R10_RCX_0 &&
             Instructions[i + 1] == DSD_MOV_R10_RCX_1 &&
@@ -1880,7 +1873,7 @@ DsdpIsIndirectSyscallPattern(
             continue;
         }
 
-        // jmp rel32 (E9 XX XX XX XX) — compute real target
+        // jmp rel32 (E9 XX XX XX XX) â€” compute real target
         if (Instructions[i] == DSD_JMP_REL32 && i + 4 < Length) {
             LONG32 displacement = *(PLONG32)(&Instructions[i + 1]);
             ULONG_PTR instrAddr = callerBase + i;
@@ -2131,13 +2124,13 @@ DsdpIsHalosGatePattern(
  *   - x64 gs: TEB manipulation
  *
  * Intentional exception triggers:
- *   - int 3 (CC) — breakpoint
- *   - ud2 (0F 0B) — undefined instruction
- *   - int 2d (CD 2D) — debug service
- *   - int 1 (CD 01) — single step
- *   - int 29h (CD 29) — fast fail
- *   - hlt (F4) — privilege exception in ring 3
- *   - in/out (EC/ED/EE/EF) — I/O privilege exception
+ *   - int 3 (CC) â€” breakpoint
+ *   - ud2 (0F 0B) â€” undefined instruction
+ *   - int 2d (CD 2D) â€” debug service
+ *   - int 1 (CD 01) â€” single step
+ *   - int 29h (CD 29) â€” fast fail
+ *   - hlt (F4) â€” privilege exception in ring 3
+ *   - in/out (EC/ED/EE/EF) â€” I/O privilege exception
  *   - Null pointer dereference (xor reg,reg + mov [reg],X)
  *   - Write to NULL (C7 05 00000000 ...)
  *   - Division by zero (xor reg,reg + div reg)
@@ -2250,7 +2243,7 @@ DsdpIsTartarusGatePattern(
         }
 
         //
-        // --- REX.W gs: (0x48 0x65 ...) — some compilers emit REX before segment ---
+        // --- REX.W gs: (0x48 0x65 ...) â€” some compilers emit REX before segment ---
         //
         if (Instructions[i] == 0x48 && remaining >= 6 &&
             Instructions[i + 1] == 0x65) {
@@ -2378,47 +2371,47 @@ DsdpIsTartarusGatePattern(
         // INTENTIONAL EXCEPTION TRIGGER PATTERNS
         // ================================================================
 
-        // int 3 (CC) — breakpoint exception
+        // int 3 (CC) â€” breakpoint exception
         if (Instructions[i] == 0xCC) {
             hasExceptionTrigger = TRUE;
         }
 
-        // ud2 (0F 0B) — undefined instruction exception
+        // ud2 (0F 0B) â€” undefined instruction exception
         if (remaining >= 2 &&
             Instructions[i] == 0x0F && Instructions[i + 1] == 0x0B) {
             hasExceptionTrigger = TRUE;
         }
 
-        // int 2d (CD 2D) — debug service exception (anti-debug + Tartarus)
+        // int 2d (CD 2D) â€” debug service exception (anti-debug + Tartarus)
         if (remaining >= 2 &&
             Instructions[i] == 0xCD && Instructions[i + 1] == 0x2D) {
             hasExceptionTrigger = TRUE;
         }
 
-        // int 1 (CD 01) — single step exception
+        // int 1 (CD 01) â€” single step exception
         if (remaining >= 2 &&
             Instructions[i] == 0xCD && Instructions[i + 1] == 0x01) {
             hasExceptionTrigger = TRUE;
         }
 
-        // int 29h (CD 29) — KiFastFailDispatch / __fastfail
+        // int 29h (CD 29) â€” KiFastFailDispatch / __fastfail
         if (remaining >= 2 &&
             Instructions[i] == 0xCD && Instructions[i + 1] == 0x29) {
             hasExceptionTrigger = TRUE;
         }
 
-        // hlt (F4) — causes #GP in ring 3
+        // hlt (F4) â€” causes #GP in ring 3
         if (Instructions[i] == 0xF4) {
             hasExceptionTrigger = TRUE;
         }
 
-        // Privileged I/O: in/out (EC/ED/EE/EF) — #GP in ring 3
+        // Privileged I/O: in/out (EC/ED/EE/EF) â€” #GP in ring 3
         if (Instructions[i] == 0xEC || Instructions[i] == 0xED ||
             Instructions[i] == 0xEE || Instructions[i] == 0xEF) {
             hasExceptionTrigger = TRUE;
         }
 
-        // cli (FA) / sti (FB) — privileged instructions, #GP in ring 3
+        // cli (FA) / sti (FB) â€” privileged instructions, #GP in ring 3
         if (Instructions[i] == 0xFA || Instructions[i] == 0xFB) {
             hasExceptionTrigger = TRUE;
         }
@@ -2612,7 +2605,7 @@ DsdpIsSysWhispersPattern(
     //
     // SysWhispers1: ror/rol + xor hash loop with specific structure.
     // Require: C1 [C8-CF] XX (ror reg, imm8) followed within 6 bytes by
-    //          33 [C0-FF] (xor reg, reg) — tighter than just any C1/33.
+    //          33 [C0-FF] (xor reg, reg) â€” tighter than just any C1/33.
     //
     if (Length >= 10) {
         for (ULONG i = 0; i + 6 < Length; i++) {
@@ -2694,7 +2687,7 @@ DsdpCalculateSuspicionScore(
     ULONG score = 0;
 
     //
-    // Base score by technique (mutually exclusive — no double-counting)
+    // Base score by technique (mutually exclusive â€” no double-counting)
     //
     switch (Detection->Base.Technique) {
         case DsdTechnique_DirectSyscall:  score = 80;  break;

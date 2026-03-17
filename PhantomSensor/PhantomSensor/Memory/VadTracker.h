@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -158,7 +160,7 @@ typedef struct _VAD_REGION {
     ULONG Entropy;                      // 0-100 scale
     
     //
-    // List linkage (sole ownership — no AVL copy)
+    // List linkage (sole ownership â€” no AVL copy)
     //
     LIST_ENTRY ListEntry;
     
@@ -298,7 +300,7 @@ typedef struct _VAD_TRACKER {
     volatile LONG ProcessCount;
     
     //
-    // Process lookup hash table (chained — each bucket is a list head)
+    // Process lookup hash table (chained â€” each bucket is a list head)
     //
     struct {
         LIST_ENTRY* Buckets;

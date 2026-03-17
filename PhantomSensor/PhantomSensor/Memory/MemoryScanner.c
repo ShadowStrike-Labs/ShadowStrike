@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -91,7 +93,7 @@
 
 /**
  * @brief Maximum Aho-Corasick state count.
- * Capped to limit NonPagedPool consumption: 8192 * ~1052 bytes ≈ 8.4MB.
+ * Capped to limit NonPagedPool consumption: 8192 * ~1052 bytes â‰ˆ 8.4MB.
  */
 #define MS_AC_MAX_STATES                8192
 
@@ -721,7 +723,7 @@ MsShutdown(
     }
 
     //
-    // Signal shutdown — prevent new operations from starting.
+    // Signal shutdown â€” prevent new operations from starting.
     //
     InterlockedExchange(&scanner->ShuttingDown, 1);
     InterlockedExchange(&scanner->Base.Initialized, 0);
@@ -1807,7 +1809,7 @@ MsScanAsync(
     RtlZeroMemory(activeScan, sizeof(MS_ACTIVE_SCAN));
 
     //
-    // Allocate work item — DeviceObject guaranteed non-NULL (checked above).
+    // Allocate work item â€” DeviceObject guaranteed non-NULL (checked above).
     //
     workItem = IoAllocateWorkItem(scanner->DeviceObject);
     if (workItem == NULL) {
@@ -2151,7 +2153,7 @@ MsFindHighEntropyRegions(
             }
 
             //
-            // Move to next region — FIX MS-H1: check for address overflow at end
+            // Move to next region â€” FIX MS-H1: check for address overflow at end
             // of address space to prevent infinite loop.
             //
             address = (PVOID)((ULONG_PTR)memInfo.BaseAddress + memInfo.RegionSize);
@@ -2555,7 +2557,7 @@ MspBuildAhoCorasickAutomaton(
     //
     // Validate allocation size won't be excessive (CRIT-4 fix).
     // MaxStates is capped at 8192. Each state is ~1052 bytes.
-    // Maximum allocation: 8192 * 1052 ≈ 8.6MB.
+    // Maximum allocation: 8192 * 1052 â‰ˆ 8.6MB.
     //
     allocSize = (SIZE_T)automaton->MaxStates * sizeof(MS_AC_STATE);
 
@@ -3171,7 +3173,7 @@ MspScanProcessRegions(
                     Flags)) {
 
                 //
-                // Detach before scanning — MspScanSingleRegion does its own attach/detach.
+                // Detach before scanning â€” MspScanSingleRegion does its own attach/detach.
                 //
                 KeUnstackDetachProcess(&apcState);
                 isAttached = FALSE;
@@ -3205,7 +3207,7 @@ MspScanProcessRegions(
             }
 
             //
-            // Move to next region — FIX MS-H1: check for address overflow at end
+            // Move to next region â€” FIX MS-H1: check for address overflow at end
             // of address space to prevent infinite loop.
             //
             address = (PVOID)((ULONG_PTR)memInfo.BaseAddress + memInfo.RegionSize);

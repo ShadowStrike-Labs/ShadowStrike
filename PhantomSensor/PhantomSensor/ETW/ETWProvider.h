@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -57,7 +59,7 @@
 #include "../../Shared/NetworkTypes.h"
 
 //
-// ETW control codes — not exported by evntrace.h in kernel partition
+// ETW control codes â€” not exported by evntrace.h in kernel partition
 //
 #ifndef EVENT_CONTROL_CODE_DISABLE_PROVIDER
 #define EVENT_CONTROL_CODE_DISABLE_PROVIDER  0
@@ -220,7 +222,7 @@ typedef enum _SHADOWSTRIKE_ETW_EVENT_ID {
 /**
  * @brief Common ETW event header.
  *
- * Naturally aligned — no #pragma pack needed. All fields are
+ * Naturally aligned â€” no #pragma pack needed. All fields are
  * properly aligned to their natural boundaries for atomic access
  * guarantees on x64 and correct behavior on ARM64.
  */
@@ -423,7 +425,7 @@ typedef struct _ETW_PROVIDER_GLOBALS {
     volatile LONG InFlightWriters;
     UINT32 Reserved4;
 
-    // Lookaside list — sized to the largest event structure
+    // Lookaside list â€” sized to the largest event structure
     NPAGED_LOOKASIDE_LIST EventBufferLookaside;
 } ETW_PROVIDER_GLOBALS, *PETW_PROVIDER_GLOBALS;
 

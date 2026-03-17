@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -74,7 +76,7 @@ ShadowStrikeCleanupFileSystemCallbacks(
 // ============================================================================
 
 /**
- * @brief Instance setup callback — decides whether to attach to a volume.
+ * @brief Instance setup callback â€” decides whether to attach to a volume.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
@@ -87,7 +89,7 @@ ShadowStrikeInstanceSetup(
     );
 
 /**
- * @brief Instance query teardown callback — allows manual detachment.
+ * @brief Instance query teardown callback â€” allows manual detachment.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -97,7 +99,7 @@ ShadowStrikeInstanceQueryTeardown(
     );
 
 /**
- * @brief Instance teardown start callback — marks volume as detaching.
+ * @brief Instance teardown start callback â€” marks volume as detaching.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
@@ -107,7 +109,7 @@ ShadowStrikeInstanceTeardownStart(
     );
 
 /**
- * @brief Instance teardown complete callback — final cleanup for volume.
+ * @brief Instance teardown complete callback â€” final cleanup for volume.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID

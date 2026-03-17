@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -66,7 +68,7 @@
 #pragma warning(pop)
 
 //
-// PsGetProcessImageFileName — declared in ntifs.h but may be gated behind
+// PsGetProcessImageFileName â€” declared in ntifs.h but may be gated behind
 // specific NTDDI checks. Forward-declare for resilience.
 //
 NTKERNELAPI
@@ -230,7 +232,7 @@ struct _DX_DETECTOR {
     volatile LONG Initialized;
 
     //
-    // Rundown protection — prevents shutdown while operations are in flight
+    // Rundown protection â€” prevents shutdown while operations are in flight
     //
     EX_RUNDOWN_REF RundownRef;
 
@@ -250,7 +252,7 @@ struct _DX_DETECTOR {
     volatile LONG64 NextTransferId;
 
     //
-    // Alerts — protected by push lock, not spin lock
+    // Alerts â€” protected by push lock, not spin lock
     //
     LIST_ENTRY AlertList;
     EX_PUSH_LOCK AlertLock;
@@ -281,7 +283,7 @@ struct _DX_DETECTOR {
     } Config;
 
     //
-    // Callbacks — protected by push lock
+    // Callbacks â€” protected by push lock
     //
     struct {
         DX_ALERT_CALLBACK AlertCallback;
@@ -305,7 +307,7 @@ struct _DX_DETECTOR {
     PKTHREAD CleanupThread;
     KEVENT CleanupWakeEvent;
     volatile LONG CleanupTerminate;
-    volatile BOOLEAN ShuttingDown;
+    volatile LONG ShuttingDown;
 
     //
     // Pre-computed Base64 lookup table
@@ -442,7 +444,7 @@ DxpValidateRemoteAddress(
     );
 
 // ============================================================================
-// INLINE HELPERS — Push Lock with Critical Region
+// INLINE HELPERS â€” Push Lock with Critical Region
 // ============================================================================
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -688,7 +690,7 @@ DxShutdown(
     //
     // Mark as shutting down and prevent new operations
     //
-    InterlockedExchange((volatile LONG*)&Detector->ShuttingDown, TRUE);
+    InterlockedExchange(&Detector->ShuttingDown, TRUE);
     InterlockedExchange(&Detector->Initialized, FALSE);
 
     //
@@ -1135,7 +1137,7 @@ DxAnalyzeTraffic(
     }
 
     //
-    // Skip excluded processes — enterprise policy override.
+    // Skip excluded processes â€” enterprise policy override.
     //
     if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
         *IsSuspicious = FALSE;
@@ -1286,7 +1288,7 @@ DxAnalyzeTraffic(
                         transfer->Matches[slot].MatchCount = 1;
                     } else {
                         //
-                        // Slot beyond array bounds — roll back to cap at array size.
+                        // Slot beyond array bounds â€” roll back to cap at array size.
                         //
                         InterlockedDecrement((volatile LONG*)&transfer->MatchCount);
                     }
@@ -1388,7 +1390,7 @@ DxRecordTransfer(
     }
 
     //
-    // Skip excluded processes — enterprise policy override.
+    // Skip excluded processes â€” enterprise policy override.
     //
     if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
         ExReleaseRundownProtection(&Detector->RundownRef);
@@ -1528,7 +1530,7 @@ DxInspectContent(
     }
 
     //
-    // Pattern matching — returns value copies (DX_PATTERN_MATCH) instead of
+    // Pattern matching â€” returns value copies (DX_PATTERN_MATCH) instead of
     // raw pointers, preventing dangling references after DxRemovePattern.
     //
     DxpAcquirePushLockShared(&Detector->PatternLock);
@@ -1662,7 +1664,7 @@ DxFreeAlert(
 
     //
     // Alerts are allocated from the general pool with DX_POOL_TAG_ALERT.
-    // No UNICODE_STRING buffers — process name is inline WCHAR array.
+    // No UNICODE_STRING buffers â€” process name is inline WCHAR array.
     //
     ExFreePoolWithTag(Alert, DX_POOL_TAG_ALERT);
 }
@@ -2048,7 +2050,7 @@ DxpMatchPattern(
 
         default:
             //
-            // Unknown pattern type — do not match.
+            // Unknown pattern type â€” do not match.
             // Only PatternType_Keyword and PatternType_FileSignature are
             // supported in kernel mode.
             //
@@ -2251,7 +2253,7 @@ DxpGetOrCreateTransfer(
     }
 
     //
-    // Lock the bucket — holds across search + potential insert
+    // Lock the bucket â€” holds across search + potential insert
     //
     DxpAcquirePushLockExclusive(&hashBucket->Lock);
 
@@ -2274,7 +2276,7 @@ DxpGetOrCreateTransfer(
 
             if (RtlCompareMemory(storedAddr, RemoteAddress, expectedAddrSize) == expectedAddrSize) {
                 //
-                // Found — take a reference and return
+                // Found â€” take a reference and return
                 //
                 DxpReferenceTransfer(transfer);
 
@@ -2292,7 +2294,7 @@ DxpGetOrCreateTransfer(
     }
 
     //
-    // Not found — insert new entry (if we have one)
+    // Not found â€” insert new entry (if we have one)
     //
     if (newTransfer == NULL || (ULONG)Detector->TransferCount >= DX_MAX_TRANSFERS) {
         DxpReleasePushLockExclusive(&hashBucket->Lock);
@@ -2339,7 +2341,7 @@ DxpReferenceTransfer(
  * @brief Dereference a transfer context.
  *
  * When refcount drops to zero, frees the transfer back to the lookaside list.
- * The hash table ref is the "last" ref — when cleanup removes from the hash
+ * The hash table ref is the "last" ref â€” when cleanup removes from the hash
  * table it calls this, and if no in-flight operations hold refs, the object
  * is freed.
  */
@@ -2408,7 +2410,7 @@ DxpCreateAlert(
 
     //
     // Populate process name from EPROCESS (best effort, 15-char kernel name).
-    // PsGetProcessImageFileName returns a pointer to an internal buffer —
+    // PsGetProcessImageFileName returns a pointer to an internal buffer â€”
     // no allocation required.
     //
     alert->ProcessNameLength = 0;
@@ -2629,11 +2631,11 @@ DxpClassifyExfiltration(
 }
 
 // ============================================================================
-// CLEANUP TIMER — TimerManager callback signals system thread
+// CLEANUP TIMER â€” TimerManager callback signals system thread
 // ============================================================================
 
 /**
- * @brief TimerManager periodic callback — signals the cleanup thread's wake event.
+ * @brief TimerManager periodic callback â€” signals the cleanup thread's wake event.
  *
  * Runs at PASSIVE_LEVEL (TmFlag_WorkItemCallback). Signals a KEVENT that
  * wakes the dedicated cleanup thread to perform the actual work.
@@ -2656,7 +2658,7 @@ DxpCleanupTimerCallback(
 }
 
 /**
- * @brief Perform one cleanup pass — runs at PASSIVE_LEVEL.
+ * @brief Perform one cleanup pass â€” runs at PASSIVE_LEVEL.
  *
  * Iterates hash table buckets, removing and dereferencing stale transfers.
  * Also trims old alerts if the alert queue is more than 75% full.

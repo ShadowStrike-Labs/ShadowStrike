@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -405,14 +407,14 @@ ShadowStrikeCompareStringToCString(
     }
 
     //
-    // Bounded length scan — cap at SHADOW_MAX_PATH to prevent unbounded
+    // Bounded length scan â€” cap at SHADOW_MAX_PATH to prevent unbounded
     // wcslen if CString is not properly null-terminated.
     // wcsnlen is available in kernel CRT (ntoskrnl exports).
     //
     cstringLen = wcsnlen(CString, SHADOW_MAX_PATH);
     if (cstringLen >= SHADOW_MAX_PATH) {
         //
-        // CString exceeds maximum sane length — no UNICODE_STRING can match
+        // CString exceeds maximum sane length â€” no UNICODE_STRING can match
         // since Length is USHORT (max ~32K chars). Reject as non-match.
         //
         return FALSE;
@@ -716,7 +718,7 @@ ShadowStrikeNormalizePath(
     )
 {
     PWCHAR outputBuffer = NULL;
-    PWCHAR components[128];  // Max path depth — 1KB on x64, bounded with error check
+    PWCHAR components[128];  // Max path depth â€” 1KB on x64, bounded with error check
     ULONG componentCount = 0;
     USHORT inputLengthChars;
     PWCHAR componentStart;
@@ -1724,7 +1726,7 @@ ShadowStrikeStringBuilderInit(
     }
 
     //
-    // Validate PoolType — only accept safe pool types
+    // Validate PoolType â€” only accept safe pool types
     //
     if (PoolType != PagedPool && PoolType != NonPagedPoolNx) {
         return STATUS_INVALID_PARAMETER;
@@ -1791,7 +1793,7 @@ ShadowStrikeStringBuilderGrow(
     SIZE_T allocationBytes;
 
     //
-    // IRQL safety: PagedPool allocation at DISPATCH_LEVEL → BSOD.
+    // IRQL safety: PagedPool allocation at DISPATCH_LEVEL â†’ BSOD.
     // Catch this programming error early with a clear status.
     //
     if (Builder->PoolType == PagedPool && KeGetCurrentIrql() >= DISPATCH_LEVEL) {
@@ -1820,7 +1822,7 @@ ShadowStrikeStringBuilderGrow(
     }
 
     //
-    // Safe multiplication — explicit check rather than relying on wrap-around
+    // Safe multiplication â€” explicit check rather than relying on wrap-around
     // (wrap-around check is dead code on 64-bit where SIZE_T is 8 bytes)
     //
     allocationBytes = newCapacity * sizeof(WCHAR);
@@ -2015,7 +2017,7 @@ ShadowStrikeStringBuilderToUnicodeString(
     capacityBytes = Builder->Capacity * sizeof(WCHAR);
 
     //
-    // UNICODE_STRING Length/MaximumLength are USHORT — reject if too large
+    // UNICODE_STRING Length/MaximumLength are USHORT â€” reject if too large
     //
     if (lengthBytes > MAXUSHORT || capacityBytes > MAXUSHORT) {
         String->Buffer = NULL;
@@ -2039,7 +2041,7 @@ ShadowStrikeStringBuilderCleanup(
     )
 {
     //
-    // NO PAGED_CODE() — Builder may use NonPagedPoolNx, and caller
+    // NO PAGED_CODE() â€” Builder may use NonPagedPoolNx, and caller
     // may need to cleanup at DISPATCH_LEVEL. ExFreePoolWithTag is
     // safe at <= DISPATCH_LEVEL.
     //
@@ -2161,7 +2163,7 @@ ShadowStrikeParseCommandLine(
                     }
                 } else {
                     //
-                    // Argument limit exceeded — fail explicitly rather than
+                    // Argument limit exceeded â€” fail explicitly rather than
                     // silently dropping arguments (an attacker could hide
                     // malicious arguments beyond the limit to evade detection)
                     //
@@ -2177,7 +2179,7 @@ ShadowStrikeParseCommandLine(
     }
 
     //
-    // SECURITY FIX: Handle unclosed quote — emit pending argument.
+    // SECURITY FIX: Handle unclosed quote â€” emit pending argument.
     // Without this, an attacker can craft "cmd.exe /c "malicious_command
     // and the final argument is silently dropped, evading argument-level detection.
     //

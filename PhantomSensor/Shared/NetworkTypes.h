@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -205,7 +207,7 @@ typedef enum _NETWORK_THREAT_TYPE {
 
 #pragma pack(push, 1)
 #pragma warning(push)
-#pragma warning(disable:4201) // nameless struct/union — required for IP address overlay
+#pragma warning(disable:4201) // nameless struct/union â€” required for IP address overlay
 
 /**
  * @brief IPv4 address structure.

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -36,7 +38,7 @@
  * - Strict bounds checking on all buffer operations
  * - Bounded allocations from PagedPool (never NonPagedPool)
  * - Malformed packet detection and rejection
- * - No CRT string functions — all bounded kernel equivalents
+ * - No CRT string functions â€” all bounded kernel equivalents
  * - Body data is copied (never aliased into caller buffer)
  *
  * @author ShadowStrike Security Team
@@ -94,7 +96,7 @@ static const ULONG g_HttpMethodLengths[] = {
 };
 
 /**
- * Suspicious URI patterns — indicators of exploitation attempts.
+ * Suspicious URI patterns â€” indicators of exploitation attempts.
  * These are attack-vector patterns, not legitimate tool signatures.
  */
 static const CHAR* g_SuspiciousUriPatterns[] = {
@@ -257,7 +259,7 @@ PppUntrackAllocation(
     );
 
 // -----------------------------------------------------------------------
-// alloc_text for private functions — MUST appear AFTER forward declarations
+// alloc_text for private functions â€” MUST appear AFTER forward declarations
 // (MSVC C2157: referenced before pragma alloc_text)
 // NOTE: PppIsHttpMethod, PppIsHttpResponse are called from DISPATCH_LEVEL
 //       (PpIsHTTPData) and must NOT be placed in PAGE section.
@@ -361,7 +363,7 @@ PpInitialize(
     //
     // NonPagedPoolNx: PP_PARSER contains a KSPIN_LOCK which must reside
     // in non-paged memory. KeAcquireSpinLock raises IRQL to DISPATCH_LEVEL;
-    // if the lock page were swapped out → IRQL_NOT_LESS_OR_EQUAL BSOD.
+    // if the lock page were swapped out â†’ IRQL_NOT_LESS_OR_EQUAL BSOD.
     // The structure is small (~80 bytes) so NP pool cost is negligible.
     //
     parser = (PPP_PARSER)ExAllocatePoolZero(
@@ -463,7 +465,7 @@ PpParseHTTPRequest(
     *Request = NULL;
 
     //
-    // Acquire rundown protection — prevents shutdown during this parse.
+    // Acquire rundown protection â€” prevents shutdown during this parse.
     //
     if (!PppAcquireRundown(Parser)) {
         return STATUS_DEVICE_NOT_READY;
@@ -573,7 +575,7 @@ PpParseHTTPRequest(
                 RtlCopyMemory(request->Body, data + totalConsumed, bodySize);
                 request->BodySize = bodySize;
             }
-            // Non-fatal if body alloc fails — headers are still useful
+            // Non-fatal if body alloc fails â€” headers are still useful
         }
     }
 
@@ -994,7 +996,7 @@ PpParseDNSPacket(
                     &bytesConsumed
                 );
                 if (!NT_SUCCESS(status)) {
-                    // Non-fatal for individual RDATA — clear and continue
+                    // Non-fatal for individual RDATA â€” clear and continue
                     packet->Answers[i].Data.CNAME[0] = '\0';
                     status = STATUS_SUCCESS;
                 }
@@ -1263,7 +1265,7 @@ PppIsHttpResponse(
     )
 {
     //
-    // Accept HTTP/1.x ONLY — HTTP/2 uses binary framing and cannot
+    // Accept HTTP/1.x ONLY â€” HTTP/2 uses binary framing and cannot
     // be parsed with this line-based parser.
     //
     if (DataSize >= 8 &&
@@ -1304,7 +1306,7 @@ PppFindLineEnd(
         }
     }
 
-    // No line ending found — incomplete HTTP data
+    // No line ending found â€” incomplete HTTP data
     return STATUS_BUFFER_TOO_SMALL;
 }
 
@@ -1442,7 +1444,7 @@ PppParseStatusLine(
     }
 
     //
-    // Parse status code — strictly 3 digits, range 100-599
+    // Parse status code â€” strictly 3 digits, range 100-599
     //
     while (ptr < lineEnd && *ptr >= '0' && *ptr <= '9' &&
            digitCount < PP_MAX_STATUS_CODE_DIGITS) {
@@ -1516,7 +1518,7 @@ PppParseHeaders(
 
         lineStatus = PppFindLineEnd(ptr, remaining, &lineLength, &lineEnd);
         if (!NT_SUCCESS(lineStatus)) {
-            // No more complete lines — stop parsing
+            // No more complete lines â€” stop parsing
             break;
         }
 
@@ -1537,11 +1539,11 @@ PppParseHeaders(
         }
 
         if (colonPos >= lineEnd) {
-            // Malformed header — skip
+            // Malformed header â€” skip
             goto NextLine;
         }
 
-        // Extract name — reject if oversized (do not silently truncate)
+        // Extract name â€” reject if oversized (do not silently truncate)
         nameLength = (ULONG)(colonPos - ptr);
         if (nameLength == 0 || nameLength >= PP_MAX_HEADER_NAME_LENGTH) {
             goto NextLine;
@@ -1607,7 +1609,7 @@ PppStrEqualInsensitive(
 
     PAGED_CODE();
 
-    // Get B length (B is a compile-time constant — bounded)
+    // Get B length (B is a compile-time constant â€” bounded)
     for (bLen = 0; B[bLen] != '\0'; bLen++) {}
 
     if (aLen != bLen) {
@@ -1855,7 +1857,7 @@ PppSafeStrLen(
 }
 
 /**
- * @brief Bounded substring search — safe replacement for strstr().
+ * @brief Bounded substring search â€” safe replacement for strstr().
  *
  * Searches within a length-bounded haystack for a null-terminated needle.
  * Never reads past HaystackLen bytes.
@@ -1899,7 +1901,7 @@ PppSafeBoundedSearch(
  * @brief Case-insensitive bounded substring search.
  *
  * Like PppSafeBoundedSearch but compares ASCII letters case-insensitively.
- * Essential for attack pattern detection — attackers trivially vary case
+ * Essential for attack pattern detection â€” attackers trivially vary case
  * to bypass exact-match filters (e.g., "union%20select" vs "UNION%20SELECT").
  * Never reads past HaystackLen bytes.
  */
@@ -2054,7 +2056,7 @@ PppParseDnsName(
                 return STATUS_INVALID_PARAMETER;
             }
 
-            // DNS header is 12 bytes — valid name data starts at offset 12
+            // DNS header is 12 bytes â€” valid name data starts at offset 12
             if (pointer < PP_DNS_HEADER_SIZE) {
                 return STATUS_INVALID_PARAMETER;
             }
@@ -2112,7 +2114,7 @@ PppParseDnsName(
         pos += 1 + labelLen;
     }
 
-    // Ran out of buffer or packet — terminate what we have
+    // Ran out of buffer or packet â€” terminate what we have
     NameBuffer[min(namePos, NameBufferSize - 1)] = '\0';
 
     if (!jumped) {

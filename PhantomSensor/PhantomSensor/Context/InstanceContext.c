@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -153,7 +155,7 @@ ShadowpValidateInstanceContext(
 #pragma alloc_text(PAGE, ShadowpQueryVolumeSerialNumber)
 #pragma alloc_text(PAGE, ShadowpDetermineVolumeType)
 #pragma alloc_text(PAGE, ShadowpAllocateAndCopyString)
-// NOTE: ShadowpValidateInstanceContext is NOT paged — called from DISPATCH_LEVEL
+// NOTE: ShadowpValidateInstanceContext is NOT paged â€” called from DISPATCH_LEVEL
 // stat increment functions (InterlockedIncrement64 callers). It only does
 // NULL check + ULONG signature compare, safe at any IRQL.
 #endif
@@ -1123,7 +1125,7 @@ ShadowpValidateInstanceContext(
     )
 {
     //
-    // No PAGED_CODE() — this function is called from DISPATCH_LEVEL
+    // No PAGED_CODE() â€” this function is called from DISPATCH_LEVEL
     // stat increment paths. Only does NULL + signature checks (safe at any IRQL).
     //
 

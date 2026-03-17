@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -198,7 +200,7 @@ AuInitialize(
     p->ProtectedDriver = DriverObject;
 
     //
-    // Null the unload routine — core anti-unload mechanism.
+    // Null the unload routine â€” core anti-unload mechanism.
     // Save original so AuShutdown can restore it for controlled unload.
     //
     p->OriginalUnload = DriverObject->DriverUnload;
@@ -265,7 +267,7 @@ AuShutdown(
     ExWaitForRundownProtectionRelease(&Protector->RundownRef);
 
     //
-    // STEP 4: Free event list (no lock needed — all callbacks are done).
+    // STEP 4: Free event list (no lock needed â€” all callbacks are done).
     //
     InitializeListHead(&evictList);
 
@@ -532,7 +534,7 @@ AuGetEvents(
         srcEvent = CONTAINING_RECORD(listEntry, AU_UNLOAD_EVENT, ListEntry);
 
         //
-        // Flat copy — AU_UNLOAD_EVENT has no embedded pointers.
+        // Flat copy â€” AU_UNLOAD_EVENT has no embedded pointers.
         //
         Events[count].Type              = srcEvent->Type;
         Events[count].CallerProcessId   = srcEvent->CallerProcessId;
@@ -545,7 +547,7 @@ AuGetEvents(
                        AU_PROCESS_NAME_LEN);
 
         //
-        // ListEntry in copy is meaningless — zero it.
+        // ListEntry in copy is meaningless â€” zero it.
         //
         InitializeListHead(&Events[count].ListEntry);
 
@@ -565,7 +567,7 @@ AuGetEvents(
 /**
  * @brief Create a flat event (no embedded pointers).
  *
- * Uses PsGetProcessImageFileName for caller name — safe at any IRQL,
+ * Uses PsGetProcessImageFileName for caller name â€” safe at any IRQL,
  * returns ANSI 15-char max, no allocation needed.
  */
 static PAU_UNLOAD_EVENT
@@ -824,7 +826,7 @@ AupProcessPreCallback(
 
     //
     // Acquire rundown protection. If this fails, the protector is
-    // shutting down — bail immediately.
+    // shutting down â€” bail immediately.
     //
     if (!ExAcquireRundownProtection(&protector->RundownRef)) {
         return OB_PREOP_SUCCESS;
@@ -847,7 +849,7 @@ AupProcessPreCallback(
     }
 
     //
-    // Never filter kernel-mode handles — they're trusted and
+    // Never filter kernel-mode handles â€” they're trusted and
     // stripping access can break WER, AV scanners, etc.
     //
     if (OperationInformation->KernelHandle) {
@@ -938,7 +940,7 @@ AupProcessPreCallback(
     }
 
     //
-    // Report to behavioral engine — tamper resistance is defense evasion.
+    // Report to behavioral engine â€” tamper resistance is defense evasion.
     // Score higher for terminate (90) vs inject (75).
     //
     (VOID)BeEngineSubmitEvent(
@@ -1076,7 +1078,7 @@ AupThreadPreCallback(
         }
 
         //
-        // Report to behavioral engine — thread tamper is defense evasion.
+        // Report to behavioral engine â€” thread tamper is defense evasion.
         //
         (VOID)BeEngineSubmitEvent(
             BehaviorEvent_DisableWindowsDefender,
@@ -1114,7 +1116,7 @@ done:
 /**
  * @brief Notify the registered user callback.
  *
- * The callback must not fault — no SEH wrapper. If it faults, the
+ * The callback must not fault â€” no SEH wrapper. If it faults, the
  * bugcheck correctly points to the buggy callback, not to us.
  */
 static VOID
@@ -1129,7 +1131,7 @@ AupNotifyCallback(
 
     //
     // Read callback/context atomically under shared lock.
-    // We're in an OB callback context (≤ APC_LEVEL typically),
+    // We're in an OB callback context (â‰¤ APC_LEVEL typically),
     // but push locks require KeEnterCriticalRegion.
     //
     KeEnterCriticalRegion();

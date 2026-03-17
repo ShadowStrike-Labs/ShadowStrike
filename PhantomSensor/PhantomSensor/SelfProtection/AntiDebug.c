@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -70,7 +72,7 @@ ZwQueryInformationProcess(
 // ============================================================================
 
 //
-// Internal event node — lives on Protector->EventList.
+// Internal event node â€” lives on Protector->EventList.
 // Never returned to callers. Contains LIST_ENTRY linkage.
 //
 typedef struct _ADB_EVENT {
@@ -174,9 +176,9 @@ AdbInitialize(
                         AdbpDetectCrashDumpConfig() ? 1 : 0);
 
     KeQuerySystemTimePrecise(&Ctx->Stats.StartTime);
-    Ctx->Stats.KernelDebuggerPresent = (BOOLEAN)Ctx->KernelDebuggerPresent;
-    Ctx->Stats.HypervisorPresent = (BOOLEAN)Ctx->HypervisorPresent;
-    Ctx->Stats.VerifierEnabled = (BOOLEAN)Ctx->VerifierEnabled;
+    Ctx->Stats.KernelDebuggerPresent = (Ctx->KernelDebuggerPresent != 0);
+    Ctx->Stats.HypervisorPresent = (Ctx->HypervisorPresent != 0);
+    Ctx->Stats.VerifierEnabled = (Ctx->VerifierEnabled != 0);
 
     // Record initial detections as events
     if (Ctx->KernelDebuggerPresent) {
@@ -274,7 +276,7 @@ AdbInitialize(
         ZwWaitForSingleObject(ThreadHandle, FALSE, NULL);
         ZwClose(ThreadHandle);
         //
-        // Thread has exited — drain event list before freeing context.
+        // Thread has exited â€” drain event list before freeing context.
         //
         while (!IsListEmpty(&Ctx->EventList)) {
             PLIST_ENTRY Entry = RemoveHeadList(&Ctx->EventList);
@@ -303,7 +305,7 @@ AdbInitialize(
         }
     }
 
-    // Mark initialized last — after all fields are set
+    // Mark initialized last â€” after all fields are set
     InterlockedExchange(&Ctx->Initialized, 1);
 
     *Protector = Ctx;
@@ -367,7 +369,7 @@ AdbShutdown(
     //
     ExWaitForRundownProtectionRelease(&Protector->RundownRef);
 
-    // Drain and free all events — no lock needed, we're fully drained
+    // Drain and free all events â€” no lock needed, we're fully drained
     InitializeListHead(&FreeList);
     while (!IsListEmpty(&Protector->EventList)) {
         PLIST_ENTRY Entry = RemoveHeadList(&Protector->EventList);
@@ -435,8 +437,8 @@ AdbCheckForDebugger(
         return STATUS_DELETE_PENDING;
     }
 
-    PreviousState = (BOOLEAN)InterlockedCompareExchange(
-        &Protector->KernelDebuggerPresent, 0, 0);
+    PreviousState = (InterlockedCompareExchange(
+        &Protector->KernelDebuggerPresent, 0, 0) != 0);
 
     CurrentState = AdbpDetectKernelDebugger();
 
@@ -508,8 +510,8 @@ AdbCheckForHypervisor(
         return STATUS_DELETE_PENDING;
     }
 
-    PreviousState = (BOOLEAN)InterlockedCompareExchange(
-        &Protector->HypervisorPresent, 0, 0);
+    PreviousState = (InterlockedCompareExchange(
+        &Protector->HypervisorPresent, 0, 0) != 0);
 
     CurrentState = AdbpDetectHypervisor();
     InterlockedExchange(&Protector->HypervisorPresent,
@@ -536,7 +538,7 @@ AdbCheckForHypervisor(
 }
 
 // ============================================================================
-// AdbGetEvents — returns value-type copies into caller-provided array
+// AdbGetEvents â€” returns value-type copies into caller-provided array
 // ============================================================================
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -609,12 +611,12 @@ AdbGetStatistics(
         &Protector->Stats.CallbackInvocations, 0, 0);
     Stats->CurrentEventCount = InterlockedCompareExchange(
         &Protector->EventCount, 0, 0);
-    Stats->KernelDebuggerPresent = (BOOLEAN)InterlockedCompareExchange(
-        &Protector->KernelDebuggerPresent, 0, 0);
-    Stats->HypervisorPresent = (BOOLEAN)InterlockedCompareExchange(
-        &Protector->HypervisorPresent, 0, 0);
-    Stats->VerifierEnabled = (BOOLEAN)InterlockedCompareExchange(
-        &Protector->VerifierEnabled, 0, 0);
+    Stats->KernelDebuggerPresent = (InterlockedCompareExchange(
+        &Protector->KernelDebuggerPresent, 0, 0) != 0);
+    Stats->HypervisorPresent = (InterlockedCompareExchange(
+        &Protector->HypervisorPresent, 0, 0) != 0);
+    Stats->VerifierEnabled = (InterlockedCompareExchange(
+        &Protector->VerifierEnabled, 0, 0) != 0);
     Stats->LastCheckTime = Protector->Stats.LastCheckTime;
     Stats->StartTime = Protector->Stats.StartTime;
 
@@ -623,7 +625,7 @@ AdbGetStatistics(
 }
 
 // ============================================================================
-// AdbClearEvents — removes and frees all events
+// AdbClearEvents â€” removes and frees all events
 // ============================================================================
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -688,7 +690,7 @@ AdbpRecordEvent(
         ADB_POOL_TAG_EVENT
         );
     if (Evt == NULL) {
-        // Cannot record — increment counter anyway
+        // Cannot record â€” increment counter anyway
         InterlockedIncrement64(&Protector->Stats.TotalDetections);
         return;
     }
@@ -842,7 +844,7 @@ AdbpEvictOldestEventsLocked(
 }
 
 // ============================================================================
-// INTERNAL: Detection — Kernel debugger
+// INTERNAL: Detection â€” Kernel debugger
 // ============================================================================
 
 static BOOLEAN
@@ -861,7 +863,7 @@ AdbpDetectKernelDebugger(VOID)
 }
 
 // ============================================================================
-// INTERNAL: Detection — User-mode debugger
+// INTERNAL: Detection â€” User-mode debugger
 // ============================================================================
 
 static BOOLEAN
@@ -900,7 +902,7 @@ AdbpDetectUserDebugger(VOID)
 }
 
 // ============================================================================
-// INTERNAL: Detection — Hypervisor
+// INTERNAL: Detection â€” Hypervisor
 // ============================================================================
 
 static BOOLEAN
@@ -922,7 +924,7 @@ AdbpDetectHypervisor(VOID)
 }
 
 // ============================================================================
-// INTERNAL: Detection — Driver Verifier
+// INTERNAL: Detection â€” Driver Verifier
 // ============================================================================
 
 static BOOLEAN
@@ -948,7 +950,7 @@ AdbpDetectDriverVerifier(
 }
 
 // ============================================================================
-// INTERNAL: Detection — Crash dump configuration
+// INTERNAL: Detection â€” Crash dump configuration
 //
 // Checks if crash dump settings have been modified to allow full memory dumps,
 // which an attacker could use to extract driver memory.
@@ -1003,7 +1005,7 @@ AdbpDetectCrashDumpConfig(VOID)
     //
     // CrashDumpEnabled values:
     //   0 = None
-    //   1 = Complete memory dump (security risk — contains all kernel memory)
+    //   1 = Complete memory dump (security risk â€” contains all kernel memory)
     //   2 = Kernel memory dump
     //   3 = Small memory dump (minidump)
     //   7 = Automatic memory dump
@@ -1018,7 +1020,7 @@ AdbpDetectCrashDumpConfig(VOID)
 }
 
 // ============================================================================
-// TIMER CALLBACK — signals the system thread to wake, does NO event processing
+// TIMER CALLBACK â€” signals the system thread to wake, does NO event processing
 // ============================================================================
 
 static VOID
@@ -1037,7 +1039,7 @@ AdbpCheckTimerCallback(
 }
 
 // ============================================================================
-// PERIODIC CHECK THREAD — runs at PASSIVE_LEVEL, waits on wake event
+// PERIODIC CHECK THREAD â€” runs at PASSIVE_LEVEL, waits on wake event
 // ============================================================================
 
 static VOID
@@ -1071,14 +1073,14 @@ AdbpPeriodicCheckThread(
         }
 
         // Read previous state
-        PrevKd = (BOOLEAN)InterlockedCompareExchange(
-            &Protector->KernelDebuggerPresent, 0, 0);
-        PrevHv = (BOOLEAN)InterlockedCompareExchange(
-            &Protector->HypervisorPresent, 0, 0);
-        PrevVf = (BOOLEAN)InterlockedCompareExchange(
-            &Protector->VerifierEnabled, 0, 0);
-        PrevDump = (BOOLEAN)InterlockedCompareExchange(
-            &Protector->CrashDumpEnabled, 0, 0);
+        PrevKd = (InterlockedCompareExchange(
+            &Protector->KernelDebuggerPresent, 0, 0) != 0);
+        PrevHv = (InterlockedCompareExchange(
+            &Protector->HypervisorPresent, 0, 0) != 0);
+        PrevVf = (InterlockedCompareExchange(
+            &Protector->VerifierEnabled, 0, 0) != 0);
+        PrevDump = (InterlockedCompareExchange(
+            &Protector->CrashDumpEnabled, 0, 0) != 0);
 
         // Run detections
         CurrKd = AdbpDetectKernelDebugger();

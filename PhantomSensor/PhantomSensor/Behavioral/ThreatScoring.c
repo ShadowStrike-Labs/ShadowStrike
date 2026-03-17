@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -436,7 +438,7 @@ TsShutdown(
     //
     // Wait for ALL outstanding rundown references to drain.
     // This blocks until every in-flight TspAcquireContext has called
-    // TspReleaseContext. No timeout — BSOD-safe.
+    // TspReleaseContext. No timeout â€” BSOD-safe.
     //
     ExWaitForRundownProtectionRelease(&Engine->RundownRef);
 

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -421,7 +423,7 @@ ShadowStrikeQueueRescan(
     _In_opt_ PCUNICODE_STRING FileName
     );
 
-// NOTE: ShadowStrikeDeferredScanWorker removed — zero callers.
+// NOTE: ShadowStrikeDeferredScanWorker removed â€” zero callers.
 // Rescan functionality is handled by ShadowStrikeQueueRescan above.
 
 #ifdef __cplusplus

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -344,7 +346,7 @@ typedef struct _SC_KNOWN_GOOD_CALLER {
 } SC_KNOWN_GOOD_CALLER, *PSC_KNOWN_GOOD_CALLER;
 
 /**
- * @brief Syscall monitor global state (INTERNAL — never exposed to callers).
+ * @brief Syscall monitor global state (INTERNAL â€” never exposed to callers).
  *
  * Synchronization:
  * - ProcessLock: EX_PUSH_LOCK protecting ProcessContextList.
@@ -412,7 +414,7 @@ typedef struct _SYSCALL_MONITOR_GLOBALS {
 } SYSCALL_MONITOR_GLOBALS, *PSYSCALL_MONITOR_GLOBALS;
 
 /**
- * @brief Safe statistics snapshot (safe to copy — contains only scalar fields).
+ * @brief Safe statistics snapshot (safe to copy â€” contains only scalar fields).
  *
  * Use ScMonitorGetStatistics to populate this struct. This is the ONLY
  * struct callers should use to read monitor statistics.
@@ -712,7 +714,7 @@ ScMonitorGetSyscallDefinition(
 // ============================================================================
 
 /**
- * @brief Get syscall monitor statistics (safe snapshot — no kernel objects).
+ * @brief Get syscall monitor statistics (safe snapshot â€” no kernel objects).
  * @param Stats Output statistics snapshot.
  * @return STATUS_SUCCESS on success.
  */

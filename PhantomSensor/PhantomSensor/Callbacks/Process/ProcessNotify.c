@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -111,7 +113,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 
 //
 // Forward-declare C2Detection and ConnectionTracker APIs to avoid
-// including NetworkFilter.h (which pulls ConnectionTracker.h —
+// including NetworkFilter.h (which pulls ConnectionTracker.h â€”
 // PCT_TRACKER/PCT_STATISTICS collide with ParentChainTracker.h).
 //
 typedef struct _C2_DETECTOR C2_DETECTOR, *PC2_DETECTOR;
@@ -953,7 +955,7 @@ Routine Description:
 
     //
     // Clear reference to centralized threat scoring engine
-    // DriverEntry owns the lifecycle — no TsShutdown here.
+    // DriverEntry owns the lifecycle â€” no TsShutdown here.
     //
     g_ProcessMonitor.ThreatScoringEngine = NULL;
 
@@ -1198,7 +1200,7 @@ Arguments:
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_TRACE_LEVEL,
-            "[ShadowStrike/ProcessNotify] PID %lu excluded — skipping analysis\n",
+            "[ShadowStrike/ProcessNotify] PID %lu excluded â€” skipping analysis\n",
             HandleToULong(ProcessId)
             );
         goto Cleanup;
@@ -1281,7 +1283,7 @@ Arguments:
     }
 
     //
-    // Privilege Escalation Monitoring — record baseline privilege state
+    // Privilege Escalation Monitoring â€” record baseline privilege state
     // for the new process so we can detect privilege changes over its lifetime.
     // Baselines are captured once at creation; PmCheckForEscalation compares
     // current token state against baseline when triggered externally.
@@ -1340,7 +1342,7 @@ Arguments:
     }
 
     //
-    // Deep PPID Spoofing Validation — PctDetectSpoofing uses creation time
+    // Deep PPID Spoofing Validation â€” PctDetectSpoofing uses creation time
     // ordering and PID reuse protection for a more robust check than the
     // simple creator-vs-parent comparison in PnpDetectPpidSpoofing above.
     // This catches sophisticated spoofing where creation times are manipulated.
@@ -1389,9 +1391,9 @@ Arguments:
     }
 
     //
-    // Parent Chain Analysis — build process ancestry chain and detect
+    // Parent Chain Analysis â€” build process ancestry chain and detect
     // suspicious parent-child patterns (T1218 LOLBins, T1059 script hosts,
-    // Office→shell, Browser→shell, chain depth anomalies)
+    // Officeâ†’shell, Browserâ†’shell, chain depth anomalies)
     //
     if (g_ProcessMonitor.Config.EnableParentChainTracking &&
         g_ProcessMonitor.ParentChainTracker != NULL) {
@@ -1402,7 +1404,7 @@ Arguments:
         NTSTATUS pctStatus = PctBuildChain(pctTracker, ProcessId, &pctChain);
         if (NT_SUCCESS(pctStatus) && pctChain != NULL) {
             //
-            // Suspicious ancestry pattern detected — report to BehaviorEngine
+            // Suspicious ancestry pattern detected â€” report to BehaviorEngine
             //
             if (pctChain->HasSuspiciousAncestor && pctChain->SuspicionScore > 0) {
                 BeEngineSubmitEvent(
@@ -1621,7 +1623,7 @@ Arguments:
     }
 
     //
-    // Deep Process Analysis via ProcessAnalyzer — PE header inspection,
+    // Deep Process Analysis via ProcessAnalyzer â€” PE header inspection,
     // entropy-based packing detection, security mitigation verification,
     // LOLBin classification, and unified suspicion scoring.
     // Complements the shallow PnpAnalyzeProcess with PE-level forensics.
@@ -1633,7 +1635,7 @@ Arguments:
         NTSTATUS paStatus = PaAnalyzeProcess(paAnalyzer, ProcessId, &paResult);
         if (NT_SUCCESS(paStatus) && paResult != NULL) {
             //
-            // Packed PE detection → BehaviorEngine (T1027.002 Software Packing)
+            // Packed PE detection â†’ BehaviorEngine (T1027.002 Software Packing)
             //
             if (paResult->PE.IsPacked) {
                 BeEngineSubmitEvent(
@@ -1660,7 +1662,7 @@ Arguments:
             }
 
             //
-            // Unsigned binary without DEP → high exploitation risk
+            // Unsigned binary without DEP â†’ high exploitation risk
             //
             if (!paResult->PE.IsSigned && !paResult->Security.HasDEP) {
                 if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
@@ -1708,7 +1710,7 @@ Arguments:
             }
 
             //
-            // High suspicion from deep analysis → behavioral event
+            // High suspicion from deep analysis â†’ behavioral event
             //
             if (paResult->SuspicionScore >= PA_SUSPICION_THRESHOLD_HIGH) {
                 BeEngineSubmitEvent(
@@ -1798,7 +1800,7 @@ Arguments:
     }
 
     //
-    // WSL/Container escape detection — classify WSL processes and detect
+    // WSL/Container escape detection â€” classify WSL processes and detect
     // host escape attempts (MITRE T1611)
     //
     WslMonCheckProcessCreate(
@@ -1808,7 +1810,7 @@ Arguments:
         );
 
     //
-    // Clipboard abuse detection — detect clipboard data theft patterns (T1115).
+    // Clipboard abuse detection â€” detect clipboard data theft patterns (T1115).
     // Score graduates based on indicator combination: encoded commands + known
     // stealer image warrants a higher score than a simple clipboard command line.
     //
@@ -1836,10 +1838,10 @@ Arguments:
     }
 
     //
-    // Application Control — enforce allowlist/blocklist policy.
+    // Application Control â€” enforce allowlist/blocklist policy.
     // In Enforce mode this can block process creation (MITRE M1038).
     // Note: ImageHash is NULL here because SHA-256 computation happens
-    // asynchronously in the scan pipeline (ScanBridge → user-mode).
+    // asynchronously in the scan pipeline (ScanBridge â†’ user-mode).
     // Hash-based rules activate when scan results flow back via CommPort.
     //
     {
@@ -1872,7 +1874,7 @@ Arguments:
 
     //
     // Submit process creation event to BehaviorEngine for kill-chain correlation.
-    // BehaviorEngine internally drives AttackChainTracker → MITREMapper pipeline.
+    // BehaviorEngine internally drives AttackChainTracker â†’ MITREMapper pipeline.
     // We submit at PASSIVE_LEVEL after all analysis enrichment is complete.
     //
     // Enhance the suspicion score with ThreatScoring engine's aggregated
@@ -1975,7 +1977,7 @@ Arguments:
                     ProcessContext->Flags |= PN_PROC_FLAG_HOLLOWED;
 
                     //
-                    // Contribute to threat scoring — hollowed process is strong indicator
+                    // Contribute to threat scoring â€” hollowed process is strong indicator
                     //
                     if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
                         TsAddFactor(
@@ -2140,7 +2142,7 @@ Arguments:
     //
     // Stream process creation event to high-performance telemetry buffer.
     // TelemetryBuffer provides per-CPU ring buffer delivery to user-mode
-    // at < 100ns latency — complementary to CommPort synchronous path.
+    // at < 100ns latency â€” complementary to CommPort synchronous path.
     //
     {
         PTB_MANAGER tbMgr = ShadowStrikeGetTelemetryBuffer();
@@ -2180,7 +2182,7 @@ Arguments:
             );
 
         //
-        // Emit ETW telemetry for blocked process (CRITICAL security event — never throttled)
+        // Emit ETW telemetry for blocked process (CRITICAL security event â€” never throttled)
         //
         TeLogProcessBlocked(
             HandleToULong(ProcessId),
@@ -2204,10 +2206,10 @@ Arguments:
     }
 
     //
-    // Release caller's reference — the tracking list holds its own ref
+    // Release caller's reference â€” the tracking list holds its own ref
     // (taken by PnpInsertProcessContext). Without this deref, every
     // context leaks with RefCount stuck at 1, leaking the EPROCESS
-    // reference and pool memory until PoolTracker hits 4MB → self-DoS.
+    // reference and pool memory until PoolTracker hits 4MB â†’ self-DoS.
     //
     PnpDereferenceContext(ProcessContext);
     ProcessContext = NULL;
@@ -2567,7 +2569,7 @@ PnpCaptureProcessInfo(
     //
     // Store creating process context in ProcessUtils hash table.
     // This enables anti-parent-spoofing detection (T1134.004) via
-    // ShadowStrikeValidateParentChild — compares captured creating PID
+    // ShadowStrikeValidateParentChild â€” compares captured creating PID
     // against the (potentially spoofed) InheritedFromUniqueProcessId.
     // Best-effort: failure here is non-fatal (fallback to inherited PID).
     //
@@ -3245,7 +3247,7 @@ Routine Description:
     // Handle forensics via HandleTracker.
     // Detects: cross-process injection handles (T1055), LSASS credential dumping
     // (T1003.001), token theft (T1134), high-privilege handle abuse, system handle
-    // manipulation. Snapshots are transient — captured and released per-process.
+    // manipulation. Snapshots are transient â€” captured and released per-process.
     //
     {
         PHT_TRACKER HtTracker = PaGetHandleTracker();
@@ -3513,6 +3515,7 @@ PnpSendProcessNotification(
     PSHADOWSTRIKE_PROCESS_VERDICT_REPLY Reply = NULL;
     SIZE_T NotificationSize;
     SIZE_T ReplySize = sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY);
+    ULONG ReplySizeUlong = (ULONG)ReplySize;
     BOOLEAN RequireReply = FALSE;
     PUCHAR BufferPtr;
 
@@ -3662,7 +3665,7 @@ PnpSendProcessNotification(
         (ULONG)NotificationSize,
         RequireReply,
         Reply,
-        RequireReply ? (PULONG)&ReplySize : NULL
+        RequireReply ? &ReplySizeUlong : NULL
         );
 
     //
@@ -3780,7 +3783,7 @@ PnpHandleProcessTermination(
 
     //
     // Remove process from relationship graph before context teardown.
-    // Must happen while process context is still accessible — enables
+    // Must happen while process context is still accessible â€” enables
     // final cluster scoring and relationship cleanup.
     //
     {
@@ -3891,7 +3894,7 @@ PnpHandleProcessTermination(
 
     //
     // Remove from MessageHandler protected process list (if registered).
-    // Without this, PID reuse inherits privileged message authorization —
+    // Without this, PID reuse inherits privileged message authorization â€”
     // a new process with the recycled PID can send push/whitelist/exclusion
     // commands that require protected-process auth. CRITICAL security fix.
     //
@@ -3899,7 +3902,7 @@ PnpHandleProcessTermination(
 
     //
     // Remove from ObjectCallback protected process list (if registered).
-    // This is a no-op if the PID was never added — safe to call unconditionally.
+    // This is a no-op if the PID was never added â€” safe to call unconditionally.
     //
     ObRemoveProtectedProcess(ProcessId);
 
@@ -3964,7 +3967,7 @@ PnpHandleProcessTermination(
     //
     // Clean up PatternMatcher per-process match states for this process.
     // Without cleanup, partial match states (PM_MATCH_STATE_INTERNAL) accumulate
-    // in NonPaged pool indefinitely — each ~600 bytes with event tracking arrays.
+    // in NonPaged pool indefinitely â€” each ~600 bytes with event tracking arrays.
     // Also prevents stale PIDs from producing false behavioral matches after recycle.
     //
     {
@@ -3989,7 +3992,7 @@ PnpHandleProcessTermination(
     //
     // Remove SelfProtect protection entry for this process.
     // Without this, the PEPROCESS reference leaks (ObReferenceObject held
-    // indefinitely) and the PID slot cannot be reused — new protected process
+    // indefinitely) and the PID slot cannot be reused â€” new protected process
     // registrations will hit the 16-entry cap and fail.
     //
     ShadowStrikeUnprotectProcess(ProcessId);
@@ -4009,7 +4012,7 @@ PnpHandleProcessTermination(
     //
     // Remove protected PID from AntiUnload on process termination.
     // Without this, terminated processes remain in the 32-slot protected
-    // PID table forever — after 32 registrations the table is permanently
+    // PID table forever â€” after 32 registrations the table is permanently
     // full and AuProtectProcess returns STATUS_INSUFFICIENT_RESOURCES.
     //
     {
@@ -4027,7 +4030,7 @@ PnpHandleProcessTermination(
 
     //
     // Remove creating process context from ProcessUtils hash table.
-    // Must happen before context teardown — frees the entry that was
+    // Must happen before context teardown â€” frees the entry that was
     // stored at process creation time for anti-PPID-spoofing detection.
     //
     ShadowStrikeRemoveCreatingProcessContext(ProcessId);
@@ -4052,7 +4055,7 @@ PnpHandleProcessTermination(
     //
     // Notify InjectionDetector of process exit so it can clean up the
     // per-process injection context. Without this, injection chain contexts
-    // accumulate indefinitely in NonPaged pool — a memory leak per-process.
+    // accumulate indefinitely in NonPaged pool â€” a memory leak per-process.
     //
     MmMonitorNotifyInjectionProcessExit(ProcessId);
 
@@ -4535,7 +4538,7 @@ Routine Description:
         Context = CONTAINING_RECORD(Entry, PN_PROCESS_CONTEXT, ListEntry);
 
         //
-        // Skip terminated processes — no point checking dead contexts
+        // Skip terminated processes â€” no point checking dead contexts
         //
         if (Context->TerminateTime.QuadPart != 0) {
             continue;
@@ -4577,7 +4580,7 @@ Routine Description:
 
             if (pmStatus == STATUS_SUCCESS && EscEvent != NULL) {
                 //
-                // Escalation detected — submit to BehaviorEngine
+                // Escalation detected â€” submit to BehaviorEngine
                 //
                 BeEngineSubmitEvent(
                     BehaviorEvent_PrivilegeEscalation,
@@ -4610,7 +4613,7 @@ Routine Description:
 
             if (NT_SUCCESS(taStatus) && Attack != TaAttack_None && TokenScore > 0) {
                 //
-                // Token attack detected — submit to BehaviorEngine
+                // Token attack detected â€” submit to BehaviorEngine
                 //
                 BeEngineSubmitEvent(
                     BehaviorEvent_TokenManipulation,
@@ -4631,7 +4634,7 @@ Routine Description:
     }
 
     //
-    // Process Relationship Graph Analysis — detect suspicious clusters
+    // Process Relationship Graph Analysis â€” detect suspicious clusters
     // of related processes that may indicate coordinated attack activity
     // (e.g., multiple injection chains, lateral movement patterns).
     // Runs once per security check cycle (not per-process) at PASSIVE_LEVEL.
@@ -4716,7 +4719,7 @@ Routine Description:
     // Run ThreatScoring maintenance on the ProcessMonitor's engine.
     // This decays factor scores over time and purges contexts for
     // terminated processes, preventing unbounded memory growth.
-    // Timer runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback. ✓
+    // Timer runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback. âœ“
     //
     if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
         TsRunMaintenancePass(g_ProcessMonitor.ThreatScoringEngine);

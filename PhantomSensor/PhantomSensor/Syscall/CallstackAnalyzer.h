@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -69,7 +71,7 @@ typedef struct _CSA_STACK_FRAME {
     PVOID StackPointer;
 
     //
-    // Module info — name is deep-copied, buffer is owned by this frame
+    // Module info â€” name is deep-copied, buffer is owned by this frame
     //
     PVOID ModuleBase;
     WCHAR ModuleNameBuffer[CSA_MAX_MODULE_NAME_CCH];
@@ -102,7 +104,7 @@ typedef struct _CSA_ANALYZER {
     BOOLEAN Initialized;
 
     //
-    // Module cache — guarded by ModuleLock (EX_PUSH_LOCK).
+    // Module cache â€” guarded by ModuleLock (EX_PUSH_LOCK).
     // Callers must use KeEnterCriticalRegion / KeLeaveCriticalRegion.
     //
     LIST_ENTRY ModuleCache;
@@ -122,7 +124,7 @@ typedef struct _CSA_ANALYZER {
 } CSA_ANALYZER, *PCSA_ANALYZER;
 
 //
-// Public API — all require IRQL <= PASSIVE_LEVEL
+// Public API â€” all require IRQL <= PASSIVE_LEVEL
 //
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -178,7 +180,7 @@ CsaFreeCallstack(
     );
 
 //
-// Process exit notification — must be called from process notify callback
+// Process exit notification â€” must be called from process notify callback
 // when a process is terminating to invalidate stale cache entries.
 //
 _IRQL_requires_(PASSIVE_LEVEL)

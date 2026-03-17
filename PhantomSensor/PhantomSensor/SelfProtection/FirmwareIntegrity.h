@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -31,10 +33,10 @@ Monitors firmware and boot configuration integrity:
   - UEFI variable integrity checks
 
 Integration Points:
-  - Driver initialization → FiInitialize() (one-time check)
-  - PreCreate callback → FiCheckEspAccess() (ESP monitoring)
-  - Periodic timer → FiVerifyBootIntegrity()
-  - DriverEntry → FiInitialize() / FiShutdown()
+  - Driver initialization â†’ FiInitialize() (one-time check)
+  - PreCreate callback â†’ FiCheckEspAccess() (ESP monitoring)
+  - Periodic timer â†’ FiVerifyBootIntegrity()
+  - DriverEntry â†’ FiInitialize() / FiShutdown()
 
 MITRE ATT&CK Coverage:
   - T1542.001: System Firmware (UEFI implants)

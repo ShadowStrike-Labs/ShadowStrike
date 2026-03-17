@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -601,7 +603,7 @@ LlCreateLookasideEx(
     InterlockedExchange((volatile LONG*)&NewLookaside->State, LlStateActive);
 
     //
-    // Add to manager's list — count check under lock to prevent races
+    // Add to manager's list â€” count check under lock to prevent races
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Manager->LookasideListLock);
@@ -950,7 +952,7 @@ LlAllocateEx(
     // Determine cache hit using native lookaside L.TotalAllocates vs L.AllocateMisses.
     // A cache hit means the allocation was satisfied from the lookaside free list
     // without going to the pool allocator. We snapshot TotalAllocates before and check
-    // AllocateMisses after — if AllocateMisses didn't change, it was a hit.
+    // AllocateMisses after â€” if AllocateMisses didn't change, it was a hit.
     // However, since we already did the allocation, we read the cumulative counters
     // and compute: Hits = TotalAllocates - AllocateMisses. Compare with our previous
     // snapshot to detect whether THIS allocation was a hit.
@@ -979,7 +981,7 @@ LlAllocateEx(
         //
         if (NativeTotal > NativeMisses) {
             //
-            // Native list has had cache hits — use depth heuristic.
+            // Native list has had cache hits â€” use depth heuristic.
             // If outstanding < depth, the list likely had free entries cached.
             //
             USHORT Depth;
@@ -1037,7 +1039,7 @@ LlFree(
 
     if (State == LlStateDestroyed || State == LlStateUninitialized) {
         //
-        // Native list is gone — free directly to pool to prevent leak.
+        // Native list is gone â€” free directly to pool to prevent leak.
         //
         ExFreePoolWithTag(Block, Lookaside->Tag);
         return;
@@ -1100,7 +1102,7 @@ LlSecureFree(
 
     if (State == LlStateDestroyed || State == LlStateUninitialized) {
         //
-        // Native list is gone — securely wipe and free to pool.
+        // Native list is gone â€” securely wipe and free to pool.
         //
         RtlSecureZeroMemory(Block, Lookaside->EntrySize);
         ExFreePoolWithTag(Block, Lookaside->Tag);
@@ -1335,7 +1337,7 @@ LlRegisterPressureCallback(
 
     //
     // Write context FIRST with an interlocked store, then the callback pointer.
-    // The reader (LlpCheckMemoryPressure) reads callback first — if it sees the
+    // The reader (LlpCheckMemoryPressure) reads callback first â€” if it sees the
     // new callback, the context store is already globally visible due to the
     // release semantics of InterlockedExchangePointer.
     //
@@ -1353,7 +1355,7 @@ LlRegisterPressureCallback(
  * entries back to the pool is to delete and re-initialize them. This function
  * iterates all managed lists, acquires exclusive access per-list via the
  * RefCountAndState mechanism, deletes the native list, and re-creates it
- * with the same parameters. Active allocations are NOT affected — they
+ * with the same parameters. Active allocations are NOT affected â€” they
  * were already removed from the free list and will be returned to pool
  * on the next LlFree (new native list will accept them).
  *
@@ -1381,7 +1383,7 @@ LlTrimCaches(
     }
 
     //
-    // Acquire exclusive lock — trim is a heavyweight operation that
+    // Acquire exclusive lock â€” trim is a heavyweight operation that
     // modifies native list internals. No allocations or frees may be
     // in-flight on any managed list during the delete/reinit cycle.
     //
@@ -1417,7 +1419,7 @@ LlTrimCaches(
 
         //
         // Skip lists with outstanding allocations that exceed the
-        // native list depth — these lists are fully utilized and
+        // native list depth â€” these lists are fully utilized and
         // trimming would not reclaim meaningful memory.
         //
         if (Lookaside->Stats.CurrentOutstanding < 0) {
@@ -1428,7 +1430,7 @@ LlTrimCaches(
         // Estimate cached (free-list) entries from native list counters.
         // NativeFrees - NativeFreeMisses = entries successfully returned to cache.
         // NativeAllocates - NativeAllocMisses = entries served from cache.
-        // Cached entries ≈ (successful returns) - (cache hits) when positive.
+        // Cached entries â‰ˆ (successful returns) - (cache hits) when positive.
         //
         {
             ULONG NativeAllocTotal;
@@ -1457,7 +1459,7 @@ LlTrimCaches(
 
             if (CachedEstimate <= 0) {
                 //
-                // No cached entries to reclaim — skip the expensive delete/reinit
+                // No cached entries to reclaim â€” skip the expensive delete/reinit
                 //
                 continue;
             }
@@ -1476,7 +1478,7 @@ LlTrimCaches(
         // Full memory barrier: ensure the Suspended write is globally visible.
         // In-flight LlAllocate that already passed State==Active are in a
         // fast SLIST pop (nanoseconds). LlFree paths that already passed
-        // Active check will push to the SLIST which is safe — ExDelete
+        // Active check will push to the SLIST which is safe â€” ExDelete
         // will drain them. The barrier ensures no new operations start.
         //
         KeMemoryBarrier();
@@ -1485,7 +1487,7 @@ LlTrimCaches(
         // Delete and reinitialize the native lookaside list.
         // ExDelete*LookasideList frees all cached entries back to pool.
         // ExInitialize*LookasideList creates a fresh empty list.
-        // Outstanding allocations are unaffected — they've already been
+        // Outstanding allocations are unaffected â€” they've already been
         // removed from the SLIST. When freed via LlFree, ExFreeTo*List
         // will insert them into the new list's SLIST.
         //
@@ -1990,7 +1992,7 @@ LlpCheckMemoryPressure(
         InterlockedIncrement64(&Manager->GlobalStats.MemoryPressureEvents);
 
         //
-        // Read callback pointer atomically — must pair with the
+        // Read callback pointer atomically â€” must pair with the
         // InterlockedExchangePointer writes in LlRegisterPressureCallback.
         // Read callback FIRST (if non-NULL, context is already visible).
         //

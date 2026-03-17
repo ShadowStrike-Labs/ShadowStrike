@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -737,7 +739,7 @@ ShadowStrikeCleanupPreSetInfo(
     }
 
     //
-    // Signal shutdown — PsipEnterOperation will fail after this
+    // Signal shutdown â€” PsipEnterOperation will fail after this
     //
     InterlockedExchange(&g_PsiState.ShuttingDown, 1);
     MemoryBarrier();
@@ -748,7 +750,7 @@ ShadowStrikeCleanupPreSetInfo(
     // proceeds to delete the lookaside while operations are still outstanding
     // will cause BSOD when those operations later free to the deleted lookaside.
     // PreSetInfo callback is synchronous (FLT_PREOP_SUCCESS_NO_CALLBACK / 
-    // FLT_PREOP_COMPLETE — no post-op), so outstanding ops are actively running
+    // FLT_PREOP_COMPLETE â€” no post-op), so outstanding ops are actively running
     // on other CPUs and will complete in bounded time.
     //
     {
@@ -961,7 +963,7 @@ ShadowStrikePreSetInformation(
                         isActualDeletion = TRUE;
                     }
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    // Buffer access failed — treat as non-deletion (fail-safe)
+                    // Buffer access failed â€” treat as non-deletion (fail-safe)
                 }
             }
             break;
@@ -983,7 +985,7 @@ ShadowStrikePreSetInformation(
                         isActualDeletion = TRUE;
                     }
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    // Buffer access failed — treat as non-deletion (fail-safe)
+                    // Buffer access failed â€” treat as non-deletion (fail-safe)
                 }
             }
             break;
@@ -1233,7 +1235,7 @@ ShadowStrikePreSetInformation(
 
     //
     // ========================================================================
-    // RANSOMWARE ROLLBACK — Backup file before rename/delete
+    // RANSOMWARE ROLLBACK â€” Backup file before rename/delete
     // ========================================================================
     //
     if (infoClass == FileDispositionInformation ||
@@ -1666,7 +1668,7 @@ PsipReferenceProcessContext(
 /**
  * @brief Release a reference to a process context.
  *
- * FIXED: Two-phase approach — interlocked decrement first (fast path),
+ * FIXED: Two-phase approach â€” interlocked decrement first (fast path),
  * only acquire exclusive lock if refcount reaches zero (slow path).
  * This avoids serializing all derefs through a single exclusive lock.
  */
@@ -1689,7 +1691,7 @@ PsipDereferenceProcessContext(
 
     if (newRefCount < 0) {
         //
-        // BUG: Over-release detected — attempt recovery
+        // BUG: Over-release detected â€” attempt recovery
         //
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "[ShadowStrike/PreSetInfo] BUG: RefCount went negative for PID=%lu\n",
@@ -1707,7 +1709,7 @@ PsipDereferenceProcessContext(
 
     if (Context->RefCount == 0) {
         //
-        // Still zero under lock — safe to remove from list
+        // Still zero under lock â€” safe to remove from list
         //
         if (!IsListEmpty(&Context->ListEntry)) {
             RemoveEntryList(&Context->ListEntry);
@@ -1716,7 +1718,7 @@ PsipDereferenceProcessContext(
         }
         shouldFree = TRUE;
     }
-    // else: someone re-referenced it while we waited for the lock — leave it
+    // else: someone re-referenced it while we waited for the lock â€” leave it
 
     ExReleasePushLockExclusive(&g_PsiState.ProcessContextLock);
     KeLeaveCriticalRegion();
@@ -2023,7 +2025,7 @@ PsipDetectCredentialAccess(
  *
  * FIXED: Replaced broken prefix-match with contains-match for directory
  * patterns. Normalized paths start with \Device\HarddiskVolumeN\ so
- * prefix matching against \Windows\ never succeeded — leaving drivers,
+ * prefix matching against \Windows\ never succeeded â€” leaving drivers,
  * boot files, and EFI partition completely unprotected.
  *
  * MatchMode 0 (suffix): path ENDS with pattern (boundary-validated)
@@ -2117,7 +2119,7 @@ PsipIsSensitiveSystemFile(
                 //
                 // Boundary validation: ensure the match is at a path boundary.
                 // If the pattern starts with '\', the leading backslash IS the
-                // boundary marker — no further check needed. Otherwise, the
+                // boundary marker â€” no further check needed. Otherwise, the
                 // character before the match must be '\' or ':' (or start of path).
                 //
                 BOOLEAN isBoundary = FALSE;
@@ -2353,7 +2355,7 @@ PsipGetRenameDestination(
         }
 
         //
-        // Allocate buffer (paged — callback runs at PASSIVE_LEVEL to APC_LEVEL)
+        // Allocate buffer (paged â€” callback runs at PASSIVE_LEVEL to APC_LEVEL)
         //
         buffer = (PWCHAR)ExAllocatePool2(
             POOL_FLAG_PAGED,
@@ -2434,7 +2436,7 @@ PsipSendTelemetryEvent(
     eventSize = FIELD_OFFSET(PSI_TELEMETRY_EVENT, FileName) + fileNameLength + sizeof(WCHAR);
 
     //
-    // Allocate event structure (paged — runs at PASSIVE_LEVEL context)
+    // Allocate event structure (paged â€” runs at PASSIVE_LEVEL context)
     //
     event = (PPSI_TELEMETRY_EVENT)ExAllocatePool2(
         POOL_FLAG_PAGED,
@@ -2467,7 +2469,7 @@ PsipSendTelemetryEvent(
 
     //
     // Send via communication port (ScanBridge).
-    // Non-blocking — if the port is not connected, the event is dropped.
+    // Non-blocking â€” if the port is not connected, the event is dropped.
     //
     status = ShadowStrikeSendMessage(
         event,

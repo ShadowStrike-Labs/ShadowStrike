@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -654,7 +656,7 @@ PrShutdown(
 
     //
     // Wait for all active operations to complete.
-    // MUST wait indefinitely — proceeding before all operations drain
+    // MUST wait indefinitely â€” proceeding before all operations drain
     // would cause use-after-free when we free graph structures below.
     //
     KeWaitForSingleObject(
@@ -1263,7 +1265,7 @@ PrAddRelationship(
     // correlation. The relationship graph's unique value is ENRICHED scoring:
     // cross-session, system-target, orphaned-injector modifiers are layered
     // on top of the raw type score. Only submit when the enriched score
-    // meets the threshold — low-noise signal for kill-chain detection.
+    // meets the threshold â€” low-noise signal for kill-chain detection.
     //
     if (relationship->SuspicionScore >= PR_BE_SUBMISSION_THRESHOLD) {
         BEHAVIOR_EVENT_TYPE beType;

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -326,7 +328,7 @@ SecInitialize(
     internal->ActiveOperations = 1;  // Initial reference
 
     //
-    // Allocate hash table buckets (NonPaged — accessed under push lock)
+    // Allocate hash table buckets (NonPaged â€” accessed under push lock)
     //
     internal->Public.SectionHash.BucketCount = SEC_HASH_BUCKET_COUNT;
     internal->Public.SectionHash.Buckets = (PLIST_ENTRY)ShadowStrikeAllocatePoolWithTag(
@@ -466,7 +468,7 @@ SecShutdown(
     }
 
     //
-    // Signal shutdown FIRST — prevents new operations from starting
+    // Signal shutdown FIRST â€” prevents new operations from starting
     //
     InterlockedExchange(&internal->ShuttingDown, 1);
 
@@ -488,7 +490,7 @@ SecShutdown(
 
     //
     // Release initial operation reference and wait for all active ops to drain.
-    // MUST wait indefinitely — returning while operations are in-flight
+    // MUST wait indefinitely â€” returning while operations are in-flight
     // would cause use-after-free on freed structures.
     //
     SecpReleaseReference(internal);
@@ -497,7 +499,7 @@ SecShutdown(
         Executive,
         KernelMode,
         FALSE,
-        NULL       // S-5 fix: INFINITE wait — cannot proceed with ops in flight
+        NULL       // S-5 fix: INFINITE wait â€” cannot proceed with ops in flight
     );
 
     //
@@ -608,7 +610,7 @@ SecTrackSectionCreate(
     }
 
     //
-    // Initialize entry (outside lock — no contention on private data)
+    // Initialize entry (outside lock â€” no contention on private data)
     //
     RtlZeroMemory(entry, sizeof(SECTION_ENTRY));
     entry->SectionObject = SectionObject;
@@ -702,7 +704,7 @@ SecTrackSectionCreate(
 
     } else {
         //
-        // No backing file — anonymous section
+        // No backing file â€” anonymous section
         //
         if (entry->MaximumSize.QuadPart > SEC_SUSPICIOUS_SIZE_THRESHOLD) {
             InterlockedOr(&entry->SuspicionFlags, SecSuspicion_LargeAnonymous);
@@ -741,7 +743,7 @@ SecTrackSectionCreate(
 
     if (existing != NULL) {
         //
-        // Already tracked — return existing ID safely under lock
+        // Already tracked â€” return existing ID safely under lock
         //
         if (SectionId != NULL) {
             *SectionId = existing->SectionId;
@@ -858,7 +860,7 @@ SecTrackSectionMap(
     isCrossProcess = (ProcessId != entry->CreatorProcessId);
 
     //
-    // Insert under push lock (not spin lock — CRITICAL-1 fix)
+    // Insert under push lock (not spin lock â€” CRITICAL-1 fix)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&entry->MapListLock);
@@ -1026,7 +1028,7 @@ SecUntrackSection(
 }
 
 // ============================================================================
-// SECTION QUERY — Returns opaque snapshots (DESIGN-1 fix)
+// SECTION QUERY â€” Returns opaque snapshots (DESIGN-1 fix)
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1344,7 +1346,7 @@ SecGetSuspiciousSections(
 }
 
 // ============================================================================
-// CROSS-PROCESS ANALYSIS — Returns copied snapshots (HIGH-4 fix)
+// CROSS-PROCESS ANALYSIS â€” Returns copied snapshots (HIGH-4 fix)
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1479,7 +1481,7 @@ SecIsCrossProcessMapped(
 }
 
 // ============================================================================
-// CALLBACKS — Per-registration handle (DESIGN-3 fix)
+// CALLBACKS â€” Per-registration handle (DESIGN-3 fix)
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1742,7 +1744,7 @@ SecpReleaseEntry(
     internal = CONTAINING_RECORD(Entry->Tracker, SEC_TRACKER_INTERNAL, Public);
 
     //
-    // Free all map entries (no lock needed — we're the sole owner)
+    // Free all map entries (no lock needed â€” we're the sole owner)
     //
     while (!IsListEmpty(&Entry->MapList)) {
         mapListEntry = RemoveHeadList(&Entry->MapList);
@@ -1917,7 +1919,7 @@ SecpFreeMapEntry(
 }
 
 // ============================================================================
-// PRIVATE: HASH TABLE (HIGH-6 fix — proper 64-bit hash)
+// PRIVATE: HASH TABLE (HIGH-6 fix â€” proper 64-bit hash)
 // ============================================================================
 
 static ULONG
@@ -2033,7 +2035,7 @@ SecpDetermineSectionType(
 }
 
 // ============================================================================
-// PRIVATE: PE ANALYSIS (CRITICAL-5 fix — proper implementation)
+// PRIVATE: PE ANALYSIS (CRITICAL-5 fix â€” proper implementation)
 // ============================================================================
 
 static VOID
@@ -2143,7 +2145,7 @@ SecpAnalyzePE(
     }
 
     //
-    // Valid PE — extract metadata
+    // Valid PE â€” extract metadata
     //
     Entry->PE.IsPE = TRUE;
     Entry->PE.Machine = ntHeaders->FileHeader.Machine;
@@ -2183,7 +2185,7 @@ CleanupPE:
 }
 
 // ============================================================================
-// PRIVATE: FILE HASH (HIGH-1 fix — real implementation using HashUtils)
+// PRIVATE: FILE HASH (HIGH-1 fix â€” real implementation using HashUtils)
 // ============================================================================
 
 static VOID
@@ -2306,7 +2308,7 @@ CleanupHash:
 }
 
 // ============================================================================
-// PRIVATE: SUSPICION SCORE (MED-4 fix — thread-safe)
+// PRIVATE: SUSPICION SCORE (MED-4 fix â€” thread-safe)
 // ============================================================================
 
 static VOID
@@ -2349,7 +2351,7 @@ SecpUpdateSuspicionScore(
 }
 
 // ============================================================================
-// PRIVATE: SNAPSHOT HELPERS (DESIGN-1 — fill read-only copies for callers)
+// PRIVATE: SNAPSHOT HELPERS (DESIGN-1 â€” fill read-only copies for callers)
 // ============================================================================
 
 static VOID
@@ -2367,7 +2369,7 @@ SecpFillSectionInfo(
     Info->MaximumSize = Entry->MaximumSize;
 
     //
-    // S-6 fix: Do NOT copy FileName UNICODE_STRING pointer — the Buffer
+    // S-6 fix: Do NOT copy FileName UNICODE_STRING pointer â€” the Buffer
     // points into the internal entry's allocation and becomes a dangling
     // pointer once the caller's lock/reference is released. Clear it to
     // prevent use-after-free. Callers needing the filename should use
@@ -2446,7 +2448,7 @@ SecpInvokeCreateCallbacks(
                 );
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 //
-                // Callback faulted — disable it to prevent repeated crashes.
+                // Callback faulted â€” disable it to prevent repeated crashes.
                 // Use interlocked writes because we hold CallbackLock SHARED.
                 //
                 InterlockedExchange8((volatile CHAR*)&Tracker->CreateCallbacks[i].InUse, FALSE);
@@ -2488,7 +2490,7 @@ SecpInvokeMapCallbacks(
                 );
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 //
-                // Callback faulted — disable it to prevent repeated crashes.
+                // Callback faulted â€” disable it to prevent repeated crashes.
                 // Use interlocked writes because we hold CallbackLock SHARED.
                 //
                 InterlockedExchange8((volatile CHAR*)&Tracker->MapCallbacks[i].InUse, FALSE);
@@ -2690,7 +2692,7 @@ SecpIsSuspiciousName(
     }
 
     //
-    // Very long filename (> 200 chars) — possible evasion
+    // Very long filename (> 200 chars) â€” possible evasion
     //
     if (fileNameLen > 200) {
         return TRUE;
@@ -2717,7 +2719,7 @@ SecpAcquireReference(
 
     if (Tracker->ShuttingDown) {
         //
-        // Shutting down — undo the increment and bail
+        // Shutting down â€” undo the increment and bail
         //
         if (InterlockedDecrement(&Tracker->ActiveOperations) == 0) {
             KeSetEvent(&Tracker->ShutdownEvent, IO_NO_INCREMENT, FALSE);

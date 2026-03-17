@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -92,13 +94,13 @@ ExclusionpIsReady(
 }
 
 // ============================================================================
-// INTERNAL HELPERS — RUNDOWN PROTECTION
+// INTERNAL HELPERS â€” RUNDOWN PROTECTION
 // ============================================================================
 
 /**
  * @brief Acquire rundown protection to prevent shutdown from freeing state.
  *
- * Uses EX_RUNDOWN_REF — the correct NT kernel primitive for this pattern.
+ * Uses EX_RUNDOWN_REF â€” the correct NT kernel primitive for this pattern.
  * No race condition: ExAcquireRundownProtection is atomic.
  *
  * @return TRUE if acquired, FALSE if shutdown is in progress.
@@ -133,7 +135,7 @@ ExclusionpReleaseRundown(
  *
  * All mutation APIs must be called from kernel mode only. If this driver
  * ever exposes IOCTLs that dispatch to these APIs, the IOCTL handler must
- * validate privileges separately — this is a defense-in-depth check.
+ * validate privileges separately â€” this is a defense-in-depth check.
  *
  * @return TRUE if caller is kernel-mode, FALSE otherwise.
  */
@@ -149,7 +151,7 @@ ExclusionpValidateCallerIsKernel(
 }
 
 // ============================================================================
-// INTERNAL HELPERS — DUPLICATE DETECTION
+// INTERNAL HELPERS â€” DUPLICATE DETECTION
 // ============================================================================
 
 /**
@@ -256,7 +258,7 @@ ExclusionpProcessExistLocked(
 }
 
 // ============================================================================
-// TIMER CALLBACK — EXPIRED ENTRY CLEANUP
+// TIMER CALLBACK â€” EXPIRED ENTRY CLEANUP
 // ============================================================================
 
 /**
@@ -280,14 +282,14 @@ ExclusionpCleanupTimerCallback(
 }
 
 // ============================================================================
-// SHUTDOWN HELPERS — STATE-GATE-FREE ENTRY FREEING
+// SHUTDOWN HELPERS â€” STATE-GATE-FREE ENTRY FREEING
 // ============================================================================
 // These helpers free all entries WITHOUT checking ExclusionpIsReady().
 // They are called ONLY from ShadowStrikeExclusionShutdown after rundown
 // drain completes. No lock is needed because:
-// 1. State is SHUTTING_DOWN — no new rundown acquisitions succeed.
-// 2. ExWaitForRundownProtectionRelease returned — all active users drained.
-// 3. The cleanup timer is cancelled — no concurrent timer callbacks.
+// 1. State is SHUTTING_DOWN â€” no new rundown acquisitions succeed.
+// 2. ExWaitForRundownProtectionRelease returned â€” all active users drained.
+// 3. The cleanup timer is cancelled â€” no concurrent timer callbacks.
 // Locks are still acquired defensively for correctness under code evolution.
 
 static VOID
@@ -439,7 +441,7 @@ ShadowStrikeExclusionInitialize(
     }
 
     //
-    // Initialize rundown protection — the correct kernel primitive for
+    // Initialize rundown protection â€” the correct kernel primitive for
     // "allow concurrent access, block shutdown until all users drain."
     //
     ExInitializeRundownProtection(&g_ExclusionManager.RundownRef);
@@ -540,13 +542,13 @@ ShadowStrikeExclusionShutdown(
     // Wait for all active users to drain. ExWaitForRundownProtectionRelease
     // blocks until every ExAcquireRundownProtection holder has called
     // ExReleaseRundownProtection. After this returns, no new acquisitions
-    // are possible. No timeout — if a caller is stuck, that is a separate
+    // are possible. No timeout â€” if a caller is stuck, that is a separate
     // bug that must not be masked by forced freeing.
     //
     ExWaitForRundownProtectionRelease(&g_ExclusionManager.RundownRef);
 
     //
-    // All users have drained — free all entries directly. We CANNOT use
+    // All users have drained â€” free all entries directly. We CANNOT use
     // ShadowStrikeClearExclusions here because it checks ExclusionpIsReady()
     // which requires State==READY, but we've already transitioned to
     // SHUTTING_DOWN. Inline the freeing to avoid the state-gate leak.
@@ -606,7 +608,7 @@ ShadowStrikeIsPathExcluded(
         bucket = &g_ExclusionManager.ExtensionBuckets[bucketIndex];
 
         //
-        // Fast-path: if bucket is empty, skip. This is a benign race —
+        // Fast-path: if bucket is empty, skip. This is a benign race â€”
         // a concurrent add may be missed for one check cycle.
         // ReadNoFence makes the intentional raciness explicit.
         //
@@ -918,7 +920,7 @@ ShadowStrikeAddPathExclusion(
     }
 
     //
-    // Allocate entry from PagedPool — only accessed at <= APC_LEVEL
+    // Allocate entry from PagedPool â€” only accessed at <= APC_LEVEL
     //
     entry = (PSHADOWSTRIKE_PATH_EXCLUSION)ExAllocatePoolZero(
         PagedPool,
@@ -931,7 +933,7 @@ ShadowStrikeAddPathExclusion(
     }
 
     //
-    // Initialize entry — normalize path to uppercase
+    // Initialize entry â€” normalize path to uppercase
     //
     entry->Flags = Flags;
 
@@ -962,7 +964,7 @@ ShadowStrikeAddPathExclusion(
     }
 
     //
-    // Insert into list under exclusive lock — check limit and duplicates atomically
+    // Insert into list under exclusive lock â€” check limit and duplicates atomically
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ExclusionManager.PathLock);
@@ -1059,7 +1061,7 @@ ShadowStrikeAddExtensionExclusion(
     }
 
     //
-    // Insert under exclusive lock — atomic limit + duplicate check
+    // Insert under exclusive lock â€” atomic limit + duplicate check
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ExclusionManager.ExtensionLock);
@@ -1160,7 +1162,7 @@ ShadowStrikeAddProcessExclusion(
     }
 
     //
-    // Insert under exclusive lock — atomic limit + duplicate check
+    // Insert under exclusive lock â€” atomic limit + duplicate check
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ExclusionManager.ProcessLock);
@@ -1291,7 +1293,7 @@ ShadowStrikeLoadDefaultExclusions(
     PAGED_CODE();
 
     //
-    // NTFS metafiles — these generate enormous I/O and cannot contain
+    // NTFS metafiles â€” these generate enormous I/O and cannot contain
     // user-mode executable code. They are safe to exclude.
     //
     // These use the ShadowStrikeExclusionFlagRecursive flag so they match
@@ -1316,7 +1318,7 @@ ShadowStrikeLoadDefaultExclusions(
         ShadowStrikeExclusionFlagSystem | ShadowStrikeExclusionFlagRecursive, 0);
 
     //
-    // System paging files — locked by the OS, cannot be tampered with.
+    // System paging files â€” locked by the OS, cannot be tampered with.
     // Recursive flag ensures matching across all volumes.
     //
     RtlInitUnicodeString(&str, L"\\pagefile.sys");
@@ -1333,7 +1335,7 @@ ShadowStrikeLoadDefaultExclusions(
 
     //
     // NOTE: No extension exclusions are loaded by default.
-    // No file extension is inherently safe — malware uses .log, .txt, .db,
+    // No file extension is inherently safe â€” malware uses .log, .txt, .db,
     // .dat, and other "innocent" extensions for payload storage, C2 data,
     // and credential exfiltration. Extension exclusions must be explicitly
     // configured by the administrator.
@@ -1346,7 +1348,7 @@ ShadowStrikeExclusionSetEnabled(
     )
 {
     //
-    // InterlockedExchange8 provides full memory barrier — no additional
+    // InterlockedExchange8 provides full memory barrier â€” no additional
     // MemoryBarrier() needed.
     //
     InterlockedExchange8((volatile CHAR*)&g_ExclusionManager.Enabled, (CHAR)Enable);
@@ -1598,7 +1600,7 @@ ShadowStrikeAddPidExclusion(
         if (g_ExclusionManager.PidExclusions[i].Valid) {
             if (g_ExclusionManager.PidExclusions[i].ProcessId == ProcessId) {
                 //
-                // Already exists — update TTL
+                // Already exists â€” update TTL
                 //
                 if (TTLSeconds > 0) {
                     g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart =
@@ -1720,7 +1722,7 @@ ShadowStrikeExclusionGetStats(
     //
     // Snapshot statistics. Individual fields are monotonically correct
     // (InterlockedIncrement64 updates). Cross-field consistency is NOT
-    // guaranteed — e.g., TotalChecks may not equal the sum of individual
+    // guaranteed â€” e.g., TotalChecks may not equal the sum of individual
     // match counters at the instant of the snapshot. This is documented
     // and acceptable for telemetry/diagnostics.
     //

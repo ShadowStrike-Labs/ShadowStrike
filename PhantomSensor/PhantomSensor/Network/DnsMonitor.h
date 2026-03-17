@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -328,7 +330,7 @@ typedef struct _DNS_PROCESS_CONTEXT {
 } DNS_PROCESS_CONTEXT, *PDNS_PROCESS_CONTEXT;
 
 //=============================================================================
-// DNS Monitor (opaque handle — internals hidden in .c)
+// DNS Monitor (opaque handle â€” internals hidden in .c)
 //=============================================================================
 
 typedef struct _DNS_MONITOR DNS_MONITOR, *PDNS_MONITOR;

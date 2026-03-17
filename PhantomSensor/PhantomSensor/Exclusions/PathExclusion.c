@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -57,7 +59,7 @@
  *
  * Bounds total work against adversarial patterns (e.g., *?*?*?*?*).
  * Set to StringLen * PatternLen cap. For a 520-char path and 520-char
- * pattern, worst case is 270400 iterations — well under 1ms on modern
+ * pattern, worst case is 270400 iterations â€” well under 1ms on modern
  * hardware. This prevents unbounded CPU consumption without affecting
  * legitimate patterns.
  */
@@ -171,7 +173,7 @@ PathpWildcardMatch(
         }
         else if (pi < PatternLen && Pattern[pi] == L'*') {
             //
-            // '*' — record bookmark for backtracking
+            // '*' â€” record bookmark for backtracking
             //
             starPi = pi;
             starSi = si;
@@ -262,7 +264,7 @@ PeNormalizePath(
 
     //
     // Reject paths exceeding maximum length. Silent truncation is a
-    // security risk — a truncated exclusion pattern could match
+    // security risk â€” a truncated exclusion pattern could match
     // unintended paths crafted by an attacker.
     //
     if (inputChars > SHADOWSTRIKE_MAX_EXCLUSION_PATH_LENGTH) {
@@ -270,7 +272,7 @@ PeNormalizePath(
     }
 
     //
-    // Allocate buffer — ULONG to prevent overflow on future constant changes.
+    // Allocate buffer â€” ULONG to prevent overflow on future constant changes.
     // Use PagedPool: this function runs at PASSIVE_LEVEL during exclusion
     // insertion, not on the hot match path. NonPagedPool is a scarce
     // kernel resource and must not be wasted for configuration operations.
@@ -421,18 +423,18 @@ ShadowStrikeMatchPathPattern(
     }
 
     //
-    // Prefix matched — check if we should match children
+    // Prefix matched â€” check if we should match children
     //
     if (recursive) {
         //
-        // Pattern ended with separator → subtree match
+        // Pattern ended with separator â†’ subtree match
         //
         if (Pattern->Buffer[patternChars - 1] == PATH_SEPARATOR) {
             return TRUE;
         }
 
         //
-        // Next character in file path is separator → proper subtree boundary
+        // Next character in file path is separator â†’ proper subtree boundary
         //
         if (FilePath->Buffer[patternChars] == PATH_SEPARATOR) {
             return TRUE;

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -114,13 +116,13 @@ typedef enum _FP_PROTECTION_FLAGS {
     //
     FpProtect_Recursive         = 0x00000100,
     FpProtect_IncludeStreams    = 0x00000200,   // Evaluated in FpCheckAccess stream path
-    FpProtect_FollowLinks       = 0x00000400,  // Reserved — reparse point traversal (future)
+    FpProtect_FollowLinks       = 0x00000400,  // Reserved â€” reparse point traversal (future)
 
     //
     // Audit flags
     //
     FpProtect_AuditOnly         = 0x00001000,
-    FpProtect_AlertOnAccess     = 0x00002000,  // Reserved — read-access telemetry (future)
+    FpProtect_AlertOnAccess     = 0x00002000,  // Reserved â€” read-access telemetry (future)
 
     //
     // Convenience combinations
@@ -163,7 +165,7 @@ typedef enum _FP_ACCESS_RESULT {
 
 /**
  * @brief Public audit log entry for consumption by callers.
- *        No LIST_ENTRY or kernel pointers — safe for user-mode copy.
+ *        No LIST_ENTRY or kernel pointers â€” safe for user-mode copy.
  */
 typedef struct _FP_AUDIT_ENTRY_INFO {
     LARGE_INTEGER Timestamp;
@@ -223,7 +225,7 @@ typedef struct _FP_STATISTICS {
 
 /**
  * @brief Access check result with matched rule info.
- *        Returned by FpCheckFileAccess — contains copies, no dangling pointers.
+ *        Returned by FpCheckFileAccess â€” contains copies, no dangling pointers.
  */
 typedef struct _FP_ACCESS_CHECK_RESULT {
     FP_ACCESS_RESULT Result;
@@ -267,7 +269,7 @@ FpShutdown(
 
 /**
  * @brief Configure the file protection engine.
- *        Thread-safe — uses internal synchronization.
+ *        Thread-safe â€” uses internal synchronization.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -328,7 +330,7 @@ FpClearAllRules(
 
 /**
  * @brief Check if a file operation should be blocked.
- *        All path data is copied under lock — no dangling references.
+ *        All path data is copied under lock â€” no dangling references.
  */
 _IRQL_requires_max_(APC_LEVEL)
 FP_ACCESS_RESULT

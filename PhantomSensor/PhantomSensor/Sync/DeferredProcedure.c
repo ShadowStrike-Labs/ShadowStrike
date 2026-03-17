@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -17,7 +19,7 @@
  */
 /**
  * ============================================================================
- * ShadowStrike NGAV — Enterprise DPC Management
+ * ShadowStrike NGAV â€” Enterprise DPC Management
  * ============================================================================
  *
  * @file DeferredProcedure.c
@@ -36,7 +38,7 @@
  *
  *   2. No SEH (__try/__except) in DPC callbacks.  DPC routines run at
  *      DISPATCH_LEVEL where SEH is undefined behavior.  Faults must
- *      bugcheck — masking them corrupts kernel state silently.
+ *      bugcheck â€” masking them corrupts kernel state silently.
  *
  *   3. No chaining.  The original chain design stored cross-object
  *      pointers with no ownership model, creating use-after-free and
@@ -49,7 +51,7 @@
  *      queues, then waits on DrainEvent (signaled when ActiveCount
  *      hits 0 during shutdown).
  *
- *   5. Dead RefCount code removed.  It was never used — false safety
+ *   5. Dead RefCount code removed.  It was never used â€” false safety
  *      claim.  Lifetime is managed by pool ownership + ActiveCount.
  *
  *   6. KeSetTargetProcessorDpcEx with PROCESSOR_NUMBER replaces
@@ -160,7 +162,7 @@ DpcInitialize(
     }
 
     //
-    // Allocate manager (NonPagedPoolNx — accessed at DISPATCH_LEVEL).
+    // Allocate manager (NonPagedPoolNx â€” accessed at DISPATCH_LEVEL).
     //
     mgr = (PDPC_MANAGER)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx, sizeof(DPC_MANAGER), DPC_POOL_TAG);
@@ -196,7 +198,7 @@ DpcInitialize(
     mgr->FreeCount = (LONG)actualSize;
 
     //
-    // Drain event — signaled when ActiveCount reaches 0 during shutdown.
+    // Drain event â€” signaled when ActiveCount reaches 0 during shutdown.
     //
     KeInitializeEvent(&mgr->DrainEvent, NotificationEvent, FALSE);
 
@@ -206,7 +208,7 @@ DpcInitialize(
     KeQuerySystemTime(&mgr->StartTime);
 
     //
-    // Publish — Initialized is the gate for all queue operations.
+    // Publish â€” Initialized is the gate for all queue operations.
     // FIX DPC-M1: Init rundown protection for TOCTOU-safe queue/shutdown.
     //
     ExInitializeRundownProtection(&mgr->RundownRef);
@@ -246,7 +248,7 @@ DpcShutdown(
     *Manager = NULL;
 
     //
-    // STEP 1: Gate — reject all new DpcQueue calls.
+    // STEP 1: Gate â€” reject all new DpcQueue calls.
     //
     InterlockedExchange(&mgr->Initialized, 0);
 
@@ -258,7 +260,7 @@ DpcShutdown(
         if (obj->State == DpcState_Queued) {
             if (KeRemoveQueueDpc(&obj->Dpc)) {
                 //
-                // Successfully dequeued — release rundown ref that was
+                // Successfully dequeued â€” release rundown ref that was
                 // acquired in DpcQueue (won't reach DpcpCompleteObject).
                 //
                 DpcpClearContext(obj);
@@ -291,7 +293,7 @@ DpcShutdown(
         if (waitStatus == STATUS_TIMEOUT) {
             //
             // FIX DPC-H1: DPC callbacks still in-flight after 30s.
-            // Do NOT free — UAF from active DPC callbacks is worse
+            // Do NOT free â€” UAF from active DPC callbacks is worse
             // than a small pool leak. Log and bail.
             //
 #if DBG
@@ -321,7 +323,7 @@ DpcShutdown(
 }
 
 // ============================================================================
-// DpcQueue  — queue a DPC with inline context copy
+// DpcQueue  â€” queue a DPC with inline context copy
 // ============================================================================
 
 _Use_decl_annotations_
@@ -399,7 +401,7 @@ DpcQueue(
     }
 
     //
-    // Initialize kernel DPC — either normal or threaded, never both.
+    // Initialize kernel DPC â€” either normal or threaded, never both.
     //
     if (type == DpcType_Threaded) {
         KeInitializeThreadedDpc(&obj->Dpc, DpcpDpcRoutine, obj);
@@ -419,7 +421,7 @@ DpcQueue(
     }
 
     //
-    // Processor targeting — use Ex variant for >64 CPU support.
+    // Processor targeting â€” use Ex variant for >64 CPU support.
     //
     if (obj->ProcessorTargeted) {
         status = KeSetTargetProcessorDpcEx(&obj->Dpc, &obj->TargetProcessor);
@@ -454,7 +456,7 @@ DpcQueue(
 }
 
 // ============================================================================
-// DpcQueueExternal — caller-managed context lifetime
+// DpcQueueExternal â€” caller-managed context lifetime
 // ============================================================================
 
 _Use_decl_annotations_
@@ -553,7 +555,7 @@ DpcQueueExternal(
 }
 
 // ============================================================================
-// DpcQueueOnProcessor — convenience wrapper
+// DpcQueueOnProcessor â€” convenience wrapper
 // ============================================================================
 
 _Use_decl_annotations_
@@ -577,7 +579,7 @@ DpcQueueOnProcessor(
 }
 
 // ============================================================================
-// DpcQueueThreaded — convenience wrapper
+// DpcQueueThreaded â€” convenience wrapper
 // ============================================================================
 
 _Use_decl_annotations_
@@ -649,7 +651,7 @@ DpcpAllocateObject(
 
     //
     // FreeListEntry is the FIRST field, so CONTAINING_RECORD is a
-    // no-op cast — but we use it for type safety.
+    // no-op cast â€” but we use it for type safety.
     //
     obj = CONTAINING_RECORD(entry, DPC_OBJECT, FreeListEntry);
 
@@ -724,7 +726,7 @@ DpcpResetObject(
 //
 // This is the single DPC routine for all queued DPCs.
 // ActiveCount tracks in-flight callbacks for deterministic shutdown.
-// No SEH — faults at DISPATCH_LEVEL must bugcheck, not be silenced.
+// No SEH â€” faults at DISPATCH_LEVEL must bugcheck, not be silenced.
 // ============================================================================
 
 static
@@ -755,7 +757,7 @@ DpcpDpcRoutine(
     InterlockedExchange((PLONG)&obj->State, DpcState_Running);
 
     //
-    // Execute the user callback.  No SEH — if this faults, the
+    // Execute the user callback.  No SEH â€” if this faults, the
     // system must bugcheck.  Masking exceptions at DISPATCH_LEVEL
     // is undefined behavior and silently corrupts kernel state.
     //
@@ -805,7 +807,7 @@ DpcpCompleteObject(
     InterlockedExchange((PLONG)&Object->State, DpcState_Completed);
 
     //
-    // Fire optional completion callback (no SEH — same rationale).
+    // Fire optional completion callback (no SEH â€” same rationale).
     //
     if (Object->CompletionCallback != NULL) {
         Object->CompletionCallback(Status, Object->CompletionContext);

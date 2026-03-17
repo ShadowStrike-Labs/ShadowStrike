@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -362,7 +364,7 @@ ShadowStrikeScanBridgeInitialize(
     PAGED_CODE();
 
     //
-    // Zero-initialize BEFORE setting flag — avoids a window where
+    // Zero-initialize BEFORE setting flag â€” avoids a window where
     // Initialized=1 but the struct is being cleared.
     //
     if (InterlockedCompareExchange(&g_ScanBridge.Initialized, 1, 0) != 0) {
@@ -1100,7 +1102,7 @@ SbSendScanRequestEx(
         //
         if (Result->ThreatDetected) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                "ScanBridge: Threat detected — verdict=%ls score=%u\n",
+                "ScanBridge: Threat detected â€” verdict=%ls score=%u\n",
                 ShadowStrikeGetVerdictName(Result->Verdict),
                 Result->ThreatScore);
         }
@@ -1577,7 +1579,7 @@ ShadowStrikeSendImageNotification(
     notification->ProcessId = HandleToULong(ProcessId);
     notification->ImageBase = (UINT64)ImageInfo->ImageBase;
     notification->ImageSize = (UINT64)ImageInfo->ImageSize;
-    notification->IsSystemImage = (BOOLEAN)ImageInfo->SystemModeImage;
+    notification->IsSystemImage = (ImageInfo->SystemModeImage != 0);
 
     //
     // Get signature information from extended info if available
@@ -2333,7 +2335,7 @@ SbpCheckCircuitBreaker(
         if (timeSinceOpen >= SB_CIRCUIT_BREAKER_RECOVERY_MS) {
             //
             // Transition to half-open to test.
-            // Use CAS to ensure only one thread wins the Open→HalfOpen
+            // Use CAS to ensure only one thread wins the Openâ†’HalfOpen
             // transition; losers see the updated state and still proceed.
             //
             LONG prev = InterlockedCompareExchange(
@@ -2532,7 +2534,7 @@ SbpSendWithRetry(
     //
     // Acquire reference-counted scanner port.  This prevents
     // use-after-free if the client disconnects between acquire
-    // and FltSendMessage — the reference keeps the slot alive.
+    // and FltSendMessage â€” the reference keeps the slot alive.
     //
     status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
     if (!NT_SUCCESS(status)) {
@@ -2582,7 +2584,7 @@ SbpSendWithRetry(
 
             if (attempt < MaxRetries) {
                 //
-                // Release reference before delay — holding a reference
+                // Release reference before delay â€” holding a reference
                 // across a long sleep blocks port cleanup on disconnect.
                 //
                 ShadowStrikeReleaseClientPort(clientRef);

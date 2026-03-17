@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -114,7 +116,7 @@ Detection Techniques Covered:
 // Callback registration entry
 //
 #pragma warning(push)
-#pragma warning(disable:4201)   // nameless union — intentional for dual callback type
+#pragma warning(disable:4201)   // nameless union â€” intentional for dual callback type
 typedef struct _INJ_CALLBACK_ENTRY {
     union {
         INJ_DETECTION_CALLBACK DetectionCallback;
@@ -136,7 +138,7 @@ typedef struct _INJ_OPERATION_BUCKET {
 } INJ_OPERATION_BUCKET, *PINJ_OPERATION_BUCKET;
 
 //
-// Process hash bucket for context lookup (chained — linked list per bucket)
+// Process hash bucket for context lookup (chained â€” linked list per bucket)
 //
 typedef struct _INJ_PROCESS_BUCKET {
     LIST_ENTRY ContextList;
@@ -148,7 +150,7 @@ typedef struct _INJ_PROCESS_BUCKET {
 // Extended detector with private data.
 //
 // C-6: This structure is large (~300KB+ due to hash tables).
-// It MUST be pool-allocated (NonPagedPoolNx) — never stack-allocated.
+// It MUST be pool-allocated (NonPagedPoolNx) â€” never stack-allocated.
 // InjInitialize is the only creator.
 //
 typedef struct _INJ_DETECTOR_INTERNAL {
@@ -195,7 +197,7 @@ typedef struct _INJ_DETECTOR_INTERNAL {
     BOOLEAN LookasideInitialized;
 
     //
-    // Worker thread for chain analysis (PETHREAD, not HANDLE — for KeWaitForSingleObject)
+    // Worker thread for chain analysis (PETHREAD, not HANDLE â€” for KeWaitForSingleObject)
     //
     PETHREAD WorkerThread;
     KEVENT ShutdownEvent;
@@ -428,7 +430,7 @@ InjpIsWritableProtection(
     );
 
 //
-// Process context cleanup — called when a process exits.
+// Process context cleanup â€” called when a process exits.
 // Must be registered via PsSetCreateProcessNotifyRoutineEx by the
 // driver's initialization code (e.g., DriverEntry or SensorInitialize).
 //
@@ -766,7 +768,7 @@ Arguments:
     }
 
     //
-    // Free all process contexts (chained hash — walk linked list per bucket)
+    // Free all process contexts (chained hash â€” walk linked list per bucket)
     //
     for (i = 0; i < INJ_HASH_BUCKET_COUNT; i++) {
         KeAcquireSpinLock(&Internal->ProcessBuckets[i].Lock, &OldIrql);
@@ -940,7 +942,7 @@ Return Value:
     // Find or create correlation chain and add operation atomically.
     // I-3 FIX: The old InjpFindOrCreateChain + InjpAddOperationToChain pair
     // released ChainLock between find and add, allowing another thread to free
-    // the chain before the operation was added → use-after-free.
+    // the chain before the operation was added â†’ use-after-free.
     // The new InjpCorrelateOperationWithChain holds ChainLock across both.
     //
     if (Internal->Public.Config.EnableChainCorrelation) {
@@ -1008,7 +1010,7 @@ Return Value:
     *Result = NULL;
 
     //
-    // Find matching chain — H-8 FIX: generate result under lock to prevent
+    // Find matching chain â€” H-8 FIX: generate result under lock to prevent
     // dangling chain pointer after lock release.
     //
     KeAcquireSpinLock(&Internal->ChainLock, &OldIrql);
@@ -1726,7 +1728,7 @@ InjpInsertOperation(
 
     //
     // FIX INJ-M1: TotalOperationCount was already pre-incremented in InjRecordOperation
-    // before allocation. No increment here — the slot was reserved upfront.
+    // before allocation. No increment here â€” the slot was reserved upfront.
     //
 
     return STATUS_SUCCESS;
@@ -1784,7 +1786,7 @@ InjpLookupProcessContext(
     Hash = InjpHashProcessId(ProcessId);
 
     //
-    // Search the chained hash bucket (single lock, no linear probing — no deadlock)
+    // Search the chained hash bucket (single lock, no linear probing â€” no deadlock)
     //
     KeAcquireSpinLock(&Detector->ProcessBuckets[Hash].Lock, &OldIrql);
 
@@ -1898,7 +1900,7 @@ InjpFreeChain(
     //
     // I-8 FIX: Detach all operations from the chain under ChainLock.
     // This prevents InjpCleanupStaleOperations from accessing ChainEntry
-    // on an operation that we're about to free (data race → BSOD).
+    // on an operation that we're about to free (data race â†’ BSOD).
     // After detach, ChainEntry points to the local OpsToFree list.
     //
     KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
@@ -1912,7 +1914,7 @@ InjpFreeChain(
     KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
 
     //
-    // Phase 2: Remove from hash buckets and free — outside all locks.
+    // Phase 2: Remove from hash buckets and free â€” outside all locks.
     //
     while (!IsListEmpty(&OpsToFree)) {
         Entry = RemoveHeadList(&OpsToFree);
@@ -1973,7 +1975,7 @@ InjpCorrelateOperationWithChain(
             }
 
             //
-            // Chain has timed out — remove from list, will free after lock release
+            // Chain has timed out â€” remove from list, will free after lock release
             //
             RemoveEntryList(&Candidate->ListEntry);
             InterlockedDecrement(&Detector->ActiveChainCount);
@@ -1983,13 +1985,13 @@ InjpCorrelateOperationWithChain(
     }
 
     //
-    // Create new chain if needed (still under ChainLock — prevents duplicate creation race)
+    // Create new chain if needed (still under ChainLock â€” prevents duplicate creation race)
     //
     if (Chain == NULL) {
         Chain = InjpAllocateChain(Detector);
         if (Chain == NULL) {
             //
-            // Allocation failed — restore stale chain if we removed one
+            // Allocation failed â€” restore stale chain if we removed one
             //
             if (StaleChain != NULL) {
                 InsertTailList(&Detector->ActiveChains, &StaleChain->ListEntry);
@@ -2011,7 +2013,7 @@ InjpCorrelateOperationWithChain(
     }
 
     //
-    // Add operation to chain — still holding ChainLock (atomically safe)
+    // Add operation to chain â€” still holding ChainLock (atomically safe)
     //
     if (Chain->OperationCount < Detector->Public.Config.MaxOperationsPerChain) {
         InsertTailList(&Chain->OperationList, &Operation->ChainEntry);
@@ -2103,7 +2105,7 @@ InjpCalculateOperationPatterns(
     // I-6 FIX: Track operation types cumulatively instead of requiring strict
     // adjacency. Real attack chains often interleave operations (e.g., an
     // attacker may allocate, then query, then write). The old PrevOp check
-    // only detected Allocate→Write when they were consecutive, missing most
+    // only detected Allocateâ†’Write when they were consecutive, missing most
     // real-world injection patterns.
     //
     BOOLEAN HasAllocate = FALSE;
@@ -2520,7 +2522,7 @@ InjpNotifyDetectionCallbacks(
     }
 
     //
-    // Invoke callbacks outside lock — caller must ensure PASSIVE_LEVEL
+    // Invoke callbacks outside lock â€” caller must ensure PASSIVE_LEVEL
     //
     for (i = 0; i < Count; i++) {
         __try {
@@ -2529,7 +2531,7 @@ InjpNotifyDetectionCallbacks(
                 LocalCallbacks[i].Context
                 );
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            // Log and continue — callback faults must not crash the driver
+            // Log and continue â€” callback faults must not crash the driver
         }
     }
 }
@@ -2672,7 +2674,7 @@ InjpWorkerThread(
                         ULONG Confidence;
 
                         //
-                        // InjpAnalyzeChain only reads chain data — safe under ChainLock
+                        // InjpAnalyzeChain only reads chain data â€” safe under ChainLock
                         //
                         Technique = InjpAnalyzeChain(Detector, Chain, &Confidence);
 
@@ -2686,7 +2688,7 @@ InjpWorkerThread(
 
                             //
                             // InjpGenerateDetectionResult only reads chain fields
-                            // and allocates from lookaside — safe at DISPATCH_LEVEL.
+                            // and allocates from lookaside â€” safe at DISPATCH_LEVEL.
                             //
                             Status = InjpGenerateDetectionResult(
                                 Detector,
@@ -2775,10 +2777,10 @@ InjpCleanupStaleOperations(
         InitializeListHead(&StaleList);
 
         //
-        // FIX INJ-H1: Phase 1 — Collect all stale operations under lock WITHOUT
+        // FIX INJ-H1: Phase 1 â€” Collect all stale operations under lock WITHOUT
         // dropping it. The previous pattern released BucketLock to do chain cleanup,
         // then re-acquired it. Between release and re-acquire, another thread could
-        // remove+free the element that 'Next' pointed to → UAF on loop continuation.
+        // remove+free the element that 'Next' pointed to â†’ UAF on loop continuation.
         // Batch-collect avoids this by holding the lock for the entire scan.
         //
         KeAcquireSpinLock(&Detector->OperationBuckets[i].Lock, &OldIrql);
@@ -2792,7 +2794,7 @@ InjpCleanupStaleOperations(
 
             if ((CurrentTime.QuadPart - Operation->Timestamp.QuadPart) > TimeoutInterval.QuadPart) {
                 //
-                // Operation is stale — unlink from bucket and move to deferred list
+                // Operation is stale â€” unlink from bucket and move to deferred list
                 //
                 RemoveEntryList(&Operation->HashEntry);
                 Detector->OperationBuckets[i].Count--;
@@ -2805,7 +2807,7 @@ InjpCleanupStaleOperations(
         KeReleaseSpinLock(&Detector->OperationBuckets[i].Lock, OldIrql);
 
         //
-        // FIX INJ-H1: Phase 2 — Process stale operations outside bucket lock.
+        // FIX INJ-H1: Phase 2 â€” Process stale operations outside bucket lock.
         // Chain cleanup happens under ChainLock (correct ordering: no bucket lock held).
         //
         while (!IsListEmpty(&StaleList)) {
@@ -2957,7 +2959,7 @@ InjpIsSuspiciousProtection(
     )
 {
     //
-    // M-6 FIX: PAGE_* constants are NOT bitmasks — they are mutually exclusive values.
+    // M-6 FIX: PAGE_* constants are NOT bitmasks â€” they are mutually exclusive values.
     // Must use equality comparison, not bitwise AND.
     // Extract the base protection (low 8 bits, ignoring modifier flags).
     //

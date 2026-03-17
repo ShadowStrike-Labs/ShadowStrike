@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -698,7 +700,7 @@ IomInitialize(
             CO_CACHE_CONFIG coConfig;
             CoInitDefaultConfig(&coConfig);
             coConfig.MaxEntries = 16384;
-            coConfig.DefaultTTLSeconds = 900;  /* 15 min — IOC results change on feed updates */
+            coConfig.DefaultTTLSeconds = 900;  /* 15 min â€” IOC results change on feed updates */
             coConfig.BucketCount = 4096;
             CoCreateCache(coMgr, CoCacheTypeIOC, "IomMatch", &coConfig, &g_IomMatchCoCache);
         }
@@ -1346,7 +1348,7 @@ IomMatch(
     }
 
     //
-    // Check bloom filter for fast negative — ONLY for exact-match types.
+    // Check bloom filter for fast negative â€” ONLY for exact-match types.
     // Bloom filter stores IOC pattern hashes. For wildcard/CIDR/subdomain types
     // the stored hash won't match the query value, causing false negatives.
     //
@@ -2584,7 +2586,7 @@ IompNotifyCallback(
     //
     // Read and invoke callback under shared lock to prevent use-after-free.
     // IomRegisterCallback swaps and frees the old registration under
-    // exclusive lock — releasing shared lock before invocation would allow
+    // exclusive lock â€” releasing shared lock before invocation would allow
     // the registration (and its Context) to be freed mid-call.
     //
     KeEnterCriticalRegion();

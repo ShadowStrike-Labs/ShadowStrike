@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -17,7 +19,7 @@
  */
 /**
  * ============================================================================
- * ShadowStrike NGAV — Async Work Queue Implementation
+ * ShadowStrike NGAV â€” Async Work Queue Implementation
  * ============================================================================
  *
  * @file AsyncWorkQueue.c
@@ -44,7 +46,7 @@
 #include <ntstrsafe.h>
 
 // ============================================================================
-// PAGE segment declarations (NOT INIT — callable after DriverEntry)
+// PAGE segment declarations (NOT INIT â€” callable after DriverEntry)
 // ============================================================================
 
 #ifdef ALLOC_PRAGMA
@@ -296,7 +298,7 @@ static VOID AwqpCheckDrainComplete(_In_ PAWQ_MANAGER_I Mgr);
     do { ExReleasePushLockShared(pLock); KeLeaveCriticalRegion(); } while(0)
 
 // ============================================================================
-// Validate handle → internal pointer
+// Validate handle â†’ internal pointer
 // ============================================================================
 
 static __forceinline PAWQ_MANAGER_I
@@ -464,7 +466,7 @@ AwqInitialize(
         if (!NT_SUCCESS(Status)) {
             if (Mgr->WorkerCount == 0) {
                 //
-                // No workers at all — tear down and fail
+                // No workers at all â€” tear down and fail
                 //
                 while (!IsListEmpty(&Mgr->Cache.FreeList)) {
                     PLIST_ENTRY E = RemoveHeadList(&Mgr->Cache.FreeList);
@@ -554,11 +556,11 @@ AwqShutdown(
                 W->ThreadObject, Executive, KernelMode, FALSE, &Timeout);
             if (waitStatus == STATUS_TIMEOUT) {
                 //
-                // FIX AWQ-H3: Thread still running — do NOT free W.
+                // FIX AWQ-H3: Thread still running â€” do NOT free W.
                 // UAF worse than small pool leak. Thread will eventually exit.
                 //
                 ObDereferenceObject(W->ThreadObject);
-                continue;  // leak W — do NOT free
+                continue;  // leak W â€” do NOT free
             }
             ObDereferenceObject(W->ThreadObject);
         }
@@ -622,9 +624,9 @@ AwqShutdown(
         Entry = RemoveHeadList(&Mgr->Serialization.KeyList);
         PAWQ_SKEY SK = CONTAINING_RECORD(Entry, AWQ_SKEY, ListEntry);
 
-        // Complete pending items properly — they are registered in the hash
+        // Complete pending items properly â€” they are registered in the hash
         // table and active items list. Raw ExFreePoolWithTag would leave
-        // dangling entries → use-after-free during hash cleanup.
+        // dangling entries â†’ use-after-free during hash cleanup.
         while (!IsListEmpty(&SK->PendingItems)) {
             PLIST_ENTRY PE = RemoveHeadList(&SK->PendingItems);
             PAWQ_WORK_ITEM_I PI = CONTAINING_RECORD(PE, AWQ_WORK_ITEM_I, QueueLink);
@@ -756,7 +758,7 @@ AwqDrain(
     // CRITICAL: Clear the drain event BEFORE setting state to Draining.
     // If we set Draining first, a worker completing the last item could
     // signal DrainCompleteEvent between our state-set and event-clear,
-    // and KeClearEvent would lose that signal → drain hangs until timeout.
+    // and KeClearEvent would lose that signal â†’ drain hangs until timeout.
     //
     KeClearEvent(&Mgr->DrainCompleteEvent);
     MemoryBarrier();
@@ -1273,7 +1275,7 @@ AwqWaitForItem(
     if (!ExAcquireRundownProtection(&Mgr->RundownRef)) return STATUS_DELETE_PENDING;
 
     //
-    // Find item (ref-counted — safe even if item completes concurrently)
+    // Find item (ref-counted â€” safe even if item completes concurrently)
     //
     Item = AwqpFindItem(Mgr, ItemId);
     if (Item == NULL) {
@@ -1842,9 +1844,9 @@ AwqpDequeue(
 
     //
     // Highest priority first.
-    // We CAS item state from Queued→Running UNDER the queue lock
+    // We CAS item state from Queuedâ†’Running UNDER the queue lock
     // to prevent a race with AwqCancel. If Cancel won the CAS first
-    // (state is Cancelled), we skip the item — Cancel will remove it.
+    // (state is Cancelled), we skip the item â€” Cancel will remove it.
     //
     for (p = AwqPriority_Count - 1; p >= 0; p--) {
         PAWQ_PQUEUE Q = &Mgr->Queues[p];
@@ -1867,7 +1869,7 @@ AwqpDequeue(
                 AWQ_UNLOCK_EXCLUSIVE(&Q->Lock);
                 return Item;
             }
-            // Item was concurrently cancelled — skip, Cancel will clean it up
+            // Item was concurrently cancelled â€” skip, Cancel will clean it up
         }
         AWQ_UNLOCK_EXCLUSIVE(&Q->Lock);
     }
@@ -1911,7 +1913,7 @@ AwqpSerializationCheck(
 
     if (!Found) {
         //
-        // First item for this key — create entry and allow execution
+        // First item for this key â€” create entry and allow execution
         //
         SK = (PAWQ_SKEY)ExAllocatePool2(
             POOL_FLAG_NON_PAGED, sizeof(AWQ_SKEY), AWQ_POOL_TAG_SKEY);
@@ -1929,7 +1931,7 @@ AwqpSerializationCheck(
 
     if (SK->ActiveCount == 0) {
         //
-        // Key exists but no active items — allow
+        // Key exists but no active items â€” allow
         //
         InterlockedIncrement(&SK->ActiveCount);
         AWQ_UNLOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
@@ -1937,7 +1939,7 @@ AwqpSerializationCheck(
     }
 
     //
-    // Key is busy — defer item to pending list
+    // Key is busy â€” defer item to pending list
     //
     InsertTailList(&SK->PendingItems, &Item->QueueLink);
     AWQ_UNLOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
@@ -1983,7 +1985,7 @@ AwqpSerializationRelease(
         InterlockedIncrement(&SK->ActiveCount);
     } else if (SK->ActiveCount == 0 && IsListEmpty(&SK->PendingItems)) {
         //
-        // No more items — remove key entry
+        // No more items â€” remove key entry
         //
         RemoveEntryList(&SK->ListEntry);
         AWQ_UNLOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
@@ -2043,7 +2045,7 @@ AwqpExecuteItem(
     //
     // Timeout enforcement: if callback exceeded its timeout, override
     // the result to STATUS_TIMEOUT. This provides observability for
-    // runaway callbacks on millions of endpoints — operators see
+    // runaway callbacks on millions of endpoints â€” operators see
     // TotalTimeouts climbing and can identify which callbacks are slow.
     //
     if (Item->TimeoutMs > 0) {
@@ -2101,7 +2103,7 @@ AwqpExecuteItem(
         InterlockedIncrement64(&Mgr->Stats.TotalRetries);
 
         //
-        // Re-enqueue (no blocking delay — just re-submit)
+        // Re-enqueue (no blocking delay â€” just re-submit)
         //
         AwqpEnqueue(Mgr, Item);
         return;
@@ -2110,7 +2112,7 @@ AwqpExecuteItem(
     //
     // Save chain info BEFORE completing (which may free the item).
     // FIX AWQ-H1: On failure, cancel+complete all successors to prevent orphaned
-    // items (permanent pool leak + rundown ref leak → shutdown hang).
+    // items (permanent pool leak + rundown ref leak â†’ shutdown hang).
     //
     if (Item->NextInChain != NULL) {
         if (NT_SUCCESS(Status)) {
@@ -2264,7 +2266,7 @@ AwqpCreateWorker(
         POOL_FLAG_NON_PAGED, sizeof(AWQ_WORKER_I), AWQ_POOL_TAG_THREAD);
     if (W == NULL) return STATUS_INSUFFICIENT_RESOURCES;
 
-    W->Manager = Mgr;  // direct pointer — no CONTAINING_RECORD hack
+    W->Manager = Mgr;  // direct pointer â€” no CONTAINING_RECORD hack
     InterlockedExchange(&W->Running, 1);
     InterlockedExchange(&W->Idle, 1);
     W->ThreadId = (ULONG)InterlockedIncrement(&Mgr->WorkerCount);
@@ -2357,7 +2359,7 @@ AwqpWorkerThread(
         }
 
         //
-        // Paused — wait for resume
+        // Paused â€” wait for resume
         //
         if (Mgr->State == (LONG)AwqQueueState_Paused) {
             LARGE_INTEGER PauseDelay;
@@ -2378,7 +2380,7 @@ AwqpWorkerThread(
             Worker->IdleStartTime = Worker->LastActivityTime;
         } else {
             //
-            // No work — wait for signal or timeout
+            // No work â€” wait for signal or timeout
             //
             Timeout.QuadPart = -((LONGLONG)1000 * 10000); // 1 second
 

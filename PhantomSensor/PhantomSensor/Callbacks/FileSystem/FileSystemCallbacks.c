@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -867,7 +869,7 @@ Return Value:
 
         if (!UdcCheckVolumePolicy(FltObjects, &UdcPolicy)) {
             //
-            // Policy is Block — reject the volume attachment entirely
+            // Policy is Block â€” reject the volume attachment entirely
             //
             DbgPrintEx(
                 DPFLTR_IHVDRIVER_ID,
@@ -951,7 +953,7 @@ Return Value:
             //
             // Query volume serial number for ScanCache invalidation on teardown.
             // Uses same FltQueryVolumeInformation approach as ScanCache BuildKey.
-            // STATUS_BUFFER_OVERFLOW is acceptable — fixed fields are populated.
+            // STATUS_BUFFER_OVERFLOW is acceptable â€” fixed fields are populated.
             //
             {
                 FILE_FS_VOLUME_INFORMATION fsVolInfo;
@@ -1059,7 +1061,7 @@ Return Value:
 
         if (NT_SUCCESS(icStatus) && InstanceCtx != NULL) {
             //
-            // Set instance context — keep existing if race
+            // Set instance context â€” keep existing if race
             //
             icStatus = FltSetInstanceContext(
                 FltObjects->Instance,
@@ -1087,7 +1089,7 @@ Return Value:
             }
 
             //
-            // Release our reference — Filter Manager holds its own
+            // Release our reference â€” Filter Manager holds its own
             //
             FltReleaseContext((PFLT_CONTEXT)InstanceCtx);
         } else {
@@ -1470,7 +1472,7 @@ Routine Description:
     KeLeaveCriticalRegion();
 
     //
-    // Delete lookaside lists — set flag BEFORE deleting (ordering matters)
+    // Delete lookaside lists â€” set flag BEFORE deleting (ordering matters)
     //
     if (g_FscState.LookasideInitialized) {
         g_FscState.LookasideInitialized = FALSE;
@@ -1721,7 +1723,7 @@ Arguments:
     }
 
     //
-    // Refcount reached zero — need exclusive lock to safely remove from list.
+    // Refcount reached zero â€” need exclusive lock to safely remove from list.
     // Another thread may have incremented refcount between our decrement and
     // lock acquisition, so re-check after acquiring.
     //
@@ -1822,7 +1824,7 @@ Return Value:
 
     if (CurrentSecond != OldSecond) {
         //
-        // New second — attempt atomic reset. Only the CAS winner resets the counter.
+        // New second â€” attempt atomic reset. Only the CAS winner resets the counter.
         //
         LONG64 Swapped = InterlockedCompareExchange64(
             &g_FscState.CurrentSecondStart100ns,
@@ -1835,7 +1837,7 @@ Return Value:
             return TRUE;
         }
         //
-        // Lost the race — another thread already reset. Fall through to normal increment.
+        // Lost the race â€” another thread already reset. Fall through to normal increment.
         //
     }
 
@@ -1886,7 +1888,7 @@ Return Value:
     // Build comparison string (without null terminator in length)
     //
     CompareLen = 0;
-    while (CompareStr[CompareLen] != L'\0' && CompareLen < 32) {
+    while (CompareLen < 32 && CompareStr[CompareLen] != L'\0') {
         CompareLen++;
     }
 
@@ -2006,7 +2008,7 @@ Arguments:
 
     //
     // Reset time window if expired (1 second window).
-    // Use CAS on WindowStartTime so only one thread resets counters — prevents
+    // Use CAS on WindowStartTime so only one thread resets counters â€” prevents
     // multiple threads zeroing counts and losing data.
     //
     {
@@ -2014,7 +2016,7 @@ Arguments:
         TimeDiff.QuadPart = CurrentTime.QuadPart - OldWindowStart;
         if (TimeDiff.QuadPart > (10000000LL)) {  // 1 second in 100ns units
             //
-            // Attempt atomic swap — only the CAS winner resets counters
+            // Attempt atomic swap â€” only the CAS winner resets counters
             //
             LONG64 Swapped = InterlockedCompareExchange64(
                 &ProcessContext->WindowStartTime.QuadPart,
@@ -2188,7 +2190,7 @@ Routine Description:
 
 Arguments:
     TimerId - Timer identifier (unused).
-    Context - Callback context (unused — uses g_FscState directly).
+    Context - Callback context (unused â€” uses g_FscState directly).
 --*/
 {
     UNREFERENCED_PARAMETER(TimerId);

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -270,7 +272,7 @@ ShadowStrikeInitializeMemoryUtils(
     // Thread-safe initialization using interlocked compare-exchange.
     // g_MemoryState is statically zero-initialized, so statistics are
     // already zero at first call. We must NOT zero them after setting
-    // the Initialized flag — another thread could already be allocating
+    // the Initialized flag â€” another thread could already be allocating
     // and we would clobber its stats.
     //
     if (InterlockedCompareExchange(&g_MemoryState.Initialized, 1, 0) != 0) {
@@ -478,7 +480,7 @@ ShadowStrikeAllocatePoolWithFlags(
     //
     // Handle contiguous memory request.
     // CRITICAL: Contiguous allocations MUST be freed with
-    // ShadowStrikeFreeContiguous — never ShadowStrikeFree.
+    // ShadowStrikeFreeContiguous â€” never ShadowStrikeFree.
     //
     if (Flags & ShadowAllocContiguous) {
         PHYSICAL_ADDRESS Lowest = { 0 };
@@ -534,7 +536,7 @@ HandlePostAllocationFlags:
     // Only retry at <= APC_LEVEL where we can sleep. At DISPATCH_LEVEL,
     // retrying without delay is a pointless busy-wait that will not help.
     // NOTE: For aligned/contiguous paths that jump here, retry uses standard
-    // pool allocation — the original path already exhausted its allocator.
+    // pool allocation â€” the original path already exhausted its allocator.
     //
     if (Buffer == NULL && (Flags & ShadowAllocMustSucceed)) {
         if (KeGetCurrentIrql() <= APC_LEVEL) {
@@ -777,7 +779,7 @@ ShadowStrikeFreeAligned(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_ERROR_LEVEL,
             "[ShadowStrike] CORRUPTION: ShadowStrikeFreeAligned called with "
-            "non-kernel address %p — refusing to free\n",
+            "non-kernel address %p â€” refusing to free\n",
             P
         );
         return;
@@ -794,7 +796,7 @@ ShadowStrikeFreeAligned(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_ERROR_LEVEL,
             "[ShadowStrike] CORRUPTION: ShadowStrikeFreeAligned pointer %p "
-            "too low for header derivation — refusing to free\n",
+            "too low for header derivation â€” refusing to free\n",
             P
         );
         return;
@@ -821,7 +823,7 @@ ShadowStrikeFreeAligned(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_ERROR_LEVEL,
             "[ShadowStrike] CORRUPTION: Invalid or already-freed aligned "
-            "pointer %p (header at %p, magic=0x%08X expected=0x%08X) — "
+            "pointer %p (header at %p, magic=0x%08X expected=0x%08X) â€” "
             "refusing to free to prevent pool corruption\n",
             P,
             Header,
@@ -855,7 +857,7 @@ ShadowStrikeFreeAligned(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_ERROR_LEVEL,
             "[ShadowStrike] CORRUPTION: Aligned header at %p has invalid "
-            "OriginalPointer=%p (aligned buffer=%p) — refusing to free\n",
+            "OriginalPointer=%p (aligned buffer=%p) â€” refusing to free\n",
             Header,
             OriginalPointer,
             P
@@ -874,7 +876,7 @@ ShadowStrikeFreeAligned(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_ERROR_LEVEL,
             "[ShadowStrike] CORRUPTION: Aligned header at %p has "
-            "UserSize=%llu exceeding maximum %llu — refusing to free\n",
+            "UserSize=%llu exceeding maximum %llu â€” refusing to free\n",
             Header,
             (ULONGLONG)UserSize,
             (ULONGLONG)SHADOWSTRIKE_MAX_ALLOCATION_SIZE
@@ -926,7 +928,7 @@ ShadowStrikeSecureFree(
     //
     if (KeGetCurrentIrql() >= DISPATCH_LEVEL && Size > SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE) {
         //
-        // Partial wipe — zero what we can safely do at DISPATCH_LEVEL
+        // Partial wipe â€” zero what we can safely do at DISPATCH_LEVEL
         //
         ShadowStrikeSecureZeroMemory(P, SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE);
     } else {
@@ -1556,7 +1558,7 @@ ShadowStrikeMapToSystemAddress(
     //
     // Map to system address.
     // Use MdlMappingNoExecute to prevent the mapped pages from being
-    // executable — security hardening against code injection.
+    // executable â€” security hardening against code injection.
     //
 #if (NTDDI_VERSION >= NTDDI_WIN8)
     #define SHADOWSTRIKE_MDL_PRIORITY (NormalPagePriority | MdlMappingNoExecute)
@@ -1722,7 +1724,7 @@ ShadowStrikeSecureWipeMemory(
     //
     // At high IRQL with large buffers, do a single zero pass capped to
     // SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE to avoid DPC timeout BSOD.
-    // Remaining bytes beyond the cap are NOT wiped — callers handling
+    // Remaining bytes beyond the cap are NOT wiped â€” callers handling
     // sensitive data should wipe at <= APC_LEVEL for full coverage.
     //
     if (KeGetCurrentIrql() >= DISPATCH_LEVEL && Length > SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE) {

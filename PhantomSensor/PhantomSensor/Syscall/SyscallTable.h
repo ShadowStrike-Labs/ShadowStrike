@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -30,7 +32,7 @@
  * - Classification metadata (category, risk level)
  *
  * Architectural Role:
- * - SyscallTable owns the DATA (syscall number ↔ name ↔ metadata)
+ * - SyscallTable owns the DATA (syscall number â†” name â†” metadata)
  * - SyscallHooks owns the MECHANISM (register, dispatch, lifecycle)
  * - SyscallMonitor owns the POLICY (what to monitor, analysis, decisions)
  *
@@ -48,8 +50,8 @@
  * Security:
  * - No kernel address disclosure to callers.
  * - No user-mode memory reads.
- * - Immutable after initialization — no TOCTOU.
- * - Bounded table size — no resource exhaustion.
+ * - Immutable after initialization â€” no TOCTOU.
+ * - Bounded table size â€” no resource exhaustion.
  *
  * @author ShadowStrike Security Team
  * @version 2.0.0 (Enterprise Edition)
@@ -152,7 +154,7 @@ typedef enum _SST_RISK_LEVEL {
 // ============================================================================
 
 /**
- * @brief Syscall entry — immutable after table initialization.
+ * @brief Syscall entry â€” immutable after table initialization.
  *
  * Contains all metadata for a single syscall. Stored in a flat array
  * and referenced by hash bucket chains via two separate LIST_ENTRY fields.
@@ -218,7 +220,7 @@ typedef struct _SST_STATISTICS {
 } SST_STATISTICS, *PSST_STATISTICS;
 
 // ============================================================================
-// PUBLIC API — LIFECYCLE
+// PUBLIC API â€” LIFECYCLE
 // ============================================================================
 
 /**
@@ -253,7 +255,7 @@ SstShutdown(
     );
 
 // ============================================================================
-// PUBLIC API — LOOKUPS
+// PUBLIC API â€” LOOKUPS
 // ============================================================================
 
 /**
@@ -345,7 +347,7 @@ SstGetCategory(
     );
 
 // ============================================================================
-// PUBLIC API — STATISTICS
+// PUBLIC API â€” STATISTICS
 // ============================================================================
 
 /**
@@ -364,7 +366,7 @@ SstGetStatistics(
     );
 
 // ============================================================================
-// PUBLIC API — ENUMERATION
+// PUBLIC API â€” ENUMERATION
 // ============================================================================
 
 /**

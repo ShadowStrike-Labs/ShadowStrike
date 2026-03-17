@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -647,7 +649,7 @@ ShadowAlpcHashPortObject(
     ULONG_PTR value = (ULONG_PTR)PortObject;
 
     //
-    // Proper 64-bit → 32-bit hash for kernel pointers.
+    // Proper 64-bit â†’ 32-bit hash for kernel pointers.
     // Kernel addresses cluster in 0xFFFF8xxx'xxxxxxxx range where the
     // top 32 bits have minimal entropy. We fold high bits into low bits
     // first via XOR shift, then apply finalization mixing.

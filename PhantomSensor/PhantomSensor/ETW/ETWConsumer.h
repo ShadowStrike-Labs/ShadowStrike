@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -516,7 +518,7 @@ typedef struct _EC_CONSUMER {
     EC_CONSUMER_CONFIG Config;
     EC_CONSUMER_STATS Stats;
 
-    // Subscriptions — KSPIN_LOCK for DISPATCH_LEVEL compatibility
+    // Subscriptions â€” KSPIN_LOCK for DISPATCH_LEVEL compatibility
     LIST_ENTRY SubscriptionList;
     KSPIN_LOCK SubscriptionLock;
     volatile LONG SubscriptionCount;
@@ -556,10 +558,10 @@ typedef struct _EC_CONSUMER {
     // Correlation engine reference
     PVOID CorrelationEngine;
 
-    // Health monitoring — managed by TimerManager
+    // Health monitoring â€” managed by TimerManager
     ULONG HealthCheckTimerId;
 
-    // Round-robin thread signaling index — overflow-safe by unsigned modulo
+    // Round-robin thread signaling index â€” overflow-safe by unsigned modulo
     volatile LONG NextThreadSignal;
 
     // Error tracking

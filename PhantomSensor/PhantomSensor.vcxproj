@@ -266,6 +266,7 @@
     <ClCompile Include="PhantomSensor\Utilities\MemoryUtils.c" />
     <ClCompile Include="PhantomSensor\Utilities\ProcessUtils.c" />
     <ClCompile Include="PhantomSensor\Utilities\StringUtils.c" />
+
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="PhantomSensorELAM\BootDriverVerify.h" />

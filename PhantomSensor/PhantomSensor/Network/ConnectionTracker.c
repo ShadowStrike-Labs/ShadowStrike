@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -30,7 +32,7 @@
  * - Real-time flow statistics and bandwidth monitoring
  * - TLS/SSL metadata extraction and JA3 fingerprinting support
  * - Automatic stale connection cleanup via work-item-deferred timer
- * - Deterministic reference counting — objects freed on last release
+ * - Deterministic reference counting â€” objects freed on last release
  * - Memory-efficient lookaside list allocations
  *
  * Lock Ordering Hierarchy (see ConnectionTracker.h):
@@ -49,7 +51,7 @@
  */
 
 #pragma warning(push)
-#pragma warning(disable:4324)   // structure padded due to alignment — fltKernel.h
+#pragma warning(disable:4324)   // structure padded due to alignment â€” fltKernel.h
 #include "ConnectionTracker.h"
 #pragma warning(pop)
 #include "../Core/Globals.h"
@@ -126,7 +128,7 @@ typedef struct _CT_TRACKER_INTERNAL {
     BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup infrastructure — system thread woken by TimerManager callback
+    // Cleanup infrastructure â€” system thread woken by TimerManager callback
     //
     volatile BOOLEAN ShuttingDown;
     volatile BOOLEAN CleanupTerminate;
@@ -510,7 +512,7 @@ CtShutdown(
     tracker = CONTAINING_RECORD(Tracker, CT_TRACKER_INTERNAL, Public);
 
     //
-    // Signal shutdown — prevents DPC/thread from doing more work
+    // Signal shutdown â€” prevents DPC/thread from doing more work
     //
     tracker->ShuttingDown = TRUE;
     tracker->CleanupTerminate = TRUE;
@@ -593,7 +595,7 @@ CtShutdown(
     ExReleasePushLockShared(&Tracker->ProcessListLock);
 
     //
-    // Free all connections — now safely detached from all hash/process lists
+    // Free all connections â€” now safely detached from all hash/process lists
     //
     ExAcquirePushLockExclusive(&Tracker->ConnectionListLock);
 
@@ -602,7 +604,7 @@ CtShutdown(
         connection = CONTAINING_RECORD(entry, CT_CONNECTION, GlobalListEntry);
 
         //
-        // Mark as removed — already detached from hash/process lists above
+        // Mark as removed â€” already detached from hash/process lists above
         //
         InterlockedOr(&connection->Flags, CtFlag_RemovedFromLists);
 
@@ -773,7 +775,7 @@ CtCreateConnection(
     KeQuerySystemTime(&connection->CreateTime);
 
     //
-    // Copy addresses — caller guarantees kernel-mode pointers
+    // Copy addresses â€” caller guarantees kernel-mode pointers
     //
     NT_ASSERT(LocalAddress >= MmSystemRangeStart);
     NT_ASSERT(RemoteAddress >= MmSystemRangeStart);
@@ -852,7 +854,7 @@ CtCreateConnection(
         //
         // Hold a reference on the process context for this connection.
         // The caller's reference from CtpGetOrCreateProcessContext is
-        // transferred to the connection — no extra addref needed.
+        // transferred to the connection â€” no extra addref needed.
         //
         connection->ProcessContextRef = processCtx;
     }
@@ -891,7 +893,7 @@ CtCreateConnection(
 
     if (duplicateFlow) {
         //
-        // FlowId already tracked — roll back everything
+        // FlowId already tracked â€” roll back everything
         //
         if (processCtx != NULL) {
             KeAcquireSpinLock(&processCtx->ConnectionLock, &oldIrql);
@@ -1275,7 +1277,7 @@ CtUpdateStats(
     InterlockedAdd64(&Tracker->Stats.TotalBytesReceived, (LONG64)BytesReceived);
 
     //
-    // Update process context if available (referenced pointer — safe)
+    // Update process context if available (referenced pointer â€” safe)
     //
     {
         PCT_PROCESS_CONTEXT processCtx = connection->ProcessContextRef;
@@ -1644,7 +1646,7 @@ CtRelease(
 
     if (newRef == 0) {
         //
-        // Last reference dropped — free the connection.
+        // Last reference dropped â€” free the connection.
         // The connection MUST have been removed from all lists before
         // the last reference is released (CtFlag_RemovedFromLists set).
         //
@@ -1920,7 +1922,7 @@ CtpGetOrCreateProcessContext(
         PCT_PROCESS_CONTEXT ctx = CONTAINING_RECORD(entry, CT_PROCESS_CONTEXT, HashListEntry);
         if (ctx->ProcessId == ProcessId) {
             //
-            // Race lost — free our new one, use existing
+            // Race lost â€” free our new one, use existing
             //
             ExReleasePushLockExclusive(&Tracker->ProcessHash.Lock);
             ExReleasePushLockExclusive(&Tracker->Public.ProcessListLock);
@@ -1939,7 +1941,7 @@ CtpGetOrCreateProcessContext(
     }
 
     //
-    // Insert new context — separate ListEntry for hash and global list
+    // Insert new context â€” separate ListEntry for hash and global list
     //
     InsertTailList(&Tracker->ProcessHash.Buckets[bucket], &context->HashListEntry);
     InsertTailList(&Tracker->Public.ProcessList, &context->GlobalListEntry);
@@ -1968,7 +1970,7 @@ CtpReleaseProcessContext(
 
     if (newRef == 0) {
         //
-        // Last reference gone — remove from lists and free.
+        // Last reference gone â€” remove from lists and free.
         // This should only happen during cleanup when the context
         // has already been removed from hash/global lists.
         //
@@ -2023,7 +2025,7 @@ CtpResolveProcessInfo(
     }
 
     //
-    // Use PsGetProcessImageFileName — safe, documented, returns a
+    // Use PsGetProcessImageFileName â€” safe, documented, returns a
     // pointer to the EPROCESS internal 15-char ANSI name. We convert
     // to UNICODE_STRING. This avoids SeLocateProcessImageName which
     // has ambiguous ownership semantics across Windows versions.
@@ -2233,7 +2235,7 @@ CtpFreeConnection(
 }
 
 // ============================================================================
-// CLEANUP TIMER CALLBACK (via TimerManager — runs at PASSIVE_LEVEL)
+// CLEANUP TIMER CALLBACK (via TimerManager â€” runs at PASSIVE_LEVEL)
 // ============================================================================
 
 static VOID
@@ -2251,7 +2253,7 @@ CtpCleanupTimerCallback(
     }
 
     //
-    // Wake the cleanup thread — it runs at PASSIVE_LEVEL.
+    // Wake the cleanup thread â€” it runs at PASSIVE_LEVEL.
     //
     KeSetEvent(&tracker->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
 }
@@ -2385,7 +2387,7 @@ CtpCleanupStaleConnections(
             staleCount < staleCapacity) {
 
             //
-            // Atomically try to increment from 1 → 2.  This guarantees no
+            // Atomically try to increment from 1 â†’ 2.  This guarantees no
             // concurrent CtFindByFlowId has taken a reference (which would
             // make RefCount > 1), and the object won't be freed under us.
             //

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -986,7 +988,7 @@ Return Value:
             }
 
             //
-            // Highest-priority match found — stop evaluating.
+            // Highest-priority match found â€” stop evaluating.
             //
             break;
         }
@@ -1033,7 +1035,7 @@ ReEvaluateInPlace(
 /*++
 Routine Description:
     Evaluates all rules against the provided context using a caller-provided
-    result buffer.  Zero heap allocations on the hot path — ideal for
+    result buffer.  Zero heap allocations on the hot path â€” ideal for
     per-event evaluation in BepProcessSingleEvent.
 
     Returns a COPY of matched rule data (no internal pointers exposed).
@@ -2039,7 +2041,7 @@ RepEvaluateCondition(
         //
         // Custom conditions are extensible placeholders that require
         // an external evaluation handler registered at runtime.
-        // No handler is registered in kernel mode — safe FALSE default.
+        // No handler is registered in kernel mode â€” safe FALSE default.
         //
         result = FALSE;
         break;

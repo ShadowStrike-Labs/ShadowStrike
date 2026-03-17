@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -414,14 +416,14 @@ extern SHADOWSTRIKE_DRIVER_DATA g_DriverData;
 #define SHADOWSTRIKE_COUNT_OPERATION() \
     InterlockedIncrement64(&g_DriverData.TotalOperationsProcessed)
 
-/// @brief Enter a protected operation (DEPRECATED — use SHADOWSTRIKE_ACQUIRE_RUNDOWN directly)
+/// @brief Enter a protected operation (DEPRECATED â€” use SHADOWSTRIKE_ACQUIRE_RUNDOWN directly)
 /// @note These no-ops are retained for backward compat in deprecated code paths
 /// (e.g. ShadowStrikePreAcquireForSectionSync in FilterRegistration.c).
 /// All active callbacks use SHADOWSTRIKE_ACQUIRE_RUNDOWN/RELEASE_RUNDOWN instead.
 #define SHADOWSTRIKE_ENTER_OPERATION() \
     do { (void)0; } while(0)
 
-/// @brief Leave a protected operation (DEPRECATED — use SHADOWSTRIKE_RELEASE_RUNDOWN directly)
+/// @brief Leave a protected operation (DEPRECATED â€” use SHADOWSTRIKE_RELEASE_RUNDOWN directly)
 #define SHADOWSTRIKE_LEAVE_OPERATION() \
     do { (void)0; } while(0)
 

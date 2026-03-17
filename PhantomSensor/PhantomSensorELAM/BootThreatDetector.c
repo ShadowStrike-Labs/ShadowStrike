@@ -1,3 +1,7 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -328,7 +332,7 @@ BtdpHexStringToBytes(
     }
 
     //
-    // Bounded length scan — never scan more than BTD_MAX_HEX_STRING_LENGTH
+    // Bounded length scan â€” never scan more than BTD_MAX_HEX_STRING_LENGTH
     //
     hexLen = 0;
     while (hexLen < BTD_MAX_HEX_STRING_LENGTH && HexString[hexLen] != '\0') {
@@ -444,7 +448,7 @@ BtdpAllocateThreat(
 }
 
 /**
- * @brief Free threat structure — releases deep-copied path and returns to lookaside
+ * @brief Free threat structure â€” releases deep-copied path and returns to lookaside
  */
 static VOID
 BtdpFreeThreatInternal(
@@ -1365,7 +1369,7 @@ BtdIsVulnerable(
  * @brief Get list of detected threats (returns pointers, NOT copies)
  *
  * The returned threat pointers remain owned by the detector.
- * Caller must NOT free them individually — use BtdFreeThreat to remove
+ * Caller must NOT free them individually â€” use BtdFreeThreat to remove
  * a specific threat, or let BtdShutdown clean up all.
  */
 _Use_decl_annotations_
@@ -1409,7 +1413,7 @@ BtdGetThreats(
 }
 
 /**
- * @brief Free a threat structure — removes from DetectedList and releases to lookaside
+ * @brief Free a threat structure â€” removes from DetectedList and releases to lookaside
  *
  * Safely unlinks the threat from the detector's DetectedList under spinlock,
  * frees the deep-copied driver path, and returns the structure to the lookaside.
@@ -1436,7 +1440,7 @@ BtdFreeThreat(
     //
     if (!InterlockedCompareExchange(&Detector->Initialized, 1, 1)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-            "[ShadowStrike/BTD] BtdFreeThreat called on shut-down detector — leak preferred over pool corruption\n");
+            "[ShadowStrike/BTD] BtdFreeThreat called on shut-down detector â€” leak preferred over pool corruption\n");
         return;
     }
 
@@ -1463,7 +1467,7 @@ BtdFreeThreat(
 
     if (!found) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-            "[ShadowStrike/BTD] BtdFreeThreat: threat %p not found in DetectedList — "
+            "[ShadowStrike/BTD] BtdFreeThreat: threat %p not found in DetectedList â€” "
             "possible double-free or stale pointer, leak preferred over corruption\n",
             Threat);
         return;

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -173,7 +175,7 @@ static const NPM_KNOWN_PATTERN g_KnownC2Patterns[] = {
 };
 
 // ============================================================================
-// SYSTEM PIPE → EXPECTED PROCESS MAPPING (T1036 defense)
+// SYSTEM PIPE â†’ EXPECTED PROCESS MAPPING (T1036 defense)
 // ============================================================================
 
 /**
@@ -192,7 +194,7 @@ typedef struct _NPM_SYSTEM_PIPE_MAP {
 } NPM_SYSTEM_PIPE_MAP;
 
 static const NPM_SYSTEM_PIPE_MAP g_SystemPipeMappings[] = {
-    // LSASS pipes — only lsass.exe may create these
+    // LSASS pipes â€” only lsass.exe may create these
     { L"lsass",              { "lsass.exe", NULL } },
     { L"lsarpc",             { "lsass.exe", NULL } },
     { L"samr",               { "lsass.exe", NULL } },
@@ -546,7 +548,7 @@ NpMonShutdown(
     }
 
     //
-    // Destroy lookaside lists — mark unavailable FIRST to prevent
+    // Destroy lookaside lists â€” mark unavailable FIRST to prevent
     // in-flight NpMonFreeEvent from using them after deletion
     //
     if (g_NpmState.LookasideInitialized) {
@@ -576,12 +578,12 @@ NpMonIsActive(
 }
 
 // ============================================================================
-// PRIVATE — CREATOR PROCESS IDENTIFICATION
+// PRIVATE â€” CREATOR PROCESS IDENTIFICATION
 // ============================================================================
 
 /**
  * @brief Case-insensitive ANSI string comparison for process image names.
- * Safe at any IRQL — no allocations, no kernel string objects.
+ * Safe at any IRQL â€” no allocations, no kernel string objects.
  */
 static BOOLEAN
 NpmImageNameEquals(
@@ -605,7 +607,7 @@ NpmImageNameEquals(
  * @brief Capture the creating process's image name for validation and forensics.
  *
  * Uses PsGetProcessImageFileName which returns the 15-char internal
- * EPROCESS.ImageFileName buffer — available at any IRQL, no allocation needed.
+ * EPROCESS.ImageFileName buffer â€” available at any IRQL, no allocation needed.
  */
 static VOID
 NpmGetCreatorImageName(
@@ -675,7 +677,7 @@ NpMonPreCreateNamedPipe(
 
     //
     // ================================================================
-    // PHASE 1: System pipe validation — RATE LIMIT EXEMPT.
+    // PHASE 1: System pipe validation â€” RATE LIMIT EXEMPT.
     //
     // System pipe spoofing is a CRITICAL threat (MITRE T1036).
     // An attacker could flood pipe creations to exhaust the rate limiter,
@@ -691,7 +693,7 @@ NpMonPreCreateNamedPipe(
 
     if (sysResult == NpmSysPipe_Validated) {
         //
-        // Legitimate system pipe from verified creator — allow immediately
+        // Legitimate system pipe from verified creator â€” allow immediately
         //
         ExReleaseRundownProtection(&g_NpmState.RundownRef);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -700,7 +702,7 @@ NpMonPreCreateNamedPipe(
     if (sysResult == NpmSysPipe_Spoofed) {
         //
         // CRITICAL: System pipe name from unauthorized process.
-        // This is pipe masquerading — block immediately regardless of rate limit.
+        // This is pipe masquerading â€” block immediately regardless of rate limit.
         //
         InterlockedIncrement64(&g_NpmState.Stats.TotalPipesCreated);
         InterlockedIncrement64(&g_NpmState.Stats.SpoofedSystemPipes);
@@ -740,7 +742,7 @@ NpMonPreCreateNamedPipe(
 
     //
     // ================================================================
-    // PHASE 2: General classification — subject to rate limiting.
+    // PHASE 2: General classification â€” subject to rate limiting.
     // At this point we know the pipe is NOT a system pipe name.
     // ================================================================
     //
@@ -894,7 +896,7 @@ NpMonPostCreateNamedPipe(
 }
 
 // ============================================================================
-// PUBLIC API — STATISTICS / EVENTS
+// PUBLIC API â€” STATISTICS / EVENTS
 // ============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -961,7 +963,7 @@ NpMonFreeEvent(
 }
 
 // ============================================================================
-// PRIVATE — PIPE NAME EXTRACTION
+// PRIVATE â€” PIPE NAME EXTRACTION
 // ============================================================================
 
 static BOOLEAN
@@ -1018,7 +1020,7 @@ NpmExtractPipeName(
 }
 
 // ============================================================================
-// PRIVATE — CLASSIFICATION ENGINE
+// PRIVATE â€” CLASSIFICATION ENGINE
 // ============================================================================
 
 static NPM_PIPE_CLASS
@@ -1153,7 +1155,7 @@ NpmValidateSystemPipe(
 }
 
 // ============================================================================
-// PRIVATE — ENTROPY CALCULATION
+// PRIVATE â€” ENTROPY CALCULATION
 // ============================================================================
 
 /**
@@ -1253,9 +1255,9 @@ NpmCalculateEntropy(
     }
 
     //
-    // Shannon entropy: H = log2(N) - (1/N) * Σ freq[i] * log2(freq[i])
+    // Shannon entropy: H = log2(N) - (1/N) * Î£ freq[i] * log2(freq[i])
     // In fixed-point (*1024):
-    //   H*1024 = log2(N)*1024 - (1/N) * Σ freq[i] * log2(freq[i])*1024
+    //   H*1024 = log2(N)*1024 - (1/N) * Î£ freq[i] * log2(freq[i])*1024
     //
     logLen = NpmLog2Fixed(LengthChars);
 
@@ -1276,7 +1278,7 @@ NpmCalculateEntropy(
 }
 
 // ============================================================================
-// PRIVATE — HASH TABLE OPERATIONS
+// PRIVATE â€” HASH TABLE OPERATIONS
 // ============================================================================
 
 static ULONG
@@ -1286,7 +1288,7 @@ NpmHashPipeName(
     )
 {
     //
-    // DJB2 hash — fast, good distribution for short strings
+    // DJB2 hash â€” fast, good distribution for short strings
     //
     ULONG hash = 5381;
     USHORT chars = NameLengthBytes / sizeof(WCHAR);
@@ -1349,7 +1351,7 @@ NpmTrackPipe(
     PAGED_CODE();
 
     //
-    // Check capacity — evict if needed
+    // Check capacity â€” evict if needed
     //
     if (InterlockedCompareExchange(&g_NpmState.TotalEntries, 0, 0) >= NPM_MAX_TRACKED_PIPES) {
         NpmEvictLruEntries(64);
@@ -1372,7 +1374,7 @@ NpmTrackPipe(
         if (existing->PipeNameLength == NameLengthBytes &&
             _wcsnicmp(existing->PipeName, PipeName, NameLengthBytes / sizeof(WCHAR)) == 0) {
             //
-            // Duplicate — update existing entry instead of inserting new one
+            // Duplicate â€” update existing entry instead of inserting new one
             //
             InterlockedIncrement(&existing->ConnectionCount);
             KeQuerySystemTimePrecise(&existing->LastAccessTime);
@@ -1394,7 +1396,7 @@ NpmTrackPipe(
     }
 
     //
-    // Not a duplicate — allocate and insert
+    // Not a duplicate â€” allocate and insert
     //
     entry = NpmAllocateEntry();
     if (entry == NULL) {
@@ -1435,7 +1437,7 @@ NpmTrackPipe(
     KeLeaveCriticalRegion();
 
     //
-    // Add to LRU list (separate lock scope — always acquired AFTER bucket lock)
+    // Add to LRU list (separate lock scope â€” always acquired AFTER bucket lock)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_NpmState.LruLock);
@@ -1447,7 +1449,7 @@ NpmTrackPipe(
 }
 
 // ============================================================================
-// PRIVATE — EVENT QUEUE
+// PRIVATE â€” EVENT QUEUE
 // ============================================================================
 
 static NTSTATUS
@@ -1519,7 +1521,7 @@ NpmQueueEvent(
 }
 
 // ============================================================================
-// PRIVATE — RATE LIMITING
+// PRIVATE â€” RATE LIMITING
 // ============================================================================
 
 static BOOLEAN
@@ -1535,7 +1537,7 @@ NpmCheckRateLimit(
 
     //
     // Read the rate window start ONCE atomically. On x64, aligned 64-bit reads
-    // are naturally atomic — avoids the CAS-to-self triple-read antipattern.
+    // are naturally atomic â€” avoids the CAS-to-self triple-read antipattern.
     //
     oldStart = *(volatile LONGLONG*)&g_NpmState.RateWindowStart.QuadPart;
 
@@ -1543,7 +1545,7 @@ NpmCheckRateLimit(
 
     //
     // If window expired, attempt atomic reset.
-    // Only one thread wins the CAS — others see the new window and proceed normally.
+    // Only one thread wins the CAS â€” others see the new window and proceed normally.
     //
     if (elapsed > (LONGLONG)NPM_RATE_LIMIT_WINDOW_MS * 10000LL) {
         LONGLONG swapped = InterlockedCompareExchange64(
@@ -1557,7 +1559,7 @@ NpmCheckRateLimit(
             return TRUE;
         }
         //
-        // Another thread already reset — fall through to normal increment
+        // Another thread already reset â€” fall through to normal increment
         //
     }
 
@@ -1575,7 +1577,7 @@ NpmCheckRateLimit(
 }
 
 // ============================================================================
-// PRIVATE — LRU EVICTION
+// PRIVATE â€” LRU EVICTION
 // ============================================================================
 
 static VOID
@@ -1595,7 +1597,7 @@ NpmEvictLruEntries(
 
     //
     // Phase 1: Collect victims from LRU list under LRU lock only.
-    // Do NOT acquire bucket locks here — that would violate lock ordering
+    // Do NOT acquire bucket locks here â€” that would violate lock ordering
     // (NpmTrackPipe acquires bucket lock then LRU lock).
     //
     KeEnterCriticalRegion();

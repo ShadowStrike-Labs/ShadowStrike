@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -1283,7 +1285,7 @@ ShadowQueryVolumeSerial(
     //
     // Query volume information to get serial number.
     // FltQueryVolumeInformation(Instance, Irp, FsInfo, Length, InfoClass)
-    // Pass NULL for IRP — direct query without associated I/O request.
+    // Pass NULL for IRP â€” direct query without associated I/O request.
     //
     status = FltQueryVolumeInformation(
         Instance,

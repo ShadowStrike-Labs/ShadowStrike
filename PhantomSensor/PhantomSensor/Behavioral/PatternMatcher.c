@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -1109,7 +1111,7 @@ PmSubmitEvent(
     //
     // Phase 1: Collect active states for this process under shared lock,
     // then process outside lock. This replaces the prior lock-drop-restart
-    // pattern that caused O(n²) re-scanning and potential double-processing.
+    // pattern that caused O(nÂ²) re-scanning and potential double-processing.
     //
     {
         PPM_MATCH_STATE_INTERNAL collectedStates[PM_MAX_STATES_PER_PROCESS];
@@ -1143,7 +1145,7 @@ PmSubmitEvent(
         FltReleasePushLock(&Matcher->StateLock);
 
         //
-        // Process all collected states outside lock — each state is ref-held
+        // Process all collected states outside lock â€” each state is ref-held
         //
         for (ci = 0; ci < collectedCount; ci++) {
             state = collectedStates[ci];
@@ -2082,7 +2084,7 @@ PmpIndexPattern(
                 Matcher->PatternIndex[eventType].Count++;
             } else {
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                    "[ShadowStrike:PatternMatcher] Index entry alloc failed for pattern '%s' event %lu — detection gap\n",
+                    "[ShadowStrike:PatternMatcher] Index entry alloc failed for pattern '%s' event %lu â€” detection gap\n",
                     Pattern->PatternId, i);
             }
         }
@@ -2203,7 +2205,7 @@ PmpCleanupTimerCallback(
  * @brief TimerManager callback for periodic cleanup.
  *
  * Runs at DISPATCH_LEVEL (DPC context from TimerManager).
- * Only signals the worker event — actual cleanup at PASSIVE_LEVEL in worker thread.
+ * Only signals the worker event â€” actual cleanup at PASSIVE_LEVEL in worker thread.
  */
 {
     PPM_MATCHER_INTERNAL matcher = (PPM_MATCHER_INTERNAL)Context;

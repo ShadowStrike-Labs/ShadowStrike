@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -886,7 +888,7 @@ Return Value:
         }
 
         //
-        // Check process exclusion (ExclusionManager — user-configured)
+        // Check process exclusion (ExclusionManager â€” user-configured)
         //
         if (ShadowStrikeIsProcessExcluded(RequestorPid, NULL)) {
             SHADOWSTRIKE_INC_STAT(ExclusionMatches);
@@ -895,7 +897,7 @@ Return Value:
         }
 
         //
-        // Check process trust (ProcessExclusion — pattern-matched at creation)
+        // Check process trust (ProcessExclusion â€” pattern-matched at creation)
         //
         if (ShadowStrikeIsProcessTrusted(RequestorPid)) {
             SHADOWSTRIKE_INC_STAT(ExclusionMatches);
@@ -1032,7 +1034,7 @@ Return Value:
     //
     // WSL/Container escape file access monitoring(MITRE T1611, T1003).
     // Detect WSL processes accessing host credential files, driver
-    // directories, and System32 — indicators of container-to-host breakout.
+    // directories, and System32 â€” indicators of container-to-host breakout.
     // BehaviorEngine events are submitted inside WslMonCheckFileAccess.
     //
     {
@@ -1257,7 +1259,7 @@ Return Value:
                 );
 
                 //
-                // Transacted write creates are inherently suspicious —
+                // Transacted write creates are inherently suspicious â€”
                 // legitimate apps rarely use TxF for file creation.
                 //
                 ThreatScore += PC_SCORE_DELETE_ON_CLOSE;
@@ -1267,7 +1269,7 @@ Return Value:
     }
 
     // =========================================================================
-    // EFI SYSTEM PARTITION PROTECTION — Bootkit prevention
+    // EFI SYSTEM PARTITION PROTECTION â€” Bootkit prevention
     // =========================================================================
 
     if (FiCheckEspAccess(
@@ -1279,7 +1281,7 @@ Return Value:
     }
 
     // =========================================================================
-    // USB AUTORUN BLOCKING — Removable media autorun prevention
+    // USB AUTORUN BLOCKING â€” Removable media autorun prevention
     // =========================================================================
 
     if (UdcCheckAutorun(FltObjects, &NameInfo->Name)) {
@@ -1568,7 +1570,7 @@ Return Value:
         } else {
             //
             // FSC-5: SbBuildFileScanRequest failed (e.g., memory allocation).
-            // Apply FailOpenOnError policy — if fail-closed, block access.
+            // Apply FailOpenOnError policy â€” if fail-closed, block access.
             //
             InterlockedIncrement64(&g_PcState.Stats.ScanErrors);
 

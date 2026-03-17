@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -560,7 +562,7 @@ TaInitialize(
     //
     // Initialize rundown protection for shutdown coordination.
     // ExAcquireRundownProtection atomically fails after
-    // ExWaitForRundownProtectionRelease is called — no TOCTOU races.
+    // ExWaitForRundownProtectionRelease is called â€” no TOCTOU races.
     //
     ExInitializeRundownProtection(&analyzer->RundownRef);
     analyzer->ShuttingDown = FALSE;
@@ -628,7 +630,7 @@ TaShutdown(
     // Wait for all in-flight operations to complete.
     // ExWaitForRundownProtectionRelease atomically disables new acquisitions
     // and blocks until all existing ExAcquireRundownProtection holders have
-    // called ExReleaseRundownProtection. This is unconditional — no timeout,
+    // called ExReleaseRundownProtection. This is unconditional â€” no timeout,
     // no races. A hang here indicates a leaked reference (caller bug).
     //
     ExWaitForRundownProtectionRelease(&analyzer->RundownRef);
@@ -1791,7 +1793,7 @@ TapGetProcessToken(
     );
 
     //
-    // Release process reference — the handle holds its own reference
+    // Release process reference â€” the handle holds its own reference
     //
     ObDereferenceObject(process);
     process = NULL;

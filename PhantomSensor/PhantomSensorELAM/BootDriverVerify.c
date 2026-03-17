@@ -1,3 +1,7 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -260,7 +264,7 @@ BdvpMurmurHash3(
     const ULONG numBlocks = Length / 4;
     const UCHAR* tail = Data + (numBlocks * 4);
 
-    // Body — use RtlCopyMemory to avoid unaligned ULONG access (ARM64 safe)
+    // Body â€” use RtlCopyMemory to avoid unaligned ULONG access (ARM64 safe)
     for (i = 0; i < numBlocks; i++) {
         RtlCopyMemory(&k, Data + (i * 4), sizeof(ULONG));
         k *= c1;
@@ -468,7 +472,7 @@ BdvpCalculateAuthenticodeHash(
         headerSize = ntHeaders64->OptionalHeader.SizeOfHeaders;
     } else {
         // 32-bit PE: must cast to IMAGE_NT_HEADERS32 for correct field offsets
-        // (IMAGE_NT_HEADERS on x64 builds is IMAGE_NT_HEADERS64 — DataDirectory
+        // (IMAGE_NT_HEADERS on x64 builds is IMAGE_NT_HEADERS64 â€” DataDirectory
         // and NumberOfRvaAndSizes are at different offsets in 32-bit layout)
         PIMAGE_NT_HEADERS32 ntHeaders32 = (PIMAGE_NT_HEADERS32)ntHeaders;
         if (ntHeaders32->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_SECURITY) {
@@ -668,7 +672,7 @@ Cleanup:
  * IMAGE_DIRECTORY_ENTRY_SECURITY data directory. If present, computes
  * a SHA-1 hash of the raw certificate bytes as a thumbprint proxy.
  *
- * @note This is a heuristic — presence of a certificate table does NOT
+ * @note This is a heuristic â€” presence of a certificate table does NOT
  *       guarantee a valid signature. Full Authenticode verification
  *       requires user-mode WinVerifyTrust or undocumented CiCheckSignedFile.
  *       The thumbprint is SHA-1 of the raw PKCS#7 blob, NOT the standard
@@ -978,7 +982,7 @@ BdvShutdown(
     }
 
     // Atomically clear Initialized: returns previous value.
-    // If it was already 0, another shutdown raced us — bail.
+    // If it was already 0, another shutdown raced us â€” bail.
     if (!InterlockedCompareExchange(&Verifier->Initialized, 0, 1)) {
         return;
     }
@@ -1057,7 +1061,7 @@ BdvLoadConfiguration(
         return STATUS_INVALID_PARAMETER;
     }
 
-    // Allocate new config before taking lock (paged — accessed only at < DISPATCH)
+    // Allocate new config before taking lock (paged â€” accessed only at < DISPATCH)
     PVOID newConfig = ExAllocatePool2(
         POOL_FLAG_PAGED,
         ConfigSize,
@@ -1163,7 +1167,7 @@ BdvVerifyDriver(
         // Calculate Authenticode hash
         status = BdvpCalculateAuthenticodeHash(ImageBase, ImageSize, driverInfo->AuthentiCodeHash);
         if (!NT_SUCCESS(status)) {
-            // Non-fatal — some drivers may not have valid Authenticode
+            // Non-fatal â€” some drivers may not have valid Authenticode
             RtlZeroMemory(driverInfo->AuthentiCodeHash, sizeof(driverInfo->AuthentiCodeHash));
         }
 

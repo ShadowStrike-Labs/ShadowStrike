@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -23,7 +25,7 @@
  * @file CacheOptimization.c
  * @brief High-performance, lock-optimized caching infrastructure for kernel EDR.
  *
- * Lock Ordering (strictly enforced — always acquire in ascending order):
+ * Lock Ordering (strictly enforced â€” always acquire in ascending order):
  *   1. Bucket lock (per-bucket EX_PUSH_LOCK)
  *   2. Shard LRU lock (per-shard EX_PUSH_LOCK)
  *   3. Global list lock (per-cache EX_PUSH_LOCK)
@@ -60,7 +62,7 @@
 /* ========================================================================= */
 
 #define CO_DEFAULT_MAX_MEMORY       (256 * 1024 * 1024)  /* 256 MB */
-#define CO_MAX_DATA_SIZE            (1 * 1024 * 1024)    /* 1 MB per entry — prevents unbounded alloc */
+#define CO_MAX_DATA_SIZE            (1 * 1024 * 1024)    /* 1 MB per entry â€” prevents unbounded alloc */
 
 #define CO_100NS_PER_SECOND         10000000LL
 
@@ -128,7 +130,7 @@ CopCallCleanupCallback(
  *
  * PRECONDITION: Caller MUST hold the entry's bucket lock EXCLUSIVE.
  * This function acquires shard LRU lock then global list lock (lock order safe).
- * After this call the entry is freed — do not dereference.
+ * After this call the entry is freed â€” do not dereference.
  */
 static VOID
 CopRemoveEntryFromCache(
@@ -629,7 +631,7 @@ CoDestroyCache(
 
     InterlockedExchange(&Cache->ShuttingDown, TRUE);
 
-    /* Remove from manager's list (Fix #10 — only one removal site) */
+    /* Remove from manager's list (Fix #10 â€” only one removal site) */
     if (manager != NULL) {
         ExAcquirePushLockExclusive(&manager->CacheListLock);
         RemoveEntryList(&Cache->ManagerEntry);
@@ -688,7 +690,7 @@ CopDestroyCacheInternal(
 /**
  * @brief Flush all entries from a cache.
  *
- * Lock ordering: bucket lock → shard LRU lock → global list lock. (Fix #3, #4)
+ * Lock ordering: bucket lock â†’ shard LRU lock â†’ global list lock. (Fix #3, #4)
  *
  * We iterate buckets (not the global list) so we always hold the bucket
  * lock when calling CopRemoveEntryFromCache.
@@ -725,7 +727,7 @@ CoFlush(
             nextEntry = listEntry->Flink;
             cacheEntry = CONTAINING_RECORD(listEntry, CO_CACHE_ENTRY, HashEntry);
 
-            /* CopRemoveEntryFromCache requires bucket lock held — we hold it */
+            /* CopRemoveEntryFromCache requires bucket lock held â€” we hold it */
             CopRemoveEntryFromCache(Cache, cacheEntry, TRUE);
         }
 
@@ -815,7 +817,7 @@ CoPutEx(
 
     if (existingEntry != NULL) {
         /*
-         * UPDATE existing entry — done entirely under bucket lock.
+         * UPDATE existing entry â€” done entirely under bucket lock.
          * LRU promotion is also done under bucket lock to prevent
          * use-after-free. (Fix #2)
          */
@@ -862,7 +864,7 @@ CoPutEx(
      *
      * Capacity check: we do a best-effort check. Under high concurrency,
      * the count may slightly overshoot MaxEntries; this is acceptable
-     * and avoids a global lock. (Fix #15 — documented, not hidden)
+     * and avoids a global lock. (Fix #15 â€” documented, not hidden)
      */
     if ((ULONG)Cache->EntryCount >= Cache->Config.MaxEntries) {
         ExReleasePushLockExclusive(&bucket->Lock);
@@ -878,7 +880,7 @@ CoPutEx(
          */
         existingEntry = CopFindEntryInBucket(Cache, bucketIndex, Key);
         if (existingEntry != NULL) {
-            /* Race: another thread inserted this key — update it instead */
+            /* Race: another thread inserted this key â€” update it instead */
             if (existingEntry->DataOwned && existingEntry->Data != NULL) {
                 SIZE_T oldSize = existingEntry->DataSize;
                 ShadowStrikeFreePoolWithTag(existingEntry->Data, CO_DATA_POOL_TAG);
@@ -955,13 +957,13 @@ CoPutEx(
     }
 
     /*
-     * Insert into shard LRU (lock order: bucket → shard LRU ✓)
+     * Insert into shard LRU (lock order: bucket â†’ shard LRU âœ“)
      * We can call this while holding the bucket lock.
      */
     CopInsertIntoLRU(Cache, entry);
 
     /*
-     * Insert into global list (lock order: bucket → shard → global ✓)
+     * Insert into global list (lock order: bucket â†’ shard â†’ global âœ“)
      */
     ExAcquirePushLockExclusive(&Cache->GlobalListLock);
     InsertTailList(&Cache->GlobalEntryList, &entry->GlobalEntry);
@@ -1001,7 +1003,7 @@ CoPutEx(
  * @brief Look up an entry. Returns a COPY of the data to the caller.
  *
  * The data is copied under the bucket lock so the entry cannot be freed
- * while we read from it. (Fix #1 — eliminates use-after-free)
+ * while we read from it. (Fix #1 â€” eliminates use-after-free)
  *
  * If DataBuffer is NULL, we only check existence and return the size.
  * If DataBuffer is non-NULL but *DataSize < actual size, returns
@@ -1062,7 +1064,7 @@ CoGet(
     }
 
     /*
-     * Copy data under the lock — this is the fix for issue #1.
+     * Copy data under the lock â€” this is the fix for issue #1.
      * The entry cannot be freed while we hold even a shared bucket lock
      * because removal requires exclusive bucket lock.
      */
@@ -1070,7 +1072,7 @@ CoGet(
         if (DataBuffer != NULL) {
             if (*DataSize < entry->DataSize) {
                 *DataSize = entry->DataSize;
-                /* Entry was found — count as hit even though buffer too small (CO-04) */
+                /* Entry was found â€” count as hit even though buffer too small (CO-04) */
                 InterlockedExchange64(&entry->LastAccessTimeQpc, currentTime.QuadPart);
                 InterlockedIncrement(&entry->AccessCount);
                 ExReleasePushLockShared(&bucket->Lock);
@@ -1087,14 +1089,14 @@ CoGet(
         *DataSize = entry->DataSize;
     }
 
-    /* Update access tracking (atomic — safe under shared lock) (Fix #16) */
+    /* Update access tracking (atomic â€” safe under shared lock) (Fix #16) */
     InterlockedExchange64(&entry->LastAccessTimeQpc, currentTime.QuadPart);
     InterlockedIncrement(&entry->AccessCount);
     InterlockedIncrement(&entry->HitCount);
 
     /*
      * LRU promotion under the bucket lock. We hold bucket shared;
-     * CopPromoteInLRU acquires shard LRU lock (lock order: bucket → shard ✓).
+     * CopPromoteInLRU acquires shard LRU lock (lock order: bucket â†’ shard âœ“).
      * The entry is guaranteed alive. (Fix #2)
      */
     if (entry->HitCount >= CO_LRU_PROMOTION_THRESHOLD) {
@@ -1187,7 +1189,7 @@ CoGetEx(
 
     /*
      * Copy data under lock. Allocate a buffer and copy.
-     * This is the safe path — no use-after-free. (Fix #1)
+     * This is the safe path â€” no use-after-free. (Fix #1)
      */
     if (entry->Data != NULL && entry->DataSize > 0) {
         dataCopy = ShadowStrikeAllocatePoolWithTag(
@@ -1197,7 +1199,7 @@ CoGetEx(
         );
         if (dataCopy == NULL) {
             /*
-             * Pool allocation failed — cannot copy entry data.
+             * Pool allocation failed â€” cannot copy entry data.
              * Do NOT report CoResultSuccess with NULL data; callers
              * would dereference NULL. Release lock and return error.
              */
@@ -1361,7 +1363,7 @@ CoTouch(
     /* Atomic access time update (Fix #16) */
     InterlockedExchange64(&entry->LastAccessTimeQpc, currentTime.QuadPart);
 
-    /* Promote under bucket lock — entry is alive (Fix #2) */
+    /* Promote under bucket lock â€” entry is alive (Fix #2) */
     CopPromoteInLRU(Cache, entry);
 
     ExReleasePushLockShared(&bucket->Lock);
@@ -1744,7 +1746,7 @@ CopRemoveFromLRU(
  * @brief Promote entry to MRU position in its shard.
  *
  * Called while the caller holds the bucket lock (shared or exclusive).
- * Lock order: bucket → shard LRU ✓ (Fix #2, #4)
+ * Lock order: bucket â†’ shard LRU âœ“ (Fix #2, #4)
  */
 static VOID
 CopPromoteInLRU(
@@ -1769,9 +1771,9 @@ CopPromoteInLRU(
 /**
  * @brief Evict the LRU entry from a shard.
  *
- * Lock order: acquires shard LRU lock → bucket lock → global list lock. (Fix #4)
+ * Lock order: acquires shard LRU lock â†’ bucket lock â†’ global list lock. (Fix #4)
  *
- * Wait — this is bucket AFTER shard, which violates our stated lock order!
+ * Wait â€” this is bucket AFTER shard, which violates our stated lock order!
  * Resolution: We grab the entry pointer and its BucketIndex under the shard
  * lock, RELEASE the shard lock (having already removed the LRU entry from
  * the shard list), then acquire the bucket lock independently.
@@ -1905,9 +1907,9 @@ CopCallCleanupCallback(
  * PRECONDITION: Caller MUST hold the entry's bucket lock EXCLUSIVE.
  *
  * Lock acquisition order:
- *   - Bucket lock: already held by caller ✓
- *   - Shard LRU lock: acquired here (bucket → shard ✓)
- *   - Global list lock: acquired here (bucket → shard → global ✓)
+ *   - Bucket lock: already held by caller âœ“
+ *   - Shard LRU lock: acquired here (bucket â†’ shard âœ“)
+ *   - Global list lock: acquired here (bucket â†’ shard â†’ global âœ“)
  *
  * This enforces the global lock order. (Fix #3, #4, #13)
  */
@@ -1922,17 +1924,17 @@ CopRemoveEntryFromCache(
 
     InterlockedExchange(&Entry->State, CoEntryStateEvicting);
 
-    /* Remove from hash bucket — caller holds bucket lock exclusive */
+    /* Remove from hash bucket â€” caller holds bucket lock exclusive */
     if (!IsListEmpty(&Entry->HashEntry)) {
         RemoveEntryList(&Entry->HashEntry);
         InitializeListHead(&Entry->HashEntry);
         InterlockedDecrement(&Cache->Buckets[Entry->BucketIndex].EntryCount);
     }
 
-    /* Remove from LRU (acquires shard LRU lock — lock order: bucket → shard ✓) */
+    /* Remove from LRU (acquires shard LRU lock â€” lock order: bucket â†’ shard âœ“) */
     CopRemoveFromLRU(Cache, Entry);
 
-    /* Remove from global list (acquires global list lock — lock order: bucket → shard → global ✓) */
+    /* Remove from global list (acquires global list lock â€” lock order: bucket â†’ shard â†’ global âœ“) */
     ExAcquirePushLockExclusive(&Cache->GlobalListLock);
     if (!IsListEmpty(&Entry->GlobalEntry)) {
         RemoveEntryList(&Entry->GlobalEntry);
@@ -1965,7 +1967,7 @@ CopRemoveEntryFromCache(
  * @brief Evict expired entries by scanning buckets.
  *
  * Acquires each bucket lock exclusively, then calls CopRemoveEntryFromCache
- * which follows the lock order (bucket → shard → global). (Fix #3, #4)
+ * which follows the lock order (bucket â†’ shard â†’ global). (Fix #3, #4)
  */
 static ULONG
 CopEvictExpiredEntries(
@@ -2034,7 +2036,7 @@ CopEvictLRUEntries(
                 evicted++;
                 InterlockedIncrement64(&Cache->Stats.LRUEvictions);
             } else {
-                /* Shard is empty or all entries are pinned — move to next shard */
+                /* Shard is empty or all entries are pinned â€” move to next shard */
                 break;
             }
         }

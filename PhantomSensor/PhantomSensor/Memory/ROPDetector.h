@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -152,7 +154,7 @@ typedef struct _ROP_GADGET {
 
 typedef struct _ROP_CHAIN_ENTRY {
     //
-    // Snapshot of gadget data (copied, not pointer — no lifetime dependency)
+    // Snapshot of gadget data (copied, not pointer â€” no lifetime dependency)
     //
     PVOID GadgetAddress;
     ROP_GADGET_TYPE GadgetType;

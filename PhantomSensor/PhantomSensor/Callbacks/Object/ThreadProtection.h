@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -148,7 +150,7 @@ extern "C" {
 #define TP_TRACKER_LOOKASIDE_DEPTH      64
 
 // ============================================================================
-// THREAD ACCESS RIGHTS — Not always defined in WDK kernel headers
+// THREAD ACCESS RIGHTS â€” Not always defined in WDK kernel headers
 // ============================================================================
 
 #ifndef THREAD_IMPERSONATE
@@ -164,7 +166,7 @@ extern "C" {
 #endif
 
 // ============================================================================
-// HASH WALK BOUNDS — Prevents infinite loops on corruption
+// HASH WALK BOUNDS â€” Prevents infinite loops on corruption
 // ============================================================================
 
 #define TP_MAX_HASH_WALK                128

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -347,7 +349,7 @@ SdpIsTimeout(
 //
 
 /**
- * @brief C-2: Lifecycle helpers — increment-then-check reference pattern.
+ * @brief C-2: Lifecycle helpers â€” increment-then-check reference pattern.
  */
 static FORCEINLINE BOOLEAN
 SdpAcquireReference(
@@ -499,7 +501,7 @@ Return Value:
     RtlZeroMemory(detector, sizeof(SD_DETECTOR));
 
     //
-    // C-2 fix: CAS-based initialization — prevent double-init
+    // C-2 fix: CAS-based initialization â€” prevent double-init
     //
     prevState = InterlockedCompareExchange(
         &detector->State, SD_STATE_INITIALIZING, SD_STATE_UNINITIALIZED);
@@ -536,7 +538,7 @@ Return Value:
     // C-2 fix: Initialize lifecycle primitives
     //
     KeInitializeEvent(&detector->ShutdownEvent, NotificationEvent, FALSE);
-    detector->ActiveOperations = 1;  // Init reference — released by SdShutdown
+    detector->ActiveOperations = 1;  // Init reference â€” released by SdShutdown
 
     //
     // Populate default API hashes (H-6: failures are non-fatal but logged)
@@ -549,7 +551,7 @@ Return Value:
     KeQuerySystemTime(&detector->Stats.StartTime);
 
     //
-    // C-2: Transition INITIALIZING → READY
+    // C-2: Transition INITIALIZING â†’ READY
     //
     InterlockedExchange(&detector->State, SD_STATE_READY);
 
@@ -582,7 +584,7 @@ Routine Description:
     }
 
     //
-    // C-2: Transition READY → SHUTTING_DOWN via CAS
+    // C-2: Transition READY â†’ SHUTTING_DOWN via CAS
     //
     prevState = InterlockedCompareExchange(
         &Detector->State, SD_STATE_SHUTTING_DOWN, SD_STATE_READY);
@@ -592,7 +594,7 @@ Routine Description:
 
     //
     // Release the init reference, then wait for active operations to drain.
-    // SC-2 fix: MUST use INFINITE wait — cannot safely free while ops in flight.
+    // SC-2 fix: MUST use INFINITE wait â€” cannot safely free while ops in flight.
     // A bounded timeout would proceed to free memory that active scans still reference.
     //
     if (InterlockedDecrement(&Detector->ActiveOperations) > 0) {
@@ -723,7 +725,7 @@ Return Value:
     }
 
     //
-    // H-4 fix: Use PagedPool — all callers at PASSIVE_LEVEL.
+    // H-4 fix: Use PagedPool â€” all callers at PASSIVE_LEVEL.
     // SD_DETECTION_RESULT is ~3.5KB, no reason for NonPaged.
     //
     result = (PSD_DETECTION_RESULT)ShadowStrikeAllocatePoolWithTag(
@@ -881,8 +883,8 @@ Return Value:
 
     //
     // 12. Polymorphic composite detection
-    // Encoder + high entropy = runtime-decoded payload → polymorphic shellcode.
-    // This is always derived from prior stages — no config toggle needed.
+    // Encoder + high entropy = runtime-decoded payload â†’ polymorphic shellcode.
+    // This is always derived from prior stages â€” no config toggle needed.
     //
     if ((result->Flags & SdFlag_Encoder) && (result->Flags & SdFlag_HighEntropy)) {
         result->Flags |= SdFlag_Polymorphic;
@@ -955,9 +957,9 @@ Routine Description:
 
     //
     // SC2-H1 fix: Acquire reference during cross-process copy phase.
-    // SdpIsReady was insufficient — if SdShutdown races between the ready check
+    // SdpIsReady was insufficient â€” if SdShutdown races between the ready check
     // and SdAnalyzeBuffer (which acquires its own ref), the detector is freed
-    // and SdAnalyzeBuffer dereferences freed memory → BSOD.
+    // and SdAnalyzeBuffer dereferences freed memory â†’ BSOD.
     //
     if (!SdpAcquireReference(Detector)) {
         return STATUS_DEVICE_NOT_READY;
@@ -980,7 +982,7 @@ Routine Description:
     }
 
     //
-    // C-3 fix: Use PagedPool — buffer only used at PASSIVE_LEVEL.
+    // C-3 fix: Use PagedPool â€” buffer only used at PASSIVE_LEVEL.
     // L-3 fix: Use SD_POOL_TAG_BUFFER for temp allocations.
     //
     buffer = ShadowStrikeAllocatePoolWithTag(
@@ -1024,7 +1026,7 @@ Routine Description:
 
     //
     // SC2-H1: Release outer reference before SdAnalyzeBuffer (it acquires its own).
-    // Detector is guaranteed alive until we release — SdShutdown waits for drain.
+    // Detector is guaranteed alive until we release â€” SdShutdown waits for drain.
     //
     SdpReleaseReference(Detector);
 
@@ -1217,14 +1219,14 @@ Routine Description:
     }
 
     //
-    // Detach BEFORE analyzing — SdAnalyzeRegion attaches on its own
+    // Detach BEFORE analyzing â€” SdAnalyzeRegion attaches on its own
     //
     KeUnstackDetachProcess(&apcState);
     ObDereferenceObject(process);
     process = NULL;
 
     //
-    // Phase 2: Analyze collected regions (detached — no double-attach)
+    // Phase 2: Analyze collected regions (detached â€” no double-attach)
     //
     for (i = 0; i < regionCount && foundCount < MaxResults; i++) {
         PSD_DETECTION_RESULT result = NULL;
@@ -1681,7 +1683,7 @@ Routine Description:
     }
 
     //
-    // Open file — kernel-handle, sequential read, share-read only
+    // Open file â€” kernel-handle, sequential read, share-read only
     //
     InitializeObjectAttributes(
         &ObjectAttributes,
@@ -1711,7 +1713,7 @@ Routine Description:
     }
 
     //
-    // Query file size — reject empty files and files > 4MB (sanity cap)
+    // Query file size â€” reject empty files and files > 4MB (sanity cap)
     //
     Status = ZwQueryInformationFile(
         FileHandle,
@@ -1797,7 +1799,7 @@ Routine Description:
     }
 
     //
-    // Cap entry count — never exceed our maximum
+    // Cap entry count â€” never exceed our maximum
     //
     if (Count > SD_MAX_API_HASHES) {
         Count = SD_MAX_API_HASHES;
@@ -1845,7 +1847,7 @@ Routine Description:
 
         //
         // Validate null-termination within field bounds.
-        // A malformed file could omit terminators → unbounded string ops.
+        // A malformed file could omit terminators â†’ unbounded string ops.
         //
         BOOLEAN ApiTerminated = FALSE;
         BOOLEAN DllTerminated = FALSE;
@@ -1872,7 +1874,7 @@ Routine Description:
         } else if (Status == STATUS_QUOTA_EXCEEDED) {
             break;  // Hash table full
         }
-        // Other errors (e.g., INSUFFICIENT_RESOURCES) — skip entry, continue
+        // Other errors (e.g., INSUFFICIENT_RESOURCES) â€” skip entry, continue
     }
 
     Status = (LoadedCount > 0) ? STATUS_SUCCESS : STATUS_NO_MORE_ENTRIES;
@@ -2026,13 +2028,13 @@ Routine Description:
         } while (0)
 
     //
-    // H-6 fix: If first allocation fails, hash table cannot be created — return early.
+    // H-6 fix: If first allocation fails, hash table cannot be created â€” return early.
     //
 
     // Common ROR13 hashes used by shellcode
     SD_ADD_HASH_INTERNAL(ROR13_LOADLIBRARYA, "LoadLibraryA", "kernel32.dll");
     if (Detector->ApiHashes.HashTable == NULL) {
-        return;  // First alloc failed — no point continuing
+        return;  // First alloc failed â€” no point continuing
     }
     
     SD_ADD_HASH_INTERNAL(ROR13_GETPROCADDRESS, "GetProcAddress", "kernel32.dll");
@@ -2936,14 +2938,12 @@ Routine Description:
                              &buffer[i], min(32, gadgetSize + 1));
 
                 gadgetCount++;
-                if (gadgetCount >= 1) {
-                    return TRUE;  // Found at least one
-                }
+                return TRUE;  // Found at least one exploitable gadget
             }
         }
     }
 
-    return (gadgetCount > 0);
+    return FALSE;  // No exploitable gadgets found
 }
 
 
@@ -3036,7 +3036,7 @@ Routine Description:
     for (i = 0; i < size - 5; i++) {
         //
         // Pattern 1: CALL $+5; POP reg (E8 00 00 00 00 58-5F)
-        // Classic x86 GetPC idiom — CALL pushes next IP, POP captures it.
+        // Classic x86 GetPC idiom â€” CALL pushes next IP, POP captures it.
         //
         if (buffer[i] == 0xE8 &&
             buffer[i + 1] == 0x00 && buffer[i + 2] == 0x00 &&
@@ -3049,7 +3049,7 @@ Routine Description:
 
         //
         // Pattern 2: FNSTENV [ESP-0xC] (D9 74 24 F4)
-        // FPU-based GetPC — stores FPU environment which includes
+        // FPU-based GetPC â€” stores FPU environment which includes
         // the EIP of the last FPU instruction executed.
         //
         if (i + 3 < size &&
@@ -3119,7 +3119,7 @@ Routine Description:
 
     Detects suspicious CALL/JMP patterns indicative of dynamically-resolved
     API invocation. Shellcode that resolves APIs via hash tables will
-    contain clusters of indirect CALL/JMP through registers — a pattern
+    contain clusters of indirect CALL/JMP through registers â€” a pattern
     rarely seen in legitimate compiled code at this density.
 
     MITRE ATT&CK: T1106 (Native API), T1055 (Process Injection)
@@ -3137,7 +3137,7 @@ Routine Description:
 
     for (i = 0; i < size - 2; i++) {
         //
-        // CALL reg (FF D0-D7) — indirect register call
+        // CALL reg (FF D0-D7) â€” indirect register call
         // Shellcode pattern: resolve API address into register, CALL through it.
         //
         if (buffer[i] == 0xFF &&
@@ -3147,7 +3147,7 @@ Routine Description:
 
         //
         // CALL [reg] (FF /2 with memory operand, mod != 11)
-        // Indirect call through memory pointer — vtable-like but in raw shellcode
+        // Indirect call through memory pointer â€” vtable-like but in raw shellcode
         // context indicates resolved function pointer table.
         //
         else if (buffer[i] == 0xFF &&
@@ -3157,7 +3157,7 @@ Routine Description:
         }
 
         //
-        // JMP reg (FF E0-E7) — indirect register jump
+        // JMP reg (FF E0-E7) â€” indirect register jump
         // Common in tail-call resolved API dispatch.
         //
         else if (buffer[i] == 0xFF &&
@@ -3167,7 +3167,7 @@ Routine Description:
 
         //
         // JMP [reg] (FF /4 with memory operand, mod != 11)
-        // Indirect jump through memory — IAT-style dispatch in shellcode.
+        // Indirect jump through memory â€” IAT-style dispatch in shellcode.
         //
         else if (buffer[i] == 0xFF &&
                  (buffer[i + 1] & 0x38) == 0x20 &&
@@ -3185,7 +3185,7 @@ Routine Description:
 
     //
     // Threshold: 3+ indirect calls/jumps in a single buffer indicates
-    // dynamic API resolution — legitimate compiled code uses direct CALLs.
+    // dynamic API resolution â€” legitimate compiled code uses direct CALLs.
     //
     return (indirectCalls >= 3);
 }
@@ -3462,7 +3462,7 @@ SdpIsTimeout(
 
 
 //
-// L-1: Dead SdpRor13Hash function removed — hash values are hardcoded constants.
+// L-1: Dead SdpRor13Hash function removed â€” hash values are hardcoded constants.
 //
 
 

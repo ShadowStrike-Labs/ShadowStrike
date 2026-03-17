@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -107,7 +109,7 @@
 #define TLS_EXTENSION_RENEGOTIATION_INFO        0xFF01
 
 //
-// GREASE values (RFC 8701) — should be ignored in JA3 computation
+// GREASE values (RFC 8701) â€” should be ignored in JA3 computation
 //
 #define TLS_IS_GREASE_VALUE(x) \
     (((x) & 0x0F0F) == 0x0A0A)
@@ -150,7 +152,7 @@ typedef struct _TLS_CLIENT_HELLO_FIXED {
 #pragma pack(pop)
 
 //
-// Internal session — lives on the inspector's list, never returned to callers.
+// Internal session â€” lives on the inspector's list, never returned to callers.
 //
 typedef struct _SSL_SESSION {
     LIST_ENTRY ListEntry;
@@ -188,7 +190,7 @@ typedef struct _SSL_BAD_JA3_ENTRY {
 } SSL_BAD_JA3_ENTRY, *PSSL_BAD_JA3_ENTRY;
 
 //
-// Parsed ClientHello data (internal use — stack allocated)
+// Parsed ClientHello data (internal use â€” stack allocated)
 //
 typedef struct _SSL_PARSED_CLIENT_HELLO {
     SSL_VERSION Version;
@@ -214,7 +216,7 @@ typedef struct _SSL_PARSED_CLIENT_HELLO {
 } SSL_PARSED_CLIENT_HELLO, *PSSL_PARSED_CLIENT_HELLO;
 
 //
-// Parsed ServerHello data (internal use — stack allocated)
+// Parsed ServerHello data (internal use â€” stack allocated)
 //
 typedef struct _SSL_PARSED_SERVER_HELLO {
     SSL_VERSION Version;
@@ -273,7 +275,7 @@ SslpSnapshotSession(
     );
 
 //
-// Internal JA3 check — caller already holds rundown, does NOT re-acquire it.
+// Internal JA3 check â€” caller already holds rundown, does NOT re-acquire it.
 //
 static VOID
 SslpCheckKnownJA3(
@@ -357,7 +359,7 @@ SslpIsWeakCipherSuite(
 }
 
 // ============================================================================
-// PUBLIC API — INITIALIZATION
+// PUBLIC API â€” INITIALIZATION
 // ============================================================================
 
 _Use_decl_annotations_
@@ -377,7 +379,7 @@ SslInitialize(
     *Inspector = NULL;
 
     //
-    // Allocate from non-paged pool — contains sync primitives.
+    // Allocate from non-paged pool â€” contains sync primitives.
     //
     NewInspector = (PSSL_INSPECTOR)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
@@ -408,7 +410,7 @@ SslInitialize(
 }
 
 // ============================================================================
-// PUBLIC API — SHUTDOWN
+// PUBLIC API â€” SHUTDOWN
 // ============================================================================
 
 _Use_decl_annotations_
@@ -456,7 +458,7 @@ SslShutdown(
 }
 
 // ============================================================================
-// PUBLIC API — INSPECT CLIENT HELLO
+// PUBLIC API â€” INSPECT CLIENT HELLO
 // ============================================================================
 
 _Use_decl_annotations_
@@ -588,7 +590,7 @@ SslInspectClientHello(
     }
 
     //
-    // Check against known bad JA3 — internal version, no nested rundown
+    // Check against known bad JA3 â€” internal version, no nested rundown
     //
     IsBadJA3 = FALSE;
     MalwareFamily[0] = '\0';
@@ -627,7 +629,7 @@ SslInspectClientHello(
     }
 
     //
-    // Snapshot session data for the caller — no internal pointers.
+    // Snapshot session data for the caller â€” no internal pointers.
     //
     SslpSnapshotSession(NewSession, Snapshot);
 
@@ -673,7 +675,7 @@ SslInspectClientHello(
 }
 
 // ============================================================================
-// PUBLIC API — INSPECT SERVER HELLO
+// PUBLIC API â€” INSPECT SERVER HELLO
 // ============================================================================
 
 _Use_decl_annotations_
@@ -726,7 +728,7 @@ SslInspectServerHello(
     }
 
     //
-    // Find and update session under EXCLUSIVE lock — prevents use-after-free
+    // Find and update session under EXCLUSIVE lock â€” prevents use-after-free
     // and protects the mutation from concurrent access.
     //
     KeEnterCriticalRegion();
@@ -759,7 +761,7 @@ SslInspectServerHello(
 
     if (Found) {
         //
-        // Update session with server-selected values — UNDER LOCK.
+        // Update session with server-selected values â€” UNDER LOCK.
         //
         if (Parsed.SelectedVersion != 0) {
             Session->Version = (SSL_VERSION)Parsed.SelectedVersion;
@@ -805,7 +807,7 @@ SslInspectServerHello(
 }
 
 // ============================================================================
-// PUBLIC API — CALCULATE JA3 (standalone, no inspector state)
+// PUBLIC API â€” CALCULATE JA3 (standalone, no inspector state)
 // ============================================================================
 
 _Use_decl_annotations_
@@ -850,7 +852,7 @@ SslCalculateJA3(
 }
 
 // ============================================================================
-// PUBLIC API — ADD BAD JA3 (atomic check+insert under single exclusive lock)
+// PUBLIC API â€” ADD BAD JA3 (atomic check+insert under single exclusive lock)
 // ============================================================================
 
 _Use_decl_annotations_
@@ -937,7 +939,7 @@ SslAddBadJA3(
     }
 
     //
-    // Insert — still under the same exclusive lock
+    // Insert â€” still under the same exclusive lock
     //
     InsertTailList(&Inspector->BadJA3List, &NewEntry->ListEntry);
     InterlockedIncrement(&Inspector->BadJA3Count);
@@ -950,7 +952,7 @@ SslAddBadJA3(
 }
 
 // ============================================================================
-// PUBLIC API — CHECK JA3
+// PUBLIC API â€” CHECK JA3
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1015,7 +1017,7 @@ SslCheckJA3(
 }
 
 // ============================================================================
-// PUBLIC API — REMOVE SESSION
+// PUBLIC API â€” REMOVE SESSION
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1087,7 +1089,7 @@ SslRemoveSession(
 }
 
 // ============================================================================
-// PUBLIC API — STATISTICS
+// PUBLIC API â€” STATISTICS
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1129,7 +1131,7 @@ SslGetStatistics(
 }
 
 // ============================================================================
-// PUBLIC API — FREE SESSION INFO (caller snapshot)
+// PUBLIC API â€” FREE SESSION INFO (caller snapshot)
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1146,7 +1148,7 @@ SslFreeSessionInfo(
 }
 
 // ============================================================================
-// PUBLIC API — STALE SESSION CLEANUP
+// PUBLIC API â€” STALE SESSION CLEANUP
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1214,7 +1216,7 @@ SslCleanupStaleSessions(
 }
 
 // ============================================================================
-// INTERNAL — PARSE CLIENT HELLO
+// INTERNAL â€” PARSE CLIENT HELLO
 // ============================================================================
 
 static
@@ -1267,7 +1269,7 @@ SslpParseClientHello(
             return STATUS_INVALID_BUFFER_SIZE;
         }
         //
-        // Constrain effective end to TLS record boundary — prevents
+        // Constrain effective end to TLS record boundary â€” prevents
         // parsing trailing data that is not part of this record.
         //
         BufferEnd = Buffer + sizeof(TLS_RECORD_HEADER) + RecordPayloadLength;
@@ -1391,7 +1393,7 @@ SslpParseClientHello(
             }
 
             //
-            // Parse specific extensions — all inner length reads
+            // Parse specific extensions â€” all inner length reads
             // are validated against ExtLength to prevent OOB access.
             //
             switch (ExtType) {
@@ -1484,7 +1486,7 @@ SslpParseClientHello(
 }
 
 // ============================================================================
-// INTERNAL — PARSE SERVER HELLO
+// INTERNAL â€” PARSE SERVER HELLO
 // ============================================================================
 
 static
@@ -1623,7 +1625,7 @@ SslpParseServerHello(
 }
 
 // ============================================================================
-// INTERNAL — BUILD JA3 STRING
+// INTERNAL â€” BUILD JA3 STRING
 //
 // Format: SSLVersion,Ciphers,Extensions,EllipticCurves,ECPointFormats
 // ============================================================================
@@ -1737,7 +1739,7 @@ SslpBuildJA3String(
 }
 
 // ============================================================================
-// INTERNAL — BUILD JA3S STRING
+// INTERNAL â€” BUILD JA3S STRING
 //
 // Format: SSLVersion,CipherSuite,Extensions
 // ============================================================================
@@ -1794,7 +1796,7 @@ SslpBuildJA3SString(
 }
 
 // ============================================================================
-// INTERNAL — SUSPICION ANALYSIS
+// INTERNAL â€” SUSPICION ANALYSIS
 // ============================================================================
 
 static
@@ -1843,7 +1845,7 @@ SslpAnalyzeSuspicion(
         Session->SuspicionScore += 10;
     }
 
-    // Missing SNI — suspicious for HTTPS
+    // Missing SNI â€” suspicious for HTTPS
     if (ClientHello->ServerName[0] == '\0') {
         Session->SuspicionScore += 5;
     }
@@ -1860,10 +1862,10 @@ SslpAnalyzeSuspicion(
 }
 
 // ============================================================================
-// INTERNAL — SESSION SNAPSHOT
+// INTERNAL â€” SESSION SNAPSHOT
 //
 // Copies internal session data to a caller-visible SSL_SESSION_INFO.
-// No pointers, no list linkage — pure value copy.
+// No pointers, no list linkage â€” pure value copy.
 // ============================================================================
 
 static
@@ -1893,7 +1895,7 @@ SslpSnapshotSession(
 }
 
 // ============================================================================
-// INTERNAL — JA3 CHECK (no rundown — called from contexts that already hold it)
+// INTERNAL â€” JA3 CHECK (no rundown â€” called from contexts that already hold it)
 // ============================================================================
 
 static

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -361,7 +363,7 @@ RtShutdown(
     InterlockedExchange(&throttler->ShutdownFlag, 1);
 
     //
-    // 2. Disable rundown — blocks new ExAcquireRundownProtection calls
+    // 2. Disable rundown â€” blocks new ExAcquireRundownProtection calls
     //
     ExWaitForRundownProtectionRelease(&throttler->RundownRef);
 
@@ -903,7 +905,7 @@ RtCheckThrottle(
     }
 
     //
-    // Acquire rundown protection — prevents shutdown during operation
+    // Acquire rundown protection â€” prevents shutdown during operation
     //
     if (!ExAcquireRundownProtection(&Throttler->RundownRef)) {
         return STATUS_DEVICE_NOT_READY;
@@ -1073,7 +1075,7 @@ RtReportProcessUsage(
     quota = RtpLookupProcessQuotaLocked(Throttler, ProcessId, &oldIrql);
     if (quota == NULL) {
         //
-        // No existing quota — try create via the full lookup path.
+        // No existing quota â€” try create via the full lookup path.
         // RtpFindOrCreateProcessQuota allocates under the lock, which is safe.
         //
         quota = RtpFindOrCreateProcessQuota(Throttler, ProcessId, TRUE);
@@ -1083,7 +1085,7 @@ RtReportProcessUsage(
         //
         // RtpFindOrCreateProcessQuota released the lock. Re-acquire
         // for the update. The quota is either found (existing) or just
-        // inserted — RtRemoveProcess cannot race here because the process
+        // inserted â€” RtRemoveProcess cannot race here because the process
         // is still running if it's reporting usage.
         //
         KeAcquireSpinLock(&Throttler->ProcessQuotas.Lock, &oldIrql);
@@ -1202,7 +1204,7 @@ RtSetProcessExemption(
     }
 
     //
-    // Not found — create. RtpFindOrCreateProcessQuota handles its own locking.
+    // Not found â€” create. RtpFindOrCreateProcessQuota handles its own locking.
     //
     quota = RtpFindOrCreateProcessQuota(Throttler, ProcessId, TRUE);
     if (quota == NULL) {
@@ -1210,7 +1212,7 @@ RtSetProcessExemption(
     }
 
     //
-    // Just created — no concurrent free possible yet. Safe to write.
+    // Just created â€” no concurrent free possible yet. Safe to write.
     //
     quota->Exempt = Exempt;
 
@@ -1456,7 +1458,7 @@ RtResetStatistics(
     KeAcquireSpinLock(&Throttler->StatsLock, &oldIrql);
 
     //
-    // Under exclusive spin lock — plain stores are safe and cheaper
+    // Under exclusive spin lock â€” plain stores are safe and cheaper
     // than Interlocked* (no bus-lock overhead on multi-core).
     //
     Throttler->Stats.TotalOperations = 0;
@@ -1643,7 +1645,7 @@ RtpMonitorTimerCallback(
     }
 
     //
-    // On battery power, refill burst tokens at 2× rate to reduce
+    // On battery power, refill burst tokens at 2Ã— rate to reduce
     // CPU overhead from throttle-induced retries. Protection is
     // still active (limits unchanged), but throttling is less aggressive.
     //
@@ -1760,7 +1762,7 @@ RtpUpdateResourceState(
     criticalAction = config->CriticalAction;
 
     //
-    // Calculate rate (modifies RateHistory etc. — under lock)
+    // Calculate rate (modifies RateHistory etc. â€” under lock)
     //
     RtpCalculateRate(state, currentTime);
 
@@ -1977,7 +1979,7 @@ RtpDetermineAction(
     }
 
     //
-    // CAS loop for burst tokens — only decrement if > 0
+    // CAS loop for burst tokens â€” only decrement if > 0
     //
     do {
         prevTokens = state->BurstTokens;
@@ -2019,12 +2021,12 @@ RtpDetermineAction(
             break;
 
         case RtStateCritical:
-            if (Priority >= RtPriorityHigh) {
+            if (Priority >= RtPriorityNormal) {
                 action = config->CriticalAction;
-            } else if (Priority >= RtPriorityNormal) {
+            } else if (Priority >= RtPriorityHigh) {
                 action = config->HardAction;
             } else {
-                action = config->SoftAction;
+                action = RtActionNone;  // Critical priority never throttled
             }
             break;
 
@@ -2114,7 +2116,7 @@ RtpLookupProcessQuotaLocked(
         quota = CONTAINING_RECORD(entry, RT_PROCESS_QUOTA, HashLink);
 
         if (quota->ProcessId == ProcessId && quota->InUse) {
-            return quota;  // Lock still held — caller MUST release
+            return quota;  // Lock still held â€” caller MUST release
         }
     }
 
@@ -2125,7 +2127,7 @@ RtpLookupProcessQuotaLocked(
 /**
  * @brief Find existing process quota (read-only, no allocation).
  *
- * Uses KSPIN_LOCK — safe at DISPATCH_LEVEL.
+ * Uses KSPIN_LOCK â€” safe at DISPATCH_LEVEL.
  */
 static PRT_PROCESS_QUOTA
 RtpFindProcessQuota(
@@ -2165,7 +2167,7 @@ RtpFindProcessQuota(
  * not embedded in the RT_THROTTLER struct. This reduces the base struct size
  * and makes cleanup straightforward.
  *
- * Uses KSPIN_LOCK — safe at DISPATCH_LEVEL.
+ * Uses KSPIN_LOCK â€” safe at DISPATCH_LEVEL.
  */
 static PRT_PROCESS_QUOTA
 RtpFindOrCreateProcessQuota(

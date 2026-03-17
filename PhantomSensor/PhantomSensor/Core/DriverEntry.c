@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -294,7 +296,7 @@ static COMP_MANAGER g_CompressionManager = {0};
 static ENC_MANAGER g_EncryptionManager = {0};
 
 /**
- * @brief Power callback bridge — forwards sleep/resume events to BehaviorEngine.
+ * @brief Power callback bridge â€” forwards sleep/resume events to BehaviorEngine.
  *
  * Detects T1497.003 (Time Based Evasion) by making power transitions visible
  * in the behavioral event stream. Attack chain tracker correlates sleep/resume
@@ -329,7 +331,7 @@ ShadowStrikePowerBehaviorBridge(
 
     case ShadowPowerEvent_ResumingFromSleep:
     case ShadowPowerEvent_ResumingFromHibernate:
-        threatScore = 5;  // Mild baseline — chain tracker evaluates context
+        threatScore = 5;  // Mild baseline â€” chain tracker evaluates context
         break;
 
     case ShadowPowerEvent_BatteryCritical:
@@ -444,7 +446,7 @@ ShadowStrikeEtwEventCallback(
 
     //
     // Stream processed events to TelemetryEvents ETW provider.
-    // NOTE: We do NOT log every individual event — that would flood the
+    // NOTE: We do NOT log every individual event â€” that would flood the
     // telemetry channel at thousands of events/second. Instead, stats
     // are aggregated and logged periodically in the health check timer.
     // Individual event forwarding to CommPort (below) handles real-time
@@ -568,7 +570,7 @@ ShadowStrikePopulateEventSchema(
                    "Security alerts and threat detections");
 
     //
-    // ── Process Events ──
+    // â”€â”€ Process Events â”€â”€
     //
 
     // EtwEventId_ProcessCreate (1)
@@ -616,7 +618,7 @@ ShadowStrikePopulateEventSchema(
     if (NT_SUCCESS(status)) registered++; else failed++;
 
     //
-    // ── Thread Events ──
+    // â”€â”€ Thread Events â”€â”€
     //
 
     // EtwEventId_ThreadCreate (100)
@@ -653,7 +655,7 @@ ShadowStrikePopulateEventSchema(
     if (NT_SUCCESS(status)) registered++; else failed++;
 
     //
-    // ── Image Events ──
+    // â”€â”€ Image Events â”€â”€
     //
 
     // EtwEventId_ImageLoad (200)
@@ -690,7 +692,7 @@ ShadowStrikePopulateEventSchema(
     if (NT_SUCCESS(status)) registered++; else failed++;
 
     //
-    // ── File Events ──
+    // â”€â”€ File Events â”€â”€
     //
 
     // EtwEventId_FileCreate (300)
@@ -707,7 +709,7 @@ ShadowStrikePopulateEventSchema(
                                ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_FILE, 8, fields);
     if (NT_SUCCESS(status)) registered++; else failed++;
 
-    // EtwEventId_FileWrite (301) — same struct as FileCreate
+    // EtwEventId_FileWrite (301) â€” same struct as FileCreate
     status = EsRegisterEventEx(Schema, EtwEventId_FileWrite, "FileWrite",
                                ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_FILE, 8, fields);
     if (NT_SUCCESS(status)) registered++; else failed++;
@@ -728,7 +730,7 @@ ShadowStrikePopulateEventSchema(
     if (NT_SUCCESS(status)) registered++; else failed++;
 
     //
-    // ── Registry Events ──
+    // â”€â”€ Registry Events â”€â”€
     //
 
     // EtwEventId_RegistrySetValue (400)
@@ -759,7 +761,7 @@ ShadowStrikePopulateEventSchema(
     if (NT_SUCCESS(status)) registered++; else failed++;
 
     //
-    // ── Memory Events ──
+    // â”€â”€ Memory Events â”€â”€
     //
 
     // EtwEventId_MemoryAllocation (500)
@@ -798,7 +800,7 @@ ShadowStrikePopulateEventSchema(
     if (NT_SUCCESS(status)) registered++; else failed++;
 
     //
-    // ── Network Events ──
+    // â”€â”€ Network Events â”€â”€
     //
 
     // EtwEventId_NetworkConnect (600)
@@ -822,7 +824,7 @@ ShadowStrikePopulateEventSchema(
                                ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_NETWORK, 15, fields);
     if (NT_SUCCESS(status)) registered++; else failed++;
 
-    // EtwEventId_NetworkListen (601) — same layout
+    // EtwEventId_NetworkListen (601) â€” same layout
     status = EsRegisterEventEx(Schema, EtwEventId_NetworkListen, "NetworkListen",
                                ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_NETWORK, 15, fields);
     if (NT_SUCCESS(status)) registered++; else failed++;
@@ -838,7 +840,7 @@ ShadowStrikePopulateEventSchema(
                                ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_NETWORK, 5, fields);
     if (NT_SUCCESS(status)) registered++; else failed++;
 
-    // EtwEventId_C2Detected (603) — uses full NetworkConnect layout (15 fields)
+    // EtwEventId_C2Detected (603) â€” uses full NetworkConnect layout (15 fields)
     RtlZeroMemory(fields, sizeof(fields));
     EsInitField(&fields[0],  "Timestamp",      EsType_UINT64,   0,   8, EsFieldFlag_None);
     EsInitField(&fields[1],  "ProcessId",      EsType_UINT32,   8,   4, EsFieldFlag_None);
@@ -870,7 +872,7 @@ ShadowStrikePopulateEventSchema(
     if (NT_SUCCESS(status)) registered++; else failed++;
 
     //
-    // ── Behavior Events ──
+    // â”€â”€ Behavior Events â”€â”€
     //
 
     // EtwEventId_BehaviorAlert (700)
@@ -911,7 +913,7 @@ ShadowStrikePopulateEventSchema(
     if (NT_SUCCESS(status)) registered++; else failed++;
 
     //
-    // ── Security Alert Events ──
+    // â”€â”€ Security Alert Events â”€â”€
     //
 
     // EtwEventId_TamperAttempt (800)
@@ -952,7 +954,7 @@ ShadowStrikePopulateEventSchema(
     if (NT_SUCCESS(status)) registered++; else failed++;
 
     //
-    // ── Diagnostic Events ──
+    // â”€â”€ Diagnostic Events â”€â”€
     //
 
     // EtwEventId_DriverStarted (900)
@@ -1104,7 +1106,7 @@ DriverEntry(
     KeQuerySystemTime(&g_DriverData.Stats.StartTime);
 
     //
-    // Step 4.5: Initialize memory utilities (foundational — must precede all allocations)
+    // Step 4.5: Initialize memory utilities (foundational â€” must precede all allocations)
     //
     status = ShadowStrikeInitializeMemoryUtils();
     if (!NT_SUCCESS(status) && status != STATUS_ALREADY_INITIALIZED) {
@@ -1150,7 +1152,7 @@ DriverEntry(
     // =========================================================================
 
     //
-    // Step 5.1: Initialize work queue (singleton — provides work item dispatch)
+    // Step 5.1: Initialize work queue (singleton â€” provides work item dispatch)
     //
     status = ShadowStrikeWorkQueueInitialize();
     if (!NT_SUCCESS(status)) {
@@ -1338,7 +1340,7 @@ DriverEntry(
     }
 
     //
-    // Step 5.8: Batch processing — telemetry event aggregator
+    // Step 5.8: Batch processing â€” telemetry event aggregator
     //
     status = BpInitialize(&g_BatchProcessor);
     if (NT_SUCCESS(status)) {
@@ -1364,7 +1366,7 @@ DriverEntry(
 
     //
     // Step 5.9: Cache optimization manager
-    // Init cost: sizeof(CO_MANAGER) + timer — memory limit is a ceiling, not a reservation.
+    // Init cost: sizeof(CO_MANAGER) + timer â€” memory limit is a ceiling, not a reservation.
     //
     {
         status = CoInitialize(&g_CacheOptimizer, 16 * 1024 * 1024);  /* 16 MB ceiling */
@@ -1458,7 +1460,7 @@ DriverEntry(
         ShadowStrikeLogInitStatus("Telemetry Buffer", STATUS_SUCCESS);
 
         //
-        // Start telemetry buffering — transitions state to Active,
+        // Start telemetry buffering â€” transitions state to Active,
         // creates flush thread, enables TbEnqueue from detection modules.
         //
         status = TbStart(g_TelemetryBuffer);
@@ -1611,7 +1613,7 @@ DriverEntry(
             }
         } else {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] WARNING: No DeviceObject available — telemetry events skipped\n");
+                       "[ShadowStrike] WARNING: No DeviceObject available â€” telemetry events skipped\n");
         }
     }
 
@@ -1829,7 +1831,7 @@ DriverEntry(
             }
         } else {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] WARNING: No DeviceObject — memory scanner skipped\n");
+                       "[ShadowStrike] WARNING: No DeviceObject â€” memory scanner skipped\n");
         }
     }
 
@@ -2224,7 +2226,7 @@ DriverEntry(
         ShadowStrikeLogInitStatus("Anti-Unload Protector", STATUS_SUCCESS);
 
         //
-        // Upgrade to Full protection — registers OB callbacks for handle
+        // Upgrade to Full protection â€” registers OB callbacks for handle
         // stripping on protected PIDs. Basic only nulls DriverUnload.
         //
         {
@@ -2254,7 +2256,7 @@ DriverEntry(
     }
 
     //
-    // Step 14.19: Initialize callback protection (LAST protection init — protects all registered callbacks)
+    // Step 14.19: Initialize callback protection (LAST protection init â€” protects all registered callbacks)
     //
     status = CpInitialize(&g_CallbackProtector);
     if (!NT_SUCCESS(status)) {
@@ -2498,7 +2500,7 @@ DriverEntry(
     //
     // Step 14.27: Initialize PostCreate subsystem (stream context management,
     // file classification, ransomware monitoring baselines, handle contexts)
-    // MUST be before FltStartFiltering — PostCreate callback needs lookaside lists
+    // MUST be before FltStartFiltering â€” PostCreate callback needs lookaside lists
     //
     status = PocInitialize();
     if (!NT_SUCCESS(status)) {
@@ -2514,7 +2516,7 @@ DriverEntry(
     //
     // Step 14.28: Initialize PostWrite subsystem (process notify callback for
     // cleanup on process termination, prevents stale PID entries and PID reuse issues)
-    // MUST be before FltStartFiltering — PostWrite callback needs process tracking
+    // MUST be before FltStartFiltering â€” PostWrite callback needs process tracking
     //
     status = ShadowStrikePostWriteInitialize();
     if (!NT_SUCCESS(status)) {
@@ -2811,7 +2813,7 @@ ShadowStrikeUnload(
 
     //
     // Step 5: Shutdown process exclusion engine (BEFORE ExclusionManager)
-    // ProcessExclusion depends on ExclusionManager — shut down dependent first.
+    // ProcessExclusion depends on ExclusionManager â€” shut down dependent first.
     //
     ShadowStrikeProcessExclusionShutdown();
 
@@ -2844,7 +2846,7 @@ ShadowStrikeUnload(
     }
 
     //
-    // Step 8.4: Shutdown PostWrite subsystem (BEFORE PostCreate —
+    // Step 8.4: Shutdown PostWrite subsystem (BEFORE PostCreate â€”
     // PostWrite has its own PsSetCreateProcessNotifyRoutineEx that must
     // be unregistered before filter teardown)
     //
@@ -2880,7 +2882,7 @@ ShadowStrikeUnload(
     }
 
     //
-    // Step 8.5: Shutdown PostCreate subsystem (BEFORE FltUnregisterFilter —
+    // Step 8.5: Shutdown PostCreate subsystem (BEFORE FltUnregisterFilter â€”
     // marks ShutdownRequested so in-flight post-creates drain cleanly)
     //
     if (g_InitFlags & InitFlag_PocInitialized) {
@@ -2898,7 +2900,7 @@ ShadowStrikeUnload(
     }
 
     //
-    // Step 9.5: Cleanup filesystem callbacks (AFTER FltUnregisterFilter — 
+    // Step 9.5: Cleanup filesystem callbacks (AFTER FltUnregisterFilter â€” 
     // InstanceTeardownComplete accesses FSC state during filter teardown)
     //
     if (g_InitFlags & InitFlag_FscInitialized) {
@@ -2906,7 +2908,7 @@ ShadowStrikeUnload(
     }
 
     //
-    // Step 9.6: Cleanup file utilities (AFTER FltUnregisterFilter —
+    // Step 9.6: Cleanup file utilities (AFTER FltUnregisterFilter â€”
     // filter callbacks may call FileUtils functions; must drain first)
     //
     if (g_FileUtilsInitialized) {
@@ -3205,13 +3207,13 @@ ShadowStrikeUnload(
     }
 
     //
-    // Step 12: Cleanup memory utilities (foundational — must be after all other
+    // Step 12: Cleanup memory utilities (foundational â€” must be after all other
     // module cleanups that may free memory; logs leak stats in debug builds)
     //
     ShadowStrikeCleanupMemoryUtils();
 
     //
-    // FINAL: Shutdown WPP tracing (must be last — after all trace-emitting code)
+    // FINAL: Shutdown WPP tracing (must be last â€” after all trace-emitting code)
     //
     WppTraceShutdown(g_DriverData.DriverObject);
 
@@ -3268,7 +3270,7 @@ ShadowStrikeBatchSendNotification(
     PBP_PROCESSOR proc = g_BatchProcessor;
 
     //
-    // Try batch path first — routes through BpQueueEvent, which is safe up
+    // Try batch path first â€” routes through BpQueueEvent, which is safe up
     // to DISPATCH_LEVEL. The batch processing thread will deliver via CommPort.
     //
     if (proc != NULL) {
@@ -3880,14 +3882,14 @@ ShadowStrikeCleanupByFlags(
     PAGED_CODE();
 
     //
-    // Signal shutdown first — stop all callbacks from processing new events.
+    // Signal shutdown first â€” stop all callbacks from processing new events.
     // Mirror Steps 1-2 of ShadowStrikeUnload to prevent UAF during teardown.
     //
     WriteBooleanRelease(&g_DriverData.ShuttingDown, TRUE);
     MemoryBarrier();
 
     //
-    // Drain rundown protection — wait for in-flight callback operations
+    // Drain rundown protection â€” wait for in-flight callback operations
     // that hold rundown refs (work items, DPCs, async operations).
     //
     ShadowStrikeWaitForRundownComplete();
@@ -4052,7 +4054,7 @@ ShadowStrikeCleanupByFlags(
     }
 
     //
-    // Cleanup file utilities AFTER FltUnregisterFilter —
+    // Cleanup file utilities AFTER FltUnregisterFilter â€”
     // filter callbacks may call FileUtils functions; must drain first
     //
     if (g_FileUtilsInitialized) {
@@ -4313,7 +4315,7 @@ ShadowStrikeCleanupByFlags(
     }
 
     //
-    // Cleanup memory utilities (foundational — after all module cleanups)
+    // Cleanup memory utilities (foundational â€” after all module cleanups)
     //
     ShadowStrikeCleanupMemoryUtils();
 
@@ -4330,7 +4332,7 @@ ShadowStrikeCleanupByFlags(
 // ============================================================================
 
 //
-// ShadowStrikeThreadNotifyCallback — REMOVED.
+// ShadowStrikeThreadNotifyCallback â€” REMOVED.
 // Thread notification is now handled by the ThreadNotify module via
 // RegisterThreadNotify()/UnregisterThreadNotify() which registers
 // TnpThreadNotifyCallback with full injection detection, shellcode

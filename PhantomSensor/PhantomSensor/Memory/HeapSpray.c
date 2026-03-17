@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -483,7 +485,7 @@ Arguments:
     KeMemoryBarrier();
 
     //
-    // Drain active references — wait for in-flight operations to complete
+    // Drain active references â€” wait for in-flight operations to complete
     //
     drainInterval.QuadPart = -10000; // 1ms relative
     for (drainWait = 0; drainWait < HS_SHUTDOWN_DRAIN_MAX_WAIT; drainWait++) {
@@ -676,7 +678,7 @@ Return Value:
 
     if (found) {
         //
-        // Use dereference instead of direct destroy — another thread
+        // Use dereference instead of direct destroy â€” another thread
         // may hold a reference from HspFindProcessContext. The context
         // will be destroyed when the last reference is released.
         //
@@ -886,7 +888,7 @@ Return Value:
         InterlockedIncrement64(&Detector->Stats.SpraysDetected);
     } else if (sprayScore < HS_MIN_SCORE_FOR_SPRAY / 2) {
         //
-        // Score dropped well below threshold — clear spray flag.
+        // Score dropped well below threshold â€” clear spray flag.
         // This prevents a single early detection from permanently flagging
         // a process that later becomes clean (e.g., after GC or free burst).
         // We use half-threshold as hysteresis to avoid oscillation.
@@ -1376,7 +1378,7 @@ Return Value:
         return STATUS_NOT_FOUND;
     }
 
-    *SprayDetected = (BOOLEAN)InterlockedCompareExchange(&context->SprayInProgress, 0, 0);
+    *SprayDetected = (InterlockedCompareExchange(&context->SprayInProgress, 0, 0) != 0);
 
     if (*SprayDetected) {
         if (Type != NULL) {
@@ -1599,7 +1601,7 @@ Routine Description:
     context->Process = NULL;
 
     //
-    // Try to get EPROCESS — check return value (HIGH-01)
+    // Try to get EPROCESS â€” check return value (HIGH-01)
     //
     status = PsLookupProcessByProcessId(ProcessId, &context->Process);
     if (!NT_SUCCESS(status)) {
@@ -1656,7 +1658,7 @@ Routine Description:
 
         if (existingContext->ProcessId == ProcessId) {
             //
-            // Another thread created it — use theirs, discard ours
+            // Another thread created it â€” use theirs, discard ours
             //
             HspReferenceProcessContext(existingContext);
             ExReleasePushLockExclusive(&Detector->ProcessListLock);

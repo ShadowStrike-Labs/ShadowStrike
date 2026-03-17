@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -90,7 +92,7 @@ typedef VOID (*PIM_TAMPER_CALLBACK)(
 );
 
 // ============================================================================
-// MONITOR STRUCTURE (Public portion — internal extends this)
+// MONITOR STRUCTURE (Public portion â€” internal extends this)
 // ============================================================================
 
 typedef struct _IM_MONITOR {

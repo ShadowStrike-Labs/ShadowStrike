@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -39,7 +41,7 @@
     - DoS prevention through resource limits
     - Reference counting on FP_PROTECTED_PATH prevents use-after-free
     - All data copied while under lock; no post-lock dereference of list entries
-    - No large stack buffers — hot-path allocations are pool-backed
+    - No large stack buffers â€” hot-path allocations are pool-backed
     - Config writes protected by exclusive lock
     - Statistics use InterlockedExchange64 for atomic reset
     - FP_ENGINE is opaque (defined here only)
@@ -151,7 +153,7 @@ typedef struct _FP_ENGINE_CONFIG {
 } FP_ENGINE_CONFIG;
 
 /**
- * @brief File protection engine (opaque — only defined here)
+ * @brief File protection engine (opaque â€” only defined here)
  */
 struct _FP_ENGINE {
     volatile LONG Initialized;
@@ -292,7 +294,7 @@ FppFindStreamSeparator(
 
     //
     // Find first colon after the last separator that isn't a drive-letter colon.
-    // Drive-letter colon is at index 1 (e.g., "C:") — skip it.
+    // Drive-letter colon is at index 1 (e.g., "C:") â€” skip it.
     //
     for (i = LastSep + 1; i < PathLenChars; i++) {
         if (Path[i] == FP_STREAM_SEPARATOR) {
@@ -534,7 +536,7 @@ FpAddProtectedPath(
     }
 
     //
-    // Insert under exclusive lock — re-check count inside the lock to prevent TOCTOU
+    // Insert under exclusive lock â€” re-check count inside the lock to prevent TOCTOU
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->PathListLock);
@@ -852,7 +854,7 @@ FpCheckAccess(
 
     //
     // Allocate normalization + matched-rule buffers from pool
-    // (not stack — avoids 2KB+ kernel stack consumption on deep call chains)
+    // (not stack â€” avoids 2KB+ kernel stack consumption on deep call chains)
     //
     NormalizedPath = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
@@ -897,7 +899,7 @@ FpCheckAccess(
     FppUpcaseInPlace(NormalizedPath, PathLength);
 
     //
-    // Extract filename and extension (FileName/Extension are small stack buffers — OK)
+    // Extract filename and extension (FileName/Extension are small stack buffers â€” OK)
     //
     {
         PWCHAR LastSlash = NULL;
@@ -1110,7 +1112,7 @@ FpCheckAccess(
     //
     if (HaveMatchedPath) {
         //
-        // Find the path again — but we don't need to, we just decrement.
+        // Find the path again â€” but we don't need to, we just decrement.
         // The path can only be freed when RefCount reaches 0.
         // FppReleaseProtectedPath handles the decrement-and-free.
         //
@@ -1220,7 +1222,7 @@ FpCheckFileAccess(
     }
 
     //
-    // FltGetRequestorProcessId returns ULONG — cast properly to HANDLE
+    // FltGetRequestorProcessId returns ULONG â€” cast properly to HANDLE
     // (fixes CRITICAL-03)
     //
     RequestorPid = (HANDLE)(ULONG_PTR)FltGetRequestorProcessId(Data);
@@ -1543,7 +1545,7 @@ Routine Description:
     }
 
     //
-    // Get normalized name (automatically resolves short → long)
+    // Get normalized name (automatically resolves short â†’ long)
     //
     Status = FltGetFileNameInformationUnsafe(
         FileObject,
@@ -1638,7 +1640,7 @@ FpLogAccessAttempt(
 
     //
     // Allocate audit entry from PagedPool (entries are large ~4.6KB each,
-    // only accessed at <= APC_LEVEL) — fixes DESIGN-02
+    // only accessed at <= APC_LEVEL) â€” fixes DESIGN-02
     //
     Entry = (PFP_AUDIT_ENTRY_INTERNAL)ShadowStrikeAllocatePoolWithTag(
         PagedPool,
@@ -1796,7 +1798,7 @@ FpGetStatistics(
 Routine Description:
 
     Reads statistics using per-field volatile reads to avoid torn reads on x86.
-    No lock needed — each field is read atomically via InterlockedCompareExchange64.
+    No lock needed â€” each field is read atomically via InterlockedCompareExchange64.
 
 --*/
 {
@@ -2002,7 +2004,7 @@ Routine Description:
     LONG MaxEntries;
 
     //
-    // Read MaxAuditEntries — ConfigLock ordering: we already hold AuditLogLock,
+    // Read MaxAuditEntries â€” ConfigLock ordering: we already hold AuditLogLock,
     // so we read it non-lockingly (it's a ULONG set under ConfigLock at PASSIVE).
     // This is safe because we only use it as a threshold.
     //

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -75,7 +77,7 @@ static const UNICODE_STRING g_EspPaths[] = {
     (sizeof(g_EspPaths) / sizeof(g_EspPaths[0]))
 
 //
-// BCD path — only matched on volume roots, not substring (see FipIsBcdPath)
+// BCD path â€” only matched on volume roots, not substring (see FipIsBcdPath)
 //
 static const UNICODE_STRING g_BcdSuffix =
     RTL_CONSTANT_STRING(L"\\Boot\\BCD");
@@ -187,7 +189,7 @@ FiInitialize(VOID)
 
     //
     // Create periodic boot integrity verification timer.
-    // Checks every 5 minutes — firmware changes are rare.
+    // Checks every 5 minutes â€” firmware changes are rare.
     // Uses WorkItem callback for PASSIVE_LEVEL (ExGetFirmwareEnvironmentVariable).
     //
     {
@@ -279,7 +281,7 @@ FiCheckEspAccess(
 
     //
     // Read access to ESP is acceptable (for backup tools, etc.)
-    // Only flag actual content modification — FILE_WRITE_ATTRIBUTES is excluded
+    // Only flag actual content modification â€” FILE_WRITE_ATTRIBUTES is excluded
     // because it's commonly requested in standard access masks even for
     // non-modifying operations and causes widespread false positives.
     //
@@ -327,7 +329,7 @@ FiCheckEspAccess(
     }
 
     //
-    // Check for BCD access specifically (read-only path — writes already handled above)
+    // Check for BCD access specifically (read-only path â€” writes already handled above)
     //
     if (FileName->Length >= BcdPath.Length) {
         Suffix.Buffer = FileName->Buffer +
@@ -388,7 +390,7 @@ FiGetStatistics(
 }
 
 // ============================================================================
-// PRIVATE — SECURE BOOT QUERY
+// PRIVATE â€” SECURE BOOT QUERY
 // ============================================================================
 
 static FI_BOOT_STATUS
@@ -401,7 +403,7 @@ FipQuerySecureBootState(VOID)
 
     //
     // Query the SecureBoot UEFI variable
-    // On BIOS systems, this will fail — that's expected
+    // On BIOS systems, this will fail â€” that's expected
     //
     Status = ExGetFirmwareEnvironmentVariable(
         &VariableName,
@@ -436,7 +438,7 @@ FipQuerySecureBootState(VOID)
     }
 
     //
-    // SecureBoot is enabled — check if we're in Setup Mode
+    // SecureBoot is enabled â€” check if we're in Setup Mode
     // (Setup Mode allows unsigned binaries even with SecureBoot "on")
     //
     {
@@ -454,7 +456,7 @@ FipQuerySecureBootState(VOID)
 
         if (NT_SUCCESS(Status) && SetupValue != 0) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike/FI] WARNING: UEFI Setup Mode active — "
+                       "[ShadowStrike/FI] WARNING: UEFI Setup Mode active â€” "
                        "Secure Boot enforcement bypassed!\n");
             return FiBoot_SecureBootSetupMode;
         }
@@ -464,7 +466,7 @@ FipQuerySecureBootState(VOID)
 }
 
 // ============================================================================
-// PRIVATE — ESP PATH DETECTION
+// PRIVATE â€” ESP PATH DETECTION
 // ============================================================================
 
 static BOOLEAN
@@ -502,7 +504,7 @@ FipIsEspPath(
 }
 
 // ============================================================================
-// PRIVATE — LIFECYCLE
+// PRIVATE â€” LIFECYCLE
 // ============================================================================
 
 static BOOLEAN
@@ -519,7 +521,7 @@ FipLeaveOperation(VOID)
 }
 
 // ============================================================================
-// PRIVATE — PERIODIC VERIFICATION TIMER
+// PRIVATE â€” PERIODIC VERIFICATION TIMER
 // ============================================================================
 
 static VOID
@@ -536,7 +538,7 @@ FipVerifyTimerCallback(
 
     //
     // Detect runtime Secure Boot state transitions.
-    // A change from Enabled → Disabled indicates potential firmware attack.
+    // A change from Enabled â†’ Disabled indicates potential firmware attack.
     //
     if (Current != Previous &&
         Current != FiBoot_Unknown &&

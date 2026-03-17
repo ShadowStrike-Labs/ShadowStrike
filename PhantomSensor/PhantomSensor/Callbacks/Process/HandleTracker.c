@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -66,7 +68,7 @@ SECURITY NOTES:
 #include <ntstrsafe.h>
 
 // ============================================================================
-// FORWARD DECLARATIONS — Kernel APIs exported but not declared in WDK headers
+// FORWARD DECLARATIONS â€” Kernel APIs exported but not declared in WDK headers
 // ============================================================================
 
 NTSYSAPI
@@ -105,7 +107,7 @@ ZwQueryInformationThread(
     );
 
 //
-// THREAD_BASIC_INFORMATION — not declared in WDK headers
+// THREAD_BASIC_INFORMATION â€” not declared in WDK headers
 //
 typedef struct _THREAD_BASIC_INFORMATION {
     NTSTATUS ExitStatus;
@@ -117,7 +119,7 @@ typedef struct _THREAD_BASIC_INFORMATION {
 } THREAD_BASIC_INFORMATION, *PTHREAD_BASIC_INFORMATION;
 
 //
-// Process/thread/token access mask constants — defined in user-mode winnt.h
+// Process/thread/token access mask constants â€” defined in user-mode winnt.h
 // but not available in kernel-mode WDK headers.
 //
 #ifndef PROCESS_VM_READ

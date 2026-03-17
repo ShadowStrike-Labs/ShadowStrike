@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -283,7 +285,7 @@ typedef enum _HP_SENSITIVITY_LEVEL {
  * @brief Tracked handle entry.
  *
  * Linked into the owning HP_PROCESS_CONTEXT.HandleList via ListEntry.
- * HashEntry field removed — handles are not independently hashed.
+ * HashEntry field removed â€” handles are not independently hashed.
  */
 typedef struct _HP_HANDLE_ENTRY {
     LIST_ENTRY ListEntry;               // Process handle list linkage
@@ -389,7 +391,7 @@ typedef struct _HP_PROCESS_CONTEXT {
     LARGE_INTEGER WindowStart;          // Activity window start
 
     //
-    // Reference counting — used to prevent use-after-free
+    // Reference counting â€” used to prevent use-after-free
     //
     volatile LONG RefCount;
 
@@ -476,7 +478,7 @@ typedef struct _HP_PROTECTION_ENGINE {
     UINT8 Reserved1[4];
 
     //
-    // Configuration — protected by ConfigLock
+    // Configuration â€” protected by ConfigLock
     //
     HP_CONFIG Config;
     EX_PUSH_LOCK ConfigLock;
@@ -500,7 +502,7 @@ typedef struct _HP_PROTECTION_ENGINE {
     LONG SensitiveObjectCount;
 
     //
-    // Event history — protected by EventHistoryLock (DISPATCH_LEVEL safe)
+    // Event history â€” protected by EventHistoryLock (DISPATCH_LEVEL safe)
     //
     LIST_ENTRY EventHistory;
     KSPIN_LOCK EventHistoryLock;
@@ -536,7 +538,7 @@ typedef struct _HP_PROTECTION_ENGINE {
     HANDLE WinlogonProcessId;
 
     //
-    // Detection callback — protected by CallbackLock
+    // Detection callback â€” protected by CallbackLock
     //
     EX_PUSH_LOCK CallbackLock;
     PVOID DetectionCallback;

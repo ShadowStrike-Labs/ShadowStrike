@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -230,7 +232,7 @@ typedef struct _PE_CONTEXT {
     KEVENT ShutdownEvent;
 
     //
-    // Statistics (approximate — no cross-field atomicity)
+    // Statistics (approximate â€” no cross-field atomicity)
     //
     PE_STATISTICS Stats;
 
@@ -575,7 +577,7 @@ ShadowStrikeProcessExclusionInitialize(
 
     //
     // Initialize reference counting.
-    // Start at 1 — shutdown releases the init reference.
+    // Start at 1 â€” shutdown releases the init reference.
     //
     ctx->ReferenceCount = 1;
     KeInitializeEvent(&ctx->ShutdownEvent, NotificationEvent, FALSE);
@@ -871,6 +873,8 @@ ShadowStrikeOnProcessCreate(
                         PepFreePidEntry(ctx->BitmapExtendedInfo[pidValue]);
                     }
                     ctx->BitmapExtendedInfo[pidValue] = extInfo;
+                } else {
+                    PepFreePidEntry(extInfo);
                 }
 
                 ExReleasePushLockExclusive(&ctx->ExtendedInfoLock);
@@ -1048,7 +1052,7 @@ ShadowStrikeIsProcessTrusted(
     } else {
         //
         // Hash table lookup - O(1) average
-        // PepFindPidInHash returns data by value — no dangling pointer.
+        // PepFindPidInHash returns data by value â€” no dangling pointer.
         //
         if (PepFindPidInHash(ProcessId, NULL, NULL, NULL, NULL)) {
             trusted = TRUE;
@@ -1143,7 +1147,7 @@ ShadowStrikeIsProcessTrustedEx(
 
     } else {
         //
-        // Hash table lookup — data returned by value
+        // Hash table lookup â€” data returned by value
         //
         if (PepFindPidInHash(ProcessId, &reason, NULL, NULL, NULL)) {
             trusted = TRUE;
@@ -1236,6 +1240,8 @@ ShadowStrikeAddTrustedProcess(
                     PepFreePidEntry(ctx->BitmapExtendedInfo[pidValue]);
                 }
                 ctx->BitmapExtendedInfo[pidValue] = extInfo;
+            } else {
+                PepFreePidEntry(extInfo);
             }
 
             ExReleasePushLockExclusive(&ctx->ExtendedInfoLock);
@@ -1304,7 +1310,7 @@ ShadowStrikeRemoveTrustedProcess(
         //
         // Single exclusive lock acquisition for permanent check + remove (H-5 fix).
         // The original code checked permanent under shared lock, released,
-        // then re-acquired exclusive — classic TOCTOU.
+        // then re-acquired exclusive â€” classic TOCTOU.
         //
         KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&ctx->ExtendedInfoLock);
@@ -1350,7 +1356,7 @@ ShadowStrikeRemoveTrustedProcess(
         //
         // PE-4 fix: Atomic permanent check + remove under single exclusive lock.
         // The original code used PepFindPidInHash (shared lock) then
-        // PepRemovePidFromHash (exclusive lock) — classic TOCTOU.
+        // PepRemovePidFromHash (exclusive lock) â€” classic TOCTOU.
         //
         ULONG bucket = PepPidToHashBucket(ProcessId);
         PLIST_ENTRY listEntry;
@@ -1419,7 +1425,7 @@ ShadowStrikeProcessExclusionGetStats(
     }
 
     //
-    // Copy each field individually — internal struct uses volatile
+    // Copy each field individually â€” internal struct uses volatile
     // qualifiers which differ from the public struct. Each read is
     // atomically consistent but the snapshot as a whole is not
     // (no cross-field lock, intentional for performance).
@@ -1494,7 +1500,7 @@ ShadowStrikeGetTrustedProcessCount(
 // ============================================================================
 
 /**
- * @brief Acquire reference — returns FALSE if shutdown is in progress.
+ * @brief Acquire reference â€” returns FALSE if shutdown is in progress.
  *
  * Callers MUST check the return value and NOT proceed if FALSE is returned.
  * The acquire-then-recheck pattern prevents the window where a caller
@@ -1749,7 +1755,7 @@ PepAddPidToHash(
 
         if (existingEntry->ProcessId == ProcessId) {
             //
-            // Already exists — release lock, free pre-allocated entry
+            // Already exists â€” release lock, free pre-allocated entry
             //
             ExReleasePushLockExclusive(&ctx->HashLock);
             KeLeaveCriticalRegion();
@@ -1930,7 +1936,7 @@ PepCheckParentExclusion(
 
     } else {
         //
-        // Check hash table — data returned by value
+        // Check hash table â€” data returned by value
         //
         PE_EXCLUSION_REASON hashReason = PeReason_None;
         BOOLEAN hashInherit = FALSE;

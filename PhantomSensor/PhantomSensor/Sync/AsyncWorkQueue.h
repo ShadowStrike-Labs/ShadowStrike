@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -232,7 +234,7 @@ typedef struct _AWQ_STATISTICS {
 } AWQ_STATISTICS, *PAWQ_STATISTICS;
 
 // ============================================================================
-// Public API — Lifecycle
+// Public API â€” Lifecycle
 // ============================================================================
 
 //
@@ -261,7 +263,7 @@ AwqShutdown(
     );
 
 // ============================================================================
-// Public API — Queue Control
+// Public API â€” Queue Control
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -291,7 +293,7 @@ AwqDrain(
     );
 
 // ============================================================================
-// Public API — Work Submission
+// Public API â€” Work Submission
 // ============================================================================
 
 //
@@ -330,7 +332,7 @@ AwqSubmitWithContext(
     );
 
 //
-// Submit a chain of items. Each item executes sequentially — the
+// Submit a chain of items. Each item executes sequentially â€” the
 // next item is enqueued only when the previous one succeeds. On
 // failure, remaining chain items are cleaned up. Returns the ID
 // of the first item in ChainId.
@@ -349,7 +351,7 @@ AwqSubmitChain(
     );
 
 // ============================================================================
-// Public API — Item Management
+// Public API â€” Item Management
 // ============================================================================
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -394,7 +396,7 @@ AwqGetItemStatus(
     );
 
 // ============================================================================
-// Public API — Thread Pool
+// Public API â€” Thread Pool
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -407,7 +409,7 @@ AwqSetThreadCount(
     );
 
 // ============================================================================
-// Public API — Statistics & Configuration
+// Public API â€” Statistics & Configuration
 // ============================================================================
 
 _IRQL_requires_max_(APC_LEVEL)

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -747,7 +749,7 @@ ShadowStrikeReleaseQueuedSpinLockFromDpcLevel(
 // READER-WRITER SPINLOCK IMPLEMENTATION
 //
 // Uses EX_SPIN_LOCK exclusively. OldIrql is ALWAYS caller-provided.
-// No State/WriterThread/ReaderCount metadata — the EX_SPIN_LOCK is
+// No State/WriterThread/ReaderCount metadata â€” the EX_SPIN_LOCK is
 // the single source of truth.
 // ============================================================================
 
@@ -963,8 +965,8 @@ ShadowStrikeAcquireRecursiveSpinLock(
 
         //
         // SECURITY: Enforce recursion depth in ALL builds.
-        // The acquisition proceeds (VOID return — rejecting would cause
-        // unmatched Release → BSOD), but we track the overflow for
+        // The acquisition proceeds (VOID return â€” rejecting would cause
+        // unmatched Release â†’ BSOD), but we track the overflow for
         // production telemetry. The real risk is kernel stack overflow
         // from the caller's re-entrant pattern, not from lock accounting.
         //

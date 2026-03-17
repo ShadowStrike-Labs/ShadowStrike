@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -59,7 +61,7 @@
 // KERNEL-MODE TYPE DEFINITIONS
 // ============================================================================
 //
-// Process access rights — defined in winnt.h (user-mode) but not always
+// Process access rights â€” defined in winnt.h (user-mode) but not always
 // available in WDK kernel headers. Define if not present.
 //
 #ifndef PROCESS_VM_READ
@@ -74,7 +76,7 @@
 #endif
 
 //
-// PROCESS_BASIC_INFORMATION is defined in ntddk.h — no need to redefine.
+// PROCESS_BASIC_INFORMATION is defined in ntddk.h â€” no need to redefine.
 //
 
 //
@@ -266,7 +268,7 @@ typedef struct _PH_PE_CONTEXT {
 //
 // PsGetProcessPeb: exported by ntoskrnl.exe; not in any WDK public header.
 // Returns the user-mode PEB address for the given EPROCESS.
-// The returned pointer lives in the target process's address space —
+// The returned pointer lives in the target process's address space â€”
 // the caller MUST attach (KeStackAttachProcess) before dereferencing.
 //
 #ifndef SHADOWSTRIKE_PS_GET_PROCESS_PEB_DECLARED
@@ -292,7 +294,7 @@ PsGetProcessPeb(
 //   4. Probe and read the DOS header to locate the NT headers.
 //   5. Detect PE format (PE32 vs. PE32+) via OptionalHeader.Magic.
 //   6. Extract SizeOfImage from the appropriate optional header.
-//   7. Detach unconditionally — even if a probe or read faults.
+//   7. Detach unconditionally â€” even if a probe or read faults.
 //
 // All user-mode memory accesses are performed inside a structured
 // exception handler so that a hostile or crashed process cannot induce
@@ -367,7 +369,7 @@ PhpGetProcessImageBase(
 
         //
         // Probe 26 bytes to read Signature[0..3] + FileHeader[4..23] +
-        // OptionalHeader.Magic[24..25] — the minimum needed to determine
+        // OptionalHeader.Magic[24..25] â€” the minimum needed to determine
         // PE format without over-probing a shorter PE32 header.
         //
         {
@@ -436,14 +438,14 @@ PhpGetProcessImageBase(
     __except (EXCEPTION_EXECUTE_HANDLER) {
         //
         // Any access violation or other exception from hostile/crashed
-        // process memory is caught here — no kernel BSOD.
+        // process memory is caught here â€” no kernel BSOD.
         //
         status     = GetExceptionCode();
         *ImageBase = NULL;
         *ImageSize = 0;
     }
 
-    // Unconditional detach — __leave and normal exit both reach this point.
+    // Unconditional detach â€” __leave and normal exit both reach this point.
     KeUnstackDetachProcess(&apcState);
 
     return status;
@@ -663,7 +665,7 @@ PhInitialize(
     // Initialize shutdown synchronization
     //
     KeInitializeEvent(&internal->ShutdownEvent, NotificationEvent, FALSE);
-    internal->ActiveOperations = 1;  // Init reference — released by PhShutdown
+    internal->ActiveOperations = 1;  // Init reference â€” released by PhShutdown
 
     //
     // Set default configuration
@@ -689,7 +691,7 @@ PhInitialize(
 
         if (g_pfnZwReadVirtualMemory == NULL) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                "[ShadowStrike/PH] WARNING: ZwReadVirtualMemory not available — "
+                "[ShadowStrike/PH] WARNING: ZwReadVirtualMemory not available â€” "
                 "process hollowing detection will be limited\n");
         }
     }
@@ -2016,7 +2018,7 @@ PhpAnalyzePEB(
     }
 
     //
-    // Read PEB from process (only our partial struct — safe)
+    // Read PEB from process (only our partial struct â€” safe)
     //
     status = PhpReadProcessMemory(
         ProcessHandle,
@@ -2322,7 +2324,7 @@ PhpParsePEHeaders(
     }
 
     //
-    // Determine architecture — C-6 fix: re-validate bounds for the specific
+    // Determine architecture â€” C-6 fix: re-validate bounds for the specific
     // header size BEFORE accessing any optional header fields
     //
     if (ntHeaders->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
@@ -2457,7 +2459,7 @@ PhpCompareMemoryWithFile(
     }
 
     //
-    // H-2 fix: Use PagedPool — this function runs at PASSIVE_LEVEL only,
+    // H-2 fix: Use PagedPool â€” this function runs at PASSIVE_LEVEL only,
     // and allocations can be up to PH_MAX_SECTION_COMPARE (256KB).
     // H-3 fix: Compare the FULL allocated range, not just 4KB. The old
     // truncation to PH_MAX_HEADER_SIZE made detection trivially evadable.
@@ -2615,7 +2617,7 @@ PhpCheckFileTransacted(
 
     if (!NT_SUCCESS(status)) {
         //
-        // File doesn't exist — possible rolled-back TxF transaction.
+        // File doesn't exist â€” possible rolled-back TxF transaction.
         // This is a strong doppelganging indicator: the process image
         // was created from a transacted file that was subsequently rolled back.
         //
@@ -2645,7 +2647,7 @@ PhpCheckFileTransacted(
         txnParams = IoGetTransactionParameterBlock(fileObject);
         if (txnParams != NULL) {
             //
-            // File is part of an active transaction — strong doppelganging indicator
+            // File is part of an active transaction â€” strong doppelganging indicator
             //
             *IsTransacted = TRUE;
         }
@@ -2969,7 +2971,7 @@ PhpInvokeCallbacks(
     KeLeaveCriticalRegion();
 
     //
-    // Invoke outside the lock — safe from deadlock
+    // Invoke outside the lock â€” safe from deadlock
     //
     for (i = 0; i < count; i++) {
         snapshot[i].Callback(Result, snapshot[i].Context);
@@ -2997,7 +2999,7 @@ PhpAcquireReference(
     }
 
     //
-    // Not ready (shutting down or not initialized) — roll back
+    // Not ready (shutting down or not initialized) â€” roll back
     //
     if (InterlockedDecrement(&Detector->ActiveOperations) == 0) {
         KeSetEvent(&Detector->ShutdownEvent, IO_NO_INCREMENT, FALSE);
@@ -3012,7 +3014,7 @@ PhpReleaseReference(
 {
     if (InterlockedDecrement(&Detector->ActiveOperations) == 0) {
         //
-        // Only signal if we're shutting down — avoid spurious wakeups
+        // Only signal if we're shutting down â€” avoid spurious wakeups
         //
         if (ReadAcquire(&Detector->State) == PH_STATE_SHUTTING_DOWN) {
             KeSetEvent(&Detector->ShutdownEvent, IO_NO_INCREMENT, FALSE);
@@ -3039,7 +3041,7 @@ PhpCopyUnicodeString(
 
     Dest->MaximumLength = Src->Length + sizeof(WCHAR);
     //
-    // M-2 fix: Use PagedPool — all callers run at PASSIVE_LEVEL and
+    // M-2 fix: Use PagedPool â€” all callers run at PASSIVE_LEVEL and
     // these are file path strings. Saves NonPagedPool pressure.
     //
     Dest->Buffer = (PWCH)ShadowStrikeAllocatePoolWithTag(

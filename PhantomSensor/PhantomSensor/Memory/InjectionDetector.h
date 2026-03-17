@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -210,7 +212,7 @@ typedef struct _INJ_OPERATION {
 } INJ_OPERATION, *PINJ_OPERATION;
 
 //=============================================================================
-// Injection Chain — correlated sequence of operations
+// Injection Chain â€” correlated sequence of operations
 //=============================================================================
 
 typedef struct _INJ_CHAIN {
@@ -257,7 +259,7 @@ typedef struct _INJ_CHAIN {
 } INJ_CHAIN, *PINJ_CHAIN;
 
 //=============================================================================
-// Detection Result — output of chain analysis
+// Detection Result â€” output of chain analysis
 //=============================================================================
 
 #define INJ_MAX_MITRE_TECHNIQUE     16
@@ -343,7 +345,7 @@ typedef struct _INJ_PROCESS_CONTEXT {
     volatile LONG RefCount;
 
     //
-    // Hash table linkage (chained — multiple contexts per bucket)
+    // Hash table linkage (chained â€” multiple contexts per bucket)
     //
     LIST_ENTRY HashEntry;
 
@@ -430,7 +432,7 @@ typedef struct _INJ_STATISTICS {
 } INJ_STATISTICS, *PINJ_STATISTICS;
 
 //=============================================================================
-// Public API — Initialization (PASSIVE_LEVEL only)
+// Public API â€” Initialization (PASSIVE_LEVEL only)
 //=============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -448,7 +450,7 @@ InjShutdown(
     );
 
 //=============================================================================
-// Public API — Operation Recording (IRQL <= DISPATCH_LEVEL)
+// Public API â€” Operation Recording (IRQL <= DISPATCH_LEVEL)
 //=============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -469,7 +471,7 @@ InjRecordOperation(
     );
 
 //=============================================================================
-// Public API — Chain Analysis (IRQL <= DISPATCH_LEVEL)
+// Public API â€” Chain Analysis (IRQL <= DISPATCH_LEVEL)
 //=============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -504,7 +506,7 @@ InjGetChainInfo(
     );
 
 //=============================================================================
-// Public API — Chain Management (IRQL <= DISPATCH_LEVEL)
+// Public API â€” Chain Management (IRQL <= DISPATCH_LEVEL)
 //=============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -524,7 +526,7 @@ InjClearAllChains(
     );
 
 //=============================================================================
-// Public API — Callbacks (IRQL <= DISPATCH_LEVEL)
+// Public API â€” Callbacks (IRQL <= DISPATCH_LEVEL)
 //=============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -560,7 +562,7 @@ InjUnregisterBlockCallback(
     );
 
 //=============================================================================
-// Public API — Result Lifetime (IRQL <= DISPATCH_LEVEL)
+// Public API â€” Result Lifetime (IRQL <= DISPATCH_LEVEL)
 //=============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -571,7 +573,7 @@ InjFreeDetectionResult(
     );
 
 //=============================================================================
-// Public API — Statistics (IRQL <= DISPATCH_LEVEL)
+// Public API â€” Statistics (IRQL <= DISPATCH_LEVEL)
 //=============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -583,7 +585,7 @@ InjGetStatistics(
     );
 
 //=============================================================================
-// Public API — Process Lifecycle (IRQL <= DISPATCH_LEVEL)
+// Public API â€” Process Lifecycle (IRQL <= DISPATCH_LEVEL)
 //=============================================================================
 
 //

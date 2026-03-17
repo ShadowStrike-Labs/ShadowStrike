@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -405,7 +407,7 @@ PocShutdown(
     InterlockedExchange(&g_PocState.ShutdownRequested, 1);
 
     //
-    // Delete lookaside lists — mark unavailable FIRST to prevent
+    // Delete lookaside lists â€” mark unavailable FIRST to prevent
     // in-flight PocFreeCompletionContext from using them after deletion
     //
     if (g_PocState.LookasideInitialized) {
@@ -514,7 +516,7 @@ Return Value:
     InterlockedIncrement64(&g_PocState.Stats.TotalPostCreates);
 
     //
-    // Check if driver is ready (volatile reads — aligned LONG on x64 is atomic)
+    // Check if driver is ready (volatile reads â€” aligned LONG on x64 is atomic)
     //
     if (*(volatile LONG*)&g_PocState.Initialized != 1) {
         goto Cleanup;
@@ -1259,7 +1261,7 @@ PocReleaseStreamContext(
 // ============================================================================
 
 //
-// NOTE: PocAllocateHandleContext removed — it allocated from NPAGED_LOOKASIDE_LIST
+// NOTE: PocAllocateHandleContext removed â€” it allocated from NPAGED_LOOKASIDE_LIST
 // which produces raw pool, incompatible with FltSetStreamHandleContext (requires
 // FltAllocateContext). Use PocGetOrCreateHandleContext instead, which correctly
 // uses FltAllocateContext for filter-managed handle contexts.

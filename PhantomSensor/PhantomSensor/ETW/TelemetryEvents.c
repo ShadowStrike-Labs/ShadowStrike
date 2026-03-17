@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -720,7 +722,7 @@ TeSetConfig(
     }
 
     //
-    // Copy and validate — never apply unvalidated config to global state.
+    // Copy and validate â€” never apply unvalidated config to global state.
     //
     RtlCopyMemory(&validated, Config, sizeof(TE_CONFIG));
 
@@ -837,7 +839,7 @@ TeResume(
             PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
             if (tmMgr != NULL) {
                 //
-                // Idempotent cancel — safe even if TePause already cancelled.
+                // Idempotent cancel â€” safe even if TePause already cancelled.
                 //
                 if (g_TeProvider.HeartbeatTimerId != 0) {
                     TmCancel(tmMgr, g_TeProvider.HeartbeatTimerId, TRUE);
@@ -886,7 +888,7 @@ TepEnableCallback(
     // IsEnabled values: EVENT_CONTROL_CODE_ENABLE_PROVIDER (1),
     // EVENT_CONTROL_CODE_DISABLE_PROVIDER (0),
     // EVENT_CONTROL_CODE_CAPTURE_STATE (2).
-    // Only track enable/disable — capture state must not alter consumer count.
+    // Only track enable/disable â€” capture state must not alter consumer count.
     //
     if (IsEnabled == EVENT_CONTROL_CODE_ENABLE_PROVIDER) {
         g_TeProvider.EnableLevel = Level;
@@ -899,7 +901,7 @@ TepEnableCallback(
     } else if (IsEnabled == EVENT_CONTROL_CODE_DISABLE_PROVIDER) {
         if (InterlockedDecrement(&g_TeProvider.ConsumerCount) <= 0) {
             //
-            // Clamp to zero — guard against orphaned disables
+            // Clamp to zero â€” guard against orphaned disables
             //
             InterlockedExchange(&g_TeProvider.ConsumerCount, 0);
             InterlockedExchange(&g_TeProvider.EtwEnabled, 0);
@@ -962,7 +964,7 @@ TepInitializeEventHeader(
 
     //
     // Generate correlation ID: mix of monotonic counter, timestamp, perf counter, and PID.
-    // Not cryptographic — provides uniqueness, not unpredictability.
+    // Not cryptographic â€” provides uniqueness, not unpredictability.
     //
     perfCounter = KeQueryPerformanceCounter(NULL);
     counter = (UINT64)InterlockedIncrement64(&g_CorrelationCounter);
@@ -980,7 +982,7 @@ TepShouldThrottle(
     LONG samplingRate;
 
     //
-    // Read cached config atomically — no lock needed on hot path.
+    // Read cached config atomically â€” no lock needed on hot path.
     //
     if (!g_TeProvider.CachedEnableThrottling) {
         return FALSE;
@@ -1072,7 +1074,7 @@ TepUpdateRateStatistics(
                          oldPeak) != oldPeak);
 
             //
-            // Throttle decision — read cached config (lock-free).
+            // Throttle decision â€” read cached config (lock-free).
             //
             throttleThreshold = g_TeProvider.CachedThrottleThreshold;
             throttleRecoveryMs = g_TeProvider.CachedThrottleRecoveryMs;
@@ -1414,7 +1416,7 @@ TeLogProcessBlocked(
     TepCopyUnicodeStringSafe(event->ImagePath, MAX_FILE_PATH_LENGTH, ImagePath);
 
     //
-    // Store block reason in dedicated field — not repurposed from CommandLine.
+    // Store block reason in dedicated field â€” not repurposed from CommandLine.
     //
     if (Reason != NULL) {
         TepCopyPcwstrSafe(event->BlockReason, ARRAYSIZE(event->BlockReason), Reason);
@@ -1775,7 +1777,7 @@ TeLogNetworkEvent(
     TepUpdateRateStatistics();
 
     //
-    // Copy caller's event safely — guard against partially valid buffers.
+    // Copy caller's event safely â€” guard against partially valid buffers.
     //
     __try {
         RtlCopyMemory(localEvent, Event, sizeof(TE_NETWORK_EVENT));

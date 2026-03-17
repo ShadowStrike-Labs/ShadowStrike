@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -34,7 +36,7 @@
  * - Automatic background maintenance
  * - Reference-counted entry access for safe concurrent reads
  *
- * Lock Ordering (MUST be followed — always acquire in ascending order):
+ * Lock Ordering (MUST be followed â€” always acquire in ascending order):
  *   1. Bucket lock (per-bucket)
  *   2. Shard LRU lock (per-shard)
  *   3. Global list lock (per-cache)

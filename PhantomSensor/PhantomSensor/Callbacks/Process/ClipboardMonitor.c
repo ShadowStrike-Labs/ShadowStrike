@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -263,7 +265,7 @@ CbMonCheckProcessCreate(
     InterlockedIncrement64(&g_CbState.Stats.TotalProcessesChecked);
 
     //
-    // Exclusion check — exempt excluded processes from clipboard monitoring.
+    // Exclusion check â€” exempt excluded processes from clipboard monitoring.
     // Prevents false positives on management tools that legitimately access clipboard.
     //
     if (ShadowStrikeIsProcessExcluded(ProcessId, NULL)) {
@@ -551,7 +553,7 @@ CbMonpLookupProcess(
                     check, CBMON_PROCESS_ENTRY, Link);
                 if (existing->ProcessId == ProcessId) {
                     //
-                    // Another thread inserted — use existing, free ours
+                    // Another thread inserted â€” use existing, free ours
                     //
                     FltReleasePushLock(&g_CbState.BucketLocks[bucket]);
                     KeLeaveCriticalRegion();
@@ -655,7 +657,7 @@ CbMonpExtractFileName(
 Routine Description:
     Extracts the filename portion from a full path, returning both the
     pointer and the bounded length in characters. Does NOT rely on null
-    termination — uses the UNICODE_STRING.Length for boundary.
+    termination â€” uses the UNICODE_STRING.Length for boundary.
 --*/
 {
     USHORT chars;

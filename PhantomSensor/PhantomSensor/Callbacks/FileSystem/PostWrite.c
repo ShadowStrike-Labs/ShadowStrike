@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -970,7 +972,7 @@ ShadowStrikePostWrite(
 
                 //
                 // Enlist in the transaction for commit/rollback notifications.
-                // Idempotent — no-op if already enlisted from PreCreate.
+                // Idempotent â€” no-op if already enlisted from PreCreate.
                 //
                 ShadowKtmEnlistInTransaction(
                     FltObjects->Instance,
@@ -996,7 +998,7 @@ ShadowStrikePostWrite(
 
     //
     // Track per-process activity with proper synchronization.
-    // The activity pointer is into the global array — hold the shared lock
+    // The activity pointer is into the global array â€” hold the shared lock
     // during access to prevent PwpCleanupProcessActivity from zeroing the
     // entry concurrently (race between process termination and pending I/O).
     //

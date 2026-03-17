@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -50,7 +52,7 @@
  *
  * Memory Management:
  * - Self-relative security descriptors (single alloc, single free)
- * - NonPagedPoolNx for security descriptor (safe at any IRQL ≤ DISPATCH)
+ * - NonPagedPoolNx for security descriptor (safe at any IRQL â‰¤ DISPATCH)
  * - All ACLs embedded in self-relative SD
  *
  * @author ShadowStrike Security Team
@@ -203,7 +205,7 @@ typedef struct _SHADOW_NAMESPACE_STATE {
     // Security Descriptors
     //
     // Self-relative SD allocated from NonPagedPoolNx.
-    // Contains embedded DACL and SACL — single free cleans everything.
+    // Contains embedded DACL and SACL â€” single free cleans everything.
     //
 
     /** @brief Self-relative security descriptor (NonPagedPoolNx). */
@@ -265,7 +267,7 @@ ShadowCreatePrivateNamespace(
  *
  * Steps:
  * 1. Set Destroying = TRUE under lock to prevent new refs.
- * 2. ExWaitForRundownProtectionRelease — blocks until all refs drained.
+ * 2. ExWaitForRundownProtectionRelease â€” blocks until all refs drained.
  * 3. ZwMakeTemporaryObject to clear OBJ_PERMANENT.
  * 4. ObDereferenceObject + ZwClose.
  * 5. Free self-relative SD.

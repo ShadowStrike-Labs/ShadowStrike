@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -286,12 +288,12 @@ FbepEnsureBackupDirectory(
 // ============================================================================
 
 //
-// Extensions worth backing up (user data — ransomware targets)
+// Extensions worth backing up (user data â€” ransomware targets)
 //
 static const UNICODE_STRING g_BackupExtensions[] = {
     //
     // SORTED ALPHABETICALLY (case-insensitive) for binary search.
-    // Do NOT reorder — FbepShouldBackup depends on sorted order.
+    // Do NOT reorder â€” FbepShouldBackup depends on sorted order.
     //
     RTL_CONSTANT_STRING(L".7z"),    RTL_CONSTANT_STRING(L".accdb"),
     RTL_CONSTANT_STRING(L".ai"),    RTL_CONSTANT_STRING(L".avi"),
@@ -610,7 +612,7 @@ FbePreWriteBackup(
 
     if (Entry != NULL) {
         //
-        // Already backed up by this process — skip
+        // Already backed up by this process â€” skip
         //
         InterlockedIncrement64(&g_FbeState.Stats.BackupsSkippedDuplicate);
         FbepLeaveOperation();
@@ -888,7 +890,7 @@ FbePreSetInfoBackup(
     }
 
     //
-    // Get file size — for delete, file may not exist after so must backup now
+    // Get file size â€” for delete, file may not exist after so must backup now
     //
     Status = FbepGetFileSize(FltObjects, &FileSize);
     if (!NT_SUCCESS(Status) || FileSize.QuadPart == 0) {
@@ -1359,7 +1361,7 @@ FbeHasBackups(
 }
 
 // ============================================================================
-// PRIVATE — HASHING
+// PRIVATE â€” HASHING
 // ============================================================================
 
 static ULONG
@@ -1400,7 +1402,7 @@ FbepProcessBucketIndex(
 }
 
 // ============================================================================
-// PRIVATE — ENTRY MANAGEMENT
+// PRIVATE â€” ENTRY MANAGEMENT
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -1466,7 +1468,7 @@ FbepFreeEntry(
 }
 
 // ============================================================================
-// PRIVATE — PROCESS TRACKER MANAGEMENT
+// PRIVATE â€” PROCESS TRACKER MANAGEMENT
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -1498,7 +1500,7 @@ FbepFindOrCreateTracker(
     FltReleasePushLock(&g_FbeState.ProcessBuckets[ProcBucket].Lock);
 
     //
-    // Not found — allocate new tracker
+    // Not found â€” allocate new tracker
     //
     Tracker = (PFBE_PROCESS_TRACKER)ExAllocateFromNPagedLookasideList(
         &g_FbeState.TrackerLookaside);
@@ -1582,7 +1584,7 @@ FbepFreeTracker(
 }
 
 // ============================================================================
-// PRIVATE — FILE I/O OPERATIONS
+// PRIVATE â€” FILE I/O OPERATIONS
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -2070,7 +2072,7 @@ FbepDeleteBackupFile(
 
     if (!NT_SUCCESS(Status)) {
         //
-        // File already deleted or path gone — not an error during cleanup
+        // File already deleted or path gone â€” not an error during cleanup
         //
         if (Status == STATUS_OBJECT_NAME_NOT_FOUND ||
             Status == STATUS_OBJECT_PATH_NOT_FOUND) {
@@ -2093,7 +2095,7 @@ FbepDeleteBackupFile(
 }
 
 // ============================================================================
-// PRIVATE — PATH GENERATION
+// PRIVATE â€” PATH GENERATION
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -2116,8 +2118,8 @@ FbepGenerateBackupPath(
     // Expected formats from FltGetFileNameInformation (normalized):
     //   \Device\HarddiskVolume1\path  (standard local)
     //   \Device\CdRom0\path           (optical)
-    //   \Device\Mup\server\share\path (network redirector — NOT supported)
-    //   \Device\LanmanRedirector\...  (network — NOT supported)
+    //   \Device\Mup\server\share\path (network redirector â€” NOT supported)
+    //   \Device\LanmanRedirector\...  (network â€” NOT supported)
     //
     // Strategy: find the 3rd backslash to isolate the volume device name.
     // Reject network paths (Mup, LanmanRedirector) where local backup
@@ -2200,7 +2202,7 @@ FbepGenerateBackupPath(
 }
 
 // ============================================================================
-// PRIVATE — FILE SIZE QUERY
+// PRIVATE â€” FILE SIZE QUERY
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -2234,7 +2236,7 @@ FbepGetFileSize(
 }
 
 // ============================================================================
-// PRIVATE — EXTENSION CLASSIFICATION
+// PRIVATE â€” EXTENSION CLASSIFICATION
 // ============================================================================
 
 static BOOLEAN
@@ -2261,7 +2263,7 @@ FbepShouldBackup(
 
     if (DotPos == 0) {
         //
-        // No extension — don't backup by default
+        // No extension â€” don't backup by default
         // (reduces noise from temp files, streams, etc.)
         //
         return FALSE;
@@ -2273,7 +2275,7 @@ FbepShouldBackup(
 
     //
     // Binary search over sorted g_BackupExtensions array.
-    // O(log n) instead of O(n) — critical for hot PreWrite path.
+    // O(log n) instead of O(n) â€” critical for hot PreWrite path.
     //
     LONG Lo = 0;
     LONG Hi = (LONG)FBE_BACKUP_EXTENSION_COUNT - 1;
@@ -2294,7 +2296,7 @@ FbepShouldBackup(
 }
 
 // ============================================================================
-// PRIVATE — LRU EVICTION
+// PRIVATE â€” LRU EVICTION
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -2337,7 +2339,7 @@ FbepEvictLruEntries(
         // Mark as evicted under LRU lock to prevent concurrent rollback
         // from claiming this entry via CAS on State.
         //
-        // FSC-6: Lock ordering note — we release LruLock before acquiring
+        // FSC-6: Lock ordering note â€” we release LruLock before acquiring
         // BucketLock/TrackerLock, which is the opposite of the insert path.
         // This is safe because:
         // 1. State=Evicted prevents concurrent rollback (CAS check)
@@ -2404,7 +2406,7 @@ FbepEvictLruEntries(
 }
 
 // ============================================================================
-// PRIVATE — LIFECYCLE HELPERS
+// PRIVATE â€” LIFECYCLE HELPERS
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -2427,7 +2429,7 @@ FbepLeaveOperation(VOID)
 }
 
 // ============================================================================
-// PRIVATE — DIRECTORY MANAGEMENT
+// PRIVATE â€” DIRECTORY MANAGEMENT
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -2453,7 +2455,7 @@ FbepEnsureBackupDirectory(
     //
     // Extract directory portion from full backup path
     // e.g., \Device\HarddiskVolume1\ShadowStrikeBackup\123.bak
-    //     → \Device\HarddiskVolume1\ShadowStrikeBackup
+    //     â†’ \Device\HarddiskVolume1\ShadowStrikeBackup
     //
     for (USHORT i = BackupPath->Length / sizeof(WCHAR); i > 0; i--) {
         if (BackupPath->Buffer[i - 1] == L'\\') {
@@ -2472,11 +2474,11 @@ FbepEnsureBackupDirectory(
 
     //
     // Build a restrictive security descriptor for the backup directory.
-    // Only LOCAL_SYSTEM has access — this prevents ransomware running as
+    // Only LOCAL_SYSTEM has access â€” this prevents ransomware running as
     // user/admin from enumerating or encrypting backup files.
     //
     // SD layout: absolute SD on stack, ACL from pool
-    //   - Protected DACL (SE_DACL_PROTECTED) — no parent inheritance
+    //   - Protected DACL (SE_DACL_PROTECTED) â€” no parent inheritance
     //   - Single ACE: SYSTEM gets FILE_ALL_ACCESS with inheritance
     //
     SECURITY_DESCRIPTOR Sd;

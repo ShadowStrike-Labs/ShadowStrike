@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -71,7 +73,7 @@
 #endif
 
 //
-// PsGetThreadTeb — returns the user-mode TEB address of a thread.
+// PsGetThreadTeb â€” returns the user-mode TEB address of a thread.
 // Exported by ntoskrnl.exe, not declared in WDK headers (NT 6.0+).
 //
 NTKERNELAPI
@@ -388,7 +390,7 @@ CsaInitialize(
     ExInitializePushLock(&analyzer->ModuleLock);
 
     //
-    // RefCount starts at 1 — the "owner" reference released by CsaShutdown.
+    // RefCount starts at 1 â€” the "owner" reference released by CsaShutdown.
     //
     analyzer->RefCount = 1;
     KeInitializeEvent(&analyzer->ZeroRefEvent, NotificationEvent, FALSE);
@@ -521,7 +523,7 @@ CsaCaptureCallstack(
     analyzerInternal = CONTAINING_RECORD(Analyzer, CSA_ANALYZER_INTERNAL, Public);
 
     //
-    // Take an operational reference FIRST — before checking ShuttingDown.
+    // Take an operational reference FIRST â€” before checking ShuttingDown.
     // This prevents a UAF race where shutdown completes and frees the
     // analyzer between our ShuttingDown check and the reference increment.
     //
@@ -533,7 +535,7 @@ CsaCaptureCallstack(
     }
 
     //
-    // Throttle check — prevent DoS via excessive captures
+    // Throttle check â€” prevent DoS via excessive captures
     //
     if (!CsapThrottleCheck(analyzerInternal)) {
         CsapDereferenceAnalyzer(analyzerInternal);
@@ -743,7 +745,7 @@ CsaDetectStackPivot(
     // are invalid, corrupted, or abnormally sized, flag as suspicious.
     // A tampered TEB is a strong evasion indicator.
     // Uses CsapReadThreadStackBoundsAttached to avoid redundant
-    // PsLookup calls — we already hold process and thread references.
+    // PsLookup calls â€” we already hold process and thread references.
     //
     {
         PVOID stackBase = NULL;
@@ -758,7 +760,7 @@ CsaDetectStackPivot(
 
             //
             // Normal thread stacks: 4KB (guard) to 64MB (max commit).
-            // Anything outside this range is suspicious — either the
+            // Anything outside this range is suspicious â€” either the
             // TEB is corrupted or the stack was manipulated.
             //
             if (stackSize < 0x1000 || stackSize > 0x4000000) {
@@ -771,7 +773,7 @@ CsaDetectStackPivot(
         }
         //
         // If bounds retrieval failed (e.g., system thread with no TEB),
-        // skip this heuristic — proceed to frame-based checks.
+        // skip this heuristic â€” proceed to frame-based checks.
         //
     }
 
@@ -788,7 +790,7 @@ CsaDetectStackPivot(
         capturedCount = RtlWalkFrameChain(capturedFrames, 16, 1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         //
-        // Stack walk threw an exception — the stack is corrupted or pivoted
+        // Stack walk threw an exception â€” the stack is corrupted or pivoted
         // to an unmapped region. Strong indicator.
         //
         pivoted = TRUE;
@@ -861,23 +863,23 @@ CsaDetectStackPivot(
 
                 BOOLEAN foundCall = FALSE;
 
-                // call rel32: E8 at [addr-5] → buf[2]
+                // call rel32: E8 at [addr-5] â†’ buf[2]
                 if (buf[2] == 0xE8) {
                     foundCall = TRUE;
                 }
 
-                // call [rip+disp32]: FF 15 at [addr-6] → buf[1..2]
+                // call [rip+disp32]: FF 15 at [addr-6] â†’ buf[1..2]
                 if (!foundCall && buf[1] == 0xFF && buf[2] == 0x15) {
                     foundCall = TRUE;
                 }
 
-                // call reg: FF D0..D7 at [addr-2] → buf[5..6]
+                // call reg: FF D0..D7 at [addr-2] â†’ buf[5..6]
                 if (!foundCall && buf[5] == 0xFF &&
                     buf[6] >= 0xD0 && buf[6] <= 0xD7) {
                     foundCall = TRUE;
                 }
 
-                // call [reg]: FF 10..17 at [addr-2] → buf[5..6]
+                // call [reg]: FF 10..17 at [addr-2] â†’ buf[5..6]
                 if (!foundCall && buf[5] == 0xFF &&
                     buf[6] >= 0x10 && buf[6] <= 0x17) {
                     foundCall = TRUE;
@@ -890,7 +892,7 @@ CsaDetectStackPivot(
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             //
-            // Exception reading code near return addresses — suspicious
+            // Exception reading code near return addresses â€” suspicious
             // but not conclusive by itself.
             //
         }
@@ -992,7 +994,7 @@ CsaOnProcessExit(
 
 
 //=============================================================================
-// Internal Functions — Throttle
+// Internal Functions â€” Throttle
 //=============================================================================
 
 static
@@ -1013,7 +1015,7 @@ CsapThrottleCheck(
     // and both reset, or a thread may increment a stale counter during
     // a window reset. This is acceptable because:
     //   - The throttle is a soft rate limiter, not a security boundary
-    //   - Worst case: ~2× captures in the first 100ms of a new window
+    //   - Worst case: ~2Ã— captures in the first 100ms of a new window
     //   - No memory safety or correctness issue
     //
     KeQuerySystemTimePrecise(&now);
@@ -1024,7 +1026,7 @@ CsapThrottleCheck(
 
     if ((now.QuadPart - windowStart) > CSA_THROTTLE_WINDOW_100NS) {
         //
-        // Window expired — reset
+        // Window expired â€” reset
         //
         InterlockedExchange64(&AnalyzerInternal->CaptureWindowStart, now.QuadPart);
         InterlockedExchange(&AnalyzerInternal->CapturesInWindow, 1);
@@ -1037,7 +1039,7 @@ CsapThrottleCheck(
 
 
 //=============================================================================
-// Internal Functions — Stack Capture
+// Internal Functions â€” Stack Capture
 //=============================================================================
 
 static
@@ -1116,7 +1118,7 @@ CsapCaptureUserStack(
 
 
 //=============================================================================
-// Internal Functions — Frame Analysis (batched single-attach)
+// Internal Functions â€” Frame Analysis (batched single-attach)
 //=============================================================================
 
 static
@@ -1192,7 +1194,7 @@ CsapAnalyzeFrames(
             CsapDereferenceModuleEntry(AnalyzerInternal, moduleEntry);
         } else {
             //
-            // No module found — unbacked code
+            // No module found â€” unbacked code
             //
             frame->ModuleBase = NULL;
             RtlZeroMemory(&frame->ModuleName, sizeof(UNICODE_STRING));
@@ -1226,7 +1228,7 @@ CsapAnalyzeFrames(
 
 
 //=============================================================================
-// Internal Functions — Module Cache
+// Internal Functions â€” Module Cache
 //=============================================================================
 
 static
@@ -1614,7 +1616,7 @@ CsapPopulateModuleCache(
 
 
 //=============================================================================
-// Internal Functions — .text Section Population
+// Internal Functions â€” .text Section Population
 //=============================================================================
 
 static
@@ -1730,13 +1732,13 @@ CsapPopulateTextSectionInline(
             CacheEntry->TextSectionSize = (SIZE_T)(textRangeMax - textRangeMin);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // PE parsing failed — leave TextSection fields as NULL/0
+        // PE parsing failed â€” leave TextSection fields as NULL/0
     }
 }
 
 
 //=============================================================================
-// Internal Functions — Module Cache Reference Counting
+// Internal Functions â€” Module Cache Reference Counting
 //=============================================================================
 
 static
@@ -1801,7 +1803,7 @@ CsapDereferenceModuleEntry(
 
 
 //=============================================================================
-// Internal Functions — Module Cache Cleanup
+// Internal Functions â€” Module Cache Cleanup
 //=============================================================================
 
 static
@@ -1837,7 +1839,7 @@ CsapCleanupModuleCache(
     //
     // Free entries outside the lock. During shutdown, all operational
     // references have been drained, so RefCount should be 1 (the initial
-    // reference). We free regardless — this is only called during shutdown.
+    // reference). We free regardless â€” this is only called during shutdown.
     //
     while (!IsListEmpty(&entriesToFree)) {
         entry = RemoveHeadList(&entriesToFree);
@@ -1880,10 +1882,10 @@ CsapEvictProcessEntries(
         if (cacheEntry->ProcessId == ProcessId) {
             //
             // Mark for eviction and drop the cache's reference.
-            // If RefCount reaches 0, no outstanding lookups — safe to
+            // If RefCount reaches 0, no outstanding lookups â€” safe to
             // remove from list and free immediately. Otherwise, leave
             // in list; CsapDereferenceModuleEntry will handle cleanup
-            // when the last lookup releases (RefCount→0).
+            // when the last lookup releases (RefCountâ†’0).
             //
             // Always set PendingEvict BEFORE decrementing to eliminate
             // the UAF race where a concurrent CsapDereferenceModuleEntry
@@ -1917,7 +1919,7 @@ CsapEvictProcessEntries(
 
 
 //=============================================================================
-// Internal Functions — Memory Analysis
+// Internal Functions â€” Memory Analysis
 //=============================================================================
 
 static
@@ -2082,7 +2084,7 @@ CsapReadThreadStackBoundsAttached(
 
 
 //=============================================================================
-// Internal Functions — Return Address Validation
+// Internal Functions â€” Return Address Validation
 //=============================================================================
 
 static
@@ -2124,7 +2126,7 @@ CsapIsReturnAddressValid(
 
 
 //=============================================================================
-// Internal Functions — ROP Gadget Detection
+// Internal Functions â€” ROP Gadget Detection
 //=============================================================================
 
 static
@@ -2173,7 +2175,7 @@ Return Value:
         // === Direct syscall / sysenter detection ===
         // If the 2 bytes immediately before the return address are
         // syscall (0F 05) or sysenter (0F 34), this is a direct system call
-        // from unbacked memory — extremely suspicious.
+        // from unbacked memory â€” extremely suspicious.
         //
         UCHAR b0 = codeBuffer[CSA_ROP_GADGET_WINDOW - 2];  // [Address - 2]
         UCHAR b1 = codeBuffer[CSA_ROP_GADGET_WINDOW - 1];  // [Address - 1]
@@ -2321,7 +2323,7 @@ Return Value:
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         //
-        // Access violation reading user memory — address may be unmapped.
+        // Access violation reading user memory â€” address may be unmapped.
         // Return what we have (likely nothing), don't flag as error.
         //
     }
@@ -2333,7 +2335,7 @@ Return Value:
 
 
 //=============================================================================
-// Internal Functions — Suspicion Scoring
+// Internal Functions â€” Suspicion Scoring
 //=============================================================================
 
 static

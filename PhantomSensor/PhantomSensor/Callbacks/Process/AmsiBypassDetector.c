@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -56,20 +58,20 @@ typedef struct _ABD_CRITICAL_FUNCTION {
 //
 // Patch signatures that indicate AMSI bypass
 //
-// Pattern 1: "mov eax, 0x80070057; ret" (E_INVALIDARG) — most common AmsiScanBuffer patch
+// Pattern 1: "mov eax, 0x80070057; ret" (E_INVALIDARG) â€” most common AmsiScanBuffer patch
 static const UCHAR g_PatchSig_MovEaxInvalidArg[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
 
-// Pattern 2: "xor eax, eax; ret" — return S_OK (AMSI_RESULT_CLEAN)
+// Pattern 2: "xor eax, eax; ret" â€” return S_OK (AMSI_RESULT_CLEAN)
 static const UCHAR g_PatchSig_XorEaxRet[] = { 0x31, 0xC0, 0xC3 };
 static const UCHAR g_PatchSig_XorEaxRet2[] = { 0x33, 0xC0, 0xC3 };
 
-// Pattern 3: "ret" — immediate return
+// Pattern 3: "ret" â€” immediate return
 static const UCHAR g_PatchSig_Ret[] = { 0xC3 };
 
-// Pattern 4: NOP sled (≥4 NOPs) — common in hook overwrite
+// Pattern 4: NOP sled (â‰¥4 NOPs) â€” common in hook overwrite
 static const UCHAR g_PatchSig_NopSled[] = { 0x90, 0x90, 0x90, 0x90 };
 
-// Pattern 5: "mov eax, 0; ret" — return S_OK explicitly
+// Pattern 5: "mov eax, 0; ret" â€” return S_OK explicitly
 static const UCHAR g_PatchSig_MovEaxZeroRet[] = { 0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3 };
 
 typedef struct _ABD_PATCH_SIGNATURE {
@@ -132,7 +134,7 @@ typedef struct _ABD_DETECTOR_STATE {
     EX_RUNDOWN_REF RundownRef;
 
     //
-    // Clean baseline — amsi.dll loaded from \SystemRoot\System32\amsi.dll
+    // Clean baseline â€” amsi.dll loaded from \SystemRoot\System32\amsi.dll
     //
     PVOID CleanAmsiCopy;                // Mapped clean copy of amsi.dll
     SIZE_T CleanAmsiSize;
@@ -519,7 +521,7 @@ AbdScanProcess(
 
         //
         // Step 1: If baseline available, check if prologue matches clean copy.
-        //         If it matches baseline → function is unmodified → skip to next.
+        //         If it matches baseline â†’ function is unmodified â†’ skip to next.
         //         This prevents false positives from signature matching on clean code.
         //
         if (g_AbdState.CleanAmsiCopy != NULL &&
@@ -532,13 +534,13 @@ AbdScanProcess(
             if (RtlCompareMemory(currentPrologue, cleanPrologue, ABD_PROLOGUE_SIZE)
                 == ABD_PROLOGUE_SIZE) {
                 //
-                // Prologue matches clean baseline — not patched, skip
+                // Prologue matches clean baseline â€” not patched, skip
                 //
                 continue;
             }
 
             //
-            // Prologue differs from baseline — classify the patch type
+            // Prologue differs from baseline â€” classify the patch type
             //
             if (AbdpCheckPrologueForPatch(currentPrologue, ABD_PROLOGUE_SIZE, &bypassType)) {
                 //
@@ -582,7 +584,7 @@ AbdScanProcess(
         }
 
         //
-        // Step 2: No baseline available — signature-only mode (lower fidelity).
+        // Step 2: No baseline available â€” signature-only mode (lower fidelity).
         //         Check against known patch patterns.
         //
         if (AbdpCheckPrologueForPatch(currentPrologue, ABD_PROLOGUE_SIZE, &bypassType)) {
@@ -704,7 +706,7 @@ AbdCheckProtectionChange(
 
         if (!wasWritable && isWritable) {
             //
-            // amsi.dll text section made writable — strong bypass indicator
+            // amsi.dll text section made writable â€” strong bypass indicator
             //
             InterlockedIncrement64(&g_AbdState.Stats.BypassesDetected);
             InterlockedIncrement64(&g_AbdState.Stats.ProtectionChangeDetections);
@@ -771,7 +773,7 @@ AbdRemoveProcessTracking(
 }
 
 // ============================================================================
-// PRIVATE — BASELINE LOADING
+// PRIVATE â€” BASELINE LOADING
 // ============================================================================
 
 /**
@@ -833,7 +835,7 @@ AbdpLoadCleanBaseline(
     }
 
     //
-    // Sanity check size — amsi.dll should be < 1MB
+    // Sanity check size â€” amsi.dll should be < 1MB
     //
     if (fileInfo.EndOfFile.QuadPart == 0 ||
         fileInfo.EndOfFile.QuadPart > (1024 * 1024)) {
@@ -909,7 +911,7 @@ AbdpLoadCleanBaseline(
 }
 
 // ============================================================================
-// PRIVATE — EXPORT RESOLUTION
+// PRIVATE â€” EXPORT RESOLUTION
 // ============================================================================
 
 /**
@@ -933,7 +935,7 @@ AbdpResolveExports(
     }
 
     //
-    // Parse PE headers for section table (needed for RVA → file offset conversion)
+    // Parse PE headers for section table (needed for RVA â†’ file offset conversion)
     //
     dosHeader = (PIMAGE_DOS_HEADER)g_AbdState.CleanAmsiCopy;
     if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
@@ -1130,7 +1132,7 @@ AbdpRvaToFileOffset(
 }
 
 // ============================================================================
-// PRIVATE — PROCESS TRACKING
+// PRIVATE â€” PROCESS TRACKING
 // ============================================================================
 
 static BOOLEAN
@@ -1360,7 +1362,7 @@ AbdpReleaseProcess(
 }
 
 // ============================================================================
-// PRIVATE — PATCH DETECTION
+// PRIVATE â€” PATCH DETECTION
 // ============================================================================
 
 static BOOLEAN
@@ -1392,7 +1394,7 @@ AbdpCheckPrologueForPatch(
 }
 
 // ============================================================================
-// PRIVATE — PROCESS MEMORY READING
+// PRIVATE â€” PROCESS MEMORY READING
 // ============================================================================
 
 /**

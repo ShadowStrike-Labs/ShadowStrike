@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -63,7 +65,7 @@ extern "C" {
 #define BP_DEFAULT_MAX_AGE_MS   1000            // 1 second
 
 //=============================================================================
-// Event structure — variable-length, always pool-allocated
+// Event structure â€” variable-length, always pool-allocated
 //=============================================================================
 
 typedef struct _BP_EVENT {
@@ -73,7 +75,7 @@ typedef struct _BP_EVENT {
 } BP_EVENT, *PBP_EVENT;
 
 //=============================================================================
-// Callback type — invoked at PASSIVE_LEVEL on the processing thread
+// Callback type â€” invoked at PASSIVE_LEVEL on the processing thread
 //=============================================================================
 
 typedef VOID (*BP_BATCH_CALLBACK)(

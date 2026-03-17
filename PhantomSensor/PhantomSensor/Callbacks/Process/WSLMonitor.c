@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -549,7 +551,7 @@ WslMonCheckFileAccess(
     WSL_ESCAPE_TYPE Result = WslEscape_None;
 
     //
-    // Defensive validation — FileName may have NULL Buffer on malformed
+    // Defensive validation â€” FileName may have NULL Buffer on malformed
     // IRP_MJ_CREATE requests or volume opens (WSL-14).
     //
     if (FileName == NULL || FileName->Buffer == NULL || FileName->Length == 0) {
@@ -585,7 +587,7 @@ WslMonCheckFileAccess(
         InterlockedIncrement64(&g_WslState.Stats.FileSystemCrossings);
 
         //
-        // Priority 1: Credential file access (T1003 — OS Credential Dumping).
+        // Priority 1: Credential file access (T1003 â€” OS Credential Dumping).
         // This is the highest severity because it indicates direct credential
         // theft attempts from WSL context.
         //
@@ -615,7 +617,7 @@ WslMonCheckFileAccess(
         }
 
         //
-        // Priority 2: Driver directory access (T1611 — Escape to Host).
+        // Priority 2: Driver directory access (T1611 â€” Escape to Host).
         // WSL processes accessing \drivers\ may be attempting to load
         // or manipulate kernel-mode drivers.
         //
@@ -646,7 +648,7 @@ WslMonCheckFileAccess(
         }
 
         //
-        // Priority 3: System32 access (T1611 — general system manipulation).
+        // Priority 3: System32 access (T1611 â€” general system manipulation).
         // WSL processes accessing \System32\ may be tampering with system
         // binaries, DLLs, or configuration files (WSL-12 fix).
         //
@@ -684,7 +686,7 @@ WslMonIsWslProcess(
     //
     // Rundown protection ensures the hash table and push locks are valid
     // (WSL-4 fix). Without this, a call during/after shutdown would access
-    // deleted push locks → BSOD.
+    // deleted push locks â†’ BSOD.
     //
     if (!WslpEnterOperation()) {
         return FALSE;
@@ -722,7 +724,7 @@ WslMonGetStatistics(
 }
 
 // ============================================================================
-// PRIVATE — PROCESS LOOKUP
+// PRIVATE â€” PROCESS LOOKUP
 // ============================================================================
 
 static ULONG
@@ -763,7 +765,7 @@ WslpFindProcessLocked(
 }
 
 // ============================================================================
-// PRIVATE — IMAGE CLASSIFICATION
+// PRIVATE â€” IMAGE CLASSIFICATION
 // ============================================================================
 
 static WSL_PROCESS_TYPE
@@ -825,7 +827,7 @@ WslpExtractImageName(
 }
 
 // ============================================================================
-// PRIVATE — CREDENTIAL PATH CHECK
+// PRIVATE â€” CREDENTIAL PATH CHECK
 // ============================================================================
 
 static BOOLEAN
@@ -854,7 +856,7 @@ WslpIsCredentialPath(
 }
 
 // ============================================================================
-// PRIVATE — PATH SUBSTRING SEARCH
+// PRIVATE â€” PATH SUBSTRING SEARCH
 // ============================================================================
 
 //
@@ -910,7 +912,7 @@ WslpPathContainsCI(
 }
 
 // ============================================================================
-// PRIVATE — NATIVE ESCAPE TARGET DETECTION
+// PRIVATE â€” NATIVE ESCAPE TARGET DETECTION
 // ============================================================================
 
 //
@@ -931,7 +933,7 @@ WslpIsNativeEscapeTarget(
 }
 
 // ============================================================================
-// PRIVATE — LIFECYCLE
+// PRIVATE â€” LIFECYCLE
 // ============================================================================
 
 static BOOLEAN

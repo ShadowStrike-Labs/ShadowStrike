@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -57,7 +59,7 @@
 // Batch: holds an array of event pointers. Allocated from lookaside list.
 // The Events array is BP_MAX_BATCH_SIZE entries. BP_MAX_BATCH_SIZE=1000
 // gives 1000 * sizeof(PBP_EVENT) = 8000 bytes. Batches must NEVER be
-// stack-allocated — always from pool/lookaside.
+// stack-allocated â€” always from pool/lookaside.
 //
 typedef struct _BP_BATCH {
     LIST_ENTRY ListEntry;
@@ -105,7 +107,7 @@ struct _BP_PROCESSOR {
     KEVENT NewBatchEvent;
 
     //
-    // Age timer — managed by TimerManager
+    // Age timer â€” managed by TimerManager
     //
     ULONG AgeTimerId;
 
@@ -180,7 +182,7 @@ BppAgeTimerCallback(
     );
 
 //
-// Internal flush helper — NOT paged. Moves current batch to ready queue
+// Internal flush helper â€” NOT paged. Moves current batch to ready queue
 // under spin lock. Can be called at any IRQL <= DISPATCH_LEVEL.
 //
 //
@@ -195,7 +197,7 @@ BppRotateCurrentBatch(
     );
 
 // ============================================================================
-// PAGE SECTION — Only PASSIVE_LEVEL functions that do NOT acquire spin locks
+// PAGE SECTION â€” Only PASSIVE_LEVEL functions that do NOT acquire spin locks
 // OR functions where spin lock acquisition is safe because they are always
 // called at PASSIVE (BpFlush is intentionally NOT here).
 // ============================================================================
@@ -339,7 +341,7 @@ BpShutdown(
     }
 
     //
-    // Free current batch (with events — they were not delivered)
+    // Free current batch (with events â€” they were not delivered)
     //
     if (Processor->CurrentBatch != NULL) {
         BppFreeBatch(Processor, Processor->CurrentBatch, TRUE);
@@ -355,7 +357,7 @@ BpShutdown(
     }
 
     //
-    // Drain and free any remaining ready batches (no callback — shutting down)
+    // Drain and free any remaining ready batches (no callback â€” shutting down)
     //
     BppDrainReadyQueue(Processor, FALSE);
 
@@ -438,7 +440,7 @@ BpRegisterCallback(
 }
 
 // ============================================================================
-// EVENT QUEUING — HOT PATH (DISPATCH_LEVEL SAFE)
+// EVENT QUEUING â€” HOT PATH (DISPATCH_LEVEL SAFE)
 // ============================================================================
 
 _Use_decl_annotations_
@@ -549,7 +551,7 @@ BpQueueEvent(
             Processor->SpareBatch = NULL;
         } else {
             //
-            // No spare available — allocate a new one. If this fails,
+            // No spare available â€” allocate a new one. If this fails,
             // CurrentBatch becomes NULL and the next BpQueueEvent call
             // will attempt recovery above.
             //
@@ -568,7 +570,7 @@ BpQueueEvent(
 }
 
 // ============================================================================
-// FLUSH — NOT in PAGE section (acquires spin lock)
+// FLUSH â€” NOT in PAGE section (acquires spin lock)
 // ============================================================================
 
 _Use_decl_annotations_
@@ -580,7 +582,7 @@ BpFlush(
     PBP_BATCH batch = NULL;
 
     //
-    // NOTE: No PAGED_CODE() here — this function acquires spin locks
+    // NOTE: No PAGED_CODE() here â€” this function acquires spin locks
     // which raise to DISPATCH_LEVEL. It must NOT be in a paged section.
     //
 
@@ -674,7 +676,7 @@ BpStart(
         //
         // Thread is running but we can't get a reference to wait on it.
         // Signal it to stop and wait via the handle we already closed...
-        // Actually, we must stop it. Signal StopEvent — the thread checks
+        // Actually, we must stop it. Signal StopEvent â€” the thread checks
         // it and will terminate. We cannot wait on it (no reference), but
         // the thread will self-terminate shortly. This is an extremely
         // rare error path.
@@ -737,7 +739,7 @@ BpStop(
 
     //
     // Flush the current batch so no events are silently lost.
-    // We do this under spin lock (same as BpFlush) — this is NOT paged.
+    // We do this under spin lock (same as BpFlush) â€” this is NOT paged.
     //
     batch = BppRotateCurrentBatch(Processor);
     if (batch != NULL) {
@@ -802,7 +804,7 @@ BpGetStatistics(
 
     //
     // ActiveBatchCount: 1 if CurrentBatch has events, 0 otherwise.
-    // We don't acquire the lock here — this is a best-effort snapshot.
+    // We don't acquire the lock here â€” this is a best-effort snapshot.
     //
     if (Processor->CurrentBatch != NULL && Processor->CurrentBatch->EventCount > 0) {
         Stats->ActiveBatchCount = 1;
@@ -815,7 +817,7 @@ BpGetStatistics(
 }
 
 // ============================================================================
-// PRIVATE — BATCH ROTATION HELPER
+// PRIVATE â€” BATCH ROTATION HELPER
 // ============================================================================
 
 /**
@@ -824,7 +826,7 @@ BpGetStatistics(
  * Returns the old batch (with events) or NULL if current batch was empty.
  * The returned batch is detached from the processor and owned by the caller.
  * 
- * NOT paged — acquires spin lock.
+ * NOT paged â€” acquires spin lock.
  */
 __declspec(noinline)
 static PBP_BATCH
@@ -853,7 +855,7 @@ BppRotateCurrentBatch(
 }
 
 // ============================================================================
-// PRIVATE — BATCH ALLOCATION
+// PRIVATE â€” BATCH ALLOCATION
 // ============================================================================
 
 static PBP_BATCH
@@ -901,7 +903,7 @@ BppFreeBatch(
 }
 
 // ============================================================================
-// PRIVATE — READY QUEUE MANAGEMENT
+// PRIVATE â€” READY QUEUE MANAGEMENT
 // ============================================================================
 
 __declspec(noinline)
@@ -923,7 +925,7 @@ BppMoveBatchToReadyQueue(
         currentCount = Processor->QueuedBatches;
         if (currentCount >= (LONG)BP_MAX_QUEUED_BATCHES) {
             //
-            // Queue is full — drop the batch
+            // Queue is full â€” drop the batch
             //
             InterlockedAdd64(
                 &Processor->Stats.EventsDropped,
@@ -941,7 +943,7 @@ BppMoveBatchToReadyQueue(
             break;
         }
         //
-        // CAS failed — another thread incremented. Retry.
+        // CAS failed â€” another thread incremented. Retry.
         //
     }
 
@@ -961,7 +963,7 @@ BppMoveBatchToReadyQueue(
  * Moves the entire list under spin lock, then processes at PASSIVE_LEVEL.
  * If InvokeCallback is TRUE, calls the registered callback for each batch.
  *
- * NOT paged — acquires spin locks.
+ * NOT paged â€” acquires spin locks.
  */
 __declspec(noinline)
 static VOID
@@ -979,7 +981,7 @@ BppDrainReadyQueue(
     InitializeListHead(&drainList);
 
     //
-    // Snapshot entire queue under spin lock (very fast — just pointer swaps)
+    // Snapshot entire queue under spin lock (very fast â€” just pointer swaps)
     //
     KeAcquireSpinLock(&Processor->QueueLock, &oldIrql);
 
@@ -1042,7 +1044,7 @@ BppDrainReadyQueue(
 }
 
 // ============================================================================
-// PRIVATE — PROCESSING THREAD
+// PRIVATE â€” PROCESSING THREAD
 // ============================================================================
 
 static VOID NTAPI
@@ -1061,7 +1063,7 @@ BppProcessingThread(
     //
     if (!ExAcquireRundownProtection(&proc->RundownRef)) {
         //
-        // Processor is already being torn down — exit immediately.
+        // Processor is already being torn down â€” exit immediately.
         //
         PsTerminateSystemThread(STATUS_CANCELLED);
         return; // Unreachable, but silences warnings
@@ -1084,7 +1086,7 @@ BppProcessingThread(
 
         if (waitStatus == STATUS_WAIT_0) {
             //
-            // StopEvent signaled — drain remaining batches and exit.
+            // StopEvent signaled â€” drain remaining batches and exit.
             // BpStop already moved the current batch to ready queue
             // before signaling, so we drain everything here.
             //
@@ -1093,7 +1095,7 @@ BppProcessingThread(
         }
 
         //
-        // NewBatchEvent signaled (or spurious) — process ready batches.
+        // NewBatchEvent signaled (or spurious) â€” process ready batches.
         // BppDrainReadyQueue drains ALL batches in the ready queue, so
         // even if multiple batches were queued before the thread woke,
         // they are all processed in this single drain cycle.
@@ -1106,7 +1108,7 @@ BppProcessingThread(
 }
 
 // ============================================================================
-// PRIVATE — AGE TIMER
+// PRIVATE â€” AGE TIMER
 // ============================================================================
 
 static VOID

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -142,7 +144,7 @@ typedef struct _HS_SPRAY_RESULT {
     ULONG ConfidenceScore;
     
     //
-    // Process context (ProcessId only — callbacks can resolve name if needed)
+    // Process context (ProcessId only â€” callbacks can resolve name if needed)
     //
     HANDLE ProcessId;
     

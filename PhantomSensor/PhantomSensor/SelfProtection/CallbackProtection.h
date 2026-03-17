@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -71,7 +73,7 @@ typedef enum _CP_CALLBACK_TYPE {
 } CP_CALLBACK_TYPE;
 
 // ============================================================================
-// Tamper notification callback — always invoked at PASSIVE_LEVEL
+// Tamper notification callback â€” always invoked at PASSIVE_LEVEL
 // ============================================================================
 
 typedef VOID (*CP_TAMPER_CALLBACK)(
@@ -100,7 +102,7 @@ typedef struct _CP_STATISTICS {
 } CP_STATISTICS, *PCP_STATISTICS;
 
 // ============================================================================
-// Public API — all PASSIVE_LEVEL only
+// Public API â€” all PASSIVE_LEVEL only
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)

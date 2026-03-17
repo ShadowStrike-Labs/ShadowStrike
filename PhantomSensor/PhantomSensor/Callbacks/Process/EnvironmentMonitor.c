@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -1410,7 +1412,7 @@ EmpCaptureEnvironmentBlockSafe(
 
             //
             // EnvironmentSize is at a high offset (0x3F0) and varies across
-            // Windows versions. We use a safe default cap instead — always
+            // Windows versions. We use a safe default cap instead â€” always
             // limit to EM_MAX_ENV_BLOCK_SIZE (64KB) and scan for the
             // double-null terminator during parsing.
             //
@@ -1483,7 +1485,7 @@ EmpCaptureEnvironmentBlockSafe(
                             copied++;
                             if (prevNull) {
                                 //
-                                // Found double-null terminator — end of environment block
+                                // Found double-null terminator â€” end of environment block
                                 //
                                 break;
                             }
@@ -1498,7 +1500,7 @@ EmpCaptureEnvironmentBlockSafe(
                     }
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
                     //
-                    // Partial capture — use what we copied so far.
+                    // Partial capture â€” use what we copied so far.
                     // This handles the case where pages beyond the actual
                     // environment block are uncommitted.
                     //
@@ -2116,7 +2118,7 @@ EmpCalculateEntropyScaled(
     // Calculate Shannon entropy using integer approximation
     // entropy = -sum(p * log2(p)) where p = frequency[i] / Length
     //
-    // Using log2 approximation: log2(n) ≈ position of highest set bit
+    // Using log2 approximation: log2(n) â‰ˆ position of highest set bit
     // Scaled by 1000 for precision
     //
     for (i = 0; i < 256; i++) {

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -109,7 +111,7 @@ MITRE ATT&CK Coverage:
 // ============================================================================
 
 //
-// Snapshot entry — compact representation of a region for change detection.
+// Snapshot entry â€” compact representation of a region for change detection.
 // Stored contiguously in the snapshot buffer for O(n) comparison.
 //
 typedef struct _VAD_SNAPSHOT_ENTRY {
@@ -420,7 +422,7 @@ Return Value:
     KeInitializeEvent(&Internal->Public.ChangeAvailableEvent, SynchronizationEvent, FALSE);
 
     //
-    // Initialize hash table (chained — each bucket is a LIST_ENTRY head)
+    // Initialize hash table (chained â€” each bucket is a LIST_ENTRY head)
     //
     Internal->Public.ProcessHash.BucketCount = VAD_HASH_BUCKET_COUNT;
     Internal->Public.ProcessHash.Buckets = (LIST_ENTRY*)ExAllocatePool2(
@@ -501,7 +503,7 @@ Return Value:
     KeInitializeEvent(&Internal->DrainEvent, NotificationEvent, FALSE);
 
     //
-    // Create worker thread — get PETHREAD reference
+    // Create worker thread â€” get PETHREAD reference
     //
     InitializeObjectAttributes(&ObjectAttributes, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
 
@@ -659,7 +661,7 @@ Arguments:
     //
     // V-8 fix: Event-based drain instead of polling loop.
     // VadpReleaseRef signals DrainEvent when ActiveRefCount reaches 0
-    // during shutdown. Wait indefinitely — operations MUST complete.
+    // during shutdown. Wait indefinitely â€” operations MUST complete.
     //
     if (InterlockedCompareExchange(&Internal->Public.ActiveRefCount, 0, 0) != 0) {
         KeWaitForSingleObject(
@@ -672,7 +674,7 @@ Arguments:
     }
 
     //
-    // Free all process contexts — single-threaded at this point
+    // Free all process contexts â€” single-threaded at this point
     //
     while (!IsListEmpty(&Internal->Public.ProcessList)) {
         Entry = RemoveHeadList(&Internal->Public.ProcessList);
@@ -809,7 +811,7 @@ Return Value:
     KeLeaveCriticalRegion();
 
     //
-    // Perform initial VAD scan — non-fatal if process already exited
+    // Perform initial VAD scan â€” non-fatal if process already exited
     //
     VadpScanProcessVad(Internal, Context);
 
@@ -896,7 +898,7 @@ Return Value:
     VadpRemoveAllRegions(Internal, Context);
 
     //
-    // Single dereference — context was never re-referenced by lookup here
+    // Single dereference â€” context was never re-referenced by lookup here
     //
     VadpDereferenceProcessContext(Internal, Context);
 
@@ -1085,7 +1087,7 @@ VadGetRegionInfo(
     if (Region != NULL) {
         RtlCopyMemory(RegionInfo, Region, sizeof(VAD_REGION));
         //
-        // Clear ListEntry in the copy — caller must not use linkage
+        // Clear ListEntry in the copy â€” caller must not use linkage
         //
         InitializeListHead(&RegionInfo->ListEntry);
     }
@@ -1538,7 +1540,7 @@ VadpAllocateProcessContext(
 /*++
 Routine Description:
     Allocates and initializes a process context.
-    Fails if PsLookupProcessByProcessId fails — no dangling contexts.
+    Fails if PsLookupProcessByProcessId fails â€” no dangling contexts.
 --*/
 {
     PVAD_PROCESS_CONTEXT Context;
@@ -1743,7 +1745,7 @@ VadpFindRegion(
         }
 
         //
-        // Sorted list — if we're past the address, stop early
+        // Sorted list â€” if we're past the address, stop early
         //
         if ((ULONG_PTR)Region->BaseAddress > (ULONG_PTR)Address) {
             break;
@@ -1820,7 +1822,7 @@ VadpScanProcessVad(
 
     //
     // VAD2-H1 fix: Compare against previous snapshot AFTER rebuilding regions
-    // to detect protection changes, new regions, deleted regions, and RW→RX
+    // to detect protection changes, new regions, deleted regions, and RWâ†’RX
     // unpacking transitions. Without this call, the entire change-detection
     // pipeline (callbacks, change events) was dead.
     //
@@ -2121,8 +2123,8 @@ VadpAnalyzeRegionSuspicion(
 
     //
     // VAD2-L1 fix: Check for protection mismatch without mutating region state.
-    // Current protection differs from allocation protection → VirtualProtect was used.
-    // This is a pure read-only analysis — no side effects.
+    // Current protection differs from allocation protection â†’ VirtualProtect was used.
+    // This is a pure read-only analysis â€” no side effects.
     //
     if (Region->Protection != Region->OriginalProtection) {
         Suspicion |= VadSuspicion_ProtectionMismatch;
@@ -2219,7 +2221,7 @@ VadpQueueChangeEvent(
     //
     // V-6 fix: Notify callbacks with the original stack Event, NOT
     // QueuedEvent (which is in the change queue and can be dequeued
-    // + freed by concurrent VadGetNextChange → use-after-free).
+    // + freed by concurrent VadGetNextChange â†’ use-after-free).
     //
     VadpNotifyCallbacks(Tracker, Event);
 
@@ -2402,7 +2404,7 @@ Routine Description:
 
     CurrentSnap = (PVAD_SNAPSHOT_ENTRY)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
-        (SIZE_T)(MaxEntries + 1) * sizeof(VAD_SNAPSHOT_ENTRY),
+        ((SIZE_T)MaxEntries + 1) * sizeof(VAD_SNAPSHOT_ENTRY),
         VAD_POOL_TAG_SNAPSHOT
         );
 
@@ -2455,7 +2457,7 @@ Routine Description:
 
         if (curBase == oldBase) {
             //
-            // Same region — check for changes
+            // Same region â€” check for changes
             //
             if (CurrentSnap[ci].Protection != OldSnap[oi].Protection) {
                 //
@@ -2476,7 +2478,7 @@ Routine Description:
                 KeQuerySystemTime(&ChangeEvent.Timestamp);
 
                 //
-                // RW→RX transition is highly suspicious (unpacking)
+                // RWâ†’RX transition is highly suspicious (unpacking)
                 //
                 if ((OldSnap[oi].Flags & VadFlag_Write) &&
                     !(OldSnap[oi].Flags & VadFlag_Execute) &&
@@ -2523,7 +2525,7 @@ Routine Description:
 
         } else if (curBase < oldBase) {
             //
-            // Region in current but not in old → newly created
+            // Region in current but not in old â†’ newly created
             //
             VAD_CHANGE_EVENT ChangeEvent;
             RtlZeroMemory(&ChangeEvent, sizeof(ChangeEvent));
@@ -2549,7 +2551,7 @@ Routine Description:
 
         } else {
             //
-            // Region in old but not in current → deleted
+            // Region in old but not in current â†’ deleted
             //
             VAD_CHANGE_EVENT ChangeEvent;
             RtlZeroMemory(&ChangeEvent, sizeof(ChangeEvent));

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -188,7 +190,7 @@ typedef struct _SEC_SECTION_INFO {
 } SEC_SECTION_INFO, *PSEC_SECTION_INFO;
 
 //=============================================================================
-// Internal Map Entry (opaque to callers — only used inside .c)
+// Internal Map Entry (opaque to callers â€” only used inside .c)
 //=============================================================================
 
 typedef struct _SEC_MAP_ENTRY {
@@ -205,7 +207,7 @@ typedef struct _SEC_MAP_ENTRY {
 } SEC_MAP_ENTRY, *PSEC_MAP_ENTRY;
 
 //=============================================================================
-// Internal Section Entry (opaque to callers — only used inside .c)
+// Internal Section Entry (opaque to callers â€” only used inside .c)
 //=============================================================================
 
 typedef struct _SECTION_ENTRY {
@@ -297,7 +299,7 @@ typedef struct _SEC_TRACKER {
 } SEC_TRACKER, *PSEC_TRACKER;
 
 //=============================================================================
-// Callback Types — receive read-only snapshots, not internal pointers
+// Callback Types â€” receive read-only snapshots, not internal pointers
 //=============================================================================
 
 typedef VOID (*SEC_CREATE_CALLBACK)(

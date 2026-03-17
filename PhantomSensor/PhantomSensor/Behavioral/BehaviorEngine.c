@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -227,7 +229,7 @@ static LIST_ENTRY g_ChainHashTable[BE_CHAIN_HASH_BUCKETS];
 static EX_PUSH_LOCK g_ChainHashLock;
 
 /**
- * @brief Subsystem pointers — children initialized in BeEngineInitialize, shutdown in BeEngineShutdown.
+ * @brief Subsystem pointers â€” children initialized in BeEngineInitialize, shutdown in BeEngineShutdown.
  */
 static PACT_TRACKER g_AttackChainTracker;
 static PRE_ENGINE g_RuleEngine;
@@ -725,7 +727,7 @@ BeEngineInitialize(
     }
 
     //
-    // Initialize child subsystems — failures are non-fatal (degrade gracefully).
+    // Initialize child subsystems â€” failures are non-fatal (degrade gracefully).
     // Each child is NULL-checked at usage sites throughout the engine.
     //
 
@@ -763,7 +765,7 @@ BeEngineInitialize(
             g_AttackChainTracker = NULL;
         } else {
             //
-            // Register callback — routes chain alerts into BehaviorEngine
+            // Register callback â€” routes chain alerts into BehaviorEngine
             // stats, logging, and (future) user-mode notification.
             //
             (VOID)ActRegisterCallback(g_AttackChainTracker, BepAttackChainCallback, NULL);
@@ -795,7 +797,7 @@ BeEngineInitialize(
             g_PatternMatcher = NULL;
         } else {
             //
-            // Register completion callback — routes pattern matches into
+            // Register completion callback â€” routes pattern matches into
             // BehaviorEngine stats and logging.
             //
             (VOID)PmRegisterCallback(g_PatternMatcher, BepPatternMatchCallback, NULL);
@@ -1114,7 +1116,7 @@ BeEngineSubmitEvent(
     }
 
     //
-    // Acquire rundown protection — prevents shutdown from freeing resources
+    // Acquire rundown protection â€” prevents shutdown from freeing resources
     // while this operation is in-flight. Returns FALSE if shutdown is draining.
     //
     if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
@@ -1474,7 +1476,7 @@ BeEngineGetChain(
         if (hashEntry->Chain->ChainId == ChainId) {
             //
             // Try-acquire reference: only increment if RefCount > 0.
-            // If RefCount is 0, the chain is being freed — skip it.
+            // If RefCount is 0, the chain is being freed â€” skip it.
             //
             {
                 LONG oldRef;
@@ -2007,7 +2009,7 @@ BeEngineGetProcessContext(
         if (hashEntry->Context->ProcessId == ProcessId) {
             //
             // Try-acquire reference: only increment if RefCount > 0.
-            // If RefCount is 0, the context is being freed — skip it.
+            // If RefCount is 0, the context is being freed â€” skip it.
             //
             {
                 LONG oldRef;
@@ -2775,7 +2777,7 @@ BepMapToPmEventType(
  * @brief Pattern match completion callback.
  *
  * Routes completed behavioral pattern matches into the logging and stats pipeline.
- * Runs at PASSIVE_LEVEL from PmpCheckPatternComplete → PmpNotifyCallback.
+ * Runs at PASSIVE_LEVEL from PmpCheckPatternComplete â†’ PmpNotifyCallback.
  */
 static VOID
 BepPatternMatchCallback(
@@ -2896,7 +2898,7 @@ BepProcessSingleEvent(
     // - Chain-level scoring that exceeds individual event scores
     //
     // IRQL: BepProcessSingleEvent runs at PASSIVE_LEVEL (worker thread or sync path).
-    // ActSubmitEvent requires <= APC_LEVEL — always satisfied here.
+    // ActSubmitEvent requires <= APC_LEVEL â€” always satisfied here.
     //
     if (Event->MitreAttackId != 0 &&
         g_AttackChainTracker != NULL &&
@@ -2921,11 +2923,11 @@ BepProcessSingleEvent(
     //
     // === Behavioral Pattern Matcher Submission ===
     // Feed every event to the PatternMatcher for multi-event behavioral sequence
-    // detection. PatternMatcher correlates temporal event chains (e.g., create →
-    // inject → execute → encrypt) into high-confidence attack patterns with
+    // detection. PatternMatcher correlates temporal event chains (e.g., create â†’
+    // inject â†’ execute â†’ encrypt) into high-confidence attack patterns with
     // configurable time windows and per-process state tracking.
     //
-    // IRQL: PASSIVE_LEVEL (worker thread) — PmSubmitEvent requires <= PASSIVE_LEVEL.
+    // IRQL: PASSIVE_LEVEL (worker thread) â€” PmSubmitEvent requires <= PASSIVE_LEVEL.
     //
     if (g_PatternMatcher != NULL) {
         PM_EVENT_TYPE pmType = BepMapToPmEventType(Event->EventType);
@@ -2953,7 +2955,7 @@ BepProcessSingleEvent(
     // an AD metric category. The detector builds Z-score + MAD baselines
     // per process and flags statistically anomalous activity bursts.
     //
-    // IRQL: PASSIVE_LEVEL — AdCheckForAnomaly requires <= APC_LEVEL.
+    // IRQL: PASSIVE_LEVEL â€” AdCheckForAnomaly requires <= APC_LEVEL.
     //
     if (g_AnomalyDetector != NULL) {
         AD_METRIC_TYPE adMetric;
@@ -2984,7 +2986,7 @@ BepProcessSingleEvent(
 
         if (isAnomaly) {
             //
-            // Anomalous behavior burst detected — boost threat score
+            // Anomalous behavior burst detected â€” boost threat score
             // to reflect statistical deviation from baseline.
             //
             threatScore += BE_ANOMALY_SCORE_BOOST;
@@ -3000,7 +3002,7 @@ BepProcessSingleEvent(
     // path, threat score, MITRE technique, etc. and produce actions (Block,
     // Alert, Quarantine, Log). Stack-allocated result avoids pool pressure.
     //
-    // IRQL: PASSIVE_LEVEL — ReEvaluateInPlace requires <= APC_LEVEL.
+    // IRQL: PASSIVE_LEVEL â€” ReEvaluateInPlace requires <= APC_LEVEL.
     //
     if (g_RuleEngine != NULL) {
         RE_EVALUATION_CONTEXT ruleCtx;
@@ -3102,14 +3104,14 @@ BepProcessSingleEvent(
     // === ETW Telemetry Emission ===
     // Emit behavioral detection events via ETW for SIEM consumers, Windows
     // Event Log, and real-time diagnostics. This is the SINGLE telemetry
-    // funnel — every behavioral event that passes through BepProcessSingleEvent
+    // funnel â€” every behavioral event that passes through BepProcessSingleEvent
     // gets ETW visibility.
     //
     // Two emission paths:
     // 1. ETW_LOG_BEHAVIOR: Every processed event (informational+detection)
     // 2. ETW_LOG_SECURITY: High-threat events that crossed the alert threshold
     //
-    // IRQL: PASSIVE_LEVEL (worker thread) — EtwWrite requires <= DISPATCH_LEVEL.
+    // IRQL: PASSIVE_LEVEL (worker thread) â€” EtwWrite requires <= DISPATCH_LEVEL.
     //
     {
         WCHAR etwDescription[128];
@@ -3640,7 +3642,7 @@ BepInsertChain(
  * @brief Remove chain from hash table only.
  *
  * Used by reference counting cleanup when chain refcount hits zero.
- * Only removes from the hash table — caller is responsible for main list removal
+ * Only removes from the hash table â€” caller is responsible for main list removal
  * to prevent double-RemoveEntryList corruption.
  */
 static VOID
@@ -3678,7 +3680,7 @@ BepRemoveChainFromHash(
 /**
  * @brief Remove process context from hash table only.
  *
- * Only removes from the hash table — caller is responsible for main list
+ * Only removes from the hash table â€” caller is responsible for main list
  * removal to prevent double-RemoveEntryList corruption.
  */
 static VOID
@@ -4330,7 +4332,7 @@ BepCleanupStaleChains(
 
             //
             // Remove from process context's chain list.
-            // KeEnterCriticalRegion nests safely — we already entered above.
+            // KeEnterCriticalRegion nests safely â€” we already entered above.
             //
             KeEnterCriticalRegion();
             ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
@@ -4346,7 +4348,7 @@ BepCleanupStaleChains(
     KeLeaveCriticalRegion();
 
     //
-    // Free stale chains — already removed from all lists and hash tables,
+    // Free stale chains â€” already removed from all lists and hash tables,
     // so no concurrent access is possible.
     //
     while (!IsListEmpty(&staleList)) {
@@ -4413,7 +4415,7 @@ BepCleanupStaleProcessContexts(
     KeLeaveCriticalRegion();
 
     //
-    // Free stale contexts — already removed from both main list and
+    // Free stale contexts â€” already removed from both main list and
     // hash table, so no concurrent access is possible.
     //
     while (!IsListEmpty(&staleList)) {

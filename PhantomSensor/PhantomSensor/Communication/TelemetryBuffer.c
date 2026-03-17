@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -344,7 +346,7 @@ TbpNotifyOverflow(
 
     //
     // Emit behavioral event for telemetry buffer overflow.
-    // This is critical health telemetry — if the buffer is dropping events,
+    // This is critical health telemetry â€” if the buffer is dropping events,
     // the BehaviorEngine and user-mode must know about it.
     //
     BeEngineSubmitEvent(
@@ -353,7 +355,7 @@ TbpNotifyOverflow(
         HandleToULong(PsGetCurrentProcessId()),
         NULL,
         0,
-        20,     // Low threat score — operational health, not attack
+        20,     // Low threat score â€” operational health, not attack
         FALSE,
         NULL
     );
@@ -2390,7 +2392,7 @@ TbSetCompression(
     //
     if (Enable) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike/TB] Compression not implemented — deferred to user-mode pipeline\n");
+                   "[ShadowStrike/TB] Compression not implemented â€” deferred to user-mode pipeline\n");
         return STATUS_NOT_IMPLEMENTED;
     }
 
@@ -2425,7 +2427,7 @@ TbSetEncryption(
     //
     if (Enable) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike/TB] Encryption not implemented — deferred to user-mode pipeline\n");
+                   "[ShadowStrike/TB] Encryption not implemented â€” deferred to user-mode pipeline\n");
         return STATUS_NOT_IMPLEMENTED;
     }
 
@@ -3299,7 +3301,7 @@ TbpFlushThreadRoutine(
                     HandleToULong(PsGetCurrentProcessId()),
                     NULL,
                     0,
-                    15,     // Low threat score — capacity warning
+                    15,     // Low threat score â€” capacity warning
                     FALSE,
                     NULL
                 );

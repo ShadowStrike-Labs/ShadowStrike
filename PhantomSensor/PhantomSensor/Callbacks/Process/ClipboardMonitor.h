@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -25,11 +27,11 @@
     detects clipboard abuse through observable process behavior patterns:
 
     Detection Strategies:
-    1. Process image analysis — known clipboard stealers (clip.exe abuse,
+    1. Process image analysis â€” known clipboard stealers (clip.exe abuse,
        powershell Get-Clipboard, suspicious clipboard-related imports)
     2. Rapid file writes to clipboard cache paths (%TEMP%, %LocalAppData%)
     3. Cross-process handle duplication targeting clipboard-owning processes
-    4. Behavioral correlation — clipboard access + network exfiltration pattern
+    4. Behavioral correlation â€” clipboard access + network exfiltration pattern
     5. Command-line patterns indicating clipboard harvesting
 
     MITRE ATT&CK: T1115 (Clipboard Data)

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -97,7 +99,7 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     FilterMessageType_RansomwareAlert,        // Ransomware behavior detected (PostWrite)
 
     //
-    // User-Mode → Kernel Data Push Messages (0x70 - 0x8F)
+    // User-Mode â†’ Kernel Data Push Messages (0x70 - 0x8F)
     // These enable the user-mode agent to push updated threat intelligence,
     // behavioral rules, and configuration to the kernel driver at runtime.
     //
@@ -172,7 +174,7 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
 // Ransomware alert alias
 #define ShadowStrikeMessageRansomwareAlert          FilterMessageType_RansomwareAlert
 
-// Data push aliases (user-mode → kernel)
+// Data push aliases (user-mode â†’ kernel)
 #define ShadowStrikeMessagePushHashDB               FilterMessageType_PushHashDatabase
 #define ShadowStrikeMessagePushPatternDB            FilterMessageType_PushPatternDatabase
 #define ShadowStrikeMessagePushSignatureDB          FilterMessageType_PushSignatureDatabase
@@ -223,7 +225,7 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
      (type) == FilterMessageType_ThreatScoreNotify)
 
 /**
- * @brief Check if message type is a user-mode → kernel data push.
+ * @brief Check if message type is a user-mode â†’ kernel data push.
  */
 #define SHADOWSTRIKE_IS_DATA_PUSH_MESSAGE(type) \
     ((type) >= FilterMessageType_PushHashDatabase && \

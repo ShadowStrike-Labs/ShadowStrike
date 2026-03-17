@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -81,7 +83,7 @@
 // PS_PROTECTION structure for protected process detection
 //
 #pragma warning(push)
-#pragma warning(disable:4201)  // nameless struct/union — required for bitfield layout
+#pragma warning(disable:4201)  // nameless struct/union â€” required for bitfield layout
 typedef struct _PS_PROTECTION {
     union {
         UCHAR Level;
@@ -188,7 +190,7 @@ typedef BOOLEAN (NTAPI *PFN_PSISSECUREPROCESS)(
 #define PROCUTILS_STATE_INITIALIZED     2
 
 //
-// Process access rights — not available in km headers
+// Process access rights â€” not available in km headers
 //
 #ifndef PROCESS_QUERY_LIMITED_INFORMATION
 #define PROCESS_QUERY_LIMITED_INFORMATION  0x1000
@@ -940,7 +942,7 @@ ShadowProcessUtilsCleanup(
 
     if (PreviousState != PROCUTILS_STATE_INITIALIZED) {
         //
-        // Already uninitialized or mid-init — nothing to do
+        // Already uninitialized or mid-init â€” nothing to do
         //
         return;
     }
@@ -986,7 +988,7 @@ ShadowProcessUtilsCleanup(
     KeLeaveCriticalRegion();
 
     //
-    // Clear function pointers — safe now, all in-flight callers have drained
+    // Clear function pointers â€” safe now, all in-flight callers have drained
     //
     g_ProcessUtilsState.ZwQueryInformationProcess = NULL;
     g_ProcessUtilsState.ZwQueryInformationThread = NULL;
@@ -1430,7 +1432,7 @@ ShadowStrikeGetProcessInfo(
     ProcessInfo->ProcessId = ProcessId;
 
     //
-    // Get EPROCESS — this is mandatory, fail if we cannot
+    // Get EPROCESS â€” this is mandatory, fail if we cannot
     //
     Status = PsLookupProcessByProcessId(ProcessId, &Process);
     if (!NT_SUCCESS(Status)) {
@@ -1515,7 +1517,7 @@ ShadowStrikeGetProcessInfo(
     }
 
     //
-    // Token analysis (best-effort — uses dedicated tokenStatus)
+    // Token analysis (best-effort â€” uses dedicated tokenStatus)
     //
     subStatus = ShadowGetProcessToken(ProcessId, &Token);
     if (NT_SUCCESS(subStatus) && Token != NULL) {
@@ -1956,7 +1958,7 @@ ShadowStrikeValidateParentChild(
 
     //
     // First check the creating context table (captured at creation time).
-    // This is the authoritative source — not spoofable.
+    // This is the authoritative source â€” not spoofable.
     //
     Status = PsLookupProcessByProcessId(ChildId, &Process);
     if (!NT_SUCCESS(Status)) {
@@ -1984,7 +1986,7 @@ ShadowStrikeValidateParentChild(
         *IsValid = (ClaimedParentId == CreatingProcessId);
     } else {
         //
-        // No captured context — fall back to inherited (less reliable)
+        // No captured context â€” fall back to inherited (less reliable)
         //
         *IsValid = (ClaimedParentId == InheritedParentId);
     }
@@ -2017,7 +2019,7 @@ ShadowStrikeIsProcessTerminating(
     // Fallback: PsIsProcessTerminating not resolved.
     // On our target platform (Windows 10/11 x64) this should never happen.
     // PsGetProcessExitTime(VOID) only returns the *current* process's exit
-    // time — it cannot query an arbitrary PEPROCESS, so it is not usable here.
+    // time â€” it cannot query an arbitrary PEPROCESS, so it is not usable here.
     // Conservative default: assume terminating to prevent use-after-free.
     //
     return TRUE;
@@ -2275,7 +2277,7 @@ ShadowStrikeProcessHasPrivilege(
     }
 
     //
-    // Get primary token — safe even on terminating processes as long
+    // Get primary token â€” safe even on terminating processes as long
     // as we hold an EPROCESS reference, but we check anyway above.
     //
     Token = PsReferencePrimaryToken(Process);
@@ -2699,7 +2701,7 @@ ShadowStrikeGetThreadStartAddress(
 // ============================================================================
 
 //
-// SeGetCachedSigningLevel — exported by ntoskrnl but not declared in WDK headers.
+// SeGetCachedSigningLevel â€” exported by ntoskrnl but not declared in WDK headers.
 // Returns the Code Integrity cached signing level for a file object.
 // Available on Windows 8.1+ (NTDDI_WINBLUE).
 //
@@ -2740,7 +2742,7 @@ ShadowpMapSigningLevelToSignerType(
         default:
             //
             // Enterprise, Developer, CodeGen, Custom, DynamicCodegen
-            // — signed but not a well-known category
+            // â€” signed but not a well-known category
             //
             if (SigningLevel >= SE_SIGNING_LEVEL_ENTERPRISE) {
                 return ShadowSignerAuthenticode;
@@ -2779,7 +2781,7 @@ ShadowStrikeValidateProcessSignature(
     }
 
     //
-    // Validate process ID — reject NULL and idle process (PID 0)
+    // Validate process ID â€” reject NULL and idle process (PID 0)
     //
     if (!ShadowStrikeIsValidProcessId(ProcessId)) {
         return STATUS_INVALID_PARAMETER;
@@ -2842,7 +2844,7 @@ ShadowStrikeValidateProcessSignature(
 
     if (NT_SUCCESS(Status) && Protection.Type != PsProtectedTypeNone) {
         //
-        // Protected process — determine signer from PPL info
+        // Protected process â€” determine signer from PPL info
         //
         *IsSigned = TRUE;
         if (SignerType != NULL) {
@@ -2880,7 +2882,7 @@ ShadowStrikeValidateProcessSignature(
     }
 
     //
-    // ProcessProtectionInformation may fail on older OS — not fatal.
+    // ProcessProtectionInformation may fail on older OS â€” not fatal.
     // Fall through to image-based signing check.
     //
 
@@ -2905,7 +2907,7 @@ ShadowStrikeValidateProcessSignature(
 
     if (!NT_SUCCESS(Status)) {
         //
-        // Cannot obtain file object — process may be exiting or
+        // Cannot obtain file object â€” process may be exiting or
         // have no image section (e.g. minimal processes).
         // Return success with IsSigned = FALSE (unknown signing status).
         //
@@ -2941,7 +2943,7 @@ ShadowStrikeValidateProcessSignature(
         } else if (Status == STATUS_NOT_FOUND ||
                    Status == STATUS_INVALID_INFO_CLASS) {
             //
-            // No cached signing level — image was not validated by CI.
+            // No cached signing level â€” image was not validated by CI.
             // Treat as unsigned. This is not an error condition.
             //
             Status = STATUS_SUCCESS;

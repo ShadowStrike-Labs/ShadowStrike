@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -33,7 +35,7 @@
     - EX_PUSH_LOCK used for all list/hash protection.
     - EX_RUNDOWN_REF used for safe shutdown draining.
     - Periodic analysis runs at PASSIVE_LEVEL via work item.
-    - No spin locks — beacon samples protected by push locks.
+    - No spin locks â€” beacon samples protected by push locks.
 
     Copyright (c) ShadowStrike Team
 --*/
@@ -90,7 +92,7 @@ typedef enum _C2_TYPE {
 } C2_TYPE;
 
 //=============================================================================
-// C2 Indicators (bitmask — use InterlockedOr for concurrent updates)
+// C2 Indicators (bitmask â€” use InterlockedOr for concurrent updates)
 //=============================================================================
 
 typedef enum _C2_INDICATORS {
@@ -172,7 +174,7 @@ typedef struct _C2_JA3_FINGERPRINT {
 
 typedef struct _C2_DESTINATION {
     //
-    // Reference counting — must be first for clarity
+    // Reference counting â€” must be first for clarity
     //
     volatile LONG RefCount;
 
@@ -197,20 +199,20 @@ typedef struct _C2_DESTINATION {
     LARGE_INTEGER LastSeen;
 
     //
-    // Beacon samples — protected by SampleLock (push lock, <= APC_LEVEL)
+    // Beacon samples â€” protected by SampleLock (push lock, <= APC_LEVEL)
     //
     LIST_ENTRY BeaconSamples;
     EX_PUSH_LOCK SampleLock;
     volatile LONG SampleCount;
 
     //
-    // Analysis results — written only under DestinationLock exclusive
+    // Analysis results â€” written only under DestinationLock exclusive
     //
     C2_BEACON_ANALYSIS BeaconAnalysis;
     C2_JA3_FINGERPRINT JA3Fingerprint;
 
     //
-    // C2 detection — Indicators updated via InterlockedOr
+    // C2 detection â€” Indicators updated via InterlockedOr
     //
     C2_TYPE DetectedType;
     volatile LONG Indicators;
@@ -218,7 +220,7 @@ typedef struct _C2_DESTINATION {
     BOOLEAN IsConfirmedC2;
 
     //
-    // Associated processes — protected by DestinationLock
+    // Associated processes â€” protected by DestinationLock
     //
     HANDLE AssociatedProcesses[16];
     ULONG ProcessCount;
@@ -341,18 +343,18 @@ typedef struct _C2_DETECTION_RESULT {
 } C2_DETECTION_RESULT, *PC2_DETECTION_RESULT;
 
 //=============================================================================
-// C2 Detector (opaque to callers — internal layout in .c)
+// C2 Detector (opaque to callers â€” internal layout in .c)
 //=============================================================================
 
 typedef struct _C2_DETECTOR {
     //
-    // Shutdown synchronization — rundown reference
+    // Shutdown synchronization â€” rundown reference
     //
     EX_RUNDOWN_REF RundownRef;
     volatile LONG Initialized;
 
     //
-    // Destination tracking — single push lock protects list + hash
+    // Destination tracking â€” single push lock protects list + hash
     //
     LIST_ENTRY DestinationList;
     EX_PUSH_LOCK DestinationLock;
@@ -385,13 +387,13 @@ typedef struct _C2_DETECTOR {
     volatile LONG KnownJA3Count;
 
     //
-    // Analysis timer — managed by TimerManager at PASSIVE_LEVEL
+    // Analysis timer â€” managed by TimerManager at PASSIVE_LEVEL
     //
     ULONG AnalysisTimerId;
     ULONG AnalysisIntervalMs;
 
     //
-    // Cleanup event — signaled when cleanup work item completes
+    // Cleanup event â€” signaled when cleanup work item completes
     //
     KEVENT CleanupCompleteEvent;
     volatile LONG CleanupInProgress;

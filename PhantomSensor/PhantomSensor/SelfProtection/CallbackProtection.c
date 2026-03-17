@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -137,12 +139,12 @@ typedef struct _CP_SHA256_CTX {
 
 typedef struct _CP_CALLBACK_ENTRY_INTERNAL {
     //
-    // List linkage — main ordered list
+    // List linkage â€” main ordered list
     //
     LIST_ENTRY ListEntry;
 
     //
-    // Hash table linkage — fast lookup by Registration pointer
+    // Hash table linkage â€” fast lookup by Registration pointer
     //
     LIST_ENTRY HashEntry;
     ULONG HashBucket;
@@ -222,7 +224,7 @@ struct _CP_PROTECTOR {
     PVOID TamperContext;
 
     //
-    // Periodic verification via TimerManager → system thread
+    // Periodic verification via TimerManager â†’ system thread
     //
     ULONG VerifyTimerId;
     ULONG VerifyIntervalMs;
@@ -256,7 +258,7 @@ struct _CP_PROTECTOR {
 };
 
 // ============================================================================
-// PUSH LOCK WRAPPERS — Mandatory KeEnterCriticalRegion bracketing
+// PUSH LOCK WRAPPERS â€” Mandatory KeEnterCriticalRegion bracketing
 // ============================================================================
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -612,7 +614,7 @@ CppHashPointer(
 {
     ULONG_PTR val = (ULONG_PTR)Ptr;
     //
-    // FNV-1a-style mix for pointer → bucket index.
+    // FNV-1a-style mix for pointer â†’ bucket index.
     // Shift right 4 to discard alignment bits.
     //
     val = val >> 4;
@@ -1272,7 +1274,7 @@ CpVerifyAll(
 
     //
     // Phase 2: Verify each entry outside the lock at PASSIVE_LEVEL.
-    // No data race — we hold a ref on each entry so it won't be freed.
+    // No data race â€” we hold a ref on each entry so it won't be freed.
     // Verification-specific fields (WasTampered, TamperCount, etc.) are
     // written exclusively by the verification path, which is single-threaded
     // (VerifyPending gate ensures only one work item at a time).
@@ -1382,7 +1384,7 @@ CpGetStatistics(
 }
 
 // ============================================================================
-// PRIVATE — SINGLE ENTRY VERIFICATION
+// PRIVATE â€” SINGLE ENTRY VERIFICATION
 // ============================================================================
 
 /**
@@ -1410,7 +1412,7 @@ CppVerifySingleEntry(
 }
 
 // ============================================================================
-// PRIVATE — CALLBACK RESTORATION
+// PRIVATE â€” CALLBACK RESTORATION
 // ============================================================================
 
 /**
@@ -1514,7 +1516,7 @@ CppRestoreCallback(
 }
 
 // ============================================================================
-// PRIVATE — TAMPER NOTIFICATION
+// PRIVATE â€” TAMPER NOTIFICATION
 // ============================================================================
 
 /**
@@ -1545,11 +1547,11 @@ CppNotifyTamper(
 }
 
 // ============================================================================
-// PRIVATE — TIMER CALLBACK / WORKER THREAD
+// PRIVATE â€” TIMER CALLBACK / WORKER THREAD
 // ============================================================================
 
 /**
- * TimerManager callback — signals the system thread to perform
+ * TimerManager callback â€” signals the system thread to perform
  * PASSIVE_LEVEL verification. TmFlag_WorkItemCallback ensures this
  * runs at PASSIVE_LEVEL via work item, but we keep it lightweight
  * and delegate the real work to the dedicated thread.
@@ -1570,14 +1572,14 @@ CppVerifyTimerCallback(
 
     //
     // Signal the system thread to run verification.
-    // The thread handles its own serialization — SynchronizationEvent
+    // The thread handles its own serialization â€” SynchronizationEvent
     // auto-resets, so duplicate signals are harmlessly absorbed.
     //
     KeSetEvent(&prot->VerifyWakeEvent, IO_NO_INCREMENT, FALSE);
 }
 
 /**
- * System thread — runs at PASSIVE_LEVEL. Waits on VerifyWakeEvent,
+ * System thread â€” runs at PASSIVE_LEVEL. Waits on VerifyWakeEvent,
  * performs SHA-256 verification when signaled by the timer callback.
  * Terminates cleanly when TerminateThread is set.
  */

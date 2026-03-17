@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -132,7 +134,7 @@ typedef struct _DX_PATTERN {
 } DX_PATTERN, *PDX_PATTERN;
 
 //=============================================================================
-// Pattern Match Result (value copy — safe after release)
+// Pattern Match Result (value copy â€” safe after release)
 //=============================================================================
 
 typedef struct _DX_PATTERN_MATCH {
@@ -170,7 +172,7 @@ typedef struct _DX_TRANSFER_CONTEXT {
     BOOLEAN IsEncoded;
 
     //
-    // Pattern match snapshots — stores copies of category/sensitivity,
+    // Pattern match snapshots â€” stores copies of category/sensitivity,
     // not raw pointers to pattern objects (avoids dangling pointer).
     //
     struct {
@@ -238,7 +240,7 @@ typedef struct _DX_ALERT {
 //=============================================================================
 
 //
-// DX_DETECTOR is opaque — consumers receive PDX_DETECTOR but cannot
+// DX_DETECTOR is opaque â€” consumers receive PDX_DETECTOR but cannot
 // access internal fields. The full structure is defined only in
 // DataExfiltration.c.
 //

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -517,7 +519,7 @@ Return Value:
     RtlZeroMemory(Internal, sizeof(HGD_DETECTOR));
 
     //
-    // Initialize rundown protection (active state — acquisitions succeed)
+    // Initialize rundown protection (active state â€” acquisitions succeed)
     //
     ExInitializeRundownProtection(&Internal->RundownRef);
 
@@ -636,9 +638,9 @@ Routine Description:
     Blocks until all pending work items complete, then frees all resources.
 
     Shutdown sequence:
-    1. Signal intent (ShutdownRequested — timer callback fast-exit)
+    1. Signal intent (ShutdownRequested â€” timer callback fast-exit)
     2. Cancel cleanup timer (TmCancel Wait=TRUE drains in-flight callback)
-    3. ExWaitForRundownProtectionRelease — drains all public API callers
+    3. ExWaitForRundownProtectionRelease â€” drains all public API callers
     4. Free all resources (no concurrent access possible)
 
 Arguments:
@@ -659,7 +661,7 @@ Arguments:
         "HgdShutdown: Shutting down Heaven's Gate detector");
 
     //
-    // Step 1: Signal shutdown intent — timer callback checks this for fast exit
+    // Step 1: Signal shutdown intent â€” timer callback checks this for fast exit
     //
     InterlockedExchange8((volatile CHAR*)&Detector->ShutdownRequested, TRUE);
 
@@ -684,7 +686,7 @@ Arguments:
     ExWaitForRundownProtectionRelease(&Detector->RundownRef);
 
     //
-    // Step 4: All callers drained, timer stopped — safe to free everything.
+    // Step 4: All callers drained, timer stopped â€” safe to free everything.
     // No locks needed since no concurrent access is possible.
     //
 
@@ -725,7 +727,7 @@ Arguments:
         "HgdShutdown: Heaven's Gate detector shutdown complete");
 
     //
-    // Free detector structure (must be last — no field access after this)
+    // Free detector structure (must be last â€” no field access after this)
     //
     ShadowStrikeFreePoolWithTag(Detector, HGD_POOL_TAG);
 }
@@ -1422,7 +1424,7 @@ Return Value:
 
     if (!NT_SUCCESS(Status)) {
         //
-        // Cannot read return address — security-conservative: treat as suspicious.
+        // Cannot read return address â€” security-conservative: treat as suspicious.
         // This catches memory evasion techniques (guard pages, unmapped code).
         //
         *IsSuspicious = TRUE;
@@ -2218,7 +2220,7 @@ Routine Description:
         //
         // Direct RETF preceded by PUSH 0x33
         //
-        if (Buffer[i] == 0xCB && i >= 2) {
+        if (i >= 2 && Buffer[i] == 0xCB) {
             if (Buffer[i - 2] == 0x6A && Buffer[i - 1] == 0x33) {
                 *PatternOffset = i - 2;
                 return TRUE;
@@ -2820,7 +2822,7 @@ HgdpCleanupTimerCallback(
 Routine Description:
     TimerManager periodic callback.
     Runs at PASSIVE_LEVEL (TmFlag_WorkItemCallback), so push locks
-    and PEB walking are safe — no intermediate work-item needed.
+    and PEB walking are safe â€” no intermediate work-item needed.
     
     Acquires rundown protection for defense-in-depth: if TmCancel
     ever races with resource freeing, rundown prevents UAF.

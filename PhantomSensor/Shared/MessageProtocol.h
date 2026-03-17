@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -199,7 +201,7 @@ typedef struct _SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION {
 } SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION, *PSHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION;
 
 // ============================================================================
-// DATA PUSH PAYLOAD STRUCTURES (User-Mode → Kernel)
+// DATA PUSH PAYLOAD STRUCTURES (User-Mode â†’ Kernel)
 // ============================================================================
 //
 // These structures define the wire format for data push messages from the
@@ -263,7 +265,7 @@ typedef struct _SHADOWSTRIKE_PUSH_HASH_ENTRY {
 //
 // 11. Pattern Database Push Entry (FilterMessageType_PushPatternDatabase)
 //
-// Same wire format as hash entry — patterns are loaded via IOCMatcher
+// Same wire format as hash entry â€” patterns are loaded via IOCMatcher
 // with IOM_IOC_TYPE set to pattern type.
 //
 typedef SHADOWSTRIKE_PUSH_HASH_ENTRY   SHADOWSTRIKE_PUSH_PATTERN_ENTRY;
@@ -272,7 +274,7 @@ typedef PSHADOWSTRIKE_PUSH_HASH_ENTRY  PSHADOWSTRIKE_PUSH_PATTERN_ENTRY;
 //
 // 12. Signature Database Push Entry (FilterMessageType_PushSignatureDatabase)
 //
-// Same wire format — signatures routed via IOCMatcher.
+// Same wire format â€” signatures routed via IOCMatcher.
 //
 typedef SHADOWSTRIKE_PUSH_HASH_ENTRY   SHADOWSTRIKE_PUSH_SIGNATURE_ENTRY;
 typedef PSHADOWSTRIKE_PUSH_HASH_ENTRY  PSHADOWSTRIKE_PUSH_SIGNATURE_ENTRY;

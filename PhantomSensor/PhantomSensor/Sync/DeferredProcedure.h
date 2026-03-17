@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -34,10 +36,10 @@
         - Inline context capped at 64 bytes; larger payloads use external API.
 
     IRQL contract:
-        DpcInitialize   — PASSIVE_LEVEL (INIT section)
-        DpcShutdown     — PASSIVE_LEVEL (PAGE section)
-        DpcQueue*       — any IRQL <= DISPATCH_LEVEL
-        DpcGetStatistics— any IRQL <= DISPATCH_LEVEL
+        DpcInitialize   â€” PASSIVE_LEVEL (INIT section)
+        DpcShutdown     â€” PASSIVE_LEVEL (PAGE section)
+        DpcQueue*       â€” any IRQL <= DISPATCH_LEVEL
+        DpcGetStatisticsâ€” any IRQL <= DISPATCH_LEVEL
 
     Copyright (c) ShadowStrike Team
 --*/
@@ -58,7 +60,7 @@ extern "C" {
 // Pool Tags
 // ============================================================================
 
-#define DPC_POOL_TAG    'cPDd'  // dDPc — DPC pool
+#define DPC_POOL_TAG    'cPDd'  // dDPc â€” DPC pool
 
 // ============================================================================
 // Configuration Constants
@@ -81,7 +83,7 @@ extern "C" {
 
 typedef enum _DPC_TYPE {
     DpcType_Normal = 0,             /**< Normal DPC, medium importance.       */
-    DpcType_Threaded,               /**< Threaded DPC — may lower to PASSIVE. */
+    DpcType_Threaded,               /**< Threaded DPC â€” may lower to PASSIVE. */
     DpcType_HighImportance,         /**< Queued at front of DPC queue.        */
     DpcType_LowImportance           /**< Queued at back of DPC queue.         */
 } DPC_TYPE;
@@ -131,7 +133,7 @@ typedef VOID (*DPC_COMPLETION_CALLBACK)(
 
 typedef struct DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT) _DPC_OBJECT {
 
-    /** Free-list linkage — MUST be first for SLIST alignment. */
+    /** Free-list linkage â€” MUST be first for SLIST alignment. */
     SLIST_ENTRY FreeListEntry;
 
     /** Kernel DPC object. */
@@ -151,7 +153,7 @@ typedef struct DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT) _DPC_OBJECT {
     /** Inline context for small payloads (<= DPC_MAX_CONTEXT_SIZE). */
     UCHAR InlineContext[DPC_MAX_CONTEXT_SIZE];
 
-    /** External context pointer — caller manages lifetime. */
+    /** External context pointer â€” caller manages lifetime. */
     PVOID ExternalContext;
 
     ULONG ContextSize;
@@ -187,7 +189,7 @@ typedef struct DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT) _DPC_MANAGER {
     volatile LONG AllocatedCount;
     ULONG PoolSize;
 
-    /** Contiguous backing array — freed in DpcShutdown. */
+    /** Contiguous backing array â€” freed in DpcShutdown. */
     PDPC_OBJECT PoolMemory;
     SIZE_T PoolMemorySize;
 
@@ -225,7 +227,7 @@ typedef struct _DPC_OPTIONS {
 } DPC_OPTIONS, *PDPC_OPTIONS;
 
 // ============================================================================
-// Public API — Initialization
+// Public API â€” Initialization
 // ============================================================================
 
 /**
@@ -259,7 +261,7 @@ DpcShutdown(
     );
 
 // ============================================================================
-// Public API — DPC Queue Operations
+// Public API â€” DPC Queue Operations
 // ============================================================================
 
 /**
@@ -324,7 +326,7 @@ DpcQueueThreaded(
     );
 
 // ============================================================================
-// Public API — Statistics
+// Public API â€” Statistics
 // ============================================================================
 
 typedef struct _DPC_STATISTICS {
@@ -340,7 +342,7 @@ typedef struct _DPC_STATISTICS {
 } DPC_STATISTICS, *PDPC_STATISTICS;
 
 /**
- * Snapshot current statistics.  Not collectively atomic — individual
+ * Snapshot current statistics.  Not collectively atomic â€” individual
  * counters are read atomically but the snapshot may be slightly skewed.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -194,7 +196,7 @@ static FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
         FLT_STREAM_CONTEXT,                         // ContextType
         0,                                          // Flags
         ShadowStrikeStreamContextCleanup,           // ContextCleanupCallback
-        FLT_VARIABLE_SIZED_CONTEXTS,                // Size — PostCreate specifies exact size
+        FLT_VARIABLE_SIZED_CONTEXTS,                // Size â€” PostCreate specifies exact size
         SHADOWSTRIKE_STREAM_CTX_TAG,                // PoolTag
         NULL,                                       // ContextAllocateCallback
         NULL,                                       // ContextFreeCallback
@@ -205,30 +207,30 @@ static FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
         FLT_VOLUME_CONTEXT,                         // ContextType
         0,                                          // Flags
         ShadowStrikeVolumeContextCleanup,           // ContextCleanupCallback
-        FLT_VARIABLE_SIZED_CONTEXTS,                // Size — FSC specifies exact size
-        'xCVS',                                     // PoolTag — SVCx (Volume Context)
+        FLT_VARIABLE_SIZED_CONTEXTS,                // Size â€” FSC specifies exact size
+        'xCVS',                                     // PoolTag â€” SVCx (Volume Context)
         NULL,                                       // ContextAllocateCallback
         NULL,                                       // ContextFreeCallback
         NULL                                        // Reserved
     },
 
     //
-    // Stream Handle Context — per-open-handle tracking (PostCreate.c)
+    // Stream Handle Context â€” per-open-handle tracking (PostCreate.c)
     // Used for per-handle write/delete/rename tracking
     //
     {
         FLT_STREAMHANDLE_CONTEXT,                   // ContextType
         0,                                          // Flags
         NULL,                                       // ContextCleanupCallback (no special cleanup needed)
-        FLT_VARIABLE_SIZED_CONTEXTS,                // Size — PostCreate specifies exact size
-        'hHCP',                                     // PoolTag — PCHh (Handle Context)
+        FLT_VARIABLE_SIZED_CONTEXTS,                // Size â€” PostCreate specifies exact size
+        'hHCP',                                     // PoolTag â€” PCHh (Handle Context)
         NULL,                                       // ContextAllocateCallback
         NULL,                                       // ContextFreeCallback
         NULL                                        // Reserved
     },
 
     //
-    // Instance Context — per-instance scan stats, policy, and volume capabilities
+    // Instance Context â€” per-instance scan stats, policy, and volume capabilities
     // SHADOW_INSTANCE_CONTEXT: signature validation, ERESOURCE sync,
     // detailed verdict counters, avg scan time, activity timestamps
     //
@@ -236,15 +238,15 @@ static FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
         FLT_INSTANCE_CONTEXT,                       // ContextType
         0,                                          // Flags
         ShadowCleanupInstanceContext,               // ContextCleanupCallback
-        sizeof(SHADOW_INSTANCE_CONTEXT),            // Size — fixed size allocation
-        SHADOW_INSTANCE_TAG,                        // PoolTag — 'iSSx'
+        sizeof(SHADOW_INSTANCE_CONTEXT),            // Size â€” fixed size allocation
+        SHADOW_INSTANCE_TAG,                        // PoolTag â€” 'iSSx'
         NULL,                                       // ContextAllocateCallback
         NULL,                                       // ContextFreeCallback
         NULL                                        // Reserved
     },
 
     //
-    // Transaction Context — per-transaction tracking for KTM commit/rollback
+    // Transaction Context â€” per-transaction tracking for KTM commit/rollback
     // SHADOW_KTM_TRANSACTION_CONTEXT: stores transaction GUID + originating PID
     // Set by ShadowKtmEnlistInTransaction, used by ShadowKtmNotificationCallback
     //
@@ -252,8 +254,8 @@ static FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
         FLT_TRANSACTION_CONTEXT,                    // ContextType
         0,                                          // Flags
         NULL,                                       // ContextCleanupCallback (no dynamic allocs)
-        sizeof(SHADOW_KTM_TRANSACTION_CONTEXT),     // Size — fixed size
-        SHADOW_KTM_TXN_CTX_TAG,                     // PoolTag — 'kSTc'
+        sizeof(SHADOW_KTM_TRANSACTION_CONTEXT),     // Size â€” fixed size
+        SHADOW_KTM_TXN_CTX_TAG,                     // PoolTag â€” 'kSTc'
         NULL,                                       // ContextAllocateCallback
         NULL,                                       // ContextFreeCallback
         NULL                                        // Reserved
@@ -713,7 +715,7 @@ ShadowStrikeQueueRescan(
 
     //
     // Build a FILE_SCAN_REQUEST with the variable-length file path appended.
-    // This is the standard scan request protocol — user-mode opens and scans
+    // This is the standard scan request protocol â€” user-mode opens and scans
     // the file independently based on the path we provide.
     //
     reqSize = sizeof(FILE_SCAN_REQUEST) + copyLen;
@@ -759,7 +761,7 @@ ShadowStrikeQueueRescan(
 }
 
 // ============================================================================
-// NOTE: ShadowStrikeDeferredScanWorker removed — zero callers.
+// NOTE: ShadowStrikeDeferredScanWorker removed â€” zero callers.
 // Rescan functionality is handled by ShadowStrikeQueueRescan above.
 // ============================================================================
 

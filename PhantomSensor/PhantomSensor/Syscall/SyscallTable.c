@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -25,10 +27,10 @@
  *
  * Implements production-quality syscall table management with:
  * - Hardcoded syscall number tables for Windows 10/11 x64 builds
- * - No user-mode memory access — all data is kernel-side
- * - No SSDT pointer exposure — KASLR protection preserved
+ * - No user-mode memory access â€” all data is kernel-side
+ * - No SSDT pointer exposure â€” KASLR protection preserved
  * - Hash-based O(1) lookup by number and by name
- * - Read-only after initialization — no TOCTOU, no write-side locking
+ * - Read-only after initialization â€” no TOCTOU, no write-side locking
  * - Magic-validated pointers on all public API entries
  * - Safe at IRQL <= DISPATCH_LEVEL for lookups
  *
@@ -67,7 +69,7 @@
 
 /**
  * @brief Static definition of a syscall for table population.
- * These are compiled into the driver — no runtime memory parsing needed.
+ * These are compiled into the driver â€” no runtime memory parsing needed.
  */
 typedef struct _SST_STATIC_DEFINITION {
     ULONG Number;
@@ -90,7 +92,7 @@ typedef struct _SST_BUILD_RANGE {
 } SST_BUILD_RANGE;
 
 // ============================================================================
-// KNOWN SYSCALL TABLES — WINDOWS 10/11 x64
+// KNOWN SYSCALL TABLES â€” WINDOWS 10/11 x64
 // ============================================================================
 //
 // These tables contain security-critical syscalls that ShadowStrike monitors.
@@ -168,7 +170,7 @@ static const SST_STATIC_DEFINITION g_SyscallsWin10_14393[] = {
 };
 
 static const SST_STATIC_DEFINITION g_SyscallsWin11_22000[] = {
-    /* Process manipulation — some numbers shifted in Win11 */
+    /* Process manipulation â€” some numbers shifted in Win11 */
     { 0x00B5, "NtCreateProcess",            8,  SstCategory_Process, SstRisk_Critical,  SST_FLAG_INJECTION_RISK | SST_FLAG_CROSS_PROCESS },
     { 0x00B4, "NtCreateProcessEx",          9,  SstCategory_Process, SstRisk_Critical,  SST_FLAG_INJECTION_RISK | SST_FLAG_CROSS_PROCESS },
     { 0x00C9, "NtCreateUserProcess",       11,  SstCategory_Process, SstRisk_Critical,  SST_FLAG_INJECTION_RISK },
@@ -275,7 +277,7 @@ typedef struct _SST_TABLE_INTERNAL {
     /** OS version detected at init */
     ULONG OsBuildNumber;
 
-    /** Flat array of all entries — populated at init, immutable after */
+    /** Flat array of all entries â€” populated at init, immutable after */
     SST_ENTRY Entries[SST_MAX_ENTRIES];
 
     /** Number of populated entries */
@@ -357,7 +359,7 @@ SstpStrCmpInsensitive(
 #pragma alloc_text(PAGE, SstShutdown)
 #endif
 /*
- * Lookup functions are NOT placed in PAGE section — they must be safe
+ * Lookup functions are NOT placed in PAGE section â€” they must be safe
  * at DISPATCH_LEVEL because the table is in NonPagedPoolNx and
  * lookups are lock-free (read-only after init).
  */
@@ -557,7 +559,7 @@ SstpPopulateFromBuildRange(
         entry->Flags = def->Flags;
         entry->Reserved = 0;
 
-        /* Safe string copy — always null-terminated */
+        /* Safe string copy â€” always null-terminated */
         RtlStringCbCopyA(entry->Name, sizeof(entry->Name), def->Name);
 
         /* Initialize hash links */
@@ -639,7 +641,7 @@ SstInitialize(
      * Allocate from NonPagedPoolNx:
      * - Lookup functions are safe at DISPATCH_LEVEL
      * - No paging faults during hot-path lookups
-     * - Immutable after init — no locking needed
+     * - Immutable after init â€” no locking needed
      */
     tbl = (PSST_TABLE_INTERNAL)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
@@ -695,7 +697,7 @@ SstShutdown(
     }
 
     /*
-     * The table is immutable after init — no active writers to drain.
+     * The table is immutable after init â€” no active writers to drain.
      * Callers must ensure no concurrent lookups are in-flight when
      * calling shutdown (driver unload serialization handles this).
      */

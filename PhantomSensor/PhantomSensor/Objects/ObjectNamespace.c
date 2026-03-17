@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -110,7 +112,7 @@ RtlSetSaclSecurityDescriptor(
 #endif
 
 // ============================================================================
-// GLOBAL STATE (file-scoped — NOT exported in header)
+// GLOBAL STATE (file-scoped â€” NOT exported in header)
 // ============================================================================
 
 static SHADOW_NAMESPACE_STATE g_NamespaceState = { 0 };
@@ -155,7 +157,7 @@ ShadowpFreeSid(
     );
 
 // ============================================================================
-// ALLOC_TEXT — place paged functions in PAGE section
+// ALLOC_TEXT â€” place paged functions in PAGE section
 // ============================================================================
 
 #ifdef ALLOC_PRAGMA
@@ -359,14 +361,14 @@ ShadowCreatePrivateNamespace(
     );
 
     if (NT_SUCCESS(status)) {
-        // Directory created by us — proceed.
+        // Directory created by us â€” proceed.
     } else if (status == STATUS_OBJECT_NAME_COLLISION) {
         //
         // Directory already exists. Open it, then verify ownership
         // to prevent namespace squatting attacks.
         //
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Directory already exists — verifying owner\n");
+                   "[ShadowStrike] Directory already exists â€” verifying owner\n");
 
         //
         // Remove OBJ_PERMANENT for the open (we didn't create it).
@@ -451,7 +453,7 @@ ShadowCreatePrivateNamespace(
 
     //
     // STEP 6: Mark namespace as initialized.
-    // RundownInitialized is set HERE — after all state is valid — so that
+    // RundownInitialized is set HERE â€” after all state is valid â€” so that
     // ShadowReferenceNamespace cannot acquire protection against incomplete state.
     //
     KeQuerySystemTime(&state->CreationTime);
@@ -507,7 +509,7 @@ ShadowDestroyPrivateNamespace(
     // ExWaitForRundownProtectionRelease blocks until all
     // ExAcquireRundownProtection holders call ExReleaseRundownProtection.
     // After this returns, ExAcquireRundownProtection will return FALSE
-    // for all future callers — no new work can begin.
+    // for all future callers â€” no new work can begin.
     //
     if (state->RundownInitialized) {
         ExWaitForRundownProtectionRelease(&state->RundownRef);
@@ -646,7 +648,7 @@ ShadowCreateNamespaceObject(
              ObjectType == *PsThreadType ||
              ObjectType == *SeTokenObjectType) {
         //
-        // Dangerous or invalid object types — deny creation.
+        // Dangerous or invalid object types â€” deny creation.
         //
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "[ShadowStrike] Denied creation of restricted object type: %p\n",
@@ -676,7 +678,7 @@ ShadowCreateNamespaceObject(
             *ObjectPointer = objectPtr;
         } else {
             //
-            // Reference failed — close the handle to avoid leak.
+            // Reference failed â€” close the handle to avoid leak.
             //
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "[ShadowStrike] ObReferenceObjectByHandle failed: 0x%X "
@@ -728,7 +730,7 @@ ShadowIsNamespaceInitialized(
 /**
  * @brief Acquire rundown protection on the namespace.
  *
- * Uses EX_RUNDOWN_REF — no TOCTOU races, no manual refcount.
+ * Uses EX_RUNDOWN_REF â€” no TOCTOU races, no manual refcount.
  * Returns FALSE after ExWaitForRundownProtectionRelease has been called.
  */
 BOOLEAN
@@ -927,7 +929,7 @@ ShadowpBuildSecurityDescriptor(
     if (!NT_SUCCESS(status)) goto cleanup;
 
     //
-    // Mandatory label ACE — CRITICAL for security. Failure is fatal.
+    // Mandatory label ACE â€” CRITICAL for security. Failure is fatal.
     //
     status = RtlAddMandatoryAce(
         sacl,
@@ -944,7 +946,7 @@ ShadowpBuildSecurityDescriptor(
     }
 
     //
-    // Audit ACE — non-fatal (nice to have).
+    // Audit ACE â€” non-fatal (nice to have).
     //
     {
         NTSTATUS auditStatus = RtlAddAuditAccessAceEx(
@@ -991,7 +993,7 @@ ShadowpBuildSecurityDescriptor(
     if (!NT_SUCCESS(status)) goto cleanup;
 
     //
-    // SUCCESS — transfer ownership.
+    // SUCCESS â€” transfer ownership.
     //
     *SecurityDescriptor = selfRelativeSD;
     *DescriptorSize = selfRelativeSize;
@@ -1104,7 +1106,7 @@ ShadowpVerifyDirectoryOwner(
     //
     if (!RtlEqualSid(ownerSid, systemSid)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Directory owner is NOT SYSTEM — rejecting\n");
+                   "[ShadowStrike] Directory owner is NOT SYSTEM â€” rejecting\n");
         status = STATUS_ACCESS_DENIED;
     } else {
         status = STATUS_SUCCESS;
@@ -1194,11 +1196,11 @@ ShadowpVerifyDirectoryDacl(
     }
 
     //
-    // NULL DACL means full access to everyone — reject immediately.
+    // NULL DACL means full access to everyone â€” reject immediately.
     //
     if (!daclPresent || dacl == NULL) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Directory has NULL DACL (unrestricted access) — rejecting\n");
+                   "[ShadowStrike] Directory has NULL DACL (unrestricted access) â€” rejecting\n");
         ExFreePoolWithTag(sd, SHADOW_NAMESPACE_TAG);
         return STATUS_ACCESS_DENIED;
     }
@@ -1248,7 +1250,7 @@ ShadowpVerifyDirectoryDacl(
                 !RtlEqualSid(aceSid, adminsSid)) {
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                            "[ShadowStrike] Directory DACL contains non-privileged "
-                           "ACCESS_ALLOWED ACE (index %u) — rejecting\n", i);
+                           "ACCESS_ALLOWED ACE (index %u) â€” rejecting\n", i);
                 acceptable = FALSE;
                 break;
             }
@@ -1306,7 +1308,7 @@ ShadowpCleanupState(
 
     //
     // Free self-relative security descriptor (single alloc contains
-    // embedded DACL + SACL — no other ACL allocations to free).
+    // embedded DACL + SACL â€” no other ACL allocations to free).
     //
     if (State->SecurityDescriptorAllocated && State->DirectorySecurityDescriptor != NULL) {
         ExFreePoolWithTag(State->DirectorySecurityDescriptor, SHADOW_NAMESPACE_SD_TAG);

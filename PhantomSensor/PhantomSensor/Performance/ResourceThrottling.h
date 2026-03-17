@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -254,7 +256,7 @@ typedef struct _RT_RESOURCE_STATE {
     ULONG RateHistoryIndex;
     ULONG RateHistorySamples;
 
-    /// Per-resource spin lock — safe at DISPATCH_LEVEL (DPC)
+    /// Per-resource spin lock â€” safe at DISPATCH_LEVEL (DPC)
     KSPIN_LOCK ResourceLock;
 
 } RT_RESOURCE_STATE, *PRT_RESOURCE_STATE;
@@ -365,7 +367,7 @@ typedef struct _RT_THROTTLER {
     UCHAR Reserved;
     ULONG Magic;
 
-    /// Set to 1 before ExWaitForRundownProtectionRelease — safe to read at any IRQL
+    /// Set to 1 before ExWaitForRundownProtectionRelease â€” safe to read at any IRQL
     volatile LONG ShutdownFlag;
 
     /// Resource configurations (protected by per-resource ResourceLock)
@@ -377,12 +379,12 @@ typedef struct _RT_THROTTLER {
     /// Number of configured resources (Interlocked* access)
     volatile LONG ConfiguredResourceCount;
 
-    /// Callback — protected by CallbackSpinLock
+    /// Callback â€” protected by CallbackSpinLock
     PRT_THROTTLE_CALLBACK ThrottleCallback;
     PVOID CallbackContext;
     KSPIN_LOCK CallbackSpinLock;
 
-    /// Callback rundown — prevents unregister during invocation
+    /// Callback rundown â€” prevents unregister during invocation
     volatile LONG CallbackActiveCount;
 
     /// Per-process quota tracking (protected by ProcessQuotas.Lock KSPIN_LOCK)
@@ -709,7 +711,7 @@ PCWSTR RtGetStateName(_In_ RT_THROTTLE_STATE State);
  * @brief Check if throttler pointer is valid.
  *
  * Safe to call with NULL (returns FALSE).
- * NOTE: Does NOT protect against use-after-free on its own —
+ * NOTE: Does NOT protect against use-after-free on its own â€”
  * callers must ensure the pointer is still owned (not freed).
  */
 FORCEINLINE

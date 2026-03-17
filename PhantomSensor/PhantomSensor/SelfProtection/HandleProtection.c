@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -390,7 +392,7 @@ HpInitialize(
     InterlockedExchange(&engine->Initialized, 1);
 
     //
-    // Initialize analysis timer via TimerManager — AFTER Initialized is set
+    // Initialize analysis timer via TimerManager â€” AFTER Initialized is set
     //
     {
         PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
@@ -439,7 +441,7 @@ HpShutdown(
     }
 
     //
-    // Atomically mark as shutting down — fail if already shutdown
+    // Atomically mark as shutting down â€” fail if already shutdown
     //
     if (InterlockedCompareExchange(&Engine->Initialized, 0, 1) != 1) {
         return;
@@ -469,7 +471,7 @@ HpShutdown(
     }
 
     //
-    // Free all process contexts — must clean both list AND hash table
+    // Free all process contexts â€” must clean both list AND hash table
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->ProcessListLock);
@@ -483,7 +485,7 @@ HpShutdown(
         // Release list-membership reference. During shutdown, RefCount should
         // be 1 (no in-flight callers after Initialized=0 + spin drain), so
         // this frees immediately. If a straggler still holds a ref, the memory
-        // is freed when they release — preventing UAF.
+        // is freed when they release â€” preventing UAF.
         //
         HppReleaseProcessContext(Engine, processContext);
     }
@@ -681,7 +683,7 @@ HpAnalyzeHandleOperation(
     // Read OriginalDesiredAccess for analysis (immutable, callback-order-independent).
     // Read DesiredAccess for stripping baseline (reflects prior callbacks' stripping).
     // This ensures HandleProtection detects the original attack pattern regardless of
-    // callback registration order, while only further restricting — never widening — access.
+    // callback registration order, while only further restricting â€” never widening â€” access.
     //
     if (OperationInfo->Operation == OB_OPERATION_HANDLE_CREATE) {
         requestedAccess = OperationInfo->Parameters->CreateHandleInformation.OriginalDesiredAccess;
@@ -778,7 +780,7 @@ HpAnalyzeHandleOperation(
     }
 
     //
-    // Apply modifications — compare against pre-strip baseline, not
+    // Apply modifications â€” compare against pre-strip baseline, not
     // OriginalDesiredAccess, to avoid false positives when prior
     // ObCallbacks already stripped rights before HandleProtection ran.
     //
@@ -1301,7 +1303,7 @@ HpAnalyzeProcessHandles(
 }
 
 /**
- * @brief Find handles targeting a process — returns COPIES, not raw pointers.
+ * @brief Find handles targeting a process â€” returns COPIES, not raw pointers.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -1459,7 +1461,7 @@ HpGetStatistics(
 }
 
 /**
- * @brief Get recent events — returns COPIES of event data, not raw pointers.
+ * @brief Get recent events â€” returns COPIES of event data, not raw pointers.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -1512,10 +1514,10 @@ HpGetRecentEvents(
 // ============================================================================
 
 /**
- * @brief Process terminated — inline hash lookup to avoid self-deadlock.
+ * @brief Process terminated â€” inline hash lookup to avoid self-deadlock.
  *
  * The original code called HppFindProcessContext (which acquires ProcessHash.Lock
- * shared) while already holding ProcessHash.Lock exclusive → self-deadlock.
+ * shared) while already holding ProcessHash.Lock exclusive â†’ self-deadlock.
  * Fixed by inlining the hash lookup.
  */
 _Use_decl_annotations_
@@ -1586,7 +1588,7 @@ HpProcessTerminated(
 }
 
 /**
- * @brief Flush all tracking — cleans BOTH process list AND hash table.
+ * @brief Flush all tracking â€” cleans BOTH process list AND hash table.
  *
  * Original only removed from ProcessList, leaving dangling hash entries.
  */
@@ -1610,7 +1612,7 @@ HpFlushAllTracking(
     }
 
     //
-    // Free all process contexts — remove from BOTH list and hash
+    // Free all process contexts â€” remove from BOTH list and hash
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Engine->ProcessListLock);
@@ -1651,7 +1653,7 @@ HpFlushAllTracking(
 // ============================================================================
 
 /**
- * @brief Periodic analysis callback — runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback.
+ * @brief Periodic analysis callback â€” runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback.
  *
  * Replaces the old HppAnalysisTimerDpc which ran at DISPATCH_LEVEL.
  * PASSIVE_LEVEL execution is safe for push locks and other pageable work.
@@ -1679,7 +1681,7 @@ HppAnalysisTimerCallback(
     }
 
     //
-    // Now running at PASSIVE_LEVEL — safe to use push locks if needed.
+    // Now running at PASSIVE_LEVEL â€” safe to use push locks if needed.
     //
     HppCleanupStaleEntries(engine);
 
@@ -1748,7 +1750,7 @@ HppHashProcessId(
 // ============================================================================
 
 /**
- * @brief Find process context by PID — acquires a reference before returning.
+ * @brief Find process context by PID â€” acquires a reference before returning.
  *
  * The returned context is REFERENCE-COUNTED. Caller MUST call
  * HppReleaseProcessContext when done. This prevents use-after-free
@@ -1822,7 +1824,7 @@ HppReleaseProcessContext(
 }
 
 /**
- * @brief Create a new process context — checks for duplicates under exclusive lock.
+ * @brief Create a new process context â€” checks for duplicates under exclusive lock.
  *
  * Fixed race condition: two threads could both create contexts for the same PID.
  * Now we re-check under exclusive lock before inserting.
@@ -1873,7 +1875,7 @@ HppCreateProcessContext(
     }
 
     //
-    // Insert under exclusive lock — but first check for duplicate
+    // Insert under exclusive lock â€” but first check for duplicate
     //
     hash = HppHashProcessId(ProcessId);
     bucket = hash & HP_HASH_BUCKET_MASK;
@@ -1894,7 +1896,7 @@ HppCreateProcessContext(
 
         if (existing->ProcessId == ProcessId) {
             //
-            // Duplicate found — ref it and discard our new allocation
+            // Duplicate found â€” ref it and discard our new allocation
             //
             InterlockedIncrement(&existing->RefCount);
 
@@ -1915,7 +1917,7 @@ HppCreateProcessContext(
     }
 
     //
-    // No duplicate — insert
+    // No duplicate â€” insert
     //
     InsertTailList(&Engine->ProcessList, &context->ListEntry);
     InsertTailList(&Engine->ProcessHash.Buckets[bucket], &context->HashEntry);
@@ -2190,7 +2192,7 @@ HppRecordEvent(
     KeAcquireSpinLock(&Engine->EventHistoryLock, &oldIrql);
 
     //
-    // Evict oldest if at capacity (no Interlocked needed — we hold the spin lock)
+    // Evict oldest if at capacity (no Interlocked needed â€” we hold the spin lock)
     //
     if (Engine->EventCount >= HP_MAX_HANDLE_HISTORY) {
         PLIST_ENTRY oldest = RemoveHeadList(&Engine->EventHistory);
@@ -2210,7 +2212,7 @@ HppRecordEvent(
 // ============================================================================
 
 /**
- * @brief Notify detection callback — reads callback+context atomically under CallbackLock.
+ * @brief Notify detection callback â€” reads callback+context atomically under CallbackLock.
  */
 static VOID
 HppNotifyCallback(
@@ -2244,7 +2246,7 @@ HppNotifyCallback(
 
 /**
  * @brief Clean up stale event entries.
- * Called from DPC (DISPATCH_LEVEL) — only uses spin-lock-protected EventHistory.
+ * Called from DPC (DISPATCH_LEVEL) â€” only uses spin-lock-protected EventHistory.
  */
 static VOID
 HppCleanupStaleEntries(

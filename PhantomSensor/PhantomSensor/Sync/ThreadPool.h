@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -28,7 +30,7 @@
     - Graceful shutdown with work completion guarantees
     - Per-thread statistics and performance monitoring
     - DPC-safe scaling via IoQueueWorkItem (deferred to PASSIVE_LEVEL)
-    - Opaque internal structures — public API only
+    - Opaque internal structures â€” public API only
     
     IRQL Contract:
     - TpCreate / TpCreateDefault / TpDestroy: PASSIVE_LEVEL only
@@ -76,7 +78,7 @@ extern "C" {
 #define TP_IDLE_TIMEOUT_MS          60000   // Idle thread timeout (ms)
 
 //=============================================================================
-// Thread State (Public — read-only for callers)
+// Thread State (Public â€” read-only for callers)
 //=============================================================================
 
 typedef enum _TP_THREAD_STATE {
@@ -102,7 +104,7 @@ typedef enum _TP_THREAD_PRIORITY {
 } TP_THREAD_PRIORITY;
 
 //=============================================================================
-// Opaque Types — Internal structures defined only in ThreadPool.c
+// Opaque Types â€” Internal structures defined only in ThreadPool.c
 //=============================================================================
 
 //
@@ -131,7 +133,7 @@ typedef struct _TP_THREAD_INFO TP_THREAD_INFO, *PTP_THREAD_INFO;
 //   ThreadInfo      - Opaque per-thread info (for TpGetThreadIndex)
 //   WorkSemaphore   - Auto-decrementing semaphore signaled when work is available.
 //                     Use with KeWaitForSingleObject/KeWaitForMultipleObjects.
-//                     Do NOT call KeSetEvent on this — it is a KSEMAPHORE, not a KEVENT.
+//                     Do NOT call KeSetEvent on this â€” it is a KSEMAPHORE, not a KEVENT.
 //   ShutdownEvent   - Signals when pool is shutting down (manual-reset)
 //   ExecutorContext  - Caller-supplied context from TpSetWorkExecutor
 //
@@ -178,11 +180,11 @@ typedef struct _TP_CONFIG {
     TP_THREAD_INIT_CALLBACK InitCallback;
     TP_THREAD_CLEANUP_CALLBACK CleanupCallback;
     PVOID CallbackContext;
-    PDEVICE_OBJECT DeviceObject;    // Required for DPC→work item deferral
+    PDEVICE_OBJECT DeviceObject;    // Required for DPCâ†’work item deferral
 } TP_CONFIG, *PTP_CONFIG;
 
 //=============================================================================
-// Statistics (Public — returned by TpGetStatistics, no internal pointers)
+// Statistics (Public â€” returned by TpGetStatistics, no internal pointers)
 //=============================================================================
 
 typedef struct _TP_STATISTICS {
@@ -317,7 +319,7 @@ TpSetScaling(
     );
 
 //
-// Trigger an immediate scale evaluation (queues DPC → work item).
+// Trigger an immediate scale evaluation (queues DPC â†’ work item).
 // IRQL: <= DISPATCH_LEVEL
 //
 _IRQL_requires_max_(DISPATCH_LEVEL)

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -35,12 +37,12 @@
       - Timer starts with RefCount=2: 1 for the TimerList, 1 for creation.
       - TmpFindTimerById adds +1 (caller must TmpDereferenceTimer).
       - TmCancel releases all three references (list + creation + find).
-        If a DPC/WorkItem is in-flight, its ref keeps RefCount ≥ 1 until
+        If a DPC/WorkItem is in-flight, its ref keeps RefCount â‰¥ 1 until
         the DPC/WorkItem routine completes and releases its own ref.
       - Auto-delete one-shot: TmpFireTimer releases both the list reference
         and the creation reference (2 derefs). The DPC/WorkItem caller
         still holds its own ref, so neither deref hits 0. The caller's
-        deref then hits 0 → TmpDestroyTimer frees the memory.
+        deref then hits 0 â†’ TmpDestroyTimer frees the memory.
       - TmpDestroyTimer is called when RefCount reaches 0.
 
     Context Ownership:
@@ -80,7 +82,7 @@
 typedef struct _TM_TIMER_INTERNAL {
     //
     // Signature for debug validation (never used for control flow decisions
-    // after timer destruction — only checked while timer is referenced)
+    // after timer destruction â€” only checked while timer is referenced)
     //
     ULONG Signature;
 
@@ -220,7 +222,7 @@ TmpAllocateTimerId(
     do {
         id = InterlockedIncrement(&Manager->NextTimerId);
         if (id == 0) {
-            // Wrapped — skip 0 (invalid sentinel)
+            // Wrapped â€” skip 0 (invalid sentinel)
             id = InterlockedIncrement(&Manager->NextTimerId);
         }
     } while (id == 0);
@@ -399,7 +401,7 @@ IRQL:
     }
 
     //
-    // Atomically transition Initialized 1→0. Only one caller proceeds.
+    // Atomically transition Initialized 1â†’0. Only one caller proceeds.
     //
     if (InterlockedCompareExchange(&Manager->Initialized, 0, 1) != 1) {
         return;
@@ -463,7 +465,7 @@ IRQL:
 
     //
     // Wait for any in-flight DPCs to complete.
-    // NOTE: KeFlushQueuedDpcs only drains DPCs — it does NOT wait for
+    // NOTE: KeFlushQueuedDpcs only drains DPCs â€” it does NOT wait for
     // work items that those DPCs may have queued via IoQueueWorkItem.
     //
     KeFlushQueuedDpcs();
@@ -472,7 +474,7 @@ IRQL:
     // Wait for all in-flight work items to complete. DPCs increment
     // PendingWorkItems before IoQueueWorkItem; TmpWorkItemRoutine
     // decrements and signals AllWorkItemsDrained when it reaches 0.
-    // Without this, IoFreeWorkItem on an active work item → BSOD.
+    // Without this, IoFreeWorkItem on an active work item â†’ BSOD.
     //
     {
     BOOLEAN workItemsDrained = TRUE;
@@ -489,8 +491,8 @@ IRQL:
             );
         //
         // FIX TM-M1: If timeout fires, work items are still active.
-        // IoFreeWorkItem on active item → BSOD. Skip IoFreeWorkItem for
-        // timers with active work items — leak is better than bugcheck.
+        // IoFreeWorkItem on active item â†’ BSOD. Skip IoFreeWorkItem for
+        // timers with active work items â€” leak is better than bugcheck.
         //
         if (drainStatus == STATUS_TIMEOUT) {
             workItemsDrained = FALSE;
@@ -503,7 +505,7 @@ IRQL:
     }
 
     //
-    // Now free all timers directly (bypass refcount — we own everything)
+    // Now free all timers directly (bypass refcount â€” we own everything)
     //
     while (!IsListEmpty(&timersToFree)) {
         entry = RemoveHeadList(&timersToFree);
@@ -515,7 +517,7 @@ IRQL:
         KeSetEvent(&timerInternal->Timer.CancelEvent, IO_NO_INCREMENT, FALSE);
 
         //
-        // Free work item if allocated — but ONLY if drain completed
+        // Free work item if allocated â€” but ONLY if drain completed
         //
         if (timerInternal->WorkItem != NULL && workItemsDrained) {
             IoFreeWorkItem(timerInternal->WorkItem);
@@ -777,7 +779,7 @@ Routine Description:
 
     Reference counting:
     - Timer starts with RefCount=2 (list ref + creation ref).
-    - TmpFindTimerById adds +1 → RefCount=3.
+    - TmpFindTimerById adds +1 â†’ RefCount=3.
     - We remove from TimerList and release the list ref (deref #1).
     - We release the creation ref (deref #2).
     - We release the find ref (deref #3).
@@ -837,7 +839,7 @@ Routine Description:
     //
     // Ensure no DPC is in-flight or pending for this timer.
     // Race: if a DPC is queued but hasn't called TmpReferenceTimer yet,
-    // our 3 derefs below could free the timer → DPC hits freed memory.
+    // our 3 derefs below could free the timer â†’ DPC hits freed memory.
     //
     // KeRemoveQueueDpc dequeues a pending DPC (fast path, any IRQL).
     // If it returns FALSE, the DPC is either running or was never queued;
@@ -889,21 +891,21 @@ Routine Description:
 
     //
     // Release list reference (timer was in list, now removed)
-    // RefCount: N → N-1
+    // RefCount: N â†’ N-1
     //
     TmpDereferenceTimer(timerInternal);
 
     //
     // Release creation reference (cancel is the ownership release mechanism;
     // mirrors the 2nd ref added at TmpCreateTimerInternal line 1412).
-    // RefCount: N-1 → N-2. If a DPC/WorkItem is in-flight, its ref
-    // keeps RefCount ≥ 1, so this won't trigger destroy prematurely.
+    // RefCount: N-1 â†’ N-2. If a DPC/WorkItem is in-flight, its ref
+    // keeps RefCount â‰¥ 1, so this won't trigger destroy prematurely.
     //
     TmpDereferenceTimer(timerInternal);
 
     //
     // Release find reference (from TmpFindTimerById).
-    // If no DPC/WorkItem is in-flight, this hits 0 → TmpDestroyTimer.
+    // If no DPC/WorkItem is in-flight, this hits 0 â†’ TmpDestroyTimer.
     //
     TmpDereferenceTimer(timerInternal);
 
@@ -921,7 +923,7 @@ TmReset(
 
 Routine Description:
 
-    Resets a timer — stops it and starts it again with same parameters.
+    Resets a timer â€” stops it and starts it again with same parameters.
     Uses direct internal calls on the found timer, avoiding triple-lookup.
 
 --*/
@@ -1156,7 +1158,7 @@ TmCancelAll(
     }
 
     //
-    // Iterate in batches — TmCancel modifies the list so we can't
+    // Iterate in batches â€” TmCancel modifies the list so we can't
     // cancel while iterating.
     //
     do {
@@ -1665,7 +1667,7 @@ Routine Description:
     LONG prevState;
 
     //
-    // Atomically transition Created → Active
+    // Atomically transition Created â†’ Active
     //
     prevState = InterlockedCompareExchange(
         &TimerInternal->Timer.State,
@@ -1749,7 +1751,7 @@ Routine Description:
 
     //
     // FIX TM-H1: Dequeue any pending DPC. KeCancelTimer only prevents
-    // future expirations — a DPC already queued from a recent fire
+    // future expirations â€” a DPC already queued from a recent fire
     // would still execute and resurrect a "stopped" timer as a zombie.
     //
     KeRemoveQueueDpc(&TimerInternal->Timer.TimerDpc);
@@ -1870,9 +1872,9 @@ Routine Description:
 
     Reference counting for auto-delete one-shot:
       Before DPC/WorkItem calls us: RefCount = 3 (list + creation + caller)
-      We release list ref and creation ref (2 derefs) → RefCount = 1 (caller)
-      Caller releases its ref → RefCount = 0 → TmpDestroyTimer.
-      Both our derefs are safe because the caller's ref keeps RefCount ≥ 1.
+      We release list ref and creation ref (2 derefs) â†’ RefCount = 1 (caller)
+      Caller releases its ref â†’ RefCount = 0 â†’ TmpDestroyTimer.
+      Both our derefs are safe because the caller's ref keeps RefCount â‰¥ 1.
 
 --*/
 {
@@ -1895,13 +1897,13 @@ Routine Description:
     // Transition to firing state.
     // FIX TM-H1 defense-in-depth: Use CAS instead of unconditional exchange.
     // If timer was stopped/cancelled between DPC queue and DPC execution,
-    // state won't be Active → stale DPC bails instead of invoking callback.
+    // state won't be Active â†’ stale DPC bails instead of invoking callback.
     //
     if (InterlockedCompareExchange(&TimerInternal->Timer.State,
             (LONG)TmTimerState_Firing,
             (LONG)TmTimerState_Active) != (LONG)TmTimerState_Active) {
         //
-        // Timer was stopped/cancelled — stale DPC, bail
+        // Timer was stopped/cancelled â€” stale DPC, bail
         //
         return;
     }
@@ -1940,7 +1942,7 @@ Routine Description:
         //
         // Auto-delete: remove from list, release list ref + creation ref.
         // Use CAS on DeletionPending to prevent double-cleanup race with
-        // TmCancel — only one path (auto-delete OR TmCancel) performs
+        // TmCancel â€” only one path (auto-delete OR TmCancel) performs
         // list removal and ref releases.
         //
         if ((TimerInternal->Timer.Flags & TmFlag_AutoDelete) &&
@@ -1957,10 +1959,10 @@ Routine Description:
             // Remove from wheel
             TmpRemoveTimerFromWheel(manager, TimerInternal);
 
-            // Release list reference (RefCount 3→2, safe: caller holds ref)
+            // Release list reference (RefCount 3â†’2, safe: caller holds ref)
             TmpDereferenceTimer(TimerInternal);
 
-            // Release creation reference (RefCount 2→1, safe: caller holds ref)
+            // Release creation reference (RefCount 2â†’1, safe: caller holds ref)
             TmpDereferenceTimer(TimerInternal);
         }
     }
@@ -2013,7 +2015,7 @@ Routine Description:
 
     Always releases its DPC reference. For auto-delete one-shots,
     TmpFireTimer releases list + creation refs (both safe because our
-    DPC ref keeps RefCount ≥ 1), then our deref hits 0 → destroy.
+    DPC ref keeps RefCount â‰¥ 1), then our deref hits 0 â†’ destroy.
 
 --*/
 {
@@ -2113,7 +2115,7 @@ Routine Description:
 
     //
     // Advance wheel slot atomically. Use mask to get slot index.
-    // The raw value may wrap (LONG_MAX → negative) but & TM_WHEEL_MASK
+    // The raw value may wrap (LONG_MAX â†’ negative) but & TM_WHEEL_MASK
     // always produces a valid index 0..TM_WHEEL_SIZE-1.
     //
     rawSlot = InterlockedIncrement(&manager->CurrentSlot);
@@ -2138,7 +2140,7 @@ TmpProcessWheelSlot(
 Routine Description:
 
     Processes all timers in a wheel slot to detect missed deadlines.
-    This is a monitoring/statistics function — actual timer firing is
+    This is a monitoring/statistics function â€” actual timer firing is
     done by the kernel timer DPC (TmpTimerDpcRoutine).
 
 --*/
@@ -2211,7 +2213,7 @@ Routine Description:
     }
 
     //
-    // Save manager pointer before TmpDereferenceTimer — the deref may
+    // Save manager pointer before TmpDereferenceTimer â€” the deref may
     // hit RefCount=0 and free timerInternal, making timerInternal->Manager
     // a use-after-free. Manager itself is safe because TmShutdown is
     // blocked on AllWorkItemsDrained until we signal it below.

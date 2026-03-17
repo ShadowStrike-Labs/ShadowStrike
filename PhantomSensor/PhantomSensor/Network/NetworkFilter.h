@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -42,7 +44,7 @@
 #define SHADOWSTRIKE_NETWORK_FILTER_H
 
 #pragma warning(push)
-#pragma warning(disable:4201)   // nameless struct/union — ndis.h, fwpsk.h
+#pragma warning(disable:4201)   // nameless struct/union â€” ndis.h, fwpsk.h
 #pragma warning(disable:4324)   // structure padded due to __declspec(align())
 #include <fltKernel.h>
 #define NDIS_SUPPORT_NDIS650  1
@@ -289,7 +291,7 @@ typedef struct _NF_FILTER_STATISTICS {
 } NF_FILTER_STATISTICS, *PNF_FILTER_STATISTICS;
 
 // ============================================================================
-// NETWORK FILTER GLOBAL STATE (internal — do not expose outside module)
+// NETWORK FILTER GLOBAL STATE (internal â€” do not expose outside module)
 // ============================================================================
 
 /**
@@ -545,7 +547,7 @@ NfFilterIsKnownMaliciousJA3(
 
 /**
  * @brief Get network filter statistics (safe snapshot).
- * @param Stats Output statistics — contains only counters, no kernel pointers.
+ * @param Stats Output statistics â€” contains only counters, no kernel pointers.
  * @return STATUS_SUCCESS on success.
  */
 NTSTATUS

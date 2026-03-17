@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -991,7 +993,7 @@ ActSubmitEvent(
 
             //
             // Emit attack chain confirmation telemetry.
-            // This is a HIGH-VALUE event — confirmed multi-stage attacks
+            // This is a HIGH-VALUE event â€” confirmed multi-stage attacks
             // are rare and critical for SOC correlation.
             //
             TeLogAttackChain(

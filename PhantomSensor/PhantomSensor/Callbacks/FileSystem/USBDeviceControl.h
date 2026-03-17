@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -38,11 +40,11 @@ Policy Modes:
   - Audit:    Log only, no blocking
 
 Integration Points:
-  - InstanceSetup callback → UdcCheckVolumePolicy()
-  - PreWrite callback → UdcIsWriteBlocked()
-  - PreSetInfo callback → UdcIsSetInfoBlocked()
-  - PreCreate callback → UdcCheckAutorun()
-  - DriverEntry → UdcInitialize() / UdcShutdown()
+  - InstanceSetup callback â†’ UdcCheckVolumePolicy()
+  - PreWrite callback â†’ UdcIsWriteBlocked()
+  - PreSetInfo callback â†’ UdcIsSetInfoBlocked()
+  - PreCreate callback â†’ UdcCheckAutorun()
+  - DriverEntry â†’ UdcInitialize() / UdcShutdown()
 
 MITRE ATT&CK Coverage:
   - T1052.001: Exfiltration over USB
@@ -211,7 +213,7 @@ typedef struct _UDC_CONFIG {
 } UDC_CONFIG, *PUDC_CONFIG;
 
 // ============================================================================
-// PUBLIC API — LIFECYCLE
+// PUBLIC API â€” LIFECYCLE
 // ============================================================================
 
 /**
@@ -232,7 +234,7 @@ VOID
 UdcShutdown(VOID);
 
 // ============================================================================
-// PUBLIC API — POLICY CHECKS (called from minifilter callbacks)
+// PUBLIC API â€” POLICY CHECKS (called from minifilter callbacks)
 // ============================================================================
 
 /**
@@ -299,7 +301,7 @@ UdcCheckAutorun(
     );
 
 // ============================================================================
-// PUBLIC API — VOLUME TRACKING
+// PUBLIC API â€” VOLUME TRACKING
 // ============================================================================
 
 /**
@@ -327,7 +329,7 @@ UdcNotifyVolumeDismount(
     );
 
 // ============================================================================
-// PUBLIC API — QUERY
+// PUBLIC API â€” QUERY
 // ============================================================================
 
 /**
@@ -342,7 +344,7 @@ UdcGetStatistics(
     );
 
 // ============================================================================
-// PUBLIC API — RULE MANAGEMENT
+// PUBLIC API â€” RULE MANAGEMENT
 // ============================================================================
 
 /**

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -196,7 +198,7 @@ typedef struct _NPM_PIPE_EVENT {
 } NPM_PIPE_EVENT, *PNPM_PIPE_EVENT;
 
 // ============================================================================
-// PUBLIC API — LIFECYCLE
+// PUBLIC API â€” LIFECYCLE
 // ============================================================================
 
 /**
@@ -230,7 +232,7 @@ NpMonIsActive(
     );
 
 // ============================================================================
-// PUBLIC API — MINIFILTER CALLBACKS
+// PUBLIC API â€” MINIFILTER CALLBACKS
 // ============================================================================
 
 /**
@@ -257,7 +259,7 @@ NpMonPostCreateNamedPipe(
     );
 
 // ============================================================================
-// PUBLIC API — STATISTICS / EVENTS
+// PUBLIC API â€” STATISTICS / EVENTS
 // ============================================================================
 
 /**

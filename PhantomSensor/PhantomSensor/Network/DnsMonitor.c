@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -474,7 +476,7 @@ DnspPopulateProcessName(
     );
 
 //
-// Page-aligned functions — all run at IRQL <= APC_LEVEL and use push locks.
+// Page-aligned functions â€” all run at IRQL <= APC_LEVEL and use push locks.
 // alloc_text must come after function prototypes to avoid C2157.
 //
 #ifdef ALLOC_PRAGMA
@@ -867,7 +869,7 @@ DnsInitialize(
             CO_CACHE_CONFIG coConfig;
             CoInitDefaultConfig(&coConfig);
             coConfig.MaxEntries = 4096;
-            coConfig.DefaultTTLSeconds = 600;  /* 10 min — DNS results change */
+            coConfig.DefaultTTLSeconds = 600;  /* 10 min â€” DNS results change */
             coConfig.BucketCount = 1024;
             CoCreateCache(coMgr, CoCacheTypeDNS, "DnsDomain", &coConfig, &g_DnsDomainCoCache);
         }
@@ -968,7 +970,7 @@ DnsShutdown(
     }
 
     //
-    // Free all queries — remove from ALL lists
+    // Free all queries â€” remove from ALL lists
     //
     ExAcquirePushLockExclusive(&Monitor->QueryListLock);
     ExAcquirePushLockExclusive(&Monitor->TransactionHash.Lock);
@@ -1119,7 +1121,7 @@ Routine Description:
 
     //
     // Unlink all queries from this context's per-process list.
-    // The queries remain in the global QueryList and TransactionHash —
+    // The queries remain in the global QueryList and TransactionHash â€”
     // they will be freed by the cleanup timer.
     //
     ExAcquirePushLockExclusive(&processCtx->QueryLock);
@@ -1203,7 +1205,7 @@ DnsProcessQuery(
     }
 
     //
-    // Parse the DNS query — now also receives source address info
+    // Parse the DNS query â€” now also receives source address info
     //
     status = DnspParseQuery(
         Monitor,
@@ -1414,7 +1416,7 @@ DnsProcessQuery(
     //
     // === IOC Domain Matching ===
     // Check the queried domain against the threat-intel IOC database.
-    // IomMatch requires PASSIVE_LEVEL — DnsProcessQuery is in PAGED section.
+    // IomMatch requires PASSIVE_LEVEL â€” DnsProcessQuery is in PAGED section.
     //
     {
         PIOM_MATCHER iocMatcher = BeGetIocMatcher();
@@ -1444,7 +1446,7 @@ DnsProcessQuery(
     //
     // === Domain Reputation Check ===
     // Query the NetworkReputation database for domain-level threat intelligence.
-    // NrLookupDomain operates at APC_LEVEL max — DnsProcessQuery runs paged.
+    // NrLookupDomain operates at APC_LEVEL max â€” DnsProcessQuery runs paged.
     //
     {
         PNR_MANAGER repManager = NfFilterGetReputationManager();
@@ -1479,7 +1481,7 @@ DnsProcessQuery(
     }
 
     //
-    // Update process context — hold reference until done with ALL uses
+    // Update process context â€” hold reference until done with ALL uses
     //
     processCtx = DnspGetOrCreateProcessContext(Monitor, ProcessId);
     if (processCtx != NULL) {
@@ -1489,7 +1491,7 @@ DnsProcessQuery(
             InterlockedIncrement(&processCtx->SuspiciousQueries);
         }
 
-        // Push lock usage (safe in PAGE section — no IRQL elevation)
+        // Push lock usage (safe in PAGE section â€” no IRQL elevation)
         ExAcquirePushLockExclusive(&processCtx->QueryLock);
         InsertTailList(&processCtx->QueryList, &query->ProcessListEntry);
         InterlockedIncrement(&processCtx->QueryCount);
@@ -1730,7 +1732,7 @@ DnsDetectTunneling(
         *Score = 0;
     }
 
-    // Lookup only — do not create context for a read-only query
+    // Lookup only â€” do not create context for a read-only query
     processCtx = DnspFindProcessContext(Monitor, ProcessId);
     if (processCtx == NULL) {
         return STATUS_NOT_FOUND;
@@ -1810,7 +1812,7 @@ DnsLookupDomain(
 /*++
 Routine Description:
     Looks up a domain in the cache and returns a COPY of the entry.
-    Caller does not receive a live pointer — safe against concurrent cleanup.
+    Caller does not receive a live pointer â€” safe against concurrent cleanup.
 --*/
 {
     PDNS_DOMAIN_CACHE entry;
@@ -1905,7 +1907,7 @@ DnsGetProcessQueries(
 
     *QueryCount = 0;
 
-    // Lookup only — do not create for read-only query
+    // Lookup only â€” do not create for read-only query
     processCtx = DnspFindProcessContext(Monitor, ProcessId);
     if (processCtx == NULL) {
         return STATUS_NOT_FOUND;
@@ -2235,7 +2237,7 @@ DnspParseQuery(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    // Lookaside does NOT zero memory — must zero explicitly
+    // Lookaside does NOT zero memory â€” must zero explicitly
     RtlZeroMemory(query, sizeof(DNS_QUERY));
 
     query->TransactionId = RtlUshortByteSwap(header->TransactionId);
@@ -2336,7 +2338,7 @@ DnspParseResponse(
     answerCount = RtlUshortByteSwap(header->AnswerCount);
 
     //
-    // O(1) lookup via transaction hash table — EXCLUSIVE lock for writes
+    // O(1) lookup via transaction hash table â€” EXCLUSIVE lock for writes
     //
     hashBucket = DnspHashTransactionId(transactionId, ServerAddress, IsIPv6)
                  % Monitor->TransactionHash.BucketCount;
@@ -3286,7 +3288,7 @@ Routine Description:
     if (Query->ProcessListEntry.Flink != NULL &&
         Query->ProcessListEntry.Blink != NULL &&
         !IsListEmpty(&Query->ProcessListEntry)) {
-        // Need process context lock — find process context
+        // Need process context lock â€” find process context
         PDNS_PROCESS_CONTEXT processCtx = DnspFindProcessContext(Monitor, Query->ProcessId);
         if (processCtx != NULL) {
             ExAcquirePushLockExclusive(&processCtx->QueryLock);
@@ -3295,7 +3297,7 @@ Routine Description:
             ExReleasePushLockExclusive(&processCtx->QueryLock);
             DnspDereferenceProcessContext(Monitor, processCtx);
         } else {
-            // Process context already gone — just unlink safely
+            // Process context already gone â€” just unlink safely
             RemoveEntryList(&Query->ProcessListEntry);
         }
     }
@@ -3398,7 +3400,7 @@ Routine Description:
     KeQuerySystemTimePrecise(&currentTime);
 
     //
-    // Collect expired queries — remove from BOTH QueryList and TransactionHash
+    // Collect expired queries â€” remove from BOTH QueryList and TransactionHash
     //
     ExAcquirePushLockExclusive(&Monitor->QueryListLock);
     ExAcquirePushLockExclusive(&Monitor->TransactionHash.Lock);

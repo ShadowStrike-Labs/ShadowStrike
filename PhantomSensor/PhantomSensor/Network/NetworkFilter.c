@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -55,7 +57,7 @@
  */
 
 #pragma warning(push)
-#pragma warning(disable:4324)   // structure padded due to __declspec(align()) — fltKernel.h
+#pragma warning(disable:4324)   // structure padded due to __declspec(align()) â€” fltKernel.h
 #include "NetworkFilter.h"
 #pragma warning(pop)
 
@@ -147,13 +149,13 @@ EXTERN_C __declspec(selectany) const GUID SHADOWSTRIKE_STREAM_V4_CALLOUT_GUID =
 #define NF_MAX_DNS_ENTRIES              32768       // Cap DNS tracking to prevent pool exhaustion
 #define NF_DNS_HEADER_SIZE              12          // Minimum DNS header
 #define NF_MAX_DNS_PACKET_SIZE          65535       // Max DNS packet (TCP max)
-#define NF_FORCE_CLOSE_TIMEOUT_MS       1200000     // 20 min — force-close non-Closed stale connections
+#define NF_FORCE_CLOSE_TIMEOUT_MS       1200000     // 20 min â€” force-close non-Closed stale connections
 
 #ifndef MAXUINT32
 #define MAXUINT32   ((UINT32)0xFFFFFFFF)
 #endif
 
-// Suppress C4996 for ExAllocatePoolWithTag — needed for Windows 10 1507–1903 compat.
+// Suppress C4996 for ExAllocatePoolWithTag â€” needed for Windows 10 1507â€“1903 compat.
 // ExAllocatePool2 only available from 2004 (19041) forward.
 #pragma warning(disable:4996)
 
@@ -519,7 +521,7 @@ NfFilterInitialize(
     g_PendingDnsCount = 0;
 
     //
-    // Open WFP engine — use DYNAMIC session so objects are auto-cleaned on close
+    // Open WFP engine â€” use DYNAMIC session so objects are auto-cleaned on close
     //
     session.flags = FWPM_SESSION_FLAG_DYNAMIC;
     session.displayData.name = L"ShadowStrike Network Monitor";
@@ -546,7 +548,7 @@ NfFilterInitialize(
     }
 
     //
-    // Register provider — NOT persistent (dynamic session cleans up)
+    // Register provider â€” NOT persistent (dynamic session cleans up)
     //
     provider.providerKey = SHADOWSTRIKE_WFP_PROVIDER_GUID;
     provider.displayData.name = L"ShadowStrike NGAV Provider";
@@ -675,9 +677,9 @@ NfFilterInitialize(
     InterlockedExchange64(&g_TotalEventsDropped, 0);
 
     //
-    // Initialize network detection sub-modules (non-fatal — graceful degradation)
-    // Order: ConnectionTracker → DnsMonitor → C2Detection → NetworkReputation →
-    //        SSLInspection → DataExfiltration
+    // Initialize network detection sub-modules (non-fatal â€” graceful degradation)
+    // Order: ConnectionTracker â†’ DnsMonitor â†’ C2Detection â†’ NetworkReputation â†’
+    //        SSLInspection â†’ DataExfiltration
     //
     status = CtInitialize(&g_ConnectionTracker);
     if (!NT_SUCCESS(status)) {
@@ -744,7 +746,7 @@ NfFilterInitialize(
     }
 
     //
-    // Reset status — sub-module failures are non-fatal
+    // Reset status â€” sub-module failures are non-fatal
     //
     status = STATUS_SUCCESS;
 
@@ -815,7 +817,7 @@ NfFilterShutdown(
     }
 
     //
-    // Unregister WFP filters and callouts FIRST — this drains in-flight
+    // Unregister WFP filters and callouts FIRST â€” this drains in-flight
     // classify callbacks so sub-module pointers are no longer accessed
     // from WFP context.  Only then is it safe to destroy sub-modules.
     //
@@ -824,7 +826,7 @@ NfFilterShutdown(
 
     //
     // Shutdown network detection sub-modules (reverse init order).
-    // WFP callouts are fully drained at this point — no UAF risk.
+    // WFP callouts are fully drained at this point â€” no UAF risk.
     //
     if (g_ProtocolParser != NULL) {
         PpShutdown(&g_ProtocolParser);
@@ -1179,7 +1181,7 @@ NfFilterReleaseConnection(
 
     if (refCount < 0) {
         //
-        // RefCount underflow — serious bug. Clamp to 0 and log.
+        // RefCount underflow â€” serious bug. Clamp to 0 and log.
         // Do not free here; cleanup timer handles final free.
         //
         InterlockedIncrement(&Connection->RefCount);
@@ -1564,7 +1566,7 @@ NfFilterIsKnownMaliciousJA3(
         //
         // Parse 32-char hex MD5 string to 16 raw bytes
         //
-        while (JA3Fingerprint[len] != '\0' && len < 33) {
+        while (len < 33 && JA3Fingerprint[len] != '\0') {
             len++;
         }
 
@@ -2054,7 +2056,7 @@ NfCalloutNotify(
     case FWPS_CALLOUT_NOTIFY_DELETE_FILTER:
         //
         // A filter referencing our callout was removed.
-        // Log for diagnostics — may indicate policy tampering.
+        // Log for diagnostics â€” may indicate policy tampering.
         //
         break;
 
@@ -2098,7 +2100,7 @@ NfFlowDeleteNotify(
         //
         // === Beaconing Detection on Connection Close (T1071/T1573) ===
         // Analyze the completed connection's send-interval pattern for
-        // periodic beaconing behavior. This is the ideal time — the full
+        // periodic beaconing behavior. This is the ideal time â€” the full
         // timing history is available and no further data will arrive.
         //
         {
@@ -2190,7 +2192,7 @@ NfFlowDeleteNotify(
         }
 
         //
-        // C2 process-level analysis on connection close (T1071) — aggregate
+        // C2 process-level analysis on connection close (T1071) â€” aggregate
         // all connection data for this process to detect C2 patterns.
         //
         if (g_C2Detector != NULL) {
@@ -2235,7 +2237,7 @@ NfFlowDeleteNotify(
         //
         // Transition connection in ConnectionTracker to Closed.
         // Uses WFP FlowId which was stored at NfpCreateAndInsertConnection time.
-        // Update state to Closed before removing — allows ConnectionTracker
+        // Update state to Closed before removing â€” allows ConnectionTracker
         // to record final state for forensics/telemetry before cleanup.
         //
         if (g_ConnectionTracker != NULL && connection->FlowId != 0) {
@@ -2673,7 +2675,7 @@ NfpCleanupHashTables(VOID)
 {
     PAGED_CODE();
 
-    // Static arrays — no dynamic memory to free.
+    // Static arrays â€” no dynamic memory to free.
     // Entries are freed during connection/dns cleanup.
 }
 
@@ -3026,7 +3028,7 @@ NfpRemoveConnection(
 // ============================================================================
 
 /**
- * @brief Periodic cleanup callback — runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback.
+ * @brief Periodic cleanup callback â€” runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback.
  */
 static VOID
 NfpCleanupTimerCallback(
@@ -3049,7 +3051,7 @@ NfpCleanupTimerCallback(
         NfpCleanupStalePendingDns();
 
         //
-        // Evict stale SSL sessions — prevents NonPaged pool exhaustion
+        // Evict stale SSL sessions â€” prevents NonPaged pool exhaustion
         // and STATUS_QUOTA_EXCEEDED after 65536 accumulated sessions.
         //
         if (g_SslInspector != NULL) {
@@ -3065,7 +3067,7 @@ NfpCleanupTimerCallback(
  *
  * Phase 1: Collect candidate stale connections under shared lock (increment ref).
  * Phase 2: Re-verify under exclusive lock (decrement ref, check again).
- *          Only remove + free if ref == 0 under exclusive lock — prevents
+ *          Only remove + free if ref == 0 under exclusive lock â€” prevents
  *          use-after-free from concurrent FindConnection taking a reference
  *          between Phase 1 scan and Phase 2 removal.
  */
@@ -3146,7 +3148,7 @@ NfpCleanupStaleConnections(VOID)
 
         if (connection->RefCount <= 0) {
             //
-            // Safe to remove — no other thread holds a reference
+            // Safe to remove â€” no other thread holds a reference
             //
             RemoveEntryList(&connection->ListEntry);
             InterlockedDecrement(&g_NfState.ConnectionCount);
@@ -3439,10 +3441,10 @@ NfpIsPrivateAddress(_In_ PSS_IP_ADDRESS Address)
     if (SS_IS_IPV6(Address)) {
         PUCHAR bytes = Address->V6.Bytes;
 
-        // fc00::/7 — Unique Local Address (ULA)
+        // fc00::/7 â€” Unique Local Address (ULA)
         if ((bytes[0] & 0xFE) == 0xFC) return TRUE;
 
-        // fe80::/10 — Link-local
+        // fe80::/10 â€” Link-local
         if (bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80) return TRUE;
     }
 
@@ -3630,7 +3632,7 @@ NfpCreateAndInsertConnection(
     connection->ConnectionId = (UINT64)InterlockedIncrement64(&g_NfState.NextConnectionId);
 
     //
-    // Use WFP flow handle for flow tracking — NOT the classify flowContext
+    // Use WFP flow handle for flow tracking â€” NOT the classify flowContext
     // parameter, which is always 0 unless FwpsFlowAssociateContext0 is called
     // at this layer. The flow handle uniquely identifies flows across layers.
     //
@@ -3751,13 +3753,13 @@ NfpCreateAndInsertConnection(
 
     //
     // Feed connection to C2Detection for beaconing/IOC analysis (T1071/T1573).
-    // Passes the raw remote address pointer — C2RecordConnection copies it.
+    // Passes the raw remote address pointer â€” C2RecordConnection copies it.
     //
     if (g_C2Detector != NULL) {
         PVOID remoteAddr = IsV6 ? (PVOID)remoteIp6 : (PVOID)&remoteIp;
 
         //
-        // C2 IOC check (T1071) — check if the destination is a known C2
+        // C2 IOC check (T1071) â€” check if the destination is a known C2
         // indicator of compromise before recording the connection.
         //
         {
@@ -3821,7 +3823,7 @@ NfpCreateAndInsertConnection(
         );
 
         //
-        // C2 destination analysis (T1071/T1573) — analyze the remote endpoint
+        // C2 destination analysis (T1071/T1573) â€” analyze the remote endpoint
         // for known C2 patterns, IOC matches, and behavioral indicators.
         // C2AnalyzeDestination aggregates beaconing, reputation, IOC, and JA3
         // data to produce a composite C2 confidence score.
@@ -3900,7 +3902,7 @@ NfpCreateAndInsertConnection(
         );
 
         //
-        // Port scan detection (T1046) — check if this process has accumulated
+        // Port scan detection (T1046) â€” check if this process has accumulated
         // enough connection attempts to trigger port scan detection.
         // SsPsCheckForScan returns a detection result when the scanner
         // determines that the process is conducting network reconnaissance.
@@ -4063,7 +4065,7 @@ NfpProcessInboundAccept(
 }
 
 /**
- * @brief Process DNS packet — extracts query from NET_BUFFER, parses, inspects.
+ * @brief Process DNS packet â€” extracts query from NET_BUFFER, parses, inspects.
  */
 static VOID
 NfpProcessDnsPacket(
@@ -4133,7 +4135,7 @@ NfpProcessDnsPacket(
     transactionId = (UINT16)((dnsData[0] << 8) | dnsData[1]);
 
     //
-    // Check QR bit (bit 15 of flags) — 0 = query, 1 = response
+    // Check QR bit (bit 15 of flags) â€” 0 = query, 1 = response
     // We only process queries here
     //
     if ((dnsData[2] & 0x80) != 0) {
@@ -4238,8 +4240,8 @@ NfpProcessDnsPacket(
     // Compute domain entropy for DGA detection.
     //
     // Shannon entropy approximation using integer arithmetic:
-    //   H = -Σ (p_i * log2(p_i))
-    // We use: H * 100 = Σ (count_i * log2(totalChars/count_i) * 100 / totalChars)
+    //   H = -Î£ (p_i * log2(p_i))
+    // We use: H * 100 = Î£ (count_i * log2(totalChars/count_i) * 100 / totalChars)
     // Approximation via lookup table for log2(n) * 100 for n in [1..32].
     //
     {
@@ -4250,7 +4252,7 @@ NfpProcessDnsPacket(
 
         //
         // log2(n) * 100, indexed by n (1-based). log2(1)=0, log2(2)=100, etc.
-        // Used for integer Shannon entropy: H = Σ count[i]/total * log2(total/count[i])
+        // Used for integer Shannon entropy: H = Î£ count[i]/total * log2(total/count[i])
         //
         static const UINT16 log2x100[] = {
             0,    0,  100, 158, 200, 232, 258, 280, 300, 317,   // 0-9
@@ -4271,8 +4273,8 @@ NfpProcessDnsPacket(
 
         if (totalChars > 1 && totalChars <= LOG2X100_MAX_IDX) {
             //
-            // H * 100 = Σ (count_i / totalChars) * log2(totalChars / count_i) * 100
-            //         = Σ count_i * (log2(totalChars) - log2(count_i)) * 100 / totalChars
+            // H * 100 = Î£ (count_i / totalChars) * log2(totalChars / count_i) * 100
+            //         = Î£ count_i * (log2(totalChars) - log2(count_i)) * 100 / totalChars
             //
             UINT32 log2Total = log2x100[totalChars];
 
@@ -4289,7 +4291,7 @@ NfpProcessDnsPacket(
             //
             // For very long names (>32 chars), use unique-char ratio as proxy.
             // Ratio = uniqueChars * 100 / min(totalChars, 36).
-            // Random strings → high ratio, dictionary → low ratio.
+            // Random strings â†’ high ratio, dictionary â†’ low ratio.
             //
             UINT32 uniqueChars = 0;
             for (i = 0; i < 36; i++) {
@@ -4297,8 +4299,8 @@ NfpProcessDnsPacket(
             }
             entropyX100 = (uniqueChars * 100) / min(totalChars, 36);
             //
-            // Scale: 36 unique in 36 chars → 100.
-            // True Shannon entropy for uniform 36-char → ~514.
+            // Scale: 36 unique in 36 chars â†’ 100.
+            // True Shannon entropy for uniform 36-char â†’ ~514.
             // Map ratio to entropy-like scale: ratio * 5 approximates H*100.
             //
             entropyX100 = entropyX100 * 5;
@@ -4317,7 +4319,7 @@ NfpProcessDnsPacket(
         }
 
         //
-        // High entropy (>350 ≈ 3.5 bits/char) with long name suggests DGA.
+        // High entropy (>350 â‰ˆ 3.5 bits/char) with long name suggests DGA.
         // Typical DGA domains: 400-500. Legitimate domains: 200-350.
         //
         if (dnsEntry->DomainEntropy > 350 && totalChars > 20) {
@@ -4437,7 +4439,7 @@ Cleanup:
 }
 
 /**
- * @brief Process TCP stream data — update statistics using atomic operations.
+ * @brief Process TCP stream data â€” update statistics using atomic operations.
  */
 static VOID
 NfpProcessStreamData(
@@ -4664,7 +4666,7 @@ NfpProcessStreamData(
                             &ja3fp);
 
                         //
-                        // JA3 known-bad check (T1573) — compare the computed
+                        // JA3 known-bad check (T1573) â€” compare the computed
                         // JA3 hash against the SSL inspector's blocklist of
                         // known malware/C2 JA3 fingerprints.
                         //
@@ -4834,7 +4836,7 @@ NfpProcessStreamData(
         }
 
         //
-        // Check for "HTTP/" prefix before parsing — avoid wasting cycles
+        // Check for "HTTP/" prefix before parsing â€” avoid wasting cycles
         // on binary protocols.
         //
         if (respData != NULL && respCopied >= 5 &&
@@ -4854,7 +4856,7 @@ NfpProcessStreamData(
 
             if (NT_SUCCESS(parseStatus) && httpResponse != NULL) {
                 //
-                // HTTP response successfully parsed — enrichment data available.
+                // HTTP response successfully parsed â€” enrichment data available.
                 // Future: analyze Server header, Content-Type, response timing
                 // for C2 framework fingerprinting.
                 //
@@ -4871,7 +4873,7 @@ NfpProcessStreamData(
 
     //
     // Update ConnectionTracker per-connection and per-process byte/packet stats.
-    // Uses flow context (NF ConnectionId) — ConnectionTracker keyed by WFP FlowId.
+    // Uses flow context (NF ConnectionId) â€” ConnectionTracker keyed by WFP FlowId.
     //
     if (g_ConnectionTracker != NULL && connection->FlowId != 0) {
         BOOLEAN isSend = !!(StreamPacket->streamData->flags & FWPS_STREAM_FLAG_SEND);
@@ -4886,7 +4888,7 @@ NfpProcessStreamData(
 
         //
         // NET-CT: Transition connection to Established on first data flow.
-        // CAS-style: only transitions from New/Connected → Established.
+        // CAS-style: only transitions from New/Connected â†’ Established.
         // CtUpdateConnectionState internally ignores invalid transitions.
         //
         if (!(connection->Flags & NF_CONN_FLAG_STATE_ESTABLISHED)) {
@@ -4979,7 +4981,7 @@ NfpProcessStreamData(
 
             //
             // Convert WCHAR hostname to ANSI for DxAnalyzeTraffic.
-            // Stack buffer is sufficient — hostnames are at most 255 chars.
+            // Stack buffer is sufficient â€” hostnames are at most 255 chars.
             //
             CHAR ansiHostname[256] = { 0 };
             PCSTR hostnamePtr = NULL;
@@ -5027,7 +5029,7 @@ NfpProcessStreamData(
 
     //
     // Also record volume-only transfer stats for burst/threshold detection.
-    // This works independently of content inspection — records byte counts
+    // This works independently of content inspection â€” records byte counts
     // even when content copy was not possible.
     //
     if (g_DxDetector != NULL &&

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -194,7 +196,7 @@ static ULONG C2pHashAddress(
     _In_ PVOID Address, _In_ USHORT Port, _In_ BOOLEAN IsIPv6);
 
 //
-// Destination management — all require DestinationLock held by caller
+// Destination management â€” all require DestinationLock held by caller
 //
 static PC2_DESTINATION C2pFindDestinationLocked(
     _In_ PC2_DETECTOR Detector,
@@ -226,7 +228,7 @@ static VOID C2pAddBeaconSample(
     _In_ ULONG DataSize, _In_ CT_DIRECTION Direction);
 
 //
-// Analysis — runs at PASSIVE_LEVEL
+// Analysis â€” runs at PASSIVE_LEVEL
 //
 static VOID C2pAnalyzeBeaconing(
     _Inout_ PC2_DESTINATION Destination,
@@ -281,7 +283,7 @@ static VOID C2pFillResultFromDestination(
     ExReleaseRundownProtection(&(det)->RundownRef)
 
 // ============================================================================
-// PUBLIC API — INITIALIZATION
+// PUBLIC API â€” INITIALIZATION
 // ============================================================================
 
 _Use_decl_annotations_
@@ -472,7 +474,7 @@ C2Shutdown(
     //
 
     //
-    // Free all destinations (no lock needed — exclusive ownership)
+    // Free all destinations (no lock needed â€” exclusive ownership)
     //
     while (!IsListEmpty(&Detector->DestinationList)) {
         entry = RemoveHeadList(&Detector->DestinationList);
@@ -526,7 +528,7 @@ C2Shutdown(
 }
 
 // ============================================================================
-// PUBLIC API — TRAFFIC RECORDING
+// PUBLIC API â€” TRAFFIC RECORDING
 // ============================================================================
 
 _Use_decl_annotations_
@@ -573,7 +575,7 @@ C2RecordConnection(
     }
 
     //
-    // destination is referenced — safe to use outside lock
+    // destination is referenced â€” safe to use outside lock
     //
     InterlockedIncrement(&destination->ConnectionCount);
     InterlockedIncrement(&destination->ActiveConnections);
@@ -732,7 +734,7 @@ C2RecordTLSHandshake(
 }
 
 // ============================================================================
-// PUBLIC API — DETECTION
+// PUBLIC API â€” DETECTION
 // ============================================================================
 
 _Use_decl_annotations_
@@ -946,6 +948,14 @@ C2CheckIOC(
         *MatchedIOC = NULL;
     }
 
+    //
+    // Pre-compute hostname length once (V814: avoid strlen in loop)
+    //
+    SIZE_T hostnameLen = 0;
+    if (Hostname != NULL) {
+        hostnameLen = strlen(Hostname);
+    }
+
     if (!C2_ACQUIRE_RUNDOWN(Detector)) {
         return STATUS_DELETE_PENDING;
     }
@@ -970,7 +980,6 @@ C2CheckIOC(
                 }
             }
         } else if (ioc->Type == IOCType_Domain && Hostname != NULL) {
-            ULONG hostnameLen = (ULONG)strlen(Hostname);
             if (hostnameLen > 0 && hostnameLen < 256) {
                 if (_stricmp(Hostname, ioc->Value.Domain) == 0) {
                     found = TRUE;
@@ -1012,7 +1021,7 @@ C2CheckIOC(
 }
 
 // ============================================================================
-// PUBLIC API — IOC MANAGEMENT
+// PUBLIC API â€” IOC MANAGEMENT
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1112,7 +1121,7 @@ C2RemoveIOC(
 }
 
 // ============================================================================
-// PUBLIC API — JA3 DATABASE
+// PUBLIC API â€” JA3 DATABASE
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1213,7 +1222,7 @@ C2LookupJA3(
 }
 
 // ============================================================================
-// PUBLIC API — CALLBACKS
+// PUBLIC API â€” CALLBACKS
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1297,7 +1306,7 @@ C2UnregisterCallback(
 }
 
 // ============================================================================
-// PUBLIC API — RESULTS
+// PUBLIC API â€” RESULTS
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1312,7 +1321,7 @@ C2FreeResult(
 }
 
 // ============================================================================
-// PUBLIC API — STATISTICS
+// PUBLIC API â€” STATISTICS
 // ============================================================================
 
 _Use_decl_annotations_
@@ -1351,7 +1360,7 @@ C2GetStatistics(
 }
 
 // ============================================================================
-// PUBLIC API — PROCESS LIFECYCLE
+// PUBLIC API â€” PROCESS LIFECYCLE
 //
 // Must be called from ProcessNotify on process termination to prevent
 // C2_PROCESS_CONTEXT accumulation (capped at 4096).
@@ -1401,7 +1410,7 @@ C2ProcessTerminated(
 }
 
 // ============================================================================
-// PRIVATE — PERIODIC ANALYSIS CALLBACK (PASSIVE_LEVEL via TimerManager)
+// PRIVATE â€” PERIODIC ANALYSIS CALLBACK (PASSIVE_LEVEL via TimerManager)
 // ============================================================================
 
 static VOID
@@ -1448,7 +1457,7 @@ C2pAnalysisTimerCallback(
                           ((LONGLONG)pub->Config.AnalysisWindowMs * 10000);
 
     //
-    // Phase 1: Analyze destinations under exclusive lock (PASSIVE_LEVEL — safe).
+    // Phase 1: Analyze destinations under exclusive lock (PASSIVE_LEVEL â€” safe).
     //          Collect detection results into a pool-allocated array.
     //          Do NOT invoke callbacks while holding the lock.
     //
@@ -1507,7 +1516,7 @@ C2pAnalysisTimerCallback(
         KeLeaveCriticalRegion();
 
         //
-        // Phase 2: Notify callbacks OUTSIDE the lock — safe for re-entrant APIs.
+        // Phase 2: Notify callbacks OUTSIDE the lock â€” safe for re-entrant APIs.
         //
         if (pendingResults != NULL) {
             ULONG resultIdx;
@@ -1530,7 +1539,7 @@ C2pAnalysisTimerCallback(
 }
 
 // ============================================================================
-// PRIVATE — HASH TABLE
+// PRIVATE â€” HASH TABLE
 // ============================================================================
 
 static NTSTATUS
@@ -1597,7 +1606,7 @@ C2pHashAddress(
 }
 
 // ============================================================================
-// PRIVATE — DESTINATION MANAGEMENT
+// PRIVATE â€” DESTINATION MANAGEMENT
 //
 // Single DestinationLock protects both list and hash table.
 // ============================================================================
@@ -1794,7 +1803,7 @@ C2pFreeBeaconSamples(
 }
 
 // ============================================================================
-// PRIVATE — BEACON SAMPLE RECORDING
+// PRIVATE â€” BEACON SAMPLE RECORDING
 // ============================================================================
 
 static VOID
@@ -1843,7 +1852,7 @@ C2pAddBeaconSample(
 }
 
 // ============================================================================
-// PRIVATE — BEACON ANALYSIS (PASSIVE_LEVEL)
+// PRIVATE â€” BEACON ANALYSIS (PASSIVE_LEVEL)
 //
 // Caller must hold DestinationLock exclusive. IntervalBuffer is a
 // caller-provided pool-allocated scratch buffer.
@@ -1879,7 +1888,7 @@ C2pAnalyzeBeaconing(
 
     //
     // Collect intervals from sample list.
-    // SampleLock is a push lock — acquire at APC_LEVEL.
+    // SampleLock is a push lock â€” acquire at APC_LEVEL.
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Destination->SampleLock);
@@ -1977,7 +1986,7 @@ C2pAnalyzeBeaconing(
 }
 
 // ============================================================================
-// PRIVATE — INTERVAL STATISTICS
+// PRIVATE â€” INTERVAL STATISTICS
 //
 // Operates entirely on the caller-provided array. No locks or allocations.
 // ============================================================================
@@ -2054,7 +2063,7 @@ C2pInsertionSort(
 }
 
 // ============================================================================
-// PRIVATE — JA3 CHECKING
+// PRIVATE â€” JA3 CHECKING
 // ============================================================================
 
 static BOOLEAN
@@ -2066,7 +2075,7 @@ C2pCheckKnownJA3(
     )
 {
     //
-    // Internal lookup — caller already holds rundown protection.
+    // Internal lookup â€” caller already holds rundown protection.
     // Only acquire JA3Lock, do NOT re-acquire rundown.
     //
     PLIST_ENTRY entry;
@@ -2117,10 +2126,10 @@ C2pIsSuspiciousPort(
 }
 
 // ============================================================================
-// PRIVATE — SCORING
+// PRIVATE â€” SCORING
 //
 // Caller must hold DestinationLock exclusive.
-// Score is fully recalculated from indicators — no accumulation races.
+// Score is fully recalculated from indicators â€” no accumulation races.
 // ============================================================================
 
 static VOID
@@ -2169,7 +2178,7 @@ C2pCalculateSuspicionScore(
 }
 
 // ============================================================================
-// PRIVATE — CALLBACKS
+// PRIVATE â€” CALLBACKS
 // ============================================================================
 
 static VOID
@@ -2199,7 +2208,7 @@ C2pNotifyCallbacks(
 }
 
 // ============================================================================
-// PRIVATE — PROCESS CONTEXT
+// PRIVATE â€” PROCESS CONTEXT
 // ============================================================================
 
 static PC2_PROCESS_CONTEXT
@@ -2297,7 +2306,7 @@ C2pFreeProcessContext(
 }
 
 // ============================================================================
-// PRIVATE — RESULT ALLOCATION
+// PRIVATE â€” RESULT ALLOCATION
 //
 // Results are allocated with ExAllocatePool2 and freed with ExFreePoolWithTag.
 // This avoids the lookaside-alloc/pool-free mismatch.
@@ -2350,7 +2359,7 @@ C2pFillResultFromDestination(
 }
 
 // ============================================================================
-// PRIVATE — STALE ENTRY CLEANUP (PASSIVE_LEVEL)
+// PRIVATE â€” STALE ENTRY CLEANUP (PASSIVE_LEVEL)
 // ============================================================================
 
 static VOID

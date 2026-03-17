@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -118,7 +120,7 @@ typedef struct _PP_HTTP_REQUEST {
     CHAR Cookie[1024];
     CHAR Referer[PP_MAX_URL_LENGTH];
 
-    // Body (owned copy — caller must free via PpFreeHTTPRequest)
+    // Body (owned copy â€” caller must free via PpFreeHTTPRequest)
     PVOID Body;
     ULONG BodySize;
 
@@ -149,7 +151,7 @@ typedef struct _PP_HTTP_RESPONSE {
     CHAR Server[256];
     CHAR SetCookie[1024];
 
-    // Body (owned copy — caller must free via PpFreeHTTPResponse)
+    // Body (owned copy â€” caller must free via PpFreeHTTPResponse)
     PVOID Body;
     ULONG BodySize;
 
@@ -319,7 +321,7 @@ PpFreeDNSPacket(
     _In_opt_ _Post_invalid_ PPP_DNS_PACKET Packet
     );
 
-// Utility functions — safe at any IRQL <= DISPATCH (read-only, no paged access)
+// Utility functions â€” safe at any IRQL <= DISPATCH (read-only, no paged access)
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 PpIsHTTPData(

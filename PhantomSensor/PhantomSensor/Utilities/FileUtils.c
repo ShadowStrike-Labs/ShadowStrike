@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -1073,7 +1075,7 @@ ShadowStrikeGetFileInfo(
     }
 
     //
-    // Query basic information — this is the primary query
+    // Query basic information â€” this is the primary query
     //
     basicStatus = FltQueryInformationFile(
         Instance,
@@ -1129,7 +1131,7 @@ ShadowStrikeGetFileInfo(
     }
 
     //
-    // Query file ID (non-critical — failure is acceptable)
+    // Query file ID (non-critical â€” failure is acceptable)
     //
     status = FltQueryInformationFile(
         Instance,
@@ -1243,7 +1245,7 @@ ShadowStrikeGetFileInfo(
                     }
                 } else {
                     //
-                    // Not PE — check magic byte signatures
+                    // Not PE â€” check magic byte signatures
                     //
                     FileInfo->FileType = ShadowFileTypeData;
                     for (sig = g_FileSignatures; sig->Magic != NULL; sig++) {
@@ -1411,7 +1413,7 @@ ShadowStrikeDetectFileType(
     }
 
     //
-    // Allocate header buffer from pool — use PE_HEADER_READ_SIZE (4096)
+    // Allocate header buffer from pool â€” use PE_HEADER_READ_SIZE (4096)
     // to ensure we can reach the NT headers for proper PE32/PE64 classification
     //
     headerBuffer = (PUCHAR)ExAllocatePool2(
@@ -1628,7 +1630,7 @@ ShadowStrikeIsFilePE(
     }
 
     //
-    // Allocate header buffer from pool — 4KB is too large for kernel stack
+    // Allocate header buffer from pool â€” 4KB is too large for kernel stack
     //
     headerBuffer = (PUCHAR)ExAllocatePool2(
         POOL_FLAG_PAGED,
@@ -1725,7 +1727,7 @@ ShadowpParsePEHeaders(
     }
 
     //
-    // Validate PE offset — must be positive and >= DOS header size
+    // Validate PE offset â€” must be positive and >= DOS header size
     //
     peOffset = dosHeader->e_lfanew;
     if (peOffset < (LONG)sizeof(SHADOW_DOS_HEADER) || peOffset < 0) {
@@ -2406,20 +2408,20 @@ ShadowStrikeGetZoneIdentifier(
 
     if (!foundStream) {
         //
-        // No Zone.Identifier stream — file has no Mark-of-the-Web.
+        // No Zone.Identifier stream â€” file has no Mark-of-the-Web.
         //
         return STATUS_SUCCESS;
     }
 
     //
-    // Zone.Identifier stream exists — delegate to helper for open/read/parse
+    // Zone.Identifier stream exists â€” delegate to helper for open/read/parse
     //
     *HasZoneId = TRUE;
 
     status = ShadowpReadZoneIdentifierContent(Instance, FileObject, ZoneId);
     if (!NT_SUCCESS(status)) {
         //
-        // Stream exists but cannot be read — default to zone 3 (Internet)
+        // Stream exists but cannot be read â€” default to zone 3 (Internet)
         // as conservative security assumption
         //
         *ZoneId = 3;
@@ -2522,7 +2524,7 @@ ShadowStrikeGetVolumeInfo(
         }
 
         //
-        // Copy file system name safely — only when we have a full (non-truncated) response
+        // Copy file system name safely â€” only when we have a full (non-truncated) response
         //
         if (volumeProps->FileSystemDriverName.Length > 0 &&
             volumeProps->FileSystemDriverName.Buffer != NULL) {
@@ -2811,7 +2813,7 @@ ShadowStrikeInitFileReadContext(
     }
 
     //
-    // Allocate read buffer — prefer lookaside for standard chunk size.
+    // Allocate read buffer â€” prefer lookaside for standard chunk size.
     // Use rundown protection to prevent use-after-free if the lookaside
     // is deleted concurrently during driver unload.
     //
@@ -3000,7 +3002,7 @@ ShadowpValidateReparseBuffer(
 
         //
         // Calculate data area available for path strings.
-        // ReparseDataLength includes the fixed fields (4×USHORT + Flags ULONG = 12 bytes)
+        // ReparseDataLength includes the fixed fields (4Ã—USHORT + Flags ULONG = 12 bytes)
         // before PathBuffer. SubstituteNameOffset/PrintNameOffset are relative to
         // PathBuffer[0], so subtract the fixed-field size.
         //
@@ -3310,7 +3312,7 @@ ShadowStrikeGetFileOwner(
     }
 
     //
-    // Query security descriptor — retry with proper size if initial buffer is too small
+    // Query security descriptor â€” retry with proper size if initial buffer is too small
     //
     status = FltQuerySecurityObject(
         Instance,
@@ -3550,7 +3552,7 @@ ShadowStrikeIsExecuteAccess(
 
     if (Data->Iopb->MajorFunction != IRP_MJ_CREATE) {
         //
-        // Check for section acquisition — only treat as execute if
+        // Check for section acquisition â€” only treat as execute if
         // the page protection indicates execution intent.
         //
         if (Data->Iopb->MajorFunction == IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION) {

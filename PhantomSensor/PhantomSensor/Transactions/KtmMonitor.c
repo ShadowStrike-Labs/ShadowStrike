@@ -1,3 +1,5 @@
+// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -81,7 +83,7 @@ ShadowCreateKtmCommunicationPort(
 #define SHADOW_KTM_PORT_NAME L"\\ShadowStrikeKtmPort"
 
 // ============================================================================
-// REFERENCE COUNTING — CAS LOOP IMPLEMENTATION
+// REFERENCE COUNTING â€” CAS LOOP IMPLEMENTATION
 // ============================================================================
 
 /**
@@ -120,7 +122,7 @@ ShadowReferenceKtmTransaction(
         }
 
         //
-        // CAS failed — another thread modified the refcount. Retry.
+        // CAS failed â€” another thread modified the refcount. Retry.
         //
     }
 }
@@ -128,7 +130,7 @@ ShadowReferenceKtmTransaction(
 /**
  * @brief Release transaction reference.
  *
- * On final release (refcount → 0), sets DESTROYING sentinel and frees.
+ * On final release (refcount â†’ 0), sets DESTROYING sentinel and frees.
  * On detected underflow or double-free, logs and leaks rather than
  * crashing the customer's machine.
  */
@@ -146,12 +148,12 @@ ShadowReleaseKtmTransaction(
 
     //
     // Validate magic before touching refcount. If magic is wrong,
-    // we are operating on freed / corrupted memory — do not touch it.
+    // we are operating on freed / corrupted memory â€” do not touch it.
     //
     if (Transaction->Magic != SHADOW_KTM_TRANSACTION_MAGIC) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "[ShadowStrike] KTM: Release called on transaction with bad magic "
-                   "(0x%08lX != 0x%08lX) — memory corruption suspected, leaking\n",
+                   "(0x%08lX != 0x%08lX) â€” memory corruption suspected, leaking\n",
                    Transaction->Magic, SHADOW_KTM_TRANSACTION_MAGIC);
         InterlockedIncrement64(&g_KtmMonitorState.Stats.RefCountRaces);
         return;
@@ -159,7 +161,7 @@ ShadowReleaseKtmTransaction(
 
     //
     // Pre-check: if refcount is already <= 0 this is a double-free.
-    // Log and leak — never crash the customer's machine for a refcount bug.
+    // Log and leak â€” never crash the customer's machine for a refcount bug.
     //
     if (Transaction->ReferenceCount <= 0) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -198,7 +200,7 @@ ShadowReleaseKtmTransaction(
     }
     else if (newRefCount < 0) {
         //
-        // Underflow race — restore and leak. Do NOT bugcheck.
+        // Underflow race â€” restore and leak. Do NOT bugcheck.
         //
         InterlockedIncrement(&Transaction->ReferenceCount);
 
@@ -304,7 +306,7 @@ ShadowGetProcessImageName(
 
 /**
  * @brief Check if cached process name matches a suspicious process.
- *        Uses only the embedded ProcessName field — safe at any IRQL.
+ *        Uses only the embedded ProcessName field â€” safe at any IRQL.
  */
 static BOOLEAN
 ShadowIsSuspiciousProcessCached(
@@ -439,7 +441,7 @@ ShadowKtmPortMessageNotify(
 
     //
     // Handle statistics query. Copy to kernel stack first, THEN to
-    // user-mode buffer — ShadowGetKtmStatistics acquires a spinlock
+    // user-mode buffer â€” ShadowGetKtmStatistics acquires a spinlock
     // (DISPATCH_LEVEL), so writing directly to user-mode would BSOD
     // if the page is paged out (IRQL_NOT_LESS_OR_EQUAL).
     //
@@ -700,7 +702,7 @@ ShadowCleanupKtmMonitor(
     InterlockedExchange(&state->InitializationState, KTM_STATE_SHUTTING_DOWN);
 
     //
-    // Unregister callbacks FIRST — no new callbacks after this returns
+    // Unregister callbacks FIRST â€” no new callbacks after this returns
     //
     ShadowUnregisterTransactionCallbacks();
 
@@ -711,7 +713,7 @@ ShadowCleanupKtmMonitor(
     ShadowCleanupKtmAlertQueue();
 
     //
-    // Close communication ports — server port first to stop new connections,
+    // Close communication ports â€” server port first to stop new connections,
     // then client port.
     //
     if (state->ServerPort != NULL) {
@@ -789,9 +791,10 @@ ShadowRegisterTransactionCallbacks(
     pTmTxType = (POBJECT_TYPE*)MmGetSystemRoutineAddress(&tmTxTypeName);
     pTmRmType = (POBJECT_TYPE*)MmGetSystemRoutineAddress(&tmRmTypeName);
 
-    if (pTmTxType == NULL || *pTmTxType == NULL) {
+    if (pTmTxType == NULL || *pTmTxType == NULL ||
+        pTmRmType == NULL || *pTmRmType == NULL) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] TmTx type not available — fallback mode\n");
+                   "[ShadowStrike] TmTx/TmRm type not available - fallback mode\n");
         state->TransactionCallbackHandle = NULL;
         state->CallbacksRegistered = FALSE;
         return STATUS_SUCCESS;
@@ -830,7 +833,7 @@ ShadowRegisterTransactionCallbacks(
 
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] ObRegisterCallbacks failed: 0x%X — fallback mode\n", status);
+                   "[ShadowStrike] ObRegisterCallbacks failed: 0x%X â€” fallback mode\n", status);
         state->TransactionCallbackHandle = NULL;
         state->CallbacksRegistered = FALSE;
         return STATUS_SUCCESS;
@@ -1043,7 +1046,7 @@ ShadowFindKtmTransaction(
 }
 
 // ============================================================================
-// THREAT SCORING (DISPATCH_LEVEL SAFE — uses cached data only)
+// THREAT SCORING (DISPATCH_LEVEL SAFE â€” uses cached data only)
 // ============================================================================
 
 /**
@@ -1098,7 +1101,7 @@ ShadowCalculateKtmThreatScore(
     }
 
     //
-    // FACTOR 2: Suspicious process (uses cached name — safe at any IRQL)
+    // FACTOR 2: Suspicious process (uses cached name â€” safe at any IRQL)
     //
     if (ShadowIsSuspiciousProcessCached(Transaction->ProcessName)) {
         score += 15;
@@ -1133,7 +1136,7 @@ ShadowCalculateKtmThreatScore(
 }
 
 // ============================================================================
-// FILE EXTENSION CHECK (DISPATCH_LEVEL SAFE — pool-allocated buffer)
+// FILE EXTENSION CHECK (DISPATCH_LEVEL SAFE â€” pool-allocated buffer)
 // ============================================================================
 
 /**
@@ -1168,7 +1171,7 @@ ShadowIsRansomwareTargetFile(
     }
 
     //
-    // Allocate from NonPagedPool — safe at DISPATCH_LEVEL
+    // Allocate from NonPagedPool â€” safe at DISPATCH_LEVEL
     //
     lowerBuf = (PWCHAR)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
@@ -1422,7 +1425,7 @@ ShadowQueueKtmAlert(
     KIRQL oldIrql;
 
     //
-    // Allocate from lookaside (NonPagedPool — safe at DISPATCH)
+    // Allocate from lookaside (NonPagedPool â€” safe at DISPATCH)
     //
     if (state->AlertLookasideInitialized) {
         alert = (PSHADOW_KTM_ALERT)ExAllocateFromNPagedLookasideList(
@@ -1501,7 +1504,7 @@ ShadowQueueKtmAlert(
  *
  * Allocates a FLT_TRANSACTION_CONTEXT containing the transaction GUID and
  * originating process ID, sets it on the transaction, then enlists for
- * COMMIT + ROLLBACK notifications. Idempotent — if a context already exists
+ * COMMIT + ROLLBACK notifications. Idempotent â€” if a context already exists
  * on this instance+transaction pair, returns STATUS_SUCCESS without re-enlisting.
  *
  * On enlistment success, Filter Manager will invoke ShadowKtmNotificationCallback
@@ -1572,7 +1575,7 @@ ShadowKtmEnlistInTransaction(
 
     //
     // Set the context on the transaction. KEEP_IF_EXISTS handles the race
-    // where two threads detect the same transaction simultaneously — the
+    // where two threads detect the same transaction simultaneously â€” the
     // loser gets STATUS_FLT_CONTEXT_ALREADY_DEFINED and skips enlistment.
     //
     status = FltSetTransactionContext(
@@ -1606,7 +1609,7 @@ ShadowKtmEnlistInTransaction(
 
     if (!NT_SUCCESS(status)) {
         //
-        // Enlistment failed — remove the context we just set.
+        // Enlistment failed â€” remove the context we just set.
         // FltDeleteTransactionContext will trigger context teardown.
         //
         FltDeleteTransactionContext(Instance, Transaction, NULL);
@@ -1674,7 +1677,7 @@ ShadowKtmNotificationCallback(
 
     if (!NT_SUCCESS(findStatus) || trackedTxn == NULL) {
         //
-        // Transaction evicted from LRU — count the event for statistics.
+        // Transaction evicted from LRU â€” count the event for statistics.
         //
         if (NotificationMask & TRANSACTION_NOTIFY_COMMIT) {
             InterlockedIncrement64(&g_KtmMonitorState.Stats.TotalCommits);
@@ -1848,7 +1851,7 @@ ShadowTransactionPreOperationCallback(
     }
 
     //
-    // Always null-terminate — we allocated extra sizeof(WCHAR) above
+    // Always null-terminate â€” we allocated extra sizeof(WCHAR) above
     // to guarantee this is within bounds even when Length == MaximumLength.
     //
     objectNameInfo->Name.Buffer[objectNameInfo->Name.Length / sizeof(WCHAR)] = L'\0';
@@ -1959,7 +1962,7 @@ ShadowTransactionPostOperationCallback(
     // The pre-op callback already counts actual blocks when it strips
     // TRANSACTION_COMMIT/ROLLBACK access bits. Failed handle creations
     // in post-op can be caused by other security products, access checks,
-    // or unrelated reasons — counting them here would inflate the metric.
+    // or unrelated reasons â€” counting them here would inflate the metric.
     //
     UNREFERENCED_PARAMETER(OperationInformation);
 }
@@ -2031,7 +2034,7 @@ ShadowCleanupTransactionEntries(
         //
         // Drain outstanding references with timeout.
         // Since callbacks are already unregistered, no NEW references
-        // can be taken — we only wait for in-flight ones to complete.
+        // can be taken â€” we only wait for in-flight ones to complete.
         //
         ULONG spinCount = 0;
         while (transaction->ReferenceCount > 1 &&

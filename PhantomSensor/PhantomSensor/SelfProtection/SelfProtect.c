@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -105,7 +107,7 @@ static SHADOWSTRIKE_PROTECTED_REGKEY g_ProtectedRegKeys[SHADOWSTRIKE_MAX_PROTECT
 static EX_SPIN_LOCK   g_ProtectedRegKeyLock;
 
 //
-// Statistics — updated via InterlockedIncrement64, snapshot under spin lock.
+// Statistics â€” updated via InterlockedIncrement64, snapshot under spin lock.
 //
 static SHADOWSTRIKE_SELFPROTECT_STATS g_SelfProtectStats;
 static EX_SPIN_LOCK   g_SelfProtectStatsLock;
@@ -246,7 +248,7 @@ SspStripThreadAccess(
     ACCESS_MASK stripped = original;
 
     //
-    // Strip thread rights corresponding to protection flags — mirrors
+    // Strip thread rights corresponding to protection flags â€” mirrors
     // the per-flag granularity of SspStripProcessAccess.
     //
     if (ProtectionFlags & ProtectionFlagBlockTerminate) {
@@ -412,7 +414,7 @@ ShadowStrikeInitializeSelfProtection(
     KeInitializeEvent(&g_SelfProtectDrainEvent, NotificationEvent, FALSE);
 
     //
-    // Mark initialized — publish with full barrier
+    // Mark initialized â€” publish with full barrier
     //
     InterlockedExchange(&g_SelfProtectInitialized, 1);
 
@@ -444,17 +446,17 @@ ShadowStrikeShutdownSelfProtection(
                "[ShadowStrike] Shutting down self-protection\n");
 
     //
-    // Phase 1: Signal shutdown — no new operations will start
+    // Phase 1: Signal shutdown â€” no new operations will start
     //
     InterlockedExchange(&g_SelfProtectShuttingDown, 1);
 
     //
     // Phase 2: Wait for in-flight operations to drain.
-    // Loop with bounded retries — proceeding with active ops causes UAF.
+    // Loop with bounded retries â€” proceeding with active ops causes UAF.
     //
     {
         LONG drainRetries = 0;
-        const LONG maxDrainRetries = 10;  // 10 × 5s = 50s maximum
+        const LONG maxDrainRetries = 10;  // 10 Ã— 5s = 50s maximum
 
         while (ReadNoFence(&g_SelfProtectActiveOps) > 0 && drainRetries < maxDrainRetries) {
             timeout.QuadPart = -50000000LL;  // 5 seconds per attempt
@@ -528,7 +530,7 @@ ShadowStrikeShutdownSelfProtection(
     InterlockedExchange(&g_SelfProtectInitialized, 0);
 
     //
-    // Log final stats (safe — no concurrent access after drain)
+    // Log final stats (safe â€” no concurrent access after drain)
     //
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Self-protection stats: HandleStrips=%lld, TermBlocks=%lld, "
@@ -605,7 +607,7 @@ ShadowStrikeProtectProcess(
     }
 
     //
-    // Allocate entry (NonPagedPoolNx — accessed from DISPATCH_LEVEL callbacks)
+    // Allocate entry (NonPagedPoolNx â€” accessed from DISPATCH_LEVEL callbacks)
     //
     newEntry = (PSHADOWSTRIKE_PROTECTED_PROCESS_ENTRY)ShadowStrikeAllocatePoolWithTag(
         NonPagedPool,
@@ -633,7 +635,7 @@ ShadowStrikeProtectProcess(
     }
 
     //
-    // Insert under exclusive spin lock — check for duplicates
+    // Insert under exclusive spin lock â€” check for duplicates
     //
     oldIrql = ExAcquireSpinLockExclusive(&g_ProtectedProcessLock);
 
@@ -1172,7 +1174,7 @@ ShadowStrikeObjectPreCallback(
 
         //
         // Check if target is protected using PEPROCESS pointer comparison
-        // (PID-reuse safe — stored PEPROCESS is ref-counted and unique)
+        // (PID-reuse safe â€” stored PEPROCESS is ref-counted and unique)
         //
         if (!SspIsProcessProtectedByObject(targetProcess, &targetFlags)) {
             goto Exit;

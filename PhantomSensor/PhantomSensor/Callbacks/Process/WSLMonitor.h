@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -24,17 +26,17 @@ ShadowStrike NGAV - WSL/CONTAINER MONITORING MODULE
 @brief Windows Subsystem for Linux and container escape detection.
 
 Monitors WSL2 process activity and detects container-to-host escape attempts:
-  - WSL process chain identification (wsl.exe → wslhost.exe → Pico processes)
+  - WSL process chain identification (wsl.exe â†’ wslhost.exe â†’ Pico processes)
   - Pico process subsystem detection (LxssManager)
-  - WSL-to-Windows filesystem access monitoring (/mnt/c/ → C:\ mapping)
+  - WSL-to-Windows filesystem access monitoring (/mnt/c/ â†’ C:\ mapping)
   - Container escape pattern detection
   - Cross-subsystem process creation tracking
 
 Integration Points:
-  - ProcessNotify callback → WslMonCheckProcessCreate()
-  - ImageNotify callback → WslMonCheckImageLoad()
-  - PreCreate callback → WslMonCheckFileAccess()
-  - DriverEntry → WslMonInitialize() / WslMonShutdown()
+  - ProcessNotify callback â†’ WslMonCheckProcessCreate()
+  - ImageNotify callback â†’ WslMonCheckImageLoad()
+  - PreCreate callback â†’ WslMonCheckFileAccess()
+  - DriverEntry â†’ WslMonInitialize() / WslMonShutdown()
 
 MITRE ATT&CK Coverage:
   - T1610: Deploy Container
@@ -150,7 +152,7 @@ typedef struct _WSL_STATISTICS {
 } WSL_STATISTICS, *PWSL_STATISTICS;
 
 // ============================================================================
-// PUBLIC API — LIFECYCLE
+// PUBLIC API â€” LIFECYCLE
 // ============================================================================
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -163,7 +165,7 @@ VOID
 WslMonShutdown(VOID);
 
 // ============================================================================
-// PUBLIC API — DETECTION (called from existing callbacks)
+// PUBLIC API â€” DETECTION (called from existing callbacks)
 // ============================================================================
 
 /**

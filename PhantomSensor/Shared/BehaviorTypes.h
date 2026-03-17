@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -251,7 +253,7 @@ typedef enum _BEHAVIOR_EVENT_TYPE {
     BehaviorEvent_FirmwareBootkitDetected       = 0x0E03,
     BehaviorEvent_FirmwareIntegrityFailure      = 0x0E04,
 
-    // Clipboard Abuse Events (0x0F00 - 0x0F04) — MITRE T1115
+    // Clipboard Abuse Events (0x0F00 - 0x0F04) â€” MITRE T1115
     BehaviorEvent_ClipboardCommandLine          = 0x0F00,
     BehaviorEvent_ClipboardStealerImage         = 0x0F01,
     BehaviorEvent_ClipboardRapidTempWrites      = 0x0F02,
@@ -664,7 +666,7 @@ typedef struct _ATTACK_CHAIN_SUMMARY {
     // Variable: ATTACK_CHAIN_ENTRY entries follow
 } ATTACK_CHAIN_SUMMARY, *PATTACK_CHAIN_SUMMARY;
 
-// Attack chain flags (guarded — canonical definitions in AttackPatterns.h)
+// Attack chain flags (guarded â€” canonical definitions in AttackPatterns.h)
 #ifndef CHAIN_FLAG_ACTIVE
 #define CHAIN_FLAG_ACTIVE                 0x00000001  // Chain is still active
 #endif
@@ -736,7 +738,7 @@ typedef struct _BEHAVIOR_RULE {
     // Variable: Rule conditions follow
 } BEHAVIOR_RULE, *PBEHAVIOR_RULE;
 
-// Rule flags (guarded — canonical definitions in AttackPatterns.h)
+// Rule flags (guarded â€” canonical definitions in AttackPatterns.h)
 #ifndef RULE_FLAG_ENABLED
 #define RULE_FLAG_ENABLED                 0x00000001
 #endif

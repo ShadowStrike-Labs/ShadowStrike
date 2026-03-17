@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -2626,7 +2628,7 @@ Routine Description:
     }
 
     //
-    // Check for ShadowStrike (our EDR) — image name heuristic.
+    // Check for ShadowStrike (our EDR) â€” image name heuristic.
     // Full code-signing verification is performed by the SelfProtection module
     // via ShadowStrikeIsProcessProtected() in the main callback path.
     //
@@ -2787,7 +2789,7 @@ Routine Description:
     }
 
     //
-    // Build alert payload (no header — batch callback adds it)
+    // Build alert payload (no header â€” batch callback adds it)
     //
     RtlZeroMemory(&Alert, sizeof(Alert));
 
@@ -3032,5 +3034,5 @@ Routine Description:
 
 
 // ============================================================================
-// Legacy wrapper ShadowStrikeProcessPreCallback removed — canonical
+// Legacy wrapper ShadowStrikeProcessPreCallback removed â€” canonical
 // implementation is in ObjectCallback.c

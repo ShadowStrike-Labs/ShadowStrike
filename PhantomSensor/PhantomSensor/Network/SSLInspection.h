@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -26,7 +28,7 @@
     - EX_PUSH_LOCK used for all list protection.
     - EX_RUNDOWN_REF used for safe shutdown draining.
     - Sessions are reference-counted; callers receive a snapshot (SSL_SESSION_INFO)
-      that is a standalone copy — no pointers into internal lists.
+      that is a standalone copy â€” no pointers into internal lists.
     - Internal sessions (SSL_SESSION) live on the SessionList and are
       exclusively owned by the inspector; never returned to callers.
 
@@ -75,7 +77,7 @@ typedef enum _SSL_VERSION {
 } SSL_VERSION;
 
 //=============================================================================
-// TLS Suspicion Flags — used with InterlockedOr, must be LONG-compatible
+// TLS Suspicion Flags â€” used with InterlockedOr, must be LONG-compatible
 //=============================================================================
 
 typedef enum _SSL_SUSPICION {
@@ -117,7 +119,7 @@ typedef struct _SSL_CERT_INFO {
 } SSL_CERT_INFO, *PSSL_CERT_INFO;
 
 //=============================================================================
-// SSL_SESSION_INFO — Caller-visible snapshot (value type, no list linkage)
+// SSL_SESSION_INFO â€” Caller-visible snapshot (value type, no list linkage)
 //
 // Returned from SslInspectClientHello. Caller owns this allocation and
 // must free it via SslFreeSessionInfo. Contains NO internal pointers.
@@ -162,16 +164,16 @@ typedef struct _SSL_SESSION_INFO {
 typedef struct _SSL_INSPECTOR {
     volatile LONG Initialized;
 
-    // Shutdown synchronization — every public API acquires rundown
+    // Shutdown synchronization â€” every public API acquires rundown
     EX_RUNDOWN_REF RundownRef;
 
-    // Sessions — protected by SessionLock
+    // Sessions â€” protected by SessionLock
     LIST_ENTRY SessionList;
     EX_PUSH_LOCK SessionLock;
     volatile LONG SessionCount;
     volatile LONG64 NextSessionId;
 
-    // Known bad JA3 — protected by BadJA3Lock
+    // Known bad JA3 â€” protected by BadJA3Lock
     LIST_ENTRY BadJA3List;
     EX_PUSH_LOCK BadJA3Lock;
     volatile LONG BadJA3Count;
@@ -214,7 +216,7 @@ SslShutdown(
     );
 
 //
-// SslInspectClientHello — parses ClientHello, creates internal session,
+// SslInspectClientHello â€” parses ClientHello, creates internal session,
 // returns a SNAPSHOT copy to the caller. Caller must free via SslFreeSessionInfo.
 //
 _IRQL_requires_max_(APC_LEVEL)
@@ -231,7 +233,7 @@ SslInspectClientHello(
     );
 
 //
-// SslInspectServerHello — parses ServerHello, updates the existing internal session.
+// SslInspectServerHello â€” parses ServerHello, updates the existing internal session.
 // All mutation is done under SessionLock exclusive.
 //
 _IRQL_requires_max_(APC_LEVEL)
@@ -246,7 +248,7 @@ SslInspectServerHello(
     );
 
 //
-// SslCalculateJA3 — standalone JA3 computation (no inspector state needed).
+// SslCalculateJA3 â€” standalone JA3 computation (no inspector state needed).
 //
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
@@ -257,7 +259,7 @@ SslCalculateJA3(
     );
 
 //
-// SslAddBadJA3 — atomically checks for duplicate + inserts under exclusive lock.
+// SslAddBadJA3 â€” atomically checks for duplicate + inserts under exclusive lock.
 //
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
@@ -268,7 +270,7 @@ SslAddBadJA3(
     );
 
 //
-// SslCheckJA3 — checks if a JA3 hash matches the known-bad list.
+// SslCheckJA3 â€” checks if a JA3 hash matches the known-bad list.
 //
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
@@ -281,7 +283,7 @@ SslCheckJA3(
     );
 
 //
-// SslRemoveSession — removes and frees an internal session by endpoint.
+// SslRemoveSession â€” removes and frees an internal session by endpoint.
 //
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
@@ -308,8 +310,8 @@ SslGetStatistics(
     );
 
 //
-// SslFreeSessionInfo — frees a snapshot returned by SslInspectClientHello.
-// This is a pure free of the caller's copy — no list removal.
+// SslFreeSessionInfo â€” frees a snapshot returned by SslInspectClientHello.
+// This is a pure free of the caller's copy â€” no list removal.
 //
 _IRQL_requires_max_(APC_LEVEL)
 VOID
@@ -318,7 +320,7 @@ SslFreeSessionInfo(
     );
 
 //
-// SslCleanupStaleSessions — evicts sessions older than SSL_SESSION_STALE_MS.
+// SslCleanupStaleSessions â€” evicts sessions older than SSL_SESSION_STALE_MS.
 // Call periodically (e.g., from a timer work item).
 //
 _IRQL_requires_max_(APC_LEVEL)

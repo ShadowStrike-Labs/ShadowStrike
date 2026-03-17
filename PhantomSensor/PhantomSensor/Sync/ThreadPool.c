@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -31,7 +33,7 @@
  *   and priority at startup (not from creating thread).
  * - All pool configuration changes require PASSIVE_LEVEL.
  * - Counters (ThreadCount, IdleThreadCount, RunningThreadCount) are
- *   volatile LONGs, updated with Interlocked* ops — safe at any IRQL.
+ *   volatile LONGs, updated with Interlocked* ops â€” safe at any IRQL.
  *
  * Synchronization:
  * - ThreadListLock (KSPIN_LOCK): protects ThreadList add/remove.
@@ -42,12 +44,12 @@
  * - ScaleInProgress (InterlockedCAS): prevents concurrent scale operations.
  *
  * Thread Lifecycle:
- * - TppCreateThread: alloc info → PsCreateSystemThread → ObReferenceObjectByHandle
- *   → add to list → signal StartEvent. PASSIVE_LEVEL only.
- * - TppDestroyThread: signal StopEvent → wait → ObDereference → ZwClose
- *   → cleanup callback → free. PASSIVE_LEVEL only.
- * - Worker thread exit: save pre-exit state → decrement correct counter
- *   → remove self from list under spinlock → decrement ThreadCount.
+ * - TppCreateThread: alloc info â†’ PsCreateSystemThread â†’ ObReferenceObjectByHandle
+ *   â†’ add to list â†’ signal StartEvent. PASSIVE_LEVEL only.
+ * - TppDestroyThread: signal StopEvent â†’ wait â†’ ObDereference â†’ ZwClose
+ *   â†’ cleanup callback â†’ free. PASSIVE_LEVEL only.
+ * - Worker thread exit: save pre-exit state â†’ decrement correct counter
+ *   â†’ remove self from list under spinlock â†’ decrement ThreadCount.
  *
  * Memory:
  * - All allocations use ShadowStrikeAllocatePoolWithTag / ShadowStrikeFreePoolWithTag.
@@ -158,7 +160,7 @@ struct _TP_THREAD_POOL {
     LARGE_INTEGER LastScaleTime;
     volatile LONG ScaleInProgress;
 
-    // DPC → work item deferral for scaling
+    // DPC â†’ work item deferral for scaling
     PIO_WORKITEM ScaleWorkItem;
     PDEVICE_OBJECT DeviceObject;
     volatile LONG ScaleWorkItemQueued;
@@ -377,7 +379,7 @@ TpCreate(
     KeInitializeDpc(&pool->ScaleDpc, TppScaleDpcRoutine, pool);
 
     //
-    // Allocate scale work item (for DPC → PASSIVE deferral)
+    // Allocate scale work item (for DPC â†’ PASSIVE deferral)
     //
     if (pool->DeviceObject != NULL) {
         pool->ScaleWorkItem = IoAllocateWorkItem(pool->DeviceObject);
@@ -1001,7 +1003,7 @@ TpSetAffinity(
     }
 
     //
-    // Store new mask — new threads will use this at startup
+    // Store new mask â€” new threads will use this at startup
     //
     Pool->AffinityMask = AffinityMask;
 
@@ -1036,7 +1038,7 @@ TpSetAffinity(
         KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
 
         //
-        // Apply at PASSIVE_LEVEL. Thread objects are referenced — safe even
+        // Apply at PASSIVE_LEVEL. Thread objects are referenced â€” safe even
         // if auto-scaling concurrently destroys the thread.
         //
         for (i = 0; i < handleCount; i++) {
@@ -1269,7 +1271,7 @@ TppCreateThread(
     *ThreadInfo = NULL;
 
     //
-    // Allocate thread info — always use the same allocator
+    // Allocate thread info â€” always use the same allocator
     //
     info = (PTP_THREAD_INFO)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
@@ -1418,7 +1420,7 @@ TppDestroyThread(
         );
         if (waitStatus == STATUS_TIMEOUT) {
             //
-            // Thread still running — revert to self-cleanup to prevent UAF.
+            // Thread still running â€” revert to self-cleanup to prevent UAF.
             // Thread's exit path will handle ObDeref + ZwClose + free.
             //
             InterlockedExchange(&ThreadInfo->OwnerWillDestroy, 0);
@@ -1426,7 +1428,7 @@ TppDestroyThread(
         }
     } else if (!Wait) {
         //
-        // Caller doesn't want to wait — let thread self-cleanup.
+        // Caller doesn't want to wait â€” let thread self-cleanup.
         //
         InterlockedExchange(&ThreadInfo->OwnerWillDestroy, 0);
         return;
@@ -1609,14 +1611,14 @@ TppWorkerThreadRoutine(
         }
 
         //
-        // If signaled by StopEvent or ShutdownEvent → exit
+        // If signaled by StopEvent or ShutdownEvent â†’ exit
         //
         if (waitStatus == STATUS_WAIT_1 || waitStatus == STATUS_WAIT_2) {
             break;
         }
 
         //
-        // If work semaphore was signaled → execute work
+        // If work semaphore was signaled â†’ execute work
         //
         if (waitStatus == STATUS_WAIT_0) {
             //
@@ -1631,7 +1633,7 @@ TppWorkerThreadRoutine(
 
             if (executor != NULL) {
                 //
-                // Transition: Idle → Running
+                // Transition: Idle â†’ Running
                 //
                 threadInfo->State = TpThreadState_Running;
                 InterlockedDecrement(&pool->IdleThreadCount);
@@ -1672,7 +1674,7 @@ TppWorkerThreadRoutine(
                 InterlockedIncrement64(&pool->Stats.TotalWorkItems);
 
                 //
-                // Transition: Running → Idle
+                // Transition: Running â†’ Idle
                 //
                 InterlockedExchange(&threadInfo->IsExecuting, 0);
                 InterlockedDecrement(&pool->RunningThreadCount);
@@ -1690,7 +1692,7 @@ ExitCleanup:
     //
     // Only decrement pool counters if this thread was registered in the pool.
     // Threads that failed ObReferenceObjectByHandle during creation were never
-    // added to the pool list or counted — decrementing would corrupt counters.
+    // added to the pool list or counted â€” decrementing would corrupt counters.
     //
     if (threadInfo->Registered) {
         //
@@ -1737,7 +1739,7 @@ ExitCleanup:
     // Self-cleanup: only if NOT owned by TppDestroyThread.
     // This covers: (1) scale-down, (2) unregistered threads (ObRef failure),
     // (3) threads that self-remove during shutdown before TpDestroy collects them.
-    // OwnerWillDestroy is the sole discriminator — set by TppDestroyThread
+    // OwnerWillDestroy is the sole discriminator â€” set by TppDestroyThread
     // before signaling stop.
     //
     if (!threadInfo->OwnerWillDestroy) {
@@ -1773,7 +1775,7 @@ ExitCleanup:
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - SCALING (DPC → WORK ITEM → PASSIVE_LEVEL)
+// PRIVATE IMPLEMENTATION - SCALING (DPC â†’ WORK ITEM â†’ PASSIVE_LEVEL)
 // ============================================================================
 
 /**
@@ -1966,7 +1968,7 @@ TppEvaluateScaling(
 
                 if (idleTime.QuadPart / 10000 >= (LONGLONG)Pool->IdleTimeoutMs) {
                     //
-                    // DON'T remove from list here — the thread will self-remove on exit
+                    // DON'T remove from list here â€” the thread will self-remove on exit
                     //
                     threadToRemove = ti;
                     break;
@@ -1994,7 +1996,7 @@ TppEvaluateScaling(
 // ============================================================================
 
 /**
- * @brief Default work executor — logs a warning and returns.
+ * @brief Default work executor â€” logs a warning and returns.
  *
  * If no executor is set, work signals are consumed with a warning.
  * In production, callers MUST set a real executor via TpSetWorkExecutor
@@ -2071,7 +2073,7 @@ TppReleasePoolReference(
  * @brief Set kernel thread priority.
  *
  * Uses KeSetPriorityThread (absolute priority), NOT KeSetBasePriorityThread
- * (which takes a priority INCREMENT, not an absolute value — HIGH-06 fix).
+ * (which takes a priority INCREMENT, not an absolute value â€” HIGH-06 fix).
  *
  * KeSetPriorityThread is safe at any IRQL.
  */
@@ -2109,7 +2111,7 @@ TppSetThreadPriority(
 
     //
     // HIGH-06 fix: KeSetPriorityThread takes absolute priority.
-    // KeSetBasePriorityThread takes an INCREMENT — wrong API for absolute values.
+    // KeSetBasePriorityThread takes an INCREMENT â€” wrong API for absolute values.
     //
     KeSetPriorityThread(Thread, absolutePriority);
 }

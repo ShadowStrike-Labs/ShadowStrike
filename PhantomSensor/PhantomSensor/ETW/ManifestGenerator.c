@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -518,7 +520,7 @@ Return Value:
     }
 
     //
-    // Register default levels (no lock needed — not yet published)
+    // Register default levels (no lock needed â€” not yet published)
     //
     Status = MgpRegisterDefaultLevels(NewGenerator);
     if (!NT_SUCCESS(Status)) {
@@ -578,7 +580,7 @@ Arguments:
 
     //
     // Release our init reference and wait for all in-flight operations to complete.
-    // Timeout after 10 seconds to prevent hang — log and proceed if hit.
+    // Timeout after 10 seconds to prevent hang â€” log and proceed if hit.
     //
     if (InterlockedDecrement(&Generator->ReferenceCount) > 0) {
         Timeout.QuadPart = -10LL * 10 * 1000 * 1000;   // 10 seconds relative
@@ -2209,7 +2211,7 @@ Return Value:
     PAGED_CODE();
 
     //
-    // No explicit MgpAcquireReference needed — MgRegisterChannel handles ref counting.
+    // No explicit MgpAcquireReference needed â€” MgRegisterChannel handles ref counting.
     // Just validate the generator pointer.
     //
     if (Generator == NULL || !Generator->Initialized || Generator->ShuttingDown) {
@@ -2783,7 +2785,7 @@ Routine Description:
     }
 
     //
-    // Provider opening — escape all string attributes to prevent XML injection
+    // Provider opening â€” escape all string attributes to prevent XML injection
     //
     Status = MgpStringBuilderAppend(Builder, "            <provider\r\n                name=\"");
     if (!NT_SUCCESS(Status)) return Status;

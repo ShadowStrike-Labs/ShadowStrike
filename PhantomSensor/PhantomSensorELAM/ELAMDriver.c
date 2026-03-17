@@ -1,3 +1,7 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -131,7 +135,7 @@ ElamDriverInitialize(
     UNREFERENCED_PARAMETER(RegistryPath);
 
     //
-    // Atomically claim initialization (0→1). Prevents double-init race
+    // Atomically claim initialization (0â†’1). Prevents double-init race
     // where two threads both read 0, then both zero + initialize.
     //
     if (InterlockedCompareExchange(&g_ElamGlobals.Initialized, 1, 0) != 0) {
@@ -225,7 +229,7 @@ VOID
 ElamDriverShutdown(VOID)
 {
     //
-    // CAS double-shutdown guard: atomically clear Initialized (1→0).
+    // CAS double-shutdown guard: atomically clear Initialized (1â†’0).
     // If not initialized or already shutdown, nothing to do.
     //
     if (InterlockedCompareExchange(&g_ElamGlobals.Initialized, 0, 1) != 1) {
@@ -441,7 +445,7 @@ ElamImageLoadCallback(
                 ElamTakeRemediationAction(threat, driverInfo);
             } else {
                 //
-                // No BTD threat but classified as bad by hash/cert — create one
+                // No BTD threat but classified as bad by hash/cert â€” create one
                 //
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                     "[ShadowStrike/ELAM] KNOWN BAD driver detected: %wZ\n",
@@ -474,7 +478,7 @@ ElamImageLoadCallback(
 
     //
     // Feed classification results into the ELAMCallbacks tracking subsystem.
-    // Maps ELAM classification → BDCB classification constants for the
+    // Maps ELAM classification â†’ BDCB classification constants for the
     // callback layer's policy engine and user notification pipeline.
     //
     if (g_ElamCallbacks != NULL) {
@@ -1002,7 +1006,7 @@ ElamRegistryCallbackRoutine(
                 //
                 // Monitor creation of new keys under protected boot driver paths.
                 // Use CmCallbackGetKeyObjectIDEx on RootObject to get the absolute
-                // parent path — CompleteName is relative and would never match our
+                // parent path â€” CompleteName is relative and would never match our
                 // absolute protected paths.
                 //
                 NTSTATUS lookupStatus;
@@ -1169,7 +1173,7 @@ ElamLoadSignatureData(
             if (!resEntry[i].NameIsString && resEntry[i].Id == 10) {  // RT_RCDATA
                 if (resEntry[i].DataIsDirectory) {
                     //
-                    // Descend into type directory → name directory → language entry
+                    // Descend into type directory â†’ name directory â†’ language entry
                     //
                     PIMAGE_RESOURCE_DIRECTORY nameDir;
                     ULONG nameDirOffset = resEntry[i].OffsetToDirectory;
@@ -1200,7 +1204,7 @@ ElamLoadSignatureData(
 
                                 if (nameEntry[j].DataIsDirectory) {
                                     //
-                                    // Language directory — take first entry
+                                    // Language directory â€” take first entry
                                     //
                                     PIMAGE_RESOURCE_DIRECTORY langDir;
                                     ULONG langOffset = nameEntry[j].OffsetToDirectory;
@@ -1326,7 +1330,7 @@ ElamLoadSignatureData(
 
 FallbackEmbedded:
     //
-    // No PE resource found — use minimal embedded signatures
+    // No PE resource found â€” use minimal embedded signatures
     //
     status = ElamLoadEmbeddedSignatures();
 
@@ -1611,7 +1615,7 @@ ElamTakeRemediationAction(
     }
 
     //
-    // Log the threat at ERROR level — this is always visible
+    // Log the threat at ERROR level â€” this is always visible
     //
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
         "[ShadowStrike/ELAM] REMEDIATION: threat=%s severity=%u driver=%wZ\n",
@@ -1621,10 +1625,10 @@ ElamTakeRemediationAction(
     //
     // Write a marker in the registry for the user-mode agent.
     // Path: HKLM\System\CurrentControlSet\Control\EarlyLaunch\BlockedDrivers
-    // Value: severity score — the agent reads this after boot to take action.
+    // Value: severity score â€” the agent reads this after boot to take action.
     //
     // Set self-exclusion flag so our registry callback allows these writes
-    // through — the BlockedDrivers path is under the protected EarlyLaunch prefix.
+    // through â€” the BlockedDrivers path is under the protected EarlyLaunch prefix.
     //
     InterlockedExchange(&g_SelfModifyingRegistry, 1);
 

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -301,12 +303,12 @@ EcInitialize(
     KeQuerySystemTimePrecise(&NewConsumer->CurrentSecondStart);
 
     //
-    // Initialize lookaside lists (cannot fail — ExInitializeNPagedLookasideList is void)
+    // Initialize lookaside lists (cannot fail â€” ExInitializeNPagedLookasideList is void)
     //
     EcpInitializeLookasideLists(NewConsumer);
 
     //
-    // Health check timer ID — created later in EcStart via TimerManager
+    // Health check timer ID â€” created later in EcStart via TimerManager
     //
     NewConsumer->HealthCheckTimerId = 0;
 
@@ -627,7 +629,7 @@ EcPause(
     }
 
     //
-    // Atomically transition Running → Paused.
+    // Atomically transition Running â†’ Paused.
     // Clear the resume event BEFORE setting state to prevent the race
     // where a thread sees Paused but the event is still signaled.
     //
@@ -641,7 +643,7 @@ EcPause(
 
     if (OldState != (LONG)EcState_Running) {
         //
-        // CAS failed — state wasn't Running. Restore the event we cleared.
+        // CAS failed â€” state wasn't Running. Restore the event we cleared.
         // No thread can be blocked on this event since state was never Paused.
         //
         KeSetEvent(&Consumer->FlowResumeEvent, IO_NO_INCREMENT, FALSE);
@@ -669,7 +671,7 @@ EcResume(
     }
 
     //
-    // Atomically transition Paused → Running.
+    // Atomically transition Paused â†’ Running.
     // Set the resume event AFTER state transition so threads see
     // Running when they wake.
     //
@@ -813,7 +815,7 @@ EcIngestEvent(
         }
 
         //
-        // Found a match — reference the subscription while holding lock
+        // Found a match â€” reference the subscription while holding lock
         // to prevent it from being freed between match and reference.
         //
         EcpReferenceSubscription(Sub);
@@ -825,7 +827,7 @@ EcIngestEvent(
 
     if (MatchedSub == NULL) {
         //
-        // No matching subscription — caller retains ownership
+        // No matching subscription â€” caller retains ownership
         //
         return STATUS_NOT_FOUND;
     }
@@ -1938,7 +1940,7 @@ EcpStopProcessingThreads(
 
         //
         // Wait INDEFINITELY for thread to exit. We MUST NOT proceed
-        // with cleanup while threads are still running — that causes
+        // with cleanup while threads are still running â€” that causes
         // use-after-free on the Consumer structure and all its contents.
         //
         if (Consumer->ProcessingThreads[i].ThreadObject != NULL) {
@@ -2017,7 +2019,7 @@ EcpProcessingThreadRoutine(
         }
 
         //
-        // Check if paused — wait on FlowResumeEvent AND StopEvent
+        // Check if paused â€” wait on FlowResumeEvent AND StopEvent
         // to prevent deadlock when stop is called while paused
         //
         if (InterlockedCompareExchange(&Consumer->State, 0, 0) == (LONG)EcState_Paused) {
@@ -2680,19 +2682,19 @@ EcEmitKernelEvent(
     }
 
     //
-    // Ingest into pipeline — ownership transfers on success
+    // Ingest into pipeline â€” ownership transfers on success
     //
     Status = EcIngestEvent(Consumer, Record);
     if (!NT_SUCCESS(Status) && Status != STATUS_NOT_FOUND) {
         //
-        // STATUS_NOT_FOUND means no matching subscription — expected when
+        // STATUS_NOT_FOUND means no matching subscription â€” expected when
         // no subscription covers this provider. Free the record.
         // All other errors also require cleanup.
         //
         EcFreeEventRecord(Consumer, Record);
     } else if (Status == STATUS_NOT_FOUND) {
         //
-        // No matching subscription — free record, return success to
+        // No matching subscription â€” free record, return success to
         // avoid caller treating this as a hard error.
         //
         EcFreeEventRecord(Consumer, Record);
@@ -2711,7 +2713,7 @@ EcEmitKernelEvent(
  *
  * This is a basic safety check to prevent accidentally registering
  * user-mode function pointers as kernel callbacks. It does NOT validate
- * that the address points to valid code — that requires deeper checks
+ * that the address points to valid code â€” that requires deeper checks
  * (e.g., MmIsAddressValid, which is itself unreliable for code pages).
  */
 static

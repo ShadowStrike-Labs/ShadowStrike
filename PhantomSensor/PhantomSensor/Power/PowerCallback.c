@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -34,7 +36,7 @@
  *   Lock-free query functions use volatile reads and are DISPATCH_LEVEL safe.
  *
  * Lock Ordering (to prevent deadlocks):
- *   StateLock → EventHistoryLock → CallbackLock
+ *   StateLock â†’ EventHistoryLock â†’ CallbackLock
  *   (Never acquire in reverse order)
  *
  * Work Item Safety:
@@ -152,7 +154,7 @@ typedef struct _SHADOW_POWER_GLOBALS {
     volatile LONG Enabled;
     volatile LONG ShuttingDown;
 
-    // Current state — protected by StateLock (EX_PUSH_LOCK, max APC_LEVEL)
+    // Current state â€” protected by StateLock (EX_PUSH_LOCK, max APC_LEVEL)
     SHADOW_POWER_STATE_INFO StateInfo;
     EX_PUSH_LOCK StateLock;
 
@@ -178,13 +180,13 @@ typedef struct _SHADOW_POWER_GLOBALS {
     PCALLBACK_OBJECT SystemStateCallback;
     PVOID SystemStateRegistration;
 
-    // Event history — protected by EventHistoryLock (push lock, max APC_LEVEL)
+    // Event history â€” protected by EventHistoryLock (push lock, max APC_LEVEL)
     LIST_ENTRY EventHistory;
     EX_PUSH_LOCK EventHistoryLock;
     volatile LONG EventCount;
     volatile LONG64 EventSequence;
 
-    // Registered callbacks — protected by CallbackLock (push lock, max APC_LEVEL)
+    // Registered callbacks â€” protected by CallbackLock (push lock, max APC_LEVEL)
     LIST_ENTRY CallbackList;
     EX_PUSH_LOCK CallbackLock;
     volatile LONG CallbackCount;
@@ -205,7 +207,7 @@ typedef struct _SHADOW_POWER_GLOBALS {
     PWR_DEFERRED_EVENT_CONTEXT DeferredCtx;
     KSPIN_LOCK DeferredCtxLock;
 
-    // Statistics — protected by StatsLock (push lock)
+    // Statistics â€” protected by StatsLock (push lock)
     // All volatile counters updated via Interlocked*, but durations need lock
     struct {
         volatile LONG64 TotalPowerEvents;
@@ -398,7 +400,7 @@ ShadowRegisterPowerCallbacks(
     InterlockedExchange(&g_PowerState.CurrentPowerSource, (LONG)ShadowPowerSource_Unknown);
 
     //
-    // Create worker thread for DISPATCH_LEVEL → PASSIVE_LEVEL deferral.
+    // Create worker thread for DISPATCH_LEVEL â†’ PASSIVE_LEVEL deferral.
     // Without this thread, system state callbacks (sleep/resume/hibernate)
     // that fire at DISPATCH_LEVEL cannot be processed.
     //
@@ -459,7 +461,7 @@ ShadowRegisterPowerCallbacks(
 
     //
     // Register system state callback (sleep/resume).
-    // Don't register if no worker thread — callbacks fire at DISPATCH_LEVEL
+    // Don't register if no worker thread â€” callbacks fire at DISPATCH_LEVEL
     // and need the worker thread to drain the deferred event queue.
     //
     if (g_PowerState.WorkerThread != NULL) {
@@ -471,7 +473,7 @@ ShadowRegisterPowerCallbacks(
         }
     } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Skipping system state callback — no worker thread to process events\n");
+                   "[ShadowStrike] Skipping system state callback â€” no worker thread to process events\n");
     }
 
     //
@@ -529,7 +531,7 @@ ShadowUnregisterPowerCallbacks(
                "[ShadowStrike] Shutting down power management\n");
 
     //
-    // Step 1: Mark as shutting down — no new events will be processed
+    // Step 1: Mark as shutting down â€” no new events will be processed
     //
     InterlockedExchange(&g_PowerState.ShuttingDown, TRUE);
     InterlockedExchange(&g_PowerState.Enabled, FALSE);
@@ -623,7 +625,7 @@ ShadowUnregisterPowerCallbacks(
 
     //
     // Step 7: Mark as uninitialized.
-    // Do NOT RtlZeroMemory the struct — that would destroy lock state
+    // Do NOT RtlZeroMemory the struct â€” that would destroy lock state
     // that late readers might still touch momentarily.
     //
     InterlockedExchange(&g_PowerState.Initialized, FALSE);
@@ -954,7 +956,7 @@ ShadowPowerGetEventHistory(
         internalEvent = CONTAINING_RECORD(entry, SHADOW_POWER_EVENT_INTERNAL, ListEntry);
 
         //
-        // Copy only the public info — no ListEntry, no internal flags
+        // Copy only the public info â€” no ListEntry, no internal flags
         //
         RtlCopyMemory(&Events[count], &internalEvent->Info, sizeof(SHADOW_POWER_EVENT_INFO));
         count++;
@@ -1764,7 +1766,7 @@ PwrpSystemStateCallback(
     }
 
     //
-    // Store event in deferred context (protected by spin lock — DISPATCH_LEVEL safe)
+    // Store event in deferred context (protected by spin lock â€” DISPATCH_LEVEL safe)
     //
     KeAcquireSpinLock(&g_PowerState.DeferredCtxLock, &oldIrql);
 
@@ -1778,7 +1780,7 @@ PwrpSystemStateCallback(
     //
     // Wake worker thread to process events at PASSIVE_LEVEL.
     // SynchronizationEvent auto-resets; multiple signals before the thread
-    // wakes coalesce into one wake — the thread drains all queued events.
+    // wakes coalesce into one wake â€” the thread drains all queued events.
     //
     if (g_PowerState.WorkerThread != NULL) {
         KeSetEvent(&g_PowerState.WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
@@ -1955,7 +1957,7 @@ PwrpNotifyCallbacks(
 }
 
 /**
- * @brief Worker thread for DISPATCH_LEVEL → PASSIVE_LEVEL event deferral.
+ * @brief Worker thread for DISPATCH_LEVEL â†’ PASSIVE_LEVEL event deferral.
  *
  * Waits on WorkerWakeEvent (SynchronizationEvent, auto-reset).
  * When signaled by PwrpSystemStateCallback, drains the deferred event queue
@@ -2194,7 +2196,7 @@ PwrpUpdateVolatileState(
  * @brief Perform actual resume validation checks.
  *
  * Validates driver integrity after resume from sleep/hibernate.
- * Each check is independent — failure of one doesn't prevent others.
+ * Each check is independent â€” failure of one doesn't prevent others.
  */
 static NTSTATUS
 PwrpPerformResumeValidation(
@@ -2227,7 +2229,7 @@ PwrpPerformResumeValidation(
                        "[ShadowStrike] Resume validation: Time anomaly detected "
                        "(sleep start > current time)\n");
             //
-            // Log but don't fail — clock can be adjusted legitimately
+            // Log but don't fail â€” clock can be adjusted legitimately
             //
         } else {
             LONGLONG sleepDuration = currentTime.QuadPart - g_PowerState.LastSleepStartTime.QuadPart;

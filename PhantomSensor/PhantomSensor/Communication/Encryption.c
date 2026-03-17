@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -87,7 +89,7 @@ typedef struct _ENC_KEY_INTERNAL {
     ULONG Signature;
     ENC_KEY Key;
     PENC_MANAGER Manager;
-    volatile BOOLEAN Destroying;
+    volatile LONG Destroying;
 } ENC_KEY_INTERNAL, *PENC_KEY_INTERNAL;
 
 //=============================================================================
@@ -448,7 +450,7 @@ Routine Description:
             drainDelay.QuadPart = -10000LL;  // 1ms
             while (ReadNoFence(&key->RefCount) > 0) {
                 if (++drainWaitCount > 5000) {
-                    // 5 second timeout per key — break to avoid hang
+                    // 5 second timeout per key â€” break to avoid hang
                     break;
                 }
                 KeDelayExecutionThread(KernelMode, FALSE, &drainDelay);
@@ -1008,7 +1010,7 @@ Routine Description:
     KeInitializeSpinLock(&key->NonceLock);
 
     //
-    // Store algorithm handle — no persistent BCrypt key handle (see EncGenerateKey)
+    // Store algorithm handle â€” no persistent BCrypt key handle (see EncGenerateKey)
     //
     key->AlgHandle = Manager->AesGcmAlgHandle;
 
@@ -1208,7 +1210,7 @@ Routine Description:
     KeInitializeSpinLock(&key->NonceLock);
 
     //
-    // Store algorithm handle — no persistent BCrypt key handle (see EncGenerateKey)
+    // Store algorithm handle â€” no persistent BCrypt key handle (see EncGenerateKey)
     //
     key->AlgHandle = Manager->AesGcmAlgHandle;
 
@@ -1354,7 +1356,7 @@ Routine Description:
     //
     // Mark as being destroyed to prevent concurrent access
     //
-    if (InterlockedCompareExchange((LONG*)&keyInternal->Destroying, TRUE, FALSE) == TRUE) {
+    if (InterlockedCompareExchange(&keyInternal->Destroying, TRUE, FALSE) == TRUE) {
         // Already being destroyed by another thread
         return;
     }
@@ -1402,7 +1404,7 @@ Routine Description:
     while (ReadNoFence(&Key->RefCount) > 0) {
         if (++drainWaitCount > 5000) {
             //
-            // 5 second timeout — break to avoid driver hang.
+            // 5 second timeout â€” break to avoid driver hang.
             // Remaining refs are leaked encrypt/decrypt operations.
             //
             break;
@@ -1532,11 +1534,11 @@ EncKeyAddRef(
 
     //
     // CAS loop: atomically check IsBeingDestroyed and increment RefCount.
-    // Use ReadAcquire for proper memory ordering — ensures we see the
+    // Use ReadAcquire for proper memory ordering â€” ensures we see the
     // latest value of IsBeingDestroyed published by EncDestroyKey.
     //
     do {
-        if (ReadAcquire((volatile LONG*)&Key->IsBeingDestroyed)) {
+        if (ReadAcquire(&Key->IsBeingDestroyed)) {
             return FALSE;
         }
 

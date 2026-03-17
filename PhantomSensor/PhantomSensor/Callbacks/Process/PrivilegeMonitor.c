@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -100,7 +102,7 @@ PsGetProcessExitStatus(
 #define PM_MONITOR_SIGNATURE_DEAD       0x44454144  // 'DEAD'
 
 //
-// Privilege LUID values — guarded to avoid redefinition with WDK headers
+// Privilege LUID values â€” guarded to avoid redefinition with WDK headers
 //
 #ifndef SE_CREATE_TOKEN_PRIVILEGE
 #define SE_CREATE_TOKEN_PRIVILEGE           2
@@ -1639,7 +1641,7 @@ Return Value:
     InterlockedIncrement64(&Internal->Stats.EscalationsDetected);
 
     //
-    // Submit to BehaviorEngine — map escalation type to behavioral event
+    // Submit to BehaviorEngine â€” map escalation type to behavioral event
     //
     {
         BEHAVIOR_EVENT_TYPE beEvent = BehaviorEvent_PrivilegeEscalation;
@@ -2410,7 +2412,7 @@ Return Value:
 
     //
     // SeQueryInformationToken(TokenIntegrityLevel) returns TOKEN_MANDATORY_LABEL*
-    // which contains SID_AND_ATTRIBUTES Label — the SID is at Label.Sid.
+    // which contains SID_AND_ATTRIBUTES Label â€” the SID is at Label.Sid.
     //
     Status = SeQueryInformationToken(
         Token,

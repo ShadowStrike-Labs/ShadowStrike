@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -561,7 +563,7 @@ ShadowStrikeIsProcessWow64(
 /**
  * @brief Check if process is an OS-level protected process.
  *
- * Queries the Windows kernel PsIsProtectedProcess status — distinct from
+ * Queries the Windows kernel PsIsProtectedProcess status â€” distinct from
  * ShadowStrike's own protection list (SelfProtect.h).
  *
  * @param Process  EPROCESS pointer

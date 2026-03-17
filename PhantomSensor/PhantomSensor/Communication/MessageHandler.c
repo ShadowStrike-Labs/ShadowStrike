@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -330,7 +332,7 @@ MhpHandleDisableFiltering(
     _Out_ PULONG ReturnOutputBufferLength
     );
 
-// Data push handlers (user-mode → kernel threat intel)
+// Data push handlers (user-mode â†’ kernel threat intel)
 static NTSTATUS
 MhpHandlePushHashDatabase(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
@@ -576,7 +578,7 @@ MhInitialize(
     }
 
     //
-    // Register data push handlers (user-mode → kernel threat intel)
+    // Register data push handlers (user-mode â†’ kernel threat intel)
     //
     status = MhRegisterHandler(FilterMessageType_PushHashDatabase, MhpHandlePushHashDatabase, NULL);
     if (!NT_SUCCESS(status)) {
@@ -707,7 +709,7 @@ MhShutdown(
             // Active handlers may be traversing the protected process list
             // or allocating from the lookaside. Destroying these resources
             // now would cause pool corruption / use-after-free / BSOD.
-            // Accept the pool leak — OS reclaims on driver unload.
+            // Accept the pool leak â€” OS reclaims on driver unload.
             //
             return;
         }
@@ -882,7 +884,7 @@ MhUnregisterHandler(
     }
 
     //
-    // Clear the handler entry — lock is always held here
+    // Clear the handler entry â€” lock is always held here
     //
     g_MhGlobals.Handlers[slot].Callback = NULL;
     g_MhGlobals.Handlers[slot].Context = NULL;
@@ -1581,7 +1583,7 @@ MhpHandlePolicyUpdate(
 
     //
     // Apply message queue tuning if any values are non-zero.
-    // Zero fields mean "keep current value" — MqConfigure handles this internally.
+    // Zero fields mean "keep current value" â€” MqConfigure handles this internally.
     //
     if (policy->MqMaxQueueDepth != 0 || policy->MqMaxMessageSize != 0 ||
         policy->MqBatchSize != 0 || policy->MqBatchTimeoutMs != 0) {
@@ -2490,7 +2492,7 @@ MhUnprotectProcess(
 //   1. Validate payload >= sizeof(batch header)
 //   2. Validate batch header (entry count, sizes, flags)
 //   3. Get target module instance via accessor
-//   4. Iterate entries, convert wire format → module API, call loading API
+//   4. Iterate entries, convert wire format â†’ module API, call loading API
 //   5. Build push reply with accepted/rejected counts
 //
 
@@ -3656,10 +3658,10 @@ Done:
  * @brief Handle network IoC push (FilterMessageType_PushNetworkIoC).
  *
  * Routes network threat indicators to the appropriate subsystem:
- * - IPv4/IPv6 → C2Detection + NetworkReputation
- * - Domain → C2Detection + DnsMonitor + NetworkReputation
- * - JA3 → C2Detection + SSLInspection
- * - URL → C2Detection
+ * - IPv4/IPv6 â†’ C2Detection + NetworkReputation
+ * - Domain â†’ C2Detection + DnsMonitor + NetworkReputation
+ * - JA3 â†’ C2Detection + SSLInspection
+ * - URL â†’ C2Detection
  */
 static NTSTATUS
 MhpHandlePushNetworkIoC(

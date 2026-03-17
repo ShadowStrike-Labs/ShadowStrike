@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -174,7 +176,7 @@ typedef struct _SHADOWSTRIKE_INSTACK_QUEUED_LOCK {
 
 /**
  * Uses EX_SPIN_LOCK. OldIrql is always caller-provided (out-param).
- * No State/WriterThread/ReaderCount metadata — the EX_SPIN_LOCK itself
+ * No State/WriterThread/ReaderCount metadata â€” the EX_SPIN_LOCK itself
  * is the single source of truth. Upgrade/Downgrade are not supported
  * because EX_SPIN_LOCK does not provide atomic transitions.
  */

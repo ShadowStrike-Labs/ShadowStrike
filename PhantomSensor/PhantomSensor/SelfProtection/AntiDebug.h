@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -71,7 +73,7 @@ typedef enum _ADB_DEBUG_ATTEMPT {
 } ADB_DEBUG_ATTEMPT;
 
 // ============================================================================
-// EVENT SNAPSHOT (returned to callers — self-contained value type)
+// EVENT SNAPSHOT (returned to callers â€” self-contained value type)
 // ============================================================================
 
 typedef struct _ADB_EVENT_INFO {
@@ -97,7 +99,7 @@ typedef struct _ADB_EVENT_INFO {
 // LIFETIME CONTRACT: The callback function pointer and Context must remain
 // valid (in memory, not unloaded) until AdbShutdown() returns. The caller
 // must NOT unload the module containing the callback before shutdown.
-// To deregister, call AdbRegisterCallback(Protector, NULL, NULL) — this
+// To deregister, call AdbRegisterCallback(Protector, NULL, NULL) â€” this
 // guarantees no further invocations after it returns.
 //
 typedef BOOLEAN (ADB_DEBUG_CALLBACK)(
@@ -132,23 +134,23 @@ typedef struct _ADB_PROTECTOR {
     // Shutdown synchronization
     EX_RUNDOWN_REF      RundownRef;
 
-    // Detection state — written atomically, read atomically
+    // Detection state â€” written atomically, read atomically
     volatile LONG       KernelDebuggerPresent;
     volatile LONG       HypervisorPresent;
     volatile LONG       VerifierEnabled;
     volatile LONG       CrashDumpEnabled;   // Complete memory dump (type 1)
 
-    // Callback — set via InterlockedExchangePointer
+    // Callback â€” set via InterlockedExchangePointer
     PADB_DEBUG_CALLBACK UserCallback;
     PVOID               CallbackContext;
     EX_PUSH_LOCK        CallbackLock;   // Protects callback registration
 
-    // Event list — protected by EventLock (push lock, <= APC_LEVEL)
+    // Event list â€” protected by EventLock (push lock, <= APC_LEVEL)
     LIST_ENTRY          EventList;
     EX_PUSH_LOCK        EventLock;
     volatile LONG       EventCount;
 
-    // Periodic check — system thread + TimerManager periodic timer
+    // Periodic check â€” system thread + TimerManager periodic timer
     HANDLE              CheckThreadHandle;
     PETHREAD            CheckThread;
     KEVENT              CheckWakeEvent;

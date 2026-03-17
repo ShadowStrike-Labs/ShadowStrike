@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -36,10 +38,10 @@ Architecture:
   - Rollback restores all files modified by a given process to their pre-modification state
 
 Integration Points:
-  - ShadowStrikePreWrite → FbePreWriteBackup()
-  - ShadowStrikePreSetInformation → FbePreSetInfoBackup()
-  - BehaviorEngine ransomware verdict → FbeRollbackProcess()
-  - DriverEntry → FbeInitialize() / FbeShutdown()
+  - ShadowStrikePreWrite â†’ FbePreWriteBackup()
+  - ShadowStrikePreSetInformation â†’ FbePreSetInfoBackup()
+  - BehaviorEngine ransomware verdict â†’ FbeRollbackProcess()
+  - DriverEntry â†’ FbeInitialize() / FbeShutdown()
 
 MITRE ATT&CK Coverage:
   - T1486: Data Encrypted for Impact (ransomware recovery)
@@ -235,7 +237,7 @@ typedef struct _FBE_CONFIG {
 } FBE_CONFIG, *PFBE_CONFIG;
 
 // ============================================================================
-// PUBLIC API — LIFECYCLE
+// PUBLIC API â€” LIFECYCLE
 // ============================================================================
 
 /**
@@ -262,7 +264,7 @@ VOID
 FbeShutdown(VOID);
 
 // ============================================================================
-// PUBLIC API — BACKUP OPERATIONS
+// PUBLIC API â€” BACKUP OPERATIONS
 // ============================================================================
 
 /**
@@ -311,7 +313,7 @@ FbePreSetInfoBackup(
     );
 
 // ============================================================================
-// PUBLIC API — ROLLBACK OPERATIONS
+// PUBLIC API â€” ROLLBACK OPERATIONS
 // ============================================================================
 
 /**
@@ -348,7 +350,7 @@ FbeCommitProcess(
     );
 
 // ============================================================================
-// PUBLIC API — QUERY
+// PUBLIC API â€” QUERY
 // ============================================================================
 
 /**

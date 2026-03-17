@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -183,13 +185,13 @@ typedef struct _PAS_SYSTEM_PROCESS_INFORMATION {
 #endif // _PAS_SYSTEM_INFO_DEFINED
 
 //
-// Thread wait state — matches kernel KTHREAD_STATE
+// Thread wait state â€” matches kernel KTHREAD_STATE
 // Value 5 = Waiting (includes suspended threads)
 //
 #define PAS_THREAD_STATE_WAITING    5
 
 //
-// Suspend wait reason — KWAIT_REASON::Suspended = 5
+// Suspend wait reason â€” KWAIT_REASON::Suspended = 5
 //
 #define PAS_WAIT_REASON_SUSPENDED   5
 
@@ -1473,7 +1475,7 @@ IRQL:
     }
 
     //
-    // Exclusion check — skip analysis for excluded processes
+    // Exclusion check â€” skip analysis for excluded processes
     //
     if (ShadowStrikeIsProcessExcluded(CurrentProcessId, NULL)) {
         InterlockedIncrement64((PLONG64)&g_PasState.Stats.Allowed);
@@ -1643,7 +1645,7 @@ IRQL:
             Status = FltParseFileNameInformation(NameInfo);
             if (NT_SUCCESS(Status)) {
                 //
-                // Check path exclusion — skip further analysis for excluded paths
+                // Check path exclusion â€” skip further analysis for excluded paths
                 //
                 if (ShadowStrikeIsPathExcluded(&NameInfo->Name, &NameInfo->Extension)) {
                     InterlockedIncrement64((PLONG64)&g_PasState.Stats.Allowed);
@@ -1992,7 +1994,7 @@ PaspDereferenceProcessContext(
     BOOLEAN ShouldFree = FALSE;
 
     //
-    // Single atomic decrement — never double-decrement
+    // Single atomic decrement â€” never double-decrement
     //
     NewRef = InterlockedDecrement(&Context->RefCount);
 
@@ -2001,7 +2003,7 @@ PaspDereferenceProcessContext(
     }
 
     //
-    // RefCount reached zero — acquire lock to safely remove from list
+    // RefCount reached zero â€” acquire lock to safely remove from list
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PasState.ProcessContextLock);

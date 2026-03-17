@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -262,7 +264,7 @@ typedef struct _SHADOW_KTM_ALERT {
  * a transacted file operation. Filter Manager passes this context back in
  * ShadowKtmNotificationCallback on commit/rollback.
  *
- * No dynamic allocations — NULL cleanup callback is correct.
+ * No dynamic allocations â€” NULL cleanup callback is correct.
  */
 typedef struct _SHADOW_KTM_TRANSACTION_CONTEXT {
 
@@ -575,7 +577,7 @@ ShadowKtmNotificationCallback(
 
 /**
  * @brief Enlist the minifilter in a kernel transaction for commit/rollback
- *        notifications. Idempotent — safe to call multiple times for the
+ *        notifications. Idempotent â€” safe to call multiple times for the
  *        same instance+transaction pair (subsequent calls are no-ops).
  *
  * Must be called at PASSIVE_LEVEL from PreCreate/PostWrite callbacks when

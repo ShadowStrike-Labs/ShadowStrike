@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -29,8 +31,8 @@
     - Proper lifecycle with drain on shutdown
 
     Lock Ordering:
-    - MetricBuffers[i].Lock (spin lock, DISPATCH_LEVEL) — leaf locks, independent
-    - ThresholdLock (spin lock) — never held while holding a metric buffer lock
+    - MetricBuffers[i].Lock (spin lock, DISPATCH_LEVEL) â€” leaf locks, independent
+    - ThresholdLock (spin lock) â€” never held while holding a metric buffer lock
 
     Memory:
     - Monitor structure: NonPagedPoolNx
@@ -97,18 +99,18 @@ struct _SSPM_MONITOR {
     KEVENT DrainEvent;
 
     //
-    // Ring buffers — one per metric type
+    // Ring buffers â€” one per metric type
     //
     SSPM_RING_BUFFER MetricBuffers[SsPmMetric_Count];
 
     //
-    // Thresholds — protected by ThresholdLock
+    // Thresholds â€” protected by ThresholdLock
     //
     SSPM_THRESHOLD Thresholds[SsPmMetric_Count];
     KSPIN_LOCK ThresholdLock;
 
     //
-    // Alert callback — volatile pointer, read atomically
+    // Alert callback â€” volatile pointer, read atomically
     //
     SSPM_ALERT_CALLBACK AlertCallback;
     PVOID AlertContext;
@@ -205,9 +207,9 @@ SspmiIsValidMetric(
 //=============================================================================
 
 //
-// Quickselect (Hoare partition) — O(n) average for kth smallest.
+// Quickselect (Hoare partition) â€” O(n) average for kth smallest.
 // Called at <= APC_LEVEL with a bounded-size heap buffer.
-// Used instead of insertion sort to avoid O(n²) on 1024 elements.
+// Used instead of insertion sort to avoid O(nÂ²) on 1024 elements.
 //
 static
 ULONG64
@@ -358,7 +360,7 @@ SsPmShutdown(
     }
 
     //
-    // Phase 1: Signal shutdown — reject new operations
+    // Phase 1: Signal shutdown â€” reject new operations
     //
     InterlockedExchange(&Monitor->ShuttingDown, 1);
     InterlockedExchange(&Monitor->Initialized, 0);
@@ -570,7 +572,7 @@ Routine Description:
     Ring = &Monitor->MetricBuffers[(ULONG)Metric];
 
     //
-    // Take snapshot under spin lock (brief hold — just copy count and values)
+    // Take snapshot under spin lock (brief hold â€” just copy count and values)
     //
     KeAcquireSpinLock(&Ring->Lock, &OldIrql);
     SnapCount = Ring->Count;
@@ -660,7 +662,7 @@ Routine Description:
     Stats->Mean = Sum / (ULONG64)SnapCount;
 
     //
-    // Compute percentiles using O(n) quickselect instead of O(n²) sort
+    // Compute percentiles using O(n) quickselect instead of O(nÂ²) sort
     //
     if (SnapCount >= 20) {
         ULONG P95Idx = (ULONG)((ULONG64)SnapCount * 95 / 100);
@@ -901,7 +903,7 @@ Routine Description:
     //
     // IRQL guard: alert callbacks may touch paged memory or block.
     // Only invoke at PASSIVE_LEVEL. At elevated IRQL, the threshold
-    // breach is still counted but callback is skipped — the periodic
+    // breach is still counted but callback is skipped â€” the periodic
     // collection timer at PASSIVE will re-evaluate.
     //
     if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
@@ -948,7 +950,7 @@ SspmiCollectionTimerCallback(
 /*++
 Routine Description:
     Periodic callback that collects system-level performance metrics.
-    Runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback — all spin-lock
+    Runs at PASSIVE_LEVEL via TmFlag_WorkItemCallback â€” all spin-lock
     operations remain valid, and paged access is also permitted.
 --*/
 {
@@ -969,7 +971,7 @@ Routine Description:
     //
     // On battery, skip every other collection cycle to reduce CPU overhead.
     // The heartbeat still fires (timer alive detection), but full metric
-    // collection frequency is halved — CrowdStrike-style power conservation.
+    // collection frequency is halved â€” CrowdStrike-style power conservation.
     //
     if (ShadowPowerIsOnBattery()) {
         static volatile LONG s_BatterySkipTick = 0;

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -258,7 +260,7 @@ typedef struct _IM_MONITOR_INTERNAL {
     BCRYPT_ALG_HANDLE           AlgHandle;
     ULONG                       HashObjectSize;
 
-    // Worker thread (replaces KTIMER+KDPC+IoWorkItem — no DeviceObject needed)
+    // Worker thread (replaces KTIMER+KDPC+IoWorkItem â€” no DeviceObject needed)
     PETHREAD                    ThreadObject;
     KEVENT                      WakeEvent;
     volatile LONG               TerminateThread;
@@ -577,7 +579,7 @@ ImpParseDriverImage(
         );
 
         //
-        // Skip INIT and other discardable sections — the OS frees their
+        // Skip INIT and other discardable sections â€” the OS frees their
         // physical pages after DriverEntry returns (MmFreeDriverInitialization).
         // Hashing freed memory causes BSOD or perpetual false positives.
         //
@@ -1093,7 +1095,7 @@ ImpCheckComponent(
     {
         // FIX #8: Real configuration hash comparison
         if (!Monitor->ConfigBaselineValid) {
-            // No baseline was established — cannot verify
+            // No baseline was established â€” cannot verify
             RtlStringCbPrintfA(Result->Details, sizeof(Result->Details),
                 "No configuration baseline available");
             break;
@@ -1123,7 +1125,7 @@ ImpCheckComponent(
 }
 
 // ============================================================================
-// ImInitialize — ENTERPRISE-GRADE INITIALIZATION
+// ImInitialize â€” ENTERPRISE-GRADE INITIALIZATION
 // Replaces IoWorkItem+KTIMER+KDPC with PsCreateSystemThread+KEVENT
 // ============================================================================
 
@@ -1236,7 +1238,7 @@ InitFailed:
 }
 
 // ============================================================================
-// ImShutdown — SAFE SHUTDOWN WITH THREAD JOIN
+// ImShutdown â€” SAFE SHUTDOWN WITH THREAD JOIN
 // Thread-based: signal terminate, wait for thread, then cleanup.
 // ============================================================================
 
@@ -1593,7 +1595,7 @@ ImpNotifyTamper(
     {
         CallbackEntry = CONTAINING_RECORD(Entry, IM_CALLBACK_ENTRY, ListEntry);
 
-        // Call user callback — wrapped in __try for safety
+        // Call user callback â€” wrapped in __try for safety
         __try {
             CallbackEntry->Callback(Result, CallbackEntry->Context);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1606,7 +1608,7 @@ ImpNotifyTamper(
 }
 
 // ============================================================================
-// WORKER THREAD — Replaces KTIMER+KDPC+IoWorkItem
+// WORKER THREAD â€” Replaces KTIMER+KDPC+IoWorkItem
 // Runs at PASSIVE_LEVEL. Waits on WakeEvent with timeout = CheckIntervalMs.
 // When PeriodicEnabled is 0, waits indefinitely until signaled.
 // ============================================================================
@@ -1640,7 +1642,7 @@ ImpWorkerThreadRoutine(
             Timeout.QuadPart = -((LONGLONG)IntervalMs * 10000LL);
             pTimeout = &Timeout;
         } else {
-            // Periodic disabled — wait indefinitely until signaled
+            // Periodic disabled â€” wait indefinitely until signaled
             pTimeout = NULL;
         }
 

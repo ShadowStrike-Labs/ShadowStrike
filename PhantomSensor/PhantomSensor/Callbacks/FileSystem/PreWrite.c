@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -907,7 +909,7 @@ Return Value:
     }
 
     // =========================================================================
-    // EXCLUSION CHECK — Skip analysis for excluded processes and paths
+    // EXCLUSION CHECK â€” Skip analysis for excluded processes and paths
     // =========================================================================
 
     if (ShadowStrikeIsProcessExcluded(RequestorPid, NULL)) {
@@ -927,7 +929,7 @@ Return Value:
     }
 
     // =========================================================================
-    // USB DEVICE CONTROL — Block writes to restricted removable media
+    // USB DEVICE CONTROL â€” Block writes to restricted removable media
     // =========================================================================
 
     if (UdcIsWriteBlocked(FltObjects)) {
@@ -1014,7 +1016,7 @@ Return Value:
     }
 
     // =========================================================================
-    // RANSOMWARE ROLLBACK — Copy-on-first-write backup before modification
+    // RANSOMWARE ROLLBACK â€” Copy-on-first-write backup before modification
     // =========================================================================
 
     FbePreWriteBackup(Data, FltObjects, &NameInfo->Name);
@@ -1130,7 +1132,7 @@ CacheInvalidation:
     }
 
     //
-    // Clipboard exfiltration detection — check if this write matches
+    // Clipboard exfiltration detection â€” check if this write matches
     // rapid temp file dump pattern from a clipboard-indicator process (T1115).
     // CbMonCheckFileWrite returns quickly for untracked processes.
     //
@@ -1201,7 +1203,7 @@ Cleanup:
 
     //
     // Always release the operation reference in the pre-op path.
-    // PreWrite never returns WITH_CALLBACK — PostWrite.c owns the
+    // PreWrite never returns WITH_CALLBACK â€” PostWrite.c owns the
     // registered post-op independently.
     //
     PwpLeaveOperation();

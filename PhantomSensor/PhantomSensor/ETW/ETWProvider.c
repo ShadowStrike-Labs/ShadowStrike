@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -34,7 +36,7 @@
     - In-flight writer reference counting with bounded drain timeout
     - ReadAcquire-based state checks for ARM64 memory ordering correctness
 
-    Version: 2.1.0 — Full fix pass addressing all CRITICAL/HIGH/MEDIUM/LOW
+    Version: 2.1.0 â€” Full fix pass addressing all CRITICAL/HIGH/MEDIUM/LOW
     issues from the v2.0.0 security review.
 
     Copyright (c) ShadowStrike Team
@@ -808,7 +810,7 @@ EtwpCopyUnicodeStringBounded(
 Routine Description:
 
     Copies a UNICODE_STRING to a fixed-size WCHAR buffer.
-    Uses the Length field (in bytes) — no unbounded string scan.
+    Uses the Length field (in bytes) â€” no unbounded string scan.
     Always null-terminates the destination.
 
 --*/
@@ -931,7 +933,7 @@ EtwWriteProcessEvent(
     event->ExitCode = ExitCode;
 
     //
-    // Copy strings using length-counted UNICODE_STRING — no unbounded scan
+    // Copy strings using length-counted UNICODE_STRING â€” no unbounded scan
     //
     if (ImagePath != NULL) {
         EtwpCopyUnicodeStringBounded(
@@ -1134,7 +1136,7 @@ Routine Description:
     }
 
     //
-    // Select event descriptor — each event ID maps to its own descriptor
+    // Select event descriptor â€” each event ID maps to its own descriptor
     // so ETW consumers see the correct Id in the trace.
     //
     switch (EventId) {
@@ -1242,7 +1244,7 @@ EtwWriteBehaviorEvent(
     }
 
     //
-    // Select event descriptor — each event ID maps to its own descriptor
+    // Select event descriptor â€” each event ID maps to its own descriptor
     // so ETW consumers see the correct Id in the trace.
     //
     switch (EventId) {
@@ -2125,7 +2127,7 @@ Return Value:
 
     //
     // CRITICAL events bypass rate limiting entirely.
-    // Tamper attempts, C2 detections, privilege escalation — these must
+    // Tamper attempts, C2 detections, privilege escalation â€” these must
     // always be emitted regardless of event volume from other sources.
     //
     if (EventLevel <= ETW_LEVEL_CRITICAL) {
@@ -2152,7 +2154,7 @@ Return Value:
                 windowStart
                 ) == windowStart) {
             //
-            // We won the race — reset the counter.
+            // We won the race â€” reset the counter.
             //
             InterlockedExchange(&g_EtwGlobals.EventsThisSecond, 1);
             return TRUE;

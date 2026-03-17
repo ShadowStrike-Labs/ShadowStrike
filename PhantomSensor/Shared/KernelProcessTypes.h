@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -45,13 +47,13 @@ extern "C" {
 #endif
 
 // ============================================================================
-// UNDOCUMENTED KERNEL API — PsGetProcessPeb
+// UNDOCUMENTED KERNEL API â€” PsGetProcessPeb
 // ============================================================================
 //
 // Exported by ntoskrnl.exe but not declared in WDK headers.
 // Resolved at link time; available on all NT 6.0+ (Vista through Win11).
 // Returns the user-mode PEB address for the given process.
-// The returned pointer is in the target process's address space —
+// The returned pointer is in the target process's address space â€”
 // the caller MUST attach to the process (KeStackAttachProcess) before
 // dereferencing.
 //
@@ -64,7 +66,7 @@ PsGetProcessPeb(
 );
 
 // ============================================================================
-// LDR_DATA_TABLE_ENTRY — PEB module list entry (partial)
+// LDR_DATA_TABLE_ENTRY â€” PEB module list entry (partial)
 // ============================================================================
 //
 // Each loaded module in the process address space has an entry in the
@@ -87,7 +89,7 @@ typedef struct _KM_LDR_DATA_TABLE_ENTRY {
 } KM_LDR_DATA_TABLE_ENTRY, *PKM_LDR_DATA_TABLE_ENTRY;
 
 // ============================================================================
-// PEB_LDR_DATA — PEB loader data (partial)
+// PEB_LDR_DATA â€” PEB loader data (partial)
 // ============================================================================
 //
 // Contains the three linked lists of loaded modules.
@@ -104,7 +106,7 @@ typedef struct _KM_PEB_LDR_DATA {
 } KM_PEB_LDR_DATA, *PKM_PEB_LDR_DATA;
 
 // ============================================================================
-// PEB — Process Environment Block (partial, x64 layout)
+// PEB â€” Process Environment Block (partial, x64 layout)
 // ============================================================================
 //
 // The PEB is mapped into every process's address space at a fixed location.
@@ -122,7 +124,7 @@ typedef struct _KM_PEB {
     UCHAR           Padding0[4];                // offset 0x04 (x64 alignment)
     HANDLE          Mutant;                     // offset 0x08
     PVOID           ImageBaseAddress;            // offset 0x10
-    PKM_PEB_LDR_DATA Ldr;                       // offset 0x18 — this is what we need
+    PKM_PEB_LDR_DATA Ldr;                       // offset 0x18 â€” this is what we need
 } KM_PEB, *PKM_PEB;
 
 //

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -211,7 +213,7 @@ typedef struct _TM_WHEEL_SLOT {
 
 typedef struct _TM_MANAGER {
     //
-    // Initialization state — volatile LONG for interlocked CAS
+    // Initialization state â€” volatile LONG for interlocked CAS
     //
     volatile LONG Initialized;          // 0 = not init, 1 = initialized
     volatile LONG ShuttingDown;         // 0 = running, 1 = shutting down
@@ -232,7 +234,7 @@ typedef struct _TM_MANAGER {
     KDPC WheelDpc;
 
     //
-    // ID generation — uses InterlockedIncrement, never returns 0
+    // ID generation â€” uses InterlockedIncrement, never returns 0
     //
     volatile LONG NextTimerId;
 
@@ -254,7 +256,7 @@ typedef struct _TM_MANAGER {
     } Stats;
 
     //
-    // Work item drain support — tracks in-flight work items so
+    // Work item drain support â€” tracks in-flight work items so
     // TmShutdown can wait for them before freeing timer memory.
     // KeFlushQueuedDpcs only drains DPCs, not work items queued
     // by those DPCs via IoQueueWorkItem.

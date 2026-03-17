@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -366,7 +368,7 @@ RegpCheckRateLimit(
 
     if (elapsed > (REG_NOTIFICATION_WINDOW_MS * 10000LL)) {
         //
-        // New window — try to reset atomically.
+        // New window â€” try to reset atomically.
         // Only one thread wins the CAS; losers fall through and count normally.
         //
         if (InterlockedCompareExchange64(
@@ -374,7 +376,7 @@ RegpCheckRateLimit(
                 currentTime.QuadPart,
                 windowStart) == windowStart) {
             //
-            // We won the reset — zero the counter and count ourselves as 1
+            // We won the reset â€” zero the counter and count ourselves as 1
             //
             InterlockedExchange64(&g_RegistryMonitor.NotificationCount, 1);
             return TRUE;
@@ -879,7 +881,7 @@ ShadowStrikeClassifyRegistryKey(
     }
 
     //
-    // Run Keys — HKLM (T1547.001)
+    // Run Keys â€” HKLM (T1547.001)
     //
     RtlInitUnicodeString(&testPath, SHADOWSTRIKE_REG_RUN_KEY);
     if (RtlPrefixUnicodeString(&testPath, KeyPath, TRUE)) {
@@ -897,7 +899,7 @@ ShadowStrikeClassifyRegistryKey(
     }
 
     //
-    // Run Keys — HKCU (T1547.001)
+    // Run Keys â€” HKCU (T1547.001)
     //
     // User hives appear as \REGISTRY\USER\<SID>\...
     // We cannot use the wildcard constants directly with RtlPrefixUnicodeString,
@@ -1213,7 +1215,7 @@ ShadowStrikeDetectDefenseEvasionRegistry(
             if (RtlEqualUnicodeString(ValueName, &disableValue, TRUE)) {
                 //
                 // Only flag as evasion if the value is being SET to non-zero (disabling protection).
-                // Setting to 0 means re-enabling protection — that is benign.
+                // Setting to 0 means re-enabling protection â€” that is benign.
                 //
                 if (Data != NULL && DataSize >= sizeof(ULONG)) {
                     __try {
@@ -1971,7 +1973,7 @@ SkipCreatePathBuild:
                 // (4) Multi-technique behavioral pattern detection
                 //
                 // Count distinct persistence categories this process has touched.
-                // Each category is a different MITRE technique — touching 2+ in
+                // Each category is a different MITRE technique â€” touching 2+ in
                 // a single process session is highly anomalous.
                 //
                 if (procCtx->RunKeyModifications > 0)   distinctCategories++;
@@ -1983,7 +1985,7 @@ SkipCreatePathBuild:
                 //
                 // PATTERN: Multi-persistence spray (T1547+T1543+T1546)
                 // A process modifying 3+ distinct persistence categories is
-                // almost certainly malicious — legitimate installers rarely
+                // almost certainly malicious â€” legitimate installers rarely
                 // touch more than one category.
                 //
                 if (distinctCategories >= 3 &&
@@ -2007,7 +2009,7 @@ SkipCreatePathBuild:
                     //
                     // Submit high-confidence multi-technique event.
                     // Use BehaviorEvent_RegistryRunKey with elevated score
-                    // as the primary indicator — the BehaviorEngine's
+                    // as the primary indicator â€” the BehaviorEngine's
                     // kill-chain correlation will connect this with other
                     // events from the same process.
                     //
@@ -2374,8 +2376,8 @@ ShadowStrikeReleaseRegistryProcessContext(
     if (refCount == 0) {
         //
         // Last reference released. This happens when ProcessTerminated already
-        // removed the entry from the hash table (dropping its ref from 2→1)
-        // and now the last caller releases (1→0). Safe to free.
+        // removed the entry from the hash table (dropping its ref from 2â†’1)
+        // and now the last caller releases (1â†’0). Safe to free.
         //
         if (Context->Process != NULL) {
             ObDereferenceObject(Context->Process);

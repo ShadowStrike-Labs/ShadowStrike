@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -420,7 +422,7 @@ NrInitialize(
             CO_CACHE_CONFIG coConfig;
             CoInitDefaultConfig(&coConfig);
             coConfig.MaxEntries = 4096;
-            coConfig.DefaultTTLSeconds = 1800;  /* 30 min — reputation is relatively stable */
+            coConfig.DefaultTTLSeconds = 1800;  /* 30 min â€” reputation is relatively stable */
             coConfig.BucketCount = 1024;
             CoCreateCache(coMgr, CoCacheTypeNetworkConnection, "NrReputation", &coConfig, &g_NrReputationCoCache);
         }
@@ -896,7 +898,7 @@ NrpAddEntryInternal(
     }
 
     //
-    // Must allocate outside the lock? No — we hold exclusive so we are safe,
+    // Must allocate outside the lock? No â€” we hold exclusive so we are safe,
     // and PagedPool allocation at APC_LEVEL is fine (critical region raises
     // to APC_LEVEL which is still legal for paged allocations).
     //
@@ -1789,7 +1791,7 @@ NrpIsLoopbackIPv6(
 
     PAGED_CODE();
 
-    // ::1 — all zeros except last byte is 1
+    // ::1 â€” all zeros except last byte is 1
     for (i = 0; i < 15; i++) {
         if (IPv6Bytes[i] != 0) return FALSE;
     }
@@ -1803,10 +1805,10 @@ NrpIsPrivateIPv6(
 {
     PAGED_CODE();
 
-    // fc00::/7 — Unique Local Address (ULA): first byte fc or fd
+    // fc00::/7 â€” Unique Local Address (ULA): first byte fc or fd
     if ((IPv6Bytes[0] & 0xFE) == 0xFC) return TRUE;
 
-    // fe80::/10 — Link-local: first byte fe, second byte 80-bf (top 2 bits = 10)
+    // fe80::/10 â€” Link-local: first byte fe, second byte 80-bf (top 2 bits = 10)
     if (IPv6Bytes[0] == 0xFE && (IPv6Bytes[1] & 0xC0) == 0x80) return TRUE;
 
     return FALSE;
@@ -1829,7 +1831,7 @@ NrpCalculateDGAScore(
     ULONG digitCount = 0;
     ULONG hyphenCount = 0;
     ULONG uniqueChars = 0;
-    UCHAR charCounts[128];   // ASCII only — 128 bytes, not 1KB
+    UCHAR charCounts[128];   // ASCII only â€” 128 bytes, not 1KB
     PCSTR dotPos = NULL;
     ULONG i;
     ULONG bigramPenalty = 0;

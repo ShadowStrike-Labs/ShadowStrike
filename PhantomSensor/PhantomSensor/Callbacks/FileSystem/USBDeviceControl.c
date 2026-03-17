@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -32,7 +34,7 @@ Volume Detection Strategy:
   - Hardware ID parsed from physical device object for USB VID_xxxx/PID_xxxx
 
 Policy Resolution Order:
-  1. Blacklist (explicit deny) — highest priority
+  1. Blacklist (explicit deny) â€” highest priority
   2. Whitelist (explicit allow)
   3. Default policy (configurable, default=Audit)
 
@@ -226,7 +228,7 @@ UdcInitialize(VOID)
     g_UdcState.VolumeCount = 0;
 
     //
-    // UDC-5 FIX: Use 0 for Flags — NPagedPool is already non-executable
+    // UDC-5 FIX: Use 0 for Flags â€” NPagedPool is already non-executable
     // since Windows 8+. POOL_FLAG_NON_PAGED (0x40) is for ExAllocatePool2,
     // NOT for ExInitializeNPagedLookasideList.
     //
@@ -356,7 +358,7 @@ UdcCheckVolumePolicy(
     //
     if (!UdcpIsRemovableVolume(FltObjects)) {
         UdcpLeaveOperation();
-        return TRUE;    // Non-removable — always allow
+        return TRUE;    // Non-removable â€” always allow
     }
 
     //
@@ -432,7 +434,7 @@ UdcIsWriteBlocked(
     // UDC-1 FIX: Hold VolumeLock shared for the entire operation to prevent
     // use-after-free from concurrent UdcNotifyVolumeDismount. The old code
     // released the lock inside UdcpFindVolume then dereferenced the returned
-    // pointer — a classic TOCTOU leading to BSOD.
+    // pointer â€” a classic TOCTOU leading to BSOD.
     //
     FltAcquirePushLockShared(&g_UdcState.VolumeLock);
 
@@ -473,7 +475,7 @@ UdcIsSetInfoBlocked(
     )
 {
     //
-    // Same policy as write blocking — rename/delete on read-only volumes is blocked
+    // Same policy as write blocking â€” rename/delete on read-only volumes is blocked
     //
     return UdcIsWriteBlocked(FltObjects);
 }
@@ -988,17 +990,17 @@ UdcGetStatistics(
 }
 
 // ============================================================================
-// PRIVATE — DEVICE INFORMATION EXTRACTION
+// PRIVATE â€” DEVICE INFORMATION EXTRACTION
 // ============================================================================
 
 /*++
     Queries the storage stack for USB device identity information.
 
-    Step 1: FltGetDiskDeviceObject → disk device for this volume
-    Step 2: IOCTL_STORAGE_QUERY_PROPERTY → STORAGE_DEVICE_DESCRIPTOR
-            → BusType, serial number (ASCII → Unicode)
-    Step 3: Walk device stack to PDO → IoGetDeviceProperty(HardwareID)
-            → Parse VID_xxxx&PID_xxxx for numeric USB VID/PID
+    Step 1: FltGetDiskDeviceObject â†’ disk device for this volume
+    Step 2: IOCTL_STORAGE_QUERY_PROPERTY â†’ STORAGE_DEVICE_DESCRIPTOR
+            â†’ BusType, serial number (ASCII â†’ Unicode)
+    Step 3: Walk device stack to PDO â†’ IoGetDeviceProperty(HardwareID)
+            â†’ Parse VID_xxxx&PID_xxxx for numeric USB VID/PID
 
     All steps are best-effort: failure at any stage leaves the
     corresponding output fields at zero/empty. This ensures devices
@@ -1061,7 +1063,7 @@ UdcpQueryDeviceInfo(
         }
 
         //
-        // Extract serial number (ASCII → Unicode)
+        // Extract serial number (ASCII â†’ Unicode)
         // Storage firmware often pads serial strings with whitespace
         //
         if (Descriptor->SerialNumberOffset != 0 &&
@@ -1237,7 +1239,7 @@ UdcpSendStorageQuery(
     Walks the device stack from the given device object down to the
     Physical Device Object (PDO) at the bottom of the stack.
 
-    Returns a referenced PDO — caller must call ObDereferenceObject.
+    Returns a referenced PDO â€” caller must call ObDereferenceObject.
     Returns NULL if the walk fails for any reason.
 --*/
 static PDEVICE_OBJECT
@@ -1280,7 +1282,7 @@ UdcpGetPhysicalDeviceObject(
     Parses a REG_MULTI_SZ hardware ID string for USB VID_xxxx and PID_xxxx
     patterns. USB hardware IDs look like: USB\VID_1234&PID_5678\serial
 
-    Case-insensitive search — firmware may use any case.
+    Case-insensitive search â€” firmware may use any case.
 --*/
 static VOID
 UdcpParseHardwareIdForVidPid(
@@ -1379,7 +1381,7 @@ UdcpParseHex4(
 }
 
 // ============================================================================
-// PRIVATE — POLICY RESOLUTION
+// PRIVATE â€” POLICY RESOLUTION
 // ============================================================================
 
 static UDC_DEVICE_POLICY
@@ -1494,13 +1496,13 @@ UdcpResolvePolicy(
     FltReleasePushLock(&g_UdcState.RulesLock);
 
     //
-    // No matching rule — return default policy
+    // No matching rule â€” return default policy
     //
     return DefaultPolicy;
 }
 
 // ============================================================================
-// PRIVATE — VOLUME DETECTION
+// PRIVATE â€” VOLUME DETECTION
 // ============================================================================
 
 static BOOLEAN
@@ -1545,7 +1547,7 @@ UdcpIsRemovableVolume(
 }
 
 // ============================================================================
-// PRIVATE — VOLUME LOOKUP (CALLER MUST HOLD VolumeLock)
+// PRIVATE â€” VOLUME LOOKUP (CALLER MUST HOLD VolumeLock)
 // ============================================================================
 
 static PUDC_TRACKED_VOLUME
@@ -1571,7 +1573,7 @@ UdcpFindVolumeUnlocked(
 }
 
 // ============================================================================
-// PRIVATE — LIFECYCLE HELPERS
+// PRIVATE â€” LIFECYCLE HELPERS
 // ============================================================================
 
 static BOOLEAN

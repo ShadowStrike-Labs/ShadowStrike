@@ -366,6 +366,12 @@
     <ClCompile Include="PhantomSensor\Core\FilterRegistration.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="PhantomSensor\Cache\ScanCache.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TestFile.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="PhantomSensor\Context\InstanceContext.h">

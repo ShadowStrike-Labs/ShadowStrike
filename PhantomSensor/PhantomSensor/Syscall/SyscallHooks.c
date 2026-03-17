@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -31,7 +33,7 @@
  * - Lookaside-pooled hook allocations for minimal allocation latency
  * - Rate limiting to bound callback storms
  * - Magic-validated pointer safety on all public API entry points
- * - Complete cleanup on every error path — no resource leaks
+ * - Complete cleanup on every error path â€” no resource leaks
  *
  * Thread Safety Model:
  * - Framework-level: EX_PUSH_LOCK protects the hook hash table and list.
@@ -40,7 +42,7 @@
  *   Unregister spins on this count draining to zero before freeing.
  * - Framework-level: volatile LONG ActiveDispatchCount tracks concurrent
  *   dispatches. Shutdown spins on this draining to zero.
- * - Enable/Disable: InterlockedExchange on volatile LONG Enabled field —
+ * - Enable/Disable: InterlockedExchange on volatile LONG Enabled field â€”
  *   no lock acquisition on the hot path.
  *
  * IRQL Rules:
@@ -101,7 +103,7 @@ typedef struct _SH_HOOK_INTERNAL {
     /** Opaque caller-supplied cookie passed to callbacks */
     PVOID Cookie;
 
-    /** Hook enabled state — interlocked, no lock needed for read */
+    /** Hook enabled state â€” interlocked, no lock needed for read */
     volatile LONG Enabled;
 
     /** Count of callbacks currently executing on this hook */
@@ -119,7 +121,7 @@ typedef struct _SH_HOOK_INTERNAL {
 } SH_HOOK_INTERNAL, *PSH_HOOK_INTERNAL;
 
 /**
- * @brief Hash table bucket — one per SH_HASH_BUCKET_COUNT.
+ * @brief Hash table bucket â€” one per SH_HASH_BUCKET_COUNT.
  */
 typedef struct _SH_HASH_BUCKET {
     LIST_ENTRY Head;
@@ -165,17 +167,17 @@ typedef struct _SH_FRAMEWORK_INTERNAL {
      * @brief Rundown protection for dispatch lifecycle.
      * Replaces the former ActiveDispatchCount + ShuttingDown + polling drain.
      * ExWaitForRundownProtectionRelease atomically rejects new dispatches
-     * AND waits for in-flight ones — no race window, no spin-polling.
+     * AND waits for in-flight ones â€” no race window, no spin-polling.
      */
     EX_RUNDOWN_REF DispatchRundownRef;
 
-    /** Dispatch count for statistics (peak tracking) — NOT used for shutdown */
+    /** Dispatch count for statistics (peak tracking) â€” NOT used for shutdown */
     volatile LONG ActiveDispatchCount;
 
     /** Peak concurrent dispatches (high-water mark) */
     volatile LONG PeakConcurrentDispatches;
 
-    /** Shutdown flag — quick reject for registration APIs (ShRegisterHook, ShEnableHook) */
+    /** Shutdown flag â€” quick reject for registration APIs (ShRegisterHook, ShEnableHook) */
     volatile LONG ShuttingDown;
 
     /** Lookaside list for hook entry allocations */
@@ -402,7 +404,7 @@ ShpFindHookInBucket(
  * @return TRUE if acquired (dispatch may proceed), FALSE if shutdown in progress.
  *
  * After ExWaitForRundownProtectionRelease is called in ShShutdown,
- * ExAcquireRundownProtection atomically returns FALSE — no race window.
+ * ExAcquireRundownProtection atomically returns FALSE â€” no race window.
  */
 static BOOLEAN
 ShpAcquireDispatchRef(
@@ -524,7 +526,7 @@ ShpCheckRateLimit(
     if ((now.QuadPart - windowStart) >= SH_RATE_LIMIT_WINDOW_100NS) {
         /*
          * Use CAS to atomically claim the window reset. Only the winning
-         * thread resets the dispatch counter — losers proceed with the
+         * thread resets the dispatch counter â€” losers proceed with the
          * new window already in effect.
          */
         if (InterlockedCompareExchange64(
@@ -618,8 +620,8 @@ ShInitialize(
     /* Initialize lookaside list for hook allocations */
     ExInitializeNPagedLookasideList(
         &fw->HookLookaside,
-        NULL,                               /* AllocateFunction — use default */
-        NULL,                               /* FreeFunction — use default */
+        NULL,                               /* AllocateFunction â€” use default */
+        NULL,                               /* FreeFunction â€” use default */
         POOL_NX_ALLOCATION,                 /* NX enforcement */
         sizeof(SH_HOOK_INTERNAL),
         SH_HOOK_TAG,
@@ -681,7 +683,7 @@ ShShutdown(
      * then drain and free OUTSIDE the lock.
      *
      * We must NOT call ShpDrainHookCallbacks while holding the exclusive
-     * push lock — if drain needs to sleep (KeDelayExecutionThread), any
+     * push lock â€” if drain needs to sleep (KeDelayExecutionThread), any
      * thread trying to acquire the lock would be blocked. By moving the
      * drain outside the lock, we avoid this deadlock-prone pattern.
      *
@@ -812,7 +814,7 @@ ShRegisterHook(
     newHook->PreCallback = PreCallback;
     newHook->PostCallback = PostCallback;
     newHook->Cookie = Cookie;
-    newHook->Enabled = 0;  /* Created disabled — caller must ShEnableHook */
+    newHook->Enabled = 0;  /* Created disabled â€” caller must ShEnableHook */
     newHook->ActiveCallbackCount = 0;
     newHook->HitCount = 0;
     InitializeListHead(&newHook->HashListEntry);
@@ -889,17 +891,17 @@ ShUnregisterHook(
     /*
      * Phase 1: Acquire exclusive lock BEFORE validating the hook.
      * This prevents a TOCTOU race where two threads call ShUnregisterHook
-     * concurrently — the first frees the hook, the second accesses freed memory.
+     * concurrently â€” the first frees the hook, the second accesses freed memory.
      * Under exclusive lock, only one thread can operate on the hook at a time.
      *
      * SEH wraps the magic check because hook is a raw user-supplied handle.
      * If the pointer is dangling (freed pool page decommitted), the dereference
-     * would BSOD while holding the exclusive lock — lock never released.
+     * would BSOD while holding the exclusive lock â€” lock never released.
      */
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&fw->HookLock);
 
-    /* Validate hook magic under lock — safe from concurrent free */
+    /* Validate hook magic under lock â€” safe from concurrent free */
     __try {
         if (hook->Magic != SH_HOOK_MAGIC) {
             ExReleasePushLockExclusive(&fw->HookLock);
@@ -927,7 +929,7 @@ ShUnregisterHook(
 
     /*
      * Phase 2: Disable the hook so no new callbacks will be invoked.
-     * This is safe under exclusive lock — dispatch holds shared lock,
+     * This is safe under exclusive lock â€” dispatch holds shared lock,
      * so it cannot be running concurrently.
      */
     wasEnabled = (InterlockedExchange(&hook->Enabled, 0) != 0);
@@ -993,7 +995,7 @@ ShEnableHook(
     /*
      * Acquire shared lock to prevent concurrent ShUnregisterHook from
      * freeing the hook between our magic check and the enable toggle.
-     * Shared lock is sufficient — we're not modifying the hash table.
+     * Shared lock is sufficient â€” we're not modifying the hash table.
      */
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&fw->HookLock);
@@ -1100,7 +1102,7 @@ ShDispatchSyscall(
     /*
      * Acquire dispatch reference via EX_RUNDOWN_REF.
      * If shutdown has started (ExWaitForRundownProtectionRelease called),
-     * ExAcquireRundownProtection atomically returns FALSE — no race window
+     * ExAcquireRundownProtection atomically returns FALSE â€” no race window
      * between validate and acquire. This replaces the former pattern of
      * InterlockedIncrement + ShuttingDown check.
      */
@@ -1111,13 +1113,13 @@ ShDispatchSyscall(
     /* Rate limit check */
     if (!ShpCheckRateLimit(fw)) {
         ShpReleaseDispatchRef(fw);
-        return STATUS_SUCCESS;  /* Silently allow — rate limited */
+        return STATUS_SUCCESS;  /* Silently allow â€” rate limited */
     }
 
     /* Validate syscall number */
     if (Context->SyscallNumber >= SH_MAX_SYSCALL_NUMBER) {
         ShpReleaseDispatchRef(fw);
-        return STATUS_SUCCESS;  /* Unknown syscall — allow through */
+        return STATUS_SUCCESS;  /* Unknown syscall â€” allow through */
     }
 
     InterlockedIncrement64(&fw->TotalDispatches);
@@ -1138,7 +1140,7 @@ ShDispatchSyscall(
         ExReleasePushLockShared(&fw->HookLock);
         KeLeaveCriticalRegion();
         ShpReleaseDispatchRef(fw);
-        return STATUS_SUCCESS;  /* No hook or disabled — allow */
+        return STATUS_SUCCESS;  /* No hook or disabled â€” allow */
     }
 
     /*
@@ -1151,7 +1153,7 @@ ShDispatchSyscall(
     KeLeaveCriticalRegion();
 
     /*
-     * Invoke callbacks outside the lock — critical for avoiding deadlocks
+     * Invoke callbacks outside the lock â€” critical for avoiding deadlocks
      * if callbacks call back into the framework or into other kernel subsystems.
      *
      * Wrap in __try/__except to guarantee reference release even if a
@@ -1216,7 +1218,7 @@ ShDispatchSyscall(
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         /*
-         * Callback faulted — allow the syscall through and log.
+         * Callback faulted â€” allow the syscall through and log.
          * The critical path below still releases references correctly.
          */
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -1255,7 +1257,7 @@ ShGetStatistics(
 
     /*
      * Read all volatile counters. These are individually atomic reads
-     * but the snapshot is not globally consistent — this is acceptable
+     * but the snapshot is not globally consistent â€” this is acceptable
      * for statistics. Full consistency would require stopping all
      * dispatches, which is unacceptable for a hot-path monitoring tool.
      */

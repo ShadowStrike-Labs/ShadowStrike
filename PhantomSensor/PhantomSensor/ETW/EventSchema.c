@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -812,7 +814,7 @@ EsReleaseReference(
         LONG oldVal = InterlockedDecrement(&Schema->ReferenceCount);
         if (oldVal < 0) {
             //
-            // Underflow detected — use CompareExchange to atomically restore
+            // Underflow detected â€” use CompareExchange to atomically restore
             // ONLY if still negative, preventing double-restore race.
             //
             LONG current = Schema->ReferenceCount;
@@ -878,7 +880,7 @@ EsRegisterEvent(
     }
 
     //
-    // Copy only public/data fields — never copy internal fields
+    // Copy only public/data fields â€” never copy internal fields
     // (ListEntry, OrderedEntry, Magic, ReferenceCount, AllocatedFromPool)
     //
     newEvent->EventId = Event->EventId;
@@ -1033,7 +1035,7 @@ EsRegisterEventEx(
     }
 
     //
-    // Allocate from pool — ES_EVENT_DEFINITION is ~30KB, too large for kernel stack
+    // Allocate from pool â€” ES_EVENT_DEFINITION is ~30KB, too large for kernel stack
     //
     eventDef = (PES_EVENT_DEFINITION)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
@@ -2177,7 +2179,7 @@ EsAddValueMapEntry(
 
     //
     // Hold ValueMapLock while accessing the per-map lock (correct lock ordering:
-    // ValueMapLock level 1 → per-object Lock subordinate)
+    // ValueMapLock level 1 â†’ per-object Lock subordinate)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Schema->ValueMapLock);
@@ -2654,7 +2656,7 @@ EsSerializeSchema(
     }
 
     //
-    // Calculate total size using SERIALIZED (wire-format) structures only —
+    // Calculate total size using SERIALIZED (wire-format) structures only â€”
     // these exclude LIST_ENTRY, Magic, ReferenceCount, AllocatedFromPool
     // to prevent kernel pointer leakage.
     //
@@ -2703,7 +2705,7 @@ EsSerializeSchema(
 
     //
     // NOTE: ValueMapCount is stored in the header for informational purposes only.
-    // Value map data is NOT serialized — value maps contain runtime-only structures
+    // Value map data is NOT serialized â€” value maps contain runtime-only structures
     // (LIST_ENTRY, EX_PUSH_LOCK) and must be rebuilt by the caller after deserialization.
     //
     header->ValueMapCount = Schema->ValueMapCount;
@@ -2714,7 +2716,7 @@ EsSerializeSchema(
     currentPos += sizeof(ES_BINARY_HEADER);
 
     //
-    // Serialize events — copy only public fields via ES_SERIALIZED_EVENT_DEFINITION
+    // Serialize events â€” copy only public fields via ES_SERIALIZED_EVENT_DEFINITION
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Schema->EventLock);
@@ -2761,7 +2763,7 @@ EsSerializeSchema(
     KeLeaveCriticalRegion();
 
     //
-    // Serialize keywords — exclude LIST_ENTRY
+    // Serialize keywords â€” exclude LIST_ENTRY
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Schema->KeywordLock);
@@ -2787,7 +2789,7 @@ EsSerializeSchema(
     KeLeaveCriticalRegion();
 
     //
-    // Serialize tasks — exclude LIST_ENTRY
+    // Serialize tasks â€” exclude LIST_ENTRY
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Schema->TaskLock);
@@ -2814,7 +2816,7 @@ EsSerializeSchema(
     KeLeaveCriticalRegion();
 
     //
-    // Serialize opcodes — exclude LIST_ENTRY
+    // Serialize opcodes â€” exclude LIST_ENTRY
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Schema->OpcodeLock);
@@ -2842,7 +2844,7 @@ EsSerializeSchema(
     KeLeaveCriticalRegion();
 
     //
-    // Serialize channels — exclude LIST_ENTRY
+    // Serialize channels â€” exclude LIST_ENTRY
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Schema->ChannelLock);
@@ -2968,7 +2970,7 @@ EsDeserializeSchema(
 
     //
     // Deserialize events from wire-format structs
-    // NOTE: ES_EVENT_DEFINITION is ~30KB — must be pool-allocated, not stack.
+    // NOTE: ES_EVENT_DEFINITION is ~30KB â€” must be pool-allocated, not stack.
     //
     if (header->EventCount > 0) {
         PES_EVENT_DEFINITION eventDef = (PES_EVENT_DEFINITION)ShadowStrikeAllocatePoolWithTag(
@@ -3317,7 +3319,7 @@ EspHashEventName(
 )
 {
     //
-    // Case-insensitive DJB2 hash — normalize to lowercase to match
+    // Case-insensitive DJB2 hash â€” normalize to lowercase to match
     // the case-insensitive _stricmp comparison in EsGetEventByName
     //
     ULONG hash = ES_HASH_SEED;

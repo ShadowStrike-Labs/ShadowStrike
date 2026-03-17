@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -26,7 +28,7 @@
     - Overwriting AMSI context structures
     - Patching ETW provider functions (EtwEventWrite) to blind telemetry
 
-    This module operates purely as a DETECTOR — it does NOT implement
+    This module operates purely as a DETECTOR â€” it does NOT implement
     an AMSI scan provider. The actual AMSI provider runs in user-space.
 
     MITRE ATT&CK:
@@ -126,7 +128,7 @@ typedef struct _ABD_STATISTICS {
 } ABD_STATISTICS, *PABD_STATISTICS;
 
 // ============================================================================
-// PUBLIC API — LIFECYCLE
+// PUBLIC API â€” LIFECYCLE
 // ============================================================================
 
 /**
@@ -161,7 +163,7 @@ AbdIsActive(
     );
 
 // ============================================================================
-// PUBLIC API — IMAGE LOAD INTEGRATION
+// PUBLIC API â€” IMAGE LOAD INTEGRATION
 // ============================================================================
 
 /**
@@ -185,7 +187,7 @@ AbdNotifyImageLoad(
     );
 
 // ============================================================================
-// PUBLIC API — INTEGRITY SCAN
+// PUBLIC API â€” INTEGRITY SCAN
 // ============================================================================
 
 /**
@@ -232,7 +234,7 @@ AbdCheckProtectionChange(
     );
 
 // ============================================================================
-// PUBLIC API — PROCESS CLEANUP
+// PUBLIC API â€” PROCESS CLEANUP
 // ============================================================================
 
 /**
@@ -250,7 +252,7 @@ AbdRemoveProcessTracking(
     );
 
 // ============================================================================
-// PUBLIC API — STATISTICS
+// PUBLIC API â€” STATISTICS
 // ============================================================================
 
 /**

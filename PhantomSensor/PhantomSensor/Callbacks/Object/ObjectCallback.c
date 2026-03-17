@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -79,7 +81,7 @@
 // ============================================================================
 
 //
-// PsGetProcessSessionId — returns session ID for a given EPROCESS
+// PsGetProcessSessionId â€” returns session ID for a given EPROCESS
 //
 NTKERNELAPI
 ULONG
@@ -88,7 +90,7 @@ PsGetProcessSessionId(
     );
 
 //
-// PsGetProcessImageFileName — returns up to 15-char image name, IRQL-safe
+// PsGetProcessImageFileName â€” returns up to 15-char image name, IRQL-safe
 //
 NTKERNELAPI
 PCHAR
@@ -403,7 +405,7 @@ ShadowStrikeRegisterObjectCallbacks(
 
     //
     // We won the race - reinitialize fields individually
-    // (do NOT RtlZeroMemory the whole struct — it clobbers InitState,
+    // (do NOT RtlZeroMemory the whole struct â€” it clobbers InitState,
     //  creating a window where another CPU sees 0 and CAS succeeds)
     //
     g_ObCallbackContext.TotalProcessOperations = 0;
@@ -844,7 +846,7 @@ ShadowStrikeProcessPreCallback(
                     );
 
                 //
-                // Feed ThreatScoring — handle-based attacks contribute to
+                // Feed ThreatScoring â€” handle-based attacks contribute to
                 // per-process score (LSASS credential theft, injection, termination).
                 //
                 if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
@@ -919,7 +921,7 @@ ShadowStrikeProcessPreCallback(
         );
 
     //
-    // HandleProtection deep analysis — per-process forensic tracking, event
+    // HandleProtection deep analysis â€” per-process forensic tracking, event
     // history recording, suspicion scoring, and detection callback notification.
     // Uses OriginalDesiredAccess internally for callback-order-independent detection.
     //
@@ -932,7 +934,7 @@ ShadowStrikeProcessPreCallback(
             //
             // Record handle operation in HandleProtection audit trail.
             // Handle values are not available in OB PreOperation callbacks.
-            // NOTE: HpRecordHandleClose cannot be wired here — PostOperation
+            // NOTE: HpRecordHandleClose cannot be wired here â€” PostOperation
             // is NULL (see operationRegistration[0] setup). Close tracking
             // would require adding a PostOperation callback.
             //
@@ -959,7 +961,7 @@ ShadowStrikeProcessPreCallback(
 
     //
     // Record handle duplication in HandleTracker for cross-process forensics.
-    // Only duplicate operations are recorded — not creates, which are expected.
+    // Only duplicate operations are recorded â€” not creates, which are expected.
     //
     if (isDuplicate) {
         PHT_TRACKER htTracker = PaGetHandleTracker();
@@ -1087,8 +1089,8 @@ ShadowStrikeThreadPreCallback(
 
     //
     // Cross-session detection for threads (mirrors process callback logic).
-    // Cross-session thread handle access is suspicious — indicates lateral
-    // movement or session-hopping attacks (e.g., Session 0 → Session 1).
+    // Cross-session thread handle access is suspicious â€” indicates lateral
+    // movement or session-hopping attacks (e.g., Session 0 â†’ Session 1).
     //
     if (context->EnableCrossSessionMonitoring && !isKernelHandle) {
         sourceSessionId = PsGetProcessSessionId(sourceProcess);
@@ -1216,7 +1218,7 @@ ShadowStrikeThreadPreCallback(
             InterlockedIncrement64(&context->SuspiciousOperations);
 
             //
-            // Thread handle injection pattern → BehaviorEngine (T1055)
+            // Thread handle injection pattern â†’ BehaviorEngine (T1055)
             //
             BeEngineSubmitEvent(
                 BehaviorEvent_ThreadExecutionHijack,
@@ -1229,7 +1231,7 @@ ShadowStrikeThreadPreCallback(
                 );
 
             //
-            // Feed ThreatScoring — thread handle injection pattern (T1055)
+            // Feed ThreatScoring â€” thread handle injection pattern (T1055)
             //
             if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
                 PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
@@ -1293,7 +1295,7 @@ ShadowStrikeThreadPreCallback(
         );
 
     //
-    // HandleProtection deep analysis — per-process forensic tracking, event
+    // HandleProtection deep analysis â€” per-process forensic tracking, event
     // history recording, and detection callback notification for thread handles.
     // Thread handle operations are analyzed for injection precursors (T1055).
     //
@@ -1306,7 +1308,7 @@ ShadowStrikeThreadPreCallback(
             //
             // Record thread handle operation in HandleProtection audit trail.
             // Handle values are not available in OB PreOperation callbacks.
-            // NOTE: HpRecordHandleClose cannot be wired here — PostOperation
+            // NOTE: HpRecordHandleClose cannot be wired here â€” PostOperation
             // is NULL (see operationRegistration[1] setup). Close tracking
             // would require adding a PostOperation callback.
             //
@@ -1333,7 +1335,7 @@ ShadowStrikeThreadPreCallback(
 
     //
     // Record thread handle duplication in HandleTracker for cross-process
-    // injection forensics (T1055 — thread handle duplicate is injection precursor).
+    // injection forensics (T1055 â€” thread handle duplicate is injection precursor).
     //
     if (isDuplicate) {
         PHT_TRACKER htTracker = PaGetHandleTracker();
@@ -1498,8 +1500,8 @@ ObRemoveProtectedProcess(
     KeLeaveCriticalRegion();
 
     //
-    // Free outside lock — but ONLY if refcount drained to zero.
-    // Freeing with outstanding references causes use-after-free → BSOD.
+    // Free outside lock â€” but ONLY if refcount drained to zero.
+    // Freeing with outstanding references causes use-after-free â†’ BSOD.
     //
     if (foundEntry != NULL) {
         ULONG spinCount = 0;
@@ -1520,13 +1522,13 @@ ObRemoveProtectedProcess(
             ShadowStrikeFreePoolWithTag(foundEntry, OB_PROTECTED_ENTRY_TAG);
         } else {
             //
-            // Refcount did not drain — leak the entry rather than cause UAF.
+            // Refcount did not drain â€” leak the entry rather than cause UAF.
             // This is a defensive choice: a small leak is infinitely better
             // than a BSOD from use-after-free on a hot callback path.
             //
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                 "[ShadowStrike] ObRemoveProtectedProcess: refcount drain timeout PID=%p "
-                "refcount=%ld — entry leaked to prevent UAF\n",
+                "refcount=%ld â€” entry leaked to prevent UAF\n",
                 foundEntry->ProcessId,
                 InterlockedCompareExchange(&foundEntry->ReferenceCount, 0, 0));
         }
@@ -1643,7 +1645,7 @@ ObQueueTelemetryEvent(
     }
 
     //
-    // Build alert payload (no header — batch callback adds it)
+    // Build alert payload (no header â€” batch callback adds it)
     //
     RtlZeroMemory(&Alert, sizeof(Alert));
 
@@ -2563,7 +2565,7 @@ ObpMatchProcessNameAnsi(
     }
 
     //
-    // Cache miss — get image name using IRQL-safe function
+    // Cache miss â€” get image name using IRQL-safe function
     //
     ObpGetProcessImageFileNameSafe(Process, imageName);
 
@@ -2627,7 +2629,7 @@ ObpValidateProcessPath(
     //
     if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
         //
-        // Cannot validate at elevated IRQL — fail closed.
+        // Cannot validate at elevated IRQL â€” fail closed.
         // A name-matched process without path validation is NOT trusted;
         // the explicit protected process list provides coverage at all IRQLs.
         //
@@ -2684,7 +2686,7 @@ ObpValidateProcessPath(
                     imagePath->Buffer[5] == L':' &&
                     imagePath->Buffer[6] == L'\\') {
                     //
-                    // Looks like \??\X:\... — check the rest matches \Windows\System32\
+                    // Looks like \??\X:\... â€” check the rest matches \Windows\System32\
                     //
                     UNICODE_STRING pathAfterDrive;
                     pathAfterDrive.Buffer = &imagePath->Buffer[6];
@@ -2700,7 +2702,7 @@ ObpValidateProcessPath(
 
         case PpCategoryAntimalware:
             //
-            // ShadowStrike processes — validate against cached install directory.
+            // ShadowStrike processes â€” validate against cached install directory.
             // Install path is read from registry at initialization:
             //   HKLM\SOFTWARE\ShadowStrike\InstallPath
             // Falls back to default path if registry key is not present.
@@ -3111,7 +3113,7 @@ Fail:
     }
 
     //
-    // Failed to resolve — the function will still work via
+    // Failed to resolve â€” the function will still work via
     // \SystemRoot\System32\ prefix and \??\X:\Windows\System32\ DOS path checks
     //
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,

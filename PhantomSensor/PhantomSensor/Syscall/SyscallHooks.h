@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -127,7 +129,7 @@ typedef enum _SH_HOOK_RESULT {
     ShResult_Allow      = 0,
     /** Block the syscall (return STATUS_ACCESS_DENIED to caller) */
     ShResult_Block      = 1,
-    /** Log only — allow but flag for telemetry */
+    /** Log only â€” allow but flag for telemetry */
     ShResult_Log        = 2,
 } SH_HOOK_RESULT;
 
@@ -167,7 +169,7 @@ typedef struct _SH_SYSCALL_CONTEXT {
     /** Padding */
     UCHAR Reserved1[3];
 
-    /** User-mode return address of the syscall caller (informational only — NOT dereferenced) */
+    /** User-mode return address of the syscall caller (informational only â€” NOT dereferenced) */
     ULONG64 CallerReturnAddress;
 
     /**
@@ -219,7 +221,7 @@ DECLARE_HANDLE(SH_FRAMEWORK_HANDLE);
 DECLARE_HANDLE(SH_HOOK_HANDLE);
 
 // ============================================================================
-// PUBLIC API — LIFECYCLE
+// PUBLIC API â€” LIFECYCLE
 // ============================================================================
 
 /**
@@ -256,7 +258,7 @@ ShShutdown(
     );
 
 // ============================================================================
-// PUBLIC API — HOOK REGISTRATION
+// PUBLIC API â€” HOOK REGISTRATION
 // ============================================================================
 
 /**
@@ -309,7 +311,7 @@ ShUnregisterHook(
     );
 
 // ============================================================================
-// PUBLIC API — HOOK CONTROL
+// PUBLIC API â€” HOOK CONTROL
 // ============================================================================
 
 /**
@@ -345,7 +347,7 @@ ShDisableHook(
     );
 
 // ============================================================================
-// PUBLIC API — DISPATCH
+// PUBLIC API â€” DISPATCH
 // ============================================================================
 
 /**
@@ -372,7 +374,7 @@ ShDispatchSyscall(
     );
 
 // ============================================================================
-// PUBLIC API — STATISTICS
+// PUBLIC API â€” STATISTICS
 // ============================================================================
 
 /**

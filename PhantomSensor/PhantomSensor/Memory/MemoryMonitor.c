@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -80,7 +82,7 @@
 #endif
 
 //
-// Push lock primitives — not declared in all WDK header configurations.
+// Push lock primitives â€” not declared in all WDK header configurations.
 //
 NTKERNELAPI
 VOID
@@ -263,11 +265,11 @@ static NTSTATUS MmpQueryVirtualMemory(_In_ PEPROCESS Process, _In_ PVOID Address
 // ============================================================================
 
 /**
- * @brief HeapSpray detection callback — invoked when spray pattern is confirmed.
+ * @brief HeapSpray detection callback â€” invoked when spray pattern is confirmed.
  *
  * Routes the detection into BehaviorEngine for threat scoring and response
  * decision. Invoked at <= APC_LEVEL under HeapSpray's shared callback lock.
- * Must complete quickly — no blocking or heavy allocation.
+ * Must complete quickly â€” no blocking or heavy allocation.
  */
 static VOID
 MmpHeapSprayDetectionCallback(
@@ -289,7 +291,7 @@ MmpHeapSprayDetectionCallback(
     //
     threatScore = (UINT32)((Result->ConfidenceScore * 100) / 1000);
     if (threatScore < 50) {
-        threatScore = 50;   // Minimum — spray was confirmed
+        threatScore = 50;   // Minimum â€” spray was confirmed
     }
 
     BeEngineSubmitEvent(
@@ -335,7 +337,7 @@ MmpHeapSprayDetectionCallback(
 // ============================================================================
 
 /**
- * @brief InjectionDetector detection callback — invoked when injection chain confirmed.
+ * @brief InjectionDetector detection callback â€” invoked when injection chain confirmed.
  *
  * Maps injection technique to BehaviorEngine event types for threat scoring.
  * Invoked at PASSIVE_LEVEL from the InjectionDetector's analysis worker thread.
@@ -390,7 +392,7 @@ MmpInjectionDetectionCallback(
     }
 
     //
-    // Enforce minimum score of 60 — detector has already confirmed the chain
+    // Enforce minimum score of 60 â€” detector has already confirmed the chain
     //
     threatScore = Result->ConfidenceScore;
     if (threatScore < 60) {
@@ -438,7 +440,7 @@ MmpInjectionDetectionCallback(
 // ============================================================================
 
 /**
- * @brief HollowingDetector detection callback — invoked when hollowing is confirmed.
+ * @brief HollowingDetector detection callback â€” invoked when hollowing is confirmed.
  *
  * Routes the detection into BehaviorEngine for threat scoring and response.
  * Invoked at PASSIVE_LEVEL under HollowingDetector's shared callback lock.
@@ -463,7 +465,7 @@ MmpHollowingDetectionCallback(
     //
     threatScore = max(Result->ConfidenceScore, Result->SeverityScore);
     if (threatScore < 60) {
-        threatScore = 60;   // Minimum — hollowing was confirmed
+        threatScore = 60;   // Minimum â€” hollowing was confirmed
     }
 
     BeEngineSubmitEvent(
@@ -520,7 +522,7 @@ MmMonitorInitialize(
     PAGED_CODE();
 
     //
-    // Atomic init guard — only one thread can initialize
+    // Atomic init guard â€” only one thread can initialize
     //
     PrevState = InterlockedCompareExchange(&g_MemoryMonitor.InitState,
                                            MM_INIT_IN_PROGRESS,
@@ -589,13 +591,13 @@ MmMonitorInitialize(
 
     //
     // Initialize sub-module detectors.
-    // Each sub-module is independent — failure of one does NOT block the others.
+    // Each sub-module is independent â€” failure of one does NOT block the others.
     // We log and continue so the monitor still provides partial coverage.
     //
     if (g_MemoryMonitor.Config.EnableHeapSprayDetection) {
         Status = HsInitialize((PHS_DETECTOR*)&g_MemoryMonitor.HeapSprayDetector);
         if (!NT_SUCCESS(Status)) {
-            DbgPrint("MemoryMonitor: HeapSpray init failed: 0x%08X — continuing without heap spray detection", Status);
+            DbgPrint("MemoryMonitor: HeapSpray init failed: 0x%08X â€” continuing without heap spray detection", Status);
             g_MemoryMonitor.Config.EnableHeapSprayDetection = FALSE;
             g_MemoryMonitor.HeapSprayDetector = NULL;
         } else {
@@ -617,7 +619,7 @@ MmMonitorInitialize(
     if (g_MemoryMonitor.Config.EnableROPDetection) {
         Status = RopInitialize((PROP_DETECTOR*)&g_MemoryMonitor.ROPDetector);
         if (!NT_SUCCESS(Status)) {
-            DbgPrint("MemoryMonitor: ROPDetector init failed: 0x%08X — continuing without ROP detection", Status);
+            DbgPrint("MemoryMonitor: ROPDetector init failed: 0x%08X â€” continuing without ROP detection", Status);
             g_MemoryMonitor.Config.EnableROPDetection = FALSE;
             g_MemoryMonitor.ROPDetector = NULL;
         }
@@ -626,7 +628,7 @@ MmMonitorInitialize(
     if (g_MemoryMonitor.Config.EnableSectionTracking) {
         Status = SecInitialize((PSEC_TRACKER*)&g_MemoryMonitor.SectionTracker);
         if (!NT_SUCCESS(Status)) {
-            DbgPrint("MemoryMonitor: SectionTracker init failed: 0x%08X — continuing without section tracking", Status);
+            DbgPrint("MemoryMonitor: SectionTracker init failed: 0x%08X â€” continuing without section tracking", Status);
             g_MemoryMonitor.Config.EnableSectionTracking = FALSE;
             g_MemoryMonitor.SectionTracker = NULL;
         }
@@ -639,7 +641,7 @@ MmMonitorInitialize(
     if (g_MemoryMonitor.Config.EnableVADTracking) {
         Status = VadInitialize((PVAD_TRACKER*)&g_MemoryMonitor.VadTracker);
         if (!NT_SUCCESS(Status)) {
-            DbgPrint("MemoryMonitor: VadTracker init failed: 0x%08X — continuing without VAD tracking", Status);
+            DbgPrint("MemoryMonitor: VadTracker init failed: 0x%08X â€” continuing without VAD tracking", Status);
             g_MemoryMonitor.Config.EnableVADTracking = FALSE;
             g_MemoryMonitor.VadTracker = NULL;
         }
@@ -650,14 +652,14 @@ MmMonitorInitialize(
             (PVAD_TRACKER)g_MemoryMonitor.VadTracker,
             (PINJ_DETECTOR*)&g_MemoryMonitor.InjectionDetector);
         if (!NT_SUCCESS(Status)) {
-            DbgPrint("MemoryMonitor: InjectionDetector init failed: 0x%08X — continuing without injection detection", Status);
+            DbgPrint("MemoryMonitor: InjectionDetector init failed: 0x%08X â€” continuing without injection detection", Status);
             g_MemoryMonitor.Config.EnableInjectionDetection = FALSE;
             g_MemoryMonitor.InjectionDetector = NULL;
         } else {
             //
             // Register BehaviorEngine callback so injection chain detections feed
             // into the threat scoring pipeline. Without this, chain-correlated
-            // detections (Alloc→Write→Protect→Thread) are silent.
+            // detections (Allocâ†’Writeâ†’Protectâ†’Thread) are silent.
             //
             Status = InjRegisterDetectionCallback(
                 (PINJ_DETECTOR)g_MemoryMonitor.InjectionDetector,
@@ -673,7 +675,7 @@ MmMonitorInitialize(
     if (g_MemoryMonitor.Config.EnableHollowingDetection) {
         Status = PhInitialize((PPH_DETECTOR*)&g_MemoryMonitor.HollowingDetector);
         if (!NT_SUCCESS(Status)) {
-            DbgPrint("MemoryMonitor: HollowingDetector init failed: 0x%08X — continuing without hollowing detection", Status);
+            DbgPrint("MemoryMonitor: HollowingDetector init failed: 0x%08X â€” continuing without hollowing detection", Status);
             g_MemoryMonitor.Config.EnableHollowingDetection = FALSE;
             g_MemoryMonitor.HollowingDetector = NULL;
         } else {
@@ -695,7 +697,7 @@ MmMonitorInitialize(
     if (g_MemoryMonitor.Config.EnableShellcodeDetection) {
         Status = SdInitialize((PSD_DETECTOR*)&g_MemoryMonitor.ShellcodeDetector, NULL);
         if (!NT_SUCCESS(Status)) {
-            DbgPrint("MemoryMonitor: ShellcodeDetector init failed: 0x%08X — continuing without shellcode detection", Status);
+            DbgPrint("MemoryMonitor: ShellcodeDetector init failed: 0x%08X â€” continuing without shellcode detection", Status);
             g_MemoryMonitor.Config.EnableShellcodeDetection = FALSE;
             g_MemoryMonitor.ShellcodeDetector = NULL;
         }
@@ -736,7 +738,7 @@ MmMonitorShutdown(
     MemoryBarrier();
 
     //
-    // Wait for outstanding references to drain — INFINITE wait is mandatory
+    // Wait for outstanding references to drain â€” INFINITE wait is mandatory
     // to prevent BSOD from freeing resources while operations still hold refs.
     //
     if (g_MemoryMonitor.OutstandingRefs > 0) {
@@ -751,8 +753,8 @@ MmMonitorShutdown(
 
     //
     // Shut down sub-module detectors (reverse init order).
-    // Init order: VadTracker → InjectionDetector → HollowingDetector → ShellcodeDetector
-    // Shutdown must be reverse: ShellcodeDetector → HollowingDetector → InjectionDetector → VadTracker
+    // Init order: VadTracker â†’ InjectionDetector â†’ HollowingDetector â†’ ShellcodeDetector
+    // Shutdown must be reverse: ShellcodeDetector â†’ HollowingDetector â†’ InjectionDetector â†’ VadTracker
     // This ensures InjectionDetector releases its VadTracker reference before VadTracker shuts down.
     //
     if (g_MemoryMonitor.ShellcodeDetector != NULL) {
@@ -853,7 +855,7 @@ MmMonitorUpdateConfig(
     }
 
     //
-    // Copy to local then apply defaults — never mutate caller's buffer (FIX-13)
+    // Copy to local then apply defaults â€” never mutate caller's buffer (FIX-13)
     //
     RtlCopyMemory(&LocalConfig, Config, sizeof(MEMORY_MONITOR_CONFIG));
 
@@ -900,7 +902,7 @@ MmMonitorGetStatistics(
     }
 
     //
-    // Copy only safe, scalar fields — no sync primitives or internal pointers
+    // Copy only safe, scalar fields â€” no sync primitives or internal pointers
     //
     Stats->Enabled = g_MemoryMonitor.Enabled;
     Stats->ProcessContextCount = g_MemoryMonitor.ProcessContextCount;
@@ -1292,7 +1294,7 @@ MmMonitorHandleAllocation(
     }
 
     //
-    // Check for initial RWX allocation — hold RegionLock for MmpFindRegion (FIX-02)
+    // Check for initial RWX allocation â€” hold RegionLock for MmpFindRegion (FIX-02)
     //
     if (MmpIsRWXProtection(Protection)) {
         KeEnterCriticalRegion();
@@ -1352,7 +1354,7 @@ MmMonitorHandleAllocation(
             (PVOID)(ULONG_PTR)BaseAddress,
             (SIZE_T)RegionSize,
             Protection,
-            NULL    // ReturnAddress — not captured at this layer
+            NULL    // ReturnAddress â€” not captured at this layer
         );
     }
 
@@ -1448,7 +1450,7 @@ MmMonitorHandleProtectionChange(
 
     if (Region == NULL) {
         //
-        // Region not tracked — release lock, add it, re-acquire
+        // Region not tracked â€” release lock, add it, re-acquire
         //
         ExfReleasePushLockExclusive(&Context->RegionLock);
         KeLeaveCriticalRegion();
@@ -1470,7 +1472,7 @@ MmMonitorHandleProtectionChange(
         KeQuerySystemTimePrecise((PLARGE_INTEGER)&Region->LastProtectionChangeTime);
 
         //
-        // Detect W→X transition (classic unpacking/shellcode pattern)
+        // Detect Wâ†’X transition (classic unpacking/shellcode pattern)
         //
         if (Region->WasWritten && MmpIsExecutableProtection(NewProtection)) {
             Region->NowExecutable = TRUE;
@@ -1520,7 +1522,7 @@ MmMonitorHandleProtectionChange(
     KeLeaveCriticalRegion();
 
     //
-    // Trigger memory scanner for W→X transitions (classic unpacking/shellcode)
+    // Trigger memory scanner for Wâ†’X transitions (classic unpacking/shellcode)
     //
     if (RegionFound && RegionWasWritten && MmpIsExecutableProtection(NewProtection) &&
         KeGetCurrentIrql() == PASSIVE_LEVEL) {
@@ -1555,8 +1557,8 @@ MmMonitorHandleProtectionChange(
 
     //
     // Feed cross-process protection changes to InjectionDetector for chain
-    // correlation. Protection changes (especially W→X, RW→RX) are critical
-    // steps in injection chains (alloc→write→protect→thread).
+    // correlation. Protection changes (especially Wâ†’X, RWâ†’RX) are critical
+    // steps in injection chains (allocâ†’writeâ†’protectâ†’thread).
     //
     if (IsCrossProcess && g_MemoryMonitor.Config.EnableInjectionDetection &&
         g_MemoryMonitor.InjectionDetector != NULL) {
@@ -1693,7 +1695,7 @@ MmMonitorHandleCrossProcessWrite(
 
     //
     // Delegate to InjectionDetector for correlation-based detection.
-    // The detector tracks multi-step injection chains (alloc → write → protect → thread)
+    // The detector tracks multi-step injection chains (alloc â†’ write â†’ protect â†’ thread)
     // and only counts confirmed injection sequences.
     //
     if (g_MemoryMonitor.Config.EnableInjectionDetection && g_MemoryMonitor.InjectionDetector != NULL) {
@@ -1702,11 +1704,11 @@ MmMonitorHandleCrossProcessWrite(
             InjOpWrite,
             ULongToHandle(SourceProcessId),
             ULongToHandle(TargetProcessId),
-            NULL,     // SourceThreadId — not available here
-            NULL,     // TargetThreadId — not available here
+            NULL,     // SourceThreadId â€” not available here
+            NULL,     // TargetThreadId â€” not available here
             (PVOID)(ULONG_PTR)TargetAddress,
             (SIZE_T)Size,
-            0,        // Protection — not available for write ops
+            0,        // Protection â€” not available for write ops
             SourceBuffer,
             0         // Flags
         );
@@ -1752,7 +1754,7 @@ MmMonitorHandleSectionMap(
     //
     // Delegate to SectionTracker for section-level anomaly detection
     // (doppelganging, transacted sections, cross-process shared sections).
-    // SectionHandle is passed directly — SectionTracker can dereference if needed.
+    // SectionHandle is passed directly â€” SectionTracker can dereference if needed.
     //
     if (g_MemoryMonitor.Config.EnableSectionTracking && g_MemoryMonitor.SectionTracker != NULL) {
         NTSTATUS SecStatus;
@@ -1762,7 +1764,7 @@ MmMonitorHandleSectionMap(
             ULongToHandle(ProcessId),
             (PVOID)(ULONG_PTR)BaseAddress,
             (SIZE_T)ViewSize,
-            0,              // SectionOffset — not available at this layer
+            0,              // SectionOffset â€” not available at this layer
             Protection
         );
         if (!NT_SUCCESS(SecStatus)) {
@@ -1939,7 +1941,7 @@ MmMonitorScanForShellcode(
 
             if (NT_SUCCESS(SdStatus) && SdResult != NULL && SdResult->IsShellcode) {
                 //
-                // ShellcodeDetector returned a positive result — use its scoring
+                // ShellcodeDetector returned a positive result â€” use its scoring
                 //
                 ShellcodeDetected = TRUE;
 
@@ -2001,7 +2003,7 @@ MmMonitorScanForShellcode(
                 SdFreeResult(SdResult);
             } else {
                 //
-                // ShellcodeDetector didn't confirm — fall back to entropy-only heuristic.
+                // ShellcodeDetector didn't confirm â€” fall back to entropy-only heuristic.
                 // This prevents false negatives if the detector fails transiently.
                 //
                 ShellcodeDetected = TRUE;
@@ -2029,7 +2031,7 @@ MmMonitorScanForShellcode(
             }
         } else {
             //
-            // No ShellcodeDetector available — entropy-only fallback
+            // No ShellcodeDetector available â€” entropy-only fallback
             //
             ShellcodeDetected = TRUE;
 
@@ -2173,7 +2175,7 @@ MmMonitorDetectInjection(
 
         //
         // Delegate to InjectionDetector for full chain-correlation analysis.
-        // The detector maintains per-source→target chains and uses multi-step
+        // The detector maintains per-sourceâ†’target chains and uses multi-step
         // correlation (alloc + write + protect + thread/APC) for high-fidelity detection.
         //
         if (g_MemoryMonitor.InjectionDetector != NULL) {
@@ -2200,7 +2202,7 @@ MmMonitorDetectInjection(
                     Event->InjectionType = InjectionType;
                     Event->InjectedAddress = TargetAddress;
                     Event->InjectedSize = Size;
-                    Event->ThreatScore = InjResult->Severity * 25;  // 1-4 → 25-100
+                    Event->ThreatScore = InjResult->Severity * 25;  // 1-4 â†’ 25-100
                     Event->Confidence = (UINT32)min(InjResult->ConfidenceScore, 100);
                     Event->Flags |= INJECTION_FLAG_CROSS_SESSION;
                 }
@@ -2239,7 +2241,7 @@ MmMonitorDetectInjection(
             }
         } else {
             //
-            // No InjectionDetector — heuristic-only fallback
+            // No InjectionDetector â€” heuristic-only fallback
             //
             InjectionDetected = TRUE;
 
@@ -2342,7 +2344,7 @@ MmMonitorDetectHollowing(
 
     //
     // If the deep detector didn't fire (or wasn't available), check context flags
-    // as a secondary heuristic — process was flagged during HandleProtectionChange
+    // as a secondary heuristic â€” process was flagged during HandleProtectionChange
     // when an image region received RWX during early process life.
     //
     if (!HollowingDetected && (Context->Flags & MM_PROCESS_FLAG_HOLLOWING_TARGET)) {
@@ -2539,12 +2541,16 @@ MmMonitorBuildVadMap(
     }
 
     //
-    // Allocate VAD map structure with space for entries (FIX-11: overflow guard)
+    // Allocate VAD map structure with space for entries.
+    // Use safe multiplication to detect overflow on SIZE_T.
     //
-    MapSize = sizeof(PROCESS_VAD_MAP) + ((SIZE_T)MaxRegions * sizeof(VAD_ENTRY));
-    if (MapSize < sizeof(PROCESS_VAD_MAP)) {
-        ObDereferenceObject(Process);
-        return STATUS_INTEGER_OVERFLOW;
+    {
+        SIZE_T entryBytes = (SIZE_T)MaxRegions * sizeof(VAD_ENTRY);
+        if (MaxRegions != 0 && entryBytes / MaxRegions != sizeof(VAD_ENTRY)) {
+            ObDereferenceObject(Process);
+            return STATUS_INTEGER_OVERFLOW;
+        }
+        MapSize = sizeof(PROCESS_VAD_MAP) + entryBytes;
     }
     Map = (PPROCESS_VAD_MAP)ExAllocatePool2(POOL_FLAG_PAGED, MapSize, MM_POOL_TAG_GENERAL);
     if (Map == NULL) {
@@ -3134,13 +3140,13 @@ MmpCreateProcessContext(
     }
 
     //
-    // Insert into list first (safe — not yet discoverable via hash table)
+    // Insert into list first (safe â€” not yet discoverable via hash table)
     //
     InsertTailList(&g_MemoryMonitor.ProcessContextList, &NewContext->ListEntry);
     g_MemoryMonitor.ProcessContextCount++;
 
     //
-    // Now insert into hash table — context is fully linked, safe to discover
+    // Now insert into hash table â€” context is fully linked, safe to discover
     //
     InsertTailList(&g_ProcessHashTable.Buckets[Hash], &HashEntry->ListEntry);
     InterlockedIncrement(&g_ProcessHashTable.EntryCount);
@@ -3150,9 +3156,9 @@ MmpCreateProcessContext(
     KeLeaveCriticalRegion();
 
     //
-    // Start VAD tracking for this process (T1055 — injection/hollowing detection).
+    // Start VAD tracking for this process (T1055 â€” injection/hollowing detection).
     // VadStartTracking enumerates current VADs and sets up change monitoring.
-    // PASSIVE_LEVEL required — we are in PAGED context after lock release.
+    // PASSIVE_LEVEL required â€” we are in PAGED context after lock release.
     //
     if (g_MemoryMonitor.VadTracker != NULL &&
         KeGetCurrentIrql() == PASSIVE_LEVEL) {
@@ -3243,7 +3249,7 @@ MmpDereferenceProcessContext(
     if (NewRef <= 0) {
         if (NewRef < 0) {
             //
-            // Underflow — double-deref bug. Increment back to prevent
+            // Underflow â€” double-deref bug. Increment back to prevent
             // double-free and log. Do NOT free the context.
             //
             InterlockedIncrement(&Context->RefCount);
@@ -3408,7 +3414,7 @@ MmpAddRegion(
     }
 
     //
-    // Insert into list — re-check count under lock to close TOCTOU window (FIX MM-M1).
+    // Insert into list â€” re-check count under lock to close TOCTOU window (FIX MM-M1).
     // The pre-checks above (lines 2967/2970) are optimistic fast-path filters.
     // This definitive check under lock prevents concurrent threads from exceeding the limit.
     //

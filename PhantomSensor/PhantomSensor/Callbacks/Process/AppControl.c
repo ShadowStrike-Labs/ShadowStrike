@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -326,7 +328,7 @@ AcCheckProcessExecution(
     }
 
     //
-    // Exclusion check — exempt excluded processes from app control policy.
+    // Exclusion check â€” exempt excluded processes from app control policy.
     // Excluded processes are typically trusted management tools that must
     // never be blocked by allowlisting policies.
     //
@@ -415,7 +417,7 @@ AcCheckProcessExecution(
             HandleToULong(ProcessId),
             ImageFileName->Buffer,
             (ImageFileName->Length < 512) ? ImageFileName->Length : 512,
-            90,     // High suspicion — actively blocked
+            90,     // High suspicion â€” actively blocked
             FALSE,
             NULL
         );
@@ -432,7 +434,7 @@ AcCheckProcessExecution(
             HandleToULong(ProcessId),
             ImageFileName->Buffer,
             (ImageFileName->Length < 512) ? ImageFileName->Length : 512,
-            40,     // Medium suspicion — audit only
+            40,     // Medium suspicion â€” audit only
             FALSE,
             NULL
         );
@@ -463,7 +465,7 @@ AcCheckImageLoad(
     }
 
     //
-    // Exclusion check — exempt excluded processes from DLL load control
+    // Exclusion check â€” exempt excluded processes from DLL load control
     //
     if (ShadowStrikeIsProcessExcluded(ProcessId, NULL) ||
         ShadowStrikeIsPathExcluded(ImageFileName, NULL)) {
@@ -517,7 +519,7 @@ AcGetStatistics(
 }
 
 // ============================================================================
-// PRIVATE — HASH LOOKUP
+// PRIVATE â€” HASH LOOKUP
 // ============================================================================
 
 static ULONG
@@ -571,7 +573,7 @@ AcpFindHashRule(
 }
 
 // ============================================================================
-// PRIVATE — PATH RULES
+// PRIVATE â€” PATH RULES
 // ============================================================================
 
 static AC_VERDICT
@@ -677,7 +679,7 @@ AcpIsTrustedPath(
     }
 
     //
-    // \??\X:\ — DOS device path, root starts after drive letter colon
+    // \??\X:\ â€” DOS device path, root starts after drive letter colon
     //
     if (LenChars > 6 &&
         ImagePath->Buffer[0] == L'\\' &&
@@ -690,7 +692,7 @@ AcpIsTrustedPath(
     }
 
     //
-    // \Device\<name>\ — NT device path, find backslash after device name.
+    // \Device\<name>\ â€” NT device path, find backslash after device name.
     // Cap scan at 80 chars to prevent runaway on malformed paths.
     //
     if (RootOffset == MAXUSHORT && LenChars > 9) {
@@ -736,7 +738,7 @@ AcpIsTrustedPath(
 }
 
 // ============================================================================
-// PRIVATE — LEARNING MODE
+// PRIVATE â€” LEARNING MODE
 // ============================================================================
 
 static VOID
@@ -803,7 +805,7 @@ AcpLearnHashRule(
 }
 
 // ============================================================================
-// PRIVATE — LIFECYCLE
+// PRIVATE â€” LIFECYCLE
 // ============================================================================
 
 static BOOLEAN

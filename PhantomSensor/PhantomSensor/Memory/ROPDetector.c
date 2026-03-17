@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -98,7 +100,7 @@ typedef struct _ROP_LDR_DATA_TABLE_ENTRY {
 } ROP_LDR_DATA_TABLE_ENTRY, *PROP_LDR_DATA_TABLE_ENTRY_KM;
 
 //
-// TEB subset — only NtTib (first field) is needed for stack bounds.
+// TEB subset â€” only NtTib (first field) is needed for stack bounds.
 //
 typedef struct _ROP_TEB {
     NT_TIB          NtTib;
@@ -2065,7 +2067,7 @@ Routine Description:
 
     if (mod == 3) {
         //
-        // Register direct — no SIB, no displacement
+        // Register direct â€” no SIB, no displacement
         //
         return 1;
     }
@@ -2275,25 +2277,25 @@ Routine Description:
                 UCHAR reg = (modrm & MODRM_REG_MASK) >> MODRM_REG_SHIFT;
 
                 if (opcode == 0x89 && rm == 4) {
-                    // MOV ESP/RSP, reg — stack pivot
+                    // MOV ESP/RSP, reg â€” stack pivot
                     Gadget->Semantics.ModifiesStack = TRUE;
                     Gadget->Semantics.RegistersModified |= REG_RSP;
                 } else if (opcode == 0x8B && reg == 4) {
-                    // MOV reg, ESP/RSP — reading stack pointer
+                    // MOV reg, ESP/RSP â€” reading stack pointer
                     Gadget->Semantics.RegistersRead |= REG_RSP;
                 }
             }
             i++;  // skip ModR/M
         }
         //
-        // XCHG rAX, rSP (0x94) — stack pivot
+        // XCHG rAX, rSP (0x94) â€” stack pivot
         //
         else if (opcode == 0x94) {
             Gadget->Semantics.ModifiesStack = TRUE;
             Gadget->Semantics.RegistersModified |= (REG_RAX | REG_RSP);
         }
         //
-        // RET/RETF/RETN — terminal, stop analysis
+        // RET/RETF/RETN â€” terminal, stop analysis
         //
         else if (opcode == OPCODE_RET || opcode == OPCODE_RET_IMM16 ||
                  opcode == OPCODE_RETF || opcode == OPCODE_RETF_IMM16) {
@@ -2376,14 +2378,14 @@ RoppInitializeDangerousPatterns(
 {
     ULONG idx = 0;
 
-    // XCHG EAX, ESP / XCHG RAX, RSP — stack pivot (32-bit operand)
+    // XCHG EAX, ESP / XCHG RAX, RSP â€” stack pivot (32-bit operand)
     Detector->DangerousPatterns[idx].Pattern[0] = 0x94;
     Detector->DangerousPatterns[idx].PatternSize = 1;
     Detector->DangerousPatterns[idx].DangerScore = 50;
     Detector->DangerousPatterns[idx].Description = "Stack pivot XCHG (32-bit)";
     idx++;
 
-    // REX.W XCHG RAX, RSP — stack pivot (64-bit operand, full width)
+    // REX.W XCHG RAX, RSP â€” stack pivot (64-bit operand, full width)
     Detector->DangerousPatterns[idx].Pattern[0] = 0x48;
     Detector->DangerousPatterns[idx].Pattern[1] = 0x94;
     Detector->DangerousPatterns[idx].PatternSize = 2;
@@ -2391,7 +2393,7 @@ RoppInitializeDangerousPatterns(
     Detector->DangerousPatterns[idx].Description = "Stack pivot XCHG RAX,RSP (REX.W)";
     idx++;
 
-    // MOV ESP, EAX — stack pivot (32-bit operand)
+    // MOV ESP, EAX â€” stack pivot (32-bit operand)
     Detector->DangerousPatterns[idx].Pattern[0] = 0x89;
     Detector->DangerousPatterns[idx].Pattern[1] = 0xC4;
     Detector->DangerousPatterns[idx].PatternSize = 2;
@@ -2399,7 +2401,7 @@ RoppInitializeDangerousPatterns(
     Detector->DangerousPatterns[idx].Description = "Stack pivot MOV ESP,EAX";
     idx++;
 
-    // REX.W MOV RSP, RAX — stack pivot (64-bit operand)
+    // REX.W MOV RSP, RAX â€” stack pivot (64-bit operand)
     Detector->DangerousPatterns[idx].Pattern[0] = 0x48;
     Detector->DangerousPatterns[idx].Pattern[1] = 0x89;
     Detector->DangerousPatterns[idx].Pattern[2] = 0xC4;
@@ -2465,7 +2467,7 @@ RoppInitializeDangerousPatterns(
     Detector->DangerousPatterns[idx].Description = "ADD RSP, imm8 (REX.W)";
     idx++;
 
-    // ADD ESP, imm8 (no REX — zero-extends RSP on x64)
+    // ADD ESP, imm8 (no REX â€” zero-extends RSP on x64)
     Detector->DangerousPatterns[idx].Pattern[0] = 0x83;
     Detector->DangerousPatterns[idx].Pattern[1] = 0xC4;
     Detector->DangerousPatterns[idx].PatternSize = 2;
@@ -2554,7 +2556,7 @@ Routine Description:
         } else {
             //
             // Cannot safely read another kernel thread's stack limits.
-            // IoGetInitialStack() returns the CURRENT thread's stack — NOT
+            // IoGetInitialStack() returns the CURRENT thread's stack â€” NOT
             // the target thread's. Using it here would give completely
             // wrong stack bounds. Bail out; the caller should only analyze
             // kernel threads from the thread's own context.
@@ -2579,7 +2581,7 @@ Routine Description:
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             //
-            // TEB read failed — will be caught later as NULL stack bounds
+            // TEB read failed â€” will be caught later as NULL stack bounds
             //
         }
 
@@ -2829,7 +2831,7 @@ Routine Description:
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         //
-        // Partial cache is still useful — use what we got
+        // Partial cache is still useful â€” use what we got
         //
         Context->ModuleCacheCount = count;
         status = STATUS_SUCCESS;
@@ -2968,7 +2970,7 @@ Routine Description:
             // Address is in an executable module but not in our gadget DB.
             // This is a real "unknown executable address" (legitimate
             // return address or unindexed gadget).
-            // Always reset consecutive count — a legitimate return address
+            // Always reset consecutive count â€” a legitimate return address
             // in the middle of a gadget sequence breaks the chain.
             //
             Context->UnknownAddresses++;
@@ -3351,7 +3353,7 @@ Routine Description:
                 }
                 __except (EXCEPTION_EXECUTE_HANDLER) {
                     //
-                    // Callback threw exception — continue with remaining
+                    // Callback threw exception â€” continue with remaining
                     //
                 }
                 ExReleaseRundownProtection(&callbackEntry->RundownRef);

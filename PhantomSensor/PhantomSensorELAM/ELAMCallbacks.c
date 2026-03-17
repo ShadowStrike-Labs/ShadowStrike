@@ -1,3 +1,7 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -380,7 +384,7 @@ ElcbShutdown(
     // After this returns, no new ExAcquireRundownProtection can succeed.
     ExWaitForRundownProtectionRelease(&Callbacks->RundownRef);
 
-    // All in-flight calls have drained — safe to tear down
+    // All in-flight calls have drained â€” safe to tear down
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Callbacks->DriverLock);
     while (!IsListEmpty(&Callbacks->DriverList)) {
@@ -570,7 +574,7 @@ ElcbGetBootDrivers(
             POOL_FLAG_NON_PAGED, allocSize, EC_POOL_TAG);
 
         if (copy == NULL) {
-            // Out of memory — free already-allocated copies and bail
+            // Out of memory â€” free already-allocated copies and bail
             ExReleasePushLockShared(&Callbacks->DriverLock);
             KeLeaveCriticalRegion();
             ExReleaseRundownProtection(&Callbacks->RundownRef);
@@ -583,7 +587,7 @@ ElcbGetBootDrivers(
         // Copy flat fields
         RtlCopyMemory(copy, &driver->Public, sizeof(EC_BOOT_DRIVER));
 
-        // Fixup DriverPath → points past the struct
+        // Fixup DriverPath â†’ points past the struct
         PWCHAR dstDriverPath = (PWCHAR)((PUCHAR)copy + sizeof(EC_BOOT_DRIVER));
         if (drvLen > 0 && driver->Public.DriverPath.Buffer != NULL) {
             RtlCopyMemory(dstDriverPath, driver->Public.DriverPath.Buffer, drvLen);
@@ -592,7 +596,7 @@ ElcbGetBootDrivers(
         copy->DriverPath.Length = drvLen;
         copy->DriverPath.MaximumLength = drvLen;
 
-        // Fixup RegistryPath → points past DriverPath data
+        // Fixup RegistryPath â†’ points past DriverPath data
         PWCHAR dstRegistryPath = (PWCHAR)((PUCHAR)dstDriverPath + drvLen);
         if (regLen > 0 && driver->Public.RegistryPath.Buffer != NULL) {
             RtlCopyMemory(dstRegistryPath, driver->Public.RegistryPath.Buffer, regLen);
@@ -601,7 +605,7 @@ ElcbGetBootDrivers(
         copy->RegistryPath.Length = regLen;
         copy->RegistryPath.MaximumLength = regLen;
 
-        // Clear ListEntry — snapshot entry is not in any list
+        // Clear ListEntry â€” snapshot entry is not in any list
         InitializeListHead(&copy->ListEntry);
 
         Drivers[index] = copy;
@@ -680,7 +684,7 @@ ElcbProcessBootDriver(
     EC_DRIVER_CALLBACK savedCallback = NULL;
     PVOID savedContext = NULL;
 
-    // Deep-copy snapshot for user callback — stack buffers for string data
+    // Deep-copy snapshot for user callback â€” stack buffers for string data
     EC_BOOT_DRIVER publicCopy;
     WCHAR copyDriverPathBuf[EC_MAX_PATH_LENGTH];
     WCHAR copyRegistryPathBuf[EC_MAX_PATH_LENGTH];
@@ -805,7 +809,7 @@ ElcbProcessBootDriver(
     KeLeaveCriticalRegion();
 
     //
-    // Invoke user callback outside the lock — publicCopy is fully self-contained
+    // Invoke user callback outside the lock â€” publicCopy is fully self-contained
     //
     if (savedCallback != NULL) {
         BOOLEAN userAllow = allow;
@@ -931,8 +935,8 @@ ElcbIsBootComplete(
     }
 
     internal = CONTAINING_RECORD(Callbacks, EC_ELAM_CALLBACKS_INTERNAL, Public);
-    complete = (BOOLEAN)InterlockedCompareExchange(
-        (volatile LONG*)&internal->BootComplete, 0, 0);
+    complete = (InterlockedCompareExchange(
+        (volatile LONG*)&internal->BootComplete, 0, 0) != 0);
 
     ExReleaseRundownProtection(&Callbacks->RundownRef);
     return complete;

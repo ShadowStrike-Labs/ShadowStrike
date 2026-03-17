@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -49,7 +51,7 @@ extern "C" {
 
 //
 // Pool tags read naturally in WinDbg (stored little-endian, displayed reversed).
-// 'MScP' displays as "PcSM" — "Pattern, context, Scanner, Memory"
+// 'MScP' displays as "PcSM" â€” "Pattern, context, Scanner, Memory"
 //
 #define MS_POOL_TAG_PATTERN     'MScP'  // Memory Scanner - Pattern
 #define MS_POOL_TAG_CONTEXT     'MScC'  // Memory Scanner - Context
@@ -335,7 +337,7 @@ typedef struct _MS_SCANNER {
     EX_PUSH_LOCK AhoCorasickLock;
     
     //
-    // Active scans (EX_PUSH_LOCK — all callers at PASSIVE_LEVEL)
+    // Active scans (EX_PUSH_LOCK â€” all callers at PASSIVE_LEVEL)
     //
     LIST_ENTRY ActiveScans;
     EX_PUSH_LOCK ActiveScansLock;

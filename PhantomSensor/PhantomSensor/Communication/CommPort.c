@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -49,7 +51,7 @@
 #include "../Context/InstanceContext.h"
 
 //
-// PsGetProcessInheritedFromUniqueProcessId — exported by ntoskrnl.exe
+// PsGetProcessInheritedFromUniqueProcessId â€” exported by ntoskrnl.exe
 // since Windows XP. Not declared in public WDK headers but stable and
 // widely used in production security drivers (minifilters, EDR agents).
 // Returns the parent process ID from the EPROCESS structure.
@@ -1349,7 +1351,7 @@ ShadowStrikeHandleHeartbeat(
 //
 // DEPRECATED: Returns raw PFLT_PORT without reference increment.
 // Use ShadowStrikeAcquirePrimaryScannerPort() for safe, ref-counted access.
-// Retained only for backward compatibility — zero external callers.
+// Retained only for backward compatibility â€” zero external callers.
 //
 PFLT_PORT
 ShadowStrikeGetPrimaryScannerPort(
@@ -1447,7 +1449,7 @@ ShadowStrikeAcquirePrimaryScannerPort(
         InterlockedCompareExchange(&g_ClientPortRefs[targetSlot].Disconnecting, 0, 0) != 0) {
         //
         // Either ref count was invalid or client started disconnecting
-        // between our scan and the increment — undo and fail.
+        // between our scan and the increment â€” undo and fail.
         //
         InterlockedDecrement(&g_ClientPortRefs[targetSlot].ReferenceCount);
         ExReleasePushLockShared(&g_DriverData.ClientPortLock);
@@ -1725,7 +1727,7 @@ ShadowStrikeSendNotification(
     status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
     if (!NT_SUCCESS(status)) {
         //
-        // No connected user-mode client — buffer the message in MessageQueue
+        // No connected user-mode client â€” buffer the message in MessageQueue
         // for delivery when a client reconnects.  This prevents telemetry
         // loss during user-mode agent restart / reconnect windows.
         //
@@ -2262,7 +2264,7 @@ ShadowStrikeBuildFileScanRequest(
         if (NT_SUCCESS(status) && processImageName != NULL) {
             //
             // Extract just the file name portion using length arithmetic.
-            // UNICODE_STRING is NOT guaranteed null-terminated — do NOT use wcslen.
+            // UNICODE_STRING is NOT guaranteed null-terminated â€” do NOT use wcslen.
             //
             USHORT totalChars = processImageName->Length / sizeof(WCHAR);
             USHORT lastSepIdx = 0;
@@ -2406,7 +2408,7 @@ ShadowStrikeBuildFileScanRequest(
  *
  * Searches within Source (Length chars) for Needle (null-terminated).
  * Returns TRUE if found, FALSE otherwise. Does NOT require null-termination
- * of Source — operates on character count only.
+ * of Source â€” operates on character count only.
  */
 static BOOLEAN
 ShadowStrikepFindSubstringNoCase(
@@ -2497,7 +2499,7 @@ ShadowStrikepExtractFilename(
  * @brief Compute FNV-1a hash of a wide character buffer.
  *
  * Produces a deterministic 32-bit hash for tracking purposes.
- * Not cryptographic — used for fast image path fingerprinting.
+ * Not cryptographic â€” used for fast image path fingerprinting.
  */
 static ULONG
 ShadowStrikepFnv1aHashW(
@@ -2539,7 +2541,7 @@ ShadowStrikepFnv1aHashW(
  * @param Capabilities     Receives the granted capability bitmask.
  * @param ImageHash        Receives 32-byte hash output (FNV-1a in first 4 bytes, zero-padded).
  *
- * @return STATUS_SUCCESS on completion (even if verification fails — the
+ * @return STATUS_SUCCESS on completion (even if verification fails â€” the
  *         Capabilities output distinguishes verified vs minimal).
  */
 NTSTATUS
@@ -2599,7 +2601,7 @@ ShadowStrikeVerifyClient(
 
     //
     // Step 3: Verify image filename matches expected service executable.
-    // Use length-safe comparison — no wcsstr, no null-termination assumption.
+    // Use length-safe comparison â€” no wcsstr, no null-termination assumption.
     //
     if (imageName->Buffer != NULL && imageName->Length > 0) {
         charCount = imageName->Length / sizeof(WCHAR);
@@ -2794,7 +2796,7 @@ ShadowStrikeRegisterProtectedProcess(
     }
 
     //
-    // Insert — still under the same exclusive lock
+    // Insert â€” still under the same exclusive lock
     //
     InsertTailList(&g_DriverData.ProtectedProcessList, &entry->ListEntry);
     InterlockedIncrement(&g_DriverData.ProtectedProcessCount);

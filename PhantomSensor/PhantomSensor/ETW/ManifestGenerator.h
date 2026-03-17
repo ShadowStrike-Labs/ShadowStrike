@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -588,7 +590,7 @@ typedef struct _MG_GENERATOR {
     /// Lock for cache operations
     EX_PUSH_LOCK CacheLock;
 
-    /// Shutdown completion event — signaled when ReferenceCount reaches 0
+    /// Shutdown completion event â€” signaled when ReferenceCount reaches 0
     KEVENT ShutdownEvent;
 
 } MG_GENERATOR, *PMG_GENERATOR;

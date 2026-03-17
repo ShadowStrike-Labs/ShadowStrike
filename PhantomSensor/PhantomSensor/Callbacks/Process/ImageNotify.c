@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -289,7 +291,7 @@ typedef struct _IMG_NOTIFY_GLOBALS {
 static IMG_NOTIFY_GLOBALS g_ImgNotify = { 0 };
 
 /*
- * Centralized cache for file hash results (FileId → SHA256/SHA1/MD5).
+ * Centralized cache for file hash results (FileId â†’ SHA256/SHA1/MD5).
  * Managed by CacheOptimization framework for centralized memory management.
  */
 static PCO_CACHE g_ImgHashCoCache = NULL;
@@ -685,7 +687,7 @@ Return Value:
             CO_CACHE_CONFIG coConfig;
             CoInitDefaultConfig(&coConfig);
             coConfig.MaxEntries = 8192;
-            coConfig.DefaultTTLSeconds = 3600;  /* 1 hour — matches IMG_CACHE_TTL_SECONDS */
+            coConfig.DefaultTTLSeconds = 3600;  /* 1 hour â€” matches IMG_CACHE_TTL_SECONDS */
             coConfig.BucketCount = 2048;
             CoCreateCache(coMgr, CoCacheTypeFileHash, "ImgHash", &coConfig, &g_ImgHashCoCache);
         }
@@ -913,7 +915,7 @@ Routine Description:
     KeLeaveCriticalRegion();
 
     //
-    // Free module tracking — entries are stored in ProcessModuleHash buckets
+    // Free module tracking â€” entries are stored in ProcessModuleHash buckets
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ImgNotify.ModuleTrackingLock);
@@ -2042,7 +2044,7 @@ Arguments:
     //
     // NOTE: PsSetLoadImageNotifyRoutine[Ex] callbacks are notification-only
     // (VOID return, no ExtendedFlags). The IMAGE_INFO_EX structure provides
-    // only Size, ImageInfo, and FileObject — no blocking mechanism exists.
+    // only Size, ImageInfo, and FileObject â€” no blocking mechanism exists.
     // Actual prevention of malicious image loads is handled by:
     //   1. Minifilter PreCreate callback blocking file opens (AppControl)
     //   2. ELAM for boot-start driver classification
@@ -2169,7 +2171,7 @@ Arguments:
     //
     // === IOC Hash Matching ===
     // Check computed SHA256 against threat intelligence IOC hash database.
-    // IomMatchHash requires PASSIVE_LEVEL — PsLoadImageNotifyRoutine always
+    // IomMatchHash requires PASSIVE_LEVEL â€” PsLoadImageNotifyRoutine always
     // runs at PASSIVE_LEVEL inside a critical region.  Guard defensively.
     // Placed after suspicious-indicator detection so |= does not get overwritten.
     //
@@ -2218,7 +2220,7 @@ Arguments:
     }
 
     //
-    // Application Control — check DLL/image against allowlist/blocklist.
+    // Application Control â€” check DLL/image against allowlist/blocklist.
     // ImageNotify is notification-only (cannot block loads), so we boost
     // the threat score and emit telemetry for enforcement-layer correlation.
     //
@@ -2260,13 +2262,13 @@ Arguments:
     }
 
     //
-    // AMSI Bypass Detection — monitor amsi.dll loads and check integrity
+    // AMSI Bypass Detection â€” monitor amsi.dll loads and check integrity
     // Detects runtime patching of AmsiScanBuffer/AmsiOpenSession (T1562.001)
     //
     AbdNotifyImageLoad(ProcessId, ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName);
 
     //
-    // Deferred AMSI bypass scan — on non-amsi.dll loads, check if process is
+    // Deferred AMSI bypass scan â€” on non-amsi.dll loads, check if process is
     // being tracked (has amsi.dll) and scan for prologue patches. Bypasses are
     // typically applied between amsi.dll load and subsequent DLL/script loads.
     // AbdScanProcess returns STATUS_NOT_FOUND fast for untracked processes.
@@ -2281,7 +2283,7 @@ Arguments:
     // For user-mode process images, run the HollowingDetector at creation time.
     // PhAnalyzeAtCreation compares the loaded image against its on-disk backing
     // file, checks entry point validity, and detects doppelganging/ghosting.
-    // PASSIVE_LEVEL required — PsLoadImageNotifyRoutine runs at PASSIVE_LEVEL.
+    // PASSIVE_LEVEL required â€” PsLoadImageNotifyRoutine runs at PASSIVE_LEVEL.
     //
     if (ProcessId != NULL && event->ProcessId != 0 &&
         KeGetCurrentIrql() == PASSIVE_LEVEL) {
@@ -2390,7 +2392,7 @@ Arguments:
         }
 
         //
-        // Advanced evasion detection: Doppelgänging (T1055.013) and Ghosting
+        // Advanced evasion detection: DoppelgÃ¤nging (T1055.013) and Ghosting
         //
         if (phDetector != NULL) {
                 BOOLEAN isDoppelganging = FALSE;
@@ -2427,7 +2429,7 @@ Arguments:
                 }
 
                 //
-                // Entry point validation — detect tampered entry points
+                // Entry point validation â€” detect tampered entry points
                 //
                 {
                     BOOLEAN entryPointValid = TRUE;
@@ -2443,7 +2445,7 @@ Arguments:
             }
 
         //
-        // Section tracking — record image load as section creation for
+        // Section tracking â€” record image load as section creation for
         // cross-process mapping analysis.
         //
         {
@@ -2472,7 +2474,7 @@ Arguments:
                 //
                 // Analyze the section for suspicious characteristics (transacted file,
                 // deleted backing file, unusual section attributes). This complements
-                // SecTrackSectionCreate which only records — SecAnalyzeSection evaluates.
+                // SecTrackSectionCreate which only records â€” SecAnalyzeSection evaluates.
                 //
                 {
                     SEC_SUSPICION suspicionFlags = 0;

@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -517,7 +519,7 @@ ShadowStrikeAllocatePoolWithTag(
  * @warning ShadowAllocCacheAligned / ShadowAllocPageAligned allocations
  *          MUST be freed with ShadowStrikeFreeAligned.
  * @warning ShadowAllocContiguous allocations MUST be freed with
- *          ShadowStrikeFreeContiguous — never ShadowStrikeFree.
+ *          ShadowStrikeFreeContiguous â€” never ShadowStrikeFree.
  */
 _Must_inspect_result_
 _IRQL_requires_max_(DISPATCH_LEVEL)

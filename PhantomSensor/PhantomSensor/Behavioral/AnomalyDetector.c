@@ -1,9 +1,11 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
  * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published
+ * it under the terms of the GNU Affero General Public License as published //-V1042
  * by the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  *
@@ -692,7 +694,7 @@ AdInitialize(
 
         if (!NT_SUCCESS(status)) {
             //
-            // FP state already restored at line 663 — do NOT double-restore.
+            // FP state already restored at line 663 â€” do NOT double-restore.
             //
 
             KeEnterCriticalRegion();
@@ -801,7 +803,7 @@ AdShutdown(
 
         if (waitStatus == STATUS_TIMEOUT) {
             //
-            // Thread didn't exit in time — wait indefinitely to prevent UAF.
+            // Thread didn't exit in time â€” wait indefinitely to prevent UAF.
             // Driver unload cannot safely proceed with a live thread.
             //
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -838,7 +840,7 @@ AdShutdown(
 
         if (waitStatus == STATUS_TIMEOUT) {
             //
-            // Outstanding references still exist. Wait indefinitely — freeing
+            // Outstanding references still exist. Wait indefinitely â€” freeing
             // the detector with live references would cause UAF/BSOD.
             //
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -1625,7 +1627,7 @@ AdGetStatistics(
 /**
  * @brief Cleanup worker thread.
  *
- * Runs at PASSIVE_LEVEL — can safely acquire push locks for process
+ * Runs at PASSIVE_LEVEL â€” can safely acquire push locks for process
  * baseline eviction. Wakes periodically or on shutdown signal.
  */
 static VOID
@@ -1665,7 +1667,7 @@ AdpCleanupWorkerThread(
         KeQuerySystemTime(&currentTime);
 
         //
-        // Phase 1: Evict stale anomalies (spinlock — safe at any IRQL)
+        // Phase 1: Evict stale anomalies (spinlock â€” safe at any IRQL)
         //
         cutoffTime.QuadPart = currentTime.QuadPart - ((LONGLONG)3600 * 10000000);
 
@@ -2208,7 +2210,7 @@ AdpCalculateModifiedZScore(
     );
 
     //
-    // Release baseline lock (stay at DISPATCH — scratch lock still held)
+    // Release baseline lock (stay at DISPATCH â€” scratch lock still held)
     //
     KeReleaseSpinLockFromDpcLevel(&Baseline->Lock);
 
@@ -2230,7 +2232,7 @@ AdpCalculateModifiedZScore(
 
     if (mad < 0.0001) {
         //
-        // MAD is essentially zero — fall back to standard Z-score
+        // MAD is essentially zero â€” fall back to standard Z-score
         //
         KeAcquireSpinLock(&Baseline->Lock, &oldIrql);
         {

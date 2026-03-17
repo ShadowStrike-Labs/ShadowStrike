@@ -1,3 +1,5 @@
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -1846,7 +1848,7 @@ CompGetBound(
     // LZ4 worst case: input + input/255 + 16 + header
     //
     // Maximum safe input size to prevent overflow:
-    // ULONG_MAX - 16 - sizeof(COMP_HEADER) - (ULONG_MAX/255) ≈ 4GB - overhead
+    // ULONG_MAX - 16 - sizeof(COMP_HEADER) - (ULONG_MAX/255) â‰ˆ 4GB - overhead
     //
     // For safety, cap at COMP_MAX_INPUT_SIZE (64MB)
     //
