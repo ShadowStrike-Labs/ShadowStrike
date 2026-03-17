@@ -37,34 +37,38 @@ jobs:
         run: |
           # windows-2022 runner comes with WDK pre-installed
           $wdkRoot = "C:\Program Files (x86)\Windows Kits\10"
-          
-          # List available SDK/WDK versions
           $includeDir = Join-Path $wdkRoot "Include"
-          $versions = Get-ChildItem $includeDir -Directory | Sort-Object Name -Descending
-          Write-Host "Available WDK versions:"
-          foreach ($v in $versions) {
-              $kmDir = Join-Path $v.FullName "km"
-              $hasNtifs = Test-Path (Join-Path $kmDir "ntifs.h")
+
+          Write-Host "Available WDK include directories:"
+          foreach ($v in Get-ChildItem $includeDir -Directory) {
+              $hasNtifs = Test-Path (Join-Path $v.FullName "km\ntifs.h")
               Write-Host "  $($v.Name) - km headers: $hasNtifs"
           }
-          
-          # Verify critical headers exist
-          $latestVer = $versions[0].Name
-          $ntifs = Join-Path $includeDir "$latestVer\km\ntifs.h"
-          $fltKernel = Join-Path $includeDir "$latestVer\km\fltKernel.h"
-          
-          if (-not (Test-Path $ntifs)) {
-              Write-Error "FATAL: ntifs.h not found at $ntifs"
-              Write-Host "WDK kernel-mode headers are missing. Install WDK."
+
+          # Find the newest directory that actually has kernel-mode headers.
+          # Filter on ntifs.h presence (excludes 'wdf' and SDK-only dirs),
+          # then sort numerically descending by the version string.
+          $kmVersions = Get-ChildItem $includeDir -Directory |
+              Where-Object { Test-Path (Join-Path $_.FullName "km\ntifs.h") } |
+              Sort-Object { [Version]($_.Name -replace '[^0-9.]','') } -Descending
+
+          if ($null -eq $kmVersions -or $kmVersions.Count -eq 0) {
+              Write-Error "FATAL: No WDK directory with km\ntifs.h found under $includeDir"
               exit 1
           }
-          
+
+          $selectedVer = $kmVersions[0].Name
+          Write-Host "Selected WDK version: $selectedVer"
+
+          $ntifs     = Join-Path $includeDir "$selectedVer\km\ntifs.h"
+          $fltKernel = Join-Path $includeDir "$selectedVer\km\fltKernel.h"
+
           if (-not (Test-Path $fltKernel)) {
               Write-Error "FATAL: fltKernel.h not found at $fltKernel"
               exit 1
           }
-          
-          Write-Host "WDK verified: ntifs.h and fltKernel.h present in $latestVer"
+
+          Write-Host "WDK verified: ntifs.h and fltKernel.h present in $selectedVer"
       
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
