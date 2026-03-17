@@ -8,11 +8,11 @@ on:
 
 jobs:
   coverity:
-    runs-on: windows-latest
+    runs-on: windows-2022
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       
@@ -31,10 +31,44 @@ jobs:
           Expand-Archive -Path "cov-analysis-win64.zip" -DestinationPath "." -Force
           
           Write-Host "Done"
+
+      - name: Verify WDK Installation
+        shell: powershell
+        run: |
+          # windows-2022 runner comes with WDK pre-installed
+          $wdkRoot = "C:\Program Files (x86)\Windows Kits\10"
+          
+          # List available SDK/WDK versions
+          $includeDir = Join-Path $wdkRoot "Include"
+          $versions = Get-ChildItem $includeDir -Directory | Sort-Object Name -Descending
+          Write-Host "Available WDK versions:"
+          foreach ($v in $versions) {
+              $kmDir = Join-Path $v.FullName "km"
+              $hasNtifs = Test-Path (Join-Path $kmDir "ntifs.h")
+              Write-Host "  $($v.Name) - km headers: $hasNtifs"
+          }
+          
+          # Verify critical headers exist
+          $latestVer = $versions[0].Name
+          $ntifs = Join-Path $includeDir "$latestVer\km\ntifs.h"
+          $fltKernel = Join-Path $includeDir "$latestVer\km\fltKernel.h"
+          
+          if (-not (Test-Path $ntifs)) {
+              Write-Error "FATAL: ntifs.h not found at $ntifs"
+              Write-Host "WDK kernel-mode headers are missing. Install WDK."
+              exit 1
+          }
+          
+          if (-not (Test-Path $fltKernel)) {
+              Write-Error "FATAL: fltKernel.h not found at $fltKernel"
+              exit 1
+          }
+          
+          Write-Host "WDK verified: ntifs.h and fltKernel.h present in $latestVer"
       
       - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v1.1
-      
+        uses: microsoft/setup-msbuild@v2
+
       - name: Build PhantomSensor with Coverity
         shell: powershell
         run: |
@@ -45,16 +79,23 @@ jobs:
           # Set PATH
           $env:PATH = "$($covDir.FullName)\bin;$env:PATH"
           
-          # Create cov-int
+          # Create cov-int directory
           New-Item -ItemType Directory -Path "cov-int" -Force | Out-Null
           
-          # Build
+          # Build with Coverity instrumentation
+          # InfVerif_NoError: skip INF verification on CI (no stampinf)
           Write-Host "Building with Coverity..."
-          cov-build --dir cov-int msbuild PhantomSensor\PhantomSensor.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64
+          cov-build --dir cov-int msbuild PhantomSensor\PhantomSensor.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64 /p:InfVerif_NoError=true
+          
+          # Verify build succeeded
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Build failed with exit code $LASTEXITCODE"
+              exit $LASTEXITCODE
+          }
           
           # Analyze
-          Write-Host "Analyzing..."
-          cov-analyze --dir cov-int --strip-path $PWD
+          Write-Host "Running Coverity analysis..."
+          cov-analyze --dir cov-int --strip-path $PWD --all --enable-constraint-fpp --enable-fnptr --enable-virtual
       
       - name: Submit to Coverity
         shell: powershell
@@ -62,7 +103,10 @@ jobs:
           Write-Host "Creating archive..."
           tar -czf cov-int.tar.gz cov-int
           
-          Write-Host "Submitting..."
+          $fileSize = (Get-Item "cov-int.tar.gz").Length / 1MB
+          Write-Host "Archive size: $([math]::Round($fileSize, 2)) MB"
+          
+          Write-Host "Submitting to Coverity Scan..."
           $token = "${{ secrets.COVERITY_SCAN_TOKEN }}"
           $email = "${{ secrets.COVERITY_SCAN_EMAIL }}"
           
@@ -70,5 +114,12 @@ jobs:
                    --form "email=${email}" `
                    --form "file=@cov-int.tar.gz" `
                    --form "version=${{ github.sha }}" `
-                   --form "description=PhantomSensor" `
+                   --form "description=PhantomSensor Kernel Driver - ${{ github.ref_name }}" `
                    https://scan.coverity.com/builds
+          
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Coverity submission failed"
+              exit $LASTEXITCODE
+          }
+          
+          Write-Host "Coverity submission complete"
