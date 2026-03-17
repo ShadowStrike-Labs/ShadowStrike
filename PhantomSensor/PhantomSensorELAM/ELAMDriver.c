@@ -138,9 +138,16 @@ ElamDriverInitialize(
         return STATUS_ALREADY_INITIALIZED;
     }
 
-    // Zero all fields then re-set our "initializing" sentinel
-    RtlZeroMemory(&g_ElamGlobals, sizeof(ELAM_DRIVER_GLOBALS));
-    InterlockedExchange(&g_ElamGlobals.Initialized, 1);
+    //
+    // Zero all fields EXCEPT Initialized (which holds our CAS sentinel).
+    // RtlZeroMemory of the entire struct would create a window where
+    // Initialized=0 between the CAS and the re-set, allowing a concurrent
+    // caller to also pass the CAS check.
+    //
+    RtlZeroMemory(
+        (PUCHAR)&g_ElamGlobals + sizeof(LONG),
+        sizeof(ELAM_DRIVER_GLOBALS) - sizeof(LONG)
+        );
 
     // Initialize hash utilities (required for all hash operations)
     status = ShadowStrikeInitializeHashUtils();
@@ -515,10 +522,9 @@ ElamImageLoadCallback(
             FullImageName, (int)classification, (int)bootInfo.IsSigned, elapsedMs);
     }
 
-    // Release resources allocated by BDV/BTD
-    if (threat != NULL) {
-        BtdFreeThreat(g_ThreatDetector, threat);
-    }
+    // Release resources allocated by BDV (NOT BTD: threats stay in
+    // DetectedList so BtdGetThreats can enumerate them. BtdShutdown
+    // handles final cleanup of accumulated threats.)
     if (driverInfo != NULL) {
         BdvFreeDriverInfo(g_BootVerifier, driverInfo);
     }
@@ -628,9 +634,12 @@ ElamIsHashKnownGood(
 
     // Skip certificate entries
     for (i = 0; i < header->SignatureCount; i++) {
-        PELAM_CERTIFICATE_ENTRY certEntry = (PELAM_CERTIFICATE_ENTRY)entryPtr;
+        PELAM_CERTIFICATE_ENTRY certEntry;
+        if (offset + sizeof(ELAM_CERTIFICATE_ENTRY) > header->TotalSize) {
+            break;
+        }
+        certEntry = (PELAM_CERTIFICATE_ENTRY)entryPtr;
         if (certEntry->EntrySize == 0 ||
-            offset > header->TotalSize ||
             certEntry->EntrySize > header->TotalSize - offset) {
             break;
         }
@@ -640,10 +649,12 @@ ElamIsHashKnownGood(
 
     // Search hash entries
     for (i = 0; i < header->HashCount; i++) {
+        if (offset + sizeof(ELAM_HASH_ENTRY) > header->TotalSize) {
+            break;
+        }
         hashEntry = (PELAM_HASH_ENTRY)entryPtr;
 
         if (hashEntry->EntrySize == 0 ||
-            offset > header->TotalSize ||
             hashEntry->EntrySize > header->TotalSize - offset) {
             break;
         }
@@ -695,9 +706,12 @@ ElamIsHashKnownBad(
     entryPtr = (PUCHAR)header + offset;
 
     for (i = 0; i < header->SignatureCount; i++) {
-        PELAM_CERTIFICATE_ENTRY certEntry = (PELAM_CERTIFICATE_ENTRY)entryPtr;
+        PELAM_CERTIFICATE_ENTRY certEntry;
+        if (offset + sizeof(ELAM_CERTIFICATE_ENTRY) > header->TotalSize) {
+            break;
+        }
+        certEntry = (PELAM_CERTIFICATE_ENTRY)entryPtr;
         if (certEntry->EntrySize == 0 ||
-            offset > header->TotalSize ||
             certEntry->EntrySize > header->TotalSize - offset) {
             break;
         }
@@ -707,10 +721,12 @@ ElamIsHashKnownBad(
 
     // Search for bad hash
     for (i = 0; i < header->HashCount; i++) {
+        if (offset + sizeof(ELAM_HASH_ENTRY) > header->TotalSize) {
+            break;
+        }
         hashEntry = (PELAM_HASH_ENTRY)entryPtr;
 
         if (hashEntry->EntrySize == 0 ||
-            offset > header->TotalSize ||
             hashEntry->EntrySize > header->TotalSize - offset) {
             break;
         }
@@ -762,10 +778,12 @@ ElamIsCertificateKnownGood(
     entryPtr = (PUCHAR)header + offset;
 
     for (i = 0; i < header->SignatureCount; i++) {
+        if (offset + sizeof(ELAM_CERTIFICATE_ENTRY) > header->TotalSize) {
+            break;
+        }
         certEntry = (PELAM_CERTIFICATE_ENTRY)entryPtr;
 
         if (certEntry->EntrySize == 0 ||
-            offset > header->TotalSize ||
             certEntry->EntrySize > header->TotalSize - offset) {
             break;
         }
@@ -837,10 +855,12 @@ ElamIsCertificateKnownBad(
     entryPtr = (PUCHAR)header + offset;
 
     for (i = 0; i < header->SignatureCount; i++) {
+        if (offset + sizeof(ELAM_CERTIFICATE_ENTRY) > header->TotalSize) {
+            break;
+        }
         certEntry = (PELAM_CERTIFICATE_ENTRY)entryPtr;
 
         if (certEntry->EntrySize == 0 ||
-            offset > header->TotalSize ||
             certEntry->EntrySize > header->TotalSize - offset) {
             break;
         }
@@ -996,9 +1016,15 @@ ElamRegistryCallbackRoutine(
 
                 if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
                     if (ElamIsProtectedRegistryPath(objectName)) {
-                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                            "[ShadowStrike/ELAM] New key creation under protected path: %wZ\\%wZ\n",
-                            objectName, createKeyInfo->CompleteName);
+                        if (createKeyInfo->CompleteName != NULL) {
+                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                                "[ShadowStrike/ELAM] New key creation under protected path: %wZ\\%wZ\n",
+                                objectName, createKeyInfo->CompleteName);
+                        } else {
+                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                                "[ShadowStrike/ELAM] New key creation under protected path: %wZ\n",
+                                objectName);
+                        }
                     }
                     CmCallbackReleaseKeyObjectIDEx(objectName);
                 }

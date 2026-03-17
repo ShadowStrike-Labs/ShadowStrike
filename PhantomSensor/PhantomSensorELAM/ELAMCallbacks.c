@@ -519,16 +519,13 @@ ElcbSetPolicy(
 }
 
 /**
- * @brief Get list of processed boot drivers
+ * @brief Get list of processed boot drivers (deep-copy, caller-owned)
  *
- * Returns pointers to internal EC_BOOT_DRIVER structures. These pointers
- * are valid only while the caller holds rundown protection (which this
- * function acquires and releases). Callers must copy data they need
- * before calling any function that could trigger shutdown.
+ * Allocates independent copies of each EC_BOOT_DRIVER so the caller
+ * can safely use them after this function returns. Each returned
+ * pointer must be freed via ElcbFreeBootDriverSnapshot when done.
  *
- * NOTE: Rundown protection ensures the structure cannot be freed while
- * this function is executing, making the returned pointers safe for the
- * duration of the call. Caller must not cache them across calls.
+ * Layout per entry: [EC_BOOT_DRIVER][DriverPathChars][RegistryPathChars]
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -543,7 +540,7 @@ ElcbGetBootDrivers(
     PEC_BOOT_DRIVER_INTERNAL driver;
     ULONG index = 0;
 
-    if (Callbacks == NULL || Drivers == NULL || Count == NULL) {
+    if (Callbacks == NULL || Drivers == NULL || Count == NULL || Max == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -561,7 +558,53 @@ ElcbGetBootDrivers(
          entry = entry->Flink) {
 
         driver = CONTAINING_RECORD(entry, EC_BOOT_DRIVER_INTERNAL, Public.ListEntry);
-        Drivers[index] = &driver->Public;
+
+        //
+        // Compute allocation size: struct + both path buffers (WCHAR-sized)
+        //
+        USHORT drvLen = driver->Public.DriverPath.Length;
+        USHORT regLen = driver->Public.RegistryPath.Length;
+        SIZE_T allocSize = sizeof(EC_BOOT_DRIVER) + drvLen + regLen;
+
+        PEC_BOOT_DRIVER copy = (PEC_BOOT_DRIVER)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, allocSize, EC_POOL_TAG);
+
+        if (copy == NULL) {
+            // Out of memory — free already-allocated copies and bail
+            ExReleasePushLockShared(&Callbacks->DriverLock);
+            KeLeaveCriticalRegion();
+            ExReleaseRundownProtection(&Callbacks->RundownRef);
+
+            ElcbFreeBootDriverSnapshot(Drivers, index);
+            *Count = 0;
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        // Copy flat fields
+        RtlCopyMemory(copy, &driver->Public, sizeof(EC_BOOT_DRIVER));
+
+        // Fixup DriverPath → points past the struct
+        PWCHAR dstDriverPath = (PWCHAR)((PUCHAR)copy + sizeof(EC_BOOT_DRIVER));
+        if (drvLen > 0 && driver->Public.DriverPath.Buffer != NULL) {
+            RtlCopyMemory(dstDriverPath, driver->Public.DriverPath.Buffer, drvLen);
+        }
+        copy->DriverPath.Buffer = dstDriverPath;
+        copy->DriverPath.Length = drvLen;
+        copy->DriverPath.MaximumLength = drvLen;
+
+        // Fixup RegistryPath → points past DriverPath data
+        PWCHAR dstRegistryPath = (PWCHAR)((PUCHAR)dstDriverPath + drvLen);
+        if (regLen > 0 && driver->Public.RegistryPath.Buffer != NULL) {
+            RtlCopyMemory(dstRegistryPath, driver->Public.RegistryPath.Buffer, regLen);
+        }
+        copy->RegistryPath.Buffer = dstRegistryPath;
+        copy->RegistryPath.Length = regLen;
+        copy->RegistryPath.MaximumLength = regLen;
+
+        // Clear ListEntry — snapshot entry is not in any list
+        InitializeListHead(&copy->ListEntry);
+
+        Drivers[index] = copy;
         index++;
     }
 
@@ -572,6 +615,33 @@ ElcbGetBootDrivers(
 
     ExReleaseRundownProtection(&Callbacks->RundownRef);
     return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Free an array of deep-copied boot driver snapshots
+ *
+ * Frees each entry allocated by ElcbGetBootDrivers. Safe to call
+ * with Count=0 (no-op).
+ */
+_Use_decl_annotations_
+VOID
+ElcbFreeBootDriverSnapshot(
+    PEC_BOOT_DRIVER* Drivers,
+    ULONG Count
+    )
+{
+    ULONG i;
+
+    if (Drivers == NULL) {
+        return;
+    }
+
+    for (i = 0; i < Count; i++) {
+        if (Drivers[i] != NULL) {
+            ExFreePoolWithTag(Drivers[i], EC_POOL_TAG);
+            Drivers[i] = NULL;
+        }
+    }
 }
 
 // ============================================================================

@@ -102,6 +102,7 @@ NTSTATUS ElcbUnregisterCallbacks(_In_ PEC_ELAM_CALLBACKS Callbacks);
 NTSTATUS ElcbSetUserCallback(_In_ PEC_ELAM_CALLBACKS Callbacks, _In_ EC_DRIVER_CALLBACK Callback, _In_opt_ PVOID Context);
 NTSTATUS ElcbSetPolicy(_In_ PEC_ELAM_CALLBACKS Callbacks, _In_ BOOLEAN BlockUnknown, _In_ BOOLEAN AllowUnsigned);
 NTSTATUS ElcbGetBootDrivers(_In_ PEC_ELAM_CALLBACKS Callbacks, _Out_writes_to_(Max, *Count) PEC_BOOT_DRIVER* Drivers, _In_ ULONG Max, _Out_ PULONG Count);
+VOID ElcbFreeBootDriverSnapshot(_In_reads_(Count) PEC_BOOT_DRIVER* Drivers, _In_ ULONG Count);
 
 // ============================================================================
 // INTERNAL API - Called by ELAMDriver.c
