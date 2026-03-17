@@ -42,6 +42,9 @@ jobs:
           for /f "tokens=*" %%i in ('dir /b cov-analysis-win64*') do set COV_DIR=%%i
           set PATH=%CD%\%COV_DIR%\bin;%PATH%
           
+          REM Create output directory
+          if not exist cov-int mkdir cov-int
+          
           REM Build PhantomSensor with Coverity
           cov-build --dir cov-int msbuild PhantomSensor\PhantomSensor.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64 || exit /b 0
           
