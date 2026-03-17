@@ -24,58 +24,51 @@ jobs:
           $project = "ShadowStrike-Labs/ShadowStrike"
           $url = "https://scan.coverity.com/download/cxx/win64?token=${token}&project=${project}"
           
-          Write-Host "Downloading Coverity from: $url"
+          Write-Host "Downloading Coverity..."
           Invoke-WebRequest -Uri $url -OutFile "cov-analysis-win64.zip" -ErrorAction Stop
           
-          Write-Host "Extracting Coverity..."
+          Write-Host "Extracting..."
           Expand-Archive -Path "cov-analysis-win64.zip" -DestinationPath "." -Force
           
-          Write-Host "Coverity downloaded successfully"
+          Write-Host "Done"
       
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v1.1
       
       - name: Build PhantomSensor with Coverity
-        shell: cmd
-        run: |
-          REM Add Coverity to PATH
-          for /f "tokens=*" %%i in ('dir /b cov-analysis-win64*') do set COV_DIR=%%i
-          set PATH=%CD%\%COV_DIR%\bin;%PATH%
-          
-          REM Create output directory
-          if not exist cov-int mkdir cov-int
-          
-          REM Build PhantomSensor with Coverity
-          cov-build --dir cov-int msbuild PhantomSensor\PhantomSensor.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64 || exit /b 0
-          
-          REM Analyze with Coverity
-          cov-analyze --dir cov-int --strip-path %CD% --enable-virtual-functions || exit /b 0
-      
-      - name: Submit results to Coverity Scan
         shell: powershell
         run: |
-          Write-Host "Creating tar archive..."
+          # Find Coverity directory
+          $covDir = Get-ChildItem -Filter "cov-analysis-win64*" -Directory | Select-Object -First 1
+          Write-Host "Found Coverity at: $($covDir.FullName)"
+          
+          # Set PATH
+          $env:PATH = "$($covDir.FullName)\bin;$env:PATH"
+          
+          # Create cov-int
+          New-Item -ItemType Directory -Path "cov-int" -Force | Out-Null
+          
+          # Build
+          Write-Host "Building with Coverity..."
+          cov-build --dir cov-int msbuild PhantomSensor\PhantomSensor.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64
+          
+          # Analyze
+          Write-Host "Analyzing..."
+          cov-analyze --dir cov-int --strip-path $PWD
+      
+      - name: Submit to Coverity
+        shell: powershell
+        run: |
+          Write-Host "Creating archive..."
           tar -czf cov-int.tar.gz cov-int
           
-          Write-Host "Submitting to Coverity Scan..."
+          Write-Host "Submitting..."
           $token = "${{ secrets.COVERITY_SCAN_TOKEN }}"
           $email = "${{ secrets.COVERITY_SCAN_EMAIL }}"
-          $sha = "${{ github.sha }}"
-          $repo = "${{ github.repository }}"
-          $ref = "${{ github.ref_name }}"
           
           curl.exe --form "token=${token}" `
                    --form "email=${email}" `
                    --form "file=@cov-int.tar.gz" `
-                   --form "version=${sha}" `
-                   --form "description=PhantomSensor Kernel Driver - ${repo}/${ref}" `
+                   --form "version=${{ github.sha }}" `
+                   --form "description=PhantomSensor" `
                    https://scan.coverity.com/builds
-          
-          Write-Host "Submission complete"
-      
-      - name: Save Coverity report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverity-phantom-sensor
-          path: cov-int/
