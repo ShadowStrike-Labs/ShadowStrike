@@ -632,7 +632,7 @@ PtmShutdown(
     //
     // Collect all states under lock, then free outside lock
     //
-    ExAcquirePushLockExclusive(&Matcher->StateLock);
+    FltAcquirePushLockExclusive(&Matcher->StateLock);
 
     while (!IsListEmpty(&Matcher->StateList)) {
         entry = RemoveHeadList(&Matcher->StateList);
@@ -642,16 +642,16 @@ PtmShutdown(
     }
     Matcher->StateCount = 0;
 
-    ExReleasePushLockExclusive(&Matcher->StateLock);
+    FltReleasePushLock(&Matcher->StateLock);
 
     //
     // Clear process hash table
     //
-    ExAcquirePushLockExclusive(&matcher->ProcessStateHash.Lock);
+    FltAcquirePushLockExclusive(&matcher->ProcessStateHash.Lock);
     for (i = 0; i < 256; i++) {
         InitializeListHead(&matcher->ProcessStateHash.Buckets[i]);
     }
-    ExReleasePushLockExclusive(&matcher->ProcessStateHash.Lock);
+    FltReleasePushLock(&matcher->ProcessStateHash.Lock);
 
     //
     // Free collected states
@@ -677,7 +677,7 @@ PtmShutdown(
     //
     // Collect all index entries under lock
     //
-    ExAcquirePushLockExclusive(&matcher->IndexLock);
+    FltAcquirePushLockExclusive(&matcher->IndexLock);
 
     for (i = 0; i < PmEvent_MaxType; i++) {
         while (!IsListEmpty(&matcher->PatternIndex[i].Patterns)) {
@@ -687,7 +687,7 @@ PtmShutdown(
         matcher->PatternIndex[i].Count = 0;
     }
 
-    ExReleasePushLockExclusive(&matcher->IndexLock);
+    FltReleasePushLock(&matcher->IndexLock);
 
     //
     // Free collected index entries
@@ -706,7 +706,7 @@ PtmShutdown(
     //
     // Collect all patterns under lock
     //
-    ExAcquirePushLockExclusive(&Matcher->PatternLock);
+    FltAcquirePushLockExclusive(&Matcher->PatternLock);
 
     while (!IsListEmpty(&Matcher->PatternList)) {
         entry = RemoveHeadList(&Matcher->PatternList);
@@ -714,7 +714,7 @@ PtmShutdown(
     }
     Matcher->PatternCount = 0;
 
-    ExReleasePushLockExclusive(&Matcher->PatternLock);
+    FltReleasePushLock(&Matcher->PatternLock);
 
     //
     // Free collected patterns
@@ -867,9 +867,9 @@ PmLoadPattern(
     //
     // Insert into pattern list
     //
-    ExAcquirePushLockExclusive(&Matcher->PatternLock);
+    FltAcquirePushLockExclusive(&Matcher->PatternLock);
     InsertTailList(&Matcher->PatternList, &newPattern->ListEntry);
-    ExReleasePushLockExclusive(&Matcher->PatternLock);
+    FltReleasePushLock(&Matcher->PatternLock);
 
     //
     // Index pattern by event types it matches
@@ -913,7 +913,7 @@ PmUnloadPattern(
     //
     // Find and remove pattern
     //
-    ExAcquirePushLockExclusive(&Matcher->PatternLock);
+    FltAcquirePushLockExclusive(&Matcher->PatternLock);
 
     for (entry = Matcher->PatternList.Flink;
          entry != &Matcher->PatternList;
@@ -929,7 +929,7 @@ PmUnloadPattern(
         }
     }
 
-    ExReleasePushLockExclusive(&Matcher->PatternLock);
+    FltReleasePushLock(&Matcher->PatternLock);
 
     if (!found) {
         return STATUS_NOT_FOUND;
@@ -952,7 +952,7 @@ PmUnloadPattern(
         PLIST_ENTRY stateEntry;
         PPM_MATCH_STATE_INTERNAL stateRef;
 
-        ExAcquirePushLockExclusive(&Matcher->StateLock);
+        FltAcquirePushLockExclusive(&Matcher->StateLock);
 
         for (stateEntry = Matcher->StateList.Flink;
              stateEntry != &Matcher->StateList;
@@ -965,7 +965,7 @@ PmUnloadPattern(
             }
         }
 
-        ExReleasePushLockExclusive(&Matcher->StateLock);
+        FltReleasePushLock(&Matcher->StateLock);
     }
 
     //
@@ -1007,7 +1007,7 @@ PmRegisterCallback(
     //
     // Atomically update both callback and context under lock
     //
-    ExAcquirePushLockExclusive(&Matcher->CallbackLock);
+    FltAcquirePushLockExclusive(&Matcher->CallbackLock);
 
     //
     // Use volatile write to ensure visibility
@@ -1015,7 +1015,7 @@ PmRegisterCallback(
     ((volatile PM_CALLBACK_REGISTRATION*)&Matcher->CallbackReg)->Callback = Callback;
     ((volatile PM_CALLBACK_REGISTRATION*)&Matcher->CallbackReg)->Context = Context;
 
-    ExReleasePushLockExclusive(&Matcher->CallbackLock);
+    FltReleasePushLock(&Matcher->CallbackLock);
 
     return STATUS_SUCCESS;
 }
@@ -1092,7 +1092,7 @@ PmSubmitEvent(
     //
     bucket = PmpHashProcessId(ProcessId);
 
-    ExAcquirePushLockShared(&matcher->ProcessStateHash.Lock);
+    FltAcquirePushLockShared(&matcher->ProcessStateHash.Lock);
 
     for (stateEntry = matcher->ProcessStateHash.Buckets[bucket].Flink;
          stateEntry != &matcher->ProcessStateHash.Buckets[bucket];
@@ -1104,7 +1104,7 @@ PmSubmitEvent(
         }
     }
 
-    ExReleasePushLockShared(&matcher->ProcessStateHash.Lock);
+    FltReleasePushLock(&matcher->ProcessStateHash.Lock);
 
     //
     // Phase 1: Collect active states for this process under shared lock,
@@ -1116,7 +1116,7 @@ PmSubmitEvent(
         ULONG collectedCount = 0;
         ULONG ci;
 
-        ExAcquirePushLockShared(&Matcher->StateLock);
+        FltAcquirePushLockShared(&Matcher->StateLock);
 
         for (stateEntry = Matcher->StateList.Flink;
              stateEntry != &Matcher->StateList;
@@ -1140,7 +1140,7 @@ PmSubmitEvent(
             }
         }
 
-        ExReleasePushLockShared(&Matcher->StateLock);
+        FltReleasePushLock(&Matcher->StateLock);
 
         //
         // Process all collected states outside lock — each state is ref-held
@@ -1183,7 +1183,7 @@ PmSubmitEvent(
     //
     // Phase 2: Check if this event starts any new patterns
     //
-    ExAcquirePushLockShared(&matcher->IndexLock);
+    FltAcquirePushLockShared(&matcher->IndexLock);
 
     for (indexEntry = matcher->PatternIndex[Type].Patterns.Flink;
          indexEntry != &matcher->PatternIndex[Type].Patterns;
@@ -1212,7 +1212,7 @@ PmSubmitEvent(
         //
         stateExists = FALSE;
 
-        ExAcquirePushLockShared(&Matcher->StateLock);
+        FltAcquirePushLockShared(&Matcher->StateLock);
 
         for (stateEntry = Matcher->StateList.Flink;
              stateEntry != &Matcher->StateList;
@@ -1231,7 +1231,7 @@ PmSubmitEvent(
             }
         }
 
-        ExReleasePushLockShared(&Matcher->StateLock);
+        FltReleasePushLock(&Matcher->StateLock);
 
         if (stateExists) {
             continue;
@@ -1280,9 +1280,9 @@ PmSubmitEvent(
         //
         // Insert into state list (under exclusive lock)
         //
-        ExAcquirePushLockExclusive(&Matcher->StateLock);
+        FltAcquirePushLockExclusive(&Matcher->StateLock);
         InsertTailList(&Matcher->StateList, &newState->Public.ListEntry);
-        ExReleasePushLockExclusive(&Matcher->StateLock);
+        FltReleasePushLock(&Matcher->StateLock);
 
         //
         // Insert into process hash
@@ -1301,7 +1301,7 @@ NextPattern:
         ;  // Continue to next pattern
     }
 
-    ExReleasePushLockShared(&matcher->IndexLock);
+    FltReleasePushLock(&matcher->IndexLock);
 
     return STATUS_SUCCESS;
 }
@@ -1358,7 +1358,7 @@ PmGetActiveStates(
     matcher = CONTAINING_RECORD(Matcher, PM_MATCHER_INTERNAL, Public);
     bucket = PmpHashProcessId(ProcessId);
 
-    ExAcquirePushLockShared(&matcher->ProcessStateHash.Lock);
+    FltAcquirePushLockShared(&matcher->ProcessStateHash.Lock);
 
     for (entry = matcher->ProcessStateHash.Buckets[bucket].Flink;
          entry != &matcher->ProcessStateHash.Buckets[bucket];
@@ -1376,7 +1376,7 @@ PmGetActiveStates(
         }
     }
 
-    ExReleasePushLockShared(&matcher->ProcessStateHash.Lock);
+    FltReleasePushLock(&matcher->ProcessStateHash.Lock);
 
     *StateCount = count;
 
@@ -1451,7 +1451,7 @@ PmCleanupProcessStates(
     //
     // Mark states as stale under lock
     //
-    ExAcquirePushLockExclusive(&matcher->ProcessStateHash.Lock);
+    FltAcquirePushLockExclusive(&matcher->ProcessStateHash.Lock);
 
     for (entry = matcher->ProcessStateHash.Buckets[bucket].Flink;
          entry != &matcher->ProcessStateHash.Buckets[bucket];
@@ -1465,7 +1465,7 @@ PmCleanupProcessStates(
         }
     }
 
-    ExReleasePushLockExclusive(&matcher->ProcessStateHash.Lock);
+    FltReleasePushLock(&matcher->ProcessStateHash.Lock);
 
     //
     // Trigger cleanup
@@ -2030,9 +2030,9 @@ PmpNotifyCallback(
     //
     // Read callback registration atomically
     //
-    ExAcquirePushLockShared(&Matcher->Public.CallbackLock);
+    FltAcquirePushLockShared(&Matcher->Public.CallbackLock);
     reg = Matcher->Public.CallbackReg;
-    ExReleasePushLockShared(&Matcher->Public.CallbackLock);
+    FltReleasePushLock(&Matcher->Public.CallbackLock);
 
     if (reg.Callback != NULL) {
         reg.Callback(Pattern, State, reg.Context);
@@ -2055,7 +2055,7 @@ PmpIndexPattern(
 
     PAGED_CODE();
 
-    ExAcquirePushLockExclusive(&Matcher->IndexLock);
+    FltAcquirePushLockExclusive(&Matcher->IndexLock);
 
     for (i = 0; i < Pattern->EventCount && i < PM_MAX_EVENTS_PER_PATTERN; i++) {
         eventType = Pattern->Events[i].Type;
@@ -2088,7 +2088,7 @@ PmpIndexPattern(
         }
     }
 
-    ExReleasePushLockExclusive(&Matcher->IndexLock);
+    FltReleasePushLock(&Matcher->IndexLock);
 }
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
@@ -2111,7 +2111,7 @@ PmpUnindexPattern(
 
     InitializeListHead(&freeList);
 
-    ExAcquirePushLockExclusive(&Matcher->IndexLock);
+    FltAcquirePushLockExclusive(&Matcher->IndexLock);
 
     for (i = 0; i < PmEvent_MaxType; i++) {
         for (entry = Matcher->PatternIndex[i].Patterns.Flink;
@@ -2129,7 +2129,7 @@ PmpUnindexPattern(
         }
     }
 
-    ExReleasePushLockExclusive(&Matcher->IndexLock);
+    FltReleasePushLock(&Matcher->IndexLock);
 
     //
     // Free collected entries outside lock
@@ -2162,10 +2162,10 @@ PmpInsertStateIntoProcessHash(
 
     bucket = PmpHashProcessId(State->Public.ProcessId);
 
-    ExAcquirePushLockExclusive(&Matcher->ProcessStateHash.Lock);
+    FltAcquirePushLockExclusive(&Matcher->ProcessStateHash.Lock);
     InsertTailList(&Matcher->ProcessStateHash.Buckets[bucket], &State->ProcessHashEntry);
     State->ProcessHashBucket = bucket;
-    ExReleasePushLockExclusive(&Matcher->ProcessStateHash.Lock);
+    FltReleasePushLock(&Matcher->ProcessStateHash.Lock);
 }
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
@@ -2180,7 +2180,7 @@ PmpRemoveStateFromProcessHash(
 {
     PAGED_CODE();
 
-    ExAcquirePushLockExclusive(&Matcher->ProcessStateHash.Lock);
+    FltAcquirePushLockExclusive(&Matcher->ProcessStateHash.Lock);
 
     //
     // Check if actually in list before removing
@@ -2190,7 +2190,7 @@ PmpRemoveStateFromProcessHash(
         InitializeListHead(&State->ProcessHashEntry);
     }
 
-    ExReleasePushLockExclusive(&Matcher->ProcessStateHash.Lock);
+    FltReleasePushLock(&Matcher->ProcessStateHash.Lock);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -2322,7 +2322,7 @@ PmpCleanupStaleStates(
     //
     // Phase 1: Mark stale states and collect removable states
     //
-    ExAcquirePushLockExclusive(&Matcher->Public.StateLock);
+    FltAcquirePushLockExclusive(&Matcher->Public.StateLock);
 
     for (entry = Matcher->Public.StateList.Flink;
          entry != &Matcher->Public.StateList;
@@ -2344,9 +2344,11 @@ PmpCleanupStaleStates(
 
         //
         // Remove completed or stale states with no external references
-        // RefCount of 1 means only we hold a reference
+        // RefCount of 1 means only we hold a reference.
+        // Use ReadNoFence for consistent read of volatile refcount.
         //
-        if ((state->Public.IsComplete || state->IsStale) && state->RefCount <= 1) {
+        if ((state->Public.IsComplete || state->IsStale) &&
+            ReadNoFence(&state->RefCount) <= 1) {
             RemoveEntryList(&state->Public.ListEntry);
             InterlockedDecrement(&Matcher->Public.StateCount);
             state->IsRemoved = TRUE;
@@ -2354,7 +2356,7 @@ PmpCleanupStaleStates(
         }
     }
 
-    ExReleasePushLockExclusive(&Matcher->Public.StateLock);
+    FltReleasePushLock(&Matcher->Public.StateLock);
 
     //
     // Phase 2: Remove from process hash and free

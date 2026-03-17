@@ -450,14 +450,10 @@ ShadowStrikeIsScannable(
     for (i = 0; g_ScannableExtensions[i].Extension != NULL; i++) {
 
         //
-        // Compute table entry length manually (avoid RtlInitUnicodeString
-        // which is PASSIVE_LEVEL in some WDK annotations).
+        // Use pre-computed length from table entry (no runtime strlen needed).
         //
         tblBuf = g_ScannableExtensions[i].Extension;
-        tblLenBytes = 0;
-        while (tblBuf[tblLenBytes / sizeof(WCHAR)] != L'\0') {
-            tblLenBytes += sizeof(WCHAR);
-        }
+        tblLenBytes = g_ScannableExtensions[i].Length;
 
         if (extLenBytes != tblLenBytes) {
             continue;
@@ -507,20 +503,18 @@ ShadowStrikePostSetInformation(
     _In_ FLT_POST_OPERATION_FLAGS Flags
     )
 {
-    PFLT_FILE_NAME_INFORMATION nameInfo = (PFLT_FILE_NAME_INFORMATION)CompletionContext;
+    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     FILE_INFORMATION_CLASS fileInfoClass;
     BOOLEAN isDelete;
     BOOLEAN isRename;
 
-    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(CompletionContext);
 
     //
-    // Handle draining
+    // During draining (filter unload), skip all work.
+    // We cannot safely call FltGetFileNameInformation at DISPATCH_LEVEL.
     //
     if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING)) {
-        if (nameInfo != NULL) {
-            FltReleaseFileNameInformation(nameInfo);
-        }
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
@@ -528,29 +522,38 @@ ShadowStrikePostSetInformation(
     // If the operation failed, no notification needed
     //
     if (!NT_SUCCESS(Data->IoStatus.Status)) {
-        if (nameInfo != NULL) {
-            FltReleaseFileNameInformation(nameInfo);
-        }
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
     //
-    // Send notification to user-mode about successful rename/delete
+    // Determine operation type
     //
-    if (nameInfo != NULL && g_DriverData.Config.NotificationsEnabled &&
+    fileInfoClass = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+    isDelete = (fileInfoClass == FileDispositionInformation ||
+                fileInfoClass == FileDispositionInformationEx);
+    isRename = (fileInfoClass == FileRenameInformation ||
+                fileInfoClass == FileRenameInformationEx);
+
+    if (!isDelete && !isRename) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    //
+    // Send notification to user-mode about successful rename/delete.
+    // Query the file name here (safe IRQL in non-draining post-op).
+    //
+    if (g_DriverData.Config.NotificationsEnabled &&
         SHADOWSTRIKE_USER_MODE_CONNECTED()) {
 
-        fileInfoClass = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
-        isDelete = (fileInfoClass == FileDispositionInformation ||
-                    fileInfoClass == FileDispositionInformationEx);
-        isRename = (fileInfoClass == FileRenameInformation ||
-                    fileInfoClass == FileRenameInformationEx);
+        NTSTATUS nameStatus = FltGetFileNameInformation(
+            Data,
+            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+            &nameInfo
+            );
 
-        if (isDelete || isRename) {
-            //
-            // Build and send notification asynchronously
-            // This is fire-and-forget - we don't wait for reply
-            //
+        if (NT_SUCCESS(nameStatus)) {
+            FltParseFileNameInformation(nameInfo);
+
             PSHADOWSTRIKE_MESSAGE_HEADER notification = NULL;
             ULONG notificationSize = 0;
 
@@ -561,7 +564,6 @@ ShadowStrikePostSetInformation(
                     &notification,
                     &notificationSize))) {
 
-                // Send notification (ignore result - fire and forget)
                 ShadowStrikeSendNotification(notification, notificationSize);
                 ShadowStrikeFreeMessageBuffer(notification);
             }
@@ -570,11 +572,9 @@ ShadowStrikePostSetInformation(
                        "[ShadowStrike] %s notification sent: %wZ\n",
                        isDelete ? "Delete" : "Rename",
                        &nameInfo->Name);
-        }
-    }
 
-    if (nameInfo != NULL) {
-        FltReleaseFileNameInformation(nameInfo);
+            FltReleaseFileNameInformation(nameInfo);
+        }
     }
 
     return FLT_POSTOP_FINISHED_PROCESSING;
@@ -664,192 +664,11 @@ ShadowStrikePreCleanup(
 }
 
 // ============================================================================
-// FILE SYSTEM CALLBACKS - SECTION SYNCHRONIZATION
+// NOTE: IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION handling is implemented
+// in PreAcquireSection.c (ShadowStrikePreAcquireSection), wired in the
+// operations table above. The previous ShadowStrikePreAcquireForSectionSync
+// function that was here has been removed as dead code.
 // ============================================================================
-
-_IRQL_requires_max_(APC_LEVEL)
-FLT_PREOP_CALLBACK_STATUS
-ShadowStrikePreAcquireForSectionSync(
-    _Inout_ PFLT_CALLBACK_DATA Data,
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _Flt_CompletionContext_Outptr_ PVOID* CompletionContext
-    )
-{
-    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
-    NTSTATUS status;
-    SHADOWSTRIKE_SCAN_VERDICT cachedVerdict = Verdict_Unknown;
-    PSHADOWSTRIKE_STREAM_CONTEXT streamContext = NULL;
-    ULONG pageProtection;
-    BOOLEAN isExecuteMapping = FALSE;
-    HANDLE requestorPid;
-
-    *CompletionContext = NULL;
-
-    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
-
-    if (!ShadowStrikeIsDriverReady()) {
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
-    //
-    // SECURITY FIX: Check self-protection BEFORE checking ScanOnExecute config
-    // This prevents attackers from disabling scan and then executing malware
-    //
-    if (g_DriverData.Config.SelfProtectionEnabled) {
-        status = FltGetFileNameInformation(
-            Data,
-            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
-            &nameInfo
-        );
-
-        if (NT_SUCCESS(status)) {
-            FltParseFileNameInformation(nameInfo);
-            requestorPid = PsGetCurrentProcessId();
-
-            if (ShadowStrikeShouldBlockFileAccess(
-                    &nameInfo->Name,
-                    SECTION_MAP_EXECUTE,
-                    requestorPid,
-                    FALSE
-                )) {
-                //
-                // Block execution mapping of protected file from unauthorized process
-                //
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                           "[ShadowStrike] BLOCKED execute mapping of protected file: %wZ (PID=%p)\n",
-                           &nameInfo->Name, requestorPid);
-
-                SHADOWSTRIKE_INC_STAT(SelfProtectionBlocks);
-
-                FltReleaseFileNameInformation(nameInfo);
-
-                Data->IoStatus.Status = STATUS_ACCESS_DENIED;
-                return FLT_PREOP_COMPLETE;
-            }
-
-            // Keep nameInfo for later use
-        }
-    }
-
-    if (!g_DriverData.Config.ScanOnExecute) {
-        if (nameInfo != NULL) {
-            FltReleaseFileNameInformation(nameInfo);
-        }
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
-    //
-    // Check if this is for execute access
-    //
-    pageProtection = Data->Iopb->Parameters.AcquireForSectionSynchronization.PageProtection;
-    if (pageProtection == PAGE_EXECUTE ||
-        pageProtection == PAGE_EXECUTE_READ ||
-        pageProtection == PAGE_EXECUTE_READWRITE ||
-        pageProtection == PAGE_EXECUTE_WRITECOPY) {
-        isExecuteMapping = TRUE;
-    }
-
-    if (!isExecuteMapping) {
-        if (nameInfo != NULL) {
-            FltReleaseFileNameInformation(nameInfo);
-        }
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
-    SHADOWSTRIKE_ENTER_OPERATION();
-
-    //
-    // Get file name if we didn't get it for self-protection
-    //
-    if (nameInfo == NULL) {
-        status = FltGetFileNameInformation(
-            Data,
-            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
-            &nameInfo
-        );
-
-        if (!NT_SUCCESS(status)) {
-            SHADOWSTRIKE_LEAVE_OPERATION();
-            return FLT_PREOP_SUCCESS_NO_CALLBACK;
-        }
-
-        FltParseFileNameInformation(nameInfo);
-    }
-
-    //
-    // CRITICAL: In section sync callback, we MUST NOT block waiting for user-mode
-    // This can cause deadlocks as the memory manager holds locks.
-    // Use cached verdicts only.
-    //
-    if (FltObjects->FileObject != NULL) {
-        status = FltGetStreamContext(
-            FltObjects->Instance,
-            FltObjects->FileObject,
-            (PFLT_CONTEXT*)&streamContext
-        );
-
-        if (NT_SUCCESS(status) && streamContext != NULL) {
-            //
-            // Use cached verdict if available and valid
-            // Use push lock for read access
-            //
-            KeEnterCriticalRegion();
-            ExAcquirePushLockShared(&streamContext->Lock);
-
-            if (streamContext->Scanned && !streamContext->Dirty) {
-                //
-                // Map PostCreate's boolean ScanResult to verdict enum
-                //
-                if (streamContext->ScanResult) {
-                    cachedVerdict = Verdict_Clean;
-                } else {
-                    cachedVerdict = Verdict_Malicious;
-                }
-            }
-
-            ExReleasePushLockShared(&streamContext->Lock);
-            KeLeaveCriticalRegion();
-
-            FltReleaseContext(streamContext);
-        }
-    }
-
-    //
-    // If no cached verdict, we must allow (cannot block for scan)
-    // Queue an async scan for future reference
-    //
-    if (cachedVerdict == Verdict_Unknown) {
-        //
-        // Queue async scan if user-mode is connected
-        // This populates the cache for next time
-        //
-        if (SHADOWSTRIKE_USER_MODE_CONNECTED()) {
-            ShadowStrikeQueueRescan(
-                FltObjects->Instance,
-                FltObjects->FileObject,
-                &nameInfo->Name
-            );
-        }
-
-        // Allow - no cached verdict available
-        cachedVerdict = Verdict_Clean;
-    }
-
-    FltReleaseFileNameInformation(nameInfo);
-
-    SHADOWSTRIKE_LEAVE_OPERATION();
-
-    //
-    // Block execution if cached verdict indicates malware
-    //
-    if (cachedVerdict == Verdict_Malicious) {
-        SHADOWSTRIKE_INC_STAT(FilesBlocked);
-        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
-        return FLT_PREOP_COMPLETE;
-    }
-
-    return FLT_PREOP_SUCCESS_NO_CALLBACK;
-}
 
 // ============================================================================
 // RESCAN QUEUE IMPLEMENTATION
@@ -940,84 +759,9 @@ ShadowStrikeQueueRescan(
 }
 
 // ============================================================================
-// DEFERRED WORK ITEM WORKER
+// NOTE: ShadowStrikeDeferredScanWorker removed — zero callers.
+// Rescan functionality is handled by ShadowStrikeQueueRescan above.
 // ============================================================================
-
-_IRQL_requires_(PASSIVE_LEVEL)
-VOID
-ShadowStrikeDeferredScanWorker(
-    _In_ PFLT_DEFERRED_IO_WORKITEM WorkItem,
-    _In_ PFLT_CALLBACK_DATA Data,
-    _In_ PVOID Context
-    )
-{
-    PSHADOW_DEFERRED_SCAN_CONTEXT scanContext = (PSHADOW_DEFERRED_SCAN_CONTEXT)Context;
-    NTSTATUS status;
-
-    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
-
-    UNREFERENCED_PARAMETER(Data);
-
-    if (scanContext == NULL) {
-        FltFreeDeferredIoWorkItem(WorkItem);
-        return;
-    }
-
-    //
-    // At PASSIVE_LEVEL we can safely send a scan request to user-mode.
-    // Build a lightweight rescan notification using the cached context.
-    //
-    if (scanContext->FileName.Buffer != NULL &&
-        scanContext->FileName.Length > 0 &&
-        SHADOWSTRIKE_USER_MODE_CONNECTED()) {
-
-        USHORT copyLen = (scanContext->FileName.Length > 520) ?
-                         520 : scanContext->FileName.Length;
-        USHORT pathChars = copyLen / sizeof(WCHAR);
-        ULONG reqSize = sizeof(FILE_SCAN_REQUEST) + copyLen;
-
-        PFILE_SCAN_REQUEST req = (PFILE_SCAN_REQUEST)ExAllocatePool2(
-            POOL_FLAG_PAGED, reqSize, 'dsQS');
-
-        if (req != NULL) {
-            RtlZeroMemory(req, sizeof(FILE_SCAN_REQUEST));
-            req->MessageId = SHADOWSTRIKE_NEXT_MESSAGE_ID();
-            req->AccessType = (UINT8)scanContext->AccessType;
-            req->Priority = scanContext->IsExecute ? 0 : 1;
-            req->RequiresReply = 0;
-            req->ProcessId = HandleToULong(scanContext->ProcessId);
-            req->FileSize = (UINT64)scanContext->FileSize.QuadPart;
-            req->PathLength = pathChars;
-
-            RtlCopyMemory(
-                (PUCHAR)req + sizeof(FILE_SCAN_REQUEST),
-                scanContext->FileName.Buffer,
-                copyLen);
-
-            status = ShadowStrikeBatchSendNotification(
-                (UINT16)FilterMessageType_ScanRequest,
-                req,
-                reqSize);
-
-            if (!NT_SUCCESS(status)) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                           "[ShadowStrike] Deferred scan send failed: 0x%08X\n", status);
-            }
-
-            ExFreePoolWithTag(req, 'dsQS');
-        }
-    }
-
-    //
-    // Cleanup context resources
-    //
-    if (scanContext->FileName.Buffer != NULL) {
-        ExFreePoolWithTag(scanContext->FileName.Buffer, SHADOW_WORK_ITEM_TAG);
-    }
-
-    ExFreePoolWithTag(scanContext, SHADOW_WORK_ITEM_TAG);
-    FltFreeDeferredIoWorkItem(WorkItem);
-}
 
 // ============================================================================
 // FILE SYSTEM CALLBACKS - NAMED PIPE MONITORING

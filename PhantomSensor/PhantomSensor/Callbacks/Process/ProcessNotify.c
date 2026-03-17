@@ -645,7 +645,6 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
-    NTSTATUS Status = STATUS_SUCCESS;
     ULONG i;
 
     PAGED_CODE();
@@ -757,17 +756,20 @@ Return Value:
     // - Factor aging and decay for temporal relevance
     // - Configurable thresholds for verdicts (suspicious/malicious/blocked)
     //
-    Status = TsInitialize(&g_ProcessMonitor.ThreatScoringEngine);
-    if (!NT_SUCCESS(Status)) {
+    //
+    // Use the centralized ThreatScoring engine from DriverEntry
+    // instead of creating a duplicate instance (split-brain fix).
+    //
+    g_ProcessMonitor.ThreatScoringEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+    if (g_ProcessMonitor.ThreatScoringEngine == NULL) {
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_ERROR_LEVEL,
-            "[ShadowStrike/ProcessNotify] Failed to initialize ThreatScoring engine: 0x%08X\n",
-            Status
+            "[ShadowStrike/ProcessNotify] ThreatScoring engine not available from DriverEntry\n"
             );
         ExDeleteNPagedLookasideList(&g_ProcessMonitor.ContextLookaside);
         ExDeleteNPagedLookasideList(&g_ProcessMonitor.NotificationLookaside);
-        return Status;
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
@@ -949,13 +951,10 @@ Routine Description:
     KeReleaseSpinLock(&g_ProcessMonitor.NotificationLock, OldIrql);
 
     //
-    // Shutdown centralized threat scoring engine
-    // This will drain outstanding references and free all process contexts
+    // Clear reference to centralized threat scoring engine
+    // DriverEntry owns the lifecycle — no TsShutdown here.
     //
-    if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
-        TsShutdown(g_ProcessMonitor.ThreatScoringEngine);
-        g_ProcessMonitor.ThreatScoringEngine = NULL;
-    }
+    g_ProcessMonitor.ThreatScoringEngine = NULL;
 
     //
     // Delete lookaside lists - safe now that all contexts are freed
@@ -1298,6 +1297,55 @@ Arguments:
                 HandleToULong(ProcessId),
                 HandleToULong(ProcessContext->ParentProcessId),
                 HandleToULong(ProcessContext->RealParentProcessId)
+                );
+        }
+    }
+
+    //
+    // Deep PPID Spoofing Validation — PctDetectSpoofing uses creation time
+    // ordering and PID reuse protection for a more robust check than the
+    // simple creator-vs-parent comparison in PnpDetectPpidSpoofing above.
+    // This catches sophisticated spoofing where creation times are manipulated.
+    //
+    if (g_ProcessMonitor.Config.EnablePpidSpoofingDetection &&
+        g_ProcessMonitor.ParentChainTracker != NULL) {
+
+        PPCT_TRACKER pctTracker = (PPCT_TRACKER)g_ProcessMonitor.ParentChainTracker;
+        BOOLEAN pctSpoofed = FALSE;
+
+        NTSTATUS pctSpStatus = PctDetectSpoofing(
+            pctTracker,
+            ProcessId,
+            CreateInfo->ParentProcessId,
+            NULL,
+            &pctSpoofed
+            );
+
+        if (NT_SUCCESS(pctSpStatus) && pctSpoofed && !ProcessContext->IsPpidSpoofed) {
+            ProcessContext->IsPpidSpoofed = TRUE;
+            ProcessContext->Flags |= PN_PROC_FLAG_PPID_SPOOFED;
+            InterlockedIncrement64(&g_ProcessMonitor.Stats.PpidSpoofingDetected);
+
+            if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+                TsAddFactor(
+                    g_ProcessMonitor.ThreatScoringEngine,
+                    ProcessId,
+                    TsFactor_MITRE,
+                    "T1134.004-DeepPPID",
+                    50,
+                    "PPID spoofing detected via creation-time ordering analysis"
+                    );
+            }
+
+            BeEngineSubmitEvent(
+                BehaviorEvent_SuspiciousParentChild,
+                BehaviorCategory_DefenseEvasion,
+                HandleToULong(ProcessId),
+                &pctSpoofed,
+                sizeof(BOOLEAN),
+                80,
+                FALSE,
+                NULL
                 );
         }
     }
@@ -4542,6 +4590,44 @@ Routine Description:
         }
 
         CheckCount++;
+    }
+
+    //
+    // Process Relationship Graph Analysis — detect suspicious clusters
+    // of related processes that may indicate coordinated attack activity
+    // (e.g., multiple injection chains, lateral movement patterns).
+    // Runs once per security check cycle (not per-process) at PASSIVE_LEVEL.
+    //
+    {
+        PPR_GRAPH prGraph = PaGetProcessRelationshipGraph();
+        if (prGraph != NULL) {
+            HANDLE suspiciousPids[32];
+            ULONG suspiciousCount = 0;
+
+            NTSTATUS prStatus = PrFindSuspiciousClusters(
+                prGraph,
+                suspiciousPids,
+                ARRAYSIZE(suspiciousPids),
+                &suspiciousCount
+                );
+
+            if (NT_SUCCESS(prStatus) && suspiciousCount > 0) {
+                for (ULONG c = 0; c < suspiciousCount; c++) {
+                    BeEngineSubmitEvent(
+                        BehaviorEvent_SuspiciousParentChild,
+                        BehaviorCategory_ProcessExecution,
+                        HandleToULong(suspiciousPids[c]),
+                        &suspiciousCount,
+                        sizeof(ULONG),
+                        60,
+                        FALSE,
+                        NULL
+                        );
+
+                    InterlockedIncrement64(&g_ProcessMonitor.Stats.SecurityChecksTriggered);
+                }
+            }
+        }
     }
 }
 

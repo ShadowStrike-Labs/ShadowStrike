@@ -58,6 +58,7 @@ Performance Characteristics:
 --*/
 
 #include "FileSystemCallbacks.h"
+#include "PostCreate.h"
 #include "../../Core/Globals.h"
 #include "../../Core/DriverEntry.h"
 #include "../../Shared/SharedDefs.h"

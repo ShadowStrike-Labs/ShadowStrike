@@ -889,6 +889,34 @@ MmMonitorGetInjectionDetector(
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+PROP_DETECTOR
+MmMonitorGetROPDetector(
+    VOID
+    )
+{
+    if (g_MemoryMonitor.InitState != MM_INIT_DONE ||
+        g_MemoryMonitor.ROPDetector == NULL) {
+        return NULL;
+    }
+
+    return (PROP_DETECTOR)g_MemoryMonitor.ROPDetector;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PSD_DETECTOR
+MmMonitorGetShellcodeDetector(
+    VOID
+    )
+{
+    if (g_MemoryMonitor.InitState != MM_INIT_DONE ||
+        g_MemoryMonitor.ShellcodeDetector == NULL) {
+        return NULL;
+    }
+
+    return (PSD_DETECTOR)g_MemoryMonitor.ShellcodeDetector;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 MmMonitorGetInjectionStats(
@@ -2846,6 +2874,19 @@ MmpCreateProcessContext(
     ExReleaseResourceLite(&g_MemoryMonitor.ProcessContextLock);
     KeLeaveCriticalRegion();
 
+    //
+    // Start VAD tracking for this process (T1055 — injection/hollowing detection).
+    // VadStartTracking enumerates current VADs and sets up change monitoring.
+    // PASSIVE_LEVEL required — we are in PAGED context after lock release.
+    //
+    if (g_MemoryMonitor.VadTracker != NULL &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        VadStartTracking(
+            (PVAD_TRACKER)g_MemoryMonitor.VadTracker,
+            ULongToHandle(ProcessId)
+        );
+    }
+
     *Context = NewContext;
 
     return STATUS_SUCCESS;
@@ -2862,6 +2903,18 @@ MmpFreeProcessContext(
 
     if (Context == NULL) {
         return;
+    }
+
+    //
+    // Stop VAD tracking before freeing the context.
+    // VadStopTracking cleans up per-process VAD monitoring state.
+    //
+    if (g_MemoryMonitor.VadTracker != NULL &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        VadStopTracking(
+            (PVAD_TRACKER)g_MemoryMonitor.VadTracker,
+            ULongToHandle(Context->ProcessId)
+        );
     }
 
     //

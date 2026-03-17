@@ -48,15 +48,17 @@
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, AdInitialize)
-#pragma alloc_text(PAGE, AdShutdown)
 #pragma alloc_text(PAGE, AdSetThreshold)
 #pragma alloc_text(PAGE, AdRegisterCallback)
 #pragma alloc_text(PAGE, AdUnregisterCallback)
-#pragma alloc_text(PAGE, AdRecordSample)
-#pragma alloc_text(PAGE, AdCheckForAnomaly)
-#pragma alloc_text(PAGE, AdGetBaseline)
-#pragma alloc_text(PAGE, AdGetRecentAnomalies)
 #pragma alloc_text(PAGE, AdGetStatistics)
+//
+// AdShutdown, AdRecordSample, AdCheckForAnomaly, AdGetBaseline,
+// AdGetRecentAnomalies: NOT in PAGE section because they acquire
+// KSPIN_LOCK (raises to DISPATCH_LEVEL). The Baseline->Lock spinlock
+// is shared with AdpCalculateModifiedZScore which runs at DPC level,
+// so converting to push lock is not possible.
+//
 #endif
 
 // ============================================================================
@@ -299,9 +301,9 @@ AdpCleanupWorkerThread(
     _In_ PVOID StartContext
     );
 
-#ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, AdpCleanupWorkerThread)
-#endif
+//
+// AdpCleanupWorkerThread NOT in PAGE: acquires AnomalyLock spinlock
+//
 
 static NTSTATUS
 AdpInitializeHashTable(
@@ -761,7 +763,7 @@ AdShutdown(
     KIRQL oldIrql;
     LARGE_INTEGER timeout;
 
-    PAGED_CODE();
+    // NOT paged: acquires AnomalyLock spinlock (DISPATCH_LEVEL)
 
     if (!AdpValidateDetector(Detector)) {
         return;
@@ -786,15 +788,32 @@ AdShutdown(
     KeSetEvent(&Detector->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
 
     if (Detector->CleanupThread != NULL) {
+        NTSTATUS waitStatus;
         timeout.QuadPart = -((LONGLONG)AD_SHUTDOWN_TIMEOUT_MS * 10000);
 
-        KeWaitForSingleObject(
+        waitStatus = KeWaitForSingleObject(
             Detector->CleanupThread,
             Executive,
             KernelMode,
             FALSE,
             &timeout
         );
+
+        if (waitStatus == STATUS_TIMEOUT) {
+            //
+            // Thread didn't exit in time — wait indefinitely to prevent UAF.
+            // Driver unload cannot safely proceed with a live thread.
+            //
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike:AnomalyDetector] Cleanup thread did not exit within timeout, waiting indefinitely\n");
+            KeWaitForSingleObject(
+                Detector->CleanupThread,
+                Executive,
+                KernelMode,
+                FALSE,
+                NULL
+            );
+        }
 
         ObDereferenceObject(Detector->CleanupThread);
         Detector->CleanupThread = NULL;
@@ -806,14 +825,33 @@ AdShutdown(
     //
     AdpDereferenceDetector(Detector);
 
-    timeout.QuadPart = -((LONGLONG)AD_SHUTDOWN_TIMEOUT_MS * 10000);
-    KeWaitForSingleObject(
-        &Detector->ZeroRefEvent,
-        Executive,
-        KernelMode,
-        FALSE,
-        &timeout
-    );
+    {
+        NTSTATUS waitStatus;
+        timeout.QuadPart = -((LONGLONG)AD_SHUTDOWN_TIMEOUT_MS * 10000);
+        waitStatus = KeWaitForSingleObject(
+            &Detector->ZeroRefEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &timeout
+        );
+
+        if (waitStatus == STATUS_TIMEOUT) {
+            //
+            // Outstanding references still exist. Wait indefinitely — freeing
+            // the detector with live references would cause UAF/BSOD.
+            //
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike:AnomalyDetector] ZeroRefEvent not signaled within timeout, waiting indefinitely\n");
+            KeWaitForSingleObject(
+                &Detector->ZeroRefEvent,
+                Executive,
+                KernelMode,
+                FALSE,
+                NULL
+            );
+        }
+    }
 
     //
     // Free all global baselines
@@ -1058,7 +1096,7 @@ AdRecordSample(
     NTSTATUS status;
     BOOLEAN floatSaved = FALSE;
 
-    PAGED_CODE();
+    // NOT paged: acquires Baseline spinlock (DISPATCH_LEVEL)
 
     if (!AdpValidateDetector(Detector)) {
         return STATUS_INVALID_PARAMETER;
@@ -1181,7 +1219,7 @@ AdCheckForAnomaly(
     DOUBLE baselineMean, baselineStdDev, baselineMin, baselineMax;
     ULONG sampleCount;
 
-    PAGED_CODE();
+    // NOT paged: acquires Baseline spinlock (DISPATCH_LEVEL)
 
     if (!AdpValidateDetector(Detector) || IsAnomaly == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1408,7 +1446,7 @@ AdGetBaseline(
     PAD_PROCESS_BASELINE processBaseline = NULL;
     KIRQL oldIrql;
 
-    PAGED_CODE();
+    // NOT paged: acquires Baseline spinlock (DISPATCH_LEVEL)
 
     if (!AdpValidateDetector(Detector) || BaselineInfo == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1510,7 +1548,7 @@ AdGetRecentAnomalies(
     KIRQL oldIrql;
     ULONG count = 0;
 
-    PAGED_CODE();
+    // NOT paged: acquires AnomalyLock spinlock (DISPATCH_LEVEL)
 
     if (!AdpValidateDetector(Detector) ||
         AnomalyArray == NULL || ActualCount == NULL || MaxCount == 0) {
@@ -1604,7 +1642,7 @@ AdpCleanupWorkerThread(
     PLIST_ENTRY next;
     KIRQL oldIrql;
 
-    PAGED_CODE();
+    // NOT paged: acquires AnomalyLock spinlock (DISPATCH_LEVEL)
 
     timeout.QuadPart = -((LONGLONG)AD_CLEANUP_INTERVAL_MS * 10000);
 
@@ -2392,35 +2430,43 @@ AdpNotifyCallbacks(
     )
 {
     ULONG i;
-    AD_ANOMALY_CALLBACK callback;
-    PVOID context;
+    AD_ANOMALY_CALLBACK callbacks[AD_MAX_CALLBACKS];
+    PVOID contexts[AD_MAX_CALLBACKS];
+    ULONG count = 0;
 
+    //
+    // Snapshot all active callbacks under lock, then invoke outside lock.
+    // This prevents UAF: once we snapshot, unregister can proceed but our
+    // snapshot still holds valid function pointers and contexts.
+    // The caller of AdUnregisterCallback must not free the context until
+    // AdUnregisterCallback returns, which waits for the exclusive lock.
+    // Since we hold the shared lock during snapshot, the unregister cannot
+    // complete until we release, guaranteeing our snapshots are valid.
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Detector->CallbackLock);
 
     for (i = 0; i < AD_MAX_CALLBACKS; i++) {
         if (Detector->Callbacks[i].InUse &&
             Detector->Callbacks[i].Callback != NULL) {
-
-            //
-            // Snapshot callback and context before releasing lock
-            // to prevent UAF if another thread unregisters concurrently
-            //
-            callback = Detector->Callbacks[i].Callback;
-            context = Detector->Callbacks[i].Context;
-
-            ExReleasePushLockShared(&Detector->CallbackLock);
-            KeLeaveCriticalRegion();
-
-            callback(AnomalyInfo, context);
-
-            KeEnterCriticalRegion();
-            ExAcquirePushLockShared(&Detector->CallbackLock);
+            callbacks[count] = Detector->Callbacks[i].Callback;
+            contexts[count] = Detector->Callbacks[i].Context;
+            count++;
         }
     }
 
     ExReleasePushLockShared(&Detector->CallbackLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Invoke outside lock. Callers who unregistered after our snapshot
+    // must keep their context alive until AdUnregisterCallback returns.
+    // This is safe because AdUnregisterCallback holds exclusive lock,
+    // which cannot be acquired until our shared lock is released above.
+    //
+    for (i = 0; i < count; i++) {
+        callbacks[i](AnomalyInfo, contexts[i]);
+    }
 }
 
 // ============================================================================

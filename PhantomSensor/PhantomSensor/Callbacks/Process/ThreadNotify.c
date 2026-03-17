@@ -60,6 +60,8 @@
 #include "../../Communication/ScanBridge.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Memory/MemoryMonitor.h"
+#include "../../Memory/ROPDetector.h"
+#include "../../Memory/ShellcodeDetector.h"
 #include "../../Utilities/ProcessUtils.h"
 #include "../../Shared/KernelProcessTypes.h"
 #include "../../Behavioral/BehaviorEngine.h"
@@ -947,6 +949,123 @@ Routine Description:
                 InterlockedIncrement64(&g_TnMonitor.Stats.SuspiciousThreadsDetected);
                 InterlockedIncrement(&processContext->SuspiciousThreadCount);
                 InterlockedIncrement64(&g_TnMonitor.Stats.InjectionAttempts);
+            }
+
+            //
+            // Deep Memory Analysis — when injection indicators are present,
+            // trigger the full memory detection pipeline:
+            //   1. Shellcode scan at thread start address
+            //   2. Injection detection across source→target
+            //   3. VAD suspicious region enumeration
+            // These APIs are the analysis layer atop the recording layer
+            // (InjRecordOperation wired below). PASSIVE_LEVEL required.
+            //
+            if (event->InjectionScore > 0 && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                UINT32 targetPid = HandleToULong(event->TargetProcessId);
+                UINT32 sourcePid = HandleToULong(creatorProcessId);
+
+                //
+                // MEM-1: Shellcode scan at thread start address (unbacked or RWX)
+                //
+                if ((event->Indicators & (TnIndicator_UnbackedStartAddr | TnIndicator_RWXStartAddr |
+                                          TnIndicator_ShellcodePattern)) != 0 &&
+                    event->StartAddress != NULL) {
+
+                    SHELLCODE_DETECTION_EVENT shellcodeEvent = { 0 };
+                    BOOLEAN shellcodeFound = MmMonitorScanForShellcode(
+                        targetPid,
+                        (UINT64)(ULONG_PTR)event->StartAddress,
+                        PAGE_SIZE,
+                        &shellcodeEvent
+                        );
+
+                    if (shellcodeFound) {
+                        event->Indicators |= TnIndicator_ShellcodePattern;
+                        event->InjectionScore = TnpSafeAddScore(
+                            event->InjectionScore, TN_SCORE_SHELLCODE_PATTERN);
+
+                        BeEngineSubmitEvent(
+                            BehaviorEvent_ShellcodeDetected,
+                            BehaviorCategory_CodeInjection,
+                            targetPid,
+                            &shellcodeEvent,
+                            sizeof(shellcodeEvent),
+                            85,
+                            FALSE,
+                            NULL
+                            );
+                    }
+                }
+
+                //
+                // MEM-2: Cross-process injection detection
+                //
+                if (event->IsRemote) {
+                    INJECTION_DETECTION_EVENT injEvent = { 0 };
+                    BOOLEAN injectionFound = MmMonitorDetectInjection(
+                        sourcePid,
+                        targetPid,
+                        (UINT64)(ULONG_PTR)event->StartAddress,
+                        PAGE_SIZE,
+                        Injection_ClassicDLL,
+                        &injEvent
+                        );
+
+                    if (injectionFound) {
+                        event->InjectionScore = TnpSafeAddScore(
+                            event->InjectionScore, 150);
+
+                        BeEngineSubmitEvent(
+                            BehaviorEvent_CrossProcessWrite,
+                            BehaviorCategory_CodeInjection,
+                            targetPid,
+                            &injEvent,
+                            sizeof(injEvent),
+                            90,
+                            FALSE,
+                            NULL
+                            );
+                    }
+                }
+
+                //
+                // MEM-ROP: ROP chain detection (T1055/T1574) — analyze the
+                // thread's call stack for ROP gadget chains, stack pivots,
+                // and return-oriented programming indicators.
+                //
+                {
+                    PROP_DETECTOR ropDetector = MmMonitorGetROPDetector();
+
+                    if (ropDetector != NULL) {
+                        PROP_DETECTION_RESULT ropResult = NULL;
+                        NTSTATUS ropStatus = RopAnalyzeStack(
+                            ropDetector,
+                            event->TargetProcessId,
+                            event->TargetThreadId,
+                            NULL,
+                            &ropResult
+                        );
+
+                        if (NT_SUCCESS(ropStatus) && ropResult != NULL) {
+                            if (ropResult->ChainDetected) {
+                                event->InjectionScore = TnpSafeAddScore(
+                                    event->InjectionScore, 200);
+
+                                BeEngineSubmitEvent(
+                                    BehaviorEvent_ROPChainDetected,
+                                    BehaviorCategory_CodeInjection,
+                                    targetPid,
+                                    NULL,
+                                    0,
+                                    ropResult->ConfidenceScore,
+                                    (ropResult->ConfidenceScore >= 80),
+                                    NULL
+                                );
+                            }
+                            RopFreeResult(ropResult);
+                        }
+                    }
+                }
             }
 
             //

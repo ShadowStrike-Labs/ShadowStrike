@@ -59,6 +59,7 @@
 #pragma warning(disable: 4324)  // structure was padded due to alignment specifier (fltKernel.h)
 #include "FileSystemCallbacks.h"
 #pragma warning(pop)
+#include "PostCreate.h"
 #include "../../Core/Globals.h"
 #include "../../Cache/ScanCache.h"
 #include "../../Shared/SharedDefs.h"
@@ -815,7 +816,7 @@ ShadowStrikePostWrite(
         // Detect full file overwrite pattern
         //
         if (writeContext.WriteOffset.QuadPart == 0 &&
-            writeContext.BytesWritten >= streamContext->ScanFileSize) {
+            (LONGLONG)writeContext.BytesWritten >= streamContext->ScanFileSize) {
             writeContext.IsFullOverwrite = TRUE;
         }
 

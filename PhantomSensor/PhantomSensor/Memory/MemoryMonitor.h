@@ -47,6 +47,8 @@
 #include "../../Shared/BehaviorTypes.h"
 #include "HollowingDetector.h"
 #include "InjectionDetector.h"
+#include "ROPDetector.h"
+#include "ShellcodeDetector.h"
 
 // ============================================================================
 // MEMORY MONITOR CONFIGURATION
@@ -319,6 +321,26 @@ MmMonitorGetHollowingDetector(
 _IRQL_requires_max_(DISPATCH_LEVEL)
 PINJ_DETECTOR
 MmMonitorGetInjectionDetector(
+    VOID
+    );
+
+/**
+ * @brief Get the ROPDetector instance for stack analysis.
+ * @return PROP_DETECTOR opaque pointer, or NULL if not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PROP_DETECTOR
+MmMonitorGetROPDetector(
+    VOID
+    );
+
+/**
+ * @brief Get the ShellcodeDetector instance for region analysis.
+ * @return PSD_DETECTOR opaque pointer, or NULL if not initialized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PSD_DETECTOR
+MmMonitorGetShellcodeDetector(
     VOID
     );
 

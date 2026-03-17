@@ -73,58 +73,12 @@ extern "C" {
 // ============================================================================
 
 /**
- * @brief Context for deferred post-operation processing.
+ * @brief Context for deferred post-operation processing has been removed.
  *
- * Used when post-operation callbacks need to perform work at PASSIVE_LEVEL
- * but were called at elevated IRQL or during draining.
+ * NOTE: The SHADOW_DEFERRED_SCAN_CONTEXT struct and ShadowStrikeDeferredScanWorker
+ * function were dead code (zero callers). Rescan functionality is handled by
+ * ShadowStrikeQueueRescan which uses the rescan queue mechanism.
  */
-typedef struct _SHADOW_DEFERRED_SCAN_CONTEXT {
-    /**
-     * @brief Work item for deferred processing.
-     */
-    PFLT_DEFERRED_IO_WORKITEM WorkItem;
-
-    /**
-     * @brief Filter instance handle.
-     */
-    PFLT_INSTANCE Instance;
-
-    /**
-     * @brief File object for the operation.
-     */
-    PFILE_OBJECT FileObject;
-
-    /**
-     * @brief Cached file name (allocated copy).
-     */
-    UNICODE_STRING FileName;
-
-    /**
-     * @brief File size for scan decision.
-     */
-    LARGE_INTEGER FileSize;
-
-    /**
-     * @brief Access type for scan request.
-     */
-    ULONG AccessType;
-
-    /**
-     * @brief Process ID of requestor.
-     */
-    HANDLE ProcessId;
-
-    /**
-     * @brief TRUE if this is an execute access.
-     */
-    BOOLEAN IsExecute;
-
-    /**
-     * @brief Reserved for alignment.
-     */
-    BOOLEAN Reserved[7];
-
-} SHADOW_DEFERRED_SCAN_CONTEXT, *PSHADOW_DEFERRED_SCAN_CONTEXT;
 
 // ============================================================================
 // SCANNABLE EXTENSION TABLE
@@ -421,29 +375,10 @@ ShadowStrikePreCleanup(
 /**
  * @brief Pre-acquire-for-section-synchronization callback.
  *
- * Called when a file is being mapped for execution. Critical trigger
- * for scanning before code execution.
- *
- * NOTE: This callback uses cached verdicts only to avoid blocking.
- * New scans are queued asynchronously.
- *
- * @param Data        Callback data for this operation.
- * @param FltObjects  Filter objects for this operation.
- * @param CompletionContext  Context passed to post-operation callback.
- * @return FLT_PREOP_SUCCESS_NO_CALLBACK or FLT_PREOP_COMPLETE.
- *
- * @irql <= APC_LEVEL
- *
- * @deprecated Replaced by ShadowStrikePreAcquireSection in PreAcquireSection.c
- *             which provides full behavioral detection. Retained for reference only.
+ * NOTE: IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION is handled by
+ * ShadowStrikePreAcquireSection in PreAcquireSection.c. The previous
+ * ShadowStrikePreAcquireForSectionSync has been removed as dead code.
  */
-_IRQL_requires_max_(APC_LEVEL)
-FLT_PREOP_CALLBACK_STATUS
-ShadowStrikePreAcquireForSectionSync(
-    _Inout_ PFLT_CALLBACK_DATA Data,
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _Flt_CompletionContext_Outptr_ PVOID* CompletionContext
-    );
 
 // ============================================================================
 // INTERNAL HELPER FUNCTIONS
@@ -486,23 +421,8 @@ ShadowStrikeQueueRescan(
     _In_opt_ PCUNICODE_STRING FileName
     );
 
-/**
- * @brief Deferred scan worker function.
- *
- * Called from work item to perform scan at PASSIVE_LEVEL.
- *
- * @param WorkItem    Work item.
- * @param Context     SHADOW_DEFERRED_SCAN_CONTEXT.
- *
- * @irql PASSIVE_LEVEL
- */
-_IRQL_requires_(PASSIVE_LEVEL)
-VOID
-ShadowStrikeDeferredScanWorker(
-    _In_ PFLT_DEFERRED_IO_WORKITEM WorkItem,
-    _In_ PFLT_CALLBACK_DATA Data,
-    _In_ PVOID Context
-    );
+// NOTE: ShadowStrikeDeferredScanWorker removed — zero callers.
+// Rescan functionality is handled by ShadowStrikeQueueRescan above.
 
 #ifdef __cplusplus
 }

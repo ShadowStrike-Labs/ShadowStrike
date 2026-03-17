@@ -838,7 +838,23 @@ ShadowStrikePopulateEventSchema(
                                ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_NETWORK, 5, fields);
     if (NT_SUCCESS(status)) registered++; else failed++;
 
-    // EtwEventId_C2Detected (603)
+    // EtwEventId_C2Detected (603) — uses full NetworkConnect layout (15 fields)
+    RtlZeroMemory(fields, sizeof(fields));
+    EsInitField(&fields[0],  "Timestamp",      EsType_UINT64,   0,   8, EsFieldFlag_None);
+    EsInitField(&fields[1],  "ProcessId",      EsType_UINT32,   8,   4, EsFieldFlag_None);
+    EsInitField(&fields[2],  "Protocol",       EsType_UINT32,  24,   4, EsFieldFlag_None);
+    EsInitField(&fields[3],  "Direction",      EsType_UINT32,  28,   4, EsFieldFlag_None);
+    EsInitField(&fields[4],  "LocalPort",      EsType_UINT16,  32,   2, EsFieldFlag_None);
+    EsInitField(&fields[5],  "RemotePort",     EsType_UINT16,  34,   2, EsFieldFlag_None);
+    EsInitField(&fields[6],  "LocalIpV4",      EsType_IPV4,    36,   4, EsFieldFlag_None);
+    EsInitField(&fields[7],  "RemoteIpV4",     EsType_IPV4,    40,   4, EsFieldFlag_None);
+    EsInitField(&fields[8],  "LocalIpV6",      EsType_IPV6,    44,  16, EsFieldFlag_FixedCount);
+    EsInitField(&fields[9],  "RemoteIpV6",     EsType_IPV6,    60,  16, EsFieldFlag_FixedCount);
+    EsInitField(&fields[10], "BytesSent",      EsType_UINT64,  76,   8, EsFieldFlag_None);
+    EsInitField(&fields[11], "BytesReceived",  EsType_UINT64,  84,   8, EsFieldFlag_None);
+    EsInitField(&fields[12], "ThreatScore",    EsType_UINT32,  92,   4, EsFieldFlag_None);
+    EsInitField(&fields[13], "ThreatType",     EsType_UINT32,  96,   4, EsFieldFlag_None);
+    EsInitField(&fields[14], "RemoteHostname", EsType_UNICODESTRING, 0, 0, EsFieldFlag_VariableLength);
     status = EsRegisterEventEx(Schema, EtwEventId_C2Detected, "C2Detected",
                                ETW_LEVEL_WARNING, ETW_KEYWORD_NETWORK | ETW_KEYWORD_THREAT, 15, fields);
     if (NT_SUCCESS(status)) registered++; else failed++;
@@ -3011,6 +3027,16 @@ ShadowStrikeUnload(
         MmMonitorShutdown();
     }
 
+    //
+    // Unregister power-to-behavior bridge BEFORE shutting down BehaviorEngine.
+    // Prevents ShadowStrikePowerBehaviorBridge from calling BeEngineSubmitEvent
+    // on a destroyed engine during power transitions.
+    //
+    if (g_PowerBehaviorBridgeHandle != NULL) {
+        ShadowPowerUnregisterCallback(g_PowerBehaviorBridgeHandle);
+        g_PowerBehaviorBridgeHandle = NULL;
+    }
+
     if (g_SubsystemFlags & SubsysFlag_BehaviorEngine) {
         BeEngineShutdown();
     }
@@ -3066,10 +3092,7 @@ ShadowStrikeUnload(
     // =========================================================================
 
     if (g_SubsystemFlags & SubsysFlag_PowerCallback) {
-        if (g_PowerBehaviorBridgeHandle != NULL) {
-            ShadowPowerUnregisterCallback(g_PowerBehaviorBridgeHandle);
-            g_PowerBehaviorBridgeHandle = NULL;
-        }
+        // Power behavior bridge already unregistered above (before BehaviorEngine shutdown)
         ShadowUnregisterPowerCallbacks();
     }
 
@@ -3849,6 +3872,19 @@ ShadowStrikeCleanupByFlags(
     PAGED_CODE();
 
     //
+    // Signal shutdown first — stop all callbacks from processing new events.
+    // Mirror Steps 1-2 of ShadowStrikeUnload to prevent UAF during teardown.
+    //
+    WriteBooleanRelease(&g_DriverData.ShuttingDown, TRUE);
+    MemoryBarrier();
+
+    //
+    // Drain rundown protection — wait for in-flight callback operations
+    // that hold rundown refs (work items, DPCs, async operations).
+    //
+    ShadowStrikeWaitForRundownComplete();
+
+    //
     // Emit ETW diagnostic event: driver cleanup starting (failure path)
     //
     EtwWriteDiagnosticEvent(
@@ -4049,17 +4085,17 @@ ShadowStrikeCleanupByFlags(
         g_IntegrityMonitor = NULL;
     }
 
-    if (g_InitFlags & InitFlag_FileProtectionInitialized) {
+    if (InitFlags & InitFlag_FileProtectionInitialized) {
         FpShutdown(g_FileProtectionEngine);
         g_FileProtectionEngine = NULL;
     }
 
-    if (g_InitFlags & InitFlag_AntiUnloadInitialized) {
+    if (InitFlags & InitFlag_AntiUnloadInitialized) {
         AuShutdown(g_AntiUnloadProtector);
         g_AntiUnloadProtector = NULL;
     }
 
-    if (g_InitFlags & InitFlag_AntiDebugInitialized) {
+    if (InitFlags & InitFlag_AntiDebugInitialized) {
         AdbShutdown(g_AntiDebugProtector);
         g_AntiDebugProtector = NULL;
     }
@@ -4072,7 +4108,7 @@ ShadowStrikeCleanupByFlags(
     //
     // Phase 4A: ELAM shutdown
     //
-    if (g_InitFlags & InitFlag_ElamInitialized) {
+    if (InitFlags & InitFlag_ElamInitialized) {
         ElamUnregisterCallback();
         ElamDriverShutdown();
     }
@@ -4115,6 +4151,14 @@ ShadowStrikeCleanupByFlags(
 
     if (g_SubsystemFlags & SubsysFlag_MemoryMonitor) {
         MmMonitorShutdown();
+    }
+
+    //
+    // Unregister power-to-behavior bridge BEFORE shutting down BehaviorEngine.
+    //
+    if (g_PowerBehaviorBridgeHandle != NULL) {
+        ShadowPowerUnregisterCallback(g_PowerBehaviorBridgeHandle);
+        g_PowerBehaviorBridgeHandle = NULL;
     }
 
     if (g_SubsystemFlags & SubsysFlag_BehaviorEngine) {
@@ -4170,10 +4214,7 @@ ShadowStrikeCleanupByFlags(
     // Phase 1C: Shutdown power management
     //
     if (g_SubsystemFlags & SubsysFlag_PowerCallback) {
-        if (g_PowerBehaviorBridgeHandle != NULL) {
-            ShadowPowerUnregisterCallback(g_PowerBehaviorBridgeHandle);
-            g_PowerBehaviorBridgeHandle = NULL;
-        }
+        // Power behavior bridge already unregistered above (before BehaviorEngine shutdown)
         ShadowUnregisterPowerCallbacks();
     }
 

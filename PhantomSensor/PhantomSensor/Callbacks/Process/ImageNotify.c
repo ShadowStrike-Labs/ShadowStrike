@@ -64,6 +64,9 @@
 #include "../../Performance/CacheOptimization.h"
 #include "../../Performance/PerformanceMonitor.h"
 #include "../../Performance/ResourceThrottling.h"
+#include "../../Memory/MemoryMonitor.h"
+#include "../../Memory/HollowingDetector.h"
+#include "../../Memory/SectionTracker.h"
 
 //
 // Forward declarations for undocumented but exported ntoskrnl APIs
@@ -2250,6 +2253,82 @@ Arguments:
     if (ProcessId != NULL && AbdIsActive()) {
         ABD_DETECTION abdDetection;
         AbdScanProcess(ProcessId, &abdDetection);
+    }
+
+    //
+    // === Process Hollowing Detection (T1055.012) ===
+    // For user-mode process images, run the HollowingDetector at creation time.
+    // PhAnalyzeAtCreation compares the loaded image against its on-disk backing
+    // file, checks entry point validity, and detects doppelganging/ghosting.
+    // PASSIVE_LEVEL required — PsLoadImageNotifyRoutine runs at PASSIVE_LEVEL.
+    //
+    if (ProcessId != NULL && event->ProcessId != 0 &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL) {
+
+        PPH_DETECTOR phDetector = MmMonitorGetHollowingDetector();
+        if (phDetector != NULL) {
+            PEPROCESS targetProcess = NULL;
+            NTSTATUS phLookup = PsLookupProcessByProcessId(ProcessId, &targetProcess);
+
+            if (NT_SUCCESS(phLookup)) {
+                PPH_ANALYSIS_RESULT phResult = NULL;
+                NTSTATUS phStatus = PhAnalyzeAtCreation(
+                    phDetector,
+                    ProcessId,
+                    PsGetProcessInheritedFromUniqueProcessId(targetProcess),
+                    targetProcess,
+                    &phResult
+                );
+
+                if (NT_SUCCESS(phStatus) && phResult != NULL) {
+                    if (phResult->HollowingDetected) {
+                        event->SuspiciousReasons |= ImgSuspicious_KnownMalware;
+                        event->ThreatScore += phResult->SeverityScore;
+
+                        BeEngineSubmitEvent(
+                            BehaviorEvent_ProcessHollowing,
+                            BehaviorCategory_CodeInjection,
+                            HandleToULong(ProcessId),
+                            NULL,
+                            0,
+                            phResult->ConfidenceScore,
+                            (phResult->ConfidenceScore >= 80),
+                            NULL
+                        );
+                    }
+                    PhFreeResult(phResult);
+                }
+                ObDereferenceObject(targetProcess);
+            }
+        }
+
+        //
+        // === Memory Monitor Hollowing Check (T1055.012) ===
+        // Secondary hollowing detection via MemoryMonitor's internal heuristics
+        // (PEB/image-base mismatch, section characteristics anomalies).
+        //
+        {
+            HOLLOWING_DETECTION_EVENT hollowEvent;
+            RtlZeroMemory(&hollowEvent, sizeof(hollowEvent));
+
+            if (MmMonitorDetectHollowing(HandleToULong(ProcessId), &hollowEvent)) {
+                if (!(event->SuspiciousReasons & ImgSuspicious_KnownMalware)) {
+                    event->SuspiciousReasons |= ImgSuspicious_KnownMalware;
+                    event->ThreatScore += 60;
+
+                    BeEngineSubmitEvent(
+                        BehaviorEvent_ProcessHollowing,
+                        BehaviorCategory_CodeInjection,
+                        HandleToULong(ProcessId),
+                        NULL,
+                        0,
+                        60,
+                        FALSE,
+                        NULL
+                    );
+                }
+            }
+        }
     }
 
     //

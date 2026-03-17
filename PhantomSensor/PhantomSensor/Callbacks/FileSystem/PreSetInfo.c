@@ -1453,6 +1453,17 @@ AllowOperation:
         return FLT_PREOP_COMPLETE;
     }
 
+    //
+    // For rename/delete operations that were NOT blocked, request post-op
+    // callback to send user-mode notifications about the completed change.
+    //
+    if (infoClass == FileDispositionInformation ||
+        infoClass == FileDispositionInformationEx ||
+        infoClass == FileRenameInformation ||
+        infoClass == FileRenameInformationEx) {
+        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+    }
+
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 

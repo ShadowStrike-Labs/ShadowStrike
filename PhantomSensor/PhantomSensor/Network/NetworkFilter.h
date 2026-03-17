@@ -165,6 +165,7 @@ typedef struct _NF_CONNECTION_ENTRY {
 #define NF_CONN_FLAG_TLS_INSPECTED        0x00000040
 #define NF_CONN_FLAG_DNS_OVER_HTTPS       0x00000080
 #define NF_CONN_FLAG_FIRST_CONTACT        0x00000100
+#define NF_CONN_FLAG_STATE_ESTABLISHED    0x00000200
 
 // ============================================================================
 // DNS TRACKING

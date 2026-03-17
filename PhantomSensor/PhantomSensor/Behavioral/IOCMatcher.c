@@ -1543,13 +1543,31 @@ IomMatch(
             }
 
             //
-            // Pattern matching
+            // Type-specific matching (same dispatch as hash-bucket path)
             //
-            matched = IompMatchWildcard(
-                ioc->Value, ioc->ValueLength,
-                Value, ValueLength,
-                ioc->CaseSensitive
-            );
+            switch (Type) {
+                case IomType_Domain:
+                    matched = IompMatchDomain(
+                        ioc->Value, ioc->ValueLength,
+                        Value, ValueLength
+                    );
+                    break;
+
+                case IomType_IPAddress:
+                    matched = IompMatchIPAddress(
+                        ioc->Value, ioc->ValueLength,
+                        Value, ValueLength
+                    );
+                    break;
+
+                default:
+                    matched = IompMatchWildcard(
+                        ioc->Value, ioc->ValueLength,
+                        Value, ValueLength,
+                        ioc->CaseSensitive
+                    );
+                    break;
+            }
 
             if (matched) {
                 IompPopulateMatchResult(ioc, Value, ValueLength, PsGetCurrentProcessId(), Result);
@@ -2564,10 +2582,12 @@ IompNotifyCallback(
     PVOID context = NULL;
 
     //
-    // Read callback registration under shared lock to prevent use-after-free.
-    // IomRegisterCallback swaps and frees the old registration — without the
-    // lock, the pointer could be freed between our read and invocation.
+    // Read and invoke callback under shared lock to prevent use-after-free.
+    // IomRegisterCallback swaps and frees the old registration under
+    // exclusive lock — releasing shared lock before invocation would allow
+    // the registration (and its Context) to be freed mid-call.
     //
+    KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Matcher->CallbackLock);
 
     reg = Matcher->CallbackReg;
@@ -2576,15 +2596,12 @@ IompNotifyCallback(
         context = reg->Context;
     }
 
-    ExReleasePushLockShared(&Matcher->CallbackLock);
-
-    //
-    // Invoke callback outside lock (safe — reg stays valid because
-    // IomRegisterCallback holds CallbackLock exclusive during swap)
-    //
     if (callback != NULL) {
         callback(Result, context);
     }
+
+    ExReleasePushLockShared(&Matcher->CallbackLock);
+    KeLeaveCriticalRegion();
 }
 
 static VOID

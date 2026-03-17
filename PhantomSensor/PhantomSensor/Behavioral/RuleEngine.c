@@ -1896,11 +1896,22 @@ RepEvaluateCondition(
     case ReCondition_FileHash:
         if (Context->FileHash != NULL &&
             Context->FileHashLength == RE_SHA256_HASH_SIZE) {
-            result = (RtlCompareMemory(
+
+            BOOLEAN hashMatch = (RtlCompareMemory(
                 Condition->Data.FileHash.Hash,
                 Context->FileHash,
                 RE_SHA256_HASH_SIZE
             ) == RE_SHA256_HASH_SIZE);
+
+            switch (Condition->Operator) {
+            case ReOp_NotEquals:
+                result = !hashMatch;
+                break;
+            case ReOp_Equals:
+            default:
+                result = hashMatch;
+                break;
+            }
         }
         break;
 
@@ -1973,7 +1984,22 @@ RepEvaluateCondition(
         break;
 
     case ReCondition_BehaviorFlag:
-        result = (Context->BehaviorFlags & Condition->Data.Numeric.Value) != 0;
+        {
+            BOOLEAN hasFlag = (Context->BehaviorFlags & Condition->Data.Numeric.Value) != 0;
+
+            switch (Condition->Operator) {
+            case ReOp_Equals:
+                result = ((Context->BehaviorFlags & Condition->Data.Numeric.Value) ==
+                          Condition->Data.Numeric.Value);
+                break;
+            case ReOp_NotEquals:
+                result = !hasFlag;
+                break;
+            default:
+                result = hasFlag;
+                break;
+            }
+        }
         break;
 
     case ReCondition_TimeOfDay:

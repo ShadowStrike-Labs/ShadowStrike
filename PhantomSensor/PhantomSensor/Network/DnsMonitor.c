@@ -65,6 +65,7 @@ Performance Characteristics:
 #include "../Core/DriverEntry.h"
 #include "../Sync/TimerManager.h"
 #include "NetworkReputation.h"
+#include "NetworkFilter.h"
 #include "C2Detection.h"
 #include <ntstrsafe.h>
 #include "../../Shared/BehaviorTypes.h"
@@ -1334,6 +1335,36 @@ DnsProcessQuery(
                 query->SuspicionFlags |= DnsSuspicion_KnownBad;
                 query->SuspicionScore += 60;
                 InterlockedIncrement64(&Monitor->Stats.SuspiciousQueries);
+            }
+        }
+    }
+
+    //
+    // === Domain Reputation Check ===
+    // Query the NetworkReputation database for domain-level threat intelligence.
+    // NrLookupDomain operates at APC_LEVEL max — DnsProcessQuery runs paged.
+    //
+    {
+        PNR_MANAGER repManager = NfFilterGetReputationManager();
+
+        if (repManager != NULL) {
+            NR_LOOKUP_RESULT repResult;
+            RtlZeroMemory(&repResult, sizeof(repResult));
+
+            NTSTATUS repStatus = NrLookupDomain(
+                repManager,
+                query->DomainName,
+                &repResult
+            );
+
+            if (NT_SUCCESS(repStatus) && repResult.Found) {
+                if (repResult.Reputation == NrReputation_Malicious ||
+                    repResult.Reputation == NrReputation_Blacklisted) {
+                    query->SuspicionFlags |= DnsSuspicion_KnownBad;
+                    query->SuspicionScore += 50;
+                } else if (repResult.Reputation == NrReputation_High) {
+                    query->SuspicionScore += 25;
+                }
             }
         }
     }

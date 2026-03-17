@@ -329,6 +329,10 @@ typedef struct _BEHAVIOR_ENGINE_GLOBALS {
     BOOLEAN Enabled;
     UINT16 Reserved1;
     
+    // Rundown protection — prevents shutdown from freeing resources
+    // while in-flight operations are still using them
+    EX_RUNDOWN_REF RundownRef;
+    
     // Configuration
     UINT32 ChainTimeoutMs;
     UINT32 MaxActiveChains;

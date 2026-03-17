@@ -2028,10 +2028,70 @@ NfFlowDeleteNotify(
         InterlockedExchange((LONG*)&connection->State, (LONG)ConnectionState_Closed);
 
         //
+        // === Beaconing Detection on Connection Close (T1071/T1573) ===
+        // Analyze the completed connection's send-interval pattern for
+        // periodic beaconing behavior. This is the ideal time — the full
+        // timing history is available and no further data will arrive.
+        //
+        {
+            BEACONING_DATA beaconData;
+            RtlZeroMemory(&beaconData, sizeof(beaconData));
+
+            if (NfFilterDetectBeaconing(connection->ConnectionId, &beaconData)) {
+                InterlockedOr(
+                    (LONG*)&connection->Flags,
+                    NF_CONN_FLAG_BEACONING);
+
+                BeEngineSubmitEvent(
+                    BehaviorEvent_C2Communication,
+                    BehaviorCategory_NetworkOperation,
+                    connection->ProcessId,
+                    NULL,
+                    0,
+                    75,
+                    FALSE,
+                    NULL
+                );
+
+                InterlockedIncrement64(&g_NfState.TotalC2Detections);
+            }
+        }
+
+        //
+        // === Exfiltration Detection on Connection Close (T1041) ===
+        // Check final send/receive ratio for asymmetric data transfer
+        // indicative of data exfiltration.
+        //
+        {
+            NETWORK_EXFIL_EVENT exfilEvent;
+            RtlZeroMemory(&exfilEvent, sizeof(exfilEvent));
+
+            if (NfFilterDetectExfiltration(connection->ConnectionId, &exfilEvent)) {
+                BeEngineSubmitEvent(
+                    BehaviorEvent_DataExfiltration,
+                    BehaviorCategory_NetworkOperation,
+                    connection->ProcessId,
+                    NULL,
+                    0,
+                    65,
+                    FALSE,
+                    NULL
+                );
+            }
+        }
+
+        //
         // Transition connection in ConnectionTracker to Closed.
         // Uses WFP FlowId which was stored at NfpCreateAndInsertConnection time.
+        // Update state to Closed before removing — allows ConnectionTracker
+        // to record final state for forensics/telemetry before cleanup.
         //
         if (g_ConnectionTracker != NULL && connection->FlowId != 0) {
+            (VOID)CtUpdateConnectionState(
+                g_ConnectionTracker,
+                connection->FlowId,
+                CtState_Closed
+            );
             CtRemoveConnection(g_ConnectionTracker, connection->FlowId);
         }
 
@@ -3551,6 +3611,46 @@ NfpCreateAndInsertConnection(
             IsV6,
             NULL
         );
+
+        //
+        // C2 destination analysis (T1071/T1573) — analyze the remote endpoint
+        // for known C2 patterns, IOC matches, and behavioral indicators.
+        // C2AnalyzeDestination aggregates beaconing, reputation, IOC, and JA3
+        // data to produce a composite C2 confidence score.
+        //
+        {
+            PC2_DETECTION_RESULT c2Result = NULL;
+            NTSTATUS c2Status = C2AnalyzeDestination(
+                g_C2Detector,
+                remoteAddr,
+                remotePort,
+                IsV6,
+                &c2Result
+            );
+
+            if (NT_SUCCESS(c2Status) && c2Result != NULL) {
+                if (c2Result->C2Detected) {
+                    InterlockedOr(
+                        (LONG*)&connection->Flags,
+                        NF_CONN_FLAG_C2_SUSPECT);
+                    connection->ThreatScore = max(
+                        connection->ThreatScore,
+                        c2Result->SeverityScore);
+
+                    BeEngineSubmitEvent(
+                        BehaviorEvent_C2Communication,
+                        BehaviorCategory_NetworkOperation,
+                        connection->ProcessId,
+                        NULL,
+                        0,
+                        c2Result->ConfidenceScore,
+                        (c2Result->ConfidenceScore >= 80),
+                        NULL
+                    );
+                }
+                C2FreeResult(c2Result);
+            }
+        }
     }
 
     //
@@ -3569,6 +3669,41 @@ NfpCreateAndInsertConnection(
             (protocol == IPPROTO_TCP) ? SSPS_TCP_FLAG_SYN : 0,
             TRUE
         );
+
+        //
+        // Port scan detection (T1046) — check if this process has accumulated
+        // enough connection attempts to trigger port scan detection.
+        // SsPsCheckForScan returns a detection result when the scanner
+        // determines that the process is conducting network reconnaissance.
+        //
+        {
+            PSSPS_DETECTION_RESULT psResult = NULL;
+            NTSTATUS psStatus = SsPsCheckForScan(
+                g_PortScanner,
+                (HANDLE)(ULONG_PTR)processId,
+                processCreateTime,
+                &psResult
+            );
+
+            if (NT_SUCCESS(psStatus) && psResult != NULL) {
+                InterlockedOr(
+                    (LONG*)&connection->Flags,
+                    NF_CONN_FLAG_SUSPICIOUS);
+
+                BeEngineSubmitEvent(
+                    BehaviorEvent_PortScanning,
+                    BehaviorCategory_NetworkOperation,
+                    connection->ProcessId,
+                    NULL,
+                    0,
+                    70,
+                    FALSE,
+                    NULL
+                );
+
+                SsPsFreeResult(psResult);
+            }
+        }
     }
 
     if (InterlockedCompareExchange((LONG*)&connection->Flags, 0, 0) & NF_CONN_FLAG_BLOCKED) {
@@ -4238,6 +4373,40 @@ NfpProcessStreamData(
                             isV6,
                             &ja3fp);
 
+                        //
+                        // JA3 known-bad check (T1573) — compare the computed
+                        // JA3 hash against the SSL inspector's blocklist of
+                        // known malware/C2 JA3 fingerprints.
+                        //
+                        {
+                            BOOLEAN isBadJA3 = FALSE;
+                            CHAR malwareFamily[64] = {0};
+                            NTSTATUS ja3Status = SslCheckJA3(
+                                g_SslInspector,
+                                ja3fp.JA3Hash,
+                                &isBadJA3,
+                                malwareFamily,
+                                sizeof(malwareFamily)
+                            );
+
+                            if (NT_SUCCESS(ja3Status) && isBadJA3) {
+                                InterlockedOr(
+                                    (LONG*)&connection->Flags,
+                                    NF_CONN_FLAG_C2_SUSPECT | NF_CONN_FLAG_SUSPICIOUS);
+
+                                BeEngineSubmitEvent(
+                                    BehaviorEvent_C2Communication,
+                                    BehaviorCategory_NetworkOperation,
+                                    connection->ProcessId,
+                                    NULL,
+                                    0,
+                                    85,
+                                    TRUE,
+                                    NULL
+                                );
+                            }
+                        }
+
                         connection->TlsHandshakeComplete = TRUE;
                         SslFreeSessionInfo(sessionInfo);
                     }
@@ -4320,6 +4489,75 @@ NfpProcessStreamData(
         }
     }
 
+    //
+    // NET-PP: Parse HTTP responses on inbound (receive) data for C2 response
+    // fingerprinting (T1071.001). Detect suspicious Server headers, unusual
+    // content types, and C2 framework response patterns.
+    // PpParseHTTPResponse requires PASSIVE_LEVEL and allocates from PagedPool.
+    //
+    if (g_ProtocolParser != NULL && dataSize >= 12 && dataSize <= 65536 &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL &&
+        !connection->TlsHandshakeComplete) {
+
+        PVOID respData = NULL;
+        BOOLEAN respAllocated = FALSE;
+        UCHAR respLocalBuf[2048];
+        SIZE_T respCopied = 0;
+
+        if (dataSize <= sizeof(respLocalBuf)) {
+            FwpsCopyStreamDataToBuffer0(
+                StreamPacket->streamData, respLocalBuf, sizeof(respLocalBuf), &respCopied);
+            if (respCopied >= 12) {
+                respData = respLocalBuf;
+            }
+        } else if (dataSize <= 32768) {
+            respData = ExAllocatePool2(POOL_FLAG_PAGED, (SIZE_T)dataSize, 'pRfN');
+            if (respData != NULL) {
+                FwpsCopyStreamDataToBuffer0(
+                    StreamPacket->streamData, respData, (SIZE_T)dataSize, &respCopied);
+                respAllocated = TRUE;
+                if (respCopied < 12) {
+                    ExFreePoolWithTag(respData, 'pRfN');
+                    respData = NULL;
+                    respAllocated = FALSE;
+                }
+            }
+        }
+
+        //
+        // Check for "HTTP/" prefix before parsing — avoid wasting cycles
+        // on binary protocols.
+        //
+        if (respData != NULL && respCopied >= 5 &&
+            ((PUCHAR)respData)[0] == 'H' &&
+            ((PUCHAR)respData)[1] == 'T' &&
+            ((PUCHAR)respData)[2] == 'T' &&
+            ((PUCHAR)respData)[3] == 'P' &&
+            ((PUCHAR)respData)[4] == '/') {
+
+            PPP_HTTP_RESPONSE httpResponse = NULL;
+            NTSTATUS parseStatus = PpParseHTTPResponse(
+                g_ProtocolParser,
+                respData,
+                (ULONG)respCopied,
+                &httpResponse
+            );
+
+            if (NT_SUCCESS(parseStatus) && httpResponse != NULL) {
+                //
+                // HTTP response successfully parsed — enrichment data available.
+                // Future: analyze Server header, Content-Type, response timing
+                // for C2 framework fingerprinting.
+                //
+                PpFreeHTTPResponse(httpResponse);
+            }
+        }
+
+        if (respAllocated && respData != NULL) {
+            ExFreePoolWithTag(respData, 'pRfN');
+        }
+    }
+
     InterlockedAdd64(&g_NfState.TotalBytesMonitored, (LONG64)dataSize);
 
     //
@@ -4336,6 +4574,22 @@ NfpProcessStreamData(
             isSend ? 1 : 0,
             isSend ? 0 : 1
         );
+
+        //
+        // NET-CT: Transition connection to Established on first data flow.
+        // CAS-style: only transitions from New/Connected → Established.
+        // CtUpdateConnectionState internally ignores invalid transitions.
+        //
+        if (!(connection->Flags & NF_CONN_FLAG_STATE_ESTABLISHED)) {
+            NTSTATUS ctStateStatus = CtUpdateConnectionState(
+                g_ConnectionTracker,
+                connection->FlowId,
+                CtState_Established
+            );
+            if (NT_SUCCESS(ctStateStatus)) {
+                InterlockedOr((LONG*)&connection->Flags, NF_CONN_FLAG_STATE_ESTABLISHED);
+            }
+        }
     }
 
     //

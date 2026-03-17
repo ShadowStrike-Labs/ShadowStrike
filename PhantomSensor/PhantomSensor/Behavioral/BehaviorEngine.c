@@ -93,6 +93,7 @@
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
 #include "../Callbacks/FileSystem/FileBackupEngine.h"
+#include "../ETW/ETWProvider.h"
 #include <ntstrsafe.h>
 
 //
@@ -573,6 +574,9 @@ BepGetProcessName(
 // Forward declaration for pattern match callback (defined after BepProcessSingleEvent)
 static VOID BepPatternMatchCallback(_In_ PPM_PATTERN, _In_ PPM_MATCH_STATE, _In_opt_ PVOID);
 
+// Forward declaration for attack chain alert callback
+static VOID BepAttackChainCallback(_In_ PACT_ATTACK_CHAIN, _In_ PACT_CHAIN_EVENT, _In_opt_ PVOID);
+
 /**
  * @brief Initialize the behavioral engine.
  *
@@ -605,6 +609,11 @@ BeEngineInitialize(
     }
 
     RtlZeroMemory(&g_BeState, sizeof(BEHAVIOR_ENGINE_GLOBALS));
+
+    //
+    // Initialize rundown protection for safe shutdown drain
+    //
+    ExInitializeRundownProtection(&g_BeState.RundownRef);
 
     //
     // Initialize hash tables
@@ -751,6 +760,12 @@ BeEngineInitialize(
                        "[ShadowStrike:BehaviorEngine] AttackChainTracker init failed: 0x%08X\n",
                        childStatus);
             g_AttackChainTracker = NULL;
+        } else {
+            //
+            // Register callback — routes chain alerts into BehaviorEngine
+            // stats, logging, and (future) user-mode notification.
+            //
+            (VOID)ActRegisterCallback(g_AttackChainTracker, BepAttackChainCallback, NULL);
         }
     }
 
@@ -918,6 +933,14 @@ BeEngineShutdown(
     }
 
     //
+    // Wait for all in-flight operations to complete before freeing resources.
+    // ExWaitForRundownProtectionRelease blocks until all ExAcquireRundownProtection
+    // callers have called ExReleaseRundownProtection. After this returns,
+    // no new acquisitions can succeed (they return FALSE).
+    //
+    ExWaitForRundownProtectionRelease(&g_BeState.RundownRef);
+
+    //
     // Free all pending events
     //
     {
@@ -938,8 +961,16 @@ BeEngineShutdown(
     }
 
     //
+    // CRITICAL: Clean hash tables FIRST to prevent any in-flight lookups
+    // from finding objects we're about to free. After this, no new refs
+    // can be acquired via BeEngineGetChain/BeEngineGetProcessContext.
+    //
+    BepCleanupHashTables();
+
+    //
     // Free all attack chains
     //
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_BeState.ChainLock, TRUE);
 
     while (!IsListEmpty(&g_BeState.ActiveChainList)) {
@@ -960,10 +991,12 @@ BeEngineShutdown(
     }
 
     ExReleaseResourceLite(&g_BeState.ChainLock);
+    KeLeaveCriticalRegion();
 
     //
     // Free all process contexts
     //
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
 
     while (!IsListEmpty(&g_BeState.ProcessContextList)) {
@@ -974,6 +1007,7 @@ BeEngineShutdown(
     }
 
     ExReleaseResourceLite(&g_BeState.ProcessLock);
+    KeLeaveCriticalRegion();
 
     //
     // Shutdown child subsystems (reverse init order)
@@ -1009,13 +1043,12 @@ BeEngineShutdown(
     }
 
     //
-    // Cleanup resources
+    // Cleanup resources (hash tables already cleaned above before frees)
     //
     ExDeleteResourceLite(&g_BeState.ChainLock);
     ExDeleteResourceLite(&g_BeState.ProcessLock);
     ExDeleteResourceLite(&g_BeState.RuleLock);
 
-    BepCleanupHashTables();
     BepCleanupLookasideLists();
 
     //
@@ -1080,21 +1113,27 @@ BeEngineSubmitEvent(
     }
 
     //
+    // Acquire rundown protection — prevents shutdown from freeing resources
+    // while this operation is in-flight. Returns FALSE if shutdown is draining.
+    //
+    if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
+        if (Response != NULL) {
+            *Response = BehaviorResponse_Allow;
+        }
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
     // CRITICAL IRQL CHECK: Blocking events require synchronous processing
     // which calls functions that acquire ERESOURCE locks. These locks
     // can only be acquired at IRQL <= APC_LEVEL. Reject blocking requests
     // at DISPATCH_LEVEL to prevent BSOD.
     //
     if (IsBlocking && KeGetCurrentIrql() > APC_LEVEL) {
-        //
-        // Cannot process blocking event at elevated IRQL.
-        // Caller must either:
-        // 1. Call at PASSIVE_LEVEL/APC_LEVEL, or
-        // 2. Use non-blocking mode (IsBlocking = FALSE)
-        //
         if (Response != NULL) {
             *Response = BehaviorResponse_Allow;
         }
+        ExReleaseRundownProtection(&g_BeState.RundownRef);
         return STATUS_INVALID_DEVICE_STATE;
     }
 
@@ -1106,6 +1145,7 @@ BeEngineSubmitEvent(
         if (Response != NULL) {
             *Response = BehaviorResponse_Allow;
         }
+        ExReleaseRundownProtection(&g_BeState.RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1130,6 +1170,7 @@ BeEngineSubmitEvent(
         if (Response != NULL) {
             *Response = BehaviorResponse_Allow;
         }
+        ExReleaseRundownProtection(&g_BeState.RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1186,6 +1227,7 @@ BeEngineSubmitEvent(
         }
 
         BepFreeEvent(event);
+        ExReleaseRundownProtection(&g_BeState.RundownRef);
         return status;
     }
 
@@ -1206,6 +1248,7 @@ BeEngineSubmitEvent(
         *Response = BehaviorResponse_Allow;
     }
 
+    ExReleaseRundownProtection(&g_BeState.RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1428,7 +1471,31 @@ BeEngineGetChain(
         hashEntry = CONTAINING_RECORD(entry, BE_CHAIN_HASH_ENTRY, HashListEntry);
 
         if (hashEntry->Chain->ChainId == ChainId) {
-            InterlockedIncrement(&hashEntry->Chain->RefCount);
+            //
+            // Try-acquire reference: only increment if RefCount > 0.
+            // If RefCount is 0, the chain is being freed — skip it.
+            //
+            {
+                LONG oldRef;
+                BOOLEAN acquired = FALSE;
+
+                do {
+                    oldRef = ReadNoFence(&hashEntry->Chain->RefCount);
+                    if (oldRef <= 0) {
+                        break;
+                    }
+                    if (InterlockedCompareExchange(&hashEntry->Chain->RefCount,
+                                                   oldRef + 1, oldRef) == oldRef) {
+                        acquired = TRUE;
+                        break;
+                    }
+                } while (TRUE);
+
+                if (!acquired) {
+                    continue;
+                }
+            }
+
             *Chain = hashEntry->Chain;
             status = STATUS_SUCCESS;
             break;
@@ -1482,6 +1549,7 @@ BeEngineGetProcessChains(
     // context's implicit ownership, but we need to ensure the chains
     // themselves aren't freed while we're referencing them.
     //
+    KeEnterCriticalRegion();
     ExAcquireResourceSharedLite(&g_BeState.ProcessLock, TRUE);
 
     for (entry = context->ChainList.Flink;
@@ -1519,6 +1587,7 @@ BeEngineGetProcessChains(
     }
 
     ExReleaseResourceLite(&g_BeState.ProcessLock);
+    KeLeaveCriticalRegion();
 
     *ChainCount = count;
     BeEngineReleaseProcessContext(context);
@@ -1574,10 +1643,12 @@ BeEngineReleaseChain(
             //
             // Remove from active chain list (main list)
             //
+            KeEnterCriticalRegion();
             ExAcquireResourceExclusiveLite(&g_BeState.ChainLock, TRUE);
             RemoveEntryList(&Chain->ListEntry);
             g_BeState.ActiveChainCount--;
             ExReleaseResourceLite(&g_BeState.ChainLock);
+            KeLeaveCriticalRegion();
 
             //
             // Remove from hash table
@@ -1587,9 +1658,11 @@ BeEngineReleaseChain(
             //
             // Remove from process context's chain list
             //
+            KeEnterCriticalRegion();
             ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
             RemoveEntryList(&Chain->ProcessListEntry);
             ExReleaseResourceLite(&g_BeState.ProcessLock);
+            KeLeaveCriticalRegion();
 
             //
             // Free all chain entries
@@ -1931,7 +2004,31 @@ BeEngineGetProcessContext(
         hashEntry = CONTAINING_RECORD(entry, BE_PROCESS_HASH_ENTRY, HashListEntry);
 
         if (hashEntry->Context->ProcessId == ProcessId) {
-            InterlockedIncrement(&hashEntry->Context->RefCount);
+            //
+            // Try-acquire reference: only increment if RefCount > 0.
+            // If RefCount is 0, the context is being freed — skip it.
+            //
+            {
+                LONG oldRef;
+                BOOLEAN acquired = FALSE;
+
+                do {
+                    oldRef = ReadNoFence(&hashEntry->Context->RefCount);
+                    if (oldRef <= 0) {
+                        break;
+                    }
+                    if (InterlockedCompareExchange(&hashEntry->Context->RefCount,
+                                                   oldRef + 1, oldRef) == oldRef) {
+                        acquired = TRUE;
+                        break;
+                    }
+                } while (TRUE);
+
+                if (!acquired) {
+                    continue;
+                }
+            }
+
             *Context = hashEntry->Context;
             status = STATUS_SUCCESS;
             break;
@@ -1985,10 +2082,12 @@ BeEngineReleaseProcessContext(
             //
             // Remove from main process list
             //
+            KeEnterCriticalRegion();
             ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
             RemoveEntryList(&Context->ListEntry);
             g_BeState.ProcessContextCount--;
             ExReleaseResourceLite(&g_BeState.ProcessLock);
+            KeLeaveCriticalRegion();
 
             //
             // Remove from hash table
@@ -2067,6 +2166,7 @@ BeEngineLoadRules(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_BeState.RuleLock, TRUE);
 
     for (i = 0; i < RuleCount; i++) {
@@ -2103,6 +2203,7 @@ BeEngineLoadRules(
     }
 
     ExReleaseResourceLite(&g_BeState.RuleLock);
+    KeLeaveCriticalRegion();
     return status;
 }
 
@@ -2124,6 +2225,7 @@ BeEngineSetRuleEnabled(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_BeState.RuleLock, TRUE);
 
     for (entry = g_BeState.LoadedRuleList.Flink;
@@ -2148,6 +2250,7 @@ BeEngineSetRuleEnabled(
     }
 
     ExReleaseResourceLite(&g_BeState.RuleLock);
+    KeLeaveCriticalRegion();
     return status;
 }
 
@@ -2174,6 +2277,7 @@ BeEngineGetRuleStats(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    KeEnterCriticalRegion();
     ExAcquireResourceSharedLite(&g_BeState.RuleLock, TRUE);
 
     for (entry = g_BeState.LoadedRuleList.Flink;
@@ -2191,6 +2295,7 @@ BeEngineGetRuleStats(
     }
 
     ExReleaseResourceLite(&g_BeState.RuleLock);
+    KeLeaveCriticalRegion();
     return status;
 }
 
@@ -2700,6 +2805,36 @@ BepPatternMatchCallback(
 }
 
 /**
+ * @brief Callback for AttackChainTracker chain alerts.
+ *
+ * Called when a new event is correlated into an attack chain. Updates
+ * global detection stats and logs the chain progression.
+ */
+static VOID
+BepAttackChainCallback(
+    _In_ PACT_ATTACK_CHAIN Chain,
+    _In_ PACT_CHAIN_EVENT NewEvent,
+    _In_opt_ PVOID Context
+    )
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    if (Chain == NULL || NewEvent == NULL) {
+        return;
+    }
+
+    InterlockedIncrement64(&g_BeState.TotalThreatsDetected);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[ShadowStrike:BehaviorEngine] ChainAlert: PID=%p "
+        "events=%ld score=%lu confirmed=%s\n",
+        Chain->RootProcessId,
+        Chain->EventCount,
+        Chain->ConfidenceScore,
+        Chain->IsConfirmedAttack ? "YES" : "no");
+}
+
+/**
  * @brief Process a single event.
  */
 static NTSTATUS
@@ -2927,6 +3062,89 @@ BepProcessSingleEvent(
     //
     if (threatScore >= g_BeState.HighThreatThreshold) {
         InterlockedIncrement64(&g_BeState.TotalThreatsDetected);
+    }
+
+    //
+    // === ETW Telemetry Emission ===
+    // Emit behavioral detection events via ETW for SIEM consumers, Windows
+    // Event Log, and real-time diagnostics. This is the SINGLE telemetry
+    // funnel — every behavioral event that passes through BepProcessSingleEvent
+    // gets ETW visibility.
+    //
+    // Two emission paths:
+    // 1. ETW_LOG_BEHAVIOR: Every processed event (informational+detection)
+    // 2. ETW_LOG_SECURITY: High-threat events that crossed the alert threshold
+    //
+    // IRQL: PASSIVE_LEVEL (worker thread) — EtwWrite requires <= DISPATCH_LEVEL.
+    //
+    {
+        WCHAR etwDescription[128];
+        NTSTATUS etwFmtStatus;
+
+        //
+        // Format a bounded description for the ETW event.
+        // Use process image path truncated to last component if available.
+        //
+        etwFmtStatus = RtlStringCchPrintfW(
+            etwDescription,
+            RTL_NUMBER_OF(etwDescription),
+            L"Score=%u Flags=0x%08X",
+            threatScore,
+            processContext->Flags
+        );
+        if (!NT_SUCCESS(etwFmtStatus)) {
+            etwDescription[0] = L'\0';
+        }
+
+        //
+        // Emit behavioral event for all processed events
+        //
+        ETW_LOG_BEHAVIOR(
+            EtwEventId_BehaviorAlert,
+            Event->ProcessId,
+            (UINT32)Event->EventType,
+            (UINT32)Event->Category,
+            Event->CorrelationId.SequenceNumber,
+            Event->MitreAttackId,
+            (UINT32)0,
+            threatScore,
+            (threatScore > 100) ? 100 : threatScore,
+            etwDescription
+        );
+
+        //
+        // Emit security alert for high-threat events (SIEM critical path)
+        //
+        if (threatScore >= g_BeState.HighThreatThreshold) {
+            WCHAR alertTitle[64];
+            PCWSTR procPath = processContext->ImagePath;
+            UINT32 responseAction = 0;
+
+            if (Event->Flags & BE_EVENT_FLAG_BLOCKING) {
+                responseAction = 1;
+            }
+
+            (VOID)RtlStringCchPrintfW(
+                alertTitle,
+                RTL_NUMBER_OF(alertTitle),
+                L"Threat T%04X PID %u",
+                Event->MitreAttackId,
+                Event->ProcessId
+            );
+
+            ETW_LOG_SECURITY(
+                (UINT32)EtwEventId_TamperAttempt + (UINT32)(Event->Category & 0x0F),
+                (threatScore >= g_BeState.CriticalThreshold) ? 1u : 2u,
+                Event->ProcessId,
+                Event->CorrelationId.SequenceNumber,
+                alertTitle,
+                etwDescription,
+                procPath,
+                NULL,
+                threatScore,
+                responseAction
+            );
+        }
     }
 
     Event->Flags |= BE_EVENT_FLAG_PROCESSED;
@@ -3164,10 +3382,12 @@ BepInsertProcessContext(
     //
     // Insert into main list
     //
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
     InsertTailList(&g_BeState.ProcessContextList, &Context->ListEntry);
     g_BeState.ProcessContextCount++;
     ExReleaseResourceLite(&g_BeState.ProcessLock);
+    KeLeaveCriticalRegion();
 
     //
     // Insert into hash
@@ -3194,10 +3414,12 @@ BepRemoveProcessContext(
     //
     // Remove from main list
     //
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
     RemoveEntryList(&Context->ListEntry);
     g_BeState.ProcessContextCount--;
     ExReleaseResourceLite(&g_BeState.ProcessLock);
+    KeLeaveCriticalRegion();
 
     //
     // Remove from hash
@@ -3323,10 +3545,12 @@ BepGetOrCreateProcessContext(
     //
     // Insert into main list (separate lock, follows lock hierarchy)
     //
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
     InsertTailList(&g_BeState.ProcessContextList, &newContext->ListEntry);
     g_BeState.ProcessContextCount++;
     ExReleaseResourceLite(&g_BeState.ProcessLock);
+    KeLeaveCriticalRegion();
 
     *Context = newContext;
     return STATUS_SUCCESS;
@@ -3359,10 +3583,12 @@ BepInsertChain(
     //
     // Insert into main list
     //
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_BeState.ChainLock, TRUE);
     InsertTailList(&g_BeState.ActiveChainList, &Chain->ListEntry);
     g_BeState.ActiveChainCount++;
     ExReleaseResourceLite(&g_BeState.ChainLock);
+    KeLeaveCriticalRegion();
 
     //
     // Insert into hash
@@ -3468,10 +3694,12 @@ BepRemoveChain(
     //
     // Remove from main list
     //
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_BeState.ChainLock, TRUE);
     RemoveEntryList(&Chain->ListEntry);
     g_BeState.ActiveChainCount--;
     ExReleaseResourceLite(&g_BeState.ChainLock);
+    KeLeaveCriticalRegion();
 
     //
     // Remove from hash
@@ -3536,6 +3764,7 @@ BepGetOrCreateChain(
     // CRITICAL: Hold ProcessLock while checking and modifying chain list
     // to prevent TOCTOU race where two threads create chains for same process.
     //
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
 
     //
@@ -3553,6 +3782,7 @@ BepGetOrCreateChain(
         //
         if (InterlockedIncrement(&(*Chain)->RefCount) > 1) {
             ExReleaseResourceLite(&g_BeState.ProcessLock);
+            KeLeaveCriticalRegion();
             BeEngineReleaseProcessContext(context);
             return STATUS_SUCCESS;
         } else {
@@ -3569,6 +3799,7 @@ BepGetOrCreateChain(
     //
     if (g_BeState.ActiveChainCount >= g_BeState.MaxActiveChains) {
         ExReleaseResourceLite(&g_BeState.ProcessLock);
+        KeLeaveCriticalRegion();
         BeEngineReleaseProcessContext(context);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -3579,6 +3810,7 @@ BepGetOrCreateChain(
     newChain = BepAllocateChain();
     if (newChain == NULL) {
         ExReleaseResourceLite(&g_BeState.ProcessLock);
+        KeLeaveCriticalRegion();
         BeEngineReleaseProcessContext(context);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -3606,6 +3838,7 @@ BepGetOrCreateChain(
                   sizeof(newChain->PrimaryImagePath));
 
     ExReleaseResourceLite(&g_BeState.ProcessLock);
+    KeLeaveCriticalRegion();
 
     //
     // Insert into chain tracking (separate locks, follows hierarchy)
@@ -3615,10 +3848,12 @@ BepGetOrCreateChain(
         //
         // Remove from process context on failure
         //
+        KeEnterCriticalRegion();
         ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
         RemoveEntryList(&newChain->ProcessListEntry);
         context->ChainCount--;
         ExReleaseResourceLite(&g_BeState.ProcessLock);
+        KeLeaveCriticalRegion();
 
         BepFreeChain(newChain);
         BeEngineReleaseProcessContext(context);
@@ -4032,6 +4267,7 @@ BepCleanupStaleChains(
     KeQuerySystemTime(&currentTime);
     currentTimeMs = (UINT64)(currentTime.QuadPart / 10000);
 
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_BeState.ChainLock, TRUE);
 
     for (entry = g_BeState.ActiveChainList.Flink;
@@ -4059,17 +4295,21 @@ BepCleanupStaleChains(
             BepRemoveChainFromHash(chain);
 
             //
-            // Remove from process context's chain list
+            // Remove from process context's chain list.
+            // KeEnterCriticalRegion nests safely — we already entered above.
             //
+            KeEnterCriticalRegion();
             ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
             RemoveEntryList(&chain->ProcessListEntry);
             ExReleaseResourceLite(&g_BeState.ProcessLock);
+            KeLeaveCriticalRegion();
 
             InsertTailList(&staleList, &chain->ListEntry);
         }
     }
 
     ExReleaseResourceLite(&g_BeState.ChainLock);
+    KeLeaveCriticalRegion();
 
     //
     // Free stale chains — already removed from all lists and hash tables,
@@ -4107,6 +4347,7 @@ BepCleanupStaleProcessContexts(
 
     InitializeListHead(&staleList);
 
+    KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
 
     for (entry = g_BeState.ProcessContextList.Flink;
@@ -4135,6 +4376,7 @@ BepCleanupStaleProcessContexts(
     }
 
     ExReleaseResourceLite(&g_BeState.ProcessLock);
+    KeLeaveCriticalRegion();
 
     //
     // Free stale contexts — already removed from both main list and

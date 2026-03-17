@@ -1192,8 +1192,11 @@ TsRunMaintenancePass(
                 Context->ScoreValid = FALSE;
             } else {
                 //
-                // Apply decay
+                // Apply decay (guard against zero interval)
                 //
+                if (Engine->DecayConfig.DecayIntervalSeconds == 0) {
+                    continue;
+                }
                 DecayIntervals = AgeSeconds / (LONG64)Engine->DecayConfig.DecayIntervalSeconds;
 
                 if (DecayIntervals > 0 && Factor->CurrentScore != 0) {
