@@ -1,0 +1,684 @@
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.063 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 29
+
+Microsoft (R) Windows Debugger Version 10.0.26100.6584 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+
+Loading Dump File [C:\ShadowStrike\ShadowStrike\PhantomSensor\latest_report.dmp]
+Mini Kernel Dump File: Only registers and stack trace are available
+
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+OK                                             C:\ShadowStrike\ShadowStrike\PhantomSensor\x64\Release
+Deferred                                       srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+DBGHELP: Symbol Search Path: c:\shadowstrike\shadowstrike\phantomsensor\x64\release;srv*c:\symbols*https://msdl.microsoft.com/download/symbols
+Symbol search path is: C:\ShadowStrike\ShadowStrike\PhantomSensor\x64\Release;srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+Executable search path is: 
+SYMSRV:  BYINDEX: 0x1
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         ntkrnlmp.exe
+         4473D78D1450000
+SYMSRV:  PATH: c:\symbols\ntkrnlmp.exe\4473D78D1450000\ntkrnlmp.exe
+SYMSRV:  RESULT: 0x00000000
+DBGHELP: c:\symbols\ntkrnlmp.exe\4473D78D1450000\ntkrnlmp.exe - OK
+DBGENG:  c:\symbols\ntkrnlmp.exe\4473D78D1450000\ntkrnlmp.exe - Mapped image memory
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\ntkrnlmp.pdb - file not found
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\exe\ntkrnlmp.pdb - file not found
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\symbols\exe\ntkrnlmp.pdb - file not found
+SYMSRV:  BYINDEX: 0x2
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         ntkrnlmp.pdb
+         24DE61DB3A27C5B383DFF181CB51F7E11
+SYMSRV:  PATH: c:\symbols\ntkrnlmp.pdb\24DE61DB3A27C5B383DFF181CB51F7E11\ntkrnlmp.pdb
+SYMSRV:  RESULT: 0x00000000
+DBGHELP: nt - public symbols  
+        c:\symbols\ntkrnlmp.pdb\24DE61DB3A27C5B383DFF181CB51F7E11\ntkrnlmp.pdb
+Windows 10 Kernel Version 26100 MP (8 procs) Free x64
+Product: WinNt, suite: TerminalServer SingleUserTS Personal
+Kernel base = 0xfffff801`74200000 PsLoadedModuleList = 0xfffff801`750f50c0
+Debug session time: Wed Mar 18 21:04:06.680 2026 (UTC + 3:00)
+System Uptime: 0 days 0:24:48.500
+SYMSRV:  BYINDEX: 0x3
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         ntkrnlmp.exe
+         4473D78D1450000
+SYMSRV:  PATH: c:\symbols\ntkrnlmp.exe\4473D78D1450000\ntkrnlmp.exe
+SYMSRV:  RESULT: 0x00000000
+DBGHELP: c:\symbols\ntkrnlmp.exe\4473D78D1450000\ntkrnlmp.exe - OK
+DBGENG:  c:\symbols\ntkrnlmp.exe\4473D78D1450000\ntkrnlmp.exe - Mapped image memory
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\ntkrnlmp.pdb - file not found
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\exe\ntkrnlmp.pdb - file not found
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\symbols\exe\ntkrnlmp.pdb - file not found
+SYMSRV:  BYINDEX: 0x4
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         ntkrnlmp.pdb
+         24DE61DB3A27C5B383DFF181CB51F7E11
+SYMSRV:  PATH: c:\symbols\ntkrnlmp.pdb\24DE61DB3A27C5B383DFF181CB51F7E11\ntkrnlmp.pdb
+SYMSRV:  RESULT: 0x00000000
+DBGHELP: nt - public symbols  
+        c:\symbols\ntkrnlmp.pdb\24DE61DB3A27C5B383DFF181CB51F7E11\ntkrnlmp.pdb
+Loading Kernel Symbols
+.
+SYMSRV:  BYINDEX: 0x5
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         hal.dll
+         EB9DEAA96000
+SYMSRV:  PATH: c:\symbols\hal.dll\EB9DEAA96000\hal.dll
+SYMSRV:  RESULT: 0x00000000
+DBGHELP: c:\symbols\hal.dll\EB9DEAA96000\hal.dll - OK
+DBGENG:  c:\symbols\hal.dll\EB9DEAA96000\hal.dll - Mapped image memory
+.
+SYMSRV:  BYINDEX: 0x6
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         kdcom.dll
+         7C46E6C1b000
+SYMSRV:  UNC: c:\symbols\kdcom.dll\7C46E6C1b000\kdcom.dll - path not found
+SYMSRV:  UNC: c:\symbols\kdcom.dll\7C46E6C1b000\kdcom.dl_ - path not found
+SYMSRV:  UNC: c:\symbols\kdcom.dll\7C46E6C1b000\file.ptr - path not found
+SYMSRV:  HTTPGET: /download/symbols/index2.txt
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdcom.dll/7C46E6C1b000/kdcom.dll
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdcom.dll/7C46E6C1b000/kdcom.dl_
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdcom.dll/7C46E6C1b000/file.ptr
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  RESULT: 0x80190194
+SYMSRV:  BYINDEX: 0x7
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         kdusb.dll
+         7C46E6C1b000
+SYMSRV:  UNC: c:\symbols\kdusb.dll\7C46E6C1b000\kdusb.dll - path not found
+SYMSRV:  UNC: c:\symbols\kdusb.dll\7C46E6C1b000\kdusb.dl_ - path not found
+SYMSRV:  UNC: c:\symbols\kdusb.dll\7C46E6C1b000\file.ptr - path not found
+SYMSRV:  HTTPGET: /download/symbols/kdusb.dll/7C46E6C1b000/kdusb.dll
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdusb.dll/7C46E6C1b000/kdusb.dl_
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdusb.dll/7C46E6C1b000/file.ptr
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  RESULT: 0x80190194
+SYMSRV:  BYINDEX: 0x8
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         kd1394.dll
+         7C46E6C1b000
+SYMSRV:  UNC: c:\symbols\kd1394.dll\7C46E6C1b000\kd1394.dll - path not found
+SYMSRV:  UNC: c:\symbols\kd1394.dll\7C46E6C1b000\kd1394.dl_ - path not found
+SYMSRV:  UNC: c:\symbols\kd1394.dll\7C46E6C1b000\file.ptr - path not found
+SYMSRV:  HTTPGET: /download/symbols/kd1394.dll/7C46E6C1b000/kd1394.dll
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kd1394.dll/7C46E6C1b000/kd1394.dl_
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kd1394.dll/7C46E6C1b000/file.ptr
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  RESULT: 0x80190194
+SYMSRV:  BYINDEX: 0x9
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         kdnet.dll
+         7C46E6C1b000
+SYMSRV:  UNC: c:\symbols\kdnet.dll\7C46E6C1b000\kdnet.dll - path not found
+SYMSRV:  UNC: c:\symbols\kdnet.dll\7C46E6C1b000\kdnet.dl_ - path not found
+SYMSRV:  UNC: c:\symbols\kdnet.dll\7C46E6C1b000\file.ptr - path not found
+SYMSRV:  HTTPGET: /download/symbols/kdnet.dll/7C46E6C1b000/kdnet.dll
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdnet.dll/7C46E6C1b000/kdnet.dl_
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdnet.dll/7C46E6C1b000/file.ptr
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  RESULT: 0x80190194
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kdcom.dll - file not found
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kdcom.dll - file not found
+DBGHELP: kdcom.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: kdcom.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kdusb.dll - file not found
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kdusb.dll - file not found
+DBGHELP: kdusb.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: kdusb.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kd1394.dll - file not found
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kd1394.dll - file not found
+DBGHELP: kd1394.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: kd1394.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kdnet.dll - file not found
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kdnet.dll - file not found
+DBGHELP: kdnet.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: kdnet.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGENG:  kdcom.dll - Image mapping disallowed by non-local path.
+.............................................................
+................................................................
+......................................
+Loading User Symbols
+
+Loading unloaded module list
+.........
+For analysis of this file, run !analyze -v
+0: kd> DBGHELP: Symbol Search Path: c:\shadowstrike\shadowstrike\phantomsensor\x64\release;srv*c:\symbols*https://msdl.microsoft.com/download/symbols
+Symbol search path is: C:\ShadowStrike\ShadowStrike\PhantomSensor\x64\Release;srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+Expanded Symbol search path is: c:\shadowstrike\shadowstrike\phantomsensor\x64\release;srv*c:\symbols*https://msdl.microsoft.com/download/symbols
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+OK                                             C:\ShadowStrike\ShadowStrike\PhantomSensor\x64\Release
+Deferred                                       srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+0: kd> SYMSRV:  BYINDEX: 0xA
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         ntkrnlmp.exe
+         4473D78D1450000
+SYMSRV:  PATH: c:\symbols\ntkrnlmp.exe\4473D78D1450000\ntkrnlmp.exe
+SYMSRV:  RESULT: 0x00000000
+DBGHELP: c:\symbols\ntkrnlmp.exe\4473D78D1450000\ntkrnlmp.exe - OK
+DBGENG:  c:\symbols\ntkrnlmp.exe\4473D78D1450000\ntkrnlmp.exe - Mapped image memory
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\ntkrnlmp.pdb - file not found
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\exe\ntkrnlmp.pdb - file not found
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\symbols\exe\ntkrnlmp.pdb - file not found
+SYMSRV:  BYINDEX: 0xB
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         ntkrnlmp.pdb
+         24DE61DB3A27C5B383DFF181CB51F7E11
+SYMSRV:  PATH: c:\symbols\ntkrnlmp.pdb\24DE61DB3A27C5B383DFF181CB51F7E11\ntkrnlmp.pdb
+SYMSRV:  RESULT: 0x00000000
+DBGHELP: nt - public symbols  
+        c:\symbols\ntkrnlmp.pdb\24DE61DB3A27C5B383DFF181CB51F7E11\ntkrnlmp.pdb
+Loading Kernel Symbols
+.
+SYMSRV:  BYINDEX: 0xC
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         hal.dll
+         EB9DEAA96000
+SYMSRV:  PATH: c:\symbols\hal.dll\EB9DEAA96000\hal.dll
+SYMSRV:  RESULT: 0x00000000
+DBGHELP: c:\symbols\hal.dll\EB9DEAA96000\hal.dll - OK
+DBGENG:  c:\symbols\hal.dll\EB9DEAA96000\hal.dll - Mapped image memory
+.
+SYMSRV:  BYINDEX: 0xD
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         kdcom.dll
+         7C46E6C1b000
+SYMSRV:  UNC: c:\symbols\kdcom.dll\7C46E6C1b000\kdcom.dll - path not found
+SYMSRV:  UNC: c:\symbols\kdcom.dll\7C46E6C1b000\kdcom.dl_ - path not found
+SYMSRV:  UNC: c:\symbols\kdcom.dll\7C46E6C1b000\file.ptr - path not found
+SYMSRV:  HTTPGET: /download/symbols/kdcom.dll/7C46E6C1b000/kdcom.dll
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdcom.dll/7C46E6C1b000/kdcom.dl_
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdcom.dll/7C46E6C1b000/file.ptr
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  RESULT: 0x80190194
+SYMSRV:  BYINDEX: 0xE
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         kdusb.dll
+         7C46E6C1b000
+SYMSRV:  UNC: c:\symbols\kdusb.dll\7C46E6C1b000\kdusb.dll - path not found
+SYMSRV:  UNC: c:\symbols\kdusb.dll\7C46E6C1b000\kdusb.dl_ - path not found
+SYMSRV:  UNC: c:\symbols\kdusb.dll\7C46E6C1b000\file.ptr - path not found
+SYMSRV:  HTTPGET: /download/symbols/kdusb.dll/7C46E6C1b000/kdusb.dll
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdusb.dll/7C46E6C1b000/kdusb.dl_
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdusb.dll/7C46E6C1b000/file.ptr
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  RESULT: 0x80190194
+SYMSRV:  BYINDEX: 0xF
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         kd1394.dll
+         7C46E6C1b000
+SYMSRV:  UNC: c:\symbols\kd1394.dll\7C46E6C1b000\kd1394.dll - path not found
+SYMSRV:  UNC: c:\symbols\kd1394.dll\7C46E6C1b000\kd1394.dl_ - path not found
+SYMSRV:  UNC: c:\symbols\kd1394.dll\7C46E6C1b000\file.ptr - path not found
+SYMSRV:  HTTPGET: /download/symbols/kd1394.dll/7C46E6C1b000/kd1394.dll
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kd1394.dll/7C46E6C1b000/kd1394.dl_
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kd1394.dll/7C46E6C1b000/file.ptr
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  RESULT: 0x80190194
+SYMSRV:  BYINDEX: 0x10
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         kdnet.dll
+         7C46E6C1b000
+SYMSRV:  UNC: c:\symbols\kdnet.dll\7C46E6C1b000\kdnet.dll - path not found
+SYMSRV:  UNC: c:\symbols\kdnet.dll\7C46E6C1b000\kdnet.dl_ - path not found
+SYMSRV:  UNC: c:\symbols\kdnet.dll\7C46E6C1b000\file.ptr - path not found
+SYMSRV:  HTTPGET: /download/symbols/kdnet.dll/7C46E6C1b000/kdnet.dll
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdnet.dll/7C46E6C1b000/kdnet.dl_
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/kdnet.dll/7C46E6C1b000/file.ptr
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  RESULT: 0x80190194
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kdcom.dll - file not found
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kdcom.dll - file not found
+DBGHELP: kdcom.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: kdcom.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kdusb.dll - file not found
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kdusb.dll - file not found
+DBGHELP: kdusb.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: kdusb.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kd1394.dll - file not found
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kd1394.dll - file not found
+DBGHELP: kd1394.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: kd1394.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kdnet.dll - file not found
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\kdnet.dll - file not found
+DBGHELP: kdnet.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: kdnet.dll not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGENG:  kdcom.dll - Image mapping disallowed by non-local path.
+.............................................................
+................................................................
+......................................
+Loading User Symbols
+
+Loading unloaded module list
+.........
+0: kd> *******************************************************************************
+*                                                                             *
+*                        Bugcheck Analysis                                    *
+*                                                                             *
+*******************************************************************************
+
+PAGE_FAULT_IN_NONPAGED_AREA (50)
+Invalid system memory was referenced.  This cannot be protected by try-except.
+Typically the address is just plain bad or it is pointing at freed memory.
+Arguments:
+Arg1: ffffcd88f3403088, memory referenced.
+Arg2: 0000000000000000, X64: bit 0 set if the fault was due to a not-present PTE.
+	bit 1 is set if the fault was due to a write, clear if a read.
+	bit 3 is set if the processor decided the fault was due to a corrupted PTE.
+	bit 4 is set if the fault was due to attempted execute of a no-execute PTE.
+	- ARM64: bit 1 is set if the fault was due to a write, clear if a read.
+	bit 3 is set if the fault was due to attempted execute of a no-execute PTE.
+Arg3: fffff8010ae5b38f, If non-zero, the instruction address which referenced the bad memory
+	address.
+Arg4: 0000000000000002, (reserved)
+
+Debugging Details:
+------------------
+
+DBGENG:  c:\shadowstrike\shadowstrike\phantomsensor\x64\release\PhantomSensor.sys image header does not match memory image header.
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\PhantomSensor.sys - mismatched
+SYMSRV:  BYINDEX: 0x11
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         PhantomSensor.sys
+         69BA96861ba000
+SYMSRV:  UNC: c:\symbols\PhantomSensor.sys\69BA96861ba000\PhantomSensor.sys - path not found
+SYMSRV:  UNC: c:\symbols\PhantomSensor.sys\69BA96861ba000\PhantomSensor.sy_ - path not found
+SYMSRV:  UNC: c:\symbols\PhantomSensor.sys\69BA96861ba000\file.ptr - path not found
+SYMSRV:  HTTPGET: /download/symbols/PhantomSensor.sys/69BA96861ba000/PhantomSensor.sys
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/PhantomSensor.sys/69BA96861ba000/PhantomSensor.sy_
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  HTTPGET: /download/symbols/PhantomSensor.sys/69BA96861ba000/file.ptr
+SYMSRV:  HttpQueryInfo: 80190194 - HTTP_STATUS_NOT_FOUND
+SYMSRV:  RESULT: 0x80190194
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\PhantomSensor.sys - file not found
+DBGHELP: C:\ShadowStrike\ShadowStrike\PhantomSensor\PhantomSensor.sys - file not found
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\PhantomSensor.sys - mismatched timestamp
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\PhantomSensor.sys - mismatched timestamp
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\PhantomSensor\PhantomSensor.sys - mismatched timestamp
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\PhantomSensor\PhantomSensor.sys - mismatched timestamp
+DBGHELP: PhantomSensor.sys not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGHELP: PhantomSensor.sys not found in c:\shadowstrike\shadowstrike\phantomsensor\x64\release
+DBGENG:  PhantomSensor.sys - Image mapping disallowed by non-local path.
+DBGENG:  PhantomSensor.sys - Partial symbol image load missing image info
+DBGHELP: No header for PhantomSensor.sys.  Searching for dbg file
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\PhantomSensor.dbg - file not found
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\sys\PhantomSensor.dbg - path not found
+DBGHELP: c:\shadowstrike\shadowstrike\phantomsensor\x64\release\symbols\sys\PhantomSensor.dbg - path not found
+DBGHELP: .\PhantomSensor.dbg - file not found
+DBGHELP: .\sys\PhantomSensor.dbg - path not found
+DBGHELP: .\symbols\sys\PhantomSensor.dbg - path not found
+DBGHELP: PhantomSensor.sys missing debug info.  Searching for pdb anyway
+*** WARNING: Unable to verify timestamp for PhantomSensor.sys
+DBGHELP: PhantomSensor - private symbols & lines 
+        c:\shadowstrike\shadowstrike\phantomsensor\x64\release\PhantomSensor.pdb - unmatched
+SYMSRV:  BYINDEX: 0x12
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         KslD.sys
+         24AF1A1D18000
+SYMSRV:  UNC: c:\symbols\KslD.sys\24AF1A1D18000\KslD.sys - path not found
+SYMSRV:  UNC: c:\symbols\KslD.sys\24AF1A1D18000\KslD.sy_ - path not found
+SYMSRV:  UNC: c:\symbols\KslD.sys\24AF1A1D18000\file.ptr - path not found
+SYMSRV:  HTTPGET: /download/symbols/KslD.sys/24AF1A1D18000/KslD.sys
+SYMSRV:  HttpQueryInfo: 801900c8 - HTTP_STATUS_OK
+SYMSRV:  UNC: c:\symbols\KslD.sys\24AF1A1D18000\KslD.sys - path not found
+SYMSRV:  UNC: c:\symbols\KslD.sys\24AF1A1D18000\KslD.sy_ - path not found
+SYMSRV:  UNC: c:\symbols\KslD.sys\24AF1A1D18000\file.ptr - path not found
+SYMSRV:  KslD.sys from https://msdl.microsoft.com/download/symbols: 82352 bytes -                0 percent   4 percent copied      
+SYMSRV:  PATH: c:\symbols\KslD.sys\24AF1A1D18000\KslD.sys
+SYMSRV:  RESULT: 0x00000000
+DBGHELP: c:\symbols\KslD.sys\24AF1A1D18000\KslD.sys - OK
+DBGENG:  c:\symbols\KslD.sys\24AF1A1D18000\KslD.sys - Mapped image memory
+DBGHELP: PhantomSensor is not source indexed
+
+KEY_VALUES_STRING: 1
+
+    Key  : AV.Type
+    Value: Read
+
+    Key  : Analysis.CPU.mSec
+    Value: 1577
+
+    Key  : Analysis.Elapsed.mSec
+    Value: 3170
+
+    Key  : Analysis.IO.Other.Mb
+    Value: 0
+
+    Key  : Analysis.IO.Read.Mb
+    Value: 0
+
+    Key  : Analysis.IO.Write.Mb
+    Value: 0
+
+    Key  : Analysis.Init.CPU.mSec
+    Value: 390
+
+    Key  : Analysis.Init.Elapsed.mSec
+    Value: 1474
+
+    Key  : Analysis.Memory.CommitPeak.Mb
+    Value: 93
+
+    Key  : Bugcheck.Code.LegacyAPI
+    Value: 0x50
+
+    Key  : Dump.Attributes.AsUlong
+    Value: 20008
+
+    Key  : Dump.Attributes.KernelGeneratedTriageDump
+    Value: 1
+
+    Key  : Failure.Bucket
+    Value: AV_R_(null)_PhantomSensor!MgValidateSchema
+
+    Key  : Failure.Hash
+    Value: {a5a8fa4c-d919-1e88-94b8-0d051f36c307}
+
+    Key  : Hypervisor.Enlightenments.ValueHex
+    Value: 6090ebf4
+
+    Key  : Hypervisor.Flags.AnyHypervisorPresent
+    Value: 1
+
+    Key  : Hypervisor.Flags.ApicEnlightened
+    Value: 1
+
+    Key  : Hypervisor.Flags.ApicVirtualizationAvailable
+    Value: 0
+
+    Key  : Hypervisor.Flags.AsyncMemoryHint
+    Value: 0
+
+    Key  : Hypervisor.Flags.CoreSchedulerRequested
+    Value: 0
+
+    Key  : Hypervisor.Flags.CpuManager
+    Value: 0
+
+    Key  : Hypervisor.Flags.DeprecateAutoEoi
+    Value: 0
+
+    Key  : Hypervisor.Flags.DynamicCpuDisabled
+    Value: 1
+
+    Key  : Hypervisor.Flags.Epf
+    Value: 0
+
+    Key  : Hypervisor.Flags.ExtendedProcessorMasks
+    Value: 1
+
+    Key  : Hypervisor.Flags.HardwareMbecAvailable
+    Value: 1
+
+    Key  : Hypervisor.Flags.MaxBankNumber
+    Value: 0
+
+    Key  : Hypervisor.Flags.MemoryZeroingControl
+    Value: 0
+
+    Key  : Hypervisor.Flags.NoExtendedRangeFlush
+    Value: 0
+
+    Key  : Hypervisor.Flags.NoNonArchCoreSharing
+    Value: 0
+
+    Key  : Hypervisor.Flags.Phase0InitDone
+    Value: 1
+
+    Key  : Hypervisor.Flags.PowerSchedulerQos
+    Value: 0
+
+    Key  : Hypervisor.Flags.RootScheduler
+    Value: 0
+
+    Key  : Hypervisor.Flags.SynicAvailable
+    Value: 1
+
+    Key  : Hypervisor.Flags.UseQpcBias
+    Value: 0
+
+    Key  : Hypervisor.Flags.Value
+    Value: 659693
+
+    Key  : Hypervisor.Flags.ValueHex
+    Value: a10ed
+
+    Key  : Hypervisor.Flags.VpAssistPage
+    Value: 1
+
+    Key  : Hypervisor.Flags.VsmAvailable
+    Value: 1
+
+    Key  : Hypervisor.RootFlags.AccessStats
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.CrashdumpEnlightened
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.CreateVirtualProcessor
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.DisableHyperthreading
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.HostTimelineSync
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.HypervisorDebuggingEnabled
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.IsHyperV
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.LivedumpEnlightened
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.MapDeviceInterrupt
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.MceEnlightened
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.Nested
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.StartLogicalProcessor
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.Value
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.ValueHex
+    Value: 0
+
+
+BUGCHECK_CODE:  50
+
+BUGCHECK_P1: ffffcd88f3403088
+
+BUGCHECK_P2: 0
+
+BUGCHECK_P3: fffff8010ae5b38f
+
+BUGCHECK_P4: 2
+
+FILE_IN_CAB:  latest_report.dmp
+
+VIRTUAL_MACHINE:  HyperV
+
+DUMP_FILE_ATTRIBUTES: 0x20008
+  Kernel Generated Triage Dump
+
+READ_ADDRESS: fffff801751c44c8: Unable to get MiVisibleState
+Unable to get NonPagedPoolStart
+Unable to get NonPagedPoolEnd
+Unable to get PagedPoolStart
+Unable to get PagedPoolEnd
+unable to get nt!MmSpecialPagesInUse
+ ffffcd88f3403088 
+
+MM_INTERNAL_CODE:  2
+
+IMAGE_NAME:  PhantomSensor.sys
+
+MODULE_NAME: PhantomSensor
+
+FAULTING_MODULE: fffff8010ae20000 PhantomSensor
+
+BLACKBOXBSD: 1 (!blackboxbsd)
+
+
+BLACKBOXNTFS: 1 (!blackboxntfs)
+
+
+BLACKBOXWINLOGON: 1
+
+PROCESS_NAME:  System
+
+TRAP_FRAME:  ffff91885db41e50 -- (.trap 0xffff91885db41e50)
+NOTE: The trap frame does not contain all registers.
+Some register values may be zeroed or incorrect.
+rax=000000000002f5a1 rbx=0000000000000000 rcx=0000000005162cb8
+rdx=0000000000000000 rsi=0000000000000000 rdi=0000000000000000
+rip=fffff8010ae5b38f rsp=ffff91885db41fe0 rbp=ffff91885db42048
+ r8=0000000000000000  r9=0000000000000001 r10=ffffcd88e775d040
+r11=ffffcd88e775d8c0 r12=0000000000000000 r13=0000000000000000
+r14=0000000000000000 r15=0000000000000000
+iopl=0         nv up ei ng nz ac pe nc
+PhantomSensor!MgValidateSchema+0x3eb:
+fffff801`0ae5b38f 8b8419c0030000  mov     eax,dword ptr [rcx+rbx+3C0h] ds:00000000`05163078=????????
+Resetting default scope
+
+STACK_TEXT:  
+ffff9188`5db41be8 fffff801`74429dc0     : 00000000`00000050 ffffcd88`f3403088 00000000`00000000 ffff9188`5db41e50 : nt!KeBugCheckEx
+ffff9188`5db41bf0 fffff801`74416d96     : 00000000`00000fff ffff8000`00000000 ffffcd88`f3403088 0000007f`fffffff8 : nt!MiSystemFault+0x850
+ffff9188`5db41ce0 fffff801`748b9ecb     : 00000003`773a3eaa ffff9188`5db41ed0 00000000`00000000 000005ac`d5c6db00 : nt!MmAccessFault+0x646
+ffff9188`5db41e50 fffff801`0ae5b38f     : ffffa584`9a2d05c8 ffffa584`9a2d0320 00000000`00000000 00000000`00000000 : nt!KiPageFault+0x38b
+ffff9188`5db41fe0 fffff801`0ae8ed20     : ffff9188`5db420d0 fffff801`0afcef15 ffffa584`9a2d0310 ffff9188`5db42110 : PhantomSensor!MgValidateSchema+0x3eb
+ffff9188`5db42080 ffff9188`5db420d0     : fffff801`0afcef15 ffffa584`9a2d0310 ffff9188`5db42110 00000000`00000000 : PhantomSensor! ?? ::FNODOBFM::`string'+0x10
+ffff9188`5db42088 fffff801`0afcef15     : ffffa584`9a2d0310 ffff9188`5db42110 00000000`00000000 00000000`00000000 : 0xffff9188`5db420d0
+ffff9188`5db42090 ffffcd88`ed0fda9d     : ffffcd88`00000000 ffffcd88`f2ff4e20 ffffcd88`f2ff4e20 fffff801`74bc76cc : PhantomSensor!DriverEntry+0xd95
+ffff9188`5db42110 ffffcd88`00000000     : ffffcd88`f2ff4e20 ffffcd88`f2ff4e20 fffff801`74bc76cc ffffcd88`f1f53000 : 0xffffcd88`ed0fda9d
+ffff9188`5db42118 ffffcd88`f2ff4e20     : ffffcd88`f2ff4e20 fffff801`74bc76cc ffffcd88`f1f53000 ffffa584`931b3c70 : 0xffffcd88`00000000
+ffff9188`5db42120 ffffcd88`f2ff4e20     : fffff801`74bc76cc ffffcd88`f1f53000 ffffa584`931b3c70 ffffffff`8000003d : 0xffffcd88`f2ff4e20
+ffff9188`5db42128 fffff801`74bc76cc     : ffffcd88`f1f53000 ffffa584`931b3c70 ffffffff`8000003d ffff9188`5db42140 : 0xffffcd88`f2ff4e20
+ffff9188`5db42130 fffff801`74bc97b2     : 00000000`0000001c ffffa584`931b3c70 ffffcd88`f1f53000 ffffcd88`00001000 : nt!PnpCallDriverEntry+0x54
+ffff9188`5db42180 fffff801`74bc777b     : ffffcd88`00000000 00000000`00000000 ffff9188`00000000 00000000`00000000 : nt!IopLoadDriver+0x6f2
+ffff9188`5db42350 fffff801`7440817b     : ffffcd88`00000000 ffffffff`8000239c ffffcd88`e775d040 ffffcd88`e7879ae0 : nt!IopLoadUnloadDriver+0x7b
+ffff9188`5db423c0 fffff801`746870ba     : ffffcd88`e775d040 ffffcd88`e775d040 fffff801`74407cc0 ffffcd88`e7879ae0 : nt!ExpWorkerThread+0x4bb
+ffff9188`5db42570 fffff801`748abdf4     : ffff9400`d85db180 ffffcd88`e775d040 fffff801`74687060 00000000`245a5768 : nt!PspSystemThreadStartup+0x5a
+ffff9188`5db425c0 00000000`00000000     : ffff9188`5db43000 ffff9188`5db3c000 00000000`00000000 00000000`00000000 : nt!KiStartSystemThread+0x34
+
+
+FAULTING_SOURCE_LINE:  C:\ShadowStrike\ShadowStrike\PhantomSensor\PhantomSensor\ETW\ManifestGenerator.c
+
+FAULTING_SOURCE_FILE:  C:\ShadowStrike\ShadowStrike\PhantomSensor\PhantomSensor\ETW\ManifestGenerator.c
+
+FAULTING_SOURCE_LINE_NUMBER:  2073
+
+SYMBOL_NAME:  PhantomSensor!MgValidateSchema+3eb
+
+STACK_COMMAND:  .cxr; .ecxr ; kb
+
+BUCKET_ID_FUNC_OFFSET:  3eb
+
+FAILURE_BUCKET_ID:  AV_R_(null)_PhantomSensor!MgValidateSchema
+
+OSPLATFORM_TYPE:  x64
+
+OSNAME:  Windows 10
+
+FAILURE_ID_HASH:  {a5a8fa4c-d919-1e88-94b8-0d051f36c307}
+
+Followup:     MachineOwner
+---------
+
+0: kd> Can't switch processors on a single processor kernel triage dump
+Unable to get exception context, HRESULT 0x8000FFFF
+0: kd>  # RetAddr               : Args to Child                                                           : Call Site
+00 fffff801`74429dc0     : 00000000`00000050 ffffcd88`f3403088 00000000`00000000 ffff9188`5db41e50 : nt!KeBugCheckEx
+01 fffff801`74416d96     : 00000000`00000fff ffff8000`00000000 ffffcd88`f3403088 0000007f`fffffff8 : nt!MiSystemFault+0x850
+02 fffff801`748b9ecb     : 00000003`773a3eaa ffff9188`5db41ed0 00000000`00000000 000005ac`d5c6db00 : nt!MmAccessFault+0x646
+03 fffff801`0ae5b38f     : ffffa584`9a2d05c8 ffffa584`9a2d0320 00000000`00000000 00000000`00000000 : nt!KiPageFault+0x38b
+04 fffff801`0ae8ed20     : ffff9188`5db420d0 fffff801`0afcef15 ffffa584`9a2d0310 ffff9188`5db42110 : PhantomSensor!MgValidateSchema+0x3eb
+05 ffff9188`5db420d0     : fffff801`0afcef15 ffffa584`9a2d0310 ffff9188`5db42110 00000000`00000000 : PhantomSensor! ?? ::FNODOBFM::`string'+0x10
+06 fffff801`0afcef15     : ffffa584`9a2d0310 ffff9188`5db42110 00000000`00000000 00000000`00000000 : 0xffff9188`5db420d0
+07 (Inline Function)     : --------`-------- --------`-------- --------`-------- --------`-------- : PhantomSensor!ShadowStrikeLogInitStatus+0x7
+08 ffffcd88`ed0fda9d     : ffffcd88`00000000 ffffcd88`f2ff4e20 ffffcd88`f2ff4e20 fffff801`74bc76cc : PhantomSensor!DriverEntry+0xd95
+09 ffffcd88`00000000     : ffffcd88`f2ff4e20 ffffcd88`f2ff4e20 fffff801`74bc76cc ffffcd88`f1f53000 : 0xffffcd88`ed0fda9d
+0a ffffcd88`f2ff4e20     : ffffcd88`f2ff4e20 fffff801`74bc76cc ffffcd88`f1f53000 ffffa584`931b3c70 : 0xffffcd88`00000000
+0b ffffcd88`f2ff4e20     : fffff801`74bc76cc ffffcd88`f1f53000 ffffa584`931b3c70 ffffffff`8000003d : 0xffffcd88`f2ff4e20
+0c fffff801`74bc76cc     : ffffcd88`f1f53000 ffffa584`931b3c70 ffffffff`8000003d ffff9188`5db42140 : 0xffffcd88`f2ff4e20
+0d fffff801`74bc97b2     : 00000000`0000001c ffffa584`931b3c70 ffffcd88`f1f53000 ffffcd88`00001000 : nt!PnpCallDriverEntry+0x54
+0e fffff801`74bc777b     : ffffcd88`00000000 00000000`00000000 ffff9188`00000000 00000000`00000000 : nt!IopLoadDriver+0x6f2
+0f fffff801`7440817b     : ffffcd88`00000000 ffffffff`8000239c ffffcd88`e775d040 ffffcd88`e7879ae0 : nt!IopLoadUnloadDriver+0x7b
+10 fffff801`746870ba     : ffffcd88`e775d040 ffffcd88`e775d040 fffff801`74407cc0 ffffcd88`e7879ae0 : nt!ExpWorkerThread+0x4bb
+11 fffff801`748abdf4     : ffff9400`d85db180 ffffcd88`e775d040 fffff801`74687060 00000000`245a5768 : nt!PspSystemThreadStartup+0x5a
+12 00000000`00000000     : ffff9188`5db43000 ffff9188`5db3c000 00000000`00000000 00000000`00000000 : nt!KiStartSystemThread+0x34
+0: kd> Browse full module list
+start             end                 module name
+fffff801`0ae20000 fffff801`0afda000   PhantomSensor T (private pdb symbols)  c:\shadowstrike\shadowstrike\phantomsensor\x64\release\PhantomSensor.pdb
+    Loaded symbol image file: PhantomSensor.sys
+    Image path: PhantomSensor.sys
+    Image name: PhantomSensor.sys
+    Browse all global symbols  functions  data
+    Timestamp:        Wed Mar 18 15:11:50 2026 (69BA9686)
+    CheckSum:         000EB518
+    ImageSize:        001BA000
+    Translations:     0000.04b0 0000.04e4 0409.04b0 0409.04e4
+    Information from resource tables:
+0: kd> quit:
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Kernel.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Usb4Kd.natvis'

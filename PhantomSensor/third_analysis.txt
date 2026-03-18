@@ -1,0 +1,436 @@
+Opened log file 'C:\ShadowStrike\ShadowStrike\PhantomSensor\third_analysis.txt'
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.016 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 29
+
+Microsoft (R) Windows Debugger Version 10.0.26100.6584 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+
+Loading Dump File [C:\ShadowStrike\ShadowStrike\PhantomSensor\third_report.dmp]
+Mini Kernel Dump File: Only registers and stack trace are available
+
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+OK                                             C:\ShadowStrike\ShadowStrike\PhantomSensor\x64\Release
+Deferred                                       srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+Symbol search path is: C:\ShadowStrike\ShadowStrike\PhantomSensor\x64\Release;srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+Executable search path is: 
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Kernel.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Usb4Kd.natvis'
+Windows 10 Kernel Version 26100 MP (8 procs) Free x64
+Product: WinNt, suite: TerminalServer SingleUserTS Personal
+Kernel base = 0xfffff805`9aa00000 PsLoadedModuleList = 0xfffff805`9b8f50c0
+Debug session time: Wed Mar 18 19:48:18.515 2026 (UTC + 3:00)
+System Uptime: 0 days 0:59:07.845
+Loading Kernel Symbols
+...............................................................
+................................................................
+......................................
+Loading User Symbols
+
+Loading unloaded module list
+.........
+For analysis of this file, run !analyze -v
+5: kd> !analyze -v; .ecxr; kb 50; dps @rsp L40; q
+*******************************************************************************
+*                                                                             *
+*                        Bugcheck Analysis                                    *
+*                                                                             *
+*******************************************************************************
+
+KERNEL_SECURITY_CHECK_FAILURE (139)
+A kernel component has corrupted a critical data structure.  The corruption
+could potentially allow a malicious user to gain control of this machine.
+Arguments:
+Arg1: 0000000000000003, A LIST_ENTRY has been corrupted (i.e. double remove).
+Arg2: fffffd0b3b2d7340, Address of the trap frame for the exception that caused the BugCheck
+Arg3: fffffd0b3b2d7298, Address of the exception record for the exception that caused the BugCheck
+Arg4: 0000000000000000, Reserved
+
+Debugging Details:
+------------------
+
+*** WARNING: Unable to verify timestamp for PhantomSensor.sys
+
+KEY_VALUES_STRING: 1
+
+    Key  : Analysis.CPU.mSec
+    Value: 1468
+
+    Key  : Analysis.Elapsed.mSec
+    Value: 3191
+
+    Key  : Analysis.IO.Other.Mb
+    Value: 0
+
+    Key  : Analysis.IO.Read.Mb
+    Value: 0
+
+    Key  : Analysis.IO.Write.Mb
+    Value: 0
+
+    Key  : Analysis.Init.CPU.mSec
+    Value: 202
+
+    Key  : Analysis.Init.Elapsed.mSec
+    Value: 694
+
+    Key  : Analysis.Memory.CommitPeak.Mb
+    Value: 91
+
+    Key  : Bugcheck.Code.LegacyAPI
+    Value: 0x139
+
+    Key  : Dump.Attributes.AsUlong
+    Value: 20008
+
+    Key  : Dump.Attributes.KernelGeneratedTriageDump
+    Value: 1
+
+    Key  : FailFast.Name
+    Value: CORRUPT_LIST_ENTRY
+
+    Key  : FailFast.Type
+    Value: 3
+
+    Key  : Failure.Bucket
+    Value: 0x139_3_CORRUPT_LIST_ENTRY_PhantomSensor!TppWorkerThreadRoutine
+
+    Key  : Failure.Hash
+    Value: {9e3c7251-32a6-507d-8284-a3853426ff3d}
+
+    Key  : Hypervisor.Enlightenments.ValueHex
+    Value: 6090ebf4
+
+    Key  : Hypervisor.Flags.AnyHypervisorPresent
+    Value: 1
+
+    Key  : Hypervisor.Flags.ApicEnlightened
+    Value: 1
+
+    Key  : Hypervisor.Flags.ApicVirtualizationAvailable
+    Value: 0
+
+    Key  : Hypervisor.Flags.AsyncMemoryHint
+    Value: 0
+
+    Key  : Hypervisor.Flags.CoreSchedulerRequested
+    Value: 0
+
+    Key  : Hypervisor.Flags.CpuManager
+    Value: 0
+
+    Key  : Hypervisor.Flags.DeprecateAutoEoi
+    Value: 0
+
+    Key  : Hypervisor.Flags.DynamicCpuDisabled
+    Value: 1
+
+    Key  : Hypervisor.Flags.Epf
+    Value: 0
+
+    Key  : Hypervisor.Flags.ExtendedProcessorMasks
+    Value: 1
+
+    Key  : Hypervisor.Flags.HardwareMbecAvailable
+    Value: 1
+
+    Key  : Hypervisor.Flags.MaxBankNumber
+    Value: 0
+
+    Key  : Hypervisor.Flags.MemoryZeroingControl
+    Value: 0
+
+    Key  : Hypervisor.Flags.NoExtendedRangeFlush
+    Value: 0
+
+    Key  : Hypervisor.Flags.NoNonArchCoreSharing
+    Value: 0
+
+    Key  : Hypervisor.Flags.Phase0InitDone
+    Value: 1
+
+    Key  : Hypervisor.Flags.PowerSchedulerQos
+    Value: 0
+
+    Key  : Hypervisor.Flags.RootScheduler
+    Value: 0
+
+    Key  : Hypervisor.Flags.SynicAvailable
+    Value: 1
+
+    Key  : Hypervisor.Flags.UseQpcBias
+    Value: 0
+
+    Key  : Hypervisor.Flags.Value
+    Value: 659693
+
+    Key  : Hypervisor.Flags.ValueHex
+    Value: a10ed
+
+    Key  : Hypervisor.Flags.VpAssistPage
+    Value: 1
+
+    Key  : Hypervisor.Flags.VsmAvailable
+    Value: 1
+
+    Key  : Hypervisor.RootFlags.AccessStats
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.CrashdumpEnlightened
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.CreateVirtualProcessor
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.DisableHyperthreading
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.HostTimelineSync
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.HypervisorDebuggingEnabled
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.IsHyperV
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.LivedumpEnlightened
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.MapDeviceInterrupt
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.MceEnlightened
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.Nested
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.StartLogicalProcessor
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.Value
+    Value: 0
+
+    Key  : Hypervisor.RootFlags.ValueHex
+    Value: 0
+
+
+BUGCHECK_CODE:  139
+
+BUGCHECK_P1: 3
+
+BUGCHECK_P2: fffffd0b3b2d7340
+
+BUGCHECK_P3: fffffd0b3b2d7298
+
+BUGCHECK_P4: 0
+
+FILE_IN_CAB:  third_report.dmp
+
+VIRTUAL_MACHINE:  HyperV
+
+DUMP_FILE_ATTRIBUTES: 0x20008
+  Kernel Generated Triage Dump
+
+TRAP_FRAME:  fffffd0b3b2d7340 -- (.trap 0xfffffd0b3b2d7340)
+.trap 0xfffffd0b3b2d7340
+NOTE: The trap frame does not contain all registers.
+Some register values may be zeroed or incorrect.
+rax=0000000000000000 rbx=0000000000000000 rcx=0000000000000003
+rdx=ffffd406fca7fb20 rsi=0000000000000000 rdi=0000000000000000
+rip=fffff80531f9f697 rsp=fffffd0b3b2d74d0 rbp=0000000000000080
+ r8=0000000000000000  r9=00000000000000af r10=00000000000000af
+r11=fffff80529f4f180 r12=0000000000000000 r13=0000000000000000
+r14=0000000000000000 r15=0000000000000000
+iopl=0         nv up ei pl nz na po nc
+PhantomSensor!TppWorkerThreadRoutine+0x257:
+fffff805`31f9f697 ??              ???
+.trap
+Resetting default scope
+
+EXCEPTION_RECORD:  fffffd0b3b2d7298 -- (.exr 0xfffffd0b3b2d7298)
+.exr 0xfffffd0b3b2d7298
+ExceptionAddress: fffff80531f9f697 (PhantomSensor!TppWorkerThreadRoutine+0x0000000000000257)
+   ExceptionCode: c0000409 (Security check failure or stack buffer overrun)
+  ExceptionFlags: 00000001
+NumberParameters: 1
+   Parameter[0]: 0000000000000003
+Subcode: 0x3 FAST_FAIL_CORRUPT_LIST_ENTRY 
+
+BLACKBOXBSD: 1 (!blackboxbsd)
+
+
+BLACKBOXNTFS: 1 (!blackboxntfs)
+
+
+BLACKBOXWINLOGON: 1
+
+PROCESS_NAME:  System
+
+ERROR_CODE: (NTSTATUS) 0xc0000409 - Sistem, bu uygulamada y   n tabanl  bir arabelle in ta t   n  alg lad . Bu ta ma, k t  niyetli bir kullan c n n bu uygulaman n denetimini ele ge irmesine olanak verebilir.
+
+EXCEPTION_CODE_STR:  c0000409
+
+EXCEPTION_PARAMETER1:  0000000000000003
+
+EXCEPTION_STR:  0xc0000409
+
+STACK_TEXT:  
+fffffd0b`3b2d7018 fffff805`9b0bece9     : 00000000`00000139 00000000`00000003 fffffd0b`3b2d7340 fffffd0b`3b2d7298 : nt!KeBugCheckEx
+fffffd0b`3b2d7020 fffff805`9b0bf2f2     : 00000000`00000000 fffff805`9b0b2ad6 00000000`00000000 fffff805`9b815940 : nt!KiBugCheckDispatch+0x69
+fffffd0b`3b2d7160 fffff805`9b0bcf28     : 00000000`00000000 00000000`00000000 fffffd0b`3b2d7460 00000000`000000af : nt!KiFastFailDispatch+0xb2
+fffffd0b`3b2d7340 fffff805`31f9f697     : ffffd406`fc1dd040 ffffd406`fc1dd040 ffffd406`fc1dd040 00000000`00000000 : nt!KiRaiseSecurityCheckFailure+0x368
+fffffd0b`3b2d74d0 fffff805`9ae870ba     : ffffd406`fc1dd040 ffffd406`fc1dd040 00000000`00000080 fffff805`31f9f370 : PhantomSensor!TppWorkerThreadRoutine+0x257
+fffffd0b`3b2d7570 fffff805`9b0abdf4     : ffffe781`ccbe0180 ffffd406`fc1dd040 fffff805`9ae87060 00000000`00000000 : nt!PspSystemThreadStartup+0x5a
+fffffd0b`3b2d75c0 00000000`00000000     : fffffd0b`3b2d8000 fffffd0b`3b2d1000 00000000`00000000 00000000`00000000 : nt!KiStartSystemThread+0x34
+
+
+FAULTING_SOURCE_LINE:  C:\ShadowStrike\ShadowStrike\PhantomSensor\PhantomSensor\Sync\ThreadPool.c
+
+FAULTING_SOURCE_FILE:  C:\ShadowStrike\ShadowStrike\PhantomSensor\PhantomSensor\Sync\ThreadPool.c
+
+FAULTING_SOURCE_LINE_NUMBER:  1726
+
+SYMBOL_NAME:  PhantomSensor!TppWorkerThreadRoutine+257
+
+MODULE_NAME: PhantomSensor
+
+IMAGE_NAME:  PhantomSensor.sys
+
+STACK_COMMAND:  .cxr; .ecxr ; kb
+
+BUCKET_ID_FUNC_OFFSET:  257
+
+FAILURE_BUCKET_ID:  0x139_3_CORRUPT_LIST_ENTRY_PhantomSensor!TppWorkerThreadRoutine
+
+OSPLATFORM_TYPE:  x64
+
+OSNAME:  Windows 10
+
+FAILURE_ID_HASH:  {9e3c7251-32a6-507d-8284-a3853426ff3d}
+
+Followup:     MachineOwner
+---------
+
+Can't switch processors on a single processor kernel triage dump
+Unable to get exception context, HRESULT 0x8000FFFF
+ # RetAddr               : Args to Child                                                           : Call Site
+00 fffff805`9b0bece9     : 00000000`00000139 00000000`00000003 fffffd0b`3b2d7340 fffffd0b`3b2d7298 : nt!KeBugCheckEx
+01 fffff805`9b0bf2f2     : 00000000`00000000 fffff805`9b0b2ad6 00000000`00000000 fffff805`9b815940 : nt!KiBugCheckDispatch+0x69
+02 fffff805`9b0bcf28     : 00000000`00000000 00000000`00000000 fffffd0b`3b2d7460 00000000`000000af : nt!KiFastFailDispatch+0xb2
+03 fffff805`31f9f697     : ffffd406`fc1dd040 ffffd406`fc1dd040 ffffd406`fc1dd040 00000000`00000000 : nt!KiRaiseSecurityCheckFailure+0x368
+04 fffff805`9ae870ba     : ffffd406`fc1dd040 ffffd406`fc1dd040 00000000`00000080 fffff805`31f9f370 : PhantomSensor!TppWorkerThreadRoutine+0x257
+05 fffff805`9b0abdf4     : ffffe781`ccbe0180 ffffd406`fc1dd040 fffff805`9ae87060 00000000`00000000 : nt!PspSystemThreadStartup+0x5a
+06 00000000`00000000     : fffffd0b`3b2d8000 fffffd0b`3b2d1000 00000000`00000000 00000000`00000000 : nt!KiStartSystemThread+0x34
+fffffd0b`3b2d7018  fffff805`9b0bece9 nt!KiBugCheckDispatch+0x69
+fffffd0b`3b2d7020  00000000`00000139
+fffffd0b`3b2d7028  00000000`00000003
+fffffd0b`3b2d7030  fffffd0b`3b2d7340
+fffffd0b`3b2d7038  fffffd0b`3b2d7298
+fffffd0b`3b2d7040  00000000`00000000
+fffffd0b`3b2d7048  00007ff9`3b9cc6a0
+fffffd0b`3b2d7050  00000000`00000000
+fffffd0b`3b2d7058  00000000`00000000
+fffffd0b`3b2d7060  00000000`00000000
+fffffd0b`3b2d7068  00000000`00000000
+fffffd0b`3b2d7070  00000000`00000000
+fffffd0b`3b2d7078  00000000`00000000
+fffffd0b`3b2d7080  00000000`00000000
+fffffd0b`3b2d7088  00000000`00000000
+fffffd0b`3b2d7090  00000000`00000000
+fffffd0b`3b2d7098  00000000`00000000
+fffffd0b`3b2d70a0  00000000`00000000
+fffffd0b`3b2d70a8  00000000`00000000
+fffffd0b`3b2d70b0  00000000`00000000
+fffffd0b`3b2d70b8  00000000`00000000
+fffffd0b`3b2d70c0  00000000`00000000
+fffffd0b`3b2d70c8  00000000`00000000
+fffffd0b`3b2d70d0  00000000`00000000
+fffffd0b`3b2d70d8  00000000`00000000
+fffffd0b`3b2d70e0  00000000`00000000
+fffffd0b`3b2d70e8  00000000`00000000
+fffffd0b`3b2d70f0  00000000`00000000
+fffffd0b`3b2d70f8  ffffe781`ccbe0180
+fffffd0b`3b2d7100  00000000`00000000
+fffffd0b`3b2d7108  ffffd406`fc1dd040
+fffffd0b`3b2d7110  ffffd406`f087d280
+fffffd0b`3b2d7118  ffffe781`ccbe0180
+fffffd0b`3b2d7120  ffffd406`fc1dd040
+fffffd0b`3b2d7128  ffffd406`fca811c0
+fffffd0b`3b2d7130  ffffd406`f9dfec70
+fffffd0b`3b2d7138  00000000`00000000
+fffffd0b`3b2d7140  00000000`00000000
+fffffd0b`3b2d7148  ffffd406`f9dfeca8
+fffffd0b`3b2d7150  ffffd406`f9dfecc8
+fffffd0b`3b2d7158  fffff805`9b0bf2f2 nt!KiFastFailDispatch+0xb2
+fffffd0b`3b2d7160  00000000`00000000
+fffffd0b`3b2d7168  fffff805`9b0b2ad6 nt!KiSwapContext+0x76
+fffffd0b`3b2d7170  00000000`00000000
+fffffd0b`3b2d7178  fffff805`9b815940 nt!KiInitialNodeStructures+0x40
+fffffd0b`3b2d7180  00000000`00000000
+fffffd0b`3b2d7188  fffff805`9aee9dc2 nt!KiSearchForNewThreadsWithinSearchContext+0x42
+fffffd0b`3b2d7190  00000000`00000000
+fffffd0b`3b2d7198  00000000`00000000
+fffffd0b`3b2d71a0  00000000`00000000
+fffffd0b`3b2d71a8  00000000`00000000
+fffffd0b`3b2d71b0  00000000`00000000
+fffffd0b`3b2d71b8  00000000`00000000
+fffffd0b`3b2d71c0  00000000`00000000
+fffffd0b`3b2d71c8  00000000`00000000
+fffffd0b`3b2d71d0  00000000`00000000
+fffffd0b`3b2d71d8  00000000`00000000
+fffffd0b`3b2d71e0  00000000`00000000
+fffffd0b`3b2d71e8  00000000`00000000
+fffffd0b`3b2d71f0  00000000`00000000
+fffffd0b`3b2d71f8  00000000`00000000
+fffffd0b`3b2d7200  00000000`00000000
+fffffd0b`3b2d7208  00000000`00000000
+fffffd0b`3b2d7210  00000000`00000000
+quit:
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Kernel.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Usb4Kd.natvis'

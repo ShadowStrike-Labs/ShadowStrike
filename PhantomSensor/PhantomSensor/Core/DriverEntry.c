@@ -1816,14 +1816,21 @@ DriverEntry(
 
                 //
                 // Step 7.7b: Validate schema integrity at init time
+                // Protected with SEH — validation is non-critical for driver operation.
                 //
                 {
                     ULONG validationErrors = 0;
-                    mgStatus = MgValidateSchema(g_ManifestGenerator, &validationErrors, NULL, NULL);
-                    if (validationErrors > 0) {
-                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                                   "[ShadowStrike] ManifestGenerator schema validation: %lu error(s)\n",
-                                   validationErrors);
+                    __try {
+                        mgStatus = MgValidateSchema(g_ManifestGenerator, &validationErrors, NULL, NULL);
+                        if (validationErrors > 0) {
+                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                                       "[ShadowStrike] ManifestGenerator schema validation: %lu error(s)\n",
+                                       validationErrors);
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                                   "[ShadowStrike] WARNING: MgValidateSchema faulted (code 0x%08X) — skipping validation\n",
+                                   GetExceptionCode());
                     }
                 }
 

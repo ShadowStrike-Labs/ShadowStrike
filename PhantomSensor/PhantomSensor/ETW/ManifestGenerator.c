@@ -1861,17 +1861,30 @@ Return Value:
     //
     // Check for empty schema
     //
-    if (Generator->Schema == NULL || Generator->Schema->EventCount == 0) {
+    if (Generator->Schema == NULL ||
+        Generator->Schema->Magic != ES_SCHEMA_MAGIC) {
         Errors++;
         if (BuilderInitialized) {
-            MgpStringBuilderAppend(&ErrorBuilder, "ERROR: Schema is empty or NULL\r\n");
+            MgpStringBuilderAppend(&ErrorBuilder,
+                Generator->Schema == NULL ?
+                    "ERROR: Schema is NULL\r\n" :
+                    "ERROR: Schema magic invalid (possible corruption or use-after-free)\r\n");
+        }
+        goto SkipSchemaValidation;
+    }
+
+    if (Generator->Schema->EventCount == 0) {
+        Errors++;
+        if (BuilderInitialized) {
+            MgpStringBuilderAppend(&ErrorBuilder, "ERROR: Schema is empty (0 events)\r\n");
         }
     }
 
     //
     // Check for duplicate event IDs
     //
-    if (Generator->Schema != NULL) {
+    if (Generator->Schema != NULL &&
+        Generator->Schema->Magic == ES_SCHEMA_MAGIC) {
         KeEnterCriticalRegion();
         ExAcquirePushLockShared(&Generator->Schema->EventLock);
 
@@ -1922,7 +1935,9 @@ Return Value:
     //
     // Check for missing provider info
     //
-    if (Generator->Schema != NULL && Generator->Schema->ProviderName[0] == '\0') {
+    if (Generator->Schema != NULL &&
+        Generator->Schema->Magic == ES_SCHEMA_MAGIC &&
+        Generator->Schema->ProviderName[0] == '\0') {
         Errors++;
         if (BuilderInitialized) {
             MgpStringBuilderAppend(&ErrorBuilder, "WARNING: Provider name is empty\r\n");
@@ -2043,7 +2058,8 @@ Return Value:
     //
     // Check for out-of-bounds field types in events
     //
-    if (Generator->Schema != NULL) {
+    if (Generator->Schema != NULL &&
+        Generator->Schema->Magic == ES_SCHEMA_MAGIC) {
         KeEnterCriticalRegion();
         ExAcquirePushLockShared(&Generator->Schema->EventLock);
 
@@ -2071,6 +2087,8 @@ Return Value:
         ExReleasePushLockShared(&Generator->Schema->EventLock);
         KeLeaveCriticalRegion();
     }
+
+SkipSchemaValidation:
 
     *ErrorCount = Errors;
     Generator->Stats.ValidationErrors = Errors;
