@@ -164,10 +164,17 @@ VOID ShadowStrikeCleanupPreWrite(VOID);
 #include "../Sync/SpinLock.h"
 #include "../Communication/MessageQueue.h"
 
+// Forward declaration for INIT-section breadcrumb function
+static VOID ShadowStrikeLogBootStep(
+    _In_ PUNICODE_STRING RegistryPath,
+    _In_ ULONG StepNumber
+);
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, DriverEntry)
 #pragma alloc_text(INIT, ShadowStrikeCheckVersionCompatibility)
 #pragma alloc_text(INIT, ShadowStrikeLoadConfiguration)
+#pragma alloc_text(INIT, ShadowStrikeLogBootStep)
 #pragma alloc_text(PAGE, ShadowStrikeUnload)
 #pragma alloc_text(PAGE, ShadowStrikeInitializeLookasideLists)
 #pragma alloc_text(PAGE, ShadowStrikeCleanupLookasideLists)
@@ -1004,6 +1011,65 @@ ShadowStrikePopulateEventSchema(
 }
 
 // ============================================================================
+// BOOT-STEP BREADCRUMB LOGGING
+// ============================================================================
+
+/**
+ * @brief Write current initialization step to the registry.
+ *
+ * Persists the step number as DWORD "LastInitStep" under the driver's
+ * Parameters key. Because registry writes survive BSODs, the last
+ * written value pinpoints exactly which init step the crash occurred
+ * AFTER. Read with:
+ *   reg query "HKLM\SYSTEM\CurrentControlSet\Services\PhantomSensor\Parameters" /v LastInitStep
+ *
+ * @param RegistryPath  Service key path supplied by the I/O manager.
+ * @param Step          Monotonic step number (see comments in DriverEntry).
+ */
+static VOID
+ShadowStrikeLogBootStep(
+    _In_ PUNICODE_STRING RegistryPath,
+    _In_ ULONG Step
+    )
+{
+    HANDLE serviceKey = NULL;
+    HANDLE paramsKey = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING subKeyName = RTL_CONSTANT_STRING(L"Parameters");
+    UNICODE_STRING valueName = RTL_CONSTANT_STRING(L"LastInitStep");
+    NTSTATUS st;
+
+    InitializeObjectAttributes(
+        &oa, RegistryPath,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+        NULL, NULL);
+
+    st = ZwOpenKey(&serviceKey, KEY_CREATE_SUB_KEY, &oa);
+    if (!NT_SUCCESS(st)) {
+        return;
+    }
+
+    InitializeObjectAttributes(
+        &oa, &subKeyName,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+        serviceKey, NULL);
+
+    st = ZwCreateKey(
+        &paramsKey, KEY_SET_VALUE, &oa,
+        0, NULL, REG_OPTION_NON_VOLATILE, NULL);
+    if (!NT_SUCCESS(st)) {
+        ZwClose(serviceKey);
+        return;
+    }
+
+    ZwSetValueKey(paramsKey, &valueName, 0, REG_DWORD, &Step, sizeof(Step));
+    ZwFlushKey(paramsKey);
+
+    ZwClose(paramsKey);
+    ZwClose(serviceKey);
+}
+
+// ============================================================================
 // DRIVER ENTRY
 // ============================================================================
 
@@ -1022,6 +1088,40 @@ DriverEntry(
 {
     NTSTATUS status = STATUS_SUCCESS;
     ULONG buildNumber = 0;
+
+    //
+    // Boot-step breadcrumb: Step 0 = DriverEntry entered.
+    // After a BSOD, read the registry to find the last completed step:
+    //   reg query "HKLM\SYSTEM\CurrentControlSet\Services\PhantomSensor\Parameters" /v LastInitStep
+    //
+    // Step Map:
+    //   0  = DriverEntry entered
+    //   1  = Version check passed
+    //   2  = Global state zeroed
+    //   3  = WPP + Lock subsystem
+    //   5  = Lookaside lists
+    //   6  = Sync infrastructure (WorkQueue..DPC)
+    //   7  = Perf + Throttling + Batch
+    //   8  = Power + ETW + Telemetry
+    //   9  = Compression
+    //  10  = FltRegisterFilter
+    //  11  = CommPort
+    //  12  = Telemetry Events + Schema + Manifest
+    //  13  = ScanCache + Exclusions + Hash/File Utils
+    //  14  = BehaviorEngine + Memory + Syscall
+    //  15  = NetworkFilter
+    //  16  = Process/Thread/Image callbacks
+    //  17  = Registry + Object callbacks
+    //  18  = Self-protection suite
+    //  19  = ELAM + Handle/Integrity/AntiDebug
+    //  20  = FileProtection + Callback + ALPC + KTM
+    //  21  = ThreatScoring + Perf + Power bridge
+    //  22  = FSC + PostCreate + PostWrite init
+    //  23  = PreAcquire + PreCreate + PreSetInfo + PreWrite init
+    //  24  = FltStartFiltering
+    //  25  = Init complete (driver READY)
+    //
+    ShadowStrikeLogBootStep(RegistryPath, 0);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] DriverEntry: Starting initialization (v%u.%u.%u)\n",
@@ -1042,6 +1142,8 @@ DriverEntry(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Windows build %lu detected, compatibility verified.\n",
                buildNumber);
+
+    ShadowStrikeLogBootStep(RegistryPath, 1); // Version check passed
 
     //
     // Step 2: Initialize global state
@@ -1146,6 +1248,8 @@ DriverEntry(
     g_InitFlags |= InitFlag_LookasideLists;
     g_DriverData.LookasideInitialized = TRUE;
     ShadowStrikeLogInitStatus("Lookaside Lists", status);
+
+    ShadowStrikeLogBootStep(RegistryPath, 5); // Lookaside lists ready
 
     // =========================================================================
     // PHASE 1A: Synchronization Infrastructure
@@ -1533,6 +1637,8 @@ DriverEntry(
         ShadowStrikeLogInitStatus("Compression Engine", STATUS_SUCCESS);
     }
 
+    ShadowStrikeLogBootStep(RegistryPath, 9); // Pre-FltRegisterFilter
+
     //
     // Step 6: Register the minifilter
     //
@@ -1550,6 +1656,8 @@ DriverEntry(
     }
     g_InitFlags |= InitFlag_FilterRegistered;
     ShadowStrikeLogInitStatus("FltRegisterFilter", status);
+
+    ShadowStrikeLogBootStep(RegistryPath, 10); // FltRegisterFilter succeeded
 
     //
     // Step 6.1: Wire WorkQueue with FilterHandle + DeviceObject now available.
@@ -1594,6 +1702,8 @@ DriverEntry(
     }
     g_InitFlags |= InitFlag_CommPortCreated;
     ShadowStrikeLogInitStatus("Communication Port", status);
+
+    ShadowStrikeLogBootStep(RegistryPath, 11); // CommPort created
 
     //
     // Step 7.5: Initialize telemetry events (requires DeviceObject from FltRegisterFilter)
@@ -1781,6 +1891,8 @@ DriverEntry(
     // PHASE 2: Detection Subsystems
     // =========================================================================
 
+    ShadowStrikeLogBootStep(RegistryPath, 13); // Pre-detection subsystems
+
     //
     // Step 10.1: Initialize behavioral engine (multi-stage attack detection)
     // Children: AttackChainTracker, PatternMatcher, RuleEngine, IOCMatcher, MITREMapper
@@ -1851,6 +1963,8 @@ DriverEntry(
         ShadowStrikeLogInitStatus("Syscall Monitor", STATUS_SUCCESS);
     }
 
+    ShadowStrikeLogBootStep(RegistryPath, 15); // Pre-NetworkFilter
+
     //
     // Step 10.4: Initialize network filter (WFP-based network detection)
     // Children: DnsMonitor, C2Detection, DataExfiltration, ConnectionTracker,
@@ -1867,6 +1981,8 @@ DriverEntry(
         g_SubsystemFlags |= SubsysFlag_NetworkFilter;
         ShadowStrikeLogInitStatus("Network Filter", STATUS_SUCCESS);
     }
+
+    ShadowStrikeLogBootStep(RegistryPath, 16); // Pre-process callbacks
 
     //
     // Step 11: Register process/thread notification callbacks
@@ -2118,6 +2234,8 @@ DriverEntry(
     // PHASE 4A: Boot-Time Protection (ELAM Alternative)
     // Initialize early-launch driver classification before self-protection
     // so boot drivers are monitored as soon as possible.
+
+    ShadowStrikeLogBootStep(RegistryPath, 19); // Pre-ELAM + self-protection
     // =========================================================================
 
     //
@@ -2486,16 +2604,18 @@ DriverEntry(
     // InstanceSetup is called during FltStartFiltering and accesses FSC global state
     // (VolumeList, ProcessContextList, lookaside lists). Without this init, BSOD occurs.
     //
+
+    ShadowStrikeLogBootStep(RegistryPath, 22); // Pre-FSC + callback subsystem init
     status = ShadowStrikeInitializeFileSystemCallbacks();
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] WARNING: Failed to initialize filesystem callbacks: 0x%08X\n",
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] CRITICAL: Failed to initialize filesystem callbacks: 0x%08X\n"
+                   "    Cannot start filtering - InstanceSetup requires FSC state.\n",
                    status);
-        status = STATUS_SUCCESS;
-    } else {
-        g_InitFlags |= InitFlag_FscInitialized;
-        ShadowStrikeLogInitStatus("Filesystem Callbacks", STATUS_SUCCESS);
+        goto Cleanup;
     }
+    g_InitFlags |= InitFlag_FscInitialized;
+    ShadowStrikeLogInitStatus("Filesystem Callbacks", STATUS_SUCCESS);
 
     //
     // Step 14.27: Initialize PostCreate subsystem (stream context management,
@@ -2595,6 +2715,9 @@ DriverEntry(
     //
     // Step 15: Start filtering
     //
+
+    ShadowStrikeLogBootStep(RegistryPath, 24); // Pre-FltStartFiltering
+
     status = FltStartFiltering(g_DriverData.FilterHandle);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -2615,6 +2738,8 @@ DriverEntry(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Driver initialized successfully (InitFlags=0x%08X)\n",
                g_InitFlags);
+
+    ShadowStrikeLogBootStep(RegistryPath, 25); // Init complete — driver READY
 
     //
     // Emit ETW diagnostic event: driver started successfully

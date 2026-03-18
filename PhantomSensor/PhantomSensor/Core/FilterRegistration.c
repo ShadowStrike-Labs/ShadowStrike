@@ -790,6 +790,9 @@ ShadowStrikePreCreateNamedPipe(
 
 /**
  * @brief Post-operation callback for IRP_MJ_CREATE_NAMED_PIPE.
+ *
+ * Guard matches the PreCreateNamedPipe wrapper to prevent post-callback
+ * from executing before the driver is fully initialized.
  */
 FLT_POSTOP_CALLBACK_STATUS
 ShadowStrikePostCreateNamedPipe(
@@ -799,5 +802,13 @@ ShadowStrikePostCreateNamedPipe(
     _In_ FLT_POST_OPERATION_FLAGS Flags
     )
 {
+    if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING)) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    if (!ShadowStrikeIsDriverReady()) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
     return NpMonPostCreateNamedPipe(Data, FltObjects, CompletionContext, Flags);
 }

@@ -682,13 +682,6 @@ ShadowStrikePostWrite(
     }
 
     //
-    // Lazy initialization of global state with proper synchronization
-    //
-    if (!g_PostWriteState.Initialized) {
-        PwpInitializeState();
-    }
-
-    //
     // Check if we're draining - don't do any work during unload
     // This is CRITICAL for preventing BSODs during driver unload
     //
@@ -697,10 +690,23 @@ ShadowStrikePostWrite(
     }
 
     //
-    // Check if driver is ready for processing
+    // Check if driver is ready for processing BEFORE any state access.
+    // This guard must precede the lazy-init block below: during
+    // FltStartFiltering the driver is not yet READY and the PostWrite
+    // subsystem state may not be fully wired. Accessing g_PostWriteState
+    // fields (push locks, hash table) before READY would be unsafe.
     //
     if (!SHADOWSTRIKE_IS_READY()) {
         return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    //
+    // Lazy initialization of global state with proper synchronization.
+    // Safe here: SHADOWSTRIKE_IS_READY() above guarantees DriverEntry
+    // completed and ShadowStrikePostWriteInitialize() already ran.
+    //
+    if (!g_PostWriteState.Initialized) {
+        PwpInitializeState();
     }
 
     //

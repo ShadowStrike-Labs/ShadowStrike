@@ -712,6 +712,20 @@ Return Value:
     UNREFERENCED_PARAMETER(Flags);
 
     //
+    // Safety: FSC state must be initialized before we can attach.
+    // DriverEntry guarantees this by making FSC init fatal, but defend
+    // against any re-entry or abnormal code path that bypasses the guard.
+    //
+    if (!g_FscState.Initialized) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike/FS] CRITICAL: InstanceSetup called before FSC init - refusing attach\n"
+            );
+        return STATUS_FLT_DO_NOT_ATTACH;
+    }
+
+    //
     // Check if we should attach to this volume type
     //
     switch (VolumeDeviceType) {
