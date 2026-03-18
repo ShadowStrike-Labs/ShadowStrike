@@ -1746,7 +1746,7 @@ Return Value:
              Entry != &Generator->Schema->EventList;
              Entry = Entry->Flink) {
 
-            PES_EVENT_DEFINITION Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, ListEntry);
+            PES_EVENT_DEFINITION Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, OrderedEntry);
 
             Status = MgpStringBuilderAppendFormat(&Builder,
                 "MessageId=0x%08X\r\n"
@@ -1879,13 +1879,13 @@ Return Value:
              Entry != &Generator->Schema->EventList;
              Entry = Entry->Flink) {
 
-            Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, ListEntry);
+            Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, OrderedEntry);
 
             for (Entry2 = Entry->Flink;
                  Entry2 != &Generator->Schema->EventList;
                  Entry2 = Entry2->Flink) {
 
-                Event2 = CONTAINING_RECORD(Entry2, ES_EVENT_DEFINITION, ListEntry);
+                Event2 = CONTAINING_RECORD(Entry2, ES_EVENT_DEFINITION, OrderedEntry);
 
                 if (Event->EventId == Event2->EventId) {
                     Errors++;
@@ -2051,7 +2051,7 @@ Return Value:
              Entry != &Generator->Schema->EventList;
              Entry = Entry->Flink) {
 
-            PES_EVENT_DEFINITION FieldEvent = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, ListEntry);
+            PES_EVENT_DEFINITION FieldEvent = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, OrderedEntry);
 
             for (ULONG fi = 0; fi < FieldEvent->FieldCount; fi++) {
                 if (FieldEvent->Fields[fi].Type >= MG_FIELD_TYPE_COUNT) {
@@ -3256,7 +3256,7 @@ Routine Description:
          Entry != &Generator->Schema->EventList;
          Entry = Entry->Flink) {
 
-        Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, ListEntry);
+        Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, OrderedEntry);
 
         if (Event->FieldCount == 0) {
             continue;
@@ -3367,7 +3367,7 @@ Routine Description:
          Entry != &Generator->Schema->EventList;
          Entry = Entry->Flink) {
 
-        Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, ListEntry);
+        Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, OrderedEntry);
 
         //
         // Map event level to standard ETW level name
@@ -3701,7 +3701,7 @@ Routine Description:
              Entry != &Generator->Schema->EventList;
              Entry = Entry->Flink) {
 
-            Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, ListEntry);
+            Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, OrderedEntry);
 
             Status = MgpStringBuilderAppendFormat(Builder,
                 "                <string id=\"Event.%s\" value=\"",
@@ -3857,7 +3857,7 @@ Routine Description:
          Entry != &Generator->Schema->EventList;
          Entry = Entry->Flink) {
 
-        Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, ListEntry);
+        Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, OrderedEntry);
 
         Status = MgpStringBuilderAppendFormat(Builder,
             "#define %s_EVENT_%s    %u\r\n",
