@@ -428,6 +428,24 @@ TpGetThreadIndex(
     _In_ PTP_THREAD_INFO ThreadInfo
     );
 
+//=============================================================================
+// Public API - Diagnostics
+//=============================================================================
+
+//
+// Validate internal ThreadList integrity (Flink/Blink consistency).
+// Returns TRUE if list is valid, FALSE if corruption detected.
+// Writes diagnostic info to DbgPrint on corruption.
+// IRQL: <= DISPATCH_LEVEL
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+BOOLEAN
+TpValidateThreadList(
+    _In_ PTP_THREAD_POOL Pool,
+    _In_opt_ PCSTR CallerTag
+    );
+
 #ifdef __cplusplus
 }
 #endif

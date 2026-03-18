@@ -278,6 +278,18 @@ TppSafeRemoveHeadList(
     _Inout_ PLIST_ENTRY ListHead
     );
 
+/**
+ * @brief Safe InsertTailList without __fastfail.
+ *
+ * Returns FALSE if list head integrity check fails.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN
+TppSafeInsertTailList(
+    _Inout_ PLIST_ENTRY ListHead,
+    _Inout_ PLIST_ENTRY Entry
+    );
+
 static VOID
 TppSetThreadPriority(
     _In_ PKTHREAD Thread,
@@ -1301,9 +1313,138 @@ TpGetThreadIndex(
     return ThreadInfo->ThreadIndex;
 }
 
-// ============================================================================
-// PRIVATE IMPLEMENTATION - THREAD CREATION / DESTRUCTION
-// ============================================================================
+/**
+ * @brief Validate ThreadList integrity by walking the doubly-linked list.
+ *
+ * Acquires ThreadListLock (spinlock) and walks every entry, checking:
+ *  1. Flink->Blink == Entry (forward consistency)
+ *  2. Blink->Flink == Entry (backward consistency)
+ *  3. Traversal count <= MaxThreads (detect infinite loops from corruption)
+ *  4. Thread magic value is valid
+ *
+ * Prints diagnostics on corruption. Use CallerTag to identify the call site
+ * (e.g., "POST-AWQ-INIT", "POST-STEP-6").
+ *
+ * @return TRUE if the list is fully consistent, FALSE if corruption detected.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+BOOLEAN
+TpValidateThreadList(
+    _In_ PTP_THREAD_POOL Pool,
+    _In_opt_ PCSTR CallerTag
+)
+{
+    KIRQL oldIrql;
+    PLIST_ENTRY entry;
+    PLIST_ENTRY listHead;
+    PTP_THREAD_INFO threadInfo;
+    ULONG count = 0;
+    ULONG maxEntries;
+    BOOLEAN valid = TRUE;
+    PCSTR tag = CallerTag ? CallerTag : "UNKNOWN";
+
+    if (Pool == NULL || Pool->Magic != TP_POOL_MAGIC) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike:TP-VALIDATE:%s] Invalid pool (NULL or bad magic)\n", tag);
+        return FALSE;
+    }
+
+    maxEntries = Pool->MaxThreads + 4;
+    listHead = &Pool->ThreadList;
+
+    KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
+
+    //
+    // Validate list head self-consistency
+    //
+    if (listHead->Flink == NULL || listHead->Blink == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike:TP-VALIDATE:%s] LIST HEAD NULL: Flink=%p Blink=%p\n",
+                   tag, listHead->Flink, listHead->Blink);
+        KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
+        return FALSE;
+    }
+
+    if (IsListEmpty(listHead)) {
+        KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                   "[ShadowStrike:TP-VALIDATE:%s] OK (empty list)\n", tag);
+        return TRUE;
+    }
+
+    //
+    // Walk each entry and validate bidirectional consistency
+    //
+    for (entry = listHead->Flink;
+         entry != listHead && count < maxEntries;
+         entry = entry->Flink) {
+
+        count++;
+
+        if (entry == NULL) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike:TP-VALIDATE:%s] NULL Flink at entry #%u\n", tag, count);
+            valid = FALSE;
+            break;
+        }
+
+        if (entry->Blink == NULL) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike:TP-VALIDATE:%s] NULL Blink at entry #%u (%p)\n",
+                       tag, count, entry);
+            valid = FALSE;
+            break;
+        }
+
+        if (entry->Flink != NULL && entry->Flink->Blink != entry) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike:TP-VALIDATE:%s] FORWARD CORRUPTION at entry #%u: "
+                       "Flink=%p Flink->Blink=%p (expected %p)\n",
+                       tag, count, entry->Flink, entry->Flink->Blink, entry);
+            valid = FALSE;
+            break;
+        }
+
+        if (entry->Blink->Flink != entry) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike:TP-VALIDATE:%s] BACKWARD CORRUPTION at entry #%u: "
+                       "Blink=%p Blink->Flink=%p (expected %p)\n",
+                       tag, count, entry->Blink, entry->Blink->Flink, entry);
+            valid = FALSE;
+            break;
+        }
+
+        //
+        // Validate thread info magic
+        //
+        threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
+        if (threadInfo->Magic != TP_THREAD_INFO_MAGIC) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike:TP-VALIDATE:%s] BAD MAGIC at entry #%u: "
+                       "expected 0x%08X got 0x%08X (entry=%p)\n",
+                       tag, count, TP_THREAD_INFO_MAGIC, threadInfo->Magic, entry);
+            valid = FALSE;
+            break;
+        }
+    }
+
+    if (count >= maxEntries) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike:TP-VALIDATE:%s] INFINITE LOOP detected (>%u entries)\n",
+                   tag, maxEntries);
+        valid = FALSE;
+    }
+
+    KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
+
+    if (valid) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                   "[ShadowStrike:TP-VALIDATE:%s] OK (%u entries)\n", tag, count);
+    }
+
+    return valid;
+}
 
 _IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
@@ -1411,7 +1552,22 @@ TppCreateThread(
     // Add to thread list BEFORE signaling start
     //
     KeAcquireSpinLock(&Pool->ThreadListLock, &oldIrql);
-    InsertTailList(&Pool->ThreadList, &info->ListEntry);
+    if (!TppSafeInsertTailList(&Pool->ThreadList, &info->ListEntry)) {
+        KeReleaseSpinLock(&Pool->ThreadListLock, oldIrql);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike:TP] TppCreateThread: ThreadList corrupted, cannot insert thread %u\n",
+                   info->ThreadIndex);
+        info->StopRequested = 1;
+        KeSetEvent(&info->StartEvent, IO_NO_INCREMENT, FALSE);
+        ZwWaitForSingleObject(threadHandle, FALSE, NULL);
+        ZwClose(threadHandle);
+        if (info->ThreadObject != NULL) {
+            ObDereferenceObject(info->ThreadObject);
+        }
+        TppReleasePoolReference(Pool);
+        ShadowStrikeFreePoolWithTag(info, TP_POOL_TAG_THREAD);
+        return STATUS_DATA_ERROR;
+    }
     InterlockedExchange(&info->Registered, 1);
     InterlockedIncrement(&Pool->ThreadCount);
     InterlockedIncrement(&Pool->IdleThreadCount);
@@ -2201,8 +2357,49 @@ TppSafeRemoveHeadList(
 }
 
 /**
- * @brief Set kernel thread priority.
+ * @brief Safe InsertTailList that validates list head integrity before inserting.
  *
+ * WDK's InsertTailList checks ListHead->Blink->Flink == ListHead before
+ * insertion. On failure it calls __fastfail(FAST_FAIL_CORRUPT_LIST_ENTRY).
+ * This version returns FALSE instead.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN
+TppSafeInsertTailList(
+    _Inout_ PLIST_ENTRY ListHead,
+    _Inout_ PLIST_ENTRY Entry
+)
+{
+    PLIST_ENTRY Blink;
+
+    if (ListHead == NULL || Entry == NULL) {
+        return FALSE;
+    }
+
+    Blink = ListHead->Blink;
+    if (Blink == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike:TP] INSERT CORRUPTION: ListHead->Blink is NULL (Head=%p)\n",
+                   ListHead);
+        return FALSE;
+    }
+
+    if (Blink->Flink != ListHead) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike:TP] INSERT CORRUPTION: Blink->Flink=%p != ListHead=%p (Blink=%p)\n",
+                   Blink->Flink, ListHead, Blink);
+        return FALSE;
+    }
+
+    Entry->Flink = ListHead;
+    Entry->Blink = Blink;
+    Blink->Flink = Entry;
+    ListHead->Blink = Entry;
+    return TRUE;
+}
+
+/**
+ * @brief Set kernel thread priority.
  * Uses KeSetPriorityThread (absolute priority), NOT KeSetBasePriorityThread
  * (which takes a priority INCREMENT, not an absolute value â€” HIGH-06 fix).
  *

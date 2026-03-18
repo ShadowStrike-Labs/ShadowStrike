@@ -1090,6 +1090,20 @@ DriverEntry(
     ULONG buildNumber = 0;
 
     //
+    // Diagnostic: validate ThreadPool->ThreadList integrity after each init step.
+    // Set to 0 to disable once root cause found. Tag identifies the step.
+    //
+#define TP_VALIDATE_AFTER_STEP(stepTag) \
+    do { \
+        if (g_ThreadPool != NULL) { \
+            if (!TpValidateThreadList(g_ThreadPool, stepTag)) { \
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
+                    "[ShadowStrike] *** THREAD LIST CORRUPTION DETECTED AFTER %s ***\n", stepTag); \
+            } \
+        } \
+    } while (0)
+
+    //
     // Boot-step breadcrumb: Step 0 = DriverEntry entered.
     // After a BSOD, read the registry to find the last completed step:
     //   reg query "HKLM\SYSTEM\CurrentControlSet\Services\PhantomSensor\Parameters" /v LastInitStep
@@ -1288,6 +1302,7 @@ DriverEntry(
         g_SubsystemFlags |= SubsysFlag_ThreadPool;
         ShadowStrikeLogInitStatus("Thread Pool", STATUS_SUCCESS);
     }
+    TP_VALIDATE_AFTER_STEP("5.2-ThreadPool");
 
     //
     // Step 5.3: Initialize async work queue (deferred async processing)
@@ -1308,6 +1323,7 @@ DriverEntry(
         g_SubsystemFlags |= SubsysFlag_AsyncWorkQueue;
         ShadowStrikeLogInitStatus("Async Work Queue", STATUS_SUCCESS);
     }
+    TP_VALIDATE_AFTER_STEP("5.3-AsyncWorkQueue");
 
     //
     // Step 5.4: Create control device for TimerManager work items.
@@ -1352,6 +1368,7 @@ DriverEntry(
         g_SubsystemFlags |= SubsysFlag_TimerManager;
         ShadowStrikeLogInitStatus("Timer Manager", STATUS_SUCCESS);
     }
+    TP_VALIDATE_AFTER_STEP("5.5-TimerManager");
 
     //
     // Step 5.5: Initialize DPC manager (deferred procedure call management)
@@ -1367,6 +1384,7 @@ DriverEntry(
         g_SubsystemFlags |= SubsysFlag_DeferredProcedure;
         ShadowStrikeLogInitStatus("DPC Manager", STATUS_SUCCESS);
     }
+    TP_VALIDATE_AFTER_STEP("5.5-DPC");
 
     // =========================================================================
     // PHASE 1B: Performance Infrastructure
@@ -1658,6 +1676,7 @@ DriverEntry(
     ShadowStrikeLogInitStatus("FltRegisterFilter", status);
 
     ShadowStrikeLogBootStep(RegistryPath, 10); // FltRegisterFilter succeeded
+    TP_VALIDATE_AFTER_STEP("6-FltRegisterFilter");
 
     //
     // Step 6.1: Wire WorkQueue with FilterHandle + DeviceObject now available.
@@ -1704,6 +1723,7 @@ DriverEntry(
     ShadowStrikeLogInitStatus("Communication Port", status);
 
     ShadowStrikeLogBootStep(RegistryPath, 11); // CommPort created
+    TP_VALIDATE_AFTER_STEP("7-CommPort");
 
     //
     // Step 7.5: Initialize telemetry events (requires DeviceObject from FltRegisterFilter)
@@ -1907,6 +1927,7 @@ DriverEntry(
         g_SubsystemFlags |= SubsysFlag_BehaviorEngine;
         ShadowStrikeLogInitStatus("Behavioral Engine", STATUS_SUCCESS);
     }
+    TP_VALIDATE_AFTER_STEP("10.1-BehaviorEngine");
 
     //
     // Step 10.2: Initialize memory monitoring subsystem
@@ -1981,6 +2002,7 @@ DriverEntry(
         g_SubsystemFlags |= SubsysFlag_NetworkFilter;
         ShadowStrikeLogInitStatus("Network Filter", STATUS_SUCCESS);
     }
+    TP_VALIDATE_AFTER_STEP("10.4-NetworkFilter");
 
     ShadowStrikeLogBootStep(RegistryPath, 16); // Pre-process callbacks
 
@@ -2717,6 +2739,7 @@ DriverEntry(
     //
 
     ShadowStrikeLogBootStep(RegistryPath, 24); // Pre-FltStartFiltering
+    TP_VALIDATE_AFTER_STEP("PRE-FltStartFiltering");
 
     status = FltStartFiltering(g_DriverData.FilterHandle);
     if (!NT_SUCCESS(status)) {
@@ -2728,6 +2751,7 @@ DriverEntry(
     g_InitFlags |= InitFlag_FilteringStarted;
     WriteBooleanRelease(&g_DriverData.FilteringStarted, TRUE);
     ShadowStrikeLogInitStatus("FltStartFiltering", status);
+    TP_VALIDATE_AFTER_STEP("POST-FltStartFiltering");
 
     //
     // Mark driver as initialized with proper memory barrier
@@ -2762,6 +2786,7 @@ DriverEntry(
     return STATUS_SUCCESS;
 
 Cleanup:
+#undef TP_VALIDATE_AFTER_STEP
     //
     // Cleanup precisely based on what was initialized
     //
