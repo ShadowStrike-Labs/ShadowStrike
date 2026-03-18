@@ -236,6 +236,8 @@ Any derivative work must also be released under AGPL-3.0. For commercial licensi
 - [Zydis](https://github.com/zyantific/zydis) — x86/x64 disassembler
 - The security research community whose published work makes open EDR possible
 
+
+For Business : ShadowStrike.Labs@outlook.com
 ---
 
 <div align="center">
