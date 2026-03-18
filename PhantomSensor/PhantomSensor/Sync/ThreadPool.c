@@ -251,6 +251,33 @@ TppReleasePoolReference(
     _Inout_ PTP_THREAD_POOL Pool
     );
 
+/**
+ * @brief Safe list entry removal that validates integrity before unlinking.
+ *
+ * Windows' RemoveEntryList includes __fastfail(FAST_FAIL_CORRUPT_LIST_ENTRY)
+ * if Flink/Blink are inconsistent, causing an unrecoverable BSOD. This helper
+ * performs the same unlinking but returns FALSE on corruption instead of
+ * crashing, allowing the driver to degrade gracefully.
+ *
+ * IRQL: Any (no allocations, no waits).
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN
+TppSafeRemoveEntryList(
+    _Inout_ PLIST_ENTRY Entry
+    );
+
+/**
+ * @brief Safe list head removal (RemoveHeadList equivalent).
+ *
+ * Returns the removed entry, or NULL if the list is empty or corrupted.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static PLIST_ENTRY
+TppSafeRemoveHeadList(
+    _Inout_ PLIST_ENTRY ListHead
+    );
+
 static VOID
 TppSetThreadPriority(
     _In_ PKTHREAD Thread,
@@ -555,18 +582,26 @@ TpDestroy(
 
     KeAcquireSpinLock(&pool->ThreadListLock, &oldIrql);
     while (!IsListEmpty(&pool->ThreadList)) {
-        entry = RemoveHeadList(&pool->ThreadList);
+        entry = TppSafeRemoveHeadList(&pool->ThreadList);
+        if (entry == NULL) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike:TP] TpDestroy: corrupted ThreadList, breaking\n");
+            break;
+        }
         threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
         InterlockedExchange(&threadInfo->RemovedFromPoolList, 1);
+        InitializeListHead(entry);
         InsertTailList(&threadsToDestroy, &threadInfo->ListEntry);
     }
     KeReleaseSpinLock(&pool->ThreadListLock, oldIrql);
 
     //
     // Step 6: Destroy each thread (signal stop + wait + cleanup).
+    // threadsToDestroy is a local list we control — still use safe ops defensively.
     //
     while (!IsListEmpty(&threadsToDestroy)) {
-        entry = RemoveHeadList(&threadsToDestroy);
+        entry = TppSafeRemoveHeadList(&threadsToDestroy);
+        if (entry == NULL) break;
         InitializeListHead(entry);
         threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
         TppDestroyThread(threadInfo, WaitForCompletion);
@@ -737,7 +772,12 @@ TpRemoveThreads(
         threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
 
         if (threadInfo->State == TpThreadState_Idle) {
-            RemoveEntryList(entry);
+            if (!TppSafeRemoveEntryList(entry)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike:TP] TpRemoveThreads: corrupted idle entry %p, skipping\n", entry);
+                entry = next;
+                continue;
+            }
             InterlockedExchange(&threadInfo->RemovedFromPoolList, 1);
             InitializeListHead(entry);
             InsertTailList(&threadsToRemove, entry);
@@ -757,7 +797,12 @@ TpRemoveThreads(
 
         if (threadInfo->State == TpThreadState_Running ||
             threadInfo->State == TpThreadState_Starting) {
-            RemoveEntryList(entry);
+            if (!TppSafeRemoveEntryList(entry)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike:TP] TpRemoveThreads: corrupted running entry %p, skipping\n", entry);
+                entry = next;
+                continue;
+            }
             InterlockedExchange(&threadInfo->RemovedFromPoolList, 1);
             InitializeListHead(entry);
             InsertTailList(&threadsToRemove, entry);
@@ -773,7 +818,8 @@ TpRemoveThreads(
     // Destroy removed threads outside spinlock
     //
     while (!IsListEmpty(&threadsToRemove)) {
-        entry = RemoveHeadList(&threadsToRemove);
+        entry = TppSafeRemoveHeadList(&threadsToRemove);
+        if (entry == NULL) break;
         InitializeListHead(entry);
         threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
         TppDestroyThread(threadInfo, WaitForCompletion);
@@ -1723,9 +1769,15 @@ ExitCleanup:
         //
         KeAcquireSpinLock(&pool->ThreadListLock, &oldIrql);
         if (!threadInfo->RemovedFromPoolList) {
-            RemoveEntryList(&threadInfo->ListEntry);
-            InitializeListHead(&threadInfo->ListEntry);
-            InterlockedExchange(&threadInfo->RemovedFromPoolList, 1);
+            if (TppSafeRemoveEntryList(&threadInfo->ListEntry)) {
+                InitializeListHead(&threadInfo->ListEntry);
+                InterlockedExchange(&threadInfo->RemovedFromPoolList, 1);
+            } else {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike:TP] ExitCleanup: corrupted ListEntry %p (thread %u), "
+                           "skipping removal\n", &threadInfo->ListEntry, threadInfo->ThreadIndex);
+                InterlockedExchange(&threadInfo->RemovedFromPoolList, 1);
+            }
         }
         KeReleaseSpinLock(&pool->ThreadListLock, oldIrql);
 
@@ -2075,6 +2127,77 @@ TppReleasePoolReference(
     if (ref == 0) {
         ShadowStrikeFreePoolWithTag(Pool, TP_POOL_TAG_CONTEXT);
     }
+}
+
+/**
+ * @brief Safe list entry removal without __fastfail.
+ *
+ * Validates that Flink->Blink == Entry and Blink->Flink == Entry before
+ * unlinking. Returns FALSE if corruption is detected, allowing the caller
+ * to handle it without crashing the system.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN
+TppSafeRemoveEntryList(
+    _Inout_ PLIST_ENTRY Entry
+)
+{
+    PLIST_ENTRY Flink;
+    PLIST_ENTRY Blink;
+
+    if (Entry == NULL) {
+        return FALSE;
+    }
+
+    Flink = Entry->Flink;
+    Blink = Entry->Blink;
+
+    if (Flink == NULL || Blink == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike:TP] LIST CORRUPTION: NULL Flink/Blink (Entry=%p F=%p B=%p)\n",
+                   Entry, Flink, Blink);
+        return FALSE;
+    }
+
+    if (Flink->Blink != Entry || Blink->Flink != Entry) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike:TP] LIST CORRUPTION: Flink->Blink=%p Blink->Flink=%p Entry=%p\n",
+                   Flink->Blink, Blink->Flink, Entry);
+        return FALSE;
+    }
+
+    Blink->Flink = Flink;
+    Flink->Blink = Blink;
+    return TRUE;
+}
+
+/**
+ * @brief Safe head removal from a list without __fastfail.
+ *
+ * Returns the removed entry, or NULL if empty or corrupted.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static PLIST_ENTRY
+TppSafeRemoveHeadList(
+    _Inout_ PLIST_ENTRY ListHead
+)
+{
+    PLIST_ENTRY Entry;
+
+    if (ListHead == NULL || IsListEmpty(ListHead)) {
+        return NULL;
+    }
+
+    Entry = ListHead->Flink;
+    if (Entry == NULL || Entry == ListHead) {
+        return NULL;
+    }
+
+    if (!TppSafeRemoveEntryList(Entry)) {
+        return NULL;
+    }
+
+    return Entry;
 }
 
 /**
