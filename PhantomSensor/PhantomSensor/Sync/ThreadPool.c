@@ -115,8 +115,9 @@ struct _TP_THREAD_INFO {
     volatile LONG IsExecuting;
 
     // Lifecycle flags
-    volatile LONG Registered;       // TRUE if added to pool's ThreadList and counters
-    volatile LONG OwnerWillDestroy; // TRUE if TppDestroyThread will handle cleanup
+    volatile LONG Registered;           // TRUE if added to pool's ThreadList and counters
+    volatile LONG OwnerWillDestroy;     // TRUE if TppDestroyThread will handle cleanup
+    volatile LONG RemovedFromPoolList;  // TRUE if already removed from Pool->ThreadList
 
     // Owner pool (back-pointer, protected by pool lifetime)
     struct _TP_THREAD_POOL* Pool;
@@ -556,6 +557,7 @@ TpDestroy(
     while (!IsListEmpty(&pool->ThreadList)) {
         entry = RemoveHeadList(&pool->ThreadList);
         threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
+        InterlockedExchange(&threadInfo->RemovedFromPoolList, 1);
         InsertTailList(&threadsToDestroy, &threadInfo->ListEntry);
     }
     KeReleaseSpinLock(&pool->ThreadListLock, oldIrql);
@@ -565,6 +567,7 @@ TpDestroy(
     //
     while (!IsListEmpty(&threadsToDestroy)) {
         entry = RemoveHeadList(&threadsToDestroy);
+        InitializeListHead(entry);
         threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
         TppDestroyThread(threadInfo, WaitForCompletion);
     }
@@ -735,6 +738,7 @@ TpRemoveThreads(
 
         if (threadInfo->State == TpThreadState_Idle) {
             RemoveEntryList(entry);
+            InterlockedExchange(&threadInfo->RemovedFromPoolList, 1);
             InitializeListHead(entry);
             InsertTailList(&threadsToRemove, entry);
             removed++;
@@ -754,6 +758,7 @@ TpRemoveThreads(
         if (threadInfo->State == TpThreadState_Running ||
             threadInfo->State == TpThreadState_Starting) {
             RemoveEntryList(entry);
+            InterlockedExchange(&threadInfo->RemovedFromPoolList, 1);
             InitializeListHead(entry);
             InsertTailList(&threadsToRemove, entry);
             removed++;
@@ -769,6 +774,7 @@ TpRemoveThreads(
     //
     while (!IsListEmpty(&threadsToRemove)) {
         entry = RemoveHeadList(&threadsToRemove);
+        InitializeListHead(entry);
         threadInfo = CONTAINING_RECORD(entry, TP_THREAD_INFO, ListEntry);
         TppDestroyThread(threadInfo, WaitForCompletion);
     }
@@ -1711,13 +1717,15 @@ ExitCleanup:
 
         //
         // Remove ourselves from the thread list under spinlock.
-        // TppDestroyThread may have already removed us (TpRemoveThreads path),
-        // so check IsListEmpty first.
+        // TpShutdown/TpRemoveThreads may have already removed us and set
+        // RemovedFromPoolList — check the flag (not IsListEmpty, which can
+        // see stale Flink/Blink from a local threadsToDestroy list).
         //
         KeAcquireSpinLock(&pool->ThreadListLock, &oldIrql);
-        if (!IsListEmpty(&threadInfo->ListEntry)) {
+        if (!threadInfo->RemovedFromPoolList) {
             RemoveEntryList(&threadInfo->ListEntry);
             InitializeListHead(&threadInfo->ListEntry);
+            InterlockedExchange(&threadInfo->RemovedFromPoolList, 1);
         }
         KeReleaseSpinLock(&pool->ThreadListLock, oldIrql);
 
