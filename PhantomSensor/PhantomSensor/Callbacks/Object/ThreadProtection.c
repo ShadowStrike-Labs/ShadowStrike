@@ -1629,10 +1629,14 @@ TppFindOrCreateTracker(
 
     //
     // Insert into lists
+    // Initial refcount (1) = list ownership reference.
+    // Add caller reference so release in TpTrackActivity does not free
+    // a tracker that is still linked in ActivityList + hash bucket.
     //
     InsertTailList(&g_TpState.ActivityList, &newTracker->ListEntry);
     InsertTailList(hashHead, &newTracker->HashEntry);
     InterlockedIncrement(&g_TpState.ActiveTrackers);
+    InterlockedIncrement(&newTracker->ReferenceCount);
 
     KeReleaseSpinLock(&g_TpState.ActivitySpinLock, oldIrql);
 
