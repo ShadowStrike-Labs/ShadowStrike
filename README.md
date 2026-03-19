@@ -2,7 +2,12 @@
 <a href="https://shadowstrike.dev">
   <img src="https://shadowstrike.dev/logo.png" alt="ShadowStrike Phantom" width="120"/>
 </a>
-# ShadowStrike Phantom
+
+  Loaded Succesfully + ETW Tracing Works.
+<img width="2552" height="1327" alt="Screenshot 2026-03-19 141605-2" src="https://github.com/user-attachments/assets/1bc89108-3c12-414c-b538-df35db11d62f" />
+
+Driver Verifier Pass
+<img width="2506" height="1323" alt="Screenshot 2026-03-19 143358" src="https://github.com/user-attachments/assets/d9e97fcd-9730-453e-a1a3-e9f123ded97d" />
 
 **Next-Generation Open-Source Endpoint Protection Platform for Windows**
 
@@ -236,9 +241,8 @@ Any derivative work must also be released under AGPL-3.0. For commercial licensi
 - [Zydis](https://github.com/zyantific/zydis) — x86/x64 disassembler
 - The security research community whose published work makes open EDR possible
 
-
-For Business : ShadowStrike.Labs@outlook.com
 ---
+For Business  Opportunities : ShadowStrike.Labs@outlook.com
 
 <div align="center">
 
