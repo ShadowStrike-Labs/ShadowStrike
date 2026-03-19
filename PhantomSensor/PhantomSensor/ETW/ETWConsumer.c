@@ -59,14 +59,15 @@
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, EcInitialize)
 #pragma alloc_text(PAGE, EcShutdown)
-#pragma alloc_text(PAGE, EcStart)
-#pragma alloc_text(PAGE, EcStop)
+//
+// EcStart, EcStop, EcSubscribe, EcResetStatistics acquire
+// SubscriptionLock (KSPIN_LOCK) which raises IRQL to DISPATCH_LEVEL.
+// Code executing at DISPATCH must be in nonpaged memory.
+// EcSubscribeByGuid calls EcSubscribe internally.
+// EcUnsubscribe also acquires SubscriptionLock.
+//
 #pragma alloc_text(PAGE, EcPause)
 #pragma alloc_text(PAGE, EcResume)
-#pragma alloc_text(PAGE, EcSubscribe)
-#pragma alloc_text(PAGE, EcSubscribeByGuid)
-#pragma alloc_text(PAGE, EcUnsubscribe)
-#pragma alloc_text(PAGE, EcResetStatistics)
 #pragma alloc_text(PAGE, EcSubscribeKernelProcess)
 #pragma alloc_text(PAGE, EcSubscribeKernelFile)
 #pragma alloc_text(PAGE, EcSubscribeKernelNetwork)
@@ -440,7 +441,9 @@ EcStart(
     KIRQL OldIrql;
     LONG State;
 
-    PAGED_CODE();
+    //
+    // NOT paged: acquires SubscriptionLock (spinlock -> DISPATCH_LEVEL)
+    //
 
     if (Consumer == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -549,7 +552,9 @@ EcStop(
     KIRQL OldIrql;
     LONG State;
 
-    PAGED_CODE();
+    //
+    // NOT paged: acquires SubscriptionLock (spinlock -> DISPATCH_LEVEL)
+    //
 
     if (Consumer == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -867,7 +872,9 @@ EcSubscribe(
     PEC_SUBSCRIPTION NewSub = NULL;
     KIRQL OldIrql;
 
-    PAGED_CODE();
+    //
+    // NOT paged: acquires SubscriptionLock (spinlock -> DISPATCH_LEVEL)
+    //
 
     if (Consumer == NULL || Config == NULL || Subscription == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -979,7 +986,9 @@ EcSubscribeByGuid(
 {
     EC_SUBSCRIPTION_CONFIG Config;
 
-    PAGED_CODE();
+    //
+    // NOT paged: calls EcSubscribe which acquires SubscriptionLock
+    //
 
     if (Consumer == NULL || ProviderId == NULL ||
         Callback == NULL || Subscription == NULL) {
@@ -1010,7 +1019,9 @@ EcUnsubscribe(
 {
     KIRQL OldIrql;
 
-    PAGED_CODE();
+    //
+    // NOT paged: acquires SubscriptionLock (spinlock -> DISPATCH_LEVEL)
+    //
 
     if (Consumer == NULL || Subscription == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1413,7 +1424,9 @@ EcResetStatistics(
     PEC_SUBSCRIPTION Sub;
     KIRQL OldIrql;
 
-    PAGED_CODE();
+    //
+    // NOT paged: acquires SubscriptionLock (spinlock -> DISPATCH_LEVEL)
+    //
 
     if (Consumer == NULL) {
         return;
