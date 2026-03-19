@@ -393,7 +393,7 @@ NpmExtractPipeName(
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, NpMonInitialize)
-#pragma alloc_text(PAGE, NpMonShutdown)
+// Removed: #pragma alloc_text(PAGE, NpMonShutdown) — acquires spinlock (DISPATCH_LEVEL)
 #pragma alloc_text(PAGE, NpmExtractPipeName)
 #pragma alloc_text(PAGE, NpmClassifyPipe)
 #pragma alloc_text(PAGE, NpmValidateSystemPipe)
@@ -504,7 +504,7 @@ NpMonShutdown(
 {
     LONG prevState;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     prevState = InterlockedCompareExchange(
         &g_NpmState.State,

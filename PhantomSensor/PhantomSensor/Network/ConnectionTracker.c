@@ -235,9 +235,9 @@ CtpCleanupThreadRoutine(
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, CtInitialize)
-#pragma alloc_text(PAGE, CtShutdown)
-#pragma alloc_text(PAGE, CtCreateConnection)
-#pragma alloc_text(PAGE, CtGetProcessConnections)
+// Removed: #pragma alloc_text(PAGE, CtShutdown) — acquires spinlock (DISPATCH_LEVEL)
+// Removed: #pragma alloc_text(PAGE, CtCreateConnection) — acquires spinlock (DISPATCH_LEVEL)
+// Removed: #pragma alloc_text(PAGE, CtGetProcessConnections) — acquires spinlock (DISPATCH_LEVEL)
 #pragma alloc_text(PAGE, CtGetProcessNetworkStats)
 #pragma alloc_text(PAGE, CtEnumerateConnections)
 #pragma alloc_text(PAGE, CtRegisterCallback)
@@ -503,7 +503,7 @@ CtShutdown(
     PCT_CONNECTION connection;
     PCT_PROCESS_CONTEXT processCtx;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (Tracker == NULL || !Tracker->Initialized) {
         return;
@@ -696,7 +696,7 @@ CtCreateConnection(
     KIRQL oldIrql;
     BOOLEAN duplicateFlow = FALSE;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (Tracker == NULL || !Tracker->Initialized || Connection == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1324,7 +1324,7 @@ CtGetProcessConnections(
     ULONG bucket;
     KIRQL oldIrql;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (Tracker == NULL || !Tracker->Initialized ||
         Connections == NULL || ConnectionCount == NULL) {

@@ -122,7 +122,7 @@ ExfReleasePushLockShared(
 #pragma alloc_text(PAGE, MmMonitorSetEnabled)
 #pragma alloc_text(PAGE, MmMonitorUpdateConfig)
 #pragma alloc_text(PAGE, MmMonitorGetProcessContext)
-#pragma alloc_text(PAGE, MmMonitorRemoveProcessContext)
+// Removed: #pragma alloc_text(PAGE, MmMonitorRemoveProcessContext) — acquires spinlock (DISPATCH_LEVEL)
 #pragma alloc_text(PAGE, MmMonitorBuildVadMap)
 #pragma alloc_text(PAGE, MmMonitorFreeVadMap)
 #pragma alloc_text(PAGE, MmMonitorFindSuspiciousVads)
@@ -1139,7 +1139,7 @@ MmMonitorRemoveProcessContext(
     PMM_PROCESS_HASH_ENTRY HashEntry;
     BOOLEAN Found = FALSE;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (!MmpIsActive()) {
         return;

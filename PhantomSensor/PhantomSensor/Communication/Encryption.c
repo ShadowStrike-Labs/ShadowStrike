@@ -55,7 +55,7 @@
 #pragma alloc_text(PAGE, EncDeriveKey)
 #pragma alloc_text(PAGE, EncImportKey)
 #pragma alloc_text(PAGE, EncExportKey)
-#pragma alloc_text(PAGE, EncDestroyKey)
+// Removed: #pragma alloc_text(PAGE, EncDestroyKey) — acquires spinlock (DISPATCH_LEVEL)
 #pragma alloc_text(PAGE, EncCreateContext)
 #pragma alloc_text(PAGE, EncDestroyContext)
 #pragma alloc_text(PAGE, EncSetAAD)
@@ -64,7 +64,7 @@
 #pragma alloc_text(PAGE, EncEncryptWithContext)
 #pragma alloc_text(PAGE, EncDecryptWithContext)
 #pragma alloc_text(PAGE, EncRotateKey)
-#pragma alloc_text(PAGE, EncRotateAllKeys)
+// Removed: #pragma alloc_text(PAGE, EncRotateAllKeys) — acquires spinlock (DISPATCH_LEVEL)
 #pragma alloc_text(PAGE, EncSetAutoRotation)
 #pragma alloc_text(PAGE, EncRandomBytes)
 #pragma alloc_text(PAGE, EncHmacSha256)
@@ -1341,7 +1341,7 @@ Routine Description:
     LARGE_INTEGER drainDelay;
     ULONG drainWaitCount;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (Key == NULL || Manager == NULL) {
         return;
@@ -2428,7 +2428,7 @@ EncRotateAllKeys(
     NTSTATUS status;
     ULONG i;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (Manager == NULL || !Manager->Initialized) {
         return STATUS_INVALID_PARAMETER;

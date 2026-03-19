@@ -68,12 +68,12 @@
 // ============================================================================
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, ShadowAcquireStreamContextShared)
-#pragma alloc_text(PAGE, ShadowAcquireStreamContextExclusive)
+// Removed: #pragma alloc_text(PAGE, ShadowAcquireStreamContextShared) — acquires spinlock (DISPATCH_LEVEL)
+// Removed: #pragma alloc_text(PAGE, ShadowAcquireStreamContextExclusive) — acquires spinlock (DISPATCH_LEVEL)
 #pragma alloc_text(PAGE, ShadowReleaseStreamContext)
 #pragma alloc_text(PAGE, ShadowGetOrCreateStreamContext)
 #pragma alloc_text(PAGE, ShadowGetStreamContext)
-#pragma alloc_text(PAGE, ShadowCleanupStreamContext)
+// Removed: #pragma alloc_text(PAGE, ShadowCleanupStreamContext) — acquires spinlock (DISPATCH_LEVEL)
 #pragma alloc_text(PAGE, ShadowInvalidateStreamContext)
 #pragma alloc_text(PAGE, ShadowSetStreamVerdict)
 #pragma alloc_text(PAGE, ShadowMarkScanInProgress)
@@ -190,7 +190,7 @@ ShadowAcquireStreamContextShared(
     KIRQL oldIrql;
     LONG state;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (Context == NULL) {
         return FALSE;
@@ -253,7 +253,7 @@ ShadowAcquireStreamContextExclusive(
     KIRQL oldIrql;
     LONG state;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (Context == NULL) {
         return FALSE;
@@ -506,7 +506,7 @@ ShadowCleanupStreamContext(
     ULONG waitCount = 0;
     USHORT fileNameLength = 0;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
     UNREFERENCED_PARAMETER(ContextType);
 
     //

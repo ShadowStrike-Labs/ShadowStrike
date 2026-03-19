@@ -65,7 +65,7 @@
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, TmInitialize)
-#pragma alloc_text(PAGE, TmShutdown)
+// Removed: #pragma alloc_text(PAGE, TmShutdown) — acquires spinlock (DISPATCH_LEVEL)
 #endif
 
 //=============================================================================
@@ -403,7 +403,7 @@ IRQL:
     LIST_ENTRY timersToFree;
     ULONG slotIndex;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (Manager == NULL) {
         return;

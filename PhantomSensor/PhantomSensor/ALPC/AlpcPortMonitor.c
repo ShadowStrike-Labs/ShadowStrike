@@ -167,7 +167,7 @@ ZwQueryObject(
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowAlpcInitialize)
-#pragma alloc_text(PAGE, ShadowAlpcCleanup)
+// Removed: #pragma alloc_text(PAGE, ShadowAlpcCleanup) — acquires spinlock (DISPATCH_LEVEL)
 #endif
 
 // ============================================================================
@@ -590,7 +590,7 @@ ShadowAlpcCleanup(
     LIST_ENTRY entriesToFree;
     LIST_ENTRY eventsToFree;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (!state->Initialized) {
         return;

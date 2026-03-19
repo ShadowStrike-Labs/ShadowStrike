@@ -175,7 +175,10 @@ TppReleaseTrackerRef(
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, TpInitializeThreadProtection)
-#pragma alloc_text(PAGE, TpShutdownThreadProtection)
+//
+// TpShutdownThreadProtection removed from PAGE:
+// Calls KeAcquireSpinLock(&g_TpState.ActivitySpinLock) at line 389.
+// PAGE code + spinlock = 0xD1 under Driver Verifier during fltmc unload.
 //
 // TpCleanupExpiredTrackers and TpCleanupProcessTracker removed from PAGE:
 // Both acquire KeAcquireSpinLock (DISPATCH_LEVEL). PAGE code + spinlock = 0xD1
@@ -327,7 +330,7 @@ TpShutdownThreadProtection(
     LONG refCount;
     BOOLEAN lookasideWasActive;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — this function acquires a spinlock (DISPATCH_LEVEL).
 
     //
     // Validate state

@@ -292,7 +292,7 @@ SbpSafeAddUlong(
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, ShadowStrikeScanBridgeInitialize)
-#pragma alloc_text(PAGE, ShadowStrikeScanBridgeShutdown)
+// Removed: #pragma alloc_text(PAGE, ShadowStrikeScanBridgeShutdown) — acquires spinlock (DISPATCH_LEVEL)
 #pragma alloc_text(PAGE, SbBuildFileScanRequest)
 #pragma alloc_text(PAGE, SbBuildFileScanRequestEx)
 #pragma alloc_text(PAGE, SbSendScanRequest)
@@ -478,7 +478,7 @@ ShadowStrikeScanBridgeShutdown(
     PSB_PENDING_REQUEST request;
     ULONG i;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (!g_ScanBridge.Initialized) {
         return;

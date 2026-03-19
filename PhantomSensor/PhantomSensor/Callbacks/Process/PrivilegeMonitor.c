@@ -81,7 +81,7 @@ PsGetProcessExitStatus(
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, PmInitialize)
-#pragma alloc_text(PAGE, PmShutdown)
+// Removed: #pragma alloc_text(PAGE, PmShutdown) — acquires spinlock (DISPATCH_LEVEL)
 #pragma alloc_text(PAGE, PmRecordBaseline)
 #pragma alloc_text(PAGE, PmRemoveBaseline)
 #pragma alloc_text(PAGE, PmMarkProcessTerminated)
@@ -901,7 +901,7 @@ Arguments:
     LIST_ENTRY BaselinesToFree;
     LIST_ENTRY EventsToFree;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (!PmpIsValidMonitorInternal(Internal)) {
         return;

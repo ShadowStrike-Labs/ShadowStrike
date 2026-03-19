@@ -54,7 +54,7 @@
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, PpInitialize)
+// Removed: #pragma alloc_text(PAGE, PpInitialize) — acquires spinlock (DISPATCH_LEVEL)
 #pragma alloc_text(PAGE, PpShutdown)
 #pragma alloc_text(PAGE, PpParseHTTPRequest)
 #pragma alloc_text(PAGE, PpParseHTTPResponse)
@@ -352,7 +352,7 @@ PpInitialize(
 {
     PPP_PARSER parser = NULL;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (Parser == NULL) {
         return STATUS_INVALID_PARAMETER;

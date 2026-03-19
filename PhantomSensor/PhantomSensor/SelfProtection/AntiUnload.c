@@ -76,7 +76,7 @@ PsGetProcessImageFileName(
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, AuInitialize)
-#pragma alloc_text(PAGE, AuShutdown)
+// Removed: #pragma alloc_text(PAGE, AuShutdown) — acquires spinlock (DISPATCH_LEVEL)
 #pragma alloc_text(PAGE, AuSetLevel)
 #pragma alloc_text(PAGE, AuRegisterCallback)
 #endif
@@ -241,7 +241,7 @@ AuShutdown(
     PAU_UNLOAD_EVENT event;
     KIRQL oldIrql;
 
-    PAGED_CODE();
+    // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
     if (Protector == NULL || !Protector->Initialized) {
         return;
