@@ -958,11 +958,15 @@ ShadowAllocateStreamContext(
     //
     // Allocate context from Filter Manager
     //
+    //
+    // NonPagedPoolNx required: SHADOW_STREAM_CONTEXT embeds ERESOURCE
+    // which must reside in nonpaged memory (MSDN).  DV 0xC4/E1.
+    //
     status = FltAllocateContext(
         g_DriverData.FilterHandle,
         FLT_STREAM_CONTEXT,
         sizeof(SHADOW_STREAM_CONTEXT),
-        PagedPool,
+        NonPagedPoolNx,
         (PFLT_CONTEXT*)&ctx
     );
 

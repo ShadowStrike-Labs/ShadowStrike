@@ -406,11 +406,13 @@ Return Value:
     *Monitor = NULL;
 
     //
-    // Allocate internal monitor structure from paged pool â€” all access is
-    // at PASSIVE_LEVEL so no need to consume precious non-paged pool.
+    // NonPagedPoolNx required: NI_MONITOR_INTERNAL embeds two
+    // PAGED_LOOKASIDE_LIST headers which must reside in nonpaged memory
+    // per MSDN, even though the entries they allocate come from paged
+    // pool.  Driver Verifier flags this as 0xC4 subcode 0xE1.
     //
     monitorInternal = (PNI_MONITOR_INTERNAL)ShadowStrikeAllocatePoolWithTag(
-        PagedPool,
+        NonPagedPoolNx,
         sizeof(NI_MONITOR_INTERNAL),
         NI_POOL_TAG_MONITOR
         );

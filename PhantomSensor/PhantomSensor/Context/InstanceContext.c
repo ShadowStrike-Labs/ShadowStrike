@@ -191,11 +191,15 @@ ShadowCreateInstanceContext(
     //
     // Allocate context from Filter Manager
     //
+    //
+    // NonPagedPoolNx required: SHADOW_INSTANCE_CONTEXT embeds ERESOURCE
+    // which must reside in nonpaged memory (MSDN).  DV 0xC4/E1.
+    //
     status = FltAllocateContext(
         FilterHandle,
         FLT_INSTANCE_CONTEXT,
         sizeof(SHADOW_INSTANCE_CONTEXT),
-        PagedPool,
+        NonPagedPoolNx,
         (PFLT_CONTEXT*)&ctx
     );
 
