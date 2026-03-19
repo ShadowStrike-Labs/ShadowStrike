@@ -58,7 +58,11 @@
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeWorkQueueInitialize)
 #pragma alloc_text(PAGE, ShadowStrikeWorkQueueInitializeEx)
-#pragma alloc_text(PAGE, ShadowStrikeWorkQueueShutdown)
+//
+// ShadowStrikeWorkQueueShutdown removed from PAGE:
+// Uses KeAcquireSpinLock (DISPATCH_LEVEL) at lines 261/328.
+// DV Force IRQL Checking trims PAGE code -> 0xD1.
+//
 #pragma alloc_text(PAGE, ShadowStrikeWorkQueueDrain)
 #pragma alloc_text(PAGE, ShadowStrikeWaitForWorkItem)
 #pragma alloc_text(PAGE, ShadowStrikeWorkQueueSetDeviceObject)
@@ -229,8 +233,6 @@ ShadowStrikeWorkQueueShutdown(
     _In_ BOOLEAN WaitForCompletion)
 {
     LARGE_INTEGER Timeout;
-
-    PAGED_CODE();
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_WqManager.InitLock);

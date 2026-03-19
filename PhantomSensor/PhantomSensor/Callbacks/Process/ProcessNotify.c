@@ -148,8 +148,14 @@ static VOID PnpCleanupStaleContexts(VOID);
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeInitializeProcessMonitoring)
-#pragma alloc_text(PAGE, ShadowStrikeCleanupProcessMonitoring)
-#pragma alloc_text(PAGE, PnpCleanupStaleContexts)
+//
+// ShadowStrikeCleanupProcessMonitoring removed from PAGE:
+// Uses KeAcquireSpinLock (NotificationLock) internally.
+// DV Force IRQL Checking trims PAGE code at DISPATCH_LEVEL -> 0xD1.
+//
+// PnpCleanupStaleContexts also removed from PAGE for consistency:
+// Called from cleanup paths that may run alongside spinlock-holding code.
+//
 #endif
 
 // ============================================================================
@@ -852,8 +858,6 @@ Routine Description:
     PPN_NOTIFICATION_ENTRY Notification;
     KIRQL OldIrql;
     LIST_ENTRY FreeList;
-
-    PAGED_CODE();
 
     if (!g_ProcessMonitor.Initialized) {
         return;
@@ -4748,8 +4752,6 @@ Routine Description:
     PLIST_ENTRY Entry, Next;
     PPN_PROCESS_CONTEXT Context;
     LIST_ENTRY StaleList;
-
-    PAGED_CODE();
 
     InitializeListHead(&StaleList);
 
