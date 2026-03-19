@@ -438,10 +438,13 @@ Return Value:
     EsAcquireReference(Schema);
 
     //
-    // Allocate generator structure (ExAllocatePool2 zero-initializes)
+    // Allocate generator structure from NonPaged pool.
+    // MG_GENERATOR embeds a KEVENT (ShutdownEvent) whose DISPATCHER_HEADER
+    // is touched by the kernel dispatcher at DISPATCH_LEVEL — paged pool
+    // would cause a page fault at elevated IRQL.
     //
     NewGenerator = (PMG_GENERATOR)ExAllocatePool2(
-        POOL_FLAG_PAGED,
+        POOL_FLAG_NON_PAGED,
         sizeof(MG_GENERATOR),
         MG_POOL_TAG
         );
