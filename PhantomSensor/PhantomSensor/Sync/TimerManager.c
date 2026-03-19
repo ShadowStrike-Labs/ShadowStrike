@@ -112,6 +112,15 @@ typedef struct _TM_TIMER_INTERNAL {
     volatile LONG DeletionPending;      // LONG for interlocked ops
     volatile LONG InWheelSlot;          // Track whether we're in the wheel
 
+    //
+    // Guard against double-queuing IO_WORKITEM. An IO_WORKITEM can only
+    // be queued once at a time — re-queuing an active work item triggers
+    // WORKER_INVALID (0xE4) bugcheck. For periodic timers, the DPC may
+    // fire again before the previous work item callback completes.
+    // CAS 0→1 in DPC, clear to 0 at end of work item callback.
+    //
+    volatile LONG WorkItemQueued;
+
 } TM_TIMER_INTERNAL, *PTM_TIMER_INTERNAL;
 
 //=============================================================================
@@ -1423,6 +1432,7 @@ Routine Description:
     //
     timerInternal->Signature = TM_TIMER_SIGNATURE;
     timerInternal->Manager = Manager;
+    timerInternal->WorkItemQueued = 0;
 
     //
     // Initialize kernel timer and DPC
@@ -2050,8 +2060,23 @@ Routine Description:
     // Increment PendingWorkItems BEFORE IoQueueWorkItem so TmShutdown
     // knows to wait. TmpWorkItemRoutine will decrement and signal.
     //
+    // FIX TM-C1: Guard against double-queuing. IO_WORKITEM can only be
+    // queued once at a time — re-queuing an active item triggers bugcheck
+    // WORKER_INVALID (0xE4). For periodic timers, if the work item from
+    // the previous fire is still queued or executing, skip this tick.
+    //
     if ((timerInternal->Timer.Flags & TmFlag_WorkItemCallback) &&
         timerInternal->WorkItem != NULL) {
+
+        if (InterlockedCompareExchange(&timerInternal->WorkItemQueued,
+                                       1, 0) != 0) {
+            //
+            // Work item still queued/executing from previous fire.
+            // Drop this tick — the periodic timer will fire again.
+            //
+            TmpDereferenceTimer(timerInternal);
+            return;
+        }
 
         InterlockedIncrement(&timerInternal->Manager->PendingWorkItems);
         KeClearEvent(&timerInternal->Manager->AllWorkItemsDrained);
@@ -2221,6 +2246,22 @@ Routine Description:
     manager = timerInternal->Manager;
 
     TmpFireTimer(timerInternal);
+
+    //
+    // FIX TM-C1: Clear WorkItemQueued BEFORE releasing our reference.
+    // For periodic timers, TmpFireTimer re-arms the timer (inserts into
+    // wheel). The next DPC may fire soon after — clearing the flag here
+    // allows it to re-queue the work item. Must happen before deref
+    // because deref could free timerInternal on one-shot auto-delete
+    // timers (UAF on WorkItemQueued field).
+    //
+    // For periodic timers, refcount cannot reach 0 here because the
+    // timer list and creation references are still held. For one-shot
+    // auto-delete timers, TmpFireTimer already released list + creation
+    // refs, so deref below hits 0 and frees — clearing first is safe
+    // because one-shot timers won't be re-queued anyway.
+    //
+    InterlockedExchange(&timerInternal->WorkItemQueued, 0);
 
     //
     // Release the reference that was added by the DPC routine

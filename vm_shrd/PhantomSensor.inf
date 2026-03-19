@@ -17,7 +17,7 @@ Class       = "AntiVirus"
 ClassGuid   = {b1d1a169-c54f-4379-81db-bee7d88d7454}
 Provider    = %ManufacturerName%
 CatalogFile = PhantomSensor.cat
-DriverVer   = 03/19/2026,17.2.0.0
+DriverVer = 03/19/2026,12.43.33.347
 PnpLockdown = 1
 
 ; ---------------------------------------------------------------------------

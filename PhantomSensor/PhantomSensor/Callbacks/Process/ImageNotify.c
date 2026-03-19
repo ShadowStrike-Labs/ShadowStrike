@@ -2179,21 +2179,29 @@ Arguments:
         PIOM_MATCHER iocMatcher = BeGetIocMatcher();
 
         if (iocMatcher != NULL) {
-            IOM_MATCH_RESULT_DATA iocResult;
+            PIOM_MATCH_RESULT_DATA iocResult =
+                (PIOM_MATCH_RESULT_DATA)ShadowStrikeAllocatePoolWithTag(
+                    NonPagedPoolNx,
+                    sizeof(IOM_MATCH_RESULT_DATA),
+                    'cOIx');
 
-            RtlZeroMemory(&iocResult, sizeof(iocResult));
+            if (iocResult != NULL) {
+                RtlZeroMemory(iocResult, sizeof(*iocResult));
 
-            if (IomMatchHash(
-                    iocMatcher,
-                    event->Sha256Hash,
-                    32,
-                    IomType_FileHash_SHA256,
-                    &iocResult
-                    ) == STATUS_SUCCESS) {
+                if (IomMatchHash(
+                        iocMatcher,
+                        event->Sha256Hash,
+                        32,
+                        IomType_FileHash_SHA256,
+                        iocResult
+                        ) == STATUS_SUCCESS) {
 
-                event->Flags |= ImgFlag_KnownVulnerable;
-                event->SuspiciousReasons |= ImgSuspicious_KnownMalware;
-                InterlockedIncrement64(&g_ImgNotify.Stats.SuspiciousImages);
+                    event->Flags |= ImgFlag_KnownVulnerable;
+                    event->SuspiciousReasons |= ImgSuspicious_KnownMalware;
+                    InterlockedIncrement64(&g_ImgNotify.Stats.SuspiciousImages);
+                }
+
+                ShadowStrikeFreePoolWithTag(iocResult, 'cOIx');
             }
         }
     }
@@ -2348,46 +2356,56 @@ Arguments:
         // === Memory Monitor Hollowing Check (T1055.012) ===
         // Secondary hollowing detection via MemoryMonitor's internal heuristics
         // (PEB/image-base mismatch, section characteristics anomalies).
+        // HOLLOWING_DETECTION_EVENT is ~4KB — pool-allocate to avoid kernel stack overflow.
         //
         {
-            HOLLOWING_DETECTION_EVENT hollowEvent;
-            RtlZeroMemory(&hollowEvent, sizeof(hollowEvent));
+            PHOLLOWING_DETECTION_EVENT hollowEvent =
+                (PHOLLOWING_DETECTION_EVENT)ShadowStrikeAllocatePoolWithTag(
+                    NonPagedPoolNx,
+                    sizeof(HOLLOWING_DETECTION_EVENT),
+                    'DEHx');
 
-            if (MmMonitorDetectHollowing(HandleToULong(ProcessId), &hollowEvent)) {
-                if (!(event->SuspiciousReasons & ImgSuspicious_KnownMalware)) {
-                    event->SuspiciousReasons |= ImgSuspicious_KnownMalware;
-                    event->ThreatScore += 60;
+            if (hollowEvent != NULL) {
+                RtlZeroMemory(hollowEvent, sizeof(*hollowEvent));
 
-                    BeEngineSubmitEvent(
-                        BehaviorEvent_ProcessHollowing,
-                        BehaviorCategory_CodeInjection,
-                        HandleToULong(ProcessId),
-                        NULL,
-                        0,
-                        60,
-                        FALSE,
-                        NULL
-                    );
+                if (MmMonitorDetectHollowing(HandleToULong(ProcessId), hollowEvent)) {
+                    if (!(event->SuspiciousReasons & ImgSuspicious_KnownMalware)) {
+                        event->SuspiciousReasons |= ImgSuspicious_KnownMalware;
+                        event->ThreatScore += 60;
 
-                    {
-                        PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
-                        if (tsEngine != NULL) {
-                            TsAddFactor(tsEngine, ProcessId,
-                                TsFactor_Behavioral, "HollowingHeuristic",
-                                80, "Secondary hollowing heuristic detected memory modification");
+                        BeEngineSubmitEvent(
+                            BehaviorEvent_ProcessHollowing,
+                            BehaviorCategory_CodeInjection,
+                            HandleToULong(ProcessId),
+                            NULL,
+                            0,
+                            60,
+                            FALSE,
+                            NULL
+                        );
+
+                        {
+                            PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                            if (tsEngine != NULL) {
+                                TsAddFactor(tsEngine, ProcessId,
+                                    TsFactor_Behavioral, "HollowingHeuristic",
+                                    80, "Secondary hollowing heuristic detected memory modification");
+                            }
                         }
-                    }
 
-                    TeLogThreatDetection(
-                        HandleToULong(ProcessId),
-                        L"Memory.HollowingHeuristic",
-                        60,
-                        ThreatSeverity_Medium,
-                        0x041F,
-                        L"Secondary hollowing heuristic detected memory modification",
-                        0
+                        TeLogThreatDetection(
+                            HandleToULong(ProcessId),
+                            L"Memory.HollowingHeuristic",
+                            60,
+                            ThreatSeverity_Medium,
+                            0x041F,
+                            L"Secondary hollowing heuristic detected memory modification",
+                            0
                     );
+                    }
                 }
+
+                ShadowStrikeFreePoolWithTag(hollowEvent, 'DEHx');
             }
         }
 

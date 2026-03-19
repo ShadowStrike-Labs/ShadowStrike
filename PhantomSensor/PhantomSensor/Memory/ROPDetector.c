@@ -1191,7 +1191,7 @@ Routine Description:
 {
     NTSTATUS status;
     PROP_DETECTOR_INTERNAL internalDetector;
-    ROP_ANALYSIS_CONTEXT context;
+    PROP_ANALYSIS_CONTEXT context = NULL;
     PROP_DETECTION_RESULT result = NULL;
 
     PAGED_CODE();
@@ -1216,6 +1216,22 @@ Routine Description:
     }
 
     //
+    // Allocate analysis context from pool — ROP_ANALYSIS_CONTEXT is ~10KB
+    // (ModuleCache[64]) and MUST NOT live on the kernel stack.
+    //
+    context = (PROP_ANALYSIS_CONTEXT)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(ROP_ANALYSIS_CONTEXT),
+        'xCOR');
+
+    if (context == NULL) {
+        RoppReleaseRundown(Detector);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(context, sizeof(ROP_ANALYSIS_CONTEXT));
+
+    //
     // Initialize analysis context
     //
     status = RoppInitializeAnalysisContext(
@@ -1223,10 +1239,11 @@ Routine Description:
         ProcessId,
         ThreadId,
         ThreadContext,
-        &context
+        context
         );
 
     if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreePoolWithTag(context, 'xCOR');
         RoppReleaseRundown(Detector);
         return status;
     }
@@ -1236,22 +1253,23 @@ Routine Description:
     //
     status = RoppAllocateResult(&result);
     if (!NT_SUCCESS(status)) {
-        RoppCleanupAnalysisContext(&context);
+        RoppCleanupAnalysisContext(context);
+        ShadowStrikeFreePoolWithTag(context, 'xCOR');
         RoppReleaseRundown(Detector);
         return status;
     }
 
     result->ProcessId = ProcessId;
     result->ThreadId = ThreadId;
-    result->StackBase = context.StackBase;
-    result->StackLimit = context.StackLimit;
-    result->CurrentSp = context.CurrentSp;
+    result->StackBase = context->StackBase;
+    result->StackLimit = context->StackLimit;
+    result->CurrentSp = context->CurrentSp;
     InitializeListHead(&result->ChainEntries);
 
     //
     // Capture stack contents
     //
-    status = RoppCaptureStack(&context);
+    status = RoppCaptureStack(context);
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
     }
@@ -1259,7 +1277,7 @@ Routine Description:
     //
     // Build module cache for fast lookups
     //
-    status = RoppBuildModuleCache(&context);
+    status = RoppBuildModuleCache(context);
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
     }
@@ -1268,7 +1286,7 @@ Routine Description:
     // Detect stack pivot
     //
     result->StackPivotDetected = RoppDetectStackPivot(
-        &context,
+        context,
         &result->PivotSource,
         &result->PivotDestination
         );
@@ -1276,7 +1294,7 @@ Routine Description:
     //
     // Analyze stack for gadget chains
     //
-    status = RoppDetectChain(&context, result);
+    status = RoppDetectChain(context, result);
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
     }
@@ -1319,13 +1337,15 @@ Routine Description:
     *Result = result;
     result = NULL;
 
-    RoppCleanupAnalysisContext(&context);
+    RoppCleanupAnalysisContext(context);
+    ShadowStrikeFreePoolWithTag(context, 'xCOR');
     RoppReleaseRundown(Detector);
 
     return (*Result)->ChainDetected ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 
 Cleanup:
-    RoppCleanupAnalysisContext(&context);
+    RoppCleanupAnalysisContext(context);
+    ShadowStrikeFreePoolWithTag(context, 'xCOR');
 
     if (result != NULL) {
         RopFreeResult(result);

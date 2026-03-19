@@ -974,38 +974,48 @@ Routine Description:
                                           TnIndicator_ShellcodePattern)) != 0 &&
                     event->StartAddress != NULL) {
 
-                    SHELLCODE_DETECTION_EVENT shellcodeEvent = { 0 };
-                    BOOLEAN shellcodeFound = MmMonitorScanForShellcode(
-                        targetPid,
-                        (UINT64)(ULONG_PTR)event->StartAddress,
-                        PAGE_SIZE,
-                        &shellcodeEvent
-                        );
+                    PSHELLCODE_DETECTION_EVENT shellcodeEvent =
+                        (PSHELLCODE_DETECTION_EVENT)ShadowStrikeAllocatePoolWithTag(
+                            NonPagedPoolNx,
+                            sizeof(SHELLCODE_DETECTION_EVENT),
+                            'DCSx');
 
-                    if (shellcodeFound) {
-                        event->Indicators |= TnIndicator_ShellcodePattern;
-                        event->InjectionScore = TnpSafeAddScore(
-                            event->InjectionScore, TN_SCORE_SHELLCODE_PATTERN);
-
-                        BeEngineSubmitEvent(
-                            BehaviorEvent_ShellcodeDetected,
-                            BehaviorCategory_CodeInjection,
+                    if (shellcodeEvent != NULL) {
+                        RtlZeroMemory(shellcodeEvent, sizeof(*shellcodeEvent));
+                        BOOLEAN shellcodeFound = MmMonitorScanForShellcode(
                             targetPid,
-                            &shellcodeEvent,
-                            sizeof(shellcodeEvent),
-                            85,
-                            FALSE,
-                            NULL
+                            (UINT64)(ULONG_PTR)event->StartAddress,
+                            PAGE_SIZE,
+                            shellcodeEvent
                             );
 
-                        {
-                            PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
-                            if (tsEngine != NULL) {
-                                TsAddFactor(tsEngine, event->TargetProcessId,
-                                    TsFactor_Behavioral, "ThreadShellcode",
-                                    85, "Shellcode pattern detected at thread start address");
+                        if (shellcodeFound) {
+                            event->Indicators |= TnIndicator_ShellcodePattern;
+                            event->InjectionScore = TnpSafeAddScore(
+                                event->InjectionScore, TN_SCORE_SHELLCODE_PATTERN);
+
+                            BeEngineSubmitEvent(
+                                BehaviorEvent_ShellcodeDetected,
+                                BehaviorCategory_CodeInjection,
+                                targetPid,
+                                shellcodeEvent,
+                                sizeof(*shellcodeEvent),
+                                85,
+                                FALSE,
+                                NULL
+                                );
+
+                            {
+                                PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                                if (tsEngine != NULL) {
+                                    TsAddFactor(tsEngine, event->TargetProcessId,
+                                        TsFactor_Behavioral, "ThreadShellcode",
+                                        85, "Shellcode pattern detected at thread start address");
+                                }
                             }
                         }
+
+                        ShadowStrikeFreePoolWithTag(shellcodeEvent, 'DCSx');
                     }
                 }
 
@@ -1013,39 +1023,49 @@ Routine Description:
                 // MEM-2: Cross-process injection detection
                 //
                 if (event->IsRemote) {
-                    INJECTION_DETECTION_EVENT injEvent = { 0 };
-                    BOOLEAN injectionFound = MmMonitorDetectInjection(
-                        sourcePid,
-                        targetPid,
-                        (UINT64)(ULONG_PTR)event->StartAddress,
-                        PAGE_SIZE,
-                        Injection_ClassicDLL,
-                        &injEvent
-                        );
+                    PINJECTION_DETECTION_EVENT injEvent =
+                        (PINJECTION_DETECTION_EVENT)ShadowStrikeAllocatePoolWithTag(
+                            NonPagedPoolNx,
+                            sizeof(INJECTION_DETECTION_EVENT),
+                            'JNIx');
 
-                    if (injectionFound) {
-                        event->InjectionScore = TnpSafeAddScore(
-                            event->InjectionScore, 150);
-
-                        BeEngineSubmitEvent(
-                            BehaviorEvent_CrossProcessWrite,
-                            BehaviorCategory_CodeInjection,
+                    if (injEvent != NULL) {
+                        RtlZeroMemory(injEvent, sizeof(*injEvent));
+                        BOOLEAN injectionFound = MmMonitorDetectInjection(
+                            sourcePid,
                             targetPid,
-                            &injEvent,
-                            sizeof(injEvent),
-                            90,
-                            FALSE,
-                            NULL
+                            (UINT64)(ULONG_PTR)event->StartAddress,
+                            PAGE_SIZE,
+                            Injection_ClassicDLL,
+                            injEvent
                             );
 
-                        {
-                            PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
-                            if (tsEngine != NULL) {
-                                TsAddFactor(tsEngine, event->TargetProcessId,
-                                    TsFactor_Behavioral, "CrossProcessThread",
-                                    90, "Cross-process thread injection detected (T1055)");
+                        if (injectionFound) {
+                            event->InjectionScore = TnpSafeAddScore(
+                                event->InjectionScore, 150);
+
+                            BeEngineSubmitEvent(
+                                BehaviorEvent_CrossProcessWrite,
+                                BehaviorCategory_CodeInjection,
+                                targetPid,
+                                injEvent,
+                                sizeof(*injEvent),
+                                90,
+                                FALSE,
+                                NULL
+                                );
+
+                            {
+                                PTS_SCORING_ENGINE tsEngine = (PTS_SCORING_ENGINE)ShadowStrikeGetThreatScoringEngine();
+                                if (tsEngine != NULL) {
+                                    TsAddFactor(tsEngine, event->TargetProcessId,
+                                        TsFactor_Behavioral, "CrossProcessThread",
+                                        90, "Cross-process thread injection detected (T1055)");
+                                }
                             }
                         }
+
+                        ShadowStrikeFreePoolWithTag(injEvent, 'JNIx');
                     }
                 }
 
