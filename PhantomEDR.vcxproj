@@ -20,7 +20,7 @@
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>18.0</VCProjectVersion>
-    <ProjectGuid>{7E511BF5-F27B-BF5E-7FE3-AF087A6A05F1}</ProjectGuid>
+    <ProjectGuid>{A3904751-2251-4DBD-8A6D-C370D342EC9D}</ProjectGuid>
     <Keyword>Win32Proj</Keyword>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
@@ -159,16 +159,6 @@
     <ClCompile Include="src\Shared_modules\AntiEvasion\SandboxEvasionDetector.cpp" />
     <ClCompile Include="src\Shared_modules\AntiEvasion\TimeBasedEvasionDetector.cpp" />
     <ClCompile Include="src\Shared_modules\AntiEvasion\VMEvasionDetector.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Backup\BackupManager.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Backup\BackupScheduler.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Backup\IncrementalBackup.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Backup\RestoreManager.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Banking\BankingTrojanDetector.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Banking\CertificatePinning.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Banking\KeyloggerProtection.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Banking\ScreenshotBlocker.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Banking\SecureBrowser.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Banking\TransactionMonitor.cpp" />
     <ClCompile Include="src\Shared_modules\Communication\AlertSystem.cpp" />
     <ClCompile Include="src\Shared_modules\Communication\IPCManager.cpp" />
     <ClCompile Include="src\Shared_modules\Communication\NotificationManager.cpp" />
@@ -237,11 +227,6 @@
     <ClCompile Include="src\Shared_modules\Core\System\PerformanceMonitor.cpp" />
     <ClCompile Include="src\Shared_modules\Core\System\ServiceManager.cpp" />
     <ClCompile Include="src\Shared_modules\Core\System\SystemInfo.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\BrowserMinerDetector.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\CPUUsageAnalyzer.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\CryptoMinerDetector.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\GPUMiningDetector.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\PoolConnectionDetector.cpp" />
     <ClCompile Include="src\Shared_modules\Database\ConfigurationDB.cpp" />
     <ClCompile Include="src\Shared_modules\Database\DatabaseManager.cpp" />
     <ClCompile Include="src\Shared_modules\Database\LogDB.cpp" />
@@ -251,12 +236,6 @@
     <ClCompile Include="src\Drivers\FilterDriver.cpp" />
     <ClCompile Include="src\Drivers\ProcessFilterCallbacks.cpp" />
     <ClCompile Include="src\Drivers\RegistryFilterCallbacks.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Email\AttachmentScanner.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Email\EmailProtection.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Email\OutlookScanner.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Email\PhishingEmailDetector.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Email\SpamDetector.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Email\ThunderbirdScanner.cpp" />
     <ClCompile Include="src\Shared_modules\Exploits\BufferOverflowProtection.cpp" />
     <ClCompile Include="src\Shared_modules\Exploits\HeapSprayDetector.cpp" />
     <ClCompile Include="src\Shared_modules\Exploits\JITSprayDetector.cpp" />
@@ -329,21 +308,12 @@
     <ClCompile Include="src\Products\PhantomEDR\Forensics\MemoryDumper.cpp" />
     <ClCompile Include="src\Products\PhantomEDR\Forensics\NetworkCapture.cpp" />
     <ClCompile Include="src\Products\PhantomEDR\Forensics\TimelineAnalyzer.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\GameMode\GameCheatDetector.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\GameMode\GameModeManager.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\GameMode\GameProcessDetector.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\GameMode\OverlayProtection.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\GameMode\PerformanceOptimizer.cpp" />
     <ClCompile Include="src\Shared_modules\HashStore\BloomFilter_impl.cpp" />
     <ClCompile Include="src\Shared_modules\HashStore\HashBucket_impl.cpp" />
     <ClCompile Include="src\Shared_modules\HashStore\HashStore.cpp" />
     <ClCompile Include="src\Shared_modules\HashStore\HashStore_import_export.cpp" />
     <ClCompile Include="src\Shared_modules\HashStore\HashStore_mgnmnt.cpp" />
     <ClCompile Include="src\Shared_modules\HashStore\HashStore_query_operations.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\IoT\IoTDeviceScanner.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\IoT\RouterSecurityChecker.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\IoT\SmartHomeProtection.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\IoT\WiFiSecurityAnalyzer.cpp" />
     <ClCompile Include="src\Main.cpp" />
     <ClCompile Include="src\Shared_modules\PatternStore\aho_crsck_impl.cpp" />
     <ClCompile Include="src\Shared_modules\PatternStore\boyer_moore_impl.cpp" />
@@ -359,14 +329,6 @@
     <ClCompile Include="src\Shared_modules\Performance\MemoryProfiler.cpp" />
     <ClCompile Include="src\Shared_modules\Performance\NetworkPerformanceMonitor.cpp" />
     <ClCompile Include="src\Shared_modules\Performance\PerformanceProfiler.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Privacy\CookieManager.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Privacy\DataLeakProtection.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Privacy\DNSLeakProtection.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Privacy\IPLeakProtection.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Privacy\LocationPrivacy.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Privacy\MicrophoneGuard.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Privacy\PrivacyCleaner.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\Privacy\WebcamProtector.cpp" />
     <ClCompile Include="src\Shared_modules\RansomwareProtection\BackupProtector.cpp" />
     <ClCompile Include="src\Shared_modules\RansomwareProtection\FileBackupManager.cpp" />
     <ClCompile Include="src\Shared_modules\RansomwareProtection\HoneypotManager.cpp" />
@@ -452,11 +414,6 @@
     <ClCompile Include="src\Shared_modules\Update\UpdateManager.cpp" />
     <ClCompile Include="src\Shared_modules\Update\UpdateScheduler.cpp" />
     <ClCompile Include="src\Shared_modules\Update\UpdateVerifier.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\USB_Protection\BadUSBDetector.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\USB_Protection\DeviceControlManager.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\USB_Protection\USBAutorunBlocker.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\USB_Protection\USBDeviceMonitor.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\USB_Protection\USBScanner.cpp" />
     <ClCompile Include="src\Shared_modules\Utils\NetworkUtilsIpAddress.cpp" />
     <ClCompile Include="src\Shared_modules\Utils\Base64Utils.cpp" />
     <ClCompile Include="src\Shared_modules\Utils\CacheManager.cpp" />
@@ -490,14 +447,6 @@
     <ClCompile Include="src\Shared_modules\Utils\ThreadPool.cpp" />
     <ClCompile Include="src\Shared_modules\Utils\Timer.cpp" />
     <ClCompile Include="src\Shared_modules\Utils\XMLUtils.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\AdBlocker.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\BrowserProtection.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\ChromeExtensionScanner.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\FirefoxAddonScanner.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\MaliciousDownloadBlocker.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\PhishingDetector.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\SafeBrowsingAPI.cpp" />
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\TrackerBlocker.cpp" />
     <ClCompile Include="src\Shared_modules\Whitelist\WhiteListBloomFilter.cpp" />
     <ClCompile Include="src\Shared_modules\Whitelist\WhiteListFormat.cpp" />
     <ClCompile Include="src\Shared_modules\Whitelist\WhiteListHashIndex.cpp" />
@@ -634,10 +583,6 @@
     <ClInclude Include="src\Shared_modules\AntiEvasion\SandboxEvasionDetector.hpp" />
     <ClInclude Include="src\Shared_modules\AntiEvasion\TimeBasedEvasionDetector.hpp" />
     <ClInclude Include="src\Shared_modules\AntiEvasion\VMEvasionDetector.hpp" />
-    <ClInclude Include="src\Products\PhantomHome\Backup\BackupManager.hpp" />
-    <ClInclude Include="src\Products\PhantomHome\Backup\BackupScheduler.hpp" />
-    <ClInclude Include="src\Products\PhantomHome\Backup\IncrementalBackup.hpp" />
-    <ClInclude Include="src\Products\PhantomHome\Backup\RestoreManager.hpp" />
     <ClInclude Include="src\Shared_modules\Core\System\BootTimeAnalyzer.hpp" />
     <ClInclude Include="src\Shared_modules\Core\System\CrashHandler.hpp" />
     <ClInclude Include="src\Shared_modules\Core\System\DriverAnalyzer.hpp" />

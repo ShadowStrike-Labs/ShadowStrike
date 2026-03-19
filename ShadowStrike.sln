@@ -7,6 +7,12 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ShadowStrike", "ShadowStrik
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomSensor", "PhantomSensor\PhantomSensor.vcxproj", "{78370031-C4FE-967D-E0AF-6159EAC744CC}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomHome", "PhantomHome.vcxproj", "{264DE895-7C8E-4853-AB6F-EB6969F6B38D}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomEDR", "PhantomEDR.vcxproj", "{A3904751-2251-4DBD-8A6D-C370D342EC9D}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomXDR", "PhantomXDR.vcxproj", "{C1829004-1592-412E-8B68-735E5403ABC3}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -35,6 +41,30 @@ Global
 		{78370031-C4FE-967D-E0AF-6159EAC744CC}.Release|x86.ActiveCfg = Release|x64
 		{78370031-C4FE-967D-E0AF-6159EAC744CC}.Release|x86.Build.0 = Release|x64
 		{78370031-C4FE-967D-E0AF-6159EAC744CC}.Release|x86.Deploy.0 = Release|x64
+		{264DE895-7C8E-4853-AB6F-EB6969F6B38D}.Debug|x64.ActiveCfg = Debug|x64
+		{264DE895-7C8E-4853-AB6F-EB6969F6B38D}.Debug|x64.Build.0 = Debug|x64
+		{264DE895-7C8E-4853-AB6F-EB6969F6B38D}.Debug|x86.ActiveCfg = Debug|Win32
+		{264DE895-7C8E-4853-AB6F-EB6969F6B38D}.Debug|x86.Build.0 = Debug|Win32
+		{264DE895-7C8E-4853-AB6F-EB6969F6B38D}.Release|x64.ActiveCfg = Release|x64
+		{264DE895-7C8E-4853-AB6F-EB6969F6B38D}.Release|x64.Build.0 = Release|x64
+		{264DE895-7C8E-4853-AB6F-EB6969F6B38D}.Release|x86.ActiveCfg = Release|Win32
+		{264DE895-7C8E-4853-AB6F-EB6969F6B38D}.Release|x86.Build.0 = Release|Win32
+		{A3904751-2251-4DBD-8A6D-C370D342EC9D}.Debug|x64.ActiveCfg = Debug|x64
+		{A3904751-2251-4DBD-8A6D-C370D342EC9D}.Debug|x64.Build.0 = Debug|x64
+		{A3904751-2251-4DBD-8A6D-C370D342EC9D}.Debug|x86.ActiveCfg = Debug|Win32
+		{A3904751-2251-4DBD-8A6D-C370D342EC9D}.Debug|x86.Build.0 = Debug|Win32
+		{A3904751-2251-4DBD-8A6D-C370D342EC9D}.Release|x64.ActiveCfg = Release|x64
+		{A3904751-2251-4DBD-8A6D-C370D342EC9D}.Release|x64.Build.0 = Release|x64
+		{A3904751-2251-4DBD-8A6D-C370D342EC9D}.Release|x86.ActiveCfg = Release|Win32
+		{A3904751-2251-4DBD-8A6D-C370D342EC9D}.Release|x86.Build.0 = Release|Win32
+		{C1829004-1592-412E-8B68-735E5403ABC3}.Debug|x64.ActiveCfg = Debug|x64
+		{C1829004-1592-412E-8B68-735E5403ABC3}.Debug|x64.Build.0 = Debug|x64
+		{C1829004-1592-412E-8B68-735E5403ABC3}.Debug|x86.ActiveCfg = Debug|Win32
+		{C1829004-1592-412E-8B68-735E5403ABC3}.Debug|x86.Build.0 = Debug|Win32
+		{C1829004-1592-412E-8B68-735E5403ABC3}.Release|x64.ActiveCfg = Release|x64
+		{C1829004-1592-412E-8B68-735E5403ABC3}.Release|x64.Build.0 = Release|x64
+		{C1829004-1592-412E-8B68-735E5403ABC3}.Release|x86.ActiveCfg = Release|Win32
+		{C1829004-1592-412E-8B68-735E5403ABC3}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -42,4 +72,10 @@ Global
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {C23E03CD-CBE2-4B14-B940-49C174575A9F}
 	EndGlobalSection
-EndGlobal
+EndProject("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomHome", "PhantomHome.vcxproj", "{264DE895-7C8E-4853-AB6F-EB6969F6B38D}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomEDR", "PhantomEDR.vcxproj", "{A3904751-2251-4DBD-8A6D-C370D342EC9D}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomXDR", "PhantomXDR.vcxproj", "{C1829004-1592-412E-8B68-735E5403ABC3}"
+EndProject
+Global

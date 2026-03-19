@@ -20,7 +20,7 @@
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>18.0</VCProjectVersion>
-    <ProjectGuid>{7E511BF5-F27B-BF5E-7FE3-AF087A6A05F1}</ProjectGuid>
+    <ProjectGuid>{264DE895-7C8E-4853-AB6F-EB6969F6B38D}</ProjectGuid>
     <Keyword>Win32Proj</Keyword>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
@@ -323,12 +323,6 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\ArtifactExtractor.cpp" />
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\EvidenceCollector.cpp" />
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\IncidentRecorder.cpp" />
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\MemoryDumper.cpp" />
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\NetworkCapture.cpp" />
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\TimelineAnalyzer.cpp" />
     <ClCompile Include="src\Products\PhantomHome\GameMode\GameCheatDetector.cpp" />
     <ClCompile Include="src\Products\PhantomHome\GameMode\GameModeManager.cpp" />
     <ClCompile Include="src\Products\PhantomHome\GameMode\GameProcessDetector.cpp" />

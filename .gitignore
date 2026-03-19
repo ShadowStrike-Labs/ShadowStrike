@@ -366,17 +366,16 @@ FodyWeavers.xsd
 .vscode/
 .claude/
 .gemini/
-.github/
-
-!.github/
-!.github/workflows/
-!.github/workflows/**
-!.github/FUNDING.yml
 .pvs-studio/
 NUL
 CLAUDE.md
 DAILY_MODULE_ROADMAP.md
 SHADOWSTRIKE_3_YEAR_ROADMAP.md
+
+# .github — only allow FUNDING.yml and workflows/
+.github/*
+!.github/FUNDING.yml
+!.github/workflows/
 
 
 # PVS-Studio log files
