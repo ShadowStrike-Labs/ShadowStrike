@@ -168,6 +168,9 @@ typedef struct _NF_CONNECTION_ENTRY {
 #define NF_CONN_FLAG_DNS_OVER_HTTPS       0x00000080
 #define NF_CONN_FLAG_FIRST_CONTACT        0x00000100
 #define NF_CONN_FLAG_STATE_ESTABLISHED    0x00000200
+#define NF_CONN_FLAG_PRIVATE_NET          0x00000400  // Remote is RFC1918/loopback — skip heavy analysis
+#define NF_CONN_FLAG_HTTP_PARSED          0x00000800  // HTTP request already parsed for this connection
+#define NF_CONN_FLAG_HTTP_RESP_PARSED     0x00001000  // HTTP response already parsed
 
 // ============================================================================
 // DNS TRACKING

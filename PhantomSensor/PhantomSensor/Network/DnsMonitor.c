@@ -2491,10 +2491,11 @@ DnspCalculateEntropy(
 Routine Description:
     Calculates Shannon entropy using fixed-point arithmetic and a log2 lookup
     table. Returns entropy * 100 (e.g., 380 = 3.80 bits per character).
-    Uses stack-allocated frequency table (1KB on x64 12-24KB kernel stack).
+    NF-PERF: Uses 128-entry table (512 bytes) instead of 256 (1KB) — DNS domain
+    names are always ASCII (RFC 1035), so characters above 0x7F never appear.
 --*/
 {
-    ULONG charCount[256];
+    ULONG charCount[128];
     ULONG i;
     ULONG64 entropy = 0;
 
@@ -2505,7 +2506,10 @@ Routine Description:
     RtlZeroMemory(charCount, sizeof(charCount));
 
     for (i = 0; i < Length; i++) {
-        charCount[(UCHAR)String[i]]++;
+        UCHAR ch = (UCHAR)String[i];
+        if (ch < 128) {
+            charCount[ch]++;
+        }
     }
 
     //
@@ -2515,7 +2519,7 @@ Routine Description:
     // Using lookup table: g_Log2Table[i] ~ -log2(i/256)*256
     // We normalize counts to [0..255] range for the lookup.
     //
-    for (i = 0; i < 256; i++) {
+    for (i = 0; i < 128; i++) {
         if (charCount[i] > 0) {
             // p = charCount[i] / Length, scaled to [0..255]
             ULONG scaled = (charCount[i] * 255) / Length;

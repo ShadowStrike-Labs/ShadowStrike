@@ -3677,8 +3677,14 @@ NfpCreateAndInsertConnection(
     connection->LastActivityTime = connection->ConnectTime;
 
     InterlockedOr((LONG*)&connection->Flags, NF_CONN_FLAG_MONITORED);
-    if (!NfpIsPrivateAddress(&connection->RemoteAddress.Address) &&
-        !NfpIsLoopbackAddress(&connection->RemoteAddress.Address)) {
+    if (NfpIsPrivateAddress(&connection->RemoteAddress.Address) ||
+        NfpIsLoopbackAddress(&connection->RemoteAddress.Address)) {
+        //
+        // NF-PERF: Tag private/loopback connections so NfpProcessStreamData
+        // can skip expensive C2/DLP analysis on local traffic.
+        //
+        InterlockedOr((LONG*)&connection->Flags, NF_CONN_FLAG_PRIVATE_NET);
+    } else {
         InterlockedOr((LONG*)&connection->Flags, NF_CONN_FLAG_FIRST_CONTACT);
     }
 
@@ -4485,6 +4491,26 @@ NfpProcessStreamData(
         (LONG64*)&connection->LastActivityTime,
         (LONG64)(currentTime.QuadPart / 10000));
 
+    //
+    // NF-PERF: Fast-path for private/loopback traffic. Update byte counters
+    // only — skip protocol parsing, C2 detection, and DLP analysis.
+    // Private network traffic (RFC1918, loopback) is extremely unlikely to be
+    // C2 or exfiltration, and inspecting it wastes significant CPU on every
+    // LAN packet (file shares, printers, localhost services).
+    //
+    if (connection->Flags & NF_CONN_FLAG_PRIVATE_NET) {
+        if (StreamPacket->streamData->flags & FWPS_STREAM_FLAG_SEND) {
+            InterlockedAdd64((LONG64*)&connection->BytesSent, (LONG64)dataSize);
+            InterlockedIncrement((LONG*)&connection->PacketsSent);
+        } else {
+            InterlockedAdd64((LONG64*)&connection->BytesReceived, (LONG64)dataSize);
+            InterlockedIncrement((LONG*)&connection->PacketsReceived);
+        }
+        InterlockedAdd64(&g_NfState.TotalBytesMonitored, (LONG64)dataSize);
+        NfFilterReleaseConnection(connection);
+        return;
+    }
+
     if (StreamPacket->streamData->flags & FWPS_STREAM_FLAG_SEND) {
         InterlockedAdd64((LONG64*)&connection->BytesSent, (LONG64)dataSize);
         InterlockedIncrement((LONG*)&connection->PacketsSent);
@@ -4494,14 +4520,16 @@ NfpProcessStreamData(
         //
         // Attempt HTTP protocol parsing on outbound sends for C2 detection (T1071.001).
         // Only parse if ProtocolParser is available and data is plausible HTTP size.
-        // KeGetCurrentIrql() must be PASSIVE_LEVEL for PpParseHTTPRequest.
+        // NF-PERF: Parse only the first outbound packet per connection — subsequent
+        // packets on the same connection don't carry new HTTP request headers.
         //
         if (g_ProtocolParser != NULL && dataSize >= 16 && dataSize <= 65536 &&
+            !(connection->Flags & NF_CONN_FLAG_HTTP_PARSED) &&
             KeGetCurrentIrql() == PASSIVE_LEVEL) {
 
             PVOID contiguousData = NULL;
             BOOLEAN ppAllocated = FALSE;
-            UCHAR ppLocalBuf[2048];
+            UCHAR ppLocalBuf[512];
 
             //
             // Get contiguous view of stream data
@@ -4580,6 +4608,12 @@ NfpProcessStreamData(
                     ExFreePoolWithTag(contiguousData, 'pPfN');
                 }
             }
+
+            //
+            // NF-PERF: Mark connection as HTTP-parsed so subsequent packets
+            // on this connection skip protocol parsing entirely.
+            //
+            InterlockedOr((LONG*)&connection->Flags, NF_CONN_FLAG_HTTP_PARSED);
         }
 
         //
@@ -4604,7 +4638,7 @@ NfpProcessStreamData(
 
                 PVOID tlsData = NULL;
                 BOOLEAN tlsAllocated = FALSE;
-                UCHAR tlsLocalBuf[2048];
+                UCHAR tlsLocalBuf[512];
                 SIZE_T tlsCopied = 0;
 
                 if (dataSize <= sizeof(tlsLocalBuf)) {
@@ -4753,7 +4787,7 @@ NfpProcessStreamData(
 
                 PVOID shData = NULL;
                 BOOLEAN shAllocated = FALSE;
-                UCHAR shLocalBuf[2048];
+                UCHAR shLocalBuf[512];
                 SIZE_T shCopied = 0;
 
                 if (dataSize <= sizeof(shLocalBuf)) {
@@ -4802,15 +4836,16 @@ NfpProcessStreamData(
     // NET-PP: Parse HTTP responses on inbound (receive) data for C2 response
     // fingerprinting (T1071.001). Detect suspicious Server headers, unusual
     // content types, and C2 framework response patterns.
-    // PpParseHTTPResponse requires PASSIVE_LEVEL and allocates from PagedPool.
+    // NF-PERF: Parse only first response per connection.
     //
     if (g_ProtocolParser != NULL && dataSize >= 12 && dataSize <= 65536 &&
+        !(connection->Flags & NF_CONN_FLAG_HTTP_RESP_PARSED) &&
         KeGetCurrentIrql() == PASSIVE_LEVEL &&
         !connection->TlsHandshakeComplete) {
 
         PVOID respData = NULL;
         BOOLEAN respAllocated = FALSE;
-        UCHAR respLocalBuf[2048];
+        UCHAR respLocalBuf[512];
         SIZE_T respCopied = 0;
 
         if (dataSize <= sizeof(respLocalBuf)) {
@@ -4865,6 +4900,8 @@ NfpProcessStreamData(
         if (respAllocated && respData != NULL) {
             ExFreePoolWithTag(respData, 'pRfN');
         }
+
+        InterlockedOr((LONG*)&connection->Flags, NF_CONN_FLAG_HTTP_RESP_PARSED);
     }
 
     InterlockedAdd64(&g_NfState.TotalBytesMonitored, (LONG64)dataSize);
@@ -4935,7 +4972,7 @@ NfpProcessStreamData(
 
         PVOID dxContiguousData = NULL;
         BOOLEAN dxAllocated = FALSE;
-        UCHAR dxLocalBuf[2048];
+        UCHAR dxLocalBuf[512];
         SIZE_T dxInspectSize = min(dataSize, DX_MAX_INSPECT_SIZE);
 
         //
