@@ -59,13 +59,15 @@ static VOID ActpCleanupWorkerThread(_In_ PVOID StartContext);
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ActInitialize)
-#pragma alloc_text(PAGE, ActShutdown)
-#pragma alloc_text(PAGE, ActRegisterCallback)
-#pragma alloc_text(PAGE, ActUnregisterCallback)
 #pragma alloc_text(PAGE, ActGetChain)
 #pragma alloc_text(PAGE, ActCorrelateEvents)
-#pragma alloc_text(PAGE, ActGetActiveChains)
-#pragma alloc_text(PAGE, ActpCleanupWorkerThread)
+//
+// ActShutdown, ActRegisterCallback, ActUnregisterCallback, ActGetActiveChains,
+// and ActpCleanupWorkerThread acquire KeAcquireSpinLock (IRQL → DISPATCH_LEVEL).
+// They MUST NOT be in PAGE section — DV Force IRQL checking trims pageable memory
+// when the verified driver raises IRQL, causing 0xD1 BSOD on the next instruction
+// fetch from the paged code page.
+//
 #endif
 
 // ============================================================================
@@ -597,8 +599,6 @@ ActShutdown(
     PACT_CALLBACK_REGISTRATION oldReg;
     KIRQL oldIrql;
 
-    PAGED_CODE();
-
     if (Tracker == NULL) {
         return;
     }
@@ -706,8 +706,6 @@ ActRegisterCallback(
     PACT_CALLBACK_REGISTRATION oldReg;
     KIRQL oldIrql;
 
-    PAGED_CODE();
-
     if (Tracker == NULL || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -765,8 +763,6 @@ ActUnregisterCallback(
 {
     PACT_CALLBACK_REGISTRATION oldReg;
     KIRQL oldIrql;
-
-    PAGED_CODE();
 
     if (Tracker == NULL) {
         return;
@@ -1205,8 +1201,6 @@ ActGetActiveChains(
     KIRQL oldIrql;
     BOOLEAN expired;
 
-    PAGED_CODE();
-
     if (Tracker == NULL || Chains == NULL || ChainCount == NULL || MaxChains == 0) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1274,8 +1268,6 @@ ActpCleanupWorkerThread(
     BOOLEAN expired;
     LARGE_INTEGER timeout;
     NTSTATUS waitStatus;
-
-    PAGED_CODE();
 
     //
     // 5-minute cleanup interval (negative = relative, in 100ns units)

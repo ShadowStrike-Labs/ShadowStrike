@@ -61,13 +61,11 @@
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeInitializeSelfProtection)
-#pragma alloc_text(PAGE, ShadowStrikeShutdownSelfProtection)
-#pragma alloc_text(PAGE, ShadowStrikeProtectProcess)
-#pragma alloc_text(PAGE, ShadowStrikeUnprotectProcess)
-#pragma alloc_text(PAGE, ShadowStrikeAddProtectedPath)
-#pragma alloc_text(PAGE, ShadowStrikeRemoveProtectedPath)
-#pragma alloc_text(PAGE, ShadowStrikeAddProtectedRegistryKey)
-#pragma alloc_text(PAGE, ShadowStrikeRemoveProtectedRegistryKey)
+//
+// All other SelfProtect functions acquire ExAcquireSpinLockExclusive
+// (EX_SPIN_LOCK → DISPATCH_LEVEL). They MUST NOT be in PAGE section —
+// DV Force IRQL checking trims pageable memory at elevated IRQL → 0xD1 BSOD.
+//
 #endif
 
 // ============================================================================
@@ -436,8 +434,6 @@ ShadowStrikeShutdownSelfProtection(
     KIRQL oldIrql;
     LARGE_INTEGER timeout;
 
-    PAGED_CODE();
-
     if (InterlockedCompareExchange(&g_SelfProtectInitialized, 0, 0) == 0) {
         return;
     }
@@ -560,8 +556,6 @@ ShadowStrikeProtectProcess(
     BOOLEAN duplicate = FALSE;
     SIZE_T copyLen = 0;
     LARGE_INTEGER createTime;
-
-    PAGED_CODE();
 
     if (ProcessId == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -704,8 +698,6 @@ ShadowStrikeUnprotectProcess(
     PSHADOWSTRIKE_PROTECTED_PROCESS_ENTRY found = NULL;
     KIRQL oldIrql;
 
-    PAGED_CODE();
-
     if (!ReadNoFence(&g_SelfProtectInitialized) || ProcessId == NULL) {
         return;
     }
@@ -821,8 +813,6 @@ ShadowStrikeAddProtectedPath(
     KIRQL oldIrql;
     LONG i;
 
-    PAGED_CODE();
-
     if (Path == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -879,8 +869,6 @@ ShadowStrikeRemoveProtectedPath(
     SIZE_T pathLen = 0;
     KIRQL oldIrql;
     LONG i;
-
-    PAGED_CODE();
 
     if (Path == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -980,8 +968,6 @@ ShadowStrikeAddProtectedRegistryKey(
     KIRQL oldIrql;
     LONG i;
 
-    PAGED_CODE();
-
     if (KeyPath == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1031,8 +1017,6 @@ ShadowStrikeRemoveProtectedRegistryKey(
     SIZE_T pathLen = 0;
     KIRQL oldIrql;
     LONG i;
-
-    PAGED_CODE();
 
     if (KeyPath == NULL) {
         return STATUS_INVALID_PARAMETER;

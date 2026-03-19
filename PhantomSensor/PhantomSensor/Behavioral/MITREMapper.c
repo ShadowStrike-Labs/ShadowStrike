@@ -57,7 +57,10 @@
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, MmInitialize)
-#pragma alloc_text(PAGE, MmShutdown)
+//
+// MmShutdown acquires KeAcquireSpinLock(DetectionLock) — cannot be paged.
+// DV Force IRQL checking trims PAGE memory at DISPATCH_LEVEL → 0xD1 BSOD.
+//
 #pragma alloc_text(PAGE, MmLoadTechniques)
 #pragma alloc_text(PAGE, MmLookupTechnique)
 #pragma alloc_text(PAGE, MmLookupByName)
@@ -883,8 +886,6 @@ MmShutdown(
     PMM_TECHNIQUE technique;
     PMM_DETECTION detection;
     KIRQL oldIrql;
-
-    PAGED_CODE();
 
     if (Mapper == NULL) {
         return;
