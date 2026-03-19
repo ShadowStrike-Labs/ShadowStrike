@@ -368,6 +368,7 @@ FodyWeavers.xsd
 .gemini/
 .github/
 
+!.github/
 !.github/workflows/
 !.github/workflows/**
 !.github/FUNDING.yml

@@ -1,0 +1,92 @@
+﻿name: Coverity Scan
+
+on:
+  push:
+    branches: [ master, main ]
+  schedule:
+    - cron: '0 0 * * 0'
+
+jobs:
+  coverity:
+    runs-on: windows-2022
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Download Coverity Build Tool (2024.12.1)
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $token = "${{ secrets.COVERITY_SCAN_TOKEN }}"
+          $project = "ShadowStrike-Labs/ShadowStrike"
+          
+          # Fix the version to 2024.12.1 as required by Coverity Scan server
+          $url = "https://scan.coverity.com/download/cxx/win64?token=${token}&project=${project}&version=2024.12.1"
+          
+          Write-Host "Downloading Coverity 2024.12.1..."
+          Invoke-WebRequest -Uri $url -OutFile "cov-analysis-win64.zip" -ErrorAction Stop
+          
+          Write-Host "Extracting..."
+          Expand-Archive -Path "cov-analysis-win64.zip" -DestinationPath "." -Force
+          Write-Host "Done"
+
+      - name: Verify WDK Installation
+        shell: powershell
+        run: |
+          $wdkRoot = "C:\Program Files (x86)\Windows Kits\10"
+          $includeDir = Join-Path $wdkRoot "Include"
+          $kmVersions = Get-ChildItem $includeDir -Directory |
+              Where-Object { Test-Path (Join-Path $_.FullName "km\ntifs.h") } |
+              Sort-Object { [Version]($_.Name -replace '[^0-9.]','') } -Descending
+          if ($null -eq $kmVersions) { exit 1 }
+          Write-Host "WDK: $($kmVersions[0].Name)"
+      
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build PhantomSensor with Coverity
+        shell: powershell
+        run: |
+          $covDir = Get-ChildItem -Filter "cov-analysis-win64*" -Directory | Select-Object -First 1
+          $env:PATH = "$($covDir.FullName)\bin;$env:PATH"
+          
+          # Compiler configuration for MSVC
+          cov-configure --msvc
+          
+          # Clean start: remove existing cov-int directory
+          if (Test-Path "cov-int") { Remove-Item -Recurse -Force "cov-int" }
+          
+          Write-Host "Running cov-build..."
+          # Use Rebuild to ensure all translation units are captured
+          cov-build --dir cov-int msbuild PhantomSensor\PhantomSensor.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=x64 /p:InfVerif_Enable=false /p:InfVerif_NoError=true
+          
+          $tuCount = (Get-ChildItem -Path "cov-int\emit" -Recurse -File).Count
+          Write-Host "Captured $tuCount files."
+
+      - name: Submit to Coverity
+        shell: powershell
+        run: |
+          Write-Host "Creating archive with tar.exe (to preserve structure)..."
+          # Use native tar.exe to ensure the 'cov-int' folder itself is at the root of the archive
+          tar.exe -a -c -f cov-int.zip cov-int
+          
+          $fileSize = (Get-Item "cov-int.zip").Length / 1MB
+          Write-Host "Size: $([math]::Round($fileSize, 2)) MB"
+          
+          $token = "${{ secrets.COVERITY_SCAN_TOKEN }}"
+          $email = "${{ secrets.COVERITY_SCAN_EMAIL }}"
+          
+          Write-Host "Submitting to Coverity Scan..."
+          curl.exe --fail --show-error `
+                   --form "token=${token}" `
+                   --form "email=${email}" `
+                   --form "project=ShadowStrike-Labs/ShadowStrike" `
+                   --form "file=@cov-int.zip" `
+                   --form "version=${{ github.sha }}" `
+                   --form "description=ShadowStrike Kernel - Stable Build" `
+                   https://scan.coverity.com/builds
+          
+          Write-Host "Submission complete."
