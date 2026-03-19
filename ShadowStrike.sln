@@ -72,10 +72,4 @@ Global
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {C23E03CD-CBE2-4B14-B940-49C174575A9F}
 	EndGlobalSection
-EndProject("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomHome", "PhantomHome.vcxproj", "{264DE895-7C8E-4853-AB6F-EB6969F6B38D}"
-EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomEDR", "PhantomEDR.vcxproj", "{A3904751-2251-4DBD-8A6D-C370D342EC9D}"
-EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomXDR", "PhantomXDR.vcxproj", "{C1829004-1592-412E-8B68-735E5403ABC3}"
-EndProject
-Global
+EndGlobal
