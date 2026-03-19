@@ -1629,62 +1629,67 @@ BeEngineReleaseChain(
 
     if (newRefCount == 0) {
         //
-        // Last reference released - chain must be cleaned up.
+        // Last reference released — chain must be cleaned up.
         // We cannot call cleanup functions that acquire ERESOURCE
         // at DISPATCH_LEVEL, so we mark the chain as inactive and
         // let the cleanup thread handle actual removal.
         //
-        Chain->IsActive = FALSE;
-
-        //
-        // If we're at PASSIVE_LEVEL, we can clean up immediately
-        //
         if (KeGetCurrentIrql() <= APC_LEVEL) {
             PLIST_ENTRY entryEntry;
             PBE_CHAIN_ENTRY chainEntry;
+            BOOLEAN needFree = FALSE;
 
             //
-            // Remove from active chain list (main list)
+            // CRITICAL: Acquire ChainLock BEFORE setting IsActive = FALSE.
+            // Setting the flag without the lock created a race with
+            // BepCleanupStaleChains: the worker could see !IsActive, remove
+            // the chain from the list, and then this thread would do a
+            // second RemoveEntryList on the same LIST_ENTRY — causing
+            // BugCheck 0x139 P1=3 (LIST_ENTRY double remove).
             //
             KeEnterCriticalRegion();
             ExAcquireResourceExclusiveLite(&g_BeState.ChainLock, TRUE);
-            RemoveEntryList(&Chain->ListEntry);
-            g_BeState.ActiveChainCount--;
+
+            if (Chain->IsActive) {
+                Chain->IsActive = FALSE;
+                RemoveEntryList(&Chain->ListEntry);
+                g_BeState.ActiveChainCount--;
+                BepRemoveChainFromHash(Chain);
+                needFree = TRUE;
+            }
+
             ExReleaseResourceLite(&g_BeState.ChainLock);
             KeLeaveCriticalRegion();
 
-            //
-            // Remove from hash table
-            //
-            BepRemoveChainFromHash(Chain);
+            if (needFree) {
+                //
+                // Remove from process context's chain list
+                //
+                KeEnterCriticalRegion();
+                ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
+                RemoveEntryList(&Chain->ProcessListEntry);
+                ExReleaseResourceLite(&g_BeState.ProcessLock);
+                KeLeaveCriticalRegion();
 
-            //
-            // Remove from process context's chain list
-            //
-            KeEnterCriticalRegion();
-            ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
-            RemoveEntryList(&Chain->ProcessListEntry);
-            ExReleaseResourceLite(&g_BeState.ProcessLock);
-            KeLeaveCriticalRegion();
+                //
+                // Free all chain entries
+                //
+                while (!IsListEmpty(&Chain->EntryList)) {
+                    entryEntry = RemoveHeadList(&Chain->EntryList);
+                    chainEntry = CONTAINING_RECORD(entryEntry, BE_CHAIN_ENTRY, ListEntry);
+                    BepFreeChainEntry(chainEntry);
+                }
 
-            //
-            // Free all chain entries
-            //
-            while (!IsListEmpty(&Chain->EntryList)) {
-                entryEntry = RemoveHeadList(&Chain->EntryList);
-                chainEntry = CONTAINING_RECORD(entryEntry, BE_CHAIN_ENTRY, ListEntry);
-                BepFreeChainEntry(chainEntry);
+                BepFreeChain(Chain);
             }
-
+        } else {
             //
-            // Free the chain itself
+            // At DISPATCH_LEVEL: mark inactive for worker cleanup.
+            // Only one thread can reach RefCount==0 (InterlockedDecrement
+            // is atomic), so this store is safe without additional locking.
             //
-            BepFreeChain(Chain);
+            Chain->IsActive = FALSE;
         }
-        //
-        // At DISPATCH_LEVEL, the chain will be cleaned up by
-        // BepCleanupStaleChains() on the worker thread
-        //
     }
 }
 
@@ -2072,40 +2077,46 @@ BeEngineReleaseProcessContext(
 
     if (newRefCount == 0) {
         //
-        // Last reference released - context must be cleaned up.
+        // Last reference released — context must be cleaned up.
         // Mark as terminated so cleanup thread handles it, or
         // clean up immediately if at appropriate IRQL.
         //
-        Context->Flags |= BE_PROC_FLAG_TERMINATED;
-
-        //
-        // If we're at PASSIVE_LEVEL, we can clean up immediately
-        //
         if (KeGetCurrentIrql() <= APC_LEVEL) {
+            BOOLEAN needFree = FALSE;
+
             //
-            // Remove from main process list
+            // CRITICAL: Acquire ProcessLock BEFORE setting the
+            // TERMINATED flag. Setting the flag without the lock
+            // created a race with BepCleanupStaleProcessContexts:
+            // the worker could see TERMINATED + RefCount<=1, remove
+            // the context from the list, and then this thread would
+            // do a second RemoveEntryList — BugCheck 0x139 P1=3.
             //
             KeEnterCriticalRegion();
             ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
-            RemoveEntryList(&Context->ListEntry);
-            g_BeState.ProcessContextCount--;
+
+            if (!(Context->Flags & BE_PROC_FLAG_CLEANUP_DONE)) {
+                Context->Flags |= BE_PROC_FLAG_TERMINATED | BE_PROC_FLAG_CLEANUP_DONE;
+                RemoveEntryList(&Context->ListEntry);
+                g_BeState.ProcessContextCount--;
+                BepRemoveProcessContextFromHash(Context);
+                needFree = TRUE;
+            }
+
             ExReleaseResourceLite(&g_BeState.ProcessLock);
             KeLeaveCriticalRegion();
 
+            if (needFree) {
+                BepFreeProcessContext(Context);
+            }
+        } else {
             //
-            // Remove from hash table
+            // At DISPATCH_LEVEL: mark terminated for worker cleanup.
+            // Only one thread can reach RefCount==0 (InterlockedDecrement
+            // is atomic), so this store is safe without additional locking.
             //
-            BepRemoveProcessContextFromHash(Context);
-
-            //
-            // Free the context
-            //
-            BepFreeProcessContext(Context);
+            Context->Flags |= BE_PROC_FLAG_TERMINATED;
         }
-        //
-        // At DISPATCH_LEVEL, the context will be cleaned up by
-        // BepCleanupStaleProcessContexts() on the worker thread
-        //
     }
 }
 
@@ -4394,9 +4405,15 @@ BepCleanupStaleProcessContexts(
         context = CONTAINING_RECORD(entry, BE_PROCESS_CONTEXT, ListEntry);
 
         //
-        // Check if process is terminated and has no references
+        // Check if process is terminated and has no references.
+        // CLEANUP_DONE prevents double-remove if BeEngineReleaseProcessContext
+        // already handled this context's list removal.
         //
-        if ((context->Flags & BE_PROC_FLAG_TERMINATED) && context->RefCount <= 1) {
+        if ((context->Flags & BE_PROC_FLAG_TERMINATED) &&
+            !(context->Flags & BE_PROC_FLAG_CLEANUP_DONE) &&
+            context->RefCount <= 1) {
+
+            context->Flags |= BE_PROC_FLAG_CLEANUP_DONE;
             RemoveEntryList(&context->ListEntry);
             g_BeState.ProcessContextCount--;
 
