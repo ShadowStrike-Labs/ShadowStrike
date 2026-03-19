@@ -176,8 +176,11 @@ TppReleaseTrackerRef(
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, TpInitializeThreadProtection)
 #pragma alloc_text(PAGE, TpShutdownThreadProtection)
-#pragma alloc_text(PAGE, TpCleanupExpiredTrackers)
-#pragma alloc_text(PAGE, TpCleanupProcessTracker)
+//
+// TpCleanupExpiredTrackers and TpCleanupProcessTracker removed from PAGE:
+// Both acquire KeAcquireSpinLock (DISPATCH_LEVEL). PAGE code + spinlock = 0xD1
+// under Driver Verifier "Force IRQL Checking". Must be nonpaged.
+//
 #endif
 
 // ============================================================================
@@ -1130,8 +1133,6 @@ TpCleanupExpiredTrackers(
     KIRQL oldIrql;
     LIST_ENTRY freeList;
 
-    PAGED_CODE();
-
     if (!TpIsStateValid()) {
         return;
     }
@@ -1198,8 +1199,6 @@ TpCleanupProcessTracker(
     PTP_ACTIVITY_TRACKER tracker;
     PTP_ACTIVITY_TRACKER trackerToFree = NULL;
     KIRQL oldIrql;
-
-    PAGED_CODE();
 
     if (!TpIsStateValid()) {
         return;

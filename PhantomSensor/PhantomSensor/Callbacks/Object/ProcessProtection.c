@@ -145,7 +145,12 @@ typedef struct _PP_SYSTEM_PROCESS_INFORMATION {
 #pragma alloc_text(PAGE, PpAddAccessPolicy)
 #pragma alloc_text(PAGE, PpRemovePoliciesForCategory)
 #pragma alloc_text(PAGE, PpValidateCachedProcess)
-#pragma alloc_text(PAGE, PpCleanupActivityTrackerForProcess)
+//
+// PpCleanupActivityTrackerForProcess removed from PAGE:
+// Called from PppProcessNotifyCallback alongside TpCleanupProcessTracker
+// which acquires spinlock. DV "Force IRQL Checking" trims all pageable
+// code after spinlock acquire, causing 0xD1 on this function too.
+//
 #endif
 
 // ============================================================================
@@ -2337,8 +2342,6 @@ Routine Description:
 {
     ULONG HashIndex;
     PPP_ACTIVITY_TRACKER Tracker = NULL;
-
-    PAGED_CODE();
 
     if (InterlockedCompareExchange(&g_ProcessProtection.Initialized, 0, 0) == 0) {
         return;
