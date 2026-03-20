@@ -16,7 +16,6 @@ Driver Verifier Pass
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-lightgrey?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
 [![Language](https://img.shields.io/badge/language-C%20%2F%20C%2B%2B%20%2F%20ASM-orange?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
 [![Coverity](https://img.shields.io/badge/Coverity%20Scan-passed-brightgreen?style=flat-square&logo=synopsys)](https://scan.coverity.com/projects/ShadowStrike-Labs-ShadowStrike)
-[![Phase 1](https://img.shields.io/badge/phase%201%20kernel-77%25-brightgreen?style=flat-square)](https://www.shadowstrike.dev/roadmap)
 [![Commits](https://img.shields.io/github/commit-activity/w/ShadowStrike-Labs/ShadowStrike?style=flat-square&label=commits%2Fweek)](https://github.com/ShadowStrike-Labs/ShadowStrike/commits/master)
 [![Beta](https://img.shields.io/badge/beta%20target-2028-blueviolet?style=flat-square)](https://www.shadowstrike.dev/beta)
 
@@ -61,7 +60,7 @@ ShadowStrike Phantom is the alternative:
 |---|---|
 | Architecture | ✅ Designed |
 | Core Infrastructure | ✅ Completed |
-| Kernel Driver (PhantomSensor) | 🔧 In Development — Phase 1: 77% |
+| Kernel Driver (PhantomSensor) | ✅ Completed |
 | User-Mode Detection Engines | 🔧 In Development — Phase 2: 43% |
 | Windows Service | 🔧 Planned |
 | GUI | ❌ Not Started |
