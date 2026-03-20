@@ -207,7 +207,7 @@ namespace {
             totalDelta += (end - start);
         }
 
-        return totalDelta / iterations;
+        return totalDelta;  // Return accumulated total (NOT averaged) — consistent with assembly
     }
 
     // ------------------------------------------------------------------------
@@ -1162,6 +1162,51 @@ struct VMEvasionDetector::Impl {
         m_cachedResult = result;
         m_cacheTimestamp = std::chrono::system_clock::now();
     }
+
+    // Core detection logic — caller MUST hold m_mutex (shared or exclusive)
+    void RunDetectionChecks(VMEvasionDetector& outer, VMEvasionResult& result) {
+        const auto& config = m_config;
+
+        if (config.IsCategoryEnabled(VMDetectionCategory::CPUID)) {
+            outer.CheckCPUID(result);
+        }
+        if (config.IsCategoryEnabled(VMDetectionCategory::Registry)) {
+            outer.CheckRegistryArtifacts(result);
+        }
+        if (config.IsCategoryEnabled(VMDetectionCategory::FileSystem)) {
+            outer.CheckFileArtifacts(result);
+        }
+        if (config.IsCategoryEnabled(VMDetectionCategory::Network)) {
+            outer.CheckNetworkAdapters(result);
+        }
+        if (config.IsCategoryEnabled(VMDetectionCategory::Firmware)) {
+            outer.CheckFirmwareTables(result);
+        }
+        if (config.IsCategoryEnabled(VMDetectionCategory::Process) && config.enableProcessEnumeration) {
+            outer.CheckRunningProcesses(result);
+        }
+        if (config.IsCategoryEnabled(VMDetectionCategory::Timing) && config.enableTimingChecks) {
+            outer.CheckTiming(result);
+        }
+        if (config.IsCategoryEnabled(VMDetectionCategory::IOPort) && config.enableIOPortProbing) {
+            outer.CheckIOPorts(result);
+        }
+        if (config.IsCategoryEnabled(VMDetectionCategory::Memory) && config.enableMemoryScanning) {
+            outer.CheckMemoryArtifacts(result);
+        }
+        if (config.IsCategoryEnabled(VMDetectionCategory::Device)) {
+            outer.CheckDevices(result);
+        }
+        if (config.IsCategoryEnabled(VMDetectionCategory::WMI) && config.enableWMIQueries) {
+            outer.CheckWMI(result);
+        }
+        if (config.IsCategoryEnabled(VMDetectionCategory::Window)) {
+            outer.CheckWindows(result);
+        }
+
+        outer.CalculateFinalScore(result);
+        outer.DetermineVMType(result);
+    }
 };
 
 // ============================================================================
@@ -1228,62 +1273,7 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment() {
 
     try {
         std::shared_lock<std::shared_mutex> lock(m_impl->m_mutex);
-
-        // Execute detection checks based on enabled categories
-        const auto& config = m_impl->m_config;
-
-        if (config.IsCategoryEnabled(VMDetectionCategory::CPUID)) {
-            CheckCPUID(result);
-        }
-
-        if (config.IsCategoryEnabled(VMDetectionCategory::Registry)) {
-            CheckRegistryArtifacts(result);
-        }
-
-        if (config.IsCategoryEnabled(VMDetectionCategory::FileSystem)) {
-            CheckFileArtifacts(result);
-        }
-
-        if (config.IsCategoryEnabled(VMDetectionCategory::Network)) {
-            CheckNetworkAdapters(result);
-        }
-
-        if (config.IsCategoryEnabled(VMDetectionCategory::Firmware)) {
-            CheckFirmwareTables(result);
-        }
-
-        if (config.IsCategoryEnabled(VMDetectionCategory::Process) && config.enableProcessEnumeration) {
-            CheckRunningProcesses(result);
-        }
-
-        if (config.IsCategoryEnabled(VMDetectionCategory::Timing) && config.enableTimingChecks) {
-            CheckTiming(result);
-        }
-
-        if (config.IsCategoryEnabled(VMDetectionCategory::IOPort) && config.enableIOPortProbing) {
-            CheckIOPorts(result);
-        }
-
-        if (config.IsCategoryEnabled(VMDetectionCategory::Memory) && config.enableMemoryScanning) {
-            CheckMemoryArtifacts(result);
-        }
-
-        if (config.IsCategoryEnabled(VMDetectionCategory::Device)) {
-            CheckDevices(result);
-        }
-
-        if (config.IsCategoryEnabled(VMDetectionCategory::WMI) && config.enableWMIQueries) {
-            CheckWMI(result);
-        }
-
-        if (config.IsCategoryEnabled(VMDetectionCategory::Window)) {
-            CheckWindows(result);
-        }
-
-        // Calculate final scores and determine VM type
-        CalculateFinalScore(result);
-        DetermineVMType(result);
-
+        m_impl->RunDetectionChecks(*this, result);
         result.completed = true;
 
     } catch (const std::exception& e) {
@@ -1316,22 +1306,86 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment() {
 }
 
 VMEvasionResult VMEvasionDetector::DetectEnvironment(const VMDetectionConfig& config) {
-    // Temporarily use custom config (don't cache these results)
-    const auto originalConfig = m_impl->m_config;
-    m_impl->m_config = config;
-    m_impl->m_config.enableCaching = false;  // Force no caching for custom config
+    const auto startTime = std::chrono::high_resolution_clock::now();
+    m_impl->m_statistics.totalDetections.fetch_add(1, std::memory_order_relaxed);
 
-    auto result = DetectEnvironment();
+    VMEvasionResult result;
+    result.detectionTime = std::chrono::system_clock::now();
 
-    m_impl->m_config = originalConfig;
+    try {
+        // Exclusive lock: safely swap config, run checks, restore
+        std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
+        const auto originalConfig = m_impl->m_config;
+        m_impl->m_config = config;
+        m_impl->m_config.enableCaching = false;
+
+        try {
+            m_impl->RunDetectionChecks(*this, result);
+            result.completed = true;
+        } catch (...) {
+            m_impl->m_config = originalConfig;
+            throw;
+        }
+        m_impl->m_config = originalConfig;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"AntiEvasion", L"VMEvasionDetector: Custom-config detection failed - %hs", e.what());
+        result.completed = false;
+        result.errorMessage = Utils::StringUtils::ToWide(e.what());
+    }
+
+    const auto endTime = std::chrono::high_resolution_clock::now();
+    result.detectionDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime);
+    UpdateStatistics(result, result.detectionDuration);
+
+    // Do NOT cache custom-config results
+    if (result.isVM) {
+        m_impl->m_statistics.vmDetectedCount.fetch_add(1, std::memory_order_relaxed);
+        SS_LOG_WARN(L"AntiEvasion", L"VMEvasionDetector: VM DETECTED (custom config) - %ls (confidence: %.1f%%)",
+                           VMTypeToString(result.detectedType).c_str(), result.confidenceScore);
+    }
 
     return result;
 }
 
 VMEvasionResult VMEvasionDetector::DetectEnvironmentWithProgress(ProgressCallback callback) {
-    m_impl->m_progressCallback = std::move(callback);
-    auto result = DetectEnvironment();
-    m_impl->m_progressCallback = nullptr;
+    const auto startTime = std::chrono::high_resolution_clock::now();
+    m_impl->m_statistics.totalDetections.fetch_add(1, std::memory_order_relaxed);
+
+    VMEvasionResult result;
+    result.detectionTime = std::chrono::system_clock::now();
+
+    try {
+        // Exclusive lock: safely set callback, run checks, clear callback
+        std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
+        m_impl->m_progressCallback = std::move(callback);
+
+        try {
+            m_impl->RunDetectionChecks(*this, result);
+            result.completed = true;
+        } catch (...) {
+            m_impl->m_progressCallback = nullptr;
+            throw;
+        }
+        m_impl->m_progressCallback = nullptr;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"AntiEvasion", L"VMEvasionDetector: Detection with progress failed - %hs", e.what());
+        result.completed = false;
+        result.errorMessage = Utils::StringUtils::ToWide(e.what());
+    }
+
+    const auto endTime = std::chrono::high_resolution_clock::now();
+    result.detectionDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime);
+    UpdateStatistics(result, result.detectionDuration);
+    m_impl->UpdateCache(result);
+
+    if (result.isVM) {
+        m_impl->m_statistics.vmDetectedCount.fetch_add(1, std::memory_order_relaxed);
+        SS_LOG_WARN(L"AntiEvasion", L"VMEvasionDetector: VM DETECTED - %ls (confidence: %.1f%%)",
+                           VMTypeToString(result.detectedType).c_str(), result.confidenceScore);
+    }
+
     return result;
 }
 
@@ -2252,14 +2306,18 @@ bool VMEvasionDetector::AnalyzeProcessAntiVMBehavior(
             // Only scan committed, executable image pages (code sections)
             if (mbi.State == MEM_COMMIT && isExecutable && mbi.Type == MEM_IMAGE) {
 
+                // Cap per-region allocation to prevent OOM on huge mapped regions
+                constexpr size_t MAX_REGION_SCAN = 16 * 1024 * 1024; // 16MB per region
+                const size_t regionScanSize = std::min<size_t>(mbi.RegionSize, MAX_REGION_SCAN);
+
                 std::vector<uint8_t> buffer;
-                buffer.resize(mbi.RegionSize);
+                buffer.resize(regionScanSize);
                 SIZE_T bytesRead = 0;
 
-                if (ReadProcessMemory((HANDLE)hProcess.get(), mbi.BaseAddress, buffer.data(), mbi.RegionSize, &bytesRead)) {
-                    // Scan buffer for Anti-VM patterns
-
-                    for (size_t i = 0; i < bytesRead - 4; ++i) {
+                if (ReadProcessMemory((HANDLE)hProcess.get(), mbi.BaseAddress, buffer.data(), regionScanSize, &bytesRead)) {
+                    // Scan buffer for Anti-VM patterns — guard against underflow
+                    if (bytesRead >= 4) {
+                        for (size_t i = 0; i <= bytesRead - 4; ++i) {
                         // Pattern 1: SIDT (Red Pill)
                         // x86: 0F 01 0D
                         // x64: 0F 01 4C 24 (SIDT [RSP+...]) or just 0F 01 (SIDT/SGDT)
@@ -2355,6 +2413,7 @@ bool VMEvasionDetector::AnalyzeProcessAntiVMBehavior(
                             }
                         }
                     }
+                    } // if (bytesRead >= 4)
                 }
 
                 totalScanned += bytesRead;
