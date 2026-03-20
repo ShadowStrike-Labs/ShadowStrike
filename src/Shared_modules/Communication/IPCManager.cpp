@@ -32,9 +32,15 @@
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
+#include <aclapi.h>
+#include <sddl.h>
+#include <wintrust.h>
+#include <softpub.h>
 
 #ifdef _WIN32
 #pragma comment(lib, "fltlib.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "wintrust.lib")
 #endif
 
 namespace ShadowStrike {
@@ -76,7 +82,7 @@ public:
     struct PendingReply {
         uint64_t messageId;
         TimePoint expirationTime;
-        std::promise<SCAN_VERDICT_REPLY> promise;
+        std::promise<SHADOWSTRIKE_SCAN_VERDICT_REPLY> promise;
     };
     std::unordered_map<uint64_t, std::unique_ptr<PendingReply>> pendingReplies;
     mutable std::mutex pendingMutex;
@@ -311,8 +317,11 @@ void IPCManager::Stop() {
     }
 
     // Cancel any pending filter operations
-    if (m_hPort != nullptr) {
-        CancelIoEx(m_hPort, nullptr);
+    {
+        HANDLE hPort = m_hPort.load(std::memory_order_acquire);
+        if (hPort != nullptr) {
+            CancelIoEx(hPort, nullptr);
+        }
     }
 
     // Wait for all workers to finish
@@ -406,7 +415,7 @@ IPCConfiguration IPCManager::GetConfiguration() const {
 // ============================================================================
 
 bool IPCManager::ConnectFilterPort() {
-    if (m_hPort != nullptr) {
+    if (m_hPort.load(std::memory_order_acquire) != nullptr) {
         Utils::Logger::Debug("[IPCManager] Filter port already connected");
         return true;
     }
@@ -420,28 +429,28 @@ bool IPCManager::ConnectFilterPort() {
     Utils::Logger::Info("[IPCManager] Connecting to filter port: {}",
                         Utils::StringUtils::WideToUtf8(portName));
 
-    // Connect to the kernel driver's communication port
+    // FIX [BUG #11]: Use temp handle — FilterConnectCommunicationPort writes
+    // directly to &handle. Storing into atomic<HANDLE> address isn't portable.
+    HANDLE hPortTemp = nullptr;
     HRESULT hr = FilterConnectCommunicationPort(
-        portName.c_str(),           // Port name
-        0,                          // Options (0 = default)
-        nullptr,                    // Context (passed to driver)
-        0,                          // Context size
-        nullptr,                    // Security attributes
-        &m_hPort                    // Output: port handle
+        portName.c_str(),
+        0,
+        nullptr,
+        0,
+        nullptr,
+        &hPortTemp
     );
 
     if (FAILED(hr)) {
         Utils::Logger::Error("[IPCManager] FilterConnectCommunicationPort failed: 0x{:08X}",
                              static_cast<unsigned int>(hr));
 
-        // Provide more specific error messages
         if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
             Utils::Logger::Error("[IPCManager] Driver port not found - is driver loaded?");
         } else if (hr == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)) {
             Utils::Logger::Error("[IPCManager] Access denied - check service permissions");
         }
 
-        m_hPort = nullptr;
         m_impl->NotifyError("Filter port connection failed", hr);
         return false;
     }
@@ -449,9 +458,9 @@ bool IPCManager::ConnectFilterPort() {
     // Associate with IOCP for async operations
     if (m_hIOCP != nullptr) {
         HANDLE result = CreateIoCompletionPort(
-            m_hPort,
+            hPortTemp,
             m_hIOCP,
-            reinterpret_cast<ULONG_PTR>(m_hPort),
+            reinterpret_cast<ULONG_PTR>(hPortTemp),
             0
         );
 
@@ -461,6 +470,7 @@ bool IPCManager::ConnectFilterPort() {
         }
     }
 
+    m_hPort.store(hPortTemp, std::memory_order_release);
     m_connected.store(true, std::memory_order_release);
     m_impl->NotifyConnectionChange(ChannelType::FilterPort, ConnectionStatus::Connected);
 
@@ -469,12 +479,12 @@ bool IPCManager::ConnectFilterPort() {
 }
 
 void IPCManager::DisconnectFilterPort() {
-    if (m_hPort != nullptr) {
-        // Cancel any pending I/O
-        CancelIoEx(m_hPort, nullptr);
-
-        CloseHandle(m_hPort);
-        m_hPort = nullptr;
+    // FIX [BUG #11]: Atomic exchange prevents double-close race between
+    // Stop() and worker threads seeing ERROR_INVALID_HANDLE.
+    HANDLE hOld = m_hPort.exchange(nullptr, std::memory_order_acq_rel);
+    if (hOld != nullptr) {
+        CancelIoEx(hOld, nullptr);
+        CloseHandle(hOld);
         m_connected.store(false, std::memory_order_release);
 
         m_impl->NotifyConnectionChange(ChannelType::FilterPort, ConnectionStatus::Disconnected);
@@ -483,7 +493,8 @@ void IPCManager::DisconnectFilterPort() {
 }
 
 bool IPCManager::IsFilterPortConnected() const noexcept {
-    return m_hPort != nullptr && m_connected.load(std::memory_order_acquire);
+    return m_hPort.load(std::memory_order_acquire) != nullptr
+        && m_connected.load(std::memory_order_acquire);
 }
 
 bool IPCManager::SendToKernel(
@@ -493,7 +504,9 @@ bool IPCManager::SendToKernel(
     size_t* replySize,
     uint32_t timeoutMs) {
 
-    if (m_hPort == nullptr) {
+    // FIX [BUG #11]: Atomic snapshot of handle
+    HANDLE hPort = m_hPort.load(std::memory_order_acquire);
+    if (hPort == nullptr) {
         Utils::Logger::Error("[IPCManager] Cannot send - not connected to filter port");
         return false;
     }
@@ -511,13 +524,22 @@ bool IPCManager::SendToKernel(
 
     auto startTime = Clock::now();
 
+    // FIX [BUG #7]: Guard against reply != nullptr && replySize == nullptr
+    DWORD replyBufSize = 0;
+    if (reply != nullptr && replySize != nullptr) {
+        replyBufSize = static_cast<DWORD>(*replySize);
+    } else if (reply != nullptr && replySize == nullptr) {
+        Utils::Logger::Error("[IPCManager] reply buffer provided but replySize is null");
+        return false;
+    }
+
     DWORD bytesReturned = 0;
     HRESULT hr = FilterSendMessage(
-        m_hPort,
+        hPort,
         const_cast<void*>(message),
         static_cast<DWORD>(messageSize),
         reply,
-        reply ? static_cast<DWORD>(*replySize) : 0,
+        replyBufSize,
         &bytesReturned
     );
 
@@ -528,9 +550,8 @@ bool IPCManager::SendToKernel(
     if (FAILED(hr)) {
         Utils::Logger::Error("[IPCManager] FilterSendMessage failed: 0x{:08X}",
                              static_cast<unsigned int>(hr));
-        m_impl->stats.errors++;
+        m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
 
-        // Handle specific errors
         if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
             m_connected.store(false);
             m_impl->NotifyConnectionChange(ChannelType::FilterPort, ConnectionStatus::Error);
@@ -544,8 +565,8 @@ bool IPCManager::SendToKernel(
     }
 
     // Update statistics
-    m_impl->stats.messagesSent++;
-    m_impl->stats.bytesSent += messageSize;
+    m_impl->stats.messagesSent.fetch_add(1, std::memory_order_relaxed);
+    m_impl->stats.bytesSent.fetch_add(messageSize, std::memory_order_relaxed);
 
     // Update latency tracking (exponential moving average)
     uint64_t currentAvg = m_impl->stats.avgLatencyUs.load(std::memory_order_relaxed);
@@ -553,10 +574,14 @@ bool IPCManager::SendToKernel(
         (currentAvg * 95 + static_cast<uint64_t>(latencyUs) * 5) / 100,
         std::memory_order_relaxed);
 
+    // FIX [BUG #15]: CAS loop for maxLatencyUs — plain store races under contention
     uint64_t currentMax = m_impl->stats.maxLatencyUs.load(std::memory_order_relaxed);
-    if (static_cast<uint64_t>(latencyUs) > currentMax) {
-        m_impl->stats.maxLatencyUs.store(static_cast<uint64_t>(latencyUs),
-                                         std::memory_order_relaxed);
+    uint64_t newLatency = static_cast<uint64_t>(latencyUs);
+    while (newLatency > currentMax) {
+        if (m_impl->stats.maxLatencyUs.compare_exchange_weak(
+                currentMax, newLatency, std::memory_order_relaxed)) {
+            break;
+        }
     }
 
     return true;
@@ -582,7 +607,7 @@ bool IPCManager::CreatePipeServer(const std::wstring& pipeName) {
         pipeName.c_str(),
         PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_UNLIMITED_INSTANCES,
+        1,  // FIX [BUG #16]: Single instance prevents named pipe squatting attacks
         static_cast<DWORD>(IPCConstants::MAX_MESSAGE_SIZE),
         static_cast<DWORD>(IPCConstants::MAX_MESSAGE_SIZE),
         0,
@@ -686,7 +711,11 @@ bool IPCManager::SendPipeMessage(const void* data, size_t size) {
             if (waitResult == WAIT_OBJECT_0) {
                 GetOverlappedResult(m_hPipe, &overlapped, &bytesWritten, FALSE);
             } else {
+                // FIX [BUG #8]: After CancelIoEx, MUST drain with
+                // GetOverlappedResult(bWait=TRUE) before OVERLAPPED goes out
+                // of scope. Without this, the kernel may write to freed stack.
                 CancelIoEx(m_hPipe, &overlapped);
+                GetOverlappedResult(m_hPipe, &overlapped, &bytesWritten, TRUE);
                 CloseHandle(overlapped.hEvent);
                 return false;
             }
@@ -728,15 +757,34 @@ bool IPCManager::CreateSharedMemory(const std::wstring& name, size_t size, bool 
     region.size = size;
     region.isWritable = writable;
 
+    // FIX [BUG #13]: Create restricted SECURITY_ATTRIBUTES (SYSTEM + Admins only)
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE };
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+
+    // SDDL: D:P(A;;GA;;;SY)(A;;GA;;;BA) = SYSTEM full + Admins full, deny all others
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;SY)(A;;GA;;;BA)",
+            SDDL_REVISION_1,
+            &pSD,
+            nullptr)) {
+        sa.lpSecurityDescriptor = pSD;
+    } else {
+        Utils::Logger::Warn("[IPCManager] Failed to create shared memory DACL: {}", GetLastError());
+    }
+
     // Create file mapping
     region.mappingHandle = CreateFileMappingW(
         INVALID_HANDLE_VALUE,
-        nullptr,
+        &sa,
         writable ? PAGE_READWRITE : PAGE_READONLY,
         static_cast<DWORD>(size >> 32),
         static_cast<DWORD>(size & 0xFFFFFFFF),
         name.c_str()
     );
+
+    if (pSD != nullptr) {
+        LocalFree(pSD);
+    }
 
     if (region.mappingHandle == nullptr) {
         Utils::Logger::Error("[IPCManager] CreateFileMapping failed: {}", GetLastError());
@@ -925,7 +973,7 @@ ConnectionInfo IPCManager::GetConnectionInfo(ChannelType channel) const {
 
     switch (channel) {
         case ChannelType::FilterPort:
-            info.status = m_hPort != nullptr
+            info.status = m_hPort.load(std::memory_order_acquire) != nullptr
                           ? ConnectionStatus::Connected
                           : ConnectionStatus::Disconnected;
             {
@@ -1019,9 +1067,8 @@ void IPCManager::UnregisterCallbacks() {
 // STATISTICS
 // ============================================================================
 
-IPCStatistics IPCManager::GetStatistics() const {
-    // Return a copy of statistics (atomic members are thread-safe)
-    return m_impl->stats;
+IPCStatisticsSnapshot IPCManager::GetStatistics() const {
+    return TakeSnapshot(m_impl->stats);
 }
 
 void IPCManager::ResetStatistics() {
@@ -1037,17 +1084,14 @@ void IPCManager::WorkerRoutine() {
     Utils::Logger::Debug("[IPCManager] Worker thread {} started",
                          std::this_thread::get_id());
 
-    // Allocate message buffer for this thread
+    // Allocate per-thread receive buffer.
+    // Wire format: [FILTER_MESSAGE_HEADER (WDK, 12 bytes)] [SHADOWSTRIKE_MESSAGE_HEADER (40 bytes)] [payload]
     std::vector<uint8_t> buffer(IPCConstants::MAX_MESSAGE_SIZE);
 
-    // Cast to FILTER_MESSAGE_HEADER for receiving messages
-    PFILTER_MESSAGE_HEADER pMessage =
-        reinterpret_cast<PFILTER_MESSAGE_HEADER>(buffer.data());
-
     while (m_running.load(std::memory_order_acquire)) {
-        // Check if we're connected
-        if (m_hPort == nullptr) {
-            // Not connected - wait a bit and try reconnect if enabled
+        // FIX [BUG #11]: Atomic snapshot of handle — prevents TOCTOU
+        HANDLE hPort = m_hPort.load(std::memory_order_acquire);
+        if (hPort == nullptr) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
             std::shared_lock lock(m_impl->configMutex);
@@ -1058,29 +1102,29 @@ void IPCManager::WorkerRoutine() {
             continue;
         }
 
-        // Receive message from kernel driver
+        // Cast buffer start to WDK FILTER_MESSAGE_HEADER for FilterGetMessage
+        PFILTER_MESSAGE_HEADER pWdkHeader =
+            reinterpret_cast<PFILTER_MESSAGE_HEADER>(buffer.data());
+
         HRESULT hr = FilterGetMessage(
-            m_hPort,
-            pMessage,
+            hPort,
+            pWdkHeader,
             static_cast<DWORD>(buffer.size()),
-            nullptr  // Synchronous operation
+            nullptr  // Synchronous
         );
 
         if (FAILED(hr)) {
-            // Handle different error conditions
             if (hr == HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED) ||
                 hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-                // Port is being closed - normal shutdown
                 Utils::Logger::Debug("[IPCManager] Worker: Operation aborted (shutdown)");
                 break;
             }
 
             if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
-                // Port handle is invalid
                 Utils::Logger::Error("[IPCManager] Worker: Invalid port handle");
                 m_connected.store(false);
-                m_hPort = nullptr;
-
+                // Don't null-out m_hPort here — DisconnectFilterPort handles that.
+                // Just sleep and let reconnect logic handle it.
                 std::shared_lock lock(m_impl->configMutex);
                 if (m_impl->config.autoReconnect && m_running.load()) {
                     lock.unlock();
@@ -1091,20 +1135,40 @@ void IPCManager::WorkerRoutine() {
             }
 
             if (hr != HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT)) {
-                // Log non-timeout errors
                 Utils::Logger::Warn("[IPCManager] FilterGetMessage failed: 0x{:08X}",
                                     static_cast<unsigned int>(hr));
-                m_impl->stats.errors++;
+                m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
             }
             continue;
         }
 
-        // Successfully received a message
-        m_impl->stats.messagesReceived++;
-        m_impl->stats.bytesReceived += pMessage->MessageLength;
+        // FIX [BUG #1,#2]: Proper two-header parsing.
+        // After FILTER_MESSAGE_HEADER comes SHADOWSTRIKE_MESSAGE_HEADER + payload.
+        constexpr size_t kWdkHeaderSize = sizeof(FILTER_MESSAGE_HEADER);
+        constexpr size_t kAppHeaderSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
 
-        // Dispatch to appropriate handler
-        DispatchMessage(buffer.data(), pMessage->MessageId);
+        if (buffer.size() < kWdkHeaderSize + kAppHeaderSize) {
+            Utils::Logger::Error("[IPCManager] Buffer too small for dual-header parse");
+            continue;
+        }
+
+        auto* pAppHeader = reinterpret_cast<PSHADOWSTRIKE_MESSAGE_HEADER>(
+            buffer.data() + kWdkHeaderSize);
+
+        // Validate magic
+        if (pAppHeader->Magic != SHADOWSTRIKE_MESSAGE_MAGIC) {
+            Utils::Logger::Warn("[IPCManager] Invalid message magic: 0x{:08X}",
+                                pAppHeader->Magic);
+            m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+
+        m_impl->stats.messagesReceived.fetch_add(1, std::memory_order_relaxed);
+        m_impl->stats.bytesReceived.fetch_add(
+            kAppHeaderSize + pAppHeader->DataSize, std::memory_order_relaxed);
+
+        // Dispatch with WDK MessageId (needed for FilterReplyMessage)
+        DispatchMessage(buffer.data(), pWdkHeader->MessageId);
     }
 
     Utils::Logger::Debug("[IPCManager] Worker thread {} exiting",
@@ -1112,65 +1176,159 @@ void IPCManager::WorkerRoutine() {
 }
 
 void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
-    // Parse message structure
-    // FILTER_MESSAGE_HEADER is at the beginning
     if (!buffer) return;
-    
-    PFILTER_MESSAGE_HEADER pHeader = reinterpret_cast<PFILTER_MESSAGE_HEADER>(buffer);
-    
-    // Payload follows the header
-    uint8_t* pPayload = buffer + sizeof(FILTER_MESSAGE_HEADER);
+
+    // FIX [BUG #1,#2,#3,#5]: Parse two-header wire format correctly.
+    // buffer layout: [FILTER_MESSAGE_HEADER (WDK)] [SHADOWSTRIKE_MESSAGE_HEADER] [payload]
+    constexpr size_t kWdkHeaderSize = sizeof(FILTER_MESSAGE_HEADER);
+    constexpr size_t kAppHeaderSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+
+    auto* pAppHeader = reinterpret_cast<PSHADOWSTRIKE_MESSAGE_HEADER>(
+        buffer + kWdkHeaderSize);
+    uint8_t* pPayload = buffer + kWdkHeaderSize + kAppHeaderSize;
 
     SHADOWSTRIKE_SCAN_VERDICT verdict = Verdict_Unknown;
-    bool handled = false;
+    bool needsReply = false;
 
-    // Lock handlers for the duration of dispatch
-    std::lock_guard lock(m_handlerMutex);
+    // FIX [BUG #14]: Snapshot handlers under lock, invoke outside lock.
+    // Holding the mutex during file scan I/O would serialize all worker threads.
+    FileScanCallback fileScanHandler;
+    ProcessNotifyCallback processHandler;
+    ImageLoadCallback imageLoadHandler;
+    RegistryOpCallback registryHandler;
+    GenericMessageCallback genericHandler;
 
-    switch (pHeader->MessageType) {
-        case MessageType_FileScanRequest: {
-            if (m_fileScanHandler) {
-                // Ensure we have enough data
-                if (pHeader->DataLength < sizeof(FILE_SCAN_REQUEST)) {
-                    Utils::Logger::Error("[IPCManager] Invalid payload length for FileScanRequest");
+    {
+        std::lock_guard lock(m_handlerMutex);
+        fileScanHandler  = m_fileScanHandler;
+        processHandler   = m_processHandler;
+        imageLoadHandler = m_imageLoadHandler;
+        registryHandler  = m_registryHandler;
+        genericHandler   = m_genericHandler;
+    }
+
+    switch (static_cast<SHADOWSTRIKE_MESSAGE_TYPE>(pAppHeader->MessageType)) {
+        case FilterMessageType_ScanRequest: {
+            if (fileScanHandler) {
+                if (pAppHeader->DataSize < sizeof(FILE_SCAN_REQUEST)) {
+                    Utils::Logger::Error("[IPCManager] Truncated FileScanRequest: {} < {}",
+                                         pAppHeader->DataSize, sizeof(FILE_SCAN_REQUEST));
                     break;
                 }
-                
-                PFILE_SCAN_REQUEST req = reinterpret_cast<PFILE_SCAN_REQUEST>(pPayload);
+
+                auto* req = reinterpret_cast<PFILE_SCAN_REQUEST>(pPayload);
                 try {
-                    // Handler returns SHADOWSTRIKE_SCAN_VERDICT
-                    verdict = m_fileScanHandler(*req);
-                    handled = true;
+                    verdict = fileScanHandler(*req);
+                    needsReply = true;
                 } catch (const std::exception& e) {
                     Utils::Logger::Error("[IPCManager] File scan handler exception: {}", e.what());
                     verdict = Verdict_Error;
+                    needsReply = true;
                 }
-                
-                // Reply
-                if (handled) {
-                     SCAN_VERDICT_REPLY reply = {0};
-                     reply.MessageId = pHeader->MessageId;
-                     reply.Verdict = verdict;
-                     reply.ThreatLevel = (verdict == Verdict_Malicious) ? 100 : 0;
-                     // ThreatName left empty for now
-                     
-                     SendToKernel(&reply, sizeof(reply));
-                }
-                
-                m_impl->stats.byMessageType[static_cast<size_t>(MessageType_FileScanRequest)]++;
+            }
+
+            auto idx = static_cast<size_t>(FilterMessageType_ScanRequest);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
             }
             break;
         }
 
-        case MessageType_Register:
-        case MessageType_Heartbeat:
-            // Handle internal messages
+        case FilterMessageType_ProcessNotify: {
+            if (processHandler) {
+                if (pAppHeader->DataSize < sizeof(ProcessNotifyRequest)) {
+                    Utils::Logger::Error("[IPCManager] Truncated ProcessNotify payload");
+                    break;
+                }
+                auto* req = reinterpret_cast<ProcessNotifyRequest*>(pPayload);
+                try {
+                    verdict = processHandler(*req);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] Process handler exception: {}", e.what());
+                }
+            }
+            break;
+        }
+
+        case FilterMessageType_Register:
+        case FilterMessageType_Heartbeat:
             break;
 
         default:
-            Utils::Logger::Warn("[IPCManager] Unknown message type: {}", static_cast<uint32_t>(pHeader->MessageType));
+            if (genericHandler) {
+                try {
+                    genericHandler(
+                        static_cast<SHADOWSTRIKE_MESSAGE_TYPE>(pAppHeader->MessageType),
+                        pPayload,
+                        pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] Generic handler exception: {}", e.what());
+                }
+            } else {
+                Utils::Logger::Warn("[IPCManager] Unhandled message type: {}",
+                                    pAppHeader->MessageType);
+            }
             break;
     }
+
+    // FIX [BUG #1 CRITICAL]: Reply using FilterReplyMessage, NOT FilterSendMessage.
+    // The kernel's FltSendMessage is BLOCKING until we call FilterReplyMessage.
+    if (needsReply) {
+        SHADOWSTRIKE_SCAN_VERDICT_REPLY verdictReply = {};
+        verdictReply.MessageId  = pAppHeader->MessageId;
+        verdictReply.Verdict    = static_cast<UINT8>(verdict);
+        verdictReply.ThreatScore = (verdict == Verdict_Malicious) ? 100 : 0;
+        verdictReply.ResultCode = 0;
+        verdictReply.CacheResult = (verdict == Verdict_Clean) ? 1 : 0;
+        verdictReply.CacheTTL   = (verdict == Verdict_Clean) ? 300 : 0;
+
+        if (!ReplyToKernel(messageId, verdictReply)) {
+            Utils::Logger::Error("[IPCManager] Failed to reply to kernel for messageId {}",
+                                 messageId);
+        }
+
+        auto vIdx = static_cast<size_t>(verdict);
+        if (vIdx < m_impl->stats.byVerdict.size()) {
+            m_impl->stats.byVerdict[vIdx].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+bool IPCManager::ReplyToKernel(
+    uint64_t messageId,
+    const SHADOWSTRIKE_SCAN_VERDICT_REPLY& verdictReply) {
+
+    HANDLE hPort = m_hPort.load(std::memory_order_acquire);
+    if (hPort == nullptr) {
+        Utils::Logger::Error("[IPCManager] ReplyToKernel: not connected");
+        return false;
+    }
+
+    // Wire format: [FILTER_REPLY_HEADER (WDK)] [SHADOWSTRIKE_SCAN_VERDICT_REPLY]
+    struct alignas(8) ReplyBuffer {
+        FILTER_REPLY_HEADER  wdkHeader;
+        SHADOWSTRIKE_SCAN_VERDICT_REPLY payload;
+    };
+
+    ReplyBuffer replyBuf = {};
+    replyBuf.wdkHeader.Status    = 0;  // STATUS_SUCCESS
+    replyBuf.wdkHeader.MessageId = messageId;
+    replyBuf.payload = verdictReply;
+
+    HRESULT hr = FilterReplyMessage(
+        hPort,
+        &replyBuf.wdkHeader,
+        static_cast<DWORD>(sizeof(replyBuf))
+    );
+
+    if (FAILED(hr)) {
+        Utils::Logger::Error("[IPCManager] FilterReplyMessage failed: 0x{:08X} for msgId {}",
+                             static_cast<unsigned int>(hr), messageId);
+        m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    return true;
 }
 
 // ============================================================================
@@ -1245,7 +1403,7 @@ bool IPCManager::SelfTest() {
     // Test 5: Enum name lookups
     testNum++;
     {
-        auto cmdName = GetMessageTypeName(MessageType_FileScanRequest);
+        auto cmdName = GetMessageTypeName(FilterMessageType_ScanRequest);
         auto verdictName = GetVerdictName(Verdict_Malicious);
 
         if (cmdName.empty() || verdictName.empty()) {
@@ -1305,7 +1463,7 @@ void IPCStatistics::Reset() noexcept {
     avgLatencyUs.store(0, std::memory_order_relaxed);
     maxLatencyUs.store(0, std::memory_order_relaxed);
 
-    for (auto& counter : bySHADOWSTRIKE_MESSAGE_TYPE) {
+    for (auto& counter : byMessageType) {
         counter.store(0, std::memory_order_relaxed);
     }
     for (auto& counter : byVerdict) {
@@ -1336,6 +1494,27 @@ std::string IPCStatistics::ToJson() const {
     return oss.str();
 }
 
+std::string IPCStatisticsSnapshot::ToJson() const {
+    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+        Clock::now() - startTime).count();
+
+    std::ostringstream oss;
+    oss << "{"
+        << "\"uptimeSeconds\":" << uptime << ","
+        << "\"messagesReceived\":" << messagesReceived << ","
+        << "\"messagesSent\":" << messagesSent << ","
+        << "\"messagesDropped\":" << messagesDropped << ","
+        << "\"bytesReceived\":" << bytesReceived << ","
+        << "\"bytesSent\":" << bytesSent << ","
+        << "\"timeouts\":" << timeouts << ","
+        << "\"errors\":" << errors << ","
+        << "\"reconnects\":" << reconnects << ","
+        << "\"avgLatencyUs\":" << avgLatencyUs << ","
+        << "\"maxLatencyUs\":" << maxLatencyUs
+        << "}";
+    return oss.str();
+}
+
 std::string ConnectionInfo::ToJson() const {
     std::ostringstream oss;
     oss << "{"
@@ -1357,14 +1536,22 @@ std::string ConnectionInfo::ToJson() const {
 
 std::string_view GetMessageTypeName(SHADOWSTRIKE_MESSAGE_TYPE type) noexcept {
     switch (type) {
-        case MessageType_None: return "None";
-        case MessageType_Register: return "Register";
-        case MessageType_Unregister: return "Unregister";
-        case MessageType_Heartbeat: return "Heartbeat";
-        case MessageType_FileScanRequest: return "FileScanRequest";
-        case MessageType_FileScanVerdict: return "FileScanVerdict";
-        case MessageType_ConfigUpdate: return "ConfigUpdate";
-        case MessageType_ThreatDetected: return "ThreatDetected";
+        case FilterMessageType_None:          return "None";
+        case FilterMessageType_Register:      return "Register";
+        case FilterMessageType_Unregister:    return "Unregister";
+        case FilterMessageType_Heartbeat:     return "Heartbeat";
+        case FilterMessageType_ScanRequest:   return "ScanRequest";
+        case FilterMessageType_ScanVerdict:   return "ScanVerdict";
+        case FilterMessageType_ConfigUpdate:  return "ConfigUpdate";
+        case FilterMessageType_ProcessNotify: return "ProcessNotify";
+        case FilterMessageType_ThreadNotify:  return "ThreadNotify";
+        case FilterMessageType_ImageLoad:     return "ImageLoad";
+        case FilterMessageType_RegistryNotify:return "RegistryNotify";
+        case FilterMessageType_BehavioralAlert: return "BehavioralAlert";
+        case FilterMessageType_MemoryAlert:   return "MemoryAlert";
+        case FilterMessageType_NetworkAlert:  return "NetworkAlert";
+        case FilterMessageType_HandleAlert:   return "HandleAlert";
+        case FilterMessageType_RansomwareAlert: return "RansomwareAlert";
         default: return "Unknown";
     }
 }
@@ -1405,27 +1592,22 @@ std::string_view GetConnectionStatusName(ConnectionStatus status) noexcept {
 }
 
 bool CreateSecurePipeDacl(SECURITY_ATTRIBUTES& sa) {
-    // Create a security descriptor with restricted access:
-    // - SYSTEM: Full control
-    // - Administrators: Full control
-    // - Service account: Read/Write
+    // FIX [BUG #10 CRITICAL]: NULL DACL = Everyone full access.
+    // Build proper DACL: SYSTEM + Administrators only.
+    //
+    // SDDL string breakdown:
+    //   D:P         — DACL present, protected (no inheritance)
+    //   (A;;GA;;;SY) — Allow GENERIC_ALL to SYSTEM
+    //   (A;;GA;;;BA) — Allow GENERIC_ALL to Built-in Administrators
+    PSECURITY_DESCRIPTOR pSD = nullptr;
 
-    PSECURITY_DESCRIPTOR pSD = static_cast<PSECURITY_DESCRIPTOR>(
-        LocalAlloc(LPTR, SECURITY_DESCRIPTOR_MIN_LENGTH));
-
-    if (pSD == nullptr) {
-        return false;
-    }
-
-    if (!InitializeSecurityDescriptor(pSD, SECURITY_DESCRIPTOR_REVISION)) {
-        LocalFree(pSD);
-        return false;
-    }
-
-    // For production, create proper ACL with specific SIDs
-    // For now, use a permissive DACL
-    if (!SetSecurityDescriptorDacl(pSD, TRUE, nullptr, FALSE)) {
-        LocalFree(pSD);
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;SY)(A;;GA;;;BA)",
+            SDDL_REVISION_1,
+            &pSD,
+            nullptr)) {
+        Utils::Logger::Error("[IPCManager] ConvertStringSecurityDescriptor failed: {}",
+                             GetLastError());
         return false;
     }
 
@@ -1441,15 +1623,53 @@ bool VerifyDriverSignature(const std::wstring& driverPath) {
         return false;
     }
 
-    // In production implementation:
-    // 1. Use WinVerifyTrust with WINTRUST_ACTION_GENERIC_VERIFY_V2
-    // 2. Verify Authenticode signature
-    // 3. Check certificate chain validity
-    // 4. Check for certificate revocation
-    // 5. Verify certificate is from trusted publisher
+    // FIX [BUG #11 CRITICAL]: Stub always returned true — complete security bypass.
+    // Implement real Authenticode verification via WinVerifyTrust.
 
-    // Placeholder - always returns true for development
-    // TODO: Implement full signature verification
+    GUID actionId = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+    WINTRUST_FILE_INFO fileInfo = {};
+    fileInfo.cbStruct      = sizeof(WINTRUST_FILE_INFO);
+    fileInfo.pcwszFilePath = driverPath.c_str();
+    fileInfo.hFile         = nullptr;
+    fileInfo.pgKnownSubject= nullptr;
+
+    WINTRUST_DATA trustData = {};
+    trustData.cbStruct            = sizeof(WINTRUST_DATA);
+    trustData.pPolicyCallbackData = nullptr;
+    trustData.pSIPClientData      = nullptr;
+    trustData.dwUIChoice          = WTD_UI_NONE;
+    trustData.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
+    trustData.dwUnionChoice       = WTD_CHOICE_FILE;
+    trustData.pFile               = &fileInfo;
+    trustData.dwStateAction       = WTD_STATEACTION_VERIFY;
+    trustData.hWVTStateData       = nullptr;
+    trustData.dwProvFlags         = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+    LONG status = WinVerifyTrust(
+        static_cast<HWND>(INVALID_HANDLE_VALUE),
+        &actionId,
+        &trustData
+    );
+
+    // Clean up state
+    trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(
+        static_cast<HWND>(INVALID_HANDLE_VALUE),
+        &actionId,
+        &trustData
+    );
+
+    if (status != ERROR_SUCCESS) {
+        Utils::Logger::Error("[IPCManager] Driver signature verification FAILED "
+                             "for '{}': WinVerifyTrust returned 0x{:08X}",
+                             Utils::StringUtils::WideToUtf8(driverPath),
+                             static_cast<unsigned long>(status));
+        return false;
+    }
+
+    Utils::Logger::Info("[IPCManager] Driver signature verified: {}",
+                        Utils::StringUtils::WideToUtf8(driverPath));
     return true;
 }
 

@@ -150,6 +150,16 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 
+// FIX [BUG #3 CRITICAL]: fltUser.h defines FILTER_MESSAGE_HEADER (WDK version:
+// ReplyLength + MessageId, 12 bytes). MessageProtocol.h tries to typedef
+// SHADOWSTRIKE_MESSAGE_HEADER as FILTER_MESSAGE_HEADER, but only when
+// __FLT_USER_STRUCTURES_H__ is not defined. The guard name doesn't match
+// the WDK's actual guard, causing a type redefinition conflict. Force the
+// guard so the WDK version takes precedence.
+#ifndef __FLT_USER_STRUCTURES_H__
+#  define __FLT_USER_STRUCTURES_H__
+#endif
+
 #include "../../Drivers/Shared/MessageProtocol.h"
 #include "../../Drivers/Shared/MessageTypes.h"
 #include "../../Drivers/Shared/VerdictTypes.h"
@@ -392,9 +402,8 @@ struct RegistryOpRequest {
 };
 
 /**
- * @brief Kernel reply
+ * @brief Kernel reply — uses SHADOWSTRIKE_SCAN_VERDICT_REPLY from MessageProtocol.h
  */
-// struct KernelReply replaced by SCAN_VERDICT_REPLY
 
 #pragma pack(pop)
 
@@ -447,7 +456,7 @@ struct PendingMessage {
     uint64_t messageId = 0;
     
     /// @brief Command type
-    SHADOWSTRIKE_MESSAGE_TYPE command = MessageType_None;
+    SHADOWSTRIKE_MESSAGE_TYPE command = FilterMessageType_None;
     
     /// @brief Queued time
     TimePoint queuedTime;
@@ -502,13 +511,56 @@ struct IPCStatistics {
     std::atomic<uint64_t> reconnects{0};
     std::atomic<uint64_t> avgLatencyUs{0};
     std::atomic<uint64_t> maxLatencyUs{0};
-    std::array<std::atomic<uint64_t>, 16> bySHADOWSTRIKE_MESSAGE_TYPE{};
+    std::array<std::atomic<uint64_t>, 16> byMessageType{};
     std::array<std::atomic<uint64_t>, 8> byVerdict{};
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
+
+/**
+ * @brief Copyable snapshot of IPCStatistics for return-by-value.
+ *        IPCStatistics contains std::atomic members and is non-copyable.
+ */
+struct IPCStatisticsSnapshot {
+    uint64_t messagesReceived{0};
+    uint64_t messagesSent{0};
+    uint64_t messagesDropped{0};
+    uint64_t bytesReceived{0};
+    uint64_t bytesSent{0};
+    uint64_t timeouts{0};
+    uint64_t errors{0};
+    uint64_t reconnects{0};
+    uint64_t avgLatencyUs{0};
+    uint64_t maxLatencyUs{0};
+    std::array<uint64_t, 16> byMessageType{};
+    std::array<uint64_t, 8> byVerdict{};
+    TimePoint startTime{};
+    
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/// @brief Take a thread-safe snapshot of live IPCStatistics
+[[nodiscard]] inline IPCStatisticsSnapshot TakeSnapshot(const IPCStatistics& stats) noexcept {
+    IPCStatisticsSnapshot snap;
+    snap.messagesReceived = stats.messagesReceived.load(std::memory_order_relaxed);
+    snap.messagesSent     = stats.messagesSent.load(std::memory_order_relaxed);
+    snap.messagesDropped  = stats.messagesDropped.load(std::memory_order_relaxed);
+    snap.bytesReceived    = stats.bytesReceived.load(std::memory_order_relaxed);
+    snap.bytesSent        = stats.bytesSent.load(std::memory_order_relaxed);
+    snap.timeouts         = stats.timeouts.load(std::memory_order_relaxed);
+    snap.errors           = stats.errors.load(std::memory_order_relaxed);
+    snap.reconnects       = stats.reconnects.load(std::memory_order_relaxed);
+    snap.avgLatencyUs     = stats.avgLatencyUs.load(std::memory_order_relaxed);
+    snap.maxLatencyUs     = stats.maxLatencyUs.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < stats.byMessageType.size(); ++i)
+        snap.byMessageType[i] = stats.byMessageType[i].load(std::memory_order_relaxed);
+    for (size_t i = 0; i < stats.byVerdict.size(); ++i)
+        snap.byVerdict[i] = stats.byVerdict[i].load(std::memory_order_relaxed);
+    snap.startTime = stats.startTime;
+    return snap;
+}
 
 /**
  * @brief Configuration
@@ -624,6 +676,13 @@ public:
         void* reply = nullptr,
         size_t* replySize = nullptr,
         uint32_t timeoutMs = IPCConstants::REPLY_TIMEOUT_MS);
+    
+    /// @brief Reply to a pending kernel message (FilterReplyMessage wrapper).
+    ///        This is for responding to FltSendMessage from the kernel driver —
+    ///        NOT for initiating new user→kernel messages.
+    [[nodiscard]] bool ReplyToKernel(
+        uint64_t messageId,
+        const SHADOWSTRIKE_SCAN_VERDICT_REPLY& verdictReply);
 
     // ========================================================================
     // NAMED PIPE OPERATIONS
@@ -721,7 +780,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] IPCStatistics GetStatistics() const;
+    [[nodiscard]] IPCStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
@@ -739,8 +798,8 @@ private:
     
     std::unique_ptr<IPCManagerImpl> m_impl;
     
-    // Core handles
-    HANDLE m_hPort = nullptr;
+    // Core handles (m_hPort is atomic — accessed by multiple worker threads)
+    std::atomic<HANDLE> m_hPort{nullptr};
     HANDLE m_hPipe = nullptr;
     HANDLE m_hIOCP = nullptr;
     
@@ -772,7 +831,7 @@ private:
 // UTILITY FUNCTIONS
 // ============================================================================
 
-[[nodiscard]] std::string_view GetSHADOWSTRIKE_MESSAGE_TYPEName(SHADOWSTRIKE_MESSAGE_TYPE type) noexcept;
+[[nodiscard]] std::string_view GetMessageTypeName(SHADOWSTRIKE_MESSAGE_TYPE type) noexcept;
 [[nodiscard]] std::string_view GetVerdictName(SHADOWSTRIKE_SCAN_VERDICT verdict) noexcept;
 [[nodiscard]] std::string_view GetChannelTypeName(ChannelType type) noexcept;
 [[nodiscard]] std::string_view GetConnectionStatusName(ConnectionStatus status) noexcept;
@@ -790,9 +849,9 @@ private:
 // MACROS
 // ============================================================================
 
-#define SS_IPC_SEND_VERDICT(msgId, verdict) \
-    ::ShadowStrike::Communication::IPCManager::Instance().SendToKernel( \
-        &(verdict), sizeof(verdict), nullptr, nullptr, 0)
+#define SS_IPC_SEND_VERDICT(msgId, verdictReply) \
+    ::ShadowStrike::Communication::IPCManager::Instance().ReplyToKernel( \
+        (msgId), (verdictReply))
 
 #define SS_IPC_IS_CONNECTED() \
     ::ShadowStrike::Communication::IPCManager::Instance().IsConnected()
