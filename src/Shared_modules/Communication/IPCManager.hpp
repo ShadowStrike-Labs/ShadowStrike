@@ -171,6 +171,8 @@
 
 namespace ShadowStrike::Communication {
     class IPCManagerImpl;
+    class FilterConnection;
+    class ThreatIntelPusher;
 }
 
 namespace ShadowStrike {
@@ -777,6 +779,14 @@ public:
     void UnregisterCallbacks();
 
     // ========================================================================
+    // THREAT INTEL PUSH OPERATIONS
+    // ========================================================================
+
+    /// @brief Get the ThreatIntelPusher for pushing data to kernel stores.
+    ///        Returns nullptr if not connected to filter port.
+    [[nodiscard]] ThreatIntelPusher* GetPusher() noexcept;
+
+    // ========================================================================
     // STATISTICS
     // ========================================================================
     
@@ -825,6 +835,11 @@ private:
     mutable std::shared_mutex m_sharedMemoryMutex;
     
     static std::atomic<bool> s_instanceCreated;
+
+    // Dedicated push connection (separate handle for user→kernel data push)
+    std::unique_ptr<FilterConnection> m_pushConnection;
+    std::unique_ptr<ThreatIntelPusher> m_pusher;
+    mutable std::mutex m_pusherMutex;
 };
 
 // ============================================================================

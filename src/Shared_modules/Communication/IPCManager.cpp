@@ -26,6 +26,8 @@
  */
 
 #include "IPCManager.hpp"
+#include "FilterConnection.hpp"
+#include "ThreatIntelPusher.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 
@@ -474,11 +476,40 @@ bool IPCManager::ConnectFilterPort() {
     m_connected.store(true, std::memory_order_release);
     m_impl->NotifyConnectionChange(ChannelType::FilterPort, ConnectionStatus::Connected);
 
+    // Create dedicated push connection + ThreatIntelPusher
+    {
+        std::lock_guard lock(m_pusherMutex);
+        try {
+            m_pushConnection = std::make_unique<FilterConnection>();
+            if (m_pushConnection->Connect()) {
+                m_pusher = std::make_unique<ThreatIntelPusher>(*m_pushConnection);
+                Utils::Logger::Info("[IPCManager] ThreatIntelPusher created on dedicated push connection");
+            } else {
+                Utils::Logger::Warn("[IPCManager] Push connection failed — ThreatIntelPusher unavailable");
+                m_pushConnection.reset();
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("[IPCManager] Failed to create ThreatIntelPusher: {}", e.what());
+            m_pusher.reset();
+            m_pushConnection.reset();
+        }
+    }
+
     Utils::Logger::Info("[IPCManager] Successfully connected to filter port");
     return true;
 }
 
 void IPCManager::DisconnectFilterPort() {
+    // Tear down pusher before closing the port
+    {
+        std::lock_guard lock(m_pusherMutex);
+        m_pusher.reset();
+        if (m_pushConnection) {
+            m_pushConnection->Disconnect();
+            m_pushConnection.reset();
+        }
+    }
+
     // FIX [BUG #11]: Atomic exchange prevents double-close race between
     // Stop() and worker threads seeing ERROR_INVALID_HANDLE.
     HANDLE hOld = m_hPort.exchange(nullptr, std::memory_order_acq_rel);
@@ -495,6 +526,11 @@ void IPCManager::DisconnectFilterPort() {
 bool IPCManager::IsFilterPortConnected() const noexcept {
     return m_hPort.load(std::memory_order_acquire) != nullptr
         && m_connected.load(std::memory_order_acquire);
+}
+
+ThreatIntelPusher* IPCManager::GetPusher() noexcept {
+    std::lock_guard lock(m_pusherMutex);
+    return m_pusher.get();
 }
 
 bool IPCManager::SendToKernel(

@@ -74,19 +74,26 @@ struct PushResult {
  */
 struct SyncResult {
     PushResult hashes;
+    PushResult patterns;
+    PushResult signatures;
     PushResult networkIOCs;
     PushResult whitelist;
     PushResult exclusions;
+    PushResult iocFeed;
+    PushResult behavioralRules;
     std::chrono::milliseconds elapsed{0};
 
     [[nodiscard]] bool AllSucceeded() const noexcept {
-        return hashes.success && networkIOCs.success &&
-               whitelist.success && exclusions.success;
+        return hashes.success && patterns.success && signatures.success &&
+               networkIOCs.success && whitelist.success && exclusions.success &&
+               iocFeed.success && behavioralRules.success;
     }
 
     [[nodiscard]] uint32_t TotalAccepted() const noexcept {
-        return hashes.entriesAccepted + networkIOCs.entriesAccepted +
-               whitelist.entriesAccepted + exclusions.entriesAccepted;
+        return hashes.entriesAccepted + patterns.entriesAccepted +
+               signatures.entriesAccepted + networkIOCs.entriesAccepted +
+               whitelist.entriesAccepted + exclusions.entriesAccepted +
+               iocFeed.entriesAccepted + behavioralRules.entriesAccepted;
     }
 };
 
@@ -156,6 +163,63 @@ struct ExclusionPushEntry {
     uint32_t  ttlSeconds;   // 0 = permanent
     std::wstring value;     // Path, extension, or process name
     uint64_t  pid;          // For PID exclusions
+};
+
+/**
+ * @brief IoC Feed entry for pushing to kernel IOCMatcher.
+ *
+ * Variable-length entry — the value string (hash, IP, domain, URL)
+ * is appended after the fixed header on the wire.
+ */
+struct IoCFeedPushEntry {
+    uint8_t     type;           // IOM_IOC_TYPE value
+    uint8_t     severity;       // IOM_SEVERITY value (0-4)
+    uint8_t     matchMode;      // IOM_MATCH_MODE value
+    bool        caseSensitive;
+    std::string threatName;     // max 63 chars
+    std::string source;         // max 63 chars (attribution)
+    std::string value;          // The IoC value (hash hex, IP, domain, URL)
+    int64_t     expiry;         // FILETIME expiry (0 = no expiry)
+};
+
+/**
+ * @brief Condition for behavioral rule push.
+ */
+struct BehavioralRuleCondition {
+    uint32_t    type;           // RE_CONDITION_TYPE (0-12)
+    uint32_t    op;             // RE_OPERATOR (0-9)
+    std::string value;          // max 255 chars
+    bool        negate = false;
+};
+
+/**
+ * @brief Action for behavioral rule push.
+ */
+struct BehavioralRuleAction {
+    uint32_t    type;           // RE_ACTION_TYPE (0-8)
+    std::string parameter;      // max 255 chars
+};
+
+/**
+ * @brief Behavioral rule entry for pushing to kernel RuleEngine.
+ *
+ * Supports Add/Remove/Enable/Disable operations.
+ * For Add: conditions and actions must be populated.
+ * For Remove/Enable/Disable: only ruleId is required.
+ */
+struct BehavioralRulePushEntry {
+    enum Operation : uint8_t {
+        Add = 0, Remove = 1, Enable = 2, Disable = 3
+    };
+
+    Operation   operation;
+    bool        stopProcessing = false;
+    uint32_t    priority = 0;
+    std::string ruleId;         // max 31 chars
+    std::string ruleName;       // max 63 chars (Add only)
+    std::string description;    // max 255 chars (Add only)
+    std::vector<BehavioralRuleCondition> conditions;  // max 16
+    std::vector<BehavioralRuleAction>    actions;      // max 8
 };
 
 /**
@@ -293,6 +357,35 @@ public:
      * @return Push result.
      */
     [[nodiscard]] PushResult PushExclusions(std::span<const ExclusionPushEntry> entries);
+
+    // =========================================================================
+    // IoC Feed Pushes (FilterMessageType_PushIoCFeed)
+    // =========================================================================
+
+    /**
+     * @brief Push IoC feed entries to kernel IOCMatcher.
+     * @param entries Variable-length IoC entries (hashes, IPs, domains, URLs).
+     * @return Push result.
+     *
+     * Uses SHADOWSTRIKE_PUSH_IOC_ENTRY wire format. Entries are variable-length
+     * (value string appended after fixed header). Auto-batched to fit 64KB.
+     */
+    [[nodiscard]] PushResult PushIoCFeed(std::span<const IoCFeedPushEntry> entries);
+
+    // =========================================================================
+    // Behavioral Rule Updates (FilterMessageType_UpdateBehavioralRules)
+    // =========================================================================
+
+    /**
+     * @brief Push behavioral rule updates to kernel RuleEngine.
+     * @param entries Rule entries (Add/Remove/Enable/Disable).
+     * @return Push result.
+     *
+     * For Add operations, RE_CONDITION and RE_ACTION structs are appended
+     * after the fixed SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE header.
+     * Max 16 conditions and 8 actions per rule.
+     */
+    [[nodiscard]] PushResult PushBehavioralRules(std::span<const BehavioralRulePushEntry> entries);
 
     // =========================================================================
     // Diagnostics

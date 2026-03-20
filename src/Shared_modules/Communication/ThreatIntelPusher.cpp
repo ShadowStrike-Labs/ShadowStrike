@@ -29,6 +29,7 @@
 // Shared protocol definitions (kernel/user-mode compatible)
 #include "../../PhantomSensor/Shared/MessageProtocol.h"
 #include "../../PhantomSensor/Shared/MessageTypes.h"
+#include "../../PhantomSensor/PhantomSensor/Behavioral/RuleEngine.h"
 
 namespace ShadowStrike {
 namespace Communication {
@@ -632,8 +633,296 @@ public:
     }
 
     // ========================================================================
-    // State
+    // IoC Feed Push Implementation (variable-length entries)
     // ========================================================================
+
+    PushResult PushIoCFeedBatch(std::span<const IoCFeedPushEntry> entries)
+    {
+        std::lock_guard lock(m_mutex);
+
+        PushResult aggregate;
+
+        if (entries.empty()) {
+            aggregate.success = true;
+            return aggregate;
+        }
+
+        if (!m_connection.IsConnected()) {
+            aggregate.success = false;
+            aggregate.errorMessage = "FilterConnection not connected";
+            Utils::Logger::Warn("[ThreatIntelPusher] PushIoCFeed aborted: not connected");
+            return aggregate;
+        }
+
+        aggregate.success = true;
+        const uint32_t maxBatch = m_maxBatchSize.load(std::memory_order_relaxed);
+
+        size_t offset = 0;
+        while (offset < entries.size()) {
+            std::vector<uint8_t> buffer;
+            buffer.reserve(MAX_MESSAGE_BUFFER_SIZE);
+            buffer.resize(sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
+                         + sizeof(SHADOWSTRIKE_PUSH_BATCH_HEADER));
+
+            uint32_t count = 0;
+            size_t idx = offset;
+
+            while (idx < entries.size() && count < maxBatch) {
+                const auto& src = entries[idx];
+
+                // Validate value length fits in UINT16
+                if (src.value.size() > UINT16_MAX) {
+                    Utils::Logger::Warn(
+                        "[ThreatIntelPusher] IoC value too large ({} bytes, max 65535), skipping",
+                        src.value.size());
+                    aggregate.entriesRejected++;
+                    m_stats.oversizedEntriesSkipped.fetch_add(1, std::memory_order_relaxed);
+                    ++idx;
+                    continue;
+                }
+
+                // Wire: fixed IOC_ENTRY header + variable Value[ValueLength]
+                size_t entrySize = sizeof(SHADOWSTRIKE_PUSH_IOC_ENTRY)
+                    + src.value.size();  // Value is CHAR[], not WCHAR
+
+                if (buffer.size() + entrySize > MAX_MESSAGE_BUFFER_SIZE) {
+                    if (count == 0) {
+                        Utils::Logger::Warn(
+                            "[ThreatIntelPusher] IoC feed entry too large ({} bytes), skipping",
+                            entrySize);
+                        aggregate.entriesRejected++;
+                        m_stats.oversizedEntriesSkipped.fetch_add(1, std::memory_order_relaxed);
+                        ++idx;
+                        continue;
+                    }
+                    break;
+                }
+
+                size_t entryOffset = buffer.size();
+                buffer.resize(entryOffset + entrySize);
+
+                auto* dst = reinterpret_cast<SHADOWSTRIKE_PUSH_IOC_ENTRY*>(
+                    buffer.data() + entryOffset);
+                memset(dst, 0, sizeof(*dst));
+                dst->Type = src.type;
+                dst->Severity = std::min<uint8_t>(src.severity, 4);
+                dst->MatchMode = src.matchMode;
+                dst->CaseSensitive = src.caseSensitive ? 1 : 0;
+                dst->ValueLength = static_cast<UINT16>(src.value.size());
+                dst->Reserved = 0;
+                strncpy_s(dst->ThreatName, sizeof(dst->ThreatName),
+                    src.threatName.c_str(), _TRUNCATE);
+                strncpy_s(dst->Source, sizeof(dst->Source),
+                    src.source.c_str(), _TRUNCATE);
+                dst->Expiry.QuadPart = src.expiry;
+
+                // Append value string after the fixed struct
+                if (!src.value.empty()) {
+                    auto* valPtr = reinterpret_cast<char*>(
+                        buffer.data() + entryOffset
+                        + sizeof(SHADOWSTRIKE_PUSH_IOC_ENTRY));
+                    memcpy(valPtr, src.value.data(), src.value.size());
+                }
+
+                ++count;
+                ++idx;
+            }
+
+            if (count == 0) {
+                offset = idx;
+                continue;
+            }
+
+            uint32_t dataSize = static_cast<uint32_t>(
+                buffer.size() - sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+
+            auto* header = reinterpret_cast<SHADOWSTRIKE_MESSAGE_HEADER*>(buffer.data());
+            BuildMessageHeader(*header, FilterMessageType_PushIoCFeed, dataSize);
+
+            auto* batch = reinterpret_cast<SHADOWSTRIKE_PUSH_BATCH_HEADER*>(
+                buffer.data() + sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+            BuildBatchHeader(*batch, count, 0,
+                dataSize - static_cast<uint32_t>(sizeof(SHADOWSTRIKE_PUSH_BATCH_HEADER)));
+
+            auto batchResult = SendBatchMessage(
+                std::span<const uint8_t>(buffer.data(), buffer.size()), count);
+
+            aggregate.entriesAccepted += batchResult.entriesAccepted;
+            aggregate.entriesRejected += batchResult.entriesRejected;
+            aggregate.batchesSent += batchResult.batchesSent;
+            if (!batchResult.success) {
+                aggregate.success = false;
+                aggregate.kernelStatus = batchResult.kernelStatus;
+                aggregate.errorMessage = batchResult.errorMessage;
+                break;
+            }
+
+            offset = idx;
+        }
+
+        Utils::Logger::Debug(
+            "[ThreatIntelPusher] PushIoCFeed complete: accepted={} rejected={} batches={}",
+            aggregate.entriesAccepted, aggregate.entriesRejected, aggregate.batchesSent);
+
+        return aggregate;
+    }
+
+    // ========================================================================
+    // Behavioral Rule Push Implementation (variable-length entries)
+    // ========================================================================
+
+    PushResult PushBehavioralRulesBatch(std::span<const BehavioralRulePushEntry> entries)
+    {
+        std::lock_guard lock(m_mutex);
+
+        PushResult aggregate;
+
+        if (entries.empty()) {
+            aggregate.success = true;
+            return aggregate;
+        }
+
+        if (!m_connection.IsConnected()) {
+            aggregate.success = false;
+            aggregate.errorMessage = "FilterConnection not connected";
+            Utils::Logger::Warn("[ThreatIntelPusher] PushBehavioralRules aborted: not connected");
+            return aggregate;
+        }
+
+        aggregate.success = true;
+        const uint32_t maxBatch = m_maxBatchSize.load(std::memory_order_relaxed);
+
+        size_t offset = 0;
+        while (offset < entries.size()) {
+            std::vector<uint8_t> buffer;
+            buffer.reserve(MAX_MESSAGE_BUFFER_SIZE);
+            buffer.resize(sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
+                         + sizeof(SHADOWSTRIKE_PUSH_BATCH_HEADER));
+
+            uint32_t count = 0;
+            size_t idx = offset;
+
+            while (idx < entries.size() && count < maxBatch) {
+                const auto& src = entries[idx];
+
+                // Clamp conditions/actions to kernel maximums
+                const uint32_t condCount = static_cast<uint32_t>(
+                    std::min<size_t>(src.conditions.size(), RE_MAX_CONDITIONS));
+                const uint32_t actCount = static_cast<uint32_t>(
+                    std::min<size_t>(src.actions.size(), RE_MAX_ACTIONS));
+
+                // Wire: fixed BEHAVIORAL_RULE header + RE_CONDITION[] + RE_ACTION[]
+                size_t entrySize = sizeof(SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE)
+                    + condCount * sizeof(RE_CONDITION)
+                    + actCount * sizeof(RE_ACTION);
+
+                if (buffer.size() + entrySize > MAX_MESSAGE_BUFFER_SIZE) {
+                    if (count == 0) {
+                        Utils::Logger::Warn(
+                            "[ThreatIntelPusher] Behavioral rule entry too large ({} bytes), skipping",
+                            entrySize);
+                        aggregate.entriesRejected++;
+                        m_stats.oversizedEntriesSkipped.fetch_add(1, std::memory_order_relaxed);
+                        ++idx;
+                        continue;
+                    }
+                    break;
+                }
+
+                size_t entryOffset = buffer.size();
+                buffer.resize(entryOffset + entrySize);
+
+                auto* dst = reinterpret_cast<SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE*>(
+                    buffer.data() + entryOffset);
+                memset(dst, 0, sizeof(*dst));
+                dst->Operation = static_cast<UINT8>(
+                    std::min<uint8_t>(static_cast<uint8_t>(src.operation), 3));
+                dst->StopProcessing = src.stopProcessing ? 1 : 0;
+                dst->Reserved = 0;
+                dst->Priority = src.priority;
+                strncpy_s(dst->RuleId, sizeof(dst->RuleId),
+                    src.ruleId.c_str(), _TRUNCATE);
+                strncpy_s(dst->RuleName, sizeof(dst->RuleName),
+                    src.ruleName.c_str(), _TRUNCATE);
+                strncpy_s(dst->Description, sizeof(dst->Description),
+                    src.description.c_str(), _TRUNCATE);
+                dst->ConditionCount = condCount;
+                dst->ActionCount = actCount;
+
+                // Serialize conditions after the fixed struct
+                auto* condPtr = reinterpret_cast<RE_CONDITION*>(
+                    buffer.data() + entryOffset
+                    + sizeof(SHADOWSTRIKE_PUSH_BEHAVIORAL_RULE));
+
+                for (uint32_t c = 0; c < condCount; ++c) {
+                    memset(&condPtr[c], 0, sizeof(RE_CONDITION));
+                    condPtr[c].Type = static_cast<RE_CONDITION_TYPE>(
+                        std::min(src.conditions[c].type,
+                            static_cast<uint32_t>(ReCondition_MaxValue) - 1));
+                    condPtr[c].Operator = static_cast<RE_OPERATOR>(
+                        std::min(src.conditions[c].op,
+                            static_cast<uint32_t>(ReOp_MaxValue) - 1));
+                    strncpy_s(condPtr[c].Value, sizeof(condPtr[c].Value),
+                        src.conditions[c].value.c_str(), _TRUNCATE);
+                    condPtr[c].Negate = src.conditions[c].negate ? TRUE : FALSE;
+                }
+
+                // Serialize actions after conditions
+                auto* actPtr = reinterpret_cast<RE_ACTION*>(
+                    reinterpret_cast<uint8_t*>(condPtr)
+                    + condCount * sizeof(RE_CONDITION));
+
+                for (uint32_t a = 0; a < actCount; ++a) {
+                    memset(&actPtr[a], 0, sizeof(RE_ACTION));
+                    actPtr[a].Type = static_cast<RE_ACTION_TYPE>(
+                        std::min(src.actions[a].type,
+                            static_cast<uint32_t>(ReAction_MaxValue) - 1));
+                    strncpy_s(actPtr[a].Parameter, sizeof(actPtr[a].Parameter),
+                        src.actions[a].parameter.c_str(), _TRUNCATE);
+                }
+
+                ++count;
+                ++idx;
+            }
+
+            if (count == 0) {
+                offset = idx;
+                continue;
+            }
+
+            uint32_t dataSize = static_cast<uint32_t>(
+                buffer.size() - sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+
+            auto* header = reinterpret_cast<SHADOWSTRIKE_MESSAGE_HEADER*>(buffer.data());
+            BuildMessageHeader(*header, FilterMessageType_UpdateBehavioralRules, dataSize);
+
+            auto* batch = reinterpret_cast<SHADOWSTRIKE_PUSH_BATCH_HEADER*>(
+                buffer.data() + sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+            BuildBatchHeader(*batch, count, 0,
+                dataSize - static_cast<uint32_t>(sizeof(SHADOWSTRIKE_PUSH_BATCH_HEADER)));
+
+            auto batchResult = SendBatchMessage(
+                std::span<const uint8_t>(buffer.data(), buffer.size()), count);
+
+            aggregate.entriesAccepted += batchResult.entriesAccepted;
+            aggregate.entriesRejected += batchResult.entriesRejected;
+            aggregate.batchesSent += batchResult.batchesSent;
+            if (!batchResult.success) {
+                aggregate.success = false;
+                aggregate.kernelStatus = batchResult.kernelStatus;
+                aggregate.errorMessage = batchResult.errorMessage;
+                break;
+            }
+
+            offset = idx;
+        }
+
+        Utils::Logger::Debug(
+            "[ThreatIntelPusher] PushBehavioralRules complete: accepted={} rejected={} batches={}",
+            aggregate.entriesAccepted, aggregate.entriesRejected, aggregate.batchesSent);
+
+        return aggregate;
+    }
 
     FilterConnection&               m_connection;
     std::mutex                      m_mutex;
@@ -685,6 +974,16 @@ PushResult ThreatIntelPusher::PushWhitelist(std::span<const WhitelistPushEntry> 
 PushResult ThreatIntelPusher::PushExclusions(std::span<const ExclusionPushEntry> entries)
 {
     return m_impl->PushExclusionBatch(entries);
+}
+
+PushResult ThreatIntelPusher::PushIoCFeed(std::span<const IoCFeedPushEntry> entries)
+{
+    return m_impl->PushIoCFeedBatch(entries);
+}
+
+PushResult ThreatIntelPusher::PushBehavioralRules(std::span<const BehavioralRulePushEntry> entries)
+{
+    return m_impl->PushBehavioralRulesBatch(entries);
 }
 
 PusherStatisticsSnapshot ThreatIntelPusher::GetStatistics() const noexcept
