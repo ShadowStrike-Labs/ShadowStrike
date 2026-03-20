@@ -519,7 +519,27 @@ struct DeliveryResult {
 };
 
 /**
- * @brief Statistics
+ * @brief Statistics snapshot (POD — thread-safe copy of atomic counters)
+ */
+struct AlertStatisticsSnapshot {
+    uint64_t totalAlerts = 0;
+    uint64_t alertsSent = 0;
+    uint64_t alertsFailed = 0;
+    uint64_t alertsSuppressed = 0;
+    uint64_t alertsAcknowledged = 0;
+    uint64_t alertsEscalated = 0;
+    uint64_t emailsSent = 0;
+    uint64_t webhooksSent = 0;
+    uint64_t smsSent = 0;
+    uint64_t rateLimitHits = 0;
+    std::array<uint64_t, 8> bySeverity{};
+    std::array<uint64_t, 16> byChannel{};
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Live statistics (internal, atomic counters)
  */
 struct AlertStatistics {
     std::atomic<uint64_t> totalAlerts{0};
@@ -535,9 +555,9 @@ struct AlertStatistics {
     std::array<std::atomic<uint64_t>, 8> bySeverity{};
     std::array<std::atomic<uint64_t>, 16> byChannel{};
     TimePoint startTime = Clock::now();
-    
+
     void Reset() noexcept;
-    [[nodiscard]] std::string ToJson() const;
+    [[nodiscard]] AlertStatisticsSnapshot TakeSnapshot() const noexcept;
 };
 
 /**
@@ -593,7 +613,7 @@ struct AlertConfiguration {
 using AlertCallback = std::function<void(const Alert&)>;
 using DeliveryCallback = std::function<void(const DeliveryResult&)>;
 using EscalationCallback = std::function<void(const Alert&, EscalationLevel)>;
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+using AlertErrorCallback = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
 // ALERT SYSTEM CLASS
@@ -772,14 +792,14 @@ public:
     void RegisterAlertCallback(AlertCallback callback);
     void RegisterDeliveryCallback(DeliveryCallback callback);
     void RegisterEscalationCallback(EscalationCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
+    void RegisterErrorCallback(AlertErrorCallback callback);
     void UnregisterCallbacks();
 
     // ========================================================================
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] AlertStatistics GetStatistics() const;
+    [[nodiscard]] AlertStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
