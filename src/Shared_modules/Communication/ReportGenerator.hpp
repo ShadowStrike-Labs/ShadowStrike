@@ -571,6 +571,22 @@ struct ReportStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+    [[nodiscard]] ReportStatisticsSnapshot TakeSnapshot() const noexcept;
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Statistics snapshot (copyable POD for thread-safe return)
+ */
+struct ReportStatisticsSnapshot {
+    uint64_t reportsGenerated = 0;
+    uint64_t reportsFailed = 0;
+    uint64_t reportsDelivered = 0;
+    uint64_t totalGenerationTimeMs = 0;
+    uint64_t totalSizeBytes = 0;
+    std::array<uint64_t, 16> byFormat{};
+    std::array<uint64_t, 16> byType{};
+    
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -626,7 +642,7 @@ struct ReportConfiguration {
 
 using ProgressCallback = std::function<void(const std::string& jobId, uint8_t progress)>;
 using CompletionCallback = std::function<void(const ReportJob&)>;
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+using ReportErrorCallback = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
 // REPORT GENERATOR CLASS
@@ -797,14 +813,14 @@ public:
     
     void RegisterProgressCallback(ProgressCallback callback);
     void RegisterCompletionCallback(CompletionCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
+    void RegisterErrorCallback(ReportErrorCallback callback);
     void UnregisterCallbacks();
 
     // ========================================================================
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] ReportStatistics GetStatistics() const;
+    [[nodiscard]] ReportStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
