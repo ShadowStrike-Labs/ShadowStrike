@@ -38,6 +38,37 @@
 #include <sstream>
 #include <chrono>
 
+namespace {
+
+/// Escape a UTF-8 string for safe embedding in a JSON value.
+std::string EscapeJsonString(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (const char c : s) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x",
+                             static_cast<unsigned>(static_cast<unsigned char>(c)));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+} // anonymous namespace
+
 namespace ShadowStrike {
 namespace Communication {
 
@@ -49,7 +80,6 @@ class MessageDispatcherImpl {
 public:
     explicit MessageDispatcherImpl(FilterConnection& connection)
         : m_connection(connection) {
-        m_stats.startTime = std::chrono::steady_clock::now();
     }
 
     ~MessageDispatcherImpl() = default;
@@ -102,7 +132,6 @@ public:
     [[nodiscard]] bool DispatchMessage(std::span<const uint8_t> messageBuffer) {
         auto startTime = std::chrono::steady_clock::now();
 
-        // CRITICAL: Validate buffer before ANY access
         if (messageBuffer.empty()) {
             Utils::Logger::Error("[MessageDispatcher] Empty message buffer");
             m_stats.parseErrors++;
@@ -116,11 +145,9 @@ public:
             return false;
         }
 
-        // CRITICAL: Safe header access with bounds check
         const MessageHeader* header =
             reinterpret_cast<const MessageHeader*>(messageBuffer.data());
 
-        // Validate header fields
         if (!header->IsValid()) {
             Utils::Logger::Warn("[MessageDispatcher] Invalid message header "
                               "(magic=0x{:08X}, version={}, size={})",
@@ -129,7 +156,6 @@ public:
             return false;
         }
 
-        // CRITICAL: Verify total size matches buffer
         if (header->totalSize > messageBuffer.size()) {
             Utils::Logger::Warn("[MessageDispatcher] Message size mismatch: {} > {}",
                               header->totalSize, messageBuffer.size());
@@ -139,7 +165,6 @@ public:
 
         m_stats.messagesDispatched++;
 
-        // Extract payload (data after header)
         const size_t payloadOffset = sizeof(MessageHeader);
         const size_t payloadSize = header->dataSize;
 
@@ -154,12 +179,11 @@ public:
             payloadSize
         );
 
-        // Dispatch based on message type
         bool handled = false;
         bool needsReply = false;
         ScanVerdictReply reply;
         reply.messageId = header->messageId;
-        reply.verdict = m_defaultVerdict;
+        reply.verdict = m_defaultVerdict.load(std::memory_order_relaxed);
         reply.resultCode = 0;
         reply.threatDetected = false;
         reply.threatScore = 0;
@@ -171,79 +195,29 @@ public:
         try {
             switch (msgType) {
                 //=============================================================
-                // Scan requests (require reply)
+                // Scan request — the ONLY kernel→user type requiring a reply
                 //=============================================================
-                case MessageType::FileScanOnOpen:
-                case MessageType::FileScanOnExecute:
-                case MessageType::FileScanOnWrite:
-                case MessageType::FileScanOnClose: {
+                case MessageType::ScanRequest: {
                     needsReply = true;
                     m_stats.fileScanRequests++;
 
                     auto request = ParseFileScanRequest(payload);
                     if (request.has_value()) {
-                        std::lock_guard<std::mutex> lock(m_handlerMutex);
-                        if (m_fileScanHandler) {
+                        FileScanCallback handlerCopy;
+                        {
+                            std::lock_guard<std::mutex> lock(m_handlerMutex);
+                            handlerCopy = m_fileScanHandler;
+                        }
+                        if (handlerCopy) {
                             try {
-                                reply = m_fileScanHandler(request.value());
+                                reply = handlerCopy(request.value());
                                 handled = true;
                             } catch (const std::exception& e) {
                                 Utils::Logger::Error(
                                     "[MessageDispatcher] File scan handler exception: {}",
                                     e.what());
                                 m_stats.handlerErrors++;
-                                // Fail-open: allow on error
-                                reply.verdict = ScanVerdict::Allow;
-                            }
-                        }
-                    } else {
-                        m_stats.parseErrors++;
-                    }
-                    break;
-                }
-
-                case MessageType::ProcessScan: {
-                    needsReply = true;
-                    m_stats.processScanRequests++;
-
-                    auto notification = ParseProcessNotification(payload);
-                    if (notification.has_value()) {
-                        std::lock_guard<std::mutex> lock(m_handlerMutex);
-                        if (m_processScanHandler) {
-                            try {
-                                reply = m_processScanHandler(notification.value());
-                                handled = true;
-                            } catch (const std::exception& e) {
-                                Utils::Logger::Error(
-                                    "[MessageDispatcher] Process scan handler exception: {}",
-                                    e.what());
-                                m_stats.handlerErrors++;
-                                reply.verdict = ScanVerdict::Allow;
-                            }
-                        }
-                    } else {
-                        m_stats.parseErrors++;
-                    }
-                    break;
-                }
-
-                case MessageType::RegistryScan: {
-                    needsReply = true;
-                    m_stats.registryScanRequests++;
-
-                    auto notification = ParseRegistryNotification(payload);
-                    if (notification.has_value()) {
-                        std::lock_guard<std::mutex> lock(m_handlerMutex);
-                        if (m_registryScanHandler) {
-                            try {
-                                reply = m_registryScanHandler(notification.value());
-                                handled = true;
-                            } catch (const std::exception& e) {
-                                Utils::Logger::Error(
-                                    "[MessageDispatcher] Registry scan handler exception: {}",
-                                    e.what());
-                                m_stats.handlerErrors++;
-                                reply.verdict = ScanVerdict::Allow;
+                                reply.verdict = ScanVerdict::Clean;
                             }
                         }
                     } else {
@@ -253,78 +227,126 @@ public:
                 }
 
                 //=============================================================
-                // Notifications (no reply required)
+                // Process notification (no reply)
                 //=============================================================
-                case MessageType::NotifyFileCreate:
-                case MessageType::NotifyFileModify:
-                case MessageType::NotifyFileDelete:
-                case MessageType::NotifyFileRename: {
-                    m_stats.fileNotifications++;
-
-                    auto request = ParseFileScanRequest(payload);
-                    if (request.has_value()) {
-                        std::lock_guard<std::mutex> lock(m_handlerMutex);
-                        if (m_fileNotifyHandler) {
-                            try {
-                                m_fileNotifyHandler(request.value());
-                                handled = true;
-                            } catch (...) {
-                                m_stats.handlerErrors++;
-                            }
-                        }
-                    }
-                    break;
-                }
-
-                case MessageType::NotifyProcessCreate:
-                case MessageType::NotifyProcessTerminate:
-                case MessageType::NotifyImageLoad:
-                case MessageType::NotifyThreadCreate: {
+                case MessageType::ProcessNotify: {
                     m_stats.processNotifications++;
 
                     auto notification = ParseProcessNotification(payload);
                     if (notification.has_value()) {
-                        std::lock_guard<std::mutex> lock(m_handlerMutex);
-                        if (m_processNotifyHandler) {
+                        ProcessEventCallback handlerCopy;
+                        {
+                            std::lock_guard<std::mutex> lock(m_handlerMutex);
+                            handlerCopy = m_processNotifyHandler;
+                        }
+                        if (handlerCopy) {
                             try {
-                                m_processNotifyHandler(notification.value());
+                                handlerCopy(notification.value());
+                                handled = true;
+                            } catch (const std::exception& e) {
+                                Utils::Logger::Error(
+                                    "[MessageDispatcher] Process notify handler exception: {}",
+                                    e.what());
+                                m_stats.handlerErrors++;
+                            }
+                        }
+                    } else {
+                        m_stats.parseErrors++;
+                    }
+                    break;
+                }
+
+                //=============================================================
+                // Thread / Image load notifications (no reply)
+                //=============================================================
+                case MessageType::ThreadNotify:
+                case MessageType::ImageLoad: {
+                    m_stats.processNotifications++;
+
+                    auto notification = ParseProcessNotification(payload);
+                    if (notification.has_value()) {
+                        ProcessEventCallback handlerCopy;
+                        {
+                            std::lock_guard<std::mutex> lock(m_handlerMutex);
+                            handlerCopy = m_processNotifyHandler;
+                        }
+                        if (handlerCopy) {
+                            try {
+                                handlerCopy(notification.value());
                                 handled = true;
                             } catch (...) {
                                 m_stats.handlerErrors++;
                             }
                         }
+                    } else {
+                        m_stats.parseErrors++;
                     }
                     break;
                 }
 
-                case MessageType::NotifyRegistryCreate:
-                case MessageType::NotifyRegistrySetValue:
-                case MessageType::NotifyRegistryDelete: {
+                //=============================================================
+                // Registry notification (no reply)
+                //=============================================================
+                case MessageType::RegistryNotify: {
                     m_stats.registryNotifications++;
 
                     auto notification = ParseRegistryNotification(payload);
                     if (notification.has_value()) {
-                        std::lock_guard<std::mutex> lock(m_handlerMutex);
-                        if (m_registryNotifyHandler) {
+                        RegistryEventCallback handlerCopy;
+                        {
+                            std::lock_guard<std::mutex> lock(m_handlerMutex);
+                            handlerCopy = m_registryNotifyHandler;
+                        }
+                        if (handlerCopy) {
                             try {
-                                m_registryNotifyHandler(notification.value());
+                                handlerCopy(notification.value());
                                 handled = true;
                             } catch (...) {
                                 m_stats.handlerErrors++;
                             }
                         }
+                    } else {
+                        m_stats.parseErrors++;
                     }
                     break;
                 }
 
                 //=============================================================
-                // Control messages
+                // Heartbeat (kernel-initiated keepalive, reply with success)
                 //=============================================================
-                case MessageType::ControlPing: {
-                    // Simple ping - just reply with success
+                case MessageType::Heartbeat: {
                     needsReply = true;
-                    reply.verdict = ScanVerdict::Allow;
+                    reply.verdict = ScanVerdict::Clean;
                     reply.resultCode = 0;
+                    handled = true;
+                    break;
+                }
+
+                //=============================================================
+                // Alert/notification types (no reply, count + log)
+                //=============================================================
+                case MessageType::HandleAlert:
+                case MessageType::RansomwareAlert:
+                case MessageType::BehavioralAlert:
+                case MessageType::MemoryAlert:
+                case MessageType::NetworkAlert:
+                case MessageType::SyscallAlert:
+                case MessageType::SelfProtectAlert:
+                case MessageType::ThreatScoreNotify:
+                case MessageType::NamedPipeEvent:
+                case MessageType::FileBackupEvent:
+                case MessageType::FileRollbackEvent:
+                case MessageType::AlpcPortCreated:
+                case MessageType::AlpcPortConnected:
+                case MessageType::AlpcPortDisconnected:
+                case MessageType::AlpcSuspiciousAccess:
+                case MessageType::AlpcImpersonation:
+                case MessageType::AlpcSandboxEscape:
+                case MessageType::AlpcRateLimitExceeded: {
+                    m_stats.fileNotifications++;
+                    Utils::Logger::Debug(
+                        "[MessageDispatcher] Alert/notification type={} id={}",
+                        header->messageType, header->messageId);
                     handled = true;
                     break;
                 }
@@ -339,12 +361,13 @@ public:
         } catch (const std::exception& e) {
             Utils::Logger::Error("[MessageDispatcher] Dispatch exception: {}", e.what());
             m_stats.handlerErrors++;
-            // Ensure we still reply if needed
-            reply.verdict = m_blockOnError ? ScanVerdict::Block : ScanVerdict::Allow;
+            reply.verdict = m_blockOnError.load(std::memory_order_relaxed)
+                ? ScanVerdict::Malicious : ScanVerdict::Clean;
         } catch (...) {
             Utils::Logger::Error("[MessageDispatcher] Unknown dispatch exception");
             m_stats.handlerErrors++;
-            reply.verdict = m_blockOnError ? ScanVerdict::Block : ScanVerdict::Allow;
+            reply.verdict = m_blockOnError.load(std::memory_order_relaxed)
+                ? ScanVerdict::Malicious : ScanVerdict::Clean;
         }
 
         // Send reply if required
@@ -384,15 +407,15 @@ public:
     //=========================================================================
 
     void SetDefaultVerdict(ScanVerdict verdict) {
-        m_defaultVerdict = verdict;
+        m_defaultVerdict.store(verdict, std::memory_order_relaxed);
     }
 
     void SetBlockOnTimeout(bool block) {
-        m_blockOnTimeout = block;
+        m_blockOnTimeout.store(block, std::memory_order_relaxed);
     }
 
     void SetBlockOnError(bool block) {
-        m_blockOnError = block;
+        m_blockOnError.store(block, std::memory_order_relaxed);
     }
 
     //=========================================================================
@@ -607,10 +630,10 @@ private:
     RegistryEventCallback m_registryNotifyHandler;
     mutable std::mutex m_handlerMutex;
 
-    // Configuration
-    ScanVerdict m_defaultVerdict = ScanVerdict::Allow;
-    bool m_blockOnTimeout = false;
-    bool m_blockOnError = false;
+    // Configuration (atomic — written by config thread, read by dispatch workers)
+    std::atomic<ScanVerdict> m_defaultVerdict{ScanVerdict::Clean};
+    std::atomic<bool> m_blockOnTimeout{false};
+    std::atomic<bool> m_blockOnError{false};
 
     // Statistics
     MessageDispatcher::DispatchStatistics m_stats;
@@ -763,8 +786,8 @@ std::string FileScanRequest::ToJson() const {
     std::ostringstream oss;
     oss << "{"
         << "\"messageId\":" << messageId << ","
-        << "\"filePath\":\"" << Utils::StringUtils::WideToUtf8(filePath) << "\","
-        << "\"processName\":\"" << Utils::StringUtils::WideToUtf8(processName) << "\","
+        << "\"filePath\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(filePath)) << "\","
+        << "\"processName\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(processName)) << "\","
         << "\"processId\":" << processId << ","
         << "\"fileSize\":" << fileSize << ","
         << "\"isDirectory\":" << (isDirectory ? "true" : "false") << ","
@@ -780,8 +803,8 @@ std::string ProcessNotification::ToJson() const {
         << "\"messageId\":" << messageId << ","
         << "\"processId\":" << processId << ","
         << "\"parentProcessId\":" << parentProcessId << ","
-        << "\"imagePath\":\"" << Utils::StringUtils::WideToUtf8(imagePath) << "\","
-        << "\"commandLine\":\"" << Utils::StringUtils::WideToUtf8(commandLine) << "\","
+        << "\"imagePath\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(imagePath)) << "\","
+        << "\"commandLine\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(commandLine)) << "\","
         << "\"isWow64\":" << (isWow64 ? "true" : "false") << ","
         << "\"isElevated\":" << (isElevated ? "true" : "false") << ","
         << "\"requiresReply\":" << (requiresReply ? "true" : "false")
@@ -794,8 +817,8 @@ std::string RegistryNotification::ToJson() const {
     oss << "{"
         << "\"messageId\":" << messageId << ","
         << "\"processId\":" << processId << ","
-        << "\"keyPath\":\"" << Utils::StringUtils::WideToUtf8(keyPath) << "\","
-        << "\"valueName\":\"" << Utils::StringUtils::WideToUtf8(valueName) << "\","
+        << "\"keyPath\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(keyPath)) << "\","
+        << "\"valueName\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(valueName)) << "\","
         << "\"operationType\":" << operationType << ","
         << "\"valueType\":" << valueType << ","
         << "\"requiresReply\":" << (requiresReply ? "true" : "false")
@@ -813,7 +836,7 @@ std::string ScanVerdictReply::ToJson() const {
         << "\"threatScore\":" << static_cast<int>(threatScore) << ","
         << "\"shouldCache\":" << (shouldCache ? "true" : "false") << ","
         << "\"cacheTTL\":" << cacheTTL << ","
-        << "\"threatName\":\"" << Utils::StringUtils::WideToUtf8(threatName) << "\""
+        << "\"threatName\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(threatName)) << "\""
         << "}";
     return oss.str();
 }
@@ -821,7 +844,7 @@ std::string ScanVerdictReply::ToJson() const {
 std::string CommunicationConfig::ToJson() const {
     std::ostringstream oss;
     oss << "{"
-        << "\"portName\":\"" << Utils::StringUtils::WideToUtf8(portName) << "\","
+        << "\"portName\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(portName)) << "\","
         << "\"replyTimeoutMs\":" << replyTimeoutMs << ","
         << "\"reconnectIntervalMs\":" << reconnectIntervalMs << ","
         << "\"maxReconnectAttempts\":" << maxReconnectAttempts << ","
@@ -840,6 +863,53 @@ CommunicationConfig CommunicationConfig::FromJson(const std::string& json) {
     // Parse implementation would go here
     // For now, return defaults
     return config;
+}
+
+// ============================================================================
+// DISPATCH STATISTICS SNAPSHOT
+// ============================================================================
+
+DispatchStatisticsSnapshot
+MessageDispatcher::DispatchStatistics::TakeSnapshot() const noexcept {
+    DispatchStatisticsSnapshot snap;
+    snap.messagesDispatched   = messagesDispatched.load(std::memory_order_relaxed);
+    snap.fileScanRequests     = fileScanRequests.load(std::memory_order_relaxed);
+    snap.processScanRequests  = processScanRequests.load(std::memory_order_relaxed);
+    snap.registryScanRequests = registryScanRequests.load(std::memory_order_relaxed);
+    snap.fileNotifications    = fileNotifications.load(std::memory_order_relaxed);
+    snap.processNotifications = processNotifications.load(std::memory_order_relaxed);
+    snap.registryNotifications = registryNotifications.load(std::memory_order_relaxed);
+    snap.unknownMessages      = unknownMessages.load(std::memory_order_relaxed);
+    snap.parseErrors          = parseErrors.load(std::memory_order_relaxed);
+    snap.handlerErrors        = handlerErrors.load(std::memory_order_relaxed);
+    snap.repliesSent          = repliesSent.load(std::memory_order_relaxed);
+    snap.replyErrors          = replyErrors.load(std::memory_order_relaxed);
+    snap.totalProcessingTimeUs = totalProcessingTimeUs.load(std::memory_order_relaxed);
+    snap.avgProcessingTimeUs  = snap.messagesDispatched > 0
+        ? static_cast<double>(snap.totalProcessingTimeUs) / snap.messagesDispatched
+        : 0.0;
+    return snap;
+}
+
+std::string DispatchStatisticsSnapshot::ToJson() const {
+    std::ostringstream oss;
+    oss << "{"
+        << "\"messagesDispatched\":" << messagesDispatched << ","
+        << "\"fileScanRequests\":" << fileScanRequests << ","
+        << "\"processScanRequests\":" << processScanRequests << ","
+        << "\"registryScanRequests\":" << registryScanRequests << ","
+        << "\"fileNotifications\":" << fileNotifications << ","
+        << "\"processNotifications\":" << processNotifications << ","
+        << "\"registryNotifications\":" << registryNotifications << ","
+        << "\"unknownMessages\":" << unknownMessages << ","
+        << "\"parseErrors\":" << parseErrors << ","
+        << "\"handlerErrors\":" << handlerErrors << ","
+        << "\"repliesSent\":" << repliesSent << ","
+        << "\"replyErrors\":" << replyErrors << ","
+        << "\"totalProcessingTimeUs\":" << totalProcessingTimeUs << ","
+        << "\"avgProcessingTimeUs\":" << avgProcessingTimeUs
+        << "}";
+    return oss.str();
 }
 
 } // namespace Communication

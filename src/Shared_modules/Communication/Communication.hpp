@@ -52,64 +52,89 @@ constexpr uint32_t DEFAULT_REPLY_TIMEOUT_MS = 30000;
 constexpr uint32_t MAX_CONCURRENT_CONNECTIONS = 8;
 
 //=============================================================================
-// Enumerations (must match kernel definitions)
+// Enumerations — MUST match kernel SHADOWSTRIKE_MESSAGE_TYPE (MessageTypes.h)
+// Values are sequential; do NOT reorder without updating the kernel enum.
 //=============================================================================
 
 enum class MessageType : uint16_t {
-    // Scan requests (require reply)
-    FileScanOnOpen = 1,
-    FileScanOnExecute = 2,
-    FileScanOnWrite = 3,
-    FileScanOnClose = 4,
-    ProcessScan = 5,
-    RegistryScan = 6,
-    NetworkScan = 7,
-    MemoryScan = 8,
+    // Control (0–4)
+    None                     = 0,
+    Register                 = 1,
+    Unregister               = 2,
+    Heartbeat                = 3,
+    ConfigUpdate             = 4,
 
-    // Notifications (no reply required)
-    NotifyFileCreate = 100,
-    NotifyFileModify = 101,
-    NotifyFileDelete = 102,
-    NotifyFileRename = 103,
-    NotifyProcessCreate = 110,
-    NotifyProcessTerminate = 111,
-    NotifyImageLoad = 112,
-    NotifyThreadCreate = 113,
-    NotifyRegistryCreate = 120,
-    NotifyRegistrySetValue = 121,
-    NotifyRegistryDelete = 122,
-    NotifyNetworkConnect = 130,
-    NotifyNetworkListen = 131,
+    // Scan (5–6) — ScanRequest is the ONLY type requiring a verdict reply
+    ScanRequest              = 5,
+    ScanVerdictReply         = 6,
 
-    // Control messages
-    ControlPing = 200,
-    ControlPolicyUpdate = 201,
-    ControlExclusionAdd = 202,
-    ControlExclusionRemove = 203,
-    ControlCacheClear = 204,
-    ControlStatsRequest = 205,
-    ControlShutdown = 206,
-    ControlRegisterProtected = 207,
-    ControlUnregisterProtected = 208,
+    // Behavioral notifications (7–13) — no reply required
+    ProcessNotify            = 7,
+    ThreadNotify             = 8,
+    ImageLoad                = 9,
+    RegistryNotify           = 10,
+    NamedPipeEvent           = 11,
+    FileBackupEvent          = 12,
+    FileRollbackEvent        = 13,
 
-    // Replies
-    ScanVerdictReply = 300,
-    ControlReply = 301,
-    StatsReply = 302,
-    ErrorReply = 399
+    // ALPC notifications (14–20)
+    AlpcPortCreated          = 14,
+    AlpcPortConnected        = 15,
+    AlpcPortDisconnected     = 16,
+    AlpcSuspiciousAccess     = 17,
+    AlpcImpersonation        = 18,
+    AlpcSandboxEscape        = 19,
+    AlpcRateLimitExceeded    = 20,
+
+    // Policy (21–25)
+    QueryDriverStatus        = 21,
+    UpdatePolicy             = 22,
+    EnableFiltering          = 23,
+    DisableFiltering         = 24,
+    RegisterProtectedProcess = 25,
+
+    // Alerts (26–27)
+    HandleAlert              = 26,
+    RansomwareAlert          = 27,
+
+    // Data push: user → kernel (28–35)
+    PushHashDatabase         = 28,
+    PushPatternDatabase      = 29,
+    PushSignatureDatabase    = 30,
+    PushIoCFeed              = 31,
+    PushWhitelist            = 32,
+    UpdateBehavioralRules    = 33,
+    PushNetworkIoC           = 34,
+    ExclusionUpdate          = 35,
+
+    // Telemetry / status (36–42)
+    BehavioralAlert          = 36,
+    MemoryAlert              = 37,
+    NetworkAlert             = 38,
+    SyscallAlert             = 39,
+    SelfProtectAlert         = 40,
+    ExclusionQuery           = 41,
+    ThreatScoreNotify        = 42,
+
+    Max                      = 43
 };
 
+//=============================================================================
+// Wire-protocol verdict — MUST match kernel SHADOWSTRIKE_SCAN_VERDICT
+// (VerdictTypes.h). Only these values are valid on the comm port wire.
+//=============================================================================
+
 enum class ScanVerdict : uint8_t {
-    Allow = 0,
-    Block = 1,
-    Quarantine = 2,
-    BlockAndQuarantine = 3,
-    Delete = 4,
-    Pending = 5,
-    Error = 6,
-    Timeout = 7,
-    CacheHit = 8,
-    Whitelisted = 9
+    Unknown    = 0,   // Verdict_Unknown    — not yet determined
+    Clean      = 1,   // Verdict_Clean      — file is safe
+    Malicious  = 2,   // Verdict_Malicious  — confirmed malware
+    Suspicious = 3,   // Verdict_Suspicious — heuristic hit, not confirmed
+    Error      = 4,   // Verdict_Error      — scan failed
+    Timeout    = 5,   // Verdict_Timeout    — scan timed out
+
+    // Backward-compatibility aliases (map action names → verdict values)
+    Allow = Clean,
+    Block = Malicious
 };
 
 enum class FileAccessType : uint8_t {

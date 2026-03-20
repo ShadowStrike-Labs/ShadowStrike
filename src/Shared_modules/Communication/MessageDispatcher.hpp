@@ -210,6 +210,7 @@ public:
 
         void Reset() noexcept;
         [[nodiscard]] std::string ToJson() const;
+        [[nodiscard]] struct DispatchStatisticsSnapshot TakeSnapshot() const noexcept;
     };
 
     /**
@@ -231,6 +232,28 @@ public:
 
 private:
     std::unique_ptr<MessageDispatcherImpl> m_impl;
+};
+
+/**
+ * @brief POD snapshot of DispatchStatistics (no atomics, freely copyable).
+ */
+struct DispatchStatisticsSnapshot {
+    uint64_t messagesDispatched = 0;
+    uint64_t fileScanRequests = 0;
+    uint64_t processScanRequests = 0;
+    uint64_t registryScanRequests = 0;
+    uint64_t fileNotifications = 0;
+    uint64_t processNotifications = 0;
+    uint64_t registryNotifications = 0;
+    uint64_t unknownMessages = 0;
+    uint64_t parseErrors = 0;
+    uint64_t handlerErrors = 0;
+    uint64_t repliesSent = 0;
+    uint64_t replyErrors = 0;
+    uint64_t totalProcessingTimeUs = 0;
+    double avgProcessingTimeUs = 0.0;
+
+    [[nodiscard]] std::string ToJson() const;
 };
 
 } // namespace Communication

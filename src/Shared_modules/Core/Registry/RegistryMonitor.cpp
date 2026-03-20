@@ -1248,7 +1248,7 @@ private:
             if (bytesReceived >= sizeof(Communication::MessageHeader)) {
                 auto* header = reinterpret_cast<Communication::MessageHeader*>(messageBuffer.data());
 
-                if (header->IsValid() && header->messageType == static_cast<uint16_t>(Communication::MessageType::NotifyRegistrySetValue)) {
+                if (header->IsValid() && header->messageType == static_cast<uint16_t>(Communication::MessageType::RegistryNotify)) {
                     // Process the registry notification
                     // In a full implementation, we would marshal the raw buffer into a RegistryEvent
                     // and call ProcessEvent(event)
