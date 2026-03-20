@@ -368,13 +368,13 @@ uint64_t Fallback_TimingCalibrateTimebase(void) {
             // No overflow case - simple division
             frequency = low / qpcDelta;
         } else {
-            // Overflow case - approximate by shifting
+            // Overflow case: use 128-bit / 64-bit division
             // Shift right until high is 0, divide, shift result back
             int shift = 0;
             while (high > 0 && shift < 64) {
+                uint64_t carry = high & 1;
                 high >>= 1;
-                low = (low >> 1) | ((high & 1) << 63);
-                high >>= 1;
+                low = (low >> 1) | (carry << 63);
                 shift++;
             }
             frequency = (low / qpcDelta) << shift;
@@ -408,7 +408,8 @@ uint64_t Fallback_TimingMeasureInstructions(void) {
 
 /// Fallback: TimingMeasureMemory
 uint64_t Fallback_TimingMeasureMemory(void) {
-    alignas(64) static volatile char buffer[4096];
+    // Stack-local buffer to avoid cross-thread cache flush interference
+    alignas(64) volatile char buffer[4096] = {};
     
     // Flush cache
     _mm_clflush(const_cast<char*>(&buffer[0]));
@@ -1795,7 +1796,8 @@ struct TimeBasedEvasionDetector::Impl {
         std::unique_lock lock(m_monitorMutex);
 
         auto it = m_monitoredProcesses.find(processId);
-        if (it != m_monitoredProcesses.end()) {
+        if (it != m_monitoredProcesses.end() &&
+            it->second->state != MonitoringState::Completed) {
             it->second->state = MonitoringState::Completed;
             m_stats.currentlyMonitoring.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -1897,14 +1899,23 @@ struct TimeBasedEvasionDetector::Impl {
     }
 
     void InvokeCallbacks(const TimingEvasionResult& result) {
-        std::shared_lock lock(m_callbackMutex);
-        for (const auto& [id, callback] : m_callbacks) {
-            if (callback) {
-                try {
-                    callback(result);
-                } catch (...) {
-                    SS_LOG_ERROR(LOG_CATEGORY, L"Exception in timing evasion callback");
+        // Snapshot callbacks under lock, then invoke outside lock to prevent
+        // deadlock if a callback tries to unregister itself (unique_lock vs shared_lock)
+        std::vector<TimingEvasionCallback> snapshot;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot.reserve(m_callbacks.size());
+            for (const auto& [id, callback] : m_callbacks) {
+                if (callback) {
+                    snapshot.push_back(callback);
                 }
+            }
+        }
+        for (const auto& callback : snapshot) {
+            try {
+                callback(result);
+            } catch (...) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Exception in timing evasion callback");
             }
         }
     }
@@ -2142,17 +2153,22 @@ public:
             }
         }
 
-        // Invoke event callbacks
+        // Snapshot event callbacks under lock, invoke outside to prevent deadlock
+        std::vector<TimingEventCallback> eventSnapshot;
         {
             std::shared_lock lock(m_callbackMutex);
+            eventSnapshot.reserve(m_eventCallbacks.size());
             for (const auto& [id, callback] : m_eventCallbacks) {
                 if (callback) {
-                    try {
-                        callback(event);
-                    } catch (...) {
-                        SS_LOG_ERROR(LOG_CATEGORY, L"Exception in timing event callback");
-                    }
+                    eventSnapshot.push_back(callback);
                 }
+            }
+        }
+        for (const auto& callback : eventSnapshot) {
+            try {
+                callback(event);
+            } catch (...) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Exception in timing event callback");
             }
         }
 

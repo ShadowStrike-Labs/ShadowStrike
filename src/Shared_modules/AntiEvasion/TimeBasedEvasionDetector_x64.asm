@@ -995,6 +995,8 @@ TimingGetTSCFrequency PROC
     jz      @NoTSCInfo
     test    ecx, ecx
     jz      @NoTSCInfo
+    test    eax, eax
+    jz      @NoTSCInfo
     
     ;; TSC frequency = ECX * EBX / EAX
     mov     r8d, eax
