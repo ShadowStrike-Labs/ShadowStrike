@@ -186,6 +186,18 @@ namespace ShadowStrike::AntiEvasion {
             "CreateProcessWithTokenW"
         };
 
+        /// RAII guard for Windows HANDLE — exception-safe cleanup
+        struct HandleGuard {
+            HANDLE h = nullptr;
+            explicit HandleGuard(HANDLE handle) noexcept : h(handle) {}
+            ~HandleGuard() noexcept { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+            HandleGuard(const HandleGuard&) = delete;
+            HandleGuard& operator=(const HandleGuard&) = delete;
+            explicit operator bool() const noexcept { return h && h != INVALID_HANDLE_VALUE; }
+            HANDLE get() const noexcept { return h; }
+            HANDLE release() noexcept { HANDLE tmp = h; h = nullptr; return tmp; }
+        };
+
         /// Known shellcode byte patterns (common prologues)
         const std::vector<std::vector<uint8_t>> SHELLCODE_PATTERNS = {
             // GetPC via CALL $+5
@@ -478,7 +490,7 @@ namespace ShadowStrike::AntiEvasion {
         // Masquerading detection helpers
         [[nodiscard]] bool IsPathAnomaly(std::wstring_view processName, std::wstring_view actualPath) const noexcept;
         [[nodiscard]] bool IsParentSpoofed(std::wstring_view processName, std::wstring_view actualParent) const noexcept;
-        [[nodiscard]] bool IsSignatureValid(std::wstring_view filePath) const noexcept;
+        [[nodiscard]] bool IsSignatureValid(const std::wstring& filePath) const noexcept;
 
         // Anti-debugging detection helpers
         [[nodiscard]] bool CheckDebuggerPresent(HANDLE hProcess) const noexcept;
@@ -940,6 +952,7 @@ namespace ShadowStrike::AntiEvasion {
             if (hSnapshot == INVALID_HANDLE_VALUE) {
                 return false;
             }
+            HandleGuard snapshotGuard(hSnapshot);
 
             THREADENTRY32 te32 = {};
             te32.dwSize = sizeof(te32);
@@ -954,6 +967,7 @@ namespace ShadowStrike::AntiEvasion {
                     if (te32.th32OwnerProcessID == processId) {
                         HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID);
                         if (hThread) {
+                            HandleGuard threadGuard(hThread);
                             PVOID startAddress = nullptr;
                             ULONG returnLength = 0;
 
@@ -984,15 +998,11 @@ namespace ShadowStrike::AntiEvasion {
                                     }
                                 }
                             }
-
-                            CloseHandle(hThread);
                         }
                         threadCount++;
                     }
                 } while (Thread32Next(hSnapshot, &te32));
             }
-
-            CloseHandle(hSnapshot);
 
             return (suspiciousThreads > 0);
         }
@@ -1885,13 +1895,13 @@ namespace ShadowStrike::AntiEvasion {
         }
     }
 
-    bool ProcessEvasionDetector::Impl::IsSignatureValid(std::wstring_view filePath) const noexcept {
+    bool ProcessEvasionDetector::Impl::IsSignatureValid(const std::wstring& filePath) const noexcept {
         try {
             if (filePath.empty()) return false;
 
             WINTRUST_FILE_INFO fileInfo = {};
             fileInfo.cbStruct = sizeof(fileInfo);
-            fileInfo.pcwszFilePath = filePath.data();
+            fileInfo.pcwszFilePath = filePath.c_str();
             fileInfo.hFile = NULL;
             fileInfo.pgKnownSubject = NULL;
 
@@ -2068,12 +2078,12 @@ namespace ShadowStrike::AntiEvasion {
             if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
                 return false;
             }
+            HandleGuard tokenGuard(hToken);
 
             DWORD returnLength = 0;
             GetTokenInformation(hToken, TokenPrivileges, nullptr, 0, &returnLength);
 
             if (returnLength == 0) {
-                CloseHandle(hToken);
                 return false;
             }
 
@@ -2081,29 +2091,25 @@ namespace ShadowStrike::AntiEvasion {
             TOKEN_PRIVILEGES* privileges = reinterpret_cast<TOKEN_PRIVILEGES*>(buffer.data());
 
             if (!GetTokenInformation(hToken, TokenPrivileges, privileges, returnLength, &returnLength)) {
-                CloseHandle(hToken);
                 return false;
             }
 
             LUID luid;
             if (!LookupPrivilegeValueW(NULL, L"SeDebugPrivilege", &luid)) {
-                CloseHandle(hToken);
                 return false;
             }
 
-            bool hasDebugPrivilege = false;
             for (DWORD i = 0; i < privileges->PrivilegeCount; i++) {
                 if (privileges->Privileges[i].Luid.LowPart == luid.LowPart &&
                     privileges->Privileges[i].Luid.HighPart == luid.HighPart) {
                     if (privileges->Privileges[i].Attributes & (SE_PRIVILEGE_ENABLED | SE_PRIVILEGE_ENABLED_BY_DEFAULT)) {
-                        hasDebugPrivilege = true;
+                        return true;
                     }
                     break;
                 }
             }
 
-            CloseHandle(hToken);
-            return hasDebugPrivilege;
+            return false;
         }
         catch (...) {
             return false;
@@ -2116,12 +2122,12 @@ namespace ShadowStrike::AntiEvasion {
             if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
                 return false;
             }
+            HandleGuard tokenGuard(hToken);
 
             DWORD returnLength = 0;
             GetTokenInformation(hToken, TokenIntegrityLevel, nullptr, 0, &returnLength);
 
             if (returnLength == 0) {
-                CloseHandle(hToken);
                 return false;
             }
 
@@ -2129,7 +2135,6 @@ namespace ShadowStrike::AntiEvasion {
             TOKEN_MANDATORY_LABEL* tml = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buffer.data());
 
             if (!GetTokenInformation(hToken, TokenIntegrityLevel, tml, returnLength, &returnLength)) {
-                CloseHandle(hToken);
                 return false;
             }
 
@@ -2152,7 +2157,6 @@ namespace ShadowStrike::AntiEvasion {
                 integrityLevel = L"Untrusted";
             }
 
-            CloseHandle(hToken);
             return true;
         }
         catch (...) {
@@ -2242,12 +2246,12 @@ namespace ShadowStrike::AntiEvasion {
                 m_impl->m_stats.cacheMisses++;
             }
 
-            // Open process handle
-            HANDLE hProcess = OpenProcess(
+            // Open process handle (RAII-guarded)
+            HandleGuard hProcess(OpenProcess(
                 PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                 FALSE,
                 processId
-            );
+            ));
 
             if (!hProcess) {
                 if (err) {
@@ -2265,9 +2269,7 @@ namespace ShadowStrike::AntiEvasion {
             result.parentProcessName = m_impl->GetProcessName(result.parentProcessId);
 
             // Perform analysis
-            AnalyzeProcessInternal(hProcess, processId, config, result);
-
-            CloseHandle(hProcess);
+            AnalyzeProcessInternal(hProcess.get(), processId, config, result);
 
             const auto endTime = std::chrono::high_resolution_clock::now();
             const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
@@ -2420,7 +2422,7 @@ namespace ShadowStrike::AntiEvasion {
         try {
             outInfo = ProcessInjectionInfo{};
 
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+            HandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
             if (!hProcess) {
                 if (err) {
                     err->win32Code = GetLastError();
@@ -2429,66 +2431,7 @@ namespace ShadowStrike::AntiEvasion {
                 return false;
             }
 
-            bool is64Bit = m_impl->IsProcess64Bit(hProcess);
-
-            // Check for remote threads
-            uint32_t threadCount = 0;
-            std::vector<std::wstring> threadDetails;
-            if (m_impl->HasRemoteThreads(hProcess, threadCount, threadDetails)) {
-                outInfo.hasInjection = true;
-                outInfo.injectedThreadCount = threadCount;
-                outInfo.hasRemoteThreads = true;
-            }
-
-            // Scan memory for suspicious regions
-            std::vector<MemoryRegionInfo> regions;
-            if (m_impl->ScanProcessMemory(hProcess, regions)) {
-                for (const auto& region : regions) {
-                    if (region.isSuspicious) {
-                        outInfo.suspiciousMemoryRegions++;
-                        if (region.isExecutable && region.isWritable) {
-                            outInfo.rwxMemoryAddresses.push_back(region.baseAddress);
-                        }
-                    }
-                }
-
-                if (outInfo.suspiciousMemoryRegions > 0) {
-                    outInfo.hasInjection = true;
-                }
-
-                // Check for reflective DLL injection
-                if (m_impl->DetectReflectiveDLLInjection(hProcess, regions)) {
-                    outInfo.hasInjection = true;
-                    outInfo.method = InjectionMethod::ReflectiveDLL;
-                }
-            }
-
-            // Check for suspicious DLLs
-            if (m_impl->HasSuspiciousDLLs(hProcess, outInfo.injectedDLLs)) {
-                outInfo.hasInjection = true;
-            }
-
-            // Check for process hollowing
-            if (m_impl->DetectProcessHollowing(hProcess, processId)) {
-                outInfo.hasInjection = true;
-                outInfo.hasHollowedImage = true;
-                outInfo.method = InjectionMethod::ProcessHollowing;
-            }
-
-            // Check for inline hooks
-            std::vector<std::wstring> hookedFunctions;
-            if (m_impl->DetectInlineHooks(hProcess, is64Bit, hookedFunctions)) {
-                outInfo.hasInjection = true;
-                // Could add hook details to outInfo if needed
-            }
-
-            CloseHandle(hProcess);
-
-            outInfo.valid = true;
-
-            if (outInfo.hasInjection) {
-                m_impl->m_stats.injectionsDetected++;
-            }
+            DetectInjectionCore(hProcess.get(), processId, outInfo);
 
             return outInfo.hasInjection;
         }
@@ -2596,7 +2539,7 @@ namespace ShadowStrike::AntiEvasion {
         try {
             outInfo = AntiDebugInfo{};
 
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+            HandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
             if (!hProcess) {
                 if (err) {
                     err->win32Code = GetLastError();
@@ -2605,74 +2548,7 @@ namespace ShadowStrike::AntiEvasion {
                 return false;
             }
 
-            // Check for debugger presence
-            if (m_impl->CheckDebuggerPresent(hProcess)) {
-                outInfo.hasAntiDebug = true;
-                outInfo.isDebuggerPresent = true;
-                outInfo.detectedTechniques.push_back(L"Debugger detected via CheckRemoteDebuggerPresent");
-            }
-
-            // Check debug port
-            if (m_impl->CheckDebugPort(hProcess)) {
-                outInfo.hasAntiDebug = true;
-                outInfo.detectedTechniques.push_back(L"Debug port detected via NtQueryInformationProcess");
-            }
-
-            // Check debug flags
-            if (m_impl->CheckDebugFlags(hProcess)) {
-                outInfo.hasAntiDebug = true;
-                outInfo.detectedTechniques.push_back(L"Debug flags indicate debugging via NtQueryInformationProcess");
-            }
-
-            // Check for debug privileges
-            if (m_impl->CheckSeDebugPrivilege(hProcess)) {
-                outInfo.hasDebugPrivilege = true;
-                outInfo.detectedTechniques.push_back(L"SeDebugPrivilege enabled");
-            }
-
-            // Check for hardware breakpoints
-            if (m_impl->CheckHardwareBreakpoints(hProcess)) {
-                outInfo.hasAntiDebug = true;
-                outInfo.hasHardwareBreakpoints = true;
-                outInfo.detectedTechniques.push_back(L"Hardware breakpoints detected");
-            }
-
-            // Check for anti-debug APIs in imports
-            std::wstring processPath = m_impl->GetProcessPath(processId);
-            if (!processPath.empty()) {
-                std::vector<std::wstring> antiDebugApis;
-                if (m_impl->HasAntiDebugAPIs(processPath, antiDebugApis)) {
-                    outInfo.hasAntiDebug = true;
-                    for (const auto& api : antiDebugApis) {
-                        outInfo.detectedTechniques.push_back(L"Anti-debug API imported: " + api);
-                    }
-                }
-
-                // Check for anti-debug instructions
-                std::vector<std::wstring> asmTechniques;
-                if (m_impl->DetectAntiDebugInstructions(hProcess, processPath, asmTechniques)) {
-                    outInfo.hasAntiDebug = true;
-                    for (const auto& tech : asmTechniques) {
-                        outInfo.detectedTechniques.push_back(tech);
-                    }
-                }
-
-                // Check for TLS callbacks (often used for anti-debug)
-                std::vector<uint64_t> tlsCallbacks;
-                if (m_impl->AnalyzeTLSCallbacks(processPath, tlsCallbacks)) {
-                    outInfo.hasAntiDebug = true;
-                    outInfo.detectedTechniques.push_back(
-                        std::format(L"TLS callbacks detected: {} callbacks (potential anti-debug)", tlsCallbacks.size()));
-                }
-            }
-
-            CloseHandle(hProcess);
-
-            outInfo.valid = true;
-
-            if (outInfo.hasAntiDebug) {
-                m_impl->m_stats.antiDebugDetected++;
-            }
+            DetectAntiDebugCore(hProcess.get(), processId, outInfo);
 
             return outInfo.hasAntiDebug;
         }
@@ -2702,7 +2578,7 @@ namespace ShadowStrike::AntiEvasion {
         try {
             outRegions.clear();
 
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+            HandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
             if (!hProcess) {
                 if (err) {
                     err->win32Code = GetLastError();
@@ -2711,11 +2587,7 @@ namespace ShadowStrike::AntiEvasion {
                 return false;
             }
 
-            const bool success = m_impl->ScanProcessMemory(hProcess, outRegions);
-
-            CloseHandle(hProcess);
-
-            return success;
+            return m_impl->ScanProcessMemory(hProcess.get(), outRegions);
         }
         catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY, L"ScanMemory failed: %hs", e.what());
@@ -2792,6 +2664,157 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     // ========================================================================
+    // INTERNAL CORE METHODS (accept HANDLE — no redundant OpenProcess)
+    // ========================================================================
+
+    void ProcessEvasionDetector::DetectInjectionCore(
+        HANDLE hProcess,
+        uint32_t processId,
+        ProcessInjectionInfo& outInfo
+    ) noexcept {
+        try {
+            bool is64Bit = m_impl->IsProcess64Bit(hProcess);
+
+            // Check for remote threads
+            uint32_t threadCount = 0;
+            std::vector<std::wstring> threadDetails;
+            if (m_impl->HasRemoteThreads(hProcess, threadCount, threadDetails)) {
+                outInfo.hasInjection = true;
+                outInfo.injectedThreadCount = threadCount;
+                outInfo.hasRemoteThreads = true;
+            }
+
+            // Scan memory for suspicious regions
+            std::vector<MemoryRegionInfo> regions;
+            if (m_impl->ScanProcessMemory(hProcess, regions)) {
+                for (const auto& region : regions) {
+                    if (region.isSuspicious) {
+                        outInfo.suspiciousMemoryRegions++;
+                        if (region.isExecutable && region.isWritable) {
+                            outInfo.rwxMemoryAddresses.push_back(region.baseAddress);
+                        }
+                    }
+                }
+
+                if (outInfo.suspiciousMemoryRegions > 0) {
+                    outInfo.hasInjection = true;
+                }
+
+                // Check for reflective DLL injection
+                if (m_impl->DetectReflectiveDLLInjection(hProcess, regions)) {
+                    outInfo.hasInjection = true;
+                    outInfo.method = InjectionMethod::ReflectiveDLL;
+                }
+            }
+
+            // Check for suspicious DLLs
+            if (m_impl->HasSuspiciousDLLs(hProcess, outInfo.injectedDLLs)) {
+                outInfo.hasInjection = true;
+            }
+
+            // Check for process hollowing
+            if (m_impl->DetectProcessHollowing(hProcess, processId)) {
+                outInfo.hasInjection = true;
+                outInfo.hasHollowedImage = true;
+                outInfo.method = InjectionMethod::ProcessHollowing;
+            }
+
+            // Check for inline hooks
+            std::vector<std::wstring> hookedFunctions;
+            if (m_impl->DetectInlineHooks(hProcess, is64Bit, hookedFunctions)) {
+                outInfo.hasInjection = true;
+            }
+
+            outInfo.valid = true;
+
+            if (outInfo.hasInjection) {
+                m_impl->m_stats.injectionsDetected++;
+            }
+        }
+        catch (...) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"DetectInjectionCore: Exception");
+        }
+    }
+
+    void ProcessEvasionDetector::DetectAntiDebugCore(
+        HANDLE hProcess,
+        uint32_t processId,
+        AntiDebugInfo& outInfo
+    ) noexcept {
+        try {
+            // Check for debugger presence
+            if (m_impl->CheckDebuggerPresent(hProcess)) {
+                outInfo.hasAntiDebug = true;
+                outInfo.isDebuggerPresent = true;
+                outInfo.detectedTechniques.push_back(L"Debugger detected via CheckRemoteDebuggerPresent");
+            }
+
+            // Check debug port
+            if (m_impl->CheckDebugPort(hProcess)) {
+                outInfo.hasAntiDebug = true;
+                outInfo.detectedTechniques.push_back(L"Debug port detected via NtQueryInformationProcess");
+            }
+
+            // Check debug flags
+            if (m_impl->CheckDebugFlags(hProcess)) {
+                outInfo.hasAntiDebug = true;
+                outInfo.detectedTechniques.push_back(L"Debug flags indicate debugging via NtQueryInformationProcess");
+            }
+
+            // Check for debug privileges
+            if (m_impl->CheckSeDebugPrivilege(hProcess)) {
+                outInfo.hasDebugPrivilege = true;
+                outInfo.detectedTechniques.push_back(L"SeDebugPrivilege enabled");
+            }
+
+            // Check for hardware breakpoints
+            if (m_impl->CheckHardwareBreakpoints(hProcess)) {
+                outInfo.hasAntiDebug = true;
+                outInfo.hasHardwareBreakpoints = true;
+                outInfo.detectedTechniques.push_back(L"Hardware breakpoints detected");
+            }
+
+            // Check for anti-debug APIs in imports
+            std::wstring processPath = m_impl->GetProcessPath(processId);
+            if (!processPath.empty()) {
+                std::vector<std::wstring> antiDebugApis;
+                if (m_impl->HasAntiDebugAPIs(processPath, antiDebugApis)) {
+                    outInfo.hasAntiDebug = true;
+                    for (const auto& api : antiDebugApis) {
+                        outInfo.detectedTechniques.push_back(L"Anti-debug API imported: " + api);
+                    }
+                }
+
+                // Check for anti-debug instructions
+                std::vector<std::wstring> asmTechniques;
+                if (m_impl->DetectAntiDebugInstructions(hProcess, processPath, asmTechniques)) {
+                    outInfo.hasAntiDebug = true;
+                    for (const auto& tech : asmTechniques) {
+                        outInfo.detectedTechniques.push_back(tech);
+                    }
+                }
+
+                // Check for TLS callbacks (often used for anti-debug)
+                std::vector<uint64_t> tlsCallbacks;
+                if (m_impl->AnalyzeTLSCallbacks(processPath, tlsCallbacks)) {
+                    outInfo.hasAntiDebug = true;
+                    outInfo.detectedTechniques.push_back(
+                        std::format(L"TLS callbacks detected: {} callbacks (potential anti-debug)", tlsCallbacks.size()));
+                }
+            }
+
+            outInfo.valid = true;
+
+            if (outInfo.hasAntiDebug) {
+                m_impl->m_stats.antiDebugDetected++;
+            }
+        }
+        catch (...) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"DetectAntiDebugCore: Exception");
+        }
+    }
+
+    // ========================================================================
     // INTERNAL ANALYSIS METHODS
     // ========================================================================
 
@@ -2804,30 +2827,32 @@ namespace ShadowStrike::AntiEvasion {
         try {
             bool is64Bit = m_impl->IsProcess64Bit(hProcess);
 
-            // Injection detection
+            // Injection detection — use Core to avoid redundant OpenProcess
             if (HasFlag(config.flags, ProcessAnalysisFlags::CheckInjection)) {
-                if (DetectInjection(processId, result.injectionInfo, nullptr)) {
+                DetectInjectionCore(hProcess, processId, result.injectionInfo);
+                if (result.injectionInfo.hasInjection) {
                     CheckInjectionTechniques(hProcess, result);
                 }
             }
 
-            // Masquerading detection
+            // Masquerading detection (no handle needed — uses snapshot APIs)
             if (HasFlag(config.flags, ProcessAnalysisFlags::CheckMasquerading)) {
                 if (DetectMasquerading(processId, result.masqueradingInfo, nullptr)) {
                     CheckMasqueradingTechniques(hProcess, processId, result);
                 }
             }
 
-            // Anti-debugging detection
+            // Anti-debugging detection — use Core to avoid redundant OpenProcess
             if (HasFlag(config.flags, ProcessAnalysisFlags::CheckAntiDebug)) {
-                if (DetectAntiDebug(processId, result.antiDebugInfo, nullptr)) {
+                DetectAntiDebugCore(hProcess, processId, result.antiDebugInfo);
+                if (result.antiDebugInfo.hasAntiDebug) {
                     CheckAntiDebugTechniques(hProcess, result);
                 }
             }
 
-            // Memory scanning
+            // Memory scanning — use Impl directly to avoid redundant OpenProcess
             if (HasFlag(config.flags, ProcessAnalysisFlags::CheckMemory)) {
-                (void)ScanMemory(processId, result.suspiciousMemoryRegions, nullptr);
+                (void)m_impl->ScanProcessMemory(hProcess, result.suspiciousMemoryRegions);
             }
 
             // Deep analysis - additional checks
@@ -3099,10 +3124,16 @@ namespace ShadowStrike::AntiEvasion {
             const auto catIdx = (techIdx / 50) % 8;
             m_impl->m_stats.categoryDetections[catIdx]++;
 
-            // Invoke callback if set
-            if (m_impl->m_detectionCallback) {
+            // Snapshot callback under lock to prevent data race with Set/ClearDetectionCallback
+            ProcessDetectionCallback callbackCopy;
+            {
+                std::shared_lock lock(m_impl->m_mutex);
+                callbackCopy = m_impl->m_detectionCallback;
+            }
+
+            if (callbackCopy) {
                 try {
-                    m_impl->m_detectionCallback(result.processId, detection);
+                    callbackCopy(result.processId, detection);
                 }
                 catch (...) {
                     // Swallow callback exceptions

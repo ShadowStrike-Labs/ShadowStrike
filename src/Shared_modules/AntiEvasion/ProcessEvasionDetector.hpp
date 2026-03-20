@@ -667,6 +667,19 @@ namespace ShadowStrike::AntiEvasion {
         class Impl;
         std::unique_ptr<Impl> m_impl;
 
+        // Internal core methods (accept HANDLE — avoid redundant OpenProcess)
+        void DetectInjectionCore(
+            HANDLE hProcess,
+            uint32_t processId,
+            ProcessInjectionInfo& outInfo
+        ) noexcept;
+
+        void DetectAntiDebugCore(
+            HANDLE hProcess,
+            uint32_t processId,
+            AntiDebugInfo& outInfo
+        ) noexcept;
+
         // Internal methods
         void AnalyzeProcessInternal(
             HANDLE hProcess,
