@@ -138,20 +138,22 @@ GetRDTSCValue ENDP
 ; ==============================================================================
 GetRDTSCPValue PROC
     push rbx
-    push rcx                    ; Save processor ID pointer
+    mov rbx, rcx                ; Save processor ID pointer in callee-saved RBX
     
     ; Execute RDTSCP (serializing)
     rdtscp
+    
+    ; Save processor ID before it gets lost
+    mov r10d, ecx               ; R10D = processor ID from RDTSCP
     
     ; Combine EDX:EAX into RAX
     shl rdx, 32
     or rax, rdx
     
     ; Store processor ID if pointer provided
-    pop rcx
-    test rcx, rcx
+    test rbx, rbx
     jz @skip_pid
-    mov dword ptr [rcx], ecx    ; ECX from RDTSCP contains processor ID
+    mov dword ptr [rbx], r10d   ; Store actual processor ID
 @skip_pid:
     
     pop rbx
@@ -177,11 +179,12 @@ MeasureUnpackStubTiming PROC
     push rsi
     push r12
     push r13
+    push r14
     
     mov r12, rcx                ; Code pointer
     mov r13, rdx                ; Code size
     mov rdi, r8                 ; Start time pointer
-    mov rsi, r9                 ; End time pointer
+    mov r14, r9                 ; End time pointer (callee-saved R14)
     
     ; Serialize and get start time
     xor eax, eax
@@ -219,11 +222,12 @@ MeasureUnpackStubTiming PROC
     rdtsc
     shl rdx, 32
     or rax, rdx
-    mov [rsi], rax              ; Store end time
+    mov [r14], rax              ; Store end time via preserved R14
     
     ; Calculate delta
     sub rax, rbx
     
+    pop r14
     pop r13
     pop r12
     pop rsi
