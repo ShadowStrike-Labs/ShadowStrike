@@ -415,6 +415,34 @@ struct CommunicationStatistics {
 
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
+
+    /**
+     * @brief Take a thread-safe point-in-time snapshot of all counters.
+     *
+     * CommunicationStatistics contains std::atomic members and is non-copyable.
+     * Use this method to obtain a copyable snapshot for reporting/serialization.
+     */
+    [[nodiscard]] CommunicationStatisticsSnapshot TakeSnapshot() const noexcept;
+};
+
+/**
+ * @brief POD snapshot of CommunicationStatistics (no atomics, freely copyable).
+ */
+struct CommunicationStatisticsSnapshot {
+    uint64_t messagesReceived = 0;
+    uint64_t messagesSent = 0;
+    uint64_t fileScanRequests = 0;
+    uint64_t processNotifications = 0;
+    uint64_t registryNotifications = 0;
+    uint64_t repliesSent = 0;
+    uint64_t timeouts = 0;
+    uint64_t errors = 0;
+    uint64_t reconnections = 0;
+    uint64_t bytesReceived = 0;
+    uint64_t bytesSent = 0;
+    int64_t uptimeSeconds = 0;
+
+    [[nodiscard]] std::string ToJson() const;
 };
 
 //=============================================================================

@@ -38,6 +38,9 @@
 
 #include <algorithm>
 #include <sstream>
+#include <mutex>
+#include <atomic>
+#include <thread>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -56,7 +59,6 @@ class FilterConnectionImpl {
 public:
     FilterConnectionImpl(const std::wstring& portName)
         : m_portName(portName) {
-        // Validate port name immediately
         if (portName.empty()) {
             m_portName = SHADOWSTRIKE_PORT_NAME;
         }
@@ -72,13 +74,54 @@ public:
     FilterConnectionImpl& operator=(const FilterConnectionImpl&) = delete;
 
     //=========================================================================
+    // RAII guard for port handle — prevents use-after-close races.
+    //
+    // FIX [BUG #1 CRITICAL]: The original code copied m_hPort under lock then
+    // used the copy outside the lock. Between lock release and API call,
+    // Disconnect() could close the handle. This guard increments a pending-ops
+    // counter that Disconnect() drains before CloseHandle.
+    //=========================================================================
+    class PortGuard {
+    public:
+        explicit PortGuard(FilterConnectionImpl& owner) noexcept
+            : m_owner(owner), m_port(nullptr), m_acquired(false) {
+            std::lock_guard<std::mutex> lock(owner.m_mutex);
+            if (owner.m_connected.load(std::memory_order_relaxed) &&
+                owner.m_hPort != nullptr && owner.m_hPort != INVALID_HANDLE_VALUE) {
+                m_port = owner.m_hPort;
+                owner.m_pendingOps.fetch_add(1, std::memory_order_acq_rel);
+                m_acquired = true;
+            }
+        }
+
+        ~PortGuard() {
+            if (m_acquired) {
+                auto prev = m_owner.m_pendingOps.fetch_sub(1, std::memory_order_acq_rel);
+                if (prev == 1) {
+                    m_owner.m_pendingOps.notify_all();
+                }
+            }
+        }
+
+        PortGuard(const PortGuard&) = delete;
+        PortGuard& operator=(const PortGuard&) = delete;
+
+        [[nodiscard]] HANDLE get() const noexcept { return m_port; }
+        [[nodiscard]] bool valid() const noexcept { return m_acquired; }
+
+    private:
+        FilterConnectionImpl& m_owner;
+        HANDLE m_port;
+        bool m_acquired;
+    };
+
+    //=========================================================================
     // Connection Management
     //=========================================================================
 
     [[nodiscard]] bool Connect() {
         std::lock_guard<std::mutex> lock(m_mutex);
 
-        // Already connected?
         if (m_hPort != nullptr) {
             Utils::Logger::Debug("[FilterConnection] Already connected");
             return true;
@@ -87,21 +130,19 @@ public:
         Utils::Logger::Info("[FilterConnection] Connecting to port: {}",
                            Utils::StringUtils::WideToUtf8(m_portName));
 
-        // CRITICAL: FilterConnectCommunicationPort parameters must be valid
         HRESULT hr = FilterConnectCommunicationPort(
-            m_portName.c_str(),     // Port name - validated in constructor
-            0,                       // Options
-            nullptr,                 // Context (none needed)
-            0,                       // Context size
-            nullptr,                 // Security attributes
-            &m_hPort                 // Output handle
+            m_portName.c_str(),
+            0,
+            nullptr,
+            0,
+            nullptr,
+            &m_hPort
         );
 
         if (FAILED(hr)) {
-            m_lastError = hr;
-            m_hPort = nullptr;  // Ensure null on failure
+            m_lastError.store(hr, std::memory_order_relaxed);
+            m_hPort = nullptr;
 
-            // Detailed error logging
             if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
                 Utils::Logger::Error(
                     "[FilterConnection] Port not found - driver may not be loaded");
@@ -118,39 +159,54 @@ public:
             return false;
         }
 
-        // Validate handle before accepting
         if (m_hPort == nullptr || m_hPort == INVALID_HANDLE_VALUE) {
             Utils::Logger::Error("[FilterConnection] Invalid handle returned");
             m_hPort = nullptr;
-            m_lastError = E_HANDLE;
+            m_lastError.store(E_HANDLE, std::memory_order_relaxed);
             return false;
         }
 
-        m_connected = true;
+        m_connected.store(true, std::memory_order_release);
         Utils::Logger::Info("[FilterConnection] Connected successfully");
         return true;
     }
 
+    // FIX [BUG #1 CRITICAL]: Two-phase disconnect — mark dead, cancel I/O,
+    // drain in-flight operations, THEN close handle.
     void Disconnect() {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        HANDLE portToClose = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_hPort == nullptr) return;
 
-        if (m_hPort != nullptr) {
-            // Cancel any pending I/O before closing
-            CancelIoEx(m_hPort, nullptr);
-
-            CloseHandle(m_hPort);
+            m_connected.store(false, std::memory_order_release);
+            portToClose = m_hPort;
             m_hPort = nullptr;
-            m_connected = false;
-
-            Utils::Logger::Info("[FilterConnection] Disconnected");
         }
+
+        // Cancel any pending I/O (outside lock so GetMessage can return)
+        CancelIoEx(portToClose, nullptr);
+
+        // Wait for all in-flight PortGuard holders to release (C++20 atomic wait)
+        int32_t pending = m_pendingOps.load(std::memory_order_acquire);
+        while (pending > 0) {
+            m_pendingOps.wait(pending, std::memory_order_acquire);
+            pending = m_pendingOps.load(std::memory_order_acquire);
+        }
+
+        CloseHandle(portToClose);
+        Utils::Logger::Info("[FilterConnection] Disconnected");
     }
 
     [[nodiscard]] bool IsConnected() const noexcept {
-        return m_connected && m_hPort != nullptr;
+        // FIX [BUG #9 MEDIUM]: Only read the atomic flag. Checking m_hPort
+        // without the lock was a torn read. The PortGuard validates the handle
+        // under lock anyway, so this is sufficient for a quick check.
+        return m_connected.load(std::memory_order_acquire);
     }
 
     [[nodiscard]] void* GetHandle() const noexcept {
+        std::lock_guard<std::mutex> lock(m_mutex);
         return m_hPort;
     }
 
@@ -159,18 +215,12 @@ public:
     //=========================================================================
 
     [[nodiscard]] size_t GetMessage(std::span<uint8_t> buffer, uint32_t timeoutMs) {
-        // Validate connection state
-        HANDLE port = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (!IsConnected()) {
-                Utils::Logger::Warn("[FilterConnection] GetMessage: Not connected");
-                return 0;
-            }
-            port = m_hPort;
+        PortGuard guard(*this);
+        if (!guard.valid()) {
+            Utils::Logger::Warn("[FilterConnection] GetMessage: Not connected");
+            return 0;
         }
 
-        // Validate buffer
         if (buffer.empty()) {
             Utils::Logger::Error("[FilterConnection] GetMessage: Empty buffer");
             return 0;
@@ -182,24 +232,26 @@ public:
             return 0;
         }
 
-        // Cap buffer size to MAX_MESSAGE_SIZE
         const DWORD bufferSize = static_cast<DWORD>(
             std::min(buffer.size(), static_cast<size_t>(MAX_MESSAGE_SIZE)));
 
-        // CRITICAL: Cast to proper type for FilterGetMessage
         PFILTER_MESSAGE_HEADER pMessage =
             reinterpret_cast<PFILTER_MESSAGE_HEADER>(buffer.data());
 
         HRESULT hr;
+        DWORD actualBytes = 0;
 
         if (timeoutMs == 0) {
             // Synchronous (blocking) call
             hr = FilterGetMessage(
-                port,
+                guard.get(),
                 pMessage,
                 bufferSize,
-                nullptr  // No overlapped = synchronous
+                nullptr
             );
+            if (SUCCEEDED(hr)) {
+                actualBytes = pMessage->MessageLength;
+            }
         } else {
             // Asynchronous with timeout
             OVERLAPPED overlapped = {};
@@ -207,58 +259,69 @@ public:
 
             if (overlapped.hEvent == nullptr) {
                 Utils::Logger::Error("[FilterConnection] Failed to create event: {}",
-                                    GetLastError());
+                                    ::GetLastError());
                 m_stats.errors++;
                 return 0;
             }
 
             hr = FilterGetMessage(
-                port,
+                guard.get(),
                 pMessage,
                 bufferSize,
                 &overlapped
             );
 
             if (hr == HRESULT_FROM_WIN32(ERROR_IO_PENDING)) {
-                // Wait for completion with timeout
                 DWORD waitResult = WaitForSingleObject(overlapped.hEvent, timeoutMs);
 
                 if (waitResult == WAIT_OBJECT_0) {
-                    // Check overlapped result
                     DWORD bytesTransferred = 0;
-                    if (GetOverlappedResult(port, &overlapped, &bytesTransferred, FALSE)) {
+                    if (GetOverlappedResult(guard.get(), &overlapped,
+                                           &bytesTransferred, FALSE)) {
                         hr = S_OK;
+                        // FIX [BUG #8 MEDIUM]: Use actual bytes from overlapped
+                        // result instead of the potentially stale MessageLength.
+                        actualBytes = bytesTransferred;
                     } else {
-                        hr = HRESULT_FROM_WIN32(GetLastError());
+                        hr = HRESULT_FROM_WIN32(::GetLastError());
                     }
                 } else if (waitResult == WAIT_TIMEOUT) {
-                    CancelIoEx(port, &overlapped);
+                    CancelIoEx(guard.get(), &overlapped);
+                    // FIX [BUG #3 CRITICAL]: Must wait for cancellation to
+                    // complete before OVERLAPPED goes out of scope, otherwise
+                    // the kernel may write to freed stack memory.
+                    DWORD ignored = 0;
+                    GetOverlappedResult(guard.get(), &overlapped, &ignored, TRUE);
                     CloseHandle(overlapped.hEvent);
                     m_stats.timeouts++;
                     return 0;
                 } else {
-                    hr = HRESULT_FROM_WIN32(GetLastError());
+                    hr = HRESULT_FROM_WIN32(::GetLastError());
+                    // Also drain the I/O before destroying OVERLAPPED
+                    CancelIoEx(guard.get(), &overlapped);
+                    DWORD ignored = 0;
+                    GetOverlappedResult(guard.get(), &overlapped, &ignored, TRUE);
                 }
+            } else if (SUCCEEDED(hr)) {
+                // Completed synchronously despite async request
+                actualBytes = pMessage->MessageLength;
             }
 
             CloseHandle(overlapped.hEvent);
         }
 
         if (FAILED(hr)) {
-            m_lastError = hr;
+            m_lastError.store(hr, std::memory_order_relaxed);
 
-            // Handle specific error conditions
             if (hr == HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED) ||
                 hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-                // Normal during shutdown - don't log as error
                 return 0;
             }
 
             if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
-                // Port closed - mark as disconnected
                 std::lock_guard<std::mutex> lock(m_mutex);
-                m_connected = false;
-                m_hPort = nullptr;
+                m_connected.store(false, std::memory_order_release);
+                // Do NOT null m_hPort — Disconnect() handles cleanup and drain.
             }
 
             if (hr != HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT)) {
@@ -270,66 +333,68 @@ public:
             return 0;
         }
 
-        // Validate received message
-        if (pMessage->MessageLength < sizeof(FILTER_MESSAGE_HEADER)) {
+        if (actualBytes < sizeof(FILTER_MESSAGE_HEADER)) {
             Utils::Logger::Warn("[FilterConnection] Received malformed message");
             m_stats.errors++;
             return 0;
         }
 
-        // Update statistics
         m_stats.messagesReceived++;
-        m_stats.bytesReceived += pMessage->MessageLength;
+        m_stats.bytesReceived += actualBytes;
 
-        return static_cast<size_t>(pMessage->MessageLength);
+        return static_cast<size_t>(actualBytes);
     }
 
     [[nodiscard]] bool ReplyMessage(std::span<const uint8_t> replyBuffer,
                                     uint64_t originalMessageId) {
-        // Validate connection state
-        HANDLE port = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (!IsConnected()) {
-                Utils::Logger::Warn("[FilterConnection] ReplyMessage: Not connected");
-                return false;
-            }
-            port = m_hPort;
+        PortGuard guard(*this);
+        if (!guard.valid()) {
+            Utils::Logger::Warn("[FilterConnection] ReplyMessage: Not connected");
+            return false;
         }
 
-        // Validate buffer
         if (replyBuffer.empty()) {
             Utils::Logger::Error("[FilterConnection] ReplyMessage: Empty buffer");
             return false;
         }
 
-        if (replyBuffer.size() < sizeof(FILTER_REPLY_HEADER)) {
-            Utils::Logger::Error("[FilterConnection] ReplyMessage: Buffer too small");
+        // FIX [BUG #4 HIGH]: The old check demanded payload >= sizeof(FILTER_REPLY_HEADER)
+        // which is wrong — replyBuffer is the PAYLOAD, not a pre-formed reply.
+        // The correct validation: total size (header + payload) must fit in DWORD
+        // and not exceed MAX_MESSAGE_SIZE.
+        const size_t totalReplySize = sizeof(FILTER_REPLY_HEADER) + replyBuffer.size();
+        if (totalReplySize > MAX_MESSAGE_SIZE) {
+            Utils::Logger::Error(
+                "[FilterConnection] ReplyMessage: Reply too large ({} bytes, max {})",
+                totalReplySize, MAX_MESSAGE_SIZE);
             return false;
         }
 
-        // Build reply with proper header
-        // CRITICAL: We need to construct FILTER_REPLY_HEADER + our payload
-        std::vector<uint8_t> fullReply(sizeof(FILTER_REPLY_HEADER) + replyBuffer.size());
+        std::vector<uint8_t> fullReply(totalReplySize);
 
         PFILTER_REPLY_HEADER pReply =
             reinterpret_cast<PFILTER_REPLY_HEADER>(fullReply.data());
 
         pReply->MessageId = originalMessageId;
-        pReply->Status = 0;  // Success
+        pReply->Status = 0;
 
-        // Copy payload after header
         std::memcpy(fullReply.data() + sizeof(FILTER_REPLY_HEADER),
                    replyBuffer.data(), replyBuffer.size());
 
         HRESULT hr = FilterReplyMessage(
-            port,
+            guard.get(),
             pReply,
             static_cast<DWORD>(fullReply.size())
         );
 
         if (FAILED(hr)) {
-            m_lastError = hr;
+            m_lastError.store(hr, std::memory_order_relaxed);
+
+            if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_connected.store(false, std::memory_order_release);
+            }
+
             Utils::Logger::Warn("[FilterConnection] FilterReplyMessage failed: 0x{:08X}",
                                static_cast<unsigned int>(hr));
             m_stats.errors++;
@@ -345,19 +410,13 @@ public:
 
     [[nodiscard]] size_t SendMessage(std::span<const uint8_t> sendBuffer,
                                      std::span<uint8_t> replyBuffer,
-                                     uint32_t timeoutMs) {
-        // Validate connection state
-        HANDLE port = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (!IsConnected()) {
-                Utils::Logger::Warn("[FilterConnection] SendMessage: Not connected");
-                return 0;
-            }
-            port = m_hPort;
+                                     uint32_t /*timeoutMs*/) {
+        PortGuard guard(*this);
+        if (!guard.valid()) {
+            Utils::Logger::Warn("[FilterConnection] SendMessage: Not connected");
+            return 0;
         }
 
-        // Validate buffers
         if (sendBuffer.empty()) {
             Utils::Logger::Error("[FilterConnection] SendMessage: Empty send buffer");
             return 0;
@@ -365,12 +424,8 @@ public:
 
         DWORD bytesReturned = 0;
 
-        // FilterSendMessage with timeout is not directly supported
-        // We use the synchronous version which has no timeout
-        // For timeout support, caller should use async patterns
-
         HRESULT hr = FilterSendMessage(
-            port,
+            guard.get(),
             const_cast<void*>(static_cast<const void*>(sendBuffer.data())),
             static_cast<DWORD>(sendBuffer.size()),
             replyBuffer.empty() ? nullptr : replyBuffer.data(),
@@ -379,11 +434,13 @@ public:
         );
 
         if (FAILED(hr)) {
-            m_lastError = hr;
+            m_lastError.store(hr, std::memory_order_relaxed);
 
+            // FIX [BUG #6 HIGH]: Consistent INVALID_HANDLE handling — set
+            // m_connected=false (same as GetMessage). Don't null m_hPort.
             if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
                 std::lock_guard<std::mutex> lock(m_mutex);
-                m_connected = false;
+                m_connected.store(false, std::memory_order_release);
             }
 
             Utils::Logger::Warn("[FilterConnection] FilterSendMessage failed: 0x{:08X}",
@@ -403,8 +460,48 @@ public:
         return static_cast<size_t>(bytesReturned);
     }
 
+    // FIX [BUG #2 CRITICAL]: The old code did `SendMessage(...) >= 0` which is
+    // always true for size_t (unsigned). Now calls FilterSendMessage directly
+    // with null reply buffer and checks the HRESULT for success/failure.
     [[nodiscard]] bool SendMessageNoReply(std::span<const uint8_t> sendBuffer) {
-        return SendMessage(sendBuffer, {}, 0) >= 0;
+        PortGuard guard(*this);
+        if (!guard.valid()) {
+            Utils::Logger::Warn("[FilterConnection] SendMessageNoReply: Not connected");
+            return false;
+        }
+
+        if (sendBuffer.empty()) {
+            Utils::Logger::Error("[FilterConnection] SendMessageNoReply: Empty buffer");
+            return false;
+        }
+
+        HRESULT hr = FilterSendMessage(
+            guard.get(),
+            const_cast<void*>(static_cast<const void*>(sendBuffer.data())),
+            static_cast<DWORD>(sendBuffer.size()),
+            nullptr,
+            0,
+            nullptr
+        );
+
+        if (FAILED(hr)) {
+            m_lastError.store(hr, std::memory_order_relaxed);
+
+            if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_connected.store(false, std::memory_order_release);
+            }
+
+            Utils::Logger::Warn(
+                "[FilterConnection] FilterSendMessage (no reply) failed: 0x{:08X}",
+                static_cast<unsigned int>(hr));
+            m_stats.errors++;
+            return false;
+        }
+
+        m_stats.messagesSent++;
+        m_stats.bytesSent += sendBuffer.size();
+        return true;
     }
 
     //=========================================================================
@@ -412,11 +509,13 @@ public:
     //=========================================================================
 
     [[nodiscard]] int32_t GetLastError() const noexcept {
-        return m_lastError;
+        // FIX [BUG #5 HIGH]: Now atomic — safe for concurrent reads/writes.
+        return m_lastError.load(std::memory_order_relaxed);
     }
 
     [[nodiscard]] std::string GetLastErrorMessage() const {
-        if (m_lastError == 0) {
+        const int32_t err = m_lastError.load(std::memory_order_relaxed);
+        if (err == 0) {
             return "No error";
         }
 
@@ -424,7 +523,7 @@ public:
         DWORD size = FormatMessageW(
             FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
             nullptr,
-            static_cast<DWORD>(m_lastError),
+            static_cast<DWORD>(err),
             0,
             reinterpret_cast<LPWSTR>(&msgBuffer),
             0,
@@ -432,13 +531,12 @@ public:
         );
 
         if (size == 0 || msgBuffer == nullptr) {
-            return "Unknown error: " + std::to_string(m_lastError);
+            return "Unknown error: " + std::to_string(err);
         }
 
         std::wstring wideMsg(msgBuffer, size);
         LocalFree(msgBuffer);
 
-        // Remove trailing newlines
         while (!wideMsg.empty() &&
                (wideMsg.back() == L'\n' || wideMsg.back() == L'\r')) {
             wideMsg.pop_back();
@@ -451,38 +549,49 @@ public:
     // Statistics
     //=========================================================================
 
-    [[nodiscard]] CommunicationStatistics GetStatistics() const {
-        return m_stats;
+    // FIX [BUG #7 HIGH]: Return a copyable snapshot instead of trying to copy
+    // CommunicationStatistics (which contains non-copyable std::atomic members).
+    [[nodiscard]] CommunicationStatisticsSnapshot GetStatistics() const {
+        return m_stats.TakeSnapshot();
     }
 
+    // FIX [BUG #10 LOW]: Escape backslashes in port name for valid JSON.
     [[nodiscard]] std::string ToJson() const {
+        std::string escapedPort = Utils::StringUtils::WideToUtf8(m_portName);
+        // Escape backslashes for JSON
+        std::string jsonPort;
+        jsonPort.reserve(escapedPort.size() + 4);
+        for (char c : escapedPort) {
+            if (c == '\\') jsonPort += "\\\\";
+            else if (c == '"') jsonPort += "\\\"";
+            else jsonPort += c;
+        }
+
         std::ostringstream oss;
         oss << "{"
-            << "\"connected\":" << (m_connected ? "true" : "false") << ","
-            << "\"portName\":\"" << Utils::StringUtils::WideToUtf8(m_portName) << "\","
-            << "\"messagesReceived\":" << m_stats.messagesReceived.load() << ","
-            << "\"messagesSent\":" << m_stats.messagesSent.load() << ","
-            << "\"bytesReceived\":" << m_stats.bytesReceived.load() << ","
-            << "\"bytesSent\":" << m_stats.bytesSent.load() << ","
-            << "\"errors\":" << m_stats.errors.load() << ","
-            << "\"timeouts\":" << m_stats.timeouts.load()
+            << "\"connected\":" << (m_connected.load(std::memory_order_relaxed) ? "true" : "false") << ","
+            << "\"portName\":\"" << jsonPort << "\","
+            << "\"messagesReceived\":" << m_stats.messagesReceived.load(std::memory_order_relaxed) << ","
+            << "\"messagesSent\":" << m_stats.messagesSent.load(std::memory_order_relaxed) << ","
+            << "\"bytesReceived\":" << m_stats.bytesReceived.load(std::memory_order_relaxed) << ","
+            << "\"bytesSent\":" << m_stats.bytesSent.load(std::memory_order_relaxed) << ","
+            << "\"errors\":" << m_stats.errors.load(std::memory_order_relaxed) << ","
+            << "\"timeouts\":" << m_stats.timeouts.load(std::memory_order_relaxed)
             << "}";
         return oss.str();
     }
 
 private:
-    // Port configuration
     std::wstring m_portName;
 
-    // Connection state
     HANDLE m_hPort = nullptr;
     std::atomic<bool> m_connected{false};
+    std::atomic<int32_t> m_pendingOps{0};  // Outstanding PortGuard holders
     mutable std::mutex m_mutex;
 
-    // Error tracking
-    int32_t m_lastError = 0;
+    // FIX [BUG #5 HIGH]: Was plain int32_t written from multiple threads.
+    std::atomic<int32_t> m_lastError{0};
 
-    // Statistics
     CommunicationStatistics m_stats;
 };
 
@@ -557,10 +666,9 @@ std::string FilterConnection::GetLastErrorMessage() const {
     return m_impl ? m_impl->GetLastErrorMessage() : "Implementation not initialized";
 }
 
-CommunicationStatistics FilterConnection::GetStatistics() const {
+CommunicationStatisticsSnapshot FilterConnection::GetStatistics() const {
     if (!m_impl) {
-        CommunicationStatistics empty;
-        return empty;
+        return CommunicationStatisticsSnapshot{};
     }
     return m_impl->GetStatistics();
 }
@@ -589,23 +697,42 @@ void CommunicationStatistics::Reset() noexcept {
 }
 
 std::string CommunicationStatistics::ToJson() const {
-    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now() - startTime).count();
+    return TakeSnapshot().ToJson();
+}
 
+CommunicationStatisticsSnapshot CommunicationStatistics::TakeSnapshot() const noexcept {
+    CommunicationStatisticsSnapshot snap;
+    snap.messagesReceived = messagesReceived.load(std::memory_order_relaxed);
+    snap.messagesSent = messagesSent.load(std::memory_order_relaxed);
+    snap.fileScanRequests = fileScanRequests.load(std::memory_order_relaxed);
+    snap.processNotifications = processNotifications.load(std::memory_order_relaxed);
+    snap.registryNotifications = registryNotifications.load(std::memory_order_relaxed);
+    snap.repliesSent = repliesSent.load(std::memory_order_relaxed);
+    snap.timeouts = timeouts.load(std::memory_order_relaxed);
+    snap.errors = errors.load(std::memory_order_relaxed);
+    snap.reconnections = reconnections.load(std::memory_order_relaxed);
+    snap.bytesReceived = bytesReceived.load(std::memory_order_relaxed);
+    snap.bytesSent = bytesSent.load(std::memory_order_relaxed);
+    snap.uptimeSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - startTime).count();
+    return snap;
+}
+
+std::string CommunicationStatisticsSnapshot::ToJson() const {
     std::ostringstream oss;
     oss << "{"
-        << "\"uptimeSeconds\":" << uptime << ","
-        << "\"messagesReceived\":" << messagesReceived.load() << ","
-        << "\"messagesSent\":" << messagesSent.load() << ","
-        << "\"fileScanRequests\":" << fileScanRequests.load() << ","
-        << "\"processNotifications\":" << processNotifications.load() << ","
-        << "\"registryNotifications\":" << registryNotifications.load() << ","
-        << "\"repliesSent\":" << repliesSent.load() << ","
-        << "\"timeouts\":" << timeouts.load() << ","
-        << "\"errors\":" << errors.load() << ","
-        << "\"reconnections\":" << reconnections.load() << ","
-        << "\"bytesReceived\":" << bytesReceived.load() << ","
-        << "\"bytesSent\":" << bytesSent.load()
+        << "\"uptimeSeconds\":" << uptimeSeconds << ","
+        << "\"messagesReceived\":" << messagesReceived << ","
+        << "\"messagesSent\":" << messagesSent << ","
+        << "\"fileScanRequests\":" << fileScanRequests << ","
+        << "\"processNotifications\":" << processNotifications << ","
+        << "\"registryNotifications\":" << registryNotifications << ","
+        << "\"repliesSent\":" << repliesSent << ","
+        << "\"timeouts\":" << timeouts << ","
+        << "\"errors\":" << errors << ","
+        << "\"reconnections\":" << reconnections << ","
+        << "\"bytesReceived\":" << bytesReceived << ","
+        << "\"bytesSent\":" << bytesSent
         << "}";
     return oss.str();
 }

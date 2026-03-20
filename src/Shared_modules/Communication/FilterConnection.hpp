@@ -165,7 +165,7 @@ public:
      * @brief Get connection statistics
      * @return Statistics structure
      */
-    [[nodiscard]] CommunicationStatistics GetStatistics() const;
+    [[nodiscard]] CommunicationStatisticsSnapshot GetStatistics() const;
 
     /**
      * @brief Get status as JSON
