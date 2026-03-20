@@ -459,7 +459,27 @@ struct QuietHoursSchedule {
 };
 
 /**
- * @brief Statistics
+ * @brief Statistics snapshot (POD, copyable)
+ */
+struct NotificationStatisticsSnapshot {
+    uint64_t totalShown = 0;
+    uint64_t totalClicked = 0;
+    uint64_t totalDismissed = 0;
+    uint64_t totalExpired = 0;
+    uint64_t totalSuppressed = 0;
+    uint64_t totalFailed = 0;
+    uint64_t totalButtonClicks = 0;
+    uint64_t rateLimitHits = 0;
+    uint64_t quietModeSuppressions = 0;
+    std::array<uint64_t, 8> byLevel{};
+    std::array<uint64_t, 16> byCategory{};
+    int64_t uptimeSeconds = 0;
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Statistics (non-copyable, atomic counters)
  */
 struct NotificationStatistics {
     std::atomic<uint64_t> totalShown{0};
@@ -476,7 +496,7 @@ struct NotificationStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
-    [[nodiscard]] std::string ToJson() const;
+    [[nodiscard]] NotificationStatisticsSnapshot TakeSnapshot() const noexcept;
 };
 
 /**
@@ -523,7 +543,7 @@ struct NotificationConfiguration {
 using NotificationCallback = std::function<void(const Notification&)>;
 using ActionCallback = std::function<void(const std::string& notificationId, const std::string& actionId)>;
 using DismissCallback = std::function<void(const std::string& notificationId)>;
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+using NotificationErrorCallback = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
 // NOTIFICATION MANAGER CLASS
@@ -650,14 +670,14 @@ public:
     void RegisterNotificationCallback(NotificationCallback callback);
     void RegisterActionCallback(ActionCallback callback);
     void RegisterDismissCallback(DismissCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
+    void RegisterErrorCallback(NotificationErrorCallback callback);
     void UnregisterCallbacks();
 
     // ========================================================================
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] NotificationStatistics GetStatistics() const;
+    [[nodiscard]] NotificationStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
