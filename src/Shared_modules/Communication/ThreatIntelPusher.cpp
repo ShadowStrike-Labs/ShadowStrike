@@ -19,6 +19,7 @@
 
 #include "ThreatIntelPusher.hpp"
 #include "FilterConnection.hpp"
+#include "../Utils/Logger.hpp"
 
 #include <Windows.h>
 #include <mutex>
@@ -46,12 +47,14 @@ static constexpr uint32_t MAX_MESSAGE_BUFFER_SIZE = 64 * 1024; // 64KB per messa
 
 class ThreatIntelPusher::Impl {
 public:
-    explicit Impl(FilterConnection& connection) noexcept
+    explicit Impl(FilterConnection& connection)
         : m_connection(connection)
         , m_maxBatchSize(DEFAULT_MAX_BATCH_SIZE)
         , m_replyTimeoutMs(DEFAULT_REPLY_TIMEOUT_MS)
         , m_nextMessageId(1)
     {
+        Utils::Logger::Info("[ThreatIntelPusher] Initialized (maxBatch={}, timeout={}ms)",
+            DEFAULT_MAX_BATCH_SIZE, DEFAULT_REPLY_TIMEOUT_MS);
     }
 
     // ========================================================================
@@ -101,12 +104,12 @@ public:
     {
         PushResult result;
 
-        // Allocate reply buffer for SHADOWSTRIKE_PUSH_REPLY
         uint8_t replyBuf[sizeof(SHADOWSTRIKE_PUSH_REPLY) + 64];
         std::span<uint8_t> replySpan(replyBuf, sizeof(replyBuf));
 
+        const uint32_t timeout = m_replyTimeoutMs.load(std::memory_order_relaxed);
         size_t replySize = m_connection.SendMessage(
-            messageBuffer, replySpan, m_replyTimeoutMs);
+            messageBuffer, replySpan, timeout);
 
         if (replySize >= sizeof(SHADOWSTRIKE_PUSH_REPLY)) {
             auto* reply = reinterpret_cast<const SHADOWSTRIKE_PUSH_REPLY*>(replyBuf);
@@ -115,39 +118,50 @@ public:
             result.entriesRejected = reply->EntriesRejected;
             result.kernelStatus = reply->Status;
             result.batchesSent = 1;
-        } else if (replySize == 0) {
-            // SendMessage returned 0 — might be fire-and-forget success
-            // or connection error. Check connection state.
-            if (m_connection.IsConnected()) {
-                // Assume success with no reply (fire-and-forget mode)
-                result.success = true;
-                result.entriesAccepted = entryCount;
-                result.batchesSent = 1;
-            } else {
-                result.success = false;
-                result.errorMessage = "FilterConnection disconnected";
+
+            if (!result.success) {
+                char ntBuf[32];
+                snprintf(ntBuf, sizeof(ntBuf), "0x%08X", reply->Status);
+                result.errorMessage = std::string("Kernel returned NTSTATUS ") + ntBuf;
+                Utils::Logger::Warn(
+                    "[ThreatIntelPusher] Kernel rejected batch: NTSTATUS=0x{:08X} "
+                    "accepted={} rejected={}",
+                    reply->Status, reply->EntriesAccepted, reply->EntriesRejected);
             }
         } else {
+            // replySize==0 or undersized reply — treat as error
             result.success = false;
-            result.errorMessage = "Invalid reply size: " + std::to_string(replySize);
+            result.batchesSent = 1;
+            if (!m_connection.IsConnected()) {
+                result.errorMessage = "FilterConnection disconnected during push";
+            } else if (replySize == 0) {
+                result.errorMessage = "Kernel returned empty reply (timeout or protocol error)";
+            } else {
+                result.errorMessage = "Invalid reply size: " + std::to_string(replySize);
+            }
+            Utils::Logger::Error(
+                "[ThreatIntelPusher] SendBatchMessage failed: {} (replySize={})",
+                result.errorMessage, replySize);
         }
 
-        // Update statistics
+        // Update statistics (all atomic)
+        auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
         m_stats.totalBatchesSent.fetch_add(1, std::memory_order_relaxed);
         m_stats.totalBytesSent.fetch_add(
             messageBuffer.size(), std::memory_order_relaxed);
+        m_stats.totalPushes.fetch_add(1, std::memory_order_relaxed);
+        m_stats.lastPushTimeMs.store(nowMs, std::memory_order_relaxed);
 
         if (result.success) {
             m_stats.successfulPushes.fetch_add(1, std::memory_order_relaxed);
             m_stats.totalEntriesPushed.fetch_add(
                 result.entriesAccepted, std::memory_order_relaxed);
-            m_stats.lastSuccessTime = std::chrono::system_clock::now();
+            m_stats.lastSuccessTimeMs.store(nowMs, std::memory_order_relaxed);
         } else {
             m_stats.failedPushes.fetch_add(1, std::memory_order_relaxed);
         }
-
-        m_stats.totalPushes.fetch_add(1, std::memory_order_relaxed);
-        m_stats.lastPushTime = std::chrono::system_clock::now();
 
         return result;
     }
@@ -163,10 +177,24 @@ public:
         std::lock_guard lock(m_mutex);
 
         PushResult aggregate;
+
+        if (entries.empty()) {
+            aggregate.success = true;
+            return aggregate;
+        }
+
+        if (!m_connection.IsConnected()) {
+            aggregate.success = false;
+            aggregate.errorMessage = "FilterConnection not connected";
+            Utils::Logger::Warn("[ThreatIntelPusher] PushHash aborted: not connected");
+            return aggregate;
+        }
+
         aggregate.success = true;
 
+        const uint32_t maxBatch = m_maxBatchSize.load(std::memory_order_relaxed);
         const uint32_t batchMax = std::min(
-            m_maxBatchSize,
+            maxBatch,
             static_cast<uint32_t>(
                 (MAX_MESSAGE_BUFFER_SIZE - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
                  - sizeof(SHADOWSTRIKE_PUSH_BATCH_HEADER))
@@ -181,7 +209,6 @@ public:
                 static_cast<uint32_t>(sizeof(SHADOWSTRIKE_PUSH_BATCH_HEADER))
                 + count * static_cast<uint32_t>(sizeof(SHADOWSTRIKE_PUSH_HASH_ENTRY));
 
-            // Build message buffer
             std::vector<uint8_t> buffer(
                 sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + dataSize);
 
@@ -203,11 +230,11 @@ public:
                 auto& dst = entryPtr[i];
 
                 memset(&dst, 0, sizeof(dst));
-                dst.HashType = src.hashType;
-                dst.Verdict = src.verdict;
+                dst.HashType = std::min<uint8_t>(src.hashType, 2);
+                dst.Verdict = std::min<uint8_t>(src.verdict, 3);
                 dst.Severity = src.severity;
                 dst.Reserved = 0;
-                dst.Score = src.score;
+                dst.Score = std::min(src.score, 100u);
                 memcpy(dst.Hash, src.hash, sizeof(dst.Hash));
                 strncpy_s(dst.ThreatName, sizeof(dst.ThreatName),
                     src.threatName.c_str(), _TRUNCATE);
@@ -224,11 +251,15 @@ public:
                 aggregate.success = false;
                 aggregate.kernelStatus = batchResult.kernelStatus;
                 aggregate.errorMessage = batchResult.errorMessage;
-                break; // Stop on first failure
+                break;
             }
 
             offset += count;
         }
+
+        Utils::Logger::Debug(
+            "[ThreatIntelPusher] PushHash complete: type=0x{:04X} accepted={} rejected={} batches={}",
+            messageType, aggregate.entriesAccepted, aggregate.entriesRejected, aggregate.batchesSent);
 
         return aggregate;
     }
@@ -242,10 +273,24 @@ public:
         std::lock_guard lock(m_mutex);
 
         PushResult aggregate;
+
+        if (entries.empty()) {
+            aggregate.success = true;
+            return aggregate;
+        }
+
+        if (!m_connection.IsConnected()) {
+            aggregate.success = false;
+            aggregate.errorMessage = "FilterConnection not connected";
+            Utils::Logger::Warn("[ThreatIntelPusher] PushNetworkIOC aborted: not connected");
+            return aggregate;
+        }
+
         aggregate.success = true;
 
+        const uint32_t maxBatch = m_maxBatchSize.load(std::memory_order_relaxed);
         const uint32_t batchMax = std::min(
-            m_maxBatchSize,
+            maxBatch,
             static_cast<uint32_t>(
                 (MAX_MESSAGE_BUFFER_SIZE - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
                  - sizeof(SHADOWSTRIKE_PUSH_BATCH_HEADER))
@@ -281,10 +326,11 @@ public:
                 auto& dst = entryPtr[i];
 
                 memset(&dst, 0, sizeof(dst));
-                dst.Type = static_cast<UINT8>(src.type);
+                dst.Type = static_cast<UINT8>(std::min<uint8_t>(
+                    static_cast<uint8_t>(src.type), 4));
                 dst.Reputation = src.reputation;
                 dst.Categories = src.categories;
-                dst.Score = src.score;
+                dst.Score = std::min(src.score, 100u);
                 strncpy_s(dst.ThreatName, sizeof(dst.ThreatName),
                     src.threatName.c_str(), _TRUNCATE);
                 strncpy_s(dst.MalwareFamily, sizeof(dst.MalwareFamily),
@@ -328,6 +374,10 @@ public:
             offset += count;
         }
 
+        Utils::Logger::Debug(
+            "[ThreatIntelPusher] PushNetworkIOC complete: accepted={} rejected={} batches={}",
+            aggregate.entriesAccepted, aggregate.entriesRejected, aggregate.batchesSent);
+
         return aggregate;
     }
 
@@ -340,39 +390,52 @@ public:
         std::lock_guard lock(m_mutex);
 
         PushResult aggregate;
-        aggregate.success = true;
 
-        // Whitelist entries are variable-length (path/process names appended).
-        // Send one batch at a time, packing as many entries as fit in 64KB.
+        if (entries.empty()) {
+            aggregate.success = true;
+            return aggregate;
+        }
+
+        if (!m_connection.IsConnected()) {
+            aggregate.success = false;
+            aggregate.errorMessage = "FilterConnection not connected";
+            Utils::Logger::Warn("[ThreatIntelPusher] PushWhitelist aborted: not connected");
+            return aggregate;
+        }
+
+        aggregate.success = true;
+        const uint32_t maxBatch = m_maxBatchSize.load(std::memory_order_relaxed);
+
         size_t offset = 0;
         while (offset < entries.size()) {
             std::vector<uint8_t> buffer;
             buffer.reserve(MAX_MESSAGE_BUFFER_SIZE);
 
-            // Reserve space for headers
             buffer.resize(sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
                          + sizeof(SHADOWSTRIKE_PUSH_BATCH_HEADER));
 
             uint32_t count = 0;
             size_t idx = offset;
 
-            while (idx < entries.size() && count < m_maxBatchSize) {
+            while (idx < entries.size() && count < maxBatch) {
                 const auto& src = entries[idx];
 
-                // Calculate this entry's wire size
                 size_t entrySize = sizeof(SHADOWSTRIKE_PUSH_WHITELIST_ENTRY)
                     + src.value.size() * sizeof(wchar_t);
 
                 if (buffer.size() + entrySize > MAX_MESSAGE_BUFFER_SIZE) {
                     if (count == 0) {
-                        // Single entry exceeds buffer — skip it
+                        Utils::Logger::Warn(
+                            "[ThreatIntelPusher] Whitelist entry too large ({} bytes), skipping",
+                            entrySize);
+                        aggregate.entriesRejected++;
+                        m_stats.oversizedEntriesSkipped.fetch_add(1, std::memory_order_relaxed);
                         ++idx;
                         continue;
                     }
                     break;
                 }
 
-                // Serialize entry
                 size_t entryOffset = buffer.size();
                 buffer.resize(entryOffset + sizeof(SHADOWSTRIKE_PUSH_WHITELIST_ENTRY)
                              + src.value.size() * sizeof(wchar_t));
@@ -380,13 +443,13 @@ public:
                 auto* dst = reinterpret_cast<SHADOWSTRIKE_PUSH_WHITELIST_ENTRY*>(
                     buffer.data() + entryOffset);
                 memset(dst, 0, sizeof(*dst));
-                dst->EntryType = static_cast<UINT8>(src.entryType);
-                dst->HashType = src.hashType;
+                dst->EntryType = static_cast<UINT8>(std::min<uint8_t>(
+                    static_cast<uint8_t>(src.entryType), 3));
+                dst->HashType = std::min<uint8_t>(src.hashType, 2);
                 dst->Flags = src.flags;
                 memcpy(dst->Hash, src.hash, sizeof(dst->Hash));
                 dst->ValueLength = static_cast<UINT16>(src.value.size());
 
-                // Append wide string value after the fixed structure
                 if (!src.value.empty()) {
                     auto* valuePtr = reinterpret_cast<wchar_t*>(
                         buffer.data() + entryOffset
@@ -404,7 +467,6 @@ public:
                 continue;
             }
 
-            // Fill headers
             uint32_t dataSize = static_cast<uint32_t>(
                 buffer.size() - sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
 
@@ -413,7 +475,7 @@ public:
 
             auto* batch = reinterpret_cast<SHADOWSTRIKE_PUSH_BATCH_HEADER*>(
                 buffer.data() + sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
-            BuildBatchHeader(*batch, count, 0, // 0 = variable size entries
+            BuildBatchHeader(*batch, count, 0,
                 dataSize - static_cast<uint32_t>(sizeof(SHADOWSTRIKE_PUSH_BATCH_HEADER)));
 
             auto batchResult = SendBatchMessage(
@@ -432,6 +494,10 @@ public:
             offset = idx;
         }
 
+        Utils::Logger::Debug(
+            "[ThreatIntelPusher] PushWhitelist complete: accepted={} rejected={} batches={}",
+            aggregate.entriesAccepted, aggregate.entriesRejected, aggregate.batchesSent);
+
         return aggregate;
     }
 
@@ -444,7 +510,21 @@ public:
         std::lock_guard lock(m_mutex);
 
         PushResult aggregate;
+
+        if (entries.empty()) {
+            aggregate.success = true;
+            return aggregate;
+        }
+
+        if (!m_connection.IsConnected()) {
+            aggregate.success = false;
+            aggregate.errorMessage = "FilterConnection not connected";
+            Utils::Logger::Warn("[ThreatIntelPusher] PushExclusion aborted: not connected");
+            return aggregate;
+        }
+
         aggregate.success = true;
+        const uint32_t maxBatch = m_maxBatchSize.load(std::memory_order_relaxed);
 
         size_t offset = 0;
         while (offset < entries.size()) {
@@ -456,7 +536,7 @@ public:
             uint32_t count = 0;
             size_t idx = offset;
 
-            while (idx < entries.size() && count < m_maxBatchSize) {
+            while (idx < entries.size() && count < maxBatch) {
                 const auto& src = entries[idx];
 
                 size_t valueBytes = (src.exclusionType == ExclusionPushEntry::PIDExcl)
@@ -466,7 +546,15 @@ public:
                 size_t entrySize = sizeof(SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY) + valueBytes;
 
                 if (buffer.size() + entrySize > MAX_MESSAGE_BUFFER_SIZE) {
-                    if (count == 0) { ++idx; continue; }
+                    if (count == 0) {
+                        Utils::Logger::Warn(
+                            "[ThreatIntelPusher] Exclusion entry too large ({} bytes), skipping",
+                            entrySize);
+                        aggregate.entriesRejected++;
+                        m_stats.oversizedEntriesSkipped.fetch_add(1, std::memory_order_relaxed);
+                        ++idx;
+                        continue;
+                    }
                     break;
                 }
 
@@ -476,8 +564,10 @@ public:
                 auto* dst = reinterpret_cast<SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY*>(
                     buffer.data() + entryOffset);
                 memset(dst, 0, sizeof(*dst));
-                dst->ExclusionType = static_cast<UINT8>(src.exclusionType);
-                dst->Operation = static_cast<UINT8>(src.operation);
+                dst->ExclusionType = static_cast<UINT8>(std::min<uint8_t>(
+                    static_cast<uint8_t>(src.exclusionType), 3));
+                dst->Operation = static_cast<UINT8>(std::min<uint8_t>(
+                    static_cast<uint8_t>(src.operation), 2));
                 dst->Flags = src.flags;
                 dst->TTLSeconds = src.ttlSeconds;
 
@@ -534,6 +624,10 @@ public:
             offset = idx;
         }
 
+        Utils::Logger::Debug(
+            "[ThreatIntelPusher] PushExclusion complete: accepted={} rejected={} batches={}",
+            aggregate.entriesAccepted, aggregate.entriesRejected, aggregate.batchesSent);
+
         return aggregate;
     }
 
@@ -541,19 +635,19 @@ public:
     // State
     // ========================================================================
 
-    FilterConnection&       m_connection;
-    std::mutex              m_mutex;
-    uint32_t                m_maxBatchSize;
-    uint32_t                m_replyTimeoutMs;
-    std::atomic<uint64_t>   m_nextMessageId;
-    PusherStatistics        m_stats;
+    FilterConnection&               m_connection;
+    std::mutex                      m_mutex;
+    std::atomic<uint32_t>           m_maxBatchSize;
+    std::atomic<uint32_t>           m_replyTimeoutMs;
+    std::atomic<uint64_t>           m_nextMessageId;
+    PusherStatistics                m_stats;
 };
 
 // ============================================================================
 // PUBLIC INTERFACE FORWARDING
 // ============================================================================
 
-ThreatIntelPusher::ThreatIntelPusher(FilterConnection& connection) noexcept
+ThreatIntelPusher::ThreatIntelPusher(FilterConnection& connection)
     : m_impl(std::make_unique<Impl>(connection))
 {
 }
@@ -566,6 +660,16 @@ ThreatIntelPusher& ThreatIntelPusher::operator=(ThreatIntelPusher&&) noexcept = 
 PushResult ThreatIntelPusher::PushHashes(std::span<const HashPushEntry> entries)
 {
     return m_impl->PushHashBatch(entries, FilterMessageType_PushHashDatabase);
+}
+
+PushResult ThreatIntelPusher::PushPatterns(std::span<const HashPushEntry> entries)
+{
+    return m_impl->PushHashBatch(entries, FilterMessageType_PushPatternDatabase);
+}
+
+PushResult ThreatIntelPusher::PushSignatures(std::span<const HashPushEntry> entries)
+{
+    return m_impl->PushHashBatch(entries, FilterMessageType_PushSignatureDatabase);
 }
 
 PushResult ThreatIntelPusher::PushNetworkIOCs(std::span<const NetworkIOCPushEntry> entries)
@@ -583,19 +687,32 @@ PushResult ThreatIntelPusher::PushExclusions(std::span<const ExclusionPushEntry>
     return m_impl->PushExclusionBatch(entries);
 }
 
-const PusherStatistics& ThreatIntelPusher::GetStatistics() const noexcept
+PusherStatisticsSnapshot ThreatIntelPusher::GetStatistics() const noexcept
 {
-    return m_impl->m_stats;
+    PusherStatisticsSnapshot snap;
+    snap.totalPushes         = m_impl->m_stats.totalPushes.load(std::memory_order_relaxed);
+    snap.successfulPushes    = m_impl->m_stats.successfulPushes.load(std::memory_order_relaxed);
+    snap.failedPushes        = m_impl->m_stats.failedPushes.load(std::memory_order_relaxed);
+    snap.totalEntriesPushed  = m_impl->m_stats.totalEntriesPushed.load(std::memory_order_relaxed);
+    snap.totalBatchesSent    = m_impl->m_stats.totalBatchesSent.load(std::memory_order_relaxed);
+    snap.totalBytesSent      = m_impl->m_stats.totalBytesSent.load(std::memory_order_relaxed);
+    snap.oversizedEntriesSkipped = m_impl->m_stats.oversizedEntriesSkipped.load(std::memory_order_relaxed);
+    snap.lastPushTimeMs      = m_impl->m_stats.lastPushTimeMs.load(std::memory_order_relaxed);
+    snap.lastSuccessTimeMs   = m_impl->m_stats.lastSuccessTimeMs.load(std::memory_order_relaxed);
+    return snap;
 }
 
 void ThreatIntelPusher::ResetStatistics() noexcept
 {
-    m_impl->m_stats.totalPushes.store(0);
-    m_impl->m_stats.successfulPushes.store(0);
-    m_impl->m_stats.failedPushes.store(0);
-    m_impl->m_stats.totalEntriesPushed.store(0);
-    m_impl->m_stats.totalBatchesSent.store(0);
-    m_impl->m_stats.totalBytesSent.store(0);
+    m_impl->m_stats.totalPushes.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.successfulPushes.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.failedPushes.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.totalEntriesPushed.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.totalBatchesSent.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.totalBytesSent.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.oversizedEntriesSkipped.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.lastPushTimeMs.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.lastSuccessTimeMs.store(0, std::memory_order_relaxed);
 }
 
 bool ThreatIntelPusher::IsConnected() const noexcept
@@ -605,13 +722,14 @@ bool ThreatIntelPusher::IsConnected() const noexcept
 
 void ThreatIntelPusher::SetMaxBatchSize(uint32_t maxEntries) noexcept
 {
-    m_impl->m_maxBatchSize = std::min(maxEntries,
-        static_cast<uint32_t>(SHADOWSTRIKE_PUSH_MAX_BATCH_ENTRIES));
+    m_impl->m_maxBatchSize.store(
+        std::min(maxEntries, static_cast<uint32_t>(SHADOWSTRIKE_PUSH_MAX_BATCH_ENTRIES)),
+        std::memory_order_relaxed);
 }
 
 void ThreatIntelPusher::SetReplyTimeout(uint32_t timeoutMs) noexcept
 {
-    m_impl->m_replyTimeoutMs = timeoutMs;
+    m_impl->m_replyTimeoutMs.store(timeoutMs, std::memory_order_relaxed);
 }
 
 } // namespace Communication

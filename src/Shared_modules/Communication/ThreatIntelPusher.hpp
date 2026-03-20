@@ -159,7 +159,10 @@ struct ExclusionPushEntry {
 };
 
 /**
- * @brief Statistics for push operations.
+ * @brief Thread-safe statistics for push operations.
+ *
+ * All fields are atomic. Timestamps stored as epoch milliseconds
+ * (int64_t) to avoid data races on non-atomic time_point.
  */
 struct PusherStatistics {
     std::atomic<uint64_t> totalPushes{0};
@@ -168,8 +171,24 @@ struct PusherStatistics {
     std::atomic<uint64_t> totalEntriesPushed{0};
     std::atomic<uint64_t> totalBatchesSent{0};
     std::atomic<uint64_t> totalBytesSent{0};
-    std::chrono::system_clock::time_point lastPushTime;
-    std::chrono::system_clock::time_point lastSuccessTime;
+    std::atomic<uint64_t> oversizedEntriesSkipped{0};
+    std::atomic<int64_t>  lastPushTimeMs{0};     // epoch ms
+    std::atomic<int64_t>  lastSuccessTimeMs{0};  // epoch ms
+};
+
+/**
+ * @brief POD snapshot of PusherStatistics for thread-safe reading.
+ */
+struct PusherStatisticsSnapshot {
+    uint64_t totalPushes = 0;
+    uint64_t successfulPushes = 0;
+    uint64_t failedPushes = 0;
+    uint64_t totalEntriesPushed = 0;
+    uint64_t totalBatchesSent = 0;
+    uint64_t totalBytesSent = 0;
+    uint64_t oversizedEntriesSkipped = 0;
+    int64_t  lastPushTimeMs = 0;
+    int64_t  lastSuccessTimeMs = 0;
 };
 
 /**
@@ -197,7 +216,7 @@ public:
      * @param connection Active FilterConnection to the kernel driver.
      *                   Must remain valid for the lifetime of this pusher.
      */
-    explicit ThreatIntelPusher(FilterConnection& connection) noexcept;
+    explicit ThreatIntelPusher(FilterConnection& connection);
 
     ~ThreatIntelPusher();
 
@@ -219,6 +238,28 @@ public:
      * (4096) if the input exceeds that limit.
      */
     [[nodiscard]] PushResult PushHashes(std::span<const HashPushEntry> entries);
+
+    // =========================================================================
+    // Pattern Pushes (FilterMessageType_PushPatternDatabase)
+    // =========================================================================
+
+    /**
+     * @brief Push pattern entries to the kernel IOCMatcher.
+     * @param entries Pattern entries (same wire format as hashes).
+     * @return Push result.
+     */
+    [[nodiscard]] PushResult PushPatterns(std::span<const HashPushEntry> entries);
+
+    // =========================================================================
+    // Signature Pushes (FilterMessageType_PushSignatureDatabase)
+    // =========================================================================
+
+    /**
+     * @brief Push signature entries to the kernel IOCMatcher.
+     * @param entries Signature entries (same wire format as hashes).
+     * @return Push result.
+     */
+    [[nodiscard]] PushResult PushSignatures(std::span<const HashPushEntry> entries);
 
     // =========================================================================
     // Network IoC Pushes (FilterMessageType_PushNetworkIoC)
@@ -258,9 +299,9 @@ public:
     // =========================================================================
 
     /**
-     * @brief Get push operation statistics.
+     * @brief Get a thread-safe snapshot of push operation statistics.
      */
-    [[nodiscard]] const PusherStatistics& GetStatistics() const noexcept;
+    [[nodiscard]] PusherStatisticsSnapshot GetStatistics() const noexcept;
 
     /**
      * @brief Reset statistics counters.
