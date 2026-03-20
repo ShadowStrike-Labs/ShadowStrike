@@ -49,6 +49,11 @@
 #include "../Scripts/AMSIIntegration.hpp"
 #include "../RealTime/RealTimeProtection.hpp"
 #include "../Communication/IPCManager.hpp"
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/NotificationManager.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/ReportGenerator.hpp"
+#include "../Communication/ServiceCommunication.hpp"
 #include "../Update/UpdateManager.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 
@@ -145,6 +150,23 @@ public:
                 return false;
             }
 
+            // Initialize Communication subsystems (singletons — all depend on IPCManager)
+            if (!Communication::AlertSystem::Instance().Initialize(Communication::AlertConfiguration{})) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize AlertSystem");
+            }
+            if (!Communication::TelemetryCollector::Instance().Initialize()) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize TelemetryCollector");
+            }
+            if (!Communication::NotificationManager::Instance().Initialize()) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize NotificationManager");
+            }
+            if (!Communication::ReportGenerator::Instance().Initialize()) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize ReportGenerator");
+            }
+            if (!Communication::ServiceCommunication::Instance().Initialize()) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize ServiceCommunication");
+            }
+
             // 5. Initialize Update Manager
             if (!Update::UpdateManager::Instance().Initialize()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize UpdateManager");
@@ -174,6 +196,9 @@ public:
         RealTime::RealTimeProtection::Instance().Start();
         Communication::IPCManager::Instance().StartListening();
 
+        // Start Communication subsystems
+        Communication::ServiceCommunication::Instance().Start(true);
+
         // Register AMSI provider
         Scripts::AMSIIntegration::Instance().RegisterProvider();
 
@@ -188,6 +213,15 @@ public:
         SS_LOG_INFO(LOG_CATEGORY, L"Stopping services...");
 
         // Shutdown in reverse order
+
+        // Shutdown Communication subsystems first (they depend on IPCManager)
+        Communication::ServiceCommunication::Instance().Stop();
+        Communication::ServiceCommunication::Instance().Shutdown();
+        Communication::ReportGenerator::Instance().Shutdown();
+        Communication::NotificationManager::Instance().Shutdown();
+        Communication::TelemetryCollector::Instance().Shutdown();
+        Communication::AlertSystem::Instance().Shutdown();
+
         Communication::IPCManager::Instance().StopListening();
 
         Scripts::AMSIIntegration::Instance().UnregisterProvider();

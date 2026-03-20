@@ -52,6 +52,19 @@
 #include "ZeroHourProtection.hpp"
 
 // ============================================================================
+// ANTI-EVASION DETECTOR INCLUDES
+// ============================================================================
+#include "../AntiEvasion/DebuggerEvasionDetector.hpp"
+#include "../AntiEvasion/VMEvasionDetector.hpp"
+#include "../AntiEvasion/SandboxEvasionDetector.hpp"
+#include "../AntiEvasion/ProcessEvasionDetector.hpp"
+#include "../AntiEvasion/metamorphic_polymorphicdetector.hpp"
+#include "../AntiEvasion/TimeBasedEvasionDetector.hpp"
+#include "../AntiEvasion/NetworkBasedEvasionDetector.hpp"
+#include "../AntiEvasion/EnvironmentEvasionDetector.hpp"
+#include "../AntiEvasion/PackerDetector.hpp"
+
+// ============================================================================
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
 #include "../Communication/IPCManager.hpp"
@@ -208,12 +221,20 @@ public:
     std::deque<ThreatEvent> m_recentThreats;
     static constexpr size_t MAX_RECENT_THREATS = 1000;
 
-    // Anti-Evasion Detectors
+    // Anti-Evasion Detectors (non-singleton, owned by RTP)
     std::unique_ptr<ShadowStrike::AntiEvasion::DebuggerEvasionDetector> m_debuggerDetector;
     std::unique_ptr<ShadowStrike::AntiEvasion::VMEvasionDetector> m_vmDetector;
-    std::unique_ptr<ShadowStrike::AntiEvasion::SandboxEvasionDetector> m_sandboxDetector;
     std::unique_ptr<ShadowStrike::AntiEvasion::ProcessEvasionDetector> m_processDetector;
     std::unique_ptr<ShadowStrike::AntiEvasion::MetamorphicDetector> m_metamorphicDetector;
+    std::unique_ptr<ShadowStrike::AntiEvasion::NetworkBasedEvasionDetector> m_networkDetector;
+    std::unique_ptr<ShadowStrike::AntiEvasion::EnvironmentEvasionDetector> m_environmentDetector;
+    std::unique_ptr<ShadowStrike::AntiEvasion::PackerDetector> m_packerDetector;
+
+    // Anti-Evasion Detectors (singletons — accessed via Instance(), not owned)
+    // SandboxEvasionDetector: system-level sandbox fingerprinting (startup + periodic)
+    // TimeBasedEvasionDetector: per-process timing evasion analysis
+    std::atomic<bool> m_sandboxDetectorInitialized{ false };
+    std::atomic<bool> m_timeBasedDetectorInitialized{ false };
 
     // Component Status
     std::array<ComponentStatus, static_cast<size_t>(ComponentType::COMPONENT_COUNT)> m_componentStatus;
@@ -242,15 +263,17 @@ public:
         m_stats.lastReset = Now();
         m_protectionStatus.startTime = Now();
         m_protectionStatus.lastUpdate = Now();
-        // Initialize Anti-Evasion Detectors
+        // Create Anti-Evasion Detectors (non-singleton, owned)
         try {
             m_debuggerDetector = std::make_unique<ShadowStrike::AntiEvasion::DebuggerEvasionDetector>();
             m_vmDetector = std::make_unique<ShadowStrike::AntiEvasion::VMEvasionDetector>();
-            m_sandboxDetector = std::make_unique<ShadowStrike::AntiEvasion::SandboxEvasionDetector>();
             m_processDetector = std::make_unique<ShadowStrike::AntiEvasion::ProcessEvasionDetector>();
             m_metamorphicDetector = std::make_unique<ShadowStrike::AntiEvasion::MetamorphicDetector>();
+            m_networkDetector = std::make_unique<ShadowStrike::AntiEvasion::NetworkBasedEvasionDetector>();
+            m_environmentDetector = std::make_unique<ShadowStrike::AntiEvasion::EnvironmentEvasionDetector>();
+            m_packerDetector = std::make_unique<ShadowStrike::AntiEvasion::PackerDetector>();
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"Failed to initialize Anti-Evasion detectors: {}", Utils::StringUtils::ToWideString(e.what()));
+            Utils::Logger::Error(L"Failed to create Anti-Evasion detectors: {}", Utils::StringUtils::ToWideString(e.what()));
         }
 
         // Initialize component status array
@@ -322,16 +345,9 @@ public:
             // 7. Update protection status
             m_protectionStatus.isProtected = true;
             m_protectionStatus.lastUpdate = Now();
-        // Initialize Anti-Evasion Detectors
-        try {
-            m_debuggerDetector = std::make_unique<ShadowStrike::AntiEvasion::DebuggerEvasionDetector>();
-            m_vmDetector = std::make_unique<ShadowStrike::AntiEvasion::VMEvasionDetector>();
-            m_sandboxDetector = std::make_unique<ShadowStrike::AntiEvasion::SandboxEvasionDetector>();
-            m_processDetector = std::make_unique<ShadowStrike::AntiEvasion::ProcessEvasionDetector>();
-            m_metamorphicDetector = std::make_unique<ShadowStrike::AntiEvasion::MetamorphicDetector>();
-        } catch (const std::exception& e) {
-            Utils::Logger::Error(L"Failed to initialize Anti-Evasion detectors: {}", Utils::StringUtils::ToWideString(e.what()));
-        }
+
+            // 8. Initialize Anti-Evasion Detectors
+            InitializeAntiEvasionDetectors();
 
             SetState(ProtectionState::ACTIVE);
             Utils::Logger::Info(L"RealTimeProtection: Started successfully");
@@ -388,16 +404,9 @@ public:
 
         m_protectionStatus.isProtected = false;
         m_protectionStatus.lastUpdate = Now();
-        // Initialize Anti-Evasion Detectors
-        try {
-            m_debuggerDetector = std::make_unique<ShadowStrike::AntiEvasion::DebuggerEvasionDetector>();
-            m_vmDetector = std::make_unique<ShadowStrike::AntiEvasion::VMEvasionDetector>();
-            m_sandboxDetector = std::make_unique<ShadowStrike::AntiEvasion::SandboxEvasionDetector>();
-            m_processDetector = std::make_unique<ShadowStrike::AntiEvasion::ProcessEvasionDetector>();
-            m_metamorphicDetector = std::make_unique<ShadowStrike::AntiEvasion::MetamorphicDetector>();
-        } catch (const std::exception& e) {
-            Utils::Logger::Error(L"Failed to initialize Anti-Evasion detectors: {}", Utils::StringUtils::ToWideString(e.what()));
-        }
+
+        // 6. Shutdown Anti-Evasion Detectors
+        ShutdownAntiEvasionDetectors();
 
         SetState(ProtectionState::UNINITIALIZED);
         Utils::Logger::Info(L"RealTimeProtection: Stopped");
@@ -525,6 +534,108 @@ public:
         } catch (...) {
             return false;
         }
+    }
+
+    // =========================================================================
+    // ANTI-EVASION DETECTOR LIFECYCLE
+    // =========================================================================
+
+    void InitializeAntiEvasionDetectors() {
+        Utils::Logger::Info(L"RealTimeProtection: Initializing Anti-Evasion detectors...");
+
+        // Non-singleton detectors: Initialize() on owned instances
+        if (m_debuggerDetector) {
+            if (!m_debuggerDetector->Initialize()) {
+                Utils::Logger::Warn(L"RealTimeProtection: DebuggerEvasionDetector Initialize failed");
+            }
+        }
+        if (m_processDetector) {
+            if (!m_processDetector->Initialize()) {
+                Utils::Logger::Warn(L"RealTimeProtection: ProcessEvasionDetector Initialize failed");
+            }
+        }
+        if (m_metamorphicDetector) {
+            if (!m_metamorphicDetector->Initialize()) {
+                Utils::Logger::Warn(L"RealTimeProtection: MetamorphicDetector Initialize failed");
+            }
+        }
+        if (m_networkDetector) {
+            if (!m_networkDetector->Initialize()) {
+                Utils::Logger::Warn(L"RealTimeProtection: NetworkBasedEvasionDetector Initialize failed");
+            }
+        }
+        if (m_environmentDetector) {
+            if (!m_environmentDetector->Initialize()) {
+                Utils::Logger::Warn(L"RealTimeProtection: EnvironmentEvasionDetector Initialize failed");
+            }
+        }
+        if (m_packerDetector) {
+            if (!m_packerDetector->Initialize()) {
+                Utils::Logger::Warn(L"RealTimeProtection: PackerDetector Initialize failed");
+            }
+        }
+        // VMEvasionDetector has no Initialize() — ready on construction
+
+        // Singleton detectors: Initialize via Instance()
+        try {
+            auto& sandbox = ShadowStrike::AntiEvasion::SandboxEvasionDetector::Instance();
+            if (sandbox.Initialize(m_threadPool)) {
+                m_sandboxDetectorInitialized = true;
+                // Run initial system-level sandbox analysis at startup
+                auto hwProfile = sandbox.AnalyzeHardware();
+                auto envResult = sandbox.AnalyzeEnvironment();
+                if (hwProfile.isSandboxLike || envResult.isSandboxLikely) {
+                    Utils::Logger::Warn(L"RealTimeProtection: Sandbox environment detected — "
+                        L"endpoint may be under malware analysis");
+                }
+            } else {
+                Utils::Logger::Warn(L"RealTimeProtection: SandboxEvasionDetector Initialize failed");
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error(L"RealTimeProtection: SandboxEvasionDetector exception: {}",
+                Utils::StringUtils::ToWideString(e.what()));
+        }
+
+        try {
+            auto& timeBased = ShadowStrike::AntiEvasion::TimeBasedEvasionDetector::Instance();
+            if (timeBased.Initialize(m_threadPool)) {
+                m_timeBasedDetectorInitialized = true;
+            } else {
+                Utils::Logger::Warn(L"RealTimeProtection: TimeBasedEvasionDetector Initialize failed");
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error(L"RealTimeProtection: TimeBasedEvasionDetector exception: {}",
+                Utils::StringUtils::ToWideString(e.what()));
+        }
+
+        Utils::Logger::Info(L"RealTimeProtection: Anti-Evasion detectors initialized");
+    }
+
+    void ShutdownAntiEvasionDetectors() {
+        Utils::Logger::Info(L"RealTimeProtection: Shutting down Anti-Evasion detectors...");
+
+        // Singleton detectors: Shutdown via Instance()
+        if (m_timeBasedDetectorInitialized.exchange(false)) {
+            try {
+                ShadowStrike::AntiEvasion::TimeBasedEvasionDetector::Instance().Shutdown();
+            } catch (...) {}
+        }
+        if (m_sandboxDetectorInitialized.exchange(false)) {
+            try {
+                ShadowStrike::AntiEvasion::SandboxEvasionDetector::Instance().Shutdown();
+            } catch (...) {}
+        }
+
+        // Non-singleton detectors: Shutdown then release
+        if (m_packerDetector) { m_packerDetector->Shutdown(); m_packerDetector.reset(); }
+        if (m_environmentDetector) { m_environmentDetector->Shutdown(); m_environmentDetector.reset(); }
+        if (m_networkDetector) { m_networkDetector->Shutdown(); m_networkDetector.reset(); }
+        if (m_metamorphicDetector) { m_metamorphicDetector->Shutdown(); m_metamorphicDetector.reset(); }
+        if (m_processDetector) { m_processDetector->Shutdown(); m_processDetector.reset(); }
+        if (m_debuggerDetector) { m_debuggerDetector->Shutdown(); m_debuggerDetector.reset(); }
+        m_vmDetector.reset();
+
+        Utils::Logger::Info(L"RealTimeProtection: Anti-Evasion detectors shut down");
     }
 
     void StartComponents() {
@@ -718,6 +829,19 @@ public:
             }
         }
 
+        // Anti-Evasion: Packer Detection (packed executables are suspicious — feed into scan context)
+        bool fileIsPacked = false;
+        double packingConfidence = 0.0;
+        if (m_packerDetector) {
+            auto packResult = m_packerDetector->AnalyzeFile(filePath);
+            if (packResult.isPacked) {
+                fileIsPacked = true;
+                packingConfidence = packResult.packingConfidence;
+                Utils::Logger::Info(L"RealTimeProtection: Packed file detected: {} (packer: {}, confidence: {:.1f}%)",
+                    filePath, packResult.packerName, packResult.packingConfidence * 100.0);
+            }
+        }
+
         // 3. Prepare Scan Context
         Core::Engine::ScanContext context;
         context.type = Core::Engine::ScanType::RealTime;
@@ -852,9 +976,9 @@ public:
 
             // 2. VM Evasion
             if (!evasionDetected && m_vmDetector) {
-                ShadowStrike::AntiEvasion::VMEvasionResult result;
-                if (m_vmDetector->AnalyzeProcessAntiVMBehavior(req.processId, result)) {
-                    if (result.isEvasive) {
+                ShadowStrike::AntiEvasion::ProcessVMEvasionResult vmResult;
+                if (m_vmDetector->AnalyzeProcessAntiVMBehavior(req.processId, vmResult)) {
+                    if (vmResult.hasAntiVMBehavior) {
                         evasionDetected = true;
                         detectionSource = L"VM Evasion";
                     }
@@ -867,6 +991,36 @@ public:
                 if (result.isEvasive) {
                     evasionDetected = true;
                     detectionSource = L"Process Evasion";
+                }
+            }
+
+            // 4. Time-Based Evasion (singleton — RDTSC abuse, sleep acceleration, timing anti-debug)
+            if (!evasionDetected && m_timeBasedDetectorInitialized) {
+                try {
+                    auto result = ShadowStrike::AntiEvasion::TimeBasedEvasionDetector::Instance()
+                        .AnalyzeProcess(req.processId);
+                    if (result.isEvasive) {
+                        evasionDetected = true;
+                        detectionSource = L"Time-Based Evasion";
+                    }
+                } catch (...) {}
+            }
+
+            // 5. Network-Based Evasion (DGA detection, DNS tunneling, C2 beaconing, fast-flux)
+            if (!evasionDetected && m_networkDetector) {
+                auto result = m_networkDetector->AnalyzeProcess(req.processId);
+                if (result.isEvasive) {
+                    evasionDetected = true;
+                    detectionSource = L"Network-Based Evasion";
+                }
+            }
+
+            // 6. Environment Evasion (environment fingerprinting, anti-analysis imports)
+            if (!evasionDetected && m_environmentDetector) {
+                auto result = m_environmentDetector->AnalyzeProcess(req.processId);
+                if (result.isEvasive) {
+                    evasionDetected = true;
+                    detectionSource = L"Environment Evasion";
                 }
             }
 
@@ -1307,16 +1461,6 @@ public:
         // Update protection status
         m_protectionStatus.hasErrors = !allHealthy;
         m_protectionStatus.lastUpdate = Now();
-        // Initialize Anti-Evasion Detectors
-        try {
-            m_debuggerDetector = std::make_unique<ShadowStrike::AntiEvasion::DebuggerEvasionDetector>();
-            m_vmDetector = std::make_unique<ShadowStrike::AntiEvasion::VMEvasionDetector>();
-            m_sandboxDetector = std::make_unique<ShadowStrike::AntiEvasion::SandboxEvasionDetector>();
-            m_processDetector = std::make_unique<ShadowStrike::AntiEvasion::ProcessEvasionDetector>();
-            m_metamorphicDetector = std::make_unique<ShadowStrike::AntiEvasion::MetamorphicDetector>();
-        } catch (const std::exception& e) {
-            Utils::Logger::Error(L"Failed to initialize Anti-Evasion detectors: {}", Utils::StringUtils::ToWideString(e.what()));
-        }
 
         // Check if we should go to degraded mode
         if (!allHealthy && m_state == ProtectionState::ACTIVE) {
