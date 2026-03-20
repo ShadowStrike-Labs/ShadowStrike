@@ -480,7 +480,7 @@ namespace AsmFallback {
         }
         
         uint64_t end = __rdtsc();
-        return (end - start / 100 > 500) ? 1 : 0;
+        return ((end - start) / 100 > 500) ? 1 : 0;
     }
 
     // Fallback: MeasureDebugInstructionTiming
@@ -606,17 +606,18 @@ namespace AsmFallback {
 
     // Fallback: MeasureCodeIntegrity
     extern "C" uint64_t Fallback_MeasureCodeIntegrity(const void* start, size_t size) noexcept {
-        if (!start || size == 0) return 0;
+        if (!start || size < 8) return 0;
         
         uint64_t total = 0;
         const uint8_t* ptr = static_cast<const uint8_t*>(start);
+        const size_t alignedSize = size & ~static_cast<size_t>(7); // Round down to 8-byte boundary
         
         __try {
             for (int iter = 0; iter < 10; ++iter) {
                 uint64_t startTime = __rdtsc();
                 
                 volatile uint64_t checksum = 0;
-                for (size_t i = 0; i < size; i += 8) {
+                for (size_t i = 0; i < alignedSize; i += 8) {
                     checksum ^= *reinterpret_cast<const uint64_t*>(ptr + i);
                 }
                 
@@ -853,13 +854,16 @@ namespace ShadowStrike::AntiEvasion {
         // Known syscall numbers for validation
         std::unordered_map<std::string, uint32_t> m_syscallNumbers;
 
+        // Track whether we own the NTDLL reference (LoadLibrary vs GetModuleHandle)
+        bool m_ownsNtDll = false;
+
         Impl() = default;
 
         ~Impl() {
-            if (m_hNtDll) {
+            if (m_hNtDll && m_ownsNtDll) {
                 FreeLibrary(m_hNtDll);
-                m_hNtDll = nullptr;
             }
+            m_hNtDll = nullptr;
         }
 
         bool Initialize(Error* err) noexcept {
@@ -869,9 +873,11 @@ namespace ShadowStrike::AntiEvasion {
                 SS_LOG_INFO(LOG_CATEGORY, L"DebuggerEvasionDetector: Initializing...");
 
                 // Load NTDLL functions
+                // GetModuleHandle does NOT increment refcount — only FreeLibrary if we called LoadLibrary
                 m_hNtDll = GetModuleHandleW(L"ntdll.dll");
                 if (!m_hNtDll) {
                     m_hNtDll = LoadLibraryW(L"ntdll.dll");
+                    m_ownsNtDll = (m_hNtDll != nullptr);
                 }
                 if (!m_hNtDll) {
                     if (err) *err = Error::FromWin32(GetLastError(), L"Failed to load ntdll.dll");
@@ -2806,20 +2812,21 @@ namespace ShadowStrike::AntiEvasion {
         bool hiddenFound = false;
 
         try {
-            // 1. Snapshot Method
+            // 1. Snapshot Method (RAII handle management)
             std::unordered_set<uint32_t> snapshotThreads;
-            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-            if (hSnapshot != INVALID_HANDLE_VALUE) {
-                THREADENTRY32 te32 = {};
-                te32.dwSize = sizeof(te32);
-                if (Thread32First(hSnapshot, &te32)) {
-                    do {
-                        if (te32.th32OwnerProcessID == processId) {
-                            snapshotThreads.insert(te32.th32ThreadID);
-                        }
-                    } while (Thread32Next(hSnapshot, &te32));
+            {
+                SnapshotHandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+                if (hSnapshot.IsValid()) {
+                    THREADENTRY32 te32 = {};
+                    te32.dwSize = sizeof(te32);
+                    if (Thread32First(hSnapshot.Get(), &te32)) {
+                        do {
+                            if (te32.th32OwnerProcessID == processId) {
+                                snapshotThreads.insert(te32.th32ThreadID);
+                            }
+                        } while (Thread32Next(hSnapshot.Get(), &te32));
+                    }
                 }
-                CloseHandle(hSnapshot);
             }
 
             // 2. Kernel Query Method (SystemProcessInformation)
@@ -2854,11 +2861,11 @@ namespace ShadowStrike::AntiEvasion {
 
                             // Check ThreadHideFromDebugger using NtQueryInformationThread
                             if (m_impl->m_NtQueryInformationThread) {
-                                HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+                                ProcessHandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid));
                                 if (hThread) {
                                     BOOLEAN hideFromDebugger = FALSE;
                                     NTSTATUS tStatus = m_impl->m_NtQueryInformationThread(
-                                        hThread, ThreadHideFromDebugger,
+                                        hThread.Get(), ThreadHideFromDebugger,
                                         &hideFromDebugger, sizeof(hideFromDebugger), NULL
                                     );
 
@@ -2872,7 +2879,6 @@ namespace ShadowStrike::AntiEvasion {
                                         tech.threadId = tid;
                                         outDetections.push_back(tech);
                                     }
-                                    CloseHandle(hThread);
                                 }
                             }
                         }
@@ -3846,12 +3852,25 @@ namespace ShadowStrike::AntiEvasion {
                 return;
             }
 
+            // Bounds check: ensure e_lfanew + NT headers fit in buffer
+            if (dosHeader->e_lfanew < 0 ||
+                static_cast<size_t>(dosHeader->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > bytesRead) {
+                return;
+            }
+
             auto* ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS64*>(headerBuffer + dosHeader->e_lfanew);
             if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
                 return;
             }
 
-            DWORD entryPointRva = ntHeaders->OptionalHeader.AddressOfEntryPoint;
+            // Use correct header size based on target bitness
+            DWORD entryPointRva = 0;
+            if (result.is64Bit) {
+                entryPointRva = ntHeaders->OptionalHeader.AddressOfEntryPoint;
+            } else {
+                auto* ntHeaders32 = reinterpret_cast<IMAGE_NT_HEADERS32*>(headerBuffer + dosHeader->e_lfanew);
+                entryPointRva = ntHeaders32->OptionalHeader.AddressOfEntryPoint;
+            }
             if (entryPointRva == 0) {
                 return;
             }
@@ -4675,7 +4694,7 @@ namespace ShadowStrike::AntiEvasion {
         return m_impl->m_resultCache.size();
     }
 
-    const DebuggerEvasionDetector::Statistics& DebuggerEvasionDetector::GetStatistics() const noexcept {
+    const DebuggerEvasionDetector::Statistics DebuggerEvasionDetector::GetStatistics() const noexcept {
         return m_impl->m_stats;
     }
 
@@ -4928,11 +4947,19 @@ namespace ShadowStrike::AntiEvasion {
     ) noexcept {
         std::vector<DWORD> pids(4096);
         DWORD bytesReturned = 0;
-        EnumProcesses(pids.data(), sizeof(DWORD) * 4096, &bytesReturned);
+        if (!EnumProcesses(pids.data(), static_cast<DWORD>(sizeof(DWORD) * pids.size()), &bytesReturned)) {
+            return {};
+        }
         DWORD count = bytesReturned / sizeof(DWORD);
 
         std::vector<Utils::ProcessUtils::ProcessId> pidList;
-        for (size_t i = 0; i < count; i++) pidList.push_back(pids[i]);
+        pidList.reserve(count);
+        for (size_t i = 0; i < count; i++) {
+            // Skip System Idle (0) and System (4) processes
+            if (pids[i] > 4) {
+                pidList.push_back(pids[i]);
+            }
+        }
 
         return AnalyzeProcesses(pidList, config, progressCallback, err);
     }
@@ -5029,6 +5056,12 @@ namespace ShadowStrike::AntiEvasion {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (hSnapshot == INVALID_HANDLE_VALUE) return false;
 
+        // RAII guard to prevent handle leak
+        struct SnapGuard {
+            HANDLE h;
+            ~SnapGuard() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+        } guard{ hSnapshot };
+
         THREADENTRY32 te32 = {};
         te32.dwSize = sizeof(te32);
 
@@ -5039,7 +5072,6 @@ namespace ShadowStrike::AntiEvasion {
                 }
             } while (Thread32Next(hSnapshot, &te32));
         }
-        CloseHandle(hSnapshot);
         return !threadIds.empty();
     }
 
@@ -5051,13 +5083,18 @@ namespace ShadowStrike::AntiEvasion {
         HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, threadId);
         if (!hThread) return false;
 
+        // RAII guard prevents handle leak if SuspendThread/GetThreadContext/ResumeThread fail
+        struct ThreadGuard {
+            HANDLE h;
+            ~ThreadGuard() { if (h) CloseHandle(h); }
+        } guard{ hThread };
+
         bool result = false;
         if (SuspendThread(hThread) != (DWORD)-1) {
             context.ContextFlags = contextFlags;
             result = ::GetThreadContext(hThread, &context);
             ResumeThread(hThread);
         }
-        CloseHandle(hThread);
         return result;
     }
 

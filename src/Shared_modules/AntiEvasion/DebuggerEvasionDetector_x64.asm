@@ -1214,9 +1214,14 @@ MeasureCodeIntegrity PROC
     jz      integrity_invalid
     test    rdx, rdx
     jz      integrity_invalid
+    cmp     rdx, 8
+    jb      integrity_invalid       ; Size must be >= 8 to read QWORD
     
     mov     rdi, rcx            ; Code address
     mov     rsi, rdx            ; Size
+    and     rsi, 0FFFFFFFFFFFFFFF8h ; Round down to 8-byte boundary
+    test    rsi, rsi
+    jz      integrity_invalid
     xor     r13, r13            ; Accumulated timing
     mov     ebx, 10             ; 10 iterations
     
@@ -1228,15 +1233,19 @@ integrity_loop:
     or      rax, rdx
     mov     r12, rax
     
-    ; Read through the code region
+    ; Read through the code region (rsi is already 8-byte aligned)
     mov     rcx, rsi
     mov     rax, rdi
     
 integrity_read_loop:
+    cmp     rcx, 8
+    jb      integrity_read_done     ; Stop when less than 8 bytes remain
     mov     r8, [rax]           ; Read 8 bytes
     add     rax, 8
     sub     rcx, 8
-    ja      integrity_read_loop
+    jmp     integrity_read_loop
+    
+integrity_read_done:
     
     rdtscp
     shl     rdx, 32

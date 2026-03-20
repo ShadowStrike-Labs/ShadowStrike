@@ -1879,7 +1879,7 @@ namespace ShadowStrike {
             /**
              * @brief Get detector statistics
              */
-            [[nodiscard]] const Statistics& GetStatistics() const noexcept;
+            [[nodiscard]] const Statistics GetStatistics() const noexcept;
 
             /**
              * @brief Reset statistics
