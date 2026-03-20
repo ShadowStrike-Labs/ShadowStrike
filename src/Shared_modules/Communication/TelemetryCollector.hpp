@@ -236,9 +236,9 @@ enum class SubmissionStatus : uint8_t {
 };
 
 /**
- * @brief Module status
+ * @brief Telemetry module status
  */
-enum class ModuleStatus : uint8_t {
+enum class TelemetryModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
     Running         = 2,
@@ -449,7 +449,26 @@ struct TelemetryBatch {
 };
 
 /**
- * @brief Statistics
+ * @brief Statistics snapshot (POD, copyable)
+ */
+struct TelemetryStatisticsSnapshot {
+    uint64_t eventsRecorded = 0;
+    uint64_t eventsSubmitted = 0;
+    uint64_t eventsFailed = 0;
+    uint64_t eventsDropped = 0;
+    uint64_t batchesSubmitted = 0;
+    uint64_t batchesFailed = 0;
+    uint64_t bytesSubmitted = 0;
+    uint64_t retryAttempts = 0;
+    uint64_t anonymizationTime = 0;
+    std::array<uint64_t, 16> byEventType{};
+    int64_t uptimeSeconds = 0;
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Statistics (non-copyable, atomic counters)
  */
 struct TelemetryStatistics {
     std::atomic<uint64_t> eventsRecorded{0};
@@ -465,7 +484,7 @@ struct TelemetryStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
-    [[nodiscard]] std::string ToJson() const;
+    [[nodiscard]] TelemetryStatisticsSnapshot TakeSnapshot() const noexcept;
 };
 
 /**
@@ -527,7 +546,7 @@ struct TelemetryConfiguration {
 using EventCallback = std::function<void(const TelemetryEvent&)>;
 using BatchCallback = std::function<void(const TelemetryBatch&)>;
 using ConsentCallback = std::function<bool(ConsentLevel)>;
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+using TelemetryErrorCallback = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
 // TELEMETRY COLLECTOR CLASS
@@ -554,7 +573,7 @@ public:
     [[nodiscard]] bool Initialize(const TelemetryConfiguration& config = {});
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
-    [[nodiscard]] ModuleStatus GetStatus() const noexcept;
+    [[nodiscard]] TelemetryModuleStatus GetStatus() const noexcept;
     
     [[nodiscard]] bool UpdateConfiguration(const TelemetryConfiguration& config);
     [[nodiscard]] TelemetryConfiguration GetConfiguration() const;
@@ -662,14 +681,14 @@ public:
     void RegisterEventCallback(EventCallback callback);
     void RegisterBatchCallback(BatchCallback callback);
     void RegisterConsentCallback(ConsentCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
+    void RegisterErrorCallback(TelemetryErrorCallback callback);
     void UnregisterCallbacks();
 
     // ========================================================================
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] TelemetryStatistics GetStatistics() const;
+    [[nodiscard]] TelemetryStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
