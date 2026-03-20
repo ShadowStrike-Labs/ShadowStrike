@@ -1346,7 +1346,7 @@ namespace ShadowStrike::AntiEvasion {
         try {
             // Check if string is all hexadecimal
             bool allHex = std::all_of(name.begin(), name.end(), [](wchar_t c) {
-                return std::isxdigit(static_cast<unsigned char>(c));
+                return std::iswxdigit(c) != 0;
                 });
 
             if (!allHex) {
@@ -2269,10 +2269,16 @@ namespace ShadowStrike::AntiEvasion {
         result.totalDetections++;
         m_impl->m_stats.totalDetections++;
 
-        // Invoke callback if set
-        if (m_impl->m_detectionCallback) {
+        // Snapshot callback under shared lock, invoke outside lock to prevent
+        // data race with SetDetectionCallback/ClearDetectionCallback (unique_lock writers)
+        std::function<void(uint32_t, const EnvironmentDetectedTechnique&)> callbackSnapshot;
+        {
+            std::shared_lock lock(m_impl->m_mutex);
+            callbackSnapshot = m_impl->m_detectionCallback;
+        }
+        if (callbackSnapshot) {
             try {
-                m_impl->m_detectionCallback(result.targetPid, detection);
+                callbackSnapshot(result.targetPid, detection);
             }
             catch (...) {
                 // Swallow callback exceptions
@@ -3585,6 +3591,7 @@ namespace ShadowStrike::AntiEvasion {
                 }
                 return false;
             }
+            SnapshotHandleGuard snapshotGuard(hSnapshot);
 
             PROCESSENTRY32W pe = {};
             pe.dwSize = sizeof(pe);
@@ -3648,8 +3655,6 @@ namespace ShadowStrike::AntiEvasion {
 
                 } while (Process32NextW(hSnapshot, &pe));
             }
-
-            CloseHandle(hSnapshot);
 
             // Generate detections based on findings
             
@@ -4812,9 +4817,10 @@ namespace ShadowStrike::AntiEvasion {
             auto result = AnalyzeProcess(pid, config, err);
 
             if (result.analysisComplete) {
+                const bool evasive = result.isEvasive;
                 batchResult.results.push_back(std::move(result));
 
-                if (result.isEvasive) {
+                if (evasive) {
                     batchResult.evasiveProcesses++;
                 }
             }
@@ -4840,6 +4846,7 @@ namespace ShadowStrike::AntiEvasion {
 
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnapshot != INVALID_HANDLE_VALUE) {
+            SnapshotHandleGuard snapshotGuard(hSnapshot);
             PROCESSENTRY32W pe = {};
             pe.dwSize = sizeof(pe);
 
@@ -4848,8 +4855,6 @@ namespace ShadowStrike::AntiEvasion {
                     allPids.push_back(pe.th32ProcessID);
                 } while (Process32NextW(hSnapshot, &pe));
             }
-
-            CloseHandle(hSnapshot);
         }
 
         return AnalyzeProcesses(allPids, config, progressCallback, err);
