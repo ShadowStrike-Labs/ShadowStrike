@@ -61,6 +61,7 @@
 #include <queue>
 #include <stack>
 #include <numeric>
+#include <cwctype>
 
 #pragma comment(lib, "Psapi.lib")
 
@@ -2103,7 +2104,33 @@ void MetamorphicDetector::AnalyzeFileInternal(
                     AddDetection(result, std::move(detection));
                 }
             }
+
+            // Deep technique analysis — complementary to Impl:: quick checks above
+            if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanMetamorphic)) {
+                AnalyzeMetamorphicTechniques(codeBuffer, codeSize, result);
+            }
+            if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanPolymorphic)) {
+                AnalyzePolymorphicTechniques(codeBuffer, codeSize, result);
+            }
+            if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanSelfModifying)) {
+                AnalyzeSelfModifyingTechniques(codeBuffer, codeSize, result);
+            }
+            if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanObfuscation)) {
+                AnalyzeObfuscationTechniques(codeBuffer, codeSize, result);
+            }
+            if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanVMProtection)) {
+                AnalyzeVMProtection(codeBuffer, codeSize, result);
+            }
         }
+    }
+
+    if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanPacking) && isPE) {
+        AnalyzePacking(buffer, size, result);
+    }
+
+    if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanSimilarity) ||
+        HasFlag(config.flags, MetamorphicAnalysisFlags::EnableFuzzyHashing)) {
+        PerformSimilarityAnalysis(filePath, result);
     }
 
     result.totalDetections = static_cast<uint32_t>(result.detectedTechniques.size());
@@ -2295,7 +2322,7 @@ MetamorphicBatchResult MetamorphicDetector::AnalyzeDirectory(
             size_t dotPos = fileName.rfind(L'.');
             if (dotPos != std::wstring::npos) {
                 std::wstring ext = fileName.substr(dotPos);
-                for (auto& c : ext) c = static_cast<wchar_t>(tolower(c));
+                for (auto& c : ext) c = std::towlower(c);
 
                 if (ext == L".exe" || ext == L".dll" || ext == L".sys" || ext == L".scr" || ext == L".ocx") {
                     files.push_back(directoryPath + L"\\" + findData.cFileName);
@@ -2323,7 +2350,7 @@ MetamorphicBatchResult MetamorphicDetector::AnalyzeDirectory(
                     size_t dotPos = fileName.rfind(L'.');
                     if (dotPos != std::wstring::npos) {
                         std::wstring ext = fileName.substr(dotPos);
-                        for (auto& c : ext) c = static_cast<wchar_t>(tolower(c));
+                        for (auto& c : ext) c = std::towlower(c);
                         if (ext == L".exe" || ext == L".dll" || ext == L".sys") {
                             files.push_back(subDir + L"\\" + findData.cFileName);
                         }
@@ -2771,6 +2798,8 @@ bool MetamorphicDetector::MatchKnownFamilies(
 
         // Search for patterns in buffer
         for (const auto& pat : PATTERNS) {
+            if (size < pat.patternLen) continue;
+
             // Simple pattern search (production would use Aho-Corasick from PatternStore)
             const uint8_t* haystack = buffer;
             const uint8_t* haystackEnd = buffer + size - pat.patternLen;
@@ -2797,19 +2826,22 @@ bool MetamorphicDetector::MatchKnownFamilies(
         // Common in polymorphic/metamorphic code
         static constexpr uint8_t GETPC_CALL[] = { 0xE8, 0x00, 0x00, 0x00, 0x00 }; // call $+5
         
-        const uint8_t* p = buffer;
-        const uint8_t* pEnd = buffer + size - 6;
         int getPcCount = 0;
 
-        while (p < pEnd) {
-            if (std::memcmp(p, GETPC_CALL, sizeof(GETPC_CALL)) == 0) {
-                // Check if followed by POP
-                uint8_t nextByte = p[5];
-                if (nextByte >= 0x58 && nextByte <= 0x5F) { // pop eax-edi
-                    ++getPcCount;
+        if (size >= 6) {
+            const uint8_t* p = buffer;
+            const uint8_t* pEnd = buffer + size - 6;
+
+            while (p < pEnd) {
+                if (std::memcmp(p, GETPC_CALL, sizeof(GETPC_CALL)) == 0) {
+                    // Check if followed by POP
+                    uint8_t nextByte = p[5];
+                    if (nextByte >= 0x58 && nextByte <= 0x5F) { // pop eax-edi
+                        ++getPcCount;
+                    }
                 }
+                ++p;
             }
-            ++p;
         }
 
         if (getPcCount >= 2) {
