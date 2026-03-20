@@ -1273,10 +1273,23 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
         case FilterMessageType_ProcessNotify: {
             if (processHandler) {
                 if (pAppHeader->DataSize < sizeof(ProcessNotifyRequest)) {
-                    Utils::Logger::Error("[IPCManager] Truncated ProcessNotify payload");
+                    Utils::Logger::Error("[IPCManager] Truncated ProcessNotify payload: {} < {}",
+                                         pAppHeader->DataSize, sizeof(ProcessNotifyRequest));
                     break;
                 }
                 auto* req = reinterpret_cast<ProcessNotifyRequest*>(pPayload);
+
+                // Validate variable-length bounds: imagePathLength + commandLineLength must fit
+                uint32_t varOffset = static_cast<uint32_t>(sizeof(ProcessNotifyRequest));
+                uint32_t remaining = pAppHeader->DataSize - varOffset;
+                if (req->imagePathLength > remaining ||
+                    req->commandLineLength > (remaining - req->imagePathLength)) {
+                    Utils::Logger::Error("[IPCManager] ProcessNotify variable data exceeds buffer: "
+                                         "imgPath={} cmdLine={} available={}",
+                                         req->imagePathLength, req->commandLineLength, remaining);
+                    break;
+                }
+
                 try {
                     verdict = processHandler(*req);
                 } catch (const std::exception& e) {
@@ -1286,8 +1299,316 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
             break;
         }
 
+        // =====================================================================
+        // IMAGE LOAD NOTIFICATIONS (DLL/driver injection detection)
+        // =====================================================================
+        case FilterMessageType_ImageLoad: {
+            if (imageLoadHandler) {
+                if (pAppHeader->DataSize < sizeof(ImageLoadRequest)) {
+                    Utils::Logger::Error("[IPCManager] Truncated ImageLoad payload: {} < {}",
+                                         pAppHeader->DataSize, sizeof(ImageLoadRequest));
+                    break;
+                }
+                auto* req = reinterpret_cast<ImageLoadRequest*>(pPayload);
+
+                // Validate variable-length bounds
+                uint32_t varOffset = static_cast<uint32_t>(sizeof(ImageLoadRequest));
+                if (req->imagePathLength > (pAppHeader->DataSize - varOffset)) {
+                    Utils::Logger::Error("[IPCManager] ImageLoad imagePath exceeds buffer: {} > {}",
+                                         req->imagePathLength, pAppHeader->DataSize - varOffset);
+                    break;
+                }
+
+                try {
+                    verdict = imageLoadHandler(*req);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] ImageLoad handler exception: {}", e.what());
+                }
+            } else if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_ImageLoad, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] Generic ImageLoad handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_ImageLoad);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        // =====================================================================
+        // REGISTRY NOTIFICATIONS (persistence, defense evasion)
+        // =====================================================================
+        case FilterMessageType_RegistryNotify: {
+            if (registryHandler) {
+                if (pAppHeader->DataSize < sizeof(RegistryOpRequest)) {
+                    Utils::Logger::Error("[IPCManager] Truncated RegistryNotify payload: {} < {}",
+                                         pAppHeader->DataSize, sizeof(RegistryOpRequest));
+                    break;
+                }
+                auto* req = reinterpret_cast<RegistryOpRequest*>(pPayload);
+
+                // Validate variable-length bounds: keyPath + valueName + data must fit
+                uint32_t varOffset = static_cast<uint32_t>(sizeof(RegistryOpRequest));
+                uint32_t remaining = pAppHeader->DataSize - varOffset;
+                if (req->keyPathLength > remaining) {
+                    Utils::Logger::Error("[IPCManager] RegistryNotify keyPath exceeds buffer");
+                    break;
+                }
+                remaining -= req->keyPathLength;
+                if (req->valueNameLength > remaining) {
+                    Utils::Logger::Error("[IPCManager] RegistryNotify valueName exceeds buffer");
+                    break;
+                }
+                remaining -= req->valueNameLength;
+                if (req->dataSize > remaining) {
+                    Utils::Logger::Error("[IPCManager] RegistryNotify data exceeds buffer");
+                    break;
+                }
+
+                try {
+                    verdict = registryHandler(*req);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] Registry handler exception: {}", e.what());
+                }
+            } else if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_RegistryNotify, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] Generic Registry handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_RegistryNotify);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        // =====================================================================
+        // THREAD NOTIFICATIONS (remote thread injection, Heaven's Gate)
+        // =====================================================================
+        case FilterMessageType_ThreadNotify: {
+            if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_ThreadNotify, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] ThreadNotify handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_ThreadNotify);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        // =====================================================================
+        // SECURITY ALERTS (high-priority kernel detections)
+        // =====================================================================
+        case FilterMessageType_HandleAlert: {
+            if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_HandleAlert, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] HandleAlert handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_HandleAlert);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        case FilterMessageType_RansomwareAlert: {
+            if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_RansomwareAlert, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] RansomwareAlert handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_RansomwareAlert);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        case FilterMessageType_BehavioralAlert: {
+            if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_BehavioralAlert, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] BehavioralAlert handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_BehavioralAlert);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        case FilterMessageType_MemoryAlert: {
+            if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_MemoryAlert, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] MemoryAlert handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_MemoryAlert);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        case FilterMessageType_NetworkAlert: {
+            if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_NetworkAlert, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] NetworkAlert handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_NetworkAlert);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        case FilterMessageType_SyscallAlert: {
+            if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_SyscallAlert, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] SyscallAlert handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_SyscallAlert);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        case FilterMessageType_SelfProtectAlert: {
+            if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_SelfProtectAlert, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] SelfProtectAlert handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_SelfProtectAlert);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        case FilterMessageType_ThreatScoreNotify: {
+            if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_ThreatScoreNotify, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] ThreatScoreNotify handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_ThreatScoreNotify);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        // =====================================================================
+        // FILE OPERATION NOTIFICATIONS (ransomware backup, file events)
+        // =====================================================================
+        case FilterMessageType_NamedPipeEvent:
+        case FilterMessageType_FileBackupEvent:
+        case FilterMessageType_FileRollbackEvent: {
+            if (genericHandler) {
+                try {
+                    genericHandler(
+                        static_cast<SHADOWSTRIKE_MESSAGE_TYPE>(pAppHeader->MessageType),
+                        pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] FileOp handler exception for type {}: {}",
+                                         pAppHeader->MessageType, e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(pAppHeader->MessageType);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        // =====================================================================
+        // ALPC NOTIFICATIONS (sandbox escape, impersonation, lateral movement)
+        // =====================================================================
+        case FilterMessageType_AlpcPortCreated:
+        case FilterMessageType_AlpcPortConnected:
+        case FilterMessageType_AlpcPortDisconnected:
+        case FilterMessageType_AlpcSuspiciousAccess:
+        case FilterMessageType_AlpcImpersonation:
+        case FilterMessageType_AlpcSandboxEscape:
+        case FilterMessageType_AlpcRateLimitExceeded: {
+            if (genericHandler) {
+                try {
+                    genericHandler(
+                        static_cast<SHADOWSTRIKE_MESSAGE_TYPE>(pAppHeader->MessageType),
+                        pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] ALPC handler exception for type {}: {}",
+                                         pAppHeader->MessageType, e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(pAppHeader->MessageType);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        // =====================================================================
+        // CONTROL / POLICY MESSAGES (status queries, config updates)
+        // =====================================================================
         case FilterMessageType_Register:
         case FilterMessageType_Heartbeat:
+        case FilterMessageType_Unregister:
+        case FilterMessageType_QueryDriverStatus:
+        case FilterMessageType_ExclusionQuery:
+            break;
+
+        // =====================================================================
+        // USER→KERNEL PUSH ACKNOWLEDGEMENTS (data push reply handling)
+        // These message types are user→kernel (outbound) and should not arrive
+        // as inbound dispatches. Log if they do — indicates protocol mismatch.
+        // =====================================================================
+        case FilterMessageType_PushHashDatabase:
+        case FilterMessageType_PushPatternDatabase:
+        case FilterMessageType_PushSignatureDatabase:
+        case FilterMessageType_PushIoCFeed:
+        case FilterMessageType_PushWhitelist:
+        case FilterMessageType_UpdateBehavioralRules:
+        case FilterMessageType_PushNetworkIoC:
+        case FilterMessageType_ExclusionUpdate:
+        case FilterMessageType_ConfigUpdate:
+        case FilterMessageType_UpdatePolicy:
+        case FilterMessageType_EnableFiltering:
+        case FilterMessageType_DisableFiltering:
+        case FilterMessageType_RegisterProtectedProcess:
+        case FilterMessageType_ScanVerdict:
+            Utils::Logger::Warn("[IPCManager] Received outbound-only message type {} as inbound — protocol mismatch",
+                                pAppHeader->MessageType);
             break;
 
         default:
@@ -1298,7 +1619,8 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
                         pPayload,
                         pAppHeader->DataSize);
                 } catch (const std::exception& e) {
-                    Utils::Logger::Error("[IPCManager] Generic handler exception: {}", e.what());
+                    Utils::Logger::Error("[IPCManager] Generic handler exception for type {}: {}",
+                                         pAppHeader->MessageType, e.what());
                 }
             } else {
                 Utils::Logger::Warn("[IPCManager] Unhandled message type: {}",

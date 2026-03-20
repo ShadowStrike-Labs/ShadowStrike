@@ -19,6 +19,17 @@
  * @file MessageDispatcher.hpp
  * @brief Message routing and dispatching for ShadowStrike NGAV
  *
+ * @deprecated This module is superseded by IPCManager's integrated dispatch.
+ *             IPCManager now handles all 43 message types directly in its
+ *             DispatchMessage() method with per-type handler callbacks,
+ *             handler snapshot under lock, and per-type statistics.
+ *
+ *             MessageDispatcher remains as a reference implementation with
+ *             advanced features (async dispatch, PIMPL, comprehensive stats)
+ *             that may be promoted into IPCManager in a future refactor.
+ *
+ *             DO NOT wire new callers to this module — use IPCManager instead.
+ *
  * Routes incoming kernel messages to appropriate handlers and
  * manages the reply pipeline.
  *

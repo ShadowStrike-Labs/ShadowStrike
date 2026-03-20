@@ -302,105 +302,120 @@ enum class IPCStatus : uint8_t {
 // struct FileScanRequest replaced by FILE_SCAN_REQUEST
 
 /**
- * @brief Process notification request
+ * @brief Process notification wire struct — mirrors SHADOWSTRIKE_PROCESS_NOTIFICATION (pack 1).
+ *
+ * Wire layout at pPayload:
+ *   [SS_MESSAGE_HEADER (40B, kernel inner header — redundant, skip)]
+ *   [ProcessId (4B)]  [ParentProcessId (4B)]
+ *   [CreatingProcessId (4B)]  [CreatingThreadId (4B)]
+ *   [Create (1B)]  [ImagePathLength (2B)]  [CommandLineLength (2B)]
+ *   [ImagePath (variable)]  [CommandLine (variable)]
+ *
+ * sizeof(ProcessNotifyRequest) == sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION) == 61 bytes (pack 1).
+ * Dispatch validates variable-length bounds before invoking handler.
  */
 struct ProcessNotifyRequest {
-    /// @brief Header
-    FILTER_MESSAGE_HEADER header;
-    
-    /// @brief Parent process ID
+    /// Kernel SHADOWSTRIKE_PROCESS_NOTIFICATION has SS_MESSAGE_HEADER as first field.
+    /// Redundant (outer header already parsed by dispatch) but must be accounted for.
+    SS_MESSAGE_HEADER _kernelInnerHeader;
+
+    uint32_t processId;
     uint32_t parentProcessId;
-    
-    /// @brief Creating process ID
     uint32_t creatingProcessId;
-    
-    /// @brief Creating thread ID
     uint32_t creatingThreadId;
-    
-    /// @brief Session ID
-    uint32_t sessionId;
-    
-    /// @brief Token info
-    uint64_t tokenHandle;
-    
-    /// @brief Is WoW64
-    uint8_t isWow64;
-    
-    /// @brief Reserved
-    uint8_t reserved[3];
-    
-    /// @brief Image path length
-    uint16_t imagePathLength;
-    
-    /// @brief Command line length
-    uint16_t commandLineLength;
-    
-    /// @brief Image path
-    wchar_t imagePath[260];
-    
-    /// @brief Command line (follows image path in actual buffer)
-    wchar_t commandLine[512];
+    uint8_t  isCreation;        ///< BOOLEAN Create: 1=creation, 0=termination
+    uint16_t imagePathLength;   ///< Byte count of ImagePath (not char count)
+    uint16_t commandLineLength; ///< Byte count of CommandLine (not char count)
+
+    // Variable-length data follows the fixed struct in the wire buffer.
+    // Accessors return pointers INTO the message buffer — valid only while buffer is alive.
+    // Caller must ensure dispatch validated variable bounds before use.
+
+    [[nodiscard]] const wchar_t* imagePathData() const noexcept {
+        return reinterpret_cast<const wchar_t*>(
+            reinterpret_cast<const uint8_t*>(this) + sizeof(ProcessNotifyRequest));
+    }
+    [[nodiscard]] size_t imagePathCharLen() const noexcept {
+        return imagePathLength / sizeof(wchar_t);
+    }
+    [[nodiscard]] const wchar_t* commandLineData() const noexcept {
+        return reinterpret_cast<const wchar_t*>(
+            reinterpret_cast<const uint8_t*>(this) + sizeof(ProcessNotifyRequest) + imagePathLength);
+    }
+    [[nodiscard]] size_t commandLineCharLen() const noexcept {
+        return commandLineLength / sizeof(wchar_t);
+    }
 };
 
 /**
- * @brief Image load notification
+ * @brief Image load notification wire struct — mirrors SHADOWSTRIKE_IMAGE_NOTIFICATION (pack 1).
+ *
+ * Wire layout at pPayload:
+ *   [ProcessId (4B)]  [ImageBase (8B)]  [ImageSize (8B)]
+ *   [SignatureLevel (1B)]  [SignatureType (1B)]  [IsSystemImage (1B)]
+ *   [ImageNameLength (2B)]
+ *   [ImageName (variable)]
+ *
+ * sizeof(ImageLoadRequest) == sizeof(SHADOWSTRIKE_IMAGE_NOTIFICATION) == 25 bytes (pack 1).
+ * NO embedded header — kernel struct starts directly with ProcessId.
  */
 struct ImageLoadRequest {
-    /// @brief Header
-    FILTER_MESSAGE_HEADER header;
-    
-    /// @brief Process ID
     uint32_t processId;
-    
-    /// @brief Image base address
     uint64_t imageBase;
-    
-    /// @brief Image size
     uint64_t imageSize;
-    
-    /// @brief Is system module
-    uint8_t isSystemModule;
-    
-    /// @brief Reserved
-    uint8_t reserved[3];
-    
-    /// @brief Image path length
-    uint16_t imagePathLength;
-    
-    /// @brief Image path
-    wchar_t imagePath[260];
+    uint8_t  signatureLevel;
+    uint8_t  signatureType;
+    uint8_t  isSystemModule;    ///< BOOLEAN IsSystemImage
+    uint16_t imagePathLength;   ///< Byte count of ImageName
+
+    [[nodiscard]] const wchar_t* imagePathData() const noexcept {
+        return reinterpret_cast<const wchar_t*>(
+            reinterpret_cast<const uint8_t*>(this) + sizeof(ImageLoadRequest));
+    }
+    [[nodiscard]] size_t imagePathCharLen() const noexcept {
+        return imagePathLength / sizeof(wchar_t);
+    }
 };
 
 /**
- * @brief Registry operation request
+ * @brief Registry operation wire struct — mirrors SHADOWSTRIKE_REGISTRY_NOTIFICATION (pack 1).
+ *
+ * Wire layout at pPayload:
+ *   [ProcessId (4B)]  [ThreadId (4B)]  [Operation (1B)]
+ *   [KeyPathLength (2B)]  [ValueNameLength (2B)]
+ *   [DataSize (4B)]  [DataType (4B)]
+ *   [KeyPath (variable)]  [ValueName (variable)]  [Data (variable)]
+ *
+ * sizeof(RegistryOpRequest) == sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION) == 21 bytes (pack 1).
+ * NO embedded header — kernel struct starts directly with ProcessId.
  */
 struct RegistryOpRequest {
-    /// @brief Header
-    FILTER_MESSAGE_HEADER header;
-    
-    /// @brief Operation type
-    uint32_t operationType;
-    
-    /// @brief Key handle
-    uint64_t keyHandle;
-    
-    /// @brief Key path length
-    uint16_t keyPathLength;
-    
-    /// @brief Value name length
-    uint16_t valueNameLength;
-    
-    /// @brief Value type
-    uint32_t valueType;
-    
-    /// @brief Data length
-    uint32_t dataLength;
-    
-    /// @brief Key path
-    wchar_t keyPath[260];
-    
-    /// @brief Value name
-    wchar_t valueName[128];
+    uint32_t processId;
+    uint32_t threadId;
+    uint8_t  operation;         ///< Create, Set, Delete
+    uint16_t keyPathLength;     ///< Byte count of KeyPath
+    uint16_t valueNameLength;   ///< Byte count of ValueName
+    uint32_t dataSize;          ///< Byte count of registry Data
+    uint32_t dataType;          ///< REG_SZ, REG_DWORD, etc.
+
+    [[nodiscard]] const wchar_t* keyPathData() const noexcept {
+        return reinterpret_cast<const wchar_t*>(
+            reinterpret_cast<const uint8_t*>(this) + sizeof(RegistryOpRequest));
+    }
+    [[nodiscard]] size_t keyPathCharLen() const noexcept {
+        return keyPathLength / sizeof(wchar_t);
+    }
+    [[nodiscard]] const wchar_t* valueNameData() const noexcept {
+        return reinterpret_cast<const wchar_t*>(
+            reinterpret_cast<const uint8_t*>(this) + sizeof(RegistryOpRequest) + keyPathLength);
+    }
+    [[nodiscard]] size_t valueNameCharLen() const noexcept {
+        return valueNameLength / sizeof(wchar_t);
+    }
+    [[nodiscard]] const uint8_t* registryData() const noexcept {
+        return reinterpret_cast<const uint8_t*>(this) +
+               sizeof(RegistryOpRequest) + keyPathLength + valueNameLength;
+    }
 };
 
 /**
