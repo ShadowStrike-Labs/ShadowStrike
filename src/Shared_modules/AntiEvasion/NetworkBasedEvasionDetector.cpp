@@ -702,8 +702,7 @@ namespace ShadowStrike::AntiEvasion {
                 return false;
             }
 
-            // Initialize bigram frequencies for DGA detection
-            InitializeBigramFrequencies();
+            // Bigram frequencies already initialized in Impl constructor
 
             SS_LOG_INFO(LOG_CATEGORY, L"NetworkBasedEvasionDetector: Initialized successfully");
             return true;
@@ -2032,11 +2031,12 @@ namespace ShadowStrike::AntiEvasion {
             } // End adapter loop
             
             // Method 3: Check for packet capture driver presence (system-wide check, do once)
-            static bool driversChecked = false;
-            static bool captureDriversFound = false;
+            // Must be atomic — DetectPromiscuousMode can be called from multiple threads
+            static std::atomic<bool> driversChecked{ false };
+            static std::atomic<bool> captureDriversFound{ false };
             
-            if (!driversChecked) {
-                driversChecked = true;
+            if (!driversChecked.load(std::memory_order_acquire)) {
+                driversChecked.store(true, std::memory_order_release);
                 
                 // Check for WinPcap/Npcap service
                 SC_HANDLE hSCManager = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
@@ -2053,7 +2053,7 @@ namespace ShadowStrike::AntiEvasion {
                             SERVICE_STATUS status = {};
                             if (::QueryServiceStatus(hService, &status)) {
                                 if (status.dwCurrentState == SERVICE_RUNNING) {
-                                    captureDriversFound = true;
+                                    captureDriversFound.store(true, std::memory_order_release);
                                     SS_LOG_INFO(LOG_CATEGORY,
                                         L"Packet capture driver running: %ls", serviceName);
                                 }
@@ -2075,7 +2075,7 @@ namespace ShadowStrike::AntiEvasion {
                     nullptr
                 );
                 if (hNpf != INVALID_HANDLE_VALUE) {
-                    captureDriversFound = true;
+                    captureDriversFound.store(true, std::memory_order_release);
                     ::CloseHandle(hNpf);
                     SS_LOG_INFO(LOG_CATEGORY,
                         L"NPF device accessible - packet capture infrastructure present");
@@ -3273,30 +3273,13 @@ namespace ShadowStrike::AntiEvasion {
             DWORD proxyInfoSize = sizeof(proxyInfo);
 
             if (InternetQueryOptionA(nullptr, INTERNET_OPTION_PROXY, &proxyInfo, &proxyInfoSize)) {
-                // ================================================================
-                // SECURITY FIX #5: RAII cleanup for proxy strings
-                // Original code leaked memory if ToWide() threw an exception.
-                // Use scope guards to ensure cleanup happens regardless of
-                // exception paths.
-                // ================================================================
-                
-                // RAII guards for automatic cleanup
-                struct ProxyCleanup {
-                    LPCSTR proxy = nullptr;
-                    LPCSTR bypass = nullptr;
-                    ~ProxyCleanup() {
-                        if (proxy) GlobalFree((HGLOBAL)proxy);
-                        if (bypass) GlobalFree((HGLOBAL)bypass);
-                    }
-                } cleanup;
-                cleanup.proxy = proxyInfo.lpszProxy;
-                cleanup.bypass = proxyInfo.lpszProxyBypass;
+                // lpszProxy and lpszProxyBypass point to WinInet-internal
+                // static buffers. They must NOT be freed by the caller.
 
                 if (proxyInfo.lpszProxy && proxyInfo.lpszProxy[0] != '\0') {
                     outProxyAddress = Utils::StringUtils::ToWide(proxyInfo.lpszProxy);
                     return true;
                 }
-                // cleanup destructor runs here, freeing both strings
             }
 
             return false;
@@ -4267,10 +4250,17 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
-            // Invoke callback if set
-            if (m_impl->m_detectionCallback) {
+            // Snapshot-then-invoke: read callback under shared lock, invoke outside
+            // Prevents data race with SetDetectionCallback/ClearDetectionCallback
+            // and avoids deadlock if the callback calls back into the detector
+            NetworkDetectionCallback callbackSnapshot;
+            {
+                std::shared_lock lock(m_impl->m_mutex);
+                callbackSnapshot = m_impl->m_detectionCallback;
+            }
+            if (callbackSnapshot) {
                 try {
-                    m_impl->m_detectionCallback(result.processId, detection);
+                    callbackSnapshot(result.processId, detection);
                 }
                 catch (...) {
                     // Swallow callback exceptions
