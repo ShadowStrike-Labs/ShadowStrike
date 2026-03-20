@@ -510,7 +510,24 @@ struct ServiceMessage {
 };
 
 /**
- * @brief Statistics
+ * @brief Statistics snapshot (POD — thread-safe copy of atomic counters)
+ */
+struct ServiceCommStatisticsSnapshot {
+    uint64_t messagesReceived = 0;
+    uint64_t messagesSent = 0;
+    uint64_t bytesReceived = 0;
+    uint64_t bytesSent = 0;
+    uint64_t connectionsTotal = 0;
+    uint64_t connectionsFailed = 0;
+    uint64_t authFailures = 0;
+    uint64_t errors = 0;
+    std::array<uint64_t, 32> byMessageType{};
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Live statistics (internal, atomic counters)
  */
 struct ServiceCommStatistics {
     std::atomic<uint64_t> messagesReceived{0};
@@ -525,7 +542,7 @@ struct ServiceCommStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
-    [[nodiscard]] std::string ToJson() const;
+    [[nodiscard]] ServiceCommStatisticsSnapshot TakeSnapshot() const noexcept;
 };
 
 /**
@@ -550,8 +567,8 @@ struct ServiceCommConfiguration {
     /// @brief Heartbeat interval (ms)
     uint32_t heartbeatIntervalMs = ServiceCommConstants::HEARTBEAT_INTERVAL_MS;
     
-    /// @brief Enable encryption
-    bool enableEncryption = true;
+    /// @brief Enable encryption (reserved — CryptoUtils integration pending)
+    bool enableEncryption = false;
     
     /// @brief Enable authentication
     bool enableAuthentication = true;
@@ -576,7 +593,7 @@ using MessageCallback = std::function<void(const std::string&)>;
 using ServiceMessageCallback = std::function<void(const ServiceMessage&, const std::string& sessionId)>;
 using ConnectionCallback = std::function<void(const ClientSession&, bool connected)>;
 using CommandCallback = std::function<bool(MessageType cmd, const std::vector<uint8_t>& payload, std::vector<uint8_t>& response)>;
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+using ServiceErrorCallback = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
 // SERVICE COMMUNICATION CLASS
@@ -724,14 +741,14 @@ public:
     void RegisterMessageCallback(ServiceMessageCallback callback);
     void RegisterConnectionCallback(ConnectionCallback callback);
     void RegisterCommandCallback(CommandCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
+    void RegisterErrorCallback(ServiceErrorCallback callback);
     void UnregisterCallbacks();
 
     // ========================================================================
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] ServiceCommStatistics GetStatistics() const;
+    [[nodiscard]] ServiceCommStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
