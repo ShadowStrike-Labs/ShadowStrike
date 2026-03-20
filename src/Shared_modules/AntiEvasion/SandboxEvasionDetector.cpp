@@ -725,7 +725,7 @@ namespace ShadowStrike {
                 return is64Bit ? &decoder64 : &decoder32;
             }
 
-            [[nodiscard]] bool IsCacheValid() const noexcept {
+            [[nodiscard]] bool IsCacheValid() const {
                 std::shared_lock lock(cacheMutex);
                 if (!cachedResult.has_value()) return false;
 
@@ -925,7 +925,16 @@ namespace ShadowStrike {
             if (currentConfig.checkArtifacts) {
                 CheckLoadedModules(result);
                 CheckNamedObjects(result);
-                CheckProcesses(result);
+            }
+
+            // Scan artifacts ONCE and reuse for processes, files, and API hooks
+            ArtifactAnalysis scannedArtifacts;
+            if (currentConfig.checkArtifacts || currentConfig.checkFileSystem) {
+                scannedArtifacts = ScanArtifacts();
+            }
+
+            if (currentConfig.checkArtifacts) {
+                CheckProcesses(result, scannedArtifacts);
                 CheckServices(result);
                 CheckAPIHooks(result);
             }
@@ -940,7 +949,7 @@ namespace ShadowStrike {
             }
 
             if (currentConfig.checkFileSystem) {
-                CheckFileSystem(result);
+                CheckFileSystem(result, scannedArtifacts);
             }
 
             if (currentConfig.checkNetwork) {
@@ -1543,9 +1552,15 @@ namespace ShadowStrike {
             analysis.monitorCount = GetSystemMetrics(SM_CMONITORS);
 
             // -------------------------------------------------------------------------
-            // DPI
+            // DPI (reuse DC pattern from color depth above)
             // -------------------------------------------------------------------------
-            analysis.dpi = GetDeviceCaps(GetDC(nullptr), LOGPIXELSX);
+            {
+                HDC hdcDpi = GetDC(nullptr);
+                if (hdcDpi) {
+                    analysis.dpi = GetDeviceCaps(hdcDpi, LOGPIXELSX);
+                    ReleaseDC(nullptr, hdcDpi);
+                }
+            }
 
             // -------------------------------------------------------------------------
             // Timezone
@@ -1920,6 +1935,15 @@ namespace ShadowStrike {
 
             m_impl->stats.humanInteractionChecks.fetch_add(1, std::memory_order_relaxed);
 
+            // Reset thread_local state to avoid cross-call contamination
+            // (previous call's final state would cause phantom transitions on first sample)
+            thread_local bool lastLeftButton = false;
+            thread_local bool lastRightButton = false;
+            thread_local std::bitset<256> previousKeyStates;
+            lastLeftButton = false;
+            lastRightButton = false;
+            previousKeyStates.reset();
+
 #ifdef _WIN32
             analysis.startTime = std::chrono::steady_clock::now();
 
@@ -1954,12 +1978,7 @@ namespace ShadowStrike {
                 lastPos = currentPos;
 
                 // Check for clicks - use state change detection to avoid counting held buttons
-                // THREAD-SAFETY FIX: Use thread_local instead of static to avoid race conditions
-                // when multiple threads call AnalyzeHumanInteraction() simultaneously
-                // (e.g., via ScanSystemAsync concurrent calls)
-                thread_local bool lastLeftButton = false;
-                thread_local bool lastRightButton = false;
-                
+                // Thread-safe: thread_local declared at function scope and reset per-call
                 bool leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
                 bool rightDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
                 
@@ -1975,11 +1994,8 @@ namespace ShadowStrike {
                 lastLeftButton = leftDown;
                 lastRightButton = rightDown;
 
-                // CRITICAL FIX (Issue #5): Keyboard input counting bug
-                // Previous code counted EVERY held key each sample (Shift+A = 2 counts)
-                // Fixed: Track state changes to count only NEW key presses
-                // THREAD-SAFETY FIX: Use thread_local to avoid race conditions
-                thread_local std::bitset<256> previousKeyStates;
+                // Track state changes to count only NEW key presses (not held keys)
+                // Thread-safe: thread_local declared at function scope and reset per-call
                 std::bitset<256> currentKeyStates;
                 
                 for (int key = 0x08; key <= 0xFE; ++key) {
@@ -2143,7 +2159,7 @@ namespace ShadowStrike {
 
         bool SandboxEvasionDetector::DoesMutexExist(std::wstring_view mutexName) {
 #ifdef _WIN32
-            HANDLE mutex = OpenMutexW(MUTEX_ALL_ACCESS, FALSE, mutexName.data());
+            HANDLE mutex = OpenMutexW(SYNCHRONIZE, FALSE, mutexName.data());
             if (mutex != nullptr) {
                 CloseHandle(mutex);
                 return true;
@@ -2452,9 +2468,7 @@ namespace ShadowStrike {
             }
         }
 
-        void SandboxEvasionDetector::CheckProcesses(SandboxEvasionResult& result) {
-            auto artifacts = ScanArtifacts();
-
+        void SandboxEvasionDetector::CheckProcesses(SandboxEvasionResult& result, const ArtifactAnalysis& artifacts) {
             for (const auto& proc : artifacts.sandboxProcesses) {
                 AddIndicator(result, SandboxCheckType::SandboxProcesses, SandboxIndicatorCategory::Artifact,
                     SandboxIndicatorSeverity::High, 4.0f, 90.0f,
@@ -2473,8 +2487,8 @@ namespace ShadowStrike {
                 ++result.failedChecks;
             }
 
-            result.artifacts.sandboxProcesses = std::move(artifacts.sandboxProcesses);
-            result.artifacts.analysisToolProcesses = std::move(artifacts.analysisToolProcesses);
+            result.artifacts.sandboxProcesses = artifacts.sandboxProcesses;
+            result.artifacts.analysisToolProcesses = artifacts.analysisToolProcesses;
 
             result.totalChecks += static_cast<uint32_t>(result.artifacts.sandboxProcesses.size() +
                 result.artifacts.analysisToolProcesses.size());
@@ -2546,9 +2560,7 @@ namespace ShadowStrike {
             result.totalChecks += static_cast<uint32_t>(env.issues.size()) + 1;
         }
 
-        void SandboxEvasionDetector::CheckFileSystem(SandboxEvasionResult& result) {
-            auto artifacts = ScanArtifacts();
-
+        void SandboxEvasionDetector::CheckFileSystem(SandboxEvasionResult& result, const ArtifactAnalysis& artifacts) {
             for (const auto& file : artifacts.sandboxFiles) {
                 AddIndicator(result, SandboxCheckType::SandboxFiles, SandboxIndicatorCategory::FileSystem,
                     SandboxIndicatorSeverity::High, 3.5f, 88.0f,
@@ -2558,7 +2570,7 @@ namespace ShadowStrike {
                 ++result.failedChecks;
             }
 
-            result.artifacts.sandboxFiles = std::move(artifacts.sandboxFiles);
+            result.artifacts.sandboxFiles = artifacts.sandboxFiles;
 
             ++result.totalChecks;
             if (result.artifacts.sandboxFiles.empty()) {

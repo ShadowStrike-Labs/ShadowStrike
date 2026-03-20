@@ -2440,8 +2440,10 @@ namespace ShadowStrike {
 
             /**
              * @brief Check running processes for sandbox indicators.
+             * @param result Result to populate.
+             * @param artifacts Pre-scanned artifacts (avoids redundant ScanArtifacts calls).
              */
-            void CheckProcesses(SandboxEvasionResult& result);
+            void CheckProcesses(SandboxEvasionResult& result, const ArtifactAnalysis& artifacts);
 
             /**
              * @brief Check services for sandbox indicators.
@@ -2455,8 +2457,10 @@ namespace ShadowStrike {
 
             /**
              * @brief Check file system for sandbox artifacts.
+             * @param result Result to populate.
+             * @param artifacts Pre-scanned artifacts (avoids redundant ScanArtifacts calls).
              */
-            void CheckFileSystem(SandboxEvasionResult& result);
+            void CheckFileSystem(SandboxEvasionResult& result, const ArtifactAnalysis& artifacts);
 
             /**
              * @brief Check for API hooks.
