@@ -172,6 +172,7 @@ namespace ShadowStrike {
             Base64Alphabet alphabet = Base64Alphabet::Standard; ///< Alphabet variant
             bool ignoreWhitespace = true;                       ///< Skip whitespace characters
             bool acceptMissingPadding = true;                   ///< Allow input without '=' padding
+            bool rejectNonCanonical = false;                    ///< Reject non-zero trailing padding bits
         };
 
         // ============================================================================
@@ -187,7 +188,8 @@ namespace ShadowStrike {
             InvalidPadding = 2,    ///< Padding characters are malformed
             TrailingData = 3,      ///< Non-whitespace data after padding
             AllocationFailed = 4,  ///< Memory allocation failed
-            InputTooLarge = 5      ///< Input exceeds safe processing limits
+            InputTooLarge = 5,     ///< Input exceeds safe processing limits
+            NonCanonicalEncoding = 6  ///< Non-zero trailing bits in padding (strict mode)
         };
 
         /**
@@ -197,13 +199,14 @@ namespace ShadowStrike {
          */
         [[nodiscard]] constexpr const char* Base64DecodeErrorToString(Base64DecodeError err) noexcept {
             switch (err) {
-                case Base64DecodeError::None:             return "No error";
-                case Base64DecodeError::InvalidCharacter: return "Invalid Base64 character";
-                case Base64DecodeError::InvalidPadding:   return "Invalid padding";
-                case Base64DecodeError::TrailingData:     return "Trailing data after padding";
-                case Base64DecodeError::AllocationFailed: return "Memory allocation failed";
-                case Base64DecodeError::InputTooLarge:    return "Input exceeds safe size limits";
-                default:                                  return "Unknown error";
+                case Base64DecodeError::None:                return "No error";
+                case Base64DecodeError::InvalidCharacter:    return "Invalid Base64 character";
+                case Base64DecodeError::InvalidPadding:      return "Invalid padding";
+                case Base64DecodeError::TrailingData:        return "Trailing data after padding";
+                case Base64DecodeError::AllocationFailed:    return "Memory allocation failed";
+                case Base64DecodeError::InputTooLarge:       return "Input exceeds safe size limits";
+                case Base64DecodeError::NonCanonicalEncoding:return "Non-zero trailing bits in padding";
+                default:                                     return "Unknown error";
             }
         }
 

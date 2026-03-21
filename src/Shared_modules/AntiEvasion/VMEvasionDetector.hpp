@@ -1414,6 +1414,24 @@ namespace ShadowStrike {
         /**
          * @brief Configuration for process anti-VM behavior analysis
          */
+        /**
+         * @brief Kernel-verified process context for tamper-proof VM evasion detection.
+         *
+         * Populated from kernel sensor ProcessNotify callback data.
+         * Provides tamper-proof process information that user-mode APIs cannot spoof.
+         */
+        struct VMKernelContext {
+            std::wstring imagePath;              ///< Kernel-verified image path
+            std::wstring commandLine;            ///< Kernel-verified command line
+            uint32_t parentProcessId = 0;        ///< Kernel-verified parent PID
+            uint32_t creatingProcessId = 0;      ///< Creating process ID
+            uint32_t creatingThreadId = 0;       ///< Creating thread ID
+
+            [[nodiscard]] bool hasKernelData() const noexcept {
+                return !imagePath.empty();
+            }
+        };
+
         struct ProcessAnalysisConfig {
             bool analyzeCodePatterns = true;                   ///< Scan for anti-VM code patterns
             bool analyzeImports = true;                        ///< Check imported APIs
@@ -1424,6 +1442,7 @@ namespace ShadowStrike {
             uint32_t timeoutMs = 10000;                        ///< Analysis timeout per process
             size_t maxMemoryToScan = 64 * 1024 * 1024;        ///< Max memory to scan per process
 
+            std::optional<VMKernelContext> kernelContext;       ///< Kernel-enriched context
             const std::atomic<bool>* cancelFlag = nullptr;
         };
 

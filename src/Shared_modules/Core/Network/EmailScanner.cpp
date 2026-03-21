@@ -53,6 +53,7 @@
 #include "../../Utils/Logger.hpp"
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
+#include "../../Utils/Base64Utils.hpp"
 #include "../FileSystem/FileTypeAnalyzer.hpp"
 #include "../FileSystem/ExecutableAnalyzer.hpp"
 
@@ -75,46 +76,17 @@ namespace Network {
 namespace {
 
 /**
- * @brief Base64 decoding.
+ * @brief Base64 decoding — delegates to enterprise Base64Utils.
  */
 std::vector<uint8_t> Base64Decode(std::string_view input) {
-    static const std::string base64_chars =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz"
-        "0123456789+/";
-
     std::vector<uint8_t> result;
-    result.reserve((input.size() * 3) / 4);
-
-    std::array<int, 4> charArray;
-    int i = 0;
-
-    for (char c : input) {
-        if (std::isspace(static_cast<unsigned char>(c))) continue;
-        if (c == '=') break;
-
-        const size_t pos = base64_chars.find(c);
-        if (pos == std::string::npos) continue;
-
-        charArray[i++] = static_cast<int>(pos);
-
-        if (i == 4) {
-            result.push_back(static_cast<uint8_t>((charArray[0] << 2) + ((charArray[1] & 0x30) >> 4)));
-            result.push_back(static_cast<uint8_t>(((charArray[1] & 0x0f) << 4) + ((charArray[2] & 0x3c) >> 2)));
-            result.push_back(static_cast<uint8_t>(((charArray[2] & 0x03) << 6) + charArray[3]));
-            i = 0;
-        }
+    ShadowStrike::Utils::Base64DecodeError err{};
+    ShadowStrike::Utils::Base64DecodeOptions opts;
+    opts.ignoreWhitespace = true;
+    opts.acceptMissingPadding = true;
+    if (!ShadowStrike::Utils::Base64Decode(input, result, err, opts)) {
+        return {};
     }
-
-    if (i > 0) {
-        if (i >= 2) {
-            result.push_back(static_cast<uint8_t>((charArray[0] << 2) + ((charArray[1] & 0x30) >> 4)));
-        }
-        if (i >= 3) {
-            result.push_back(static_cast<uint8_t>(((charArray[1] & 0x0f) << 4) + ((charArray[2] & 0x3c) >> 2)));
-        }
-    }
-
     return result;
 }
 

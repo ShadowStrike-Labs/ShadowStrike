@@ -180,14 +180,14 @@ namespace ShadowStrike {
             }
 
             /**
-             * @brief Maximum safe input length for encoding.
+             * @brief Maximum safe input length for encoding/decoding.
              * 
-             * Calculated to prevent overflow in size calculations:
-             * - Base64 expansion is 4/3 (worst case ~1.34x)
-             * - Leave headroom for line breaks and safety margin
-             * - Use SIZE_MAX / 4 as conservative upper bound
+             * Capped at 256 MB to prevent OOM from attacker-controlled input
+             * in an EDR context. This is far above any legitimate Base64 payload
+             * (signatures, certificates, encoded commands) while preventing
+             * denial-of-service from hostile data.
              */
-            constexpr size_t kMaxSafeInputLength = (std::numeric_limits<size_t>::max() / 4) - 4096;
+            constexpr size_t kMaxSafeInputLength = 256 * 1024 * 1024; // 256 MB
 
             /**
              * @brief Select the appropriate encode table based on alphabet.
@@ -630,9 +630,11 @@ namespace ShadowStrike {
                 // (padding should zero out remaining bits)
                 const uint32_t remainingBitsMask = (1U << bitsInAccumulator) - 1U;
                 if ((accumulator & remainingBitsMask) != 0) {
-                    // Non-canonical encoding - trailing bits should be zero
-                    // This is technically valid per RFC 4648 but some implementations reject it
-                    // We accept it but could add a strict mode flag if needed
+                    if (opt.rejectNonCanonical) {
+                        err = Base64DecodeError::NonCanonicalEncoding;
+                        out.clear();
+                        return false;
+                    }
                 }
             }
             else {

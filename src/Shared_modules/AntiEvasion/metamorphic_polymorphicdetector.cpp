@@ -2766,8 +2766,33 @@ bool MetamorphicDetector::MatchKnownFamilies(
     }
 
     try {
-        // Known metamorphic engine byte patterns (simplified - real implementation
-        // would use SignatureStore's Aho-Corasick multi-pattern matching)
+        // Use SignatureStore's Aho-Corasick multi-pattern engine when available
+        // for high-performance scanning. Falls back to built-in patterns if stores not wired.
+        if (m_impl->m_sigStore) {
+            SignatureStore::ScanOptions scanOpt;
+            scanOpt.enablePatternScan = true;
+            scanOpt.enableHashLookup = false;
+            scanOpt.enableYaraScan = false;       // YARA is slower, not needed for family matching
+            scanOpt.stopOnFirstMatch = false;      // Collect all family matches
+
+            auto sigResult = m_impl->m_sigStore->ScanBuffer(
+                std::span<const uint8_t>(buffer, size), scanOpt);
+
+            for (const auto& det : sigResult.patternMatches) {
+                FamilyMatchInfo match;
+                match.familyName = Utils::StringUtils::ToWide(det.signatureName);
+                match.variant = L"Generic";
+                match.confidence = 0.8 + (static_cast<double>(det.threatLevel) * 0.04);
+                match.matchMethod = L"SignatureStore_AhoCorasick";
+                match.matchedPattern = Utils::StringUtils::ToWide(det.description);
+                match.knownBehaviors.push_back(L"Code mutation");
+                match.knownBehaviors.push_back(L"Signature evasion");
+                outMatches.push_back(std::move(match));
+            }
+        }
+
+        // Built-in metamorphic engine byte patterns — always active as a baseline
+        // These detect classic metamorphic engines even when SignatureStore is empty
         struct KnownPattern {
             const char* familyName;
             const char* variant;
@@ -2799,11 +2824,12 @@ bool MetamorphicDetector::MatchKnownFamilies(
             { "W32.Sality", "Generic", SALITY_MARKER, sizeof(SALITY_MARKER), "Polymorphic virus" },
         };
 
-        // Search for patterns in buffer
+        // Fallback linear pattern search for built-in metamorphic engine signatures
         for (const auto& pat : PATTERNS) {
             if (size < pat.patternLen) continue;
 
-            // Simple pattern search (production would use Aho-Corasick from PatternStore)
+            // Boyer-Moore-Horspool would be faster for single pattern, but these are
+            // short patterns (5-7 bytes) — memcmp scan is cache-friendly and sufficient
             const uint8_t* haystack = buffer;
             const uint8_t* haystackEnd = buffer + size - pat.patternLen;
 
@@ -4903,15 +4929,28 @@ void MetamorphicDetector::PerformSimilarityAnalysis(
     if (m_impl->m_hashStore) {
         auto fuzzyHashStr = ComputeFuzzyHash(filePath, nullptr);
         if (fuzzyHashStr) {
-            // Store for result
             result.fuzzyHash = *fuzzyHashStr;
 
-            // Query hash store for similar hashes
-            // Note: This is a simplified implementation
-            // Real implementation would query the HashStore's fuzzy index
+            // Query HashStore's fuzzy index for similar known-malware hashes
+            SignatureStore::HashValue fuzzyHv{};
+            fuzzyHv.type = SignatureStore::HashType::FUZZY;
+            const auto& hashBytes = *fuzzyHashStr;
+            fuzzyHv.length = static_cast<uint8_t>(
+                std::min(hashBytes.size(), static_cast<size_t>(64)));
+            std::memcpy(fuzzyHv.data.data(), hashBytes.data(), fuzzyHv.length);
 
-            // For now, we mark that fuzzy hash was computed successfully
-            // The actual matching would be performed by HashStore
+            auto fuzzyMatches = m_impl->m_hashStore->FuzzyMatch(fuzzyHv, 70);
+            for (const auto& det : fuzzyMatches) {
+                result.totalDetections++;
+                if (!det.signatureName.empty() && result.familyName.empty()) {
+                    result.familyName = Utils::StringUtils::ToWide(det.signatureName);
+                }
+                // Map threat level to mutation score boost
+                float levelScore = static_cast<float>(det.threatLevel) * 15.0f;
+                if (levelScore > result.mutationScore) {
+                    result.mutationScore = levelScore;
+                }
+            }
         }
     }
 
@@ -4924,8 +4963,21 @@ void MetamorphicDetector::PerformSimilarityAnalysis(
         if (tlshHash) {
             result.tlshHash = *tlshHash;
 
-            // TLSH provides distance-based matching
-            // Lower distance = higher similarity
+            // Query HashStore's fuzzy index for TLSH distance-based matching
+            SignatureStore::HashValue tlshHv{};
+            tlshHv.type = SignatureStore::HashType::TLSH;
+            const auto& tlshBytes = *tlshHash;
+            tlshHv.length = static_cast<uint8_t>(
+                std::min(tlshBytes.size(), static_cast<size_t>(64)));
+            std::memcpy(tlshHv.data.data(), tlshBytes.data(), tlshHv.length);
+
+            auto tlshMatches = m_impl->m_hashStore->FuzzyMatch(tlshHv, 60);
+            for (const auto& det : tlshMatches) {
+                result.totalDetections++;
+                if (!det.signatureName.empty() && result.familyName.empty()) {
+                    result.familyName = Utils::StringUtils::ToWide(det.signatureName);
+                }
+            }
         }
     }
 

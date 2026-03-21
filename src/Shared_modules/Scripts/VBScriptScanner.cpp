@@ -51,7 +51,6 @@
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
-#include "../Utils/Base64Utils.hpp"
 #include "../PatternStore/PatternStore.hpp"
 #include "../SignatureStore/SignatureStore.hpp"
 #include "../HashStore/HashStore.hpp"

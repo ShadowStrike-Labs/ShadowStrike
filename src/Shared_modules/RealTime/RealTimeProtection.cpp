@@ -70,6 +70,10 @@
 #include "../Communication/IPCManager.hpp"
 #include "../Core/Engine/ScanEngine.hpp"
 #include "../Core/Engine/QuarantineManager.hpp"
+#include "../HashStore/HashStore.hpp"
+#include "../SignatureStore/SignatureStore.hpp"
+#include "../PatternStore/PatternStore.hpp"
+#include "../ThreatIntel/ThreatIntelStore.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
@@ -236,6 +240,12 @@ public:
     std::atomic<bool> m_sandboxDetectorInitialized{ false };
     std::atomic<bool> m_timeBasedDetectorInitialized{ false };
 
+    // Shared Threat Intelligence Stores — injected into detectors for IOC correlation
+    std::shared_ptr<HashStore::HashStore> m_sharedHashStore;
+    std::shared_ptr<SignatureStore::SignatureStore> m_sharedSignatureStore;
+    std::shared_ptr<PatternStore::PatternStore> m_sharedPatternStore;
+    std::shared_ptr<ThreatIntel::ThreatIntelStore> m_sharedThreatIntelStore;
+
     // Component Status
     std::array<ComponentStatus, static_cast<size_t>(ComponentType::COMPONENT_COUNT)> m_componentStatus;
 
@@ -263,6 +273,18 @@ public:
         m_stats.lastReset = Now();
         m_protectionStatus.startTime = Now();
         m_protectionStatus.lastUpdate = Now();
+
+        // Create shared ThreatIntel stores — injected into detectors needing IOC correlation
+        try {
+            m_sharedHashStore = std::make_shared<HashStore::HashStore>();
+            m_sharedSignatureStore = std::make_shared<SignatureStore::SignatureStore>();
+            m_sharedPatternStore = std::make_shared<PatternStore::PatternStore>();
+            m_sharedThreatIntelStore = std::make_shared<ThreatIntel::ThreatIntelStore>();
+        } catch (const std::exception& e) {
+            Utils::Logger::Error(L"Failed to create shared ThreatIntel stores: {}",
+                Utils::StringUtils::ToWideString(e.what()));
+        }
+
         // Create Anti-Evasion Detectors (non-singleton, owned)
         try {
             m_debuggerDetector = std::make_unique<ShadowStrike::AntiEvasion::DebuggerEvasionDetector>();
@@ -596,6 +618,10 @@ public:
             if (!m_metamorphicDetector->Initialize()) {
                 Utils::Logger::Warn(L"RealTimeProtection: MetamorphicDetector Initialize failed");
             } else {
+                // Wire ThreatIntel stores for IOC-enriched detection
+                if (m_sharedSignatureStore) m_metamorphicDetector->SetSignatureStore(m_sharedSignatureStore);
+                if (m_sharedHashStore) m_metamorphicDetector->SetHashStore(m_sharedHashStore);
+                if (m_sharedPatternStore) m_metamorphicDetector->SetPatternStore(m_sharedPatternStore);
                 // Wire detection callback for per-technique SOC/SIEM telemetry
                 m_metamorphicDetector->SetDetectionCallback(
                     [](const std::wstring& file, const ShadowStrike::AntiEvasion::MetamorphicDetectedTechnique& detection) {
@@ -613,6 +639,8 @@ public:
             if (!m_networkDetector->Initialize()) {
                 Utils::Logger::Warn(L"RealTimeProtection: NetworkBasedEvasionDetector Initialize failed");
             } else {
+                // Wire ThreatIntel store for C2/DGA/IOC correlation
+                if (m_sharedThreatIntelStore) m_networkDetector->SetThreatIntelStore(m_sharedThreatIntelStore);
                 m_networkDetector->SetDetectionCallback(
                     [](uint32_t pid, const ShadowStrike::AntiEvasion::NetworkDetectedTechnique& detection) {
                         if (detection.severity >= ShadowStrike::AntiEvasion::NetworkEvasionSeverity::High) {
@@ -647,6 +675,10 @@ public:
             if (!m_packerDetector->Initialize()) {
                 Utils::Logger::Warn(L"RealTimeProtection: PackerDetector Initialize failed");
             } else {
+                // Wire ThreatIntel stores for packer signature/hash/pattern correlation
+                if (m_sharedSignatureStore) m_packerDetector->SetSignatureStore(m_sharedSignatureStore);
+                if (m_sharedPatternStore) m_packerDetector->SetPatternStore(m_sharedPatternStore);
+                if (m_sharedHashStore) m_packerDetector->SetHashStore(m_sharedHashStore);
                 m_packerDetector->SetDetectionCallback(
                     [](const std::wstring& file, const ShadowStrike::AntiEvasion::PackerMatch& match) {
                         if (match.severity >= ShadowStrike::AntiEvasion::PackerSeverity::High) {
@@ -987,7 +1019,13 @@ public:
             pdConfig.flags = ShadowStrike::AntiEvasion::PackerAnalysisFlags::DeepScan;
             pdConfig.processId = req.header.processId;
 
-            auto packResult = m_packerDetector->AnalyzeFile(filePath, pdConfig);
+            ShadowStrike::AntiEvasion::PackerError pdErr{};
+            auto packResult = m_packerDetector->AnalyzeFile(filePath, pdConfig, &pdErr);
+            if (pdErr.win32Code != 0) {
+                Utils::Logger::Warn(
+                    L"RealTimeProtection: PackerDetector analysis failed for {} — error={} {}",
+                    filePath.substr(0, 120), pdErr.win32Code, pdErr.message);
+            }
             if (packResult.isPacked) {
                 fileIsPacked = true;
                 packingConfidence = packResult.packingConfidence;
@@ -1230,6 +1268,15 @@ public:
                 vmConfig.analyzeCodePatterns = true;
                 vmConfig.analyzeImports = true;
                 vmConfig.analyzeStrings = true;
+
+                // Feed kernel-verified context for tamper-proof anti-VM detection
+                ShadowStrike::AntiEvasion::VMKernelContext vmKernelCtx;
+                vmKernelCtx.imagePath = imagePath;
+                vmKernelCtx.commandLine = commandLine;
+                vmKernelCtx.parentProcessId = req.parentProcessId;
+                vmKernelCtx.creatingProcessId = req.creatingProcessId;
+                vmKernelCtx.creatingThreadId = req.creatingThreadId;
+                vmConfig.kernelContext = std::move(vmKernelCtx);
 
                 if (m_vmDetector->AnalyzeProcessAntiVMBehavior(req.processId, vmResult, vmConfig)) {
                     if (vmResult.hasAntiVMBehavior) {
@@ -1514,7 +1561,13 @@ public:
                 pdConfig.flags = ShadowStrike::AntiEvasion::PackerAnalysisFlags::DeepScan;
                 pdConfig.processId = req.processId;
 
-                auto packResult = m_packerDetector->AnalyzeFile(imagePath, pdConfig);
+                ShadowStrike::AntiEvasion::PackerError pdErr{};
+                auto packResult = m_packerDetector->AnalyzeFile(imagePath, pdConfig, &pdErr);
+                if (pdErr.win32Code != 0) {
+                    Utils::Logger::Warn(
+                        L"RealTimeProtection: PackerDetector analysis failed for DLL {} in PID {} — error={} {}",
+                        imagePath.substr(0, 120), req.processId, pdErr.win32Code, pdErr.message);
+                }
                 if (packResult.isPacked) {
                     // Malware-specific packer on DLL load = immediate block
                     if (packResult.severity >= ShadowStrike::AntiEvasion::PackerSeverity::Critical) {
@@ -1723,7 +1776,12 @@ public:
             }
 
             case FilterMessageType_NetworkAlert: {
+                // Kernel network threat intelligence (C2 beaconing, suspicious DNS, etc.)
+                // Forward to NetworkBasedEvasionDetector for domain/IP correlation
                 Utils::Logger::Warn(L"RealTimeProtection: Network threat alert from kernel (payload {} bytes)", size);
+                // NOTE: When kernel NetworkFilter starts sending structured NetworkAlert
+                // messages, parse the payload here and feed to m_networkDetector->AnalyzeDomain()
+                // for DGA/C2/DNS tunneling correlation against ThreatIntel store.
                 break;
             }
 

@@ -37,7 +37,7 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
 #include "../Utils/FileUtils.hpp"
-#include "../Utils/Base64Utils.hpp" // Assuming this exists or using internal helper
+#include "../Utils/Base64Utils.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -726,10 +726,20 @@ bool IsSelfSigned(const CertificateInfo& cert) { return cert.subject == cert.iss
 bool IsCACertificate(const CertificateInfo& cert) { return cert.isCA; }
 bool DomainMatches(std::string_view pattern, std::string_view domain) { return IsDomainMatch(std::string(pattern), std::string(domain)); }
 std::string Base64Encode(std::span<const uint8_t> data) {
-    std::vector<uint8_t> vec(data.begin(), data.end());
-    return Utils::CryptoUtils::BytesToBase64(vec);
+    std::string encoded;
+    if (!ShadowStrike::Utils::Base64Encode(data.data(), data.size(), encoded)) {
+        return {};
+    }
+    return encoded;
 }
-std::vector<uint8_t> Base64Decode(std::string_view base64) { return {}; }
+std::vector<uint8_t> Base64Decode(std::string_view base64) {
+    std::vector<uint8_t> decoded;
+    ShadowStrike::Utils::Base64DecodeError err{};
+    if (!ShadowStrike::Utils::Base64Decode(base64, decoded, err)) {
+        return {};
+    }
+    return decoded;
+}
 
 } // namespace Banking
 } // namespace ShadowStrike
