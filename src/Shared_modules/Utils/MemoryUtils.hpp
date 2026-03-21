@@ -55,7 +55,6 @@
 
 #include "Logger.hpp"
 #include "SystemUtils.hpp"
-#include "FileUtils.hpp"
 
 namespace ShadowStrike {
 	namespace Utils {
@@ -168,13 +167,26 @@ namespace ShadowStrike {
 				void* data = nullptr;      ///< Pointer to usable data region
 				size_t dataSize = 0;       ///< Requested data size
 				size_t totalSize = 0;      ///< Total allocation (guards + data)
-				bool executable = false;   ///< Whether data region is executable
+				bool executable = false;   ///< Whether data region should become executable
 
 				/**
 				 * @brief Release the guarded allocation.
 				 * @note Safe to call multiple times.
 				 */
 				void Release() noexcept;
+
+				/**
+				 * @brief Transition data region from RW to RX (W^X enforcement).
+				 *
+				 * After writing code into the data region, call this to remove
+				 * write permission and enable execute. This enforces the W^X
+				 * security policy — memory is never simultaneously writable
+				 * and executable.
+				 *
+				 * @return true on success.
+				 * @note Only valid when executable == true.
+				 */
+				[[nodiscard]] bool FinalizeExecutable() noexcept;
 			};
 
 			/**

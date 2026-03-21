@@ -74,8 +74,9 @@ namespace ShadowStrike {
 				
 				// Check for overflow before aligning
 				if (v > SIZE_MAX - (a - 1)) {
-					// Overflow would occur - return max aligned value
-					return SIZE_MAX & ~(a - 1);
+					// Cannot align up without overflow — return SIZE_MAX
+					// so the caller's subsequent overflow checks will catch it
+					return SIZE_MAX;
 				}
 				
 				return (v + (a - 1)) & ~(a - 1);
@@ -137,8 +138,15 @@ namespace ShadowStrike {
 #ifdef _WIN32
 				void* p = ::VirtualAlloc(desiredBase, size, flags, protect);
 				if (p == nullptr) {
-					SS_LOG_LAST_ERROR(L"MemoryUtils", L"VirtualAlloc failed (size=%llu, flags=0x%08X, protect=0x%08X)",
-						static_cast<unsigned long long>(size), flags, protect);
+					if (desiredBase != nullptr) {
+						SS_LOG_LAST_ERROR(L"MemoryUtils",
+							L"VirtualAlloc failed at desiredBase=%p (size=%llu, flags=0x%08X, protect=0x%08X) — address may be in use",
+							desiredBase, static_cast<unsigned long long>(size), flags, protect);
+					}
+					else {
+						SS_LOG_LAST_ERROR(L"MemoryUtils", L"VirtualAlloc failed (size=%llu, flags=0x%08X, protect=0x%08X)",
+							static_cast<unsigned long long>(size), flags, protect);
+					}
 				}
 				return p;
 #else
@@ -166,18 +174,18 @@ namespace ShadowStrike {
 				}
 				else if (freeType == MEM_DECOMMIT) {
 					// For MEM_DECOMMIT: validate size
-					const size_t page = PageSize();
-					
 					if (size == 0) {
 						SS_LOG_ERROR(L"MemoryUtils", L"VirtualFree(MEM_DECOMMIT) requires non-zero size (base=%p)", base);
 						return false;
 					}
-					
+
+					// VirtualFree rounds size up to page boundary internally,
+					// but log if caller passes non-aligned size for diagnostics
+					const size_t page = PageSize();
 					if ((size % page) != 0) {
-						SS_LOG_ERROR(L"MemoryUtils", 
-							L"VirtualFree(MEM_DECOMMIT) size must be page-aligned (size=%llu, page=%llu)",
+						SS_LOG_DEBUG(L"MemoryUtils",
+							L"VirtualFree(MEM_DECOMMIT) size not page-aligned (size=%llu, page=%llu) — OS will round up",
 							static_cast<unsigned long long>(size), static_cast<unsigned long long>(page));
-						return false;
 					}
 
 					// Sanity check - prevent absurdly large sizes
@@ -347,9 +355,10 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// Commit data region with requested protection
+				// Commit data region — always PAGE_READWRITE initially (W^X policy).
+				// Caller must call FinalizeExecutable() after writing code.
 				BYTE* dataPtr = guardFront + page;
-				const DWORD prot = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+				const DWORD prot = PAGE_READWRITE;
 
 				if (::VirtualAlloc(dataPtr, dataSizeAligned, MEM_COMMIT, prot) == nullptr) {
 					SS_LOG_LAST_ERROR(L"MemoryUtils", L"AllocateWithGuards: VirtualAlloc(MEM_COMMIT) failed (dataSize=%llu)",
@@ -375,6 +384,47 @@ namespace ShadowStrike {
 				return true;
 #else
 				(void)dataSize; (void)out; (void)executable;
+				return false;
+#endif
+			}
+
+
+			bool GuardedAlloc::FinalizeExecutable() noexcept {
+#ifdef _WIN32
+				if (data == nullptr || dataSize == 0) {
+					SS_LOG_ERROR(L"MemoryUtils", L"FinalizeExecutable: No data region allocated");
+					return false;
+				}
+
+				if (!executable) {
+					SS_LOG_ERROR(L"MemoryUtils", L"FinalizeExecutable: Allocation was not marked executable");
+					return false;
+				}
+
+				const size_t page = PageSize();
+				const size_t dataSizeAligned = AlignUp(dataSize, page);
+				if (dataSizeAligned == SIZE_MAX) {
+					SS_LOG_ERROR(L"MemoryUtils", L"FinalizeExecutable: Size overflow during alignment");
+					return false;
+				}
+
+				// Transition from PAGE_READWRITE to PAGE_EXECUTE_READ (W^X enforcement)
+				DWORD oldProt = 0;
+				if (!::VirtualProtect(data, dataSizeAligned, PAGE_EXECUTE_READ, &oldProt)) {
+					SS_LOG_LAST_ERROR(L"MemoryUtils",
+						L"FinalizeExecutable: VirtualProtect(PAGE_EXECUTE_READ) failed (data=%p, size=%llu)",
+						data, static_cast<unsigned long long>(dataSizeAligned));
+					return false;
+				}
+
+				// Flush instruction cache after protection change
+				if (!::FlushInstructionCache(GetCurrentProcess(), data, dataSizeAligned)) {
+					SS_LOG_LAST_ERROR(L"MemoryUtils", L"FinalizeExecutable: FlushInstructionCache failed");
+					// Non-fatal — some CPUs may still work without explicit flush
+				}
+
+				return true;
+#else
 				return false;
 #endif
 			}
@@ -413,6 +463,11 @@ namespace ShadowStrike {
 				}
 				
 				const size_t aligned = AlignUp(size, lp);
+				if (aligned == SIZE_MAX) {
+					SS_LOG_ERROR(L"MemoryUtils", L"AllocLargePages: Size overflow during alignment (size=%llu, lp=%llu)",
+						static_cast<unsigned long long>(size), static_cast<unsigned long long>(lp));
+					return nullptr;
+				}
 				
 				void* p = ::VirtualAlloc(nullptr, aligned, 
 					MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, protect);
@@ -510,6 +565,16 @@ namespace ShadowStrike {
 					SS_LOG_ERROR(L"MemoryUtils",
 						L"GetWriteWatch (address query) failed (res=%u, error=%lu)",
 						res, lastError);
+					addresses.clear();
+					return false;
+				}
+
+				// Defensive bounds check — actualCount must not exceed buffer
+				if (actualCount > count) {
+					SS_LOG_ERROR(L"MemoryUtils",
+						L"GetWriteWatch returned more addresses (%llu) than buffer (%llu) — possible race",
+						static_cast<unsigned long long>(actualCount),
+						static_cast<unsigned long long>(count));
 					addresses.clear();
 					return false;
 				}
@@ -673,7 +738,11 @@ namespace ShadowStrike {
 				}
 
 				const DWORD access = rw ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ;
-				const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+				// Read-only: deny concurrent writes to prevent TOCTOU during scanning.
+				// Read-write: allow sharing since caller expects concurrent access.
+				const DWORD share = rw
+					? (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+					: (FILE_SHARE_READ | FILE_SHARE_DELETE);
 				const DWORD disp = rw ? OPEN_ALWAYS : OPEN_EXISTING;
 				const DWORD attrs = FILE_ATTRIBUTE_NORMAL | (rw ? 0 : FILE_FLAG_SEQUENTIAL_SCAN);
 
