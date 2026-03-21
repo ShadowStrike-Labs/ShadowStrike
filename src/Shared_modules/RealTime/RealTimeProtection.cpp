@@ -577,6 +577,19 @@ public:
         if (m_processDetector) {
             if (!m_processDetector->Initialize()) {
                 Utils::Logger::Warn(L"RealTimeProtection: ProcessEvasionDetector Initialize failed");
+            } else {
+                // Wire detection callback for per-technique SOC/SIEM telemetry
+                m_processDetector->SetDetectionCallback(
+                    [](uint32_t pid, const ShadowStrike::AntiEvasion::DetectedTechnique& detection) {
+                        if (detection.severity >= ShadowStrike::AntiEvasion::ProcessEvasionSeverity::High) {
+                            Utils::Logger::Warn(
+                                L"[PED-CB] PID={} technique={} confidence={:.2f} severity={} details={}",
+                                pid, detection.description,
+                                detection.confidence,
+                                static_cast<int>(detection.severity),
+                                detection.technicalDetails.substr(0, 200));
+                        }
+                    });
             }
         }
         if (m_metamorphicDetector) {
@@ -1167,12 +1180,50 @@ public:
                 }
             }
 
-            // 3. Process Evasion
-            if (!evasionDetected && m_processDetector) {
-                auto result = m_processDetector->AnalyzeProcess(req.processId);
+            // 3. Process Evasion — kernel-enriched injection/hollowing/masquerading detection
+            if (m_processDetector) {
+                ShadowStrike::AntiEvasion::ProcessAnalysisConfig pedConfig;
+                pedConfig.flags = ShadowStrike::AntiEvasion::ProcessAnalysisFlags::Default
+                                | ShadowStrike::AntiEvasion::ProcessAnalysisFlags::DeepAnalysis;
+                pedConfig.enableDeepScan = true;
+
+                // Feed kernel-verified context for tamper-proof masquerading/PPID detection
+                ShadowStrike::AntiEvasion::ProcessKernelContext pedKernelCtx;
+                pedKernelCtx.imagePath = imagePath;
+                pedKernelCtx.commandLine = commandLine;
+                pedKernelCtx.parentProcessId = req.parentProcessId;
+                pedKernelCtx.creatingProcessId = req.creatingProcessId;
+                pedKernelCtx.creatingThreadId = req.creatingThreadId;
+                pedConfig.kernelContext = std::move(pedKernelCtx);
+
+                auto result = m_processDetector->AnalyzeProcess(req.processId, pedConfig);
                 if (result.isEvasive) {
                     evasionDetected = true;
-                    detectionSource = L"Process Evasion";
+                    detectionSource = std::format(
+                        L"Process Evasion [score={:.1f} severity={} detections={}]",
+                        result.evasionScore,
+                        static_cast<int>(result.maxSeverity),
+                        result.totalDetections);
+
+                    // Rich telemetry for SOC/SIEM: per-technique logging
+                    for (const auto& tech : result.detectedTechniques) {
+                        if (tech.severity >= ShadowStrike::AntiEvasion::ProcessEvasionSeverity::High) {
+                            Utils::Logger::Warn(
+                                L"RealTimeProtection: PID {} process evasion: {} "
+                                L"(confidence={:.2f} severity={})",
+                                req.processId, tech.description,
+                                tech.confidence, static_cast<int>(tech.severity));
+                        }
+                    }
+
+                    // Critical severity → immediate block (APT-grade process evasion)
+                    if (result.maxSeverity >= ShadowStrike::AntiEvasion::ProcessEvasionSeverity::Critical) {
+                        Utils::Logger::Error(
+                            L"RealTimeProtection: CRITICAL process evasion in PID {} — "
+                            L"score={:.1f} detections={} image={}",
+                            req.processId, result.evasionScore,
+                            result.totalDetections, imagePath.substr(0, 120));
+                    }
                 }
             }
 

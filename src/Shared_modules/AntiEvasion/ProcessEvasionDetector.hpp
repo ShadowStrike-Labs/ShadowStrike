@@ -419,6 +419,34 @@ namespace ShadowStrike::AntiEvasion {
     };
 
     /**
+     * @brief Kernel-verified process context for enhanced evasion detection
+     *
+     * Populated from kernel PsSetCreateProcessNotifyRoutineEx callback —
+     * tamper-proof data immune to user-mode API hooking.
+     */
+    struct ProcessKernelContext {
+        /// @brief Kernel-verified image path
+        std::wstring imagePath;
+
+        /// @brief Kernel-verified command line
+        std::wstring commandLine;
+
+        /// @brief Kernel-reported parent PID (tamper-proof)
+        uint32_t parentProcessId = 0;
+
+        /// @brief Actual creating process ID (may differ from parent if PPID spoofed)
+        uint32_t creatingProcessId = 0;
+
+        /// @brief Creating thread ID
+        uint32_t creatingThreadId = 0;
+
+        /// @brief Whether kernel data is populated
+        [[nodiscard]] bool hasKernelData() const noexcept {
+            return !imagePath.empty() || parentProcessId != 0;
+        }
+    };
+
+    /**
      * @brief Analysis configuration
      */
     struct ProcessAnalysisConfig {
@@ -427,6 +455,9 @@ namespace ShadowStrike::AntiEvasion {
         bool enableDeepScan = false;
         bool checkAllThreads = true;
         bool checkAllModules = true;
+
+        /// @brief Kernel-verified process context for enhanced masquerading/PPID detection
+        std::optional<ProcessKernelContext> kernelContext;
     };
 
     /**

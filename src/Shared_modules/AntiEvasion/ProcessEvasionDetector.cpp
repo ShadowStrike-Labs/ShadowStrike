@@ -2888,6 +2888,86 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
+            // ====================================================================
+            // KERNEL-ENRICHED PROCESS EVASION DETECTION
+            // Uses tamper-proof data from kernel PsSetCreateProcessNotifyRoutineEx
+            // ====================================================================
+            if (config.kernelContext.has_value() && config.kernelContext->hasKernelData()) {
+                const auto& kctx = *config.kernelContext;
+
+                // T1134.004: Kernel-verified PPID spoofing — creating PID != parent PID
+                // This is the DEFINITIVE PPID spoof check: kernel sees the actual creator
+                if (kctx.creatingProcessId != 0 &&
+                    kctx.parentProcessId != 0 &&
+                    kctx.creatingProcessId != kctx.parentProcessId) {
+
+                    DetectedTechnique detection(ProcessEvasionTechnique::MASK_ParentProcessSpoofing);
+                    detection.severity = ProcessEvasionSeverity::Critical;
+                    detection.confidence = 0.98;
+                    detection.description = L"Kernel-verified PPID spoofing detected";
+                    detection.technicalDetails = std::format(
+                        L"Kernel: parentPid={} creatingPid={} image={} — "
+                        L"creating process differs from declared parent (definitive spoof)",
+                        kctx.parentProcessId, kctx.creatingProcessId,
+                        kctx.imagePath.substr(0, 120));
+                    AddDetection(result, std::move(detection));
+                }
+
+                // T1036.005: Path masquerading — kernel path vs expected path
+                // Kernel image path is immune to user-mode PEB manipulation
+                if (!kctx.imagePath.empty()) {
+                    std::wstring lowerKernelPath;
+                    lowerKernelPath.reserve(kctx.imagePath.size());
+                    for (wchar_t ch : kctx.imagePath) {
+                        lowerKernelPath += static_cast<wchar_t>(towlower(ch));
+                    }
+
+                    // Check kernel-verified path against known legitimate paths
+                    if (m_impl->IsPathAnomaly(result.processName, lowerKernelPath)) {
+                        // Only add if user-mode masquerading check didn't already catch it
+                        if (!result.masqueradingInfo.hasPathAnomaly) {
+                            DetectedTechnique detection(ProcessEvasionTechnique::MASK_PathAnomaly);
+                            detection.severity = ProcessEvasionSeverity::High;
+                            detection.confidence = 0.95;
+                            detection.description = L"Kernel-verified path anomaly";
+                            detection.technicalDetails = std::format(
+                                L"Kernel path={} process={} — kernel confirms masquerading",
+                                kctx.imagePath.substr(0, 100),
+                                result.processName.substr(0, 60));
+                            AddDetection(result, std::move(detection));
+                        }
+                    }
+                }
+
+                // T1059: Suspicious command-line patterns from kernel
+                if (!kctx.commandLine.empty()) {
+                    std::wstring lowerCmd;
+                    lowerCmd.reserve(kctx.commandLine.size());
+                    for (wchar_t ch : kctx.commandLine) {
+                        lowerCmd += static_cast<wchar_t>(towlower(ch));
+                    }
+
+                    // Process with injection APIs + obfuscated command line
+                    if (result.injectionInfo.hasInjection &&
+                        (lowerCmd.find(L"-enc") != std::wstring::npos ||
+                         lowerCmd.find(L"frombase64") != std::wstring::npos ||
+                         lowerCmd.find(L"-nop") != std::wstring::npos ||
+                         lowerCmd.find(L"-w hidden") != std::wstring::npos)) {
+
+                        DetectedTechnique detection(ProcessEvasionTechnique::MASK_CommandLineInconsistency);
+                        detection.severity = ProcessEvasionSeverity::Critical;
+                        detection.confidence = 0.92;
+                        detection.description = L"Injection-capable process with obfuscated command line";
+                        detection.technicalDetails = std::format(
+                            L"cmd={} — process has {} injected DLLs, {} suspicious memory regions",
+                            kctx.commandLine.substr(0, 150),
+                            result.injectionInfo.injectedDLLs.size(),
+                            result.injectionInfo.suspiciousMemoryRegions);
+                        AddDetection(result, std::move(detection));
+                    }
+                }
+            }
+
             // Calculate final evasion score
             CalculateEvasionScore(result);
         }
