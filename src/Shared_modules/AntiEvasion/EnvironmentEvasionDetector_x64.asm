@@ -644,14 +644,14 @@ MeasureExceptionTiming ENDP
 ;   RAX = IDT base address (64-bit)
 ; ==============================================================================
 GetIDTBase PROC
-    sub     rsp, 10h                ; Allocate 16 bytes for IDTR
+    sub     rsp, 18h                ; 24 bytes: 10 for IDTR + 8 for 16-byte alignment
 
     sidt    [rsp]                   ; Store IDT register (10 bytes)
 
     ; Load base address (skip first 2 bytes which are limit)
     mov     rax, qword ptr [rsp + 2]
 
-    add     rsp, 10h
+    add     rsp, 18h
     ret
 GetIDTBase ENDP
 
@@ -665,14 +665,14 @@ GetIDTBase ENDP
 ;   RAX = GDT base address (64-bit)
 ; ==============================================================================
 GetGDTBase PROC
-    sub     rsp, 10h                ; Allocate 16 bytes for GDTR
+    sub     rsp, 18h                ; 24 bytes: 10 for GDTR + 8 for 16-byte alignment
 
     sgdt    [rsp]                   ; Store GDT register (10 bytes)
 
     ; Load base address (skip first 2 bytes which are limit)
     mov     rax, qword ptr [rsp + 2]
 
-    add     rsp, 10h
+    add     rsp, 18h
     ret
 GetGDTBase ENDP
 

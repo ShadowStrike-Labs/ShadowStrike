@@ -53,6 +53,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -239,12 +240,16 @@ namespace ShadowStrike {
                     outValue.clear();
                     return false;
                 }
+                // Empty buffer → empty string (valid)
+                if (buf.empty()) {
+                    outValue.clear();
+                    return true;
+                }
                 // Validate alignment for wchar_t
                 if ((buf.size() % sizeof(wchar_t)) != 0) {
                     outValue.clear();
                     return false;
                 }
-                // Safe even if buf is empty (size / sizeof(wchar_t) == 0)
                 const wchar_t* begin = reinterpret_cast<const wchar_t*>(buf.data());
                 const size_t charCount = buf.size() / sizeof(wchar_t);
                 outValue.assign(begin, begin + charCount);
@@ -326,10 +331,26 @@ namespace ShadowStrike {
 
                 Entry() = default;
                 ~Entry() = default;
-                Entry(const Entry&) = default;
-                Entry& operator=(const Entry&) = default;
+                // Copy is deleted: lruIt aliasing makes copies unsafe
+                Entry(const Entry&) = delete;
+                Entry& operator=(const Entry&) = delete;
                 Entry(Entry&&) noexcept = default;
                 Entry& operator=(Entry&&) noexcept = default;
+            };
+
+            /**
+             * @brief Data-only snapshot for disk persistence (no LRU iterator).
+             *
+             * Used when we need to persist an entry outside the lock scope.
+             * Deliberately excludes lruIt to prevent iterator aliasing bugs.
+             */
+            struct EntrySnapshot final {
+                std::wstring key;
+                std::vector<uint8_t> value;
+                FILETIME expire{};
+                std::chrono::milliseconds ttl{0};
+                bool sliding = false;
+                bool persistent = false;
             };
 
             /**
@@ -404,11 +425,11 @@ namespace ShadowStrike {
             // ================================================================
 
             [[nodiscard]] bool ensureBaseDir();
-            [[nodiscard]] bool ensureSubdirForHash(const std::wstring& hex2);
-            [[nodiscard]] bool persistWrite(const std::wstring& key, const Entry& e);
+            [[nodiscard]] bool ensureSubdirForHash(const std::wstring& baseDir, const std::wstring& hex2);
+            [[nodiscard]] bool persistWrite(const std::wstring& key, const EntrySnapshot& e);
             [[nodiscard]] bool persistRead(const std::wstring& key, Entry& out);
             [[nodiscard]] bool persistRemoveByKey(const std::wstring& key);
-            [[nodiscard]] std::wstring pathForKeyHex(const std::wstring& hex) const;
+            [[nodiscard]] std::wstring pathForKeyHex(const std::wstring& baseDir, const std::wstring& hex) const;
 
             // ================================================================
             // Hash Helpers
@@ -441,6 +462,7 @@ namespace ShadowStrike {
             // Synchronization primitives
             mutable SRWLOCK m_lock{};                                       ///< Protects m_map, m_lru, m_totalBytes
             mutable SRWLOCK m_diskLock{};                                   ///< Protects disk operations
+            std::mutex m_lifecycleMutex;                                    ///< Serializes Initialize/Shutdown calls
 
             // In-memory cache data (protected by m_lock)
             std::unordered_map<std::wstring, std::shared_ptr<Entry>> m_map; ///< Key -> Entry mapping
@@ -450,7 +472,7 @@ namespace ShadowStrike {
             // Thread management (atomic for lock-free access)
             std::atomic<bool> m_shutdown{false};                            ///< Shutdown flag
             std::thread m_maintThread;                                      ///< Background maintenance thread
-            std::chrono::milliseconds m_maintInterval{std::chrono::minutes(1)}; ///< Maintenance interval
+            std::atomic<int64_t> m_maintIntervalMs{60000}; ///< Maintenance interval in ms (default 1 min)
             std::atomic<uint64_t> m_lastMaint{0};                           ///< Last maintenance timestamp
 
             // Disk I/O tracking

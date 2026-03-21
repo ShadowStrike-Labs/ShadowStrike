@@ -741,7 +741,7 @@ Return Value:
     g_ProcessMonitor.ProcessAnalyzer = (PVOID)ShadowStrikeGetProcessAnalyzer();
     g_ProcessMonitor.Config.EnablePrivilegeMonitoring = TRUE;
     g_ProcessMonitor.Config.EnableSignatureVerification = TRUE;
-    g_ProcessMonitor.Config.BlockSuspiciousProcesses = FALSE;  // Audit mode by default
+    g_ProcessMonitor.Config.BlockSuspiciousProcesses = TRUE;   // Enforce mode — block threats
     g_ProcessMonitor.Config.MinBlockScore = PN_SUSPICION_CRITICAL;
     g_ProcessMonitor.Config.AnalysisTimeoutMs = PN_USER_MODE_TIMEOUT_MS;
     g_ProcessMonitor.Config.MaxNotificationsPerSecond = PN_MAX_NOTIFICATIONS_PER_SECOND;

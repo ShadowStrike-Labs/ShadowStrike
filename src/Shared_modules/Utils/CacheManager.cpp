@@ -416,6 +416,9 @@ namespace ShadowStrike {
             size_t maxBytes,
             std::chrono::milliseconds maintenanceInterval
         ) {
+            // Serialize lifecycle operations to prevent torn config writes
+            std::lock_guard<std::mutex> lifecycleGuard(m_lifecycleMutex);
+
             // Check if already initialized and running
             const bool isShutdown = m_shutdown.load(std::memory_order_acquire);
 
@@ -452,7 +455,7 @@ namespace ShadowStrike {
             // Store configuration
             m_maxEntries = maxEntries;
             m_maxBytes = maxBytes;
-            m_maintInterval = maintenanceInterval;
+            m_maintIntervalMs.store(maintenanceInterval.count(), std::memory_order_relaxed);
 
             // Setup base directory
             if (!baseDir.empty()) {
@@ -489,28 +492,12 @@ namespace ShadowStrike {
                 // Continue anyway - disk persistence will simply fail
             }
 
-            // Generate HMAC key for cache file integrity
-            const auto& bcryptApi = BcryptApi::Instance();
-            if (bcryptApi.IsAvailable()) {
-                try {
-                    m_hmacKey.resize(32); // 256-bit key
-                    const NTSTATUS status = BCryptGenRandom(
-                        nullptr,
-                        m_hmacKey.data(),
-                        static_cast<ULONG>(m_hmacKey.size()),
-                        BCRYPT_USE_SYSTEM_PREFERRED_RNG
-                    );
-                    if (status != 0) {
-                        // Failed to generate random key - clear and fall back to FNV-1a
-                        SecureZeroMemory(m_hmacKey.data(), m_hmacKey.size());
-                        m_hmacKey.clear();
-                        SS_LOG_WARN(L"CacheManager", L"BCryptGenRandom failed, using FNV-1a fallback");
-                    }
-                }
-                catch (const std::bad_alloc&) {
-                    m_hmacKey.clear();
-                }
-            }
+            // NOTE: No session-random HMAC key for file path hashing.
+            // File paths must be deterministic across process restarts so
+            // persistent entries survive. hashKeyToHex() uses plain SHA256
+            // (no HMAC secret) for deterministic, cross-session file lookup.
+            // HMAC integrity is NOT needed here — files are validated by
+            // magic number, version, key verification, and size checks.
 
             // Load persistent cache entries from disk
             loadPersistentEntries();
@@ -535,6 +522,9 @@ namespace ShadowStrike {
         }
 
         void CacheManager::Shutdown() {
+            // Serialize lifecycle operations
+            std::lock_guard<std::mutex> lifecycleGuard(m_lifecycleMutex);
+
             // Signal shutdown to maintenance thread
             m_shutdown.store(true, std::memory_order_release);
 
@@ -568,19 +558,20 @@ namespace ShadowStrike {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
 
-            // Clear in-memory cache under lock
+            // Clear in-memory cache and reset configuration under lock
             {
                 SRWExclusive guard(m_lock);
                 m_map.clear();
                 m_lru.clear();
                 m_totalBytes = 0;
-            }
 
-            // Reset configuration
-            m_baseDir.clear();
-            m_maxEntries = 0;
-            m_maxBytes = 0;
-            m_maintInterval = std::chrono::minutes(1);
+                // Reset configuration under same lock to prevent races
+                // with Get/Put/Contains that read these fields
+                m_baseDir.clear();
+                m_maxEntries = 0;
+                m_maxBytes = 0;
+                m_maintIntervalMs.store(60000, std::memory_order_relaxed);
+            }
 
             // Securely zero and clear HMAC key
             if (!m_hmacKey.empty()) {
@@ -758,8 +749,14 @@ namespace ShadowStrike {
             // ----------------------------------------------------------------
 
             if (persistent) {
-                // Failure to persist is not fatal - entry is still in memory
-                if (!persistWrite(key, *entry)) {
+                EntrySnapshot snapshot;
+                snapshot.key = entry->key;
+                snapshot.value = entry->value;
+                snapshot.expire = entry->expire;
+                snapshot.ttl = entry->ttl;
+                snapshot.sliding = entry->sliding;
+                snapshot.persistent = entry->persistent;
+                if (!persistWrite(key, snapshot)) {
                     SS_LOG_WARN(L"CacheManager", L"Failed to persist cache entry to disk");
                 }
             }
@@ -776,7 +773,7 @@ namespace ShadowStrike {
 
             const FILETIME now = nowFileTime();
             bool needsPersistUpdate = false;
-            Entry entryCopyForPersist;
+            EntrySnapshot snapshotForPersist;
             bool foundInMemory = false;
 
             // Variables for deferred disk cleanup
@@ -830,7 +827,12 @@ namespace ShadowStrike {
 
                             if (entry->persistent) {
                                 needsPersistUpdate = true;
-                                entryCopyForPersist = *entry;
+                                snapshotForPersist.key = entry->key;
+                                snapshotForPersist.value = entry->value;
+                                snapshotForPersist.expire = entry->expire;
+                                snapshotForPersist.ttl = entry->ttl;
+                                snapshotForPersist.sliding = entry->sliding;
+                                snapshotForPersist.persistent = entry->persistent;
                             }
                         }
 
@@ -875,7 +877,7 @@ namespace ShadowStrike {
 
             // Update persistent storage for sliding expiration
             if (needsPersistUpdate) {
-                if (!persistWrite(key, entryCopyForPersist)) {
+                if (!persistWrite(key, snapshotForPersist)) {
                     SS_LOG_ERROR(L"CacheManager", L"Failed to update sliding expiration in disk cache");
                     // Don't return false - entry is valid in memory
                 }
@@ -989,17 +991,18 @@ namespace ShadowStrike {
 
 
         void CacheManager::Clear() {
-            // PHASE 1: Clear in-memory cache under exclusive lock
-            // RAII guard ensures lock is released when scope exits
+            // PHASE 1: Clear in-memory cache and snapshot baseDir under exclusive lock
+            std::wstring baseDirSnapshot;
             {
                 SRWExclusive memGuard(m_lock);
                 m_map.clear();
                 m_lru.clear();
                 m_totalBytes = 0;
-            } // ← Lock automatically released here by destructor
+                baseDirSnapshot = m_baseDir;
+            }
 
-            // PHASE 2: Clear disk cache - only proceed if base directory is configured
-            if (m_baseDir.empty()) {
+            // PHASE 2: Clear disk cache - only proceed if base directory was configured
+            if (baseDirSnapshot.empty()) {
                 SS_LOG_INFO(L"CacheManager", L"Cache cleared (memory only)");
                 return;
             }
@@ -1009,7 +1012,7 @@ namespace ShadowStrike {
                 SRWExclusive diskGuard(m_diskLock);
 
                 // Build search mask for immediate subdirectories
-                std::wstring searchMask = m_baseDir;
+                std::wstring searchMask = baseDirSnapshot;
                 if (!searchMask.empty() && searchMask.back() != L'\\') {
                     searchMask.push_back(L'\\');
                 }
@@ -1042,7 +1045,7 @@ namespace ShadowStrike {
                     }
 
                     // Build path to cache files within this subdirectory
-                    std::wstring cacheFilesMask = m_baseDir + L"\\" + findData.cFileName + L"\\*.cache";
+                    std::wstring cacheFilesMask = baseDirSnapshot + L"\\" + findData.cFileName + L"\\*.cache";
 
                     WIN32_FIND_DATAW cacheFileData{};
                     HANDLE hFindCacheFiles = FindFirstFileW(cacheFilesMask.c_str(), &cacheFileData);
@@ -1062,7 +1065,7 @@ namespace ShadowStrike {
                             }
 
                             // Build full path to cache file
-                            std::wstring cacheFilePath = m_baseDir + L"\\" +
+                            std::wstring cacheFilePath = baseDirSnapshot + L"\\" +
                                 findData.cFileName + L"\\" +
                                 cacheFileData.cFileName;
 
@@ -1176,7 +1179,7 @@ namespace ShadowStrike {
                 const auto elapsed = now - lastMaintenance;
 
                 // Perform maintenance if interval has elapsed
-                if (elapsed >= m_maintInterval) {
+                if (elapsed >= std::chrono::milliseconds(m_maintIntervalMs.load(std::memory_order_relaxed))) {
                     try {
                         performMaintenance();
                         lastMaintenance = now;
@@ -1232,7 +1235,7 @@ namespace ShadowStrike {
                             auto res = persistRemoveByKey(key);
 							if (res == false) {
                                 SS_LOG_ERROR(L"CacheManager", L"Failed to remove expired cache entry from disk");
-                                return;
+                                continue;  // Continue with remaining keys
                             }
                         }
                         catch (const std::exception&) {
@@ -1592,14 +1595,12 @@ namespace ShadowStrike {
          * @param hex2 The hex hash string (only first 2 chars used).
          * @return true if directory exists or was created, false on failure.
          */
-        bool CacheManager::ensureSubdirForHash(const std::wstring& hex2) {
-            // Validate input
+        bool CacheManager::ensureSubdirForHash(const std::wstring& baseDir, const std::wstring& hex2) {
             if (hex2.size() < 2) {
                 return false;
             }
 
-            // Build subdirectory path
-            std::wstring subDir = m_baseDir;
+            std::wstring subDir = baseDir;
             if (!subDir.empty() && subDir.back() != L'\\') {
                 subDir.push_back(L'\\');
             }
@@ -1628,7 +1629,7 @@ namespace ShadowStrike {
          * @note This method includes path traversal protection to ensure
          *       the resulting path is within the cache base directory.
          */
-        std::wstring CacheManager::pathForKeyHex(const std::wstring& hex) const {
+        std::wstring CacheManager::pathForKeyHex(const std::wstring& baseDir, const std::wstring& hex) const {
             // Validate hex string length
             if (hex.size() < 2 || hex.size() > 64) {
                 return L"";
@@ -1642,7 +1643,7 @@ namespace ShadowStrike {
             }
 
             // Build initial path: baseDir\XX\XXXX....cache
-            std::wstring path = m_baseDir;
+            std::wstring path = baseDir;
             if (!path.empty() && path.back() != L'\\') {
                 path.push_back(L'\\');
             }
@@ -1661,8 +1662,8 @@ namespace ShadowStrike {
 
             // PATH TRAVERSAL PROTECTION:
             // Ensure canonicalized path is still within base directory
-            if (canonicalPath.size() < m_baseDir.size() ||
-                _wcsnicmp(canonicalPath.c_str(), m_baseDir.c_str(), m_baseDir.size()) != 0) {
+            if (canonicalPath.size() < baseDir.size() ||
+                _wcsnicmp(canonicalPath.c_str(), baseDir.c_str(), baseDir.size()) != 0) {
                 SS_LOG_WARN(L"CacheManager", L"Path traversal attempt blocked");
                 return L"";
             }
@@ -1684,47 +1685,51 @@ namespace ShadowStrike {
          *       and MOVEFILE_WRITE_THROUGH for atomic rename.
          */
 
-        bool CacheManager::persistWrite(const std::wstring& key, const Entry& entry) {
-            // INPUT VALIDATION
-            if (m_baseDir.empty() || key.empty()) {
+        bool CacheManager::persistWrite(const std::wstring& key, const EntrySnapshot& entry) {
+            if (key.empty()) {
                 return false;
             }
 
-            // PHASE 1: Acquire exclusive disk lock and track pending operation
-            // Both guards use RAII - automatically released on scope exit
-            SRWExclusive diskGuard(m_diskLock);
-            DiskOpGuard opGuard(m_pendingDiskOps);
+            // Snapshot m_baseDir under shared lock to prevent race with Shutdown
+            std::wstring baseDirSnapshot;
+            {
+                SRWShared guard(m_lock);
+                if (m_baseDir.empty()) {
+                    return false;
+                }
+                baseDirSnapshot = m_baseDir;
+            }
 
-            // PHASE 2: Generate and validate cryptographic hash of key
+            // PHASE 1: Generate and validate cryptographic hash of key (lock-free)
             const std::wstring hex = hashKeyToHex(key);
             if (hex.size() < 2 || hex.empty()) {
                 SS_LOG_ERROR(L"CacheManager", L"Failed to hash cache key");
                 return false;
             }
 
-            // PHASE 3: Ensure subdirectory exists
-            if (!ensureSubdirForHash(hex.substr(0, 2))) {
+            // PHASE 2: Ensure subdirectory exists (idempotent, safe without lock)
+            if (!ensureSubdirForHash(baseDirSnapshot, hex.substr(0, 2))) {
                 SS_LOG_ERROR(L"CacheManager", L"Failed to create cache subdirectory");
                 return false;
             }
 
-            // PHASE 4: Get validated final destination path (with path traversal protection)
-            std::wstring finalPath = pathForKeyHex(hex);
+            // PHASE 3: Get validated final destination path
+            std::wstring finalPath = pathForKeyHex(baseDirSnapshot, hex);
             if (finalPath.empty()) {
                 SS_LOG_ERROR(L"CacheManager", L"Invalid cache file path generated");
                 return false;
             }
 
-            // PHASE 5: Generate unique temporary file path for atomic write
-            // Using timestamp + pointer address + process ID for uniqueness
+            // PHASE 4: Generate unique temporary file path
             wchar_t tempPath[MAX_PATH] = {};
             const int pathFormatResult = swprintf_s(
                 tempPath,
                 MAX_PATH,
-                L"%s.tmp.%08X%08X",
+                L"%s.tmp.%08X%08X%04X",
                 finalPath.c_str(),
                 static_cast<unsigned>(GetTickCount64() & 0xFFFFFFFF),
-                static_cast<unsigned>(reinterpret_cast<uintptr_t>(this) & 0xFFFFFFFF)
+                static_cast<unsigned>(reinterpret_cast<uintptr_t>(this) & 0xFFFFFFFF),
+                static_cast<unsigned>(GetCurrentThreadId() & 0xFFFF)
             );
             if (pathFormatResult <= 0) {
                 SS_LOG_ERROR(L"CacheManager", L"Failed to format temporary file path");
@@ -1842,17 +1847,20 @@ namespace ShadowStrike {
             }
 
             // PHASE 12: Close temporary file before atomic rename
-            // This ensures all data is flushed and file is fully written
-            tempFileHandle.Close();  // Explicit close, though ~FileHandle would do this
+            tempFileHandle.Close();
 
             // PHASE 13: Atomically move temporary file to final location
-            // MOVEFILE_WRITE_THROUGH ensures metadata is written to disk immediately
-            // MOVEFILE_REPLACE_EXISTING allows overwriting existing cache file
-            if (!MoveFileExW(tempPath, finalPath.c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-                SS_LOG_LAST_ERROR(L"CacheManager", L"Failed to move cache file to final location");
-                DeleteFileW(tempPath);  // Clean up orphaned temp file
-                return false;
+            // Only the rename needs exclusive lock — writing to unique temp is safe lock-free
+            // Track pending disk op so Shutdown waits for the rename to complete
+            DiskOpGuard opGuard(m_pendingDiskOps);
+            {
+                SRWExclusive diskGuard(m_diskLock);
+                if (!MoveFileExW(tempPath, finalPath.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                    SS_LOG_LAST_ERROR(L"CacheManager", L"Failed to move cache file to final location");
+                    DeleteFileW(tempPath);
+                    return false;
+                }
             }
 
             SS_LOG_DEBUG(L"CacheManager", L"Successfully persisted cache entry to disk");
@@ -1874,9 +1882,18 @@ namespace ShadowStrike {
          */
 
         bool CacheManager::persistRead(const std::wstring& key, Entry& outEntry) {
-            // INPUT VALIDATION
-            if (m_baseDir.empty() || key.empty()) {
+            if (key.empty()) {
                 return false;
+            }
+
+            // Snapshot m_baseDir under shared lock to prevent race with Shutdown
+            std::wstring baseDirSnapshot;
+            {
+                SRWShared guard(m_lock);
+                if (m_baseDir.empty()) {
+                    return false;
+                }
+                baseDirSnapshot = m_baseDir;
             }
 
             // PHASE 1: Acquire shared disk lock and track pending operation
@@ -1891,7 +1908,7 @@ namespace ShadowStrike {
             }
 
             // PHASE 3: Get validated file path (with path traversal protection)
-            const std::wstring filePath = pathForKeyHex(hex);
+            const std::wstring filePath = pathForKeyHex(baseDirSnapshot, hex);
             if (filePath.empty()) {
                 return false;
             }
@@ -2025,7 +2042,10 @@ namespace ShadowStrike {
             }
 
             if (fileHeader.valueBytes > 0) {
-              
+                if (fileHeader.valueBytes > static_cast<uint64_t>(UINT32_MAX)) {
+                    SS_LOG_ERROR(L"CacheManager", L"Cache value too large for ReadFile (exceeds DWORD)");
+                    return false;
+                }
                 const DWORD valueBytesToRead = static_cast<DWORD>(fileHeader.valueBytes);
                 bytesRead = 0;
 
@@ -2068,12 +2088,18 @@ namespace ShadowStrike {
          * @return true if file was deleted or didn't exist, false on failure.
          */
         bool CacheManager::persistRemoveByKey(const std::wstring& key) {
-            // Validate prerequisites
-            if (m_baseDir.empty()) {
-                return false;
-            }
             if (key.empty()) {
                 return false;
+            }
+
+            // Snapshot m_baseDir under shared lock to prevent race with Shutdown
+            std::wstring baseDirSnapshot;
+            {
+                SRWShared guard(m_lock);
+                if (m_baseDir.empty()) {
+                    return false;
+                }
+                baseDirSnapshot = m_baseDir;
             }
 
             // Acquire exclusive disk lock and track operation
@@ -2087,7 +2113,7 @@ namespace ShadowStrike {
             }
 
             // Get validated path
-            const std::wstring finalPath = pathForKeyHex(hex);
+            const std::wstring finalPath = pathForKeyHex(baseDirSnapshot, hex);
             if (finalPath.empty()) {
                 return false;
             }
@@ -2117,82 +2143,67 @@ namespace ShadowStrike {
             const uint8_t* bytes = reinterpret_cast<const uint8_t*>(key.data());
             const size_t byteCount = key.size() * sizeof(wchar_t);
 
-            // VALIDATION: Basic input check
             if (byteCount == 0) {
                 return L"";
             }
 
-            // STATE MANAGEMENT
             BCRYPT_ALG_HANDLE hAlg = nullptr;
             BCRYPT_HASH_HANDLE hHash = nullptr;
-            NTSTATUS status = -1; // Default to error until success is proven
+            NTSTATUS status = -1;
             uint8_t digest[32] = {};
             const auto& api = BcryptApi::Instance();
 
-            // STRATEGY: Attempt BCrypt if available and key size is within ULONG limits
-            if (byteCount <= ULONG_MAX && api.IsAvailable() && !m_hmacKey.empty()) {
+            // Use plain SHA256 (NOT HMAC) for deterministic, cross-session file paths.
+            // Session-random HMAC keys would orphan persistent files after restart.
+            if (byteCount <= ULONG_MAX && api.IsAvailable()) {
 
-                // 1. Open Algorithm Provider
                 status = api.OpenAlgorithmProvider(
                     &hAlg,
                     BCRYPT_SHA256_ALGORITHM,
                     nullptr,
-                    BCRYPT_ALG_HANDLE_HMAC_FLAG
+                    0  // No HMAC flag — plain SHA256 for deterministic output
                 );
 
                 if (status == 0) {
-                    // 2. Create HMAC Hash Object
                     status = api.CreateHash(
                         hAlg,
                         &hHash,
                         nullptr,
                         0,
-                        const_cast<PUCHAR>(m_hmacKey.data()),
-                        static_cast<ULONG>(m_hmacKey.size()),
+                        nullptr,  // No HMAC secret
+                        0,
                         0
                     );
 
                     if (status == 0) {
-                        // 3. Process Data
                         status = api.HashData(hHash, const_cast<PUCHAR>(bytes), static_cast<ULONG>(byteCount), 0);
 
                         if (status == 0) {
-                            // 4. Finalize Hash to Digest
                             status = api.FinishHash(hHash, digest, sizeof(digest), 0);
                         }
                     }
                 }
             }
 
-            // CLEANUP: Ensure resources are released regardless of status
-            // We use temporary status variables for cleanup to avoid overwriting the hashing result status
             if (hHash) {
-                NTSTATUS destroyStatus = api.DestroyHash(hHash);
-                if (destroyStatus != 0) {
-                    SS_LOG_ERROR(L"CacheManager", L"BCrypt DestroyHash failed: 0x%08X", destroyStatus);
-                }
+                [[maybe_unused]] NTSTATUS destroyStatus = api.DestroyHash(hHash);
             }
 
             if (hAlg) {
-                NTSTATUS closeStatus = api.CloseAlgorithmProvider(hAlg, 0);
-                if (closeStatus != 0) {
-                    SS_LOG_ERROR(L"CacheManager", L"BCrypt CloseAlgorithmProvider failed: 0x%08X", closeStatus);
-                }
+                [[maybe_unused]] NTSTATUS closeStatus = api.CloseAlgorithmProvider(hAlg, 0);
             }
 
-            // FINAL DECISION: Return SHA256 hex on success, or FNV-1a hex on any failure
             if (status == 0) {
                 return ToHex(digest, sizeof(digest));
             }
             else {
-                // FALLBACK: Compute 64-bit FNV-1a hash
                 const uint64_t hash = Fnv1a64(bytes, byteCount);
                 uint8_t hashBytes[8];
                 for (int i = 0; i < 8; ++i) {
                     hashBytes[i] = static_cast<uint8_t>((hash >> (i * 8)) & 0xFF);
                 }
 
-                SS_LOG_DEBUG(L"CacheManager", L"BCrypt hashing failed or bypassed. Using FNV-1a fallback.");
+                SS_LOG_DEBUG(L"CacheManager", L"BCrypt unavailable, using FNV-1a fallback for cache path");
                 return ToHex(hashBytes, sizeof(hashBytes));
             }
         }
@@ -2418,7 +2429,9 @@ namespace ShadowStrike {
                         }
 
                         if (fileHeader.valueBytes > 0) {
-                          
+                            if (fileHeader.valueBytes > static_cast<uint64_t>(UINT32_MAX)) {
+                                continue;  // Value too large for ReadFile DWORD
+                            }
                             const DWORD valueBytesToRead = static_cast<DWORD>(fileHeader.valueBytes);
                             bytesRead = 0;
 

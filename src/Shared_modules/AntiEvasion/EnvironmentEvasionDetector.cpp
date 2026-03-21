@@ -2006,6 +2006,8 @@ namespace ShadowStrike::AntiEvasion {
                 return result;
             }
 
+            const auto startTime = std::chrono::high_resolution_clock::now();
+
             const uint32_t processId = GetProcessId(hProcess);
             if (processId == 0) {
                 if (err) {
@@ -2015,8 +2017,42 @@ namespace ShadowStrike::AntiEvasion {
                 return result;
             }
 
+            // Check cache first (same logic as PID overload)
+            if (config.enableCaching) {
+                std::shared_lock lock(m_impl->m_mutex);
+                auto it = m_impl->m_resultCache.find(processId);
+
+                if (it != m_impl->m_resultCache.end()) {
+                    const auto age = std::chrono::steady_clock::now() - it->second.timestamp;
+                    const auto maxAge = std::chrono::seconds(config.cacheTtlSeconds);
+
+                    if (age < maxAge) {
+                        m_impl->m_stats.cacheHits++;
+                        result = it->second.result;
+                        result.fromCache = true;
+                        return result;
+                    }
+                }
+                m_impl->m_stats.cacheMisses++;
+            }
+
             AnalyzeProcessInternal(hProcess, processId, config, result);
+
+            const auto endTime = std::chrono::high_resolution_clock::now();
+            const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+            result.analysisDurationMs = duration.count();
             m_impl->m_stats.totalAnalyses++;
+            m_impl->m_stats.totalAnalysisTimeUs += std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+
+            if (result.isEvasive) {
+                m_impl->m_stats.evasiveProcesses++;
+            }
+
+            // Update cache
+            if (config.enableCaching) {
+                UpdateCache(processId, result);
+            }
 
             return result;
         }

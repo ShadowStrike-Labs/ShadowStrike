@@ -199,6 +199,7 @@ AcInitialize(VOID)
 
     //
     // Default: Audit mode (safe for initial deployment)
+    // Enforce mode requires a populated allowlist/blocklist database.
     //
     g_AcState.PolicyMode = AcMode_Audit;
 

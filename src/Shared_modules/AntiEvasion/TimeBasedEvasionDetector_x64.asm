@@ -458,7 +458,7 @@ TimingCPUIDVariance PROC
     push    r12
     push    r13
     push    r14
-    sub     rsp, 8*VARIANCE_ITERATIONS  ; Stack space for measurements
+    sub     rsp, 8*VARIANCE_ITERATIONS + 8  ; Stack space for measurements + 16-byte alignment
     
     mov     r12, rsp        ; Pointer to measurements
     xor     r13d, r13d      ; Iteration counter
@@ -542,7 +542,7 @@ TimingCPUIDVariance PROC
     mov     rcx, VARIANCE_ITERATIONS
     div     rcx
     
-    add     rsp, 8*VARIANCE_ITERATIONS
+    add     rsp, 8*VARIANCE_ITERATIONS + 8
     pop     r14
     pop     r13
     pop     r12
@@ -703,7 +703,7 @@ TimingCalibrateTimebase PROC
     push    r13
     push    r14
     push    r15
-    sub     rsp, 80         ; Shadow space (32) + local vars (40) + alignment (8)
+    sub     rsp, 88         ; Shadow space (32) + local vars (40) + alignment (16)
     
     ;; THREAD-SAFETY FIX: Use atomic compare-exchange for calibration check
     ;; Try to acquire calibration lock (0 -> 2 means "calibrating")
@@ -817,7 +817,7 @@ TimingCalibrateTimebase PROC
     mov     QWORD PTR [g_tscFrequency], rax
     
 @CalibReturn:
-    add     rsp, 80
+    add     rsp, 88
     pop     r15
     pop     r14
     pop     r13
