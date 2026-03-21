@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <ctime>
 #include <chrono>
+#include <filesystem>
 #include <limits>
 
 #ifdef _WIN32
@@ -309,6 +310,7 @@ namespace ShadowStrike {
 			bool toFileCfg = false;
 			bool toEventLogCfg = false;
 			size_t maxQueueSz = 0;
+			auto bpPolicy = LoggerConfig::BackPressurePolicy::DropOldest;
 
 			{
 				std::lock_guard<std::mutex> lk(m_cfgMutex);
@@ -317,19 +319,39 @@ namespace ShadowStrike {
 				toFileCfg = m_cfg.toFile;
 				toEventLogCfg = m_cfg.toEventLog;
 				maxQueueSz = m_cfg.maxQueueSize;
+				bpPolicy = m_cfg.bpPolicy;
 			}
 
 			if (asyncCfg) {
-				// Async mode: queue the item for worker thread
-				std::lock_guard<std::mutex> lk(m_queueMutex);
-
-				// Drop oldest if queue is full (bounded queue pattern)
-				if (maxQueueSz > 0 && m_queue.size() >= maxQueueSz) {
-					m_queue.pop_front();
+				if (bpPolicy == LoggerConfig::BackPressurePolicy::Block) {
+					// Block until space available (with timeout to prevent stall)
+					std::unique_lock<std::mutex> lk(m_queueMutex);
+					constexpr auto kBlockTimeout = std::chrono::milliseconds(100);
+					if (maxQueueSz > 0 && m_queue.size() >= maxQueueSz) {
+						m_queueCv.wait_for(lk, kBlockTimeout, [&]() {
+							return m_queue.size() < maxQueueSz ||
+							       m_stop.load(std::memory_order_acquire);
+						});
+						if (m_stop.load(std::memory_order_acquire)) return;
+						// If still full after timeout, drop oldest
+						if (maxQueueSz > 0 && m_queue.size() >= maxQueueSz) {
+							m_queue.pop_front();
+						}
+					}
+					m_queue.emplace_back(std::move(item));
+					m_queueCv.notify_one();
 				}
-
-				m_queue.emplace_back(std::move(item));
-				m_queueCv.notify_one();
+				else {
+					std::lock_guard<std::mutex> lk(m_queueMutex);
+					if (maxQueueSz > 0 && m_queue.size() >= maxQueueSz) {
+						if (bpPolicy == LoggerConfig::BackPressurePolicy::DropNewest) {
+							return;  // Discard incoming message
+						}
+						m_queue.pop_front();  // DropOldest (default)
+					}
+					m_queue.emplace_back(std::move(item));
+					m_queueCv.notify_one();
+				}
 			}
 			else {
 				// Sync mode: write directly
@@ -389,10 +411,11 @@ namespace ShadowStrike {
 						continue;
 					}
 
-					// Dequeue item
+					// Dequeue item and notify blocked enqueuers
 					item = std::move(m_queue.front());
 					m_queue.pop_front();
 					hasItem = true;
+					m_queueCv.notify_one();
 				}
 
 				if (!hasItem) {
@@ -498,47 +521,22 @@ namespace ShadowStrike {
 #ifdef _WIN32
 			// Get current configuration
 			bool asyncCfg = false;
-			bool toConsoleCfg = false;
-			bool toFileCfg = false;
-			bool toEventLogCfg = false;
 			{
 				std::lock_guard<std::mutex> lk(m_cfgMutex);
 				asyncCfg = m_cfg.async;
-				toConsoleCfg = m_cfg.toConsole;
-				toFileCfg = m_cfg.toFile;
-				toEventLogCfg = m_cfg.toEventLog;
 			}
 
 			if (asyncCfg) {
-				// Wait for queue to drain with timeout
+				// Wait for worker thread to drain the queue (do NOT dequeue here
+				// to avoid racing with WorkerLoop)
 				constexpr auto FLUSH_TIMEOUT = std::chrono::seconds(5);
 				const auto deadline = std::chrono::steady_clock::now() + FLUSH_TIMEOUT;
-				
-				while (std::chrono::steady_clock::now() < deadline) {
-					{
-						std::lock_guard<std::mutex> lk(m_queueMutex);
-						if (m_queue.empty()) break;
-					}
-					m_queueCv.notify_all();
-					std::this_thread::sleep_for(std::chrono::milliseconds(10));
-				}
 
-				// Drain any remaining items directly
-				LogItem x{};
-				while (Dequeue(x)) {
-					try {
-						if (toConsoleCfg) WriteConsole(x);
-						if (toFileCfg) WriteFile(x);
-						if (toEventLogCfg && x.level >= LogLevel::Warn) WriteEventLog(x);
-					}
-					catch (const std::exception& e) {
-						OutputDebugStringA("[Logger] Flush drain exception: ");
-						OutputDebugStringA(e.what());
-						OutputDebugStringA("\n");
-					}
-					catch (...) {
-						OutputDebugStringW(L"[Logger] Flush drain unknown exception\n");
-					}
+				{
+					std::unique_lock<std::mutex> lk(m_queueMutex);
+					m_queueCv.wait_until(lk, deadline, [this]() {
+						return m_queue.empty() || m_stop.load(std::memory_order_acquire);
+					});
 				}
 			}
 
@@ -556,9 +554,11 @@ namespace ShadowStrike {
 		// String Conversion Utilities
 		// ============================================================================
 
-		const wchar_t* Logger::NarrowToWideTLS(const char* s) {
+		const wchar_t* Logger::NarrowToWideTLS(const char* s, int slot) {
 #ifdef _WIN32
-			thread_local std::wstring buff;
+			static constexpr int kNumSlots = 2;
+			thread_local std::wstring buffs[kNumSlots];
+			auto& buff = buffs[static_cast<unsigned>(slot) % kNumSlots];
 			
 			// Null/empty check
 			if (s == nullptr) {
@@ -597,7 +597,9 @@ namespace ShadowStrike {
 			}
 			return buff.c_str();
 #else
-			static thread_local std::wstring buff;
+			static constexpr int kNumSlots = 2;
+			static thread_local std::wstring buffs[kNumSlots];
+			auto& buff = buffs[static_cast<unsigned>(slot) % kNumSlots];
 			buff.clear();
 			return buff.c_str();
 #endif
@@ -766,7 +768,7 @@ namespace ShadowStrike {
 		// Output Formatting
 		// ============================================================================
 
-		std::wstring Logger::FormatPrefix(const LogItem& item) const {
+		std::wstring Logger::FormatPrefix(const LogItem& item, bool inclProcTid, bool inclSrcLoc) const {
 			const std::wstring ts = FormatIso8601UTC(item.ts_100ns);
 			std::wstring s;
 			s.reserve(128);
@@ -781,17 +783,8 @@ namespace ShadowStrike {
 				s += L"]";
 			}
 
-			// Get configuration for optional fields
-			bool includeProcThreadIdCfg = false;
-			bool includeSrcLocationCfg = false;
-			{
-				std::lock_guard<std::mutex> lk(m_cfgMutex);
-				includeProcThreadIdCfg = m_cfg.includeProcThreadId;
-				includeSrcLocationCfg = m_cfg.includeSrcLocation;
-			}
-
 			// Process/Thread ID
-			if (includeProcThreadIdCfg) {
+			if (inclProcTid) {
 				s += L" (";
 				s += std::to_wstring(item.pid);
 				s += L":";
@@ -800,7 +793,7 @@ namespace ShadowStrike {
 			}
 
 			// Source location
-			if (includeSrcLocationCfg && !item.file.empty()) {
+			if (inclSrcLoc && !item.file.empty()) {
 				s += L" ";
 				s += item.file;
 				s += L":";
@@ -816,7 +809,7 @@ namespace ShadowStrike {
 			return s;
 		}
 
-		std::wstring Logger::FormatAsJson(const LogItem& item) const {
+		std::wstring Logger::FormatAsJson(const LogItem& item, bool inclProcTid, bool inclSrcLoc) const {
 			std::wstring s;
 			s.reserve(128 + item.message.size());
 			s += L"{\"ts\":\"";
@@ -831,23 +824,14 @@ namespace ShadowStrike {
 				s += L"\"";
 			}
 
-			// Get configuration for optional fields
-			bool includeProcThreadIdCfg = false;
-			bool includeSrcLocationCfg = false;
-			{
-				std::lock_guard<std::mutex> lk(m_cfgMutex);
-				includeProcThreadIdCfg = m_cfg.includeProcThreadId;
-				includeSrcLocationCfg = m_cfg.includeSrcLocation;
-			}
-
-			if (includeProcThreadIdCfg) {
+			if (inclProcTid) {
 				s += L",\"pid\":";
 				s += std::to_wstring(item.pid);
 				s += L",\"tid\":";
 				s += std::to_wstring(item.tid);
 			}
 
-			if (includeSrcLocationCfg && !item.file.empty()) {
+			if (inclSrcLoc && !item.file.empty()) {
 				s += L",\"file\":\"";
 				s += EscapeJson(item.file);
 				s += L"\",\"line\":";
@@ -901,14 +885,20 @@ namespace ShadowStrike {
 
 			SetConsoleTextAttribute(m_console, color);
 
-			// Get JSON format preference
+			// Read all format config in one lock acquisition
 			bool jsonLinesCfg = false;
+			bool inclProcTid = false;
+			bool inclSrcLoc = false;
 			{
 				std::lock_guard<std::mutex> lk(m_cfgMutex);
 				jsonLinesCfg = m_cfg.jsonLines;
+				inclProcTid = m_cfg.includeProcThreadId;
+				inclSrcLoc = m_cfg.includeSrcLocation;
 			}
 
-			std::wstring line = jsonLinesCfg ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
+			std::wstring line = jsonLinesCfg
+				? FormatAsJson(item, inclProcTid, inclSrcLoc)
+				: (FormatPrefix(item, inclProcTid, inclSrcLoc) + item.message);
 			line += L"\r\n";
 
 			// Integer overflow check BEFORE cast
@@ -972,6 +962,15 @@ namespace ShadowStrike {
 			}
 			else {
 				m_currentSize = 0;
+			}
+
+			// Write UTF-8 BOM for new/empty files
+			if (m_currentSize == 0) {
+				static constexpr BYTE utf8Bom[] = { 0xEF, 0xBB, 0xBF };
+				DWORD bomWritten = 0;
+				if (::WriteFile(m_file, utf8Bom, sizeof(utf8Bom), &bomWritten, nullptr)) {
+					m_currentSize += bomWritten;
+				}
 			}
 #endif
 		}
@@ -1111,7 +1110,9 @@ namespace ShadowStrike {
 				return;  // Directory exists
 			}
 			
-			CreateDirectoryW(logDirCfg.c_str(), nullptr);
+			// Create all intermediate directories
+			std::error_code ec;
+			std::filesystem::create_directories(logDirCfg, ec);
 #endif
 		}
 
@@ -1140,36 +1141,49 @@ namespace ShadowStrike {
 		void Logger::WriteFile(const LogItem& item) {
 #ifdef _WIN32
 			std::lock_guard<std::mutex> lk(m_cfgMutex);
-			
+
 			OpenLogFileIfNeeded();
 			if (m_file == nullptr || m_file == INVALID_HANDLE_VALUE) {
 				return;
 			}
 
+			// Read config under lock (already held) — pass to Format to avoid recursive lock
 			const bool jsonLinesCfg = m_cfg.jsonLines;
-			std::wstring line = jsonLinesCfg ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
+			const bool inclProcTid = m_cfg.includeProcThreadId;
+			const bool inclSrcLoc = m_cfg.includeSrcLocation;
+			const LogLevel flushLevelCfg = m_cfg.flushLevel;
+
+			std::wstring line = jsonLinesCfg
+				? FormatAsJson(item, inclProcTid, inclSrcLoc)
+				: (FormatPrefix(item, inclProcTid, inclSrcLoc) + item.message);
 			line += L"\r\n";
 
-			// Integer overflow check BEFORE calculation
-			constexpr size_t MAX_FILE_WRITE = std::numeric_limits<DWORD>::max() / sizeof(wchar_t);
-			if (line.size() > MAX_FILE_WRITE) {
-				return;
-			}
+			// Convert to UTF-8 for portable, human-readable log files
+			if (line.size() > static_cast<size_t>(std::numeric_limits<int>::max())) return;
+			const int wLen = static_cast<int>(line.size());
+			const int utf8Len = WideCharToMultiByte(
+				CP_UTF8, 0, line.c_str(), wLen, nullptr, 0, nullptr, nullptr);
+			if (utf8Len <= 0) return;
 
-			const BYTE* data = reinterpret_cast<const BYTE*>(line.c_str());
-			const DWORD bytesToWrite = static_cast<DWORD>(line.size() * sizeof(wchar_t));
+			std::string utf8Line(static_cast<size_t>(utf8Len), '\0');
+			const int bytesWritten = WideCharToMultiByte(
+				CP_UTF8, 0, line.c_str(), wLen,
+				utf8Line.data(), utf8Len, nullptr, nullptr);
+			if (bytesWritten <= 0) return;
 
+			constexpr size_t MAX_FILE_WRITE = std::numeric_limits<DWORD>::max();
+			if (utf8Line.size() > MAX_FILE_WRITE) return;
+
+			const DWORD bytesToWrite = static_cast<DWORD>(utf8Line.size());
 			RotateIfNeeded(bytesToWrite);
 
 			DWORD written = 0;
-			if (!::WriteFile(m_file, data, bytesToWrite, &written, nullptr)) {
-				// Write failed
+			if (!::WriteFile(m_file, utf8Line.data(), bytesToWrite, &written, nullptr)) {
 				return;
 			}
 			m_currentSize += written;
 
 			// Flush for high severity messages
-			const LogLevel flushLevelCfg = m_cfg.flushLevel;
 			if (static_cast<int>(item.level) >= static_cast<int>(flushLevelCfg)) {
 				FlushFileBuffers(m_file);
 			}
@@ -1206,13 +1220,17 @@ namespace ShadowStrike {
 
 		void Logger::WriteEventLog(const LogItem& item) {
 #ifdef _WIN32
-			// Get configuration
+			// Read all config in one lock acquisition
 			bool toEventLogCfg = false;
 			bool jsonLinesCfg = false;
+			bool inclProcTid = false;
+			bool inclSrcLoc = false;
 			{
 				std::lock_guard<std::mutex> lk(m_cfgMutex);
 				toEventLogCfg = m_cfg.toEventLog;
 				jsonLinesCfg = m_cfg.jsonLines;
+				inclProcTid = m_cfg.includeProcThreadId;
+				inclSrcLoc = m_cfg.includeSrcLocation;
 			}
 
 			if (!toEventLogCfg) {
@@ -1235,7 +1253,9 @@ namespace ShadowStrike {
 			default:              type = EVENTLOG_INFORMATION_TYPE; break;
 			}
 
-			const std::wstring payload = jsonLinesCfg ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
+			const std::wstring payload = jsonLinesCfg
+				? FormatAsJson(item, inclProcTid, inclSrcLoc)
+				: (FormatPrefix(item, inclProcTid, inclSrcLoc) + item.message);
 			const wchar_t* strings[1] = { payload.c_str() };
 			::ReportEventW(m_eventSrc, type, 0, 0, nullptr, 1, 0, strings, nullptr);
 #endif
@@ -1257,7 +1277,7 @@ namespace ShadowStrike {
 			QueryPerformanceFrequency(&m_freq);
 			QueryPerformanceCounter(&m_start);
 #endif
-			Logger::Instance().LogMessage(m_level, m_category, messageOnEnter, m_file, m_line, m_function, 0);
+			Logger::Instance().LogMessage(m_level, m_category.c_str(), messageOnEnter, m_file.c_str(), m_line, m_function.c_str(), 0);
 		}
 
 		Logger::Scope::~Scope() {
@@ -1267,7 +1287,7 @@ namespace ShadowStrike {
 
 			// Guard against division by zero
 			if (m_freq.QuadPart == 0) {
-				Logger::Instance().LogMessage(m_level, m_category, L"Leave", m_file, m_line, m_function, 0);
+				Logger::Instance().LogMessage(m_level, m_category.c_str(), L"Leave", m_file.c_str(), m_line, m_function.c_str(), 0);
 				return;
 			}
 
@@ -1277,7 +1297,7 @@ namespace ShadowStrike {
 			
 			wchar_t buf[64];
 			_snwprintf_s(buf, _TRUNCATE, L"Leave (%.3f ms)", ms);
-			Logger::Instance().LogMessage(m_level, m_category, buf, m_file, m_line, m_function, 0);
+			Logger::Instance().LogMessage(m_level, m_category.c_str(), buf, m_file.c_str(), m_line, m_function.c_str(), 0);
 #endif
 		}
 

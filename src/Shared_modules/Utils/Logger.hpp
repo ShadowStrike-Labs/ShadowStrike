@@ -243,7 +243,7 @@ namespace ShadowStrike {
 			 * @param s Narrow string to convert
 			 * @return Wide string pointer (thread-local, do not store)
 			 */
-			[[nodiscard]] static const wchar_t* NarrowToWideTLS(const char* s);
+			[[nodiscard]] static const wchar_t* NarrowToWideTLS(const char* s, int slot = 0);
 
 			/**
 			 * @brief Format a message with va_list.
@@ -273,9 +273,9 @@ namespace ShadowStrike {
 				Scope& operator=(Scope&&) = delete;
 
 			private:
-				const wchar_t* m_category;
-				const wchar_t* m_file;
-				const wchar_t* m_function;
+				std::wstring m_category;
+				std::wstring m_file;
+				std::wstring m_function;
 				int m_line;
 #ifdef _WIN32
 				LARGE_INTEGER m_start{};
@@ -325,8 +325,8 @@ namespace ShadowStrike {
 			void WriteFile(const LogItem& item);
 			void WriteEventLog(const LogItem& item);
 
-			[[nodiscard]] std::wstring FormatPrefix(const LogItem& item) const;
-			[[nodiscard]] std::wstring FormatAsJson(const LogItem& item) const;
+			[[nodiscard]] std::wstring FormatPrefix(const LogItem& item, bool inclProcTid, bool inclSrcLoc) const;
+			[[nodiscard]] std::wstring FormatAsJson(const LogItem& item, bool inclProcTid, bool inclSrcLoc) const;
 			[[nodiscard]] static std::wstring EscapeJson(const std::wstring& s);
 
 			void OpenLogFileIfNeeded();
@@ -423,8 +423,8 @@ namespace ShadowStrike {
         auto& _lg = ::ShadowStrike::Utils::Logger::Instance(); \
         if (_lg.IsInitialized() && _lg.IsEnabled(::ShadowStrike::Utils::LogLevel::Trace)) { \
             _lg.LogEx(::ShadowStrike::Utils::LogLevel::Trace, (category), \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__), __LINE__, \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__), (fmt), ##__VA_ARGS__); \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__, 0), __LINE__, \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__, 1), (fmt), ##__VA_ARGS__); \
         } \
     } while(0)
 
@@ -434,8 +434,8 @@ namespace ShadowStrike {
         auto& _lg = ::ShadowStrike::Utils::Logger::Instance(); \
         if (_lg.IsInitialized() && _lg.IsEnabled(::ShadowStrike::Utils::LogLevel::Debug)) { \
             _lg.LogEx(::ShadowStrike::Utils::LogLevel::Debug, (category), \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__), __LINE__, \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__), (fmt), ##__VA_ARGS__); \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__, 0), __LINE__, \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__, 1), (fmt), ##__VA_ARGS__); \
         } \
     } while(0)
 
@@ -445,8 +445,8 @@ namespace ShadowStrike {
         auto& _lg = ::ShadowStrike::Utils::Logger::Instance(); \
         if (_lg.IsInitialized() && _lg.IsEnabled(::ShadowStrike::Utils::LogLevel::Info)) { \
             _lg.LogEx(::ShadowStrike::Utils::LogLevel::Info, (category), \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__), __LINE__, \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__), (fmt), ##__VA_ARGS__); \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__, 0), __LINE__, \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__, 1), (fmt), ##__VA_ARGS__); \
         } \
     } while(0)
 
@@ -456,8 +456,8 @@ namespace ShadowStrike {
         auto& _lg = ::ShadowStrike::Utils::Logger::Instance(); \
         if (_lg.IsInitialized() && _lg.IsEnabled(::ShadowStrike::Utils::LogLevel::Warn)) { \
             _lg.LogEx(::ShadowStrike::Utils::LogLevel::Warn, (category), \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__), __LINE__, \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__), (fmt), ##__VA_ARGS__); \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__, 0), __LINE__, \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__, 1), (fmt), ##__VA_ARGS__); \
         } \
     } while(0)
 
@@ -467,8 +467,8 @@ namespace ShadowStrike {
         auto& _lg = ::ShadowStrike::Utils::Logger::Instance(); \
         if (_lg.IsInitialized() && _lg.IsEnabled(::ShadowStrike::Utils::LogLevel::Error)) { \
             _lg.LogEx(::ShadowStrike::Utils::LogLevel::Error, (category), \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__), __LINE__, \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__), (fmt), ##__VA_ARGS__); \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__, 0), __LINE__, \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__, 1), (fmt), ##__VA_ARGS__); \
         } \
     } while(0)
 
@@ -478,8 +478,8 @@ namespace ShadowStrike {
         auto& _lg = ::ShadowStrike::Utils::Logger::Instance(); \
         if (_lg.IsInitialized() && _lg.IsEnabled(::ShadowStrike::Utils::LogLevel::Fatal)) { \
             _lg.LogEx(::ShadowStrike::Utils::LogLevel::Fatal, (category), \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__), __LINE__, \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__), (fmt), ##__VA_ARGS__); \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__, 0), __LINE__, \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__, 1), (fmt), ##__VA_ARGS__); \
         } \
     } while(0)
 
@@ -489,16 +489,20 @@ namespace ShadowStrike {
         auto& _lg = ::ShadowStrike::Utils::Logger::Instance(); \
         if (_lg.IsInitialized() && _lg.IsEnabled(::ShadowStrike::Utils::LogLevel::Error)) { \
             _lg.LogWinErrorEx(::ShadowStrike::Utils::LogLevel::Error, (category), \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__), __LINE__, \
-                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__), \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__, 0), __LINE__, \
+                ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__, 1), \
                 ::GetLastError(), (fmt), ##__VA_ARGS__); \
         } \
     } while(0)
 
+/// @brief Helper macros for token pasting with __LINE__ expansion
+#define SS_PASTE2_(a, b) a##b
+#define SS_PASTE_(a, b) SS_PASTE2_(a, b)
+
 /// @brief RAII scope logger - logs function entry and exit with timing
 #define SS_LOG_SCOPE(category) \
-    ::ShadowStrike::Utils::Logger::Scope _ss_scope_obj_##__LINE__( \
+    ::ShadowStrike::Utils::Logger::Scope SS_PASTE_(_ss_scope_, __LINE__)( \
         (category), \
-        ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__), \
+        ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__, 0), \
         __LINE__, \
-        ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__))
+        ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__, 1))
