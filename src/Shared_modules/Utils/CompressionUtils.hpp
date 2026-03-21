@@ -61,7 +61,7 @@ namespace ShadowStrike {
             /// Reasonable limit for compressed data processing
             constexpr size_t MAX_COMPRESSED_SIZE = 256ULL * 1024 * 1024;
 
-            /// Maximum allowed compression ratio (100:1)
+            /// Maximum allowed compression ratio (512:1)
             /// Ratios above this are suspicious and may indicate an attack
             constexpr size_t MAX_COMPRESSION_RATIO = 512;
 

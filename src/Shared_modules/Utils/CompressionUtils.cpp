@@ -102,9 +102,12 @@ namespace ShadowStrike {
                 std::call_once(once, []() noexcept {
                     // Try to get already-loaded cabinet.dll first
                     HMODULE h = ::GetModuleHandleW(L"cabinet.dll");
+                    bool needsFree = false;
                     if (h == nullptr) {
-                        // Load if not already present
-                        h = ::LoadLibraryW(L"cabinet.dll");
+                        // Load from System32 only — prevents DLL hijacking from CWD
+                        h = ::LoadLibraryExW(L"cabinet.dll", nullptr,
+                            LOAD_LIBRARY_SEARCH_SYSTEM32);
+                        needsFree = (h != nullptr);
                     }
 
                     if (h == nullptr) {
@@ -131,7 +134,9 @@ namespace ShadowStrike {
                     if (!g.valid()) {
                         SS_LOG_ERROR(L"CompressionUtils",
                             L"Failed to resolve compression API functions from cabinet.dll");
-                        // Invalidate the table on partial resolution
+                        if (needsFree) {
+                            ::FreeLibrary(h);
+                        }
                         g = ApiTable{};
                     }
                 });
@@ -576,16 +581,23 @@ namespace ShadowStrike {
                     return false;
                 }
 
-                // Check compression ratio for additional bomb detection
-                // Skip ratio check if caller provided expectedSize (they vouch for it)
-                if (expectedSize == 0 && srcSize > 0) {
-                    const size_t ratio = static_cast<size_t>(required) / srcSize;
-                    if (ratio > MAX_COMPRESSION_RATIO) {
-                        SS_LOG_WARN(L"CompressionUtils",
-                            L"DecompressCore: compression ratio %zu:1 exceeds limit (potential bomb)",
-                            ratio);
-                        return false;
+                // Check compression ratio for bomb detection.
+                // Only for outputs above MIN_RATIO_CHECK_SIZE to avoid FP on tiny buffers.
+                // Always check regardless of expectedSize — callers don't vouch for safety.
+                if (static_cast<size_t>(required) > MIN_RATIO_CHECK_SIZE && srcSize > 0) {
+                    // Use multiplication instead of division to avoid integer truncation.
+                    // Guard against multiplication overflow: if srcSize * ratio would exceed
+                    // size_t, the ratio is definitely safe since required <= MAX_DECOMPRESSED_SIZE.
+                    if (srcSize <= std::numeric_limits<size_t>::max() / MAX_COMPRESSION_RATIO) {
+                        if (static_cast<size_t>(required) > srcSize * MAX_COMPRESSION_RATIO) {
+                            SS_LOG_WARN(L"CompressionUtils",
+                                L"DecompressCore: compression ratio exceeds %zu:1 limit (potential bomb)",
+                                MAX_COMPRESSION_RATIO);
+                            return false;
+                        }
                     }
+                    // If srcSize * MAX_COMPRESSION_RATIO overflows, then srcSize is very large
+                    // and 'required' (capped at MAX_DECOMPRESSED_SIZE=512MB) can't exceed it.
                 }
 
                 // Validate against expected size if provided
@@ -923,7 +935,8 @@ namespace ShadowStrike {
                 const auto& api = GetApi();
                 if (!api.valid()) return false;
 
-                SIZE_T srcSizeT = static_cast<SIZE_T>(srcSize);
+                SIZE_T srcSizeT = 0;
+                if (!SizeToSizeT(srcSize, srcSizeT)) return false;
                 SIZE_T required = 0;
                 DWORD lastErr = ERROR_SUCCESS;
 
@@ -950,12 +963,15 @@ namespace ShadowStrike {
                 // 5. Decompression Bomb Protection (Enterprise Logic)
                 if (required > MAX_DECOMPRESSED_SIZE) return false;
 
-                // Perform ratio check only for extractions above a certain size to prevent False Positives
-                if (required > MIN_RATIO_CHECK_SIZE && srcSize > 0) {
-                    const size_t ratio = static_cast<size_t>(required) / srcSize;
-                    if (ratio > MAX_COMPRESSION_RATIO) {
-                        SS_LOG_WARN(L"CompressionUtils", L"Security: Decompression bomb blocked (Ratio %zu:1)", ratio);
-                        return false;
+                // Ratio check only for outputs above MIN_RATIO_CHECK_SIZE to avoid FP
+                if (static_cast<size_t>(required) > MIN_RATIO_CHECK_SIZE && srcSize > 0) {
+                    if (srcSize <= std::numeric_limits<size_t>::max() / MAX_COMPRESSION_RATIO) {
+                        if (static_cast<size_t>(required) > srcSize * MAX_COMPRESSION_RATIO) {
+                            SS_LOG_WARN(L"CompressionUtils",
+                                L"Security: Decompression bomb blocked (ratio exceeds %zu:1)",
+                                MAX_COMPRESSION_RATIO);
+                            return false;
+                        }
                     }
                 }
 
