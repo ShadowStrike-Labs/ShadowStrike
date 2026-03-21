@@ -668,12 +668,40 @@ public:
             auto& sandbox = ShadowStrike::AntiEvasion::SandboxEvasionDetector::Instance();
             if (sandbox.Initialize(m_threadPool)) {
                 m_sandboxDetectorInitialized = true;
+
+                // Wire detection callback for SOC/SIEM telemetry
+                sandbox.RegisterCallback(
+                    [](const ShadowStrike::AntiEvasion::SandboxEvasionResult& result) {
+                        if (result.isSandboxLikely) {
+                            Utils::Logger::Warn(
+                                L"[SED-CB] Sandbox detected — probability={:.1f}% confidence={:.1f}% "
+                                L"definitive={} product={} indicators={}",
+                                result.probability, result.confidence,
+                                result.isDefinitive ? L"YES" : L"NO",
+                                result.sandboxName.empty() ? L"Unknown" : result.sandboxName.c_str(),
+                                result.indicators.size());
+
+                            // Log critical/high indicators for forensic correlation
+                            for (const auto& ind : result.indicators) {
+                                if (ind.severity >= ShadowStrike::AntiEvasion::SandboxIndicatorSeverity::High) {
+                                    Utils::Logger::Warn(
+                                        L"[SED-CB] indicator={} severity={} confidence={:.1f} {}",
+                                        ind.description.substr(0, 100),
+                                        static_cast<int>(ind.severity),
+                                        ind.confidence,
+                                        ind.technicalDetails.substr(0, 150));
+                                }
+                            }
+                        }
+                    });
+
                 // Run initial system-level sandbox analysis at startup
                 auto hwProfile = sandbox.AnalyzeHardware();
                 auto envResult = sandbox.AnalyzeEnvironment();
-                if (hwProfile.isSandboxLike || envResult.isSandboxLikely) {
+                if (hwProfile.isSandboxLike || envResult.suspicionScore >= 50.0f) {
                     Utils::Logger::Warn(L"RealTimeProtection: Sandbox environment detected — "
-                        L"endpoint may be under malware analysis");
+                        L"hardware={:.1f}% env={:.1f}% — endpoint may be under malware analysis",
+                        hwProfile.suspicionScore, envResult.suspicionScore);
                 }
             } else {
                 Utils::Logger::Warn(L"RealTimeProtection: SandboxEvasionDetector Initialize failed");

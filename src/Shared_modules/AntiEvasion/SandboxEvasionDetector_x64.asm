@@ -313,7 +313,7 @@ MeasureSleepAcceleration PROC
     push    rdi
     push    r12
     push    r13
-    sub     rsp, 40         ; Shadow space + alignment
+    sub     rsp, 48         ; Shadow space (32) + alignment (16) to maintain 16-byte RSP
     
     ;; Save sleep duration
     mov     r12d, ecx
@@ -375,7 +375,7 @@ MeasureSleepAcceleration PROC
     xor     eax, eax
     
 @Done:
-    add     rsp, 40
+    add     rsp, 48
     pop     r13
     pop     r12
     pop     rdi
@@ -434,13 +434,15 @@ MeasureTimingPrecision PROC
     mov     ecx, 100
     
 @PrecisionLoop:
-    ;; First RDTSC
+    ;; Serialize before first RDTSC to prevent out-of-order execution
+    lfence
     rdtsc
     shl     rdx, 32
     or      rax, rdx
     mov     rdi, rax
     
-    ;; Second RDTSC (immediate)
+    ;; Serialize before second RDTSC for accurate delta measurement
+    lfence
     rdtsc
     shl     rdx, 32
     or      rax, rdx
@@ -961,7 +963,9 @@ GetRDTSCFrequency PROC
     mov     eax, 15h
     cpuid
     
-    ;; Check if info is valid (EBX != 0 && ECX != 0)
+    ;; Check if info is valid (EAX != 0 && EBX != 0 && ECX != 0)
+    test    eax, eax
+    jz      @NoTSCInfo
     test    ebx, ebx
     jz      @NoTSCInfo
     test    ecx, ecx
