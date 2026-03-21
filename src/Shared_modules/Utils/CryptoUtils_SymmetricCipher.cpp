@@ -789,7 +789,13 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				ciphertext.resize(cbResult);
+				try { ciphertext.resize(cbResult); }
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(ciphertext.data(), ciphertext.size());
+					ciphertext.clear();
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"Encrypt"); }
+					return false;
+				}
 
 				// ═══════════════════════════════════════════════════════════════════
 				//  IV CHAINING (CBC mode - for continuous streaming)
@@ -821,20 +827,26 @@ namespace ShadowStrike {
 				//  TIER-1 INPUT VALIDATION
 				// ═══════════════════════════════════════════════════════════════════
 				if (!m_keySet) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key not set"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"Key not set", L"Decrypt"); }
 					return false;
 				}
 				if (!m_ivSet && GetIVSize() > 0) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"IV not set"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"IV not set", L"Decrypt"); }
 					return false;
 				}
 				if (!ciphertext && ciphertextLen != 0) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid ciphertext pointer"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_PARAMETER, L"Invalid ciphertext pointer", L"Decrypt"); }
 					return false;
 				}
 				if (IsAEAD()) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Use DecryptAEAD for AEAD modes"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_PARAMETER, L"Use DecryptAEAD for AEAD modes", L"Decrypt"); }
 					return false;
+				}
+
+				plaintext.clear();
+
+				if (ciphertextLen == 0) {
+					return true;
 				}
 
 #ifdef _WIN32
@@ -850,14 +862,22 @@ namespace ShadowStrike {
 
 				//  Block alignment validation
 				if (needsPadding && (ciphertextLen % blockSize != 0)) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Ciphertext not block-aligned"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_DATA, L"Ciphertext not block-aligned", L"Decrypt"); }
 					return false;
 				}
 
 				// ═══════════════════════════════════════════════════════════════════
 				//  IV MUTATION PROTECTION
 				// ═══════════════════════════════════════════════════════════════════
-				std::vector<uint8_t> ivLocal = m_iv;
+				std::vector<uint8_t> ivLocal;
+				try {
+					ivLocal = m_iv;
+				}
+				catch (const std::bad_alloc&) {
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"IV copy allocation failed", L"Decrypt"); }
+					return false;
+				}
+
 				PUCHAR ivPtr = ivLocal.empty() ? nullptr : ivLocal.data();
 				ULONG ivLen = static_cast<ULONG>(ivLocal.size());
 
@@ -867,10 +887,7 @@ namespace ShadowStrike {
 				DWORD flags = 0; //  CRITICAL: We handle padding removal ourselves
 
 				if (ciphertextLen > std::numeric_limits<ULONG>::max()) {
-					if (err) {
-						err->win32 = ERROR_BUFFER_OVERFLOW;
-						err->message = L"Ciphertext too large for Windows CNG API";
-					}
+					if (err) { err->SetWin32Error(ERROR_BUFFER_OVERFLOW, L"Ciphertext too large for Windows CNG API", L"Decrypt"); }
 					return false;
 				}
 				// Query decrypted size
@@ -882,16 +899,18 @@ namespace ShadowStrike {
 					nullptr, 0, &cbResult, flags);
 
 				if (st < 0) {
-					if (err) {
-						err->ntstatus = st;
-						err->win32 = RtlNtStatusToDosError(st);
-						err->message = L"BCryptDecrypt size query failed";
-					}
+					if (err) { err->SetNtStatus(st, L"BCryptDecrypt size query failed", L"Decrypt"); }
 					return false;
 				}
 
 				// Allocate output buffer
-				plaintext.resize(cbResult);
+				try {
+					plaintext.resize(cbResult);
+				}
+				catch (const std::bad_alloc&) {
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output buffer allocation failed", L"Decrypt"); }
+					return false;
+				}
 
 				// Perform decryption
 				st = BCryptDecrypt(m_keyHandle,
@@ -901,16 +920,19 @@ namespace ShadowStrike {
 					plaintext.data(), static_cast<ULONG>(plaintext.size()), &cbResult, flags);
 
 				if (st < 0) {
-					if (err) {
-						err->ntstatus = st;
-						err->win32 = RtlNtStatusToDosError(st);
-						err->message = L"BCryptDecrypt failed";
-					}
+					if (err) { err->SetNtStatus(st, L"BCryptDecrypt failed", L"Decrypt"); }
 					SecureZeroMemory(plaintext.data(), plaintext.size());
+					plaintext.clear();
 					return false;
 				}
 
-				plaintext.resize(cbResult);
+				try { plaintext.resize(cbResult); }
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(plaintext.data(), plaintext.size());
+					plaintext.clear();
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"Decrypt"); }
+					return false;
+				}
 
 				// ═══════════════════════════════════════════════════════════════════
 				//  MANUAL PADDING REMOVAL (Constant-time validation)
@@ -923,17 +945,14 @@ namespace ShadowStrike {
 						SecureZeroMemory(plaintext.data(), originalSize);
 						plaintext.clear();
 
-						if (err) {
-							err->win32 = ERROR_INVALID_DATA;
-							err->message = L"Decrypt Failed";
-						}
+						if (err) { err->SetWin32Error(ERROR_INVALID_DATA, L"Invalid PKCS7 padding", L"Decrypt"); }
 						return false;
 					}
 				}
 
 				return true;
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+				if (err) { err->SetWin32Error(ERROR_NOT_SUPPORTED, L"Platform not supported", L"Decrypt"); }
 				return false;
 #endif
 			}
@@ -945,32 +964,26 @@ namespace ShadowStrike {
 				std::vector<uint8_t>& tag, Error* err) noexcept
 			{
 				if (aadLen > 0 && !aad) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"AAD pointer invalid"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_PARAMETER, L"AAD pointer invalid", L"EncryptAEAD"); }
 					return false;
 				}
 				if (!IsAEAD()) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Not an AEAD algorithm"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_PARAMETER, L"Not an AEAD algorithm", L"EncryptAEAD"); }
 					return false;
 				}
 
 				if (!m_keySet || !m_ivSet) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key or IV not set"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"Key or IV not set", L"EncryptAEAD"); }
 					return false;
 				}
 
 				if (plaintextLen > std::numeric_limits<ULONG>::max()) {
-					if (err) {
-						err->win32 = ERROR_BUFFER_OVERFLOW;
-						err->message = L"Plaintext too large for Windows CNG API";
-					}
+					if (err) { err->SetWin32Error(ERROR_BUFFER_OVERFLOW, L"Plaintext too large for Windows CNG API", L"EncryptAEAD"); }
 					return false;
 				}
 
 				if (aadLen > std::numeric_limits<ULONG>::max()) {
-					if (err) {
-						err->win32 = ERROR_BUFFER_OVERFLOW;
-						err->message = L"AAD too large for Windows CNG API";
-					}
+					if (err) { err->SetWin32Error(ERROR_BUFFER_OVERFLOW, L"AAD too large for Windows CNG API", L"EncryptAEAD"); }
 					return false;
 				}
 
@@ -978,7 +991,14 @@ namespace ShadowStrike {
 				// ═══════════════════════════════════════════════════════════════════
 				//  IV MUTATION PROTECTION - Create local copy
 				// ═══════════════════════════════════════════════════════════════════
-				std::vector<uint8_t> ivLocal = m_iv;
+				std::vector<uint8_t> ivLocal;
+				try {
+					ivLocal = m_iv;
+				}
+				catch (const std::bad_alloc&) {
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"IV copy allocation failed", L"EncryptAEAD"); }
+					return false;
+				}
 
 				// ═══════════════════════════════════════════════════════════════════
 				//  BCRYPT AUTHENTICATED CIPHER MODE INFO SETUP
@@ -992,7 +1012,14 @@ namespace ShadowStrike {
 
 				// Allocate tag buffer
 				const size_t tagSize = GetTagSize();
-				tag.resize(tagSize);
+				try {
+					tag.resize(tagSize);
+				}
+				catch (const std::bad_alloc&) {
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Tag allocation failed", L"EncryptAEAD"); }
+					return false;
+				}
+
 				authInfo.pbTag = tag.data();
 				authInfo.cbTag = static_cast<ULONG>(tagSize);
 				authInfo.pbMacContext = nullptr;
@@ -1015,11 +1042,20 @@ namespace ShadowStrike {
 					// SECURITY: Clear tag on failure
 					SecureZeroMemory(tag.data(), tag.size());
 					tag.clear();
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptEncrypt AEAD size query failed"; }
+					if (err) { err->SetNtStatus(st, L"BCryptEncrypt AEAD size query failed", L"EncryptAEAD"); }
 					return false;
 				}
 
-				ciphertext.resize(cbResult);
+				try {
+					ciphertext.resize(cbResult);
+				}
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(tag.data(), tag.size());
+					tag.clear();
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Ciphertext allocation failed", L"EncryptAEAD"); }
+					return false;
+				}
+
 				st = BCryptEncrypt(m_keyHandle,
 					const_cast<uint8_t*>(plaintext), static_cast<ULONG>(plaintextLen),
 					&authInfo,
@@ -1031,14 +1067,22 @@ namespace ShadowStrike {
 					SecureZeroMemory(tag.data(), tag.size());
 					ciphertext.clear();
 					tag.clear();
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptEncrypt AEAD failed"; }
+					if (err) { err->SetNtStatus(st, L"BCryptEncrypt AEAD failed", L"EncryptAEAD"); }
 					return false;
 				}
 
-				ciphertext.resize(cbResult);
+				try { ciphertext.resize(cbResult); }
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(ciphertext.data(), ciphertext.size());
+					SecureZeroMemory(tag.data(), tag.size());
+					ciphertext.clear();
+					tag.clear();
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"EncryptAEAD"); }
+					return false;
+				}
 				return true;
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+				if (err) { err->SetWin32Error(ERROR_NOT_SUPPORTED, L"Platform not supported", L"EncryptAEAD"); }
 				return false;
 #endif
 			}
@@ -1049,42 +1093,43 @@ namespace ShadowStrike {
 				std::vector<uint8_t>& plaintext, Error* err) noexcept
 			{
 				if (aadLen > 0 && !aad) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"AAD pointer invalid"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_PARAMETER, L"AAD pointer invalid", L"DecryptAEAD"); }
 					return false;
 				}
 				if (!IsAEAD()) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Not an AEAD algorithm"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_PARAMETER, L"Not an AEAD algorithm", L"DecryptAEAD"); }
 					return false;
 				}
 
 				if (!m_keySet || !m_ivSet) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key or IV not set"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"Key or IV not set", L"DecryptAEAD"); }
 					return false;
 				}
 
 				if (tagLen != GetTagSize()) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid tag size"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_PARAMETER, L"Invalid tag size", L"DecryptAEAD"); }
 					return false;
 				}
 
 				if (ciphertextLen > std::numeric_limits<ULONG>::max()) {
-					if (err) {
-						err->win32 = ERROR_BUFFER_OVERFLOW;
-						err->message = L"Ciphertext is too large for Windows CNG API";
-					}
+					if (err) { err->SetWin32Error(ERROR_BUFFER_OVERFLOW, L"Ciphertext is too large for Windows CNG API", L"DecryptAEAD"); }
 					return false;
 				}
 
 				if (aadLen > std::numeric_limits<ULONG>::max()) {
-					if (err) {
-						err->win32 = ERROR_BUFFER_OVERFLOW;
-						err->message = L"AAD too large for Windows CNG API";
-					}
+					if (err) { err->SetWin32Error(ERROR_BUFFER_OVERFLOW, L"AAD too large for Windows CNG API", L"DecryptAEAD"); }
 					return false;
 				}
 
 #ifdef _WIN32
-				std::vector<uint8_t> ivLocal = m_iv;
+				std::vector<uint8_t> ivLocal;
+				try {
+					ivLocal = m_iv;
+				}
+				catch (const std::bad_alloc&) {
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"IV copy allocation failed", L"DecryptAEAD"); }
+					return false;
+				}
 
 				BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
 				BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
@@ -1107,11 +1152,18 @@ namespace ShadowStrike {
 					nullptr, 0,
 					nullptr, 0, &cbResult, 0);
 				if (st < 0) {
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptDecrypt AEAD size query failed"; }
+					if (err) { err->SetNtStatus(st, L"BCryptDecrypt AEAD size query failed", L"DecryptAEAD"); }
 					return false;
 				}
 
-				plaintext.resize(cbResult);
+				try {
+					plaintext.resize(cbResult);
+				}
+				catch (const std::bad_alloc&) {
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output allocation failed", L"DecryptAEAD"); }
+					return false;
+				}
+
 				st = BCryptDecrypt(m_keyHandle,
 					const_cast<uint8_t*>(ciphertext), static_cast<ULONG>(ciphertextLen),
 					&authInfo,
@@ -1119,25 +1171,32 @@ namespace ShadowStrike {
 					plaintext.data(), static_cast<ULONG>(plaintext.size()), &cbResult, 0);
 				if (st < 0) {
 					SecureZeroMemory(plaintext.data(), plaintext.size());
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptDecrypt AEAD failed or authentication failed"; }
+					plaintext.clear();
+					if (err) { err->SetNtStatus(st, L"BCryptDecrypt AEAD failed or authentication failed", L"DecryptAEAD"); }
 					return false;
 				}
 
-				plaintext.resize(cbResult);
+				try { plaintext.resize(cbResult); }
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(plaintext.data(), plaintext.size());
+					plaintext.clear();
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"DecryptAEAD"); }
+					return false;
+				}
 				return true;
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+				if (err) { err->SetWin32Error(ERROR_NOT_SUPPORTED, L"Platform not supported", L"DecryptAEAD"); }
 				return false;
 #endif
 			}
 
 			bool SymmetricCipher::EncryptInit(Error* err) noexcept {
 				if (!m_keySet) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key not set"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"Key not set", L"EncryptInit"); }
 					return false;
 				}
 				if (!m_ivSet && GetIVSize() > 0) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"IV not set"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"IV not set", L"EncryptInit"); }
 					return false;
 				}
 
@@ -1150,11 +1209,11 @@ namespace ShadowStrike {
 
 			bool SymmetricCipher::EncryptUpdate(const uint8_t* data, size_t len, std::vector<uint8_t>& out, Error* err) noexcept {
 				if (!m_keySet) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key not set"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"Key not set", L"EncryptUpdate"); }
 					return false;
 				}
 				if (m_streamFinalized) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Stream already finalized"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"Stream already finalized", L"EncryptUpdate"); }
 					return false;
 				}
 
@@ -1163,18 +1222,24 @@ namespace ShadowStrike {
 
 				// streaming is not supported for AEAD modes
 				if (IsAEAD()) {
-					if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"AEAD modes do not support streaming"; }
+					if (err) { err->SetWin32Error(ERROR_NOT_SUPPORTED, L"AEAD modes do not support streaming", L"EncryptUpdate"); }
 					return false;
 				}
 
 				// Accumulation limit: prevent memory bomb via unbounded streaming
 				if (len > MAX_PLAINTEXT_SIZE || m_streamBuffer.size() > MAX_PLAINTEXT_SIZE - len) {
-					if (err) { err->win32 = ERROR_BUFFER_OVERFLOW; err->message = L"Stream buffer exceeds MAX_PLAINTEXT_SIZE"; }
+					if (err) { err->SetWin32Error(ERROR_BUFFER_OVERFLOW, L"Stream buffer exceeds MAX_PLAINTEXT_SIZE", L"EncryptUpdate"); }
 					return false;
 				}
 
 				//Add the new data to the internal buffer
-				m_streamBuffer.insert(m_streamBuffer.end(), data, data + len);
+				try {
+					m_streamBuffer.insert(m_streamBuffer.end(), data, data + len);
+				}
+				catch (const std::bad_alloc&) {
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Stream buffer allocation failed", L"EncryptUpdate"); }
+					return false;
+				}
 
 				//encrypt the block-aligned data in the buffer
 				const size_t blockSize = GetBlockSize();
@@ -1189,12 +1254,19 @@ namespace ShadowStrike {
 				// ═══════════════════════════════════════════════════════════════════
 				//  EXTRACT BLOCK-ALIGNED DATA FOR ENCRYPTION
 				// ═══════════════════════════════════════════════════════════════════
-				std::vector<uint8_t> toEncrypt(m_streamBuffer.begin(), m_streamBuffer.begin() + alignedSize);
+				std::vector<uint8_t> toEncrypt;
+				try {
+					toEncrypt.assign(m_streamBuffer.begin(), m_streamBuffer.begin() + alignedSize);
+				}
+				catch (const std::bad_alloc&) {
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Plaintext copy allocation failed", L"EncryptUpdate"); }
+					return false;
+				}
 
 				// Validate sizes for ULONG conversion
 				if (toEncrypt.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
 					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
-					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"Data too large for ULONG"; }
+					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"Data too large for ULONG", L"EncryptUpdate"); }
 					return false;
 				}
 
@@ -1207,11 +1279,19 @@ namespace ShadowStrike {
 				if (st < 0) {
 					// SECURITY: Clear temporary buffer on failure
 					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptEncrypt size query failed"; }
+					if (err) { err->SetNtStatus(st, L"BCryptEncrypt size query failed", L"EncryptUpdate"); }
 					return false;
 				}
 
-				out.resize(cbResult);
+				try {
+					out.resize(cbResult);
+				}
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output allocation failed", L"EncryptUpdate"); }
+					return false;
+				}
+
 				st = BCryptEncrypt(m_keyHandle,
 					toEncrypt.data(), static_cast<ULONG>(toEncrypt.size()),
 					nullptr,
@@ -1222,11 +1302,16 @@ namespace ShadowStrike {
 					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
 					SecureZeroMemory(out.data(), out.size());
 					out.clear();
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptEncrypt failed"; }
+					if (err) { err->SetNtStatus(st, L"BCryptEncrypt failed", L"EncryptUpdate"); }
 					return false;
 				}
 
-				out.resize(cbResult);
+				try { out.resize(cbResult); }
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"EncryptUpdate"); }
+					return false;
+				}
 
 				// update IV for modes that require it (CBC, CFB, OFB)
 				if (!out.empty() && m_iv.size() == blockSize) {
@@ -1238,25 +1323,25 @@ namespace ShadowStrike {
 				m_streamBuffer.erase(m_streamBuffer.begin(), m_streamBuffer.begin() + alignedSize);
 				return true;
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+				if (err) { err->SetWin32Error(ERROR_NOT_SUPPORTED, L"Platform not supported", L"SymmetricCipher"); }
 				return false;
 #endif
 			}
 
 			bool SymmetricCipher::EncryptFinal(std::vector<uint8_t>& out, Error* err) noexcept {
 				if (!m_keySet) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key not set"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"Key not set", L"EncryptFinal"); }
 					return false;
 				}
 				if (m_streamFinalized) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Stream already finalized"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"Stream already finalized", L"EncryptFinal"); }
 					return false;
 				}
 
 				out.clear();
 
 				if (IsAEAD()) {
-					if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"AEAD modes do not support streaming"; }
+					if (err) { err->SetWin32Error(ERROR_NOT_SUPPORTED, L"AEAD modes do not support streaming", L"EncryptFinal"); }
 					return false;
 				}
 
@@ -1275,7 +1360,7 @@ namespace ShadowStrike {
 						// SECURITY: Clear stream buffer on failure
 						SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
 						m_streamBuffer.clear();
-						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Padding failed"; }
+						if (err) { err->SetWin32Error(ERROR_INVALID_DATA, L"Padding failed", L"EncryptFinal"); }
 						return false;
 					}
 				}
@@ -1284,7 +1369,7 @@ namespace ShadowStrike {
 				if (m_streamBuffer.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
 					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
-					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"Data too large for ULONG"; }
+					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"Data too large for ULONG", L"EncryptFinal"); }
 					return false;
 				}
 
@@ -1303,11 +1388,20 @@ namespace ShadowStrike {
 					// SECURITY: Clear stream buffer on failure
 					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"EncryptFinal failed"; }
+					if (err) { err->SetNtStatus(st, L"EncryptFinal size query failed", L"EncryptFinal"); }
 					return false;
 				}
 
-				out.resize(cbResult);
+				try {
+					out.resize(cbResult);
+				}
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					m_streamBuffer.clear();
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output allocation failed", L"EncryptFinal"); }
+					return false;
+				}
+
 				st = BCryptEncrypt(
 					m_keyHandle,
 					m_streamBuffer.data(), static_cast<ULONG>(m_streamBuffer.size()),
@@ -1321,11 +1415,17 @@ namespace ShadowStrike {
 					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					out.clear();
 					m_streamBuffer.clear();
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"EncryptFinal failed"; }
+					if (err) { err->SetNtStatus(st, L"EncryptFinal failed", L"EncryptFinal"); }
 					return false;
 				}
 
-				out.resize(cbResult);
+				try { out.resize(cbResult); }
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					m_streamBuffer.clear();
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"EncryptFinal"); }
+					return false;
+				}
 
 				// SECURITY: Securely clear stream buffer before clearing
 				SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
@@ -1333,18 +1433,18 @@ namespace ShadowStrike {
 				m_streamFinalized = true;
 				return true;
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+				if (err) { err->SetWin32Error(ERROR_NOT_SUPPORTED, L"Platform not supported", L"SymmetricCipher"); }
 				return false;
 #endif
 			}
 
 			bool SymmetricCipher::DecryptInit(Error* err) noexcept {
 				if (!m_keySet) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key not set"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"Key not set", L"DecryptInit"); }
 					return false;
 				}
 				if (!m_ivSet && GetIVSize() > 0) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"IV not set"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"IV not set", L"DecryptInit"); }
 					return false;
 				}
 
@@ -1356,11 +1456,11 @@ namespace ShadowStrike {
 
 			bool SymmetricCipher::DecryptUpdate(const uint8_t* data, size_t len, std::vector<uint8_t>& out, Error* err) noexcept {
 				if (!m_keySet) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"DecryptInit not called"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"DecryptInit not called", L"DecryptUpdate"); }
 					return false;
 				}
 				if (m_streamFinalized) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Stream already finalized"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"Stream already finalized", L"DecryptUpdate"); }
 					return false;
 				}
 
@@ -1368,34 +1468,40 @@ namespace ShadowStrike {
 				if (len == 0) return true;
 
 				if (IsAEAD()) {
-					if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"AEAD modes do not support streaming"; }
+					if (err) { err->SetWin32Error(ERROR_NOT_SUPPORTED, L"AEAD modes do not support streaming", L"DecryptUpdate"); }
 					return false;
 				}
 
 				//overflow guard
 				if (len > SIZE_MAX - m_streamBuffer.size()) {
-					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"Buffer overflow risk"; }
+					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"Buffer overflow risk", L"DecryptUpdate"); }
 					return false;
 				}
 
 				// Accumulation limit: prevent memory bomb via unbounded streaming
 				if (m_streamBuffer.size() + len > MAX_CIPHERTEXT_SIZE) {
-					if (err) { err->win32 = ERROR_BUFFER_OVERFLOW; err->message = L"Stream buffer exceeds MAX_CIPHERTEXT_SIZE"; }
+					if (err) { err->SetWin32Error(ERROR_BUFFER_OVERFLOW, L"Stream buffer exceeds MAX_CIPHERTEXT_SIZE", L"DecryptUpdate"); }
 					return false;
 				}
 
-				m_streamBuffer.insert(m_streamBuffer.end(), data, data + len);
+				try {
+					m_streamBuffer.insert(m_streamBuffer.end(), data, data + len);
+				}
+				catch (const std::bad_alloc&) {
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Stream buffer allocation failed", L"DecryptUpdate"); }
+					return false;
+				}
 
 				const size_t blockSize = GetBlockSize();
 
 				//blocksize validation
 				if (blockSize == 0) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid block size"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_DATA, L"Invalid block size", L"DecryptUpdate"); }
 					return false;
 				}
 				//overflow guard for blocksize
 				if (m_streamBuffer.size() / blockSize > SIZE_MAX / blockSize) {
-					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"Block size overflow"; }
+					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"Block size overflow", L"DecryptUpdate"); }
 					return false;
 				}
 				const size_t alignedSize = (m_streamBuffer.size() / blockSize) * blockSize;
@@ -1410,25 +1516,32 @@ namespace ShadowStrike {
 
 #ifdef _WIN32
 				if (processSize > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
-					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"processSize too large for ULONG"; }
+					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"processSize too large for ULONG", L"DecryptUpdate"); }
 					return false;
 				}
 
 				// ═══════════════════════════════════════════════════════════════════
 				//  EXTRACT DATA FOR DECRYPTION
 				// ═══════════════════════════════════════════════════════════════════
-				std::vector<uint8_t> toDecrypt(m_streamBuffer.begin(), m_streamBuffer.begin() + processSize);
+				std::vector<uint8_t> toDecrypt;
+				try {
+					toDecrypt.assign(m_streamBuffer.begin(), m_streamBuffer.begin() + processSize);
+				}
+				catch (const std::bad_alloc&) {
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Ciphertext copy allocation failed", L"DecryptUpdate"); }
+					return false;
+				}
 
 				// Validate sizes for ULONG conversion
 				if (toDecrypt.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
 					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
-					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"toDecrypt size too large for ULONG"; }
+					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"toDecrypt size too large for ULONG", L"DecryptUpdate"); }
 					return false;
 				}
 
 				if (m_iv.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
 					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
-					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"IV size too large for ULONG"; }
+					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"IV size too large for ULONG", L"DecryptUpdate"); }
 					return false;
 				}
 
@@ -1444,11 +1557,19 @@ namespace ShadowStrike {
 				if (st < 0) {
 					// SECURITY: Clear ciphertext copy on failure
 					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptDecrypt size query failed"; }
+					if (err) { err->SetNtStatus(st, L"BCryptDecrypt size query failed", L"DecryptUpdate"); }
 					return false;
 				}
 
-				out.resize(cbResult);
+				try {
+					out.resize(cbResult);
+				}
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output allocation failed", L"DecryptUpdate"); }
+					return false;
+				}
+
 				st = BCryptDecrypt(m_keyHandle,
 					toDecrypt.data(), static_cast<ULONG>(toDecrypt.size()),
 					nullptr,
@@ -1459,11 +1580,16 @@ namespace ShadowStrike {
 					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
 					SecureZeroMemory(out.data(), out.size());
 					out.clear();
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptDecrypt failed"; }
+					if (err) { err->SetNtStatus(st, L"BCryptDecrypt failed", L"DecryptUpdate"); }
 					return false;
 				}
 
-				out.resize(cbResult);
+				try { out.resize(cbResult); }
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"DecryptUpdate"); }
+					return false;
+				}
 
 				// update IV (for CBC mode) - use ciphertext as next IV
 				if (!toDecrypt.empty() && m_iv.size() == blockSize) {
@@ -1476,25 +1602,25 @@ namespace ShadowStrike {
 
 				return true;
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+				if (err) { err->SetWin32Error(ERROR_NOT_SUPPORTED, L"Platform not supported", L"SymmetricCipher"); }
 				return false;
 #endif
 			}
 
 			bool SymmetricCipher::DecryptFinal(std::vector<uint8_t>& out, Error* err) noexcept {
 				if (!m_keySet) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"DecryptInit not called"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"DecryptInit not called", L"DecryptFinal"); }
 					return false;
 				}
 				if (m_streamFinalized) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Stream already finalized"; }
+					if (err) { err->SetWin32Error(ERROR_INVALID_STATE, L"Stream already finalized", L"DecryptFinal"); }
 					return false;
 				}
 
 				out.clear();
 
 				if (IsAEAD()) {
-					if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"AEAD modes do not support streaming"; }
+					if (err) { err->SetWin32Error(ERROR_NOT_SUPPORTED, L"AEAD modes do not support streaming", L"DecryptFinal"); }
 					return false;
 				}
 
@@ -1509,7 +1635,7 @@ namespace ShadowStrike {
 				if (m_streamBuffer.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
 					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
-					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"Data too large for ULONG"; }
+					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"Data too large for ULONG", L"DecryptFinal"); }
 					return false;
 				}
 
@@ -1528,11 +1654,20 @@ namespace ShadowStrike {
 					// SECURITY: Clear stream buffer on failure
 					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"DecryptFinal failed"; }
+					if (err) { err->SetNtStatus(st, L"DecryptFinal size query failed", L"DecryptFinal"); }
 					return false;
 				}
 
-				out.resize(cbResult);
+				try {
+					out.resize(cbResult);
+				}
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					m_streamBuffer.clear();
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output allocation failed", L"DecryptFinal"); }
+					return false;
+				}
+
 				st = BCryptDecrypt(
 					m_keyHandle,
 					m_streamBuffer.data(), static_cast<ULONG>(m_streamBuffer.size()),
@@ -1546,11 +1681,17 @@ namespace ShadowStrike {
 					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					out.clear();
 					m_streamBuffer.clear();
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"DecryptFinal failed"; }
+					if (err) { err->SetNtStatus(st, L"DecryptFinal failed", L"DecryptFinal"); }
 					return false;
 				}
 
-				out.resize(cbResult);
+				try { out.resize(cbResult); }
+				catch (const std::bad_alloc&) {
+					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					m_streamBuffer.clear();
+					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"DecryptFinal"); }
+					return false;
+				}
 
 				// ═══════════════════════════════════════════════════════════════════
 				//  MANUAL PADDING REMOVAL (Constant-time validation)
@@ -1563,7 +1704,7 @@ namespace ShadowStrike {
 						SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
 						out.clear();
 						m_streamBuffer.clear();
-						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid padding"; }
+						if (err) { err->SetWin32Error(ERROR_INVALID_DATA, L"Invalid padding", L"DecryptFinal"); }
 						return false;
 					}
 				}
@@ -1574,7 +1715,7 @@ namespace ShadowStrike {
 				m_streamFinalized = true;
 				return true;
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+				if (err) { err->SetWin32Error(ERROR_NOT_SUPPORTED, L"Platform not supported", L"SymmetricCipher"); }
 				return false;
 #endif
 			}
@@ -1603,23 +1744,31 @@ namespace ShadowStrike {
 
 				const uint8_t padLen = data.back();
 
-				// SECURITY: Validate padding length
-				if (padLen == 0 || padLen > blockSize || padLen > data.size()) {
+				// CONSTANT-TIME VALIDATION: range + byte check in single pass
+				// Folding range check into CT loop prevents padding oracle timing leaks
+				unsigned rangeValid = 1;
+				rangeValid &= static_cast<unsigned>(padLen != 0);
+				rangeValid &= static_cast<unsigned>(padLen <= static_cast<uint8_t>(blockSize));
+				rangeValid &= static_cast<unsigned>(static_cast<size_t>(padLen) <= data.size());
+
+				// Always scan last blockSize bytes regardless of padLen validity
+				uint8_t diff = 0;
+				for (size_t i = 0; i < blockSize; ++i) {
+					const size_t idx = data.size() - blockSize + i;
+					// 0xFF mask for bytes that should be padding, 0x00 otherwise
+					const uint8_t shouldBePad = static_cast<uint8_t>(
+						-static_cast<int>(i >= (blockSize - static_cast<size_t>(padLen))));
+					diff |= shouldBePad & (data[idx] ^ padLen);
+				}
+
+				if (rangeValid == 0 || diff != 0) {
 					return false;
 				}
 
-				// CONSTANT-TIME VALIDATION (Prevent padding oracle attacks)
-				uint8_t diff = 0;
-				for (size_t i = data.size() - padLen; i < data.size(); ++i) {
-					diff |= (data[i] ^ padLen);
+				try { data.resize(data.size() - padLen); }
+				catch (const std::bad_alloc&) {
+					return false;
 				}
-
-				if (diff != 0) {
-					return false; // Invalid padding
-				}
-
-				// Remove padding
-				data.resize(data.size() - padLen);
 				return true;
 			}
 		}
