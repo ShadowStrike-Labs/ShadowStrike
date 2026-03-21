@@ -1222,13 +1222,46 @@ public:
                 }
             }
 
-            // 2. VM Evasion
-            if (!evasionDetected && m_vmDetector) {
+            // 2. VM Evasion — anti-VM code pattern detection (SIDT/SLDT/CPUID loops/VMware backdoor)
+            // Always run for telemetry — APT malware commonly combines anti-debug + anti-VM
+            if (m_vmDetector) {
                 ShadowStrike::AntiEvasion::ProcessVMEvasionResult vmResult;
-                if (m_vmDetector->AnalyzeProcessAntiVMBehavior(req.processId, vmResult)) {
+                ShadowStrike::AntiEvasion::ProcessAnalysisConfig vmConfig;
+                vmConfig.analyzeCodePatterns = true;
+                vmConfig.analyzeImports = true;
+                vmConfig.analyzeStrings = true;
+
+                if (m_vmDetector->AnalyzeProcessAntiVMBehavior(req.processId, vmResult, vmConfig)) {
                     if (vmResult.hasAntiVMBehavior) {
-                        evasionDetected = true;
-                        detectionSource = L"VM Evasion";
+                        if (!evasionDetected) {
+                            evasionDetected = true;
+                            detectionSource = std::format(
+                                L"VM Evasion [score={:.1f} techniques={}]",
+                                vmResult.evasionScore,
+                                vmResult.GetTechniqueCount());
+                        }
+
+                        // Rich telemetry for SOC/SIEM: per-technique logging (always runs)
+                        for (const auto& tech : vmResult.techniqueDetails) {
+                            if (tech.severity >= 60.0f) {
+                                Utils::Logger::Warn(
+                                    L"RealTimeProtection: PID {} VM evasion: {} "
+                                    L"(severity={:.1f} addr=0x{:X} active={})",
+                                    req.processId, tech.description.substr(0, 120),
+                                    tech.severity, tech.address,
+                                    tech.isActive ? L"yes" : L"no");
+                            }
+                        }
+
+                        // High evasion score → immediate SOC alert
+                        if (vmResult.evasionScore >= 80.0f) {
+                            Utils::Logger::Error(
+                                L"RealTimeProtection: CRITICAL VM evasion in PID {} — "
+                                L"score={:.1f} techniques={} image={}",
+                                req.processId, vmResult.evasionScore,
+                                vmResult.GetTechniqueCount(),
+                                imagePath.substr(0, 120));
+                        }
                     }
                 }
             }
