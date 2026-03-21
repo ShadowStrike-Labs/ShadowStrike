@@ -42,7 +42,6 @@
 #include"pch.h"
 #include "CryptoUtils.hpp"
 #include"CryptoUtilsCommon.hpp"
-#include<sstream>
 
 namespace ShadowStrike {
 	namespace Utils {
@@ -226,7 +225,14 @@ namespace ShadowStrike {
 					return false;
 				}
 				outKeyPair.publicKey.algorithm = m_algorithm;
-				outKeyPair.publicKey.keyBlob.resize(cbBlob);
+				try {
+					outKeyPair.publicKey.keyBlob.resize(cbBlob);
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to allocate public key blob"; }
+					BCryptDestroyKey(hKey);
+					return false;
+				}
 				st = BCryptExportKey(hKey, nullptr, pubBlobType, outKeyPair.publicKey.keyBlob.data(), cbBlob, &cbBlob, 0);
 				if (st < 0) {
 					// SECURITY: Clear public key blob on failure
@@ -249,7 +255,15 @@ namespace ShadowStrike {
 					return false;
 				}
 				outKeyPair.privateKey.algorithm = m_algorithm;
-				outKeyPair.privateKey.keyBlob.resize(cbBlob);
+				try {
+					outKeyPair.privateKey.keyBlob.resize(cbBlob);
+				}
+				catch (const std::exception&) {
+					outKeyPair.publicKey.keyBlob.clear();
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to allocate private key blob"; }
+					BCryptDestroyKey(hKey);
+					return false;
+				}
 				st = BCryptExportKey(hKey, nullptr, privBlobType, outKeyPair.privateKey.keyBlob.data(), cbBlob, &cbBlob, 0);
 				if (st < 0) {
 					// SECURITY: Clear both key blobs on failure
@@ -280,6 +294,11 @@ namespace ShadowStrike {
 #ifdef _WIN32
 				if (!ensureProvider(err)) return false;
 
+				if (key.keyBlob.empty()) {
+					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Public key blob is empty"; }
+					return false;
+				}
+
 				if (m_publicKeyHandle) {
 					BCryptDestroyKey(m_publicKeyHandle);
 					m_publicKeyHandle = nullptr;
@@ -291,9 +310,23 @@ namespace ShadowStrike {
 					key.algorithm == AsymmetricAlgorithm::ECC_P521);
 				const wchar_t* blobType = isECC ? BCRYPT_ECCPUBLIC_BLOB : BCRYPT_RSAPUBLIC_BLOB;
 
+				// Import from a local copy to avoid const_cast UB on the caller's data
+				std::vector<uint8_t> blobCopy;
+				try {
+					blobCopy = key.keyBlob;
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to copy public key blob"; }
+					return false;
+				}
+
 				NTSTATUS st = BCryptImportKeyPair(m_algHandle, nullptr, blobType,
-					&m_publicKeyHandle, const_cast<uint8_t*>(key.keyBlob.data()),
-					static_cast<ULONG>(key.keyBlob.size()), 0);
+					&m_publicKeyHandle, blobCopy.data(),
+					static_cast<ULONG>(blobCopy.size()), 0);
+
+				// Public key blobs are not secret, but wipe the copy for consistency
+				blobCopy.clear();
+
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptImportKeyPair public failed"; }
 					SS_LOG_ERROR(L"CryptoUtils", L"BCryptImportKeyPair public failed: 0x%08X", st);
@@ -386,6 +419,12 @@ namespace ShadowStrike {
 					return false;
 				}
 
+				// Guard against size_t→ULONG truncation on x64
+				if (plaintextLen > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Plaintext length exceeds ULONG max"; }
+					return false;
+				}
+
 				// Padding setup
 				ULONG flags = 0;
 				BCRYPT_OAEP_PADDING_INFO oaep{};
@@ -446,7 +485,13 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				ciphertext.resize(cbResult);
+				try {
+					ciphertext.resize(cbResult);
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to allocate ciphertext buffer"; }
+					return false;
+				}
 				st = BCryptEncrypt(m_publicKeyHandle,
 					const_cast<uint8_t*>(plaintext), static_cast<ULONG>(plaintextLen),
 					const_cast<void*>(pPadInfo),
@@ -494,6 +539,12 @@ namespace ShadowStrike {
 
 				if (!ciphertext && ciphertextLen != 0) {
 					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid ciphertext pointer"; }
+					return false;
+				}
+
+				// Guard against size_t→ULONG truncation on x64
+				if (ciphertextLen > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Ciphertext length exceeds ULONG max"; }
 					return false;
 				}
 
@@ -549,7 +600,13 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				plaintext.resize(cbResult);
+				try {
+					plaintext.resize(cbResult);
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to allocate plaintext buffer"; }
+					return false;
+				}
 				st = BCryptDecrypt(m_privateKeyHandle,
 					const_cast<uint8_t*>(ciphertext), static_cast<ULONG>(ciphertextLen),
 					const_cast<void*>(pPadInfo),
@@ -622,9 +679,21 @@ namespace ShadowStrike {
 					padding == RSAPaddingScheme::PSS_SHA384 ||
 					padding == RSAPaddingScheme::PSS_SHA512)
 				{
+					// Validate PSS padding scheme matches the hash algorithm
+					const bool pssMismatch =
+						(padding == RSAPaddingScheme::PSS_SHA256 && hashAlg != HashUtils::Algorithm::SHA256) ||
+						(padding == RSAPaddingScheme::PSS_SHA384 && hashAlg != HashUtils::Algorithm::SHA384) ||
+						(padding == RSAPaddingScheme::PSS_SHA512 && hashAlg != HashUtils::Algorithm::SHA512);
+					if (pssMismatch) {
+						if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"PSS padding scheme does not match hash algorithm"; }
+						SS_LOG_ERROR(L"CryptoUtils", L"Sign: PSS padding/hash mismatch (padding=%d, hash=%d)",
+							static_cast<int>(padding), static_cast<int>(hashAlg));
+						return false;
+					}
+
 					flags = BCRYPT_PAD_PSS;
 					pssInfo.pszAlgId = hashAlgName;
-					pssInfo.cbSalt = static_cast<ULONG>(hash.size()); // ✅ CRITICAL: Salt length = hash length (RFC 8017)
+					pssInfo.cbSalt = static_cast<ULONG>(hash.size());
 					pPaddingInfo = &pssInfo;
 				}
 				else {
@@ -652,7 +721,13 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				signature.resize(cbResult);
+				try {
+					signature.resize(cbResult);
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to allocate signature buffer"; }
+					return false;
+				}
 
 				// Perform signing
 				st = BCryptSignHash(m_privateKeyHandle,
@@ -739,9 +814,21 @@ namespace ShadowStrike {
 					padding == RSAPaddingScheme::PSS_SHA384 ||
 					padding == RSAPaddingScheme::PSS_SHA512)
 				{
+					// Validate PSS padding scheme matches the hash algorithm
+					const bool pssMismatch =
+						(padding == RSAPaddingScheme::PSS_SHA256 && hashAlg != HashUtils::Algorithm::SHA256) ||
+						(padding == RSAPaddingScheme::PSS_SHA384 && hashAlg != HashUtils::Algorithm::SHA384) ||
+						(padding == RSAPaddingScheme::PSS_SHA512 && hashAlg != HashUtils::Algorithm::SHA512);
+					if (pssMismatch) {
+						if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"PSS padding scheme does not match hash algorithm"; }
+						SS_LOG_ERROR(L"CryptoUtils", L"Verify: PSS padding/hash mismatch (padding=%d, hash=%d)",
+							static_cast<int>(padding), static_cast<int>(hashAlg));
+						return false;
+					}
+
 					flags = BCRYPT_PAD_PSS;
 					pssInfo.pszAlgId = hashAlgName;
-					pssInfo.cbSalt = static_cast<ULONG>(hash.size()); // Salt length = hash length
+					pssInfo.cbSalt = static_cast<ULONG>(hash.size());
 					pPaddingInfo = &pssInfo;
 				}
 				else {
@@ -893,7 +980,15 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				sharedSecret.resize(cbResult);
+				try {
+					sharedSecret.resize(cbResult);
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to allocate shared secret buffer"; }
+					BCryptDestroySecret(hSecret);
+					BCryptDestroyKey(hPeerPublicKey);
+					return false;
+				}
 
 				st = BCryptDeriveKey(hSecret, BCRYPT_KDF_RAW_SECRET, nullptr,
 					sharedSecret.data(), static_cast<ULONG>(sharedSecret.size()), &cbResult, 0);
@@ -1064,6 +1159,13 @@ namespace ShadowStrike {
 					return false;
 				}
 
+				// Guard against size_t→ULONG truncation for BCryptDeriveKeyPBKDF2
+				constexpr size_t ulongMax = static_cast<size_t>(std::numeric_limits<ULONG>::max());
+				if (passwordLen > ulongMax || saltLen > ulongMax || keyLen > ulongMax) {
+					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Parameter length exceeds ULONG max"; }
+					return false;
+				}
+
 #ifdef _WIN32
 				// Map HashUtils::Algorithm to BCrypt algorithm
 				const wchar_t* algName = BCRYPT_SHA256_ALGORITHM;
@@ -1174,16 +1276,19 @@ namespace ShadowStrike {
 					msg.push_back(static_cast<uint8_t>(i));
 
 					t.resize(hashLen);
-					//Use ComputeHmac here as well
 					if (!HashUtils::ComputeHmac(hashAlg, prk.data(), prk.size(),
 						msg.data(), msg.size(), t, nullptr)) {
 						// SECURITY: Clear all intermediate key material on failure
+						SecureZeroMemory(msg.data(), msg.size());
 						SecureZeroMemory(prk.data(), prk.size());
 						SecureZeroMemory(t.data(), t.size());
 						SecureZeroMemory(okm.data(), okm.size());
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"HKDF Expand failed"; }
 						return false;
 					}
+
+					// SECURITY: Wipe msg containing T(i-1) concatenation before it goes out of scope
+					SecureZeroMemory(msg.data(), msg.size());
 
 					okm.insert(okm.end(), t.begin(), t.end());
 				}
@@ -1208,7 +1313,31 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				outKey.resize(params.keyLength);
+				// Validate key length: reject 0 and unreasonably large values
+				constexpr size_t MAX_DERIVED_KEY_LEN = 1024ULL * 1024ULL; // 1 MiB
+				if (params.keyLength == 0 || params.keyLength > MAX_DERIVED_KEY_LEN) {
+					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid derived key length (0 or exceeds 1 MiB)"; }
+					return false;
+				}
+
+				// Validate iteration count for PBKDF2 algorithms
+				if (params.algorithm == KDFAlgorithm::PBKDF2_SHA256 ||
+					params.algorithm == KDFAlgorithm::PBKDF2_SHA384 ||
+					params.algorithm == KDFAlgorithm::PBKDF2_SHA512)
+				{
+					if (params.iterations < MIN_PBKDF2_ITERATIONS) {
+						if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"PBKDF2 iterations below minimum"; }
+						return false;
+					}
+				}
+
+				try {
+					outKey.resize(params.keyLength);
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to allocate output key buffer"; }
+					return false;
+				}
 
 				// Generate salt if not provided
 				std::vector<uint8_t> salt = params.salt;
@@ -1279,7 +1408,13 @@ namespace ShadowStrike {
 			// PublicKey Implementation
 			// =============================================================================
 			bool PublicKey::Export(std::vector<uint8_t>& out, Error* err) const noexcept {
-				out = keyBlob;
+				try {
+					out = keyBlob;
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to copy key blob"; }
+					return false;
+				}
 				return true;
 			}
 
@@ -1289,28 +1424,34 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// Base64 encode the DER blob
-				std::string base64 = Base64::Encode(keyBlob);
-				if (base64.empty()) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Base64 encoding failed"; }
+				try {
+					// Base64 encode the DER blob
+					std::string base64 = Base64::Encode(keyBlob);
+					if (base64.empty()) {
+						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Base64 encoding failed"; }
+						return false;
+					}
+
+					// PEM format: header + base64 (64 chars per line) + footer
+					std::string result;
+					result.reserve(base64.size() + 64);
+					result += "-----BEGIN PUBLIC KEY-----\n";
+
+					const size_t lineWidth = 64;
+					for (size_t i = 0; i < base64.size(); i += lineWidth) {
+						size_t chunkSize = std::min(lineWidth, base64.size() - i);
+						result.append(base64, i, chunkSize);
+						result += '\n';
+					}
+
+					result += "-----END PUBLIC KEY-----\n";
+					out = std::move(result);
+					return true;
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"PEM export allocation failed"; }
 					return false;
 				}
-
-				// PEM format: header + base64 (64 chars per line) + footer
-				std::ostringstream oss;
-				oss << "-----BEGIN PUBLIC KEY-----\n";
-
-				// Split base64 into 64-character lines
-				const size_t lineWidth = 64;
-				for (size_t i = 0; i < base64.size(); i += lineWidth) {
-					size_t chunkSize = std::min(lineWidth, base64.size() - i);
-					oss << base64.substr(i, chunkSize) << "\n";
-				}
-
-				oss << "-----END PUBLIC KEY-----\n";
-
-				out = oss.str();
-				return true;
 			}
 
 			bool PublicKey::Import(const uint8_t* data, size_t len, PublicKey& out, Error* err) noexcept {
@@ -1319,7 +1460,13 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				out.keyBlob.assign(data, data + len);
+				try {
+					out.keyBlob.assign(data, data + len);
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to copy key data"; }
+					return false;
+				}
 				return true;
 			}
 
@@ -1329,54 +1476,60 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// Find PEM boundaries
-				const std::string_view beginMarker = "-----BEGIN PUBLIC KEY-----";
-				const std::string_view endMarker = "-----END PUBLIC KEY-----";
+				try {
+					// Find PEM boundaries
+					const std::string_view beginMarker = "-----BEGIN PUBLIC KEY-----";
+					const std::string_view endMarker = "-----END PUBLIC KEY-----";
 
-				size_t beginPos = pem.find(beginMarker);
-				if (beginPos == std::string_view::npos) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"PEM begin marker not found"; }
-					return false;
-				}
-
-				size_t endPos = pem.find(endMarker, beginPos);
-				if (endPos == std::string_view::npos) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"PEM end marker not found"; }
-					return false;
-				}
-
-				// Extract base64 content (skip header)
-				beginPos += beginMarker.size();
-				std::string_view base64Content = pem.substr(beginPos, endPos - beginPos);
-
-				// Remove whitespace (newlines, spaces, tabs)
-				std::string cleanBase64;
-				cleanBase64.reserve(base64Content.size());
-				for (char c : base64Content) {
-					if (c != '\n' && c != '\r' && c != ' ' && c != '\t') {
-						cleanBase64.push_back(c);
+					size_t beginPos = pem.find(beginMarker);
+					if (beginPos == std::string_view::npos) {
+						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"PEM begin marker not found"; }
+						return false;
 					}
-				}
 
-				if (cleanBase64.empty()) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"PEM content is empty"; }
+					size_t endPos = pem.find(endMarker, beginPos);
+					if (endPos == std::string_view::npos) {
+						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"PEM end marker not found"; }
+						return false;
+					}
+
+					// Extract base64 content (skip header)
+					beginPos += beginMarker.size();
+					std::string_view base64Content = pem.substr(beginPos, endPos - beginPos);
+
+					// Remove whitespace (newlines, spaces, tabs)
+					std::string cleanBase64;
+					cleanBase64.reserve(base64Content.size());
+					for (char c : base64Content) {
+						if (c != '\n' && c != '\r' && c != ' ' && c != '\t') {
+							cleanBase64.push_back(c);
+						}
+					}
+
+					if (cleanBase64.empty()) {
+						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"PEM content is empty"; }
+						return false;
+					}
+
+					// Base64 decode
+					std::vector<uint8_t> decoded;
+					if (!Base64::Decode(cleanBase64, decoded)) {
+						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Base64 decoding failed"; }
+						return false;
+					}
+
+					if (decoded.empty()) {
+						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Decoded data is empty"; }
+						return false;
+					}
+
+					out.keyBlob = std::move(decoded);
+					return true;
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"PEM import allocation failed"; }
 					return false;
 				}
-
-				// Base64 decode
-				std::vector<uint8_t> decoded;
-				if (!Base64::Decode(cleanBase64, decoded)) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Base64 decoding failed"; }
-					return false;
-				}
-
-				if (decoded.empty()) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Decoded data is empty"; }
-					return false;
-				}
-
-				out.keyBlob = std::move(decoded);
-				return true;
 			}
 
 
