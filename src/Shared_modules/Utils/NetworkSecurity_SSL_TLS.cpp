@@ -137,26 +137,38 @@ namespace ShadowStrike {
 					return str.substr(cnPos, endPos - cnPos);
 				}
 
-				// Helper to check if hostname matches certificate CN or SAN
+				// Helper to check if hostname matches certificate CN or SAN (RFC 6125 compliant)
 				inline bool MatchesHostname(std::wstring_view certName, std::wstring_view hostname) noexcept {
+					if (certName.empty() || hostname.empty()) return false;
+
 					// Exact match
 					if (Internal::EqualsIgnoreCase(certName, hostname)) {
 						return true;
 					}
 
-					// Wildcard match (e.g., *.example.com matches www.example.com)
-					if (certName.size() >= 2 && certName[0] == L'*' && certName[1] == L'.') {
-						std::wstring_view wildcardDomain = certName.substr(2);
+					// Wildcard match per RFC 6125 §6.4.3:
+					// - Wildcard MUST be in leftmost label ONLY
+					// - Wildcard domain MUST have ≥2 labels (*.example.com OK, *.com REJECTED)
+					// - No additional wildcards allowed in remaining labels
+					if (certName.size() < 4) return false;
+					if (certName[0] != L'*' || certName[1] != L'.') return false;
 
-						// Find first dot in hostname
-						size_t dotPos = hostname.find(L'.');
-						if (dotPos != std::wstring_view::npos && dotPos + 1 < hostname.size()) {
-							std::wstring_view hostDomain = hostname.substr(dotPos + 1);
-							return Internal::EqualsIgnoreCase(wildcardDomain, hostDomain);
-						}
-					}
+					std::wstring_view wildcardDomain = certName.substr(2);
 
-					return false;
+					// Reject additional wildcards in domain portion (*.*.com)
+					if (wildcardDomain.find(L'*') != std::wstring_view::npos) return false;
+
+					// Wildcard domain MUST contain at least one dot (>=2 labels)
+					// Prevents *.com, *.org from being universal match certs
+					if (wildcardDomain.find(L'.') == std::wstring_view::npos) return false;
+
+					// Match hostname's parent domain against wildcard domain
+					size_t dotPos = hostname.find(L'.');
+					if (dotPos == std::wstring_view::npos || dotPos == 0) return false;
+					if (dotPos + 1 >= hostname.size()) return false;
+
+					std::wstring_view hostDomain = hostname.substr(dotPos + 1);
+					return Internal::EqualsIgnoreCase(wildcardDomain, hostDomain);
 				}
 			}
 
@@ -174,7 +186,9 @@ namespace ShadowStrike {
 					);
 
 					if (!hSession) {
-						Internal::SetError(err, ::GetLastError(), L"WinHttpOpen failed", L"GetSslCertificate");
+						const DWORD lastErr = ::GetLastError();
+						Internal::SetError(err, lastErr, L"WinHttpOpen failed", L"GetSslCertificate");
+						SS_LOG_ERROR(L"NetworkSecurity", L"WinHttpOpen failed (err=%u)", lastErr);
 						return false;
 					}
 
@@ -232,7 +246,10 @@ namespace ShadowStrike {
 						WINHTTP_NO_ADDITIONAL_HEADERS, 0,
 						WINHTTP_NO_REQUEST_DATA, 0,
 						0, 0)) {
-						Internal::SetError(err, ::GetLastError(), L"WinHttpSendRequest failed", L"GetSslCertificate");
+						const DWORD lastErr = ::GetLastError();
+						Internal::SetError(err, lastErr, L"WinHttpSendRequest failed", L"GetSslCertificate");
+						SS_LOG_ERROR(L"NetworkSecurity", L"WinHttpSendRequest failed for %s:%u (err=%u)",
+							std::wstring(hostname).c_str(), static_cast<unsigned>(port), lastErr);
 						return false;
 					}
 
@@ -275,7 +292,8 @@ namespace ShadowStrike {
 						0
 					);
 
-					if (subjectLen > 1) {
+					constexpr DWORD MAX_CERT_NAME_LEN = 8192;
+					if (subjectLen > 1 && subjectLen <= MAX_CERT_NAME_LEN) {
 						std::vector<wchar_t> subjectBuf(subjectLen);
 						::CertGetNameStringW(
 							pCertContext,
@@ -298,7 +316,7 @@ namespace ShadowStrike {
 						0
 					);
 
-					if (issuerLen > 1) {
+					if (issuerLen > 1 && issuerLen <= MAX_CERT_NAME_LEN) {
 						std::vector<wchar_t> issuerBuf(issuerLen);
 						::CertGetNameStringW(
 							pCertContext,
@@ -313,7 +331,8 @@ namespace ShadowStrike {
 
 					// Extract serial number
 					DWORD serialSize = pCertContext->pCertInfo->SerialNumber.cbData;
-					if (serialSize > 0) {
+					constexpr DWORD MAX_SERIAL_LEN = 64; // RFC 5280: max 20, allow headroom
+					if (serialSize > 0 && serialSize <= MAX_SERIAL_LEN) {
 						std::wostringstream oss;
 						oss << std::hex << std::uppercase << std::setfill(L'0');
 
@@ -330,12 +349,11 @@ namespace ShadowStrike {
 					certInfo.validFrom = FileTimeToTimePoint(pCertContext->pCertInfo->NotBefore);
 					certInfo.validTo = FileTimeToTimePoint(pCertContext->pCertInfo->NotAfter);
 
-					// Check if certificate is currently valid
-					auto now = std::chrono::system_clock::now();
-					certInfo.isValid = (now >= certInfo.validFrom && now <= certInfo.validTo);
-
-					// Check if self-signed
-					certInfo.isSelfSigned = Internal::EqualsIgnoreCase(certInfo.subject, certInfo.issuer);
+					// isValid and isSelfSigned are determined by chain validation below.
+					// Do NOT set isValid based on time alone - callers rely on this field
+					// reflecting full chain validation status.
+					certInfo.isValid = false;
+					certInfo.isSelfSigned = false;
 
 					// Extract Subject Alternative Names (SAN)
 					PCERT_EXTENSION pExtension = ::CertFindExtension(
@@ -368,11 +386,18 @@ namespace ShadowStrike {
 							};
 							std::unique_ptr<CERT_ALT_NAME_INFO, SanDeleter> sanGuard(pAltNameInfo);
 
-							for (DWORD i = 0; i < pAltNameInfo->cAltEntry; ++i) {
+							constexpr DWORD MAX_SAN_ENTRIES = 4096;
+							const DWORD sanCount = (std::min)(pAltNameInfo->cAltEntry, MAX_SAN_ENTRIES);
+							for (DWORD i = 0; i < sanCount; ++i) {
 								const auto& entry = pAltNameInfo->rgAltEntry[i];
 
 								if (entry.dwAltNameChoice == CERT_ALT_NAME_DNS_NAME && entry.pwszDNSName) {
-									certInfo.subjectAltNames.emplace_back(entry.pwszDNSName);
+									// std::wstring from LPWSTR truncates at first null (wcslen semantics).
+									// Any data after an embedded null is safely discarded.
+									std::wstring sanName(entry.pwszDNSName);
+									if (!sanName.empty()) {
+										certInfo.subjectAltNames.emplace_back(std::move(sanName));
+									}
 								}
 								else if (entry.dwAltNameChoice == CERT_ALT_NAME_IP_ADDRESS) {
 									// Handle IP address SANs if needed
@@ -400,6 +425,15 @@ namespace ShadowStrike {
 
 					PCCERT_CHAIN_CONTEXT pChainContext = nullptr;
 
+					// Request EKU validation for TLS server authentication
+					CERT_ENHKEY_USAGE ekuUsage = {};
+					char serverAuthOidBuf[] = "1.3.6.1.5.5.7.3.1"; // szOID_PKIX_KP_SERVER_AUTH
+					LPSTR serverAuthOid = serverAuthOidBuf;
+					ekuUsage.cUsageIdentifier = 1;
+					ekuUsage.rgpszUsageIdentifier = &serverAuthOid;
+					chainPara.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
+					chainPara.RequestedUsage.Usage = ekuUsage;
+
 					if (::CertGetCertificateChain(
 						nullptr,                    // Use default chain engine
 						pCertContext,
@@ -411,33 +445,65 @@ namespace ShadowStrike {
 						&pChainContext)) {
 
 						struct ChainDeleter {
-							void operator()(PCCERT_CHAIN_CONTEXT p) const {
-								if (p) ::CertFreeCertificateChain(p);
-							}
+							void operator()(PCCERT_CHAIN_CONTEXT p) const { if (p) ::CertFreeCertificateChain(p); }
 						};
 						std::unique_ptr<const CERT_CHAIN_CONTEXT, ChainDeleter> chainGuard(pChainContext);
 
-						// Check chain status
-						if (pChainContext->TrustStatus.dwErrorStatus == CERT_TRUST_NO_ERROR) {
-							// Certificate chain is valid
-							certInfo.isValid = certInfo.isValid && true;
+						const DWORD errStatus = pChainContext->TrustStatus.dwErrorStatus;
+
+						if (errStatus == CERT_TRUST_NO_ERROR) {
+							// Full chain validation passed including time, revocation, signature, EKU
+							certInfo.isValid = true;
 						}
 						else {
-							// Chain has errors - mark as potentially invalid
-							if (pChainContext->TrustStatus.dwErrorStatus & CERT_TRUST_IS_NOT_TIME_VALID) {
+							// Comprehensive error flag checking
+							constexpr DWORD FATAL_FLAGS =
+								CERT_TRUST_IS_NOT_TIME_VALID |
+								CERT_TRUST_IS_REVOKED |
+								CERT_TRUST_IS_NOT_SIGNATURE_VALID |
+								CERT_TRUST_IS_PARTIAL_CHAIN |
+								CERT_TRUST_HAS_NOT_SUPPORTED_CRITICAL_EXTENSION |
+								CERT_TRUST_IS_NOT_VALID_FOR_USAGE |
+								CERT_TRUST_CTL_IS_NOT_SIGNATURE_VALID |
+								CERT_TRUST_CTL_IS_NOT_TIME_VALID |
+								CERT_TRUST_IS_EXPLICIT_DISTRUST |
+								CERT_TRUST_INVALID_BASIC_CONSTRAINTS |
+								CERT_TRUST_IS_CYCLIC |
+								CERT_TRUST_INVALID_NAME_CONSTRAINTS;
+
+							if (errStatus & FATAL_FLAGS) {
 								certInfo.isValid = false;
+								SS_LOG_WARN(L"NetworkSecurity",
+									L"Certificate chain validation failed (flags=0x%08X) for subject: %s",
+									errStatus, certInfo.subject.c_str());
 							}
-							if (pChainContext->TrustStatus.dwErrorStatus & CERT_TRUST_IS_REVOKED) {
-								certInfo.isValid = false;
-							}
-							if (pChainContext->TrustStatus.dwErrorStatus & CERT_TRUST_IS_NOT_SIGNATURE_VALID) {
-								certInfo.isValid = false;
-							}
-							if (pChainContext->TrustStatus.dwErrorStatus & CERT_TRUST_IS_UNTRUSTED_ROOT) {
-								// Self-signed or untrusted CA
+
+							if (errStatus & CERT_TRUST_IS_UNTRUSTED_ROOT) {
 								certInfo.isSelfSigned = true;
 							}
+
+							// Weak signature algorithm (MD5, SHA1)
+							if (errStatus & CERT_TRUST_HAS_WEAK_SIGNATURE) {
+								certInfo.isValid = false;
+								SS_LOG_WARN(L"NetworkSecurity",
+									L"Certificate uses weak signature algorithm: %s",
+									certInfo.subject.c_str());
+							}
+
+							// Offline revocation - CRL/OCSP unreachable
+							if (errStatus & CERT_TRUST_IS_OFFLINE_REVOCATION) {
+								SS_LOG_DEBUG(L"NetworkSecurity",
+									L"Revocation check offline for: %s (accepting)",
+									certInfo.subject.c_str());
+							}
 						}
+					}
+					else {
+						// CertGetCertificateChain failed entirely
+						SS_LOG_ERROR(L"NetworkSecurity",
+							L"CertGetCertificateChain failed (err=%u) for: %s",
+						::GetLastError(), certInfo.subject.c_str());
+						certInfo.isValid = false;
 					}
 
 					return true;
@@ -476,6 +542,9 @@ namespace ShadowStrike {
 
 					// 2. Reject self-signed certificates (enterprise policy)
 					if (certInfo.isSelfSigned) {
+						SS_LOG_WARN(L"NetworkSecurity",
+							L"Rejecting self-signed certificate: subject=%s",
+							certInfo.subject.c_str());
 						return false;
 					}
 
@@ -495,7 +564,8 @@ namespace ShadowStrike {
 					// 4. Validate hostname matching (RFC 6125)
 					bool hostnameMatches = false;
 
-					// 4a. Check Subject Alternative Names (SAN) first (modern standard)
+					// 4a. Check Subject Alternative Names (SAN) — RFC 6125 §6.4.4:
+					// If SANs are present, CN MUST NOT be checked as fallback.
 					if (!certInfo.subjectAltNames.empty()) {
 						for (const auto& san : certInfo.subjectAltNames) {
 							if (MatchesHostname(san, expectedHostname)) {
@@ -503,18 +573,22 @@ namespace ShadowStrike {
 								break;
 							}
 						}
+						// RFC 6125: SAN present means CN is IGNORED — no fallback
 					}
-
-					// 4b. Fallback to Common Name (deprecated but still used)
-					if (!hostnameMatches && !certInfo.subject.empty()) {
-						std::wstring cn = ExtractCommonName(certInfo.subject.c_str());
-						if (!cn.empty() && MatchesHostname(cn, expectedHostname)) {
-							hostnameMatches = true;
+					else {
+						// 4b. No SAN present — check Common Name (legacy certificates only)
+						if (!certInfo.subject.empty()) {
+							std::wstring cn = ExtractCommonName(certInfo.subject.c_str());
+							if (!cn.empty() && MatchesHostname(cn, expectedHostname)) {
+								hostnameMatches = true;
+							}
 						}
 					}
 
 					if (!hostnameMatches) {
-						// Hostname doesn't match certificate
+						SS_LOG_WARN(L"NetworkSecurity",
+							L"Certificate hostname mismatch: expected=%s, subject=%s",
+							std::wstring(expectedHostname).c_str(), certInfo.subject.c_str());
 						return false;
 					}
 
