@@ -131,6 +131,18 @@ namespace ShadowStrike {
                     return true;
                 }
 
+                // Validate before allocation — Generate(buffer,size) rejects > ULONG_MAX,
+                // but resize() would attempt a multi-GiB allocation first.
+                // Cap at 256 MiB — no legitimate EDR use-case needs more random bytes.
+                static constexpr size_t kMaxRandomSize = 256ULL * 1024 * 1024;
+                if (size > kMaxRandomSize) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_BUFFER_OVERFLOW,
+                            L"Random generation size exceeds 256 MiB cap");
+                    }
+                    return false;
+                }
+
                 try {
                     out.resize(size);
                 }
@@ -259,18 +271,30 @@ namespace ShadowStrike {
                     return std::string();
                 }
 
+                std::string out;
                 try {
-                    std::string out;
                     out.reserve(length);
 
                     for (size_t i = 0; i < length; ++i) {
                         const uint32_t idx = NextUInt32(0, static_cast<uint32_t>(alphaLen), err);
+                        // Abort immediately if RNG failed — NextUInt32 returns min (0)
+                        // on failure, producing predictable 'alphanum[0]' characters.
+                        if (err != nullptr && err->HasError()) {
+                            if (out.capacity() > 0) {
+                                SecureZeroMemory(out.data(), out.capacity());
+                            }
+                            return std::string();
+                        }
                         out.push_back(alphanum[idx]);
                     }
 
                     return out;
                 }
                 catch (const std::exception&) {
+                    // Wipe partial random characters before releasing memory
+                    if (out.capacity() > 0) {
+                        SecureZeroMemory(out.data(), out.capacity());
+                    }
                     if (err != nullptr) {
                         err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
                             L"Failed to allocate alphanumeric string");
@@ -290,10 +314,17 @@ namespace ShadowStrike {
                 }
 
                 try {
-                    return HashUtils::ToHexLower(bytes.data(), bytes.size());
+                    std::string hex = HashUtils::ToHexLower(bytes.data(), bytes.size());
+                    // Wipe raw random bytes — hex string is the intended output
+                    SecureZeroMemory(bytes.data(), bytes.size());
+                    return hex;
                 }
                 catch (const std::exception&) {
                     SecureZeroMemory(bytes.data(), bytes.size());
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
+                            L"Failed to encode random bytes as hex string");
+                    }
                     return std::string();
                 }
             }
