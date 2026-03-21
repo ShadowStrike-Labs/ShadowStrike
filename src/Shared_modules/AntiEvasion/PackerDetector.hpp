@@ -1497,6 +1497,9 @@ namespace ShadowStrike {
 
             /// @brief Treat installers as benign
             bool treatInstallersAsBenign = true;
+
+            /// @brief Originating process ID for telemetry correlation
+            uint32_t processId = 0;
         };
 
         /**

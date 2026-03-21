@@ -633,6 +633,19 @@ public:
         if (m_packerDetector) {
             if (!m_packerDetector->Initialize()) {
                 Utils::Logger::Warn(L"RealTimeProtection: PackerDetector Initialize failed");
+            } else {
+                m_packerDetector->SetDetectionCallback(
+                    [](const std::wstring& file, const ShadowStrike::AntiEvasion::PackerMatch& match) {
+                        if (match.severity >= ShadowStrike::AntiEvasion::PackerSeverity::High) {
+                            Utils::Logger::Warn(
+                                L"[PD-CB] file={} packer={} confidence={:.2f} severity={} method={} mitre={}",
+                                file.substr(0, 120), match.packerName,
+                                match.confidence,
+                                static_cast<int>(match.severity),
+                                static_cast<int>(match.method),
+                                match.mitreId.empty() ? std::wstring(L"N/A") : Utils::StringUtils::Utf8ToWide(match.mitreId));
+                        }
+                    });
             }
         }
         // VMEvasionDetector has no Initialize() — ready on construction
@@ -903,12 +916,43 @@ public:
         bool fileIsPacked = false;
         double packingConfidence = 0.0;
         if (m_packerDetector) {
-            auto packResult = m_packerDetector->AnalyzeFile(filePath);
+            ShadowStrike::AntiEvasion::PackerAnalysisConfig pdConfig;
+            pdConfig.depth = ShadowStrike::AntiEvasion::PackerAnalysisDepth::Deep;
+            pdConfig.flags = ShadowStrike::AntiEvasion::PackerAnalysisFlags::DeepScan;
+            pdConfig.processId = req.header.processId;
+
+            auto packResult = m_packerDetector->AnalyzeFile(filePath, pdConfig);
             if (packResult.isPacked) {
                 fileIsPacked = true;
                 packingConfidence = packResult.packingConfidence;
-                Utils::Logger::Info(L"RealTimeProtection: Packed file detected: {} (packer: {}, confidence: {:.1f}%)",
-                    filePath, packResult.packerName, packResult.packingConfidence * 100.0);
+
+                Utils::Logger::Info(
+                    L"RealTimeProtection: Packed file: {} [packer={} confidence={:.1f}% "
+                    L"severity={} category={} layers={} entropy={:.2f}]",
+                    filePath, packResult.packerName,
+                    packResult.packingConfidence * 100.0,
+                    static_cast<int>(packResult.severity),
+                    static_cast<int>(packResult.packerCategory),
+                    packResult.layerCount,
+                    packResult.fileEntropy);
+
+                // Critical/High severity packer = malware-specific packer → block immediately
+                if (packResult.severity >= ShadowStrike::AntiEvasion::PackerSeverity::Critical) {
+                    Utils::Logger::Warn(
+                        L"RealTimeProtection: Blocked malware-specific packer: {} [packer={} matches={}]",
+                        filePath, packResult.packerName, packResult.packerMatches.size());
+                    m_stats.threatsDetected++;
+                    return Communication::KernelVerdict::Block;
+                }
+
+                for (const auto& match : packResult.packerMatches) {
+                    if (match.severity >= ShadowStrike::AntiEvasion::PackerSeverity::High) {
+                        Utils::Logger::Warn(
+                            L"RealTimeProtection: High-severity packer match in {}: {} (confidence={:.2f}, method={})",
+                            filePath, match.packerName, match.confidence,
+                            static_cast<int>(match.method));
+                    }
+                }
             }
         }
 
@@ -1299,13 +1343,46 @@ public:
             return Communication::KernelVerdict::Allow;
         }
 
-        // Packer detection on loaded modules
+        // Packer detection on loaded modules — DeepScan for runtime-loaded DLLs
         if (m_packerDetector) {
             try {
-                auto packResult = m_packerDetector->AnalyzeFile(imagePath);
-                if (packResult.isPacked && packResult.packingConfidence > 0.85) {
-                    Utils::Logger::Warn(L"RealTimeProtection: Highly packed module loaded in PID {}: {} (packer: {}, confidence: {:.1f}%)",
-                        req.processId, imagePath, packResult.packerName, packResult.packingConfidence * 100.0);
+                ShadowStrike::AntiEvasion::PackerAnalysisConfig pdConfig;
+                pdConfig.depth = ShadowStrike::AntiEvasion::PackerAnalysisDepth::Deep;
+                pdConfig.flags = ShadowStrike::AntiEvasion::PackerAnalysisFlags::DeepScan;
+                pdConfig.processId = req.processId;
+
+                auto packResult = m_packerDetector->AnalyzeFile(imagePath, pdConfig);
+                if (packResult.isPacked) {
+                    // Malware-specific packer on DLL load = immediate block
+                    if (packResult.severity >= ShadowStrike::AntiEvasion::PackerSeverity::Critical) {
+                        Utils::Logger::Warn(
+                            L"RealTimeProtection: Blocked malware-packed module in PID {}: {} "
+                            L"[packer={} severity={} confidence={:.1f}% matches={}]",
+                            req.processId, imagePath, packResult.packerName,
+                            static_cast<int>(packResult.severity),
+                            packResult.packingConfidence * 100.0,
+                            packResult.packerMatches.size());
+                        return Communication::KernelVerdict::Block;
+                    }
+
+                    if (packResult.packingConfidence > 0.7) {
+                        Utils::Logger::Warn(
+                            L"RealTimeProtection: Packed module loaded in PID {}: {} "
+                            L"[packer={} confidence={:.1f}% severity={} category={} entropy={:.2f}]",
+                            req.processId, imagePath, packResult.packerName,
+                            packResult.packingConfidence * 100.0,
+                            static_cast<int>(packResult.severity),
+                            static_cast<int>(packResult.packerCategory),
+                            packResult.fileEntropy);
+
+                        for (const auto& match : packResult.packerMatches) {
+                            if (match.severity >= ShadowStrike::AntiEvasion::PackerSeverity::High) {
+                                Utils::Logger::Warn(
+                                    L"RealTimeProtection: High-severity packer in PID {} module {}: {} (confidence={:.2f})",
+                                    req.processId, imagePath, match.packerName, match.confidence);
+                            }
+                        }
+                    }
                 }
             } catch (const std::exception& e) {
                 Utils::Logger::Error(L"RealTimeProtection: PackerDetector exception on image load PID {}: {}",

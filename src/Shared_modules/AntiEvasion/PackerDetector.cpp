@@ -1586,8 +1586,10 @@ public:
         outOverlay.hasOverlay = true;
         outOverlay.offset = peInfo.overlayOffset;
         outOverlay.size = peInfo.overlaySize;
-        outOverlay.percentageOfFile = (static_cast<double>(peInfo.overlaySize) /
-            static_cast<double>(peInfo.fileSize)) * 100.0;
+        outOverlay.percentageOfFile = (peInfo.fileSize > 0)
+            ? (static_cast<double>(peInfo.overlaySize) /
+               static_cast<double>(peInfo.fileSize)) * 100.0
+            : 0.0;
 
         // SECURITY FIX: Validate overlay size before accessing magic bytes
         // Must have at least 4 bytes to safely check all magic patterns
