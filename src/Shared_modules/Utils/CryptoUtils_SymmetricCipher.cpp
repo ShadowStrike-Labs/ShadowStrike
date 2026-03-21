@@ -1089,7 +1089,7 @@ namespace ShadowStrike {
 				BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
 				BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
 				authInfo.pbNonce = ivLocal.data();
-				authInfo.cbNonce = static_cast<ULONG>(m_iv.size());
+				authInfo.cbNonce = static_cast<ULONG>(ivLocal.size());
 				authInfo.pbAuthData = const_cast<uint8_t*>(aad);
 				authInfo.cbAuthData = static_cast<ULONG>(aadLen);
 				authInfo.pbTag = const_cast<uint8_t*>(tag);
@@ -1164,6 +1164,12 @@ namespace ShadowStrike {
 				// streaming is not supported for AEAD modes
 				if (IsAEAD()) {
 					if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"AEAD modes do not support streaming"; }
+					return false;
+				}
+
+				// Accumulation limit: prevent memory bomb via unbounded streaming
+				if (len > MAX_PLAINTEXT_SIZE || m_streamBuffer.size() > MAX_PLAINTEXT_SIZE - len) {
+					if (err) { err->win32 = ERROR_BUFFER_OVERFLOW; err->message = L"Stream buffer exceeds MAX_PLAINTEXT_SIZE"; }
 					return false;
 				}
 
@@ -1369,6 +1375,12 @@ namespace ShadowStrike {
 				//overflow guard
 				if (len > SIZE_MAX - m_streamBuffer.size()) {
 					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"Buffer overflow risk"; }
+					return false;
+				}
+
+				// Accumulation limit: prevent memory bomb via unbounded streaming
+				if (m_streamBuffer.size() + len > MAX_CIPHERTEXT_SIZE) {
+					if (err) { err->win32 = ERROR_BUFFER_OVERFLOW; err->message = L"Stream buffer exceeds MAX_CIPHERTEXT_SIZE"; }
 					return false;
 				}
 

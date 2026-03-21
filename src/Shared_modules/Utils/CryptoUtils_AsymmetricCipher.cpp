@@ -127,7 +127,7 @@ namespace ShadowStrike {
 					}
 					//prevents abort() if logger not initialized
 					if (Logger::Instance().IsInitialized()) {
-						SS_LOG_ERROR(L"CryptoUtils", L"BCryptOpenAlgorithmProvider failed: Algorithm=%s, NTSTATUS=0x%08X, Win32=%u\n", static_cast<int>(m_algorithm));
+						SS_LOG_ERROR(L"CryptoUtils", L"BCryptOpenAlgorithmProvider failed: Algorithm=%s, NTSTATUS=0x%08X, Win32=%u", algName, static_cast<unsigned>(st), RtlNtStatusToDosError(st));
 					}
 					else
 					{
@@ -324,18 +324,30 @@ namespace ShadowStrike {
 					key.algorithm == AsymmetricAlgorithm::ECC_P521);
 				const wchar_t* blobType = isECC ? BCRYPT_ECCPRIVATE_BLOB : BCRYPT_RSAFULLPRIVATE_BLOB;
 
+				// Import from a local copy to avoid const_cast UB on the caller's data
+				std::vector<uint8_t> blobCopy;
+				try {
+					blobCopy = key.keyBlob;
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to copy key blob"; }
+					return false;
+				}
+
 				NTSTATUS st = BCryptImportKeyPair(m_algHandle, nullptr, blobType,
-					&m_privateKeyHandle, const_cast<uint8_t*>(key.keyBlob.data()),
-					static_cast<ULONG>(key.keyBlob.size()), 0);
+					&m_privateKeyHandle, blobCopy.data(),
+					static_cast<ULONG>(blobCopy.size()), 0);
+
+				// Securely wipe the local copy regardless of success/failure
+				SecureZeroMemory(blobCopy.data(), blobCopy.size());
+				blobCopy.clear();
+
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptImportKeyPair private failed"; }
 					SS_LOG_ERROR(L"CryptoUtils", L"BCryptImportKeyPair private failed: 0x%08X", st);
 					return false;
 				}
-				// NOTE: Private key blob is securely erased after import.
-				// Do not rely on key.keyBlob later in the program.
-				SecureZeroMemory(const_cast<uint8_t*>(key.keyBlob.data()), key.keyBlob.size());
-				const_cast<std::vector<uint8_t>&>(key.keyBlob).clear();
+
 				m_privateKeyLoaded = true;
 				SS_LOG_INFO(L"CryptoUtils", L"Private key loaded successfully");
 				return true;

@@ -83,14 +83,21 @@ namespace ShadowStrike {
 
 			template<typename T>
 			void SecureBuffer<T>::allocate(size_t size) {
+				// Overflow guard: size * sizeof(T) must not wrap
+				if (size > SIZE_MAX / sizeof(T)) {
+					m_data = nullptr;
+					m_size = 0;
+					return;
+				}
+				const size_t byteCount = size * sizeof(T);
 #ifdef _WIN32
-				m_data = static_cast<T*>(VirtualAlloc(nullptr, size * sizeof(T), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+				m_data = static_cast<T*>(VirtualAlloc(nullptr, byteCount, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
 				if (m_data) {
 					m_size = size;
-					VirtualLock(m_data, m_size * sizeof(T));
+					VirtualLock(m_data, byteCount);
 				}
 #else
-				m_data = static_cast<T*>(std::malloc(size * sizeof(T)));
+				m_data = static_cast<T*>(std::malloc(byteCount));
 				if (m_data) m_size = size;
 #endif
 			}

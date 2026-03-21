@@ -93,6 +93,12 @@ namespace ShadowStrike {
 				const uint8_t* key, size_t keyLen,
 				Error* err) noexcept
 			{
+				// Key validation (symmetric with DecryptFile)
+				if (!key || keyLen != 32) {
+					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid key (must be 32 bytes for AES-256)"; }
+					return false;
+				}
+
 				SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
 				if (!cipher.SetKey(key, keyLen, err)) return false;
 
@@ -103,6 +109,12 @@ namespace ShadowStrike {
 				FileUtils::Error fileErr{};
 				if (!FileUtils::ReadAllBytes(inputPath, plaintext, &fileErr)) {
 					if (err) { err->win32 = fileErr.win32; err->message = L"Failed to read input file"; }
+					return false;
+				}
+
+				if (plaintext.size() > MAX_PLAINTEXT_SIZE) {
+					SecureZeroMemory(plaintext.data(), plaintext.size());
+					if (err) { err->win32 = ERROR_BUFFER_OVERFLOW; err->message = L"Input file exceeds MAX_PLAINTEXT_SIZE (256 MiB)"; }
 					return false;
 				}
 
@@ -465,6 +477,16 @@ namespace ShadowStrike {
 				std::string& outBase64Ciphertext,
 				Error* err) noexcept
 			{
+				if (!key || keyLen != 32) {
+					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid key (must be 32 bytes for AES-256)"; }
+					return false;
+				}
+
+				if (plaintext.size() > MAX_PLAINTEXT_SIZE) {
+					if (err) { err->win32 = ERROR_BUFFER_OVERFLOW; err->message = L"Plaintext exceeds MAX_PLAINTEXT_SIZE"; }
+					return false;
+				}
+
 				SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
 				if (!cipher.SetKey(key, keyLen, err)) return false;
 

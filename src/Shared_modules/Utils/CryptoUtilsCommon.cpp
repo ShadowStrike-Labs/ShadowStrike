@@ -344,17 +344,23 @@ namespace ShadowStrike  {
             }
 
             bool SecureCompare(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) noexcept {
-                // Size comparison must be done in constant time to prevent length oracle
-                // However, if sizes differ, result is always false
-                if (a.size() != b.size()) {
-                    return false;
+                // Constant-time length comparison to prevent length oracle attacks.
+                // Compare up to the longer of the two; XOR-accumulate all bytes.
+                const size_t maxLen = (a.size() > b.size()) ? a.size() : b.size();
+                if (maxLen == 0) {
+                    return (a.size() == b.size());
                 }
 
-                if (a.empty()) {
-                    return true;  // Both empty
+                volatile unsigned char accumulator = 0;
+                volatile size_t sizeDiff = a.size() ^ b.size();
+
+                for (size_t i = 0; i < maxLen; ++i) {
+                    const uint8_t byteA = (i < a.size()) ? a[i] : 0;
+                    const uint8_t byteB = (i < b.size()) ? b[i] : 0;
+                    accumulator |= static_cast<unsigned char>(byteA ^ byteB);
                 }
 
-                return SecureCompare(a.data(), b.data(), a.size());
+                return (accumulator == 0) && (sizeDiff == 0);
             }
 
             // =============================================================================

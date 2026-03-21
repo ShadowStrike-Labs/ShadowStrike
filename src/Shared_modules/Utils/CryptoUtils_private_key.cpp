@@ -44,7 +44,19 @@ namespace ShadowStrike {
 				}
 			}
 			bool PrivateKey::Export(std::vector<uint8_t>& out, Error* err) const noexcept {
-				out = keyBlob;
+				if (keyBlob.empty()) {
+					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Key blob is empty"; }
+					return false;
+				}
+				try {
+					out = keyBlob;
+				}
+				catch (const std::exception&) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to copy key blob"; }
+					return false;
+				}
+				// SECURITY WARNING: Caller MUST call SecureZeroMemory(out.data(), out.size())
+				// when finished with the exported key material.
 				return true;
 			}
 
