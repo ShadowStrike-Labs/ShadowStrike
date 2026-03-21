@@ -38,10 +38,11 @@ namespace ShadowStrike {
 
 			template<typename T>
 			SecureBuffer<T>::SecureBuffer(SecureBuffer&& other) noexcept
-				: m_data(other.m_data), m_size(other.m_size)
+				: m_data(other.m_data), m_size(other.m_size), m_locked(other.m_locked)
 			{
 				other.m_data = nullptr;
 				other.m_size = 0;
+				other.m_locked = false;
 			}
 
 			template<typename T>
@@ -50,8 +51,10 @@ namespace ShadowStrike {
 					deallocate();
 					m_data = other.m_data;
 					m_size = other.m_size;
+					m_locked = other.m_locked;
 					other.m_data = nullptr;
 					other.m_size = 0;
+					other.m_locked = false;
 				}
 				return *this;
 			}
@@ -83,18 +86,31 @@ namespace ShadowStrike {
 
 			template<typename T>
 			void SecureBuffer<T>::allocate(size_t size) {
+				// Reset lock state before any allocation attempt
+				m_locked = false;
+
 				// Overflow guard: size * sizeof(T) must not wrap
 				if (size > SIZE_MAX / sizeof(T)) {
 					m_data = nullptr;
 					m_size = 0;
 					return;
 				}
+
+				// Cap at 256 MiB — no legitimate EDR use-case needs a larger secure buffer
+				static constexpr size_t kMaxSecureBufferBytes = 256ULL * 1024 * 1024;
 				const size_t byteCount = size * sizeof(T);
+				if (byteCount > kMaxSecureBufferBytes) {
+					m_data = nullptr;
+					m_size = 0;
+					return;
+				}
+
 #ifdef _WIN32
 				m_data = static_cast<T*>(VirtualAlloc(nullptr, byteCount, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
 				if (m_data) {
 					m_size = size;
-					VirtualLock(m_data, byteCount);
+					// Track lock state — VirtualLock can fail due to working set quota
+					m_locked = (VirtualLock(m_data, byteCount) != FALSE);
 				}
 #else
 				m_data = static_cast<T*>(std::malloc(byteCount));
@@ -107,7 +123,10 @@ namespace ShadowStrike {
 				if (m_data) {
 					SecureZeroMemory(m_data, m_size * sizeof(T));
 #ifdef _WIN32
-					VirtualUnlock(m_data, m_size * sizeof(T));
+					if (m_locked) {
+						VirtualUnlock(m_data, m_size * sizeof(T));
+						m_locked = false;
+					}
 					VirtualFree(m_data, 0, MEM_RELEASE);
 #else
 					std::free(m_data);
@@ -150,12 +169,31 @@ namespace ShadowStrike {
 			}
 
 			void SecureString::Assign(std::string_view str) {
-				m_buffer.CopyFrom(str.data(), str.size() + 1);
+				if (str.empty()) {
+					Clear();
+					return;
+				}
+
+				// Allocate str.size()+1 for null terminator, but only copy str.size()
+				// bytes from the source — string_view is NOT guaranteed null-terminated.
+				m_buffer.Resize(str.size() + 1);
+				if (m_buffer.Data() == nullptr || m_buffer.Size() != str.size() + 1) {
+					Clear();
+					return;
+				}
+				std::memcpy(m_buffer.Data(), str.data(), str.size());
+				m_buffer.Data()[str.size()] = '\0';
 			}
 
 			void SecureString::Assign(std::wstring_view str) {
 				// UTF-16 → UTF-8 conversion using Windows API
 				if (str.empty()) {
+					Clear();
+					return;
+				}
+
+				// WideCharToMultiByte takes int — guard against truncation on huge strings
+				if (str.size() > static_cast<size_t>(INT_MAX)) {
 					Clear();
 					return;
 				}

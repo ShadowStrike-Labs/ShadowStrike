@@ -1248,9 +1248,9 @@ namespace ShadowStrike {
                 SecureBuffer& operator=(SecureBuffer&& other) noexcept;
 
                 /**
-                 * @brief Resize buffer (wipes old data if shrinking)
+                 * @brief Resize buffer (wipes old data, reallocates — old content is NOT preserved)
                  * @param newSize New element count
-                 * @throws std::bad_alloc on allocation failure
+                 * @note On allocation failure the buffer is left empty (Size()==0, Data()==nullptr)
                  */
                 void Resize(size_t newSize);
 
@@ -1305,6 +1305,7 @@ namespace ShadowStrike {
             private:
                 T* m_data = nullptr;   ///< Data pointer
                 size_t m_size = 0;     ///< Element count
+                bool m_locked = false; ///< Whether VirtualLock succeeded
 
                 /** @brief Allocate buffer */
                 void allocate(size_t size);
