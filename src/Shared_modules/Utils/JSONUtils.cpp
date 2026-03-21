@@ -163,7 +163,7 @@ namespace ShadowStrike {
 			static inline std::string escapeJsonPointerToken(std::string_view token) noexcept {
 				std::string out;
 				try {
-					out.reserve(token.size() + 8);  // Allow room for escapes
+					out.reserve(token.size() + 8);
 					for (char c : token) {
 						if (c == '~') {
 							out += "~0";
@@ -177,7 +177,8 @@ namespace ShadowStrike {
 					}
 				}
 				catch (...) {
-					// On allocation failure, return partial result
+					// Partial escape would navigate to wrong key — return empty
+					out.clear();
 				}
 				return out;
 			}
@@ -665,12 +666,6 @@ namespace ShadowStrike {
 						return false;
 					}
 
-					// Optionally prepend UTF-8 BOM
-					if (opt.writeBOM) {
-						static constexpr unsigned char BOM[3] = { 0xEF, 0xBB, 0xBF };
-						content.insert(content.begin(), BOM, BOM + 3);
-					}
-
 					// Ensure parent directory exists
 					const auto dir = path.parent_path().empty()
 						? std::filesystem::current_path()
@@ -678,73 +673,79 @@ namespace ShadowStrike {
 
 					std::error_code ec;
 					std::filesystem::create_directories(dir, ec);
-					// Ignore error - directory might already exist
 
-					// Generate secure temporary file name
-					// Use high-resolution clock + random number for uniqueness
-					const auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-
-					std::random_device rd;
-					uint64_t randomId = 0;
-
-					try {
-						std::mt19937_64 rng(static_cast<uint64_t>(now) ^ static_cast<uint64_t>(rd()));
-						std::uniform_int_distribution<uint64_t> dist;
-						randomId = dist(rng);
-					}
-					catch (...) {
-						// Fallback to time-based only
-						randomId = static_cast<uint64_t>(now);
-					}
-
-					// Build temp filename
-					std::wostringstream tempNameStream;
-					tempNameStream << L".tmp." << std::hex << now << L"_" << randomId << L".json";
-					const auto tmp = dir / tempNameStream.str();
-
-					// Write to temporary file first
-					{
-						std::ofstream ofs(tmp, std::ios::out | std::ios::binary | std::ios::trunc);
-						if (!ofs) {
-							setIoErr(err, "Failed to create temp file", tmp);
-							return false;
+					// Helper: write optional BOM + content to an ofstream
+					auto writeContent = [&](std::ofstream& ofs) -> bool {
+						if (opt.writeBOM) {
+							static constexpr char BOM[3] = {
+								static_cast<char>(static_cast<unsigned char>(0xEF)),
+								static_cast<char>(static_cast<unsigned char>(0xBB)),
+								static_cast<char>(static_cast<unsigned char>(0xBF))
+							};
+							ofs.write(BOM, 3);
+							if (!ofs) return false;
 						}
-
-						ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
-						if (!ofs) {
-							setIoErr(err, "Failed to write temp file", tmp);
-							// Attempt cleanup
-							std::filesystem::remove(tmp, ec);
-							return false;
-						}
-
+						ofs.write(content.data(),
+						          static_cast<std::streamsize>(content.size()));
+						if (!ofs) return false;
 						ofs.flush();
-						if (!ofs) {
-							setIoErr(err, "Failed to flush temp file", tmp);
-							std::filesystem::remove(tmp, ec);
-							return false;
+						return static_cast<bool>(ofs);
+					};
+
+					if (opt.atomicReplace) {
+						// Generate secure temporary file name
+						const auto now = std::chrono::high_resolution_clock::now()
+						                 .time_since_epoch().count();
+
+						std::random_device rd;
+						uint64_t randomId = 0;
+
+						try {
+							std::mt19937_64 rng(
+								static_cast<uint64_t>(now) ^
+								static_cast<uint64_t>(rd()));
+							std::uniform_int_distribution<uint64_t> dist;
+							randomId = dist(rng);
+						}
+						catch (...) {
+							randomId = static_cast<uint64_t>(now);
 						}
 
-						// Close file explicitly before rename
-						ofs.close();
-					}
+						std::wostringstream tempNameStream;
+						tempNameStream << L".tmp." << std::hex << now
+						               << L"_" << randomId << L".json";
+						const auto tmp = dir / tempNameStream.str();
 
-					// Perform atomic or direct write
-					if (opt.atomicReplace) {
+						// Write to temporary file
+						{
+							std::ofstream ofs(tmp, std::ios::out | std::ios::binary | std::ios::trunc);
+							if (!ofs) {
+								setIoErr(err, "Failed to create temp file", tmp);
+								return false;
+							}
+
+							if (!writeContent(ofs)) {
+								setIoErr(err, "Failed to write temp file", tmp);
+								std::filesystem::remove(tmp, ec);
+								return false;
+							}
+
+							ofs.close();
+						}
+
+						// Atomic replace
 #ifdef _WIN32
-						// Windows: Use MoveFileExW for atomic replacement with write-through
 						if (!MoveFileExW(tmp.c_str(), path.c_str(),
 						                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
 							const DWORD lastErr = GetLastError();
 							setIoErr(err, "MoveFileExW failed", path,
-							         "Error code: " + std::to_string(static_cast<unsigned long>(lastErr)));
-							// Attempt cleanup of temp file
+							         "Error code: " + std::to_string(
+							             static_cast<unsigned long>(lastErr)));
 							std::filesystem::remove(tmp, ec);
 							return false;
 						}
 #else
-						// POSIX: Remove destination first, then rename
-						std::filesystem::remove(path, ec);  // Ignore error if file doesn't exist
+						// POSIX rename() atomically replaces destination
 						std::filesystem::rename(tmp, path, ec);
 						if (ec) {
 							setIoErr(err, "Failed to rename temp file", path, ec.message());
@@ -754,32 +755,19 @@ namespace ShadowStrike {
 #endif
 					}
 					else {
-						// Non-atomic: Write directly to destination
+						// Non-atomic: write directly to destination (no temp file)
 						std::ofstream ofs(path, std::ios::out | std::ios::binary | std::ios::trunc);
 						if (!ofs) {
 							setIoErr(err, "Failed to open file for write", path);
-							std::filesystem::remove(tmp, ec);
 							return false;
 						}
 
-						ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
-						if (!ofs) {
+						if (!writeContent(ofs)) {
 							setIoErr(err, "Failed to write file", path);
-							std::filesystem::remove(tmp, ec);
-							return false;
-						}
-
-						ofs.flush();
-						if (!ofs) {
-							setIoErr(err, "Failed to flush file", path);
-							std::filesystem::remove(tmp, ec);
 							return false;
 						}
 
 						ofs.close();
-
-						// Remove temp file (was written but not used in non-atomic mode)
-						std::filesystem::remove(tmp, ec);
 					}
 
 					return true;
@@ -819,13 +807,25 @@ namespace ShadowStrike {
 				}
 			}
 
-			void MergePatch(Json& target, const Json& patch) noexcept {
+			bool MergePatch(Json& target, const Json& patch, Error* err) noexcept {
+				if (err) err->clear();
 				try {
 					target.merge_patch(patch);
+					return true;
+				}
+				catch (const std::exception& e) {
+					if (err) {
+						try { err->message = std::string("Merge patch failed: ") + e.what(); }
+						catch (...) { err->message = "Merge patch failed"; }
+					}
+					return false;
 				}
 				catch (...) {
-					// Silently ignore merge errors
-					// This is consistent with RFC 7396 behavior
+					if (err) {
+						try { err->message = "Merge patch failed: unknown error"; }
+						catch (...) { /* best-effort — leave message empty */ }
+					}
+					return false;
 				}
 			}
 

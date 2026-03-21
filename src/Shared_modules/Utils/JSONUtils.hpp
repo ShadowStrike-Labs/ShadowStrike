@@ -61,9 +61,6 @@ namespace ShadowStrike {
 			/// Maximum nesting depth to prevent stack overflow attacks
 			inline constexpr size_t MAX_JSON_DEPTH = 1000;
 
-			/// Maximum hex input size for validation (10MB)
-			inline constexpr size_t MAX_HEX_INPUT = 10ULL * 1024 * 1024;
-
 			/// Default file size limit for LoadFromFile (32MB)
 			inline constexpr size_t DEFAULT_MAX_FILE_SIZE = 32ULL * 1024 * 1024;
 
@@ -468,8 +465,11 @@ namespace ShadowStrike {
 			 *
 			 * @param target Json object to modify
 			 * @param patch Patch to apply
+			 * @param err Optional error output
+			 * @return true on success, false on failure (target may be partially modified)
 			 */
-			void MergePatch(Json& target, const Json& patch) noexcept;
+			[[nodiscard]] bool MergePatch(Json& target, const Json& patch,
+			                              Error* err = nullptr) noexcept;
 
 			/**
 			 * @brief Validate that required keys exist in an object.
