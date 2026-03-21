@@ -84,7 +84,7 @@ namespace ShadowStrike {
 				[[nodiscard]] constexpr bool hasError() const noexcept { return win32 != 0; }
 				
 				/// @brief Clear the error state
-				constexpr void clear() noexcept { win32 = 0; message.clear(); }
+				void clear() noexcept { win32 = 0; message.clear(); }
 			};
 
 			/**

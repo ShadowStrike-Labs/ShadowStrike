@@ -183,8 +183,15 @@ namespace ShadowStrike {
                 }
 
                 // Windows forbidden filename characters (except colon for drive letters)
+                // Allow '?' and '*' only within the \\?\ long path prefix
+                std::wstring_view checkTarget = input;
+                if (input.starts_with(L"\\\\?\\UNC\\")) {
+                    checkTarget = std::wstring_view(input).substr(8);
+                } else if (input.starts_with(L"\\\\?\\")) {
+                    checkTarget = std::wstring_view(input).substr(4);
+                }
                 constexpr wchar_t invalidChars[] = L"<>|?*\"";
-                if (input.find_first_of(invalidChars) != std::wstring::npos) {
+                if (std::wstring_view(checkTarget).find_first_of(invalidChars) != std::wstring_view::npos) {
                     if (err) {
                         err->win32 = ERROR_INVALID_NAME;
                         err->message = "Path contains invalid characters";
@@ -193,8 +200,9 @@ namespace ShadowStrike {
                 }
 
                 // Validate colon placement (only valid at position 1 for drive letter)
-                const size_t colonPos = input.find(L':');
-                if (colonPos != std::wstring::npos && colonPos != 1) {
+                // Use checkTarget (prefix-stripped) so \\?\C:\foo validates correctly
+                const size_t colonPos = checkTarget.find(L':');
+                if (colonPos != std::wstring_view::npos && colonPos != 1) {
                     if (err) {
                         err->win32 = ERROR_INVALID_NAME;
                         err->message = "Invalid colon position in path";
@@ -366,11 +374,10 @@ namespace ShadowStrike {
                 }
                 
                 // Convert both to lowercase for case-insensitive comparison (Windows)
+                // Use towlower for Unicode correctness (handles Ü→ü, Ö→ö etc.)
                 auto toLowerInPlace = [](std::wstring& s) {
                     for (wchar_t& c : s) {
-                        if (c >= L'A' && c <= L'Z') {
-                            c = c - L'A' + L'a';
-                        }
+                        c = static_cast<wchar_t>(::towlower(static_cast<wint_t>(c)));
                     }
                 };
                 
@@ -495,20 +502,6 @@ namespace ShadowStrike {
                 return true;
             }
 
-            /**
-             * @brief Get file size if it exists and is not a directory.
-             * @param path File path
-             * @param err Optional error output
-             * @return File size or nullopt on error
-             */
-            [[nodiscard]] std::optional<uint64_t> FileSize(std::wstring_view path, Error* err) {
-                FileStat st{};
-                if (!Stat(path, st, err) || !st.exists || st.isDirectory) {
-                    return std::nullopt;
-                }
-                return st.size;
-            }
-
             // ============================================================================
             // File Reading Operations
             // ============================================================================
@@ -527,20 +520,7 @@ namespace ShadowStrike {
             [[nodiscard]] static bool ReadAllBytesImpl(HANDLE h, std::vector<std::byte>& out, uint64_t fileSize, Error* err) {
                 out.clear();
 
-                // Limit maximum file size to prevent memory exhaustion attacks
-                // Note: Using header constant MAX_READ_FILE_SIZE would be better for consistency
-                constexpr uint64_t MAX_FILE_SIZE = 64ULL * 1024 * 1024 * 1024;  // 64 GB max
-                
-                if (fileSize > (std::numeric_limits<uint64_t>::max)()) {
-					//It is impossible to reach that point but just in case
-                    if (err) {
-                        err->win32 = ERROR_ARITHMETIC_OVERFLOW;
-                        err->message = "Physical type limit exceeded";
-                    }
-                    return false;
-                }
-
-                if (fileSize > MAX_FILE_SIZE) {
+                if (fileSize > MAX_READ_FILE_SIZE) {
                     if (err) {
                         err->win32 = ERROR_FILE_TOO_LARGE;
                         err->message = "File exceeds maximum allowed size for scanning";
@@ -907,15 +887,26 @@ namespace ShadowStrike {
                     return false;
                 }
 
-                // Path traversal attack prevention - reject ".." components
-                // This prevents directory escape attacks
-                if (d.find(L"..") != std::wstring::npos) {
-                    if (err) {
-                        err->win32 = ERROR_INVALID_PARAMETER;
-                        err->message = "Path contains '..' component";
+                // Path traversal attack prevention - reject ".." as a path component
+                // Check for ".." preceded by separator/start and followed by separator/end
+                {
+                    size_t pos = 0;
+                    while ((pos = d.find(L"..", pos)) != std::wstring::npos) {
+                        const bool atStart = (pos == 0);
+                        const bool afterSep = (pos > 0 && (d[pos - 1] == L'\\' || d[pos - 1] == L'/'));
+                        const bool atEnd = (pos + 2 == d.size());
+                        const bool beforeSep = (pos + 2 < d.size() && (d[pos + 2] == L'\\' || d[pos + 2] == L'/'));
+
+                        if ((atStart || afterSep) && (atEnd || beforeSep)) {
+                            if (err) {
+                                err->win32 = ERROR_INVALID_PARAMETER;
+                                err->message = "Path contains '..' component";
+                            }
+                            SS_LOG_ERROR(L"FileUtils", L"CreateDirectories: Path contains ..: %s", d.c_str());
+                            return false;
+                        }
+                        pos += 2;
                     }
-                    SS_LOG_ERROR(L"FileUtils", L"CreateDirectories: Path contains ..: %s", d.c_str());
-                    return false;
                 }
 
                 // Windows invalid filename characters
@@ -1486,7 +1477,8 @@ namespace ShadowStrike {
                 }
 
                 DWORD bytesRead = 0;
-                while (ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &bytesRead, nullptr) && bytesRead > 0) {
+                BOOL readOk = TRUE;
+                while ((readOk = ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &bytesRead, nullptr)) && bytesRead > 0) {
                     st = BCryptHashData(hash, buf.data(), bytesRead, 0);
                     if (!NT_SUCCESS(st)) {
                         if (err) err->win32 = RtlNtStatusToDosError(st);
@@ -1494,11 +1486,9 @@ namespace ShadowStrike {
                     }
                 }
 
-                // Check for read errors
-                const DWORD readErr = GetLastError();
-                if (readErr != ERROR_SUCCESS && bytesRead == 0) {
-                    // Only error if we didn't reach EOF normally
-                    if (err) err->win32 = readErr;
+                // Check for read errors (only if ReadFile returned FALSE, not normal EOF)
+                if (!readOk) {
+                    if (err) err->win32 = GetLastError();
                     return false;
                 }
 
@@ -1622,33 +1612,14 @@ namespace ShadowStrike {
                 }
 
                 for (int pass = 0; pass < passCount; ++pass) {
-                    // Generate pattern for this pass
+                    const bool isRandomPass = (pass >= 2);
+
+                    // Generate deterministic patterns once; random is regenerated per chunk
                     if (pass == 0) {
-                        // Pass 0: zeros
                         std::fill(buf.begin(), buf.end(), static_cast<uint8_t>(0x00));
                     }
                     else if (pass == 1) {
-                        // Pass 1: all ones
                         std::fill(buf.begin(), buf.end(), static_cast<uint8_t>(0xFF));
-                    }
-                    else {
-                        // Pass 2+: cryptographically secure random data
-                        NTSTATUS st = BCryptGenRandom(
-                            nullptr,
-                            buf.data(),
-                            static_cast<ULONG>(buf.size()),
-                            BCRYPT_USE_SYSTEM_PREFERRED_RNG
-                        );
-
-                        if (!NT_SUCCESS(st)) {
-                            // BCrypt failed - this is a security issue, abort
-                            if (err) {
-                                err->win32 = RtlNtStatusToDosError(st);
-                                err->message = "Failed to generate secure random data";
-                            }
-                            SS_LOG_ERROR(L"FileUtils", L"SecureEraseFile: BCryptGenRandom failed");
-                            return false;
-                        }
                     }
 
                     // Seek to beginning
@@ -1665,15 +1636,32 @@ namespace ShadowStrike {
                         const DWORD chunk = static_cast<DWORD>(
                             std::min<uint64_t>(buf.size(), remaining)
                         );
-                        DWORD written = 0;
 
+                        // Regenerate random data for EACH chunk to avoid repeating patterns
+                        if (isRandomPass) {
+                            NTSTATUS st = BCryptGenRandom(
+                                nullptr,
+                                buf.data(),
+                                chunk,
+                                BCRYPT_USE_SYSTEM_PREFERRED_RNG
+                            );
+                            if (!NT_SUCCESS(st)) {
+                                if (err) {
+                                    err->win32 = RtlNtStatusToDosError(st);
+                                    err->message = "Failed to generate secure random data";
+                                }
+                                SS_LOG_ERROR(L"FileUtils", L"SecureEraseFile: BCryptGenRandom failed");
+                                return false;
+                            }
+                        }
+
+                        DWORD written = 0;
                         if (!WriteFile(h, buf.data(), chunk, &written, nullptr)) {
                             if (err) err->win32 = GetLastError();
                             return false;
                         }
 
                         if (written == 0) {
-                            // No progress - treat as error
                             if (err) {
                                 err->win32 = ERROR_WRITE_FAULT;
                                 err->message = "WriteFile returned zero bytes during erase";
@@ -1686,7 +1674,6 @@ namespace ShadowStrike {
 
                     // Flush to disk after each pass
                     if (!FlushFileBuffers(h)) {
-                        // Log but continue - flush failure isn't critical
                         SS_LOG_WARN(L"FileUtils", L"SecureEraseFile: FlushFileBuffers failed");
                     }
                 }
@@ -1854,6 +1841,7 @@ namespace ShadowStrike {
                     return false;
                 }
 
+                Error walkErr{};
                 if (!WalkDirectory(dir, opts,
                     [&dirs](const std::wstring& path, const WIN32_FIND_DATAW& fd) -> bool {
                         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
@@ -1865,8 +1853,8 @@ namespace ShadowStrike {
                             }
                         }
                         return true;
-                    }, nullptr)) {
-					if (err) err->win32 = ERROR_NOT_ENOUGH_MEMORY;
+                    }, &walkErr)) {
+					if (err) *err = walkErr;
                 }
 
                 // Sort by path length descending (deepest first)
