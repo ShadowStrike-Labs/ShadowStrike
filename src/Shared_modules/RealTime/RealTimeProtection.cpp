@@ -582,6 +582,18 @@ public:
         if (m_metamorphicDetector) {
             if (!m_metamorphicDetector->Initialize()) {
                 Utils::Logger::Warn(L"RealTimeProtection: MetamorphicDetector Initialize failed");
+            } else {
+                // Wire detection callback for per-technique SOC/SIEM telemetry
+                m_metamorphicDetector->SetDetectionCallback(
+                    [](const std::wstring& file, const ShadowStrike::AntiEvasion::MetamorphicDetectedTechnique& detection) {
+                        if (detection.severity >= ShadowStrike::AntiEvasion::MetamorphicSeverity::High) {
+                            Utils::Logger::Warn(
+                                L"[META-CB] file={} technique={} confidence={:.2f} severity={}",
+                                file, detection.description,
+                                detection.confidence,
+                                static_cast<int>(detection.severity));
+                        }
+                    });
             }
         }
         if (m_networkDetector) {
@@ -858,9 +870,18 @@ public:
 
         // Anti-Evasion: Metamorphic Analysis
         if (m_metamorphicDetector) {
-            auto metaResult = m_metamorphicDetector->AnalyzeFile(filePath);
+            ShadowStrike::AntiEvasion::MetamorphicAnalysisConfig metaCfg;
+            metaCfg.processId = req.header.processId;
+            auto metaResult = m_metamorphicDetector->AnalyzeFile(filePath, metaCfg);
             if (metaResult.isMetamorphic) {
-                Utils::Logger::Warn(L"RealTimeProtection: Blocked metamorphic threat: {}", filePath);
+                Utils::Logger::Warn(
+                    L"RealTimeProtection: Blocked metamorphic threat: {} "
+                    L"[score={:.1f} severity={} detections={} family={}]",
+                    filePath,
+                    metaResult.mutationScore,
+                    static_cast<int>(metaResult.maxSeverity),
+                    metaResult.totalDetections,
+                    metaResult.familyName.empty() ? L"unknown" : metaResult.familyName);
                 m_stats.threatsDetected++;
                 return Communication::KernelVerdict::Block;
             }
@@ -1237,20 +1258,43 @@ public:
                     Utils::Logger::Warn(L"RealTimeProtection: Highly packed module loaded in PID {}: {} (packer: {}, confidence: {:.1f}%)",
                         req.processId, imagePath, packResult.packerName, packResult.packingConfidence * 100.0);
                 }
-            } catch (...) {}
+            } catch (const std::exception& e) {
+                Utils::Logger::Error(L"RealTimeProtection: PackerDetector exception on image load PID {}: {}",
+                    req.processId, Utils::StringUtils::Utf8ToWide(e.what()));
+            } catch (...) {
+                Utils::Logger::Error(L"RealTimeProtection: PackerDetector unknown exception on image load PID {}",
+                    req.processId);
+            }
         }
 
-        // Metamorphic analysis on loaded modules
+        // Metamorphic analysis on loaded modules — use DeepScan for image loads
+        // (covers self-modifying, obfuscation, VM protection beyond default StandardScan)
         if (m_metamorphicDetector) {
             try {
-                auto metaResult = m_metamorphicDetector->AnalyzeFile(imagePath);
+                ShadowStrike::AntiEvasion::MetamorphicAnalysisConfig metaCfg;
+                metaCfg.flags = ShadowStrike::AntiEvasion::MetamorphicAnalysisFlags::DeepScan
+                    | ShadowStrike::AntiEvasion::MetamorphicAnalysisFlags::ScanSelfModifying;
+                metaCfg.processId = req.processId;
+                auto metaResult = m_metamorphicDetector->AnalyzeFile(imagePath, metaCfg);
                 if (metaResult.isMetamorphic) {
-                    Utils::Logger::Warn(L"RealTimeProtection: Metamorphic module loaded in PID {}: {}",
-                        req.processId, imagePath);
+                    Utils::Logger::Warn(
+                        L"RealTimeProtection: Metamorphic module loaded in PID {}: {} "
+                        L"[score={:.1f} severity={} detections={} family={}]",
+                        req.processId, imagePath,
+                        metaResult.mutationScore,
+                        static_cast<int>(metaResult.maxSeverity),
+                        metaResult.totalDetections,
+                        metaResult.familyName.empty() ? L"unknown" : metaResult.familyName);
                     m_stats.threatsDetected++;
                     return Communication::KernelVerdict::Block;
                 }
-            } catch (...) {}
+            } catch (const std::exception& e) {
+                Utils::Logger::Error(L"RealTimeProtection: MetamorphicDetector exception on image load PID {}: {}",
+                    req.processId, Utils::StringUtils::Utf8ToWide(e.what()));
+            } catch (...) {
+                Utils::Logger::Error(L"RealTimeProtection: MetamorphicDetector unknown exception on image load PID {}",
+                    req.processId);
+            }
         }
 
         // Scan the loaded image file

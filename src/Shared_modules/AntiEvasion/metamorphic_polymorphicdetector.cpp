@@ -1681,6 +1681,7 @@ MetamorphicResult MetamorphicDetector::AnalyzeFile(
     MetamorphicResult result;
     result.analysisStartTime = std::chrono::system_clock::now();
     result.filePath = filePath;
+    result.processId = config.processId;
     result.config = config;
 
     auto startTime = std::chrono::high_resolution_clock::now();
@@ -2097,8 +2098,10 @@ void MetamorphicDetector::AnalyzeFileInternal(
                         .Confidence(0.8)
                         .Description(L"Control flow flattening detected")
                         .TechnicalDetails(L"Edge/Block ratio: " +
-                                          std::to_wstring(static_cast<double>(result.cfgAnalysis.totalEdges) /
-                                                          static_cast<double>(result.cfgAnalysis.totalBasicBlocks)))
+                                          std::to_wstring(result.cfgAnalysis.totalBasicBlocks > 0
+                                              ? static_cast<double>(result.cfgAnalysis.totalEdges) /
+                                                static_cast<double>(result.cfgAnalysis.totalBasicBlocks)
+                                              : 0.0))
                         .Build();
 
                     AddDetection(result, std::move(detection));

@@ -1499,6 +1499,9 @@ namespace ShadowStrike {
 
             /// @brief Custom patterns to search
             std::vector<std::vector<uint8_t>> customPatterns;
+
+            /// @brief Process ID context (for image-load correlation)
+            uint32_t processId = 0;
         };
 
         /**
