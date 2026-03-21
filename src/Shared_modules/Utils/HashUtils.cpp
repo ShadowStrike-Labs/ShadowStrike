@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <cstdio>
+#include "FileUtils.hpp"
 
 namespace ShadowStrike {
 	namespace Utils {
@@ -211,20 +212,17 @@ namespace ShadowStrike {
 			// ============================================================================
 
 			bool Equal(const uint8_t* a, const uint8_t* b, size_t len) noexcept {
-				// Handle identical pointers (optimization)
-				if (a == b) return true;
+				// Zero-length comparison is always equal (no timing leak)
+				if (len == 0) return true;
 
-				// Null pointer safety
+				// Null pointer safety — after len check to avoid leaking pointer identity
 				if (!a || !b) return false;
 
-				// Constant-time comparison to prevent timing attacks
-				// Accumulator collects all XOR differences
+				// Constant-time comparison — NO early exits allowed
 				volatile uint8_t acc = 0;
 				for (size_t i = 0; i < len; ++i) {
 					acc |= (a[i] ^ b[i]);
 				}
-
-				// Force compiler to not optimize away the comparison
 				return acc == 0;
 			}
 
@@ -374,19 +372,21 @@ namespace ShadowStrike {
 			}
 
 			Hasher::Hasher(Hasher&& other) noexcept
+#ifdef _WIN32
 				: m_objBuf(other.m_objBuf)
 				, m_objLen(other.m_objLen)
-#ifdef _WIN32
 				, m_hash(other.m_hash)
-#endif
 				, m_alg(other.m_alg)
+#else
+				: m_alg(other.m_alg)
+#endif
 				, m_hashLen(other.m_hashLen)
 				, m_inited(other.m_inited)
 			{
 				// Transfer ownership - nullify source to prevent double-free
+#ifdef _WIN32
 				other.m_objBuf = nullptr;
 				other.m_objLen = 0;
-#ifdef _WIN32
 				other.m_hash = nullptr;
 #endif
 				other.m_inited = false;
@@ -394,23 +394,20 @@ namespace ShadowStrike {
 
 			Hasher& Hasher::operator=(Hasher&& other) noexcept {
 				if (this != &other) {
-					// Clean up current state first
 					resetState();
 
-					// Transfer ownership
+#ifdef _WIN32
 					m_objBuf = other.m_objBuf;
 					m_objLen = other.m_objLen;
-#ifdef _WIN32
 					m_hash = other.m_hash;
 #endif
 					m_alg = other.m_alg;
 					m_hashLen = other.m_hashLen;
 					m_inited = other.m_inited;
 
-					// Nullify source
+#ifdef _WIN32
 					other.m_objBuf = nullptr;
 					other.m_objLen = 0;
-#ifdef _WIN32
 					other.m_hash = nullptr;
 #endif
 					other.m_inited = false;
@@ -604,6 +601,13 @@ namespace ShadowStrike {
 					return false;
 				}
 				outHex = upper ? ToHexUpper(digest) : ToHexLower(digest);
+				if (outHex.empty() && !digest.empty()) {
+					if (err) {
+						err->win32 = ERROR_OUTOFMEMORY;
+						err->ntstatus = STATUS_NO_MEMORY;
+					}
+					return false;
+				}
 				return true;
 			}
 
@@ -861,6 +865,13 @@ namespace ShadowStrike {
 					return false;
 				}
 				outHex = upper ? ToHexUpper(mac) : ToHexLower(mac);
+				if (outHex.empty() && !mac.empty()) {
+					if (err) {
+						err->win32 = ERROR_OUTOFMEMORY;
+						err->ntstatus = STATUS_NO_MEMORY;
+					}
+					return false;
+				}
 				return true;
 			}
 
@@ -898,6 +909,13 @@ namespace ShadowStrike {
 					return false;
 				}
 				outHex = upper ? ToHexUpper(digest) : ToHexLower(digest);
+				if (outHex.empty() && !digest.empty()) {
+					if (err) {
+						err->win32 = ERROR_OUTOFMEMORY;
+						err->ntstatus = STATUS_NO_MEMORY;
+					}
+					return false;
+				}
 				return true;
 			}
 
@@ -936,6 +954,13 @@ namespace ShadowStrike {
 					return false;
 				}
 				outHex = upper ? ToHexUpper(mac) : ToHexLower(mac);
+				if (outHex.empty() && !mac.empty()) {
+					if (err) {
+						err->win32 = ERROR_OUTOFMEMORY;
+						err->ntstatus = STATUS_NO_MEMORY;
+					}
+					return false;
+				}
 				return true;
 			}
 
@@ -957,10 +982,10 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// Convert to null-terminated string
+				// Convert to null-terminated string with long path prefix
 				std::wstring pathStr;
 				try {
-					pathStr = std::wstring(path);
+					pathStr = FileUtils::AddLongPathPrefix(path);
 				}
 				catch (const std::bad_alloc&) {
 					if (err) {
@@ -989,6 +1014,25 @@ namespace ShadowStrike {
 					HandleGuard(const HandleGuard&) = delete;
 					HandleGuard& operator=(const HandleGuard&) = delete;
 				} guard(h);
+
+				// Check file size against maximum limit to prevent DoS
+				LARGE_INTEGER fileSize;
+				if (!GetFileSizeEx(h, &fileSize)) {
+					if (err) err->win32 = GetLastError();
+					SS_LOG_LAST_ERROR(L"HashUtils", L"ComputeFile: GetFileSizeEx failed");
+					return false;
+				}
+				if (fileSize.QuadPart < 0 ||
+				    static_cast<uint64_t>(fileSize.QuadPart) > MAX_HASH_FILE_SIZE) {
+					if (err) {
+						err->win32 = ERROR_FILE_TOO_LARGE;
+					}
+					SS_LOG_ERROR(L"HashUtils",
+					             L"ComputeFile: file size %llu exceeds %llu byte limit",
+					             static_cast<unsigned long long>(fileSize.QuadPart),
+					             static_cast<unsigned long long>(MAX_HASH_FILE_SIZE));
+					return false;
+				}
 
 				// Initialize hasher
 				Hasher hasher(alg);
