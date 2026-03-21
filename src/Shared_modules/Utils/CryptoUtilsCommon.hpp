@@ -23,23 +23,19 @@
 #include <array>
 #include <cstdint>
 
-// Forward declarations of enums
-enum class SymmetricAlgorithm;
-enum class AsymmetricAlgorithm;
-
 namespace ShadowStrike {
     namespace Utils {
         namespace CryptoUtils {
 
-       // =============================================================================
-      // Internal Constants
-      // =============================================================================
+            // =============================================================================
+            // Internal Constants
+            // =============================================================================
 
-      /// Maximum iterations for rejection sampling to prevent infinite loops
-           inline static constexpr uint32_t MAX_REJECTION_ITERATIONS = 1000UL;
+            /// Maximum iterations for rejection sampling to prevent infinite loops
+            constexpr uint32_t MAX_REJECTION_ITERATIONS = 1000UL;
 
             /// Log category for crypto operations
-            inline static constexpr const wchar_t* LOG_CATEGORY = L"CryptoUtils";
+            constexpr const wchar_t* LOG_CATEGORY = L"CryptoUtils";
 
             // Algorithm mapping helpers
             const wchar_t* AlgName(SymmetricAlgorithm alg) noexcept;
@@ -50,8 +46,6 @@ namespace ShadowStrike {
 
             const wchar_t* RSAAlgName(AsymmetricAlgorithm alg) noexcept;
             unsigned long RSAKeySizeForAlg(AsymmetricAlgorithm alg) noexcept;
-            bool IsRSAAlgorithm(AsymmetricAlgorithm alg) noexcept;
-            bool IsECCAlgorithm(AsymmetricAlgorithm alg) noexcept;
 
             // Logging helpers
             void SafeLogError(const wchar_t* msg) noexcept;
@@ -64,12 +58,13 @@ namespace ShadowStrike {
                 bool Decode(std::string_view base64, std::vector<uint8_t>& out) noexcept;
             }
 
-            // Secure comparison
+            // Secure comparison (constant-time)
             bool SecureCompare(const uint8_t* a, const uint8_t* b, size_t len) noexcept;
             bool SecureCompare(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) noexcept;
 
-            // Secure memory wipe
-            void SecureZeroMemory(void* ptr, size_t size) noexcept;
-		}// namespace CryptoUtils
-	}// namespace Utils
+            // Secure memory wipe (renamed to avoid Windows SecureZeroMemory macro collision)
+            void SecureWipeMemory(void* ptr, size_t size) noexcept;
+
+        }// namespace CryptoUtils
+    }// namespace Utils
 }// namespace ShadowStrike

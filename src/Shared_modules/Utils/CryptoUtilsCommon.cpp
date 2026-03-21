@@ -19,6 +19,11 @@
 #include"CryptoUtilsCommon.hpp"
 #include"Base64Utils.hpp"
 #include"Logger.hpp"
+#include <atomic>
+#ifndef _WIN32
+#define __STDC_WANT_LIB_EXT1__ 1
+#include <string.h>
+#endif
 
 namespace ShadowStrike  {
     namespace Utils {
@@ -318,11 +323,6 @@ namespace ShadowStrike  {
             // =============================================================================
 
             bool SecureCompare(const uint8_t* a, const uint8_t* b, size_t len) noexcept {
-                // Handle pointer equality (same buffer)
-                if (a == b) {
-                    return true;
-                }
-
                 // Null pointer check (both must be valid unless len is 0)
                 if (len == 0) {
                     return true;
@@ -367,26 +367,26 @@ namespace ShadowStrike  {
             // Secure Memory Wipe
             // =============================================================================
 
-            void SecureZeroMemory(void* ptr, size_t size) noexcept {
+            void SecureWipeMemory(void* ptr, size_t size) noexcept {
                 if (ptr == nullptr || size == 0) {
                     return;
                 }
 
 #ifdef _WIN32
-                // Windows: Use RtlSecureZeroMemory which is guaranteed not to be optimized away
                 ::RtlSecureZeroMemory(ptr, size);
+#elif defined(__STDC_LIB_EXT1__) || defined(__STDC_WANT_LIB_EXT1__)
+                memset_s(ptr, size, 0, size);
+#elif defined(__GLIBC__) || defined(__APPLE__) || defined(__FreeBSD__)
+                explicit_bzero(ptr, size);
 #else
-                // Non-Windows: Use volatile pointer to prevent optimization
                 volatile unsigned char* p = static_cast<volatile unsigned char*>(ptr);
-                while (size > 0) {
-                    *p++ = 0;
-                    --size;
+                for (size_t i = 0; i < size; ++i) {
+                    p[i] = 0;
                 }
-                // Memory barrier to ensure writes complete
                 std::atomic_thread_fence(std::memory_order_seq_cst);
 #endif
             }
 
-		}// namespace CryptoUtils
-	}// namespace ShadowStrike
-}// namespace Utils
+        }// namespace CryptoUtils
+    }// namespace Utils
+}// namespace ShadowStrike
