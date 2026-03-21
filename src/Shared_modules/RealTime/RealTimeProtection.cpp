@@ -592,6 +592,18 @@ public:
         if (m_environmentDetector) {
             if (!m_environmentDetector->Initialize()) {
                 Utils::Logger::Warn(L"RealTimeProtection: EnvironmentEvasionDetector Initialize failed");
+            } else {
+                // Wire detection callback for per-technique SOC/SIEM telemetry
+                m_environmentDetector->SetDetectionCallback(
+                    [](uint32_t pid, const ShadowStrike::AntiEvasion::EnvironmentDetectedTechnique& detection) {
+                        if (detection.severity >= ShadowStrike::AntiEvasion::EnvironmentEvasionSeverity::High) {
+                            Utils::Logger::Warn(
+                                L"[EED-CB] PID={} technique={} confidence={:.2f} severity={}",
+                                pid, detection.description,
+                                detection.confidence,
+                                static_cast<int>(detection.severity));
+                        }
+                    });
             }
         }
         if (m_packerDetector) {
@@ -1108,12 +1120,33 @@ public:
                 }
             }
 
-            // 6. Environment Evasion (environment fingerprinting, anti-analysis imports)
+            // 6. Environment Evasion — pass kernel context for APT-grade detection
             if (!evasionDetected && m_environmentDetector) {
-                auto result = m_environmentDetector->AnalyzeProcess(req.processId);
+                ShadowStrike::AntiEvasion::EnvironmentAnalysisConfig eedConfig;
+
+                // Populate kernel-enriched context — kernel data is tamper-proof
+                ShadowStrike::AntiEvasion::EnvironmentKernelContext eedKernelCtx;
+                eedKernelCtx.imagePath = imagePath;
+                eedKernelCtx.commandLine = commandLine;
+                eedKernelCtx.parentProcessId = req.parentProcessId;
+                eedKernelCtx.creatingProcessId = req.creatingProcessId;
+                eedKernelCtx.creatingThreadId = req.creatingThreadId;
+                eedConfig.kernelContext = std::move(eedKernelCtx);
+
+                auto result = m_environmentDetector->AnalyzeProcess(req.processId, eedConfig);
                 if (result.isEvasive) {
                     evasionDetected = true;
-                    detectionSource = L"Environment Evasion";
+                    detectionSource = std::format(L"Environment Evasion (score={:.1f}, techniques={}, severity={})",
+                        result.evasionScore,
+                        result.totalDetections,
+                        static_cast<int>(result.maxSeverity));
+
+                    for (const auto& tech : result.detectedTechniques) {
+                        if (tech.severity >= ShadowStrike::AntiEvasion::EnvironmentEvasionSeverity::High) {
+                            Utils::Logger::Warn(L"RealTimeProtection: Env evasion in PID {}: {} (confidence={:.2f})",
+                                req.processId, tech.description, tech.confidence);
+                        }
+                    }
                 }
             }
 

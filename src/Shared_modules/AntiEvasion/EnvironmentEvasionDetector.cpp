@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -2094,6 +2095,23 @@ namespace ShadowStrike::AntiEvasion {
         result.config = config;
         result.analysisStartTime = std::chrono::system_clock::now();
 
+        // Prefer kernel-verified image path when available (tamper-proof)
+        if (config.kernelContext.has_value() && !config.kernelContext->imagePath.empty()) {
+            result.processPath = config.kernelContext->imagePath;
+        } else {
+            wchar_t pathBuf[MAX_PATH] = {};
+            DWORD pathSize = MAX_PATH;
+            if (QueryFullProcessImageNameW(hProcess, 0, pathBuf, &pathSize)) {
+                result.processPath = pathBuf;
+            }
+        }
+        if (!result.processPath.empty()) {
+            size_t lastSlash = result.processPath.find_last_of(L"\\/");
+            if (lastSlash != std::wstring::npos) {
+                result.processName = result.processPath.substr(lastSlash + 1);
+            }
+        }
+
         // Collect all requested data based on flags
         if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanHardwareFingerprint)) {
             if (m_impl->m_cachedHardwareInfo) {
@@ -2150,9 +2168,39 @@ namespace ShadowStrike::AntiEvasion {
             CheckTimingIndicators(detections, nullptr);
         }
 
+        // Previously missing detection calls — these were collected but never analyzed
+        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanUserActivity)) {
+            CheckUserActivity(result.activityInfo, detections, nullptr);
+        }
+
+        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanEnvironmentVars)) {
+            CheckEnvironmentVariables(processId, result.processEnvInfo, detections, nullptr);
+        }
+
+        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanDisplayConfig)) {
+            CheckDisplayConfiguration(detections, nullptr);
+        }
+
+        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanBrowserArtifacts)) {
+            CheckBrowserArtifacts(detections, nullptr);
+        }
+
+        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanPeripheralHistory)) {
+            CheckPeripheralHistory(detections, nullptr);
+        }
+
+        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanFileNamingPatterns)) {
+            CheckFileNaming(processId, result.fileNamingInfo, detections, nullptr);
+        }
+
         // Add all detections to result
         for (auto& detection : detections) {
             AddDetection(result, std::move(detection));
+        }
+
+        // Kernel-enriched context correlation (APT-grade detection)
+        if (config.kernelContext.has_value() && config.kernelContext->hasKernelData()) {
+            AnalyzeKernelContext(processId, config.kernelContext.value(), result);
         }
 
         CalculateEvasionScore(result);
@@ -2286,6 +2334,166 @@ namespace ShadowStrike::AntiEvasion {
         }
 
         result.detectedTechniques.push_back(std::move(detection));
+    }
+
+    // ========================================================================
+    // KERNEL-ENRICHED CONTEXT ANALYSIS
+    // ========================================================================
+
+    void EnvironmentEvasionDetector::AnalyzeKernelContext(
+        uint32_t processId,
+        const EnvironmentKernelContext& ctx,
+        EnvironmentEvasionResult& result
+    ) noexcept {
+        try {
+            // ----------------------------------------------------------------
+            // A.  Parent–child relationship anomaly (kernel-verified parentPid)
+            // ----------------------------------------------------------------
+            // APT malware uses PROC_THREAD_ATTRIBUTE_PARENT_PROCESS to spoof PPID.
+            // Kernel provides the *real* creator via PsSetCreateProcessNotifyRoutineEx.
+            if (ctx.creatingProcessId != 0 && ctx.parentProcessId != 0 &&
+                ctx.creatingProcessId != ctx.parentProcessId) {
+                AddDetection(result, EnvironmentDetectionBuilder()
+                    .Technique(EnvironmentEvasionTechnique::PROCESS_SuspiciousService)
+                    .Description(L"Parent PID spoofing: kernel creatingPid differs from parentPid")
+                    .DetectedValue(std::format(L"parentPid={} creatingPid={}", ctx.parentProcessId, ctx.creatingProcessId))
+                    .Confidence(0.90)
+                    .Severity(EnvironmentEvasionSeverity::Critical)
+                    .Build());
+            }
+
+            // ----------------------------------------------------------------
+            // B.  Sandbox-typical parent chain detection
+            // ----------------------------------------------------------------
+            // Sandboxes often spawn samples from cmd.exe, python.exe, or custom loaders.
+            // A non-explorer parent launching a process with environment evasion code is suspicious.
+            if (ctx.parentProcessId != 0) {
+                ProcessHandleGuard hParent(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ctx.parentProcessId));
+                if (hParent) {
+                    wchar_t parentPath[MAX_PATH] = {};
+                    DWORD parentSize = MAX_PATH;
+                    if (QueryFullProcessImageNameW(hParent.get(), 0, parentPath, &parentSize)) {
+                        std::wstring lowerParent(parentPath);
+                        std::transform(lowerParent.begin(), lowerParent.end(), lowerParent.begin(), ::towlower);
+
+                        static constexpr std::wstring_view kSandboxLaunchers[] = {
+                            L"python.exe", L"python3.exe", L"cuckoo.exe",
+                            L"sandbox.exe", L"sample.exe", L"agent.exe",
+                            L"analyzer.exe", L"cuckoomon.exe", L"vmtoolsd.exe",
+                        };
+                        for (const auto& launcher : kSandboxLaunchers) {
+                            if (lowerParent.find(launcher) != std::wstring::npos) {
+                                AddDetection(result, EnvironmentDetectionBuilder()
+                                    .Technique(EnvironmentEvasionTechnique::PROCESS_SandboxAgentRunning)
+                                    .Description(L"Parent process is a known sandbox/analysis launcher")
+                                    .DetectedValue(std::wstring(parentPath, parentSize))
+                                    .Confidence(0.85)
+                                    .Severity(EnvironmentEvasionSeverity::High)
+                                    .Build());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // C.  Command-line environment evasion indicators
+            // ----------------------------------------------------------------
+            if (!ctx.commandLine.empty()) {
+                std::wstring lowerCmd(ctx.commandLine.size(), L'\0');
+                std::transform(ctx.commandLine.begin(), ctx.commandLine.end(),
+                               lowerCmd.begin(), ::towlower);
+
+                // C1. Sandbox-aware command patterns
+                static constexpr std::wstring_view kEnvCheckCmds[] = {
+                    L"systeminfo",           // Hardware/OS fingerprinting
+                    L"wmic computersystem",  // WMIC sandbox detection
+                    L"wmic bios",            // BIOS string check
+                    L"getmac",               // MAC address enumeration
+                    L"hostname",             // Hostname check
+                    L"whoami",               // Username check
+                    L"query user",           // User session check
+                    L"tasklist",             // Process enumeration
+                };
+                for (const auto& pattern : kEnvCheckCmds) {
+                    if (lowerCmd.find(pattern) != std::wstring::npos) {
+                        AddDetection(result, EnvironmentDetectionBuilder()
+                            .Technique(EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning)
+                            .Description(L"Command line contains sandbox/VM fingerprinting command")
+                            .DetectedValue(std::format(L"Pattern='{}' in: {}", pattern, ctx.commandLine.substr(0, 128)))
+                            .Confidence(0.65)
+                            .Severity(EnvironmentEvasionSeverity::Medium)
+                            .Build());
+                        break;
+                    }
+                }
+
+                // C1b. Compound check: "reg query" + VM vendor (two-part match avoids regex)
+                if (lowerCmd.find(L"reg query") != std::wstring::npos) {
+                    static constexpr std::wstring_view kVmVendors[] = {
+                        L"vmware", L"virtualbox", L"vbox", L"qemu", L"hyper-v", L"xen",
+                    };
+                    for (const auto& vendor : kVmVendors) {
+                        if (lowerCmd.find(vendor) != std::wstring::npos) {
+                            AddDetection(result, EnvironmentDetectionBuilder()
+                                .Technique(EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning)
+                                .Description(L"Command line queries registry for VM vendor strings")
+                                .DetectedValue(std::format(L"reg query + '{}' in: {}", vendor, ctx.commandLine.substr(0, 128)))
+                                .Confidence(0.80)
+                                .Severity(EnvironmentEvasionSeverity::High)
+                                .Build());
+                            break;
+                        }
+                    }
+                }
+
+                // C2. Abnormally long command line (obfuscation payload)
+                constexpr size_t kSuspiciousCmdLen = 8192;
+                if (ctx.commandLine.size() > kSuspiciousCmdLen) {
+                    AddDetection(result, EnvironmentDetectionBuilder()
+                        .Technique(EnvironmentEvasionTechnique::FILENAME_RandomPattern)
+                        .Description(L"Abnormally long command line (possible obfuscated payload)")
+                        .DetectedValue(std::format(L"length={} chars", ctx.commandLine.size()))
+                        .Confidence(0.60)
+                        .Severity(EnvironmentEvasionSeverity::Medium)
+                        .Build());
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // D.  Image path from suspicious location + environment evasion
+            // ----------------------------------------------------------------
+            if (!ctx.imagePath.empty()) {
+                std::wstring lowerPath(ctx.imagePath.size(), L'\0');
+                std::transform(ctx.imagePath.begin(), ctx.imagePath.end(),
+                               lowerPath.begin(), ::towlower);
+
+                static constexpr std::wstring_view kSandboxPaths[] = {
+                    L"\\sample\\", L"\\samples\\", L"\\malware\\", L"\\virus\\",
+                    L"\\sandbox\\", L"\\analysis\\", L"\\cuckoo\\",
+                    L"\\temp\\", L"\\tmp\\", L"\\appdata\\local\\temp\\",
+                };
+                for (const auto& dir : kSandboxPaths) {
+                    if (lowerPath.find(dir) != std::wstring::npos) {
+                        AddDetection(result, EnvironmentDetectionBuilder()
+                            .Technique(EnvironmentEvasionTechnique::FILENAME_SuspiciousLocation)
+                            .Description(L"Process launched from sandbox/analysis directory")
+                            .DetectedValue(ctx.imagePath.substr(0, 200))
+                            .Confidence(0.75)
+                            .Severity(EnvironmentEvasionSeverity::High)
+                            .Build());
+                        break;
+                    }
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"AnalyzeKernelContext failed: %hs", e.what());
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"AnalyzeKernelContext: Unknown error");
+        }
     }
 
     // ========================================================================

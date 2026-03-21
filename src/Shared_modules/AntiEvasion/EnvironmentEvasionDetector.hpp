@@ -2128,6 +2128,39 @@ namespace ShadowStrike {
         };
 
         /**
+         * @brief Kernel-enriched process context for environment evasion analysis.
+         *
+         * Carries trusted data from kernel sensor's PsSetCreateProcessNotifyRoutineEx
+         * callback. These fields cannot be spoofed by the target process — unlike
+         * user-mode queries (NtQueryInformationProcess, GetCommandLineW) which
+         * sophisticated malware can hook or intercept.
+         *
+         * Environment evasion detectors use this to correlate file paths, command
+         * lines, and parent chains with sandbox/VM evasion indicators.
+         */
+        struct EnvironmentKernelContext {
+            /// @brief Process image path from kernel (tamper-proof)
+            std::wstring imagePath;
+
+            /// @brief Command line from kernel PsSetCreateProcessNotifyRoutineEx
+            std::wstring commandLine;
+
+            /// @brief Parent process ID from kernel (cannot be spoofed via PPID spoofing)
+            uint32_t parentProcessId = 0;
+
+            /// @brief Creating process ID (may differ from parent in cross-session creation)
+            uint32_t creatingProcessId = 0;
+
+            /// @brief Creating thread ID
+            uint32_t creatingThreadId = 0;
+
+            /// @brief TRUE if context fields are populated (vs default-constructed)
+            [[nodiscard]] bool hasKernelData() const noexcept {
+                return !imagePath.empty() || parentProcessId != 0;
+            }
+        };
+
+        /**
          * @brief Analysis configuration
          */
         struct EnvironmentAnalysisConfig {
@@ -2163,6 +2196,10 @@ namespace ShadowStrike {
 
             /// @brief Skip current process
             bool skipCurrentProcess = false;
+
+            /// @brief Kernel-enriched context (populated when called from kernel notification path)
+            /// Detectors use kernel-verified data for parent/image/cmdline checks.
+            std::optional<EnvironmentKernelContext> kernelContext;
         };
 
         /**
@@ -2966,6 +3003,19 @@ namespace ShadowStrike {
             ) noexcept;
 
             void CalculateEvasionScore(
+                EnvironmentEvasionResult& result
+            ) noexcept;
+
+            /**
+             * @brief Analyze kernel-enriched context for environment evasion correlation.
+             *
+             * Correlates kernel-verified process data (imagePath, commandLine, parentPid)
+             * with environmental indicators — e.g., sandbox-typical parent chains,
+             * analysis tool command-line patterns, and suspicious launch locations.
+             */
+            void AnalyzeKernelContext(
+                uint32_t processId,
+                const EnvironmentKernelContext& ctx,
                 EnvironmentEvasionResult& result
             ) noexcept;
 
