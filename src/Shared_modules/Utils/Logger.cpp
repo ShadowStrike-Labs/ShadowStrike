@@ -339,7 +339,7 @@ namespace ShadowStrike {
 						}
 					}
 					m_queue.emplace_back(std::move(item));
-					m_queueCv.notify_one();
+					m_queueCv.notify_all();
 				}
 				else {
 					std::lock_guard<std::mutex> lk(m_queueMutex);
@@ -350,7 +350,7 @@ namespace ShadowStrike {
 						m_queue.pop_front();  // DropOldest (default)
 					}
 					m_queue.emplace_back(std::move(item));
-					m_queueCv.notify_one();
+					m_queueCv.notify_all();
 				}
 			}
 			else {
@@ -411,11 +411,11 @@ namespace ShadowStrike {
 						continue;
 					}
 
-					// Dequeue item and notify blocked enqueuers
+					// Dequeue item and notify blocked enqueuers + flush waiters
 					item = std::move(m_queue.front());
 					m_queue.pop_front();
 					hasItem = true;
-					m_queueCv.notify_one();
+					m_queueCv.notify_all();
 				}
 
 				if (!hasItem) {
