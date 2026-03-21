@@ -1144,6 +1144,42 @@ namespace ShadowStrike {
         };
 
         /**
+         * @brief Kernel-enriched process context passed from kernel sensor callbacks.
+         *
+         * When the kernel notifies user-mode of a process creation, it provides
+         * trusted data (commandLine, imagePath, parentPid) that cannot be spoofed
+         * by the target process. This struct carries that data into detectors so
+         * they can make decisions using kernel-verified information rather than
+         * relying solely on user-mode queries (which malware can intercept/forge).
+         *
+         * All fields are optional — empty/zero means kernel data was unavailable.
+         */
+        struct KernelProcessContext {
+            /// @brief Process image path from kernel (trusted, not queryable by target)
+            std::wstring imagePath;
+
+            /// @brief Command line from kernel PsSetCreateProcessNotifyRoutineEx
+            std::wstring commandLine;
+
+            /// @brief Parent process ID from kernel (cannot be spoofed via NtQueryInformationProcess)
+            uint32_t parentProcessId = 0;
+
+            /// @brief Creating process ID (may differ from parent in cross-session creation)
+            uint32_t creatingProcessId = 0;
+
+            /// @brief Creating thread ID
+            uint32_t creatingThreadId = 0;
+
+            /// @brief TRUE if process is being created, FALSE if terminating
+            bool isCreation = true;
+
+            /// @brief TRUE if kernel context fields are populated (vs default-constructed)
+            [[nodiscard]] bool hasKernelData() const noexcept {
+                return !imagePath.empty() || parentProcessId != 0;
+            }
+        };
+
+        /**
          * @brief Configuration for analysis operations
          */
         struct AnalysisConfig {
@@ -1185,6 +1221,11 @@ namespace ShadowStrike {
 
             /// @brief Maximum raw data size per detection
             size_t maxRawDataSize = 256;
+
+            /// @brief Kernel-enriched context (populated when called from kernel notification path)
+            /// When present, detectors use kernel-verified data instead of user-mode queries
+            /// for parent process validation, command-line analysis, and image path checks.
+            std::optional<KernelProcessContext> kernelContext;
         };
 
         /**
@@ -2087,6 +2128,19 @@ namespace ShadowStrike {
              * @brief Query kernel debug information
              */
             void QueryKernelDebugInfo(
+                DebuggerEvasionResult& result
+            ) noexcept;
+
+            /**
+             * @brief Analyze kernel-enriched process context for APT-grade detection.
+             *
+             * Correlates kernel-verified parent PID, command line, and image path
+             * with debugger evasion indicators. This data is tamper-proof since
+             * it originates from PsSetCreateProcessNotifyRoutineEx (ring-0).
+             */
+            void AnalyzeKernelContext(
+                uint32_t processId,
+                const KernelProcessContext& ctx,
                 DebuggerEvasionResult& result
             ) noexcept;
 

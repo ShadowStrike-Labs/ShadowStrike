@@ -1876,10 +1876,18 @@ namespace ShadowStrike::AntiEvasion {
             // Identify Process
             result.targetPid = GetProcessId(hProcess);
 
-            wchar_t path[MAX_PATH] = {};
-            DWORD size = MAX_PATH;
-            if (QueryFullProcessImageNameW(hProcess, 0, path, &size)) {
-                result.processPath = path;
+            // Prefer kernel-provided image path when available (tamper-proof).
+            // User-mode QueryFullProcessImageNameW can be hooked by APT malware.
+            if (config.kernelContext.has_value() && !config.kernelContext->imagePath.empty()) {
+                result.processPath = config.kernelContext->imagePath;
+            } else {
+                wchar_t path[MAX_PATH] = {};
+                DWORD size = MAX_PATH;
+                if (QueryFullProcessImageNameW(hProcess, 0, path, &size)) {
+                    result.processPath = path;
+                }
+            }
+            if (!result.processPath.empty()) {
                 size_t lastSlash = result.processPath.find_last_of(L"\\/");
                 if (lastSlash != std::wstring::npos) {
                     result.processName = result.processPath.substr(lastSlash + 1);
@@ -2263,21 +2271,32 @@ namespace ShadowStrike::AntiEvasion {
         uint32_t processId,
         DebuggerEvasionResult& result
     ) noexcept {
-        // Get parent PID
-        SnapshotHandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-        if (!hSnapshot.IsValid()) return;
-
-        PROCESSENTRY32W pe32 = {};
-        pe32.dwSize = sizeof(pe32);
         uint32_t parentPid = 0;
 
-        if (Process32FirstW(hSnapshot.Get(), &pe32)) {
-            do {
-                if (pe32.th32ProcessID == processId) {
-                    parentPid = pe32.th32ParentProcessID;
-                    break;
-                }
-            } while (Process32NextW(hSnapshot.Get(), &pe32));
+        // KERNEL-ENRICHED PATH: If kernel context has parentProcessId, use it directly.
+        // Kernel-provided parent PID is authoritative — it comes from PsSetCreateProcessNotifyRoutineEx
+        // and cannot be spoofed by the target process (unlike NtQueryInformationProcess from user-mode
+        // which advanced malware can hook/intercept).
+        if (result.config.kernelContext.has_value() && result.config.kernelContext->parentProcessId != 0) {
+            parentPid = result.config.kernelContext->parentProcessId;
+            SS_LOG_DEBUG(LOG_CATEGORY, L"AnalyzeProcessRelationships: Using kernel-verified parentPid=%u for PID=%u",
+                         parentPid, processId);
+        } else {
+            // FALLBACK: Query via Toolhelp snapshot (can be spoofed by advanced malware)
+            SnapshotHandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+            if (!hSnapshot.IsValid()) return;
+
+            PROCESSENTRY32W pe32 = {};
+            pe32.dwSize = sizeof(pe32);
+
+            if (Process32FirstW(hSnapshot.Get(), &pe32)) {
+                do {
+                    if (pe32.th32ProcessID == processId) {
+                        parentPid = pe32.th32ParentProcessID;
+                        break;
+                    }
+                } while (Process32NextW(hSnapshot.Get(), &pe32));
+            }
         }
 
         if (parentPid != 0) {
@@ -4456,6 +4475,109 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     // ========================================================================
+    // KERNEL-ENRICHED CONTEXT ANALYSIS
+    // ========================================================================
+
+    void DebuggerEvasionDetector::AnalyzeKernelContext(
+        uint32_t processId,
+        const KernelProcessContext& ctx,
+        DebuggerEvasionResult& result
+    ) noexcept {
+        // ----------------------------------------------------------------
+        // A.  Parent–child relationship anomaly (kernel-verified parentPid)
+        // ----------------------------------------------------------------
+        // APT malware spawns via spoofed PPID (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS).
+        // The kernel's PsSetCreateProcessNotifyRoutineEx gives the *real* creator,
+        // so creatingProcessId != parentProcessId is a high-confidence indicator.
+        if (ctx.creatingProcessId != 0 && ctx.parentProcessId != 0 &&
+            ctx.creatingProcessId != ctx.parentProcessId) {
+            AddDetection(result, DetectionPatternBuilder()
+                .Technique(EvasionTechnique::PROCESS_ParentIsDebugger)
+                .Description(L"Parent PID spoofing: kernel creatingPid differs from parentPid")
+                .TechnicalDetails(std::format(L"parentPid={} creatingPid={} creatingTid={}",
+                    ctx.parentProcessId, ctx.creatingProcessId, ctx.creatingThreadId))
+                .Confidence(0.90)
+                .Severity(EvasionSeverity::Critical)
+                .Build());
+        }
+
+        // ----------------------------------------------------------------
+        // B.  Anti-debug patterns in kernel-captured command line
+        // ----------------------------------------------------------------
+        if (!ctx.commandLine.empty()) {
+            std::wstring lowerCmd(ctx.commandLine.size(), L'\0');
+            std::transform(ctx.commandLine.begin(), ctx.commandLine.end(),
+                           lowerCmd.begin(), ::towlower);
+
+            // B1. Detach-on-create flags (common in debugger-aware malware launchers)
+            static constexpr std::wstring_view kDebugFlags[] = {
+                L"--no-sandbox",       // Chromium debug mode
+                L"-debug-on-start",
+                L"debug.break",
+                L"int3",
+                L"debugbreak",
+                L"isdebuggerpresent",  // Self-test harness
+                L"ollydbg",
+                L"x64dbg",
+                L"windbg",
+                L"ida64",
+            };
+            for (const auto& flag : kDebugFlags) {
+                if (lowerCmd.find(flag) != std::wstring::npos) {
+                    AddDetection(result, DetectionPatternBuilder()
+                        .Technique(EvasionTechnique::API_CheckRemoteDebuggerPresent)
+                        .Description(L"Command line contains debugger/anti-debug keyword")
+                        .TechnicalDetails(std::format(L"Keyword='{}' in cmdline (first 128 chars): {}",
+                            flag, ctx.commandLine.substr(0, 128)))
+                        .Confidence(0.70)
+                        .Severity(EvasionSeverity::Medium)
+                        .Build());
+                    break;
+                }
+            }
+
+            // B2. Suspicious command-line length (> 8KB often indicates obfuscation payload)
+            constexpr size_t kSuspiciousCmdLen = 8192;
+            if (ctx.commandLine.size() > kSuspiciousCmdLen) {
+                AddDetection(result, DetectionPatternBuilder()
+                    .Technique(EvasionTechnique::MEMORY_SuspiciousAllocation)
+                    .Description(L"Abnormally long command line (possible obfuscated payload)")
+                    .TechnicalDetails(std::format(L"cmdline length={} chars", ctx.commandLine.size()))
+                    .Confidence(0.60)
+                    .Severity(EvasionSeverity::Medium)
+                    .Build());
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // C.  Image path anomaly — execution from suspicious locations
+        // ----------------------------------------------------------------
+        if (!ctx.imagePath.empty()) {
+            std::wstring lowerPath(ctx.imagePath.size(), L'\0');
+            std::transform(ctx.imagePath.begin(), ctx.imagePath.end(),
+                           lowerPath.begin(), ::towlower);
+
+            // Temp/AppData/Downloads launch with debugger evasion = high threat
+            static constexpr std::wstring_view kSuspiciousDirs[] = {
+                L"\\temp\\", L"\\tmp\\", L"\\appdata\\local\\temp\\",
+                L"\\downloads\\", L"\\public\\", L"\\recycle",
+            };
+            for (const auto& dir : kSuspiciousDirs) {
+                if (lowerPath.find(dir) != std::wstring::npos && !result.detectedTechniques.empty()) {
+                    AddDetection(result, DetectionPatternBuilder()
+                        .Technique(EvasionTechnique::PROCESS_ParentIsDebugger)
+                        .Description(L"Evasive process launched from suspicious directory")
+                        .TechnicalDetails(std::format(L"Path: {}", ctx.imagePath.substr(0, 200)))
+                        .Confidence(0.80)
+                        .Severity(EvasionSeverity::High)
+                        .Build());
+                    break;
+                }
+            }
+        }
+    }
+
+    // ========================================================================
     // SCORE CALCULATION
     // ========================================================================
 
@@ -4649,6 +4771,13 @@ namespace ShadowStrike::AntiEvasion {
             // 9. Kernel Info
             if (HasFlag(config.flags, AnalysisFlags::ScanKernelQueries)) {
                 QueryKernelDebugInfo(result);
+            }
+
+            // 10. Kernel-Enriched Command-Line Correlation
+            // When kernel context is available, correlate command-line patterns with
+            // debugger evasion techniques for APT-grade detection
+            if (config.kernelContext.has_value() && config.kernelContext->hasKernelData()) {
+                AnalyzeKernelContext(processId, config.kernelContext.value(), result);
             }
 
         }

@@ -560,6 +560,18 @@ public:
         if (m_debuggerDetector) {
             if (!m_debuggerDetector->Initialize()) {
                 Utils::Logger::Warn(L"RealTimeProtection: DebuggerEvasionDetector Initialize failed");
+            } else {
+                // Wire detection callback for per-technique telemetry/SOC integration
+                m_debuggerDetector->SetDetectionCallback(
+                    [](uint32_t pid, const ShadowStrike::AntiEvasion::DetectedTechnique& detection) {
+                        if (detection.severity >= ShadowStrike::AntiEvasion::EvasionSeverity::High) {
+                            Utils::Logger::Warn(
+                                L"[DED-CB] PID={} technique={} confidence={:.2f} severity={}",
+                                pid, detection.description,
+                                detection.confidence,
+                                static_cast<int>(detection.severity));
+                        }
+                    });
             }
         }
         if (m_processDetector) {
@@ -1022,12 +1034,36 @@ public:
             bool evasionDetected = false;
             std::wstring detectionSource;
 
-            // 1. Debugger Evasion
+            // 1. Debugger Evasion — pass kernel context for APT-grade detection
             if (m_debuggerDetector) {
-                auto result = m_debuggerDetector->AnalyzeProcess(req.processId);
+                ShadowStrike::AntiEvasion::DebuggerEvasionDetector::AnalysisConfig dedConfig;
+                dedConfig.depth = ShadowStrike::AntiEvasion::AnalysisDepth::Standard;
+
+                // Populate kernel-enriched context — kernel sensor provides tamper-proof data
+                ShadowStrike::AntiEvasion::KernelProcessContext kernelCtx;
+                kernelCtx.imagePath = imagePath;
+                kernelCtx.commandLine = commandLine;
+                kernelCtx.parentProcessId = req.parentProcessId;
+                kernelCtx.creatingProcessId = req.creatingProcessId;
+                kernelCtx.creatingThreadId = req.creatingThreadId;
+                kernelCtx.isCreation = req.isCreation;
+                dedConfig.kernelContext = std::move(kernelCtx);
+
+                auto result = m_debuggerDetector->AnalyzeProcess(req.processId, dedConfig);
                 if (result.isEvasive) {
                     evasionDetected = true;
-                    detectionSource = L"Debugger Evasion";
+                    detectionSource = std::format(L"Debugger Evasion (score={:.1f}, techniques={}, severity={})",
+                        result.evasionScore,
+                        result.totalDetections,
+                        static_cast<int>(result.maxSeverity));
+
+                    // Log technique details for SOC/SIEM correlation
+                    for (const auto& tech : result.detectedTechniques) {
+                        if (tech.severity >= ShadowStrike::AntiEvasion::EvasionSeverity::High) {
+                            Utils::Logger::Warn(L"RealTimeProtection: Anti-debug technique in PID {}: {} (confidence={:.2f})",
+                                req.processId, tech.description, tech.confidence);
+                        }
+                    }
                 }
             }
 
