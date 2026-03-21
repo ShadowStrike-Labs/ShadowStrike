@@ -599,6 +599,18 @@ public:
         if (m_networkDetector) {
             if (!m_networkDetector->Initialize()) {
                 Utils::Logger::Warn(L"RealTimeProtection: NetworkBasedEvasionDetector Initialize failed");
+            } else {
+                m_networkDetector->SetDetectionCallback(
+                    [](uint32_t pid, const ShadowStrike::AntiEvasion::NetworkDetectedTechnique& detection) {
+                        if (detection.severity >= ShadowStrike::AntiEvasion::NetworkEvasionSeverity::High) {
+                            Utils::Logger::Warn(
+                                L"[NBED-CB] PID={} technique={} confidence={:.2f} severity={} mitre={}",
+                                pid, detection.description,
+                                detection.confidence,
+                                static_cast<int>(detection.severity),
+                                detection.mitreId.empty() ? std::wstring(L"N/A") : Utils::StringUtils::Utf8ToWide(detection.mitreId));
+                        }
+                    });
             }
         }
         if (m_environmentDetector) {
@@ -1133,11 +1145,48 @@ public:
             }
 
             // 5. Network-Based Evasion (DGA detection, DNS tunneling, C2 beaconing, fast-flux)
-            if (!evasionDetected && m_networkDetector) {
-                auto result = m_networkDetector->AnalyzeProcess(req.processId);
-                if (result.isEvasive) {
-                    evasionDetected = true;
-                    detectionSource = L"Network-Based Evasion";
+            // Always run network analysis for telemetry even if evasion already detected
+            if (m_networkDetector) {
+                try {
+                    ShadowStrike::AntiEvasion::NetworkAnalysisConfig nbedConfig;
+                    nbedConfig.flags = ShadowStrike::AntiEvasion::NetworkAnalysisFlags::Default;
+
+                    // Populate kernel-enriched context — tamper-proof process data
+                    ShadowStrike::AntiEvasion::NetworkKernelContext nbedKernelCtx;
+                    nbedKernelCtx.imagePath = imagePath;
+                    nbedKernelCtx.commandLine = commandLine;
+                    nbedKernelCtx.parentProcessId = req.parentProcessId;
+                    nbedKernelCtx.creatingProcessId = req.creatingProcessId;
+                    nbedKernelCtx.creatingThreadId = req.creatingThreadId;
+                    nbedConfig.kernelContext = std::move(nbedKernelCtx);
+
+                    auto result = m_networkDetector->AnalyzeProcess(req.processId, nbedConfig);
+
+                    if (result.isEvasive) {
+                        if (!evasionDetected) {
+                            evasionDetected = true;
+                            detectionSource = std::format(
+                                L"Network Evasion (score={:.1f}, techniques={}, severity={})",
+                                result.evasionScore,
+                                result.totalDetections,
+                                static_cast<int>(result.maxSeverity));
+                        }
+
+                        for (const auto& tech : result.detectedTechniques) {
+                            if (tech.severity >= ShadowStrike::AntiEvasion::NetworkEvasionSeverity::High) {
+                                Utils::Logger::Warn(
+                                    L"RealTimeProtection: Network evasion in PID {}: {} (confidence={:.2f}, mitre={})",
+                                    req.processId, tech.description, tech.confidence,
+                                    tech.mitreId.empty() ? std::wstring(L"N/A") : Utils::StringUtils::Utf8ToWide(tech.mitreId));
+                            }
+                        }
+                    }
+                } catch (const std::exception& ex) {
+                    Utils::Logger::Error(L"RealTimeProtection: NetworkBasedEvasionDetector exception for PID {}: {}",
+                        req.processId, Utils::StringUtils::Utf8ToWide(ex.what()));
+                } catch (...) {
+                    Utils::Logger::Error(L"RealTimeProtection: NetworkBasedEvasionDetector unknown exception for PID {}",
+                        req.processId);
                 }
             }
 

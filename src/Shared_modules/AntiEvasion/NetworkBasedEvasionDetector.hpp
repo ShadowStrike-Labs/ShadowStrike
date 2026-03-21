@@ -989,6 +989,34 @@ namespace ShadowStrike {
         };
 
         /**
+         * @brief Kernel-verified process context for network evasion analysis
+         *
+         * Populated from kernel process creation callbacks — tamper-proof data
+         * that user-mode cannot reliably obtain post-creation.
+         */
+        struct NetworkKernelContext {
+            /// @brief Kernel-verified image path (not hookable)
+            std::wstring imagePath;
+
+            /// @brief Kernel-verified command line
+            std::wstring commandLine;
+
+            /// @brief Kernel-reported parent PID (tamper-proof)
+            uint32_t parentProcessId = 0;
+
+            /// @brief Actual creating process ID (may differ from parentPid if spoofed)
+            uint32_t creatingProcessId = 0;
+
+            /// @brief Creating thread ID
+            uint32_t creatingThreadId = 0;
+
+            /// @brief Whether kernel data is populated
+            [[nodiscard]] bool hasKernelData() const noexcept {
+                return !imagePath.empty() || parentProcessId != 0;
+            }
+        };
+
+        /**
          * @brief Analysis configuration
          */
         struct NetworkAnalysisConfig {
@@ -1015,6 +1043,9 @@ namespace ShadowStrike {
 
             /// @brief Maximum domains to check
             size_t maxDomainsToCheck = NetworkEvasionConstants::MAX_DOMAINS_PER_ANALYSIS;
+
+            /// @brief Kernel-verified process context for enhanced detection
+            std::optional<NetworkKernelContext> kernelContext;
         };
 
         /**
@@ -1547,6 +1578,12 @@ namespace ShadowStrike {
             ) noexcept;
 
             void CalculateEvasionScore(NetworkEvasionResult& result) noexcept;
+
+            void AnalyzeKernelContext(
+                uint32_t processId,
+                const NetworkKernelContext& kernelCtx,
+                NetworkEvasionResult& result
+            ) noexcept;
 
             void AddDetection(
                 NetworkEvasionResult& result,

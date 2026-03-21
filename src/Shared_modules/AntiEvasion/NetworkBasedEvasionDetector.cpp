@@ -3866,11 +3866,141 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
+            // Kernel-enriched process-network correlation
+            if (config.kernelContext.has_value() && config.kernelContext->hasKernelData()) {
+                AnalyzeKernelContext(processId, *config.kernelContext, result);
+            }
+
             // Calculate evasion score
             CalculateEvasionScore(result);
         }
         catch (...) {
             SS_LOG_ERROR(LOG_CATEGORY, L"AnalyzeProcessInternal: Exception");
+        }
+    }
+
+    void NetworkBasedEvasionDetector::AnalyzeKernelContext(
+        uint32_t processId,
+        const NetworkKernelContext& kernelCtx,
+        NetworkEvasionResult& result
+    ) noexcept {
+        try {
+            // Kernel-enriched detection: correlate process ancestry with network behavior
+            // This data comes directly from kernel PsSetCreateProcessNotifyRoutineEx
+            // and is immune to user-mode API hooking/tampering
+
+            std::wstring lowerImage;
+            lowerImage.reserve(kernelCtx.imagePath.size());
+            for (wchar_t ch : kernelCtx.imagePath) {
+                lowerImage += static_cast<wchar_t>(towlower(ch));
+            }
+
+            std::wstring lowerCmd;
+            lowerCmd.reserve(kernelCtx.commandLine.size());
+            for (wchar_t ch : kernelCtx.commandLine) {
+                lowerCmd += static_cast<wchar_t>(towlower(ch));
+            }
+
+            // T1036.005: PPID spoofing + network activity = C2 staging
+            // If creating process differs from parent, this process was launched
+            // with spoofed PPID — combined with network evasion, very likely C2
+            if (kernelCtx.creatingProcessId != 0 &&
+                kernelCtx.parentProcessId != 0 &&
+                kernelCtx.creatingProcessId != kernelCtx.parentProcessId) {
+
+                bool hasNetworkActivity = false;
+                {
+                    std::shared_lock lock(m_impl->m_mutex);
+                    auto connIt = m_impl->m_connectionTracking.find(processId);
+                    auto dnsIt = m_impl->m_dnsTracking.find(processId);
+                    hasNetworkActivity =
+                        (connIt != m_impl->m_connectionTracking.end() && !connIt->second.targetTimestamps.empty()) ||
+                        (dnsIt != m_impl->m_dnsTracking.end() && !dnsIt->second.timestamps.empty());
+                }
+
+                if (hasNetworkActivity) {
+                    NetworkDetectedTechnique detection(NetworkEvasionTechnique::C2_LowReputation);
+                    detection.confidence = 0.92;
+                    detection.severity = NetworkEvasionSeverity::Critical;
+                    detection.description = L"PPID-spoofed process performing network operations";
+                    detection.technicalDetails = std::format(
+                        L"Kernel: parentPid={} creatingPid={} image={} — PPID mismatch with active network connections",
+                        kernelCtx.parentProcessId, kernelCtx.creatingProcessId,
+                        kernelCtx.imagePath.substr(0, 120));
+                    detection.mitreId = "T1036.005";
+                    AddDetection(result, std::move(detection));
+                }
+            }
+
+            // System binary performing suspicious DNS — LOLBin network abuse
+            static constexpr std::wstring_view kLolBins[] = {
+                L"rundll32.exe", L"regsvr32.exe", L"mshta.exe",
+                L"certutil.exe", L"bitsadmin.exe", L"msiexec.exe",
+                L"wmic.exe", L"cmstp.exe", L"wscript.exe", L"cscript.exe",
+                L"powershell.exe", L"pwsh.exe",
+            };
+
+            for (const auto& lolbin : kLolBins) {
+                if (lowerImage.find(lolbin) != std::wstring::npos) {
+                    // Check if this LOLBin has DNS queries to high-entropy domains
+                    std::vector<std::wstring> suspiciousDomains;
+                    {
+                        std::shared_lock lock(m_impl->m_mutex);
+                        auto dnsIt = m_impl->m_dnsTracking.find(processId);
+                        if (dnsIt != m_impl->m_dnsTracking.end()) {
+                            for (const auto& [domain, ips] : dnsIt->second.domainToIPs) {
+                                double entropy = CalculateDomainEntropy(domain);
+                                if (entropy > 3.5) {
+                                    suspiciousDomains.push_back(domain);
+                                    if (suspiciousDomains.size() >= 5) break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!suspiciousDomains.empty()) {
+                        NetworkDetectedTechnique detection(NetworkEvasionTechnique::DNS_HighEntropyDomain);
+                        detection.confidence = 0.88;
+                        detection.severity = NetworkEvasionSeverity::High;
+                        detection.description = L"System binary resolving high-entropy domains";
+                        std::wstring domainList;
+                        for (const auto& d : suspiciousDomains) {
+                            if (!domainList.empty()) domainList += L", ";
+                            domainList += d.substr(0, 40);
+                        }
+                        detection.technicalDetails = std::format(
+                            L"LOLBin={} domains=[{}] cmd={}",
+                            lolbin, domainList, lowerCmd.substr(0, 120));
+                        detection.mitreId = "T1071.004";
+                        AddDetection(result, std::move(detection));
+                    }
+                    break;
+                }
+            }
+
+            // Download cradle detection with network correlation
+            if (!lowerCmd.empty() &&
+                (lowerCmd.find(L"downloadstring") != std::wstring::npos ||
+                 lowerCmd.find(L"downloadfile") != std::wstring::npos ||
+                 lowerCmd.find(L"invoke-webrequest") != std::wstring::npos ||
+                 lowerCmd.find(L"wget") != std::wstring::npos ||
+                 lowerCmd.find(L"curl") != std::wstring::npos ||
+                 lowerCmd.find(L"bitstransfer") != std::wstring::npos)) {
+
+                NetworkDetectedTechnique detection(NetworkEvasionTechnique::C2_CloudProviderAbuse);
+                detection.confidence = 0.85;
+                detection.severity = NetworkEvasionSeverity::High;
+                detection.description = L"Download cradle command with active network evasion";
+                detection.technicalDetails = std::format(
+                    L"image={} cmd={}",
+                    kernelCtx.imagePath.substr(0, 80),
+                    lowerCmd.substr(0, 150));
+                detection.mitreId = "T1105";
+                AddDetection(result, std::move(detection));
+            }
+        }
+        catch (...) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"AnalyzeKernelContext: Exception analyzing kernel context for PID {}", processId);
         }
     }
 
