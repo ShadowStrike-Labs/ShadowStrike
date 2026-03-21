@@ -715,6 +715,31 @@ public:
             auto& timeBased = ShadowStrike::AntiEvasion::TimeBasedEvasionDetector::Instance();
             if (timeBased.Initialize(m_threadPool)) {
                 m_timeBasedDetectorInitialized = true;
+
+                // Wire detection callback for SOC/SIEM telemetry
+                timeBased.RegisterCallback(
+                    [](const ShadowStrike::AntiEvasion::TimingEvasionResult& result) {
+                        if (result.isEvasive) {
+                            Utils::Logger::Warn(
+                                L"[TED-CB] PID={} threat={:.1f} confidence={:.1f} severity={} "
+                                L"findings={} process={}",
+                                result.processId, result.threatScore,
+                                result.confidence,
+                                static_cast<int>(result.severity),
+                                result.findings.size(),
+                                result.processName.substr(0, 80));
+
+                            for (const auto& finding : result.findings) {
+                                if (finding.severity >= ShadowStrike::AntiEvasion::TimingEvasionSeverity::High) {
+                                    Utils::Logger::Warn(
+                                        L"[TED-CB] PID={} finding={} confidence={:.1f} severity={}",
+                                        result.processId, finding.description.substr(0, 120),
+                                        finding.confidence,
+                                        static_cast<int>(finding.severity));
+                                }
+                            }
+                        }
+                    });
             } else {
                 Utils::Logger::Warn(L"RealTimeProtection: TimeBasedEvasionDetector Initialize failed");
             }
@@ -1256,13 +1281,39 @@ public:
             }
 
             // 4. Time-Based Evasion (singleton — RDTSC abuse, sleep acceleration, timing anti-debug)
-            if (!evasionDetected && m_timeBasedDetectorInitialized) {
+            // Always run for telemetry — timing evasion is orthogonal to other detections
+            if (m_timeBasedDetectorInitialized) {
                 try {
                     auto result = ShadowStrike::AntiEvasion::TimeBasedEvasionDetector::Instance()
                         .AnalyzeProcess(req.processId);
                     if (result.isEvasive) {
                         evasionDetected = true;
-                        detectionSource = L"Time-Based Evasion";
+                        detectionSource = std::format(
+                            L"Time-Based Evasion [threat={:.1f} severity={} findings={}]",
+                            result.threatScore,
+                            static_cast<int>(result.severity),
+                            result.findings.size());
+
+                        // Rich telemetry for SOC/SIEM: per-finding logging
+                        for (const auto& finding : result.findings) {
+                            if (finding.severity >= ShadowStrike::AntiEvasion::TimingEvasionSeverity::High) {
+                                Utils::Logger::Warn(
+                                    L"RealTimeProtection: PID {} timing evasion: {} "
+                                    L"(confidence={:.1f} severity={})",
+                                    req.processId, finding.description.substr(0, 120),
+                                    finding.confidence,
+                                    static_cast<int>(finding.severity));
+                            }
+                        }
+
+                        // Critical severity → immediate SOC alert
+                        if (result.severity >= ShadowStrike::AntiEvasion::TimingEvasionSeverity::Critical) {
+                            Utils::Logger::Error(
+                                L"RealTimeProtection: CRITICAL timing evasion in PID {} — "
+                                L"threat={:.1f} findings={} image={}",
+                                req.processId, result.threatScore,
+                                result.findings.size(), imagePath.substr(0, 120));
+                        }
                     }
                 } catch (...) {}
             }

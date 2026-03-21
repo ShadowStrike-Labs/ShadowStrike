@@ -703,7 +703,7 @@ TimingCalibrateTimebase PROC
     push    r13
     push    r14
     push    r15
-    sub     rsp, 72         ; Extra space for 128-bit intermediate
+    sub     rsp, 80         ; Shadow space (32) + local vars (40) + alignment (8)
     
     ;; THREAD-SAFETY FIX: Use atomic compare-exchange for calibration check
     ;; Try to acquire calibration lock (0 -> 2 means "calibrating")
@@ -817,7 +817,7 @@ TimingCalibrateTimebase PROC
     mov     QWORD PTR [g_tscFrequency], rax
     
 @CalibReturn:
-    add     rsp, 72
+    add     rsp, 80
     pop     r15
     pop     r14
     pop     r13
