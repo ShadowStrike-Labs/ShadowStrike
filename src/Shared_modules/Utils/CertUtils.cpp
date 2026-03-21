@@ -69,10 +69,15 @@ namespace {
         if (!err) {
             return;
         }
-        err->Clear();
-        err->message = msg ? msg : L"";
         err->win32 = w32;
         err->ntstatus = nt;
+        try {
+            err->message = msg ? msg : L"";
+            err->context.clear();
+        }
+        catch (...) {
+            // OOM during error reporting — preserve error codes, lose message text
+        }
     }
 
     /**
@@ -257,6 +262,20 @@ bool Certificate::LoadFromFile(std::wstring_view path, Error* err) noexcept {
         return false;
     }
 
+    // Enforce file size limit to prevent DoS via huge files
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(pathStr.c_str(), GetFileExInfoStandard, &fad)) {
+        set_err(err, L"LoadFromFile: cannot query file attributes", GetLastError());
+        return false;
+    }
+    ULARGE_INTEGER fileSize;
+    fileSize.LowPart = fad.nFileSizeLow;
+    fileSize.HighPart = fad.nFileSizeHigh;
+    if (fileSize.QuadPart > kMaxFileSize) {
+        set_err(err, L"LoadFromFile: file exceeds 10 MB size limit", ERROR_FILE_TOO_LARGE);
+        return false;
+    }
+
     // 2. Helper Lambda for CryptQueryObject (to avoid code duplication)
     auto QueryStore = [&](DWORD contentFlags) -> ScopedCertStore {
         DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
@@ -345,6 +364,12 @@ bool Certificate::LoadFromMemory(const uint8_t* data, size_t len, Error* err) no
     // Validate parameters
     if (data == nullptr || len == 0) {
         set_err(err, L"LoadFromMemory: invalid buffer", ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    // Enforce maximum certificate size to prevent DoS
+    if (len > kMaxCertificateSize) {
+        set_err(err, L"LoadFromMemory: certificate data exceeds 1 MB limit", ERROR_INVALID_PARAMETER);
         return false;
     }
 
@@ -472,6 +497,7 @@ bool Certificate::LoadFromStore(std::wstring_view storeName, std::wstring_view t
     std::wstring storeNameStr(storeName);
 
     // Open system certificate store (Current User first)
+    bool isLocalMachine = false;
     HCERTSTORE hStore = CertOpenStore(
         CERT_STORE_PROV_SYSTEM_W,
         0,
@@ -481,7 +507,8 @@ bool Certificate::LoadFromStore(std::wstring_view storeName, std::wstring_view t
     );
 
     if (hStore == nullptr) {
-        // Fallback: try Local Machine store
+        // Fallback: try Local Machine store (logged for security audit trail)
+        isLocalMachine = true;
         hStore = CertOpenStore(
             CERT_STORE_PROV_SYSTEM_W,
             0,
@@ -572,6 +599,10 @@ bool Certificate::LoadFromStore(std::wstring_view storeName, std::wstring_view t
     if (m_certContext == nullptr) {
         set_err(err, L"LoadFromStore: CertDuplicateCertificateContext failed", GetLastError());
         return false;
+    }
+
+    if (isLocalMachine) {
+        SS_LOG_INFO(L"CertUtils", L"Certificate loaded from LocalMachine store (CurrentUser fallback)");
     }
 
     return true;
@@ -1608,7 +1639,7 @@ bool Certificate::VerifySignature(const uint8_t* data, size_t dataLen,
     const uint8_t* signature, size_t signatureLen,
     Error* err) const noexcept {
 #ifdef _WIN32
-    if (m_certContext == nullptr) {
+    if (m_certContext == nullptr || m_certContext->pCertInfo == nullptr) {
         set_err(err, L"VerifySignature: no certificate loaded", ERROR_INVALID_HANDLE);
         return false;
     }
@@ -1630,28 +1661,24 @@ bool Certificate::VerifySignature(const uint8_t* data, size_t dataLen,
         return false;
     }
 
-    // Acquire public key handle from certificate
-    HCRYPTPROV_OR_NCRYPT_KEY_HANDLE hKey = 0;
-    DWORD dwKeySpec = 0;
-    BOOL fCallerFree = FALSE;
-
-    if (!CryptAcquireCertificatePrivateKey(
-        m_certContext,
-        CRYPT_ACQUIRE_COMPARE_KEY_FLAG | CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG,
+    // Import PUBLIC key from certificate's SubjectPublicKeyInfo.
+    // CryptImportPublicKeyInfoEx2 works on any certificate — no private key needed.
+    BCRYPT_KEY_HANDLE hPubKey = nullptr;
+    if (!CryptImportPublicKeyInfoEx2(
+        X509_ASN_ENCODING,
+        &m_certContext->pCertInfo->SubjectPublicKeyInfo,
+        0,
         nullptr,
-        &hKey,
-        &dwKeySpec,
-        &fCallerFree)) {
-        set_err(err, L"VerifySignature: failed to acquire key handle", GetLastError());
+        &hPubKey)) {
+        set_err(err, L"VerifySignature: CryptImportPublicKeyInfoEx2 failed", GetLastError());
         return false;
     }
 
-    // RAII guard for key handle
-    struct KeyGuard {
-        NCRYPT_KEY_HANDLE h;
-        BOOL free;
-        ~KeyGuard() { if (free && h != 0) NCryptFreeObject(h); }
-    } keyGuard{ hKey, fCallerFree };
+    // RAII guard for BCrypt key handle
+    struct PubKeyGuard {
+        BCRYPT_KEY_HANDLE h;
+        ~PubKeyGuard() { if (h != nullptr) BCryptDestroyKey(h); }
+    } pubKeyGuard{ hPubKey };
 
     // Open SHA-256 algorithm provider
     BCRYPT_ALG_HANDLE hAlg = nullptr;
@@ -1667,13 +1694,12 @@ bool Certificate::VerifySignature(const uint8_t* data, size_t dataLen,
         return false;
     }
 
-    // RAII guard for algorithm handle
     struct AlgGuard {
         BCRYPT_ALG_HANDLE h;
         ~AlgGuard() { if (h != nullptr) BCryptCloseAlgorithmProvider(h, 0); }
     } algGuard{ hAlg };
 
-    // Get hash size
+    // Get hash output size
     DWORD cbHash = 0;
     DWORD cbResult = 0;
     status = BCryptGetProperty(
@@ -1700,7 +1726,7 @@ bool Certificate::VerifySignature(const uint8_t* data, size_t dataLen,
         return false;
     }
 
-    // Create hash object
+    // Create and compute hash
     BCRYPT_HASH_HANDLE hHash = nullptr;
     status = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
 
@@ -1709,13 +1735,11 @@ bool Certificate::VerifySignature(const uint8_t* data, size_t dataLen,
         return false;
     }
 
-    // RAII guard for hash handle
     struct HashGuard {
         BCRYPT_HASH_HANDLE h;
         ~HashGuard() { if (h != nullptr) BCryptDestroyHash(h); }
     } hashGuard{ hHash };
 
-    // Hash the data
     status = BCryptHashData(
         hHash,
         const_cast<PUCHAR>(data),
@@ -1728,7 +1752,6 @@ bool Certificate::VerifySignature(const uint8_t* data, size_t dataLen,
         return false;
     }
 
-    // Finalize hash
     status = BCryptFinishHash(hHash, hash.data(), cbHash, 0);
 
     if (status != 0) {
@@ -1736,19 +1759,45 @@ bool Certificate::VerifySignature(const uint8_t* data, size_t dataLen,
         return false;
     }
 
-    // Verify signature using NCrypt
-    SECURITY_STATUS secStatus = NCryptVerifySignature(
-        hKey,
-        nullptr,
-        hash.data(),
-        cbHash,
-        const_cast<PUCHAR>(signature),
-        static_cast<ULONG>(signatureLen),
-        0
-    );
+    // Determine key algorithm to select correct padding.
+    // SubjectPublicKeyInfo.Algorithm.pszObjId is the KEY algorithm OID
+    // (szOID_RSA_RSA for RSA, szOID_ECC_PUBLIC_KEY for ECDSA) — NOT
+    // the signature algorithm OID (szOID_RSA_SHA256RSA etc.)
+    LPCSTR keyOid = m_certContext->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId;
+    const bool isRsa = (keyOid != nullptr) &&
+        (std::strcmp(keyOid, szOID_RSA_RSA) == 0);
 
-    if (secStatus != ERROR_SUCCESS) {
-        set_err(err, L"VerifySignature: signature verification failed", static_cast<DWORD>(secStatus));
+    // Verify the signature
+    NTSTATUS verifyStatus;
+    if (isRsa) {
+        BCRYPT_PKCS1_PADDING_INFO padInfo{};
+        padInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM;
+        verifyStatus = BCryptVerifySignature(
+            hPubKey,
+            &padInfo,
+            hash.data(),
+            cbHash,
+            const_cast<PUCHAR>(signature),
+            static_cast<ULONG>(signatureLen),
+            BCRYPT_PAD_PKCS1
+        );
+    }
+    else {
+        // ECDSA and other algorithms — no padding info needed
+        verifyStatus = BCryptVerifySignature(
+            hPubKey,
+            nullptr,
+            hash.data(),
+            cbHash,
+            const_cast<PUCHAR>(signature),
+            static_cast<ULONG>(signatureLen),
+            0
+        );
+    }
+
+    if (verifyStatus != 0) {
+        set_err(err, L"VerifySignature: signature verification failed",
+            static_cast<DWORD>(verifyStatus));
         return false;
     }
 
@@ -2427,8 +2476,11 @@ bool Certificate::GetRevocationStatus(bool& isRevoked, std::wstring& reason, Err
     default:
         // Unknown error during revocation check
         try {
-            reason = L"Revocation check failed (error: 0x" +
-                     std::to_wstring(revStatus.dwError) + L")";
+            wchar_t hexBuf[20]{};
+            swprintf_s(hexBuf, L"0x%08lX", revStatus.dwError);
+            reason = L"Revocation check failed (error: ";
+            reason += hexBuf;
+            reason += L")";
         }
         catch (const std::bad_alloc&) {
             reason = L"Revocation check failed";
@@ -2446,19 +2498,16 @@ bool Certificate::GetRevocationStatus(bool& isRevoked, std::wstring& reason, Err
 
 
 /**
- * @brief Parses and extracts the generation time from an RFC 3161 timestamp token.
+ * @brief Verifies and extracts the generation time from an RFC 3161 timestamp token.
  *
- * Decodes the PKCS#7 SignedData structure containing the TSTInfo to extract
- * the genTime field representing when the timestamp was created.
+ * Uses CryptVerifyTimeStampSignature to properly parse and verify the PKCS#7
+ * SignedData containing TSTInfo, then extracts the genTime field.
  *
  * @param tsToken Pointer to the RFC 3161 timestamp token (PKCS#7 SignedData).
  * @param len Length of the timestamp token in bytes.
  * @param outGenTime Output FILETIME for the extracted generation time.
  * @param err Optional error output.
- * @return true if timestamp was successfully parsed, false otherwise.
- *
- * @note This provides basic parsing; full RFC 3161 verification would require
- *       additional checks including TSA certificate validation and hash matching.
+ * @return true if timestamp was successfully verified and parsed, false otherwise.
  */
 bool Certificate::VerifyTimestampToken(const uint8_t* tsToken, size_t len,
     FILETIME& outGenTime, Error* err) const noexcept {
@@ -2484,126 +2533,66 @@ bool Certificate::VerifyTimestampToken(const uint8_t* tsToken, size_t len,
         return false;
     }
 
-    // Open cryptographic message for decoding
-    HCRYPTMSG hMsg = CryptMsgOpenToDecode(
-        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-        0,
-        0,
-        0,
-        nullptr,
-        nullptr
-    );
-
-    if (hMsg == nullptr) {
-        set_err(err, L"VerifyTimestampToken: CryptMsgOpenToDecode failed", GetLastError());
+    // Check DWORD overflow
+    DWORD cbToken = 0;
+    if (!safe_size_to_dword(len, cbToken)) {
+        set_err(err, L"VerifyTimestampToken: token length overflow", ERROR_INVALID_PARAMETER);
         return false;
     }
 
-    // RAII guard for message handle
-    struct MsgGuard {
-        HCRYPTMSG h;
-        ~MsgGuard() { if (h != nullptr) CryptMsgClose(h); }
-    } msgGuard{ hMsg };
+    // Use CryptVerifyTimeStampSignature for proper RFC 3161 parsing.
+    // Pass pbData=nullptr, cbData=0 to verify the timestamp signature
+    // without verifying the hash of the original data.
+    PCRYPT_TIMESTAMP_CONTEXT pTsContext = nullptr;
+    PCCERT_CONTEXT pTsSigner = nullptr;
 
-    // Feed the token data into the message
-    BOOL updateOk = CryptMsgUpdate(
-        hMsg,
+    BOOL ok = CryptVerifyTimeStampSignature(
         tsToken,
-        static_cast<DWORD>(len),
-        TRUE    // Final update
+        cbToken,
+        nullptr,        // pbData — skip hash match verification
+        0,              // cbData
+        nullptr,        // hAdditionalStore
+        &pTsContext,
+        &pTsSigner,
+        nullptr         // phStore
     );
 
-    if (updateOk == FALSE) {
-        set_err(err, L"VerifyTimestampToken: CryptMsgUpdate failed", GetLastError());
+    // RAII cleanup for returned pointers
+    struct TsContextGuard {
+        PCRYPT_TIMESTAMP_CONTEXT ctx;
+        ~TsContextGuard() { if (ctx) CryptMemFree(ctx); }
+    } tsGuard{ pTsContext };
+
+    struct SignerGuard {
+        PCCERT_CONTEXT ctx;
+        ~SignerGuard() { if (ctx) CertFreeCertificateContext(ctx); }
+    } signerGuard{ pTsSigner };
+
+    if (!ok || pTsContext == nullptr) {
+        set_err(err, L"VerifyTimestampToken: CryptVerifyTimeStampSignature failed", GetLastError());
         return false;
     }
 
-    // Get the inner content (TSTInfo structure)
-    DWORD cbContent = 0;
-    if (!CryptMsgGetParam(hMsg, CMSG_CONTENT_PARAM, 0, nullptr, &cbContent)) {
-        set_err(err, L"VerifyTimestampToken: content size query failed", GetLastError());
+    // Validate the returned timestamp info
+    if (pTsContext->pTimeStamp == nullptr) {
+        set_err(err, L"VerifyTimestampToken: no timestamp info in context", ERROR_INVALID_DATA);
         return false;
     }
 
-    if (cbContent == 0 || cbContent > kMaxDecodedStructureSize) {
-        set_err(err, L"VerifyTimestampToken: invalid content size", ERROR_INVALID_DATA);
+    // Extract the generation time from TSTInfo
+    outGenTime = pTsContext->pTimeStamp->ftTime;
+
+    // Validate the extracted time is reasonable
+    SYSTEMTIME stCheck{};
+    if (!FileTimeToSystemTime(&outGenTime, &stCheck)) {
+        set_err(err, L"VerifyTimestampToken: extracted time is invalid", ERROR_INVALID_DATA);
+        outGenTime = FILETIME{};
         return false;
     }
 
-    // Allocate buffer for content
-    std::vector<BYTE> content;
-    try {
-        content.resize(cbContent);
-    }
-    catch (const std::bad_alloc&) {
-        set_err(err, L"VerifyTimestampToken: allocation failed", ERROR_OUTOFMEMORY);
-        return false;
-    }
-
-    // Retrieve the content
-    if (!CryptMsgGetParam(hMsg, CMSG_CONTENT_PARAM, 0, content.data(), &cbContent)) {
-        set_err(err, L"VerifyTimestampToken: content retrieval failed", GetLastError());
-        return false;
-    }
-
-    // Decode the genTime from TSTInfo
-    // Note: This is a simplified approach - full TSTInfo parsing would use
-    // ASN.1 decoding of the SEQUENCE structure
-    DWORD cbDecoded = 0;
-    if (!CryptDecodeObject(
-        X509_ASN_ENCODING,
-        X509_CHOICE_OF_TIME,
-        content.data(),
-        cbContent,
-        0,
-        nullptr,
-        &cbDecoded)) {
-        set_err(err, L"VerifyTimestampToken: time decode size query failed", GetLastError());
-        return false;
-    }
-
-    if (cbDecoded < sizeof(SYSTEMTIME) || cbDecoded > kMaxDecodedStructureSize) {
-        set_err(err, L"VerifyTimestampToken: invalid decoded time size", ERROR_INVALID_DATA);
-        return false;
-    }
-
-    // Allocate buffer for decoded time
-    std::vector<BYTE> timeBuf;
-    try {
-        timeBuf.resize(cbDecoded);
-    }
-    catch (const std::bad_alloc&) {
-        set_err(err, L"VerifyTimestampToken: time buffer allocation failed", ERROR_OUTOFMEMORY);
-        return false;
-    }
-
-    // Decode the time
-    if (!CryptDecodeObject(
-        X509_ASN_ENCODING,
-        X509_CHOICE_OF_TIME,
-        content.data(),
-        cbContent,
-        0,
-        timeBuf.data(),
-        &cbDecoded)) {
-        set_err(err, L"VerifyTimestampToken: time decode failed", GetLastError());
-        return false;
-    }
-
-    // Convert SYSTEMTIME to FILETIME
-    auto* st = reinterpret_cast<SYSTEMTIME*>(timeBuf.data());
-
-    // Validate SYSTEMTIME before conversion
-    if (st->wYear < 1601 || st->wYear > 9999 ||
-        st->wMonth < 1 || st->wMonth > 12 ||
-        st->wDay < 1 || st->wDay > 31 ||
-        st->wHour > 23 || st->wMinute > 59 || st->wSecond > 59) {
-        set_err(err, L"VerifyTimestampToken: invalid time values", ERROR_INVALID_DATA);
-        return false;
-    }
-
-    if (!SystemTimeToFileTime(st, &outGenTime)) {
-        set_err(err, L"VerifyTimestampToken: SystemTimeToFileTime failed", GetLastError());
+    if (stCheck.wYear < 1990 || stCheck.wYear > 2100) {
+        set_err(err, L"VerifyTimestampToken: extracted time out of reasonable range", ERROR_INVALID_DATA);
+        outGenTime = FILETIME{};
         return false;
     }
 
@@ -2630,55 +2619,50 @@ bool Certificate::VerifyTimestampToken(const uint8_t* tsToken, size_t len,
 bool Certificate::ExtractPublicKey(ShadowStrike::Utils::CryptoUtils::PublicKey& outKey,
     Error* err) const noexcept {
 #ifdef _WIN32
-    if (m_certContext == nullptr) {
+    if (m_certContext == nullptr || m_certContext->pCertInfo == nullptr) {
         set_err(err, L"ExtractPublicKey: no certificate loaded", ERROR_INVALID_HANDLE);
         return false;
     }
 
-    // Acquire key handle from certificate
-    HCRYPTPROV_OR_NCRYPT_KEY_HANDLE hKey = 0;
-    DWORD dwKeySpec = 0;
-    BOOL fCallerFree = FALSE;
-
-    if (!CryptAcquireCertificatePrivateKey(
-        m_certContext,
-        CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG | CRYPT_ACQUIRE_COMPARE_KEY_FLAG,
+    // Import PUBLIC key from the certificate's SubjectPublicKeyInfo.
+    // CryptImportPublicKeyInfoEx2 works on any certificate — no private key required.
+    BCRYPT_KEY_HANDLE hPubKey = nullptr;
+    if (!CryptImportPublicKeyInfoEx2(
+        X509_ASN_ENCODING,
+        &m_certContext->pCertInfo->SubjectPublicKeyInfo,
+        0,
         nullptr,
-        &hKey,
-        &dwKeySpec,
-        &fCallerFree)) {
-        set_err(err, L"ExtractPublicKey: failed to acquire key handle", GetLastError());
+        &hPubKey)) {
+        set_err(err, L"ExtractPublicKey: CryptImportPublicKeyInfoEx2 failed", GetLastError());
         return false;
     }
 
-    // RAII guard for key handle
-    struct KeyGuard {
-        NCRYPT_KEY_HANDLE h;
-        BOOL free;
-        ~KeyGuard() { if (free && h != 0) NCryptFreeObject(h); }
-    } keyGuard{ hKey, fCallerFree };
+    // RAII guard for BCrypt key handle
+    struct PubKeyGuard {
+        BCRYPT_KEY_HANDLE h;
+        ~PubKeyGuard() { if (h != nullptr) BCryptDestroyKey(h); }
+    } pubKeyGuard{ hPubKey };
 
-    // Query required buffer size for public key export
+    // Query required buffer size for public key blob export
     DWORD cbBlob = 0;
-    SECURITY_STATUS status = NCryptExportKey(
-        hKey,
-        0,
-        BCRYPT_PUBLIC_KEY_BLOB,
+    NTSTATUS status = BCryptExportKey(
+        hPubKey,
         nullptr,
+        BCRYPT_PUBLIC_KEY_BLOB,
         nullptr,
         0,
         &cbBlob,
         0
     );
 
-    if (status != ERROR_SUCCESS) {
-        set_err(err, L"ExtractPublicKey: size query failed", static_cast<DWORD>(status));
+    if (status != 0 || cbBlob == 0) {
+        set_err(err, L"ExtractPublicKey: BCryptExportKey size query failed", static_cast<DWORD>(status));
         return false;
     }
 
     // Validate blob size
-    if (cbBlob == 0 || cbBlob > kMaxDecodedStructureSize) {
-        set_err(err, L"ExtractPublicKey: invalid key blob size", ERROR_INVALID_DATA);
+    if (cbBlob > kMaxDecodedStructureSize) {
+        set_err(err, L"ExtractPublicKey: key blob too large", ERROR_INVALID_DATA);
         return false;
     }
 
@@ -2693,25 +2677,22 @@ bool Certificate::ExtractPublicKey(ShadowStrike::Utils::CryptoUtils::PublicKey& 
     }
 
     // Export the public key
-    status = NCryptExportKey(
-        hKey,
-        0,
-        BCRYPT_PUBLIC_KEY_BLOB,
+    status = BCryptExportKey(
+        hPubKey,
         nullptr,
+        BCRYPT_PUBLIC_KEY_BLOB,
         blob.data(),
         cbBlob,
         &cbBlob,
         0
     );
 
-    if (status != ERROR_SUCCESS) {
-        set_err(err, L"ExtractPublicKey: export failed", static_cast<DWORD>(status));
+    if (status != 0) {
+        set_err(err, L"ExtractPublicKey: BCryptExportKey failed", static_cast<DWORD>(status));
         return false;
     }
 
     // Transfer to output structure
-    // Note: PublicKey::Import expects CryptoUtils::Error, but we have CertUtils::Error
-    // We call Import without error output and handle failure generically
     ShadowStrike::Utils::CryptoUtils::Error cryptoErr;
     if (!ShadowStrike::Utils::CryptoUtils::PublicKey::Import(blob.data(), cbBlob, outKey, &cryptoErr)) {
         set_err(err, L"ExtractPublicKey: failed to import key data", ERROR_INVALID_DATA);
