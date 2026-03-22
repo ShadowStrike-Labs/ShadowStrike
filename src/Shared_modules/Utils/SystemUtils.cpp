@@ -64,6 +64,27 @@ namespace SystemUtils {
 
         /** Registry key path for Windows version information */
         constexpr const wchar_t* kWindowsVersionRegKey = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+
+        /** Cached high-precision time function (resolved once, thread-safe via C++11 statics) */
+        using GetSystemTimePreciseAsFileTime_t = VOID(WINAPI*)(LPFILETIME);
+        [[nodiscard]] GetSystemTimePreciseAsFileTime_t GetPreciseTimeFunc() noexcept {
+            static const auto pFunc = []() -> GetSystemTimePreciseAsFileTime_t {
+                HMODULE hk = ::GetModuleHandleW(L"kernel32.dll");
+                return hk ? reinterpret_cast<GetSystemTimePreciseAsFileTime_t>(
+                    ::GetProcAddress(hk, "GetSystemTimePreciseAsFileTime")) : nullptr;
+            }();
+            return pFunc;
+        }
+
+        /** Gets current system time as FILETIME using best available precision */
+        void GetSystemTimeHighPrecision(FILETIME& ft) noexcept {
+            auto pPrecise = GetPreciseTimeFunc();
+            if (pPrecise != nullptr) {
+                pPrecise(&ft);
+            } else {
+                ::GetSystemTimeAsFileTime(&ft);
+            }
+        }
     } // anonymous namespace
 
     //=============================================================================
@@ -183,7 +204,7 @@ namespace SystemUtils {
          * @param arch Processor architecture value from SYSTEM_INFO
          * @return Human-readable architecture name
          */
-        [[nodiscard]] std::wstring ArchitectureToString(WORD arch) noexcept {
+        [[nodiscard]] const wchar_t* ArchitectureToString(WORD arch) noexcept {
             switch (arch) {
             case PROCESSOR_ARCHITECTURE_AMD64: return L"x64";
             case PROCESSOR_ARCHITECTURE_INTEL: return L"x86";
@@ -199,7 +220,7 @@ namespace SystemUtils {
          * @param rid Integrity level RID
          * @return Integrity level name
          */
-        [[nodiscard]] std::wstring IntegrityRidToName(DWORD rid) noexcept {
+        [[nodiscard]] const wchar_t* IntegrityRidToName(DWORD rid) noexcept {
             switch (rid) {
             case SECURITY_MANDATORY_UNTRUSTED_RID:        return L"Untrusted";
             case SECURITY_MANDATORY_LOW_RID:              return L"Low";
@@ -313,23 +334,8 @@ namespace SystemUtils {
     uint64_t NowFileTime100nsUTC() noexcept {
 #ifdef _WIN32
         FILETIME ft{};
+        GetSystemTimeHighPrecision(ft);
 
-        // Prefer GetSystemTimePreciseAsFileTime for higher precision (Win8+)
-        HMODULE hKernel = ::GetModuleHandleW(L"kernel32.dll");
-        if (hKernel != nullptr) {
-            using GetSystemTimePreciseAsFileTime_t = VOID(WINAPI*)(LPFILETIME);
-            auto pPrecise = reinterpret_cast<GetSystemTimePreciseAsFileTime_t>(
-                ::GetProcAddress(hKernel, "GetSystemTimePreciseAsFileTime"));
-            if (pPrecise != nullptr) {
-                pPrecise(&ft);
-            } else {
-                ::GetSystemTimeAsFileTime(&ft);
-            }
-        } else {
-            ::GetSystemTimeAsFileTime(&ft);
-        }
-
-        // Convert FILETIME to uint64_t
         ULARGE_INTEGER uli{};
         uli.LowPart = ft.dwLowDateTime;
         uli.HighPart = ft.dwHighDateTime;
@@ -419,8 +425,8 @@ namespace SystemUtils {
         bool isWow64 = false;
         USHORT processMachine = 0;
         if(!IsWow64Process2Safe(isWow64, processMachine)){
-            SS_LOG_ERROR(L"SystemUtils", L"IsWow64Process2Safe failed");
-            return false;
+            SS_LOG_WARN(L"SystemUtils", L"WOW64 detection failed, assuming native process");
+            // Continue with isWow64 = false (already initialized)
 		}
         out.isWow64Process = isWow64;
 
@@ -469,7 +475,11 @@ namespace SystemUtils {
         // Get basic system info for architecture
         SYSTEM_INFO sysInfo{};
         GetBasicSystemInfo(sysInfo);
-        out.architecture = ArchitectureToString(sysInfo.wProcessorArchitecture);
+        try {
+            out.architecture = ArchitectureToString(sysInfo.wProcessorArchitecture);
+        } catch (...) {
+            out.architecture.clear();
+        }
 
         // Query processor topology using GetLogicalProcessorInformationEx
         DWORD bufferLength = 0;
@@ -584,6 +594,8 @@ namespace SystemUtils {
                     );
                     if (result <= 0) {
                         out.brand.clear();
+                    } else {
+                        out.brand.resize(static_cast<size_t>(result));
                     }
                 } catch (...) {
                     out.brand.clear();
@@ -606,10 +618,15 @@ namespace SystemUtils {
         out.hasSSSE3 = (featureInfo1[2] & (1 << 9)) != 0;
         out.hasSSE41 = (featureInfo1[2] & (1 << 19)) != 0;
         out.hasSSE42 = (featureInfo1[2] & (1 << 20)) != 0;
-        out.hasAVX   = (featureInfo1[2] & (1 << 28)) != 0;
 
-        // EBX register (featureInfo7[1]) features
-        out.hasAVX2  = (featureInfo7[1] & (1 << 5)) != 0;
+        // AVX requires OS support (OSXSAVE) + XCR0 SSE/AVX state enabled
+        bool osXsave = (featureInfo1[2] & (1 << 27)) != 0;
+        if (osXsave) {
+            unsigned long long xcr0 = _xgetbv(0);
+            bool avxOsEnabled = (xcr0 & 0x6) == 0x6; // bits 1+2: SSE + AVX state
+            out.hasAVX  = avxOsEnabled && (featureInfo1[2] & (1 << 28)) != 0;
+            out.hasAVX2 = avxOsEnabled && (featureInfo7[1] & (1 << 5)) != 0;
+        }
 #else
         // Non-x86/x64 architecture - no CPUID available
         out.brand.clear();
@@ -719,7 +736,11 @@ namespace SystemUtils {
                         );
                         if (pRid != nullptr) {
                             out.integrityRid = *pRid;
-                            out.integrityName = IntegrityRidToName(*pRid);
+                            try {
+                                out.integrityName = IntegrityRidToName(*pRid);
+                            } catch (...) {
+                                out.integrityName.clear();
+                            }
                         }
                     }
                 }
@@ -877,8 +898,8 @@ namespace SystemUtils {
                 return L"";
             }
 
-            // Check if buffer was large enough
-            if (length < path.size() - 1) {
+            // Check if buffer was large enough (truncation sets length == buffer size)
+            if (length < path.size()) {
                 path.resize(length);
                 return path;
             }
@@ -929,8 +950,8 @@ namespace SystemUtils {
                 return L"";
             }
 
-            // Check if buffer was large enough
-            if (length < path.size() - 1) {
+            // Check if buffer was large enough (truncation sets length == buffer size)
+            if (length < path.size()) {
                 path.resize(length);
                 return path;
             }
@@ -1018,7 +1039,6 @@ namespace SystemUtils {
         // Convert to wstring for API call
         std::wstring input = ToWString(s);
         if (input.empty() && !s.empty()) {
-            // Allocation failed, return original
             try {
                 return std::wstring(s);
             } catch (...) {
@@ -1026,54 +1046,53 @@ namespace SystemUtils {
             }
         }
 
-        // Query required buffer size
-        DWORD requiredSize = ::ExpandEnvironmentStringsW(input.c_str(), nullptr, 0);
+        // Retry loop handles TOCTOU: env vars may change between size query and expansion
+        constexpr int kMaxRetries = 3;
+        for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+            // Query required buffer size (includes null terminator)
+            DWORD requiredSize = ::ExpandEnvironmentStringsW(input.c_str(), nullptr, 0);
 
-        // Check for failure or empty result
-        if (requiredSize == 0) {
-            SS_LOG_LAST_ERROR(L"SystemUtils", L"ExpandEnvironmentStringsW size query failed");
-            return input;
+            if (requiredSize == 0) {
+                SS_LOG_LAST_ERROR(L"SystemUtils", L"ExpandEnvironmentStringsW size query failed");
+                return input;
+            }
+
+            if (requiredSize == 1) {
+                return L"";
+            }
+
+            if (requiredSize > kMaxExpandedPathSize) {
+                SS_LOG_ERROR(L"SystemUtils", L"Expanded environment string too large");
+                return input;
+            }
+
+            std::wstring output;
+            try {
+                output.resize(requiredSize);
+            } catch (...) {
+                SS_LOG_ERROR(L"SystemUtils", L"Failed to allocate expansion buffer");
+                return input;
+            }
+
+            DWORD resultLength = ::ExpandEnvironmentStringsW(
+                input.c_str(), output.data(), requiredSize);
+
+            if (resultLength == 0) {
+                SS_LOG_LAST_ERROR(L"SystemUtils", L"ExpandEnvironmentStringsW failed");
+                return input;
+            }
+
+            // resultLength includes null terminator; if it fits our buffer, success
+            if (resultLength <= requiredSize) {
+                output.resize(resultLength > 0 ? resultLength - 1 : 0);
+                return output;
+            }
+
+            // resultLength > requiredSize: env changed between calls, retry
         }
 
-        if (requiredSize == 1) {
-            // Result is empty string (just null terminator)
-            return L"";
-        }
-
-        // Validate size is reasonable
-        if (requiredSize > kMaxExpandedPathSize) {
-            SS_LOG_ERROR(L"SystemUtils", L"Expanded environment string too large");
-            return input;
-        }
-
-        // Allocate output buffer
-        std::wstring output;
-        try {
-            output.resize(requiredSize);
-        } catch (...) {
-            SS_LOG_ERROR(L"SystemUtils", L"Failed to allocate expansion buffer");
-            return input;
-        }
-
-        // Expand environment strings
-        DWORD resultLength = ::ExpandEnvironmentStringsW(input.c_str(), output.data(), requiredSize);
-
-        if (resultLength == 0) {
-            SS_LOG_LAST_ERROR(L"SystemUtils", L"ExpandEnvironmentStringsW failed");
-            return input;
-        }
-
-        // Remove trailing null terminator if present
-        if (!output.empty() && output.back() == L'\0') {
-            output.pop_back();
-        }
-
-        // Additional safety: resize to actual length
-        if (resultLength > 0 && resultLength <= output.size()) {
-            output.resize(resultLength - 1); // -1 for null terminator
-        }
-
-        return output;
+        SS_LOG_WARN(L"SystemUtils", L"ExpandEnv: environment unstable after retries");
+        return input;
 #else
         return ToWString(s);
 #endif
@@ -1110,18 +1129,13 @@ namespace SystemUtils {
             return L"";
         }
 
-        // Get the name
+        // Get the name (bufferSize updated to chars written, excluding null)
         if (!::GetComputerNameExW(ComputerNameDnsFullyQualified, name.data(), &bufferSize)) {
             SS_LOG_LAST_ERROR(L"SystemUtils", L"GetComputerNameExW(FQDN) failed");
             return L"";
         }
 
-        // Remove trailing null if present
-        if (!name.empty() && name.back() == L'\0') {
-            name.pop_back();
-        }
-
-        // Resize to actual length
+        // Resize to actual length returned by API (excludes null terminator)
         name.resize(bufferSize);
 
         return name;
@@ -1157,18 +1171,13 @@ namespace SystemUtils {
             return L"";
         }
 
-        // Get the name
+        // Get the name (bufferSize updated to chars written, excluding null)
         if (!::GetComputerNameExW(ComputerNameDnsHostname, name.data(), &bufferSize)) {
             SS_LOG_LAST_ERROR(L"SystemUtils", L"GetComputerNameExW(Host) failed");
             return L"";
         }
 
-        // Remove trailing null if present
-        if (!name.empty() && name.back() == L'\0') {
-            name.pop_back();
-        }
-
-        // Resize to actual length
+        // Resize to actual length returned by API (excludes null terminator)
         name.resize(bufferSize);
 
         return name;
@@ -1183,22 +1192,12 @@ namespace SystemUtils {
 
     bool SetProcessDpiAwarePerMonitorV2() noexcept {
 #ifdef _WIN32
-        // Load user32.dll - use LoadLibraryW for explicit loading
-        HMODULE hUser32 = ::LoadLibraryW(L"user32.dll");
+        // user32.dll is always loaded in Windows GUI/service processes — no need for LoadLibrary
+        HMODULE hUser32 = ::GetModuleHandleW(L"user32.dll");
         if (hUser32 == nullptr) {
-            SS_LOG_LAST_ERROR(L"SystemUtils", L"LoadLibraryW(user32.dll) failed");
+            SS_LOG_WARN(L"SystemUtils", L"user32.dll not loaded — DPI awareness unavailable");
             return false;
         }
-
-        // RAII wrapper for FreeLibrary
-        struct ModuleGuard {
-            HMODULE m_module;
-            explicit ModuleGuard(HMODULE m) noexcept : m_module(m) {}
-            ~ModuleGuard() noexcept { if (m_module) ::FreeLibrary(m_module); }
-            ModuleGuard(const ModuleGuard&) = delete;
-            ModuleGuard& operator=(const ModuleGuard&) = delete;
-        };
-        ModuleGuard moduleGuard(hUser32);
 
         // Try SetProcessDpiAwarenessContext (Windows 10 1703+)
         using SetProcessDpiAwarenessContext_t = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
@@ -1309,23 +1308,9 @@ namespace SystemUtils {
 
     bool QueryBootTime(FILETIME& bootTimeUtc) noexcept {
 #ifdef _WIN32
-        // Get current system time in UTC
+        // Get current system time in UTC using cached high-precision function
         FILETIME currentTime{};
-
-        // Prefer GetSystemTimePreciseAsFileTime for higher precision (Win8+)
-        HMODULE hKernel = ::GetModuleHandleW(L"kernel32.dll");
-        if (hKernel != nullptr) {
-            using GetSystemTimePreciseAsFileTime_t = VOID(WINAPI*)(LPFILETIME);
-            auto pPrecise = reinterpret_cast<GetSystemTimePreciseAsFileTime_t>(
-                ::GetProcAddress(hKernel, "GetSystemTimePreciseAsFileTime"));
-            if (pPrecise != nullptr) {
-                pPrecise(&currentTime);
-            } else {
-                ::GetSystemTimeAsFileTime(&currentTime);
-            }
-        } else {
-            ::GetSystemTimeAsFileTime(&currentTime);
-        }
+        GetSystemTimeHighPrecision(currentTime);
 
         // Convert to ULARGE_INTEGER for arithmetic
         ULARGE_INTEGER currentTimeValue{};
@@ -1337,12 +1322,10 @@ namespace SystemUtils {
         ULONGLONG uptime100ns = uptimeMs * 10000ULL;
 
         // Calculate boot time (current time - uptime)
-        // Handle potential underflow (shouldn't happen, but defensive programming)
         ULARGE_INTEGER bootTimeValue{};
         if (currentTimeValue.QuadPart >= uptime100ns) {
             bootTimeValue.QuadPart = currentTimeValue.QuadPart - uptime100ns;
         } else {
-            // This shouldn't happen, but set to 0 if it does
             bootTimeValue.QuadPart = 0;
             SS_LOG_WARN(L"SystemUtils", L"QueryBootTime: uptime exceeds current time (clock skew?)");
         }
