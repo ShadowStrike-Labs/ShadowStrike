@@ -86,6 +86,22 @@ namespace ShadowStrike {
 					return htonl(host);
 				}
 
+				// RAII guard for BSTR — prevents SysAllocString memory leaks
+				struct BstrGuard {
+					BSTR bstr;
+					explicit BstrGuard(const wchar_t* s) noexcept : bstr(::SysAllocString(s)) {
+						if (!bstr && s && *s) SS_LOG_ERROR(L"NetworkUtils: SysAllocString OOM");
+					}
+					explicit BstrGuard(const std::wstring& s) noexcept : bstr(::SysAllocString(s.c_str())) {
+						if (!bstr && !s.empty()) SS_LOG_ERROR(L"NetworkUtils: SysAllocString OOM");
+					}
+					~BstrGuard() { if (bstr) ::SysFreeString(bstr); }
+					[[nodiscard]] bool valid() const noexcept { return bstr != nullptr; }
+					operator BSTR() const noexcept { return bstr; }
+					BstrGuard(const BstrGuard&) = delete;
+					BstrGuard& operator=(const BstrGuard&) = delete;
+				};
+
 			} // namespace Internal
 
 			// ============================================================================
@@ -95,6 +111,7 @@ namespace ShadowStrike {
 			bool GetNetworkAdapters(std::vector<NetworkAdapterInfo>& adapters, Error* err) noexcept {
 				try {
 					adapters.clear();
+					SS_LOG_DEBUG(L"NetworkUtils: GetNetworkAdapters enumeration started");
 
 					ULONG bufferSize = 15000;
 					std::vector<uint8_t> buffer(bufferSize);
@@ -139,12 +156,14 @@ namespace ShadowStrike {
 						for (PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pAdapter->FirstUnicastAddress;
 							pUnicast != nullptr; pUnicast = pUnicast->Next) {
 
-							if (pUnicast->Address.lpSockaddr->sa_family == AF_INET) {
+							if (pUnicast->Address.lpSockaddr != nullptr &&
+								pUnicast->Address.lpSockaddr->sa_family == AF_INET) {
 								auto* sa = reinterpret_cast<sockaddr_in*>(pUnicast->Address.lpSockaddr);
 								uint32_t addr = Internal::NetworkToHost32(sa->sin_addr.s_addr);
 								info.ipAddresses.emplace_back(IPv4Address(addr));
 							}
-							else if (pUnicast->Address.lpSockaddr->sa_family == AF_INET6) {
+							else if (pUnicast->Address.lpSockaddr != nullptr &&
+								pUnicast->Address.lpSockaddr->sa_family == AF_INET6) {
 								auto* sa6 = reinterpret_cast<sockaddr_in6*>(pUnicast->Address.lpSockaddr);
 								std::array<uint8_t, 16> bytes;
 								std::memcpy(bytes.data(), &sa6->sin6_addr, 16);
@@ -156,12 +175,14 @@ namespace ShadowStrike {
 						for (PIP_ADAPTER_GATEWAY_ADDRESS pGateway = pAdapter->FirstGatewayAddress;
 							pGateway != nullptr; pGateway = pGateway->Next) {
 
-							if (pGateway->Address.lpSockaddr->sa_family == AF_INET) {
+							if (pGateway->Address.lpSockaddr != nullptr &&
+								pGateway->Address.lpSockaddr->sa_family == AF_INET) {
 								auto* sa = reinterpret_cast<sockaddr_in*>(pGateway->Address.lpSockaddr);
 								uint32_t addr = Internal::NetworkToHost32(sa->sin_addr.s_addr);
 								info.gatewayAddresses.emplace_back(IPv4Address(addr));
 							}
-							else if (pGateway->Address.lpSockaddr->sa_family == AF_INET6) {
+							else if (pGateway->Address.lpSockaddr != nullptr &&
+								pGateway->Address.lpSockaddr->sa_family == AF_INET6) {
 								auto* sa6 = reinterpret_cast<sockaddr_in6*>(pGateway->Address.lpSockaddr);
 								std::array<uint8_t, 16> bytes;
 								std::memcpy(bytes.data(), &sa6->sin6_addr, 16);
@@ -173,12 +194,14 @@ namespace ShadowStrike {
 						for (PIP_ADAPTER_DNS_SERVER_ADDRESS pDns = pAdapter->FirstDnsServerAddress;
 							pDns != nullptr; pDns = pDns->Next) {
 
-							if (pDns->Address.lpSockaddr->sa_family == AF_INET) {
+							if (pDns->Address.lpSockaddr != nullptr &&
+								pDns->Address.lpSockaddr->sa_family == AF_INET) {
 								auto* sa = reinterpret_cast<sockaddr_in*>(pDns->Address.lpSockaddr);
 								uint32_t addr = Internal::NetworkToHost32(sa->sin_addr.s_addr);
 								info.dnsServers.emplace_back(IPv4Address(addr));
 							}
-							else if (pDns->Address.lpSockaddr->sa_family == AF_INET6) {
+							else if (pDns->Address.lpSockaddr != nullptr &&
+								pDns->Address.lpSockaddr->sa_family == AF_INET6) {
 								auto* sa6 = reinterpret_cast<sockaddr_in6*>(pDns->Address.lpSockaddr);
 								std::array<uint8_t, 16> bytes;
 								std::memcpy(bytes.data(), &sa6->sin6_addr, 16);
@@ -193,6 +216,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in GetNetworkAdapters");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetNetworkAdapters");
 					return false;
 				}
@@ -260,6 +284,7 @@ namespace ShadowStrike {
 
 			bool EnableNetworkAdapter(const std::wstring& adapterName, Error* err) noexcept {
 				try {
+					SS_LOG_INFO(L"NetworkUtils: EnableNetworkAdapter requested for '%%.*s'", static_cast<int>(adapterName.size()), adapterName.c_str());
 					// ====================================================================
 					// VALIDATION: Adapter name cannot be empty
 					// ====================================================================
@@ -295,10 +320,11 @@ namespace ShadowStrike {
 					// STEP 1: Initialize COM for WMI (Windows Management Instrumentation)
 					// ====================================================================
 					HRESULT hr = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-					bool comInitialized = SUCCEEDED(hr);
+					bool comInitialized = (hr == S_OK);
 
-					// If already initialized, S_FALSE is returned - that's OK
-					if (hr != S_OK && hr != S_FALSE && FAILED(hr)) {
+					// S_OK = success, S_FALSE = already initialized, RPC_E_CHANGED_MODE = different apartment
+					if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+						SS_LOG_ERROR(L"NetworkUtils: EnableNetworkAdapter CoInitializeEx failed hr=0x%%08X", hr);
 						Internal::SetError(err, hr, L"CoInitializeEx failed");
 						return false;
 					}
@@ -363,8 +389,9 @@ namespace ShadowStrike {
 					// STEP 4: Connect to WMI namespace
 					// ====================================================================
 					IWbemServices* pSvc = nullptr;
+					Internal::BstrGuard bstrNamespace(L"ROOT\\CIMV2");
 					hr = pLoc->ConnectServer(
-						::SysAllocString(L"ROOT\\CIMV2"),  // WMI namespace
+						bstrNamespace,
 						nullptr,                            // User name (use current)
 						nullptr,                            // Password (use current)
 						nullptr,                            // Locale
@@ -420,9 +447,11 @@ namespace ShadowStrike {
 					std::wstring query = L"SELECT * FROM Win32_NetworkAdapter WHERE NetConnectionID = '" + escapedName + L"'";
 
 					IEnumWbemClassObject* pEnumerator = nullptr;
+					Internal::BstrGuard bstrWql(L"WQL");
+					Internal::BstrGuard bstrQuery(query);
 					hr = pSvc->ExecQuery(
-						::SysAllocString(L"WQL"),
-						::SysAllocString(query.c_str()),
+						bstrWql,
+						bstrQuery,
 						WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
 						nullptr,
 						&pEnumerator
@@ -482,8 +511,9 @@ namespace ShadowStrike {
 					// STEP 9: Enable the adapter by calling Enable method
 					// ====================================================================
 					IWbemClassObject* pClass = nullptr;
+					Internal::BstrGuard bstrClassName(L"Win32_NetworkAdapter");
 					hr = pSvc->GetObject(
-						::SysAllocString(L"Win32_NetworkAdapter"),
+						bstrClassName,
 						0,
 						nullptr,
 						&pClass,
@@ -533,9 +563,10 @@ namespace ShadowStrike {
 
 					// Execute Enable method
 					IWbemClassObject* pOutParams = nullptr;
+					Internal::BstrGuard bstrMethodEnable(L"Enable");
 					hr = pSvc->ExecMethod(
 						objectPath,
-						::SysAllocString(L"Enable"),
+						bstrMethodEnable,
 						0,
 						nullptr,
 						nullptr,
@@ -599,6 +630,7 @@ namespace ShadowStrike {
 
 			bool DisableNetworkAdapter(const std::wstring& adapterName, Error* err) noexcept {
 				try {
+					SS_LOG_INFO(L"NetworkUtils: DisableNetworkAdapter requested for '%%.*s'", static_cast<int>(adapterName.size()), adapterName.c_str());
 					// ====================================================================
 					// VALIDATION: Adapter name cannot be empty
 					// ====================================================================
@@ -634,9 +666,11 @@ namespace ShadowStrike {
 					// STEP 1: Initialize COM
 					// ====================================================================
 					HRESULT hr = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-					bool comInitialized = SUCCEEDED(hr);
+					bool comInitialized = (hr == S_OK);
 
-					if (hr != S_OK && hr != S_FALSE && FAILED(hr)) {
+					// S_OK = success, S_FALSE = already initialized, RPC_E_CHANGED_MODE = different apartment
+					if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+						SS_LOG_ERROR(L"NetworkUtils: DisableNetworkAdapter CoInitializeEx failed hr=0x%%08X", hr);
 						Internal::SetError(err, hr, L"CoInitializeEx failed");
 						return false;
 					}
@@ -698,8 +732,9 @@ namespace ShadowStrike {
 					// STEP 4: Connect to WMI
 					// ====================================================================
 					IWbemServices* pSvc = nullptr;
+					Internal::BstrGuard bstrNamespace(L"ROOT\\CIMV2");
 					hr = pLoc->ConnectServer(
-						::SysAllocString(L"ROOT\\CIMV2"),
+						bstrNamespace,
 						nullptr,
 						nullptr,
 						nullptr,
@@ -753,9 +788,11 @@ namespace ShadowStrike {
 					std::wstring query = L"SELECT * FROM Win32_NetworkAdapter WHERE NetConnectionID = '" + escapedName + L"'";
 
 					IEnumWbemClassObject* pEnumerator = nullptr;
+					Internal::BstrGuard bstrWql(L"WQL");
+					Internal::BstrGuard bstrQuery(query);
 					hr = pSvc->ExecQuery(
-						::SysAllocString(L"WQL"),
-						::SysAllocString(query.c_str()),
+						bstrWql,
+						bstrQuery,
 						WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
 						nullptr,
 						&pEnumerator
@@ -813,8 +850,9 @@ namespace ShadowStrike {
 					// STEP 9: Disable the adapter
 					// ====================================================================
 					IWbemClassObject* pClass = nullptr;
+					Internal::BstrGuard bstrClassName(L"Win32_NetworkAdapter");
 					hr = pSvc->GetObject(
-						::SysAllocString(L"Win32_NetworkAdapter"),
+						bstrClassName,
 						0,
 						nullptr,
 						&pClass,
@@ -860,9 +898,10 @@ namespace ShadowStrike {
 					BSTR objectPath = vtProp.bstrVal;
 
 					IWbemClassObject* pOutParams = nullptr;
+					Internal::BstrGuard bstrMethodDisable(L"Disable");
 					hr = pSvc->ExecMethod(
 						objectPath,
-						::SysAllocString(L"Disable"),
+						bstrMethodDisable,
 						0,
 						nullptr,
 						nullptr,
@@ -920,6 +959,7 @@ namespace ShadowStrike {
 
 			bool RenewDhcpLease(const std::wstring& adapterName, Error* err) noexcept {
 				try {
+					SS_LOG_INFO(L"NetworkUtils: RenewDhcpLease requested for '%%.*s'", static_cast<int>(adapterName.size()), adapterName.c_str());
 					// ====================================================================
 					// VALIDATION: Adapter name
 					// ====================================================================
@@ -966,24 +1006,19 @@ namespace ShadowStrike {
 					}
 
 					// ====================================================================
-					// STEP 2: Release current DHCP lease
+					// STEP 2: Release current DHCP lease for specific adapter
 					// ====================================================================
-					DWORD result = ::IpReleaseAddress(nullptr); // Release all adapters first
-
-					// Then specifically target our adapter
 					IP_ADAPTER_INDEX_MAP adapterInfo{};
 					adapterInfo.Index = interfaceIndex;
 
-					result = ::IpReleaseAddress(&adapterInfo);
+					DWORD result = ::IpReleaseAddress(&adapterInfo);
 					if (result != NO_ERROR && result != ERROR_INVALID_PARAMETER) {
 						Internal::SetError(err, result, L"IpReleaseAddress failed");
 						return false;
 					}
 
-					// ====================================================================
-					// STEP 3: Brief delay to allow release to complete
-					// ====================================================================
-					::Sleep(500);
+					// Brief delay for DHCP release to propagate before renewal
+					::SleepEx(500, TRUE);
 
 					// ====================================================================
 					// STEP 4: Renew DHCP lease
@@ -997,7 +1032,8 @@ namespace ShadowStrike {
 					// ====================================================================
 					// STEP 5: Verify renewal by checking for valid IP
 					// ====================================================================
-					::Sleep(1000); // Wait for DHCP negotiation
+					// Wait for DHCP negotiation to complete before verification
+					::SleepEx(1000, TRUE);
 
 					std::vector<NetworkAdapterInfo> updatedAdapters;
 					if (GetNetworkAdapters(updatedAdapters, nullptr)) {
@@ -1046,6 +1082,7 @@ namespace ShadowStrike {
 
 			bool ReleaseDhcpLease(const std::wstring& adapterName, Error* err) noexcept {
 				try {
+					SS_LOG_INFO(L"NetworkUtils: ReleaseDhcpLease requested for '%%.*s'", static_cast<int>(adapterName.size()), adapterName.c_str());
 					// ====================================================================
 					// VALIDATION
 					// ====================================================================
@@ -1105,7 +1142,8 @@ namespace ShadowStrike {
 					// ====================================================================
 					// STEP 3: Verify release by checking IP addresses
 					// ====================================================================
-					::Sleep(500);
+						// Brief delay for DHCP release to propagate before verification
+					::SleepEx(500, TRUE);
 
 					std::vector<NetworkAdapterInfo> updatedAdapters;
 					if (GetNetworkAdapters(updatedAdapters, nullptr)) {
@@ -1156,31 +1194,31 @@ namespace ShadowStrike {
 			}
 
 			bool FlushDnsCache(Error* err) noexcept {
-				// DnsFlushResolverCache may not be available on all Windows versions
-				// Use ipconfig /flushdns via system command as fallback
 				HMODULE hDnsapi = ::LoadLibraryW(L"dnsapi.dll");
-				if (hDnsapi) {
-					typedef BOOL(WINAPI* DnsFlushResolverCacheFunc)();
-					auto pDnsFlushResolverCache = reinterpret_cast<DnsFlushResolverCacheFunc>(
-						::GetProcAddress(hDnsapi, "DnsFlushResolverCache"));
-
-					if (pDnsFlushResolverCache) {
-						BOOL result = pDnsFlushResolverCache();
-						::FreeLibrary(hDnsapi);
-						if (result) {
-							return true;
-						}
-					}
-					::FreeLibrary(hDnsapi);
+				if (!hDnsapi) {
+					SS_LOG_ERROR(L"NetworkUtils: FlushDnsCache failed — dnsapi.dll not found");
+					Internal::SetError(err, ::GetLastError(), L"Failed to load dnsapi.dll");
+					return false;
 				}
 
-				// Fallback: use system command
-				int result = ::_wsystem(L"ipconfig /flushdns >nul 2>&1");
-				if (result == 0) {
+				typedef BOOL(WINAPI* DnsFlushResolverCacheFunc)();
+				auto pDnsFlushResolverCache = reinterpret_cast<DnsFlushResolverCacheFunc>(
+					::GetProcAddress(hDnsapi, "DnsFlushResolverCache"));
+
+				bool success = false;
+				if (pDnsFlushResolverCache) {
+					success = !!pDnsFlushResolverCache();
+				}
+
+				::FreeLibrary(hDnsapi);
+
+				if (success) {
+					SS_LOG_INFO(L"NetworkUtils: DNS resolver cache flushed successfully");
 					return true;
 				}
 
-				Internal::SetError(err, ::GetLastError(), L"Failed to flush DNS cache");
+				SS_LOG_ERROR(L"NetworkUtils: FlushDnsCache failed — DnsFlushResolverCache unavailable or returned FALSE");
+				Internal::SetError(err, ERROR_PROC_NOT_FOUND, L"DnsFlushResolverCache not available or failed");
 				return false;
 			}
 			// ============================================================================
@@ -1190,16 +1228,21 @@ namespace ShadowStrike {
 			bool GetRoutingTable(std::vector<RouteEntry>& routes, Error* err) noexcept {
 				try {
 					routes.clear();
+					SS_LOG_DEBUG(L"NetworkUtils: GetRoutingTable enumeration started");
 
-					// IPv4 Routing Table
-					ULONG size = 0;
+					// IPv4 Routing Table (retry loop guards against TOCTOU size race)
+					DWORD result = ERROR_INSUFFICIENT_BUFFER;
+					std::vector<uint8_t> buffer;
+					for (int retry = 0; retry < 3 && result == ERROR_INSUFFICIENT_BUFFER; ++retry) {
+						ULONG size = 0;
 #pragma warning(suppress: 6387)
-					::GetIpForwardTable(nullptr, &size, FALSE);
+						::GetIpForwardTable(nullptr, &size, FALSE);
+						if (size == 0) break;
+						buffer.resize(size);
+						result = ::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data()), &size, FALSE);
+					}
 
-					std::vector<uint8_t> buffer(size);
-					DWORD result = ::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data()), &size, FALSE);
-
-					if (result == NO_ERROR) {
+					if (result == NO_ERROR && !buffer.empty()) {
 						auto* pTable = reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data());
 
 						for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
@@ -1281,15 +1324,19 @@ namespace ShadowStrike {
 					routes.clear();
 
 					if (family == AF_INET) {
-						// IPv4 only
-						ULONG size = 0;
+						// IPv4 only (retry loop guards against TOCTOU size race)
+						DWORD result = ERROR_INSUFFICIENT_BUFFER;
+						std::vector<uint8_t> buffer;
+						for (int retry = 0; retry < 3 && result == ERROR_INSUFFICIENT_BUFFER; ++retry) {
+							ULONG size = 0;
 #pragma warning(suppress: 6387)
-						::GetIpForwardTable(nullptr, &size, FALSE);
+							::GetIpForwardTable(nullptr, &size, FALSE);
+							if (size == 0) break;
+							buffer.resize(size);
+							result = ::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data()), &size, FALSE);
+						}
 
-						std::vector<uint8_t> buffer(size);
-						DWORD result = ::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data()), &size, FALSE);
-
-						if (result != NO_ERROR) {
+						if (result != NO_ERROR || buffer.empty()) {
 							Internal::SetError(err, result, L"GetIpForwardTable failed");
 							return false;
 						}
@@ -1371,6 +1418,7 @@ namespace ShadowStrike {
 
 			bool AddRoute(const IpAddress& destination, uint8_t prefixLength, const IpAddress& gateway, Error* err) noexcept {
 				try {
+					SS_LOG_INFO(L"NetworkUtils: AddRoute requested prefixLen=%%u", static_cast<unsigned>(prefixLength));
 					// Check if both addresses are same IP version
 					if (destination.IsIPv4() != gateway.IsIPv4()) {
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Destination and gateway must be same IP version");
@@ -1424,16 +1472,16 @@ namespace ShadowStrike {
 						auto* destIpv6 = destination.AsIPv6();
 						auto* gwIpv6 = gateway.AsIPv6();
 
+						if (prefixLength > 128) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid prefix length for IPv6");
+							return false;
+						}
+
 						// Destination prefix
 						route.DestinationPrefix.Prefix.si_family = AF_INET6;
 						const auto& destBytes = destIpv6->bytes;
 						std::memcpy(route.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte, destBytes.data(), 16);
 						route.DestinationPrefix.PrefixLength = prefixLength;
-
-						if (prefixLength > 128) {
-							Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid prefix length for IPv6");
-							return false;
-						}
 
 						// Next hop (gateway)
 						route.NextHop.si_family = AF_INET6;
@@ -1466,6 +1514,7 @@ namespace ShadowStrike {
 
 			bool DeleteRoute(const IpAddress& destination, uint8_t prefixLength, Error* err) noexcept {
 				try {
+					SS_LOG_INFO(L"NetworkUtils: DeleteRoute requested prefixLen=%%u", static_cast<unsigned>(prefixLength));
 					if (destination.IsIPv4()) {
 						// IPv4 Route Deletion
 						MIB_IPFORWARDROW route = {};
