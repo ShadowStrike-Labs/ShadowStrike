@@ -160,10 +160,10 @@
 #  define __FLT_USER_STRUCTURES_H__
 #endif
 
-#include "../../Drivers/Shared/MessageProtocol.h"
-#include "../../Drivers/Shared/MessageTypes.h"
-#include "../../Drivers/Shared/VerdictTypes.h"
-#include "../../Drivers/Shared/PortName.h"
+#include "../../PhantomSensor/Shared/MessageProtocol.h"
+#include "../../PhantomSensor/Shared/MessageTypes.h"
+#include "../../PhantomSensor/Shared/VerdictTypes.h"
+#include "../../PhantomSensor/Shared/PortName.h"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -632,6 +632,7 @@ struct IPCConfiguration {
 // CALLBACK TYPES
 // ============================================================================
 
+#define SS_IPC_CALLBACK_TYPES_DEFINED
 using FileScanCallback = std::function<SHADOWSTRIKE_SCAN_VERDICT(const FILE_SCAN_REQUEST&)>;
 using ProcessNotifyCallback = std::function<SHADOWSTRIKE_SCAN_VERDICT(const ProcessNotifyRequest&)>;
 using ImageLoadCallback = std::function<SHADOWSTRIKE_SCAN_VERDICT(const ImageLoadRequest&)>;

@@ -296,13 +296,13 @@ bool ReportGeneratorImpl::Initialize(const ReportConfiguration& config) {
     ReportModuleStatus expected = ReportModuleStatus::Uninitialized;
     if (!m_status.compare_exchange_strong(expected, ReportModuleStatus::Initializing,
                                           std::memory_order_acq_rel)) {
-        SS_LOG_WARN("ReportGen", "Already initialized (status={})",
+        SS_LOG_WARN(L"ReportGen", L"Already initialized (status=%d)",
                     static_cast<int>(expected));
         return false;
     }
 
     if (!config.IsValid()) {
-        SS_LOG_ERROR("ReportGen", "Invalid configuration");
+        SS_LOG_ERROR(L"ReportGen", L"Invalid configuration");
         m_status.store(ReportModuleStatus::Error, std::memory_order_release);
         return false;
     }
@@ -331,9 +331,9 @@ bool ReportGeneratorImpl::Initialize(const ReportConfiguration& config) {
     m_initialized.store(true, std::memory_order_release);
     m_status.store(ReportModuleStatus::Running, std::memory_order_release);
 
-    SS_LOG_INFO("ReportGen", "Initialized — output={}, format={}, retention={}d",
-                WideToUtf8(config.outputDirectory.wstring()),
-                GetFormatName(config.defaultFormat),
+    SS_LOG_INFO(L"ReportGen", L"Initialized — output=%s, format=%s, retention=%dd",
+                WideToUtf8(config.outputDirectory.wstring()).c_str(),
+                GetFormatName(config.defaultFormat).data(),
                 config.retentionDays);
     return true;
 }
@@ -373,7 +373,7 @@ void ReportGeneratorImpl::Shutdown() {
 
     m_initialized.store(false, std::memory_order_release);
     m_status.store(ReportModuleStatus::Stopped, std::memory_order_release);
-    SS_LOG_INFO("ReportGen", "Shutdown complete");
+    SS_LOG_INFO(L"ReportGen", L"Shutdown complete");
 }
 
 bool ReportGeneratorImpl::UpdateConfiguration(const ReportConfiguration& config) {
@@ -393,7 +393,7 @@ ReportConfiguration ReportGeneratorImpl::GetConfiguration() const {
 // ============================================================================
 
 void ReportGeneratorImpl::WorkerLoop() {
-    SS_LOG_DEBUG("ReportGen", "Worker thread started");
+    SS_LOG_DEBUG(L"ReportGen", L"Worker thread started");
 
     while (m_running.load(std::memory_order_acquire)) {
         ReportJob job;
@@ -426,7 +426,7 @@ void ReportGeneratorImpl::WorkerLoop() {
         NotifyCompletion(job);
     }
 
-    SS_LOG_DEBUG("ReportGen", "Worker thread exiting");
+    SS_LOG_DEBUG(L"ReportGen", L"Worker thread exiting");
 }
 
 void ReportGeneratorImpl::ExecuteJob(ReportJob& job) {
@@ -494,16 +494,16 @@ void ReportGeneratorImpl::ExecuteJob(ReportJob& job) {
         ArchiveReport(job);
         NotifyProgress(job.jobId, 100);
 
-        SS_LOG_INFO("ReportGen", "Report generated: {} ({}, {}ms, {})",
-                    WideToUtf8(job.outputPath.wstring()),
-                    GetFormatName(job.format),
-                    elapsedMs, FormatFileSize(job.fileSize));
+        SS_LOG_INFO(L"ReportGen", L"Report generated: %s (%s, %llums, %s)",
+                    WideToUtf8(job.outputPath.wstring()).c_str(),
+                    GetFormatName(job.format).data(),
+                    elapsedMs, FormatFileSize(job.fileSize).c_str());
 
     } catch (const std::exception& ex) {
         job.status = ReportStatus::Failed;
         job.errorMessage = std::string("Exception: ") + ex.what();
         m_stats.reportsFailed.fetch_add(1, std::memory_order_relaxed);
-        SS_LOG_ERROR("ReportGen", "Report generation failed: {}", ex.what());
+        SS_LOG_ERROR(L"ReportGen", L"Report generation failed: %s", ex.what());
         NotifyError(job.errorMessage, -3);
     }
 
@@ -515,7 +515,7 @@ void ReportGeneratorImpl::ExecuteJob(ReportJob& job) {
 // ============================================================================
 
 void ReportGeneratorImpl::SchedulerLoop() {
-    SS_LOG_DEBUG("ReportGen", "Scheduler thread started");
+    SS_LOG_DEBUG(L"ReportGen", L"Scheduler thread started");
 
     while (m_running.load(std::memory_order_acquire)) {
         {
@@ -567,12 +567,12 @@ void ReportGeneratorImpl::SchedulerLoop() {
         for (const auto& sched : dueSchedules) {
             auto range = CalculateTimeRange(sched.period);
             GenerateReportAsync(sched.reportType, sched.format, range, "");
-            SS_LOG_INFO("ReportGen", "Scheduled report triggered: {} ({})",
-                        sched.scheduleId, GetReportTypeName(sched.reportType));
+            SS_LOG_INFO(L"ReportGen", L"Scheduled report triggered: %s (%s)",
+                        sched.scheduleId.c_str(), GetReportTypeName(sched.reportType).data());
         }
     }
 
-    SS_LOG_DEBUG("ReportGen", "Scheduler thread exiting");
+    SS_LOG_DEBUG(L"ReportGen", L"Scheduler thread exiting");
 }
 
 // ============================================================================
@@ -600,7 +600,7 @@ std::optional<fs::path> ReportGeneratorImpl::GenerateReport(
     const std::string& /*tmpl*/) {
 
     if (!m_initialized.load(std::memory_order_acquire)) {
-        SS_LOG_ERROR("ReportGen", "Not initialized");
+        SS_LOG_ERROR(L"ReportGen", L"Not initialized");
         return std::nullopt;
     }
 
@@ -629,7 +629,7 @@ std::string ReportGeneratorImpl::GenerateReportAsync(
     const std::string& tmpl) {
 
     if (!m_initialized.load(std::memory_order_acquire)) {
-        SS_LOG_ERROR("ReportGen", "Not initialized");
+        SS_LOG_ERROR(L"ReportGen", L"Not initialized");
         return {};
     }
 
@@ -650,8 +650,8 @@ std::string ReportGeneratorImpl::GenerateReportAsync(
         m_jobCv.notify_one();
     }
 
-    SS_LOG_INFO("ReportGen", "Async report queued: {} ({}, {})",
-                jobId, GetReportTypeName(type), GetFormatName(format));
+    SS_LOG_INFO(L"ReportGen", L"Async report queued: %s (%s, %s)",
+                jobId.c_str(), GetReportTypeName(type).data(), GetFormatName(format).data());
     return jobId;
 }
 
@@ -927,13 +927,13 @@ std::string ReportGeneratorImpl::RenderFormat(
         case ReportFormat::PDF:
         case ReportFormat::RTF:
         case ReportFormat::XLSX:
-            SS_LOG_WARN("ReportGen",
-                "Format '{}' requires third-party renderer; falling back to HTML",
-                GetFormatName(format));
+            SS_LOG_WARN(L"ReportGen",
+                L"Format '%s' requires third-party renderer; falling back to HTML",
+                GetFormatName(format).data());
             return RenderHtml(meta, sections);
 
         default:
-            SS_LOG_ERROR("ReportGen", "Unknown format: {}", static_cast<int>(format));
+            SS_LOG_ERROR(L"ReportGen", L"Unknown format: %d", static_cast<int>(format));
             return {};
     }
 }
@@ -1263,8 +1263,8 @@ bool ReportGeneratorImpl::WriteReportFile(const fs::path& path, const std::strin
         maxBytes = m_config.maxReportSizeMB * 1024ULL * 1024ULL;
     }
     if (content.size() > maxBytes) {
-        SS_LOG_ERROR("ReportGen", "Report exceeds max size: {} > {} MB",
-                     FormatFileSize(content.size()), maxBytes / (1024 * 1024));
+        SS_LOG_ERROR(L"ReportGen", L"Report exceeds max size: %s > %llu MB",
+                     FormatFileSize(content.size()).c_str(), maxBytes / (1024 * 1024));
         return false;
     }
 
@@ -1315,7 +1315,7 @@ bool ReportGeneratorImpl::ExportToSiem(const fs::path& outputPath, ReportFormat 
                                        const TimeRange& range) {
     if (siemFormat != ReportFormat::CEF && siemFormat != ReportFormat::LEEF &&
         siemFormat != ReportFormat::SYSLOG) {
-        SS_LOG_ERROR("ReportGen", "Invalid SIEM format: {}", GetFormatName(siemFormat));
+        SS_LOG_ERROR(L"ReportGen", L"Invalid SIEM format: %s", GetFormatName(siemFormat).data());
         return false;
     }
     auto meta = BuildMetadata(ReportType::SecurityAudit, range);
@@ -1357,11 +1357,11 @@ bool ReportGeneratorImpl::LoadTemplates() {
         if (Utils::FileUtils::Exists(templateDir.wstring(), &fsErr)) {
             Utils::FileUtils::WalkOptions opts;
             opts.maxDepth = 1;
-            opts.followSymlinks = false;
+            opts.followReparsePoints = false;
 
             Utils::FileUtils::WalkDirectory(templateDir.wstring(), opts,
-                [this](const std::wstring& path, const Utils::FileUtils::FileStat& stat) -> bool {
-                    if (stat.isDirectory) return true;
+                [this](const std::wstring& path, const WIN32_FIND_DATAW& fd) -> bool {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return true;
                     // Only load .html template files
                     if (path.size() >= 5 && path.substr(path.size() - 5) == L".html") {
                         ReportTemplate tmpl;
@@ -1378,7 +1378,7 @@ bool ReportGeneratorImpl::LoadTemplates() {
         }
     }
 
-    SS_LOG_INFO("ReportGen", "Loaded {} templates ({} custom)",
+    SS_LOG_INFO(L"ReportGen", L"Loaded %zu templates (%lld custom)",
                 m_templates.size(),
                 std::count_if(m_templates.begin(), m_templates.end(),
                               [](const ReportTemplate& t) { return !t.isBuiltIn; }));
@@ -1402,15 +1402,15 @@ std::vector<ReportTemplate> ReportGeneratorImpl::GetTemplates(
 bool ReportGeneratorImpl::ImportTemplate(const fs::path& templatePath) {
     Utils::FileUtils::Error fsErr;
     if (!Utils::FileUtils::Exists(templatePath.wstring(), &fsErr)) {
-        SS_LOG_ERROR("ReportGen", "Template file not found: {}",
-                     WideToUtf8(templatePath.wstring()));
+        SS_LOG_ERROR(L"ReportGen", L"Template file not found: %s",
+                     WideToUtf8(templatePath.wstring()).c_str());
         return false;
     }
 
     std::string content;
     if (!Utils::FileUtils::ReadAllTextUtf8(templatePath.wstring(), content, &fsErr)) {
-        SS_LOG_ERROR("ReportGen", "Failed to read template: {}",
-                     WideToUtf8(templatePath.wstring()));
+        SS_LOG_ERROR(L"ReportGen", L"Failed to read template: %s",
+                     WideToUtf8(templatePath.wstring()).c_str());
         return false;
     }
 
@@ -1425,7 +1425,7 @@ bool ReportGeneratorImpl::ImportTemplate(const fs::path& templatePath) {
     std::unique_lock lock(m_templatesMutex);
     m_templates.push_back(std::move(tmpl));
 
-    SS_LOG_INFO("ReportGen", "Template imported: {}", tmpl.name);
+    SS_LOG_INFO(L"ReportGen", L"Template imported: %s", tmpl.name.c_str());
     return true;
 }
 
@@ -1435,7 +1435,7 @@ bool ReportGeneratorImpl::DeleteTemplate(const std::string& templateId) {
         [&](const ReportTemplate& t) { return t.templateId == templateId; });
     if (it == m_templates.end()) return false;
     if (it->isBuiltIn) {
-        SS_LOG_WARN("ReportGen", "Cannot delete built-in template: {}", templateId);
+        SS_LOG_WARN(L"ReportGen", L"Cannot delete built-in template: %s", templateId.c_str());
         return false;
     }
     m_templates.erase(it);
@@ -1457,7 +1457,7 @@ std::string ReportGeneratorImpl::CreateSchedule(const ReportSchedule& schedule) 
     std::unique_lock lock(m_schedulesMutex);
     m_schedules.push_back(std::move(sched));
 
-    SS_LOG_INFO("ReportGen", "Schedule created: {}", sched.scheduleId);
+    SS_LOG_INFO(L"ReportGen", L"Schedule created: %s", sched.scheduleId.c_str());
     return sched.scheduleId;
 }
 
@@ -1532,13 +1532,13 @@ ThreatStatistics ReportGeneratorImpl::GetThreatStatistics(const TimeRange& /*ran
     ThreatStatistics stats;
     // Data aggregation placeholder — will be wired to ScanEngine / ThreatDB
     // when those modules are implemented. Logs a warning so the gap is visible.
-    SS_LOG_DEBUG("ReportGen", "GetThreatStatistics: data sources not yet wired");
+    SS_LOG_DEBUG(L"ReportGen", L"GetThreatStatistics: data sources not yet wired");
     return stats;
 }
 
 ScanStatistics ReportGeneratorImpl::GetScanStatistics(const TimeRange& /*range*/) {
     ScanStatistics stats;
-    SS_LOG_DEBUG("ReportGen", "GetScanStatistics: data sources not yet wired");
+    SS_LOG_DEBUG(L"ReportGen", L"GetScanStatistics: data sources not yet wired");
     return stats;
 }
 
@@ -1671,18 +1671,17 @@ size_t ReportGeneratorImpl::CleanupArchives(uint32_t olderThanDays) {
     Utils::FileUtils::Error fsErr;
     Utils::FileUtils::WalkOptions opts;
     opts.maxDepth = 1;
-    opts.followSymlinks = false;
+    opts.followReparsePoints = false;
 
     std::vector<std::wstring> toDelete;
 
     Utils::FileUtils::WalkDirectory(archiveDir.wstring(), opts,
-        [&](const std::wstring& path, const Utils::FileUtils::FileStat& stat) -> bool {
-            if (stat.isDirectory) return true;
+        [&](const std::wstring& path, const WIN32_FIND_DATAW& fd) -> bool {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return true;
             // Check modification time against cutoff
-            FILETIME ft;
             ULARGE_INTEGER uli;
-            uli.LowPart = stat.lastWriteTime.dwLowDateTime;
-            uli.HighPart = stat.lastWriteTime.dwHighDateTime;
+            uli.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+            uli.HighPart = fd.ftLastWriteTime.dwHighDateTime;
             // FILETIME epoch: 1601-01-01; system_clock epoch: 1970-01-01
             constexpr uint64_t kEpochDiff = 116444736000000000ULL;
             if (uli.QuadPart > kEpochDiff) {
@@ -1701,7 +1700,7 @@ size_t ReportGeneratorImpl::CleanupArchives(uint32_t olderThanDays) {
     }
 
     if (deleted > 0)
-        SS_LOG_INFO("ReportGen", "Cleaned up {} old archive files", deleted);
+        SS_LOG_INFO(L"ReportGen", L"Cleaned up %zu old archive files", deleted);
     return deleted;
 }
 
@@ -1756,7 +1755,7 @@ void ReportGeneratorImpl::NotifyCompletion(const ReportJob& job) {
 }
 
 void ReportGeneratorImpl::NotifyError(const std::string& msg, int code) {
-    SS_LOG_ERROR("ReportGen", "{}", msg);
+    SS_LOG_ERROR(L"ReportGen", L"%s", msg.c_str());
     ReportErrorCallback cb;
     {
         std::lock_guard lock(m_callbackMutex);

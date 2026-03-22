@@ -35,7 +35,7 @@
  */
 
 #include "pch.h"
-#include "MetamorphicDetector.hpp"
+#include "metamorphic_polymorphicdetector.hpp"
 #include "../PEParser/PEParser.hpp"
 #include "../PEParser/PEConstants.hpp"
 #include "../Utils/Logger.hpp"

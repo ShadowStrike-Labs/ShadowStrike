@@ -61,7 +61,7 @@ public:
      * @brief Construct a new FilterConnection
      * @param portName Name of the kernel port (e.g., L"\\ShadowStrikePort")
      */
-    explicit FilterConnection(const std::wstring& portName = SHADOWSTRIKE_PORT_NAME);
+    explicit FilterConnection(const std::wstring& portName = SS_COMM_PORT_NAME);
 
     ~FilterConnection();
 

@@ -136,7 +136,7 @@ namespace fs = std::filesystem;
     const std::wstring& originalExtension
 ) noexcept {
     try {
-        auto hashW = StringUtils::ToWideString(hash.substr(0, 16));
+        auto hashW = StringUtils::ToWide(hash.substr(0, 16));
         return hashW + QuarantineConstants::QUARANTINE_EXTENSION;
     } catch (...) {
         return L"unknown.ssqf";
@@ -265,7 +265,7 @@ public:
                 }
 
                 Logger::Info("QuarantineManager: Vault path: {}",
-                    StringUtils::ToNarrowString(m_config.vaultPath));
+                    StringUtils::ToNarrow(m_config.vaultPath));
             }
 
             // Initialize database
@@ -409,7 +409,7 @@ public:
             }
 
             // Check if executable
-            auto ext = StringUtils::ToLower(metadata.extension);
+            auto ext = StringUtils::ToLowerCopy(metadata.extension);
             metadata.isExecutable = (ext == L".exe" || ext == L".dll" ||
                                     ext == L".sys" || ext == L".scr");
 #endif
@@ -418,7 +418,7 @@ public:
             metadata.ownerSid = SystemUtils::GetFileOwnerSid(filePath);
 
             Logger::Debug("QuarantineManager: Metadata collected for {}",
-                StringUtils::ToNarrowString(metadata.fileName));
+                StringUtils::ToNarrow(metadata.fileName));
 
         } catch (const std::exception& e) {
             Logger::Error("QuarantineManager: Metadata collection failed: {}", e.what());
@@ -627,7 +627,7 @@ public:
             for (auto& proc : processes) {
                 if (!proc.canTerminate) {
                     Logger::Warn("QuarantineManager: Cannot terminate system process: {} (PID {})",
-                        StringUtils::ToNarrowString(proc.processName), proc.processId);
+                        StringUtils::ToNarrow(proc.processName), proc.processId);
                     continue;
                 }
 
@@ -649,10 +649,10 @@ public:
                     m_stats.processesTerminated.fetch_add(1, std::memory_order_relaxed);
 
                     Logger::Info("QuarantineManager: Terminated process: {} (PID {})",
-                        StringUtils::ToNarrowString(proc.processName), proc.processId);
+                        StringUtils::ToNarrow(proc.processName), proc.processId);
                 } else {
                     Logger::Warn("QuarantineManager: Failed to terminate process: {} (PID {})",
-                        StringUtils::ToNarrowString(proc.processName), proc.processId);
+                        StringUtils::ToNarrow(proc.processName), proc.processId);
                 }
             }
 
@@ -742,7 +742,7 @@ public:
 
     [[nodiscard]] bool IsSystemCriticalFile(const std::wstring& filePath) const {
         try {
-            auto pathLower = StringUtils::ToLower(filePath);
+            auto pathLower = StringUtils::ToLowerCopy(filePath);
 
             // Check for Windows system directories
             static const std::vector<std::wstring> criticalPaths = {
@@ -760,7 +760,7 @@ public:
 
             // Check for critical system files
             fs::path p(filePath);
-            auto filename = StringUtils::ToLower(p.filename().wstring());
+            auto filename = StringUtils::ToLowerCopy(p.filename().wstring());
 
             static const std::vector<std::wstring> criticalFiles = {
                 L"ntoskrnl.exe", L"hal.dll", L"ntdll.dll",
@@ -892,7 +892,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
         std::lock_guard opLock(m_impl->m_operationMutex);
 
         Logger::Info("QuarantineManager: Quarantine request for: {}",
-            StringUtils::ToNarrowString(request.filePath));
+            StringUtils::ToNarrow(request.filePath));
 
         result.originalPath = request.filePath;
 
@@ -1062,7 +1062,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
             outFile.close();
 
             Logger::Info("QuarantineManager: File written to vault: {}",
-                StringUtils::ToNarrowString(quarantinePath));
+                StringUtils::ToNarrow(quarantinePath));
 
         } catch (const std::exception& e) {
             Logger::Error("QuarantineManager: Vault write failed: {}", e.what());
@@ -1169,7 +1169,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
         m_impl->m_stats.quarantineFailures.fetch_add(1, std::memory_order_relaxed);
 
         result.status = QuarantineStatus::UnknownError;
-        result.message = StringUtils::ToWideString(
+        result.message = StringUtils::ToWide(
             std::format("Exception: {}", e.what())
         );
         return result;
@@ -1386,7 +1386,7 @@ RestoreResult QuarantineManager::RestoreFile(const RestoreRequest& request) {
             outFile.close();
 
             Logger::Info("QuarantineManager: File restored to: {}",
-                StringUtils::ToNarrowString(restorePath));
+                StringUtils::ToNarrow(restorePath));
 
         } catch (const std::exception& e) {
             Logger::Error("QuarantineManager: Restore write failed: {}", e.what());
@@ -1435,7 +1435,7 @@ RestoreResult QuarantineManager::RestoreFile(const RestoreRequest& request) {
         m_impl->m_stats.restoreFailures.fetch_add(1, std::memory_order_relaxed);
 
         result.status = QuarantineStatus::UnknownError;
-        result.message = StringUtils::ToWideString(
+        result.message = StringUtils::ToWide(
             std::format("Exception: {}", e.what())
         );
         return result;
@@ -1791,7 +1791,7 @@ size_t QuarantineManager::VerifyVaultIntegrity() {
             std::error_code ec;
             if (!fs::exists(entry.quarantinePath, ec)) {
                 Logger::Warn("QuarantineManager: Quarantine file missing: {}",
-                    StringUtils::ToNarrowString(entry.quarantinePath));
+                    StringUtils::ToNarrow(entry.quarantinePath));
                 corrupted++;
             }
         }

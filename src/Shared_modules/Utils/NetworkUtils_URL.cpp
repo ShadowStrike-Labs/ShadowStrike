@@ -96,7 +96,7 @@ namespace ShadowStrike {
 					// Input length validation — reject excessively long URLs
 					constexpr size_t MAX_URL_LENGTH = 65536;
 					if (url.empty() || url.size() > MAX_URL_LENGTH) {
-						SS_LOG_ERROR(L"NetworkUtils: ParseUrl invalid URL length=%zu", url.size());
+						SS_LOG_ERROR(L"NetworkUtils", L"ParseUrl invalid URL length=%zu", url.size());
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"URL empty or exceeds maximum length");
 						return false;
 					}
@@ -127,7 +127,7 @@ namespace ShadowStrike {
 					std::wstring urlCopy(url);
 					if (!::WinHttpCrackUrl(urlCopy.c_str(), 0, 0, &urlComp)) {
 						DWORD lastErr = ::GetLastError();
-						SS_LOG_WARN(L"NetworkUtils: WinHttpCrackUrl failed err=%lu", lastErr);
+						SS_LOG_WARN(L"NetworkUtils", L"WinHttpCrackUrl failed err=%lu", lastErr);
 						Internal::SetError(err, lastErr, L"WinHttpCrackUrl failed");
 						return false;
 					}
@@ -136,7 +136,7 @@ namespace ShadowStrike {
 					if (urlComp.dwSchemeLength >= _countof(scheme) - 1 ||
 						urlComp.dwHostNameLength >= _countof(host) - 1 ||
 						urlComp.dwUrlPathLength >= _countof(path) - 1) {
-						SS_LOG_WARN(L"NetworkUtils: URL component truncated by fixed buffer");
+						SS_LOG_WARN(L"NetworkUtils", L"URL component truncated by fixed buffer");
 						Internal::SetError(err, ERROR_BUFFER_OVERFLOW, L"URL component exceeds buffer size");
 						return false;
 					}
@@ -166,7 +166,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in ParseUrl");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in ParseUrl");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in ParseUrl");
 					return false;
 				}
@@ -234,7 +234,7 @@ namespace ShadowStrike {
 					return result;
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in BuildUrl");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in BuildUrl");
 					return std::wstring();
 				}
 			}
@@ -247,7 +247,7 @@ namespace ShadowStrike {
 
 					// Reject excessively large input to prevent DoS
 					if (str.size() > 65536 || str.size() > static_cast<size_t>(INT_MAX)) {
-						SS_LOG_ERROR(L"NetworkUtils: UrlEncode input too large length=%zu", str.size());
+						SS_LOG_ERROR(L"NetworkUtils", L"UrlEncode input too large length=%zu", str.size());
 						return std::wstring();
 					}
 
@@ -257,7 +257,7 @@ namespace ShadowStrike {
 						int utf8Len = WideCharToMultiByte(CP_UTF8, 0, str.data(),
 							static_cast<int>(str.size()), nullptr, 0, nullptr, nullptr);
 						if (utf8Len <= 0) {
-							SS_LOG_WARN(L"NetworkUtils: UrlEncode WideCharToMultiByte failed");
+							SS_LOG_WARN(L"NetworkUtils", L"UrlEncode WideCharToMultiByte failed");
 							return std::wstring();
 						}
 						utf8.resize(static_cast<size_t>(utf8Len));
@@ -284,7 +284,7 @@ namespace ShadowStrike {
 					return result;
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in UrlEncode");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in UrlEncode");
 					return std::wstring();
 				}
 			}
@@ -297,7 +297,7 @@ namespace ShadowStrike {
 
 					// Reject excessively large input
 					if (str.size() > 65536) {
-						SS_LOG_ERROR(L"NetworkUtils: UrlDecode input too large length=%zu", str.size());
+						SS_LOG_ERROR(L"NetworkUtils", L"UrlDecode input too large length=%zu", str.size());
 						return std::wstring();
 					}
 
@@ -372,7 +372,7 @@ namespace ShadowStrike {
 					int wideLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
 						utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
 					if (wideLen <= 0) {
-						SS_LOG_WARN(L"NetworkUtils: UrlDecode invalid UTF-8 sequence in URL");
+						SS_LOG_WARN(L"NetworkUtils", L"UrlDecode invalid UTF-8 sequence in URL");
 						return std::wstring();
 					}
 
@@ -383,7 +383,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in UrlDecode");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in UrlDecode");
 					return std::wstring();
 				}
 			}
@@ -526,7 +526,7 @@ namespace ShadowStrike {
 
 					// Cap input length
 					if (domain.size() > 4096) {
-						SS_LOG_WARN(L"NetworkUtils: PunycodeEncode domain too long length=%zu", domain.size());
+						SS_LOG_WARN(L"NetworkUtils", L"PunycodeEncode domain too long length=%zu", domain.size());
 						return std::wstring(domain);
 					}
 
@@ -574,7 +574,7 @@ namespace ShadowStrike {
 
 						// Overflow guard
 						if (m - n > (UINT32_MAX - delta) / (handledCount + 1)) {
-							SS_LOG_ERROR(L"NetworkUtils: PunycodeEncode overflow in delta computation");
+							SS_LOG_ERROR(L"NetworkUtils", L"PunycodeEncode overflow in delta computation");
 							return std::wstring(domain);
 						}
 						delta += (m - n) * static_cast<uint32_t>(handledCount + 1);
@@ -601,7 +601,7 @@ namespace ShadowStrike {
 									q = (q - t) / (PunycodeConstants::BASE - t);
 
 									if (result.size() > 16384) {
-										SS_LOG_ERROR(L"NetworkUtils: PunycodeEncode output too large");
+										SS_LOG_ERROR(L"NetworkUtils", L"PunycodeEncode output too large");
 										return std::wstring(domain);
 									}
 								}
@@ -622,7 +622,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in PunycodeEncode");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in PunycodeEncode");
 					return std::wstring(domain);
 				}
 			}
@@ -635,7 +635,7 @@ namespace ShadowStrike {
 
 					// Cap input length
 					if (punycode.size() > 4096) {
-						SS_LOG_WARN(L"NetworkUtils: PunycodeDecode input too long length=%zu", punycode.size());
+						SS_LOG_WARN(L"NetworkUtils", L"PunycodeDecode input too long length=%zu", punycode.size());
 						return std::wstring(punycode);
 					}
 
@@ -673,7 +673,7 @@ namespace ShadowStrike {
 
 							// Overflow guard: i += digit * w
 							if (digit > (UINT32_MAX - i) / w) {
-								SS_LOG_ERROR(L"NetworkUtils: PunycodeDecode overflow in i+=digit*w");
+								SS_LOG_ERROR(L"NetworkUtils", L"PunycodeDecode overflow in i+=digit*w");
 								return std::wstring(punycode);
 							}
 							i += digit * w;
@@ -688,7 +688,7 @@ namespace ShadowStrike {
 							// Overflow guard: w *= (BASE - t)
 							uint32_t factor = PunycodeConstants::BASE - t;
 							if (w > UINT32_MAX / factor) {
-								SS_LOG_ERROR(L"NetworkUtils: PunycodeDecode overflow in w*=factor");
+								SS_LOG_ERROR(L"NetworkUtils", L"PunycodeDecode overflow in w*=factor");
 								return std::wstring(punycode);
 							}
 							w *= factor;
@@ -705,7 +705,7 @@ namespace ShadowStrike {
 
 						// Output length cap
 						if (output.size() > 4096) {
-							SS_LOG_ERROR(L"NetworkUtils: PunycodeDecode output too large");
+							SS_LOG_ERROR(L"NetworkUtils", L"PunycodeDecode output too large");
 							return std::wstring(punycode);
 						}
 
@@ -736,7 +736,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in PunycodeDecode");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in PunycodeDecode");
 					return std::wstring(punycode);
 				}
 			}

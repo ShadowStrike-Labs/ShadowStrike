@@ -25,6 +25,7 @@
  * @copyright ShadowStrike NGAV - Enterprise Security Platform
  */
 
+#include "pch.h"
 #include "IPCManager.hpp"
 #include "FilterConnection.hpp"
 #include "ThreatIntelPusher.hpp"
@@ -232,7 +233,7 @@ bool IPCManager::Initialize(const IPCConfiguration& config) {
 
     Utils::Logger::Info("[IPCManager] Initialized successfully");
     Utils::Logger::Info("[IPCManager]   Filter port: {}",
-                        Utils::StringUtils::WideToUtf8(config.filterPortName));
+                        Utils::StringUtils::ToNarrow(config.filterPortName));
     Utils::Logger::Info("[IPCManager]   Worker threads: {}", config.workerThreadCount);
     Utils::Logger::Info("[IPCManager]   Reply timeout: {} ms", config.replyTimeoutMs);
 
@@ -429,7 +430,7 @@ bool IPCManager::ConnectFilterPort() {
     }
 
     Utils::Logger::Info("[IPCManager] Connecting to filter port: {}",
-                        Utils::StringUtils::WideToUtf8(portName));
+                        Utils::StringUtils::ToNarrow(portName));
 
     // FIX [BUG #11]: Use temp handle — FilterConnectCommunicationPort writes
     // directly to &handle. Storing into atomic<HANDLE> address isn't portable.
@@ -663,7 +664,7 @@ bool IPCManager::CreatePipeServer(const std::wstring& pipeName) {
     }
 
     Utils::Logger::Info("[IPCManager] Created pipe server: {}",
-                        Utils::StringUtils::WideToUtf8(pipeName));
+                        Utils::StringUtils::ToNarrow(pipeName));
     return true;
 }
 
@@ -699,7 +700,7 @@ bool IPCManager::ConnectToPipe(const std::wstring& pipeName) {
     }
 
     Utils::Logger::Info("[IPCManager] Connected to pipe: {}",
-                        Utils::StringUtils::WideToUtf8(pipeName));
+                        Utils::StringUtils::ToNarrow(pipeName));
     return true;
 }
 
@@ -784,7 +785,7 @@ bool IPCManager::CreateSharedMemory(const std::wstring& name, size_t size, bool 
 
     if (m_sharedMemory.contains(name)) {
         Utils::Logger::Warn("[IPCManager] Shared memory already exists: {}",
-                            Utils::StringUtils::WideToUtf8(name));
+                            Utils::StringUtils::ToNarrow(name));
         return true;  // Already exists, consider it success
     }
 
@@ -847,7 +848,7 @@ bool IPCManager::CreateSharedMemory(const std::wstring& name, size_t size, bool 
     m_sharedMemory[name] = std::move(region);
 
     Utils::Logger::Info("[IPCManager] Created shared memory: {} ({} bytes)",
-                        Utils::StringUtils::WideToUtf8(name), size);
+                        Utils::StringUtils::ToNarrow(name), size);
     return true;
 }
 
@@ -945,7 +946,7 @@ void IPCManager::CloseSharedMemory(const std::wstring& name) {
         }
         m_sharedMemory.erase(it);
         Utils::Logger::Info("[IPCManager] Closed shared memory: {}",
-                            Utils::StringUtils::WideToUtf8(name));
+                            Utils::StringUtils::ToNarrow(name));
     }
 }
 
@@ -1878,7 +1879,7 @@ std::string ConnectionInfo::ToJson() const {
     oss << "{"
         << "\"channelType\":\"" << GetChannelTypeName(channelType) << "\","
         << "\"status\":\"" << GetConnectionStatusName(status) << "\","
-        << "\"endpoint\":\"" << Utils::StringUtils::WideToUtf8(endpoint) << "\","
+        << "\"endpoint\":\"" << Utils::StringUtils::ToNarrow(endpoint) << "\","
         << "\"messagesReceived\":" << messagesReceived << ","
         << "\"messagesSent\":" << messagesSent << ","
         << "\"bytesReceived\":" << bytesReceived << ","
@@ -2021,13 +2022,13 @@ bool VerifyDriverSignature(const std::wstring& driverPath) {
     if (status != ERROR_SUCCESS) {
         Utils::Logger::Error("[IPCManager] Driver signature verification FAILED "
                              "for '{}': WinVerifyTrust returned 0x{:08X}",
-                             Utils::StringUtils::WideToUtf8(driverPath),
+                             Utils::StringUtils::ToNarrow(driverPath),
                              static_cast<unsigned long>(status));
         return false;
     }
 
     Utils::Logger::Info("[IPCManager] Driver signature verified: {}",
-                        Utils::StringUtils::WideToUtf8(driverPath));
+                        Utils::StringUtils::ToNarrow(driverPath));
     return true;
 }
 

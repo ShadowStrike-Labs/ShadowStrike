@@ -4540,7 +4540,7 @@ namespace ShadowStrike::AntiEvasion {
             constexpr size_t kSuspiciousCmdLen = 8192;
             if (ctx.commandLine.size() > kSuspiciousCmdLen) {
                 AddDetection(result, DetectionPatternBuilder()
-                    .Technique(EvasionTechnique::MEMORY_SuspiciousAllocation)
+                    .Technique(EvasionTechnique::PROCESS_SubsystemValidation)
                     .Description(L"Abnormally long command line (possible obfuscated payload)")
                     .TechnicalDetails(std::format(L"cmdline length={} chars", ctx.commandLine.size()))
                     .Confidence(0.60)
@@ -4823,8 +4823,19 @@ namespace ShadowStrike::AntiEvasion {
         return m_impl->m_resultCache.size();
     }
 
-    const DebuggerEvasionDetector::Statistics DebuggerEvasionDetector::GetStatistics() const noexcept {
-        return m_impl->m_stats;
+    DebuggerEvasionDetector::StatisticsSnapshot DebuggerEvasionDetector::GetStatistics() const noexcept {
+        StatisticsSnapshot snap;
+        snap.totalAnalyses = m_impl->m_stats.totalAnalyses.load(std::memory_order_relaxed);
+        snap.evasiveProcesses = m_impl->m_stats.evasiveProcesses.load(std::memory_order_relaxed);
+        snap.totalDetections = m_impl->m_stats.totalDetections.load(std::memory_order_relaxed);
+        snap.cacheHits = m_impl->m_stats.cacheHits.load(std::memory_order_relaxed);
+        snap.cacheMisses = m_impl->m_stats.cacheMisses.load(std::memory_order_relaxed);
+        snap.analysisErrors = m_impl->m_stats.analysisErrors.load(std::memory_order_relaxed);
+        snap.totalAnalysisTimeUs = m_impl->m_stats.totalAnalysisTimeUs.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < 16; ++i) {
+            snap.categoryDetections[i] = m_impl->m_stats.categoryDetections[i].load(std::memory_order_relaxed);
+        }
+        return snap;
     }
 
     void DebuggerEvasionDetector::ResetStatistics() noexcept {

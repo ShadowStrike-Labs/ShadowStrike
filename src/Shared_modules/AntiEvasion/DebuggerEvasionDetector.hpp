@@ -1917,10 +1917,22 @@ namespace ShadowStrike {
                 }
             };
 
+            /// @brief Copyable snapshot of detector statistics
+            struct StatisticsSnapshot {
+                uint64_t totalAnalyses = 0;
+                uint64_t evasiveProcesses = 0;
+                uint64_t totalDetections = 0;
+                uint64_t cacheHits = 0;
+                uint64_t cacheMisses = 0;
+                uint64_t analysisErrors = 0;
+                uint64_t totalAnalysisTimeUs = 0;
+                std::array<uint64_t, 16> categoryDetections{};
+            };
+
             /**
-             * @brief Get detector statistics
+             * @brief Get detector statistics snapshot (thread-safe, copyable)
              */
-            [[nodiscard]] const Statistics GetStatistics() const noexcept;
+            [[nodiscard]] StatisticsSnapshot GetStatistics() const noexcept;
 
             /**
              * @brief Reset statistics

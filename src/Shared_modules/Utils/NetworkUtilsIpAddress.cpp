@@ -558,7 +558,7 @@ namespace ShadowStrike {
 
 				// Validate we have exactly 4 octets
 				if (octetIndex != 4) {
-					SS_LOG_DEBUG(L"ParseIPv4 failed: expected 4 octets, got %zu", static_cast<size_t>(octetIndex));
+					SS_LOG_DEBUG(L"NetworkUtils", L"ParseIPv4 failed: expected 4 octets, got %zu", static_cast<size_t>(octetIndex));
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, 
 						L"IPv4 must have exactly 4 octets", L"ParseIPv4");
 					return false;
@@ -638,7 +638,7 @@ namespace ShadowStrike {
 
 				// Handle common error cases with better messages
 				const int wsaErr = WSAGetLastError();
-				SS_LOG_DEBUG(L"ParseIPv6 failed: WSAStringToAddressW error %d", wsaErr);
+				SS_LOG_DEBUG(L"NetworkUtils", L"ParseIPv6 failed: WSAStringToAddressW error %d", wsaErr);
 				if (wsaErr == WSANOTINITIALISED) {
 					Internal::SetError(err, static_cast<DWORD>(wsaErr), 
 						L"WSAStartup not called - Winsock must be initialized before parsing IPv6", 
@@ -668,7 +668,7 @@ namespace ShadowStrike {
 				}
 
 				// Both failed — report combined error with both reasons
-				SS_LOG_DEBUG(L"ParseIpAddress: input rejected as both IPv4 and IPv6");
+				SS_LOG_DEBUG(L"NetworkUtils", L"ParseIpAddress: input rejected as both IPv4 and IPv6");
 				if (err) {
 					// String concatenation can throw — guard in noexcept context
 					try {
@@ -713,7 +713,7 @@ namespace ShadowStrike {
 			bool IsInSubnet(const IpAddress& address, const IpAddress& subnet, uint8_t prefixLength) noexcept {
 				// IP version mismatch check
 				if (address.version != subnet.version) {
-					SS_LOG_WARN(L"IsInSubnet: IP version mismatch (address=%d, subnet=%d)",
+					SS_LOG_WARN(L"NetworkUtils", L"IsInSubnet: IP version mismatch (address=%d, subnet=%d)",
 						static_cast<int>(address.version), static_cast<int>(subnet.version));
 					return false;
 				}

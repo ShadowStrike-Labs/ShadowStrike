@@ -253,6 +253,44 @@ namespace ShadowStrike {
 			 */
 			[[nodiscard]] static std::wstring FormatMessageV(const wchar_t* fmt, va_list args);
 
+			// ============================================================
+			// Static convenience methods (narrow string, std::format style)
+			// For backward-compatible logging from modules that use
+			// Logger::Error("message {}", arg) pattern.
+			// ============================================================
+
+			static void Fatal(const char* msg);
+			static void Error(const char* msg);
+			static void Warn(const char* msg);
+			static void Info(const char* msg);
+			static void Debug(const char* msg);
+			static void Trace(const char* msg);
+
+			template<typename... Args> requires (sizeof...(Args) > 0)
+			static void Fatal(std::format_string<Args...> fmt, Args&&... args) {
+				LogNarrowFmt_(LogLevel::Fatal, fmt, std::forward<Args>(args)...);
+			}
+			template<typename... Args> requires (sizeof...(Args) > 0)
+			static void Error(std::format_string<Args...> fmt, Args&&... args) {
+				LogNarrowFmt_(LogLevel::Error, fmt, std::forward<Args>(args)...);
+			}
+			template<typename... Args> requires (sizeof...(Args) > 0)
+			static void Warn(std::format_string<Args...> fmt, Args&&... args) {
+				LogNarrowFmt_(LogLevel::Warn, fmt, std::forward<Args>(args)...);
+			}
+			template<typename... Args> requires (sizeof...(Args) > 0)
+			static void Info(std::format_string<Args...> fmt, Args&&... args) {
+				LogNarrowFmt_(LogLevel::Info, fmt, std::forward<Args>(args)...);
+			}
+			template<typename... Args> requires (sizeof...(Args) > 0)
+			static void Debug(std::format_string<Args...> fmt, Args&&... args) {
+				LogNarrowFmt_(LogLevel::Debug, fmt, std::forward<Args>(args)...);
+			}
+			template<typename... Args> requires (sizeof...(Args) > 0)
+			static void Trace(std::format_string<Args...> fmt, Args&&... args) {
+				LogNarrowFmt_(LogLevel::Trace, fmt, std::forward<Args>(args)...);
+			}
+
 			/**
 			 * @brief RAII scope logger for function entry/exit timing.
 			 */
@@ -315,6 +353,17 @@ namespace ShadowStrike {
 			// ========================================================================
 			// Internal Methods
 			// ========================================================================
+
+			template<typename... Args>
+			static void LogNarrowFmt_(LogLevel level, std::format_string<Args...> fmt, Args&&... args) {
+				auto& lg = Instance();
+				if (!lg.IsInitialized() || !lg.IsEnabled(level)) return;
+				try {
+					std::string narrow = std::format(fmt, std::forward<Args>(args)...);
+					std::wstring wide(narrow.begin(), narrow.end());
+					lg.LogMessage(level, L"App", wide);
+				} catch (...) {}
+			}
 
 			void EnsureInitialized();
 			void WorkerLoop();

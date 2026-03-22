@@ -90,10 +90,10 @@ namespace ShadowStrike {
 				struct BstrGuard {
 					BSTR bstr;
 					explicit BstrGuard(const wchar_t* s) noexcept : bstr(::SysAllocString(s)) {
-						if (!bstr && s && *s) SS_LOG_ERROR(L"NetworkUtils: SysAllocString OOM");
+						if (!bstr && s && *s) SS_LOG_ERROR(L"NetworkUtils", L"SysAllocString OOM");
 					}
 					explicit BstrGuard(const std::wstring& s) noexcept : bstr(::SysAllocString(s.c_str())) {
-						if (!bstr && !s.empty()) SS_LOG_ERROR(L"NetworkUtils: SysAllocString OOM");
+						if (!bstr && !s.empty()) SS_LOG_ERROR(L"NetworkUtils", L"SysAllocString OOM");
 					}
 					~BstrGuard() { if (bstr) ::SysFreeString(bstr); }
 					[[nodiscard]] bool valid() const noexcept { return bstr != nullptr; }
@@ -111,7 +111,7 @@ namespace ShadowStrike {
 			bool GetNetworkAdapters(std::vector<NetworkAdapterInfo>& adapters, Error* err) noexcept {
 				try {
 					adapters.clear();
-					SS_LOG_DEBUG(L"NetworkUtils: GetNetworkAdapters enumeration started");
+					SS_LOG_DEBUG(L"NetworkUtils", L"GetNetworkAdapters enumeration started");
 
 					ULONG bufferSize = 15000;
 					std::vector<uint8_t> buffer(bufferSize);
@@ -216,7 +216,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in GetNetworkAdapters");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in GetNetworkAdapters");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetNetworkAdapters");
 					return false;
 				}
@@ -284,7 +284,7 @@ namespace ShadowStrike {
 
 			bool EnableNetworkAdapter(const std::wstring& adapterName, Error* err) noexcept {
 				try {
-					SS_LOG_INFO(L"NetworkUtils: EnableNetworkAdapter requested for '%%.*s'", static_cast<int>(adapterName.size()), adapterName.c_str());
+					SS_LOG_INFO(L"NetworkUtils", L"EnableNetworkAdapter requested for '%.*ls'", static_cast<int>(adapterName.size()), adapterName.c_str());
 					// ====================================================================
 					// VALIDATION: Adapter name cannot be empty
 					// ====================================================================
@@ -324,7 +324,7 @@ namespace ShadowStrike {
 
 					// S_OK = success, S_FALSE = already initialized, RPC_E_CHANGED_MODE = different apartment
 					if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
-						SS_LOG_ERROR(L"NetworkUtils: EnableNetworkAdapter CoInitializeEx failed hr=0x%%08X", hr);
+						SS_LOG_ERROR(L"NetworkUtils", L"EnableNetworkAdapter CoInitializeEx failed hr=0x%08X", hr);
 						Internal::SetError(err, hr, L"CoInitializeEx failed");
 						return false;
 					}
@@ -630,7 +630,7 @@ namespace ShadowStrike {
 
 			bool DisableNetworkAdapter(const std::wstring& adapterName, Error* err) noexcept {
 				try {
-					SS_LOG_INFO(L"NetworkUtils: DisableNetworkAdapter requested for '%%.*s'", static_cast<int>(adapterName.size()), adapterName.c_str());
+					SS_LOG_INFO(L"NetworkUtils", L"DisableNetworkAdapter requested for '%.*ls'", static_cast<int>(adapterName.size()), adapterName.c_str());
 					// ====================================================================
 					// VALIDATION: Adapter name cannot be empty
 					// ====================================================================
@@ -670,7 +670,7 @@ namespace ShadowStrike {
 
 					// S_OK = success, S_FALSE = already initialized, RPC_E_CHANGED_MODE = different apartment
 					if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
-						SS_LOG_ERROR(L"NetworkUtils: DisableNetworkAdapter CoInitializeEx failed hr=0x%%08X", hr);
+						SS_LOG_ERROR(L"NetworkUtils", L"DisableNetworkAdapter CoInitializeEx failed hr=0x%08X", hr);
 						Internal::SetError(err, hr, L"CoInitializeEx failed");
 						return false;
 					}
@@ -959,7 +959,7 @@ namespace ShadowStrike {
 
 			bool RenewDhcpLease(const std::wstring& adapterName, Error* err) noexcept {
 				try {
-					SS_LOG_INFO(L"NetworkUtils: RenewDhcpLease requested for '%%.*s'", static_cast<int>(adapterName.size()), adapterName.c_str());
+					SS_LOG_INFO(L"NetworkUtils", L"RenewDhcpLease requested for '%.*ls'", static_cast<int>(adapterName.size()), adapterName.c_str());
 					// ====================================================================
 					// VALIDATION: Adapter name
 					// ====================================================================
@@ -1082,7 +1082,7 @@ namespace ShadowStrike {
 
 			bool ReleaseDhcpLease(const std::wstring& adapterName, Error* err) noexcept {
 				try {
-					SS_LOG_INFO(L"NetworkUtils: ReleaseDhcpLease requested for '%%.*s'", static_cast<int>(adapterName.size()), adapterName.c_str());
+					SS_LOG_INFO(L"NetworkUtils", L"ReleaseDhcpLease requested for '%.*ls'", static_cast<int>(adapterName.size()), adapterName.c_str());
 					// ====================================================================
 					// VALIDATION
 					// ====================================================================
@@ -1196,7 +1196,7 @@ namespace ShadowStrike {
 			bool FlushDnsCache(Error* err) noexcept {
 				HMODULE hDnsapi = ::LoadLibraryW(L"dnsapi.dll");
 				if (!hDnsapi) {
-					SS_LOG_ERROR(L"NetworkUtils: FlushDnsCache failed — dnsapi.dll not found");
+					SS_LOG_ERROR(L"NetworkUtils", L"FlushDnsCache failed — dnsapi.dll not found");
 					Internal::SetError(err, ::GetLastError(), L"Failed to load dnsapi.dll");
 					return false;
 				}
@@ -1213,11 +1213,11 @@ namespace ShadowStrike {
 				::FreeLibrary(hDnsapi);
 
 				if (success) {
-					SS_LOG_INFO(L"NetworkUtils: DNS resolver cache flushed successfully");
+					SS_LOG_INFO(L"NetworkUtils", L"DNS resolver cache flushed successfully");
 					return true;
 				}
 
-				SS_LOG_ERROR(L"NetworkUtils: FlushDnsCache failed — DnsFlushResolverCache unavailable or returned FALSE");
+				SS_LOG_ERROR(L"NetworkUtils", L"FlushDnsCache failed — DnsFlushResolverCache unavailable or returned FALSE");
 				Internal::SetError(err, ERROR_PROC_NOT_FOUND, L"DnsFlushResolverCache not available or failed");
 				return false;
 			}
@@ -1228,7 +1228,7 @@ namespace ShadowStrike {
 			bool GetRoutingTable(std::vector<RouteEntry>& routes, Error* err) noexcept {
 				try {
 					routes.clear();
-					SS_LOG_DEBUG(L"NetworkUtils: GetRoutingTable enumeration started");
+					SS_LOG_DEBUG(L"NetworkUtils", L"GetRoutingTable enumeration started");
 
 					// IPv4 Routing Table (retry loop guards against TOCTOU size race)
 					DWORD result = ERROR_INSUFFICIENT_BUFFER;
@@ -1418,7 +1418,7 @@ namespace ShadowStrike {
 
 			bool AddRoute(const IpAddress& destination, uint8_t prefixLength, const IpAddress& gateway, Error* err) noexcept {
 				try {
-					SS_LOG_INFO(L"NetworkUtils: AddRoute requested prefixLen=%%u", static_cast<unsigned>(prefixLength));
+					SS_LOG_INFO(L"NetworkUtils", L"AddRoute requested prefixLen=%u", static_cast<unsigned>(prefixLength));
 					// Check if both addresses are same IP version
 					if (destination.IsIPv4() != gateway.IsIPv4()) {
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Destination and gateway must be same IP version");
@@ -1514,7 +1514,7 @@ namespace ShadowStrike {
 
 			bool DeleteRoute(const IpAddress& destination, uint8_t prefixLength, Error* err) noexcept {
 				try {
-					SS_LOG_INFO(L"NetworkUtils: DeleteRoute requested prefixLen=%%u", static_cast<unsigned>(prefixLength));
+					SS_LOG_INFO(L"NetworkUtils", L"DeleteRoute requested prefixLen=%u", static_cast<unsigned>(prefixLength));
 					if (destination.IsIPv4()) {
 						// IPv4 Route Deletion
 						MIB_IPFORWARDROW route = {};

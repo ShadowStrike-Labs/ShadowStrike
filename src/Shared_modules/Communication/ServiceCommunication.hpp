@@ -479,6 +479,41 @@ struct ClientSession {
     
     /// @brief Capabilities
     uint64_t capabilities = 0;
+
+    ClientSession() = default;
+    ~ClientSession() = default;
+    ClientSession(const ClientSession&) = delete;
+    ClientSession& operator=(const ClientSession&) = delete;
+    ClientSession(ClientSession&& o) noexcept
+        : sessionId(std::move(o.sessionId))
+        , clientType(o.clientType)
+        , processId(o.processId)
+        , pipeHandle(o.pipeHandle)
+        , state(o.state)
+        , connectedTime(std::move(o.connectedTime))
+        , lastActivity(o.lastActivity)
+        , messagesSent(o.messagesSent)
+        , messagesReceived(o.messagesReceived)
+        , sequence(o.sequence.load(std::memory_order_relaxed))
+        , isAuthenticated(o.isAuthenticated)
+        , capabilities(o.capabilities) {}
+    ClientSession& operator=(ClientSession&& o) noexcept {
+        if (this != &o) {
+            sessionId = std::move(o.sessionId);
+            clientType = o.clientType;
+            processId = o.processId;
+            pipeHandle = o.pipeHandle;
+            state = o.state;
+            connectedTime = std::move(o.connectedTime);
+            lastActivity = o.lastActivity;
+            messagesSent = o.messagesSent;
+            messagesReceived = o.messagesReceived;
+            sequence.store(o.sequence.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            isAuthenticated = o.isAuthenticated;
+            capabilities = o.capabilities;
+        }
+        return *this;
+    }
     
     [[nodiscard]] std::string ToJson() const;
 };

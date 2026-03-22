@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -5271,89 +5272,6 @@ namespace ShadowStrike::AntiEvasion {
 
     void EnvironmentEvasionDetector::AnalyzeFileNaming(std::wstring_view filePath, FileNamingInfo& info) noexcept {
         m_impl->AnalyzeFileNaming(filePath, info);
-    }
-
-    void EnvironmentEvasionDetector::CalculateEvasionScore(EnvironmentEvasionResult& result) noexcept {
-        // Calculate weighted evasion score based on detected techniques
-        double totalScore = 0.0;
-        double maxPossibleScore = 0.0;
-
-        for (const auto& detection : result.detectedTechniques) {
-            double weight = detection.weight;
-            double confidence = detection.confidence;
-
-            // Apply severity multiplier
-            double severityMultiplier = 1.0;
-            switch (detection.severity) {
-            case EnvironmentEvasionSeverity::Low:
-                severityMultiplier = 1.0;
-                break;
-            case EnvironmentEvasionSeverity::Medium:
-                severityMultiplier = 1.5;
-                break;
-            case EnvironmentEvasionSeverity::High:
-                severityMultiplier = 2.0;
-                break;
-            case EnvironmentEvasionSeverity::Critical:
-                severityMultiplier = 3.0;
-                break;
-            }
-
-            totalScore += weight * confidence * severityMultiplier;
-            maxPossibleScore += weight * severityMultiplier;
-
-            // Update max severity
-            if (detection.severity > result.maxSeverity) {
-                result.maxSeverity = detection.severity;
-            }
-
-            // Update detected categories bitfield
-            result.detectedCategories |= (1u << static_cast<uint32_t>(detection.category));
-        }
-
-        // Normalize to 0-100 scale
-        if (maxPossibleScore > 0) {
-            result.evasionScore = (totalScore / maxPossibleScore) * 100.0;
-        } else {
-            result.evasionScore = 0.0;
-        }
-
-        // Cap at 100
-        if (result.evasionScore > 100.0) {
-            result.evasionScore = 100.0;
-        }
-
-        // Determine if evasive based on threshold
-        result.isEvasive = result.evasionScore >= EnvironmentConstants::HIGH_EVASION_THRESHOLD ||
-                          result.maxSeverity >= EnvironmentEvasionSeverity::High;
-
-        result.totalDetections = static_cast<uint32_t>(result.detectedTechniques.size());
-    }
-
-    void EnvironmentEvasionDetector::AddDetection(
-        EnvironmentEvasionResult& result,
-        EnvironmentDetectedTechnique detection
-    ) noexcept {
-        // Add detection to result
-        result.detectedTechniques.push_back(std::move(detection));
-
-        // Invoke callback if set
-        std::shared_lock lock(m_impl->m_mutex);
-        if (m_impl->m_detectionCallback) {
-            try {
-                m_impl->m_detectionCallback(result.targetPid, result.detectedTechniques.back());
-            }
-            catch (...) {
-                // Callback failure is non-fatal
-            }
-        }
-
-        // Update statistics
-        m_impl->m_stats.totalDetections++;
-        auto category = static_cast<size_t>(detection.category);
-        if (category < m_impl->m_stats.categoryDetections.size()) {
-            m_impl->m_stats.categoryDetections[category]++;
-        }
     }
 
     // ========================================================================

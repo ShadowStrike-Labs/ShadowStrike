@@ -60,7 +60,7 @@ public:
     FilterConnectionImpl(const std::wstring& portName)
         : m_portName(portName) {
         if (portName.empty()) {
-            m_portName = SHADOWSTRIKE_PORT_NAME;
+            m_portName = SS_COMM_PORT_NAME;
         }
         m_stats.startTime = std::chrono::steady_clock::now();
     }

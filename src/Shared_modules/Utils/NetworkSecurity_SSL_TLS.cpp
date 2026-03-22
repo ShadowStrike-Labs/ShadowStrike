@@ -248,7 +248,7 @@ namespace ShadowStrike {
 						0, 0)) {
 						const DWORD lastErr = ::GetLastError();
 						Internal::SetError(err, lastErr, L"WinHttpSendRequest failed", L"GetSslCertificate");
-						SS_LOG_ERROR(L"NetworkSecurity", L"WinHttpSendRequest failed for %s:%u (err=%u)",
+						SS_LOG_ERROR(L"NetworkSecurity", L"WinHttpSendRequest failed for %ls:%u (err=%u)",
 							std::wstring(hostname).c_str(), static_cast<unsigned>(port), lastErr);
 						return false;
 					}
@@ -462,7 +462,7 @@ namespace ShadowStrike {
 								CERT_TRUST_IS_REVOKED |
 								CERT_TRUST_IS_NOT_SIGNATURE_VALID |
 								CERT_TRUST_IS_PARTIAL_CHAIN |
-								CERT_TRUST_HAS_NOT_SUPPORTED_CRITICAL_EXTENSION |
+								CERT_TRUST_HAS_NOT_SUPPORTED_CRITICAL_EXT |
 								CERT_TRUST_IS_NOT_VALID_FOR_USAGE |
 								CERT_TRUST_CTL_IS_NOT_SIGNATURE_VALID |
 								CERT_TRUST_CTL_IS_NOT_TIME_VALID |
@@ -474,7 +474,7 @@ namespace ShadowStrike {
 							if (errStatus & FATAL_FLAGS) {
 								certInfo.isValid = false;
 								SS_LOG_WARN(L"NetworkSecurity",
-									L"Certificate chain validation failed (flags=0x%08X) for subject: %s",
+									L"Certificate chain validation failed (flags=0x%08X) for subject: %ls",
 									errStatus, certInfo.subject.c_str());
 							}
 
@@ -486,14 +486,14 @@ namespace ShadowStrike {
 							if (errStatus & CERT_TRUST_HAS_WEAK_SIGNATURE) {
 								certInfo.isValid = false;
 								SS_LOG_WARN(L"NetworkSecurity",
-									L"Certificate uses weak signature algorithm: %s",
+									L"Certificate uses weak signature algorithm: %ls",
 									certInfo.subject.c_str());
 							}
 
 							// Offline revocation - CRL/OCSP unreachable
 							if (errStatus & CERT_TRUST_IS_OFFLINE_REVOCATION) {
 								SS_LOG_DEBUG(L"NetworkSecurity",
-									L"Revocation check offline for: %s (accepting)",
+									L"Revocation check offline for: %ls (accepting)",
 									certInfo.subject.c_str());
 							}
 						}
@@ -501,7 +501,7 @@ namespace ShadowStrike {
 					else {
 						// CertGetCertificateChain failed entirely
 						SS_LOG_ERROR(L"NetworkSecurity",
-							L"CertGetCertificateChain failed (err=%u) for: %s",
+							L"CertGetCertificateChain failed (err=%u) for: %ls",
 						::GetLastError(), certInfo.subject.c_str());
 						certInfo.isValid = false;
 					}
@@ -543,7 +543,7 @@ namespace ShadowStrike {
 					// 2. Reject self-signed certificates (enterprise policy)
 					if (certInfo.isSelfSigned) {
 						SS_LOG_WARN(L"NetworkSecurity",
-							L"Rejecting self-signed certificate: subject=%s",
+							L"Rejecting self-signed certificate: subject=%ls",
 							certInfo.subject.c_str());
 						return false;
 					}
@@ -587,7 +587,7 @@ namespace ShadowStrike {
 
 					if (!hostnameMatches) {
 						SS_LOG_WARN(L"NetworkSecurity",
-							L"Certificate hostname mismatch: expected=%s, subject=%s",
+							L"Certificate hostname mismatch: expected=%ls, subject=%ls",
 							std::wstring(expectedHostname).c_str(), certInfo.subject.c_str());
 						return false;
 					}

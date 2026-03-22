@@ -151,7 +151,6 @@
   <ItemGroup>
     <ClCompile Include="src\Shared_modules\AntiEvasion\DebuggerEvasionDetector.cpp" />
     <ClCompile Include="src\Shared_modules\AntiEvasion\EnvironmentEvasionDetector.cpp" />
-    <ClCompile Include="src\Shared_modules\AntiEvasion\MetamorphicDetector.cpp" />
     <ClCompile Include="src\Shared_modules\AntiEvasion\metamorphic_polymorphicdetector.cpp" />
     <ClCompile Include="src\Shared_modules\AntiEvasion\NetworkBasedEvasionDetector.cpp" />
     <ClCompile Include="src\Shared_modules\AntiEvasion\PackerDetector.cpp" />
@@ -248,7 +247,7 @@
     <ClCompile Include="src\Shared_modules\Database\QuarantineDB.cpp" />
     <ClCompile Include="src\Drivers\FileFilterCallbacks.cpp" />
     <ClCompile Include="src\Drivers\FilterCommunication.cpp" />
-    <ClCompile Include="src\Drivers\FilterDriver.cpp" />
+
     <ClCompile Include="src\Drivers\ProcessFilterCallbacks.cpp" />
     <ClCompile Include="src\Drivers\RegistryFilterCallbacks.cpp" />
     <ClCompile Include="src\Products\PhantomHome\Email\AttachmentScanner.cpp" />
@@ -625,7 +624,6 @@
     <ClInclude Include="include\yara\yara\utils.h" />
     <ClInclude Include="src\Shared_modules\AntiEvasion\DebuggerEvasionDetector.hpp" />
     <ClInclude Include="src\Shared_modules\AntiEvasion\EnvironmentEvasionDetector.hpp" />
-    <ClInclude Include="src\Shared_modules\AntiEvasion\MetamorphicDetector.hpp" />
     <ClInclude Include="src\Shared_modules\AntiEvasion\metamorphic_polymorphicdetector.hpp" />
     <ClInclude Include="src\Shared_modules\AntiEvasion\NetworkBasedEvasionDetector.hpp" />
     <ClInclude Include="src\Shared_modules\AntiEvasion\nt_undocumented.h" />

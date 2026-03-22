@@ -139,13 +139,13 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/CryptoUtils.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../HashStore/HashStore.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../Shared_modules/Utils/Logger.hpp"
+#include "../../../Shared_modules/Utils/NetworkUtils.hpp"
+#include "../../../Shared_modules/Utils/CryptoUtils.hpp"
+#include "../../../Shared_modules/Utils/HashUtils.hpp"
+#include "../../../Shared_modules/HashStore/HashStore.hpp"
+#include "../../../Shared_modules/PatternStore/PatternStore.hpp"
+#include "../../../Shared_modules/ThreatIntel/ThreatIntelManager.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
 
 // ============================================================================

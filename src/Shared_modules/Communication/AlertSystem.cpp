@@ -840,7 +840,7 @@ bool AlertSystemImpl::SendEmail(const std::string& to, const std::string& subjec
 
     Utils::NetworkUtils::Error err;
     if (!Utils::NetworkUtils::HttpPost(url, postData, response, opts, &err)) {
-        NotifyError("Email delivery failed: " + WideToUtf8(err.message), err.code);
+        NotifyError("Email delivery failed: " + WideToUtf8(err.message), static_cast<int>(err.win32));
         m_stats.alertsFailed.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -876,7 +876,7 @@ bool AlertSystemImpl::SendWebhookDirect(const std::string& whId, const std::stri
 
     Utils::NetworkUtils::Error err;
     if (!Utils::NetworkUtils::HttpPost(url, postData, response, opts, &err)) {
-        NotifyError("Webhook delivery failed: " + WideToUtf8(err.message), err.code);
+        NotifyError("Webhook delivery failed: " + WideToUtf8(err.message), static_cast<int>(err.win32));
         return false;
     }
 
@@ -1226,7 +1226,7 @@ void AlertSystemImpl::DeliverWebhook(Alert& alert, const WebhookConfiguration& w
     if (!Utils::NetworkUtils::HttpPost(url, postData, response, opts, &err)) {
         Utils::Logger::Error("[AlertSystem] Webhook '{}' failed: {}", wh.name,
                             WideToUtf8(err.message));
-        NotifyError("Webhook '" + wh.name + "' failed: " + WideToUtf8(err.message), err.code);
+        NotifyError("Webhook '" + wh.name + "' failed: " + WideToUtf8(err.message), static_cast<int>(err.win32));
     } else {
         m_stats.webhooksSent.fetch_add(1, std::memory_order_relaxed);
     }

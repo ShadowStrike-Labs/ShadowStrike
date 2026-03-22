@@ -95,7 +95,7 @@ namespace ShadowStrike {
 
 			bool HttpRequest(std::wstring_view url, HttpResponse& response, const HttpRequestOptions& options, Error* err) noexcept {
 				try {
-					SS_LOG_DEBUG(L"NetworkUtils: HttpRequest starting method=%d timeout=%u",
+					SS_LOG_DEBUG(L"NetworkUtils", L"HttpRequest starting method=%d timeout=%u",
 						static_cast<int>(options.method), options.timeoutMs);
 					response = HttpResponse{};
 
@@ -133,7 +133,7 @@ namespace ShadowStrike {
 
 					std::wstring urlCopy(url);
 					if (!::WinHttpCrackUrl(urlCopy.c_str(), 0, 0, &urlComp)) {
-						SS_LOG_ERROR(L"NetworkUtils: WinHttpCrackUrl failed err=%lu", ::GetLastError());
+						SS_LOG_ERROR(L"NetworkUtils", L"WinHttpCrackUrl failed err=%lu", ::GetLastError());
 						Internal::SetError(err, ::GetLastError(), L"WinHttpCrackUrl failed");
 						return false;
 					}
@@ -179,7 +179,7 @@ namespace ShadowStrike {
 
 					// Configure SSL/TLS options if requested to skip verification
 					if (!options.verifySSL && (urlComp.nScheme == INTERNET_SCHEME_HTTPS)) {
-						SS_LOG_WARN(L"NetworkUtils: SSL verification DISABLED for HTTPS request to %ls", hostName);
+						SS_LOG_WARN(L"NetworkUtils", L"SSL verification DISABLED for HTTPS request to %ls", hostName);
 						DWORD sslFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
 							SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
 							SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
@@ -259,14 +259,14 @@ namespace ShadowStrike {
 						static_cast<DWORD>(options.body.size()), 0);
 
 					if (!result) {
-						SS_LOG_ERROR(L"NetworkUtils: WinHttpSendRequest failed err=%lu", ::GetLastError());
+						SS_LOG_ERROR(L"NetworkUtils", L"WinHttpSendRequest failed err=%lu", ::GetLastError());
 						Internal::SetError(err, ::GetLastError(), L"WinHttpSendRequest failed");
 						return false;
 					}
 
 					// Receive response
 					if (!::WinHttpReceiveResponse(requestGuard.handle, nullptr)) {
-						SS_LOG_ERROR(L"NetworkUtils: WinHttpReceiveResponse failed err=%lu", ::GetLastError());
+						SS_LOG_ERROR(L"NetworkUtils", L"WinHttpReceiveResponse failed err=%lu", ::GetLastError());
 						Internal::SetError(err, ::GetLastError(), L"WinHttpReceiveResponse failed");
 						return false;
 					}
@@ -341,7 +341,7 @@ namespace ShadowStrike {
 						if (clValue > 0 && clValue <= MAX_RESPONSE_SIZE) {
 							response.body.reserve(static_cast<size_t>(clValue));
 						} else if (clValue > MAX_RESPONSE_SIZE) {
-							SS_LOG_WARN(L"NetworkUtils: Content-Length %lu exceeds limit", clValue);
+							SS_LOG_WARN(L"NetworkUtils", L"Content-Length %lu exceeds limit", clValue);
 							Internal::SetError(err, ERROR_BUFFER_OVERFLOW, L"Content-Length exceeds response size limit");
 							return false;
 						}
@@ -361,14 +361,14 @@ namespace ShadowStrike {
 
 					response.contentLength = response.body.size();
 
-					SS_LOG_INFO(L"NetworkUtils: HttpRequest completed status=%u bodySize=%zu",
+					SS_LOG_INFO(L"NetworkUtils", L"HttpRequest completed status=%u bodySize=%zu",
 						response.statusCode, response.body.size());
 					// Handles are closed by RAII guards
 					return true;
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in HttpRequest");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in HttpRequest");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in HttpRequest");
 					return false;
 				}
@@ -403,7 +403,7 @@ namespace ShadowStrike {
 
 			bool HttpDownloadFile(std::wstring_view url, const std::filesystem::path& destPath, const HttpRequestOptions& options, ProgressCallback callback, Error* err) noexcept {
 				try {
-					SS_LOG_DEBUG(L"NetworkUtils: HttpDownloadFile starting");
+					SS_LOG_DEBUG(L"NetworkUtils", L"HttpDownloadFile starting");
 
 					// Validate destination path
 					if (destPath.empty()) {
@@ -414,7 +414,7 @@ namespace ShadowStrike {
 					// Reject path traversal sequences
 					std::wstring destStr = destPath.wstring();
 					if (destStr.find(L"..") != std::wstring::npos) {
-						SS_LOG_ERROR(L"NetworkUtils: Path traversal detected in download destination");
+						SS_LOG_ERROR(L"NetworkUtils", L"Path traversal detected in download destination");
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Path traversal in destination path");
 						return false;
 					}
@@ -466,12 +466,12 @@ namespace ShadowStrike {
 
 				}
 				catch (const std::filesystem::filesystem_error& e) {
-					SS_LOG_ERROR(L"NetworkUtils: Filesystem error in HttpDownloadFile");
+					SS_LOG_ERROR(L"NetworkUtils", L"Filesystem error in HttpDownloadFile");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Filesystem error in HttpDownloadFile");
 					return false;
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in HttpDownloadFile");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in HttpDownloadFile");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in HttpDownloadFile");
 					return false;
 				}
@@ -479,7 +479,7 @@ namespace ShadowStrike {
 
 			bool HttpUploadFile(std::wstring_view url, const std::filesystem::path& filePath, std::vector<uint8_t>& response, const HttpRequestOptions& options, ProgressCallback callback, Error* err) noexcept {
 				try {
-					SS_LOG_DEBUG(L"NetworkUtils: HttpUploadFile starting");
+					SS_LOG_DEBUG(L"NetworkUtils", L"HttpUploadFile starting");
 
 					// Validate file path
 					if (filePath.empty()) {
@@ -490,7 +490,7 @@ namespace ShadowStrike {
 					// Reject path traversal sequences
 					std::wstring filePathStr = filePath.wstring();
 					if (filePathStr.find(L"..") != std::wstring::npos) {
-						SS_LOG_ERROR(L"NetworkUtils: Path traversal detected in upload source");
+						SS_LOG_ERROR(L"NetworkUtils", L"Path traversal detected in upload source");
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Path traversal in upload path");
 						return false;
 					}
@@ -498,7 +498,7 @@ namespace ShadowStrike {
 					// Reject symlinks to prevent exfiltration via symlink attacks
 					std::error_code symEc;
 					if (std::filesystem::is_symlink(filePath, symEc)) {
-						SS_LOG_ERROR(L"NetworkUtils: Symlink detected in upload path");
+						SS_LOG_ERROR(L"NetworkUtils", L"Symlink detected in upload path");
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Symlinks not allowed for upload");
 						return false;
 					}
@@ -542,7 +542,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in HttpUploadFile");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in HttpUploadFile");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in HttpUploadFile");
 					return false;
 				}
@@ -660,7 +660,7 @@ namespace ShadowStrike {
 					return true;
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in GetActiveConnections");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in GetActiveConnections");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetActiveConnections");
 					return false;
 				}

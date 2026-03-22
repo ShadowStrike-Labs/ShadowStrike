@@ -551,6 +551,64 @@ namespace ShadowStrike {
 		}
 
 		// ============================================================================
+		// Static Convenience Methods (narrow string, no-args overloads)
+		// ============================================================================
+
+		void Logger::Fatal(const char* msg) {
+			auto& lg = Instance();
+			if (!lg.IsInitialized() || !lg.IsEnabled(LogLevel::Fatal)) return;
+			try {
+				lg.LogMessage(LogLevel::Fatal, L"App",
+				              std::wstring(NarrowToWideTLS(msg, 0)));
+			} catch (...) {}
+		}
+
+		void Logger::Error(const char* msg) {
+			auto& lg = Instance();
+			if (!lg.IsInitialized() || !lg.IsEnabled(LogLevel::Error)) return;
+			try {
+				lg.LogMessage(LogLevel::Error, L"App",
+				              std::wstring(NarrowToWideTLS(msg, 0)));
+			} catch (...) {}
+		}
+
+		void Logger::Warn(const char* msg) {
+			auto& lg = Instance();
+			if (!lg.IsInitialized() || !lg.IsEnabled(LogLevel::Warn)) return;
+			try {
+				lg.LogMessage(LogLevel::Warn, L"App",
+				              std::wstring(NarrowToWideTLS(msg, 0)));
+			} catch (...) {}
+		}
+
+		void Logger::Info(const char* msg) {
+			auto& lg = Instance();
+			if (!lg.IsInitialized() || !lg.IsEnabled(LogLevel::Info)) return;
+			try {
+				lg.LogMessage(LogLevel::Info, L"App",
+				              std::wstring(NarrowToWideTLS(msg, 0)));
+			} catch (...) {}
+		}
+
+		void Logger::Debug(const char* msg) {
+			auto& lg = Instance();
+			if (!lg.IsInitialized() || !lg.IsEnabled(LogLevel::Debug)) return;
+			try {
+				lg.LogMessage(LogLevel::Debug, L"App",
+				              std::wstring(NarrowToWideTLS(msg, 0)));
+			} catch (...) {}
+		}
+
+		void Logger::Trace(const char* msg) {
+			auto& lg = Instance();
+			if (!lg.IsInitialized() || !lg.IsEnabled(LogLevel::Trace)) return;
+			try {
+				lg.LogMessage(LogLevel::Trace, L"App",
+				              std::wstring(NarrowToWideTLS(msg, 0)));
+			} catch (...) {}
+		}
+
+		// ============================================================================
 		// String Conversion Utilities
 		// ============================================================================
 

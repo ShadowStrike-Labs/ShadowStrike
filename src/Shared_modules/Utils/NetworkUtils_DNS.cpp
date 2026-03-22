@@ -97,7 +97,7 @@ namespace ShadowStrike {
 			bool ResolveHostname(std::wstring_view hostname, std::vector<IpAddress>& addresses, AddressFamily family, Error* err) noexcept {
 				try {
 					addresses.clear();
-					SS_LOG_DEBUG(L"NetworkUtils: ResolveHostname called len=%zu family=%u", hostname.size(), static_cast<unsigned>(family));
+					SS_LOG_DEBUG(L"NetworkUtils", L"ResolveHostname called len=%zu family=%u", hostname.size(), static_cast<unsigned>(family));
 
 					// Validate hostname length to prevent buffer overflow attacks
 					if (hostname.empty() || hostname.size() > 255) {
@@ -133,7 +133,7 @@ namespace ShadowStrike {
 					addrinfo* result = nullptr;
 					int ret = ::getaddrinfo(hostnameA.c_str(), nullptr, &hints, &result);
 					if (ret != 0) {
-						SS_LOG_ERROR(L"NetworkUtils: getaddrinfo failed ret=%d", ret);
+						SS_LOG_ERROR(L"NetworkUtils", L"getaddrinfo failed ret=%d", ret);
 						Internal::SetWsaError(err, ret, L"getaddrinfo");
 						return false;
 					}
@@ -163,7 +163,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in ResolveHostname");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in ResolveHostname");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in ResolveHostname");
 					return false;
 				}
@@ -208,7 +208,7 @@ namespace ShadowStrike {
 			bool ReverseLookup(const IpAddress& address, std::wstring& hostname, Error* err) noexcept {
 				try {
 					hostname.clear();
-					SS_LOG_DEBUG(L"NetworkUtils: ReverseLookup called");
+					SS_LOG_DEBUG(L"NetworkUtils", L"ReverseLookup called");
 
 					WsaInitializer wsa;
 					if (!wsa.IsInitialized()) {
@@ -289,13 +289,13 @@ namespace ShadowStrike {
 						}
 					}
 
-					SS_LOG_ERROR(L"NetworkUtils: ReverseLookup getnameinfo failed (code=%d)", gnRet);
+					SS_LOG_ERROR(L"NetworkUtils", L"ReverseLookup getnameinfo failed (code=%d)", gnRet);
 					Internal::SetWsaError(err, gnRet, L"Reverse DNS lookup failed — no PTR record");
 					return false;
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in ReverseLookup");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in ReverseLookup");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in ReverseLookup");
 					return false;
 				}
@@ -314,7 +314,7 @@ namespace ShadowStrike {
 						return false;
 					}
 
-					SS_LOG_DEBUG(L"NetworkUtils: QueryDns type=%u host_len=%zu", static_cast<unsigned>(type), hostname.size());
+					SS_LOG_DEBUG(L"NetworkUtils", L"QueryDns type=%u host_len=%zu", static_cast<unsigned>(type), hostname.size());
 					std::wstring hostStr(hostname);
 
 					// RAII wrapper explicitly using PDNS_RECORDW to ensure Unicode compatibility
@@ -351,11 +351,11 @@ namespace ShadowStrike {
 							}
 						}
 						if (ipv6Skipped > 0) {
-							SS_LOG_WARN(L"NetworkUtils: QueryDns skipped %zu IPv6-only custom DNS servers (DnsQuery_W only supports IPv4 server list)", ipv6Skipped);
+							SS_LOG_WARN(L"NetworkUtils", L"QueryDns skipped %zu IPv6-only custom DNS servers (DnsQuery_W only supports IPv4 server list)", ipv6Skipped);
 						}
 
 						if (dnsServerAddresses.empty() && ipv6Skipped > 0) {
-							SS_LOG_WARN(L"NetworkUtils: All custom DNS servers were IPv6 — falling back to system DNS");
+							SS_LOG_WARN(L"NetworkUtils", L"All custom DNS servers were IPv6 — falling back to system DNS");
 						}
 						if (!dnsServerAddresses.empty()) {
 							constexpr size_t maxDnsServers = 64;
@@ -383,10 +383,10 @@ namespace ShadowStrike {
 
 					if (status != 0) {
 						if (status == DNS_INFO_NO_RECORDS) {
-							SS_LOG_DEBUG(L"NetworkUtils: DnsQuery_W returned no records");
+							SS_LOG_DEBUG(L"NetworkUtils", L"DnsQuery_W returned no records");
 							return true;
 						}
-						SS_LOG_ERROR(L"NetworkUtils: DnsQuery_W failed status=%lu", status);
+						SS_LOG_ERROR(L"NetworkUtils", L"DnsQuery_W failed status=%lu", status);
 						Internal::SetError(err, status, L"DnsQuery_W failed");
 						return false;
 					}
@@ -470,12 +470,12 @@ namespace ShadowStrike {
 					return true;
 				}
 				catch (const std::exception& e) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in QueryDns");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in QueryDns");
 					Internal::SetError(err, ERROR_GENERIC_NOT_MAPPED, L"Exception in QueryDns");
 					return false;
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Unknown exception in QueryDns");
+					SS_LOG_ERROR(L"NetworkUtils", L"Unknown exception in QueryDns");
 					Internal::SetError(err, ERROR_GENERIC_NOT_MAPPED, L"Unknown exception in QueryDns");
 					return false;
 				}

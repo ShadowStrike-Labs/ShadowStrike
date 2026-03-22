@@ -36,6 +36,7 @@
  * @copyright (c) 2026 ShadowStrike Security Suite. All rights reserved.
  */
 
+#include "pch.h"
 #include "SandboxEvasionDetector.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/ProcessUtils.hpp"

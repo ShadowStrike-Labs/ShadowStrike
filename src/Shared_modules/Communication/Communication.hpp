@@ -43,7 +43,11 @@ namespace Communication {
 // Constants
 //=============================================================================
 
-constexpr const wchar_t* SHADOWSTRIKE_PORT_NAME = L"\\ShadowStrikePort";
+#ifdef SHADOWSTRIKE_PORT_NAME
+inline constexpr const wchar_t* SS_COMM_PORT_NAME = SHADOWSTRIKE_PORT_NAME;
+#else
+inline constexpr const wchar_t* SS_COMM_PORT_NAME = L"\\ShadowStrikePort";
+#endif
 constexpr uint32_t MESSAGE_MAGIC = 0x53534653;  // "SSFS"
 constexpr uint16_t PROTOCOL_VERSION = 2;
 constexpr size_t MAX_MESSAGE_SIZE = 65536;
@@ -409,9 +413,10 @@ struct ScanVerdictReply {
 };
 
 //=============================================================================
-// Callback Types
+// Callback Types (only if not already defined by IPCManager.hpp kernel types)
 //=============================================================================
 
+#ifndef SS_IPC_CALLBACK_TYPES_DEFINED
 using FileScanCallback = std::function<ScanVerdictReply(const FileScanRequest&)>;
 using ProcessNotifyCallback = std::function<ScanVerdictReply(const ProcessNotification&)>;
 using RegistryNotifyCallback = std::function<ScanVerdictReply(const RegistryNotification&)>;
@@ -419,10 +424,31 @@ using FileNotifyCallback = std::function<void(const FileScanRequest&)>;
 using ProcessEventCallback = std::function<void(const ProcessNotification&)>;
 using RegistryEventCallback = std::function<void(const RegistryNotification&)>;
 using ConnectionStateCallback = std::function<void(ConnectionState, const std::string&)>;
+#endif
 
 //=============================================================================
 // Statistics
 //=============================================================================
+
+/**
+ * @brief POD snapshot of CommunicationStatistics (no atomics, freely copyable).
+ */
+struct CommunicationStatisticsSnapshot {
+    uint64_t messagesReceived = 0;
+    uint64_t messagesSent = 0;
+    uint64_t fileScanRequests = 0;
+    uint64_t processNotifications = 0;
+    uint64_t registryNotifications = 0;
+    uint64_t repliesSent = 0;
+    uint64_t timeouts = 0;
+    uint64_t errors = 0;
+    uint64_t reconnections = 0;
+    uint64_t bytesReceived = 0;
+    uint64_t bytesSent = 0;
+    int64_t uptimeSeconds = 0;
+
+    [[nodiscard]] std::string ToJson() const;
+};
 
 struct CommunicationStatistics {
     std::atomic<uint64_t> messagesReceived{0};
@@ -450,32 +476,12 @@ struct CommunicationStatistics {
     [[nodiscard]] CommunicationStatisticsSnapshot TakeSnapshot() const noexcept;
 };
 
-/**
- * @brief POD snapshot of CommunicationStatistics (no atomics, freely copyable).
- */
-struct CommunicationStatisticsSnapshot {
-    uint64_t messagesReceived = 0;
-    uint64_t messagesSent = 0;
-    uint64_t fileScanRequests = 0;
-    uint64_t processNotifications = 0;
-    uint64_t registryNotifications = 0;
-    uint64_t repliesSent = 0;
-    uint64_t timeouts = 0;
-    uint64_t errors = 0;
-    uint64_t reconnections = 0;
-    uint64_t bytesReceived = 0;
-    uint64_t bytesSent = 0;
-    int64_t uptimeSeconds = 0;
-
-    [[nodiscard]] std::string ToJson() const;
-};
-
 //=============================================================================
 // Configuration
 //=============================================================================
 
 struct CommunicationConfig {
-    std::wstring portName = SHADOWSTRIKE_PORT_NAME;
+    std::wstring portName = SS_COMM_PORT_NAME;
     uint32_t replyTimeoutMs = DEFAULT_REPLY_TIMEOUT_MS;
     uint32_t reconnectIntervalMs = 5000;
     uint32_t maxReconnectAttempts = 10;

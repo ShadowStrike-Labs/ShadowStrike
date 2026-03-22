@@ -330,8 +330,8 @@ private:
     std::deque<Notification> m_history;
     mutable std::shared_mutex m_historyMutex;
 
-    // Deduplication (tag -> last-shown time)
-    std::unordered_map<std::string, TimePoint> m_dedupMap;
+    // Deduplication (tag -> last-shown time; mutable: pruned from const ShouldSuppress)
+    mutable std::unordered_map<std::string, TimePoint> m_dedupMap;
     mutable std::mutex m_dedupMutex;
 
     // Rate limiting (sliding window of dispatch timestamps)
@@ -356,8 +356,8 @@ private:
     bool m_trayIconRegistered = false;
     HWND m_hiddenHwnd = nullptr;
 
-    // Statistics
-    NotificationStatistics m_stats;
+    // Statistics (mutable: updated from const observer methods)
+    mutable NotificationStatistics m_stats;
 };
 
 // ============================================================================
@@ -368,13 +368,13 @@ bool NotificationManagerImpl::Initialize(const NotificationConfiguration& config
     ModuleStatus expected = ModuleStatus::Uninitialized;
     if (!m_status.compare_exchange_strong(expected, ModuleStatus::Initializing,
                                           std::memory_order_acq_rel)) {
-        SS_LOG_WARN("NotifyMgr", "Already initialized (status={})",
+        Utils::Logger::Warn("Already initialized (status={})",
                     static_cast<int>(expected));
         return false;
     }
 
     if (!config.IsValid()) {
-        SS_LOG_ERROR("NotifyMgr", "Invalid configuration");
+        SS_LOG_ERROR(L"NotifyMgr", L"Invalid configuration");
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     }
@@ -391,7 +391,7 @@ bool NotificationManagerImpl::Initialize(const NotificationConfiguration& config
                                     0, 0, 0, 0, 0,
                                     HWND_MESSAGE, nullptr, nullptr, nullptr);
     if (!m_hiddenHwnd) {
-        SS_LOG_WARN("NotifyMgr", "Failed to create message window (err={}) — balloon tips may fail",
+        Utils::Logger::Warn("Failed to create message window (err={}) — balloon tips may fail",
                     GetLastError());
     }
 
@@ -402,7 +402,7 @@ bool NotificationManagerImpl::Initialize(const NotificationConfiguration& config
     m_initialized.store(true, std::memory_order_release);
     m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-    SS_LOG_INFO("NotifyMgr", "Initialized — rate_limit={}/min, dedup={}s, game_detect={}, meeting_detect={}",
+    Utils::Logger::Info("Initialized — rate_limit={}/min, dedup={}s, game_detect={}, meeting_detect={}",
                 config.rateLimitPerMinute, config.dedupWindowSeconds,
                 config.detectGameMode, config.detectMeetings);
     return true;
@@ -449,13 +449,13 @@ void NotificationManagerImpl::Shutdown() {
     }
 
     m_status.store(ModuleStatus::Stopped, std::memory_order_release);
-    SS_LOG_INFO("NotifyMgr", "Shutdown complete");
+    SS_LOG_INFO(L"NotifyMgr", L"Shutdown complete");
 }
 
 bool NotificationManagerImpl::UpdateConfiguration(const NotificationConfiguration& config) {
     if (!m_initialized.load(std::memory_order_acquire)) return false;
     if (!config.IsValid()) {
-        SS_LOG_WARN("NotifyMgr", "Rejected invalid configuration update");
+        SS_LOG_WARN(L"NotifyMgr", L"Rejected invalid configuration update");
         return false;
     }
 
@@ -464,7 +464,7 @@ bool NotificationManagerImpl::UpdateConfiguration(const NotificationConfiguratio
         m_config = config;
     }
 
-    SS_LOG_INFO("NotifyMgr", "Configuration updated — rate_limit={}/min",
+    Utils::Logger::Info("Configuration updated — rate_limit={}/min",
                 config.rateLimitPerMinute);
     return true;
 }
@@ -479,7 +479,7 @@ NotificationConfiguration NotificationManagerImpl::GetConfiguration() const {
 // ============================================================================
 
 void NotificationManagerImpl::DispatchLoop() {
-    SS_LOG_DEBUG("NotifyMgr", "Dispatch thread started");
+    SS_LOG_DEBUG(L"NotifyMgr", L"Dispatch thread started");
 
     while (m_running.load(std::memory_order_acquire)) {
         QueueEntry entry;
@@ -511,7 +511,7 @@ void NotificationManagerImpl::DispatchLoop() {
         if (!CheckRateLimit()) {
             entry.notification.status = NotificationStatus::Suppressed;
             m_stats.rateLimitHits.fetch_add(1, std::memory_order_relaxed);
-            SS_LOG_DEBUG("NotifyMgr", "Rate limited notification id={}",
+            Utils::Logger::Debug("Rate limited notification id={}",
                          entry.notification.notificationId);
             RecordToHistory(entry.notification);
             continue;
@@ -528,7 +528,7 @@ void NotificationManagerImpl::DispatchLoop() {
         DeliverNotification(entry.notification);
     }
 
-    SS_LOG_DEBUG("NotifyMgr", "Dispatch thread stopped");
+    SS_LOG_DEBUG(L"NotifyMgr", L"Dispatch thread stopped");
 }
 
 // ============================================================================
@@ -536,7 +536,7 @@ void NotificationManagerImpl::DispatchLoop() {
 // ============================================================================
 
 void NotificationManagerImpl::QuietModeMonitorLoop() {
-    SS_LOG_DEBUG("NotifyMgr", "Quiet mode monitor started");
+    SS_LOG_DEBUG(L"NotifyMgr", L"Quiet mode monitor started");
 
     while (m_running.load(std::memory_order_acquire)) {
         {
@@ -587,13 +587,13 @@ void NotificationManagerImpl::QuietModeMonitorLoop() {
 
         const auto prev = m_quietModeState.exchange(newState, std::memory_order_acq_rel);
         if (prev != newState) {
-            SS_LOG_INFO("NotifyMgr", "Quiet mode changed: {} -> {}",
+            Utils::Logger::Info("Quiet mode changed: {} -> {}",
                         std::string(GetQuietModeStateName(prev)),
                         std::string(GetQuietModeStateName(newState)));
         }
     }
 
-    SS_LOG_DEBUG("NotifyMgr", "Quiet mode monitor stopped");
+    SS_LOG_DEBUG(L"NotifyMgr", L"Quiet mode monitor stopped");
 }
 
 // ============================================================================
@@ -730,7 +730,7 @@ void NotificationManagerImpl::DeliverNotification(Notification& n) {
                 n.status = NotificationStatus::Shown;
                 break;
             default:
-                SS_LOG_WARN("NotifyMgr", "Unknown notification type {} for id={}",
+                Utils::Logger::Warn("Unknown notification type {} for id={}",
                             static_cast<int>(n.type), n.notificationId);
                 n.status = NotificationStatus::Failed;
                 m_stats.totalFailed.fetch_add(1, std::memory_order_relaxed);
@@ -761,7 +761,7 @@ void NotificationManagerImpl::DeliverNotification(Notification& n) {
         RecordToHistory(n);
 
     } catch (const std::exception& ex) {
-        SS_LOG_ERROR("NotifyMgr", "Exception delivering notification id={}: {}",
+        Utils::Logger::Error("Exception delivering notification id={}: {}",
                      n.notificationId, ex.what());
         n.status = NotificationStatus::Failed;
         m_stats.totalFailed.fetch_add(1, std::memory_order_relaxed);
@@ -793,7 +793,7 @@ void NotificationManagerImpl::DeliverBalloon(const Notification& n) {
         m_trayIcon.uCallbackMessage = WM_APP + 100;
 
         // Use application icon
-        m_trayIcon.hIcon = LoadIconW(nullptr, IDI_SHIELD);
+        m_trayIcon.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32518));
         StringCchCopyW(m_trayIcon.szTip, ARRAYSIZE(m_trayIcon.szTip),
                        L"ShadowStrike EDR");
 
@@ -803,7 +803,7 @@ void NotificationManagerImpl::DeliverBalloon(const Notification& n) {
             Shell_NotifyIconW(NIM_SETVERSION, &m_trayIcon);
             m_trayIconRegistered = true;
         } else {
-            SS_LOG_WARN("NotifyMgr", "Failed to register system tray icon (err={})",
+            Utils::Logger::Warn("Failed to register system tray icon (err={})",
                         GetLastError());
         }
     }
@@ -853,7 +853,7 @@ void NotificationManagerImpl::DeliverBalloon(const Notification& n) {
     if (Shell_NotifyIconW(NIM_MODIFY, &balloon)) {
         const_cast<Notification&>(n).status = NotificationStatus::Shown;
     } else {
-        SS_LOG_WARN("NotifyMgr", "Balloon notification failed (err={})", GetLastError());
+        Utils::Logger::Warn("Balloon notification failed (err={})", GetLastError());
         const_cast<Notification&>(n).status = NotificationStatus::Failed;
         m_stats.totalFailed.fetch_add(1, std::memory_order_relaxed);
     }
@@ -934,7 +934,7 @@ void NotificationManagerImpl::NotifyCallbackShown(const Notification& n) {
     if (cb) {
         try { cb(n); }
         catch (const std::exception& ex) {
-            SS_LOG_ERROR("NotifyMgr", "Notification callback threw: {}", ex.what());
+            Utils::Logger::Error("Notification callback threw: {}", ex.what());
         }
     }
 }
@@ -970,7 +970,7 @@ void NotificationManagerImpl::ShowSimple(const std::wstring& title,
     {
         std::unique_lock lock(m_queueMutex);
         if (m_queue.size() >= NotificationConstants::MAX_QUEUE_SIZE) {
-            SS_LOG_WARN("NotifyMgr", "Queue full ({}) — dropping notification id={}",
+            Utils::Logger::Warn("Queue full ({}) — dropping notification id={}",
                         m_queue.size(), n.notificationId);
             m_stats.totalFailed.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -992,7 +992,7 @@ std::string NotificationManagerImpl::ShowFull(const Notification& notification) 
     {
         std::unique_lock lock(m_queueMutex);
         if (m_queue.size() >= NotificationConstants::MAX_QUEUE_SIZE) {
-            SS_LOG_WARN("NotifyMgr", "Queue full — dropping notification id={}", id);
+            Utils::Logger::Warn("Queue full — dropping notification id={}", id);
             m_stats.totalFailed.fetch_add(1, std::memory_order_relaxed);
             return {};
         }
@@ -1145,7 +1145,7 @@ void NotificationManagerImpl::ClearAll() {
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 
-    SS_LOG_DEBUG("NotifyMgr", "All notifications cleared");
+    SS_LOG_DEBUG(L"NotifyMgr", L"All notifications cleared");
 }
 
 // ============================================================================
@@ -1154,13 +1154,13 @@ void NotificationManagerImpl::ClearAll() {
 
 void NotificationManagerImpl::EnableQuietMode(QuietModeState state) {
     m_quietModeState.store(state, std::memory_order_release);
-    SS_LOG_INFO("NotifyMgr", "Quiet mode enabled: {}",
+    Utils::Logger::Info("Quiet mode enabled: {}",
                 std::string(GetQuietModeStateName(state)));
 }
 
 void NotificationManagerImpl::DisableQuietMode() {
     m_quietModeState.store(QuietModeState::Off, std::memory_order_release);
-    SS_LOG_INFO("NotifyMgr", "Quiet mode disabled");
+    SS_LOG_INFO(L"NotifyMgr", L"Quiet mode disabled");
 }
 
 bool NotificationManagerImpl::IsQuietModeActive() const noexcept {
@@ -1230,7 +1230,7 @@ std::vector<Notification> NotificationManagerImpl::GetNotificationsByCategory(
 void NotificationManagerImpl::ClearHistory() {
     std::unique_lock lock(m_historyMutex);
     m_history.clear();
-    SS_LOG_DEBUG("NotifyMgr", "History cleared");
+    SS_LOG_DEBUG(L"NotifyMgr", L"History cleared");
 }
 
 // ============================================================================
@@ -1239,7 +1239,7 @@ void NotificationManagerImpl::ClearHistory() {
 
 void NotificationManagerImpl::SetPreferences(const NotificationPreferences& prefs) {
     if (!prefs.IsValid()) {
-        SS_LOG_WARN("NotifyMgr", "Rejected invalid preferences");
+        SS_LOG_WARN(L"NotifyMgr", L"Rejected invalid preferences");
         return;
     }
     std::unique_lock lock(m_configMutex);
@@ -1308,26 +1308,26 @@ NotificationStatisticsSnapshot NotificationManagerImpl::GetStatistics() const no
 
 void NotificationManagerImpl::ResetStatistics() {
     m_stats.Reset();
-    SS_LOG_DEBUG("NotifyMgr", "Statistics reset");
+    SS_LOG_DEBUG(L"NotifyMgr", L"Statistics reset");
 }
 
 bool NotificationManagerImpl::SelfTest() {
-    SS_LOG_INFO("NotifyMgr", "Running self-test...");
+    SS_LOG_INFO(L"NotifyMgr", L"Running self-test...");
 
     if (!m_initialized.load(std::memory_order_acquire)) {
-        SS_LOG_ERROR("NotifyMgr", "Self-test failed: not initialized");
+        SS_LOG_ERROR(L"NotifyMgr", L"Self-test failed: not initialized");
         return false;
     }
 
     // Verify dispatch thread is alive
     if (!m_dispatchThread.joinable()) {
-        SS_LOG_ERROR("NotifyMgr", "Self-test failed: dispatch thread not running");
+        SS_LOG_ERROR(L"NotifyMgr", L"Self-test failed: dispatch thread not running");
         return false;
     }
 
     // Verify quiet mode monitor is alive
     if (!m_quietModeThread.joinable()) {
-        SS_LOG_ERROR("NotifyMgr", "Self-test failed: quiet mode monitor not running");
+        SS_LOG_ERROR(L"NotifyMgr", L"Self-test failed: quiet mode monitor not running");
         return false;
     }
 
@@ -1338,12 +1338,12 @@ bool NotificationManagerImpl::SelfTest() {
             const auto age = std::chrono::duration_cast<std::chrono::seconds>(
                 Clock::now() - m_queue.front().enqueuedAt).count();
             if (age > 30) {
-                SS_LOG_WARN("NotifyMgr", "Self-test warning: oldest queue item is {}s old", age);
+                Utils::Logger::Warn("Self-test warning: oldest queue item is {}s old", age);
             }
         }
     }
 
-    SS_LOG_INFO("NotifyMgr", "Self-test passed");
+    SS_LOG_INFO(L"NotifyMgr", L"Self-test passed");
     return true;
 }
 

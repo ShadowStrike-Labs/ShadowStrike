@@ -94,13 +94,13 @@ namespace ShadowStrike {
 
 			bool GetSystemProxySettings(ProxyInfo& proxy, Error* err) noexcept {
 				try {
-					SS_LOG_DEBUG(L"NetworkUtils: GetSystemProxySettings querying IE proxy config");
+					SS_LOG_DEBUG(L"NetworkUtils", L"GetSystemProxySettings querying IE proxy config");
 					proxy = ProxyInfo{};
 
 					WINHTTP_CURRENT_USER_IE_PROXY_CONFIG proxyConfig{};
 
 					if (!::WinHttpGetIEProxyConfigForCurrentUser(&proxyConfig)) {
-						SS_LOG_ERROR(L"NetworkUtils: WinHttpGetIEProxyConfigForCurrentUser failed err=%lu", ::GetLastError());
+						SS_LOG_ERROR(L"NetworkUtils", L"WinHttpGetIEProxyConfigForCurrentUser failed err=%lu", ::GetLastError());
 					Internal::SetError(err, ::GetLastError(), L"WinHttpGetIEProxyConfigForCurrentUser failed");
 						return false;
 					}
@@ -135,7 +135,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in GetSystemProxySettings");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in GetSystemProxySettings");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetSystemProxySettings");
 					return false;
 				}
@@ -143,7 +143,7 @@ namespace ShadowStrike {
 
 			bool SetSystemProxySettings(const ProxyInfo& proxy, Error* err) noexcept {
 				try {
-					SS_LOG_WARN(L"NetworkUtils: SetSystemProxySettings modifying system proxy — enabled=%d server=%ls",
+					SS_LOG_WARN(L"NetworkUtils", L"SetSystemProxySettings modifying system proxy — enabled=%d server=%ls",
 						proxy.enabled ? 1 : 0, proxy.server.c_str());
 
 					// Internet Settings registry path
@@ -229,7 +229,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in SetSystemProxySettings");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in SetSystemProxySettings");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in SetSystemProxySettings");
 					return false;
 				}
@@ -237,12 +237,12 @@ namespace ShadowStrike {
 
 			bool DetectProxyForUrl(std::wstring_view url, ProxyInfo& proxy, Error* err) noexcept {
 				try {
-					SS_LOG_DEBUG(L"NetworkUtils: DetectProxyForUrl starting");
+					SS_LOG_DEBUG(L"NetworkUtils", L"DetectProxyForUrl starting");
 					proxy = ProxyInfo{};
 
 					// Validate URL before passing to WinHTTP PAC engine
 					if (url.empty() || url.size() > 8192) {
-						SS_LOG_ERROR(L"NetworkUtils: DetectProxyForUrl invalid URL length=%zu", url.size());
+						SS_LOG_ERROR(L"NetworkUtils", L"DetectProxyForUrl invalid URL length=%zu", url.size());
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid URL for proxy detection");
 						return false;
 					}
@@ -329,7 +329,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in DetectProxyForUrl");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in DetectProxyForUrl");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in DetectProxyForUrl");
 					return false;
 				}
@@ -422,7 +422,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in ShouldBypassProxy");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in ShouldBypassProxy");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in ShouldBypassProxy");
 					return false;
 				}
@@ -431,7 +431,7 @@ namespace ShadowStrike {
 			//Proxy authentication test — sends actual HTTP HEAD to verify proxy + auth
 			bool TestProxyConnection(const ProxyInfo& proxy, Error* err) noexcept {
 				try {
-					SS_LOG_DEBUG(L"NetworkUtils: TestProxyConnection starting");
+					SS_LOG_DEBUG(L"NetworkUtils", L"TestProxyConnection starting");
 
 					if (!proxy.enabled || proxy.server.empty()) {
 						return true; // No proxy, connection is direct
@@ -450,7 +450,7 @@ namespace ShadowStrike {
 						0);
 
 					if (!hSession) {
-						SS_LOG_ERROR(L"NetworkUtils: TestProxyConnection WinHttpOpen failed err=%lu", ::GetLastError());
+						SS_LOG_ERROR(L"NetworkUtils", L"TestProxyConnection WinHttpOpen failed err=%lu", ::GetLastError());
 						Internal::SetError(err, ::GetLastError(), L"WinHttpOpen failed");
 						return false;
 					}
@@ -463,7 +463,7 @@ namespace ShadowStrike {
 					HINTERNET hConnect = ::WinHttpConnect(hSession, L"www.msftconnecttest.com",
 						INTERNET_DEFAULT_HTTP_PORT, 0);
 					if (!hConnect) {
-						SS_LOG_ERROR(L"NetworkUtils: TestProxyConnection WinHttpConnect failed err=%lu", ::GetLastError());
+						SS_LOG_ERROR(L"NetworkUtils", L"TestProxyConnection WinHttpConnect failed err=%lu", ::GetLastError());
 						Internal::SetError(err, ::GetLastError(), L"Proxy connection test failed");
 						return false;
 					}
@@ -473,7 +473,7 @@ namespace ShadowStrike {
 					HINTERNET hRequest = ::WinHttpOpenRequest(hConnect, L"HEAD", L"/connecttest.txt",
 						nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
 					if (!hRequest) {
-						SS_LOG_ERROR(L"NetworkUtils: TestProxyConnection WinHttpOpenRequest failed");
+						SS_LOG_ERROR(L"NetworkUtils", L"TestProxyConnection WinHttpOpenRequest failed");
 						Internal::SetError(err, ::GetLastError(), L"WinHttpOpenRequest failed");
 						return false;
 					}
@@ -482,14 +482,14 @@ namespace ShadowStrike {
 					if (!::WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
 						WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
 						DWORD lastErr = ::GetLastError();
-						SS_LOG_ERROR(L"NetworkUtils: TestProxyConnection send failed err=%lu", lastErr);
+						SS_LOG_ERROR(L"NetworkUtils", L"TestProxyConnection send failed err=%lu", lastErr);
 						Internal::SetError(err, lastErr, L"Proxy test request failed");
 						return false;
 					}
 
 					if (!::WinHttpReceiveResponse(hRequest, nullptr)) {
 						DWORD lastErr = ::GetLastError();
-						SS_LOG_ERROR(L"NetworkUtils: TestProxyConnection receive failed err=%lu", lastErr);
+						SS_LOG_ERROR(L"NetworkUtils", L"TestProxyConnection receive failed err=%lu", lastErr);
 						Internal::SetError(err, lastErr, L"Proxy test response failed");
 						return false;
 					}
@@ -500,22 +500,22 @@ namespace ShadowStrike {
 					if (!::WinHttpQueryHeaders(hRequest,
 						WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
 						nullptr, &statusCode, &statusSize, nullptr)) {
-						SS_LOG_WARN(L"NetworkUtils: Could not query HTTP status code, assuming proxy reachable");
+						SS_LOG_WARN(L"NetworkUtils", L"Could not query HTTP status code, assuming proxy reachable");
 						return true;
 					}
 
 					if (statusCode == 407) {
-						SS_LOG_WARN(L"NetworkUtils: Proxy requires authentication (407)");
+						SS_LOG_WARN(L"NetworkUtils", L"Proxy requires authentication (407)");
 						Internal::SetError(err, ERROR_ACCESS_DENIED, L"Proxy requires authentication");
 						return false;
 					}
 
-					SS_LOG_INFO(L"NetworkUtils: TestProxyConnection succeeded status=%lu", statusCode);
+					SS_LOG_INFO(L"NetworkUtils", L"TestProxyConnection succeeded status=%lu", statusCode);
 					return true;
 
 				}
 				catch (...) {
-					SS_LOG_ERROR(L"NetworkUtils: Exception in TestProxyConnection");
+					SS_LOG_ERROR(L"NetworkUtils", L"Exception in TestProxyConnection");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in TestProxyConnection");
 					return false;
 				}

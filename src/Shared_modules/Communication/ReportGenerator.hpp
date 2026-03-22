@@ -123,7 +123,7 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
-#include "../Utils/TimeUtils.hpp"
+#include <chrono>
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -558,6 +558,21 @@ struct ReportSchedule {
 };
 
 /**
+ * @brief Statistics snapshot (copyable POD for thread-safe return)
+ */
+struct ReportStatisticsSnapshot {
+    uint64_t reportsGenerated = 0;
+    uint64_t reportsFailed = 0;
+    uint64_t reportsDelivered = 0;
+    uint64_t totalGenerationTimeMs = 0;
+    uint64_t totalSizeBytes = 0;
+    std::array<uint64_t, 16> byFormat{};
+    std::array<uint64_t, 16> byType{};
+    
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
  * @brief Statistics
  */
 struct ReportStatistics {
@@ -572,21 +587,6 @@ struct ReportStatistics {
     
     void Reset() noexcept;
     [[nodiscard]] ReportStatisticsSnapshot TakeSnapshot() const noexcept;
-    [[nodiscard]] std::string ToJson() const;
-};
-
-/**
- * @brief Statistics snapshot (copyable POD for thread-safe return)
- */
-struct ReportStatisticsSnapshot {
-    uint64_t reportsGenerated = 0;
-    uint64_t reportsFailed = 0;
-    uint64_t reportsDelivered = 0;
-    uint64_t totalGenerationTimeMs = 0;
-    uint64_t totalSizeBytes = 0;
-    std::array<uint64_t, 16> byFormat{};
-    std::array<uint64_t, 16> byType{};
-    
     [[nodiscard]] std::string ToJson() const;
 };
 

@@ -21,6 +21,8 @@
 
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
+#include "../Utils/HashUtils.hpp"
+#include "../Utils/Logger.hpp"
 
 #include <algorithm>
 #include <deque>
@@ -29,6 +31,7 @@
 #include <regex>
 #include <cstdio>
 #include <ctime>
+#include <psapi.h>
 #include <sddl.h>
 #include <shlobj.h>
 
@@ -181,8 +184,8 @@ std::string ScrubPII(const std::string& data) {
 }
 
 std::string HashSensitiveData(const std::string& data) {
-    Utils::CryptoUtils::Hasher hasher(Utils::CryptoUtils::Algorithm::SHA256);
-    Utils::CryptoUtils::Error err;
+    Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+    Utils::HashUtils::Error err;
     if (!hasher.Init(&err)) return "[HASH_ERROR]";
     if (!hasher.Update(data.data(), data.size(), &err)) return "[HASH_ERROR]";
     std::string hex;
@@ -362,13 +365,13 @@ bool TelemetryCollectorImpl::Initialize(const TelemetryConfiguration& config) {
     TelemetryModuleStatus expected = TelemetryModuleStatus::Uninitialized;
     if (!m_status.compare_exchange_strong(expected, TelemetryModuleStatus::Initializing,
                                           std::memory_order_acq_rel)) {
-        SS_LOG_WARN("Telemetry", "Already initialized (status={})",
+        Utils::Logger::Warn("Already initialized (status={})",
                     static_cast<int>(expected));
         return false;
     }
 
     if (!config.IsValid()) {
-        SS_LOG_ERROR("Telemetry", "Invalid configuration");
+        SS_LOG_ERROR(L"Telemetry", L"Invalid configuration");
         m_status.store(TelemetryModuleStatus::Error, std::memory_order_release);
         return false;
     }
@@ -404,7 +407,7 @@ bool TelemetryCollectorImpl::Initialize(const TelemetryConfiguration& config) {
     m_initialized.store(true, std::memory_order_release);
     m_status.store(TelemetryModuleStatus::Running, std::memory_order_release);
 
-    SS_LOG_INFO("Telemetry", "Initialized — consent={}, anon={}, batch={}, flush={}h, endpoint={}",
+    Utils::Logger::Info("Initialized — consent={}, anon={}, batch={}, flush={}h, endpoint={}",
                 std::string(GetConsentLevelName(config.consentLevel)),
                 std::string(GetAnonymizationLevelName(config.anonymizationLevel)),
                 config.batchSize, config.flushIntervalHours,
@@ -439,14 +442,14 @@ void TelemetryCollectorImpl::Shutdown() {
     PersistOfflineQueue();
 
     m_status.store(TelemetryModuleStatus::Stopped, std::memory_order_release);
-    SS_LOG_INFO("Telemetry", "Shutdown complete — {} events persisted to offline queue",
+    Utils::Logger::Info("Shutdown complete — {} events persisted to offline queue",
                 m_eventQueue.size());
 }
 
 bool TelemetryCollectorImpl::UpdateConfiguration(const TelemetryConfiguration& config) {
     if (!m_initialized.load(std::memory_order_acquire)) return false;
     if (!config.IsValid()) {
-        SS_LOG_WARN("Telemetry", "Rejected invalid configuration update");
+        SS_LOG_WARN(L"Telemetry", L"Rejected invalid configuration update");
         return false;
     }
 
@@ -456,7 +459,7 @@ bool TelemetryCollectorImpl::UpdateConfiguration(const TelemetryConfiguration& c
     }
 
     m_consentLevel.store(config.consentLevel, std::memory_order_release);
-    SS_LOG_INFO("Telemetry", "Configuration updated — consent={}, batch={}",
+    Utils::Logger::Info("Configuration updated — consent={}, batch={}",
                 std::string(GetConsentLevelName(config.consentLevel)),
                 config.batchSize);
     return true;
@@ -472,7 +475,7 @@ TelemetryConfiguration TelemetryCollectorImpl::GetConfiguration() const {
 // ============================================================================
 
 void TelemetryCollectorImpl::FlushLoop() {
-    SS_LOG_DEBUG("Telemetry", "Flush thread started");
+    SS_LOG_DEBUG(L"Telemetry", L"Flush thread started");
 
     while (m_running.load(std::memory_order_acquire)) {
         uint32_t intervalHours = 0;
@@ -495,7 +498,7 @@ void TelemetryCollectorImpl::FlushLoop() {
         Flush();
     }
 
-    SS_LOG_DEBUG("Telemetry", "Flush thread stopped");
+    SS_LOG_DEBUG(L"Telemetry", L"Flush thread stopped");
 }
 
 // ============================================================================
@@ -503,7 +506,7 @@ void TelemetryCollectorImpl::FlushLoop() {
 // ============================================================================
 
 void TelemetryCollectorImpl::HealthCollectorLoop() {
-    SS_LOG_DEBUG("Telemetry", "Health collector started");
+    SS_LOG_DEBUG(L"Telemetry", L"Health collector started");
 
     while (m_running.load(std::memory_order_acquire)) {
         {
@@ -569,7 +572,7 @@ void TelemetryCollectorImpl::HealthCollectorLoop() {
         RecordHealth(health);
     }
 
-    SS_LOG_DEBUG("Telemetry", "Health collector stopped");
+    SS_LOG_DEBUG(L"Telemetry", L"Health collector stopped");
 }
 
 // ============================================================================
@@ -636,7 +639,7 @@ void TelemetryCollectorImpl::EnqueueEvent(TelemetryEvent event) {
         std::unique_lock lock(m_queueMutex);
         if (m_eventQueue.size() >= maxQueue) {
             m_stats.eventsDropped.fetch_add(1, std::memory_order_relaxed);
-            SS_LOG_DEBUG("Telemetry", "Queue full ({}) — dropping event {}",
+            Utils::Logger::Debug("Queue full ({}) — dropping event {}",
                          m_eventQueue.size(), event.eventId);
             return;
         }
@@ -842,7 +845,7 @@ void TelemetryCollectorImpl::SetConsentLevel(ConsentLevel level) {
     }
 
     if (old != level) {
-        SS_LOG_INFO("Telemetry", "Consent level changed: {} -> {}",
+        Utils::Logger::Info("Consent level changed: {} -> {}",
                     std::string(GetConsentLevelName(old)),
                     std::string(GetConsentLevelName(level)));
     }
@@ -868,7 +871,7 @@ bool TelemetryCollectorImpl::RequestConsent(ConsentLevel requestedLevel) {
         cb = m_consentCb;
     }
     if (!cb) {
-        SS_LOG_WARN("Telemetry", "No consent callback registered");
+        SS_LOG_WARN(L"Telemetry", L"No consent callback registered");
         return false;
     }
 
@@ -876,7 +879,7 @@ bool TelemetryCollectorImpl::RequestConsent(ConsentLevel requestedLevel) {
     try {
         granted = cb(requestedLevel);
     } catch (const std::exception& ex) {
-        SS_LOG_ERROR("Telemetry", "Consent callback threw: {}", ex.what());
+        Utils::Logger::Error("Consent callback threw: {}", ex.what());
         return false;
     }
 
@@ -971,7 +974,7 @@ void TelemetryCollectorImpl::Flush() {
     if (m_running.load(std::memory_order_acquire))
         m_status.store(TelemetryModuleStatus::Running, std::memory_order_release);
 
-    SS_LOG_INFO("Telemetry", "Flush complete — submitted={}, failed={}",
+    Utils::Logger::Info("Flush complete — submitted={}, failed={}",
                 totalSubmitted, totalFailed);
 }
 
@@ -1022,7 +1025,7 @@ bool TelemetryCollectorImpl::SubmitBatch(TelemetryBatch& batch) {
     }
 
     if (endpoint.empty()) {
-        SS_LOG_DEBUG("Telemetry", "No endpoint configured — batch {} skipped", batch.batchId);
+        Utils::Logger::Debug("No endpoint configured — batch {} skipped", batch.batchId);
         batch.status = SubmissionStatus::Submitted;
         batch.submittedTime = std::chrono::system_clock::now();
         for (auto& evt : batch.events)
@@ -1045,7 +1048,7 @@ bool TelemetryCollectorImpl::SubmitBatch(TelemetryBatch& batch) {
     std::vector<uint8_t> response;
 
     Utils::NetworkUtils::HttpRequestOptions opts;
-    opts.method = L"POST";
+    opts.method = Utils::NetworkUtils::HttpMethod::POST;
     opts.contentType = L"application/json";
     opts.timeoutMs = 30000;
     if (!apiKey.empty()) {
@@ -1066,11 +1069,11 @@ bool TelemetryCollectorImpl::SubmitBatch(TelemetryBatch& batch) {
         for (auto& evt : batch.events)
             evt.status = SubmissionStatus::Submitted;
 
-        SS_LOG_DEBUG("Telemetry", "Batch {} submitted ({} events, {} bytes)",
+        Utils::Logger::Debug("Batch {} submitted ({} events, {} bytes)",
                      batch.batchId, batch.events.size(), postData.size());
     } else {
         batch.status = SubmissionStatus::Failed;
-        SS_LOG_WARN("Telemetry", "Batch {} submission failed: {}",
+        Utils::Logger::Warn("Batch {} submission failed: {}",
                     batch.batchId, ToNarrow(netErr.message));
         NotifyError("Batch submission failed: " + ToNarrow(netErr.message), netErr.win32);
     }
@@ -1116,10 +1119,10 @@ void TelemetryCollectorImpl::PersistOfflineQueue() {
     Utils::FileUtils::Error fsErr;
     if (!Utils::FileUtils::WriteAllTextUtf8Atomic(
             m_offlineQueuePath.wstring(), json, &fsErr)) {
-        SS_LOG_WARN("Telemetry", "Failed to persist offline queue: {}",
-                    ToNarrow(fsErr.message));
+        Utils::Logger::Warn("Failed to persist offline queue: {}",
+                    fsErr.message);
     } else {
-        SS_LOG_DEBUG("Telemetry", "Persisted {} events to offline queue", count);
+        Utils::Logger::Debug("Persisted {} events to offline queue", count);
     }
 }
 
@@ -1136,8 +1139,8 @@ void TelemetryCollectorImpl::LoadOfflineQueue() {
     std::string content;
     Utils::FileUtils::Error fsErr;
     if (!Utils::FileUtils::ReadAllTextUtf8(m_offlineQueuePath.wstring(), content, &fsErr)) {
-        SS_LOG_WARN("Telemetry", "Failed to load offline queue: {}",
-                    ToNarrow(fsErr.message));
+        Utils::Logger::Warn("Failed to load offline queue: {}",
+                    fsErr.message);
         return;
     }
 
@@ -1195,7 +1198,7 @@ void TelemetryCollectorImpl::LoadOfflineQueue() {
     }
 
     if (restored > 0) {
-        SS_LOG_INFO("Telemetry", "Restored {} events from offline queue", restored);
+        Utils::Logger::Info("Restored {} events from offline queue", restored);
     }
 }
 
@@ -1243,7 +1246,7 @@ void TelemetryCollectorImpl::ClearQueue() {
         Utils::FileUtils::RemoveFile(m_offlineQueuePath.wstring(), &fsErr);
     }
 
-    SS_LOG_DEBUG("Telemetry", "Queue cleared");
+    SS_LOG_DEBUG(L"Telemetry", L"Queue cleared");
 }
 
 void TelemetryCollectorImpl::OptOut() {
@@ -1256,7 +1259,7 @@ void TelemetryCollectorImpl::OptOut() {
     }
 
     ResetStatistics();
-    SS_LOG_INFO("Telemetry", "User opted out — all telemetry data cleared");
+    SS_LOG_INFO(L"Telemetry", L"User opted out — all telemetry data cleared");
 }
 
 // ============================================================================
@@ -1300,7 +1303,7 @@ void TelemetryCollectorImpl::NotifyEventCb(const TelemetryEvent& event) {
     if (cb) {
         try { cb(event); }
         catch (const std::exception& ex) {
-            SS_LOG_ERROR("Telemetry", "Event callback threw: {}", ex.what());
+            Utils::Logger::Error("Event callback threw: {}", ex.what());
         }
     }
 }
@@ -1314,7 +1317,7 @@ void TelemetryCollectorImpl::NotifyBatchCb(const TelemetryBatch& batch) {
     if (cb) {
         try { cb(batch); }
         catch (const std::exception& ex) {
-            SS_LOG_ERROR("Telemetry", "Batch callback threw: {}", ex.what());
+            Utils::Logger::Error("Batch callback threw: {}", ex.what());
         }
     }
 }
@@ -1341,19 +1344,19 @@ TelemetryStatisticsSnapshot TelemetryCollectorImpl::GetStatistics() const noexce
 
 void TelemetryCollectorImpl::ResetStatistics() {
     m_stats.Reset();
-    SS_LOG_DEBUG("Telemetry", "Statistics reset");
+    SS_LOG_DEBUG(L"Telemetry", L"Statistics reset");
 }
 
 bool TelemetryCollectorImpl::SelfTest() {
-    SS_LOG_INFO("Telemetry", "Running self-test...");
+    SS_LOG_INFO(L"Telemetry", L"Running self-test...");
 
     if (!m_initialized.load(std::memory_order_acquire)) {
-        SS_LOG_ERROR("Telemetry", "Self-test failed: not initialized");
+        SS_LOG_ERROR(L"Telemetry", L"Self-test failed: not initialized");
         return false;
     }
 
     if (!m_flushThread.joinable()) {
-        SS_LOG_ERROR("Telemetry", "Self-test failed: flush thread not running");
+        SS_LOG_ERROR(L"Telemetry", L"Self-test failed: flush thread not running");
         return false;
     }
 
@@ -1361,26 +1364,26 @@ bool TelemetryCollectorImpl::SelfTest() {
     const std::string testInput = "test@example.com accessed 192.168.1.100 from C:\\Users\\admin\\Desktop";
     const std::string scrubbed = ScrubPII(testInput);
     if (scrubbed.find("test@example.com") != std::string::npos) {
-        SS_LOG_ERROR("Telemetry", "Self-test failed: PII scrubbing did not remove email");
+        SS_LOG_ERROR(L"Telemetry", L"Self-test failed: PII scrubbing did not remove email");
         return false;
     }
     if (scrubbed.find("192.168.1.100") != std::string::npos) {
-        SS_LOG_ERROR("Telemetry", "Self-test failed: PII scrubbing did not anonymize IP");
+        SS_LOG_ERROR(L"Telemetry", L"Self-test failed: PII scrubbing did not anonymize IP");
         return false;
     }
     if (scrubbed.find("\\admin\\") != std::string::npos) {
-        SS_LOG_ERROR("Telemetry", "Self-test failed: PII scrubbing did not normalize path");
+        SS_LOG_ERROR(L"Telemetry", L"Self-test failed: PII scrubbing did not normalize path");
         return false;
     }
 
     // Test machine ID generation
     const auto id = GenerateAnonymousMachineId();
     if (id.empty() || id == "[HASH_ERROR]") {
-        SS_LOG_ERROR("Telemetry", "Self-test failed: machine ID generation failed");
+        SS_LOG_ERROR(L"Telemetry", L"Self-test failed: machine ID generation failed");
         return false;
     }
 
-    SS_LOG_INFO("Telemetry", "Self-test passed");
+    SS_LOG_INFO(L"Telemetry", L"Self-test passed");
     return true;
 }
 
