@@ -97,6 +97,7 @@ namespace ShadowStrike {
 			bool ResolveHostname(std::wstring_view hostname, std::vector<IpAddress>& addresses, AddressFamily family, Error* err) noexcept {
 				try {
 					addresses.clear();
+					SS_LOG_DEBUG(L"NetworkUtils: ResolveHostname called len=%zu family=%u", hostname.size(), static_cast<unsigned>(family));
 
 					// Validate hostname length to prevent buffer overflow attacks
 					if (hostname.empty() || hostname.size() > 255) {
@@ -132,17 +133,25 @@ namespace ShadowStrike {
 					addrinfo* result = nullptr;
 					int ret = ::getaddrinfo(hostnameA.c_str(), nullptr, &hints, &result);
 					if (ret != 0) {
-						Internal::SetWsaError(err, WSAGetLastError(), L"getaddrinfo");
+						SS_LOG_ERROR(L"NetworkUtils: getaddrinfo failed ret=%d", ret);
+						Internal::SetWsaError(err, ret, L"getaddrinfo");
 						return false;
 					}
 
+					// RAII guard ensures freeaddrinfo on all paths (including exception)
+					struct AddrInfoGuard {
+						addrinfo* p;
+						~AddrInfoGuard() { if (p) ::freeaddrinfo(p); }
+					} aiGuard{result};
+
 					for (addrinfo* ptr = result; ptr != nullptr; ptr = ptr->ai_next) {
-						if (ptr->ai_family == AF_INET) {
+						if (ptr->ai_addr == nullptr) continue;
+						if (ptr->ai_family == AF_INET && ptr->ai_addrlen >= sizeof(sockaddr_in)) {
 							auto* sa = reinterpret_cast<sockaddr_in*>(ptr->ai_addr);
 							uint32_t addr = Internal::NetworkToHost32(sa->sin_addr.s_addr);
 							addresses.emplace_back(IPv4Address(addr));
 						}
-						else if (ptr->ai_family == AF_INET6) {
+						else if (ptr->ai_family == AF_INET6 && ptr->ai_addrlen >= sizeof(sockaddr_in6)) {
 							auto* sa6 = reinterpret_cast<sockaddr_in6*>(ptr->ai_addr);
 							std::array<uint8_t, 16> bytes;
 							std::memcpy(bytes.data(), &sa6->sin6_addr, 16);
@@ -150,11 +159,11 @@ namespace ShadowStrike {
 						}
 					}
 
-					::freeaddrinfo(result);
 					return !addresses.empty();
 
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in ResolveHostname");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in ResolveHostname");
 					return false;
 				}
@@ -199,6 +208,7 @@ namespace ShadowStrike {
 			bool ReverseLookup(const IpAddress& address, std::wstring& hostname, Error* err) noexcept {
 				try {
 					hostname.clear();
+					SS_LOG_DEBUG(L"NetworkUtils: ReverseLookup called");
 
 					WsaInitializer wsa;
 					if (!wsa.IsInitialized()) {
@@ -237,6 +247,8 @@ namespace ShadowStrike {
 						return true;
 						};
 
+					int gnRet = -1;
+
 					if (address.version == IpVersion::IPv4) {
 						auto* ipv4 = address.AsIPv4();
 						if (!ipv4) {
@@ -249,10 +261,10 @@ namespace ShadowStrike {
 						sa.sin_addr.s_addr = Internal::HostToNetwork32(ipv4->ToUInt32());
 
 						char hostBuffer[NI_MAXHOST] = {};
-						int ret = ::getnameinfo(reinterpret_cast<sockaddr*>(&sa), sizeof(sa),
+						gnRet = ::getnameinfo(reinterpret_cast<sockaddr*>(&sa), sizeof(sa),
 							hostBuffer, sizeof(hostBuffer), nullptr, 0, NI_NAMEREQD);
 
-						if (ret == 0 && convertToWide(hostBuffer, hostname)) {
+						if (gnRet == 0 && convertToWide(hostBuffer, hostname)) {
 							return true;
 						}
 
@@ -269,19 +281,21 @@ namespace ShadowStrike {
 						std::memcpy(&sa6.sin6_addr, ipv6->bytes.data(), 16);
 
 						char hostBuffer[NI_MAXHOST] = {};
-						int ret = ::getnameinfo(reinterpret_cast<sockaddr*>(&sa6), sizeof(sa6),
+						gnRet = ::getnameinfo(reinterpret_cast<sockaddr*>(&sa6), sizeof(sa6),
 							hostBuffer, sizeof(hostBuffer), nullptr, 0, NI_NAMEREQD);
 
-						if (ret == 0 && convertToWide(hostBuffer, hostname)) {
+						if (gnRet == 0 && convertToWide(hostBuffer, hostname)) {
 							return true;
 						}
 					}
 
-					Internal::SetWsaError(err, WSAGetLastError(), L"getnameinfo");
+					SS_LOG_ERROR(L"NetworkUtils: ReverseLookup getnameinfo failed (code=%d)", gnRet);
+					Internal::SetWsaError(err, gnRet, L"Reverse DNS lookup failed — no PTR record");
 					return false;
 
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in ReverseLookup");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in ReverseLookup");
 					return false;
 				}
@@ -300,6 +314,7 @@ namespace ShadowStrike {
 						return false;
 					}
 
+					SS_LOG_DEBUG(L"NetworkUtils: QueryDns type=%u host_len=%zu", static_cast<unsigned>(type), hostname.size());
 					std::wstring hostStr(hostname);
 
 					// RAII wrapper explicitly using PDNS_RECORDW to ensure Unicode compatibility
@@ -307,20 +322,14 @@ namespace ShadowStrike {
 						PDNS_RECORDW ptr = nullptr;
 						~DnsRecordGuard() {
 							if (ptr) {
-								// DnsFreeRecordList is appropriate for PDNS_RECORDW
-								::DnsRecordListFree(reinterpret_cast<PDNS_RECORD>(ptr), DnsFreeRecordList);
+								::DnsFree(ptr, DnsFreeRecordList);
 							}
 						}
 					} dnsRecordGuard;
 
-					struct DnsServerArrayGuard {
-						PIP4_ARRAY ptr = nullptr;
-						~DnsServerArrayGuard() {
-							if (ptr) {
-								free(ptr);
-							}
-						}
-					} dnsServerGuard;
+					// Backing storage for custom DNS server array (replaces raw malloc)
+					std::vector<uint8_t> dnsServerBacking;
+					PIP4_ARRAY pDnsServers = nullptr;
 
 					DWORD flags = DNS_QUERY_STANDARD;
 					if (!options.recursionDesired) flags |= DNS_QUERY_NO_RECURSION;
@@ -331,25 +340,33 @@ namespace ShadowStrike {
 						std::vector<IP4_ADDRESS> dnsServerAddresses;
 						dnsServerAddresses.reserve(options.customDnsServers.size());
 
+						size_t ipv6Skipped = 0;
 						for (const auto& dnsServer : options.customDnsServers) {
 							if (dnsServer.IsIPv4()) {
 								if (auto* ipv4 = dnsServer.AsIPv4()) {
 									dnsServerAddresses.push_back(Internal::HostToNetwork32(ipv4->ToUInt32()));
 								}
+							} else {
+								++ipv6Skipped;
 							}
 						}
+						if (ipv6Skipped > 0) {
+							SS_LOG_WARN(L"NetworkUtils: QueryDns skipped %zu IPv6-only custom DNS servers (DnsQuery_W only supports IPv4 server list)", ipv6Skipped);
+						}
 
+						if (dnsServerAddresses.empty() && ipv6Skipped > 0) {
+							SS_LOG_WARN(L"NetworkUtils: All custom DNS servers were IPv6 — falling back to system DNS");
+						}
 						if (!dnsServerAddresses.empty()) {
 							constexpr size_t maxDnsServers = 64;
 							if (dnsServerAddresses.size() > maxDnsServers) dnsServerAddresses.resize(maxDnsServers);
 
 							size_t structSize = sizeof(IP4_ARRAY) + (dnsServerAddresses.size() - 1) * sizeof(IP4_ADDRESS);
-							dnsServerGuard.ptr = static_cast<PIP4_ARRAY>(malloc(structSize));
-							if (dnsServerGuard.ptr) {
-								dnsServerGuard.ptr->AddrCount = static_cast<DWORD>(dnsServerAddresses.size());
-								for (size_t i = 0; i < dnsServerAddresses.size(); ++i) {
-									dnsServerGuard.ptr->AddrArray[i] = dnsServerAddresses[i];
-								}
+							dnsServerBacking.resize(structSize, 0);
+							pDnsServers = reinterpret_cast<PIP4_ARRAY>(dnsServerBacking.data());
+							pDnsServers->AddrCount = static_cast<DWORD>(dnsServerAddresses.size());
+							for (size_t i = 0; i < dnsServerAddresses.size(); ++i) {
+								pDnsServers->AddrArray[i] = dnsServerAddresses[i];
 							}
 						}
 					}
@@ -359,21 +376,34 @@ namespace ShadowStrike {
 						hostStr.c_str(),
 						static_cast<WORD>(type),
 						flags,
-						dnsServerGuard.ptr,
+						pDnsServers,
 						reinterpret_cast<PDNS_RECORD*>(&dnsRecordGuard.ptr),
 						nullptr
 					);
 
 					if (status != 0) {
-						if (status == DNS_INFO_NO_RECORDS) return true; // Success but empty
+						if (status == DNS_INFO_NO_RECORDS) {
+							SS_LOG_DEBUG(L"NetworkUtils: DnsQuery_W returned no records");
+							return true;
+						}
+						SS_LOG_ERROR(L"NetworkUtils: DnsQuery_W failed status=%lu", status);
 						Internal::SetError(err, status, L"DnsQuery_W failed");
 						return false;
 					}
 
-					// Use PDNS_RECORDW for iteration to match DnsQuery_W output
-					for (PDNS_RECORDW pRec = dnsRecordGuard.ptr; pRec != nullptr; pRec = pRec->pNext) {
+					// Cap record iteration to prevent malicious DNS responses from OOM
+					constexpr DWORD kMaxDnsRecords = 2048;
+					DWORD recordCount = 0;
+
+					for (PDNS_RECORDW pRec = dnsRecordGuard.ptr; pRec != nullptr && recordCount < kMaxDnsRecords; pRec = pRec->pNext, ++recordCount) {
+						// Skip records that fail DNSSEC validation if we requested it
+						if (options.dnssec && (pRec->Flags.DW & 0x0020) == 0) {
+							// DNSREC_DNSSEC_CHECKING (0x20) not set — record not validated
+							// Skip ALL unvalidated records — answer section is the critical attack surface
+							continue;
+						}
+
 						DnsRecord rec;
-						// Native PWSTR to std::wstring assignment
 						rec.name = pRec->pName ? pRec->pName : L"";
 						rec.type = static_cast<DnsRecordType>(pRec->wType);
 						rec.ttl = pRec->dwTtl;
@@ -440,10 +470,12 @@ namespace ShadowStrike {
 					return true;
 				}
 				catch (const std::exception& e) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in QueryDns");
 					Internal::SetError(err, ERROR_GENERIC_NOT_MAPPED, L"Exception in QueryDns");
 					return false;
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Unknown exception in QueryDns");
 					Internal::SetError(err, ERROR_GENERIC_NOT_MAPPED, L"Unknown exception in QueryDns");
 					return false;
 				}
