@@ -28,22 +28,22 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -716,16 +716,22 @@
   </ItemGroup>
   <ItemGroup>
     <MASM Include="src\Shared_modules\AntiEvasion\EnvironmentEvasionDetector_x64.asm">
-      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExcludedFromBuild>true</ExcludedFromBuild>
     </MASM>
-    <MASM Include="src\Shared_modules\AntiEvasion\PackerDetector_x64.asm" />
-    <MASM Include="src\Shared_modules\AntiEvasion\SandboxEvasionDetector_x64.asm" />
-    <MASM Include="src\Shared_modules\AntiEvasion\TimeBasedEvasionDetector_x64.asm" />
+    <MASM Include="src\Shared_modules\AntiEvasion\PackerDetector_x64.asm">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </MASM>
+    <MASM Include="src\Shared_modules\AntiEvasion\SandboxEvasionDetector_x64.asm">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </MASM>
+    <MASM Include="src\Shared_modules\AntiEvasion\TimeBasedEvasionDetector_x64.asm">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </MASM>
     <MASM Include="src\Shared_modules\AntiEvasion\VMEvasionDetector_x64.asm">
-      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExcludedFromBuild>true</ExcludedFromBuild>
     </MASM>
     <MASM Include="src\Shared_modules\AntiEvasion\DebuggerEvasionDetector_x64.asm">
-      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExcludedFromBuild>true</ExcludedFromBuild>
     </MASM>
   </ItemGroup>
 </Project>

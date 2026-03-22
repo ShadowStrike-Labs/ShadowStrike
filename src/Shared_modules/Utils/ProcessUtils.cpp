@@ -477,8 +477,33 @@ namespace ShadowStrike {
                 };
                 
                 // Global CPU sample cache (protected by mutex)
+                // Bounded: entries older than 60s are evicted to prevent memory leak.
                 std::mutex g_cpuMutex;
                 std::unordered_map<DWORD, CpuSample> g_cpuPrev;
+                constexpr size_t kMaxCpuCacheEntries = 4096;
+                constexpr uint64_t kCpuCacheExpiryMs = 60000; // 60 seconds
+
+                void EvictStaleCpuEntries(uint64_t nowMs) noexcept {
+                    if (g_cpuPrev.size() <= kMaxCpuCacheEntries / 2) return;
+                    for (auto it = g_cpuPrev.begin(); it != g_cpuPrev.end(); ) {
+                        if (it->second.timestampMs < nowMs &&
+                            (nowMs - it->second.timestampMs > kCpuCacheExpiryMs)) {
+                            it = g_cpuPrev.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    // Hard cap: if still over limit, remove oldest entries
+                    while (g_cpuPrev.size() > kMaxCpuCacheEntries) {
+                        auto oldest = g_cpuPrev.begin();
+                        for (auto it = g_cpuPrev.begin(); it != g_cpuPrev.end(); ++it) {
+                            if (it->second.timestampMs < oldest->second.timestampMs) {
+                                oldest = it;
+                            }
+                        }
+                        g_cpuPrev.erase(oldest);
+                    }
+                }
 
                 /**
                  * @brief Gets current tick count in milliseconds.
@@ -780,32 +805,47 @@ namespace ShadowStrike {
                             });
                     }
                     else if (options.sortByMemoryUsage) {
-                        // Collect memory info for sorting
-                        for (auto& p : processes) {
+                        // Build index of memory sizes without corrupting ProcessBasicInfo fields
+                        std::vector<std::pair<size_t, SIZE_T>> memIndex;
+                        memIndex.reserve(processes.size());
+                        for (size_t i = 0; i < processes.size(); ++i) {
                             ProcessMemoryInfo mi{};
-                            if (GetProcessMemoryInfo(p.pid, mi, nullptr)) {
-                                // Store working set in handleCount temporarily (uint64_t truncated to DWORD)
-                                p.handleCount = static_cast<DWORD>(std::min(mi.workingSetSize, 
-                                                static_cast<SIZE_T>(MAXDWORD)));
+                            SIZE_T ws = 0;
+                            if (GetProcessMemoryInfo(processes[i].pid, mi, nullptr)) {
+                                ws = mi.workingSetSize;
                             }
+                            memIndex.emplace_back(i, ws);
                         }
-                        std::stable_sort(processes.begin(), processes.end(), 
-                            [](const ProcessBasicInfo& a, const ProcessBasicInfo& b) noexcept {
-                                return a.handleCount > b.handleCount;
+                        std::stable_sort(memIndex.begin(), memIndex.end(),
+                            [](const auto& a, const auto& b) noexcept {
+                                return a.second > b.second;
                             });
+                        std::vector<ProcessBasicInfo> sorted;
+                        sorted.reserve(memIndex.size());
+                        for (const auto& [idx, _] : memIndex) {
+                            sorted.push_back(std::move(processes[idx]));
+                        }
+                        processes = std::move(sorted);
                     }
                     else if (options.sortByCpuUsage) {
-                        // Collect CPU info for sorting
-                        for (auto& p : processes) {
+                        // Build index of CPU percentages without corrupting ProcessBasicInfo fields
+                        std::vector<std::pair<size_t, double>> cpuIndex;
+                        cpuIndex.reserve(processes.size());
+                        for (size_t i = 0; i < processes.size(); ++i) {
                             ProcessCpuInfo ci{};
-                            GetProcessCpuInfo(p.pid, ci, nullptr);
-                            // Store scaled CPU percentage in basePriority temporarily
-                            p.basePriority = static_cast<int64_t>(std::clamp(ci.cpuUsagePercent, 0.0, 100.0) * 1000.0);
+                            GetProcessCpuInfo(processes[i].pid, ci, nullptr);
+                            cpuIndex.emplace_back(i, ci.cpuUsagePercent);
                         }
-                        std::stable_sort(processes.begin(), processes.end(), 
-                            [](const ProcessBasicInfo& a, const ProcessBasicInfo& b) noexcept {
-                                return a.basePriority > b.basePriority;
+                        std::stable_sort(cpuIndex.begin(), cpuIndex.end(),
+                            [](const auto& a, const auto& b) noexcept {
+                                return a.second > b.second;
                             });
+                        std::vector<ProcessBasicInfo> sorted;
+                        sorted.reserve(cpuIndex.size());
+                        for (const auto& [idx, _] : cpuIndex) {
+                            sorted.push_back(std::move(processes[idx]));
+                        }
+                        processes = std::move(sorted);
                     }
                 } catch (...) {
                     // Sorting failed, return unsorted results
@@ -895,6 +935,7 @@ namespace ShadowStrike {
 
                 // Thread-safe access to CPU sample cache
                 std::lock_guard<std::mutex> lock(g_cpuMutex);
+                EvictStaleCpuEntries(now);
                 
                 auto it = g_cpuPrev.find(pid);
                 if (it != g_cpuPrev.end()) {
@@ -988,6 +1029,7 @@ bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& sec, Error* err)
 
     // User information with buffer size validation
     DWORD len = 0;
+    SetLastError(0);
     GetTokenInformation(token.get(), TokenUser, nullptr, 0, &len);
     
     if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || len == 0 || len > kMaxTokenInfoSize) {
@@ -1270,9 +1312,37 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
             UNICODE_STRING32 CommandLine;
         };
 
+        // Use ProcessWow64Information to get the real 32-bit PEB address
+        PVOID peb32Address = nullptr;
+        using NtQIP_t = NTSTATUS(NTAPI*)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+        static auto NtQIP = reinterpret_cast<NtQIP_t>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+        if (!NtQIP) {
+            SetWin32Error(err, L"GetProcAddress(NtQueryInformationProcess)");
+            return std::nullopt;
+        }
+        NTSTATUS wow64Status = NtQIP(ph.Get(),
+            static_cast<PROCESSINFOCLASS>(26), // ProcessWow64Information
+            &peb32Address, sizeof(peb32Address), nullptr);
+        if (wow64Status < 0 || !peb32Address) {
+            SetWin32Error(err, L"NtQueryInformationProcess(Wow64)",
+                ERROR_INVALID_ADDRESS, L"Failed to get WOW64 PEB address.");
+            return std::nullopt;
+        }
+
+        // Validate PEB32 memory before reading
+        MEMORY_BASIC_INFORMATION mbiPeb{};
+        if (!::VirtualQueryEx(ph.Get(), peb32Address, &mbiPeb, sizeof(mbiPeb)) ||
+            mbiPeb.State != MEM_COMMIT ||
+            !(mbiPeb.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
+            SetWin32Error(err, L"VirtualQueryEx(PEB32)",
+                ERROR_INVALID_ADDRESS, L"PEB32 memory region is not accessible.");
+            return std::nullopt;
+        }
+
         PEB32 peb32{};
         SIZE_T read = 0;
-        if (!::ReadProcessMemory(ph.Get(), pbi.PebBaseAddress, &peb32, sizeof(peb32), &read)) {
+        if (!::ReadProcessMemory(ph.Get(), peb32Address, &peb32, sizeof(peb32), &read)) {
             SetWin32Error(err, L"ReadProcessMemory(PEB32)");
             return std::nullopt;
         }
@@ -1653,43 +1723,43 @@ bool IsProcessSuspended(ProcessId pid, Error* /*err*/) noexcept {
     if (hSnap == INVALID_HANDLE_VALUE) {
         return false;
     }
-    auto snapGuard = make_unique_handle(hSnap);  // RAII for snapshot
-    
+    auto snapGuard = make_unique_handle(hSnap);
+
+    // Query suspend count via NtQueryInformationThread(ThreadSuspendCount = 35)
+    // instead of actually suspending threads (which can deadlock target processes).
+    using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static auto NtQIT = reinterpret_cast<NtQIT_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+
     THREADENTRY32 te{};
     te.dwSize = sizeof(te);
     bool anyThread = false;
     bool anyRunning = false;
-    
+
     if (Thread32First(snapGuard.get(), &te)) {
         do {
             if (te.th32OwnerProcessID == pid) {
                 anyThread = true;
-                HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                HANDLE hThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
                 if (hThread) {
-                    auto threadGuard = make_unique_handle(hThread);  // RAII for thread handle
-                    
-                    // Suspend to get previous suspend count
-                    DWORD prev = ::SuspendThread(threadGuard.get());
-                    if (prev == static_cast<DWORD>(-1)) {
-                        anyRunning = true;
-                    }
-                    else {
-                        // If previous count was 0, thread was running
-                        if (prev == 0) {
+                    auto threadGuard = make_unique_handle(hThread);
+                    if (NtQIT) {
+                        ULONG suspendCount = 0;
+                        NTSTATUS st = NtQIT(threadGuard.get(), 35 /*ThreadSuspendCount*/,
+                            &suspendCount, sizeof(suspendCount), nullptr);
+                        if (st >= 0 && suspendCount == 0) {
                             anyRunning = true;
                         }
-                        // Resume to restore original state
-                        ::ResumeThread(threadGuard.get());
+                    } else {
+                        anyRunning = true;
                     }
-                }
-                else {
-                    // Can't open thread - assume running
+                } else {
                     anyRunning = true;
                 }
             }
         } while (Thread32Next(snapGuard.get(), &te));
     }
-    
+
     return anyThread && !anyRunning;
 }
 
@@ -1833,7 +1903,15 @@ bool EnumerateProcessModules(ProcessId pid, std::vector<ProcessModuleInfo>& modu
         SetWin32Error(err, L"EnumProcessModulesEx(size)");
         return false;
     }
-    std::vector<HMODULE> mods(needed / sizeof(HMODULE));
+    constexpr size_t kMaxModuleCount = 16384;
+    size_t modCount = needed / sizeof(HMODULE);
+    if (modCount == 0) return true;
+    if (modCount > kMaxModuleCount) {
+        SetWin32Error(err, L"EnumerateProcessModules", ERROR_BUFFER_OVERFLOW,
+            L"Module count exceeds safety cap.");
+        return false;
+    }
+    std::vector<HMODULE> mods(modCount);
     if (!EnumProcessModulesEx(ph.Get(), mods.data(), static_cast<DWORD>(mods.size() * sizeof(HMODULE)), &needed, LIST_MODULES_ALL)) {
         SetWin32Error(err, L"EnumProcessModulesEx(data)");
         return false;
@@ -2037,6 +2115,9 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
     struct MemoryGuard {
         HANDLE process;
         void* memory;
+        MemoryGuard(HANDLE p, void* m) noexcept : process(p), memory(m) {}
+        MemoryGuard(const MemoryGuard&) = delete;
+        MemoryGuard& operator=(const MemoryGuard&) = delete;
         ~MemoryGuard() {
             if (memory && process) {
                 ::VirtualFreeEx(process, memory, 0, MEM_RELEASE);
@@ -2119,12 +2200,11 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
     if (EnumerateProcessModules(pid, modules, nullptr)) {
         for (const auto& mod : modules) {
             if (ToLower(mod.name) == ToLower(targetDllName)) {
-                // ADDITIONAL CHECK: Verify base address matches HMODULE returned
-                if (reinterpret_cast<uintptr_t>(mod.baseAddress) ==
-                    static_cast<uintptr_t>(exitCode)) {
-                    verified = true;
-                    break;
-                }
+                // Module found by name in target process — sufficient verification.
+                // Note: GetExitCodeThread returns DWORD (32-bit) which truncates
+                // HMODULE on x64, so address comparison is unreliable.
+                verified = true;
+                break;
             }
         }
     }
@@ -3334,7 +3414,8 @@ bool CreateProcess(std::wstring_view executablePath,
 
     PROCESS_INFORMATION pi{};
     DWORD createFlags = static_cast<DWORD>(flags) | CREATE_UNICODE_ENVIRONMENT;
-    BOOL ok = ::CreateProcessW(executablePath.data(),
+    std::wstring execPath(executablePath);
+    BOOL ok = ::CreateProcessW(execPath.c_str(),
         cmd.data(),
         nullptr, nullptr,
         (startupInfo.redirectStdInput || startupInfo.redirectStdOutput || startupInfo.redirectStdError),
@@ -3379,8 +3460,9 @@ bool CreateProcessAsUser(std::wstring_view executablePath,
     PROCESS_INFORMATION pi{};
     DWORD createFlags = static_cast<DWORD>(flags) | CREATE_UNICODE_ENVIRONMENT;
 
+    std::wstring execPath(executablePath);
     BOOL ok = ::CreateProcessAsUserW(hUserToken,
-        executablePath.data(),
+        execPath.c_str(),
         cmd.data(),
         nullptr, nullptr,
         (startupInfo.redirectStdInput || startupInfo.redirectStdOutput || startupInfo.redirectStdError),
@@ -3419,8 +3501,9 @@ bool CreateProcessWithToken(std::wstring_view executablePath,
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
+    std::wstring execPath(executablePath);
     BOOL ok = ::CreateProcessWithTokenW(hToken, LOGON_WITH_PROFILE,
-        executablePath.data(),
+        execPath.c_str(),
         cmd.data(),
         CREATE_UNICODE_ENVIRONMENT,
         nullptr,
@@ -3743,41 +3826,62 @@ void ProcessMonitor::processSnapshot() noexcept {
     EnumerateProcesses(current, nullptr);
     std::unordered_set<ProcessId> curSet(current.begin(), current.end());
 
+    // Snapshot filters and callbacks under lock to prevent data races
+    std::unordered_set<ProcessId> processFilter;
+    std::unordered_set<std::wstring> nameFilter;
+    ProcessEventCallback onCreated, onTerminated;
+    std::unordered_set<ProcessId> lastSnap;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        processFilter = m_processFilter;
+        nameFilter = m_nameFilter;
+        onCreated = m_onProcessCreated;
+        onTerminated = m_onProcessTerminated;
+        lastSnap = m_lastSnapshot;
+    }
+
     for (auto pid : curSet) {
-        if (m_lastSnapshot.find(pid) == m_lastSnapshot.end()) {
-            if (!m_processFilter.empty() && m_processFilter.find(pid) == m_processFilter.end()) continue;
-            if (!m_nameFilter.empty()) {
+        if (lastSnap.find(pid) == lastSnap.end()) {
+            if (!processFilter.empty() && processFilter.find(pid) == processFilter.end()) continue;
+            if (!nameFilter.empty()) {
                 auto name = GetProcessName(pid, nullptr);
                 bool ok = false;
                 if (name) {
-                    for (const auto& nf : m_nameFilter) {
+                    for (const auto& nf : nameFilter) {
                         if (WildcardMatchInsensitive(nf, *name)) { ok = true; break; }
                     }
                 }
                 if (!ok) continue;
             }
-            if (m_onProcessCreated) {
-                ProcessEvent e{};
-                e.type = ProcessEventType::Created;
-                e.pid = pid;
-                e.timestamp = std::chrono::system_clock::now();
-                m_onProcessCreated(e);
+            if (onCreated && m_running.load()) {
+                try {
+                    ProcessEvent e{};
+                    e.type = ProcessEventType::Created;
+                    e.pid = pid;
+                    e.timestamp = std::chrono::system_clock::now();
+                    onCreated(e);
+                } catch (...) {}
             }
         }
     }
-    for (auto pid : m_lastSnapshot) {
+    for (auto pid : lastSnap) {
         if (curSet.find(pid) == curSet.end()) {
-            if (!m_processFilter.empty() && m_processFilter.find(pid) == m_processFilter.end()) continue;
-            if (m_onProcessTerminated) {
-                ProcessEvent e{};
-                e.type = ProcessEventType::Terminated;
-                e.pid = pid;
-                e.timestamp = std::chrono::system_clock::now();
-                m_onProcessTerminated(e);
+            if (!processFilter.empty() && processFilter.find(pid) == processFilter.end()) continue;
+            if (onTerminated && m_running.load()) {
+                try {
+                    ProcessEvent e{};
+                    e.type = ProcessEventType::Terminated;
+                    e.pid = pid;
+                    e.timestamp = std::chrono::system_clock::now();
+                    onTerminated(e);
+                } catch (...) {}
             }
         }
     }
-    m_lastSnapshot = std::move(curSet);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_lastSnapshot = std::move(curSet);
+    }
 }
 
 // ==========================================================

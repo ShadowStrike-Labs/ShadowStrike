@@ -551,21 +551,21 @@ namespace ShadowStrike {
                 bool Stop(Error* err = nullptr) noexcept;
                 bool IsRunning() const noexcept { return m_running; }
               
-                // Event callbacks
+                // Event callbacks (thread-safe: locks m_mutex)
                
-                void OnProcessCreated(ShadowStrike::Utils::ProcessUtils::ProcessEventCallback callback) noexcept { m_onProcessCreated = std::move(callback); }
-                void OnProcessTerminated(ShadowStrike::Utils::ProcessUtils::ProcessEventCallback callback) noexcept { m_onProcessTerminated = std::move(callback); }
-                void OnModuleLoaded(ShadowStrike::Utils::ProcessUtils::ProcessEventCallback callback) noexcept { m_onModuleLoaded = std::move(callback); }
-                void OnThreadCreated(ShadowStrike::Utils::ProcessUtils::ProcessEventCallback callback) noexcept { m_onThreadCreated = std::move(callback); }
+                void OnProcessCreated(ShadowStrike::Utils::ProcessUtils::ProcessEventCallback callback) noexcept { std::lock_guard<std::mutex> lk(m_mutex); m_onProcessCreated = std::move(callback); }
+                void OnProcessTerminated(ShadowStrike::Utils::ProcessUtils::ProcessEventCallback callback) noexcept { std::lock_guard<std::mutex> lk(m_mutex); m_onProcessTerminated = std::move(callback); }
+                void OnModuleLoaded(ShadowStrike::Utils::ProcessUtils::ProcessEventCallback callback) noexcept { std::lock_guard<std::mutex> lk(m_mutex); m_onModuleLoaded = std::move(callback); }
+                void OnThreadCreated(ShadowStrike::Utils::ProcessUtils::ProcessEventCallback callback) noexcept { std::lock_guard<std::mutex> lk(m_mutex); m_onThreadCreated = std::move(callback); }
 
-                // Filtering
-                void AddProcessFilter(ProcessId pid) noexcept { m_processFilter.insert(pid); }
-                void RemoveProcessFilter(ProcessId pid) noexcept { m_processFilter.erase(pid); }
-                void ClearProcessFilters() noexcept { m_processFilter.clear(); }
+                // Filtering (thread-safe: locks m_mutex)
+                void AddProcessFilter(ProcessId pid) noexcept { std::lock_guard<std::mutex> lk(m_mutex); m_processFilter.insert(pid); }
+                void RemoveProcessFilter(ProcessId pid) noexcept { std::lock_guard<std::mutex> lk(m_mutex); m_processFilter.erase(pid); }
+                void ClearProcessFilters() noexcept { std::lock_guard<std::mutex> lk(m_mutex); m_processFilter.clear(); }
 
-                void AddNameFilter(std::wstring_view name) noexcept { m_nameFilter.emplace(name); }
-                void RemoveNameFilter(std::wstring_view name) noexcept { m_nameFilter.erase(std::wstring(name)); }
-                void ClearNameFilters() noexcept { m_nameFilter.clear(); }
+                void AddNameFilter(std::wstring_view name) noexcept { std::lock_guard<std::mutex> lk(m_mutex); m_nameFilter.emplace(name); }
+                void RemoveNameFilter(std::wstring_view name) noexcept { std::lock_guard<std::mutex> lk(m_mutex); m_nameFilter.erase(std::wstring(name)); }
+                void ClearNameFilters() noexcept { std::lock_guard<std::mutex> lk(m_mutex); m_nameFilter.clear(); }
 
             private:
                 void monitorThread() noexcept;
