@@ -19,6 +19,7 @@
 #include "NetworkUtils.hpp"
 #include <fstream>
 #include <WinInet.h>
+#include <unordered_set>
 #include <dhcpcsdk.h>
 #include <wincrypt.h>
 
@@ -94,6 +95,8 @@ namespace ShadowStrike {
 
 			bool HttpRequest(std::wstring_view url, HttpResponse& response, const HttpRequestOptions& options, Error* err) noexcept {
 				try {
+					SS_LOG_DEBUG(L"NetworkUtils: HttpRequest starting method=%d timeout=%u",
+						static_cast<int>(options.method), options.timeoutMs);
 					response = HttpResponse{};
 
 					// Validate URL length to prevent buffer overflow
@@ -130,6 +133,7 @@ namespace ShadowStrike {
 
 					std::wstring urlCopy(url);
 					if (!::WinHttpCrackUrl(urlCopy.c_str(), 0, 0, &urlComp)) {
+						SS_LOG_ERROR(L"NetworkUtils: WinHttpCrackUrl failed err=%lu", ::GetLastError());
 						Internal::SetError(err, ::GetLastError(), L"WinHttpCrackUrl failed");
 						return false;
 					}
@@ -175,12 +179,20 @@ namespace ShadowStrike {
 
 					// Configure SSL/TLS options if requested to skip verification
 					if (!options.verifySSL && (urlComp.nScheme == INTERNET_SCHEME_HTTPS)) {
+						SS_LOG_WARN(L"NetworkUtils: SSL verification DISABLED for HTTPS request to %ls", hostName);
 						DWORD sslFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
 							SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
 							SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
 							SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
 						::WinHttpSetOption(requestGuard.handle, WINHTTP_OPTION_SECURITY_FLAGS,
 							&sslFlags, sizeof(sslFlags));
+					}
+
+					// Configure redirect policy
+					if (!options.allowRedirects) {
+						DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+						::WinHttpSetOption(requestGuard.handle, WINHTTP_OPTION_REDIRECT_POLICY,
+							&redirectPolicy, sizeof(redirectPolicy));
 					}
 
 					// Set timeout with validation
@@ -247,12 +259,14 @@ namespace ShadowStrike {
 						static_cast<DWORD>(options.body.size()), 0);
 
 					if (!result) {
+						SS_LOG_ERROR(L"NetworkUtils: WinHttpSendRequest failed err=%lu", ::GetLastError());
 						Internal::SetError(err, ::GetLastError(), L"WinHttpSendRequest failed");
 						return false;
 					}
 
 					// Receive response
 					if (!::WinHttpReceiveResponse(requestGuard.handle, nullptr)) {
+						SS_LOG_ERROR(L"NetworkUtils: WinHttpReceiveResponse failed err=%lu", ::GetLastError());
 						Internal::SetError(err, ::GetLastError(), L"WinHttpReceiveResponse failed");
 						return false;
 					}
@@ -264,8 +278,75 @@ namespace ShadowStrike {
 						nullptr, &statusCode, &statusCodeSize, nullptr);
 					response.statusCode = statusCode;
 
+					// Parse status text
+					wchar_t statusTextBuf[256] = {};
+					DWORD statusTextSize = sizeof(statusTextBuf);
+					if (::WinHttpQueryHeaders(requestGuard.handle, WINHTTP_QUERY_STATUS_TEXT,
+						nullptr, statusTextBuf, &statusTextSize, nullptr)) {
+						response.statusText = statusTextBuf;
+					}
+
+					// Parse Content-Type
+					wchar_t ctBuf[512] = {};
+					DWORD ctSize = sizeof(ctBuf);
+					if (::WinHttpQueryHeaders(requestGuard.handle, WINHTTP_QUERY_CONTENT_TYPE,
+						nullptr, ctBuf, &ctSize, nullptr)) {
+						response.contentType = ctBuf;
+					}
+
+					// Parse Location header for redirects
+					if (statusCode >= 300 && statusCode < 400) {
+						wchar_t locBuf[2048] = {};
+						DWORD locSize = sizeof(locBuf);
+						if (::WinHttpQueryHeaders(requestGuard.handle, WINHTTP_QUERY_LOCATION,
+							nullptr, locBuf, &locSize, nullptr)) {
+							response.redirectUrl = locBuf;
+						}
+					}
+
+					// Parse all response headers
+					DWORD rawSize = 0;
+					::WinHttpQueryHeaders(requestGuard.handle, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+						WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &rawSize, WINHTTP_NO_HEADER_INDEX);
+					if (rawSize > 0 && rawSize < 256 * 1024) {
+						std::wstring rawHeaders(rawSize / sizeof(wchar_t), L'\0');
+						if (::WinHttpQueryHeaders(requestGuard.handle, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+							WINHTTP_HEADER_NAME_BY_INDEX, rawHeaders.data(), &rawSize, WINHTTP_NO_HEADER_INDEX)) {
+							size_t pos = 0;
+							while (pos < rawHeaders.size()) {
+								auto lineEnd = rawHeaders.find(L"\r\n", pos);
+								if (lineEnd == std::wstring::npos) break;
+								auto line = rawHeaders.substr(pos, lineEnd - pos);
+								auto colon = line.find(L':');
+								if (colon != std::wstring::npos) {
+									HttpHeader hdr;
+									hdr.name = std::wstring(Internal::TrimWhitespace(line.substr(0, colon)));
+									hdr.value = std::wstring(Internal::TrimWhitespace(line.substr(colon + 1)));
+									response.headers.push_back(std::move(hdr));
+								}
+								pos = lineEnd + 2;
+							}
+						}
+					}
+
 					// Read response body with size limit
 					constexpr size_t MAX_RESPONSE_SIZE = 100 * 1024 * 1024; // 100MB max
+
+					// HT7: Pre-allocate using Content-Length if available
+					DWORD clValue = 0;
+					DWORD clSize = sizeof(clValue);
+					if (::WinHttpQueryHeaders(requestGuard.handle,
+						WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+						nullptr, &clValue, &clSize, nullptr)) {
+						if (clValue > 0 && clValue <= MAX_RESPONSE_SIZE) {
+							response.body.reserve(static_cast<size_t>(clValue));
+						} else if (clValue > MAX_RESPONSE_SIZE) {
+							SS_LOG_WARN(L"NetworkUtils: Content-Length %lu exceeds limit", clValue);
+							Internal::SetError(err, ERROR_BUFFER_OVERFLOW, L"Content-Length exceeds response size limit");
+							return false;
+						}
+					}
+
 					std::vector<uint8_t> buffer(8192);
 					DWORD bytesRead = 0;
 
@@ -280,11 +361,14 @@ namespace ShadowStrike {
 
 					response.contentLength = response.body.size();
 
+					SS_LOG_INFO(L"NetworkUtils: HttpRequest completed status=%u bodySize=%zu",
+						response.statusCode, response.body.size());
 					// Handles are closed by RAII guards
 					return true;
 
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in HttpRequest");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in HttpRequest");
 					return false;
 				}
@@ -319,9 +403,19 @@ namespace ShadowStrike {
 
 			bool HttpDownloadFile(std::wstring_view url, const std::filesystem::path& destPath, const HttpRequestOptions& options, ProgressCallback callback, Error* err) noexcept {
 				try {
+					SS_LOG_DEBUG(L"NetworkUtils: HttpDownloadFile starting");
+
 					// Validate destination path
 					if (destPath.empty()) {
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Empty destination path");
+						return false;
+					}
+
+					// Reject path traversal sequences
+					std::wstring destStr = destPath.wstring();
+					if (destStr.find(L"..") != std::wstring::npos) {
+						SS_LOG_ERROR(L"NetworkUtils: Path traversal detected in download destination");
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Path traversal in destination path");
 						return false;
 					}
 
@@ -372,10 +466,12 @@ namespace ShadowStrike {
 
 				}
 				catch (const std::filesystem::filesystem_error& e) {
+					SS_LOG_ERROR(L"NetworkUtils: Filesystem error in HttpDownloadFile");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Filesystem error in HttpDownloadFile");
 					return false;
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in HttpDownloadFile");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in HttpDownloadFile");
 					return false;
 				}
@@ -383,9 +479,27 @@ namespace ShadowStrike {
 
 			bool HttpUploadFile(std::wstring_view url, const std::filesystem::path& filePath, std::vector<uint8_t>& response, const HttpRequestOptions& options, ProgressCallback callback, Error* err) noexcept {
 				try {
+					SS_LOG_DEBUG(L"NetworkUtils: HttpUploadFile starting");
+
 					// Validate file path
 					if (filePath.empty()) {
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Empty file path");
+						return false;
+					}
+
+					// Reject path traversal sequences
+					std::wstring filePathStr = filePath.wstring();
+					if (filePathStr.find(L"..") != std::wstring::npos) {
+						SS_LOG_ERROR(L"NetworkUtils: Path traversal detected in upload source");
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Path traversal in upload path");
+						return false;
+					}
+
+					// Reject symlinks to prevent exfiltration via symlink attacks
+					std::error_code symEc;
+					if (std::filesystem::is_symlink(filePath, symEc)) {
+						SS_LOG_ERROR(L"NetworkUtils: Symlink detected in upload path");
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Symlinks not allowed for upload");
 						return false;
 					}
 
@@ -428,6 +542,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in HttpUploadFile");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in HttpUploadFile");
 					return false;
 				}
@@ -441,15 +556,17 @@ namespace ShadowStrike {
 					connections.clear();
 
 					if (protocol == ProtocolType::TCP) {
-						// IPv4 TCP Connections
-						ULONG size = 0;
+						// IPv4 TCP Connections (with TOCTOU retry)
+						for (int retry = 0; retry < 3; ++retry) {
+							ULONG size4 = 0;
 #pragma warning(suppress: 6387)
-						::GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-
-						std::vector<uint8_t> buffer(size);
-						if (::GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
-							auto* pTable = reinterpret_cast<PMIB_TCPTABLE_OWNER_PID>(buffer.data());
-
+							::GetExtendedTcpTable(nullptr, &size4, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+							if (size4 == 0) break;
+							std::vector<uint8_t> buf4(size4);
+							DWORD rc4 = ::GetExtendedTcpTable(buf4.data(), &size4, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+							if (rc4 == ERROR_INSUFFICIENT_BUFFER) continue;
+							if (rc4 != NO_ERROR) break;
+							auto* pTable = reinterpret_cast<PMIB_TCPTABLE_OWNER_PID>(buf4.data());
 							for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
 								ConnectionInfo conn;
 								conn.protocol = ProtocolType::TCP;
@@ -459,88 +576,91 @@ namespace ShadowStrike {
 								conn.remotePort = Internal::NetworkToHost16(static_cast<uint16_t>(pTable->table[i].dwRemotePort));
 								conn.state = static_cast<TcpState>(pTable->table[i].dwState);
 								conn.processId = pTable->table[i].dwOwningPid;
-
 								connections.push_back(std::move(conn));
 							}
+							break;
 						}
 
-						// IPv6 TCP Connections
-						size = 0;
+						// IPv6 TCP Connections (separate buffer to prevent stale data)
+						for (int retry = 0; retry < 3; ++retry) {
+							ULONG size6 = 0;
 #pragma warning(suppress: 6387)
-						::GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
-						buffer.resize(size);
-
-						if (::GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
-							auto* pTable6 = reinterpret_cast<PMIB_TCP6TABLE_OWNER_PID>(buffer.data());
-
+							::GetExtendedTcpTable(nullptr, &size6, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
+							if (size6 == 0) break;
+							std::vector<uint8_t> buf6(size6);
+							DWORD rc6 = ::GetExtendedTcpTable(buf6.data(), &size6, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
+							if (rc6 == ERROR_INSUFFICIENT_BUFFER) continue;
+							if (rc6 != NO_ERROR) break;
+							auto* pTable6 = reinterpret_cast<PMIB_TCP6TABLE_OWNER_PID>(buf6.data());
 							for (DWORD i = 0; i < pTable6->dwNumEntries; ++i) {
 								ConnectionInfo conn;
 								conn.protocol = ProtocolType::TCP;
-
 								std::array<uint8_t, 16> localBytes, remoteBytes;
 								std::memcpy(localBytes.data(), pTable6->table[i].ucLocalAddr, 16);
 								std::memcpy(remoteBytes.data(), pTable6->table[i].ucRemoteAddr, 16);
-
 								conn.localAddress = IpAddress(IPv6Address(localBytes));
 								conn.localPort = Internal::NetworkToHost16(static_cast<uint16_t>(pTable6->table[i].dwLocalPort));
 								conn.remoteAddress = IpAddress(IPv6Address(remoteBytes));
 								conn.remotePort = Internal::NetworkToHost16(static_cast<uint16_t>(pTable6->table[i].dwRemotePort));
 								conn.state = static_cast<TcpState>(pTable6->table[i].dwState);
 								conn.processId = pTable6->table[i].dwOwningPid;
-
 								connections.push_back(std::move(conn));
 							}
+							break;
 						}
 					}
 					else if (protocol == ProtocolType::UDP) {
-						// IPv4 UDP Connections
-						ULONG size = 0;
+						// IPv4 UDP Connections (with TOCTOU retry)
+						for (int retry = 0; retry < 3; ++retry) {
+							ULONG usize4 = 0;
 #pragma warning(suppress: 6387)
-						::GetExtendedUdpTable(nullptr, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
-
-						std::vector<uint8_t> buffer(size);
-						if (::GetExtendedUdpTable(buffer.data(), &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
-							auto* pTable = reinterpret_cast<PMIB_UDPTABLE_OWNER_PID>(buffer.data());
-
+							::GetExtendedUdpTable(nullptr, &usize4, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+							if (usize4 == 0) break;
+							std::vector<uint8_t> ubuf4(usize4);
+							DWORD urc4 = ::GetExtendedUdpTable(ubuf4.data(), &usize4, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+							if (urc4 == ERROR_INSUFFICIENT_BUFFER) continue;
+							if (urc4 != NO_ERROR) break;
+							auto* pTable = reinterpret_cast<PMIB_UDPTABLE_OWNER_PID>(ubuf4.data());
 							for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
 								ConnectionInfo conn;
 								conn.protocol = ProtocolType::UDP;
 								conn.localAddress = IpAddress(IPv4Address(Internal::NetworkToHost32(pTable->table[i].dwLocalAddr)));
 								conn.localPort = Internal::NetworkToHost16(static_cast<uint16_t>(pTable->table[i].dwLocalPort));
 								conn.processId = pTable->table[i].dwOwningPid;
-
 								connections.push_back(std::move(conn));
 							}
+							break;
 						}
 
-						// IPv6 UDP Connections
-						size = 0;
+						// IPv6 UDP Connections (separate buffer)
+						for (int retry = 0; retry < 3; ++retry) {
+							ULONG usize6 = 0;
 #pragma warning(suppress: 6387)
-						::GetExtendedUdpTable(nullptr, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
-						buffer.resize(size);
-
-						if (::GetExtendedUdpTable(buffer.data(), &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
-							auto* pTable6 = reinterpret_cast<PMIB_UDP6TABLE_OWNER_PID>(buffer.data());
-
+							::GetExtendedUdpTable(nullptr, &usize6, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
+							if (usize6 == 0) break;
+							std::vector<uint8_t> ubuf6(usize6);
+							DWORD urc6 = ::GetExtendedUdpTable(ubuf6.data(), &usize6, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
+							if (urc6 == ERROR_INSUFFICIENT_BUFFER) continue;
+							if (urc6 != NO_ERROR) break;
+							auto* pTable6 = reinterpret_cast<PMIB_UDP6TABLE_OWNER_PID>(ubuf6.data());
 							for (DWORD i = 0; i < pTable6->dwNumEntries; ++i) {
 								ConnectionInfo conn;
 								conn.protocol = ProtocolType::UDP;
-
 								std::array<uint8_t, 16> localBytes;
 								std::memcpy(localBytes.data(), pTable6->table[i].ucLocalAddr, 16);
-
 								conn.localAddress = IpAddress(IPv6Address(localBytes));
 								conn.localPort = Internal::NetworkToHost16(static_cast<uint16_t>(pTable6->table[i].dwLocalPort));
 								conn.processId = pTable6->table[i].dwOwningPid;
-
 								connections.push_back(std::move(conn));
 							}
+							break;
 						}
 					}
 
 					return true;
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in GetActiveConnections");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetActiveConnections");
 					return false;
 				}
@@ -549,6 +669,14 @@ namespace ShadowStrike {
 				std::vector<ConnectionInfo> allConnections;
 				if (!GetActiveConnections(allConnections, ProtocolType::TCP, err)) {
 					return false;
+				}
+
+				// Also fetch UDP connections — malware may use UDP C2, DNS tunneling, QUIC
+				std::vector<ConnectionInfo> udpConnections;
+				if (GetActiveConnections(udpConnections, ProtocolType::UDP, nullptr)) {
+					allConnections.insert(allConnections.end(),
+						std::make_move_iterator(udpConnections.begin()),
+						std::make_move_iterator(udpConnections.end()));
 				}
 
 				connections.clear();
@@ -582,13 +710,13 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				ports.clear();
+				// Use set for O(n) dedup instead of O(n²) linear search
+				std::unordered_set<uint16_t> portSet;
+				portSet.reserve(connections.size());
 				for (const auto& conn : connections) {
-					if (std::find(ports.begin(), ports.end(), conn.localPort) == ports.end()) {
-						ports.push_back(conn.localPort);
-					}
+					portSet.insert(conn.localPort);
 				}
-
+				ports.assign(portSet.begin(), portSet.end());
 				std::sort(ports.begin(), ports.end());
 				return true;
 			}
