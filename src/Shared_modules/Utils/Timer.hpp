@@ -245,59 +245,47 @@ namespace ShadowStrike {
                 std::chrono::steady_clock::time_point nextExecutionTime{};
                 std::chrono::milliseconds interval{ 0 };
                 bool isPeriodic = false;
-                std::function<void()> callback;
+                /// Shared ownership — periodic timers reuse the same callback across firings
+                std::shared_ptr<std::function<void()>> callback;
 
-                /// Min-heap comparison (earliest time first)
+                /// Min-heap comparison (earliest time first, ID tiebreaker for determinism)
                 [[nodiscard]] bool operator>(const TimerTask& other) const noexcept {
-                    return nextExecutionTime > other.nextExecutionTime;
+                    if (nextExecutionTime != other.nextExecutionTime)
+                        return nextExecutionTime > other.nextExecutionTime;
+                    return id > other.id;
                 }
             };
 
             /**
              * @brief Metadata for tracking active timers.
              * 
-             * Provides thread-safe cancellation tracking without modifying
-             * the priority queue directly.
+             * Stored in an unordered_map keyed by TimerId. Holds the shared callback
+             * pointer so periodic timers can be rescheduled without losing the callable.
+             * Non-copyable, non-movable — stored via unique_ptr in the map.
              */
             struct TimerMetadata {
                 TimerId id = kInvalidTimerId;
                 bool isPeriodic = false;
                 std::atomic<bool> isCancelled{ false };
                 std::chrono::steady_clock::time_point creationTime{};
+                /// Shared callback — same pointer is placed in the priority queue for each firing
+                std::shared_ptr<std::function<void()>> callback;
 
-                /// Default constructor
                 TimerMetadata() noexcept = default;
 
-                /// Parameterized constructor
-                TimerMetadata(TimerId id_, bool periodic_, bool cancelled_ = false) noexcept
+                TimerMetadata(TimerId id_, bool periodic_,
+                              std::shared_ptr<std::function<void()>> cb) noexcept
                     : id(id_)
                     , isPeriodic(periodic_)
-                    , isCancelled(cancelled_)
                     , creationTime(std::chrono::steady_clock::now())
+                    , callback(std::move(cb))
                 {}
 
-                // Non-copyable (due to atomic member)
+                // Non-copyable, non-movable (owns atomic + shared_ptr)
                 TimerMetadata(const TimerMetadata&) = delete;
                 TimerMetadata& operator=(const TimerMetadata&) = delete;
-
-                // Moveable
-                TimerMetadata(TimerMetadata&& other) noexcept
-                    : id(other.id)
-                    , isPeriodic(other.isPeriodic)
-                    , isCancelled(other.isCancelled.load(std::memory_order_acquire))
-                    , creationTime(other.creationTime)
-                {}
-
-                TimerMetadata& operator=(TimerMetadata&& other) noexcept {
-                    if (this != &other) {
-                        id = other.id;
-                        isPeriodic = other.isPeriodic;
-                        isCancelled.store(other.isCancelled.load(std::memory_order_acquire), 
-                                         std::memory_order_release);
-                        creationTime = other.creationTime;
-                    }
-                    return *this;
-                }
+                TimerMetadata(TimerMetadata&&) = delete;
+                TimerMetadata& operator=(TimerMetadata&&) = delete;
             };
 
             // ========================================================================
@@ -318,9 +306,6 @@ namespace ShadowStrike {
             /// Checks if a timer is cancelled
             [[nodiscard]] bool isTimerCancelled(TimerId id) const noexcept;
 
-            /// Removes cancelled timers from active map
-            void cleanupCancelledTimers() noexcept;
-
             // ========================================================================
             // Member Variables
             // ========================================================================
@@ -334,7 +319,7 @@ namespace ShadowStrike {
             /// Manager thread
             std::thread m_managerThread;
 
-            /// Thread pool for task execution
+            /// Thread pool for task execution — local copy taken under lock before use
             std::shared_ptr<ThreadPool> m_threadPool;
 
             /// Configuration
@@ -343,8 +328,8 @@ namespace ShadowStrike {
             /// Priority queue of timer tasks (min-heap by execution time)
             std::priority_queue<TimerTask, std::vector<TimerTask>, std::greater<TimerTask>> m_taskQueue;
 
-            /// Active timer metadata for cancellation tracking
-            std::unordered_map<TimerId, TimerMetadata> m_activeTimers;
+            /// Active timer metadata (unique_ptr because TimerMetadata is non-movable)
+            std::unordered_map<TimerId, std::unique_ptr<TimerMetadata>> m_activeTimers;
 
             /// Mutex for thread-safe access to queue and map
             mutable std::mutex m_mutex;
