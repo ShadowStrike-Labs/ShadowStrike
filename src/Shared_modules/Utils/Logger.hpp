@@ -360,8 +360,9 @@ namespace ShadowStrike {
 				if (!lg.IsInitialized() || !lg.IsEnabled(level)) return;
 				try {
 					std::string narrow = std::format(fmt, std::forward<Args>(args)...);
-					std::wstring wide(narrow.begin(), narrow.end());
-					lg.LogMessage(level, L"App", wide);
+					if (narrow.size() > 102400) narrow.resize(102400);
+					const wchar_t* wide = NarrowToWideTLS(narrow.c_str(), 0);
+					lg.LogMessage(level, L"App", wide ? wide : L"[encoding error]");
 				} catch (...) {}
 			}
 

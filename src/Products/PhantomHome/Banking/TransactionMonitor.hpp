@@ -146,7 +146,7 @@
 #include "../../../Shared_modules/HashStore/HashStore.hpp"
 #include "../../../Shared_modules/PatternStore/PatternStore.hpp"
 #include "../../../Shared_modules/ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "../../../Shared_modules/Whitelist/WhiteListStore.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
