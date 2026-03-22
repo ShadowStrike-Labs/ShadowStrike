@@ -390,6 +390,18 @@ namespace ShadowStrike {
                     return false;
                 }
 
+                // Re-validate type after second call (TOCTOU: value type may have changed)
+                if (expectedType != ValueType::Unknown && type != static_cast<DWORD>(expectedType)) {
+                    SetError(err, ERROR_INVALID_DATATYPE, L"Value type changed between queries (TOCTOU)", L"", valueName);
+                    SS_LOG_ERROR(L"RegistryUtils", L"ReadValue: Type changed for %ls (expected=%lu, got=%lu)",
+                                vn.c_str(), static_cast<DWORD>(expectedType), type);
+                    out.clear();
+                    return false;
+                }
+                if (actualType) {
+                    *actualType = static_cast<ValueType>(type);
+                }
+
                 // Resize to actual data size (may be smaller due to race condition)
                 if (actualSize != size) {
                     try {
@@ -594,7 +606,16 @@ namespace ShadowStrike {
                     return false;
                 }
 
-                const DWORD size = static_cast<DWORD>((val.size() + 1) * sizeof(wchar_t));
+                const size_t byteSize = (val.size() + 1) * sizeof(wchar_t);
+                if (byteSize > kMaxRegistryValueSize) {
+                    SetError(err, ERROR_INVALID_PARAMETER, L"String exceeds maximum registry value size", L"", valueName);
+                    return false;
+                }
+                if (byteSize > MAXDWORD || byteSize / sizeof(wchar_t) != val.size() + 1) {
+                    SetError(err, ERROR_INVALID_PARAMETER, L"String too large for registry write", L"", valueName);
+                    return false;
+                }
+                const DWORD size = static_cast<DWORD>(byteSize);
                 const LSTATUS st = RegSetValueExW(m_key, vn.c_str(), 0, REG_SZ, 
                                                   reinterpret_cast<const BYTE*>(val.c_str()), size);
                 if (st != ERROR_SUCCESS) {
@@ -629,7 +650,16 @@ namespace ShadowStrike {
                     return false;
                 }
 
-                const DWORD size = static_cast<DWORD>((val.size() + 1) * sizeof(wchar_t));
+                const size_t byteSize = (val.size() + 1) * sizeof(wchar_t);
+                if (byteSize > kMaxRegistryValueSize) {
+                    SetError(err, ERROR_INVALID_PARAMETER, L"String exceeds maximum registry value size", L"", valueName);
+                    return false;
+                }
+                if (byteSize > MAXDWORD || byteSize / sizeof(wchar_t) != val.size() + 1) {
+                    SetError(err, ERROR_INVALID_PARAMETER, L"String too large for registry write", L"", valueName);
+                    return false;
+                }
+                const DWORD size = static_cast<DWORD>(byteSize);
                 const LSTATUS st = RegSetValueExW(m_key, vn.c_str(), 0, REG_EXPAND_SZ, 
                                                   reinterpret_cast<const BYTE*>(val.c_str()), size);
                 if (st != ERROR_SUCCESS) {
@@ -702,8 +732,23 @@ namespace ShadowStrike {
                     return false;
                 }
 
-                std::wstring vn(valueName);
-                const DWORD size = static_cast<DWORD>(combined.size() * sizeof(wchar_t));
+                std::wstring vn;
+                try {
+                    vn = valueName;
+                } catch (const std::bad_alloc&) {
+                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", L"", valueName);
+                    return false;
+                }
+                const size_t byteSize = combined.size() * sizeof(wchar_t);
+                if (byteSize > kMaxRegistryValueSize) {
+                    SetError(err, ERROR_INVALID_PARAMETER, L"Multi-string exceeds maximum registry value size", L"", valueName);
+                    return false;
+                }
+                if (byteSize > MAXDWORD) {
+                    SetError(err, ERROR_INVALID_PARAMETER, L"Multi-string too large for registry write", L"", valueName);
+                    return false;
+                }
+                const DWORD size = static_cast<DWORD>(byteSize);
                 const LSTATUS st = RegSetValueExW(m_key, vn.c_str(), 0, REG_MULTI_SZ, reinterpret_cast<const BYTE*>(combined.c_str()), size);
                 if (st != ERROR_SUCCESS) {
                     SetError(err, st, L"RegSetValueExW (REG_MULTI_SZ) failed", L"", valueName);
@@ -797,7 +842,12 @@ namespace ShadowStrike {
                     return false;
                 }
                 
-                // Validate size to prevent truncation on 64-bit systems
+                // Validate size to prevent write/read asymmetry and truncation
+                if (size > kMaxRegistryValueSize) {
+                    SetError(err, ERROR_INVALID_PARAMETER, L"Binary data exceeds maximum registry value size", L"", valueName);
+                    SS_LOG_ERROR(L"RegistryUtils", L"WriteBinary: Size %zu exceeds limit %lu", size, kMaxRegistryValueSize);
+                    return false;
+                }
                 if (size > MAXDWORD) {
                     SetError(err, ERROR_INVALID_PARAMETER, L"Binary data too large", L"", valueName);
                     SS_LOG_ERROR(L"RegistryUtils", L"WriteBinary: Size %zu exceeds DWORD maximum %lu", size, MAXDWORD);
@@ -828,7 +878,11 @@ namespace ShadowStrike {
                     SetError(err, ERROR_INVALID_HANDLE, L"Invalid key handle", L"", valueName);
                     return false;
                 }
-                std::wstring vn(valueName);
+                std::wstring vn;
+                try { vn = valueName; } catch (...) {
+                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", L"", valueName);
+                    return false;
+                }
                 const LSTATUS st = RegDeleteValueW(m_key, vn.c_str());
                 if (st != ERROR_SUCCESS && st != ERROR_FILE_NOT_FOUND) {
                     SetError(err, st, L"RegDeleteValueW failed", L"", valueName);
@@ -843,7 +897,11 @@ namespace ShadowStrike {
                     SetError(err, ERROR_INVALID_HANDLE, L"Invalid key handle", subKey);
                     return false;
                 }
-                std::wstring sk(subKey);
+                std::wstring sk;
+                try { sk = subKey; } catch (...) {
+                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", subKey);
+                    return false;
+                }
                 const LSTATUS st = RegDeleteKeyW(m_key, sk.c_str());
                 if (st != ERROR_SUCCESS && st != ERROR_FILE_NOT_FOUND) {
                     SetError(err, st, L"RegDeleteKeyW failed", subKey);
@@ -858,7 +916,11 @@ namespace ShadowStrike {
                     SetError(err, ERROR_INVALID_HANDLE, L"Invalid key handle", subKey);
                     return false;
                 }
-                std::wstring sk(subKey);
+                std::wstring sk;
+                try { sk = subKey; } catch (...) {
+                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", subKey);
+                    return false;
+                }
                 const LSTATUS st = RegDeleteTreeW(m_key, sk.c_str());
                 if (st != ERROR_SUCCESS && st != ERROR_FILE_NOT_FOUND) {
                     SetError(err, st, L"RegDeleteTreeW failed", subKey);
@@ -1000,7 +1062,8 @@ namespace ShadowStrike {
 
             bool RegistryKey::ValueExists(std::wstring_view valueName) const noexcept {
                 if (!m_key) return false;
-                std::wstring vn(valueName);
+                std::wstring vn;
+                try { vn = valueName; } catch (...) { return false; }
                 DWORD type = 0, size = 0;
                 const LSTATUS st = RegQueryValueExW(m_key, vn.c_str(), nullptr, &type, nullptr, &size);
                 return st == ERROR_SUCCESS;
@@ -1013,7 +1076,8 @@ namespace ShadowStrike {
                 // For critical operations, use Open() directly and handle errors rather than checking first.
                 
                 if (!m_key) return false;
-                std::wstring sk(subKey);
+                std::wstring sk;
+                try { sk = subKey; } catch (...) { return false; }
                 HKEY hTest = nullptr;
                 const LSTATUS st = RegOpenKeyExW(m_key, sk.c_str(), 0, KEY_READ, &hTest);
                 if (st == ERROR_SUCCESS && hTest) {
@@ -1045,8 +1109,8 @@ namespace ShadowStrike {
 
                 // SE_BACKUP_NAME is necessary
                 if (!EnableBackupPrivilege(err)) {
-
-                    SS_LOG_ERROR(L"RegistryUtils_save_to_file", L"Failed to get Backup Privilege : %ls", err->message.c_str());
+                    SS_LOG_ERROR(L"RegistryUtils_save_to_file", L"Failed to get Backup Privilege%ls",
+                                err ? err->message.c_str() : L"");
                     return false;
                 }
 
@@ -1067,7 +1131,8 @@ namespace ShadowStrike {
 
 				// SE_RESTORE_NAME is necessary
                 if (!EnableRestorePrivilege(err)) {
-                    SS_LOG_ERROR(L"RegistryUtils_restore_from_file", L"Failed to Get Restore Privilege : %ls", err->message.c_str());
+                    SS_LOG_ERROR(L"RegistryUtils_restore_from_file", L"Failed to get Restore Privilege%ls",
+                                err ? err->message.c_str() : L"");
                     return false;
                 }
 
@@ -1095,13 +1160,17 @@ namespace ShadowStrike {
             }
 
             std::wstring RootKeyToString(HKEY hKey) noexcept {
-                if (hKey == HKEY_CLASSES_ROOT) return L"HKEY_CLASSES_ROOT";
-                if (hKey == HKEY_CURRENT_USER) return L"HKEY_CURRENT_USER";
-                if (hKey == HKEY_LOCAL_MACHINE) return L"HKEY_LOCAL_MACHINE";
-                if (hKey == HKEY_USERS) return L"HKEY_USERS";
-                if (hKey == HKEY_CURRENT_CONFIG) return L"HKEY_CURRENT_CONFIG";
-                if (hKey == HKEY_PERFORMANCE_DATA) return L"HKEY_PERFORMANCE_DATA";
-                return L"UNKNOWN";
+                try {
+                    if (hKey == HKEY_CLASSES_ROOT) return L"HKEY_CLASSES_ROOT";
+                    if (hKey == HKEY_CURRENT_USER) return L"HKEY_CURRENT_USER";
+                    if (hKey == HKEY_LOCAL_MACHINE) return L"HKEY_LOCAL_MACHINE";
+                    if (hKey == HKEY_USERS) return L"HKEY_USERS";
+                    if (hKey == HKEY_CURRENT_CONFIG) return L"HKEY_CURRENT_CONFIG";
+                    if (hKey == HKEY_PERFORMANCE_DATA) return L"HKEY_PERFORMANCE_DATA";
+                    return L"UNKNOWN";
+                } catch (...) {
+                    return {};
+                }
             }
 
             bool SplitPath(std::wstring_view fullPath, HKEY& rootKey, std::wstring& subKey) noexcept {
@@ -1116,7 +1185,11 @@ namespace ShadowStrike {
                 rootKey = ParseRootKey(rootName);
                 if (!rootKey) return false;
 
-                subKey = fullPath.substr(pos + 1);
+                try {
+                    subKey = fullPath.substr(pos + 1);
+                } catch (...) {
+                    return false;
+                }
                 return true;
             }
 
@@ -1168,7 +1241,11 @@ namespace ShadowStrike {
             }
 
             bool DeleteKey(HKEY hKeyRoot, std::wstring_view subKey, const OpenOptions& opt, Error* err) noexcept {
-                std::wstring sk(subKey);
+                std::wstring sk;
+                try { sk = subKey; } catch (...) {
+                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", subKey);
+                    return false;
+                }
                 const REGSAM sam = BuildAccessMask(opt) | DELETE;
                 const LSTATUS st = RegDeleteKeyExW(hKeyRoot, sk.c_str(), sam, 0);
                 if (st != ERROR_SUCCESS && st != ERROR_FILE_NOT_FOUND) {
@@ -1276,6 +1353,12 @@ namespace ShadowStrike {
                     SetError(err, ERROR_INVALID_PARAMETER, L"Null security descriptor");
                     return false;
                 }
+
+                if (!IsValidSecurityDescriptor(const_cast<PSECURITY_DESCRIPTOR>(sd))) {
+                    SetError(err, ERROR_INVALID_SECURITY_DESCR, L"Invalid or malformed security descriptor");
+                    SS_LOG_ERROR(L"RegistryUtils", L"SetKeySecurity: Security descriptor validation failed");
+                    return false;
+                }
                 
                 const LSTATUS st = RegSetKeySecurity(hKey, secInfo, const_cast<PSECURITY_DESCRIPTOR>(sd));
                 if (st != ERROR_SUCCESS) {
@@ -1362,7 +1445,7 @@ namespace ShadowStrike {
              * @return true on success, false on failure.
              */
             bool EnableBackupPrivilege(Error* err) noexcept {
-                return EnablePrivilege(L"SeRestorePrivilege", err);
+                return EnablePrivilege(L"SeBackupPrivilege", err);
             }
 
             /**

@@ -29,7 +29,6 @@
 #include <limits>
 #include <algorithm>
 #include <cstdarg>
-#include <cwctype>
 #include <stdexcept>
 #include <type_traits>
 
@@ -161,8 +160,8 @@ namespace ShadowStrike {
                     return std::string{};
                 }
 
-                // Validate output size
-                if (static_cast<size_t>(sizeNeeded) > std::numeric_limits<size_t>::max()) {
+                // Validate output size against conversion limit
+                if (static_cast<size_t>(sizeNeeded) > kMaxConversionSize) {
                     return std::string{};
                 }
 
@@ -199,13 +198,11 @@ namespace ShadowStrike {
             }
 
             std::wstring utf8_to_wstring(const char* utf8) noexcept {
-                // Handle null or empty input
                 if (!utf8 || *utf8 == '\0') {
                     return std::wstring{};
                 }
 
-                // First call: determine required buffer size
-                // Using -1 for null-terminated string (includes null in count)
+                // First call: determine required buffer size (-1 = scan until null)
                 const int sizeNeeded = MultiByteToWideChar(
                     CP_UTF8, 
                     MB_ERR_INVALID_CHARS,
@@ -215,29 +212,23 @@ namespace ShadowStrike {
                     0
                 );
 
-                if (sizeNeeded <= 0) {
+                if (sizeNeeded <= 1) {
                     return std::wstring{};
                 }
 
-                // sizeNeeded includes null terminator, so actual string length is sizeNeeded - 1
-                if (sizeNeeded <= 1) {
-                    return std::wstring{};  // Empty string (just null terminator)
+                // Security: prevent unbounded allocation from attacker-controlled input
+                if (static_cast<size_t>(sizeNeeded) > kMaxConversionSize / sizeof(wchar_t)) {
+                    return std::wstring{};
                 }
 
-                // Allocate buffer (without null terminator since std::wstring manages it)
+                // String length excluding null terminator
+                const size_t strLen = static_cast<size_t>(sizeNeeded - 1);
+
+                // Single allocation: resize result, convert directly into buffer
+                // std::wstring guarantees space for strLen + 1 (null terminator)
                 std::wstring result;
                 try {
-                    result.resize(static_cast<size_t>(sizeNeeded - 1));
-                }
-                catch (...) {
-                    return std::wstring{};
-                }
-
-                // Second call: perform conversion
-                // Allocate +1 for the null terminator that MultiByteToWideChar writes
-                std::vector<wchar_t> buffer;
-                try {
-                    buffer.resize(static_cast<size_t>(sizeNeeded));
+                    result.resize(strLen);
                 }
                 catch (...) {
                     return std::wstring{};
@@ -248,16 +239,15 @@ namespace ShadowStrike {
                     MB_ERR_INVALID_CHARS,
                     utf8, 
                     -1, 
-                    buffer.data(), 
+                    result.data(), 
                     sizeNeeded
                 );
 
-                if (converted <= 0) {
+                if (converted <= 0 || converted != sizeNeeded) {
                     return std::wstring{};
                 }
 
-                // Copy to result (excluding null terminator)
-                return std::wstring(buffer.data(), static_cast<size_t>(converted - 1));
+                return result;
             }
 
             // ============================================================================
@@ -460,27 +450,31 @@ namespace ShadowStrike {
             }
 
             bool IContains(std::wstring_view str, std::wstring_view substr) noexcept {
-                // Empty substring is always found
                 if (substr.empty()) {
                     return true;
                 }
                 
-                // If substring is longer than string, can't be found
                 if (str.empty() || substr.size() > str.size()) {
                     return false;
                 }
 
-                // Use STL search with case-insensitive comparison
-                const auto it = std::search(
-                    str.begin(), str.end(),
-                    substr.begin(), substr.end(),
-                    [](wchar_t ch1, wchar_t ch2) noexcept {
-                        return std::towupper(static_cast<std::wint_t>(ch1)) == 
-                               std::towupper(static_cast<std::wint_t>(ch2));
-                    }
-                );
+                // INT_MAX guard for CompareStringOrdinal
+                if (substr.size() > static_cast<size_t>(INT_MAX)) {
+                    return false;
+                }
 
-                return it != str.end();
+                // Sliding window with locale-independent ordinal comparison
+                const int needleLen = static_cast<int>(substr.size());
+                const size_t limit = str.size() - substr.size();
+                for (size_t i = 0; i <= limit; ++i) {
+                    const int cmp = CompareStringOrdinal(
+                        str.data() + i, needleLen,
+                        substr.data(), needleLen,
+                        TRUE);
+                    if (cmp == CSTR_EQUAL) return true;
+                }
+
+                return false;
             }
 
             // ============================================================================
@@ -569,9 +563,13 @@ namespace ShadowStrike {
                 // Add delimiter sizes (only between elements)
                 if (elements.size() > 1) {
                     const size_t delimCount = elements.size() - 1;
+                    // Check multiplication overflow BEFORE computing product
+                    if (delimiter.size() != 0 && delimCount > maxSize / delimiter.size()) {
+                        return std::wstring{};
+                    }
                     const size_t delimTotalSize = delimCount * delimiter.size();
                     
-                    // Check for overflow
+                    // Check addition overflow
                     if (totalSize > maxSize - delimTotalSize) {
                         return std::wstring{};
                     }
@@ -624,7 +622,8 @@ namespace ShadowStrike {
                         estimatedSize += (str.size() / from.size()) * diff / 10;  // Conservative estimate
                     }
                     
-                    const size_t reserveSize = (estimatedSize < str.size() * 2) ? estimatedSize : (str.size() * 2);
+                    const size_t safeDouble = (str.size() <= SIZE_MAX / 2) ? str.size() * 2 : str.size();
+                    const size_t reserveSize = (estimatedSize < safeDouble) ? estimatedSize : safeDouble;
                     
                     try {
                         result.reserve(reserveSize);
@@ -699,12 +698,12 @@ namespace ShadowStrike {
 
                 // Check for encoding error
                 if (needed < 0) {
-                    return L"[StringUtils::FormatV] Encoding error";
+                    return std::wstring{};
                 }
 
                 // Security: limit output size to prevent DoS
                 if (needed > kMaxFormatSize) {
-                    return L"[StringUtils::FormatV] Result too large";
+                    return std::wstring{};
                 }
 
                 // Handle empty result
@@ -718,7 +717,7 @@ namespace ShadowStrike {
                     result.resize(static_cast<size_t>(needed));
                 }
                 catch (const std::bad_alloc&) {
-                    return L"[StringUtils::FormatV] Memory allocation failed";
+                    return std::wstring{};
                 }
 
                 // Format the string
@@ -733,7 +732,7 @@ namespace ShadowStrike {
 
                 // Check for write error
                 if (written < 0) {
-                    return L"[StringUtils::FormatV] Write error";
+                    return std::wstring{};
                 }
 
                 // Resize if less was written (shouldn't happen normally)
