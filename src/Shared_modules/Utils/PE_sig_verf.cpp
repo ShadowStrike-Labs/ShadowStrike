@@ -584,45 +584,44 @@ namespace ShadowStrike {
                 info.isSigned = true;
 
                 // Extract PKCS#7 message and leaf cert for detailed validation
-                HCERTSTORE hStore = nullptr;
-                HCRYPTMSG hMsg = nullptr;
-                DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
-                
-                if (!CryptQueryObject(//-V1109 //-V5014
-                    CERT_QUERY_OBJECT_FILE,
-                    pathCopy.c_str(),
-                    CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
-                    CERT_QUERY_FORMAT_FLAG_BINARY,
-                    0,
-                    &dwEncoding, &dwContentType, &dwFormatType,
-                    &hStore, &hMsg, nullptr)) {
-                    set_err(err, "CryptQueryObject failed (embedded)", GetLastError());
-                    // Clean up any partially opened handles
-                    if (hStore) CertCloseStore(hStore, 0);
-                    if (hMsg) CryptMsgClose(hMsg);
-                    return false;
-                }
+                CertStoreRAII storeGuard;
+                CryptMsgRAII msgGuard;
+                {
+                    HCERTSTORE hStore = nullptr;
+                    HCRYPTMSG hMsg = nullptr;
+                    DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
 
-                // Ensure cleanup on all exit paths
-                auto cleanupHandles = [&]() {
-                    if (hStore) { CertCloseStore(hStore, 0); hStore = nullptr; }
-                    if (hMsg) { CryptMsgClose(hMsg); hMsg = nullptr; }
-                };
+                    if (!CryptQueryObject(//-V1109 //-V5014
+                        CERT_QUERY_OBJECT_FILE,
+                        pathCopy.c_str(),
+                        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
+                        CERT_QUERY_FORMAT_FLAG_BINARY,
+                        0,
+                        &dwEncoding, &dwContentType, &dwFormatType,
+                        &hStore, &hMsg, nullptr)) {
+                        DWORD lastErr = GetLastError();
+                        storeGuard.reset(hStore);
+                        msgGuard.reset(hMsg);
+                        set_err(err, "CryptQueryObject failed (embedded)", lastErr);
+                        return false;
+                    }
+                    storeGuard.reset(hStore);
+                    msgGuard.reset(hMsg);
+                }
 
                 // Get signer count
                 DWORD signerCount = 0;
                 DWORD cbCount = sizeof(signerCount);
-                if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_COUNT_PARAM, 0, &signerCount, &cbCount) || signerCount == 0) {
+                if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_COUNT_PARAM, 0, &signerCount, &cbCount) || signerCount == 0) {
                     set_err(err, "No signer found in PKCS7");
-                    cleanupHandles();
                     return false;
                 }
 
                 // Get primary signer info (index 0)
                 DWORD cbSigner = 0;
-                if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbSigner) || cbSigner == 0) {
-                    set_err(err, "Failed to get signer info size");
-                    cleanupHandles();
+                if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbSigner)
+                    || cbSigner == 0 || cbSigner > kMaxSignerInfoSize) {
+                    set_err(err, "Failed to get signer info size or size exceeds limit");
                     return false;
                 }
 
@@ -632,14 +631,12 @@ namespace ShadowStrike {
                 }
                 catch (...) {
                     set_err(err, "Memory allocation failed for signer info");
-                    cleanupHandles();
                     return false;
                 }
 
                 auto* psi = reinterpret_cast<CMSG_SIGNER_INFO*>(signerBuf.data());
-                if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, psi, &cbSigner)) {
+                if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_INFO_PARAM, 0, psi, &cbSigner)) {
                     set_err(err, "CryptMsgGetParam signer info failed", GetLastError());
-                    cleanupHandles();
                     return false;
                 }
 
@@ -650,7 +647,7 @@ namespace ShadowStrike {
                     certInfo.Issuer = psi->Issuer;
                     certInfo.SerialNumber = psi->SerialNumber;
                     leaf.p = CertFindCertificateInStore(
-                        hStore,
+                        storeGuard.get(),
                         X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
                         0,
                         CERT_FIND_SUBJECT_CERT,
@@ -659,14 +656,12 @@ namespace ShadowStrike {
                     );
                     if (!leaf.p) {
                         set_err(err, "Leaf certificate not found in store");
-                        cleanupHandles();
                         return false;
                     }
                 }
 
                 // EKU: require code signing usage
                 if (!CheckCodeSigningEKU(leaf.p, err)) {
-                    cleanupHandles();
                     return false;
                 }
                 info.isEKUValid = true;
@@ -674,7 +669,7 @@ namespace ShadowStrike {
                 // Timestamp via countersignature (RFC3161 or legacy)
                 // Fallback to current time check if countersignature absent
                 FILETIME ts{};
-                bool haveCsTs = CheckTimestampCounterSignatureFromMessage(hMsg, /*signerIndex*/ 0, ts, err);
+                bool haveCsTs = CheckTimestampCounterSignatureFromMessage(msgGuard.get(), /*signerIndex*/ 0, ts, err);
                 bool tsValid = false;
                 
                 if (haveCsTs) {
@@ -699,37 +694,33 @@ namespace ShadowStrike {
                 
                 if (!tsValid) {
                     set_err(err, "Timestamp validation failed");
-                    cleanupHandles();
                     return false;
                 }
 
                 // Chain + revocation policy
                 if (!ValidateCertificateChain(leaf.p, err)) {
-                    cleanupHandles();
                     return false;
                 }
                 info.isChainTrusted = true;
 
                 if (!CheckRevocationOnline(leaf.p, err)) {
-                    cleanupHandles();
                     return false;
                 }
                 info.isRevocationChecked = true;
 
                 // Populate additional info fields
                 if (!GetSignerName(leaf.p, info.signerName, nullptr)) {
-                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get signer's name");
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get signer name");
                 }
-                else if (!GetIssuerName(leaf.p, info.issuerName, nullptr)) {
-                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get ıssuer's name");
+                if (!GetIssuerName(leaf.p, info.issuerName, nullptr)) {
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get issuer name");
                 }
-                else if (!GetCertThumbprint(leaf.p, info.thumbprint, nullptr, true)) {
+                if (!GetCertThumbprint(leaf.p, info.thumbprint, nullptr, true)) {
                     SS_LOG_WARN(L"PE_sig_verification", L"Failed to get certificate thumbprint");
                 }
                 
                 info.isVerified = true;
 
-                cleanupHandles();
                 return true;
             }
 
@@ -927,12 +918,12 @@ namespace ShadowStrike {
 
                 // Populate additional info fields
                 if (!GetSignerName(leaf.p, info.signerName, nullptr)) {
-                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get signer's name");
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get signer name");
                 }
-                else if (!GetIssuerName(leaf.p, info.issuerName, nullptr)) {
-                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get ıssuer's name");
+                if (!GetIssuerName(leaf.p, info.issuerName, nullptr)) {
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get issuer name");
                 }
-                else if (!GetCertThumbprint(leaf.p, info.thumbprint, nullptr, true)) {
+                if (!GetCertThumbprint(leaf.p, info.thumbprint, nullptr, true)) {
                     SS_LOG_WARN(L"PE_sig_verification", L"Failed to get certificate thumbprint");
                 }
 
@@ -1145,8 +1136,9 @@ namespace ShadowStrike {
 
                     // Get signer info size
                     DWORD cbSigner = 0;
-                    if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbSigner) || cbSigner == 0) {
-                        set_err(err, "CryptMsgGetParam signer size failed (embedded)", GetLastError());
+                    if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbSigner)
+                        || cbSigner == 0 || cbSigner > kMaxSignerInfoSize) {
+                        set_err(err, "CryptMsgGetParam signer size failed or exceeds limit (embedded)", GetLastError());
                         return false;
                     }
 
@@ -1220,12 +1212,12 @@ namespace ShadowStrike {
 
                 // Populate additional info fields
                 if (!GetSignerName(leaf.p, info.signerName, nullptr)) {
-                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get signer's name");
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get signer name");
                 }
-                else if (!GetIssuerName(leaf.p, info.issuerName, nullptr)) {
-                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get ıssuer's name");
+                if (!GetIssuerName(leaf.p, info.issuerName, nullptr)) {
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get issuer name");
                 }
-                else if (!GetCertThumbprint(leaf.p, info.thumbprint, nullptr, true)) {
+                if (!GetCertThumbprint(leaf.p, info.thumbprint, nullptr, true)) {
                     SS_LOG_WARN(L"PE_sig_verification", L"Failed to get certificate thumbprint");
                 }
 
@@ -1255,9 +1247,17 @@ namespace ShadowStrike {
                         HCERTSTORE hStoreTmp = nullptr;
                         HCRYPTMSG hMsgTmp = nullptr;
                         
+                        // Persist path to avoid dangling pointer from temporary wstring
+                        std::wstring catPathCopy;
+                        try { catPathCopy = std::wstring(catalogPath); }
+                        catch (...) {
+                            set_err(err, "Memory allocation failed for catalog path");
+                            return false;
+                        }
+
                         if (!CryptQueryObject(//-V1109 //-V5014
                             CERT_QUERY_OBJECT_FILE,
-                            std::wstring(catalogPath).c_str(),
+                            catPathCopy.c_str(),
                             CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
                             CERT_QUERY_FORMAT_FLAG_BINARY,
                             0,
@@ -1569,33 +1569,42 @@ namespace ShadowStrike {
                     return result;
                 }
 
-                // Query PKCS7 from PE
-                HCERTSTORE hStore = nullptr;
-                HCRYPTMSG hMsg = nullptr;
-                DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
-                BOOL qok = CryptQueryObject(//-V1109 //-V5014
-                    CERT_QUERY_OBJECT_FILE,
-                    std::wstring(filePath).c_str(),
-                    CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
-                    CERT_QUERY_FORMAT_FLAG_BINARY,
-                    0,
-                    &dwEncoding, &dwContentType, &dwFormatType,
-                    &hStore, &hMsg, nullptr
-                );
-                if (!qok || !hStore || !hMsg) {
-                    set_err(err, "CryptQueryObject failed (ExtractAllSignatures)");
-                    if (hStore) CertCloseStore(hStore, 0);
-                    if (hMsg) CryptMsgClose(hMsg);
-                    return result;
+                // Query PKCS7 from PE using RAII for exception-safe resource management
+                CertStoreRAII storeGuard;
+                CryptMsgRAII msgGuard;
+                {
+                    HCERTSTORE hStore = nullptr;
+                    HCRYPTMSG hMsg = nullptr;
+                    DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
+
+                    std::wstring pathCopy;
+                    try { pathCopy = std::wstring(filePath); }
+                    catch (...) {
+                        set_err(err, "Memory allocation failed for file path");
+                        return result;
+                    }
+
+                    BOOL qok = CryptQueryObject(//-V1109 //-V5014
+                        CERT_QUERY_OBJECT_FILE,
+                        pathCopy.c_str(),
+                        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
+                        CERT_QUERY_FORMAT_FLAG_BINARY,
+                        0,
+                        &dwEncoding, &dwContentType, &dwFormatType,
+                        &hStore, &hMsg, nullptr
+                    );
+                    storeGuard.reset(hStore);
+                    msgGuard.reset(hMsg);
+                    if (!qok || !storeGuard.get() || !msgGuard.get()) {
+                        set_err(err, "CryptQueryObject failed (ExtractAllSignatures)");
+                        return result;
+                    }
                 }
 
                 // Get signer count
                 DWORD signerCount = 0;
                 DWORD cb = sizeof(signerCount);
-                if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_COUNT_PARAM, 0, &signerCount, &cb) || signerCount == 0) {
-                    // No signers is legitimate for unsigned files; return empty vector
-                    CertCloseStore(hStore, 0);
-                    CryptMsgClose(hMsg);
+                if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_COUNT_PARAM, 0, &signerCount, &cb) || signerCount == 0) {
                     return result;
                 }
 
@@ -1611,7 +1620,7 @@ namespace ShadowStrike {
                 for (DWORD index = 0; index < signerCount; ++index) {
                     // Fetch signer info size first
                     DWORD cbi = 0;
-                    if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, index, nullptr, &cbi) || cbi == 0) {
+                    if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_INFO_PARAM, index, nullptr, &cbi) || cbi == 0 || cbi > kMaxSignerInfoSize) {
                         continue; // Skip malformed entry
                     }
                     
@@ -1625,7 +1634,7 @@ namespace ShadowStrike {
                     }
                     
                     auto* psi = reinterpret_cast<CMSG_SIGNER_INFO*>(signerBuf.data());
-                    if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, index, psi, &cbi)) {
+                    if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_INFO_PARAM, index, psi, &cbi)) {
                         // Skip broken entry; continue others
                         continue;
                     }
@@ -1636,7 +1645,7 @@ namespace ShadowStrike {
                     ci.SerialNumber = psi->SerialNumber;
 
                     PCCERT_CONTEXT leaf = CertFindCertificateInStore(
-                        hStore,
+                        storeGuard.get(),
                         X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
                         0,
                         CERT_FIND_SUBJECT_CERT,
@@ -1661,20 +1670,18 @@ namespace ShadowStrike {
 
                     // Extract issuer name
                     if (!GetIssuerName(leafGuard.p, meta.issuerName, nullptr)) {
-                        SS_LOG_ERROR(L"PE_sig_verification", L"Failed to get signer's name.");
+                        SS_LOG_ERROR(L"PE_sig_verification", L"Failed to get issuer name");
                     }
 
                     // Extract thumbprint (SHA-256 preferred)
                     if (!GetCertThumbprint(leafGuard.p, meta.thumbprint, nullptr, /*useSha256*/ true)) {
-                        SS_LOG_ERROR(L"PE_sig_verification", L"Failed to get signer's name.");
+                        SS_LOG_ERROR(L"PE_sig_verification", L"Failed to get certificate thumbprint");
                     }
 
-                    // Extract signing time (best effort - use current time as fallback)
-                    SYSTEMTIME stNow{}; 
-                    GetSystemTime(&stNow);
-                    FILETIME ftNow{}; 
-                    if (SystemTimeToFileTime(&stNow, &ftNow)) {
-                        meta.signTime = ftNow;
+                    // Extract signing time from countersignature (best effort)
+                    FILETIME ft{};
+                    if (CheckTimestampCounterSignatureFromMessage(msgGuard.get(), index, ft, nullptr)) {
+                        meta.signTime = ft;
                     }
 
                     // Check EKU (informational - doesn't affect inclusion in results)
@@ -1686,8 +1693,6 @@ namespace ShadowStrike {
                     result.push_back(std::move(meta));
                 }
 
-                CertCloseStore(hStore, 0);
-                CryptMsgClose(hMsg);
                 return result;
             }
 
@@ -1768,8 +1773,9 @@ namespace ShadowStrike {
                 for (DWORD index = 0; index < signerCount; ++index) {
                     // Get signer info size
                     DWORD cbSigner = 0;
-                    if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_INFO_PARAM, index, nullptr, &cbSigner) || cbSigner == 0) {
-                        continue; // Skip malformed entry
+                    if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_INFO_PARAM, index, nullptr, &cbSigner)
+                        || cbSigner == 0 || cbSigner > kMaxSignerInfoSize) {
+                        continue;
                     }
 
                     // Allocate with exception safety
@@ -2077,7 +2083,18 @@ namespace ShadowStrike {
                         // Get signer info of the TST (index 0)
                         DWORD cbTsSigner = 0;
                         CryptMsgGetParam(hTsMsg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbTsSigner);
-                        std::vector<BYTE> tsSignerBuf(cbTsSigner);
+                        if (cbTsSigner == 0 || cbTsSigner > kMaxSignerInfoSize) {
+                            set_err(err, "TST signer info size invalid or exceeds limit");
+                            CryptMsgClose(hTsMsg);
+                            continue;
+                        }
+                        std::vector<BYTE> tsSignerBuf;
+                        try { tsSignerBuf.resize(cbTsSigner); }
+                        catch (...) {
+                            set_err(err, "TST signer info allocation failed");
+                            CryptMsgClose(hTsMsg);
+                            continue;
+                        }
                         auto* tsSI = reinterpret_cast<CMSG_SIGNER_INFO*>(tsSignerBuf.data());
                         if (!CryptMsgGetParam(hTsMsg, CMSG_SIGNER_INFO_PARAM, 0, tsSI, &cbTsSigner)) {
                             set_err(err, "CMSG_SIGNER_INFO(TST) fetch failed");
@@ -2127,25 +2144,27 @@ namespace ShadowStrike {
                     if (attr.pszObjId && std::strcmp(attr.pszObjId, OID_COUNTERSIGN) == 0) {
                         const CRYPT_ATTR_BLOB& blob = attr.rgValue[0];
 
-                        // Decode legacy countersignature message
-                        HCRYPTMSG hCsMsg = CryptMsgOpenToDecode(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-                            0, 0, 0, nullptr, nullptr);
-                        if (!hCsMsg) { set_err(err, "CryptMsgOpenToDecode(legacy CS) failed"); continue; }
-
-                        BOOL upd = CryptMsgUpdate(hCsMsg, blob.pbData, blob.cbData, TRUE);
-                        if (!upd) {
-                            set_err(err, "CryptMsgUpdate(legacy CS) failed");
-                            CryptMsgClose(hCsMsg);
+                        // Decode legacy countersignature as raw PKCS7_SIGNER_INFO structure
+                        // The blob IS the encoded CMSG_SIGNER_INFO, not a PKCS7 message
+                        DWORD cbCsSigner = 0;
+                        if (!CryptDecodeObject(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                            PKCS7_SIGNER_INFO, blob.pbData, blob.cbData,
+                            CRYPT_DECODE_NOCOPY_FLAG, nullptr, &cbCsSigner)
+                            || cbCsSigner == 0 || cbCsSigner > kMaxSignerInfoSize) {
+                            set_err(err, "CryptDecodeObject(legacy CS) size query failed");
                             continue;
                         }
-
-                        DWORD cbCsSigner = 0;
-                        CryptMsgGetParam(hCsMsg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbCsSigner);
-                        std::vector<BYTE> csSignerBuf(cbCsSigner);
+                        std::vector<BYTE> csSignerBuf;
+                        try { csSignerBuf.resize(cbCsSigner); }
+                        catch (...) {
+                            set_err(err, "Legacy CS signer info allocation failed");
+                            continue;
+                        }
                         auto* csSI = reinterpret_cast<CMSG_SIGNER_INFO*>(csSignerBuf.data());
-                        if (!CryptMsgGetParam(hCsMsg, CMSG_SIGNER_INFO_PARAM, 0, csSI, &cbCsSigner)) {
-                            set_err(err, "CMSG_SIGNER_INFO(legacy CS) fetch failed");
-                            CryptMsgClose(hCsMsg);
+                        if (!CryptDecodeObject(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                            PKCS7_SIGNER_INFO, blob.pbData, blob.cbData,
+                            CRYPT_DECODE_NOCOPY_FLAG, csSI, &cbCsSigner)) {
+                            set_err(err, "CryptDecodeObject(legacy CS) decode failed");
                             continue;
                         }
 
@@ -2168,7 +2187,6 @@ namespace ShadowStrike {
                             }
                         }
 
-                        CryptMsgClose(hCsMsg);
                     }
                 }
 
@@ -2200,9 +2218,19 @@ namespace ShadowStrike {
 
                 ULONGLONG graceTicks = static_cast<ULONGLONG>(tsGraceSeconds_) * 10'000'000ULL; // seconds to 100ns
 
-                // Accept if within grace window around current time (helps with minor clock skews)
-                if (ts.QuadPart + graceTicks < now.QuadPart) return false;
-                if (ts.QuadPart > now.QuadPart + graceTicks) return false;
+                // Overflow-safe lower bound: ts + grace < now  =>  ts < now - grace (when safe)
+                if (now.QuadPart > graceTicks) {
+                    if (ts.QuadPart < now.QuadPart - graceTicks) return false;
+                }
+                // else: now is very small, any ts >= 0 passes lower bound
+
+                // Overflow-safe upper bound: ts > now + grace
+                if (now.QuadPart > MAXULONGLONG - graceTicks) {
+                    // now near max — any ts passes upper bound since ts <= MAXULONGLONG
+                }
+                else {
+                    if (ts.QuadPart > now.QuadPart + graceTicks) return false;
+                }
                 return true;
             }
 
@@ -2234,9 +2262,16 @@ namespace ShadowStrike {
                     HCERTSTORE hStoreTmp = nullptr;
                     HCRYPTMSG hMsgTmp = nullptr;
 
+                    std::wstring pathCopy;
+                    try { pathCopy = std::wstring(filePath); }
+                    catch (...) {
+                        set_err(err, "Memory allocation failed for file path (LoadPrimarySigner)");
+                        return false;
+                    }
+
                     if (!CryptQueryObject(//-V1109 //-V5014
                         CERT_QUERY_OBJECT_FILE,
-                        std::wstring(filePath).c_str(),
+                        pathCopy.c_str(),
                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
                         CERT_QUERY_FORMAT_FLAG_BINARY,
                         0,
@@ -2297,15 +2332,10 @@ namespace ShadowStrike {
                     nullptr
                 );
 
-                // Best-effort: extract signing time from unauthenticated attributes if present
+                // Best-effort: extract actual signing time from countersignature
                 if (outSignTime) {
-                    // Attempt to parse legacy signing time attribute (szOID_RSA_signingTime)
-                    // We read the unauthenticated attributes from psi->UnauthenticatedAttributes if available.
-                    // Full ASN.1 parsing is beyond this function�s scope; we set current system time as fallback.
-                    SYSTEMTIME stNow{};
-                    GetSystemTime(&stNow);
-                    if (!SystemTimeToFileTime(&stNow, outSignTime)) {
-                        // Fallback: zero out signTime on conversion failure
+                    if (!CheckTimestampCounterSignatureFromMessage(msgGuard.get(), 0, *outSignTime, nullptr)) {
+                        // Countersignature not present or unparseable — zero out (no fake system time)
                         outSignTime->dwHighDateTime = 0;
                         outSignTime->dwLowDateTime = 0;
                     }
@@ -2324,31 +2354,8 @@ namespace ShadowStrike {
             // Strict OID check for Code Signing EKU.
             // Returns true when EKU includes 1.3.6.1.5.5.7.3.3; false otherwise.
             bool PEFileSignatureVerifier::CheckEKUCodeSigningOid(PCCERT_CONTEXT cert) noexcept {
-                if (!cert) return false;
-
-                DWORD cb = 0;
-                if (!CertGetEnhancedKeyUsage(cert, 0, nullptr, &cb) || cb == 0) {
-                    return false;
-                }
-
-                std::vector<BYTE> buf(cb);
-                auto* pUsage = reinterpret_cast<PCERT_ENHKEY_USAGE>(buf.data());
-                if (!CertGetEnhancedKeyUsage(cert, 0, pUsage, &cb)) {
-                    return false;
-                }
-
-                if (pUsage->cUsageIdentifier == 0 || !pUsage->rgpszUsageIdentifier) {
-                    return false;
-                }
-
-                constexpr const char* OID_CODE_SIGNING = "1.3.6.1.5.5.7.3.3";
-                for (DWORD i = 0; i < pUsage->cUsageIdentifier; ++i) {
-                    const char* oid = pUsage->rgpszUsageIdentifier[i];
-                    if (oid && std::strcmp(oid, OID_CODE_SIGNING) == 0) {
-                        return true;
-                    }
-                }
-                return false;
+                // Delegate to canonical implementation — avoids DRY violation
+                return CheckCodeSigningEKU(cert, nullptr);
             }
 
             // IsTimeValidWithGrace: already provided earlier. Keep as-is.
