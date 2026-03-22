@@ -150,8 +150,13 @@ namespace ShadowStrike {
 				// ================================================================
 
 				// Safe multiplication with overflow check for octet parsing
-				// Returns false if overflow would occur
+				// Precondition: result >= 0, multiplier > 0, addend >= 0
+				// Returns false if overflow would occur or preconditions violated
 				[[nodiscard]] constexpr bool SafeMultiplyAdd(int& result, int multiplier, int addend) noexcept {
+					// SECURITY: Reject negative inputs to prevent signed overflow UB
+					if (result < 0 || multiplier <= 0 || addend < 0) {
+						return false;
+					}
 					// Check if multiplication would overflow
 					if (result > (std::numeric_limits<int>::max() - addend) / multiplier) {
 						return false;
@@ -186,7 +191,7 @@ namespace ShadowStrike {
 
 			std::wstring IPv4Address::ToString() const {
 				// IPv4 max: "255.255.255.255" = 15 chars + null terminator
-				wchar_t buffer[16];
+				wchar_t buffer[20];
 				const int result = swprintf_s(buffer, _countof(buffer), 
 					L"%u.%u.%u.%u", 
 					static_cast<unsigned>(octets[0]), 
@@ -207,13 +212,25 @@ namespace ShadowStrike {
 			}
 
 			bool IPv4Address::IsPrivate() const noexcept {
-				// RFC 1918 private address ranges:
-				// 10.0.0.0/8 (Class A)
-				if (octets[0] == 10) return true;
-				// 172.16.0.0/12 (Class B)
-				if (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) return true;
-				// 192.168.0.0/16 (Class C)
-				if (octets[0] == 192 && octets[1] == 168) return true;
+				// RFC 1918 private address ranges
+				if (octets[0] == 10) return true;                                           // 10.0.0.0/8
+				if (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) return true;    // 172.16.0.0/12
+				if (octets[0] == 192 && octets[1] == 168) return true;                      // 192.168.0.0/16
+
+				// RFC 6598 Shared Address Space (CGNAT) — critical for enterprise networks
+				if (octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127) return true;   // 100.64.0.0/10
+
+				// RFC 1122 "This host on this network" (non-routable)
+				if (octets[0] == 0) return true;                                            // 0.0.0.0/8
+
+				// RFC 5737 Documentation / TEST-NET ranges (should never appear in production)
+				if (octets[0] == 192 && octets[1] == 0 && octets[2] == 2) return true;      // 192.0.2.0/24
+				if (octets[0] == 198 && octets[1] == 51 && octets[2] == 100) return true;   // 198.51.100.0/24
+				if (octets[0] == 203 && octets[1] == 0 && octets[2] == 113) return true;    // 203.0.113.0/24
+
+				// RFC 2544 Benchmarking (non-routable)
+				if (octets[0] == 198 && (octets[1] & 0xFE) == 18) return true;              // 198.18.0.0/15
+
 				return false;
 			}
 
@@ -238,20 +255,17 @@ namespace ShadowStrike {
 			// ============================================================================
 
 			std::wstring IPv6Address::ToString() const {
-				// Full IPv6 format: "xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx"
-				// Each group: 4 hex chars, 7 colons, null = 32 + 7 + 1 = 40
+				// Full IPv6 format per RFC 5952: no leading zeros, lowercase hex
+				// Max: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff" = 39 + null = 40
 				wchar_t buffer[40];
+				const auto word = [this](int i) -> unsigned {
+					return (static_cast<unsigned>(bytes[i * 2]) << 8) | static_cast<unsigned>(bytes[i * 2 + 1]);
+				};
 				const int result = swprintf_s(buffer, _countof(buffer),
-					L"%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-					static_cast<unsigned>(bytes[0]), static_cast<unsigned>(bytes[1]),
-					static_cast<unsigned>(bytes[2]), static_cast<unsigned>(bytes[3]),
-					static_cast<unsigned>(bytes[4]), static_cast<unsigned>(bytes[5]),
-					static_cast<unsigned>(bytes[6]), static_cast<unsigned>(bytes[7]),
-					static_cast<unsigned>(bytes[8]), static_cast<unsigned>(bytes[9]),
-					static_cast<unsigned>(bytes[10]), static_cast<unsigned>(bytes[11]),
-					static_cast<unsigned>(bytes[12]), static_cast<unsigned>(bytes[13]),
-					static_cast<unsigned>(bytes[14]), static_cast<unsigned>(bytes[15]));
-				
+					L"%x:%x:%x:%x:%x:%x:%x:%x",
+					word(0), word(1), word(2), word(3),
+					word(4), word(5), word(6), word(7));
+
 				if (result < 0) {
 					return L"::"; // Defensive fallback (unspecified address)
 				}
@@ -544,6 +558,7 @@ namespace ShadowStrike {
 
 				// Validate we have exactly 4 octets
 				if (octetIndex != 4) {
+					SS_LOG_DEBUG(L"ParseIPv4 failed: expected 4 octets, got %zu", static_cast<size_t>(octetIndex));
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, 
 						L"IPv4 must have exactly 4 octets", L"ParseIPv4");
 					return false;
@@ -623,6 +638,7 @@ namespace ShadowStrike {
 
 				// Handle common error cases with better messages
 				const int wsaErr = WSAGetLastError();
+				SS_LOG_DEBUG(L"ParseIPv6 failed: WSAStringToAddressW error %d", wsaErr);
 				if (wsaErr == WSANOTINITIALISED) {
 					Internal::SetError(err, static_cast<DWORD>(wsaErr), 
 						L"WSAStartup not called - Winsock must be initialized before parsing IPv6", 
@@ -637,22 +653,33 @@ namespace ShadowStrike {
 			bool ParseIpAddress(std::wstring_view str, IpAddress& out, Error* err) noexcept {
 				// Try IPv4 first (more common and faster to parse)
 				IPv4Address ipv4;
-				if (ParseIPv4(str, ipv4, nullptr)) {
+				Error ipv4Err{};
+				if (ParseIPv4(str, ipv4, &ipv4Err)) {
 					out = IpAddress(ipv4);
 					return true;
 				}
 
 				// Try IPv6
 				IPv6Address ipv6;
-				if (ParseIPv6(str, ipv6, err)) {
+				Error ipv6Err{};
+				if (ParseIPv6(str, ipv6, &ipv6Err)) {
 					out = IpAddress(ipv6);
 					return true;
 				}
 
-				// Neither worked - set error if not already set
-				if (err && err->message.empty()) {
-					Internal::SetError(err, ERROR_INVALID_PARAMETER, 
-						L"Invalid IP address format (not valid IPv4 or IPv6)", L"ParseIpAddress");
+				// Both failed — report combined error with both reasons
+				SS_LOG_DEBUG(L"ParseIpAddress: input rejected as both IPv4 and IPv6");
+				if (err) {
+					// String concatenation can throw — guard in noexcept context
+					try {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER,
+							L"Invalid IP address (IPv4: " + ipv4Err.message + L"; IPv6: " + ipv6Err.message + L")",
+							L"ParseIpAddress");
+					}
+					catch (...) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER,
+							L"Invalid IP address format (not valid IPv4 or IPv6)", L"ParseIpAddress");
+					}
 				}
 				return false;
 			}
@@ -686,6 +713,8 @@ namespace ShadowStrike {
 			bool IsInSubnet(const IpAddress& address, const IpAddress& subnet, uint8_t prefixLength) noexcept {
 				// IP version mismatch check
 				if (address.version != subnet.version) {
+					SS_LOG_WARN(L"IsInSubnet: IP version mismatch (address=%d, subnet=%d)",
+						static_cast<int>(address.version), static_cast<int>(subnet.version));
 					return false;
 				}
 
@@ -722,6 +751,7 @@ namespace ShadowStrike {
 					const uint8_t remainingBits = static_cast<uint8_t>(prefixLength % 8);
 
 					// Compare fully-masked bytes (all bits significant)
+					// NOTE: bytes[] is network byte order (big-endian) from WSAStringToAddressW
 					for (size_t i = 0; i < fullBytes; ++i) {
 						if (addr->bytes[i] != net->bytes[i]) {
 							return false;
@@ -778,21 +808,18 @@ namespace ShadowStrike {
 					const size_t fullBytes = static_cast<size_t>(prefixLength / 8);
 					const uint8_t remainingBits = static_cast<uint8_t>(prefixLength % 8);
 
-					// Keep full bytes as-is (they're already part of network)
-					// Apply partial mask to the boundary byte
-					if (fullBytes < 16) {
-						if (remainingBits > 0) {
-							const uint8_t mask = Internal::IPv6ByteMask(remainingBits);
-							networkBytes[fullBytes] &= mask;
-						}
-						else {
-							networkBytes[fullBytes] = 0;
+					// Apply partial mask to the boundary byte, then zero host portion
+					if (fullBytes < 16 && remainingBits > 0) {
+						networkBytes[fullBytes] &= Internal::IPv6ByteMask(remainingBits);
+						for (size_t i = fullBytes + 1; i < 16; ++i) {
+							networkBytes[i] = 0;
 						}
 					}
-
-					// Zero out remaining bytes
-					for (size_t i = fullBytes + (remainingBits > 0 ? 1 : 0); i < 16; ++i) {
-						networkBytes[i] = 0;
+					else {
+						// Byte-aligned prefix: zero from fullBytes onward
+						for (size_t i = fullBytes; i < 16; ++i) {
+							networkBytes[i] = 0;
+						}
 					}
 
 					return IpAddress(IPv6Address(networkBytes));
@@ -845,7 +872,7 @@ namespace ShadowStrike {
 					// For IPv6, if prefix < 64, the result would exceed uint64_t
 					// 2^(128-63) = 2^65 > UINT64_MAX
 					const uint64_t hostBits = 128ULL - static_cast<uint64_t>(prefixLength);
-					if (hostBits > 63) {
+					if (hostBits >= 64) {
 						// Return max value to indicate "very large"
 						// Callers should check: if (result == UINT64_MAX && prefix < 64) => overflow
 						return UINT64_MAX;
