@@ -94,12 +94,14 @@ namespace ShadowStrike {
 
 			bool GetSystemProxySettings(ProxyInfo& proxy, Error* err) noexcept {
 				try {
+					SS_LOG_DEBUG(L"NetworkUtils: GetSystemProxySettings querying IE proxy config");
 					proxy = ProxyInfo{};
 
 					WINHTTP_CURRENT_USER_IE_PROXY_CONFIG proxyConfig{};
 
 					if (!::WinHttpGetIEProxyConfigForCurrentUser(&proxyConfig)) {
-						Internal::SetError(err, ::GetLastError(), L"WinHttpGetIEProxyConfigForCurrentUser failed");
+						SS_LOG_ERROR(L"NetworkUtils: WinHttpGetIEProxyConfigForCurrentUser failed err=%lu", ::GetLastError());
+					Internal::SetError(err, ::GetLastError(), L"WinHttpGetIEProxyConfigForCurrentUser failed");
 						return false;
 					}
 
@@ -133,6 +135,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in GetSystemProxySettings");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetSystemProxySettings");
 					return false;
 				}
@@ -140,6 +143,9 @@ namespace ShadowStrike {
 
 			bool SetSystemProxySettings(const ProxyInfo& proxy, Error* err) noexcept {
 				try {
+					SS_LOG_WARN(L"NetworkUtils: SetSystemProxySettings modifying system proxy — enabled=%d server=%ls",
+						proxy.enabled ? 1 : 0, proxy.server.c_str());
+
 					// Internet Settings registry path
 					constexpr wchar_t REG_PATH[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
@@ -223,6 +229,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in SetSystemProxySettings");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in SetSystemProxySettings");
 					return false;
 				}
@@ -230,7 +237,15 @@ namespace ShadowStrike {
 
 			bool DetectProxyForUrl(std::wstring_view url, ProxyInfo& proxy, Error* err) noexcept {
 				try {
+					SS_LOG_DEBUG(L"NetworkUtils: DetectProxyForUrl starting");
 					proxy = ProxyInfo{};
+
+					// Validate URL before passing to WinHTTP PAC engine
+					if (url.empty() || url.size() > 8192) {
+						SS_LOG_ERROR(L"NetworkUtils: DetectProxyForUrl invalid URL length=%zu", url.size());
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid URL for proxy detection");
+						return false;
+					}
 
 					// Open WinHTTP session
 					HINTERNET hSession = ::WinHttpOpen(L"AntivirusProxyDetection/1.0",
@@ -314,6 +329,7 @@ namespace ShadowStrike {
 
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in DetectProxyForUrl");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in DetectProxyForUrl");
 					return false;
 				}
@@ -326,10 +342,38 @@ namespace ShadowStrike {
 						return false;
 					}
 
+					// Extract hostname from URL for matching (scheme://[user:pass@]hostname:port/path)
+					std::wstring urlStr(url);
+					std::wstring hostname;
+					{
+						size_t schemeEnd = urlStr.find(L"://");
+						size_t hostStart = (schemeEnd != std::wstring::npos) ? schemeEnd + 3 : 0;
+
+						// Skip userinfo (user:pass@) if present
+						size_t atPos = urlStr.find(L'@', hostStart);
+						if (atPos != std::wstring::npos) {
+							size_t nextSlash = urlStr.find(L'/', hostStart);
+							if (nextSlash == std::wstring::npos || atPos < nextSlash) {
+								hostStart = atPos + 1;
+							}
+						}
+
+						// Handle IPv6 literal addresses [2001:db8::1]
+						size_t hostEnd;
+						if (hostStart < urlStr.size() && urlStr[hostStart] == L'[') {
+							hostEnd = urlStr.find(L']', hostStart);
+							if (hostEnd != std::wstring::npos) hostEnd++;
+						}
+						else {
+							hostEnd = urlStr.find_first_of(L":/?", hostStart);
+						}
+						if (hostEnd == std::wstring::npos) hostEnd = urlStr.size();
+						hostname = urlStr.substr(hostStart, hostEnd - hostStart);
+					}
+					std::transform(hostname.begin(), hostname.end(), hostname.begin(), ::towlower);
+
 					// Parse bypass list (semicolon or space separated)
 					std::wstring bypassList = proxy.bypass;
-					std::wstring urlLower(url);
-					std::transform(urlLower.begin(), urlLower.end(), urlLower.begin(), ::towlower);
 
 					size_t pos = 0;
 					while (pos < bypassList.length()) {
@@ -339,67 +383,58 @@ namespace ShadowStrike {
 						}
 
 						std::wstring pattern = bypassList.substr(pos, nextPos - pos);
+						pattern.erase(std::remove_if(pattern.begin(), pattern.end(), ::iswspace), pattern.end());
 						std::transform(pattern.begin(), pattern.end(), pattern.begin(), ::towlower);
 
-						// Remove whitespace
-						pattern.erase(std::remove_if(pattern.begin(), pattern.end(), ::iswspace), pattern.end());
-
 						if (pattern.empty()) {
-							pos = nextPos + 1;
+							pos = (nextPos < bypassList.length()) ? nextPos + 1 : bypassList.length();
 							continue;
 						}
 
-						// Special case: <local>
+						// Special case: <local> — match hostnames with no dots (intranet names)
 						if (pattern == L"<local>") {
-							if (urlLower.find(L'.') == std::wstring::npos) {
+							if (!hostname.empty() && hostname.find(L'.') == std::wstring::npos) {
 								return true;
 							}
 						}
-						// Wildcard matching
-						else if (pattern.find(L'*') != std::wstring::npos) {
-							// Simple wildcard implementation
-							size_t starPos = pattern.find(L'*');
-							std::wstring prefix = pattern.substr(0, starPos);
-							std::wstring suffix = pattern.substr(starPos + 1);
-
-							if (urlLower.find(prefix) != std::wstring::npos &&
-								(suffix.empty() || urlLower.find(suffix) != std::wstring::npos)) {
+						// Wildcard matching — anchored to hostname suffix
+						else if (pattern.front() == L'*') {
+							// Pattern like "*.example.com" → suffix = ".example.com"
+							std::wstring suffix = pattern.substr(1);
+							if (suffix.empty()) {
+								return true; // "*" matches everything
+							}
+							// Hostname ends with suffix, or hostname equals suffix without leading dot
+							if (hostname.size() >= suffix.size() &&
+								hostname.compare(hostname.size() - suffix.size(), suffix.size(), suffix) == 0) {
 								return true;
 							}
 						}
-						// Direct match
-						else if (urlLower.find(pattern) != std::wstring::npos) {
+						// Direct hostname match
+						else if (hostname == pattern) {
 							return true;
 						}
 
-						pos = nextPos + 1;
+						pos = (nextPos < bypassList.length()) ? nextPos + 1 : bypassList.length();
 					}
 
 					return false;
 
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in ShouldBypassProxy");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in ShouldBypassProxy");
 					return false;
 				}
 			}
 
-			//Proxy authentication test
+			//Proxy authentication test — sends actual HTTP HEAD to verify proxy + auth
 			bool TestProxyConnection(const ProxyInfo& proxy, Error* err) noexcept {
 				try {
+					SS_LOG_DEBUG(L"NetworkUtils: TestProxyConnection starting");
+
 					if (!proxy.enabled || proxy.server.empty()) {
 						return true; // No proxy, connection is direct
-					}
-
-					HINTERNET hSession = ::WinHttpOpen(L"AntivirusProxyTest/1.0",
-						WINHTTP_ACCESS_TYPE_NAMED_PROXY,
-						proxy.server.c_str(),
-						proxy.bypass.empty() ? WINHTTP_NO_PROXY_BYPASS : proxy.bypass.c_str(),
-						0);
-
-					if (!hSession) {
-						Internal::SetError(err, ::GetLastError(), L"WinHttpOpen failed");
-						return false;
 					}
 
 					struct HandleDeleter {
@@ -407,23 +442,80 @@ namespace ShadowStrike {
 							if (h) ::WinHttpCloseHandle(h);
 						}
 					};
+
+					HINTERNET hSession = ::WinHttpOpen(L"ShadowStrike-AntiVirus/1.0",
+						WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+						proxy.server.c_str(),
+						proxy.bypass.empty() ? WINHTTP_NO_PROXY_BYPASS : proxy.bypass.c_str(),
+						0);
+
+					if (!hSession) {
+						SS_LOG_ERROR(L"NetworkUtils: TestProxyConnection WinHttpOpen failed err=%lu", ::GetLastError());
+						Internal::SetError(err, ::GetLastError(), L"WinHttpOpen failed");
+						return false;
+					}
 					std::unique_ptr<std::remove_pointer_t<HINTERNET>, HandleDeleter> sessionGuard(hSession);
 
-					// Try to connect to a known endpoint
-					HINTERNET hConnect = ::WinHttpConnect(hSession, L"www.microsoft.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+					// Set timeouts to avoid blocking indefinitely
+					::WinHttpSetTimeouts(hSession, 10000, 10000, 10000, 10000);
 
+					// Connect to a well-known endpoint and send HEAD to verify proxy + auth
+					HINTERNET hConnect = ::WinHttpConnect(hSession, L"www.msftconnecttest.com",
+						INTERNET_DEFAULT_HTTP_PORT, 0);
 					if (!hConnect) {
+						SS_LOG_ERROR(L"NetworkUtils: TestProxyConnection WinHttpConnect failed err=%lu", ::GetLastError());
 						Internal::SetError(err, ::GetLastError(), L"Proxy connection test failed");
 						return false;
 					}
-
-					// Use RAII to ensure hConnect is always closed
 					std::unique_ptr<std::remove_pointer_t<HINTERNET>, HandleDeleter> connectGuard(hConnect);
 
+					// Send HEAD request to actually test proxy authentication
+					HINTERNET hRequest = ::WinHttpOpenRequest(hConnect, L"HEAD", L"/connecttest.txt",
+						nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+					if (!hRequest) {
+						SS_LOG_ERROR(L"NetworkUtils: TestProxyConnection WinHttpOpenRequest failed");
+						Internal::SetError(err, ::GetLastError(), L"WinHttpOpenRequest failed");
+						return false;
+					}
+					std::unique_ptr<std::remove_pointer_t<HINTERNET>, HandleDeleter> requestGuard(hRequest);
+
+					if (!::WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+						WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+						DWORD lastErr = ::GetLastError();
+						SS_LOG_ERROR(L"NetworkUtils: TestProxyConnection send failed err=%lu", lastErr);
+						Internal::SetError(err, lastErr, L"Proxy test request failed");
+						return false;
+					}
+
+					if (!::WinHttpReceiveResponse(hRequest, nullptr)) {
+						DWORD lastErr = ::GetLastError();
+						SS_LOG_ERROR(L"NetworkUtils: TestProxyConnection receive failed err=%lu", lastErr);
+						Internal::SetError(err, lastErr, L"Proxy test response failed");
+						return false;
+					}
+
+					// Check for 407 Proxy Auth Required
+					DWORD statusCode = 0;
+					DWORD statusSize = sizeof(statusCode);
+					if (!::WinHttpQueryHeaders(hRequest,
+						WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+						nullptr, &statusCode, &statusSize, nullptr)) {
+						SS_LOG_WARN(L"NetworkUtils: Could not query HTTP status code, assuming proxy reachable");
+						return true;
+					}
+
+					if (statusCode == 407) {
+						SS_LOG_WARN(L"NetworkUtils: Proxy requires authentication (407)");
+						Internal::SetError(err, ERROR_ACCESS_DENIED, L"Proxy requires authentication");
+						return false;
+					}
+
+					SS_LOG_INFO(L"NetworkUtils: TestProxyConnection succeeded status=%lu", statusCode);
 					return true;
 
 				}
 				catch (...) {
+					SS_LOG_ERROR(L"NetworkUtils: Exception in TestProxyConnection");
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in TestProxyConnection");
 					return false;
 				}
