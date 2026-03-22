@@ -43,7 +43,6 @@
 #include <sstream>
 #include <algorithm>
 #include <charconv>
-#include <random>
 #include <functional>
 #include <limits>
 #include <cmath>
@@ -53,6 +52,8 @@
 #    define NOMINMAX
 #  endif
 #  include <Windows.h>
+#  include <bcrypt.h>
+#  pragma comment(lib, "bcrypt.lib")
 #endif
 
 namespace ShadowStrike {
@@ -136,9 +137,11 @@ static inline void fillLineCol(
         }
         else if (c == '\r') {
             // Handle Windows-style CRLF or old Mac CR-only
-            if (i + 1 < byteOffset && i + 1 < text.size() && text[i + 1] == '\n') {
-                // CRLF: skip CR, LF will be processed next iteration
-                ++i;
+            if (i + 1 < text.size() && text[i + 1] == '\n') {
+                // CRLF: skip both CR and LF as single line ending
+                ++line;
+                col = 1;
+                i += 2;
             }
             else {
                 // CR-only (old Mac style)
@@ -194,7 +197,7 @@ static inline void fillLineCol(
  */
 static inline void setErr(
     Error* err, 
-    std::string msg, 
+    const char* msg, 
     const std::filesystem::path& p, 
     std::string_view text, 
     size_t byteOff
@@ -203,8 +206,8 @@ static inline void setErr(
         return;
     }
     
-    err->message = std::move(msg);
-    err->path = p;
+    try { err->message = msg ? msg : ""; } catch (...) { err->message.clear(); }
+    try { err->path = p; } catch (...) { err->path.clear(); }
     err->byteOffset = byteOff;
     fillLineCol(text, byteOff, err->line, err->column);
 }
@@ -219,22 +222,26 @@ static inline void setErr(
  */
 static inline void setIoErr(
     Error* err, 
-    const std::string& what, 
+    const char* what, 
     const std::filesystem::path& p, 
-    const std::string& sysMsg = {}
+    const char* sysMsg = nullptr
 ) noexcept {
     if (!err) {
         return;
     }
     
-    if (sysMsg.empty()) {
-        err->message = what;
-    }
-    else {
-        err->message = what + ": " + sysMsg;
+    try {
+        if (sysMsg && sysMsg[0] != '\0') {
+            err->message = std::string(what) + ": " + sysMsg;
+        }
+        else {
+            err->message = what ? what : "";
+        }
+    } catch (...) {
+        try { err->message = what ? what : ""; } catch (...) { err->message.clear(); }
     }
     
-    err->path = p;
+    try { err->path = p; } catch (...) { err->path.clear(); }
     err->byteOffset = 0;
     err->line = 0;
     err->column = 0;
@@ -309,6 +316,7 @@ static void parsePathLike(std::string_view sv, std::vector<Step>& out) noexcept 
         return;
     }
     
+    try {
     // Parse dot-separated steps
     std::string cur;
     cur.reserve(sv.size());
@@ -405,6 +413,11 @@ static void parsePathLike(std::string_view sv, std::vector<Step>& out) noexcept 
         
         // Remove the [N] from the name
         s.name = s.name.substr(0, lb);
+    }
+
+    } catch (...) {
+        // OOM or other exception — return empty steps (safe fallback)
+        out.clear();
     }
 }
 
@@ -512,31 +525,71 @@ bool Parse(std::string_view xmlText, Document& out, Error* err, const ParseOptio
         
         // SECURITY: Detect XML bomb attacks by checking node expansion ratio
         if (originalSize > 0) {
-            // Count total nodes (with early termination for large documents)
+            // Iterative node count with explicit depth limit (prevents stack overflow)
+            constexpr size_t kMaxXmlDepth = 256;
             size_t nodeCount = 0;
-            
-            std::function<void(const pugi::xml_node&)> countNodes;
-            countNodes = [&](const pugi::xml_node& node) {
-                // Stop counting if we exceed the limit
-                if (++nodeCount > kMaxNodeCount) {
-                    return;
-                }
-                
-                for (auto child : node.children()) {
-                    if (nodeCount > kMaxNodeCount) {
-                        return;
-                    }
-                    countNodes(child);
-                }
+
+            struct IterFrame {
+                pugi::xml_node node;
+                pugi::xml_node::iterator it;
+                pugi::xml_node::iterator end;
             };
-            countNodes(out);
+            std::vector<IterFrame> stack;
+            stack.reserve(64);
+
+            {
+                IterFrame root_frame;
+                root_frame.node = out;
+                root_frame.it = out.children().begin();
+                root_frame.end = out.children().end();
+                stack.push_back(std::move(root_frame));
+            }
+
+            bool rejected = false;
+            while (!stack.empty()) {
+                auto& frame = stack.back();
+                if (frame.it == frame.end) {
+                    stack.pop_back();
+                    continue;
+                }
+
+                auto child = *(frame.it);
+                ++frame.it;
+                ++nodeCount;
+
+                if (nodeCount > kMaxNodeCount) {
+                    rejected = true;
+                    break;
+                }
+
+                if (stack.size() >= kMaxXmlDepth) {
+                    // Reject excessively deep documents (stack overflow / bomb variant)
+                    rejected = true;
+                    break;
+                }
+
+                if (child.first_child()) {
+                    IterFrame child_frame;
+                    child_frame.node = child;
+                    child_frame.it = child.children().begin();
+                    child_frame.end = child.children().end();
+                    stack.push_back(std::move(child_frame));
+                }
+            }
+
+            if (rejected) {
+                setErr(err,
+                       "Suspicious XML structure detected (possible entity expansion or depth attack)",
+                       {}, xmlText, 0);
+                return false;
+            }
             
-            // Reject if expansion ratio is suspicious
+            // Tiered bomb detection: reject if expansion ratio is suspicious
             // Normal XML: ~50-100 bytes per node average
-            // Entity bomb: 1KB input -> millions of nodes
+            // Only apply ratio check above 1000 nodes to avoid false positives on compact docs
             const size_t expectedMaxNodes = originalSize / 10;
             
-            if (nodeCount > expectedMaxNodes && nodeCount > 100000) {
+            if (nodeCount > 1000 && nodeCount > expectedMaxNodes) {
                 setErr(err, 
                        "Suspicious XML structure detected (possible entity expansion attack)", 
                        {}, xmlText, 0);
@@ -691,14 +744,16 @@ bool LoadFromFile(
     size_t maxBytes
 ) noexcept {
     try {
-        // Get file size
-        std::error_code ec;
-        const auto fileSize = std::filesystem::file_size(path, ec);
-        
-        if (ec) {
-            setIoErr(err, "Failed to get file size", path, ec.message());
+        // Open file FIRST, then get size from handle (eliminates TOCTOU)
+        std::ifstream ifs(path, std::ios::in | std::ios::binary | std::ios::ate);
+        if (!ifs) {
+            setIoErr(err, "Failed to open file", path);
             return false;
         }
+        
+        // Get size from the open handle's seek position
+        const auto fileSize = static_cast<size_t>(ifs.tellg());
+        ifs.seekg(0, std::ios::beg);
         
         // SECURITY: Enforce maximum file size to prevent memory exhaustion
         if (fileSize > kMaxSafeXmlFileSize) {
@@ -707,22 +762,15 @@ bool LoadFromFile(
         }
         
         // Check against user-specified limit
-        if (fileSize > static_cast<uintmax_t>(maxBytes)) {
+        if (fileSize > maxBytes) {
             setIoErr(err, "File exceeds specified size limit", path);
-            return false;
-        }
-        
-        // Open file in binary mode
-        std::ifstream ifs(path, std::ios::in | std::ios::binary);
-        if (!ifs) {
-            setIoErr(err, "Failed to open file", path);
             return false;
         }
         
         // Allocate buffer
         std::string buf;
         try {
-            buf.resize(static_cast<size_t>(fileSize));
+            buf.resize(fileSize);
         }
         catch (const std::bad_alloc&) {
             setIoErr(err, "Memory allocation failed for file content", path);
@@ -743,10 +791,7 @@ bool LoadFromFile(
             
             // Verify we read the expected amount
             if (static_cast<size_t>(bytesRead) != fileSize) {
-                std::ostringstream oss;
-                oss << "Incomplete file read (expected " << fileSize 
-                    << " bytes, got " << bytesRead << " bytes)";
-                setIoErr(err, oss.str(), path);
+                setIoErr(err, "Incomplete file read", path);
                 return false;
             }
             
@@ -796,122 +841,144 @@ bool SaveToFile(
             : path.parent_path();
             
         std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        // Ignore ec - directory may already exist
-
-        // SECURITY: Generate cryptographically random temp filename
-        // This prevents path traversal, race conditions, and symlink attacks
-#ifdef _WIN32
-        const DWORD pid = ::GetCurrentProcessId();
-        const DWORD tid = ::GetCurrentThreadId();
-#else
-        const auto pid = getpid();
-        const auto tid = 0;  // Not easily available on all platforms
-#endif
-        
-        // High-resolution timestamp for uniqueness
-        const auto now = std::chrono::high_resolution_clock::now()
-                            .time_since_epoch().count();
-        
-        // Stack address for additional entropy
-        int entropySource = 0;
-        
-        // Build cryptographically strong seed
-        std::mt19937_64 rng(
-            static_cast<uint64_t>(now) ^ 
-            reinterpret_cast<uintptr_t>(&entropySource) ^ 
-            (static_cast<uint64_t>(pid) << 32) | 
-            static_cast<uint64_t>(tid)
-        );
-        
-        std::uniform_int_distribution<uint64_t> dist;
-        const uint64_t randomId = dist(rng);
-        
-        // Build secure temp filename (NOT based on user input)
-        std::wostringstream tempBuilder;
-        tempBuilder << L".tmp_" 
-                   << std::hex << pid << L"_" 
-                   << tid << L"_" 
-                   << now << L"_" 
-                   << randomId 
-                   << L".xml";
-        
-        const auto tempPath = dir / tempBuilder.str();
-
-        // Write to temporary file
-        {
-            std::ofstream ofs(tempPath, std::ios::out | std::ios::binary | std::ios::trunc);
-            if (!ofs) {
-                setIoErr(err, "Failed to create temp file", tempPath);
-                return false;
-            }
-            
-            ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
-            if (!ofs) {
-                setIoErr(err, "Failed to write temp file", tempPath);
-                // Cleanup temp file
-                std::filesystem::remove(tempPath, ec);
-                return false;
-            }
-            
-            ofs.flush();
-            if (!ofs) {
-                setIoErr(err, "Failed to flush temp file", tempPath);
-                std::filesystem::remove(tempPath, ec);
+        if (!std::filesystem::exists(dir, ec)) {
+            std::filesystem::create_directories(dir, ec);
+            if (ec) {
+                setIoErr(err, "Failed to create directory", path, ec.message().c_str());
                 return false;
             }
         }
 
-        // Perform atomic rename or direct write
         if (opt.atomicReplace) {
+            // ============================================================
+            // Atomic write-then-rename path
+            // ============================================================
+
 #ifdef _WIN32
-            // SECURITY: Atomic rename with write-through for data integrity
+            // Generate temp filename using OS CSPRNG (BCryptGenRandom)
+            uint64_t randomBytes = 0;
+            if (!BCRYPT_SUCCESS(::BCryptGenRandom(
+                    nullptr,
+                    reinterpret_cast<PUCHAR>(&randomBytes),
+                    sizeof(randomBytes),
+                    BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+                // Fallback: use GetTickCount64 + PID (less secure but functional)
+                randomBytes = ::GetTickCount64() ^ (static_cast<uint64_t>(::GetCurrentProcessId()) << 32);
+            }
+            
+            // Build temp filename (only random ID — no PID/TID/time leak)
+            wchar_t tempName[64];
+            _snwprintf_s(tempName, _countof(tempName), _TRUNCATE,
+                         L".ss_tmp_%016llx.xml", randomBytes);
+            
+            const auto tempPath = dir / tempName;
+
+            // Create temp file exclusively (CREATE_NEW prevents symlink attacks)
+            HANDLE hFile = ::CreateFileW(
+                tempPath.c_str(),
+                GENERIC_WRITE,
+                0,                              // No sharing during write
+                nullptr,
+                CREATE_NEW,                     // Fail if already exists (anti-symlink)
+                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_SEQUENTIAL_SCAN,
+                nullptr);
+            
+            if (hFile == INVALID_HANDLE_VALUE) {
+                setIoErr(err, "Failed to create temp file exclusively", tempPath);
+                return false;
+            }
+
+            // Write content
+            size_t totalWritten = 0;
+            const DWORD toWrite = static_cast<DWORD>(
+                (std::min)(content.size(), static_cast<size_t>(MAXDWORD)));
+            DWORD written = 0;
+            
+            BOOL writeOk = ::WriteFile(hFile, content.data(), toWrite, &written, nullptr);
+            totalWritten += written;
+            
+            // For files > 4GB (unlikely for XML but defensive)
+            if (writeOk && content.size() > static_cast<size_t>(written)) {
+                const char* remaining = content.data() + written;
+                size_t left = content.size() - written;
+                while (left > 0 && writeOk) {
+                    DWORD chunk = static_cast<DWORD>((std::min)(left, static_cast<size_t>(MAXDWORD)));
+                    writeOk = ::WriteFile(hFile, remaining, chunk, &written, nullptr);
+                    remaining += written;
+                    left -= written;
+                    totalWritten += written;
+                }
+            }
+
+            // Flush to disk
+            if (writeOk) {
+                ::FlushFileBuffers(hFile);
+            }
+            ::CloseHandle(hFile);
+
+            if (!writeOk || totalWritten != content.size()) {
+                ::DeleteFileW(tempPath.c_str());
+                setIoErr(err, "Failed to write temp file", tempPath);
+                return false;
+            }
+
+            // Atomic rename with write-through
             if (!::MoveFileExW(
                     tempPath.c_str(), 
                     path.c_str(), 
                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
                         
                 const DWORD lastError = ::GetLastError();
-                
-                // Cleanup temp file on failure
                 ::DeleteFileW(tempPath.c_str());
-                
                 setIoErr(err, "MoveFileExW failed", path, 
-                         std::to_string(static_cast<unsigned long>(lastError)));
+                         std::to_string(static_cast<unsigned long>(lastError)).c_str());
                 return false;
             }
 #else
-            // POSIX: rename() is atomic on same filesystem
-            std::filesystem::remove(path, ec);
-            std::filesystem::rename(tempPath, path, ec);
+            // POSIX path: mkstemp for exclusive temp creation
+            std::string tempTemplate = (dir / ".ss_tmp_XXXXXX.xml").string();
+            int fd = mkstemps(tempTemplate.data(), 4); // 4 = strlen(".xml")
+            if (fd < 0) {
+                setIoErr(err, "Failed to create temp file", path);
+                return false;
+            }
             
+            ssize_t written = write(fd, content.data(), content.size());
+            fsync(fd);
+            close(fd);
+            
+            if (written < 0 || static_cast<size_t>(written) != content.size()) {
+                unlink(tempTemplate.c_str());
+                setIoErr(err, "Failed to write temp file", path);
+                return false;
+            }
+            
+            // rename() atomically replaces the destination on same FS
+            std::filesystem::rename(tempTemplate, path, ec);
             if (ec) {
-                setIoErr(err, "Failed to rename temp file", path, ec.message());
-                std::filesystem::remove(tempPath, ec);
+                unlink(tempTemplate.c_str());
+                setIoErr(err, "Failed to rename temp file", path, ec.message().c_str());
                 return false;
             }
 #endif
         }
         else {
-            // Non-atomic write directly to target file
+            // ============================================================
+            // Non-atomic direct write (no temp file created)
+            // ============================================================
             std::ofstream ofs(path, std::ios::out | std::ios::binary | std::ios::trunc);
             if (!ofs) {
                 setIoErr(err, "Failed to open file for write", path);
-                std::filesystem::remove(tempPath, ec);
                 return false;
             }
             
             ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
             if (!ofs) {
                 setIoErr(err, "Failed to write file", path);
-                std::filesystem::remove(tempPath, ec);
                 return false;
             }
             
             ofs.flush();
-            
-            // Cleanup temp file
-            std::filesystem::remove(tempPath, ec);
         }
         
         return true;
@@ -949,6 +1016,11 @@ static inline bool isXPathSafe(const std::string& xp) noexcept {
     
     // Check for invalid sentinel
     if (xp == "__INVALID__") {
+        return false;
+    }
+    
+    // SECURITY: Reject parent axis traversal (.. allows escaping intended subtree)
+    if (xp.find("..") != std::string::npos) {
         return false;
     }
     
