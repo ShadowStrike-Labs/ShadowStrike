@@ -27,1065 +27,6 @@
     <ClCompile Include="src\pch.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\database\ConfigurationDB.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\database\DatabaseManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\database\LogDB.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\database\QuarantineDB.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\pugixml\pugixml.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\sqlitecpp\Backup.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\sqlitecpp\Column.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\sqlitecpp\Database.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\sqlitecpp\Exception.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\sqlitecpp\Savepoint.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\sqlitecpp\Statement.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\sqlitecpp\Transaction.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\sqlitecpp\sqlite3.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\FuzzyHasher\FuzzyHasher.cpp">
-      <Filter>Source Files\FuzzyHasher</Filter>
-    </ClCompile>
-    <ClCompile Include="src\FuzzyHasher\DigestGenerator.cpp">
-      <Filter>Source Files\FuzzyHasher</Filter>
-    </ClCompile>
-    <ClCompile Include="src\FuzzyHasher\DigestComparer.cpp">
-      <Filter>Source Files\FuzzyHasher</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\tlsh\input_desc.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\tlsh\shared_file_functions.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\tlsh\tlsh.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\tlsh\tlsh_impl.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\external\tlsh\tlsh_util.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\hashstore\BloomFilter_impl.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\hashstore\HashBucket_impl.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\hashstore\HashStore.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\hashstore\HashStore_import_export.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\hashstore\HashStore_mgnmnt.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\hashstore\HashStore_query_operations.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\patternstore\aho_crsck_impl.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\patternstore\boyer_moore_impl.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\patternstore\PatternIndex.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\patternstore\PatternStore.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\patternstore\SIMD_Matcher_Impl.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\batch_sig_builder.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureBuilder.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureFormat.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureIndex.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureIndex_Cache_mngmnt.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureIndex_COW.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureIndex_Modification.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureIndex_Query.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureIndex_stat_maintenance.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureStore.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureStore_mngmnt.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureStore_Query.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureStore_scan.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\sig_builder_import_methods.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\sig_builder_input_methods.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\sig_builder_serialization.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\sig_builder_utils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\sig_indx_internal_node_mng.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\signaturestore\YaraRuleStore.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\Base64Utils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\CacheManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\CertUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\CompressionUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\CryptoUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\CryptoUtilsCommon.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\CryptoUtils_AsymmetricCipher.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\CryptoUtils_private_key.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\CryptoUtils_SecureBuffer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\CryptoUtils_Secure_Random.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\CryptoUtils_SymmetricCipher.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\FileUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\HashUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\JSONUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\Logger.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\MemoryUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\NetworkSecurity_SSL_TLS.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\NetworkUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\NetworkUtilsMacAdress.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\NetworkUtils_Adapter.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\NetworkUtils_DNS.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\NetworkUtils_http_https.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\NetworkUtils_proxy.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\NetworkUtils_URL.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\PE_sig_verf.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\ProcessUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\RegistryUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\StringUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\SystemUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\ThreadPool.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\Timer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\utils\XMLUtils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\whitelist\WhiteListBloomFilter.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\whitelist\WhiteListFormat.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\whitelist\WhiteListHashIndex.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\whitelist\WhiteListPatternIndex.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\whitelist\WhiteListStore.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\whitelist\WhiteListStringPool.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\configuration_db_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\database_manager_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\Log_db_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\Quarantine_db_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\AhoCorasick_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\BoyerMooreTests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\HashStoreTests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\pattern_store_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\sig_builder_import_methods_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\sig_builder_input_methods_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\sig_builder_main_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\sig_builder_serialization_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\sig_builder_utils_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\sig_format_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\sig_index_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\sig_store_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\yara_rule_store_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\threat_intel\ReputationCache_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelDatabase_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelExporter_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelFeedManagerTests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelFeedManager_parsers_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelFormat_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelImporter_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelIndex_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelIOCManager_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelLookup_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntel_bloom_filter_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\white_list\WhiteListBloomFilter_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\white_list\WhiteListFormatTests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\white_list\WhiteListHashIndex_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\white_list\WhiteListPatternIndex_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\white_list\WhiteListStore_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\white_list\WhiteListStringPool_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\Base64UtilsTests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\CacheManager_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\CertUtilsTests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\CompressionUtils_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\CryptoUtils_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\FileUtilsTests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\HashUtils_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\JSONUtils_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\MemoryUtils_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\NetworkUtils_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\ProcessUtils_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\RegistryUtilsTests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\SystemUtils_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\ThreadPool_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\utils\XMLUtils_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Utils\NetworkUtilsIpAddress.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ReputationCache.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelBloomFilter.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelDatabase.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelExporter.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelFeedManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelFeedManager_parsers.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelFormat.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelImporter.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_Core.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_DataStructures.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_Lookups.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_Modifications.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_Trees.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_URLMatcher.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelIOCManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelLookup.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelStore.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\Utils\PE_sig_verf_tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\Database_systems\sig_store\SIMD_Matcher_Tests.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\AntiEvasion\DebuggerEvasionDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\AntiEvasion\EnvironmentEvasionDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\AntiEvasion\MetamorphicDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\AntiEvasion\PackerDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\AntiEvasion\SandboxEvasionDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\AntiEvasion\TimeBasedEvasionDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\AntiEvasion\VMEvasionDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Backup\BackupManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Backup\BackupScheduler.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Backup\IncrementalBackup.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Backup\RestoreManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Banking\BankingTrojanDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Banking\CertificatePinning.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Banking\KeyloggerProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Banking\ScreenshotBlocker.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Banking\SecureBrowser.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Banking\TransactionMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Communication\AlertSystem.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Communication\IPCManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Communication\NotificationManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Communication\ReportGenerator.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Communication\ServiceCommunication.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Communication\TelemetryCollector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Config\ConfigManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Config\PolicyManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Config\ProfileManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Config\SettingsManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Engine\BehaviorAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Engine\EmulationEngine.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Engine\HeuristicAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Engine\MachineLearningDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Engine\PackerUnpacker.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Engine\PolymorphicDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Engine\QuarantineManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Engine\SandboxAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Engine\ScanEngine.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Engine\SignatureDatabase_Manager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Engine\ThreatDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Engine\ZeroDayDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\FileSystem\ArchiveExtractor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\FileSystem\DirectoryMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\FileSystem\DocumentScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\FileSystem\ExecutableAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\FileSystem\FileHasher.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\FileSystem\FileLockManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\FileSystem\FileReputation.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\FileSystem\FileTypeAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\FileSystem\FileWatcher.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\FileSystem\MediaFileScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\FileSystem\MountPointMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Network\BotnetDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Network\DDosProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Network\DNSMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Network\EmailScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Network\FirewallManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Network\NetworkMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Network\P2PMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Network\TorDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Network\TrafficAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Network\URLAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Network\VPNDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Network\WebProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Process\AtomBombingDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Process\DLLInjectionDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Process\MemoryScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Process\ProcessAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Process\ProcessHollowingDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Process\ProcessInjectionDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Process\ProcessKiller.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Process\ProcessMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Process\ReflectiveDLLDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Process\ThreadHijackDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Registry\PersistenceDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Registry\RegistryAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Registry\RegistryMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Registry\StartupAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\Registry\SystemSettingsMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\System\BootTimeAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\System\CrashHandler.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\System\DriverAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\System\EventLogger.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\System\HardwareMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\System\PerformanceMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\System\ServiceManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Core\System\SystemInfo.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\CryptoMiners\BrowserMinerDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\CryptoMiners\CPUUsageAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\CryptoMiners\CryptoMinerDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\CryptoMiners\GPUMiningDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\CryptoMiners\PoolConnectionDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Email\AttachmentScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Email\EmailProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Email\OutlookScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Email\PhishingEmailDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Email\SpamDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Email\ThunderbirdScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Exploits\BufferOverflowProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Exploits\HeapSprayDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Exploits\JITSprayDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Exploits\KernelExploitDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Exploits\PrivilegeEscalationDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Exploits\ROPProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Exploits\StackPivotDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Forensics\ArtifactExtractor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Forensics\EvidenceCollector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Forensics\IncidentRecorder.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Forensics\MemoryDumper.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Forensics\NetworkCapture.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Forensics\TimelineAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\GameMode\GameCheatDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\GameMode\GameModeManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\GameMode\GameProcessDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\GameMode\OverlayProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\GameMode\PerformanceOptimizer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\IoT\IoTDeviceScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\IoT\RouterSecurityChecker.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\IoT\SmartHomeProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\IoT\WiFiSecurityAnalyzer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Privacy\CookieManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Privacy\DataLeakProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Privacy\DNSLeakProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Privacy\IPLeakProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Privacy\LocationPrivacy.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Privacy\MicrophoneGuard.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Privacy\PrivacyCleaner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Privacy\WebcamProtector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\RealTime\AccessControlManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\RealTime\BehaviorBlocker.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\RealTime\ExploitPrevention.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\RealTime\FileIntegrityMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\RealTime\FileSystemFilter.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\RealTime\MemoryProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\RealTime\NetworkTrafficFilter.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\RealTime\ProcessCreationMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\RealTime\RealtTimeProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\RealTime\ZeroHourProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scripts\AMSIIntegration.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scripts\JavaScriptScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scripts\MacroDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scripts\PowerShellScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scripts\PythonScriptScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scripts\VBScriptScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Security\AntiDebug.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Security\CertificateValidator.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Security\CodeObfuscation.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Security\CryptoManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Security\DigitalSignatureValidator.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Security\FileProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Security\MemoryProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Security\ProcessProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Security\RegistryProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Security\SelfDefense.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Security\TamperProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Update\DeltaUpdater.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Update\ProgramUpdater.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Update\RollbackManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Update\SignatureUpdater.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Update\UpdateManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Update\UpdateScheduler.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Update\UpdateVerifier.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\USB\BadUSBDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\USB\DeviceControlManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\USB\USBAutorunBlocker.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\USB\USBDeviceMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\USB\USBScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\WebBrowser\AdBlocker.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\WebBrowser\BrowserProtection.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\WebBrowser\ChromeExtensionScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\WebBrowser\FirefoxAddonScanner.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\WebBrowser\MaliciousDownloadBlocker.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\WebBrowser\PhishingDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\WebBrowser\SafeBrowsingAPI.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\WebBrowser\TrackerBlocker.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Ransomware\BackupProtector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Ransomware\FileBackupManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Ransomware\HoneypotManager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Ransomware\LockyDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Ransomware\RansomwareDecryptor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Ransomware\RansomwareDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Ransomware\ShadowCopyProtector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Ransomware\VolumeSnapshotService.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Ransomware\WannaCryDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Service\AntivirusService.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Service\ServiceInstaller.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Service\ServiceController.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Service\ServiceCommunicator.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Service\ServiceMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Service\PerformanceProfiler.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Performance\PerformanceProfiler.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Performance\MemoryProfiler.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Performance\CPUMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Performance\DiskMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Performance\NetworkPerformanceMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Drivers\FilterDriver.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="src\Drivers\FilterCommunication.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -1098,250 +39,919 @@
     <ClCompile Include="src\Drivers\RegistryFilterCallbacks.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\AntiEvasion\NetworkBasedEvasionDetector.cpp">
+    <ClCompile Include="src\Shared_modules\AntiEvasion\DebuggerEvasionDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\AntiEvasion\ProcessEvasionDetector.cpp">
+    <ClCompile Include="src\Shared_modules\AntiEvasion\EnvironmentEvasionDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\AntiEvasion\metamorphic_polymorphicdetector.cpp">
+    <ClCompile Include="src\Shared_modules\AntiEvasion\metamorphic_polymorphicdetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Behavioral\AnomalyDetector.c">
+    <ClCompile Include="src\Shared_modules\AntiEvasion\NetworkBasedEvasionDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Behavioral\AttackChainTracker.c">
+    <ClCompile Include="src\Shared_modules\AntiEvasion\PackerDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Behavioral\BehaviorEngine.c">
+    <ClCompile Include="src\Shared_modules\AntiEvasion\ProcessEvasionDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Behavioral\IOCMatcher.c">
+    <ClCompile Include="src\Shared_modules\AntiEvasion\SandboxEvasionDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Behavioral\MITREMapper.c">
+    <ClCompile Include="src\Shared_modules\AntiEvasion\TimeBasedEvasionDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Behavioral\PatternMatcher.c">
+    <ClCompile Include="src\Shared_modules\AntiEvasion\VMEvasionDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Behavioral\RuleEngine.c">
+    <ClCompile Include="src\Products\PhantomHome\Backup\BackupManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Behavioral\ThreatScoring.c">
+    <ClCompile Include="src\Products\PhantomHome\Backup\BackupScheduler.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Callbacks\FileSystem\FileSystemCallbacks.c">
+    <ClCompile Include="src\Products\PhantomHome\Backup\IncrementalBackup.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\CommandLineParser.c">
+    <ClCompile Include="src\Products\PhantomHome\Backup\RestoreManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\EnvironmentMonitor.c">
+    <ClCompile Include="src\Products\PhantomHome\Banking\BankingTrojanDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\HandleTracker.c">
+    <ClCompile Include="src\Products\PhantomHome\Banking\CertificatePinning.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\ParentChainTracker.c">
+    <ClCompile Include="src\Products\PhantomHome\Banking\KeyloggerProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\PrivilegeMonitor.c">
+    <ClCompile Include="src\Products\PhantomHome\Banking\ScreenshotBlocker.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\ProcessAnalyzer.c">
+    <ClCompile Include="src\Products\PhantomHome\Banking\SecureBrowser.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\ProcessRelationship.c">
+    <ClCompile Include="src\Products\PhantomHome\Banking\TransactionMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\TokenAnalyzer.c">
+    <ClCompile Include="src\Shared_modules\Communication\AlertSystem.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Communication\Compression.c">
+    <ClCompile Include="src\Shared_modules\Communication\IPCManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Communication\Encryption.c">
+    <ClCompile Include="src\Shared_modules\Communication\NotificationManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Communication\MessageQueue.c">
+    <ClCompile Include="src\Shared_modules\Communication\ReportGenerator.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Communication\TelemetryBuffer.c">
+    <ClCompile Include="src\Shared_modules\Communication\ServiceCommunication.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\ETW\ETWConsumer.c">
+    <ClCompile Include="src\Shared_modules\Communication\TelemetryCollector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\ETW\ETWProvider.c">
+    <ClCompile Include="src\Shared_modules\Config\ConfigManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\ETW\EventSchema.c">
+    <ClCompile Include="src\Shared_modules\Config\PolicyManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\ETW\ManifestGenerator.c">
+    <ClCompile Include="src\Shared_modules\Config\ProfileManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\ETW\TelemetryEvents.c">
+    <ClCompile Include="src\Shared_modules\Config\SettingsManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Memory\HeapSpray.c">
+    <ClCompile Include="src\Shared_modules\Core\Engine\BehaviorAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Memory\HollowingDetector.c">
+    <ClCompile Include="src\Shared_modules\Core\Engine\EmulationEngine.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Memory\InjectionDetector.c">
+    <ClCompile Include="src\Shared_modules\Core\Engine\HeuristicAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Memory\MemoryMonitor.c">
+    <ClCompile Include="src\Shared_modules\Core\Engine\MachineLearningDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Memory\ROPDetector.c">
+    <ClCompile Include="src\Shared_modules\Core\Engine\PackerUnpacker.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Memory\SectionTracker.c">
+    <ClCompile Include="src\Shared_modules\Core\Engine\PolymorphicDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Memory\ShellcodeDetector.c">
+    <ClCompile Include="src\Shared_modules\Core\Engine\QuarantineManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Memory\VadTracker.c">
+    <ClCompile Include="src\Shared_modules\Core\Engine\SandboxAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Network\C2Detection.c">
+    <ClCompile Include="src\Shared_modules\Core\Engine\ScanEngine.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Network\ConnectionTracker.c">
+    <ClCompile Include="src\Shared_modules\Core\Engine\SignatureDatabase_Manager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Network\DataExfiltration.c">
+    <ClCompile Include="src\Shared_modules\Core\Engine\ThreatDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Network\DnsMonitor.c">
+    <ClCompile Include="src\Shared_modules\Core\Engine\ZeroDayDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Network\NetworkFilter.c">
+    <ClCompile Include="src\Shared_modules\Core\FileSystem\ArchiveExtractor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Network\NetworkReputation.c">
+    <ClCompile Include="src\Shared_modules\Core\FileSystem\DirectoryMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Network\PortScanner.c">
+    <ClCompile Include="src\Shared_modules\Core\FileSystem\DocumentScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Network\SSLInspection.c">
+    <ClCompile Include="src\Shared_modules\Core\FileSystem\ExecutableAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Performance\BatchProcessing.c">
+    <ClCompile Include="src\Shared_modules\Core\FileSystem\FileHasher.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Performance\CacheOptimization.c">
+    <ClCompile Include="src\Shared_modules\Core\FileSystem\FileLockManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Performance\LookasideLists.c">
+    <ClCompile Include="src\Shared_modules\Core\FileSystem\FileReputation.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Performance\PerformanceMonitor.c">
+    <ClCompile Include="src\Shared_modules\Core\FileSystem\FileTypeAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Performance\ResourceThrottling.c">
+    <ClCompile Include="src\Shared_modules\Core\FileSystem\FileWatcher.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\SelfProtection\AntiDebug.c">
+    <ClCompile Include="src\Shared_modules\Core\FileSystem\MediaFileScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\SelfProtection\AntiUnload.c">
+    <ClCompile Include="src\Shared_modules\Core\FileSystem\MountPointMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\SelfProtection\CallbackProtection.c">
+    <ClCompile Include="src\Shared_modules\Core\Network\BotnetDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\SelfProtection\IntegrityMonitor.c">
+    <ClCompile Include="src\Shared_modules\Core\Network\DDosProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Sync\AsyncWorkQueue.c">
+    <ClCompile Include="src\Shared_modules\Core\Network\DNSMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Sync\DeferredProcedure.c">
+    <ClCompile Include="src\Shared_modules\Core\Network\EmailScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Sync\SpinLock.c">
+    <ClCompile Include="src\Shared_modules\Core\Network\FirewallManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Sync\ThreadPool.c">
+    <ClCompile Include="src\Shared_modules\Core\Network\NetworkMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Sync\TimerManager.c">
+    <ClCompile Include="src\Shared_modules\Core\Network\P2PMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Syscall\CallstackAnalyzer.c">
+    <ClCompile Include="src\Shared_modules\Core\Network\TorDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Syscall\DirectSyscallDetector.c">
+    <ClCompile Include="src\Shared_modules\Core\Network\TrafficAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Syscall\HeavensGateDetector.c">
+    <ClCompile Include="src\Shared_modules\Core\Network\URLAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Syscall\NtdllIntegrity.c">
+    <ClCompile Include="src\Shared_modules\Core\Network\VPNDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Syscall\SyscallHooks.c">
+    <ClCompile Include="src\Shared_modules\Core\Network\WebProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Syscall\SyscallMonitor.c">
+    <ClCompile Include="src\Shared_modules\Core\Process\AtomBombingDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Syscall\SyscallTable.c">
+    <ClCompile Include="src\Shared_modules\Core\Process\DLLInjectionDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Tracing\Trace.c">
+    <ClCompile Include="src\Shared_modules\Core\Process\MemoryScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensor\Tracing\WppConfig.c">
+    <ClCompile Include="src\Shared_modules\Core\Process\ProcessAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensorELAM\BootDriverVerify.c">
+    <ClCompile Include="src\Shared_modules\Core\Process\ProcessHollowingDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensorELAM\BootThreatDetector.c">
+    <ClCompile Include="src\Shared_modules\Core\Process\ProcessInjectionDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensorELAM\ELAMCallbacks.c">
+    <ClCompile Include="src\Shared_modules\Core\Process\ProcessKiller.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Drivers\ShadowSensorELAM\ELAMDriver.c">
+    <ClCompile Include="src\Shared_modules\Core\Process\ProcessMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="drivers\ShadowSensor\Context\InstanceContext.c">
+    <ClCompile Include="src\Shared_modules\Core\Process\ReflectiveDLLDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\HeapSpray.c">
+    <ClCompile Include="src\Shared_modules\Core\Process\ThreadHijackDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\HollowingDetector.c">
+    <ClCompile Include="src\Shared_modules\Core\Registry\PersistenceDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\InjectionDetector.c">
+    <ClCompile Include="src\Shared_modules\Core\Registry\RegistryAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\MemoryMonitor.c">
+    <ClCompile Include="src\Shared_modules\Core\Registry\RegistryMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\MemoryScanner.c">
+    <ClCompile Include="src\Shared_modules\Core\Registry\StartupAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\ROPDetector.c">
+    <ClCompile Include="src\Shared_modules\Core\Registry\SystemSettingsMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\SectionTracker.c">
+    <ClCompile Include="src\Shared_modules\Core\System\BootTimeAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\ShellcodeDetector.c">
+    <ClCompile Include="src\Shared_modules\Core\System\CrashHandler.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="PhantomSensor\PhantomSensor\Memory\VadTracker.c">
+    <ClCompile Include="src\Shared_modules\Core\System\DriverAnalyzer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Core\System\EventLogger.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Core\System\HardwareMonitor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Core\System\PerformanceMonitor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Core\System\ServiceManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Core\System\SystemInfo.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\BrowserMinerDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\CPUUsageAnalyzer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\CryptoMinerDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\GPUMiningDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\PoolConnectionDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Database\ConfigurationDB.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Database\DatabaseManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Database\LogDB.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Database\QuarantineDB.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Email\AttachmentScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Email\EmailProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Email\OutlookScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Email\PhishingEmailDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Email\SpamDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Email\ThunderbirdScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Exploits\BufferOverflowProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Exploits\HeapSprayDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Exploits\JITSprayDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Exploits\KernelExploitDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Exploits\PrivilegeEscalationDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Exploits\ROPProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Exploits\StackPivotDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\pugixml\pugixml.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\sqlitecpp\Backup.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\sqlitecpp\Column.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\sqlitecpp\Database.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\sqlitecpp\Exception.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\sqlitecpp\Savepoint.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\sqlitecpp\sqlite3.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\sqlitecpp\Statement.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\sqlitecpp\Transaction.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\FuzzyHasher\FuzzyHasher.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\FuzzyHasher\DigestGenerator.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\FuzzyHasher\DigestComparer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\tlsh\input_desc.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\tlsh\shared_file_functions.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\tlsh\tlsh.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\tlsh\tlsh_impl.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\External\tlsh\tlsh_util.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomEDR\Forensics\ArtifactExtractor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomEDR\Forensics\EvidenceCollector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomEDR\Forensics\IncidentRecorder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomEDR\Forensics\MemoryDumper.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomEDR\Forensics\NetworkCapture.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomEDR\Forensics\TimelineAnalyzer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\GameMode\GameCheatDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\GameMode\GameModeManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\GameMode\GameProcessDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\GameMode\OverlayProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\GameMode\PerformanceOptimizer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\HashStore\BloomFilter_impl.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\HashStore\HashBucket_impl.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\HashStore\HashStore.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\HashStore\HashStore_import_export.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\HashStore\HashStore_mgnmnt.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\HashStore\HashStore_query_operations.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\IoT\IoTDeviceScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\IoT\RouterSecurityChecker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\IoT\SmartHomeProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\IoT\WiFiSecurityAnalyzer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\PatternStore\aho_crsck_impl.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\PatternStore\boyer_moore_impl.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\PatternStore\PatternIndex.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\PatternStore\PatternStore.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\PatternStore\SIMD_Matcher_Impl.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Performance\CPUMonitor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Performance\DiskMonitor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Performance\MemoryProfiler.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Performance\NetworkPerformanceMonitor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Performance\PerformanceProfiler.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Privacy\CookieManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Privacy\DataLeakProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Privacy\DNSLeakProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Privacy\IPLeakProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Privacy\LocationPrivacy.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Privacy\MicrophoneGuard.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Privacy\PrivacyCleaner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\Privacy\WebcamProtector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RansomwareProtection\BackupProtector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RansomwareProtection\FileBackupManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RansomwareProtection\HoneypotManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RansomwareProtection\LockyDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RansomwareProtection\RansomwareDecryptor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RansomwareProtection\RansomwareDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RansomwareProtection\ShadowCopyProtector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RansomwareProtection\VolumeSnapshotService.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RansomwareProtection\WannaCryDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RealTime\AccessControlManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RealTime\BehaviorBlocker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RealTime\ExploitPrevention.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RealTime\FileIntegrityMonitor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RealTime\FileSystemFilter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RealTime\MemoryProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RealTime\NetworkTrafficFilter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RealTime\ProcessCreationMonitor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RealTime\RealtTimeProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RealTime\ZeroHourProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Scripts\AMSIIntegration.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Scripts\JavaScriptScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Scripts\MacroDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Scripts\PowerShellScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Scripts\PythonScriptScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Scripts\VBScriptScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Security\AntiDebug.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Security\CertificateValidator.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Security\CodeObfuscation.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Security\CryptoManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Security\DigitalSignatureValidator.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Security\FileProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Security\MemoryProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Security\ProcessProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Security\RegistryProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Security\SelfDefense.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Security\TamperProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Service\AntivirusService.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Service\PerformanceProfiler.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Service\ServiceCommunicator.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Service\ServiceController.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Service\ServiceInstaller.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Service\ServiceMonitor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\batch_sig_builder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\SignatureBuilder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\SignatureFormat.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\SignatureIndex.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\SignatureIndex_Cache_mngmnt.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\SignatureIndex_COW.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\SignatureIndex_Modification.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\SignatureIndex_Query.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\SignatureIndex_stat_maintenance.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\SignatureStore.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\SignatureStore_mngmnt.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\SignatureStore_Query.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\SignatureStore_scan.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\sig_builder_import_methods.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\sig_builder_input_methods.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\sig_builder_serialization.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\sig_builder_utils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\sig_indx_internal_node_mng.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\SignatureStore\YaraRuleStore.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ReputationCache.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelDatabase.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelExporter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelFeedManager_parsers.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelFormat.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelImporter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelIndex_Core.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelIndex_DataStructures.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelIndex_Lookups.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelIndex_Modifications.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelIndex_Trees.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelIndex_URLMatcher.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelIOCManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelLookup.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelStore.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\ThreatIntel\ThreatIntelBloomFilter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Update\DeltaUpdater.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Update\ProgramUpdater.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Update\RollbackManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Update\SignatureUpdater.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Update\UpdateManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Update\UpdateScheduler.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Update\UpdateVerifier.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\USB_Protection\BadUSBDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\USB_Protection\DeviceControlManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\USB_Protection\USBAutorunBlocker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\USB_Protection\USBDeviceMonitor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\USB_Protection\USBScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\NetworkUtilsIpAddress.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\Base64Utils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\CacheManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\CertUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\CompressionUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\CryptoUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\CryptoUtilsCommon.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\CryptoUtils_AsymmetricCipher.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\CryptoUtils_private_key.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\CryptoUtils_SecureBuffer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\CryptoUtils_Secure_Random.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\CryptoUtils_SymmetricCipher.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\FileUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\HashUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\JSONUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\Logger.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\MemoryUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\NetworkSecurity_SSL_TLS.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\NetworkUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\NetworkUtilsMacAdress.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\NetworkUtils_Adapter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\NetworkUtils_DNS.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\NetworkUtils_http_https.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\NetworkUtils_proxy.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\NetworkUtils_URL.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\PE_sig_verf.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\ProcessUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\RegistryUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\StringUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\SystemUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\ThreadPool.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\Timer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Utils\XMLUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\WebProtection\AdBlocker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\WebProtection\BrowserProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\WebProtection\ChromeExtensionScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\WebProtection\FirefoxAddonScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\WebProtection\MaliciousDownloadBlocker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\WebProtection\PhishingDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\WebProtection\SafeBrowsingAPI.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Products\PhantomHome\WebProtection\TrackerBlocker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Whitelist\WhiteListBloomFilter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Whitelist\WhiteListFormat.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Whitelist\WhiteListHashIndex.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Whitelist\WhiteListPatternIndex.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Whitelist\WhiteListStore.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Whitelist\WhiteListStringPool.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Communication\FilterConnection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Communication\MessageDispatcher.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Communication\ThreatIntelPusher.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -1510,24 +1120,6 @@
     </ClInclude>
     <ClInclude Include="include\sqlitecpp\VariadicBind.h">
       <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\FuzzyHasher\FuzzyHasher.hpp">
-      <Filter>Header Files\FuzzyHasher</Filter>
-    </ClInclude>
-    <ClInclude Include="src\FuzzyHasher\DigestGenerator.hpp">
-      <Filter>Header Files\FuzzyHasher</Filter>
-    </ClInclude>
-    <ClInclude Include="src\FuzzyHasher\DigestComparer.hpp">
-      <Filter>Header Files\FuzzyHasher</Filter>
-    </ClInclude>
-    <ClInclude Include="src\FuzzyHasher\RollingHash.hpp">
-      <Filter>Header Files\FuzzyHasher</Filter>
-    </ClInclude>
-    <ClInclude Include="src\FuzzyHasher\ChunkHash.hpp">
-      <Filter>Header Files\FuzzyHasher</Filter>
-    </ClInclude>
-    <ClInclude Include="src\FuzzyHasher\EditDistance.hpp">
-      <Filter>Header Files\FuzzyHasher</Filter>
     </ClInclude>
     <ClInclude Include="include\tlsh\input_desc.h">
       <Filter>Header Files</Filter>
@@ -1700,195 +1292,6 @@
     <ClInclude Include="src\pch.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\database\ConfigurationDB.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\database\DatabaseManager.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\database\LogDB.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\database\QuarantineDB.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\hashstore\HashStore.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\patternstore\PatternStore.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\signaturestore\pragma_pack.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\signaturestore\SignatureBuilder.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\signaturestore\SignatureFormat.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\signaturestore\SignatureIndex.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\signaturestore\SignatureStore.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\signaturestore\YaraRuleStore.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\ThreadPoolEvents.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\Base64Utils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\CacheManager.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\CertUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\CompressionUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\CryptoUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\CryptoUtilsCommon.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\FileUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\HashUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\JSONUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\Logger.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\MemoryUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\NetworkUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\PE_sig_verf.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\ProcessUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\RegistryUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\StringUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\SystemUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\ThreadPool.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\Timer.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\utils\XMLUtils.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\whitelist\WhiteListFormat.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\whitelist\WhiteListStore.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ReputationCache.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelDatabase.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelExporter.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelFeedManager.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelFeedManager_Util.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelFormat.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelImporter.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_DataStructures.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_Internal.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_LRU.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_Trees.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_URLMatcher.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelIOCManager.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelLookup.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ThreatIntel\ThreatIntelStore.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\AntiEvasion\NetworkBasedEvasionDetector.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\AntiEvasion\ProcessEvasionDetector.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Service\AntivirusService.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Service\ServiceInstaller.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Service\ServiceController.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Service\ServiceCommunicator.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Service\ServiceMonitor.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Performance\PerformanceProfiler.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Performance\MemoryProfiler.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Performance\CPUMonitor.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Performance\DiskMonitor.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Performance\NetworkPerformanceMonitor.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="src\Drivers\FilterDriver.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -1904,121 +1307,322 @@
     <ClInclude Include="src\Drivers\RegistryFilterCallbacks.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\AntiEvasion\DebuggerEvasionDetector.hpp">
+    <ClInclude Include="src\Shared_modules\FuzzyHasher\FuzzyHasher.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\AntiEvasion\EnvironmentEvasionDetector.hpp">
+    <ClInclude Include="src\Shared_modules\FuzzyHasher\DigestGenerator.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\AntiEvasion\MetamorphicDetector.hpp">
+    <ClInclude Include="src\Shared_modules\FuzzyHasher\DigestComparer.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\AntiEvasion\PackerDetector.hpp">
+    <ClInclude Include="src\Shared_modules\FuzzyHasher\RollingHash.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\AntiEvasion\SandboxEvasionDetector.hpp">
+    <ClInclude Include="src\Shared_modules\FuzzyHasher\ChunkHash.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\AntiEvasion\TimeBasedEvasionDetector.hpp">
+    <ClInclude Include="src\Shared_modules\FuzzyHasher\EditDistance.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\AntiEvasion\VMEvasionDetector.hpp">
+    <ClInclude Include="src\Shared_modules\AntiEvasion\DebuggerEvasionDetector.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\AntiEvasion\nt_undocumented.h">
+    <ClInclude Include="src\Shared_modules\AntiEvasion\EnvironmentEvasionDetector.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\AntiEvasion\metamorphic_polymorphicdetector.hpp">
+    <ClInclude Include="src\Shared_modules\AntiEvasion\metamorphic_polymorphicdetector.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Backup\BackupManager.hpp">
+    <ClInclude Include="src\Shared_modules\AntiEvasion\NetworkBasedEvasionDetector.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Backup\BackupScheduler.hpp">
+    <ClInclude Include="src\Shared_modules\AntiEvasion\nt_undocumented.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Backup\IncrementalBackup.hpp">
+    <ClInclude Include="src\Shared_modules\AntiEvasion\PackerDetector.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Backup\RestoreManager.hpp">
+    <ClInclude Include="src\Shared_modules\AntiEvasion\ProcessEvasionDetector.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Core\System\BootTimeAnalyzer.hpp">
+    <ClInclude Include="src\Shared_modules\AntiEvasion\SandboxEvasionDetector.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Core\System\CrashHandler.hpp">
+    <ClInclude Include="src\Shared_modules\AntiEvasion\TimeBasedEvasionDetector.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Core\System\DriverAnalyzer.hpp">
+    <ClInclude Include="src\Shared_modules\AntiEvasion\VMEvasionDetector.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Core\System\EventLogger.hpp">
+    <ClInclude Include="src\Products\PhantomHome\Backup\BackupManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Core\System\HardwareMonitor.hpp">
+    <ClInclude Include="src\Products\PhantomHome\Backup\BackupScheduler.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Core\System\PerformanceMonitor.hpp">
+    <ClInclude Include="src\Products\PhantomHome\Backup\IncrementalBackup.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Core\System\ServiceManager.hpp">
+    <ClInclude Include="src\Products\PhantomHome\Backup\RestoreManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Core\System\SystemInfo.hpp">
+    <ClInclude Include="src\Shared_modules\Core\System\BootTimeAnalyzer.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="drivers\ShadowSensor\Context\InstanceContext.h">
+    <ClInclude Include="src\Shared_modules\Core\System\CrashHandler.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\HeapSpray.h">
+    <ClInclude Include="src\Shared_modules\Core\System\DriverAnalyzer.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\HollowingDetector.h">
+    <ClInclude Include="src\Shared_modules\Core\System\EventLogger.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\InjectionDetector.h">
+    <ClInclude Include="src\Shared_modules\Core\System\HardwareMonitor.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\MemoryMonitor.h">
+    <ClInclude Include="src\Shared_modules\Core\System\PerformanceMonitor.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\MemoryScanner.h">
+    <ClInclude Include="src\Shared_modules\Core\System\ServiceManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\ROPDetector.h">
+    <ClInclude Include="src\Shared_modules\Core\System\SystemInfo.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\SectionTracker.h">
+    <ClInclude Include="src\Shared_modules\Database\ConfigurationDB.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\ShellcodeDetector.h">
+    <ClInclude Include="src\Shared_modules\Database\DatabaseManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="PhantomSensor\PhantomSensor\Memory\VadTracker.h">
+    <ClInclude Include="src\Shared_modules\Database\LogDB.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Database\QuarantineDB.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\HashStore\HashStore.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\PatternStore\PatternStore.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Performance\CPUMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Performance\DiskMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Performance\MemoryProfiler.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Performance\NetworkPerformanceMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Performance\PerformanceProfiler.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Service\AntivirusService.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Service\ServiceCommunicator.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Service\ServiceController.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Service\ServiceInstaller.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Service\ServiceMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\SignatureStore\pragma_pack.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\SignatureStore\SignatureBuilder.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\SignatureStore\SignatureFormat.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\SignatureStore\SignatureIndex.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\SignatureStore\SignatureStore.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\SignatureStore\YaraRuleStore.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ReputationCache.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelDatabase.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelExporter.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelFeedManager_Util.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelImporter.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelIndex_DataStructures.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelIndex_Internal.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelIndex_LRU.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelIndex_Trees.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelIndex_URLMatcher.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelIOCManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelLookup.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\ThreatIntel\ThreatIntelStore.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\Base64Utils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\CacheManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\CertUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\CompressionUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\CryptoUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\CryptoUtilsCommon.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\FileUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\HashUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\JSONUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\Logger.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\MemoryUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\NetworkUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\PE_sig_verf.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\ProcessUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\RegistryUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\StringUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\SystemUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\ThreadPool.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\ThreadPoolEvents.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\Timer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Utils\XMLUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Whitelist\WhiteListFormat.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Whitelist\WhiteListStore.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Communication\AlertSystem.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Communication\Communication.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Communication\FilterConnection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Communication\IPCManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Communication\MessageDispatcher.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Communication\NotificationManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Communication\ReportGenerator.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Communication\ServiceCommunication.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Communication\TelemetryCollector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Communication\ThreatIntelPusher.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <MASM Include="src\AntiEvasion\EnvironmentEvasionDetector_x64.asm">
+    <MASM Include="src\Shared_modules\AntiEvasion\EnvironmentEvasionDetector_x64.asm">
       <Filter>Source Files</Filter>
     </MASM>
-    <MASM Include="src\AntiEvasion\VMEvasionDetector_x64.asm">
+    <MASM Include="src\Shared_modules\AntiEvasion\PackerDetector_x64.asm">
       <Filter>Source Files</Filter>
     </MASM>
-    <MASM Include="src\AntiEvasion\DebuggerEvasionDetector_x64.asm">
+    <MASM Include="src\Shared_modules\AntiEvasion\SandboxEvasionDetector_x64.asm">
       <Filter>Source Files</Filter>
     </MASM>
-    <MASM Include="src\AntiEvasion\PackerDetector_x64.asm">
+    <MASM Include="src\Shared_modules\AntiEvasion\TimeBasedEvasionDetector_x64.asm">
       <Filter>Source Files</Filter>
     </MASM>
-    <MASM Include="src\AntiEvasion\SandboxEvasionDetector_x64.asm">
+    <MASM Include="src\Shared_modules\AntiEvasion\VMEvasionDetector_x64.asm">
       <Filter>Source Files</Filter>
     </MASM>
-    <MASM Include="src\AntiEvasion\TimeBasedEvasionDetector_x64.asm">
+    <MASM Include="src\Shared_modules\AntiEvasion\DebuggerEvasionDetector_x64.asm">
       <Filter>Source Files</Filter>
     </MASM>
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="Drivers\ShadowSensor\Network\ProtocolParser.c" />
   </ItemGroup>
 </Project>

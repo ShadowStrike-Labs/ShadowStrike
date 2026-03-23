@@ -1,4 +1,4 @@
-<?xml version='1.0' encoding='utf-8'?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003" DefaultTargets="Build">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -169,11 +169,14 @@
     <ClCompile Include="src\Products\PhantomHome\Banking\SecureBrowser.cpp" />
     <ClCompile Include="src\Products\PhantomHome\Banking\TransactionMonitor.cpp" />
     <ClCompile Include="src\Shared_modules\Communication\AlertSystem.cpp" />
+    <ClCompile Include="src\Shared_modules\Communication\FilterConnection.cpp" />
     <ClCompile Include="src\Shared_modules\Communication\IPCManager.cpp" />
+    <ClCompile Include="src\Shared_modules\Communication\MessageDispatcher.cpp" />
     <ClCompile Include="src\Shared_modules\Communication\NotificationManager.cpp" />
     <ClCompile Include="src\Shared_modules\Communication\ReportGenerator.cpp" />
     <ClCompile Include="src\Shared_modules\Communication\ServiceCommunication.cpp" />
     <ClCompile Include="src\Shared_modules\Communication\TelemetryCollector.cpp" />
+    <ClCompile Include="src\Shared_modules\Communication\ThreatIntelPusher.cpp" />
     <ClCompile Include="src\Shared_modules\Config\ConfigManager.cpp" />
     <ClCompile Include="src\Shared_modules\Config\PolicyManager.cpp" />
     <ClCompile Include="src\Shared_modules\Config\ProfileManager.cpp" />
@@ -247,7 +250,6 @@
     <ClCompile Include="src\Shared_modules\Database\QuarantineDB.cpp" />
     <ClCompile Include="src\Drivers\FileFilterCallbacks.cpp" />
     <ClCompile Include="src\Drivers\FilterCommunication.cpp" />
-
     <ClCompile Include="src\Drivers\ProcessFilterCallbacks.cpp" />
     <ClCompile Include="src\Drivers\RegistryFilterCallbacks.cpp" />
     <ClCompile Include="src\Products\PhantomHome\Email\AttachmentScanner.cpp" />
@@ -560,6 +562,16 @@
     <ClInclude Include="include\sqlitecpp\Transaction.h" />
     <ClInclude Include="include\sqlitecpp\Utils.h" />
     <ClInclude Include="include\sqlitecpp\VariadicBind.h" />
+    <ClInclude Include="src\Shared_modules\Communication\AlertSystem.hpp" />
+    <ClInclude Include="src\Shared_modules\Communication\Communication.hpp" />
+    <ClInclude Include="src\Shared_modules\Communication\FilterConnection.hpp" />
+    <ClInclude Include="src\Shared_modules\Communication\IPCManager.hpp" />
+    <ClInclude Include="src\Shared_modules\Communication\MessageDispatcher.hpp" />
+    <ClInclude Include="src\Shared_modules\Communication\NotificationManager.hpp" />
+    <ClInclude Include="src\Shared_modules\Communication\ReportGenerator.hpp" />
+    <ClInclude Include="src\Shared_modules\Communication\ServiceCommunication.hpp" />
+    <ClInclude Include="src\Shared_modules\Communication\TelemetryCollector.hpp" />
+    <ClInclude Include="src\Shared_modules\Communication\ThreatIntelPusher.hpp" />
     <ClInclude Include="src\Shared_modules\FuzzyHasher\FuzzyHasher.hpp" />
     <ClInclude Include="src\Shared_modules\FuzzyHasher\DigestGenerator.hpp" />
     <ClInclude Include="src\Shared_modules\FuzzyHasher\DigestComparer.hpp" />
