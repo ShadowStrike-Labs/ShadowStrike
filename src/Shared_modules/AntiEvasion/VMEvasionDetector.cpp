@@ -2987,6 +2987,741 @@ uint64_t VMEvasionDetector::MeasureRDTSCDelta(uint32_t iterations) {
 }
 
 // ============================================================================
+// Extended Analysis API — IsCancelled, ClassifyImport, GetInstructionEvasionScore,
+// AnalyzeCodeBuffer, AnalyzePEFile, AnalyzeProcessExtended, AnalyzePEFilesBatch
+// ============================================================================
+
+bool VMEvasionDetector::IsCancelled() const {
+    return false;
+}
+
+AntiVMTechnique VMEvasionDetector::ClassifyImport(
+    std::string_view dllName,
+    std::string_view functionName
+) {
+    // Case-insensitive comparison helper
+    auto ciEqual = [](std::string_view a, std::string_view b) -> bool {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(a[i])) !=
+                std::tolower(static_cast<unsigned char>(b[i])))
+                return false;
+        }
+        return true;
+    };
+
+    auto ciContains = [&](std::string_view haystack, std::string_view needle) -> bool {
+        if (needle.size() > haystack.size()) return false;
+        for (size_t i = 0; i <= haystack.size() - needle.size(); ++i) {
+            if (ciEqual(haystack.substr(i, needle.size()), needle))
+                return true;
+        }
+        return false;
+    };
+
+    if (dllName.empty() || functionName.empty()) {
+        return AntiVMTechnique::None;
+    }
+
+    // kernel32.dll
+    if (ciEqual(dllName, "kernel32.dll") || ciEqual(dllName, "kernel32")) {
+        if (ciEqual(functionName, "IsDebuggerPresent"))
+            return AntiVMTechnique::None; // Wrong detector — this is anti-debug
+        if (ciEqual(functionName, "GetTickCount") || ciEqual(functionName, "GetTickCount64"))
+            return AntiVMTechnique::GetTickCountTiming;
+        if (ciEqual(functionName, "QueryPerformanceCounter") ||
+            ciEqual(functionName, "QueryPerformanceFrequency"))
+            return AntiVMTechnique::QPCTiming;
+        if (ciEqual(functionName, "GetSystemFirmwareTable") ||
+            ciEqual(functionName, "EnumSystemFirmwareTables"))
+            return AntiVMTechnique::FirmwareTableQuery;
+        if (ciEqual(functionName, "CreateToolhelp32Snapshot"))
+            return AntiVMTechnique::ProcessEnumeration;
+        if (ciEqual(functionName, "GetModuleHandleA") || ciEqual(functionName, "GetModuleHandleW") ||
+            ciEqual(functionName, "LoadLibraryA") || ciEqual(functionName, "LoadLibraryW") ||
+            ciEqual(functionName, "LoadLibraryExA") || ciEqual(functionName, "LoadLibraryExW"))
+            return AntiVMTechnique::ModuleEnumeration;
+    }
+
+    // ntdll.dll
+    if (ciEqual(dllName, "ntdll.dll") || ciEqual(dllName, "ntdll")) {
+        if (ciEqual(functionName, "NtQuerySystemInformation") ||
+            ciEqual(functionName, "ZwQuerySystemInformation"))
+            return AntiVMTechnique::ProcessEnumeration;
+        if (ciEqual(functionName, "NtQueryVirtualMemory") ||
+            ciEqual(functionName, "ZwQueryVirtualMemory"))
+            return AntiVMTechnique::MemoryArtifactScan;
+        if (ciContains(functionName, "__cpuid") || ciContains(functionName, "__cpuidex"))
+            return AntiVMTechnique::CPUIDHypervisorCheck;
+    }
+
+    // advapi32.dll
+    if (ciEqual(dllName, "advapi32.dll") || ciEqual(dllName, "advapi32")) {
+        if (ciEqual(functionName, "RegOpenKeyExA") || ciEqual(functionName, "RegOpenKeyExW") ||
+            ciEqual(functionName, "RegQueryValueExA") || ciEqual(functionName, "RegQueryValueExW") ||
+            ciEqual(functionName, "RegGetValueA") || ciEqual(functionName, "RegGetValueW"))
+            return AntiVMTechnique::RegistryKeyCheck;
+        if (ciEqual(functionName, "OpenSCManagerA") || ciEqual(functionName, "OpenSCManagerW") ||
+            ciEqual(functionName, "EnumServicesStatusA") || ciEqual(functionName, "EnumServicesStatusW") ||
+            ciEqual(functionName, "EnumServicesStatusExA") || ciEqual(functionName, "EnumServicesStatusExW"))
+            return AntiVMTechnique::ServiceEnumeration;
+    }
+
+    // WMI-related DLLs
+    if (ciContains(dllName, "wbem") || ciContains(dllName, "ole32") || ciContains(dllName, "oleaut32")) {
+        if (ciContains(functionName, "IWbemLocator") || ciContains(functionName, "IWbemServices") ||
+            ciContains(functionName, "CoCreateInstance") || ciContains(functionName, "ExecQuery"))
+            return AntiVMTechnique::WMIQuery;
+    }
+
+    // setupapi.dll
+    if (ciEqual(dllName, "setupapi.dll") || ciEqual(dllName, "setupapi")) {
+        if (ciContains(functionName, "SetupDi"))
+            return AntiVMTechnique::DeviceEnumeration;
+    }
+
+    // iphlpapi.dll
+    if (ciEqual(dllName, "iphlpapi.dll") || ciEqual(dllName, "iphlpapi")) {
+        if (ciEqual(functionName, "GetAdaptersInfo") ||
+            ciEqual(functionName, "GetAdaptersAddresses"))
+            return AntiVMTechnique::MACAddressCheck;
+    }
+
+    // user32.dll
+    if (ciEqual(dllName, "user32.dll") || ciEqual(dllName, "user32")) {
+        if (ciEqual(functionName, "FindWindowA") || ciEqual(functionName, "FindWindowW") ||
+            ciEqual(functionName, "FindWindowExA") || ciEqual(functionName, "FindWindowExW") ||
+            ciEqual(functionName, "EnumWindows") || ciEqual(functionName, "EnumChildWindows"))
+            return AntiVMTechnique::WindowEnumeration;
+    }
+
+    return AntiVMTechnique::None;
+}
+
+float VMEvasionDetector::GetInstructionEvasionScore(std::string_view mnemonic) {
+    if (mnemonic.empty()) return 0.0f;
+
+    // Build a lowercase copy for comparison
+    std::string lower(mnemonic.size(), '\0');
+    std::transform(mnemonic.begin(), mnemonic.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (lower == "cpuid")     return 30.0f;
+    if (lower == "rdtsc")     return 40.0f;
+    if (lower == "rdtscp")    return 40.0f;
+    if (lower == "sidt")      return 85.0f;
+    if (lower == "sgdt")      return 80.0f;
+    if (lower == "sldt")      return 75.0f;
+    if (lower == "str")       return 70.0f;
+    if (lower == "in")        return 60.0f;
+    if (lower == "out")       return 60.0f;
+    if (lower == "vmcall")    return 95.0f;
+    if (lower == "vmmcall")   return 95.0f;
+    if (lower == "vmread")    return 90.0f;
+    if (lower == "vmwrite")   return 90.0f;
+    if (lower == "vmlaunch")  return 90.0f;
+    if (lower == "vmresume")  return 90.0f;
+    if (lower == "vmxoff")    return 90.0f;
+    if (lower == "vmxon")     return 90.0f;
+    if (lower == "invd")      return 50.0f;
+    if (lower == "wbinvd")    return 50.0f;
+    if (lower == "rdmsr")     return 65.0f;
+    if (lower == "wrmsr")     return 65.0f;
+    if (lower == "smsw")      return 55.0f;
+    if (lower == "lmsw")      return 55.0f;
+    if (lower == "int")       return 15.0f;
+
+    return 0.0f;
+}
+
+bool VMEvasionDetector::AnalyzeCodeBuffer(
+    std::span<const uint8_t> buffer,
+    uint64_t virtualAddress,
+    bool is64Bit,
+    CodeAnalysisResult& result,
+    const ExtendedAnalysisConfig& config
+) {
+    const auto startTime = std::chrono::high_resolution_clock::now();
+
+    result = CodeAnalysisResult{};
+
+    if (buffer.empty()) {
+        return false;
+    }
+
+    try {
+        // Initialize Zydis decoder
+        ZydisDecoder decoder;
+        ZyanStatus status = ZydisDecoderInit(&decoder,
+            is64Bit ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LONG_COMPAT_32,
+            is64Bit ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32);
+        if (!ZYAN_SUCCESS(status)) {
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeCodeBuffer: ZydisDecoderInit failed (0x%08X)",
+                         static_cast<uint32_t>(status));
+            return false;
+        }
+
+        ZydisFormatter formatter;
+        status = ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+        if (!ZYAN_SUCCESS(status)) {
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeCodeBuffer: ZydisFormatterInit failed (0x%08X)",
+                         static_cast<uint32_t>(status));
+            return false;
+        }
+
+        // Track positions of anti-VM instructions for pattern detection
+        std::vector<size_t> cpuidPositions;
+        std::vector<size_t> rdtscPositions;
+        size_t instructionIndex = 0;
+
+        ZydisDecodedInstruction instruction;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        size_t offset = 0;
+
+        while (offset < buffer.size()) {
+            // Respect instruction limit
+            if (instructionIndex >= config.maxInstructionsPerRegion) {
+                break;
+            }
+
+            // Check cancellation periodically (every 4096 instructions)
+            if (config.cancelFlag && (instructionIndex & 0xFFF) == 0) {
+                if (config.cancelFlag->load(std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+
+            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder,
+                    buffer.data() + offset, buffer.size() - offset,
+                    &instruction, operands))) {
+
+                const char* mnemonicStr = ZydisMnemonicGetString(instruction.mnemonic);
+                if (!mnemonicStr) {
+                    offset += instruction.length;
+                    ++instructionIndex;
+                    continue;
+                }
+
+                const std::string_view mnemonicSv(mnemonicStr);
+
+                // Check if this mnemonic is in the anti-VM set
+                bool isAntiVM = false;
+                for (const auto& known : VMConstants::ANTI_VM_MNEMONICS) {
+                    if (known.size() == mnemonicSv.size()) {
+                        bool match = true;
+                        for (size_t ci = 0; ci < known.size(); ++ci) {
+                            if (std::tolower(static_cast<unsigned char>(known[ci])) !=
+                                std::tolower(static_cast<unsigned char>(mnemonicSv[ci]))) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) { isAntiVM = true; break; }
+                    }
+                }
+
+                if (isAntiVM) {
+                    // Format the full instruction text
+                    char fmtBuffer[256] = { 0 };
+                    ZydisFormatterFormatInstruction(&formatter, &instruction, operands,
+                        instruction.operand_count_visible, fmtBuffer, sizeof(fmtBuffer),
+                        virtualAddress + offset, ZYAN_NULL);
+
+                    // Extract operand portion (after mnemonic)
+                    std::string fullText(fmtBuffer);
+                    std::string operandText;
+                    auto spacePos = fullText.find(' ');
+                    if (spacePos != std::string::npos) {
+                        operandText = fullText.substr(spacePos + 1);
+                    }
+
+                    DisassembledInstruction disasm;
+                    disasm.address = virtualAddress + offset;
+                    disasm.length = instruction.length;
+                    disasm.mnemonic = std::string(mnemonicSv);
+                    disasm.operands = std::move(operandText);
+                    disasm.fullText = std::move(fullText);
+                    disasm.isAntiVM = true;
+
+                    // Copy raw bytes (up to 15)
+                    const size_t copyLen = std::min<size_t>(instruction.length, disasm.rawBytes.size());
+                    std::memcpy(disasm.rawBytes.data(), buffer.data() + offset, copyLen);
+
+                    // Assign associated technique & update counters
+                    std::string lowerMnemonic(mnemonicSv.size(), '\0');
+                    std::transform(mnemonicSv.begin(), mnemonicSv.end(), lowerMnemonic.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+                    if (lowerMnemonic == "cpuid") {
+                        disasm.associatedTechnique = AntiVMTechnique::CPUIDHypervisorCheck;
+                        ++result.cpuidCount;
+                        cpuidPositions.push_back(instructionIndex);
+                    } else if (lowerMnemonic == "rdtsc" || lowerMnemonic == "rdtscp") {
+                        disasm.associatedTechnique = AntiVMTechnique::RDTSCTiming;
+                        ++result.rdtscCount;
+                        ++result.timingInstructionCount;
+                        rdtscPositions.push_back(instructionIndex);
+                    } else if (lowerMnemonic == "sidt") {
+                        disasm.associatedTechnique = AntiVMTechnique::RedPillTest;
+                        ++result.sidtCount;
+                        result.hasPrivilegedInstructions = true;
+                    } else if (lowerMnemonic == "sgdt") {
+                        disasm.associatedTechnique = AntiVMTechnique::NoPillTest;
+                        ++result.sgdtCount;
+                        result.hasPrivilegedInstructions = true;
+                    } else if (lowerMnemonic == "sldt") {
+                        disasm.associatedTechnique = AntiVMTechnique::LDTCheck;
+                        ++result.sldtCount;
+                        result.hasPrivilegedInstructions = true;
+                    } else if (lowerMnemonic == "str") {
+                        disasm.associatedTechnique = AntiVMTechnique::SWIZZTest;
+                        ++result.strCount;
+                        result.hasPrivilegedInstructions = true;
+                    } else if (lowerMnemonic == "in" || lowerMnemonic == "out") {
+                        disasm.associatedTechnique = AntiVMTechnique::IOPortProbing;
+                        ++result.ioPortAccessCount;
+                        result.hasPrivilegedInstructions = true;
+                    } else if (lowerMnemonic == "vmcall" || lowerMnemonic == "vmmcall" ||
+                               lowerMnemonic == "vmread" || lowerMnemonic == "vmwrite" ||
+                               lowerMnemonic == "vmlaunch" || lowerMnemonic == "vmresume" ||
+                               lowerMnemonic == "vmxoff" || lowerMnemonic == "vmxon") {
+                        disasm.associatedTechnique = AntiVMTechnique::VMwareBackdoor;
+                        ++result.vmInstructionCount;
+                        result.hasPrivilegedInstructions = true;
+                    } else if (lowerMnemonic == "invd" || lowerMnemonic == "wbinvd") {
+                        disasm.associatedTechnique = AntiVMTechnique::MemoryArtifactScan;
+                        result.hasPrivilegedInstructions = true;
+                    } else if (lowerMnemonic == "rdmsr" || lowerMnemonic == "wrmsr") {
+                        disasm.associatedTechnique = AntiVMTechnique::MemoryArtifactScan;
+                        result.hasPrivilegedInstructions = true;
+                    } else if (lowerMnemonic == "smsw" || lowerMnemonic == "lmsw") {
+                        disasm.associatedTechnique = AntiVMTechnique::MemoryArtifactScan;
+                        result.hasPrivilegedInstructions = true;
+                    } else if (lowerMnemonic == "int") {
+                        disasm.associatedTechnique = AntiVMTechnique::INTNCheck;
+                    }
+
+                    result.antiVMInstructions.push_back(std::move(disasm));
+                }
+
+                offset += instruction.length;
+            } else {
+                // Skip bad byte
+                ++offset;
+            }
+
+            ++instructionIndex;
+        }
+
+        result.totalInstructionsAnalyzed = instructionIndex;
+
+        // Pattern detection: CPUID loop (two CPUIDs within 50 instructions)
+        if (config.detectCpuidLoops && cpuidPositions.size() >= 2) {
+            for (size_t i = 1; i < cpuidPositions.size(); ++i) {
+                if (cpuidPositions[i] - cpuidPositions[i - 1] <= 50) {
+                    result.hasCpuidLoop = true;
+                    break;
+                }
+            }
+        }
+
+        // Pattern detection: RDTSC sandwich (RDTSC → instructions → RDTSC)
+        if (config.detectRdtscPatterns && rdtscPositions.size() >= 2) {
+            for (size_t i = 1; i < rdtscPositions.size(); ++i) {
+                const size_t gap = rdtscPositions[i] - rdtscPositions[i - 1];
+                if (gap >= 2 && gap <= 200) {
+                    result.hasRdtscSandwich = true;
+                    break;
+                }
+            }
+        }
+
+        // Calculate overall evasion score
+        float score = 0.0f;
+
+        // Accumulate from individual anti-VM instructions
+        for (const auto& instr : result.antiVMInstructions) {
+            score += GetInstructionEvasionScore(instr.mnemonic);
+        }
+
+        // Pattern bonuses
+        if (result.hasCpuidLoop)         score += 25.0f;
+        if (result.hasRdtscSandwich)     score += 30.0f;
+        if (result.hasPrivilegedInstructions) score += 10.0f;
+
+        // Normalize to 0-100 range
+        result.evasionScore = std::min(score, 100.0f);
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeCodeBuffer failed: %hs", e.what());
+        return false;
+    }
+
+    const auto endTime = std::chrono::high_resolution_clock::now();
+    result.analysisTime = std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime);
+    return true;
+}
+
+bool VMEvasionDetector::AnalyzePEFile(
+    const std::wstring& filePath,
+    PEAnalysisResult& result,
+    const ExtendedAnalysisConfig& config
+) {
+    const auto startTime = std::chrono::high_resolution_clock::now();
+
+    result = PEAnalysisResult{};
+
+    if (filePath.empty()) {
+        SS_LOG_ERROR(L"AntiEvasion", L"AnalyzePEFile: empty file path");
+        return false;
+    }
+
+    try {
+        PEParser::PEParser parser;
+        PEParser::PEInfo peInfo;
+        PEParser::PEError peErr;
+
+        if (!parser.ParseFile(filePath, peInfo, &peErr)) {
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzePEFile: ParseFile failed for '%s': %s",
+                         filePath.c_str(), peErr.message.c_str());
+            return false;
+        }
+
+        // Basic PE info
+        result.isPE         = peInfo.valid;
+        result.is64Bit      = peInfo.is64Bit;
+        result.isDotNet     = peInfo.isDotNet;
+        result.isSigned     = peInfo.isSigned;
+        result.entryPointRva = peInfo.entryPointRva;
+
+        // ----------------------------------------------------------------
+        // Import analysis
+        // ----------------------------------------------------------------
+        if (config.analyzeImports) {
+            std::vector<PEParser::ImportInfo> imports;
+            PEParser::PEError importErr;
+
+            if (parser.ParseImports(imports, &importErr)) {
+                for (const auto& imp : imports) {
+                    const std::string dllNameNarrow = Utils::StringUtils::ToNarrow(imp.dllName);
+
+                    for (const auto& func : imp.functions) {
+                        ++result.totalImportedFunctions;
+
+                        if (func.byOrdinal || func.name.empty()) continue;
+
+                        AntiVMTechnique technique = ClassifyImport(dllNameNarrow, func.name);
+                        if (technique != AntiVMTechnique::None) {
+                            SuspiciousImport si;
+                            si.dllName            = dllNameNarrow;
+                            si.functionName       = func.name;
+                            si.ordinal            = func.ordinal;
+                            si.associatedTechnique = technique;
+                            si.suspicionScore     = GetInstructionEvasionScore("cpuid"); // baseline
+                            si.reason             = L"Import classified as anti-VM: " +
+                                                    Utils::StringUtils::ToWide(func.name);
+
+                            result.suspiciousImports.push_back(std::move(si));
+                            ++result.antiVMImportCount;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Section analysis
+        // ----------------------------------------------------------------
+        if (config.analyzeSections) {
+            for (size_t i = 0; i < peInfo.sections.size(); ++i) {
+                const auto& sec = peInfo.sections[i];
+
+                if (sec.isExecutable) ++result.executableSectionCount;
+
+                if (sec.isWritable && sec.isExecutable) {
+                    ++result.writableExecutableSections;
+                }
+
+                if (config.analyzeEntropy) {
+                    if (sec.entropy > result.highestSectionEntropy) {
+                        result.highestSectionEntropy = sec.entropy;
+                        result.highEntropySection = Utils::StringUtils::ToWide(sec.name);
+                    }
+                }
+
+                // Check if entry point is in a writable section
+                if (peInfo.entryPointSectionIndex.has_value() &&
+                    peInfo.entryPointSectionIndex.value() == i) {
+                    if (sec.isWritable) {
+                        result.entryPointInWritableSection = true;
+                    }
+                    if (sec.name != ".text" && sec.name != "CODE") {
+                        result.entryPointOutsideCode = true;
+                    }
+                }
+            }
+
+            // Packing heuristic based on entropy
+            if (result.highestSectionEntropy >= config.entropyThreshold) {
+                result.isPacked = true;
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // TLS callbacks
+        // ----------------------------------------------------------------
+        if (config.analyzeTLS) {
+            PEParser::TLSInfo tlsInfo;
+            PEParser::PEError tlsErr;
+
+            if (parser.ParseTLS(tlsInfo, &tlsErr)) {
+                result.tlsCallbackCount    = tlsInfo.callbacks.size();
+                result.tlsCallbackAddresses = tlsInfo.callbacks;
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // PE Anomaly detection
+        // ----------------------------------------------------------------
+        if (config.detectAnomalies) {
+            if (peInfo.timeDateStamp == 0) {
+                result.anomalies.push_back(L"Zero compilation timestamp");
+            }
+            if (peInfo.sections.size() > 16) {
+                result.anomalies.push_back(L"Unusually high number of sections: " +
+                    std::to_wstring(peInfo.sections.size()));
+            }
+            if (result.writableExecutableSections > 0) {
+                result.anomalies.push_back(L"Writable+Executable section(s) detected");
+            }
+            if (result.entryPointInWritableSection) {
+                result.anomalies.push_back(L"Entry point resides in a writable section");
+            }
+            if (result.entryPointOutsideCode) {
+                result.anomalies.push_back(L"Entry point is outside .text section");
+            }
+            if (result.isPacked) {
+                result.anomalies.push_back(L"High entropy section detected (likely packed/encrypted): " +
+                    result.highEntropySection);
+            }
+            if (result.tlsCallbackCount > 0) {
+                result.anomalies.push_back(L"TLS callbacks present (" +
+                    std::to_wstring(result.tlsCallbackCount) + L")");
+            }
+            if (peInfo.checksum == 0 && !peInfo.isDLL) {
+                result.anomalies.push_back(L"PE checksum is zero");
+            }
+            for (const auto& sec : peInfo.sections) {
+                const std::string_view sn(sec.name);
+                if (sn == ".UPX0" || sn == ".UPX1" || sn == ".aspack" ||
+                    sn == ".adata" || sn == ".nsp0" || sn == ".nsp1") {
+                    result.anomalies.push_back(L"Known packer section name: " +
+                        Utils::StringUtils::ToWide(sec.name));
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Overall suspicion score
+        // ----------------------------------------------------------------
+        float score = 0.0f;
+
+        // Import-based scoring
+        if (result.antiVMImportCount >= config.minSuspiciousImports) {
+            score += 20.0f + static_cast<float>(result.antiVMImportCount) * 2.0f;
+        }
+
+        // Section anomalies
+        score += static_cast<float>(result.writableExecutableSections) * 10.0f;
+        if (result.entryPointInWritableSection) score += 15.0f;
+        if (result.entryPointOutsideCode)       score += 10.0f;
+        if (result.isPacked)                    score += 20.0f;
+
+        // TLS callbacks
+        if (result.tlsCallbackCount > 0) {
+            score += 10.0f + static_cast<float>(result.tlsCallbackCount) * 5.0f;
+        }
+
+        // Anomaly count bonus
+        score += static_cast<float>(result.anomalies.size()) * 3.0f;
+
+        result.overallSuspicionScore = std::min(score, 100.0f);
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"AntiEvasion", L"AnalyzePEFile failed for '%s': %hs",
+                     filePath.c_str(), e.what());
+        return false;
+    }
+
+    const auto endTime = std::chrono::high_resolution_clock::now();
+    result.analysisTime = std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime);
+    return true;
+}
+
+bool VMEvasionDetector::AnalyzeProcessExtended(
+    Utils::ProcessUtils::ProcessId processId,
+    ExtendedProcessAnalysis& result,
+    const ExtendedAnalysisConfig& config
+) {
+    const auto startTime = std::chrono::high_resolution_clock::now();
+
+    result = ExtendedProcessAnalysis{};
+    result.processId = processId;
+
+    try {
+        // 1. Retrieve basic process info
+        Utils::ProcessUtils::ProcessInfo procInfo;
+        if (Utils::ProcessUtils::GetProcessInfo(processId, procInfo)) {
+            result.processName    = procInfo.basic.name;
+            result.executablePath = procInfo.basic.executablePath;
+        }
+
+        if (m_impl) {
+            m_impl->m_statistics.totalProcessesAnalyzed.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // 2. PE analysis (file-level)
+        if (config.enablePEAnalysis && !result.executablePath.empty()) {
+            (void)AnalyzePEFile(result.executablePath, result.peAnalysis, config);
+        }
+
+        // 3. Code analysis (memory-level via Zydis)
+        if (config.enableDisassembly) {
+            HANDLE rawHandle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, processId);
+            if (!rawHandle) {
+                result.errorMessage = L"Access Denied: Cannot open process for extended scanning";
+                // PE analysis may still have succeeded, continue with partial results
+            } else {
+                std::shared_ptr<void> hProcess(rawHandle, [](void* h) { CloseHandle(static_cast<HANDLE>(h)); });
+
+                // Determine if target is 64-bit
+                BOOL isWow64 = FALSE;
+                IsWow64Process(static_cast<HANDLE>(hProcess.get()), &isWow64);
+                const bool targetIs64Bit = !isWow64;
+
+                SYSTEM_INFO sysInfo{};
+                GetSystemInfo(&sysInfo);
+
+                auto pAddr = static_cast<uint8_t*>(sysInfo.lpMinimumApplicationAddress);
+                auto pMax  = static_cast<uint8_t*>(sysInfo.lpMaximumApplicationAddress);
+
+                const size_t maxScanBytes   = config.maxMemoryToScan > 0 ? config.maxMemoryToScan
+                                                                         : 128ULL * 1024 * 1024;
+                const size_t maxRegions     = config.maxRegionsToAnalyze > 0 ? config.maxRegionsToAnalyze : 64;
+                size_t totalScanned = 0;
+                size_t regionsScanned = 0;
+
+                MEMORY_BASIC_INFORMATION mbi{};
+
+                while (pAddr < pMax && totalScanned < maxScanBytes && regionsScanned < maxRegions) {
+                    // Check cancellation
+                    if (config.cancelFlag && config.cancelFlag->load(std::memory_order_relaxed)) {
+                        break;
+                    }
+
+                    if (VirtualQueryEx(static_cast<HANDLE>(hProcess.get()), pAddr, &mbi, sizeof(mbi)) == 0) {
+                        pAddr += sysInfo.dwPageSize;
+                        continue;
+                    }
+
+                    const bool isExecutable = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+
+                    if (mbi.State == MEM_COMMIT && isExecutable && mbi.Type == MEM_IMAGE) {
+                        constexpr size_t MAX_REGION_SCAN = 16ULL * 1024 * 1024;
+                        const size_t regionScanSize = std::min<size_t>(mbi.RegionSize, MAX_REGION_SCAN);
+
+                        std::vector<uint8_t> buffer(regionScanSize);
+                        SIZE_T bytesRead = 0;
+
+                        if (ReadProcessMemory(static_cast<HANDLE>(hProcess.get()),
+                                              mbi.BaseAddress, buffer.data(), regionScanSize, &bytesRead) &&
+                            bytesRead > 0) {
+
+                            auto bufferSpan = std::span<const uint8_t>(buffer.data(), bytesRead);
+                            const uint64_t regionBase = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+
+                            (void)AnalyzeCodeBuffer(bufferSpan, regionBase, targetIs64Bit,
+                                              result.codeAnalysis, config);
+
+                            totalScanned += bytesRead;
+                            ++regionsScanned;
+                        }
+                    }
+
+                    pAddr += mbi.RegionSize ? mbi.RegionSize : sysInfo.dwPageSize;
+                }
+
+                result.totalBytesScanned           = totalScanned;
+                result.executableRegionsScanned    = regionsScanned;
+            }
+        }
+
+        // 4. Combine scores
+        const float codeWeight = 0.6f;
+        const float peWeight   = 0.4f;
+
+        result.combinedEvasionScore =
+            (result.codeAnalysis.evasionScore * codeWeight) +
+            (result.peAnalysis.overallSuspicionScore * peWeight);
+
+        result.combinedEvasionScore = std::min(result.combinedEvasionScore, 100.0f);
+
+        result.hasAntiVMBehavior =
+            (result.combinedEvasionScore >= config.minEvasionScoreToReport);
+
+        // Merge detected techniques from code analysis
+        for (const auto& instr : result.codeAnalysis.antiVMInstructions) {
+            if (instr.associatedTechnique != AntiVMTechnique::None) {
+                result.detectedTechniques = result.detectedTechniques | instr.associatedTechnique;
+            }
+        }
+
+        // Merge detected techniques from import analysis
+        for (const auto& imp : result.peAnalysis.suspiciousImports) {
+            if (imp.associatedTechnique != AntiVMTechnique::None) {
+                result.detectedTechniques = result.detectedTechniques | imp.associatedTechnique;
+            }
+        }
+
+        result.completed = true;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcessExtended failed for PID %u: %hs",
+                     processId, e.what());
+        result.errorMessage = Utils::StringUtils::ToWide(e.what());
+        return false;
+    }
+
+    const auto endTime = std::chrono::high_resolution_clock::now();
+    result.totalAnalysisTime = std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime);
+    return result.completed;
+}
+
+size_t VMEvasionDetector::AnalyzePEFilesBatch(
+    std::span<const std::wstring> filePaths,
+    std::unordered_map<std::wstring, PEAnalysisResult>& results,
+    const ExtendedAnalysisConfig& config
+) {
+    size_t successCount = 0;
+
+    for (const auto& filePath : filePaths) {
+        // Check cancellation
+        if (config.cancelFlag && config.cancelFlag->load(std::memory_order_relaxed)) {
+            break;
+        }
+
+        PEAnalysisResult fileResult;
+        if (AnalyzePEFile(filePath, fileResult, config)) {
+            ++successCount;
+        }
+        results[filePath] = std::move(fileResult);
+    }
+
+    return successCount;
+}
+
+// ============================================================================
 // Free Functions
 // ============================================================================
 
