@@ -1755,11 +1755,14 @@ namespace ShadowStrike {
 
             /**
              * @brief Check for kernel-level debug information
+             * @brief Detect kernel-debug-info query code in target process
+             * @param processId Target process ID
              * @param outDetections Output detected techniques
              * @param err Optional error output
-             * @return true if kernel debug mode detected
+             * @return true if kernel debug query techniques found in target
              */
             [[nodiscard]] bool CheckKernelDebugInfo(
+                uint32_t processId,
                 std::vector<DetectedTechnique>& outDetections,
                 Error* err = nullptr
             ) noexcept;
@@ -2137,9 +2140,16 @@ namespace ShadowStrike {
             ) noexcept;
 
             /**
-             * @brief Query kernel debug information
+             * @brief Detect kernel-debug-info query techniques in target process.
+             *
+             * Scans the target's IAT and code for patterns that indicate the process
+             * attempts to detect kernel debugging (NtQuerySystemInformation with
+             * SystemKernelDebuggerInformation). This is behavioral detection of
+             * anti-debug evasion, not a self-check of system state.
              */
             void QueryKernelDebugInfo(
+                HANDLE hProcess,
+                uint32_t processId,
                 DebuggerEvasionResult& result
             ) noexcept;
 

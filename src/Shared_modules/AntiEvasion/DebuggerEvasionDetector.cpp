@@ -4448,29 +4448,204 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     // ========================================================================
-    // KERNEL DEBUG INFO CHECK
+    // KERNEL DEBUG INFO QUERY DETECTION (Behavioral — TYPE B)
+    //
+    // Detects when the TARGET process contains code that queries
+    // SystemKernelDebuggerInformation via NtQuerySystemInformation.
+    // This is a common anti-debug evasion technique (MITRE T1622).
+    //
+    // We do NOT call NtQuerySystemInformation ourselves — that would be
+    // checking our own system state (TYPE A). Instead we scan the target's
+    // imports and code for this pattern.
     // ========================================================================
 
     void DebuggerEvasionDetector::QueryKernelDebugInfo(
+        HANDLE hProcess,
+        uint32_t processId,
         DebuggerEvasionResult& result
     ) noexcept {
-        struct SYSTEM_KERNEL_DEBUGGER_INFORMATION {
-            BOOLEAN KernelDebuggerEnabled;
-            BOOLEAN KernelDebuggerNotPresent;
-        } debugInfo = {};
+        try {
+            // Phase 1: Check if target imports NtQuerySystemInformation
+            HMODULE hMods[512] = {};
+            DWORD cbNeeded = 0;
+            if (!EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+                return;
+            }
 
-        if (m_impl->m_NtQuerySystemInformation) {
-            NTSTATUS status = m_impl->m_NtQuerySystemInformation(SystemKernelDebuggerInformation, &debugInfo, sizeof(debugInfo), NULL);
-            if (status >= 0) {
-                if (debugInfo.KernelDebuggerEnabled && !debugInfo.KernelDebuggerNotPresent) {
-                    AddDetection(result, DetectionPatternBuilder()
-                        .Technique(EvasionTechnique::KERNEL_SystemKernelDebugger)
-                        .Description(L"System is booted with Kernel Debugging Enabled")
-                        .Confidence(1.0)
-                        .Severity(EvasionSeverity::High)
-                        .Build());
+            HMODULE hTargetNtdll = nullptr;
+            const DWORD modCount = std::min<DWORD>(cbNeeded / sizeof(HMODULE), 512u);
+            for (DWORD i = 0; i < modCount; ++i) {
+                wchar_t modName[MAX_PATH] = {};
+                if (GetModuleFileNameExW(hProcess, hMods[i], modName, MAX_PATH) > 0) {
+                    std::wstring_view name(modName);
+                    auto pos = name.find_last_of(L"\\/");
+                    if (pos != std::wstring_view::npos) name = name.substr(pos + 1);
+                    if (_wcsicmp(std::wstring(name).c_str(), L"ntdll.dll") == 0) {
+                        hTargetNtdll = hMods[i];
+                        break;
+                    }
                 }
             }
+
+            if (!hTargetNtdll) return;
+
+            // Read the target's PE import directory to see if NtQuerySystemInformation
+            // is imported (presence alone is not suspicious — it's how it's used)
+            bool importsNtQuerySysInfo = false;
+
+            IMAGE_DOS_HEADER dosHeader = {};
+            if (!ReadProcessMemory(hProcess, hTargetNtdll, &dosHeader, sizeof(dosHeader), nullptr) ||
+                dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
+                return;
+            }
+
+            auto* ntHeaderAddr = reinterpret_cast<const BYTE*>(hTargetNtdll) + dosHeader.e_lfanew;
+            IMAGE_NT_HEADERS64 ntHeaders = {};
+            if (!ReadProcessMemory(hProcess, ntHeaderAddr, &ntHeaders, sizeof(ntHeaders), nullptr) ||
+                ntHeaders.Signature != IMAGE_NT_SIGNATURE) {
+                return;
+            }
+
+            // Read target's main module PE to check its import table
+            MODULEINFO mainModInfo = {};
+            if (GetModuleInformation(hProcess, hMods[0], &mainModInfo, sizeof(mainModInfo))) {
+                IMAGE_DOS_HEADER mainDos = {};
+                if (ReadProcessMemory(hProcess, mainModInfo.lpBaseOfDll, &mainDos, sizeof(mainDos), nullptr) &&
+                    mainDos.e_magic == IMAGE_DOS_SIGNATURE) {
+
+                    auto* mainNtAddr = static_cast<const BYTE*>(mainModInfo.lpBaseOfDll) + mainDos.e_lfanew;
+                    IMAGE_NT_HEADERS64 mainNt = {};
+                    if (ReadProcessMemory(hProcess, mainNtAddr, &mainNt, sizeof(mainNt), nullptr) &&
+                        mainNt.Signature == IMAGE_NT_SIGNATURE) {
+
+                        const auto& importDir = mainNt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+                        if (importDir.VirtualAddress != 0 && importDir.Size > 0) {
+                            const size_t maxImports = std::min<size_t>(importDir.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR), 256);
+                            auto importBuf = std::make_unique<IMAGE_IMPORT_DESCRIPTOR[]>(maxImports);
+                            auto* importAddr = static_cast<const BYTE*>(mainModInfo.lpBaseOfDll) + importDir.VirtualAddress;
+
+                            SIZE_T bytesRead = 0;
+                            if (ReadProcessMemory(hProcess, importAddr, importBuf.get(),
+                                    maxImports * sizeof(IMAGE_IMPORT_DESCRIPTOR), &bytesRead)) {
+
+                                const size_t descCount = bytesRead / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+                                for (size_t i = 0; i < descCount; ++i) {
+                                    if (importBuf[i].Name == 0) break;
+
+                                    char dllName[64] = {};
+                                    auto* nameAddr = static_cast<const BYTE*>(mainModInfo.lpBaseOfDll) + importBuf[i].Name;
+                                    if (!ReadProcessMemory(hProcess, nameAddr, dllName, sizeof(dllName) - 1, nullptr))
+                                        continue;
+                                    dllName[63] = '\0';
+
+                                    if (_stricmp(dllName, "ntdll.dll") != 0) continue;
+
+                                    // Walk thunks looking for NtQuerySystemInformation
+                                    DWORD thunkRva = importBuf[i].OriginalFirstThunk ?
+                                                     importBuf[i].OriginalFirstThunk : importBuf[i].FirstThunk;
+                                    if (thunkRva == 0) continue;
+
+                                    auto* thunkAddr = static_cast<const BYTE*>(mainModInfo.lpBaseOfDll) + thunkRva;
+                                    IMAGE_THUNK_DATA64 thunks[512] = {};
+                                    if (!ReadProcessMemory(hProcess, thunkAddr, thunks, sizeof(thunks), nullptr))
+                                        continue;
+
+                                    for (size_t t = 0; t < 512 && thunks[t].u1.AddressOfData != 0; ++t) {
+                                        if (thunks[t].u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
+
+                                        auto* hintAddr = static_cast<const BYTE*>(mainModInfo.lpBaseOfDll) +
+                                                         static_cast<DWORD>(thunks[t].u1.AddressOfData);
+                                        char funcName[128] = {};
+                                        // Skip 2-byte hint
+                                        if (!ReadProcessMemory(hProcess, hintAddr + 2, funcName, sizeof(funcName) - 1, nullptr))
+                                            continue;
+                                        funcName[127] = '\0';
+
+                                        if (strcmp(funcName, "NtQuerySystemInformation") == 0 ||
+                                            strcmp(funcName, "ZwQuerySystemInformation") == 0) {
+                                            importsNtQuerySysInfo = true;
+                                            break;
+                                        }
+                                    }
+                                    break; // Done with ntdll.dll
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Phase 2: Scan target's executable code for the SystemKernelDebuggerInformation
+            // constant (0x23 = 35) being loaded near NtQuerySystemInformation call patterns.
+            // This detects the actual anti-debug technique, not just the import.
+            if (importsNtQuerySysInfo && mainModInfo.lpBaseOfDll != nullptr && mainModInfo.SizeOfImage > 0) {
+                constexpr uint32_t kSystemKernelDebuggerInfo = 35; // SystemKernelDebuggerInformation
+
+                // Read the first 64KB of the target's .text section
+                const BYTE* codeBase = static_cast<const BYTE*>(mainModInfo.lpBaseOfDll);
+                const size_t maxScan = std::min<size_t>(mainModInfo.SizeOfImage, 64 * 1024);
+                auto codeBuf = std::make_unique<BYTE[]>(maxScan);
+                SIZE_T codeRead = 0;
+
+                if (ReadProcessMemory(hProcess, codeBase, codeBuf.get(), maxScan, &codeRead) && codeRead > 64) {
+                    // Use Zydis to disassemble and look for:
+                    // mov ecx/edx/r8d, 0x23 (SystemKernelDebuggerInformation)
+                    // near a call to NtQuerySystemInformation
+                    ZydisDecoder decoder;
+                    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+
+                    ZydisDecodedInstruction instruction;
+                    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE];
+
+                    size_t offset = 0;
+                    bool foundConstant = false;
+                    uintptr_t constantAddr = 0;
+
+                    while (offset + 15 <= codeRead) {
+                        if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder,
+                                codeBuf.get() + offset, codeRead - offset,
+                                &instruction, operands))) {
+
+                            // Look for MOV reg, 0x23 or PUSH 0x23
+                            if (instruction.mnemonic == ZYDIS_MNEMONIC_MOV ||
+                                instruction.mnemonic == ZYDIS_MNEMONIC_PUSH) {
+                                for (uint8_t i = 0; i < instruction.operand_count_visible; ++i) {
+                                    if (operands[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                                        operands[i].imm.value.u == kSystemKernelDebuggerInfo) {
+                                        foundConstant = true;
+                                        constantAddr = reinterpret_cast<uintptr_t>(codeBase) + offset;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            offset += instruction.length;
+                        } else {
+                            offset++;
+                        }
+                    }
+
+                    if (foundConstant) {
+                        AddDetection(result, DetectionPatternBuilder()
+                            .Technique(EvasionTechnique::KERNEL_SystemKernelDebugger)
+                            .Description(L"Target process contains code that queries "
+                                         L"SystemKernelDebuggerInformation (anti-debug evasion)")
+                            .TechnicalDetails(std::format(
+                                L"NtQuerySystemInformation imported; constant 0x23 "
+                                L"(SystemKernelDebuggerInformation) found at VA 0x{:X}",
+                                constantAddr))
+                            .Confidence(0.85)
+                            .Address(constantAddr)
+                            .Severity(EvasionSeverity::High)
+                            .Build());
+                    }
+                }
+            }
+
+            result.techniquesChecked++;
+        }
+        catch (...) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"QueryKernelDebugInfo: Exception during target code analysis");
         }
     }
 
@@ -4768,9 +4943,9 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
-            // 9. Kernel Info
+            // 9. Kernel Debug Query Detection (behavioral — scans target's code)
             if (HasFlag(config.flags, AnalysisFlags::ScanKernelQueries)) {
-                QueryKernelDebugInfo(result);
+                QueryKernelDebugInfo(hProcess, processId, result);
             }
 
             // 10. Kernel-Enriched Command-Line Correlation
@@ -4995,26 +5170,21 @@ namespace ShadowStrike::AntiEvasion {
         return CheckHiddenThreadsInternal(hProcess.Get(), processId, outDetections, err);
     }
 
-    bool DebuggerEvasionDetector::CheckKernelDebugInfo(std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        struct SYSTEM_KERNEL_DEBUGGER_INFORMATION {
-            BOOLEAN KernelDebuggerEnabled;
-            BOOLEAN KernelDebuggerNotPresent;
-        } debugInfo = {};
-
-        if (m_impl->m_NtQuerySystemInformation) {
-            NTSTATUS status = m_impl->m_NtQuerySystemInformation(SystemKernelDebuggerInformation, &debugInfo, sizeof(debugInfo), NULL);
-            if (status >= 0) {
-                if (debugInfo.KernelDebuggerEnabled && !debugInfo.KernelDebuggerNotPresent) {
-                    DetectedTechnique tech(EvasionTechnique::KERNEL_SystemKernelDebugger);
-                    tech.description = L"System is booted with Kernel Debugging Enabled";
-                    tech.severity = EvasionSeverity::High;
-                    tech.confidence = 1.0;
-                    outDetections.push_back(tech);
-                    return true;
-                }
-            }
+    bool DebuggerEvasionDetector::CheckKernelDebugInfo(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        if (!hProcess) {
+            if (err) *err = Error::FromWin32(GetLastError());
+            return false;
         }
-        return false;
+
+        DebuggerEvasionResult tempResult;
+        QueryKernelDebugInfo(hProcess, processId, tempResult);
+        CloseHandle(hProcess);
+
+        for (auto& det : tempResult.detectedTechniques) {
+            outDetections.push_back(std::move(det));
+        }
+        return !outDetections.empty();
     }
 
     bool DebuggerEvasionDetector::CheckAPIHookDetection(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
