@@ -884,8 +884,8 @@ namespace {
                         ++count;
                         break;
                     }
-                    // DEC + JNZ pattern
-                    if ((buffer[j] == 0x48 || buffer[j] == 0x49 || buffer[j] == 0xFF) && 
+                    // DEC + JNZ pattern (0xFF /1 form only — 0x48/0x49 are REX prefixes in x64)
+                    if (buffer[j] == 0xFF && 
                         j + 2 < size && buffer[j + 1] == 0x75) {
                         ++count;
                         break;
@@ -1283,7 +1283,7 @@ public:
 
         try {
             auto options = recursive
-                ? std::filesystem::directory_options::follow_directory_symlink
+                ? std::filesystem::directory_options::skip_permission_denied
                 : std::filesystem::directory_options::none;
 
             auto processEntry = [&](const std::filesystem::directory_entry& entry) {
@@ -1366,7 +1366,7 @@ public:
             return -1.0;
         }
 
-        if (sectionOffset + sectionSize > mappedFile.size()) {
+        if (static_cast<size_t>(sectionOffset) + static_cast<size_t>(sectionSize) > mappedFile.size()) {
             if (err) {
                 err->win32Code = ERROR_INVALID_PARAMETER;
                 err->message = L"Section extends beyond file";
@@ -1681,7 +1681,7 @@ public:
 
         for (const auto& sec : peInfo.sections) {
             if (peInfo.entryPointRva >= sec.virtualAddress &&
-                peInfo.entryPointRva < sec.virtualAddress + sec.virtualSize) {
+                peInfo.entryPointRva < static_cast<uint64_t>(sec.virtualAddress) + sec.virtualSize) {
                 outEP.containingSection = sec.name;
                 outEP.isOutsideCodeSection = !sec.hasCode;
                 break;
@@ -1697,12 +1697,16 @@ public:
             return false;
         }
 
+        size_t epOffsetVal = *epOffset;
+        if (epOffsetVal >= mappedFile.size()) {
+            return true; // EP offset beyond file — no bytes to read
+        }
         size_t bytesToRead = std::min(static_cast<size_t>(MAX_EP_BYTES),
-            mappedFile.size() - *epOffset);
+            mappedFile.size() - epOffsetVal);
         if (bytesToRead > 0) {
             outEP.epBytes.resize(bytesToRead);
             std::memcpy(outEP.epBytes.data(),
-                static_cast<const uint8_t*>(mappedFile.data()) + *epOffset,
+                static_cast<const uint8_t*>(mappedFile.data()) + epOffsetVal,
                 bytesToRead);
 
             auto match = MatchEPSignatureInternal(outEP.epBytes.data(), outEP.epBytes.size());
@@ -1842,6 +1846,7 @@ public:
             return true;
         }
 
+        size_t entropyCount = 0;
         for (const auto& res : resources) {
             outResources.totalSize += res.size;
             if (res.size > outResources.largestResourceSize) {
@@ -1849,7 +1854,7 @@ public:
             }
 
             if (res.size >= MIN_SECTION_SIZE_FOR_ENTROPY &&
-                res.offset + res.size <= mappedFile.size()) {
+                static_cast<size_t>(res.offset) + static_cast<size_t>(res.size) <= mappedFile.size()) {
                 double entropy = CalculateEntropy(
                     static_cast<const uint8_t*>(mappedFile.data()) + res.offset,
                     res.size
@@ -1860,6 +1865,7 @@ public:
                         Utils::StringUtils::Format(L"High entropy resource (%.2f)", entropy));
                 }
                 outResources.averageEntropy += entropy;
+                ++entropyCount;
             }
 
             if (std::find(outResources.languages.begin(), outResources.languages.end(),
@@ -1868,8 +1874,8 @@ public:
             }
         }
 
-        if (outResources.count > 0) {
-            outResources.averageEntropy /= outResources.count;
+        if (entropyCount > 0) {
+            outResources.averageEntropy /= static_cast<double>(entropyCount);
         }
 
         return true;
@@ -2226,6 +2232,23 @@ public:
         return m_sigVerifier;
     }
 
+    // Public wrapper for outer class to add matches with callback notification
+    void FireCallbackAndAddMatch(PackingInfo& result, PackerMatch match) noexcept {
+        PackerDetectionCallback callbackCopy;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            if (m_detectionCallback && !result.filePath.empty()) {
+                callbackCopy = m_detectionCallback;
+            }
+        }
+        if (callbackCopy) {
+            try {
+                callbackCopy(result.filePath, match);
+            } catch (...) {}
+        }
+        result.packerMatches.push_back(std::move(match));
+    }
+
 private:
     // ========================================================================
     // INTERNAL METHODS
@@ -2501,7 +2524,7 @@ private:
         for (size_t i = 0; i < peInfo.sections.size(); ++i) {
             const auto& sec = peInfo.sections[i];
             if (peInfo.entryPointRva >= sec.virtualAddress &&
-                peInfo.entryPointRva < sec.virtualAddress + sec.virtualSize) {
+                peInfo.entryPointRva < static_cast<uint64_t>(sec.virtualAddress) + sec.virtualSize) {
                 result.entryPointInfo.containingSection = sec.name;
                 result.entryPointInfo.isOutsideCodeSection = !sec.hasCode;
 
@@ -2694,6 +2717,7 @@ private:
         result.resourceInfo.valid = true;
         result.resourceInfo.count = resources.size();
 
+        size_t entropyCount = 0;
         for (const auto& res : resources) {
             result.resourceInfo.totalSize += res.size;
             if (res.size > result.resourceInfo.largestResourceSize) {
@@ -2701,17 +2725,18 @@ private:
             }
 
             if (res.size >= MIN_SECTION_SIZE_FOR_ENTROPY &&
-                res.offset + res.size <= size) {
+                static_cast<size_t>(res.offset) + static_cast<size_t>(res.size) <= size) {
                 double entropy = CalculateEntropy(buffer + res.offset, res.size);
                 if (entropy >= PackerConstants::HIGH_SECTION_ENTROPY) {
                     ++result.resourceInfo.highEntropyCount;
                 }
                 result.resourceInfo.averageEntropy += entropy;
+                ++entropyCount;
             }
         }
 
-        if (result.resourceInfo.count > 0) {
-            result.resourceInfo.averageEntropy /= result.resourceInfo.count;
+        if (entropyCount > 0) {
+            result.resourceInfo.averageEntropy /= static_cast<double>(entropyCount);
         }
     }
 
@@ -3174,19 +3199,23 @@ private:
             return std::nullopt;
         }
 
+        std::optional<PackerMatch> bestMatch;
+
         for (const auto& sig : EPSignatures::BuiltInSignatures) {
             if (EPSignatures::MatchPattern(epBytes, size, sig.pattern, sig.mask)) {
-                PackerMatch match;
-                match.packerType = sig.packerType;
-                match.packerName = sig.packerName;
-                match.version = sig.version;
-                match.category = GetPackerCategory(sig.packerType);
-                match.severity = GetPackerSeverity(sig.packerType);
-                match.method = DetectionMethod::EPSignature;
-                match.confidence = sig.confidence;
-                match.mitreId = PackerTypeToMitreId(sig.packerType);
-                match.detectionTime = std::chrono::system_clock::now();
-                return match;
+                if (!bestMatch || sig.confidence > bestMatch->confidence) {
+                    PackerMatch match;
+                    match.packerType = sig.packerType;
+                    match.packerName = sig.packerName;
+                    match.version = sig.version;
+                    match.category = GetPackerCategory(sig.packerType);
+                    match.severity = GetPackerSeverity(sig.packerType);
+                    match.method = DetectionMethod::EPSignature;
+                    match.confidence = sig.confidence;
+                    match.mitreId = PackerTypeToMitreId(sig.packerType);
+                    match.detectionTime = std::chrono::system_clock::now();
+                    bestMatch = std::move(match);
+                }
             }
         }
 
@@ -3194,28 +3223,40 @@ private:
             std::shared_lock lock(m_customPatternsMutex);
             for (const auto& sig : m_customEPSignatures) {
                 if (EPSignatures::MatchPattern(epBytes, size, sig.pattern, sig.mask)) {
-                    PackerMatch match;
-                    match.packerType = sig.packerType;
-                    match.packerName = sig.packerName;
-                    match.category = GetPackerCategory(sig.packerType);
-                    match.severity = GetPackerSeverity(sig.packerType);
-                    match.method = DetectionMethod::EPSignature;
-                    match.confidence = sig.confidence;
-                    match.mitreId = PackerTypeToMitreId(sig.packerType);
-                    match.detectionTime = std::chrono::system_clock::now();
-                    return match;
+                    if (!bestMatch || sig.confidence > bestMatch->confidence) {
+                        PackerMatch match;
+                        match.packerType = sig.packerType;
+                        match.packerName = sig.packerName;
+                        match.category = GetPackerCategory(sig.packerType);
+                        match.severity = GetPackerSeverity(sig.packerType);
+                        match.method = DetectionMethod::EPSignature;
+                        match.confidence = sig.confidence;
+                        match.mitreId = PackerTypeToMitreId(sig.packerType);
+                        match.detectionTime = std::chrono::system_clock::now();
+                        bestMatch = std::move(match);
+                    }
                 }
             }
         }
 
-        return std::nullopt;
+        return bestMatch;
     }
 
     void AddMatch(PackingInfo& result, PackerMatch match) noexcept {
+        // Copy callback under lock, invoke outside lock to prevent deadlock
+        PackerDetectionCallback callbackCopy;
         {
             std::shared_lock lock(m_callbackMutex);
             if (m_detectionCallback && !result.filePath.empty()) {
-                m_detectionCallback(result.filePath, match);
+                callbackCopy = m_detectionCallback;
+            }
+        }
+
+        if (callbackCopy) {
+            try {
+                callbackCopy(result.filePath, match);
+            } catch (...) {
+                // Callback threw — do not propagate in noexcept context
             }
         }
 
@@ -3970,7 +4011,8 @@ void PackerDetector::AnalyzePEStructure(
         // Analyze overlay entropy
         size_t overlayAnalyzeSize = std::min(peInfo.overlaySize,
             PackerConstants::MAX_OVERLAY_SIZE);
-        if (overlayAnalyzeSize >= 256 && peInfo.overlayOffset + overlayAnalyzeSize <= size) {
+        if (overlayAnalyzeSize >= 256 &&
+            static_cast<size_t>(peInfo.overlayOffset) + overlayAnalyzeSize <= size) {
             result.overlayInfo.entropy = CalculateEntropy(
                 buffer + peInfo.overlayOffset, overlayAnalyzeSize);
             result.overlayInfo.isCompressed =
@@ -3993,7 +4035,7 @@ void PackerDetector::AnalyzePEStructure(
         for (size_t i = 0; i < peInfo.sections.size(); ++i) {
             const auto& sec = peInfo.sections[i];
             if (peInfo.entryPointRva >= sec.virtualAddress &&
-                peInfo.entryPointRva < sec.virtualAddress + sec.virtualSize) {
+                peInfo.entryPointRva < static_cast<uint64_t>(sec.virtualAddress) + sec.virtualSize) {
                 result.entryPointInfo.containingSection = sec.name;
                 result.entryPointInfo.isOutsideCodeSection = !sec.hasCode;
 
@@ -4118,8 +4160,8 @@ void PackerDetector::PerformHeuristicAnalysis(
         size_t pushCount = 0;
         for (size_t i = 0; i < std::min(epBytes.size(), size_t(50)); ++i) {
             uint8_t b = epBytes[i];
-            // PUSH reg (50-57), PUSHA (60), PUSHAD (60), PUSHF (9C)
-            if ((b >= 0x50 && b <= 0x57) || b == 0x60 || b == 0x9C) {
+            // PUSH reg (50-57), PUSHF (9C) — 0x60 (PUSHA) is invalid in x64 (encodes BOUND)
+            if ((b >= 0x50 && b <= 0x57) || b == 0x9C) {
                 ++pushCount;
             }
         }
@@ -4286,7 +4328,11 @@ void PackerDetector::DeterminePackingVerdict(PackingInfo& result) noexcept
 void PackerDetector::AddMatch(PackingInfo& result, PackerMatch match) noexcept
 {
     match.detectionTime = std::chrono::system_clock::now();
-    result.packerMatches.push_back(std::move(match));
+    if (m_impl) {
+        m_impl->FireCallbackAndAddMatch(result, std::move(match));
+    } else {
+        result.packerMatches.push_back(std::move(match));
+    }
 }
 
 void PackerDetector::UpdateCache(

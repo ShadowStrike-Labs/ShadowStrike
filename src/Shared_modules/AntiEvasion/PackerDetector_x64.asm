@@ -217,6 +217,7 @@ MeasureUnpackStubTiming PROC
     mfence
     
     ; Serialize and get end time
+    ; NOTE: cpuid clobbers EBX (zero-extended to RBX), so reload start time from [rdi]
     xor eax, eax
     cpuid                       ; Serialize
     rdtsc
@@ -224,7 +225,8 @@ MeasureUnpackStubTiming PROC
     or rax, rdx
     mov [r14], rax              ; Store end time via preserved R14
     
-    ; Calculate delta
+    ; Calculate delta — reload start from memory since CPUID destroyed RBX
+    mov rbx, [rdi]
     sub rax, rbx
     
     pop r14
@@ -313,7 +315,7 @@ DetectTimingAnomaly PROC
     rdtsc
     shl rdx, 32
     or rax, rdx
-    mov rbx, rax
+    mov r13, rax                ; Save start time in R13 (CPUID clobbers RBX)
     
     ; Execute CPUID (this is slow in VMs due to vmexit)
     xor eax, eax
@@ -323,7 +325,7 @@ DetectTimingAnomaly PROC
     rdtsc
     shl rdx, 32
     or rax, rdx
-    sub rax, rbx
+    sub rax, r13
     mov r13, rax                ; CPUID timing
     
     ; Compare against threshold
@@ -1332,8 +1334,6 @@ SIMDScanForPattern PROC
     cmp rcx, r12
     jge @pattern_found
     
-    movzx eax, byte ptr [rdi + r13]
-    add rax, rcx
     movzx eax, byte ptr [rdi + r13 + rcx]
     movzx edx, byte ptr [rsi + rcx]
     cmp al, dl
