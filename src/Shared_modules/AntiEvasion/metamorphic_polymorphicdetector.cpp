@@ -2437,6 +2437,7 @@ bool MetamorphicDetector::AnalyzePEStructure(
         secInfo.characteristics = sec.characteristics;
         secInfo.isExecutable = sec.isExecutable;
         secInfo.isWritable = sec.isWritable;
+        secInfo.hasCode = (sec.characteristics & 0x00000020) != 0; // IMAGE_SCN_CNT_CODE
 
         if (sec.rawAddress < mappedFile.size() && sec.rawSize > 0) {
             size_t secSize = std::min(static_cast<size_t>(sec.rawSize),
@@ -3508,11 +3509,13 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
 
         // Pattern 4: MOV reg, const; CMP reg, const+1; JA (never taken)
         if (instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
+            instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
             instr.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
             i + 2 < instructions.size()) {
 
             const auto& cmpInstr = instructions[i + 1];
             if (cmpInstr.mnemonic == ZYDIS_MNEMONIC_CMP &&
+                cmpInstr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                 cmpInstr.operands[0].reg.value == instr.operands[0].reg.value &&
                 cmpInstr.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
                 cmpInstr.operands[1].imm.value.u > instr.operands[1].imm.value.u) {
@@ -3639,39 +3642,63 @@ void MetamorphicDetector::AnalyzePolymorphicTechniques(
     // Look for nested decryption loops (loop within loop with crypto ops)
 
     size_t nestedLoopDepth = 0;
-    size_t currentDepth = 0;
-    std::vector<size_t> loopStarts;
+
+    // Track active loop regions by their [targetIndex, endIndex] spans.
+    // A backward jump whose target falls inside an existing loop is nested.
+    struct LoopRegion { size_t startIdx; size_t endIdx; };
+    std::vector<LoopRegion> activeLoops;
 
     for (size_t i = 0; i < instructions.size(); ++i) {
         const auto& instr = instructions[i];
 
-        // Detect loop starts (backward jumps indicate loops)
+        bool isBackwardBranch = false;
+        int64_t branchOffset = 0;
+
         if (instr.mnemonic == ZYDIS_MNEMONIC_LOOP ||
             instr.mnemonic == ZYDIS_MNEMONIC_LOOPE ||
             instr.mnemonic == ZYDIS_MNEMONIC_LOOPNE) {
 
             if (instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
                 instr.operands[0].imm.value.s < 0) {
-                loopStarts.push_back(i);
-                ++currentDepth;
-                nestedLoopDepth = std::max(nestedLoopDepth, currentDepth);
+                isBackwardBranch = true;
+                branchOffset = instr.operands[0].imm.value.s;
             }
         }
 
-        // Track conditional backward jumps as potential loop ends
         if (instr.mnemonic >= ZYDIS_MNEMONIC_JB && instr.mnemonic <= ZYDIS_MNEMONIC_JS) {
             if (instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
                 instr.operands[0].imm.value.s < 0) {
-                ++currentDepth;
-                nestedLoopDepth = std::max(nestedLoopDepth, currentDepth);
+                isBackwardBranch = true;
+                branchOffset = instr.operands[0].imm.value.s;
             }
         }
 
-        // Reset depth on unconditional forward jumps (likely loop exit)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_JMP &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-            instr.operands[0].imm.value.s > 0) {
-            if (currentDepth > 0) --currentDepth;
+        if (isBackwardBranch) {
+            // Estimate target instruction index from byte offset.
+            // Average x86-64 instruction ~3-4 bytes; use conservative estimate.
+            size_t estimatedSpan = static_cast<size_t>(
+                std::abs(branchOffset) / 3);
+            size_t targetIdx = (estimatedSpan <= i) ? (i - estimatedSpan) : 0;
+
+            // Remove expired loops (those that ended before our target)
+            std::erase_if(activeLoops, [targetIdx](const LoopRegion& lr) {
+                return lr.endIdx < targetIdx;
+            });
+
+            // Count how many existing loops are fully contained within [targetIdx, i]
+            // Inner loops are discovered before outer loops (forward scan),
+            // so an outer loop must check if previous loops fit inside it.
+            size_t containingLoops = 0;
+            for (const auto& lr : activeLoops) {
+                if (lr.startIdx >= targetIdx && lr.endIdx <= i) {
+                    ++containingLoops;
+                }
+            }
+
+            size_t depth = containingLoops + 1;
+            nestedLoopDepth = std::max(nestedLoopDepth, depth);
+
+            activeLoops.push_back({ targetIdx, i });
         }
     }
 
@@ -3744,6 +3771,16 @@ void MetamorphicDetector::AnalyzePolymorphicTechniques(
             .Confidence(0.8)
             .Description(L"Environment-based key derivation detected")
             .TechnicalDetails(L"Uses CPUID or system info for key generation")
+            .Build();
+        AddDetection(result, std::move(detection));
+    }
+
+    if (hasSelfReferencingKey) {
+        auto detection = MetamorphicDetectionBuilder()
+            .Technique(MetamorphicTechnique::POLY_VariableKey)
+            .Confidence(0.80)
+            .Description(L"Self-referencing key derivation detected")
+            .TechnicalDetails(L"Code reads from own RIP/EIP-relative address for XOR/ADD/SUB key material")
             .Build();
         AddDetection(result, std::move(detection));
     }
@@ -4156,10 +4193,27 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
             instructions[i].operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
 
             ZydisRegister xorReg = instructions[i].operands[0].reg.value;
+            ZydisRegister xorSrc = (instructions[i].operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                                     ? instructions[i].operands[1].reg.value
+                                     : ZYDIS_REGISTER_NONE;
 
-            // Look for AND with same operands
+            // Look for AND involving the same source operands
             for (size_t j = i + 1; j < std::min(i + 5, instructions.size()); ++j) {
-                if (instructions[j].mnemonic == ZYDIS_MNEMONIC_AND) {
+                if (instructions[j].mnemonic == ZYDIS_MNEMONIC_AND &&
+                    instructions[j].operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    // Verify AND uses at least one real register operand from the XOR
+                    // MBA identity: (x ^ y) + 2*(x & y)  — AND must share operands with XOR
+                    ZydisRegister andDst = instructions[j].operands[0].reg.value;
+                    ZydisRegister andSrc = (instructions[j].operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                                             ? instructions[j].operands[1].reg.value
+                                             : ZYDIS_REGISTER_NONE;
+                    // Exclude ZYDIS_REGISTER_NONE from comparisons to prevent
+                    // false matches when both operands are immediates
+                    bool sharesOperand =
+                        (andDst == xorReg) ||
+                        (xorSrc != ZYDIS_REGISTER_NONE && (andDst == xorSrc || andSrc == xorSrc)) ||
+                        (andSrc != ZYDIS_REGISTER_NONE && andSrc == xorReg);
+                    if (!sharesOperand) break;
                     // Then look for SHL by 1 (multiply by 2)
                     for (size_t k = j + 1; k < std::min(j + 3, instructions.size()); ++k) {
                         if (instructions[k].mnemonic == ZYDIS_MNEMONIC_SHL &&
@@ -4302,11 +4356,38 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
             }
         }
 
-        // JZ $+2 / JNZ $+2 (always-taken conditional over garbage)
+        // JZ/JNZ $+2 after deterministic flag-setting (XOR reg,reg / CMP reg,reg / OR reg,reg)
+        // indicates always-taken conditional over garbage bytes.
+        // Plain JZ/JNZ $+2 is too common in compiler output to flag alone.
         if ((instr.mnemonic == ZYDIS_MNEMONIC_JZ || instr.mnemonic == ZYDIS_MNEMONIC_JNZ) &&
             instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-            std::abs(instr.operands[0].imm.value.s) <= 3) {
-            ++antiDisasmTricks;
+            std::abs(instr.operands[0].imm.value.s) <= 2 && i > 0) {
+            const auto& prev = instructions[i - 1];
+            bool deterministicFlags = false;
+            // XOR reg, reg  → ZF=1 always
+            if (prev.mnemonic == ZYDIS_MNEMONIC_XOR &&
+                prev.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                prev.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                prev.operands[0].reg.value == prev.operands[1].reg.value) {
+                deterministicFlags = true;
+            }
+            // CMP reg, reg  → ZF=1 always
+            if (prev.mnemonic == ZYDIS_MNEMONIC_CMP &&
+                prev.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                prev.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                prev.operands[0].reg.value == prev.operands[1].reg.value) {
+                deterministicFlags = true;
+            }
+            // OR reg, reg  → ZF depends on value, but often used as anti-disasm setup
+            if (prev.mnemonic == ZYDIS_MNEMONIC_OR &&
+                prev.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                prev.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                prev.operands[0].reg.value == prev.operands[1].reg.value) {
+                deterministicFlags = true;
+            }
+            if (deterministicFlags) {
+                ++antiDisasmTricks;
+            }
         }
     }
 
