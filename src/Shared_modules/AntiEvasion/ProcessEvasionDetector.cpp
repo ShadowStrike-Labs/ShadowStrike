@@ -514,8 +514,17 @@ namespace ShadowStrike::AntiEvasion {
 
     bool ProcessEvasionDetector::Impl::Initialize(ProcessEvasionError* err) noexcept {
         try {
-            if (m_initialized.exchange(true)) {
-                return true; // Already initialized
+            // Fast path — already initialized
+            if (m_initialized.load(std::memory_order_acquire)) {
+                return true;
+            }
+
+            // Serialize concurrent initialization attempts
+            std::unique_lock lock(m_mutex);
+
+            // Re-check under lock — another thread may have completed init
+            if (m_initialized.load(std::memory_order_relaxed)) {
+                return true;
             }
 
             SS_LOG_INFO(LOG_CATEGORY, L"ProcessEvasionDetector: Initializing...");
@@ -539,6 +548,8 @@ namespace ShadowStrike::AntiEvasion {
                 SS_LOG_WARN(LOG_CATEGORY, L"Signature database %ls not found, running with heuristics only", sigPath.c_str());
             }
 
+            // Mark initialized AFTER all setup completes — prevents use of half-init state
+            m_initialized.store(true, std::memory_order_release);
             SS_LOG_INFO(LOG_CATEGORY, L"ProcessEvasionDetector: Initialized successfully");
             return true;
 
@@ -552,7 +563,7 @@ namespace ShadowStrike::AntiEvasion {
                 err->context = Utils::StringUtils::ToWide(e.what());
             }
 
-            m_initialized = false;
+            // m_initialized stays false — retry is possible
             return false;
         }
         catch (...) {
@@ -563,7 +574,6 @@ namespace ShadowStrike::AntiEvasion {
                 err->message = L"Unknown initialization error";
             }
 
-            m_initialized = false;
             return false;
         }
     }
@@ -634,13 +644,11 @@ namespace ShadowStrike::AntiEvasion {
             if (!hProcess) {
                 return L"";
             }
+            HandleGuard processGuard(hProcess);
 
             wchar_t processName[MAX_PATH] = {};
             DWORD size = MAX_PATH;
             if (QueryFullProcessImageNameW(hProcess, 0, processName, &size)) {
-                CloseHandle(hProcess);
-
-                // Extract just the filename
                 std::wstring fullPath(processName);
                 const size_t lastSlash = fullPath.find_last_of(L"\\/");
                 if (lastSlash != std::wstring::npos) {
@@ -649,7 +657,6 @@ namespace ShadowStrike::AntiEvasion {
                 return fullPath;
             }
 
-            CloseHandle(hProcess);
             return L"";
         }
         catch (...) {
@@ -663,15 +670,14 @@ namespace ShadowStrike::AntiEvasion {
             if (!hProcess) {
                 return L"";
             }
+            HandleGuard processGuard(hProcess);
 
             wchar_t processPath[MAX_PATH] = {};
             DWORD size = MAX_PATH;
             if (QueryFullProcessImageNameW(hProcess, 0, processPath, &size)) {
-                CloseHandle(hProcess);
                 return std::wstring(processPath);
             }
 
-            CloseHandle(hProcess);
             return L"";
         }
         catch (...) {
@@ -685,6 +691,7 @@ namespace ShadowStrike::AntiEvasion {
             if (hSnapshot == INVALID_HANDLE_VALUE) {
                 return 0;
             }
+            HandleGuard snapshotGuard(hSnapshot);
 
             PROCESSENTRY32W pe32 = {};
             pe32.dwSize = sizeof(pe32);
@@ -692,13 +699,11 @@ namespace ShadowStrike::AntiEvasion {
             if (Process32FirstW(hSnapshot, &pe32)) {
                 do {
                     if (pe32.th32ProcessID == processId) {
-                        CloseHandle(hSnapshot);
                         return pe32.th32ParentProcessID;
                     }
                 } while (Process32NextW(hSnapshot, &pe32));
             }
 
-            CloseHandle(hSnapshot);
             return 0;
         }
         catch (...) {
@@ -957,10 +962,25 @@ namespace ShadowStrike::AntiEvasion {
             THREADENTRY32 te32 = {};
             te32.dwSize = sizeof(te32);
 
-            // Get LoadLibrary addresses for comparison
-            HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-            FARPROC pLoadLibraryA = hKernel32 ? GetProcAddress(hKernel32, "LoadLibraryA") : nullptr;
-            FARPROC pLoadLibraryW = hKernel32 ? GetProcAddress(hKernel32, "LoadLibraryW") : nullptr;
+            // Resolve LoadLibrary addresses from target process (not EDR) for cross-arch safety
+            // On Windows, same-arch system DLLs share per-boot ASLR base, but WoW64 has
+            // different kernel32.dll. Use target's module list to be robust.
+            FARPROC pLoadLibraryA = nullptr;
+            FARPROC pLoadLibraryW = nullptr;
+
+            bool targetIs64 = IsProcess64Bit(hProcess);
+#ifdef _WIN64
+            constexpr bool edrIs64 = true;
+#else
+            constexpr bool edrIs64 = false;
+#endif
+            if (targetIs64 == edrIs64) {
+                // Same architecture — kernel32 base is identical (per-boot ASLR)
+                HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+                pLoadLibraryA = hKernel32 ? GetProcAddress(hKernel32, "LoadLibraryA") : nullptr;
+                pLoadLibraryW = hKernel32 ? GetProcAddress(hKernel32, "LoadLibraryW") : nullptr;
+            }
+            // For cross-arch (WoW64), skip LoadLibrary comparison — RWX thread start still detected
 
             if (Thread32First(hSnapshot, &te32)) {
                 do {
@@ -1004,6 +1024,8 @@ namespace ShadowStrike::AntiEvasion {
                 } while (Thread32Next(hSnapshot, &te32));
             }
 
+            // Output the suspicious thread count, not total (caller assigns to injectedThreadCount)
+            threadCount = suspiciousThreads;
             return (suspiciousThreads > 0);
         }
         catch (...) {
@@ -1307,18 +1329,46 @@ namespace ShadowStrike::AntiEvasion {
             };
 
             for (const auto& [moduleName, functions] : criticalModules) {
-                HMODULE hMod = GetModuleHandleW(moduleName);
-                if (!hMod) continue;
+                HMODULE hLocalMod = GetModuleHandleW(moduleName);
+                if (!hLocalMod) continue;
+
+                // Resolve module base in TARGET process for cross-arch correctness
+                // Same-arch: ASLR bases match, but enumerate target anyway for robustness
+                HMODULE hTargetMod = nullptr;
+                {
+                    constexpr DWORD MAX_MODS = 256;
+                    HMODULE hMods[MAX_MODS] = {};
+                    DWORD cbNeeded = 0;
+                    if (EnumProcessModulesEx(hProcess, hMods, sizeof(hMods), &cbNeeded, LIST_MODULES_ALL)) {
+                        const DWORD modCount = static_cast<DWORD>(std::min<size_t>(cbNeeded / sizeof(HMODULE), MAX_MODS));
+                        for (DWORD i = 0; i < modCount; ++i) {
+                            wchar_t modName[MAX_PATH] = {};
+                            if (GetModuleBaseNameW(hProcess, hMods[i], modName, MAX_PATH)) {
+                                if (_wcsicmp(modName, moduleName) == 0) {
+                                    hTargetMod = hMods[i];
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!hTargetMod) continue;
 
                 for (const char* funcName : functions) {
-                    FARPROC proc = GetProcAddress(hMod, funcName);
-                    if (!proc) continue;
+                    FARPROC localProc = GetProcAddress(hLocalMod, funcName);
+                    if (!localProc) continue;
+
+                    // Compute function offset within module, then apply to target base
+                    const auto funcOffset = reinterpret_cast<uintptr_t>(localProc) -
+                                            reinterpret_cast<uintptr_t>(hLocalMod);
+                    void* targetFuncAddr = reinterpret_cast<void*>(
+                        reinterpret_cast<uintptr_t>(hTargetMod) + funcOffset);
 
                     // Read function prologue from target process
                     uint8_t codeBuffer[MAX_HOOK_SCAN_BYTES] = {};
                     SIZE_T bytesRead = 0;
 
-                    if (!ReadProcessMemory(hProcess, proc, codeBuffer, MAX_HOOK_SCAN_BYTES, &bytesRead)) {
+                    if (!ReadProcessMemory(hProcess, targetFuncAddr, codeBuffer, MAX_HOOK_SCAN_BYTES, &bytesRead)) {
                         continue;
                     }
 
@@ -1501,11 +1551,22 @@ namespace ShadowStrike::AntiEvasion {
 
             // For each imported DLL, check if IAT entries point to expected modules
             for (const auto& importDll : imports) {
-                HMODULE hImportDll = GetModuleHandleW(importDll.dllName.c_str());
-                if (!hImportDll) continue;
+                // Resolve the imported DLL in the TARGET process (not EDR) to handle
+                // ASLR differences and WoW64 cross-arch correctly
+                HMODULE hTargetImportDll = nullptr;
+                for (DWORD i = 0; i < moduleCount && i < MAX_MODULES; ++i) {
+                    wchar_t modBaseName[MAX_PATH] = {};
+                    if (GetModuleBaseNameW(hProcess, hModules[i], modBaseName, MAX_PATH)) {
+                        if (_wcsicmp(modBaseName, importDll.dllName.c_str()) == 0) {
+                            hTargetImportDll = hModules[i];
+                            break;
+                        }
+                    }
+                }
+                if (!hTargetImportDll) continue;
 
                 MODULEINFO modInfo = {};
-                if (!GetModuleInformation(GetCurrentProcess(), hImportDll, &modInfo, sizeof(modInfo))) {
+                if (!GetModuleInformation(hProcess, hTargetImportDll, &modInfo, sizeof(modInfo))) {
                     continue;
                 }
 
@@ -1570,11 +1631,27 @@ namespace ShadowStrike::AntiEvasion {
                 return false;
             }
 
-            // Get module base in target process
-            HMODULE hModules[1] = {};
+            // Get module base in target process — must match modulePath, not just hModules[0]
+            constexpr DWORD MAX_ENUM_MODS = 256;
+            HMODULE hModules[MAX_ENUM_MODS] = {};
             DWORD cbNeeded = 0;
 
-            if (!EnumProcessModules(hProcess, hModules, sizeof(hModules), &cbNeeded) || cbNeeded == 0) {
+            if (!EnumProcessModulesEx(hProcess, hModules, sizeof(hModules), &cbNeeded, LIST_MODULES_ALL) || cbNeeded == 0) {
+                return false;
+            }
+
+            HMODULE hTargetModule = nullptr;
+            const DWORD moduleCount = static_cast<DWORD>(std::min<size_t>(cbNeeded / sizeof(HMODULE), MAX_ENUM_MODS));
+            for (DWORD i = 0; i < moduleCount; ++i) {
+                wchar_t modPath[MAX_PATH] = {};
+                if (GetModuleFileNameExW(hProcess, hModules[i], modPath, MAX_PATH)) {
+                    if (_wcsicmp(modPath, modulePath.c_str()) == 0) {
+                        hTargetModule = hModules[i];
+                        break;
+                    }
+                }
+            }
+            if (!hTargetModule) {
                 return false;
             }
 
@@ -1587,7 +1664,7 @@ namespace ShadowStrike::AntiEvasion {
                 SIZE_T bytesRead = 0;
 
                 void* sectionAddress = reinterpret_cast<void*>(
-                    reinterpret_cast<uintptr_t>(hModules[0]) + section.virtualAddress);
+                    reinterpret_cast<uintptr_t>(hTargetModule) + section.virtualAddress);
 
                 if (!ReadProcessMemory(hProcess, sectionAddress, codeBuffer.data(), scanSize, &bytesRead)) {
                     continue;
@@ -1912,7 +1989,7 @@ namespace ShadowStrike::AntiEvasion {
             trustData.pPolicyCallbackData = NULL;
             trustData.pSIPClientData = NULL;
             trustData.dwUIChoice = WTD_UI_NONE;
-            trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+            trustData.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
             trustData.dwUnionChoice = WTD_CHOICE_FILE;
             trustData.dwStateAction = WTD_STATEACTION_VERIFY;
             trustData.hWVTStateData = NULL;
@@ -2138,8 +2215,14 @@ namespace ShadowStrike::AntiEvasion {
                 return false;
             }
 
+            // Guard against malformed SID with zero sub-authority count
+            PUCHAR pSubAuthCount = GetSidSubAuthorityCount(tml->Label.Sid);
+            if (!pSubAuthCount || *pSubAuthCount == 0) {
+                return false;
+            }
+
             DWORD integrityLevelValue = *GetSidSubAuthority(tml->Label.Sid,
-                (DWORD)(UCHAR)(*GetSidSubAuthorityCount(tml->Label.Sid) - 1));
+                static_cast<DWORD>(*pSubAuthCount - 1));
 
             if (integrityLevelValue >= SECURITY_MANDATORY_SYSTEM_RID) {
                 integrityLevel = L"System";
@@ -3126,7 +3209,7 @@ namespace ShadowStrike::AntiEvasion {
                     AddDetection(result, std::move(detection));
                 }
                 else if (tech.find(L"TLS callbacks") != std::wstring::npos) {
-                    DetectedTechnique detection(ProcessEvasionTechnique::ANTI_SEHAntiDebug);
+                    DetectedTechnique detection(ProcessEvasionTechnique::ANTI_TLSCallbackAntiDebug);
                     detection.severity = ProcessEvasionSeverity::Medium;
                     detection.confidence = 0.7;
                     detection.description = L"TLS callbacks detected (potential anti-debug)";
@@ -3152,6 +3235,7 @@ namespace ShadowStrike::AntiEvasion {
                 case ProcessEvasionSeverity::Medium: severityWeight = 25.0f; break;
                 case ProcessEvasionSeverity::High: severityWeight = 50.0f; break;
                 case ProcessEvasionSeverity::Critical: severityWeight = 75.0f; break;
+                default: severityWeight = 15.0f; break;
                 }
 
                 score += (severityWeight * static_cast<float>(detection.confidence));

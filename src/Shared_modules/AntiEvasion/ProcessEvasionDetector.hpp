@@ -246,6 +246,7 @@ namespace ShadowStrike::AntiEvasion {
         ANTI_ParentProcessDebugger = 158,
         ANTI_SEHAntiDebug = 159,
         ANTI_OutputDebugString = 160,
+        ANTI_TLSCallbackAntiDebug = 161,
 
         // Privilege Escalation (201-250)
         PRIV_SeDebugPrivilege = 201,

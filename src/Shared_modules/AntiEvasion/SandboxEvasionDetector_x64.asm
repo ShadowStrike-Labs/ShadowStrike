@@ -235,7 +235,7 @@ MeasureRDTSCOverhead ENDP
 ;; =============================================================================
 MeasureCPUIDOverhead PROC
     push    rbx
-    push    rcx
+    push    r12
     push    rsi
     push    rdi
     
@@ -249,7 +249,8 @@ MeasureCPUIDOverhead PROC
     mov     edi, edx
     
     ;; Execute 100 CPUID instructions
-    mov     ecx, 100
+    ;; Use r12d as loop counter — CPUID clobbers ECX on every call
+    mov     r12d, 100
 @CPUIDLoop:
     xor     eax, eax
     cpuid
@@ -271,7 +272,7 @@ MeasureCPUIDOverhead PROC
     cpuid
     xor     eax, eax
     cpuid
-    dec     ecx
+    dec     r12d
     jnz     @CPUIDLoop
     
     ;; Get end time
@@ -291,7 +292,7 @@ MeasureCPUIDOverhead PROC
     
     pop     rdi
     pop     rsi
-    pop     rcx
+    pop     r12
     pop     rbx
     ret
 MeasureCPUIDOverhead ENDP
@@ -314,6 +315,7 @@ MeasureSleepAcceleration PROC
     push    r12
     push    r13
     sub     rsp, 48         ; Shadow space (32) + alignment (16) to maintain 16-byte RSP
+    .ENDPROLOG
     
     ;; Save sleep duration
     mov     r12d, ecx
@@ -361,6 +363,7 @@ MeasureSleepAcceleration PROC
     mov     rcx, r12
     sub     rcx, rax        ; deviation = requested - actual
     imul    rcx, 100
+    mov     rax, rcx        ; dividend = deviation * 100
     xor     edx, edx
     mov     rbx, r12
     div     rbx             ; deviation percentage
@@ -640,6 +643,7 @@ CalibrateTimingBaseline PROC
     push    rcx
     push    rsi
     push    rdi
+    push    r12
     
     ;; Check if already calibrated
     cmp     DWORD PTR [g_calibrationDone], 1
@@ -686,7 +690,7 @@ CalibrateTimingBaseline PROC
     
     rdtsc
     mov     edi, eax
-    mov     ebx, edx
+    mov     r12d, edx       ; Use r12 — CPUID clobbers EBX
     
     xor     eax, eax
     cpuid
@@ -694,8 +698,8 @@ CalibrateTimingBaseline PROC
     rdtsc
     shl     rdx, 32
     or      rax, rdx
-    shl     rbx, 32
-    or      rdi, rbx
+    shl     r12, 32
+    or      rdi, r12
     sub     rax, rdi
     add     rsi, rax
     
@@ -714,6 +718,7 @@ CalibrateTimingBaseline PROC
     mov     DWORD PTR [g_calibrationDone], 1
     
 @AlreadyCalibrated:
+    pop     r12
     pop     rdi
     pop     rsi
     pop     rcx
