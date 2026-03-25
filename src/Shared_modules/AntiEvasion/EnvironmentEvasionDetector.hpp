@@ -997,6 +997,9 @@ namespace ShadowStrike {
             /// @brief Anti-forensics detected
             ADVANCED_AntiForensics = 346,
 
+            /// @brief API hook detection / ntdll unhooking behavior
+            ADVANCED_APIHookDetection = 347,
+
             /// @brief Maximum technique ID (for bounds checking)
             _MaxTechniqueId = 360
         };
@@ -3017,6 +3020,31 @@ namespace ShadowStrike {
                 uint32_t processId,
                 const EnvironmentKernelContext& ctx,
                 EnvironmentEvasionResult& result
+            ) noexcept;
+
+            /**
+             * @brief Behavioral TYPE B: Scan target PE for embedded environment-probing strings
+             *
+             * Reads the target's .rdata/.data sections for VM registry key paths,
+             * sandbox process names, VM MAC prefixes, and analysis tool identifiers.
+             * Presence of these strings indicates the process plans to fingerprint
+             * the environment at runtime.
+             */
+            void DetectEnvironmentProbingStrings(
+                uint32_t processId,
+                std::vector<EnvironmentDetectedTechnique>& outDetections
+            ) noexcept;
+
+            /**
+             * @brief Behavioral TYPE B: Detect target scanning for API hooks
+             *
+             * Scans target's imports and code for hook-detection patterns:
+             * reading ntdll function prologues to detect JMP/detour hooks,
+             * comparing syscall stubs against expected bytes.
+             */
+            void DetectAPIHookCheckBehavior(
+                uint32_t processId,
+                std::vector<EnvironmentDetectedTechnique>& outDetections
             ) noexcept;
 
             void AddDetection(

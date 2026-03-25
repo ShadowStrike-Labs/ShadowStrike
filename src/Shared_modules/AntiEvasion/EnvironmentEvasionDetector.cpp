@@ -1069,6 +1069,9 @@ namespace ShadowStrike::AntiEvasion {
         case EnvironmentEvasionTechnique::ADVANCED_AntiForensics:
             return L"Anti-Forensics Detected";
 
+        case EnvironmentEvasionTechnique::ADVANCED_APIHookDetection:
+            return L"API Hook Detection/Unhooking Behavior";
+
         default:
             return L"Unknown Technique";
         }
@@ -2174,61 +2177,34 @@ namespace ShadowStrike::AntiEvasion {
             m_impl->CollectProcessEnvironmentInfo(processId, result.processEnvInfo);
         }
 
-        // Run detection checks based on flags
+        // Run detection checks — ONLY behavioral TYPE B checks that analyze the TARGET process.
+        // System-wide environment checks (CheckBlacklistedNames, CheckHardwareFingerprint,
+        // CheckFileSystemArtifacts, CheckRegistryArtifacts, CheckNetworkConfiguration,
+        // CheckRunningProcesses, CheckTimingIndicators, CheckUserActivity, CheckDisplayConfiguration,
+        // CheckBrowserArtifacts, CheckPeripheralHistory) are intentionally EXCLUDED here.
+        // They belong in AnalyzeSystemInternal (explicit system-wide scan) only.
+        // Adding system-wide state to per-process scores causes false positives on all
+        // Azure/Hyper-V/cloud VMs where every process would be flagged as evasive.
         std::vector<EnvironmentDetectedTechnique> detections;
 
-        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanNameChecks)) {
-            CheckBlacklistedNames(detections, nullptr);
-        }
-
-        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanHardwareFingerprint)) {
-            CheckHardwareFingerprint(result.hardwareInfo, detections, nullptr);
-        }
-
-        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanFileSystemArtifacts)) {
-            CheckFileSystemArtifacts(detections, nullptr);
-        }
-
-        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanRegistryArtifacts)) {
-            CheckRegistryArtifacts(detections, nullptr);
-        }
-
-        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanNetworkConfig)) {
-            CheckNetworkConfiguration(result.networkInfo, detections, nullptr);
-        }
-
-        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanProcessEnumeration)) {
-            CheckRunningProcesses(detections, nullptr);
-        }
-
-        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanTimingChecks)) {
-            CheckTimingIndicators(detections, nullptr);
-        }
-
-        // Previously missing detection calls — these were collected but never analyzed
-        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanUserActivity)) {
-            CheckUserActivity(result.activityInfo, detections, nullptr);
-        }
-
+        // === TYPE B: Target process environment variable analysis ===
         if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanEnvironmentVars)) {
             CheckEnvironmentVariables(processId, result.processEnvInfo, detections, nullptr);
         }
 
-        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanDisplayConfig)) {
-            CheckDisplayConfiguration(detections, nullptr);
-        }
-
-        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanBrowserArtifacts)) {
-            CheckBrowserArtifacts(detections, nullptr);
-        }
-
-        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanPeripheralHistory)) {
-            CheckPeripheralHistory(detections, nullptr);
-        }
-
+        // === TYPE B: Target executable filename pattern analysis ===
         if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanFileNamingPatterns)) {
             CheckFileNaming(processId, result.fileNamingInfo, detections, nullptr);
         }
+
+        // === TYPE B: Target PE import/section/entropy analysis ===
+        AnalyzeProcessPeForEvasion(processId, detections, nullptr);
+
+        // === TYPE B: Target PE embedded environment-probing string scan ===
+        DetectEnvironmentProbingStrings(processId, detections);
+
+        // === TYPE B: Target hook-detection behavioral analysis ===
+        DetectAPIHookCheckBehavior(processId, detections);
 
         // Add all detections to result
         for (auto& detection : detections) {
@@ -5599,6 +5575,365 @@ namespace ShadowStrike::AntiEvasion {
                 err->message = L"Unknown error in API hook detection";
             }
             return false;
+        }
+    }
+
+    // ========================================================================
+    // TYPE B: DETECT EMBEDDED ENVIRONMENT-PROBING STRINGS IN TARGET PE
+    // Scans .rdata/.data sections for VM registry paths, sandbox process
+    // names, VM MAC prefixes, and analysis tool identifiers. Presence
+    // indicates the process fingerprints the environment at runtime.
+    // ========================================================================
+
+    void EnvironmentEvasionDetector::DetectEnvironmentProbingStrings(
+        uint32_t processId,
+        std::vector<EnvironmentDetectedTechnique>& outDetections
+    ) noexcept {
+        try {
+            ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId));
+            if (!hProcess.valid()) return;
+
+            wchar_t exePath[MAX_PATH] = {};
+            DWORD pathSize = MAX_PATH;
+            if (!QueryFullProcessImageNameW(hProcess.get(), 0, exePath, &pathSize)) return;
+
+            PEParser::PEParser parser;
+            PEParser::PEError parseErr;
+            PEParser::PEInfo pe_info;
+            if (!parser.ParseFile(exePath, pe_info, &parseErr) || !pe_info.valid) return;
+
+            const auto* reader = parser.GetReader();
+            if (!reader || !reader->IsValid()) return;
+
+            // Probing string categories with associated technique
+            struct ProbingPattern {
+                const char* needle;
+                size_t len;
+                EnvironmentEvasionTechnique technique;
+                const wchar_t* category;
+            };
+
+            // VM registry key substrings (ASCII, case-insensitive search)
+            static const ProbingPattern kPatterns[] = {
+                // VM product registry keys
+                {"SOFTWARE\\VMware",       16, EnvironmentEvasionTechnique::REGISTRY_VMwareKeys,       L"VMRegistryKey"},
+                {"SOFTWARE\\Oracle\\VirtualBox", 27, EnvironmentEvasionTechnique::REGISTRY_VirtualBoxKeys,   L"VMRegistryKey"},
+                {"SYSTEM\\CurrentControlSet\\Services\\VBox", 42, EnvironmentEvasionTechnique::REGISTRY_VirtualBoxKeys, L"VMRegistryKey"},
+                {"SOFTWARE\\Microsoft\\Virtual Machine", 36, EnvironmentEvasionTechnique::REGISTRY_HyperVKeys, L"VMRegistryKey"},
+                {"HARDWARE\\ACPI\\DSDT\\VBOX", 22, EnvironmentEvasionTechnique::REGISTRY_VirtualBoxKeys,    L"VMRegistryKey"},
+                {"SYSTEM\\CurrentControlSet\\Enum\\IDE\\QEMU", 40, EnvironmentEvasionTechnique::REGISTRY_QEMUKeys, L"VMRegistryKey"},
+
+                // VM hardware identifiers
+                {"VMwareVMware",           12, EnvironmentEvasionTechnique::HARDWARE_VMManufacturer, L"VMHardwareId"},
+                {"VBoxHardDisk",           12, EnvironmentEvasionTechnique::HARDWARE_VMDiskVendor,   L"VMHardwareId"},
+                {"VBOX HARDDISK",          13, EnvironmentEvasionTechnique::HARDWARE_VMDiskVendor,   L"VMHardwareId"},
+                {"Virtual HD",             10, EnvironmentEvasionTechnique::HARDWARE_VMDiskVendor, L"VMHardwareId"},
+                {"QEMU HARDDISK",          13, EnvironmentEvasionTechnique::HARDWARE_VMDiskVendor,   L"VMHardwareId"},
+                {"Red Hat VirtIO",         14, EnvironmentEvasionTechnique::HARDWARE_VMDiskVendor,   L"VMHardwareId"},
+
+                // Sandbox process names
+                {"wireshark.exe",          13, EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning, L"SandboxProcess"},
+                {"procmon.exe",            11, EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning, L"SandboxProcess"},
+                {"procexp.exe",            11, EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning, L"SandboxProcess"},
+                {"ollydbg.exe",            11, EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning, L"SandboxProcess"},
+                {"x64dbg.exe",             10, EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning, L"SandboxProcess"},
+                {"ida.exe",                 7, EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning, L"SandboxProcess"},
+                {"idaq64.exe",             10, EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning, L"SandboxProcess"},
+                {"fiddler.exe",            11, EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning, L"SandboxProcess"},
+                {"pestudio.exe",           12, EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning, L"SandboxProcess"},
+                {"dumpcap.exe",            11, EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning, L"SandboxProcess"},
+                {"regmon.exe",             10, EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning, L"SandboxProcess"},
+
+                // Sandbox usernames
+                {"sandbox",                 7, EnvironmentEvasionTechnique::NAME_BlacklistedUsername,       L"SandboxName"},
+                {"cuckoo",                  6, EnvironmentEvasionTechnique::NAME_BlacklistedUsername,       L"SandboxName"},
+                {"maltest",                 7, EnvironmentEvasionTechnique::NAME_BlacklistedUsername,       L"SandboxName"},
+                {"malware",                 7, EnvironmentEvasionTechnique::NAME_BlacklistedUsername,       L"SandboxName"},
+                {"virus",                   5, EnvironmentEvasionTechnique::NAME_BlacklistedUsername,       L"SandboxName"},
+
+                // VM file paths
+                {"vmtoolsd.exe",           12, EnvironmentEvasionTechnique::FILESYSTEM_VMToolsDirectory,  L"VMFilePath"},
+                {"VBoxService.exe",        15, EnvironmentEvasionTechnique::FILESYSTEM_VMToolsDirectory, L"VMFilePath"},
+                {"VBoxTray.exe",           12, EnvironmentEvasionTechnique::FILESYSTEM_VMToolsDirectory, L"VMFilePath"},
+                {"vmwaretray.exe",         14, EnvironmentEvasionTechnique::FILESYSTEM_VMToolsDirectory,  L"VMFilePath"},
+
+                // VM MAC address OUI prefixes (as ASCII hex)
+                {"00:0C:29",                8, EnvironmentEvasionTechnique::NETWORK_VMMACPrefix,         L"VMacPrefix"},
+                {"00:50:56",                8, EnvironmentEvasionTechnique::NETWORK_VMMACPrefix,         L"VMacPrefix"},
+                {"08:00:27",                8, EnvironmentEvasionTechnique::NETWORK_VMMACPrefix,           L"VMacPrefix"},
+                {"00:1C:42",                8, EnvironmentEvasionTechnique::NETWORK_VMMACPrefix,      L"VMacPrefix"},
+                {"00:15:5D",                8, EnvironmentEvasionTechnique::NETWORK_VMMACPrefix,         L"VMacPrefix"},
+                {"52:54:00",                8, EnvironmentEvasionTechnique::NETWORK_VMMACPrefix,           L"VMacPrefix"},
+            };
+
+            constexpr size_t kPatternCount = sizeof(kPatterns) / sizeof(kPatterns[0]);
+
+            // Category hit counters — we report per-category clusters, not individual matches
+            struct CategoryHits {
+                const wchar_t* name = nullptr;
+                EnvironmentEvasionTechnique technique{};
+                uint32_t count = 0;
+                std::wstring firstMatch;
+            };
+            std::unordered_map<std::wstring_view, CategoryHits> categoryMap;
+
+            // Scan data sections (.rdata, .data, .rsrc) for embedded strings
+            for (size_t si = 0; si < pe_info.sections.size(); ++si) {
+                const auto& sec = pe_info.sections[si];
+
+                // Only scan data sections, not code
+                if (sec.hasCode && !sec.hasInitializedData) continue;
+                if (sec.rawSize == 0 || sec.rawSize > 10 * 1024 * 1024) continue; // Cap at 10MB
+
+                if (!reader->ValidateRange(sec.rawAddress, sec.rawSize)) continue;
+
+                const uint8_t* sectionData = reader->Data() + sec.rawAddress;
+                const size_t sectionLen = sec.rawSize;
+
+                for (size_t pi = 0; pi < kPatternCount; ++pi) {
+                    const auto& pat = kPatterns[pi];
+
+                    // Boyer-Moore-Horspool style search through section bytes
+                    if (pat.len > sectionLen) continue;
+                    for (size_t offset = 0; offset <= sectionLen - pat.len; ++offset) {
+                        bool match = true;
+                        for (size_t ci = 0; ci < pat.len; ++ci) {
+                            uint8_t b = sectionData[offset + ci];
+                            uint8_t p = static_cast<uint8_t>(pat.needle[ci]);
+                            // Case-insensitive ASCII compare
+                            if (b != p) {
+                                uint8_t bLow = (b >= 'A' && b <= 'Z') ? (b + 32) : b;
+                                uint8_t pLow = (p >= 'A' && p <= 'Z') ? (p + 32) : p;
+                                if (bLow != pLow) {
+                                    match = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (match) {
+                            auto& cat = categoryMap[pat.category];
+                            cat.name = pat.category;
+                            cat.technique = pat.technique;
+                            cat.count++;
+                            if (cat.firstMatch.empty()) {
+                                cat.firstMatch = Utils::StringUtils::ToWide(std::string(pat.needle, pat.len));
+                            }
+                            break; // One match per pattern per section suffices
+                        }
+                    }
+                }
+            }
+
+            // Emit detections for categories with significant cluster counts
+            constexpr uint32_t kVMRegKeyThreshold = 2;       // 2+ VM registry keys = suspicious
+            constexpr uint32_t kSandboxProcessThreshold = 3;  // 3+ sandbox process names = suspicious
+            constexpr uint32_t kGenericThreshold = 2;          // 2+ generic matches
+
+            for (const auto& [catName, cat] : categoryMap) {
+                uint32_t threshold = kGenericThreshold;
+                if (catName == L"VMRegistryKey") threshold = kVMRegKeyThreshold;
+                else if (catName == L"SandboxProcess") threshold = kSandboxProcessThreshold;
+
+                if (cat.count >= threshold) {
+                    EnvironmentDetectedTechnique det(cat.technique);
+                    det.confidence = std::min(0.50 + (cat.count * 0.10), 0.95);
+                    det.detectedValue = std::to_wstring(cat.count) + L" " +
+                        std::wstring(catName) + L" strings embedded in PE";
+                    det.description = L"Target PE contains embedded environment-probing strings";
+                    det.technicalDetails = L"First match: " + cat.firstMatch;
+                    det.source = L"PE Data Section String Scan";
+                    det.severity = EnvironmentEvasionSeverity::High;
+                    outDetections.push_back(std::move(det));
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector",
+                L"DetectEnvironmentProbingStrings failed for PID %u: %hs", processId, e.what());
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector",
+                L"DetectEnvironmentProbingStrings unknown error for PID %u", processId);
+        }
+    }
+
+    // ========================================================================
+    // TYPE B: DETECT API HOOK CHECKING BEHAVIOR IN TARGET PROCESS
+    // Detects malware that scans for API hooks (EDR evasion technique T1562.001)
+    // by looking for import clusters: ReadProcessMemory+ntdll resolution,
+    // MapViewOfFile (fresh ntdll copy), VirtualProtect (ntdll unhooking).
+    // ========================================================================
+
+    void EnvironmentEvasionDetector::DetectAPIHookCheckBehavior(
+        uint32_t processId,
+        std::vector<EnvironmentDetectedTechnique>& outDetections
+    ) noexcept {
+        try {
+            ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId));
+            if (!hProcess.valid()) return;
+
+            wchar_t exePath[MAX_PATH] = {};
+            DWORD pathSize = MAX_PATH;
+            if (!QueryFullProcessImageNameW(hProcess.get(), 0, exePath, &pathSize)) return;
+
+            PEParser::PEParser parser;
+            PEParser::PEError parseErr;
+            PEParser::PEInfo pe_info;
+            if (!parser.ParseFile(exePath, pe_info, &parseErr) || !pe_info.valid) return;
+
+            std::vector<PEParser::ImportInfo> imports;
+            if (!parser.ParseImports(imports, &parseErr)) return;
+
+            // Track hook-check behavioral indicators
+            bool hasReadProcessMemory = false;
+            bool hasGetModuleHandle = false;
+            bool hasGetProcAddress = false;
+            bool hasVirtualProtect = false;
+            bool hasNtProtectVirtualMemory = false;
+            bool hasMapViewOfFile = false;
+            bool hasCreateFileMapping = false;
+            bool hasNtMapViewOfSection = false;
+            bool hasWriteProcessMemory = false;
+            bool hasVirtualAllocEx = false;
+
+            for (const auto& imp : imports) {
+                for (const auto& func : imp.functions) {
+                    if (func.byOrdinal) continue;
+                    const auto& n = func.name;
+
+                    if (n == "ReadProcessMemory")       hasReadProcessMemory = true;
+                    else if (n == "GetModuleHandleA" || n == "GetModuleHandleW")
+                        hasGetModuleHandle = true;
+                    else if (n == "GetProcAddress")     hasGetProcAddress = true;
+                    else if (n == "VirtualProtect" || n == "VirtualProtectEx")
+                        hasVirtualProtect = true;
+                    else if (n == "NtProtectVirtualMemory" || n == "ZwProtectVirtualMemory")
+                        hasNtProtectVirtualMemory = true;
+                    else if (n == "MapViewOfFile" || n == "MapViewOfFileEx")
+                        hasMapViewOfFile = true;
+                    else if (n == "CreateFileMappingA" || n == "CreateFileMappingW")
+                        hasCreateFileMapping = true;
+                    else if (n == "NtMapViewOfSection")
+                        hasNtMapViewOfSection = true;
+                    else if (n == "WriteProcessMemory")
+                        hasWriteProcessMemory = true;
+                    else if (n == "VirtualAllocEx")
+                        hasVirtualAllocEx = true;
+                }
+            }
+
+            // Pattern 1: Classic hook detection (read ntdll prologues)
+            // ReadProcessMemory + GetModuleHandle + GetProcAddress
+            if (hasReadProcessMemory && hasGetModuleHandle && hasGetProcAddress) {
+                EnvironmentDetectedTechnique det(EnvironmentEvasionTechnique::ADVANCED_APIHookDetection);
+                det.confidence = 0.65;
+                det.detectedValue = L"ReadProcessMemory + GetModuleHandle + GetProcAddress";
+                det.description = L"Import cluster suggests API hook detection capability";
+                det.source = L"API Hook Check Behavioral Analysis";
+                det.severity = EnvironmentEvasionSeverity::High;
+                outDetections.push_back(std::move(det));
+            }
+
+            // Pattern 2: ntdll unhooking via fresh copy (MapViewOfFile-based)
+            // CreateFileMapping + MapViewOfFile → loads clean ntdll from disk
+            // Then VirtualProtect to overwrite hooked .text section
+            if ((hasMapViewOfFile || hasNtMapViewOfSection) &&
+                (hasCreateFileMapping || hasNtMapViewOfSection) &&
+                (hasVirtualProtect || hasNtProtectVirtualMemory)) {
+                EnvironmentDetectedTechnique det(EnvironmentEvasionTechnique::ADVANCED_APIHookDetection);
+                det.confidence = 0.75;
+                det.detectedValue = L"MapViewOfFile + VirtualProtect (ntdll unhooking pattern)";
+                det.description = L"Import cluster consistent with EDR hook removal technique";
+                det.source = L"API Hook Check Behavioral Analysis";
+                det.severity = EnvironmentEvasionSeverity::Critical;
+                outDetections.push_back(std::move(det));
+            }
+
+            // Pattern 3: Direct syscall preparation
+            // VirtualAllocEx + WriteProcessMemory + VirtualProtect = code injection
+            // Combined with ntdll resolution = direct syscall stub building
+            if (hasVirtualAllocEx && hasWriteProcessMemory &&
+                (hasVirtualProtect || hasNtProtectVirtualMemory) &&
+                hasGetProcAddress) {
+                EnvironmentDetectedTechnique det(EnvironmentEvasionTechnique::ADVANCED_SophisticatedFingerprinting);
+                det.confidence = 0.70;
+                det.detectedValue = L"VirtualAllocEx + WriteProcessMemory + VirtualProtect + GetProcAddress";
+                det.description = L"Import cluster suggests direct syscall or code injection capability";
+                det.source = L"API Hook Check Behavioral Analysis";
+                det.severity = EnvironmentEvasionSeverity::Critical;
+                outDetections.push_back(std::move(det));
+            }
+
+            // Also scan PE data sections for ntdll-related strings
+            const auto* reader = parser.GetReader();
+            if (reader && reader->IsValid()) {
+                bool foundNtdllRef = false;
+                bool foundSyscallRef = false;
+
+                for (const auto& sec : pe_info.sections) {
+                    if (sec.hasCode && !sec.hasInitializedData) continue;
+                    if (sec.rawSize == 0 || sec.rawSize > 10 * 1024 * 1024) continue;
+                    if (!reader->ValidateRange(sec.rawAddress, sec.rawSize)) continue;
+
+                    const uint8_t* data = reader->Data() + sec.rawAddress;
+                    size_t len = sec.rawSize;
+
+                    // Search for "ntdll.dll" (indicates direct ntdll resolution)
+                    static const char kNtdll[] = "ntdll.dll";
+                    constexpr size_t kNtdllLen = sizeof(kNtdll) - 1;
+                    if (len >= kNtdllLen) {
+                        for (size_t i = 0; i <= len - kNtdllLen; ++i) {
+                            bool match = true;
+                            for (size_t j = 0; j < kNtdllLen; ++j) {
+                                uint8_t b = data[i + j];
+                                uint8_t p = static_cast<uint8_t>(kNtdll[j]);
+                                uint8_t bLow = (b >= 'A' && b <= 'Z') ? (b + 32) : b;
+                                uint8_t pLow = (p >= 'A' && p <= 'Z') ? (p + 32) : p;
+                                if (bLow != pLow) { match = false; break; }
+                            }
+                            if (match) { foundNtdllRef = true; break; }
+                        }
+                    }
+
+                    // Search for syscall-related strings
+                    static const char* kSyscallPatterns[] = {
+                        "NtCreateThread",    "NtAllocateVirtualMemory",
+                        "NtWriteVirtualMemory", "NtProtectVirtualMemory",
+                        "NtQueueApcThread",  "NtCreateSection",
+                        "NtMapViewOfSection", "NtUnmapViewOfSection"
+                    };
+                    for (const char* pat : kSyscallPatterns) {
+                        size_t patLen = strlen(pat);
+                        if (patLen > len) continue;
+                        for (size_t i = 0; i <= len - patLen; ++i) {
+                            if (memcmp(data + i, pat, patLen) == 0) {
+                                foundSyscallRef = true;
+                                break;
+                            }
+                        }
+                        if (foundSyscallRef) break;
+                    }
+                }
+
+                // ntdll.dll string + syscall Nt* function names = direct syscall pattern
+                if (foundNtdllRef && foundSyscallRef) {
+                    EnvironmentDetectedTechnique det(EnvironmentEvasionTechnique::ADVANCED_APIHookDetection);
+                    det.confidence = 0.80;
+                    det.detectedValue = L"Embedded ntdll.dll + Nt* syscall function names";
+                    det.description = L"Target PE embeds direct syscall resolution strings (EDR bypass technique)";
+                    det.source = L"PE String Pattern Analysis";
+                    det.severity = EnvironmentEvasionSeverity::Critical;
+                    outDetections.push_back(std::move(det));
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector",
+                L"DetectAPIHookCheckBehavior failed for PID %u: %hs", processId, e.what());
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector",
+                L"DetectAPIHookCheckBehavior unknown error for PID %u", processId);
         }
     }
 
