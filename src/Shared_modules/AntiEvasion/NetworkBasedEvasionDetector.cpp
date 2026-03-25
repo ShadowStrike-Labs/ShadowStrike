@@ -128,6 +128,7 @@
 #include "../Utils/ProcessUtils.hpp"
 #include "../ThreatIntel/ThreatIntelStore.hpp"
 #include "../ThreatIntel/ThreatIntelFormat.hpp"
+#include "../PEParser/PEParser.hpp"
 
 namespace ShadowStrike::AntiEvasion {
 
@@ -681,8 +682,12 @@ namespace ShadowStrike::AntiEvasion {
 
     bool NetworkBasedEvasionDetector::Impl::Initialize(NetworkEvasionError* err) noexcept {
         try {
-            if (m_initialized.exchange(true)) {
-                return true; // Already initialized
+            // Atomically check if already initialized — avoid race where
+            // thread A sets true, WSAStartup fails, sets false, but thread B
+            // saw true and returned success prematurely.
+            bool expected = false;
+            if (!m_initialized.compare_exchange_strong(expected, false)) {
+                return true; // Already initialized (expected was true)
             }
 
             SS_LOG_INFO(LOG_CATEGORY, L"NetworkBasedEvasionDetector: Initializing...");
@@ -698,11 +703,11 @@ namespace ShadowStrike::AntiEvasion {
                     err->message = L"WSAStartup failed";
                 }
 
-                m_initialized = false;
                 return false;
             }
 
-            // Bigram frequencies already initialized in Impl constructor
+            // Set initialized ONLY after all initialization succeeds
+            m_initialized.store(true, std::memory_order_release);
 
             SS_LOG_INFO(LOG_CATEGORY, L"NetworkBasedEvasionDetector: Initialized successfully");
             return true;
@@ -717,7 +722,7 @@ namespace ShadowStrike::AntiEvasion {
                 err->context = Utils::StringUtils::ToWide(e.what());
             }
 
-            m_initialized = false;
+            m_initialized.store(false, std::memory_order_release);
             return false;
         }
         catch (...) {
@@ -728,7 +733,7 @@ namespace ShadowStrike::AntiEvasion {
                 err->message = L"Unknown initialization error";
             }
 
-            m_initialized = false;
+            m_initialized.store(false, std::memory_order_release);
             return false;
         }
     }
@@ -901,6 +906,14 @@ namespace ShadowStrike::AntiEvasion {
 
             for (wchar_t c : domainPart) {
                 c = std::towlower(c);
+
+                // Non-alpha chars (dots, hyphens, digits) break consonant runs
+                if (c == L'.' || c == L'-' || std::iswdigit(c)) {
+                    maxConsecutiveConsonants = std::max(maxConsecutiveConsonants, consecutiveConsonants);
+                    consecutiveConsonants = 0;
+                    continue;
+                }
+
                 if (c == L'a' || c == L'e' || c == L'i' || c == L'o' || c == L'u') {
                     vowels++;
                     maxConsecutiveConsonants = std::max(maxConsecutiveConsonants, consecutiveConsonants);
@@ -1000,6 +1013,9 @@ namespace ShadowStrike::AntiEvasion {
 
             for (wchar_t c : domainPart) {
                 if (c == L'.') {
+                    // Update max and reset counters at label boundaries
+                    maxConsecutiveDigits = std::max(maxConsecutiveDigits, consecutiveDigits);
+                    consecutiveDigits = 0;
                     prevWasDigit = false;
                     continue;
                 }
@@ -1502,7 +1518,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Bonus for reasonable beacon interval (common C2 intervals)
             // Common intervals: 1s, 5s, 10s, 30s, 60s, 300s, 600s, 900s, 1800s, 3600s
-            const std::vector<double> commonIntervals = { 1, 5, 10, 30, 60, 120, 300, 600, 900, 1800, 3600 };
+            static constexpr double commonIntervals[] = { 1, 5, 10, 30, 60, 120, 300, 600, 900, 1800, 3600 };
 
             bool nearCommonInterval = false;
             for (double common : commonIntervals) {
@@ -3767,26 +3783,31 @@ namespace ShadowStrike::AntiEvasion {
         NetworkEvasionResult& result
     ) noexcept {
         try {
-            // Analyze network configuration
-            if (HasFlag(config.flags, NetworkAnalysisFlags::ScanNetworkConfig)) {
-                CheckNetworkConfiguration(result);
-            }
+            // ====================================================================
+            // TYPE A calls REMOVED from per-process path:
+            // - CheckNetworkConfiguration(result) — checks EDR's own proxy/VPN/MAC/Tor
+            // - CheckConnectivity(result) — checks EDR's own internet state
+            // - DetectNetworkCaptureTools() — enumerates all system processes
+            // - DetectSandboxNetwork() — checks system network characteristics
+            //
+            // These system-wide checks belong in the public utility APIs
+            // (CheckInternetConnectivity, DetectProxy, DetectVPN, DetectTor)
+            // called explicitly by callers. They must NOT inflate per-process
+            // evasion scores — on cloud VMs, every process would be flagged.
+            // ====================================================================
 
-            // Analyze connectivity checks
-            if (HasFlag(config.flags, NetworkAnalysisFlags::ScanConnectivity)) {
-                CheckConnectivity(result);
-            }
+            // === TYPE B: Behavioral PE analysis — scan target's imports for ===
+            // === network evasion API clusters and embedded network strings  ===
+            DetectNetworkEvasionImports(processId, result);
+            DetectNetworkEvasionStrings(processId, result);
 
             // ====================================================================
             // SECURITY FIX #1: TOCTOU Race Condition Prevention
             // Copy tracking data while holding the lock to avoid data races.
-            // The original code released the lock before passing references to
-            // Check* functions, allowing concurrent modification during analysis.
             // ====================================================================
 
-            // Analyze DNS activity
+            // === TYPE B: Analyze per-process DNS activity ===
             if (HasFlag(config.flags, NetworkAnalysisFlags::ScanDNS)) {
-                // Copy data while holding lock to prevent TOCTOU
                 std::vector<std::chrono::system_clock::time_point> dnsTimestamps;
                 std::unordered_map<std::wstring, std::vector<std::wstring>> dnsDomainToIPs;
                 {
@@ -3797,15 +3818,13 @@ namespace ShadowStrike::AntiEvasion {
                         dnsDomainToIPs = it->second.domainToIPs;
                     }
                 }
-                // Now analyze with our local copy (lock released)
                 if (!dnsTimestamps.empty() || !dnsDomainToIPs.empty()) {
                     CheckDNSEvasion(dnsTimestamps, dnsDomainToIPs, result);
                 }
             }
 
-            // Analyze traffic patterns
+            // === TYPE B: Analyze per-process traffic patterns ===
             if (HasFlag(config.flags, NetworkAnalysisFlags::ScanTrafficPatterns)) {
-                // Copy data while holding lock to prevent TOCTOU
                 std::map<std::wstring, std::vector<std::chrono::system_clock::time_point>> targetTimestamps;
                 {
                     std::shared_lock lock(m_impl->m_mutex);
@@ -3819,9 +3838,8 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
-            // Analyze beaconing
+            // === TYPE B: Analyze per-process beaconing ===
             if (HasFlag(config.flags, NetworkAnalysisFlags::ScanBeaconing)) {
-                // Copy data while holding lock to prevent TOCTOU
                 std::map<std::wstring, std::vector<std::chrono::system_clock::time_point>> targetTimestamps;
                 {
                     std::shared_lock lock(m_impl->m_mutex);
@@ -3835,38 +3853,7 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
-            // Check for network capture tools (anti-analysis)
-            if (HasFlag(config.flags, NetworkAnalysisFlags::ScanAntiAnalysis)) {
-                std::vector<std::wstring> captureTools;
-                if (m_impl->DetectNetworkCaptureTools(captureTools)) {
-                    NetworkDetectedTechnique detection(NetworkEvasionTechnique::ANTI_NetworkCaptureDetection);
-                    detection.confidence = 0.9;
-                    detection.severity = NetworkEvasionSeverity::High;
-                    detection.description = L"Network capture tools detected";
-
-                    std::wstring toolList;
-                    for (const auto& tool : captureTools) {
-                        if (!toolList.empty()) toolList += L", ";
-                        toolList += tool;
-                    }
-                    detection.technicalDetails = L"Tools: " + toolList;
-
-                    AddDetection(result, std::move(detection));
-                }
-
-                // Check for sandbox network
-                std::wstring sandboxDetails;
-                if (m_impl->DetectSandboxNetwork(sandboxDetails)) {
-                    NetworkDetectedTechnique detection(NetworkEvasionTechnique::ANTI_SandboxNetwork);
-                    detection.confidence = 0.85;
-                    detection.severity = NetworkEvasionSeverity::High;
-                    detection.description = L"Sandbox network characteristics detected";
-                    detection.technicalDetails = sandboxDetails;
-                    AddDetection(result, std::move(detection));
-                }
-            }
-
-            // Kernel-enriched process-network correlation
+            // === TYPE B: Kernel-enriched process-network correlation ===
             if (config.kernelContext.has_value() && config.kernelContext->hasKernelData()) {
                 AnalyzeKernelContext(processId, *config.kernelContext, result);
             }
@@ -3876,6 +3863,314 @@ namespace ShadowStrike::AntiEvasion {
         }
         catch (...) {
             SS_LOG_ERROR(LOG_CATEGORY, L"AnalyzeProcessInternal: Exception");
+        }
+    }
+
+    // ========================================================================
+    // TYPE B: DETECT NETWORK EVASION IMPORT CLUSTERS IN TARGET PE
+    // Scans the target process's PE imports for clusters of network-probing
+    // APIs that indicate sandbox/VM network fingerprinting capability.
+    // ========================================================================
+
+    void NetworkBasedEvasionDetector::DetectNetworkEvasionImports(
+        uint32_t processId,
+        NetworkEvasionResult& result
+    ) noexcept {
+        try {
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+            if (!hProcess || hProcess == INVALID_HANDLE_VALUE) return;
+
+            wchar_t exePath[MAX_PATH] = {};
+            DWORD pathSize = MAX_PATH;
+            BOOL gotPath = QueryFullProcessImageNameW(hProcess, 0, exePath, &pathSize);
+            CloseHandle(hProcess);
+            if (!gotPath) return;
+
+            PEParser::PEParser parser;
+            PEParser::PEError parseErr;
+            PEParser::PEInfo pe_info;
+            if (!parser.ParseFile(exePath, pe_info, &parseErr) || !pe_info.valid) return;
+
+            std::vector<PEParser::ImportInfo> imports;
+            if (!parser.ParseImports(imports, &parseErr)) return;
+
+            // Track network evasion API categories
+            bool hasGetAdaptersInfo = false;
+            bool hasGetAdaptersAddresses = false;
+            bool hasInternetGetConnectedState = false;
+            bool hasGetBestInterface = false;
+            bool hasDnsQuery = false;
+            bool hasGetNetworkParams = false;
+            bool hasWSAStartup = false;
+            bool hasConnect = false;
+            bool hasInternetOpen = false;
+            bool hasHttpOpenRequest = false;
+            bool hasGetExtendedTcpTable = false;
+            bool hasCreateToolhelp32Snapshot = false;
+            bool hasRegOpenKeyEx = false;
+            bool hasGetIfTable = false;
+            bool hasSendARP = false;
+
+            for (const auto& imp : imports) {
+                for (const auto& func : imp.functions) {
+                    if (func.byOrdinal) continue;
+                    const auto& n = func.name;
+
+                    if (n == "GetAdaptersInfo")            hasGetAdaptersInfo = true;
+                    else if (n == "GetAdaptersAddresses")  hasGetAdaptersAddresses = true;
+                    else if (n == "InternetGetConnectedState" || n == "InternetGetConnectedStateEx")
+                        hasInternetGetConnectedState = true;
+                    else if (n == "GetBestInterface" || n == "GetBestInterfaceEx")
+                        hasGetBestInterface = true;
+                    else if (n == "DnsQuery_A" || n == "DnsQuery_W" || n == "DnsQueryEx")
+                        hasDnsQuery = true;
+                    else if (n == "GetNetworkParams")      hasGetNetworkParams = true;
+                    else if (n == "WSAStartup")            hasWSAStartup = true;
+                    else if (n == "connect")               hasConnect = true;
+                    else if (n == "InternetOpenA" || n == "InternetOpenW")
+                        hasInternetOpen = true;
+                    else if (n == "HttpOpenRequestA" || n == "HttpOpenRequestW")
+                        hasHttpOpenRequest = true;
+                    else if (n == "GetExtendedTcpTable")   hasGetExtendedTcpTable = true;
+                    else if (n == "CreateToolhelp32Snapshot") hasCreateToolhelp32Snapshot = true;
+                    else if (n == "RegOpenKeyExA" || n == "RegOpenKeyExW")
+                        hasRegOpenKeyEx = true;
+                    else if (n == "GetIfTable" || n == "GetIfTable2")
+                        hasGetIfTable = true;
+                    else if (n == "SendARP")               hasSendARP = true;
+                }
+            }
+
+            // Pattern 1: Network adapter fingerprinting
+            // GetAdaptersInfo/Addresses + connectivity check = sandbox detection
+            if ((hasGetAdaptersInfo || hasGetAdaptersAddresses) &&
+                (hasInternetGetConnectedState || hasGetBestInterface)) {
+                NetworkDetectedTechnique det(NetworkEvasionTechnique::CONN_InterfaceEnumeration);
+                det.confidence = 0.60;
+                det.severity = NetworkEvasionSeverity::Medium;
+                det.description = L"Network adapter enumeration + connectivity check import cluster";
+                det.source = L"PE Import Analysis";
+                det.mitreId = "T1016";
+                AddDetection(result, std::move(det));
+            }
+
+            // Pattern 2: DNS-based environment probing
+            // DnsQuery + GetNetworkParams (read DNS server config) = DNS fingerprinting
+            if (hasDnsQuery && hasGetNetworkParams) {
+                NetworkDetectedTechnique det(NetworkEvasionTechnique::DNS_PublicResolverCheck);
+                det.confidence = 0.55;
+                det.severity = NetworkEvasionSeverity::Medium;
+                det.description = L"DNS query + network parameter enumeration import cluster";
+                det.source = L"PE Import Analysis";
+                det.mitreId = "T1016.001";
+                AddDetection(result, std::move(det));
+            }
+
+            // Pattern 3: TCP table enumeration (detect monitoring tools/VPN)
+            if (hasGetExtendedTcpTable && hasCreateToolhelp32Snapshot) {
+                NetworkDetectedTechnique det(NetworkEvasionTechnique::ANTI_MonitoringTool);
+                det.confidence = 0.55;
+                det.severity = NetworkEvasionSeverity::Medium;
+                det.description = L"TCP table + process enumeration (monitoring tool detection pattern)";
+                det.source = L"PE Import Analysis";
+                det.mitreId = "T1518.001";
+                AddDetection(result, std::move(det));
+            }
+
+            // Pattern 4: Connectivity verification + HTTP probing
+            if (hasInternetGetConnectedState && hasInternetOpen && hasHttpOpenRequest) {
+                NetworkDetectedTechnique det(NetworkEvasionTechnique::CONN_HTTPConnectivityCheck);
+                det.confidence = 0.50;
+                det.severity = NetworkEvasionSeverity::Low;
+                det.description = L"HTTP connectivity verification import cluster";
+                det.source = L"PE Import Analysis";
+                det.mitreId = "T1016";
+                AddDetection(result, std::move(det));
+            }
+
+            // Pattern 5: ARP scanning (local network discovery / VM detection)
+            if (hasSendARP && (hasGetAdaptersInfo || hasGetIfTable)) {
+                NetworkDetectedTechnique det(NetworkEvasionTechnique::NET_FirewallEnumeration);
+                det.confidence = 0.65;
+                det.severity = NetworkEvasionSeverity::High;
+                det.description = L"ARP scanning + adapter enumeration (network discovery pattern)";
+                det.source = L"PE Import Analysis";
+                det.mitreId = "T1016";
+                AddDetection(result, std::move(det));
+            }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"DetectNetworkEvasionImports failed for PID %u: %hs", processId, e.what());
+        }
+        catch (...) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"DetectNetworkEvasionImports unknown error for PID %u", processId);
+        }
+    }
+
+    // ========================================================================
+    // TYPE B: DETECT EMBEDDED NETWORK EVASION STRINGS IN TARGET PE
+    // Scans target PE data sections for VM adapter names, sandbox network
+    // identifiers, monitoring tool names, and MAC OUI prefixes.
+    // ========================================================================
+
+    void NetworkBasedEvasionDetector::DetectNetworkEvasionStrings(
+        uint32_t processId,
+        NetworkEvasionResult& result
+    ) noexcept {
+        try {
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+            if (!hProcess || hProcess == INVALID_HANDLE_VALUE) return;
+
+            wchar_t exePath[MAX_PATH] = {};
+            DWORD pathSize = MAX_PATH;
+            BOOL gotPath = QueryFullProcessImageNameW(hProcess, 0, exePath, &pathSize);
+            CloseHandle(hProcess);
+            if (!gotPath) return;
+
+            PEParser::PEParser parser;
+            PEParser::PEError parseErr;
+            PEParser::PEInfo pe_info;
+            if (!parser.ParseFile(exePath, pe_info, &parseErr) || !pe_info.valid) return;
+
+            const auto* reader = parser.GetReader();
+            if (!reader || !reader->IsValid()) return;
+
+            // Network evasion string patterns with categories
+            struct NetPattern {
+                const char* needle;
+                size_t len;
+                NetworkEvasionTechnique technique;
+                const wchar_t* category;
+            };
+
+            static const NetPattern kPatterns[] = {
+                // VM adapter names
+                {"VMware Virtual Ethernet",   23, NetworkEvasionTechnique::NET_MultipleInterfaces, L"VMAdapter"},
+                {"VirtualBox Host-Only",       20, NetworkEvasionTechnique::NET_MultipleInterfaces, L"VMAdapter"},
+                {"Hyper-V Virtual Ethernet",   24, NetworkEvasionTechnique::NET_MultipleInterfaces, L"VMAdapter"},
+                {"Microsoft Virtual",          17, NetworkEvasionTechnique::NET_MultipleInterfaces, L"VMAdapter"},
+                {"TAP-Windows Adapter",        19, NetworkEvasionTechnique::NET_VPNDetection,       L"VPNAdapter"},
+                {"Windscribe",                 10, NetworkEvasionTechnique::NET_VPNDetection,       L"VPNAdapter"},
+                {"NordVPN",                     7, NetworkEvasionTechnique::NET_VPNDetection,       L"VPNAdapter"},
+                {"ExpressVPN",                 10, NetworkEvasionTechnique::NET_VPNDetection,       L"VPNAdapter"},
+
+                // VM MAC OUI prefixes
+                {"00:0C:29",                    8, NetworkEvasionTechnique::NET_MACRandomization,   L"VMMAC"},
+                {"00:50:56",                    8, NetworkEvasionTechnique::NET_MACRandomization,   L"VMMAC"},
+                {"08:00:27",                    8, NetworkEvasionTechnique::NET_MACRandomization,   L"VMMAC"},
+                {"00:1C:42",                    8, NetworkEvasionTechnique::NET_MACRandomization,   L"VMMAC"},
+                {"00:15:5D",                    8, NetworkEvasionTechnique::NET_MACRandomization,   L"VMMAC"},
+                {"52:54:00",                    8, NetworkEvasionTechnique::NET_MACRandomization,   L"VMMAC"},
+                {"00-0C-29",                    8, NetworkEvasionTechnique::NET_MACRandomization,   L"VMMAC"},
+                {"00-50-56",                    8, NetworkEvasionTechnique::NET_MACRandomization,   L"VMMAC"},
+                {"08-00-27",                    8, NetworkEvasionTechnique::NET_MACRandomization,   L"VMMAC"},
+
+                // Sandbox-specific network identifiers
+                {"cuckoo",                      6, NetworkEvasionTechnique::ANTI_SandboxNetwork,    L"SandboxNet"},
+                {"any.run",                     7, NetworkEvasionTechnique::ANTI_SandboxNetwork,    L"SandboxNet"},
+                {"hybrid-analysis",            15, NetworkEvasionTechnique::ANTI_SandboxNetwork,    L"SandboxNet"},
+                {"joe sandbox",                11, NetworkEvasionTechnique::ANTI_SandboxNetwork,    L"SandboxNet"},
+
+                // Network capture tool strings
+                {"wireshark",                   9, NetworkEvasionTechnique::ANTI_NetworkCaptureDetection, L"CaptTool"},
+                {"tcpdump",                     7, NetworkEvasionTechnique::ANTI_NetworkCaptureDetection, L"CaptTool"},
+                {"npcap",                       5, NetworkEvasionTechnique::ANTI_NetworkCaptureDetection, L"CaptTool"},
+                {"winpcap",                     7, NetworkEvasionTechnique::ANTI_NetworkCaptureDetection, L"CaptTool"},
+                {"fiddler",                     7, NetworkEvasionTechnique::ANTI_NetworkCaptureDetection, L"CaptTool"},
+                {"burpsuite",                   9, NetworkEvasionTechnique::ANTI_NetworkCaptureDetection, L"CaptTool"},
+                {"charles proxy",              13, NetworkEvasionTechnique::ANTI_NetworkCaptureDetection, L"CaptTool"},
+
+                // Tor/anonymization
+                {"tor.exe",                     7, NetworkEvasionTechnique::NET_TorDetection,       L"AnonNet"},
+                {"127.0.0.1:9050",             14, NetworkEvasionTechnique::NET_TorDetection,       L"AnonNet"},
+                {"127.0.0.1:9150",             14, NetworkEvasionTechnique::NET_TorDetection,       L"AnonNet"},
+                {"socks5://",                   9, NetworkEvasionTechnique::NET_ProxyDetection,     L"AnonNet"},
+            };
+
+            constexpr size_t kPatternCount = sizeof(kPatterns) / sizeof(kPatterns[0]);
+
+            // Category hit counters
+            struct CategoryHits {
+                const wchar_t* name = nullptr;
+                NetworkEvasionTechnique technique{};
+                uint32_t count = 0;
+                std::wstring firstMatch;
+            };
+            std::unordered_map<std::wstring_view, CategoryHits> categoryMap;
+
+            // Scan data sections for embedded strings
+            for (const auto& sec : pe_info.sections) {
+                if (sec.hasCode && !sec.hasInitializedData) continue;
+                if (sec.rawSize == 0 || sec.rawSize > 10 * 1024 * 1024) continue;
+                if (!reader->ValidateRange(sec.rawAddress, sec.rawSize)) continue;
+
+                const uint8_t* sectionData = reader->Data() + sec.rawAddress;
+                const size_t sectionLen = sec.rawSize;
+
+                for (size_t pi = 0; pi < kPatternCount; ++pi) {
+                    const auto& pat = kPatterns[pi];
+                    if (pat.len > sectionLen) continue;
+
+                    for (size_t offset = 0; offset <= sectionLen - pat.len; ++offset) {
+                        bool match = true;
+                        for (size_t ci = 0; ci < pat.len; ++ci) {
+                            uint8_t b = sectionData[offset + ci];
+                            uint8_t p = static_cast<uint8_t>(pat.needle[ci]);
+                            if (b != p) {
+                                uint8_t bLow = (b >= 'A' && b <= 'Z') ? (b + 32) : b;
+                                uint8_t pLow = (p >= 'A' && p <= 'Z') ? (p + 32) : p;
+                                if (bLow != pLow) { match = false; break; }
+                            }
+                        }
+                        if (match) {
+                            auto& cat = categoryMap[pat.category];
+                            cat.name = pat.category;
+                            cat.technique = pat.technique;
+                            cat.count++;
+                            if (cat.firstMatch.empty()) {
+                                cat.firstMatch = Utils::StringUtils::ToWide(
+                                    std::string(pat.needle, pat.len));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Emit detections for categories with significant clusters
+            constexpr uint32_t kVMAdapterThreshold = 2;
+            constexpr uint32_t kMACThreshold = 2;
+            constexpr uint32_t kCaptToolThreshold = 2;
+            constexpr uint32_t kGenericThreshold = 1;
+
+            for (const auto& [catName, cat] : categoryMap) {
+                uint32_t threshold = kGenericThreshold;
+                if (catName == L"VMAdapter")  threshold = kVMAdapterThreshold;
+                else if (catName == L"VMMAC") threshold = kMACThreshold;
+                else if (catName == L"CaptTool") threshold = kCaptToolThreshold;
+
+                if (cat.count >= threshold) {
+                    NetworkDetectedTechnique det(cat.technique);
+                    det.confidence = std::min(0.50 + (cat.count * 0.10), 0.95);
+                    det.severity = NetworkEvasionSeverity::High;
+                    det.detectedValue = std::to_wstring(cat.count) + L" " +
+                        std::wstring(catName) + L" strings in PE";
+                    det.description = L"Target PE embeds network environment probing strings";
+                    det.technicalDetails = L"First match: " + cat.firstMatch;
+                    det.source = L"PE Data Section String Scan";
+                    AddDetection(result, std::move(det));
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"DetectNetworkEvasionStrings failed for PID %u: %hs", processId, e.what());
+        }
+        catch (...) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"DetectNetworkEvasionStrings unknown error for PID %u", processId);
         }
     }
 

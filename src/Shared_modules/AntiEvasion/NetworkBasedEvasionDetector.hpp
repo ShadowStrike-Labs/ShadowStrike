@@ -1585,6 +1585,29 @@ namespace ShadowStrike {
                 NetworkEvasionResult& result
             ) noexcept;
 
+            /**
+             * @brief TYPE B: Scan target PE imports for network evasion API clusters
+             *
+             * Detects clusters of network-probing APIs (adapter enumeration,
+             * connectivity checks, TCP table scanning, ARP probes) that indicate
+             * sandbox/VM network fingerprinting capability.
+             */
+            void DetectNetworkEvasionImports(
+                uint32_t processId,
+                NetworkEvasionResult& result
+            ) noexcept;
+
+            /**
+             * @brief TYPE B: Scan target PE data sections for network evasion strings
+             *
+             * Searches for embedded VM adapter names, MAC OUI prefixes,
+             * sandbox network identifiers, capture tool names, and Tor/proxy strings.
+             */
+            void DetectNetworkEvasionStrings(
+                uint32_t processId,
+                NetworkEvasionResult& result
+            ) noexcept;
+
             void AddDetection(
                 NetworkEvasionResult& result,
                 NetworkDetectedTechnique detection
