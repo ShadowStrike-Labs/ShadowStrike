@@ -703,7 +703,9 @@ TimingCalibrateTimebase PROC
     push    r13
     push    r14
     push    r15
-    sub     rsp, 88         ; Shadow space (32) + local vars (40) + alignment (16)
+    sub     rsp, 80         ; Shadow space (32) + local vars (40) + alignment (8)
+                            ; 7 pushes (56 bytes) + return addr (8) = 64 ≡ 0 mod 16
+                            ; sub 80 → RSP ≡ 0 mod 16 before CALL (required by Win64 ABI)
     
     ;; THREAD-SAFETY FIX: Use atomic compare-exchange for calibration check
     ;; Try to acquire calibration lock (0 -> 2 means "calibrating")
@@ -774,6 +776,10 @@ TimingCalibrateTimebase PROC
     mov     rax, r14                 ; TSC delta
     mul     r12                      ; RDX:RAX = TSC_delta * QPC_freq (128-bit)
     
+    ;; Guard against #DE: if RDX >= divisor, quotient overflows 64-bit
+    cmp     rdx, r15
+    jae     @CalibrationFailed
+    
     ;; Now divide RDX:RAX by r15 (QPC delta)
     ;; DIV r64: RDX:RAX / r64 -> RAX=quotient, RDX=remainder
     div     r15                      ; RAX = TSC frequency
@@ -811,13 +817,16 @@ TimingCalibrateTimebase PROC
     jmp     @CalibReturn
     
 @CalibrationFailed:
-    ;; Calibration failed - reset flag and return default
-    mov     DWORD PTR [g_calibrated], 0
+    ;; Calibration failed - mark complete with default to prevent livelock
+    ;; in @WaitForCalibration (threads spinning on g_calibrated == 1).
+    ;; Setting to 1 (not 0) ensures waiting threads unblock and get the
+    ;; fallback 3 GHz value rather than spinning forever.
     mov     rax, 3000000000          ; Default: 3 GHz (reasonable fallback)
     mov     QWORD PTR [g_tscFrequency], rax
+    mov     DWORD PTR [g_calibrated], 1
     
 @CalibReturn:
-    add     rsp, 88
+    add     rsp, 80
     pop     r15
     pop     r14
     pop     r13

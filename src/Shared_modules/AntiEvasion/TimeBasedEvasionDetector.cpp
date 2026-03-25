@@ -234,9 +234,9 @@ uint32_t Fallback_TimingCheckHypervisorLeaf(char* vendorOut) {
     __cpuid(cpuInfo, 0x40000000);
     
     if (vendorOut) {
-        *reinterpret_cast<int*>(vendorOut) = cpuInfo[1];
-        *reinterpret_cast<int*>(vendorOut + 4) = cpuInfo[2];
-        *reinterpret_cast<int*>(vendorOut + 8) = cpuInfo[3];
+        std::memcpy(vendorOut, &cpuInfo[1], 4);
+        std::memcpy(vendorOut + 4, &cpuInfo[2], 4);
+        std::memcpy(vendorOut + 8, &cpuInfo[3], 4);
         vendorOut[12] = '\0';
     }
     
@@ -274,6 +274,9 @@ uint64_t Fallback_TimingCPUIDVariance(void) {
 
 /// Fallback: TimingMeasureSleep
 uint64_t Fallback_TimingMeasureSleep(uint32_t sleepMs) {
+    constexpr uint32_t MAX_SLEEP_MS = 5000;
+    sleepMs = std::min(sleepMs, MAX_SLEEP_MS);
+
     int cpuInfo[4];
     __cpuid(cpuInfo, 0);
     uint64_t start = __rdtsc();
@@ -289,6 +292,8 @@ uint64_t Fallback_TimingMeasureSleep(uint32_t sleepMs) {
 /// Fallback: TimingDetectSleepAcceleration
 uint32_t Fallback_TimingDetectSleepAcceleration(uint32_t sleepMs) {
     if (sleepMs < 100) return 0;
+    constexpr uint32_t MAX_SLEEP_MS = 5000;
+    if (sleepMs > MAX_SLEEP_MS) sleepMs = MAX_SLEEP_MS;
     
     ULONGLONG startTicks = GetTickCount64();
     Sleep(sleepMs);
@@ -324,8 +329,13 @@ uint64_t Fallback_TimingCalibrateTimebase(void) {
         if (expected == 2) {
             return g_tscFrequency_fallback.load(std::memory_order_relaxed);
         }
-        // Spin-wait for calibration to complete
+        // Spin-wait for calibration to complete (with timeout)
+        constexpr int MAX_CALIBRATION_WAIT_ITERATIONS = 5000;
+        int waitCount = 0;
         while (g_calibration_state.load(std::memory_order_acquire) == 1) {
+            if (++waitCount > MAX_CALIBRATION_WAIT_ITERATIONS) {
+                return DEFAULT_TSC_FREQ;
+            }
             Sleep(1);
         }
         return g_tscFrequency_fallback.load(std::memory_order_relaxed);
@@ -667,6 +677,7 @@ struct ProcessMonitoringContext {
     std::vector<TimingEventRecord> events;
     size_t eventWriteIndex = 0;
     size_t eventCount = 0;
+    size_t maxEventCapacity = 0;
 
     // Detection flags
     bool rdtscHighFrequencyDetected = false;
@@ -674,13 +685,15 @@ struct ProcessMonitoringContext {
     bool sleepAccelerationDetected = false;
 
     void AddEvent(const TimingEventRecord& event, size_t maxEvents) {
-        if (events.size() < maxEvents) {
+        // Use stored capacity if set, otherwise use parameter
+        const size_t effectiveMax = (maxEventCapacity > 0) ? maxEventCapacity : maxEvents;
+        if (events.size() < effectiveMax) {
             events.push_back(event);
             ++eventCount;
         } else {
             events[eventWriteIndex] = event;
-            eventWriteIndex = (eventWriteIndex + 1) % maxEvents;
-            if (eventCount < maxEvents) ++eventCount;
+            eventWriteIndex = (eventWriteIndex + 1) % effectiveMax;
+            if (eventCount < effectiveMax) ++eventCount;
         }
     }
 };
@@ -1170,10 +1183,16 @@ struct TimeBasedEvasionDetector::Impl {
             }
         }
 
-        // Detect sleep bombing (many sleep APIs + high import count)
-        if (analysis.sleepAPIsUsed.size() >= 3) {
+        // Detect sleep bombing: requires BOTH many sleep API imports AND runtime evidence
+        // Import count alone is insufficient (legitimate apps import multiple wait APIs)
+        if (analysis.sleepAPIsUsed.size() >= 3 && analysis.sleepCallCount > 50) {
             analysis.sleepBombingDetected = true;
             analysis.confidence = 60.0f;
+        } else if (analysis.sleepAPIsUsed.size() >= 4 &&
+                   analysis.totalRequestedDurationMs > 30000) {
+            // Many sleep APIs + significant total sleep duration (static + runtime)
+            analysis.sleepBombingDetected = true;
+            analysis.confidence = 50.0f;
         }
 
         return analysis;
@@ -1358,6 +1377,8 @@ struct TimeBasedEvasionDetector::Impl {
                 finding.severity = TimingEvasionSeverity::Medium;
                 finding.confidence = 60.0f;
                 finding.description = L"RDTSCP instruction usage detected";
+                finding.technicalDetails = Utils::StringUtils::Format(
+                    L"RDTSCP count: %llu", rdtscAnalysis.rdtscpCount);
                 finding.mitreId = "T1497.003";
 
                 result.findings.push_back(finding);
@@ -1632,10 +1653,12 @@ struct TimeBasedEvasionDetector::Impl {
 
         for (const auto& finding : result.findings) {
             auto typeVal = static_cast<uint8_t>(finding.type);
-            if (typeVal >= 1 && typeVal <= 19) ++rdtscCount;
-            else if (typeVal >= 20 && typeVal <= 39) ++sleepCount;
-            else if (typeVal >= 40 && typeVal <= 59) ++apiCount;
-            else if (typeVal >= 60 && typeVal <= 79) ++ntpCount;
+            // Classify by enum ranges defined in TimingEvasionType
+            if (typeVal >= 1 && typeVal <= 19) ++rdtscCount;        // RDTSC-Based (1-19)
+            else if (typeVal >= 20 && typeVal <= 39) ++sleepCount;  // Sleep-Based (20-39)
+            else if (typeVal >= 40 && typeVal <= 59) ++apiCount;    // API Timing (40-59)
+            else if (typeVal >= 60 && typeVal <= 79) ++ntpCount;    // NTP/Network (60-79)
+            else if (typeVal >= 80 && typeVal <= 119) ++apiCount;   // Hardware+SideChannel → API category
         }
 
         size_t categoryCount = 0;
@@ -1771,14 +1794,22 @@ struct TimeBasedEvasionDetector::Impl {
         if (!ctx) {
             ctx = std::make_unique<ProcessMonitoringContext>();
             ctx->processId = processId;
+            ctx->maxEventCapacity = m_config.maxEventsPerProcess;
             ctx->events.reserve(m_config.maxEventsPerProcess);
+            m_stats.currentlyMonitoring.fetch_add(1, std::memory_order_relaxed);
+        } else if (ctx->state == MonitoringState::Completed) {
+            // Re-activating a completed process — reset context and re-count
+            ctx = std::make_unique<ProcessMonitoringContext>();
+            ctx->processId = processId;
+            ctx->maxEventCapacity = m_config.maxEventsPerProcess;
+            ctx->events.reserve(m_config.maxEventsPerProcess);
+            m_stats.currentlyMonitoring.fetch_add(1, std::memory_order_relaxed);
         }
+        // If already Active or Paused, do NOT increment counter
 
         ctx->state = MonitoringState::Active;
         ctx->startTime = std::chrono::steady_clock::now();
         ctx->lastUpdate = ctx->startTime;
-
-        m_stats.currentlyMonitoring.fetch_add(1, std::memory_order_relaxed);
 
         // FIX (Issue #4): Use compare_exchange_strong to prevent race condition
         // Multiple threads could previously pass the exchange(true) check simultaneously
@@ -2020,9 +2051,13 @@ struct TimeBasedEvasionDetector::Impl {
         // FIX (Issue #2): Correct ring buffer index calculation
         // Previous code had integer underflow when count > eventWriteIndex
         std::vector<TimingEventRecord> result;
-        result.reserve(count);
 
         const size_t bufferSize = ctx.events.size();
+        
+        // Cap count to actual buffer capacity to prevent OOM
+        count = std::min(count, bufferSize);
+        
+        result.reserve(count);
         
         // Check if ring buffer has wrapped around
         if (ctx.eventCount < bufferSize) {

@@ -125,6 +125,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <array>
 #include <bitset>
 
 #ifdef _WIN32
@@ -232,10 +233,7 @@ uint64_t TimingMeasureHypervisor(void);
 // Forward declarations to avoid header pollution
 namespace ShadowStrike::Utils {
     class ThreadPool;
-    class TimerManager;
     namespace ProcessUtils {
-        struct ProcessInfo;
-        struct ProcessThreadInfo;
         struct ProcessBasicInfo;
     }
 }
@@ -883,6 +881,7 @@ namespace ShadowStrike {
                 eventsAnalyzed = 0;
                 errorMessage.clear();
                 analysisComplete = false;
+                mitreTactic = "TA0005";
             }
         };
 
