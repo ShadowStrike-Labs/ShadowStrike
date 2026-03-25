@@ -2396,6 +2396,103 @@ namespace ShadowStrike {
              */
             [[nodiscard]] std::optional<HardwareProfile> GetHardwareProfile() const;
 
+            // =========================================================================
+            // TYPE B: Per-Process Sandbox Evasion Analysis
+            // =========================================================================
+
+            /**
+             * @brief Kernel-enriched context for per-process analysis.
+             */
+            struct SandboxKernelContext {
+                std::wstring imagePath;
+                std::wstring commandLine;
+                uint32_t parentProcessId = 0;
+                uint32_t creatingProcessId = 0;
+            };
+
+            /**
+             * @brief Per-process sandbox evasion analysis result.
+             * Tracks what sandbox-detection techniques a target process has.
+             */
+            struct ProcessSandboxResult {
+                bool hasEvasionCapability = false;
+                float evasionScore = 0.0f;
+                uint32_t processId = 0;
+
+                struct ImportFindings {
+                    std::vector<std::wstring> hardwareFingerprinting;
+                    std::vector<std::wstring> timingAPIs;
+                    std::vector<std::wstring> environmentQueries;
+                    std::vector<std::wstring> artifactChecks;
+                    std::vector<std::wstring> humanInteractionChecks;
+                    float score = 0.0f;
+                } imports;
+
+                struct StringFindings {
+                    std::vector<std::wstring> sandboxProductNames;
+                    std::vector<std::wstring> sandboxDLLNames;
+                    std::vector<std::wstring> sandboxMutexNames;
+                    std::vector<std::wstring> sandboxProcessNames;
+                    std::vector<std::wstring> vmVendorStrings;
+                    std::vector<std::wstring> sandboxRegistryPaths;
+                    float score = 0.0f;
+                } strings;
+
+                struct CodeFindings {
+                    uint32_t rdtscInstructions = 0;
+                    uint32_t cpuidInstructions = 0;
+                    uint32_t timingSandwiches = 0;
+                    uint32_t vmExitProbes = 0;
+                    uint32_t portProbes = 0;
+                    float score = 0.0f;
+                } codePatterns;
+
+                std::vector<std::string> mitreIds;
+                uint64_t analysisDurationUs = 0;
+            };
+
+            /**
+             * @brief Configuration for per-process analysis.
+             */
+            struct ProcessSandboxConfig {
+                bool checkImports = true;
+                bool checkMemoryStrings = true;
+                bool checkCodePatterns = true;
+                size_t maxMemoryScanBytes = 64ULL * 1024 * 1024;
+                size_t maxCodeScanBytes = 4ULL * 1024 * 1024;
+                SandboxKernelContext kernelContext;
+            };
+
+            /**
+             * @brief Analyze a target process for sandbox evasion capability (TYPE B).
+             * @param hProcess Handle to target process (PROCESS_VM_READ | PROCESS_QUERY_INFORMATION)
+             * @param processId Target process ID
+             * @param result Output result
+             * @param config Analysis configuration
+             * @return true if analysis completed successfully
+             */
+            [[nodiscard]] bool AnalyzeProcess(
+                HANDLE hProcess,
+                uint32_t processId,
+                ProcessSandboxResult& result,
+                const ProcessSandboxConfig& config = {}
+            );
+
+            /**
+             * @brief Analyze a target process by PID (TYPE B).
+             */
+            [[nodiscard]] bool AnalyzeProcess(
+                uint32_t processId,
+                ProcessSandboxResult& result,
+                const ProcessSandboxConfig& config = {}
+            );
+
+            /**
+             * @brief Set detection callback for per-process analysis.
+             */
+            using ProcessSandboxCallback = std::function<void(const ProcessSandboxResult&)>;
+            void SetProcessDetectionCallback(ProcessSandboxCallback callback);
+
         private:
             // =========================================================================
             // Private Constructor (Singleton)
@@ -2514,6 +2611,32 @@ namespace ShadowStrike {
              * @brief Invoke registered callbacks.
              */
             void InvokeCallbacks(const SandboxEvasionResult& result);
+
+            // =========================================================================
+            // TYPE B Internal Methods (Target Process Analysis)
+            // =========================================================================
+
+            void CheckTargetSandboxImports(
+                HANDLE hProcess,
+                const std::wstring& processPath,
+                ProcessSandboxResult& result
+            );
+
+            void CheckTargetSandboxStrings(
+                HANDLE hProcess,
+                ProcessSandboxResult& result,
+                size_t maxScanBytes
+            );
+
+            void CheckTargetTimingPatterns(
+                HANDLE hProcess,
+                const std::wstring& processPath,
+                bool is64Bit,
+                ProcessSandboxResult& result,
+                size_t maxCodeScanBytes
+            );
+
+            void CalculateProcessEvasionScore(ProcessSandboxResult& result);
 
             // =========================================================================
             // Internal Data (PIMPL)
