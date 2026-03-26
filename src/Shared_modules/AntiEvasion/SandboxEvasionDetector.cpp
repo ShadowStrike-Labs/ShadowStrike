@@ -17,17 +17,19 @@
  */
 /**
  * @file SandboxEvasionDetector.cpp
- * @brief Enterprise-grade implementation of sandbox evasion detection.
+ * @brief Behavioral detection of anti-sandbox evasion in target processes
  *
- * This module implements comprehensive detection of techniques used by malware
- * to identify and evade automated analysis sandboxes. Detection covers:
- * - Hardware fingerprinting (RAM, CPU, disk, GPU)
- * - System wear and tear analysis
- * - Human interaction verification
- * - Sandbox artifact detection (DLLs, processes, mutexes, registry)
- * - Environment analysis (screen, locale, devices)
- * - Timing-based detection
- * - Network characteristics
+ * DESIGN PHILOSOPHY — DEFENDER PERSPECTIVE:
+ *
+ * This module detects MALWARE that attempts to evade sandbox analysis by
+ * probing the host environment. The detector does NOT check if the host
+ * IS a sandbox — that would be acting like malware.
+ *
+ * PRIMARY DETECTION: per-process behavioral analysis (PE imports, embedded
+ * strings, code patterns indicating sandbox detection).
+ *
+ * HOST CONTEXT: hardware/timing/artifact checks provide scoring calibration
+ * data — on a real sandbox, anti-sandbox probing is LESS suspicious.
  *
  * @note Thread-safe implementation using shared_mutex.
  * @note Follows PIMPL pattern for ABI stability.
@@ -911,15 +913,28 @@ namespace ShadowStrike {
 
             m_impl->stats.cacheMisses.fetch_add(1, std::memory_order_relaxed);
 
-            // Perform full scan
+            // ================================================================
+            // SYSTEM-WIDE SCAN — TWO PHASES:
+            //
+            // Phase 1: Collect HOST CONTEXT for behavioral score calibration.
+            //   These Check* methods tell us if the host IS a sandbox so we
+            //   can adjust per-process behavioral scores. They are NOT primary
+            //   detection sources — an EDR on a sandbox/VM is legitimate.
+            //
+            // Phase 2: BEHAVIORAL SCAN of all running processes.
+            //   This is the PRIMARY detection: scan each process for embedded
+            //   sandbox detection imports, sandbox-checking strings in PE data
+            //   sections, and timing-evasion code patterns.
+            // ================================================================
+
             SandboxEvasionResult result;
             result.analysisStartTime = std::chrono::system_clock::now();
 
-            SS_LOG_INFO(LOG_CATEGORY, L"Starting comprehensive sandbox detection scan");
+            SS_LOG_INFO(LOG_CATEGORY, L"Starting system-wide behavioral sandbox evasion scan");
 
             auto startTime = std::chrono::steady_clock::now();
 
-            // Run all checks based on configuration
+            // --- Phase 1: Host context collection (for score calibration) ---
             if (currentConfig.checkHardware) {
                 CheckHardwareSpecs(result);
             }
@@ -933,7 +948,6 @@ namespace ShadowStrike {
                 CheckNamedObjects(result);
             }
 
-            // Scan artifacts ONCE and reuse for processes, files, and API hooks
             ArtifactAnalysis scannedArtifacts;
             if (currentConfig.checkArtifacts || currentConfig.checkFileSystem) {
                 scannedArtifacts = ScanArtifacts();
@@ -962,11 +976,53 @@ namespace ShadowStrike {
                 CheckNetworkCharacteristics(result);
             }
 
-            // Human interaction check is optional and blocking
             if (currentConfig.checkHumanInteraction) {
                 auto interactionAnalysis = AnalyzeHumanInteraction(currentConfig.humanInteractionMonitorMs);
                 result.humanInteraction = interactionAnalysis;
                 result.humanInteractionScore = interactionAnalysis.humanConfidence;
+            }
+
+            // --- Phase 2: Behavioral scan of all running processes ---
+            // Enumerate all processes and analyze each for anti-sandbox behavior.
+            const bool hostIsSandbox = result.isSandboxLikely;
+            {
+                HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                if (hSnapshot != INVALID_HANDLE_VALUE) {
+                    PROCESSENTRY32W pe = {};
+                    pe.dwSize = sizeof(pe);
+
+                    if (Process32FirstW(hSnapshot, &pe)) {
+                        ProcessSandboxConfig procConfig;
+                        do {
+                            ProcessSandboxResult procResult;
+                            if (AnalyzeProcess(pe.th32ProcessID, procResult, procConfig)) {
+                                if (procResult.hasAntiSandboxBehavior) {
+                                    // Calibrate: on a real sandbox, anti-sandbox checks
+                                    // are less suspicious (artifacts genuinely exist).
+                                    float calibratedScore = procResult.evasionScore;
+                                    if (hostIsSandbox && calibratedScore > 20.0f) {
+                                        calibratedScore *= 0.6f;
+                                    }
+
+                                    AddIndicator(result,
+                                        SandboxCheckType::ProcessBehavior,
+                                        SandboxIndicatorCategory::SandboxArtifact,
+                                        calibratedScore >= 80.0f ? SandboxIndicatorSeverity::Critical :
+                                        calibratedScore >= 50.0f ? SandboxIndicatorSeverity::High :
+                                        SandboxIndicatorSeverity::Medium,
+                                        calibratedScore / 25.0f,
+                                        calibratedScore,
+                                        L"Process exhibits anti-sandbox evasion behavior",
+                                        L"PID " + std::to_wstring(pe.th32ProcessID) +
+                                            L" (" + std::wstring(pe.szExeFile) + L")",
+                                        L"Score: " + std::to_wstring(static_cast<int>(calibratedScore)),
+                                        L"None");
+                                }
+                            }
+                        } while (Process32NextW(hSnapshot, &pe));
+                    }
+                    CloseHandle(hSnapshot);
+                }
             }
 
             // Calculate final probability and identify sandbox

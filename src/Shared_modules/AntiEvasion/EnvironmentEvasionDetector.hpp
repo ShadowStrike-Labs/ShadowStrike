@@ -17,46 +17,60 @@
  */
 /**
  * @file EnvironmentEvasionDetector.hpp
- * @brief Enterprise-grade detection of environment-based sandbox/analysis evasion
+ * @brief Behavioral detection of environment-probing evasion in target processes
  *
  * ShadowStrike AntiEvasion - Environment Evasion Detection Module
  * Copyright (c) 2026 ShadowStrike Security Suite. All rights reserved.
  *
  * ============================================================================
- * OVERVIEW
+ * DESIGN PHILOSOPHY — DEFENDER PERSPECTIVE
  * ============================================================================
  *
- * This module detects malware that attempts to evade analysis by checking
- * environmental characteristics that distinguish real user systems from
- * sandboxes, analysis VMs, and automated testing environments.
+ * This module detects MALWARE that attempts to evade analysis by probing the
+ * host environment to distinguish real user systems from sandboxes, VMs, and
+ * automated analysis environments.
  *
- * Detected evasion categories:
+ * CRITICAL DISTINCTION:
+ *  - The EDR does NOT probe the host environment itself (that's malware behavior)
+ *  - The EDR DETECTS TARGET PROCESSES that exhibit environment-probing behavior
  *
- * - User/Computer Name Checks: Blacklisted names (admin, test, sandbox, malware)
- * - File System Artifacts: Recent files, user documents, desktop items
- * - Registry Artifacts: Recently used programs, MRU lists, typed URLs
- * - Hardware Fingerprinting: CPU count, RAM size, disk capacity
- * - System Uptime: Fresh installs vs. lived-in systems
- * - Network Configuration: MAC addresses, network adapters, connectivity
- * - Installed Software: Browser history, email clients, productivity apps
- * - User Activity Indicators: Mouse movement, keyboard activity, window focus
- * - Process/Service Enumeration: Analysis tools, security software
- * - File Name Analysis: Hash-based naming, suspicious paths
- * - Environment Variables: Sandbox-specific variables, paths
- * - Locale/Regional Settings: Language, timezone, keyboard layout
- * - Display/Graphics: Resolution, multiple monitors, GPU presence
- * - USB/Peripheral History: Device connection history
- * - Browser Artifacts: Cookies, history, downloads, bookmarks
+ * Detection approach (TYPE B — behavioral analysis of target process):
+ *  - PE import analysis: evasion-related API clusters in target imports
+ *  - Embedded string scan: VM/sandbox identifiers in target PE data sections
+ *  - Hook detection patterns: ntdll unhooking attempts by target process
+ *  - Kernel-enriched correlation: suspicious parent chains, launch paths
+ *  - Environment variable analysis: sandbox-specific variables in target
+ *  - Filename anomaly detection: hash-named executables, suspicious paths
+ *
+ * Host context (NOT detection — scoring calibration only):
+ *  - CPUID/hardware context → adjusts confidence on VM vs bare metal
+ *  - Identity context → calibrates false-positive thresholds
+ *
+ * ============================================================================
+ * DETECTED EVASION CATEGORIES (in target processes)
+ * ============================================================================
+ *
+ * - User/Computer Name Checks: Target probes for blacklisted names
+ * - Hardware Fingerprinting: Target queries CPU count, RAM, disk for VM traits
+ * - File System Artifacts: Target scans for VM/sandbox file artifacts
+ * - Registry Artifacts: Target queries VM-specific registry keys
+ * - System Uptime: Target checks for fresh-install indicators
+ * - Network Configuration: Target queries MAC addresses for VM prefixes
+ * - Process Enumeration: Target enumerates analysis tools / security software
+ * - Timing Checks: Target uses RDTSC/timing to detect instrumentation
+ * - File Name Analysis: Target uses hash-based naming / suspicious paths
+ * - Environment Variables: Target reads sandbox-specific variables
+ * - Display/Graphics: Target checks for VM display adapters
+ * - Browser Artifacts: Target checks for user browsing history depth
+ * - USB/Peripheral History: Target checks for device connection history
  *
  * ============================================================================
  * PERFORMANCE TARGETS
  * ============================================================================
  *
- * - Full environment analysis: < 200ms
- * - Quick check (name/uptime): < 10ms
- * - Hardware fingerprint: < 50ms
- * - File system artifact scan: < 100ms
- * - Registry artifact scan: < 100ms
+ * - Per-process behavioral analysis: < 50ms
+ * - Quick check (PE imports + strings): < 20ms
+ * - System-wide behavioral scan (all processes): < 5 seconds
  * - Batch analysis (100 processes): < 5 seconds
  *
  * ============================================================================
@@ -81,6 +95,7 @@
  * - T1082: System Information Discovery (detection of discovery attempts)
  * - T1016: System Network Configuration Discovery
  * - T1033: System Owner/User Discovery
+ * - T1562.001: Impair Defenses: Disable or Modify Tools (hook evasion)
  *
  * ============================================================================
  */
@@ -2566,14 +2581,27 @@ namespace ShadowStrike {
             ) noexcept;
 
             // ========================================================================
-            // SYSTEM-WIDE ANALYSIS
+            // SYSTEM-WIDE BEHAVIORAL ANALYSIS
             // ========================================================================
 
             /**
-             * @brief Analyze system environment (not process-specific)
+             * @brief Scan all running processes for environment-probing evasion behavior.
+             *
+             * This performs BEHAVIORAL analysis — it examines each process for
+             * indicators that the process is attempting to detect VMs, sandboxes,
+             * or analysis environments. It does NOT probe the host environment itself.
+             *
+             * Detection methods per process:
+             *  - PE import analysis for evasion-related API clusters
+             *  - Embedded string scan for VM/sandbox identifiers in PE data sections
+             *  - API hook detection behavioral patterns (ntdll unhooking)
+             *  - Kernel-enriched context correlation (if available)
+             *  - Suspicious filename pattern analysis
+             *  - Process environment variable analysis
+             *
              * @param config Analysis configuration
              * @param err Optional error output
-             * @return Analysis result
+             * @return Aggregated result with per-process breakdown
              */
             [[nodiscard]] EnvironmentEvasionResult AnalyzeSystemEnvironment(
                 const EnvironmentAnalysisConfig& config = EnvironmentAnalysisConfig{},
@@ -2613,14 +2641,29 @@ namespace ShadowStrike {
             ) noexcept;
 
             // ========================================================================
-            // SPECIFIC CATEGORY CHECKS
+            // HOST CONTEXT COLLECTION (INTERNAL USE ONLY)
+            // ========================================================================
+            //
+            // IMPORTANT: These methods collect HOST environment context for
+            // behavioral scoring calibration. They are NOT detection sources.
+            //
+            // An EDR must NOT flag processes as evasive based on whether the
+            // HOST is a VM — that would cause false positives on every Azure,
+            // AWS, or Hyper-V instance. Instead, these methods provide context
+            // that adjusts confidence scores: e.g., a process probing for
+            // VM artifacts on a REAL VM is less suspicious than one probing
+            // on bare metal (where there are no VMs to detect).
+            //
+            // Primary detection is always via AnalyzeProcess() behavioral
+            // checks (PE imports, embedded strings, hook detection patterns).
             // ========================================================================
 
             /**
-             * @brief Check username and hostname against blacklists
-             * @param outDetections Output detections
+             * @brief Collect host identity context for behavioral score calibration.
+             * @param outDetections Context indicators (severity capped at Low)
              * @param err Optional error output
-             * @return true if blacklisted names found
+             * @return true if any context indicators collected
+             * @note NOT a detection source. Used to calibrate per-process scores.
              */
             [[nodiscard]] bool CheckBlacklistedNames(
                 std::vector<EnvironmentDetectedTechnique>& outDetections,
@@ -2628,11 +2671,12 @@ namespace ShadowStrike {
             ) noexcept;
 
             /**
-             * @brief Check hardware fingerprint for VM indicators
+             * @brief Collect host hardware context for behavioral score calibration.
              * @param outHardwareInfo Output hardware info
-             * @param outDetections Output detections
+             * @param outDetections Context indicators (severity capped at Low)
              * @param err Optional error output
-             * @return true if VM indicators found
+             * @return true if any context indicators collected
+             * @note NOT a detection source. Provides VM/bare-metal context.
              */
             [[nodiscard]] bool CheckHardwareFingerprint(
                 HardwareFingerprintInfo& outHardwareInfo,
@@ -2641,10 +2685,11 @@ namespace ShadowStrike {
             ) noexcept;
 
             /**
-             * @brief Check file system for VM/sandbox artifacts
-             * @param outDetections Output detections
+             * @brief Collect host filesystem context for behavioral score calibration.
+             * @param outDetections Context indicators (severity capped at Low)
              * @param err Optional error output
-             * @return true if artifacts found
+             * @return true if any context indicators collected
+             * @note NOT a detection source.
              */
             [[nodiscard]] bool CheckFileSystemArtifacts(
                 std::vector<EnvironmentDetectedTechnique>& outDetections,
@@ -2652,10 +2697,11 @@ namespace ShadowStrike {
             ) noexcept;
 
             /**
-             * @brief Check registry for VM/sandbox keys
-             * @param outDetections Output detections
+             * @brief Collect host registry context for behavioral score calibration.
+             * @param outDetections Context indicators (severity capped at Low)
              * @param err Optional error output
-             * @return true if VM keys found
+             * @return true if any context indicators collected
+             * @note NOT a detection source.
              */
             [[nodiscard]] bool CheckRegistryArtifacts(
                 std::vector<EnvironmentDetectedTechnique>& outDetections,
@@ -2663,11 +2709,12 @@ namespace ShadowStrike {
             ) noexcept;
 
             /**
-             * @brief Check user activity artifacts
+             * @brief Collect host user-activity context for behavioral score calibration.
              * @param outActivityInfo Output activity info
-             * @param outDetections Output detections
+             * @param outDetections Context indicators (severity capped at Low)
              * @param err Optional error output
-             * @return true if lack of activity detected
+             * @return true if any context indicators collected
+             * @note NOT a detection source.
              */
             [[nodiscard]] bool CheckUserActivity(
                 UserActivityInfo& outActivityInfo,
@@ -2676,11 +2723,12 @@ namespace ShadowStrike {
             ) noexcept;
 
             /**
-             * @brief Check network configuration for VM indicators
+             * @brief Collect host network context for behavioral score calibration.
              * @param outNetworkInfo Output network info
-             * @param outDetections Output detections
+             * @param outDetections Context indicators (severity capped at Low)
              * @param err Optional error output
-             * @return true if VM network found
+             * @return true if any context indicators collected
+             * @note NOT a detection source.
              */
             [[nodiscard]] bool CheckNetworkConfiguration(
                 NetworkConfigInfo& outNetworkInfo,
@@ -2689,10 +2737,11 @@ namespace ShadowStrike {
             ) noexcept;
 
             /**
-             * @brief Check running processes for analysis tools
-             * @param outDetections Output detections
+             * @brief Collect running process landscape for behavioral score calibration.
+             * @param outDetections Context indicators (severity capped at Low)
              * @param err Optional error output
-             * @return true if analysis tools found
+             * @return true if any context indicators collected
+             * @note NOT a detection source.
              */
             [[nodiscard]] bool CheckRunningProcesses(
                 std::vector<EnvironmentDetectedTechnique>& outDetections,
@@ -2834,10 +2883,19 @@ namespace ShadowStrike {
            // ADVANCED FEATURES
            // ========================================================================
             /**
-             * @brief Check advanced CPUID indicators
-             * @param outDetections Output detections
+             * @brief Collect host CPUID context for behavioral score calibration.
+             *
+             * Reads CPUID on the local host to determine hypervisor presence,
+             * CPU vendor, and feature flags. This data is used to CALIBRATE
+             * behavioral scores — not as a detection source. On a VM host,
+             * a process probing for hypervisor presence is less suspicious
+             * because VM artifacts genuinely exist. On bare metal, such
+             * probing is far more indicative of evasion behavior.
+             *
+             * @param outDetections Context indicators (severity capped at Low)
              * @param err Optional error output
-             * @return true if advanced CPUID anomalies found
+             * @return true if host CPUID context collected
+             * @note NOT a detection source. Context for behavioral calibration only.
              */
             [[nodiscard]] bool CheckAdvancedCPUIDIndicators(
                 std::vector<EnvironmentDetectedTechnique>& outDetections,
@@ -2845,10 +2903,18 @@ namespace ShadowStrike {
             ) noexcept;
 
             /**
-             * @brief Check API hooking indicators
-             * @param outDetections Output detections
+             * @brief Detect API hooks in the current process address space.
+             *
+             * Checks whether security tool hooks (EDR inline hooks, detour
+             * patches) are present on key APIs. This provides context for
+             * scoring — if hooks ARE present, a process attempting to detect
+             * or remove them is performing EDR evasion (T1562.001).
+             *
+             * @param outDetections Context indicators
              * @param err Optional error output
-             * @return true if API hooking detected
+             * @return true if API hooks detected in our address space
+             * @note Context for behavioral calibration. Per-process hook
+             *        evasion detection is in DetectAPIHookCheckBehavior().
              */
             [[nodiscard]] bool CheckAPIHookingIndicators(
                 std::vector<EnvironmentDetectedTechnique>& outDetections,
@@ -2969,9 +3035,10 @@ namespace ShadowStrike {
             std::unique_ptr<Impl> m_impl;
 
             // ========================================================================
-            // INTERNAL METHODS
+            // INTERNAL METHODS — BEHAVIORAL ANALYSIS (PRIMARY DETECTION)
             // ========================================================================
 
+            /// @brief Per-process behavioral analysis (TYPE B — examines target process)
             void AnalyzeProcessInternal(
                 HANDLE hProcess,
                 uint32_t processId,
@@ -2979,6 +3046,7 @@ namespace ShadowStrike {
                 EnvironmentEvasionResult& result
             ) noexcept;
 
+            /// @brief System-wide behavioral scan (delegates to per-process analysis)
             void AnalyzeSystemInternal(
                 const EnvironmentAnalysisConfig& config,
                 EnvironmentEvasionResult& result

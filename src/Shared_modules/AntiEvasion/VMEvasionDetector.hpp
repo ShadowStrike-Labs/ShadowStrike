@@ -17,55 +17,45 @@
  */
 /**
  * @file VMEvasionDetector.hpp
- * @brief Enterprise-grade detection of Virtual Machine (VM) and Hypervisor environments
+ * @brief Behavioral detection of anti-VM evasion techniques in target processes
  *
  * ShadowStrike AntiEvasion - VM Evasion Detection Module
  * Copyright (c) 2026 ShadowStrike Security Suite. All rights reserved.
  *
  * ============================================================================
- * OVERVIEW
+ * DESIGN PHILOSOPHY — DEFENDER PERSPECTIVE
  * ============================================================================
  *
- * This module provides comprehensive detection of virtualization environments
- * and anti-VM techniques used by malware to evade security analysis. It detects
- * 100+ distinct VM indicators across multiple detection vectors including:
+ * This module detects MALWARE that attempts to evade analysis by probing for
+ * virtualization/hypervisor indicators. The detector does NOT check if the
+ * host IS a VM — that would be acting like malware.
  *
- * - CPUID-based detection (hypervisor brand string, feature flags, leaf values)
- * - Registry artifacts (VM-specific keys, driver entries, service registrations)
- * - File system artifacts (drivers, executables, configuration files)
- * - Network indicators (MAC OUI prefixes, virtual adapter characteristics)
- * - Hardware fingerprinting (DMI/SMBIOS, ACPI tables, firmware signatures)
- * - Process/Service enumeration (VM tools, guest additions, hypervisor agents)
- * - Memory artifacts (BIOS/ROM strings, mapped firmware regions)
- * - Timing-based detection (VM exit latency, instruction timing anomalies)
- * - I/O port probing (VM-specific I/O ports for backdoor communication)
- * - Device enumeration (PCI/USB device IDs, SCSI controller strings)
- * - WMI queries (ComputerSystem model/manufacturer, BIOS serial numbers)
- * - Anti-analysis behavioral patterns (malware's own VM detection attempts)
+ * PRIMARY DETECTION (behavioral analysis of target processes):
+ *  - Memory scanning for anti-VM instruction patterns (SIDT, SGDT, CPUID,
+ *    SLDT, STR, INT 0x20, VMware backdoor port I/O)
+ *  - PE import analysis for VM-detection API clusters
+ *  - Code pattern recognition (Red Pill, No Pill, Scoopy Doo tests)
+ *  - WMI query string scanning in target PE data sections
+ *  - Registry key path scanning for VM-specific key references
  *
- * Supported Hypervisors and Virtualization Technologies:
- * - VMware (Workstation, Fusion, ESXi, vSphere)
- * - VirtualBox (Oracle VM VirtualBox)
- * - Microsoft Hyper-V (Client, Server, Azure)
- * - QEMU/KVM (Kernel-based Virtual Machine)
- * - Xen (Citrix Hypervisor, XenServer)
- * - Parallels Desktop
- * - Bochs emulator
- * - Wine (Windows compatibility layer)
- * - Sandboxie (Application sandboxing)
- * - Docker/WSL2 containers
- * - Amazon EC2 / Google Cloud / Azure VMs
- * - Generic hypervisor detection
+ * HOST CONTEXT (for scoring calibration — NOT primary detection):
+ *  - CPUID hypervisor bit and vendor string — calibrates behavioral scores
+ *  - Registry/file/network artifact presence — adjusts confidence
+ *  - On a VM, a process probing for VM artifacts is LESS suspicious
+ *  - On bare metal, such probing is far MORE suspicious
+ *
+ * Supported hypervisor identification (for context calibration):
+ * - VMware, VirtualBox, Hyper-V, QEMU/KVM, Xen, Parallels, Bochs, Wine,
+ *   Sandboxie, Docker/WSL2, Amazon EC2, Google Cloud, Azure
  *
  * ============================================================================
  * PERFORMANCE TARGETS
  * ============================================================================
  *
- * - Quick check (CPUID only): < 1ms
- * - Standard detection: < 50ms for full system scan
- * - Deep analysis: < 200ms with all optional checks enabled
- * - Process behavior analysis: < 20ms per process
+ * - Quick context check (CPUID only): < 1ms
+ * - Per-process behavioral analysis: < 20ms
  * - Batch process analysis (100 processes): < 1 second
+ * - System-wide behavioral scan: < 5 seconds
  * - Memory region scan: < 100ms per 64MB scanned
  *
  * ============================================================================
@@ -99,23 +89,8 @@
  * ============================================================================
  *
  * @code
- *   // Quick detection with default configuration
+ *   // Behavioral scan: detect processes performing anti-VM evasion
  *   VMEvasionDetector detector;
- *   auto result = detector.DetectEnvironment();
- *   if (result.isVM) {
- *       SS_LOG_WARN(L"VMDetector", L"Running in %ls (confidence: %.1f%%)",
- *                   detector.VMTypeToString(result.detectedType).c_str(),
- *                   result.confidenceScore);
- *   }
- *
- *   // Custom configuration for deep analysis
- *   VMDetectionConfig config = VMDetectionConfig::CreateDeepAnalysis();
- *   config.enableTimingChecks = true;
- *   config.enableIOPortProbing = true;
- *   VMEvasionDetector deepDetector(nullptr, config);
- *   auto deepResult = deepDetector.DetectEnvironment();
- *
- *   // Analyze a specific process for anti-VM behavior
  *   ProcessVMEvasionResult procResult;
  *   if (detector.AnalyzeProcessAntiVMBehavior(targetPid, procResult)) {
  *       for (const auto& technique : procResult.detectedTechniques) {
@@ -123,6 +98,14 @@
  *                       technique.description.c_str());
  *       }
  *   }
+ *
+ *   // System-wide behavioral scan of all processes
+ *   auto result = detector.DetectEnvironment();
+ *   // result now contains per-process behavioral findings, NOT host-probing results
+ *
+ *   // Host context query (for calibration, NOT detection)
+ *   bool hostIsVM = detector.IsRunningInVM();
+ *   // Use to adjust behavioral scoring thresholds
  * @endcode
  *
  * ============================================================================
@@ -1592,69 +1575,72 @@ namespace ShadowStrike {
             VMEvasionDetector& operator=(VMEvasionDetector&&) noexcept;
 
             // ========================================================================
-            // Primary Detection API
+            // Primary Detection API — System-Wide Behavioral Scan
             // ========================================================================
 
             /**
-             * @brief Performs comprehensive VM environment detection
+             * @brief Scans all running processes for anti-VM evasion behavior.
              *
-             * This is the primary detection method that scans the system for VM indicators
-             * using all enabled detection categories. Results may be cached based on
-             * configuration.
+             * This method performs BEHAVIORAL analysis — it examines each process
+             * for indicators that the process is attempting to detect VMs,
+             * hypervisors, or virtualization environments. It does NOT probe the
+             * host environment itself.
              *
-             * @return VMEvasionResult containing detection results and artifacts
+             * Host context (CPUID, registry, etc.) is collected separately and
+             * used ONLY to calibrate confidence scores: on a real VM, a process
+             * probing for VM artifacts is less suspicious than on bare metal.
+             *
+             * @return VMEvasionResult with per-process behavioral findings
              *
              * @note Thread-safe - can be called concurrently
              * @note May use cached results if caching is enabled
-             * @see InvalidateCache() to force fresh detection
+             * @see ScanAllProcesses() for the batch behavioral analysis backend
              */
             [[nodiscard]] VMEvasionResult DetectEnvironment();
 
             /**
-             * @brief Performs detection with custom configuration
+             * @brief System-wide behavioral scan with custom configuration.
              *
-             * Allows overriding the detector's configuration for a single detection run.
+             * Same as DetectEnvironment() but with a one-shot config override.
              *
-             * @param config Custom configuration for this detection
-             * @return VMEvasionResult containing detection results
+             * @param config Custom configuration for this scan
+             * @return VMEvasionResult with per-process behavioral findings
              *
              * @note Results from custom config are NOT cached
              */
             [[nodiscard]] VMEvasionResult DetectEnvironment(const VMDetectionConfig& config);
 
             /**
-             * @brief Performs detection with progress callback
-             *
-             * Same as DetectEnvironment() but provides progress updates during detection.
+             * @brief System-wide behavioral scan with progress callback.
              *
              * @param callback Progress callback (return false to cancel)
-             * @return VMEvasionResult containing detection results
+             * @return VMEvasionResult with per-process behavioral findings
              */
             [[nodiscard]] VMEvasionResult DetectEnvironmentWithProgress(ProgressCallback callback);
 
             /**
-             * @brief Performs quick CPUID-only detection
+             * @brief Query host CPUID for hypervisor context (NOT a detection source).
              *
-             * Fast path that only checks CPUID for hypervisor presence. Useful when
-             * you need a quick yes/no answer with minimal overhead.
+             * Reads CPUID leaf 0x1 (hypervisor bit) and leaf 0x40000000 (vendor)
+             * to determine if the host is virtualized. This is CONTEXT for
+             * behavioral scoring calibration — not a detection source.
              *
-             * @return CPUIDInfo with hypervisor detection results
-             *
-             * @note Always returns fresh results (not cached)
+             * @return CPUIDInfo with hypervisor context
              * @note ~1ms typical execution time
+             * @note NOT a detection source. Use AnalyzeProcessAntiVMBehavior() for detection.
              */
             [[nodiscard]] CPUIDInfo QuickDetectCPUID();
 
             /**
-             * @brief Check if running in any VM environment (fast path)
+             * @brief Query whether host is virtualized (context, NOT detection).
              *
-             * Performs minimal checks to quickly determine if running in a VM.
-             * Does not collect detailed artifacts.
+             * Returns true if the host has a hypervisor present. Used internally
+             * to calibrate behavioral scoring — a process probing for VMs on a
+             * VM host is less suspicious than on bare metal.
              *
-             * @return true if VM detected, false otherwise
-             *
+             * @return true if host is virtualized
              * @note Uses cached result if available
-             * @note ~1ms typical execution time
+             * @note NOT a detection source. Context for behavioral calibration only.
              */
             [[nodiscard]] bool IsRunningInVM();
 
@@ -1810,81 +1796,70 @@ namespace ShadowStrike {
             [[nodiscard]] static float GetInstructionEvasionScore(std::string_view mnemonic);
 
             // ========================================================================
-            // Individual Detection Methods
+            // HOST CONTEXT COLLECTION (INTERNAL USE ONLY)
+            // ========================================================================
+            //
+            // IMPORTANT: These methods collect HOST context for behavioral scoring
+            // calibration. They are NOT detection sources.
+            //
+            // An EDR must NOT flag a host as "evasive" because it IS a VM — that
+            // would cause false positives on every cloud/Azure/Hyper-V instance.
+            //
+            // These methods determine whether the host is virtualized so that
+            // behavioral per-process scores can be CALIBRATED:
+            //  - On a VM: process checking for VM artifacts → lower confidence
+            //  - On bare metal: process checking for VM artifacts → higher confidence
+            //
+            // Primary detection is via AnalyzeProcessAntiVMBehavior() and
+            // ScanAllProcesses() which scan TARGET PROCESS code and memory.
             // ========================================================================
 
-            /**
-             * @brief Performs CPUID-based hypervisor detection
-             * @param result Output: Detection results to update
-             */
+            /// @brief Collect host CPUID context for behavioral score calibration.
+            /// @note NOT a detection source. Context for calibration only.
             void CheckCPUID(VMEvasionResult& result);
 
-            /**
-             * @brief Scans Windows Registry for VM artifacts
-             * @param result Output: Detection results to update
-             */
+            /// @brief Collect host registry context for behavioral score calibration.
+            /// @note NOT a detection source. Context for calibration only.
             void CheckRegistryArtifacts(VMEvasionResult& result);
 
-            /**
-             * @brief Checks file system for VM-related drivers and tools
-             * @param result Output: Detection results to update
-             */
+            /// @brief Collect host filesystem context for behavioral score calibration.
+            /// @note NOT a detection source. Context for calibration only.
             void CheckFileArtifacts(VMEvasionResult& result);
 
-            /**
-             * @brief Checks network adapters for VM-associated MAC addresses
-             * @param result Output: Detection results to update
-             */
+            /// @brief Collect host network adapter context for behavioral score calibration.
+            /// @note NOT a detection source. Context for calibration only.
             void CheckNetworkAdapters(VMEvasionResult& result);
 
-            /**
-             * @brief Checks SMBIOS/ACPI firmware tables for VM signatures
-             * @param result Output: Detection results to update
-             */
+            /// @brief Collect host firmware context for behavioral score calibration.
+            /// @note NOT a detection source. Context for calibration only.
             void CheckFirmwareTables(VMEvasionResult& result);
 
-            /**
-             * @brief Enumerates running processes for VM tools
-             * @param result Output: Detection results to update
-             */
+            /// @brief Collect host process landscape for behavioral score calibration.
+            /// @note NOT a detection source. Context for calibration only.
             void CheckRunningProcesses(VMEvasionResult& result);
 
-            /**
-             * @brief Performs timing-based VM detection
-             * @param result Output: Detection results to update
-             * @warning May produce false positives on heavily loaded systems
-             */
+            /// @brief Collect host timing characteristics for score calibration.
+            /// @note NOT a detection source. Context for calibration only.
             void CheckTiming(VMEvasionResult& result);
 
-            /**
-             * @brief Probes known VM I/O ports
-             * @param result Output: Detection results to update
-             * @warning May cause issues in some VM environments
-             */
+            /// @brief Collect host I/O port characteristics for score calibration.
+            /// @note NOT a detection source. Context for calibration only.
             void CheckIOPorts(VMEvasionResult& result);
 
-            /**
-             * @brief Scans memory for VM-related artifacts
-             * @param result Output: Detection results to update
-             */
+            /// @brief Collect host memory artifacts for score calibration.
+            /// @note NOT a detection source. Context for calibration only.
             void CheckMemoryArtifacts(VMEvasionResult& result);
 
-            /**
-             * @brief Enumerates devices for VM-specific hardware IDs
-             * @param result Output: Detection results to update
-             */
+            /// @brief Collect host device context for score calibration.
+            /// @note NOT a detection source. Context for calibration only.
             void CheckDevices(VMEvasionResult& result);
 
-            /**
-             * @brief Performs WMI queries for VM detection
-             * @param result Output: Detection results to update
-             */
+            /// @brief Collect host WMI context for score calibration.
+            /// @note NOT a detection source. Context for calibration only.
             void CheckWMI(VMEvasionResult& result);
 
-            /**
-             * @brief Enumerates windows for VM tool window classes
-             * @param result Output: Detection results to update
-             */
+            /// @brief Collect host window context for score calibration.
+            /// @note NOT a detection source. Context for calibration only.
             void CheckWindows(VMEvasionResult& result);
 
             // ========================================================================

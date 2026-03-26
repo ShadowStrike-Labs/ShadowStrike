@@ -17,13 +17,30 @@
  */
 /**
  * @file EnvironmentEvasionDetector.cpp
- * @brief Enterprise-grade environment-based sandbox/analysis evasion detection
+ * @brief Behavioral detection of environment-probing evasion in target processes
  *
  * ShadowStrike AntiEvasion - Environment Evasion Detection Module
  * Copyright (c) 2026 ShadowStrike Security Suite. All rights reserved.
  *
- * This module detects malware that attempts to evade analysis by checking
- * environmental characteristics (usernames, hardware, artifacts, etc.)
+ * DESIGN PHILOSOPHY — DEFENDER PERSPECTIVE:
+ *
+ * This module detects MALWARE that attempts to evade analysis by probing
+ * the host environment (checking for VMs, sandboxes, analysis tools, etc.).
+ * The detector does NOT probe the host environment itself — that would be
+ * acting like malware. Instead, it analyzes TARGET PROCESSES for behavioral
+ * indicators of environment-probing evasion:
+ *
+ *   PRIMARY DETECTION (TYPE B — behavioral analysis of target process):
+ *    - PE import table analysis for evasion-related API clusters
+ *    - PE data section scan for embedded VM/sandbox identifiers
+ *    - API hook detection patterns (ntdll unhooking attempts)
+ *    - Kernel-enriched correlation (suspicious parent chains, paths)
+ *    - Environment variable and filename anomaly detection
+ *
+ *   CONTEXT ENRICHMENT (host awareness for score calibration):
+ *    - Host CPUID/hardware context — adjusts confidence on VMs vs bare metal
+ *    - Host identity context — used to calibrate false positive thresholds
+ *    - These are NOT detection sources; they tune behavioral scores
  *
  * Implementation follows enterprise C++20 standards:
  * - PIMPL pattern for ABI stability
@@ -2178,13 +2195,15 @@ namespace ShadowStrike::AntiEvasion {
         }
 
         // Run detection checks — ONLY behavioral TYPE B checks that analyze the TARGET process.
-        // System-wide environment checks (CheckBlacklistedNames, CheckHardwareFingerprint,
-        // CheckFileSystemArtifacts, CheckRegistryArtifacts, CheckNetworkConfiguration,
-        // CheckRunningProcesses, CheckTimingIndicators, CheckUserActivity, CheckDisplayConfiguration,
-        // CheckBrowserArtifacts, CheckPeripheralHistory) are intentionally EXCLUDED here.
-        // They belong in AnalyzeSystemInternal (explicit system-wide scan) only.
-        // Adding system-wide state to per-process scores causes false positives on all
-        // Azure/Hyper-V/cloud VMs where every process would be flagged as evasive.
+        //
+        // Host-probing methods (CheckBlacklistedNames, CheckHardwareFingerprint,
+        // CheckFileSystemArtifacts, CheckRegistryArtifacts, CheckTimingIndicators, etc.)
+        // are NOT called here. They are context-enrichment utilities used only by
+        // AnalyzeSystemInternal to calibrate scoring — never as detection sources.
+        //
+        // This ensures zero false positives on Azure/Hyper-V/AWS/cloud VMs:
+        // the EDR does not flag the host as "evasive" just because it IS a VM.
+        // Instead, we detect PROCESSES that exhibit evasion-probing behavior.
         std::vector<EnvironmentDetectedTechnique> detections;
 
         // === TYPE B: Target process environment variable analysis ===
@@ -2226,31 +2245,86 @@ namespace ShadowStrike::AntiEvasion {
         const EnvironmentAnalysisConfig& config,
         EnvironmentEvasionResult& result
     ) noexcept {
-        // System-wide analysis (similar to process analysis but without process-specific checks)
+        // ====================================================================
+        // SYSTEM-WIDE BEHAVIORAL SCAN
+        //
+        // This method performs BEHAVIORAL analysis across all running processes.
+        // It does NOT probe the host to determine if we are inside a VM/sandbox.
+        // That would be the malware's job — our job is to detect processes that
+        // exhibit environment-probing behavior.
+        //
+        // Architecture:
+        //  1. Enumerate all running processes
+        //  2. Run per-process behavioral analysis on each (AnalyzeProcessInternal)
+        //  3. Aggregate results: track which processes show evasion indicators
+        //  4. Optionally collect host context (VM/sandbox presence) to CALIBRATE
+        //     confidence scores — NOT as a detection source
+        //
+        // The host context calibration adjusts scoring:
+        //  - On a VM: a process checking for VM artifacts is LESS suspicious
+        //    (the artifacts genuinely exist; even legitimate software checks)
+        //  - On bare metal: a process checking for VM artifacts is MORE suspicious
+        //    (there are no VMs to detect; the process is likely profiling)
+        // ====================================================================
+
         result.targetPid = 0;
-        result.processName = L"[System-Wide Scan]";
+        result.processName = L"[System-Wide Behavioral Scan]";
         result.config = config;
         result.analysisStartTime = std::chrono::system_clock::now();
 
-        // Use cached system info
+        // --- Phase 1: Collect host context for score calibration ---
+        // This tells us whether the host IS a VM/sandbox so we can adjust
+        // confidence when processes probe for these artifacts.
         if (m_impl->m_cachedIdentityInfo) {
             result.identityInfo = *m_impl->m_cachedIdentityInfo;
         }
-
         if (m_impl->m_cachedHardwareInfo) {
             result.hardwareInfo = *m_impl->m_cachedHardwareInfo;
         }
 
-        std::vector<EnvironmentDetectedTechnique> detections;
+        // Determine if we are on a VM for score calibration
+        bool hostIsVirtualized = false;
+        if (m_impl->m_cachedHardwareInfo) {
+            // Check CPUID hypervisor bit and known VM vendor strings
+            const auto& hw = *m_impl->m_cachedHardwareInfo;
+            hostIsVirtualized = hw.hypervisorPresent || hw.isVirtualMachine;
+        }
 
-        CheckBlacklistedNames(detections, nullptr);
-        CheckHardwareFingerprint(result.hardwareInfo, detections, nullptr);
-        CheckFileSystemArtifacts(detections, nullptr);
-        CheckRegistryArtifacts(detections, nullptr);
-        CheckTimingIndicators(detections, nullptr);
+        // --- Phase 2: Behavioral scan of all running processes ---
+        auto batchResult = AnalyzeAllProcesses(config, nullptr, nullptr);
 
-        for (auto& detection : detections) {
-            AddDetection(result, std::move(detection));
+        // --- Phase 3: Aggregate behavioral results ---
+        // Merge per-process detections into the system-wide result.
+        // Each detection is tagged with the source process for traceability.
+        for (auto& processResult : batchResult.results) {
+            if (!processResult.analysisComplete) continue;
+
+            for (auto& detection : processResult.detectedTechniques) {
+                // Calibrate confidence based on host context:
+                // If the host IS virtualized and the process is checking for VMs,
+                // reduce confidence (legitimate software may do this on VMs).
+                if (hostIsVirtualized) {
+                    const bool isVmProbing =
+                        detection.category == EnvironmentEvasionCategory::HardwareFingerprinting ||
+                        detection.category == EnvironmentEvasionCategory::RegistryArtifacts ||
+                        detection.category == EnvironmentEvasionCategory::FileSystemArtifacts;
+
+                    if (isVmProbing && detection.confidence > 0.3) {
+                        detection.confidence *= 0.6;  // Reduce on VM hosts
+                    }
+                }
+
+                // Tag with source process for forensic traceability
+                if (detection.detectedValue.empty()) {
+                    detection.detectedValue = L"pid:" + std::to_wstring(processResult.targetPid) +
+                        L" (" + processResult.processName + L")";
+                } else {
+                    detection.detectedValue = L"pid:" + std::to_wstring(processResult.targetPid) +
+                        L" (" + processResult.processName + L") — " + detection.detectedValue;
+                }
+
+                AddDetection(result, std::move(detection));
+            }
         }
 
         CalculateEvasionScore(result);

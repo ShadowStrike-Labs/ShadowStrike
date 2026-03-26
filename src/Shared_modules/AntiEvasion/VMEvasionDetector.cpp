@@ -17,25 +17,27 @@
  */
 /**
  * @file VMEvasionDetector.cpp
- * @brief Enterprise-grade VM/Hypervisor detection implementation
+ * @brief Behavioral detection of anti-VM evasion in target processes
  *
  * ShadowStrike AntiEvasion - VM Evasion Detection Module
  * Copyright (c) 2026 ShadowStrike Security Suite. All rights reserved.
  *
- * PRODUCTION-LEVEL IMPLEMENTATION
- * - Thread-safe with std::shared_mutex for concurrent access
- * - PIMPL pattern for ABI stability
- * - Comprehensive error handling with try-catch blocks
- * - Statistics tracking with std::atomic counters
- * - Caching with TTL for performance
- * - Integration with ThreatIntel and SignatureStore
- * - Assembly integration for low-level CPU checks
+ * DESIGN PHILOSOPHY — DEFENDER PERSPECTIVE:
  *
- * Detection Capabilities:
- * - 100+ distinct VM indicators across 12 detection categories
- * - Support for VMware, VirtualBox, Hyper-V, KVM, Xen, Parallels, and more
- * - Process analysis for anti-VM behavior detection
- * - Performance: <1ms quick check, <50ms standard, <200ms deep analysis
+ * This module detects MALWARE that attempts to evade analysis by probing
+ * for VM/hypervisor indicators. The detector does NOT probe the host
+ * environment itself — that would be acting like malware.
+ *
+ * PRIMARY DETECTION (behavioral analysis of target process):
+ *  - Memory scanning for anti-VM instruction patterns
+ *  - PE import/section analysis for evasion-related API clusters
+ *  - Code pattern recognition (Red Pill, No Pill, Scoopy Doo)
+ *
+ * HOST CONTEXT (for scoring calibration — NOT detection):
+ *  - CPUID/registry/network context → adjusts confidence on VM vs bare metal
+ *
+ * Thread-safe with shared_mutex. PIMPL pattern for ABI stability.
+ * Assembly integration for low-level CPU checks (context only).
  */
 #include"pch.h"
 #include "VMEvasionDetector.hpp"
@@ -1163,7 +1165,19 @@ struct VMEvasionDetector::Impl {
         m_cacheTimestamp = std::chrono::system_clock::now();
     }
 
-    // Core detection logic — caller MUST hold m_mutex (shared or exclusive)
+    // ====================================================================
+    // HOST CONTEXT COLLECTION — for behavioral score calibration.
+    //
+    // These Check* methods probe the HOST environment to determine if
+    // we are on a VM/hypervisor. This information is NOT used as a
+    // detection source — it CALIBRATES behavioral per-process scores.
+    //
+    // On a VM host: processes probing for VM artifacts → LOWER confidence
+    // On bare metal: processes probing for VM artifacts → HIGHER confidence
+    //
+    // Primary detection is via ScanAllProcesses / AnalyzeProcessAntiVMBehavior
+    // which scan TARGET PROCESS code and memory for anti-VM patterns.
+    // ====================================================================
     void RunDetectionChecks(VMEvasionDetector& outer, VMEvasionResult& result) {
         const auto& config = m_config;
 
@@ -1272,8 +1286,43 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment() {
     result.detectionTime = std::chrono::system_clock::now();
 
     try {
-        std::shared_lock<std::shared_mutex> lock(m_impl->m_mutex);
-        m_impl->RunDetectionChecks(*this, result);
+        // --- Phase 1: Collect host context for behavioral score calibration ---
+        // This determines if we ARE on a VM so behavioral scores can be adjusted.
+        // These Check* methods are context providers, not primary detection sources.
+        {
+            std::shared_lock<std::shared_mutex> lock(m_impl->m_mutex);
+            m_impl->RunDetectionChecks(*this, result);
+        }
+
+        // --- Phase 2: Behavioral scan of all running processes ---
+        // This is the PRIMARY detection: scan each process for anti-VM code patterns.
+        std::unordered_map<Utils::ProcessUtils::ProcessId, ProcessVMEvasionResult> processResults;
+        ScanAllProcesses(processResults);
+
+        // --- Phase 3: Merge behavioral results with context calibration ---
+        // Adjust process behavioral scores based on host context.
+        const bool hostIsVirtualized = result.isVM;
+        for (auto& [pid, procResult] : processResults) {
+            if (procResult.hasAntiVMBehavior) {
+                // On a real VM, reduce behavioral score (anti-VM checks are
+                // less suspicious because VM artifacts genuinely exist).
+                if (hostIsVirtualized && procResult.evasionScore > 20.0f) {
+                    procResult.evasionScore *= 0.6f;
+                }
+
+                // Add to the main result's artifact list for forensic traceability
+                AddArtifact(
+                    result,
+                    VMDetectionCategory::BehaviorAnalysis,
+                    result.detectedType,
+                    procResult.evasionScore,
+                    L"Process exhibits anti-VM behavior: " + procResult.processName,
+                    L"PID: " + std::to_wstring(pid),
+                    L"Behavioral Analysis"
+                );
+            }
+        }
+
         result.completed = true;
 
     } catch (const std::exception& e) {
@@ -1292,13 +1341,11 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment() {
     m_impl->UpdateCache(result);
 
     if (result.isVM) {
-        m_impl->m_statistics.vmDetectedCount.fetch_add(1, std::memory_order_relaxed);
-        SS_LOG_WARN(L"AntiEvasion", L"VMEvasionDetector: VM DETECTED - %ls (confidence: %.1f%%, duration: %lldms)",
-                           VMTypeToString(result.detectedType).c_str(),
-                           result.confidenceScore,
-                           result.detectionDuration.count() / 1000000);
+        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Host context — VM detected (%ls, confidence: %.1f%%). "
+                          L"Behavioral scores calibrated for VM environment.",
+                          VMTypeToString(result.detectedType).c_str(), result.confidenceScore);
     } else {
-        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: No VM detected (duration: %lldms)",
+        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Host context — bare metal (duration: %lldms)",
                           result.detectionDuration.count() / 1000000);
     }
 
@@ -1313,20 +1360,41 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment(const VMDetectionConfig& co
     result.detectionTime = std::chrono::system_clock::now();
 
     try {
-        // Exclusive lock: safely swap config, run checks, restore
-        std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
-        const auto originalConfig = m_impl->m_config;
-        m_impl->m_config = config;
-        m_impl->m_config.enableCaching = false;
+        // Phase 1: Collect host context with custom config
+        {
+            std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
+            const auto originalConfig = m_impl->m_config;
+            m_impl->m_config = config;
+            m_impl->m_config.enableCaching = false;
 
-        try {
-            m_impl->RunDetectionChecks(*this, result);
-            result.completed = true;
-        } catch (...) {
+            try {
+                m_impl->RunDetectionChecks(*this, result);
+            } catch (...) {
+                m_impl->m_config = originalConfig;
+                throw;
+            }
             m_impl->m_config = originalConfig;
-            throw;
         }
-        m_impl->m_config = originalConfig;
+
+        // Phase 2: Behavioral scan of all running processes
+        std::unordered_map<Utils::ProcessUtils::ProcessId, ProcessVMEvasionResult> processResults;
+        ScanAllProcesses(processResults);
+
+        // Phase 3: Merge with context calibration
+        const bool hostIsVirtualized = result.isVM;
+        for (auto& [pid, procResult] : processResults) {
+            if (procResult.hasAntiVMBehavior) {
+                if (hostIsVirtualized && procResult.evasionScore > 20.0f) {
+                    procResult.evasionScore *= 0.6f;
+                }
+                AddArtifact(result, VMDetectionCategory::BehaviorAnalysis,
+                    result.detectedType, procResult.evasionScore,
+                    L"Process exhibits anti-VM behavior: " + procResult.processName,
+                    L"PID: " + std::to_wstring(pid), L"Behavioral Analysis");
+            }
+        }
+
+        result.completed = true;
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"AntiEvasion", L"VMEvasionDetector: Custom-config detection failed - %hs", e.what());
@@ -1338,10 +1406,8 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment(const VMDetectionConfig& co
     result.detectionDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime);
     UpdateStatistics(result, result.detectionDuration);
 
-    // Do NOT cache custom-config results
     if (result.isVM) {
-        m_impl->m_statistics.vmDetectedCount.fetch_add(1, std::memory_order_relaxed);
-        SS_LOG_WARN(L"AntiEvasion", L"VMEvasionDetector: VM DETECTED (custom config) - %ls (confidence: %.1f%%)",
+        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Host context (custom config) — VM detected (%ls, confidence: %.1f%%)",
                            VMTypeToString(result.detectedType).c_str(), result.confidenceScore);
     }
 
@@ -1356,18 +1422,39 @@ VMEvasionResult VMEvasionDetector::DetectEnvironmentWithProgress(ProgressCallbac
     result.detectionTime = std::chrono::system_clock::now();
 
     try {
-        // Exclusive lock: safely set callback, run checks, clear callback
-        std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
-        m_impl->m_progressCallback = std::move(callback);
+        // Phase 1: Collect host context with progress reporting
+        {
+            std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
+            m_impl->m_progressCallback = std::move(callback);
 
-        try {
-            m_impl->RunDetectionChecks(*this, result);
-            result.completed = true;
-        } catch (...) {
+            try {
+                m_impl->RunDetectionChecks(*this, result);
+            } catch (...) {
+                m_impl->m_progressCallback = nullptr;
+                throw;
+            }
             m_impl->m_progressCallback = nullptr;
-            throw;
         }
-        m_impl->m_progressCallback = nullptr;
+
+        // Phase 2: Behavioral scan of all running processes
+        std::unordered_map<Utils::ProcessUtils::ProcessId, ProcessVMEvasionResult> processResults;
+        ScanAllProcesses(processResults);
+
+        // Phase 3: Merge with context calibration
+        const bool hostIsVirtualized = result.isVM;
+        for (auto& [pid, procResult] : processResults) {
+            if (procResult.hasAntiVMBehavior) {
+                if (hostIsVirtualized && procResult.evasionScore > 20.0f) {
+                    procResult.evasionScore *= 0.6f;
+                }
+                AddArtifact(result, VMDetectionCategory::BehaviorAnalysis,
+                    result.detectedType, procResult.evasionScore,
+                    L"Process exhibits anti-VM behavior: " + procResult.processName,
+                    L"PID: " + std::to_wstring(pid), L"Behavioral Analysis");
+            }
+        }
+
+        result.completed = true;
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"AntiEvasion", L"VMEvasionDetector: Detection with progress failed - %hs", e.what());
@@ -1381,8 +1468,7 @@ VMEvasionResult VMEvasionDetector::DetectEnvironmentWithProgress(ProgressCallbac
     m_impl->UpdateCache(result);
 
     if (result.isVM) {
-        m_impl->m_statistics.vmDetectedCount.fetch_add(1, std::memory_order_relaxed);
-        SS_LOG_WARN(L"AntiEvasion", L"VMEvasionDetector: VM DETECTED - %ls (confidence: %.1f%%)",
+        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Host context — VM detected (%ls, confidence: %.1f%%)",
                            VMTypeToString(result.detectedType).c_str(), result.confidenceScore);
     }
 

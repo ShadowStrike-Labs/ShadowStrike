@@ -17,79 +17,60 @@
  */
 /**
  * @file SandboxEvasionDetector.hpp
- * @brief Enterprise-grade detection of automated malware analysis sandbox evasion techniques.
+ * @brief Behavioral detection of anti-sandbox evasion techniques in target processes
  *
- * This module provides comprehensive detection of techniques used by malware to identify
- * and evade automated analysis sandboxes such as Cuckoo, Joe Sandbox, ANY.RUN, Hybrid Analysis,
- * VirusTotal, Windows Sandbox, and enterprise sandbox solutions.
+ * This module detects MALWARE that attempts to evade automated analysis sandboxes
+ * by probing the host environment. The detector does NOT check if the host IS a
+ * sandbox — that would be acting like malware. Instead, it analyzes TARGET PROCESSES
+ * for behavioral indicators of sandbox-probing evasion.
  *
  * =============================================================================
- * DETECTED TECHNIQUES (MITRE ATT&CK T1497.001 - System Checks)
+ * DESIGN PHILOSOPHY — DEFENDER PERSPECTIVE
+ * =============================================================================
+ *
+ * PRIMARY DETECTION (behavioral analysis of target processes):
+ *  - PE import analysis for sandbox-detection API clusters (T1497.001)
+ *  - Embedded string scan for sandbox identifiers in target PE sections
+ *  - Code pattern analysis for timing-evasion sequences (sleep bombing,
+ *    RDTSC delta checks, GetTickCount loops)
+ *  - API hook detection patterns (ntdll/kernel32 unhooking attempts)
+ *
+ * HOST CONTEXT (for scoring calibration — NOT primary detection):
+ *  - Hardware profiling (RAM, CPU, disk) → adjusts confidence
+ *  - System wear/tear metrics → calibrates false-positive thresholds
+ *  - Known sandbox artifacts → reduces confidence when host IS a sandbox
+ *  - Human interaction analysis → environmental context
+ *
+ * =============================================================================
+ * DETECTED EVASION CATEGORIES (in target processes)
  * =============================================================================
  *
  * 1. HUMAN INTERACTION DETECTION:
- *    - Mouse movement patterns and click analysis
- *    - Keyboard input monitoring
- *    - Window focus/interaction patterns
- *    - Clipboard activity monitoring
- *    - User activity timing analysis
+ *    Target process checks for mouse movement, keyboard input, window focus
  *
  * 2. HARDWARE FINGERPRINTING:
- *    - RAM size (sandboxes often < 4GB)
- *    - CPU core count (sandboxes often ≤ 2 cores)
- *    - Disk size and type (sandboxes often < 80GB)
- *    - GPU presence and capabilities
- *    - USB device history
- *    - Network adapter count and types
- *    - BIOS/UEFI information
+ *    Target process queries RAM size, CPU count, disk size to detect sandboxes
  *
  * 3. SYSTEM WEAR AND TEAR:
- *    - Recent documents count
- *    - Browser history depth
- *    - Desktop/Downloads file count
- *    - Installed program count
- *    - Temp file age distribution
- *    - Event log depth
- *    - System restore point count
- *    - User profile count and age
+ *    Target process checks recent documents, browser history, desktop files
  *
  * 4. TIMING ANALYSIS:
- *    - System uptime (sandboxes often < 10 minutes)
- *    - Process creation timestamps
- *    - System install date
- *    - Last boot time patterns
+ *    Target process uses RDTSC, GetTickCount, Sleep patterns for sandbox detection
  *
  * 5. SANDBOX ARTIFACT DETECTION:
- *    - Known sandbox DLLs (sbiedll.dll, dbghelp.dll hooks)
- *    - Sandbox-specific registry keys
- *    - Analysis tool processes
- *    - Known sandbox mutexes/named pipes
- *    - Agent service detection
- *    - Hook detection in system DLLs
+ *    Target process scans for sandbox DLLs, registry keys, processes, mutexes
  *
  * 6. ENVIRONMENT CHECKS:
- *    - Screen resolution (sandboxes often 800x600 or 1024x768)
- *    - Color depth limitations
- *    - Audio device presence
- *    - Printer/scanner presence
- *    - Monitor count and arrangement
- *    - Timezone and locale consistency
+ *    Target process checks screen resolution, audio devices, monitor count
  *
  * 7. NETWORK CHARACTERISTICS:
- *    - DNS resolver analysis
- *    - Gateway/router fingerprinting
- *    - External IP geolocation
- *    - Network latency patterns
- *    - Blocked port detection
+ *    Target process fingerprints DNS resolver, gateway, external IP
  *
  * 8. FILE SYSTEM ANALYSIS:
- *    - System32 file count and timestamps
- *    - Program Files diversity
- *    - User profile completeness
- *    - Document metadata analysis
+ *    Target process checks System32 timestamps, Program Files diversity
  *
  * =============================================================================
- * KNOWN SANDBOX PRODUCTS DETECTED
+ * KNOWN SANDBOX PRODUCTS (context calibration)
  * =============================================================================
  *
  * | Sandbox              | Detection Methods                              |
@@ -97,7 +78,7 @@
  * | Cuckoo Sandbox      | Agent process, cuckoomon.dll, network patterns |
  * | Joe Sandbox         | joeboxserver, joeboxcontrol processes          |
  * | ANY.RUN             | anyrun artifacts, characteristic timeouts      |
- * | Hybrid Analysis     | enterprise-grade agent, specific registry keys           |
+ * | Hybrid Analysis     | enterprise-grade agent, specific registry keys |
  * | VirusTotal          | VT-specific behaviors, timing patterns         |
  * | Windows Sandbox     | WindowsSandbox.exe, container markers          |
  * | Sandboxie           | SbieDll.dll, SBIE mutex                        |
@@ -107,42 +88,6 @@
  * | CAPE Sandbox        | cape_handler, analysis artifacts               |
  * | FireEye AX          | AX agent, network signatures                   |
  * | Triage              | Hatching artifacts                             |
- *
- * =============================================================================
- * ARCHITECTURE
- * =============================================================================
- *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │                     SandboxEvasionDetector                              │
- * ├─────────────────────────────────────────────────────────────────────────┤
- * │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐         │
- * │  │ Human Interaction│  │Hardware Profiler│  │ Artifact Scanner│         │
- * │  │ - Mouse/Keyboard │  │ - RAM/CPU/Disk  │  │ - DLLs/Mutexes  │         │
- * │  │ - Timing         │  │ - GPU/Network   │  │ - Processes     │         │
- * │  └─────────────────┘  └─────────────────┘  └─────────────────┘         │
- * │           │                   │                   │                     │
- * │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐         │
- * │  │ Wear & Tear     │  │ Environment     │  │ Network Analyzer │         │
- * │  │ - Documents     │  │ - Screen        │  │ - DNS/Gateway    │         │
- * │  │ - History       │  │ - Devices       │  │ - Latency        │         │
- * │  └─────────────────┘  └─────────────────┘  └─────────────────┘         │
- * │           │                   │                   │                     │
- * │           └───────────────────┼───────────────────┘                     │
- * │                               ▼                                         │
- * │                    ┌─────────────────────┐                              │
- * │                    │   Scoring Engine    │                              │
- * │                    │  - Weight system    │                              │
- * │                    │  - Correlation      │                              │
- * │                    │  - Threshold calc   │                              │
- * │                    └─────────────────────┘                              │
- * │                               │                                         │
- * │                               ▼                                         │
- * │                    ┌─────────────────────┐                              │
- * │                    │  Result Aggregator  │                              │
- * │                    │  - MITRE mapping    │                              │
- * │                    │  - Sandbox ID       │                              │
- * │                    └─────────────────────┘                              │
- * └─────────────────────────────────────────────────────────────────────────┘
  *
  * @note Thread-safe for all public methods.
  * @note Some checks require administrator privileges for full accuracy.
@@ -2234,71 +2179,90 @@ namespace ShadowStrike {
             [[nodiscard]] SandboxDetectorConfig GetConfig() const;
 
             // =========================================================================
-            // Full System Scan
+            // System-Wide Behavioral Scan
             // =========================================================================
 
             /**
-             * @brief Performs a comprehensive system scan for sandbox characteristics.
-             * @return Complete analysis result.
-             * @note This may take several seconds depending on configuration.
+             * @brief Scans all running processes for anti-sandbox evasion behavior.
+             *
+             * Phase 1: Collects host context (hardware, timing, artifacts) for
+             *   behavioral score CALIBRATION — not as a detection source.
+             * Phase 2: Analyzes each process for embedded sandbox detection
+             *   imports, strings, and code patterns (the primary detection).
+             *
+             * @return Complete analysis result with per-process behavioral findings.
+             * @note May take several seconds depending on configuration.
              */
             [[nodiscard]] SandboxEvasionResult ScanSystem();
 
             /**
-             * @brief Perform async system scan.
+             * @brief Async version of ScanSystem().
              * @param callback Callback invoked when scan completes.
              * @return true if scan started successfully.
              */
             [[nodiscard]] bool ScanSystemAsync(std::function<void(SandboxEvasionResult)> callback);
 
             /**
-             * @brief Quick scan with minimal checks.
+             * @brief Quick scan with minimal checks (artifact-based, NOT behavioral).
              * @return true if sandbox likely, false otherwise.
-             * @note Faster but less comprehensive than ScanSystem().
+             * @note Context query only — use ScanSystem() for full behavioral scan.
              */
             [[nodiscard]] bool QuickScan();
 
             // =========================================================================
-            // Individual Analysis Methods
+            // HOST CONTEXT COLLECTION (for score calibration — NOT detection)
+            // =========================================================================
+            //
+            // These methods collect host environment context to CALIBRATE
+            // behavioral per-process scores. They are NOT detection sources.
+            //
+            // On a sandbox host: anti-sandbox probing → LOWER confidence
+            // On a production host: anti-sandbox probing → HIGHER confidence
             // =========================================================================
 
             /**
-             * @brief Analyze hardware profile.
+             * @brief Collect host hardware context for behavioral score calibration.
              * @return Hardware analysis results.
+             * @note Context for calibration, not a detection source.
              */
             [[nodiscard]] HardwareProfile AnalyzeHardware();
 
             /**
-             * @brief Analyze system wear and tear.
+             * @brief Collect system wear/tear context for behavioral score calibration.
              * @return Wear and tear analysis results.
+             * @note Context for calibration, not a detection source.
              */
             [[nodiscard]] WearAndTearAnalysis AnalyzeWearAndTear();
 
             /**
-             * @brief Analyze environment characteristics.
+             * @brief Collect environment context for behavioral score calibration.
              * @return Environment analysis results.
+             * @note Context for calibration, not a detection source.
              */
             [[nodiscard]] EnvironmentAnalysis AnalyzeEnvironment();
 
             /**
-             * @brief Scan for sandbox artifacts.
+             * @brief Scan for sandbox artifacts (context enrichment).
              * @return Artifact analysis results.
+             * @note Context for calibration, not a detection source.
              */
             [[nodiscard]] ArtifactAnalysis ScanArtifacts();
 
             /**
-             * @brief Monitors user input to verify human presence.
+             * @brief Monitor user input to verify human presence (context).
              * @param monitoringDurationMs Duration to monitor (milliseconds).
              * @return true if human interaction pattern is detected.
+             * @note Context for calibration, not a detection source.
              */
             [[nodiscard]] bool VerifyHumanInteraction(
                 uint32_t monitoringDurationMs = SandboxConstants::DEFAULT_INTERACTION_MONITOR_MS
             );
 
             /**
-             * @brief Detailed human interaction analysis.
+             * @brief Detailed human interaction analysis (context).
              * @param monitoringDurationMs Duration to monitor.
              * @return Detailed interaction analysis results.
+             * @note Context for calibration, not a detection source.
              */
             [[nodiscard]] HumanInteractionAnalysis AnalyzeHumanInteraction(
                 uint32_t monitoringDurationMs = SandboxConstants::DEFAULT_INTERACTION_MONITOR_MS
