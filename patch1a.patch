@@ -1,0 +1,10 @@
+--- a/PhantomSensor/Shared/MessageProtocol.h
++++ b/PhantomSensor/Shared/MessageProtocol.h
+@@ -34,6 +34,7 @@
+ #define SHADOWSTRIKE_MSG_FLAG_HMAC              0x00000002  // HMAC-SHA256 appended after data (32 bytes)
+ #define SHADOWSTRIKE_MSG_FLAG_PRIORITY_HIGH     0x00000004  // High-priority delivery
+ #define SHADOWSTRIKE_MSG_FLAG_NO_ACK            0x00000008  // Fire-and-forget, no acknowledgment needed
++#define SHADOWSTRIKE_MSG_FLAG_ENCRYPTED         0x00000010  // Payload encrypted with per-session AES-256-GCM key
+ 
+ // Ensure structure packing is consistent
+ #pragma pack(push, 1)

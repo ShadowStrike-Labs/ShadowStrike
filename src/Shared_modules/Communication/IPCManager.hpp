@@ -852,6 +852,10 @@ private:
     
     static std::atomic<bool> s_instanceCreated;
 
+    // Primary filter connection (encrypts all kernel communication)
+    std::unique_ptr<FilterConnection> m_primaryConnection;
+    mutable std::mutex m_primaryConnMutex;
+
     // Dedicated push connection (separate handle for user→kernel data push)
     std::unique_ptr<FilterConnection> m_pushConnection;
     std::unique_ptr<ThreatIntelPusher> m_pusher;

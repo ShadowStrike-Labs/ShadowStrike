@@ -123,6 +123,7 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
+#include "../Security/CryptoManager.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -166,8 +167,38 @@ namespace ServiceCommConstants {
     /// @brief Protocol magic
     inline constexpr uint32_t PROTOCOL_MAGIC = 0x53535043;  // "SSPC"
     
-    /// @brief Protocol version
-    inline constexpr uint32_t PROTOCOL_VERSION = 0x00030000;
+    /// @brief Protocol version — bumped to 3.1 for encrypted pipe protocol
+    inline constexpr uint32_t PROTOCOL_VERSION = 0x00030001;
+
+    /// @brief Size of HMAC-SHA256 output
+    inline constexpr size_t HMAC_SIZE = 32;
+
+    /// @brief AES-256-GCM nonce size
+    inline constexpr size_t GCM_NONCE_SIZE = 12;
+
+    /// @brief AES-256-GCM auth tag size
+    inline constexpr size_t GCM_TAG_SIZE = 16;
+
+    /// @brief AES-256 key size
+    inline constexpr size_t AES_KEY_SIZE = 32;
+
+    /// @brief Challenge size for authentication
+    inline constexpr size_t CHALLENGE_SIZE = 32;
+
+    /// @brief Pre-shared key ID for service↔GUI HMAC auth
+    inline constexpr const char* PSK_KEY_ID = "shadowstrike-service-pipe-psk-v1";
+
+    /// @brief HKDF info string for session key derivation
+    inline constexpr const char* HKDF_SESSION_INFO = "ShadowStrike-Pipe-SessionKey-v1";
+
+    /// @brief MessageHeader flag: payload is AES-256-GCM encrypted
+    inline constexpr uint16_t MSG_FLAG_ENCRYPTED = 0x0001;
+
+    /// @brief MessageHeader flag: 32-byte HMAC-SHA256 appended after payload
+    inline constexpr uint16_t MSG_FLAG_HMAC = 0x0002;
+
+    /// @brief Replay window size (number of recent nonces tracked per client)
+    inline constexpr size_t REPLAY_WINDOW_SIZE = 256;
 
 }  // namespace ServiceCommConstants
 
@@ -193,6 +224,8 @@ enum class MessageType : uint16_t {
     Heartbeat       = 0x0003,
     HeartbeatAck    = 0x0004,
     Disconnect      = 0x0005,
+    HandshakeChallenge = 0x0006,  // Server→client: challenge for auth
+    HandshakeResponse  = 0x0007,  // Client→server: HMAC response to challenge
     Error           = 0x000F,
     
     // Commands (0x01xx)
@@ -311,7 +344,7 @@ struct MessageHeader {
     /// @brief Message type
     MessageType type = MessageType::Heartbeat;
     
-    /// @brief Flags
+    /// @brief Flags (bit field: 0x01=encrypted, 0x02=hmac_appended)
     uint16_t flags = 0;
     
     /// @brief Sequence number
@@ -348,6 +381,39 @@ struct HandshakeMessage {
     
     /// @brief Capabilities flags
     uint64_t capabilities = 0;
+};
+
+/**
+ * @brief Challenge message (server → client during authentication)
+ *
+ * After receiving Handshake, the server sends this challenge.
+ * The client must respond with HandshakeResponseMessage containing
+ * HMAC-SHA256(challenge, pre-shared-key).
+ */
+struct HandshakeChallengeMessage {
+    /// @brief Header (type = HandshakeChallenge)
+    MessageHeader header;
+
+    /// @brief 32-byte random challenge
+    uint8_t challenge[32] = {0};
+
+    /// @brief Server-generated salt for session key derivation
+    uint8_t salt[32] = {0};
+};
+
+/**
+ * @brief Response message (client → server to prove PSK knowledge)
+ *
+ * Client computes HMAC-SHA256(challenge, PSK) and sends it back.
+ * On success, both sides derive a session key via:
+ *   HKDF-SHA256(PSK, salt, "ShadowStrike-Pipe-SessionKey-v1")
+ */
+struct HandshakeResponseMessage {
+    /// @brief Header (type = HandshakeResponse)
+    MessageHeader header;
+
+    /// @brief HMAC-SHA256(challenge, PSK) — proof of PSK knowledge
+    uint8_t hmacResponse[32] = {0};
 };
 
 /**
@@ -602,8 +668,8 @@ struct ServiceCommConfiguration {
     /// @brief Heartbeat interval (ms)
     uint32_t heartbeatIntervalMs = ServiceCommConstants::HEARTBEAT_INTERVAL_MS;
     
-    /// @brief Enable encryption (reserved — CryptoUtils integration pending)
-    bool enableEncryption = false;
+    /// @brief Enable encryption (AES-256-GCM on all pipe traffic after handshake)
+    bool enableEncryption = true;
     
     /// @brief Enable authentication
     bool enableAuthentication = true;

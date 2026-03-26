@@ -541,13 +541,6 @@ bool IPCManager::SendToKernel(
     size_t* replySize,
     uint32_t timeoutMs) {
 
-    // FIX [BUG #11]: Atomic snapshot of handle
-    HANDLE hPort = m_hPort.load(std::memory_order_acquire);
-    if (hPort == nullptr) {
-        Utils::Logger::Error("[IPCManager] Cannot send - not connected to filter port");
-        return false;
-    }
-
     if (message == nullptr || messageSize == 0) {
         Utils::Logger::Error("[IPCManager] Invalid message parameters");
         return false;
@@ -559,68 +552,96 @@ bool IPCManager::SendToKernel(
         return false;
     }
 
-    auto startTime = Clock::now();
-
     // FIX [BUG #7]: Guard against reply != nullptr && replySize == nullptr
-    DWORD replyBufSize = 0;
-    if (reply != nullptr && replySize != nullptr) {
-        replyBufSize = static_cast<DWORD>(*replySize);
-    } else if (reply != nullptr && replySize == nullptr) {
+    if (reply != nullptr && replySize == nullptr) {
         Utils::Logger::Error("[IPCManager] reply buffer provided but replySize is null");
         return false;
     }
 
+    auto startTime = Clock::now();
+
+    // Route through FilterConnection for encryption
+    {
+        std::lock_guard lock(m_primaryConnMutex);
+        if (m_primaryConnection && m_primaryConnection->IsConnected()) {
+            std::span<const uint8_t> sendBuf(
+                static_cast<const uint8_t*>(message), messageSize);
+
+            if (reply && replySize) {
+                std::span<uint8_t> replyBuf(
+                    static_cast<uint8_t*>(reply), *replySize);
+                size_t bytesReturned = m_primaryConnection->SendMessage(
+                    sendBuf, replyBuf, timeoutMs);
+                *replySize = bytesReturned;
+                if (bytesReturned == 0) {
+                    m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
+            } else {
+                if (!m_primaryConnection->SendMessageNoReply(sendBuf)) {
+                    m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
+            }
+
+            auto endTime = Clock::now();
+            auto latencyUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                endTime - startTime).count();
+
+            m_impl->stats.messagesSent.fetch_add(1, std::memory_order_relaxed);
+            m_impl->stats.bytesSent.fetch_add(messageSize, std::memory_order_relaxed);
+
+            uint64_t currentAvg = m_impl->stats.avgLatencyUs.load(std::memory_order_relaxed);
+            m_impl->stats.avgLatencyUs.store(
+                (currentAvg * 95 + static_cast<uint64_t>(latencyUs) * 5) / 100,
+                std::memory_order_relaxed);
+
+            uint64_t currentMax = m_impl->stats.maxLatencyUs.load(std::memory_order_relaxed);
+            uint64_t newLatency = static_cast<uint64_t>(latencyUs);
+            while (newLatency > currentMax) {
+                if (m_impl->stats.maxLatencyUs.compare_exchange_weak(
+                        currentMax, newLatency, std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+
+            return true;
+        }
+    }
+
+    // Fallback: no primary FilterConnection available — use raw handle
+    // but log a warning since this path is unencrypted
+    HANDLE hPort = m_hPort.load(std::memory_order_acquire);
+    if (hPort == nullptr) {
+        Utils::Logger::Error("[IPCManager] Cannot send - not connected to filter port");
+        return false;
+    }
+
+    Utils::Logger::Warn("[IPCManager] SendToKernel: Falling back to raw handle "
+                         "(no encryption — primary FilterConnection unavailable)");
+
+    DWORD replyBufSize = (reply && replySize) ? static_cast<DWORD>(*replySize) : 0;
     DWORD bytesReturned = 0;
     HRESULT hr = FilterSendMessage(
         hPort,
         const_cast<void*>(message),
         static_cast<DWORD>(messageSize),
-        reply,
-        replyBufSize,
-        &bytesReturned
-    );
-
-    auto endTime = Clock::now();
-    auto latencyUs = std::chrono::duration_cast<std::chrono::microseconds>(
-        endTime - startTime).count();
+        reply, replyBufSize, &bytesReturned);
 
     if (FAILED(hr)) {
         Utils::Logger::Error("[IPCManager] FilterSendMessage failed: 0x{:08X}",
                              static_cast<unsigned int>(hr));
         m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
-
         if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
             m_connected.store(false);
             m_impl->NotifyConnectionChange(ChannelType::FilterPort, ConnectionStatus::Error);
         }
-
         return false;
     }
 
-    if (replySize != nullptr) {
-        *replySize = bytesReturned;
-    }
-
-    // Update statistics
+    if (replySize) *replySize = bytesReturned;
     m_impl->stats.messagesSent.fetch_add(1, std::memory_order_relaxed);
     m_impl->stats.bytesSent.fetch_add(messageSize, std::memory_order_relaxed);
-
-    // Update latency tracking (exponential moving average)
-    uint64_t currentAvg = m_impl->stats.avgLatencyUs.load(std::memory_order_relaxed);
-    m_impl->stats.avgLatencyUs.store(
-        (currentAvg * 95 + static_cast<uint64_t>(latencyUs) * 5) / 100,
-        std::memory_order_relaxed);
-
-    // FIX [BUG #15]: CAS loop for maxLatencyUs — plain store races under contention
-    uint64_t currentMax = m_impl->stats.maxLatencyUs.load(std::memory_order_relaxed);
-    uint64_t newLatency = static_cast<uint64_t>(latencyUs);
-    while (newLatency > currentMax) {
-        if (m_impl->stats.maxLatencyUs.compare_exchange_weak(
-                currentMax, newLatency, std::memory_order_relaxed)) {
-            break;
-        }
-    }
-
     return true;
 }
 
@@ -1657,11 +1678,32 @@ bool IPCManager::ReplyToKernel(
     uint64_t messageId,
     const SHADOWSTRIKE_SCAN_VERDICT_REPLY& verdictReply) {
 
+    // Route through FilterConnection for encryption
+    {
+        std::lock_guard lock(m_primaryConnMutex);
+        if (m_primaryConnection && m_primaryConnection->IsConnected()) {
+            std::span<const uint8_t> replyBuf(
+                reinterpret_cast<const uint8_t*>(&verdictReply),
+                sizeof(verdictReply));
+            if (!m_primaryConnection->ReplyMessage(replyBuf, messageId)) {
+                Utils::Logger::Error("[IPCManager] ReplyToKernel: encrypted reply failed for msgId {}",
+                                     messageId);
+                m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            return true;
+        }
+    }
+
+    // Fallback: raw handle (unencrypted — log warning)
     HANDLE hPort = m_hPort.load(std::memory_order_acquire);
     if (hPort == nullptr) {
         Utils::Logger::Error("[IPCManager] ReplyToKernel: not connected");
         return false;
     }
+
+    Utils::Logger::Warn("[IPCManager] ReplyToKernel: Falling back to raw handle "
+                         "(no encryption — primary FilterConnection unavailable)");
 
     // Wire format: [FILTER_REPLY_HEADER (WDK)] [SHADOWSTRIKE_SCAN_VERDICT_REPLY]
     struct alignas(8) ReplyBuffer {

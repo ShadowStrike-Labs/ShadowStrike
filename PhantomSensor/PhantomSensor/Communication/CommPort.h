@@ -149,8 +149,20 @@ typedef struct _SHADOWSTRIKE_CLIENT_PORT_REF {
     /// Slot index (for self-reference)
     LONG SlotIndex;
 
+    /// Per-session AES-256-GCM encryption key (32 bytes, derived at connection time)
+    UCHAR SessionKey[32];
+
+    /// Session nonce prefix (4 bytes, sent to client in key exchange)
+    UCHAR SessionNoncePrefix[4];
+
+    /// Monotonic nonce counter for this session (combined with prefix for unique nonces)
+    volatile LONG64 NonceCounter;
+
+    /// Whether encryption has been established for this client
+    BOOLEAN EncryptionEstablished;
+
     /// Reserved for alignment
-    UCHAR Reserved[4];
+    UCHAR Reserved[3];
 
 } SHADOWSTRIKE_CLIENT_PORT_REF, *PSHADOWSTRIKE_CLIENT_PORT_REF;
 

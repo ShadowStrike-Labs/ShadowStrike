@@ -35,8 +35,10 @@
 #include "FilterConnection.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
+#include "../Security/CryptoManager.hpp"
 
 #include <algorithm>
+#include <array>
 #include <sstream>
 #include <mutex>
 #include <atomic>
@@ -47,6 +49,11 @@
 #include <fltuser.h>
 #pragma comment(lib, "fltlib.lib")
 #endif
+
+// Include AFTER fltuser.h so __FLT_USER_STRUCTURES_H__ is defined,
+// preventing MessageProtocol.h from redefining FILTER_MESSAGE_HEADER.
+#include "../../PhantomSensor/Shared/MessageProtocol.h"
+#include "../../PhantomSensor/Shared/MessageTypes.h"
 
 namespace ShadowStrike {
 namespace Communication {
@@ -63,10 +70,16 @@ public:
             m_portName = SS_COMM_PORT_NAME;
         }
         m_stats.startTime = std::chrono::steady_clock::now();
+        m_sessionKey.fill(0);
     }
 
     ~FilterConnectionImpl() {
         Disconnect();
+        // Unconditionally scrub key material — even if encryption was never
+        // established, the array may contain partial key data from a failed
+        // key exchange attempt.
+        ShadowStrike::Security::CryptoManager::Instance().SecureZero(
+            m_sessionKey.data(), m_sessionKey.size());
     }
 
     // Non-copyable
@@ -182,6 +195,14 @@ public:
             m_connected.store(false, std::memory_order_release);
             portToClose = m_hPort;
             m_hPort = nullptr;
+        }
+
+        // Scrub session key
+        if (m_encryptionEstablished.load(std::memory_order_acquire)) {
+            ShadowStrike::Security::CryptoManager::Instance().SecureZero(
+                m_sessionKey.data(), m_sessionKey.size());
+            m_encryptionEstablished.store(false, std::memory_order_release);
+            m_nonceCounter.store(0, std::memory_order_release);
         }
 
         // Cancel any pending I/O (outside lock so GetMessage can return)
@@ -342,7 +363,15 @@ public:
         m_stats.messagesReceived++;
         m_stats.bytesReceived += actualBytes;
 
-        return static_cast<size_t>(actualBytes);
+        // Decrypt if message has SHADOWSTRIKE_MSG_FLAG_ENCRYPTED set
+        size_t decryptedBytes = static_cast<size_t>(actualBytes);
+        if (!DecryptReceivedMessage(buffer.data(), decryptedBytes)) {
+            Utils::Logger::Warn("[FilterConnection] GetMessage: Decryption failed, dropping message");
+            m_stats.errors++;
+            return 0;
+        }
+
+        return decryptedBytes;
     }
 
     [[nodiscard]] bool ReplyMessage(std::span<const uint8_t> replyBuffer,
@@ -358,11 +387,26 @@ public:
             return false;
         }
 
+        // Encrypt reply payload if session key established — NEVER fall back to plaintext
+        std::span<const uint8_t> actualReply = replyBuffer;
+        std::vector<uint8_t> encryptedReply;
+        if (m_encryptionEstablished.load(std::memory_order_acquire) &&
+            replyBuffer.size() > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+            if (EncryptSendMessage(replyBuffer, encryptedReply)) {
+                actualReply = std::span<const uint8_t>(encryptedReply);
+            } else {
+                Utils::Logger::Error("[FilterConnection] ReplyMessage: Encryption failed, "
+                                     "dropping reply (no plaintext fallback)");
+                m_stats.errors++;
+                return false;
+            }
+        }
+
         // FIX [BUG #4 HIGH]: The old check demanded payload >= sizeof(FILTER_REPLY_HEADER)
         // which is wrong — replyBuffer is the PAYLOAD, not a pre-formed reply.
         // The correct validation: total size (header + payload) must fit in DWORD
         // and not exceed MAX_MESSAGE_SIZE.
-        const size_t totalReplySize = sizeof(FILTER_REPLY_HEADER) + replyBuffer.size();
+        const size_t totalReplySize = sizeof(FILTER_REPLY_HEADER) + actualReply.size();
         if (totalReplySize > MAX_MESSAGE_SIZE) {
             Utils::Logger::Error(
                 "[FilterConnection] ReplyMessage: Reply too large ({} bytes, max {})",
@@ -379,7 +423,7 @@ public:
         pReply->Status = 0;
 
         std::memcpy(fullReply.data() + sizeof(FILTER_REPLY_HEADER),
-                   replyBuffer.data(), replyBuffer.size());
+                   actualReply.data(), actualReply.size());
 
         HRESULT hr = FilterReplyMessage(
             guard.get(),
@@ -403,7 +447,7 @@ public:
 
         m_stats.messagesSent++;
         m_stats.repliesSent++;
-        m_stats.bytesSent += replyBuffer.size();
+        m_stats.bytesSent += actualReply.size();
 
         return true;
     }
@@ -422,12 +466,27 @@ public:
             return 0;
         }
 
+        // Encrypt if session key established — NEVER fall back to plaintext
+        std::vector<uint8_t> encryptedBuf;
+        std::span<const uint8_t> actualSend = sendBuffer;
+        if (m_encryptionEstablished.load(std::memory_order_acquire) &&
+            sendBuffer.size() > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+            if (EncryptSendMessage(sendBuffer, encryptedBuf)) {
+                actualSend = std::span<const uint8_t>(encryptedBuf);
+            } else {
+                Utils::Logger::Error("[FilterConnection] SendMessage: Encryption failed, "
+                                     "dropping message (no plaintext fallback)");
+                m_stats.errors++;
+                return 0;
+            }
+        }
+
         DWORD bytesReturned = 0;
 
         HRESULT hr = FilterSendMessage(
             guard.get(),
-            const_cast<void*>(static_cast<const void*>(sendBuffer.data())),
-            static_cast<DWORD>(sendBuffer.size()),
+            const_cast<void*>(static_cast<const void*>(actualSend.data())),
+            static_cast<DWORD>(actualSend.size()),
             replyBuffer.empty() ? nullptr : replyBuffer.data(),
             static_cast<DWORD>(replyBuffer.size()),
             &bytesReturned
@@ -475,10 +534,25 @@ public:
             return false;
         }
 
+        // Encrypt if session key established — NEVER fall back to plaintext
+        std::vector<uint8_t> encryptedBuf;
+        std::span<const uint8_t> actualSend = sendBuffer;
+        if (m_encryptionEstablished.load(std::memory_order_acquire) &&
+            sendBuffer.size() > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+            if (EncryptSendMessage(sendBuffer, encryptedBuf)) {
+                actualSend = std::span<const uint8_t>(encryptedBuf);
+            } else {
+                Utils::Logger::Error("[FilterConnection] SendMessageNoReply: Encryption failed, "
+                                     "dropping message (no plaintext fallback)");
+                m_stats.errors++;
+                return false;
+            }
+        }
+
         HRESULT hr = FilterSendMessage(
             guard.get(),
-            const_cast<void*>(static_cast<const void*>(sendBuffer.data())),
-            static_cast<DWORD>(sendBuffer.size()),
+            const_cast<void*>(static_cast<const void*>(actualSend.data())),
+            static_cast<DWORD>(actualSend.size()),
             nullptr,
             0,
             nullptr
@@ -593,6 +667,124 @@ private:
     std::atomic<int32_t> m_lastError{0};
 
     CommunicationStatistics m_stats;
+
+    // Per-session encryption state
+    std::array<uint8_t, 32> m_sessionKey;
+    std::atomic<bool> m_encryptionEstablished{false};
+    std::atomic<uint64_t> m_nonceCounter{0};
+
+    //=========================================================================
+    // Encryption Helpers
+    //=========================================================================
+
+    /**
+     * @brief Decrypt an encrypted message payload in-place.
+     *
+     * Checks the SHADOWSTRIKE_MSG_FLAG_ENCRYPTED flag in the message header.
+     * If set, decrypts the data portion (after SHADOWSTRIKE_MESSAGE_HEADER)
+     * using the per-session AES-256-GCM key, with the header as AAD.
+     *
+     * @param buffer Raw message buffer (FILTER_MESSAGE_HEADER + SHADOWSTRIKE payload)
+     * @param actualBytes Total bytes received (updated if decryption changes size)
+     * @return true if no encryption flag set, or if decryption succeeded
+     */
+    bool DecryptReceivedMessage(uint8_t* buffer, size_t& actualBytes) {
+        if (!m_encryptionEstablished.load(std::memory_order_acquire)) return true;
+
+        // The filter message starts with FILTER_MESSAGE_HEADER, followed by
+        // our SHADOWSTRIKE_MESSAGE_HEADER and payload.
+        if (actualBytes < sizeof(FILTER_MESSAGE_HEADER) + sizeof(SHADOWSTRIKE_MESSAGE_HEADER))
+            return true;  // Too small to contain encrypted data
+
+        auto* ssHeader = reinterpret_cast<SHADOWSTRIKE_MESSAGE_HEADER*>(
+            buffer + sizeof(FILTER_MESSAGE_HEADER));
+
+        if (!(ssHeader->Flags & SHADOWSTRIKE_MSG_FLAG_ENCRYPTED))
+            return true;  // Not encrypted
+
+        // Data portion starts after SHADOWSTRIKE_MESSAGE_HEADER
+        const size_t dataOffset = sizeof(FILTER_MESSAGE_HEADER) + sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+        if (actualBytes <= dataOffset) return false;
+
+        const size_t encDataSize = actualBytes - dataOffset;
+        uint8_t* encData = buffer + dataOffset;
+
+        // Use CryptoManager to decrypt — the simple vector overload automatically
+        // splits [12B nonce][ciphertext][16B tag] from the combined blob
+        auto& crypto = ShadowStrike::Security::CryptoManager::Instance();
+        std::vector<uint8_t> ciphertext(encData, encData + encDataSize);
+        std::vector<uint8_t> keyVec(m_sessionKey.begin(), m_sessionKey.end());
+
+        auto plaintext = crypto.Decrypt(ciphertext, keyVec);
+
+        // Scrub key copy immediately
+        crypto.SecureZero(keyVec.data(), keyVec.size());
+
+        if (plaintext.empty() && encDataSize > 0) {
+            Utils::Logger::Warn("[FilterConnection] AES-256-GCM decryption failed "
+                                "(authentication failure or wrong key)");
+            return false;
+        }
+
+        // Copy plaintext back into buffer
+        if (plaintext.size() <= encDataSize) {
+            memcpy(encData, plaintext.data(), plaintext.size());
+            actualBytes = dataOffset + plaintext.size();
+            ssHeader->DataSize = static_cast<ULONG>(plaintext.size());
+            ssHeader->TotalSize = static_cast<ULONG>(
+                sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + plaintext.size());
+            ssHeader->Flags &= ~SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Encrypt a message payload before sending to kernel.
+     *
+     * @param plainBuffer Original message data
+     * @param[out] encryptedBuffer Output encrypted buffer
+     * @return true if encryption succeeded
+     */
+    bool EncryptSendMessage(std::span<const uint8_t> plainBuffer,
+                            std::vector<uint8_t>& encryptedBuffer) {
+        if (!m_encryptionEstablished.load(std::memory_order_acquire) ||
+            plainBuffer.size() <= sizeof(SHADOWSTRIKE_MESSAGE_HEADER))
+            return false;
+
+        auto& crypto = ShadowStrike::Security::CryptoManager::Instance();
+
+        // Split into header + data
+        const auto* header = reinterpret_cast<const SHADOWSTRIKE_MESSAGE_HEADER*>(plainBuffer.data());
+        const size_t dataSize = plainBuffer.size() - sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+        const uint8_t* data = plainBuffer.data() + sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+
+        // Encrypt data portion using simple API (returns [nonce][ciphertext][tag])
+        std::vector<uint8_t> dataVec(data, data + dataSize);
+        std::vector<uint8_t> keyVec(m_sessionKey.begin(), m_sessionKey.end());
+        auto encrypted = crypto.Encrypt(dataVec, keyVec);
+
+        if (encrypted.empty()) {
+            Utils::Logger::Error("[FilterConnection] Encryption failed");
+            return false;
+        }
+
+        // Build output: [SHADOWSTRIKE_MESSAGE_HEADER (modified)][encrypted data]
+        encryptedBuffer.resize(sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + encrypted.size());
+        memcpy(encryptedBuffer.data(), header, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+
+        auto* outHeader = reinterpret_cast<SHADOWSTRIKE_MESSAGE_HEADER*>(encryptedBuffer.data());
+        outHeader->Flags |= SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
+        outHeader->DataSize = static_cast<ULONG>(encrypted.size());
+        outHeader->TotalSize = static_cast<ULONG>(encryptedBuffer.size());
+
+        memcpy(encryptedBuffer.data() + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+               encrypted.data(), encrypted.size());
+
+        // Scrub intermediaries
+        crypto.SecureZero(keyVec.data(), keyVec.size());
+        return true;
+    }
 };
 
 // ============================================================================

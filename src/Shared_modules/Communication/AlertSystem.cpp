@@ -27,8 +27,14 @@
 #include <condition_variable>
 
 #include <WinSock2.h>
+#include <ws2tcpip.h>
 #include <shellapi.h>
+
+#define SECURITY_WIN32
+#include <security.h>
+#include <schannel.h>
 #pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Secur32.lib")
 
 namespace ShadowStrike {
 namespace Communication {
@@ -1248,8 +1254,8 @@ void AlertSystemImpl::DeliverDesktop(const Alert& alert) {
 }
 
 void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
-    // RFC 5424 syslog over UDP to 127.0.0.1:514 (configurable)
-    // Syslog facility = 4 (auth), severity mapped from AlertSeverity
+    // RFC 5425: TLS syslog over TCP to port 6514 (default), with octet-counting framing.
+    // Falls back to LOCAL LOGGING ONLY if TLS connection fails — NEVER plaintext UDP.
     static const int severityMap[] = { 6, 5, 4, 3, 2, 1 }; // Info..Emergency → 6..1
 
     const int syslogSeverity = (static_cast<size_t>(alert.severity) < 6)
@@ -1257,8 +1263,8 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
     const int priority = (4 << 3) | syslogSeverity; // facility=4 (auth)
 
     const std::string timestamp = SystemTimeToIso8601(alert.createdTime);
-    char msg[2048]{};
-    std::snprintf(msg, sizeof(msg),
+    char syslogMsg[2048]{};
+    std::snprintf(syslogMsg, sizeof(syslogMsg),
                   "<%d>1 %s %s ShadowStrike - - - [alert@shadowstrike severity=\"%s\" type=\"%s\"] %s",
                   priority,
                   timestamp.c_str(),
@@ -1267,16 +1273,363 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
                   std::string(GetAlertTypeName(alert.type)).c_str(),
                   alert.subject.c_str());
 
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) return;
+    const size_t msgLen = strlen(syslogMsg);
+
+    // RFC 5425 octet-counting framing: "<len> <message>"
+    char framedMsg[2128]{};
+    int framedLen = std::snprintf(framedMsg, sizeof(framedMsg), "%zu %s",
+                                  msgLen, syslogMsg);
+    if (framedLen <= 0 || static_cast<size_t>(framedLen) >= sizeof(framedMsg)) {
+        Utils::Logger::Error("[AlertSystem] Syslog message framing overflow");
+        return;
+    }
+
+    //
+    // Attempt TLS connection to syslog server (port 6514).
+    // Using Windows SChannel via SSPI for TLS 1.2/1.3.
+    //
+    // For this release, we use a simplified approach:
+    // 1. Establish TCP connection to configured syslog host:6514
+    // 2. Initialize SChannel security context
+    // 3. Send TLS-encrypted syslog message
+    // 4. Close connection
+    //
+    // Production optimization: maintain a persistent TLS connection pool
+    // and only reconnect on failure. This is acceptable for alert-rate traffic.
+    //
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        Utils::Logger::Warn("[AlertSystem] Cannot create TCP socket for TLS syslog: {}",
+                            WSAGetLastError());
+        return;
+    }
+
+    // Set TCP_NODELAY and connect timeout
+    BOOL noDelay = TRUE;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+               reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
+
+    // Configure non-blocking connect with 5-second timeout
+    u_long nonBlocking = 1;
+    ioctlsocket(sock, FIONBIO, &nonBlocking);
 
     sockaddr_in dest{};
     dest.sin_family = AF_INET;
-    dest.sin_port = htons(514);
+    dest.sin_port = htons(6514);  // RFC 5425 TLS syslog port
     dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    sendto(sock, msg, static_cast<int>(strlen(msg)), 0,
-           reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+    int connectResult = connect(sock, reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+    if (connectResult == SOCKET_ERROR) {
+        int wsaErr = WSAGetLastError();
+        if (wsaErr == WSAEWOULDBLOCK) {
+            // Wait for connection with timeout
+            fd_set writeSet;
+            FD_ZERO(&writeSet);
+            FD_SET(sock, &writeSet);
+            timeval tv{};
+            tv.tv_sec = 5;
+            tv.tv_usec = 0;
+
+            int selectResult = select(0, nullptr, &writeSet, nullptr, &tv);
+            if (selectResult <= 0) {
+                Utils::Logger::Warn("[AlertSystem] TLS syslog TCP connect timed out (port 6514)");
+                closesocket(sock);
+                return;
+            }
+
+            // Verify connection actually succeeded (select writable != connected)
+            int sockErr = 0;
+            int optLen = sizeof(sockErr);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR,
+                       reinterpret_cast<char*>(&sockErr), &optLen);
+            if (sockErr != 0) {
+                Utils::Logger::Warn("[AlertSystem] TLS syslog TCP connect failed after select: {}",
+                                    sockErr);
+                closesocket(sock);
+                return;
+            }
+        } else {
+            Utils::Logger::Warn("[AlertSystem] TLS syslog TCP connect failed: {}", wsaErr);
+            closesocket(sock);
+            return;
+        }
+    }
+
+    // Switch back to blocking mode for SChannel operations
+    nonBlocking = 0;
+    ioctlsocket(sock, FIONBIO, &nonBlocking);
+
+    //
+    // Initialize SChannel TLS context.
+    //
+    // SChannel requires SSPI (Security Support Provider Interface) calls:
+    //   1. AcquireCredentialsHandle — get TLS client credential
+    //   2. InitializeSecurityContext — perform TLS handshake
+    //   3. EncryptMessage — wrap application data
+    //   4. Send encrypted data over TCP
+    //   5. DeleteSecurityContext + FreeCredentialsHandle — cleanup
+    //
+    // For enterprise deployment, the syslog server's CA certificate should be
+    // trusted in the machine certificate store, or configured via AlertSystemConfig.
+    //
+    CredHandle credHandle{};
+    CtxtHandle ctxtHandle{};
+    bool schannelInitialized = false;
+
+    SCHANNEL_CRED schCred{};
+    schCred.dwVersion = SCHANNEL_CRED_VERSION;
+    schCred.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT;
+    schCred.dwFlags = SCH_CRED_AUTO_CRED_VALIDATION |
+                      SCH_CRED_NO_DEFAULT_CREDS |
+                      SCH_USE_STRONG_CRYPTO;
+
+    SECURITY_STATUS sspiStatus = AcquireCredentialsHandleW(
+        nullptr,
+        const_cast<SEC_WCHAR*>(UNISP_NAME_W),
+        SECPKG_CRED_OUTBOUND,
+        nullptr,
+        &schCred,
+        nullptr,
+        nullptr,
+        &credHandle,
+        nullptr
+    );
+
+    if (sspiStatus != SEC_E_OK) {
+        Utils::Logger::Warn("[AlertSystem] SChannel AcquireCredentialsHandle failed: 0x{:08X}",
+                            static_cast<unsigned int>(sspiStatus));
+        closesocket(sock);
+        return;
+    }
+
+    // TLS handshake loop
+    SecBufferDesc outBufferDesc{};
+    SecBuffer outBuffer{};
+    ULONG contextAttribs = 0;
+    bool handshakeComplete = false;
+    std::vector<uint8_t> inData;
+
+    // Initial handshake call (no input token)
+    outBuffer.pvBuffer = nullptr;
+    outBuffer.cbBuffer = 0;
+    outBuffer.BufferType = SECBUFFER_TOKEN;
+    outBufferDesc.cBuffers = 1;
+    outBufferDesc.pBuffers = &outBuffer;
+    outBufferDesc.ulVersion = SECBUFFER_VERSION;
+
+    DWORD contextReq = ISC_REQ_STREAM |
+                       ISC_REQ_REPLAY_DETECT |
+                       ISC_REQ_SEQUENCE_DETECT |
+                       ISC_REQ_CONFIDENTIALITY |
+                       ISC_REQ_ALLOCATE_MEMORY;
+
+    sspiStatus = InitializeSecurityContextW(
+        &credHandle,
+        nullptr,  // No context yet
+        const_cast<SEC_WCHAR*>(L"localhost"),  // Target name for SNI
+        contextReq,
+        0, 0,
+        nullptr,  // No input
+        0,
+        &ctxtHandle,
+        &outBufferDesc,
+        &contextAttribs,
+        nullptr
+    );
+
+    if (sspiStatus == SEC_I_CONTINUE_NEEDED && outBuffer.cbBuffer > 0 && outBuffer.pvBuffer) {
+        // Send ClientHello
+        send(sock, static_cast<const char*>(outBuffer.pvBuffer),
+             static_cast<int>(outBuffer.cbBuffer), 0);
+        FreeContextBuffer(outBuffer.pvBuffer);
+        schannelInitialized = true;
+
+        // Handshake loop: read server response, call InitializeSecurityContext again
+        uint8_t recvBuf[16384];
+        constexpr int kMaxHandshakeRounds = 20;
+
+        for (int round = 0; round < kMaxHandshakeRounds && !handshakeComplete; ++round) {
+            int bytesRecv = recv(sock, reinterpret_cast<char*>(recvBuf), sizeof(recvBuf), 0);
+            if (bytesRecv <= 0) {
+                Utils::Logger::Warn("[AlertSystem] TLS handshake recv failed");
+                break;
+            }
+
+            inData.insert(inData.end(), recvBuf, recvBuf + bytesRecv);
+
+            SecBuffer inBuffers[2]{};
+            inBuffers[0].pvBuffer = inData.data();
+            inBuffers[0].cbBuffer = static_cast<ULONG>(inData.size());
+            inBuffers[0].BufferType = SECBUFFER_TOKEN;
+            inBuffers[1].pvBuffer = nullptr;
+            inBuffers[1].cbBuffer = 0;
+            inBuffers[1].BufferType = SECBUFFER_EMPTY;
+
+            SecBufferDesc inBufferDesc{};
+            inBufferDesc.cBuffers = 2;
+            inBufferDesc.pBuffers = inBuffers;
+            inBufferDesc.ulVersion = SECBUFFER_VERSION;
+
+            SecBuffer outBuf2{};
+            outBuf2.pvBuffer = nullptr;
+            outBuf2.cbBuffer = 0;
+            outBuf2.BufferType = SECBUFFER_TOKEN;
+
+            SecBufferDesc outBufDesc2{};
+            outBufDesc2.cBuffers = 1;
+            outBufDesc2.pBuffers = &outBuf2;
+            outBufDesc2.ulVersion = SECBUFFER_VERSION;
+
+            sspiStatus = InitializeSecurityContextW(
+                &credHandle,
+                &ctxtHandle,
+                nullptr,
+                contextReq,
+                0, 0,
+                &inBufferDesc,
+                0,
+                nullptr,
+                &outBufDesc2,
+                &contextAttribs,
+                nullptr
+            );
+
+            // Send any output token
+            if (outBuf2.cbBuffer > 0 && outBuf2.pvBuffer) {
+                send(sock, static_cast<const char*>(outBuf2.pvBuffer),
+                     static_cast<int>(outBuf2.cbBuffer), 0);
+                FreeContextBuffer(outBuf2.pvBuffer);
+            }
+
+            // Handle extra data (not consumed by SChannel)
+            if (inBuffers[1].BufferType == SECBUFFER_EXTRA && inBuffers[1].cbBuffer > 0) {
+                size_t extraOffset = inData.size() - inBuffers[1].cbBuffer;
+                std::vector<uint8_t> extra(inData.begin() + extraOffset, inData.end());
+                inData = std::move(extra);
+            } else {
+                inData.clear();
+            }
+
+            if (sspiStatus == SEC_E_OK) {
+                handshakeComplete = true;
+            } else if (sspiStatus == SEC_I_CONTINUE_NEEDED) {
+                continue;
+            } else if (sspiStatus == SEC_E_INCOMPLETE_MESSAGE) {
+                // Need more data
+                continue;
+            } else {
+                Utils::Logger::Warn("[AlertSystem] TLS handshake failed: 0x{:08X}",
+                                    static_cast<unsigned int>(sspiStatus));
+                break;
+            }
+        }
+    } else {
+        Utils::Logger::Warn("[AlertSystem] SChannel InitializeSecurityContext initial call failed: 0x{:08X}",
+                            static_cast<unsigned int>(sspiStatus));
+        FreeCredentialsHandle(&credHandle);
+        closesocket(sock);
+        return;
+    }
+
+    if (!handshakeComplete) {
+        Utils::Logger::Warn("[AlertSystem] TLS handshake incomplete — alert NOT sent over network "
+                            "(logged locally only)");
+        if (schannelInitialized) {
+            DeleteSecurityContext(&ctxtHandle);
+        }
+        FreeCredentialsHandle(&credHandle);
+        closesocket(sock);
+        return;
+    }
+
+    //
+    // Handshake complete — encrypt and send the syslog message.
+    //
+    SecPkgContext_StreamSizes streamSizes{};
+    QueryContextAttributesW(&ctxtHandle, SECPKG_ATTR_STREAM_SIZES, &streamSizes);
+
+    const ULONG totalBufSize = streamSizes.cbHeader +
+                                static_cast<ULONG>(framedLen) +
+                                streamSizes.cbTrailer;
+    std::vector<uint8_t> tlsBuffer(totalBufSize);
+
+    SecBuffer encBuffers[4]{};
+    encBuffers[0].pvBuffer = tlsBuffer.data();
+    encBuffers[0].cbBuffer = streamSizes.cbHeader;
+    encBuffers[0].BufferType = SECBUFFER_STREAM_HEADER;
+
+    encBuffers[1].pvBuffer = tlsBuffer.data() + streamSizes.cbHeader;
+    encBuffers[1].cbBuffer = static_cast<ULONG>(framedLen);
+    encBuffers[1].BufferType = SECBUFFER_DATA;
+    memcpy(encBuffers[1].pvBuffer, framedMsg, framedLen);
+
+    encBuffers[2].pvBuffer = tlsBuffer.data() + streamSizes.cbHeader + framedLen;
+    encBuffers[2].cbBuffer = streamSizes.cbTrailer;
+    encBuffers[2].BufferType = SECBUFFER_STREAM_TRAILER;
+
+    encBuffers[3].pvBuffer = nullptr;
+    encBuffers[3].cbBuffer = 0;
+    encBuffers[3].BufferType = SECBUFFER_EMPTY;
+
+    SecBufferDesc encDesc{};
+    encDesc.cBuffers = 4;
+    encDesc.pBuffers = encBuffers;
+    encDesc.ulVersion = SECBUFFER_VERSION;
+
+    sspiStatus = EncryptMessage(&ctxtHandle, 0, &encDesc, 0);
+    if (sspiStatus == SEC_E_OK) {
+        const ULONG sendTotal = encBuffers[0].cbBuffer +
+                                 encBuffers[1].cbBuffer +
+                                 encBuffers[2].cbBuffer;
+        int bytesSent = send(sock, reinterpret_cast<const char*>(tlsBuffer.data()),
+                             static_cast<int>(sendTotal), 0);
+        if (bytesSent <= 0) {
+            Utils::Logger::Warn("[AlertSystem] TLS syslog send failed: {}", WSAGetLastError());
+        }
+    } else {
+        Utils::Logger::Warn("[AlertSystem] EncryptMessage failed: 0x{:08X}",
+                            static_cast<unsigned int>(sspiStatus));
+    }
+
+    // Graceful TLS shutdown
+    DWORD shutdownType = SCHANNEL_SHUTDOWN;
+    SecBuffer shutdownBuf{};
+    shutdownBuf.pvBuffer = &shutdownType;
+    shutdownBuf.cbBuffer = sizeof(shutdownType);
+    shutdownBuf.BufferType = SECBUFFER_TOKEN;
+
+    SecBufferDesc shutdownDesc{};
+    shutdownDesc.cBuffers = 1;
+    shutdownDesc.pBuffers = &shutdownBuf;
+    shutdownDesc.ulVersion = SECBUFFER_VERSION;
+
+    ApplyControlToken(&ctxtHandle, &shutdownDesc);
+
+    SecBuffer finalOutBuf{};
+    finalOutBuf.pvBuffer = nullptr;
+    finalOutBuf.cbBuffer = 0;
+    finalOutBuf.BufferType = SECBUFFER_TOKEN;
+
+    SecBufferDesc finalOutDesc{};
+    finalOutDesc.cBuffers = 1;
+    finalOutDesc.pBuffers = &finalOutBuf;
+    finalOutDesc.ulVersion = SECBUFFER_VERSION;
+
+    sspiStatus = InitializeSecurityContextW(
+        &credHandle, &ctxtHandle, nullptr,
+        contextReq, 0, 0, nullptr, 0, nullptr,
+        &finalOutDesc, &contextAttribs, nullptr);
+
+    if (finalOutBuf.cbBuffer > 0 && finalOutBuf.pvBuffer) {
+        send(sock, static_cast<const char*>(finalOutBuf.pvBuffer),
+             static_cast<int>(finalOutBuf.cbBuffer), 0);
+        FreeContextBuffer(finalOutBuf.pvBuffer);
+    }
+
+    DeleteSecurityContext(&ctxtHandle);
+    FreeCredentialsHandle(&credHandle);
+    shutdown(sock, SD_SEND);
     closesocket(sock);
 }
 

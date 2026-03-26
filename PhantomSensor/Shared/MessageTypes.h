@@ -52,6 +52,11 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     FilterMessageType_ConfigUpdate,       // Configuration update
 
     //
+    // Security / Key Exchange (0x05 - 0x0F)
+    //
+    FilterMessageType_KeyExchange,         // Session key exchange (K→U after client verification)
+
+    //
     // Scan Messages (0x10 - 0x1F)
     //
     FilterMessageType_ScanRequest,        // File scan request (Pre-Create/Write)
@@ -142,6 +147,7 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
 #define ShadowStrikeMessageUnregister               FilterMessageType_Unregister
 #define ShadowStrikeMessageHeartbeat                FilterMessageType_Heartbeat
 #define ShadowStrikeMessageConfigUpdate             FilterMessageType_ConfigUpdate
+#define ShadowStrikeMessageKeyExchange              FilterMessageType_KeyExchange
 
 #define ShadowStrikeMessageFileScanOnOpen           FilterMessageType_ScanRequest
 #define ShadowStrikeMessageFileScanOnExecute        FilterMessageType_ScanRequest

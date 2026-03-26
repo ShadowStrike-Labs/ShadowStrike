@@ -1,4 +1,4 @@
-﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+´╗┐// This is a personal academic project. Dear PVS-Studio, please check it.
 // PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
@@ -34,7 +34,6 @@
 #define SHADOWSTRIKE_MSG_FLAG_HMAC              0x00000002  // HMAC-SHA256 appended after data (32 bytes)
 #define SHADOWSTRIKE_MSG_FLAG_PRIORITY_HIGH     0x00000004  // High-priority delivery
 #define SHADOWSTRIKE_MSG_FLAG_NO_ACK            0x00000008  // Fire-and-forget, no acknowledgment needed
-#define SHADOWSTRIKE_MSG_FLAG_ENCRYPTED         0x00000010  // Payload encrypted with per-session AES-256-GCM key
 
 // Ensure structure packing is consistent
 #pragma pack(push, 1)
@@ -202,7 +201,7 @@ typedef struct _SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION {
 } SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION, *PSHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION;
 
 // ============================================================================
-// DATA PUSH PAYLOAD STRUCTURES (User-Mode â†’ Kernel)
+// DATA PUSH PAYLOAD STRUCTURES (User-Mode ├óÔÇáÔÇÖ Kernel)
 // ============================================================================
 //
 // These structures define the wire format for data push messages from the
@@ -266,7 +265,7 @@ typedef struct _SHADOWSTRIKE_PUSH_HASH_ENTRY {
 //
 // 11. Pattern Database Push Entry (FilterMessageType_PushPatternDatabase)
 //
-// Same wire format as hash entry â€” patterns are loaded via IOCMatcher
+// Same wire format as hash entry ├óÔé¼ÔÇØ patterns are loaded via IOCMatcher
 // with IOM_IOC_TYPE set to pattern type.
 //
 typedef SHADOWSTRIKE_PUSH_HASH_ENTRY   SHADOWSTRIKE_PUSH_PATTERN_ENTRY;
@@ -275,7 +274,7 @@ typedef PSHADOWSTRIKE_PUSH_HASH_ENTRY  PSHADOWSTRIKE_PUSH_PATTERN_ENTRY;
 //
 // 12. Signature Database Push Entry (FilterMessageType_PushSignatureDatabase)
 //
-// Same wire format â€” signatures routed via IOCMatcher.
+// Same wire format ├óÔé¼ÔÇØ signatures routed via IOCMatcher.
 //
 typedef SHADOWSTRIKE_PUSH_HASH_ENTRY   SHADOWSTRIKE_PUSH_SIGNATURE_ENTRY;
 typedef PSHADOWSTRIKE_PUSH_HASH_ENTRY  PSHADOWSTRIKE_PUSH_SIGNATURE_ENTRY;
@@ -401,43 +400,5 @@ typedef struct _SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY {
     // WCHAR Value[ValueLength]  (path, extension, process name)
     // For PID exclusions: HANDLE ProcessId stored as UINT64 in first 8 bytes of Value
 } SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY, *PSHADOWSTRIKE_PUSH_EXCLUSION_ENTRY;
-
-//
-// 18. Process Verdict Reply (FilterMessageType_ProcessNotify with RequireReply)
-//
-typedef struct _SHADOWSTRIKE_PROCESS_VERDICT_REPLY {
-    UINT64 MessageId;
-    UINT8  Verdict;         // 0=Allow, 1=Block, 2=Quarantine
-    UINT32 ResultCode;
-    UINT32 Reserved;
-} SHADOWSTRIKE_PROCESS_VERDICT_REPLY, *PSHADOWSTRIKE_PROCESS_VERDICT_REPLY;
-
-//
-// 19. Key Exchange Message (FilterMessageType_KeyExchange)
-//
-// Sent by the kernel driver to user-mode immediately after successful client
-// verification (ShadowStrikeVerifyClient) during ShadowStrikeConnectNotify.
-//
-// The session key is wrapped (encrypted) using a Key-Wrapping-Key (KWK) derived
-// via HKDF(client_image_hash, Salt, "ShadowStrike-KEX-v1"). The user-mode
-// process derives the same KWK from its own executable hash to unwrap.
-//
-// All subsequent messages on this connection use the unwrapped session key for
-// AES-256-GCM encryption (indicated by SHADOWSTRIKE_MSG_FLAG_ENCRYPTED).
-//
-typedef struct _SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE {
-    SS_MESSAGE_HEADER Header;
-
-    UCHAR Salt[32];              // Random salt for HKDF KWK derivation
-    UCHAR Nonce[12];             // AES-256-GCM nonce for wrapping the session key
-    UCHAR WrappedSessionKey[32]; // Session key encrypted with KWK (AES-256-GCM)
-    UCHAR Tag[16];               // AES-256-GCM auth tag over WrappedSessionKey
-    UCHAR SessionNoncePrefix[4]; // First 4 bytes of all message nonces for this session
-    UINT32 KeyExpirySeconds;     // Suggested key lifetime (0 = no expiry)
-    UINT32 ProtocolFlags;        // Reserved for protocol negotiation
-    UINT32 Reserved;
-} SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE, *PSHADOWSTRIKE_KEY_EXCHANGE_MESSAGE;
-
-#define SHADOWSTRIKE_KEX_PROTOCOL_FLAG_MANDATORY_ENCRYPTION  0x00000001
 
 #pragma pack(pop)
