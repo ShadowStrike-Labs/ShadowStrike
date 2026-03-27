@@ -55,6 +55,8 @@
 // EXPLOIT DETECTOR INCLUDES
 // ============================================================================
 #include "../Exploits/HeapSprayDetector.hpp"
+#include "../Exploits/JITSprayDetector.hpp"
+#include "../Exploits/BufferOverflowProtection.hpp"
 
 // ============================================================================
 // ANTI-EVASION DETECTOR INCLUDES
@@ -1069,6 +1071,38 @@ public:
             Utils::Logger::Error("RealTimeProtection: HeapSprayDetector unknown exception");
         }
 
+        // JITSprayDetector (singleton — initialize + start JIT code analysis engine)
+        try {
+            auto& jsd = Exploits::JITSprayDetector::Instance();
+            if (jsd.Initialize()) {
+                if (!jsd.Start()) {
+                    Utils::Logger::Warn(L"RealTimeProtection: JITSprayDetector Start failed");
+                }
+            } else {
+                Utils::Logger::Warn(L"RealTimeProtection: JITSprayDetector Initialize failed");
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("RealTimeProtection: JITSprayDetector exception: {}", e.what());
+        } catch (...) {
+            Utils::Logger::Error("RealTimeProtection: JITSprayDetector unknown exception");
+        }
+
+        // BufferOverflowProtection (singleton — initialize + start overflow detection engine)
+        try {
+            auto& bop = Exploits::BufferOverflowProtection::Instance();
+            if (bop.Initialize()) {
+                if (!bop.Start()) {
+                    Utils::Logger::Warn(L"RealTimeProtection: BufferOverflowProtection Start failed");
+                }
+            } else {
+                Utils::Logger::Warn(L"RealTimeProtection: BufferOverflowProtection Initialize failed");
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("RealTimeProtection: BufferOverflowProtection exception: {}", e.what());
+        } catch (...) {
+            Utils::Logger::Error("RealTimeProtection: BufferOverflowProtection unknown exception");
+        }
+
         Utils::Logger::Info(L"RealTimeProtection: Components started");
     }
 
@@ -1102,6 +1136,8 @@ public:
         try { ZeroHourProtection::Instance().Stop(); } catch (...) {}
         SetComponentState(ComponentType::ZERO_HOUR, ComponentState::STOPPED);
 
+        try { Exploits::BufferOverflowProtection::Instance().Shutdown(); } catch (...) {}
+        try { Exploits::JITSprayDetector::Instance().Shutdown(); } catch (...) {}
         try { Exploits::HeapSprayDetector::Instance().Shutdown(); } catch (...) {}
 
         Utils::Logger::Info(L"RealTimeProtection: Components stopped");
