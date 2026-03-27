@@ -88,54 +88,69 @@ PolicyManager::~PolicyManager() {
 // ============================================================================
 
 bool PolicyManager::Initialize(const PolicyManagerConfiguration& config) {
-    std::unique_lock lock(m_mutex);
+    bool shouldLoadCache = false;
 
-    if (m_impl->m_status == PolicyStatus::Running) {
-        SS_LOG_WARN(L"Policy", L"PolicyManager already initialized");
-        return true;
+    {
+        std::unique_lock lock(m_mutex);
+
+        if (m_impl->m_status == PolicyStatus::Running ||
+            m_impl->m_status == PolicyStatus::Initializing) {
+            SS_LOG_WARN(L"Policy", L"PolicyManager already initialized or initializing");
+            return (m_impl->m_status == PolicyStatus::Running);
+        }
+
+        if (!config.IsValid()) {
+            SS_LOG_ERROR(L"Policy", L"Invalid PolicyManagerConfiguration supplied");
+            return false;
+        }
+
+        m_impl->m_status = PolicyStatus::Initializing;
+        m_impl->m_config = config;
+        m_impl->m_shutdownRequested.store(false, std::memory_order_release);
+        m_impl->m_stats.Reset();
+        m_impl->m_stats.startTime = Clock::now();
+
+        shouldLoadCache = config.enableOfflineCache && !config.offlineCachePath.empty();
     }
 
-    if (!config.IsValid()) {
-        SS_LOG_ERROR(L"Policy", L"Invalid PolicyManagerConfiguration supplied");
-        return false;
-    }
-
-    m_impl->m_status = PolicyStatus::Initializing;
-    m_impl->m_config = config;
-    m_impl->m_shutdownRequested.store(false, std::memory_order_release);
-    m_impl->m_stats.Reset();
-    m_impl->m_stats.startTime = Clock::now();
-
-    // Attempt loading offline cache (failure is non-fatal)
-    if (config.enableOfflineCache && !config.offlineCachePath.empty()) {
-        lock.unlock();
+    // Load offline cache outside the lock (LoadFromOfflineCache takes its own locks)
+    if (shouldLoadCache) {
         (void)LoadFromOfflineCache();
-        lock.lock();
     }
 
-    // Launch periodic sync thread
-    if (config.enableAutoSync && config.syncIntervalSeconds > 0) {
-        m_impl->m_syncThread = std::jthread([this](std::stop_token stoken) {
-            const auto interval = std::chrono::seconds(m_impl->m_config.syncIntervalSeconds);
-            while (!stoken.stop_requested() && !m_impl->m_shutdownRequested.load(std::memory_order_acquire)) {
-                // Sleep in small increments so we can respond to shutdown quickly
-                constexpr auto kWakeInterval = std::chrono::seconds(1);
-                auto remaining = interval;
-                while (remaining > std::chrono::seconds(0) &&
-                       !stoken.stop_requested() &&
-                       !m_impl->m_shutdownRequested.load(std::memory_order_acquire)) {
-                    auto sleepTime = std::min(remaining, kWakeInterval);
-                    std::this_thread::sleep_for(sleepTime);
-                    remaining -= sleepTime;
+    {
+        std::unique_lock lock(m_mutex);
+
+        // Guard against concurrent Shutdown() that ran while we were loading cache
+        if (m_impl->m_status != PolicyStatus::Initializing) {
+            SS_LOG_WARN(L"Policy", L"PolicyManager state changed during init, aborting");
+            return false;
+        }
+
+        // Launch periodic sync thread
+        if (config.enableAutoSync && config.syncIntervalSeconds > 0) {
+            m_impl->m_syncThread = std::jthread([this](std::stop_token stoken) {
+                const auto interval = std::chrono::seconds(m_impl->m_config.syncIntervalSeconds);
+                while (!stoken.stop_requested() && !m_impl->m_shutdownRequested.load(std::memory_order_acquire)) {
+                    constexpr auto kWakeInterval = std::chrono::seconds(1);
+                    auto remaining = interval;
+                    while (remaining > std::chrono::seconds(0) &&
+                           !stoken.stop_requested() &&
+                           !m_impl->m_shutdownRequested.load(std::memory_order_acquire)) {
+                        auto sleepTime = std::min(remaining, kWakeInterval);
+                        std::this_thread::sleep_for(sleepTime);
+                        remaining -= sleepTime;
+                    }
+                    if (stoken.stop_requested() || m_impl->m_shutdownRequested.load(std::memory_order_acquire))
+                        break;
+                    (void)SyncWithServer();
                 }
-                if (stoken.stop_requested() || m_impl->m_shutdownRequested.load(std::memory_order_acquire))
-                    break;
-                (void)SyncWithServer();
-            }
-        });
+            });
+        }
+
+        m_impl->m_status = PolicyStatus::Running;
     }
 
-    m_impl->m_status = PolicyStatus::Running;
     SS_LOG_INFO(L"Policy", L"PolicyManager initialized successfully");
     return true;
 }
@@ -627,7 +642,7 @@ bool PolicyManager::ApplyPolicy(const Policy& policy) {
         return false;
     }
 
-    // Signature verification for signed policies
+    // Signature verification for signed policies — fail-closed
     if (!policy.signature.empty()) {
         SS_LOG_INFO(L"Policy", L"Verifying signature for policy id=%hs", policy.id.c_str());
 
@@ -637,11 +652,10 @@ bool PolicyManager::ApplyPolicy(const Policy& policy) {
         const std::string payload = verifyPolicy.ToJson();
 
         // Signature verification requires a loaded public key from the management server.
-        // Without the server's public key material, we cannot verify.
-        // In a full deployment this would load the key from a trust store.
-        // For now we log and reject unsigned-verifiable policies as a secure default.
-        SS_LOG_WARN(L"Policy", L"Policy id=%hs has signature but no trust store key configured; "
-                    L"signature verification deferred", policy.id.c_str());
+        // Without the server's public key material, we cannot verify — reject to fail closed.
+        SS_LOG_ERROR(L"Policy", L"Policy id=%hs has signature but no trust store key configured; "
+                    L"rejecting signed policy (fail-closed)", policy.id.c_str());
+        return false;
     }
 
     // Snapshot callbacks under lock, then fire outside lock
@@ -883,62 +897,70 @@ EnforcementLevel PolicyManager::GetEnforcementLevel(const std::string& settingNa
 }
 
 bool PolicyManager::ValidateSetting(const std::string& key, const PolicyValue& value) const {
-    std::shared_lock lock(m_mutex);
-    m_impl->m_stats.enforcementChecks.fetch_add(1, std::memory_order_relaxed);
+    // Build violation and snapshot callbacks under exclusive lock since we
+    // mutate m_violations and m_nextViolationId (non-atomic, non-thread-safe).
+    std::optional<PolicyViolation> detectedViolation;
+    std::vector<ViolationCallback> vcbs;
 
-    for (const auto& [id, p] : m_activePolicies) {
-        if (p.state != PolicyState::Active || !p.isMandatory) continue;
-        auto sit = p.settings.find(key);
-        if (sit == p.settings.end()) continue;
-        if (sit->second.enforcement != EnforcementLevel::Mandatory) continue;
+    {
+        std::unique_lock lock(m_mutex);
+        m_impl->m_stats.enforcementChecks.fetch_add(1, std::memory_order_relaxed);
 
-        // Proposed value differs from mandatory policy value → violation
-        if (PolicyValueToString(sit->second.value) != PolicyValueToString(value)) {
-            // Record violation
-            PolicyViolation violation;
-            violation.violationId  = m_impl->m_nextViolationId++;
-            violation.policyId     = p.id;
-            violation.settingKey   = key;
-            violation.expectedValue = sit->second.value;
-            violation.actualValue  = value;
-            violation.timestamp    = std::chrono::system_clock::now();
-            violation.action       = ViolationAction::Block;
+        for (const auto& [id, p] : m_activePolicies) {
+            if (p.state != PolicyState::Active || !p.isMandatory) continue;
+            auto sit = p.settings.find(key);
+            if (sit == p.settings.end()) continue;
+            if (sit->second.enforcement != EnforcementLevel::Mandatory) continue;
 
-            // Retrieve machine name for violation context
-            {
-                char compName[MAX_COMPUTERNAME_LENGTH + 1]{};
-                DWORD sz = sizeof(compName);
-                if (::GetComputerNameA(compName, &sz)) {
-                    violation.machineName = compName;
+            // Proposed value differs from mandatory policy value → violation
+            if (PolicyValueToString(sit->second.value) != PolicyValueToString(value)) {
+                PolicyViolation violation;
+                violation.violationId  = m_impl->m_nextViolationId++;
+                violation.policyId     = p.id;
+                violation.settingKey   = key;
+                violation.expectedValue = sit->second.value;
+                violation.actualValue  = value;
+                violation.timestamp    = std::chrono::system_clock::now();
+                violation.action       = ViolationAction::Block;
+
+                {
+                    char compName[MAX_COMPUTERNAME_LENGTH + 1]{};
+                    DWORD sz = sizeof(compName);
+                    if (::GetComputerNameA(compName, &sz)) {
+                        violation.machineName = compName;
+                    }
                 }
-            }
 
-            m_impl->m_stats.violationsDetected.fetch_add(1, std::memory_order_relaxed);
+                m_impl->m_stats.violationsDetected.fetch_add(1, std::memory_order_relaxed);
 
-            m_impl->m_violations.push_back(violation);
-            if (m_impl->m_violations.size() > m_impl->m_config.maxViolationHistory) {
-                m_impl->m_violations.erase(m_impl->m_violations.begin());
-            }
-
-            // Snapshot violation callbacks to fire outside (we hold shared_lock, so copy is safe)
-            std::vector<ViolationCallback> vcbs;
-            vcbs.reserve(m_impl->m_violationCallbacks.size());
-            for (const auto& [cbId, cb] : m_impl->m_violationCallbacks) {
-                if (cb) vcbs.push_back(cb);
-            }
-
-            // Fire violation callbacks (we're in shared_lock, callbacks must not modify policies)
-            for (const auto& cb : vcbs) {
-                try { cb(violation); }
-                catch (...) {
-                    SS_LOG_WARN(L"Policy", L"Violation callback threw for key=%hs", key.c_str());
+                m_impl->m_violations.push_back(violation);
+                if (m_impl->m_violations.size() > m_impl->m_config.maxViolationHistory) {
+                    m_impl->m_violations.erase(m_impl->m_violations.begin());
                 }
-            }
 
-            SS_LOG_WARN(L"Policy", L"Policy violation: key=%hs conflicts with mandatory policy id=%hs",
-                        key.c_str(), p.id.c_str());
-            return false;
+                vcbs.reserve(m_impl->m_violationCallbacks.size());
+                for (const auto& [cbId, cb] : m_impl->m_violationCallbacks) {
+                    if (cb) vcbs.push_back(cb);
+                }
+
+                detectedViolation = std::move(violation);
+                break;
+            }
         }
+    }
+
+    // Fire violation callbacks outside lock
+    if (detectedViolation.has_value()) {
+        for (const auto& cb : vcbs) {
+            try { cb(*detectedViolation); }
+            catch (...) {
+                SS_LOG_WARN(L"Policy", L"Violation callback threw for key=%hs", key.c_str());
+            }
+        }
+
+        SS_LOG_WARN(L"Policy", L"Policy violation: key=%hs conflicts with mandatory policy id=%hs",
+                    key.c_str(), detectedViolation->policyId.c_str());
+        return false;
     }
     return true;
 }
@@ -1202,43 +1224,60 @@ bool PolicyManager::IsSyncInProgress() const noexcept {
 // ============================================================================
 
 bool PolicyManager::SaveToOfflineCache() const {
-    std::shared_lock lock(m_mutex);
+    std::string content;
+    std::wstring widePath;
+    size_t policyCount = 0;
 
-    if (m_impl->m_config.offlineCachePath.empty()) {
-        SS_LOG_WARN(L"Policy", L"SaveToOfflineCache: no cache path configured");
-        return false;
+    {
+        std::shared_lock lock(m_mutex);
+
+        if (m_impl->m_config.offlineCachePath.empty()) {
+            SS_LOG_WARN(L"Policy", L"SaveToOfflineCache: no cache path configured");
+            return false;
+        }
+
+        try {
+            Utils::JSON::Json root;
+            root["version"] = GetVersionString();
+            root["savedAt"] = TimePointToIso8601(std::chrono::system_clock::now());
+
+            Utils::JSON::Json policiesArr = Utils::JSON::Json::array();
+            for (const auto& [id, p] : m_activePolicies) {
+                policiesArr.push_back(PolicyToJsonObj(p));
+            }
+            root["policies"] = std::move(policiesArr);
+
+            content = root.dump(2);
+            widePath = m_impl->m_config.offlineCachePath.wstring();
+            policyCount = m_activePolicies.size();
+        }
+        catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"Policy", L"SaveToOfflineCache serialization exception: %hs", ex.what());
+            return false;
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"Policy", L"SaveToOfflineCache serialization unknown exception");
+            return false;
+        }
     }
 
+    // Write file outside lock to avoid blocking writers during I/O
     try {
-        Utils::JSON::Json root;
-        root["version"] = GetVersionString();
-        root["savedAt"] = TimePointToIso8601(std::chrono::system_clock::now());
-
-        Utils::JSON::Json policiesArr = Utils::JSON::Json::array();
-        for (const auto& [id, p] : m_activePolicies) {
-            policiesArr.push_back(PolicyToJsonObj(p));
-        }
-        root["policies"] = std::move(policiesArr);
-
-        const std::string content = root.dump(2);
-        const auto widePath = m_impl->m_config.offlineCachePath.wstring();
-
         Utils::FileUtils::Error fileErr;
         if (!Utils::FileUtils::WriteAllTextUtf8Atomic(widePath, content, &fileErr)) {
             SS_LOG_ERROR(L"Policy", L"SaveToOfflineCache failed: %hs", fileErr.message.c_str());
             return false;
         }
 
-        SS_LOG_INFO(L"Policy", L"Saved %zu policies to offline cache",
-                    m_activePolicies.size());
+        SS_LOG_INFO(L"Policy", L"Saved %zu policies to offline cache", policyCount);
         return true;
     }
     catch (const std::exception& ex) {
-        SS_LOG_ERROR(L"Policy", L"SaveToOfflineCache exception: %hs", ex.what());
+        SS_LOG_ERROR(L"Policy", L"SaveToOfflineCache write exception: %hs", ex.what());
         return false;
     }
     catch (...) {
-        SS_LOG_ERROR(L"Policy", L"SaveToOfflineCache unknown exception");
+        SS_LOG_ERROR(L"Policy", L"SaveToOfflineCache write unknown exception");
         return false;
     }
 }
@@ -1348,6 +1387,7 @@ PolicyStatistics PolicyManager::GetStatistics() const {
 }
 
 void PolicyManager::ResetStatistics() {
+    std::unique_lock lock(m_mutex);
     m_impl->m_stats.Reset();
 }
 
