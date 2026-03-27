@@ -337,24 +337,30 @@ public:
             m_hPort = nullptr;
         }
 
-        // Scrub ALL session key material unconditionally — key may have been
-        // partially written if ReceiveKeyExchange failed mid-operation.
-        ShadowStrike::Security::CryptoManager::Instance().SecureZero(
-            m_sessionKey.data(), m_sessionKey.size());
-        ShadowStrike::Security::CryptoManager::Instance().SecureZero(
-            m_sessionNoncePrefix.data(), m_sessionNoncePrefix.size());
+        // Mark encryption as torn down so new PortGuard holders that call
+        // Encrypt/Decrypt will see the flag and skip crypto. Existing holders
+        // that already passed the check may still read the key — but they
+        // hold PortGuard, so we MUST wait for them before scrubbing.
         m_encryptionEstablished.store(false, std::memory_order_release);
-        m_nonceCounter.store(0, std::memory_order_release);
 
         // Cancel any pending I/O (outside lock so GetMessage can return)
         CancelIoEx(portToClose, nullptr);
 
-        // Wait for all in-flight PortGuard holders to release (C++20 atomic wait)
+        // Wait for all in-flight PortGuard holders to release (C++20 atomic wait).
+        // CRITICAL: key material must NOT be scrubbed until all holders have
+        // finished — they may still reference m_sessionKey / m_sessionNoncePrefix.
         int32_t pending = m_pendingOps.load(std::memory_order_acquire);
         while (pending > 0) {
             m_pendingOps.wait(pending, std::memory_order_acquire);
             pending = m_pendingOps.load(std::memory_order_acquire);
         }
+
+        // All in-flight operations drained — safe to scrub key material.
+        ShadowStrike::Security::CryptoManager::Instance().SecureZero(
+            m_sessionKey.data(), m_sessionKey.size());
+        ShadowStrike::Security::CryptoManager::Instance().SecureZero(
+            m_sessionNoncePrefix.data(), m_sessionNoncePrefix.size());
+        m_nonceCounter.store(0, std::memory_order_relaxed);
 
         CloseHandle(portToClose);
         Utils::Logger::Info("[FilterConnection] Disconnected");
@@ -979,6 +985,10 @@ private:
         m_nonceCounter.store(0, std::memory_order_relaxed);
         m_encryptionEstablished.store(true, std::memory_order_release);
 
+        // Scrub the key exchange buffer — contains salt, wrapped key, nonce,
+        // tag that are sensitive key-derivation inputs.
+        crypto.SecureZero(buf.data(), buf.size());
+
         Utils::Logger::Info("[FilterConnection] Key exchange complete — "
                             "AES-256-GCM encryption established");
         return true;
@@ -1115,16 +1125,38 @@ private:
         const size_t dataSize = plainBuffer.size() - sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
         const uint8_t* data = plainBuffer.data() + sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
 
+        // Guard against integer overflow in size calculations.
+        // dataSize + sizeof(KernelEncHeader) must fit in uint32_t (ULONG) since
+        // kernel-side DataSize/TotalSize fields are ULONG.
+        constexpr size_t kMaxEncPayload =
+            static_cast<size_t>(UINT32_MAX) - sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+        const size_t encPayloadSize = sizeof(KernelEncHeader) + dataSize;
+        if (dataSize > kMaxEncPayload - sizeof(KernelEncHeader) ||
+            encPayloadSize > kMaxEncPayload) {
+            Utils::Logger::Error("[FilterConnection] EncryptSendMessage: payload too large "
+                                 "({} bytes)", dataSize);
+            return false;
+        }
+
+        // Nonce counter exhaustion check (mirrors kernel ENC_NONCE_COUNTER_MAX).
+        // With uint64_t this is practically unreachable, but parity with kernel
+        // prevents theoretical nonce reuse on counter wrap.
+        constexpr uint64_t kNonceCounterMax = 0x7FFFFFFFFFFFFFFFuLL;
+        const uint64_t counter = m_nonceCounter.fetch_add(1, std::memory_order_relaxed);
+        if (counter >= kNonceCounterMax) {
+            Utils::Logger::Error("[FilterConnection] Nonce counter exhausted — "
+                                 "session key must be rotated");
+            return false;
+        }
+
         // Build structured nonce: [prefix(4) || counter(8)]
         // This ensures nonces are unique across sessions (prefix) and messages (counter).
-        const uint64_t counter = m_nonceCounter.fetch_add(1, std::memory_order_relaxed);
         std::array<uint8_t, 12> nonce{};
         memcpy(nonce.data(), m_sessionNoncePrefix.data(), 4);
         memcpy(nonce.data() + 4, &counter, sizeof(counter));
 
         // Compute AAD from header with FINAL flags/size (as receiver will see it)
         SHADOWSTRIKE_MESSAGE_HEADER aadHeader = *header;
-        const size_t encPayloadSize = sizeof(KernelEncHeader) + dataSize;
         aadHeader.Flags |= SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
         aadHeader.DataSize = static_cast<ULONG>(encPayloadSize);
         aadHeader.TotalSize = static_cast<ULONG>(
@@ -1167,9 +1199,8 @@ private:
         innerHeader.headerCrc32 = ComputeKernelEncHeaderCrc32(
             &innerHeader, offsetof(KernelEncHeader, headerCrc32));
 
-        // Wire format: [header][KernelEncHeader][ciphertext]
+        // Wire format: [SHADOWSTRIKE_MESSAGE_HEADER][KernelEncHeader][ciphertext]
         encryptedBuffer.resize(sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + encPayloadSize);
-        memcpy(encryptedBuffer.data(), &aadHeader, sizeof(aadHeader));
 
         auto* outHeader = reinterpret_cast<SHADOWSTRIKE_MESSAGE_HEADER*>(encryptedBuffer.data());
         *outHeader = aadHeader;
