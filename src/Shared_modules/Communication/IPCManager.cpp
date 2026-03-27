@@ -481,7 +481,7 @@ bool IPCManager::ConnectFilterPort() {
     {
         std::lock_guard lock(m_pusherMutex);
         try {
-            m_pushConnection = std::make_unique<FilterConnection>();
+            m_pushConnection = std::make_unique<FilterConnection>(portName);
             if (m_pushConnection->Connect()) {
                 m_pusher = std::make_unique<ThreatIntelPusher>(*m_pushConnection);
                 Utils::Logger::Info("[IPCManager] ThreatIntelPusher created on dedicated push connection");
@@ -496,11 +496,42 @@ bool IPCManager::ConnectFilterPort() {
         }
     }
 
+    // Create primary encrypted connection for SendToKernel / ReplyToKernel.
+    // This is the ONLY path that should be used for kernel IPC — the raw
+    // m_hPort handle is kept for IOCP-based async operations and as an
+    // absolute last resort if FilterConnection is unavailable.
+    {
+        std::lock_guard lock(m_primaryConnMutex);
+        try {
+            m_primaryConnection = std::make_unique<FilterConnection>(portName);
+            if (m_primaryConnection->Connect()) {
+                Utils::Logger::Info("[IPCManager] Primary encrypted connection established");
+            } else {
+                Utils::Logger::Error("[IPCManager] Primary encrypted connection FAILED — "
+                                      "kernel IPC will be unencrypted until reconnect");
+                m_primaryConnection.reset();
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("[IPCManager] Failed to create primary FilterConnection: {}",
+                                  e.what());
+            m_primaryConnection.reset();
+        }
+    }
+
     Utils::Logger::Info("[IPCManager] Successfully connected to filter port");
     return true;
 }
 
 void IPCManager::DisconnectFilterPort() {
+    // Tear down primary encrypted connection
+    {
+        std::lock_guard lock(m_primaryConnMutex);
+        if (m_primaryConnection) {
+            m_primaryConnection->Disconnect();
+            m_primaryConnection.reset();
+        }
+    }
+
     // Tear down pusher before closing the port
     {
         std::lock_guard lock(m_pusherMutex);
@@ -609,40 +640,10 @@ bool IPCManager::SendToKernel(
         }
     }
 
-    // Fallback: no primary FilterConnection available — use raw handle
-    // but log a warning since this path is unencrypted
-    HANDLE hPort = m_hPort.load(std::memory_order_acquire);
-    if (hPort == nullptr) {
-        Utils::Logger::Error("[IPCManager] Cannot send - not connected to filter port");
-        return false;
-    }
-
-    Utils::Logger::Warn("[IPCManager] SendToKernel: Falling back to raw handle "
-                         "(no encryption — primary FilterConnection unavailable)");
-
-    DWORD replyBufSize = (reply && replySize) ? static_cast<DWORD>(*replySize) : 0;
-    DWORD bytesReturned = 0;
-    HRESULT hr = FilterSendMessage(
-        hPort,
-        const_cast<void*>(message),
-        static_cast<DWORD>(messageSize),
-        reply, replyBufSize, &bytesReturned);
-
-    if (FAILED(hr)) {
-        Utils::Logger::Error("[IPCManager] FilterSendMessage failed: 0x{:08X}",
-                             static_cast<unsigned int>(hr));
-        m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
-        if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
-            m_connected.store(false);
-            m_impl->NotifyConnectionChange(ChannelType::FilterPort, ConnectionStatus::Error);
-        }
-        return false;
-    }
-
-    if (replySize) *replySize = bytesReturned;
-    m_impl->stats.messagesSent.fetch_add(1, std::memory_order_relaxed);
-    m_impl->stats.bytesSent.fetch_add(messageSize, std::memory_order_relaxed);
-    return true;
+    Utils::Logger::Error("[IPCManager] SendToKernel: encrypted channel unavailable; "
+                         "refusing plaintext fallback");
+    m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+    return false;
 }
 
 // ============================================================================
@@ -793,7 +794,10 @@ bool IPCManager::SendPipeMessage(const void* data, size_t size) {
 
 void IPCManager::SendCommand(const std::string& cmd) {
     if (!cmd.empty()) {
-        SendPipeMessage(cmd.data(), cmd.size());
+        if (!SendPipeMessage(cmd.data(), cmd.size())) {
+            Utils::Logger::Warn("[IPCManager] Failed to send command over named pipe");
+            m_impl->stats.errors++;
+        }
     }
 }
 
@@ -1091,7 +1095,10 @@ void IPCManager::Reconnect(ChannelType channel) {
             DisconnectPipe();
             {
                 std::shared_lock lock(m_impl->configMutex);
-                ConnectToPipe(m_impl->config.servicePipeName);
+                if (!ConnectToPipe(m_impl->config.servicePipeName)) {
+                    Utils::Logger::Warn("[IPCManager] Failed to reconnect named pipe channel");
+                    m_impl->stats.errors++;
+                }
             }
             m_impl->stats.reconnects++;
             break;
@@ -1155,7 +1162,10 @@ void IPCManager::WorkerRoutine() {
             std::shared_lock lock(m_impl->configMutex);
             if (m_impl->config.autoReconnect && m_running.load()) {
                 lock.unlock();
-                ConnectFilterPort();
+                if (!ConnectFilterPort()) {
+                    Utils::Logger::Debug("[IPCManager] Filter port reconnect attempt failed");
+                    m_impl->stats.errors++;
+                }
             }
             continue;
         }
@@ -1695,41 +1705,10 @@ bool IPCManager::ReplyToKernel(
         }
     }
 
-    // Fallback: raw handle (unencrypted — log warning)
-    HANDLE hPort = m_hPort.load(std::memory_order_acquire);
-    if (hPort == nullptr) {
-        Utils::Logger::Error("[IPCManager] ReplyToKernel: not connected");
-        return false;
-    }
-
-    Utils::Logger::Warn("[IPCManager] ReplyToKernel: Falling back to raw handle "
-                         "(no encryption — primary FilterConnection unavailable)");
-
-    // Wire format: [FILTER_REPLY_HEADER (WDK)] [SHADOWSTRIKE_SCAN_VERDICT_REPLY]
-    struct alignas(8) ReplyBuffer {
-        FILTER_REPLY_HEADER  wdkHeader;
-        SHADOWSTRIKE_SCAN_VERDICT_REPLY payload;
-    };
-
-    ReplyBuffer replyBuf = {};
-    replyBuf.wdkHeader.Status    = 0;  // STATUS_SUCCESS
-    replyBuf.wdkHeader.MessageId = messageId;
-    replyBuf.payload = verdictReply;
-
-    HRESULT hr = FilterReplyMessage(
-        hPort,
-        &replyBuf.wdkHeader,
-        static_cast<DWORD>(sizeof(replyBuf))
-    );
-
-    if (FAILED(hr)) {
-        Utils::Logger::Error("[IPCManager] FilterReplyMessage failed: 0x{:08X} for msgId {}",
-                             static_cast<unsigned int>(hr), messageId);
-        m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-
-    return true;
+    Utils::Logger::Error("[IPCManager] ReplyToKernel: encrypted channel unavailable; "
+                         "refusing plaintext fallback for msgId {}", messageId);
+    m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+    return false;
 }
 
 // ============================================================================

@@ -195,7 +195,7 @@ private:
     void DeliverToChannel(Alert& alert, DeliveryChannel channel);
     void DeliverWebhook(Alert& alert, const WebhookConfiguration& wh);
     void DeliverDesktop(const Alert& alert);
-    void DeliverSyslog(const Alert& alert);
+    [[nodiscard]] bool DeliverSyslog(const Alert& alert);
     void DeliverSIEM(const Alert& alert);
 
     bool CheckRateLimit();
@@ -1111,8 +1111,7 @@ void AlertSystemImpl::DeliverToChannel(Alert& alert, DeliveryChannel channel) {
                 break;
 
             case DeliveryChannel::Syslog:
-                DeliverSyslog(alert);
-                result.success = true;
+                result.success = DeliverSyslog(alert);
                 break;
 
             case DeliveryChannel::SIEM:
@@ -1253,9 +1252,33 @@ void AlertSystemImpl::DeliverDesktop(const Alert& alert) {
     // may not have. The NotificationManager module handles that separately.
 }
 
-void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
+bool AlertSystemImpl::DeliverSyslog(const Alert& alert) {
     // RFC 5425: TLS syslog over TCP to port 6514 (default), with octet-counting framing.
     // Falls back to LOCAL LOGGING ONLY if TLS connection fails — NEVER plaintext UDP.
+
+    // Read syslog configuration under shared lock
+    std::string syslogHost;
+    uint16_t syslogPort = 6514;
+    std::string syslogTlsTarget;
+    uint32_t connectTimeoutSec = 5;
+    {
+        std::shared_lock lock(m_configMutex);
+        syslogHost = m_config.syslogHost;
+        syslogPort = m_config.syslogPort;
+        syslogTlsTarget = m_config.syslogTlsTargetName.empty()
+                          ? m_config.syslogHost
+                          : m_config.syslogTlsTargetName;
+        connectTimeoutSec = m_config.syslogConnectTimeoutSec;
+    }
+
+    if (syslogHost.empty()) {
+        Utils::Logger::Warn("[AlertSystem] Syslog host not configured, dropping alert");
+        return false;
+    }
+    if (connectTimeoutSec == 0 || connectTimeoutSec > 30) {
+        connectTimeoutSec = 5;
+    }
+
     static const int severityMap[] = { 6, 5, 4, 3, 2, 1 }; // Info..Emergency → 6..1
 
     const int syslogSeverity = (static_cast<size_t>(alert.severity) < 6)
@@ -1281,7 +1304,7 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
                                   msgLen, syslogMsg);
     if (framedLen <= 0 || static_cast<size_t>(framedLen) >= sizeof(framedMsg)) {
         Utils::Logger::Error("[AlertSystem] Syslog message framing overflow");
-        return;
+        return false;
     }
 
     //
@@ -1298,11 +1321,26 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
     // and only reconnect on failure. This is acceptable for alert-rate traffic.
     //
 
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    // Resolve syslog host to address
+    struct addrinfo hints{}, *addrResult = nullptr;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    std::string portStr = std::to_string(syslogPort);
+    int gaiRet = getaddrinfo(syslogHost.c_str(), portStr.c_str(), &hints, &addrResult);
+    if (gaiRet != 0 || addrResult == nullptr) {
+        Utils::Logger::Warn("[AlertSystem] Cannot resolve syslog host '{}': getaddrinfo={}",
+                            syslogHost, gaiRet);
+        return false;
+    }
+
+    SOCKET sock = socket(addrResult->ai_family, SOCK_STREAM, IPPROTO_TCP);
     if (sock == INVALID_SOCKET) {
         Utils::Logger::Warn("[AlertSystem] Cannot create TCP socket for TLS syslog: {}",
                             WSAGetLastError());
-        return;
+        freeaddrinfo(addrResult);
+        return false;
     }
 
     // Set TCP_NODELAY and connect timeout
@@ -1310,32 +1348,31 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
 
-    // Configure non-blocking connect with 5-second timeout
+    // Configure non-blocking connect with configurable timeout
     u_long nonBlocking = 1;
     ioctlsocket(sock, FIONBIO, &nonBlocking);
 
-    sockaddr_in dest{};
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(6514);  // RFC 5425 TLS syslog port
-    dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int connectResult = connect(sock, addrResult->ai_addr,
+                                static_cast<int>(addrResult->ai_addrlen));
+    freeaddrinfo(addrResult);
 
-    int connectResult = connect(sock, reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
     if (connectResult == SOCKET_ERROR) {
         int wsaErr = WSAGetLastError();
         if (wsaErr == WSAEWOULDBLOCK) {
-            // Wait for connection with timeout
+            // Wait for connection with configurable timeout
             fd_set writeSet;
             FD_ZERO(&writeSet);
             FD_SET(sock, &writeSet);
             timeval tv{};
-            tv.tv_sec = 5;
+            tv.tv_sec = static_cast<long>(connectTimeoutSec);
             tv.tv_usec = 0;
 
             int selectResult = select(0, nullptr, &writeSet, nullptr, &tv);
             if (selectResult <= 0) {
-                Utils::Logger::Warn("[AlertSystem] TLS syslog TCP connect timed out (port 6514)");
+                Utils::Logger::Warn("[AlertSystem] TLS syslog TCP connect timed out ({}:{})",
+                                    syslogHost, syslogPort);
                 closesocket(sock);
-                return;
+                return false;
             }
 
             // Verify connection actually succeeded (select writable != connected)
@@ -1347,18 +1384,23 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
                 Utils::Logger::Warn("[AlertSystem] TLS syslog TCP connect failed after select: {}",
                                     sockErr);
                 closesocket(sock);
-                return;
+                return false;
             }
         } else {
             Utils::Logger::Warn("[AlertSystem] TLS syslog TCP connect failed: {}", wsaErr);
             closesocket(sock);
-            return;
+            return false;
         }
     }
 
     // Switch back to blocking mode for SChannel operations
     nonBlocking = 0;
     ioctlsocket(sock, FIONBIO, &nonBlocking);
+
+    // Set receive timeout to prevent hanging on malicious/stalled syslog servers
+    DWORD recvTimeout = connectTimeoutSec * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
 
     //
     // Initialize SChannel TLS context.
@@ -1400,7 +1442,7 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
         Utils::Logger::Warn("[AlertSystem] SChannel AcquireCredentialsHandle failed: 0x{:08X}",
                             static_cast<unsigned int>(sspiStatus));
         closesocket(sock);
-        return;
+        return false;
     }
 
     // TLS handshake loop
@@ -1424,10 +1466,17 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
                        ISC_REQ_CONFIDENTIALITY |
                        ISC_REQ_ALLOCATE_MEMORY;
 
+    // Convert TLS target name to wide string for SChannel SNI (proper UTF-8 → UTF-16)
+    int wLen = MultiByteToWideChar(CP_UTF8, 0, syslogTlsTarget.c_str(),
+                                    static_cast<int>(syslogTlsTarget.size()), nullptr, 0);
+    std::wstring tlsTargetW(static_cast<size_t>(wLen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, syslogTlsTarget.c_str(),
+                         static_cast<int>(syslogTlsTarget.size()), tlsTargetW.data(), wLen);
+
     sspiStatus = InitializeSecurityContextW(
         &credHandle,
         nullptr,  // No context yet
-        const_cast<SEC_WCHAR*>(L"localhost"),  // Target name for SNI
+        const_cast<SEC_WCHAR*>(tlsTargetW.c_str()),  // Configurable SNI target
         contextReq,
         0, 0,
         nullptr,  // No input
@@ -1507,7 +1556,9 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
                 size_t extraOffset = inData.size() - inBuffers[1].cbBuffer;
                 std::vector<uint8_t> extra(inData.begin() + extraOffset, inData.end());
                 inData = std::move(extra);
-            } else {
+            } else if (sspiStatus != SEC_E_INCOMPLETE_MESSAGE) {
+                // Only clear when SChannel consumed ALL input. For INCOMPLETE_MESSAGE,
+                // the partial TLS record must be preserved and appended to on next recv.
                 inData.clear();
             }
 
@@ -1529,7 +1580,7 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
                             static_cast<unsigned int>(sspiStatus));
         FreeCredentialsHandle(&credHandle);
         closesocket(sock);
-        return;
+        return false;
     }
 
     if (!handshakeComplete) {
@@ -1540,14 +1591,32 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
         }
         FreeCredentialsHandle(&credHandle);
         closesocket(sock);
-        return;
+        return false;
     }
 
     //
     // Handshake complete — encrypt and send the syslog message.
     //
     SecPkgContext_StreamSizes streamSizes{};
-    QueryContextAttributesW(&ctxtHandle, SECPKG_ATTR_STREAM_SIZES, &streamSizes);
+    SECURITY_STATUS qcaStatus = QueryContextAttributesW(
+        &ctxtHandle, SECPKG_ATTR_STREAM_SIZES, &streamSizes);
+    if (qcaStatus != SEC_E_OK) {
+        Utils::Logger::Error("[AlertSystem] QueryContextAttributes(STREAM_SIZES) failed: 0x{:08X}",
+                             static_cast<unsigned int>(qcaStatus));
+        DeleteSecurityContext(&ctxtHandle);
+        FreeCredentialsHandle(&credHandle);
+        closesocket(sock);
+        return false;
+    }
+
+    if (static_cast<ULONG>(framedLen) > streamSizes.cbMaximumMessage) {
+        Utils::Logger::Error("[AlertSystem] Syslog payload ({} bytes) exceeds TLS max message size "
+                             "({} bytes)", framedLen, streamSizes.cbMaximumMessage);
+        DeleteSecurityContext(&ctxtHandle);
+        FreeCredentialsHandle(&credHandle);
+        closesocket(sock);
+        return false;
+    }
 
     const ULONG totalBufSize = streamSizes.cbHeader +
                                 static_cast<ULONG>(framedLen) +
@@ -1578,6 +1647,7 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
     encDesc.ulVersion = SECBUFFER_VERSION;
 
     sspiStatus = EncryptMessage(&ctxtHandle, 0, &encDesc, 0);
+    bool sendSuccess = false;
     if (sspiStatus == SEC_E_OK) {
         const ULONG sendTotal = encBuffers[0].cbBuffer +
                                  encBuffers[1].cbBuffer +
@@ -1586,6 +1656,8 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
                              static_cast<int>(sendTotal), 0);
         if (bytesSent <= 0) {
             Utils::Logger::Warn("[AlertSystem] TLS syslog send failed: {}", WSAGetLastError());
+        } else {
+            sendSuccess = true;
         }
     } else {
         Utils::Logger::Warn("[AlertSystem] EncryptMessage failed: 0x{:08X}",
@@ -1631,12 +1703,13 @@ void AlertSystemImpl::DeliverSyslog(const Alert& alert) {
     FreeCredentialsHandle(&credHandle);
     shutdown(sock, SD_SEND);
     closesocket(sock);
+    return sendSuccess;
 }
 
 void AlertSystemImpl::DeliverSIEM(const Alert& alert) {
     // SIEM delivery: format as JSON, send via syslog or HTTPS
     // Uses syslog as transport (most SIEM collectors listen on syslog)
-    DeliverSyslog(alert);
+    (void)DeliverSyslog(alert);
 }
 
 // ============================================================================

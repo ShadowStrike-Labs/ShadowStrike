@@ -15,6 +15,8 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
+#include "pch.h"
+
 /**
  * @file FilterConnection.cpp
  * @brief Filter Manager connection management implementation
@@ -39,6 +41,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <sstream>
 #include <mutex>
 #include <atomic>
@@ -57,6 +60,127 @@
 
 namespace ShadowStrike {
 namespace Communication {
+
+namespace {
+
+#pragma pack(push, 1)
+struct KernelEncHeader {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t algorithm;
+    uint32_t flags;
+    uint32_t plaintextSize;
+    uint32_t ciphertextSize;
+    uint8_t nonce[12];
+    uint8_t tag[16];
+    uint64_t keyId;
+    uint32_t aadSize;
+    int64_t timestamp;
+    uint32_t headerCrc32;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(KernelEncHeader) == 72, "KernelEncHeader size mismatch");
+
+constexpr uint32_t kKernelEncMagic = 'RCNE';
+constexpr uint16_t kKernelEncVersion = 2;
+constexpr uint16_t kKernelEncAlgorithmAes256Gcm = 2;
+constexpr uint32_t kKernelEncFlagUseAad = 0x00000002;
+constexpr uint32_t kKernelEncCrc32Polynomial = 0xEDB88320UL;
+
+[[nodiscard]] std::string WideToUtf8String(const std::wstring& value) noexcept {
+    if (value.empty()) {
+        return {};
+    }
+
+    if (value.size() > static_cast<size_t>(INT_MAX)) {
+        return {};
+    }
+
+    const int requiredBytes = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr
+    );
+    if (requiredBytes <= 0) {
+        return {};
+    }
+
+    std::string utf8(static_cast<size_t>(requiredBytes), '\0');
+    const int converted = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        value.data(),
+        static_cast<int>(value.size()),
+        utf8.data(),
+        requiredBytes,
+        nullptr,
+        nullptr
+    );
+    if (converted != requiredBytes) {
+        return {};
+    }
+
+    return utf8;
+}
+
+[[nodiscard]] DWORD GetDeliveredMessageSize(
+    const uint8_t* buffer,
+    size_t bufferSize
+) noexcept {
+    constexpr size_t kTransportHeaderSize = sizeof(FILTER_MESSAGE_HEADER) +
+                                            sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+
+    if (buffer == nullptr || bufferSize < kTransportHeaderSize) {
+        return 0;
+    }
+
+    const auto* ssHeader = reinterpret_cast<const SHADOWSTRIKE_MESSAGE_HEADER*>(
+        buffer + sizeof(FILTER_MESSAGE_HEADER)
+    );
+    if (ssHeader->TotalSize < sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+        return 0;
+    }
+
+    const size_t totalSize = sizeof(FILTER_MESSAGE_HEADER) + ssHeader->TotalSize;
+    if (totalSize > bufferSize || totalSize > static_cast<size_t>(MAXDWORD)) {
+        return 0;
+    }
+
+    return static_cast<DWORD>(totalSize);
+}
+
+[[nodiscard]] uint32_t ComputeKernelEncHeaderCrc32(const void* data, size_t size) noexcept {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    uint32_t crc = 0xFFFFFFFFu;
+
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= bytes[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            const uint32_t mask = 0u - (crc & 1u);
+            crc = (crc >> 1) ^ (kKernelEncCrc32Polynomial & mask);
+        }
+    }
+
+    return crc ^ 0xFFFFFFFFu;
+}
+
+[[nodiscard]] int64_t GetKernelEncTimestamp() noexcept {
+    FILETIME ft{};
+    GetSystemTimeAsFileTime(&ft);
+
+    ULARGE_INTEGER value{};
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    return static_cast<int64_t>(value.QuadPart);
+}
+
+}  // namespace
 
 // ============================================================================
 // IMPLEMENTATION CLASS (PIMPL)
@@ -140,8 +264,10 @@ public:
             return true;
         }
 
-        Utils::Logger::Info("[FilterConnection] Connecting to port: {}",
-                           Utils::StringUtils::WideToUtf8(m_portName));
+        const std::string connectMessage =
+            std::string("[FilterConnection] Connecting to port: ") +
+            WideToUtf8String(m_portName);
+        Utils::Logger::Info(connectMessage.c_str());
 
         HRESULT hr = FilterConnectCommunicationPort(
             m_portName.c_str(),
@@ -180,7 +306,21 @@ public:
         }
 
         m_connected.store(true, std::memory_order_release);
-        Utils::Logger::Info("[FilterConnection] Connected successfully");
+
+        // Receive key exchange message from kernel.
+        // The kernel sends SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE immediately after
+        // accepting the connection. We must receive and process it before any
+        // other communication can occur.
+        if (!ReceiveKeyExchange()) {
+            Utils::Logger::Error("[FilterConnection] Key exchange failed — "
+                                 "encryption not established, disconnecting");
+            m_connected.store(false, std::memory_order_release);
+            CloseHandle(m_hPort);
+            m_hPort = nullptr;
+            return false;
+        }
+
+        Utils::Logger::Info("[FilterConnection] Connected successfully (encrypted)");
         return true;
     }
 
@@ -197,13 +337,14 @@ public:
             m_hPort = nullptr;
         }
 
-        // Scrub session key
-        if (m_encryptionEstablished.load(std::memory_order_acquire)) {
-            ShadowStrike::Security::CryptoManager::Instance().SecureZero(
-                m_sessionKey.data(), m_sessionKey.size());
-            m_encryptionEstablished.store(false, std::memory_order_release);
-            m_nonceCounter.store(0, std::memory_order_release);
-        }
+        // Scrub ALL session key material unconditionally — key may have been
+        // partially written if ReceiveKeyExchange failed mid-operation.
+        ShadowStrike::Security::CryptoManager::Instance().SecureZero(
+            m_sessionKey.data(), m_sessionKey.size());
+        ShadowStrike::Security::CryptoManager::Instance().SecureZero(
+            m_sessionNoncePrefix.data(), m_sessionNoncePrefix.size());
+        m_encryptionEstablished.store(false, std::memory_order_release);
+        m_nonceCounter.store(0, std::memory_order_release);
 
         // Cancel any pending I/O (outside lock so GetMessage can return)
         CancelIoEx(portToClose, nullptr);
@@ -271,7 +412,10 @@ public:
                 nullptr
             );
             if (SUCCEEDED(hr)) {
-                actualBytes = pMessage->MessageLength;
+                actualBytes = GetDeliveredMessageSize(buffer.data(), bufferSize);
+                if (actualBytes == 0) {
+                    hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                }
             }
         } else {
             // Asynchronous with timeout
@@ -325,7 +469,10 @@ public:
                 }
             } else if (SUCCEEDED(hr)) {
                 // Completed synchronously despite async request
-                actualBytes = pMessage->MessageLength;
+                actualBytes = GetDeliveredMessageSize(buffer.data(), bufferSize);
+                if (actualBytes == 0) {
+                    hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                }
             }
 
             CloseHandle(overlapped.hEvent);
@@ -616,7 +763,7 @@ public:
             wideMsg.pop_back();
         }
 
-        return Utils::StringUtils::WideToUtf8(wideMsg);
+        return WideToUtf8String(wideMsg);
     }
 
     //=========================================================================
@@ -631,7 +778,7 @@ public:
 
     // FIX [BUG #10 LOW]: Escape backslashes in port name for valid JSON.
     [[nodiscard]] std::string ToJson() const {
-        std::string escapedPort = Utils::StringUtils::WideToUtf8(m_portName);
+        std::string escapedPort = WideToUtf8String(m_portName);
         // Escape backslashes for JSON
         std::string jsonPort;
         jsonPort.reserve(escapedPort.size() + 4);
@@ -670,8 +817,172 @@ private:
 
     // Per-session encryption state
     std::array<uint8_t, 32> m_sessionKey;
+    std::array<uint8_t, 4> m_sessionNoncePrefix{};
     std::atomic<bool> m_encryptionEstablished{false};
     std::atomic<uint64_t> m_nonceCounter{0};
+
+    //=========================================================================
+    // Key Exchange
+    //=========================================================================
+
+    /**
+     * @brief Receive and process the key exchange message from the kernel.
+     *
+     * After FilterConnectCommunicationPort succeeds, the kernel immediately sends
+     * a SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE containing:
+     *   - Salt[32]: HKDF salt for deriving KWK
+     *   - WrappedSessionKey[32]: Session key encrypted with KWK
+     *   - Nonce[12]: GCM nonce for the wrapping operation
+     *   - Tag[16]: GCM auth tag
+     *   - SessionNoncePrefix[4]: Prefix for message nonces
+     *
+     * User-mode derives KWK = HKDF(SHA256, ownImageHash, salt, "ShadowStrike-KWK-v1"),
+     * then unwraps the session key using AES-256-GCM.
+     */
+    [[nodiscard]] bool ReceiveKeyExchange() {
+        using namespace ShadowStrike::Security;
+        auto& crypto = CryptoManager::Instance();
+
+        // Allocate buffer for key exchange message
+        constexpr size_t kBufSize = sizeof(FILTER_MESSAGE_HEADER) +
+                                     sizeof(SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE);
+        std::vector<uint8_t> buf(kBufSize, 0);
+
+        // Receive with 10-second timeout
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (ov.hEvent == nullptr) {
+            Utils::Logger::Error("[FilterConnection] KEX: CreateEvent failed: {}",
+                                 GetLastError());
+            return false;
+        }
+
+        HRESULT hr = FilterGetMessage(
+            m_hPort,
+            reinterpret_cast<PFILTER_MESSAGE_HEADER>(buf.data()),
+            static_cast<DWORD>(kBufSize),
+            &ov);
+
+        if (hr == HRESULT_FROM_WIN32(ERROR_IO_PENDING)) {
+            DWORD waitResult = WaitForSingleObject(ov.hEvent, 10000);
+            if (waitResult != WAIT_OBJECT_0) {
+                CancelIoEx(m_hPort, &ov);
+                // Drain the cancelled I/O to prevent kernel writing to freed stack OVERLAPPED
+                DWORD ignored = 0;
+                GetOverlappedResult(m_hPort, &ov, &ignored, TRUE);
+                CloseHandle(ov.hEvent);
+                Utils::Logger::Error("[FilterConnection] KEX: Timeout waiting for key exchange");
+                return false;
+            }
+        } else if (FAILED(hr)) {
+            CloseHandle(ov.hEvent);
+            Utils::Logger::Error("[FilterConnection] KEX: FilterGetMessage failed: 0x{:08X}",
+                                 static_cast<unsigned int>(hr));
+            return false;
+        }
+
+        DWORD bytesReceived = 0;
+        if (!GetOverlappedResult(m_hPort, &ov, &bytesReceived, FALSE)) {
+            CloseHandle(ov.hEvent);
+            Utils::Logger::Error("[FilterConnection] KEX: GetOverlappedResult failed: {}",
+                                 GetLastError());
+            return false;
+        }
+        CloseHandle(ov.hEvent);
+
+        if (bytesReceived < sizeof(FILTER_MESSAGE_HEADER) + sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+            Utils::Logger::Error("[FilterConnection] KEX: Message too small ({} bytes)",
+                                 bytesReceived);
+            return false;
+        }
+
+        // Verify this is a key exchange message
+        auto* ssHeader = reinterpret_cast<const SHADOWSTRIKE_MESSAGE_HEADER*>(
+            buf.data() + sizeof(FILTER_MESSAGE_HEADER));
+
+        if (ssHeader->MessageType != FilterMessageType_KeyExchange) {
+            Utils::Logger::Error("[FilterConnection] KEX: Expected key exchange message, got type={}",
+                                 ssHeader->MessageType);
+            return false;
+        }
+
+        if (bytesReceived < sizeof(FILTER_MESSAGE_HEADER) + sizeof(SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE)) {
+            Utils::Logger::Error("[FilterConnection] KEX: Truncated key exchange ({} bytes)",
+                                 bytesReceived);
+            return false;
+        }
+
+        auto* kexMsg = reinterpret_cast<const SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE*>(
+            buf.data() + sizeof(FILTER_MESSAGE_HEADER));
+
+        //
+        // Derive KWK (Key-Wrapping-Key) from our own executable image hash + salt.
+        // This mirrors what the kernel did with the same inputs.
+        //
+        // Get our own executable hash (same hash the kernel verified during connect)
+        //
+        std::vector<uint8_t> ownImageHash;
+        {
+            wchar_t exePath[MAX_PATH]{};
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            auto hashOpt = crypto.HashFile(std::wstring(exePath), HashAlgorithm::SHA256);
+            if (!hashOpt.has_value() || hashOpt->size() < 32) {
+                Utils::Logger::Error("[FilterConnection] KEX: Failed to hash own executable");
+                return false;
+            }
+            ownImageHash = std::move(*hashOpt);
+        }
+
+        // Derive KWK = HKDF(SHA256, imageHash, salt, "ShadowStrike-KWK-v1")
+        static const std::string kwkInfo = "ShadowStrike-KWK-v1";
+        std::span<const uint8_t> saltSpan(kexMsg->Salt, sizeof(kexMsg->Salt));
+
+        auto kwk = crypto.HKDF(
+            std::span<const uint8_t>(ownImageHash.data(), ownImageHash.size()),
+            saltSpan,
+            std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(kwkInfo.data()), kwkInfo.size()),
+            32,
+            HashAlgorithm::SHA256);
+
+        if (kwk.size() != 32) {
+            Utils::Logger::Error("[FilterConnection] KEX: KWK derivation failed");
+            return false;
+        }
+
+        // Unwrap session key: decrypt WrappedSessionKey with KWK, using Salt as AAD
+        auto decrypted = crypto.Decrypt(
+            std::span<const uint8_t>(kexMsg->WrappedSessionKey, sizeof(kexMsg->WrappedSessionKey)),
+            std::span<const uint8_t>(kwk.data(), kwk.size()),
+            SymmetricAlgorithm::AES_256_GCM,
+            std::span<const uint8_t>(kexMsg->Nonce, sizeof(kexMsg->Nonce)),
+            std::span<const uint8_t>(kexMsg->Tag, sizeof(kexMsg->Tag)),
+            saltSpan);
+
+        // Scrub KWK immediately
+        crypto.SecureZero(kwk.data(), kwk.size());
+
+        if (decrypted.plaintext.size() != 32) {
+            Utils::Logger::Error("[FilterConnection] KEX: Session key unwrap failed "
+                                 "(got {} bytes, expected 32)", decrypted.plaintext.size());
+            return false;
+        }
+
+        // Store session key, nonce prefix, and mark encryption as established
+        std::copy(decrypted.plaintext.begin(), decrypted.plaintext.end(), m_sessionKey.begin());
+        crypto.SecureZero(decrypted.plaintext.data(), decrypted.plaintext.size());
+
+        std::copy(kexMsg->SessionNoncePrefix,
+                  kexMsg->SessionNoncePrefix + sizeof(kexMsg->SessionNoncePrefix),
+                  m_sessionNoncePrefix.begin());
+
+        m_nonceCounter.store(0, std::memory_order_relaxed);
+        m_encryptionEstablished.store(true, std::memory_order_release);
+
+        Utils::Logger::Info("[FilterConnection] Key exchange complete — "
+                            "AES-256-GCM encryption established");
+        return true;
+    }
 
     //=========================================================================
     // Encryption Helpers
@@ -708,32 +1019,72 @@ private:
 
         const size_t encDataSize = actualBytes - dataOffset;
         uint8_t* encData = buffer + dataOffset;
-
-        // Use CryptoManager to decrypt — the simple vector overload automatically
-        // splits [12B nonce][ciphertext][16B tag] from the combined blob
-        auto& crypto = ShadowStrike::Security::CryptoManager::Instance();
-        std::vector<uint8_t> ciphertext(encData, encData + encDataSize);
-        std::vector<uint8_t> keyVec(m_sessionKey.begin(), m_sessionKey.end());
-
-        auto plaintext = crypto.Decrypt(ciphertext, keyVec);
-
-        // Scrub key copy immediately
-        crypto.SecureZero(keyVec.data(), keyVec.size());
-
-        if (plaintext.empty() && encDataSize > 0) {
-            Utils::Logger::Warn("[FilterConnection] AES-256-GCM decryption failed "
-                                "(authentication failure or wrong key)");
+        if (encDataSize < sizeof(KernelEncHeader)) {
+            Utils::Logger::Warn("[FilterConnection] Encrypted payload too small for kernel ENC_HEADER");
             return false;
         }
 
-        // Copy plaintext back into buffer
-        if (plaintext.size() <= encDataSize) {
-            memcpy(encData, plaintext.data(), plaintext.size());
-            actualBytes = dataOffset + plaintext.size();
-            ssHeader->DataSize = static_cast<ULONG>(plaintext.size());
+        const auto* encHeader = reinterpret_cast<const KernelEncHeader*>(encData);
+        if (encHeader->magic != kKernelEncMagic ||
+            encHeader->version != kKernelEncVersion ||
+            encHeader->algorithm != kKernelEncAlgorithmAes256Gcm) {
+            Utils::Logger::Warn("[FilterConnection] Invalid kernel encryption header");
+            return false;
+        }
+
+        const uint32_t expectedHeaderCrc = ComputeKernelEncHeaderCrc32(
+            encHeader, offsetof(KernelEncHeader, headerCrc32));
+        if (encHeader->headerCrc32 != expectedHeaderCrc) {
+            Utils::Logger::Warn("[FilterConnection] Kernel ENC_HEADER CRC mismatch");
+            return false;
+        }
+
+        if (encHeader->aadSize != sizeof(SHADOWSTRIKE_MESSAGE_HEADER) ||
+            encHeader->plaintextSize != encHeader->ciphertextSize ||
+            encDataSize < sizeof(KernelEncHeader) + encHeader->ciphertextSize) {
+            Utils::Logger::Warn("[FilterConnection] Invalid encrypted payload sizes");
+            return false;
+        }
+
+        using namespace ShadowStrike::Security;
+        auto& crypto = CryptoManager::Instance();
+        std::span<const uint8_t> keySpan(m_sessionKey.data(), m_sessionKey.size());
+        std::span<const uint8_t> nonceSpan(encHeader->nonce, sizeof(encHeader->nonce));
+        std::span<const uint8_t> tagSpan(encHeader->tag, sizeof(encHeader->tag));
+        std::span<const uint8_t> aadSpan(
+            reinterpret_cast<const uint8_t*>(ssHeader), sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+        std::span<const uint8_t> ciphertextSpan(
+            encData + sizeof(KernelEncHeader), encHeader->ciphertextSize);
+
+        auto result = crypto.Decrypt(
+            ciphertextSpan,
+            keySpan,
+            SymmetricAlgorithm::AES_256_GCM,
+            nonceSpan,
+            tagSpan,
+            aadSpan);
+
+        if (result.plaintext.size() != encHeader->plaintextSize) {
+            Utils::Logger::Warn("[FilterConnection] AES-256-GCM decryption failed "
+                                "(authentication failure or size mismatch)");
+            return false;
+        }
+
+        if (result.plaintext.size() <= encDataSize) {
+            memcpy(encData, result.plaintext.data(), result.plaintext.size());
+            actualBytes = dataOffset + result.plaintext.size();
+            ssHeader->DataSize = static_cast<ULONG>(result.plaintext.size());
             ssHeader->TotalSize = static_cast<ULONG>(
-                sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + plaintext.size());
+                sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + result.plaintext.size());
             ssHeader->Flags &= ~SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
+            if (!result.plaintext.empty()) {
+                crypto.SecureZero(result.plaintext.data(), result.plaintext.size());
+            }
+        } else {
+            Utils::Logger::Error("[FilterConnection] Decrypted plaintext ({} bytes) exceeds "
+                                 "encrypted buffer ({} bytes) — corrupted message",
+                                 result.plaintext.size(), encDataSize);
+            return false;
         }
 
         return true;
@@ -748,41 +1099,89 @@ private:
      */
     bool EncryptSendMessage(std::span<const uint8_t> plainBuffer,
                             std::vector<uint8_t>& encryptedBuffer) {
-        if (!m_encryptionEstablished.load(std::memory_order_acquire) ||
-            plainBuffer.size() <= sizeof(SHADOWSTRIKE_MESSAGE_HEADER))
+        if (!m_encryptionEstablished.load(std::memory_order_acquire))
             return false;
 
-        auto& crypto = ShadowStrike::Security::CryptoManager::Instance();
+        if (plainBuffer.size() <= sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+            encryptedBuffer.assign(plainBuffer.begin(), plainBuffer.end());
+            return true;
+        }
+
+        using namespace ShadowStrike::Security;
+        auto& crypto = CryptoManager::Instance();
 
         // Split into header + data
         const auto* header = reinterpret_cast<const SHADOWSTRIKE_MESSAGE_HEADER*>(plainBuffer.data());
         const size_t dataSize = plainBuffer.size() - sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
         const uint8_t* data = plainBuffer.data() + sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
 
-        // Encrypt data portion using simple API (returns [nonce][ciphertext][tag])
-        std::vector<uint8_t> dataVec(data, data + dataSize);
-        std::vector<uint8_t> keyVec(m_sessionKey.begin(), m_sessionKey.end());
-        auto encrypted = crypto.Encrypt(dataVec, keyVec);
+        // Build structured nonce: [prefix(4) || counter(8)]
+        // This ensures nonces are unique across sessions (prefix) and messages (counter).
+        const uint64_t counter = m_nonceCounter.fetch_add(1, std::memory_order_relaxed);
+        std::array<uint8_t, 12> nonce{};
+        memcpy(nonce.data(), m_sessionNoncePrefix.data(), 4);
+        memcpy(nonce.data() + 4, &counter, sizeof(counter));
 
-        if (encrypted.empty()) {
+        // Compute AAD from header with FINAL flags/size (as receiver will see it)
+        SHADOWSTRIKE_MESSAGE_HEADER aadHeader = *header;
+        const size_t encPayloadSize = sizeof(KernelEncHeader) + dataSize;
+        aadHeader.Flags |= SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
+        aadHeader.DataSize = static_cast<ULONG>(encPayloadSize);
+        aadHeader.TotalSize = static_cast<ULONG>(
+            sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + encPayloadSize);
+
+        std::span<const uint8_t> keySpan(m_sessionKey.data(), m_sessionKey.size());
+        std::span<const uint8_t> nonceSpan(nonce.data(), nonce.size());
+        std::span<const uint8_t> aadSpan(
+            reinterpret_cast<const uint8_t*>(&aadHeader), sizeof(aadHeader));
+
+        auto result = crypto.Encrypt(
+            std::span<const uint8_t>(data, dataSize),
+            keySpan,
+            SymmetricAlgorithm::AES_256_GCM,
+            nonceSpan,
+            aadSpan);
+
+        if (result.ciphertext.empty() && dataSize > 0) {
             Utils::Logger::Error("[FilterConnection] Encryption failed");
             return false;
         }
 
-        // Build output: [SHADOWSTRIKE_MESSAGE_HEADER (modified)][encrypted data]
-        encryptedBuffer.resize(sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + encrypted.size());
-        memcpy(encryptedBuffer.data(), header, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+        if (result.tag.size() != 16 || result.ciphertext.size() != dataSize) {
+            Utils::Logger::Error("[FilterConnection] Encryption returned unexpected AES-GCM layout");
+            return false;
+        }
+
+        KernelEncHeader innerHeader{};
+        innerHeader.magic = kKernelEncMagic;
+        innerHeader.version = kKernelEncVersion;
+        innerHeader.algorithm = kKernelEncAlgorithmAes256Gcm;
+        innerHeader.flags = kKernelEncFlagUseAad;
+        innerHeader.plaintextSize = static_cast<uint32_t>(dataSize);
+        innerHeader.ciphertextSize = static_cast<uint32_t>(result.ciphertext.size());
+        memcpy(innerHeader.nonce, nonce.data(), nonce.size());
+        memcpy(innerHeader.tag, result.tag.data(), result.tag.size());
+        innerHeader.keyId = 0;
+        innerHeader.aadSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+        innerHeader.timestamp = GetKernelEncTimestamp();
+        innerHeader.headerCrc32 = ComputeKernelEncHeaderCrc32(
+            &innerHeader, offsetof(KernelEncHeader, headerCrc32));
+
+        // Wire format: [header][KernelEncHeader][ciphertext]
+        encryptedBuffer.resize(sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + encPayloadSize);
+        memcpy(encryptedBuffer.data(), &aadHeader, sizeof(aadHeader));
 
         auto* outHeader = reinterpret_cast<SHADOWSTRIKE_MESSAGE_HEADER*>(encryptedBuffer.data());
-        outHeader->Flags |= SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
-        outHeader->DataSize = static_cast<ULONG>(encrypted.size());
-        outHeader->TotalSize = static_cast<ULONG>(encryptedBuffer.size());
+        *outHeader = aadHeader;
 
-        memcpy(encryptedBuffer.data() + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
-               encrypted.data(), encrypted.size());
+        uint8_t* payloadDst = encryptedBuffer.data() + sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+        memcpy(payloadDst, &innerHeader, sizeof(innerHeader));
+        memcpy(payloadDst + sizeof(innerHeader),
+               result.ciphertext.data(),
+               result.ciphertext.size());
 
-        // Scrub intermediaries
-        crypto.SecureZero(keyVec.data(), keyVec.size());
+        // Scrub nonce (contains counter) — key was not copied
+        crypto.SecureZero(nonce.data(), nonce.size());
         return true;
     }
 };

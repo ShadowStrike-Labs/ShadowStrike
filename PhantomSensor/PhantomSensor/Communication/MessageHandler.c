@@ -217,8 +217,9 @@ static MH_GLOBALS g_MhGlobals = {0};
 
 static NTSTATUS
 MhpValidateAndCopyMessage(
-    _In_reads_bytes_(UserBufferSize) PVOID UserBuffer,
-    _In_ ULONG UserBufferSize,
+    _In_reads_bytes_(InputBufferSize) PVOID InputBuffer,
+    _In_ ULONG InputBufferSize,
+    _In_ BOOLEAN InputBufferTrusted,
     _Out_ PVOID* KernelBuffer,
     _Out_ PULONG KernelBufferSize,
     _Out_ PSS_MESSAGE_HEADER* Header,
@@ -1021,8 +1022,9 @@ MhpIsPrivilegedOperation(
  */
 static NTSTATUS
 MhpValidateAndCopyMessage(
-    _In_reads_bytes_(UserBufferSize) PVOID UserBuffer,
-    _In_ ULONG UserBufferSize,
+    _In_reads_bytes_(InputBufferSize) PVOID InputBuffer,
+    _In_ ULONG InputBufferSize,
+    _In_ BOOLEAN InputBufferTrusted,
     _Out_ PVOID* KernelBuffer,
     _Out_ PULONG KernelBufferSize,
     _Out_ PSS_MESSAGE_HEADER* Header,
@@ -1045,15 +1047,15 @@ MhpValidateAndCopyMessage(
     //
     // Basic parameter validation
     //
-    if (UserBuffer == NULL) {
+    if (InputBuffer == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (UserBufferSize < sizeof(SS_MESSAGE_HEADER)) {
+    if (InputBufferSize < sizeof(SS_MESSAGE_HEADER)) {
         return SHADOWSTRIKE_ERROR_BUFFER_TOO_SMALL;
     }
 
-    if (UserBufferSize > MH_MAX_INPUT_BUFFER_SIZE) {
+    if (InputBufferSize > MH_MAX_INPUT_BUFFER_SIZE) {
         return STATUS_INVALID_BUFFER_SIZE;
     }
 
@@ -1062,7 +1064,7 @@ MhpValidateAndCopyMessage(
     //
     kernelBuf = ExAllocatePool2(
         POOL_FLAG_PAGED | POOL_FLAG_UNINITIALIZED,
-        UserBufferSize,
+        InputBufferSize,
         MH_KERNEL_BUFFER_TAG
     );
 
@@ -1071,18 +1073,17 @@ MhpValidateAndCopyMessage(
     }
 
     //
-    // Probe and copy under SEH
+    // Copy under SEH. Only probe when the source is an actual user-mode buffer.
     //
     __try {
-        //
-        // Probe for read access - this validates the user pointer
-        //
-        ProbeForRead(UserBuffer, UserBufferSize, sizeof(UCHAR));
+        if (!InputBufferTrusted) {
+            ProbeForRead(InputBuffer, InputBufferSize, sizeof(UCHAR));
+        }
 
         //
         // Copy to kernel buffer
         //
-        RtlCopyMemory(kernelBuf, UserBuffer, UserBufferSize);
+        RtlCopyMemory(kernelBuf, InputBuffer, InputBufferSize);
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();
@@ -1117,15 +1118,15 @@ MhpValidateAndCopyMessage(
     //
     // Validate sizes - prevent integer overflow
     //
-    if (hdr->TotalSize > UserBufferSize) {
+    if (hdr->TotalSize > InputBufferSize) {
         ExFreePoolWithTag(kernelBuf, MH_KERNEL_BUFFER_TAG);
         return SHADOWSTRIKE_ERROR_INVALID_MESSAGE;
     }
 
     //
-    // Safe subtraction - we already validated UserBufferSize >= sizeof(SS_MESSAGE_HEADER)
+    // Safe subtraction - we already validated InputBufferSize >= sizeof(SS_MESSAGE_HEADER)
     //
-    ULONG maxPayloadSize = UserBufferSize - sizeof(SS_MESSAGE_HEADER);
+    ULONG maxPayloadSize = InputBufferSize - sizeof(SS_MESSAGE_HEADER);
     if (hdr->DataSize > maxPayloadSize) {
         ExFreePoolWithTag(kernelBuf, MH_KERNEL_BUFFER_TAG);
         return SHADOWSTRIKE_ERROR_INVALID_MESSAGE;
@@ -1135,7 +1136,7 @@ MhpValidateAndCopyMessage(
     // Success - return kernel buffer and parsed pointers
     //
     *KernelBuffer = kernelBuf;
-    *KernelBufferSize = UserBufferSize;
+    *KernelBufferSize = InputBufferSize;
     *Header = hdr;
 
     if (hdr->DataSize > 0) {
@@ -1213,6 +1214,7 @@ ShadowStrikeProcessUserMessage(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
     _In_reads_bytes_(InputBufferSize) PVOID InputBuffer,
     _In_ ULONG InputBufferSize,
+    _In_ BOOLEAN InputBufferTrusted,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
     _In_ ULONG OutputBufferSize,
     _Out_ PULONG ReturnOutputBufferLength
@@ -1268,6 +1270,7 @@ ShadowStrikeProcessUserMessage(
     status = MhpValidateAndCopyMessage(
         InputBuffer,
         InputBufferSize,
+        InputBufferTrusted,
         &kernelBuffer,
         &kernelBufferSize,
         &header,

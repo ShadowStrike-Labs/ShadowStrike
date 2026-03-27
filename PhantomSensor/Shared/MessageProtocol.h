@@ -405,12 +405,8 @@ typedef struct _SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY {
 //
 // 18. Process Verdict Reply (FilterMessageType_ProcessNotify with RequireReply)
 //
-typedef struct _SHADOWSTRIKE_PROCESS_VERDICT_REPLY {
-    UINT64 MessageId;
-    UINT8  Verdict;         // 0=Allow, 1=Block, 2=Quarantine
-    UINT32 ResultCode;
-    UINT32 Reserved;
-} SHADOWSTRIKE_PROCESS_VERDICT_REPLY, *PSHADOWSTRIKE_PROCESS_VERDICT_REPLY;
+// Defined in SharedDefs.h. Keep a single canonical declaration to prevent
+// kernel/user header skew and ODR-style type collisions during shared builds.
 
 //
 // 19. Key Exchange Message (FilterMessageType_KeyExchange)

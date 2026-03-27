@@ -100,6 +100,7 @@ typedef struct _SHADOWSTRIKE_PROTECTED_PROCESS_ENTRY {
  * the reference-counted version.
  */
 static SHADOWSTRIKE_CLIENT_PORT_REF g_ClientPortRefs[SHADOWSTRIKE_MAX_CONNECTIONS];
+static PENC_KEY g_ClientSessionEncKeys[SHADOWSTRIKE_MAX_CONNECTIONS];
 
 //
 // HMAC-SHA256 transport authentication key (32 bytes, generated per boot)
@@ -182,7 +183,8 @@ static NTSTATUS
 ShadowStrikeHandleUpdatePolicy(
     _In_ LONG ClientIndex,
     _In_reads_bytes_(InputBufferLength) PVOID InputBuffer,
-    _In_ ULONG InputBufferLength
+    _In_ ULONG InputBufferLength,
+    _In_ BOOLEAN InputBufferTrusted
     );
 
 static NTSTATUS
@@ -195,7 +197,41 @@ static NTSTATUS
 ShadowStrikeHandleRegisterProtectedProcess(
     _In_ LONG ClientIndex,
     _In_reads_bytes_(InputBufferLength) PVOID InputBuffer,
-    _In_ ULONG InputBufferLength
+    _In_ ULONG InputBufferLength,
+    _In_ BOOLEAN InputBufferTrusted
+    );
+
+static NTSTATUS
+ShadowStrikeCopyMessagePayload(
+    _In_reads_bytes_(InputBufferLength) PVOID InputBuffer,
+    _In_ ULONG InputBufferLength,
+    _In_ ULONG PayloadOffset,
+    _Out_writes_bytes_(PayloadSize) PVOID LocalPayload,
+    _In_ ULONG PayloadSize,
+    _In_ BOOLEAN InputBufferTrusted
+    );
+
+static NTSTATUS
+ShadowStrikeAcquireClientPortBySlot(
+    _In_ LONG SlotIndex,
+    _Out_ PSHADOWSTRIKE_CLIENT_PORT_REF* ClientRef
+    );
+
+static VOID
+ShadowStrikePrepareEncryptedMessageHeader(
+    _Out_ PSHADOWSTRIKE_MESSAGE_HEADER DestinationHeader,
+    _In_ PSHADOWSTRIKE_MESSAGE_HEADER SourceHeader,
+    _In_ ULONG EncryptedPayloadSize
+    );
+
+static VOID
+ShadowStrikeReleaseSessionCryptoKey(
+    _Inout_opt_ PENC_KEY* SessionKey
+    );
+
+static VOID
+ShadowStrikeFinalizeClientDisconnect(
+    _In_ LONG SlotIndex
     );
 
 static NTSTATUS
@@ -279,6 +315,88 @@ ShadowStrikeValidateInputBuffer(
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] DataSize exceeds available space\n");
         return STATUS_INVALID_PARAMETER;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static VOID
+ShadowStrikePrepareEncryptedMessageHeader(
+    _Out_ PSHADOWSTRIKE_MESSAGE_HEADER DestinationHeader,
+    _In_ PSHADOWSTRIKE_MESSAGE_HEADER SourceHeader,
+    _In_ ULONG EncryptedPayloadSize
+    )
+{
+    if (DestinationHeader == NULL || SourceHeader == NULL) {
+        return;
+    }
+
+    RtlCopyMemory(
+        DestinationHeader,
+        SourceHeader,
+        sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
+    );
+    DestinationHeader->Flags |= SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
+    DestinationHeader->DataSize = EncryptedPayloadSize;
+    DestinationHeader->TotalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + EncryptedPayloadSize;
+}
+
+static VOID
+ShadowStrikeReleaseSessionCryptoKey(
+    _Inout_opt_ PENC_KEY* SessionKey
+    )
+{
+    PENC_KEY key;
+    LONG remainingRefs;
+    PENC_MANAGER encMgr;
+
+    if (SessionKey == NULL || *SessionKey == NULL) {
+        return;
+    }
+
+    key = *SessionKey;
+    *SessionKey = NULL;
+
+    remainingRefs = EncKeyRelease(key);
+    if (remainingRefs == 0) {
+        encMgr = ShadowStrikeGetEncryptionManager();
+        if (encMgr != NULL) {
+            EncDestroyKey(encMgr, key);
+        }
+    }
+}
+
+static NTSTATUS
+ShadowStrikeCopyMessagePayload(
+    _In_reads_bytes_(InputBufferLength) PVOID InputBuffer,
+    _In_ ULONG InputBufferLength,
+    _In_ ULONG PayloadOffset,
+    _Out_writes_bytes_(PayloadSize) PVOID LocalPayload,
+    _In_ ULONG PayloadSize,
+    _In_ BOOLEAN InputBufferTrusted
+    )
+{
+    if (InputBuffer == NULL || LocalPayload == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (InputBufferLength < PayloadOffset ||
+        InputBufferLength - PayloadOffset < PayloadSize) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    __try {
+        if (!InputBufferTrusted) {
+            ProbeForRead(InputBuffer, InputBufferLength, sizeof(UINT32));
+        }
+
+        RtlCopyMemory(
+            LocalPayload,
+            (PUCHAR)InputBuffer + PayloadOffset,
+            PayloadSize
+        );
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return InputBufferTrusted ? STATUS_ACCESS_VIOLATION : STATUS_INVALID_USER_BUFFER;
     }
 
     return STATUS_SUCCESS;
@@ -509,6 +627,12 @@ ShadowStrikeCloseCommunicationPort(
 
     for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
         if (g_ClientPortRefs[i].ClientPort != NULL) {
+            if (g_ClientSessionEncKeys[i] != NULL) {
+                ShadowStrikeReleaseSessionCryptoKey(&g_ClientSessionEncKeys[i]);
+            }
+
+            RtlSecureZeroMemory(g_ClientPortRefs[i].SessionKey,
+                                sizeof(g_ClientPortRefs[i].SessionKey));
             FltCloseClientPort(
                 g_DriverData.FilterHandle,
                 &g_ClientPortRefs[i].ClientPort
@@ -550,19 +674,24 @@ ShadowStrikeCloseCommunicationPort(
 //
 // Drains messages buffered in MessageQueue while no user-mode client was
 // connected.  Called at PASSIVE_LEVEL after a new client registers.
-// Sends directly via FltSendMessage to avoid recursive enqueue.
+// Encrypts each message using the session key before sending.
 //
 static
 VOID
 ShadowStrikeDrainMessageQueue(
-    _In_ PFLT_PORT ClientPort
+    _In_ LONG SlotIndex
     )
 {
     PQUEUED_MESSAGE messages[32];
+    PSHADOWSTRIKE_CLIENT_PORT_REF clientRef = NULL;
+    PFLT_PORT clientPort = NULL;
     UINT32 count = 0;
     UINT32 totalDrained = 0;
     LARGE_INTEGER timeout;
     NTSTATUS status;
+    BOOLEAN canEncrypt = FALSE;
+    PENC_MANAGER encMgr = NULL;
+    PENC_KEY sessionKey = NULL;
 
     PAGED_CODE();
 
@@ -571,6 +700,21 @@ ShadowStrikeDrainMessageQueue(
     //
     timeout.QuadPart = 0;  // fire-and-forget
 
+    status = ShadowStrikeAcquireClientPortBySlot(SlotIndex, &clientRef);
+    if (!NT_SUCCESS(status)) {
+        return;
+    }
+
+    clientPort = clientRef->ClientPort;
+    canEncrypt = (clientRef->EncryptionEstablished != FALSE);
+    if (canEncrypt) {
+        encMgr = ShadowStrikeGetEncryptionManager();
+        sessionKey = g_ClientSessionEncKeys[SlotIndex];
+        if (encMgr == NULL || sessionKey == NULL) {
+            canEncrypt = FALSE;
+        }
+    }
+
     while (totalDrained < 512) {
         status = MqDequeueBatch(messages, 32, &count, 0);
         if (!NT_SUCCESS(status) || count == 0) {
@@ -578,20 +722,107 @@ ShadowStrikeDrainMessageQueue(
         }
 
         for (UINT32 i = 0; i < count; i++) {
+            PVOID sendData = messages[i]->Data;
+            ULONG sendSize = messages[i]->MessageSize;
+            PVOID encBuf = NULL;
+            BOOLEAN dropMessage = FALSE;
+
             //
-            // Send directly via FltSendMessage (not ShadowStrikeSendNotification)
-            // to prevent recursive re-enqueue on transient failure.
+            // Encrypt the queued message before sending.
+            // If encryption fails, DROP the message — never send plaintext.
             //
-            // Best-effort drain — failures are expected during reconnect
+            if (sendSize > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+                ULONG dataSize = sendSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+                ULONG encryptedSize = 0;
+                NTSTATUS encSizeStatus;
+
+                if (!canEncrypt) {
+                    dropMessage = TRUE;
+                } else {
+                    encSizeStatus = EncGetEncryptedSize(dataSize, TRUE, &encryptedSize);
+                    if (!NT_SUCCESS(encSizeStatus) || encryptedSize == 0) {
+                        dropMessage = TRUE;
+                    } else {
+                        ULONG totalEncSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + encryptedSize;
+                        encBuf = ExAllocatePool2(
+                            POOL_FLAG_NON_PAGED,
+                            totalEncSize,
+                            'edCP'
+                        );
+
+                        if (encBuf == NULL) {
+                            dropMessage = TRUE;
+                        } else {
+                            PSHADOWSTRIKE_MESSAGE_HEADER encHeader =
+                                (PSHADOWSTRIKE_MESSAGE_HEADER)encBuf;
+                            ENC_OPTIONS encOpts = {0};
+                            ULONG ciphertextSize = 0;
+                            NTSTATUS encStatus;
+
+                            ShadowStrikePrepareEncryptedMessageHeader(
+                                encHeader,
+                                (PSHADOWSTRIKE_MESSAGE_HEADER)sendData,
+                                encryptedSize
+                            );
+
+                            encOpts.Flags = EncFlag_IncludeHeader | EncFlag_UseAAD;
+                            encOpts.Key = sessionKey;
+                            encOpts.AAD = encBuf;
+                            encOpts.AADSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+                            encOpts.TagSize = ENC_GCM_TAG_SIZE;
+
+                            encStatus = EncEncrypt(
+                                encMgr,
+                                EncKeyType_Ephemeral,
+                                (PUCHAR)sendData + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+                                dataSize,
+                                (PUCHAR)encBuf + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+                                encryptedSize,
+                                &ciphertextSize,
+                                &encOpts
+                            );
+
+                            if (!NT_SUCCESS(encStatus) ||
+                                ciphertextSize == 0 ||
+                                ciphertextSize != encryptedSize) {
+                                ExFreePoolWithTag(encBuf, 'edCP');
+                                encBuf = NULL;
+                                dropMessage = TRUE;
+                            } else {
+                                sendData = encBuf;
+                                sendSize = encHeader->TotalSize;
+                                InterlockedExchange64(
+                                    &clientRef->NonceCounter,
+                                    sessionKey->NonceCounter
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (dropMessage) {
+                if (encBuf != NULL) {
+                    ExFreePoolWithTag(encBuf, 'edCP');
+                }
+                MqFreeMessage(messages[i]);
+                SHADOWSTRIKE_INC_STAT(MessagesDropped);
+                continue;
+            }
+
             (void)FltSendMessage(
                 g_DriverData.FilterHandle,
-                &ClientPort,
-                messages[i]->Data,
-                messages[i]->MessageSize,
+                &clientPort,
+                sendData,
+                sendSize,
                 NULL,
                 NULL,
                 &timeout
             );
+
+            if (encBuf != NULL) {
+                ExFreePoolWithTag(encBuf, 'edCP');
+            }
 
             MqFreeMessage(messages[i]);
         }
@@ -608,6 +839,8 @@ ShadowStrikeDrainMessageQueue(
                    "[ShadowStrike] Drained %lu queued messages on client connect\n",
                    totalDrained);
     }
+
+    ShadowStrikeReleaseClientPort(clientRef);
 }
 
 NTSTATUS
@@ -730,6 +963,7 @@ ShadowStrikeConnectNotify(
     // Initialize client slot with reference count of 1 (for the connection itself)
     //
     RtlZeroMemory(&g_ClientPortRefs[slotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
+    g_ClientSessionEncKeys[slotIndex] = NULL;
     g_ClientPortRefs[slotIndex].ClientPort = ClientPort;
     g_ClientPortRefs[slotIndex].ClientProcessId = clientProcessId;
     g_ClientPortRefs[slotIndex].IsPrimaryScanner = isPrimaryScanner;
@@ -751,8 +985,9 @@ ShadowStrikeConnectNotify(
             EncGetHmacAlgHandle(encMgr) : NULL;
 
         //
-        // Generate random salt for HKDF
+        // Generate random salt for HKDF and nonce prefix for this session
         //
+        UCHAR hkdfSalt[32];
         NTSTATUS keyStatus = BCryptGenRandom(
             NULL,
             g_ClientPortRefs[slotIndex].SessionNoncePrefix,
@@ -761,7 +996,6 @@ ShadowStrikeConnectNotify(
         );
 
         if (NT_SUCCESS(keyStatus)) {
-            UCHAR hkdfSalt[32];
             keyStatus = BCryptGenRandom(
                 NULL, hkdfSalt, sizeof(hkdfSalt),
                 BCRYPT_USE_SYSTEM_PREFERRED_RNG
@@ -778,11 +1012,202 @@ ShadowStrikeConnectNotify(
                     sizeof(g_ClientPortRefs[slotIndex].SessionKey)
                 );
             }
-            RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
+        }
+
+        if (NT_SUCCESS(keyStatus)) {
+            BOOLEAN sessionKeyAllZero = TRUE;
+            ULONG keyByte = 0;
+
+            for (keyByte = 0; keyByte < sizeof(g_ClientPortRefs[slotIndex].SessionKey); keyByte++) {
+                if (g_ClientPortRefs[slotIndex].SessionKey[keyByte] != 0) {
+                    sessionKeyAllZero = FALSE;
+                    break;
+                }
+            }
+
+            if (sessionKeyAllZero) {
+                keyStatus = STATUS_ENCRYPTION_FAILED;
+            } else {
+                PENC_KEY sessionCryptoKey = NULL;
+                NTSTATUS sessionKeyStatus = EncDeriveKey(
+                    encMgr,
+                    EncKeyType_Ephemeral,
+                    EncAlgorithm_AES_256_GCM,
+                    g_ClientPortRefs[slotIndex].SessionKey,
+                    sizeof(g_ClientPortRefs[slotIndex].SessionKey),
+                    &sessionCryptoKey
+                );
+
+                if (NT_SUCCESS(sessionKeyStatus) && sessionCryptoKey != NULL) {
+                    g_ClientSessionEncKeys[slotIndex] = sessionCryptoKey;
+                } else {
+                    if (sessionCryptoKey != NULL) {
+                        EncKeyRelease(sessionCryptoKey);
+                    }
+                    keyStatus = NT_SUCCESS(sessionKeyStatus) ? STATUS_ENCRYPTION_FAILED
+                                                             : sessionKeyStatus;
+                }
+            }
         }
 
         if (NT_SUCCESS(keyStatus)) {
             g_ClientPortRefs[slotIndex].NonceCounter = 0;
+
+            //
+            // Send key exchange message to user-mode.
+            // The session key is wrapped (encrypted) using a Key-Wrapping-Key (KWK)
+            // derived from the same HKDF inputs. User-mode can derive the same KWK
+            // from its own executable hash + the salt we send here.
+            //
+            // Build SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE with:
+            //   - Salt: the HKDF salt (user-mode needs this to derive KWK)
+            //   - WrappedSessionKey: session key encrypted with KWK via AES-256-GCM
+            //   - Nonce: GCM nonce for the wrapping operation
+            //   - Tag: GCM auth tag
+            //   - SessionNoncePrefix: 4-byte prefix for message nonces
+            //
+            SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE kexMsg = {0};
+            ShadowStrikeInitMessageHeader(&kexMsg.Header,
+                FilterMessageType_KeyExchange,
+                sizeof(SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE) - sizeof(SS_MESSAGE_HEADER));
+
+            RtlCopyMemory(kexMsg.Salt, hkdfSalt, sizeof(kexMsg.Salt));
+            RtlCopyMemory(kexMsg.SessionNoncePrefix,
+                          g_ClientPortRefs[slotIndex].SessionNoncePrefix,
+                          sizeof(kexMsg.SessionNoncePrefix));
+            kexMsg.KeyExpirySeconds = 0;  // No expiry
+            kexMsg.ProtocolFlags = SHADOWSTRIKE_KEX_PROTOCOL_FLAG_MANDATORY_ENCRYPTION;
+
+            //
+            // Derive KWK (Key-Wrapping-Key) from imageHash + salt.
+            // User-mode will derive the same KWK to unwrap the session key.
+            //
+            UCHAR kwk[32] = {0};
+            static const char kwkInfo[] = "ShadowStrike-KWK-v1";
+            NTSTATUS kwkStatus = EncHkdfDerive(
+                hmacHandle,
+                imageHash, sizeof(imageHash),
+                hkdfSalt, sizeof(hkdfSalt),
+                (PVOID)kwkInfo, sizeof(kwkInfo) - 1,
+                kwk, sizeof(kwk)
+            );
+
+            if (NT_SUCCESS(kwkStatus) && encMgr != NULL) {
+                //
+                // Wrap (encrypt) the session key with KWK using AES-256-GCM.
+                // EncEncrypt emits [ENC_HEADER][ciphertext], so extract the
+                // nonce and tag from ENC_HEADER and the ciphertext from the
+                // bytes immediately after it.
+                //
+                PENC_KEY wrapKey = NULL;
+                NTSTATUS wrapKeyStatus = EncDeriveKey(
+                    encMgr, EncKeyType_Ephemeral, EncAlgorithm_AES_256_GCM,
+                    kwk, sizeof(kwk), &wrapKey);
+
+                if (NT_SUCCESS(wrapKeyStatus) && wrapKey != NULL) {
+                    ENC_OPTIONS wrapOpts = {0};
+                    wrapOpts.Flags = EncFlag_UseAAD;
+                    wrapOpts.Key = wrapKey;
+                    wrapOpts.AAD = kexMsg.Salt;
+                    wrapOpts.AADSize = sizeof(kexMsg.Salt);
+                    wrapOpts.TagSize = ENC_GCM_TAG_SIZE;
+
+                    UCHAR wrappedOutput[128] = {0};
+                    ULONG wrappedSize = 0;
+
+                    NTSTATUS wrapStatus = EncEncrypt(
+                        encMgr, EncKeyType_Ephemeral,
+                        g_ClientPortRefs[slotIndex].SessionKey,
+                        sizeof(g_ClientPortRefs[slotIndex].SessionKey),
+                        wrappedOutput, sizeof(wrappedOutput),
+                        &wrappedSize, &wrapOpts);
+
+                    if (NT_SUCCESS(wrapStatus) &&
+                        wrappedSize >= sizeof(ENC_HEADER) + sizeof(kexMsg.WrappedSessionKey)) {
+                        PENC_HEADER wrappedHeader = (PENC_HEADER)wrappedOutput;
+                        RtlCopyMemory(kexMsg.Nonce,
+                                      wrappedHeader->Nonce,
+                                      sizeof(kexMsg.Nonce));
+                        RtlCopyMemory(kexMsg.Tag,
+                                      wrappedHeader->Tag,
+                                      sizeof(kexMsg.Tag));
+                        RtlCopyMemory(kexMsg.WrappedSessionKey,
+                                      wrappedOutput + sizeof(ENC_HEADER),
+                                      sizeof(kexMsg.WrappedSessionKey));
+                    } else {
+                        kwkStatus = NT_SUCCESS(wrapStatus) ? STATUS_ENCRYPTION_FAILED
+                                                           : wrapStatus;
+                    }
+
+                    RtlSecureZeroMemory(wrappedOutput, sizeof(wrappedOutput));
+                    EncKeyRelease(wrapKey);
+                } else {
+                    kwkStatus = NT_SUCCESS(wrapKeyStatus) ? STATUS_ENCRYPTION_FAILED
+                                                          : wrapKeyStatus;
+                }
+            } else if (NT_SUCCESS(kwkStatus)) {
+                kwkStatus = STATUS_INVALID_DEVICE_STATE;
+            }
+
+            RtlSecureZeroMemory(kwk, sizeof(kwk));
+            if (!NT_SUCCESS(kwkStatus)) {
+                keyStatus = kwkStatus;
+            }
+
+            if (!NT_SUCCESS(keyStatus)) {
+                RtlSecureZeroMemory(&kexMsg, sizeof(kexMsg));
+                RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
+                if (g_ClientSessionEncKeys[slotIndex] != NULL) {
+                    ShadowStrikeReleaseSessionCryptoKey(&g_ClientSessionEncKeys[slotIndex]);
+                }
+                g_ClientPortRefs[slotIndex].EncryptionEstablished = FALSE;
+                RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionKey,
+                                    sizeof(g_ClientPortRefs[slotIndex].SessionKey));
+                RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionNoncePrefix,
+                                    sizeof(g_ClientPortRefs[slotIndex].SessionNoncePrefix));
+                RtlZeroMemory(&g_ClientPortRefs[slotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
+                g_ClientPortRefs[slotIndex].SlotIndex = slotIndex;
+
+                ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
+                KeLeaveCriticalRegion();
+                return STATUS_ENCRYPTION_FAILED;
+            }
+
+            //
+            // Send the key exchange message to the newly connected client.
+            // This happens inside the lock so the client port is guaranteed valid.
+            //
+            LARGE_INTEGER kexTimeout;
+            kexTimeout.QuadPart = -50000000LL;  // 5 seconds
+            NTSTATUS kexSendStatus = FltSendMessage(
+                g_DriverData.FilterHandle,
+                &ClientPort,
+                &kexMsg,
+                sizeof(kexMsg),
+                NULL, NULL,
+                &kexTimeout
+            );
+
+            if (!NT_SUCCESS(kexSendStatus)) {
+                RtlSecureZeroMemory(&kexMsg, sizeof(kexMsg));
+                RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
+                if (g_ClientSessionEncKeys[slotIndex] != NULL) {
+                    ShadowStrikeReleaseSessionCryptoKey(&g_ClientSessionEncKeys[slotIndex]);
+                }
+                g_ClientPortRefs[slotIndex].EncryptionEstablished = FALSE;
+                RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionKey,
+                                    sizeof(g_ClientPortRefs[slotIndex].SessionKey));
+                RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionNoncePrefix,
+                                    sizeof(g_ClientPortRefs[slotIndex].SessionNoncePrefix));
+                RtlZeroMemory(&g_ClientPortRefs[slotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
+                g_ClientPortRefs[slotIndex].SlotIndex = slotIndex;
+
+                ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
+                KeLeaveCriticalRegion();
+                return STATUS_ENCRYPTION_FAILED;
+            }
+
+            RtlSecureZeroMemory(&kexMsg, sizeof(kexMsg));
             g_ClientPortRefs[slotIndex].EncryptionEstablished = TRUE;
 
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -790,16 +1215,29 @@ ShadowStrikeConnectNotify(
                        slotIndex);
         } else {
             //
-            // Key derivation failed — continue without encryption.
-            // Log but don't reject the connection; the driver still
-            // functions without encryption (degraded security mode).
+            // Key derivation failed — REJECT the connection.
+            // An enterprise security product must not operate with degraded
+            // encryption. If key derivation fails, the session is unsafe.
             //
             g_ClientPortRefs[slotIndex].EncryptionEstablished = FALSE;
+            if (g_ClientSessionEncKeys[slotIndex] != NULL) {
+                ShadowStrikeReleaseSessionCryptoKey(&g_ClientSessionEncKeys[slotIndex]);
+            }
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "[ShadowStrike] Session key derivation FAILED for slot %ld: 0x%08X "
-                       "(operating in unencrypted mode)\n",
+                       "(connection rejected — encryption is mandatory)\n",
                        slotIndex, keyStatus);
+
+            // Clean up slot
+            RtlZeroMemory(&g_ClientPortRefs[slotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
+            g_ClientPortRefs[slotIndex].SlotIndex = slotIndex;
+            RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
+
+            ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
+            KeLeaveCriticalRegion();
+            return STATUS_ENCRYPTION_FAILED;
         }
+        RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
     }
 
     //
@@ -824,9 +1262,71 @@ ShadowStrikeConnectNotify(
     // Must happen AFTER the slot is published so concurrent senders
     // can also reach the new port.
     //
-    ShadowStrikeDrainMessageQueue(ClientPort);
+    ShadowStrikeDrainMessageQueue(slotIndex);
 
     return status;
+}
+
+static VOID
+ShadowStrikeFinalizeClientDisconnect(
+    _In_ LONG SlotIndex
+    )
+{
+    PENC_KEY sessionKey = NULL;
+
+    if (SlotIndex < 0 || SlotIndex >= SHADOWSTRIKE_MAX_CONNECTIONS) {
+        return;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_DriverData.ClientPortLock);
+
+    if (g_ClientPortRefs[SlotIndex].Disconnecting == 0 ||
+        g_ClientPortRefs[SlotIndex].ReferenceCount != 0 ||
+        g_ClientPortRefs[SlotIndex].ClientPort == NULL) {
+        ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
+        KeLeaveCriticalRegion();
+        return;
+    }
+
+    sessionKey = g_ClientSessionEncKeys[SlotIndex];
+    g_ClientSessionEncKeys[SlotIndex] = NULL;
+
+    FltCloseClientPort(
+        g_DriverData.FilterHandle,
+        &g_ClientPortRefs[SlotIndex].ClientPort
+    );
+
+    RtlSecureZeroMemory(
+        g_ClientPortRefs[SlotIndex].SessionKey,
+        sizeof(g_ClientPortRefs[SlotIndex].SessionKey)
+    );
+    RtlSecureZeroMemory(
+        g_ClientPortRefs[SlotIndex].SessionNoncePrefix,
+        sizeof(g_ClientPortRefs[SlotIndex].SessionNoncePrefix)
+    );
+    g_ClientPortRefs[SlotIndex].EncryptionEstablished = FALSE;
+
+    RtlZeroMemory(&g_ClientPortRefs[SlotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
+    g_ClientPortRefs[SlotIndex].SlotIndex = SlotIndex;
+
+    if (g_DriverData.ConnectedClients > 0) {
+        g_DriverData.ConnectedClients--;
+    }
+
+    ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
+    KeLeaveCriticalRegion();
+
+    if (sessionKey != NULL) {
+        ShadowStrikeReleaseSessionCryptoKey(&sessionKey);
+    }
+
+    DbgPrintEx(
+        DPFLTR_IHVDRIVER_ID,
+        DPFLTR_INFO_LEVEL,
+        "[ShadowStrike] Client disconnected, remaining=%ld\n",
+        g_DriverData.ConnectedClients
+    );
 }
 
 VOID
@@ -835,8 +1335,7 @@ ShadowStrikeDisconnectNotify(
     )
 {
     LONG slotIndex;
-    LARGE_INTEGER waitInterval;
-    LONG waitCount = 0;
+    LONG remainingRefs;
 
     PAGED_CODE();
 
@@ -863,60 +1362,15 @@ ShadowStrikeDisconnectNotify(
     //
     // Decrement the initial connection reference
     //
-    InterlockedDecrement(&g_ClientPortRefs[slotIndex].ReferenceCount);
+    remainingRefs = InterlockedDecrement(&g_ClientPortRefs[slotIndex].ReferenceCount);
 
-    //
-    // Wait for all outstanding references to drain
-    //
-    waitInterval.QuadPart = -10000LL * 50;  // 50ms intervals
-
-    while (g_ClientPortRefs[slotIndex].ReferenceCount > 0 && waitCount < 100) {
-        KeDelayExecutionThread(KernelMode, FALSE, &waitInterval);
-        waitCount++;
-    }
-
-    if (g_ClientPortRefs[slotIndex].ReferenceCount > 0) {
+    if (remainingRefs > 0) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Warning: Client slot %ld still has %ld references after timeout\n",
-                   slotIndex, g_ClientPortRefs[slotIndex].ReferenceCount);
+                   "[ShadowStrike] Deferring disconnect cleanup for slot %ld until %ld references drain\n",
+                   slotIndex, remainingRefs);
     }
 
-    //
-    // Now safe to close the port
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_DriverData.ClientPortLock);
-
-    if (g_ClientPortRefs[slotIndex].ClientPort != NULL) {
-        FltCloseClientPort(
-            g_DriverData.FilterHandle,
-            &g_ClientPortRefs[slotIndex].ClientPort
-        );
-
-        //
-        // Scrub session encryption key material before clearing slot
-        //
-        RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionKey,
-                            sizeof(g_ClientPortRefs[slotIndex].SessionKey));
-        g_ClientPortRefs[slotIndex].EncryptionEstablished = FALSE;
-
-        //
-        // Clear the slot but preserve slot index
-        //
-        RtlZeroMemory(&g_ClientPortRefs[slotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
-        g_ClientPortRefs[slotIndex].SlotIndex = slotIndex;
-
-        if (g_DriverData.ConnectedClients > 0) {
-            g_DriverData.ConnectedClients--;
-        }
-    }
-
-    ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
-    KeLeaveCriticalRegion();
-
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Client disconnected, remaining=%ld\n",
-               g_DriverData.ConnectedClients);
+    ShadowStrikeFinalizeClientDisconnect(slotIndex);
 }
 
 // ============================================================================
@@ -936,6 +1390,12 @@ ShadowStrikeMessageNotify(
     NTSTATUS status = STATUS_SUCCESS;
     SHADOWSTRIKE_MESSAGE_HEADER localHeader;
     PSHADOWSTRIKE_MESSAGE_HEADER header = NULL;
+    PSHADOWSTRIKE_CLIENT_PORT_REF clientRef = NULL;
+    PVOID dispatchBuffer = InputBuffer;
+    ULONG dispatchBufferLength = InputBufferLength;
+    PVOID encryptedTransportBuffer = NULL;
+    PVOID decryptedBuffer = NULL;
+    BOOLEAN dispatchBufferTrusted = FALSE;
     LONG slotIndex;
 
     PAGED_CODE();
@@ -963,6 +1423,124 @@ ShadowStrikeMessageNotify(
     }
 
     header = &localHeader;
+
+    status = ShadowStrikeAcquireClientPortBySlot(slotIndex, &clientRef);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    //
+    // Decrypt encrypted user-mode payloads before dispatching to handlers.
+    // The transport keeps SHADOWSTRIKE_MESSAGE_HEADER in plaintext and wraps the
+    // data portion as [ENC_HEADER][ciphertext] with the outer header as AAD.
+    //
+    if ((header->Flags & SHADOWSTRIKE_MSG_FLAG_ENCRYPTED) != 0) {
+        PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
+        PENC_KEY sessionKey = g_ClientSessionEncKeys[slotIndex];
+        ULONG encryptedDataSize;
+        ENC_HEADER localEncryptedHeader;
+        PENC_HEADER encryptedHeader;
+        ULONG plaintextSize = 0;
+        ULONG totalDecryptedSize;
+        PSHADOWSTRIKE_MESSAGE_HEADER decryptedHeader;
+        ENC_OPTIONS decryptOpts = {0};
+
+        if (encMgr == NULL || sessionKey == NULL) {
+            status = STATUS_ENCRYPTION_FAILED;
+            goto Cleanup;
+        }
+
+        if (InputBufferLength <= sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+            status = STATUS_INVALID_BUFFER_SIZE;
+            goto Cleanup;
+        }
+
+        encryptedDataSize = InputBufferLength - sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+        if (encryptedDataSize < sizeof(ENC_HEADER)) {
+            status = STATUS_DECRYPTION_FAILED;
+            goto Cleanup;
+        }
+
+        status = ShadowStrikeCopyMessagePayload(
+            InputBuffer,
+            InputBufferLength,
+            sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+            &localEncryptedHeader,
+            sizeof(localEncryptedHeader),
+            FALSE
+        );
+        if (!NT_SUCCESS(status)) {
+            goto Cleanup;
+        }
+
+        if (localEncryptedHeader.Magic != ENC_MAGIC ||
+            localEncryptedHeader.Version != ENC_VERSION ||
+            localEncryptedHeader.PlaintextSize == 0 ||
+            localEncryptedHeader.PlaintextSize > ENC_MAX_PLAINTEXT_SIZE ||
+            localEncryptedHeader.PlaintextSize != localEncryptedHeader.CiphertextSize ||
+            encryptedDataSize < sizeof(ENC_HEADER) + localEncryptedHeader.CiphertextSize) {
+            status = STATUS_DECRYPTION_FAILED;
+            goto Cleanup;
+        }
+
+        encryptedTransportBuffer = ExAllocatePool2(POOL_FLAG_PAGED, encryptedDataSize, 'emCP');
+        if (encryptedTransportBuffer == NULL) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto Cleanup;
+        }
+
+        status = ShadowStrikeCopyMessagePayload(
+            InputBuffer,
+            InputBufferLength,
+            sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+            encryptedTransportBuffer,
+            encryptedDataSize,
+            FALSE
+        );
+        if (!NT_SUCCESS(status)) {
+            goto Cleanup;
+        }
+
+        encryptedHeader = (PENC_HEADER)encryptedTransportBuffer;
+        totalDecryptedSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + encryptedHeader->PlaintextSize;
+
+        decryptedBuffer = ExAllocatePool2(POOL_FLAG_PAGED, totalDecryptedSize, 'dmCP');
+        if (decryptedBuffer == NULL) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto Cleanup;
+        }
+
+        RtlCopyMemory(decryptedBuffer, header, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+
+        decryptOpts.Key = sessionKey;
+        decryptOpts.AAD = decryptedBuffer;
+        decryptOpts.AADSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+
+        status = EncDecrypt(
+            encMgr,
+            encryptedTransportBuffer,
+            encryptedDataSize,
+            (PUCHAR)decryptedBuffer + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+            encryptedHeader->PlaintextSize,
+            &plaintextSize,
+            &decryptOpts
+        );
+
+        if (!NT_SUCCESS(status)) {
+            goto Cleanup;
+        }
+
+        decryptedHeader = (PSHADOWSTRIKE_MESSAGE_HEADER)decryptedBuffer;
+        decryptedHeader->Flags &= ~SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
+        decryptedHeader->DataSize = plaintextSize;
+        decryptedHeader->TotalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + plaintextSize;
+
+        dispatchBuffer = decryptedBuffer;
+        dispatchBufferLength = decryptedHeader->TotalSize;
+        dispatchBufferTrusted = TRUE;
+        localHeader = *decryptedHeader;
+        header = &localHeader;
+    }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                "[ShadowStrike] Message received: type=%u, id=%llu, slot=%ld\n",
@@ -999,7 +1577,12 @@ ShadowStrikeMessageNotify(
                 status = STATUS_ACCESS_DENIED;
                 break;
             }
-            status = ShadowStrikeHandleUpdatePolicy(slotIndex, InputBuffer, InputBufferLength);
+            status = ShadowStrikeHandleUpdatePolicy(
+                slotIndex,
+                dispatchBuffer,
+                dispatchBufferLength,
+                dispatchBufferTrusted
+            );
             break;
 
         case ShadowStrikeMessageEnableFiltering:
@@ -1040,8 +1623,9 @@ ShadowStrikeMessageNotify(
             }
             status = ShadowStrikeHandleRegisterProtectedProcess(
                 slotIndex,
-                InputBuffer,
-                InputBufferLength
+                dispatchBuffer,
+                dispatchBufferLength,
+                dispatchBufferTrusted
             );
             break;
 
@@ -1073,17 +1657,18 @@ ShadowStrikeMessageNotify(
                 SHADOWSTRIKE_CLIENT_PORT clientPortContext;
 
                 RtlZeroMemory(&clientPortContext, sizeof(clientPortContext));
-                clientPortContext.ClientPort = g_ClientPortRefs[slotIndex].ClientPort;
-                clientPortContext.ClientProcessId = g_ClientPortRefs[slotIndex].ClientProcessId;
-                clientPortContext.ConnectedTime = g_ClientPortRefs[slotIndex].ConnectedTime;
-                clientPortContext.MessagesSent = g_ClientPortRefs[slotIndex].MessagesSent;
-                clientPortContext.RepliesReceived = g_ClientPortRefs[slotIndex].RepliesReceived;
-                clientPortContext.IsPrimaryScanner = g_ClientPortRefs[slotIndex].IsPrimaryScanner;
+                clientPortContext.ClientPort = clientRef->ClientPort;
+                clientPortContext.ClientProcessId = clientRef->ClientProcessId;
+                clientPortContext.ConnectedTime = clientRef->ConnectedTime;
+                clientPortContext.MessagesSent = clientRef->MessagesSent;
+                clientPortContext.RepliesReceived = clientRef->RepliesReceived;
+                clientPortContext.IsPrimaryScanner = clientRef->IsPrimaryScanner;
 
                 status = ShadowStrikeProcessUserMessage(
                     &clientPortContext,
-                    InputBuffer,
-                    InputBufferLength,
+                    dispatchBuffer,
+                    dispatchBufferLength,
+                    dispatchBufferTrusted,
                     OutputBuffer,
                     OutputBufferLength,
                     ReturnOutputBufferLength
@@ -1096,6 +1681,19 @@ ShadowStrikeMessageNotify(
                 }
             }
             break;
+    }
+
+Cleanup:
+    if (encryptedTransportBuffer != NULL) {
+        ExFreePoolWithTag(encryptedTransportBuffer, 'emCP');
+    }
+
+    if (decryptedBuffer != NULL) {
+        ExFreePoolWithTag(decryptedBuffer, 'dmCP');
+    }
+
+    if (clientRef != NULL) {
+        ShadowStrikeReleaseClientPort(clientRef);
     }
 
     return status;
@@ -1229,11 +1827,13 @@ static NTSTATUS
 ShadowStrikeHandleUpdatePolicy(
     _In_ LONG ClientIndex,
     _In_reads_bytes_(InputBufferLength) PVOID InputBuffer,
-    _In_ ULONG InputBufferLength
+    _In_ ULONG InputBufferLength,
+    _In_ BOOLEAN InputBufferTrusted
     )
 {
     SHADOWSTRIKE_POLICY_UPDATE localPolicy;
     ULONG requiredSize;
+    NTSTATUS copyStatus;
 
     PAGED_CODE();
 
@@ -1247,15 +1847,16 @@ ShadowStrikeHandleUpdatePolicy(
     //
     // Safely copy policy from user buffer
     //
-    __try {
-        ProbeForRead(InputBuffer, InputBufferLength, sizeof(UINT32));
-        RtlCopyMemory(
-            &localPolicy,
-            (PUCHAR)InputBuffer + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
-            sizeof(SHADOWSTRIKE_POLICY_UPDATE)
-        );
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return STATUS_INVALID_USER_BUFFER;
+    copyStatus = ShadowStrikeCopyMessagePayload(
+        InputBuffer,
+        InputBufferLength,
+        sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+        &localPolicy,
+        sizeof(localPolicy),
+        InputBufferTrusted
+    );
+    if (!NT_SUCCESS(copyStatus)) {
+        return copyStatus;
     }
 
     //
@@ -1327,7 +1928,8 @@ static NTSTATUS
 ShadowStrikeHandleRegisterProtectedProcess(
     _In_ LONG ClientIndex,
     _In_reads_bytes_(InputBufferLength) PVOID InputBuffer,
-    _In_ ULONG InputBufferLength
+    _In_ ULONG InputBufferLength,
+    _In_ BOOLEAN InputBufferTrusted
     )
 {
     SHADOWSTRIKE_PROTECTED_PROCESS localProtectedProcess;
@@ -1346,15 +1948,16 @@ ShadowStrikeHandleRegisterProtectedProcess(
     //
     // Safely copy protected process info from user buffer
     //
-    __try {
-        ProbeForRead(InputBuffer, InputBufferLength, sizeof(UINT32));
-        RtlCopyMemory(
-            &localProtectedProcess,
-            (PUCHAR)InputBuffer + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
-            sizeof(SHADOWSTRIKE_PROTECTED_PROCESS)
-        );
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return STATUS_INVALID_USER_BUFFER;
+    status = ShadowStrikeCopyMessagePayload(
+        InputBuffer,
+        InputBufferLength,
+        sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+        &localProtectedProcess,
+        sizeof(localProtectedProcess),
+        InputBufferTrusted
+    );
+    if (!NT_SUCCESS(status)) {
+        return status;
     }
 
     //
@@ -1463,6 +2066,50 @@ ShadowStrikeGetPrimaryScannerPort(
 // MESSAGE SENDING WITH REFERENCE COUNTING
 // ============================================================================
 
+static NTSTATUS
+ShadowStrikeAcquireClientPortBySlot(
+    _In_ LONG SlotIndex,
+    _Out_ PSHADOWSTRIKE_CLIENT_PORT_REF* ClientRef
+    )
+{
+    LONG oldRefCount;
+
+    if (ClientRef == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *ClientRef = NULL;
+
+    if (SlotIndex < 0 || SlotIndex >= SHADOWSTRIKE_MAX_CONNECTIONS) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_DriverData.ClientPortLock);
+
+    if (g_ClientPortRefs[SlotIndex].ClientPort == NULL ||
+        g_ClientPortRefs[SlotIndex].Disconnecting != 0) {
+        ExReleasePushLockShared(&g_DriverData.ClientPortLock);
+        KeLeaveCriticalRegion();
+        return SHADOWSTRIKE_ERROR_CLIENT_DISCONNECTED;
+    }
+
+    oldRefCount = InterlockedIncrement(&g_ClientPortRefs[SlotIndex].ReferenceCount);
+    if (oldRefCount <= 0 ||
+        InterlockedCompareExchange(&g_ClientPortRefs[SlotIndex].Disconnecting, 0, 0) != 0) {
+        InterlockedDecrement(&g_ClientPortRefs[SlotIndex].ReferenceCount);
+        ExReleasePushLockShared(&g_DriverData.ClientPortLock);
+        KeLeaveCriticalRegion();
+        return SHADOWSTRIKE_ERROR_CLIENT_DISCONNECTED;
+    }
+
+    *ClientRef = &g_ClientPortRefs[SlotIndex];
+
+    ExReleasePushLockShared(&g_DriverData.ClientPortLock);
+    KeLeaveCriticalRegion();
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS
 ShadowStrikeAcquirePrimaryScannerPort(
     _Out_ PSHADOWSTRIKE_CLIENT_PORT_REF* ClientRef
@@ -1540,11 +2187,19 @@ ShadowStrikeReleaseClientPort(
     _In_ PSHADOWSTRIKE_CLIENT_PORT_REF ClientRef
     )
 {
+    LONG slotIndex;
+    LONG remainingRefs;
+
     if (ClientRef == NULL) {
         return;
     }
 
-    InterlockedDecrement(&ClientRef->ReferenceCount);
+    slotIndex = ClientRef->SlotIndex;
+    remainingRefs = InterlockedDecrement(&ClientRef->ReferenceCount);
+
+    if (remainingRefs == 0) {
+        ShadowStrikeFinalizeClientDisconnect(slotIndex);
+    }
 }
 
 NTSTATUS
@@ -1617,10 +2272,18 @@ ShadowStrikeSendScanRequest(
     ULONG encryptedSendSize = 0;
     BOOLEAN encryptionAllocated = FALSE;
 
-    if (clientRef->EncryptionEstablished &&
-        RequestSize > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+    if (RequestSize > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
         PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
-        if (encMgr != NULL) {
+        if (!clientRef->EncryptionEstablished || encMgr == NULL) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] Scan request transport unavailable: slot=%ld, encReady=%d\n",
+                       clientRef->SlotIndex, clientRef->EncryptionEstablished);
+            ShadowStrikeReleaseClientPort(clientRef);
+            InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
+            SHADOWSTRIKE_INC_STAT(MessagesDropped);
+            return STATUS_ENCRYPTION_FAILED;
+        }
+
             ULONG dataSize = RequestSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
             PVOID dataStart = (PUCHAR)Request + sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
             ULONG encryptedSize = 0;
@@ -1635,28 +2298,23 @@ ShadowStrikeSendScanRequest(
                     POOL_FLAG_NON_PAGED, totalEncSize, 'enCP');
                 if (encBuf != NULL) {
                     //
-                    // Copy header, then encrypt data portion
+                    // Prepare the final on-wire header before encryption so
+                    // the authenticated AAD matches what user-mode receives.
                     //
-                    RtlCopyMemory(encBuf, Request, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+                    ShadowStrikePrepareEncryptedMessageHeader(
+                        (PSHADOWSTRIKE_MESSAGE_HEADER)encBuf,
+                        Request,
+                        encryptedSize
+                    );
 
                     ENC_OPTIONS encOpts = {0};
                     encOpts.Flags = EncFlag_IncludeHeader | EncFlag_UseAAD;
-                    encOpts.Key = NULL;  // Use per-session key
                     encOpts.AAD = encBuf;  // Header as AAD
                     encOpts.AADSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
                     encOpts.TagSize = ENC_GCM_TAG_SIZE;
 
-                    //
-                    // Temporarily set the session key as active ephemeral key
-                    // for this encryption operation.
-                    //
-                    PENC_KEY sessionKey = NULL;
-                    NTSTATUS keyStatus = EncDeriveKey(
-                        encMgr, EncKeyType_Ephemeral, EncAlgorithm_AES_256_GCM,
-                        clientRef->SessionKey, sizeof(clientRef->SessionKey),
-                        &sessionKey);
-
-                    if (NT_SUCCESS(keyStatus) && sessionKey != NULL) {
+                    PENC_KEY sessionKey = g_ClientSessionEncKeys[clientRef->SlotIndex];
+                    if (sessionKey != NULL) {
                         encOpts.Key = sessionKey;
 
                         ULONG ciphertextSize = 0;
@@ -1670,20 +2328,21 @@ ShadowStrikeSendScanRequest(
                             &encOpts
                         );
 
-                        if (NT_SUCCESS(encStatus) && ciphertextSize > 0) {
-                            //
-                            // Update header with encrypted flag and sizes
-                            //
+                        if (NT_SUCCESS(encStatus) &&
+                            ciphertextSize == encryptedSize &&
+                            ciphertextSize > 0) {
                             PSHADOWSTRIKE_MESSAGE_HEADER encHeader =
                                 (PSHADOWSTRIKE_MESSAGE_HEADER)encBuf;
-                            encHeader->Flags |= SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
-                            encHeader->DataSize = ciphertextSize;
-                            encHeader->TotalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
-                                                    ciphertextSize;
-
                             encryptedBuffer = encBuf;
                             encryptedSendSize = encHeader->TotalSize;
                             encryptionAllocated = TRUE;
+
+                            //
+                            // Mirror the actual encryption library nonce counter so
+                            // transport diagnostics reflect the real GCM nonce state.
+                            //
+                            InterlockedExchange64(&clientRef->NonceCounter,
+                                                 sessionKey->NonceCounter);
 
                             // Update send pointers
                             sendBuffer = encryptedBuffer;
@@ -1698,18 +2357,36 @@ ShadowStrikeSendScanRequest(
                             SHADOWSTRIKE_INC_STAT(MessagesDropped);
                             return STATUS_ENCRYPTION_FAILED;
                         }
-
-                        EncKeyRelease(sessionKey);
                     } else {
                         ExFreePoolWithTag(encBuf, 'enCP');
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                                   "[ShadowStrike] Scan request session key missing for slot %ld, "
+                                   "DROPPING message (no plaintext fallback)\n",
+                                   clientRef->SlotIndex);
                         ShadowStrikeReleaseClientPort(clientRef);
                         InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
                         SHADOWSTRIKE_INC_STAT(MessagesDropped);
                         return STATUS_ENCRYPTION_FAILED;
                     }
                 }
+                else {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "[ShadowStrike] Scan request encryption allocation failed\n");
+                    ShadowStrikeReleaseClientPort(clientRef);
+                    InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
+                    SHADOWSTRIKE_INC_STAT(MessagesDropped);
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
             }
-        }
+            else {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] Scan request encrypted size calculation failed: 0x%08X\n",
+                           encSizeStatus);
+                ShadowStrikeReleaseClientPort(clientRef);
+                InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
+                SHADOWSTRIKE_INC_STAT(MessagesDropped);
+                return STATUS_ENCRYPTION_FAILED;
+            }
     }
 
     //
@@ -1948,9 +2625,20 @@ ShadowStrikeSendNotification(
     //
     // Encrypt notification if session key is established
     //
-    if (clientRef->EncryptionEstablished && sendSize > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+    if (sendSize > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
         PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
-        if (encMgr != NULL) {
+        if (!clientRef->EncryptionEstablished || encMgr == NULL) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] Notification transport unavailable: slot=%ld, encReady=%d\n",
+                       clientRef->SlotIndex, clientRef->EncryptionEstablished);
+            ShadowStrikeReleaseClientPort(clientRef);
+            if (usedCompression) {
+                ExFreePoolWithTag(sendBuffer, 'cmCP');
+            }
+            SHADOWSTRIKE_INC_STAT(MessagesDropped);
+            return STATUS_ENCRYPTION_FAILED;
+        }
+
             ULONG dataSize = sendSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
             PVOID dataStart = (PUCHAR)sendBuffer + sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
             ULONG encryptedSize = 0;
@@ -1961,7 +2649,11 @@ ShadowStrikeSendNotification(
                 PVOID encBuf = ExAllocatePool2(
                     POOL_FLAG_NON_PAGED, totalEncSize, 'enCP');
                 if (encBuf != NULL) {
-                    RtlCopyMemory(encBuf, sendBuffer, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+                    ShadowStrikePrepareEncryptedMessageHeader(
+                        (PSHADOWSTRIKE_MESSAGE_HEADER)encBuf,
+                        (PSHADOWSTRIKE_MESSAGE_HEADER)sendBuffer,
+                        encryptedSize
+                    );
 
                     ENC_OPTIONS encOpts = {0};
                     encOpts.Flags = EncFlag_IncludeHeader | EncFlag_UseAAD;
@@ -1969,13 +2661,8 @@ ShadowStrikeSendNotification(
                     encOpts.AADSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
                     encOpts.TagSize = ENC_GCM_TAG_SIZE;
 
-                    PENC_KEY sessionKey = NULL;
-                    NTSTATUS keyStatus = EncDeriveKey(
-                        encMgr, EncKeyType_Ephemeral, EncAlgorithm_AES_256_GCM,
-                        clientRef->SessionKey, sizeof(clientRef->SessionKey),
-                        &sessionKey);
-
-                    if (NT_SUCCESS(keyStatus) && sessionKey != NULL) {
+                    PENC_KEY sessionKey = g_ClientSessionEncKeys[clientRef->SlotIndex];
+                    if (sessionKey != NULL) {
                         encOpts.Key = sessionKey;
                         ULONG ciphertextSize = 0;
                         NTSTATUS encStatus = EncEncrypt(
@@ -1984,23 +2671,22 @@ ShadowStrikeSendNotification(
                             (PUCHAR)encBuf + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
                             encryptedSize, &ciphertextSize, &encOpts);
 
-                        if (NT_SUCCESS(encStatus) && ciphertextSize > 0) {
+                        if (NT_SUCCESS(encStatus) &&
+                            ciphertextSize == encryptedSize &&
+                            ciphertextSize > 0) {
                             PSHADOWSTRIKE_MESSAGE_HEADER encHeader =
                                 (PSHADOWSTRIKE_MESSAGE_HEADER)encBuf;
-                            encHeader->Flags |= SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
-                            encHeader->DataSize = ciphertextSize;
-                            encHeader->TotalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
-                                                    ciphertextSize;
                             encryptedNotifBuffer = encBuf;
                             sendBuffer = encryptedNotifBuffer;
                             sendSize = encHeader->TotalSize;
                             notifEncrypted = TRUE;
+                            InterlockedExchange64(&clientRef->NonceCounter,
+                                                 sessionKey->NonceCounter);
                         } else {
                             ExFreePoolWithTag(encBuf, 'enCP');
                             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                                        "[ShadowStrike] Notification encryption failed: 0x%08X, "
                                        "DROPPING message (no plaintext fallback)\n", encStatus);
-                            EncKeyRelease(sessionKey);
                             ShadowStrikeReleaseClientPort(clientRef);
                             if (usedCompression) {
                                 ExFreePoolWithTag(sendBuffer, 'cmCP');
@@ -2008,13 +2694,42 @@ ShadowStrikeSendNotification(
                             SHADOWSTRIKE_INC_STAT(MessagesDropped);
                             return STATUS_ENCRYPTION_FAILED;
                         }
-                        EncKeyRelease(sessionKey);
                     } else {
                         ExFreePoolWithTag(encBuf, 'enCP');
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                                   "[ShadowStrike] Notification session key missing for slot %ld, "
+                                   "DROPPING message (no plaintext fallback)\n",
+                                   clientRef->SlotIndex);
+                        ShadowStrikeReleaseClientPort(clientRef);
+                        if (usedCompression) {
+                            ExFreePoolWithTag(sendBuffer, 'cmCP');
+                        }
+                        SHADOWSTRIKE_INC_STAT(MessagesDropped);
+                        return STATUS_ENCRYPTION_FAILED;
                     }
                 }
+                else {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "[ShadowStrike] Notification encryption allocation failed\n");
+                    ShadowStrikeReleaseClientPort(clientRef);
+                    if (usedCompression) {
+                        ExFreePoolWithTag(sendBuffer, 'cmCP');
+                    }
+                    SHADOWSTRIKE_INC_STAT(MessagesDropped);
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
             }
-        }
+            else {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] Notification encrypted size calculation failed: 0x%08X\n",
+                           encSizeStatus);
+                ShadowStrikeReleaseClientPort(clientRef);
+                if (usedCompression) {
+                    ExFreePoolWithTag(sendBuffer, 'cmCP');
+                }
+                SHADOWSTRIKE_INC_STAT(MessagesDropped);
+                return STATUS_ENCRYPTION_FAILED;
+            }
     }
 
     //
@@ -2154,9 +2869,18 @@ ShadowStrikeSendProcessNotification(
     PVOID encryptedProcBuf = NULL;
     BOOLEAN procEncrypted = FALSE;
 
-    if (clientRef->EncryptionEstablished) {
+    if (Size > 0) {
         PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
-        if (encMgr != NULL) {
+        if (!clientRef->EncryptionEstablished || encMgr == NULL) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] ProcessNotification transport unavailable: slot=%ld, encReady=%d\n",
+                       clientRef->SlotIndex, clientRef->EncryptionEstablished);
+            ShadowStrikeFreeMessageBuffer(header);
+            ShadowStrikeReleaseClientPort(clientRef);
+            SHADOWSTRIKE_INC_STAT(MessagesDropped);
+            return STATUS_ENCRYPTION_FAILED;
+        }
+
             ULONG encryptedSize = 0;
             NTSTATUS encSizeStatus = EncGetEncryptedSize(Size, TRUE, &encryptedSize);
             if (NT_SUCCESS(encSizeStatus) && encryptedSize > 0) {
@@ -2164,7 +2888,11 @@ ShadowStrikeSendProcessNotification(
                 PVOID encBuf = ExAllocatePool2(
                     POOL_FLAG_NON_PAGED, totalEncSize, 'enCP');
                 if (encBuf != NULL) {
-                    RtlCopyMemory(encBuf, header, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+                    ShadowStrikePrepareEncryptedMessageHeader(
+                        (PSHADOWSTRIKE_MESSAGE_HEADER)encBuf,
+                        header,
+                        encryptedSize
+                    );
 
                     ENC_OPTIONS encOpts = {0};
                     encOpts.Flags = EncFlag_IncludeHeader | EncFlag_UseAAD;
@@ -2172,13 +2900,8 @@ ShadowStrikeSendProcessNotification(
                     encOpts.AADSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
                     encOpts.TagSize = ENC_GCM_TAG_SIZE;
 
-                    PENC_KEY sessionKey = NULL;
-                    NTSTATUS keyStatus = EncDeriveKey(
-                        encMgr, EncKeyType_Ephemeral, EncAlgorithm_AES_256_GCM,
-                        clientRef->SessionKey, sizeof(clientRef->SessionKey),
-                        &sessionKey);
-
-                    if (NT_SUCCESS(keyStatus) && sessionKey != NULL) {
+                    PENC_KEY sessionKey = g_ClientSessionEncKeys[clientRef->SlotIndex];
+                    if (sessionKey != NULL) {
                         encOpts.Key = sessionKey;
                         ULONG ciphertextSize = 0;
                         NTSTATUS encStatus = EncEncrypt(
@@ -2188,37 +2911,59 @@ ShadowStrikeSendProcessNotification(
                             (PUCHAR)encBuf + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
                             encryptedSize, &ciphertextSize, &encOpts);
 
-                        if (NT_SUCCESS(encStatus) && ciphertextSize > 0) {
+                        if (NT_SUCCESS(encStatus) &&
+                            ciphertextSize == encryptedSize &&
+                            ciphertextSize > 0) {
                             PSHADOWSTRIKE_MESSAGE_HEADER encHeader =
                                 (PSHADOWSTRIKE_MESSAGE_HEADER)encBuf;
-                            encHeader->Flags |= SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
-                            encHeader->DataSize = ciphertextSize;
-                            encHeader->TotalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
-                                                    ciphertextSize;
                             // Free original unencrypted buffer, use encrypted one
                             ShadowStrikeFreeMessageBuffer(header);
                             header = (PSHADOWSTRIKE_MESSAGE_HEADER)encBuf;
                             totalSize = encHeader->TotalSize;
                             encryptedProcBuf = encBuf;
                             procEncrypted = TRUE;
+                            InterlockedExchange64(&clientRef->NonceCounter,
+                                                 sessionKey->NonceCounter);
                         } else {
                             ExFreePoolWithTag(encBuf, 'enCP');
                             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                                        "[ShadowStrike] ProcessNotification encryption failed: 0x%08X, "
                                        "DROPPING message (no plaintext fallback)\n", encStatus);
-                            EncKeyRelease(sessionKey);
                             ShadowStrikeFreeMessageBuffer(header);
                             ShadowStrikeReleaseClientPort(clientRef);
                             SHADOWSTRIKE_INC_STAT(MessagesDropped);
                             return STATUS_ENCRYPTION_FAILED;
                         }
-                        EncKeyRelease(sessionKey);
                     } else {
                         ExFreePoolWithTag(encBuf, 'enCP');
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                                   "[ShadowStrike] ProcessNotification session key missing for slot %ld, "
+                                   "DROPPING message (no plaintext fallback)\n",
+                                   clientRef->SlotIndex);
+                        ShadowStrikeFreeMessageBuffer(header);
+                        ShadowStrikeReleaseClientPort(clientRef);
+                        SHADOWSTRIKE_INC_STAT(MessagesDropped);
+                        return STATUS_ENCRYPTION_FAILED;
                     }
                 }
+                else {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "[ShadowStrike] ProcessNotification encryption allocation failed\n");
+                    ShadowStrikeFreeMessageBuffer(header);
+                    ShadowStrikeReleaseClientPort(clientRef);
+                    SHADOWSTRIKE_INC_STAT(MessagesDropped);
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
             }
-        }
+            else {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] ProcessNotification encrypted size calculation failed: 0x%08X\n",
+                           encSizeStatus);
+                ShadowStrikeFreeMessageBuffer(header);
+                ShadowStrikeReleaseClientPort(clientRef);
+                SHADOWSTRIKE_INC_STAT(MessagesDropped);
+                return STATUS_ENCRYPTION_FAILED;
+            }
     }
 
     if (RequireReply) {

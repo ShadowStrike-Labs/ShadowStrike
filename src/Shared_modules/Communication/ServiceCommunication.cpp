@@ -19,6 +19,7 @@
 #include "ServiceCommunication.hpp"
 
 #include <algorithm>
+#include <bitset>
 #include <sstream>
 #include <random>
 #include <cassert>
@@ -92,7 +93,7 @@ static void InitCrc32Table() {
     for (uint32_t i = 0; i < 256; ++i) {
         uint32_t crc = i;
         for (int j = 0; j < 8; ++j)
-            crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
+            crc = (crc >> 1) ^ ((crc & 1U) ? 0xEDB88320U : 0U);
         Crc32Table[i] = crc;
     }
 }
@@ -217,6 +218,55 @@ struct ConnectedClient {
 
     // Monotonic nonce counter for replay protection (incremented per encrypted message sent)
     std::atomic<uint64_t> nonceCounter{0};
+
+    // Replay detection: sliding window of recent nonces received from this client.
+    // highWaterNonce tracks the highest nonce seen. The bitset tracks which of the
+    // previous REPLAY_WINDOW_SIZE nonces have been seen (relative to highWaterNonce).
+    uint64_t highWaterNonce = 0;
+    std::bitset<ServiceCommConstants::REPLAY_WINDOW_SIZE> replayBitset;
+    bool replayInitialized = false;
+
+    /// @brief Check if a nonce has been seen before. If not, mark it as seen.
+    /// @return true if the nonce is valid (not replayed), false if replayed/out-of-window
+    [[nodiscard]] bool CheckAndRecordNonce(uint64_t nonce) noexcept {
+        if (!replayInitialized) {
+            highWaterNonce = nonce;
+            replayBitset.reset();
+            replayBitset.set(0);  // Mark this nonce as seen
+            replayInitialized = true;
+            return true;
+        }
+
+        constexpr size_t W = ServiceCommConstants::REPLAY_WINDOW_SIZE;
+
+        if (nonce > highWaterNonce) {
+            // New high water mark — shift the window
+            uint64_t shift = nonce - highWaterNonce;
+            if (shift >= W) {
+                replayBitset.reset();
+            } else {
+                replayBitset <<= static_cast<size_t>(shift);
+            }
+            highWaterNonce = nonce;
+            replayBitset.set(0);
+            return true;
+        }
+
+        uint64_t diff = highWaterNonce - nonce;
+        if (diff >= W) {
+            // Too old — outside the replay window, reject
+            return false;
+        }
+
+        auto idx = static_cast<size_t>(diff);
+        if (replayBitset.test(idx)) {
+            // Already seen — replay attack
+            return false;
+        }
+
+        replayBitset.set(idx);
+        return true;
+    }
 
     ConnectedClient() = default;
     ~ConnectedClient() {
@@ -1499,13 +1549,17 @@ bool ServiceCommunicationImpl::WriteMessage(HANDLE pipe, std::mutex& writeLock,
         if (!EncryptPayload(encryptedPayload, outHdr, sessionKeyCopy, *nonceCounterPtr)) {
             Utils::Logger::Error("[ServiceComm] WriteMessage: encryption failed, dropping message");
             // Scrub key copy
-            CryptoManager::Instance().SecureZero(sessionKeyCopy.data(), sessionKeyCopy.size());
+            ShadowStrike::Security::CryptoManager::Instance().SecureZero(
+                sessionKeyCopy.data(),
+                sessionKeyCopy.size()
+            );
             return false;
         }
         // Scrub key copy after use
-        CryptoManager::Instance().SecureZero(sessionKeyCopy.data(), sessionKeyCopy.size());
-            return false;
-        }
+        ShadowStrike::Security::CryptoManager::Instance().SecureZero(
+            sessionKeyCopy.data(),
+            sessionKeyCopy.size()
+        );
     } else {
         // CRC32 for backward compatibility on pre-auth messages
         if (payloadLen > 0 && payload) {
@@ -1626,6 +1680,14 @@ bool ServiceCommunicationImpl::ReadMessage(HANDLE pipe, MessageHeader& hdr,
 
         // Encrypted messages: decrypt using session key
         if (hdr.flags & ServiceCommConstants::MSG_FLAG_ENCRYPTED) {
+            // Extract nonce counter for replay detection BEFORE decryption strips it.
+            // Wire format: [12-byte nonce][ciphertext][16-byte tag]
+            // Nonce layout: bytes 0-7 = counter, byte 8 = direction, bytes 9-11 = zero
+            uint64_t receivedNonceCounter = 0;
+            if (payload.size() >= ServiceCommConstants::GCM_NONCE_SIZE) {
+                memcpy(&receivedNonceCounter, payload.data(), sizeof(receivedNonceCounter));
+            }
+
             // Copy session key under lock to avoid use-after-free
             std::array<uint8_t, ServiceCommConstants::AES_KEY_SIZE> keyCopy{};
             bool hasKey = false;
@@ -1653,10 +1715,50 @@ bool ServiceCommunicationImpl::ReadMessage(HANDLE pipe, MessageHeader& hdr,
             }
 
             bool decryptOk = DecryptPayload(payload, hdr, keyCopy);
-            CryptoManager::Instance().SecureZero(keyCopy.data(), keyCopy.size());
+            ShadowStrike::Security::CryptoManager::Instance().SecureZero(
+                keyCopy.data(),
+                keyCopy.size()
+            );
             if (!decryptOk) {
                 m_stats.errors.fetch_add(1, std::memory_order_relaxed);
                 return false;
+            }
+
+            // Replay detection: check nonce counter against client's sliding window.
+            // Server-side only — client trusts server nonces (server controls the session).
+            if (m_isService) {
+                bool foundClient = false;
+                bool nonceAccepted = false;
+                uint32_t clientPid = 0;
+
+                {
+                    std::unique_lock clientLock(m_clientsMutex);
+                    for (auto& c : m_clients) {
+                        if (c && c->pipeHandle.h == pipe && c->encryptionEstablished) {
+                            foundClient = true;
+                            clientPid = c->processId;
+                            nonceAccepted = c->CheckAndRecordNonce(receivedNonceCounter);
+                            break;
+                        }
+                    }
+                }
+
+                if (!foundClient) {
+                    Utils::Logger::Warn("[ServiceComm] Encrypted message source disconnected "
+                                        "before replay validation");
+                    m_stats.errors.fetch_add(1, std::memory_order_relaxed);
+                    payload.clear();
+                    return false;
+                }
+
+                if (!nonceAccepted) {
+                    Utils::Logger::Warn("[ServiceComm] REPLAY DETECTED: nonce={} from client PID={}, "
+                                        "dropping message",
+                                        receivedNonceCounter, clientPid);
+                    m_stats.errors.fetch_add(1, std::memory_order_relaxed);
+                    payload.clear();
+                    return false;
+                }
             }
         } else {
             // Plaintext message — verify CRC32 for backward compat (pre-auth messages)
@@ -1678,8 +1780,27 @@ bool ServiceCommunicationImpl::ReadMessage(HANDLE pipe, MessageHeader& hdr,
 // ============================================================================
 
 void ServiceCommunicationImpl::ProcessMessage(const std::string& sessionId,
-                                               const MessageHeader& hdr,
-                                               const std::vector<uint8_t>& payload) {
+                                              const MessageHeader& hdr,
+                                              const std::vector<uint8_t>& payload) {
+    if (m_isService) {
+        const bool allowUnauthenticated =
+            hdr.type == MessageType::Handshake ||
+            hdr.type == MessageType::HandshakeResponse ||
+            hdr.type == MessageType::Disconnect;
+
+        if (!allowUnauthenticated) {
+            std::shared_lock lock(m_clientsMutex);
+            ConnectedClient* client = FindClient(sessionId);
+            if (!client || !client->isAuthenticated) {
+                Utils::Logger::Warn("[ServiceComm] Rejecting message type 0x{:04X} from "
+                                    "unauthenticated client {}",
+                                    static_cast<uint16_t>(hdr.type),
+                                    sessionId);
+                return;
+            }
+        }
+    }
+
     switch (hdr.type) {
         case MessageType::Handshake:
             HandleHandshake(sessionId, hdr, payload);
@@ -1705,18 +1826,6 @@ void ServiceCommunicationImpl::ProcessMessage(const std::string& sessionId,
         }
 
         default: {
-            // SECURITY: Reject all non-handshake messages from unauthenticated clients
-            if (m_isService) {
-                std::shared_lock lock(m_clientsMutex);
-                ConnectedClient* client = FindClient(sessionId);
-                if (!client || !client->isAuthenticated) {
-                    Utils::Logger::Warn("[ServiceComm] Rejecting message type 0x{:04X} from "
-                                        "unauthenticated client {}", static_cast<uint16_t>(hdr.type),
-                                        sessionId);
-                    return;
-                }
-            }
-
             // Response to pending request
             if (hdr.responseTo != 0) {
                 std::lock_guard lock(m_pendingMutex);
@@ -2070,8 +2179,18 @@ std::vector<uint8_t> ServiceCommunicationImpl::GetOrCreatePreSharedKey() {
         return {};
     }
 
-    crypto.StoreKey(psk, KeyType::Symmetric, KeyStorage::DPAPI,
-                    ServiceCommConstants::PSK_KEY_ID);
+    const std::string storedKeyId = crypto.StoreKey(
+        psk,
+        KeyType::Symmetric,
+        KeyStorage::DPAPI,
+        ServiceCommConstants::PSK_KEY_ID
+    );
+    if (storedKeyId.empty()) {
+        Utils::Logger::Error("[ServiceComm] Failed to persist generated pipe pre-shared key");
+        crypto.SecureZero(psk.data(), psk.size());
+        return {};
+    }
+
     Utils::Logger::Info("[ServiceComm] Generated and stored new pipe pre-shared key");
     return psk;
 }

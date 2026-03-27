@@ -602,6 +602,19 @@ struct AlertConfiguration {
     
     /// @brief Max retry attempts
     uint32_t maxRetryAttempts = AlertConstants::MAX_RETRY_ATTEMPTS;
+
+    /// @brief TLS Syslog server hostname or IP (RFC 5425, port 6514)
+    std::string syslogHost = "127.0.0.1";
+
+    /// @brief TLS Syslog server port (default: 6514 per RFC 5425)
+    uint16_t syslogPort = 6514;
+
+    /// @brief TLS SNI target name for certificate validation.
+    ///        If empty, defaults to syslogHost. Must match the server certificate CN/SAN.
+    std::string syslogTlsTargetName;
+
+    /// @brief Connection timeout for syslog TCP+TLS in seconds
+    uint32_t syslogConnectTimeoutSec = 5;
     
     [[nodiscard]] bool IsValid() const noexcept;
 };

@@ -189,8 +189,11 @@ MhUnregisterHandler(
  * - Authorization checks for privileged operations
  *
  * @param ClientContext Client port context (must not be NULL).
- * @param InputBuffer Input message buffer (user-mode address).
+ * @param InputBuffer Input message buffer.
  * @param InputBufferSize Size of input buffer.
+ * @param InputBufferTrusted TRUE if InputBuffer is already trusted kernel memory
+ *        and must NOT be probed with ProbeForRead. FALSE for normal user-mode
+ *        communication-port buffers.
  * @param OutputBuffer Optional output buffer for reply (user-mode address).
  * @param OutputBufferSize Size of output buffer.
  * @param ReturnOutputBufferLength Receives size written to output (must not be NULL).
@@ -203,6 +206,7 @@ ShadowStrikeProcessUserMessage(
     _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
     _In_reads_bytes_(InputBufferSize) PVOID InputBuffer,
     _In_ ULONG InputBufferSize,
+    _In_ BOOLEAN InputBufferTrusted,
     _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
     _In_ ULONG OutputBufferSize,
     _Out_ PULONG ReturnOutputBufferLength
