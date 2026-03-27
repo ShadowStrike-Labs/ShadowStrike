@@ -120,8 +120,12 @@ Json ThemeSettingsToObj(const ThemeSettings& ts) {
 ThemeSettings ThemeSettingsFromObj(const Json& j) {
     ThemeSettings ts;
     if (j.is_object()) {
-        ts.theme              = static_cast<Theme>(j.value("theme", static_cast<uint8_t>(Theme::System)));
-        ts.accent             = static_cast<AccentColor>(j.value("accent", static_cast<uint8_t>(AccentColor::Blue)));
+        auto rawTheme  = j.value("theme", static_cast<uint8_t>(Theme::System));
+        auto rawAccent = j.value("accent", static_cast<uint8_t>(AccentColor::Blue));
+        ts.theme              = (rawTheme <= static_cast<uint8_t>(Theme::Custom))
+                                ? static_cast<Theme>(rawTheme) : Theme::System;
+        ts.accent             = (rawAccent <= static_cast<uint8_t>(AccentColor::Custom))
+                                ? static_cast<AccentColor>(rawAccent) : AccentColor::Blue;
         ts.customAccentRgb    = j.value("customAccentRgb", 0x0078D4u);
         ts.customThemePath    = j.value("customThemePath", std::string{});
         ts.enableAnimations   = j.value("enableAnimations", true);
@@ -149,14 +153,19 @@ LocalizationSettings LocalizationSettingsFromObj(const Json& j) {
     LocalizationSettings ls;
     if (j.is_object()) {
         ls.languageCode      = j.value("languageCode", std::string{"en-US"});
-        ls.dateFormat        = static_cast<DateFormat>(j.value("dateFormat", static_cast<uint8_t>(DateFormat::System)));
-        ls.timeFormat        = static_cast<TimeFormat>(j.value("timeFormat", static_cast<uint8_t>(TimeFormat::System)));
+        auto rawDateFmt      = j.value("dateFormat", static_cast<uint8_t>(DateFormat::System));
+        auto rawTimeFmt      = j.value("timeFormat", static_cast<uint8_t>(TimeFormat::System));
+        ls.dateFormat        = (rawDateFmt <= static_cast<uint8_t>(DateFormat::Relative))
+                               ? static_cast<DateFormat>(rawDateFmt) : DateFormat::System;
+        ls.timeFormat        = (rawTimeFmt <= static_cast<uint8_t>(TimeFormat::Hour12))
+                               ? static_cast<TimeFormat>(rawTimeFmt) : TimeFormat::System;
         auto decSep          = j.value("decimalSeparator", std::string{"."});
         ls.decimalSeparator  = decSep.empty() ? '.' : decSep[0];
         auto thousSep        = j.value("thousandsSeparator", std::string{","});
         ls.thousandsSeparator = thousSep.empty() ? ',' : thousSep[0];
         ls.use24HourFormat   = j.value("use24HourFormat", false);
         ls.firstDayOfWeek    = j.value("firstDayOfWeek", static_cast<uint8_t>(0));
+        if (ls.firstDayOfWeek > 6) ls.firstDayOfWeek = 0;
     }
     return ls;
 }
@@ -182,8 +191,12 @@ NotificationSettings NotificationSettingsFromObj(const Json& j) {
     NotificationSettings ns;
     if (j.is_object()) {
         ns.enabled                = j.value("enabled", true);
-        ns.level                  = static_cast<NotificationLevel>(j.value("level", static_cast<uint8_t>(NotificationLevel::All)));
-        ns.sound                  = static_cast<SoundSetting>(j.value("sound", static_cast<uint8_t>(SoundSetting::Important)));
+        auto rawLevel = j.value("level", static_cast<uint8_t>(NotificationLevel::All));
+        auto rawSound = j.value("sound", static_cast<uint8_t>(SoundSetting::Important));
+        ns.level                  = (rawLevel <= static_cast<uint8_t>(NotificationLevel::None))
+                                    ? static_cast<NotificationLevel>(rawLevel) : NotificationLevel::All;
+        ns.sound                  = (rawSound <= static_cast<uint8_t>(SoundSetting::Custom))
+                                    ? static_cast<SoundSetting>(rawSound) : SoundSetting::Important;
         ns.customSoundPath        = j.value("customSoundPath", std::string{});
         ns.showToast              = j.value("showToast", true);
         ns.toastDurationSeconds   = j.value("toastDurationSeconds", 5u);
@@ -217,7 +230,9 @@ StartupSettings StartupSettingsFromObj(const Json& j) {
         ss.startMinimized        = j.value("startMinimized", false);
         ss.minimizeToTray        = j.value("minimizeToTray", true);
         ss.closeToTray           = j.value("closeToTray", true);
-        ss.trayBehavior          = static_cast<TrayIconBehavior>(j.value("trayBehavior", static_cast<uint8_t>(TrayIconBehavior::AlwaysShow)));
+        auto rawTray = j.value("trayBehavior", static_cast<uint8_t>(TrayIconBehavior::AlwaysShow));
+        ss.trayBehavior          = (rawTray <= static_cast<uint8_t>(TrayIconBehavior::ShowOnActivity))
+                                   ? static_cast<TrayIconBehavior>(rawTray) : TrayIconBehavior::AlwaysShow;
         ss.showSplashScreen      = j.value("showSplashScreen", true);
         ss.checkUpdatesOnStartup = j.value("checkUpdatesOnStartup", true);
         ss.quickScanOnStartup    = j.value("quickScanOnStartup", false);
@@ -376,6 +391,9 @@ UserSettings UserSettingsFromObj(const Json& j) {
             if (loc.is_string()) {
                 s.favoriteLocations.push_back(Utf8ToWide(loc.get<std::string>()));
             }
+        }
+        if (s.favoriteLocations.size() > SettingsConstants::MAX_RECENT_FILES) {
+            s.favoriteLocations.resize(SettingsConstants::MAX_RECENT_FILES);
         }
     }
 
@@ -601,7 +619,7 @@ public:
             // Ensure parent directory exists
             const auto parentDir = m_config.settingsFilePath.parent_path();
             if (!parentDir.empty()) {
-                Utils::FileUtils::CreateDirectories(parentDir.wstring());
+                (void)Utils::FileUtils::CreateDirectories(parentDir.wstring());
             }
 
             Utils::FileUtils::Error err{};
@@ -761,13 +779,23 @@ bool SettingsManager::Initialize(const SettingsManagerConfiguration& config) {
         return true;
     }
 
+    if (impl.m_status == SettingsStatus::Initializing) {
+        SS_LOG_WARN(LOG_CAT, L"SettingsManager initialization already in progress");
+        return false;
+    }
+
     impl.m_status = SettingsStatus::Initializing;
     impl.m_config = config;
 
     // Default settings file path: next to executable
     if (impl.m_config.settingsFilePath.empty()) {
         wchar_t exePath[MAX_PATH]{};
-        ::GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        const DWORD len = ::GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH) {
+            SS_LOG_ERROR(LOG_CAT, L"Failed to determine executable path for settings file");
+            impl.m_status = SettingsStatus::Error;
+            return false;
+        }
         impl.m_config.settingsFilePath =
             fs::path(exePath).parent_path() / SettingsConstants::SETTINGS_FILE_NAME;
     }
@@ -1622,6 +1650,7 @@ SettingsStatistics SettingsManager::GetStatistics() const {
 }
 
 void SettingsManager::ResetStatistics() {
+    std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_stats.Reset();
     SS_LOG_INFO(LOG_CAT, L"Settings statistics reset");
 }
@@ -1858,9 +1887,13 @@ Theme GetSystemTheme() {
 
     DWORD value = 1;
     DWORD size = sizeof(value);
-    DWORD type = REG_DWORD;
-    ::RegQueryValueExW(guard.key, L"AppsUseLightTheme", nullptr, &type,
+    DWORD type = 0;
+    const LONG qr = ::RegQueryValueExW(guard.key, L"AppsUseLightTheme", nullptr, &type,
                        reinterpret_cast<BYTE*>(&value), &size);
+
+    if (qr != ERROR_SUCCESS || type != REG_DWORD || size != sizeof(DWORD)) {
+        return Theme::Light; // Safe default on any anomaly
+    }
 
     return (value == 0) ? Theme::Dark : Theme::Light;
 }

@@ -33,6 +33,23 @@ namespace Config {
 using Json = Utils::JSON::Json;
 
 // ============================================================================
+// UTF-8 CONVERSION UTILITIES
+// ============================================================================
+
+static std::string WideToUtf8(std::wstring_view wide) noexcept {
+    if (wide.empty()) return {};
+    const int needed = ::WideCharToMultiByte(
+        CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string result(static_cast<size_t>(needed), '\0');
+    ::WideCharToMultiByte(
+        CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
+        result.data(), needed, nullptr, nullptr);
+    return result;
+}
+
+// ============================================================================
 // LOGGING CATEGORY
 // ============================================================================
 
@@ -73,6 +90,9 @@ public:
 
     // Profile active before emergency mode was engaged
     SystemProfile m_preEmergencyProfile{ SystemProfile::Standard };
+
+    // Tracks which custom profile is active when m_currentProfile == Custom
+    std::string m_activeCustomProfileName;
 
     void PopulateBuiltInProfiles();
 };
@@ -242,13 +262,13 @@ void ProfileManagerImpl::PopulateBuiltInProfiles()
         def.scan.scanArchives = false;
         def.scan.maxArchiveDepth = 0;
         def.scan.scanNetworkFiles = false;
-        def.scan.heuristicLevel = 0;
+        def.scan.heuristicLevel = 1;
         def.scan.cloudLookupEnabled = false;
 
         def.notifications.enabled = false;
         def.notifications.soundEnabled = false;
         def.notifications.showScanProgress = false;
-        def.notifications.showThreatAlerts = false;
+        def.notifications.showThreatAlerts = true;
         def.notifications.showUpdateNotifications = false;
         def.notifications.doNotDisturbEnabled = true;
         def.notifications.dndStartHour = 0;
@@ -408,7 +428,7 @@ void ProfileManagerImpl::PopulateBuiltInProfiles()
         def.resources.maxCpuPercent = 5;
         def.resources.maxMemoryMb = 64;
         def.resources.ioPriority = 0;
-        def.resources.maxConcurrentScans = 0;
+        def.resources.maxConcurrentScans = 1;
         def.resources.backgroundMode = true;
 
         def.scan.realtimeProtection = true;
@@ -538,21 +558,21 @@ std::string ProfileDefinition::ToJson() const
         {
             Json excl = Json::array();
             for (const auto& p : pathExclusions) {
-                excl.push_back(std::string(p.begin(), p.end()));
+                excl.push_back(WideToUtf8(p));
             }
             j["pathExclusions"] = std::move(excl);
         }
         {
             Json excl = Json::array();
             for (const auto& p : processExclusions) {
-                excl.push_back(std::string(p.begin(), p.end()));
+                excl.push_back(WideToUtf8(p));
             }
             j["processExclusions"] = std::move(excl);
         }
         {
             Json excl = Json::array();
             for (const auto& p : extensionExclusions) {
-                excl.push_back(std::string(p.begin(), p.end()));
+                excl.push_back(WideToUtf8(p));
             }
             j["extensionExclusions"] = std::move(excl);
         }
@@ -650,7 +670,7 @@ std::string ApplicationTriggerRule::ToJson() const
     try {
         Json j;
         j["ruleId"] = ruleId;
-        j["applicationPattern"] = std::string(applicationPattern.begin(), applicationPattern.end());
+        j["applicationPattern"] = WideToUtf8(applicationPattern);
         j["profileWhenRunning"] = std::string(GetSystemProfileName(profileWhenRunning));
         j["profileAfterExit"] = std::string(GetSystemProfileName(profileAfterExit));
         j["switchDelaySeconds"] = switchDelaySeconds;
@@ -1034,21 +1054,23 @@ bool ProfileManager::SetActiveProfile(SystemProfile profile)
 
 bool ProfileManager::SetActiveProfile(const std::string& profileName)
 {
-    std::unique_lock lock(m_mutex);
+    {
+        std::unique_lock lock(m_mutex);
 
-    if (m_impl->m_status != ProfileStatus::Running) {
-        SS_LOG_ERROR(kLogCategory, L"Cannot switch profile: ProfileManager not running");
-        return false;
+        if (m_impl->m_status != ProfileStatus::Running) {
+            SS_LOG_ERROR(kLogCategory, L"Cannot switch profile: ProfileManager not running");
+            return false;
+        }
+
+        auto it = m_impl->m_customProfiles.find(profileName);
+        if (it == m_impl->m_customProfiles.end()) {
+            SS_LOG_ERROR(kLogCategory, L"Custom profile '%hs' not found", profileName.c_str());
+            return false;
+        }
+
+        m_impl->m_activeCustomProfileName = profileName;
     }
 
-    auto it = m_impl->m_customProfiles.find(profileName);
-    if (it == m_impl->m_customProfiles.end()) {
-        SS_LOG_ERROR(kLogCategory, L"Custom profile '%hs' not found", profileName.c_str());
-        return false;
-    }
-
-    // Delegate to the typed overload but release lock first to avoid deadlock
-    lock.unlock();
     return SetActiveProfile(SystemProfile::Custom);
 }
 
@@ -1061,6 +1083,15 @@ SystemProfile ProfileManager::GetActiveProfile() const noexcept
 ProfileDefinition ProfileManager::GetActiveProfileDefinition() const
 {
     std::shared_lock lock(m_mutex);
+
+    // If a custom profile is active, return it
+    if (m_currentProfile == SystemProfile::Custom &&
+        !m_impl->m_activeCustomProfileName.empty()) {
+        auto cit = m_impl->m_customProfiles.find(m_impl->m_activeCustomProfileName);
+        if (cit != m_impl->m_customProfiles.end()) {
+            return cit->second;
+        }
+    }
 
     auto it = m_impl->m_builtInProfiles.find(m_currentProfile);
     if (it != m_impl->m_builtInProfiles.end()) {
@@ -1350,6 +1381,23 @@ uint64_t ProfileManager::AddScheduleEntry(const ProfileScheduleEntry& entry)
         return 0;
     }
 
+    constexpr size_t MAX_SCHEDULE_ENTRIES = 256;
+    if (m_impl->m_scheduleEntries.size() >= MAX_SCHEDULE_ENTRIES) {
+        SS_LOG_ERROR(kLogCategory, L"Cannot add schedule: limit of %zu reached", MAX_SCHEDULE_ENTRIES);
+        return 0;
+    }
+
+    if (entry.startHour > 23 || entry.endHour > 23 ||
+        entry.startMinute > 59 || entry.endMinute > 59) {
+        SS_LOG_ERROR(kLogCategory, L"Invalid schedule time values: %02u:%02u-%02u:%02u",
+            entry.startHour, entry.startMinute, entry.endHour, entry.endMinute);
+        return 0;
+    }
+
+    if (entry.daysOfWeek == 0) {
+        SS_LOG_WARN(kLogCategory, L"Schedule entry has no active days (daysOfWeek=0)");
+    }
+
     ProfileScheduleEntry newEntry = entry;
     newEntry.scheduleId = m_impl->m_nextScheduleId++;
     m_impl->m_scheduleEntries.push_back(newEntry);
@@ -1432,6 +1480,12 @@ uint64_t ProfileManager::AddApplicationTrigger(const ApplicationTriggerRule& rul
 
     if (m_impl->m_status != ProfileStatus::Running) {
         SS_LOG_ERROR(kLogCategory, L"Cannot add trigger: ProfileManager not running");
+        return 0;
+    }
+
+    constexpr size_t MAX_APPLICATION_TRIGGERS = 256;
+    if (m_impl->m_applicationTriggers.size() >= MAX_APPLICATION_TRIGGERS) {
+        SS_LOG_ERROR(kLogCategory, L"Cannot add trigger: limit of %zu reached", MAX_APPLICATION_TRIGGERS);
         return 0;
     }
 
@@ -1549,15 +1603,15 @@ bool ProfileManager::ActivateEmergencyProfile()
     SS_LOG_WARN(kLogCategory, L"Emergency profile activation requested");
 
     {
-        std::shared_lock lock(m_mutex);
-        if (m_impl->m_emergencyMode.load(std::memory_order_acquire)) {
+        std::unique_lock lock(m_mutex);
+        if (m_impl->m_emergencyMode.load(std::memory_order_relaxed)) {
             SS_LOG_WARN(kLogCategory, L"Already in emergency mode");
             return true;
         }
         m_impl->m_preEmergencyProfile = m_currentProfile;
+        m_impl->m_emergencyMode.store(true, std::memory_order_release);
     }
 
-    m_impl->m_emergencyMode.store(true, std::memory_order_release);
     return SetActiveProfile(SystemProfile::Emergency);
 }
 
@@ -1568,23 +1622,23 @@ bool ProfileManager::IsInEmergencyMode() const noexcept
 
 bool ProfileManager::ExitEmergencyMode()
 {
-    if (!m_impl->m_emergencyMode.load(std::memory_order_acquire)) {
-        SS_LOG_WARN(kLogCategory, L"Not in emergency mode; nothing to exit");
-        return false;
-    }
-
-    SS_LOG_INFO(kLogCategory, L"Exiting emergency mode");
-    m_impl->m_emergencyMode.store(false, std::memory_order_release);
-
     SystemProfile target;
     {
-        std::shared_lock lock(m_mutex);
-        target = m_impl->m_preEmergencyProfile;
+        std::unique_lock lock(m_mutex);
 
-        // Fallback to configured initial profile if the saved profile is Emergency
+        if (!m_impl->m_emergencyMode.load(std::memory_order_relaxed)) {
+            SS_LOG_WARN(kLogCategory, L"Not in emergency mode; nothing to exit");
+            return false;
+        }
+
+        SS_LOG_INFO(kLogCategory, L"Exiting emergency mode");
+
+        target = m_impl->m_preEmergencyProfile;
         if (target == SystemProfile::Emergency) {
             target = m_impl->m_config.initialProfile;
         }
+
+        m_impl->m_emergencyMode.store(false, std::memory_order_release);
     }
 
     return SetActiveProfile(target);
@@ -1640,30 +1694,7 @@ void ProfileManager::UnregisterCallback(uint64_t callbackId)
 ProfileStatistics ProfileManager::GetStatistics() const
 {
     std::shared_lock lock(m_mutex);
-    const auto& s = m_impl->m_stats;
-    constexpr auto r = std::memory_order_relaxed;
-
-    // Aggregate-initialize as a prvalue so guaranteed copy elision applies
-    // (ProfileStatistics is non-copyable/non-movable due to std::atomic members)
-    return ProfileStatistics{
-        s.profileSwitches.load(r),
-        s.manualSwitches.load(r),
-        s.scheduledSwitches.load(r),
-        s.applicationTriggers.load(r),
-        s.emergencySwitches.load(r),
-        s.switchFailures.load(r),
-        {{
-            s.timeInProfile[ 0].load(r), s.timeInProfile[ 1].load(r),
-            s.timeInProfile[ 2].load(r), s.timeInProfile[ 3].load(r),
-            s.timeInProfile[ 4].load(r), s.timeInProfile[ 5].load(r),
-            s.timeInProfile[ 6].load(r), s.timeInProfile[ 7].load(r),
-            s.timeInProfile[ 8].load(r), s.timeInProfile[ 9].load(r),
-            s.timeInProfile[10].load(r), s.timeInProfile[11].load(r),
-            s.timeInProfile[12].load(r), s.timeInProfile[13].load(r),
-            s.timeInProfile[14].load(r), s.timeInProfile[15].load(r)
-        }},
-        s.startTime
-    };
+    return m_impl->m_stats;
 }
 
 void ProfileManager::ResetStatistics()
