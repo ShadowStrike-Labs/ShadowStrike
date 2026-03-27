@@ -57,6 +57,8 @@
 #include "../Exploits/HeapSprayDetector.hpp"
 #include "../Exploits/JITSprayDetector.hpp"
 #include "../Exploits/BufferOverflowProtection.hpp"
+#include "../Exploits/StackPivotDetector.hpp"
+#include "../Exploits/KernelExploitDetector.hpp"
 
 // ============================================================================
 // ANTI-EVASION DETECTOR INCLUDES
@@ -1103,6 +1105,83 @@ public:
             Utils::Logger::Error("RealTimeProtection: BufferOverflowProtection unknown exception");
         }
 
+        // StackPivotDetector (singleton — initialize + start stack pivot detection engine)
+        try {
+            auto& spd = Exploits::StackPivotDetector::Instance();
+            if (spd.Initialize()) {
+                if (!spd.Start()) {
+                    Utils::Logger::Warn(L"RealTimeProtection: StackPivotDetector Start failed");
+                }
+            } else {
+                Utils::Logger::Warn(L"RealTimeProtection: StackPivotDetector Initialize failed");
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("RealTimeProtection: StackPivotDetector exception: {}", e.what());
+        } catch (...) {
+            Utils::Logger::Error("RealTimeProtection: StackPivotDetector unknown exception");
+        }
+
+        // KernelExploitDetector (singleton — BYOVD / vulnerable driver / IOCTL abuse detection)
+        try {
+            auto& ked = Exploits::KernelExploitDetector::Instance();
+            Exploits::KernelExploitDetectorConfiguration kedConfig;
+            kedConfig.enableDriverMonitoring = true;
+            kedConfig.blockVulnerableDrivers = true;
+            kedConfig.enableLOLDriversDatabase = true;
+            kedConfig.enableMicrosoftBlocklist = true;
+            kedConfig.monitorIOCTL = true;
+            kedConfig.blockSuspiciousIOCTL = true;
+            kedConfig.detectKASLRLeaks = true;
+            kedConfig.analyzeBSODDumps = true;
+
+            if (ked.Initialize(kedConfig)) {
+                if (!ked.Start()) {
+                    Utils::Logger::Warn(L"RealTimeProtection: KernelExploitDetector Start failed");
+                } else {
+                    // Wire exploit detection callback for SOC alerting
+                    ked.RegisterKernelExploitCallback(
+                        [](const Exploits::KernelExploitEvent& event) {
+                            auto typeName = Exploits::GetKernelThreatTypeName(event.threatType);
+                            Utils::Logger::Warn(
+                                L"[KED-CB] Kernel exploit detected: {} (PID={}, confidence={:.1f}, blocked={})",
+                                Utils::StringUtils::Utf8ToWide(typeName.data()),
+                                event.sourceProcessId,
+                                event.confidence,
+                                event.wasBlocked ? L"YES" : L"NO");
+                        });
+
+                    // Wire driver load callback for telemetry
+                    ked.RegisterDriverLoadCallback(
+                        [](const Exploits::DriverInfo& info, Exploits::DetectionAction action) {
+                            if (info.isVulnerable || info.isMicrosoftBlocked || info.isLOLDriver) {
+                                Utils::Logger::Error(
+                                    L"[KED-CB] Vulnerable driver: {} (SHA256: {}, "
+                                    L"LOLDriver={}, MSBlocked={}, Action={})",
+                                    info.fileName,
+                                    Utils::StringUtils::Utf8ToWide(info.sha256.substr(0, 16)),
+                                    info.isLOLDriver ? L"YES" : L"NO",
+                                    info.isMicrosoftBlocked ? L"YES" : L"NO",
+                                    static_cast<int>(action));
+                            }
+                        });
+
+                    // Wire error callback
+                    ked.RegisterErrorCallback(
+                        [](const std::string& message, int code) {
+                            Utils::Logger::Error("[KED-ERR] {} (code={})", message, code);
+                        });
+
+                    Utils::Logger::Info(L"RealTimeProtection: KernelExploitDetector initialized and started");
+                }
+            } else {
+                Utils::Logger::Warn(L"RealTimeProtection: KernelExploitDetector Initialize failed");
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("RealTimeProtection: KernelExploitDetector exception: {}", e.what());
+        } catch (...) {
+            Utils::Logger::Error("RealTimeProtection: KernelExploitDetector unknown exception");
+        }
+
         Utils::Logger::Info(L"RealTimeProtection: Components started");
     }
 
@@ -1136,9 +1215,11 @@ public:
         try { ZeroHourProtection::Instance().Stop(); } catch (...) {}
         SetComponentState(ComponentType::ZERO_HOUR, ComponentState::STOPPED);
 
+        try { Exploits::StackPivotDetector::Instance().Shutdown(); } catch (...) {}
         try { Exploits::BufferOverflowProtection::Instance().Shutdown(); } catch (...) {}
         try { Exploits::JITSprayDetector::Instance().Shutdown(); } catch (...) {}
         try { Exploits::HeapSprayDetector::Instance().Shutdown(); } catch (...) {}
+        try { Exploits::KernelExploitDetector::Instance().Shutdown(); } catch (...) {}
 
         Utils::Logger::Info(L"RealTimeProtection: Components stopped");
     }
@@ -1836,33 +1917,64 @@ public:
             }
         }
 
-        // Metamorphic analysis on loaded modules — use DeepScan for image loads
-        // (covers self-modifying, obfuscation, VM protection beyond default StandardScan)
-        if (m_metamorphicDetector) {
-            try {
-                ShadowStrike::AntiEvasion::MetamorphicAnalysisConfig metaCfg;
-                metaCfg.flags = ShadowStrike::AntiEvasion::MetamorphicAnalysisFlags::DeepScan
-                    | ShadowStrike::AntiEvasion::MetamorphicAnalysisFlags::ScanSelfModifying;
-                metaCfg.processId = req.processId;
-                auto metaResult = m_metamorphicDetector->AnalyzeFile(imagePath, metaCfg);
-                if (metaResult.isMetamorphic) {
-                    Utils::Logger::Warn(
-                        L"RealTimeProtection: Metamorphic module loaded in PID {}: {} "
-                        L"[score={:.1f} severity={} detections={} family={}]",
-                        req.processId, imagePath,
-                        metaResult.mutationScore,
-                        static_cast<int>(metaResult.maxSeverity),
-                        metaResult.totalDetections,
-                        metaResult.familyName.empty() ? L"unknown" : metaResult.familyName);
-                    m_stats.threatsDetected++;
-                    return Communication::KernelVerdict::Block;
+        // KernelExploitDetector — scan loaded drivers for BYOVD / rootkit / vulnerable driver abuse
+        // Only scan .sys files (kernel drivers) — skip user-mode DLLs
+        {
+            std::wstring lowerImage = ToLowerW(imagePath);
+            bool isDriver = lowerImage.size() >= 4 &&
+                          (lowerImage.substr(lowerImage.size() - 4)                              == L".sys");
+            if (isDriver) {
+                try {
+                    auto& ked = Exploits::KernelExploitDetector::Instance();
+                    if (ked.IsInitialized()) {
+                        auto driverInfo = ked.ScanDriver(imagePath);
+                        if (driverInfo.isVulnerable || driverInfo.isMicrosoftBlocked || driverInfo.isLOLDriver) {
+                            Utils::Logger::Error(
+                                L"RealTimeProtection: BLOCKED vulnerable driver in PID {}: {} "
+                                L"[LOLDriver={} MSBlocked={} sha256={}]",
+                                req.processId, imagePath,
+                                driverInfo.isLOLDriver ? L"YES" : L"NO",
+                                driverInfo.isMicrosoftBlocked ? L"YES" : L"NO",
+                                Utils::StringUtils::Utf8ToWide(driverInfo.sha256.substr(0, 16)));
+
+                            // Emit telemetry for SOC
+                            if (Communication::TelemetryCollector::HasInstance()) {
+                                Communication::DetectionEventData detection;
+                                detection.threatName = "KernelExploit." + GetKernelThreatTypeName(driverInfo.isLOLDriver ?
+                                    KernelThreatType::VulnerableDriverLoad : KernelThreatType::DriverBlocklistViolation);
+                                detection.threatType = "KernelExploit";
+                                detection.detectionMethod = "KernelExploitDetector";
+                                detection.actionTaken = "Blocked";
+                                detection.detectionTime = static_cast<uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch()).count());
+                                detection.fpProbability = 0.01; // High confidence
+                                Communication::TelemetryCollector::Instance().RecordDetection(detection);
+                            }
+
+                            m_stats.threatsDetected++;
+                            return Communication::KernelVerdict::Block;
+                        }
+
+                        // Check unsigned drivers in strict mode
+                        if (driverInfo.signatureStatus == Exploits::DriverSignatureStatus::Unsigned) {
+                            if (m_config.mode == ProtectionMode::BLOCK_UNKNOWN ||
+                                m_config.mode == ProtectionMode::BLOCK_SUSPICIOUS) {
+                                Utils::Logger::Warn(
+                                    L"RealTimeProtection: Blocked unsigned driver in PID {}: {}",
+                                    req.processId, imagePath);
+                                m_stats.threatsDetected++;
+                                return Communication::KernelVerdict::Block;
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error(L"RealTimeProtection: KernelExploitDetector scan failed for {} in PID {}: {}",
+                        imagePath, req.processId, Utils::StringUtils::Utf8ToWide(e.what()));
+                } catch (...) {
+                    Utils::Logger::Error(L"RealTimeProtection: KernelExploitDetector unknown exception for {} in PID {}",
+                        imagePath, req.processId);
                 }
-            } catch (const std::exception& e) {
-                Utils::Logger::Error(L"RealTimeProtection: MetamorphicDetector exception on image load PID {}: {}",
-                    req.processId, Utils::StringUtils::Utf8ToWide(e.what()));
-            } catch (...) {
-                Utils::Logger::Error(L"RealTimeProtection: MetamorphicDetector unknown exception on image load PID {}",
-                    req.processId);
             }
         }
 
@@ -2013,6 +2125,42 @@ public:
             }
 
             case FilterMessageType_SyscallAlert: {
+                // Route syscall anomalies to KernelExploitDetector for IOCTL abuse correlation
+                if (size >= sizeof(uint32_t) * 3) && data) {
+                    try {
+                        auto& ked = Exploits::KernelExploitDetector::Instance();
+                        if (ked.IsInitialized()) {
+                            // Extract PID, IOCTL code, and device path from payload
+                            auto* payload = static_cast<const uint8_t*>(data);
+                            uint32_t pid = *reinterpret_cast<const uint32_t*>(payload);
+                            uint32_t ioctlCode = *reinterpret_cast<const uint32_t*>(payload + 4);
+                            uint32_t pathLen = *reinterpret_cast<const uint32_t*>(payload + 8);
+
+                            if (size >= sizeof(uint32_t) * 3 + pathLen &&
+                                pathLen > 0 && pathLen < 512) {
+                                std::wstring devicePath(reinterpret_cast<const wchar_t*>(
+                                    payload + sizeof(uint32_t) * 3),
+                                    pathLen / sizeof(wchar_t));
+
+                                std::span<const uint8_t> inputBuf;
+                                if (size > sizeof(uint32_t) * 3 + pathLen) {
+                                    size_t inputOffset = sizeof(uint32_t) * 3 + pathLen;
+                                    // Align to 4 bytes
+                                    inputOffset = (inputOffset + 3) & ~3;
+                                    if (inputOffset < size) {
+                                        inputBuf = std::span<const uint8_t>(
+                                            payload + inputOffset, size - inputOffset);
+                                    }
+                                }
+
+                                auto ioctlEvent = ked.AnalyzeIOCTL(pid, devicePath, ioctlCode, inputBuf);
+                                if (ioctlEvent.isSuspicious && ioctlEvent.wasBlocked) {
+                                    m_stats.threatsDetected++;
+                                }
+                            }
+                        }
+                    } catch (...) {}
+                }
                 Utils::Logger::Warn(L"RealTimeProtection: Syscall anomaly alert from kernel (payload {} bytes)", size);
                 break;
             }
