@@ -466,7 +466,39 @@ struct PolicyStatistics {
     std::atomic<uint64_t> syncFailures{0};
     std::array<std::atomic<uint64_t>, 16> byPolicyType{};
     TimePoint startTime = Clock::now();
-    
+
+    PolicyStatistics() = default;
+
+    PolicyStatistics(const PolicyStatistics& other) noexcept
+        : policiesApplied(other.policiesApplied.load(std::memory_order_relaxed))
+        , policiesActive(other.policiesActive.load(std::memory_order_relaxed))
+        , enforcementChecks(other.enforcementChecks.load(std::memory_order_relaxed))
+        , violationsDetected(other.violationsDetected.load(std::memory_order_relaxed))
+        , violationsRemediated(other.violationsRemediated.load(std::memory_order_relaxed))
+        , syncOperations(other.syncOperations.load(std::memory_order_relaxed))
+        , syncFailures(other.syncFailures.load(std::memory_order_relaxed))
+        , startTime(other.startTime) {
+        for (size_t i = 0; i < byPolicyType.size(); ++i)
+            byPolicyType[i].store(other.byPolicyType[i].load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+    }
+
+    PolicyStatistics& operator=(const PolicyStatistics& other) noexcept {
+        if (this != &other) {
+            policiesApplied.store(other.policiesApplied.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            policiesActive.store(other.policiesActive.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            enforcementChecks.store(other.enforcementChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            violationsDetected.store(other.violationsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            violationsRemediated.store(other.violationsRemediated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            syncOperations.store(other.syncOperations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            syncFailures.store(other.syncFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < byPolicyType.size(); ++i)
+                byPolicyType[i].store(other.byPolicyType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };

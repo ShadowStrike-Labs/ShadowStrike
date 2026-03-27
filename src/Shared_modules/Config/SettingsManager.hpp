@@ -549,7 +549,31 @@ struct SettingsStatistics {
     std::atomic<uint64_t> imports{0};
     std::atomic<uint64_t> exports{0};
     TimePoint startTime = Clock::now();
-    
+
+    SettingsStatistics() = default;
+
+    SettingsStatistics(const SettingsStatistics& other) noexcept
+        : totalLoads(other.totalLoads.load(std::memory_order_relaxed))
+        , totalSaves(other.totalSaves.load(std::memory_order_relaxed))
+        , settingChanges(other.settingChanges.load(std::memory_order_relaxed))
+        , resets(other.resets.load(std::memory_order_relaxed))
+        , imports(other.imports.load(std::memory_order_relaxed))
+        , exports(other.exports.load(std::memory_order_relaxed))
+        , startTime(other.startTime) {}
+
+    SettingsStatistics& operator=(const SettingsStatistics& other) noexcept {
+        if (this != &other) {
+            totalLoads.store(other.totalLoads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalSaves.store(other.totalSaves.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            settingChanges.store(other.settingChanges.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            resets.store(other.resets.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            imports.store(other.imports.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            exports.store(other.exports.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };

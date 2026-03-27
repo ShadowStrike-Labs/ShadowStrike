@@ -426,7 +426,35 @@ struct ConfigStatistics {
     std::atomic<uint64_t> policyUpdates{0};
     std::atomic<uint64_t> snapshotsTaken{0};
     TimePoint startTime = Clock::now();
-    
+
+    ConfigStatistics() = default;
+
+    ConfigStatistics(const ConfigStatistics& other) noexcept
+        : totalReads(other.totalReads.load(std::memory_order_relaxed))
+        , totalWrites(other.totalWrites.load(std::memory_order_relaxed))
+        , cacheHits(other.cacheHits.load(std::memory_order_relaxed))
+        , cacheMisses(other.cacheMisses.load(std::memory_order_relaxed))
+        , validationErrors(other.validationErrors.load(std::memory_order_relaxed))
+        , hotReloads(other.hotReloads.load(std::memory_order_relaxed))
+        , policyUpdates(other.policyUpdates.load(std::memory_order_relaxed))
+        , snapshotsTaken(other.snapshotsTaken.load(std::memory_order_relaxed))
+        , startTime(other.startTime) {}
+
+    ConfigStatistics& operator=(const ConfigStatistics& other) noexcept {
+        if (this != &other) {
+            totalReads.store(other.totalReads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalWrites.store(other.totalWrites.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            cacheHits.store(other.cacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            cacheMisses.store(other.cacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            validationErrors.store(other.validationErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            hotReloads.store(other.hotReloads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            policyUpdates.store(other.policyUpdates.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            snapshotsTaken.store(other.snapshotsTaken.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };

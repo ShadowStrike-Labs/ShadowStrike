@@ -492,9 +492,39 @@ struct ProfileStatistics {
     std::atomic<uint64_t> applicationTriggers{0};
     std::atomic<uint64_t> emergencySwitches{0};
     std::atomic<uint64_t> switchFailures{0};
-    std::array<std::atomic<uint64_t>, 16> timeInProfile{};  // Seconds per profile
+    std::array<std::atomic<uint64_t>, 16> timeInProfile{};
     TimePoint startTime = Clock::now();
-    
+
+    ProfileStatistics() = default;
+
+    ProfileStatistics(const ProfileStatistics& other) noexcept
+        : profileSwitches(other.profileSwitches.load(std::memory_order_relaxed))
+        , manualSwitches(other.manualSwitches.load(std::memory_order_relaxed))
+        , scheduledSwitches(other.scheduledSwitches.load(std::memory_order_relaxed))
+        , applicationTriggers(other.applicationTriggers.load(std::memory_order_relaxed))
+        , emergencySwitches(other.emergencySwitches.load(std::memory_order_relaxed))
+        , switchFailures(other.switchFailures.load(std::memory_order_relaxed))
+        , startTime(other.startTime) {
+        for (size_t i = 0; i < timeInProfile.size(); ++i)
+            timeInProfile[i].store(other.timeInProfile[i].load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+    }
+
+    ProfileStatistics& operator=(const ProfileStatistics& other) noexcept {
+        if (this != &other) {
+            profileSwitches.store(other.profileSwitches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            manualSwitches.store(other.manualSwitches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            scheduledSwitches.store(other.scheduledSwitches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            applicationTriggers.store(other.applicationTriggers.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            emergencySwitches.store(other.emergencySwitches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            switchFailures.store(other.switchFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < timeInProfile.size(); ++i)
+                timeInProfile[i].store(other.timeInProfile[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
