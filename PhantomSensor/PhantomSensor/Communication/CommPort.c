@@ -613,20 +613,29 @@ ShadowStrikeCloseCommunicationPort(
         }
 
         if (g_ClientPortRefs[i].ReferenceCount > 0) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] Warning: Client slot %ld still has %ld references\n",
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] CRITICAL: Client slot %ld still has %ld references at shutdown — "
+                       "leaking port to avoid use-after-free BSOD\n",
                        i, g_ClientPortRefs[i].ReferenceCount);
         }
     }
 
     //
-    // Now close all client ports under lock
+    // Now close all client ports under lock — only slots with zero refs
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_DriverData.ClientPortLock);
 
     for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
         if (g_ClientPortRefs[i].ClientPort != NULL) {
+            if (g_ClientPortRefs[i].ReferenceCount > 0) {
+                //
+                // Skip slots with outstanding references to avoid BSOD.
+                // The port handle and key material will be cleaned up
+                // when the driver unloads (OS reclaims all allocations).
+                //
+                continue;
+            }
             if (g_ClientSessionEncKeys[i] != NULL) {
                 ShadowStrikeReleaseSessionCryptoKey(&g_ClientSessionEncKeys[i]);
             }
@@ -1042,7 +1051,7 @@ ShadowStrikeConnectNotify(
                     g_ClientSessionEncKeys[slotIndex] = sessionCryptoKey;
                 } else {
                     if (sessionCryptoKey != NULL) {
-                        EncKeyRelease(sessionCryptoKey);
+                        ShadowStrikeReleaseSessionCryptoKey(&sessionCryptoKey);
                     }
                     keyStatus = NT_SUCCESS(sessionKeyStatus) ? STATUS_ENCRYPTION_FAILED
                                                              : sessionKeyStatus;
@@ -1502,7 +1511,14 @@ ShadowStrikeMessageNotify(
         }
 
         encryptedHeader = (PENC_HEADER)encryptedTransportBuffer;
-        totalDecryptedSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + encryptedHeader->PlaintextSize;
+
+        //
+        // CRITICAL: Use the VALIDATED first-copy sizes, not the second-copy.
+        // The user buffer could be modified between the two copies (TOCTOU).
+        // The GCM tag will detect any tampering with ciphertext, but
+        // PlaintextSize is not part of the authenticated ciphertext.
+        //
+        totalDecryptedSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + localEncryptedHeader.PlaintextSize;
 
         decryptedBuffer = ExAllocatePool2(POOL_FLAG_PAGED, totalDecryptedSize, 'dmCP');
         if (decryptedBuffer == NULL) {
@@ -1521,7 +1537,7 @@ ShadowStrikeMessageNotify(
             encryptedTransportBuffer,
             encryptedDataSize,
             (PUCHAR)decryptedBuffer + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
-            encryptedHeader->PlaintextSize,
+            localEncryptedHeader.PlaintextSize,
             &plaintextSize,
             &decryptOpts
         );
@@ -1540,6 +1556,18 @@ ShadowStrikeMessageNotify(
         dispatchBufferTrusted = TRUE;
         localHeader = *decryptedHeader;
         header = &localHeader;
+    }
+    else if (clientRef->EncryptionEstablished) {
+        //
+        // Reject plaintext messages when encryption has been established.
+        // A legitimate client always encrypts after KEX succeeds.
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Rejecting plaintext message type=%u from slot=%ld "
+                   "(encryption mandatory after KEX)\n",
+                   header->MessageType, slotIndex);
+        status = STATUS_ENCRYPTION_FAILED;
+        goto Cleanup;
     }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
@@ -1735,17 +1763,22 @@ ShadowStrikeHandleQueryDriverStatus(
     replyHeader.MessageId = InputHeader->MessageId;  // Correlation
 
     //
-    // Build driver status
+    // Build driver status — acquire config lock for consistent reads
     //
     RtlZeroMemory(&driverStatus, sizeof(SHADOWSTRIKE_DRIVER_STATUS));
     driverStatus.VersionMajor = SHADOWSTRIKE_VERSION_MAJOR;
     driverStatus.VersionMinor = SHADOWSTRIKE_VERSION_MINOR;
     driverStatus.VersionBuild = SHADOWSTRIKE_VERSION_BUILD;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_DriverData.ConfigLock);
     driverStatus.FilteringActive = g_DriverData.FilteringStarted;
     driverStatus.ScanOnOpenEnabled = g_DriverData.Config.ScanOnOpen;
     driverStatus.ScanOnExecuteEnabled = g_DriverData.Config.ScanOnExecute;
     driverStatus.ScanOnWriteEnabled = g_DriverData.Config.ScanOnWrite;
     driverStatus.NotificationsEnabled = g_DriverData.Config.NotificationsEnabled;
+    ExReleasePushLockShared(&g_DriverData.ConfigLock);
+    KeLeaveCriticalRegion();
     //
     // Read 64-bit volatile counters atomically (LONG64 reads are NOT atomic on x86)
     //
@@ -2197,6 +2230,14 @@ ShadowStrikeReleaseClientPort(
     slotIndex = ClientRef->SlotIndex;
     remainingRefs = InterlockedDecrement(&ClientRef->ReferenceCount);
 
+    if (remainingRefs < 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] CRITICAL: Negative refcount %ld on slot %ld — double release detected\n",
+                   remainingRefs, slotIndex);
+        NT_ASSERT(remainingRefs >= 0);
+        return;
+    }
+
     if (remainingRefs == 0) {
         ShadowStrikeFinalizeClientDisconnect(slotIndex);
     }
@@ -2307,6 +2348,15 @@ ShadowStrikeSendScanRequest(
                         encryptedSize
                     );
 
+                    //
+                    // If HMAC will be applied, include the flag in the header
+                    // BEFORE encryption so GCM AAD matches the on-wire header.
+                    //
+                    if (g_CommHmacKeyReady) {
+                        ((PSHADOWSTRIKE_MESSAGE_HEADER)encBuf)->Flags |=
+                            SHADOWSTRIKE_MSG_FLAG_HMAC;
+                    }
+
                     ENC_OPTIONS encOpts = {0};
                     encOpts.Flags = EncFlag_IncludeHeader | EncFlag_UseAAD;
                     encOpts.AAD = encBuf;  // Header as AAD
@@ -2414,8 +2464,8 @@ ShadowStrikeSendScanRequest(
                 (PUCHAR)authBuffer + sendSize
             );
             if (NT_SUCCESS(hmacStatus)) {
-                ((PSHADOWSTRIKE_MESSAGE_HEADER)authBuffer)->Flags |=
-                    SHADOWSTRIKE_MSG_FLAG_HMAC;
+                // HMAC flag already set in header before encryption (AAD alignment).
+                // Just swap the send buffer to the authenticated one.
                 sendBuffer = authBuffer;
                 sendSize = authenticatedSize;
                 hmacAllocated = TRUE;
@@ -2984,7 +3034,11 @@ ShadowStrikeSendProcessNotification(
 
         if ((ULONG)pendingCount > g_DriverData.Config.MaxPendingRequests) {
             InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
-            ShadowStrikeFreeMessageBuffer(header);
+            if (procEncrypted) {
+                ExFreePoolWithTag(encryptedProcBuf, 'enCP');
+            } else {
+                ShadowStrikeFreeMessageBuffer(header);
+            }
             ShadowStrikeReleaseClientPort(clientRef);
             SHADOWSTRIKE_INC_STAT(MessagesDropped);
             return SHADOWSTRIKE_ERROR_QUEUE_FULL;

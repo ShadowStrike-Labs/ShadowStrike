@@ -1087,6 +1087,9 @@ struct VMEvasionDetector::Impl {
     // Initialization flag
     std::atomic<bool> m_initialized{false};
 
+    // Cancellation flag for long-running batch scans
+    std::atomic<bool> m_cancelled{false};
+
     // Constructor
     Impl(std::shared_ptr<ThreatIntel::ThreatIntelStore> threatIntel,
          std::shared_ptr<SignatureStore::SignatureStore> signatureStore,
@@ -3078,7 +3081,11 @@ uint64_t VMEvasionDetector::MeasureRDTSCDelta(uint32_t iterations) {
 // ============================================================================
 
 bool VMEvasionDetector::IsCancelled() const {
-    return false;
+    if (m_impl->m_cancelled.load(std::memory_order_acquire)) {
+        return true;
+    }
+    const auto* extFlag = m_impl->m_config.cancelFlag;
+    return extFlag && extFlag->load(std::memory_order_acquire);
 }
 
 AntiVMTechnique VMEvasionDetector::ClassifyImport(

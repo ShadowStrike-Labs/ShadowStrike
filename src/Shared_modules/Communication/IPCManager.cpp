@@ -1231,6 +1231,15 @@ void IPCManager::WorkerRoutine() {
             continue;
         }
 
+        // Validate DataSize against buffer bounds to prevent out-of-bounds dispatch
+        if (kWdkHeaderSize + kAppHeaderSize + pAppHeader->DataSize > buffer.size()) {
+            Utils::Logger::Error("[IPCManager] DataSize {} exceeds buffer bounds (max {})",
+                                 pAppHeader->DataSize,
+                                 buffer.size() - kWdkHeaderSize - kAppHeaderSize);
+            m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+
         m_impl->stats.messagesReceived.fetch_add(1, std::memory_order_relaxed);
         m_impl->stats.bytesReceived.fetch_add(
             kAppHeaderSize + pAppHeader->DataSize, std::memory_order_relaxed);

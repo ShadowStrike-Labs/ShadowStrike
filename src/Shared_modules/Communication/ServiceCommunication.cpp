@@ -1207,16 +1207,10 @@ HANDLE ServiceCommunicationImpl::CreateServerPipe() {
         &sa);
 
     if (hPipe == INVALID_HANDLE_VALUE) {
-        // First instance flag may fail if pipe exists; retry without it
-        hPipe = CreateNamedPipeW(
-            pipeName.c_str(),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
-            PIPE_UNLIMITED_INSTANCES,
-            static_cast<DWORD>(ServiceCommConstants::MAX_MESSAGE_SIZE),
-            static_cast<DWORD>(ServiceCommConstants::MAX_MESSAGE_SIZE),
-            0,
-            &sa);
+        DWORD err = GetLastError();
+        Utils::Logger::Error("[ServiceComm] CreateNamedPipe with FIRST_PIPE_INSTANCE failed: {} "
+                             "— possible pipe squatting attack or prior instance not closed", err);
+        return INVALID_HANDLE_VALUE;
     }
 
     return hPipe;
@@ -1675,7 +1669,9 @@ bool ServiceCommunicationImpl::ReadMessage(HANDLE pipe, MessageHeader& hdr,
         }
 
         if (bytesRead < hdr.payloadLength) {
-            payload.resize(bytesRead);
+            Utils::Logger::Warn("[ServiceComm] Partial payload read: {} of {} bytes",
+                                bytesRead, hdr.payloadLength);
+            return false;
         }
 
         // Encrypted messages: decrypt using session key
@@ -1884,7 +1880,7 @@ void ServiceCommunicationImpl::HandleHandshake(const std::string& sessionId,
     using namespace ShadowStrike::Security;
     auto& crypto = CryptoManager::Instance();
 
-    std::shared_lock lock(m_clientsMutex);
+    std::unique_lock lock(m_clientsMutex);
     ConnectedClient* client = FindClient(sessionId);
     if (!client) return;
 
@@ -2206,7 +2202,7 @@ void ServiceCommunicationImpl::HandleChallengeResponse(
     using namespace ShadowStrike::Security;
     auto& crypto = CryptoManager::Instance();
 
-    std::shared_lock lock(m_clientsMutex);
+    std::unique_lock lock(m_clientsMutex);
     ConnectedClient* client = FindClient(sessionId);
     if (!client) return;
 

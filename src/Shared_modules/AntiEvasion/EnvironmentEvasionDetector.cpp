@@ -437,7 +437,6 @@ namespace AsmFallback {
 
     // Fallback: MeasureRDTSCLatency
     extern "C" uint64_t Fallback_MeasureRDTSCLatency() noexcept {
-        unsigned int aux;
         int cpuInfo[4];
         __cpuid(cpuInfo, 0); // Serialize
         uint64_t start = __rdtsc();
@@ -1838,12 +1837,14 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             wchar_t buffer[512] = {};
-            DWORD bufferSize = sizeof(buffer);
+            DWORD bufferSize = sizeof(buffer) - sizeof(wchar_t); // Reserve space for null terminator
             DWORD type = REG_SZ;
 
             if (RegQueryValueExW(hOpenKey, valueName.c_str(), nullptr, &type,
                 reinterpret_cast<LPBYTE>(buffer), &bufferSize) == ERROR_SUCCESS) {
                 RegCloseKey(hOpenKey);
+                // Force null-termination: bufferSize is in bytes, may not include terminator
+                buffer[min(bufferSize / sizeof(wchar_t), static_cast<DWORD>(510))] = L'\0';
                 return buffer;
             }
 
@@ -2208,16 +2209,16 @@ namespace ShadowStrike::AntiEvasion {
 
         // === TYPE B: Target process environment variable analysis ===
         if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanEnvironmentVars)) {
-            CheckEnvironmentVariables(processId, result.processEnvInfo, detections, nullptr);
+            (void)CheckEnvironmentVariables(processId, result.processEnvInfo, detections, nullptr);
         }
 
         // === TYPE B: Target executable filename pattern analysis ===
         if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanFileNamingPatterns)) {
-            CheckFileNaming(processId, result.fileNamingInfo, detections, nullptr);
+            (void)CheckFileNaming(processId, result.fileNamingInfo, detections, nullptr);
         }
 
         // === TYPE B: Target PE import/section/entropy analysis ===
-        AnalyzeProcessPeForEvasion(processId, detections, nullptr);
+        (void)AnalyzeProcessPeForEvasion(processId, detections, nullptr);
 
         // === TYPE B: Target PE embedded environment-probing string scan ===
         DetectEnvironmentProbingStrings(processId, detections);
@@ -2287,7 +2288,7 @@ namespace ShadowStrike::AntiEvasion {
         if (m_impl->m_cachedHardwareInfo) {
             // Check CPUID hypervisor bit and known VM vendor strings
             const auto& hw = *m_impl->m_cachedHardwareInfo;
-            hostIsVirtualized = hw.hypervisorPresent || hw.isVirtualMachine;
+            hostIsVirtualized = hw.hypervisorDetected || !hw.vmIndicators.empty();
         }
 
         // --- Phase 2: Behavioral scan of all running processes ---
@@ -3241,11 +3242,12 @@ namespace ShadowStrike::AntiEvasion {
             HKEY hDiskEnumKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\Disk\\Enum", 0, KEY_READ, &hDiskEnumKey) == ERROR_SUCCESS) {
                 wchar_t diskIdBuffer[512] = {};
-                DWORD bufSize = sizeof(diskIdBuffer);
+                DWORD bufSize = sizeof(diskIdBuffer) - sizeof(wchar_t);
                 DWORD type = REG_SZ;
 
                 // Check disk 0
                 if (RegQueryValueExW(hDiskEnumKey, L"0", nullptr, &type, reinterpret_cast<LPBYTE>(diskIdBuffer), &bufSize) == ERROR_SUCCESS) {
+                    diskIdBuffer[min(bufSize / sizeof(wchar_t), static_cast<DWORD>(510))] = L'\0';
                     std::wstring diskId(diskIdBuffer);
                     const std::vector<std::pair<std::wstring, std::wstring>> vmDiskPatterns = {
                         {L"VBOX", L"VirtualBox"},
@@ -4566,11 +4568,13 @@ namespace ShadowStrike::AntiEvasion {
             HKEY hVideoKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DEVICEMAP\\VIDEO", 0, KEY_READ, &hVideoKey) == ERROR_SUCCESS) {
                 wchar_t valueData[512] = {};
-                DWORD dataSize = sizeof(valueData);
+                DWORD dataSize = sizeof(valueData) - sizeof(wchar_t); // Reserve space for null terminator
                 DWORD type = REG_SZ;
                 
                 if (RegQueryValueExW(hVideoKey, L"\\Device\\Video0", nullptr, &type, 
                     reinterpret_cast<LPBYTE>(valueData), &dataSize) == ERROR_SUCCESS) {
+                    // Force null-termination: dataSize is in bytes, may not include terminator
+                    valueData[min(dataSize / sizeof(wchar_t), static_cast<DWORD>(510))] = L'\0';
                     std::wstring videoPath(valueData);
                     
                     for (const auto& [pattern, vendor] : vmDisplayPatterns) {
@@ -5560,6 +5564,9 @@ namespace ShadowStrike::AntiEvasion {
                 uint8_t funcBytes[16] = {};
                 SIZE_T bytesRead = 0;
                 if (!ReadProcessMemory(GetCurrentProcess(), funcAddr, funcBytes, sizeof(funcBytes), &bytesRead)) {
+                    continue;
+                }
+                if (bytesRead < sizeof(funcBytes)) {
                     continue;
                 }
 

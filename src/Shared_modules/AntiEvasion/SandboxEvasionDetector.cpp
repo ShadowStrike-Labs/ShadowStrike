@@ -311,33 +311,31 @@ uint64_t Fallback_MeasureVMExitOverhead(void) {
 /// Fallback: CalibrateTimingBaseline
 static uint64_t g_baselineRDTSC_fallback = 0;
 static uint64_t g_baselineCPUID_fallback = 0;
-static bool g_calibrationDone_fallback = false;
+static std::once_flag g_calibrationOnce_fallback;
 
 void Fallback_CalibrateTimingBaseline(void) {
 #ifdef _WIN32
-    if (g_calibrationDone_fallback) return;
-    
-    // Measure RDTSC baseline
-    uint64_t sum = 0;
-    for (int i = 0; i < 10; ++i) {
-        uint64_t start = __rdtsc();
-        uint64_t end = __rdtsc();
-        sum += (end - start);
-    }
-    g_baselineRDTSC_fallback = sum / 10;
-    
-    // Measure CPUID baseline
-    int cpuInfo[4];
-    sum = 0;
-    for (int i = 0; i < 10; ++i) {
-        uint64_t start = __rdtsc();
-        __cpuid(cpuInfo, 0);
-        uint64_t end = __rdtsc();
-        sum += (end - start);
-    }
-    g_baselineCPUID_fallback = sum / 10;
-    
-    g_calibrationDone_fallback = true;
+    std::call_once(g_calibrationOnce_fallback, []() {
+        // Measure RDTSC baseline
+        uint64_t sum = 0;
+        for (int i = 0; i < 10; ++i) {
+            uint64_t start = __rdtsc();
+            uint64_t end = __rdtsc();
+            sum += (end - start);
+        }
+        g_baselineRDTSC_fallback = sum / 10;
+
+        // Measure CPUID baseline
+        int cpuInfo[4];
+        sum = 0;
+        for (int i = 0; i < 10; ++i) {
+            uint64_t start = __rdtsc();
+            __cpuid(cpuInfo, 0);
+            uint64_t end = __rdtsc();
+            sum += (end - start);
+        }
+        g_baselineCPUID_fallback = sum / 10;
+    });
 #endif
 }
 
@@ -996,7 +994,7 @@ namespace ShadowStrike {
                         do {
                             ProcessSandboxResult procResult;
                             if (AnalyzeProcess(pe.th32ProcessID, procResult, procConfig)) {
-                                if (procResult.hasAntiSandboxBehavior) {
+                                if (procResult.hasEvasionCapability) {
                                     // Calibrate: on a real sandbox, anti-sandbox checks
                                     // are less suspicious (artifacts genuinely exist).
                                     float calibratedScore = procResult.evasionScore;
@@ -1005,8 +1003,8 @@ namespace ShadowStrike {
                                     }
 
                                     AddIndicator(result,
-                                        SandboxCheckType::ProcessBehavior,
-                                        SandboxIndicatorCategory::SandboxArtifact,
+                                        SandboxCheckType::SandboxProcesses,
+                                        SandboxIndicatorCategory::Artifact,
                                         calibratedScore >= 80.0f ? SandboxIndicatorSeverity::Critical :
                                         calibratedScore >= 50.0f ? SandboxIndicatorSeverity::High :
                                         SandboxIndicatorSeverity::Medium,
@@ -2107,11 +2105,11 @@ namespace ShadowStrike {
 
             if (hasMovement && hasDistance && hasNaturalPath) {
                 analysis.result = InteractionResult::HumanDetected;
-                analysis.humanConfidence = 80.0f + (analysis.pathEntropy * 20.0f);
+                analysis.humanConfidence = 80.0f + static_cast<float>(analysis.pathEntropy) * 20.0f;
             }
             else if (hasMovement && analysis.straightLineRatio >= SandboxConstants::MAX_STRAIGHT_LINE_RATIO) {
                 analysis.result = InteractionResult::BotPatterns;
-                analysis.botConfidence = 70.0f + (analysis.straightLineRatio * 30.0f);
+                analysis.botConfidence = 70.0f + static_cast<float>(analysis.straightLineRatio) * 30.0f;
             }
             else if (hasMovement) {
                 analysis.result = InteractionResult::SimulatedInteraction;
@@ -3080,6 +3078,9 @@ namespace ShadowStrike {
                     }
                     catch (const std::exception& e) {
                         SS_LOG_ERROR(LOG_CATEGORY, L"Callback %llu threw exception: %hs", id, e.what());
+                    }
+                    catch (...) {
+                        SS_LOG_ERROR(LOG_CATEGORY, L"Callback %llu threw unknown exception", id);
                     }
                 }
             }

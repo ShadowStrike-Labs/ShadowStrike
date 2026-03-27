@@ -1077,7 +1077,7 @@ MhpValidateAndCopyMessage(
     //
     __try {
         if (!InputBufferTrusted) {
-            ProbeForRead(InputBuffer, InputBufferSize, sizeof(UCHAR));
+            ProbeForRead(InputBuffer, InputBufferSize, sizeof(ULONG));
         }
 
         //
@@ -1118,7 +1118,7 @@ MhpValidateAndCopyMessage(
     //
     // Validate sizes - prevent integer overflow
     //
-    if (hdr->TotalSize > InputBufferSize) {
+    if (hdr->TotalSize > InputBufferSize || hdr->TotalSize < sizeof(SS_MESSAGE_HEADER)) {
         ExFreePoolWithTag(kernelBuf, MH_KERNEL_BUFFER_TAG);
         return SHADOWSTRIKE_ERROR_INVALID_MESSAGE;
     }
@@ -1390,6 +1390,16 @@ ShadowStrikeProcessUserMessage(
     // Copy output to user buffer if needed
     //
     if (NT_SUCCESS(status) && OutputBuffer != NULL && localOutputLength > 0) {
+        //
+        // Cap handler output against our stack buffer to prevent overread
+        //
+        if (localOutputLength > sizeof(localOutputBuffer)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/MH] Handler returned localOutputLength %u > stack buffer %u, capping\n",
+                       localOutputLength, (ULONG)sizeof(localOutputBuffer));
+            localOutputLength = sizeof(localOutputBuffer);
+        }
+
         if (localOutputLength <= OutputBufferSize) {
             NTSTATUS copyStatus = MhpCopyOutputToUser(
                 OutputBuffer,
@@ -3284,6 +3294,13 @@ MhpHandlePushWhitelist(
                 entryTotalSize += entry->ValueLength * sizeof(WCHAR);
             } else if (entry->ValueLength > 259) {
                 rejected++;
+                //
+                // Overflow-safe cursor advancement: cap ValueLength
+                //
+                if (entry->ValueLength > (MAXULONG - sizeof(SHADOWSTRIKE_PUSH_WHITELIST_ENTRY)) / sizeof(WCHAR)) {
+                    rejected += (entryCount - i - 1);
+                    break;
+                }
                 entryTotalSize = sizeof(SHADOWSTRIKE_PUSH_WHITELIST_ENTRY) + entry->ValueLength * sizeof(WCHAR);
                 if (cursor + entryTotalSize <= payloadEnd) {
                     cursor += entryTotalSize;
@@ -4069,6 +4086,13 @@ MhpHandleExclusionUpdate(
         //
         if (entry->ValueLength == 0 || entry->ValueLength > 259) {
             rejected++;
+            //
+            // Overflow-safe cursor advancement
+            //
+            if (entry->ValueLength > (MAXULONG - sizeof(SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY)) / sizeof(WCHAR)) {
+                rejected += (entryCount - i - 1);
+                break;
+            }
             entryTotalSize = sizeof(SHADOWSTRIKE_PUSH_EXCLUSION_ENTRY) + entry->ValueLength * sizeof(WCHAR);
             if (cursor + entryTotalSize <= payloadEnd) {
                 cursor += entryTotalSize;

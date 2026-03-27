@@ -342,6 +342,16 @@ CheckVMwareBackdoor PROC FRAME
     .pushreg rbx
     .endprolog
 
+    ; Validate all 4 pointer parameters — caller must not pass NULL
+    test rcx, rcx
+    jz vmware_backdoor_fail
+    test rdx, rdx
+    jz vmware_backdoor_fail
+    test r8, r8
+    jz vmware_backdoor_fail
+    test r9, r9
+    jz vmware_backdoor_fail
+
     mov r10, rcx                ; Save pEax
     mov r11, rdx                ; Save pEbx
 
@@ -360,6 +370,10 @@ CheckVMwareBackdoor PROC FRAME
     mov dword ptr [r8], ecx
     mov dword ptr [r9], edx
 
+    pop rbx
+    ret
+
+vmware_backdoor_fail:
     pop rbx
     ret
 CheckVMwareBackdoor ENDP

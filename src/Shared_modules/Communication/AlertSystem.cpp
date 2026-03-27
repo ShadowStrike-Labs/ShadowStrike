@@ -1489,9 +1489,15 @@ bool AlertSystemImpl::DeliverSyslog(const Alert& alert) {
 
     if (sspiStatus == SEC_I_CONTINUE_NEEDED && outBuffer.cbBuffer > 0 && outBuffer.pvBuffer) {
         // Send ClientHello
-        send(sock, static_cast<const char*>(outBuffer.pvBuffer),
+        int clientHelloSent = send(sock, static_cast<const char*>(outBuffer.pvBuffer),
              static_cast<int>(outBuffer.cbBuffer), 0);
         FreeContextBuffer(outBuffer.pvBuffer);
+        if (clientHelloSent <= 0) {
+            Utils::Logger::Warn("[AlertSystem] Failed to send ClientHello: {}", WSAGetLastError());
+            DeleteSecurityContext(&ctxtHandle);
+            closesocket(sock);
+            return false;
+        }
         schannelInitialized = true;
 
         // Handshake loop: read server response, call InitializeSecurityContext again
@@ -1652,11 +1658,18 @@ bool AlertSystemImpl::DeliverSyslog(const Alert& alert) {
         const ULONG sendTotal = encBuffers[0].cbBuffer +
                                  encBuffers[1].cbBuffer +
                                  encBuffers[2].cbBuffer;
-        int bytesSent = send(sock, reinterpret_cast<const char*>(tlsBuffer.data()),
-                             static_cast<int>(sendTotal), 0);
-        if (bytesSent <= 0) {
-            Utils::Logger::Warn("[AlertSystem] TLS syslog send failed: {}", WSAGetLastError());
-        } else {
+        const char* sendPtr = reinterpret_cast<const char*>(tlsBuffer.data());
+        int remaining = static_cast<int>(sendTotal);
+        while (remaining > 0) {
+            int bytesSent = send(sock, sendPtr, remaining, 0);
+            if (bytesSent <= 0) {
+                Utils::Logger::Warn("[AlertSystem] TLS syslog send failed: {}", WSAGetLastError());
+                break;
+            }
+            sendPtr += bytesSent;
+            remaining -= bytesSent;
+        }
+        if (remaining == 0) {
             sendSuccess = true;
         }
     } else {
