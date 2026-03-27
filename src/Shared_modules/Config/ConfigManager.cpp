@@ -20,12 +20,14 @@
 #include "../Utils/JSONUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
+#include "../Security/CryptoManager.hpp"
 #include "../Database/ConfigurationDB.hpp"
 
 #include <sstream>
 #include <thread>
 #include <charconv>
 #include <cstring>
+#include <limits>
 
 namespace ShadowStrike {
 namespace Config {
@@ -80,6 +82,12 @@ ConfigValueToDbValue(const ConfigValue& cv) noexcept {
             return Database::ConfigurationDB::ConfigValue{static_cast<int64_t>(*v)};
         }
         if (const auto* v = std::get_if<uint64_t>(&cv)) {
+            if (*v > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                SS_LOG_WARN(L"Config",
+                    L"uint64_t value %llu exceeds int64_t range — storing as double",
+                    *v);
+                return Database::ConfigurationDB::ConfigValue{static_cast<double>(*v)};
+            }
             return Database::ConfigurationDB::ConfigValue{static_cast<int64_t>(*v)};
         }
         if (const auto* v = std::get_if<double>(&cv)) {
@@ -107,7 +115,11 @@ ConfigValueToDbValue(const ConfigValue& cv) noexcept {
             for (const auto& [k, val] : *v) obj[k] = val;
             return Database::ConfigurationDB::ConfigValue{NarrowToWide(obj.dump())};
         }
-    } catch (...) {}
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"Config", L"Exception in ConfigValueToDbValue: %hs", ex.what());
+    } catch (...) {
+        SS_LOG_ERROR(L"Config", L"Unknown exception in ConfigValueToDbValue");
+    }
     return std::nullopt;
 }
 
@@ -134,7 +146,11 @@ ConfigValueToDbValue(const ConfigValue& cv) noexcept {
             }
             return ConfigValue{v->dump()};
         }
-    } catch (...) {}
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"Config", L"Exception in DbValueToConfigValue: %hs", ex.what());
+    } catch (...) {
+        SS_LOG_ERROR(L"Config", L"Unknown exception in DbValueToConfigValue");
+    }
     return ConfigValue{std::monostate{}};
 }
 
@@ -147,7 +163,7 @@ ConfigValueToDbValue(const ConfigValue& cv) noexcept {
 class ConfigManagerImpl {
 public:
     ConfigManagerConfiguration m_config;
-    ConfigStatus m_status{ConfigStatus::Uninitialized};
+    std::atomic<ConfigStatus> m_status{ConfigStatus::Uninitialized};
     std::array<std::map<std::string, ConfigValue>, 7> m_layers;
     std::unordered_map<std::string, ConfigKeyMetadata> m_metadata;
     std::unordered_map<std::string, ValidationCallback> m_validators;
@@ -193,7 +209,43 @@ public:
     }
 
     // ========================================================================
-    // Fire Change Callbacks
+    // Deferred Callback Invocation (avoids deadlock from firing under lock)
+    // ========================================================================
+
+    struct PendingCallbacks {
+        std::vector<std::pair<uint64_t, ChangeCallback>> callbacks;
+        ConfigChangeEvent event;
+    };
+
+    /// Collect callbacks to fire later (called UNDER the lock)
+    [[nodiscard]] PendingCallbacks CollectCallbacks(const ConfigChangeEvent& event) const {
+        PendingCallbacks pending;
+        pending.event = event;
+        for (const auto& [id, cb] : m_globalCallbacks) {
+            if (cb) pending.callbacks.emplace_back(id, cb);
+        }
+        auto it = m_keyCallbacks.find(event.key);
+        if (it != m_keyCallbacks.end()) {
+            for (const auto& [id, cb] : it->second) {
+                if (cb) pending.callbacks.emplace_back(id, cb);
+            }
+        }
+        return pending;
+    }
+
+    /// Fire collected callbacks (called WITHOUT the lock)
+    static void FirePendingCallbacks(const PendingCallbacks& pending) {
+        for (const auto& [id, cb] : pending.callbacks) {
+            try {
+                cb(pending.event);
+            } catch (...) {
+                SS_LOG_WARN(L"Config", L"Change callback %llu threw exception", id);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Fire Change Callbacks (legacy - only safe to call without holding m_mutex)
     // ========================================================================
 
     void FireChangeCallbacks(const ConfigChangeEvent& event) {
@@ -270,112 +322,80 @@ public:
     // ========================================================================
 
     [[nodiscard]] ConfigValue EncryptSensitiveValue(const ConfigValue& value) const {
-        // Only encrypt string types
         const auto* strVal = std::get_if<std::string>(&value);
         if (!strVal) return value;
 
         try {
-            Utils::CryptoUtils::SymmetricCipher cipher(
-                Utils::CryptoUtils::SymmetricAlgorithm::AES_256_GCM);
+            auto& crypto = Security::CryptoManager::Instance();
+            std::span<const uint8_t> plainSpan(
+                reinterpret_cast<const uint8_t*>(strVal->data()), strVal->size());
 
-            std::vector<uint8_t> key;
-            if (!cipher.GenerateKey(key)) {
-                SS_LOG_ERROR(L"Config", L"Failed to generate encryption key for sensitive value");
-                return value;
+            auto protectedData = crypto.DPAPIProtect(plainSpan);
+            if (!protectedData.has_value() || protectedData->empty()) {
+                SS_LOG_ERROR(L"Config",
+                    L"DPAPI protection failed for sensitive config value — "
+                    L"value will NOT be stored to prevent plaintext exposure");
+                return ConfigValue{std::monostate{}};
             }
 
-            std::vector<uint8_t> iv;
-            if (!cipher.GenerateIV(iv)) {
-                SS_LOG_ERROR(L"Config", L"Failed to generate IV for sensitive value");
-                return value;
-            }
-
-            std::vector<uint8_t> ciphertext, tag;
-            auto plainBytes = reinterpret_cast<const uint8_t*>(strVal->data());
-            if (!cipher.EncryptAEAD(plainBytes, strVal->size(),
-                                     nullptr, 0, ciphertext, tag)) {
-                SS_LOG_ERROR(L"Config", L"Failed to encrypt sensitive config value");
-                return value;
-            }
-
-            // Pack as: key_len(4) + key + iv_len(4) + iv + tag_len(4) + tag + ciphertext
+            // Pack as: marker prefix + DPAPI blob
             std::string packed;
-            auto appendU32 = [&](uint32_t n) {
-                packed.append(reinterpret_cast<const char*>(&n), 4);
-            };
-            auto appendBytes = [&](const std::vector<uint8_t>& v) {
-                packed.append(reinterpret_cast<const char*>(v.data()), v.size());
-            };
-            appendU32(static_cast<uint32_t>(key.size()));
-            appendBytes(key);
-            appendU32(static_cast<uint32_t>(iv.size()));
-            appendBytes(iv);
-            appendU32(static_cast<uint32_t>(tag.size()));
-            appendBytes(tag);
-            appendU32(static_cast<uint32_t>(ciphertext.size()));
-            appendBytes(ciphertext);
+            packed.reserve(6 + protectedData->size());
+            packed.append("\x01""DPAPI:");
+            packed.append(reinterpret_cast<const char*>(protectedData->data()),
+                          protectedData->size());
 
-            // Return encrypted payload as a string value with a marker prefix
-            return ConfigValue{std::string("\x01""ENC:" + packed)};
+            return ConfigValue{std::move(packed)};
         } catch (...) {
-            SS_LOG_ERROR(L"Config", L"Exception encrypting sensitive value");
-            return value;
+            SS_LOG_ERROR(L"Config",
+                L"Exception encrypting sensitive value — "
+                L"refusing to store plaintext");
+            return ConfigValue{std::monostate{}};
         }
     }
 
     [[nodiscard]] ConfigValue DecryptSensitiveValue(const ConfigValue& value) const {
         const auto* strVal = std::get_if<std::string>(&value);
-        if (!strVal || strVal->size() < 5) return value;
-        if (strVal->substr(0, 5) != "\x01""ENC:") return value;
+        if (!strVal) return value;
 
-        try {
-            const std::string& packed = *strVal;
-            size_t offset = 5;
-            auto readU32 = [&]() -> uint32_t {
-                if (offset + 4 > packed.size()) return 0;
-                uint32_t n = 0;
-                std::memcpy(&n, packed.data() + offset, 4);
-                offset += 4;
-                return n;
-            };
-            auto readBytes = [&](uint32_t len) -> std::vector<uint8_t> {
-                if (offset + len > packed.size()) return {};
-                std::vector<uint8_t> result(packed.begin() + offset,
-                                            packed.begin() + offset + len);
-                offset += len;
-                return result;
-            };
+        // Support new DPAPI format
+        static constexpr std::string_view kDpapiPrefix = "\x01""DPAPI:";
+        if (strVal->size() > kDpapiPrefix.size() &&
+            strVal->substr(0, kDpapiPrefix.size()) == kDpapiPrefix) {
+            try {
+                auto& crypto = Security::CryptoManager::Instance();
+                const size_t blobOffset = kDpapiPrefix.size();
+                const size_t blobSize = strVal->size() - blobOffset;
 
-            uint32_t keyLen = readU32();
-            auto key = readBytes(keyLen);
-            uint32_t ivLen = readU32();
-            auto iv = readBytes(ivLen);
-            uint32_t tagLen = readU32();
-            auto tag = readBytes(tagLen);
-            uint32_t ctLen = readU32();
-            auto ciphertext = readBytes(ctLen);
+                std::span<const uint8_t> protectedSpan(
+                    reinterpret_cast<const uint8_t*>(strVal->data() + blobOffset),
+                    blobSize);
 
-            Utils::CryptoUtils::SymmetricCipher cipher(
-                Utils::CryptoUtils::SymmetricAlgorithm::AES_256_GCM);
-            if (!cipher.SetKey(key) || !cipher.SetIV(iv)) {
-                SS_LOG_ERROR(L"Config", L"Failed to set key/IV for decryption");
+                auto plainData = crypto.DPAPIUnprotect(protectedSpan);
+                if (!plainData.has_value()) {
+                    SS_LOG_ERROR(L"Config", L"DPAPI unprotection failed for sensitive config value");
+                    return value;
+                }
+
+                return ConfigValue{std::string(plainData->begin(), plainData->end())};
+            } catch (...) {
+                SS_LOG_ERROR(L"Config", L"Exception during DPAPI decryption of sensitive value");
                 return value;
             }
+        }
 
-            std::vector<uint8_t> plaintext;
-            if (!cipher.DecryptAEAD(ciphertext.data(), ciphertext.size(),
-                                     nullptr, 0,
-                                     tag.data(), tag.size(),
-                                     plaintext)) {
-                SS_LOG_ERROR(L"Config", L"Failed to decrypt sensitive config value");
-                return value;
-            }
-
-            return ConfigValue{std::string(plaintext.begin(), plaintext.end())};
-        } catch (...) {
-            SS_LOG_ERROR(L"Config", L"Exception decrypting sensitive value");
+        // Legacy ENC format: fail-closed — do not attempt decryption with
+        // key-alongside-ciphertext scheme. Log and return opaque value.
+        static constexpr std::string_view kLegacyPrefix = "\x01""ENC:";
+        if (strVal->size() > kLegacyPrefix.size() &&
+            strVal->substr(0, kLegacyPrefix.size()) == kLegacyPrefix) {
+            SS_LOG_WARN(L"Config",
+                L"Legacy ENC-format sensitive value detected — "
+                L"re-encrypt with DPAPI by re-setting the value");
             return value;
         }
+
+        return value;
     }
 
     // ========================================================================
@@ -404,52 +424,58 @@ public:
                 auto& db = Database::ConfigurationDB::Instance();
                 if (!db.IsInitialized()) continue;
 
-                std::unique_lock lock(m_mutex);
-                m_status = ConfigStatus::Reloading;
+                std::vector<PendingCallbacks> pendingList;
+                {
+                    std::unique_lock lock(m_mutex);
+                    m_status.store(ConfigStatus::Reloading, std::memory_order_release);
 
-                auto keys = db.GetAllKeys();
-                for (const auto& wideKey : keys) {
-                    auto optVal = db.Get(wideKey);
-                    if (!optVal.has_value()) continue;
+                    auto keys = db.GetAllKeys();
+                    for (const auto& wideKey : keys) {
+                        auto optVal = db.Get(wideKey);
+                        if (!optVal.has_value()) continue;
 
-                    std::string narrowKey = WideToNarrow(wideKey);
-                    auto newValue = DbValueToConfigValue(optVal.value());
-                    auto& defaultLayer = m_layers[static_cast<size_t>(ConfigLayer::Default)];
-                    auto it = defaultLayer.find(narrowKey);
+                        std::string narrowKey = WideToNarrow(wideKey);
+                        auto newValue = DbValueToConfigValue(optVal.value());
+                        auto& defaultLayer = m_layers[static_cast<size_t>(ConfigLayer::Default)];
+                        auto it = defaultLayer.find(narrowKey);
 
-                    bool changed = (it == defaultLayer.end());
-                    if (!changed) {
-                        // Compare indices to detect changes
-                        changed = (it->second.index() != newValue.index());
+                        bool changed = (it == defaultLayer.end());
                         if (!changed) {
-                            // Deep compare via string representation
-                            changed = (ConfigValueToString(it->second) !=
-                                       ConfigValueToString(newValue));
+                            changed = (it->second.index() != newValue.index());
+                            if (!changed) {
+                                changed = (ConfigValueToString(it->second) !=
+                                           ConfigValueToString(newValue));
+                            }
+                        }
+
+                        if (changed) {
+                            ConfigValue oldValue = (it != defaultLayer.end())
+                                ? it->second : ConfigValue{std::monostate{}};
+                            defaultLayer[narrowKey] = newValue;
+
+                            ConfigChangeEvent event;
+                            event.key = narrowKey;
+                            event.oldValue = oldValue;
+                            event.newValue = newValue;
+                            event.layer = ConfigLayer::Default;
+                            event.reason = ChangeReason::HotReload;
+                            event.timestamp = std::chrono::system_clock::now();
+                            event.source = "HotReload";
+                            pendingList.push_back(CollectCallbacks(event));
                         }
                     }
 
-                    if (changed) {
-                        ConfigValue oldValue = (it != defaultLayer.end())
-                            ? it->second : ConfigValue{std::monostate{}};
-                        defaultLayer[narrowKey] = newValue;
-
-                        ConfigChangeEvent event;
-                        event.key = narrowKey;
-                        event.oldValue = oldValue;
-                        event.newValue = newValue;
-                        event.layer = ConfigLayer::Default;
-                        event.reason = ChangeReason::HotReload;
-                        event.timestamp = std::chrono::system_clock::now();
-                        event.source = "HotReload";
-                        FireChangeCallbacks(event);
-                    }
+                    m_stats.hotReloads.fetch_add(1, std::memory_order_relaxed);
+                    m_status.store(ConfigStatus::Running, std::memory_order_release);
                 }
 
-                m_stats.hotReloads.fetch_add(1, std::memory_order_relaxed);
-                m_status = ConfigStatus::Running;
+                // Fire callbacks OUTSIDE the lock
+                for (const auto& pending : pendingList) {
+                    FirePendingCallbacks(pending);
+                }
             } catch (...) {
                 SS_LOG_ERROR(L"Config", L"Exception during hot-reload cycle");
-                m_status = ConfigStatus::Running;
+                m_status.store(ConfigStatus::Running, std::memory_order_release);
             }
         }
 
@@ -495,14 +521,23 @@ ConfigManager::~ConfigManager() {
 // ============================================================================
 
 bool ConfigManager::Initialize(const ConfigManagerConfiguration& config) {
+    if (!config.IsValid()) {
+        SS_LOG_ERROR(L"Config",
+            L"Initialize failed: invalid configuration "
+            L"(hotReloadIntervalMs=%u, maxSnapshots=%u, cacheTtlSeconds=%u, enableCaching=%d)",
+            config.hotReloadIntervalMs, config.maxSnapshots,
+            config.cacheTtlSeconds, config.enableCaching ? 1 : 0);
+        return false;
+    }
+
     std::unique_lock lock(m_impl->m_mutex);
 
-    if (m_impl->m_status == ConfigStatus::Running) {
+    if (m_impl->m_status.load(std::memory_order_acquire) == ConfigStatus::Running) {
         SS_LOG_WARN(L"Config", L"ConfigManager already initialized");
         return true;
     }
 
-    m_impl->m_status = ConfigStatus::Initializing;
+    m_impl->m_status.store(ConfigStatus::Initializing, std::memory_order_release);
     m_impl->m_config = config;
     m_impl->m_stats.startTime = Clock::now();
 
@@ -522,7 +557,7 @@ bool ConfigManager::Initialize(const ConfigManagerConfiguration& config) {
             [this](std::stop_token st) { m_impl->HotReloadLoop(st); });
     }
 
-    m_impl->m_status = ConfigStatus::Running;
+    m_impl->m_status.store(ConfigStatus::Running, std::memory_order_release);
     SS_LOG_INFO(L"Config", L"ConfigManager initialized successfully");
     return true;
 }
@@ -536,11 +571,12 @@ bool ConfigManager::Initialize(const std::wstring& dbPath) {
 void ConfigManager::Shutdown() {
     {
         std::unique_lock lock(m_impl->m_mutex);
-        if (m_impl->m_status == ConfigStatus::Stopped ||
-            m_impl->m_status == ConfigStatus::Uninitialized) {
+        auto currentStatus = m_impl->m_status.load(std::memory_order_acquire);
+        if (currentStatus == ConfigStatus::Stopped ||
+            currentStatus == ConfigStatus::Uninitialized) {
             return;
         }
-        m_impl->m_status = ConfigStatus::Stopping;
+        m_impl->m_status.store(ConfigStatus::Stopping, std::memory_order_release);
     }
 
     SS_LOG_INFO(L"Config", L"ConfigManager shutting down");
@@ -552,21 +588,18 @@ void ConfigManager::Shutdown() {
         m_impl->m_hotReloadThread.join();
     }
 
-    {
-        std::unique_lock lock(m_impl->m_mutex);
-        m_impl->m_status = ConfigStatus::Stopped;
-    }
+    m_impl->m_status.store(ConfigStatus::Stopped, std::memory_order_release);
 
     SS_LOG_INFO(L"Config", L"ConfigManager shutdown complete");
 }
 
 bool ConfigManager::IsInitialized() const noexcept {
-    return m_impl->m_status == ConfigStatus::Running ||
-           m_impl->m_status == ConfigStatus::Reloading;
+    auto s = m_impl->m_status.load(std::memory_order_acquire);
+    return s == ConfigStatus::Running || s == ConfigStatus::Reloading;
 }
 
 ConfigStatus ConfigManager::GetStatus() const noexcept {
-    return m_impl->m_status;
+    return m_impl->m_status.load(std::memory_order_acquire);
 }
 
 // ============================================================================
@@ -721,9 +754,11 @@ bool ConfigManager::SetRawValue(const std::string& key, const ConfigValue& value
         return false;
     }
 
-    // Check read-only / policy locked
+    ConfigManagerImpl::PendingCallbacks pending;
     {
-        std::shared_lock readLock(m_impl->m_mutex);
+        std::unique_lock lock(m_impl->m_mutex);
+
+        // Check read-only / policy locked (under same unique_lock — no TOCTOU)
         auto metaIt = m_impl->m_metadata.find(key);
         if (metaIt != m_impl->m_metadata.end()) {
             if (metaIt->second.isReadOnly &&
@@ -732,37 +767,42 @@ bool ConfigManager::SetRawValue(const std::string& key, const ConfigValue& value
                 return false;
             }
         }
+
+        ConfigValue oldValue = m_impl->ResolveValue(key);
+
+        // Handle sensitive value encryption
+        ConfigValue storeValue = value;
+        if (metaIt != m_impl->m_metadata.end() && metaIt->second.isSensitive &&
+            m_impl->m_config.encryptSensitiveValues) {
+            storeValue = m_impl->EncryptSensitiveValue(value);
+            if (std::holds_alternative<std::monostate>(storeValue)) {
+                SS_LOG_ERROR(L"Config",
+                    L"Refusing to store sensitive key '%hs': encryption failed", key.c_str());
+                return false;
+            }
+        }
+
+        m_impl->m_layers[static_cast<size_t>(layer)][key] = storeValue;
+
+        // Persist to DB for User and System layers
+        if (layer == ConfigLayer::User || layer == ConfigLayer::System) {
+            m_impl->PersistToDb(key, value);
+        }
+
+        // Collect callbacks to fire OUTSIDE the lock
+        ConfigChangeEvent event;
+        event.key = key;
+        event.oldValue = oldValue;
+        event.newValue = value;
+        event.layer = layer;
+        event.reason = ChangeReason::UserModification;
+        event.timestamp = std::chrono::system_clock::now();
+        event.source = "SetRawValue";
+        pending = m_impl->CollectCallbacks(event);
     }
 
-    std::unique_lock lock(m_impl->m_mutex);
-
-    ConfigValue oldValue = m_impl->ResolveValue(key);
-
-    // Handle sensitive value encryption
-    ConfigValue storeValue = value;
-    auto metaIt = m_impl->m_metadata.find(key);
-    if (metaIt != m_impl->m_metadata.end() && metaIt->second.isSensitive &&
-        m_impl->m_config.encryptSensitiveValues) {
-        storeValue = m_impl->EncryptSensitiveValue(value);
-    }
-
-    m_impl->m_layers[static_cast<size_t>(layer)][key] = storeValue;
-
-    // Persist to DB for User and System layers
-    if (layer == ConfigLayer::User || layer == ConfigLayer::System) {
-        m_impl->PersistToDb(key, value);
-    }
-
-    // Fire change callbacks
-    ConfigChangeEvent event;
-    event.key = key;
-    event.oldValue = oldValue;
-    event.newValue = value;
-    event.layer = layer;
-    event.reason = ChangeReason::UserModification;
-    event.timestamp = std::chrono::system_clock::now();
-    event.source = "SetRawValue";
-    m_impl->FireChangeCallbacks(event);
+    // Fire callbacks outside lock to prevent deadlock
+    ConfigManagerImpl::FirePendingCallbacks(pending);
 
     SS_LOG_DEBUG(L"Config", L"Set key '%hs' in layer %hs",
                  key.c_str(), std::string(GetConfigLayerName(layer)).c_str());
@@ -786,23 +826,28 @@ ValueType ConfigManager::GetValueType(const std::string& key) const {
 bool ConfigManager::DeleteValue(const std::string& key, ConfigLayer layer) {
     if (key.empty() || static_cast<uint8_t>(layer) > 6) return false;
 
-    std::unique_lock lock(m_impl->m_mutex);
-    auto& layerMap = m_impl->m_layers[static_cast<size_t>(layer)];
-    auto it = layerMap.find(key);
-    if (it == layerMap.end()) return false;
+    ConfigManagerImpl::PendingCallbacks pending;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
+        auto& layerMap = m_impl->m_layers[static_cast<size_t>(layer)];
+        auto it = layerMap.find(key);
+        if (it == layerMap.end()) return false;
 
-    ConfigValue oldValue = it->second;
-    layerMap.erase(it);
+        ConfigValue oldValue = it->second;
+        layerMap.erase(it);
 
-    ConfigChangeEvent event;
-    event.key = key;
-    event.oldValue = oldValue;
-    event.newValue = ConfigValue{std::monostate{}};
-    event.layer = layer;
-    event.reason = ChangeReason::Reset;
-    event.timestamp = std::chrono::system_clock::now();
-    event.source = "DeleteValue";
-    m_impl->FireChangeCallbacks(event);
+        ConfigChangeEvent event;
+        event.key = key;
+        event.oldValue = oldValue;
+        event.newValue = ConfigValue{std::monostate{}};
+        event.layer = layer;
+        event.reason = ChangeReason::Reset;
+        event.timestamp = std::chrono::system_clock::now();
+        event.source = "DeleteValue";
+        pending = m_impl->CollectCallbacks(event);
+    }
+
+    ConfigManagerImpl::FirePendingCallbacks(pending);
 
     SS_LOG_DEBUG(L"Config", L"Deleted key '%hs' from layer %hs",
                  key.c_str(), std::string(GetConfigLayerName(layer)).c_str());
@@ -854,13 +899,71 @@ std::map<std::string, ConfigValue> ConfigManager::GetAllValues(ConfigLayer layer
 bool ConfigManager::SetMultipleValues(
     const std::map<std::string, ConfigValue>& values, ConfigLayer layer) {
 
-    bool allOk = true;
-    for (const auto& [key, value] : values) {
-        if (!SetRawValue(key, value, layer)) {
-            allOk = false;
+    if (static_cast<uint8_t>(layer) > 6) {
+        SS_LOG_ERROR(L"Config", L"SetMultipleValues failed: invalid layer");
+        return false;
+    }
+
+    std::vector<ConfigManagerImpl::PendingCallbacks> pendingList;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
+
+        // Validate all keys first (fail-fast, no partial writes)
+        for (const auto& [key, value] : values) {
+            if (key.empty() || key.size() > ConfigConstants::MAX_KEY_LENGTH) {
+                SS_LOG_ERROR(L"Config",
+                    L"SetMultipleValues: invalid key '%hs' — aborting batch", key.c_str());
+                return false;
+            }
+            auto metaIt = m_impl->m_metadata.find(key);
+            if (metaIt != m_impl->m_metadata.end() && metaIt->second.isReadOnly &&
+                layer != ConfigLayer::Default && layer != ConfigLayer::Override) {
+                SS_LOG_ERROR(L"Config",
+                    L"SetMultipleValues: read-only key '%hs' — aborting batch", key.c_str());
+                return false;
+            }
+        }
+
+        // All validation passed — apply atomically
+        for (const auto& [key, value] : values) {
+            m_impl->m_stats.totalWrites.fetch_add(1, std::memory_order_relaxed);
+            ConfigValue oldValue = m_impl->ResolveValue(key);
+
+            ConfigValue storeValue = value;
+            auto metaIt = m_impl->m_metadata.find(key);
+            if (metaIt != m_impl->m_metadata.end() && metaIt->second.isSensitive &&
+                m_impl->m_config.encryptSensitiveValues) {
+                storeValue = m_impl->EncryptSensitiveValue(value);
+                if (std::holds_alternative<std::monostate>(storeValue)) {
+                    SS_LOG_ERROR(L"Config",
+                        L"SetMultipleValues: encryption failed for '%hs'", key.c_str());
+                    continue;
+                }
+            }
+
+            m_impl->m_layers[static_cast<size_t>(layer)][key] = storeValue;
+
+            if (layer == ConfigLayer::User || layer == ConfigLayer::System) {
+                m_impl->PersistToDb(key, value);
+            }
+
+            ConfigChangeEvent event;
+            event.key = key;
+            event.oldValue = oldValue;
+            event.newValue = value;
+            event.layer = layer;
+            event.reason = ChangeReason::UserModification;
+            event.timestamp = std::chrono::system_clock::now();
+            event.source = "SetMultipleValues";
+            pendingList.push_back(m_impl->CollectCallbacks(event));
         }
     }
-    return allOk;
+
+    // Fire all callbacks outside the lock
+    for (const auto& pending : pendingList) {
+        ConfigManagerImpl::FirePendingCallbacks(pending);
+    }
+    return true;
 }
 
 // ============================================================================
@@ -917,9 +1020,9 @@ void ConfigManager::Reload() {
     SS_LOG_INFO(L"Config", L"Manual reload requested");
 
     std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_status = ConfigStatus::Reloading;
+    m_impl->m_status.store(ConfigStatus::Reloading, std::memory_order_release);
     m_impl->LoadFromDb();
-    m_impl->m_status = ConfigStatus::Running;
+    m_impl->m_status.store(ConfigStatus::Running, std::memory_order_release);
     m_impl->m_stats.hotReloads.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -927,7 +1030,7 @@ void ConfigManager::ForceReload() {
     SS_LOG_INFO(L"Config", L"Force reload requested — clearing all layers");
 
     std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_status = ConfigStatus::Reloading;
+    m_impl->m_status.store(ConfigStatus::Reloading, std::memory_order_release);
 
     // Clear all layers and re-load from DB
     for (auto& layer : m_impl->m_layers) {
@@ -935,7 +1038,7 @@ void ConfigManager::ForceReload() {
     }
 
     m_impl->LoadFromDb();
-    m_impl->m_status = ConfigStatus::Running;
+    m_impl->m_status.store(ConfigStatus::Running, std::memory_order_release);
     m_impl->m_stats.hotReloads.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1038,19 +1141,23 @@ ValidationResult ConfigManager::ValidateValue(
 
 std::vector<ConfigValidationError> ConfigManager::ValidateAll() const {
     std::vector<ConfigValidationError> errors;
-    std::shared_lock lock(m_impl->m_mutex);
 
-    for (const auto& [key, meta] : m_impl->m_metadata) {
-        ConfigValue val = m_impl->ResolveValue(key);
-        if (std::holds_alternative<std::monostate>(val)) {
-            continue; // Key not set, skip
+    // Snapshot keys and their resolved values under lock to avoid
+    // iterator invalidation when releasing/re-acquiring the lock.
+    std::vector<std::pair<std::string, ConfigValue>> keysToValidate;
+    {
+        std::shared_lock lock(m_impl->m_mutex);
+        for (const auto& [key, meta] : m_impl->m_metadata) {
+            ConfigValue val = m_impl->ResolveValue(key);
+            if (!std::holds_alternative<std::monostate>(val)) {
+                keysToValidate.emplace_back(key, std::move(val));
+            }
         }
+    }
 
-        // Temporarily release shared lock for ValidateValue which takes its own
-        lock.unlock();
+    // Validate each key outside the lock (ValidateValue acquires its own lock)
+    for (const auto& [key, val] : keysToValidate) {
         auto result = ValidateValue(key, val);
-        lock.lock();
-
         if (result != ValidationResult::Valid) {
             ConfigValidationError err;
             err.key = key;
@@ -1102,28 +1209,36 @@ uint64_t ConfigManager::CreateSnapshot(const std::string& description) {
 }
 
 bool ConfigManager::RestoreSnapshot(uint64_t snapshotId) {
-    std::unique_lock lock(m_impl->m_mutex);
+    std::vector<ConfigManagerImpl::PendingCallbacks> pendingList;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
 
-    auto it = m_impl->m_snapshots.find(snapshotId);
-    if (it == m_impl->m_snapshots.end()) {
-        SS_LOG_ERROR(L"Config", L"Snapshot #%llu not found", snapshotId);
-        return false;
+        auto it = m_impl->m_snapshots.find(snapshotId);
+        if (it == m_impl->m_snapshots.end()) {
+            SS_LOG_ERROR(L"Config", L"Snapshot #%llu not found", snapshotId);
+            return false;
+        }
+
+        auto& userLayer = m_impl->m_layers[static_cast<size_t>(ConfigLayer::User)];
+        userLayer = it->second.values;
+
+        // Collect callbacks for restored keys
+        for (const auto& [key, val] : userLayer) {
+            ConfigChangeEvent event;
+            event.key = key;
+            event.oldValue = ConfigValue{std::monostate{}};
+            event.newValue = val;
+            event.layer = ConfigLayer::User;
+            event.reason = ChangeReason::Rollback;
+            event.timestamp = std::chrono::system_clock::now();
+            event.source = "RestoreSnapshot";
+            pendingList.push_back(m_impl->CollectCallbacks(event));
+        }
     }
 
-    auto& userLayer = m_impl->m_layers[static_cast<size_t>(ConfigLayer::User)];
-    userLayer = it->second.values;
-
-    // Fire callbacks for restored keys
-    for (const auto& [key, val] : userLayer) {
-        ConfigChangeEvent event;
-        event.key = key;
-        event.oldValue = ConfigValue{std::monostate{}};
-        event.newValue = val;
-        event.layer = ConfigLayer::User;
-        event.reason = ChangeReason::Rollback;
-        event.timestamp = std::chrono::system_clock::now();
-        event.source = "RestoreSnapshot";
-        m_impl->FireChangeCallbacks(event);
+    // Fire callbacks outside the lock
+    for (const auto& pending : pendingList) {
+        ConfigManagerImpl::FirePendingCallbacks(pending);
     }
 
     SS_LOG_INFO(L"Config", L"Restored snapshot #%llu", snapshotId);
@@ -1282,9 +1397,26 @@ bool ConfigManager::ImportFromJson(const std::string& json, ConfigLayer targetLa
 bool ConfigManager::ExportToFile(const fs::path& filePath,
                                   const ConfigIOOptions& options) const {
     try {
+        // Path validation: canonicalize and reject traversal attempts
+        std::error_code ec;
+        fs::path canonical = fs::weakly_canonical(filePath, ec);
+        if (ec) {
+            SS_LOG_ERROR(L"Config",
+                L"ExportToFile: path canonicalization failed for '%ls': %hs",
+                filePath.wstring().c_str(), ec.message().c_str());
+            return false;
+        }
+
+        // Reject paths containing suspicious components
+        std::wstring pathStr = canonical.wstring();
+        if (pathStr.find(L"..") != std::wstring::npos) {
+            SS_LOG_ERROR(L"Config",
+                L"ExportToFile: path traversal detected in '%ls'", pathStr.c_str());
+            return false;
+        }
+
         std::string json = ExportToJson(options);
-        std::wstring widePath = filePath.wstring();
-        if (!Utils::FileUtils::WriteAllTextUtf8Atomic(widePath, json)) {
+        if (!Utils::FileUtils::WriteAllTextUtf8Atomic(pathStr, json)) {
             SS_LOG_ERROR(L"Config", L"ExportToFile: failed to write file");
             return false;
         }
@@ -1298,9 +1430,39 @@ bool ConfigManager::ExportToFile(const fs::path& filePath,
 
 bool ConfigManager::ImportFromFile(const fs::path& filePath, ConfigLayer targetLayer) {
     try {
+        // Path validation: canonicalize and reject traversal attempts
+        std::error_code ec;
+        fs::path canonical = fs::canonical(filePath, ec);
+        if (ec) {
+            SS_LOG_ERROR(L"Config",
+                L"ImportFromFile: path canonicalization failed for '%ls': %hs",
+                filePath.wstring().c_str(), ec.message().c_str());
+            return false;
+        }
+
+        std::wstring pathStr = canonical.wstring();
+        if (pathStr.find(L"..") != std::wstring::npos) {
+            SS_LOG_ERROR(L"Config",
+                L"ImportFromFile: path traversal detected in '%ls'", pathStr.c_str());
+            return false;
+        }
+
+        // Verify file exists and has reasonable size
+        auto fileSize = fs::file_size(canonical, ec);
+        if (ec || fileSize == 0) {
+            SS_LOG_ERROR(L"Config", L"ImportFromFile: file does not exist or is empty");
+            return false;
+        }
+        constexpr uintmax_t kMaxImportSize = 10 * 1024 * 1024; // 10 MB
+        if (fileSize > kMaxImportSize) {
+            SS_LOG_ERROR(L"Config",
+                L"ImportFromFile: file too large (%llu bytes, max %llu)",
+                fileSize, kMaxImportSize);
+            return false;
+        }
+
         std::string content;
-        std::wstring widePath = filePath.wstring();
-        if (!Utils::FileUtils::ReadAllTextUtf8(widePath, content)) {
+        if (!Utils::FileUtils::ReadAllTextUtf8(pathStr, content)) {
             SS_LOG_ERROR(L"Config", L"ImportFromFile: failed to read file");
             return false;
         }
@@ -1316,27 +1478,35 @@ bool ConfigManager::ImportFromFile(const fs::path& filePath, ConfigLayer targetL
 // ============================================================================
 
 void ConfigManager::ResetToDefaults(ConfigLayer layer) {
-    std::unique_lock lock(m_impl->m_mutex);
-
     if (static_cast<uint8_t>(layer) > 6) return;
 
-    auto& layerMap = m_impl->m_layers[static_cast<size_t>(layer)];
-    auto oldValues = std::move(layerMap);
-    layerMap.clear();
+    std::vector<ConfigManagerImpl::PendingCallbacks> pendingList;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
 
-    // Fire callbacks for cleared keys
-    for (const auto& [key, val] : oldValues) {
-        if (std::holds_alternative<std::monostate>(val)) continue;
+        auto& layerMap = m_impl->m_layers[static_cast<size_t>(layer)];
+        auto oldValues = std::move(layerMap);
+        layerMap.clear();
 
-        ConfigChangeEvent event;
-        event.key = key;
-        event.oldValue = val;
-        event.newValue = ConfigValue{std::monostate{}};
-        event.layer = layer;
-        event.reason = ChangeReason::Reset;
-        event.timestamp = std::chrono::system_clock::now();
-        event.source = "ResetToDefaults";
-        m_impl->FireChangeCallbacks(event);
+        // Collect callbacks for cleared keys
+        for (const auto& [key, val] : oldValues) {
+            if (std::holds_alternative<std::monostate>(val)) continue;
+
+            ConfigChangeEvent event;
+            event.key = key;
+            event.oldValue = val;
+            event.newValue = ConfigValue{std::monostate{}};
+            event.layer = layer;
+            event.reason = ChangeReason::Reset;
+            event.timestamp = std::chrono::system_clock::now();
+            event.source = "ResetToDefaults";
+            pendingList.push_back(m_impl->CollectCallbacks(event));
+        }
+    }
+
+    // Fire callbacks outside the lock
+    for (const auto& pending : pendingList) {
+        ConfigManagerImpl::FirePendingCallbacks(pending);
     }
 
     SS_LOG_INFO(L"Config", L"Reset layer %hs to defaults",
@@ -1346,24 +1516,29 @@ void ConfigManager::ResetToDefaults(ConfigLayer layer) {
 bool ConfigManager::ResetKeyToDefault(const std::string& key) {
     if (key.empty()) return false;
 
-    std::unique_lock lock(m_impl->m_mutex);
+    ConfigManagerImpl::PendingCallbacks pending;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
 
-    // Remove from all layers except Default
-    for (int i = 1; i <= 6; ++i) {
-        m_impl->m_layers[static_cast<size_t>(i)].erase(key);
+        // Remove from all layers except Default
+        for (int i = 1; i <= 6; ++i) {
+            m_impl->m_layers[static_cast<size_t>(i)].erase(key);
+        }
+
+        // Collect callback
+        ConfigValue resolved = m_impl->ResolveValue(key);
+        ConfigChangeEvent event;
+        event.key = key;
+        event.oldValue = ConfigValue{std::monostate{}};
+        event.newValue = resolved;
+        event.layer = ConfigLayer::Default;
+        event.reason = ChangeReason::Reset;
+        event.timestamp = std::chrono::system_clock::now();
+        event.source = "ResetKeyToDefault";
+        pending = m_impl->CollectCallbacks(event);
     }
 
-    // Fire callback
-    ConfigValue resolved = m_impl->ResolveValue(key);
-    ConfigChangeEvent event;
-    event.key = key;
-    event.oldValue = ConfigValue{std::monostate{}};
-    event.newValue = resolved;
-    event.layer = ConfigLayer::Default;
-    event.reason = ChangeReason::Reset;
-    event.timestamp = std::chrono::system_clock::now();
-    event.source = "ResetKeyToDefault";
-    m_impl->FireChangeCallbacks(event);
+    ConfigManagerImpl::FirePendingCallbacks(pending);
 
     SS_LOG_DEBUG(L"Config", L"Reset key '%hs' to default", key.c_str());
     return true;
@@ -1436,7 +1611,7 @@ void ConfigManager::RegisterErrorCallback(ErrorCallback callback) {
 // ============================================================================
 
 ConfigStatistics ConfigManager::GetStatistics() const {
-    std::shared_lock lock(m_impl->m_rwMutex);
+    std::shared_lock lock(m_impl->m_mutex);
     return m_impl->m_stats;
 }
 

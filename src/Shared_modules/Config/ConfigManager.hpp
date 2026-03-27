@@ -698,10 +698,10 @@ public:
     // ========================================================================
     
     /// @brief Register change callback
-    uint64_t RegisterChangeCallback(ChangeCallback callback);
+    [[nodiscard]] uint64_t RegisterChangeCallback(ChangeCallback callback);
     
     /// @brief Register callback for specific key
-    uint64_t RegisterKeyChangeCallback(const std::string& key, ChangeCallback callback);
+    [[nodiscard]] uint64_t RegisterKeyChangeCallback(const std::string& key, ChangeCallback callback);
     
     /// @brief Unregister callback
     void UnregisterCallback(uint64_t callbackId);
