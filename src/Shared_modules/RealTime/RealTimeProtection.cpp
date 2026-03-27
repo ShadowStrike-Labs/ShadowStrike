@@ -52,6 +52,11 @@
 #include "ZeroHourProtection.hpp"
 
 // ============================================================================
+// EXPLOIT DETECTOR INCLUDES
+// ============================================================================
+#include "../Exploits/HeapSprayDetector.hpp"
+
+// ============================================================================
 // ANTI-EVASION DETECTOR INCLUDES
 // ============================================================================
 #include "../AntiEvasion/DebuggerEvasionDetector.hpp"
@@ -1048,6 +1053,22 @@ public:
             }
         }
 
+        // HeapSprayDetector (singleton — initialize + start monitoring engine)
+        try {
+            auto& hsd = Exploits::HeapSprayDetector::Instance();
+            if (hsd.Initialize()) {
+                if (!hsd.Start()) {
+                    Utils::Logger::Warn(L"RealTimeProtection: HeapSprayDetector Start failed");
+                }
+            } else {
+                Utils::Logger::Warn(L"RealTimeProtection: HeapSprayDetector Initialize failed");
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("RealTimeProtection: HeapSprayDetector exception: {}", e.what());
+        } catch (...) {
+            Utils::Logger::Error("RealTimeProtection: HeapSprayDetector unknown exception");
+        }
+
         Utils::Logger::Info(L"RealTimeProtection: Components started");
     }
 
@@ -1080,6 +1101,8 @@ public:
 
         try { ZeroHourProtection::Instance().Stop(); } catch (...) {}
         SetComponentState(ComponentType::ZERO_HOUR, ComponentState::STOPPED);
+
+        try { Exploits::HeapSprayDetector::Instance().Shutdown(); } catch (...) {}
 
         Utils::Logger::Info(L"RealTimeProtection: Components stopped");
     }
