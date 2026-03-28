@@ -1,0 +1,503 @@
+diff --git a/src/Shared_modules/HashStore/HashStore_query_operations.cpp b/src/Shared_modules/HashStore/HashStore_query_operations.cpp
+index 9a0dcb5..debdace 100644
+--- a/src/Shared_modules/HashStore/HashStore_query_operations.cpp
++++ b/src/Shared_modules/HashStore/HashStore_query_operations.cpp
+@@ -22,9 +22,10 @@
+ #include<tlsh/tlsh.h>
+ #include "../FuzzyHasher/FuzzyHasher.hpp"
+ #include <format>
++#include <numeric>
+ 
+ namespace ShadowStrike {
+-	namespace SignatureStore {
++	namespace HashStore {
+         // ============================================================================
+         // QUERY OPERATIONS 
+         // ============================================================================
+@@ -35,12 +36,24 @@ namespace ShadowStrike {
+                 return std::nullopt;
+             }
+ 
+-            // Validate hash input
++            // Validate hash input ÔÇö generic bounds check
+             if (hash.length == 0 || hash.length > 64) {
+                 SS_LOG_DEBUG(L"HashStore", L"LookupHash: Invalid hash length %u", hash.length);
+                 return std::nullopt;
+             }
+ 
++            // Type-specific length validation for fixed-length hash types.
++            // Variable-length types (FUZZY, TLSH) skip this ÔÇö their lengths vary.
++            if (hash.type != HashType::FUZZY && hash.type != HashType::TLSH) {
++                const uint8_t expectedLen = GetHashLengthForType(hash.type);
++                if (expectedLen > 0 && hash.length != expectedLen) {
++                    SS_LOG_DEBUG(L"HashStore",
++                        L"LookupHash: Hash length %u does not match expected %u for type %u",
++                        hash.length, expectedLen, static_cast<uint8_t>(hash.type));
++                    return std::nullopt;
++                }
++            }
++
+             m_totalLookups.fetch_add(1, std::memory_order_relaxed);
+ 
+             LARGE_INTEGER startTime{};
+@@ -71,22 +84,29 @@ namespace ShadowStrike {
+ 
+             auto signatureOffset = bucket->Lookup(hash);
+             if (!signatureOffset.has_value()) {
+-                // Cache negative result to avoid repeated lookups
+-                if (m_cachingEnabled.load(std::memory_order_acquire)) {
+-                    AddToCache(hash, std::nullopt);
+-                }
++                // NOTE: We intentionally do NOT cache negative results here.
++                // GetFromCache() returns std::optional<DetectionResult> which cannot
++                // distinguish "cache miss" from "cached negative" ÔÇö both are std::nullopt.
++                // Storing negatives would only waste cache slots without ever serving hits.
++                // HEADER PATCH NEEDED: Change GetFromCache return type to
++                // std::optional<std::optional<DetectionResult>> to enable negative caching.
+                 return std::nullopt;
+             }
+ 
+             // Build detection result
+             DetectionResult result = BuildDetectionResult(hash, *signatureOffset);
+ 
+-            // Performance tracking
++            // Performance tracking (overflow-safe nanosecond computation)
+             LARGE_INTEGER endTime{};
+-            if (QueryPerformanceCounter(&endTime) && m_perfFrequency.QuadPart > 0) {
+-                result.matchTimeNanoseconds =
+-                    ((endTime.QuadPart - startTime.QuadPart) * 1000000000ULL) /
+-                    static_cast<uint64_t>(m_perfFrequency.QuadPart);
++            if (QueryPerformanceCounter(&endTime) && m_perfFrequency.QuadPart > 0 &&
++                endTime.QuadPart >= startTime.QuadPart && startTime.QuadPart > 0) {
++                const uint64_t elapsed = static_cast<uint64_t>(endTime.QuadPart - startTime.QuadPart);
++                const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
++                if (elapsed <= UINT64_MAX / 1000000000ULL) {
++                    result.matchTimeNanoseconds = (elapsed * 1000000000ULL) / freq;
++                } else {
++                    result.matchTimeNanoseconds = (elapsed / freq) * 1000000000ULL;
++                }
+             }
+ 
+             // Cache result
+@@ -116,6 +136,19 @@ namespace ShadowStrike {
+                 return std::nullopt;
+             }
+ 
++            // Validate expected hex string length for fixed-length types.
++            // Hex encoding doubles the byte length (e.g., MD5=16 bytes ÔåÆ 32 hex chars).
++            if (type != HashType::FUZZY && type != HashType::TLSH) {
++                const size_t expectedHexLen = static_cast<size_t>(GetHashLengthForType(type)) * 2;
++                if (expectedHexLen > 0 && hashStr.length() != expectedHexLen) {
++                    SS_LOG_ERROR(L"HashStore",
++                        L"LookupHashString: Hash string length %zu does not match "
++                        L"expected %zu hex chars for type %u",
++                        hashStr.length(), expectedHexLen, static_cast<uint8_t>(type));
++                    return std::nullopt;
++                }
++            }
++
+             auto hash = Format::ParseHashString(hashStr, type);
+             if (!hash.has_value()) {
+                 SS_LOG_ERROR(L"HashStore", L"Failed to parse hash string: %S", hashStr.c_str());
+@@ -131,12 +164,11 @@ namespace ShadowStrike {
+         ) const noexcept {
+             std::vector<DetectionResult> results;
+ 
+-            // Early exit for empty input
+-            if (hashes.empty()) {
++            if (hashes.empty() || !m_initialized.load(std::memory_order_acquire)) {
+                 return results;
+             }
+ 
+-            // DoS protection - limit batch size
++            // DoS protection ÔÇö cap batch size
+             constexpr size_t MAX_BATCH_LOOKUP_SIZE = 100000;
+             const size_t limitedSize = std::min(hashes.size(), MAX_BATCH_LOOKUP_SIZE);
+ 
+@@ -150,36 +182,78 @@ namespace ShadowStrike {
+                 results.reserve(std::min(limitedSize, static_cast<size_t>(options.maxResults)));
+             }
+             catch (const std::bad_alloc&) {
+-                SS_LOG_ERROR(L"HashStore", L"BatchLookup: Memory allocation failed");
++                SS_LOG_ERROR(L"HashStore",
++                    L"BatchLookup: Reserve failed for %zu results",
++                    std::min(limitedSize, static_cast<size_t>(options.maxResults)));
+                 return results;
+             }
+ 
++            // CRITICAL: Acquire the shared lock ONCE for the entire batch.
++            // DO NOT call LookupHash() from within this lock ÔÇö it also acquires
++            // m_globalLock and std::shared_mutex is NOT recursive per the C++ standard.
++            // Recursive shared acquisition is undefined behavior (even if MSVC's SRWLOCK
++            // tolerates it, we must not rely on implementation-specific behavior).
+             std::shared_lock<std::shared_mutex> lock(m_globalLock);
+ 
+             for (size_t i = 0; i < limitedSize; ++i) {
+                 const auto& hash = hashes[i];
+ 
+-                // Validate each hash
+                 if (hash.length == 0 || hash.length > 64) {
+                     continue;
+                 }
+ 
+-                auto result = LookupHash(hash);
+-                if (result.has_value()) {
+-                    // Apply filters
+-                    if (result->threatLevel >= options.minThreatLevel) {
+-                        try {
+-                            results.push_back(*result);
+-                        }
+-                        catch (const std::bad_alloc&) {
+-                            SS_LOG_ERROR(L"HashStore", L"BatchLookup: Memory allocation failed");
+-                            break;
+-                        }
++                // Type-specific length validation for fixed-length types
++                if (hash.type != HashType::FUZZY && hash.type != HashType::TLSH) {
++                    const uint8_t expectedLen = GetHashLengthForType(hash.type);
++                    if (expectedLen > 0 && hash.length != expectedLen) {
++                        continue;
++                    }
++                }
+ 
+-                        if (results.size() >= options.maxResults) {
+-                            break; // Hit limit
++                m_totalLookups.fetch_add(1, std::memory_order_relaxed);
++
++                // Check cache first (lock-free via SeqLock ÔÇö no mutex needed)
++                if (m_cachingEnabled.load(std::memory_order_acquire)) {
++                    auto cached = GetFromCache(hash);
++                    if (cached.has_value()) {
++                        m_cacheHits.fetch_add(1, std::memory_order_relaxed);
++                        if (cached->threatLevel >= options.minThreatLevel) {
++                            try {
++                                results.push_back(std::move(*cached));
++                            } catch (const std::bad_alloc&) {
++                                SS_LOG_ERROR(L"HashStore", L"BatchLookup: Allocation failure");
++                                break;
++                            }
++                            if (results.size() >= options.maxResults) break;
+                         }
++                        continue;
++                    }
++                    m_cacheMisses.fetch_add(1, std::memory_order_relaxed);
++                }
++
++                // Lookup in appropriate bucket (already under shared lock)
++                const HashBucket* bucket = GetBucket(hash.type);
++                if (!bucket) continue;
++
++                auto signatureOffset = bucket->Lookup(hash);
++                if (!signatureOffset.has_value()) {
++                    continue;
++                }
++
++                DetectionResult result = BuildDetectionResult(hash, *signatureOffset);
++
++                if (m_cachingEnabled.load(std::memory_order_acquire)) {
++                    AddToCache(hash, result);
++                }
++
++                if (result.threatLevel >= options.minThreatLevel) {
++                    try {
++                        results.push_back(std::move(result));
++                    } catch (const std::bad_alloc&) {
++                        SS_LOG_ERROR(L"HashStore", L"BatchLookup: Allocation failure");
++                        break;
+                     }
++                    if (results.size() >= options.maxResults) break;
+                 }
+             }
+ 
+@@ -187,7 +261,22 @@ namespace ShadowStrike {
+         }
+ 
+         bool HashStore::Contains(const HashValue& hash) const noexcept {
+-            return LookupHash(hash).has_value();
++            if (!m_initialized.load(std::memory_order_acquire)) {
++                return false;
++            }
++            if (hash.length == 0 || hash.length > 64) {
++                return false;
++            }
++
++            // Use per-bucket Contains() which leverages the bloom filter fast path.
++            // This avoids the full index lookup, cache operations, and DetectionResult
++            // construction that LookupHash() would perform.
++            std::shared_lock<std::shared_mutex> lock(m_globalLock);
++            const HashBucket* bucket = GetBucket(hash.type);
++            if (!bucket) {
++                return false;
++            }
++            return bucket->Contains(hash);
+         }
+ 
+         std::vector<DetectionResult> HashStore::FuzzyMatch(
+@@ -196,6 +285,10 @@ namespace ShadowStrike {
+         ) const noexcept {
+             std::vector<DetectionResult> results;
+ 
++            // Track similarity scores in parallel with results for proper sort ordering.
++            // DetectionResult has no similarity field (HEADER PATCH NEEDED to add one).
++            std::vector<int32_t> resultSimilarities;
++
+             // ========================================================================
+             // STEP 1: CRITICAL INPUT VALIDATION
+             // ========================================================================
+@@ -231,7 +324,7 @@ namespace ShadowStrike {
+             }
+ 
+             // Fuzzy/TLSH can have longer variable-length hashes
+-            constexpr uint8_t MAX_FUZZY_HASH_LEN = 128;  // Increased for fuzzy hashes
++            constexpr uint8_t MAX_FUZZY_HASH_LEN = 64;   // Must not exceed HashValue::data array size
+             if (hash.length > MAX_FUZZY_HASH_LEN) {
+                 SS_LOG_ERROR(L"HashStore",
+                     L"FuzzyMatch: Hash length %u exceeds maximum %u",
+@@ -289,14 +382,16 @@ namespace ShadowStrike {
+             // STEP 4: PREPARE HASH FOR COMPARISON (Native Library Format)
+             // ========================================================================
+ 
+-            // Use larger buffer for fuzzy hashes (CTPH/TLSH can be longer)
++            // Copy hash data into null-terminated buffer for string-based comparison APIs.
+             std::array<char, 256> hashBuffer{};
+-            // Ensure we don't copy more than buffer can hold minus null terminator
+-            const size_t maxCopyLen = hashBuffer.size() - 1;
+-            const size_t copyLen = std::min(static_cast<size_t>(hash.length), maxCopyLen);
+-            if (copyLen > 0 && copyLen <= hash.data.size()) {
+-                std::memcpy(hashBuffer.data(), hash.data.data(), copyLen);
++            const size_t copyLen = static_cast<size_t>(hash.length);
++            if (copyLen == 0 || copyLen > hash.data.size()) {
++                SS_LOG_ERROR(L"HashStore",
++                    L"FuzzyMatch: Hash length %u exceeds data array capacity %zu",
++                    hash.length, hash.data.size());
++                return results;
+             }
++            std::memcpy(hashBuffer.data(), hash.data.data(), copyLen);
+             hashBuffer[copyLen] = '\0';
+ 
+             const char* hashString = hashBuffer.data();
+@@ -327,7 +422,12 @@ namespace ShadowStrike {
+             // ========================================================================
+ 
+             std::vector<std::pair<uint64_t, HashValue>> candidates;
+-            candidates.reserve(10000);
++            try {
++                candidates.reserve(10000);
++            } catch (const std::bad_alloc&) {
++                SS_LOG_ERROR(L"HashStore", L"FuzzyMatch: Failed to reserve candidate storage");
++                return results;
++            }
+ 
+             SS_LOG_DEBUG(L"HashStore",
+                 L"FuzzyMatch: Starting B+Tree enumeration for type %S",
+@@ -351,9 +451,14 @@ namespace ShadowStrike {
+                     // Timeout protection
+                     LARGE_INTEGER currentTime;
+                     QueryPerformanceCounter(&currentTime);
+-                    uint64_t elapsedUs =
+-                        ((currentTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
+-                        m_perfFrequency.QuadPart;
++                    uint64_t elapsedUs = 0;
++                    if (m_perfFrequency.QuadPart > 0 &&
++                        currentTime.QuadPart >= startTime.QuadPart) {
++                        const uint64_t elapsed = static_cast<uint64_t>(
++                            currentTime.QuadPart - startTime.QuadPart);
++                        elapsedUs = (elapsed * 1000000ULL) /
++                            static_cast<uint64_t>(m_perfFrequency.QuadPart);
++                    }
+ 
+                     if (elapsedUs > 5'000'000) { // 5 second timeout
+                         SS_LOG_WARN(L"HashStore",
+@@ -426,7 +531,12 @@ namespace ShadowStrike {
+                     HashValue candidateHash{};
+                     std::memcpy(&candidateHash, storedHashPtr, sizeof(HashValue));
+ 
+-                    candidates.emplace_back(signatureOffset, candidateHash);
++                    try {
++                        candidates.emplace_back(signatureOffset, candidateHash);
++                    } catch (const std::bad_alloc&) {
++                        SS_LOG_WARN(L"HashStore", L"FuzzyMatch: Candidate storage allocation failed");
++                        return false; // Stop enumeration
++                    }
+ 
+                     return true; // Continue enumeration
+                 });
+@@ -445,7 +555,11 @@ namespace ShadowStrike {
+                     candidates.size());
+ 
+                 std::vector<std::pair<uint64_t, HashValue>> filteredCandidates;
+-                filteredCandidates.reserve(candidates.size() / 10);
++                try {
++                    filteredCandidates.reserve(candidates.size() / 10);
++                } catch (const std::bad_alloc&) {
++                    SS_LOG_WARN(L"HashStore", L"FuzzyMatch: LSH filter reserve failed, skipping filter");
++                }
+ 
+                 if (hash.type == HashType::FUZZY) {
+                     // Extract blocksize from query hash with exception safety
+@@ -536,7 +650,12 @@ namespace ShadowStrike {
+                             static_cast<int32_t>(candT));
+ 
+                         if (tDiff <= 16) {
+-                            filteredCandidates.emplace_back(offset, candidateHash);
++                            try {
++                                filteredCandidates.emplace_back(offset, candidateHash);
++                            } catch (const std::bad_alloc&) {
++                                SS_LOG_WARN(L"HashStore", L"FuzzyMatch: TLSH filter allocation failed");
++                                break;
++                            }
+                         }
+                     }
+                 }
+@@ -567,9 +686,14 @@ namespace ShadowStrike {
+ 
+                 LARGE_INTEGER currentTime;
+                 QueryPerformanceCounter(&currentTime);
+-                uint64_t elapsedUs =
+-                    ((currentTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
+-                    m_perfFrequency.QuadPart;
++                uint64_t elapsedUs = 0;
++                if (m_perfFrequency.QuadPart > 0 &&
++                    currentTime.QuadPart >= startTime.QuadPart) {
++                    const uint64_t elapsed = static_cast<uint64_t>(
++                        currentTime.QuadPart - startTime.QuadPart);
++                    elapsedUs = (elapsed * 1000000ULL) /
++                        static_cast<uint64_t>(m_perfFrequency.QuadPart);
++                }
+ 
+                 if (elapsedUs > TIMEOUT_US) {
+                     SS_LOG_WARN(L"HashStore",
+@@ -580,17 +704,11 @@ namespace ShadowStrike {
+ 
+                 candidatesScanned++;
+ 
+-                // ====================================================================
+-                // BLOOM FILTER PRE-SCREENING
+-                // ====================================================================
+-
+-                if (bucket->m_bloomFilter) {
+-                    uint64_t candidateFastHash = candidateHash.FastHash();
+-                    if (!bucket->m_bloomFilter->MightContain(candidateFastHash)) {
+-                        bloomFilterRejections++;
+-                        continue;
+-                    }
+-                }
++                // NOTE: Bloom filter pre-screening removed. Candidates were enumerated
++                // FROM the B+Tree index ÔÇö they are definitively present. Checking bloom
++                // filter on known-present entries is wasted CPU and risks false negatives
++                // (bloom filters cannot have false negatives, but checking existing entries
++                // against a bloom filter provides zero filtering value).
+ 
+                 // ====================================================================
+                 // PREPARE CANDIDATE HASH FOR COMPARISON
+@@ -598,13 +716,13 @@ namespace ShadowStrike {
+ 
+                 // Use larger buffer for fuzzy hashes
+                 std::array<char, 256> candidateBuffer{};
+-                const size_t candCopyLen = std::min(
+-                    static_cast<size_t>(candidateHash.length),
+-                    candidateBuffer.size() - 1);
+-                if (candCopyLen > 0 && candCopyLen <= candidateHash.data.size()) {
+-                    std::memcpy(candidateBuffer.data(), candidateHash.data.data(),
+-                        candCopyLen);
++                const size_t candCopyLen = static_cast<size_t>(candidateHash.length);
++                if (candCopyLen == 0 || candCopyLen > candidateHash.data.size()) {
++                    SS_LOG_DEBUG(L"HashStore",
++                        L"FuzzyMatch: Candidate #%zu has invalid length %u", i, candidateHash.length);
++                    continue;
+                 }
++                std::memcpy(candidateBuffer.data(), candidateHash.data.data(), candCopyLen);
+                 candidateBuffer[candCopyLen] = '\0';
+ 
+                 const char* candidateString = candidateBuffer.data();
+@@ -700,9 +818,13 @@ namespace ShadowStrike {
+ 
+                 LARGE_INTEGER computeEnd;
+                 QueryPerformanceCounter(&computeEnd);
+-                uint64_t computeTimeUs =
+-                    ((computeEnd.QuadPart - computeStart.QuadPart) * 1000000ULL) /
+-                    m_perfFrequency.QuadPart;
++                uint64_t computeTimeUs = 0;
++                if (m_perfFrequency.QuadPart > 0 &&
++                    computeEnd.QuadPart >= computeStart.QuadPart) {
++                    computeTimeUs =
++                        ((static_cast<uint64_t>(computeEnd.QuadPart - computeStart.QuadPart)) * 1000000ULL) /
++                        static_cast<uint64_t>(m_perfFrequency.QuadPart);
++                }
+ 
+                 totalComputeTimeUs += computeTimeUs;
+                 maxComputeTimeUs = std::max(maxComputeTimeUs, computeTimeUs);
+@@ -714,7 +836,6 @@ namespace ShadowStrike {
+                 if (computeSuccess &&
+                     static_cast<uint32_t>(similarityScore) >= similarityThreshold) {
+ 
+-                    // Build detection result
+                     DetectionResult result = BuildDetectionResult(
+                         candidateHash,
+                         signatureOffset
+@@ -722,16 +843,21 @@ namespace ShadowStrike {
+ 
+                     result.matchTimeNanoseconds = computeTimeUs * 1000;
+ 
+-                    // Add similarity information to description
+-                    std::wstring similarityInfo = std::format(
+-                        L" [Fuzzy Match: {}% similarity]",
+-                        similarityScore
+-                    );
+-
+-                    result.description += ShadowStrike::Utils::StringUtils::ToNarrow(similarityInfo);
+-
++                    // Append similarity info (allocation-safe ÔÇö non-critical annotation)
++                    try {
++                        result.description += std::format(
++                            " [Fuzzy Match: {}% similarity]", similarityScore);
++                    } catch (const std::exception&) {
++                        // Non-critical: proceed without similarity annotation
++                    }
+ 
+-                    results.push_back(std::move(result));
++                    try {
++                        results.push_back(std::move(result));
++                        resultSimilarities.push_back(similarityScore);
++                    } catch (const std::bad_alloc&) {
++                        SS_LOG_ERROR(L"HashStore", L"FuzzyMatch: Allocation failure adding match");
++                        break;
++                    }
+                     matchesFound++;
+ 
+                     SS_LOG_DEBUG(L"HashStore",
+@@ -805,13 +931,28 @@ namespace ShadowStrike {
+             // STEP 9: RESULT POST-PROCESSING
+             // ========================================================================
+ 
+-            // Sort results by similarity (descending) - highest similarity first
+-            std::sort(results.begin(), results.end(),
+-                [](const DetectionResult& a, const DetectionResult& b) {
+-                    // Extract similarity percentage from description (naive parsing)
+-                    // In production, could store similarity as separate field
+-                    return a.matchTimeNanoseconds < b.matchTimeNanoseconds;
+-                });
++            // Sort results by similarity score (descending ÔÇö highest match first)
++            if (results.size() > 1 && resultSimilarities.size() == results.size()) {
++                try {
++                    std::vector<size_t> sortIdx(results.size());
++                    std::iota(sortIdx.begin(), sortIdx.end(), size_t{0});
++                    std::sort(sortIdx.begin(), sortIdx.end(),
++                        [&resultSimilarities](size_t a, size_t b) {
++                            return resultSimilarities[a] > resultSimilarities[b];
++                        });
++
++                    std::vector<DetectionResult> sorted;
++                    sorted.reserve(results.size());
++                    for (size_t idx : sortIdx) {
++                        sorted.push_back(std::move(results[idx]));
++                    }
++                    results = std::move(sorted);
++                } catch (const std::exception&) {
++                    // Sort allocation failed ÔÇö return unsorted results rather than crash
++                    SS_LOG_WARN(L"HashStore",
++                        L"FuzzyMatch: Could not sort results, returning unsorted");
++                }
++            }
+ 
+             if (results.empty()) {
+                 SS_LOG_INFO(L"HashStore",
