@@ -78,6 +78,7 @@ namespace ShadowStrike {
             , m_cacheHits(0)
             , m_cacheMisses(0)
             , m_totalMatches(0)
+            , m_nextAllocationOffset(PAGE_SIZE * 100)
             , m_bloomExpectedElements(1'000'000)
             , m_bloomFalsePositiveRate(0.01)
             , m_perfFrequency{}
@@ -340,8 +341,9 @@ namespace ShadowStrike {
             for (auto& entry : m_queryCache) {
                 entry.seqlock.store(0, std::memory_order_relaxed);
                 entry.hash = HashValue{};
-                entry.result = std::nullopt;
+                entry.signatureOffset = 0;
                 entry.timestamp = 0;
+                entry.hasResult = false;
             }
 
             // Reset state
@@ -356,9 +358,7 @@ namespace ShadowStrike {
 		//================= STATISTICS & MAINTENANCE ==================================
 		// ============================================================================
 
-        HashStore::HashStoreStatistics HashStore::GetStatistics() const noexcept {
-            std::shared_lock<std::shared_mutex> lock(m_globalLock);
-
+        HashStore::HashStoreStatistics HashStore::GetStatisticsLocked() const noexcept {
             HashStoreStatistics stats{};
             stats.totalLookups = m_totalLookups.load(std::memory_order_relaxed);
             stats.cacheHits = m_cacheHits.load(std::memory_order_relaxed);
@@ -412,6 +412,11 @@ namespace ShadowStrike {
             }
 
             return stats;
+        }
+
+        HashStore::HashStoreStatistics HashStore::GetStatistics() const noexcept {
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+            return GetStatisticsLocked();
         }
 
         void HashStore::ResetStatistics() noexcept {
@@ -484,7 +489,7 @@ namespace ShadowStrike {
             // STEP 4: COLLECT STATISTICS BEFORE REBUILD
             // ========================================================================
 
-            auto statsBeforeRebuild = GetStatistics();
+            auto statsBeforeRebuild = GetStatisticsLocked();
             SS_LOG_INFO(L"HashStore",
                 L"Rebuild: Before rebuild - %llu total hashes, %zu bucket types",
                 statsBeforeRebuild.totalHashes, m_buckets.size());
@@ -728,7 +733,7 @@ namespace ShadowStrike {
                 }
             }
 
-            auto statsAfterRebuild = GetStatistics();
+            auto statsAfterRebuild = GetStatisticsLocked();
 
             SS_LOG_INFO(L"HashStore",
                 L"Rebuild: Complete - %zu hashes processed, %zu buckets rebuilt in %llu µs",
@@ -795,7 +800,7 @@ namespace ShadowStrike {
                 compactStartTime.QuadPart = 0;
             }
 
-            auto statsBefore = GetStatistics();
+            auto statsBefore = GetStatisticsLocked();
 
             // ========================================================================
             // STEP 4: ANALYZE FRAGMENTATION IN EACH BUCKET
@@ -1032,7 +1037,7 @@ namespace ShadowStrike {
                 }
             }
 
-            auto statsAfter = GetStatistics();
+            auto statsAfter = GetStatisticsLocked();
 
             // ====================================================================
             // VERIFY BLOOM FILTERS ARE NOW HEALTHY
@@ -1122,6 +1127,13 @@ namespace ShadowStrike {
 
             // Verify buckets
             for (const auto& [type, bucket] : m_buckets) {
+                if (!bucket) {
+                    if (logCallback) {
+                        logCallback("WARNING: Null bucket for type " +
+                            std::string(Format::HashTypeToString(type)));
+                    }
+                    continue;
+                }
                 auto stats = bucket->GetStatistics();
                 if (logCallback) {
                     std::ostringstream oss;
@@ -1140,6 +1152,10 @@ namespace ShadowStrike {
         }
 
         StoreError HashStore::Flush() noexcept {
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                return StoreError{ SignatureStoreError::Unknown, 0, "Database not initialized" };
+            }
+
             if (m_readOnly.load(std::memory_order_acquire)) {
                 return StoreError{ SignatureStoreError::AccessDenied, 0, "Read-only mode" };
             }
@@ -1187,8 +1203,9 @@ namespace ShadowStrike {
                 
                 // Clear the entry
                 entry.hash = HashValue{};
-                entry.result = std::nullopt;
+                entry.signatureOffset = 0;
                 entry.timestamp = 0;
+                entry.hasResult = false;
                 
                 // Release write lock (increment to even)
                 entry.seqlock.store(oldSeq + 2, std::memory_order_release);
@@ -1322,10 +1339,6 @@ const HashBucket* HashStore::GetBucket(HashType type) const noexcept {
 }
 
 uint64_t HashStore::AllocateSignatureEntry(size_t size) noexcept {
-    // Thread-safe allocation using atomic fetch_add
-    // Initial offset starts after header pages (100 pages reserved)
-    static std::atomic<uint64_t> currentOffset{ PAGE_SIZE * 100 };
-    
     // Validate size
     if (size == 0) {
         SS_LOG_ERROR(L"HashStore", L"AllocateSignatureEntry: Zero size requested");
@@ -1343,14 +1356,14 @@ uint64_t HashStore::AllocateSignatureEntry(size_t size) noexcept {
     const size_t alignedSize = Format::AlignToPage(size);
     
     // Check for overflow before allocation
-    uint64_t current = currentOffset.load(std::memory_order_relaxed);
+    uint64_t current = m_nextAllocationOffset.load(std::memory_order_relaxed);
     if (current > UINT64_MAX - alignedSize) {
         SS_LOG_ERROR(L"HashStore", L"AllocateSignatureEntry: Offset overflow");
         return UINT64_MAX;
     }
 
     // Atomically reserve space and return the starting offset
-    uint64_t offset = currentOffset.fetch_add(alignedSize, std::memory_order_acq_rel);
+    uint64_t offset = m_nextAllocationOffset.fetch_add(alignedSize, std::memory_order_acq_rel);
     
     // Verify the allocation is within bounds (if we have a valid file size)
     if (m_mappedView.IsValid() && offset + alignedSize > m_mappedView.fileSize) {
@@ -1389,7 +1402,6 @@ DetectionResult HashStore::BuildDetectionResult(
 }
 
 std::optional<DetectionResult> HashStore::GetFromCache(const HashValue& hash) const noexcept {
-    // Validate hash before using it for indexing
     if (hash.length == 0 || hash.length > 64) {
         return std::nullopt;
     }
@@ -1398,31 +1410,40 @@ std::optional<DetectionResult> HashStore::GetFromCache(const HashValue& hash) co
     const size_t cacheIdx = static_cast<size_t>(fastHash % CACHE_SIZE);
     const auto& entry = m_queryCache[cacheIdx];
     
-    // SeqLock read: retry if writer is active or sequence changed
+    // SeqLock read protocol: all cached fields are POD/trivially-copyable,
+    // so torn reads produce only garbage values (no UB from following stale
+    // pointers or reading corrupted vtables) — detected and discarded via
+    // seq mismatch on the second read of the seqlock counter.
     constexpr int MAX_RETRIES = 5;
     for (int retry = 0; retry < MAX_RETRIES; ++retry) {
         uint64_t seq1 = entry.seqlock.load(std::memory_order_acquire);
         
-        // Odd sequence means write in progress - yield and retry
+        // Odd sequence means write in progress — yield and retry
         if (seq1 & 1) {
             std::this_thread::yield();
             continue;
         }
         
-        // Read the data (these are copies, not references)
-        HashValue readHash = entry.hash;
-        std::optional<DetectionResult> readResult = entry.result;
+        // Copy POD fields (safe even if torn — we validate via seq2)
+        const HashValue readHash = entry.hash;
+        const uint64_t readOffset = entry.signatureOffset;
+        const bool readHasResult = entry.hasResult;
         
-        // Memory fence before reading sequence again
         std::atomic_thread_fence(std::memory_order_acquire);
         
-        uint64_t seq2 = entry.seqlock.load(std::memory_order_acquire);
+        const uint64_t seq2 = entry.seqlock.load(std::memory_order_acquire);
         
         // If sequence unchanged, read was consistent
         if (seq1 == seq2 && readHash == hash) {
-            return readResult;
+            if (readHasResult) {
+                return BuildDetectionResult(hash, readOffset);
+            }
+            // Cached negative: hash was looked up but not found.
+            // Return nullopt — caller treats this as cache miss and re-queries,
+            // which is correct (avoids needing a three-state return type).
+            return std::nullopt;
         }
-        // Sequence changed during read - retry
+        // Sequence changed during read — retry
     }
     
     // Cache miss or too many retries
@@ -1479,7 +1500,8 @@ void HashStore::AddToCache(
     
     // Now we hold the write lock (sequence is odd)
     entry.hash = hash;
-    entry.result = result;
+    entry.signatureOffset = result.has_value() ? result->signatureId : 0;
+    entry.hasResult = result.has_value();
     entry.timestamp = m_cacheAccessCounter.fetch_add(1, std::memory_order_relaxed);
     
     // Release write lock (increment to even)
