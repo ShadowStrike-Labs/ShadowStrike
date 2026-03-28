@@ -32,24 +32,25 @@
  * 1. REAL-TIME I/O METRICS
  *    - Read/Write throughput (B/s)
  *    - IOPS monitoring
- *    - Latency tracking (where available via ETW/PDH)
+ *    - Per-process "other" ops tracking (directory enumeration signal)
  *
  * 2. PROCESS ATTRIBUTION
- *    - Per-process I/O tracking
+ *    - Per-process I/O tracking via GetProcessIoCounters
  *    - Top consumer identification
- *    - I/O priority analysis
+ *    - Self-monitoring (EDR's own I/O footprint)
  *
  * 3. ANOMALY DETECTION
- *    - Ransomware-like write pattern detection
- *    - Massive file enumeration detection
- *    - Hidden stream (ADS) activity monitoring
+ *    - Sustained ransomware-like write pattern detection (time-windowed)
+ *    - File enumeration storm detection (high other-ops rate)
+ *    - PID reuse detection (counter reset on name change)
  *
  * 4. STORAGE HEALTH
- *    - Free space monitoring
- *    - Drive availability tracking
+ *    - Free space monitoring per volume
+ *    - Space consumption rate tracking
+ *    - Low-space alerting with configurable thresholds
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 4.0.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -71,7 +72,6 @@
 #include <shared_mutex>
 #include <chrono>
 #include <functional>
-#include <map>
 #include <optional>
 
 // ============================================================================
@@ -101,16 +101,28 @@ namespace Performance {
 // CONSTANTS
 // ============================================================================
 namespace DiskConstants {
-    constexpr uint32_t DEFAULT_POLLING_INTERVAL_MS = 1000;
-    constexpr uint32_t MIN_POLLING_INTERVAL_MS = 100;
-    constexpr uint32_t MAX_POLLING_INTERVAL_MS = 60000;
-    constexpr size_t MAX_HISTORY_POINTS = 60; // Keep last 60 seconds
+    constexpr uint32_t DEFAULT_POLLING_INTERVAL_MS      = 1000;
+    constexpr uint32_t MIN_POLLING_INTERVAL_MS          = 100;
+    constexpr uint32_t MAX_POLLING_INTERVAL_MS          = 60000;
+    constexpr size_t   MAX_HISTORY_POINTS               = 60;
+
+    constexpr uint32_t DEFAULT_SUSTAINED_WINDOW_SEC     = 5;
+    constexpr uint32_t MIN_SUSTAINED_WINDOW_SEC         = 2;
+    constexpr uint32_t MAX_SUSTAINED_WINDOW_SEC         = 60;
+
+    constexpr uint32_t DEFAULT_FILE_ENUM_THRESHOLD_OPS  = 500;
+    constexpr uint32_t DEFAULT_FILE_ENUM_WINDOW_SEC     = 3;
+
+    constexpr size_t   MAX_TRACKED_PROCESSES            = 10000;
+
+    constexpr double   DEFAULT_LOW_SPACE_PERCENT        = 95.0;
+    constexpr uint64_t DEFAULT_LOW_SPACE_BYTES          = 1024ULL * 1024 * 1024;
 }
 
 // ============================================================================
 // TYPE ALIASES
 // ============================================================================
-using Clock = std::chrono::steady_clock;
+using Clock     = std::chrono::steady_clock;
 using TimePoint = std::chrono::steady_clock::time_point;
 
 // ============================================================================
@@ -118,116 +130,151 @@ using TimePoint = std::chrono::steady_clock::time_point;
 // ============================================================================
 
 /**
- * @brief Raw I/O counters for a specific snapshot
+ * @brief Raw I/O counters for a specific snapshot.
  */
 struct DiskIoCounters {
-    uint64_t readBytes = 0;
+    uint64_t readBytes  = 0;
     uint64_t writeBytes = 0;
     uint64_t otherBytes = 0;
-    uint64_t readOps = 0;
-    uint64_t writeOps = 0;
-    uint64_t otherOps = 0;
+    uint64_t readOps    = 0;
+    uint64_t writeOps   = 0;
+    uint64_t otherOps   = 0;
 
-    DiskIoCounters& operator+=(const DiskIoCounters& other) {
-        readBytes += other.readBytes;
+    DiskIoCounters& operator+=(const DiskIoCounters& other) noexcept {
+        readBytes  += other.readBytes;
         writeBytes += other.writeBytes;
         otherBytes += other.otherBytes;
-        readOps += other.readOps;
-        writeOps += other.writeOps;
-        otherOps += other.otherOps;
+        readOps    += other.readOps;
+        writeOps   += other.writeOps;
+        otherOps   += other.otherOps;
         return *this;
     }
 };
 
 /**
- * @brief Computed disk usage metrics for a process
+ * @brief Computed disk usage metrics for a process.
  */
 struct ProcessDiskUsage {
-    uint32_t processId = 0;
+    uint32_t     processId   = 0;
     std::wstring processName;
 
-    // Rates (per second)
-    double readBytesPerSec = 0.0;
+    double readBytesPerSec  = 0.0;
     double writeBytesPerSec = 0.0;
-    double readOpsPerSec = 0.0;
-    double writeOpsPerSec = 0.0;
+    double readOpsPerSec    = 0.0;
+    double writeOpsPerSec   = 0.0;
+    double otherOpsPerSec   = 0.0;
 
-    // Totals since monitoring start (or process start)
-    uint64_t totalReadBytes = 0;
+    uint64_t totalReadBytes  = 0;
     uint64_t totalWriteBytes = 0;
 
-    // Risk indicators
-    bool highWriteRate = false;      // Potential ransomware indicator
-    bool highFileEnumeration = false; // Potential scan indicator
+    bool highWriteRate       = false;
+    bool highFileEnumeration = false;
 
     [[nodiscard]] std::string ToJson() const;
 };
 
 /**
- * @brief Drive information
+ * @brief Ransomware behavioral alert (sustained high writes).
+ */
+struct RansomwareAlert {
+    uint32_t     processId                     = 0;
+    std::wstring processName;
+    double       sustainedWriteBytesPerSec     = 0.0;
+    uint32_t     sustainedDurationSamples      = 0;
+    uint64_t     totalBytesWrittenDuringWindow = 0;
+    TimePoint    detectedAt;
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief File enumeration storm alert (sustained high other-ops).
+ */
+struct FileEnumAlert {
+    uint32_t     processId                = 0;
+    std::wstring processName;
+    double       sustainedOtherOpsPerSec  = 0.0;
+    uint32_t     sustainedDurationSamples = 0;
+    TimePoint    detectedAt;
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Per-volume drive information with consumption rate.
  */
 struct DriveInfo {
-    std::wstring mountPoint;     // e.g. "C:\"
-    std::wstring volumeName;     // e.g. "System"
-    std::wstring fileSystem;     // e.g. "NTFS"
-    uint64_t totalBytes = 0;
-    uint64_t freeBytes = 0;
-    uint64_t availableBytes = 0; // Available to user
-    double usagePercent = 0.0;
-    bool isSystemDrive = false;
+    std::wstring mountPoint;
+    std::wstring volumeName;
+    std::wstring fileSystem;
+    uint64_t totalBytes            = 0;
+    uint64_t freeBytes             = 0;
+    uint64_t availableBytes        = 0;
+    double   usagePercent          = 0.0;
+    double   freeBytesDeltaPerSec  = 0.0;
+    bool     isSystemDrive         = false;
 
     [[nodiscard]] std::string ToJson() const;
 };
 
 /**
- * @brief Global disk statistics
+ * @brief Global disk I/O statistics.
  */
 struct DiskGlobalStats {
-    double totalReadBytesPerSec = 0.0;
-    double totalWriteBytesPerSec = 0.0;
-    double totalReadOpsPerSec = 0.0;
-    double totalWriteOpsPerSec = 0.0;
-    uint32_t activeProcesses = 0; // Number of processes with disk activity > 0
+    double   totalReadBytesPerSec  = 0.0;
+    double   totalWriteBytesPerSec = 0.0;
+    double   totalReadOpsPerSec    = 0.0;
+    double   totalWriteOpsPerSec   = 0.0;
+    uint32_t activeProcesses       = 0;
     TimePoint timestamp;
 
     [[nodiscard]] std::string ToJson() const;
 };
 
 /**
- * @brief Disk monitor configuration
+ * @brief Disk monitor configuration.
  */
 struct DiskMonitorConfig {
-    bool enabled = true;
-    uint32_t pollingIntervalMs = DiskConstants::DEFAULT_POLLING_INTERVAL_MS;
-    bool enableProcessMonitoring = true;
-    bool enableDriveSpaceMonitoring = true;
+    bool     enabled                      = true;
+    uint32_t pollingIntervalMs            = DiskConstants::DEFAULT_POLLING_INTERVAL_MS;
+    bool     enableProcessMonitoring      = true;
+    bool     enableDriveSpaceMonitoring   = true;
+    bool     enableSelfMonitoring         = true;
 
-    // Thresholds for alerts
-    uint64_t ransomwareWriteThresholdBps = 50 * 1024 * 1024; // 50 MB/s sustained
-    uint32_t highIoProcessCountLimit = 10;
+    uint64_t ransomwareWriteThresholdBps  = 50ULL * 1024 * 1024;
+    uint32_t ransomwareSustainedWindowSec = DiskConstants::DEFAULT_SUSTAINED_WINDOW_SEC;
+    uint32_t fileEnumThresholdOpsPerSec   = DiskConstants::DEFAULT_FILE_ENUM_THRESHOLD_OPS;
+    uint32_t fileEnumSustainedWindowSec   = DiskConstants::DEFAULT_FILE_ENUM_WINDOW_SEC;
+    uint32_t highIoProcessCountLimit      = 10;
+    double   lowSpaceThresholdPercent     = DiskConstants::DEFAULT_LOW_SPACE_PERCENT;
+    uint64_t lowSpaceThresholdBytes       = DiskConstants::DEFAULT_LOW_SPACE_BYTES;
+    size_t   maxTrackedProcesses          = DiskConstants::MAX_TRACKED_PROCESSES;
 
     [[nodiscard]] bool IsValid() const noexcept;
 };
 
 /**
- * @brief Internal statistics for the module
+ * @brief Module statistics snapshot (plain types — safe to copy/return by value).
  */
 struct DiskMonitorModuleStats {
-    std::atomic<uint64_t> cyclesCompleted{0};
-    std::atomic<uint64_t> alertsTriggered{0};
-    std::atomic<uint64_t> errorsEncountered{0};
-    std::atomic<uint64_t> processesTracked{0};
-    TimePoint startTime = Clock::now();
+    uint64_t cyclesCompleted           = 0;
+    uint64_t alertsTriggered           = 0;
+    uint64_t errorsEncountered         = 0;
+    uint64_t processesTracked          = 0;
+    uint64_t ransomwareAlertsTriggered = 0;
+    uint64_t fileEnumAlertsTriggered   = 0;
+    double   uptimeSeconds             = 0.0;
 
-    void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
 
 // ============================================================================
 // CALLBACKS
 // ============================================================================
-using HighIoCallback = std::function<void(const ProcessDiskUsage&)>;
-using LowSpaceCallback = std::function<void(const DriveInfo&)>;
+using HighIoCallback     = std::function<void(const ProcessDiskUsage&)>;
+using LowSpaceCallback   = std::function<void(const DriveInfo&)>;
+using RansomwareCallback = std::function<void(const RansomwareAlert&)>;
+using FileEnumCallback   = std::function<void(const FileEnumAlert&)>;
 
 // ============================================================================
 // DISK MONITOR CLASS
@@ -236,6 +283,10 @@ using LowSpaceCallback = std::function<void(const DriveInfo&)>;
 /**
  * @class DiskMonitor
  * @brief Singleton class for monitoring system disk activity.
+ *
+ * Thread-safe. All public accessors may be called concurrently.
+ * Registered callbacks are invoked from the monitor thread — they
+ * must be non-blocking and exception-safe.
  */
 class DiskMonitor final {
 public:
@@ -244,17 +295,16 @@ public:
     // ========================================================================
     [[nodiscard]] static DiskMonitor& Instance() noexcept;
 
-    // Non-copyable/movable
-    DiskMonitor(const DiskMonitor&) = delete;
+    DiskMonitor(const DiskMonitor&)            = delete;
     DiskMonitor& operator=(const DiskMonitor&) = delete;
-    DiskMonitor(DiskMonitor&&) = delete;
-    DiskMonitor& operator=(DiskMonitor&&) = delete;
+    DiskMonitor(DiskMonitor&&)                 = delete;
+    DiskMonitor& operator=(DiskMonitor&&)      = delete;
 
     // ========================================================================
     // LIFECYCLE
     // ========================================================================
     [[nodiscard]] bool Initialize(const DiskMonitorConfig& config);
-    void Shutdown();
+    void Shutdown() noexcept;
     [[nodiscard]] bool IsInitialized() const noexcept;
 
     // ========================================================================
@@ -267,36 +317,29 @@ public:
     // DATA ACCESS
     // ========================================================================
 
-    /**
-     * @brief Get disk usage for a specific process
-     * @param pid Process ID
-     * @return Optional usage data (nullopt if process not found or no I/O)
-     */
+    /** @brief Get disk usage for a specific process. */
     [[nodiscard]] std::optional<ProcessDiskUsage> GetProcessUsage(uint32_t pid) const;
 
-    /**
-     * @brief Get top consumers by total throughput (Read+Write)
-     * @param count Number of processes to return
-     * @return Vector of top consumers
-     */
+    /** @brief Get top consumers by total throughput (read + write B/s). */
     [[nodiscard]] std::vector<ProcessDiskUsage> GetTopConsumers(size_t count = 5) const;
 
-    /**
-     * @brief Get global disk I/O statistics
-     */
+    /** @brief Get global disk I/O statistics. */
     [[nodiscard]] DiskGlobalStats GetGlobalStats() const;
 
-    /**
-     * @brief Get drive space information
-     */
+    /** @brief Get drive space information for all fixed drives. */
     [[nodiscard]] std::vector<DriveInfo> GetDriveInfo() const;
+
+    /** @brief Get the EDR agent's own I/O usage (always available). */
+    [[nodiscard]] std::optional<ProcessDiskUsage> GetSelfIoUsage() const;
 
     // ========================================================================
     // CALLBACK REGISTRATION
     // ========================================================================
     void RegisterHighIoCallback(HighIoCallback callback);
     void RegisterLowSpaceCallback(LowSpaceCallback callback);
-    void UnregisterCallbacks();
+    void RegisterRansomwareCallback(RansomwareCallback callback);
+    void RegisterFileEnumCallback(FileEnumCallback callback);
+    void UnregisterCallbacks() noexcept;
 
     // ========================================================================
     // DIAGNOSTICS
@@ -309,7 +352,6 @@ private:
     DiskMonitor();
     ~DiskMonitor();
 
-    // PIMPL idiom
     std::unique_ptr<DiskMonitorImpl> m_impl;
     static std::atomic<bool> s_instanceCreated;
 };
