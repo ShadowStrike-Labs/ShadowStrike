@@ -225,6 +225,47 @@ struct RichHeaderInfo {
 };
 
 /**
+ * @brief Delay-loaded import information.
+ */
+struct DelayImportInfo {
+    std::wstring dllName;           ///< DLL name
+    std::vector<ImportFunctionInfo> functions; ///< Delay-imported functions
+    uint32_t attributes = 0;        ///< Delay import attributes (0 or 1)
+    uint32_t moduleHandleRva = 0;   ///< RVA of module handle storage
+    uint32_t iatRva = 0;            ///< RVA of delay IAT
+    uint32_t intRva = 0;            ///< RVA of delay INT
+    uint32_t boundIatRva = 0;       ///< RVA of bound delay IAT
+    uint32_t unloadIatRva = 0;      ///< RVA of unload delay IAT
+    uint32_t timeDateStamp = 0;     ///< Timestamp (0 if not bound)
+};
+
+/**
+ * @brief Load configuration directory information.
+ */
+struct LoadConfigInfo {
+    uint32_t size = 0;              ///< Size of load config in PE
+    uint32_t timeDateStamp = 0;
+    uint16_t majorVersion = 0;
+    uint16_t minorVersion = 0;
+    uint32_t globalFlagsClear = 0;
+    uint32_t globalFlagsSet = 0;
+    uint64_t securityCookie = 0;    ///< VA of security cookie (/GS)
+    uint64_t seHandlerTable = 0;    ///< VA of SE handler table
+    uint64_t seHandlerCount = 0;    ///< Number of SE handlers
+    bool hasSEH = false;            ///< SEH handler table present
+    bool hasSecurityCookie = false;  ///< /GS security cookie present
+};
+
+/**
+ * @brief Exception directory entry (x64 RUNTIME_FUNCTION).
+ */
+struct ExceptionEntry {
+    uint32_t beginAddress = 0;      ///< RVA of function start
+    uint32_t endAddress = 0;        ///< RVA of function end
+    uint32_t unwindInfoAddress = 0; ///< RVA of unwind information
+};
+
+/**
  * @brief Complete parsed PE information.
  */
 struct PEInfo {
@@ -462,6 +503,41 @@ public:
      */
     [[nodiscard]] bool ParseRichHeader(RichHeaderInfo& out,
                                         PEError* err = nullptr) noexcept;
+
+    /**
+     * @brief Parse delay-loaded imports.
+     *
+     * @param out Output vector of delay import information.
+     * @param err Optional error output.
+     * @return true if parsing succeeded.
+     */
+    [[nodiscard]] bool ParseDelayImports(std::vector<DelayImportInfo>& out,
+                                          PEError* err = nullptr) noexcept;
+
+    /**
+     * @brief Parse load configuration directory.
+     *
+     * Extracts security cookie, SEH handler table, and other
+     * load-time configuration data.
+     *
+     * @param out Output for load config information.
+     * @param err Optional error output.
+     * @return true if parsing succeeded.
+     */
+    [[nodiscard]] bool ParseLoadConfig(LoadConfigInfo& out,
+                                        PEError* err = nullptr) noexcept;
+
+    /**
+     * @brief Parse exception directory (x64 only).
+     *
+     * Extracts RUNTIME_FUNCTION entries for structured exception handling.
+     *
+     * @param out Output vector of exception entries.
+     * @param err Optional error output.
+     * @return true if parsing succeeded.
+     */
+    [[nodiscard]] bool ParseExceptionDirectory(std::vector<ExceptionEntry>& out,
+                                                PEError* err = nullptr) noexcept;
 
     // ========================================================================
     // Address Translation

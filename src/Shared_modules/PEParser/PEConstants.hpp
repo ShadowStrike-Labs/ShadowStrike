@@ -332,6 +332,15 @@ namespace Limits {
     /// Maximum Rich header entries
     inline constexpr size_t MAX_RICH_ENTRIES = 1000;
 
+    /// Maximum delay import descriptors
+    inline constexpr size_t MAX_DELAY_IMPORT_DESCRIPTORS = 10000;
+
+    /// Maximum exception directory entries
+    inline constexpr size_t MAX_EXCEPTION_ENTRIES = 1000000;
+
+    /// Maximum load config size we'll read
+    inline constexpr size_t MAX_LOAD_CONFIG_SIZE = 1024;
+
     /// Maximum string length for any string read from PE
     inline constexpr size_t MAX_STRING_LENGTH = 65536;
 
