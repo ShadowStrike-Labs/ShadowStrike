@@ -89,23 +89,15 @@
 
 #include "PatternStore.hpp"
 #include "../Utils/Logger.hpp"
-#include "../Utils/FileUtils.hpp"
 
 #include <algorithm>
-#include <queue>
 #include <cctype>
-#include <sstream>
-#include <bit>
-#include <iomanip>
-#include <string>
-#include <chrono>
-#include <mutex>
 #include <limits>
 #include <stdexcept>
 #include <cstring>
 
 namespace ShadowStrike {
-    namespace SignatureStore {
+    namespace PatternStore {
 
         // ============================================================================
         // COMPILE-TIME CONFIGURATION
@@ -312,6 +304,18 @@ namespace ShadowStrike {
             }
 
             // ====================================================================
+            // PHASE 3.5: Normalize Pattern Against Mask
+            // ====================================================================
+            // Zero out masked bits in the pattern so that table construction and
+            // comparisons always operate on canonical byte values.  This prevents
+            // bugs where non-zero masked-out bits in the pattern affect table
+            // construction (e.g. bad-char table indexing by raw pattern byte) or
+            // good-suffix byte comparisons.
+            for (size_t i = 0; i < m_pattern.size(); ++i) {
+                m_pattern[i] &= m_mask[i];
+            }
+
+            // ====================================================================
             // PHASE 4: Preprocessing Tables Construction
             // ====================================================================
 
@@ -469,20 +473,11 @@ namespace ShadowStrike {
                         skip = m_badCharTable[termChar];
                     }
 
-                    // 2. Good Suffix Rule (only safe when no wildcards in matched suffix)
-                    // The matched suffix is pattern[mismatchIdx+1..m-1]
-                    // If any position in that range has a wildcard (mask 0x00), the
-                    // good suffix shift may skip valid matches, so we disable it
-                    bool hasWildcardInSuffix = false;
-                    for (size_t k = mismatchIdx + 1; k < m_pattern.size(); ++k) {
-                        if (m_mask[k] == 0x00) {
-                            hasWildcardInSuffix = true;
-                            break;
-                        }
-                    }
-
-                    if (!hasWildcardInSuffix && mismatchIdx < m_goodSuffixTable.size()) {
-                        size_t gsSkip = m_goodSuffixTable[mismatchIdx];
+                    // 2. Good Suffix Rule
+                    // (Table is pre-degraded to shift-1 for masked patterns,
+                    //  so this is always safe to apply unconditionally.)
+                    if (mismatchIdx < m_goodSuffixTable.size()) {
+                        const size_t gsSkip = m_goodSuffixTable[mismatchIdx];
                         skip = std::max(skip, gsSkip);
                     }
 
@@ -586,17 +581,9 @@ namespace ShadowStrike {
                     skip = m_badCharTable[termChar];
                 }
 
-                // 2. Good Suffix Rule (only safe when no wildcards in matched suffix)
-                bool hasWildcardInSuffix = false;
-                for (size_t k = mismatchIdx + 1; k < m_pattern.size(); ++k) {
-                    if (m_mask[k] == 0x00) {
-                        hasWildcardInSuffix = true;
-                        break;
-                    }
-                }
-
-                if (!hasWildcardInSuffix && mismatchIdx < m_goodSuffixTable.size()) {
-                    size_t gsSkip = m_goodSuffixTable[mismatchIdx];
+                // 2. Good Suffix Rule
+                if (mismatchIdx < m_goodSuffixTable.size()) {
+                    const size_t gsSkip = m_goodSuffixTable[mismatchIdx];
                     skip = std::max(skip, gsSkip);
                 }
 
@@ -625,55 +612,49 @@ namespace ShadowStrike {
          * @note All entries guaranteed to be in range [1, pattern.size()]
          */
         void BoyerMooreMatcher::BuildBadCharTable() noexcept {
-            // Handle empty pattern case - should not happen but be defensive
             if (m_pattern.empty()) {
-                m_badCharTable.fill(1);  // Minimum skip for safety
+                m_badCharTable.fill(1);
                 return;
             }
 
             const size_t patternLen = m_pattern.size();
-
-            // Initialize with pattern length (skip entire pattern if char not found)
-            m_badCharTable.fill(static_cast<int>(patternLen));
-
-            // Fill with last occurrence positions (exclude last character)
-            // This gives us the shift values for the bad character rule
             const size_t lastIndex = patternLen - 1;
 
-            size_t minWildcardShift = patternLen;
-            bool hasWildcards = false;
+            // Default: skip full pattern length if character not seen
+            m_badCharTable.fill(patternLen);
 
-            // Horspool-like table construction:
-            // For each character in pattern (except last), store distance to end (lastIndex - i)
-            // Rightmost occurrences overwrite earlier ones (smaller shift).
+            // Horspool table: for each position (excluding last), record shift
+            // = distance from that position to pattern end.
+            // Iterate left-to-right so rightmost occurrences (smallest shifts)
+            // overwrite earlier ones — giving optimal shift per byte value.
+            //
+            // Mask-aware: for each position, update ALL byte values that would
+            // match there under the mask.  This prevents over-shifting past
+            // valid matches when partial masks (e.g. 0xF0) are in play.
             for (size_t i = 0; i < lastIndex; ++i) {
                 const size_t shift = lastIndex - i;
-                
-                // If we have a wildcard (mask 0x00), ANY character matches at this position.
-                // Thus, every character 'occurs' at position i.
-                // We track the minimum shift imposed by wildcards (the rightmost wildcard).
-                if (!m_mask.empty() && m_mask[i] == 0x00) {
-                    if (shift < minWildcardShift) {
-                        minWildcardShift = shift;
-                    }
-                    hasWildcards = true;
+                const uint8_t maskByte = (!m_mask.empty() && i < m_mask.size())
+                                             ? m_mask[i]
+                                             : uint8_t(0xFF);
+                const uint8_t maskedPat = m_pattern[i] & maskByte;
+
+                if (maskByte == 0xFF) {
+                    // Exact: only this specific byte value
+                    m_badCharTable[m_pattern[i]] = shift;
                 }
-
-                // Normal Bad Character Rule
-                // Update specific entry for the character in the pattern.
-                // (Even if wildcards exist, we update specific char entry, 
-                //  the wildcard clamp loop below will ensure correctness).
-                const uint8_t byte = m_pattern[i];
-                m_badCharTable[byte] = static_cast<int>(shift);
-            }
-
-            // Apply wildcard constraints
-            // If we have wildcards, no character can have a shift larger than
-            // the shift to the rightmost wildcard, because the wildcard matches it.
-            if (hasWildcards) {
-                for (auto& val : m_badCharTable) {
-                    if (val > static_cast<int>(minWildcardShift)) {
-                        val = static_cast<int>(minWildcardShift);
+                else if (maskByte == 0x00) {
+                    // Full wildcard: every byte value matches at this position
+                    for (auto& entry : m_badCharTable) {
+                        entry = shift;
+                    }
+                }
+                else {
+                    // Partial mask: enumerate all byte values that satisfy
+                    // (c & mask) == (pattern[i] & mask)
+                    for (unsigned c = 0; c < 256; ++c) {
+                        if ((static_cast<uint8_t>(c) & maskByte) == maskedPat) {
+                            m_badCharTable[c] = shift;
+                        }
                     }
                 }
             }
@@ -759,6 +740,26 @@ namespace ShadowStrike {
                         m_goodSuffixTable[k] = 1;
                     }
                 }
+
+                // ================================================================
+                // STEP 4: Disable good-suffix for masked/wildcard patterns
+                // ================================================================
+                // The good-suffix table is built from raw (exact) pattern bytes.
+                // When ANY position carries a non-0xFF mask, the table's shift
+                // guarantees break: wildcards elsewhere in the pattern create
+                // match possibilities that exact-byte suffix analysis cannot see,
+                // so a "safe" shift may skip valid matches.
+                //
+                // Conservative fix: degrade the table to shift-1 (equivalent to
+                // not using good-suffix at all).  The bad-char table — which IS
+                // mask-aware — still provides O(n/m) average performance.
+                for (size_t k = 0; k < m_mask.size(); ++k) {
+                    if (m_mask[k] != 0xFF) {
+                        std::fill(m_goodSuffixTable.begin(),
+                                  m_goodSuffixTable.end(), size_t(1));
+                        break;
+                    }
+                }
             }
             catch (const std::exception& ex) {
                 SS_LOG_ERROR(L"BoyerMoore", L"BuildGoodSuffixTable: Exception: %S", ex.what());
@@ -836,16 +837,11 @@ namespace ShadowStrike {
                 // Calculate buffer index with overflow protection
                 size_t bufferIndex = 0;
                 if (!SafeAdd(offset, idx, bufferIndex)) {
-                    return false;  // Overflow would occur
+                    return false;
                 }
 
                 // Redundant bounds check for defense in depth
                 if (bufferIndex >= buffer.size()) {
-                    return false;
-                }
-
-                // Bounds check on pattern/mask arrays (should always pass given checks above)
-                if (idx >= patternSize) {
                     return false;
                 }
 
@@ -864,5 +860,5 @@ namespace ShadowStrike {
             return true;
         }
 
-    } // namespace SignatureStore
+    } // namespace PatternStore
 } // namespace ShadowStrike
