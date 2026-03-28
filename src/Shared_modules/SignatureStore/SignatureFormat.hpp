@@ -102,7 +102,8 @@ enum class HashType : uint8_t {
     SHA512 = 3,
     IMPHASH = 4,        // PE Import Hash
     FUZZY = 5,          // Context-triggered piecewise hash
-    TLSH = 6            // Trend Micro Locality Sensitive Hash
+    TLSH = 6,           // Trend Micro Locality Sensitive Hash
+    All = 0xFF          // Sentinel: match any hash type (used as export/query filter)
 };
 
 // Fixed-size hash storage (zero-copy compatible)
@@ -387,6 +388,7 @@ struct DetectionResult {
     std::vector<std::string> tags;                        // Metadata tags
     uint64_t matchTimestamp{0};                           // Detection time (us precision)
     uint64_t matchTimeNanoseconds{0};                     // Time to match (profiling)
+    float similarity{0.0f};                               // Fuzzy match similarity [0.0, 1.0]
 
     // Default constructor
     DetectionResult() = default;

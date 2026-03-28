@@ -419,18 +419,11 @@ namespace HashStore {
          *
          * Outputs TYPE:HASH:NAME:LEVEL format, compatible with ImportFromFile.
          *
-         * HEADER PATCH NEEDED (cannot fix without header change):
-         *   - typeFilter defaults to HashType::MD5, which doubles as a sentinel
-         *     for "export all types." This makes it impossible to export ONLY
-         *     MD5 hashes. Fix: change parameter to std::optional<HashType>.
-         *
-         * HEADER PATCH NEEDED:
-         *   - ForEach only provides (fastHash, signatureOffset). Actual signature
-         *     name, threat level, description, and tags are not accessible via
-         *     the current index API. Exports use placeholder name "Hash_<id>"
-         *     and default threat level "Medium."
-         *     Fix: expose richer metadata in the ForEach callback or provide a
-         *     metadata-aware iteration method.
+         * NOTE (ForEach metadata limitation):
+         *   ForEach only provides (fastHash, signatureOffset). Actual signature
+         *   name, threat level, description, and tags are read from the mapped
+         *   SignatureRecord at signatureOffset. If the record is unavailable or
+         *   corrupt, placeholder values are used. See BuildDetectionResult().
          *
          * ========================================================================
          */
@@ -484,9 +477,8 @@ namespace HashStore {
             }
 
             for (const auto& [bucketType, bucket] : m_buckets) {
-                // NOTE: typeFilter == HashType::MD5 acts as "export all types" sentinel.
-                // See HEADER PATCH NEEDED above.
-                if (typeFilter != HashType::MD5 && bucketType != typeFilter) {
+                // HashType::All = export all types; any specific type filters to that type only.
+                if (typeFilter != HashType::All && bucketType != typeFilter) {
                     continue;
                 }
 
@@ -935,8 +927,8 @@ namespace HashStore {
                 }
 
                 for (const auto& [bucketType, bucket] : m_buckets) {
-                    // NOTE: typeFilter == MD5 is the sentinel for "all types."
-                    if (typeFilter != HashType::MD5 && bucketType != typeFilter) {
+                    // HashType::All = export all types; any specific type filters to that type only.
+                    if (typeFilter != HashType::All && bucketType != typeFilter) {
                         continue;
                     }
 

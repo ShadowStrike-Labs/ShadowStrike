@@ -63,7 +63,21 @@
 #include <bitset>
 
 namespace ShadowStrike {
-namespace SignatureStore {
+namespace HashStore {
+
+// Import SignatureStore types used throughout this module
+using SignatureStore::HashType;
+using SignatureStore::HashValue;
+using SignatureStore::StoreError;
+using SignatureStore::SignatureStoreError;
+using SignatureStore::DetectionResult;
+using SignatureStore::ThreatLevel;
+using SignatureStore::MemoryMappedView;
+using SignatureStore::SignatureDatabaseHeader;
+using SignatureStore::QueryOptions;
+using SignatureStore::SignatureIndex;
+using SignatureStore::PAGE_SIZE;
+using SignatureStore::CACHE_LINE_SIZE;
 
 // ============================================================================
 // BLOOM FILTER (Fast Negative Lookups)
@@ -312,7 +326,7 @@ public:
     // Export all hashes to text file
     [[nodiscard]] StoreError ExportToFile(
         const std::wstring& filePath,
-        HashType typeFilter = HashType::MD5
+        HashType typeFilter = HashType::All   // HashType::All = export all types
     ) const noexcept;
 
     // Import from JSON (structured format)
@@ -322,7 +336,7 @@ public:
 
     // Export to JSON
     [[nodiscard]] std::string ExportToJson(
-        HashType typeFilter = HashType::MD5,
+        HashType typeFilter = HashType::All,  // HashType::All = export all types
         uint32_t maxEntries = UINT32_MAX
     ) const noexcept;
 
@@ -343,6 +357,8 @@ public:
         double cacheHitRate{0.0};
         double bloomFilterEfficiency{0.0};
     };
+    // Backward-compat alias used by SignatureStore.hpp consumers
+    using StoreStatistics = HashStoreStatistics;
 
     [[nodiscard]] HashStoreStatistics GetStatistics() const noexcept;
     void ResetStatistics() noexcept;
@@ -489,14 +505,10 @@ private:
     LARGE_INTEGER m_perfFrequency{};
 };
 
+// Namespace-level alias so consumers can write HashStore::StoreStatistics
+// (previously HashStore was a class inside SignatureStore; now it's a namespace).
+using StoreStatistics = HashStore::HashStoreStatistics;
 
 
-
-} // namespace SignatureStore
+} // namespace HashStore
 } // namespace ShadowStrike
-
-// NOTE: Two implementation files (HashStore_query_operations.cpp, HashStore_import_export.cpp)
-// still use `namespace ShadowStrike::HashStore` due to a pre-existing inconsistency.
-// They must be updated to `namespace ShadowStrike::SignatureStore` to match this header.
-// The remaining files (HashStore.cpp, HashBucket_impl.cpp, BloomFilter_impl.cpp,
-// HashStore_mgnmnt.cpp) already use the correct `namespace ShadowStrike::SignatureStore`.
