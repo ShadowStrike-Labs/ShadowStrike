@@ -1720,9 +1720,8 @@ bool PEParser::ParseResources(std::vector<ResourceEntry>& out, uint32_t maxDepth
         return false;
     }
 
-    // Resource parsing would go here - simplified for now
-    // Full implementation would recursively parse the resource tree
-    return true;
+    return m_impl->ParseResourcesInternal(out, maxDepth, err);
+}
 
 bool PEParser::ParseRelocations(std::vector<RelocationBlock>& out, PEError* err) noexcept {
     if (!m_impl->m_parsed) {
@@ -1805,7 +1804,12 @@ std::optional<size_t> PEParser::GetSectionByRva(uint32_t rva) const noexcept {
 
     for (size_t i = 0; i < m_impl->m_info.sections.size(); ++i) {
         const auto& sec = m_impl->m_info.sections[i];
-        uint32_t secEnd = sec.virtualAddress + (sec.virtualSize ? sec.virtualSize : sec.rawSize);
+        const uint32_t secSize = sec.virtualSize ? sec.virtualSize : sec.rawSize;
+        uint32_t secEnd;
+        // Guard against virtualAddress + secSize wrapping to near-zero
+        if (!SafeMath::SafeAdd(sec.virtualAddress, secSize, secEnd)) {
+            continue;  // Overflow — skip this section
+        }
         if (rva >= sec.virtualAddress && rva < secEnd) {
             return i;
         }
@@ -1889,14 +1893,63 @@ double PEParser::CalculateSectionEntropy(size_t sectionIndex) const noexcept {
 bool PEParser::VerifyChecksum() const noexcept {
     if (!m_impl->m_parsed) return false;
 
-    // If checksum is zero, it's "valid" (not set)
+    // A stored checksum of zero means "not set" — treat as passing.
     if (m_impl->m_info.checksum == 0) return true;
 
-    // Calculate actual checksum using PE checksum algorithm
-    // This is a simplified version - full implementation would use
-    // the standard PE checksum algorithm
+    const size_t fileSize = m_impl->m_reader.Size();
+    if (fileSize == 0) return false;
 
-    return true;  // Simplified - always return true for now
+    // The CheckSum field in the optional header is at a fixed offset of 64 bytes
+    // from the start of the optional header in BOTH PE32 and PE32+ (confirmed
+    // by counting struct member sizes).  It occupies 4 bytes = two 16-bit words.
+    static constexpr size_t kChecksumFieldOffset = 64;
+    const size_t checksumByteOffset = m_impl->m_optionalHeaderOffset + kChecksumFieldOffset;
+
+    // The field must be word-aligned and fully within the file.
+    if ((checksumByteOffset & 1u) != 0 || checksumByteOffset + 4u > fileSize) {
+        SS_LOG_ERROR(L"PEParser",
+            L"Checksum field offset 0x%zX is misaligned or out of bounds",
+            checksumByteOffset);
+        return false;
+    }
+
+    // Obtain the file as a contiguous span of 16-bit words.  One ReadArray call
+    // does a single bounds check instead of one per word.
+    const size_t wordCount = fileSize / 2;
+    std::span<const uint16_t> words;
+    if (!m_impl->m_reader.ReadArray<uint16_t>(0, wordCount, words)) {
+        return false;
+    }
+
+    // The two words that constitute the stored checksum field must be skipped.
+    const size_t skipWord0 = checksumByteOffset / 2;
+    const size_t skipWord1 = skipWord0 + 1;
+
+    // Microsoft fold-and-add algorithm (equivalent to MapFileAndCheckSumW):
+    //   accumulator += word; accumulator = (hi16 + lo16);
+    uint32_t acc = 0;
+    for (size_t i = 0; i < wordCount; ++i) {
+        if (i == skipWord0 || i == skipWord1) continue;
+        acc += words[i];
+        acc = (acc >> 16) + (acc & 0xFFFFu);
+    }
+
+    // Trailing odd byte (if file size is not a multiple of 2): pad with 0x00.
+    if (fileSize & 1u) {
+        uint8_t lastByte = 0;
+        if (m_impl->m_reader.ReadByte(fileSize - 1, lastByte)) {
+            acc += static_cast<uint16_t>(lastByte);
+            acc = (acc >> 16) + (acc & 0xFFFFu);
+        }
+    }
+
+    // Final fold, then add file size.
+    acc  = (acc & 0xFFFFu) + (acc >> 16);
+    acc += static_cast<uint32_t>(fileSize);
+    acc  = (acc & 0xFFFFu) + (acc >> 16);
+
+    const uint32_t computed = acc & 0xFFFFu;
+    return computed == m_impl->m_info.checksum;
 }
 
 std::wstring PEParser::MachineToString(uint16_t machine) noexcept {
