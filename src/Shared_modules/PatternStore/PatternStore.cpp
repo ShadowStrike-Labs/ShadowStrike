@@ -2016,15 +2016,19 @@ StoreError PatternStore::Flush() noexcept {
     SS_LOG_DEBUG(L"PatternStore", L"Flush: Flushing changes to disk");
 
     if (m_readOnly.load(std::memory_order_acquire)) {
-        return StoreError{ SignatureStoreError::Success }; // Nothing to flush
+        return StoreError{ SignatureStoreError::Success };
     }
 
     std::shared_lock<std::shared_mutex> lock(m_globalLock);
+    return FlushInternal();
+}
 
+StoreError PatternStore::FlushInternal() noexcept {
+    // Caller must hold at least a shared lock on m_globalLock
     if (m_mappedView.IsValid()) {
         StoreError err{};
         if (!MemoryMapping::FlushView(m_mappedView, err)) {
-            SS_LOG_ERROR(L"PatternStore", L"Flush: Failed to flush view");
+            SS_LOG_ERROR(L"PatternStore", L"FlushInternal: Failed to flush view");
             return err;
         }
     }
@@ -2046,21 +2050,26 @@ StoreError PatternStore::Compact() noexcept {
 
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
 
-    // Remove patterns with zero hit count (if heatmap enabled)
-    if (m_heatmapEnabled.load(std::memory_order_acquire)) {
-        size_t beforeCount = m_patternCache.size();
+    // Remove only explicitly deprecated patterns (NEVER remove based on hit count —
+    // that would silently disable detection of new or rare malware signatures)
+    size_t beforeCount = m_patternCache.size();
 
-        auto newEnd = std::remove_if(m_patternCache.begin(), m_patternCache.end(),
-            [](const PatternMetadata& meta) {
-                return meta.hitCount == 0;
-            });
+    auto newEnd = std::remove_if(m_patternCache.begin(), m_patternCache.end(),
+        [](const PatternMetadata& meta) {
+            return meta.isDeprecated;
+        });
 
-        m_patternCache.erase(newEnd, m_patternCache.end());
+    m_patternCache.erase(newEnd, m_patternCache.end());
 
-        size_t afterCount = m_patternCache.size();
-        size_t removed = beforeCount - afterCount;
+    size_t afterCount = m_patternCache.size();
+    size_t removed = beforeCount - afterCount;
 
-        SS_LOG_INFO(L"PatternStore", L"Compact: Removed %zu unused patterns", removed);
+    if (removed > 0) {
+        SS_LOG_INFO(L"PatternStore", L"Compact: Removed %zu deprecated patterns", removed);
+
+        for (size_t i = 0; i < m_patternCache.size(); ++i) {
+            m_patternCache[i].signatureId = i;
+        }
     }
 
     // Rebuild automaton
@@ -2070,8 +2079,8 @@ StoreError PatternStore::Compact() noexcept {
         return err;
     }
 
-    // Flush to disk
-    return Flush();
+    // Flush to disk (use internal variant — we already hold exclusive lock)
+    return FlushInternal();
 }
 
 // ======== HELPERS ===========================================================
@@ -2168,11 +2177,18 @@ std::vector<DetectionResult> PatternStore::ScanWithAutomaton(
     // Track match count for maxResults limit
     size_t matchCount = 0;
     const size_t maxResults = options.maxResults > 0 ? options.maxResults : SIZE_MAX;
+    bool timedOut = false;
 
     try {
         m_automaton->Search(buffer, [&](uint64_t patternId, size_t offset) {
-            // Check max results limit
-            if (matchCount >= maxResults) {
+            if (matchCount >= maxResults || timedOut) {
+                return;
+            }
+
+            // Periodic timeout check (every 64 matches to amortize syscall cost)
+            if ((matchCount & 63) == 0 && IsDeadlineExceeded(deadline)) {
+                timedOut = true;
+                SS_LOG_WARN(L"PatternStore", L"ScanWithAutomaton: Timeout exceeded");
                 return;
             }
 
@@ -2211,7 +2227,8 @@ std::vector<DetectionResult> PatternStore::ScanWithAutomaton(
 
 std::vector<DetectionResult> PatternStore::ScanWithSIMD(
     std::span<const uint8_t> buffer,
-    const QueryOptions& options
+    const QueryOptions& options,
+    const LARGE_INTEGER& deadline
 ) const noexcept {
     std::vector<DetectionResult> results;
 
@@ -2242,13 +2259,18 @@ std::vector<DetectionResult> PatternStore::ScanWithSIMD(
     }
 
     // Use SIMD for exact patterns only
+    size_t patternIdx = 0;
     for (const auto& meta : m_patternCache) {
-        // Check max results limit
         if (matchCount >= maxResults) {
             break;
         }
 
-        // SIMD only works well with exact patterns
+        // Periodic timeout check (every 32 patterns to amortize syscall cost)
+        if ((patternIdx++ & 31) == 0 && IsDeadlineExceeded(deadline)) {
+            SS_LOG_WARN(L"PatternStore", L"ScanWithSIMD: Timeout exceeded");
+            break;
+        }
+
         if (meta.mode != PatternMode::Exact) {
             continue;
         }
@@ -2324,8 +2346,12 @@ DetectionResult PatternStore::BuildDetectionResult(
     return result;
 }
 
-void PatternStore::UpdateHitCount(uint64_t patternId) noexcept {
-    // Validate pattern ID before atomic access
+void PatternStore::UpdateHitCount(uint64_t patternId) const noexcept {
+    // Thread-safe hit count update using atomic_ref under shared lock.
+    // Shared lock prevents m_hitCounters from being resized, while
+    // atomic_ref provides safe concurrent increments.
+    std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
     if (patternId >= m_hitCounters.size()) {
         SS_LOG_WARN(L"PatternStore", 
             L"UpdateHitCount: Pattern ID %llu out of range (%zu)", 
@@ -2333,26 +2359,12 @@ void PatternStore::UpdateHitCount(uint64_t patternId) noexcept {
         return;
     }
 
-    // Thread-safe hit count update using atomic counters
-    try {
-        std::atomic_ref<uint64_t> counter(m_hitCounters[patternId]);
-        counter.fetch_add(1, std::memory_order_relaxed);
-    } catch (...) {
-        SS_LOG_WARN(L"PatternStore", L"UpdateHitCount: Atomic update failed");
-        return;
-    }
-    
-    // Also update the cache copy under lock for persistence
-    std::unique_lock<std::shared_mutex> lock(m_globalLock);
-    if (patternId < m_patternCache.size()) {
-        // Safe increment with overflow protection
-        if (m_patternCache[patternId].hitCount < (std::numeric_limits<uint32_t>::max)()) {
-            m_patternCache[patternId].hitCount++;
-        }
-    }
+    std::atomic_ref<uint64_t> counter(m_hitCounters[patternId]);
+    counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::wstring PatternStore::GetDatabasePath() const noexcept {
+    std::shared_lock<std::shared_mutex> lock(m_globalLock);
     return m_databasePath;
 }
 
@@ -2533,8 +2545,17 @@ void PatternStore::ResetStatistics() noexcept {
     m_totalScans.store(0, std::memory_order_release);
     m_totalMatches.store(0, std::memory_order_release);
     m_totalBytesScanned.store(0, std::memory_order_release);
+
+    // Clear hit counters under exclusive lock (prevents concurrent atomic_ref access)
+    std::unique_lock<std::shared_mutex> lock(m_globalLock);
+    for (size_t i = 0; i < m_hitCounters.size(); ++i) {
+        m_hitCounters[i] = 0;
+    }
+    for (auto& meta : m_patternCache) {
+        meta.hitCount = 0;
+    }
     
-    SS_LOG_DEBUG(L"PatternStore", L"ResetStatistics: Statistics cleared");
+    SS_LOG_DEBUG(L"PatternStore", L"ResetStatistics: Statistics and hit counters cleared");
 }
 
 std::vector<std::pair<uint64_t, uint32_t>> PatternStore::GetHeatmap() const noexcept {
@@ -2550,25 +2571,17 @@ std::vector<std::pair<uint64_t, uint32_t>> PatternStore::GetHeatmap() const noex
         return heatmap;
     }
 
-    // Read hit counts safely
+    // Read hit counts safely (shared lock held — vector won't be resized)
     for (size_t i = 0; i < m_patternCache.size(); ++i) {
         const auto& meta = m_patternCache[i];
         uint32_t hitCount = 0;
 
         if (i < m_hitCounters.size()) {
-            try {
-                // Use atomic_ref for safe read
-                std::atomic_ref<const uint64_t> counter(m_hitCounters[i]);
-                const uint64_t rawCount = counter.load(std::memory_order_relaxed);
-                
-                // Safe narrowing conversion
-                hitCount = static_cast<uint32_t>(
-                    (std::min)(rawCount, static_cast<uint64_t>((std::numeric_limits<uint32_t>::max)()))
-                );
-            } catch (...) {
-                // Fall back to cached value
-                hitCount = meta.hitCount;
-            }
+            std::atomic_ref<uint64_t> counter(m_hitCounters[i]);
+            const uint64_t rawCount = counter.load(std::memory_order_relaxed);
+            hitCount = static_cast<uint32_t>(
+                (std::min)(rawCount, static_cast<uint64_t>((std::numeric_limits<uint32_t>::max)()))
+            );
         } else {
             hitCount = meta.hitCount;
         }
@@ -2707,5 +2720,5 @@ size_t HammingDistance(
 
 } // namespace PatternUtils
 
-} // namespace SignatureStore
+} // namespace PatternStore
 } // namespace ShadowStrike

@@ -61,8 +61,17 @@
 namespace ShadowStrike {
     namespace PatternStore {
 
-        // Import types from SignatureStore namespace
-        using namespace ShadowStrike::SignatureStore;
+        // Import specific types from SignatureStore namespace
+        // (explicit using-declarations to avoid polluting every includer)
+        using ShadowStrike::SignatureStore::StoreError;
+        using ShadowStrike::SignatureStore::SignatureStoreError;
+        using ShadowStrike::SignatureStore::DetectionResult;
+        using ShadowStrike::SignatureStore::ThreatLevel;
+        using ShadowStrike::SignatureStore::PatternMode;
+        using ShadowStrike::SignatureStore::QueryOptions;
+        using ShadowStrike::SignatureStore::MemoryMappedView;
+        using ShadowStrike::SignatureStore::SignatureDatabaseHeader;
+        using ShadowStrike::SignatureStore::PatternIndex;
 
         // ============================================================================
         // AHO-CORASICK AUTOMATON (Multi-Pattern Matching)
@@ -241,11 +250,11 @@ namespace ShadowStrike {
             PatternStore();
             ~PatternStore();
 
-            // Disable copy, enable move
+            // Non-copyable, non-movable (contains std::shared_mutex and std::atomic members)
             PatternStore(const PatternStore&) = delete;
             PatternStore& operator=(const PatternStore&) = delete;
-            PatternStore(PatternStore&&) noexcept = default;
-            PatternStore& operator=(PatternStore&&) noexcept = default;
+            PatternStore(PatternStore&&) = delete;
+            PatternStore& operator=(PatternStore&&) = delete;
 
             // ========================================================================
             // INITIALIZATION & LIFECYCLE
@@ -302,6 +311,9 @@ namespace ShadowStrike {
 
             private:
                 friend class PatternStore;
+                // LIFETIME CONTRACT: m_store is a non-owning observer pointer.
+                // The PatternStore that created this ScanContext MUST outlive it.
+                // Destroying the PatternStore while ScanContext is alive is undefined behavior.
                 const PatternStore* m_store{ nullptr };
                 std::vector<uint8_t> m_buffer;
                 size_t m_totalBytesProcessed{ 0 };
@@ -391,6 +403,9 @@ namespace ShadowStrike {
                 size_t automatonNodeCount{ 0 };
             };
 
+            // Alias for cross-module integration (SignatureStore.hpp uses PatternStore::StoreStatistics)
+            using StoreStatistics = PatternStoreStatistics;
+
             [[nodiscard]] PatternStoreStatistics GetStatistics() const noexcept;
             void ResetStatistics() noexcept;
 
@@ -399,168 +414,161 @@ namespace ShadowStrike {
 
             [[nodiscard]] std::wstring GetDatabasePath() const noexcept;
 
-           // Get database header
-           [[nodiscard]] const SignatureDatabaseHeader* GetHeader() const noexcept;
-       
+            // Get database header
+            [[nodiscard]] const SignatureDatabaseHeader* GetHeader() const noexcept;
 
-    // ========================================================================
-    // OPTIMIZATION & MAINTENANCE
-    // ========================================================================
+            // ========================================================================
+            // OPTIMIZATION & MAINTENANCE
+            // ========================================================================
 
-    // Rebuild automaton (optimize after many updates)
-    [[nodiscard]] StoreError Rebuild() noexcept;
+            [[nodiscard]] StoreError Rebuild() noexcept;
+            [[nodiscard]] StoreError OptimizeByHitRate() noexcept;
 
-    // Optimize pattern order by hit frequency
-    [[nodiscard]] StoreError OptimizeByHitRate() noexcept;
+            [[nodiscard]] StoreError Verify(
+                std::function<void(const std::string&)> logCallback = nullptr
+            ) const noexcept;
 
-    // Verify database integrity
-    [[nodiscard]] StoreError Verify(
-        std::function<void(const std::string&)> logCallback = nullptr
-    ) const noexcept;
+            [[nodiscard]] StoreError Flush() noexcept;
+            [[nodiscard]] StoreError Compact() noexcept;
 
-    // Flush changes to disk
-    [[nodiscard]] StoreError Flush() noexcept;
+            // ========================================================================
+            // ADVANCED FEATURES
+            // ========================================================================
 
-    // Compact database (remove fragmentation)
-    [[nodiscard]] StoreError Compact() noexcept;
+            void SetSIMDEnabled(bool enabled) noexcept {
+                m_simdEnabled.store(enabled, std::memory_order_release);
+            }
 
-    // ========================================================================
-    // ADVANCED FEATURES
-    // ========================================================================
+            // Set scan buffer size (clamped to [64KB, 1GB])
+            void SetScanBufferSize(size_t bytes) noexcept {
+                constexpr size_t kMin = 64 * 1024;
+                constexpr size_t kMax = 1024ULL * 1024ULL * 1024ULL;
+                if (bytes < kMin) bytes = kMin;
+                if (bytes > kMax) bytes = kMax;
+                m_scanBufferSize.store(bytes, std::memory_order_release);
+            }
 
-    // Enable/disable SIMD acceleration
-    void SetSIMDEnabled(bool enabled) noexcept {
-        m_simdEnabled.store(enabled, std::memory_order_release);
-    }
+            void SetHeatmapEnabled(bool enabled) noexcept {
+                m_heatmapEnabled.store(enabled, std::memory_order_release);
+            }
 
-    // Set scan buffer size (for file scanning)
-    void SetScanBufferSize(size_t bytes) noexcept {
-        m_scanBufferSize = bytes;
-    }
+            [[nodiscard]] std::vector<std::pair<uint64_t, uint32_t>> GetHeatmap() const noexcept;
 
-    // Enable pattern heatmap tracking
-    void SetHeatmapEnabled(bool enabled) noexcept {
-        m_heatmapEnabled.store(enabled, std::memory_order_release);
-    }
+        private:
+            // ========================================================================
+            // INTERNAL METHODS
+            // ========================================================================
 
-    // Get pattern hit heatmap (for optimization)
-    [[nodiscard]] std::vector<std::pair<uint64_t, uint32_t>> GetHeatmap() const noexcept;
+            [[nodiscard]] StoreError OpenMemoryMapping(
+                const std::wstring& path,
+                bool readOnly
+            ) noexcept;
 
-private:
-    // ========================================================================
-    // INTERNAL METHODS
-    // ========================================================================
+            void CloseMemoryMapping() noexcept;
 
-    [[nodiscard]] StoreError OpenMemoryMapping(
-        const std::wstring& path,
-        bool readOnly
-    ) noexcept;
+            [[nodiscard]] StoreError BuildAutomaton() noexcept;
 
-    void CloseMemoryMapping() noexcept;
+            // Internal flush without locking (caller must hold appropriate lock)
+            [[nodiscard]] StoreError FlushInternal() noexcept;
 
-    [[nodiscard]] StoreError BuildAutomaton() noexcept;
+            [[nodiscard]] std::vector<DetectionResult> ScanWithAutomaton(
+                std::span<const uint8_t> buffer,
+                const QueryOptions& options,
+                const LARGE_INTEGER& deadline
+            ) const noexcept;
 
-    [[nodiscard]] std::vector<DetectionResult> ScanWithAutomaton(
-        std::span<const uint8_t> buffer,
-        const QueryOptions& options
-    ) const noexcept;
+            [[nodiscard]] std::vector<DetectionResult> ScanWithSIMD(
+                std::span<const uint8_t> buffer,
+                const QueryOptions& options,
+                const LARGE_INTEGER& deadline
+            ) const noexcept;
 
-    [[nodiscard]] std::vector<DetectionResult> ScanWithSIMD(
-        std::span<const uint8_t> buffer,
-        const QueryOptions& options
-    ) const noexcept;
+            [[nodiscard]] DetectionResult BuildDetectionResult(
+                uint64_t patternId,
+                size_t offset,
+                uint64_t matchTimeNs
+            ) const noexcept;
 
-    [[nodiscard]] DetectionResult BuildDetectionResult(
-        uint64_t patternId,
-        size_t offset,
-        uint64_t matchTimeNs
-    ) const noexcept;
+            void UpdateHitCount(uint64_t patternId) const noexcept;
 
-    void UpdateHitCount(uint64_t patternId) noexcept;
+            [[nodiscard]] bool IsDeadlineExceeded(const LARGE_INTEGER& deadline) const noexcept;
 
-    // ========================================================================
-    // INTERNAL STATE
-    // ========================================================================
+            // ========================================================================
+            // INTERNAL STATE
+            // ========================================================================
 
-    std::wstring m_databasePath;
-    MemoryMappedView m_mappedView{};
-    std::atomic<bool> m_initialized{false};
-    std::atomic<bool> m_readOnly{true};
+            std::wstring m_databasePath;
+            MemoryMappedView m_mappedView{};
+            std::atomic<bool> m_initialized{false};
+            std::atomic<bool> m_readOnly{true};
 
-    // Pattern index and automaton
-    std::unique_ptr<PatternIndex> m_patternIndex;
-    std::unique_ptr<AhoCorasickAutomaton> m_automaton;
+            std::unique_ptr<PatternIndex> m_patternIndex;
+            std::unique_ptr<AhoCorasickAutomaton> m_automaton;
 
-    // Pattern metadata cache
-    struct PatternMetadata {
-        uint64_t signatureId;
-        std::string name;
-        ThreatLevel threatLevel;
-        PatternMode mode;
-        std::vector<uint8_t> pattern;
-        std::vector<uint8_t> mask;
-        float entropy;
-        uint32_t hitCount;
-        std::string description;                    // Threat description
-        std::vector<std::string> tags;              // Classification tags
-        std::chrono::system_clock::time_point created;      // Creation timestamp
-        std::chrono::system_clock::time_point lastModified; // Last update
-        uint32_t modificationCount = 0;             // Change counter
-        bool isDeprecated = false;                  // Deprecation flag
-        std::string deprecationReason;              // Why deprecated
-    };
-   mutable std::vector<PatternMetadata> m_patternCache;
-   
-    // Lock-free hit counters for thread-safe updates during scanning
-    // Indexed by signatureId, resized when patterns are added
-   mutable std::vector<uint64_t> m_hitCounters;
+            struct PatternMetadata {
+                uint64_t signatureId;
+                std::string name;
+                ThreatLevel threatLevel;
+                PatternMode mode;
+                std::vector<uint8_t> pattern;
+                std::vector<uint8_t> mask;
+                float entropy;
+                uint32_t hitCount;
+                std::string description;
+                std::vector<std::string> tags;
+                std::chrono::system_clock::time_point created;
+                std::chrono::system_clock::time_point lastModified;
+                uint32_t modificationCount = 0;
+                bool isDeprecated = false;
+                std::string deprecationReason;
+            };
+            mutable std::vector<PatternMetadata> m_patternCache;
 
-    // Statistics
-    mutable std::atomic<uint64_t> m_totalScans{0};
-    mutable std::atomic<uint64_t> m_totalMatches{0};
-    mutable std::atomic<uint64_t> m_totalBytesScanned{0};
+            // Hit counters: access only under m_globalLock (shared for reads/increments
+            // via atomic_ref, exclusive for resize).
+            mutable std::vector<uint64_t> m_hitCounters;
 
-    // Configuration
-    std::atomic<bool> m_simdEnabled{true};
-    std::atomic<bool> m_heatmapEnabled{true};
-    size_t m_scanBufferSize{4 * 1024 * 1024};            // 4MB default
+            mutable std::atomic<uint64_t> m_totalScans{0};
+            mutable std::atomic<uint64_t> m_totalMatches{0};
+            mutable std::atomic<uint64_t> m_totalBytesScanned{0};
 
-    // Synchronization
-    mutable std::shared_mutex m_globalLock;
+            std::atomic<bool> m_simdEnabled{true};
+            std::atomic<bool> m_heatmapEnabled{true};
+            std::atomic<size_t> m_scanBufferSize{4 * 1024 * 1024};
 
-    // Performance monitoring
-    LARGE_INTEGER m_perfFrequency{};
-};
+            mutable std::shared_mutex m_globalLock;
 
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
+            LARGE_INTEGER m_perfFrequency{};
+        };
 
-namespace PatternUtils {
+        // Namespace-level alias so consumers can write PatternStore::StoreStatistics
+        using StoreStatistics = PatternStore::PatternStoreStatistics;
 
-// Validate pattern string syntax
-[[nodiscard]] bool IsValidPatternString(
-    const std::string& pattern,
-    std::string& errorMessage
-) noexcept;
+        // ============================================================================
+        // UTILITY FUNCTIONS
+        // ============================================================================
 
-// Convert hex string to bytes
-[[nodiscard]] std::optional<std::vector<uint8_t>> HexStringToBytes(
-    const std::string& hexStr
-) noexcept;
+        namespace PatternUtils {
 
-// Convert bytes to hex string
-[[nodiscard]] std::string BytesToHexString(
-    std::span<const uint8_t> bytes
-) noexcept;
+        [[nodiscard]] bool IsValidPatternString(
+            const std::string& pattern,
+            std::string& errorMessage
+        ) noexcept;
 
-// Calculate Hamming distance between patterns
-[[nodiscard]] size_t HammingDistance(
-    std::span<const uint8_t> a,
-    std::span<const uint8_t> b
-) noexcept;
+        [[nodiscard]] std::optional<std::vector<uint8_t>> HexStringToBytes(
+            const std::string& hexStr
+        ) noexcept;
 
-} // namespace PatternUtils
+        [[nodiscard]] std::string BytesToHexString(
+            std::span<const uint8_t> bytes
+        ) noexcept;
 
-} // namespace SignatureStore
+        [[nodiscard]] size_t HammingDistance(
+            std::span<const uint8_t> a,
+            std::span<const uint8_t> b
+        ) noexcept;
+
+        } // namespace PatternUtils
+
+    } // namespace PatternStore
 } // namespace ShadowStrike
