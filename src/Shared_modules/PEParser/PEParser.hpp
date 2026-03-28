@@ -585,7 +585,7 @@ public:
      * @param machine Machine type value.
      * @return Machine type string.
      */
-    [[nodiscard]] static std::wstring MachineToString(uint16_t machine) noexcept;
+    [[nodiscard]] static std::wstring_view MachineToString(uint16_t machine) noexcept;
 
     /**
      * @brief Get subsystem as human-readable string.
@@ -593,7 +593,7 @@ public:
      * @param subsystem Subsystem value.
      * @return Subsystem string.
      */
-    [[nodiscard]] static std::wstring SubsystemToString(uint16_t subsystem) noexcept;
+    [[nodiscard]] static std::wstring_view SubsystemToString(uint16_t subsystem) noexcept;
 
 private:
     std::unique_ptr<PEParserImpl> m_impl;

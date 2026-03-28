@@ -349,8 +349,15 @@ public:
             return false;
         }
 
+        // Verify pointer alignment for type T to avoid undefined behavior
+        const uint8_t* ptr = m_data + offset;
+        if constexpr (alignof(T) > 1) {
+            if (reinterpret_cast<uintptr_t>(ptr) % alignof(T) != 0) {
+                return false;  // Misaligned access would be UB
+            }
+        }
         out = std::span<const T>(
-            reinterpret_cast<const T*>(m_data + offset),
+            reinterpret_cast<const T*>(ptr),
             count
         );
         return true;

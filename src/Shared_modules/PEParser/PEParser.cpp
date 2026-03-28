@@ -236,7 +236,8 @@ public:
             return;
         }
         if (ddEnd > headerSize) {
-            ddCount = (headerSize - sizeof(OptionalHeader32)) / sizeof(DataDirectoryEntry);
+            if (headerSize < sizeof(OptionalHeader32)) { ddCount = 0; }
+            else { ddCount = (headerSize - sizeof(OptionalHeader32)) / sizeof(DataDirectoryEntry); }
         }
 
         for (size_t i = 0; i < ddCount && i < DataDirectory::MAX_ENTRIES; ++i) {
@@ -270,7 +271,8 @@ public:
             return;
         }
         if (ddEnd > headerSize) {
-            ddCount = (headerSize - sizeof(OptionalHeader64)) / sizeof(DataDirectoryEntry);
+            if (headerSize < sizeof(OptionalHeader64)) { ddCount = 0; }
+            else { ddCount = (headerSize - sizeof(OptionalHeader64)) / sizeof(DataDirectoryEntry); }
         }
 
         for (size_t i = 0; i < ddCount && i < DataDirectory::MAX_ENTRIES; ++i) {
@@ -411,8 +413,9 @@ public:
                 secSize = sec.rawSize;
             }
 
+            uint64_t secEnd = static_cast<uint64_t>(secStart) + static_cast<uint64_t>(secSize);
             if (m_info.entryPointRva >= secStart &&
-                m_info.entryPointRva < secStart + secSize) {
+                m_info.entryPointRva < secEnd) {
                 m_info.entryPointSectionIndex = i;
                 m_info.entryPointInExecutableSection = sec.isExecutable;
 
@@ -598,7 +601,8 @@ public:
                 secVSize = sec.SizeOfRawData;
             }
 
-            if (rva >= secVa && rva < secVa + secVSize) {
+            uint64_t secEnd = static_cast<uint64_t>(secVa) + static_cast<uint64_t>(secVSize);
+            if (rva >= secVa && rva < secEnd) {
                 // Calculate offset within section
                 uint32_t sectionOffset = rva - secVa;
 
@@ -669,6 +673,7 @@ public:
             ImportInfo import;
             import.originalFirstThunk = desc.OriginalFirstThunk;
             import.firstThunk = desc.FirstThunk;
+            import.isBoundImport = (desc.TimeDateStamp != 0 && desc.TimeDateStamp != static_cast<uint32_t>(-1));
 
             // Parse DLL name
             if (desc.Name != 0) {
@@ -720,6 +725,8 @@ public:
                 if (thunk & ORDINAL_FLAG64) {
                     func.byOrdinal = true;
                     func.ordinal = static_cast<uint16_t>(thunk & 0xFFFF);
+                } else if ((thunk & 0xFFFFFFFF00000000ULL) != 0) {
+                    // Invalid: non-zero upper bits in non-ordinal thunk — skip
                 } else {
                     auto hintNameOffset = RvaToOffsetInternal(static_cast<uint32_t>(thunk));
                     if (hintNameOffset) {
@@ -847,7 +854,8 @@ public:
             eat[i].rva = funcRva;
 
             // Forwarder: RVA falls within the export directory bounds
-            if (funcRva >= exportDir.rva && funcRva < exportDir.rva + exportDir.size) {
+            uint64_t exportDirEnd = static_cast<uint64_t>(exportDir.rva) + static_cast<uint64_t>(exportDir.size);
+            if (funcRva >= exportDir.rva && funcRva < exportDirEnd) {
                 eat[i].isForwarder = true;
                 auto fwdOffset = RvaToOffsetInternal(funcRva);
                 if (fwdOffset) {
@@ -1025,7 +1033,10 @@ public:
 
         std::unordered_set<size_t> visitedBlocks;
         size_t offset = *relocOffset;
-        size_t endOffset = *relocOffset + relocDir.size;
+        size_t endOffset;
+        if (!SafeMath::SafeAdd(*relocOffset, static_cast<size_t>(relocDir.size), endOffset)) {
+            return false;
+        }
         size_t blockCount = 0;
         size_t totalEntries = 0;
 
@@ -1952,7 +1963,7 @@ bool PEParser::VerifyChecksum() const noexcept {
     return computed == m_impl->m_info.checksum;
 }
 
-std::wstring PEParser::MachineToString(uint16_t machine) noexcept {
+std::wstring_view PEParser::MachineToString(uint16_t machine) noexcept {
     switch (machine) {
         case Machine::UNKNOWN:   return L"Unknown";
         case Machine::I386:      return L"Intel 386";
@@ -1969,11 +1980,11 @@ std::wstring PEParser::MachineToString(uint16_t machine) noexcept {
         case Machine::SH3:       return L"Hitachi SH3";
         case Machine::SH4:       return L"Hitachi SH4";
         case Machine::EBC:       return L"EFI Byte Code";
-        default:                 return L"Unknown (" + std::to_wstring(machine) + L")";
+        default:                 return L"Unknown";
     }
 }
 
-std::wstring PEParser::SubsystemToString(uint16_t subsystem) noexcept {
+std::wstring_view PEParser::SubsystemToString(uint16_t subsystem) noexcept {
     switch (subsystem) {
         case Subsystem::UNKNOWN:                  return L"Unknown";
         case Subsystem::NATIVE:                   return L"Native (Driver)";
@@ -1989,7 +2000,7 @@ std::wstring PEParser::SubsystemToString(uint16_t subsystem) noexcept {
         case Subsystem::EFI_ROM:                  return L"EFI ROM";
         case Subsystem::XBOX:                     return L"Xbox";
         case Subsystem::WINDOWS_BOOT_APPLICATION: return L"Windows Boot Application";
-        default:                                  return L"Unknown (" + std::to_wstring(subsystem) + L")";
+        default:                                  return L"Unknown";
     }
 }
 

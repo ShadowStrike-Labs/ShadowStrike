@@ -25,6 +25,8 @@
 #include "PEValidation.hpp"
 #include "../Utils/Logger.hpp"
 
+#include <limits>
+
 namespace ShadowStrike {
 namespace PEParser {
 
@@ -413,33 +415,35 @@ namespace PEParser {
 
     if (magic == PE64_MAGIC) {
         outIs64Bit = true;
-        if (outFileHeader.SizeOfOptionalHeader < sizeof(OptionalHeader64)) {
-            // Allow smaller if NumberOfRvaAndSizes is reduced
-            if (outFileHeader.SizeOfOptionalHeader < sizeof(OptionalHeader64)) {  // Minimum PE64 header
-                if (err) {
-                    err->Set(ValidationResult::SizeOfOptionalHeaderTooSmall,
-                             L"PE64 optional header too small",
-                             fileHeaderOffset + offsetof(FileHeader, SizeOfOptionalHeader));
-                }
-                return ValidationResult::SizeOfOptionalHeaderTooSmall;
+        // Minimum: base optional header without any data directories
+        constexpr size_t kMinPE64Header = offsetof(OptionalHeader64, DataDirectory);
+        if (outFileHeader.SizeOfOptionalHeader < kMinPE64Header) {
+            if (err) {
+                err->Set(ValidationResult::SizeOfOptionalHeaderTooSmall,
+                         L"PE64 optional header too small",
+                         fileHeaderOffset + offsetof(FileHeader, SizeOfOptionalHeader));
             }
+            return ValidationResult::SizeOfOptionalHeaderTooSmall;
         }
     } else if (magic == PE32_MAGIC) {
         outIs64Bit = false;
-        if (outFileHeader.SizeOfOptionalHeader < sizeof(OptionalHeader32)) {
-            // Allow smaller if NumberOfRvaAndSizes is reduced
-            if (outFileHeader.SizeOfOptionalHeader < sizeof(OptionalHeader32)) {  // Minimum PE32 header
-                if (err) {
-                    err->Set(ValidationResult::SizeOfOptionalHeaderTooSmall,
-                             L"PE32 optional header too small",
-                             fileHeaderOffset + offsetof(FileHeader, SizeOfOptionalHeader));
-                }
-                return ValidationResult::SizeOfOptionalHeaderTooSmall;
+        constexpr size_t kMinPE32Header = offsetof(OptionalHeader32, DataDirectory);
+        if (outFileHeader.SizeOfOptionalHeader < kMinPE32Header) {
+            if (err) {
+                err->Set(ValidationResult::SizeOfOptionalHeaderTooSmall,
+                         L"PE32 optional header too small",
+                         fileHeaderOffset + offsetof(FileHeader, SizeOfOptionalHeader));
             }
+            return ValidationResult::SizeOfOptionalHeaderTooSmall;
         }
     } else if (magic == ROM_MAGIC) {
-        // ROM images - rare but valid
-        outIs64Bit = false;
+        // ROM images are not standard Windows PE format — reject and flag
+        if (err) {
+            err->Set(ValidationResult::InvalidOptionalMagic,
+                     L"ROM image magic (0x107) not supported — potential evasion",
+                     optionalOffset);
+        }
+        return ValidationResult::InvalidOptionalMagic;
     } else {
         if (err) {
             err->Set(ValidationResult::InvalidOptionalMagic,
@@ -606,6 +610,42 @@ namespace PEParser {
         return ValidationResult::SizeOfHeadersNotAligned;
     }
 
+    // Validate subsystem
+    switch (outOptional.Subsystem) {
+        case 0:   // IMAGE_SUBSYSTEM_UNKNOWN
+        case 1:   // IMAGE_SUBSYSTEM_NATIVE
+        case 2:   // IMAGE_SUBSYSTEM_WINDOWS_GUI
+        case 3:   // IMAGE_SUBSYSTEM_WINDOWS_CUI
+        case 5:   // IMAGE_SUBSYSTEM_OS2_CUI
+        case 7:   // IMAGE_SUBSYSTEM_POSIX_CUI
+        case 8:   // IMAGE_SUBSYSTEM_NATIVE_WINDOWS
+        case 9:   // IMAGE_SUBSYSTEM_WINDOWS_CE_GUI
+        case 10:  // IMAGE_SUBSYSTEM_EFI_APPLICATION
+        case 11:  // IMAGE_SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER
+        case 12:  // IMAGE_SUBSYSTEM_EFI_RUNTIME_DRIVER
+        case 13:  // IMAGE_SUBSYSTEM_EFI_ROM
+        case 14:  // IMAGE_SUBSYSTEM_XBOX
+        case 16:  // IMAGE_SUBSYSTEM_WINDOWS_BOOT_APPLICATION
+            break;
+        default:
+            if (err) {
+                err->Set(ValidationResult::InvalidSubsystem,
+                         L"Invalid PE subsystem value",
+                         offset + offsetof(OptionalHeader32, Subsystem));
+            }
+            return ValidationResult::InvalidSubsystem;
+    }
+
+    // Validate ImageBase alignment (must be multiple of 64KB)
+    if (outOptional.ImageBase % 0x10000 != 0) {
+        if (err) {
+            err->Set(ValidationResult::InvalidImageBase,
+                     L"ImageBase not aligned to 64KB boundary",
+                     offset + offsetof(OptionalHeader32, ImageBase));
+        }
+        return ValidationResult::InvalidImageBase;
+    }
+
     return ValidationResult::Valid;
 }
 
@@ -761,6 +801,42 @@ namespace PEParser {
         return ValidationResult::SizeOfHeadersNotAligned;
     }
 
+    // Validate subsystem
+    switch (outOptional.Subsystem) {
+        case 0:   // IMAGE_SUBSYSTEM_UNKNOWN
+        case 1:   // IMAGE_SUBSYSTEM_NATIVE
+        case 2:   // IMAGE_SUBSYSTEM_WINDOWS_GUI
+        case 3:   // IMAGE_SUBSYSTEM_WINDOWS_CUI
+        case 5:   // IMAGE_SUBSYSTEM_OS2_CUI
+        case 7:   // IMAGE_SUBSYSTEM_POSIX_CUI
+        case 8:   // IMAGE_SUBSYSTEM_NATIVE_WINDOWS
+        case 9:   // IMAGE_SUBSYSTEM_WINDOWS_CE_GUI
+        case 10:  // IMAGE_SUBSYSTEM_EFI_APPLICATION
+        case 11:  // IMAGE_SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER
+        case 12:  // IMAGE_SUBSYSTEM_EFI_RUNTIME_DRIVER
+        case 13:  // IMAGE_SUBSYSTEM_EFI_ROM
+        case 14:  // IMAGE_SUBSYSTEM_XBOX
+        case 16:  // IMAGE_SUBSYSTEM_WINDOWS_BOOT_APPLICATION
+            break;
+        default:
+            if (err) {
+                err->Set(ValidationResult::InvalidSubsystem,
+                         L"Invalid PE subsystem value",
+                         offset + offsetof(OptionalHeader64, Subsystem));
+            }
+            return ValidationResult::InvalidSubsystem;
+    }
+
+    // Validate ImageBase alignment (must be multiple of 64KB)
+    if (outOptional.ImageBase % 0x10000 != 0) {
+        if (err) {
+            err->Set(ValidationResult::InvalidImageBase,
+                     L"ImageBase not aligned to 64KB boundary",
+                     offset + offsetof(OptionalHeader64, ImageBase));
+        }
+        return ValidationResult::InvalidImageBase;
+    }
+
     return ValidationResult::Valid;
 }
 
@@ -868,7 +944,9 @@ namespace PEParser {
         size_t s1Start = s1.PointerToRawData;
         size_t s1End;
         if (!SafeMath::SafeAdd(s1Start, static_cast<size_t>(s1.SizeOfRawData), s1End)) {
-            continue;  // Overflow, skip
+            // Overflow means the section wraps the address space — treat as
+            // extending to maximum so it correctly overlaps with everything.
+            s1End = std::numeric_limits<size_t>::max();
         }
 
         for (size_t j = i + 1; j < sections.size(); ++j) {
@@ -878,7 +956,7 @@ namespace PEParser {
             size_t s2Start = s2.PointerToRawData;
             size_t s2End;
             if (!SafeMath::SafeAdd(s2Start, static_cast<size_t>(s2.SizeOfRawData), s2End)) {
-                continue;  // Overflow, skip
+                s2End = std::numeric_limits<size_t>::max();
             }
 
             // Check for overlap
@@ -898,7 +976,9 @@ namespace PEParser {
 
         size_t s1VStart = s1.VirtualAddress;
         size_t s1VEnd;
-        if (!SafeMath::SafeAdd(s1VStart, static_cast<size_t>(s1VSize), s1VEnd)) continue;
+        if (!SafeMath::SafeAdd(s1VStart, static_cast<size_t>(s1VSize), s1VEnd)) {
+            s1VEnd = std::numeric_limits<size_t>::max();
+        }
 
         for (size_t j = i + 1; j < sections.size(); ++j) {
             const auto& s2 = sections[j];
@@ -907,7 +987,9 @@ namespace PEParser {
 
             size_t s2VStart = s2.VirtualAddress;
             size_t s2VEnd;
-            if (!SafeMath::SafeAdd(s2VStart, static_cast<size_t>(s2VSize), s2VEnd)) continue;
+            if (!SafeMath::SafeAdd(s2VStart, static_cast<size_t>(s2VSize), s2VEnd)) {
+                s2VEnd = std::numeric_limits<size_t>::max();
+            }
 
             if (s1VStart < s2VEnd && s2VStart < s1VEnd) {
                 // Avoid duplicating a pair already recorded in pass 1
