@@ -73,6 +73,15 @@ namespace ShadowStrike {
         using ShadowStrike::SignatureStore::SignatureDatabaseHeader;
         using ShadowStrike::SignatureStore::PatternIndex;
 
+        // Database-format constants — referenced by PatternStore.cpp
+        using ShadowStrike::SignatureStore::SIGNATURE_DB_MAGIC;
+        using ShadowStrike::SignatureStore::SIGNATURE_DB_VERSION_MAJOR;
+        using ShadowStrike::SignatureStore::SIGNATURE_DB_VERSION_MINOR;
+
+        // Namespace aliases for Format and MemoryMapping utilities
+        namespace Format       = ShadowStrike::SignatureStore::Format;
+        namespace MemoryMapping = ShadowStrike::SignatureStore::MemoryMapping;
+
         // ============================================================================
         // AHO-CORASICK AUTOMATON (Multi-Pattern Matching)
         // ============================================================================

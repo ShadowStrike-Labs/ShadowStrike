@@ -756,6 +756,10 @@ namespace ShadowStrike {
             // STEP 5: TRIE-BASED PATTERN SEARCH
             // ========================================================================
 
+            // searchAborted is set inside collectOutputs lambda — must be declared
+            // before the lambda so it is in scope when the lambda captures [&].
+            bool searchAborted = false;
+
             // Lambda: collect output matches at the given node.
             // Used after every node transition (child or failure link).
             auto collectOutputs = [&](const TrieNodeBinary* node, size_t matchPos) {
@@ -813,7 +817,6 @@ namespace ShadowStrike {
 
             uint32_t currentNodeOffset = rootOffset;
             const TrieNodeBinary* currentNode = rootNode;
-            bool searchAborted = false;
 
             for (size_t bufIdx = 0; bufIdx < buffer.size() && !searchAborted; ++bufIdx) {
                 const uint8_t byte = buffer[bufIdx];
