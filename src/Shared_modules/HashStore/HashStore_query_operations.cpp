@@ -22,7 +22,6 @@
 #include<tlsh/tlsh.h>
 #include "../FuzzyHasher/FuzzyHasher.hpp"
 #include <format>
-#include <numeric>
 
 namespace ShadowStrike {
 	namespace HashStore {
@@ -285,9 +284,7 @@ namespace ShadowStrike {
         ) const noexcept {
             std::vector<DetectionResult> results;
 
-            // Track similarity scores in parallel with results for proper sort ordering.
-            // DetectionResult has no similarity field (HEADER PATCH NEEDED to add one).
-            std::vector<int32_t> resultSimilarities;
+            // Similarity scores are stored directly on DetectionResult::similarity [0,1].
 
             // ========================================================================
             // STEP 1: CRITICAL INPUT VALIDATION
@@ -844,18 +841,10 @@ namespace ShadowStrike {
                     );
 
                     result.matchTimeNanoseconds = computeTimeUs * 1000;
-
-                    // Append similarity info (allocation-safe — non-critical annotation)
-                    try {
-                        result.description += std::format(
-                            " [Fuzzy Match: {}% similarity]", similarityScore);
-                    } catch (const std::exception&) {
-                        // Non-critical: proceed without similarity annotation
-                    }
+                    result.similarity = static_cast<float>(similarityScore) / 100.0f;
 
                     try {
                         results.push_back(std::move(result));
-                        resultSimilarities.push_back(similarityScore);
                     } catch (const std::bad_alloc&) {
                         SS_LOG_ERROR(L"HashStore", L"FuzzyMatch: Allocation failure adding match");
                         break;
@@ -934,21 +923,12 @@ namespace ShadowStrike {
             // ========================================================================
 
             // Sort results by similarity score (descending — highest match first)
-            if (results.size() > 1 && resultSimilarities.size() == results.size()) {
+            if (results.size() > 1) {
                 try {
-                    std::vector<size_t> sortIdx(results.size());
-                    std::iota(sortIdx.begin(), sortIdx.end(), size_t{0});
-                    std::sort(sortIdx.begin(), sortIdx.end(),
-                        [&resultSimilarities](size_t a, size_t b) {
-                            return resultSimilarities[a] > resultSimilarities[b];
+                    std::sort(results.begin(), results.end(),
+                        [](const DetectionResult& a, const DetectionResult& b) noexcept {
+                            return a.similarity > b.similarity;
                         });
-
-                    std::vector<DetectionResult> sorted;
-                    sorted.reserve(results.size());
-                    for (size_t idx : sortIdx) {
-                        sorted.push_back(std::move(results[idx]));
-                    }
-                    results = std::move(sorted);
                 } catch (const std::exception&) {
                     // Sort allocation failed — return unsorted results rather than crash
                     SS_LOG_WARN(L"HashStore",

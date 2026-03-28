@@ -59,7 +59,7 @@
 #pragma comment(lib, "crypt32.lib")
 
 namespace ShadowStrike {
-    namespace SignatureStore {
+    namespace HashStore {
 
         // ============================================================================
         // HASH STORE IMPLEMENTATION
@@ -1513,5 +1513,5 @@ const SignatureDatabaseHeader* HashStore::GetHeader() const noexcept {
 }
 
 
-} // namespace SignatureStore
+} // namespace HashStore
 } // namespace ShadowStrike
