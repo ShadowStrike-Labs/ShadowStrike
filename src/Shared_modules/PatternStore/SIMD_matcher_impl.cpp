@@ -15,31 +15,48 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
-#include"pch.h"
+#include "pch.h"
 #include "PatternStore.hpp"
 #include "../Utils/Logger.hpp"
-#include "../Utils/FileUtils.hpp"
 
 #include <algorithm>
-#include <queue>
 #include <cctype>
-#include <sstream>
-#include <bit>
-#include <iomanip>
-#include <string>
-#include <mutex>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 
-// Platform-specific SIMD includes
+// ---------------------------------------------------------------------------
+// Platform SIMD intrinsics — always included on MSVC so runtime dispatch
+// works regardless of /arch: flag; guarded by CPUID+XSAVE checks at runtime.
+// On GCC/Clang, inclusion is gated by the compile-time __AVX2__/__AVX512F__
+// macros since those require -mavx2 / -mavx512f.
+// ---------------------------------------------------------------------------
 #ifdef _MSC_VER
-#include <intrin.h>      // MSVC intrinsics (__cpuid, __cpuidex)
-#endif
-
-#ifdef __AVX2__
-#include <immintrin.h>   // AVX2/AVX-512 intrinsics
+#  include <intrin.h>
+#  include <immintrin.h>
+#  define SS_HAS_AVX2_INTRINSICS   1
+#  define SS_HAS_AVX512_INTRINSICS 1
+// Portable trailing-zero-count: MSVC _BitScanForward[64]
+#  define SS_TZCNT32(x) ([](unsigned long _v) noexcept -> int { \
+        unsigned long _i = 0; _BitScanForward(&_i, _v); return static_cast<int>(_i); \
+    }(static_cast<unsigned long>(x)))
+#  define SS_TZCNT64(x) ([](unsigned __int64 _v) noexcept -> int { \
+        unsigned long _i = 0; _BitScanForward64(&_i, _v); return static_cast<int>(_i); \
+    }(static_cast<unsigned __int64>(x)))
+#else
+#  if defined(__AVX2__)
+#    include <immintrin.h>
+#    define SS_HAS_AVX2_INTRINSICS 1
+#  endif
+#  if defined(__AVX512F__)
+#    ifndef SS_HAS_AVX2_INTRINSICS
+#      include <immintrin.h>
+#    endif
+#    define SS_HAS_AVX512_INTRINSICS 1
+#  endif
+#  define SS_TZCNT32(x) __builtin_ctz(static_cast<unsigned int>(x))
+#  define SS_TZCNT64(x) __builtin_ctzll(static_cast<unsigned long long>(x))
 #endif
 
 // Branch prediction hints for performance-critical paths
@@ -54,7 +71,7 @@
 #endif
 
 namespace ShadowStrike {
-    namespace SignatureStore {
+    namespace PatternStore {
 
 
 
@@ -62,51 +79,66 @@ namespace ShadowStrike {
 // SIMD MATCHER IMPLEMENTATION
 // ============================================================================
 
-// TITANIUM: Thread-safe lazy initialization of CPU feature detection
 namespace {
-    // Cached CPU feature flags to avoid repeated CPUID calls
+    // File-scope constants — defined once, used by all three Search functions.
+    static constexpr size_t SIMD_MAX_MATCHES     = 10'000'000;
+    static constexpr size_t SIMD_MAX_BUFFER_SIZE = 1ULL * 1024 * 1024 * 1024; // 1 GB
+
+    // CPU feature detection with XSAVE/XCR0 validation.
+    // Without the OSXSAVE + XCR0 check the OS may not save/restore YMM/ZMM
+    // register state on context switches, making AVX instructions AV-crash the
+    // system in VMs, containers, or on older hypervisors.
     struct CPUFeatures {
-        bool hasAVX2 = false;
-        bool hasAVX512F = false;
-        bool initialized = false;
-        
-        void Initialize() noexcept {
-            if (initialized) return;
-            
+        bool hasAVX2{false};
+        bool hasAVX512F{false};
+
+        CPUFeatures() noexcept { Detect(); }
+
+    private:
+        void Detect() noexcept {
 #ifdef _MSC_VER
-            int cpuInfo[4] = {0, 0, 0, 0};
-            
-            // Get maximum supported CPUID level
+            int cpuInfo[4]{};
+
+            // Leaf 1 — check OSXSAVE (ECX bit 27): OS opted in to XSAVE.
+            __cpuid(cpuInfo, 1);
+            if (!(cpuInfo[2] & (1 << 27))) return;
+
+            // XCR0 — bits 1+2 (SSE+YMM state) must be set by the OS.
+            const uint64_t xcr0 = static_cast<uint64_t>(_xgetbv(0));
+            if ((xcr0 & 0x6ULL) != 0x6ULL) return;
+
+            // Leaf 7 — extended feature flags.
             __cpuid(cpuInfo, 0);
-            const int maxId = cpuInfo[0];
-            
-            if (maxId >= 7) {
+            if (cpuInfo[0] >= 7) {
                 __cpuidex(cpuInfo, 7, 0);
-                // EBX bit 5 = AVX2
                 hasAVX2 = (cpuInfo[1] & (1 << 5)) != 0;
-                // EBX bit 16 = AVX-512F (Foundation)
-                hasAVX512F = (cpuInfo[1] & (1 << 16)) != 0;
+                // AVX-512 also requires ZMM state saved (XCR0 bits 5-7).
+                const bool zmm_ok = (xcr0 & 0xE0ULL) == 0xE0ULL;
+                hasAVX512F = zmm_ok && ((cpuInfo[1] & (1 << 16)) != 0);
             }
 #elif defined(__GNUC__) || defined(__clang__)
-            // GCC/Clang intrinsics
-            unsigned int eax, ebx, ecx, edx;
+            unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+            if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) return;
+            if (!(ecx & (1u << 27))) return; // OSXSAVE
+
+            uint64_t xcr0 = 0;
+            __asm__ volatile("xgetbv" : "=A"(xcr0) : "c"(0u));
+            if ((xcr0 & 0x6ULL) != 0x6ULL) return;
+
             if (__get_cpuid_max(0, nullptr) >= 7) {
                 __cpuid_count(7, 0, eax, ebx, ecx, edx);
-                hasAVX2 = (ebx & (1 << 5)) != 0;
-                hasAVX512F = (ebx & (1 << 16)) != 0;
+                hasAVX2 = (ebx & (1u << 5)) != 0;
+                const bool zmm_ok = (xcr0 & 0xE0ULL) == 0xE0ULL;
+                hasAVX512F = zmm_ok && ((ebx & (1u << 16)) != 0);
             }
 #endif
-            initialized = true;
         }
     };
-    
-    // Thread-safe singleton for CPU features
-    CPUFeatures& GetCPUFeatures() noexcept {
-        static CPUFeatures features;
-        // Note: C++11 guarantees thread-safe static initialization
-        if (!features.initialized) {
-            features.Initialize();
-        }
+
+    // C++11 guarantees thread-safe initialisation of function-local statics —
+    // no explicit locking or double-checked locking needed.
+    const CPUFeatures& GetCPUFeatures() noexcept {
+        static const CPUFeatures features;
         return features;
     }
 } // anonymous namespace
@@ -139,174 +171,106 @@ std::vector<size_t> SIMDMatcher::SearchAVX2(
         return matches;
     }
     
-    // VALIDATION 3: Pattern size limit (must fit in reasonable search)
+    // VALIDATION 3: Pattern must fit in buffer
     if (pattern.size() > buffer.size()) {
-        return matches;
-    }
-    
-    // VALIDATION 4: Overflow-safe search length calculation
-    if (buffer.size() < pattern.size()) {
         return matches;
     }
     const size_t searchLen = buffer.size() - pattern.size() + 1;
     
-    // VALIDATION 5: Reasonable limits to prevent resource exhaustion
-    constexpr size_t MAX_MATCHES = 10000000; // 10M matches max
-    constexpr size_t MAX_BUFFER_SIZE = 1ULL * 1024 * 1024 * 1024; // 1GB
-    if (buffer.size() > MAX_BUFFER_SIZE) {
+    if (buffer.size() > SIMD_MAX_BUFFER_SIZE) {
         SS_LOG_WARN(L"SIMDMatcher", L"SearchAVX2: Buffer too large (%zu bytes)", buffer.size());
         return matches;
     }
 
-#ifdef __AVX2__
-    // Check for AVX2 support at runtime
-    if (!IsAVX2Available()) {
-        // Fall back to scalar search
-        goto scalar_fallback;
-    }
-    
-    // Pattern size limit for AVX2 optimization
-    // Patterns > 32 bytes need different approach
-    if (pattern.size() > 32) {
-        goto scalar_fallback;
-    }
-
-    try {
-        // Reserve reasonable capacity to avoid repeated allocations
-        matches.reserve(std::min(searchLen / 64, size_t(10000)));
-    }
-    catch (const std::bad_alloc&) {
-        SS_LOG_WARN(L"SIMDMatcher", L"SearchAVX2: Memory reservation failed");
-        // Continue without reservation
-    }
-
-    {
-        // Load pattern first byte into SIMD register (replicate 32 times)
-        const __m256i patternVec = _mm256_set1_epi8(static_cast<char>(pattern[0]));
-        const size_t patternLen = pattern.size();
-        size_t i = 0;
-
-        // ====================================================================
-        // PROCESS 32 BYTES AT A TIME (256-bit register)
-        // ====================================================================
-        for (; i + 32 <= searchLen; i += 32) {
-            // Load buffer chunk (using unaligned load for safety)
-            const __m256i bufferVec = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(buffer.data() + i)
-            );
-
-            // Compare first byte across all 32 positions
-            const __m256i cmp = _mm256_cmpeq_epi8(bufferVec, patternVec);
-            int mask = _mm256_movemask_epi8(cmp);
-
-            // Process each potential match position
-            while (mask != 0) {
-                // Find position of lowest set bit (first match)
-                const int pos = _tzcnt_u32(static_cast<unsigned int>(mask));
-                const size_t matchPos = i + static_cast<size_t>(pos);
-                
-                // TITANIUM: Strict bounds check before pattern verification
-                if (matchPos + patternLen <= buffer.size()) {
-                    // Verify full pattern match (first byte already matched)
-                    bool fullMatch = true;
-                    for (size_t j = 1; j < patternLen; ++j) {
-                        if (buffer[matchPos + j] != pattern[j]) {
-                            fullMatch = false;
-                            break;
-                        }
-                    }
-
-                    if (fullMatch) {
-                        // TITANIUM: Prevent unbounded growth
-                        if (matches.size() >= MAX_MATCHES) {
-                            SS_LOG_WARN(L"SIMDMatcher", L"SearchAVX2: Max matches reached");
-                            return matches;
-                        }
-                        
-                        try {
-                            matches.push_back(matchPos);
-                        }
-                        catch (const std::bad_alloc&) {
-                            SS_LOG_ERROR(L"SIMDMatcher", L"SearchAVX2: Out of memory");
-                            return matches;
-                        }
-                    }
-                }
-
-                // Clear lowest set bit to continue to next match
-                mask &= (mask - 1);
-            }
+#ifdef SS_HAS_AVX2_INTRINSICS
+    if (IsAVX2Available() && pattern.size() <= 32) {
+        try {
+            matches.reserve(std::min(searchLen / 64, size_t(10000)));
+        }
+        catch (const std::bad_alloc&) {
+            SS_LOG_WARN(L"SIMDMatcher", L"SearchAVX2: Memory reservation failed, continuing");
         }
 
-        // ====================================================================
-        // HANDLE REMAINING 1-31 BYTES WITH SCALAR CODE
-        // ====================================================================
-        for (; i < searchLen; ++i) {
-            // TITANIUM: Bounds check
-            if (i + patternLen > buffer.size()) {
-                break;
-            }
-            
-            bool match = true;
-            for (size_t j = 0; j < patternLen; ++j) {
-                if (buffer[i + j] != pattern[j]) {
-                    match = false;
-                    break;
+        {
+            const __m256i patternVec = _mm256_set1_epi8(static_cast<char>(pattern[0]));
+            const size_t patternLen = pattern.size();
+            size_t i = 0;
+
+            for (; i + 32 <= searchLen; i += 32) {
+                const __m256i bufferVec = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(buffer.data() + i)
+                );
+                const __m256i cmp = _mm256_cmpeq_epi8(bufferVec, patternVec);
+                int mask = _mm256_movemask_epi8(cmp);
+
+                while (mask != 0) {
+                    const int pos = SS_TZCNT32(static_cast<unsigned int>(mask));
+                    const size_t matchPos = i + static_cast<size_t>(pos);
+
+                    if (matchPos + patternLen <= buffer.size()) {
+                        bool fullMatch = true;
+                        for (size_t j = 1; j < patternLen; ++j) {
+                            if (buffer[matchPos + j] != pattern[j]) {
+                                fullMatch = false;
+                                break;
+                            }
+                        }
+                        if (fullMatch) {
+                            if (matches.size() >= SIMD_MAX_MATCHES) {
+                                SS_LOG_WARN(L"SIMDMatcher", L"SearchAVX2: Max matches reached");
+                                return matches;
+                            }
+                            try {
+                                matches.push_back(matchPos);
+                            }
+                            catch (const std::bad_alloc&) {
+                                SS_LOG_ERROR(L"SIMDMatcher", L"SearchAVX2: Out of memory at match collection");
+                                return matches;
+                            }
+                        }
+                    }
+                    mask &= (mask - 1);
                 }
             }
-            if (match) {
-                if (matches.size() >= MAX_MATCHES) {
-                    return matches;
+
+            // Scalar tail: remaining 1-31 bytes
+            for (; i < searchLen; ++i) {
+                if (i + patternLen > buffer.size()) break;
+                bool match = true;
+                for (size_t j = 0; j < patternLen; ++j) {
+                    if (buffer[i + j] != pattern[j]) { match = false; break; }
                 }
-                try {
-                    matches.push_back(i);
-                }
-                catch (const std::bad_alloc&) {
-                    return matches;
+                if (match) {
+                    if (matches.size() >= SIMD_MAX_MATCHES) return matches;
+                    try { matches.push_back(i); }
+                    catch (const std::bad_alloc&) { return matches; }
                 }
             }
         }
-        
         return matches;
     }
-
-scalar_fallback:
 #endif
+
     // ========================================================================
-    // SCALAR FALLBACK (no AVX2 or pattern too large)
+    // SCALAR FALLBACK (AVX2 unavailable, not OS-enabled, or pattern > 32 B)
     // ========================================================================
     try {
         matches.reserve(std::min(searchLen / 64, size_t(10000)));
     }
-    catch (...) {
-        // Continue without reservation
-    }
+    catch (...) {}
     
     for (size_t i = 0; i < searchLen; ++i) {
-        if (i + pattern.size() > buffer.size()) {
-            break;
-        }
-        
+        if (i + pattern.size() > buffer.size()) break;
         bool match = true;
         for (size_t j = 0; j < pattern.size(); ++j) {
-            if (buffer[i + j] != pattern[j]) {
-                match = false;
-                break;
-            }
+            if (buffer[i + j] != pattern[j]) { match = false; break; }
         }
         if (match) {
-            if (matches.size() >= MAX_MATCHES) {
-                return matches;
-            }
-            try {
-                matches.push_back(i);
-            }
-            catch (...) {
-                return matches;
-            }
+            if (matches.size() >= SIMD_MAX_MATCHES) return matches;
+            try { matches.push_back(i); }
+            catch (...) { return matches; }
         }
     }
-
     return matches;
 }
 
@@ -336,14 +300,12 @@ std::vector<size_t> SIMDMatcher::SearchAVX512(
     }
     
     // VALIDATION 4: Reasonable size limits
-    constexpr size_t MAX_MATCHES = 10000000; // 10M matches max
-    constexpr size_t MAX_BUFFER_SIZE = 1ULL * 1024 * 1024 * 1024; // 1GB
-    if (buffer.size() > MAX_BUFFER_SIZE) {
+    if (buffer.size() > SIMD_MAX_BUFFER_SIZE) {
         SS_LOG_WARN(L"SIMDMatcher", L"SearchAVX512: Buffer too large (%zu bytes)", buffer.size());
         return matches;
     }
 
-#ifdef __AVX512F__
+#ifdef SS_HAS_AVX512_INTRINSICS
     // Runtime AVX-512 check
     if (!IsAVX512Available()) {
         // Fall back to AVX2
@@ -399,7 +361,7 @@ std::vector<size_t> SIMDMatcher::SearchAVX512(
         // Process each match position
         while (cmpMask != 0) {
             // Find lowest set bit (first match position)
-            const int pos = static_cast<int>(_tzcnt_u64(cmpMask));
+            const int pos = static_cast<int>(SS_TZCNT64(cmpMask));
             const size_t matchPos = i + static_cast<size_t>(pos);
             
             // TITANIUM: Strict bounds check
@@ -436,7 +398,7 @@ std::vector<size_t> SIMDMatcher::SearchAVX512(
 
             if (fullMatch) {
                 // TITANIUM: Prevent unbounded growth
-                if (matches.size() >= MAX_MATCHES) {
+                if (matches.size() >= SIMD_MAX_MATCHES) {
                     SS_LOG_WARN(L"SIMDMatcher", L"SearchAVX512: Max matches reached");
                     return matches;
                 }
@@ -474,7 +436,7 @@ std::vector<size_t> SIMDMatcher::SearchAVX512(
                 int mask256 = _mm256_movemask_epi8(cmp256);
 
                 while (mask256 != 0) {
-                    const int pos = _tzcnt_u32(static_cast<unsigned int>(mask256));
+                    const int pos = SS_TZCNT32(static_cast<unsigned int>(mask256));
                     const size_t matchPos = j + static_cast<size_t>(pos);
 
                     // TITANIUM: Bounds check
@@ -488,7 +450,7 @@ std::vector<size_t> SIMDMatcher::SearchAVX512(
                         }
 
                         if (fullMatch) {
-                            if (matches.size() >= MAX_MATCHES) {
+                            if (matches.size() >= SIMD_MAX_MATCHES) {
                                 return matches;
                             }
                             try {
@@ -504,34 +466,20 @@ std::vector<size_t> SIMDMatcher::SearchAVX512(
                 }
             }
 
-            // Update i to reflect AVX2 progress
             i = searchLen - (searchLen - i) % 32;
         }
 
-        // Final 1-31 bytes: scalar (cache-friendly)
+        // Final 1-31 bytes: scalar
         for (; i < searchLen; ++i) {
-            // TITANIUM: Bounds check
-            if (i + patternLen > buffer.size()) {
-                break;
-            }
-            
+            if (i + patternLen > buffer.size()) break;
             bool match = true;
             for (size_t j = 0; j < patternLen; ++j) {
-                if (buffer[i + j] != pattern[j]) {
-                    match = false;
-                    break;
-                }
+                if (buffer[i + j] != pattern[j]) { match = false; break; }
             }
             if (match) {
-                if (matches.size() >= MAX_MATCHES) {
-                    return matches;
-                }
-                try {
-                    matches.push_back(i);
-                }
-                catch (...) {
-                    return matches;
-                }
+                if (matches.size() >= SIMD_MAX_MATCHES) return matches;
+                try { matches.push_back(i); }
+                catch (...) { return matches; }
             }
         }
     }
@@ -565,52 +513,39 @@ std::vector<std::pair<size_t, size_t>> SIMDMatcher::SearchMultipleAVX2(
     }
     
     // VALIDATION 3: Reasonable limits
-    constexpr size_t MAX_PATTERNS = 100000;
-    constexpr size_t MAX_TOTAL_MATCHES = 10000000;
-    
+    static constexpr size_t MAX_PATTERNS      = 100'000;
+    static constexpr size_t MAX_TOTAL_MATCHES = SIMD_MAX_MATCHES;
+
+    if (buffer.size() > SIMD_MAX_BUFFER_SIZE) {
+        SS_LOG_WARN(L"SIMDMatcher", L"SearchMultipleAVX2: Buffer too large (%zu bytes)", buffer.size());
+        return matches;
+    }
+
     if (patterns.size() > MAX_PATTERNS) {
         SS_LOG_WARN(L"SIMDMatcher", L"SearchMultipleAVX2: Too many patterns (%zu)", patterns.size());
         return matches;
     }
 
-    // Pre-allocate with reasonable estimate
     try {
         matches.reserve(std::min(patterns.size() * 100, MAX_TOTAL_MATCHES));
     }
     catch (const std::bad_alloc&) {
-        SS_LOG_WARN(L"SIMDMatcher", L"SearchMultipleAVX2: Memory reservation failed");
-        // Continue without reservation
+        SS_LOG_WARN(L"SIMDMatcher", L"SearchMultipleAVX2: Memory reservation failed, continuing");
     }
 
-    // ========================================================================
-    // BATCH SEARCH MULTIPLE PATTERNS
-    // ========================================================================
     for (size_t patternIdx = 0; patternIdx < patterns.size(); ++patternIdx) {
         const auto& pattern = patterns[patternIdx];
-        
-        // TITANIUM: Validate each pattern
-        if (pattern.empty() || pattern.data() == nullptr) {
-            continue; // Skip invalid patterns
-        }
-        
-        // Search for this pattern
-        std::vector<size_t> patternMatches;
-        try {
-            patternMatches = SearchAVX2(buffer, pattern);
-        }
-        catch (...) {
-            SS_LOG_ERROR(L"SIMDMatcher", L"SearchMultipleAVX2: Exception searching pattern %zu", patternIdx);
-            continue; // Skip this pattern on error
-        }
-        
-        // Add results with pattern index
+
+        if (pattern.empty() || pattern.data() == nullptr) continue;
+
+        // SearchAVX2 is noexcept — no try/catch needed.
+        const std::vector<size_t> patternMatches = SearchAVX2(buffer, pattern);
+
         for (const size_t offset : patternMatches) {
-            // TITANIUM: Check total match limit
             if (matches.size() >= MAX_TOTAL_MATCHES) {
                 SS_LOG_WARN(L"SIMDMatcher", L"SearchMultipleAVX2: Max total matches reached");
                 return matches;
             }
-            
             try {
                 matches.emplace_back(patternIdx, offset);
             }
@@ -624,7 +559,5 @@ std::vector<std::pair<size_t, size_t>> SIMDMatcher::SearchMultipleAVX2(
     return matches;
 }
 
-
-
-    }
-}
+    } // namespace PatternStore
+} // namespace ShadowStrike
