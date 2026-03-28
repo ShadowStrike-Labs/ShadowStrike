@@ -355,7 +355,24 @@ namespace Limits {
 
     /// Maximum optional header size (prevent overflow in section table offset calc)
     inline constexpr uint16_t MAX_OPTIONAL_HEADER_SIZE = 1024;
+    /// Maximum PDB path length (matches MAX_PATH)
+    inline constexpr size_t MAX_PDB_PATH_LENGTH = 260;
+
+    /// Minimum WIN_CERTIFICATE header size:
+    /// DWORD dwLength (4) + WORD wRevision (2) + WORD wCertificateType (2)
+    inline constexpr size_t MIN_WIN_CERTIFICATE = 8;
 } // namespace Limits
+
+// ============================================================================
+// WIN_CERTIFICATE Constants (Authenticode / Security Directory)
+// ============================================================================
+
+namespace WinCert {
+    /// WIN_CERT_REVISION_2_0
+    inline constexpr uint16_t REVISION_2_0 = 0x0200;
+    /// WIN_CERT_TYPE_PKCS_SIGNED_DATA
+    inline constexpr uint16_t TYPE_PKCS    = 0x0002;
+} // namespace WinCert
 
 // ============================================================================
 // Rich Header Constants

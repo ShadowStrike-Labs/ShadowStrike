@@ -90,6 +90,10 @@ enum class ValidationResult : uint32_t {
     InvalidAddressOfEntryPoint = 46,
     InvalidImageBase = 47,
     InvalidSubsystem = 48,
+    SizeOfStackCommitExceedsReserve = 49,
+    SizeOfHeapCommitExceedsReserve = 50,
+    SizeOfImageNotAligned = 51,
+    SizeOfHeadersNotAligned = 52,
 
     // Section failures (60-99)
     SectionTableOutOfBounds = 60,
@@ -228,7 +232,8 @@ struct PEError {
      */
     void Set(ValidationResult c, const wchar_t* msg, uint64_t off = 0) noexcept {
         code = c;
-        if (msg) message = msg;
+        // std::wstring assignment can throw std::bad_alloc; swallow under memory pressure.
+        try { if (msg) message = msg; } catch (...) {}
         offset = off;
     }
 
@@ -238,11 +243,14 @@ struct PEError {
     void SetWithContext(ValidationResult c, const wchar_t* msg,
                         const wchar_t* ctx, uint64_t off = 0) noexcept {
         code = c;
-        if (msg) message = msg;
-        if (ctx) context = ctx;
+        try { if (msg) message = msg; } catch (...) {}
+        try { if (ctx) context = ctx; } catch (...) {}
         offset = off;
     }
 };
+
+// Forward declaration: Anomaly is defined in the Anomaly Detection section below.
+struct Anomaly;
 
 // ============================================================================
 // Validation Functions
@@ -324,7 +332,8 @@ struct PEError {
     uint32_t sizeOfImage,
     uint32_t fileAlignment,
     size_t sectionIndex,
-    PEError* err = nullptr) noexcept;
+    PEError* err = nullptr,
+    std::vector<Anomaly>* outAnomalies = nullptr) noexcept;
 
 /**
  * @brief Check for overlapping sections.
@@ -349,6 +358,7 @@ struct PEError {
     size_t index,
     uint32_t rva,
     uint32_t size,
+    uint32_t sizeOfImage,
     size_t fileSize,
     PEError* err = nullptr) noexcept;
 
@@ -386,6 +396,7 @@ enum class AnomalyType : uint32_t {
     TooManySections,
     UnusualSectionOrder,
     CodeOutsideCodeSection,
+    SectionAlignmentViolation,
 
     // Entry point anomalies
     EntryPointInHeader,
@@ -436,18 +447,26 @@ enum class AnomalyType : uint32_t {
 
 /**
  * @brief Detected anomaly with details.
+ *
+ * @note description and context are non-owning pointers that MUST refer to
+ *       string literals (static storage duration). This avoids heap allocation
+ *       inside noexcept code paths where std::terminate would otherwise be
+ *       triggered by std::bad_alloc.
  */
 struct Anomaly {
     AnomalyType type = AnomalyType::None;
-    std::wstring description;
+    const wchar_t* description = nullptr;  ///< Non-owning pointer to a string literal
     uint64_t offset = 0;
-    std::wstring context;
+    const wchar_t* context = nullptr;      ///< Non-owning pointer to a string literal
 
     Anomaly() = default;
-    Anomaly(AnomalyType t, const wchar_t* desc)
-        : type(t), description(desc ? desc : L"") {}
-    Anomaly(AnomalyType t, const wchar_t* desc, uint64_t off, const wchar_t* ctx)
-        : type(t), description(desc ? desc : L""), offset(off), context(ctx ? ctx : L"") {}
+
+    explicit Anomaly(AnomalyType t, const wchar_t* desc = nullptr) noexcept
+        : type(t), description(desc) {}
+
+    Anomaly(AnomalyType t, const wchar_t* desc, uint64_t off,
+            const wchar_t* ctx = nullptr) noexcept
+        : type(t), description(desc), offset(off), context(ctx) {}
 };
 
 } // namespace PEParser
