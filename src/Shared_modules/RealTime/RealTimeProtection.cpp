@@ -59,6 +59,7 @@
 #include "../Exploits/BufferOverflowProtection.hpp"
 #include "../Exploits/StackPivotDetector.hpp"
 #include "../Exploits/KernelExploitDetector.hpp"
+#include "../Exploits/PrivilegeEscalationDetector.hpp"
 
 // ============================================================================
 // ANTI-EVASION DETECTOR INCLUDES
@@ -1182,6 +1183,51 @@ public:
             Utils::Logger::Error("RealTimeProtection: KernelExploitDetector unknown exception");
         }
 
+        // PrivilegeEscalationDetector (singleton — token manipulation, UAC bypass, potato attacks, LPE)
+        try {
+            auto& ped = Exploits::PrivilegeEscalationDetector::Instance();
+            Exploits::PrivilegeEscalationDetectorConfiguration pedConfig;
+            pedConfig.monitorTokenChanges = true;
+            pedConfig.monitorUACBypass = true;
+            pedConfig.monitorServiceConfig = true;
+            pedConfig.monitorRegistry = true;
+            pedConfig.detectDLLHijacking = true;
+            pedConfig.blockOnDetection = true;
+            pedConfig.terminateOnHighConfidence = true;
+
+            if (ped.Initialize(pedConfig)) {
+                if (!ped.Start()) {
+                    Utils::Logger::Warn(L"RealTimeProtection: PrivilegeEscalationDetector Start failed");
+                } else {
+                    // Wire LPE detection callback for SOC alerting and threat correlation
+                    ped.RegisterLpeCallback(
+                        [](const Exploits::LpeEvent& event) {
+                            auto techniqueName = Exploits::GetLpeTechniqueName(event.technique);
+                            Utils::Logger::Warn(
+                                L"[PED-CB] Privilege escalation detected: {} (PID={}, confidence={:.1f}, blocked={})",
+                                Utils::StringUtils::Utf8ToWide(techniqueName),
+                                event.processId,
+                                event.confidenceScore,
+                                event.wasBlocked ? L"YES" : L"NO");
+                        });
+
+                    // Wire error callback
+                    ped.RegisterErrorCallback(
+                        [](const std::string& message, int code) {
+                            Utils::Logger::Error("[PED-ERR] {} (code={})", message, code);
+                        });
+
+                    Utils::Logger::Info(L"RealTimeProtection: PrivilegeEscalationDetector initialized and started");
+                }
+            } else {
+                Utils::Logger::Warn(L"RealTimeProtection: PrivilegeEscalationDetector Initialize failed");
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("RealTimeProtection: PrivilegeEscalationDetector exception: {}", e.what());
+        } catch (...) {
+            Utils::Logger::Error("RealTimeProtection: PrivilegeEscalationDetector unknown exception");
+        }
+
         Utils::Logger::Info(L"RealTimeProtection: Components started");
     }
 
@@ -1220,6 +1266,7 @@ public:
         try { Exploits::JITSprayDetector::Instance().Shutdown(); } catch (...) {}
         try { Exploits::HeapSprayDetector::Instance().Shutdown(); } catch (...) {}
         try { Exploits::KernelExploitDetector::Instance().Shutdown(); } catch (...) {}
+        try { Exploits::PrivilegeEscalationDetector::Instance().Shutdown(); } catch (...) {}
 
         Utils::Logger::Info(L"RealTimeProtection: Components stopped");
     }
@@ -1794,6 +1841,21 @@ public:
             return Communication::KernelVerdict::Allow;
         }
 
+        // PrivilegeEscalationDetector — feed kernel-enriched process creation events
+        // This enables immediate detection of potato binaries, token manipulation
+        // targets, and tracks elevation state from tamper-proof kernel data.
+        if (req.isCreation) {
+            try {
+                auto& ped = Exploits::PrivilegeEscalationDetector::Instance();
+                ped.OnKernelProcessCreated(
+                    req.processId,
+                    req.parentProcessId,
+                    imagePath,
+                    commandLine,
+                    req.isElevated);
+            } catch (...) {}
+        }
+
         // Invoke process creation callbacks
         bool shouldBlock = false;
         {
@@ -2055,6 +2117,21 @@ public:
                 break;
             }
         }
+
+        // PrivilegeEscalationDetector — feed kernel-enriched registry modification events
+        // Enables immediate detection of IFEO debugger injection, UAC bypass preparation,
+        // AlwaysInstallElevated abuse, and COM CLSID hijacking from tamper-proof kernel data.
+        try {
+            auto& ped = Exploits::PrivilegeEscalationDetector::Instance();
+            auto valueData = std::vector<uint8_t>(
+                req.valueDataBegin(),
+                req.valueDataEnd());
+            ped.OnKernelRegistryModified(
+                req.processId,
+                keyPath,
+                valueName,
+                valueData);
+        } catch (...) {}
 
         return Communication::KernelVerdict::Allow;
     }
