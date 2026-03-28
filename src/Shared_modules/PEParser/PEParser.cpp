@@ -215,6 +215,11 @@ public:
 
         m_info.valid = true;
         m_parsed = true;
+
+        // Step 10: Verify PE checksum post-parse (requires m_parsed = true)
+        // Mismatch is flagged as anomaly, not a parse failure
+        VerifyChecksumAnomaly();
+
         return true;
     }
 
@@ -387,6 +392,21 @@ public:
             }
         }
 
+        // Post-process: calculate entropy and packing heuristics for each section
+        for (size_t i = 0; i < m_info.sections.size(); ++i) {
+            auto& sec = m_info.sections[i];
+            if (sec.rawSize > 0 && sec.rawAddress != 0) {
+                sec.entropy = CalculateSectionEntropyInternal(i);
+                // High entropy (>7.0) in executable sections strongly indicates packing
+                sec.isPackedHeuristic = (sec.entropy > 7.0 &&
+                    (sec.isExecutable || sec.hasCode));
+                if (sec.entropy > 7.2) {
+                    m_info.anomalies.emplace_back(AnomalyType::SectionHighEntropy,
+                        L"Section has very high entropy (>7.2) — likely packed or encrypted");
+                }
+            }
+        }
+
         return true;
     }
 
@@ -478,6 +498,32 @@ public:
             if (m_info.overlaySize > 0) {
                 m_info.anomalies.emplace_back(AnomalyType::OverlayPresent,
                                               L"File has overlay data");
+
+                // Calculate overlay entropy — high entropy indicates embedded
+                // encrypted/compressed payloads (common in malware droppers)
+                const size_t sampleSize = std::min(m_info.overlaySize,
+                    static_cast<size_t>(1024 * 1024));  // Cap at 1MB sample
+                if (m_reader.ValidateRange(m_info.overlayOffset, sampleSize)) {
+                    std::array<size_t, 256> freq = {};
+                    std::span<const uint8_t> overlayData;
+                    if (m_reader.ReadArray<uint8_t>(m_info.overlayOffset, sampleSize, overlayData)) {
+                        for (const uint8_t byte : overlayData) {
+                            ++freq[byte];
+                        }
+                        double entropy = 0.0;
+                        const double total = static_cast<double>(sampleSize);
+                        for (size_t count : freq) {
+                            if (count > 0) {
+                                double p = static_cast<double>(count) / total;
+                                entropy -= p * std::log2(p);
+                            }
+                        }
+                        if (entropy > 7.0) {
+                            m_info.anomalies.emplace_back(AnomalyType::OverlayHighEntropy,
+                                L"Overlay data has high entropy (>7.0) — encrypted/compressed payload");
+                        }
+                    }
+                }
             }
         }
     }
@@ -569,6 +615,33 @@ public:
                     m_info.anomalies.emplace_back(AnomalyType::SectionNameNonPrintable,
                                                   L"Section has non-printable characters in name");
                 }
+
+                // Detect suspicious section names (known packer signatures)
+                static constexpr std::string_view kSuspiciousNames[] = {
+                    "UPX0", "UPX1", "UPX2", "UPX!",           // UPX packer
+                    ".aspack", ".adata",                        // ASPack
+                    ".nsp0", ".nsp1", ".nsp2",                  // NsPack
+                    ".packed", ".RLPack",                        // RLPack
+                    ".petite",                                   // Petite
+                    ".yP", ".y0da",                              // yoda Protector
+                    "pebundle", "PEBundle",                      // PEBundle
+                    ".Themida", ".Winlice",                      // Themida/WinLicense
+                    ".vmp0", ".vmp1", ".vmp2",                   // VMProtect
+                    ".enigma1", ".enigma2",                      // Enigma Protector
+                    "MEW",                                       // MEW packer
+                    ".MPRESS1", ".MPRESS2",                      // MPRESS
+                    ".perplex",                                  // Perplex PE Protector
+                    ".sforce",                                   // StarForce
+                    "BitArts", ".boom",                          // Misc packers
+                    ".ndata",                                    // NSIS installer
+                };
+                for (const auto& suspicious : kSuspiciousNames) {
+                    if (sec.name == suspicious) {
+                        m_info.anomalies.emplace_back(AnomalyType::SectionNameSuspicious,
+                            L"Section name matches known packer/protector signature");
+                        break;
+                    }
+                }
             }
         }
 
@@ -576,6 +649,24 @@ public:
         if (!m_info.dataDirectories[DataDirectory::IMPORT].present && !m_info.isDLL) {
             m_info.anomalies.emplace_back(AnomalyType::NoImports,
                                           L"No import table");
+        }
+
+        // Packer detection heuristics
+        {
+            size_t packedSections = 0;
+            size_t execSections = 0;
+            for (const auto& sec : m_info.sections) {
+                if (sec.isExecutable || sec.hasCode) {
+                    ++execSections;
+                    if (sec.isPackedHeuristic) ++packedSections;
+                }
+            }
+            // If majority of executable sections show packing indicators
+            if (execSections > 0 && packedSections > 0 &&
+                packedSections >= (execSections + 1) / 2) {
+                m_info.anomalies.emplace_back(AnomalyType::PackerSignatureDetected,
+                    L"Majority of executable sections show high entropy — likely packed");
+            }
         }
     }
 
@@ -1568,6 +1659,309 @@ public:
     }
 
     // ========================================================================
+    // Checksum Anomaly Detection
+    // ========================================================================
+
+    void VerifyChecksumAnomaly() noexcept {
+        if (m_info.checksum == 0) return;  // No checksum to verify
+
+        const size_t fileSize = m_reader.Size();
+        if (fileSize == 0) return;
+
+        static constexpr size_t kChecksumFieldOffset = 64;
+        const size_t checksumByteOffset = m_optionalHeaderOffset + kChecksumFieldOffset;
+
+        if ((checksumByteOffset & 1u) != 0 || checksumByteOffset + 4u > fileSize) return;
+
+        const size_t wordCount = fileSize / 2;
+        std::span<const uint16_t> words;
+        if (!m_reader.ReadArray<uint16_t>(0, wordCount, words)) return;
+
+        const size_t skipWord0 = checksumByteOffset / 2;
+        const size_t skipWord1 = skipWord0 + 1;
+
+        uint32_t acc = 0;
+        for (size_t i = 0; i < wordCount; ++i) {
+            if (i == skipWord0 || i == skipWord1) continue;
+            acc += words[i];
+            acc = (acc >> 16) + (acc & 0xFFFFu);
+        }
+
+        if (fileSize & 1u) {
+            uint8_t lastByte = 0;
+            if (m_reader.ReadByte(fileSize - 1, lastByte)) {
+                acc += static_cast<uint16_t>(lastByte);
+                acc = (acc >> 16) + (acc & 0xFFFFu);
+            }
+        }
+
+        acc = (acc & 0xFFFFu) + (acc >> 16);
+        acc += static_cast<uint32_t>(fileSize);
+        acc = (acc & 0xFFFFu) + (acc >> 16);
+
+        const uint32_t computed = acc & 0xFFFFu;
+        if (computed != m_info.checksum) {
+            m_info.anomalies.emplace_back(AnomalyType::ChecksumMismatch,
+                L"PE checksum does not match computed value — possible tampering");
+        }
+    }
+
+    // ========================================================================
+    // Delay Import Parsing
+    // ========================================================================
+
+    [[nodiscard]] bool ParseDelayImportsInternal(std::vector<DelayImportInfo>& out,
+                                                  PEError* err) noexcept {
+        out.clear();
+
+        const auto& delayDir = m_info.dataDirectories[DataDirectory::DELAY_IMPORT];
+        if (!delayDir.present || delayDir.rva == 0 || delayDir.size == 0) {
+            return true;  // No delay imports is valid
+        }
+
+        auto delayOffset = RvaToOffsetInternal(delayDir.rva);
+        if (!delayOffset) {
+            if (err) {
+                err->Set(ValidationResult::DelayImportInvalid,
+                         L"Delay import directory RVA does not resolve", 0);
+            }
+            return false;
+        }
+
+        size_t offset = *delayOffset;
+        size_t descriptorCount = 0;
+
+        while (descriptorCount < Limits::MAX_DELAY_IMPORT_DESCRIPTORS) {
+            DelayImportDescriptor desc;
+            if (!m_reader.Read(offset, desc)) break;
+
+            // Null terminator check
+            if (desc.DllNameRVA == 0 && desc.ImportAddressTableRVA == 0 &&
+                desc.ImportNameTableRVA == 0) {
+                break;
+            }
+
+            DelayImportInfo import;
+            import.attributes = desc.Attributes;
+            import.moduleHandleRva = desc.ModuleHandleRVA;
+            import.iatRva = desc.ImportAddressTableRVA;
+            import.intRva = desc.ImportNameTableRVA;
+            import.boundIatRva = desc.BoundImportAddressTableRVA;
+            import.unloadIatRva = desc.UnloadInformationTableRVA;
+            import.timeDateStamp = desc.TimeDateStamp;
+
+            // Parse DLL name
+            if (desc.DllNameRVA != 0) {
+                auto nameOffset = RvaToOffsetInternal(desc.DllNameRVA);
+                if (nameOffset) {
+                    std::string_view name;
+                    if (m_reader.ReadString(*nameOffset, Limits::MAX_DLL_NAME, name)) {
+                        import.dllName = Utils::StringUtils::ToWide(std::string(name));
+                    }
+                }
+            }
+
+            // Parse delay-imported functions via INT
+            if (desc.ImportNameTableRVA != 0) {
+                auto intOffset = RvaToOffsetInternal(desc.ImportNameTableRVA);
+                if (intOffset) {
+                    size_t thunkOff = *intOffset;
+                    size_t funcCount = 0;
+
+                    while (funcCount < Limits::MAX_IMPORTS_PER_DLL) {
+                        ImportFunctionInfo func;
+
+                        if (m_info.is64Bit) {
+                            uint64_t thunk;
+                            if (!m_reader.Read(thunkOff, thunk) || thunk == 0) break;
+
+                            if (thunk & ORDINAL_FLAG64) {
+                                func.byOrdinal = true;
+                                func.ordinal = static_cast<uint16_t>(thunk & 0xFFFF);
+                            } else if ((thunk & 0xFFFFFFFF00000000ULL) == 0) {
+                                auto hintOff = RvaToOffsetInternal(static_cast<uint32_t>(thunk));
+                                if (hintOff) {
+                                    m_reader.Read(*hintOff, func.hint);
+                                    std::string_view funcName;
+                                    if (m_reader.ReadString(*hintOff + 2,
+                                            Limits::MAX_FUNCTION_NAME, funcName)) {
+                                        func.name = std::string(funcName);
+                                    }
+                                }
+                            }
+                            thunkOff += sizeof(uint64_t);
+                        } else {
+                            uint32_t thunk;
+                            if (!m_reader.Read(thunkOff, thunk) || thunk == 0) break;
+
+                            if (thunk & ORDINAL_FLAG32) {
+                                func.byOrdinal = true;
+                                func.ordinal = static_cast<uint16_t>(thunk & 0xFFFF);
+                            } else {
+                                auto hintOff = RvaToOffsetInternal(thunk);
+                                if (hintOff) {
+                                    m_reader.Read(*hintOff, func.hint);
+                                    std::string_view funcName;
+                                    if (m_reader.ReadString(*hintOff + 2,
+                                            Limits::MAX_FUNCTION_NAME, funcName)) {
+                                        func.name = std::string(funcName);
+                                    }
+                                }
+                            }
+                            thunkOff += sizeof(uint32_t);
+                        }
+
+                        import.functions.push_back(std::move(func));
+                        ++funcCount;
+                    }
+                }
+            }
+
+            out.push_back(std::move(import));
+            offset += sizeof(DelayImportDescriptor);
+            ++descriptorCount;
+        }
+
+        return true;
+    }
+
+    // ========================================================================
+    // Load Config Parsing
+    // ========================================================================
+
+    [[nodiscard]] bool ParseLoadConfigInternal(LoadConfigInfo& out, PEError* err) noexcept {
+        out = LoadConfigInfo();
+
+        const auto& lcDir = m_info.dataDirectories[DataDirectory::LOAD_CONFIG];
+        if (!lcDir.present || lcDir.rva == 0 || lcDir.size == 0) {
+            return true;
+        }
+
+        auto lcOffset = RvaToOffsetInternal(lcDir.rva);
+        if (!lcOffset) {
+            if (err) {
+                err->Set(ValidationResult::LoadConfigInvalid,
+                         L"Load config directory RVA invalid", 0);
+            }
+            return false;
+        }
+
+        // Read the Size field first to know how much to parse
+        uint32_t configSize = 0;
+        if (!m_reader.Read(*lcOffset, configSize)) {
+            return false;
+        }
+
+        // Sanity check size
+        if (configSize == 0 || configSize > Limits::MAX_LOAD_CONFIG_SIZE) {
+            return true;  // Unusual but not an error
+        }
+
+        out.size = configSize;
+
+        if (m_info.is64Bit) {
+            LoadConfigDirectory64 lc64;
+            // Read only what fits
+            const size_t readSize = std::min(static_cast<size_t>(configSize),
+                                             sizeof(LoadConfigDirectory64));
+            if (!m_reader.ValidateRange(*lcOffset, readSize)) return false;
+            std::memset(&lc64, 0, sizeof(lc64));
+            m_reader.ReadBytes(*lcOffset, &lc64, readSize);
+
+            out.timeDateStamp = lc64.TimeDateStamp;
+            out.majorVersion = lc64.MajorVersion;
+            out.minorVersion = lc64.MinorVersion;
+            out.globalFlagsClear = lc64.GlobalFlagsClear;
+            out.globalFlagsSet = lc64.GlobalFlagsSet;
+            out.securityCookie = lc64.SecurityCookie;
+            out.seHandlerTable = lc64.SEHandlerTable;
+            out.seHandlerCount = lc64.SEHandlerCount;
+            out.hasSEH = (lc64.SEHandlerTable != 0);
+            out.hasSecurityCookie = (lc64.SecurityCookie != 0);
+        } else {
+            LoadConfigDirectory32 lc32;
+            const size_t readSize = std::min(static_cast<size_t>(configSize),
+                                             sizeof(LoadConfigDirectory32));
+            if (!m_reader.ValidateRange(*lcOffset, readSize)) return false;
+            std::memset(&lc32, 0, sizeof(lc32));
+            m_reader.ReadBytes(*lcOffset, &lc32, readSize);
+
+            out.timeDateStamp = lc32.TimeDateStamp;
+            out.majorVersion = lc32.MajorVersion;
+            out.minorVersion = lc32.MinorVersion;
+            out.globalFlagsClear = lc32.GlobalFlagsClear;
+            out.globalFlagsSet = lc32.GlobalFlagsSet;
+            out.securityCookie = lc32.SecurityCookie;
+            out.seHandlerTable = lc32.SEHandlerTable;
+            out.seHandlerCount = lc32.SEHandlerCount;
+            out.hasSEH = (lc32.SEHandlerTable != 0);
+            out.hasSecurityCookie = (lc32.SecurityCookie != 0);
+        }
+
+        return true;
+    }
+
+    // ========================================================================
+    // Exception Directory Parsing
+    // ========================================================================
+
+    [[nodiscard]] bool ParseExceptionDirectoryInternal(std::vector<ExceptionEntry>& out,
+                                                        PEError* err) noexcept {
+        out.clear();
+
+        const auto& excDir = m_info.dataDirectories[DataDirectory::EXCEPTION];
+        if (!excDir.present || excDir.rva == 0 || excDir.size == 0) {
+            return true;
+        }
+
+        // Exception directory is only meaningful for x64/ARM64
+        if (m_info.machine != Machine::AMD64 && m_info.machine != Machine::ARM64 &&
+            m_info.machine != Machine::IA64) {
+            return true;  // Not applicable — not an error
+        }
+
+        auto excOffset = RvaToOffsetInternal(excDir.rva);
+        if (!excOffset) {
+            if (err) {
+                err->Set(ValidationResult::DataDirectoryRvaInvalid,
+                         L"Exception directory RVA invalid", 0);
+            }
+            return false;
+        }
+
+        // Each RUNTIME_FUNCTION is 12 bytes (3x uint32_t)
+        static constexpr size_t kRuntimeFuncSize = 12;
+        size_t numEntries = excDir.size / kRuntimeFuncSize;
+        if (numEntries > Limits::MAX_EXCEPTION_ENTRIES) {
+            numEntries = Limits::MAX_EXCEPTION_ENTRIES;
+        }
+
+        out.reserve(std::min(numEntries, static_cast<size_t>(65536)));
+
+        for (size_t i = 0; i < numEntries; ++i) {
+            size_t entryOff = *excOffset + i * kRuntimeFuncSize;
+
+            uint32_t beginAddr, endAddr, unwindInfo;
+            if (!m_reader.Read(entryOff, beginAddr) ||
+                !m_reader.Read(entryOff + 4, endAddr) ||
+                !m_reader.Read(entryOff + 8, unwindInfo)) {
+                break;
+            }
+
+            // Null terminator
+            if (beginAddr == 0 && endAddr == 0 && unwindInfo == 0) break;
+
+            ExceptionEntry entry;
+            entry.beginAddress = beginAddr;
+            entry.endAddress = endAddr;
+            entry.unwindInfoAddress = unwindInfo;
+            out.push_back(entry);
+        }
+
+        return true;
+    }
+
+    // ========================================================================
     // Reset
     // ========================================================================
 
@@ -1768,6 +2162,39 @@ bool PEParser::ParseRichHeader(RichHeaderInfo& out, PEError* err) noexcept {
         return false;
     }
     return m_impl->ParseRichHeaderInternal(out, err);
+}
+
+bool PEParser::ParseDelayImports(std::vector<DelayImportInfo>& out, PEError* err) noexcept {
+    if (!m_impl->m_parsed) {
+        if (err) {
+            err->Set(ValidationResult::UnknownError,
+                     L"No PE file has been parsed", 0);
+        }
+        return false;
+    }
+    return m_impl->ParseDelayImportsInternal(out, err);
+}
+
+bool PEParser::ParseLoadConfig(LoadConfigInfo& out, PEError* err) noexcept {
+    if (!m_impl->m_parsed) {
+        if (err) {
+            err->Set(ValidationResult::UnknownError,
+                     L"No PE file has been parsed", 0);
+        }
+        return false;
+    }
+    return m_impl->ParseLoadConfigInternal(out, err);
+}
+
+bool PEParser::ParseExceptionDirectory(std::vector<ExceptionEntry>& out, PEError* err) noexcept {
+    if (!m_impl->m_parsed) {
+        if (err) {
+            err->Set(ValidationResult::UnknownError,
+                     L"No PE file has been parsed", 0);
+        }
+        return false;
+    }
+    return m_impl->ParseExceptionDirectoryInternal(out, err);
 }
 
 std::optional<size_t> PEParser::RvaToOffset(uint32_t rva) const noexcept {

@@ -853,6 +853,45 @@ namespace PEParser {
     PEError* err,
     std::vector<Anomaly>* outAnomalies) noexcept
 {
+    // Check for zero VirtualAddress (suspicious in non-object files)
+    // A section with VirtualSize > 0 but VirtualAddress == 0 will overlay
+    // the PE headers in memory — this is a known evasion technique.
+    if (header.VirtualAddress == 0 && header.VirtualSize > 0) {
+        if (outAnomalies) {
+            try {
+                outAnomalies->emplace_back(
+                    AnomalyType::UnusualSectionOrder,
+                    L"Section has VirtualAddress == 0 with non-zero VirtualSize (header overlay technique)");
+            } catch (...) {}
+        }
+    }
+
+    // Check for completely empty sections (both virtual and raw size zero)
+    // Empty sections waste space and are sometimes used as markers by packers
+    if (header.VirtualSize == 0 && header.SizeOfRawData == 0) {
+        if (outAnomalies) {
+            try {
+                outAnomalies->emplace_back(
+                    AnomalyType::SectionZeroRawSize,
+                    L"Section has zero virtual and raw size");
+            } catch (...) {}
+        }
+    }
+
+    // Check for sections with no memory protection flags at all
+    // A section with none of MEM_READ, MEM_WRITE, MEM_EXECUTE is inaccessible
+    // to user code — this is either a bug or deliberate obfuscation
+    constexpr uint32_t kRWXMask = 0xE0000000u;  // MEM_EXECUTE | MEM_READ | MEM_WRITE
+    if ((header.Characteristics & kRWXMask) == 0 && header.SizeOfRawData > 0) {
+        if (outAnomalies) {
+            try {
+                outAnomalies->emplace_back(
+                    AnomalyType::SectionSizeMismatch,
+                    L"Section has no memory access flags (not readable, writable, or executable)");
+            } catch (...) {}
+        }
+    }
+
     // Check raw data bounds
     if (header.SizeOfRawData > 0) {
         size_t rawEnd;
