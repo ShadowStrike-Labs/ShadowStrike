@@ -1006,10 +1006,23 @@ std::vector<DetectionResult> PatternStore::Scan(
     m_totalScans.fetch_add(1, std::memory_order_relaxed);
     m_totalBytesScanned.fetch_add(buffer.size(), std::memory_order_relaxed);
 
-    // Get start time for performance measurement
+    // Get start time and compute scan deadline for timeout enforcement
     LARGE_INTEGER startTime{};
     if (!QueryPerformanceCounter(&startTime)) {
         startTime.QuadPart = 0;
+    }
+
+    LARGE_INTEGER deadline{};
+    if (options.timeoutMilliseconds > 0 && startTime.QuadPart != 0) {
+        LARGE_INTEGER freq{};
+        if (QueryPerformanceFrequency(&freq) && freq.QuadPart > 0) {
+            deadline.QuadPart = startTime.QuadPart +
+                (static_cast<int64_t>(options.timeoutMilliseconds) * freq.QuadPart / 1000LL);
+        } else {
+            deadline.QuadPart = LLONG_MAX;
+        }
+    } else {
+        deadline.QuadPart = LLONG_MAX; // no timeout
     }
 
     // Reserve reasonable capacity for results
@@ -1027,7 +1040,7 @@ std::vector<DetectionResult> PatternStore::Scan(
     // Use SIMD if enabled and available
     if (m_simdEnabled.load(std::memory_order_acquire) && SIMDMatcher::IsAVX2Available()) {
         try {
-            auto simdResults = ScanWithSIMD(buffer, options);
+            auto simdResults = ScanWithSIMD(buffer, options, deadline);
             results.insert(results.end(), 
                 std::make_move_iterator(simdResults.begin()),
                 std::make_move_iterator(simdResults.end()));
@@ -1040,7 +1053,7 @@ std::vector<DetectionResult> PatternStore::Scan(
     // Fall back to or supplement with automaton search
     if (results.empty() || !m_simdEnabled.load(std::memory_order_acquire)) {
         try {
-            auto acResults = ScanWithAutomaton(buffer, options);
+            auto acResults = ScanWithAutomaton(buffer, options, deadline);
             results.insert(results.end(),
                 std::make_move_iterator(acResults.begin()),
                 std::make_move_iterator(acResults.end()));
@@ -2144,7 +2157,8 @@ StoreError PatternStore::BuildAutomaton() noexcept {
 
 std::vector<DetectionResult> PatternStore::ScanWithAutomaton(
     std::span<const uint8_t> buffer,
-    const QueryOptions& options
+    const QueryOptions& options,
+    const LARGE_INTEGER& deadline
 ) const noexcept {
     std::vector<DetectionResult> results;
 

@@ -70,7 +70,7 @@ SignatureStore::SignatureStore()
 
     // TITANIUM: Initialize component stores with exception safety
     try {
-        m_hashStore = std::make_unique<HashStore>();
+        m_hashStore = std::make_unique<HashStore::HashStore>();
     }
     catch (const std::exception& e) {
         SS_LOG_ERROR(L"SignatureStore", L"Failed to create HashStore: %S", e.what());
@@ -82,7 +82,7 @@ SignatureStore::SignatureStore()
     }
 
     try {
-        m_patternStore = std::make_unique<PatternStore>();
+        m_patternStore = std::make_unique<PatternStore::PatternStore>();
     }
     catch (const std::exception& e) {
         SS_LOG_ERROR(L"SignatureStore", L"Failed to create PatternStore: %S", e.what());
@@ -634,27 +634,27 @@ void SignatureStore::ResetStatistics() noexcept {
     SS_LOG_DEBUG(L"SignatureStore", L"Statistics reset completed");
 }
 
-HashStore::HashStoreStatistics SignatureStore::GetHashStatistics() const noexcept {
+HashStore::StoreStatistics SignatureStore::GetHashStatistics() const noexcept {
     try {
         if (!m_hashStore) {
-            return HashStore::HashStoreStatistics{};
+            return HashStore::StoreStatistics{};
         }
         return m_hashStore->GetStatistics();
     }
     catch (...) {
-        return HashStore::HashStoreStatistics{};
+        return HashStore::StoreStatistics{};
     }
 }
 
-PatternStore::PatternStoreStatistics SignatureStore::GetPatternStatistics() const noexcept {
+PatternStore::StoreStatistics SignatureStore::GetPatternStatistics() const noexcept {
     try {
         if (!m_patternStore) {
-            return PatternStore::PatternStoreStatistics{};
+            return PatternStore::StoreStatistics{};
         }
         return m_patternStore->GetStatistics();
     }
     catch (...) {
-        return PatternStore::PatternStoreStatistics{};
+        return PatternStore::StoreStatistics{};
     }
 }
 
@@ -1589,8 +1589,8 @@ StoreError SignatureStore::MergeDatabases(
     SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Opening %zu source databases", sourcePaths.size());
 
     // Use vectors of unique_ptr to avoid attempts to copy non-copyable classes
-    std::vector<std::unique_ptr<HashStore>> sourceHashStores;
-    std::vector<std::unique_ptr<PatternStore>> sourcePatternStores;
+    std::vector<std::unique_ptr<HashStore::HashStore>> sourceHashStores;
+    std::vector<std::unique_ptr<PatternStore::PatternStore>> sourcePatternStores;
     std::vector<std::unique_ptr<YaraRuleStore>> sourceYaraStores;
     
     // TITANIUM: Reserve to avoid reallocations
@@ -1606,7 +1606,7 @@ StoreError SignatureStore::MergeDatabases(
 
             // HashStore
             {
-                auto hs = std::make_unique<HashStore>();
+                auto hs = std::make_unique<HashStore::HashStore>();
                 StoreError hashErr = hs->Initialize(sourcePaths[i], true);
                 if (hashErr.IsSuccess()) {
                     sourceHashStores.push_back(std::move(hs));
@@ -1619,7 +1619,7 @@ StoreError SignatureStore::MergeDatabases(
 
             // PatternStore
             {
-                auto ps = std::make_unique<PatternStore>();
+                auto ps = std::make_unique<PatternStore::PatternStore>();
                 StoreError patternErr = ps->Initialize(sourcePaths[i], true);
                 if (patternErr.IsSuccess()) {
                     sourcePatternStores.push_back(std::move(ps));
@@ -1653,8 +1653,8 @@ StoreError SignatureStore::MergeDatabases(
         // CREATE OUTPUT DATABASES
         SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Creating output databases");
 
-        HashStore outputHashStore;
-        PatternStore outputPatternStore;
+        HashStore::HashStore outputHashStore;
+        PatternStore::PatternStore outputPatternStore;
         YaraRuleStore outputYaraStore;
 
         StoreError hashCreateErr = outputHashStore.CreateNew(outputPath);

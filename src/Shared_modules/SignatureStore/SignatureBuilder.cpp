@@ -839,7 +839,7 @@ StoreError SignatureBuilder::ValidateHashInputs() noexcept {
 StoreError SignatureBuilder::ValidatePatternInputs() noexcept {
     for (const auto& input : m_pendingPatterns) {
         std::string errorMsg;
-        if (!PatternUtils::IsValidPatternString(input.patternString, errorMsg)) {
+        if (!PatternStore::PatternUtils::IsValidPatternString(input.patternString, errorMsg)) {
             m_statistics.invalidSignaturesSkipped++;
             SS_LOG_WARN(L"SignatureBuilder", L"Invalid pattern: %S", errorMsg.c_str());
         }
@@ -1065,10 +1065,10 @@ StoreError SignatureBuilder::OptimizePatterns() noexcept {
     for (auto& pattern : m_pendingPatterns) {
         PatternMode mode;
         std::vector<uint8_t> mask;
-        auto compiled = PatternCompiler::CompilePattern(pattern.patternString, mode, mask);
+        auto compiled = PatternStore::PatternCompiler::CompilePattern(pattern.patternString, mode, mask);
         
         if (compiled.has_value()) {
-            float entropy = PatternCompiler::ComputeEntropy(*compiled);
+            float entropy = PatternStore::PatternCompiler::ComputeEntropy(*compiled);
             // Store entropy in description for sorting (simplified)
         }
     }
