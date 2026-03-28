@@ -46,7 +46,7 @@ inline constexpr uint16_t DOS_SIGNATURE = 0x5A4D;
 inline constexpr int32_t MIN_LFANEW = 0x40;
 
 /// Maximum e_lfanew to prevent scanning entire large files
-inline constexpr int32_t MAX_LFANEW = 0x10000000; // 256MB
+inline constexpr int32_t MAX_LFANEW = 0x400000; // 4MB — no legitimate PE has e_lfanew beyond this
 
 // ============================================================================
 // NT Headers Constants
@@ -355,8 +355,8 @@ namespace Limits {
 
     /// Maximum optional header size (prevent overflow in section table offset calc)
     inline constexpr uint16_t MAX_OPTIONAL_HEADER_SIZE = 1024;
-    /// Maximum PDB path length (matches MAX_PATH)
-    inline constexpr size_t MAX_PDB_PATH_LENGTH = 260;
+    /// Maximum PDB path length
+    inline constexpr size_t MAX_PDB_PATH_LENGTH = 1024;  // Support long paths (build systems may exceed MAX_PATH)
 
     /// Minimum WIN_CERTIFICATE header size:
     /// DWORD dwLength (4) + WORD wRevision (2) + WORD wCertificateType (2)
