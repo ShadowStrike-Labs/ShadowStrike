@@ -63,10 +63,7 @@
 #include <bitset>
 
 namespace ShadowStrike {
-namespace HashStore {
-
-    // Import types from SignatureStore namespace
-    using namespace ShadowStrike::SignatureStore;
+namespace SignatureStore {
 
 // ============================================================================
 // BLOOM FILTER (Fast Negative Lookups)
@@ -108,11 +105,14 @@ public:
     explicit HashBucket(HashType type);
     ~HashBucket();
 
-    // Disable copy, enable move
+    // Disable copy and move (shared_mutex + atomics are non-movable)
     HashBucket(const HashBucket&) = delete;
     HashBucket& operator=(const HashBucket&) = delete;
-    HashBucket(HashBucket&&) noexcept = default;
-    HashBucket& operator=(HashBucket&&) noexcept = default;
+    HashBucket(HashBucket&&) = delete;
+    HashBucket& operator=(HashBucket&&) = delete;
+
+    // HashStore needs access to m_index and m_bloomFilter for rebuild/compact/fuzzy
+    friend class HashStore;
 
     // ========================================================================
     // INITIALIZATION
@@ -180,10 +180,9 @@ public:
     [[nodiscard]] BucketStatistics GetStatistics() const noexcept;
     void ResetStatistics() noexcept;
 
+private:
     std::unique_ptr<SignatureIndex> m_index;
     std::unique_ptr<BloomFilter> m_bloomFilter;
-
-private:
     HashType m_type;
     
     
@@ -208,11 +207,11 @@ public:
     HashStore();
     ~HashStore();
 
-    // Disable copy, enable move
+    // Disable copy and move (shared_mutex + atomic array are non-movable)
     HashStore(const HashStore&) = delete;
     HashStore& operator=(const HashStore&) = delete;
-    HashStore(HashStore&&) noexcept = default;
-    HashStore& operator=(HashStore&&) noexcept = default;
+    HashStore(HashStore&&) = delete;
+    HashStore& operator=(HashStore&&) = delete;
 
     // ========================================================================
     // INITIALIZATION & LIFECYCLE
@@ -369,7 +368,7 @@ public:
     ) const noexcept;
 
     // Flush changes to disk
-    StoreError Flush() noexcept;
+    [[nodiscard]] StoreError Flush() noexcept;
 
     void ClearCache() noexcept;
 
@@ -420,12 +419,18 @@ private:
         uint64_t signatureOffset
     ) const noexcept;
 
-    // Query result cache with SeqLock for lock-free reads
-    struct alignas(64) CacheEntry {  // Cache-line aligned to prevent false sharing
+    // Query result cache with SeqLock for lock-free reads.
+    // CRITICAL: Only POD/trivially-copyable types are stored — seqlock reads
+    // copy raw bytes, so non-trivially-copyable types (std::string inside
+    // DetectionResult) would cause UB if read during a concurrent write.
+    // DetectionResult is reconstructed from signatureOffset on cache hit.
+    struct alignas(64) CacheEntry {
         mutable std::atomic<uint64_t> seqlock{0};         // SeqLock: odd = writing, even = valid
-        HashValue hash{};
-        std::optional<DetectionResult> result;
-        uint64_t timestamp{0};                            // For LRU eviction
+        HashValue hash{};                                  // POD: safe under seqlock
+        uint64_t signatureOffset{0};                       // POD: offset for BuildDetectionResult
+        uint64_t timestamp{0};                             // POD: for LRU eviction
+        bool hasResult{false};                             // POD: true = positive cache hit
+        uint8_t padding_[7]{};                             // Explicit padding for alignment
     };
 
     [[nodiscard]] std::optional<DetectionResult> GetFromCache(
@@ -436,6 +441,11 @@ private:
         const HashValue& hash,
         const std::optional<DetectionResult>& result
     ) const noexcept;
+
+    // Internal statistics collection — caller must already hold m_globalLock
+    // (shared or exclusive). Avoids deadlock when Rebuild/Compact call
+    // GetStatistics while holding unique_lock on m_globalLock.
+    [[nodiscard]] HashStoreStatistics GetStatisticsLocked() const noexcept;
 
   
 
@@ -465,6 +475,8 @@ private:
     mutable std::atomic<uint64_t> m_cacheMisses{0};
     mutable std::atomic<uint64_t> m_totalMatches{ 0 };      // Fuzzy matching results counter
 
+    // Thread-safe allocation offset for new signature entries (per-instance, not static)
+    std::atomic<uint64_t> m_nextAllocationOffset{PAGE_SIZE * 100};
 
     // Bloom filter configuration
     size_t m_bloomExpectedElements{1'000'000};
@@ -482,3 +494,9 @@ private:
 
 } // namespace SignatureStore
 } // namespace ShadowStrike
+
+// NOTE: Two implementation files (HashStore_query_operations.cpp, HashStore_import_export.cpp)
+// still use `namespace ShadowStrike::HashStore` due to a pre-existing inconsistency.
+// They must be updated to `namespace ShadowStrike::SignatureStore` to match this header.
+// The remaining files (HashStore.cpp, HashBucket_impl.cpp, BloomFilter_impl.cpp,
+// HashStore_mgnmnt.cpp) already use the correct `namespace ShadowStrike::SignatureStore`.
