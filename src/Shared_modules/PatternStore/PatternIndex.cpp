@@ -16,7 +16,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 #include "pch.h"
-#include "../../src/SignatureStore/SignatureIndex.hpp"
+#include "../SignatureStore/SignatureIndex.hpp"
 #include "../Utils/Logger.hpp"
 
 #include <algorithm>

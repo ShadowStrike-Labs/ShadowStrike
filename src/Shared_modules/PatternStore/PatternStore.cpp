@@ -54,7 +54,7 @@
 #include <immintrin.h> // AVX2/AVX-512 intrinsics
 
 namespace ShadowStrike {
-namespace SignatureStore {
+namespace PatternStore {
 
 // ============================================================================
 // COMPILE-TIME CONSTANTS
