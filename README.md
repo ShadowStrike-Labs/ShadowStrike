@@ -177,7 +177,7 @@ Full architecture detail: [shadowstrike.dev/architecture](https://www.shadowstri
 
 ## Building
 
-**Current status:** Does not compile. Build instructions will be provided when the codebase reaches a compilable state.
+**Current status:** The Codebase is not ready yet. Build instructions will be provided when the codebase reaches a complete state.
 
 **Requirements (for future reference):**
 - Visual Studio 2022 with C++20 support
