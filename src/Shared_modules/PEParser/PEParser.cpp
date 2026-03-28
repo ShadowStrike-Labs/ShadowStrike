@@ -179,9 +179,27 @@ public:
             m_info.isDotNet = true;
         }
 
-        // Step 7: Check for signature
+        // Step 7: Check for Authenticode signature (validate WIN_CERTIFICATE, not just presence)
         if (m_info.dataDirectories[DataDirectory::SECURITY].present) {
-            m_info.isSigned = true;
+            const auto& secDir = m_info.dataDirectories[DataDirectory::SECURITY];
+            // SECURITY directory uses a file offset (not an RVA) — PE spec exception
+            const uint32_t certFileOffset = secDir.rva;
+            if (certFileOffset != 0 && secDir.size >= 8u &&
+                m_reader.ValidateRange(certFileOffset, secDir.size)) {
+                // WIN_CERTIFICATE: dwLength(4), wRevision(2), wCertificateType(2)
+                uint32_t dwLength   = 0;
+                uint16_t wRevision  = 0;
+                uint16_t wCertType  = 0;
+                if (m_reader.Read(certFileOffset,     dwLength) &&
+                    m_reader.Read(certFileOffset + 4, wRevision) &&
+                    m_reader.Read(certFileOffset + 6, wCertType) &&
+                    wRevision  == 0x0200u &&   // WIN_CERT_REVISION_2_0
+                    wCertType  == 0x0002u &&   // WIN_CERT_TYPE_PKCS_SIGNED_DATA
+                    dwLength   >= 8u &&
+                    dwLength   <= secDir.size) {
+                    m_info.isSigned = true;
+                }
+            }
         }
 
         // Step 8: Detect overlay
@@ -320,13 +338,14 @@ public:
 
             m_rawSections.push_back(header);
 
-            // Validate section
+            SectionInfo info;
+
+            // Validate section (alignment anomalies are collected into info.anomalies)
             auto valResult = ValidateSectionHeader(header, m_reader.Size(),
                                                     m_info.sizeOfImage,
-                                                    m_info.fileAlignment, i, err);
-            // Don't fail on validation errors, just note them
-
-            SectionInfo info;
+                                                    m_info.fileAlignment, i, err,
+                                                    &info.anomalies);
+            // Don't fail on section validation errors; anomalies are recorded above
 
             // Extract name (handle non-null-terminated 8-char names)
             std::string name;
@@ -499,6 +518,28 @@ public:
         if ((m_info.dllCharacteristics & DllCharacteristics::NO_SEH) == 0 &&
             (m_info.dllCharacteristics & DllCharacteristics::GUARD_CF) == 0) {
             // Not necessarily bad, but notable for modern binaries
+        }
+
+        // NoCFG: Control Flow Guard absent on binaries compiled after 2014-01-01
+        // (the year Microsoft shipped GUARD_CF support). Exclude .NET — the CLR
+        // provides its own control-flow model.
+        static constexpr uint32_t kCFGEpoch = 1388534400u;  // 2014-01-01 UTC
+        if (!m_info.isDotNet &&
+            m_info.timeDateStamp > kCFGEpoch &&
+            (m_info.dllCharacteristics & DllCharacteristics::GUARD_CF) == 0) {
+            m_info.anomalies.emplace_back(
+                AnomalyType::NoCFG,
+                L"Control Flow Guard (GUARD_CF) not enabled on modern binary (post-2014)");
+        }
+
+        // NoSEH: For user-mode executables (not DLL / driver / .NET), the absence
+        // of NO_SEH means SEH handlers are present and could be exploited via
+        // traditional SEH-overwrite techniques if CFG/SEHOP is also absent.
+        if (!m_info.isDLL && !m_info.isDriver && !m_info.isDotNet &&
+            (m_info.dllCharacteristics & DllCharacteristics::NO_SEH) == 0) {
+            m_info.anomalies.emplace_back(
+                AnomalyType::NoSEH,
+                L"NO_SEH flag not set; executable may contain exploitable SEH handlers");
         }
 
         // Checksum check
@@ -788,37 +829,38 @@ public:
 
         if (!eatOffset) return true;  // No exports
 
-        // Parse exports
-        for (uint32_t i = 0; i < dir.NumberOfFunctions && i < Limits::MAX_EXPORTS; ++i) {
-            ExportInfo exp;
-            exp.ordinal = dir.Base + i;
+        // Build a fixed-size EAT indexed 0..(NumberOfFunctions-1).
+        // ordIndex values from the Name-Ordinal table are 0-based indices into
+        // this full array, NOT indices into a compacted vector.  Building a
+        // compacted vector first and then using ordIndex as an index into it
+        // produces wrong name→ordinal associations.
+        std::vector<ExportInfo> eat(dir.NumberOfFunctions);
+        for (uint32_t i = 0; i < dir.NumberOfFunctions; ++i) {
+            eat[i].ordinal = dir.Base + i;
 
-            // Read function RVA
             uint32_t funcRva;
             if (!m_reader.Read(*eatOffset + i * sizeof(uint32_t), funcRva)) {
                 continue;
             }
+            if (funcRva == 0) continue;  // Empty EAT slot
 
-            if (funcRva == 0) continue;  // Empty slot
+            eat[i].rva = funcRva;
 
-            exp.rva = funcRva;
-
-            // Check if forwarder (RVA within export directory)
+            // Forwarder: RVA falls within the export directory bounds
             if (funcRva >= exportDir.rva && funcRva < exportDir.rva + exportDir.size) {
-                exp.isForwarder = true;
+                eat[i].isForwarder = true;
                 auto fwdOffset = RvaToOffsetInternal(funcRva);
                 if (fwdOffset) {
                     std::string_view fwdName;
                     if (m_reader.ReadString(*fwdOffset, Limits::MAX_DLL_NAME, fwdName)) {
-                        exp.forwarderName = std::string(fwdName);
+                        eat[i].forwarderName = std::string(fwdName);
                     }
                 }
             }
-
-            out.exports.push_back(std::move(exp));
         }
 
-        // Match names to ordinals
+        // Match export names using the raw EAT index (ordIndex is a 0-based
+        // index into the full EAT, validated against NumberOfFunctions).
         if (nptOffset && ordOffset && dir.NumberOfNames > 0) {
             for (uint32_t i = 0; i < dir.NumberOfNames && i < Limits::MAX_EXPORTS; ++i) {
                 uint32_t nameRva;
@@ -827,16 +869,24 @@ public:
                 if (!m_reader.Read(*nptOffset + i * sizeof(uint32_t), nameRva)) continue;
                 if (!m_reader.Read(*ordOffset + i * sizeof(uint16_t), ordIndex)) continue;
 
-                if (ordIndex < out.exports.size()) {
+                if (static_cast<uint32_t>(ordIndex) < dir.NumberOfFunctions) {
                     auto nameOffset = RvaToOffsetInternal(nameRva);
                     if (nameOffset) {
                         std::string_view name;
                         if (m_reader.ReadString(*nameOffset, Limits::MAX_FUNCTION_NAME, name)) {
-                            out.exports[ordIndex].name = std::string(name);
-                            out.exports[ordIndex].byName = true;
+                            eat[ordIndex].name    = std::string(name);
+                            eat[ordIndex].byName  = true;
                         }
                     }
                 }
+            }
+        }
+
+        // Prune empty EAT slots and move into output
+        out.exports.reserve(dir.NumberOfFunctions);
+        for (auto& exp : eat) {
+            if (exp.rva != 0) {
+                out.exports.push_back(std::move(exp));
             }
         }
 
@@ -883,17 +933,26 @@ public:
 
             // Parse callbacks
             if (tls.AddressOfCallBacks != 0) {
-                // Convert VA to RVA
+                // Convert VA to RVA; validate the subtraction does not exceed 32 bits
+                // before casting.  On a 64-bit PE imageBase can be large, and a crafted
+                // file could produce callbacksRva > UINT32_MAX causing silent truncation.
                 if (tls.AddressOfCallBacks >= m_info.imageBase) {
-                    uint64_t callbacksRva = tls.AddressOfCallBacks - m_info.imageBase;
-                    auto cbOffset = RvaToOffsetInternal(static_cast<uint32_t>(callbacksRva));
-                    if (cbOffset) {
-                        size_t offset = *cbOffset;
-                        for (size_t i = 0; i < Limits::MAX_TLS_CALLBACKS; ++i) {
-                            uint64_t callback;
-                            if (!m_reader.Read(offset, callback) || callback == 0) break;
-                            out.callbacks.push_back(callback);
-                            offset += sizeof(uint64_t);
+                    const uint64_t callbacksRva = tls.AddressOfCallBacks - m_info.imageBase;
+                    if (callbacksRva > static_cast<uint64_t>(UINT32_MAX)) {
+                        SS_LOG_WARNING(L"PEParser",
+                            L"TLS callback VA exceeds 32-bit RVA range; skipping callbacks");
+                        m_info.anomalies.emplace_back(AnomalyType::TLSCallbackPresent,
+                            L"TLS callback address produces RVA > UINT32_MAX — possible crafted PE");
+                    } else {
+                        auto cbOffset = RvaToOffsetInternal(static_cast<uint32_t>(callbacksRva));
+                        if (cbOffset) {
+                            size_t offset = *cbOffset;
+                            for (size_t i = 0; i < Limits::MAX_TLS_CALLBACKS; ++i) {
+                                uint64_t callback;
+                                if (!m_reader.Read(offset, callback) || callback == 0) break;
+                                out.callbacks.push_back(callback);
+                                offset += sizeof(uint64_t);
+                            }
                         }
                     }
                 }
@@ -1079,10 +1138,28 @@ public:
                 // Read age
                 m_reader.Read(offset + 20, info.pdbAge);
 
-                // Read PDB path
+                // Read PDB path and sanitize before storing.
+                // Paths from hostile PEs can be UNC paths (\\server\share) that
+                // trigger outbound SMB auth, excessively long, or embed control chars.
                 std::string_view path;
                 if (m_reader.ReadString(offset + 24, size - 24, path)) {
-                    info.pdbPath = std::string(path);
+                    // 1. Reject UNC paths entirely to prevent outbound SMB auth
+                    if (path.size() >= 2 && path[0] == '\\' && path[1] == '\\') {
+                        info.pdbPath.clear();
+                    } else {
+                        // 2. Limit to MAX_PATH characters
+                        const size_t maxLen = std::min(path.size(), static_cast<size_t>(MAX_PATH));
+                        std::string sanitized;
+                        sanitized.reserve(maxLen);
+                        for (size_t k = 0; k < maxLen; ++k) {
+                            const unsigned char c = static_cast<unsigned char>(path[k]);
+                            // 3. Strip null bytes and control characters (0x00-0x1F, DEL 0x7F)
+                            if (c >= 0x20u && c != 0x7Fu) {
+                                sanitized += static_cast<char>(c);
+                            }
+                        }
+                        info.pdbPath = std::move(sanitized);
+                    }
                 }
             }
         }
@@ -1102,7 +1179,12 @@ public:
         }
 
         // Search for "Rich" signature
-        size_t searchEnd = m_ntHeaderOffset;
+        // Cap the search window to 4 KB past the DOS header.  The Rich header
+        // lives in the DOS stub, which is never more than a few KB in practice.
+        // Without this cap an attacker can set e_lfanew = MAX_LFANEW (256 MB)
+        // and force 256M loop iterations — a complete CPU stall.
+        const size_t kMaxRichSearchBytes = 4096;
+        size_t searchEnd = std::min(m_ntHeaderOffset, sizeof(DosHeader) + kMaxRichSearchBytes);
         size_t searchStart = sizeof(DosHeader);
 
         std::optional<size_t> richOffset;
@@ -1189,13 +1271,17 @@ public:
             return -1.0;
         }
 
-        // Count byte frequencies
+        // Count byte frequencies using a single bounds-checked ReadArray call.
+        // The original byte-by-byte loop performed O(rawSize) individual bounds
+        // checks — for a 512 MB section that is 512 M checks.  ReadArray does
+        // one check and returns a zero-copy span.
         std::array<size_t, 256> freq = {};
-        for (size_t i = 0; i < sec.rawSize; ++i) {
-            uint8_t byte;
-            if (m_reader.ReadByte(sec.rawAddress + i, byte)) {
-                ++freq[byte];
-            }
+        std::span<const uint8_t> secData;
+        if (!m_reader.ReadArray<uint8_t>(sec.rawAddress, sec.rawSize, secData)) {
+            return -1.0;
+        }
+        for (const uint8_t byte : secData) {
+            ++freq[byte];
         }
 
         // Calculate Shannon entropy
@@ -1210,6 +1296,264 @@ public:
         }
 
         return entropy;
+    }
+
+    // ========================================================================
+    // Resource Directory Parsing (Recursive)
+    // ========================================================================
+
+    // Recursively parses one level of the resource tree.
+    //
+    // Parameters:
+    //   out               – accumulator for leaf ResourceEntry records
+    //   rsrcBase          – file offset of the resource section start
+    //   rsrcSize          – size of the resource section in the file
+    //   dirOffsetFromBase – offset of *this* directory from rsrcBase
+    //   typeId/nameId/langId – IDs accumulated from ancestor levels
+    //   nameIsStringEntry – true when the parent name-level entry had a string name
+    //   nameStringOffset  – offset from rsrcBase to the UNICODE name string
+    //   depth             – current depth (0=type, 1=name, 2=language)
+    //   maxDepth          – caller-supplied recursion cap
+    //   visited           – set of already-processed dir offsets for loop detection
+    void ParseResourceDirectoryLevel(
+            std::vector<ResourceEntry>& out,
+            size_t        rsrcBase,
+            uint32_t      rsrcSize,
+            uint32_t      dirOffsetFromBase,
+            uint32_t      typeId,
+            uint32_t      nameId,
+            uint32_t      langId,
+            bool          nameIsStringEntry,
+            uint32_t      nameStringOffset,
+            uint32_t      depth,
+            uint32_t      maxDepth,
+            std::unordered_set<uint32_t>& visited) noexcept {
+
+        if (depth >= maxDepth) {
+            m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                L"Resource tree depth limit exceeded");
+            return;
+        }
+
+        if (out.size() >= Limits::MAX_TOTAL_RESOURCES) return;
+
+        // Loop detection: offsets are relative to section base (uint32_t).
+        if (!visited.insert(dirOffsetFromBase).second) {
+            m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                L"Circular reference detected in resource directory");
+            return;
+        }
+
+        size_t rsrcEnd;
+        if (!SafeMath::SafeAdd(rsrcBase, static_cast<size_t>(rsrcSize), rsrcEnd)) return;
+
+        size_t dirFileOffset;
+        if (!SafeMath::SafeAdd(rsrcBase, static_cast<size_t>(dirOffsetFromBase), dirFileOffset))
+            return;
+
+        if (dirFileOffset + sizeof(ResourceDirectory) > rsrcEnd) {
+            m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                L"Resource directory offset is outside the resource section");
+            return;
+        }
+
+        ResourceDirectory dir;
+        if (!m_reader.Read(dirFileOffset, dir)) return;
+
+        uint32_t numEntries;
+        if (!SafeMath::SafeAdd(static_cast<uint32_t>(dir.NumberOfNamedEntries),
+                               static_cast<uint32_t>(dir.NumberOfIdEntries), numEntries)) {
+            m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                L"Resource directory entry count overflow");
+            return;
+        }
+
+        if (numEntries > static_cast<uint32_t>(Limits::MAX_RESOURCE_ENTRIES)) {
+            m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                L"Resource directory entry count exceeds limit; truncating");
+            numEntries = static_cast<uint32_t>(Limits::MAX_RESOURCE_ENTRIES);
+        }
+
+        const size_t entryTableBase = dirFileOffset + sizeof(ResourceDirectory);
+
+        for (uint32_t i = 0;
+             i < numEntries && out.size() < Limits::MAX_TOTAL_RESOURCES;
+             ++i) {
+
+            size_t stride, entryFileOffset;
+            if (!SafeMath::SafeMul(static_cast<size_t>(i), sizeof(ResourceDirectoryEntry), stride) ||
+                !SafeMath::SafeAdd(entryTableBase, stride, entryFileOffset)) break;
+
+            if (entryFileOffset + sizeof(ResourceDirectoryEntry) > rsrcEnd) break;
+
+            ResourceDirectoryEntry entry;
+            if (!m_reader.Read(entryFileOffset, entry)) break;
+
+            // Decode via explicit bit masks for portability (bitfield layout
+            // of anonymous union structs is implementation-defined).
+            const bool     entryNameIsString    = (entry.Name       >> 31) != 0;
+            const uint32_t entryNameOffsetOrId  = entry.Name        & 0x7FFFFFFFu;
+            const bool     entryDataIsDir       = (entry.OffsetToData >> 31) != 0;
+            const uint32_t entryDirOrDataOffset = entry.OffsetToData & 0x7FFFFFFFu;
+
+            // Propagate IDs down based on the current depth level.
+            uint32_t curType          = typeId;
+            uint32_t curName          = nameId;
+            uint32_t curLang          = langId;
+            bool     curNameIsString  = nameIsStringEntry;
+            uint32_t curNameStrOffset = nameStringOffset;
+
+            if (depth == 0) {
+                // Type level — types are almost always integer IDs (RT_*)
+                curType = entryNameIsString ? 0u : (entryNameOffsetOrId & 0xFFFFu);
+            } else if (depth == 1) {
+                // Name level — may be string or integer
+                curNameIsString  = entryNameIsString;
+                if (entryNameIsString) {
+                    curName          = 0;
+                    curNameStrOffset = entryNameOffsetOrId;  // offset from section base
+                } else {
+                    curName          = entryNameOffsetOrId & 0xFFFFu;
+                    curNameStrOffset = 0;
+                }
+            } else if (depth == 2) {
+                // Language level — always integer ID
+                curLang = entryNameIsString ? 0u : (entryNameOffsetOrId & 0xFFFFu);
+            }
+
+            if (entryDataIsDir) {
+                ParseResourceDirectoryLevel(out, rsrcBase, rsrcSize, entryDirOrDataOffset,
+                                            curType, curName, curLang,
+                                            curNameIsString, curNameStrOffset,
+                                            depth + 1, maxDepth, visited);
+            } else {
+                // Leaf node: entryDirOrDataOffset is offset from section base to
+                // a ResourceDataEntry struct.
+                size_t dataEntryFileOffset;
+                if (!SafeMath::SafeAdd(rsrcBase,
+                                       static_cast<size_t>(entryDirOrDataOffset),
+                                       dataEntryFileOffset)) continue;
+
+                if (dataEntryFileOffset + sizeof(ResourceDataEntry) > rsrcEnd) {
+                    m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                        L"Resource data entry is outside the resource section bounds");
+                    continue;
+                }
+
+                ResourceDataEntry dataEntry;
+                if (!m_reader.Read(dataEntryFileOffset, dataEntry)) continue;
+
+                if (dataEntry.Size > 0x1000000u) {  // > 16 MB
+                    m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                        L"Resource data entry has suspiciously large size (>16 MB)");
+                }
+
+                ResourceEntry resEntry;
+                resEntry.type         = curType;
+                resEntry.name         = curName;
+                resEntry.language     = curLang;
+                resEntry.codePage     = dataEntry.CodePage;
+                resEntry.size         = dataEntry.Size;
+                resEntry.nameIsString = curNameIsString;
+
+                // dataEntry.OffsetToData is an RVA — convert to file offset.
+                if (dataEntry.OffsetToData != 0) {
+                    auto dataFileOpt = RvaToOffsetInternal(dataEntry.OffsetToData);
+                    if (dataFileOpt) {
+                        resEntry.offset = static_cast<uint32_t>(*dataFileOpt & 0xFFFFFFFFu);
+                        if (!m_reader.ValidateRange(*dataFileOpt, dataEntry.Size)) {
+                            m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                                L"Resource data extends beyond file boundary");
+                        }
+                    } else {
+                        m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                            L"Resource data RVA cannot be resolved to a file offset");
+                    }
+                }
+
+                // Resolve Unicode string name when the name-level entry was string-typed.
+                // The name string is a WORD length followed by a WORD array (UTF-16LE).
+                if (curNameIsString && curNameStrOffset != 0) {
+                    size_t nameStrFileOffset;
+                    if (SafeMath::SafeAdd(rsrcBase,
+                                          static_cast<size_t>(curNameStrOffset),
+                                          nameStrFileOffset)) {
+                        uint16_t nameLen = 0;
+                        if (m_reader.Read(nameStrFileOffset, nameLen) &&
+                            nameLen > 0 && nameLen <= 256) {
+                            std::wstring nameStr;
+                            nameStr.reserve(nameLen);
+                            bool nameOk = true;
+                            for (uint16_t k = 0; k < nameLen && nameOk; ++k) {
+                                size_t chOffset;
+                                uint16_t ch = 0;
+                                if (!SafeMath::SafeAdd(nameStrFileOffset + 2u,
+                                                       static_cast<size_t>(k) * 2u,
+                                                       chOffset) ||
+                                    !m_reader.Read(chOffset, ch)) {
+                                    nameOk = false;
+                                } else {
+                                    nameStr += static_cast<wchar_t>(ch);
+                                }
+                            }
+                            if (nameOk) {
+                                resEntry.nameString = std::move(nameStr);
+                            }
+                        }
+                    }
+                }
+
+                out.push_back(std::move(resEntry));
+            }
+        }
+    }
+
+    [[nodiscard]] bool ParseResourcesInternal(std::vector<ResourceEntry>& out,
+                                              uint32_t maxDepth,
+                                              PEError* err) noexcept {
+        out.clear();
+
+        const auto& rsrcDir = m_info.dataDirectories[DataDirectory::RESOURCE];
+        if (!rsrcDir.present || rsrcDir.rva == 0 || rsrcDir.size == 0) {
+            return true;  // No resource directory — valid
+        }
+
+        if (maxDepth == 0) maxDepth = 1;
+        if (maxDepth > Limits::MAX_RESOURCE_DEPTH) maxDepth = Limits::MAX_RESOURCE_DEPTH;
+
+        auto rsrcBaseOpt = RvaToOffsetInternal(rsrcDir.rva);
+        if (!rsrcBaseOpt) {
+            if (err) {
+                err->Set(ValidationResult::ResourceDirectoryInvalid,
+                         L"Resource section RVA cannot be resolved to a file offset", 0);
+            }
+            SS_LOG_ERROR(L"PEParser",
+                L"Resource directory RVA 0x%08X is invalid", rsrcDir.rva);
+            return false;
+        }
+
+        const size_t rsrcBase = *rsrcBaseOpt;
+
+        size_t rsrcEnd;
+        if (!SafeMath::SafeAdd(rsrcBase, static_cast<size_t>(rsrcDir.size), rsrcEnd) ||
+            rsrcEnd > m_reader.Size()) {
+            if (err) {
+                err->Set(ValidationResult::ResourceDirectoryOutOfBounds,
+                         L"Resource section extends beyond end of file", rsrcBase);
+            }
+            return false;
+        }
+
+        std::unordered_set<uint32_t> visited;
+        visited.reserve(64);
+
+        // Root directory is at offset 0 from the section base.
+        ParseResourceDirectoryLevel(out, rsrcBase, rsrcDir.size,
+                                    0u,          // dirOffsetFromBase = 0
+                                    0u, 0u, 0u,  // typeId, nameId, langId
+                                    false, 0u,   // nameIsStringEntry, nameStringOffset
+                                    0u, maxDepth, visited);
+        return true;
     }
 
     // ========================================================================
@@ -1244,13 +1588,34 @@ PEParser& PEParser::operator=(PEParser&&) noexcept = default;
 bool PEParser::ParseFile(const std::wstring& path, PEInfo& out, PEError* err) noexcept {
     m_impl->Reset();
 
+    // Validate path before touching the filesystem
+    if (path.empty()) {
+        if (err) err->Set(ValidationResult::NullPointer, L"Empty path provided", 0);
+        return false;
+    }
+    if (path.size() > MAX_PATH) {
+        if (err) err->Set(ValidationResult::UnknownError, L"Path length exceeds MAX_PATH", 0);
+        return false;
+    }
+    // Reject device paths (\\?\ and \\.\) — these bypass normal path processing
+    if (path.size() >= 4 &&
+        path[0] == L'\\' && path[1] == L'\\' &&
+        (path[2] == L'?' || path[2] == L'.') &&
+        path[3] == L'\\') {
+        if (err) err->Set(ValidationResult::UnknownError, L"Device paths are not permitted", 0);
+        SS_LOG_ERROR(L"PEParser", L"Rejected device path: %ls", path.c_str());
+        return false;
+    }
+
     // Memory map the file
     if (!m_impl->m_mappedFile.mapReadOnly(path)) {
+        // Capture GetLastError() BEFORE err->Set(), which may call OS functions
+        const uint32_t lastErr = static_cast<uint32_t>(GetLastError());
         if (err) {
             err->Set(ValidationResult::UnknownError,
                      L"Failed to open or map file",
                      0);
-            err->win32Error = GetLastError();
+            err->win32Error = lastErr;
         }
         SS_LOG_ERROR(L"PEParser", L"Failed to map file: %ls", path.c_str());
         return false;
@@ -1358,7 +1723,6 @@ bool PEParser::ParseResources(std::vector<ResourceEntry>& out, uint32_t maxDepth
     // Resource parsing would go here - simplified for now
     // Full implementation would recursively parse the resource tree
     return true;
-}
 
 bool PEParser::ParseRelocations(std::vector<RelocationBlock>& out, PEError* err) noexcept {
     if (!m_impl->m_parsed) {

@@ -148,6 +148,15 @@ namespace PEParser {
         case ValidationResult::SignatureOutOfBounds: return L"Signature beyond file";
         case ValidationResult::SignatureFormatInvalid: return L"Invalid signature format";
 
+        case ValidationResult::SizeOfStackCommitExceedsReserve:
+            return L"SizeOfStackCommit exceeds SizeOfStackReserve";
+        case ValidationResult::SizeOfHeapCommitExceedsReserve:
+            return L"SizeOfHeapCommit exceeds SizeOfHeapReserve";
+        case ValidationResult::SizeOfImageNotAligned:
+            return L"SizeOfImage is not a multiple of SectionAlignment";
+        case ValidationResult::SizeOfHeadersNotAligned:
+            return L"SizeOfHeaders is not a multiple of FileAlignment";
+
         default: return L"Unknown validation result";
     }
 }
@@ -304,24 +313,46 @@ namespace PEParser {
         return ValidationResult::NtHeadersOutOfBounds;
     }
 
-    // Validate machine type
+    // Validate machine type - reject values not defined in the PE spec.
+    // Hostile PEs use arbitrary machine values to probe parsers; we enforce
+    // the known-good allowlist and fail everything else.
     bool validMachine = false;
     switch (outFileHeader.Machine) {
-        case Machine::I386:
-        case Machine::AMD64:
-        case Machine::ARM:
-        case Machine::ARMNT:
-        case Machine::ARM64:
-        case Machine::IA64:
-            validMachine = true;
-            break;
         case Machine::UNKNOWN:
-            // Allow unknown for some edge cases
+        case Machine::TARGET_HOST:
+        case Machine::I386:
+        case Machine::R3000:
+        case Machine::R4000:
+        case Machine::R10000:
+        case Machine::WCEMIPSV2:
+        case Machine::ALPHA:
+        case Machine::SH3:
+        case Machine::SH3DSP:
+        case Machine::SH3E:
+        case Machine::SH4:
+        case Machine::SH5:
+        case Machine::ARM:
+        case Machine::THUMB:
+        case Machine::ARMNT:
+        case Machine::AM33:
+        case Machine::POWERPC:
+        case Machine::POWERPCFP:
+        case Machine::IA64:
+        case Machine::MIPS16:
+        case Machine::ALPHA64:
+        case Machine::MIPSFPU:
+        case Machine::MIPSFPU16:
+        case Machine::TRICORE:
+        case Machine::CEF:
+        case Machine::EBC:
+        case Machine::AMD64:
+        case Machine::M32R:
+        case Machine::ARM64:
+        case Machine::CEE:
             validMachine = true;
             break;
         default:
-            // Allow other less common but valid types
-            validMachine = true;
+            validMachine = false;
             break;
     }
 
@@ -384,7 +415,7 @@ namespace PEParser {
         outIs64Bit = true;
         if (outFileHeader.SizeOfOptionalHeader < sizeof(OptionalHeader64)) {
             // Allow smaller if NumberOfRvaAndSizes is reduced
-            if (outFileHeader.SizeOfOptionalHeader < 112) {  // Minimum PE64 header
+            if (outFileHeader.SizeOfOptionalHeader < sizeof(OptionalHeader64)) {  // Minimum PE64 header
                 if (err) {
                     err->Set(ValidationResult::SizeOfOptionalHeaderTooSmall,
                              L"PE64 optional header too small",
@@ -397,7 +428,7 @@ namespace PEParser {
         outIs64Bit = false;
         if (outFileHeader.SizeOfOptionalHeader < sizeof(OptionalHeader32)) {
             // Allow smaller if NumberOfRvaAndSizes is reduced
-            if (outFileHeader.SizeOfOptionalHeader < 96) {  // Minimum PE32 header
+            if (outFileHeader.SizeOfOptionalHeader < sizeof(OptionalHeader32)) {  // Minimum PE32 header
                 if (err) {
                     err->Set(ValidationResult::SizeOfOptionalHeaderTooSmall,
                              L"PE32 optional header too small",
@@ -533,6 +564,48 @@ namespace PEParser {
         return ValidationResult::NumberOfRvaAndSizesInvalid;
     }
 
+    // Stack commit must not exceed reserve — malformed headers can cause loader issues
+    if (outOptional.SizeOfStackCommit > outOptional.SizeOfStackReserve) {
+        if (err) {
+            err->Set(ValidationResult::SizeOfStackCommitExceedsReserve,
+                     L"SizeOfStackCommit exceeds SizeOfStackReserve",
+                     offset + offsetof(OptionalHeader32, SizeOfStackCommit));
+        }
+        return ValidationResult::SizeOfStackCommitExceedsReserve;
+    }
+
+    // Heap commit must not exceed reserve
+    if (outOptional.SizeOfHeapCommit > outOptional.SizeOfHeapReserve) {
+        if (err) {
+            err->Set(ValidationResult::SizeOfHeapCommitExceedsReserve,
+                     L"SizeOfHeapCommit exceeds SizeOfHeapReserve",
+                     offset + offsetof(OptionalHeader32, SizeOfHeapCommit));
+        }
+        return ValidationResult::SizeOfHeapCommitExceedsReserve;
+    }
+
+    // SizeOfImage must be a multiple of SectionAlignment (PE spec requirement)
+    if (outOptional.SectionAlignment > 0 &&
+        (outOptional.SizeOfImage % outOptional.SectionAlignment) != 0) {
+        if (err) {
+            err->Set(ValidationResult::SizeOfImageNotAligned,
+                     L"SizeOfImage is not a multiple of SectionAlignment",
+                     offset + offsetof(OptionalHeader32, SizeOfImage));
+        }
+        return ValidationResult::SizeOfImageNotAligned;
+    }
+
+    // SizeOfHeaders must be a multiple of FileAlignment when FileAlignment >= 512
+    if (outOptional.FileAlignment >= Limits::MIN_FILE_ALIGNMENT &&
+        (outOptional.SizeOfHeaders % outOptional.FileAlignment) != 0) {
+        if (err) {
+            err->Set(ValidationResult::SizeOfHeadersNotAligned,
+                     L"SizeOfHeaders is not a multiple of FileAlignment",
+                     offset + offsetof(OptionalHeader32, SizeOfHeaders));
+        }
+        return ValidationResult::SizeOfHeadersNotAligned;
+    }
+
     return ValidationResult::Valid;
 }
 
@@ -646,6 +719,48 @@ namespace PEParser {
         return ValidationResult::NumberOfRvaAndSizesInvalid;
     }
 
+    // Stack commit must not exceed reserve
+    if (outOptional.SizeOfStackCommit > outOptional.SizeOfStackReserve) {
+        if (err) {
+            err->Set(ValidationResult::SizeOfStackCommitExceedsReserve,
+                     L"SizeOfStackCommit exceeds SizeOfStackReserve",
+                     offset + offsetof(OptionalHeader64, SizeOfStackCommit));
+        }
+        return ValidationResult::SizeOfStackCommitExceedsReserve;
+    }
+
+    // Heap commit must not exceed reserve
+    if (outOptional.SizeOfHeapCommit > outOptional.SizeOfHeapReserve) {
+        if (err) {
+            err->Set(ValidationResult::SizeOfHeapCommitExceedsReserve,
+                     L"SizeOfHeapCommit exceeds SizeOfHeapReserve",
+                     offset + offsetof(OptionalHeader64, SizeOfHeapCommit));
+        }
+        return ValidationResult::SizeOfHeapCommitExceedsReserve;
+    }
+
+    // SizeOfImage must be a multiple of SectionAlignment
+    if (outOptional.SectionAlignment > 0 &&
+        (outOptional.SizeOfImage % outOptional.SectionAlignment) != 0) {
+        if (err) {
+            err->Set(ValidationResult::SizeOfImageNotAligned,
+                     L"SizeOfImage is not a multiple of SectionAlignment",
+                     offset + offsetof(OptionalHeader64, SizeOfImage));
+        }
+        return ValidationResult::SizeOfImageNotAligned;
+    }
+
+    // SizeOfHeaders must be a multiple of FileAlignment when FileAlignment >= 512
+    if (outOptional.FileAlignment >= Limits::MIN_FILE_ALIGNMENT &&
+        (outOptional.SizeOfHeaders % outOptional.FileAlignment) != 0) {
+        if (err) {
+            err->Set(ValidationResult::SizeOfHeadersNotAligned,
+                     L"SizeOfHeaders is not a multiple of FileAlignment",
+                     offset + offsetof(OptionalHeader64, SizeOfHeaders));
+        }
+        return ValidationResult::SizeOfHeadersNotAligned;
+    }
+
     return ValidationResult::Valid;
 }
 
@@ -659,7 +774,8 @@ namespace PEParser {
     uint32_t sizeOfImage,
     uint32_t fileAlignment,
     size_t sectionIndex,
-    PEError* err) noexcept
+    PEError* err,
+    std::vector<Anomaly>* outAnomalies) noexcept
 {
     // Check raw data bounds
     if (header.SizeOfRawData > 0) {
@@ -714,11 +830,20 @@ namespace PEParser {
         }
     }
 
-    // Check alignment (PointerToRawData should be aligned to FileAlignment)
+    // Check alignment (PointerToRawData should be aligned to FileAlignment).
+    // Misaligned sections are a significant packer/malware indicator; record
+    // as an anomaly rather than a hard failure since legitimate packers do this.
     if (header.PointerToRawData != 0 && fileAlignment > 0) {
         if ((header.PointerToRawData % fileAlignment) != 0) {
-            // This is technically a violation but many packers do it
-            // We don't return error, just note it as anomaly
+            if (outAnomalies) {
+                try {
+                    outAnomalies->emplace_back(
+                        AnomalyType::SectionAlignmentViolation,
+                        L"Section PointerToRawData is not aligned to FileAlignment");
+                } catch (...) {
+                    // Anomaly recording is informational; allocation failure is non-fatal.
+                }
+            }
         }
     }
 
@@ -735,6 +860,7 @@ namespace PEParser {
 {
     outOverlaps.clear();
 
+    // Pass 1: raw file (physical) overlaps
     for (size_t i = 0; i < sections.size(); ++i) {
         const auto& s1 = sections[i];
         if (s1.SizeOfRawData == 0) continue;
@@ -757,7 +883,44 @@ namespace PEParser {
 
             // Check for overlap
             if (s1Start < s2End && s2Start < s1End) {
-                outOverlaps.emplace_back(i, j);
+                try { outOverlaps.emplace_back(i, j); } catch (...) {}
+            }
+        }
+    }
+
+    // Pass 2: virtual address overlaps.
+    // Overlapping VAs corrupt RVA->offset mapping and can bypass section-based
+    // anomaly detection — a known evasion technique.
+    for (size_t i = 0; i < sections.size(); ++i) {
+        const auto& s1 = sections[i];
+        const uint32_t s1VSize = (s1.VirtualSize != 0) ? s1.VirtualSize : s1.SizeOfRawData;
+        if (s1VSize == 0 || s1.VirtualAddress == 0) continue;
+
+        size_t s1VStart = s1.VirtualAddress;
+        size_t s1VEnd;
+        if (!SafeMath::SafeAdd(s1VStart, static_cast<size_t>(s1VSize), s1VEnd)) continue;
+
+        for (size_t j = i + 1; j < sections.size(); ++j) {
+            const auto& s2 = sections[j];
+            const uint32_t s2VSize = (s2.VirtualSize != 0) ? s2.VirtualSize : s2.SizeOfRawData;
+            if (s2VSize == 0 || s2.VirtualAddress == 0) continue;
+
+            size_t s2VStart = s2.VirtualAddress;
+            size_t s2VEnd;
+            if (!SafeMath::SafeAdd(s2VStart, static_cast<size_t>(s2VSize), s2VEnd)) continue;
+
+            if (s1VStart < s2VEnd && s2VStart < s1VEnd) {
+                // Avoid duplicating a pair already recorded in pass 1
+                bool alreadyRecorded = false;
+                for (const auto& p : outOverlaps) {
+                    if (p.first == i && p.second == j) {
+                        alreadyRecorded = true;
+                        break;
+                    }
+                }
+                if (!alreadyRecorded) {
+                    try { outOverlaps.emplace_back(i, j); } catch (...) {}
+                }
             }
         }
     }
@@ -773,37 +936,133 @@ namespace PEParser {
     size_t index,
     uint32_t rva,
     uint32_t size,
+    uint32_t sizeOfImage,
     size_t fileSize,
     PEError* err) noexcept
 {
-    // Zero RVA and size is valid (directory not present)
+    // Empty directory entry is valid (directory not present)
     if (rva == 0 && size == 0) {
         return ValidationResult::Valid;
     }
 
-    // Non-zero size with zero RVA is suspicious
+    // Non-zero size with zero RVA is structurally malformed
     if (rva == 0 && size != 0) {
         if (err) {
             err->Set(ValidationResult::DataDirectoryRvaInvalid,
-                     L"Data directory has size but zero RVA",
-                     0);
+                     L"Data directory has non-zero size but zero RVA", 0);
         }
         return ValidationResult::DataDirectoryRvaInvalid;
     }
 
-    // Check for overflow
-    size_t end;
-    if (!SafeMath::SafeAdd(static_cast<size_t>(rva), static_cast<size_t>(size), end)) {
-        if (err) {
-            err->Set(ValidationResult::IntegerOverflow,
-                     L"Data directory size overflow",
-                     0);
+    // Security directory (index 4) is special: the "VirtualAddress" field
+    // actually stores a file offset, not an RVA.  Validate against fileSize.
+    if (index == DataDirectory::SECURITY) {
+        size_t certEnd;
+        if (!SafeMath::SafeAdd(static_cast<size_t>(rva),
+                               static_cast<size_t>(size), certEnd)) {
+            if (err) {
+                err->Set(ValidationResult::IntegerOverflow,
+                         L"Security certificate directory size overflow", 0);
+            }
+            return ValidationResult::IntegerOverflow;
         }
-        return ValidationResult::IntegerOverflow;
+        if (certEnd > fileSize) {
+            if (err) {
+                err->Set(ValidationResult::SecurityDirectoryInvalid,
+                         L"Security certificate directory extends beyond file",
+                         static_cast<uint64_t>(rva));
+            }
+            return ValidationResult::SecurityDirectoryInvalid;
+        }
+        // Minimum WIN_CERTIFICATE: 4 (dwLength) + 2 (wRevision) + 2 (wCertificateType)
+        if (size < Limits::MIN_WIN_CERTIFICATE) {
+            if (err) {
+                err->Set(ValidationResult::SecurityDirectoryInvalid,
+                         L"Security directory too small for a valid WIN_CERTIFICATE header",
+                         static_cast<uint64_t>(rva));
+            }
+            return ValidationResult::SecurityDirectoryInvalid;
+        }
+        return ValidationResult::Valid;
     }
 
-    // Note: We can't fully validate RVA->offset mapping here
-    // That requires section table information
+    // All remaining directories use RVAs — validate against sizeOfImage
+    if (sizeOfImage > 0) {
+        if (rva >= sizeOfImage) {
+            if (err) {
+                err->Set(ValidationResult::DataDirectoryRvaInvalid,
+                         L"Data directory RVA exceeds image size",
+                         static_cast<uint64_t>(rva));
+            }
+            return ValidationResult::DataDirectoryRvaInvalid;
+        }
+
+        size_t end;
+        if (!SafeMath::SafeAdd(static_cast<size_t>(rva),
+                               static_cast<size_t>(size), end)) {
+            if (err) {
+                err->Set(ValidationResult::IntegerOverflow,
+                         L"Data directory RVA+size overflow", 0);
+            }
+            return ValidationResult::IntegerOverflow;
+        }
+        if (end > static_cast<size_t>(sizeOfImage)) {
+            if (err) {
+                err->Set(ValidationResult::DataDirectoryOutOfBounds,
+                         L"Data directory extends beyond image",
+                         static_cast<uint64_t>(rva));
+            }
+            return ValidationResult::DataDirectoryOutOfBounds;
+        }
+    } else {
+        // No sizeOfImage available; at minimum guard against arithmetic overflow
+        size_t end;
+        if (!SafeMath::SafeAdd(static_cast<size_t>(rva),
+                               static_cast<size_t>(size), end)) {
+            if (err) {
+                err->Set(ValidationResult::IntegerOverflow,
+                         L"Data directory size overflow", 0);
+            }
+            return ValidationResult::IntegerOverflow;
+        }
+    }
+
+    // Per-directory minimum size checks for known critical directories
+    switch (index) {
+        case DataDirectory::IMPORT:
+            if (size < sizeof(ImportDescriptor)) {
+                if (err) {
+                    err->Set(ValidationResult::ImportDirectoryInvalid,
+                             L"Import directory too small for an import descriptor",
+                             static_cast<uint64_t>(rva));
+                }
+                return ValidationResult::ImportDirectoryInvalid;
+            }
+            break;
+        case DataDirectory::EXPORT:
+            if (size < sizeof(ExportDirectory)) {
+                if (err) {
+                    err->Set(ValidationResult::ExportDirectoryInvalid,
+                             L"Export directory too small for an export directory",
+                             static_cast<uint64_t>(rva));
+                }
+                return ValidationResult::ExportDirectoryInvalid;
+            }
+            break;
+        case DataDirectory::TLS:
+            // TLS directory must accommodate at least the 32-bit variant
+            if (size < sizeof(TLSDirectory32)) {
+                if (err) {
+                    err->Set(ValidationResult::TLSDirectoryInvalid,
+                             L"TLS directory too small for a TLS descriptor",
+                             static_cast<uint64_t>(rva));
+                }
+                return ValidationResult::TLSDirectoryInvalid;
+            }
+            break;
+        default:
+            break;
+    }
 
     return ValidationResult::Valid;
 }
