@@ -30,31 +30,38 @@
  * CAPABILITIES:
  * =============
  * 1. TRAFFIC METRICS
- *    - System-wide throughput (Ingress/Egress)
- *    - Per-interface statistics
- *    - Packet rates and error counters
+ *    - System-wide throughput (Ingress/Egress) with rate calculation
+ *    - Per-interface statistics including error/discard rates
+ *    - Packet rates, counter-rollover-safe delta computation
  *
- * 2. CONNECTION TRACKING
- *    - Active TCP/UDP connection counts
- *    - State analysis (ESTABLISHED, LISTENING, etc.)
- *    - Per-process connection mapping
+ * 2. CONNECTION TRACKING (IPv4 + IPv6)
+ *    - Active TCP/UDP connection enumeration via IP Helper
+ *    - State analysis (ESTABLISHED, LISTENING, TIME_WAIT, etc.)
+ *    - Per-process connection mapping with PID attribution
  *
  * 3. PROCESS ATTRIBUTION
- *    - Bandwidth usage per process
- *    - Top talker identification
- *    - New connection detection
+ *    - Connection count per process (TCP v4/v6, UDP v4/v6)
+ *    - Top talker identification sorted by total connections
+ *    - Process name caching with TTL to avoid repeated handle opens
  *
- * 4. ANOMALY DETECTION
- *    - High bandwidth spikes
- *    - Connection flooding
- *    - Port scanning patterns
+ * 4. ANOMALY / THREAT DETECTION
+ *    - C2 Beaconing: regular-interval connections to same destination
+ *    - Data Exfiltration: cumulative outbound connection tracking
+ *    - Connection Flooding: rapid new-connection bursts per process
+ *    - Interface Health: error/discard rate spike detection
+ *    - High Bandwidth: aggregate throughput threshold alerts
+ *
+ * 5. ALERT SYSTEM
+ *    - Callback registration for real-time alert delivery
+ *    - Rate-limited alert emission to prevent alert storms
+ *    - Recent alert ring buffer for diagnostic queries
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 4.0.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
- * LICENSE: Proprietary - ShadowStrike Enterprise License
+ * LICENSE: AGPL-3.0 — ShadowStrike Enterprise License
  * ============================================================================
  */
 
@@ -102,115 +109,212 @@ namespace Performance {
 // CONSTANTS
 // ============================================================================
 namespace NetworkConstants {
-    constexpr uint32_t DEFAULT_POLLING_INTERVAL_MS = 1000;
-    constexpr uint32_t MIN_POLLING_INTERVAL_MS = 100;
-    constexpr uint32_t MAX_POLLING_INTERVAL_MS = 60000;
+    constexpr uint32_t DEFAULT_POLLING_INTERVAL_MS  = 1000;
+    constexpr uint32_t MIN_POLLING_INTERVAL_MS      = 100;
+    constexpr uint32_t MAX_POLLING_INTERVAL_MS      = 60000;
+
+    constexpr uint32_t MAX_TRACKED_PROCESSES        = 4096;
+    constexpr uint32_t MAX_TRACKED_DESTINATIONS     = 16384;
+    constexpr uint32_t MAX_TABLE_ALLOC_BYTES        = 64u * 1024u * 1024u;  // 64 MiB cap
+
+    constexpr uint32_t BEACONING_HISTORY_SIZE       = 64;
+    constexpr uint32_t BEACONING_MIN_SAMPLES        = 5;
+    constexpr double   BEACONING_JITTER_THRESHOLD   = 0.15;   // CoV < 15 % ⇒ suspicious
+
+    constexpr uint64_t EXFIL_DEFAULT_THRESHOLD_BYTES = 100ULL * 1024 * 1024;  // 100 MiB
+    constexpr uint32_t FLOOD_DEFAULT_THRESHOLD       = 500;    // new conns / interval
+
+    constexpr uint32_t PROCESS_NAME_CACHE_TTL_SEC    = 30;
+    constexpr size_t   MAX_RECENT_ALERTS             = 200;
+    constexpr uint32_t ALERT_COOLDOWN_SEC            = 60;
 }
 
 // ============================================================================
 // TYPE ALIASES
 // ============================================================================
-using Clock = std::chrono::steady_clock;
+using Clock     = std::chrono::steady_clock;
 using TimePoint = std::chrono::steady_clock::time_point;
+
+// ============================================================================
+// ENUMERATIONS
+// ============================================================================
+
+enum class NetworkAlertType : uint8_t {
+    HighBandwidth       = 0,
+    ConnectionFlood     = 1,
+    SuspectedBeaconing  = 2,
+    DataExfiltration    = 3,
+    InterfaceErrors     = 4,
+};
+
+enum class NetworkAlertSeverity : uint8_t {
+    Low      = 0,
+    Medium   = 1,
+    High     = 2,
+    Critical = 3,
+};
 
 // ============================================================================
 // STRUCTURES
 // ============================================================================
 
 /**
- * @brief Network interface statistics
+ * @brief A single network alert emitted by the detection heuristics.
+ */
+struct NetworkAlert {
+    NetworkAlertType     type{};
+    NetworkAlertSeverity severity{};
+    uint32_t             processId   = 0;
+    std::wstring         processName;
+    std::string          remoteAddress;
+    uint16_t             remotePort  = 0;
+    std::string          details;
+    TimePoint            timestamp;
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Network interface statistics with rate calculations.
  */
 struct NetworkInterfaceStats {
     std::string interfaceName;
     std::string description;
     std::string macAddress;
+    uint32_t    interfaceIndex = 0;
 
     // Rates (per second)
-    double inboundBitsPerSec = 0.0;
-    double outboundBitsPerSec = 0.0;
-    double inboundPacketsPerSec = 0.0;
+    double inboundBitsPerSec     = 0.0;
+    double outboundBitsPerSec    = 0.0;
+    double inboundPacketsPerSec  = 0.0;
     double outboundPacketsPerSec = 0.0;
 
-    // Totals
-    uint64_t totalBytesIn = 0;
-    uint64_t totalBytesOut = 0;
-    uint64_t errorsIn = 0;
-    uint64_t errorsOut = 0;
+    // Cumulative totals
+    uint64_t totalBytesIn    = 0;
+    uint64_t totalBytesOut   = 0;
+    uint64_t totalPacketsIn  = 0;
+    uint64_t totalPacketsOut = 0;
+    uint64_t errorsIn        = 0;
+    uint64_t errorsOut       = 0;
+    uint64_t discardsIn      = 0;
+    uint64_t discardsOut     = 0;
+
+    // Error / discard rates (per second)
+    double errorRateIn   = 0.0;
+    double errorRateOut  = 0.0;
+    double discardRateIn = 0.0;
+    double discardRateOut = 0.0;
 
     // Status
-    bool isUp = false;
-    uint64_t speedBits = 0; // Link speed
+    bool     isUp      = false;
+    uint64_t speedBits = 0;
 
     [[nodiscard]] std::string ToJson() const;
 };
 
 /**
- * @brief Process network usage metrics
+ * @brief Per-process network usage metrics (IPv4 + IPv6).
  */
 struct ProcessNetworkUsage {
-    uint32_t processId = 0;
+    uint32_t     processId = 0;
     std::wstring processName;
 
-    // Connections
-    uint32_t tcpConnections = 0;
-    uint32_t udpListeners = 0;
+    uint32_t tcpConnectionsV4 = 0;
+    uint32_t tcpConnectionsV6 = 0;
+    uint32_t udpListenersV4   = 0;
+    uint32_t udpListenersV6   = 0;
 
-    // Usage (if available via ETW/NDIS)
-    // Note: Standard user-mode APIs often don't provide per-process bandwidth
-    // without ETW. We will track what is available.
-    uint64_t bytesSent = 0;
-    uint64_t bytesReceived = 0;
+    uint32_t establishedConnections = 0;
+    uint32_t listeningPorts         = 0;
+
+    // Detection flags (set by heuristic engines)
+    bool suspectedBeaconing    = false;
+    bool suspectedExfiltration = false;
+    bool suspectedFlood        = false;
+
+    [[nodiscard]] uint32_t TotalConnections() const noexcept {
+        return tcpConnectionsV4 + tcpConnectionsV6 + udpListenersV4 + udpListenersV6;
+    }
 
     [[nodiscard]] std::string ToJson() const;
 };
 
 /**
- * @brief Global network statistics
+ * @brief System-wide network statistics snapshot.
  */
 struct NetworkGlobalStats {
-    double totalInboundBitsPerSec = 0.0;
-    double totalOutboundBitsPerSec = 0.0;
-    uint32_t totalTcpConnections = 0;
-    uint32_t totalUdpListeners = 0;
-    uint32_t activeInterfaces = 0;
+    double   totalInboundBitsPerSec  = 0.0;
+    double   totalOutboundBitsPerSec = 0.0;
+    uint32_t totalTcpConnectionsV4   = 0;
+    uint32_t totalTcpConnectionsV6   = 0;
+    uint32_t totalUdpListenersV4     = 0;
+    uint32_t totalUdpListenersV6     = 0;
+    uint32_t activeInterfaces        = 0;
+    uint64_t totalErrorsIn           = 0;
+    uint64_t totalErrorsOut          = 0;
+    uint64_t totalDiscardsIn         = 0;
+    uint64_t totalDiscardsOut        = 0;
     TimePoint timestamp;
 
+    [[nodiscard]] uint32_t TotalTcpConnections() const noexcept {
+        return totalTcpConnectionsV4 + totalTcpConnectionsV6;
+    }
+    [[nodiscard]] uint32_t TotalUdpListeners() const noexcept {
+        return totalUdpListenersV4 + totalUdpListenersV6;
+    }
     [[nodiscard]] std::string ToJson() const;
 };
 
 /**
- * @brief Configuration
+ * @brief Configuration for the network monitor.
  */
 struct NetworkMonitorConfig {
-    bool enabled = true;
-    uint32_t pollingIntervalMs = NetworkConstants::DEFAULT_POLLING_INTERVAL_MS;
-    bool trackPerProcess = true;
-    bool trackInterfaces = true;
+    bool     enabled                = true;
+    uint32_t pollingIntervalMs      = NetworkConstants::DEFAULT_POLLING_INTERVAL_MS;
+    bool     trackPerProcess        = true;
+    bool     trackInterfaces        = true;
+
+    // Detection toggles
+    bool     detectBeaconing        = true;
+    bool     detectExfiltration     = true;
+    bool     detectConnectionFlood  = true;
 
     // Alert thresholds
-    double highBandwidthThresholdMbps = 100.0;
-    uint32_t connectionFloodThreshold = 1000;
+    double   highBandwidthThresholdMbps  = 100.0;
+    uint32_t connectionFloodThreshold    = NetworkConstants::FLOOD_DEFAULT_THRESHOLD;
+    uint64_t exfiltrationThresholdBytes  = NetworkConstants::EXFIL_DEFAULT_THRESHOLD_BYTES;
+    double   beaconingJitterThreshold    = NetworkConstants::BEACONING_JITTER_THRESHOLD;
+    double   interfaceErrorRateThreshold = 100.0;   // errors/sec
 
     [[nodiscard]] bool IsValid() const noexcept;
 };
 
 /**
- * @brief Module statistics
+ * @brief Module health / diagnostic snapshot (plain values, no atomics).
+ *
+ * Returned by GetModuleStats().  The implementation stores atomics internally
+ * and loads them into this copyable snapshot.
  */
 struct NetworkMonitorModuleStats {
-    std::atomic<uint64_t> cyclesCompleted{0};
-    std::atomic<uint64_t> errorsEncountered{0};
-    std::atomic<uint64_t> alertsTriggered{0};
-    TimePoint startTime = Clock::now();
+    uint64_t  cyclesCompleted        = 0;
+    uint64_t  errorsEncountered      = 0;
+    uint64_t  alertsTriggered        = 0;
+    uint64_t  totalConnectionsTracked = 0;
+    uint64_t  totalProcessesTracked  = 0;
+    uint64_t  uptimeSeconds          = 0;
 
-    void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
 
 // ============================================================================
 // CALLBACKS
 // ============================================================================
-using NetworkAlertCallback = std::function<void(const std::string& alertType, const std::string& details)>;
+
+/**
+ * @brief Callback invoked on each network alert.  Fired outside internal locks;
+ *        implementations MUST NOT call back into NetworkPerformanceMonitor.
+ */
+using NetworkAlertCallback = std::function<void(const NetworkAlert& alert)>;
 
 // ============================================================================
 // NETWORK MONITOR CLASS
@@ -218,7 +322,10 @@ using NetworkAlertCallback = std::function<void(const std::string& alertType, co
 
 /**
  * @class NetworkPerformanceMonitor
- * @brief Singleton class for monitoring system network activity.
+ * @brief Meyers' Singleton — monitors system network activity and detects
+ *        anomalies indicative of C2, exfiltration, and flooding.
+ *
+ * Thread-safe.  All public methods may be called from any thread.
  */
 class NetworkPerformanceMonitor final {
 public:
@@ -227,11 +334,11 @@ public:
     // ========================================================================
     [[nodiscard]] static NetworkPerformanceMonitor& Instance() noexcept;
 
-    // Non-copyable/movable
-    NetworkPerformanceMonitor(const NetworkPerformanceMonitor&) = delete;
+    // Non-copyable / non-movable
+    NetworkPerformanceMonitor(const NetworkPerformanceMonitor&)            = delete;
     NetworkPerformanceMonitor& operator=(const NetworkPerformanceMonitor&) = delete;
-    NetworkPerformanceMonitor(NetworkPerformanceMonitor&&) = delete;
-    NetworkPerformanceMonitor& operator=(NetworkPerformanceMonitor&&) = delete;
+    NetworkPerformanceMonitor(NetworkPerformanceMonitor&&)                 = delete;
+    NetworkPerformanceMonitor& operator=(NetworkPerformanceMonitor&&)      = delete;
 
     // ========================================================================
     // LIFECYCLE
@@ -250,25 +357,30 @@ public:
     // DATA ACCESS
     // ========================================================================
 
-    /**
-     * @brief Get global network statistics
-     */
+    /** @brief Snapshot of system-wide network statistics. */
     [[nodiscard]] NetworkGlobalStats GetGlobalStats() const;
 
-    /**
-     * @brief Get statistics for all active interfaces
-     */
+    /** @brief Statistics for all active (UP) interfaces. */
     [[nodiscard]] std::vector<NetworkInterfaceStats> GetInterfaceStats() const;
 
-    /**
-     * @brief Get top processes by connection count
-     */
-    [[nodiscard]] std::vector<ProcessNetworkUsage> GetTopProcesses(size_t count = 5) const;
+    /** @brief Top processes by total connection count. */
+    [[nodiscard]] std::vector<ProcessNetworkUsage> GetTopProcesses(size_t count = 10) const;
 
-    /**
-     * @brief Get usage for specific process
-     */
+    /** @brief Usage for a specific PID (nullopt if not tracked). */
     [[nodiscard]] std::optional<ProcessNetworkUsage> GetProcessUsage(uint32_t pid) const;
+
+    // ========================================================================
+    // ALERT MANAGEMENT
+    // ========================================================================
+
+    /** @brief Register a callback invoked on each emitted alert. */
+    void RegisterAlertCallback(NetworkAlertCallback callback);
+
+    /** @brief Remove all registered callbacks. */
+    void ClearAlertCallbacks();
+
+    /** @brief Return the last N alerts (most-recent first). */
+    [[nodiscard]] std::vector<NetworkAlert> GetRecentAlerts(size_t maxCount = 50) const;
 
     // ========================================================================
     // DIAGNOSTICS
