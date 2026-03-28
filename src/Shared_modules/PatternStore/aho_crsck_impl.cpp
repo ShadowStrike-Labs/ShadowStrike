@@ -59,7 +59,7 @@
 #include <stdexcept>
 
 namespace ShadowStrike {
-namespace SignatureStore {
+namespace PatternStore {
 
 // ============================================================================
 // INTERNAL CONSTANTS AND HELPERS
@@ -72,7 +72,9 @@ namespace {
 constexpr size_t AC_MAX_PATTERN_LENGTH = 4096;
 
 /// @brief Maximum total nodes to prevent memory exhaustion attacks
-constexpr size_t MAX_TOTAL_NODES = 10'000'000;  // 10M nodes max (~2.5GB)
+/// ACNode is ~1056 bytes (1024 children + 24 vector + 8 misc).
+/// 2M nodes ≈ 2GB — hard ceiling to protect endpoint stability.
+constexpr size_t MAX_TOTAL_NODES = 2'000'000;
 
 /// @brief Maximum failure link chain length (corruption detection)
 constexpr size_t MAX_FAILURE_CHAIN = 10000;
@@ -221,16 +223,16 @@ bool AhoCorasickAutomaton::AddPattern(
                 const uint32_t newNodeIndex = static_cast<uint32_t>(m_nodes.size());
                 
                 // Get parent depth before potential reallocation
-                const uint16_t parentDepth = m_nodes[currentNode].depth;
+                const uint32_t parentDepth = m_nodes[currentNode].depth;
                 
                 // Allocate new node - THIS MAY REALLOCATE THE VECTOR!
                 m_nodes.emplace_back();
                 
                 // Set depth with overflow protection (use newNodeIndex to access)
-                if (parentDepth < UINT16_MAX) {
+                if (parentDepth < UINT32_MAX) {
                     m_nodes[newNodeIndex].depth = parentDepth + 1;
                 } else {
-                    m_nodes[newNodeIndex].depth = UINT16_MAX; // Saturate at max
+                    m_nodes[newNodeIndex].depth = UINT32_MAX; // Saturate at max
                 }
                 
                 // Update child pointer AFTER allocation using index (not reference!)
@@ -272,10 +274,9 @@ bool AhoCorasickAutomaton::AddPattern(
     
     // Security: Limit outputs per node to prevent memory attacks
     if (m_nodes[currentNode].outputs.size() >= MAX_OUTPUTS_PER_NODE) {
-        SS_LOG_WARN(L"AhoCorasick", 
-            L"Output limit reached for node %u - pattern may be duplicate", currentNode);
-        // Still return success - pattern path exists, just limit outputs
-        return true;
+        SS_LOG_ERROR(L"AhoCorasick", 
+            L"Output limit reached for node %u - pattern not recorded (detection gap risk)", currentNode);
+        return false;
     }
     
     try {
@@ -638,8 +639,10 @@ void AhoCorasickAutomaton::BuildFailureLinks() noexcept {
     // ========================================================================
     
     // Iteration limit to prevent infinite loops from corrupted data
+    // Counter increments once per BFS pop (one node per iteration),
+    // so bound relative to node count, not node * 256.
     size_t iterationCount = 0;
-    const size_t maxIterations = m_nodes.size() * 256 + 1000; // Safety margin
+    const size_t maxIterations = m_nodes.size() * 2 + 1000;
 
     while (!bfsQueue.empty()) {
         // Corruption detection
@@ -783,5 +786,5 @@ void AhoCorasickAutomaton::BuildFailureLinks() noexcept {
         L"BuildFailureLinks complete: processed %zu iterations", iterationCount);
 }
 
-} // namespace SignatureStore
+} // namespace PatternStore
 } // namespace ShadowStrike
