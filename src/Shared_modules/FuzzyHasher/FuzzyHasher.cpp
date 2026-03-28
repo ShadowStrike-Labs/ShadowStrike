@@ -45,6 +45,9 @@
 // Logger: required for explicit, traceable error reporting
 #include "../Utils/Logger.hpp"
 
+// HashUtils: required for SHA-256/SHA-3 cryptographic confirmation
+#include "../Utils/HashUtils.hpp"
+
 #ifdef _WIN32
 #  ifndef NOMINMAX
 #    define NOMINMAX
@@ -209,6 +212,136 @@ namespace ShadowStrike::FuzzyHasher {
             return (trimmed == 0) ? 1 : trimmed; // Keep at least 1 byte
         }
 
+        // =====================================================================
+        // Cryptographic confirmation helpers
+        // =====================================================================
+
+        /**
+         * @brief Determine the best cryptographic algorithm available at runtime.
+         *
+         * Tries SHA-3-256 first (Windows 10 1903+); falls back to SHA-256.
+         * Result is cached after the first call (C++ static-local guarantee).
+         *
+         * @return CryptoAlgorithm::SHA3_256 when BCrypt can open it;
+         *         CryptoAlgorithm::SHA256   otherwise.
+         */
+        [[nodiscard]] CryptoAlgorithm PickCryptoAlgorithm() noexcept {
+            static const CryptoAlgorithm kAvailable = []() noexcept -> CryptoAlgorithm {
+                // Probe by attempting Init(). If it succeeds, SHA-3 is available.
+                ShadowStrike::Utils::HashUtils::Hasher probe(
+                    ShadowStrike::Utils::HashUtils::Algorithm::SHA3_256);
+                if (probe.Init()) {
+                    SS_LOG_DEBUG(L"FuzzyHasher",
+                        L"CryptoConfirm: SHA-3-256 is available on this system");
+                    return CryptoAlgorithm::SHA3_256;
+                }
+                SS_LOG_DEBUG(L"FuzzyHasher",
+                    L"CryptoConfirm: SHA-3-256 unavailable — using SHA-256 fallback");
+                return CryptoAlgorithm::SHA256;
+            }();
+            return kAvailable;
+        }
+
+        /**
+         * @brief Map our CryptoAlgorithm enum to HashUtils::Algorithm.
+         */
+        [[nodiscard]] ShadowStrike::Utils::HashUtils::Algorithm ToHashUtilsAlg(
+            CryptoAlgorithm ca
+        ) noexcept {
+            switch (ca) {
+            case CryptoAlgorithm::SHA3_256:
+                return ShadowStrike::Utils::HashUtils::Algorithm::SHA3_256;
+            case CryptoAlgorithm::SHA256:
+            default:
+                return ShadowStrike::Utils::HashUtils::Algorithm::SHA256;
+            }
+        }
+
+        /**
+         * @brief Compute a cryptographic hash of a byte buffer, returned as
+         *        a lowercase hex string.
+         *
+         * @param data    Input bytes
+         * @param alg     HashUtils algorithm to use
+         * @return Lowercase hex string, or std::nullopt on failure.
+         */
+        [[nodiscard]] std::optional<std::string> ComputeCryptoHashHex(
+            std::span<const uint8_t>                     data,
+            ShadowStrike::Utils::HashUtils::Algorithm    alg
+        ) noexcept {
+            if (data.empty()) {
+                return std::nullopt;
+            }
+            std::string hexOut;
+            ShadowStrike::Utils::HashUtils::Error err{};
+            const bool ok = ShadowStrike::Utils::HashUtils::ComputeHex(
+                alg,
+                data.data(),
+                data.size(),
+                hexOut,
+                /*upper=*/false,
+                &err
+            );
+            if (!ok) {
+                SS_LOG_WARN(L"FuzzyHasher",
+                    L"ComputeCryptoHashHex failed (nt=0x%08X, win32=%lu)",
+                    static_cast<unsigned>(err.ntstatus),
+                    static_cast<unsigned long>(err.win32));
+                return std::nullopt;
+            }
+            return hexOut;
+        }
+
+        /**
+         * @brief Normalize a buffer (PE section extraction or zero-strip) and
+         *        return the raw normalized bytes for cryptographic hashing.
+         *
+         * This mirrors the normalization in HashBufferNormalized() but returns
+         * the raw bytes rather than a CTPH digest, so that CompareWithCryptoConfirmation
+         * can hash those bytes with SHA-256/SHA-3.
+         *
+         * @param data   Input buffer
+         * @return Normalized bytes.  Falls back to the original data on parse failure.
+         *         Returns empty span only when input is empty.
+         */
+        [[nodiscard]] std::vector<uint8_t> NormalizeForCrypto(
+            std::span<const uint8_t> data
+        ) noexcept {
+            if (data.empty()) {
+                return {};
+            }
+
+            try {
+                // Auto-detect PE
+                const bool looksLikePE =
+                    (data.size() >= 2 && data[0] == 0x4D && data[1] == 0x5A);
+
+                if (looksLikePE) {
+                    ShadowStrike::PEParser::PEParser parser;
+                    ShadowStrike::PEParser::PEInfo   info{};
+                    ShadowStrike::PEParser::PEError  peErr{};
+
+                    if (parser.ParseBuffer(data, info, &peErr)) {
+                        std::vector<uint8_t> codeBytes = ExtractCodeSections(data, info);
+                        if (!codeBytes.empty()) {
+                            return codeBytes;
+                        }
+                    }
+                    // PE parse failed or no code sections — use full buffer.
+                    return std::vector<uint8_t>(data.begin(), data.end());
+                }
+
+                // Non-PE: strip trailing zero-padding.
+                const size_t effectiveLen = EffectiveLengthAfterZeroStrip(data);
+                return std::vector<uint8_t>(data.begin(), data.begin() + effectiveLen);
+
+            } catch (...) {
+                SS_LOG_ERROR(L"FuzzyHasher",
+                    L"NormalizeForCrypto: unexpected exception — returning full buffer");
+                return std::vector<uint8_t>(data.begin(), data.end());
+            }
+        }
+
     } // anonymous namespace
 
     // =========================================================================
@@ -316,6 +449,10 @@ namespace ShadowStrike::FuzzyHasher {
                         out.normalizedDigest = GenerateDigest(
                             std::span<const uint8_t>(codeBytes)
                         );
+                        out.sha256Hex = ComputeCryptoHashHex(
+                            std::span<const uint8_t>(codeBytes),
+                            ShadowStrike::Utils::HashUtils::Algorithm::SHA256
+                        );
                         out.wasNormalized = true;
                         SS_LOG_DEBUG(L"FuzzyHasher",
                             L"HashBufferNormalized: PE code-section extraction "
@@ -336,14 +473,21 @@ namespace ShadowStrike::FuzzyHasher {
 
                 // PE normalization failed — use full-file hash as normalizedDigest.
                 out.normalizedDigest = out.fullFileDigest;
+                out.sha256Hex = ComputeCryptoHashHex(
+                    data,
+                    ShadowStrike::Utils::HashUtils::Algorithm::SHA256
+                );
                 return out;
             }
 
             // Non-PE path: strip trailing zero-padding.
             const size_t effectiveLen = EffectiveLengthAfterZeroStrip(data);
             if (effectiveLen < data.size()) {
-                out.normalizedDigest = GenerateDigest(
-                    data.subspan(0, effectiveLen)
+                const auto trimmed = data.subspan(0, effectiveLen);
+                out.normalizedDigest = GenerateDigest(trimmed);
+                out.sha256Hex = ComputeCryptoHashHex(
+                    trimmed,
+                    ShadowStrike::Utils::HashUtils::Algorithm::SHA256
                 );
                 out.wasNormalized = true;
                 SS_LOG_DEBUG(L"FuzzyHasher",
@@ -352,6 +496,10 @@ namespace ShadowStrike::FuzzyHasher {
                     data.size() - effectiveLen, data.size(), effectiveLen);
             } else {
                 out.normalizedDigest = GenerateDigest(data);
+                out.sha256Hex = ComputeCryptoHashHex(
+                    data,
+                    ShadowStrike::Utils::HashUtils::Algorithm::SHA256
+                );
             }
 
         } catch (...) {
@@ -491,6 +639,130 @@ namespace ShadowStrike::FuzzyHasher {
         }
 
         return results;
+    }
+
+    CryptoConfirmResult CompareWithCryptoConfirmation(
+        std::span<const uint8_t> buf1,
+        std::span<const uint8_t> buf2,
+        int                      threshold
+    ) noexcept {
+        CryptoConfirmResult result;
+
+        // Validate inputs — reuse the same size cap as HashBuffer.
+        if (buf1.empty() || buf2.empty()) {
+            SS_LOG_WARN(L"FuzzyHasher",
+                L"CompareWithCryptoConfirmation: one or both input buffers are empty");
+            return result; // fuzzyScore == -1
+        }
+        if (buf1.size() > kMaxHashableSize || buf2.size() > kMaxHashableSize) {
+            SS_LOG_WARN(L"FuzzyHasher",
+                L"CompareWithCryptoConfirmation: input exceeds kMaxHashableSize "
+                L"(buf1=%zu, buf2=%zu, max=%zu)",
+                buf1.size(), buf2.size(), kMaxHashableSize);
+            return result;
+        }
+
+        try {
+            // ----------------------------------------------------------------
+            // Step 1: Normalize both buffers independently.
+            //         NormalizeForCrypto() applies the same PE section
+            //         extraction / zero-strip as HashBufferNormalized(), and
+            //         returns the raw bytes so we can both fuzzy-hash and
+            //         crypto-hash them from the same normalized representation.
+            // ----------------------------------------------------------------
+            const std::vector<uint8_t> norm1 = NormalizeForCrypto(buf1);
+            const std::vector<uint8_t> norm2 = NormalizeForCrypto(buf2);
+
+            if (norm1.empty() || norm2.empty()) {
+                SS_LOG_ERROR(L"FuzzyHasher",
+                    L"CompareWithCryptoConfirmation: normalization returned empty buffer");
+                return result;
+            }
+
+            // ----------------------------------------------------------------
+            // Step 2: Fuzzy comparison on normalized content.
+            // ----------------------------------------------------------------
+            const auto dig1 = GenerateDigest(std::span<const uint8_t>(norm1));
+            const auto dig2 = GenerateDigest(std::span<const uint8_t>(norm2));
+
+            if (!dig1.has_value() || !dig2.has_value()) {
+                SS_LOG_ERROR(L"FuzzyHasher",
+                    L"CompareWithCryptoConfirmation: digest generation failed");
+                return result;
+            }
+
+            result.fuzzyScore = CompareDigests(dig1->c_str(), dig2->c_str());
+            if (result.fuzzyScore < 0) {
+                SS_LOG_WARN(L"FuzzyHasher",
+                    L"CompareWithCryptoConfirmation: CompareDigests returned error");
+                result.fuzzyScore = -1;
+                return result;
+            }
+
+            // ----------------------------------------------------------------
+            // Step 3: Cryptographic confirmation — only when fuzzy score meets
+            //         threshold.  Skip on low-confidence matches for performance.
+            // ----------------------------------------------------------------
+            if (result.fuzzyScore < threshold) {
+                SS_LOG_DEBUG(L"FuzzyHasher",
+                    L"CompareWithCryptoConfirmation: fuzzyScore=%d < threshold=%d, "
+                    L"skipping crypto pass",
+                    result.fuzzyScore, threshold);
+                return result; // cryptoRan stays false
+            }
+
+            // Determine best available algorithm (SHA-3-256 or SHA-256 fallback),
+            // probed once at process start and cached.
+            result.algorithm = PickCryptoAlgorithm();
+            const auto huAlg = ToHashUtilsAlg(result.algorithm);
+
+            result.hash1Hex = ComputeCryptoHashHex(
+                std::span<const uint8_t>(norm1), huAlg);
+            result.hash2Hex = ComputeCryptoHashHex(
+                std::span<const uint8_t>(norm2), huAlg);
+
+            if (!result.hash1Hex.has_value() || !result.hash2Hex.has_value()) {
+                SS_LOG_ERROR(L"FuzzyHasher",
+                    L"CompareWithCryptoConfirmation: cryptographic hash computation "
+                    L"failed (alg=%u)", static_cast<unsigned>(result.algorithm));
+                // Fuzzy score is still valid; crypto result is indeterminate.
+                result.cryptoRan = false;
+                return result;
+            }
+
+            result.cryptoRan = true;
+
+            // Constant-time comparison via HashUtils::Equal to prevent timing
+            // side-channels when the hashes differ by only a few bytes.
+            // Both hashes are hex strings of equal length (64 hex chars for 32-byte
+            // digests); length equality is verified first.
+            if (result.hash1Hex->size() == result.hash2Hex->size()) {
+                result.exactMatch = ShadowStrike::Utils::HashUtils::Equal(
+                    reinterpret_cast<const uint8_t*>(result.hash1Hex->data()),
+                    reinterpret_cast<const uint8_t*>(result.hash2Hex->data()),
+                    result.hash1Hex->size()
+                );
+            } else {
+                // Digest length mismatch — hash computation error; treat as no match.
+                result.exactMatch = false;
+                SS_LOG_ERROR(L"FuzzyHasher",
+                    L"CompareWithCryptoConfirmation: hash hex length mismatch "
+                    L"(%zu vs %zu) — exactMatch forced false",
+                    result.hash1Hex->size(), result.hash2Hex->size());
+            }
+
+            SS_LOG_DEBUG(L"FuzzyHasher",
+                L"CompareWithCryptoConfirmation: fuzzy=%d, exact=%s, alg=%s",
+                result.fuzzyScore,
+                result.exactMatch ? L"true" : L"false",
+                result.algorithm == CryptoAlgorithm::SHA3_256 ? L"SHA3-256" : L"SHA-256");
+
+        } catch (...) {
+            SS_LOG_ERROR(L"FuzzyHasher",
+                L"CompareWithCryptoConfirmation: unexpected exception");
+        }
+
+        return result;
     }
 
 } // namespace ShadowStrike::FuzzyHasher

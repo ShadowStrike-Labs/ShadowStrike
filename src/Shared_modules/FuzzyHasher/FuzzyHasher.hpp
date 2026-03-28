@@ -56,8 +56,12 @@
  *   - Call IsSuspiciousDigest() on any externally-supplied digest string
  *     before passing it to Compare() to reject score-inflation crafted inputs.
  *   - A score of 100 is necessary but NOT sufficient to confirm identity;
- *     always confirm with a cryptographic hash (SHA-256/SHA-3) on high-value
- *     detections.
+ *     always call CompareWithCryptoConfirmation() on high-value detections
+ *     (threshold >= kCryptoConfirmThreshold) to obtain a cryptographic
+ *     exact-match verdict (SHA-3-256 on Windows 10 1903+, SHA-256 otherwise)
+ *     on PE-normalized content.  This eliminates false positives caused by
+ *     rolling-hash trigger-point manipulation even when the session salt is
+ *     known to the adversary.
  *
  * @copyright Copyright (c) ShadowStrike Contributors
  * @license AGPL-3.0-only
@@ -93,9 +97,26 @@ namespace ShadowStrike::FuzzyHasher {
     /// blocksize (10) + ':' + sig1 (64) + ':' + sig2 (32) = 109; 200 is generous.
     inline constexpr size_t kMaxDigestStringLength = 200;
 
+    /// Fuzzy-score threshold above which CompareWithCryptoConfirmation() runs the
+    /// cryptographic confirmation pass.  At this score and above the fuzzy engine
+    /// has high confidence; the crypto pass resolves whether the match is exact
+    /// or a near-variant.  Callers may pass a lower threshold for deeper investigation.
+    inline constexpr int kCryptoConfirmThreshold = 90;
+
     // =========================================================================
     // Result Types
     // =========================================================================
+
+    /**
+     * @brief Cryptographic algorithm actually used for confirmation.
+     *
+     * SHA3_256 is preferred; SHA256 is the fallback on older Windows versions
+     * that do not support SHA-3 via BCrypt.
+     */
+    enum class CryptoAlgorithm : uint8_t {
+        SHA256,   ///< SHA-2 256-bit — available on all Windows versions
+        SHA3_256  ///< SHA-3 256-bit (Keccak) — Windows 10 1903+ / Server 2022+
+    };
 
     /**
      * @brief Result of a normalized hashing operation.
@@ -104,11 +125,49 @@ namespace ShadowStrike::FuzzyHasher {
      * normalizedDigest reflects only the semantic content of the file.
      * fullFileDigest (populated only for PE files) provides the full-file hash
      * for secondary verification.
+     *
+     * sha256Hex is the lowercase SHA-256 hex digest of the same content that
+     * normalizedDigest covers.  Populated whenever normalizedDigest is populated.
+     * Consumers can store this alongside the fuzzy digest for exact-match lookups
+     * without re-hashing.
      */
     struct NormalizedHashResult {
-        std::optional<std::string> normalizedDigest; ///< Hash of normalized content
-        std::optional<std::string> fullFileDigest;   ///< Full-file hash (PE only)
+        std::optional<std::string> normalizedDigest; ///< CTPH of normalized content
+        std::optional<std::string> fullFileDigest;   ///< CTPH of full file (PE only)
+        std::optional<std::string> sha256Hex;        ///< SHA-256 of normalized content (lower-hex)
         bool wasNormalized = false;                  ///< True if input was modified
+    };
+
+    /**
+     * @brief Result of a fuzzy + cryptographic confirmation comparison.
+     *
+     * Returned by CompareWithCryptoConfirmation().
+     * Combines the CTPH similarity score with a cryptographic exact-match
+     * verdict on the PE-normalized content of both buffers.
+     */
+    struct CryptoConfirmResult {
+        /// Fuzzy similarity score (0-100). -1 if fuzzy comparison failed.
+        int fuzzyScore = -1;
+
+        /// True if the cryptographic hashes of the normalized content match.
+        /// Only meaningful when cryptoRan == true.
+        bool exactMatch = false;
+
+        /// True if the crypto confirmation pass was actually executed.
+        /// False when fuzzyScore < threshold (fast-path skip) or on error.
+        bool cryptoRan = false;
+
+        /// Algorithm used for the cryptographic comparison.
+        /// SHA3_256 when available (Windows 10 1903+), SHA256 otherwise.
+        CryptoAlgorithm algorithm = CryptoAlgorithm::SHA256;
+
+        /// Lowercase hex hash of the normalized content of buf1.
+        /// Populated when cryptoRan == true.
+        std::optional<std::string> hash1Hex;
+
+        /// Lowercase hex hash of the normalized content of buf2.
+        /// Populated when cryptoRan == true.
+        std::optional<std::string> hash2Hex;
     };
 
     /**
@@ -267,6 +326,42 @@ namespace ShadowStrike::FuzzyHasher {
     [[nodiscard]] std::vector<BatchCompareEntry> BatchCompare(
         std::span<const std::string> candidates,
         const std::string& target
+    ) noexcept;
+
+    /**
+     * @brief Perform fuzzy comparison followed by cryptographic confirmation.
+     *
+     * Algorithm:
+     *   1. Normalize both buffers independently (PE section extraction or
+     *      trailing-zero-pad strip — same logic as HashBufferNormalized()).
+     *   2. Compute fuzzy similarity on the normalized content.
+     *   3. If fuzzyScore >= threshold:
+     *        a. Compute SHA-3-256 (Windows 10 1903+) or SHA-256 (fallback)
+     *           on the normalized bytes of each buffer.
+     *        b. Compare the digests in constant time.
+     *        c. Populate result.exactMatch, hash1Hex, hash2Hex.
+     *
+     * Why this matters:
+     *   A session salt prevents offline pre-computation, but a privileged
+     *   adversary who has read the salt from process memory can still craft
+     *   a binary that achieves a target fuzzy score.  A cryptographic hash
+     *   on the same normalized content provides an independent, manipulation-
+     *   resistant verdict:
+     *     - exactMatch == true  → identical code sections (exact match / same
+     *                             packer family with no code changes).
+     *     - exactMatch == false → genuine code variant (mutation / polymorphism).
+     *
+     * @param buf1      First raw buffer (file bytes)
+     * @param buf2      Second raw buffer (file bytes)
+     * @param threshold Fuzzy score at or above which crypto confirmation runs.
+     *                  Default: kCryptoConfirmThreshold (90).
+     * @return CryptoConfirmResult populated with fuzzy score, crypto verdict,
+     *         hashes, and algorithm used.  On total failure, fuzzyScore == -1.
+     */
+    [[nodiscard]] CryptoConfirmResult CompareWithCryptoConfirmation(
+        std::span<const uint8_t> buf1,
+        std::span<const uint8_t> buf2,
+        int threshold = kCryptoConfirmThreshold
     ) noexcept;
 
 } // namespace ShadowStrike::FuzzyHasher

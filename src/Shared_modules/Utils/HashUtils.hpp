@@ -89,7 +89,12 @@ namespace ShadowStrike {
 				SHA256,     ///< SHA-256 (256-bit) - Recommended minimum
 				SHA384,     ///< SHA-384 (384-bit) - High security
 				SHA512,     ///< SHA-512 (512-bit) - Maximum security
-				MD5         ///< MD5 (128-bit) - INSECURE, compatibility only
+				MD5,        ///< MD5 (128-bit) - INSECURE, compatibility only
+				SHA3_256    ///< SHA-3 256-bit (Keccak) — requires Windows 10 1903+ (build 18362).
+				            ///< BCryptOpenAlgorithmProvider will fail on older systems;
+				            ///< Hasher::Init() returns false in that case. Plain hash
+				            ///< operations are supported; HMAC-SHA3 may not be available
+				            ///< depending on the Windows version and is treated as optional.
 			};
 
 			/**
