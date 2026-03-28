@@ -34,9 +34,6 @@
 #include <atomic>
 #include <filesystem>
 
-// Forward decls
-namespace nlohmann { class json; }
-
 namespace ShadowStrike {
 namespace Performance {
 

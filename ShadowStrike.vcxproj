@@ -355,11 +355,15 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\Shared_modules\PEParser\PEParser.cpp" />
+    <ClCompile Include="src\Shared_modules\PEParser\PEValidation.cpp" />
     <ClCompile Include="src\Shared_modules\Performance\CPUMonitor.cpp" />
+    <ClCompile Include="src\Shared_modules\Performance\dev\MemoryProfiler.cpp" />
+    <ClCompile Include="src\Shared_modules\Performance\dev\PerformanceProfiler.cpp" />
     <ClCompile Include="src\Shared_modules\Performance\DiskMonitor.cpp" />
-    <ClCompile Include="src\Shared_modules\Performance\MemoryProfiler.cpp" />
+    <!-- MemoryProfiler moved to dev\ subfolder -->
     <ClCompile Include="src\Shared_modules\Performance\NetworkPerformanceMonitor.cpp" />
-    <ClCompile Include="src\Shared_modules\Performance\PerformanceProfiler.cpp" />
+    <!-- PerformanceProfiler moved to dev\ subfolder -->
     <ClCompile Include="src\Products\PhantomHome\Privacy\CookieManager.cpp" />
     <ClCompile Include="src\Products\PhantomHome\Privacy\DataLeakProtection.cpp" />
     <ClCompile Include="src\Products\PhantomHome\Privacy\DNSLeakProtection.cpp" />
@@ -405,7 +409,7 @@
     <ClCompile Include="src\Shared_modules\Security\SelfDefense.cpp" />
     <ClCompile Include="src\Shared_modules\Security\TamperProtection.cpp" />
     <ClCompile Include="src\Shared_modules\Service\AntivirusService.cpp" />
-    <ClCompile Include="src\Shared_modules\Service\PerformanceProfiler.cpp" />
+    <!-- Service\PerformanceProfiler.cpp does not exist -->
     <ClCompile Include="src\Shared_modules\Service\ServiceCommunicator.cpp" />
     <ClCompile Include="src\Shared_modules\Service\ServiceController.cpp" />
     <ClCompile Include="src\Shared_modules\Service\ServiceInstaller.cpp" />
@@ -668,7 +672,14 @@
     <ClInclude Include="src\Shared_modules\HashStore\HashStore.hpp" />
     <ClInclude Include="src\Shared_modules\PatternStore\PatternStore.hpp" />
     <ClInclude Include="src\pch.h" />
+    <ClInclude Include="src\Shared_modules\PEParser\PEConstants.hpp" />
+    <ClInclude Include="src\Shared_modules\PEParser\PEParser.hpp" />
+    <ClInclude Include="src\Shared_modules\PEParser\PETypes.hpp" />
+    <ClInclude Include="src\Shared_modules\PEParser\PEValidation.hpp" />
+    <ClInclude Include="src\Shared_modules\PEParser\SafeReader.hpp" />
     <ClInclude Include="src\Shared_modules\Performance\CPUMonitor.hpp" />
+    <ClInclude Include="src\Shared_modules\Performance\dev\MemoryProfiler.hpp" />
+    <ClInclude Include="src\Shared_modules\Performance\dev\PerformanceProfiler.hpp" />
     <ClInclude Include="src\Shared_modules\Performance\DiskMonitor.hpp" />
     <ClInclude Include="src\Shared_modules\Performance\MemoryProfiler.hpp" />
     <ClInclude Include="src\Shared_modules\Performance\NetworkPerformanceMonitor.hpp" />

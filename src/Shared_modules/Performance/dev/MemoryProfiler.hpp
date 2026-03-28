@@ -104,6 +104,8 @@ struct MemoryProfilerConfig {
     uint64_t leakThresholdBytes = 100 * 1024 * 1024; // Alert if growth > 100MB over history
 
     bool trackPerProcess = true;        // Enable process scanning
+    uint32_t maxTrackedProcesses = 2048; // Cap tracked processes to bound own memory
+    uint32_t minSamplesForLeakDetection = 10; // Minimum samples before regression analysis
 
     [[nodiscard]] bool IsValid() const noexcept;
 };
@@ -191,6 +193,12 @@ public:
      * @return true if successful
      */
     [[nodiscard]] bool RefreshNow();
+
+    /**
+     * @brief Get EDR agent's own memory footprint (real-time, not cached)
+     * @return Current self-process memory info with live working set and private bytes
+     */
+    [[nodiscard]] ProcessMemoryInfo GetSelfMemoryUsage() const;
 
     // ========================================================================
     // UTILITIES

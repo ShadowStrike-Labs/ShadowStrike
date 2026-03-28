@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
+#include "pch.h"
 #include "PerformanceProfiler.hpp"
 #include "../../Utils/Logger.hpp"
 
@@ -35,7 +36,7 @@
 
 #pragma comment(lib, "psapi.lib")
 
-using json = nlohmann::json;
+namespace nl = nlohmann;
 
 namespace ShadowStrike {
 namespace Performance {
@@ -54,7 +55,7 @@ namespace Performance {
     // -------------------------------------------------------------------------
     std::string SystemResourceUsage::ToJson() const {
         try {
-            return json{
+            return nl::json{
                 {"cpuUsagePercent",    processCpuUsagePercent},
                 {"workingSetBytes",    workingSetBytes},
                 {"privateBytes",       privateBytes},
@@ -473,7 +474,7 @@ namespace Performance {
 
         [[nodiscard]] std::string GenerateReportLocked() const {
             try {
-                json report;
+                nl::json report;
                 report["session"]       = m_sessionName;
                 report["total_samples"] = m_snapshots.size();
 
@@ -483,9 +484,9 @@ namespace Performance {
                     report["session_elapsed_ms"] = elapsed;
                 }
 
-                json statsObj = json::object();
+                nl::json statsObj = nl::json::object();
                 for (const auto& [name, stat] : m_stats) {
-                    json entry;
+                    nl::json entry;
                     entry["count"]    = stat.count;
                     entry["total_ns"] = stat.totalTimeNs;
                     entry["avg_ms"]   = (stat.count > 0)
@@ -500,7 +501,7 @@ namespace Performance {
                 }
                 report["statistics"] = statsObj;
 
-                json events = json::array();
+                nl::json events = nl::json::array();
                 const size_t total    = m_snapshots.size();
                 const size_t startIdx = (total > kMaxReportEvents)
                     ? (total - kMaxReportEvents) : 0;

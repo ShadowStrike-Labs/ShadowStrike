@@ -954,6 +954,18 @@
     <ClCompile Include="src\Shared_modules\Communication\ThreatIntelPusher.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\Shared_modules\Performance\dev\MemoryProfiler.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Performance\dev\PerformanceProfiler.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\PEParser\PEParser.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\PEParser\PEValidation.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\gmock\gmock-actions.h">
@@ -1602,6 +1614,27 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\Shared_modules\Communication\ThreatIntelPusher.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Performance\dev\MemoryProfiler.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Performance\dev\PerformanceProfiler.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\PEParser\PEConstants.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\PEParser\PEParser.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\PEParser\PETypes.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\PEParser\PEValidation.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\PEParser\SafeReader.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
