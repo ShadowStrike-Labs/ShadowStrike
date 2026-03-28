@@ -659,8 +659,18 @@ namespace ShadowStrike {
                 return results;
             }
 
-            // Capture local snapshot of view pointer to prevent TOCTOU race conditions
-            // This ensures consistent state throughout the search operation
+            // ========================================================================
+            // STEP 2: ACQUIRE SHARED LOCK (prevents data race with AddPattern/RemovePattern)
+            // ========================================================================
+            std::shared_lock<std::shared_mutex> readLock(m_rwLock);
+
+            // Load root offset — also serves as the initialization "ready flag"
+            // (zero = not yet initialized).  Thread safety for non-atomic members
+            // (m_view, m_indexOffset, m_indexSize) is provided by the shared_lock above.
+            const uint64_t rootOffset64 = m_rootOffset.load(std::memory_order_acquire);
+            const uint32_t rootOffset = static_cast<uint32_t>(rootOffset64);
+
+            // Snapshot shared state (safe under shared_lock)
             const MemoryMappedView* view = m_view;
             const uint64_t indexOffset = m_indexOffset;
             const uint64_t indexSize = m_indexSize;
@@ -693,7 +703,7 @@ namespace ShadowStrike {
             }
 
             // ========================================================================
-            // STEP 2: INITIALIZE TIMING
+            // STEP 3: INITIALIZE TIMING
             // ========================================================================
 
             LARGE_INTEGER startTime{};
@@ -711,13 +721,11 @@ namespace ShadowStrike {
             }
 
             // ========================================================================
-            // STEP 3: GET ROOT NODE
+            // STEP 4: VALIDATE ROOT NODE
             // ========================================================================
 
-            const uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
-
             // Validate root offset is within bounds
-            if (rootOffset >= indexSize) {
+            if (rootOffset == 0 || rootOffset >= indexSize) {
                 SS_LOG_ERROR(L"PatternIndex",
                     L"Search: Root offset (0x%X) exceeds index size (0x%llX)",
                     rootOffset, indexSize);
@@ -745,8 +753,63 @@ namespace ShadowStrike {
             }
 
             // ========================================================================
-            // STEP 4: TRIE-BASED PATTERN SEARCH
+            // STEP 5: TRIE-BASED PATTERN SEARCH
             // ========================================================================
+
+            // Lambda: collect output matches at the given node.
+            // Used after every node transition (child or failure link).
+            auto collectOutputs = [&](const TrieNodeBinary* node, size_t matchPos) {
+                if (!node || node->outputCount == 0 || node->outputOffset == 0)
+                    return;
+
+                if (node->outputOffset >= indexSize)
+                    return;
+                if (node->outputOffset > indexSize - sizeof(uint32_t))
+                    return;
+
+                const auto* outPool = view->GetAt<uint32_t>(indexOffset + node->outputOffset);
+                if (!outPool)
+                    return;
+
+                uint32_t cnt = *outPool;
+                if (cnt > MAX_PATTERNS_PER_NODE)
+                    cnt = MAX_PATTERNS_PER_NODE;
+
+                const uint64_t reqSpace = sizeof(uint32_t)
+                    + (static_cast<uint64_t>(cnt) * sizeof(uint64_t));
+                const uint64_t absOff = indexOffset + node->outputOffset;
+
+                if (absOff > view->fileSize || reqSpace > view->fileSize - absOff)
+                    return;
+
+                const uint8_t* pidBase =
+                    reinterpret_cast<const uint8_t*>(outPool) + sizeof(uint32_t);
+
+                for (uint32_t i = 0; i < cnt; ++i) {
+                    if (results.size() >= maxResults) {
+                        searchAborted = true;
+                        return;
+                    }
+                    uint64_t patternId = 0;
+                    std::memcpy(&patternId, pidBase + (i * sizeof(uint64_t)),
+                        sizeof(uint64_t));
+
+                    try {
+                        DetectionResult det;
+                        det.signatureId = patternId;
+                        det.signatureName = "Pattern_" + std::to_string(patternId);
+                        det.threatLevel = ThreatLevel::Medium;
+                        det.fileOffset = matchPos;
+                        det.matchTimestamp = GetCurrentTimeNs();
+                        results.push_back(std::move(det));
+                    }
+                    catch (const std::bad_alloc&) {
+                        searchAborted = true;
+                        return;
+                    }
+                    catch (...) { /* continue */ }
+                }
+            };
 
             uint32_t currentNodeOffset = rootOffset;
             const TrieNodeBinary* currentNode = rootNode;
@@ -820,127 +883,8 @@ namespace ShadowStrike {
                     currentNodeOffset = childOffset;
                     currentNode = nextNode;
 
-                    // ================================================================
-                    // CHECK FOR PATTERN MATCHES AT THIS NODE
-                    // ================================================================
-                    if (currentNode->outputCount > 0 && currentNode->outputOffset > 0) {
-                        // Validate output offset
-                        if (currentNode->outputOffset >= indexSize) {
-                            SS_LOG_ERROR(L"PatternIndex",
-                                L"Search: Output offset (0x%X) out of bounds",
-                                currentNode->outputOffset);
-                            continue;
-                        }
-
-                        // Ensure we can read at least the count
-                        if (currentNode->outputOffset > indexSize - sizeof(uint32_t)) {
-                            SS_LOG_ERROR(L"PatternIndex",
-                                L"Search: Cannot read output count at offset 0x%X",
-                                currentNode->outputOffset);
-                            continue;
-                        }
-
-                        const auto* outputPool = view->GetAt<uint32_t>(
-                            indexOffset + currentNode->outputOffset
-                        );
-
-                        if (outputPool) {
-                            uint32_t count = *outputPool;
-
-                            // Bounds check on pattern count to prevent DoS
-                            if (count > MAX_PATTERNS_PER_NODE) {
-                                SS_LOG_WARN(L"PatternIndex",
-                                    L"Search: Suspicious pattern count %u at node, limiting to %u",
-                                    count, MAX_PATTERNS_PER_NODE);
-                                count = MAX_PATTERNS_PER_NODE;
-                            }
-
-                            // Validate we have enough space for pattern IDs
-                            // Use absolute offset calculation: indexOffset + outputOffset + requiredSpace
-                            const uint64_t requiredSpace = sizeof(uint32_t) +
-                                (static_cast<uint64_t>(count) * sizeof(uint64_t));
-
-                            const uint64_t absoluteOutputOffset = indexOffset + currentNode->outputOffset;
-
-                            // Check for overflow in addition
-                            if (absoluteOutputOffset > view->fileSize ||
-                                requiredSpace > view->fileSize - absoluteOutputOffset) {
-                                SS_LOG_ERROR(L"PatternIndex",
-                                    L"Search: Pattern IDs would exceed file bounds");
-                                continue;
-                            }
-
-                            // Calculate pointer to pattern IDs with alignment check
-                            const uint8_t* patternIdBase = reinterpret_cast<const uint8_t*>(outputPool) + sizeof(uint32_t);
-
-                            // Check 8-byte alignment for uint64_t access
-                            if (reinterpret_cast<uintptr_t>(patternIdBase) % alignof(uint64_t) != 0) {
-                                // Misaligned - must use memcpy to avoid UB
-                                for (uint32_t i = 0; i < count; ++i) {
-                                    if (results.size() >= maxResults) {
-                                        searchAborted = true;
-                                        break;
-                                    }
-
-                                    uint64_t patternId = 0;
-                                    std::memcpy(&patternId, patternIdBase + (i * sizeof(uint64_t)), sizeof(uint64_t));
-
-                                    try {
-                                        DetectionResult detection;
-                                        detection.signatureId = patternId;
-                                        detection.signatureName = "Pattern_" + std::to_string(patternId);
-                                        detection.threatLevel = ThreatLevel::Medium;
-                                        detection.fileOffset = bufIdx;
-                                        detection.matchTimestamp = GetCurrentTimeNs();
-                                        results.push_back(std::move(detection));
-                                    }
-                                    catch (...) {
-                                        SS_LOG_ERROR(L"PatternIndex", L"Search: Failed to create detection result");
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // Aligned access - safe to cast
-                            const auto* patternIds = reinterpret_cast<const uint64_t*>(patternIdBase);
-
-                            for (uint32_t i = 0; i < count; ++i) {
-                                // Check max results limit
-                                if (results.size() >= maxResults) {
-                                    SS_LOG_DEBUG(L"PatternIndex",
-                                        L"Search: Reached max results limit (%u)", maxResults);
-                                    searchAborted = true;
-                                    break;
-                                }
-
-                                const uint64_t patternId = patternIds[i];
-
-                                // Create detection result with robust exception handling
-                                try {
-                                    DetectionResult detection;
-                                    detection.signatureId = patternId;
-                                    detection.signatureName = "Pattern_" + std::to_string(patternId);
-                                    detection.threatLevel = ThreatLevel::Medium;
-                                    detection.fileOffset = bufIdx;
-                                    detection.matchTimestamp = GetCurrentTimeNs();
-
-                                    results.push_back(std::move(detection));
-                                }
-                                catch (const std::bad_alloc&) {
-                                    SS_LOG_ERROR(L"PatternIndex",
-                                        L"Search: Out of memory creating detection result");
-                                    // Memory exhaustion - abort search to prevent further allocations
-                                    searchAborted = true;
-                                    break;
-                                }
-                                catch (...) {
-                                    SS_LOG_ERROR(L"PatternIndex",
-                                        L"Search: Failed to create detection result");
-                                    // Continue with other patterns for non-memory errors
-                                }
-                            }
-                        }
-                    }
+                    // Collect output matches at this node
+                    collectOutputs(currentNode, bufIdx);
                 }
                 else {
                     // ================================================================
@@ -973,6 +917,11 @@ namespace ShadowStrike {
                             currentNode = failureNode;
                             currentNodeOffset = failureOffset;
 
+                            // Collect outputs at the failure-link destination
+                            // (Aho-Corasick requires checking outputs along the
+                            //  failure chain, not only at direct child transitions)
+                            collectOutputs(currentNode, bufIdx);
+
                             // Try the current byte again from failure state
                             if (currentNode->childOffsets[byte] != 0) {
                                 const uint32_t childOffset = currentNode->childOffsets[byte];
@@ -987,6 +936,9 @@ namespace ShadowStrike {
                                     if (nextNode && nextNode->magic == TRIE_MAGIC) {
                                         currentNode = nextNode;
                                         currentNodeOffset = childOffset;
+
+                                        // Collect outputs at the child reached from failure state
+                                        collectOutputs(currentNode, bufIdx);
                                     }
                                 }
                             }
@@ -1016,6 +968,9 @@ namespace ShadowStrike {
                                 if (nextNode && nextNode->magic == TRIE_MAGIC) {
                                     currentNode = nextNode;
                                     currentNodeOffset = childOffset;
+
+                                    // Collect outputs at root's child
+                                    collectOutputs(currentNode, bufIdx);
                                 }
                             }
                         }
@@ -1024,7 +979,7 @@ namespace ShadowStrike {
             }
 
             // ========================================================================
-            // STEP 5: PERFORMANCE TRACKING
+            // STEP 6: PERFORMANCE TRACKING
             // ========================================================================
 
             LARGE_INTEGER endTime{};
@@ -1155,6 +1110,14 @@ namespace ShadowStrike {
                                   "Index not initialized for writing" };
             }
 
+            // Reject writes on a read-only mapped view (prevents access violation)
+            if (m_view && m_view->readOnly) {
+                SS_LOG_ERROR(L"PatternIndex",
+                    L"AddPattern: Index was opened read-only, cannot modify");
+                return StoreError{ SignatureStoreError::AccessDenied, 0,
+                                  "Cannot add patterns to a read-only index" };
+            }
+
             // ========================================================================
             // ADD PATTERN TO TRIE
             // ========================================================================
@@ -1199,6 +1162,19 @@ namespace ShadowStrike {
 
                 if (currentNode->childOffsets[byte] == 0) {
                     // Need to create a new node
+
+                    // Align nextNodeOffset to TrieNodeBinary alignment requirement
+                    const uint64_t alignReq = alignof(TrieNodeBinary);
+                    const uint64_t aligned = (nextNodeOffset + alignReq - 1) & ~(alignReq - 1);
+                    nextNodeOffset = aligned;
+
+                    // Validate nextNodeOffset fits in uint32_t (childOffsets are uint32_t)
+                    if (nextNodeOffset > (std::numeric_limits<uint32_t>::max)()) {
+                        SS_LOG_ERROR(L"PatternIndex",
+                            L"AddPattern: Node offset 0x%llX exceeds uint32_t capacity", nextNodeOffset);
+                        return StoreError{ SignatureStoreError::TooLarge, 0,
+                                          "Index offset exceeds addressable range" };
+                    }
 
                     // Check if we have space for a new node
                     if (nextNodeOffset + sizeof(TrieNodeBinary) > m_indexSize) {
@@ -1270,17 +1246,24 @@ namespace ShadowStrike {
             // At terminal node - add pattern ID to output list
             // Check if pattern ID already exists in output list
             if (currentNode->outputCount > 0 && currentNode->outputOffset > 0) {
-                // Check for duplicate
-                if (currentNode->outputOffset < m_indexSize) {
+                // Check for duplicate — validate bounds for count + all IDs
+                if (currentNode->outputOffset + sizeof(uint32_t) <= m_indexSize) {
                     const auto* countPtr = reinterpret_cast<const uint32_t*>(
                         static_cast<uint8_t*>(m_baseAddress) + currentNode->outputOffset
                         );
                     const uint32_t existingCount = *countPtr;
 
-                    if (existingCount > 0 && existingCount <= MAX_PATTERNS_PER_NODE) {
-                        const uint64_t* patternIds = reinterpret_cast<const uint64_t*>(countPtr + 1);
+                    const uint64_t idsSpace = static_cast<uint64_t>(existingCount) * sizeof(uint64_t);
+                    const uint64_t totalOutputSpace = sizeof(uint32_t) + idsSpace;
+
+                    if (existingCount > 0 && existingCount <= MAX_PATTERNS_PER_NODE &&
+                        totalOutputSpace <= m_indexSize - currentNode->outputOffset) {
+                        const uint8_t* idBase = reinterpret_cast<const uint8_t*>(countPtr + 1);
                         for (uint32_t i = 0; i < existingCount; ++i) {
-                            if (patternIds[i] == pattern.signatureId) {
+                            uint64_t existingId = 0;
+                            std::memcpy(&existingId, idBase + (i * sizeof(uint64_t)),
+                                sizeof(uint64_t));
+                            if (existingId == pattern.signatureId) {
                                 SS_LOG_WARN(L"PatternIndex",
                                     L"AddPattern: Duplicate pattern ID %llu", pattern.signatureId);
                                 return StoreError{ SignatureStoreError::DuplicateEntry, 0,
@@ -1292,46 +1275,71 @@ namespace ShadowStrike {
             }
 
             // Allocate space for new output entry (or expand existing)
+            // Align output block to uint64_t boundary for safe pattern-ID access
+            const uint64_t alignedOutputOffset = (nextNodeOffset + alignof(uint64_t) - 1)
+                & ~(static_cast<uint64_t>(alignof(uint64_t)) - 1);
+
             const uint64_t requiredOutputSpace = sizeof(uint32_t) +
                 (static_cast<uint64_t>(currentNode->outputCount) + 1) * sizeof(uint64_t);
 
+            // Validate alignedOutputOffset fits in uint32_t (outputOffset field is uint32_t)
+            if (alignedOutputOffset > (std::numeric_limits<uint32_t>::max)()) {
+                SS_LOG_ERROR(L"PatternIndex",
+                    L"AddPattern: Output offset 0x%llX exceeds uint32_t capacity",
+                    alignedOutputOffset);
+                return StoreError{ SignatureStoreError::TooLarge, 0,
+                                  "Output offset exceeds addressable range" };
+            }
+
             // Allocate new output block at end of index
-            if (nextNodeOffset + requiredOutputSpace > m_indexSize) {
+            if (alignedOutputOffset + requiredOutputSpace > m_indexSize) {
                 SS_LOG_ERROR(L"PatternIndex",
                     L"AddPattern: Out of space for output entry");
                 return StoreError{ SignatureStoreError::TooLarge, 0,
                                   "Index full - no space for pattern output" };
             }
 
-            // Create new output block
-            auto* newOutputCount = reinterpret_cast<uint32_t*>(
-                static_cast<uint8_t*>(m_baseAddress) + nextNodeOffset
-                );
-            auto* newPatternIds = reinterpret_cast<uint64_t*>(newOutputCount + 1);
+            // Create new output block — use memcpy for potentially misaligned writes
+            uint8_t* newOutputBase = static_cast<uint8_t*>(m_baseAddress) + alignedOutputOffset;
 
             // Copy existing pattern IDs if any
             uint32_t newCount = 0;
             if (currentNode->outputCount > 0 && currentNode->outputOffset > 0) {
-                const auto* oldCountPtr = reinterpret_cast<const uint32_t*>(
-                    static_cast<uint8_t*>(m_baseAddress) + currentNode->outputOffset
-                    );
-                const uint64_t* oldPatternIds = reinterpret_cast<const uint64_t*>(oldCountPtr + 1);
+                // Validate source bounds: count + all existing IDs
+                const uint64_t srcIdsSpace = static_cast<uint64_t>(currentNode->outputCount)
+                    * sizeof(uint64_t);
+                if (currentNode->outputOffset + sizeof(uint32_t) + srcIdsSpace <= m_indexSize) {
+                    const uint8_t* oldIdBase = static_cast<uint8_t*>(m_baseAddress)
+                        + currentNode->outputOffset + sizeof(uint32_t);
 
-                for (uint32_t i = 0; i < currentNode->outputCount && i < MAX_PATTERNS_PER_NODE; ++i) {
-                    newPatternIds[newCount++] = oldPatternIds[i];
+                    for (uint32_t i = 0; i < currentNode->outputCount
+                        && i < MAX_PATTERNS_PER_NODE; ++i) {
+                        uint64_t existId = 0;
+                        std::memcpy(&existId, oldIdBase + (i * sizeof(uint64_t)),
+                            sizeof(uint64_t));
+                        std::memcpy(newOutputBase + sizeof(uint32_t)
+                            + (newCount * sizeof(uint64_t)),
+                            &existId, sizeof(uint64_t));
+                        newCount++;
+                    }
                 }
             }
 
             // Add new pattern ID
-            newPatternIds[newCount++] = pattern.signatureId;
-            *newOutputCount = newCount;
+            std::memcpy(newOutputBase + sizeof(uint32_t)
+                + (newCount * sizeof(uint64_t)),
+                &pattern.signatureId, sizeof(uint64_t));
+            newCount++;
+
+            // Write count
+            std::memcpy(newOutputBase, &newCount, sizeof(uint32_t));
 
             // Update node to point to new output block
-            currentNode->outputOffset = static_cast<uint32_t>(nextNodeOffset);
+            currentNode->outputOffset = static_cast<uint32_t>(alignedOutputOffset);
             currentNode->outputCount = newCount;
 
             // Update header
-            nextNodeOffset += requiredOutputSpace;
+            nextNodeOffset = alignedOutputOffset + requiredOutputSpace;
             header->outputPoolOffset = nextNodeOffset;
             header->outputPoolSize = nextNodeOffset - (header->rootNodeOffset + sizeof(TrieNodeBinary));
             header->totalPatterns++;
@@ -1378,6 +1386,14 @@ namespace ShadowStrike {
                 SS_LOG_ERROR(L"PatternIndex", L"RemovePattern: Index not initialized for writing");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0,
                                   "Index not initialized for writing" };
+            }
+
+            // Reject writes on a read-only mapped view (prevents access violation)
+            if (m_view && m_view->readOnly) {
+                SS_LOG_ERROR(L"PatternIndex",
+                    L"RemovePattern: Index was opened read-only, cannot modify");
+                return StoreError{ SignatureStoreError::AccessDenied, 0,
+                                  "Cannot remove patterns from a read-only index" };
             }
 
             // ========================================================================
@@ -1450,28 +1466,56 @@ namespace ShadowStrike {
 
                 // Check if this node has the pattern ID in its output list
                 if (currentNode->outputCount > 0 && currentNode->outputOffset > 0) {
-                    if (currentNode->outputOffset < m_indexSize) {
+                    // Validate full output block bounds: count field + all pattern IDs
+                    const uint64_t idsSpace = static_cast<uint64_t>(currentNode->outputCount)
+                        * sizeof(uint64_t);
+                    const uint64_t totalOutSize = sizeof(uint32_t) + idsSpace;
+
+                    if (currentNode->outputOffset + totalOutSize <= m_indexSize) {
                         auto* countPtr = reinterpret_cast<uint32_t*>(
                             static_cast<uint8_t*>(m_baseAddress) + currentNode->outputOffset
                             );
                         const uint32_t existingCount = *countPtr;
 
                         if (existingCount > 0 && existingCount <= MAX_PATTERNS_PER_NODE) {
-                            uint64_t* patternIds = reinterpret_cast<uint64_t*>(countPtr + 1);
+                            uint8_t* idBase = static_cast<uint8_t*>(m_baseAddress)
+                                + currentNode->outputOffset + sizeof(uint32_t);
 
-                            // Search for pattern ID
+                            // Re-validate bounds with actual existingCount
+                            const uint64_t actualIdsSpace = static_cast<uint64_t>(existingCount)
+                                * sizeof(uint64_t);
+                            if (currentNode->outputOffset + sizeof(uint32_t) + actualIdsSpace
+                                > m_indexSize) {
+                                continue; // corrupted
+                            }
+
+                            // Search for pattern ID using memcpy (safe for misaligned access)
                             for (uint32_t i = 0; i < existingCount; ++i) {
-                                if (patternIds[i] == signatureId) {
+                                uint64_t pid = 0;
+                                std::memcpy(&pid, idBase + (i * sizeof(uint64_t)),
+                                    sizeof(uint64_t));
+
+                                if (pid == signatureId) {
                                     // Found - remove by shifting remaining IDs
                                     for (uint32_t j = i; j < existingCount - 1; ++j) {
-                                        patternIds[j] = patternIds[j + 1];
+                                        uint64_t nextPid = 0;
+                                        std::memcpy(&nextPid,
+                                            idBase + ((j + 1) * sizeof(uint64_t)),
+                                            sizeof(uint64_t));
+                                        std::memcpy(
+                                            idBase + (j * sizeof(uint64_t)),
+                                            &nextPid, sizeof(uint64_t));
                                     }
                                     // Clear the last slot
-                                    patternIds[existingCount - 1] = 0;
+                                    uint64_t zero = 0;
+                                    std::memcpy(
+                                        idBase + ((existingCount - 1) * sizeof(uint64_t)),
+                                        &zero, sizeof(uint64_t));
 
                                     // Update count
-                                    *countPtr = existingCount - 1;
-                                    currentNode->outputCount = existingCount - 1;
+                                    const uint32_t newCnt = existingCount - 1;
+                                    *countPtr = newCnt;
+                                    currentNode->outputCount = newCnt;
 
                                     patternFound = true;
                                     nodesModified++;
@@ -1580,6 +1624,21 @@ namespace ShadowStrike {
                     }
                 }
             }
+            else if (m_baseAddress && indexSize >= sizeof(TrieIndexHeader)) {
+                // Fallback: after CreateNew(), m_view may be nullptr; read from m_baseAddress
+                const auto* header = reinterpret_cast<const TrieIndexHeader*>(m_baseAddress);
+                if (header && header->magic == TRIE_MAGIC) {
+                    stats.totalPatterns = header->totalPatterns;
+                    stats.totalNodes = header->totalNodes;
+
+                    if (stats.totalPatterns > 0 && header->maxNodeDepth > 0) {
+                        stats.averagePatternLength = (header->maxNodeDepth * 6) / 10;
+                        if (stats.averagePatternLength == 0) {
+                            stats.averagePatternLength = 1;
+                        }
+                    }
+                }
+            }
 
             // Calculate average search time if we have searches
             // For accurate timing, we would need to accumulate total search time
@@ -1672,7 +1731,8 @@ namespace ShadowStrike {
             // Check for potential overflow in buffer size
             constexpr size_t MAX_BUFFER_SIZE = 64ULL * 1024ULL * 1024ULL; // 64MB limit
 
-            if (m_buffer.size() > MAX_BUFFER_SIZE - chunk.size()) {
+            if (chunk.size() > MAX_BUFFER_SIZE ||
+                m_buffer.size() > MAX_BUFFER_SIZE - chunk.size()) {
                 SS_LOG_WARN(L"PatternIndex::SearchContext",
                     L"Feed: Buffer would exceed maximum size (%zu + %zu > %zu)",
                     m_buffer.size(), chunk.size(), MAX_BUFFER_SIZE);
@@ -1727,6 +1787,9 @@ namespace ShadowStrike {
                     L"Feed: No parent PatternIndex - context not properly initialized");
                 return results;
             }
+
+            // Acquire shared lock on parent index to prevent data races with writers
+            std::shared_lock<std::shared_mutex> readLock(m_patternIndex->m_rwLock);
 
             // Get local snapshot of PatternIndex state for TOCTOU safety
             const MemoryMappedView* view = m_patternIndex->m_view;
@@ -1791,6 +1854,42 @@ namespace ShadowStrike {
             SS_LOG_TRACE(L"PatternIndex::SearchContext",
                 L"Feed: Processing bytes %zu to %zu", startPos, m_buffer.size());
 
+            // Lambda: collect output matches at a given node (mirrors Search()'s lambda)
+            auto feedCollectOutputs = [&](const TrieNodeBinary* node, size_t matchPos) {
+                if (!node || node->outputCount == 0 || node->outputOffset == 0)
+                    return;
+                if (node->outputOffset >= indexSize ||
+                    node->outputOffset > indexSize - sizeof(uint32_t))
+                    return;
+                const auto* outPool = view->GetAt<uint32_t>(indexOffset + node->outputOffset);
+                if (!outPool)
+                    return;
+                uint32_t cnt = *outPool;
+                if (cnt > MAX_PATTERNS_PER_NODE) cnt = MAX_PATTERNS_PER_NODE;
+                const uint64_t reqSpace = sizeof(uint32_t)
+                    + (static_cast<uint64_t>(cnt) * sizeof(uint64_t));
+                const uint64_t absOff = indexOffset + node->outputOffset;
+                if (absOff > view->fileSize || reqSpace > view->fileSize - absOff)
+                    return;
+                const uint8_t* pidBase =
+                    reinterpret_cast<const uint8_t*>(outPool) + sizeof(uint32_t);
+                for (uint32_t i = 0; i < cnt; ++i) {
+                    uint64_t patternId = 0;
+                    std::memcpy(&patternId, pidBase + (i * sizeof(uint64_t)),
+                        sizeof(uint64_t));
+                    try {
+                        DetectionResult det;
+                        det.signatureId = patternId;
+                        det.signatureName = "Pattern_" + std::to_string(patternId);
+                        det.threatLevel = ThreatLevel::Medium;
+                        det.fileOffset = matchPos;
+                        det.matchTimestamp = GetCurrentTimeNs();
+                        results.push_back(std::move(det));
+                    }
+                    catch (...) { /* continue */ }
+                }
+            };
+
             for (size_t bufIdx = startPos; bufIdx < m_buffer.size(); ++bufIdx) {
                 const uint8_t byte = m_buffer[bufIdx];
 
@@ -1810,51 +1909,8 @@ namespace ShadowStrike {
                             currentNode = nextNode;
                             m_currentNodeOffset = childOffset;
 
-                            // Check for pattern matches at this node
-                            if (currentNode->outputCount > 0 && currentNode->outputOffset > 0) {
-                                if (currentNode->outputOffset < indexSize) {
-                                    const auto* outputPool = view->GetAt<uint32_t>(
-                                        indexOffset + currentNode->outputOffset
-                                    );
-
-                                    if (outputPool) {
-                                        uint32_t count = *outputPool;
-                                        if (count > MAX_PATTERNS_PER_NODE) {
-                                            count = MAX_PATTERNS_PER_NODE;
-                                        }
-
-                                        // Validate pattern IDs fit in bounds
-                                        const uint64_t requiredSpace = sizeof(uint32_t) +
-                                            (static_cast<uint64_t>(count) * sizeof(uint64_t));
-                                        const uint64_t absoluteOffset = indexOffset + currentNode->outputOffset;
-
-                                        if (absoluteOffset + requiredSpace <= view->fileSize) {
-                                            const uint8_t* patternIdBase =
-                                                reinterpret_cast<const uint8_t*>(outputPool) + sizeof(uint32_t);
-
-                                            for (uint32_t i = 0; i < count; ++i) {
-                                                uint64_t patternId = 0;
-                                                std::memcpy(&patternId,
-                                                    patternIdBase + (i * sizeof(uint64_t)),
-                                                    sizeof(uint64_t));
-
-                                                try {
-                                                    DetectionResult detection;
-                                                    detection.signatureId = patternId;
-                                                    detection.signatureName = "Pattern_" + std::to_string(patternId);
-                                                    detection.threatLevel = ThreatLevel::Medium;
-                                                    detection.fileOffset = bufIdx;
-                                                    detection.matchTimestamp = GetCurrentTimeNs();
-                                                    results.push_back(std::move(detection));
-                                                }
-                                                catch (...) {
-                                                    // Continue on allocation failure
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            // Collect outputs at this node
+                            feedCollectOutputs(currentNode, bufIdx);
                         }
                         else {
                             // Invalid node - reset to root
@@ -1890,6 +1946,9 @@ namespace ShadowStrike {
                             currentNode = failureNode;
                             m_currentNodeOffset = failureOffset;
 
+                            // Collect outputs at the failure-link destination (AC correctness)
+                            feedCollectOutputs(currentNode, bufIdx);
+
                             // Retry current byte from failure state
                             if (currentNode->childOffsets[byte] != 0) {
                                 const uint32_t childOffset = currentNode->childOffsets[byte];
@@ -1901,6 +1960,9 @@ namespace ShadowStrike {
                                     if (nextNode && nextNode->magic == TRIE_MAGIC) {
                                         currentNode = nextNode;
                                         m_currentNodeOffset = childOffset;
+
+                                        // Collect outputs at child from failure state
+                                        feedCollectOutputs(currentNode, bufIdx);
                                     }
                                 }
                             }
@@ -1925,6 +1987,9 @@ namespace ShadowStrike {
                                 if (nextNode && nextNode->magic == TRIE_MAGIC) {
                                     currentNode = nextNode;
                                     m_currentNodeOffset = childOffset;
+
+                                    // Collect outputs at root's child
+                                    feedCollectOutputs(currentNode, bufIdx);
                                 }
                             }
                         }
