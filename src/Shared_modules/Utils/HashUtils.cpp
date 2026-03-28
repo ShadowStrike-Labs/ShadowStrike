@@ -64,12 +64,13 @@ namespace ShadowStrike {
 			 */
 			[[nodiscard]] static const wchar_t* AlgName(Algorithm a) noexcept {
 				switch (a) {
-				case Algorithm::SHA1:   return BCRYPT_SHA1_ALGORITHM;
-				case Algorithm::SHA256: return BCRYPT_SHA256_ALGORITHM;
-				case Algorithm::SHA384: return BCRYPT_SHA384_ALGORITHM;
-				case Algorithm::SHA512: return BCRYPT_SHA512_ALGORITHM;
-				case Algorithm::MD5:    return BCRYPT_MD5_ALGORITHM;
-				default:                return BCRYPT_SHA256_ALGORITHM;
+				case Algorithm::SHA1:     return BCRYPT_SHA1_ALGORITHM;
+				case Algorithm::SHA256:   return BCRYPT_SHA256_ALGORITHM;
+				case Algorithm::SHA384:   return BCRYPT_SHA384_ALGORITHM;
+				case Algorithm::SHA512:   return BCRYPT_SHA512_ALGORITHM;
+				case Algorithm::MD5:      return BCRYPT_MD5_ALGORITHM;
+				case Algorithm::SHA3_256: return BCRYPT_SHA3_256_ALGORITHM;
+				default:                  return BCRYPT_SHA256_ALGORITHM;
 				}
 			}
 
@@ -84,14 +85,15 @@ namespace ShadowStrike {
 			 */
 			[[nodiscard]] static AlgProv& GetProv(Algorithm a) noexcept {
 				// Static providers - one per algorithm
-				static AlgProv sha1, sha256, sha384, sha512, md5;
+				static AlgProv sha1, sha256, sha384, sha512, md5, sha3_256;
 				switch (a) {
-				case Algorithm::SHA1:   return sha1;
-				case Algorithm::SHA256: return sha256;
-				case Algorithm::SHA384: return sha384;
-				case Algorithm::SHA512: return sha512;
-				case Algorithm::MD5:    return md5;
-				default:                return sha256;  // Safe default
+				case Algorithm::SHA1:     return sha1;
+				case Algorithm::SHA256:   return sha256;
+				case Algorithm::SHA384:   return sha384;
+				case Algorithm::SHA512:   return sha512;
+				case Algorithm::MD5:      return md5;
+				case Algorithm::SHA3_256: return sha3_256;
+				default:                  return sha256;  // Safe default
 				}
 			}
 
@@ -108,12 +110,13 @@ namespace ShadowStrike {
 			[[nodiscard]] static bool EnsureProv(Algorithm a, Error* err) noexcept {
 				AlgProv& ap = GetProv(a);
 
-				// Thread-safe one-time initialization per algorithm
-				static std::once_flag onceFlags[5];
+				// Thread-safe one-time initialization per algorithm.
+				// Array size is 6: SHA1=0, SHA256=1, SHA384=2, SHA512=3, MD5=4, SHA3_256=5.
+				static std::once_flag onceFlags[6];
 				const int idx = static_cast<int>(a);
 
 				// Bounds check for safety
-				if (idx < 0 || idx >= 5) {
+				if (idx < 0 || idx >= 6) {
 					if (err) {
 						err->win32 = ERROR_INVALID_PARAMETER;
 						err->ntstatus = STATUS_INVALID_PARAMETER;
@@ -124,42 +127,57 @@ namespace ShadowStrike {
 				std::call_once(onceFlags[idx], [&]() {
 					const wchar_t* name = AlgName(a);
 
-					// Open normal hash provider
+					// Open normal hash provider (required — failure is fatal for this algorithm).
 					NTSTATUS st = BCryptOpenAlgorithmProvider(&ap.hAlg, name, nullptr, 0);
 					ap.lastNt = st;
 					if (!NT_SUCCESS(st)) {
-						return;
+						return; // ap.ready stays false
 					}
 
-					// Query hash length
+					// Query hash length.
 					DWORD cb = 0;
 					st = BCryptGetProperty(ap.hAlg, BCRYPT_HASH_LENGTH,
 					                       reinterpret_cast<PUCHAR>(&ap.hashLen),
 					                       sizeof(ap.hashLen), &cb, 0);
-					ap.lastNt = st;
-					if (!NT_SUCCESS(st)) return;
+					if (!NT_SUCCESS(st)) {
+						ap.lastNt = st;
+						return;
+					}
 
-					// Query object length for hash operations
+					// Query object length for hash operations.
 					st = BCryptGetProperty(ap.hAlg, BCRYPT_OBJECT_LENGTH,
 					                       reinterpret_cast<PUCHAR>(&ap.objLen),
 					                       sizeof(ap.objLen), &cb, 0);
-					ap.lastNt = st;
-					if (!NT_SUCCESS(st)) return;
+					if (!NT_SUCCESS(st)) {
+						ap.lastNt = st;
+						return;
+					}
 
-					// Open HMAC provider with HMAC flag
-					st = BCryptOpenAlgorithmProvider(&ap.hAlgHmac, name, nullptr,
-					                                 BCRYPT_ALG_HANDLE_HMAC_FLAG);
-					ap.lastNt = st;
-					if (!NT_SUCCESS(st)) return;
+					// Open HMAC provider (optional — SHA-3 HMAC may not be available on all
+					// Windows versions, and that is acceptable.  Hash-only operations are
+					// still fully functional when hAlgHmac == nullptr.  Hmac::Init() will
+					// return false if called for an algorithm without HMAC support).
+					const NTSTATUS hmacSt = BCryptOpenAlgorithmProvider(
+					    &ap.hAlgHmac, name, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+					if (NT_SUCCESS(hmacSt)) {
+						DWORD cbHmac = 0;
+						const NTSTATUS hmacPropSt = BCryptGetProperty(
+						    ap.hAlgHmac, BCRYPT_OBJECT_LENGTH,
+						    reinterpret_cast<PUCHAR>(&ap.objLenHmac),
+						    sizeof(ap.objLenHmac), &cbHmac, 0);
+						if (!NT_SUCCESS(hmacPropSt)) {
+							// HMAC open succeeded but property query failed — discard handle.
+							BCryptCloseAlgorithmProvider(ap.hAlgHmac, 0);
+							ap.hAlgHmac = nullptr;
+							ap.objLenHmac = 0;
+						}
+					} else {
+						// HMAC not available for this algorithm/OS combination — leave nullptr.
+						ap.hAlgHmac = nullptr;
+						ap.objLenHmac = 0;
+					}
 
-					// Query HMAC object length
-					st = BCryptGetProperty(ap.hAlgHmac, BCRYPT_OBJECT_LENGTH,
-					                       reinterpret_cast<PUCHAR>(&ap.objLenHmac),
-					                       sizeof(ap.objLenHmac), &cb, 0);
-					ap.lastNt = st;
-					if (!NT_SUCCESS(st)) return;
-
-					ap.ready = true;
+					ap.ready = true; // Hash operations are available.
 				});
 
 				if (!ap.ready) {
@@ -184,6 +202,13 @@ namespace ShadowStrike {
 #define STATUS_INVALID_DEVICE_STATE ((NTSTATUS)0xC0000184L)
 #endif
 
+// SHA-3 BCrypt algorithm name — added in Windows 10 1903 (SDK 10.0.18362).
+// Define here so code compiles against older SDKs; BCryptOpenAlgorithmProvider
+// will return STATUS_NOT_FOUND / STATUS_NOT_SUPPORTED on older OS versions.
+#ifndef BCRYPT_SHA3_256_ALGORITHM
+#  define BCRYPT_SHA3_256_ALGORITHM L"SHA3-256"
+#endif
+
 // Maximum ULONG value for bounds checking
 #ifndef MAXULONG
 #define MAXULONG 0xFFFFFFFFUL
@@ -198,12 +223,13 @@ namespace ShadowStrike {
 
 			size_t DigestSize(Algorithm alg) noexcept {
 				switch (alg) {
-				case Algorithm::SHA1:   return 20;   // 160 bits
-				case Algorithm::SHA256: return 32;   // 256 bits
-				case Algorithm::SHA384: return 48;   // 384 bits
-				case Algorithm::SHA512: return 64;   // 512 bits
-				case Algorithm::MD5:    return 16;   // 128 bits
-				default:                return 32;   // Default to SHA256
+				case Algorithm::SHA1:     return 20;   // 160 bits
+				case Algorithm::SHA256:   return 32;   // 256 bits
+				case Algorithm::SHA384:   return 48;   // 384 bits
+				case Algorithm::SHA512:   return 64;   // 512 bits
+				case Algorithm::MD5:      return 16;   // 128 bits
+				case Algorithm::SHA3_256: return 32;   // 256 bits (Keccak sponge)
+				default:                  return 32;   // Default to SHA256
 				}
 			}
 
