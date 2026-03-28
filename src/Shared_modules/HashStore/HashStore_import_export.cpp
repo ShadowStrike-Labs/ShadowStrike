@@ -15,104 +15,245 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
-#include"pch.h"
-#include"HashStore.hpp"
+#include "pch.h"
+#include "HashStore.hpp"
 #include <sstream>
 #include <fstream>
-#include<string>
+#include <string>
+#include <algorithm>
+#include <chrono>
 #include "../Utils/JSONUtils.hpp"
 
-
-
 namespace ShadowStrike {
-	namespace SignatureStore {
+namespace HashStore {
 
-        // ============================================================================
-        // ================= IMPORT / EXPORT OPERATIONS ===============================
-        // ============================================================================
+    // ============================================================================
+    // ================= IMPORT / EXPORT OPERATIONS ===============================
+    // ============================================================================
 
-        /**
-         * @brief Batch size for streaming file import to prevent memory exhaustion.
-         * 
-         * @details This constant limits memory usage during import operations.
-         * Processing in batches of 1000 hashes ensures:
-         * - Constant memory footprint regardless of input file size
-         * - Good balance between memory usage and I/O efficiency
-         * - Prevention of DoS attacks via large file uploads
-         */
-        constexpr size_t IMPORT_BATCH_SIZE = 1000;
+    // ---- Compile-time constants ----
 
-        /**
-         * @brief Maximum allowed file size for import operations (100 MB).
-         * 
-         * @details Prevents processing of excessively large files that could
-         * cause resource exhaustion or take too long to process.
-         */
-        constexpr size_t MAX_IMPORT_FILE_SIZE = 100ULL * 1024 * 1024;
+    /** Batch size for streaming import - caps per-batch memory. */
+    constexpr size_t IMPORT_BATCH_SIZE = 1000;
 
-        //imports hashes from the given file path to the hash store
-        StoreError HashStore::ImportFromFile(
-            const std::wstring& filePath,
-            std::function<void(size_t, size_t)> progressCallback
-        ) noexcept {
-            /*
-             * ========================================================================
-             * IMPORT FROM FILE - STREAMING TEXT FILE HASH IMPORT
-             * ========================================================================
-             *
-             * Format: TYPE:HASH:NAME:LEVEL
-             * Example: SHA256:a1b2c3...:Trojan.Generic:High
-             *
-             * Security Features:
-             * - Streaming line-by-line processing (prevents memory exhaustion DoS)
-             * - Batch accumulation with bounded size
-             * - File size validation
-             * - Progress tracking for large files
-             *
-             * ========================================================================
-             */
+    /** Maximum import file size (100 MB) to prevent resource exhaustion. */
+    constexpr size_t MAX_IMPORT_FILE_SIZE = 100ULL * 1024 * 1024;
 
-            SS_LOG_INFO(L"HashStore", L"ImportFromFile: %s", filePath.c_str());
+    /** Maximum text line length. Lines exceeding this are hostile or corrupt. */
+    constexpr size_t MAX_LINE_LENGTH = 4096;
 
-            if (m_readOnly.load(std::memory_order_acquire)) {
-                return StoreError{ SignatureStoreError::AccessDenied, 0, "Read-only mode" };
+    /** Maximum name/description length after sanitization. */
+    constexpr size_t MAX_NAME_LENGTH = 256;
+
+    /** Maximum JSON input size for ImportFromJson (same cap as file import). */
+    constexpr size_t MAX_JSON_IMPORT_SIZE = MAX_IMPORT_FILE_SIZE;
+
+    /** JSON nesting depth limit. Hash import schema is flat; deep nesting is never needed. */
+    constexpr size_t JSON_MAX_PARSE_DEPTH = 16;
+
+    // ---- Static helpers (file-scope, not exposed in header) ----
+
+    /**
+     * @brief Parse hash type identifier string to enum.
+     * Supports all 7 HashStore types: MD5, SHA1, SHA256, SHA512, IMPHASH, FUZZY/CTPH, TLSH.
+     */
+    static HashType ParseHashTypeString(const std::string& typeStr, bool& valid) noexcept {
+        valid = true;
+        if (typeStr == "MD5")     return HashType::MD5;
+        if (typeStr == "SHA1")    return HashType::SHA1;
+        if (typeStr == "SHA256")  return HashType::SHA256;
+        if (typeStr == "SHA512")  return HashType::SHA512;
+        if (typeStr == "IMPHASH") return HashType::IMPHASH;
+        if (typeStr == "FUZZY" || typeStr == "CTPH") return HashType::FUZZY;
+        if (typeStr == "TLSH")    return HashType::TLSH;
+        valid = false;
+        return HashType::SHA256;
+    }
+
+    /**
+     * @brief Parse threat level from string (named or numeric, for backward compat).
+     * Named: "Critical", "High", "Medium", "Low", "Info"
+     * Numeric: integer 0-100 mapped to nearest named level.
+     */
+    static ThreatLevel ParseThreatLevelString(const std::string& levelStr) noexcept {
+        // Named levels (preferred)
+        if (levelStr == "Critical") return ThreatLevel::Critical;
+        if (levelStr == "High")     return ThreatLevel::High;
+        if (levelStr == "Medium")   return ThreatLevel::Medium;
+        if (levelStr == "Low")      return ThreatLevel::Low;
+        if (levelStr == "Info")     return ThreatLevel::Info;
+
+        // Numeric levels (backward compat with legacy exports that wrote e.g. "50")
+        try {
+            const unsigned long val = std::stoul(levelStr);
+            if (val >= 90)  return ThreatLevel::Critical;
+            if (val >= 65)  return ThreatLevel::High;
+            if (val >= 35)  return ThreatLevel::Medium;
+            if (val >= 10)  return ThreatLevel::Low;
+            return ThreatLevel::Info;
+        }
+        catch (...) {
+            return ThreatLevel::Medium;
+        }
+    }
+
+    /**
+     * @brief Convert ThreatLevel enum to its canonical string name.
+     * Used by ExportToFile so that ImportFromFile can round-trip correctly.
+     */
+    static const char* ThreatLevelToString(ThreatLevel level) noexcept {
+        switch (level) {
+            case ThreatLevel::Critical: return "Critical";
+            case ThreatLevel::High:     return "High";
+            case ThreatLevel::Medium:   return "Medium";
+            case ThreatLevel::Low:      return "Low";
+            case ThreatLevel::Info:     return "Info";
+            default:                    return "Medium";
+        }
+    }
+
+    /**
+     * @brief Map a clamped integer (0-100) to the nearest valid ThreatLevel enum value.
+     * Prevents creating invalid enum values from arbitrary numeric input.
+     */
+    static ThreatLevel MapIntToThreatLevel(int value) noexcept {
+        if (value >= 90)  return ThreatLevel::Critical;
+        if (value >= 65)  return ThreatLevel::High;
+        if (value >= 35)  return ThreatLevel::Medium;
+        if (value >= 10)  return ThreatLevel::Low;
+        return ThreatLevel::Info;
+    }
+
+    /**
+     * @brief Sanitize an imported name for safe storage and logging.
+     *
+     * - Strips ASCII control characters (0x00-0x1F, 0x7F)
+     * - Strips '%' (defense-in-depth against format string misuse)
+     * - Preserves high-byte characters (UTF-8 multibyte sequences)
+     * - Caps length at MAX_NAME_LENGTH
+     * - Returns "Unknown" if result is empty after filtering
+     */
+    static std::string SanitizeName(const std::string& input) noexcept {
+        try {
+            std::string result;
+            const size_t limit = std::min(input.size(), MAX_NAME_LENGTH);
+            result.reserve(limit);
+
+            for (size_t i = 0; i < limit; ++i) {
+                const auto c = static_cast<unsigned char>(input[i]);
+                if (c >= 0x20 && c <= 0x7E && c != '%') {
+                    result += static_cast<char>(c);
+                } else if (c > 0x7F) {
+                    result += static_cast<char>(c);
+                }
+                // else: drop control characters, DEL (0x7F), and '%'
             }
 
-            // Open file
-            std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+            return result.empty() ? std::string("Unknown") : result;
+        }
+        catch (...) {
+            return "Unknown";
+        }
+    }
+
+    // ============================================================================
+    // IMPORT FROM TEXT FILE
+    // ============================================================================
+
+    StoreError HashStore::ImportFromFile(
+        const std::wstring& filePath,
+        std::function<void(size_t, size_t)> progressCallback
+    ) noexcept {
+        /*
+         * ========================================================================
+         * STREAMING TEXT FILE HASH IMPORT
+         * ========================================================================
+         *
+         * Format: TYPE:HASH:NAME:LEVEL  (one entry per line)
+         * Example: SHA256:a1b2c3...:Trojan.Generic:High
+         *
+         * Security controls:
+         *   - Path validation via ValidateAndCanonicalizePath (traversal, NUL, etc.)
+         *   - File size cap (MAX_IMPORT_FILE_SIZE) checked before any reads
+         *   - Per-line length cap (MAX_LINE_LENGTH) to bound heap usage
+         *   - Hash type whitelist (all 7 supported types)
+         *   - Name sanitization (control chars, format string chars stripped)
+         *   - Exception-safe progress callback invocation
+         *
+         * Memory model:
+         *   - Streaming line-by-line with batch flushes every IMPORT_BATCH_SIZE
+         *   - Batch vectors capped and reused (capacity preserved across flushes)
+         *
+         * Thread safety:
+         *   - No import-level lock. AddHashBatch handles its own exclusive locking.
+         *   - Concurrent imports serialize at the AddHashBatch level.
+         *
+         * NOTE: This operation is NOT transactional. If a mid-file batch fails,
+         *       previously committed batches remain in the store.
+         *
+         * ========================================================================
+         */
+
+        SS_LOG_INFO(L"HashStore", L"ImportFromFile: beginning import");
+
+        // Pre-condition: database must be initialized
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            SS_LOG_ERROR(L"HashStore", L"ImportFromFile: database not initialized");
+            return StoreError{ SignatureStoreError::Unknown, 0, "Database not initialized" };
+        }
+
+        if (m_readOnly.load(std::memory_order_acquire)) {
+            SS_LOG_ERROR(L"HashStore", L"ImportFromFile: database is read-only");
+            return StoreError{ SignatureStoreError::AccessDenied, 0, "Database is read-only" };
+        }
+
+        // SECURITY: Validate and canonicalize path (rejects traversal, NUL bytes,
+        // non-absolute paths, reserved device names, etc.)
+        std::wstring canonicalPath;
+        std::string pathError;
+        if (!Format::ValidateAndCanonicalizePath(filePath, canonicalPath, pathError)) {
+            SS_LOG_ERROR(L"HashStore", L"ImportFromFile: path validation failed: %S",
+                pathError.c_str());
+            return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                "Invalid file path: " + pathError };
+        }
+
+        try {
+            // Open file (binary | ate: seek to end to measure size, then rewind)
+            std::ifstream file(canonicalPath, std::ios::binary | std::ios::ate);
             if (!file.is_open()) {
-                SS_LOG_ERROR(L"HashStore", L"ImportFromFile: Cannot open file");
-                return StoreError{ SignatureStoreError::FileNotFound, 0, "Cannot open file" };
+                SS_LOG_ERROR(L"HashStore", L"ImportFromFile: cannot open file");
+                return StoreError{ SignatureStoreError::FileNotFound, 0,
+                    "Cannot open import file" };
             }
 
-            // Security: Check file size to prevent resource exhaustion
+            // SECURITY: Check file size BEFORE reading any content
             const auto fileSize = file.tellg();
             if (fileSize < 0) {
-                SS_LOG_ERROR(L"HashStore", L"ImportFromFile: Cannot determine file size");
-                return StoreError{ SignatureStoreError::Unknown, 0, "Cannot determine file size" };
+                SS_LOG_ERROR(L"HashStore", L"ImportFromFile: cannot determine file size");
+                return StoreError{ SignatureStoreError::Unknown, 0,
+                    "Cannot determine file size" };
             }
-            
+
             if (static_cast<size_t>(fileSize) > MAX_IMPORT_FILE_SIZE) {
-                SS_LOG_ERROR(L"HashStore", L"ImportFromFile: File too large (%lld bytes, max %zu)",
+                SS_LOG_ERROR(L"HashStore",
+                    L"ImportFromFile: file too large (%lld bytes, max %zu)",
                     static_cast<long long>(fileSize), MAX_IMPORT_FILE_SIZE);
-                return StoreError{ SignatureStoreError::TooLarge, 0, 
-                    "File exceeds maximum allowed size (100 MB)" };
+                return StoreError{ SignatureStoreError::TooLarge, 0,
+                    "File exceeds 100 MB limit" };
             }
-            
-            // Reset to beginning for line-by-line reading
+
             file.seekg(0, std::ios::beg);
 
-            // Estimate total lines for progress reporting (rough estimate: ~80 bytes per line)
-            const size_t estimatedTotalLines = (fileSize > 0) 
-                ? static_cast<size_t>(fileSize) / 80 + 1 
+            // Rough line-count estimate for progress reporting (~80 bytes/line average)
+            const size_t estimatedTotalLines = (fileSize > 0)
+                ? static_cast<size_t>(fileSize) / 80 + 1
                 : 0;
 
-            // Batch buffers - bounded size to prevent memory exhaustion
+            // Batch buffers (bounded to IMPORT_BATCH_SIZE)
             std::vector<HashValue> hashes;
             std::vector<std::string> names;
             std::vector<ThreatLevel> levels;
-            
-            // Pre-allocate batch buffers
             hashes.reserve(IMPORT_BATCH_SIZE);
             names.reserve(IMPORT_BATCH_SIZE);
             levels.reserve(IMPORT_BATCH_SIZE);
@@ -121,12 +262,27 @@ namespace ShadowStrike {
             size_t totalImported = 0;
             size_t totalSkipped = 0;
             std::string line;
+            line.reserve(512);
 
-            // Stream file line-by-line to prevent memory exhaustion
             while (std::getline(file, line)) {
                 lineNum++;
 
-                // Skip empty lines and comments
+                // Strip trailing CR from CRLF line endings (file opened in binary mode)
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+
+                // SECURITY: Reject overlong lines. Without this check, a file with no
+                // newlines could cause std::getline to allocate up to MAX_IMPORT_FILE_SIZE.
+                if (line.size() > MAX_LINE_LENGTH) {
+                    SS_LOG_WARN(L"HashStore",
+                        L"ImportFromFile: line %zu exceeds max length (%zu), skipping",
+                        lineNum, line.size());
+                    totalSkipped++;
+                    continue;
+                }
+
+                // Skip empty lines and comment lines
                 if (line.empty() || line[0] == '#') {
                     continue;
                 }
@@ -139,288 +295,446 @@ namespace ShadowStrike {
                     !std::getline(iss, hashStr, ':') ||
                     !std::getline(iss, name, ':') ||
                     !std::getline(iss, levelStr)) {
-                    SS_LOG_WARN(L"HashStore", L"ImportFromFile: Invalid format at line %zu", lineNum);
+                    SS_LOG_WARN(L"HashStore",
+                        L"ImportFromFile: malformed line %zu (expected TYPE:HASH:NAME:LEVEL)",
+                        lineNum);
                     totalSkipped++;
                     continue;
                 }
 
-                // Parse hash type
-                HashType type = HashType::SHA256;  // Default
-                if (typeStr == "MD5") type = HashType::MD5;
-                else if (typeStr == "SHA1") type = HashType::SHA1;
-                else if (typeStr == "SHA256") type = HashType::SHA256;
-                else if (typeStr == "SHA512") type = HashType::SHA512;
+                // Validate hash type (all 7 types: MD5, SHA1, SHA256, SHA512, IMPHASH, FUZZY, TLSH)
+                bool typeValid = false;
+                HashType type = ParseHashTypeString(typeStr, typeValid);
+                if (!typeValid) {
+                    SS_LOG_WARN(L"HashStore",
+                        L"ImportFromFile: unknown hash type '%S' at line %zu",
+                        typeStr.c_str(), lineNum);
+                    totalSkipped++;
+                    continue;
+                }
 
-                // Parse hash value
+                // Parse and validate hash value (ParseHashString validates hex format,
+                // length, and character set internally)
                 auto hash = Format::ParseHashString(hashStr, type);
                 if (!hash.has_value()) {
-                    SS_LOG_WARN(L"HashStore", L"ImportFromFile: Invalid hash at line %zu", lineNum);
+                    SS_LOG_WARN(L"HashStore",
+                        L"ImportFromFile: invalid hash at line %zu", lineNum);
                     totalSkipped++;
                     continue;
                 }
 
-                // Parse threat level
-                ThreatLevel level = ThreatLevel::Medium;
-                if (levelStr == "Critical") level = ThreatLevel::Critical;
-                else if (levelStr == "High") level = ThreatLevel::High;
-                else if (levelStr == "Low") level = ThreatLevel::Low;
+                // Parse threat level (supports both named strings and numeric values)
+                ThreatLevel level = ParseThreatLevelString(levelStr);
 
-                // Add to current batch
+                // Sanitize name (strip control chars, cap length)
+                name = SanitizeName(name);
+
+                // Accumulate into batch
                 hashes.push_back(*hash);
                 names.push_back(std::move(name));
                 levels.push_back(level);
 
-                // Process batch when full to maintain bounded memory usage
+                // Flush batch at threshold
                 if (hashes.size() >= IMPORT_BATCH_SIZE) {
                     StoreError err = AddHashBatch(hashes, names, levels);
                     if (err.code != SignatureStoreError::Success) {
-                        SS_LOG_ERROR(L"HashStore", 
-                            L"ImportFromFile: Batch import failed at line %zu: %S",
+                        SS_LOG_ERROR(L"HashStore",
+                            L"ImportFromFile: batch import failed at line %zu: %S",
                             lineNum, err.message.c_str());
                         return err;
                     }
-                    
                     totalImported += hashes.size();
-                    
-                    // Clear buffers for next batch (capacity preserved)
                     hashes.clear();
                     names.clear();
                     levels.clear();
                 }
 
-                // Progress callback
+                // Progress callback (exception-safe: must not propagate through noexcept)
                 if (progressCallback) {
-                    progressCallback(lineNum, estimatedTotalLines);
+                    try {
+                        progressCallback(lineNum, estimatedTotalLines);
+                    }
+                    catch (...) {
+                        SS_LOG_WARN(L"HashStore",
+                            L"ImportFromFile: progress callback threw at line %zu, ignoring",
+                            lineNum);
+                    }
                 }
             }
 
-            file.close();
+            // Detect I/O errors (distinct from normal EOF)
+            if (file.bad()) {
+                SS_LOG_ERROR(L"HashStore", L"ImportFromFile: I/O error during file read");
+                return StoreError{ SignatureStoreError::Unknown, 0,
+                    "I/O error reading import file" };
+            }
 
-            // Process remaining entries in final batch
+            // Flush remaining entries in final partial batch
             if (!hashes.empty()) {
                 StoreError err = AddHashBatch(hashes, names, levels);
                 if (err.code != SignatureStoreError::Success) {
-                    SS_LOG_ERROR(L"HashStore", L"ImportFromFile: Final batch import failed: %S",
+                    SS_LOG_ERROR(L"HashStore",
+                        L"ImportFromFile: final batch import failed: %S",
                         err.message.c_str());
                     return err;
                 }
                 totalImported += hashes.size();
             }
 
-            SS_LOG_INFO(L"HashStore", 
-                L"ImportFromFile: Completed - imported %zu hashes, skipped %zu invalid entries",
+            SS_LOG_INFO(L"HashStore",
+                L"ImportFromFile: completed - imported %zu hashes, skipped %zu invalid entries",
                 totalImported, totalSkipped);
-            
+
             return StoreError{ SignatureStoreError::Success };
         }
+        catch (const std::bad_alloc&) {
+            SS_LOG_ERROR(L"HashStore", L"ImportFromFile: memory allocation failed");
+            return StoreError{ SignatureStoreError::OutOfMemory, 0,
+                "Memory allocation failed during import" };
+        }
+        catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"HashStore", L"ImportFromFile: exception: %S", ex.what());
+            return StoreError{ SignatureStoreError::Unknown, 0,
+                "Unexpected exception during import" };
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"HashStore", L"ImportFromFile: unknown exception");
+            return StoreError{ SignatureStoreError::Unknown, 0,
+                "Unknown exception during import" };
+        }
+    }
 
+    // ============================================================================
+    // EXPORT TO TEXT FILE
+    // ============================================================================
 
-        //exports hashes from database to a file. Supports filtering by hash type.
-        StoreError HashStore::ExportToFile(
-            const std::wstring& filePath,
-            HashType typeFilter
-        ) const noexcept {
-            SS_LOG_INFO(L"HashStore", L"ExportToFile: %s (filter=%S)",
-                filePath.c_str(), Format::HashTypeToString(typeFilter));
+    StoreError HashStore::ExportToFile(
+        const std::wstring& filePath,
+        HashType typeFilter
+    ) const noexcept {
+        /*
+         * ========================================================================
+         * EXPORT HASHES TO TEXT FILE
+         * ========================================================================
+         *
+         * Outputs TYPE:HASH:NAME:LEVEL format, compatible with ImportFromFile.
+         *
+         * HEADER PATCH NEEDED (cannot fix without header change):
+         *   - typeFilter defaults to HashType::MD5, which doubles as a sentinel
+         *     for "export all types." This makes it impossible to export ONLY
+         *     MD5 hashes. Fix: change parameter to std::optional<HashType>.
+         *
+         * HEADER PATCH NEEDED:
+         *   - ForEach only provides (fastHash, signatureOffset). Actual signature
+         *     name, threat level, description, and tags are not accessible via
+         *     the current index API. Exports use placeholder name "Hash_<id>"
+         *     and default threat level "Medium."
+         *     Fix: expose richer metadata in the ForEach callback or provide a
+         *     metadata-aware iteration method.
+         *
+         * ========================================================================
+         */
 
-            if (!m_initialized.load(std::memory_order_acquire)) {
-                SS_LOG_ERROR(L"HashStore", L"ExportToFile: Database not initialized");
-                return StoreError{ SignatureStoreError::Unknown, 0, "Database not initialized" };
-            }
+        SS_LOG_INFO(L"HashStore", L"ExportToFile: filter=%S",
+            Format::HashTypeToString(typeFilter));
 
-            if (filePath.empty()) {
-                SS_LOG_ERROR(L"HashStore", L"ExportToFile: Empty file path");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File path cannot be empty" };
-            }
-
-            std::shared_lock<std::shared_mutex> lock(m_globalLock);
-
-            std::ofstream file(filePath);
-            if (!file.is_open()) {
-                SS_LOG_ERROR(L"HashStore", L"ExportToFile: Cannot create file: %s", filePath.c_str());
-                return StoreError{ SignatureStoreError::FileNotFound, 0, "Cannot create output file" };
-            }
-
-            try {
-                file << "# ShadowStrike Hash Export\n";
-                file << "# Format: TYPE:HASH:NAME:LEVEL\n";
-                file << "# Generated: " << std::chrono::system_clock::now().time_since_epoch().count() << "\n";
-                file << "# Filter: " << Format::HashTypeToString(typeFilter) << "\n\n";
-
-                size_t exportedCount = 0;
-                LARGE_INTEGER startTime{}, endTime{};
-                if (!QueryPerformanceCounter(&startTime)) {
-                    startTime.QuadPart = 0;
-                }
-
-                for (const auto& [bucketType, bucket] : m_buckets) {
-                    if (typeFilter != HashType::MD5 && bucketType != typeFilter) {
-                        continue;
-                    }
-
-                    bucket->m_index->ForEach(
-                        [&](uint64_t fastHash, uint64_t signatureOffset) -> bool {
-                            const uint8_t* dataBase =
-                                static_cast<const uint8_t*>(m_mappedView.baseAddress);
-
-                            // Null pointer check
-                            if (dataBase == nullptr) {
-                                return true; // Continue to next
-                            }
-
-                            if (signatureOffset >= m_mappedView.fileSize) {
-                                return true;
-                            }
-
-                            // Bounds check before dereferencing
-                            if (signatureOffset > m_mappedView.fileSize - sizeof(HashValue)) {
-                                return true;
-                            }
-
-                            const HashValue* hashPtr =
-                                reinterpret_cast<const HashValue*>(dataBase + signatureOffset);
-
-                            if (hashPtr->length == 0 || hashPtr->length > 64) {
-                                return true;
-                            }
-
-                            std::string hashTypeStr = Format::HashTypeToString(hashPtr->type);
-                            std::string hashHex = Format::FormatHashString(*hashPtr);
-                            std::string threatLevelStr = std::to_string(
-                                static_cast<uint8_t>(ThreatLevel::Medium));
-
-                            file << hashTypeStr << ":" << hashHex << ":Hash_" << fastHash
-                                << ":" << threatLevelStr << "\n";
-
-                            exportedCount++;
-                            return true;
-                        });
-                }
-
-                if (!QueryPerformanceCounter(&endTime)) {
-                    endTime.QuadPart = startTime.QuadPart;
-                }
-
-                uint64_t exportTimeUs = 0;
-                if (m_perfFrequency.QuadPart > 0 && endTime.QuadPart >= startTime.QuadPart) {
-                    const uint64_t elapsed = static_cast<uint64_t>(endTime.QuadPart - startTime.QuadPart);
-                    const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
-                    if (elapsed <= UINT64_MAX / 1000000ULL) {
-                        exportTimeUs = (elapsed * 1000000ULL) / freq;
-                    }
-                    else {
-                        exportTimeUs = (elapsed / freq) * 1000000ULL;
-                    }
-                }
-
-                file << "\n# Total exported: " << exportedCount << " hashes\n";
-                file << "# Export time: " << exportTimeUs << " microseconds\n";
-
-                file.close();
-
-                SS_LOG_INFO(L"HashStore",
-                    L"ExportToFile: Complete - %zu hashes exported in %llu �s",
-                    exportedCount, exportTimeUs);
-
-                return StoreError{ SignatureStoreError::Success };
-            }
-            catch (const std::exception& ex) {
-                SS_LOG_ERROR(L"HashStore", L"ExportToFile: Exception: %S", ex.what());
-                file.close();
-                return StoreError{ SignatureStoreError::Unknown, 0, "Export operation failed" };
-            }
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            SS_LOG_ERROR(L"HashStore", L"ExportToFile: database not initialized");
+            return StoreError{ SignatureStoreError::Unknown, 0, "Database not initialized" };
         }
 
-        //imports hashes from a JSON string to the hash store
-        StoreError HashStore::ImportFromJson(const std::string& jsonData) noexcept {
-            SS_LOG_INFO(L"HashStore", L"ImportFromJson: %zu bytes", jsonData.size());
+        // SECURITY: Validate and canonicalize output path
+        std::wstring canonicalPath;
+        std::string pathError;
+        if (!Format::ValidateAndCanonicalizePath(filePath, canonicalPath, pathError)) {
+            SS_LOG_ERROR(L"HashStore", L"ExportToFile: path validation failed: %S",
+                pathError.c_str());
+            return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                "Invalid file path: " + pathError };
+        }
 
-            if (m_readOnly.load(std::memory_order_acquire)) {
-                SS_LOG_ERROR(L"HashStore", L"ImportFromJson: Database is read-only");
-                return StoreError{ SignatureStoreError::AccessDenied, 0, "Database is read-only" };
+        std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+        try {
+            std::ofstream file(canonicalPath, std::ios::binary);
+            if (!file.is_open()) {
+                SS_LOG_ERROR(L"HashStore", L"ExportToFile: cannot create output file");
+                return StoreError{ SignatureStoreError::FileNotFound, 0,
+                    "Cannot create output file" };
             }
 
-            if (jsonData.empty()) {
-                SS_LOG_ERROR(L"HashStore", L"ImportFromJson: Empty JSON data");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "JSON data cannot be empty" };
+            file << "# ShadowStrike Hash Export\n";
+            file << "# Format: TYPE:HASH:NAME:LEVEL\n";
+            file << "# Generated: "
+                 << std::chrono::system_clock::now().time_since_epoch().count() << "\n";
+            file << "# Filter: " << Format::HashTypeToString(typeFilter) << "\n\n";
+
+            if (file.fail()) {
+                SS_LOG_ERROR(L"HashStore", L"ExportToFile: I/O error writing header");
+                return StoreError{ SignatureStoreError::Unknown, 0,
+                    "I/O error writing export header" };
             }
 
-            using namespace ShadowStrike::Utils::JSON;
-
-            Json jsonRoot;
-            Error jsonErr;
-            ParseOptions parseOpts;
-            parseOpts.allowComments = true;
-            parseOpts.maxDepth = 1000;
-
-            if (!Parse(jsonData, jsonRoot, &jsonErr, parseOpts)) {
-                SS_LOG_ERROR(L"HashStore",
-                    L"ImportFromJson: Parse error at line %zu, column %zu: %S",
-                    jsonErr.line, jsonErr.column, jsonErr.message.c_str());
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "JSON parse error" };
-            }
-
-            if (!jsonRoot.is_object()) {
-                SS_LOG_ERROR(L"HashStore", L"ImportFromJson: Root must be a JSON object");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Root must be JSON object" };
-            }
-
-            if (!jsonRoot.contains("hashes")) {
-                SS_LOG_ERROR(L"HashStore", L"ImportFromJson: Missing 'hashes' array");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Missing 'hashes' field" };
-            }
-
-            const Json& hashesArray = jsonRoot["hashes"];
-            if (!hashesArray.is_array()) {
-                SS_LOG_ERROR(L"HashStore", L"ImportFromJson: 'hashes' must be an array");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "'hashes' must be array" };
-            }
-
-            std::vector<HashValue> hashes;
-            std::vector<std::string> names;
-            std::vector<ThreatLevel> levels;
+            size_t exportedCount = 0;
+            bool writeError = false;
 
             LARGE_INTEGER startTime{}, endTime{};
             if (!QueryPerformanceCounter(&startTime)) {
                 startTime.QuadPart = 0;
             }
 
+            for (const auto& [bucketType, bucket] : m_buckets) {
+                // NOTE: typeFilter == HashType::MD5 acts as "export all types" sentinel.
+                // See HEADER PATCH NEEDED above.
+                if (typeFilter != HashType::MD5 && bucketType != typeFilter) {
+                    continue;
+                }
+
+                if (!bucket || !bucket->m_index) {
+                    continue;
+                }
+
+                bucket->m_index->ForEach(
+                    [&](uint64_t fastHash, uint64_t signatureOffset) -> bool {
+                        // ForEach is noexcept; lambda must not allow exceptions to propagate.
+                        try {
+                            const uint8_t* dataBase =
+                                static_cast<const uint8_t*>(m_mappedView.baseAddress);
+
+                            if (dataBase == nullptr) {
+                                writeError = true;
+                                return false;
+                            }
+
+                            // Bounds checks before dereferencing
+                            if (signatureOffset >= m_mappedView.fileSize ||
+                                signatureOffset > m_mappedView.fileSize - sizeof(HashValue)) {
+                                return true; // Skip corrupt offset, continue
+                            }
+
+                            const HashValue* hashPtr =
+                                reinterpret_cast<const HashValue*>(dataBase + signatureOffset);
+
+                            if (hashPtr->length == 0 || hashPtr->length > 64) {
+                                return true; // Skip corrupt entry
+                            }
+
+                            // Write TYPE:HASH:NAME:LEVEL with named threat level for round-trip
+                            const char* hashTypeStr = Format::HashTypeToString(hashPtr->type);
+                            std::string hashHex = Format::FormatHashString(*hashPtr);
+
+                            file << hashTypeStr << ":"
+                                 << hashHex << ":"
+                                 << "Hash_" << fastHash << ":"
+                                 << ThreatLevelToString(ThreatLevel::Medium) << "\n";
+
+                            if (file.fail()) {
+                                writeError = true;
+                                return false;
+                            }
+
+                            exportedCount++;
+                            return true;
+                        }
+                        catch (...) {
+                            writeError = true;
+                            return false;
+                        }
+                    });
+
+                if (writeError) {
+                    break;
+                }
+            }
+
+            if (writeError) {
+                SS_LOG_ERROR(L"HashStore", L"ExportToFile: I/O error during hash export");
+                return StoreError{ SignatureStoreError::Unknown, 0,
+                    "I/O error during hash export" };
+            }
+
+            if (!QueryPerformanceCounter(&endTime)) {
+                endTime.QuadPart = startTime.QuadPart;
+            }
+
+            uint64_t exportTimeUs = 0;
+            if (m_perfFrequency.QuadPart > 0 && endTime.QuadPart >= startTime.QuadPart) {
+                const uint64_t elapsed = static_cast<uint64_t>(
+                    endTime.QuadPart - startTime.QuadPart);
+                const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                if (elapsed <= UINT64_MAX / 1'000'000ULL) {
+                    exportTimeUs = (elapsed * 1'000'000ULL) / freq;
+                }
+                else {
+                    exportTimeUs = (elapsed / freq) * 1'000'000ULL;
+                }
+            }
+
+            file << "\n# Total exported: " << exportedCount << " hashes\n";
+            file << "# Export time: " << exportTimeUs << " microseconds\n";
+
+            file.flush();
+            if (file.fail()) {
+                SS_LOG_ERROR(L"HashStore", L"ExportToFile: I/O error flushing output");
+                return StoreError{ SignatureStoreError::Unknown, 0,
+                    "I/O error flushing export file" };
+            }
+
+            file.close();
+
+            SS_LOG_INFO(L"HashStore",
+                L"ExportToFile: complete - %zu hashes exported in %llu us",
+                exportedCount, exportTimeUs);
+
+            return StoreError{ SignatureStoreError::Success };
+        }
+        catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"HashStore", L"ExportToFile: exception: %S", ex.what());
+            return StoreError{ SignatureStoreError::Unknown, 0, "Export operation failed" };
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"HashStore", L"ExportToFile: unknown exception");
+            return StoreError{ SignatureStoreError::Unknown, 0, "Export operation failed" };
+        }
+    }
+
+    // ============================================================================
+    // IMPORT FROM JSON
+    // ============================================================================
+
+    StoreError HashStore::ImportFromJson(const std::string& jsonData) noexcept {
+        /*
+         * ========================================================================
+         * JSON HASH IMPORT
+         * ========================================================================
+         *
+         * Expected schema:
+         * {
+         *   "hashes": [
+         *     { "type": "SHA256", "hash": "abc...", "name": "Trojan.X",
+         *       "threat_level": 75 },
+         *     ...
+         *   ]
+         * }
+         *
+         * Security: input size cap, reduced JSON depth limit, per-entry validation,
+         *           name sanitization, batched persistence.
+         *
+         * Thread safety: relies on AddHashBatch internal locking (same as ImportFromFile).
+         *
+         * NOTE: Not transactional. Partial batch commits persist on failure.
+         *
+         * ========================================================================
+         */
+
+        SS_LOG_INFO(L"HashStore", L"ImportFromJson: %zu bytes", jsonData.size());
+
+        // Pre-condition checks
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            SS_LOG_ERROR(L"HashStore", L"ImportFromJson: database not initialized");
+            return StoreError{ SignatureStoreError::Unknown, 0, "Database not initialized" };
+        }
+
+        if (m_readOnly.load(std::memory_order_acquire)) {
+            SS_LOG_ERROR(L"HashStore", L"ImportFromJson: database is read-only");
+            return StoreError{ SignatureStoreError::AccessDenied, 0, "Database is read-only" };
+        }
+
+        if (jsonData.empty()) {
+            SS_LOG_ERROR(L"HashStore", L"ImportFromJson: empty JSON data");
+            return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                "JSON data cannot be empty" };
+        }
+
+        // SECURITY: Cap JSON input size to prevent resource exhaustion
+        if (jsonData.size() > MAX_JSON_IMPORT_SIZE) {
+            SS_LOG_ERROR(L"HashStore",
+                L"ImportFromJson: JSON too large (%zu bytes, max %zu)",
+                jsonData.size(), MAX_JSON_IMPORT_SIZE);
+            return StoreError{ SignatureStoreError::TooLarge, 0,
+                "JSON data exceeds size limit" };
+        }
+
+        try {
+            using namespace ShadowStrike::Utils::JSON;
+
+            Json jsonRoot;
+            Error jsonErr;
+            ParseOptions parseOpts;
+            parseOpts.allowComments = true;
+            parseOpts.allowExceptions = false;
+            parseOpts.maxDepth = JSON_MAX_PARSE_DEPTH;
+
+            if (!Parse(jsonData, jsonRoot, &jsonErr, parseOpts)) {
+                SS_LOG_ERROR(L"HashStore",
+                    L"ImportFromJson: parse error at line %zu, col %zu: %S",
+                    jsonErr.line, jsonErr.column, jsonErr.message.c_str());
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "JSON parse error" };
+            }
+
+            if (!jsonRoot.is_object()) {
+                SS_LOG_ERROR(L"HashStore", L"ImportFromJson: root must be a JSON object");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Root must be JSON object" };
+            }
+
+            if (!jsonRoot.contains("hashes")) {
+                SS_LOG_ERROR(L"HashStore", L"ImportFromJson: missing 'hashes' array");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Missing 'hashes' field" };
+            }
+
+            const Json& hashesArray = jsonRoot["hashes"];
+            if (!hashesArray.is_array()) {
+                SS_LOG_ERROR(L"HashStore", L"ImportFromJson: 'hashes' must be an array");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "'hashes' must be array" };
+            }
+
+            const size_t totalEntries = hashesArray.size();
+
+            LARGE_INTEGER startTime{}, endTime{};
+            if (!QueryPerformanceCounter(&startTime)) {
+                startTime.QuadPart = 0;
+            }
+
+            // Batch buffers (capped reserve to prevent huge upfront allocation)
+            std::vector<HashValue> hashes;
+            std::vector<std::string> names;
+            std::vector<ThreatLevel> levels;
+            const size_t reserveSize = std::min(totalEntries, IMPORT_BATCH_SIZE);
+            hashes.reserve(reserveSize);
+            names.reserve(reserveSize);
+            levels.reserve(reserveSize);
+
             size_t validCount = 0;
             size_t invalidCount = 0;
+            size_t totalImported = 0;
 
-            // Pre-allocate vectors to reduce reallocations
-            const size_t expectedSize = hashesArray.size();
-            try {
-                hashes.reserve(expectedSize);
-                names.reserve(expectedSize);
-                levels.reserve(expectedSize);
-            }
-            catch (const std::bad_alloc&) {
-                SS_LOG_ERROR(L"HashStore", L"ImportFromJson: Memory allocation failed");
-                return StoreError{ SignatureStoreError::Unknown, 0, "Memory allocation failed" };
-            }
-
-            for (size_t i = 0; i < hashesArray.size(); ++i) {
+            for (size_t i = 0; i < totalEntries; ++i) {
                 const Json& entry = hashesArray[i];
 
                 try {
                     if (!entry.is_object()) {
                         SS_LOG_WARN(L"HashStore",
-                            L"ImportFromJson: Entry %zu is not an object", i);
+                            L"ImportFromJson: entry %zu is not an object", i);
                         invalidCount++;
                         continue;
                     }
 
                     std::string typeStr;
                     if (!Get<std::string>(entry, "type", typeStr)) {
-                        SS_LOG_WARN(L"HashStore", L"ImportFromJson: Entry %zu missing 'type'", i);
+                        SS_LOG_WARN(L"HashStore",
+                            L"ImportFromJson: entry %zu missing 'type'", i);
                         invalidCount++;
                         continue;
                     }
 
                     std::string hashStr;
                     if (!Get<std::string>(entry, "hash", hashStr)) {
-                        SS_LOG_WARN(L"HashStore", L"ImportFromJson: Entry %zu missing 'hash'", i);
+                        SS_LOG_WARN(L"HashStore",
+                            L"ImportFromJson: entry %zu missing 'hash'", i);
                         invalidCount++;
                         continue;
                     }
@@ -429,45 +743,77 @@ namespace ShadowStrike {
                     if (!Get<std::string>(entry, "name", name)) {
                         name = "Imported_" + std::to_string(i);
                     }
+                    name = SanitizeName(name);
 
-                    int threatLevelInt = 50;
-                    if (Get<int>(entry, "threat_level", threatLevelInt) == true) {
-                        threatLevelInt = std::clamp(threatLevelInt, 0, 100);
+                    // Parse threat_level (supports both int and string for flexibility)
+                    int threatLevelInt = static_cast<int>(ThreatLevel::Medium);
+                    if (!Get<int>(entry, "threat_level", threatLevelInt)) {
+                        std::string levelStr;
+                        if (Get<std::string>(entry, "threat_level", levelStr)) {
+                            threatLevelInt = static_cast<int>(
+                                ParseThreatLevelString(levelStr));
+                        }
                     }
-                    HashType hashType = HashType::SHA256;
-                    if (typeStr == "MD5") hashType = HashType::MD5;
-                    else if (typeStr == "SHA1") hashType = HashType::SHA1;
-                    else if (typeStr == "SHA256") hashType = HashType::SHA256;
-                    else if (typeStr == "SHA512") hashType = HashType::SHA512;
-                    else {
+                    threatLevelInt = std::clamp(threatLevelInt, 0, 100);
+
+                    // Validate hash type (all 7 types)
+                    bool typeValid = false;
+                    HashType hashType = ParseHashTypeString(typeStr, typeValid);
+                    if (!typeValid) {
                         SS_LOG_WARN(L"HashStore",
-                            L"ImportFromJson: Unknown hash type at entry %zu: %S",
+                            L"ImportFromJson: unknown type at entry %zu: %S",
                             i, typeStr.c_str());
                         invalidCount++;
                         continue;
                     }
 
+                    // Parse and validate hash value
                     auto parsedHash = Format::ParseHashString(hashStr, hashType);
                     if (!parsedHash.has_value()) {
                         SS_LOG_WARN(L"HashStore",
-                            L"ImportFromJson: Invalid hash value at entry %zu",
-                            i);
+                            L"ImportFromJson: invalid hash at entry %zu", i);
                         invalidCount++;
                         continue;
                     }
 
                     hashes.push_back(*parsedHash);
                     names.push_back(std::move(name));
-                    levels.push_back(static_cast<ThreatLevel>(threatLevelInt));
+                    levels.push_back(MapIntToThreatLevel(threatLevelInt));
                     validCount++;
+
+                    // Batch flush to prevent memory exhaustion on large JSON inputs
+                    if (hashes.size() >= IMPORT_BATCH_SIZE) {
+                        StoreError err = AddHashBatch(hashes, names, levels);
+                        if (err.code != SignatureStoreError::Success) {
+                            SS_LOG_ERROR(L"HashStore",
+                                L"ImportFromJson: batch insert failed at entry %zu: %S",
+                                i, err.message.c_str());
+                            return err;
+                        }
+                        totalImported += hashes.size();
+                        hashes.clear();
+                        names.clear();
+                        levels.clear();
+                    }
                 }
                 catch (const std::exception& ex) {
                     SS_LOG_WARN(L"HashStore",
-                        L"ImportFromJson: Exception at entry %zu: %S",
-                        i, ex.what());
+                        L"ImportFromJson: exception at entry %zu: %S", i, ex.what());
                     invalidCount++;
                     continue;
                 }
+            }
+
+            // Flush remaining entries
+            if (!hashes.empty()) {
+                StoreError err = AddHashBatch(hashes, names, levels);
+                if (err.code != SignatureStoreError::Success) {
+                    SS_LOG_ERROR(L"HashStore",
+                        L"ImportFromJson: final batch insert failed: %S",
+                        err.message.c_str());
+                    return err;
+                }
+                totalImported += hashes.size();
             }
 
             if (!QueryPerformanceCounter(&endTime)) {
@@ -476,64 +822,94 @@ namespace ShadowStrike {
 
             uint64_t parseTimeUs = 0;
             if (m_perfFrequency.QuadPart > 0 && endTime.QuadPart >= startTime.QuadPart) {
-                const uint64_t elapsed = static_cast<uint64_t>(endTime.QuadPart - startTime.QuadPart);
+                const uint64_t elapsed = static_cast<uint64_t>(
+                    endTime.QuadPart - startTime.QuadPart);
                 const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
-                if (elapsed <= UINT64_MAX / 1000000ULL) {
-                    parseTimeUs = (elapsed * 1000000ULL) / freq;
+                if (elapsed <= UINT64_MAX / 1'000'000ULL) {
+                    parseTimeUs = (elapsed * 1'000'000ULL) / freq;
                 }
                 else {
-                    parseTimeUs = (elapsed / freq) * 1000000ULL;
+                    parseTimeUs = (elapsed / freq) * 1'000'000ULL;
                 }
             }
 
-            if (validCount == 0) {
+            if (totalImported == 0 && validCount == 0) {
                 SS_LOG_ERROR(L"HashStore",
-                    L"ImportFromJson: No valid hashes found (invalid: %zu)",
+                    L"ImportFromJson: no valid hashes found (invalid: %zu)",
                     invalidCount);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "No valid hashes in JSON" };
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "No valid hashes in JSON" };
             }
 
             SS_LOG_INFO(L"HashStore",
-                L"ImportFromJson: Parsed %zu valid hashes (invalid: %zu, parse time: %llu �s)",
-                validCount, invalidCount, parseTimeUs);
-
-            StoreError batchErr = AddHashBatch(hashes, names, levels);
-
-            if (!batchErr.IsSuccess()) {
-                SS_LOG_ERROR(L"HashStore",
-                    L"ImportFromJson: Batch insert failed: %S",
-                    batchErr.message.c_str());
-                return batchErr;
-            }
-
-            SS_LOG_INFO(L"HashStore",
-                L"ImportFromJson: Successfully imported %zu hashes",
-                validCount);
+                L"ImportFromJson: completed - imported %zu hashes "
+                L"(invalid: %zu, time: %llu us)",
+                totalImported, invalidCount, parseTimeUs);
 
             return StoreError{ SignatureStoreError::Success };
         }
+        catch (const std::bad_alloc&) {
+            SS_LOG_ERROR(L"HashStore", L"ImportFromJson: memory allocation failed");
+            return StoreError{ SignatureStoreError::OutOfMemory, 0,
+                "Memory allocation failed during JSON import" };
+        }
+        catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"HashStore", L"ImportFromJson: exception: %S", ex.what());
+            return StoreError{ SignatureStoreError::Unknown, 0,
+                "Unexpected exception during JSON import" };
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"HashStore", L"ImportFromJson: unknown exception");
+            return StoreError{ SignatureStoreError::Unknown, 0,
+                "Unknown exception during JSON import" };
+        }
+    }
 
-        //exports hashes from the hash store to a JSON string. Supports filtering by hash type and limiting entries.
-        std::string HashStore::ExportToJson(
-            HashType typeFilter,
-            uint32_t maxEntries
-        ) const noexcept {
-            SS_LOG_DEBUG(L"HashStore", L"ExportToJson: filter=%S, max=%u",
-                Format::HashTypeToString(typeFilter), maxEntries);
+    // ============================================================================
+    // EXPORT TO JSON
+    // ============================================================================
 
-            if (!m_initialized.load(std::memory_order_acquire)) {
-                SS_LOG_ERROR(L"HashStore", L"ExportToJson: Database not initialized");
-                return "{}";
-            }
+    std::string HashStore::ExportToJson(
+        HashType typeFilter,
+        uint32_t maxEntries
+    ) const noexcept {
+        /*
+         * ========================================================================
+         * JSON HASH EXPORT
+         * ========================================================================
+         *
+         * HEADER PATCH NEEDED:
+         *   - Same MD5-as-sentinel type filter issue as ExportToFile.
+         *   - ForEach only provides fastHash/signatureOffset. Actual name and
+         *     threat level are not accessible; placeholders are used.
+         *
+         * Security:
+         *   - Internal offsets (signatureOffset, fastHash) are NOT exported.
+         *   - Memory bounded by maxEntries.
+         *
+         * Thread safety:
+         *   - Shared lock held during iteration, released before GetStatistics()
+         *     to avoid UB from recursive shared_mutex acquisition.
+         *
+         * ========================================================================
+         */
 
+        SS_LOG_DEBUG(L"HashStore", L"ExportToJson: filter=%S, max=%u",
+            Format::HashTypeToString(typeFilter), maxEntries);
+
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            SS_LOG_ERROR(L"HashStore", L"ExportToJson: database not initialized");
+            return "{}";
+        }
+
+        try {
             using namespace ShadowStrike::Utils::JSON;
-
-            std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
             Json exportRoot;
             exportRoot["version"] = "1.0";
             exportRoot["format"] = "ShadowStrike Hash Export";
-            exportRoot["timestamp"] = std::chrono::system_clock::now().time_since_epoch().count();
+            exportRoot["timestamp"] =
+                std::chrono::system_clock::now().time_since_epoch().count();
             exportRoot["filter"] = Format::HashTypeToString(typeFilter);
 
             Json hashesArray = Json::array();
@@ -544,60 +920,77 @@ namespace ShadowStrike {
             }
 
             size_t exportCount = 0;
-            const uint8_t* dataBase = static_cast<const uint8_t*>(m_mappedView.baseAddress);
 
-            // Early exit if base address is null
-            if (dataBase == nullptr) {
-                SS_LOG_ERROR(L"HashStore", L"ExportToJson: Memory-mapped base address is null");
-                return "{}";
-            }
+            // Scoped shared lock for iteration over memory-mapped data
+            {
+                std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
-            for (const auto& [bucketType, bucket] : m_buckets) {
-                if (typeFilter != HashType::MD5 && bucketType != typeFilter) {
-                    continue;
+                const uint8_t* dataBase =
+                    static_cast<const uint8_t*>(m_mappedView.baseAddress);
+
+                if (dataBase == nullptr) {
+                    SS_LOG_ERROR(L"HashStore",
+                        L"ExportToJson: memory-mapped base address is null");
+                    return "{}";
                 }
 
-                bucket->m_index->ForEach(
-                    [&](uint64_t fastHash, uint64_t signatureOffset) -> bool {
-                        if (exportCount >= maxEntries) {
-                            return false;
-                        }
+                for (const auto& [bucketType, bucket] : m_buckets) {
+                    // NOTE: typeFilter == MD5 is the sentinel for "all types."
+                    if (typeFilter != HashType::MD5 && bucketType != typeFilter) {
+                        continue;
+                    }
 
-                        if (signatureOffset >= m_mappedView.fileSize) {
-                            return true;
-                        }
+                    if (!bucket || !bucket->m_index) {
+                        continue;
+                    }
 
-                        // Bounds check before dereferencing
-                        if (signatureOffset > m_mappedView.fileSize - sizeof(HashValue)) {
-                            return true;
-                        }
+                    bucket->m_index->ForEach(
+                        [&](uint64_t fastHash, uint64_t signatureOffset) -> bool {
+                            // Lambda must not throw through noexcept ForEach.
+                            try {
+                                if (exportCount >= maxEntries) {
+                                    return false;
+                                }
 
-                        const HashValue* hashPtr =
-                            reinterpret_cast<const HashValue*>(dataBase + signatureOffset);
+                                if (signatureOffset >= m_mappedView.fileSize ||
+                                    signatureOffset >
+                                        m_mappedView.fileSize - sizeof(HashValue)) {
+                                    return true;
+                                }
 
-                        if (hashPtr->length == 0 || hashPtr->length > 64) {
-                            return true;
-                        }
+                                const HashValue* hashPtr =
+                                    reinterpret_cast<const HashValue*>(
+                                        dataBase + signatureOffset);
 
-                        Json entry;
-                        entry["type"] = Format::HashTypeToString(hashPtr->type);
-                        entry["hash"] = Format::FormatHashString(*hashPtr);
-                        entry["name"] = "Hash_" + std::to_string(fastHash);
-                        entry["threat_level"] = 50;
-                        entry["fast_hash"] = fastHash;
-                        entry["signature_offset"] = signatureOffset;
-                        entry["length_bytes"] = hashPtr->length;
+                                if (hashPtr->length == 0 || hashPtr->length > 64) {
+                                    return true;
+                                }
 
-                        hashesArray.push_back(entry);
-                        exportCount++;
+                                Json entry;
+                                entry["type"] =
+                                    Format::HashTypeToString(hashPtr->type);
+                                entry["hash"] =
+                                    Format::FormatHashString(*hashPtr);
+                                entry["name"] =
+                                    "Hash_" + std::to_string(fastHash);
+                                entry["threat_level"] =
+                                    static_cast<int>(ThreatLevel::Medium);
+                                entry["length_bytes"] = hashPtr->length;
 
-                        return true;
-                    });
+                                hashesArray.push_back(std::move(entry));
+                                exportCount++;
+                                return true;
+                            }
+                            catch (...) {
+                                return false;
+                            }
+                        });
 
-                if (exportCount >= maxEntries) {
-                    break;
+                    if (exportCount >= maxEntries) {
+                        break;
+                    }
                 }
-            }
+            } // shared lock released here
 
             if (!QueryPerformanceCounter(&endTime)) {
                 endTime.QuadPart = startTime.QuadPart;
@@ -605,28 +998,30 @@ namespace ShadowStrike {
 
             uint64_t exportTimeUs = 0;
             if (m_perfFrequency.QuadPart > 0 && endTime.QuadPart >= startTime.QuadPart) {
-                const uint64_t elapsed = static_cast<uint64_t>(endTime.QuadPart - startTime.QuadPart);
+                const uint64_t elapsed = static_cast<uint64_t>(
+                    endTime.QuadPart - startTime.QuadPart);
                 const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
-                if (elapsed <= UINT64_MAX / 1000000ULL) {
-                    exportTimeUs = (elapsed * 1000000ULL) / freq;
+                if (elapsed <= UINT64_MAX / 1'000'000ULL) {
+                    exportTimeUs = (elapsed * 1'000'000ULL) / freq;
                 }
                 else {
-                    exportTimeUs = (elapsed / freq) * 1000000ULL;
+                    exportTimeUs = (elapsed / freq) * 1'000'000ULL;
                 }
             }
 
-            exportRoot["hashes"] = hashesArray;
+            exportRoot["hashes"] = std::move(hashesArray);
             exportRoot["count"] = exportCount;
             exportRoot["export_time_microseconds"] = exportTimeUs;
 
-            Json stats;
+            // GetStatistics() safely called AFTER releasing m_globalLock to avoid
+            // undefined behavior from recursive shared_mutex acquisition.
             auto storeStats = GetStatistics();
+            Json stats;
             stats["total_hashes"] = storeStats.totalHashes;
             stats["total_lookups"] = storeStats.totalLookups;
             stats["cache_hit_rate"] = storeStats.cacheHitRate;
             stats["database_size_bytes"] = storeStats.databaseSizeBytes;
-
-            exportRoot["statistics"] = stats;
+            exportRoot["statistics"] = std::move(stats);
 
             std::string result;
             StringifyOptions stringOpts;
@@ -634,16 +1029,29 @@ namespace ShadowStrike {
             stringOpts.indentSpaces = 2;
 
             if (!Stringify(exportRoot, result, stringOpts)) {
-                SS_LOG_ERROR(L"HashStore", L"ExportToJson: Failed to stringify JSON");
+                SS_LOG_ERROR(L"HashStore", L"ExportToJson: failed to stringify JSON");
                 return "{}";
             }
 
             SS_LOG_DEBUG(L"HashStore",
-                L"ExportToJson: Exported %zu hashes in %llu �s, JSON size: %zu bytes",
+                L"ExportToJson: exported %zu hashes in %llu us, JSON size: %zu bytes",
                 exportCount, exportTimeUs, result.size());
 
             return result;
         }
+        catch (const std::bad_alloc&) {
+            SS_LOG_ERROR(L"HashStore", L"ExportToJson: memory allocation failed");
+            return "{}";
+        }
+        catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"HashStore", L"ExportToJson: exception: %S", ex.what());
+            return "{}";
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"HashStore", L"ExportToJson: unknown exception");
+            return "{}";
+        }
+    }
 
-	}
-}
+} // namespace HashStore
+} // namespace ShadowStrike
