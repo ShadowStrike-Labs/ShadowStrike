@@ -95,7 +95,7 @@ struct BehaviorAnalyzer::Impl {
     // External integrations
     std::shared_ptr<ThreatIntel::ThreatIntelStore> m_threatIntel;
     std::shared_ptr<SignatureStore::SignatureStore> m_signatureStore;
-    std::shared_ptr<ShadowStrike::SignatureStore::PatternStore> m_patternStore;
+    std::shared_ptr<ShadowStrike::PatternStore::PatternStore> m_patternStore;
 
     // Per-process state tracking
     std::unordered_map<uint32_t, ProcessBehaviorState> m_processStates;
