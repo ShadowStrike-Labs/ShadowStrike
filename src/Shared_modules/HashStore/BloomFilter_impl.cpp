@@ -21,7 +21,7 @@
 #include<bit>
 
 namespace ShadowStrike {
-    namespace SignatureStore {
+    namespace HashStore {
 
 
 
@@ -124,8 +124,8 @@ namespace ShadowStrike {
                 SS_LOG_ERROR(L"BloomFilter",
                     L"Bit array size invalid: %zu slots (max: %zu)",
                     uint64Count, MAX_UINT64_COUNT);
-                m_size = 64;
-                m_numHashes = 3;
+                m_size = 0;
+                m_numHashes = 0;
                 return;
             }
 
@@ -243,26 +243,37 @@ namespace ShadowStrike {
         }
 
         uint64_t BloomFilter::Hash(uint64_t value, size_t seed) const noexcept {
-            // FNV-1a hash with seed - deterministic and fast
-            uint64_t hash = 14695981039346656037ULL;
+            // Enhanced double hashing (Kirsch & Mitzenmacher, 2006):
+            // h_i(x) = h1(x) + i * h2(x) + i^2
+            // Proven equivalent to k fully-independent hash functions for
+            // Bloom filters. Two base hashes give optimal bit distribution
+            // regardless of k, outperforming naive FNV-1a with seed mixing.
 
-            // Mix in seed first
-            hash ^= static_cast<uint64_t>(seed);
-            hash *= 1099511628211ULL;
-
-            // Process value bytes
+            // h1: FNV-1a over value bytes
+            uint64_t h1 = 14695981039346656037ULL;
             const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&value);
             for (size_t i = 0; i < sizeof(uint64_t); ++i) {
-                hash ^= bytes[i];
-                hash *= 1099511628211ULL;
+                h1 ^= bytes[i];
+                h1 *= 1099511628211ULL;
             }
 
-            return hash;
+            // h2: MurmurHash3 64-bit finalizer (excellent avalanche properties)
+            uint64_t h2 = value;
+            h2 ^= h2 >> 33;
+            h2 *= 0xff51afd7ed558ccdULL;
+            h2 ^= h2 >> 33;
+            h2 *= 0xc4ceb9fe1a85ec53ULL;
+            h2 ^= h2 >> 33;
+
+            // Force h2 odd for better modular distribution across the bit array
+            h2 |= 1ULL;
+
+            return h1 + seed * h2 + seed * seed;
         }
 
 
 
 
 
-    }
-}
+    } // namespace HashStore
+} // namespace ShadowStrike

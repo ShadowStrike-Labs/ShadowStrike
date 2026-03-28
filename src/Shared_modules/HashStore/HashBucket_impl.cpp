@@ -24,7 +24,7 @@
 
 namespace ShadowStrike {
 
-	namespace SignatureStore {
+	namespace HashStore {
 
 
         // ============================================================================
@@ -32,9 +32,9 @@ namespace ShadowStrike {
         // ============================================================================
 
         HashBucket::HashBucket(HashType type)
-            : m_type(type)
-            , m_index(nullptr)
+            : m_index(nullptr)
             , m_bloomFilter(nullptr)
+            , m_type(type)
             , m_view(nullptr)
             , m_bucketOffset(0)
             , m_bucketSize(0)
@@ -231,6 +231,9 @@ namespace ShadowStrike {
 
             std::shared_lock<std::shared_mutex> lock(m_rwLock);
 
+            m_lookupCount.fetch_add(static_cast<uint64_t>(hashes.size()),
+                std::memory_order_relaxed);
+
             for (const auto& hash : hashes) {
                 const uint64_t fastHash = hash.FastHash();
 
@@ -257,24 +260,22 @@ namespace ShadowStrike {
             // ================================================================
             // ENTERPRISE-GRADE INSERT WITH BLOOM FILTER UPDATE
             // ================================================================
-            // CRITICAL: Update Bloom filter FIRST before index validation
-            // This ensures statistics are tracked even if index isn't initialized,
-            // which is important for unit tests and defensive programming.
-            // The Bloom filter is an optimization layer and should always be updated
-            // when a hash is being inserted, regardless of index state.
-            // ================================================================
             
             std::unique_lock<std::shared_mutex> lock(m_rwLock);
 
-            // Add to Bloom filter first (cannot fail, updates stats)
-            if (m_bloomFilter) {
-                m_bloomFilter->Add(hash.FastHash());
-            }
-            
-            // Validate index state AFTER bloom filter update
+            // Validate index state FIRST — do not pollute bloom filter
+            // when the bucket is in a broken (uninitialized) state.
             if (!m_index) {
                 SS_LOG_ERROR(L"HashBucket", L"Insert: Index not initialized");
                 return StoreError{ SignatureStoreError::Unknown, 0, "Index not initialized" };
+            }
+
+            // Add to bloom filter BEFORE B+Tree insert to prevent false negatives
+            // during concurrent reads (bloom filter check is lock-free in Lookup).
+            // If the B+Tree insert below fails, this creates a benign false positive
+            // (bloom says "maybe" but B+Tree says "no") — acceptable by design.
+            if (m_bloomFilter) {
+                m_bloomFilter->Add(hash.FastHash());
             }
 
             // Add to B+Tree
@@ -348,5 +349,5 @@ namespace ShadowStrike {
 
 
 
-	}
-}
+	} // namespace HashStore
+} // namespace ShadowStrike
