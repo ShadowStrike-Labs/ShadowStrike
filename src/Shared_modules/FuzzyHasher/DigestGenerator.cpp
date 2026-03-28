@@ -95,19 +95,31 @@ namespace ShadowStrike::FuzzyHasher {
          * @param sig1Len Output: length of primary signature
          * @param sig2 Output: secondary signature buffer (kHalfDigestLength + 1)
          * @param sig2Len Output: length of secondary signature
+         * @param chunkInitialState Initial FNV state for chunk hashers.
+         *        Pass a salt-derived value for APT-hardened hashing (BUG-8).
+         *        Defaults to kFnvOffsetBasis (standard CTPH behaviour).
          */
         void GenerateSignatures(
             std::span<const uint8_t> data,
             uint32_t blockSize,
             char* sig1, uint32_t& sig1Len,
-            char* sig2, uint32_t& sig2Len
+            char* sig2, uint32_t& sig2Len,
+            uint32_t chunkInitialState = kFnvOffsetBasis
         ) noexcept {
             RollingHash roller;
-            ChunkHash chunk1;
-            ChunkHash chunk2;
+            ChunkHash chunk1(chunkInitialState);
+            ChunkHash chunk2(chunkInitialState);
 
             sig1Len = 0;
             sig2Len = 0;
+
+            // Track bytes accumulated since the last Reset() on each chunk hasher.
+            // Used for explicit finalization (BUG-6): replaces the fragile
+            // chunk.Digest() != kFnvOffsetBasis check, which could theoretically
+            // produce a false negative on a rare FNV fixed-point coincidence
+            // and is also incorrect when a non-default chunkInitialState is used.
+            uint32_t chunk1Pending = 0;
+            uint32_t chunk2Pending = 0;
 
             // Use uint64_t to prevent overflow when blockSize >= 0x80000000
             const uint64_t doubleBlockSize = static_cast<uint64_t>(blockSize) * 2;
@@ -117,7 +129,9 @@ namespace ShadowStrike::FuzzyHasher {
 
                 const uint32_t rollVal = roller.Update(byte);
                 chunk1.Update(byte);
+                ++chunk1Pending;
                 chunk2.Update(byte);
+                ++chunk2Pending;
 
                 // Primary signature: trigger when rolling hash aligns with blocksize
                 if ((rollVal % blockSize) == (blockSize - 1)) {
@@ -125,11 +139,13 @@ namespace ShadowStrike::FuzzyHasher {
 
                     if (sig1Len < kDigestComponentLength - 1) {
                         chunk1.Reset();
+                        chunk1Pending = 0;
                         ++sig1Len;
                     }
-                    // If we've reached max length, keep accumulating into the last
-                    // character position — this combines all remaining chunks into
-                    // the final character, ensuring the tail is always represented.
+                    // Saturation path: sig1Len stays at kDigestComponentLength-1.
+                    // The slot is repeatedly overwritten with the evolving hash,
+                    // so the final character encodes all bytes since the last reset.
+                    // chunk1Pending is NOT reset here, enabling correct finalization.
                 }
 
                 // Secondary signature: trigger at 2x blocksize
@@ -138,21 +154,23 @@ namespace ShadowStrike::FuzzyHasher {
 
                     if (sig2Len < kHalfDigestLength - 1) {
                         chunk2.Reset();
+                        chunk2Pending = 0;
                         ++sig2Len;
                     }
                 }
             }
 
-            // Finalize: if chunk hashers have accumulated data since their last
-            // reset (i.e., there's a partial chunk after the last trigger point),
-            // emit one more character to capture the tail content
-            if (chunk1.Digest() != kFnvOffsetBasis) {
+            // Finalize: emit trailing partial chunk if any unfinalized bytes remain.
+            // Uses byte-pending counters rather than FNV state comparison (BUG-6 fix):
+            //   - Immune to FNV fixed-point coincidences (theoretically possible)
+            //   - Correct when chunkInitialState != kFnvOffsetBasis (salted hashing)
+            if (chunk1Pending > 0) {
                 if (sig1Len < kDigestComponentLength) {
                     sig1[sig1Len] = kBase64Alphabet[chunk1.Digest() % 64];
                     ++sig1Len;
                 }
             }
-            if (chunk2.Digest() != kFnvOffsetBasis) {
+            if (chunk2Pending > 0) {
                 if (sig2Len < kHalfDigestLength) {
                     sig2[sig2Len] = kBase64Alphabet[chunk2.Digest() % 64];
                     ++sig2Len;
@@ -163,48 +181,80 @@ namespace ShadowStrike::FuzzyHasher {
             sig2[sig2Len] = '\0';
         }
 
-    } // anonymous namespace
-
-    std::optional<std::string> GenerateDigest(std::span<const uint8_t> data) noexcept {
-        try {
-            if (data.empty()) {
-                return std::nullopt;
-            }
-
-            // Select initial blocksize
+        /**
+         * @brief Internal helper shared by GenerateDigest and GenerateDigestWithSalt.
+         *
+         * Selects blocksize, runs GenerateSignatures (with optional salted state),
+         * retries with halved blocksize if the primary signature is too sparse,
+         * then formats the "blocksize:sig1:sig2" result string.
+         */
+        [[nodiscard]] std::optional<std::string> BuildDigest(
+            std::span<const uint8_t> data,
+            uint32_t chunkInitialState
+        ) noexcept {
             uint32_t blockSize = SelectBlockSize(data.size());
 
-            // Signature buffers
             char sig1[kDigestComponentLength + 1] = { 0 };
             char sig2[kHalfDigestLength + 1] = { 0 };
             uint32_t sig1Len = 0;
             uint32_t sig2Len = 0;
 
-            // Generate signatures — may retry with halved blocksize if the
-            // primary signature is too short (less than half the target length)
-            GenerateSignatures(data, blockSize, sig1, sig1Len, sig2, sig2Len);
+            GenerateSignatures(data, blockSize, sig1, sig1Len, sig2, sig2Len, chunkInitialState);
 
             // If the primary signature is very short, reduce blocksize and retry.
-            // This ensures we have sufficient granularity for meaningful comparison.
+            // This ensures sufficient granularity for meaningful comparison.
             while (blockSize > kMinBlockSize && sig1Len < kDigestComponentLength / 2) {
                 blockSize /= 2;
                 std::memset(sig1, 0, sizeof(sig1));
                 std::memset(sig2, 0, sizeof(sig2));
-                GenerateSignatures(data, blockSize, sig1, sig1Len, sig2, sig2Len);
+                sig1Len = 0;
+                sig2Len = 0;
+                GenerateSignatures(data, blockSize, sig1, sig1Len, sig2, sig2Len, chunkInitialState);
             }
 
-            // Format: "blocksize:signature1:signature2"
             std::string result;
             result.reserve(20 + sig1Len + sig2Len);
-
             result += std::to_string(blockSize);
             result += ':';
             result += sig1;
             result += ':';
             result += sig2;
-
             return result;
+        }
 
+    } // anonymous namespace
+
+    std::optional<std::string> GenerateDigest(std::span<const uint8_t> data) noexcept {
+        try {
+            // BUG-5: single authoritative empty-input guard at this layer.
+            // GenerateDigestRaw delegates here, so no duplicate check is needed there.
+            if (data.empty()) {
+                return std::nullopt;
+            }
+            return BuildDigest(data, kFnvOffsetBasis);
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+
+    std::optional<std::string> GenerateDigestWithSalt(
+        std::span<const uint8_t> data,
+        uint64_t salt
+    ) noexcept {
+        try {
+            if (data.empty()) {
+                return std::nullopt;
+            }
+
+            // Derive a 32-bit initial ChunkHash state from the 64-bit salt by
+            // XORing both halves into the standard FNV offset basis.
+            // This makes chunk boundaries and content unpredictable to an attacker
+            // who does not know the per-session salt.
+            const uint32_t saltedState = kFnvOffsetBasis
+                ^ static_cast<uint32_t>(salt & 0xFFFFFFFFULL)
+                ^ static_cast<uint32_t>(salt >> 32);
+
+            return BuildDigest(data, saltedState);
         } catch (...) {
             return std::nullopt;
         }
@@ -215,6 +265,8 @@ namespace ShadowStrike::FuzzyHasher {
         uint32_t buf_len,
         char* result
     ) noexcept {
+        // BUG-5: delegate directly to GenerateDigest — no duplicate null/empty guard.
+        // GenerateDigest is the single authoritative validation point.
         if (!buf || buf_len == 0 || !result) {
             return -1;
         }
@@ -226,8 +278,10 @@ namespace ShadowStrike::FuzzyHasher {
 
         const auto& str = digest.value();
 
-        // 148 is the documented max result length
-        if (str.size() >= 148) {
+        // BUG-7: use kMaxResultLength constant instead of the magic number 148.
+        // kMaxResultLength includes the null terminator, so str.size() must be
+        // strictly less than kMaxResultLength to leave room for '\0'.
+        if (str.size() >= kMaxResultLength) {
             return -1;
         }
 

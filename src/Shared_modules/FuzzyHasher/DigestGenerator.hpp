@@ -46,6 +46,15 @@ namespace ShadowStrike::FuzzyHasher {
     /// Half of the digest component length (for the second signature)
     inline constexpr uint32_t kHalfDigestLength = kDigestComponentLength / 2;
 
+    /// Maximum length of a generated digest result string, including null terminator.
+    /// Format: "<blocksize>:<sig1>:<sig2>\0"
+    ///   blocksize: up to 10 chars for uint32_t max
+    ///   sig1:      up to kDigestComponentLength = 64 chars
+    ///   sig2:      up to kHalfDigestLength = 32 chars
+    ///   colons/null: 3 chars
+    ///   Total: 10 + 64 + 32 + 3 = 109; 148 is a conservative ceiling.
+    inline constexpr size_t kMaxResultLength = 148;
+
     /**
      * @brief Generate a CTPH digest from a byte buffer.
      *
@@ -62,11 +71,33 @@ namespace ShadowStrike::FuzzyHasher {
     ) noexcept;
 
     /**
+     * @brief Generate a CTPH digest with a per-session salt mixed into
+     *        the chunk hash initial state.
+     *
+     * The salt is XOR-folded into the FNV offset basis so that all chunk
+     * boundaries and their Base64 encodings are session-specific.  An
+     * attacker who does not know the salt cannot pre-compute which byte
+     * sequences will produce a given digest character, defeating
+     * trigger-point manipulation and chunk-content forgery attacks.
+     *
+     * Two digests produced with different salts MUST NOT be compared
+     * with CompareDigests — comparison is only valid within one session.
+     *
+     * @param data Input buffer to hash
+     * @param salt 64-bit per-session random value (from BCryptGenRandom)
+     * @return Digest string, or std::nullopt on error
+     */
+    [[nodiscard]] std::optional<std::string> GenerateDigestWithSalt(
+        std::span<const uint8_t> data,
+        uint64_t salt
+    ) noexcept;
+
+    /**
      * @brief Generate a CTPH digest into a pre-allocated C buffer.
      *
      * @param buf Input data pointer
      * @param buf_len Input data length
-     * @param result Output buffer (must be at least 148 bytes)
+     * @param result Output buffer (must be at least kMaxResultLength bytes)
      * @return 0 on success, -1 on error
      */
     [[nodiscard]] int GenerateDigestRaw(

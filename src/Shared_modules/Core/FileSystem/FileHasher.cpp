@@ -36,9 +36,13 @@
 #include "../../Utils/Logger.hpp"
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
+#include "../../Utils/MemoryUtils.hpp"
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/ThreadPool.hpp"
+
+// FuzzyHasher: CTPH engine for fuzzy hash computation and comparison
+#include "../../FuzzyHasher/FuzzyHasher.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -63,7 +67,6 @@
 #endif
 
 // External fuzzy hash libraries (assumed available)
-// Fuzzy hashing via FuzzyHasher module
 // #include <tlsh.h>
 
 namespace ShadowStrike {
@@ -837,18 +840,49 @@ public:
 
     void ComputeFuzzyHashImpl(const std::wstring& filePath, FileHashes& result) {
         try {
-            // TODO: Integrate FuzzyHasher module
-            // For now, placeholder implementation
-            Logger::Debug("FileHasher: fuzzy hash computation not yet implemented");
+            // Memory-map the file for zero-copy access — preferred over
+            // ReadAllBytes because it avoids a heap allocation proportional
+            // to the file size and works efficiently on large files.
+            Utils::MemoryUtils::MappedView mappedFile;
+            if (!mappedFile.mapReadOnly(filePath)) {
+                Logger::Warn("FileHasher: Failed to memory-map file for fuzzy hash: {}",
+                    StringUtils::ToNarrowString(filePath));
+                return;
+            }
 
-            // Placeholder fuzzy hash format: blocksize:hash1:hash2
-            result.fuzzyHash = "3:PLACEHOLDER:HASH";
-            result.hasFuzzyHash = false; // Set to true when implemented
+            if (!mappedFile.hasData()) {
+                Logger::Debug("FileHasher: Skipping fuzzy hash for empty file: {}",
+                    StringUtils::ToNarrowString(filePath));
+                return;
+            }
 
-            // m_stats.fuzzyHashComputed.fetch_add(1, std::memory_order_relaxed);
+            // Cap input to FuzzyHasher's maximum to prevent CPU/memory DoS.
+            const size_t hashSize = std::min(
+                mappedFile.size(),
+                ShadowStrike::FuzzyHasher::kMaxHashableSize
+            );
+
+            auto digest = ShadowStrike::FuzzyHasher::HashBuffer(
+                std::span<const uint8_t>(
+                    static_cast<const uint8_t*>(mappedFile.data()),
+                    hashSize
+                )
+            );
+
+            if (!digest.has_value()) {
+                Logger::Warn("FileHasher: FuzzyHasher::HashBuffer returned no digest for: {}",
+                    StringUtils::ToNarrowString(filePath));
+                return;
+            }
+
+            result.fuzzyHash  = std::move(digest.value());
+            result.hasFuzzyHash = true;
+            m_stats.fuzzyHashComputed.fetch_add(1, std::memory_order_relaxed);
+
+            Logger::Debug("FileHasher: Fuzzy hash = {}", result.fuzzyHash);
 
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: fuzzy hash exception: {}", e.what());
+            Logger::Error("FileHasher: Fuzzy hash exception: {}", e.what());
         }
     }
 
@@ -1026,10 +1060,26 @@ public:
         std::string_view hash2
     ) const noexcept {
         try {
-            // TODO: Implement fuzzy hash comparison using FuzzyHasher
-            // For now, return 0.0 (no similarity)
-            Logger::Debug("FileHasher: fuzzy hash comparison not yet implemented");
-            return 0.0;
+            if (hash1.empty() || hash2.empty()) {
+                return 0.0;
+            }
+
+            // Both string_views are backed by std::string members in FileHashes —
+            // safe to construct a temporary std::string for the Compare call.
+            const int score = ShadowStrike::FuzzyHasher::Compare(
+                std::string(hash1),
+                std::string(hash2)
+            );
+
+            if (score < 0) {
+                Logger::Warn("FileHasher: FuzzyHasher::Compare returned error (-1) — "
+                             "one or both digests may be malformed");
+                return 0.0;
+            }
+
+            // Normalize the 0-100 integer score to the [0.0, 1.0] double range
+            // used by the HashComparison::fuzzySimilarity field.
+            return static_cast<double>(score) / 100.0;
 
         } catch (...) {
             return 0.0;

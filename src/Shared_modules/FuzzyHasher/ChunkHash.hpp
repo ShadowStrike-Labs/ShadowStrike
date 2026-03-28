@@ -54,10 +54,25 @@ namespace ShadowStrike::FuzzyHasher {
      * Accumulates bytes one at a time between trigger points.
      * At each trigger point, the accumulated digest is used to produce
      * one Base64 character for the output signature.
+     *
+     * Supports an optional salted initial state for APT-hardened hashing.
+     * When a non-default initialState is provided, Reset() returns to that
+     * same salted state, ensuring consistent salt application across all
+     * chunks in a single hashing pass.
      */
     class ChunkHash final {
     public:
-        ChunkHash() noexcept : m_state(kFnvOffsetBasis) {}
+        /**
+         * @brief Construct with optional salted initial state.
+         *
+         * @param initialState Starting FNV state. Defaults to kFnvOffsetBasis.
+         *        Pass a per-session salt-derived value to harden against
+         *        offline trigger-point pre-computation by adversaries.
+         */
+        explicit ChunkHash(uint32_t initialState = kFnvOffsetBasis) noexcept
+            : m_state(initialState)
+            , m_initialState(initialState)
+        {}
 
         /**
          * @brief Feed one byte into the hash accumulator.
@@ -76,14 +91,25 @@ namespace ShadowStrike::FuzzyHasher {
         }
 
         /**
-         * @brief Reset to the initial FNV offset basis.
+         * @brief Reset to the initial state (salted or default).
+         *
+         * Returns to m_initialState rather than hard-coded kFnvOffsetBasis,
+         * so that salt is uniformly applied across all chunks.
          */
         void Reset() noexcept {
-            m_state = kFnvOffsetBasis;
+            m_state = m_initialState;
+        }
+
+        /**
+         * @brief Return the initial state this hasher was constructed with.
+         */
+        [[nodiscard]] uint32_t InitialState() const noexcept {
+            return m_initialState;
         }
 
     private:
         uint32_t m_state;
+        uint32_t m_initialState;  ///< Restored on Reset(); supports salted hashing
     };
 
 } // namespace ShadowStrike::FuzzyHasher

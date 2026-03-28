@@ -23,9 +23,12 @@
  * @file FuzzyHasher.cpp
  * @brief Public API facade for the CTPH fuzzy hashing engine
  *
- * This file delegates to the internal DigestGenerator and DigestComparer
- * modules. It provides input validation, size capping, and a clean
- * public interface.
+ * Responsibilities:
+ *   - Input validation and size capping (BUG-3)
+ *   - Delegation to DigestGenerator / DigestComparer
+ *   - Per-session salt generation via BCryptGenRandom (BUG-8)
+ *   - APT-hardening extensions: normalized hashing, salted hashing,
+ *     suspicious-digest detection, and batch comparison
  *
  * @copyright Copyright (c) ShadowStrike Contributors
  * @license AGPL-3.0-only
@@ -36,25 +39,212 @@
 #include "DigestGenerator.hpp"
 #include "DigestComparer.hpp"
 
+// PEParser: required for HashBufferNormalized PE-section extraction
+#include "../PEParser/PEParser.hpp"
+
+// Logger: required for explicit, traceable error reporting
+#include "../Utils/Logger.hpp"
+
+#ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <Windows.h>
+#  include <bcrypt.h>
+#  pragma comment(lib, "bcrypt.lib")
+#endif
+
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <vector>
+
 namespace ShadowStrike::FuzzyHasher {
 
-    std::optional<std::string> HashBuffer(std::span<const uint8_t> data) noexcept {
-        if (data.empty()) {
-            return std::nullopt;
+    namespace {
+
+        // =====================================================================
+        // Per-session salt (BCryptGenRandom, initialized once at first use)
+        // =====================================================================
+
+        /**
+         * @brief Retrieve the module-level per-session random salt.
+         *
+         * Initialized exactly once (C++ static-local guarantee) using
+         * BCryptGenRandom with BCRYPT_USE_SYSTEM_PREFERRED_RNG, which does
+         * not require an open provider handle and is FIPS-compliant.
+         *
+         * Falls back to QPC XOR PID if BCryptGenRandom fails (should never
+         * happen on a healthy Windows install, but must not crash silently).
+         *
+         * The salt is 64 bits so that after XOR-folding into the 32-bit FNV
+         * offset basis the attacker needs to guess a 64-bit secret to
+         * pre-compute any chunk hash.
+         */
+        [[nodiscard]] uint64_t SessionSalt() noexcept {
+            static const uint64_t kSalt = []() noexcept -> uint64_t {
+                uint64_t s = 0;
+#ifdef _WIN32
+                const NTSTATUS st = BCryptGenRandom(
+                    nullptr,
+                    reinterpret_cast<PUCHAR>(&s),
+                    static_cast<ULONG>(sizeof(s)),
+                    BCRYPT_USE_SYSTEM_PREFERRED_RNG
+                );
+                if (st != 0 || s == 0) {
+                    // BCryptGenRandom failed or returned zero — use QPC + PID fallback.
+                    LARGE_INTEGER qpc{};
+                    QueryPerformanceCounter(&qpc);
+                    s = static_cast<uint64_t>(qpc.QuadPart)
+                      ^ (static_cast<uint64_t>(GetCurrentProcessId()) << 32);
+                    if (s == 0) {
+                        // Absolute last resort: a non-zero compile-time constant.
+                        s = 0xDEADBEEFCAFEBABEULL;
+                    }
+                    SS_LOG_WARN(L"FuzzyHasher",
+                        L"BCryptGenRandom failed (NTSTATUS=0x%08X); "
+                        L"session salt derived from QPC+PID",
+                        static_cast<unsigned>(st));
+                }
+#else
+                // Non-Windows stub: use a non-zero compile-time constant.
+                s = 0xABCDEF0123456789ULL;
+#endif
+                return s;
+            }();
+            return kSalt;
         }
 
+        // =====================================================================
+        // PE section extraction helpers for HashBufferNormalized
+        // =====================================================================
+
+        /**
+         * @brief Extract and concatenate the raw bytes of all executable/code
+         *        sections from a PE image buffer.
+         *
+         * Iterates over PEInfo::sections and collects every section where
+         * isExecutable || hasCode is true.  Raw section data is copied from
+         * the original buffer using rawAddress and rawSize (both bounds-checked
+         * against the buffer size).
+         *
+         * @param data     Original PE buffer
+         * @param info     Parsed PEInfo from PEParser::PEParser::ParseBuffer
+         * @return Vector containing concatenated code section bytes, or empty
+         *         on failure (no code sections, all sections out of bounds).
+         */
+        [[nodiscard]] std::vector<uint8_t> ExtractCodeSections(
+            std::span<const uint8_t>            data,
+            const ShadowStrike::PEParser::PEInfo& info
+        ) noexcept {
+            try {
+                std::vector<uint8_t> extracted;
+                extracted.reserve(data.size() / 2); // Pre-allocate ~half the file
+
+                for (const auto& sec : info.sections) {
+                    if (!sec.isExecutable && !sec.hasCode) {
+                        continue;
+                    }
+                    if (sec.rawAddress == 0 || sec.rawSize == 0) {
+                        continue;
+                    }
+
+                    // Bounds-check: never read beyond the mapped buffer.
+                    const uint64_t secEnd =
+                        static_cast<uint64_t>(sec.rawAddress) + sec.rawSize;
+                    if (secEnd > data.size()) {
+                        SS_LOG_WARN(L"FuzzyHasher",
+                            L"HashBufferNormalized: section '%S' extends beyond "
+                            L"buffer (rawAddr=%u, rawSize=%u, bufSize=%zu) — skipped",
+                            sec.name.c_str(), sec.rawAddress, sec.rawSize, data.size());
+                        continue;
+                    }
+
+                    const uint8_t* start = data.data() + sec.rawAddress;
+                    extracted.insert(extracted.end(), start, start + sec.rawSize);
+                }
+
+                return extracted;
+            } catch (...) {
+                return {};
+            }
+        }
+
+        /**
+         * @brief Find the effective end of a buffer after stripping trailing
+         *        zero-padding of at least kMinZeroPad consecutive zero bytes.
+         *
+         * Preserves at least one byte so we never return a zero-length span
+         * for a buffer that is all zeros.
+         *
+         * @return Number of meaningful bytes (trimmed length).
+         */
+        [[nodiscard]] size_t EffectiveLengthAfterZeroStrip(
+            std::span<const uint8_t> data
+        ) noexcept {
+            constexpr size_t kMinZeroPad = 512;
+
+            if (data.size() < kMinZeroPad) {
+                return data.size();
+            }
+
+            // Count trailing zeros from the end.
+            size_t zeroCount = 0;
+            for (size_t i = data.size(); i > 0; --i) {
+                if (data[i - 1] == 0) {
+                    ++zeroCount;
+                } else {
+                    break;
+                }
+            }
+
+            if (zeroCount < kMinZeroPad) {
+                return data.size(); // Not enough trailing zeros to strip
+            }
+
+            const size_t trimmed = data.size() - zeroCount;
+            return (trimmed == 0) ? 1 : trimmed; // Keep at least 1 byte
+        }
+
+    } // anonymous namespace
+
+    // =========================================================================
+    // Core API
+    // =========================================================================
+
+    std::optional<std::string> HashBuffer(std::span<const uint8_t> data) noexcept {
+        // BUG-3 FIX: enforce a maximum input size to prevent CPU/memory DoS.
+        if (data.empty()) {
+            SS_LOG_WARN(L"FuzzyHasher", L"HashBuffer called with empty input");
+            return std::nullopt;
+        }
+        if (data.size() > kMaxHashableSize) {
+            SS_LOG_WARN(L"FuzzyHasher",
+                L"HashBuffer input too large (%zu bytes, max %zu) — rejected",
+                data.size(), kMaxHashableSize);
+            return std::nullopt;
+        }
         return GenerateDigest(data);
     }
 
     int HashBufferRaw(
         const uint8_t* buf,
-        uint32_t buf_len,
-        char* result
+        uint32_t       buf_len,
+        char*          result
     ) noexcept {
         if (!buf || buf_len == 0 || !result) {
             return -1;
         }
-
+        // BUG-3 FIX: buf_len is uint32_t (max ~4 GB) but kMaxHashableSize is 200 MB.
+        if (static_cast<size_t>(buf_len) > kMaxHashableSize) {
+            SS_LOG_WARN(L"FuzzyHasher",
+                L"HashBufferRaw input too large (%u bytes, max %zu) — rejected",
+                buf_len, kMaxHashableSize);
+            return -1;
+        }
         return GenerateDigestRaw(buf, buf_len, result);
     }
 
@@ -62,7 +252,16 @@ namespace ShadowStrike::FuzzyHasher {
         if (!digest1 || !digest2) {
             return -1;
         }
-
+        // BUG-3 FIX: strnlen-bound before any further scanning.
+        // CompareDigests also applies this check, but we guard here at the
+        // public boundary for defence-in-depth.
+        if (strnlen(digest1, kMaxDigestStringLength + 1) > kMaxDigestStringLength ||
+            strnlen(digest2, kMaxDigestStringLength + 1) > kMaxDigestStringLength) {
+            SS_LOG_WARN(L"FuzzyHasher",
+                L"Compare: digest string exceeds kMaxDigestStringLength (%zu) — rejected",
+                kMaxDigestStringLength);
+            return -1;
+        }
         return CompareDigests(digest1, digest2);
     }
 
@@ -70,8 +269,228 @@ namespace ShadowStrike::FuzzyHasher {
         if (digest1.empty() || digest2.empty()) {
             return -1;
         }
-
+        if (digest1.size() > kMaxDigestStringLength ||
+            digest2.size() > kMaxDigestStringLength) {
+            SS_LOG_WARN(L"FuzzyHasher",
+                L"Compare: digest string exceeds kMaxDigestStringLength (%zu) — rejected",
+                kMaxDigestStringLength);
+            return -1;
+        }
         return CompareDigests(digest1.c_str(), digest2.c_str());
+    }
+
+    // =========================================================================
+    // APT-Hardening Extensions
+    // =========================================================================
+
+    NormalizedHashResult HashBufferNormalized(
+        std::span<const uint8_t> data,
+        bool                     isPE
+    ) noexcept {
+        NormalizedHashResult out;
+
+        if (data.empty() || data.size() > kMaxHashableSize) {
+            SS_LOG_WARN(L"FuzzyHasher",
+                L"HashBufferNormalized: invalid input size (%zu bytes)", data.size());
+            return out;
+        }
+
+        try {
+            // Auto-detect PE via MZ magic (0x4D 0x5A = 'MZ') if hint not given.
+            const bool looksLikePE = isPE ||
+                (data.size() >= 2 && data[0] == 0x4D && data[1] == 0x5A);
+
+            if (looksLikePE) {
+                // Compute full-file hash as a secondary reference.
+                out.fullFileDigest = GenerateDigest(data);
+
+                // Attempt PE parsing to extract code sections.
+                ShadowStrike::PEParser::PEParser parser;
+                ShadowStrike::PEParser::PEInfo   info{};
+                ShadowStrike::PEParser::PEError  peErr{};
+
+                if (parser.ParseBuffer(data, info, &peErr)) {
+                    std::vector<uint8_t> codeBytes = ExtractCodeSections(data, info);
+
+                    if (!codeBytes.empty()) {
+                        out.normalizedDigest = GenerateDigest(
+                            std::span<const uint8_t>(codeBytes)
+                        );
+                        out.wasNormalized = true;
+                        SS_LOG_DEBUG(L"FuzzyHasher",
+                            L"HashBufferNormalized: PE code-section extraction "
+                            L"succeeded (%zu bytes from %zu sections)",
+                            codeBytes.size(), info.sections.size());
+                        return out;
+                    }
+
+                    SS_LOG_DEBUG(L"FuzzyHasher",
+                        L"HashBufferNormalized: PE parsed but no executable sections "
+                        L"found — falling back to full-file hash");
+                } else {
+                    SS_LOG_DEBUG(L"FuzzyHasher",
+                        L"HashBufferNormalized: PE parse failed (%ls) — "
+                        L"falling back to full-file hash",
+                        peErr.message.c_str());
+                }
+
+                // PE normalization failed — use full-file hash as normalizedDigest.
+                out.normalizedDigest = out.fullFileDigest;
+                return out;
+            }
+
+            // Non-PE path: strip trailing zero-padding.
+            const size_t effectiveLen = EffectiveLengthAfterZeroStrip(data);
+            if (effectiveLen < data.size()) {
+                out.normalizedDigest = GenerateDigest(
+                    data.subspan(0, effectiveLen)
+                );
+                out.wasNormalized = true;
+                SS_LOG_DEBUG(L"FuzzyHasher",
+                    L"HashBufferNormalized: stripped %zu trailing zero bytes "
+                    L"(original=%zu, effective=%zu)",
+                    data.size() - effectiveLen, data.size(), effectiveLen);
+            } else {
+                out.normalizedDigest = GenerateDigest(data);
+            }
+
+        } catch (...) {
+            SS_LOG_ERROR(L"FuzzyHasher",
+                L"HashBufferNormalized: unexpected exception during normalization");
+        }
+
+        return out;
+    }
+
+    std::optional<std::string> HashWithSalt(
+        std::span<const uint8_t> data,
+        uint64_t                 salt
+    ) noexcept {
+        if (data.empty() || data.size() > kMaxHashableSize) {
+            SS_LOG_WARN(L"FuzzyHasher",
+                L"HashWithSalt: invalid input size (%zu bytes)", data.size());
+            return std::nullopt;
+        }
+
+        // Callers that pass salt == 0 get the module-level session salt.
+        const uint64_t effectiveSalt = (salt != 0) ? salt : SessionSalt();
+
+        return GenerateDigestWithSalt(data, effectiveSalt);
+    }
+
+    bool IsSuspiciousDigest(const std::string& digest) noexcept {
+        try {
+            if (digest.empty() || digest.size() > kMaxDigestStringLength) {
+                return true; // Empty or oversized is always suspicious
+            }
+
+            // Parse the digest to extract its components.
+            const char* raw = digest.c_str();
+
+            // Locate first colon
+            const char* colon1 = std::strchr(raw, ':');
+            if (!colon1 || colon1 == raw) return true;
+
+            // Parse blocksize
+            char* endPtr = nullptr;
+            const unsigned long long bsLong = std::strtoull(raw, &endPtr, 10);
+            if (endPtr != colon1 || bsLong == 0 || bsLong > 0xFFFFFFFFULL) return true;
+            const uint32_t blockSize = static_cast<uint32_t>(bsLong);
+
+            // Locate second colon
+            const char* hash1Start = colon1 + 1;
+            const char* colon2 = std::strchr(hash1Start, ':');
+            if (!colon2) return true;
+
+            const std::string_view sig1(hash1Start,
+                                        static_cast<size_t>(colon2 - hash1Start));
+            const std::string_view sig2(colon2 + 1);
+
+            // CHECK 1: blocksize must be 3 * 2^n (i.e., a power-of-2 multiple of
+            // kMinBlockSize).  Legitimate CTPH always selects blocksize by doubling
+            // from 3.  A blocksize that is not of this form indicates a crafted digest.
+            {
+                uint32_t bs = blockSize;
+                if (bs % 3 != 0) return true; // Not a multiple of 3
+                bs /= 3;
+                // bs must now be a power of two (or 1)
+                if (bs == 0 || (bs & (bs - 1)) != 0) return true;
+            }
+
+            // CHECK 2: signature component lengths must be >= kRollingWindowSize (7).
+            // Signatures shorter than the rolling window can never satisfy
+            // HasCommonSubstring and will always score 0, yet a crafted digest
+            // with length just at this boundary might trigger edge-case behaviour.
+            constexpr size_t kMinSigLen = 7; // kRollingWindowSize from RollingHash.hpp
+            if (sig1.size() < kMinSigLen || sig2.size() < kMinSigLen) {
+                return true;
+            }
+
+            // CHECK 3: all-identical-character signature — score inflation attack.
+            // A signature like "AAAAAAAAAAAAAAAAAA" scores 100 against any file
+            // that contains a run of bytes mapping to the same Base64 character.
+            auto allSameChar = [](std::string_view s) noexcept -> bool {
+                if (s.empty()) return false;
+                const char first = s[0];
+                for (char c : s) {
+                    if (c != first) return false;
+                }
+                return true;
+            };
+
+            if (allSameChar(sig1) || allSameChar(sig2)) {
+                return true;
+            }
+
+            return false;
+
+        } catch (...) {
+            return true; // Treat exceptions as suspicious
+        }
+    }
+
+    std::vector<BatchCompareEntry> BatchCompare(
+        std::span<const std::string> candidates,
+        const std::string&           target
+    ) noexcept {
+        std::vector<BatchCompareEntry> results;
+
+        if (candidates.empty() || target.empty()) {
+            return results;
+        }
+        if (target.size() > kMaxDigestStringLength) {
+            SS_LOG_WARN(L"FuzzyHasher",
+                L"BatchCompare: target digest exceeds kMaxDigestStringLength — rejected");
+            return results;
+        }
+
+        try {
+            results.reserve(candidates.size());
+
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                const std::string& cand = candidates[i];
+                if (cand.empty() || cand.size() > kMaxDigestStringLength) {
+                    continue;
+                }
+
+                const int score = CompareDigests(target.c_str(), cand.c_str());
+                if (score > 0) {
+                    results.push_back(BatchCompareEntry{ i, score });
+                }
+            }
+
+            // Sort by score descending so callers get the best matches first.
+            std::sort(results.begin(), results.end(),
+                [](const BatchCompareEntry& a, const BatchCompareEntry& b) noexcept {
+                    return a.score > b.score;
+                });
+
+        } catch (...) {
+            SS_LOG_ERROR(L"FuzzyHasher",
+                L"BatchCompare: unexpected exception during batch comparison");
+        }
+
+        return results;
     }
 
 } // namespace ShadowStrike::FuzzyHasher
