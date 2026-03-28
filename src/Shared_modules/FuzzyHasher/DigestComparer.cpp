@@ -78,13 +78,16 @@ namespace ShadowStrike::FuzzyHasher {
                 return false;
             }
 
-            // Parse blocksize
+            // BUG-2 FIX: use strtoull (64-bit) instead of strtoul (32-bit on Windows).
+            // On Windows, unsigned long is 32 bits. strtoul overflow returns ULONG_MAX
+            // (0xFFFFFFFF), making the check bs > 0xFFFFFFFFul always false — a crafted
+            // blocksize of 4294967295 would bypass the guard and cascade into BUG-1.
             char* endPtr = nullptr;
-            const unsigned long bs = std::strtoul(digest, &endPtr, 10);
-            if (endPtr != colon1 || bs == 0 || bs > 0xFFFFFFFFul) {
+            const unsigned long long bsLong = std::strtoull(digest, &endPtr, 10);
+            if (endPtr != colon1 || bsLong == 0 || bsLong > 0xFFFFFFFFULL) {
                 return false;
             }
-            out.blockSize = static_cast<uint32_t>(bs);
+            out.blockSize = static_cast<uint32_t>(bsLong);
 
             // Find second colon — separates hash1 from hash2
             const char* hash1Start = colon1 + 1;
@@ -145,6 +148,12 @@ namespace ShadowStrike::FuzzyHasher {
          * then confirms with a direct comparison. This dramatically reduces
          * false positives for low-score comparisons.
          *
+         * Inputs are bounded by kMaxSignatureComponentLength (64 chars) by the
+         * caller, so worst-case work is 64×64 = 4 096 hash comparisons.
+         * The memcmp path is marked [[unlikely]] because hash collisions in a
+         * 7-byte rolling window over a 64-entry array are rare; it exists only
+         * as a correctness gate against hash collisions.
+         *
          * @return true if a common substring of sufficient length exists
          */
         [[nodiscard]] bool HasCommonSubstring(
@@ -155,7 +164,8 @@ namespace ShadowStrike::FuzzyHasher {
                 return false;
             }
 
-            // Compute rolling hash at each position in s1
+            // Both inputs are bounded to kMaxSignatureComponentLength (64) by
+            // ParseDigest validation, so these arrays are always sufficient.
             constexpr size_t kMaxHashes = kMaxSignatureComponentLength;
             std::array<uint32_t, kMaxHashes> hashes{};
 
@@ -166,21 +176,20 @@ namespace ShadowStrike::FuzzyHasher {
                 }
             }
 
-            // For each position in s2, compute rolling hash and check against s1's hashes
             {
                 RollingHash roller;
                 for (size_t i = 0; i < s2.size(); ++i) {
                     const uint32_t h = roller.Update(static_cast<uint8_t>(s2[i]));
 
-                    // Need at least kRollingWindowSize bytes before we have a valid window
                     if (i < kRollingWindowSize - 1) {
                         continue;
                     }
 
-                    // Check against all valid hash positions in s1
                     for (size_t j = kRollingWindowSize - 1; j < s1.size(); ++j) {
-                        if (hashes[j] == h) {
-                            // Hash match — verify with direct string comparison
+                        if (hashes[j] == h) [[unlikely]] {
+                            // Hash match — confirm with direct string comparison.
+                            // [[unlikely]]: rolling-hash collisions over 7-byte windows
+                            // in 64-char inputs are rare; memcmp is a correctness gate.
                             const size_t s2Start = i - (kRollingWindowSize - 1);
                             const size_t s1Start = j - (kRollingWindowSize - 1);
 
@@ -257,9 +266,17 @@ namespace ShadowStrike::FuzzyHasher {
             score = 100 - score;
 
             // Cap score for small blocksizes to avoid exaggerating matches
-            // on very short inputs
+            // on very short inputs.
+            // BUG-1 FIX: cap calculation uses uint64_t to prevent overflow.
+            // With blockSize up to 0x80000000 and minLen up to 64:
+            //   (0x80000000 / 3) * 64 = 45,812,984,832 — overflows uint32_t.
+            // Clamp the cap to [0, 100] since score is already in that range.
             const uint32_t minLen = std::min(len1, len2);
-            const uint32_t cap = (blockSize / kMinBlockSize) * minLen;
+            const uint64_t capU64 = (static_cast<uint64_t>(blockSize) / kMinBlockSize)
+                                  * static_cast<uint64_t>(minLen);
+            const uint32_t cap = static_cast<uint32_t>(
+                std::min(capU64, static_cast<uint64_t>(100u))
+            );
             if (score > cap) {
                 score = cap;
             }
@@ -271,6 +288,20 @@ namespace ShadowStrike::FuzzyHasher {
 
     int CompareDigests(const char* digest1, const char* digest2) noexcept {
         try {
+            // BUG-3 FIX: bound the strchr scan in ParseDigest by verifying that
+            // both strings are within a safe maximum length before touching them.
+            // A null-terminator-less string passed by a hostile caller would
+            // cause strchr to scan arbitrarily far into memory.
+            //
+            // Maximum valid digest length:
+            //   blocksize (10 chars for uint32_t max) + ':' + sig1 (64) + ':' + sig2 (32) = 109
+            // We allow 200 chars to be generous but still bound the scan.
+            constexpr size_t kMaxDigestLen = 200;
+            if (strnlen(digest1, kMaxDigestLen + 1) > kMaxDigestLen ||
+                strnlen(digest2, kMaxDigestLen + 1) > kMaxDigestLen) {
+                return -1;
+            }
+
             ParsedDigest d1, d2;
 
             if (!ParseDigest(digest1, d1) || !ParseDigest(digest2, d2)) {
