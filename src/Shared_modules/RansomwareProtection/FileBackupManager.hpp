@@ -542,6 +542,31 @@ struct BackupStatistics {
     [[nodiscard]] std::string ToJson() const;
 };
 
+/**
+ * @brief Thread-safe snapshot of backup statistics (non-atomic, copyable by value)
+ *
+ * BackupStatistics contains std::atomic members and cannot be returned by value.
+ * This snapshot captures a consistent point-in-time view for callers.
+ */
+struct BackupStatisticsSnapshot {
+    uint64_t filesBackedUp = 0;
+    uint64_t filesRestored = 0;
+    uint64_t filesCommitted = 0;
+    uint64_t backupFailures = 0;
+    uint64_t restoreFailures = 0;
+    uint64_t bytesBackedUp = 0;
+    uint64_t bytesRestored = 0;
+    uint64_t currentRamUsage = 0;
+    uint64_t currentDiskUsage = 0;
+    uint64_t activeBackups = 0;
+    TimePoint startTime;
+
+    /**
+     * @brief Serialize to JSON
+     */
+    [[nodiscard]] std::string ToJson() const;
+};
+
 // ============================================================================
 // CALLBACK TYPES
 // ============================================================================
@@ -745,7 +770,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] BackupStatistics GetStatistics() const;
+    [[nodiscard]] BackupStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     // ========================================================================
