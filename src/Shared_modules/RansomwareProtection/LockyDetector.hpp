@@ -114,6 +114,7 @@
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/NetworkUtils.hpp"
 #include "../PatternStore/PatternStore.hpp"
+#include "../HashStore/HashStore.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -141,13 +142,76 @@ namespace LockyConstants {
         L".zzzzz", L".osiris", L".diablo6", L".lukitus", L".ykcol"
     };
     
-    /// @brief Ransom note patterns
+    /// @brief Ransom note patterns (all known Locky variants)
     inline constexpr const wchar_t* RANSOM_NOTE_PATTERNS[] = {
         L"_Locky_recover_instructions.txt",
         L"_HELP_instructions.html",
         L"_HOWDO_text.html",
-        L"info.html"
+        L"_HOWDO_text.bmp",
+        L"_README_.html",
+        L"_README_.txt",
+        L"_README_.bmp",
+        L"info.html",
+        L"info.bmp",
+        L"DesktopOSIRIS.htm",
+        L"DesktopOSIRIS.bmp",
+        L"OSIRIS.htm",
+        L"OSIRIS.bmp",
+        L"diablo6.htm",
+        L"diablo6.bmp",
+        L"lukitus.htm",
+        L"lukitus.bmp"
     };
+
+    // ====================================================================
+    // BEHAVIORAL THRESHOLDS
+    // ====================================================================
+
+    /// @brief Default correlation window in seconds
+    inline constexpr uint32_t DEFAULT_CORRELATION_WINDOW_SECS = 60;
+
+    /// @brief Mass-rename threshold within correlation window
+    inline constexpr uint32_t DEFAULT_MASS_RENAME_THRESHOLD = 10;
+
+    /// @brief Mass-write threshold within correlation window
+    inline constexpr uint32_t DEFAULT_MASS_WRITE_THRESHOLD = 25;
+
+    /// @brief High-entropy threshold (Shannon)
+    inline constexpr double HIGH_ENTROPY_THRESHOLD = 7.5;
+
+    // ====================================================================
+    // DETECTION SCORE WEIGHTS
+    // ====================================================================
+
+    inline constexpr double SCORE_KNOWN_HASH          = 100.0;
+    inline constexpr double SCORE_LOCKY_EXT_RENAME    =  25.0;
+    inline constexpr double SCORE_MASS_RENAME          =  20.0;
+    inline constexpr double SCORE_HIGH_ENTROPY_WRITE   =  15.0;
+    inline constexpr double SCORE_RANSOM_NOTE           =  30.0;
+    inline constexpr double SCORE_VSS_DESTRUCTION       =  35.0;
+    inline constexpr double SCORE_REGISTRY_PERSISTENCE  =  20.0;
+    inline constexpr double SCORE_WALLPAPER_CHANGE      =  15.0;
+    inline constexpr double SCORE_DGA_DOMAIN            =  25.0;
+    inline constexpr double SCORE_GUID_MUTEX            =  15.0;
+    inline constexpr double SCORE_DROPPER_BEHAVIOR      =  20.0;
+    inline constexpr double SCORE_MEMORY_PATTERN        =  30.0;
+    inline constexpr double SCORE_MULTI_DIR_ACTIVITY    =  15.0;
+    inline constexpr double SCORE_HEX_RENAME_PATTERN    =  20.0;
+
+    // ====================================================================
+    // CONFIDENCE THRESHOLDS
+    // ====================================================================
+
+    inline constexpr double CONFIDENCE_LOW_THRESHOLD       = 20.0;
+    inline constexpr double CONFIDENCE_MEDIUM_THRESHOLD    = 45.0;
+    inline constexpr double CONFIDENCE_HIGH_THRESHOLD      = 70.0;
+    inline constexpr double CONFIDENCE_CONFIRMED_THRESHOLD = 90.0;
+
+    /// @brief Maximum tracked processes to prevent memory exhaustion
+    inline constexpr size_t MAX_TRACKED_PROCESSES = 2048;
+
+    /// @brief Stale process entry age in seconds
+    inline constexpr uint32_t STALE_PROCESS_AGE_SECS = 600;
 }
 
 // ============================================================================
@@ -243,6 +307,9 @@ struct LockyDetectionResult {
     /// @brief Files encrypted count
     uint32_t filesEncrypted = 0;
     
+    /// @brief Accumulated behavioral score
+    double score = 0.0;
+    
     /// @brief Detection time
     SystemTimePoint detectionTime;
     
@@ -273,6 +340,24 @@ struct LockyDetectorConfiguration {
     
     /// @brief Auto-terminate on detection
     bool autoTerminate = true;
+    
+    /// @brief Correlation window for behavioral events (seconds)
+    uint32_t correlationWindowSecs = LockyConstants::DEFAULT_CORRELATION_WINDOW_SECS;
+    
+    /// @brief Mass rename threshold (renames within correlation window)
+    uint32_t massRenameThreshold = LockyConstants::DEFAULT_MASS_RENAME_THRESHOLD;
+    
+    /// @brief Mass write threshold (writes within correlation window)
+    uint32_t massWriteThreshold = LockyConstants::DEFAULT_MASS_WRITE_THRESHOLD;
+    
+    /// @brief Score threshold for alerts
+    double scoreAlertThreshold = LockyConstants::CONFIDENCE_MEDIUM_THRESHOLD;
+    
+    /// @brief Score threshold for auto-kill
+    double scoreBlockThreshold = LockyConstants::CONFIDENCE_HIGH_THRESHOLD;
+    
+    /// @brief Whitelisted process names (case-insensitive)
+    std::vector<std::wstring> whitelistedProcesses;
     
     /// @brief Verbose logging
     bool verboseLogging = false;
@@ -384,6 +469,89 @@ public:
     [[nodiscard]] bool AnalyzeEncryptedFile(std::wstring_view filePath);
     
     // ========================================================================
+    // BEHAVIORAL EVENT HANDLERS
+    // ========================================================================
+    
+    /**
+     * @brief Process a file rename event (from kernel minifilter)
+     * @param pid Process performing the rename
+     * @param oldPath Original file path
+     * @param newPath New file path (with potentially Locky extension)
+     * @return Detection result if score exceeds alert threshold
+     */
+    [[nodiscard]] std::optional<LockyDetectionResult> OnFileRename(
+        uint32_t pid, std::wstring_view oldPath, std::wstring_view newPath);
+    
+    /**
+     * @brief Process a file write event
+     * @param pid Process performing the write
+     * @param filePath File being written
+     * @param dataSize Bytes written
+     * @param entropy Shannon entropy of written data (0-8)
+     * @return Detection result if score exceeds alert threshold
+     */
+    [[nodiscard]] std::optional<LockyDetectionResult> OnFileWrite(
+        uint32_t pid, std::wstring_view filePath,
+        size_t dataSize, double entropy);
+    
+    /**
+     * @brief Process a process creation event (dropper chain detection)
+     * @param pid New process PID
+     * @param parentPid Parent process PID
+     * @param imagePath Executable path
+     * @param commandLine Full command line
+     * @return Detection result if score exceeds alert threshold
+     */
+    [[nodiscard]] std::optional<LockyDetectionResult> OnProcessCreate(
+        uint32_t pid, uint32_t parentPid,
+        std::wstring_view imagePath, std::wstring_view commandLine);
+    
+    /**
+     * @brief Process a DNS query event (DGA detection)
+     * @param pid Process making the query
+     * @param domain Domain being queried
+     * @return Detection result if score exceeds alert threshold
+     */
+    [[nodiscard]] std::optional<LockyDetectionResult> OnDnsQuery(
+        uint32_t pid, std::string_view domain);
+    
+    /**
+     * @brief Process a registry write event
+     * @param pid Process writing registry
+     * @param keyPath Full registry key path
+     * @param valueName Value name being written
+     * @param data Value data
+     * @return Detection result if score exceeds alert threshold
+     */
+    [[nodiscard]] std::optional<LockyDetectionResult> OnRegistryWrite(
+        uint32_t pid, std::wstring_view keyPath,
+        std::wstring_view valueName, std::wstring_view data);
+    
+    /**
+     * @brief Process a mutex creation event
+     * @param pid Process creating the mutex
+     * @param mutexName Mutex name
+     * @return Detection result if score exceeds alert threshold
+     */
+    [[nodiscard]] std::optional<LockyDetectionResult> OnMutexCreate(
+        uint32_t pid, std::wstring_view mutexName);
+    
+    /**
+     * @brief Get accumulated score for a process
+     */
+    [[nodiscard]] double GetProcessScore(uint32_t pid) const;
+    
+    /**
+     * @brief Build detection result from accumulated behavioral state
+     */
+    [[nodiscard]] LockyDetectionResult BuildResultFromBehavior(uint32_t pid) const;
+    
+    /**
+     * @brief Purge stale process tracking entries
+     */
+    void PurgeStaleProcesses();
+    
+    // ========================================================================
     // PATTERN MANAGEMENT
     // ========================================================================
     
@@ -391,6 +559,11 @@ public:
      * @brief Add known C2 domain
      */
     void AddKnownC2Domain(std::string_view domain);
+    
+    /**
+     * @brief Add known malicious hash (SHA-256 hex lowercase)
+     */
+    void AddKnownHash(std::string_view sha256Hex);
     
     /**
      * @brief Add known extension

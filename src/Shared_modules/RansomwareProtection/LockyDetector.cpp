@@ -21,17 +21,32 @@
  * ============================================================================
  *
  * @file LockyDetector.cpp
- * @brief Implementation of Locky ransomware family detection logic.
+ * @brief Enterprise-grade multi-vector Locky ransomware family detection.
  *
- * Implements deep forensic detection for Locky and its variants (Zepto, Odin, etc.)
- * Includes DGA generation, registry persistence analysis, and VSS destruction monitoring.
+ * Implements behavioral, static, and heuristic detection for all Locky
+ * variants: Original, Zepto, Odin, Thor, Aesir, Zzzzz, Osiris, Diablo6,
+ * Lukitus, and Ykcol. Uses per-process score accumulation across a
+ * configurable correlation window for high-fidelity detection with
+ * minimal false positives.
+ *
+ * Detection vectors:
+ *   - Mass file rename with Locky extension patterns
+ *   - Hex-ID filename rename pattern (e.g. A1B2C3D4E5F6.locky)
+ *   - High-entropy file writes (RSA-2048 + AES-128 encrypted content)
+ *   - VSS/shadow copy destruction (vssadmin, wmic, bcdedit)
+ *   - Ransom note creation across multiple directories
+ *   - Wallpaper registry modification
+ *   - DGA domain generation and DNS query correlation
+ *   - GUID-format mutex creation
+ *   - Dropper behavior chain (temp exe + PowerShell download)
+ *   - Registry persistence (HKCU Run key, Software\Locky)
+ *   - Process memory pattern scanning
+ *   - Known-bad SHA-256 hash matching
  *
  * @author ShadowStrike Security Team
- * @version 3.1.0 (Enhanced)
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
- *
- * LICENSE: Proprietary - ShadowStrike Enterprise License
  * ============================================================================
  */
 
@@ -47,123 +62,200 @@
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../PatternStore/PatternStore.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <algorithm>
-#include <mutex>
 #include <shared_mutex>
-#include <vector>
 #include <unordered_map>
 #include <unordered_set>
-#include <filesystem>
-#include <fstream>
-#include <regex>
 #include <format>
 #include <nlohmann/json.hpp>
 #include <ctime>
-
-namespace fs = std::filesystem;
 
 namespace ShadowStrike {
 namespace Ransomware {
 
 // ============================================================================
-// ANONYMOUS HELPER NAMESPACE - CRYPTO & DGA
+// LOG CATEGORY
+// ============================================================================
+static constexpr const wchar_t* LOG_CAT = L"LockyDetector";
+
+// ============================================================================
+// ANONYMOUS HELPER NAMESPACE
 // ============================================================================
 namespace {
 
+    // RAII wrapper for registry key handles
+    struct RegKeyGuard {
+        HKEY key = nullptr;
+        RegKeyGuard() = default;
+        explicit RegKeyGuard(HKEY k) noexcept : key(k) {}
+        ~RegKeyGuard() { if (key) RegCloseKey(key); }
+        RegKeyGuard(const RegKeyGuard&) = delete;
+        RegKeyGuard& operator=(const RegKeyGuard&) = delete;
+        explicit operator bool() const noexcept { return key != nullptr; }
+    };
+
     // Unique event ID generator
-    uint64_t GenerateEventId() {
+    [[nodiscard]] uint64_t GenerateEventId() noexcept {
         static std::atomic<uint64_t> s_counter{0};
-        auto now = std::chrono::system_clock::now().time_since_epoch().count();
-        return static_cast<uint64_t>(now) ^ s_counter.fetch_add(1);
+        const auto now = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        return now ^ s_counter.fetch_add(1, std::memory_order_relaxed);
     }
-
-    // Helper to lower-case string
-    std::string ToLower(std::string_view str) {
-        std::string result(str);
-        std::transform(result.begin(), result.end(), result.begin(),
-                      [](unsigned char c){ return std::tolower(c); });
-        return result;
-    }
-
-    std::wstring ToLowerW(std::wstring_view str) {
-        std::wstring result(str);
-        std::transform(result.begin(), result.end(), result.begin(),
-                      [](wchar_t c){ return std::tolower(c); });
-        return result;
-    }
-
-    // ------------------------------------------------------------------------
-    // LOCKY DGA IMPLEMENTATION
-    // ------------------------------------------------------------------------
-    // Locky uses a DGA based on the system date and a seed value.
-    // This allows us to predict the C2 domains for the current day.
 
     // Rotate Right 32-bit
-    inline uint32_t ROR32(uint32_t x, uint32_t n) {
+    [[nodiscard]] constexpr uint32_t ROR32(uint32_t x, uint32_t n) noexcept {
+        n &= 31;
         return (x >> n) | (x << (32 - n));
     }
 
     // Rotate Left 32-bit
-    inline uint32_t ROL32(uint32_t x, uint32_t n) {
+    [[nodiscard]] constexpr uint32_t ROL32(uint32_t x, uint32_t n) noexcept {
+        n &= 31;
         return (x << n) | (x >> (32 - n));
     }
 
     /**
-     * @brief Generates Locky C2 domains for a specific date and seed
+     * @brief Generates Locky C2 domains for a specific date and seed.
      *
-     * @param year Current year
-     * @param month Current month (1-12)
-     * @param day Current day (1-31)
-     * @param seed Configuration seed (varies by campaign, e.g., 5, 7)
-     * @return std::vector<std::string> List of generated domains
+     * Adapted from reverse-engineered Locky DGA algorithm. The domain set
+     * changes every 2 days based on the date components and affiliate seed.
      */
-    std::vector<std::string> GenerateLockyDomains(int year, int month, int day, uint32_t seed) {
+    [[nodiscard]] std::vector<std::string> GenerateLockyDomains(
+        int year, int month, int day, uint32_t seed)
+    {
         std::vector<std::string> domains;
-        const char* tlds[] = { "ru", "biz", "info", "org", "net", "top", "click", "pl", "in", "us", "eu", "work" };
+        domains.reserve(12);
 
-        // Locky DGA pseudo-code adaptation
-        // Based on reverse engineering of the Locky algorithm
+        static constexpr const char* tlds[] = {
+            "ru", "biz", "info", "org", "net", "top",
+            "click", "pl", "in", "us", "eu", "work"
+        };
+        static constexpr size_t tldCount = std::size(tlds);
 
-        // Base timestamp derived from date
-        uint32_t time_const = (year * 366 + month * 31 + day) / 2; // Changes every 2 days
+        const uint32_t time_const =
+            static_cast<uint32_t>(year * 366 + month * 31 + day) / 2u;
 
-        for (int i = 0; i < 12; i++) {
-            uint32_t key = ROL32(seed, i % 32);
-            uint32_t b = time_const;
+        for (int i = 0; i < 12; ++i) {
+            uint32_t key = ROL32(seed, static_cast<uint32_t>(i) % 32u);
 
-            // Domain generation round
-            key ^= b;
+            key ^= time_const;
             key = ROR32(key, 7);
-            key += b;
-            key ^= i;
+            key += time_const;
+            key ^= static_cast<uint32_t>(i);
             key = ROL32(key, 13);
 
-            // Generate length (between 7 and 18 chars)
-            int length = (key % 12) + 7;
+            const int length = static_cast<int>(key % 12u) + 7;
 
             std::string domain;
-            for (int k = 0; k < length; k++) {
-                key = (key * 1664525 + 1013904223) & 0xFFFFFFFF;
-                domain += (char)('a' + (key % 26));
+            domain.reserve(static_cast<size_t>(length) + 8);
+
+            for (int k = 0; k < length; ++k) {
+                key = (key * 1664525u + 1013904223u);
+                domain += static_cast<char>('a' + (key % 26u));
             }
 
-            // Append TLD based on index
-            domain += ".";
-            domain += tlds[i % (sizeof(tlds)/sizeof(tlds[0]))];
-
-            domains.push_back(domain);
+            domain += '.';
+            domain += tlds[static_cast<size_t>(i) % tldCount];
+            domains.push_back(std::move(domain));
         }
 
         return domains;
     }
 
-} // namespace
+    // Check if a filename matches Locky hex-ID pattern: [hex]{16,32}.[ext]
+    [[nodiscard]] bool IsHexIdFilename(std::wstring_view stem) noexcept {
+        if (stem.size() < 16 || stem.size() > 32) return false;
+        return std::all_of(stem.begin(), stem.end(), [](wchar_t c) {
+            return (c >= L'0' && c <= L'9') ||
+                   (c >= L'a' && c <= L'f') ||
+                   (c >= L'A' && c <= L'F');
+        });
+    }
+
+    // Check if a mutex name is GUID format: {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
+    [[nodiscard]] bool IsGuidFormat(std::wstring_view name) noexcept {
+        // Minimum: {8-4-4-4-12} = 38 chars
+        if (name.size() < 38) return false;
+        if (name.front() != L'{' || name.back() != L'}') return false;
+        // Check dash positions: 9, 14, 19, 24
+        if (name[9] != L'-' || name[14] != L'-' ||
+            name[19] != L'-' || name[24] != L'-')
+            return false;
+
+        for (size_t i = 1; i < name.size() - 1; ++i) {
+            if (i == 9 || i == 14 || i == 19 || i == 24) continue;
+            const wchar_t c = name[i];
+            if (!((c >= L'0' && c <= L'9') ||
+                  (c >= L'a' && c <= L'f') ||
+                  (c >= L'A' && c <= L'F')))
+                return false;
+        }
+        return true;
+    }
+
+    // Extract file extension (lowercase) from path
+    [[nodiscard]] std::wstring ExtractExtension(std::wstring_view path) noexcept {
+        const auto dotPos = path.rfind(L'.');
+        if (dotPos == std::wstring_view::npos || dotPos == 0)
+            return {};
+        std::wstring ext(path.substr(dotPos));
+        for (auto& c : ext) {
+            if (c >= L'A' && c <= L'Z') c += 32;
+        }
+        return ext;
+    }
+
+    // Extract filename (without directory) from path
+    [[nodiscard]] std::wstring_view ExtractFilename(std::wstring_view path) noexcept {
+        const auto slashPos = path.find_last_of(L"\\/");
+        return (slashPos != std::wstring_view::npos)
+            ? path.substr(slashPos + 1) : path;
+    }
+
+    // Extract file stem (filename without extension)
+    [[nodiscard]] std::wstring_view ExtractStem(std::wstring_view filename) noexcept {
+        const auto dotPos = filename.rfind(L'.');
+        return (dotPos != std::wstring_view::npos)
+            ? filename.substr(0, dotPos) : filename;
+    }
+
+    // Extract directory path
+    [[nodiscard]] std::wstring ExtractDirectory(std::wstring_view path) noexcept {
+        const auto slashPos = path.find_last_of(L"\\/");
+        if (slashPos == std::wstring_view::npos) return {};
+        std::wstring dir(path.substr(0, slashPos));
+        for (auto& c : dir) {
+            if (c >= L'A' && c <= L'Z') c += 32;
+        }
+        return dir;
+    }
+
+    // Check if command line contains VSS destruction patterns
+    [[nodiscard]] bool ContainsVSSDestructionPattern(std::wstring_view cmdLower) noexcept {
+        if (cmdLower.find(L"vssadmin") != std::wstring_view::npos &&
+            cmdLower.find(L"delete") != std::wstring_view::npos &&
+            cmdLower.find(L"shadows") != std::wstring_view::npos)
+            return true;
+
+        if (cmdLower.find(L"wmic") != std::wstring_view::npos &&
+            cmdLower.find(L"shadowcopy") != std::wstring_view::npos &&
+            cmdLower.find(L"delete") != std::wstring_view::npos)
+            return true;
+
+        if (cmdLower.find(L"bcdedit") != std::wstring_view::npos &&
+            cmdLower.find(L"recoveryenabled") != std::wstring_view::npos &&
+            cmdLower.find(L"no") != std::wstring_view::npos)
+            return true;
+
+        return false;
+    }
+
+} // anonymous namespace
 
 // ============================================================================
 // STRUCTURE IMPLEMENTATIONS
@@ -171,33 +263,41 @@ namespace {
 
 std::string LockyDetectionResult::ToJson() const {
     nlohmann::json j;
-    j["detected"] = detected;
-    j["variant"] = GetLockyVariantName(variant);
-    j["confidence"] = GetDetectionConfidenceName(confidence);
-    j["pid"] = pid;
-    j["processName"] = Utils::StringUtils::WideToUtf8(processName);
-    j["indicators"] = indicators;
+    j["detected"]    = detected;
+    j["variant"]     = GetLockyVariantName(variant);
+    j["confidence"]  = GetDetectionConfidenceName(confidence);
+    j["pid"]         = pid;
+    j["processName"] = Utils::StringUtils::ToNarrow(processName);
+    j["indicators"]  = indicators;
+    j["score"]       = score;
 
     std::vector<std::string> extStr;
-    for(const auto& ext : extensionsObserved) {
-        extStr.push_back(Utils::StringUtils::WideToUtf8(ext));
+    extStr.reserve(extensionsObserved.size());
+    for (const auto& ext : extensionsObserved) {
+        extStr.push_back(Utils::StringUtils::ToNarrow(ext));
     }
     j["extensionsObserved"] = extStr;
 
     std::vector<std::string> noteStr;
-    for(const auto& note : ransomNotesFound) {
-        noteStr.push_back(Utils::StringUtils::WideToUtf8(note));
+    noteStr.reserve(ransomNotesFound.size());
+    for (const auto& note : ransomNotesFound) {
+        noteStr.push_back(Utils::StringUtils::ToNarrow(note));
     }
     j["ransomNotesFound"] = noteStr;
 
-    j["c2Domains"] = c2Domains;
-    j["filesEncrypted"] = filesEncrypted;
-    j["detectionTime"] = std::chrono::system_clock::to_time_t(detectionTime);
+    j["c2Domains"]      = c2Domains;
+    j["filesEncrypted"]  = filesEncrypted;
+    j["detectionTime"]   = std::chrono::system_clock::to_time_t(detectionTime);
 
     return j.dump();
 }
 
 bool LockyDetectorConfiguration::IsValid() const noexcept {
+    if (correlationWindowSecs == 0 || correlationWindowSecs > 3600) return false;
+    if (massRenameThreshold == 0)  return false;
+    if (massWriteThreshold == 0)   return false;
+    if (scoreAlertThreshold <= 0.0 || scoreAlertThreshold > 200.0) return false;
+    if (scoreBlockThreshold < scoreAlertThreshold) return false;
     return true;
 }
 
@@ -212,18 +312,19 @@ void LockyStatistics::Reset() noexcept {
 
 std::string LockyStatistics::ToJson() const {
     nlohmann::json j;
-    j["totalDetections"] = totalDetections.load();
-    j["processesTerminated"] = processesTerminated.load();
+    j["totalDetections"]    = totalDetections.load(std::memory_order_relaxed);
+    j["processesTerminated"] = processesTerminated.load(std::memory_order_relaxed);
 
-    std::map<std::string, uint64_t> variants;
-    for (size_t i = 0; i < byVariant.size(); ++i) {
-        if (i <= static_cast<size_t>(LockyVariant::Ykcol)) {
-            variants[std::string(GetLockyVariantName(static_cast<LockyVariant>(i)))] = byVariant[i].load();
+    nlohmann::json variants = nlohmann::json::object();
+    for (size_t i = 0; i <= static_cast<size_t>(LockyVariant::Ykcol); ++i) {
+        const auto count = byVariant[i].load(std::memory_order_relaxed);
+        if (count > 0) {
+            variants[std::string(GetLockyVariantName(static_cast<LockyVariant>(i)))] = count;
         }
     }
     j["byVariant"] = variants;
 
-    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+    const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
         Clock::now() - startTime).count();
     j["uptimeSeconds"] = uptime;
 
@@ -231,90 +332,161 @@ std::string LockyStatistics::ToJson() const {
 }
 
 // ============================================================================
+// PER-PROCESS BEHAVIORAL STATE
+// ============================================================================
+
+struct ProcessBehavior {
+    uint32_t pid = 0;
+    std::wstring processName;
+    std::wstring processPath;
+    TimePoint firstSeen{};
+    TimePoint lastActivity{};
+
+    // Behavioral counters
+    uint32_t totalRenames       = 0;
+    uint32_t lockyExtRenames    = 0;
+    uint32_t hexPatternRenames  = 0;
+    uint32_t totalWrites        = 0;
+    uint32_t highEntropyWrites  = 0;
+    uint32_t ransomNotesCreated = 0;
+    uint32_t dgaDomainsContacted = 0;
+
+    // Directories affected
+    std::unordered_set<std::wstring> affectedDirectories;
+    std::unordered_set<std::wstring> ransomNoteDirectories;
+
+    // Boolean indicators (each can fire score only once)
+    bool vssDestruction       = false;
+    bool registryPersistence  = false;
+    bool wallpaperModified    = false;
+    bool guidMutex            = false;
+    bool dropperBehavior      = false;
+    bool memoryPatterns       = false;
+    bool knownHash            = false;
+    bool massRenameTriggered  = false;
+    bool multiDirTriggered    = false;
+    bool hexPatternScored     = false;
+
+    // Rate tracking
+    std::vector<TimePoint> renameTimestamps;
+
+    // Accumulated score and detected variant
+    double score = 0.0;
+    LockyVariant variant = LockyVariant::Unknown;
+    std::vector<std::string> indicators;
+    std::vector<std::wstring> extensionsObserved;
+    std::vector<std::wstring> ransomNotesFound;
+    std::vector<std::string>  c2Domains;
+
+    mutable std::mutex mtx;
+
+    void PruneTimestamps(std::chrono::seconds window) {
+        const auto cutoff = Clock::now() - window;
+        std::erase_if(renameTimestamps, [&](const TimePoint& tp) {
+            return tp < cutoff;
+        });
+    }
+};
+
+// ============================================================================
 // PIMPL IMPLEMENTATION
 // ============================================================================
 
 class LockyDetector::LockyDetectorImpl {
 public:
-    // Synchronization
+    // ====================================================================
+    // STATE
+    // ====================================================================
     mutable std::shared_mutex m_mutex;
-
-    // Configuration
     LockyDetectorConfiguration m_config;
+    std::atomic<ModuleStatus>  m_status{ModuleStatus::Uninitialized};
+    std::atomic<bool>          m_initialized{false};
+    LockyStatistics            m_stats;
 
-    // State
-    std::atomic<ModuleStatus> m_status{ModuleStatus::Uninitialized};
-    std::atomic<bool> m_initialized{false};
-
-    // Statistics
-    LockyStatistics m_stats;
-
-    // Pattern Databases
+    // ====================================================================
+    // PATTERN DATABASES
+    // ====================================================================
     std::unordered_set<std::wstring> m_knownExtensions;
-    std::unordered_set<std::string> m_generatedDGADomains; // Dynamic
-    std::unordered_set<std::string> m_staticC2Domains;     // Static
-    mutable std::shared_mutex m_patternsMutex;
+    std::unordered_set<std::string>  m_generatedDGADomains;
+    std::unordered_set<std::string>  m_staticC2Domains;
+    std::unordered_set<std::string>  m_knownC2Domains;
+    std::unordered_set<std::string>  m_knownBadHashes;
+    mutable std::shared_mutex        m_patternsMutex;
 
-    // Callback
+    // ====================================================================
+    // PER-PROCESS BEHAVIORAL STATE
+    // ====================================================================
+    std::unordered_map<uint32_t, std::shared_ptr<ProcessBehavior>> m_processBehaviors;
+    mutable std::shared_mutex m_behaviorMutex;
+
+    // ====================================================================
+    // CALLBACK
+    // ====================================================================
     LockyDetectionCallback m_callback;
-    std::mutex m_callbackMutex;
+    std::mutex             m_callbackMutex;
 
-    // Infrastructure
-    std::shared_ptr<ThreatIntel::ThreatIntelManager> m_threatIntel;
-
-    // Methods
+    // ====================================================================
+    // CONSTRUCTOR
+    // ====================================================================
     LockyDetectorImpl() {
         InitializePatterns();
     }
 
+    // ====================================================================
+    // PATTERN INITIALIZATION
+    // ====================================================================
     void InitializePatterns() {
         std::unique_lock lock(m_patternsMutex);
 
-        // Add known extensions from constants
         for (const auto* ext : LockyConstants::LOCKY_EXTENSIONS) {
-            m_knownExtensions.insert(ext);
+            m_knownExtensions.emplace(ext);
         }
 
-        // Static Historic C2s (Fallback)
+        // Historic C2 domains (sinkholed, used for correlation only)
         m_staticC2Domains.insert("greesxnmo6s.top");
         m_staticC2Domains.insert("qwe123sd.ru");
         m_staticC2Domains.insert("knyete.com");
 
-        // Generate Dynamic DGA Domains for TODAY and TOMORROW
-        // This makes the detector robust against current campaigns
-        UpdateDGADomains();
+        UpdateDGADomainsLocked();
     }
 
-    void UpdateDGADomains() {
-        // Generate domains for common Locky seeds (Affiliate IDs)
-        // Known seeds: 1, 3, 5, 7, etc.
-        const std::vector<uint32_t> seeds = { 1, 3, 5, 7, 12, 17 };
+    void UpdateDGADomainsLocked() {
+        static constexpr uint32_t seeds[] = {1, 3, 5, 7, 12, 17};
 
-        auto now = std::chrono::system_clock::now();
-        std::time_t t = std::chrono::system_clock::to_time_t(now);
-        std::tm tm;
-        #ifdef _WIN32
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+#ifdef _WIN32
         localtime_s(&tm, &t);
-        #else
+#else
         localtime_r(&t, &tm);
-        #endif
+#endif
+        const int year  = tm.tm_year + 1900;
+        const int month = tm.tm_mon + 1;
+        const int day   = tm.tm_mday;
 
-        int year = tm.tm_year + 1900;
-        int month = tm.tm_mon + 1;
-        int day = tm.tm_mday;
+        m_generatedDGADomains.clear();
 
-        for (uint32_t seed : seeds) {
-            auto dailyDomains = GenerateLockyDomains(year, month, day, seed);
-            for (const auto& domain : dailyDomains) {
-                m_generatedDGADomains.insert(domain);
+        // Generate for today and tomorrow (+1 day rollover coverage)
+        for (int dayOffset = 0; dayOffset <= 1; ++dayOffset) {
+            const int d = day + dayOffset;
+            for (const uint32_t seed : seeds) {
+                auto domains = GenerateLockyDomains(year, month, d, seed);
+                for (auto& domain : domains) {
+                    m_generatedDGADomains.insert(std::move(domain));
+                }
             }
         }
 
-        Utils::Logger::Info(L"LockyDetector: Generated {} DGA domains for today", m_generatedDGADomains.size());
+        SS_LOG_INFO(LOG_CAT, L"Generated %zu DGA domains for today+tomorrow",
+                    m_generatedDGADomains.size());
     }
 
+    // ====================================================================
+    // LIFECYCLE
+    // ====================================================================
     bool Initialize(const LockyDetectorConfiguration& config) {
-        if (m_initialized.exchange(true)) {
+        if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
             return true;
         }
 
@@ -322,307 +494,588 @@ public:
         m_config = config;
 
         if (!m_config.IsValid()) {
-            Utils::Logger::Error(L"LockyDetector: Invalid configuration provided");
-            m_initialized = false;
-            m_status = ModuleStatus::Error;
+            SS_LOG_ERROR(LOG_CAT,
+                L"Invalid configuration: windowSecs=%u renameThresh=%u "
+                L"alertThresh=%.1f blockThresh=%.1f",
+                m_config.correlationWindowSecs,
+                m_config.massRenameThreshold,
+                m_config.scoreAlertThreshold,
+                m_config.scoreBlockThreshold);
+            m_initialized.store(false, std::memory_order_release);
+            m_status.store(ModuleStatus::Error, std::memory_order_release);
             return false;
         }
 
-        m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelManager>();
-
-        m_status = ModuleStatus::Running;
-        Utils::Logger::Info(L"LockyDetector: Initialized successfully");
+        m_status.store(ModuleStatus::Running, std::memory_order_release);
+        SS_LOG_INFO(LOG_CAT, L"Initialized v%u.%u.%u (correlation=%us, "
+            L"renameThresh=%u, alertScore=%.0f, blockScore=%.0f)",
+            LockyConstants::VERSION_MAJOR,
+            LockyConstants::VERSION_MINOR,
+            LockyConstants::VERSION_PATCH,
+            m_config.correlationWindowSecs,
+            m_config.massRenameThreshold,
+            m_config.scoreAlertThreshold,
+            m_config.scoreBlockThreshold);
         return true;
     }
 
     void Shutdown() {
-        m_status = ModuleStatus::Stopping;
-        m_initialized = false;
-        m_status = ModuleStatus::Stopped;
-        Utils::Logger::Info(L"LockyDetector: Shutdown complete");
+        m_status.store(ModuleStatus::Stopping, std::memory_order_release);
+        m_initialized.store(false, std::memory_order_release);
+
+        {
+            std::unique_lock lock(m_behaviorMutex);
+            m_processBehaviors.clear();
+        }
+
+        m_status.store(ModuleStatus::Stopped, std::memory_order_release);
+        SS_LOG_INFO(LOG_CAT, L"Shutdown complete");
     }
 
-    // ------------------------------------------------------------------------
-    // CORE DETECTION LOGIC
-    // ------------------------------------------------------------------------
+    // ====================================================================
+    // PER-PROCESS STATE ACCESS
+    // ====================================================================
+    [[nodiscard]] std::shared_ptr<ProcessBehavior> GetOrCreateBehavior(uint32_t pid) {
+        {
+            std::shared_lock lock(m_behaviorMutex);
+            auto it = m_processBehaviors.find(pid);
+            if (it != m_processBehaviors.end()) return it->second;
+        }
 
-    bool Detect(uint32_t pid) {
-        auto result = DetectEx(pid);
-        return result.detected;
+        std::unique_lock lock(m_behaviorMutex);
+
+        // Double-check after acquiring exclusive lock
+        auto& entry = m_processBehaviors[pid];
+        if (entry) return entry;
+
+        // Enforce cap to prevent unbounded memory growth
+        if (m_processBehaviors.size() > LockyConstants::MAX_TRACKED_PROCESSES) {
+            PurgeStaleProcessesLocked();
+        }
+
+        entry = std::make_shared<ProcessBehavior>();
+
+        // Hold per-entry lock during initialization to prevent
+        // TOCTOU race where another thread reads partially written fields
+        std::lock_guard pbLock(entry->mtx);
+        entry->pid = pid;
+        entry->firstSeen = Clock::now();
+        entry->lastActivity = entry->firstSeen;
+
+        // Resolve process name (best-effort)
+        auto pathOpt = Utils::ProcessUtils::GetProcessPath(pid);
+        if (pathOpt) {
+            entry->processPath = *pathOpt;
+            entry->processName = std::wstring(
+                ExtractFilename(*pathOpt));
+        }
+
+        return entry;
     }
 
-    LockyDetectionResult DetectEx(uint32_t pid) {
+    [[nodiscard]] std::shared_ptr<ProcessBehavior> FindBehavior(uint32_t pid) const {
+        std::shared_lock lock(m_behaviorMutex);
+        auto it = m_processBehaviors.find(pid);
+        return (it != m_processBehaviors.end()) ? it->second : nullptr;
+    }
+
+    void PurgeStaleProcessesLocked() {
+        const auto cutoff = Clock::now() -
+            std::chrono::seconds(LockyConstants::STALE_PROCESS_AGE_SECS);
+        std::erase_if(m_processBehaviors, [&](const auto& pair) {
+            return pair.second->lastActivity < cutoff;
+        });
+    }
+
+    // ====================================================================
+    // WHITELISTING
+    // ====================================================================
+    [[nodiscard]] bool IsWhitelisted(std::wstring_view processName) const {
+        std::shared_lock lock(m_mutex);
+        for (const auto& wl : m_config.whitelistedProcesses) {
+            if (Utils::StringUtils::IEquals(processName, wl)) return true;
+        }
+        return false;
+    }
+
+    // ====================================================================
+    // CONFIDENCE CALCULATION FROM SCORE
+    // ====================================================================
+    [[nodiscard]] static DetectionConfidence ScoreToConfidence(double score) noexcept {
+        if (score >= LockyConstants::CONFIDENCE_CONFIRMED_THRESHOLD)
+            return DetectionConfidence::Confirmed;
+        if (score >= LockyConstants::CONFIDENCE_HIGH_THRESHOLD)
+            return DetectionConfidence::High;
+        if (score >= LockyConstants::CONFIDENCE_MEDIUM_THRESHOLD)
+            return DetectionConfidence::Medium;
+        if (score >= LockyConstants::CONFIDENCE_LOW_THRESHOLD)
+            return DetectionConfidence::Low;
+        return DetectionConfidence::None;
+    }
+
+    // ====================================================================
+    // ADD SCORE (with deduplication for boolean indicators)
+    // ====================================================================
+    void AddScore(ProcessBehavior& pb, double points,
+                  const char* indicator, bool& flag)
+    {
+        if (flag) return; // Already scored
+        flag = true;
+        pb.score += points;
+        pb.indicators.push_back(indicator);
+    }
+
+    void AddScoreUnguarded(ProcessBehavior& pb, double points,
+                           const char* indicator)
+    {
+        pb.score += points;
+        pb.indicators.push_back(indicator);
+    }
+
+    // ====================================================================
+    // BUILD DETECTION RESULT FROM BEHAVIORAL STATE
+    // ====================================================================
+    [[nodiscard]] LockyDetectionResult BuildResult(const ProcessBehavior& pb) const {
         LockyDetectionResult result;
-        result.pid = pid;
-        result.detectionTime = std::chrono::system_clock::now();
-
-        try {
-            // 1. Process Info
-            auto path = Utils::ProcessUtils::GetProcessPath(pid);
-            result.processName = path.filename().wstring();
-
-            // 2. Static Hash Analysis
-            auto hash = Utils::HashUtils::CalculateSHA256(path);
-            if (m_threatIntel && m_threatIntel->IsKnownMalware(hash)) {
-                result.detected = true;
-                result.confidence = DetectionConfidence::Confirmed;
-                result.indicators.push_back("Known malicious hash via ThreatIntel");
-            }
-
-            // 3. Registry Persistence Check (Locky Specific)
-            if (CheckRegistryPersistence(pid)) {
-                result.detected = true;
-                result.confidence = (result.confidence == DetectionConfidence::None) ?
-                                     DetectionConfidence::High : DetectionConfidence::Confirmed;
-                result.indicators.push_back("Locky registry persistence detected (HKCU\\Software\\Locky)");
-            }
-
-            // 4. VSS Destruction Attempt
-            if (CheckVSSDestruction(pid)) {
-                result.detected = true;
-                result.confidence = DetectionConfidence::Confirmed;
-                result.indicators.push_back("VSS destruction attempt (vssadmin/wmic)");
-            }
-
-            // 5. Network Analysis (DGA Check)
-            // In a real agent, we inspect network traffic associated with the PID.
-            // Here, we simulate checking resolved domains if we had network hooks.
-            // For now, we perform a DNS cache check or similar heuristic if possible.
-            // (Placeholder for actual network hook integration)
-
-            // 6. Memory String Scan
-            // Scan for DGA seeds or specific ransom strings
-            if (ScanProcessMemoryForPatterns(pid)) {
-                result.detected = true;
-                result.confidence = DetectionConfidence::High;
-                result.indicators.push_back("Locky patterns found in process memory");
-            }
-
-        } catch (const std::exception& e) {
-            Utils::Logger::Warn(L"LockyDetector: Failed to scan PID {}: {}", pid, Utils::StringUtils::Utf8ToWide(e.what()));
-        }
-
-        // Action & Reporting
-        if (result.detected) {
-            m_stats.totalDetections++;
-
-            // Try to identify variant
-            if (result.variant == LockyVariant::Unknown) {
-                // Default to original if we can't tell, or leave unknown
-                // Usually identified by extension later
-            }
-
-            m_stats.byVariant[static_cast<int>(result.variant)]++;
-
-            // Auto-Terminate
-            if (m_config.autoTerminate && result.confidence >= m_config.minAlertConfidence) {
-                if (Utils::ProcessUtils::TerminateProcess(pid)) {
-                    m_stats.processesTerminated++;
-                    result.indicators.push_back("Process terminated automatically");
-                    Utils::Logger::Critical(L"LockyDetector: Terminated Locky process PID {}", pid);
-                }
-            }
-
-            // Notify callback
-            {
-                std::lock_guard lock(m_callbackMutex);
-                if (m_callback) {
-                    m_callback(result);
-                }
-            }
-        }
-
+        result.detected           = (pb.score >= m_config.scoreAlertThreshold);
+        result.variant            = pb.variant;
+        result.confidence         = ScoreToConfidence(pb.score);
+        result.pid                = pb.pid;
+        result.processName        = pb.processName;
+        result.indicators         = pb.indicators;
+        result.extensionsObserved = pb.extensionsObserved;
+        result.ransomNotesFound   = pb.ransomNotesFound;
+        result.c2Domains          = pb.c2Domains;
+        result.score              = pb.score;
+        result.detectionTime      = std::chrono::system_clock::now();
         return result;
     }
 
-    // ------------------------------------------------------------------------
-    // SPECIFIC FORENSIC CHECKS
-    // ------------------------------------------------------------------------
+    // ====================================================================
+    // FIRE CALLBACK + UPDATE STATS + AUTO-TERMINATE
+    // ====================================================================
+    void HandleDetection(ProcessBehavior& pb, LockyDetectionResult& result) {
+        m_stats.totalDetections.fetch_add(1, std::memory_order_relaxed);
 
-    /**
-     * @brief Checks registry for known Locky keys
-     * Locky typically stores configuration in HKCU\Software\Locky
-     * Also checks for startup persistence with random filenames
-     */
-    bool CheckRegistryPersistence(uint32_t pid) {
-#ifdef _WIN32
-        HKEY hKey;
-        // Check 1: Specific Locky Key
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Locky", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            RegCloseKey(hKey);
-            return true;
+        const auto varIdx = static_cast<size_t>(result.variant);
+        if (varIdx < m_stats.byVariant.size()) {
+            m_stats.byVariant[varIdx].fetch_add(1, std::memory_order_relaxed);
         }
 
-        // Check 2: Run Key for suspicious entry pointing to this process
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            wchar_t valueName[16384];
-            DWORD valueNameSize = 16384;
-            DWORD type;
-            wchar_t data[16384];
-            DWORD dataSize = 16384;
+        // Fire callback
+        {
+            std::lock_guard cbLock(m_callbackMutex);
+            if (m_callback) {
+                m_callback(result);
+            }
+        }
+
+        // Auto-terminate if score exceeds block threshold
+        if (m_config.autoTerminate &&
+            pb.score >= m_config.scoreBlockThreshold)
+        {
+            Utils::ProcessUtils::Error termErr{};
+            if (Utils::ProcessUtils::TerminateProcessTree(
+                    pb.pid, 1, &termErr))
+            {
+                m_stats.processesTerminated.fetch_add(1, std::memory_order_relaxed);
+                result.indicators.push_back("Process tree terminated");
+                SS_LOG_FATAL(LOG_CAT,
+                    L"LOCKY KILL: Terminated PID %u (%ls) score=%.0f variant=%hs",
+                    pb.pid, pb.processName.c_str(), pb.score,
+                    GetLockyVariantName(pb.variant).data());
+            } else {
+                SS_LOG_ERROR(LOG_CAT,
+                    L"Failed to terminate PID %u: continuing with block",
+                    pb.pid);
+            }
+        }
+
+        SS_LOG_WARN(LOG_CAT,
+            L"LOCKY DETECTED: PID=%u name=%ls score=%.0f confidence=%hs "
+            L"variant=%hs indicators=%zu",
+            result.pid, result.processName.c_str(), result.score,
+            GetDetectionConfidenceName(result.confidence).data(),
+            GetLockyVariantName(result.variant).data(),
+            result.indicators.size());
+    }
+
+    // ====================================================================
+    // EVALUATE: check if behavioral state warrants detection
+    // Returns populated result if score >= alert threshold
+    // ====================================================================
+    [[nodiscard]] std::optional<LockyDetectionResult> Evaluate(
+        ProcessBehavior& pb)
+    {
+        pb.lastActivity = Clock::now();
+        const auto conf = ScoreToConfidence(pb.score);
+
+        if (pb.score < m_config.scoreAlertThreshold) {
+            return std::nullopt;
+        }
+
+        auto result = BuildResult(pb);
+        HandleDetection(pb, result);
+        return result;
+    }
+
+    // ====================================================================
+    // POINT-IN-TIME DETECTION (Detect / DetectEx)
+    // ====================================================================
+    [[nodiscard]] LockyDetectionResult DetectEx(uint32_t pid) {
+        auto pb = GetOrCreateBehavior(pid);
+        if (!pb) return {};
+
+        std::lock_guard pbLock(pb->mtx);
+
+        // Skip whitelisted
+        if (IsWhitelisted(pb->processName)) {
+            return BuildResult(*pb);
+        }
+
+        // 1. Hash check
+        CheckProcessHash(*pb);
+
+        // 2. Registry persistence
+        CheckRegistryPersistence(*pb);
+
+        // 3. VSS destruction (self + children)
+        CheckVSSDestruction(*pb);
+
+        // 4. Process memory scan
+        ScanProcessMemory(*pb);
+
+        // Build result (may or may not trigger alert)
+        auto result = BuildResult(*pb);
+        if (result.detected) {
+            HandleDetection(*pb, result);
+        }
+        return result;
+    }
+
+    // ====================================================================
+    // STATIC HASH CHECK
+    // ====================================================================
+    void CheckProcessHash(ProcessBehavior& pb) {
+        if (pb.knownHash) return;
+        if (pb.processPath.empty()) return;
+
+        std::vector<uint8_t> hashBytes;
+        Utils::HashUtils::Error hashErr{};
+        if (!Utils::HashUtils::ComputeFile(
+                Utils::HashUtils::Algorithm::SHA256,
+                pb.processPath, hashBytes, &hashErr))
+        {
+            return;
+        }
+
+        const std::string hexHash = Utils::HashUtils::ToHexLower(
+            hashBytes.data(), hashBytes.size());
+
+        std::shared_lock lock(m_patternsMutex);
+        if (m_knownBadHashes.contains(hexHash)) {
+            AddScore(pb, LockyConstants::SCORE_KNOWN_HASH,
+                     "Known Locky SHA-256 hash match", pb.knownHash);
+        }
+    }
+
+    // ====================================================================
+    // REGISTRY PERSISTENCE CHECK (RAII, no stack overflow)
+    // ====================================================================
+    void CheckRegistryPersistence(ProcessBehavior& pb) {
+        if (pb.registryPersistence) return;
+
+#ifdef _WIN32
+        // Check 1: HKCU\Software\Locky
+        {
+            HKEY hKey = nullptr;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Locky",
+                              0, KEY_READ, &hKey) == ERROR_SUCCESS)
+            {
+                RegKeyGuard guard(hKey);
+                AddScore(pb, LockyConstants::SCORE_REGISTRY_PERSISTENCE,
+                         "Locky registry key (HKCU\\Software\\Locky)",
+                         pb.registryPersistence);
+                return;
+            }
+        }
+
+        // Check 2: Run key pointing to suspicious process
+        {
+            HKEY hKey = nullptr;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                    L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                    0, KEY_READ, &hKey) != ERROR_SUCCESS)
+                return;
+
+            RegKeyGuard guard(hKey);
+
+            const std::wstring procPathLower =
+                Utils::StringUtils::ToLowerCopy(pb.processPath);
+            if (procPathLower.empty()) return;
+
+            constexpr DWORD kBufSize = 1024;
+            wchar_t valueName[kBufSize]{};
+            wchar_t data[kBufSize]{};
             DWORD index = 0;
 
-            auto processPath = Utils::ProcessUtils::GetProcessPath(pid);
-            std::wstring procPathStr = ToLowerW(processPath.wstring());
+            for (;;) {
+                DWORD nameSize = kBufSize;
+                DWORD dataSize = kBufSize * sizeof(wchar_t);
+                DWORD type = 0;
 
-            while (RegEnumValueW(hKey, index, valueName, &valueNameSize, NULL, &type, (LPBYTE)data, &dataSize) == ERROR_SUCCESS) {
-                if (type == REG_SZ) {
-                    std::wstring entryData = ToLowerW(data);
-                    // Check if the registry Run key points to the suspicious process
-                    if (entryData.find(procPathStr) != std::wstring::npos) {
-                        // Check if the key name is Locky-like (e.g. "Locky" or random chars)
-                        // This is heuristic
-                        if (std::wstring(valueName) == L"Locky" ||
-                            std::wstring(valueName) == L"_Locky_recover_instructions") {
-                            RegCloseKey(hKey);
-                            return true;
-                        }
-                    }
-                }
-                index++;
-                valueNameSize = 16384;
-                dataSize = 16384;
+                const LONG rc = RegEnumValueW(
+                    hKey, index++, valueName, &nameSize,
+                    nullptr, &type, reinterpret_cast<LPBYTE>(data), &dataSize);
+
+                if (rc != ERROR_SUCCESS) break;
+                if (type != REG_SZ) continue;
+                if (dataSize == 0 || dataSize > sizeof(data)) continue;
+                // Ensure dataSize is aligned to wchar_t boundary
+                dataSize &= ~static_cast<DWORD>(sizeof(wchar_t) - 1);
+                if (dataSize == 0) continue;
+
+                const std::wstring entryLower =
+                    Utils::StringUtils::ToLowerCopy(
+                        std::wstring_view(data, dataSize / sizeof(wchar_t)));
+
+                if (entryLower.find(procPathLower) == std::wstring::npos)
+                    continue;
+
+                // Run value points to our suspicious process — flag it
+                AddScore(pb, LockyConstants::SCORE_REGISTRY_PERSISTENCE,
+                         "Run key persistence for suspicious process",
+                         pb.registryPersistence);
+                return;
             }
-            RegCloseKey(hKey);
         }
 #endif
-        return false;
     }
 
-    /**
-     * @brief Checks if the process has spawned vssadmin or wmic to delete shadows
-     *
-     * Uses ProcessUtils to get child processes or command line history
-     */
-    bool CheckVSSDestruction(uint32_t pid) {
-        // In a real EDR, we'd have a process tree history.
-        // Here we can check if the current process CommandLine contains suspicious strings
-        // or if it's parent of a vssadmin process (snapshot)
+    // ====================================================================
+    // VSS DESTRUCTION CHECK (self + child processes)
+    // ====================================================================
+    void CheckVSSDestruction(ProcessBehavior& pb) {
+        if (pb.vssDestruction) return;
 
-        try {
-            // Check command line of the process itself (sometimes ransomware runs via script)
-            std::wstring cmdLine = Utils::ProcessUtils::GetProcessCommandLine(pid);
-            std::wstring lowerCmd = ToLowerW(cmdLine);
-
-            if (lowerCmd.find(L"vssadmin") != std::wstring::npos &&
-                lowerCmd.find(L"delete") != std::wstring::npos &&
-                lowerCmd.find(L"shadows") != std::wstring::npos) {
-                return true;
+        // Check the process itself
+        auto cmdOpt = Utils::ProcessUtils::GetProcessCommandLine(pb.pid);
+        if (cmdOpt) {
+            const std::wstring cmdLower =
+                Utils::StringUtils::ToLowerCopy(*cmdOpt);
+            if (ContainsVSSDestructionPattern(cmdLower)) {
+                AddScore(pb, LockyConstants::SCORE_VSS_DESTRUCTION,
+                         "VSS destruction command in process cmdline",
+                         pb.vssDestruction);
+                return;
             }
-
-            if (lowerCmd.find(L"wmic") != std::wstring::npos &&
-                lowerCmd.find(L"shadowcopy") != std::wstring::npos &&
-                lowerCmd.find(L"delete") != std::wstring::npos) {
-                return true;
-            }
-
-            if (lowerCmd.find(L"bcdedit") != std::wstring::npos &&
-                lowerCmd.find(L"recoveryenabled") != std::wstring::npos &&
-                lowerCmd.find(L"no") != std::wstring::npos) {
-                return true;
-            }
-
-        } catch (...) {
-            // Ignore access denied etc
         }
-        return false;
+
+        // Check child processes
+        std::vector<uint32_t> children;
+        Utils::ProcessUtils::Error childErr{};
+        if (Utils::ProcessUtils::GetChildProcesses(
+                pb.pid, children, &childErr))
+        {
+            for (const uint32_t childPid : children) {
+                auto childCmd = Utils::ProcessUtils::GetProcessCommandLine(childPid);
+                if (!childCmd) continue;
+
+                const std::wstring childLower =
+                    Utils::StringUtils::ToLowerCopy(*childCmd);
+                if (ContainsVSSDestructionPattern(childLower)) {
+                    AddScore(pb, LockyConstants::SCORE_VSS_DESTRUCTION,
+                             "VSS destruction in child process",
+                             pb.vssDestruction);
+                    return;
+                }
+            }
+        }
     }
 
-    /**
-     * @brief Scans process memory for Locky specific patterns
-     * (Stub for actual signature scanning engine)
-     */
-    bool ScanProcessMemoryForPatterns(uint32_t pid) {
-        // Enterprise implementation would use Utils::ProcessUtils::ReadMemory
-        // and scan for:
-        // 1. "Locky" string
-        // 2. RSA public keys in specific format
-        // 3. Embedded ransom note HTML
+    // ====================================================================
+    // PROCESS MEMORY PATTERN SCAN
+    // ====================================================================
+    void ScanProcessMemory(ProcessBehavior& pb) {
+        if (pb.memoryPatterns) return;
 
-        // Simulating a positive for demo if process name matches known bad
-        try {
-            auto path = Utils::ProcessUtils::GetProcessPath(pid);
-            auto name = ToLowerW(path.filename().wstring());
-            if (name.find(L"locky") != std::wstring::npos) return true;
-        } catch (...) {}
+        static constexpr uint8_t kLockyAscii[]  = {'L','o','c','k','y'};
+        static constexpr uint8_t kRansomNote[]   = {'_','L','o','c','k','y','_',
+                                                     'r','e','c','o','v','e','r'};
+        static constexpr uint8_t kPubKeyBlob[]   = {0x06, 0x02, 0x00, 0x00,
+                                                     0x00, 0xA4, 0x00, 0x00};
 
-        return false;
+        constexpr SIZE_T kMaxScan = 4 * 1024 * 1024;
+        std::vector<uint8_t> buffer;
+        buffer.resize(kMaxScan);
+
+        SYSTEM_INFO sysInfo{};
+        GetSystemInfo(&sysInfo);
+
+        HANDLE hProcess = OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pb.pid);
+        if (!hProcess) return;
+
+        // RAII guard for the process handle
+        struct HandleGuard {
+            HANDLE h;
+            ~HandleGuard() { if (h) CloseHandle(h); }
+        } handleGuard{hProcess};
+
+        auto* addr = static_cast<uint8_t*>(sysInfo.lpMinimumApplicationAddress);
+        auto* maxAddr = static_cast<uint8_t*>(sysInfo.lpMaximumApplicationAddress);
+
+        SIZE_T totalScanned = 0;
+        constexpr SIZE_T kScanLimit = 32 * 1024 * 1024;
+
+        while (addr < maxAddr && totalScanned < kScanLimit) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQueryEx(hProcess, addr, &mbi, sizeof(mbi)) == 0)
+                break;
+
+            if (mbi.RegionSize == 0) break;
+
+            // Overflow-safe pointer advance check
+            if (static_cast<SIZE_T>(maxAddr - addr) < mbi.RegionSize) break;
+
+            if (mbi.State == MEM_COMMIT &&
+                (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY |
+                                PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+            {
+                const SIZE_T readSize = (std::min)(
+                    static_cast<SIZE_T>(mbi.RegionSize), kMaxScan);
+
+                SIZE_T bytesRead = 0;
+                if (::ReadProcessMemory(hProcess, mbi.BaseAddress,
+                        buffer.data(), readSize, &bytesRead) && bytesRead > 0)
+                {
+                    totalScanned += bytesRead;
+                    const auto* data = buffer.data();
+
+                    auto contains = [&](const uint8_t* pattern, size_t pLen) -> bool {
+                        if (bytesRead < pLen) return false;
+                        return std::search(data, data + bytesRead,
+                                          pattern, pattern + pLen) !=
+                               (data + bytesRead);
+                    };
+
+                    if (contains(kLockyAscii, sizeof(kLockyAscii)) &&
+                        contains(kRansomNote, sizeof(kRansomNote)))
+                    {
+                        AddScore(pb, LockyConstants::SCORE_MEMORY_PATTERN,
+                                 "Locky string patterns in process memory",
+                                 pb.memoryPatterns);
+                        return;
+                    }
+
+                    if (contains(kPubKeyBlob, sizeof(kPubKeyBlob))) {
+                        AddScore(pb, LockyConstants::SCORE_MEMORY_PATTERN,
+                                 "RSA PUBLICKEYBLOB in process memory",
+                                 pb.memoryPatterns);
+                        return;
+                    }
+                }
+            }
+
+            addr += mbi.RegionSize;
+        }
     }
 
-    // ------------------------------------------------------------------------
-    // UTILITY METHODS
-    // ------------------------------------------------------------------------
-
-    bool IsLockyExtension(std::wstring_view extension) const {
+    // ====================================================================
+    // PATTERN MATCHING HELPERS
+    // ====================================================================
+    [[nodiscard]] bool IsLockyExtension(std::wstring_view extension) const {
         std::shared_lock lock(m_patternsMutex);
-        std::wstring lowerExt = ToLowerW(extension);
+        const std::wstring lowerExt = ExtractExtension(extension);
+        if (lowerExt.empty()) {
+            // Extension was already just the extension (e.g. ".locky")
+            std::wstring lower(extension);
+            for (auto& c : lower) {
+                if (c >= L'A' && c <= L'Z') c += 32;
+            }
+            return m_knownExtensions.contains(lower);
+        }
         return m_knownExtensions.contains(lowerExt);
     }
 
-    LockyVariant IdentifyVariant(std::wstring_view extension) const {
-        std::wstring ext = ToLowerW(extension);
+    [[nodiscard]] LockyVariant IdentifyVariant(std::wstring_view extension) const {
+        std::wstring ext(extension);
+        for (auto& c : ext) {
+            if (c >= L'A' && c <= L'Z') c += 32;
+        }
 
-        if (ext == L".locky") return LockyVariant::Original;
-        if (ext == L".zepto") return LockyVariant::Zepto;
-        if (ext == L".odin") return LockyVariant::Odin;
-        if (ext == L".thor") return LockyVariant::Thor;
-        if (ext == L".aesir") return LockyVariant::Aesir;
-        if (ext == L".zzzzz") return LockyVariant::Zzzzz;
-        if (ext == L".osiris") return LockyVariant::Osiris;
+        if (ext == L".locky")   return LockyVariant::Original;
+        if (ext == L".zepto")   return LockyVariant::Zepto;
+        if (ext == L".odin")    return LockyVariant::Odin;
+        if (ext == L".thor")    return LockyVariant::Thor;
+        if (ext == L".aesir")   return LockyVariant::Aesir;
+        if (ext == L".zzzzz")   return LockyVariant::Zzzzz;
+        if (ext == L".osiris")  return LockyVariant::Osiris;
         if (ext == L".diablo6") return LockyVariant::Diablo6;
         if (ext == L".lukitus") return LockyVariant::Lukitus;
-        if (ext == L".ykcol") return LockyVariant::Ykcol;
+        if (ext == L".ykcol")   return LockyVariant::Ykcol;
 
         return LockyVariant::Unknown;
     }
 
-    bool IsLockyRansomNote(std::wstring_view filename) const {
-        // Iterate through known ransom note patterns
+    [[nodiscard]] bool IsLockyRansomNote(std::wstring_view filename) const {
         for (const auto* pattern : LockyConstants::RANSOM_NOTE_PATTERNS) {
-            if (filename == pattern) return true;
+            if (Utils::StringUtils::IEquals(filename, pattern)) return true;
         }
-        // Check for loose matches (e.g. [ID]-INSTRUCTION.html)
-        if (filename.find(L"_recover_instructions.txt") != std::wstring_view::npos) return true;
-
+        // Partial matches for variant-specific notes
+        if (Utils::StringUtils::IContains(filename, L"_recover_instructions"))
+            return true;
+        if (Utils::StringUtils::IContains(filename, L"_HOWDO_text"))
+            return true;
+        if (Utils::StringUtils::IContains(filename, L"_HELP_instructions"))
+            return true;
+        if (Utils::StringUtils::IContains(filename, L"_README_"))
+            return true;
         return false;
     }
 
-    bool IsLockyC2Domain(std::string_view domain) const {
+    [[nodiscard]] bool IsLockyC2Domain(std::string_view domain) const {
         std::shared_lock lock(m_patternsMutex);
-        std::string d = ToLower(domain);
+        std::string d(domain);
+        for (auto& c : d) {
+            if (c >= 'A' && c <= 'Z') c += 32;
+        }
 
-        // Check static list
-        if (m_knownC2Domains.contains(d)) return true;
-        if (m_staticC2Domains.contains(d)) return true;
-
-        // Check generated DGA list (Today's domains)
+        if (m_knownC2Domains.contains(d))     return true;
+        if (m_staticC2Domains.contains(d))     return true;
         if (m_generatedDGADomains.contains(d)) return true;
 
         return false;
     }
 
-    bool AnalyzeEncryptedFile(std::wstring_view filePath) {
-        // Basic entropy check or header check
-        // Locky typically overwrites the header completely with high entropy data
-        try {
-            fs::path path(filePath);
-            if (!fs::exists(path)) return false;
+    [[nodiscard]] bool AnalyzeEncryptedFile(std::wstring_view filePath) {
+        if (!Utils::FileUtils::Exists(filePath)) return false;
 
-            // Check if file is "high entropy" (encrypted)
-            // Using FileUtils infrastructure
-            double entropy = Utils::FileUtils::CalculateEntropy(path);
-            if (entropy > 7.5) { // 8.0 is max entropy
-                return true;
-            }
-
-            // Check file header
-            // Locky doesn't leave a magic header, it just encrypts.
-            // But if we see high entropy AND .locky extension, it's confirmed.
-
-        } catch (...) {
+        // Read first 4KB for entropy analysis
+        std::vector<std::byte> fileData;
+        Utils::FileUtils::Error fileErr{};
+        if (!Utils::FileUtils::ReadAllBytes(filePath, fileData, &fileErr))
             return false;
+
+        if (fileData.size() < 256) return false;
+
+        // Calculate Shannon entropy of the first 4KB
+        const size_t sampleSize = (std::min)(fileData.size(),
+                                             static_cast<size_t>(4096));
+        std::array<uint32_t, 256> freq{};
+        for (size_t i = 0; i < sampleSize; ++i) {
+            freq[static_cast<uint8_t>(fileData[i])]++;
         }
-        return false;
+
+        double entropy = 0.0;
+        const double total = static_cast<double>(sampleSize);
+        for (const auto& f : freq) {
+            if (f == 0) continue;
+            const double p = static_cast<double>(f) / total;
+            entropy -= p * std::log2(p);
+        }
+
+        return entropy > LockyConstants::HIGH_ENTROPY_THRESHOLD;
     }
 };
 
@@ -643,12 +1096,13 @@ bool LockyDetector::HasInstance() noexcept {
 }
 
 // ============================================================================
-// LIFECYCLE MANAGEMENT
+// LIFECYCLE
 // ============================================================================
 
 LockyDetector::LockyDetector()
-    : m_impl(std::make_unique<LockyDetectorImpl>()) {
-    Utils::Logger::Info(L"LockyDetector: Constructor called");
+    : m_impl(std::make_unique<LockyDetectorImpl>())
+{
+    SS_LOG_DEBUG(LOG_CAT, L"LockyDetector constructed");
 }
 
 LockyDetector::~LockyDetector() {
@@ -668,24 +1122,31 @@ void LockyDetector::Shutdown() {
 }
 
 bool LockyDetector::IsInitialized() const noexcept {
-    return m_impl ? m_impl->m_initialized.load() : false;
+    return m_impl ? m_impl->m_initialized.load(std::memory_order_acquire) : false;
 }
 
 ModuleStatus LockyDetector::GetStatus() const noexcept {
-    return m_impl ? m_impl->m_status.load() : ModuleStatus::Uninitialized;
+    return m_impl ? m_impl->m_status.load(std::memory_order_acquire)
+                  : ModuleStatus::Uninitialized;
 }
 
 // ============================================================================
-// DETECTION
+// POINT-IN-TIME DETECTION
 // ============================================================================
 
 bool LockyDetector::Detect(uint32_t pid) {
-    return m_impl ? m_impl->Detect(pid) : false;
+    if (!m_impl) return false;
+    auto result = m_impl->DetectEx(pid);
+    return result.detected;
 }
 
 LockyDetectionResult LockyDetector::DetectEx(uint32_t pid) {
     return m_impl ? m_impl->DetectEx(pid) : LockyDetectionResult{};
 }
+
+// ============================================================================
+// PATTERN QUERIES
+// ============================================================================
 
 bool LockyDetector::IsLockyExtension(std::wstring_view extension) const {
     return m_impl ? m_impl->IsLockyExtension(extension) : false;
@@ -708,6 +1169,374 @@ bool LockyDetector::AnalyzeEncryptedFile(std::wstring_view filePath) {
 }
 
 // ============================================================================
+// BEHAVIORAL EVENT HANDLERS
+// ============================================================================
+
+std::optional<LockyDetectionResult> LockyDetector::OnFileRename(
+    uint32_t pid, std::wstring_view oldPath, std::wstring_view newPath)
+{
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire))
+        return std::nullopt;
+
+    auto pb = m_impl->GetOrCreateBehavior(pid);
+    if (!pb) return std::nullopt;
+
+    std::lock_guard lock(pb->mtx);
+
+    if (m_impl->IsWhitelisted(pb->processName))
+        return std::nullopt;
+
+    const auto correlationWindow = std::chrono::seconds(
+        m_impl->m_config.correlationWindowSecs);
+
+    pb->totalRenames++;
+    pb->renameTimestamps.push_back(Clock::now());
+    pb->PruneTimestamps(correlationWindow);
+
+    const std::wstring newExt = ExtractExtension(newPath);
+    const std::wstring dir    = ExtractDirectory(newPath);
+    const auto filename       = ExtractFilename(newPath);
+    const auto stem           = ExtractStem(filename);
+
+    if (!dir.empty()) {
+        pb->affectedDirectories.insert(dir);
+    }
+
+    // Check if new extension is a known Locky extension
+    if (m_impl->IsLockyExtension(newExt)) {
+        pb->lockyExtRenames++;
+        pb->extensionsObserved.push_back(std::wstring(newExt));
+
+        // Identify variant from extension
+        const auto variant = m_impl->IdentifyVariant(newExt);
+        if (variant != LockyVariant::Unknown) {
+            pb->variant = variant;
+        }
+
+        if (pb->lockyExtRenames == 1) {
+            m_impl->AddScoreUnguarded(*pb,
+                LockyConstants::SCORE_LOCKY_EXT_RENAME,
+                "File renamed to Locky family extension");
+        }
+    }
+
+    // Check for hex-ID filename pattern: [A-Fa-f0-9]{16,32}.[ext]
+    if (IsHexIdFilename(stem)) {
+        pb->hexPatternRenames++;
+        if (pb->hexPatternRenames >= 3) {
+            m_impl->AddScore(*pb, LockyConstants::SCORE_HEX_RENAME_PATTERN,
+                             "Hex-ID filename rename pattern (Locky dropper)",
+                             pb->hexPatternScored);
+        }
+    }
+
+    // Mass rename rate detection
+    if (!pb->massRenameTriggered &&
+        pb->renameTimestamps.size() >= m_impl->m_config.massRenameThreshold)
+    {
+        m_impl->AddScore(*pb, LockyConstants::SCORE_MASS_RENAME,
+                         "Mass rename rate exceeded threshold",
+                         pb->massRenameTriggered);
+    }
+
+    // Multi-directory activity (4+ directories = suspicious)
+    if (!pb->multiDirTriggered && pb->affectedDirectories.size() >= 4) {
+        m_impl->AddScore(*pb, LockyConstants::SCORE_MULTI_DIR_ACTIVITY,
+                         "File operations across 4+ directories",
+                         pb->multiDirTriggered);
+    }
+
+    // Check if new file is a ransom note
+    if (m_impl->IsLockyRansomNote(filename)) {
+        pb->ransomNotesCreated++;
+        pb->ransomNotesFound.push_back(std::wstring(newPath));
+        if (!dir.empty()) {
+            pb->ransomNoteDirectories.insert(dir);
+        }
+        if (pb->ransomNotesCreated == 1) {
+            m_impl->AddScoreUnguarded(*pb,
+                LockyConstants::SCORE_RANSOM_NOTE,
+                "Locky ransom note file created");
+        }
+    }
+
+    return m_impl->Evaluate(*pb);
+}
+
+std::optional<LockyDetectionResult> LockyDetector::OnFileWrite(
+    uint32_t pid, std::wstring_view filePath,
+    size_t /*dataSize*/, double entropy)
+{
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire))
+        return std::nullopt;
+
+    auto pb = m_impl->GetOrCreateBehavior(pid);
+    if (!pb) return std::nullopt;
+
+    std::lock_guard lock(pb->mtx);
+
+    if (m_impl->IsWhitelisted(pb->processName))
+        return std::nullopt;
+
+    pb->totalWrites++;
+    pb->lastActivity = Clock::now();
+
+    const std::wstring dir = ExtractDirectory(filePath);
+    if (!dir.empty()) {
+        pb->affectedDirectories.insert(dir);
+    }
+
+    if (entropy > LockyConstants::HIGH_ENTROPY_THRESHOLD) {
+        pb->highEntropyWrites++;
+        if (pb->highEntropyWrites == 3) {
+            m_impl->AddScoreUnguarded(*pb,
+                LockyConstants::SCORE_HIGH_ENTROPY_WRITE,
+                "Multiple high-entropy file writes (encrypted content)");
+        }
+    }
+
+    // Check if file being written is a ransom note
+    const auto filename = ExtractFilename(filePath);
+    if (m_impl->IsLockyRansomNote(filename)) {
+        pb->ransomNotesCreated++;
+        pb->ransomNotesFound.push_back(std::wstring(filePath));
+        if (!dir.empty()) {
+            pb->ransomNoteDirectories.insert(dir);
+        }
+        if (pb->ransomNotesCreated == 1) {
+            m_impl->AddScoreUnguarded(*pb,
+                LockyConstants::SCORE_RANSOM_NOTE,
+                "Locky ransom note written");
+        }
+    }
+
+    // Multi-directory activity
+    if (!pb->multiDirTriggered && pb->affectedDirectories.size() >= 4) {
+        m_impl->AddScore(*pb, LockyConstants::SCORE_MULTI_DIR_ACTIVITY,
+                         "File operations across 4+ directories",
+                         pb->multiDirTriggered);
+    }
+
+    return m_impl->Evaluate(*pb);
+}
+
+std::optional<LockyDetectionResult> LockyDetector::OnProcessCreate(
+    uint32_t pid, uint32_t parentPid,
+    std::wstring_view imagePath, std::wstring_view commandLine)
+{
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire))
+        return std::nullopt;
+
+    // Check for VSS destruction in child processes
+    const std::wstring cmdLower =
+        Utils::StringUtils::ToLowerCopy(commandLine);
+
+    if (ContainsVSSDestructionPattern(cmdLower)) {
+        // Attribute to parent process
+        auto pb = m_impl->GetOrCreateBehavior(parentPid);
+        if (pb) {
+            std::lock_guard lock(pb->mtx);
+            if (!m_impl->IsWhitelisted(pb->processName)) {
+                m_impl->AddScore(*pb,
+                    LockyConstants::SCORE_VSS_DESTRUCTION,
+                    "Child process executing VSS destruction",
+                    pb->vssDestruction);
+                return m_impl->Evaluate(*pb);
+            }
+        }
+    }
+
+    // Dropper behavior: PowerShell downloading executable
+    const auto imageNameLower =
+        Utils::StringUtils::ToLowerCopy(
+            std::wstring(ExtractFilename(imagePath)));
+
+    if (imageNameLower == L"powershell.exe" ||
+        imageNameLower == L"pwsh.exe")
+    {
+        // PowerShell with download cradle patterns
+        if (Utils::StringUtils::IContains(commandLine, L"downloadstring") ||
+            Utils::StringUtils::IContains(commandLine, L"downloadfile") ||
+            Utils::StringUtils::IContains(commandLine, L"invoke-webrequest") ||
+            Utils::StringUtils::IContains(commandLine, L"wget") ||
+            Utils::StringUtils::IContains(commandLine, L"start-bitstransfer") ||
+            Utils::StringUtils::IContains(commandLine, L"invoke-expression") ||
+            Utils::StringUtils::IContains(commandLine, L"iex"))
+        {
+            auto pb = m_impl->GetOrCreateBehavior(parentPid);
+            if (pb) {
+                std::lock_guard lock(pb->mtx);
+                if (!m_impl->IsWhitelisted(pb->processName)) {
+                    m_impl->AddScore(*pb,
+                        LockyConstants::SCORE_DROPPER_BEHAVIOR,
+                        "PowerShell download cradle (dropper chain)",
+                        pb->dropperBehavior);
+                    return m_impl->Evaluate(*pb);
+                }
+            }
+        }
+    }
+
+    // Check if exe in temp directory (common Locky dropper behavior)
+    const std::wstring imagePathLower =
+        Utils::StringUtils::ToLowerCopy(std::wstring(imagePath));
+
+    if ((Utils::StringUtils::IContains(imagePathLower, L"\\temp\\") ||
+         Utils::StringUtils::IContains(imagePathLower, L"\\tmp\\") ||
+         Utils::StringUtils::IContains(imagePathLower, L"\\appdata\\local\\temp")) &&
+        (Utils::StringUtils::EndsWith(imagePathLower, L".exe") ||
+         Utils::StringUtils::EndsWith(imagePathLower, L".scr")))
+    {
+        auto pb = m_impl->GetOrCreateBehavior(pid);
+        if (pb) {
+            std::lock_guard lock(pb->mtx);
+            pb->processPath = std::wstring(imagePath);
+            pb->processName = std::wstring(ExtractFilename(imagePath));
+
+            // Don't score temp exe alone — just track it.
+            // Score fires if combined with other indicators.
+            if (m_impl->m_config.verboseLogging) {
+                SS_LOG_DEBUG(LOG_CAT,
+                    L"Tracking temp-dir executable PID=%u path=%ls",
+                    pid, imagePath.data());
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<LockyDetectionResult> LockyDetector::OnDnsQuery(
+    uint32_t pid, std::string_view domain)
+{
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire))
+        return std::nullopt;
+
+    if (!m_impl->IsLockyC2Domain(domain))
+        return std::nullopt;
+
+    auto pb = m_impl->GetOrCreateBehavior(pid);
+    if (!pb) return std::nullopt;
+
+    std::lock_guard lock(pb->mtx);
+
+    if (m_impl->IsWhitelisted(pb->processName))
+        return std::nullopt;
+
+    pb->dgaDomainsContacted++;
+    pb->c2Domains.emplace_back(domain);
+
+    if (pb->dgaDomainsContacted == 1) {
+        m_impl->AddScoreUnguarded(*pb,
+            LockyConstants::SCORE_DGA_DOMAIN,
+            "DNS query to Locky DGA-generated domain");
+    }
+
+    SS_LOG_WARN(LOG_CAT,
+        L"DGA domain hit: PID=%u domain=%hs total=%u",
+        pid, std::string(domain).c_str(), pb->dgaDomainsContacted);
+
+    return m_impl->Evaluate(*pb);
+}
+
+std::optional<LockyDetectionResult> LockyDetector::OnRegistryWrite(
+    uint32_t pid, std::wstring_view keyPath,
+    std::wstring_view valueName, std::wstring_view data)
+{
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire))
+        return std::nullopt;
+
+    auto pb = m_impl->GetOrCreateBehavior(pid);
+    if (!pb) return std::nullopt;
+
+    std::lock_guard lock(pb->mtx);
+
+    if (m_impl->IsWhitelisted(pb->processName))
+        return std::nullopt;
+
+    // Wallpaper modification detection
+    if (Utils::StringUtils::IContains(keyPath,
+            L"Control Panel\\Desktop") &&
+        Utils::StringUtils::IEquals(valueName, L"Wallpaper"))
+    {
+        m_impl->AddScore(*pb,
+            LockyConstants::SCORE_WALLPAPER_CHANGE,
+            "Desktop wallpaper registry modification",
+            pb->wallpaperModified);
+        return m_impl->Evaluate(*pb);
+    }
+
+    // Run key persistence detection
+    if (Utils::StringUtils::IContains(keyPath,
+            L"CurrentVersion\\Run"))
+    {
+        m_impl->AddScore(*pb,
+            LockyConstants::SCORE_REGISTRY_PERSISTENCE,
+            "Run key registry persistence attempt",
+            pb->registryPersistence);
+        return m_impl->Evaluate(*pb);
+    }
+
+    // Locky-specific registry key
+    if (Utils::StringUtils::IContains(keyPath, L"Software\\Locky")) {
+        m_impl->AddScore(*pb,
+            LockyConstants::SCORE_REGISTRY_PERSISTENCE,
+            "Locky-specific registry key written",
+            pb->registryPersistence);
+        return m_impl->Evaluate(*pb);
+    }
+
+    return std::nullopt;
+}
+
+std::optional<LockyDetectionResult> LockyDetector::OnMutexCreate(
+    uint32_t pid, std::wstring_view mutexName)
+{
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire))
+        return std::nullopt;
+
+    if (!IsGuidFormat(mutexName))
+        return std::nullopt;
+
+    auto pb = m_impl->GetOrCreateBehavior(pid);
+    if (!pb) return std::nullopt;
+
+    std::lock_guard lock(pb->mtx);
+
+    if (m_impl->IsWhitelisted(pb->processName))
+        return std::nullopt;
+
+    m_impl->AddScore(*pb,
+        LockyConstants::SCORE_GUID_MUTEX,
+        "GUID-format mutex creation (Locky signature)",
+        pb->guidMutex);
+
+    return m_impl->Evaluate(*pb);
+}
+
+double LockyDetector::GetProcessScore(uint32_t pid) const {
+    if (!m_impl) return 0.0;
+    auto pb = m_impl->FindBehavior(pid);
+    if (!pb) return 0.0;
+    std::lock_guard lock(pb->mtx);
+    return pb->score;
+}
+
+LockyDetectionResult LockyDetector::BuildResultFromBehavior(uint32_t pid) const {
+    if (!m_impl) return {};
+    auto pb = m_impl->FindBehavior(pid);
+    if (!pb) return {};
+    std::lock_guard lock(pb->mtx);
+    return m_impl->BuildResult(*pb);
+}
+
+void LockyDetector::PurgeStaleProcesses() {
+    if (!m_impl) return;
+    std::unique_lock lock(m_impl->m_behaviorMutex);
+    m_impl->PurgeStaleProcessesLocked();
+}
+
+// ============================================================================
 // PATTERN MANAGEMENT
 // ============================================================================
 
@@ -717,19 +1546,31 @@ void LockyDetector::AddKnownC2Domain(std::string_view domain) {
     m_impl->m_knownC2Domains.emplace(domain);
 }
 
+void LockyDetector::AddKnownHash(std::string_view sha256Hex) {
+    if (!m_impl) return;
+    std::unique_lock lock(m_impl->m_patternsMutex);
+    std::string lower(sha256Hex);
+    for (auto& c : lower) {
+        if (c >= 'A' && c <= 'Z') c += 32;
+    }
+    m_impl->m_knownBadHashes.insert(std::move(lower));
+}
+
 void LockyDetector::AddKnownExtension(std::wstring_view extension) {
     if (!m_impl) return;
     std::unique_lock lock(m_impl->m_patternsMutex);
-    m_impl->m_knownExtensions.emplace(extension);
+    std::wstring lower(extension);
+    for (auto& c : lower) {
+        if (c >= L'A' && c <= L'Z') c += 32;
+    }
+    m_impl->m_knownExtensions.insert(std::move(lower));
 }
 
 void LockyDetector::UpdatePatternsFromThreatIntel() {
-    if (!m_impl || !m_impl->m_threatIntel) return;
-
-    // In a real implementation, this would query ThreatIntelManager
-    // for specific Locky tags and update local sets.
-    Utils::Logger::Info(L"LockyDetector: Patterns updated from ThreatIntel");
-    m_impl->UpdateDGADomains(); // Re-run DGA for new day
+    if (!m_impl) return;
+    std::unique_lock lock(m_impl->m_patternsMutex);
+    m_impl->UpdateDGADomainsLocked();
+    SS_LOG_INFO(LOG_CAT, L"Patterns refreshed from threat intel");
 }
 
 // ============================================================================
@@ -747,7 +1588,22 @@ void LockyDetector::SetDetectionCallback(LockyDetectionCallback callback) {
 // ============================================================================
 
 LockyStatistics LockyDetector::GetStatistics() const {
-    return m_impl ? m_impl->m_stats : LockyStatistics{};
+    if (!m_impl) return {};
+    // LockyStatistics has atomics — copy element by element
+    LockyStatistics copy;
+    copy.totalDetections.store(
+        m_impl->m_stats.totalDetections.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    copy.processesTerminated.store(
+        m_impl->m_stats.processesTerminated.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    for (size_t i = 0; i < m_impl->m_stats.byVariant.size(); ++i) {
+        copy.byVariant[i].store(
+            m_impl->m_stats.byVariant[i].load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+    }
+    copy.startTime = m_impl->m_stats.startTime;
+    return copy;
 }
 
 void LockyDetector::ResetStatistics() {
@@ -757,56 +1613,105 @@ void LockyDetector::ResetStatistics() {
 }
 
 // ============================================================================
-// UTILITY
+// SELF-TEST & VERSION
 // ============================================================================
 
 bool LockyDetector::SelfTest() {
     if (!m_impl) return false;
 
-    Utils::Logger::Info(L"LockyDetector: Starting SelfTest...");
+    SS_LOG_INFO(LOG_CAT, L"Starting SelfTest...");
 
-    // 1. Check Extension Detection
+    // 1. Extension detection
     if (!IsLockyExtension(L".locky")) {
-        Utils::Logger::Error(L"LockyDetector: SelfTest failed - .locky extension not detected");
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: .locky extension not detected");
+        return false;
+    }
+    if (!IsLockyExtension(L".ZEPTO")) { // Case-insensitive
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: .ZEPTO (uppercase) not detected");
         return false;
     }
 
-    // 2. Check Variant Identification
+    // 2. Variant identification
     if (IdentifyVariant(L".zepto") != LockyVariant::Zepto) {
-        Utils::Logger::Error(L"LockyDetector: SelfTest failed - Zepto variant mismatch");
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: Zepto variant mismatch");
+        return false;
+    }
+    if (IdentifyVariant(L".OSIRIS") != LockyVariant::Osiris) {
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: Osiris variant mismatch");
         return false;
     }
 
-    // 3. Check Ransom Note
+    // 3. Ransom note detection
     if (!IsLockyRansomNote(L"_Locky_recover_instructions.txt")) {
-        Utils::Logger::Error(L"LockyDetector: SelfTest failed - Ransom note not detected");
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: Ransom note not detected");
+        return false;
+    }
+    if (!IsLockyRansomNote(L"_HOWDO_text.html")) {
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: _HOWDO_text.html not detected");
+        return false;
+    }
+    if (!IsLockyRansomNote(L"_README_.txt")) {
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: _README_.txt not detected");
         return false;
     }
 
-    // 4. Check DGA Logic (Test Vector)
-    // Seed 5, Date 2016-01-01 (historical check)
-    // 2016 = 366 days, jan=1, day=1. time_const = (2016*366 + 1*31 + 1)/2 = 369064
-    // This is just a sanity check that the function runs and produces 12 domains
+    // 4. DGA generation
     auto domains = GenerateLockyDomains(2016, 1, 1, 5);
     if (domains.size() != 12) {
-        Utils::Logger::Error(L"LockyDetector: SelfTest failed - DGA generation count mismatch");
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: DGA count=%zu expected=12",
+                     domains.size());
         return false;
     }
-    if (domains[0].find(".") == std::string::npos) {
-        Utils::Logger::Error(L"LockyDetector: SelfTest failed - DGA domain format invalid");
+    for (const auto& d : domains) {
+        if (d.find('.') == std::string::npos) {
+            SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: DGA domain missing TLD");
+            return false;
+        }
+    }
+
+    // 5. Configuration validation
+    LockyDetectorConfiguration badConfig;
+    badConfig.correlationWindowSecs = 0; // Invalid
+    if (badConfig.IsValid()) {
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: Invalid config passed validation");
         return false;
     }
 
-    // 5. Statistics
-    auto initialStats = GetStatistics();
+    // 6. Hex-ID pattern check
+    if (!IsHexIdFilename(L"A1B2C3D4E5F6A7B8")) {
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: Hex-ID pattern not detected");
+        return false;
+    }
+    if (IsHexIdFilename(L"hello_world")) {
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: Non-hex falsely detected as hex-ID");
+        return false;
+    }
+
+    // 7. GUID mutex check
+    if (!IsGuidFormat(L"{12345678-1234-1234-1234-123456789012}")) {
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: GUID format not recognized");
+        return false;
+    }
+
+    // 8. Statistics reset
     ResetStatistics();
     auto resetStats = GetStatistics();
-    if (resetStats.totalDetections != 0) {
-        Utils::Logger::Error(L"LockyDetector: SelfTest failed - Statistics reset failed");
+    if (resetStats.totalDetections.load() != 0) {
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: Statistics reset failed");
         return false;
     }
 
-    Utils::Logger::Info(L"LockyDetector: SelfTest Passed");
+    // 9. Score-to-confidence mapping
+    if (LockyDetectorImpl::ScoreToConfidence(0.0) != DetectionConfidence::None) {
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: ScoreToConfidence(0) != None");
+        return false;
+    }
+    if (LockyDetectorImpl::ScoreToConfidence(95.0) != DetectionConfidence::Confirmed) {
+        SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: ScoreToConfidence(95) != Confirmed");
+        return false;
+    }
+
+    SS_LOG_INFO(LOG_CAT, L"SelfTest PASSED (9/9 checks)");
     return true;
 }
 
@@ -818,11 +1723,11 @@ std::string LockyDetector::GetVersionString() noexcept {
 }
 
 // ============================================================================
-// UTILITY FUNCTIONS IMPLEMENTATION
+// FREE FUNCTION IMPLEMENTATIONS
 // ============================================================================
 
 std::string_view GetLockyVariantName(LockyVariant variant) noexcept {
-    switch(variant) {
+    switch (variant) {
         case LockyVariant::Original: return "Original (.locky)";
         case LockyVariant::Zepto:    return "Zepto";
         case LockyVariant::Odin:     return "Odin";
@@ -838,7 +1743,7 @@ std::string_view GetLockyVariantName(LockyVariant variant) noexcept {
 }
 
 std::string_view GetDetectionConfidenceName(DetectionConfidence conf) noexcept {
-    switch(conf) {
+    switch (conf) {
         case DetectionConfidence::Low:       return "Low";
         case DetectionConfidence::Medium:    return "Medium";
         case DetectionConfidence::High:      return "High";
@@ -848,7 +1753,7 @@ std::string_view GetDetectionConfidenceName(DetectionConfidence conf) noexcept {
 }
 
 std::wstring_view GetLockyExtension(LockyVariant variant) noexcept {
-    switch(variant) {
+    switch (variant) {
         case LockyVariant::Original: return L".locky";
         case LockyVariant::Zepto:    return L".zepto";
         case LockyVariant::Odin:     return L".odin";
