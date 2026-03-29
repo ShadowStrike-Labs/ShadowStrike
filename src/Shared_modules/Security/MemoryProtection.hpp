@@ -358,6 +358,10 @@ inline constexpr PageProtection operator|(PageProtection a, PageProtection b) no
     return static_cast<PageProtection>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
+inline constexpr PageProtection operator&(PageProtection a, PageProtection b) noexcept {
+    return static_cast<PageProtection>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+
 /**
  * @brief Memory allocation type
  */
@@ -424,6 +428,10 @@ enum class ProtectionResponse : uint32_t {
 
 inline constexpr ProtectionResponse operator|(ProtectionResponse a, ProtectionResponse b) noexcept {
     return static_cast<ProtectionResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+
+inline constexpr ProtectionResponse operator&(ProtectionResponse a, ProtectionResponse b) noexcept {
+    return static_cast<ProtectionResponse>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
 }
 
 /**
@@ -1364,9 +1372,9 @@ public:
     [[nodiscard]] bool SelfTest();
     
     /**
-     * @brief Secure zero memory
+     * @brief Secure zero memory (named SecureZero to avoid collision with Windows SDK macro)
      */
-    static void SecureZeroMemory(void* ptr, size_t size);
+    static void SecureZero(void* ptr, size_t size);
     
     /**
      * @brief Compare memory in constant time
@@ -1502,7 +1510,7 @@ private:
  * @brief Secure zero memory
  */
 #define SS_SECURE_ZERO(ptr, size) \
-    ::ShadowStrike::Security::MemoryProtection::SecureZeroMemory((ptr), (size))
+    ::ShadowStrike::Security::MemoryProtection::SecureZero((ptr), (size))
 
 /**
  * @brief Allocate secure buffer on stack (compile-time size)
