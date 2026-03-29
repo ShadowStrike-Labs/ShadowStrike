@@ -176,7 +176,13 @@ namespace JSConstants {
     
     /// @brief Emulation timeout (ms)
     inline constexpr uint32_t EMULATION_TIMEOUT_MS = 2000;
-    
+
+    /// @brief Default scan timeout per script (ms) — prevents ReDoS
+    inline constexpr uint32_t DEFAULT_SCAN_TIMEOUT_MS = 5000;
+
+    /// @brief Maximum content size for regex operations (avoid catastrophic backtracking)
+    inline constexpr size_t MAX_REGEX_CONTENT_SIZE = 512 * 1024;
+
     /// @brief High entropy threshold (obfuscation indicator)
     inline constexpr double ENTROPY_THRESHOLD_OBFUSCATED = 5.5;
     
@@ -485,7 +491,16 @@ struct JSScanConfig {
     
     /// @brief Emulation timeout (ms)
     uint32_t emulationTimeoutMs = JSConstants::EMULATION_TIMEOUT_MS;
-    
+
+    /// @brief Per-script scan timeout (ms) — enforced to prevent ReDoS hangs
+    uint32_t scanTimeoutMs = JSConstants::DEFAULT_SCAN_TIMEOUT_MS;
+
+    /// @brief Maximum deobfuscation recursion depth
+    size_t maxDeobfuscationDepth = JSConstants::MAX_DEOBFUSCATION_DEPTH;
+
+    /// @brief Block all encoded script files (.jse) — enterprise default
+    bool blockEncodedScripts = true;
+
     /// @brief Maximum script size
     size_t maxScriptSize = JSConstants::MAX_SCRIPT_SIZE;
     
