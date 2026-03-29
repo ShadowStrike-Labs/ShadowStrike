@@ -173,28 +173,71 @@ namespace {
         return std::count(source.begin(), source.begin() + pos, '\n') + 1;
     }
 
-    // VBE Decoding table (Script Encoder)
-    // This is the reverse mapping for Microsoft Script Encoder
-    const uint8_t VBE_DECODE_TABLE[128] = {
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-        0x08, 0x57, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-        0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
-        0x2E, 0x47, 0x7A, 0x56, 0x42, 0x6A, 0x2F, 0x26,
-        0x49, 0x41, 0x34, 0x32, 0x5B, 0x76, 0x72, 0x43,
-        0x38, 0x39, 0x70, 0x45, 0x68, 0x71, 0x4F, 0x09,
-        0x62, 0x44, 0x23, 0x75, 0x3C, 0x7E, 0x3E, 0x5E,
-        0xFF, 0x77, 0x4A, 0x61, 0x5D, 0x22, 0x4B, 0x6F,
-        0x4E, 0x3B, 0x4C, 0x50, 0x67, 0x2A, 0x7D, 0x74,
-        0x54, 0x2B, 0x2D, 0x2C, 0x30, 0x6E, 0x6B, 0x66,
-        0x35, 0x25, 0x21, 0x64, 0x4D, 0x52, 0x63, 0x29,
-        0x60, 0x6C, 0x48, 0x7F, 0x73, 0x55, 0x46, 0x33,
-        0x65, 0x51, 0x6D, 0x31, 0x36, 0x7C, 0x37, 0x7B,
-        0x79, 0x5A, 0x59, 0x40, 0x78, 0x27, 0x5F, 0x28,
-        0x53, 0x3A, 0x24, 0x3D, 0x58, 0x5C, 0x3F, 0x20
+    // Microsoft Script Encoder uses three independent substitution tables
+    // selected via a combination (pick) table that rotates per character index.
+    // Each printable char (0x20-0x7F) maps through one of three tables.
+    const uint8_t VBE_DECODE_TABLE[3][128] = {
+        // Table 0
+        {
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x57, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+            0x2E, 0x47, 0x7A, 0x56, 0x42, 0x6A, 0x2F, 0x26,
+            0x49, 0x41, 0x34, 0x32, 0x5B, 0x76, 0x72, 0x43,
+            0x38, 0x39, 0x70, 0x45, 0x68, 0x71, 0x4F, 0x09,
+            0x62, 0x44, 0x23, 0x75, 0x3C, 0x7E, 0x3E, 0x5E,
+            0xFF, 0x77, 0x4A, 0x61, 0x5D, 0x22, 0x4B, 0x6F,
+            0x4E, 0x3B, 0x4C, 0x50, 0x67, 0x2A, 0x7D, 0x74,
+            0x54, 0x2B, 0x2D, 0x2C, 0x30, 0x6E, 0x6B, 0x66,
+            0x35, 0x25, 0x21, 0x64, 0x4D, 0x52, 0x63, 0x29,
+            0x60, 0x6C, 0x48, 0x7F, 0x73, 0x55, 0x46, 0x33,
+            0x65, 0x51, 0x6D, 0x31, 0x36, 0x7C, 0x37, 0x7B,
+            0x79, 0x5A, 0x59, 0x40, 0x78, 0x27, 0x5F, 0x28,
+            0x53, 0x3A, 0x24, 0x3D, 0x58, 0x5C, 0x3F, 0x20
+        },
+        // Table 1
+        {
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x7B, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+            0x32, 0x30, 0x21, 0x29, 0x5B, 0x38, 0x33, 0x3D,
+            0x58, 0x3A, 0x35, 0x65, 0x23, 0x44, 0x27, 0x2C,
+            0x4E, 0x37, 0x4F, 0x4A, 0x51, 0x25, 0x2D, 0x48,
+            0x34, 0x6C, 0x6D, 0x46, 0x3E, 0x55, 0x3C, 0x42,
+            0xFF, 0x2E, 0x45, 0x6A, 0x68, 0x72, 0x56, 0x73,
+            0x39, 0x66, 0x78, 0x41, 0x6E, 0x76, 0x77, 0x75,
+            0x5C, 0x43, 0x40, 0x67, 0x63, 0x28, 0x79, 0x62,
+            0x70, 0x7C, 0x5E, 0x74, 0x53, 0x6B, 0x7E, 0x2B,
+            0x4D, 0x22, 0x5D, 0x7A, 0x31, 0x4C, 0x2F, 0x5F,
+            0x52, 0x36, 0x26, 0x7F, 0x57, 0x7D, 0x50, 0x60,
+            0x54, 0x47, 0x71, 0x61, 0x24, 0x2A, 0x6F, 0x4B,
+            0x59, 0x64, 0x5A, 0x49, 0x69, 0x09, 0x3F, 0x20
+        },
+        // Table 2
+        {
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x6E, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+            0x2D, 0x75, 0x52, 0x60, 0x71, 0x5E, 0x49, 0x5C,
+            0x62, 0x7D, 0x29, 0x36, 0x20, 0x7C, 0x7A, 0x7F,
+            0x6B, 0x63, 0x33, 0x2B, 0x68, 0x51, 0x66, 0x76,
+            0x31, 0x64, 0x54, 0x43, 0x3E, 0x22, 0x45, 0x28,
+            0xFF, 0x78, 0x79, 0x5D, 0x44, 0x72, 0x26, 0x2A,
+            0x6C, 0x24, 0x40, 0x5F, 0x73, 0x4A, 0x39, 0x48,
+            0x70, 0x2F, 0x7B, 0x35, 0x2E, 0x5B, 0x6D, 0x46,
+            0x57, 0x27, 0x47, 0x55, 0x3A, 0x4D, 0x38, 0x25,
+            0x59, 0x56, 0x4F, 0x37, 0x41, 0x67, 0x2C, 0x23,
+            0x6F, 0x6A, 0x4E, 0x42, 0x34, 0x32, 0x30, 0x4C,
+            0x21, 0x50, 0x3D, 0x4B, 0x58, 0x3C, 0x61, 0x7E,
+            0x69, 0x53, 0x09, 0x65, 0x5A, 0x77, 0x3F, 0x20
+        }
     };
 
-    // Combination table for VBE decoding
+    // Combination/pick table: for each of 64 rotation positions, selects
+    // which of the 3 decode sub-tables to use for the current character.
     const uint8_t VBE_COMBINATION[64][3] = {
         {0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {1, 0, 2}, {2, 1, 0},
         {1, 0, 2}, {2, 1, 0}, {0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1},
@@ -208,6 +251,14 @@ namespace {
         {0, 2, 1}, {1, 0, 2}, {2, 1, 0}, {0, 1, 2}, {1, 2, 0}, {2, 0, 1},
         {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {1, 0, 2}
     };
+
+    // Characters that pass through the VBE encoder without transformation
+    bool IsVBEPassthroughChar(unsigned char c) {
+        return (c < 0x20) || (c == 0x7F);
+    }
+
+    // Regex iteration limit for attacker-controlled content
+    constexpr size_t MAX_REGEX_ITERATIONS = 50000;
 
     // Dangerous COM objects map
     const std::unordered_map<std::string, DangerousObjectType> DANGEROUS_COM_MAP = {
@@ -225,7 +276,12 @@ namespace {
         {"word.application", DangerousObjectType::OfficeApp},
         {"outlook.application", DangerousObjectType::OfficeApp},
         {"wscript.network", DangerousObjectType::Network},
-        {"internetexplorer.application", DangerousObjectType::IE}
+        {"internetexplorer.application", DangerousObjectType::IE},
+        {"winhttp.winhttprequest.5.1", DangerousObjectType::WinHttp},
+        {"winhttp.winhttprequest", DangerousObjectType::WinHttp},
+        {"msxml2.xmlhttp.6.0", DangerousObjectType::XMLHTTP},
+        {"msxml2.xmlhttp.3.0", DangerousObjectType::XMLHTTP},
+        {"msxml2.serverxmlhttp.6.0", DangerousObjectType::XMLHTTP}
     };
 
     // Dangerous method patterns
@@ -593,57 +649,93 @@ public:
     // =========================================================================
 
     std::optional<std::string> DecodeVBE(std::string_view encoded) {
-        // Find the encoded section between #@~^ and ^#~@
+        // Microsoft Script Encoder format:
+        // #@~^XXXXXX==ENCODED_DATA==XXXXXX^#~@
+        // Where XXXXXX is a 6-char base64 checksum, and ENCODED_DATA is the
+        // substitution-ciphered script using 3-table rotation.
         size_t start = encoded.find("#@~^");
         if (start == std::string_view::npos) return std::nullopt;
 
-        size_t end = encoded.find("^#~@", start);
+        size_t end = encoded.find("^#~@", start + 4);
         if (end == std::string_view::npos) return std::nullopt;
 
-        start += 4; // Skip #@~^
+        // Content between #@~^ and ^#~@
+        std::string_view block = encoded.substr(start + 4, end - (start + 4));
 
-        // Get the encoded data
-        std::string_view data = encoded.substr(start, end - start);
+        // Block format: <6-char-len-encoding>==<encoded-data>==<6-char-checksum>
+        // Find the first == delimiter (after length prefix)
+        size_t firstEq = block.find("==");
+        if (firstEq == std::string_view::npos || firstEq < 1) return std::nullopt;
 
-        // Skip the checksum (first 8 characters after delimiter marker)
-        if (data.size() < 12) return std::nullopt;
+        // Find the trailing == (before checksum)
+        size_t lastEq = block.rfind("==");
+        if (lastEq == std::string_view::npos || lastEq <= firstEq) return std::nullopt;
 
-        // Find the actual encoded content
-        size_t contentStart = data.find("==");
-        if (contentStart == std::string_view::npos) contentStart = 0;
-        else contentStart += 2;
+        // Encoded data lies between the two == markers
+        size_t dataStart = firstEq + 2;
+        size_t dataEnd = lastEq;
+        if (dataStart >= dataEnd) return std::nullopt;
+
+        std::string_view data = block.substr(dataStart, dataEnd - dataStart);
+
+        // Cap decoded size to prevent memory bombs
+        if (data.size() > VBSConstants::MAX_SCRIPT_SIZE) {
+            Utils::Logger::Warn(L"VBScriptScanner: VBE encoded data exceeds size limit");
+            return std::nullopt;
+        }
 
         std::string decoded;
         decoded.reserve(data.size());
 
-        size_t index = 0;
-        for (size_t i = contentStart; i < data.size(); ++i) {
+        size_t charIndex = 0; // Rotation counter for printable chars only
+        for (size_t i = 0; i < data.size(); ++i) {
             unsigned char c = static_cast<unsigned char>(data[i]);
 
-            // Skip special characters
-            if (c == '\r' || c == '\n' || c == '\t') continue;
+            // Whitespace/control chars pass through untransformed
+            if (c == '\r' || c == '\n' || c == '\t') {
+                decoded += static_cast<char>(c);
+                continue;
+            }
 
-            // Handle escape sequences
+            // The @ character is an escape: next char passes through literally
             if (c == '@') {
-                // Special escape
                 if (i + 1 < data.size()) {
                     decoded += static_cast<char>(data[++i]);
                 }
                 continue;
             }
 
-            // Decode regular character
-            if (c < 128) {
-                uint8_t decodedChar = VBE_DECODE_TABLE[c];
-                size_t combo = index % 64;
-                // Apply combination transformation
-                decoded += static_cast<char>(decodedChar);
+            // Characters < 0x20 pass through unchanged
+            if (c < 0x20) {
+                decoded += static_cast<char>(c);
+                continue;
             }
 
-            index++;
+            // For printable characters (0x20-0x7F): apply 3-table substitution
+            if (c < 0x80) {
+                size_t combo = charIndex % 64;
+                // VBE_COMBINATION[combo] gives {pickA, pickB, pickC}
+                // The first element selects which of 3 tables to use
+                uint8_t tableIdx = VBE_COMBINATION[combo][0];
+                uint8_t decodedChar = VBE_DECODE_TABLE[tableIdx][c];
+
+                // 0xFF is an invalid mapping marker
+                if (decodedChar == 0xFF) {
+                    decoded += static_cast<char>(c);
+                } else {
+                    decoded += static_cast<char>(decodedChar);
+                }
+                charIndex++;
+            } else {
+                // High-byte chars: pass through
+                decoded += static_cast<char>(c);
+            }
         }
 
         if (decoded.empty()) return std::nullopt;
+
+        Utils::Logger::Debug(L"VBScriptScanner: VBE decoded {} bytes -> {} bytes",
+            data.size(), decoded.size());
         return decoded;
     }
 
@@ -652,14 +744,20 @@ public:
     // =========================================================================
 
     VBSObfuscationType DetectObfuscation(std::string_view source) {
-        std::string lowerSrc = ToLower(source);
+        std::string src(source); // Copy once for regex safety
+        std::string lowerSrc = ToLower(src);
 
-        // Count Chr() calls
+        // Count Chr() calls with iteration limit
         size_t chrCount = 0;
         {
-            std::sregex_iterator it(source.begin(), source.end(), CHR_PATTERN);
+            std::sregex_iterator it(src.begin(), src.end(), CHR_PATTERN);
             std::sregex_iterator end;
-            chrCount = std::distance(it, end);
+            size_t iters = 0;
+            while (it != end && iters < MAX_REGEX_ITERATIONS) {
+                ++chrCount;
+                ++it;
+                ++iters;
+            }
         }
 
         // High Chr() count indicates obfuscation
@@ -688,8 +786,7 @@ public:
         }
 
         // Check for Replace() based deobfuscation
-        if (std::count_if(lowerSrc.begin(), lowerSrc.end(), [](char c) {
-                return c == 'r'; }) > 0) {
+        {
             size_t replaceCount = 0;
             size_t pos = 0;
             while ((pos = lowerSrc.find("replace(", pos)) != std::string::npos) {
@@ -697,6 +794,19 @@ public:
                 pos++;
             }
             if (replaceCount >= 5) {
+                return VBSObfuscationType::ReplaceTechnique;
+            }
+        }
+
+        // Check for StrReverse-based obfuscation
+        {
+            size_t reverseCount = 0;
+            size_t pos = 0;
+            while ((pos = lowerSrc.find("strreverse(", pos)) != std::string::npos) {
+                reverseCount++;
+                pos++;
+            }
+            if (reverseCount >= 2) {
                 return VBSObfuscationType::ReplaceTechnique;
             }
         }
@@ -738,15 +848,18 @@ public:
                 result.depth = depth + 1;
                 std::string previous = current;
 
-                // Decode Chr() calls
+                // Decode Chr()/ChrW() calls
                 current = DecodeChrCalls(current, result.chrCallCount);
+
+                // Resolve StrReverse() calls
+                current = ResolveStrReverse(current);
 
                 // Resolve simple string concatenations
                 current = ResolveStringConcat(current);
 
                 // Check if we made progress
                 if (current == previous) {
-                    break; // No more deobfuscation possible
+                    break;
                 }
             }
 
@@ -809,37 +922,61 @@ public:
     }
 
     std::string ResolveStringConcat(std::string_view source) {
-        // Simplified string concatenation resolution
-        // Handles: "str1" & "str2" -> "str1str2"
+        // Resolve "str1" & "str2" -> "str1str2"
         std::string result(source);
 
-        // Pattern: "..." & "..."
-        std::regex concatPattern(R"("([^"]*)"\s*&\s*"([^"]*)")");
+        static const std::regex concatPattern(R"("([^"]*)"\s*&\s*"([^"]*)")",
+            std::regex::optimize);
 
         std::string previous;
-        while (previous != result) {
+        size_t iters = 0;
+        while (previous != result && iters < 100) {
             previous = result;
             result = std::regex_replace(result, concatPattern, "\"$1$2\"");
+            ++iters;
+        }
+
+        return result;
+    }
+
+    std::string ResolveStrReverse(std::string_view source) {
+        // Resolve StrReverse("literal") -> reversed string
+        static const std::regex reversePattern(
+            R"(strreverse\s*\(\s*"([^"]*)"\s*\))",
+            std::regex::icase | std::regex::optimize);
+
+        std::string result(source);
+        std::smatch match;
+        size_t iters = 0;
+
+        while (std::regex_search(result, match, reversePattern) && iters < MAX_REGEX_ITERATIONS) {
+            std::string literal = match[1].str();
+            std::string reversed(literal.rbegin(), literal.rend());
+            std::string replacement = "\"" + reversed + "\"";
+
+            result = match.prefix().str() + replacement + match.suffix().str();
+            ++iters;
         }
 
         return result;
     }
 
     void ExtractStringsFromScript(std::string_view source, std::vector<std::string>& strings) {
-        // Extract quoted strings
-        std::regex stringPattern(R"("([^"]{4,})")");
+        static const std::regex stringPattern(R"("([^"]{4,})")", std::regex::optimize);
         std::string src(source);
 
         std::sregex_iterator it(src.begin(), src.end(), stringPattern);
         std::sregex_iterator end;
 
         std::unordered_set<std::string> seen;
-        while (it != end) {
+        size_t iters = 0;
+        while (it != end && iters < MAX_REGEX_ITERATIONS) {
             std::string str = (*it)[1].str();
             if (seen.insert(str).second) {
                 strings.push_back(str);
             }
             ++it;
+            ++iters;
         }
     }
 
@@ -851,12 +988,14 @@ public:
         std::sregex_iterator end;
 
         std::unordered_set<std::string> seen;
-        while (it != end) {
+        size_t iters = 0;
+        while (it != end && iters < MAX_REGEX_ITERATIONS) {
             std::string url = (*it)[0].str();
             if (seen.insert(url).second) {
                 urls.push_back(url);
             }
             ++it;
+            ++iters;
         }
 
         return urls;
@@ -870,16 +1009,14 @@ public:
         std::sregex_iterator end;
 
         std::unordered_set<std::string> seen;
-        while (it != end) {
+        size_t iters = 0;
+        while (it != end && iters < MAX_REGEX_ITERATIONS) {
             std::string ip = (*it)[0].str();
-            // Filter out version numbers and common false positives
-            if (ip != "127.0.0.1" && ip != "0.0.0.0" &&
-                !ip.starts_with("192.168.") && !ip.starts_with("10.")) {
-                if (seen.insert(ip).second) {
-                    ips.push_back(ip);
-                }
+            if (ip != "0.0.0.0" && seen.insert(ip).second) {
+                ips.push_back(ip);
             }
             ++it;
+            ++iters;
         }
 
         return ips;
@@ -965,6 +1102,8 @@ public:
                 return "Network configuration access";
             case DangerousObjectType::IE:
                 return "Internet Explorer automation";
+            case DangerousObjectType::WinHttp:
+                return "WinHTTP download capability";
             default:
                 return "Unknown danger";
         }
@@ -981,6 +1120,8 @@ public:
             case DangerousObjectType::ADODBStream:
                 return VBSCapability::BinaryFileCreate;
             case DangerousObjectType::XMLHTTP:
+                return VBSCapability::NetworkDownload;
+            case DangerousObjectType::WinHttp:
                 return VBSCapability::NetworkDownload;
             case DangerousObjectType::ShellApplication:
                 return VBSCapability::ProcessCreation;
@@ -1032,10 +1173,11 @@ public:
             caps |= static_cast<uint32_t>(VBSCapability::FileOperations);
         }
 
-        // Network Download
+        // Network Download (fixed precedence; also detect WinHttp)
         if (ContainsCI(source, "xmlhttp") ||
             ContainsCI(source, "serverxmlhttp") ||
-            ContainsCI(source, ".open") && ContainsCI(source, ".send")) {
+            ContainsCI(source, "winhttprequest") ||
+            (ContainsCI(source, ".open") && ContainsCI(source, ".send"))) {
             caps |= static_cast<uint32_t>(VBSCapability::NetworkDownload);
         }
 
@@ -1061,7 +1203,8 @@ public:
         // WMI Access
         if (ContainsCI(source, "wbemscripting") ||
             ContainsCI(source, "winmgmts:") ||
-            ContainsCI(source, "execquery")) {
+            ContainsCI(source, "execquery") ||
+            ContainsCI(source, "execmethod")) {
             caps |= static_cast<uint32_t>(VBSCapability::WMIAccess);
         }
 
@@ -1093,7 +1236,8 @@ public:
         // System Info
         if (ContainsCI(source, "computername") ||
             ContainsCI(source, "username") ||
-            ContainsCI(source, "userdomain")) {
+            ContainsCI(source, "userdomain") ||
+            (ContainsCI(source, "environ(") && ContainsCI(source, "temp"))) {
             caps |= static_cast<uint32_t>(VBSCapability::SystemInfo);
         }
 
@@ -1310,6 +1454,16 @@ public:
                     reinterpret_cast<const uint8_t*>(source.data()),
                     source.size()));
 
+            // Check cache
+            {
+                std::shared_lock lock(m_cacheMutex);
+                auto cacheIt = m_scanCache.find(result.sha256);
+                if (cacheIt != m_scanCache.end() &&
+                    cacheIt->second.expiry > std::chrono::system_clock::now()) {
+                    return cacheIt->second.result;
+                }
+            }
+
             // Check hash store for known malware
             if (m_hashStore) {
                 // auto hashResult = m_hashStore->Lookup(result.sha256);
@@ -1357,6 +1511,9 @@ public:
                 result.extractedCommands = ExtractCommands(analysisSource);
             }
 
+            // Detect download+write+execute attack chain (APT dropper pattern)
+            DetectAttackChains(analysisSource, result);
+
             // Check threat intelligence
             if (m_threatIntel && !result.extractedUrls.empty()) {
                 // for (const auto& url : result.extractedUrls) {
@@ -1388,6 +1545,31 @@ public:
                 m_stats.suspiciousDetected++;
             } else {
                 result.status = VBSScanStatus::Clean;
+            }
+
+            // Populate cache
+            {
+                std::unique_lock lock(m_cacheMutex);
+                if (m_scanCache.size() >= MAX_CACHE_SIZE) {
+                    // Evict oldest entries
+                    auto now = std::chrono::system_clock::now();
+                    std::erase_if(m_scanCache, [&now](const auto& pair) {
+                        return pair.second.expiry <= now;
+                    });
+                    // If still full, clear half
+                    if (m_scanCache.size() >= MAX_CACHE_SIZE) {
+                        auto it = m_scanCache.begin();
+                        size_t toRemove = m_scanCache.size() / 2;
+                        while (toRemove > 0 && it != m_scanCache.end()) {
+                            it = m_scanCache.erase(it);
+                            --toRemove;
+                        }
+                    }
+                }
+                m_scanCache[result.sha256] = CacheEntry{
+                    result,
+                    std::chrono::system_clock::now() + CACHE_TTL
+                };
             }
 
         } catch (const std::exception& e) {
@@ -1620,7 +1802,6 @@ public:
     std::vector<std::pair<size_t, std::string>> FindFlaggedLines(std::string_view source) {
         std::vector<std::pair<size_t, std::string>> flagged;
 
-        // Split into lines
         std::istringstream stream(std::string(source));
         std::string line;
         size_t lineNum = 0;
@@ -1628,11 +1809,10 @@ public:
         while (std::getline(stream, line)) {
             lineNum++;
 
-            // Check for dangerous patterns
             bool isFlagged = false;
-            std::string reason;
 
-            if (ContainsCI(line, "wscript.shell")) {
+            if (ContainsCI(line, "wscript.shell") ||
+                ContainsCI(line, "shell.application")) {
                 isFlagged = true;
             } else if (ContainsCI(line, ".run") || ContainsCI(line, ".exec")) {
                 isFlagged = true;
@@ -1644,6 +1824,15 @@ public:
                 isFlagged = true;
             } else if (ContainsCI(line, "regwrite") || ContainsCI(line, "regread")) {
                 isFlagged = true;
+            } else if (ContainsCI(line, "xmlhttp") || ContainsCI(line, "winhttprequest")) {
+                isFlagged = true;
+            } else if (ContainsCI(line, "mshta") || ContainsCI(line, "cscript") ||
+                       ContainsCI(line, "wscript")) {
+                isFlagged = true;
+            } else if (ContainsCI(line, "regsvr32") || ContainsCI(line, ".sct")) {
+                isFlagged = true;
+            } else if (ContainsCI(line, "winmgmts:") || ContainsCI(line, "execmethod")) {
+                isFlagged = true;
             }
 
             if (isFlagged) {
@@ -1652,6 +1841,53 @@ public:
         }
 
         return flagged;
+    }
+
+    void DetectAttackChains(std::string_view source, VBSScanResult& result) {
+        // Download + Write + Execute chain (Emotet/TrickBot/Qbot dropper pattern)
+        bool hasDownload = ContainsCI(source, "xmlhttp") ||
+                          ContainsCI(source, "winhttprequest") ||
+                          ContainsCI(source, "serverxmlhttp");
+        bool hasBinaryWrite = ContainsCI(source, "adodb.stream") ||
+                             ContainsCI(source, "savetofile");
+        bool hasExec = ContainsCI(source, "wscript.shell") ||
+                      ContainsCI(source, ".run") ||
+                      ContainsCI(source, "shell.application");
+
+        if (hasDownload && hasBinaryWrite && hasExec) {
+            result.matchedSignatures.push_back("CHAIN:Download+Write+Execute");
+            Utils::Logger::Warn(L"VBScriptScanner: Detected download-write-execute chain");
+        }
+
+        if (hasDownload && hasBinaryWrite) {
+            result.matchedSignatures.push_back("CHAIN:Download+Write");
+        }
+
+        // mshta.exe / cscript.exe / wscript.exe invocation from script
+        if (ContainsCI(source, "mshta") &&
+            (ContainsCI(source, "vbscript:") || ContainsCI(source, ".hta"))) {
+            result.matchedSignatures.push_back("CHAIN:MshtaVBScript");
+        }
+
+        // RegSvr32 scriptlet abuse
+        if (ContainsCI(source, "regsvr32") &&
+            (ContainsCI(source, "/s") || ContainsCI(source, "/i:") ||
+             ContainsCI(source, ".sct"))) {
+            result.matchedSignatures.push_back("CHAIN:RegSvr32Scriptlet");
+        }
+
+        // WMI process creation chain
+        if (ContainsCI(source, "winmgmts:") && ContainsCI(source, "win32_process") &&
+            ContainsCI(source, "create")) {
+            result.matchedSignatures.push_back("CHAIN:WMI_ProcessCreate");
+        }
+
+        // Environ("TEMP") + file write (VBA dropper)
+        if (ContainsCI(source, "environ") && ContainsCI(source, "temp") &&
+            (ContainsCI(source, "createtextfile") || ContainsCI(source, "savetofile") ||
+             ContainsCI(source, "opentextfile"))) {
+            result.matchedSignatures.push_back("CHAIN:TempDirDrop");
+        }
     }
 
     std::string DetermineThreatName(const VBSScanResult& result) {
@@ -1766,6 +2002,37 @@ public:
             if (urls.empty()) {
                 Utils::Logger::Error(L"VBScriptScanner: Self-test failed: URL extraction");
                 passed = false;
+            }
+
+            // Test 6: WinHttp.WinHttpRequest detection
+            std::string winHttpSample = "Set http = CreateObject(\"WinHttp.WinHttpRequest.5.1\")";
+            auto winHttpCom = AnalyzeCOMUsage(winHttpSample);
+            if (winHttpCom.empty() || !winHttpCom[0].isDangerous) {
+                Utils::Logger::Error(L"VBScriptScanner: Self-test failed: WinHttp detection");
+                passed = false;
+            }
+
+            // Test 7: StrReverse deobfuscation
+            std::string reverseSample = "x = StrReverse(\"dlroW olleH\")";
+            auto reverseResult = ResolveStrReverse(reverseSample);
+            if (reverseResult.find("Hello World") == std::string::npos) {
+                Utils::Logger::Error(L"VBScriptScanner: Self-test failed: StrReverse deobfuscation");
+                passed = false;
+            }
+
+            // Test 8: VBE decode structure validation
+            // Validate the decode tables are internally consistent (no 0xFF at printable positions)
+            for (int table = 0; table < 3; ++table) {
+                size_t validCount = 0;
+                for (int c = 0x20; c < 0x7F; ++c) {
+                    if (VBE_DECODE_TABLE[table][c] != 0xFF) {
+                        validCount++;
+                    }
+                }
+                if (validCount < 90) {
+                    Utils::Logger::Error(L"VBScriptScanner: Self-test failed: VBE decode table {} has too few valid entries", table);
+                    passed = false;
+                }
             }
 
         } catch (const std::exception& e) {
@@ -1989,6 +2256,7 @@ std::string_view GetDangerousObjectTypeName(DangerousObjectType type) noexcept {
         case DangerousObjectType::OfficeApp: return "Office.Application";
         case DangerousObjectType::Network: return "WScript.Network";
         case DangerousObjectType::IE: return "InternetExplorer.Application";
+        case DangerousObjectType::WinHttp: return "WinHttp.WinHttpRequest";
         default: return "None";
     }
 }
