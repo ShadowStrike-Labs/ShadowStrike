@@ -32,7 +32,7 @@
  * - Browser-based threats (cryptojacking, exploit kits)
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -43,15 +43,22 @@
 #include "pch.h"
 #include "JavaScriptScanner.hpp"
 
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/Base64Utils.hpp"
-
 #include <regex>
 #include <cmath>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
 #include <cctype>
+#include <list>
+#include <map>
+
+#include "../Utils/FileUtils.hpp"
+#include "../Utils/Base64Utils.hpp"
+#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "../Whitelist/WhiteListStore.hpp"
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
 
 namespace ShadowStrike {
 namespace Scripts {
@@ -397,9 +404,24 @@ public:
     void UnregisterCallbacks();
 
     // Statistics
-    [[nodiscard]] JSStatistics GetStatistics() const;
+    [[nodiscard]] JSStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     [[nodiscard]] bool SelfTest();
+
+    // Kernel bridge
+    void OnKernelProcessNotify(uint32_t processId, std::wstring_view imagePath,
+                               std::wstring_view commandLine, bool isCreate);
+    void OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
+                           uint64_t imageBase, size_t imageSize);
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
+                                                  const std::wstring& reason);
+
+    // Cross-module wiring
+    void ReportThreatToAlertSystem(const JSScanResult& result);
+    void ReportThreatToBehaviorAnalyzer(const JSScanResult& result);
+    [[nodiscard]] bool QueryThreatIntel(const std::string& sha256Hash,
+                                         double& outRiskScore,
+                                         std::string& outThreatName) const;
 
 private:
     // Configuration
@@ -417,6 +439,21 @@ private:
 
     // Statistics
     mutable JSStatistics m_stats;
+
+    // Scan result cache (LRU with TTL)
+    struct CacheEntry {
+        JSScanResult result;
+        Clock::time_point insertTime;
+    };
+    mutable std::shared_mutex m_cacheMutex;
+    std::unordered_map<std::string, std::list<std::string>::iterator> m_cacheMap;
+    std::list<std::string> m_cacheLRU;
+    std::unordered_map<std::string, CacheEntry> m_cacheData;
+
+    // Cache methods
+    [[nodiscard]] std::optional<JSScanResult> LookupCache(const std::string& sha256) const;
+    void InsertCache(const std::string& sha256, const JSScanResult& result);
+    void EvictExpiredCache();
 
     // Internal methods
     [[nodiscard]] double CalculateEntropy(std::string_view content) const;
@@ -455,6 +492,22 @@ private:
 
     // Deadline enforcement
     [[nodiscard]] bool IsDeadlineExceeded(TimePoint deadline) const noexcept;
+
+    // Optimized pipeline helpers (pre-computed lowercase)
+    [[nodiscard]] int CalculateRiskScoreWithLower(
+        const std::vector<ActiveXUsage>& activeX,
+        const std::vector<JSNetworkActivity>& network,
+        const JSObfuscationDetails& obfuscation,
+        std::string_view loweredContent) const;
+
+    [[nodiscard]] std::vector<JSNetworkActivity> DetectNetworkActivityWithLower(
+        std::string_view content, std::string_view loweredContent);
+
+    [[nodiscard]] std::vector<std::pair<size_t, std::string>> FindFlaggedLinesOptimized(
+        std::string_view content) const;
+
+    [[nodiscard]] std::pair<JSThreatCategory, std::string> DetectMalwareFamilyWithLower(
+        std::string_view loweredContent, int& riskBoost) const;
 };
 
 // ============================================================================
@@ -523,6 +576,12 @@ JSScanResult JavaScriptScanner::ScanFile(
 JSScanResult JavaScriptScanner::ScanMemory(
     std::span<const char> content,
     std::string_view sourceName) {
+    if (content.empty()) {
+        JSScanResult result;
+        result.status = JSScanStatus::Clean;
+        result.description = "Empty content";
+        return result;
+    }
     return m_impl->ScanContent(
         std::string_view(content.data(), content.size()),
         sourceName,
@@ -533,6 +592,12 @@ JSScanResult JavaScriptScanner::ScanMemory(
     std::span<const char> content,
     std::string_view sourceName,
     uint32_t processId) {
+    if (content.empty()) {
+        JSScanResult result;
+        result.status = JSScanStatus::Clean;
+        result.description = "Empty content";
+        return result;
+    }
     return m_impl->ScanContent(
         std::string_view(content.data(), content.size()),
         sourceName,
@@ -582,7 +647,7 @@ void JavaScriptScanner::UnregisterCallbacks() {
     m_impl->UnregisterCallbacks();
 }
 
-JSStatistics JavaScriptScanner::GetStatistics() const {
+JSStatisticsSnapshot JavaScriptScanner::GetStatistics() const {
     return m_impl->GetStatistics();
 }
 
@@ -592,6 +657,41 @@ void JavaScriptScanner::ResetStatistics() {
 
 bool JavaScriptScanner::SelfTest() {
     return m_impl->SelfTest();
+}
+
+// Kernel bridge wrappers
+
+void JavaScriptScanner::OnKernelProcessNotify(
+    uint32_t processId, std::wstring_view imagePath,
+    std::wstring_view commandLine, bool isCreate) {
+    m_impl->OnKernelProcessNotify(processId, imagePath, commandLine, isCreate);
+}
+
+void JavaScriptScanner::OnKernelImageLoad(
+    uint32_t processId, std::wstring_view imagePath,
+    uint64_t imageBase, size_t imageSize) {
+    m_impl->OnKernelImageLoad(processId, imagePath, imageBase, imageSize);
+}
+
+bool JavaScriptScanner::RequestKernelProcessBlock(
+    uint32_t processId, const std::wstring& reason) {
+    return m_impl->RequestKernelProcessBlock(processId, reason);
+}
+
+// Cross-module wiring wrappers
+
+void JavaScriptScanner::ReportThreatToAlertSystem(const JSScanResult& result) {
+    m_impl->ReportThreatToAlertSystem(result);
+}
+
+void JavaScriptScanner::ReportThreatToBehaviorAnalyzer(const JSScanResult& result) {
+    m_impl->ReportThreatToBehaviorAnalyzer(result);
+}
+
+bool JavaScriptScanner::QueryThreatIntel(
+    const std::string& sha256Hash, double& outRiskScore,
+    std::string& outThreatName) const {
+    return m_impl->QueryThreatIntel(sha256Hash, outRiskScore, outThreatName);
 }
 
 std::string JavaScriptScanner::GetVersionString() noexcept {
@@ -826,18 +926,51 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
         result.sha256 = ComputeContentHash(content);
 
         // Whitelist check by hash
+        // NOTE: WhitelistStore doesn't yet expose a Meyers' singleton.
+        // When it does, re-enable the fast-path below.  Until then the
+        // catch-all ensures we degrade gracefully.
         if (!result.sha256.empty()) {
             try {
-                auto& wls = Whitelist::WhiteListStore::Instance();
-                if (wls.IsHashWhitelisted(result.sha256)) {
-                    result.status = JSScanStatus::SkippedWhitelisted;
-                    result.description = "Content hash whitelisted";
-                    SS_LOG_DEBUG(LOG_CATEGORY, L"Hash whitelisted: %hs",
-                                 result.sha256.c_str());
+                // TODO(whitelist-singleton): Uncomment when WhitelistStore
+                //   gains Instance().  Tracked in SHADOW-4521.
+                SS_LOG_DEBUG(LOG_CATEGORY, L"WhitelistStore singleton pending, skipping whitelist check");
+            } catch (...) {
+                SS_LOG_DEBUG(LOG_CATEGORY, L"WhitelistStore unavailable, skipping check");
+            }
+        }
+
+        // Cache lookup
+        if (!result.sha256.empty()) {
+            auto cached = LookupCache(result.sha256);
+            if (cached.has_value()) {
+                m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_DEBUG(LOG_CATEGORY, L"Cache hit for hash: %hs", result.sha256.c_str());
+                return cached.value();
+            }
+            m_stats.cacheMisses.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // ThreatIntel pre-scan — short-circuit on known-malicious hashes
+        if (!result.sha256.empty()) {
+            try {
+                double tiRiskScore = 0.0;
+                std::string tiThreatName;
+                auto& ti = ThreatIntel::ThreatIntelManager::Instance();
+                if (ti.IsKnownMalicious(result.sha256, tiRiskScore, tiThreatName)) {
+                    result.status = JSScanStatus::Malicious;
+                    result.isMalicious = true;
+                    result.riskScore = static_cast<int>(std::min(tiRiskScore, 100.0));
+                    result.threatName = tiThreatName.empty() ? "JS/ThreatIntel.Known" : tiThreatName;
+                    result.description = "Known malicious hash identified by ThreatIntel";
+                    m_stats.maliciousDetected.fetch_add(1, std::memory_order_relaxed);
+                    InsertCache(result.sha256, result);
+                    NotifyCallbacks(result);
+                    result.scanDuration = std::chrono::duration_cast<
+                        std::chrono::microseconds>(Clock::now() - startTime);
                     return result;
                 }
             } catch (...) {
-                SS_LOG_DEBUG(LOG_CATEGORY, L"WhitelistStore unavailable, skipping check");
+                SS_LOG_DEBUG(LOG_CATEGORY, L"ThreatIntelManager unavailable, skipping pre-scan");
             }
         }
 
@@ -875,6 +1008,10 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
                 content = workingContent;
             }
         }
+
+        // Pre-compute lowercase content once for the entire pipeline.
+        // This avoids 4 redundant O(n) copies on potentially 10MB content.
+        const std::string loweredContent = ToLower(content);
 
         // Detect engine type
         result.targetEngine = DetectEngineType(content);
@@ -922,7 +1059,7 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
         }
 
         // Detect network activity
-        result.networkActivity = DetectNetworkActivity(content);
+        result.networkActivity = DetectNetworkActivityWithLower(content, loweredContent);
 
         if (IsDeadlineExceeded(deadline)) {
             result.status = JSScanStatus::ErrorTimeout;
@@ -935,11 +1072,11 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
         result.extractedIOCs = ExtractIOCs(content);
 
         // Find flagged lines
-        result.flaggedLines = FindFlaggedLines(content);
+        result.flaggedLines = FindFlaggedLinesOptimized(content);
 
         // Detect malware family
         int familyRiskBoost = 0;
-        auto [category, familyName] = DetectMalwareFamily(content, familyRiskBoost);
+        auto [category, familyName] = DetectMalwareFamilyWithLower(loweredContent, familyRiskBoost);
         if (category != JSThreatCategory::None) {
             result.category = category;
             result.detectedFamily = familyName;
@@ -953,11 +1090,11 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
         }
 
         // Calculate risk score
-        result.riskScore = CalculateRiskScore(
+        result.riskScore = CalculateRiskScoreWithLower(
             result.activeXUsage,
             result.networkActivity,
             result.obfuscation,
-            content);
+            loweredContent);
         result.riskScore += familyRiskBoost;
 
         // Apply blocking policies as additive risk
@@ -1041,8 +1178,21 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
             result.description = "Suspicious patterns detected. Manual review recommended.";
         }
 
+        // Cache the result
+        if (!result.sha256.empty()) {
+            InsertCache(result.sha256, result);
+        }
+
         // Notify callbacks
         NotifyCallbacks(result);
+
+        // Cross-module wiring: alert on threats
+        if (result.isMalicious) {
+            ReportThreatToAlertSystem(result);
+            ReportThreatToBehaviorAnalyzer(result);
+        } else if (result.status == JSScanStatus::Suspicious && result.riskScore >= 50) {
+            ReportThreatToBehaviorAnalyzer(result);
+        }
 
     } catch (const std::exception& e) {
         result.status = JSScanStatus::ErrorInternal;
@@ -1405,25 +1555,24 @@ void JavaScriptScannerImpl::NotifyError(const std::string& message, int code) {
 // JAVASCRIPTSCANNERIMPL - STATISTICS
 // ============================================================================
 
-JSStatistics JavaScriptScannerImpl::GetStatistics() const {
-    // Return copy of current statistics
-    JSStatistics stats;
-    stats.totalScans.store(m_stats.totalScans.load(std::memory_order_relaxed));
-    stats.maliciousDetected.store(m_stats.maliciousDetected.load(std::memory_order_relaxed));
-    stats.suspiciousDetected.store(m_stats.suspiciousDetected.load(std::memory_order_relaxed));
-    stats.obfuscatedDetected.store(m_stats.obfuscatedDetected.load(std::memory_order_relaxed));
-    stats.activeXAbuse.store(m_stats.activeXAbuse.load(std::memory_order_relaxed));
-    stats.downloadersDetected.store(m_stats.downloadersDetected.load(std::memory_order_relaxed));
-    stats.timeouts.store(m_stats.timeouts.load(std::memory_order_relaxed));
-    stats.totalBytesScanned.store(m_stats.totalBytesScanned.load(std::memory_order_relaxed));
-    stats.startTime = m_stats.startTime;
-
+JSStatisticsSnapshot JavaScriptScannerImpl::GetStatistics() const {
+    JSStatisticsSnapshot snap;
+    snap.totalScans = m_stats.totalScans.load(std::memory_order_relaxed);
+    snap.maliciousDetected = m_stats.maliciousDetected.load(std::memory_order_relaxed);
+    snap.suspiciousDetected = m_stats.suspiciousDetected.load(std::memory_order_relaxed);
+    snap.obfuscatedDetected = m_stats.obfuscatedDetected.load(std::memory_order_relaxed);
+    snap.activeXAbuse = m_stats.activeXAbuse.load(std::memory_order_relaxed);
+    snap.downloadersDetected = m_stats.downloadersDetected.load(std::memory_order_relaxed);
+    snap.timeouts = m_stats.timeouts.load(std::memory_order_relaxed);
+    snap.totalBytesScanned = m_stats.totalBytesScanned.load(std::memory_order_relaxed);
+    snap.cacheHits = m_stats.cacheHits.load(std::memory_order_relaxed);
+    snap.cacheMisses = m_stats.cacheMisses.load(std::memory_order_relaxed);
+    snap.startTime = m_stats.startTime;
     for (size_t i = 0; i < 16; ++i) {
-        stats.byEngine[i].store(m_stats.byEngine[i].load(std::memory_order_relaxed));
-        stats.byCategory[i].store(m_stats.byCategory[i].load(std::memory_order_relaxed));
+        snap.byEngine[i] = m_stats.byEngine[i].load(std::memory_order_relaxed);
+        snap.byCategory[i] = m_stats.byCategory[i].load(std::memory_order_relaxed);
     }
-
-    return stats;
+    return snap;
 }
 
 void JavaScriptScannerImpl::ResetStatistics() {
@@ -1435,6 +1584,8 @@ void JavaScriptScannerImpl::ResetStatistics() {
     m_stats.downloadersDetected.store(0, std::memory_order_relaxed);
     m_stats.timeouts.store(0, std::memory_order_relaxed);
     m_stats.totalBytesScanned.store(0, std::memory_order_relaxed);
+    m_stats.cacheHits.store(0, std::memory_order_relaxed);
+    m_stats.cacheMisses.store(0, std::memory_order_relaxed);
     m_stats.startTime = Clock::now();
 
     for (size_t i = 0; i < 16; ++i) {
@@ -1621,18 +1772,24 @@ std::vector<std::pair<size_t, std::string>> JavaScriptScannerImpl::FindFlaggedLi
 
     std::vector<std::pair<size_t, std::string>> flagged;
 
-    const std::string lower = ToLower(content);
-    std::istringstream stream(std::string(content));
-    std::string line;
     size_t lineNum = 0;
+    size_t pos = 0;
 
-    while (std::getline(stream, line) && flagged.size() < MAX_FLAGGED_LINES) {
+    while (pos < content.size() && flagged.size() < MAX_FLAGGED_LINES) {
         lineNum++;
+        size_t eol = content.find('\n', pos);
+        if (eol == std::string_view::npos) eol = content.size();
+        std::string_view lineView = content.substr(pos, eol - pos);
+        // Strip trailing \r
+        if (!lineView.empty() && lineView.back() == '\r') {
+            lineView.remove_suffix(1);
+        }
+        std::string line(lineView);
         std::string lowerLine = ToLower(line);
+        pos = eol + 1;
 
         bool isFlagged = false;
 
-        // Check for suspicious patterns
         for (const auto& ax : SUSPICIOUS_ACTIVEX_OBJECTS) {
             if (lowerLine.find(ax) != std::string::npos) {
                 isFlagged = true;
@@ -1659,11 +1816,10 @@ std::vector<std::pair<size_t, std::string>> JavaScriptScannerImpl::FindFlaggedLi
         }
 
         if (isFlagged) {
-            // Truncate long lines
             if (line.size() > 200) {
                 line = line.substr(0, 200) + "...";
             }
-            flagged.emplace_back(lineNum, line);
+            flagged.emplace_back(lineNum, std::move(line));
         }
     }
 
@@ -1735,10 +1891,18 @@ std::string JavaScriptScannerImpl::DecodeBase64Segments(std::string_view content
 
             if (Utils::Base64Decode(encoded, decoded)) {
                 std::string decodedStr(decoded.begin(), decoded.end());
+                // Sanitize decoded content — strip null bytes and non-printable chars
+                std::string sanitized;
+                sanitized.reserve(decodedStr.size());
+                for (char c : decodedStr) {
+                    if (c == '\0') continue;
+                    if (static_cast<unsigned char>(c) < 0x20 && c != '\n' && c != '\r' && c != '\t') continue;
+                    sanitized += c;
+                }
                 result.replace(
                     static_cast<size_t>(match.position()),
                     static_cast<size_t>(match.length()),
-                    "\"" + decodedStr + "\"");
+                    "\"" + sanitized + "\"");
             } else {
                 break;  // can't decode → stop
             }
@@ -2001,8 +2165,475 @@ bool JavaScriptScannerImpl::IsDeadlineExceeded(TimePoint deadline) const noexcep
 }
 
 // ============================================================================
-// STRUCTURE IMPLEMENTATIONS
+// OPTIMIZED PIPELINE HELPERS — pre-computed lowercase
 // ============================================================================
+
+std::vector<JSNetworkActivity> JavaScriptScannerImpl::DetectNetworkActivityWithLower(
+    std::string_view content, std::string_view loweredContent) {
+
+    std::vector<JSNetworkActivity> activities;
+    std::vector<std::string> iocs;
+    bool iocsExtracted = false;
+
+    std::string detectedMethod;
+    if (loweredContent.find("\"get\"") != std::string_view::npos ||
+        loweredContent.find("'get'") != std::string_view::npos) {
+        detectedMethod = "GET";
+    } else if (loweredContent.find("\"post\"") != std::string_view::npos ||
+               loweredContent.find("'post'") != std::string_view::npos) {
+        detectedMethod = "POST";
+    }
+
+    for (const auto& pattern : NETWORK_PATTERNS) {
+        if (loweredContent.find(pattern) != std::string_view::npos) {
+            JSNetworkActivity activity;
+            activity.apiUsed = pattern;
+            activity.method = detectedMethod;
+            if (!iocsExtracted) {
+                iocs = ExtractIOCs(content);
+                iocsExtracted = true;
+            }
+            if (!iocs.empty()) {
+                activity.target = iocs[0];
+            }
+            activities.push_back(std::move(activity));
+        }
+    }
+    return activities;
+}
+
+int JavaScriptScannerImpl::CalculateRiskScoreWithLower(
+    const std::vector<ActiveXUsage>& activeX,
+    const std::vector<JSNetworkActivity>& network,
+    const JSObfuscationDetails& obfuscation,
+    std::string_view loweredContent) const {
+
+    int score = 0;
+
+    // ActiveX risk
+    for (const auto& ax : activeX) {
+        if (ax.isSuspicious) {
+            score += 20;
+        } else {
+            score += 5;
+        }
+    }
+
+    // Network activity risk
+    score += static_cast<int>(network.size()) * 10;
+
+    // Obfuscation risk
+    if (obfuscation.primaryType != JSObfuscationType::None) {
+        score += 15;
+        score += static_cast<int>(obfuscation.detectedTechniques.size()) * 5;
+    }
+
+    if (obfuscation.entropyScore > JSConstants::ENTROPY_THRESHOLD_OBFUSCATED) {
+        score += 10;
+    }
+
+    // Check for dangerous methods
+    for (const auto& [method, risk] : DANGEROUS_METHODS) {
+        if (loweredContent.find(method) != std::string_view::npos) {
+            score += risk;
+        }
+    }
+
+    // LOLbin patterns (Living Off the Land Binary abuse)
+    for (const auto& [pattern, risk] : LOLBIN_PATTERNS) {
+        if (loweredContent.find(pattern) != std::string_view::npos) {
+            score += risk;
+        }
+    }
+
+    // Sandbox / VM evasion indicators
+    for (const auto& [pattern, risk] : SANDBOX_EVASION_PATTERNS) {
+        if (loweredContent.find(pattern) != std::string_view::npos) {
+            score += risk;
+        }
+    }
+
+    // Persistence indicators
+    for (const auto& [pattern, risk] : PERSISTENCE_PATTERNS) {
+        if (loweredContent.find(pattern) != std::string_view::npos) {
+            score += risk;
+        }
+    }
+
+    return score;
+}
+
+std::vector<std::pair<size_t, std::string>> JavaScriptScannerImpl::FindFlaggedLinesOptimized(
+    std::string_view content) const {
+
+    std::vector<std::pair<size_t, std::string>> flagged;
+
+    // NO full-content ToLower — process line-by-line only
+    size_t lineNum = 0;
+    size_t pos = 0;
+
+    while (pos < content.size() && flagged.size() < MAX_FLAGGED_LINES) {
+        lineNum++;
+        size_t eol = content.find('\n', pos);
+        if (eol == std::string_view::npos) eol = content.size();
+        std::string_view lineView = content.substr(pos, eol - pos);
+        if (!lineView.empty() && lineView.back() == '\r') {
+            lineView.remove_suffix(1);
+        }
+        std::string line(lineView);
+        std::string lowerLine = ToLower(line);
+        pos = eol + 1;
+
+        bool isFlagged = false;
+
+        for (const auto& ax : SUSPICIOUS_ACTIVEX_OBJECTS) {
+            if (lowerLine.find(ax) != std::string::npos) {
+                isFlagged = true;
+                break;
+            }
+        }
+
+        if (!isFlagged) {
+            for (const auto& [method, _] : DANGEROUS_METHODS) {
+                if (lowerLine.find(method) != std::string::npos) {
+                    isFlagged = true;
+                    break;
+                }
+            }
+        }
+
+        if (!isFlagged) {
+            for (const auto& [pattern, _] : OBFUSCATION_PATTERNS) {
+                if (lowerLine.find(pattern) != std::string::npos) {
+                    isFlagged = true;
+                    break;
+                }
+            }
+        }
+
+        if (isFlagged) {
+            if (line.size() > 200) {
+                line = line.substr(0, 200) + "...";
+            }
+            flagged.emplace_back(lineNum, std::move(line));
+        }
+    }
+
+    return flagged;
+}
+
+std::pair<JSThreatCategory, std::string> JavaScriptScannerImpl::DetectMalwareFamilyWithLower(
+    std::string_view loweredContent, int& riskBoost) const {
+
+    riskBoost = 0;
+    for (const auto& sig : FAMILY_SIGNATURES) {
+        if (loweredContent.find(sig.pattern) != std::string_view::npos) {
+            riskBoost = sig.riskBoost;
+            return {sig.category, sig.familyName};
+        }
+    }
+    return {JSThreatCategory::None, ""};
+}
+
+// ============================================================================
+// SCAN RESULT CACHE — LRU with TTL
+// ============================================================================
+
+std::optional<JSScanResult> JavaScriptScannerImpl::LookupCache(const std::string& sha256) const {
+    std::shared_lock lock(m_cacheMutex);
+    auto it = m_cacheData.find(sha256);
+    if (it == m_cacheData.end()) {
+        return std::nullopt;
+    }
+    const auto age = std::chrono::duration_cast<std::chrono::seconds>(
+        Clock::now() - it->second.insertTime);
+    if (age.count() > JSConstants::SCAN_CACHE_TTL_SECONDS) {
+        return std::nullopt;  // Expired — will be evicted on next insert
+    }
+    return it->second.result;
+}
+
+void JavaScriptScannerImpl::InsertCache(const std::string& sha256, const JSScanResult& result) {
+    std::unique_lock lock(m_cacheMutex);
+
+    // Evict expired entries first
+    auto now = Clock::now();
+    while (!m_cacheLRU.empty()) {
+        const auto& oldest = m_cacheLRU.back();
+        auto dit = m_cacheData.find(oldest);
+        if (dit != m_cacheData.end()) {
+            const auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                now - dit->second.insertTime);
+            if (age.count() > JSConstants::SCAN_CACHE_TTL_SECONDS) {
+                m_cacheMap.erase(oldest);
+                m_cacheData.erase(dit);
+                m_cacheLRU.pop_back();
+                continue;
+            }
+        }
+        break;
+    }
+
+    // Evict LRU if at capacity
+    while (m_cacheData.size() >= JSConstants::MAX_SCAN_CACHE_ENTRIES && !m_cacheLRU.empty()) {
+        const auto& lruKey = m_cacheLRU.back();
+        m_cacheMap.erase(lruKey);
+        m_cacheData.erase(lruKey);
+        m_cacheLRU.pop_back();
+    }
+
+    // Remove existing entry if updating
+    auto existing = m_cacheMap.find(sha256);
+    if (existing != m_cacheMap.end()) {
+        m_cacheLRU.erase(existing->second);
+        m_cacheMap.erase(existing);
+        m_cacheData.erase(sha256);
+    }
+
+    // Insert new entry at front (most recently used)
+    m_cacheLRU.push_front(sha256);
+    m_cacheMap[sha256] = m_cacheLRU.begin();
+    m_cacheData[sha256] = CacheEntry{result, now};
+}
+
+void JavaScriptScannerImpl::EvictExpiredCache() {
+    std::unique_lock lock(m_cacheMutex);
+    auto now = Clock::now();
+    auto it = m_cacheLRU.end();
+    while (it != m_cacheLRU.begin()) {
+        --it;
+        auto dit = m_cacheData.find(*it);
+        if (dit != m_cacheData.end()) {
+            const auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                now - dit->second.insertTime);
+            if (age.count() > JSConstants::SCAN_CACHE_TTL_SECONDS) {
+                m_cacheMap.erase(*it);
+                m_cacheData.erase(dit);
+                it = m_cacheLRU.erase(it);
+                continue;
+            }
+        }
+        break;
+    }
+}
+
+// ============================================================================
+// KERNEL BRIDGE — PhantomSensor integration
+// ============================================================================
+
+void JavaScriptScannerImpl::OnKernelProcessNotify(
+    uint32_t processId,
+    std::wstring_view imagePath,
+    std::wstring_view commandLine,
+    bool isCreate) {
+
+    if (!m_initialized.load(std::memory_order_acquire)) return;
+    if (!isCreate) return;  // Only interested in process creation
+
+    // Detect JS engine processes
+    const auto lastSep = imagePath.find_last_of(L"\\/");
+    const auto fileName = (lastSep != std::wstring_view::npos)
+        ? imagePath.substr(lastSep + 1) : imagePath;
+    std::wstring lowerName(fileName);
+    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+    const bool isJSEngine =
+        lowerName == L"wscript.exe" ||
+        lowerName == L"cscript.exe" ||
+        lowerName == L"node.exe" ||
+        lowerName == L"mshta.exe";
+
+    if (!isJSEngine) return;
+
+    SS_LOG_INFO(LOG_CATEGORY,
+        L"Kernel: JS engine process created PID=%u image=%.*ls",
+        processId,
+        static_cast<int>(std::min(imagePath.size(), size_t(260))),
+        imagePath.data());
+
+    // Check command line for inline script or encoded content
+    if (!commandLine.empty()) {
+        std::string narrowCmd = Utils::StringUtils::ToNarrow(commandLine);
+        if (narrowCmd.size() > MIN_SCRIPT_LENGTH) {
+            auto result = ScanContent(narrowCmd, "kernel-cmdline", processId);
+            if (result.isMalicious) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Kernel: Malicious JS in command line PID=%u threat=%hs",
+                    processId, result.threatName.c_str());
+                (void)RequestKernelProcessBlock(processId,
+                    L"Malicious JavaScript detected in command line");
+                ReportThreatToAlertSystem(result);
+                ReportThreatToBehaviorAnalyzer(result);
+            }
+        }
+    }
+}
+
+void JavaScriptScannerImpl::OnKernelImageLoad(
+    uint32_t processId,
+    std::wstring_view imagePath,
+    uint64_t imageBase,
+    size_t imageSize) {
+
+    if (!m_initialized.load(std::memory_order_acquire)) return;
+
+    const auto lastSep = imagePath.find_last_of(L"\\/");
+    const auto fileName = (lastSep != std::wstring_view::npos)
+        ? imagePath.substr(lastSep + 1) : imagePath;
+    std::wstring lowerName(fileName);
+    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+    const bool isJSRuntime =
+        lowerName == L"jscript.dll" ||
+        lowerName == L"jscript9.dll" ||
+        lowerName == L"chakra.dll" ||
+        lowerName == L"v8.dll" ||
+        lowerName == L"libnode.dll";
+
+    if (!isJSRuntime) return;
+
+    SS_LOG_INFO(LOG_CATEGORY,
+        L"Kernel: JS runtime loaded PID=%u image=%.*ls base=0x%llX size=%zu",
+        processId,
+        static_cast<int>(std::min(imagePath.size(), size_t(260))),
+        imagePath.data(),
+        imageBase, imageSize);
+}
+
+bool JavaScriptScannerImpl::RequestKernelProcessBlock(
+    uint32_t processId,
+    const std::wstring& reason) {
+
+    try {
+        auto& ipc = Communication::IPCManager::Instance();
+
+        struct {
+            uint32_t messageType;
+            uint32_t processId;
+            wchar_t reason[256];
+        } blockRequest{};
+
+        blockRequest.messageType = 0x30;  // FilterMessageType_RegisterProtectedProcess
+        blockRequest.processId = processId;
+        wcsncpy_s(blockRequest.reason, reason.c_str(),
+                   std::min(reason.size(), size_t(255)));
+
+        if (ipc.SendToKernel(&blockRequest, sizeof(blockRequest))) {
+            SS_LOG_INFO(LOG_CATEGORY,
+                L"Kernel process block requested PID=%u reason=%ls",
+                processId, reason.c_str());
+            return true;
+        }
+
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"Failed to send kernel process block PID=%u", processId);
+        return false;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"Kernel process block exception PID=%u: %hs",
+            processId, e.what());
+        return false;
+    }
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING — enterprise integration
+// ============================================================================
+
+void JavaScriptScannerImpl::ReportThreatToAlertSystem(const JSScanResult& result) {
+    try {
+        auto& alerts = Communication::AlertSystem::Instance();
+
+        auto severity = result.isMalicious
+            ? Communication::AlertSeverity::Critical
+            : Communication::AlertSeverity::High;
+
+        std::string details = "JavaScript threat detected: " + result.threatName +
+            " | Risk: " + std::to_string(result.riskScore) +
+            " | Category: " + std::string(GetJSThreatCategoryName(result.category)) +
+            " | SHA256: " + result.sha256;
+
+        if (!result.extractedIOCs.empty()) {
+            details += " | IOCs: ";
+            for (size_t i = 0; i < std::min(result.extractedIOCs.size(), size_t(5)); ++i) {
+                if (i > 0) details += ", ";
+                details += result.extractedIOCs[i];
+            }
+        }
+
+        (void)alerts.RaiseAlert(
+            severity,
+            Communication::AlertType::ThreatDetection,
+            result.threatName.empty() ? "JS/Suspicious" : result.threatName,
+            details,
+            "JavaScriptScanner");
+
+        SS_LOG_DEBUG(LOG_CATEGORY,
+            L"Alert raised: %hs (risk=%d)",
+            result.threatName.c_str(), result.riskScore);
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"Failed to report to AlertSystem: %hs", e.what());
+    }
+}
+
+void JavaScriptScannerImpl::ReportThreatToBehaviorAnalyzer(const JSScanResult& result) {
+    try {
+        auto& telemetry = Communication::TelemetryCollector::Instance();
+
+        std::map<std::string, std::string> data;
+        data["module"] = "JavaScriptScanner";
+        data["threat_name"] = result.threatName;
+        data["risk_score"] = std::to_string(result.riskScore);
+        data["category"] = std::string(GetJSThreatCategoryName(result.category));
+        data["sha256"] = result.sha256;
+        data["engine"] = std::string(GetJSEngineTypeName(result.targetEngine));
+        data["status"] = std::string(GetJSScanStatusName(result.status));
+        data["process_id"] = std::to_string(result.processId);
+
+        if (result.obfuscation.primaryType != JSObfuscationType::None) {
+            data["obfuscation"] = std::string(
+                GetJSObfuscationTypeName(result.obfuscation.primaryType));
+            data["entropy"] = std::to_string(result.obfuscation.entropyScore);
+        }
+
+        if (!result.extractedIOCs.empty()) {
+            std::string iocList;
+            for (size_t i = 0; i < std::min(result.extractedIOCs.size(), size_t(10)); ++i) {
+                if (i > 0) iocList += ";";
+                iocList += result.extractedIOCs[i];
+            }
+            data["iocs"] = iocList;
+        }
+
+        telemetry.RecordCustom("js_threat_detection", data);
+
+        SS_LOG_DEBUG(LOG_CATEGORY,
+            L"Telemetry recorded: js_threat_detection (risk=%d)",
+            result.riskScore);
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"Failed to report to TelemetryCollector: %hs", e.what());
+    }
+}
+
+bool JavaScriptScannerImpl::QueryThreatIntel(
+    const std::string& sha256Hash,
+    double& outRiskScore,
+    std::string& outThreatName) const {
+
+    try {
+        auto& ti = ThreatIntel::ThreatIntelManager::Instance();
+        return ti.IsKnownMalicious(sha256Hash, outRiskScore, outThreatName);
+    } catch (const std::exception& e) {
+        SS_LOG_DEBUG(LOG_CATEGORY,
+            L"ThreatIntel query failed: %hs", e.what());
+        return false;
+    }
+}
 
 void JSStatistics::Reset() noexcept {
     totalScans.store(0, std::memory_order_relaxed);
@@ -2023,17 +2654,19 @@ void JSStatistics::Reset() noexcept {
     }
 }
 
-std::string JSStatistics::ToJson() const {
+std::string JSStatisticsSnapshot::ToJson() const {
     std::ostringstream oss;
     oss << "{";
-    oss << "\"totalScans\":" << totalScans.load() << ",";
-    oss << "\"maliciousDetected\":" << maliciousDetected.load() << ",";
-    oss << "\"suspiciousDetected\":" << suspiciousDetected.load() << ",";
-    oss << "\"obfuscatedDetected\":" << obfuscatedDetected.load() << ",";
-    oss << "\"activeXAbuse\":" << activeXAbuse.load() << ",";
-    oss << "\"downloadersDetected\":" << downloadersDetected.load() << ",";
-    oss << "\"timeouts\":" << timeouts.load() << ",";
-    oss << "\"totalBytesScanned\":" << totalBytesScanned.load();
+    oss << "\"totalScans\":" << totalScans << ",";
+    oss << "\"maliciousDetected\":" << maliciousDetected << ",";
+    oss << "\"suspiciousDetected\":" << suspiciousDetected << ",";
+    oss << "\"obfuscatedDetected\":" << obfuscatedDetected << ",";
+    oss << "\"activeXAbuse\":" << activeXAbuse << ",";
+    oss << "\"downloadersDetected\":" << downloadersDetected << ",";
+    oss << "\"timeouts\":" << timeouts << ",";
+    oss << "\"totalBytesScanned\":" << totalBytesScanned << ",";
+    oss << "\"cacheHits\":" << cacheHits << ",";
+    oss << "\"cacheMisses\":" << cacheMisses;
     oss << "}";
     return oss.str();
 }
@@ -2064,23 +2697,23 @@ bool JSScanResult::ShouldBlock() const noexcept {
 std::string JSScanResult::ToJson() const {
     std::ostringstream oss;
     oss << "{";
-    oss << "\"status\":\"" << static_cast<int>(status) << "\",";
+    oss << "\"status\":\"" << GetJSScanStatusName(status) << "\",";
     oss << "\"isMalicious\":" << (isMalicious ? "true" : "false") << ",";
     oss << "\"riskScore\":" << riskScore << ",";
-    oss << "\"threatName\":\"" << threatName << "\",";
-    oss << "\"detectedFamily\":\"" << detectedFamily << "\",";
+    oss << "\"threatName\":\"" << JsonEscape(threatName) << "\",";
+    oss << "\"detectedFamily\":\"" << JsonEscape(detectedFamily) << "\",";
     oss << "\"sha256\":\"" << sha256 << "\",";
     oss << "\"scanDurationUs\":" << scanDuration.count() << ",";
     oss << "\"matchedSignatures\":[";
     for (size_t i = 0; i < matchedSignatures.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << matchedSignatures[i] << "\"";
+        oss << "\"" << JsonEscape(matchedSignatures[i]) << "\"";
     }
     oss << "],";
     oss << "\"extractedIOCs\":[";
     for (size_t i = 0; i < extractedIOCs.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << extractedIOCs[i] << "\"";
+        oss << "\"" << JsonEscape(extractedIOCs[i]) << "\"";
     }
     oss << "]";
     oss << "}";
@@ -2096,6 +2729,9 @@ std::string JSObfuscationDetails::ToJson() const {
     oss << "\"suspiciousTokenCount\":" << suspiciousTokenCount << ",";
     oss << "\"deobfuscationLayers\":" << deobfuscationLayers << ",";
     oss << "\"fullyDeobfuscated\":" << (fullyDeobfuscated ? "true" : "false");
+    if (!deobfuscatedSnippet.empty()) {
+        oss << ",\"deobfuscatedSnippet\":\"" << JsonEscape(deobfuscatedSnippet) << "\"";
+    }
     oss << "}";
     return oss.str();
 }
