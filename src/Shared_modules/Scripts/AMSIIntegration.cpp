@@ -47,6 +47,9 @@
 #include <amsi.h>
 #pragma comment(lib, "amsi.lib")
 
+#include <Psapi.h>
+#pragma comment(lib, "Psapi.lib")
+
 // ============================================================================
 // STANDARD LIBRARY
 // ============================================================================
@@ -57,12 +60,14 @@
 #include <random>
 #include <thread>
 #include <condition_variable>
+#include <cwctype>
 
 // ============================================================================
 // SHADOWSTRIKE INFRASTRUCTURE
 // ============================================================================
 
 #include "../Utils/StringUtils.hpp"
+#include "PowerShellScanner.hpp"
 
 namespace ShadowStrike {
 namespace Scripts {
@@ -534,17 +539,60 @@ public:
             return true;
         }
 
-        // Note: Full provider registration requires COM interface implementation
-        // and registry entries. This is a simplified version that uses the
-        // standard AMSI consumer interface.
+        // Write AMSI provider registry key under
+        // HKLM\SOFTWARE\Microsoft\AMSI\Providers\{our-GUID}
+        // so Windows loads our provider DLL into AMSI-aware processes.
+        HKEY hProviderKey = nullptr;
+        std::wstring registryPath = L"SOFTWARE\\Microsoft\\AMSI\\Providers\\";
+        registryPath += AMSIConstants::PROVIDER_GUID;
 
+        LONG regResult = RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            registryPath.c_str(),
+            0, nullptr,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE | KEY_WOW64_64KEY,
+            nullptr,
+            &hProviderKey,
+            nullptr);
+
+        if (regResult != ERROR_SUCCESS) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"Failed to create AMSI provider registry key: %lu", regResult);
+            m_providerStatus = ProviderStatus::Failed;
+            return false;
+        }
+
+        std::wstring providerName(AMSIConstants::PROVIDER_NAME);
+        RegSetValueExW(hProviderKey, nullptr, 0, REG_SZ,
+            reinterpret_cast<const BYTE*>(providerName.c_str()),
+            static_cast<DWORD>((providerName.size() + 1) * sizeof(wchar_t)));
+
+        RegCloseKey(hProviderKey);
+
+        m_registrationVerifiedTime = Clock::now();
         m_providerStatus = ProviderStatus::Registered;
-        SS_LOG_INFO(LOG_CATEGORY, L"AMSI provider registered");
+        SS_LOG_INFO(LOG_CATEGORY, L"AMSI provider registered at %ls", registryPath.c_str());
         return true;
     }
 
     [[nodiscard]] bool UnregisterProvider() {
         std::unique_lock lock(m_mutex);
+
+        std::wstring registryPath = L"SOFTWARE\\Microsoft\\AMSI\\Providers\\";
+        registryPath += AMSIConstants::PROVIDER_GUID;
+
+        LONG regResult = RegDeleteKeyExW(
+            HKEY_LOCAL_MACHINE,
+            registryPath.c_str(),
+            KEY_WOW64_64KEY,
+            0);
+
+        if (regResult != ERROR_SUCCESS && regResult != ERROR_FILE_NOT_FOUND) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"Failed to remove AMSI provider registry key: %lu", regResult);
+        }
+
         m_providerStatus = ProviderStatus::Unregistered;
         SS_LOG_INFO(LOG_CATEGORY, L"AMSI provider unregistered");
         return true;
@@ -612,7 +660,16 @@ public:
             }
         }
 
-        // Perform AMSI scan
+        // Guard against ULONG overflow — AmsiScanBuffer takes ULONG length
+        if (request.content.size() > static_cast<size_t>(MAXULONG)) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"Content size %zu exceeds ULONG maximum for AmsiScanBuffer",
+                request.content.size());
+            response.result = AmsiResult::Unknown;
+            InvokeErrorCallback("Content exceeds ULONG maximum", ERROR_BUFFER_OVERFLOW);
+            return response;
+        }
+
         AMSI_RESULT amsiResult = AMSI_RESULT_NOT_DETECTED;
         HRESULT hr = AmsiScanBuffer(
             m_amsiContext,
@@ -644,6 +701,11 @@ public:
         } else {
             m_stats.cleanResults.fetch_add(1, std::memory_order_relaxed);
         }
+
+        // Dispatch to internal sub-scanners for deep behavioral analysis.
+        // PowerShellScanner provides deobfuscation and pattern matching
+        // that system AMSI providers may miss.
+        DispatchToSubScanner(request, response);
 
         // Calculate scan duration
         auto endTime = Clock::now();
