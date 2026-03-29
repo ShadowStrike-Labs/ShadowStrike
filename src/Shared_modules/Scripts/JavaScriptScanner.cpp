@@ -94,7 +94,15 @@ namespace {
         "wmi",
         "winmgmts",
         "msxml2.domdocument",
-        "wbemscripting.swbemlocator"
+        "wbemscripting.swbemlocator",
+        "wscript.network",
+        "adodb.recordset",
+        "scripting.encoder",
+        "microsoft.xmldom",
+        "internetexplorer.application",
+        "outlook.application",
+        "msxml2.serverxmlhttp",
+        "adodb.connection",
     };
 
     /// Dangerous method patterns
@@ -184,20 +192,90 @@ namespace {
     };
 
     /// URL/IP regex patterns for IOC extraction
-    const std::regex URL_REGEX(
-        R"((https?:\/\/[^\s\"'<>\)\]]+))",
-        std::regex::icase | std::regex::optimize
-    );
+    /// THREAD SAFETY: std::regex is NOT safe for concurrent matching in MSVC.
+    /// Use thread_local to guarantee each thread has its own regex instance.
+    const std::regex& GetURLRegex() {
+        thread_local const std::regex re(
+            R"((https?:\/\/[^\s\"'<>\)\]]{1,2000}))",
+            std::regex::icase | std::regex::optimize
+        );
+        return re;
+    }
 
-    const std::regex IP_REGEX(
-        R"(\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b)",
-        std::regex::optimize
-    );
+    const std::regex& GetIPRegex() {
+        thread_local const std::regex re(
+            R"(\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b)",
+            std::regex::optimize
+        );
+        return re;
+    }
 
-    const std::regex DOMAIN_REGEX(
-        R"(\b([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b)",
-        std::regex::optimize
-    );
+    const std::regex& GetDomainRegex() {
+        thread_local const std::regex re(
+            R"(\b([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b)",
+            std::regex::optimize
+        );
+        return re;
+    }
+
+    const std::regex& GetActiveXRegex() {
+        thread_local const std::regex re(
+            R"((new\s+activexobject|createobject|getobject)\s*\(\s*[\"']([^\"']+)[\"'])",
+            std::regex::icase | std::regex::optimize
+        );
+        return re;
+    }
+
+    /// LOLbin patterns (Living Off the Land Binary abuse)
+    const std::vector<std::pair<std::string, int>> LOLBIN_PATTERNS = {
+        {"powershell.exe", 30},
+        {"powershell -", 25},
+        {"powershell -enc", 40},
+        {"cmd.exe /c", 20},
+        {"mshta.exe", 30},
+        {"mshta ", 25},
+        {"certutil -decode", 35},
+        {"certutil -urlcache", 35},
+        {"bitsadmin /transfer", 30},
+        {"wmic process call create", 35},
+        {"regsvr32 /s /n /u", 30},
+        {"rundll32", 20},
+        {"msbuild", 15},
+        {"cscript.exe", 15},
+        {"wscript.exe", 15},
+    };
+
+    /// Sandbox / VM evasion indicators
+    const std::vector<std::pair<std::string, int>> SANDBOX_EVASION_PATTERNS = {
+        {"wscript.sleep", 10},
+        {"vmware", 20},
+        {"virtualbox", 20},
+        {"vbox", 15},
+        {"sandbox", 15},
+        {"screen.width", 8},
+        {"screen.height", 8},
+        {"navigator.plugins.length", 10},
+        {"getobject(\"winmgmts", 20},
+        {"win32_computersystem", 20},
+        {"win32_bios", 15},
+    };
+
+    /// Persistence indicators
+    const std::vector<std::pair<std::string, int>> PERSISTENCE_PATTERNS = {
+        {"currentversion\\\\run", 30},
+        {"currentversion\\run", 30},
+        {"startup", 10},
+        {"schtasks", 25},
+        {"at /every", 20},
+    };
+
+    /// JSE / WSF / HTA content markers
+    constexpr const char* JSE_START_MARKER   = "#@~^";
+    constexpr const char* JSE_END_MARKER     = "==^#~@";
+    constexpr const char* WSF_JOB_TAG        = "<job";
+    constexpr const char* WSF_PACKAGE_TAG    = "<package";
+    constexpr const char* WSF_SCRIPT_TAG     = "<script";
+    constexpr const char* HTA_APP_TAG        = "<hta:application";
 
 }  // anonymous namespace
 
@@ -289,6 +367,17 @@ private:
     [[nodiscard]] std::string DecodeCharCodeSequences(std::string_view content) const;
     [[nodiscard]] std::string DecodeHexEscapes(std::string_view content) const;
     [[nodiscard]] std::string DecodeUnicodeEscapes(std::string_view content) const;
+
+    // JSE / WSF / HTA support
+    [[nodiscard]] bool IsJSEContent(std::string_view content) const noexcept;
+    [[nodiscard]] std::string DecodeJSE(std::string_view content) const;
+    [[nodiscard]] std::string ExtractScriptFromWSF(std::string_view content) const;
+    [[nodiscard]] std::string ExtractScriptFromHTA(std::string_view content) const;
+    [[nodiscard]] bool IsHTAContent(std::string_view content) const noexcept;
+    [[nodiscard]] bool IsWSFContent(std::string_view content) const noexcept;
+
+    // Deadline enforcement
+    [[nodiscard]] bool IsDeadlineExceeded(TimePoint deadline) const noexcept;
 };
 
 // ============================================================================
