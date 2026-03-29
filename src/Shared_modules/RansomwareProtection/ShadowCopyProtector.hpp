@@ -26,46 +26,47 @@
  *
  * This module provides comprehensive protection for VSS shadow copies against
  * ransomware attempting to destroy backup recovery options through various
- * attack vectors.
+ * attack vectors including living-off-the-land binaries, direct COM calls,
+ * obfuscated PowerShell, and WMI-based deletion.
  *
  * PROTECTION CAPABILITIES:
  * ========================
  *
- * 1. COMMAND LINE DETECTION
- *    - vssadmin delete shadows
+ * 1. COMMAND LINE DETECTION (with obfuscation bypass)
+ *    - vssadmin delete shadows (caret/env-var/quoting bypass resistant)
  *    - vssadmin resize shadowstorage
  *    - wmic shadowcopy delete
- *    - PowerShell shadow deletion
- *    - diskshadow commands
+ *    - PowerShell shadow deletion (base64 -EncodedCommand detection)
+ *    - diskshadow script commands
+ *    - bcdedit recovery disable
+ *    - wbadmin catalog/backup deletion
  *
- * 2. API-LEVEL PROTECTION
- *    - VSS API interception
- *    - COM interface monitoring
- *    - WMI query blocking
- *    - Direct VSS service access
+ * 2. KERNEL PROCESS CREATION BLOCKING
+ *    - PhantomSensor PsSetCreateProcessNotifyRoutineEx integration
+ *    - Pre-execution blocking via process creation verdict
+ *    - Command line analysis before process starts
  *
  * 3. SERVICE PROTECTION
- *    - VSS service lock
- *    - Service stop prevention
- *    - Configuration protection
- *    - Startup type protection
+ *    - VSS service startup type enforcement (auto-start)
+ *    - Service status monitoring with auto-restart
+ *    - Configuration change detection
  *
- * 4. REGISTRY PROTECTION
- *    - VSS registry keys
- *    - Shadow storage settings
- *    - Provider configurations
+ * 4. SNAPSHOT INVENTORY MONITORING
+ *    - Continuous shadow copy count tracking
+ *    - Decrease detection triggers immediate alert
+ *    - Proactive snapshot creation on attack detection
  *
  * 5. PROACTIVE DEFENSE
  *    - Pre-attack snapshot creation
- *    - Scheduled snapshot protection
+ *    - Scheduled snapshot health verification
  *    - Storage monitoring
- *    - Health verification
  *
- * @note Requires administrative privileges for service lock.
- * @note Works in conjunction with BackupProtector.
+ * @note Requires administrative privileges for service management.
+ * @note Works in conjunction with BackupProtector and VolumeSnapshotService.
+ * @note Kernel process blocking requires PhantomSensor driver loaded.
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -91,6 +92,7 @@
 #include <chrono>
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 
 // ============================================================================
 // WINDOWS SDK INCLUDES
@@ -130,16 +132,17 @@ namespace Ransomware {
 
 namespace ShadowCopyConstants {
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
-    
-    /// @brief Dangerous command patterns
-    inline constexpr const wchar_t* DELETE_PATTERNS[] = {
-        L"delete shadows",
-        L"shadowcopy delete",
-        L"remove-wmiobject",
-        L"resize shadowstorage"
-    };
+
+    /// @brief Monitoring interval (ms) for shadow copy inventory checks
+    inline constexpr uint32_t MONITORING_INTERVAL_MS = 2000;
+
+    /// @brief Maximum recent attacks to retain in memory
+    inline constexpr size_t MAX_RECENT_ATTACKS = 500;
+
+    /// @brief Maximum whitelist entries (prevent unbounded growth)
+    inline constexpr size_t MAX_WHITELIST_ENTRIES = 256;
 }
 
 // ============================================================================
@@ -156,17 +159,29 @@ using Hash256 = std::array<uint8_t, 32>;
 // ============================================================================
 
 /**
- * @brief VSS attack type
+ * @brief VSS attack vector classification
  */
 enum class VSSAttackType : uint8_t {
     Unknown             = 0,
-    CommandLineDelete   = 1,
-    WMIDelete           = 2,
-    APIDelete           = 3,
-    ServiceStop         = 4,
-    StorageResize       = 5,
-    RegistryModify      = 6,
-    ProviderDisable     = 7
+    CommandLineDelete   = 1,  ///< vssadmin/diskshadow/wbadmin delete
+    WMIDelete           = 2,  ///< wmic/PowerShell WMI shadow deletion
+    APIDelete           = 3,  ///< Direct IVssBackupComponents::DeleteSnapshots COM call
+    ServiceStop         = 4,  ///< VSS service stop/disable attempt
+    StorageResize       = 5,  ///< vssadmin resize shadowstorage (shrink attack)
+    RegistryModify      = 6,  ///< bcdedit recovery disable / VSS registry tampering
+    ProviderDisable     = 7   ///< VSS provider disable/unregister
+};
+
+/**
+ * @brief Process creation verdict for kernel callback integration
+ *
+ * Returned by OnProcessCreation() to tell the kernel driver whether
+ * to allow or deny the process from starting.
+ */
+enum class ProcessCreationVerdict : uint8_t {
+    Allow   = 0,  ///< Process is safe, allow execution
+    Block   = 1,  ///< VSS attack detected, deny execution at kernel level
+    Monitor = 2   ///< Suspicious but not conclusive, allow with enhanced monitoring
 };
 
 /**
@@ -294,7 +309,7 @@ struct ShadowCopyProtectorConfiguration {
     /// @brief Kill attacking process
     bool killAttacker = true;
     
-    /// @brief Whitelisted processes
+    /// @brief Whitelisted processes (full paths, case-insensitive match)
     std::vector<std::wstring> whitelist;
     
     /// @brief Verbose logging
@@ -307,7 +322,10 @@ struct ShadowCopyProtectorConfiguration {
 };
 
 /**
- * @brief Shadow copy statistics
+ * @brief Shadow copy statistics (thread-safe, copyable)
+ *
+ * Contains atomic counters for lock-free updates from multiple threads.
+ * Custom copy operations load atomics safely.
  */
 struct ShadowCopyStatistics {
     /// @brief Attacks blocked
@@ -315,6 +333,12 @@ struct ShadowCopyStatistics {
     
     /// @brief Processes killed
     std::atomic<uint64_t> processesKilled{0};
+    
+    /// @brief Processes blocked at kernel level (pre-execution)
+    std::atomic<uint64_t> processesBlockedKernel{0};
+    
+    /// @brief Snapshot count decreases detected
+    std::atomic<uint64_t> snapshotDecreaseAlerts{0};
     
     /// @brief By attack type
     std::array<std::atomic<uint64_t>, 8> byAttackType{};
@@ -324,6 +348,42 @@ struct ShadowCopyStatistics {
     
     /// @brief Start time
     TimePoint startTime = Clock::now();
+
+    ShadowCopyStatistics() noexcept = default;
+
+    ShadowCopyStatistics(const ShadowCopyStatistics& other) noexcept
+        : attacksBlocked(other.attacksBlocked.load(std::memory_order_relaxed))
+        , processesKilled(other.processesKilled.load(std::memory_order_relaxed))
+        , processesBlockedKernel(other.processesBlockedKernel.load(std::memory_order_relaxed))
+        , snapshotDecreaseAlerts(other.snapshotDecreaseAlerts.load(std::memory_order_relaxed))
+        , currentShadowCopies(other.currentShadowCopies.load(std::memory_order_relaxed))
+        , startTime(other.startTime) {
+        for (size_t i = 0; i < byAttackType.size(); ++i) {
+            byAttackType[i].store(other.byAttackType[i].load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+        }
+    }
+
+    ShadowCopyStatistics& operator=(const ShadowCopyStatistics& other) noexcept {
+        if (this != &other) {
+            attacksBlocked.store(other.attacksBlocked.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+            processesKilled.store(other.processesKilled.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+            processesBlockedKernel.store(other.processesBlockedKernel.load(std::memory_order_relaxed),
+                                         std::memory_order_relaxed);
+            snapshotDecreaseAlerts.store(other.snapshotDecreaseAlerts.load(std::memory_order_relaxed),
+                                         std::memory_order_relaxed);
+            currentShadowCopies.store(other.currentShadowCopies.load(std::memory_order_relaxed),
+                                      std::memory_order_relaxed);
+            startTime = other.startTime;
+            for (size_t i = 0; i < byAttackType.size(); ++i) {
+                byAttackType[i].store(other.byAttackType[i].load(std::memory_order_relaxed),
+                                      std::memory_order_relaxed);
+            }
+        }
+        return *this;
+    }
     
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
@@ -344,7 +404,10 @@ using DecisionCallback = std::function<bool(uint32_t pid, VSSAttackType type)>;
  * @class ShadowCopyProtector
  * @brief Enterprise-grade VSS shadow copy protection
  *
- * Protects Windows Volume Shadow Copies from unauthorized deletion.
+ * Protects Windows Volume Shadow Copies from unauthorized deletion
+ * through command-line monitoring, obfuscation detection, kernel
+ * process creation blocking, service protection, and snapshot
+ * inventory monitoring.
  *
  * THREAD SAFETY: All public methods are thread-safe.
  */
@@ -386,9 +449,35 @@ public:
     [[nodiscard]] std::optional<VSSAttackType> AnalyzeCommand(std::wstring_view cmdLine);
     
     /**
-     * @brief Check if process should be blocked
+     * @brief Check if process should be blocked (user-mode, post-creation)
      */
     [[nodiscard]] bool ShouldBlock(uint32_t pid, std::wstring_view cmdLine);
+
+    // ========================================================================
+    // KERNEL PROCESS CREATION INTEGRATION
+    // ========================================================================
+
+    /**
+     * @brief Kernel process creation callback handler
+     *
+     * Called by the user-mode message dispatcher when PhantomSensor's
+     * PsSetCreateProcessNotifyRoutineEx callback fires. This enables
+     * PRE-EXECUTION blocking of vssadmin.exe, wmic.exe, PowerShell,
+     * bcdedit.exe, and diskshadow.exe before they can delete shadow copies.
+     *
+     * @param pid          Process ID of the new process
+     * @param parentPid    Parent process ID
+     * @param imagePath    Full NT image path of the executable
+     * @param commandLine  Full command line of the process
+     * @return Verdict: Allow, Block, or Monitor
+     *
+     * @note This runs in the hot path of process creation — must be fast (<1ms).
+     */
+    [[nodiscard]] ProcessCreationVerdict OnProcessCreation(
+        uint32_t pid,
+        uint32_t parentPid,
+        std::wstring_view imagePath,
+        std::wstring_view commandLine);
     
     // ========================================================================
     // SERVICE PROTECTION
