@@ -334,6 +334,8 @@ enum class VBSScanStatus : uint8_t {
 /**
  * @brief Module status
  */
+#ifndef SHADOWSTRIKE_SCRIPTS_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_SCRIPTS_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -343,10 +345,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 5,
     Error           = 6
 };
-
-// ============================================================================
-// STRUCTURES
-// ============================================================================
+#endif
 
 /**
  * @brief COM object usage info
@@ -584,8 +583,11 @@ struct VBSScannerConfiguration {
 // CALLBACK TYPES
 // ============================================================================
 
-using ScanResultCallback = std::function<void(const VBSScanResult&)>;
+using VBSScanResultCallback = std::function<void(const VBSScanResult&)>;
+#ifndef SHADOWSTRIKE_SCRIPTS_ERROR_CALLBACK_DEFINED
+#define SHADOWSTRIKE_SCRIPTS_ERROR_CALLBACK_DEFINED
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
+#endif
 
 // ============================================================================
 // VBSCRIPT SCANNER CLASS
@@ -671,7 +673,7 @@ public:
     // CALLBACKS
     // ========================================================================
     
-    void RegisterCallback(ScanResultCallback callback);
+    void RegisterCallback(VBSScanResultCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
     void UnregisterCallbacks();
 

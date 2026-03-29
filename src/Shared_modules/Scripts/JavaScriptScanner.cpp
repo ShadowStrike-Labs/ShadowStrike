@@ -399,8 +399,8 @@ public:
     [[nodiscard]] std::vector<JSNetworkActivity> DetectNetworkActivity(std::string_view content);
 
     // Callbacks
-    void RegisterCallback(ScanResultCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
+    void RegisterCallback(JSScanResultCallback callback);
+    void RegisterErrorCallback(JSErrorCallback callback);
     void UnregisterCallbacks();
 
     // Statistics
@@ -434,8 +434,8 @@ private:
 
     // Callbacks
     mutable std::shared_mutex m_callbackMutex;
-    std::vector<ScanResultCallback> m_callbacks;
-    std::vector<ErrorCallback> m_errorCallbacks;
+    std::vector<JSScanResultCallback> m_callbacks;
+    std::vector<JSErrorCallback> m_errorCallbacks;
 
     // Statistics
     mutable JSStatistics m_stats;
@@ -635,11 +635,11 @@ std::vector<JSNetworkActivity> JavaScriptScanner::DetectNetworkActivity(
     return m_impl->DetectNetworkActivity(content);
 }
 
-void JavaScriptScanner::RegisterCallback(ScanResultCallback callback) {
+void JavaScriptScanner::RegisterCallback(JSScanResultCallback callback) {
     m_impl->RegisterCallback(std::move(callback));
 }
 
-void JavaScriptScanner::RegisterErrorCallback(ErrorCallback callback) {
+void JavaScriptScanner::RegisterErrorCallback(JSErrorCallback callback) {
     m_impl->RegisterErrorCallback(std::move(callback));
 }
 
@@ -1509,14 +1509,14 @@ std::vector<JSNetworkActivity> JavaScriptScannerImpl::DetectNetworkActivity(
 // JAVASCRIPTSCANNERIMPL - CALLBACKS
 // ============================================================================
 
-void JavaScriptScannerImpl::RegisterCallback(ScanResultCallback callback) {
+void JavaScriptScannerImpl::RegisterCallback(JSScanResultCallback callback) {
     if (!callback) return;
 
     std::unique_lock lock(m_callbackMutex);
     m_callbacks.push_back(std::move(callback));
 }
 
-void JavaScriptScannerImpl::RegisterErrorCallback(ErrorCallback callback) {
+void JavaScriptScannerImpl::RegisterErrorCallback(JSErrorCallback callback) {
     if (!callback) return;
 
     std::unique_lock lock(m_callbackMutex);

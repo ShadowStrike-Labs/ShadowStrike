@@ -141,8 +141,7 @@
 #include "../Utils/HashUtils.hpp"
 #include "../PatternStore/PatternStore.hpp"
 #include "../SignatureStore/SignatureStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+// ThreatIntelManager + WhiteListStore included via PIMPL in .cpp only (ABI stability)
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -162,7 +161,7 @@ namespace Scripts {
 namespace JSConstants {
 
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
     /// @brief Maximum script size (10 MB)
@@ -197,6 +196,12 @@ namespace JSConstants {
         "Scripting.Dictionary",
         "Schedule.Service",
     };
+
+    /// @brief Maximum entries in scan result cache (LRU)
+    inline constexpr size_t MAX_SCAN_CACHE_ENTRIES = 8192;
+
+    /// @brief TTL for cached scan results (seconds)
+    inline constexpr uint32_t SCAN_CACHE_TTL_SECONDS = 300;
 
 }  // namespace JSConstants
 
@@ -287,6 +292,8 @@ enum class JSScanStatus : uint8_t {
 /**
  * @brief Module status
  */
+#ifndef SHADOWSTRIKE_SCRIPTS_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_SCRIPTS_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -296,6 +303,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 5,
     Error           = 6
 };
+#endif
 
 // ============================================================================
 // STRUCTURES
@@ -465,11 +473,36 @@ struct JSStatistics {
     std::atomic<uint64_t> downloadersDetected{0};
     std::atomic<uint64_t> timeouts{0};
     std::atomic<uint64_t> totalBytesScanned{0};
+    std::atomic<uint64_t> cacheHits{0};
+    std::atomic<uint64_t> cacheMisses{0};
     std::array<std::atomic<uint64_t>, 16> byEngine{};
     std::array<std::atomic<uint64_t>, 16> byCategory{};
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+};
+
+/**
+ * @brief Copyable statistics snapshot for public API consumption.
+ *
+ * JSStatistics contains std::atomic fields and is non-copyable.
+ * This snapshot uses plain uint64_t for safe return from GetStatistics().
+ */
+struct JSStatisticsSnapshot {
+    uint64_t totalScans = 0;
+    uint64_t maliciousDetected = 0;
+    uint64_t suspiciousDetected = 0;
+    uint64_t obfuscatedDetected = 0;
+    uint64_t activeXAbuse = 0;
+    uint64_t downloadersDetected = 0;
+    uint64_t timeouts = 0;
+    uint64_t totalBytesScanned = 0;
+    uint64_t cacheHits = 0;
+    uint64_t cacheMisses = 0;
+    std::array<uint64_t, 16> byEngine{};
+    std::array<uint64_t, 16> byCategory{};
+    TimePoint startTime{};
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -526,8 +559,8 @@ struct JSScanConfig {
 // CALLBACK TYPES
 // ============================================================================
 
-using ScanResultCallback = std::function<void(const JSScanResult&)>;
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+using JSScanResultCallback = std::function<void(const JSScanResult&)>;
+using JSErrorCallback = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
 // JAVASCRIPT SCANNER CLASS
@@ -616,19 +649,56 @@ public:
     // CALLBACKS
     // ========================================================================
     
-    void RegisterCallback(ScanResultCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
+    void RegisterCallback(JSScanResultCallback callback);
+    void RegisterErrorCallback(JSErrorCallback callback);
     void UnregisterCallbacks();
 
     // ========================================================================
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] JSStatistics GetStatistics() const;
+    [[nodiscard]] JSStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL BRIDGE — PhantomSensor integration
+    // ========================================================================
+
+    /// @brief Handle kernel process creation/termination notification.
+    /// Triggers re-scan of JS content associated with the process.
+    void OnKernelProcessNotify(uint32_t processId,
+                               std::wstring_view imagePath,
+                               std::wstring_view commandLine,
+                               bool isCreate);
+
+    /// @brief Handle kernel image load notification.
+    /// Detects JS engines (wscript.exe, cscript.exe, node.exe, mshta.exe).
+    void OnKernelImageLoad(uint32_t processId,
+                           std::wstring_view imagePath,
+                           uint64_t imageBase,
+                           size_t imageSize);
+
+    /// @brief Request kernel driver to terminate a process running malicious JS.
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
+                                                  const std::wstring& reason);
+
+    // ========================================================================
+    // CROSS-MODULE WIRING — enterprise integration
+    // ========================================================================
+
+    /// @brief Report malicious/suspicious JS detection to AlertSystem.
+    void ReportThreatToAlertSystem(const JSScanResult& result);
+
+    /// @brief Report JS threat to BehaviorAnalyzer via TelemetryCollector.
+    void ReportThreatToBehaviorAnalyzer(const JSScanResult& result);
+
+    /// @brief Query ThreatIntel for a known-malicious hash. Returns true if found.
+    [[nodiscard]] bool QueryThreatIntel(const std::string& sha256Hash,
+                                         double& outRiskScore,
+                                         std::string& outThreatName) const;
 
 private:
     JavaScriptScanner();

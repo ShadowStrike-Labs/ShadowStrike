@@ -516,7 +516,7 @@ public:
     VBSStatistics m_stats;
 
     // Callbacks
-    std::vector<ScanResultCallback> m_scanCallbacks;
+    std::vector<VBSScanResultCallback> m_scanCallbacks;
     std::vector<ErrorCallback> m_errorCallbacks;
 
     // Cache: SHA256 -> ScanResult (for recently scanned files)
@@ -2343,7 +2343,7 @@ bool VBScriptScanner::IsDangerousCOMObject(std::string_view objectName) const no
 // CALLBACKS
 // ============================================================================
 
-void VBScriptScanner::RegisterCallback(ScanResultCallback callback) {
+void VBScriptScanner::RegisterCallback(VBSScanResultCallback callback) {
     std::unique_lock lock(m_impl->m_callbackMutex);
     m_impl->m_scanCallbacks.push_back(std::move(callback));
 }

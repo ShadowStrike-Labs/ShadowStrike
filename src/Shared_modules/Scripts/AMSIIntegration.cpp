@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -69,7 +69,14 @@
 // ============================================================================
 
 #include "../Utils/StringUtils.hpp"
+
+// PowerShellScanner.hpp defines ScanStatus::ERROR_TIMEOUT which collides with
+// the Windows SDK macro ERROR_TIMEOUT (winerror.h).  Temporarily suppress the
+// macro so the enum compiles, then restore it for the rest of this TU.
+#pragma push_macro("ERROR_TIMEOUT")
+#undef ERROR_TIMEOUT
 #include "PowerShellScanner.hpp"
+#pragma pop_macro("ERROR_TIMEOUT")
 #include "VBScriptScanner.hpp"
 #include "JavaScriptScanner.hpp"
 #include "MacroDetector.hpp"
@@ -462,7 +469,7 @@ public:
     void Shutdown() {
         // Capture handles under lock, then release lock before joining thread
         HAMSICONTEXT capturedContext = nullptr;
-        std::vector<std::pair<uint64_t, HAMSISSESSION>> capturedSessions;
+        std::vector<std::pair<uint64_t, HAMSISESSION>> capturedSessions;
 
         {
             std::unique_lock lock(m_mutex);
@@ -483,7 +490,7 @@ public:
                 if (session.sessionHandle != 0) {
                     capturedSessions.emplace_back(
                         id,
-                        reinterpret_cast<HAMSISSESSION>(session.sessionHandle));
+                        reinterpret_cast<HAMSISESSION>(session.sessionHandle));
                 }
             }
             m_sessions.clear();
@@ -769,17 +776,17 @@ public:
         }
 
         // Get or create session
-        HAMSISSESSION amsiSession = nullptr;
+        HAMSISESSION amsiSession = nullptr;
         if (request.sessionId != 0) {
             std::shared_lock lock(m_mutex);
             auto it = m_sessions.find(request.sessionId);
             if (it != m_sessions.end()) {
-                amsiSession = reinterpret_cast<HAMSISSESSION>(it->second.sessionHandle);
+                amsiSession = reinterpret_cast<HAMSISESSION>(it->second.sessionHandle);
             }
         }
 
         // Guard against ULONG overflow — AmsiScanBuffer takes ULONG length
-        if (request.content.size() > static_cast<size_t>(MAXULONG)) {
+        if (request.content.size() > static_cast<size_t>((std::numeric_limits<ULONG>::max)())) {
             SS_LOG_ERROR(LOG_CATEGORY,
                 L"Content size %zu exceeds ULONG maximum for AmsiScanBuffer",
                 request.content.size());
@@ -919,7 +926,7 @@ public:
             return AmsiResult::Clean;
         }
 
-        if (buffer.size() > static_cast<size_t>(MAXULONG)) {
+        if (buffer.size() > static_cast<size_t>((std::numeric_limits<ULONG>::max)())) {
             SS_LOG_ERROR(LOG_CATEGORY,
                 L"Content size %zu exceeds ULONG maximum for system AMSI scan",
                 buffer.size());
@@ -965,7 +972,7 @@ public:
             return 0;
         }
 
-        HAMSISSESSION amsiSession = nullptr;
+        HAMSISESSION amsiSession = nullptr;
         HRESULT hr = AmsiOpenSession(m_amsiContext, &amsiSession);
         if (FAILED(hr)) {
             SS_LOG_ERROR(LOG_CATEGORY, L"AmsiOpenSession failed: 0x%08X", hr);
@@ -1000,7 +1007,7 @@ public:
 
         if (it->second.sessionHandle != 0) {
             AmsiCloseSession(m_amsiContext,
-                reinterpret_cast<HAMSISSESSION>(it->second.sessionHandle));
+                reinterpret_cast<HAMSISESSION>(it->second.sessionHandle));
         }
 
         SS_LOG_DEBUG(LOG_CATEGORY, L"Closed AMSI session %llu", sessionId);
@@ -1996,8 +2003,9 @@ private:
         }
     }
 
+public:
     // ========================================================================
-    // CROSS-MODULE INTEGRATION (Impl helpers)
+    // CROSS-MODULE INTEGRATION (Impl helpers — public for outer-class PIMPL access)
     // ========================================================================
 
     void ReportBypassToAlertSystemImpl(const AmsiBypassEvent& event) {
