@@ -177,12 +177,20 @@ namespace MacroConstants {
     /// @brief Maximum modules to analyze
     inline constexpr size_t MAX_VBA_MODULES = 256;
     
+    /// @brief Maximum deobfuscation recursion depth
+    inline constexpr size_t MAX_DEOBFUSCATION_DEPTH = 8;
+
+    /// @brief Maximum string size for regex operations (prevent ReDoS)
+    inline constexpr size_t MAX_REGEX_INPUT_SIZE = 2 * 1024 * 1024;
+
     /// @brief Auto-execute function names (VBA)
     inline constexpr const char* VBA_AUTO_EXEC_FUNCTIONS[] = {
         "AutoExec", "AutoOpen", "Auto_Open", "AutoClose", "Auto_Close",
         "AutoNew", "AutoExit", "Document_Open", "Document_Close",
         "Document_New", "Workbook_Open", "Workbook_Activate",
         "Workbook_Close", "Workbook_BeforeClose", "Workbook_BeforeSave",
+        "Workbook_SheetActivate", "Workbook_AddinInstall",
+        "Worksheet_Change", "Worksheet_Activate",
     };
     
     /// @brief Suspicious VBA API calls
@@ -190,6 +198,23 @@ namespace MacroConstants {
         "Shell", "CreateObject", "GetObject", "Environ", "CallByName",
         "MacScript", "ExecuteExcel4Macro", "Run", "WScript.Shell",
         "Scripting.FileSystemObject", "MSXML2.XMLHTTP", "ADODB.Stream",
+        "URLDownloadToFile", "WinHttp.WinHttpRequest",
+        "Microsoft.XMLHTTP", "InternetOpen", "VirtualAlloc",
+        "RtlMoveMemory", "CreateThread", "NtCreateThreadEx",
+    };
+
+    /// @brief XLM (Excel 4.0) suspicious cell functions
+    inline constexpr const char* SUSPICIOUS_XLM_FUNCTIONS[] = {
+        "EXEC(", "CALL(", "RUN(", "HALT()", "FORMULA(",
+        "REGISTER(", "CHAR(", "ALERT(", "FOPEN(", "FWRITE(",
+        "FCLOSE(", "FILES(", "DIRECTORY(", "SET.VALUE(",
+        "GET.WORKSPACE(", "GET.WINDOW(", "APP.MAXIMIZE(",
+    };
+
+    /// @brief Template injection indicators in XML
+    inline constexpr const char* TEMPLATE_INJECTION_MARKERS[] = {
+        "attachedTemplate", "Target=\"http", "Target=\"https",
+        "externalLink", "oleLink", "frame",
     };
 
 }  // namespace MacroConstants
@@ -210,16 +235,18 @@ using SystemTimePoint = std::chrono::system_clock::time_point;
  * @brief Document/macro type
  */
 enum class MacroType : uint8_t {
-    Unknown         = 0,
-    VBALegacy       = 1,    ///< VBA in OLE (Word 97-2003, etc.)
-    VBAModern       = 2,    ///< VBA in OpenXML (Office 2007+)
-    Excel4XLM       = 3,    ///< Excel 4.0 XLM macros
-    DDE             = 4,    ///< Dynamic Data Exchange
-    SLK             = 5,    ///< Symbolic Link (Excel)
-    RTF_OLE         = 6,    ///< RTF with embedded OLE
-    Publisher       = 7,    ///< Publisher macros
-    Visio           = 8,    ///< Visio macros
-    OpenDocument    = 9     ///< OpenDocument macros
+    Unknown            = 0,
+    VBALegacy          = 1,     ///< VBA in OLE (Word 97-2003, etc.)
+    VBAModern          = 2,     ///< VBA in OpenXML (Office 2007+)
+    Excel4XLM          = 3,     ///< Excel 4.0 XLM macros
+    DDE                = 4,     ///< Dynamic Data Exchange
+    SLK                = 5,     ///< Symbolic Link (Excel)
+    RTF_OLE            = 6,     ///< RTF with embedded OLE
+    Publisher          = 7,     ///< Publisher macros
+    Visio              = 8,     ///< Visio macros
+    OpenDocument       = 9,     ///< OpenDocument macros
+    XLLAddin           = 10,    ///< XLL add-in (native DLL loaded by Excel)
+    TemplateInjection  = 11,    ///< Remote template injection (macro-less initial vector)
 };
 
 /**
@@ -242,7 +269,8 @@ enum class DocumentFormat : uint8_t {
     ODS             = 13,   ///< OpenDocument Spreadsheet (.ods)
     MHT             = 14,   ///< MHTML format
     PUB             = 15,   ///< Publisher (.pub)
-    VSD             = 16    ///< Visio (.vsd, .vsdx)
+    VSD             = 16,   ///< Visio (.vsd, .vsdx)
+    XLL             = 17    ///< Excel XLL add-in (.xll)
 };
 
 /**
@@ -444,6 +472,44 @@ struct XLMMacroInfo {
 };
 
 /**
+ * @brief Template injection info (macro-less remote template attack)
+ */
+struct TemplateInjectionInfo {
+    /// @brief Detected template URL
+    std::string templateUrl;
+    
+    /// @brief XML element where injection was found
+    std::string xmlElement;
+    
+    /// @brief Relationship type (e.g., attachedTemplate, oleLink, frame)
+    std::string relationshipType;
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief XLL add-in analysis info
+ */
+struct XLLInfo {
+    /// @brief Has PE/MZ header (confirms it is a DLL)
+    bool isPEFile = false;
+    
+    /// @brief Has xlAutoOpen export (auto-execution on load)
+    bool hasXlAutoOpen = false;
+    
+    /// @brief Has xlAutoClose export
+    bool hasXlAutoClose = false;
+    
+    /// @brief Has xlAutoRegister export
+    bool hasXlAutoRegister = false;
+    
+    /// @brief Detected export function names
+    std::vector<std::string> exportNames;
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
  * @brief Scan result
  */
 struct MacroScanResult {
@@ -455,6 +521,9 @@ struct MacroScanResult {
     
     /// @brief Is malicious
     bool isMalicious = false;
+    
+    /// @brief Is suspicious (risk >= 50 but not confirmed malicious)
+    bool isSuspicious = false;
     
     /// @brief Threat category
     MacroThreatCategory category = MacroThreatCategory::None;
@@ -479,6 +548,12 @@ struct MacroScanResult {
     
     /// @brief XLM macro info (Excel 4.0)
     std::vector<XLMMacroInfo> xlmMacros;
+    
+    /// @brief Template injection findings
+    std::vector<TemplateInjectionInfo> templateInjections;
+    
+    /// @brief XLL add-in analysis
+    std::optional<XLLInfo> xllInfo;
     
     /// @brief Trigger functions (auto-exec)
     std::vector<std::string> triggerFunctions;
@@ -634,6 +709,12 @@ public:
     
     /// @brief Quick check if document has auto-execute macros
     [[nodiscard]] bool HasAutoExecMacros(const std::filesystem::path& path);
+
+    /// @brief Full macro analysis — bridge for AttachmentScanner integration
+    [[nodiscard]] MacroScanResult AnalyzeMacros(const std::filesystem::path& path);
+    
+    /// @brief Scan raw VBA content submitted by AMSI provider
+    [[nodiscard]] MacroScanResult ScanVBAContent(std::string_view vbaContent);
 
     // ========================================================================
     // EXTRACTION
