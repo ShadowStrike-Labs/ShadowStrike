@@ -266,6 +266,23 @@ enum class VBSCapability : uint32_t {
     SelfModifying       = 1 << 19   ///< Self-modifying code
 };
 
+/// Bitwise OR for VBSCapability flags
+[[nodiscard]] inline constexpr VBSCapability operator|(VBSCapability a, VBSCapability b) noexcept {
+    return static_cast<VBSCapability>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+/// Bitwise AND for VBSCapability flags
+[[nodiscard]] inline constexpr VBSCapability operator&(VBSCapability a, VBSCapability b) noexcept {
+    return static_cast<VBSCapability>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+/// Compound OR-assign for VBSCapability flags
+inline constexpr VBSCapability& operator|=(VBSCapability& a, VBSCapability b) noexcept {
+    a = a | b; return a;
+}
+/// Test whether a specific capability bit is set
+[[nodiscard]] inline constexpr bool HasCapability(VBSCapability caps, VBSCapability test) noexcept {
+    return (static_cast<uint32_t>(caps) & static_cast<uint32_t>(test)) != 0;
+}
+
 /**
  * @brief Obfuscation type
  */
@@ -501,6 +518,29 @@ struct VBSStatistics {
 };
 
 /**
+ * @brief Thread-safe snapshot of statistics (copyable, returned by value)
+ */
+struct VBSStatisticsSnapshot {
+    uint64_t totalScans = 0;
+    uint64_t maliciousDetected = 0;
+    uint64_t suspiciousDetected = 0;
+    uint64_t vbsFilesScanned = 0;
+    uint64_t vbeFilesScanned = 0;
+    uint64_t wsfFilesScanned = 0;
+    uint64_t htaFilesScanned = 0;
+    uint64_t obfuscatedDetected = 0;
+    uint64_t deobfuscationSuccess = 0;
+    uint64_t deobfuscationFailure = 0;
+    uint64_t dangerousObjectsFound = 0;
+    uint64_t totalBytesScanned = 0;
+    std::array<uint64_t, 16> byCategory{};
+    std::array<uint64_t, 32> byCapability{};
+    TimePoint startTime = Clock::now();
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
  * @brief Configuration
  */
 struct VBSScannerConfiguration {
@@ -639,7 +679,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] VBSStatistics GetStatistics() const;
+    [[nodiscard]] VBSStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();

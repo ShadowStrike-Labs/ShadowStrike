@@ -318,9 +318,9 @@ namespace SelfDefenseConstants {
         L"reg.exe",
         L"regedit.exe",
         L"mmc.exe",
-        L"services.msc",
-        L"devmgmt.msc",
-        L"diskmgmt.msc"
+        L"rundll32.exe",
+        L"wscript.exe",
+        L"cscript.exe"
     };
 
 }  // namespace SelfDefenseConstants
@@ -609,8 +609,8 @@ struct ProtectedProcess {
     /// @brief Protection timestamp
     TimePoint protectedSince;
     
-    /// @brief Number of blocked access attempts
-    std::atomic<uint64_t> blockedAttempts{0};
+    /// @brief Number of blocked access attempts (snapshot value)
+    uint64_t blockedAttempts = 0;
     
     /// @brief Last blocked attempt timestamp
     TimePoint lastBlockedAttempt;
@@ -643,8 +643,8 @@ struct ProtectedPath {
     /// @brief Protection timestamp
     TimePoint protectedSince;
     
-    /// @brief Blocked operation count
-    std::atomic<uint64_t> blockedOperations{0};
+    /// @brief Blocked operation count (snapshot value)
+    uint64_t blockedOperations = 0;
 };
 
 /**
@@ -670,8 +670,8 @@ struct ProtectedRegistryKey {
     /// @brief Protection timestamp
     TimePoint protectedSince;
     
-    /// @brief Blocked operation count
-    std::atomic<uint64_t> blockedOperations{0};
+    /// @brief Blocked operation count (snapshot value)
+    uint64_t blockedOperations = 0;
 };
 
 /**
@@ -826,37 +826,37 @@ struct ComponentStatus {
  */
 struct SelfDefenseStatistics {
     /// @brief Total threats detected
-    std::atomic<uint64_t> totalThreatsDetected{0};
+    uint64_t totalThreatsDetected = 0;
     
     /// @brief Total threats blocked
-    std::atomic<uint64_t> totalThreatsBlocked{0};
+    uint64_t totalThreatsBlocked = 0;
     
     /// @brief Threats by type
     std::unordered_map<ThreatType, uint64_t> threatsByType;
     
     /// @brief Process termination attempts blocked
-    std::atomic<uint64_t> processTerminationBlocked{0};
+    uint64_t processTerminationBlocked = 0;
     
     /// @brief Thread termination attempts blocked
-    std::atomic<uint64_t> threadTerminationBlocked{0};
+    uint64_t threadTerminationBlocked = 0;
     
     /// @brief Memory modification attempts blocked
-    std::atomic<uint64_t> memoryModificationBlocked{0};
+    uint64_t memoryModificationBlocked = 0;
     
     /// @brief File modification attempts blocked
-    std::atomic<uint64_t> fileModificationBlocked{0};
+    uint64_t fileModificationBlocked = 0;
     
     /// @brief Registry modification attempts blocked
-    std::atomic<uint64_t> registryModificationBlocked{0};
+    uint64_t registryModificationBlocked = 0;
     
     /// @brief Service control attempts blocked
-    std::atomic<uint64_t> serviceControlBlocked{0};
+    uint64_t serviceControlBlocked = 0;
     
     /// @brief Auto-recovery events
-    std::atomic<uint64_t> autoRecoveryEvents{0};
+    uint64_t autoRecoveryEvents = 0;
     
     /// @brief Successful auto-recoveries
-    std::atomic<uint64_t> successfulRecoveries{0};
+    uint64_t successfulRecoveries = 0;
     
     /// @brief Module start time
     TimePoint startTime = Clock::now();

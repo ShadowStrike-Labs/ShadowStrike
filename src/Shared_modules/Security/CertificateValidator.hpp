@@ -151,7 +151,6 @@
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/StringUtils.hpp"
-#include "../Utils/TimeUtils.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -409,6 +408,10 @@ inline constexpr ExtendedKeyUsage operator|(ExtendedKeyUsage a, ExtendedKeyUsage
     return static_cast<ExtendedKeyUsage>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
+inline constexpr ExtendedKeyUsage operator&(ExtendedKeyUsage a, ExtendedKeyUsage b) noexcept {
+    return static_cast<ExtendedKeyUsage>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+
 /**
  * @brief Revocation status
  */
@@ -484,6 +487,8 @@ enum class TrustLevel : uint8_t {
 /**
  * @brief Module status
  */
+#ifndef SHADOWSTRIKE_SECURITY_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_SECURITY_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -494,6 +499,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 6,
     Error           = 7
 };
+#endif // SHADOWSTRIKE_SECURITY_MODULE_STATUS_DEFINED
 
 // ============================================================================
 // STRUCTURES
@@ -864,6 +870,44 @@ struct CertificateValidatorStatistics {
     
     /// @brief Start time
     TimePoint startTime = Clock::now();
+
+    CertificateValidatorStatistics() = default;
+
+    /// @brief Copy constructor (loads atomics with relaxed ordering)
+    CertificateValidatorStatistics(const CertificateValidatorStatistics& other)
+        : startTime(other.startTime) {
+        totalValidations.store(other.totalValidations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        validCertificates.store(other.validCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        invalidCertificates.store(other.invalidCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        expiredCertificates.store(other.expiredCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        revokedCertificates.store(other.revokedCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        ocspChecks.store(other.ocspChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        ocspCacheHits.store(other.ocspCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        crlChecks.store(other.crlChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        crlCacheHits.store(other.crlCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        validationCacheHits.store(other.validationCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        chainBuildFailures.store(other.chainBuildFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        avgValidationTimeUs.store(other.avgValidationTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+
+    CertificateValidatorStatistics& operator=(const CertificateValidatorStatistics& other) {
+        if (this != &other) {
+            totalValidations.store(other.totalValidations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            validCertificates.store(other.validCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            invalidCertificates.store(other.invalidCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            expiredCertificates.store(other.expiredCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            revokedCertificates.store(other.revokedCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ocspChecks.store(other.ocspChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ocspCacheHits.store(other.ocspCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            crlChecks.store(other.crlChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            crlCacheHits.store(other.crlCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            validationCacheHits.store(other.validationCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            chainBuildFailures.store(other.chainBuildFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            avgValidationTimeUs.store(other.avgValidationTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
     
     /**
      * @brief Reset statistics

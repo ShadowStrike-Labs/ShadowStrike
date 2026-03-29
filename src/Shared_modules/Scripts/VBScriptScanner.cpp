@@ -76,6 +76,11 @@ namespace ShadowStrike {
 namespace Scripts {
 
 // ============================================================================
+// LOG CATEGORY
+// ============================================================================
+static constexpr const wchar_t* LOG_CATEGORY = L"VBScriptScanner";
+
+// ============================================================================
 // STATIC MEMBER INITIALIZATION
 // ============================================================================
 std::atomic<bool> VBScriptScanner::s_instanceCreated{ false };
@@ -459,6 +464,28 @@ std::string VBSStatistics::ToJson() const {
     return j.dump(2);
 }
 
+std::string VBSStatisticsSnapshot::ToJson() const {
+    json j;
+    j["totalScans"] = totalScans;
+    j["maliciousDetected"] = maliciousDetected;
+    j["suspiciousDetected"] = suspiciousDetected;
+    j["vbsFilesScanned"] = vbsFilesScanned;
+    j["vbeFilesScanned"] = vbeFilesScanned;
+    j["wsfFilesScanned"] = wsfFilesScanned;
+    j["htaFilesScanned"] = htaFilesScanned;
+    j["obfuscatedDetected"] = obfuscatedDetected;
+    j["deobfuscationSuccess"] = deobfuscationSuccess;
+    j["deobfuscationFailure"] = deobfuscationFailure;
+    j["dangerousObjectsFound"] = dangerousObjectsFound;
+    j["totalBytesScanned"] = totalBytesScanned;
+
+    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+        Clock::now() - startTime).count();
+    j["uptimeSeconds"] = uptime;
+
+    return j.dump(2);
+}
+
 bool VBSScannerConfiguration::IsValid() const noexcept {
     if (maxFileSize == 0 || maxFileSize > 100 * 1024 * 1024) return false;
     if (maxDeobfuscationDepth == 0 || maxDeobfuscationDepth > 100) return false;
@@ -526,15 +553,15 @@ public:
 
     bool Initialize(const VBSScannerConfiguration& config) {
         if (m_initialized.exchange(true)) {
-            Utils::Logger::Warn(L"VBScriptScanner: Already initialized");
+            SS_LOG_WARN(LOG_CATEGORY, L"Already initialized");
             return true;
         }
 
-        Utils::Logger::Info(L"VBScriptScanner: Initializing...");
+        SS_LOG_INFO(LOG_CATEGORY, L"Initializing...");
         m_status = ModuleStatus::Initializing;
 
         if (!config.IsValid()) {
-            Utils::Logger::Error(L"VBScriptScanner: Invalid configuration");
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid configuration");
             m_initialized = false;
             m_status = ModuleStatus::Error;
             return false;
@@ -545,27 +572,39 @@ public:
             m_config = config;
         }
 
-        // Try to connect to infrastructure (optional)
+        // Connect to infrastructure singletons (optional — graceful if unavailable)
         try {
-            // These would connect to existing singletons if available
-            // m_patternStore = &PatternStore::PatternStore::Instance();
-            // m_hashStore = &HashStore::HashStore::Instance();
-            // m_threatIntel = &ThreatIntel::ThreatIntelManager::Instance();
-        } catch (...) {
-            Utils::Logger::Warn(L"VBScriptScanner: Some infrastructure modules unavailable");
+            auto& sigStore = SignatureStore::SignatureStore::Instance();
+            if (sigStore.IsInitialized()) m_signatureStore = &sigStore;
+        } catch (...) {}
+        try {
+            auto& hashStore = HashStore::HashStore::Instance();
+            if (hashStore.IsInitialized()) m_hashStore = &hashStore;
+        } catch (...) {}
+        try {
+            auto& tiStore = ThreatIntel::ThreatIntelManager::Instance();
+            if (tiStore.IsInitialized()) m_threatIntel = &tiStore;
+        } catch (...) {}
+        try {
+            auto& wlStore = Whitelist::WhiteListStore::Instance();
+            if (wlStore.IsInitialized()) m_whitelistStore = &wlStore;
+        } catch (...) {}
+
+        if (!m_signatureStore && !m_hashStore && !m_threatIntel) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Some infrastructure modules unavailable");
         }
 
         m_stats.Reset();
         m_status = ModuleStatus::Running;
 
-        Utils::Logger::Info(L"VBScriptScanner: Initialized successfully");
+        SS_LOG_INFO(LOG_CATEGORY, L"Initialized successfully");
         return true;
     }
 
     void Shutdown() {
         if (!m_initialized.exchange(false)) return;
 
-        Utils::Logger::Info(L"VBScriptScanner: Shutting down...");
+        SS_LOG_INFO(LOG_CATEGORY, L"Shutting down...");
         m_status = ModuleStatus::Stopping;
 
         // Clear cache
@@ -582,7 +621,7 @@ public:
         }
 
         m_status = ModuleStatus::Stopped;
-        Utils::Logger::Info(L"VBScriptScanner: Shutdown complete");
+        SS_LOG_INFO(LOG_CATEGORY, L"Shutdown complete");
     }
 
     // =========================================================================
@@ -590,8 +629,7 @@ public:
     // =========================================================================
 
     VBSFileType DetectFileType(const fs::path& path) {
-        if (!fs::exists(path)) return VBSFileType::Unknown;
-
+        // Check extension first (no I/O needed)
         std::wstring ext = path.extension().wstring();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
 
@@ -680,7 +718,7 @@ public:
 
         // Cap decoded size to prevent memory bombs
         if (data.size() > VBSConstants::MAX_SCRIPT_SIZE) {
-            Utils::Logger::Warn(L"VBScriptScanner: VBE encoded data exceeds size limit");
+            SS_LOG_WARN(LOG_CATEGORY, L"VBE encoded data exceeds size limit");
             return std::nullopt;
         }
 
@@ -734,7 +772,7 @@ public:
 
         if (decoded.empty()) return std::nullopt;
 
-        Utils::Logger::Debug(L"VBScriptScanner: VBE decoded {} bytes -> {} bytes",
+        SS_LOG_DEBUG(LOG_CATEGORY, L"VBE decoded %zu bytes -> %zu bytes",
             data.size(), decoded.size());
         return decoded;
     }
@@ -842,7 +880,11 @@ public:
 
         try {
             std::string current(source);
-            size_t maxDepth = m_config.maxDeobfuscationDepth;
+            size_t maxDepth;
+            {
+                std::shared_lock lock(m_configMutex);
+                maxDepth = m_config.maxDeobfuscationDepth;
+            }
 
             for (size_t depth = 0; depth < maxDepth; ++depth) {
                 result.depth = depth + 1;
@@ -1033,8 +1075,9 @@ public:
         // Find CreateObject calls
         std::sregex_iterator it(src.begin(), src.end(), CREATEOBJECT_PATTERN);
         std::sregex_iterator end;
+        size_t iters = 0;
 
-        while (it != end) {
+        while (it != end && iters < MAX_REGEX_ITERATIONS) {
             COMObjectUsage usage;
             usage.objectName = (*it)[1].str();
             usage.lineNumber = GetLineNumber(source, (*it).position());
@@ -1051,11 +1094,13 @@ public:
 
             objects.push_back(usage);
             ++it;
+            ++iters;
         }
 
         // Find GetObject calls (for WMI, etc.)
         std::sregex_iterator git(src.begin(), src.end(), GETOBJECT_PATTERN);
-        while (git != end) {
+        iters = 0;
+        while (git != end && iters < MAX_REGEX_ITERATIONS) {
             COMObjectUsage usage;
             usage.objectName = (*git)[1].str();
             usage.lineNumber = GetLineNumber(source, (*git).position());
@@ -1070,6 +1115,7 @@ public:
 
             objects.push_back(usage);
             ++git;
+            ++iters;
         }
 
         // Analyze method calls for each object
@@ -1136,11 +1182,8 @@ public:
         }
     }
 
-    std::vector<std::string> FindMethodCalls(std::string_view source, const std::string& objectName) {
+    std::vector<std::string> FindMethodCalls(std::string_view source, const std::string& /*objectName*/) {
         std::vector<std::string> methods;
-
-        // Look for .MethodName patterns after object assignment
-        std::string lowerSrc = ToLower(std::string(source));
 
         for (const auto& [method, desc] : DANGEROUS_METHODS) {
             if (ContainsCI(source, std::string(".") + method)) {
@@ -1291,26 +1334,33 @@ public:
         }
 
         // Extract domains from URLs
-        std::regex domainPattern(R"(https?://([^/\s:]+))");
+        static const std::regex domainPattern(R"(https?://([^/\s:]+))",
+            std::regex::icase | std::regex::optimize);
         std::string src(source);
         std::sregex_iterator it(src.begin(), src.end(), domainPattern);
         std::sregex_iterator end;
 
         std::unordered_set<std::string> seenDomains;
-        while (it != end) {
+        size_t iters = 0;
+        while (it != end && iters < MAX_REGEX_ITERATIONS) {
             std::string domain = (*it)[1].str();
             if (seenDomains.insert(domain).second) {
                 iocs.push_back("domain:" + domain);
             }
             ++it;
+            ++iters;
         }
 
         // Extract file paths
-        std::regex pathPattern(R"(([a-zA-Z]:\\[^\s"'<>|]+\.(exe|dll|bat|cmd|ps1|vbs|js)))");
+        static const std::regex pathPattern(
+            R"(([a-zA-Z]:\\[^\s"'<>|]+\.(exe|dll|bat|cmd|ps1|vbs|js)))",
+            std::regex::icase | std::regex::optimize);
         std::sregex_iterator pit(src.begin(), src.end(), pathPattern);
-        while (pit != end) {
+        iters = 0;
+        while (pit != end && iters < MAX_REGEX_ITERATIONS) {
             iocs.push_back("path:" + (*pit)[0].str());
             ++pit;
+            ++iters;
         }
 
         return iocs;
@@ -1427,8 +1477,15 @@ public:
         result.fileType = VBSFileType::Memory;
         result.fileSize = source.size();
 
-        m_stats.totalScans++;
-        m_stats.totalBytesScanned += source.size();
+        // Take a snapshot of config under lock to avoid repeated lock acquisitions
+        VBSScannerConfiguration config;
+        {
+            std::shared_lock lock(m_configMutex);
+            config = m_config;
+        }
+
+        m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
+        m_stats.totalBytesScanned.fetch_add(source.size(), std::memory_order_relaxed);
 
         // Input validation
         if (source.empty()) {
@@ -1438,21 +1495,29 @@ public:
             return result;
         }
 
-        if (source.size() > m_config.maxFileSize) {
+        if (source.size() > config.maxFileSize) {
             result.status = VBSScanStatus::SkippedSizeLimit;
             result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
                 Clock::now() - startTime);
-            Utils::Logger::Warn(L"VBScriptScanner: File exceeds size limit: {}",
-                Utils::StringUtils::Utf8ToWide(sourceName));
+            SS_LOG_WARN(LOG_CATEGORY, L"File exceeds size limit: %ls",
+                Utils::StringUtils::ToWide(sourceName).c_str());
             return result;
         }
 
         try {
             // Calculate hash
-            result.sha256 = Utils::HashUtils::CalculateSHA256(
-                std::span<const uint8_t>(
-                    reinterpret_cast<const uint8_t*>(source.data()),
-                    source.size()));
+            {
+                std::vector<uint8_t> hashBytes;
+                Utils::HashUtils::Error hashErr;
+                if (Utils::HashUtils::Compute(
+                        Utils::HashUtils::Algorithm::SHA256,
+                        source.data(),
+                        source.size(),
+                        hashBytes,
+                        &hashErr)) {
+                    result.sha256 = Utils::HashUtils::ToHexLower(hashBytes);
+                }
+            }
 
             // Check cache
             {
@@ -1465,9 +1530,34 @@ public:
             }
 
             // Check hash store for known malware
-            if (m_hashStore) {
-                // auto hashResult = m_hashStore->Lookup(result.sha256);
-                // if (hashResult.isMalicious) { ... }
+            if (m_hashStore && !result.sha256.empty()) {
+                auto hashLookup = m_hashStore->LookupHashString(
+                    result.sha256, HashStore::HashType::SHA256);
+                if (hashLookup.has_value()) {
+                    result.status = VBSScanStatus::Malicious;
+                    result.isMalicious = true;
+                    result.threatName = hashLookup->signatureName;
+                    result.matchedSignatures.push_back("HASH:" + hashLookup->signatureName);
+                    m_stats.maliciousDetected.fetch_add(1, std::memory_order_relaxed);
+                    result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
+                        Clock::now() - startTime);
+                    InvokeScanCallbacks(result);
+                    return result;
+                }
+            }
+
+            // Check whitelist by hash — skip scanning for known-good files
+            if (m_whitelistStore && !result.sha256.empty()) {
+                HashStore::HashValue wlHash{};
+                wlHash.type = HashStore::HashType::SHA256;
+                Utils::HashUtils::FromHex(result.sha256, wlHash.bytes);
+                auto wlResult = m_whitelistStore->IsHashWhitelisted(wlHash);
+                if (wlResult.isWhitelisted) {
+                    result.status = VBSScanStatus::SkippedWhitelisted;
+                    result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
+                        Clock::now() - startTime);
+                    return result;
+                }
             }
 
             // Detect obfuscation
@@ -1475,12 +1565,12 @@ public:
             result.isObfuscated = (result.obfuscationType != VBSObfuscationType::None);
 
             if (result.isObfuscated) {
-                m_stats.obfuscatedDetected++;
+                m_stats.obfuscatedDetected.fetch_add(1, std::memory_order_relaxed);
             }
 
             // Deobfuscate if needed
             std::string analysisSource(source);
-            if (result.isObfuscated && m_config.enableDeobfuscation) {
+            if (result.isObfuscated && config.enableDeobfuscation) {
                 result.deobfuscation = Deobfuscate(source);
                 if (result.deobfuscation->success) {
                     analysisSource = result.deobfuscation->deobfuscatedScript;
@@ -1494,7 +1584,7 @@ public:
             for (const auto& com : result.comObjectUsage) {
                 if (com.isDangerous) {
                     result.dangerousObjects.push_back(com);
-                    m_stats.dangerousObjectsFound++;
+                    m_stats.dangerousObjectsFound.fetch_add(1, std::memory_order_relaxed);
                 }
             }
 
@@ -1505,7 +1595,7 @@ public:
             result.detectedCapabilities = CapabilitiesToStrings(result.capabilities);
 
             // Extract IOCs
-            if (m_config.extractIOCs) {
+            if (config.extractIOCs) {
                 result.extractedIOCs = ExtractIOCs(analysisSource);
                 result.extractedUrls = ExtractURLs(analysisSource);
                 result.extractedCommands = ExtractCommands(analysisSource);
@@ -1514,14 +1604,32 @@ public:
             // Detect download+write+execute attack chain (APT dropper pattern)
             DetectAttackChains(analysisSource, result);
 
-            // Check threat intelligence
+            // Check threat intelligence for extracted IOCs
             if (m_threatIntel && !result.extractedUrls.empty()) {
-                // for (const auto& url : result.extractedUrls) {
-                //     auto intel = m_threatIntel->Lookup(url);
-                //     if (intel.isMalicious) {
-                //         result.matchedSignatures.push_back("TI:" + intel.threatName);
-                //     }
-                // }
+                for (const auto& url : result.extractedUrls) {
+                    auto intel = m_threatIntel->LookupURL(url);
+                    if (intel.found) {
+                        result.matchedSignatures.push_back("TI:" + intel.threatName);
+                    }
+                }
+            }
+            if (m_threatIntel && !result.extractedIOCs.empty()) {
+                for (const auto& ioc : result.extractedIOCs) {
+                    // Extract the value after the type prefix (e.g. "ip:1.2.3.4" → "1.2.3.4")
+                    auto sep = ioc.find(':');
+                    if (sep == std::string::npos) continue;
+                    std::string type = ioc.substr(0, sep);
+                    std::string value = ioc.substr(sep + 1);
+                    ThreatIntel::StoreLookupResult tiResult{};
+                    if (type == "ip") {
+                        tiResult = m_threatIntel->LookupIP(value);
+                    } else if (type == "domain") {
+                        tiResult = m_threatIntel->LookupDomain(value);
+                    }
+                    if (tiResult.found) {
+                        result.matchedSignatures.push_back("TI:" + tiResult.threatName);
+                    }
+                }
             }
 
             // Find flagged lines
@@ -1538,11 +1646,14 @@ public:
                 result.status = VBSScanStatus::Malicious;
                 result.isMalicious = true;
                 result.threatName = DetermineThreatName(result);
-                m_stats.maliciousDetected++;
-                m_stats.byCategory[static_cast<size_t>(result.category)]++;
+                m_stats.maliciousDetected.fetch_add(1, std::memory_order_relaxed);
+                auto catIdx = static_cast<size_t>(result.category);
+                if (catIdx < m_stats.byCategory.size()) {
+                    m_stats.byCategory[catIdx].fetch_add(1, std::memory_order_relaxed);
+                }
             } else if (result.riskScore >= 50 || !result.dangerousObjects.empty()) {
                 result.status = VBSScanStatus::Suspicious;
-                m_stats.suspiciousDetected++;
+                m_stats.suspiciousDetected.fetch_add(1, std::memory_order_relaxed);
             } else {
                 result.status = VBSScanStatus::Clean;
             }
@@ -1574,8 +1685,8 @@ public:
 
         } catch (const std::exception& e) {
             result.status = VBSScanStatus::ErrorParsing;
-            Utils::Logger::Error(L"VBScriptScanner: Scan error: {}",
-                Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(LOG_CATEGORY, L"Scan error: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
             InvokeErrorCallbacks(e.what(), 1);
         }
 
@@ -1596,25 +1707,19 @@ public:
         // Validate path
         if (path.empty()) {
             result.status = VBSScanStatus::ErrorFileAccess;
-            Utils::Logger::Error(L"VBScriptScanner: Empty file path");
+            SS_LOG_ERROR(LOG_CATEGORY, L"Empty file path");
             return result;
         }
 
-        if (!fs::exists(path)) {
-            result.status = VBSScanStatus::ErrorFileAccess;
-            Utils::Logger::Error(L"VBScriptScanner: File not found: {}", path.wstring());
-            return result;
-        }
-
-        // Detect file type
+        // Detect file type (uses extension first, falls back to content probe)
         result.fileType = DetectFileType(path);
 
         // Update stats by type
         switch (result.fileType) {
-            case VBSFileType::VBS: m_stats.vbsFilesScanned++; break;
-            case VBSFileType::VBE: m_stats.vbeFilesScanned++; break;
-            case VBSFileType::WSF: m_stats.wsfFilesScanned++; break;
-            case VBSFileType::HTA: m_stats.htaFilesScanned++; break;
+            case VBSFileType::VBS: m_stats.vbsFilesScanned.fetch_add(1, std::memory_order_relaxed); break;
+            case VBSFileType::VBE: m_stats.vbeFilesScanned.fetch_add(1, std::memory_order_relaxed); break;
+            case VBSFileType::WSF: m_stats.wsfFilesScanned.fetch_add(1, std::memory_order_relaxed); break;
+            case VBSFileType::HTA: m_stats.htaFilesScanned.fetch_add(1, std::memory_order_relaxed); break;
             default: break;
         }
 
@@ -1624,30 +1729,39 @@ public:
             std::ifstream file(path, std::ios::binary);
             if (!file) {
                 result.status = VBSScanStatus::ErrorFileAccess;
-                Utils::Logger::Error(L"VBScriptScanner: Cannot open file: {}", path.wstring());
+                SS_LOG_ERROR(LOG_CATEGORY, L"Cannot open file: %ls", path.wstring().c_str());
                 return result;
             }
 
-            // Get file size
+            // Get file size safely (tellg returns -1 on error)
             file.seekg(0, std::ios::end);
-            size_t fileSize = file.tellg();
+            auto pos = file.tellg();
+            if (pos < 0) {
+                result.status = VBSScanStatus::ErrorFileAccess;
+                SS_LOG_ERROR(LOG_CATEGORY, L"Cannot determine file size: %ls", path.wstring().c_str());
+                return result;
+            }
+            size_t fileSize = static_cast<size_t>(pos);
             file.seekg(0, std::ios::beg);
 
             result.fileSize = fileSize;
 
-            if (fileSize > m_config.maxFileSize) {
-                result.status = VBSScanStatus::SkippedSizeLimit;
-                Utils::Logger::Warn(L"VBScriptScanner: File too large: {}", path.wstring());
-                return result;
+            {
+                std::shared_lock lock(m_configMutex);
+                if (fileSize > m_config.maxFileSize) {
+                    result.status = VBSScanStatus::SkippedSizeLimit;
+                    SS_LOG_WARN(LOG_CATEGORY, L"File too large: %ls", path.wstring().c_str());
+                    return result;
+                }
             }
 
             content.resize(fileSize);
-            file.read(content.data(), fileSize);
+            file.read(content.data(), static_cast<std::streamsize>(fileSize));
 
         } catch (const std::exception& e) {
             result.status = VBSScanStatus::ErrorFileAccess;
-            Utils::Logger::Error(L"VBScriptScanner: Read error: {}",
-                Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(LOG_CATEGORY, L"Read error: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
             return result;
         }
 
@@ -1657,7 +1771,7 @@ public:
             if (decoded) {
                 content = *decoded;
             } else {
-                Utils::Logger::Warn(L"VBScriptScanner: VBE decode failed: {}", path.wstring());
+                SS_LOG_WARN(LOG_CATEGORY, L"VBE decode failed: %ls", path.wstring().c_str());
             }
         }
 
@@ -1690,27 +1804,33 @@ public:
         std::string extracted;
 
         // Find <script language="VBScript"> blocks
-        std::regex scriptPattern(
+        static const std::regex scriptPattern(
             R"(<script[^>]*language\s*=\s*["']?vbscript["']?[^>]*>([\s\S]*?)</script>)",
-            std::regex::icase);
+            std::regex::icase | std::regex::optimize);
 
         std::sregex_iterator it(content.begin(), content.end(), scriptPattern);
         std::sregex_iterator end;
+        size_t iters = 0;
 
-        while (it != end) {
+        while (it != end && iters < MAX_REGEX_ITERATIONS) {
             extracted += (*it)[1].str();
             extracted += "\n";
             ++it;
+            ++iters;
         }
 
         // If no explicit VBScript blocks, return all script content
         if (extracted.empty()) {
-            std::regex anyScriptPattern(R"(<script[^>]*>([\s\S]*?)</script>)", std::regex::icase);
+            static const std::regex anyScriptPattern(
+                R"(<script[^>]*>([\s\S]*?)</script>)",
+                std::regex::icase | std::regex::optimize);
             std::sregex_iterator sit(content.begin(), content.end(), anyScriptPattern);
-            while (sit != end) {
+            iters = 0;
+            while (sit != end && iters < MAX_REGEX_ITERATIONS) {
                 extracted += (*sit)[1].str();
                 extracted += "\n";
                 ++sit;
+                ++iters;
             }
         }
 
@@ -1721,17 +1841,19 @@ public:
         std::string extracted;
 
         // Find <script language="VBScript"> blocks in WSF
-        std::regex scriptPattern(
+        static const std::regex scriptPattern(
             R"(<script[^>]*language\s*=\s*["']?vbscript["']?[^>]*>([\s\S]*?)</script>)",
-            std::regex::icase);
+            std::regex::icase | std::regex::optimize);
 
         std::sregex_iterator it(content.begin(), content.end(), scriptPattern);
         std::sregex_iterator end;
+        size_t iters = 0;
 
-        while (it != end) {
+        while (it != end && iters < MAX_REGEX_ITERATIONS) {
             extracted += (*it)[1].str();
             extracted += "\n";
             ++it;
+            ++iters;
         }
 
         return extracted.empty() ? content : extracted;
@@ -1785,15 +1907,19 @@ public:
         std::vector<std::string> commands;
 
         // Find .Run() and .Exec() calls
-        std::regex runPattern(R"(\.(?:run|exec)\s*\(\s*["']([^"']+)["'])", std::regex::icase);
+        static const std::regex runPattern(
+            R"(\.(?:run|exec)\s*\(\s*["']([^"']+)["'])",
+            std::regex::icase | std::regex::optimize);
         std::string src(source);
 
         std::sregex_iterator it(src.begin(), src.end(), runPattern);
         std::sregex_iterator end;
+        size_t iters = 0;
 
-        while (it != end) {
+        while (it != end && iters < MAX_REGEX_ITERATIONS) {
             commands.push_back((*it)[1].str());
             ++it;
+            ++iters;
         }
 
         return commands;
@@ -1856,10 +1982,8 @@ public:
 
         if (hasDownload && hasBinaryWrite && hasExec) {
             result.matchedSignatures.push_back("CHAIN:Download+Write+Execute");
-            Utils::Logger::Warn(L"VBScriptScanner: Detected download-write-execute chain");
-        }
-
-        if (hasDownload && hasBinaryWrite) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Detected download-write-execute chain");
+        } else if (hasDownload && hasBinaryWrite) {
             result.matchedSignatures.push_back("CHAIN:Download+Write");
         }
 
@@ -1961,30 +2085,32 @@ public:
     // =========================================================================
 
     bool SelfTest() {
-        Utils::Logger::Info(L"VBScriptScanner: Running self-test...");
+        SS_LOG_INFO(LOG_CATEGORY, L"Running self-test...");
 
         bool passed = true;
 
         try {
-            // Test 1: Obfuscation detection
-            std::string obfuscatedSample = "Dim x : x = Chr(87) & Chr(83) & Chr(99) & Chr(114) & Chr(105) & Chr(112) & Chr(116)";
+            // Test 1: Obfuscation detection (needs >= CHR_OBFUSCATION_THRESHOLD Chr() calls)
+            std::string obfuscatedSample =
+                "Dim x : x = Chr(87) & Chr(83) & Chr(99) & Chr(114) & Chr(105) & "
+                "Chr(112) & Chr(116) & Chr(46) & Chr(83) & Chr(104) & Chr(101) & Chr(108) & Chr(108)";
             auto obfType = DetectObfuscation(obfuscatedSample);
             if (obfType != VBSObfuscationType::ChrEncoding) {
-                Utils::Logger::Error(L"VBScriptScanner: Self-test failed: Chr obfuscation detection");
+                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: Chr obfuscation detection");
                 passed = false;
             }
 
             // Test 2: Deobfuscation
             auto deobResult = Deobfuscate(obfuscatedSample);
-            if (!deobResult.success || deobResult.deobfuscatedScript.find("WScript") == std::string::npos) {
-                Utils::Logger::Warn(L"VBScriptScanner: Self-test: Deobfuscation incomplete");
+            if (!deobResult.success || deobResult.deobfuscatedScript.find("WScript.Shell") == std::string::npos) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Self-test: Deobfuscation incomplete");
             }
 
             // Test 3: COM object detection
             std::string comSample = "Set objShell = CreateObject(\"WScript.Shell\")";
             auto comUsage = AnalyzeCOMUsage(comSample);
             if (comUsage.empty() || !comUsage[0].isDangerous) {
-                Utils::Logger::Error(L"VBScriptScanner: Self-test failed: COM detection");
+                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: COM detection");
                 passed = false;
             }
 
@@ -1992,7 +2118,7 @@ public:
             std::string capSample = "objShell.Run \"cmd.exe /c whoami\"";
             auto caps = DetectCapabilities(capSample);
             if (!(static_cast<uint32_t>(caps) & static_cast<uint32_t>(VBSCapability::CommandExecution))) {
-                Utils::Logger::Error(L"VBScriptScanner: Self-test failed: Capability detection");
+                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: Capability detection");
                 passed = false;
             }
 
@@ -2000,7 +2126,7 @@ public:
             std::string urlSample = "url = \"http://malware.com/payload.exe\"";
             auto urls = ExtractURLs(urlSample);
             if (urls.empty()) {
-                Utils::Logger::Error(L"VBScriptScanner: Self-test failed: URL extraction");
+                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: URL extraction");
                 passed = false;
             }
 
@@ -2008,7 +2134,7 @@ public:
             std::string winHttpSample = "Set http = CreateObject(\"WinHttp.WinHttpRequest.5.1\")";
             auto winHttpCom = AnalyzeCOMUsage(winHttpSample);
             if (winHttpCom.empty() || !winHttpCom[0].isDangerous) {
-                Utils::Logger::Error(L"VBScriptScanner: Self-test failed: WinHttp detection");
+                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: WinHttp detection");
                 passed = false;
             }
 
@@ -2016,7 +2142,7 @@ public:
             std::string reverseSample = "x = StrReverse(\"dlroW olleH\")";
             auto reverseResult = ResolveStrReverse(reverseSample);
             if (reverseResult.find("Hello World") == std::string::npos) {
-                Utils::Logger::Error(L"VBScriptScanner: Self-test failed: StrReverse deobfuscation");
+                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: StrReverse deobfuscation");
                 passed = false;
             }
 
@@ -2030,21 +2156,21 @@ public:
                     }
                 }
                 if (validCount < 90) {
-                    Utils::Logger::Error(L"VBScriptScanner: Self-test failed: VBE decode table {} has too few valid entries", table);
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: VBE decode table %d has too few valid entries", table);
                     passed = false;
                 }
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"VBScriptScanner: Self-test exception: {}",
-                Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(LOG_CATEGORY, L"Self-test exception: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
             passed = false;
         }
 
         if (passed) {
-            Utils::Logger::Info(L"VBScriptScanner: Self-test PASSED");
+            SS_LOG_INFO(LOG_CATEGORY, L"Self-test PASSED");
         } else {
-            Utils::Logger::Error(L"VBScriptScanner: Self-test FAILED");
+            SS_LOG_ERROR(LOG_CATEGORY, L"Self-test FAILED");
         }
 
         return passed;
@@ -2103,13 +2229,13 @@ ModuleStatus VBScriptScanner::GetStatus() const noexcept {
 
 bool VBScriptScanner::UpdateConfiguration(const VBSScannerConfiguration& config) {
     if (!config.IsValid()) {
-        Utils::Logger::Error(L"VBScriptScanner: Invalid configuration update");
+        SS_LOG_ERROR(LOG_CATEGORY, L"Invalid configuration update");
         return false;
     }
 
     std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_config = config;
-    Utils::Logger::Info(L"VBScriptScanner: Configuration updated");
+    SS_LOG_INFO(LOG_CATEGORY, L"Configuration updated");
     return true;
 }
 
@@ -2123,26 +2249,54 @@ VBSScannerConfiguration VBScriptScanner::GetConfiguration() const {
 // ============================================================================
 
 VBSScanResult VBScriptScanner::ScanFile(const fs::path& path) {
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+        VBSScanResult err;
+        err.status = VBSScanStatus::ErrorParsing;
+        err.filePath = path;
+        SS_LOG_ERROR(LOG_CATEGORY, L"ScanFile called before initialization");
+        return err;
+    }
     return m_impl->ScanFile(path);
 }
 
 VBSScanResult VBScriptScanner::ScanSource(std::string_view source, const std::string& sourceName) {
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+        VBSScanResult err;
+        err.status = VBSScanStatus::ErrorParsing;
+        SS_LOG_ERROR(LOG_CATEGORY, L"ScanSource called before initialization");
+        return err;
+    }
     return m_impl->ScanSource(source, sourceName);
 }
 
 VBSScanResult VBScriptScanner::ScanEncodedVBE(const fs::path& vbePath) {
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+        VBSScanResult err;
+        err.status = VBSScanStatus::ErrorParsing;
+        return err;
+    }
     auto result = m_impl->ScanFile(vbePath);
     result.fileType = VBSFileType::VBE;
     return result;
 }
 
 VBSScanResult VBScriptScanner::ScanWSF(const fs::path& wsfPath) {
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+        VBSScanResult err;
+        err.status = VBSScanStatus::ErrorParsing;
+        return err;
+    }
     auto result = m_impl->ScanFile(wsfPath);
     result.fileType = VBSFileType::WSF;
     return result;
 }
 
 VBSScanResult VBScriptScanner::ScanHTA(const fs::path& htaPath) {
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+        VBSScanResult err;
+        err.status = VBSScanStatus::ErrorParsing;
+        return err;
+    }
     auto result = m_impl->ScanFile(htaPath);
     result.fileType = VBSFileType::HTA;
     return result;
@@ -2209,8 +2363,26 @@ void VBScriptScanner::UnregisterCallbacks() {
 // STATISTICS
 // ============================================================================
 
-VBSStatistics VBScriptScanner::GetStatistics() const {
-    return m_impl->m_stats;
+VBSStatisticsSnapshot VBScriptScanner::GetStatistics() const {
+    VBSStatisticsSnapshot snap;
+    snap.totalScans = m_impl->m_stats.totalScans.load(std::memory_order_relaxed);
+    snap.maliciousDetected = m_impl->m_stats.maliciousDetected.load(std::memory_order_relaxed);
+    snap.suspiciousDetected = m_impl->m_stats.suspiciousDetected.load(std::memory_order_relaxed);
+    snap.vbsFilesScanned = m_impl->m_stats.vbsFilesScanned.load(std::memory_order_relaxed);
+    snap.vbeFilesScanned = m_impl->m_stats.vbeFilesScanned.load(std::memory_order_relaxed);
+    snap.wsfFilesScanned = m_impl->m_stats.wsfFilesScanned.load(std::memory_order_relaxed);
+    snap.htaFilesScanned = m_impl->m_stats.htaFilesScanned.load(std::memory_order_relaxed);
+    snap.obfuscatedDetected = m_impl->m_stats.obfuscatedDetected.load(std::memory_order_relaxed);
+    snap.deobfuscationSuccess = m_impl->m_stats.deobfuscationSuccess.load(std::memory_order_relaxed);
+    snap.deobfuscationFailure = m_impl->m_stats.deobfuscationFailure.load(std::memory_order_relaxed);
+    snap.dangerousObjectsFound = m_impl->m_stats.dangerousObjectsFound.load(std::memory_order_relaxed);
+    snap.totalBytesScanned = m_impl->m_stats.totalBytesScanned.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < m_impl->m_stats.byCategory.size(); ++i)
+        snap.byCategory[i] = m_impl->m_stats.byCategory[i].load(std::memory_order_relaxed);
+    for (size_t i = 0; i < m_impl->m_stats.byCapability.size(); ++i)
+        snap.byCapability[i] = m_impl->m_stats.byCapability[i].load(std::memory_order_relaxed);
+    snap.startTime = m_impl->m_stats.startTime;
+    return snap;
 }
 
 void VBScriptScanner::ResetStatistics() {

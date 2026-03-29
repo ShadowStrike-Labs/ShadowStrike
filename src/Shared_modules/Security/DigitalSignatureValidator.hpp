@@ -159,7 +159,7 @@
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
 #include "../Utils/StringUtils.hpp"
-#include "../Utils/PEParser.hpp"
+#include "../PEParser/PEParser.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
 
 // ============================================================================

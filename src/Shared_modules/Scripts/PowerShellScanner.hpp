@@ -66,6 +66,9 @@
 
 #include "../Utils/Logger.hpp"
 
+// Forward declarations for cross-module integration
+namespace ShadowStrike::Whitelist { class WhitelistStore; }
+
 namespace ShadowStrike::Scripts {
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -219,15 +222,15 @@ struct ScanResult {
 };
 
 struct PowerShellStats {
-    std::atomic<uint64_t> totalScans{0};
-    std::atomic<uint64_t> maliciousDetected{0};
-    std::atomic<uint64_t> suspiciousDetected{0};
-    std::atomic<uint64_t> obfuscatedDetected{0};
-    std::atomic<uint64_t> amsiBypassesBlocked{0};
-    std::atomic<uint64_t> v2DowngradesBlocked{0};
-    std::atomic<uint64_t> timeouts{0};
-    std::atomic<uint64_t> totalBytesScanned{0};
-    std::atomic<uint64_t> averageScanTimeUs{0};
+    uint64_t totalScans{0};
+    uint64_t maliciousDetected{0};
+    uint64_t suspiciousDetected{0};
+    uint64_t obfuscatedDetected{0};
+    uint64_t amsiBypassesBlocked{0};
+    uint64_t v2DowngradesBlocked{0};
+    uint64_t timeouts{0};
+    uint64_t totalBytesScanned{0};
+    uint64_t averageScanTimeUs{0};
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -265,6 +268,8 @@ public:
     [[nodiscard]] PowerShellScanConfig getConfig() const;
 
     void registerCallback(std::function<void(const ScanResult&)> callback);
+
+    void setWhitelistStore(Whitelist::WhitelistStore* store) noexcept;
 
     [[nodiscard]] PowerShellStats getStats() const;
 

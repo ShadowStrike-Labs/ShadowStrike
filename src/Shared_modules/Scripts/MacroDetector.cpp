@@ -76,6 +76,42 @@ namespace Scripts {
 std::atomic<bool> MacroDetector::s_instanceCreated{false};
 
 // ============================================================================
+// JSON ESCAPE UTILITY (must precede struct ToJson implementations)
+// ============================================================================
+
+namespace {
+
+/// @brief Escapes a string for safe embedding in JSON values.
+[[nodiscard]] std::string JsonEscapeStr(std::string_view input) {
+    std::string out;
+    out.reserve(input.size() + 16);
+    for (char c : input) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                  static_cast<unsigned int>(static_cast<unsigned char>(c)));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+}  // anonymous namespace
+
+// ============================================================================
 // UTILITY FUNCTION IMPLEMENTATIONS
 // ============================================================================
 
@@ -163,10 +199,10 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
 }
 
 [[nodiscard]] bool IsAutoExecFunction(std::string_view functionName) noexcept {
+    const std::wstring wideName = Utils::StringUtils::ToWide(functionName);
     for (const auto* autoExec : MacroConstants::VBA_AUTO_EXEC_FUNCTIONS) {
-        if (Utils::StringUtils::IEquals(
-                Utils::StringUtils::ToWide(std::string(functionName)),
-                Utils::StringUtils::ToWide(autoExec))) {
+        if (Utils::StringUtils::IEquals(wideName,
+                Utils::StringUtils::ToWide(std::string_view(autoExec)))) {
             return true;
         }
     }
@@ -174,10 +210,10 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
 }
 
 [[nodiscard]] bool IsSuspiciousVBAAPI(std::string_view apiName) noexcept {
+    const std::wstring wideName = Utils::StringUtils::ToWide(apiName);
     for (const auto* api : MacroConstants::SUSPICIOUS_VBA_APIS) {
-        if (Utils::StringUtils::IContains(
-                Utils::StringUtils::ToWide(std::string(apiName)),
-                Utils::StringUtils::ToWide(api))) {
+        if (Utils::StringUtils::IContains(wideName,
+                Utils::StringUtils::ToWide(std::string_view(api)))) {
             return true;
         }
     }
@@ -189,7 +225,7 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
 // ============================================================================
 
 [[nodiscard]] std::string VBAModuleInfo::ToJson() const {
-    auto esc = MacroDetectorImpl::JsonEscape;
+    auto esc = JsonEscapeStr;
     std::ostringstream oss;
     oss << "{";
     oss << "\"moduleName\":\"" << esc(moduleName) << "\",";
@@ -222,7 +258,7 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
 }
 
 [[nodiscard]] std::string VBAProjectInfo::ToJson() const {
-    auto esc = MacroDetectorImpl::JsonEscape;
+    auto esc = JsonEscapeStr;
     std::ostringstream oss;
     oss << "{";
     oss << "\"projectName\":\"" << esc(projectName) << "\",";
@@ -258,7 +294,7 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
 }
 
 [[nodiscard]] std::string XLMMacroInfo::ToJson() const {
-    auto esc = MacroDetectorImpl::JsonEscape;
+    auto esc = JsonEscapeStr;
     std::ostringstream oss;
     oss << "{";
     oss << "\"sheetName\":\"" << esc(sheetName) << "\",";
@@ -298,6 +334,35 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
     return oss.str();
 }
 
+[[nodiscard]] std::string TemplateInjectionInfo::ToJson() const {
+    auto esc = JsonEscapeStr;
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"templateUrl\":\"" << esc(templateUrl) << "\",";
+    oss << "\"xmlElement\":\"" << esc(xmlElement) << "\",";
+    oss << "\"relationshipType\":\"" << esc(relationshipType) << "\"";
+    oss << "}";
+    return oss.str();
+}
+
+[[nodiscard]] std::string XLLInfo::ToJson() const {
+    auto esc = JsonEscapeStr;
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"isPEFile\":" << (isPEFile ? "true" : "false") << ",";
+    oss << "\"hasXlAutoOpen\":" << (hasXlAutoOpen ? "true" : "false") << ",";
+    oss << "\"hasXlAutoClose\":" << (hasXlAutoClose ? "true" : "false") << ",";
+    oss << "\"hasXlAutoRegister\":" << (hasXlAutoRegister ? "true" : "false") << ",";
+    oss << "\"exportNames\":[";
+    for (size_t i = 0; i < exportNames.size(); ++i) {
+        if (i > 0) oss << ",";
+        oss << "\"" << esc(exportNames[i]) << "\"";
+    }
+    oss << "]";
+    oss << "}";
+    return oss.str();
+}
+
 [[nodiscard]] bool MacroScanResult::ShouldBlock() const noexcept {
     if (isMalicious) return true;
     if (status == MacroScanStatus::Malicious) return true;
@@ -307,18 +372,20 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
 }
 
 [[nodiscard]] std::string MacroScanResult::ToJson() const {
+    auto esc = JsonEscapeStr;
     std::ostringstream oss;
     oss << "{";
     oss << "\"status\":" << static_cast<int>(status) << ",";
     oss << "\"hasMacros\":" << (hasMacros ? "true" : "false") << ",";
     oss << "\"isMalicious\":" << (isMalicious ? "true" : "false") << ",";
+    oss << "\"isSuspicious\":" << (isSuspicious ? "true" : "false") << ",";
     oss << "\"category\":\"" << GetMacroThreatCategoryName(category) << "\",";
     oss << "\"riskScore\":" << riskScore << ",";
-    oss << "\"detectedFamily\":\"" << detectedFamily << "\",";
-    oss << "\"threatName\":\"" << threatName << "\",";
+    oss << "\"detectedFamily\":\"" << esc(detectedFamily) << "\",";
+    oss << "\"threatName\":\"" << esc(threatName) << "\",";
     oss << "\"format\":\"" << GetDocumentFormatName(format) << "\",";
-    oss << "\"filePath\":\"" << filePath.string() << "\",";
-    oss << "\"sha256\":\"" << sha256 << "\",";
+    oss << "\"filePath\":\"" << esc(filePath.string()) << "\",";
+    oss << "\"sha256\":\"" << esc(sha256) << "\",";
     oss << "\"fileSize\":" << fileSize << ",";
     oss << "\"scanDurationUs\":" << scanDuration.count() << ",";
 
@@ -332,28 +399,28 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
     oss << "\"triggerFunctions\":[";
     for (size_t i = 0; i < triggerFunctions.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << triggerFunctions[i] << "\"";
+        oss << "\"" << esc(triggerFunctions[i]) << "\"";
     }
     oss << "],";
 
     oss << "\"suspiciousAPIs\":[";
     for (size_t i = 0; i < suspiciousAPIs.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << suspiciousAPIs[i] << "\"";
+        oss << "\"" << esc(suspiciousAPIs[i]) << "\"";
     }
     oss << "],";
 
     oss << "\"extractedIOCs\":[";
     for (size_t i = 0; i < extractedIOCs.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << extractedIOCs[i] << "\"";
+        oss << "\"" << esc(extractedIOCs[i]) << "\"";
     }
     oss << "],";
 
     oss << "\"matchedSignatures\":[";
     for (size_t i = 0; i < matchedSignatures.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << matchedSignatures[i] << "\"";
+        oss << "\"" << esc(matchedSignatures[i]) << "\"";
     }
     oss << "]";
 
@@ -367,6 +434,19 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
         oss << xlmMacros[i].ToJson();
     }
     oss << "]";
+
+    if (!templateInjections.empty()) {
+        oss << ",\"templateInjections\":[";
+        for (size_t i = 0; i < templateInjections.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << templateInjections[i].ToJson();
+        }
+        oss << "]";
+    }
+
+    if (xllInfo.has_value()) {
+        oss << ",\"xllInfo\":" << xllInfo->ToJson();
+    }
 
     oss << "}";
     return oss.str();
@@ -681,30 +761,7 @@ const std::vector<std::string> MacroDetectorImpl::s_persistenceIndicators = {
 }
 
 [[nodiscard]] std::string MacroDetectorImpl::JsonEscape(std::string_view input) {
-    std::string out;
-    out.reserve(input.size() + 16);
-    for (char c : input) {
-        switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b";  break;
-            case '\f': out += "\\f";  break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x",
-                                  static_cast<unsigned int>(static_cast<unsigned char>(c)));
-                    out += buf;
-                } else {
-                    out += c;
-                }
-                break;
-        }
-    }
-    return out;
+    return JsonEscapeStr(input);
 }
 
 // ============================================================================
@@ -741,11 +798,13 @@ MacroDetectorImpl::~MacroDetectorImpl() {
     // Initialize COM for OLE parsing
 #ifdef _WIN32
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
+    if (SUCCEEDED(hr)) {
         m_comInitialized = true;
+    } else if (hr == RPC_E_CHANGED_MODE) {
+        // Thread already in STA — COM is usable, but we must NOT call CoUninitialize
+        m_comInitialized = false;
     } else {
         SS_LOG_WARN(L"MacroDetector", L"COM initialization failed: 0x%08X", hr);
-        // Continue anyway, some functionality may work
     }
 #endif
 
@@ -867,9 +926,10 @@ void MacroDetectorImpl::Shutdown() {
     }
 
     // Compute file hash
-    std::array<uint8_t, 32> hashBytes;
+    std::array<uint8_t, 32> hashBytes{};
+    std::string sha256Hex;
     if (Utils::FileUtils::ComputeFileSHA256(widePath, hashBytes, &fileErr)) {
-        result.sha256 = Utils::HashUtils::ToHexLower(hashBytes.data(), hashBytes.size());
+        sha256Hex = Utils::HashUtils::ToHexLower(hashBytes.data(), hashBytes.size());
     }
 
     // Convert to uint8_t span
@@ -878,11 +938,14 @@ void MacroDetectorImpl::Shutdown() {
         content.size()
     );
 
-    // Perform scan
+    // Perform scan — delegate to the span overload for all analysis logic
     result = ScanDocument(contentSpan, path.filename().string());
+
+    // Restore file-specific metadata that the span overload cannot know
     result.filePath = path;
-    result.sha256 = Utils::HashUtils::ToHexLower(hashBytes.data(), hashBytes.size());
+    result.sha256 = sha256Hex;
     result.fileSize = fileStat.size;
+    result.scanTime = std::chrono::system_clock::now();
 
     auto endTime = Clock::now();
     result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
@@ -933,8 +996,8 @@ void MacroDetectorImpl::Shutdown() {
         return result;
     }
 
-    // Detect format
-    result.format = DetectFormat(content);
+    // Detect format (use fileName for extension-based refinement)
+    result.format = DetectFormat(content, fileName);
 
     // Check for password protection
     if (IsPasswordProtected(content)) {
@@ -989,11 +1052,36 @@ void MacroDetectorImpl::Shutdown() {
                     m_stats.vbaMacrosDetected++;
                 }
             }
+
+            // Detect remote template injection in OpenXML
+            std::vector<TemplateInjectionInfo> injections;
+            if (DetectTemplateInjection(content, injections)) {
+                result.templateInjections = std::move(injections);
+                if (!result.templateInjections.empty()) {
+                    result.hasMacros = true;
+                    result.macroTypes.push_back(MacroType::TemplateInjection);
+                }
+            }
         } else if (content.size() >= 5 &&
                    std::memcmp(content.data(), RTF_SIGNATURE, 5) == 0) {
-            // RTF format - check for embedded OLE
+            // RTF format — check for embedded OLE objects
             result.format = DocumentFormat::RTF;
-            // RTF parsing would go here
+            if (BinaryContains(content, "\\objdata") ||
+                BinaryContains(content, "\\objemb") ||
+                BinaryContains(content, "\\objocx")) {
+                result.hasMacros = true;
+                result.macroTypes.push_back(MacroType::RTF_OLE);
+                SS_LOG_WARN(L"MacroDetector", L"RTF with embedded OLE object detected");
+            }
+        } else if (content.size() >= 2 &&
+                   content[0] == 'M' && content[1] == 'Z') {
+            // Possible XLL add-in (PE/DLL loaded by Excel)
+            XLLInfo xll;
+            if (DetectXLLAddin(content, xll)) {
+                result.xllInfo = xll;
+                result.hasMacros = true;
+                result.macroTypes.push_back(MacroType::XLLAddin);
+            }
         }
 
         // Analyze VBA modules if found
@@ -1031,9 +1119,9 @@ void MacroDetectorImpl::Shutdown() {
             }
         }
 
-        // Extract IOCs
+        // Extract IOCs from in-memory content (not from filePath which may be empty)
         if (m_config.extractIOCs) {
-            std::string allCode = ExtractAllMacroContent(result.filePath);
+            std::string allCode = ExtractAllMacroContentFromMemory(content, fileName);
             result.extractedIOCs = ExtractIOCs(allCode);
         }
 
@@ -1050,12 +1138,12 @@ void MacroDetectorImpl::Shutdown() {
         if (result.riskScore >= 80) {
             result.status = MacroScanStatus::Malicious;
             result.isMalicious = true;
+            result.isSuspicious = true;
             result.threatName = "Malicious.Macro." +
                 std::string(GetMacroThreatCategoryName(result.category));
         } else if (result.riskScore >= 50) {
             result.status = MacroScanStatus::Suspicious;
-        } else if (result.hasMacros) {
-            result.status = MacroScanStatus::Clean;
+            result.isSuspicious = true;
         } else {
             result.status = MacroScanStatus::Clean;
         }
@@ -1185,48 +1273,94 @@ void MacroDetectorImpl::Shutdown() {
 }
 
 [[nodiscard]] DocumentFormat MacroDetectorImpl::DetectFormat(const std::filesystem::path& path) {
-    std::wstring widePath = path.wstring();
-    std::vector<std::byte> header;
-
-    // Read first 8 bytes
-    Utils::FileUtils::Error fileErr;
-    if (!Utils::FileUtils::ReadAllBytes(widePath, header, &fileErr)) {
+    // Read only the first 16 bytes for magic-number detection
+    std::error_code ec;
+    auto fileSize = std::filesystem::file_size(path, ec);
+    if (ec || fileSize < 4) {
         return DocumentFormat::Unknown;
     }
 
-    if (header.size() < 4) {
+    std::array<uint8_t, 16> header{};
+    size_t bytesToRead = std::min(static_cast<size_t>(fileSize), header.size());
+
+    // Use FileUtils to read the full file only if we truly need it, otherwise
+    // we just need the magic bytes. Since FileUtils doesn't expose partial reads,
+    // use a quick Win32 read for the header.
+#ifdef _WIN32
+    HANDLE hFile = CreateFileW(path.wstring().c_str(), GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
         return DocumentFormat::Unknown;
     }
+    DWORD bytesRead = 0;
+    BOOL ok = ReadFile(hFile, header.data(), static_cast<DWORD>(bytesToRead), &bytesRead, nullptr);
+    CloseHandle(hFile);
+    if (!ok || bytesRead < 4) {
+        return DocumentFormat::Unknown;
+    }
+#else
+    return DocumentFormat::Unknown;
+#endif
 
-    std::span<const uint8_t> headerSpan(
-        reinterpret_cast<const uint8_t*>(header.data()),
-        std::min(header.size(), size_t(16))
-    );
-
-    return DetectFormat(headerSpan);
+    std::span<const uint8_t> headerSpan(header.data(), bytesRead);
+    return DetectFormat(headerSpan, path.filename().string());
 }
 
-[[nodiscard]] DocumentFormat MacroDetectorImpl::DetectFormat(std::span<const uint8_t> content) {
+[[nodiscard]] DocumentFormat MacroDetectorImpl::DetectFormat(
+    std::span<const uint8_t> content, const std::string& fileName) {
+
     if (content.size() < 4) {
         return DocumentFormat::Unknown;
     }
 
+    // Extract lowercase extension from fileName for refinement
+    std::string ext;
+    if (!fileName.empty()) {
+        auto dotPos = fileName.rfind('.');
+        if (dotPos != std::string::npos) {
+            ext = fileName.substr(dotPos);
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        }
+    }
+
     // Check OLE signature
     if (content.size() >= 8 && std::memcmp(content.data(), OLE_SIGNATURE, 8) == 0) {
-        // Need to inspect OLE structure to determine exact type
-        // For now, return based on typical sizes and patterns
-        return DocumentFormat::DOC;  // Default for OLE
+        if (ext == ".xls")  return DocumentFormat::XLS;
+        if (ext == ".xlsb") return DocumentFormat::XLSB;
+        if (ext == ".ppt")  return DocumentFormat::PPT;
+        if (ext == ".pub")  return DocumentFormat::PUB;
+        if (ext == ".vsd" || ext == ".vsdx") return DocumentFormat::VSD;
+        return DocumentFormat::DOC;
     }
 
     // Check ZIP signature (OpenXML)
     if (std::memcmp(content.data(), ZIP_SIGNATURE, 4) == 0) {
-        // Would need to inspect ZIP contents
-        return DocumentFormat::DOCX;  // Default for OpenXML
+        if (ext == ".docm") return DocumentFormat::DOCM;
+        if (ext == ".xlsm") return DocumentFormat::XLSM;
+        if (ext == ".xlsx") return DocumentFormat::XLSX;
+        if (ext == ".xlsb") return DocumentFormat::XLSB;
+        if (ext == ".pptx") return DocumentFormat::PPTX;
+        if (ext == ".pptm") return DocumentFormat::PPTM;
+        if (ext == ".odt")  return DocumentFormat::ODT;
+        if (ext == ".ods")  return DocumentFormat::ODS;
+        return DocumentFormat::DOCX;
     }
 
     // Check RTF signature
     if (content.size() >= 5 && std::memcmp(content.data(), RTF_SIGNATURE, 5) == 0) {
         return DocumentFormat::RTF;
+    }
+
+    // Check for PE/MZ (XLL add-in)
+    if (content.size() >= 2 && content[0] == 'M' && content[1] == 'Z') {
+        if (ext == ".xll") return DocumentFormat::XLL;
+    }
+
+    // MHT by extension
+    if (ext == ".mht" || ext == ".mhtml") {
+        return DocumentFormat::MHT;
     }
 
     return DocumentFormat::Unknown;
@@ -1272,8 +1406,12 @@ void MacroDetectorImpl::Shutdown() {
     if (result.riskScore >= 80) {
         result.status = MacroScanStatus::Malicious;
         result.isMalicious = true;
+        result.isSuspicious = true;
+        result.threatName = "Malicious.Macro." +
+            std::string(GetMacroThreatCategoryName(result.category));
     } else if (result.riskScore >= 50) {
         result.status = MacroScanStatus::Suspicious;
+        result.isSuspicious = true;
     } else {
         result.status = MacroScanStatus::Clean;
     }
@@ -1281,12 +1419,22 @@ void MacroDetectorImpl::Shutdown() {
     return result;
 }
 
-[[nodiscard]] std::string MacroDetectorImpl::Deobfuscate(const std::string& code) {
+[[nodiscard]] std::string MacroDetectorImpl::Deobfuscate(const std::string& code, size_t depth) {
     if (!m_config.enableDeobfuscation) {
         return code;
     }
 
-    std::string result = code;
+    if (depth >= MacroConstants::MAX_DEOBFUSCATION_DEPTH) {
+        return code;
+    }
+
+    // Guard against ReDoS on extremely large inputs
+    std::string safeInput = code;
+    if (safeInput.size() > MacroConstants::MAX_REGEX_INPUT_SIZE) {
+        safeInput.resize(MacroConstants::MAX_REGEX_INPUT_SIZE);
+    }
+
+    std::string result = safeInput;
 
     // Basic Chr() deobfuscation
     std::regex chrPattern(R"(Chr\(\s*(\d+)\s*\))");
@@ -1344,8 +1492,7 @@ void MacroDetectorImpl::Shutdown() {
     result = deobfuscated;
 
     // Concatenation simplification (basic)
-    std::regex concatPattern(R"("([^"]*)" \& "([^"]*)")");
-    searchStart = result.cbegin();
+    std::regex concatPattern(R"re("([^"]*)" \& "([^"]*)")re");    searchStart = result.cbegin();
     deobfuscated.clear();
     lastPos = 0;
 
@@ -1358,8 +1505,14 @@ void MacroDetectorImpl::Shutdown() {
         searchStart = match.suffix().first;
     }
     deobfuscated += result.substr(lastPos);
+    result = deobfuscated;
 
-    return deobfuscated;
+    // If the output changed, recurse to handle nested obfuscation layers
+    if (result != safeInput) {
+        return Deobfuscate(result, depth + 1);
+    }
+
+    return result;
 }
 
 [[nodiscard]] std::vector<std::string> MacroDetectorImpl::ExtractIOCs(const std::string& code) {
@@ -1369,25 +1522,30 @@ void MacroDetectorImpl::Shutdown() {
         return iocs;
     }
 
+    // Guard against ReDoS on extremely large inputs
+    const std::string& safeCode = (code.size() <= MacroConstants::MAX_REGEX_INPUT_SIZE)
+        ? code : code.substr(0, MacroConstants::MAX_REGEX_INPUT_SIZE);
+
+    const std::sregex_iterator endSentinel;
+
     // Extract URLs
     std::regex urlPattern(R"((https?://[^\s\"'\)>]+))");
-    std::sregex_iterator urlBegin(code.begin(), code.end(), urlPattern);
-    std::sregex_iterator urlEnd;
+    std::sregex_iterator urlIt(safeCode.begin(), safeCode.end(), urlPattern);
 
-    for (auto it = urlBegin; it != urlEnd && iocs.size() < 100; ++it) {
-        std::string url = it->str();
+    for (; urlIt != endSentinel && iocs.size() < 100; ++urlIt) {
+        std::string url = urlIt->str();
         if (std::find(iocs.begin(), iocs.end(), url) == iocs.end()) {
-            iocs.push_back(url);
+            iocs.push_back(std::move(url));
         }
     }
 
     // Extract IP addresses
     std::regex ipPattern(R"(\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b)");
-    std::sregex_iterator ipBegin(code.begin(), code.end(), ipPattern);
+    std::sregex_iterator ipIt(safeCode.begin(), safeCode.end(), ipPattern);
 
-    for (auto it = ipBegin; it != urlEnd && iocs.size() < 100; ++it) {
-        std::string ip = it->str();
-        // Validate IP ranges
+    for (; ipIt != endSentinel && iocs.size() < 100; ++ipIt) {
+        std::string ip = ipIt->str();
+        // Validate IP octet ranges
         bool valid = true;
         std::istringstream iss(ip);
         std::string octet;
@@ -1405,29 +1563,29 @@ void MacroDetectorImpl::Shutdown() {
         }
 
         if (valid && std::find(iocs.begin(), iocs.end(), ip) == iocs.end()) {
-            iocs.push_back(ip);
+            iocs.push_back(std::move(ip));
         }
     }
 
     // Extract file paths
     std::regex pathPattern(R"(([A-Za-z]:\\[^\s\"'\)>]+\.(exe|dll|bat|cmd|ps1|vbs|js)))");
-    std::sregex_iterator pathBegin(code.begin(), code.end(), pathPattern);
+    std::sregex_iterator pathIt(safeCode.begin(), safeCode.end(), pathPattern);
 
-    for (auto it = pathBegin; it != urlEnd && iocs.size() < 100; ++it) {
-        std::string path = it->str();
-        if (std::find(iocs.begin(), iocs.end(), path) == iocs.end()) {
-            iocs.push_back(path);
+    for (; pathIt != endSentinel && iocs.size() < 100; ++pathIt) {
+        std::string fpath = pathIt->str();
+        if (std::find(iocs.begin(), iocs.end(), fpath) == iocs.end()) {
+            iocs.push_back(std::move(fpath));
         }
     }
 
     // Extract registry keys
     std::regex regPattern(R"((HKLM\\[^\s\"'\)>]+|HKCU\\[^\s\"'\)>]+))");
-    std::sregex_iterator regBegin(code.begin(), code.end(), regPattern);
+    std::sregex_iterator regIt(safeCode.begin(), safeCode.end(), regPattern);
 
-    for (auto it = regBegin; it != urlEnd && iocs.size() < 100; ++it) {
-        std::string reg = it->str();
+    for (; regIt != endSentinel && iocs.size() < 100; ++regIt) {
+        std::string reg = regIt->str();
         if (std::find(iocs.begin(), iocs.end(), reg) == iocs.end()) {
-            iocs.push_back(reg);
+            iocs.push_back(std::move(reg));
         }
     }
 
@@ -1451,7 +1609,25 @@ void MacroDetectorImpl::UnregisterCallbacks() {
 }
 
 [[nodiscard]] MacroStatistics MacroDetectorImpl::GetStatistics() const {
-    return m_stats;
+    MacroStatistics snapshot;
+    snapshot.totalScans.store(m_stats.totalScans.load());
+    snapshot.documentsWithMacros.store(m_stats.documentsWithMacros.load());
+    snapshot.maliciousDetected.store(m_stats.maliciousDetected.load());
+    snapshot.suspiciousDetected.store(m_stats.suspiciousDetected.load());
+    snapshot.xlmMacrosDetected.store(m_stats.xlmMacrosDetected.load());
+    snapshot.vbaMacrosDetected.store(m_stats.vbaMacrosDetected.load());
+    snapshot.obfuscatedDetected.store(m_stats.obfuscatedDetected.load());
+    snapshot.passwordProtected.store(m_stats.passwordProtected.load());
+    snapshot.parseErrors.store(m_stats.parseErrors.load());
+    snapshot.totalBytesScanned.store(m_stats.totalBytesScanned.load());
+    for (size_t i = 0; i < m_stats.byFormat.size(); ++i) {
+        snapshot.byFormat[i].store(m_stats.byFormat[i].load());
+    }
+    for (size_t i = 0; i < m_stats.byCategory.size(); ++i) {
+        snapshot.byCategory[i].store(m_stats.byCategory[i].load());
+    }
+    snapshot.startTime = m_stats.startTime;
+    return snapshot;
 }
 
 void MacroDetectorImpl::ResetStatistics() {
@@ -1527,20 +1703,14 @@ void MacroDetectorImpl::ResetStatistics() {
         return false;
     }
 
-    // OLE parsing is complex - this is a simplified implementation
-    // In production, use a proper OLE library or Windows IStorage
-
     outProject.projectName = "VBAProject";
 
-    // Search for VBA project stream markers
-    std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
+    // Search for VBA project stream markers using safe binary search
+    bool hasVBAIndicator = BinaryContains(content, "Attribute VB_Name") ||
+                           BinaryContains(content, "_VBA_PROJECT") ||
+                           BinaryContains(content, std::string_view("dir", 3));
 
-    // Look for VBA module indicators
-    if (contentStr.find("Attribute VB_Name") != std::string::npos ||
-        contentStr.find("_VBA_PROJECT") != std::string::npos ||
-        contentStr.find("dir") != std::string::npos) {
-
-        // Extract VBA code (simplified)
+    if (hasVBAIndicator) {
         std::string vbaCode;
         if (ExtractVBAFromOLE(content, vbaCode)) {
             VBAModuleInfo module;
@@ -1549,16 +1719,15 @@ void MacroDetectorImpl::ResetStatistics() {
             module.sourceSize = vbaCode.size();
             module.type = VBAModuleType::Standard;
 
-            // Count lines
             module.lineCount = std::count(vbaCode.begin(), vbaCode.end(), '\n') + 1;
 
-            outProject.modules.push_back(module);
+            outProject.modules.push_back(std::move(module));
         }
     }
 
-    // Check for project protection
-    if (contentStr.find("DPB=") != std::string::npos ||
-        contentStr.find("CMG=") != std::string::npos) {
+    // Check for project protection using binary search
+    if (BinaryContains(content, "DPB=") ||
+        BinaryContains(content, "CMG=")) {
         outProject.isProtected = true;
         outProject.protectionType = "Password Protected";
     }
@@ -1584,24 +1753,18 @@ void MacroDetectorImpl::ResetStatistics() {
         return false;
     }
 
-    // OpenXML parsing requires ZIP decompression
-    // In production, use a proper ZIP library
-
     outProject.projectName = "VBAProject";
 
-    // Look for vbaProject.bin in the content
-    std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
+    // Look for vbaProject.bin in the ZIP content using safe binary search
+    if (BinaryContains(content, "vbaProject.bin") ||
+        BinaryContains(content, "xl/vbaProject.bin") ||
+        BinaryContains(content, "word/vbaProject.bin")) {
 
-    if (contentStr.find("vbaProject.bin") != std::string::npos ||
-        contentStr.find("xl/vbaProject.bin") != std::string::npos ||
-        contentStr.find("word/vbaProject.bin") != std::string::npos) {
-
-        // Has VBA macros
         VBAModuleInfo module;
         module.moduleName = "Module1";
         module.type = VBAModuleType::Standard;
 
-        outProject.modules.push_back(module);
+        outProject.modules.push_back(std::move(module));
     }
 
     outProject.moduleCount = outProject.modules.size();
@@ -1613,28 +1776,24 @@ void MacroDetectorImpl::ResetStatistics() {
     std::span<const uint8_t> content,
     std::string& outVBA) {
 
-    // Simplified VBA extraction
-    // In production, properly parse the OLE structure and decompress VBA streams
-
-    std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
-
-    // Look for VBA code markers
-    size_t pos = contentStr.find("Attribute VB_Name");
+    // Use BinaryFind to locate VBA code markers without copying entire content
+    size_t pos = BinaryFind(content, "Attribute VB_Name");
     if (pos == std::string::npos) {
-        pos = contentStr.find("Sub ");
+        pos = BinaryFind(content, "Sub ");
         if (pos == std::string::npos) {
-            pos = contentStr.find("Function ");
+            pos = BinaryFind(content, "Function ");
         }
     }
 
     if (pos != std::string::npos) {
-        // Extract a reasonable chunk of VBA code
-        size_t endPos = std::min(pos + 10000, contentStr.size());
-        outVBA = contentStr.substr(pos, endPos - pos);
+        // Extract a bounded chunk of VBA code from the binary
+        size_t maxExtract = std::min(size_t(10000), content.size() - pos);
+        outVBA.assign(reinterpret_cast<const char*>(content.data() + pos), maxExtract);
 
         // Clean up non-printable characters
         for (char& c : outVBA) {
-            if (c < 32 && c != '\n' && c != '\r' && c != '\t') {
+            if (static_cast<unsigned char>(c) < 32 &&
+                c != '\n' && c != '\r' && c != '\t') {
                 c = ' ';
             }
         }
@@ -1649,53 +1808,59 @@ void MacroDetectorImpl::ResetStatistics() {
     std::span<const uint8_t> content,
     std::vector<XLMMacroInfo>& outXLM) {
 
-    // XLM macro detection
-    std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
+    // XLM macro detection using safe binary search
+    bool hasXLM = BinaryContains(content, "=EXEC(")  ||
+                  BinaryContains(content, "=CALL(")  ||
+                  BinaryContains(content, "=RUN(")   ||
+                  BinaryContains(content, "=HALT()") ||
+                  BinaryContains(content, "=FORMULA(") ||
+                  BinaryContains(content, "Auto_Open");
 
-    // Look for Excel 4.0 macro indicators
-    bool hasXLM = false;
-
-    // Check for macro sheet indicators
-    if (contentStr.find("=EXEC(") != std::string::npos ||
-        contentStr.find("=CALL(") != std::string::npos ||
-        contentStr.find("=RUN(") != std::string::npos ||
-        contentStr.find("=HALT()") != std::string::npos ||
-        contentStr.find("=FORMULA(") != std::string::npos ||
-        contentStr.find("Auto_Open") != std::string::npos) {
-        hasXLM = true;
+    if (!hasXLM) {
+        return false;
     }
 
-    if (hasXLM) {
-        XLMMacroInfo xlm;
-        xlm.sheetName = "Macro1";
+    XLMMacroInfo xlm;
+    xlm.sheetName = "Macro1";
 
-        // Extract EXEC calls
+    // Extract text-like content for regex matching, capped for ReDoS safety
+    size_t safeLen = std::min(content.size(), MacroConstants::MAX_REGEX_INPUT_SIZE);
+    std::string safeStr;
+    safeStr.reserve(safeLen);
+    for (size_t i = 0; i < safeLen; ++i) {
+        char c = static_cast<char>(content[i]);
+        if (static_cast<unsigned char>(c) >= 32 || c == '\n' || c == '\r' || c == '\t') {
+            safeStr += c;
+        }
+    }
+
+    // Extract EXEC calls
+    {
         std::regex execPattern(R"(=EXEC\([^)]+\))");
-        std::sregex_iterator execBegin(contentStr.begin(), contentStr.end(), execPattern);
-        std::sregex_iterator execEnd;
-
-        for (auto it = execBegin; it != execEnd; ++it) {
+        std::sregex_iterator it(safeStr.begin(), safeStr.end(), execPattern);
+        const std::sregex_iterator end;
+        for (; it != end; ++it) {
             xlm.execCalls.push_back(it->str());
         }
-
-        // Extract CALL functions
-        std::regex callPattern(R"(=CALL\([^)]+\))");
-        std::sregex_iterator callBegin(contentStr.begin(), contentStr.end(), callPattern);
-
-        for (auto it = callBegin; it != execEnd; ++it) {
-            xlm.callFunctions.push_back(it->str());
-        }
-
-        // Check for Auto_Open
-        if (contentStr.find("Auto_Open") != std::string::npos) {
-            xlm.hasAutoOpen = true;
-        }
-
-        outXLM.push_back(xlm);
-        return true;
     }
 
-    return false;
+    // Extract CALL functions
+    {
+        std::regex callPattern(R"(=CALL\([^)]+\))");
+        std::sregex_iterator it(safeStr.begin(), safeStr.end(), callPattern);
+        const std::sregex_iterator end;
+        for (; it != end; ++it) {
+            xlm.callFunctions.push_back(it->str());
+        }
+    }
+
+    // Check for Auto_Open
+    if (BinaryContains(content, "Auto_Open")) {
+        xlm.hasAutoOpen = true;
+    }
+
+    outXLM.push_back(std::move(xlm));
+    return true;
 }
 
 [[nodiscard]] VBAModuleInfo MacroDetectorImpl::AnalyzeVBAModule(
@@ -1830,8 +1995,11 @@ void MacroDetectorImpl::ResetStatistics() {
     }
 
     // Check for meaningless variable names (single letter or random)
+    // Guard input size for regex
+    const std::string& safeCode = (code.size() <= MacroConstants::MAX_REGEX_INPUT_SIZE)
+        ? code : code.substr(0, MacroConstants::MAX_REGEX_INPUT_SIZE);
     std::regex shortVarPattern(R"(\b[a-z]{1,2}\d*\s*=)");
-    std::sregex_iterator shortVarBegin(code.begin(), code.end(), shortVarPattern);
+    std::sregex_iterator shortVarBegin(safeCode.begin(), safeCode.end(), shortVarPattern);
     std::sregex_iterator shortVarEnd;
     size_t shortVarCount = std::distance(shortVarBegin, shortVarEnd);
 
@@ -1913,16 +2081,19 @@ void MacroDetectorImpl::ResetStatistics() {
         }
     }
 
-    // Check for persistence indicators
-    std::string allCode;
+    // Check for persistence indicators (case-insensitive)
+    std::wstring wideCode;
     if (result.vbaProject.has_value()) {
+        std::string allCode;
         for (const auto& mod : result.vbaProject->modules) {
             allCode += mod.sourceCode;
         }
+        wideCode = Utils::StringUtils::ToWide(allCode);
     }
 
     for (const auto& indicator : s_persistenceIndicators) {
-        if (allCode.find(indicator) != std::string::npos) {
+        if (Utils::StringUtils::IContains(wideCode,
+                Utils::StringUtils::ToWide(std::string_view(indicator)))) {
             hasPersistence = true;
             break;
         }
@@ -1957,7 +2128,7 @@ void MacroDetectorImpl::ResetStatistics() {
 }
 
 [[nodiscard]] std::string MacroDetectorImpl::IdentifyMalwareFamily(const MacroScanResult& result) {
-    // Pattern-based family identification
+    // Pattern-based family identification using case-insensitive matching
     std::string allCode;
     if (result.vbaProject.has_value()) {
         for (const auto& mod : result.vbaProject->modules) {
@@ -1965,40 +2136,47 @@ void MacroDetectorImpl::ResetStatistics() {
         }
     }
 
+    if (allCode.empty()) {
+        return "";
+    }
+
+    // Convert to wide for case-insensitive matching
+    std::wstring wideCode = Utils::StringUtils::ToWide(allCode);
+
     // Emotet indicators
-    if (allCode.find("powershell") != std::string::npos &&
-        allCode.find("downloadstring") != std::string::npos) {
+    if (Utils::StringUtils::IContains(wideCode, L"powershell") &&
+        Utils::StringUtils::IContains(wideCode, L"downloadstring")) {
         return "Emotet";
     }
 
     // Trickbot indicators
-    if (allCode.find("wscript.shell") != std::string::npos &&
-        allCode.find("cmd /c") != std::string::npos &&
-        allCode.find("certutil") != std::string::npos) {
+    if (Utils::StringUtils::IContains(wideCode, L"wscript.shell") &&
+        Utils::StringUtils::IContains(wideCode, L"cmd /c") &&
+        Utils::StringUtils::IContains(wideCode, L"certutil")) {
         return "Trickbot";
     }
 
     // Dridex indicators
-    if (allCode.find("rundll32") != std::string::npos &&
-        allCode.find(",DllRegisterServer") != std::string::npos) {
+    if (Utils::StringUtils::IContains(wideCode, L"rundll32") &&
+        Utils::StringUtils::IContains(wideCode, L",DllRegisterServer")) {
         return "Dridex";
     }
 
     // QakBot indicators
-    if (allCode.find("regsvr32") != std::string::npos &&
-        allCode.find(".tmp") != std::string::npos) {
+    if (Utils::StringUtils::IContains(wideCode, L"regsvr32") &&
+        Utils::StringUtils::IContains(wideCode, L".tmp")) {
         return "QakBot";
     }
 
     // BazarLoader indicators
-    if (allCode.find("mshta") != std::string::npos &&
-        allCode.find("http") != std::string::npos) {
+    if (Utils::StringUtils::IContains(wideCode, L"mshta") &&
+        Utils::StringUtils::IContains(wideCode, L"http")) {
         return "BazarLoader";
     }
 
     // Hancitor indicators
-    if (allCode.find("urlmon") != std::string::npos &&
-        allCode.find("URLDownloadToFile") != std::string::npos) {
+    if (Utils::StringUtils::IContains(wideCode, L"urlmon") &&
+        Utils::StringUtils::IContains(wideCode, L"URLDownloadToFile")) {
         return "Hancitor";
     }
 
@@ -2010,20 +2188,17 @@ void MacroDetectorImpl::ResetStatistics() {
         return false;
     }
 
-    std::string contentStr(reinterpret_cast<const char*>(content.data()),
-                           std::min(content.size(), size_t(4096)));
-
-    // Check for encryption markers
-    if (contentStr.find("EncryptedPackage") != std::string::npos ||
-        contentStr.find("StrongEncryptionDataSpace") != std::string::npos ||
-        contentStr.find("Encryption") != std::string::npos) {
+    // Check for encryption markers using safe binary search (bounded to first 4KB)
+    auto headerSpan = content.subspan(0, std::min(content.size(), size_t(4096)));
+    if (BinaryContains(headerSpan, "EncryptedPackage") ||
+        BinaryContains(headerSpan, "StrongEncryptionDataSpace") ||
+        BinaryContains(headerSpan, "Encryption")) {
         return true;
     }
 
-    // Check OLE encryption flags
+    // Check OLE encryption flags using safe aligned read
     if (content.size() >= 532) {
-        // Check sector 0 for encryption indicator
-        uint16_t flags = *reinterpret_cast<const uint16_t*>(content.data() + 530);
+        uint16_t flags = SafeReadU16LE(content, 530);
         if (flags & 0x0001) {
             return true;
         }
@@ -2039,14 +2214,14 @@ void MacroDetectorImpl::ResetStatistics() {
 
     // Validate OLE header
     if (std::memcmp(content.data(), OLE_SIGNATURE, 8) == 0) {
-        // Check sector size
-        uint16_t sectorSize = *reinterpret_cast<const uint16_t*>(content.data() + 30);
+        // Check sector size using safe aligned read
+        uint16_t sectorSize = SafeReadU16LE(content, 30);
         if (sectorSize != 0x0009 && sectorSize != 0x000C) {
             return false;
         }
 
-        // Check mini sector size
-        uint16_t miniSectorSize = *reinterpret_cast<const uint16_t*>(content.data() + 32);
+        // Check mini sector size using safe aligned read
+        uint16_t miniSectorSize = SafeReadU16LE(content, 32);
         if (miniSectorSize != 0x0006) {
             return false;
         }
@@ -2060,6 +2235,138 @@ void MacroDetectorImpl::ResetStatistics() {
     }
 
     return false;
+}
+
+[[nodiscard]] bool MacroDetectorImpl::DetectTemplateInjection(
+    std::span<const uint8_t> content,
+    std::vector<TemplateInjectionInfo>& outInjections) {
+
+    // Template injection uses relationship XML in OpenXML to reference
+    // a remote URL for macros/content — enabling "macro-less" initial delivery.
+    for (const auto* marker : MacroConstants::TEMPLATE_INJECTION_MARKERS) {
+        size_t pos = 0;
+        while ((pos = BinaryFind(content, std::string_view(marker), pos)) != std::string::npos) {
+            // Try to extract a URL near this marker
+            // Look ahead up to 512 bytes for http:// or https://
+            size_t searchEnd = std::min(pos + 512, content.size());
+            auto window = content.subspan(pos, searchEnd - pos);
+
+            size_t httpPos = BinaryFind(window, "http");
+            if (httpPos != std::string::npos) {
+                // Extract URL (up to next quote, angle bracket, or whitespace)
+                size_t urlStart = httpPos;
+                size_t urlEnd = urlStart;
+                while (urlEnd < window.size()) {
+                    char c = static_cast<char>(window[urlEnd]);
+                    if (c == '"' || c == '\'' || c == '>' || c == '<' ||
+                        c == ' ' || c == '\n' || c == '\r') {
+                        break;
+                    }
+                    ++urlEnd;
+                }
+                if (urlEnd > urlStart) {
+                    TemplateInjectionInfo info;
+                    info.templateUrl.assign(
+                        reinterpret_cast<const char*>(window.data() + urlStart),
+                        urlEnd - urlStart);
+                    info.xmlElement = marker;
+                    info.relationshipType = marker;
+                    outInjections.push_back(std::move(info));
+
+                    SS_LOG_WARN(L"MacroDetector",
+                                L"Template injection detected: %hs -> %hs",
+                                marker, outInjections.back().templateUrl.c_str());
+                }
+            }
+
+            pos += std::strlen(marker);
+        }
+    }
+
+    return !outInjections.empty();
+}
+
+[[nodiscard]] bool MacroDetectorImpl::DetectXLLAddin(
+    std::span<const uint8_t> content, XLLInfo& outXLL) {
+
+    // XLL files are native DLLs loaded by Excel.
+    // Check for PE/MZ header first.
+    if (content.size() < 64) {
+        return false;
+    }
+    if (content[0] != 'M' || content[1] != 'Z') {
+        return false;
+    }
+    outXLL.isPEFile = true;
+
+    // Check for XLL-specific exports by scanning the export name table.
+    // These exports auto-execute when Excel loads the add-in.
+    if (BinaryContains(content, "xlAutoOpen")) {
+        outXLL.hasXlAutoOpen = true;
+        outXLL.exportNames.push_back("xlAutoOpen");
+    }
+    if (BinaryContains(content, "xlAutoClose")) {
+        outXLL.hasXlAutoClose = true;
+        outXLL.exportNames.push_back("xlAutoClose");
+    }
+    if (BinaryContains(content, "xlAutoRegister")) {
+        outXLL.hasXlAutoRegister = true;
+        outXLL.exportNames.push_back("xlAutoRegister");
+    }
+    if (BinaryContains(content, "xlAutoAdd")) {
+        outXLL.exportNames.push_back("xlAutoAdd");
+    }
+    if (BinaryContains(content, "xlAutoRemove")) {
+        outXLL.exportNames.push_back("xlAutoRemove");
+    }
+
+    // Consider it a detection if it has any auto-execution export
+    return outXLL.hasXlAutoOpen || outXLL.hasXlAutoClose || outXLL.hasXlAutoRegister;
+}
+
+[[nodiscard]] std::string MacroDetectorImpl::ExtractAllMacroContentFromMemory(
+    std::span<const uint8_t> content, const std::string& fileName) {
+
+    std::ostringstream oss;
+
+    // Try to extract VBA from the in-memory content
+    std::string vbaCode;
+    if (ExtractVBAFromOLE(content, vbaCode)) {
+        oss << vbaCode << "\n";
+    }
+
+    // Try to extract XLM macros from the in-memory content
+    std::vector<XLMMacroInfo> xlmMacros;
+    if (ExtractXLMFromOLE(content, xlmMacros)) {
+        for (const auto& macro : xlmMacros) {
+            oss << "' === XLM Sheet: " << macro.sheetName << " ===\n";
+            for (const auto& formula : macro.formulas) {
+                oss << formula << "\n";
+            }
+            oss << "\n";
+        }
+    }
+
+    return oss.str();
+}
+
+[[nodiscard]] MacroScanResult MacroDetectorImpl::AnalyzeMacros(
+    const std::filesystem::path& path) {
+    // Bridge for AttachmentScanner integration — delegates to full document scan
+    return ScanDocument(path);
+}
+
+[[nodiscard]] MacroScanResult MacroDetectorImpl::ScanVBAContent(std::string_view vbaContent) {
+    // Scan raw VBA content submitted by AMSI provider or other callers.
+    // No document container to parse — analyze the VBA code directly.
+    if (vbaContent.empty()) {
+        MacroScanResult result;
+        result.status = MacroScanStatus::Clean;
+        result.scanTime = std::chrono::system_clock::now();
+        return result;
+    }
+
+    return AnalyzeVBA(std::string(vbaContent));
 }
 
 void MacroDetectorImpl::NotifyCallback(const MacroScanResult& result) {
@@ -2150,6 +2457,14 @@ void MacroDetector::Shutdown() {
     return m_impl->HasAutoExecMacros(path);
 }
 
+[[nodiscard]] MacroScanResult MacroDetector::AnalyzeMacros(const std::filesystem::path& path) {
+    return m_impl->AnalyzeMacros(path);
+}
+
+[[nodiscard]] MacroScanResult MacroDetector::ScanVBAContent(std::string_view vbaContent) {
+    return m_impl->ScanVBAContent(vbaContent);
+}
+
 [[nodiscard]] std::string MacroDetector::ExtractVBA(const std::filesystem::path& path) {
     return m_impl->ExtractVBA(path);
 }
@@ -2174,7 +2489,7 @@ void MacroDetector::Shutdown() {
 }
 
 [[nodiscard]] DocumentFormat MacroDetector::DetectFormat(std::span<const uint8_t> content) {
-    return m_impl->DetectFormat(content);
+    return m_impl->DetectFormat(content, "");
 }
 
 [[nodiscard]] MacroScanResult MacroDetector::AnalyzeVBA(const std::string& vbaCode) {
@@ -2214,11 +2529,13 @@ void MacroDetector::ResetStatistics() {
 }
 
 [[nodiscard]] std::string MacroDetector::GetVersionString() noexcept {
-    std::ostringstream oss;
-    oss << MacroConstants::VERSION_MAJOR << "."
-        << MacroConstants::VERSION_MINOR << "."
-        << MacroConstants::VERSION_PATCH;
-    return oss.str();
+    try {
+        return std::to_string(MacroConstants::VERSION_MAJOR) + "." +
+               std::to_string(MacroConstants::VERSION_MINOR) + "." +
+               std::to_string(MacroConstants::VERSION_PATCH);
+    } catch (...) {
+        return "0.0.0";
+    }
 }
 
 }  // namespace Scripts

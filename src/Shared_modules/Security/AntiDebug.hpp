@@ -2263,6 +2263,10 @@ private:
 // MACROS FOR CONVENIENT USAGE
 // ============================================================================
 
+// Helper macros for unique variable names via __LINE__ expansion
+#define SS_CONCAT_IMPL_(a, b) a##b
+#define SS_CONCAT_(a, b) SS_CONCAT_IMPL_(a, b)
+
 /**
  * @brief Quick debugger check macro
  * @return true if debugger detected
@@ -2273,19 +2277,19 @@ private:
  * @brief Protect current thread from debugger
  */
 #define SS_PROTECT_THREAD() \
-    ::ShadowStrike::Security::ScopedThreadProtection _ss_thread_protection_##__LINE__
+    ::ShadowStrike::Security::ScopedThreadProtection SS_CONCAT_(_ss_thread_protection_, __LINE__)
 
 /**
  * @brief Pause anti-debug monitoring in current scope
  */
 #define SS_PAUSE_ANTIDEBUG() \
-    ::ShadowStrike::Security::ScopedAntiDebugPause _ss_antidebug_pause_##__LINE__
+    ::ShadowStrike::Security::ScopedAntiDebugPause SS_CONCAT_(_ss_antidebug_pause_, __LINE__)
 
 /**
  * @brief Register code region for integrity protection
  */
 #define SS_PROTECT_CODE(id, addr, size) \
-    ::ShadowStrike::Security::IntegrityGuard _ss_integrity_##__LINE__((id), (addr), (size))
+    ::ShadowStrike::Security::IntegrityGuard SS_CONCAT_(_ss_integrity_, __LINE__)((id), (addr), (size))
 
 /**
  * @brief Anti-debug check with action on detection

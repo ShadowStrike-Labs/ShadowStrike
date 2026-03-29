@@ -576,101 +576,103 @@ AntiDebugImpl::~AntiDebugImpl() {
 }
 
 bool AntiDebugImpl::Initialize(const AntiDebugConfiguration& config) {
-    std::unique_lock lock(m_mutex);
+    {
+        std::unique_lock lock(m_mutex);
 
-    if (m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Warn("[AntiDebug] Already initialized");
-        return true;
-    }
+        if (m_initialized.load(std::memory_order_acquire)) {
+            SS_LOG_WARN(L"AntiDebug", L"Already initialized");
+            return true;
+        }
 
-    SetStatus(ModuleStatus::Initializing);
+        SetStatus(ModuleStatus::Initializing);
 
-    // Validate configuration
-    if (!ValidateConfiguration(config)) {
-        Utils::Logger::Error("[AntiDebug] Invalid configuration");
-        SetStatus(ModuleStatus::Error);
-        return false;
-    }
+        if (!ValidateConfiguration(config)) {
+            SS_LOG_ERROR(L"AntiDebug", L"Invalid configuration");
+            SetStatus(ModuleStatus::Error);
+            return false;
+        }
 
-    m_config = config;
+        m_config = config;
 
-    // Load NTDLL functions
-    if (!LoadNtdllFunctions()) {
-        Utils::Logger::Error("[AntiDebug] Failed to load NTDLL functions");
-        SetStatus(ModuleStatus::Error);
-        return false;
-    }
+        if (!LoadNtdllFunctions()) {
+            SS_LOG_ERROR(L"AntiDebug", L"Failed to load NTDLL functions");
+            SetStatus(ModuleStatus::Error);
+            return false;
+        }
 
-    // Establish timing baselines
-    SerializeExecution();
-    m_rdtscBaseline = ReadTSC();
+        // Establish timing baselines
+        SerializeExecution();
+        m_rdtscBaseline = ReadTSC();
 
 #ifdef _WIN32
-    LARGE_INTEGER qpc;
-    ::QueryPerformanceCounter(&qpc);
-    m_qpcBaseline = qpc.QuadPart;
+        LARGE_INTEGER qpc;
+        ::QueryPerformanceCounter(&qpc);
+        m_qpcBaseline = qpc.QuadPart;
 #endif
 
-    // Apply protection level settings
-    ApplyProtectionLevel(m_config.protectionLevel);
+        ApplyProtectionLevel(m_config.protectionLevel);
+
+        m_initialized.store(true, std::memory_order_release);
+        SetStatus(ModuleStatus::Running);
+    }
+    // Lock released before operations that may re-acquire it
 
     // Register self integrity if enabled
-    if (m_config.enableCodeIntegrity) {
+    if (config.enableCodeIntegrity) {
         if (!RegisterSelfIntegrity()) {
-            Utils::Logger::Warn("[AntiDebug] Failed to register self integrity");
+            SS_LOG_WARN(L"AntiDebug", L"Failed to register self integrity");
         }
     }
 
     // Auto-hide threads if configured
-    if (m_config.autoHideThreads) {
+    if (config.autoHideThreads) {
         size_t hiddenCount = HideAllThreads();
-        Utils::Logger::Info("[AntiDebug] Auto-hid {} threads from debugger", hiddenCount);
+        SS_LOG_INFO(L"AntiDebug", L"Auto-hid %zu threads from debugger", hiddenCount);
     }
 
-    m_initialized.store(true, std::memory_order_release);
-    SetStatus(ModuleStatus::Running);
-
-    // Start monitoring thread if needed
-    if (m_config.monitoringMode == MonitoringMode::Periodic ||
-        m_config.monitoringMode == MonitoringMode::Continuous ||
-        m_config.monitoringMode == MonitoringMode::Adaptive) {
+    // Start monitoring thread if needed (OUTSIDE lock to avoid deadlock)
+    if (config.monitoringMode == MonitoringMode::Periodic ||
+        config.monitoringMode == MonitoringMode::Continuous ||
+        config.monitoringMode == MonitoringMode::Adaptive) {
         StartMonitoringThread();
     }
 
-    Utils::Logger::Info("[AntiDebug] Initialized successfully with protection level: {}",
-                        static_cast<int>(m_config.protectionLevel));
+    SS_LOG_INFO(L"AntiDebug", L"Initialized successfully with protection level: %d",
+                        static_cast<int>(config.protectionLevel));
 
     return true;
 }
 
 void AntiDebugImpl::Shutdown() noexcept {
     try {
-        std::unique_lock lock(m_mutex);
-
         if (!m_initialized.load(std::memory_order_acquire)) {
             return;
         }
 
         SetStatus(ModuleStatus::Stopping);
 
-        // Stop monitoring thread
+        // Stop monitoring thread BEFORE acquiring m_mutex to avoid deadlock:
+        // The monitoring thread acquires shared_lock(m_mutex) during scans,
+        // so joining it while holding unique_lock would deadlock.
         StopMonitoringThread();
 
-        // Clear state
-        m_detectedHooks.clear();
-        m_detectedDebuggers.clear();
-        m_integrityRegions.clear();
-        m_threadStates.clear();
+        {
+            std::unique_lock lock(m_mutex);
+            m_detectedHooks.clear();
+            m_detectedDebuggers.clear();
+            m_integrityRegions.clear();
+            m_threadStates.clear();
+        }
 
         m_initialized.store(false, std::memory_order_release);
         SetStatus(ModuleStatus::Stopped);
 
-        Utils::Logger::Info("[AntiDebug] Shutdown complete");
+        SS_LOG_INFO(L"AntiDebug", L"Shutdown complete");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("[AntiDebug] Exception during shutdown: {}", e.what());
+        SS_LOG_ERROR(L"AntiDebug", L"Exception during shutdown: %hs", e.what());
     } catch (...) {
-        Utils::Logger::Error("[AntiDebug] Unknown exception during shutdown");
+        SS_LOG_ERROR(L"AntiDebug", L"Unknown exception during shutdown");
     }
 }
 
@@ -685,7 +687,7 @@ ModuleStatus AntiDebugImpl::GetStatus() const noexcept {
 void AntiDebugImpl::Pause() noexcept {
     if (m_status.load(std::memory_order_acquire) == ModuleStatus::Running) {
         SetStatus(ModuleStatus::Paused);
-        Utils::Logger::Info("[AntiDebug] Monitoring paused");
+        SS_LOG_INFO(L"AntiDebug", L"Monitoring paused");
     }
 }
 
@@ -693,36 +695,38 @@ void AntiDebugImpl::Resume() noexcept {
     if (m_status.load(std::memory_order_acquire) == ModuleStatus::Paused) {
         SetStatus(ModuleStatus::Running);
         m_monitoringCV.notify_one();
-        Utils::Logger::Info("[AntiDebug] Monitoring resumed");
+        SS_LOG_INFO(L"AntiDebug", L"Monitoring resumed");
     }
 }
 
 bool AntiDebugImpl::SetConfiguration(const AntiDebugConfiguration& config) {
-    std::unique_lock lock(m_mutex);
-
     if (!ValidateConfiguration(config)) {
-        Utils::Logger::Error("[AntiDebug] Invalid configuration update");
+        SS_LOG_ERROR(L"AntiDebug", L"Invalid configuration update");
         return false;
     }
 
-    auto oldMode = m_config.monitoringMode;
-    m_config = config;
+    MonitoringMode oldMode;
+    MonitoringMode newMode;
+    {
+        std::unique_lock lock(m_mutex);
+        oldMode = m_config.monitoringMode;
+        m_config = config;
+        newMode = m_config.monitoringMode;
+        ApplyProtectionLevel(m_config.protectionLevel);
+    }
 
-    // Apply new protection level
-    ApplyProtectionLevel(m_config.protectionLevel);
-
-    // Handle monitoring mode changes
-    if (oldMode != m_config.monitoringMode) {
+    // Handle monitoring mode changes OUTSIDE m_mutex to avoid deadlock
+    if (oldMode != newMode) {
         StopMonitoringThread();
 
-        if (m_config.monitoringMode == MonitoringMode::Periodic ||
-            m_config.monitoringMode == MonitoringMode::Continuous ||
-            m_config.monitoringMode == MonitoringMode::Adaptive) {
+        if (newMode == MonitoringMode::Periodic ||
+            newMode == MonitoringMode::Continuous ||
+            newMode == MonitoringMode::Adaptive) {
             StartMonitoringThread();
         }
     }
 
-    Utils::Logger::Info("[AntiDebug] Configuration updated");
+    SS_LOG_INFO(L"AntiDebug", L"Configuration updated");
     return true;
 }
 
@@ -743,11 +747,14 @@ ProtectionLevel AntiDebugImpl::GetProtectionLevel() const noexcept {
 }
 
 void AntiDebugImpl::SetMonitoringMode(MonitoringMode mode) {
-    std::unique_lock lock(m_mutex);
+    MonitoringMode oldMode;
+    {
+        std::unique_lock lock(m_mutex);
+        oldMode = m_config.monitoringMode;
+        m_config.monitoringMode = mode;
+    }
 
-    auto oldMode = m_config.monitoringMode;
-    m_config.monitoringMode = mode;
-
+    // Stop/start monitoring OUTSIDE m_mutex to avoid deadlock
     if (oldMode != mode) {
         StopMonitoringThread();
 
@@ -807,7 +814,7 @@ void AntiDebugImpl::AddToWhitelist(std::wstring_view processName) {
     }
 
     m_config.whitelistedProcesses.emplace_back(processName);
-    Utils::Logger::Info("[AntiDebug] Added to whitelist: {}", WideToNarrow(processName));
+    SS_LOG_INFO(L"AntiDebug", L"Added to whitelist: %hs", WideToNarrow(processName).c_str());
 }
 
 void AntiDebugImpl::RemoveFromWhitelist(std::wstring_view processName) {
@@ -821,7 +828,7 @@ void AntiDebugImpl::RemoveFromWhitelist(std::wstring_view processName) {
 
     if (it != m_config.whitelistedProcesses.end()) {
         m_config.whitelistedProcesses.erase(it, m_config.whitelistedProcesses.end());
-        Utils::Logger::Info("[AntiDebug] Removed from whitelist: {}", WideToNarrow(processName));
+        SS_LOG_INFO(L"AntiDebug", L"Removed from whitelist: %hs", WideToNarrow(processName).c_str());
     }
 }
 
@@ -923,7 +930,7 @@ DetectionResult AntiDebugImpl::PerformFullScan() {
         NotifyDetection(event);
 
         // Log the detection
-        Utils::Logger::Warn("[AntiDebug] TAMPER DETECTED - Score: {}, Confidence: {}, Type: {}",
+        SS_LOG_WARN(L"AntiDebug", L"TAMPER DETECTED - Score: %u, Confidence: %d, Type: %d",
                            result.totalScore,
                            static_cast<int>(result.overallConfidence),
                            static_cast<int>(result.primaryDebuggerType));
@@ -1037,14 +1044,14 @@ DetectionCheckResult AntiDebugImpl::CheckPEB_BeingDebugged() {
             result.message = "PEB.BeingDebugged flag is set - debugger attached";
             result.details["peb_address"] = std::to_string(reinterpret_cast<uintptr_t>(pPeb));
 
-            Utils::Logger::Warn("[AntiDebug] PEB.BeingDebugged flag detected");
+            SS_LOG_WARN(L"AntiDebug", L"PEB.BeingDebugged flag detected");
         } else {
             result.message = "PEB.BeingDebugged flag is clear";
         }
     } catch (const std::exception& e) {
         result.errorCode = 1;
         result.message = std::string("PEB check failed: ") + e.what();
-        Utils::Logger::Error("[AntiDebug] PEB.BeingDebugged check failed: {}", e.what());
+        SS_LOG_ERROR(L"AntiDebug", L"PEB.BeingDebugged check failed: %hs", e.what());
     }
 #else
     result.message = "PEB check not supported on this platform";
@@ -1081,7 +1088,7 @@ DetectionCheckResult AntiDebugImpl::CheckPEB_NtGlobalFlag() {
                 result.message = "NtGlobalFlag indicates debugger presence";
                 result.details["ntglobalflag"] = std::to_string(ntGlobalFlag);
 
-                Utils::Logger::Warn("[AntiDebug] NtGlobalFlag debug flags detected: 0x{:X}", ntGlobalFlag);
+                SS_LOG_WARN(L"AntiDebug", L"NtGlobalFlag debug flags detected: 0x%lX", ntGlobalFlag);
             } else {
                 result.message = "NtGlobalFlag is clean";
             }
@@ -1136,7 +1143,7 @@ DetectionCheckResult AntiDebugImpl::CheckPEB_HeapFlags() {
                 result.details["heap_flags"] = std::to_string(heapFlags);
                 result.details["force_flags"] = std::to_string(forceFlags);
 
-                Utils::Logger::Warn("[AntiDebug] Heap debug flags detected: Flags=0x{:X}, ForceFlags=0x{:X}",
+                SS_LOG_WARN(L"AntiDebug", L"Heap debug flags detected: Flags=0x%lX, ForceFlags=0x%lX",
                                    heapFlags, forceFlags);
             } else {
                 result.message = "Heap flags are clean";
@@ -1241,7 +1248,7 @@ DetectionCheckResult AntiDebugImpl::CheckAPI_IsDebuggerPresent() {
         result.debuggerType = DebuggerType::UserMode;
         result.message = "IsDebuggerPresent() returned TRUE - debugger attached";
 
-        Utils::Logger::Warn("[AntiDebug] IsDebuggerPresent() detected debugger");
+        SS_LOG_WARN(L"AntiDebug", L"IsDebuggerPresent() detected debugger");
     } else {
         result.message = "IsDebuggerPresent() returned FALSE";
     }
@@ -1269,7 +1276,7 @@ DetectionCheckResult AntiDebugImpl::CheckAPI_CheckRemoteDebuggerPresent() {
             result.debuggerType = DebuggerType::Remote;
             result.message = "CheckRemoteDebuggerPresent() detected remote debugger";
 
-            Utils::Logger::Warn("[AntiDebug] Remote debugger detected via CheckRemoteDebuggerPresent()");
+            SS_LOG_WARN(L"AntiDebug", L"Remote debugger detected via CheckRemoteDebuggerPresent()");
         } else {
             result.message = "No remote debugger detected";
         }
@@ -1310,7 +1317,7 @@ DetectionCheckResult AntiDebugImpl::CheckAPI_NtQueryInformationProcess_DebugPort
             result.message = "ProcessDebugPort is non-zero - debugger attached";
             result.details["debug_port"] = std::to_string(debugPort);
 
-            Utils::Logger::Warn("[AntiDebug] ProcessDebugPort detected: 0x{:X}", debugPort);
+            SS_LOG_WARN(L"AntiDebug", L"ProcessDebugPort detected: 0x%IX", debugPort);
         } else {
             result.message = "ProcessDebugPort is zero";
         }
@@ -1351,7 +1358,7 @@ DetectionCheckResult AntiDebugImpl::CheckAPI_NtQueryInformationProcess_DebugFlag
             result.debuggerType = DebuggerType::UserMode;
             result.message = "ProcessDebugFlags is zero - debugger attached";
 
-            Utils::Logger::Warn("[AntiDebug] ProcessDebugFlags indicates debugger");
+            SS_LOG_WARN(L"AntiDebug", L"ProcessDebugFlags indicates debugger");
         } else {
             result.message = "ProcessDebugFlags indicates no debugger";
         }
@@ -1394,7 +1401,7 @@ DetectionCheckResult AntiDebugImpl::CheckAPI_NtQueryInformationProcess_DebugObje
             result.message = "Debug object handle exists - debugger attached";
             result.details["debug_object"] = std::to_string(reinterpret_cast<uintptr_t>(debugObject));
 
-            Utils::Logger::Warn("[AntiDebug] Debug object handle detected");
+            SS_LOG_WARN(L"AntiDebug", L"Debug object handle detected");
         } else {
             result.message = "No debug object handle";
         }
@@ -1431,7 +1438,7 @@ DetectionCheckResult AntiDebugImpl::CheckAPI_OutputDebugString() {
         result.debuggerType = DebuggerType::UserMode;
         result.message = "OutputDebugString behavior indicates debugger";
 
-        Utils::Logger::Warn("[AntiDebug] OutputDebugString debugger behavior detected");
+        SS_LOG_WARN(L"AntiDebug", L"OutputDebugString debugger behavior detected");
     } else {
         result.message = "OutputDebugString behavior normal";
     }
@@ -1469,7 +1476,7 @@ DetectionCheckResult AntiDebugImpl::CheckAPI_CloseHandle() {
         result.debuggerType = DebuggerType::UserMode;
         result.message = "CloseHandle threw exception - debugger attached";
 
-        Utils::Logger::Warn("[AntiDebug] CloseHandle exception detected - debugger present");
+        SS_LOG_WARN(L"AntiDebug", L"CloseHandle exception detected - debugger present");
     }
 #else
     result.message = "CloseHandle check not supported on this platform";
@@ -1572,7 +1579,7 @@ DetectionCheckResult AntiDebugImpl::CheckTiming_RDTSC() {
         result.debuggerType = DebuggerType::UserMode;
         result.message = "RDTSC timing anomaly detected - possible single-stepping";
 
-        Utils::Logger::Warn("[AntiDebug] RDTSC timing anomaly: avg={} cycles (threshold={})",
+        SS_LOG_WARN(L"AntiDebug", L"RDTSC timing anomaly: avg=%llu cycles (threshold=%llu)",
                            avg, AntiDebugConstants::RDTSC_SINGLE_INSTRUCTION_THRESHOLD);
     } else {
         result.message = "RDTSC timing within normal range";
@@ -1631,7 +1638,7 @@ DetectionCheckResult AntiDebugImpl::CheckTiming_QPC() {
         result.debuggerType = DebuggerType::UserMode;
         result.message = "QPC timing anomaly detected";
 
-        Utils::Logger::Warn("[AntiDebug] QPC timing anomaly: avg={} ns", avgNs);
+        SS_LOG_WARN(L"AntiDebug", L"QPC timing anomaly: avg=%lld ns", avgNs);
     } else {
         result.message = "QPC timing within normal range";
     }
@@ -1672,7 +1679,7 @@ DetectionCheckResult AntiDebugImpl::CheckTiming_GetTickCount() {
         result.debuggerType = DebuggerType::UserMode;
         result.message = "GetTickCount timing anomaly detected";
 
-        Utils::Logger::Warn("[AntiDebug] GetTickCount anomaly: {} ms for simple loop", elapsed);
+        SS_LOG_WARN(L"AntiDebug", L"GetTickCount anomaly: %llu ms for simple loop", elapsed);
     } else {
         result.message = "GetTickCount timing within normal range";
     }
@@ -1716,7 +1723,7 @@ DetectionCheckResult AntiDebugImpl::CheckTiming_InstructionExecution() {
         result.debuggerType = DebuggerType::UserMode;
         result.message = "Instruction timing anomaly - possible single-stepping";
 
-        Utils::Logger::Warn("[AntiDebug] Instruction block timing anomaly: {} cycles", elapsed);
+        SS_LOG_WARN(L"AntiDebug", L"Instruction block timing anomaly: %llu cycles", elapsed);
     } else {
         result.message = "Instruction timing within normal range";
     }
@@ -1882,10 +1889,8 @@ DetectionCheckResult AntiDebugImpl::CheckHardware_DebugRegisters() {
             result.debuggerType = DebuggerType::UserMode;
             result.message = "Hardware debug registers contain breakpoints";
 
-            Utils::Logger::Warn("[AntiDebug] Hardware breakpoints detected: DR0=0x{:X}, DR1=0x{:X}, DR2=0x{:X}, DR3=0x{:X}, DR7=0x{:X}",
+            SS_LOG_WARN(L"AntiDebug", L"Hardware breakpoints detected: DR0=0x%IX, DR1=0x%IX, DR2=0x%IX, DR3=0x%IX, DR7=0x%IX",
                                ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3, ctx.Dr7);
-
-            m_stats.breakpointsCleared.fetch_add(1, std::memory_order_relaxed);
         } else {
             result.message = "No hardware breakpoints detected";
         }
@@ -1950,7 +1955,7 @@ DetectionCheckResult AntiDebugImpl::CheckHardware_BreakpointsViaContext() {
                     result.message = "Hardware breakpoints found on thread " + std::to_string(tid);
                     result.details["thread_id"] = std::to_string(tid);
 
-                    Utils::Logger::Warn("[AntiDebug] Hardware breakpoints on thread {}", tid);
+                    SS_LOG_WARN(L"AntiDebug", L"Hardware breakpoints on thread %u", tid);
                 }
             }
 
@@ -2029,7 +2034,7 @@ DetectionCheckResult AntiDebugImpl::CheckException_INT3() {
         result.debuggerType = DebuggerType::UserMode;
         result.message = "INT3 exception was swallowed - debugger attached";
 
-        Utils::Logger::Warn("[AntiDebug] INT3 exception not caught - debugger handling it");
+        SS_LOG_WARN(L"AntiDebug", L"INT3 exception not caught - debugger handling it");
     } else {
         result.message = "INT3 exception caught normally";
     }
@@ -2047,11 +2052,11 @@ DetectionCheckResult AntiDebugImpl::CheckException_INT2D() {
     result.technique = DetectionTechnique::Exception_INT2D;
     result.timestamp = startTime;
 
-#ifdef _WIN32
+    // INT 2D uses inline asm - only available on x86 (MSVC has no __asm on x64)
+#if defined(_WIN32) && !defined(_WIN64)
     bool exceptionCaught = false;
 
     __try {
-        // INT 2D is a kernel debugger breakpoint
         __asm {
             int 0x2D
             nop
@@ -2068,12 +2073,12 @@ DetectionCheckResult AntiDebugImpl::CheckException_INT2D() {
         result.debuggerType = DebuggerType::KernelMode;
         result.message = "INT 2D exception was swallowed - kernel debugger may be present";
 
-        Utils::Logger::Warn("[AntiDebug] INT 2D exception not caught");
+        SS_LOG_WARN(L"AntiDebug", L"INT 2D exception not caught");
     } else {
         result.message = "INT 2D exception caught normally";
     }
 #else
-    result.message = "INT 2D check not supported on this platform";
+    result.message = "INT 2D check not supported on x64 or this platform";
 #endif
 
     result.checkDuration = std::chrono::duration_cast<Microseconds>(Clock::now() - startTime);
@@ -2086,11 +2091,12 @@ DetectionCheckResult AntiDebugImpl::CheckException_SingleStep() {
     result.technique = DetectionTechnique::Exception_SingleStep;
     result.timestamp = startTime;
 
-#ifdef _WIN32
+    // Trap flag asm only available on x86
+#if defined(_WIN32) && !defined(_WIN64)
     bool exceptionCaught = false;
 
     __try {
-        // Set trap flag to trigger single-step exception
+        // Trap flag uses inline asm - only available on x86
         __asm {
             pushfd
             or dword ptr [esp], 0x100
@@ -2109,12 +2115,12 @@ DetectionCheckResult AntiDebugImpl::CheckException_SingleStep() {
         result.debuggerType = DebuggerType::UserMode;
         result.message = "Single-step exception was swallowed - debugger attached";
 
-        Utils::Logger::Warn("[AntiDebug] Single-step exception not caught");
+        SS_LOG_WARN(L"AntiDebug", L"Single-step exception not caught");
     } else {
         result.message = "Single-step exception caught normally";
     }
 #else
-    result.message = "Single-step check not supported on this platform";
+    result.message = "Single-step check not available on x64 or this platform";
 #endif
 
     result.checkDuration = std::chrono::duration_cast<Microseconds>(Clock::now() - startTime);
@@ -2150,7 +2156,7 @@ DetectionCheckResult AntiDebugImpl::CheckException_GuardPage() {
             result.debuggerType = DebuggerType::UserMode;
             result.message = "Guard page exception was swallowed - possible debugger";
 
-            Utils::Logger::Warn("[AntiDebug] Guard page exception not caught");
+            SS_LOG_WARN(L"AntiDebug", L"Guard page exception not caught");
         } else {
             result.message = "Guard page exception caught normally";
         }
@@ -2174,10 +2180,48 @@ DetectionCheckResult AntiDebugImpl::CheckException_VEH() {
     result.technique = DetectionTechnique::Exception_VEH;
     result.timestamp = startTime;
 
-    // Note: VEH analysis is limited from user mode
-    // We check if there are any suspicious VEH handlers installed
+#ifdef _WIN32
+    // Detect suspicious VEH by installing our own VEH and checking if it fires.
+    // Also check for known VEH hooking by testing a known exception path.
+    // A debugger may install VEH handlers to intercept exceptions before our SEH.
+    static std::atomic<bool> s_vehFired{false};
+    s_vehFired.store(false, std::memory_order_release);
 
-    result.message = "VEH analysis complete";
+    auto vehHandler = [](PEXCEPTION_POINTERS) -> LONG {
+        s_vehFired.store(true, std::memory_order_release);
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+
+    PVOID handle = ::AddVectoredExceptionHandler(0 /* last */, vehHandler);
+    if (handle) {
+        // Trigger exception and verify our VEH sees it
+        __try {
+            ::RaiseException(0xC0000005, 0, 0, nullptr);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Expected
+        }
+
+        // If our VEH at the end of the chain didn't fire, something intercepted it
+        bool fired = s_vehFired.load(std::memory_order_acquire);
+        ::RemoveVectoredExceptionHandler(handle);
+
+        if (!fired) {
+            result.detected = true;
+            result.confidence = DetectionConfidence::Low;
+            result.score = AntiDebugConstants::WEIGHT_EXCEPTION_DETECTION / 2;
+            result.debuggerType = DebuggerType::Instrumentation;
+            result.message = "VEH handler chain may be manipulated";
+        } else {
+            result.message = "VEH analysis: no anomalies detected";
+        }
+    } else {
+        result.message = "VEH analysis: could not register handler";
+    }
+#else
+    result.message = "VEH analysis not supported on this platform";
+#endif
+
     result.checkDuration = std::chrono::duration_cast<Microseconds>(Clock::now() - startTime);
     return result;
 }
@@ -2234,8 +2278,21 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_SoftwareBreakpoints() {
     HMODULE hModule = ::GetModuleHandleW(nullptr);
     if (hModule) {
         PIMAGE_DOS_HEADER pDosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(hModule);
+        if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+            result.errorCode = 3;
+            result.message = "Invalid DOS signature";
+            result.checkDuration = std::chrono::duration_cast<Microseconds>(Clock::now() - startTime);
+            return result;
+        }
+
         PIMAGE_NT_HEADERS pNtHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
             reinterpret_cast<PBYTE>(hModule) + pDosHeader->e_lfanew);
+        if (pNtHeaders->Signature != IMAGE_NT_SIGNATURE) {
+            result.errorCode = 4;
+            result.message = "Invalid NT signature";
+            result.checkDuration = std::chrono::duration_cast<Microseconds>(Clock::now() - startTime);
+            return result;
+        }
 
         PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNtHeaders);
 
@@ -2268,10 +2325,9 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_SoftwareBreakpoints() {
                     result.debuggerType = DebuggerType::UserMode;
                     result.message = "Software breakpoints detected in code section";
                     result.details["breakpoint_count"] = std::to_string(breakpointCount);
-                    result.details["section"] = reinterpret_cast<const char*>(pSection->Name);
+                    result.details["section"] = std::string(reinterpret_cast<const char*>(pSection->Name), strnlen(reinterpret_cast<const char*>(pSection->Name), 8));
 
-                    Utils::Logger::Warn("[AntiDebug] Software breakpoints detected: {} in section {}",
-                                       breakpointCount, pSection->Name);
+                    SS_LOG_WARN(L"AntiDebug", L"Software breakpoints detected: %zu in code section", breakpointCount);
                     break;
                 }
             }
@@ -2344,7 +2400,7 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_CodeIntegrity() {
     result.technique = DetectionTechnique::Memory_CodeIntegrity;
     result.timestamp = startTime;
 
-    std::shared_lock lock(m_mutex);
+    std::unique_lock lock(m_mutex);
 
     bool anyViolation = false;
     for (auto& [id, region] : m_integrityRegions) {
@@ -2364,8 +2420,8 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_CodeIntegrity() {
 
                 result.details[id + "_status"] = "modified";
 
-                Utils::Logger::Warn("[AntiDebug] Code integrity violation in region '{}': expected CRC 0x{:08X}, got 0x{:08X}",
-                                   id, region.expectedCrc32, currentCrc);
+                SS_LOG_WARN(L"AntiDebug", L"Code integrity violation in region '%hs': expected CRC 0x%08X, got 0x%08X",
+                                   id.c_str(), region.expectedCrc32, currentCrc);
 
                 m_stats.integrityViolations.fetch_add(1, std::memory_order_relaxed);
             } else {
@@ -2403,8 +2459,18 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_IATHooks() {
     }
 
     PIMAGE_DOS_HEADER pDosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(hModule);
+    if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        result.message = "Invalid DOS signature";
+        result.checkDuration = std::chrono::duration_cast<Microseconds>(Clock::now() - startTime);
+        return result;
+    }
     PIMAGE_NT_HEADERS pNtHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
         reinterpret_cast<PBYTE>(hModule) + pDosHeader->e_lfanew);
+    if (pNtHeaders->Signature != IMAGE_NT_SIGNATURE) {
+        result.message = "Invalid NT signature";
+        result.checkDuration = std::chrono::duration_cast<Microseconds>(Clock::now() - startTime);
+        return result;
+    }
 
     // Get import directory
     DWORD importRva = pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
@@ -2418,22 +2484,20 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_IATHooks() {
         reinterpret_cast<PBYTE>(hModule) + importRva);
 
     size_t hookCount = 0;
+    std::vector<HookInfo> foundHooks;
 
     while (pImportDesc->Name != 0) {
         LPCSTR dllName = reinterpret_cast<LPCSTR>(
             reinterpret_cast<PBYTE>(hModule) + pImportDesc->Name);
 
-        // Get the original IAT address
         PIMAGE_THUNK_DATA pThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(
             reinterpret_cast<PBYTE>(hModule) + pImportDesc->FirstThunk);
 
-        // Load the DLL to compare
         HMODULE hDll = ::GetModuleHandleA(dllName);
         if (hDll) {
             while (pThunk->u1.Function != 0) {
                 FARPROC pFunc = reinterpret_cast<FARPROC>(pThunk->u1.Function);
 
-                // Check if the function address is within the DLL's address range
                 MODULEINFO modInfo = {};
                 if (::GetModuleInformation(::GetCurrentProcess(), hDll, &modInfo, sizeof(modInfo))) {
                     uintptr_t dllStart = reinterpret_cast<uintptr_t>(hDll);
@@ -2450,10 +2514,7 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_IATHooks() {
                         hookInfo.moduleName = NarrowToWide(dllName);
                         hookInfo.isSuspicious = true;
 
-                        std::unique_lock writeLock(m_mutex);
-                        m_detectedHooks.push_back(hookInfo);
-
-                        m_stats.hooksDetected.fetch_add(1, std::memory_order_relaxed);
+                        foundHooks.push_back(std::move(hookInfo));
                     }
                 }
 
@@ -2465,6 +2526,15 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_IATHooks() {
     }
 
     if (hookCount > 0) {
+        // Store all found hooks under lock in one batch
+        {
+            std::unique_lock writeLock(m_mutex);
+            for (auto& h : foundHooks) {
+                m_detectedHooks.push_back(std::move(h));
+            }
+        }
+        m_stats.hooksDetected.fetch_add(hookCount, std::memory_order_relaxed);
+
         result.detected = true;
         result.confidence = DetectionConfidence::High;
         result.score = AntiDebugConstants::WEIGHT_HOOK_DETECTION;
@@ -2472,7 +2542,7 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_IATHooks() {
         result.message = "IAT hooks detected";
         result.details["hook_count"] = std::to_string(hookCount);
 
-        Utils::Logger::Warn("[AntiDebug] Detected {} IAT hooks", hookCount);
+        SS_LOG_WARN(L"AntiDebug", L"Detected %zu IAT hooks", hookCount);
     } else {
         result.message = "No IAT hooks detected";
     }
@@ -2506,6 +2576,7 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_InlineHooks() {
     }};
 
     size_t hookCount = 0;
+    std::vector<HookInfo> foundHooks;
 
     for (const auto& [dllName, funcName] : criticalFunctions) {
         HMODULE hDll = ::GetModuleHandleA(dllName);
@@ -2514,22 +2585,17 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_InlineHooks() {
             if (pFunc) {
                 PBYTE pBytes = reinterpret_cast<PBYTE>(pFunc);
 
-                // Check for common hook signatures
-                // JMP rel32: E9 xx xx xx xx
-                // JMP [rip+rel32]: FF 25 xx xx xx xx (x64)
-                // MOV r10, imm64; JMP r10 (x64 detour)
-
                 bool isHooked = false;
 
                 if (pBytes[0] == 0xE9) {
                     isHooked = true;
                 } else if (pBytes[0] == 0xFF && pBytes[1] == 0x25) {
                     isHooked = true;
-                } else if (pBytes[0] == 0x68) { // PUSH imm32
+                } else if (pBytes[0] == 0x68) {
                     isHooked = true;
                 }
 #ifdef _WIN64
-                else if (pBytes[0] == 0x48 && pBytes[1] == 0xB8) { // MOV RAX, imm64
+                else if (pBytes[0] == 0x48 && pBytes[1] == 0xB8) {
                     isHooked = true;
                 }
 #endif
@@ -2543,22 +2609,25 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_InlineHooks() {
                     hookInfo.moduleName = NarrowToWide(dllName);
                     hookInfo.functionName = funcName;
                     hookInfo.isSuspicious = true;
-
-                    // Store first 16 bytes
                     hookInfo.currentBytes.assign(pBytes, pBytes + 16);
 
-                    std::unique_lock lock(m_mutex);
-                    m_detectedHooks.push_back(hookInfo);
+                    foundHooks.push_back(std::move(hookInfo));
 
-                    m_stats.hooksDetected.fetch_add(1, std::memory_order_relaxed);
-
-                    Utils::Logger::Warn("[AntiDebug] Inline hook detected on {}!{}", dllName, funcName);
+                    SS_LOG_WARN(L"AntiDebug", L"Inline hook detected on %hs!%hs", dllName, funcName);
                 }
             }
         }
     }
 
     if (hookCount > 0) {
+        {
+            std::unique_lock lock(m_mutex);
+            for (auto& h : foundHooks) {
+                m_detectedHooks.push_back(std::move(h));
+            }
+        }
+        m_stats.hooksDetected.fetch_add(hookCount, std::memory_order_relaxed);
+
         result.detected = true;
         result.confidence = DetectionConfidence::Critical;
         result.score = AntiDebugConstants::WEIGHT_HOOK_DETECTION;
@@ -2684,8 +2753,8 @@ DetectionCheckResult AntiDebugImpl::CheckProcess_ParentProcess() {
                                     result.debuggerType = DebuggerType::UserMode;
                                     result.message = "Parent process is a known debugger: " + WideToNarrow(parentName);
 
-                                    Utils::Logger::Warn("[AntiDebug] Parent process is debugger: {} (PID {})",
-                                                       WideToNarrow(parentName), parentPid);
+                                    SS_LOG_WARN(L"AntiDebug", L"Parent process is debugger: %ls (PID %u)",
+                                                       parentName.c_str(), parentPid);
                                 }
                                 break;
                             }
@@ -2783,7 +2852,7 @@ DetectionCheckResult AntiDebugImpl::CheckProcess_DebuggerProcesses() {
         }
         result.details["debuggers"] = debuggerList;
 
-        Utils::Logger::Warn("[AntiDebug] Found {} debugger processes: {}", debuggerCount, debuggerList);
+        SS_LOG_WARN(L"AntiDebug", L"Found %zu debugger processes: %hs", debuggerCount, debuggerList.c_str());
     } else {
         result.message = "No debugger processes found";
     }
@@ -2818,8 +2887,8 @@ DetectionCheckResult AntiDebugImpl::CheckProcess_DebuggerWindows() {
             result.details["window_class"] = WideToNarrow(wClassName);
             result.details["window_title"] = WideToNarrow(title);
 
-            Utils::Logger::Warn("[AntiDebug] Debugger window found: class='{}', title='{}'",
-                               className, WideToNarrow(title));
+            SS_LOG_WARN(L"AntiDebug", L"Debugger window found: class='%hs', title='%ls'",
+                               std::string(className).c_str(), title);
         }
     }
 
@@ -2869,7 +2938,7 @@ DetectionCheckResult AntiDebugImpl::CheckProcess_DebuggerDrivers() {
 
             result.details["driver"] = std::string(driverName);
 
-            Utils::Logger::Warn("[AntiDebug] Debugger driver found: {}", driverName);
+            SS_LOG_WARN(L"AntiDebug", L"Debugger driver found: %hs", std::string(driverName).c_str());
         }
     }
 
@@ -2908,7 +2977,7 @@ DetectionCheckResult AntiDebugImpl::CheckProcess_InstrumentationFrameworks() {
         result.message = "Frida instrumentation framework detected";
         result.details["framework"] = "frida";
 
-        Utils::Logger::Warn("[AntiDebug] Frida instrumentation detected");
+        SS_LOG_WARN(L"AntiDebug", L"Frida instrumentation detected");
     }
 
     // Check for other instrumentation frameworks
@@ -2928,7 +2997,7 @@ DetectionCheckResult AntiDebugImpl::CheckProcess_InstrumentationFrameworks() {
             result.message = std::string("Instrumentation framework detected: ") + frameworkName;
             result.details["framework"] = frameworkName;
 
-            Utils::Logger::Warn("[AntiDebug] {} instrumentation detected", frameworkName);
+            SS_LOG_WARN(L"AntiDebug", L"%hs instrumentation detected", frameworkName);
         }
     }
 
@@ -2992,20 +3061,25 @@ DetectionCheckResult AntiDebugImpl::CheckAllProcess() {
 bool AntiDebugImpl::HideThread(uint32_t threadId) {
 #ifdef _WIN32
     if (!m_pNtSetInformationThread) {
-        Utils::Logger::Error("[AntiDebug] NtSetInformationThread not available");
+        SS_LOG_ERROR(L"AntiDebug", L"NtSetInformationThread not available");
         return false;
     }
 
     uint32_t tid = threadId == 0 ? ::GetCurrentThreadId() : threadId;
 
-    HANDLE hThread = ::OpenThread(THREAD_SET_INFORMATION, FALSE, tid);
-    if (!hThread && threadId == 0) {
-        hThread = ::GetCurrentThread();
-    }
+    // For the current thread use the pseudohandle directly; for other threads open a real handle
+    HANDLE hThread = nullptr;
+    bool needsClose = false;
 
-    if (!hThread) {
-        Utils::Logger::Error("[AntiDebug] Failed to open thread {} for hiding", tid);
-        return false;
+    if (threadId == 0) {
+        hThread = ::GetCurrentThread();
+    } else {
+        hThread = ::OpenThread(THREAD_SET_INFORMATION, FALSE, tid);
+        if (!hThread) {
+            SS_LOG_ERROR(L"AntiDebug", L"Failed to open thread %u for hiding", tid);
+            return false;
+        }
+        needsClose = true;
     }
 
     NTSTATUS status = m_pNtSetInformationThread(
@@ -3015,12 +3089,11 @@ bool AntiDebugImpl::HideThread(uint32_t threadId) {
         0
     );
 
-    if (threadId != 0) {
+    if (needsClose) {
         ::CloseHandle(hThread);
     }
 
     if (NT_SUCCESS(status)) {
-        // Update thread state
         std::unique_lock lock(m_mutex);
         auto& state = m_threadStates[tid];
         state.threadId = tid;
@@ -3029,10 +3102,10 @@ bool AntiDebugImpl::HideThread(uint32_t threadId) {
 
         m_stats.threadsHidden.fetch_add(1, std::memory_order_relaxed);
 
-        Utils::Logger::Info("[AntiDebug] Thread {} hidden from debugger", tid);
+        SS_LOG_INFO(L"AntiDebug", L"Thread %u hidden from debugger", tid);
         return true;
     } else {
-        Utils::Logger::Error("[AntiDebug] Failed to hide thread {}: NTSTATUS 0x{:08X}", tid, status);
+        SS_LOG_ERROR(L"AntiDebug", L"Failed to hide thread %u: NTSTATUS 0x%08lX", tid, static_cast<unsigned long>(status));
         return false;
     }
 #else
@@ -3052,7 +3125,7 @@ size_t AntiDebugImpl::HideAllThreads() {
         }
     }
 
-    Utils::Logger::Info("[AntiDebug] Hidden {} threads from debugger", count);
+    SS_LOG_INFO(L"AntiDebug", L"Hidden %zu threads from debugger", count);
 #endif
 
     return count;
@@ -3107,26 +3180,29 @@ bool AntiDebugImpl::ClearDebugRegisters(uint32_t threadId) {
 #ifdef _WIN32
     uint32_t tid = threadId == 0 ? ::GetCurrentThreadId() : threadId;
 
-    HANDLE hThread = ::OpenThread(THREAD_SET_CONTEXT | THREAD_GET_CONTEXT, FALSE, tid);
-    if (!hThread && threadId == 0) {
-        hThread = ::GetCurrentThread();
-    }
+    HANDLE hThread = nullptr;
+    bool needsClose = false;
 
-    if (!hThread) {
-        Utils::Logger::Error("[AntiDebug] Failed to open thread {} for DR clearing", tid);
-        return false;
+    if (threadId == 0) {
+        hThread = ::GetCurrentThread();
+    } else {
+        hThread = ::OpenThread(THREAD_SET_CONTEXT | THREAD_GET_CONTEXT, FALSE, tid);
+        if (!hThread) {
+            SS_LOG_ERROR(L"AntiDebug", L"Failed to open thread %u for DR clearing", tid);
+            return false;
+        }
+        needsClose = true;
     }
 
     CONTEXT ctx = {};
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
 
     if (!::GetThreadContext(hThread, &ctx)) {
-        if (threadId != 0) ::CloseHandle(hThread);
-        Utils::Logger::Error("[AntiDebug] Failed to get context for thread {}", tid);
+        if (needsClose) ::CloseHandle(hThread);
+        SS_LOG_ERROR(L"AntiDebug", L"Failed to get context for thread %u", tid);
         return false;
     }
 
-    // Clear all debug registers
     ctx.Dr0 = 0;
     ctx.Dr1 = 0;
     ctx.Dr2 = 0;
@@ -3135,24 +3211,25 @@ bool AntiDebugImpl::ClearDebugRegisters(uint32_t threadId) {
     ctx.Dr7 = 0;
 
     if (!::SetThreadContext(hThread, &ctx)) {
-        if (threadId != 0) ::CloseHandle(hThread);
-        Utils::Logger::Error("[AntiDebug] Failed to set context for thread {}", tid);
+        if (needsClose) ::CloseHandle(hThread);
+        SS_LOG_ERROR(L"AntiDebug", L"Failed to set context for thread %u", tid);
         return false;
     }
 
-    if (threadId != 0) {
+    if (needsClose) {
         ::CloseHandle(hThread);
     }
 
-    // Update thread state
-    std::unique_lock lock(m_mutex);
-    auto& state = m_threadStates[tid];
-    state.threadId = tid;
-    state.debugRegistersClear = true;
+    {
+        std::unique_lock lock(m_mutex);
+        auto& state = m_threadStates[tid];
+        state.threadId = tid;
+        state.debugRegistersClear = true;
+    }
 
     m_stats.breakpointsCleared.fetch_add(1, std::memory_order_relaxed);
 
-    Utils::Logger::Info("[AntiDebug] Debug registers cleared for thread {}", tid);
+    SS_LOG_INFO(L"AntiDebug", L"Debug registers cleared for thread %u", tid);
     return true;
 #else
     return false;
@@ -3171,7 +3248,7 @@ size_t AntiDebugImpl::ClearAllDebugRegisters() {
         }
     }
 
-    Utils::Logger::Info("[AntiDebug] Cleared debug registers for {} threads", count);
+    SS_LOG_INFO(L"AntiDebug", L"Cleared debug registers for %zu threads", count);
 #endif
 
     return count;
@@ -3191,14 +3268,14 @@ bool AntiDebugImpl::RegisterIntegrityRegion(std::string_view id, uintptr_t addre
     }
 
     if (size > AntiDebugConstants::MAX_CODE_SECTION_SIZE) {
-        Utils::Logger::Warn("[AntiDebug] Integrity region too large: {} bytes", size);
+        SS_LOG_WARN(L"AntiDebug", L"Integrity region too large: %zu bytes", size);
         return false;
     }
 
     std::unique_lock lock(m_mutex);
 
     if (m_integrityRegions.size() >= AntiDebugConstants::MAX_INTEGRITY_REGIONS) {
-        Utils::Logger::Warn("[AntiDebug] Maximum integrity regions reached");
+        SS_LOG_WARN(L"AntiDebug", L"Maximum integrity regions reached");
         return false;
     }
 
@@ -3217,8 +3294,8 @@ bool AntiDebugImpl::RegisterIntegrityRegion(std::string_view id, uintptr_t addre
 
     m_integrityRegions[std::string(id)] = region;
 
-    Utils::Logger::Info("[AntiDebug] Registered integrity region '{}': addr=0x{:X}, size={}, crc=0x{:08X}",
-                       id, address, size, region.expectedCrc32);
+    SS_LOG_INFO(L"AntiDebug", L"Registered integrity region '%hs': addr=0x%IX, size=%zu, crc=0x%08X",
+                       std::string(id).c_str(), address, size, region.expectedCrc32);
 
     return true;
 }
@@ -3231,8 +3308,14 @@ bool AntiDebugImpl::RegisterSelfIntegrity() {
     }
 
     PIMAGE_DOS_HEADER pDosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(hModule);
+    if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        return false;
+    }
     PIMAGE_NT_HEADERS pNtHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
         reinterpret_cast<PBYTE>(hModule) + pDosHeader->e_lfanew);
+    if (pNtHeaders->Signature != IMAGE_NT_SIGNATURE) {
+        return false;
+    }
 
     PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNtHeaders);
 
@@ -3287,8 +3370,8 @@ IntegrityStatus AntiDebugImpl::VerifyIntegrity(std::string_view id) {
 
         m_stats.integrityViolations.fetch_add(1, std::memory_order_relaxed);
 
-        Utils::Logger::Warn("[AntiDebug] Integrity violation in '{}': expected 0x{:08X}, got 0x{:08X}",
-                           id, region.expectedCrc32, region.currentCrc32);
+        SS_LOG_WARN(L"AntiDebug", L"Integrity violation in '%hs': expected 0x%08X, got 0x%08X",
+                           id.c_str(), region.expectedCrc32, region.currentCrc32);
     } else {
         region.status = IntegrityStatus::Valid;
     }
@@ -3299,11 +3382,18 @@ IntegrityStatus AntiDebugImpl::VerifyIntegrity(std::string_view id) {
 std::unordered_map<std::string, IntegrityStatus> AntiDebugImpl::VerifyAllIntegrity() {
     std::unordered_map<std::string, IntegrityStatus> results;
 
-    std::shared_lock lock(m_mutex);
-    for (const auto& [id, region] : m_integrityRegions) {
-        lock.unlock();
+    // Collect IDs under lock, then verify each outside to avoid iterator invalidation
+    std::vector<std::string> ids;
+    {
+        std::shared_lock lock(m_mutex);
+        ids.reserve(m_integrityRegions.size());
+        for (const auto& [id, region] : m_integrityRegions) {
+            ids.push_back(id);
+        }
+    }
+
+    for (const auto& id : ids) {
         results[id] = VerifyIntegrity(id);
-        lock.lock();
     }
 
     return results;
@@ -3342,7 +3432,7 @@ bool AntiDebugImpl::ExecuteResponse(ResponseAction action, const DetectionResult
 
     // Log action
     if ((static_cast<uint32_t>(action) & static_cast<uint32_t>(ResponseAction::Log)) != 0) {
-        Utils::Logger::Warn("[AntiDebug] Detection logged: score={}, confidence={}",
+        SS_LOG_WARN(L"AntiDebug", L"Detection logged: score=%u, confidence=%d",
                            result.totalScore, static_cast<int>(result.overallConfidence));
         executed = true;
     }
@@ -3535,43 +3625,43 @@ std::string AntiDebugImpl::ExportReport() const {
 // ============================================================================
 
 bool AntiDebugImpl::SelfTest() {
-    Utils::Logger::Info("[AntiDebug] Starting self-test...");
+    SS_LOG_INFO(L"AntiDebug", L"Starting self-test...");
 
     bool passed = true;
 
     // Test 1: Configuration validation
     AntiDebugConfiguration testConfig;
     if (!testConfig.IsValid()) {
-        Utils::Logger::Error("[AntiDebug] Self-test FAILED: Default config invalid");
+        SS_LOG_ERROR(L"AntiDebug", L"Self-test FAILED: Default config invalid");
         passed = false;
     }
 
     // Test 2: PEB check (should return result without crash)
     try {
         auto pebResult = CheckPEB_BeingDebugged();
-        Utils::Logger::Info("[AntiDebug] Self-test: PEB check completed, detected={}",
-                           pebResult.detected);
+        SS_LOG_INFO(L"AntiDebug", L"Self-test: PEB check completed, detected=%d",
+                           static_cast<int>(pebResult.detected));
     } catch (const std::exception& e) {
-        Utils::Logger::Error("[AntiDebug] Self-test FAILED: PEB check threw: {}", e.what());
+        SS_LOG_ERROR(L"AntiDebug", L"Self-test FAILED: PEB check threw: %hs", e.what());
         passed = false;
     }
 
     // Test 3: API check
     try {
         auto apiResult = CheckAPI_IsDebuggerPresent();
-        Utils::Logger::Info("[AntiDebug] Self-test: API check completed, detected={}",
-                           apiResult.detected);
+        SS_LOG_INFO(L"AntiDebug", L"Self-test: API check completed, detected=%d",
+                           static_cast<int>(apiResult.detected));
     } catch (const std::exception& e) {
-        Utils::Logger::Error("[AntiDebug] Self-test FAILED: API check threw: {}", e.what());
+        SS_LOG_ERROR(L"AntiDebug", L"Self-test FAILED: API check threw: %hs", e.what());
         passed = false;
     }
 
     // Test 4: Debug register state retrieval
     try {
         auto drState = GetDebugRegisterState();
-        Utils::Logger::Info("[AntiDebug] Self-test: DR state retrieved");
+        SS_LOG_INFO(L"AntiDebug", L"Self-test: DR state retrieved");
     } catch (const std::exception& e) {
-        Utils::Logger::Error("[AntiDebug] Self-test FAILED: DR state threw: {}", e.what());
+        SS_LOG_ERROR(L"AntiDebug", L"Self-test FAILED: DR state threw: %hs", e.what());
         passed = false;
     }
 
@@ -3580,15 +3670,13 @@ bool AntiDebugImpl::SelfTest() {
         // May be okay if just started
     }
 
-    Utils::Logger::Info("[AntiDebug] Self-test completed: {}", passed ? "PASSED" : "FAILED");
+    SS_LOG_INFO(L"AntiDebug", L"Self-test completed: %hs", passed ? "PASSED" : "FAILED");
 
     return passed;
 }
 
 void AntiDebugImpl::ForceGarbageCollection() {
-    std::unique_lock lock(m_mutex);
-
-    // Clear old detection history
+    // Trim history under its own lock (not holding m_mutex)
     {
         std::lock_guard historyLock(m_historyMutex);
         while (m_detectionHistory.size() > MAX_HISTORY_SIZE / 2) {
@@ -3596,18 +3684,21 @@ void AntiDebugImpl::ForceGarbageCollection() {
         }
     }
 
-    // Clear stale thread states
-    auto now = Clock::now();
-    for (auto it = m_threadStates.begin(); it != m_threadStates.end();) {
-        auto age = std::chrono::duration_cast<std::chrono::minutes>(now - it->second.protectionTime);
-        if (age.count() > 60) {
-            it = m_threadStates.erase(it);
-        } else {
-            ++it;
+    // Clear stale thread states under m_mutex
+    {
+        std::unique_lock lock(m_mutex);
+        auto now = Clock::now();
+        for (auto it = m_threadStates.begin(); it != m_threadStates.end();) {
+            auto age = std::chrono::duration_cast<std::chrono::minutes>(now - it->second.protectionTime);
+            if (age.count() > 60) {
+                it = m_threadStates.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 
-    Utils::Logger::Info("[AntiDebug] Garbage collection completed");
+    SS_LOG_INFO(L"AntiDebug", L"Garbage collection completed");
 }
 
 // ============================================================================
@@ -3630,7 +3721,7 @@ void AntiDebugImpl::StartMonitoringThread() {
     m_stopMonitoring.store(false, std::memory_order_release);
     m_monitoringThread = std::make_unique<std::thread>(&AntiDebugImpl::MonitoringThreadFunc, this);
 
-    Utils::Logger::Info("[AntiDebug] Monitoring thread started");
+    SS_LOG_INFO(L"AntiDebug", L"Monitoring thread started");
 }
 
 void AntiDebugImpl::StopMonitoringThread() {
@@ -3642,11 +3733,11 @@ void AntiDebugImpl::StopMonitoringThread() {
         m_monitoringThread.reset();
     }
 
-    Utils::Logger::Info("[AntiDebug] Monitoring thread stopped");
+    SS_LOG_INFO(L"AntiDebug", L"Monitoring thread stopped");
 }
 
 void AntiDebugImpl::MonitoringThreadFunc() {
-    Utils::Logger::Info("[AntiDebug] Monitoring thread running");
+    SS_LOG_INFO(L"AntiDebug", L"Monitoring thread running");
 
     while (!m_stopMonitoring.load(std::memory_order_acquire)) {
         // Wait for interval or stop signal
@@ -3724,7 +3815,7 @@ void AntiDebugImpl::NotifyDetection(const DetectionEvent& event) {
         try {
             cb(event);
         } catch (const std::exception& e) {
-            Utils::Logger::Error("[AntiDebug] Detection callback threw: {}", e.what());
+            SS_LOG_ERROR(L"AntiDebug", L"Detection callback threw: %hs", e.what());
         }
     }
 }
@@ -3743,7 +3834,7 @@ void AntiDebugImpl::NotifyStatusChange(ModuleStatus oldStatus, ModuleStatus newS
         try {
             cb(oldStatus, newStatus);
         } catch (const std::exception& e) {
-            Utils::Logger::Error("[AntiDebug] Status callback threw: {}", e.what());
+            SS_LOG_ERROR(L"AntiDebug", L"Status callback threw: %hs", e.what());
         }
     }
 }
