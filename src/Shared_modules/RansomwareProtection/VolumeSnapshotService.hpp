@@ -28,45 +28,17 @@
  * Copy Service (VSS) for backup and recovery operations without relying
  * on external command-line tools.
  *
- * VSS CAPABILITIES:
- * =================
+ * INTEGRATION:
+ *   - ShadowCopyProtector: notified of every snapshot ID for tamper protection
+ *   - RansomwareDetector:  triggers CreateEmergencySnapshot on detection
+ *   - RansomwareDecryptor: queries GetRecoveryPoints for file restoration
+ *   - PhantomSensor:       kernel storage-pressure events trigger pre-snapshots
  *
- * 1. SNAPSHOT CREATION
- *    - Per-volume snapshots
- *    - Multi-volume snapshots
- *    - Application-consistent snapshots
- *    - Crash-consistent snapshots
- *    - Transportable snapshots
- *
- * 2. SNAPSHOT MANAGEMENT
- *    - Enumeration
- *    - Deletion
- *    - Retention policies
- *    - Storage management
- *    - Provider selection
- *
- * 3. RESTORATION
- *    - File-level restore
- *    - Directory restore
- *    - Volume restore
- *    - Point-in-time recovery
- *
- * 4. MONITORING
- *    - Storage usage tracking
- *    - Provider health checks
- *    - Event logging
- *    - Quota management
- *
- * 5. WRITER COORDINATION
- *    - Application writer notification
- *    - Consistent state capture
- *    - Pre/post snapshot hooks
- *
- * @note Requires administrative privileges for most operations.
- * @note Uses VSS COM interfaces directly.
+ * @note Requires SeBackupPrivilege, SeRestorePrivilege, SeSecurityPrivilege.
+ * @note Uses VSS COM interfaces directly (IVssBackupComponents).
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -92,6 +64,7 @@
 #include <chrono>
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 
 // ============================================================================
 // WINDOWS SDK INCLUDES
@@ -131,276 +104,219 @@ namespace Ransomware {
 
 namespace VSSConstants {
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
-    
-    /// @brief Maximum snapshots per volume
-    inline constexpr size_t MAX_SNAPSHOTS_PER_VOLUME = 64;
-    
-    /// @brief Snapshot creation timeout (milliseconds)
-    inline constexpr uint32_t SNAPSHOT_TIMEOUT_MS = 300000;  // 5 minutes
-    
-    /// @brief Default storage percentage
-    inline constexpr uint32_t DEFAULT_STORAGE_PERCENT = 10;
+
+    inline constexpr size_t   MAX_SNAPSHOTS_PER_VOLUME      = 64;
+    inline constexpr uint32_t SNAPSHOT_TIMEOUT_MS            = 300000;  // 5 minutes
+    inline constexpr uint32_t DEFAULT_STORAGE_LIMIT_PERCENT  = 10;
+    inline constexpr uint32_t DEFAULT_MONITORING_INTERVAL_S  = 300;     // 5 minutes
+    inline constexpr uint32_t DEFAULT_MAX_SNAPSHOT_AGE_DAYS  = 30;
+    inline constexpr size_t   MAX_VOLUME_PATH_LEN            = 260;
+    inline constexpr uint32_t EMERGENCY_SNAPSHOT_TIMEOUT_MS  = 60000;   // 1 minute
 }
 
 // ============================================================================
 // TYPE ALIASES
 // ============================================================================
 
-using Clock = std::chrono::steady_clock;
-using TimePoint = std::chrono::steady_clock::time_point;
+using Clock           = std::chrono::steady_clock;
+using TimePoint       = std::chrono::steady_clock::time_point;
 using SystemTimePoint = std::chrono::system_clock::time_point;
-using GUID = std::array<uint8_t, 16>;
 
 // ============================================================================
 // ENUMERATIONS
 // ============================================================================
 
-/**
- * @brief Snapshot type
- */
+/// @brief Snapshot type (maps to VSS backup context flags)
 enum class SnapshotType : uint8_t {
-    Standard        = 0,    ///< Standard snapshot
-    AppConsistent   = 1,    ///< Application-consistent
-    CrashConsistent = 2,    ///< Crash-consistent
-    Transportable   = 3     ///< Transportable snapshot
+    Standard        = 0,    ///< VSS_BT_COPY — non-intrusive snapshot
+    AppConsistent   = 1,    ///< Full writer coordination
+    CrashConsistent = 2,    ///< No writer coordination
+    Transportable   = 3     ///< Transportable snapshot set
 };
 
-/**
- * @brief Snapshot state
- */
+/// @brief Snapshot lifecycle state (mirrors VSS_SNAPSHOT_STATE)
 enum class SnapshotState : uint8_t {
     Unknown     = 0,
-    Creating    = 1,
-    Ready       = 2,
-    Mounted     = 3,
-    Deleting    = 4,
-    Deleted     = 5,
-    Error       = 6
+    Preparing   = 1,
+    Processing  = 2,
+    Prepared    = 3,
+    Committed   = 4,
+    Created     = 5
 };
 
-/**
- * @brief Operation result
- */
+/// @brief VSS writer state
+enum class WriterState : uint8_t {
+    Unknown              = 0,
+    Stable               = 1,
+    WaitingForFreeze     = 2,
+    WaitingForThaw       = 3,
+    WaitingForCompletion = 4,
+    Failed               = 5
+};
+
+/// @brief Operation result codes (exhaustive VSS HRESULT mapping)
 enum class VSSResult : uint8_t {
-    Success             = 0,
-    AccessDenied        = 1,
-    ServiceUnavailable  = 2,
-    VolumeNotFound      = 3,
-    SnapshotNotFound    = 4,
-    InsufficientSpace   = 5,
-    Timeout             = 6,
-    WriterError         = 7,
-    ProviderError       = 8,
-    UnknownError        = 255
+    Success              = 0,
+    NotInitialized       = 1,
+    AlreadyInitialized   = 2,
+    InvalidParameter     = 3,
+    AccessDenied         = 4,
+    OutOfMemory          = 5,
+    NotFound             = 6,
+    BadState             = 7,
+    ProviderError        = 8,
+    VolumeNotSupported   = 9,
+    InsufficientStorage  = 10,
+    ProviderVeto         = 11,
+    MaxSnapshotsReached  = 12,
+    WriterFailed         = 13,
+    Timeout              = 14,
+    MountFailed          = 15,
+    RestoreFailed        = 16,
+    IntegrityCheckFailed = 17,
+    PrivilegeError       = 18,
+    UnknownError         = 255
 };
 
-/**
- * @brief Module status
- */
+/// @brief Module lifecycle status
 enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
+    Uninitialized = 0,
+    Initializing  = 1,
+    Running       = 2,
+    Degraded      = 3,
+    Paused        = 4,
+    Stopping      = 5,
+    Stopped       = 6,
+    Error         = 7
+};
+
+/// @brief Snapshot operation type (for tracking active operations)
+enum class OperationType : uint8_t {
+    Create  = 0,
+    Delete  = 1,
+    Mount   = 2,
+    Restore = 3
+};
+
+/// @brief Snapshot operation state
+enum class OperationState : uint8_t {
+    Pending    = 0,
+    InProgress = 1,
+    Completed  = 2,
+    Failed     = 3,
+    Cancelled  = 4
 };
 
 // ============================================================================
 // STRUCTURES
 // ============================================================================
 
-/**
- * @brief Snapshot information
- */
+/// @brief Snapshot information
 struct SnapshotInfo {
-    /// @brief Snapshot ID (GUID as string)
-    std::wstring snapshotId;
-    
-    /// @brief Snapshot set ID
-    std::wstring snapshotSetId;
-    
-    /// @brief Volume name (e.g., "C:\")
-    std::wstring volumeName;
-    
-    /// @brief Volume display name
-    std::wstring volumeDisplayName;
-    
-    /// @brief Snapshot device object name
-    std::wstring deviceName;
-    
-    /// @brief Provider ID
-    std::wstring providerId;
-    
-    /// @brief Provider name
-    std::wstring providerName;
-    
-    /// @brief Creation time
+    std::wstring    snapshotId;
+    std::wstring    snapshotSetId;
+    std::wstring    volumeName;
+    std::wstring    deviceName;
     SystemTimePoint creationTime;
-    
-    /// @brief Snapshot type
-    SnapshotType type = SnapshotType::Standard;
-    
-    /// @brief State
-    SnapshotState state = SnapshotState::Unknown;
-    
-    /// @brief Attributes
-    uint32_t attributes = 0;
-    
-    /// @brief Is exposed (mounted)
-    bool isExposed = false;
-    
-    /// @brief Expose path (if mounted)
-    std::wstring exposePath;
-    
-    /**
-     * @brief Serialize to JSON
-     */
+    SnapshotType    type       = SnapshotType::Standard;
+    SnapshotState   state      = SnapshotState::Unknown;
+    uint32_t        attributes = 0;
+    uint64_t        sizeBytes  = 0;
+    bool            isExposed  = false;
+    std::wstring    exposePath;
+
     [[nodiscard]] std::string ToJson() const;
 };
 
-/**
- * @brief Volume information
- */
+/// @brief Volume information
 struct VolumeInfo {
-    /// @brief Volume name (e.g., "\\?\Volume{GUID}\")
     std::wstring volumeName;
-    
-    /// @brief Mount point (e.g., "C:\")
     std::wstring mountPoint;
-    
-    /// @brief File system
     std::wstring fileSystem;
-    
-    /// @brief Volume label
     std::wstring label;
-    
-    /// @brief Total size
-    uint64_t totalSize = 0;
-    
-    /// @brief Free space
-    uint64_t freeSpace = 0;
-    
-    /// @brief Shadow storage max size
-    uint64_t shadowStorageMax = 0;
-    
-    /// @brief Shadow storage used
-    uint64_t shadowStorageUsed = 0;
-    
-    /// @brief Number of snapshots
-    uint32_t snapshotCount = 0;
-    
-    /// @brief VSS supported
-    bool vssSupported = false;
-    
-    /**
-     * @brief Serialize to JSON
-     */
+    uint64_t     totalSize        = 0;
+    uint64_t     freeSpace        = 0;
+    uint64_t     shadowStorageMax = 0;
+    uint64_t     shadowStorageUsed= 0;
+    uint32_t     snapshotCount    = 0;
+    bool         vssSupported     = false;
+
     [[nodiscard]] std::string ToJson() const;
 };
 
-/**
- * @brief Writer information
- */
+/// @brief VSS writer information
 struct WriterInfo {
-    /// @brief Writer ID (GUID)
     std::wstring writerId;
-    
-    /// @brief Writer name
     std::wstring writerName;
-    
-    /// @brief Instance ID
     std::wstring instanceId;
-    
-    /// @brief State
-    uint32_t state = 0;
-    
-    /// @brief Last error
-    uint32_t lastError = 0;
-    
-    /**
-     * @brief Serialize to JSON
-     */
+    WriterState  state     = WriterState::Unknown;
+    HRESULT      lastError = S_OK;
+
     [[nodiscard]] std::string ToJson() const;
 };
 
-/**
- * @brief Snapshot creation options
- */
+/// @brief Active operation tracking
+struct SnapshotOperation {
+    std::wstring    operationId;
+    OperationType   type  = OperationType::Create;
+    OperationState  state = OperationState::Pending;
+    std::wstring    volumeName;
+    std::wstring    snapshotId;
+    uint32_t        progressPercent = 0;
+    TimePoint       startTime;
+    TimePoint       endTime;
+    std::string     errorMessage;
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/// @brief Snapshot creation options
 struct SnapshotOptions {
-    /// @brief Snapshot type
-    SnapshotType type = SnapshotType::Standard;
-    
-    /// @brief Include writers
-    bool includeWriters = true;
-    
-    /// @brief Wait for completion
-    bool waitForCompletion = true;
-    
-    /// @brief Timeout (milliseconds)
-    uint32_t timeoutMs = VSSConstants::SNAPSHOT_TIMEOUT_MS;
-    
-    /// @brief Auto-delete after timeout
-    bool autoDeleteOnTimeout = true;
-    
-    /// @brief Description
+    SnapshotType type            = SnapshotType::Standard;
+    bool         includeWriters  = true;
+    bool         autoCleanup     = false;
+    uint32_t     timeoutMs       = VSSConstants::SNAPSHOT_TIMEOUT_MS;
     std::wstring description;
 };
 
-/**
- * @brief VSS configuration
- */
-struct VolumeSnapshotServiceConfiguration {
-    /// @brief Enable service
-    bool enabled = true;
-    
-    /// @brief Default snapshot type
-    SnapshotType defaultType = SnapshotType::Standard;
-    
-    /// @brief Default timeout (milliseconds)
-    uint32_t defaultTimeoutMs = VSSConstants::SNAPSHOT_TIMEOUT_MS;
-    
-    /// @brief Auto-cleanup old snapshots
-    bool autoCleanup = false;
-    
-    /// @brief Maximum snapshots per volume
-    size_t maxSnapshotsPerVolume = VSSConstants::MAX_SNAPSHOTS_PER_VOLUME;
-    
-    /// @brief Verbose logging
-    bool verboseLogging = false;
-    
-    /**
-     * @brief Validate configuration
-     */
+/// @brief Service configuration
+struct VolumeSnapshotConfiguration {
+    bool     enabled                    = true;
+    uint32_t maxSnapshotsPerVolume      = VSSConstants::MAX_SNAPSHOTS_PER_VOLUME;
+    uint32_t defaultStorageLimitPercent = VSSConstants::DEFAULT_STORAGE_LIMIT_PERCENT;
+    uint32_t monitoringIntervalSeconds = VSSConstants::DEFAULT_MONITORING_INTERVAL_S;
+    bool     enableMonitoring          = true;
+    bool     autoCleanupSnapshots      = false;
+    uint32_t maxSnapshotAgeDays        = VSSConstants::DEFAULT_MAX_SNAPSHOT_AGE_DAYS;
+    bool     monitorWriters            = true;
+    bool     verboseLogging            = false;
+
     [[nodiscard]] bool IsValid() const noexcept;
 };
 
-/**
- * @brief VSS statistics
- */
-struct VSSStatistics {
-    /// @brief Snapshots created
+/// @brief Service statistics
+struct VolumeSnapshotStatistics {
     std::atomic<uint64_t> snapshotsCreated{0};
-    
-    /// @brief Snapshots deleted
     std::atomic<uint64_t> snapshotsDeleted{0};
-    
-    /// @brief Files restored
+    std::atomic<uint64_t> snapshotsMounted{0};
     std::atomic<uint64_t> filesRestored{0};
-    
-    /// @brief Creation failures
-    std::atomic<uint64_t> creationFailures{0};
-    
-    /// @brief Total bytes in snapshots
-    std::atomic<uint64_t> totalSnapshotBytes{0};
-    
-    /// @brief Start time
+    std::atomic<uint64_t> directoriesRestored{0};
+    std::atomic<uint64_t> operationsFailed{0};
+    std::atomic<uint64_t> totalCreationTimeMs{0};
+    std::atomic<uint64_t> totalDeletionTimeMs{0};
+    std::atomic<uint64_t> totalRestorationTimeMs{0};
+    std::atomic<uint64_t> currentOperations{0};
+    std::atomic<uint64_t> emergencySnapshotsCreated{0};
+
+    static constexpr size_t kTypeCount   = 4;
+    static constexpr size_t kResultCount = 19;
+    std::array<std::atomic<uint64_t>, kTypeCount>   byType{};
+    std::array<std::atomic<uint64_t>, kResultCount> byResult{};
+
     TimePoint startTime = Clock::now();
-    
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
@@ -409,10 +325,9 @@ struct VSSStatistics {
 // CALLBACK TYPES
 // ============================================================================
 
-using SnapshotProgressCallback = std::function<void(
-    const std::wstring& volume, uint32_t percentComplete)>;
-using SnapshotCompleteCallback = std::function<void(
-    const SnapshotInfo& snapshot, VSSResult result)>;
+using ProgressCallback   = std::function<void(const std::wstring& operationId, uint32_t percent)>;
+using CompletionCallback = std::function<void(const std::wstring& operationId, VSSResult result)>;
+using ErrorCallback      = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
 // VOLUME SNAPSHOT SERVICE CLASS
@@ -420,195 +335,185 @@ using SnapshotCompleteCallback = std::function<void(
 
 /**
  * @class VolumeSnapshotService
- * @brief Enterprise-grade VSS wrapper for shadow copy management
+ * @brief Enterprise-grade VSS wrapper for shadow copy management.
  *
  * Provides programmatic access to Windows VSS for backup and recovery.
+ * Uses PIMPL pattern for ABI stability and Meyers' Singleton.
  *
- * THREAD SAFETY: All public methods are thread-safe.
+ * THREAD SAFETY: All public methods are thread-safe via std::shared_mutex.
  */
 class VolumeSnapshotService final {
 public:
     // ========================================================================
     // SINGLETON ACCESS
     // ========================================================================
-    
+
     [[nodiscard]] static VolumeSnapshotService& Instance() noexcept;
     [[nodiscard]] static bool HasInstance() noexcept;
-    
-    VolumeSnapshotService(const VolumeSnapshotService&) = delete;
+
+    VolumeSnapshotService(const VolumeSnapshotService&)            = delete;
     VolumeSnapshotService& operator=(const VolumeSnapshotService&) = delete;
-    VolumeSnapshotService(VolumeSnapshotService&&) = delete;
-    VolumeSnapshotService& operator=(VolumeSnapshotService&&) = delete;
+    VolumeSnapshotService(VolumeSnapshotService&&)                 = delete;
+    VolumeSnapshotService& operator=(VolumeSnapshotService&&)      = delete;
 
     // ========================================================================
     // LIFECYCLE MANAGEMENT
     // ========================================================================
-    
-    [[nodiscard]] bool Initialize(const VolumeSnapshotServiceConfiguration& config = {});
+
+    [[nodiscard]] bool Initialize(const VolumeSnapshotConfiguration& config = {});
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
     [[nodiscard]] ModuleStatus GetStatus() const noexcept;
-    
+    [[nodiscard]] bool UpdateConfiguration(const VolumeSnapshotConfiguration& config);
+    [[nodiscard]] VolumeSnapshotConfiguration GetConfiguration() const;
+
     // ========================================================================
     // SNAPSHOT CREATION
     // ========================================================================
-    
-    /**
-     * @brief Create snapshot of a drive
-     */
-    [[nodiscard]] bool CreateSnapshot(const std::wstring& driveLetter);
-    
-    /**
-     * @brief Create snapshot with options
-     */
-    [[nodiscard]] std::optional<std::wstring> CreateSnapshotEx(
-        std::wstring_view volume, const SnapshotOptions& options = {});
-    
-    /**
-     * @brief Create snapshots of multiple volumes
-     */
-    [[nodiscard]] std::vector<std::wstring> CreateSnapshotSet(
-        std::span<const std::wstring> volumes, const SnapshotOptions& options = {});
-    
+
+    [[nodiscard]] VSSResult CreateSnapshot(
+        const std::wstring& volumeName,
+        std::wstring& outSnapshotId,
+        SnapshotType type = SnapshotType::Standard);
+
+    [[nodiscard]] VSSResult CreateSnapshotEx(
+        const std::wstring& volumeName,
+        std::wstring& outSnapshotId,
+        const SnapshotOptions& options = {});
+
+    [[nodiscard]] VSSResult CreateSnapshotSet(
+        const std::vector<std::wstring>& volumes,
+        std::vector<std::wstring>& outSnapshotIds,
+        SnapshotType type = SnapshotType::Standard);
+
+    /// @brief Emergency snapshot triggered by RansomwareDetector.
+    /// Uses reduced timeout, skips writers, notifies ShadowCopyProtector.
+    [[nodiscard]] VSSResult CreateEmergencySnapshot(
+        const std::wstring& volumeName,
+        std::wstring& outSnapshotId);
+
     // ========================================================================
-    // SNAPSHOT MANAGEMENT
+    // SNAPSHOT QUERY
     // ========================================================================
-    
-    /**
-     * @brief Enumerate all snapshots
-     */
-    [[nodiscard]] std::vector<std::wstring> EnumSnapshots();
-    
-    /**
-     * @brief Enumerate with full details
-     */
+
     [[nodiscard]] std::vector<SnapshotInfo> EnumerateSnapshots();
-    
-    /**
-     * @brief Enumerate for specific volume
-     */
     [[nodiscard]] std::vector<SnapshotInfo> EnumerateSnapshotsForVolume(
-        std::wstring_view volume);
-    
-    /**
-     * @brief Get snapshot info
-     */
-    [[nodiscard]] std::optional<SnapshotInfo> GetSnapshot(std::wstring_view snapshotId);
-    
-    /**
-     * @brief Delete snapshot
-     */
-    [[nodiscard]] VSSResult DeleteSnapshot(std::wstring_view snapshotId);
-    
-    /**
-     * @brief Delete all snapshots for volume
-     */
-    [[nodiscard]] size_t DeleteSnapshotsForVolume(std::wstring_view volume);
-    
+        const std::wstring& volumeName);
+    [[nodiscard]] std::optional<SnapshotInfo> GetSnapshotInfo(const std::wstring& snapshotId);
+
+    /// @brief Recovery-point query for RansomwareDecryptor integration.
+    [[nodiscard]] std::vector<SnapshotInfo> GetRecoveryPoints(const std::wstring& volumeName);
+
     // ========================================================================
-    // SNAPSHOT ACCESS
+    // SNAPSHOT DELETION
     // ========================================================================
-    
-    /**
-     * @brief Mount snapshot (expose)
-     */
-    [[nodiscard]] std::optional<std::wstring> MountSnapshot(
-        std::wstring_view snapshotId, std::wstring_view mountPoint);
-    
-    /**
-     * @brief Unmount snapshot
-     */
-    [[nodiscard]] VSSResult UnmountSnapshot(std::wstring_view snapshotId);
-    
-    /**
-     * @brief Get file from snapshot
-     */
-    [[nodiscard]] bool RestoreFile(std::wstring_view snapshotId,
-                                   std::wstring_view relativePath,
-                                   std::wstring_view destinationPath);
-    
-    /**
-     * @brief Get directory from snapshot
-     */
-    [[nodiscard]] bool RestoreDirectory(std::wstring_view snapshotId,
-                                        std::wstring_view relativePath,
-                                        std::wstring_view destinationPath);
-    
+
+    [[nodiscard]] VSSResult DeleteSnapshot(const std::wstring& snapshotId, bool force = false);
+    [[nodiscard]] VSSResult DeleteSnapshotsForVolume(const std::wstring& volumeName);
+    [[nodiscard]] VSSResult DeleteOldestSnapshot(const std::wstring& volumeName);
+    [[nodiscard]] uint32_t  DeleteSnapshotsOlderThan(const SystemTimePoint& cutoffTime);
+
+    // ========================================================================
+    // SNAPSHOT MOUNTING & RESTORATION
+    // ========================================================================
+
+    [[nodiscard]] VSSResult MountSnapshot(
+        const std::wstring& snapshotId,
+        const std::wstring& mountPoint);
+    [[nodiscard]] VSSResult UnmountSnapshot(const std::wstring& snapshotId);
+    [[nodiscard]] bool IsSnapshotMounted(const std::wstring& snapshotId);
+    [[nodiscard]] std::optional<std::wstring> GetMountPoint(const std::wstring& snapshotId);
+
+    [[nodiscard]] VSSResult RestoreFile(
+        const std::wstring& snapshotId,
+        const std::wstring& sourceFile,
+        const std::wstring& destinationFile);
+    [[nodiscard]] VSSResult RestoreDirectory(
+        const std::wstring& snapshotId,
+        const std::wstring& sourceDir,
+        const std::wstring& destinationDir,
+        bool recursive = true);
+    [[nodiscard]] VSSResult RestoreToOriginalLocation(
+        const std::wstring& snapshotId,
+        const std::wstring& filePath);
+
+    // ========================================================================
+    // SNAPSHOT INTEGRITY
+    // ========================================================================
+
+    /// @brief Verify snapshot is accessible and not corrupted.
+    [[nodiscard]] bool VerifySnapshotIntegrity(const std::wstring& snapshotId);
+
     // ========================================================================
     // VOLUME INFORMATION
     // ========================================================================
-    
-    /**
-     * @brief Get volumes supporting VSS
-     */
+
     [[nodiscard]] std::vector<VolumeInfo> GetVSSVolumes();
-    
-    /**
-     * @brief Get volume info
-     */
-    [[nodiscard]] std::optional<VolumeInfo> GetVolumeInfo(std::wstring_view volume);
-    
-    /**
-     * @brief Check if VSS supported
-     */
-    [[nodiscard]] bool IsVSSSupported(std::wstring_view volume);
-    
+    [[nodiscard]] std::optional<VolumeInfo> GetVolumeInfo(const std::wstring& volumeName);
+    [[nodiscard]] bool IsVSSSupported(const std::wstring& volumeName);
+    [[nodiscard]] std::wstring GetVolumeFromPath(const std::wstring& path);
+
     // ========================================================================
     // STORAGE MANAGEMENT
     // ========================================================================
-    
-    /**
-     * @brief Set shadow storage limit
-     */
-    [[nodiscard]] VSSResult SetStorageLimit(std::wstring_view volume,
-                                            uint64_t maxBytes);
-    
-    /**
-     * @brief Set storage limit as percentage
-     */
-    [[nodiscard]] VSSResult SetStorageLimitPercent(std::wstring_view volume,
-                                                   uint32_t percent);
-    
-    /**
-     * @brief Get storage usage
-     */
-    [[nodiscard]] std::pair<uint64_t, uint64_t> GetStorageUsage(
-        std::wstring_view volume);  // (used, max)
-    
+
+    [[nodiscard]] VSSResult SetStorageLimit(const std::wstring& volumeName, uint64_t maxSizeBytes);
+    [[nodiscard]] VSSResult SetStorageLimitPercent(const std::wstring& volumeName, uint32_t percent);
+    [[nodiscard]] std::optional<uint64_t> GetStorageLimit(const std::wstring& volumeName);
+    [[nodiscard]] std::optional<uint64_t> GetStorageUsage(const std::wstring& volumeName);
+    [[nodiscard]] VSSResult CleanupOldSnapshots(const std::wstring& volumeName, uint32_t keepCount);
+
     // ========================================================================
-    // WRITER INFORMATION
+    // WRITER MANAGEMENT
     // ========================================================================
-    
-    /**
-     * @brief Get VSS writers
-     */
+
     [[nodiscard]] std::vector<WriterInfo> GetWriters();
-    
+    [[nodiscard]] bool AreWritersStable();
+    [[nodiscard]] VSSResult WaitForWriters(uint32_t timeoutMs = 30000);
+
+    // ========================================================================
+    // OPERATION TRACKING
+    // ========================================================================
+
+    [[nodiscard]] std::vector<SnapshotOperation> GetActiveOperations();
+    [[nodiscard]] std::optional<SnapshotOperation> GetOperation(const std::wstring& operationId);
+    [[nodiscard]] bool CancelOperation(const std::wstring& operationId);
+
+    // ========================================================================
+    // MONITORING
+    // ========================================================================
+
+    [[nodiscard]] bool StartMonitoring();
+    void StopMonitoring();
+    [[nodiscard]] bool IsMonitoring() const noexcept;
+
     // ========================================================================
     // CALLBACKS
     // ========================================================================
-    
-    void SetProgressCallback(SnapshotProgressCallback callback);
-    void SetCompleteCallback(SnapshotCompleteCallback callback);
-    
+
+    void RegisterProgressCallback(ProgressCallback callback);
+    void RegisterCompletionCallback(CompletionCallback callback);
+    void RegisterErrorCallback(ErrorCallback callback);
+    void UnregisterCallbacks();
+
     // ========================================================================
     // STATISTICS
     // ========================================================================
-    
-    [[nodiscard]] VSSStatistics GetStatistics() const;
+
+    [[nodiscard]] VolumeSnapshotStatistics GetStatistics() const;
     void ResetStatistics();
-    
+
     // ========================================================================
     // UTILITY
     // ========================================================================
-    
+
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
 
 private:
     VolumeSnapshotService();
     ~VolumeSnapshotService();
-    
+
     std::unique_ptr<VolumeSnapshotServiceImpl> m_impl;
     static std::atomic<bool> s_instanceCreated;
 };
@@ -620,16 +525,20 @@ private:
 [[nodiscard]] std::string_view GetSnapshotTypeName(SnapshotType type) noexcept;
 [[nodiscard]] std::string_view GetSnapshotStateName(SnapshotState state) noexcept;
 [[nodiscard]] std::string_view GetVSSResultName(VSSResult result) noexcept;
+[[nodiscard]] std::string_view GetWriterStateName(WriterState state) noexcept;
 
 }  // namespace Ransomware
 }  // namespace ShadowStrike
 
 // ============================================================================
-// MACROS
+// CONVENIENCE MACROS
 // ============================================================================
 
-#define SS_CREATE_SNAPSHOT(drive) \
-    ::ShadowStrike::Ransomware::VolumeSnapshotService::Instance().CreateSnapshot(drive)
+#define SS_VSS_CREATE_SNAPSHOT(volume, outId) \
+    ::ShadowStrike::Ransomware::VolumeSnapshotService::Instance().CreateSnapshot((volume), (outId))
 
-#define SS_ENUM_SNAPSHOTS() \
-    ::ShadowStrike::Ransomware::VolumeSnapshotService::Instance().EnumSnapshots()
+#define SS_VSS_EMERGENCY_SNAPSHOT(volume, outId) \
+    ::ShadowStrike::Ransomware::VolumeSnapshotService::Instance().CreateEmergencySnapshot((volume), (outId))
+
+#define SS_VSS_ENUM_SNAPSHOTS() \
+    ::ShadowStrike::Ransomware::VolumeSnapshotService::Instance().EnumerateSnapshots()
