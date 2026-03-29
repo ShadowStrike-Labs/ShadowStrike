@@ -25,8 +25,7 @@
  *        providing bidirectional malware scanning and bypass detection.
  *
  * This implementation provides comprehensive AMSI capabilities for enterprise
- * endpoint protection, competing with enterprise-grade enterprise-grade, enterprise-grade, and
- * enterprise-grade's script scanning engines.
+ * endpoint protection with bidirectional scanning and bypass detection.
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0
@@ -61,6 +60,7 @@
 #include <thread>
 #include <condition_variable>
 #include <cwctype>
+#include <unordered_set>
 
 // ============================================================================
 // SHADOWSTRIKE INFRASTRUCTURE
@@ -105,7 +105,7 @@ constexpr std::array<uint8_t, 8> AMSI_SCAN_BUFFER_PROLOGUE_WIN11 = {
 
 // Common bypass patterns to detect
 constexpr std::array<uint8_t, 3> BYPASS_PATTERN_RET = { 0xC3, 0x00, 0x00 };           // ret
-constexpr std::array<uint8_t, 6> BYPASS_PATTERN_XOR_EAX = { 0x31, 0xC0, 0xC3 };       // xor eax, eax; ret
+constexpr std::array<uint8_t, 3> BYPASS_PATTERN_XOR_EAX = { 0x31, 0xC0, 0xC3 };       // xor eax, eax; ret
 constexpr std::array<uint8_t, 5> BYPASS_PATTERN_MOV_EAX = { 0xB8, 0x57, 0x00, 0x07, 0x80 }; // mov eax, 0x80070057
 
 // Generate unique event ID
@@ -161,22 +161,6 @@ constexpr std::array<uint8_t, 5> BYPASS_PATTERN_MOV_EAX = { 0xB8, 0x57, 0x00, 0x
     return oss.str();
 }
 
-// Convert wide string to narrow string (UTF-8)
-[[nodiscard]] std::string WideToUtf8(const std::wstring& wide) {
-    if (wide.empty()) return {};
-
-    int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(),
-                                    static_cast<int>(wide.size()),
-                                    nullptr, 0, nullptr, nullptr);
-    if (size <= 0) return {};
-
-    std::string result(static_cast<size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(),
-                        static_cast<int>(wide.size()),
-                        result.data(), size, nullptr, nullptr);
-    return result;
-}
-
 // Convert bytes to hex string
 [[nodiscard]] std::string BytesToHex(const std::vector<uint8_t>& bytes) {
     std::ostringstream oss;
@@ -199,7 +183,7 @@ constexpr std::array<uint8_t, 5> BYPASS_PATTERN_MOV_EAX = { 0xB8, 0x57, 0x00, 0x
     oss << "\"sessionId\":" << sessionId << ",";
     oss << "\"sessionHandle\":" << sessionHandle << ",";
     oss << "\"processId\":" << processId << ",";
-    oss << "\"applicationName\":\"" << EscapeJsonString(WideToUtf8(applicationName)) << "\",";
+    oss << "\"applicationName\":\"" << EscapeJsonString(Utils::StringUtils::ToNarrow(applicationName)) << "\",";
     oss << "\"contentType\":" << static_cast<int>(contentType) << ",";
     oss << "\"scanCount\":" << scanCount << ",";
     oss << "\"detectionCount\":" << detectionCount << ",";
@@ -236,8 +220,8 @@ constexpr std::array<uint8_t, 5> BYPASS_PATTERN_MOV_EAX = { 0xB8, 0x57, 0x00, 0x
     oss << "\"eventId\":\"" << EscapeJsonString(eventId) << "\",";
     oss << "\"processId\":" << processId << ",";
     oss << "\"threadId\":" << threadId << ",";
-    oss << "\"processName\":\"" << EscapeJsonString(WideToUtf8(processName)) << "\",";
-    oss << "\"processPath\":\"" << EscapeJsonString(WideToUtf8(processPath)) << "\",";
+    oss << "\"processName\":\"" << EscapeJsonString(Utils::StringUtils::ToNarrow(processName)) << "\",";
+    oss << "\"processPath\":\"" << EscapeJsonString(Utils::StringUtils::ToNarrow(processPath)) << "\",";
     oss << "\"techniques\":" << static_cast<uint32_t>(techniques) << ",";
     oss << "\"targetFunction\":\"" << EscapeJsonString(targetFunction) << "\",";
     oss << "\"targetAddress\":" << targetAddress << ",";
@@ -389,6 +373,7 @@ void AMSIStatistics::Reset() noexcept {
 }
 
 [[nodiscard]] bool IsAmsiResultMalicious(AmsiResult result) noexcept {
+    if (result == AmsiResult::Unknown) return false;
     uint32_t value = static_cast<uint32_t>(result);
     return value >= static_cast<uint32_t>(AmsiResult::Detected);
 }
@@ -542,7 +527,7 @@ public:
         // Write AMSI provider registry key under
         // HKLM\SOFTWARE\Microsoft\AMSI\Providers\{our-GUID}
         // so Windows loads our provider DLL into AMSI-aware processes.
-        HKEY hProviderKey = nullptr;
+        HKEY hRawKey = nullptr;
         std::wstring registryPath = L"SOFTWARE\\Microsoft\\AMSI\\Providers\\";
         registryPath += AMSIConstants::PROVIDER_GUID;
 
@@ -553,7 +538,7 @@ public:
             REG_OPTION_NON_VOLATILE,
             KEY_SET_VALUE | KEY_WOW64_64KEY,
             nullptr,
-            &hProviderKey,
+            &hRawKey,
             nullptr);
 
         if (regResult != ERROR_SUCCESS) {
@@ -563,12 +548,21 @@ public:
             return false;
         }
 
+        // RAII guard: ensure the key is closed on all exit paths
+        auto keyGuard = std::unique_ptr<
+            std::remove_pointer_t<HKEY>, decltype(&RegCloseKey)>(hRawKey, &RegCloseKey);
+
         std::wstring providerName(AMSIConstants::PROVIDER_NAME);
-        RegSetValueExW(hProviderKey, nullptr, 0, REG_SZ,
+        LONG setResult = RegSetValueExW(hRawKey, nullptr, 0, REG_SZ,
             reinterpret_cast<const BYTE*>(providerName.c_str()),
             static_cast<DWORD>((providerName.size() + 1) * sizeof(wchar_t)));
 
-        RegCloseKey(hProviderKey);
+        if (setResult != ERROR_SUCCESS) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"Failed to set AMSI provider value: %lu", setResult);
+            m_providerStatus = ProviderStatus::Failed;
+            return false;
+        }
 
         m_registrationVerifiedTime = Clock::now();
         m_providerStatus = ProviderStatus::Registered;
@@ -616,6 +610,19 @@ public:
         AmsiScanResponse response;
         response.timestamp = GetCurrentSystemTime();
 
+        if (m_status.load(std::memory_order_acquire) != ModuleStatus::Running) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"AMSI not initialized, scan rejected");
+            response.result = AmsiResult::Unknown;
+            InvokeErrorCallback("AMSI module not initialized", E_NOT_VALID_STATE);
+            return response;
+        }
+
+        // Snapshot config under lock for thread-safe access
+        const size_t maxContentSize = [&] {
+            std::shared_lock lock(m_mutex);
+            return m_config.maxContentSize;
+        }();
+
         auto startTime = Clock::now();
 
         // Validate request
@@ -625,7 +632,7 @@ public:
             return response;
         }
 
-        if (request.content.size() > m_config.maxContentSize) {
+        if (request.content.size() > maxContentSize) {
             SS_LOG_WARN(LOG_CATEGORY, L"Content too large: %zu bytes",
                         request.content.size());
             response.result = AmsiResult::Unknown;
@@ -751,8 +758,13 @@ public:
         std::wstring_view contentName,
         AmsiContentType type) {
 
+        if (m_status.load(std::memory_order_acquire) != ModuleStatus::Running) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"AMSI not initialized for string scan");
+            return AmsiResult::Unknown;
+        }
+
         // Convert wide string to UTF-8 bytes
-        std::string utf8Content = WideToUtf8(std::wstring(content));
+        std::string utf8Content = Utils::StringUtils::ToNarrow(content);
 
         AmsiScanRequest request;
         request.content = std::span<const uint8_t>(
@@ -770,18 +782,34 @@ public:
         std::span<const uint8_t> buffer,
         std::wstring_view contentName) {
 
-        // Direct scan using system AMSI without custom provider logic
+        if (m_status.load(std::memory_order_acquire) != ModuleStatus::Running) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"AMSI not initialized for system scan");
+            return AmsiResult::Unknown;
+        }
+
         if (m_amsiContext == nullptr) {
             SS_LOG_ERROR(LOG_CATEGORY, L"AMSI context not initialized");
             return AmsiResult::Unknown;
         }
 
+        if (buffer.empty()) {
+            return AmsiResult::Clean;
+        }
+
+        if (buffer.size() > static_cast<size_t>(MAXULONG)) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"Content size %zu exceeds ULONG maximum for system AMSI scan",
+                buffer.size());
+            return AmsiResult::Unknown;
+        }
+
+        std::wstring nameStorage(contentName);
         AMSI_RESULT result = AMSI_RESULT_NOT_DETECTED;
         HRESULT hr = AmsiScanBuffer(
             m_amsiContext,
             const_cast<void*>(static_cast<const void*>(buffer.data())),
             static_cast<ULONG>(buffer.size()),
-            std::wstring(contentName).c_str(),
+            nameStorage.c_str(),
             nullptr,
             &result
         );
@@ -801,6 +829,11 @@ public:
     [[nodiscard]] uint64_t OpenSession(
         std::wstring_view applicationName,
         uint32_t processId) {
+
+        if (m_status.load(std::memory_order_acquire) != ModuleStatus::Running) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"AMSI not initialized, cannot open session");
+            return 0;
+        }
 
         std::unique_lock lock(m_mutex);
 
@@ -939,13 +972,15 @@ public:
             event.processPath = processPath;
             event.processName = std::filesystem::path(processPath).filename().wstring();
 
-            // Store event
+            // Store event and update bypass tracking maps
             {
                 std::unique_lock lock(m_mutex);
                 m_recentBypassEvents.push_back(event);
                 if (m_recentBypassEvents.size() > 1000) {
                     m_recentBypassEvents.erase(m_recentBypassEvents.begin());
                 }
+                m_bypassDetectedProcesses.insert(processId);
+                m_detectedBypassTechniques[processId] = report.detectedBypasses;
             }
 
             InvokeBypassCallback(event);
@@ -973,34 +1008,52 @@ public:
     [[nodiscard]] bool RepairIntegrity(uint32_t processId) {
         SS_LOG_INFO(LOG_CATEGORY, L"Attempting AMSI repair for process %u", processId);
 
-        // Note: Full repair requires reloading amsi.dll or restoring bytes
-        // from disk. This is a simplified implementation that demonstrates
-        // the repair flow.
-
-        bool success = false;
-
-        // Try to restore function prologues
         HMODULE hAmsi = GetModuleHandleW(L"amsi.dll");
         if (hAmsi == nullptr) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Cannot repair: amsi.dll not loaded");
             return false;
         }
 
-        // Get function addresses
-        auto pAmsiScanBuffer = GetProcAddress(hAmsi, "AmsiScanBuffer");
-        if (pAmsiScanBuffer != nullptr) {
-            success = RestoreFunctionPrologue("AmsiScanBuffer",
-                reinterpret_cast<uint64_t>(pAmsiScanBuffer));
+        bool anyRepaired = false;
+
+        // Restore all critical AMSI function prologues
+        static constexpr const char* kFunctions[] = {
+            "AmsiScanBuffer", "AmsiInitialize", "AmsiOpenSession"
+        };
+
+        for (const char* funcName : kFunctions) {
+            auto pFunc = GetProcAddress(hAmsi, funcName);
+            if (pFunc == nullptr) continue;
+
+            // Check if this function is actually tampered before repairing
+            std::shared_lock readLock(m_mutex);
+            auto it = m_expectedPrologues.find(funcName);
+            if (it == m_expectedPrologues.end()) continue;
+
+            std::vector<uint8_t> currentPrologue(it->second.size());
+            memcpy(currentPrologue.data(), pFunc, currentPrologue.size());
+
+            if (currentPrologue == it->second) continue;  // Already intact
+            readLock.unlock();
+
+            if (RestoreFunctionPrologue(funcName,
+                    reinterpret_cast<uint64_t>(pFunc))) {
+                anyRepaired = true;
+                SS_LOG_INFO(LOG_CATEGORY, L"Restored %hs prologue", funcName);
+            } else {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to restore %hs prologue", funcName);
+            }
         }
 
-        if (success) {
+        if (anyRepaired) {
             m_stats.bypassesRepaired.fetch_add(1, std::memory_order_relaxed);
             SS_LOG_INFO(LOG_CATEGORY, L"AMSI repair successful for process %u", processId);
         } else {
-            SS_LOG_ERROR(LOG_CATEGORY, L"AMSI repair failed for process %u", processId);
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"AMSI repair: no functions needed repair for process %u", processId);
         }
 
-        return success;
+        return anyRepaired;
     }
 
     [[nodiscard]] bool RepairIntegrity() {
@@ -1185,13 +1238,12 @@ private:
     }
 
     [[nodiscard]] bool CaptureExpectedPrologues() {
+        // amsi.dll should already be loaded by AmsiInitialize.
+        // Using GetModuleHandleW avoids incrementing the DLL reference count.
         HMODULE hAmsi = GetModuleHandleW(L"amsi.dll");
         if (hAmsi == nullptr) {
-            // Try to load it
-            hAmsi = LoadLibraryW(L"amsi.dll");
-            if (hAmsi == nullptr) {
-                return false;
-            }
+            SS_LOG_WARN(LOG_CATEGORY, L"amsi.dll not loaded; cannot capture prologues");
+            return false;
         }
 
         // Capture AmsiScanBuffer prologue
@@ -1253,19 +1305,37 @@ private:
     [[nodiscard]] bool IsCommonBypassPattern(const std::vector<uint8_t>& prologue) const {
         if (prologue.empty()) return false;
 
-        // Check for RET as first instruction
+        // Check for RET as first instruction (simplest bypass)
         if (prologue[0] == 0xC3) return true;
 
-        // Check for XOR EAX, EAX; RET
+        // Check for NOP; RET
+        if (prologue.size() >= 2 &&
+            prologue[0] == 0x90 && prologue[1] == 0xC3) {
+            return true;
+        }
+
+        // Check for XOR EAX, EAX; RET (force S_OK / clean result)
         if (prologue.size() >= 3 &&
             prologue[0] == 0x31 && prologue[1] == 0xC0 && prologue[2] == 0xC3) {
             return true;
         }
 
-        // Check for MOV EAX, <error>; RET
+        // Check for MOV EAX, <imm32>; RET (force specific HRESULT)
         if (prologue.size() >= 6 && prologue[0] == 0xB8 && prologue[5] == 0xC3) {
             return true;
         }
+
+        // Check for JMP rel32 (inline hook / trampoline)
+        if (prologue[0] == 0xE9) return true;
+
+        // Check for JMP [rip+disp32] (FF 25 xx xx xx xx) — IAT-style hook
+        if (prologue.size() >= 6 &&
+            prologue[0] == 0xFF && prologue[1] == 0x25) {
+            return true;
+        }
+
+        // Check for INT3 (breakpoint, possible anti-debug sabotage)
+        if (prologue[0] == 0xCC) return true;
 
         return false;
     }
@@ -1279,25 +1349,17 @@ private:
             if (fs.isIntact) continue;
 
             if (fs.functionName == "AmsiScanBuffer") {
-                techniques = static_cast<AmsiBypassTechnique>(
-                    static_cast<uint32_t>(techniques) |
-                    static_cast<uint32_t>(AmsiBypassTechnique::AmsiScanBufferPatch));
+                techniques |= AmsiBypassTechnique::AmsiScanBufferPatch;
             } else if (fs.functionName == "AmsiInitialize") {
-                techniques = static_cast<AmsiBypassTechnique>(
-                    static_cast<uint32_t>(techniques) |
-                    static_cast<uint32_t>(AmsiBypassTechnique::AmsiInitializePatch));
+                techniques |= AmsiBypassTechnique::AmsiInitializePatch;
             } else if (fs.functionName == "AmsiOpenSession") {
-                techniques = static_cast<AmsiBypassTechnique>(
-                    static_cast<uint32_t>(techniques) |
-                    static_cast<uint32_t>(AmsiBypassTechnique::AmsiOpenSessionPatch));
+                techniques |= AmsiBypassTechnique::AmsiOpenSessionPatch;
             }
 
-            // Check for inline hooking pattern
+            // Check for inline hooking pattern (JMP rel32 or JMP [rip+disp32])
             if (!fs.currentPrologue.empty() &&
                 (fs.currentPrologue[0] == 0xE9 || fs.currentPrologue[0] == 0xFF)) {
-                techniques = static_cast<AmsiBypassTechnique>(
-                    static_cast<uint32_t>(techniques) |
-                    static_cast<uint32_t>(AmsiBypassTechnique::InlineHooking));
+                techniques |= AmsiBypassTechnique::InlineHooking;
             }
         }
 
@@ -1335,6 +1397,57 @@ private:
         return true;
     }
 
+    void DispatchToSubScanner(const AmsiScanRequest& request,
+                              AmsiScanResponse& response) {
+        // Only dispatch PowerShell content to the PowerShellScanner sub-engine
+        if (request.contentType != AmsiContentType::PowerShell &&
+            request.contentType != AmsiContentType::Unknown) {
+            return;
+        }
+
+        try {
+            auto& psScanner = PowerShellScanner::getInstance();
+            std::string contentDesc = Utils::StringUtils::ToNarrow(request.contentName);
+
+            auto psResult = psScanner.scanMemory(
+                std::span<const char>(
+                    reinterpret_cast<const char*>(request.content.data()),
+                    request.content.size()),
+                contentDesc,
+                request.processId);
+
+            // Merge PowerShellScanner results into the AMSI response.
+            // Escalate severity: if PS scanner finds malicious/suspicious content
+            // that the system AMSI providers missed, elevate the result.
+            if (psResult.status == ScanStatus::MALICIOUS) {
+                if (!response.isMalicious) {
+                    m_stats.maliciousDetected.fetch_add(1, std::memory_order_relaxed);
+                }
+                response.isMalicious = true;
+                response.result = AmsiResult::Detected;
+                if (response.riskScore < static_cast<double>(psResult.riskScore)) {
+                    response.riskScore = static_cast<double>(psResult.riskScore);
+                }
+                if (!psResult.threatName.empty()) {
+                    response.threatName = psResult.threatName;
+                }
+            } else if (psResult.status == ScanStatus::SUSPICIOUS &&
+                       !response.isMalicious) {
+                if (response.riskScore < static_cast<double>(psResult.riskScore)) {
+                    response.riskScore = static_cast<double>(psResult.riskScore);
+                }
+            }
+
+            // Merge matched rules as signatures
+            for (const auto& rule : psResult.matchedRules) {
+                response.matchedSignatures.push_back(rule);
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"PowerShellScanner dispatch failed: %hs", e.what());
+        }
+    }
+
     void IntegrityMonitorLoop() {
         SS_LOG_INFO(LOG_CATEGORY, L"Integrity monitor thread started");
 
@@ -1361,8 +1474,13 @@ private:
 
             for (uint32_t pid : processesToCheck) {
                 if (!m_integrityMonitorRunning) break;
-                // Note: Cross-process integrity checking requires additional
-                // privileges and memory reading capabilities
+                if (pid == GetCurrentProcessId()) {
+                    continue;  // Already checked above
+                }
+                // Cross-process AMSI integrity requires ReadProcessMemory into the target.
+                // Only in-process (our own PID) checking is currently supported.
+                SS_LOG_TRACE(LOG_CATEGORY,
+                    L"Cross-process integrity check for PID %u deferred (requires injection)", pid);
             }
         }
 
@@ -1435,6 +1553,9 @@ private:
     // Session management
     std::unordered_map<uint64_t, AmsiSessionInfo> m_sessions;
     uint64_t m_nextSessionId = 1;
+
+    // Provider registration
+    TimePoint m_registrationVerifiedTime{};
 
     // Expected function prologues (for integrity checking)
     std::unordered_map<std::string, std::vector<uint8_t>> m_expectedPrologues;
@@ -1640,12 +1761,14 @@ void AMSIIntegration::ResetStatistics() {
 }
 
 [[nodiscard]] std::string AMSIIntegration::GetVersionString() noexcept {
-    std::ostringstream oss;
-    oss << "ShadowStrike AMSIIntegration v"
-        << AMSIConstants::VERSION_MAJOR << "."
-        << AMSIConstants::VERSION_MINOR << "."
-        << AMSIConstants::VERSION_PATCH;
-    return oss.str();
+    try {
+        return "ShadowStrike AMSIIntegration v"
+            + std::to_string(AMSIConstants::VERSION_MAJOR) + "."
+            + std::to_string(AMSIConstants::VERSION_MINOR) + "."
+            + std::to_string(AMSIConstants::VERSION_PATCH);
+    } catch (...) {
+        return "ShadowStrike AMSIIntegration v?.?.?";
+    }
 }
 
 }  // namespace Scripts

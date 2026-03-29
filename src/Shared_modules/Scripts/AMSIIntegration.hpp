@@ -240,6 +240,20 @@ enum class AmsiBypassTechnique : uint32_t {
     ForceError                  = 1 << 14   ///< Force AMSI initialization error
 };
 
+/// Bitwise OR for AmsiBypassTechnique bitmask
+[[nodiscard]] inline constexpr AmsiBypassTechnique operator|(AmsiBypassTechnique a, AmsiBypassTechnique b) noexcept {
+    return static_cast<AmsiBypassTechnique>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+/// Bitwise AND for AmsiBypassTechnique bitmask
+[[nodiscard]] inline constexpr AmsiBypassTechnique operator&(AmsiBypassTechnique a, AmsiBypassTechnique b) noexcept {
+    return static_cast<AmsiBypassTechnique>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+/// Bitwise OR-assign for AmsiBypassTechnique bitmask
+inline constexpr AmsiBypassTechnique& operator|=(AmsiBypassTechnique& a, AmsiBypassTechnique b) noexcept {
+    a = a | b;
+    return a;
+}
+
 /**
  * @brief Integrity status
  */
