@@ -48,6 +48,7 @@
  * ============================================================================
  */
 
+#include "pch.h"
 #include "MacroDetector.hpp"
 
 // Standard library includes
@@ -80,16 +81,18 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
 
 [[nodiscard]] std::string_view GetMacroTypeName(MacroType type) noexcept {
     switch (type) {
-        case MacroType::VBALegacy:    return "VBA Legacy (OLE)";
-        case MacroType::VBAModern:    return "VBA Modern (OpenXML)";
-        case MacroType::Excel4XLM:    return "Excel 4.0 XLM";
-        case MacroType::DDE:          return "Dynamic Data Exchange";
-        case MacroType::SLK:          return "Symbolic Link";
-        case MacroType::RTF_OLE:      return "RTF with OLE";
-        case MacroType::Publisher:    return "Publisher Macro";
-        case MacroType::Visio:        return "Visio Macro";
-        case MacroType::OpenDocument: return "OpenDocument Macro";
-        default:                      return "Unknown";
+        case MacroType::VBALegacy:          return "VBA Legacy (OLE)";
+        case MacroType::VBAModern:          return "VBA Modern (OpenXML)";
+        case MacroType::Excel4XLM:          return "Excel 4.0 XLM";
+        case MacroType::DDE:                return "Dynamic Data Exchange";
+        case MacroType::SLK:                return "Symbolic Link";
+        case MacroType::RTF_OLE:            return "RTF with OLE";
+        case MacroType::Publisher:          return "Publisher Macro";
+        case MacroType::Visio:              return "Visio Macro";
+        case MacroType::OpenDocument:       return "OpenDocument Macro";
+        case MacroType::XLLAddin:           return "XLL Add-in (Native DLL)";
+        case MacroType::TemplateInjection:  return "Remote Template Injection";
+        default:                            return "Unknown";
     }
 }
 
@@ -111,6 +114,7 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
         case DocumentFormat::MHT:  return ".mht (MHTML)";
         case DocumentFormat::PUB:  return ".pub (Publisher)";
         case DocumentFormat::VSD:  return ".vsd (Visio)";
+        case DocumentFormat::XLL:  return ".xll (Excel Add-in)";
         default:                   return "Unknown Format";
     }
 }
@@ -185,9 +189,10 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
 // ============================================================================
 
 [[nodiscard]] std::string VBAModuleInfo::ToJson() const {
+    auto esc = MacroDetectorImpl::JsonEscape;
     std::ostringstream oss;
     oss << "{";
-    oss << "\"moduleName\":\"" << moduleName << "\",";
+    oss << "\"moduleName\":\"" << esc(moduleName) << "\",";
     oss << "\"type\":\"" << GetVBAModuleTypeName(type) << "\",";
     oss << "\"sourceSize\":" << sourceSize << ",";
     oss << "\"lineCount\":" << lineCount << ",";
@@ -201,14 +206,14 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
     oss << "\"autoExecFunctions\":[";
     for (size_t i = 0; i < autoExecFunctions.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << autoExecFunctions[i] << "\"";
+        oss << "\"" << esc(autoExecFunctions[i]) << "\"";
     }
     oss << "],";
 
     oss << "\"suspiciousAPIs\":[";
     for (size_t i = 0; i < suspiciousAPIs.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << suspiciousAPIs[i] << "\"";
+        oss << "\"" << esc(suspiciousAPIs[i]) << "\"";
     }
     oss << "]";
 
@@ -217,11 +222,12 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
 }
 
 [[nodiscard]] std::string VBAProjectInfo::ToJson() const {
+    auto esc = MacroDetectorImpl::JsonEscape;
     std::ostringstream oss;
     oss << "{";
-    oss << "\"projectName\":\"" << projectName << "\",";
+    oss << "\"projectName\":\"" << esc(projectName) << "\",";
     oss << "\"isProtected\":" << (isProtected ? "true" : "false") << ",";
-    oss << "\"protectionType\":\"" << protectionType << "\",";
+    oss << "\"protectionType\":\"" << esc(protectionType) << "\",";
     oss << "\"moduleCount\":" << moduleCount << ",";
     oss << "\"totalSourceSize\":" << totalSourceSize << ",";
     oss << "\"hasPCodeOnly\":" << (hasPCodeOnly ? "true" : "false") << ",";
@@ -236,14 +242,14 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
     oss << "\"references\":[";
     for (size_t i = 0; i < references.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << references[i] << "\"";
+        oss << "\"" << esc(references[i]) << "\"";
     }
     oss << "],";
 
     oss << "\"userForms\":[";
     for (size_t i = 0; i < userForms.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << userForms[i] << "\"";
+        oss << "\"" << esc(userForms[i]) << "\"";
     }
     oss << "]";
 
@@ -252,9 +258,10 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
 }
 
 [[nodiscard]] std::string XLMMacroInfo::ToJson() const {
+    auto esc = MacroDetectorImpl::JsonEscape;
     std::ostringstream oss;
     oss << "{";
-    oss << "\"sheetName\":\"" << sheetName << "\",";
+    oss << "\"sheetName\":\"" << esc(sheetName) << "\",";
     oss << "\"isHidden\":" << (isHidden ? "true" : "false") << ",";
     oss << "\"isVeryHidden\":" << (isVeryHidden ? "true" : "false") << ",";
     oss << "\"hasAutoOpen\":" << (hasAutoOpen ? "true" : "false") << ",";
@@ -262,28 +269,28 @@ std::atomic<bool> MacroDetector::s_instanceCreated{false};
     oss << "\"formulas\":[";
     for (size_t i = 0; i < formulas.size() && i < 100; ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << formulas[i] << "\"";
+        oss << "\"" << esc(formulas[i]) << "\"";
     }
     oss << "],";
 
     oss << "\"execCalls\":[";
     for (size_t i = 0; i < execCalls.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << execCalls[i] << "\"";
+        oss << "\"" << esc(execCalls[i]) << "\"";
     }
     oss << "],";
 
     oss << "\"callFunctions\":[";
     for (size_t i = 0; i < callFunctions.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << callFunctions[i] << "\"";
+        oss << "\"" << esc(callFunctions[i]) << "\"";
     }
     oss << "],";
 
     oss << "\"externalLinks\":[";
     for (size_t i = 0; i < externalLinks.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << externalLinks[i] << "\"";
+        oss << "\"" << esc(externalLinks[i]) << "\"";
     }
     oss << "]";
 
@@ -442,6 +449,8 @@ public:
                                                 const std::string& fileName);
     [[nodiscard]] bool HasMacros(const std::filesystem::path& path);
     [[nodiscard]] bool HasAutoExecMacros(const std::filesystem::path& path);
+    [[nodiscard]] MacroScanResult AnalyzeMacros(const std::filesystem::path& path);
+    [[nodiscard]] MacroScanResult ScanVBAContent(std::string_view vbaContent);
 
     // Extraction
     [[nodiscard]] std::string ExtractVBA(const std::filesystem::path& path);
@@ -451,9 +460,10 @@ public:
 
     // Analysis
     [[nodiscard]] DocumentFormat DetectFormat(const std::filesystem::path& path);
-    [[nodiscard]] DocumentFormat DetectFormat(std::span<const uint8_t> content);
+    [[nodiscard]] DocumentFormat DetectFormat(std::span<const uint8_t> content,
+                                              const std::string& fileName = "");
     [[nodiscard]] MacroScanResult AnalyzeVBA(const std::string& vbaCode);
-    [[nodiscard]] std::string Deobfuscate(const std::string& code);
+    [[nodiscard]] std::string Deobfuscate(const std::string& code, size_t depth = 0);
     [[nodiscard]] std::vector<std::string> ExtractIOCs(const std::string& code);
 
     // Callbacks
@@ -489,9 +499,29 @@ private:
 
     [[nodiscard]] bool IsPasswordProtected(std::span<const uint8_t> content);
     [[nodiscard]] bool ValidateDocumentStructure(std::span<const uint8_t> content);
+    [[nodiscard]] bool DetectTemplateInjection(std::span<const uint8_t> content,
+                                                std::vector<TemplateInjectionInfo>& outInjections);
+    [[nodiscard]] bool DetectXLLAddin(std::span<const uint8_t> content, XLLInfo& outXLL);
+    [[nodiscard]] std::string ExtractAllMacroContentFromMemory(
+        std::span<const uint8_t> content, const std::string& fileName);
 
     void NotifyCallback(const MacroScanResult& result);
     void NotifyError(const std::string& message, int code);
+
+    // ========================================================================
+    // SAFE BINARY CONTENT SEARCHING (bounds-checked, no full string copy)
+    // ========================================================================
+
+    [[nodiscard]] static bool BinaryContains(std::span<const uint8_t> data,
+                                              std::string_view needle) noexcept;
+    [[nodiscard]] static size_t BinaryFind(std::span<const uint8_t> data,
+                                            std::string_view needle,
+                                            size_t startPos = 0) noexcept;
+    [[nodiscard]] static uint16_t SafeReadU16LE(std::span<const uint8_t> data,
+                                                 size_t offset) noexcept;
+    [[nodiscard]] static uint32_t SafeReadU32LE(std::span<const uint8_t> data,
+                                                 size_t offset) noexcept;
+    [[nodiscard]] static std::string JsonEscape(std::string_view input);
 
     // ========================================================================
     // OLE COMPOUND DOCUMENT PARSING
@@ -610,6 +640,72 @@ const std::vector<std::string> MacroDetectorImpl::s_persistenceIndicators = {
     "CurrentVersion\\Run", "Startup", "ScheduledTasks", "schtasks",
     "RegWrite", "CreateShortcut", "HKCU\\Software\\Microsoft\\Windows"
 };
+
+// ============================================================================
+// SAFE BINARY UTILITIES
+// ============================================================================
+
+[[nodiscard]] bool MacroDetectorImpl::BinaryContains(
+    std::span<const uint8_t> data, std::string_view needle) noexcept {
+    return BinaryFind(data, needle) != std::string::npos;
+}
+
+[[nodiscard]] size_t MacroDetectorImpl::BinaryFind(
+    std::span<const uint8_t> data, std::string_view needle, size_t startPos) noexcept {
+    if (needle.empty() || data.size() < needle.size() || startPos > data.size() - needle.size()) {
+        return std::string::npos;
+    }
+    auto needleBytes = reinterpret_cast<const uint8_t*>(needle.data());
+    auto it = std::search(data.begin() + startPos, data.end(),
+                          needleBytes, needleBytes + needle.size());
+    if (it == data.end()) {
+        return std::string::npos;
+    }
+    return static_cast<size_t>(it - data.begin());
+}
+
+[[nodiscard]] uint16_t MacroDetectorImpl::SafeReadU16LE(
+    std::span<const uint8_t> data, size_t offset) noexcept {
+    if (offset + 2 > data.size()) return 0;
+    uint16_t val = 0;
+    std::memcpy(&val, data.data() + offset, sizeof(val));
+    return val;
+}
+
+[[nodiscard]] uint32_t MacroDetectorImpl::SafeReadU32LE(
+    std::span<const uint8_t> data, size_t offset) noexcept {
+    if (offset + 4 > data.size()) return 0;
+    uint32_t val = 0;
+    std::memcpy(&val, data.data() + offset, sizeof(val));
+    return val;
+}
+
+[[nodiscard]] std::string MacroDetectorImpl::JsonEscape(std::string_view input) {
+    std::string out;
+    out.reserve(input.size() + 16);
+    for (char c : input) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                  static_cast<unsigned int>(static_cast<unsigned char>(c)));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+                break;
+        }
+    }
+    return out;
+}
 
 // ============================================================================
 // MACRO DETECTOR IMPL IMPLEMENTATION
