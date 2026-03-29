@@ -28,7 +28,7 @@
  * endpoint protection with bidirectional scanning and bypass detection.
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -61,6 +61,8 @@
 #include <condition_variable>
 #include <cwctype>
 #include <unordered_set>
+#include <deque>
+#include <list>
 
 // ============================================================================
 // SHADOWSTRIKE INFRASTRUCTURE
@@ -68,6 +70,15 @@
 
 #include "../Utils/StringUtils.hpp"
 #include "PowerShellScanner.hpp"
+#include "VBScriptScanner.hpp"
+#include "JavaScriptScanner.hpp"
+#include "MacroDetector.hpp"
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
+#include "../Communication/Communication.hpp"
+#include "../Whitelist/WhiteListStore.hpp"
+#include "../ThreatIntel/ThreatIntelStore.hpp"
 
 namespace ShadowStrike {
 namespace Scripts {
@@ -271,27 +282,31 @@ void AMSIStatistics::Reset() noexcept {
     integrityChecks.store(0, std::memory_order_relaxed);
     integrityFailures.store(0, std::memory_order_relaxed);
     totalBytesScanned.store(0, std::memory_order_relaxed);
+    cacheHits.store(0, std::memory_order_relaxed);
+    cacheMisses.store(0, std::memory_order_relaxed);
     for (auto& ct : byContentType) {
         ct.store(0, std::memory_order_relaxed);
     }
     startTime = Clock::now();
 }
 
-[[nodiscard]] std::string AMSIStatistics::ToJson() const {
+[[nodiscard]] std::string AMSIStatisticsSnapshot::ToJson() const {
     auto uptimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - startTime).count();
 
     std::ostringstream oss;
     oss << "{";
-    oss << "\"totalScans\":" << totalScans.load(std::memory_order_relaxed) << ",";
-    oss << "\"maliciousDetected\":" << maliciousDetected.load(std::memory_order_relaxed) << ",";
-    oss << "\"cleanResults\":" << cleanResults.load(std::memory_order_relaxed) << ",";
-    oss << "\"sessionsCreated\":" << sessionsCreated.load(std::memory_order_relaxed) << ",";
-    oss << "\"bypassAttemptsDetected\":" << bypassAttemptsDetected.load(std::memory_order_relaxed) << ",";
-    oss << "\"bypassesRepaired\":" << bypassesRepaired.load(std::memory_order_relaxed) << ",";
-    oss << "\"integrityChecks\":" << integrityChecks.load(std::memory_order_relaxed) << ",";
-    oss << "\"integrityFailures\":" << integrityFailures.load(std::memory_order_relaxed) << ",";
-    oss << "\"totalBytesScanned\":" << totalBytesScanned.load(std::memory_order_relaxed) << ",";
+    oss << "\"totalScans\":" << totalScans << ",";
+    oss << "\"maliciousDetected\":" << maliciousDetected << ",";
+    oss << "\"cleanResults\":" << cleanResults << ",";
+    oss << "\"sessionsCreated\":" << sessionsCreated << ",";
+    oss << "\"bypassAttemptsDetected\":" << bypassAttemptsDetected << ",";
+    oss << "\"bypassesRepaired\":" << bypassesRepaired << ",";
+    oss << "\"integrityChecks\":" << integrityChecks << ",";
+    oss << "\"integrityFailures\":" << integrityFailures << ",";
+    oss << "\"totalBytesScanned\":" << totalBytesScanned << ",";
+    oss << "\"cacheHits\":" << cacheHits << ",";
+    oss << "\"cacheMisses\":" << cacheMisses << ",";
     oss << "\"uptimeMs\":" << uptimeMs;
     oss << "}";
     return oss.str();
@@ -445,44 +460,59 @@ public:
     }
 
     void Shutdown() {
-        std::unique_lock lock(m_mutex);
+        // Capture handles under lock, then release lock before joining thread
+        HAMSICONTEXT capturedContext = nullptr;
+        std::vector<std::pair<uint64_t, HAMSISSESSION>> capturedSessions;
 
-        if (m_status == ModuleStatus::Uninitialized ||
-            m_status == ModuleStatus::Stopped) {
-            return;
+        {
+            std::unique_lock lock(m_mutex);
+
+            if (m_status == ModuleStatus::Uninitialized ||
+                m_status == ModuleStatus::Stopped) {
+                return;
+            }
+
+            m_status = ModuleStatus::Stopping;
+
+            // Capture AMSI context and sessions for cleanup outside lock
+            capturedContext = m_amsiContext;
+            m_amsiContext = nullptr;
+
+            capturedSessions.reserve(m_sessions.size());
+            for (auto& [id, session] : m_sessions) {
+                if (session.sessionHandle != 0) {
+                    capturedSessions.emplace_back(
+                        id,
+                        reinterpret_cast<HAMSISSESSION>(session.sessionHandle));
+                }
+            }
+            m_sessions.clear();
+
+            // Signal integrity monitor to stop
+            m_integrityMonitorRunning = false;
         }
 
-        m_status = ModuleStatus::Stopping;
-
-        // Stop integrity monitor
-        m_integrityMonitorRunning = false;
+        // Wake and join the monitor thread without holding m_mutex
         m_integrityMonitorCV.notify_all();
-
-        lock.unlock();
 
         if (m_integrityMonitorThread.joinable()) {
             m_integrityMonitorThread.join();
         }
 
-        lock.lock();
-
-        // Close all sessions
-        for (auto& [id, session] : m_sessions) {
-            if (session.sessionHandle != 0) {
-                AmsiCloseSession(m_amsiContext,
-                    reinterpret_cast<HAMSISSESSION>(session.sessionHandle));
+        // Close captured sessions and uninitialize (no lock needed, we own the handles)
+        if (capturedContext != nullptr) {
+            for (auto& [id, hSession] : capturedSessions) {
+                AmsiCloseSession(capturedContext, hSession);
             }
-        }
-        m_sessions.clear();
-
-        // Uninitialize AMSI
-        if (m_amsiContext != nullptr) {
-            AmsiUninitialize(m_amsiContext);
-            m_amsiContext = nullptr;
+            AmsiUninitialize(capturedContext);
         }
 
-        m_providerStatus = ProviderStatus::Unregistered;
-        m_status = ModuleStatus::Stopped;
+        // Final state update under lock
+        {
+            std::unique_lock lock(m_mutex);
+            m_providerStatus = ProviderStatus::Unregistered;
+            m_status = ModuleStatus::Stopped;
+        }
 
         SS_LOG_INFO(LOG_CATEGORY, L"AMSI Integration shutdown complete");
     }
@@ -657,6 +687,87 @@ public:
             hasher.FinalHex(response.contentHash, false);
         }
 
+        // FIX 6: Whitelist fast-path — skip scanning entirely for known-good hashes
+        if (!response.contentHash.empty()) {
+            try {
+                if (IsWhitelistedImpl(response.contentHash)) {
+                    response.result = AmsiResult::Clean;
+                    response.isMalicious = false;
+                    m_stats.cleanResults.fetch_add(1, std::memory_order_relaxed);
+                    m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
+
+                    auto endTime = Clock::now();
+                    response.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
+                        endTime - startTime);
+
+                    SS_LOG_DEBUG(LOG_CATEGORY,
+                        L"Content whitelisted, skipping scan: %ls", request.contentName.c_str());
+                    InvokeScanCallback(response);
+                    return response;
+                }
+            } catch (const std::exception& e) {
+                SS_LOG_TRACE(LOG_CATEGORY,
+                    L"Whitelist lookup unavailable: %hs", e.what());
+            }
+        }
+
+        // FIX 5: ThreatIntel pre-scan — short-circuit if hash is known-malicious
+        if (!response.contentHash.empty()) {
+            try {
+                double tiRiskScore = 0.0;
+                std::string tiThreatName;
+                if (QueryThreatIntelImpl(response.contentHash, tiRiskScore, tiThreatName)) {
+                    response.result = AmsiResult::Detected;
+                    response.isMalicious = true;
+                    response.riskScore = tiRiskScore;
+                    if (!tiThreatName.empty()) {
+                        response.threatName = tiThreatName;
+                    }
+                    m_stats.maliciousDetected.fetch_add(1, std::memory_order_relaxed);
+
+                    auto endTime = Clock::now();
+                    response.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
+                        endTime - startTime);
+
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"ThreatIntel pre-scan: malicious hash for %ls", request.contentName.c_str());
+                    InvokeScanCallback(response);
+                    return response;
+                }
+            } catch (const std::exception& e) {
+                SS_LOG_TRACE(LOG_CATEGORY,
+                    L"ThreatIntel lookup unavailable: %hs", e.what());
+            }
+        }
+
+        // FIX 4: Check scan cache before calling system AMSI
+        if (!response.contentHash.empty()) {
+            auto cachedResult = LookupScanCache(response.contentHash);
+            if (cachedResult.has_value()) {
+                m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
+                response.result = cachedResult->result;
+                response.isMalicious = cachedResult->isMalicious;
+                response.threatName = cachedResult->threatName;
+                response.riskScore = cachedResult->riskScore;
+
+                if (response.isMalicious) {
+                    m_stats.maliciousDetected.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    m_stats.cleanResults.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                DispatchToSubScanner(request, response);
+
+                auto endTime = Clock::now();
+                response.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
+                    endTime - startTime);
+
+                InvokeScanCallback(response);
+                return response;
+            }
+            m_stats.cacheMisses.fetch_add(1, std::memory_order_relaxed);
+        }
+
         // Get or create session
         HAMSISSESSION amsiSession = nullptr;
         if (request.sessionId != 0) {
@@ -713,6 +824,11 @@ public:
         // PowerShellScanner provides deobfuscation and pattern matching
         // that system AMSI providers may miss.
         DispatchToSubScanner(request, response);
+
+        // FIX 4: Update scan cache with result
+        if (!response.contentHash.empty()) {
+            UpdateScanCache(response.contentHash, response);
+        }
 
         // Calculate scan duration
         auto endTime = Clock::now();
@@ -976,14 +1092,16 @@ public:
             {
                 std::unique_lock lock(m_mutex);
                 m_recentBypassEvents.push_back(event);
-                if (m_recentBypassEvents.size() > 1000) {
-                    m_recentBypassEvents.erase(m_recentBypassEvents.begin());
+                while (m_recentBypassEvents.size() > AMSIConstants::MAX_BYPASS_EVENTS) {
+                    m_recentBypassEvents.pop_front();
                 }
                 m_bypassDetectedProcesses.insert(processId);
                 m_detectedBypassTechniques[processId] = report.detectedBypasses;
             }
 
             InvokeBypassCallback(event);
+            ReportBypassToAlertSystemImpl(event);
+            ReportBypassToBehaviorAnalyzerImpl(event);
             InvokeIntegrityCallback(processId, AmsiIntegrityStatus::Tampered);
 
             SS_LOG_ERROR(LOG_CATEGORY, L"AMSI tampering detected in process %u", processId);
@@ -1025,24 +1143,37 @@ public:
             auto pFunc = GetProcAddress(hAmsi, funcName);
             if (pFunc == nullptr) continue;
 
-            // Check if this function is actually tampered before repairing
+            // FIX 2: Hold single shared_lock scope through compare-and-repair
+            // to close the TOCTOU window between reading expected bytes and restoring.
             std::shared_lock readLock(m_mutex);
             auto it = m_expectedPrologues.find(funcName);
             if (it == m_expectedPrologues.end()) continue;
 
-            std::vector<uint8_t> currentPrologue(it->second.size());
+            const auto& expectedBytes = it->second;
+
+            std::vector<uint8_t> currentPrologue(expectedBytes.size());
             memcpy(currentPrologue.data(), pFunc, currentPrologue.size());
 
-            if (currentPrologue == it->second) continue;  // Already intact
+            if (currentPrologue == expectedBytes) continue;  // Already intact
+
+            // Restore in-place while still holding the lock that protects
+            // m_expectedPrologues so the expected bytes cannot change under us.
+            void* target = reinterpret_cast<void*>(pFunc);
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(target, expectedBytes.size(),
+                                PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"VirtualProtect failed during repair of %hs", funcName);
+                continue;
+            }
+            memcpy(target, expectedBytes.data(), expectedBytes.size());
+            VirtualProtect(target, expectedBytes.size(), oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), target, expectedBytes.size());
+
             readLock.unlock();
 
-            if (RestoreFunctionPrologue(funcName,
-                    reinterpret_cast<uint64_t>(pFunc))) {
-                anyRepaired = true;
-                SS_LOG_INFO(LOG_CATEGORY, L"Restored %hs prologue", funcName);
-            } else {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to restore %hs prologue", funcName);
-            }
+            anyRepaired = true;
+            SS_LOG_INFO(LOG_CATEGORY, L"Restored %hs prologue", funcName);
         }
 
         if (anyRepaired) {
@@ -1123,20 +1254,24 @@ public:
     // STATISTICS
     // ========================================================================
 
-    [[nodiscard]] AMSIStatistics GetStatistics() const {
-        // Return copy (atomic values are read safely)
-        AMSIStatistics copy;
-        copy.totalScans.store(m_stats.totalScans.load(std::memory_order_relaxed));
-        copy.maliciousDetected.store(m_stats.maliciousDetected.load(std::memory_order_relaxed));
-        copy.cleanResults.store(m_stats.cleanResults.load(std::memory_order_relaxed));
-        copy.sessionsCreated.store(m_stats.sessionsCreated.load(std::memory_order_relaxed));
-        copy.bypassAttemptsDetected.store(m_stats.bypassAttemptsDetected.load(std::memory_order_relaxed));
-        copy.bypassesRepaired.store(m_stats.bypassesRepaired.load(std::memory_order_relaxed));
-        copy.integrityChecks.store(m_stats.integrityChecks.load(std::memory_order_relaxed));
-        copy.integrityFailures.store(m_stats.integrityFailures.load(std::memory_order_relaxed));
-        copy.totalBytesScanned.store(m_stats.totalBytesScanned.load(std::memory_order_relaxed));
-        copy.startTime = m_stats.startTime;
-        return copy;
+    [[nodiscard]] AMSIStatisticsSnapshot GetStatistics() const {
+        AMSIStatisticsSnapshot snapshot;
+        snapshot.totalScans = m_stats.totalScans.load(std::memory_order_relaxed);
+        snapshot.maliciousDetected = m_stats.maliciousDetected.load(std::memory_order_relaxed);
+        snapshot.cleanResults = m_stats.cleanResults.load(std::memory_order_relaxed);
+        snapshot.sessionsCreated = m_stats.sessionsCreated.load(std::memory_order_relaxed);
+        snapshot.bypassAttemptsDetected = m_stats.bypassAttemptsDetected.load(std::memory_order_relaxed);
+        snapshot.bypassesRepaired = m_stats.bypassesRepaired.load(std::memory_order_relaxed);
+        snapshot.integrityChecks = m_stats.integrityChecks.load(std::memory_order_relaxed);
+        snapshot.integrityFailures = m_stats.integrityFailures.load(std::memory_order_relaxed);
+        snapshot.totalBytesScanned = m_stats.totalBytesScanned.load(std::memory_order_relaxed);
+        snapshot.cacheHits = m_stats.cacheHits.load(std::memory_order_relaxed);
+        snapshot.cacheMisses = m_stats.cacheMisses.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < snapshot.byContentType.size(); ++i) {
+            snapshot.byContentType[i] = m_stats.byContentType[i].load(std::memory_order_relaxed);
+        }
+        snapshot.startTime = m_stats.startTime;
+        return snapshot;
     }
 
     void ResetStatistics() {
@@ -1399,12 +1534,38 @@ private:
 
     void DispatchToSubScanner(const AmsiScanRequest& request,
                               AmsiScanResponse& response) {
-        // Only dispatch PowerShell content to the PowerShellScanner sub-engine
-        if (request.contentType != AmsiContentType::PowerShell &&
-            request.contentType != AmsiContentType::Unknown) {
-            return;
-        }
+        // Dispatch to the appropriate sub-scanner based on content type
+        switch (request.contentType) {
+            case AmsiContentType::PowerShell:
+            case AmsiContentType::Unknown:
+                DispatchToPowerShellScanner(request, response);
+                break;
 
+            case AmsiContentType::VBScript:
+                DispatchToVBScriptScanner(request, response);
+                break;
+
+            case AmsiContentType::JScript:
+                DispatchToJavaScriptScanner(request, response);
+                break;
+
+            case AmsiContentType::Macro:
+                DispatchToMacroDetector(request, response);
+                break;
+
+            case AmsiContentType::DotNetCLR:
+            case AmsiContentType::Binary:
+            case AmsiContentType::URL:
+            case AmsiContentType::Custom:
+                SS_LOG_TRACE(LOG_CATEGORY,
+                    L"No sub-scanner available for content type %d, relying on system AMSI",
+                    static_cast<int>(request.contentType));
+                break;
+        }
+    }
+
+    void DispatchToPowerShellScanner(const AmsiScanRequest& request,
+                                     AmsiScanResponse& response) {
         try {
             auto& psScanner = PowerShellScanner::getInstance();
             std::string contentDesc = Utils::StringUtils::ToNarrow(request.contentName);
@@ -1416,35 +1577,119 @@ private:
                 contentDesc,
                 request.processId);
 
-            // Merge PowerShellScanner results into the AMSI response.
-            // Escalate severity: if PS scanner finds malicious/suspicious content
-            // that the system AMSI providers missed, elevate the result.
-            if (psResult.status == ScanStatus::MALICIOUS) {
-                if (!response.isMalicious) {
-                    m_stats.maliciousDetected.fetch_add(1, std::memory_order_relaxed);
-                }
-                response.isMalicious = true;
-                response.result = AmsiResult::Detected;
-                if (response.riskScore < static_cast<double>(psResult.riskScore)) {
-                    response.riskScore = static_cast<double>(psResult.riskScore);
-                }
-                if (!psResult.threatName.empty()) {
-                    response.threatName = psResult.threatName;
-                }
-            } else if (psResult.status == ScanStatus::SUSPICIOUS &&
-                       !response.isMalicious) {
-                if (response.riskScore < static_cast<double>(psResult.riskScore)) {
-                    response.riskScore = static_cast<double>(psResult.riskScore);
-                }
-            }
-
-            // Merge matched rules as signatures
-            for (const auto& rule : psResult.matchedRules) {
-                response.matchedSignatures.push_back(rule);
-            }
+            MergeScanResult(response, psResult.status == ScanStatus::MALICIOUS,
+                psResult.status == ScanStatus::SUSPICIOUS,
+                static_cast<double>(psResult.riskScore),
+                psResult.threatName, psResult.matchedRules);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY,
                 L"PowerShellScanner dispatch failed: %hs", e.what());
+        }
+    }
+
+    void DispatchToVBScriptScanner(const AmsiScanRequest& request,
+                                    AmsiScanResponse& response) {
+        try {
+            auto& vbsScanner = VBScriptScanner::Instance();
+            if (!vbsScanner.IsInitialized()) {
+                SS_LOG_TRACE(LOG_CATEGORY,
+                    L"VBScriptScanner not initialized, skipping dispatch");
+                return;
+            }
+            std::string source(
+                reinterpret_cast<const char*>(request.content.data()),
+                request.content.size());
+            std::string sourceName = Utils::StringUtils::ToNarrow(request.contentName);
+
+            auto vbsResult = vbsScanner.ScanSource(source, sourceName);
+
+            MergeScanResult(response,
+                vbsResult.status == VBSScanStatus::Malicious,
+                vbsResult.status == VBSScanStatus::Suspicious,
+                static_cast<double>(vbsResult.riskScore),
+                vbsResult.threatName, {});
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"VBScriptScanner dispatch failed: %hs", e.what());
+        }
+    }
+
+    void DispatchToJavaScriptScanner(const AmsiScanRequest& request,
+                                      AmsiScanResponse& response) {
+        try {
+            auto& jsScanner = JavaScriptScanner::Instance();
+            if (!jsScanner.IsInitialized()) {
+                SS_LOG_TRACE(LOG_CATEGORY,
+                    L"JavaScriptScanner not initialized, skipping dispatch");
+                return;
+            }
+
+            auto jsResult = jsScanner.ScanMemory(
+                std::span<const char>(
+                    reinterpret_cast<const char*>(request.content.data()),
+                    request.content.size()),
+                Utils::StringUtils::ToNarrow(request.contentName));
+
+            MergeScanResult(response,
+                jsResult.status == JSScanStatus::Malicious,
+                jsResult.status == JSScanStatus::Suspicious,
+                static_cast<double>(jsResult.riskScore),
+                jsResult.threatName, {});
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"JavaScriptScanner dispatch failed: %hs", e.what());
+        }
+    }
+
+    void DispatchToMacroDetector(const AmsiScanRequest& request,
+                                  AmsiScanResponse& response) {
+        try {
+            auto& macroDetector = MacroDetector::Instance();
+            if (!macroDetector.IsInitialized()) {
+                SS_LOG_TRACE(LOG_CATEGORY,
+                    L"MacroDetector not initialized, skipping dispatch");
+                return;
+            }
+
+            std::string fileName = Utils::StringUtils::ToNarrow(request.contentName);
+            auto macroResult = macroDetector.ScanDocument(request.content, fileName);
+
+            MergeScanResult(response,
+                macroResult.status == MacroScanStatus::Malicious,
+                macroResult.status == MacroScanStatus::Suspicious,
+                static_cast<double>(macroResult.riskScore),
+                macroResult.threatName, {});
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"MacroDetector dispatch failed: %hs", e.what());
+        }
+    }
+
+    /// Merge sub-scanner result into the AMSI response, escalating severity.
+    void MergeScanResult(AmsiScanResponse& response,
+                         bool isMalicious, bool isSuspicious,
+                         double riskScore, const std::string& threatName,
+                         const std::vector<std::string>& matchedRules) {
+        if (isMalicious) {
+            if (!response.isMalicious) {
+                m_stats.maliciousDetected.fetch_add(1, std::memory_order_relaxed);
+            }
+            response.isMalicious = true;
+            response.result = AmsiResult::Detected;
+            if (response.riskScore < riskScore) {
+                response.riskScore = riskScore;
+            }
+            if (!threatName.empty()) {
+                response.threatName = threatName;
+            }
+        } else if (isSuspicious && !response.isMalicious) {
+            if (response.riskScore < riskScore) {
+                response.riskScore = riskScore;
+            }
+        }
+
+        for (const auto& rule : matchedRules) {
+            response.matchedSignatures.push_back(rule);
         }
     }
 
@@ -1477,10 +1722,8 @@ private:
                 if (pid == GetCurrentProcessId()) {
                     continue;  // Already checked above
                 }
-                // Cross-process AMSI integrity requires ReadProcessMemory into the target.
-                // Only in-process (our own PID) checking is currently supported.
-                SS_LOG_TRACE(LOG_CATEGORY,
-                    L"Cross-process integrity check for PID %u deferred (requires injection)", pid);
+                // IMPL 8: Cross-process AMSI integrity check via ReadProcessMemory
+                CheckCrossProcessIntegrity(pid);
             }
         }
 
@@ -1531,6 +1774,473 @@ private:
         }
     }
 
+    // ========================================================================
+    // SCAN CACHE (LRU with TTL)
+    // ========================================================================
+
+    struct CachedScanEntry {
+        AmsiResult result = AmsiResult::Unknown;
+        bool isMalicious = false;
+        std::string threatName;
+        double riskScore = 0.0;
+        TimePoint insertTime{};
+    };
+
+    [[nodiscard]] std::optional<CachedScanEntry> LookupScanCache(
+        const std::string& hash) const {
+
+        std::unique_lock lock(m_scanCacheMutex);
+        auto mapIt = m_scanCacheMap.find(hash);
+        if (mapIt == m_scanCacheMap.end()) {
+            return std::nullopt;
+        }
+
+        // Check TTL
+        auto age = Clock::now() - mapIt->second->second.insertTime;
+        if (age > std::chrono::seconds(AMSIConstants::SCAN_CACHE_TTL_SECONDS)) {
+            // Expired - evict
+            m_scanCacheLRU.erase(mapIt->second);
+            m_scanCacheMap.erase(mapIt);
+            return std::nullopt;
+        }
+
+        // Move to front (most recently used)
+        m_scanCacheLRU.splice(m_scanCacheLRU.begin(), m_scanCacheLRU, mapIt->second);
+        return mapIt->second->second;
+    }
+
+    void UpdateScanCache(const std::string& hash,
+                         const AmsiScanResponse& response) {
+
+        std::unique_lock lock(m_scanCacheMutex);
+
+        // If already present, update and move to front
+        auto mapIt = m_scanCacheMap.find(hash);
+        if (mapIt != m_scanCacheMap.end()) {
+            mapIt->second->second.result = response.result;
+            mapIt->second->second.isMalicious = response.isMalicious;
+            mapIt->second->second.threatName = response.threatName;
+            mapIt->second->second.riskScore = response.riskScore;
+            mapIt->second->second.insertTime = Clock::now();
+            m_scanCacheLRU.splice(m_scanCacheLRU.begin(), m_scanCacheLRU, mapIt->second);
+            return;
+        }
+
+        // Evict LRU if at capacity
+        while (m_scanCacheLRU.size() >= AMSIConstants::MAX_SCAN_CACHE_ENTRIES) {
+            auto& lruEntry = m_scanCacheLRU.back();
+            m_scanCacheMap.erase(lruEntry.first);
+            m_scanCacheLRU.pop_back();
+        }
+
+        // Insert at front
+        CachedScanEntry entry;
+        entry.result = response.result;
+        entry.isMalicious = response.isMalicious;
+        entry.threatName = response.threatName;
+        entry.riskScore = response.riskScore;
+        entry.insertTime = Clock::now();
+
+        m_scanCacheLRU.emplace_front(hash, entry);
+        m_scanCacheMap[hash] = m_scanCacheLRU.begin();
+    }
+
+    // ========================================================================
+    // CROSS-PROCESS INTEGRITY CHECK
+    // ========================================================================
+
+    void CheckCrossProcessIntegrity(uint32_t pid) {
+        // Open the target process with memory-read privileges
+        HANDLE hProcess = OpenProcess(
+            PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+        if (hProcess == nullptr) {
+            DWORD err = GetLastError();
+            if (err == ERROR_ACCESS_DENIED) {
+                SS_LOG_TRACE(LOG_CATEGORY,
+                    L"Cross-process integrity: access denied for PID %u", pid);
+            } else if (err == ERROR_INVALID_PARAMETER) {
+                // Process may have already exited
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"Cross-process integrity: PID %u no longer exists", pid);
+                std::unique_lock lock(m_mutex);
+                m_monitoredProcesses.erase(pid);
+            } else {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Cross-process integrity: OpenProcess failed for PID %u: %lu", pid, err);
+            }
+            return;
+        }
+        auto processGuard = std::unique_ptr<
+            std::remove_pointer_t<HANDLE>, decltype(&CloseHandle)>(hProcess, &CloseHandle);
+
+        // Enumerate modules to find amsi.dll base in target process
+        HMODULE hMods[512]{};
+        DWORD cbNeeded = 0;
+        if (!EnumProcessModulesEx(hProcess, hMods, sizeof(hMods),
+                                   &cbNeeded, LIST_MODULES_ALL)) {
+            SS_LOG_TRACE(LOG_CATEGORY,
+                L"Cross-process integrity: EnumProcessModulesEx failed for PID %u", pid);
+            return;
+        }
+
+        HMODULE hAmsiRemote = nullptr;
+        DWORD moduleCount = cbNeeded / sizeof(HMODULE);
+        for (DWORD i = 0; i < moduleCount; ++i) {
+            WCHAR moduleName[MAX_PATH]{};
+            if (GetModuleBaseNameW(hProcess, hMods[i], moduleName, MAX_PATH) > 0) {
+                if (_wcsicmp(moduleName, L"amsi.dll") == 0) {
+                    hAmsiRemote = hMods[i];
+                    break;
+                }
+            }
+        }
+
+        if (hAmsiRemote == nullptr) {
+            SS_LOG_TRACE(LOG_CATEGORY,
+                L"amsi.dll not loaded in PID %u", pid);
+            return;
+        }
+
+        m_stats.integrityChecks.fetch_add(1, std::memory_order_relaxed);
+
+        // Check function prologues by reading remote process memory.
+        // We use the same offsets as our own amsi.dll (assumes same DLL version).
+        bool hasTampering = false;
+
+        std::shared_lock readLock(m_mutex);
+        for (const auto& [funcName, expectedBytes] : m_expectedPrologues) {
+            // Get function offset from our own loaded amsi.dll
+            HMODULE hAmsiLocal = GetModuleHandleW(L"amsi.dll");
+            if (hAmsiLocal == nullptr) break;
+
+            auto pFuncLocal = GetProcAddress(hAmsiLocal, funcName.c_str());
+            if (pFuncLocal == nullptr) continue;
+
+            // Calculate offset and apply to remote base
+            auto offset = reinterpret_cast<uintptr_t>(pFuncLocal)
+                        - reinterpret_cast<uintptr_t>(hAmsiLocal);
+            auto remoteAddr = reinterpret_cast<const void*>(
+                reinterpret_cast<uintptr_t>(hAmsiRemote) + offset);
+
+            std::vector<uint8_t> remotePrologue(expectedBytes.size());
+            SIZE_T bytesRead = 0;
+            if (!ReadProcessMemory(hProcess, remoteAddr, remotePrologue.data(),
+                                    remotePrologue.size(), &bytesRead)) {
+                SS_LOG_TRACE(LOG_CATEGORY,
+                    L"ReadProcessMemory failed for %hs in PID %u", funcName.c_str(), pid);
+                continue;
+            }
+
+            if (bytesRead < remotePrologue.size()) continue;
+
+            if (remotePrologue != expectedBytes) {
+                hasTampering = true;
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"AMSI bypass detected in PID %u: %hs prologue tampered", pid, funcName.c_str());
+            }
+        }
+        readLock.unlock();
+
+        if (hasTampering) {
+            m_stats.integrityFailures.fetch_add(1, std::memory_order_relaxed);
+            m_stats.bypassAttemptsDetected.fetch_add(1, std::memory_order_relaxed);
+
+            AmsiBypassEvent event;
+            event.eventId = GenerateEventId();
+            event.processId = pid;
+            event.threadId = 0;
+            event.techniques = AmsiBypassTechnique::AmsiScanBufferPatch;
+            event.details = "Cross-process AMSI tampering detected via ReadProcessMemory";
+            event.timestamp = GetCurrentSystemTime();
+
+            // Attempt to get remote process name
+            WCHAR remotePath[MAX_PATH]{};
+            if (GetModuleFileNameExW(hProcess, nullptr, remotePath, MAX_PATH)) {
+                event.processPath = remotePath;
+                event.processName = std::filesystem::path(remotePath).filename().wstring();
+            }
+
+            {
+                std::unique_lock lock(m_mutex);
+                m_recentBypassEvents.push_back(event);
+                while (m_recentBypassEvents.size() > AMSIConstants::MAX_BYPASS_EVENTS) {
+                    m_recentBypassEvents.pop_front();
+                }
+                m_bypassDetectedProcesses.insert(pid);
+            }
+
+            InvokeBypassCallback(event);
+            ReportBypassToAlertSystemImpl(event);
+            ReportBypassToBehaviorAnalyzerImpl(event);
+            InvokeIntegrityCallback(pid, AmsiIntegrityStatus::Tampered);
+
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"AMSI tampering detected in remote process %u", pid);
+
+            // Request kernel block if configured
+            std::shared_lock cfgLock(m_mutex);
+            bool shouldTerminate = m_config.terminateOnRepeatedBypass;
+            cfgLock.unlock();
+
+            if (shouldTerminate) {
+                RequestKernelProcessBlockImpl(pid,
+                    L"Repeated AMSI bypass detected in script host");
+            }
+        }
+    }
+
+    // ========================================================================
+    // CROSS-MODULE INTEGRATION (Impl helpers)
+    // ========================================================================
+
+    void ReportBypassToAlertSystemImpl(const AmsiBypassEvent& event) {
+        try {
+            if (!Communication::AlertSystem::HasInstance()) return;
+            auto& alertSystem = Communication::AlertSystem::Instance();
+            if (!alertSystem.IsInitialized()) return;
+
+            std::string subject = "AMSI Bypass Detected - PID "
+                + std::to_string(event.processId);
+            std::string details = "Event: " + event.eventId
+                + " | Process: " + Utils::StringUtils::ToNarrow(event.processName)
+                + " | Technique: " + std::string(GetAmsiBypassTechniqueName(event.techniques))
+                + " | Repaired: " + (event.wasRepaired ? "yes" : "no")
+                + " | " + event.details;
+
+            alertSystem.RaiseAlert(
+                Communication::AlertSeverity::Critical,
+                Communication::AlertType::Security,
+                subject, details, "AMSIIntegration");
+
+            SS_LOG_DEBUG(LOG_CATEGORY,
+                L"Bypass alert dispatched to AlertSystem for PID %u", event.processId);
+        } catch (const std::exception& e) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"AlertSystem dispatch failed: %hs", e.what());
+        }
+    }
+
+    void ReportBypassToBehaviorAnalyzerImpl(const AmsiBypassEvent& event) {
+        // Report via TelemetryCollector as the integration bridge.
+        // BehaviorAnalyzer's EvasionAMSIBypass (206) enum is referenced via
+        // telemetry metadata; direct inclusion of BehaviorAnalyzer.hpp is
+        // avoided to prevent circular dependency.
+        try {
+            if (!Communication::TelemetryCollector::HasInstance()) return;
+            auto& telemetry = Communication::TelemetryCollector::Instance();
+
+            std::map<std::string, std::string> data;
+            data["eventId"] = event.eventId;
+            data["processId"] = std::to_string(event.processId);
+            data["processName"] = Utils::StringUtils::ToNarrow(event.processName);
+            data["technique"] = std::string(GetAmsiBypassTechniqueName(event.techniques));
+            data["techniqueId"] = std::to_string(static_cast<uint32_t>(event.techniques));
+            data["repaired"] = event.wasRepaired ? "true" : "false";
+            // BehaviorPatternType::EvasionAMSIBypass = 206
+            data["behaviorPatternType"] = "206";
+
+            telemetry.RecordCustom("amsi_bypass", data);
+
+            SS_LOG_DEBUG(LOG_CATEGORY,
+                L"Bypass telemetry emitted for PID %u (BehaviorPattern=206)", event.processId);
+        } catch (const std::exception& e) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"TelemetryCollector dispatch failed: %hs", e.what());
+        }
+    }
+
+    [[nodiscard]] bool QueryThreatIntelImpl(const std::string& sha256Hash,
+                                             double& outRiskScore,
+                                             std::string& outThreatName) const {
+        try {
+            std::shared_lock lock(m_mutex);
+            if (!m_threatIntelStore) {
+                return false;
+            }
+            auto& store = *m_threatIntelStore;
+            lock.unlock();
+
+            auto result = store.LookupHash("sha256", sha256Hash);
+            if (result.found && result.IsMalicious()) {
+                outRiskScore = static_cast<double>(result.score);
+                outThreatName = "ThreatIntel.Hash." + sha256Hash.substr(0, 8);
+                return true;
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_TRACE(LOG_CATEGORY,
+                L"ThreatIntel query failed (graceful): %hs", e.what());
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool IsWhitelistedImpl(const std::string& sha256Hash) const {
+        try {
+            std::shared_lock lock(m_mutex);
+            if (!m_whitelistStore) {
+                return false;
+            }
+            auto& store = *m_whitelistStore;
+            lock.unlock();
+
+            auto result = store.IsHashWhitelisted(
+                sha256Hash, Whitelist::HashAlgorithm::SHA256);
+            return result.found;
+        } catch (const std::exception& e) {
+            SS_LOG_TRACE(LOG_CATEGORY,
+                L"Whitelist lookup failed (graceful): %hs", e.what());
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool RequestKernelProcessBlockImpl(uint32_t processId,
+                                                      const std::wstring& reason) {
+        try {
+            if (!Communication::IPCManager::HasInstance()) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"IPCManager not available for kernel process block");
+                return false;
+            }
+            auto& ipc = Communication::IPCManager::Instance();
+            if (!ipc.IsConnected()) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"IPCManager not connected to kernel driver");
+                return false;
+            }
+
+            // Serialize a process block control message as a flat buffer:
+            // [MessageType:uint16(2)] [ProcessId:uint32(4)] [Verdict:uint8(1)]
+            // [ThreatScore:uint8(1)] [ReasonLenWchars:uint16(2)] [Reason:wchar[]]
+            std::wstring truncatedReason = reason.substr(0, 256);
+
+            constexpr size_t kHeaderSize = 2 + 4 + 1 + 1 + 2;
+            size_t reasonBytes = truncatedReason.size() * sizeof(wchar_t);
+            size_t totalSize = kHeaderSize + reasonBytes;
+
+            std::vector<uint8_t> msgBuffer(totalSize, 0);
+            uint8_t* ptr = msgBuffer.data();
+
+            // MessageType: use a reserved value indicating process block
+            auto msgType = static_cast<uint16_t>(Communication::MessageType::ProcessNotify);
+            memcpy(ptr, &msgType, 2); ptr += 2;
+
+            memcpy(ptr, &processId, 4); ptr += 4;
+
+            auto verdict = static_cast<uint8_t>(Communication::ScanVerdict::Block);
+            memcpy(ptr, &verdict, 1); ptr += 1;
+
+            uint8_t threatScore = 100;
+            memcpy(ptr, &threatScore, 1); ptr += 1;
+
+            auto reasonLen = static_cast<uint16_t>(truncatedReason.size());
+            memcpy(ptr, &reasonLen, 2); ptr += 2;
+
+            if (!truncatedReason.empty()) {
+                memcpy(ptr, truncatedReason.data(), reasonBytes);
+            }
+
+            bool sent = ipc.SendToKernel(msgBuffer.data(), msgBuffer.size());
+
+            if (sent) {
+                SS_LOG_INFO(LOG_CATEGORY,
+                    L"Kernel process block requested for PID %u: %ls",
+                    processId, reason.c_str());
+            } else {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Failed to send kernel process block for PID %u", processId);
+            }
+            return sent;
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"Kernel process block exception: %hs", e.what());
+            return false;
+        }
+    }
+
+    // ========================================================================
+    // KERNEL BRIDGE (Impl helpers)
+    // ========================================================================
+
+    // Script host executable names (lowercase for case-insensitive comparison)
+    [[nodiscard]] static bool IsScriptHostProcess(std::wstring_view imagePath) {
+        static constexpr std::wstring_view kScriptHosts[] = {
+            L"powershell.exe", L"pwsh.exe", L"cscript.exe",
+            L"wscript.exe", L"mshta.exe", L"msbuild.exe", L"regsvr32.exe"
+        };
+
+        auto filename = std::filesystem::path(imagePath).filename().wstring();
+        // Convert to lowercase for case-insensitive match
+        for (auto& ch : filename) {
+            ch = static_cast<wchar_t>(std::towlower(ch));
+        }
+
+        for (auto host : kScriptHosts) {
+            if (filename == host) return true;
+        }
+        return false;
+    }
+
+    void OnKernelProcessNotifyImpl(uint32_t processId,
+                                    std::wstring_view imagePath,
+                                    std::wstring_view commandLine,
+                                    bool isCreate) {
+        if (isCreate) {
+            if (IsScriptHostProcess(imagePath)) {
+                SS_LOG_INFO(LOG_CATEGORY,
+                    L"Script host detected: PID %u (%ls)", processId,
+                    std::filesystem::path(imagePath).filename().c_str());
+
+                StartIntegrityMonitoring(processId);
+            }
+        } else {
+            // Process destruction - clean up monitoring state
+            bool wasMonitored = false;
+            {
+                std::unique_lock lock(m_mutex);
+                wasMonitored = (m_monitoredProcesses.erase(processId) > 0);
+                m_bypassDetectedProcesses.erase(processId);
+                m_detectedBypassTechniques.erase(processId);
+            }
+
+            if (wasMonitored) {
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"Script host exited: PID %u, cleaned up monitoring", processId);
+            }
+        }
+    }
+
+    void OnKernelImageLoadImpl(uint32_t processId,
+                                std::wstring_view imagePath,
+                                uint64_t imageBase,
+                                size_t imageSize) {
+        auto filename = std::filesystem::path(imagePath).filename().wstring();
+        for (auto& ch : filename) {
+            ch = static_cast<wchar_t>(std::towlower(ch));
+        }
+
+        if (filename != L"amsi.dll") return;
+
+        SS_LOG_INFO(LOG_CATEGORY,
+            L"amsi.dll loaded in PID %u at 0x%llX (size=%zu)",
+            processId, imageBase, imageSize);
+
+        // If this process is monitored, schedule an immediate integrity check
+        bool isMonitored = false;
+        {
+            std::shared_lock lock(m_mutex);
+            isMonitored = (m_monitoredProcesses.count(processId) > 0);
+        }
+
+        if (isMonitored) {
+            if (processId == GetCurrentProcessId()) {
+                // In-process: direct check
+                CheckIntegrity(processId);
+            } else {
+                // Cross-process: use ReadProcessMemory path
+                CheckCrossProcessIntegrity(processId);
+            }
+        }
+    }
+
 private:
     // ========================================================================
     // MEMBER VARIABLES
@@ -1569,8 +2279,8 @@ private:
     std::unordered_set<uint32_t> m_bypassDetectedProcesses;
     std::unordered_map<uint32_t, AmsiBypassTechnique> m_detectedBypassTechniques;
 
-    // Recent bypass events
-    std::vector<AmsiBypassEvent> m_recentBypassEvents;
+    // Recent bypass events (deque for O(1) pop_front)
+    std::deque<AmsiBypassEvent> m_recentBypassEvents;
 
     // Statistics
     AMSIStatistics m_stats;
@@ -1580,6 +2290,31 @@ private:
     BypassCallback m_bypassCallback;
     IntegrityCallback m_integrityCallback;
     ErrorCallback m_errorCallback;
+
+    // Scan result cache: LRU eviction via list + unordered_map
+    using ScanCacheList = std::list<std::pair<std::string, CachedScanEntry>>;
+    mutable ScanCacheList m_scanCacheLRU;
+    mutable std::unordered_map<std::string, ScanCacheList::iterator> m_scanCacheMap;
+    mutable std::mutex m_scanCacheMutex;
+
+    // External store references (set via dependency injection; nullable)
+    std::shared_ptr<ThreatIntel::ThreatIntelStore> m_threatIntelStore;
+    std::shared_ptr<Whitelist::WhitelistStore> m_whitelistStore;
+
+public:
+    /// @brief Inject ThreatIntelStore for hash reputation lookups
+    void SetThreatIntelStore(std::shared_ptr<ThreatIntel::ThreatIntelStore> store) {
+        std::unique_lock lock(m_mutex);
+        m_threatIntelStore = std::move(store);
+        SS_LOG_INFO(LOG_CATEGORY, L"ThreatIntelStore injected into AMSI integration");
+    }
+
+    /// @brief Inject WhitelistStore for hash whitelist lookups
+    void SetWhitelistStore(std::shared_ptr<Whitelist::WhitelistStore> store) {
+        std::unique_lock lock(m_mutex);
+        m_whitelistStore = std::move(store);
+        SS_LOG_INFO(LOG_CATEGORY, L"WhitelistStore injected into AMSI integration");
+    }
 };
 
 // ============================================================================
@@ -1743,7 +2478,7 @@ void AMSIIntegration::UnregisterCallbacks() {
     m_impl->UnregisterCallbacks();
 }
 
-[[nodiscard]] AMSIStatistics AMSIIntegration::GetStatistics() const {
+[[nodiscard]] AMSIStatisticsSnapshot AMSIIntegration::GetStatistics() const {
     return m_impl->GetStatistics();
 }
 
@@ -1769,6 +2504,53 @@ void AMSIIntegration::ResetStatistics() {
     } catch (...) {
         return "ShadowStrike AMSIIntegration v?.?.?";
     }
+}
+
+// ============================================================================
+// KERNEL BRIDGE IMPLEMENTATIONS
+// ============================================================================
+
+void AMSIIntegration::OnKernelProcessNotify(uint32_t processId,
+                                             std::wstring_view imagePath,
+                                             std::wstring_view commandLine,
+                                             bool isCreate) {
+    m_impl->OnKernelProcessNotifyImpl(processId, imagePath, commandLine, isCreate);
+}
+
+void AMSIIntegration::OnKernelImageLoad(uint32_t processId,
+                                         std::wstring_view imagePath,
+                                         uint64_t imageBase,
+                                         size_t imageSize) {
+    m_impl->OnKernelImageLoadImpl(processId, imagePath, imageBase, imageSize);
+}
+
+[[nodiscard]] bool AMSIIntegration::RequestKernelProcessBlock(
+    uint32_t processId,
+    const std::wstring& reason) {
+    return m_impl->RequestKernelProcessBlockImpl(processId, reason);
+}
+
+// ============================================================================
+// CROSS-MODULE INTEGRATION IMPLEMENTATIONS
+// ============================================================================
+
+void AMSIIntegration::ReportBypassToBehaviorAnalyzer(const AmsiBypassEvent& event) {
+    m_impl->ReportBypassToBehaviorAnalyzerImpl(event);
+}
+
+void AMSIIntegration::ReportBypassToAlertSystem(const AmsiBypassEvent& event) {
+    m_impl->ReportBypassToAlertSystemImpl(event);
+}
+
+[[nodiscard]] bool AMSIIntegration::QueryThreatIntel(
+    const std::string& sha256Hash,
+    double& outRiskScore,
+    std::string& outThreatName) const {
+    return m_impl->QueryThreatIntelImpl(sha256Hash, outRiskScore, outThreatName);
+}
+
+[[nodiscard]] bool AMSIIntegration::IsWhitelisted(const std::string& sha256Hash) const {
+    return m_impl->IsWhitelistedImpl(sha256Hash);
 }
 
 }  // namespace Scripts
