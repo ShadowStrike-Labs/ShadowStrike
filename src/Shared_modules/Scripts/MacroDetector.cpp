@@ -547,7 +547,7 @@ public:
     [[nodiscard]] std::vector<std::string> ExtractIOCs(const std::string& code);
 
     // Callbacks
-    void RegisterCallback(ScanResultCallback callback);
+    void RegisterCallback(MacroScanResultCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
     void UnregisterCallbacks();
 
@@ -650,7 +650,7 @@ private:
     MacroDetectorConfiguration m_config;
     MacroStatistics m_stats;
 
-    ScanResultCallback m_resultCallback;
+    MacroScanResultCallback m_resultCallback;
     ErrorCallback m_errorCallback;
 
     // COM initialization state
@@ -1592,7 +1592,7 @@ void MacroDetectorImpl::Shutdown() {
     return iocs;
 }
 
-void MacroDetectorImpl::RegisterCallback(ScanResultCallback callback) {
+void MacroDetectorImpl::RegisterCallback(MacroScanResultCallback callback) {
     std::unique_lock lock(m_mutex);
     m_resultCallback = std::move(callback);
 }
@@ -2504,7 +2504,7 @@ void MacroDetector::Shutdown() {
     return m_impl->ExtractIOCs(code);
 }
 
-void MacroDetector::RegisterCallback(ScanResultCallback callback) {
+void MacroDetector::RegisterCallback(MacroScanResultCallback callback) {
     m_impl->RegisterCallback(std::move(callback));
 }
 

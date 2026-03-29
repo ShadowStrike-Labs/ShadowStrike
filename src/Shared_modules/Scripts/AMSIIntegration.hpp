@@ -290,6 +290,8 @@ enum class ProviderStatus : uint8_t {
 /**
  * @brief Module status
  */
+#ifndef SHADOWSTRIKE_SCRIPTS_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_SCRIPTS_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -299,7 +301,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 5,
     Error           = 6
 };
-
+#endif
 // ============================================================================
 // STRUCTURES
 // ============================================================================
@@ -311,7 +313,7 @@ struct AmsiSessionInfo {
     /// @brief Session ID
     uint64_t sessionId = 0;
     
-    /// @brief Session handle (HAMSISSESSION)
+    /// @brief Session handle (HAMSISESSION)
     uint64_t sessionHandle = 0;
     
     /// @brief Process ID
@@ -586,7 +588,10 @@ struct AMSIConfiguration {
 using ScanCallback = std::function<void(const AmsiScanResponse&)>;
 using BypassCallback = std::function<void(const AmsiBypassEvent&)>;
 using IntegrityCallback = std::function<void(uint32_t processId, AmsiIntegrityStatus)>;
+#ifndef SHADOWSTRIKE_SCRIPTS_ERROR_CALLBACK_DEFINED
+#define SHADOWSTRIKE_SCRIPTS_ERROR_CALLBACK_DEFINED
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
+#endif
 
 // ============================================================================
 // AMSI INTEGRATION CLASS

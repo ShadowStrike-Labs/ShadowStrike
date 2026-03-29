@@ -336,6 +336,8 @@ enum class MacroScanStatus : uint8_t {
 /**
  * @brief Module status
  */
+#ifndef SHADOWSTRIKE_SCRIPTS_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_SCRIPTS_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -345,10 +347,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 5,
     Error           = 6
 };
-
-// ============================================================================
-// STRUCTURES
-// ============================================================================
+#endif
 
 /**
  * @brief VBA module information
@@ -658,8 +657,11 @@ struct MacroDetectorConfiguration {
 // CALLBACK TYPES
 // ============================================================================
 
-using ScanResultCallback = std::function<void(const MacroScanResult&)>;
+using MacroScanResultCallback = std::function<void(const MacroScanResult&)>;
+#ifndef SHADOWSTRIKE_SCRIPTS_ERROR_CALLBACK_DEFINED
+#define SHADOWSTRIKE_SCRIPTS_ERROR_CALLBACK_DEFINED
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
+#endif
 
 // ============================================================================
 // MACRO DETECTOR CLASS
@@ -756,7 +758,7 @@ public:
     // CALLBACKS
     // ========================================================================
     
-    void RegisterCallback(ScanResultCallback callback);
+    void RegisterCallback(MacroScanResultCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
     void UnregisterCallbacks();
 
