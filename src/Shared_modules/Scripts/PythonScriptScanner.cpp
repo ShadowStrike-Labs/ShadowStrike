@@ -441,23 +441,42 @@ void PythonStatistics::Reset() noexcept {
     startTime = Clock::now();
 }
 
-[[nodiscard]] std::string PythonStatistics::ToJson() const {
-    std::ostringstream oss;
-    auto now = Clock::now();
-    auto uptimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
+[[nodiscard]] PythonStatisticsSnapshot PythonStatistics::ToSnapshot() const noexcept {
+    PythonStatisticsSnapshot snap;
+    snap.totalScans = totalScans.load(std::memory_order_relaxed);
+    snap.maliciousDetected = maliciousDetected.load(std::memory_order_relaxed);
+    snap.suspiciousDetected = suspiciousDetected.load(std::memory_order_relaxed);
+    snap.sourceFilesScanned = sourceFilesScanned.load(std::memory_order_relaxed);
+    snap.bytecodeFilesScanned = bytecodeFilesScanned.load(std::memory_order_relaxed);
+    snap.packedExecutablesScanned = packedExecutablesScanned.load(std::memory_order_relaxed);
+    snap.obfuscatedDetected = obfuscatedDetected.load(std::memory_order_relaxed);
+    snap.decompileFailures = decompileFailures.load(std::memory_order_relaxed);
+    snap.extractionFailures = extractionFailures.load(std::memory_order_relaxed);
+    snap.totalBytesScanned = totalBytesScanned.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < byCategory.size(); ++i) {
+        snap.byCategory[i] = byCategory[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < byCapability.size(); ++i) {
+        snap.byCapability[i] = byCapability[i].load(std::memory_order_relaxed);
+    }
+    snap.uptime = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - startTime);
+    return snap;
+}
 
+[[nodiscard]] std::string PythonStatisticsSnapshot::ToJson() const {
+    std::ostringstream oss;
     oss << "{";
-    oss << "\"totalScans\":" << totalScans.load() << ",";
-    oss << "\"maliciousDetected\":" << maliciousDetected.load() << ",";
-    oss << "\"suspiciousDetected\":" << suspiciousDetected.load() << ",";
-    oss << "\"sourceFilesScanned\":" << sourceFilesScanned.load() << ",";
-    oss << "\"bytecodeFilesScanned\":" << bytecodeFilesScanned.load() << ",";
-    oss << "\"packedExecutablesScanned\":" << packedExecutablesScanned.load() << ",";
-    oss << "\"obfuscatedDetected\":" << obfuscatedDetected.load() << ",";
-    oss << "\"decompileFailures\":" << decompileFailures.load() << ",";
-    oss << "\"extractionFailures\":" << extractionFailures.load() << ",";
-    oss << "\"totalBytesScanned\":" << totalBytesScanned.load() << ",";
-    oss << "\"uptimeMs\":" << uptimeMs;
+    oss << "\"totalScans\":" << totalScans << ",";
+    oss << "\"maliciousDetected\":" << maliciousDetected << ",";
+    oss << "\"suspiciousDetected\":" << suspiciousDetected << ",";
+    oss << "\"sourceFilesScanned\":" << sourceFilesScanned << ",";
+    oss << "\"bytecodeFilesScanned\":" << bytecodeFilesScanned << ",";
+    oss << "\"packedExecutablesScanned\":" << packedExecutablesScanned << ",";
+    oss << "\"obfuscatedDetected\":" << obfuscatedDetected << ",";
+    oss << "\"decompileFailures\":" << decompileFailures << ",";
+    oss << "\"extractionFailures\":" << extractionFailures << ",";
+    oss << "\"totalBytesScanned\":" << totalBytesScanned << ",";
+    oss << "\"uptimeMs\":" << uptime.count();
     oss << "}";
     return oss.str();
 }
@@ -512,7 +531,7 @@ public:
     void UnregisterCallbacks();
 
     // Statistics
-    [[nodiscard]] PythonStatistics GetStatistics() const;
+    [[nodiscard]] PythonStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     [[nodiscard]] bool SelfTest();
 
@@ -882,6 +901,12 @@ void PythonScriptScannerImpl::Shutdown() {
     result.scanTime = std::chrono::system_clock::now();
     auto startTime = Clock::now();
 
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"PythonScanner", L"ScanFile called before initialization");
+        result.status = PythonScanStatus::ErrorParsing;
+        return result;
+    }
+
     // Validation
     if (path.empty()) {
         SS_LOG_ERROR(L"PythonScanner", L"Empty file path provided");
@@ -1031,6 +1056,13 @@ void PythonScriptScannerImpl::Shutdown() {
 
     auto startTime = Clock::now();
 
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"PythonScanner", L"ScanSource called before initialization");
+        PythonScanResult result;
+        result.status = PythonScanStatus::ErrorParsing;
+        return result;
+    }
+
     PythonScanResult result = AnalyzeSource(source, sourceName, PythonArtifactType::SourcePy);
 
     auto endTime = Clock::now();
@@ -1056,6 +1088,12 @@ void PythonScriptScannerImpl::Shutdown() {
     result.filePath = exePath;
     result.scanTime = std::chrono::system_clock::now();
     result.artifactType = PythonArtifactType::PackedPyInstaller;
+
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"PythonScanner", L"ScanPyInstallerExe called before initialization");
+        result.status = PythonScanStatus::ErrorParsing;
+        return result;
+    }
 
     // Read executable
     std::wstring widePath = exePath.wstring();
@@ -1130,6 +1168,19 @@ void PythonScriptScannerImpl::Shutdown() {
     result.scanTime = std::chrono::system_clock::now();
     result.artifactType = PythonArtifactType::BytecodePyc;
 
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"PythonScanner", L"ScanBytecode called before initialization");
+        result.status = PythonScanStatus::ErrorParsing;
+        return result;
+    }
+
+    // Thread-safe config snapshot
+    PythonScannerConfiguration configSnapshot;
+    {
+        std::shared_lock lock(m_mutex);
+        configSnapshot = m_config;
+    }
+
     // Read bytecode
     std::wstring widePath = pycPath.wstring();
     std::vector<std::byte> content;
@@ -1154,7 +1205,7 @@ void PythonScriptScannerImpl::Shutdown() {
     }
 
     // Try to decompile if enabled
-    if (m_config.enableDecompilation) {
+    if (configSnapshot.enableDecompilation) {
         auto decompiledSource = DecompileBytecode(pycPath);
         if (decompiledSource.has_value()) {
             // Analyze the decompiled source
@@ -1213,7 +1264,9 @@ void PythonScriptScannerImpl::Shutdown() {
         std::vector<std::byte> header;
         Utils::FileUtils::Error fileErr;
 
-        // Read first 4KB
+        // NOTE: ReadAllBytes reads the entire file. Acceptable here because
+        // ScanFile already enforces maxFileSize before reaching this point,
+        // and the full content is reused by the caller for scanning.
         if (Utils::FileUtils::ReadAllBytes(widePath, header, &fileErr)) {
             if (header.size() >= 2 &&
                 header[0] == std::byte{'M'} && header[1] == std::byte{'Z'}) {
@@ -1248,13 +1301,15 @@ void PythonScriptScannerImpl::Shutdown() {
         return imports;
     }
 
-    std::string sourceStr(source);
+    // Enforce regex input size limit to prevent ReDoS
+    std::string sourceStr(source.substr(0,
+        std::min(source.size(), PythonConstants::MAX_REGEX_INPUT_SIZE)));
 
-    // Pattern: import module
-    std::regex importPattern(R"(^\s*import\s+([a-zA-Z_][a-zA-Z0-9_\.]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_\.]*)*))");
-
-    // Pattern: from module import ...
-    std::regex fromImportPattern(R"(^\s*from\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s+import\s+(.+))");
+    // Pre-compiled static regex patterns
+    static const std::regex importPattern(
+        R"(^\s*import\s+([a-zA-Z_][a-zA-Z0-9_\.]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_\.]*)*))");
+    static const std::regex fromImportPattern(
+        R"(^\s*from\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s+import\s+(.+))");
 
     std::istringstream iss(sourceStr);
     std::string line;
@@ -1499,21 +1554,42 @@ void PythonScriptScannerImpl::Shutdown() {
         }
     }
 
-    // Check for XOR patterns
-    if (Utils::StringUtils::IContains(wideSource, L"^ ") ||
-        Utils::StringUtils::IContains(wideSource, L"^=") ||
-        Utils::StringUtils::IContains(wideSource, L"xor")) {
-        return PythonObfuscationType::XorEncryption;
+    // Check for XOR patterns — require both XOR operator usage AND
+    // byte-level data manipulation to reduce false positives
+    {
+        size_t xorOpCount = 0;
+        size_t xorPos = 0;
+        while ((xorPos = sourceStr.find("^=", xorPos)) != std::string::npos) {
+            xorOpCount++;
+            xorPos += 2;
+        }
+        xorPos = 0;
+        while ((xorPos = sourceStr.find("^ 0x", xorPos)) != std::string::npos) {
+            xorOpCount++;
+            xorPos += 4;
+        }
+        bool hasXorByteManip =
+            Utils::StringUtils::IContains(wideSource, L"bytearray") ||
+            Utils::StringUtils::IContains(wideSource, L"bytes") ||
+            Utils::StringUtils::IContains(wideSource, L"chr(") ||
+            Utils::StringUtils::IContains(wideSource, L"ord(");
+
+        if (xorOpCount >= 3 && hasXorByteManip) {
+            return PythonObfuscationType::XorEncryption;
+        }
     }
 
     // Check for variable renaming (many single-letter variables)
-    std::regex singleVarPattern(R"(\b[a-z]\s*=)");
-    std::sregex_iterator begin(sourceStr.begin(), sourceStr.end(), singleVarPattern);
-    std::sregex_iterator end;
-    size_t singleVarCount = std::distance(begin, end);
+    // Only run regex on bounded input
+    if (sourceStr.size() <= PythonConstants::MAX_REGEX_INPUT_SIZE) {
+        static const std::regex singleVarPattern(R"(\b[a-z]\s*=)");
+        std::sregex_iterator begin(sourceStr.begin(), sourceStr.end(), singleVarPattern);
+        std::sregex_iterator end;
+        size_t singleVarCount = static_cast<size_t>(std::distance(begin, end));
 
-    if (singleVarCount > 30) {
-        return PythonObfuscationType::VariableRenaming;
+        if (singleVarCount > 30) {
+            return PythonObfuscationType::VariableRenaming;
+        }
     }
 
     return PythonObfuscationType::None;
@@ -1535,11 +1611,15 @@ void PythonScriptScannerImpl::UnregisterCallbacks() {
     m_errorCallback = nullptr;
 }
 
-[[nodiscard]] PythonStatistics PythonScriptScannerImpl::GetStatistics() const {
-    return m_stats;
+[[nodiscard]] PythonStatisticsSnapshot PythonScriptScannerImpl::GetStatistics() const {
+    // startTime is non-atomic; protect reads with shared_lock
+    std::shared_lock lock(m_mutex);
+    return m_stats.ToSnapshot();
 }
 
 void PythonScriptScannerImpl::ResetStatistics() {
+    // startTime is non-atomic; protect writes with unique_lock
+    std::unique_lock lock(m_mutex);
     m_stats.Reset();
 }
 
@@ -1620,6 +1700,13 @@ void PythonScriptScannerImpl::ResetStatistics() {
         return result;
     }
 
+    // Thread-safe config snapshot
+    PythonScannerConfiguration configSnapshot;
+    {
+        std::shared_lock lock(m_mutex);
+        configSnapshot = m_config;
+    }
+
     // Analyze imports
     result.allImports = AnalyzeImports(source);
 
@@ -1638,7 +1725,7 @@ void PythonScriptScannerImpl::ResetStatistics() {
     result.isObfuscated = (result.obfuscationType != PythonObfuscationType::None);
 
     // Extract IOCs
-    if (m_config.extractIOCs) {
+    if (configSnapshot.extractIOCs) {
         result.extractedIOCs = ExtractIOCs(source);
     }
 
@@ -1688,12 +1775,19 @@ void PythonScriptScannerImpl::ResetStatistics() {
     if (caps & static_cast<uint32_t>(PythonCapability::CredentialAccess)) score += 35;
     if (caps & static_cast<uint32_t>(PythonCapability::FileEncryption)) score += 25;
     if (caps & static_cast<uint32_t>(PythonCapability::Persistence)) score += 30;
+    if (caps & static_cast<uint32_t>(PythonCapability::ShellcodeInjection)) score += 50;
+    if (caps & static_cast<uint32_t>(PythonCapability::LsassDumping)) score += 50;
+    if (caps & static_cast<uint32_t>(PythonCapability::AttackFramework)) score += 45;
+    if (caps & static_cast<uint32_t>(PythonCapability::ReverseShell)) score += 45;
 
     // Medium-risk capabilities
     if (caps & static_cast<uint32_t>(PythonCapability::ProcessExecution)) score += 20;
     if (caps & static_cast<uint32_t>(PythonCapability::ShellAccess)) score += 25;
     if (caps & static_cast<uint32_t>(PythonCapability::RegistryAccess)) score += 20;
     if (caps & static_cast<uint32_t>(PythonCapability::DynamicExecution)) score += 25;
+    if (caps & static_cast<uint32_t>(PythonCapability::C2Communication)) score += 30;
+    if (caps & static_cast<uint32_t>(PythonCapability::AntiVM)) score += 20;
+    if (caps & static_cast<uint32_t>(PythonCapability::AntiDebug)) score += 20;
 
     // Low-risk capabilities
     if (caps & static_cast<uint32_t>(PythonCapability::NetworkCommunication)) score += 10;
@@ -1730,6 +1824,18 @@ void PythonScriptScannerImpl::ResetStatistics() {
     // Keylogger
     if (caps & static_cast<uint32_t>(PythonCapability::Keylogging)) {
         return PythonThreatCategory::Keylogger;
+    }
+
+    // Exploit / attack framework tooling
+    if ((caps & static_cast<uint32_t>(PythonCapability::AttackFramework)) ||
+        (caps & static_cast<uint32_t>(PythonCapability::ShellcodeInjection)) ||
+        (caps & static_cast<uint32_t>(PythonCapability::LsassDumping))) {
+        return PythonThreatCategory::Exploit;
+    }
+
+    // Reverse shell
+    if (caps & static_cast<uint32_t>(PythonCapability::ReverseShell)) {
+        return PythonThreatCategory::Backdoor;
     }
 
     // RAT (multiple remote capabilities)
@@ -1830,58 +1936,77 @@ void PythonScriptScannerImpl::ResetStatistics() {
     std::string_view source) {
 
     std::vector<std::string> iocs;
-    std::string sourceStr(source);
 
     if (source.empty()) {
         return iocs;
     }
 
-    // Extract URLs
-    std::regex urlPattern(R"((https?://[^\s\"'\)\]>]+))");
-    std::sregex_iterator urlBegin(sourceStr.begin(), sourceStr.end(), urlPattern);
-    std::sregex_iterator urlEnd;
+    // Enforce regex input size limit to prevent ReDoS
+    std::string sourceStr(source.substr(0,
+        std::min(source.size(), PythonConstants::MAX_REGEX_INPUT_SIZE)));
 
-    for (auto it = urlBegin; it != urlEnd && iocs.size() < 100; ++it) {
+    // Extract URLs
+    static const std::regex urlPattern(R"((https?://[^\s\"'\)\]>]+))");
+    std::sregex_iterator urlBegin(sourceStr.begin(), sourceStr.end(), urlPattern);
+    std::sregex_iterator iterEnd;  // default-constructed sentinel
+
+    for (auto it = urlBegin; it != iterEnd && iocs.size() < 100; ++it) {
         std::string url = it->str();
         if (std::find(iocs.begin(), iocs.end(), url) == iocs.end()) {
-            iocs.push_back(url);
+            iocs.push_back(std::move(url));
         }
     }
 
     // Extract IP addresses
-    std::regex ipPattern(R"(\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b)");
+    static const std::regex ipPattern(R"(\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b)");
     std::sregex_iterator ipBegin(sourceStr.begin(), sourceStr.end(), ipPattern);
 
-    for (auto it = ipBegin; it != urlEnd && iocs.size() < 100; ++it) {
+    for (auto it = ipBegin; it != iterEnd && iocs.size() < 100; ++it) {
         std::string ip = it->str();
 
+        // Validate octet ranges (0-255)
+        bool validIp = true;
+        std::istringstream ipStream(ip);
+        std::string octet;
+        while (std::getline(ipStream, octet, '.')) {
+            int val = std::stoi(octet);
+            if (val < 0 || val > 255) { validIp = false; break; }
+        }
+
+        if (!validIp) continue;
+
         // Skip common non-malicious IPs
-        if (ip == "127.0.0.1" || ip == "0.0.0.0" || ip.substr(0, 3) == "10.") {
+        if (ip == "127.0.0.1" || ip == "0.0.0.0" ||
+            ip.starts_with("10.") || ip.starts_with("192.168.") ||
+            ip.starts_with("172.16.") || ip.starts_with("169.254.")) {
             continue;
         }
 
         if (std::find(iocs.begin(), iocs.end(), ip) == iocs.end()) {
-            iocs.push_back(ip);
+            iocs.push_back(std::move(ip));
         }
     }
 
     // Extract domains
-    std::regex domainPattern(R"(\b([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b)");
+    static const std::regex domainPattern(
+        R"(\b([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b)");
     std::sregex_iterator domainBegin(sourceStr.begin(), sourceStr.end(), domainPattern);
 
-    for (auto it = domainBegin; it != urlEnd && iocs.size() < 100; ++it) {
+    for (auto it = domainBegin; it != iterEnd && iocs.size() < 100; ++it) {
         std::string domain = it->str();
 
         // Skip common non-malicious domains
         if (domain.find("python.org") != std::string::npos ||
             domain.find("pypi.org") != std::string::npos ||
             domain.find("github.com") != std::string::npos ||
-            domain.find("google.com") != std::string::npos) {
+            domain.find("google.com") != std::string::npos ||
+            domain.find("microsoft.com") != std::string::npos ||
+            domain.find("stackoverflow.com") != std::string::npos) {
             continue;
         }
 
         if (std::find(iocs.begin(), iocs.end(), domain) == iocs.end()) {
-            iocs.push_back(domain);
+            iocs.push_back(std::move(domain));
         }
     }
 
@@ -1950,10 +2075,30 @@ PythonScriptScannerImpl::FindFlaggedLines(std::string_view source) {
         names.push_back("System Enumeration");
     if (capVal & static_cast<uint32_t>(PythonCapability::ProcessInjection))
         names.push_back("Process Injection");
+    if (capVal & static_cast<uint32_t>(PythonCapability::AntiVM))
+        names.push_back("Anti-VM");
+    if (capVal & static_cast<uint32_t>(PythonCapability::AntiDebug))
+        names.push_back("Anti-Debug");
+    if (capVal & static_cast<uint32_t>(PythonCapability::SelfModifying))
+        names.push_back("Self-Modifying Code");
     if (capVal & static_cast<uint32_t>(PythonCapability::DynamicExecution))
         names.push_back("Dynamic Execution");
     if (capVal & static_cast<uint32_t>(PythonCapability::ShellAccess))
         names.push_back("Shell Access");
+    if (capVal & static_cast<uint32_t>(PythonCapability::EmailAccess))
+        names.push_back("Email Access");
+    if (capVal & static_cast<uint32_t>(PythonCapability::BrowserManipulation))
+        names.push_back("Browser Manipulation");
+    if (capVal & static_cast<uint32_t>(PythonCapability::ShellcodeInjection))
+        names.push_back("Shellcode Injection");
+    if (capVal & static_cast<uint32_t>(PythonCapability::LsassDumping))
+        names.push_back("LSASS Credential Dump");
+    if (capVal & static_cast<uint32_t>(PythonCapability::C2Communication))
+        names.push_back("C2 Communication");
+    if (capVal & static_cast<uint32_t>(PythonCapability::AttackFramework))
+        names.push_back("Attack Framework");
+    if (capVal & static_cast<uint32_t>(PythonCapability::ReverseShell))
+        names.push_back("Reverse Shell");
 
     return names;
 }
@@ -1962,12 +2107,12 @@ PythonScriptScannerImpl::FindFlaggedLines(std::string_view source) {
     std::span<const uint8_t> content,
     PythonBytecodeInfo& outInfo) {
 
-    if (content.size() < 16) {
+    if (content.size() < 8) {
         return false;
     }
 
-    // Read magic number (first 4 bytes, but only first 2 are version-specific)
-    outInfo.magicNumber = *reinterpret_cast<const uint32_t*>(content.data());
+    // Safe aligned reads via memcpy
+    std::memcpy(&outInfo.magicNumber, content.data(), sizeof(uint32_t));
 
     // Detect version from magic
     outInfo.version = DetectPythonVersionFromMagic(outInfo.magicNumber);
@@ -1976,20 +2121,20 @@ PythonScriptScannerImpl::FindFlaggedLines(std::string_view source) {
     // Python 3.0-3.2: magic(4) + timestamp(4)
     // Python 3.3+: magic(4) + bit_field(4) + timestamp(4) + source_size(4)
 
+    uint16_t versionVal = static_cast<uint16_t>(outInfo.version);
+
     if (outInfo.version == PythonVersion::Python27) {
-        if (content.size() >= 8) {
-            outInfo.timestamp = *reinterpret_cast<const uint32_t*>(content.data() + 4);
-        }
-    } else if (static_cast<uint8_t>(outInfo.version) >= 33) {
-        // Python 3.3+
+        std::memcpy(&outInfo.timestamp, content.data() + 4, sizeof(uint32_t));
+    } else if (versionVal >= 35) {
+        // Python 3.3+ header with bit_field
         if (content.size() >= 16) {
-            outInfo.timestamp = *reinterpret_cast<const uint32_t*>(content.data() + 8);
-            outInfo.sourceSize = *reinterpret_cast<const uint32_t*>(content.data() + 12);
+            std::memcpy(&outInfo.timestamp, content.data() + 8, sizeof(uint32_t));
+            std::memcpy(&outInfo.sourceSize, content.data() + 12, sizeof(uint32_t));
         }
     } else {
         // Python 3.0-3.2
         if (content.size() >= 8) {
-            outInfo.timestamp = *reinterpret_cast<const uint32_t*>(content.data() + 4);
+            std::memcpy(&outInfo.timestamp, content.data() + 4, sizeof(uint32_t));
         }
     }
 
@@ -2003,19 +2148,29 @@ PythonScriptScannerImpl::FindFlaggedLines(std::string_view source) {
         return false;
     }
 
-    std::string contentStr(reinterpret_cast<const char*>(content.data()),
-                           std::min(content.size(), size_t(100000)));
+    // Scan a bounded portion for string markers
+    size_t scanLimit = std::min(content.size(), size_t(100000));
+    std::string_view contentView(reinterpret_cast<const char*>(content.data()), scanLimit);
 
-    // PyInstaller markers
-    if (contentStr.find("PyInstaller") != std::string::npos ||
-        contentStr.find("pyi-") != std::string::npos ||
-        contentStr.find("_MEIPASS") != std::string::npos ||
-        contentStr.find("MEI") != std::string::npos) {
+    // PyInstaller markers (specific enough to avoid false positives)
+    if (contentView.find("PyInstaller") != std::string_view::npos ||
+        contentView.find("pyi-") != std::string_view::npos ||
+        contentView.find("_MEIPASS") != std::string_view::npos) {
         return true;
     }
 
-    // Check for PyInstaller archive at end of file
-    // PyInstaller appends "MEI" marker followed by archive
+    // Check for the 8-byte MEI archive magic at the end of the file
+    // PyInstaller appends: 'M','E','I',0x0C,0x0B,0x0A,0x0B,0x0E
+    if (content.size() >= sizeof(PYINSTALLER_MARKER) + 24) {
+        // Marker is typically near the end of the file
+        size_t tailStart = content.size() > 4096 ? content.size() - 4096 : 0;
+        for (size_t i = tailStart; i + sizeof(PYINSTALLER_MARKER) <= content.size(); ++i) {
+            if (std::memcmp(content.data() + i, PYINSTALLER_MARKER,
+                            sizeof(PYINSTALLER_MARKER)) == 0) {
+                return true;
+            }
+        }
+    }
 
     return false;
 }
@@ -2027,12 +2182,12 @@ PythonScriptScannerImpl::FindFlaggedLines(std::string_view source) {
         return false;
     }
 
-    std::string contentStr(reinterpret_cast<const char*>(content.data()),
-                           std::min(content.size(), size_t(50000)));
+    size_t scanLimit = std::min(content.size(), size_t(50000));
+    std::string_view contentView(reinterpret_cast<const char*>(content.data()), scanLimit);
 
     // cx_Freeze markers
-    if (contentStr.find("cx_Freeze") != std::string::npos ||
-        contentStr.find("cxfreeze") != std::string::npos) {
+    if (contentView.find("cx_Freeze") != std::string_view::npos ||
+        contentView.find("cxfreeze") != std::string_view::npos) {
         return true;
     }
 
@@ -2046,12 +2201,12 @@ PythonScriptScannerImpl::FindFlaggedLines(std::string_view source) {
         return false;
     }
 
-    std::string contentStr(reinterpret_cast<const char*>(content.data()),
-                           std::min(content.size(), size_t(50000)));
+    size_t scanLimit = std::min(content.size(), size_t(50000));
+    std::string_view contentView(reinterpret_cast<const char*>(content.data()), scanLimit);
 
     // Nuitka markers
-    if (contentStr.find("Nuitka") != std::string::npos ||
-        contentStr.find("nuitka") != std::string::npos) {
+    if (contentView.find("Nuitka") != std::string_view::npos ||
+        contentView.find("nuitka") != std::string_view::npos) {
         return true;
     }
 
@@ -2192,7 +2347,7 @@ void PythonScriptScanner::UnregisterCallbacks() {
     m_impl->UnregisterCallbacks();
 }
 
-[[nodiscard]] PythonStatistics PythonScriptScanner::GetStatistics() const {
+[[nodiscard]] PythonStatisticsSnapshot PythonScriptScanner::GetStatistics() const {
     return m_impl->GetStatistics();
 }
 
@@ -2205,11 +2360,9 @@ void PythonScriptScanner::ResetStatistics() {
 }
 
 [[nodiscard]] std::string PythonScriptScanner::GetVersionString() noexcept {
-    std::ostringstream oss;
-    oss << PythonConstants::VERSION_MAJOR << "."
-        << PythonConstants::VERSION_MINOR << "."
-        << PythonConstants::VERSION_PATCH;
-    return oss.str();
+    return std::to_string(PythonConstants::VERSION_MAJOR) + "." +
+           std::to_string(PythonConstants::VERSION_MINOR) + "." +
+           std::to_string(PythonConstants::VERSION_PATCH);
 }
 
 }  // namespace Scripts

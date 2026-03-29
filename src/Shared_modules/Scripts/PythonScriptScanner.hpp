@@ -147,7 +147,7 @@
 #include "../PatternStore/PatternStore.hpp"
 #include "../SignatureStore/SignatureStore.hpp"
 #include "../HashStore/HashStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "../ThreatIntel/ThreatIntelStore.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -542,7 +542,28 @@ struct PythonScanResult {
 };
 
 /**
- * @brief Statistics
+ * @brief Thread-safe copyable snapshot of scanner statistics.
+ */
+struct PythonStatisticsSnapshot {
+    uint64_t totalScans = 0;
+    uint64_t maliciousDetected = 0;
+    uint64_t suspiciousDetected = 0;
+    uint64_t sourceFilesScanned = 0;
+    uint64_t bytecodeFilesScanned = 0;
+    uint64_t packedExecutablesScanned = 0;
+    uint64_t obfuscatedDetected = 0;
+    uint64_t decompileFailures = 0;
+    uint64_t extractionFailures = 0;
+    uint64_t totalBytesScanned = 0;
+    std::array<uint64_t, 16> byCategory{};
+    std::array<uint64_t, 32> byCapability{};
+    std::chrono::milliseconds uptime{0};
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Live statistics with atomic counters (non-copyable).
  */
 struct PythonStatistics {
     std::atomic<uint64_t> totalScans{0};
@@ -560,7 +581,9 @@ struct PythonStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
-    [[nodiscard]] std::string ToJson() const;
+
+    /// @brief Create a copyable, consistent snapshot of current statistics.
+    [[nodiscard]] PythonStatisticsSnapshot ToSnapshot() const noexcept;
 };
 
 /**
@@ -695,7 +718,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] PythonStatistics GetStatistics() const;
+    [[nodiscard]] PythonStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
