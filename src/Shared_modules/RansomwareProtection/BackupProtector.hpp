@@ -435,6 +435,9 @@ struct BackupProtectorConfiguration {
     /// @brief Kill process on detection
     bool killOnDetection = true;
     
+    /// @brief Default action for detected threats
+    ProtectionAction defaultAction = ProtectionAction::Block;
+    
     /// @brief Whitelisted processes (can perform backup operations)
     std::vector<std::wstring> whitelistedProcesses;
     
@@ -477,28 +480,28 @@ struct BackupProtectorConfiguration {
  */
 struct BackupProtectorStatistics {
     /// @brief Attempts blocked
-    std::atomic<uint64_t> attemptsBlocked{0};
+    uint64_t attemptsBlocked = 0;
     
     /// @brief Processes terminated
-    std::atomic<uint64_t> processesTerminated{0};
+    uint64_t processesTerminated = 0;
     
     /// @brief VSS deletions blocked
-    std::atomic<uint64_t> vssDeletesBlocked{0};
+    uint64_t vssDeletesBlocked = 0;
     
     /// @brief File deletions blocked
-    std::atomic<uint64_t> fileDeletesBlocked{0};
+    uint64_t fileDeletesBlocked = 0;
     
     /// @brief Service stops blocked
-    std::atomic<uint64_t> serviceStopsBlocked{0};
+    uint64_t serviceStopsBlocked = 0;
     
     /// @brief Registry changes blocked
-    std::atomic<uint64_t> registryChangesBlocked{0};
+    uint64_t registryChangesBlocked = 0;
     
     /// @brief Whitelisted operations allowed
-    std::atomic<uint64_t> whitelistedAllowed{0};
+    uint64_t whitelistedAllowed = 0;
     
     /// @brief By threat type
-    std::array<std::atomic<uint64_t>, 16> byThreatType{};
+    std::array<uint64_t, 16> byThreatType{};
     
     /// @brief Start time
     TimePoint startTime = Clock::now();
@@ -570,6 +573,16 @@ public:
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
     [[nodiscard]] ModuleStatus GetStatus() const noexcept;
+    
+    /**
+     * @brief Update configuration at runtime
+     */
+    [[nodiscard]] bool UpdateConfiguration(const BackupProtectorConfiguration& config);
+    
+    /**
+     * @brief Get current configuration snapshot
+     */
+    [[nodiscard]] BackupProtectorConfiguration GetConfiguration() const;
     
     // ========================================================================
     // DETECTION

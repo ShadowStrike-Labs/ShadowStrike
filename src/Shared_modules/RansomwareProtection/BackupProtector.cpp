@@ -36,25 +36,10 @@
  * - Meyers' Singleton for thread-safe instance management
  * - std::shared_mutex for concurrent read access
  * - RAII throughout for exception safety
+ * - Internal atomic counters, non-atomic public snapshot
  *
- * PERFORMANCE:
- * ============
- * - Lock-free statistics updates
- * - Compiled regex caching for command patterns
- * - Efficient whitelist lookups with hash sets
- * - LRU eviction for blocked attempt history
- *
- * PROTECTION COVERAGE:
- * ====================
- * - vssadmin.exe (delete shadows, resize shadowstorage)
- * - wbadmin.exe (delete catalog, delete backup)
- * - bcdedit.exe (recoveryenabled No, bootstatuspolicy ignoreallfailures)
- * - wmic.exe (shadowcopy delete, shadowstorage delete)
- * - PowerShell (Get-WmiObject Win32_ShadowCopy...Delete)
- * - diskshadow.exe (automated VSS manipulation)
- * - Service stops (VSS, SDRSVC, wbengine)
- * - Registry changes (VSS settings, BCD)
- * - Backup file deletions (.bak, .vhd, .vmdk, .tib, etc.)
+ * LOCK ORDERING (to prevent deadlocks):
+ *   m_mutex > m_whitelistMutex > m_blockMutex > m_callbackMutex
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0
@@ -69,245 +54,320 @@
 #include "BackupProtector.hpp"
 
 #include <algorithm>
-#include <sstream>
-#include <iomanip>
-#include <regex>
+#include <filesystem>
 #include <deque>
+#include <regex>
 #include <unordered_set>
 
-// Third-party libraries
 #include <nlohmann/json.hpp>
 
-// ShadowStrike infrastructure
-#include "../Utils/Logger.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../Utils/FileUtils.hpp"
 #include "../Utils/StringUtils.hpp"
-#include "../Utils/RegistryUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
-
-// Windows-specific headers
-#ifdef _WIN32
-#include <vss.h>
-#include <vswriter.h>
-#include <vsbackup.h>
-#pragma comment(lib, "vssapi.lib")
-#endif
+#include "../Core/Process/ProcessKiller.hpp"
 
 namespace ShadowStrike {
 namespace Ransomware {
 
+namespace fs = std::filesystem;
+using Utils::StringUtils;
+
+static constexpr const wchar_t* kLogCat = L"BackupProtector";
+
+// RAII wrapper for SC_HANDLE to prevent leaks on error/exception paths
+struct ScHandleDeleter {
+    void operator()(SC_HANDLE h) const noexcept {
+        if (h) ::CloseServiceHandle(h);
+    }
+};
+using UniqueScHandle = std::unique_ptr<std::remove_pointer_t<SC_HANDLE>, ScHandleDeleter>;
+
+/// @brief Normalize a file path for consistent whitelist comparison.
+/// Lowercases, resolves \..\, //, forward-slashes, and trailing dots/spaces.
+[[nodiscard]] static std::wstring NormalizePathForWhitelist(std::wstring_view rawPath) {
+    if (rawPath.empty())
+        return {};
+    try {
+        // weakly_canonical resolves .., //, etc. without requiring the file to exist
+        fs::path canonical = fs::weakly_canonical(fs::path(rawPath));
+        return StringUtils::ToLowerCopy(canonical.wstring());
+    } catch (...) {
+        // Fallback: at minimum lowercase for case-insensitive comparison
+        return StringUtils::ToLowerCopy(std::wstring(rawPath));
+    }
+}
 // ============================================================================
-// INTERNAL STRUCTURES
+// ANONYMOUS NAMESPACE: BUILT-IN DATA
 // ============================================================================
 
 namespace {
 
-/**
- * @brief Built-in command patterns for ransomware detection
- */
+static constexpr size_t kMaxBlockedHistory = 1000;
+static constexpr size_t kMaxCmdLineLen     = 32768;
+
 std::vector<CommandPattern> CreateBuiltInPatterns() {
     std::vector<CommandPattern> patterns;
+    patterns.reserve(12);
 
-    // vssadmin delete shadows
+    // --- vssadmin delete shadows ---
     {
-        CommandPattern pattern;
-        pattern.patternName = "vssadmin_delete_shadows";
-        pattern.toolType = DangerousToolType::VSSAdmin;
-        pattern.threatType = BackupThreatType::VSSDelete;
-        pattern.regexPattern = LR"(vssadmin\.exe.*delete\s+shadows)";
-        pattern.keywords = {L"delete", L"shadows", L"/all", L"/quiet"};
-        pattern.description = "VSS shadow copy deletion via vssadmin";
-        pattern.recommendedAction = ProtectionAction::BlockKill;
-        pattern.caseSensitive = false;
-        patterns.push_back(pattern);
+        CommandPattern p;
+        p.patternName = "vssadmin_delete_shadows";
+        p.toolType = DangerousToolType::VSSAdmin;
+        p.threatType = BackupThreatType::VSSDelete;
+        p.regexPattern = LR"(vssadmin[\.\s\\/]*exe.*delete\s+shadows)";
+        p.keywords = {L"delete", L"shadows"};
+        p.description = "VSS shadow copy deletion via vssadmin";
+        p.recommendedAction = ProtectionAction::BlockKill;
+        patterns.push_back(std::move(p));
     }
 
-    // vssadmin resize shadowstorage
+    // --- vssadmin resize shadowstorage ---
     {
-        CommandPattern pattern;
-        pattern.patternName = "vssadmin_resize_shadowstorage";
-        pattern.toolType = DangerousToolType::VSSAdmin;
-        pattern.threatType = BackupThreatType::VSSResize;
-        pattern.regexPattern = LR"(vssadmin\.exe.*resize\s+shadowstorage)";
-        pattern.keywords = {L"resize", L"shadowstorage", L"/maxsize="};
-        pattern.description = "VSS shadow storage resize (often to 0)";
-        pattern.recommendedAction = ProtectionAction::Block;
-        pattern.caseSensitive = false;
-        patterns.push_back(pattern);
+        CommandPattern p;
+        p.patternName = "vssadmin_resize_shadowstorage";
+        p.toolType = DangerousToolType::VSSAdmin;
+        p.threatType = BackupThreatType::VSSResize;
+        p.regexPattern = LR"(vssadmin[\.\s\\/]*exe.*resize\s+shadowstorage)";
+        p.keywords = {L"resize", L"shadowstorage"};
+        p.description = "VSS shadow storage resize (ransomware sets to 0)";
+        p.recommendedAction = ProtectionAction::Block;
+        patterns.push_back(std::move(p));
     }
 
-    // wbadmin delete catalog
+    // --- wbadmin delete ---
     {
-        CommandPattern pattern;
-        pattern.patternName = "wbadmin_delete_catalog";
-        pattern.toolType = DangerousToolType::WBAdmin;
-        pattern.threatType = BackupThreatType::BackupDelete;
-        pattern.regexPattern = LR"(wbadmin\.exe.*delete\s+(catalog|backup))";
-        pattern.keywords = {L"delete", L"catalog", L"backup", L"/quiet"};
-        pattern.description = "Windows Backup catalog deletion";
-        pattern.recommendedAction = ProtectionAction::BlockKill;
-        pattern.caseSensitive = false;
-        patterns.push_back(pattern);
+        CommandPattern p;
+        p.patternName = "wbadmin_delete";
+        p.toolType = DangerousToolType::WBAdmin;
+        p.threatType = BackupThreatType::BackupDelete;
+        p.regexPattern = LR"(wbadmin[\.\s\\/]*exe.*delete\s+(catalog|backup|systemstatebackup))";
+        p.keywords = {L"delete"};
+        p.description = "Windows Backup catalog or backup deletion";
+        p.recommendedAction = ProtectionAction::BlockKill;
+        patterns.push_back(std::move(p));
     }
 
-    // bcdedit recovery disable
+    // --- bcdedit recovery disable ---
     {
-        CommandPattern pattern;
-        pattern.patternName = "bcdedit_recovery_disable";
-        pattern.toolType = DangerousToolType::BCDEdit;
-        pattern.threatType = BackupThreatType::RecoveryDisable;
-        pattern.regexPattern = LR"(bcdedit\.exe.*/set.*recoveryenabled\s+no)";
-        pattern.keywords = {L"/set", L"recoveryenabled", L"no"};
-        pattern.description = "Disable Windows Recovery";
-        pattern.recommendedAction = ProtectionAction::BlockKill;
-        pattern.caseSensitive = false;
-        patterns.push_back(pattern);
+        CommandPattern p;
+        p.patternName = "bcdedit_recovery_disable";
+        p.toolType = DangerousToolType::BCDEdit;
+        p.threatType = BackupThreatType::RecoveryDisable;
+        p.regexPattern = LR"(bcdedit[\.\s\\/]*exe.*/set.*recoveryenabled\s+no)";
+        p.keywords = {L"/set", L"recoveryenabled", L"no"};
+        p.description = "Disable Windows Recovery via bcdedit";
+        p.recommendedAction = ProtectionAction::BlockKill;
+        patterns.push_back(std::move(p));
     }
 
-    // bcdedit bootstatuspolicy ignore
+    // --- bcdedit bootstatuspolicy ---
     {
-        CommandPattern pattern;
-        pattern.patternName = "bcdedit_bootstatuspolicy_ignore";
-        pattern.toolType = DangerousToolType::BCDEdit;
-        pattern.threatType = BackupThreatType::BootConfigChange;
-        pattern.regexPattern = LR"(bcdedit\.exe.*/set.*bootstatuspolicy\s+ignoreallfailures)";
-        pattern.keywords = {L"/set", L"bootstatuspolicy", L"ignoreallfailures"};
-        pattern.description = "Ignore boot failures (hide ransomware damage)";
-        pattern.recommendedAction = ProtectionAction::BlockKill;
-        pattern.caseSensitive = false;
-        patterns.push_back(pattern);
+        CommandPattern p;
+        p.patternName = "bcdedit_bootstatuspolicy";
+        p.toolType = DangerousToolType::BCDEdit;
+        p.threatType = BackupThreatType::BootConfigChange;
+        p.regexPattern = LR"(bcdedit[\.\s\\/]*exe.*/set.*bootstatuspolicy\s+ignoreallfailures)";
+        p.keywords = {L"/set", L"bootstatuspolicy", L"ignoreallfailures"};
+        p.description = "Hide boot failures to mask ransomware damage";
+        p.recommendedAction = ProtectionAction::BlockKill;
+        patterns.push_back(std::move(p));
     }
 
-    // wmic shadowcopy delete
+    // --- wmic shadowcopy delete ---
     {
-        CommandPattern pattern;
-        pattern.patternName = "wmic_shadowcopy_delete";
-        pattern.toolType = DangerousToolType::WMIC;
-        pattern.threatType = BackupThreatType::WMIShadowDelete;
-        pattern.regexPattern = LR"(wmic\.exe.*shadowcopy.*delete)";
-        pattern.keywords = {L"shadowcopy", L"delete", L"/nointeractive"};
-        pattern.description = "WMI-based shadow copy deletion";
-        pattern.recommendedAction = ProtectionAction::BlockKill;
-        pattern.caseSensitive = false;
-        patterns.push_back(pattern);
+        CommandPattern p;
+        p.patternName = "wmic_shadowcopy_delete";
+        p.toolType = DangerousToolType::WMIC;
+        p.threatType = BackupThreatType::WMIShadowDelete;
+        p.regexPattern = LR"(wmic[\.\s\\/]*exe.*shadowcopy.*delete)";
+        p.keywords = {L"shadowcopy", L"delete"};
+        p.description = "WMI-based shadow copy deletion";
+        p.recommendedAction = ProtectionAction::BlockKill;
+        patterns.push_back(std::move(p));
     }
 
-    // PowerShell WMI shadow copy deletion
+    // --- PowerShell Get-WmiObject Win32_ShadowCopy .Delete() ---
     {
-        CommandPattern pattern;
-        pattern.patternName = "powershell_wmi_shadowcopy_delete";
-        pattern.toolType = DangerousToolType::PowerShell;
-        pattern.threatType = BackupThreatType::WMIShadowDelete;
-        pattern.regexPattern = LR"(Get-WmiObject.*Win32_ShadowCopy.*\.Delete\(\))";
-        pattern.keywords = {L"Get-WmiObject", L"Win32_ShadowCopy", L"Delete"};
-        pattern.description = "PowerShell WMI shadow copy deletion";
-        pattern.recommendedAction = ProtectionAction::BlockKill;
-        pattern.caseSensitive = false;
-        patterns.push_back(pattern);
+        CommandPattern p;
+        p.patternName = "powershell_wmi_shadow_delete";
+        p.toolType = DangerousToolType::PowerShell;
+        p.threatType = BackupThreatType::WMIShadowDelete;
+        p.regexPattern = LR"(Get-WmiObject.*Win32_ShadowCopy.*\.Delete\b)";
+        p.keywords = {L"Win32_ShadowCopy", L"Delete"};
+        p.description = "PowerShell WMI shadow copy deletion";
+        p.recommendedAction = ProtectionAction::BlockKill;
+        patterns.push_back(std::move(p));
     }
 
-    // PowerShell VSS deletion (alternative syntax)
+    // --- PowerShell CIM shadow copy ---
     {
-        CommandPattern pattern;
-        pattern.patternName = "powershell_vss_delete";
-        pattern.toolType = DangerousToolType::PowerShell;
-        pattern.threatType = BackupThreatType::VSSDelete;
-        pattern.regexPattern = LR"((Get-)?CimInstance.*Win32_ShadowCopy.*Remove)";
-        pattern.keywords = {L"CimInstance", L"Win32_ShadowCopy", L"Remove"};
-        pattern.description = "PowerShell CIM shadow copy deletion";
-        pattern.recommendedAction = ProtectionAction::BlockKill;
-        pattern.caseSensitive = false;
-        patterns.push_back(pattern);
+        CommandPattern p;
+        p.patternName = "powershell_cim_shadow_delete";
+        p.toolType = DangerousToolType::PowerShell;
+        p.threatType = BackupThreatType::VSSDelete;
+        p.regexPattern = LR"((Get-|Remove-)?CimInstance.*Win32_ShadowCopy)";
+        p.keywords = {L"CimInstance", L"Win32_ShadowCopy"};
+        p.description = "PowerShell CIM shadow copy removal";
+        p.recommendedAction = ProtectionAction::BlockKill;
+        patterns.push_back(std::move(p));
     }
 
-    // diskshadow automated
+    // --- diskshadow scripted ---
     {
-        CommandPattern pattern;
-        pattern.patternName = "diskshadow_script";
-        pattern.toolType = DangerousToolType::DiskShadow;
-        pattern.threatType = BackupThreatType::VSSDelete;
-        pattern.regexPattern = LR"(diskshadow\.exe.*/s)";
-        pattern.keywords = {L"/s", L"delete", L"shadows"};
-        pattern.description = "DiskShadow scripted VSS manipulation";
-        pattern.recommendedAction = ProtectionAction::Block;
-        pattern.caseSensitive = false;
-        patterns.push_back(pattern);
+        CommandPattern p;
+        p.patternName = "diskshadow_script";
+        p.toolType = DangerousToolType::DiskShadow;
+        p.threatType = BackupThreatType::VSSDelete;
+        p.regexPattern = LR"(diskshadow[\.\s\\/]*exe.*/s)";
+        p.keywords = {L"/s"};
+        p.description = "DiskShadow scripted VSS manipulation";
+        p.recommendedAction = ProtectionAction::Block;
+        patterns.push_back(std::move(p));
+    }
+
+    // --- VSS service stop via net/sc/PowerShell ---
+    {
+        CommandPattern p;
+        p.patternName = "vss_service_stop";
+        p.toolType = DangerousToolType::CMD;
+        p.threatType = BackupThreatType::ServiceStop;
+        p.regexPattern = LR"((Stop-Service|sc\s+stop|net\s+stop)\s+.*VSS)";
+        p.keywords = {L"VSS"};
+        p.description = "VSS service stop via command line";
+        p.recommendedAction = ProtectionAction::BlockKill;
+        patterns.push_back(std::move(p));
+    }
+
+    // --- bcdedit safeboot (forces safe mode reboot to bypass AV) ---
+    {
+        CommandPattern p;
+        p.patternName = "bcdedit_safeboot";
+        p.toolType = DangerousToolType::BCDEdit;
+        p.threatType = BackupThreatType::BootConfigChange;
+        p.regexPattern = LR"(bcdedit[\.\s\\/]*exe.*/set.*safeboot)";
+        p.keywords = {L"/set", L"safeboot"};
+        p.description = "Force safe-mode reboot (ransomware evasion)";
+        p.recommendedAction = ProtectionAction::BlockKill;
+        patterns.push_back(std::move(p));
     }
 
     return patterns;
 }
 
-/**
- * @brief Protected services that ransomware tries to stop
- */
-const std::vector<std::wstring> PROTECTED_SERVICES = {
-    L"VSS",           // Volume Shadow Copy
-    L"SDRSVC",        // Windows Backup
-    L"wbengine",      // Block Level Backup Engine
-    L"swprv",         // Software Shadow Copy Provider
-    L"MSSQLServerADHelper100"  // SQL Server VSS Writer
+const std::vector<std::wstring> kProtectedServiceNames = {
+    L"VSS",
+    L"SDRSVC",
+    L"wbengine",
+    L"swprv",
+    L"MSSQLServerADHelper100"
 };
 
-/**
- * @brief Protected registry keys (VSS configuration)
- */
-const std::vector<std::wstring> PROTECTED_REGISTRY_KEYS = {
+const std::vector<std::wstring> kProtectedRegistryPaths = {
     LR"(SYSTEM\CurrentControlSet\Services\VSS)",
     LR"(SYSTEM\CurrentControlSet\Control\BackupRestore)",
     LR"(SYSTEM\CurrentControlSet\Control\Session Manager\Boot Manager)",
     LR"(SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore)"
 };
 
-} // anonymous namespace
+}  // anonymous namespace
+// ============================================================================
+// INTERNAL STATS (THREAD-SAFE ATOMIC COUNTERS)
+// ============================================================================
+
+struct InternalStats {
+    std::atomic<uint64_t> attemptsBlocked{0};
+    std::atomic<uint64_t> processesTerminated{0};
+    std::atomic<uint64_t> vssDeletesBlocked{0};
+    std::atomic<uint64_t> fileDeletesBlocked{0};
+    std::atomic<uint64_t> serviceStopsBlocked{0};
+    std::atomic<uint64_t> registryChangesBlocked{0};
+    std::atomic<uint64_t> whitelistedAllowed{0};
+    std::array<std::atomic<uint64_t>, 16> byThreatType{};
+    TimePoint startTime = Clock::now();
+
+    void Reset() noexcept {
+        attemptsBlocked.store(0, std::memory_order_relaxed);
+        processesTerminated.store(0, std::memory_order_relaxed);
+        vssDeletesBlocked.store(0, std::memory_order_relaxed);
+        fileDeletesBlocked.store(0, std::memory_order_relaxed);
+        serviceStopsBlocked.store(0, std::memory_order_relaxed);
+        registryChangesBlocked.store(0, std::memory_order_relaxed);
+        whitelistedAllowed.store(0, std::memory_order_relaxed);
+        for (auto& c : byThreatType)
+            c.store(0, std::memory_order_relaxed);
+        startTime = Clock::now();
+    }
+
+    [[nodiscard]] BackupProtectorStatistics Snapshot() const noexcept {
+        BackupProtectorStatistics s;
+        s.attemptsBlocked      = attemptsBlocked.load(std::memory_order_relaxed);
+        s.processesTerminated  = processesTerminated.load(std::memory_order_relaxed);
+        s.vssDeletesBlocked    = vssDeletesBlocked.load(std::memory_order_relaxed);
+        s.fileDeletesBlocked   = fileDeletesBlocked.load(std::memory_order_relaxed);
+        s.serviceStopsBlocked  = serviceStopsBlocked.load(std::memory_order_relaxed);
+        s.registryChangesBlocked = registryChangesBlocked.load(std::memory_order_relaxed);
+        s.whitelistedAllowed   = whitelistedAllowed.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < s.byThreatType.size(); ++i)
+            s.byThreatType[i] = byThreatType[i].load(std::memory_order_relaxed);
+        s.startTime = startTime;
+        return s;
+    }
+};
 
 // ============================================================================
-// BACKUP PROTECTOR IMPLEMENTATION (PIMPL)
+// PIMPL IMPLEMENTATION CLASS
 // ============================================================================
 
 class BackupProtectorImpl {
 public:
-    BackupProtectorImpl();
-    ~BackupProtectorImpl();
+    BackupProtectorImpl() {
+        SS_LOG_DEBUG(kLogCat, L"Impl instance created");
+    }
 
-    // Lifecycle
+    ~BackupProtectorImpl() {
+        Shutdown();
+    }
+
+    // --- Lifecycle ---
     bool Initialize(const BackupProtectorConfiguration& config);
     void Shutdown();
-    bool IsInitialized() const noexcept { return m_initialized.load(std::memory_order_acquire); }
-    ModuleStatus GetStatus() const noexcept { return m_status.load(std::memory_order_acquire); }
-
+    [[nodiscard]] bool IsInitialized() const noexcept {
+        return m_initialized.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] ModuleStatus GetStatus() const noexcept {
+        return m_status.load(std::memory_order_acquire);
+    }
     bool UpdateConfiguration(const BackupProtectorConfiguration& config);
     BackupProtectorConfiguration GetConfiguration() const;
 
-    // Detection
+    // --- Detection ---
     bool IsDestructiveTool(const std::wstring& imagePath, const std::wstring& commandLine);
     std::optional<BlockedAttempt> AnalyzeProcess(uint32_t pid, std::wstring_view imagePath,
-                                                   std::wstring_view commandLine);
+                                                  std::wstring_view commandLine);
     bool IsDestructiveCommand(std::wstring_view commandLine);
     bool IsProtectedBackupFile(const std::wstring& filePath);
     bool ShouldBlockFileAccess(std::wstring_view filePath, uint32_t pid, uint32_t desiredAccess);
 
-    // Service Protection
+    // --- Service protection ---
     void LockVSSService();
     void UnlockVSSService();
     bool ShouldBlockServiceOperation(std::wstring_view serviceName, uint32_t operation, uint32_t pid);
 
-    // Registry Protection
+    // --- Registry protection ---
     bool ShouldBlockRegistryOperation(std::wstring_view keyPath, std::wstring_view valueName,
                                       uint32_t operation, uint32_t pid);
 
-    // Whitelist
+    // --- Whitelist ---
     void AddToWhitelist(std::wstring_view processPath);
     void RemoveFromWhitelist(std::wstring_view processPath);
     bool IsWhitelisted(std::wstring_view processPath) const;
     void WhitelistSigner(std::wstring_view signerName);
 
-    // Callbacks
+    // --- Callbacks ---
     void SetBlockCallback(BlockCallback callback);
     void SetDecisionCallback(DecisionCallback callback);
 
-    // Statistics
+    // --- Statistics ---
     BackupProtectorStatistics GetStatistics() const;
     void ResetStatistics();
     std::vector<BlockedAttempt> GetRecentBlocks(size_t maxCount) const;
@@ -315,189 +375,179 @@ public:
     bool SelfTest();
 
 private:
-    // Helper functions
-    DangerousToolType IdentifyTool(std::wstring_view imagePath);
+    // --- Helpers ---
+    DangerousToolType IdentifyToolType(std::wstring_view imagePath);
     std::optional<CommandPattern> MatchCommandPattern(std::wstring_view commandLine);
     ProtectionAction DetermineAction(const BlockedAttempt& attempt);
     void RecordBlockedAttempt(const BlockedAttempt& attempt);
     void NotifyBlock(const BlockedAttempt& attempt);
-    ProtectionAction QueryDecision(uint32_t pid, const std::wstring& commandLine,
-                                    BackupThreatType threatType);
+    ProtectionAction QueryDecision(uint32_t pid, const std::wstring& cmdLine,
+                                   BackupThreatType threatType);
     bool IsFileProtectedExtension(std::wstring_view filePath);
     bool IsServiceProtected(std::wstring_view serviceName);
     bool IsRegistryKeyProtected(std::wstring_view keyPath);
     std::wstring GetProcessImagePath(uint32_t pid);
-    std::wstring GetProcessCommandLine(uint32_t pid);
     uint32_t GetParentProcessId(uint32_t pid);
+    void ExecuteTermination(uint32_t pid, const BlockedAttempt& attempt);
 
-    // Member variables
+    // --- Members (lock ordering: m_mutex > m_whitelistMutex > m_blockMutex > m_callbackMutex) ---
     mutable std::shared_mutex m_mutex;
-    std::atomic<bool> m_initialized{false};
+    std::atomic<bool>         m_initialized{false};
     std::atomic<ModuleStatus> m_status{ModuleStatus::Uninitialized};
     BackupProtectorConfiguration m_config;
 
-    // Patterns
-    std::vector<CommandPattern> m_patterns;
-    std::unordered_map<std::wstring, std::wregex> m_compiledPatterns;
+    std::vector<CommandPattern>                     m_patterns;
+    std::unordered_map<std::string, std::wregex>    m_compiledPatterns;
 
-    // Whitelist
-    mutable std::shared_mutex m_whitelistMutex;
-    std::unordered_set<std::wstring> m_whitelistedPaths;
-    std::unordered_set<std::wstring> m_whitelistedSigners;
+    mutable std::shared_mutex                       m_whitelistMutex;
+    std::unordered_set<std::wstring>                m_whitelistedPaths;
+    std::unordered_set<std::wstring>                m_whitelistedSigners;
 
-    // Blocked attempts history
-    mutable std::mutex m_blockMutex;
-    std::deque<BlockedAttempt> m_blockedAttempts;
-    static constexpr size_t MAX_BLOCKED_LOG = 1000;
-    std::atomic<uint64_t> m_attemptIdCounter{1};
+    mutable std::mutex                              m_blockMutex;
+    std::deque<BlockedAttempt>                      m_blockedAttempts;
+    std::atomic<uint64_t>                           m_attemptIdCounter{1};
 
-    // Callbacks
-    mutable std::mutex m_callbackMutex;
-    BlockCallback m_blockCallback;
-    DecisionCallback m_decisionCallback;
+    mutable std::mutex                              m_callbackMutex;
+    BlockCallback                                   m_blockCallback;
+    DecisionCallback                                m_decisionCallback;
 
-    // Statistics
-    mutable BackupProtectorStatistics m_stats;
+    InternalStats                                   m_stats;
+    std::atomic<bool>                               m_vssLocked{false};
 
-    // Infrastructure references
-    Whitelist::WhiteListStore* m_whitelistStore = nullptr;
+    Whitelist::WhiteListStore*                      m_whitelistStore = nullptr;
 };
-
 // ============================================================================
-// IMPLEMENTATION
+// LIFECYCLE
 // ============================================================================
-
-BackupProtectorImpl::BackupProtectorImpl() {
-    Logger::Info("[BackupProtector] Instance created");
-}
-
-BackupProtectorImpl::~BackupProtectorImpl() {
-    Shutdown();
-    Logger::Info("[BackupProtector] Instance destroyed");
-}
 
 bool BackupProtectorImpl::Initialize(const BackupProtectorConfiguration& config) {
     std::unique_lock lock(m_mutex);
 
     if (m_initialized.load(std::memory_order_acquire)) {
-        Logger::Warn("[BackupProtector] Already initialized");
+        SS_LOG_WARN(kLogCat, L"Already initialized - ignoring duplicate call");
         return true;
     }
 
+    m_status.store(ModuleStatus::Initializing, std::memory_order_release);
+
+    if (!config.IsValid()) {
+        SS_LOG_ERROR(kLogCat, L"Configuration validation failed");
+        m_status.store(ModuleStatus::Error, std::memory_order_release);
+        return false;
+    }
+
     try {
-        m_status.store(ModuleStatus::Initializing, std::memory_order_release);
-
-        // Validate configuration
-        if (!config.IsValid()) {
-            Logger::Error("[BackupProtector] Invalid configuration");
-            m_status.store(ModuleStatus::Error, std::memory_order_release);
-            return false;
-        }
-
         m_config = config;
 
-        // Initialize infrastructure references
+        // Resolve WhiteListStore (non-fatal if unavailable)
         try {
             m_whitelistStore = &Whitelist::WhiteListStore::Instance();
         } catch (const std::exception& e) {
-            Logger::Warn("[BackupProtector] WhiteListStore not available: {}", e.what());
+            SS_LOG_WARN(kLogCat, L"WhiteListStore unavailable: %hs", e.what());
             m_whitelistStore = nullptr;
         }
 
-        // Load built-in patterns
+        // Load built-in patterns, then append user-supplied patterns
         m_patterns = CreateBuiltInPatterns();
+        for (const auto& cp : m_config.commandPatterns)
+            m_patterns.push_back(cp);
 
-        // Add custom patterns
-        for (const auto& pattern : m_config.customPatterns) {
-            m_patterns.push_back(pattern);
-        }
-
-        // Compile regex patterns
-        for (const auto& pattern : m_patterns) {
+        // Compile regex for every pattern (cache once)
+        m_compiledPatterns.clear();
+        m_compiledPatterns.reserve(m_patterns.size());
+        for (const auto& pat : m_patterns) {
             try {
-                std::wregex regex(pattern.regexPattern,
-                    std::regex_constants::ECMAScript | std::regex_constants::icase);
-                m_compiledPatterns[pattern.patternName] = regex;
+                auto flags = std::regex_constants::ECMAScript | std::regex_constants::optimize;
+                if (!pat.caseSensitive)
+                    flags |= std::regex_constants::icase;
+                m_compiledPatterns.emplace(pat.patternName,
+                                           std::wregex(pat.regexPattern, flags));
             } catch (const std::regex_error& e) {
-                Logger::Error("[BackupProtector] Failed to compile pattern {}: {}",
-                    StringUtils::WStringToString(pattern.patternName), e.what());
+                SS_LOG_ERROR(kLogCat, L"Regex compile failed for pattern '%hs': %hs",
+                             pat.patternName.c_str(), e.what());
             }
         }
 
-        // Initialize whitelist
-        for (const auto& path : m_config.trustedProcesses) {
-            m_whitelistedPaths.insert(StringUtils::ToLowerW(path));
+        // Seed whitelist from config
+        {
+            std::unique_lock wlLock(m_whitelistMutex);
+            for (const auto& proc : m_config.whitelistedProcesses) {
+                if (proc.size() > 0 && m_whitelistedPaths.size() < BackupProtectorConstants::MAX_WHITELIST_SIZE)
+                    m_whitelistedPaths.insert(NormalizePathForWhitelist(proc));
+            }
+            for (const auto& signer : m_config.whitelistedSigners)
+                m_whitelistedSigners.insert(StringUtils::ToLowerCopy(signer));
         }
 
-        // Reset statistics
-        m_stats.Reset();
-        m_stats.startTime = Clock::now();
+        // If no custom protected extensions, load defaults
+        if (m_config.protectedExtensions.empty()) {
+            for (const auto* ext : BackupProtectorConstants::PROTECTED_EXTENSIONS)
+                m_config.protectedExtensions.emplace_back(ext);
+        }
 
+        m_stats.Reset();
         m_initialized.store(true, std::memory_order_release);
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-        Logger::Info("[BackupProtector] Initialized successfully (Version {}, {} patterns)",
-            BackupProtector::GetVersionString(), m_patterns.size());
-
+        SS_LOG_INFO(kLogCat, L"Initialized v%hs with %zu patterns, %zu whitelisted",
+                    BackupProtector::GetVersionString().c_str(),
+                    m_patterns.size(), m_whitelistedPaths.size());
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Critical("[BackupProtector] Initialization failed: {}", e.what());
+        SS_LOG_FATAL(kLogCat, L"Initialization failed: %hs", e.what());
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     } catch (...) {
-        Logger::Critical("[BackupProtector] Initialization failed: Unknown error");
+        SS_LOG_FATAL(kLogCat, L"Initialization failed: unknown exception");
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     }
 }
 
 void BackupProtectorImpl::Shutdown() {
-    std::unique_lock lock(m_mutex);
-
-    if (!m_initialized.load(std::memory_order_acquire)) {
+    // Fast-path check (no lock needed for atomic read)
+    if (!m_initialized.load(std::memory_order_acquire))
         return;
-    }
 
-    try {
-        m_status.store(ModuleStatus::Stopping, std::memory_order_release);
+    m_status.store(ModuleStatus::Stopping, std::memory_order_release);
 
-        // Clear state
+    // Clear state under locks, respecting lock ordering
+    {
+        std::unique_lock lock(m_mutex);
         m_patterns.clear();
         m_compiledPatterns.clear();
+    }
+    {
+        std::unique_lock wlLock(m_whitelistMutex);
         m_whitelistedPaths.clear();
         m_whitelistedSigners.clear();
-        m_blockedAttempts.clear();
-
-        // Clear callbacks
-        {
-            std::lock_guard cbLock(m_callbackMutex);
-            m_blockCallback = nullptr;
-            m_decisionCallback = nullptr;
-        }
-
-        m_initialized.store(false, std::memory_order_release);
-        m_status.store(ModuleStatus::Stopped, std::memory_order_release);
-
-        Logger::Info("[BackupProtector] Shutdown complete");
-
-    } catch (const std::exception& e) {
-        Logger::Error("[BackupProtector] Shutdown error: {}", e.what());
-    } catch (...) {
-        Logger::Error("[BackupProtector] Shutdown error: Unknown exception");
     }
+    {
+        std::lock_guard blockLock(m_blockMutex);
+        m_blockedAttempts.clear();
+    }
+    {
+        std::lock_guard cbLock(m_callbackMutex);
+        m_blockCallback = nullptr;
+        m_decisionCallback = nullptr;
+    }
+
+    m_whitelistStore = nullptr;
+    m_initialized.store(false, std::memory_order_release);
+    m_status.store(ModuleStatus::Stopped, std::memory_order_release);
+    SS_LOG_INFO(kLogCat, L"Shutdown complete");
 }
 
 bool BackupProtectorImpl::UpdateConfiguration(const BackupProtectorConfiguration& config) {
-    std::unique_lock lock(m_mutex);
-
     if (!config.IsValid()) {
-        Logger::Error("[BackupProtector] Invalid configuration");
+        SS_LOG_ERROR(kLogCat, L"Invalid configuration rejected");
         return false;
     }
 
+    std::unique_lock lock(m_mutex);
     m_config = config;
-    Logger::Info("[BackupProtector] Configuration updated");
+    SS_LOG_INFO(kLogCat, L"Configuration updated at runtime");
     return true;
 }
 
@@ -505,168 +555,175 @@ BackupProtectorConfiguration BackupProtectorImpl::GetConfiguration() const {
     std::shared_lock lock(m_mutex);
     return m_config;
 }
-
 // ============================================================================
 // DETECTION
 // ============================================================================
 
 bool BackupProtectorImpl::IsDestructiveTool(const std::wstring& imagePath,
                                              const std::wstring& commandLine) {
-    if (!m_initialized.load(std::memory_order_acquire)) {
+    if (!m_initialized.load(std::memory_order_acquire))
         return false;
-    }
 
-    // Check if whitelisted
     if (IsWhitelisted(imagePath)) {
-        m_stats.whitelistedAllowed++;
+        m_stats.whitelistedAllowed.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
-    // Identify tool type
-    DangerousToolType toolType = IdentifyTool(imagePath);
-    if (toolType == DangerousToolType::Unknown) {
+    if (IdentifyToolType(imagePath) == DangerousToolType::Unknown)
         return false;
-    }
 
-    // Check command line for destructive patterns
     return IsDestructiveCommand(commandLine);
 }
 
 std::optional<BlockedAttempt> BackupProtectorImpl::AnalyzeProcess(
-    uint32_t pid,
-    std::wstring_view imagePath,
-    std::wstring_view commandLine) {
+    uint32_t pid, std::wstring_view imagePath, std::wstring_view commandLine) {
 
-    if (!m_initialized.load(std::memory_order_acquire)) {
+    if (!m_initialized.load(std::memory_order_acquire))
         return std::nullopt;
-    }
 
-    // Check if whitelisted
+    // Validate inputs
+    if (imagePath.empty() || commandLine.empty() || commandLine.size() > kMaxCmdLineLen)
+        return std::nullopt;
+
     if (IsWhitelisted(imagePath)) {
-        m_stats.whitelistedAllowed++;
+        m_stats.whitelistedAllowed.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
     }
 
-    // Identify tool
-    DangerousToolType toolType = IdentifyTool(imagePath);
-    if (toolType == DangerousToolType::Unknown) {
+    DangerousToolType toolType = IdentifyToolType(imagePath);
+    if (toolType == DangerousToolType::Unknown)
         return std::nullopt;
-    }
 
-    // Match command pattern
     auto patternOpt = MatchCommandPattern(commandLine);
-    if (!patternOpt) {
+    if (!patternOpt)
         return std::nullopt;
-    }
 
-    const auto& pattern = *patternOpt;
+    const auto& matchedPattern = *patternOpt;
 
-    // Create blocked attempt
+    // Build blocked attempt record
     BlockedAttempt attempt;
     attempt.attemptId = m_attemptIdCounter.fetch_add(1, std::memory_order_relaxed);
     attempt.timestamp = std::chrono::system_clock::now();
     attempt.pid = pid;
-    attempt.processName = fs::path(imagePath).filename().wstring();
-    attempt.processPath = std::wstring(imagePath);
     attempt.commandLine = std::wstring(commandLine);
-    attempt.parentPid = GetParentProcessId(pid);
-    attempt.threatType = pattern.threatType;
+    attempt.threatType = matchedPattern.threatType;
     attempt.toolType = toolType;
 
-    // Get parent process name
+    // Resolve process metadata (best-effort, failures are non-fatal)
+    try {
+        fs::path imgFsPath(imagePath);
+        attempt.processName = imgFsPath.filename().wstring();
+        attempt.processPath = std::wstring(imagePath);
+    } catch (...) {
+        attempt.processPath = std::wstring(imagePath);
+    }
+
+    attempt.parentPid = GetParentProcessId(pid);
     if (attempt.parentPid != 0) {
-        attempt.parentName = fs::path(GetProcessImagePath(attempt.parentPid)).filename().wstring();
+        try {
+            auto parentPath = GetProcessImagePath(attempt.parentPid);
+            if (!parentPath.empty())
+                attempt.parentName = fs::path(parentPath).filename().wstring();
+        } catch (...) { /* best-effort */ }
     }
 
     // Determine action
     attempt.action = DetermineAction(attempt);
 
-    // Query decision callback if present
-    ProtectionAction callbackAction = QueryDecision(pid, attempt.commandLine, pattern.threatType);
-    if (callbackAction != ProtectionAction::Allow) {
-        attempt.action = callbackAction;
-    }
+    // Allow external decision callback to override
+    ProtectionAction cbAction = QueryDecision(pid, attempt.commandLine, matchedPattern.threatType);
+    if (cbAction != ProtectionAction::Allow)
+        attempt.action = cbAction;
 
-    // Record and notify
-    if (attempt.action == ProtectionAction::Block || attempt.action == ProtectionAction::BlockKill) {
+    // Execute block / block+kill
+    if (attempt.action == ProtectionAction::Block ||
+        attempt.action == ProtectionAction::BlockKill) {
+
         RecordBlockedAttempt(attempt);
         NotifyBlock(attempt);
 
-        m_stats.attemptsBlocked++;
+        m_stats.attemptsBlocked.fetch_add(1, std::memory_order_relaxed);
 
-        // Update specific counters
-        switch (pattern.threatType) {
+        auto threatIdx = static_cast<size_t>(matchedPattern.threatType);
+        if (threatIdx < m_stats.byThreatType.size())
+            m_stats.byThreatType[threatIdx].fetch_add(1, std::memory_order_relaxed);
+
+        switch (matchedPattern.threatType) {
             case BackupThreatType::VSSDelete:
-                m_stats.vssDeletesBlocked++;
+            case BackupThreatType::VSSResize:
+            case BackupThreatType::VSSDisable:
+            case BackupThreatType::WMIShadowDelete:
+                m_stats.vssDeletesBlocked.fetch_add(1, std::memory_order_relaxed);
                 break;
             case BackupThreatType::BackupDelete:
-                m_stats.fileDeletesBlocked++;
+                m_stats.fileDeletesBlocked.fetch_add(1, std::memory_order_relaxed);
                 break;
             case BackupThreatType::ServiceStop:
-                m_stats.serviceStopsBlocked++;
+                m_stats.serviceStopsBlocked.fetch_add(1, std::memory_order_relaxed);
                 break;
             default:
                 break;
         }
 
-        // Update threat type counter
-        if (static_cast<size_t>(pattern.threatType) < m_stats.byThreatType.size()) {
-            m_stats.byThreatType[static_cast<size_t>(pattern.threatType)]++;
-        }
+        SS_LOG_WARN(kLogCat,
+            L"BLOCKED PID=%u Tool=%hs Threat=%hs Action=%hs CmdLine=%.256ls",
+            pid,
+            GetToolTypeName(toolType).data(),
+            GetThreatTypeName(matchedPattern.threatType).data(),
+            GetProtectionActionName(attempt.action).data(),
+            std::wstring(commandLine).c_str());
 
-        Logger::Warn("[BackupProtector] Blocked attempt {} - PID: {}, Tool: {}, Threat: {}",
-            attempt.attemptId, pid,
-            GetDangerousToolTypeName(toolType),
-            GetBackupThreatTypeName(pattern.threatType));
+        // Terminate process if BlockKill
+        if (attempt.action == ProtectionAction::BlockKill)
+            ExecuteTermination(pid, attempt);
     }
 
     return attempt;
 }
 
 bool BackupProtectorImpl::IsDestructiveCommand(std::wstring_view commandLine) {
+    if (commandLine.empty() || commandLine.size() > kMaxCmdLineLen)
+        return false;
+
     std::shared_lock lock(m_mutex);
 
-    for (const auto& pattern : m_patterns) {
-        // Check keywords first (fast path)
-        bool hasAllKeywords = true;
-        for (const auto& keyword : pattern.keywords) {
-            std::wstring cmdLower = StringUtils::ToLowerW(std::wstring(commandLine));
-            std::wstring keywordLower = StringUtils::ToLowerW(keyword);
+    // Lowercase the command line ONCE outside the loop
+    const std::wstring cmdLower = StringUtils::ToLowerCopy(std::wstring(commandLine));
 
-            if (cmdLower.find(keywordLower) == std::wstring::npos) {
-                hasAllKeywords = false;
+    for (const auto& pattern : m_patterns) {
+        // Fast keyword check first
+        bool allMatch = true;
+        for (const auto& kw : pattern.keywords) {
+            if (cmdLower.find(StringUtils::ToLowerCopy(kw)) == std::wstring::npos) {
+                allMatch = false;
                 break;
             }
         }
-
-        if (!hasAllKeywords) {
+        if (!allMatch)
             continue;
-        }
 
-        // Check regex pattern
+        // Regex confirmation against the cached compiled pattern
         auto it = m_compiledPatterns.find(pattern.patternName);
         if (it != m_compiledPatterns.end()) {
             try {
-                if (std::regex_search(commandLine.begin(), commandLine.end(), it->second)) {
+                if (std::regex_search(commandLine.begin(), commandLine.end(), it->second))
                     return true;
-                }
             } catch (const std::regex_error&) {
+                // Malformed regex in pattern - skip, already logged at init
                 continue;
             }
         }
     }
-
     return false;
 }
 
 bool BackupProtectorImpl::IsProtectedBackupFile(const std::wstring& filePath) {
-    if (!m_initialized.load(std::memory_order_acquire)) {
+    if (!m_initialized.load(std::memory_order_acquire))
         return false;
-    }
 
-    if (!m_config.protectBackupFiles) {
+    std::shared_lock lock(m_mutex);
+    if (!m_config.protectBackupFiles)
         return false;
-    }
 
     return IsFileProtectedExtension(filePath);
 }
@@ -674,91 +731,135 @@ bool BackupProtectorImpl::IsProtectedBackupFile(const std::wstring& filePath) {
 bool BackupProtectorImpl::ShouldBlockFileAccess(std::wstring_view filePath,
                                                  uint32_t pid,
                                                  uint32_t desiredAccess) {
-    if (!m_initialized.load(std::memory_order_acquire)) {
+    if (!m_initialized.load(std::memory_order_acquire))
         return false;
+
+    {
+        std::shared_lock lock(m_mutex);
+        if (!m_config.protectBackupFiles)
+            return false;
     }
 
-    if (!m_config.protectBackupFiles) {
+    if (!IsFileProtectedExtension(filePath))
         return false;
-    }
 
-    // Check if it's a protected backup file
-    if (!IsFileProtectedExtension(filePath)) {
+    // Resolve caller image and check whitelist
+    std::wstring callerPath = GetProcessImagePath(pid);
+    if (IsWhitelisted(callerPath))
         return false;
-    }
 
-    // Check if process is whitelisted
-    std::wstring imagePath = GetProcessImagePath(pid);
-    if (IsWhitelisted(imagePath)) {
-        return false;
-    }
+    // Block delete, write-data, write-dac, and write-owner on backup files
+    constexpr uint32_t DANGEROUS_ACCESS =
+        DELETE                  |   // 0x00010000
+        FILE_WRITE_DATA         |   // 0x00000002
+        WRITE_DAC               |   // 0x00040000
+        WRITE_OWNER;                // 0x00080000
 
-    // Check if deletion is requested
-    constexpr uint32_t DELETE_ACCESS = 0x00010000;  // DELETE
-    if (desiredAccess & DELETE_ACCESS) {
-        Logger::Warn("[BackupProtector] Blocking delete access to backup file: {} from PID: {}",
-            StringUtils::WStringToString(std::wstring(filePath)), pid);
-
-        m_stats.fileDeletesBlocked++;
+    if (desiredAccess & DANGEROUS_ACCESS) {
+        SS_LOG_WARN(kLogCat,
+            L"Blocking file access: PID=%u Access=0x%08X Path=%.512ls",
+            pid, desiredAccess, std::wstring(filePath).c_str());
+        m_stats.fileDeletesBlocked.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
     return false;
 }
-
 // ============================================================================
 // SERVICE PROTECTION
 // ============================================================================
 
 void BackupProtectorImpl::LockVSSService() {
-    if (!m_initialized.load(std::memory_order_acquire)) {
+    if (!m_initialized.load(std::memory_order_acquire))
+        return;
+
+    if (m_vssLocked.exchange(true, std::memory_order_acq_rel)) {
+        SS_LOG_DEBUG(kLogCat, L"VSS service already locked");
         return;
     }
 
-    Logger::Info("[BackupProtector] VSS service lock requested (implementation platform-specific)");
-    // Platform-specific implementation would go here
+#ifdef _WIN32
+    UniqueScHandle hSCM(::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS));
+    if (!hSCM) {
+        SS_LOG_LAST_ERROR(kLogCat, L"OpenSCManagerW failed for VSS lock");
+        m_vssLocked.store(false, std::memory_order_release);
+        return;
+    }
+
+    UniqueScHandle hService(::OpenServiceW(hSCM.get(), L"VSS",
+                                            SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG));
+    if (!hService) {
+        SS_LOG_LAST_ERROR(kLogCat, L"OpenServiceW(VSS) failed");
+        m_vssLocked.store(false, std::memory_order_release);
+        return;
+    }
+
+    // Set auto-start to prevent disable
+    if (!::ChangeServiceConfigW(hService.get(), SERVICE_NO_CHANGE, SERVICE_AUTO_START,
+                                 SERVICE_NO_CHANGE, nullptr, nullptr, nullptr,
+                                 nullptr, nullptr, nullptr, nullptr)) {
+        SS_LOG_LAST_ERROR(kLogCat, L"ChangeServiceConfigW(VSS auto-start) failed");
+    }
+
+    // Configure failure actions: restart on any failure
+    SC_ACTION actions[3] = {
+        { SC_ACTION_RESTART, 1000 },
+        { SC_ACTION_RESTART, 2000 },
+        { SC_ACTION_RESTART, 5000 }
+    };
+    SERVICE_FAILURE_ACTIONSW failActions{};
+    failActions.dwResetPeriod = 86400;  // 24h reset window
+    failActions.cActions = 3;
+    failActions.lpsaActions = actions;
+
+    if (!::ChangeServiceConfig2W(hService.get(), SERVICE_CONFIG_FAILURE_ACTIONS, &failActions)) {
+        SS_LOG_LAST_ERROR(kLogCat, L"ChangeServiceConfig2W(VSS failure actions) failed");
+    }
+
+    SS_LOG_INFO(kLogCat, L"VSS service locked: auto-start + auto-restart on failure");
+#endif
 }
 
 void BackupProtectorImpl::UnlockVSSService() {
-    if (!m_initialized.load(std::memory_order_acquire)) {
+    if (!m_initialized.load(std::memory_order_acquire))
         return;
-    }
 
-    Logger::Info("[BackupProtector] VSS service unlock requested");
+    if (!m_vssLocked.exchange(false, std::memory_order_acq_rel))
+        return;  // wasn't locked
+
+    SS_LOG_INFO(kLogCat, L"VSS service lock released");
 }
 
 bool BackupProtectorImpl::ShouldBlockServiceOperation(std::wstring_view serviceName,
                                                        uint32_t operation,
                                                        uint32_t pid) {
-    if (!m_initialized.load(std::memory_order_acquire)) {
+    if (!m_initialized.load(std::memory_order_acquire))
         return false;
+
+    {
+        std::shared_lock lock(m_mutex);
+        if (!m_config.protectServices)
+            return false;
     }
 
-    if (!m_config.protectServices) {
+    if (!IsServiceProtected(serviceName))
         return false;
-    }
 
-    // Check if service is protected
-    if (!IsServiceProtected(serviceName)) {
+    std::wstring callerPath = GetProcessImagePath(pid);
+    if (IsWhitelisted(callerPath))
         return false;
-    }
 
-    // Check if process is whitelisted
-    std::wstring imagePath = GetProcessImagePath(pid);
-    if (IsWhitelisted(imagePath)) {
-        return false;
-    }
+    // Block stop, delete, and config-change operations
+    constexpr uint32_t kServiceStop        = 0x0020;  // SERVICE_STOP
+    constexpr uint32_t kServiceDelete      = DELETE;
+    constexpr uint32_t kServiceChangeConfig = 0x0002;  // SERVICE_CHANGE_CONFIG
 
-    // Check operation type
-    constexpr uint32_t SERVICE_STOP = 0x0001;
-    constexpr uint32_t SERVICE_DELETE = 0x0002;
-    constexpr uint32_t SERVICE_CHANGE_CONFIG = 0x0004;
-
-    if (operation & (SERVICE_STOP | SERVICE_DELETE | SERVICE_CHANGE_CONFIG)) {
-        Logger::Warn("[BackupProtector] Blocking service operation on {} from PID: {}",
-            StringUtils::WStringToString(std::wstring(serviceName)), pid);
-
-        m_stats.serviceStopsBlocked++;
+    if (operation & (kServiceStop | kServiceDelete | kServiceChangeConfig)) {
+        SS_LOG_WARN(kLogCat,
+            L"Blocking service op: Service=%ls Op=0x%08X PID=%u Caller=%ls",
+            std::wstring(serviceName).c_str(), operation,
+            pid, callerPath.c_str());
+        m_stats.serviceStopsBlocked.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
@@ -773,76 +874,87 @@ bool BackupProtectorImpl::ShouldBlockRegistryOperation(std::wstring_view keyPath
                                                         std::wstring_view valueName,
                                                         uint32_t operation,
                                                         uint32_t pid) {
-    if (!m_initialized.load(std::memory_order_acquire)) {
+    if (!m_initialized.load(std::memory_order_acquire))
         return false;
+
+    {
+        std::shared_lock lock(m_mutex);
+        if (!m_config.protectRegistry)
+            return false;
     }
 
-    if (!m_config.protectRegistryKeys) {
+    if (!IsRegistryKeyProtected(keyPath))
         return false;
-    }
 
-    // Check if registry key is protected
-    if (!IsRegistryKeyProtected(keyPath)) {
+    std::wstring callerPath = GetProcessImagePath(pid);
+    if (IsWhitelisted(callerPath))
         return false;
-    }
 
-    // Check if process is whitelisted
-    std::wstring imagePath = GetProcessImagePath(pid);
-    if (IsWhitelisted(imagePath)) {
-        return false;
-    }
+    constexpr uint32_t kRegDelete   = KEY_SET_VALUE;   // 0x0002
+    constexpr uint32_t kRegSetValue = KEY_CREATE_SUB_KEY;  // 0x0004
 
-    // Check operation type
-    constexpr uint32_t REG_DELETE = 0x0001;
-    constexpr uint32_t REG_SET_VALUE = 0x0002;
-
-    if (operation & (REG_DELETE | REG_SET_VALUE)) {
-        Logger::Warn("[BackupProtector] Blocking registry operation on {} from PID: {}",
-            StringUtils::WStringToString(std::wstring(keyPath)), pid);
-
-        m_stats.registryChangesBlocked++;
+    if (operation & (kRegDelete | kRegSetValue | DELETE)) {
+        SS_LOG_WARN(kLogCat,
+            L"Blocking registry op: Key=%ls Value=%ls Op=0x%08X PID=%u",
+            std::wstring(keyPath).c_str(),
+            std::wstring(valueName).c_str(),
+            operation, pid);
+        m_stats.registryChangesBlocked.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
     return false;
 }
-
 // ============================================================================
 // WHITELIST
 // ============================================================================
 
 void BackupProtectorImpl::AddToWhitelist(std::wstring_view processPath) {
+    if (processPath.empty())
+        return;
+
     std::unique_lock lock(m_whitelistMutex);
-    m_whitelistedPaths.insert(StringUtils::ToLowerW(std::wstring(processPath)));
-    Logger::Info("[BackupProtector] Added to whitelist: {}",
-        StringUtils::WStringToString(std::wstring(processPath)));
+    if (m_whitelistedPaths.size() >= BackupProtectorConstants::MAX_WHITELIST_SIZE) {
+        SS_LOG_WARN(kLogCat, L"Whitelist at capacity (%zu), rejecting add",
+                    BackupProtectorConstants::MAX_WHITELIST_SIZE);
+        return;
+    }
+    auto normalized = NormalizePathForWhitelist(processPath);
+    m_whitelistedPaths.insert(std::move(normalized));
+    SS_LOG_INFO(kLogCat, L"Added to whitelist: %ls",
+                std::wstring(processPath).c_str());
 }
 
 void BackupProtectorImpl::RemoveFromWhitelist(std::wstring_view processPath) {
     std::unique_lock lock(m_whitelistMutex);
-    m_whitelistedPaths.erase(StringUtils::ToLowerW(std::wstring(processPath)));
-    Logger::Info("[BackupProtector] Removed from whitelist: {}",
-        StringUtils::WStringToString(std::wstring(processPath)));
+    m_whitelistedPaths.erase(NormalizePathForWhitelist(processPath));
+    SS_LOG_INFO(kLogCat, L"Removed from whitelist: %ls",
+                std::wstring(processPath).c_str());
 }
 
 bool BackupProtectorImpl::IsWhitelisted(std::wstring_view processPath) const {
-    std::shared_lock lock(m_whitelistMutex);
+    if (processPath.empty())
+        return false;
 
-    std::wstring pathLower = StringUtils::ToLowerW(std::wstring(processPath));
+    std::wstring pathNormalized = NormalizePathForWhitelist(processPath);
 
-    // Check local whitelist
-    if (m_whitelistedPaths.find(pathLower) != m_whitelistedPaths.end()) {
-        return true;
+    {
+        std::shared_lock lock(m_whitelistMutex);
+        if (m_whitelistedPaths.count(pathNormalized))
+            return true;
     }
 
-    // Check WhiteListStore
+    // Fallback to central WhiteListStore
     if (m_whitelistStore) {
         try {
-            if (m_whitelistStore->IsWhitelisted(processPath)) {
+            auto result = m_whitelistStore->IsWhitelisted(processPath);
+            // LookupResult's implicit bool indicates a positive match
+            if (static_cast<bool>(result))
                 return true;
-            }
+        } catch (const std::exception& e) {
+            SS_LOG_WARN(kLogCat, L"WhiteListStore query failed: %hs", e.what());
         } catch (...) {
-            // Ignore errors
+            SS_LOG_WARN(kLogCat, L"WhiteListStore query failed: unknown error");
         }
     }
 
@@ -850,10 +962,13 @@ bool BackupProtectorImpl::IsWhitelisted(std::wstring_view processPath) const {
 }
 
 void BackupProtectorImpl::WhitelistSigner(std::wstring_view signerName) {
+    if (signerName.empty())
+        return;
+
     std::unique_lock lock(m_whitelistMutex);
-    m_whitelistedSigners.insert(StringUtils::ToLowerW(std::wstring(signerName)));
-    Logger::Info("[BackupProtector] Whitelisted signer: {}",
-        StringUtils::WStringToString(std::wstring(signerName)));
+    m_whitelistedSigners.insert(StringUtils::ToLowerCopy(std::wstring(signerName)));
+    SS_LOG_INFO(kLogCat, L"Whitelisted signer: %ls",
+                std::wstring(signerName).c_str());
 }
 
 // ============================================================================
@@ -875,13 +990,12 @@ void BackupProtectorImpl::SetDecisionCallback(DecisionCallback callback) {
 // ============================================================================
 
 BackupProtectorStatistics BackupProtectorImpl::GetStatistics() const {
-    return m_stats;
+    return m_stats.Snapshot();
 }
 
 void BackupProtectorImpl::ResetStatistics() {
     m_stats.Reset();
-    m_stats.startTime = Clock::now();
-    Logger::Info("[BackupProtector] Statistics reset");
+    SS_LOG_INFO(kLogCat, L"Statistics reset");
 }
 
 std::vector<BlockedAttempt> BackupProtectorImpl::GetRecentBlocks(size_t maxCount) const {
@@ -891,67 +1005,64 @@ std::vector<BlockedAttempt> BackupProtectorImpl::GetRecentBlocks(size_t maxCount
     std::vector<BlockedAttempt> result;
     result.reserve(count);
 
-    for (size_t i = 0; i < count; ++i) {
-        result.push_back(m_blockedAttempts[i]);
-    }
+    // Deque is front-newest, copy the N most recent
+    auto it = m_blockedAttempts.begin();
+    for (size_t i = 0; i < count; ++i, ++it)
+        result.push_back(*it);
 
     return result;
 }
-
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
-DangerousToolType BackupProtectorImpl::IdentifyTool(std::wstring_view imagePath) {
-    std::wstring filename = fs::path(imagePath).filename().wstring();
-    std::wstring filenameLower = StringUtils::ToLowerW(filename);
-
-    if (filenameLower == L"vssadmin.exe") {
-        return DangerousToolType::VSSAdmin;
-    } else if (filenameLower == L"wbadmin.exe") {
-        return DangerousToolType::WBAdmin;
-    } else if (filenameLower == L"bcdedit.exe") {
-        return DangerousToolType::BCDEdit;
-    } else if (filenameLower == L"wmic.exe") {
-        return DangerousToolType::WMIC;
-    } else if (filenameLower == L"powershell.exe" || filenameLower == L"pwsh.exe") {
-        return DangerousToolType::PowerShell;
-    } else if (filenameLower == L"cmd.exe") {
-        return DangerousToolType::CMD;
-    } else if (filenameLower == L"diskshadow.exe") {
-        return DangerousToolType::DiskShadow;
+DangerousToolType BackupProtectorImpl::IdentifyToolType(std::wstring_view imagePath) {
+    std::wstring filename;
+    try {
+        filename = fs::path(imagePath).filename().wstring();
+    } catch (...) {
+        return DangerousToolType::Unknown;
     }
+
+    std::wstring lower = StringUtils::ToLowerCopy(filename);
+
+    if (lower == L"vssadmin.exe")                         return DangerousToolType::VSSAdmin;
+    if (lower == L"wbadmin.exe")                          return DangerousToolType::WBAdmin;
+    if (lower == L"bcdedit.exe")                          return DangerousToolType::BCDEdit;
+    if (lower == L"wmic.exe")                             return DangerousToolType::WMIC;
+    if (lower == L"powershell.exe" || lower == L"pwsh.exe") return DangerousToolType::PowerShell;
+    if (lower == L"cmd.exe")                              return DangerousToolType::CMD;
+    if (lower == L"diskshadow.exe")                       return DangerousToolType::DiskShadow;
 
     return DangerousToolType::Unknown;
 }
 
-std::optional<CommandPattern> BackupProtectorImpl::MatchCommandPattern(std::wstring_view commandLine) {
+std::optional<CommandPattern> BackupProtectorImpl::MatchCommandPattern(
+    std::wstring_view commandLine) {
+
     std::shared_lock lock(m_mutex);
 
-    for (const auto& pattern : m_patterns) {
-        // Check keywords
-        bool hasAllKeywords = true;
-        for (const auto& keyword : pattern.keywords) {
-            std::wstring cmdLower = StringUtils::ToLowerW(std::wstring(commandLine));
-            std::wstring keywordLower = StringUtils::ToLowerW(keyword);
+    // Lowercase once for all keyword comparisons
+    const std::wstring cmdLower = StringUtils::ToLowerCopy(std::wstring(commandLine));
 
-            if (cmdLower.find(keywordLower) == std::wstring::npos) {
-                hasAllKeywords = false;
+    for (const auto& pattern : m_patterns) {
+        // Keyword pre-filter (fast reject)
+        bool allKeywordsPresent = true;
+        for (const auto& kw : pattern.keywords) {
+            if (cmdLower.find(StringUtils::ToLowerCopy(kw)) == std::wstring::npos) {
+                allKeywordsPresent = false;
                 break;
             }
         }
-
-        if (!hasAllKeywords) {
+        if (!allKeywordsPresent)
             continue;
-        }
 
-        // Check regex
+        // Regex confirmation
         auto it = m_compiledPatterns.find(pattern.patternName);
         if (it != m_compiledPatterns.end()) {
             try {
-                if (std::regex_search(commandLine.begin(), commandLine.end(), it->second)) {
+                if (std::regex_search(commandLine.begin(), commandLine.end(), it->second))
                     return pattern;
-                }
             } catch (const std::regex_error&) {
                 continue;
             }
@@ -964,13 +1075,19 @@ std::optional<CommandPattern> BackupProtectorImpl::MatchCommandPattern(std::wstr
 ProtectionAction BackupProtectorImpl::DetermineAction(const BlockedAttempt& attempt) {
     std::shared_lock lock(m_mutex);
 
-    // Use default action
     ProtectionAction action = m_config.defaultAction;
 
-    // Override for critical threats
-    if (attempt.threatType == BackupThreatType::VSSDelete ||
-        attempt.threatType == BackupThreatType::WMIShadowDelete) {
-        action = ProtectionAction::BlockKill;
+    // Critical threats always get BlockKill if kill-on-detection is enabled
+    if (m_config.killOnDetection) {
+        switch (attempt.threatType) {
+            case BackupThreatType::VSSDelete:
+            case BackupThreatType::WMIShadowDelete:
+            case BackupThreatType::RecoveryDisable:
+                action = ProtectionAction::BlockKill;
+                break;
+            default:
+                break;
+        }
     }
 
     return action;
@@ -978,160 +1095,206 @@ ProtectionAction BackupProtectorImpl::DetermineAction(const BlockedAttempt& atte
 
 void BackupProtectorImpl::RecordBlockedAttempt(const BlockedAttempt& attempt) {
     std::lock_guard lock(m_blockMutex);
-
     m_blockedAttempts.push_front(attempt);
 
-    // LRU eviction
-    if (m_blockedAttempts.size() > MAX_BLOCKED_LOG) {
+    while (m_blockedAttempts.size() > kMaxBlockedHistory)
         m_blockedAttempts.pop_back();
-    }
 }
 
 void BackupProtectorImpl::NotifyBlock(const BlockedAttempt& attempt) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_blockCallback) {
+    BlockCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_blockCallback;  // copy under lock
+    }
+    if (cb) {
         try {
-            m_blockCallback(attempt);
+            cb(attempt);
         } catch (const std::exception& e) {
-            Logger::Error("[BackupProtector] Block callback exception: {}", e.what());
+            SS_LOG_ERROR(kLogCat, L"Block callback threw: %hs", e.what());
+        } catch (...) {
+            SS_LOG_ERROR(kLogCat, L"Block callback threw unknown exception");
         }
     }
 }
 
 ProtectionAction BackupProtectorImpl::QueryDecision(uint32_t pid,
-                                                     const std::wstring& commandLine,
+                                                     const std::wstring& cmdLine,
                                                      BackupThreatType threatType) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_decisionCallback) {
+    DecisionCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_decisionCallback;  // copy under lock
+    }
+    if (cb) {
         try {
-            return m_decisionCallback(pid, commandLine, threatType);
+            return cb(pid, cmdLine, threatType);
         } catch (const std::exception& e) {
-            Logger::Error("[BackupProtector] Decision callback exception: {}", e.what());
+            SS_LOG_ERROR(kLogCat, L"Decision callback threw: %hs", e.what());
+        } catch (...) {
+            SS_LOG_ERROR(kLogCat, L"Decision callback threw unknown exception");
         }
     }
     return ProtectionAction::Allow;
 }
 
 bool BackupProtectorImpl::IsFileProtectedExtension(std::wstring_view filePath) {
-    std::wstring ext = fs::path(filePath).extension().wstring();
-    std::wstring extLower = StringUtils::ToLowerW(ext);
+    std::wstring ext;
+    try {
+        ext = fs::path(filePath).extension().wstring();
+    } catch (...) {
+        return false;
+    }
+    if (ext.empty())
+        return false;
 
-    for (const auto& protectedExt : PROTECTED_EXTENSIONS) {
-        if (extLower == StringUtils::ToLowerW(protectedExt)) {
+    std::wstring extLower = StringUtils::ToLowerCopy(ext);
+
+    std::shared_lock lock(m_mutex);
+    for (const auto& protExt : m_config.protectedExtensions) {
+        if (extLower == StringUtils::ToLowerCopy(protExt))
             return true;
-        }
     }
 
     return false;
 }
 
 bool BackupProtectorImpl::IsServiceProtected(std::wstring_view serviceName) {
-    std::wstring nameLower = StringUtils::ToLowerW(std::wstring(serviceName));
-
-    for (const auto& protectedService : PROTECTED_SERVICES) {
-        if (nameLower == StringUtils::ToLowerW(protectedService)) {
+    std::wstring lower = StringUtils::ToLowerCopy(std::wstring(serviceName));
+    for (const auto& svc : kProtectedServiceNames) {
+        if (lower == StringUtils::ToLowerCopy(svc))
             return true;
-        }
     }
 
+    // Also check config
+    std::shared_lock lock(m_mutex);
+    for (const auto& ps : m_config.protectedServices) {
+        if (StringUtils::IEquals(serviceName, ps.serviceName))
+            return true;
+    }
     return false;
 }
 
 bool BackupProtectorImpl::IsRegistryKeyProtected(std::wstring_view keyPath) {
-    std::wstring pathUpper = StringUtils::ToUpperW(std::wstring(keyPath));
-
-    for (const auto& protectedKey : PROTECTED_REGISTRY_KEYS) {
-        std::wstring protectedUpper = StringUtils::ToUpperW(protectedKey);
-        if (pathUpper.find(protectedUpper) != std::wstring::npos) {
+    std::wstring pathLower = StringUtils::ToLowerCopy(std::wstring(keyPath));
+    for (const auto& protKey : kProtectedRegistryPaths) {
+        if (pathLower.find(StringUtils::ToLowerCopy(protKey)) != std::wstring::npos)
             return true;
-        }
     }
 
+    std::shared_lock lock(m_mutex);
+    for (const auto& prk : m_config.protectedRegistryKeys) {
+        std::wstring prkLower = StringUtils::ToLowerCopy(prk.path);
+        if (pathLower.find(prkLower) != std::wstring::npos)
+            return true;
+    }
     return false;
 }
 
 std::wstring BackupProtectorImpl::GetProcessImagePath(uint32_t pid) {
     try {
-        return ProcessUtils::GetProcessImagePath(pid);
+        return Utils::ProcessUtils::GetProcessImagePath(pid);
     } catch (...) {
-        return L"";
-    }
-}
-
-std::wstring BackupProtectorImpl::GetProcessCommandLine(uint32_t pid) {
-    try {
-        return ProcessUtils::GetProcessCommandLine(pid);
-    } catch (...) {
-        return L"";
+        return {};
     }
 }
 
 uint32_t BackupProtectorImpl::GetParentProcessId(uint32_t pid) {
     try {
-        return ProcessUtils::GetParentProcessId(pid);
+        return Utils::ProcessUtils::GetParentProcessId(pid);
     } catch (...) {
         return 0;
     }
 }
 
+void BackupProtectorImpl::ExecuteTermination(uint32_t pid, const BlockedAttempt& attempt) {
+    SS_LOG_WARN(kLogCat, L"Terminating PID=%u (Threat=%hs)", pid,
+                GetThreatTypeName(attempt.threatType).data());
+
+    try {
+        auto result = Core::Process::ProcessKiller::Terminate(
+            pid, Core::Process::KillMethod::Auto);
+
+        if (result == Core::Process::KillResult::Success ||
+            result == Core::Process::KillResult::AlreadyDead) {
+            m_stats.processesTerminated.fetch_add(1, std::memory_order_relaxed);
+            SS_LOG_INFO(kLogCat, L"Process PID=%u terminated successfully", pid);
+        } else {
+            SS_LOG_ERROR(kLogCat, L"Process PID=%u termination failed (result=%u)",
+                         pid, static_cast<uint32_t>(result));
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(kLogCat, L"Exception terminating PID=%u: %hs", pid, e.what());
+    } catch (...) {
+        SS_LOG_ERROR(kLogCat, L"Unknown exception terminating PID=%u", pid);
+    }
+}
+// ============================================================================
+// SELF-TEST
+// ============================================================================
+
 bool BackupProtectorImpl::SelfTest() {
-    Logger::Info("[BackupProtector] Running self-test...");
+    SS_LOG_INFO(kLogCat, L"Running self-test...");
 
     try {
         // Test 1: Tool identification
+        if (IdentifyToolType(L"C:\\Windows\\System32\\vssadmin.exe") != DangerousToolType::VSSAdmin) {
+            SS_LOG_ERROR(kLogCat, L"Self-test FAIL: VSSAdmin identification");
+            return false;
+        }
+        if (IdentifyToolType(L"C:\\Windows\\System32\\bcdedit.exe") != DangerousToolType::BCDEdit) {
+            SS_LOG_ERROR(kLogCat, L"Self-test FAIL: BCDEdit identification");
+            return false;
+        }
+
+        // Test 2: Destructive command detection
+        if (!IsDestructiveCommand(L"vssadmin.exe delete shadows /all /quiet")) {
+            SS_LOG_ERROR(kLogCat, L"Self-test FAIL: vssadmin pattern match");
+            return false;
+        }
+        if (!IsDestructiveCommand(L"wmic.exe shadowcopy delete /nointeractive")) {
+            SS_LOG_ERROR(kLogCat, L"Self-test FAIL: wmic pattern match");
+            return false;
+        }
+
+        // Test 3: Non-destructive command (must NOT match)
+        if (IsDestructiveCommand(L"vssadmin.exe list shadows")) {
+            SS_LOG_ERROR(kLogCat, L"Self-test FAIL: false positive on list shadows");
+            return false;
+        }
+
+        // Test 4: Protected backup file extension
+        if (m_config.protectBackupFiles && !IsProtectedBackupFile(L"C:\\Backup\\data.vhd")) {
+            SS_LOG_ERROR(kLogCat, L"Self-test FAIL: .vhd not detected as protected");
+            return false;
+        }
+
+        // Test 5: Whitelist round-trip
         {
-            if (IdentifyTool(L"C:\\Windows\\System32\\vssadmin.exe") != DangerousToolType::VSSAdmin) {
-                Logger::Error("[BackupProtector] Self-test failed: Tool identification");
+            const std::wstring testPath = L"C:\\SelfTest\\trusted_test.exe";
+            AddToWhitelist(testPath);
+            if (!IsWhitelisted(testPath)) {
+                SS_LOG_ERROR(kLogCat, L"Self-test FAIL: whitelist add/check");
+                return false;
+            }
+            RemoveFromWhitelist(testPath);
+            if (IsWhitelisted(testPath)) {
+                SS_LOG_ERROR(kLogCat, L"Self-test FAIL: whitelist remove");
                 return false;
             }
         }
 
-        // Test 2: Command pattern matching
-        {
-            std::wstring testCmd = L"vssadmin.exe delete shadows /all /quiet";
-            if (!IsDestructiveCommand(testCmd)) {
-                Logger::Error("[BackupProtector] Self-test failed: Command pattern matching");
-                return false;
-            }
-        }
-
-        // Test 3: Protected file extension
-        {
-            if (!IsProtectedBackupFile(L"C:\\Backup\\data.vhd")) {
-                Logger::Error("[BackupProtector] Self-test failed: Protected file detection");
-                return false;
-            }
-        }
-
-        // Test 4: Whitelist functionality
-        {
-            AddToWhitelist(L"C:\\Test\\trusted.exe");
-            if (!IsWhitelisted(L"C:\\Test\\trusted.exe")) {
-                Logger::Error("[BackupProtector] Self-test failed: Whitelist");
-                return false;
-            }
-            RemoveFromWhitelist(L"C:\\Test\\trusted.exe");
-        }
-
-        // Test 5: Statistics tracking
-        {
-            auto stats = GetStatistics();
-            if (stats.whitelistedAllowed.load() == 0) {
-                Logger::Warn("[BackupProtector] Self-test warning: No whitelist events");
-            }
-        }
-
-        Logger::Info("[BackupProtector] Self-test PASSED");
+        SS_LOG_INFO(kLogCat, L"Self-test PASSED (5/5 checks)");
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[BackupProtector] Self-test exception: {}", e.what());
+        SS_LOG_ERROR(kLogCat, L"Self-test exception: %hs", e.what());
         return false;
     }
 }
 
 // ============================================================================
-// SINGLETON IMPLEMENTATION
+// SINGLETON + PUBLIC API FORWARDING
 // ============================================================================
 
 std::atomic<bool> BackupProtector::s_instanceCreated{false};
@@ -1151,10 +1314,6 @@ BackupProtector& BackupProtector::Instance() noexcept {
 bool BackupProtector::HasInstance() noexcept {
     return s_instanceCreated.load(std::memory_order_acquire);
 }
-
-// ============================================================================
-// PUBLIC API FORWARDING
-// ============================================================================
 
 bool BackupProtector::Initialize(const BackupProtectorConfiguration& config) {
     return m_impl->Initialize(config);
@@ -1186,9 +1345,7 @@ bool BackupProtector::IsDestructiveTool(const std::wstring& imagePath,
 }
 
 std::optional<BlockedAttempt> BackupProtector::AnalyzeProcess(
-    uint32_t pid,
-    std::wstring_view imagePath,
-    std::wstring_view commandLine) {
+    uint32_t pid, std::wstring_view imagePath, std::wstring_view commandLine) {
     return m_impl->AnalyzeProcess(pid, imagePath, commandLine);
 }
 
@@ -1201,8 +1358,7 @@ bool BackupProtector::IsProtectedBackupFile(const std::wstring& filePath) {
 }
 
 bool BackupProtector::ShouldBlockFileAccess(std::wstring_view filePath,
-                                             uint32_t pid,
-                                             uint32_t desiredAccess) {
+                                             uint32_t pid, uint32_t desiredAccess) {
     return m_impl->ShouldBlockFileAccess(filePath, pid, desiredAccess);
 }
 
@@ -1215,15 +1371,13 @@ void BackupProtector::UnlockVSSService() {
 }
 
 bool BackupProtector::ShouldBlockServiceOperation(std::wstring_view serviceName,
-                                                   uint32_t operation,
-                                                   uint32_t pid) {
+                                                   uint32_t operation, uint32_t pid) {
     return m_impl->ShouldBlockServiceOperation(serviceName, operation, pid);
 }
 
 bool BackupProtector::ShouldBlockRegistryOperation(std::wstring_view keyPath,
                                                     std::wstring_view valueName,
-                                                    uint32_t operation,
-                                                    uint32_t pid) {
+                                                    uint32_t operation, uint32_t pid) {
     return m_impl->ShouldBlockRegistryOperation(keyPath, valueName, operation, pid);
 }
 
@@ -1272,58 +1426,53 @@ std::string BackupProtector::GetVersionString() noexcept {
            std::to_string(BackupProtectorConstants::VERSION_MINOR) + "." +
            std::to_string(BackupProtectorConstants::VERSION_PATCH);
 }
-
 // ============================================================================
 // STRUCTURE IMPLEMENTATIONS
 // ============================================================================
 
 bool CommandPattern::Matches(std::wstring_view commandLine) const {
-    // Check keywords
-    for (const auto& keyword : keywords) {
-        std::wstring cmdLower = StringUtils::ToLowerW(std::wstring(commandLine));
-        std::wstring keywordLower = StringUtils::ToLowerW(keyword);
+    if (commandLine.empty())
+        return false;
 
-        if (cmdLower.find(keywordLower) == std::wstring::npos) {
+    std::wstring cmdLower = StringUtils::ToLowerCopy(std::wstring(commandLine));
+
+    for (const auto& kw : keywords) {
+        if (cmdLower.find(StringUtils::ToLowerCopy(kw)) == std::wstring::npos)
             return false;
-        }
     }
 
-    // Check regex
     try {
-        std::wregex regex(regexPattern,
-            caseSensitive ? std::regex_constants::ECMAScript :
-                           (std::regex_constants::ECMAScript | std::regex_constants::icase));
-        return std::regex_search(commandLine.begin(), commandLine.end(), regex);
+        auto flags = std::regex_constants::ECMAScript | std::regex_constants::optimize;
+        if (!caseSensitive)
+            flags |= std::regex_constants::icase;
+        std::wregex rx(regexPattern, flags);
+        return std::regex_search(commandLine.begin(), commandLine.end(), rx);
     } catch (const std::regex_error&) {
         return false;
     }
 }
 
 void BackupProtectorStatistics::Reset() noexcept {
-    attemptsBlocked.store(0, std::memory_order_release);
-    processesTerminated.store(0, std::memory_order_release);
-    vssDeletesBlocked.store(0, std::memory_order_release);
-    fileDeletesBlocked.store(0, std::memory_order_release);
-    serviceStopsBlocked.store(0, std::memory_order_release);
-    registryChangesBlocked.store(0, std::memory_order_release);
-    whitelistedAllowed.store(0, std::memory_order_release);
-
-    for (auto& counter : byThreatType) {
-        counter.store(0, std::memory_order_release);
-    }
-
+    attemptsBlocked = 0;
+    processesTerminated = 0;
+    vssDeletesBlocked = 0;
+    fileDeletesBlocked = 0;
+    serviceStopsBlocked = 0;
+    registryChangesBlocked = 0;
+    whitelistedAllowed = 0;
+    byThreatType.fill(0);
     startTime = Clock::now();
 }
 
 std::string BackupProtectorStatistics::ToJson() const {
     nlohmann::json j;
-    j["attemptsBlocked"] = attemptsBlocked.load(std::memory_order_acquire);
-    j["processesTerminated"] = processesTerminated.load(std::memory_order_acquire);
-    j["vssDeletesBlocked"] = vssDeletesBlocked.load(std::memory_order_acquire);
-    j["fileDeletesBlocked"] = fileDeletesBlocked.load(std::memory_order_acquire);
-    j["serviceStopsBlocked"] = serviceStopsBlocked.load(std::memory_order_acquire);
-    j["registryChangesBlocked"] = registryChangesBlocked.load(std::memory_order_acquire);
-    j["whitelistedAllowed"] = whitelistedAllowed.load(std::memory_order_acquire);
+    j["attemptsBlocked"]      = attemptsBlocked;
+    j["processesTerminated"]  = processesTerminated;
+    j["vssDeletesBlocked"]    = vssDeletesBlocked;
+    j["fileDeletesBlocked"]   = fileDeletesBlocked;
+    j["serviceStopsBlocked"]  = serviceStopsBlocked;
+    j["registryChangesBlocked"] = registryChangesBlocked;
+    j["whitelistedAllowed"]   = whitelistedAllowed;
 
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         Clock::now() - startTime).count();
@@ -1334,32 +1483,60 @@ std::string BackupProtectorStatistics::ToJson() const {
 
 std::string BlockedAttempt::ToJson() const {
     nlohmann::json j;
-    j["attemptId"] = attemptId;
-    j["pid"] = pid;
-    j["processName"] = StringUtils::WStringToString(processName);
-    j["processPath"] = StringUtils::WStringToString(processPath);
-    j["commandLine"] = StringUtils::WStringToString(commandLine);
-    j["parentPid"] = parentPid;
-    j["parentName"] = StringUtils::WStringToString(parentName);
-    j["threatType"] = static_cast<int>(threatType);
-    j["toolType"] = static_cast<int>(toolType);
-    j["action"] = static_cast<int>(action);
-    j["target"] = StringUtils::WStringToString(target);
-    j["userSid"] = StringUtils::WStringToString(userSid);
-    j["details"] = StringUtils::WStringToString(details);
+    j["attemptId"]    = attemptId;
+    j["pid"]          = pid;
+    j["processName"]  = StringUtils::ToNarrow(processName);
+    j["processPath"]  = StringUtils::ToNarrow(processPath);
+    j["commandLine"]  = StringUtils::ToNarrow(commandLine);
+    j["parentPid"]    = parentPid;
+    j["parentName"]   = StringUtils::ToNarrow(parentName);
+    j["threatType"]   = static_cast<int>(threatType);
+    j["toolType"]     = static_cast<int>(toolType);
+    j["action"]       = static_cast<int>(action);
+    j["target"]       = StringUtils::ToNarrow(target);
+    j["userSid"]      = StringUtils::ToNarrow(userSid);
+    j["details"]      = StringUtils::ToNarrow(details);
     return j.dump();
 }
 
 bool BackupProtectorConfiguration::IsValid() const noexcept {
-    // Configuration is always valid (all fields are boolean flags or containers)
+    // At least one protection category must be enabled
+    if (enabled && !protectVSS && !protectBackupFiles && !protectBCD &&
+        !protectServices && !protectRegistry)
+        return false;
+
+    // Whitelist size within bounds
+    if (whitelistedProcesses.size() > BackupProtectorConstants::MAX_WHITELIST_SIZE)
+        return false;
+
+    // Validate that no whitelisted paths are empty strings
+    for (const auto& p : whitelistedProcesses) {
+        if (p.empty())
+            return false;
+    }
+
     return true;
 }
 
+void BackupProtectorConfiguration::LoadDefaultPatterns() {
+    commandPatterns = CreateBuiltInPatterns();
+}
+
+void BackupProtectorConfiguration::LoadDefaultServices() {
+    protectedServices.clear();
+    for (const auto& svc : kProtectedServiceNames) {
+        ProtectedService ps;
+        ps.serviceName = svc;
+        ps.displayName = svc;
+        protectedServices.push_back(std::move(ps));
+    }
+}
+
 // ============================================================================
-// UTILITY FUNCTIONS
+// UTILITY FUNCTIONS (match header declarations exactly)
 // ============================================================================
 
-std::string_view GetBackupThreatTypeName(BackupThreatType type) noexcept {
+std::string_view GetThreatTypeName(BackupThreatType type) noexcept {
     switch (type) {
         case BackupThreatType::VSSDelete:        return "VSSDelete";
         case BackupThreatType::VSSResize:        return "VSSResize";
@@ -1385,7 +1562,7 @@ std::string_view GetProtectionActionName(ProtectionAction action) noexcept {
     }
 }
 
-std::string_view GetDangerousToolTypeName(DangerousToolType type) noexcept {
+std::string_view GetToolTypeName(DangerousToolType type) noexcept {
     switch (type) {
         case DangerousToolType::VSSAdmin:   return "VSSAdmin";
         case DangerousToolType::WBAdmin:    return "WBAdmin";
@@ -1396,6 +1573,66 @@ std::string_view GetDangerousToolTypeName(DangerousToolType type) noexcept {
         case DangerousToolType::DiskShadow: return "DiskShadow";
         default:                            return "Unknown";
     }
+}
+
+DangerousToolType IdentifyTool(std::wstring_view processName) noexcept {
+    if (processName.empty())
+        return DangerousToolType::Unknown;
+
+    std::wstring lower;
+    try {
+        lower = StringUtils::ToLowerCopy(std::wstring(processName));
+    } catch (...) {
+        return DangerousToolType::Unknown;
+    }
+
+    // Extract filename if full path provided
+    auto pos = lower.find_last_of(L"\\/");
+    if (pos != std::wstring::npos)
+        lower = lower.substr(pos + 1);
+
+    if (lower == L"vssadmin.exe")                         return DangerousToolType::VSSAdmin;
+    if (lower == L"wbadmin.exe")                          return DangerousToolType::WBAdmin;
+    if (lower == L"bcdedit.exe")                          return DangerousToolType::BCDEdit;
+    if (lower == L"wmic.exe")                             return DangerousToolType::WMIC;
+    if (lower == L"powershell.exe" || lower == L"pwsh.exe") return DangerousToolType::PowerShell;
+    if (lower == L"cmd.exe")                              return DangerousToolType::CMD;
+    if (lower == L"diskshadow.exe")                       return DangerousToolType::DiskShadow;
+
+    return DangerousToolType::Unknown;
+}
+
+BackupThreatType IdentifyThreat(std::wstring_view commandLine) noexcept {
+    if (commandLine.empty())
+        return BackupThreatType::Unknown;
+
+    std::wstring lower;
+    try {
+        lower = StringUtils::ToLowerCopy(std::wstring(commandLine));
+    } catch (...) {
+        return BackupThreatType::Unknown;
+    }
+
+    // Ordered by severity (most critical first)
+    if (lower.find(L"delete") != std::wstring::npos && lower.find(L"shadows") != std::wstring::npos)
+        return BackupThreatType::VSSDelete;
+    if (lower.find(L"shadowcopy") != std::wstring::npos && lower.find(L"delete") != std::wstring::npos)
+        return BackupThreatType::WMIShadowDelete;
+    if (lower.find(L"win32_shadowcopy") != std::wstring::npos)
+        return BackupThreatType::WMIShadowDelete;
+    if (lower.find(L"recoveryenabled") != std::wstring::npos && lower.find(L"no") != std::wstring::npos)
+        return BackupThreatType::RecoveryDisable;
+    if (lower.find(L"bootstatuspolicy") != std::wstring::npos)
+        return BackupThreatType::BootConfigChange;
+    if (lower.find(L"resize") != std::wstring::npos && lower.find(L"shadowstorage") != std::wstring::npos)
+        return BackupThreatType::VSSResize;
+    if (lower.find(L"delete") != std::wstring::npos &&
+        (lower.find(L"catalog") != std::wstring::npos || lower.find(L"backup") != std::wstring::npos))
+        return BackupThreatType::BackupDelete;
+    if (lower.find(L"stop") != std::wstring::npos && lower.find(L"vss") != std::wstring::npos)
+        return BackupThreatType::ServiceStop;
+
+    return BackupThreatType::Unknown;
 }
 
 }  // namespace Ransomware
