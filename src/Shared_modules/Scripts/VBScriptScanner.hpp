@@ -189,7 +189,9 @@ namespace VBSConstants {
         "Outlook.Application",
         "WScript.Network",
         "Scripting.Dictionary",
-        "InternetExplorer.Application"
+        "InternetExplorer.Application",
+        "WinHttp.WinHttpRequest.5.1",
+        "WinHttp.WinHttpRequest"
     };
 
 }  // namespace VBSConstants
@@ -233,7 +235,8 @@ enum class DangerousObjectType : uint8_t {
     Scheduler       = 7,    ///< Schedule.Service
     OfficeApp       = 8,    ///< Office applications
     Network         = 9,    ///< WScript.Network
-    IE              = 10    ///< InternetExplorer.Application
+    IE              = 10,   ///< InternetExplorer.Application
+    WinHttp         = 11    ///< WinHttp.WinHttpRequest.5.1
 };
 
 /**
