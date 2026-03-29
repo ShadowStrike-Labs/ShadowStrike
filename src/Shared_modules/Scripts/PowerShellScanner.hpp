@@ -32,22 +32,15 @@
  *        • Download cradles and remote code execution
  *        • Process injection and reflective loading
  *        • Persistence mechanisms via profiles and scheduled tasks
+ *        • PowerShell v2 downgrade attacks (AMSI bypass)
  *
- *      Integrates with Windows AMSI, ETW, Script Block Logging, and ML models
- *      for behavioral pattern analysis. Supports both real-time and static
- *      analysis with comprehensive threat intelligence correlation.
+ *      Integrates with Windows AMSI, ETW, Script Block Logging, and
+ *      kernel driver (PhantomSensor) for process-level enforcement.
  *
- * Version: 3.0.0 Enterprise Edition
- * Build: 2026.01.25
+ * Version: 4.0.0 Enterprise Edition
+ * Build: 2026.01.28
  * Author: ShadowStrike Advanced Threat Research Team
  * Classification: CONFIDENTIAL - Enterprise Security Infrastructure
- * 
- * Threat Coverage:
- *   - PowerShell Empire (Invoke-Mimikatz, Invoke-ReflectivePEInjection)
- *   - Cobalt Strike (PowerShell beacons, stagers)
- *   - Metasploit (PowerSploit framework)
- *   - Living-off-the-Land binaries (LOLBins)
- *   - Custom malware frameworks
  * ════════════════════════════════════════════════════════════════════════════════
  */
 
@@ -56,10 +49,6 @@
 #ifndef SHADOWSTRIKE_SCRIPTS_POWERSHELLSCANNER_HPP
 #define SHADOWSTRIKE_SCRIPTS_POWERSHELLSCANNER_HPP
 
-// ════════════════════════════════════════════════════════════════════════════════
-// STANDARD LIBRARY INCLUDES (C++20)
-// ════════════════════════════════════════════════════════════════════════════════
-
 #include <string>
 #include <string_view>
 #include <vector>
@@ -67,69 +56,15 @@
 #include <functional>
 #include <chrono>
 #include <filesystem>
-#include <map>
-#include <unordered_map>
-#include <set>
-#include <unordered_set>
 #include <optional>
 #include <span>
 #include <mutex>
 #include <shared_mutex>
 #include <atomic>
-#include <concepts>
-#include <variant>
 #include <array>
-#include <algorithm>
-#include <ranges>
-#include <format>
-#include <expected>
-#include <source_location>
-#include <stacktrace>
-#include <coroutine>
-#include <thread>
-#include <condition_variable>
-#include <queue>
-#include <deque>
-#include <bitset>
 #include <cstdint>
-#include <cstring>
-#include <cmath>
-#include <numeric>
-#include <ratio>
-#include <regex>
 
-// ════════════════════════════════════════════════════════════════════════════════
-// INFRASTRUCTURE INCLUDES (ShadowStrike Modules)
-// ════════════════════════════════════════════════════════════════════════════════
-
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/HashUtils.hpp"
 #include "../Utils/Logger.hpp"
-#include "../Utils/CryptoUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/MemoryUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../Utils/RegistryUtils.hpp"
-#include "../Utils/JSONUtils.hpp"
-#include "../Utils/XMLUtils.hpp"
-#include "../Utils/Base64Utils.hpp"
-#include "../Utils/CompressionUtils.hpp"
-#include "../Utils/CacheManager.hpp"
-#include "../Utils/ThreadPool.hpp"
-#include "../Utils/Timer.hpp"
-
-#include "../HashStore/HashStore.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../SignatureStore/SignatureStore.hpp"
-#include "../ThreatIntel/ThreatIntelLookup.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
-#include "../Config/ConfigManager.hpp"
-
-// ════════════════════════════════════════════════════════════════════════════════
-// NAMESPACE DEFINITION
-// ════════════════════════════════════════════════════════════════════════════════
 
 namespace ShadowStrike::Scripts {
 
@@ -138,299 +73,213 @@ namespace ShadowStrike::Scripts {
 // ════════════════════════════════════════════════════════════════════════════════
 
 class PowerShellScanner;
-class PowerShellDeobfuscator;
-class PowerShellEmulator;
-class AMSIBypassDetector;
-class ScriptBlockAnalyzer;
 
 // ════════════════════════════════════════════════════════════════════════════════
-// CONSTANTS & THRESHOLDS NAMESPACE
+// CONSTANTS & THRESHOLDS
 // ════════════════════════════════════════════════════════════════════════════════
-    namespace Constants {
-        constexpr size_t MAX_SCRIPT_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
-        constexpr size_t MAX_RECURSION_DEPTH = 32;
-        constexpr double MIN_ENTROPY_OBFUSCATION = 5.8;
-        constexpr size_t MAX_TOKEN_ANALYSIS_WINDOW = 500;
-        
-        constexpr std::string_view POWERSHELL_EXE = "powershell.exe";
-        constexpr std::string_view PWSH_EXE = "pwsh.exe";
-        
-        namespace Heuristics {
-            constexpr int SCORE_AMSI_BYPASS = 100;
-            constexpr int SCORE_REFLECTION_LOAD = 90;
-            constexpr int SCORE_ENCODED_COMMAND = 50;
-            constexpr int SCORE_NET_WEBCLIENT = 60;
-            constexpr int SCORE_INVOKE_EXPRESSION = 70;
-            constexpr int SCORE_SUSPICIOUS_OBFUSCATION = 40;
-            
-            constexpr int THRESHOLD_BLOCK = 90;
-            constexpr int THRESHOLD_SUSPICIOUS = 50;
-        }
 
-        namespace Timeouts {
-            constexpr std::chrono::milliseconds SCAN_TIMEOUT_MS(2000);
-            constexpr std::chrono::milliseconds AMSI_CHECK_TIMEOUT_MS(500);
-        }
+namespace Constants {
+    constexpr size_t MAX_SCRIPT_SIZE_BYTES       = 10 * 1024 * 1024;
+    constexpr size_t MAX_DEOBFUSCATION_DEPTH     = 5;
+    constexpr size_t MAX_FLAGGED_LINES           = 100;
+    constexpr double MIN_ENTROPY_OBFUSCATION     = 5.8;
+
+    constexpr std::string_view POWERSHELL_EXE    = "powershell.exe";
+    constexpr std::string_view PWSH_EXE          = "pwsh.exe";
+
+    namespace Heuristics {
+        constexpr int SCORE_AMSI_BYPASS          = 100;
+        constexpr int SCORE_REFLECTION_LOAD      = 90;
+        constexpr int SCORE_ENCODED_COMMAND       = 50;
+        constexpr int SCORE_NET_WEBCLIENT         = 60;
+        constexpr int SCORE_INVOKE_EXPRESSION     = 70;
+        constexpr int SCORE_SUSPICIOUS_OBFUSCATION = 40;
+        constexpr int SCORE_V2_DOWNGRADE          = 100;
+        constexpr int SCORE_MIMIKATZ              = 100;
+        constexpr int SCORE_SHELLCODE_INJECTION   = 95;
+        constexpr int SCORE_WMI_PERSISTENCE       = 80;
+        constexpr int SCORE_LANGUAGE_MODE_BYPASS  = 90;
+        constexpr int SCORE_REVERSE_SHELL         = 90;
+
+        constexpr int THRESHOLD_BLOCK             = 90;
+        constexpr int THRESHOLD_SUSPICIOUS        = 50;
     }
 
-    // --------------------------------------------------------------------------------
-    // ENUMS
-    // --------------------------------------------------------------------------------
-    enum class ScanStatus {
-        CLEAN,
-        SUSPICIOUS,
-        MALICIOUS,
-        ERROR_FILE_ACCESS,
-        ERROR_TIMEOUT,
-        ERROR_INTERNAL,
-        SKIPPED_WHITELISTED,
-        SKIPPED_SIZE_LIMIT
-    };
+    namespace Timeouts {
+        constexpr std::chrono::milliseconds SCAN_TIMEOUT_MS{2000};
+        constexpr std::chrono::milliseconds AMSI_CHECK_TIMEOUT_MS{500};
+    }
+}
 
-    enum class ObfuscationType {
-        NONE,
-        BASE64,
-        XOR,
-        STRING_CONCATENATION,
-        VARIABLE_REPLACEMENT,
-        BACKTICK_INSERTION,
-        MIXED_CASE_RANDOMIZATION,
-        COMPRESSION_GZIP,
-        CUSTOM_ENCODING
-    };
+// ════════════════════════════════════════════════════════════════════════════════
+// ENUMS
+// ════════════════════════════════════════════════════════════════════════════════
 
-    enum class ThreatCategory {
-        NONE,
-        DOWNLOADER,
-        RANSOMWARE_STAGER,
-        CREDENTIAL_THEFT,
-        PERSISTENCE_MECHANISM,
-        PRIVILEGE_ESCALATION,
-        REVERSE_SHELL,
-        RECONNAISSANCE,
-        AMSI_TAMPERING
-    };
+enum class ScanStatus {
+    CLEAN,
+    SUSPICIOUS,
+    MALICIOUS,
+    ERROR_FILE_ACCESS,
+    ERROR_TIMEOUT,
+    ERROR_INTERNAL,
+    SKIPPED_WHITELISTED,
+    SKIPPED_SIZE_LIMIT
+};
 
-    enum class ExecutionMode {
-        FILE_ON_DISK,
-        MEMORY_ONLY,
-        INTERACTIVE_SHELL,
-        ENCODED_COMMAND_LINE
-    };
+enum class ObfuscationType {
+    NONE,
+    BASE64,
+    XOR,
+    STRING_CONCATENATION,
+    VARIABLE_REPLACEMENT,
+    BACKTICK_INSERTION,
+    MIXED_CASE_RANDOMIZATION,
+    COMPRESSION_GZIP,
+    CHAR_ARRAY,
+    CUSTOM_ENCODING
+};
 
-    // --------------------------------------------------------------------------------
-    // CONCEPTS
-    // --------------------------------------------------------------------------------
-    template<typename T>
-    concept PowerShellContext = requires(T t) {
-        { t.getProcessId() } -> std::convertible_to<uint32_t>;
-        { t.getCommandLine() } -> std::convertible_to<std::string_view>;
-        { t.getUserSid() } -> std::convertible_to<std::string_view>;
-    };
+enum class ThreatCategory {
+    NONE,
+    DOWNLOADER,
+    RANSOMWARE_STAGER,
+    CREDENTIAL_THEFT,
+    PERSISTENCE_MECHANISM,
+    PRIVILEGE_ESCALATION,
+    REVERSE_SHELL,
+    RECONNAISSANCE,
+    AMSI_TAMPERING,
+    PROCESS_INJECTION,
+    V2_DOWNGRADE
+};
 
-    // --------------------------------------------------------------------------------
-    // DATA STRUCTURES
-    // --------------------------------------------------------------------------------
-    
-    struct PowerShellScanConfig {
-        bool enableAmsiIntegration = true;
-        bool enableDeepScriptAnalysis = true;
-        bool enableDeobfuscation = true;
-        bool blockObfuscatedScripts = false; // Aggressive mode
-        bool scanInteractiveCommands = true;
-        bool reportToCloud = true;
-        
-        uint32_t maxScriptSize = Constants::MAX_SCRIPT_SIZE_BYTES;
-        uint32_t maxScanTimeMs = Constants::Timeouts::SCAN_TIMEOUT_MS.count();
-        double minEntropyThreshold = Constants::MIN_ENTROPY_OBFUSCATION;
-        
-        std::vector<std::string> blacklistedCmdlets;
-        std::vector<std::string> whitelistedSigners;
+enum class ExecutionMode {
+    FILE_ON_DISK,
+    MEMORY_ONLY,
+    INTERACTIVE_SHELL,
+    ENCODED_COMMAND_LINE
+};
 
-        // Custom equality for configuration comparison
-        bool operator==(const PowerShellScanConfig& other) const = default;
-    };
+// ════════════════════════════════════════════════════════════════════════════════
+// DATA STRUCTURES
+// ════════════════════════════════════════════════════════════════════════════════
 
-    struct ObfuscationDetails {
-        ObfuscationType primaryType = ObfuscationType::NONE;
-        double entropyScore = 0.0;
-        size_t suspiciousTokenCount = 0;
-        std::string decodedSnippet; // Preview of deobfuscated content
-        std::vector<std::string> techniquesDetected;
-    };
+struct PowerShellScanConfig {
+    bool enableAmsiIntegration         = true;
+    bool enableDeepScriptAnalysis      = true;
+    bool enableDeobfuscation           = true;
+    bool blockObfuscatedScripts        = false;
+    bool scanInteractiveCommands       = true;
+    bool blockV2Downgrade              = true;
 
-    struct ScanResult {
-        ScanStatus status = ScanStatus::CLEAN;
-        ThreatCategory category = ThreatCategory::NONE;
-        int riskScore = 0;
-        std::string threatName;
-        std::string description;
-        
-        // Metadata
-        std::string filePath; // Empty if memory-only
-        std::string sha256;
-        std::chrono::system_clock::time_point scanTime;
-        std::chrono::microseconds scanDuration;
-        
-        // Analysis Details
-        ObfuscationDetails obfuscation;
-        std::vector<std::string> matchedRules;
-        std::vector<std::pair<size_t, std::string>> flaggedLines; // Line number, Content
-        
-        // Context
-        uint32_t processId = 0;
-        std::string userSid;
-        ExecutionMode mode = ExecutionMode::FILE_ON_DISK;
+    uint32_t maxScriptSize             = Constants::MAX_SCRIPT_SIZE_BYTES;
+    uint32_t maxScanTimeMs             = static_cast<uint32_t>(Constants::Timeouts::SCAN_TIMEOUT_MS.count());
+    uint32_t maxDeobfuscationDepth     = Constants::MAX_DEOBFUSCATION_DEPTH;
+    double   minEntropyThreshold       = Constants::MIN_ENTROPY_OBFUSCATION;
 
-        [[nodiscard]] bool isBlocking() const {
-            return status == ScanStatus::MALICIOUS || 
-                  (status == ScanStatus::SUSPICIOUS && riskScore >= Constants::Heuristics::THRESHOLD_BLOCK);
-        }
-    };
+    std::vector<std::string> blacklistedCmdlets;
+    std::vector<std::string> whitelistedSigners;
 
-    struct PowerShellStats {
-        std::atomic<uint64_t> totalScans{0};
-        std::atomic<uint64_t> maliciousDetected{0};
-        std::atomic<uint64_t> suspiciousDetected{0};
-        std::atomic<uint64_t> obfuscatedDetected{0};
-        std::atomic<uint64_t> amsiBypassesBlocked{0};
-        std::atomic<uint64_t> timeouts{0};
-        std::atomic<uint64_t> totalBytesScanned{0};
-        std::atomic<uint64_t> averageScanTimeUs{0};
-    };
+    bool operator==(const PowerShellScanConfig& other) const = default;
+};
 
-    // --------------------------------------------------------------------------------
-    // MAIN CLASS
-    // --------------------------------------------------------------------------------
-    class PowerShellScanner {
-    public:
-        // ----------------------------------------------------------------------------
-        // LIFECYCLE
-        // ----------------------------------------------------------------------------
-        
-        // Singleton Accessor
-        static PowerShellScanner& getInstance();
+struct ObfuscationDetails {
+    ObfuscationType primaryType         = ObfuscationType::NONE;
+    double          entropyScore        = 0.0;
+    size_t          suspiciousTokenCount = 0;
+    std::string     decodedSnippet;
+    std::vector<std::string> techniquesDetected;
+};
 
-        // Delete copy/move to enforce singleton
-        PowerShellScanner(const PowerShellScanner&) = delete;
-        PowerShellScanner& operator=(const PowerShellScanner&) = delete;
-        PowerShellScanner(PowerShellScanner&&) = delete;
-        PowerShellScanner& operator=(PowerShellScanner&&) = delete;
+struct ScanResult {
+    ScanStatus      status              = ScanStatus::CLEAN;
+    ThreatCategory  category            = ThreatCategory::NONE;
+    int             riskScore           = 0;
+    std::string     threatName;
+    std::string     description;
 
-        // ----------------------------------------------------------------------------
-        // PUBLIC API - SCANNING
-        // ----------------------------------------------------------------------------
-        
-        /**
-         * @brief Scans a PowerShell script file on disk.
-         * 
-         * @param path The filesystem path to the script (.ps1, .psm1, .psd1).
-         * @param pid Optional process ID if triggered by process creation.
-         * @return ScanResult Detailed analysis result.
-         */
-        [[nodiscard]] ScanResult scanFile(
-            const std::filesystem::path& path, 
-            uint32_t pid = 0
-        );
+    std::string     filePath;
+    std::string     sha256;
+    std::chrono::system_clock::time_point scanTime;
+    std::chrono::microseconds             scanDuration{0};
 
-        /**
-         * @brief Scans an in-memory script or command block.
-         * 
-         * @param content The script content to analyze.
-         * @param sourceDescription Description of origin (e.g., "AMSI Buffer", "EncodedCommand").
-         * @param pid Process ID executing the script.
-         * @return ScanResult Detailed analysis result.
-         */
-        [[nodiscard]] ScanResult scanMemory(
-            std::span<const char> content,
-            std::string_view sourceDescription,
-            uint32_t pid
-        );
+    ObfuscationDetails obfuscation;
+    std::vector<std::string> matchedRules;
+    std::vector<std::pair<size_t, std::string>> flaggedLines;
 
-        /**
-         * @brief Scans a parsed command line for PowerShell execution flags and encoded commands.
-         * 
-         * @param commandLine The full command line string.
-         * @param pid The process ID.
-         * @return ScanResult Detailed analysis result.
-         */
-        [[nodiscard]] ScanResult scanCommandLine(
-            std::string_view commandLine,
-            uint32_t pid
-        );
+    uint32_t      processId             = 0;
+    std::string   userSid;
+    ExecutionMode mode                  = ExecutionMode::FILE_ON_DISK;
 
-        // ----------------------------------------------------------------------------
-        // PUBLIC API - MANAGEMENT
-        // ----------------------------------------------------------------------------
+    [[nodiscard]] bool isBlocking() const noexcept {
+        return status == ScanStatus::MALICIOUS ||
+              (status == ScanStatus::SUSPICIOUS &&
+               riskScore >= Constants::Heuristics::THRESHOLD_BLOCK);
+    }
+};
 
-        /**
-         * @brief Updates the scanner configuration.
-         * Thread-safe.
-         */
-        void updateConfig(const PowerShellScanConfig& newConfig);
+struct PowerShellStats {
+    std::atomic<uint64_t> totalScans{0};
+    std::atomic<uint64_t> maliciousDetected{0};
+    std::atomic<uint64_t> suspiciousDetected{0};
+    std::atomic<uint64_t> obfuscatedDetected{0};
+    std::atomic<uint64_t> amsiBypassesBlocked{0};
+    std::atomic<uint64_t> v2DowngradesBlocked{0};
+    std::atomic<uint64_t> timeouts{0};
+    std::atomic<uint64_t> totalBytesScanned{0};
+    std::atomic<uint64_t> averageScanTimeUs{0};
+};
 
-        /**
-         * @brief Retrieves the current configuration.
-         */
-        PowerShellScanConfig getConfig() const;
+// ════════════════════════════════════════════════════════════════════════════════
+// MAIN CLASS — PIMPL + Meyers' Singleton
+// ════════════════════════════════════════════════════════════════════════════════
 
-        /**
-         * @brief Registers a callback for scan events.
-         */
-        void registerCallback(std::function<void(const ScanResult&)> callback);
+class PowerShellScanner {
+public:
+    static PowerShellScanner& getInstance();
 
-        /**
-         * @brief Retrieves current runtime statistics.
-         */
-        PowerShellStats getStats() const;
+    PowerShellScanner(const PowerShellScanner&)            = delete;
+    PowerShellScanner& operator=(const PowerShellScanner&) = delete;
+    PowerShellScanner(PowerShellScanner&&)                 = delete;
+    PowerShellScanner& operator=(PowerShellScanner&&)      = delete;
 
-        /**
-         * @brief Resets runtime statistics.
-         */
-        void resetStats();
+    // ── Scanning ─────────────────────────────────────────────────────────────
 
-        /**
-         * @brief Performs a self-test of the scanner engine.
-         * @return true if operational, false if critical failure.
-         */
-        bool healthCheck();
+    [[nodiscard]] ScanResult scanFile(
+        const std::filesystem::path& path,
+        uint32_t pid = 0);
 
-    private:
-        // ----------------------------------------------------------------------------
-        // PRIVATE IMPLEMENTATION (PIMPL)
-        // ----------------------------------------------------------------------------
-        class Impl;
-        std::unique_ptr<Impl> pImpl;
+    [[nodiscard]] ScanResult scanMemory(
+        std::span<const char> content,
+        std::string_view sourceDescription,
+        uint32_t pid);
 
-        // Private constructor for Singleton
-        PowerShellScanner();
-        ~PowerShellScanner();
+    [[nodiscard]] ScanResult scanCommandLine(
+        std::string_view commandLine,
+        uint32_t pid);
 
-        // ----------------------------------------------------------------------------
-        // INTERNAL HELPERS
-        // ----------------------------------------------------------------------------
-        
-        // Helper to check whitelist caches before deep scanning
-        bool isWhitelisted(const std::filesystem::path& path, const std::string& hash);
-        
-        // Helper to perform static analysis on script content
-        ScanResult performStaticAnalysis(
-            std::string_view content, 
-            const std::string& contextName
-        );
+    // ── Management ───────────────────────────────────────────────────────────
 
-        // Helper to detect and handle AMSI bypass attempts specifically
-        bool detectAmsiBypass(std::string_view content, std::vector<std::string>& techniques);
+    void updateConfig(const PowerShellScanConfig& newConfig);
 
-        // Deobfuscation engine entry point
-        std::string attemptDeobfuscation(std::string_view content, ObfuscationType& detectedType);
-        
-        // Base64 decoding helper for PowerShell's specific unicode/widechar encoding
-        std::string decodePowerShellBase64(std::string_view encoded);
+    [[nodiscard]] PowerShellScanConfig getConfig() const;
 
-        // Thread synchronization
-        mutable std::mutex configMutex;
-        mutable std::mutex callbackMutex;
-    };
+    void registerCallback(std::function<void(const ScanResult&)> callback);
+
+    [[nodiscard]] PowerShellStats getStats() const;
+
+    void resetStats();
+
+    [[nodiscard]] bool healthCheck();
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> pImpl;
+
+    PowerShellScanner();
+    ~PowerShellScanner();
+};
 
 } // namespace ShadowStrike::Scripts
+
+#endif // SHADOWSTRIKE_SCRIPTS_POWERSHELLSCANNER_HPP
