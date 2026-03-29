@@ -49,6 +49,7 @@
 #ifdef _WIN32
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "advapi32.lib")
 #endif
 
 // ============================================================================
@@ -61,6 +62,12 @@
 #include <random>
 #include <cstring>
 #include <filesystem>
+
+#ifdef _WIN32
+#include <TlHelp32.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
+#endif
 
 namespace ShadowStrike {
 namespace Security {
@@ -306,18 +313,45 @@ std::string ProtectionEvent::GetSummary() const {
 }
 
 std::string ProtectionEvent::ToJson() const {
+    // Escape a string for safe JSON embedding
+    auto escapeJson = [](const std::string& input) -> std::string {
+        std::string output;
+        output.reserve(input.size() + 8);
+        for (char c : input) {
+            switch (c) {
+                case '"':  output += "\\\""; break;
+                case '\\': output += "\\\\"; break;
+                case '\b': output += "\\b"; break;
+                case '\f': output += "\\f"; break;
+                case '\n': output += "\\n"; break;
+                case '\r': output += "\\r"; break;
+                case '\t': output += "\\t"; break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        char buf[8];
+                        snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                        output += buf;
+                    } else {
+                        output += c;
+                    }
+                    break;
+            }
+        }
+        return output;
+    };
+
     std::ostringstream oss;
     oss << "{";
     oss << "\"eventId\":" << eventId << ",";
     oss << "\"type\":" << static_cast<uint32_t>(type) << ",";
     oss << "\"address\":\"0x" << std::hex << address << "\",";
     oss << "\"size\":" << std::dec << size << ",";
-    oss << "\"regionId\":\"" << regionId << "\",";
+    oss << "\"regionId\":\"" << escapeJson(regionId) << "\",";
     oss << "\"sourceProcessId\":" << sourceProcessId << ",";
     oss << "\"sourceThreadId\":" << sourceThreadId << ",";
     oss << "\"wasBlocked\":" << (wasBlocked ? "true" : "false") << ",";
     oss << "\"wasRepaired\":" << (wasRepaired ? "true" : "false") << ",";
-    oss << "\"description\":\"" << description << "\"";
+    oss << "\"description\":\"" << escapeJson(description) << "\"";
     oss << "}";
     return oss.str();
 }
@@ -384,8 +418,8 @@ void SecureAllocator<T>::deallocate(pointer p, size_type n) noexcept {
     if (p) {
         size_t bytes = n * sizeof(T);
 
-        // Securely zero memory before freeing
-        SecureZeroMemory(p, bytes);
+        // Use Windows SDK RtlSecureZeroMemory directly to avoid macro collision
+        RtlSecureZeroMemory(p, bytes);
 
         // Unlock memory
         VirtualUnlock(p, bytes);
@@ -750,7 +784,7 @@ public:
         const SecureAllocation& alloc = it->second;
 
         // Securely zero the memory
-        SecureZeroMemory(ptr, alloc.size);
+        SecureZero(ptr, alloc.size);
 
         // Fill with free pattern
         std::memset(ptr, MemoryProtectionConstants::FREE_MEMORY_FILL, alloc.size);
@@ -971,15 +1005,38 @@ public:
             return false;
         }
 
-        // Parse PE headers to find code sections
+        // Get module size via VirtualQuery to bound PE header parsing
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(hModule, &mbi, sizeof(mbi)) == 0) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to query module memory region");
+            return false;
+        }
+
         auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(hModule);
         if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid DOS signature in self module");
+            return false;
+        }
+
+        // Validate e_lfanew is within module bounds
+        if (dosHeader->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
+            static_cast<size_t>(dosHeader->e_lfanew) + sizeof(IMAGE_NT_HEADERS) > mbi.RegionSize) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid e_lfanew offset: 0x%lx", dosHeader->e_lfanew);
             return false;
         }
 
         auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
             reinterpret_cast<uint8_t*>(hModule) + dosHeader->e_lfanew);
         if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid NT signature in self module");
+            return false;
+        }
+
+        // Validate section count is reasonable
+        if (ntHeaders->FileHeader.NumberOfSections == 0 ||
+            ntHeaders->FileHeader.NumberOfSections > 96) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Suspicious section count: %u",
+                ntHeaders->FileHeader.NumberOfSections);
             return false;
         }
 
@@ -991,6 +1048,10 @@ public:
                 uintptr_t sectionAddr = reinterpret_cast<uintptr_t>(hModule) +
                     sectionHeader[i].VirtualAddress;
                 size_t sectionSize = sectionHeader[i].Misc.VirtualSize;
+
+                if (sectionSize == 0) {
+                    continue;
+                }
 
                 std::string sectionName(reinterpret_cast<char*>(sectionHeader[i].Name), 8);
                 sectionName = "self_" + sectionName;
@@ -1049,78 +1110,133 @@ public:
     // ========================================================================
 
     [[nodiscard]] IntegrityStatus VerifyRegionIntegrity(std::string_view id) noexcept {
-        std::unique_lock lock(m_mutex);
+        ProtectionEvent event;
+        bool hasViolation = false;
+        IntegrityStatus resultStatus = IntegrityStatus::Unknown;
 
-        auto it = m_protectedRegions.find(std::string(id));
-        if (it == m_protectedRegions.end()) {
-            return IntegrityStatus::Unknown;
-        }
+        // Snapshot of callbacks to invoke outside the lock
+        std::vector<IntegrityCallback> integrityCallbacksCopy;
+        ProtectedRegion regionCopy;
 
-        ProtectedRegion& region = it->second;
+        {
+            std::unique_lock lock(m_mutex);
 
-        m_stats.totalIntegrityChecks++;
-
-        // Calculate current hash
-        uint32_t currentCrc32 = 0;
-        std::array<uint8_t, 32> currentSha256{};
-
-        if (!calculateRegionHash(region.baseAddress, region.size, currentCrc32, currentSha256)) {
-            region.status = IntegrityStatus::Corrupted;
-            return IntegrityStatus::Corrupted;
-        }
-
-        region.currentCrc32 = currentCrc32;
-        region.lastVerified = Clock::now();
-
-        // Compare with expected
-        if (currentCrc32 != region.expectedCrc32 || currentSha256 != region.expectedSha256) {
-            region.status = IntegrityStatus::Modified;
-            region.violationCount++;
-            m_stats.integrityViolations++;
-
-            // Check if this looks like a hook (JMP instruction at start)
-            auto ptr = reinterpret_cast<const uint8_t*>(region.baseAddress);
-            if (*ptr == 0xE9 || *ptr == 0xEB || (*ptr == 0xFF && *(ptr + 1) == 0x25)) {
-                region.status = IntegrityStatus::Hooked;
-                m_stats.hooksDetected++;
+            auto it = m_protectedRegions.find(std::string(id));
+            if (it == m_protectedRegions.end()) {
+                return IntegrityStatus::Unknown;
             }
 
-            // Fire event
-            ProtectionEvent event;
-            event.eventId = m_nextEventId++;
-            event.type = ProtectionEventType::IntegrityViolation;
-            event.address = region.baseAddress;
-            event.size = region.size;
-            event.regionId = region.id;
-            event.timestamp = Clock::now();
-            event.description = "Integrity violation detected";
+            ProtectedRegion& region = it->second;
 
-            fireEvent(event);
+            m_stats.totalIntegrityChecks++;
 
-            // Invoke callbacks
-            for (const auto& [cbId, callback] : m_integrityCallbacks) {
+            // Calculate current hash
+            uint32_t currentCrc32 = 0;
+            std::array<uint8_t, 32> currentSha256{};
+
+            if (!calculateRegionHash(region.baseAddress, region.size, currentCrc32, currentSha256)) {
+                region.status = IntegrityStatus::Corrupted;
+                return IntegrityStatus::Corrupted;
+            }
+
+            region.currentCrc32 = currentCrc32;
+            region.lastVerified = Clock::now();
+
+            // Compare with expected
+            if (currentCrc32 != region.expectedCrc32 || currentSha256 != region.expectedSha256) {
+                region.status = IntegrityStatus::Modified;
+                region.violationCount++;
+                m_stats.integrityViolations++;
+
+                // Check if this looks like a hook
+                auto ptr = reinterpret_cast<const uint8_t*>(region.baseAddress);
+                bool isHook = false;
+                if (region.size >= 2) {
+                    if (ptr[0] == 0xE9) isHook = true;
+                    else if (ptr[0] == 0xEB) isHook = true;
+                    else if (ptr[0] == 0xFF && ptr[1] == 0x25) isHook = true;
+                    else if (region.size >= 6 && ptr[0] == 0x68 && ptr[5] == 0xC3) isHook = true;
+                    else if (ptr[0] == 0xCC) isHook = true;
+#ifdef _WIN64
+                    else if (region.size >= 12 && ptr[0] == 0x48 && ptr[1] == 0xB8 &&
+                             ptr[10] == 0xFF && ptr[11] == 0xE0) isHook = true;
+                    else if (region.size >= 13 && ptr[0] == 0x49 && ptr[1] == 0xBA &&
+                             ptr[10] == 0x41 && ptr[11] == 0xFF && ptr[12] == 0xE2) isHook = true;
+#endif
+                }
+
+                if (isHook) {
+                    region.status = IntegrityStatus::Hooked;
+                    m_stats.hooksDetected++;
+                }
+
+                // Prepare event (will be fired after releasing lock)
+                hasViolation = true;
+                event.eventId = m_nextEventId++;
+                event.type = ProtectionEventType::IntegrityViolation;
+                event.address = region.baseAddress;
+                event.size = region.size;
+                event.regionId = region.id;
+                event.timestamp = Clock::now();
+                event.description = "Integrity violation detected";
+
+                // Store event in history while we hold the lock
+                m_eventHistory.push_back(event);
+                if (m_eventHistory.size() > 10000) {
+                    m_eventHistory.erase(m_eventHistory.begin(),
+                        m_eventHistory.begin() + 5000);
+                }
+                m_stats.lastEventTime = Clock::now();
+
+                // Snapshot callbacks
+                regionCopy = region;
+                integrityCallbacksCopy.reserve(m_integrityCallbacks.size());
+                for (const auto& [cbId, cb] : m_integrityCallbacks) {
+                    integrityCallbacksCopy.push_back(cb);
+                }
+
+                SS_LOG_WARN(LOG_CATEGORY, L"Integrity violation in region '%hs'", region.id.c_str());
+                resultStatus = region.status;
+            } else {
+                region.status = IntegrityStatus::Valid;
+                resultStatus = IntegrityStatus::Valid;
+            }
+        }
+        // Lock released — safe to invoke callbacks
+
+        if (hasViolation) {
+            // Fire event callbacks
+            fireEventCallbacksUnlocked(event);
+
+            // Fire integrity callbacks
+            for (const auto& cb : integrityCallbacksCopy) {
                 try {
-                    callback(region);
-                } catch (...) {}
+                    cb(regionCopy);
+                } catch (...) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Exception in integrity callback");
+                }
             }
-
-            SS_LOG_WARN(LOG_CATEGORY, L"Integrity violation in region '%hs'", region.id.c_str());
-            return region.status;
         }
 
-        region.status = IntegrityStatus::Valid;
-        return IntegrityStatus::Valid;
+        return resultStatus;
     }
 
     [[nodiscard]] std::vector<std::pair<std::string, IntegrityStatus>> VerifyAllIntegrity() noexcept {
         std::vector<std::pair<std::string, IntegrityStatus>> results;
 
-        std::shared_lock lock(m_mutex);
+        // Copy region IDs under lock to avoid iterator invalidation
+        std::vector<std::string> regionIds;
+        {
+            std::shared_lock lock(m_mutex);
+            regionIds.reserve(m_protectedRegions.size());
+            for (const auto& [id, region] : m_protectedRegions) {
+                regionIds.push_back(id);
+            }
+        }
 
-        for (auto& [id, region] : m_protectedRegions) {
-            lock.unlock();
+        // Verify each region without holding the collection lock
+        for (const auto& id : regionIds) {
             auto status = VerifyRegionIntegrity(id);
-            lock.lock();
             results.emplace_back(id, status);
         }
 
@@ -1176,9 +1292,17 @@ public:
 
         std::unique_lock lock(m_mutex);
 
-        // Restore PE headers if we saved them
+        // Restore PE headers inline (avoid calling RestorePEHeaders which re-locks)
         if (!m_savedPEHeaders.empty()) {
-            RestorePEHeaders(authorizationToken);
+            HMODULE hModule = GetModuleHandle(nullptr);
+            if (hModule) {
+                DWORD oldProtect;
+                if (VirtualProtect(hModule, m_savedPEHeaders.size(), PAGE_READWRITE, &oldProtect)) {
+                    std::memcpy(hModule, m_savedPEHeaders.data(), m_savedPEHeaders.size());
+                    VirtualProtect(hModule, m_savedPEHeaders.size(), oldProtect, &oldProtect);
+                }
+                m_savedPEHeaders.clear();
+            }
         }
 
         m_antiDumpEnabled = false;
@@ -1198,11 +1322,30 @@ public:
         std::unique_lock lock(m_mutex);
 
         auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(hModule);
+        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid DOS signature during header obfuscation");
+            return false;
+        }
+
+        // Validate e_lfanew to prevent out-of-bounds access
+        if (dosHeader->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER))) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid e_lfanew offset: 0x%lx", dosHeader->e_lfanew);
+            return false;
+        }
+
         auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
             reinterpret_cast<uint8_t*>(hModule) + dosHeader->e_lfanew);
+        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid NT signature during header obfuscation");
+            return false;
+        }
 
         // Calculate header size
         size_t headerSize = ntHeaders->OptionalHeader.SizeOfHeaders;
+        if (headerSize == 0 || headerSize > 4096 * 16) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Suspicious header size: %zu", headerSize);
+            return false;
+        }
 
         // Save original headers
         m_savedPEHeaders.resize(headerSize);
@@ -1211,13 +1354,17 @@ public:
         // Make headers writable
         DWORD oldProtect;
         if (!VirtualProtect(hModule, headerSize, PAGE_READWRITE, &oldProtect)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to make headers writable: %lu", GetLastError());
+            m_savedPEHeaders.clear();
             return false;
         }
 
-        // Wipe some header fields (but not critical ones)
-        // Wipe DOS stub
-        std::memset(reinterpret_cast<uint8_t*>(hModule) + sizeof(IMAGE_DOS_HEADER),
-            0, dosHeader->e_lfanew - sizeof(IMAGE_DOS_HEADER));
+        // Wipe DOS stub (between DOS header and NT headers)
+        size_t stubSize = static_cast<size_t>(dosHeader->e_lfanew) - sizeof(IMAGE_DOS_HEADER);
+        if (stubSize > 0) {
+            std::memset(reinterpret_cast<uint8_t*>(hModule) + sizeof(IMAGE_DOS_HEADER),
+                0, stubSize);
+        }
 
         // Wipe optional header fields that aren't needed at runtime
         ntHeaders->OptionalHeader.CheckSum = 0;
@@ -1275,8 +1422,12 @@ public:
     }
 
     [[nodiscard]] bool ValidateHeapIntegrity() noexcept {
-        HANDLE heaps[100];
-        DWORD heapCount = GetProcessHeaps(100, heaps);
+        constexpr DWORD MAX_HEAPS = 256;
+        HANDLE heaps[MAX_HEAPS];
+        DWORD heapCount = GetProcessHeaps(MAX_HEAPS, heaps);
+        if (heapCount > MAX_HEAPS) {
+            heapCount = MAX_HEAPS;
+        }
 
         for (DWORD i = 0; i < heapCount; i++) {
             if (!HeapValidate(heaps[i], 0, nullptr)) {
@@ -1303,8 +1454,12 @@ public:
     [[nodiscard]] std::vector<HeapInfo> GetHeapInfo() const noexcept {
         std::vector<HeapInfo> result;
 
-        HANDLE heaps[100];
-        DWORD heapCount = GetProcessHeaps(100, heaps);
+        constexpr DWORD MAX_HEAPS = 256;
+        HANDLE heaps[MAX_HEAPS];
+        DWORD heapCount = GetProcessHeaps(MAX_HEAPS, heaps);
+        if (heapCount > MAX_HEAPS) {
+            heapCount = MAX_HEAPS;
+        }
 
         HANDLE defaultHeap = GetProcessHeap();
 
@@ -1335,7 +1490,7 @@ public:
     }
 
     [[nodiscard]] void* CreateSecureHeap(size_t initialSize) noexcept {
-        HANDLE heap = HeapCreate(HEAP_NO_SERIALIZE, initialSize, 0);
+        HANDLE heap = HeapCreate(0, initialSize, 0);
         if (heap) {
             HeapSetInformation(heap, HeapEnableTerminationOnCorruption, nullptr, 0);
             SS_LOG_INFO(LOG_CATEGORY, L"Created secure heap: %p", heap);
@@ -1367,42 +1522,66 @@ public:
     }
 
     [[nodiscard]] bool VerifyStackCanary(uint32_t threadId) noexcept {
-        // This would require cooperation with the compiler's stack canary mechanism
-        // For now, we verify the stack is not overflowed
-
         if (threadId == 0) {
             threadId = GetCurrentThreadId();
         }
 
-        HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, threadId);
+        const bool isCurrentThread = (threadId == GetCurrentThreadId());
+
+        if (isCurrentThread) {
+            // For the current thread, use TEB directly
+            NT_TIB* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+            uintptr_t stackBase = reinterpret_cast<uintptr_t>(tib->StackBase);
+            uintptr_t stackLimit = reinterpret_cast<uintptr_t>(tib->StackLimit);
+
+            // Approximate SP check using local variable address
+            uintptr_t approxSp = reinterpret_cast<uintptr_t>(&tib);
+            if (approxSp < stackLimit || approxSp > stackBase) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Stack pointer out of range for current thread %u", threadId);
+                m_stats.stackOverflowsDetected++;
+                return false;
+            }
+            return true;
+        }
+
+        // For other threads: open, suspend, query, resume
+        HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                     FALSE, threadId);
         if (!hThread) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Failed to open thread %u: %lu", threadId, GetLastError());
             return false;
         }
 
-        CONTEXT ctx = {};
+        bool result = true;
+        DWORD suspendCount = SuspendThread(hThread);
+        if (suspendCount == static_cast<DWORD>(-1)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Failed to suspend thread %u: %lu", threadId, GetLastError());
+            CloseHandle(hThread);
+            return false;
+        }
+
+        CONTEXT ctx{};
         ctx.ContextFlags = CONTEXT_CONTROL;
 
-        bool result = true;
-
         if (GetThreadContext(hThread, &ctx)) {
-            // Check if stack pointer is within expected range
-            NT_TIB* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
-
 #ifdef _WIN64
             uintptr_t sp = ctx.Rsp;
 #else
             uintptr_t sp = ctx.Esp;
 #endif
-            uintptr_t stackBase = reinterpret_cast<uintptr_t>(tib->StackBase);
-            uintptr_t stackLimit = reinterpret_cast<uintptr_t>(tib->StackLimit);
-
-            if (sp < stackLimit || sp > stackBase) {
-                SS_LOG_WARN(LOG_CATEGORY, L"Stack pointer out of range for thread %u", threadId);
+            // We can't access the target thread's TEB directly from here.
+            // A zero SP is definitely invalid; further checks require NtQueryInformationThread.
+            if (sp == 0) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Null stack pointer for thread %u", threadId);
                 m_stats.stackOverflowsDetected++;
                 result = false;
             }
+        } else {
+            SS_LOG_WARN(LOG_CATEGORY, L"Failed to get context for thread %u: %lu", threadId, GetLastError());
+            result = false;
         }
 
+        ResumeThread(hThread);
         CloseHandle(hThread);
         return result;
     }
@@ -1416,31 +1595,54 @@ public:
 
         info.threadId = threadId;
 
-        // Get stack bounds from TEB
-        NT_TIB* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+        const bool isCurrentThread = (threadId == GetCurrentThreadId());
 
-        info.stackBase = reinterpret_cast<uintptr_t>(tib->StackBase);
-        info.stackLimit = reinterpret_cast<uintptr_t>(tib->StackLimit);
-        info.stackSize = info.stackBase - info.stackLimit;
+        if (isCurrentThread) {
+            // Safe to use NtCurrentTeb() only for the calling thread
+            NT_TIB* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+            info.stackBase = reinterpret_cast<uintptr_t>(tib->StackBase);
+            info.stackLimit = reinterpret_cast<uintptr_t>(tib->StackLimit);
+            info.stackSize = info.stackBase - info.stackLimit;
 
-        // Get current SP
-        CONTEXT ctx = {};
-        ctx.ContextFlags = CONTEXT_CONTROL;
-
-        HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, threadId);
-        if (hThread) {
-            if (GetThreadContext(hThread, &ctx)) {
-#ifdef _WIN64
-                info.currentSP = ctx.Rsp;
-#else
-                info.currentSP = ctx.Esp;
-#endif
-            }
-            CloseHandle(hThread);
+            // Approximate SP using a local variable address
+            uintptr_t approxSp = reinterpret_cast<uintptr_t>(&tib);
+            info.currentSP = approxSp;
+            info.stackUsage = info.stackBase - info.currentSP;
+            info.hasCanary = true;
+            info.canaryIntact = VerifyStackCanary(threadId);
+            return info;
         }
 
-        info.stackUsage = info.stackBase - info.currentSP;
-        info.hasCanary = true; // Assume /GS is enabled
+        // For non-current threads, suspend and query
+        HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                     FALSE, threadId);
+        if (!hThread) {
+            return info;
+        }
+
+        DWORD suspendCount = SuspendThread(hThread);
+        if (suspendCount == static_cast<DWORD>(-1)) {
+            CloseHandle(hThread);
+            return info;
+        }
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL;
+
+        if (GetThreadContext(hThread, &ctx)) {
+#ifdef _WIN64
+            info.currentSP = ctx.Rsp;
+#else
+            info.currentSP = ctx.Esp;
+#endif
+        }
+
+        ResumeThread(hThread);
+        CloseHandle(hThread);
+
+        // We cannot safely access another thread's TEB from user mode without NtQueryInformationThread.
+        // Fill what we can.
+        info.hasCanary = true;
         info.canaryIntact = VerifyStackCanary(threadId);
 
         return info;
@@ -1547,9 +1749,24 @@ public:
 
     [[nodiscard]] bool SetPageProtection(uintptr_t address, size_t size,
                                           PageProtection protection) noexcept {
+        // Block RWX pages — a security-critical invariant for an EDR
+        uint32_t protVal = static_cast<uint32_t>(protection);
+        if (protVal == PAGE_EXECUTE_READWRITE || protVal == PAGE_EXECUTE_WRITECOPY) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"Blocked RWX page protection request at 0x%llx (size %zu) — W^X violation",
+                static_cast<unsigned long long>(address), size);
+            return false;
+        }
+
         DWORD oldProtect;
-        return VirtualProtect(reinterpret_cast<void*>(address), size,
-            static_cast<DWORD>(protection), &oldProtect) != 0;
+        if (!VirtualProtect(reinterpret_cast<void*>(address), size,
+                static_cast<DWORD>(protection), &oldProtect)) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"VirtualProtect failed at 0x%llx: %lu",
+                static_cast<unsigned long long>(address), GetLastError());
+            return false;
+        }
+        return true;
     }
 
     // ========================================================================
@@ -1642,6 +1859,8 @@ public:
     }
 
     [[nodiscard]] std::string ExportReport() const noexcept {
+        std::shared_lock lock(m_mutex);
+
         std::ostringstream oss;
         oss << "MemoryProtection Report\n";
         oss << "=======================\n\n";
@@ -1719,12 +1938,12 @@ public:
             passed = false;
         }
 
-        // Test 3: SecureZeroMemory
+        // Test 3: SecureZero
         try {
             uint8_t buffer[64];
             std::memset(buffer, 0xFF, sizeof(buffer));
 
-            SecureZeroMemory(buffer, sizeof(buffer));
+            SecureZero(buffer, sizeof(buffer));
 
             bool allZero = true;
             for (auto b : buffer) {
@@ -1735,7 +1954,7 @@ public:
             }
 
             if (!allZero) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test: SecureZeroMemory failed");
+                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test: SecureZero failed");
                 passed = false;
             }
         } catch (...) {
@@ -1756,7 +1975,7 @@ public:
     // STATIC UTILITIES
     // ========================================================================
 
-    static void SecureZeroMemory(void* ptr, size_t size) noexcept {
+    static void SecureZero(void* ptr, size_t size) noexcept {
         if (!ptr || size == 0) {
             return;
         }
@@ -1886,7 +2105,7 @@ private:
     }
 
     void initializeSecureHeap(size_t poolSize) noexcept {
-        m_secureHeap = HeapCreate(HEAP_NO_SERIALIZE, poolSize, 0);
+        m_secureHeap = HeapCreate(0, poolSize, 0);
         if (m_secureHeap) {
             HeapSetInformation(m_secureHeap, HeapEnableTerminationOnCorruption, nullptr, 0);
             SS_LOG_INFO(LOG_CATEGORY, L"Secure heap initialized with size %zu", poolSize);
@@ -1895,7 +2114,7 @@ private:
 
     void freeAllSecureAllocations() noexcept {
         for (auto& [ptr, alloc] : m_secureAllocations) {
-            SecureZeroMemory(ptr, alloc.size);
+            SecureZero(ptr, alloc.size);
 
             if (alloc.isLocked) {
                 VirtualUnlock(ptr, alloc.size);
@@ -1961,6 +2180,27 @@ private:
     [[nodiscard]] bool calculateRegionHash(uintptr_t address, size_t size,
                                            uint32_t& crc32,
                                            std::array<uint8_t, 32>& sha256) noexcept {
+        // Validate the memory region is still committed and readable
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) == 0) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"calculateRegionHash: VirtualQuery failed at 0x%llx",
+                static_cast<unsigned long long>(address));
+            return false;
+        }
+
+        if (mbi.State != MEM_COMMIT) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"calculateRegionHash: region at 0x%llx is not committed",
+                static_cast<unsigned long long>(address));
+            return false;
+        }
+
+        // Reject regions protected with PAGE_NOACCESS or PAGE_GUARD (would cause AV)
+        if ((mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"calculateRegionHash: region at 0x%llx has no-access/guard protection",
+                static_cast<unsigned long long>(address));
+            return false;
+        }
+
         const uint8_t* data = reinterpret_cast<const uint8_t*>(address);
 
         // Calculate CRC32
@@ -1986,6 +2226,13 @@ private:
             return false;
         }
 
+        // CryptHashData takes DWORD size — cap to prevent truncation
+        if (size > static_cast<size_t>(MAXDWORD)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Region too large for SHA-256 hash: %zu", size);
+            CryptReleaseContext(hProv, 0);
+            return false;
+        }
+
         if (!CryptHashData(hHash, data, static_cast<DWORD>(size), 0)) {
             CryptDestroyHash(hHash);
             CryptReleaseContext(hProv, 0);
@@ -2006,18 +2253,31 @@ private:
     }
 
     void generateSessionKey() noexcept {
-        // Generate random encryption key for this session
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        std::uniform_int_distribution<uint8_t> dist(0, 255);
+        // Generate random encryption key using OS CSPRNG
+        NTSTATUS status = BCryptGenRandom(
+            nullptr,
+            m_sessionKey.data(),
+            static_cast<ULONG>(m_sessionKey.size()),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 
-        for (auto& byte : m_sessionKey) {
-            byte = dist(gen);
+        if (!BCRYPT_SUCCESS(status)) {
+            // Fallback to CryptGenRandom if BCrypt is unavailable
+            HCRYPTPROV hProv = 0;
+            if (CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+                CryptGenRandom(hProv, static_cast<DWORD>(m_sessionKey.size()), m_sessionKey.data());
+                CryptReleaseContext(hProv, 0);
+            } else {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to generate session key via any CSPRNG");
+            }
         }
     }
 
     [[nodiscard]] bool verifyAuthToken(std::string_view token) const noexcept {
-        return token == INTERNAL_AUTH_TOKEN;
+        // Constant-time comparison to prevent timing side-channels
+        if (token.size() != INTERNAL_AUTH_TOKEN.size()) {
+            return false;
+        }
+        return ConstantTimeCompare(token.data(), INTERNAL_AUTH_TOKEN.data(), token.size());
     }
 
     void fireEvent(const ProtectionEvent& event) noexcept {
@@ -2035,9 +2295,23 @@ private:
             m_stats.lastEventTime = Clock::now();
         }
 
-        // Invoke callbacks
-        std::shared_lock lock(m_mutex);
-        for (const auto& [id, callback] : m_eventCallbacks) {
+        // Invoke callbacks outside the lock to prevent deadlock
+        fireEventCallbacksUnlocked(event);
+    }
+
+    /// Fire event callbacks without acquiring m_mutex for event history.
+    /// Acquires a shared_lock only to snapshot the callback list, then invokes outside.
+    void fireEventCallbacksUnlocked(const ProtectionEvent& event) noexcept {
+        std::vector<ProtectionEventCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy.reserve(m_eventCallbacks.size());
+            for (const auto& [id, callback] : m_eventCallbacks) {
+                callbacksCopy.push_back(callback);
+            }
+        }
+
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(event);
             } catch (...) {
@@ -2408,8 +2682,8 @@ bool MemoryProtection::SelfTest() {
     return m_impl->SelfTest();
 }
 
-void MemoryProtection::SecureZeroMemory(void* ptr, size_t size) {
-    MemoryProtectionImpl::SecureZeroMemory(ptr, size);
+void MemoryProtection::SecureZero(void* ptr, size_t size) {
+    MemoryProtectionImpl::SecureZero(ptr, size);
 }
 
 bool MemoryProtection::ConstantTimeCompare(const void* a, const void* b, size_t size) {
@@ -2476,20 +2750,12 @@ SecureBuffer& SecureBuffer::operator=(SecureBuffer&& other) noexcept {
 ProtectedRegionGuard::ProtectedRegionGuard(std::string_view id, uintptr_t address, size_t size)
     : m_id(id)
 {
-    // Generate auth token for cleanup
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    std::ostringstream oss;
-    oss << std::hex << gen();
-    m_authToken = oss.str();
-
     m_protected = MemoryProtection::Instance().ProtectRegion(id, address, size);
 }
 
 ProtectedRegionGuard::~ProtectedRegionGuard() {
     if (m_protected) {
-        // Note: In production, you'd use a proper auth token mechanism
-        MemoryProtection::Instance().UnprotectRegion(m_id, "SS_INTERNAL_MEMORY_PROTECTION_AUTH");
+        MemoryProtection::Instance().UnprotectRegion(m_id, INTERNAL_AUTH_TOKEN);
     }
 }
 
