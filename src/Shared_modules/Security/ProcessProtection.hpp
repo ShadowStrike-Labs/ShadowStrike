@@ -289,22 +289,22 @@ namespace ProcessProtectionConstants {
     // ========================================================================
     
     /// @brief Untrusted integrity level
-    inline constexpr uint32_t SECURITY_MANDATORY_UNTRUSTED_RID = 0x00000000;
+    inline constexpr uint32_t INTEGRITY_UNTRUSTED = 0x00000000;
     
     /// @brief Low integrity level
-    inline constexpr uint32_t SECURITY_MANDATORY_LOW_RID = 0x00001000;
+    inline constexpr uint32_t INTEGRITY_LOW = 0x00001000;
     
     /// @brief Medium integrity level
-    inline constexpr uint32_t SECURITY_MANDATORY_MEDIUM_RID = 0x00002000;
+    inline constexpr uint32_t INTEGRITY_MEDIUM = 0x00002000;
     
     /// @brief High integrity level
-    inline constexpr uint32_t SECURITY_MANDATORY_HIGH_RID = 0x00003000;
+    inline constexpr uint32_t INTEGRITY_HIGH = 0x00003000;
     
     /// @brief System integrity level
-    inline constexpr uint32_t SECURITY_MANDATORY_SYSTEM_RID = 0x00004000;
+    inline constexpr uint32_t INTEGRITY_SYSTEM = 0x00004000;
     
     /// @brief Protected process integrity level
-    inline constexpr uint32_t SECURITY_MANDATORY_PROTECTED_PROCESS_RID = 0x00005000;
+    inline constexpr uint32_t INTEGRITY_PROTECTED_PROCESS = 0x00005000;
 
 }  // namespace ProcessProtectionConstants
 
@@ -406,6 +406,14 @@ inline constexpr ThreatAction operator|(ThreatAction a, ThreatAction b) noexcept
     return static_cast<ThreatAction>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
+inline constexpr ThreatAction operator&(ThreatAction a, ThreatAction b) noexcept {
+    return static_cast<ThreatAction>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+
+inline constexpr ThreatAction operator~(ThreatAction a) noexcept {
+    return static_cast<ThreatAction>(~static_cast<uint32_t>(a));
+}
+
 /**
  * @brief Response to threat
  */
@@ -425,6 +433,14 @@ enum class ThreatResponse : uint32_t {
 
 inline constexpr ThreatResponse operator|(ThreatResponse a, ThreatResponse b) noexcept {
     return static_cast<ThreatResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+
+inline constexpr ThreatResponse operator&(ThreatResponse a, ThreatResponse b) noexcept {
+    return static_cast<ThreatResponse>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+
+inline constexpr ThreatResponse operator~(ThreatResponse a) noexcept {
+    return static_cast<ThreatResponse>(~static_cast<uint32_t>(a));
 }
 
 /**
@@ -583,8 +599,8 @@ struct ProtectedProcessInfo {
     /// @brief Session ID
     uint32_t sessionId = 0;
     
-    /// @brief Blocked access attempts
-    std::atomic<uint64_t> blockedAttempts{0};
+    /// @brief Blocked access attempts (updated under m_mutex)
+    uint64_t blockedAttempts = 0;
     
     /// @brief Last blocked attempt time
     TimePoint lastBlockedAttempt;
@@ -621,8 +637,8 @@ struct ProtectedThreadInfo {
     /// @brief Thread state
     uint32_t threadState = 0;
     
-    /// @brief Blocked access attempts
-    std::atomic<uint64_t> blockedAttempts{0};
+    /// @brief Blocked access attempts (updated under m_mutex)
+    uint64_t blockedAttempts = 0;
 };
 
 /**
@@ -770,7 +786,47 @@ struct ProcessProtectionStatistics {
     
     /// @brief Last event time
     TimePoint lastEventTime;
-    
+
+    /// @brief Default constructor
+    ProcessProtectionStatistics() noexcept = default;
+
+    /// @brief Copy constructor (loads atomic values)
+    ProcessProtectionStatistics(const ProcessProtectionStatistics& other) noexcept
+        : totalProtectedProcesses(other.totalProtectedProcesses.load(std::memory_order_relaxed))
+        , totalProtectedThreads(other.totalProtectedThreads.load(std::memory_order_relaxed))
+        , totalAccessRequests(other.totalAccessRequests.load(std::memory_order_relaxed))
+        , totalAccessBlocked(other.totalAccessBlocked.load(std::memory_order_relaxed))
+        , totalAccessReduced(other.totalAccessReduced.load(std::memory_order_relaxed))
+        , processTerminationBlocked(other.processTerminationBlocked.load(std::memory_order_relaxed))
+        , threadTerminationBlocked(other.threadTerminationBlocked.load(std::memory_order_relaxed))
+        , memoryWriteBlocked(other.memoryWriteBlocked.load(std::memory_order_relaxed))
+        , threadCreationBlocked(other.threadCreationBlocked.load(std::memory_order_relaxed))
+        , apcInjectionBlocked(other.apcInjectionBlocked.load(std::memory_order_relaxed))
+        , handleDuplicationBlocked(other.handleDuplicationBlocked.load(std::memory_order_relaxed))
+        , startTime(other.startTime)
+        , lastEventTime(other.lastEventTime)
+    {}
+
+    /// @brief Copy assignment (loads/stores atomic values)
+    ProcessProtectionStatistics& operator=(const ProcessProtectionStatistics& other) noexcept {
+        if (this != &other) {
+            totalProtectedProcesses.store(other.totalProtectedProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalProtectedThreads.store(other.totalProtectedThreads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalAccessRequests.store(other.totalAccessRequests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalAccessBlocked.store(other.totalAccessBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalAccessReduced.store(other.totalAccessReduced.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            processTerminationBlocked.store(other.processTerminationBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            threadTerminationBlocked.store(other.threadTerminationBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            memoryWriteBlocked.store(other.memoryWriteBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            threadCreationBlocked.store(other.threadCreationBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            apcInjectionBlocked.store(other.apcInjectionBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            handleDuplicationBlocked.store(other.handleDuplicationBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+            lastEventTime = other.lastEventTime;
+        }
+        return *this;
+    }
+
     /**
      * @brief Reset statistics
      */
@@ -1189,11 +1245,24 @@ public:
 
 private:
     // ========================================================================
+    // FRIEND DECLARATIONS
+    // ========================================================================
+    
+    friend class ProcessProtectionGuard;
+    
+    // ========================================================================
     // PRIVATE CONSTRUCTOR
     // ========================================================================
     
     ProcessProtection();
     ~ProcessProtection();
+    
+    // ========================================================================
+    // PRIVATE METHODS
+    // ========================================================================
+    
+    /// @brief Get internal authorization token (for trusted RAII guards only)
+    [[nodiscard]] std::string GetInternalAuthToken() const;
     
     // ========================================================================
     // PIMPL
@@ -1258,9 +1327,30 @@ public:
     ProcessProtectionGuard(const ProcessProtectionGuard&) = delete;
     ProcessProtectionGuard& operator=(const ProcessProtectionGuard&) = delete;
     
+    ProcessProtectionGuard(ProcessProtectionGuard&& other) noexcept
+        : m_processId(other.m_processId)
+        , m_protected(other.m_protected)
+        , m_authToken(std::move(other.m_authToken))
+    {
+        other.m_protected = false;
+    }
+    
+    ProcessProtectionGuard& operator=(ProcessProtectionGuard&& other) noexcept {
+        if (this != &other) {
+            Release();
+            m_processId = other.m_processId;
+            m_protected = other.m_protected;
+            m_authToken = std::move(other.m_authToken);
+            other.m_protected = false;
+        }
+        return *this;
+    }
+    
     [[nodiscard]] bool IsProtected() const noexcept { return m_protected; }
 
 private:
+    void Release() noexcept;
+    
     uint32_t m_processId = 0;
     bool m_protected = false;
     std::string m_authToken;

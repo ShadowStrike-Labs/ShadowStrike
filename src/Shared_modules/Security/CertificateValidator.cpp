@@ -306,6 +306,19 @@ public:
     CertChainPtr(const CertChainPtr&) = delete;
     CertChainPtr& operator=(const CertChainPtr&) = delete;
 
+    CertChainPtr(CertChainPtr&& other) noexcept : m_chain(other.m_chain) {
+        other.m_chain = nullptr;
+    }
+
+    CertChainPtr& operator=(CertChainPtr&& other) noexcept {
+        if (this != &other) {
+            Release();
+            m_chain = other.m_chain;
+            other.m_chain = nullptr;
+        }
+        return *this;
+    }
+
     void Release() {
         if (m_chain) {
             CertFreeCertificateChain(m_chain);
@@ -319,6 +332,45 @@ public:
 
 private:
     PCCERT_CHAIN_CONTEXT m_chain = nullptr;
+};
+
+// RAII wrapper for Win32 HANDLE
+class WinHandle {
+public:
+    WinHandle() = default;
+    explicit WinHandle(HANDLE h) noexcept : m_handle(h) {}
+    ~WinHandle() { Release(); }
+
+    WinHandle(const WinHandle&) = delete;
+    WinHandle& operator=(const WinHandle&) = delete;
+
+    WinHandle(WinHandle&& other) noexcept : m_handle(other.m_handle) {
+        other.m_handle = INVALID_HANDLE_VALUE;
+    }
+
+    WinHandle& operator=(WinHandle&& other) noexcept {
+        if (this != &other) {
+            Release();
+            m_handle = other.m_handle;
+            other.m_handle = INVALID_HANDLE_VALUE;
+        }
+        return *this;
+    }
+
+    void Release() noexcept {
+        if (m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr) {
+            CloseHandle(m_handle);
+            m_handle = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
+    [[nodiscard]] bool IsValid() const noexcept {
+        return m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr;
+    }
+
+private:
+    HANDLE m_handle = INVALID_HANDLE_VALUE;
 };
 
 }  // anonymous namespace
@@ -654,19 +706,19 @@ public:
 
         // Open system certificate stores
         if (m_config.useSystemTrustStore) {
-            m_rootStore.reset(new CertStorePtr(
+            m_rootStore = std::make_unique<CertStorePtr>(
                 CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
                     CERT_STORE_READONLY_FLAG | CERT_SYSTEM_STORE_LOCAL_MACHINE,
-                    L"ROOT")));
+                    L"ROOT"));
 
             if (!m_rootStore || !m_rootStore->IsValid()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to open ROOT store");
             }
 
-            m_caStore.reset(new CertStorePtr(
+            m_caStore = std::make_unique<CertStorePtr>(
                 CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
                     CERT_STORE_READONLY_FLAG | CERT_SYSTEM_STORE_LOCAL_MACHINE,
-                    L"CA")));
+                    L"CA"));
 
             if (!m_caStore || !m_caStore->IsValid()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to open CA store");
@@ -1037,40 +1089,40 @@ public:
 
         ValidationDetails details;
 
-        // Read file
         try {
-            if (!std::filesystem::exists(filePath)) {
+            WinHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+            if (!hFile.IsValid()) {
+                DWORD err = GetLastError();
                 details.result = ValidationResult::Error;
-                details.errorMessage = "File does not exist";
+                details.errorMessage = (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+                    ? "File does not exist"
+                    : "Failed to open file";
+                details.errorCode = static_cast<int32_t>(err);
                 return details;
             }
 
-            auto fileSize = std::filesystem::file_size(filePath);
-            if (fileSize > CertificateConstants::MAX_CERTIFICATE_SIZE) {
+            LARGE_INTEGER fileSize{};
+            if (!GetFileSizeEx(hFile.Get(), &fileSize) || fileSize.QuadPart <= 0) {
                 details.result = ValidationResult::Error;
-                details.errorMessage = "File too large";
+                details.errorMessage = "Failed to get file size or file is empty";
                 return details;
             }
 
-            std::vector<uint8_t> data(static_cast<size_t>(fileSize));
-
-            HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (hFile == INVALID_HANDLE_VALUE) {
+            if (static_cast<uint64_t>(fileSize.QuadPart) > CertificateConstants::MAX_CERTIFICATE_SIZE) {
                 details.result = ValidationResult::Error;
-                details.errorMessage = "Failed to open file";
-                details.errorCode = static_cast<int32_t>(GetLastError());
+                details.errorMessage = "File too large for certificate data";
                 return details;
             }
 
+            std::vector<uint8_t> data(static_cast<size_t>(fileSize.QuadPart));
             DWORD bytesRead = 0;
-            BOOL success = ReadFile(hFile, data.data(), static_cast<DWORD>(fileSize),
-                                    &bytesRead, nullptr);
-            CloseHandle(hFile);
-
-            if (!success || bytesRead != fileSize) {
+            if (!ReadFile(hFile.Get(), data.data(), static_cast<DWORD>(fileSize.QuadPart),
+                          &bytesRead, nullptr) ||
+                bytesRead != static_cast<DWORD>(fileSize.QuadPart)) {
                 details.result = ValidationResult::Error;
                 details.errorMessage = "Failed to read file";
+                details.errorCode = static_cast<int32_t>(GetLastError());
                 return details;
             }
 
@@ -1089,20 +1141,36 @@ public:
         ValidationCallback callback,
         const ValidationOptions& options) {
 
-        // Copy data for async operation
-        std::vector<uint8_t> data(certData.begin(), certData.end());
+        if (!callback) {
+            SS_LOG_WARN(LOG_CATEGORY, L"VerifyCertificateAsync called with null callback");
+            return;
+        }
 
-        std::thread([this, data = std::move(data), callback, options]() {
-            auto details = VerifyCertificateWithOptions(
-                std::span<const uint8_t>(data.data(), data.size()), options);
-            if (callback) {
-                try {
-                    callback(details);
-                } catch (...) {
-                    SS_LOG_ERROR(LOG_CATEGORY, L"Validation callback threw exception");
-                }
+        // Copy data and callback for async operation
+        auto data = std::make_shared<std::vector<uint8_t>>(certData.begin(), certData.end());
+        auto cb = std::make_shared<ValidationCallback>(std::move(callback));
+        auto opts = options;
+
+        std::thread worker([this, data, cb, opts]() {
+            try {
+                auto details = VerifyCertificateWithOptions(
+                    std::span<const uint8_t>(data->data(), data->size()), opts);
+                (*cb)(details);
+            } catch (...) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Validation async task threw exception");
+                ValidationDetails errDetails;
+                errDetails.result = ValidationResult::Error;
+                errDetails.errorMessage = "Async validation threw unexpected exception";
+                try { (*cb)(errDetails); } catch (...) {}
             }
-        }).detach();
+        });
+
+        // Track the thread; detach only after moving it so the impl can be destroyed safely.
+        // In a production system this would use a thread pool. For now, detach is acceptable
+        // because we hold shared_ptr copies of all data the thread needs - no dangling references
+        // to stack objects. The only risk is calling methods on `this` after destruction,
+        // which the singleton lifetime guarantees against during normal operation.
+        worker.detach();
     }
 
     // ========================================================================
@@ -1110,11 +1178,67 @@ public:
     // ========================================================================
 
     [[nodiscard]] bool IsRevoked(const std::wstring& serialNumber) {
-        // This is a simplified check - in production would query OCSP/CRL
-        std::shared_lock lock(m_mutex);
+        std::string serialUtf8 = WideToUtf8(serialNumber);
+        if (serialUtf8.empty()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"IsRevoked called with empty serial number");
+            return false;
+        }
 
-        for (const auto& [fp, reason] : m_blockedCerts) {
-            // Would need certificate lookup by serial
+        // Normalize serial to lowercase hex for comparison
+        std::string normalizedSerial;
+        normalizedSerial.reserve(serialUtf8.size());
+        for (char c : serialUtf8) {
+            if (c != ':' && c != ' ') {
+                normalizedSerial.push_back(
+                    static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            }
+        }
+
+        // Check our validation cache for a previously-seen cert with this serial
+        {
+            std::shared_lock lock(m_mutex);
+            for (const auto& [fp, details] : m_validationCache) {
+                if (details.chain.empty()) continue;
+                std::string cachedSerial = details.chain[0].serialNumber;
+                // Normalize cached serial
+                std::string normalizedCached;
+                normalizedCached.reserve(cachedSerial.size());
+                for (char c : cachedSerial) {
+                    if (c != ':' && c != ' ') {
+                        normalizedCached.push_back(
+                            static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+                    }
+                }
+                if (normalizedCached == normalizedSerial) {
+                    if (details.result == ValidationResult::Revoked) return true;
+                    if (m_blockedCerts.find(fp) != m_blockedCerts.end()) return true;
+                }
+            }
+        }
+
+        // Check Windows "Disallowed" certificate store (Microsoft blocklist)
+        CertStorePtr disallowedStore(CertOpenStore(
+            CERT_STORE_PROV_SYSTEM_W, 0, 0,
+            CERT_STORE_READONLY_FLAG | CERT_SYSTEM_STORE_LOCAL_MACHINE,
+            L"Disallowed"));
+
+        if (disallowedStore.IsValid()) {
+            std::vector<uint8_t> serialBytes;
+            if (HexToBytes(normalizedSerial, serialBytes) && !serialBytes.empty()) {
+                // Windows stores serials in little-endian; our hex is big-endian
+                std::vector<uint8_t> serialLE(serialBytes.rbegin(), serialBytes.rend());
+
+                PCCERT_CONTEXT pCert = nullptr;
+                while ((pCert = CertEnumCertificatesInStore(
+                            disallowedStore.Get(), pCert)) != nullptr) {
+                    auto& certSerial = pCert->pCertInfo->SerialNumber;
+                    if (certSerial.cbData == static_cast<DWORD>(serialLE.size()) &&
+                        memcmp(certSerial.pbData, serialLE.data(), certSerial.cbData) == 0) {
+                        CertFreeCertificateContext(pCert);
+                        return true;
+                    }
+                }
+            }
         }
 
         return false;
@@ -1152,10 +1276,65 @@ public:
             return RevocationStatus::OCSPNotAvailable;
         }
 
-        // In production: send OCSP request to responder
-        // For now, return Good (would need HTTP client)
+        // Both cert and issuer need raw DER data for CryptoAPI
+        if (cert.rawData.empty() || issuer.rawData.empty()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"CheckOCSP: missing raw certificate data");
+            return RevocationStatus::Unknown;
+        }
 
-        RevocationStatus status = RevocationStatus::Good;
+        // Create cert contexts from raw data
+        CertContextPtr certCtx(CertCreateCertificateContext(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            cert.rawData.data(),
+            static_cast<DWORD>(cert.rawData.size())));
+
+        CertContextPtr issuerCtx(CertCreateCertificateContext(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            issuer.rawData.data(),
+            static_cast<DWORD>(issuer.rawData.size())));
+
+        if (!certCtx || !issuerCtx) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"CheckOCSP: failed to create cert context");
+            return RevocationStatus::CheckFailed;
+        }
+
+        // Use CertVerifyRevocation for the actual OCSP/revocation check
+        CERT_REVOCATION_PARA revPara{};
+        revPara.cbSize = sizeof(revPara);
+        revPara.pIssuerCert = issuerCtx.Get();
+
+        CERT_REVOCATION_STATUS revStatus{};
+        revStatus.cbSize = sizeof(revStatus);
+
+        // CertVerifyRevocation expects void** - must strip const from PCCERT_CONTEXT
+        void* contexts[] = { const_cast<CERT_CONTEXT*>(certCtx.Get()) };
+
+        BOOL result = CertVerifyRevocation(
+            X509_ASN_ENCODING,
+            CERT_CONTEXT_REVOCATION_TYPE,
+            1,
+            contexts,
+            CERT_VERIFY_REV_CHAIN_FLAG,
+            &revPara,
+            &revStatus);
+
+        RevocationStatus status;
+        if (result) {
+            status = RevocationStatus::Good;
+        } else {
+            DWORD err = revStatus.dwError;
+            if (err == CRYPT_E_REVOKED) {
+                status = RevocationStatus::Revoked;
+                SS_LOG_WARN(LOG_CATEGORY, L"Certificate revoked (OCSP): serial=%hs, subject=%hs",
+                            cert.serialNumber.c_str(), cert.subject.commonName.c_str());
+            } else if (err == CRYPT_E_NO_REVOCATION_CHECK ||
+                       err == CRYPT_E_REVOCATION_OFFLINE) {
+                status = RevocationStatus::OCSPNotAvailable;
+            } else {
+                status = RevocationStatus::Unknown;
+                SS_LOG_DEBUG(LOG_CATEGORY, L"OCSP check inconclusive: 0x%08X", err);
+            }
+        }
 
         // Cache result
         {
@@ -1204,10 +1383,72 @@ public:
             return RevocationStatus::CRLNotAvailable;
         }
 
-        // In production: download and parse CRL
-        // For now, return Good
+        if (cert.rawData.empty() || issuer.rawData.empty()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"CheckCRL: missing raw certificate data");
+            return RevocationStatus::Unknown;
+        }
 
-        return RevocationStatus::Good;
+        // Create cert contexts
+        CertContextPtr certCtx(CertCreateCertificateContext(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            cert.rawData.data(),
+            static_cast<DWORD>(cert.rawData.size())));
+
+        CertContextPtr issuerCtx(CertCreateCertificateContext(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            issuer.rawData.data(),
+            static_cast<DWORD>(issuer.rawData.size())));
+
+        if (!certCtx || !issuerCtx) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"CheckCRL: failed to create cert context");
+            return RevocationStatus::CheckFailed;
+        }
+
+        // Use CertVerifyRevocation for the CRL-based check
+        CERT_REVOCATION_PARA revPara{};
+        revPara.cbSize = sizeof(revPara);
+        revPara.pIssuerCert = issuerCtx.Get();
+
+        CERT_REVOCATION_STATUS revStatus{};
+        revStatus.cbSize = sizeof(revStatus);
+
+        void* contexts[] = { const_cast<CERT_CONTEXT*>(certCtx.Get()) };
+
+        BOOL result = CertVerifyRevocation(
+            X509_ASN_ENCODING,
+            CERT_CONTEXT_REVOCATION_TYPE,
+            1,
+            contexts,
+            CERT_VERIFY_REV_CHAIN_FLAG,
+            &revPara,
+            &revStatus);
+
+        RevocationStatus status;
+        if (result) {
+            status = RevocationStatus::Good;
+        } else {
+            DWORD err = revStatus.dwError;
+            if (err == CRYPT_E_REVOKED) {
+                status = RevocationStatus::Revoked;
+                SS_LOG_WARN(LOG_CATEGORY, L"Certificate revoked (CRL): serial=%hs, subject=%hs",
+                            cert.serialNumber.c_str(), cert.subject.commonName.c_str());
+
+                // Update CRL cache with this revocation
+                {
+                    std::unique_lock lock(m_mutex);
+                    m_crlCache[cacheKey].revokedSerials.insert(cert.serialNumber);
+                    m_crlCache[cacheKey].fetchTime = Clock::now();
+                }
+            } else if (err == CRYPT_E_NO_REVOCATION_CHECK ||
+                       err == CRYPT_E_REVOCATION_OFFLINE) {
+                status = RevocationStatus::CRLNotAvailable;
+            } else {
+                status = RevocationStatus::Unknown;
+                SS_LOG_DEBUG(LOG_CATEGORY, L"CRL check inconclusive: 0x%08X", err);
+            }
+        }
+
+        return status;
     }
 
     [[nodiscard]] std::optional<std::tuple<RevocationStatus, RevocationReason, SystemTimePoint>>
@@ -1360,15 +1601,15 @@ public:
         m_rootStore.reset();
         m_caStore.reset();
 
-        m_rootStore.reset(new CertStorePtr(
+        m_rootStore = std::make_unique<CertStorePtr>(
             CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
                 CERT_STORE_READONLY_FLAG | CERT_SYSTEM_STORE_LOCAL_MACHINE,
-                L"ROOT")));
+                L"ROOT"));
 
-        m_caStore.reset(new CertStorePtr(
+        m_caStore = std::make_unique<CertStorePtr>(
             CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
                 CERT_STORE_READONLY_FLAG | CERT_SYSTEM_STORE_LOCAL_MACHINE,
-                L"CA")));
+                L"CA"));
 
         SS_LOG_INFO(LOG_CATEGORY, L"System trust store reloaded");
         return m_rootStore && m_rootStore->IsValid();
@@ -1748,15 +1989,30 @@ private:
         // Issuer
         info.issuer = ParseDistinguishedName(&pCert->pCertInfo->Issuer);
 
-        // Self-signed check
-        info.isSelfSigned = (info.subject == info.issuer);
+        // Self-signed check: DN match AND cryptographic signature verification
+        info.isSelfSigned = false;
+        if (info.subject == info.issuer) {
+            // DN match is necessary but not sufficient; verify the cert is signed by its own key.
+            // CryptVerifyCertificateSignatureEx verifies the signature cryptographically.
+            BOOL selfSigValid = CryptVerifyCertificateSignatureEx(
+                0,
+                X509_ASN_ENCODING,
+                CRYPT_VERIFY_CERT_SIGN_SUBJECT_CERT,
+                const_cast<void*>(static_cast<const void*>(pCert)),
+                CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT,
+                const_cast<void*>(static_cast<const void*>(pCert)),
+                0,
+                nullptr);
+            info.isSelfSigned = (selfSigValid != FALSE);
+        }
 
         // Validity period
         info.validity.notBefore = FileTimeToSystemTime(pCert->pCertInfo->NotBefore);
         info.validity.notAfter = FileTimeToSystemTime(pCert->pCertInfo->NotAfter);
 
         // Signature algorithm
-        info.signatureAlgorithmOID = pCert->pCertInfo->SignatureAlgorithm.pszObjId;
+        info.signatureAlgorithmOID = pCert->pCertInfo->SignatureAlgorithm.pszObjId
+            ? pCert->pCertInfo->SignatureAlgorithm.pszObjId : "";
         info.signatureAlgorithm = ParseSignatureAlgorithm(info.signatureAlgorithmOID);
 
         // Public key
@@ -1784,7 +2040,7 @@ private:
         DWORD size = CertNameToStrA(X509_ASN_ENCODING, pName,
                                      CERT_X500_NAME_STR | CERT_NAME_STR_REVERSE_FLAG,
                                      nullptr, 0);
-        if (size > 0) {
+        if (size > 1) {
             std::vector<char> buffer(size);
             CertNameToStrA(X509_ASN_ENCODING, pName,
                            CERT_X500_NAME_STR | CERT_NAME_STR_REVERSE_FLAG,
@@ -1792,23 +2048,18 @@ private:
             dn.raw = buffer.data();
         }
 
-        // Parse individual RDNs
-        auto getRDN = [&](LPCSTR oid) -> std::string {
-            DWORD size = CertGetNameStringA(nullptr, CERT_NAME_ATTR_TYPE, 0,
-                                            const_cast<void*>(static_cast<const void*>(oid)),
-                                            nullptr, 0);
-            // Simplified - would need actual cert context
-            return "";
-        };
-
-        // Extract CN from raw string
+        // Extract individual RDN components from the X.500 formatted string
         auto extractField = [&](const std::string& prefix) -> std::string {
             auto pos = dn.raw.find(prefix);
             if (pos == std::string::npos) return "";
             pos += prefix.length();
             auto end = dn.raw.find(',', pos);
             if (end == std::string::npos) end = dn.raw.length();
-            return dn.raw.substr(pos, end - pos);
+            // Trim leading/trailing whitespace
+            std::string val = dn.raw.substr(pos, end - pos);
+            while (!val.empty() && val.front() == ' ') val.erase(val.begin());
+            while (!val.empty() && val.back() == ' ') val.pop_back();
+            return val;
         };
 
         dn.commonName = extractField("CN=");
@@ -1817,6 +2068,8 @@ private:
         dn.country = extractField("C=");
         dn.state = extractField("ST=");
         dn.locality = extractField("L=");
+        dn.email = extractField("E=");
+        dn.serialNumber = extractField("SERIALNUMBER=");
 
         return dn;
     }
@@ -1837,38 +2090,47 @@ private:
     [[nodiscard]] PublicKeyInfo ParsePublicKeyInfo(PCERT_PUBLIC_KEY_INFO pKeyInfo) {
         PublicKeyInfo keyInfo;
 
-        keyInfo.algorithmOID = pKeyInfo->Algorithm.pszObjId;
+        keyInfo.algorithmOID = pKeyInfo->Algorithm.pszObjId
+            ? pKeyInfo->Algorithm.pszObjId : "";
 
-        // Determine key type
+        // Determine key type from OID
         if (keyInfo.algorithmOID.find("1.2.840.113549.1.1") == 0) {
             keyInfo.type = KeyType::RSA;
         } else if (keyInfo.algorithmOID.find("1.2.840.10045") == 0) {
             keyInfo.type = KeyType::ECDSA;
         } else if (keyInfo.algorithmOID.find("1.2.840.10040.4.1") == 0) {
             keyInfo.type = KeyType::DSA;
+        } else if (keyInfo.algorithmOID.find("1.3.101.112") == 0) {
+            keyInfo.type = KeyType::EdDSA;  // Ed25519
+        } else if (keyInfo.algorithmOID.find("1.3.101.113") == 0) {
+            keyInfo.type = KeyType::EdDSA;  // Ed448
         }
 
-        // Get key size
-        DWORD keySize = 0;
-        if (CryptDecodeObject(X509_ASN_ENCODING, RSA_CSP_PUBLICKEYBLOB,
-                               pKeyInfo->PublicKey.pbData, pKeyInfo->PublicKey.cbData,
-                               0, nullptr, &keySize)) {
-            // RSA key - size in bits is cbData * 8 roughly
-            keyInfo.keySizeBits = pKeyInfo->PublicKey.cbData * 8;
+        // Use CertGetPublicKeyLength for accurate key size in bits
+        DWORD keyBitLen = CertGetPublicKeyLength(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            pKeyInfo);
+        if (keyBitLen > 0) {
+            keyInfo.keySizeBits = keyBitLen;
         } else {
-            // Estimate based on blob size
-            keyInfo.keySizeBits = (pKeyInfo->PublicKey.cbData - 1) * 8;
+            // Fallback estimate for key types not handled by CertGetPublicKeyLength
+            if (keyInfo.type == KeyType::ECDSA && pKeyInfo->PublicKey.cbData > 0) {
+                // Uncompressed EC point: 0x04 || x || y, key size = (cbData - 1) * 8 / 2
+                keyInfo.keySizeBits = ((pKeyInfo->PublicKey.cbData - 1) * 8) / 2;
+            }
         }
 
         // Copy public key data
-        keyInfo.publicKeyData.assign(pKeyInfo->PublicKey.pbData,
-                                      pKeyInfo->PublicKey.pbData + pKeyInfo->PublicKey.cbData);
+        if (pKeyInfo->PublicKey.pbData && pKeyInfo->PublicKey.cbData > 0) {
+            keyInfo.publicKeyData.assign(pKeyInfo->PublicKey.pbData,
+                                          pKeyInfo->PublicKey.pbData + pKeyInfo->PublicKey.cbData);
+        }
 
         return keyInfo;
     }
 
     void ParseExtension(const CERT_EXTENSION& ext, CertificateInfo& info) {
-        std::string oid = ext.pszObjId;
+        std::string oid = ext.pszObjId ? ext.pszObjId : "";
 
         if (oid == szOID_BASIC_CONSTRAINTS2) {
             DWORD size = 0;
@@ -1887,12 +2149,25 @@ private:
                 }
             }
         } else if (oid == szOID_KEY_USAGE) {
-            if (ext.Value.cbData >= 1) {
-                uint16_t usage = ext.Value.pbData[0];
-                if (ext.Value.cbData >= 2) {
-                    usage |= static_cast<uint16_t>(ext.Value.pbData[1]) << 8;
+            // Properly decode Key Usage using CryptDecodeObject
+            DWORD size = 0;
+            if (CryptDecodeObject(X509_ASN_ENCODING, X509_KEY_USAGE,
+                                   ext.Value.pbData, ext.Value.cbData,
+                                   0, nullptr, &size) && size > 0) {
+                std::vector<uint8_t> buffer(size);
+                if (CryptDecodeObject(X509_ASN_ENCODING, X509_KEY_USAGE,
+                                       ext.Value.pbData, ext.Value.cbData,
+                                       0, buffer.data(), &size)) {
+                    auto* blob = reinterpret_cast<CRYPT_BIT_BLOB*>(buffer.data());
+                    uint16_t usage = 0;
+                    if (blob->cbData >= 1) {
+                        usage = blob->pbData[0];
+                    }
+                    if (blob->cbData >= 2) {
+                        usage |= static_cast<uint16_t>(blob->pbData[1]) << 8;
+                    }
+                    info.keyUsage = static_cast<KeyUsage>(usage);
                 }
-                info.keyUsage = static_cast<KeyUsage>(usage);
             }
         } else if (oid == szOID_ENHANCED_KEY_USAGE) {
             DWORD size = 0;
@@ -1916,7 +2191,102 @@ private:
                             info.extKeyUsage = info.extKeyUsage | ExtendedKeyUsage::EmailProtection;
                         } else if (ekuOid == szOID_PKIX_KP_TIMESTAMP_SIGNING) {
                             info.extKeyUsage = info.extKeyUsage | ExtendedKeyUsage::Timestamping;
+                        } else if (ekuOid == szOID_PKIX_KP_OCSP_SIGNING) {
+                            info.extKeyUsage = info.extKeyUsage | ExtendedKeyUsage::OCSPSigning;
                         }
+                    }
+                }
+            }
+        } else if (oid == szOID_SUBJECT_ALT_NAME2) {
+            // Parse Subject Alternative Name
+            DWORD size = 0;
+            if (CryptDecodeObject(X509_ASN_ENCODING, X509_ALTERNATE_NAME,
+                                   ext.Value.pbData, ext.Value.cbData,
+                                   0, nullptr, &size) && size > 0) {
+                std::vector<uint8_t> buffer(size);
+                if (CryptDecodeObject(X509_ASN_ENCODING, X509_ALTERNATE_NAME,
+                                       ext.Value.pbData, ext.Value.cbData,
+                                       0, buffer.data(), &size)) {
+                    auto* altName = reinterpret_cast<CERT_ALT_NAME_INFO*>(buffer.data());
+                    for (DWORD i = 0; i < altName->cAltEntry; ++i) {
+                        auto& entry = altName->rgAltEntry[i];
+                        switch (entry.dwAltNameChoice) {
+                            case CERT_ALT_NAME_DNS_NAME:
+                                if (entry.pwszDNSName) {
+                                    info.subjectAltName.dnsNames.push_back(
+                                        WideToUtf8(entry.pwszDNSName));
+                                }
+                                break;
+                            case CERT_ALT_NAME_RFC822_NAME:
+                                if (entry.pwszRfc822Name) {
+                                    info.subjectAltName.emails.push_back(
+                                        WideToUtf8(entry.pwszRfc822Name));
+                                }
+                                break;
+                            case CERT_ALT_NAME_URL:
+                                if (entry.pwszURL) {
+                                    info.subjectAltName.uris.push_back(
+                                        WideToUtf8(entry.pwszURL));
+                                }
+                                break;
+                            case CERT_ALT_NAME_IP_ADDRESS:
+                                if (entry.IPAddress.cbData == 4) {
+                                    // IPv4
+                                    auto* ip = entry.IPAddress.pbData;
+                                    info.subjectAltName.ipAddresses.push_back(
+                                        std::to_string(ip[0]) + "." + std::to_string(ip[1]) + "." +
+                                        std::to_string(ip[2]) + "." + std::to_string(ip[3]));
+                                } else if (entry.IPAddress.cbData == 16) {
+                                    // IPv6 - store as hex
+                                    info.subjectAltName.ipAddresses.push_back(
+                                        BytesToHex(entry.IPAddress.pbData, entry.IPAddress.cbData));
+                                }
+                                break;
+                            case CERT_ALT_NAME_DIRECTORY_NAME:
+                            {
+                                DistinguishedName dirDn = ParseDistinguishedName(
+                                    &entry.DirectoryName);
+                                info.subjectAltName.directoryNames.push_back(dirDn.raw);
+                                break;
+                            }
+                            default:
+                                break;
+                        }
+                    }
+                }
+            }
+        } else if (oid == szOID_AUTHORITY_KEY_IDENTIFIER2) {
+            // Parse Authority Key Identifier
+            DWORD size = 0;
+            if (CryptDecodeObject(X509_ASN_ENCODING, X509_AUTHORITY_KEY_ID2,
+                                   ext.Value.pbData, ext.Value.cbData,
+                                   0, nullptr, &size) && size > 0) {
+                std::vector<uint8_t> buffer(size);
+                if (CryptDecodeObject(X509_ASN_ENCODING, X509_AUTHORITY_KEY_ID2,
+                                       ext.Value.pbData, ext.Value.cbData,
+                                       0, buffer.data(), &size)) {
+                    auto* aki = reinterpret_cast<CERT_AUTHORITY_KEY_ID2_INFO*>(buffer.data());
+                    if (aki->KeyId.cbData > 0 && aki->KeyId.pbData) {
+                        info.authorityKeyId.assign(
+                            aki->KeyId.pbData,
+                            aki->KeyId.pbData + aki->KeyId.cbData);
+                    }
+                }
+            }
+        } else if (oid == szOID_SUBJECT_KEY_IDENTIFIER) {
+            // Parse Subject Key Identifier
+            DWORD size = 0;
+            if (CryptDecodeObject(X509_ASN_ENCODING, szOID_SUBJECT_KEY_IDENTIFIER,
+                                   ext.Value.pbData, ext.Value.cbData,
+                                   0, nullptr, &size) && size > 0) {
+                std::vector<uint8_t> buffer(size);
+                if (CryptDecodeObject(X509_ASN_ENCODING, szOID_SUBJECT_KEY_IDENTIFIER,
+                                       ext.Value.pbData, ext.Value.cbData,
+                                       0, buffer.data(), &size)) {
+                    auto* blob = reinterpret_cast<CRYPT_DATA_BLOB*>(buffer.data());
+                    if (blob->cbData > 0 && blob->pbData) {
+                        info.subjectKeyId.assign(
+                            blob->pbData, blob->pbData + blob->cbData);
                     }
                 }
             }
@@ -1957,7 +2327,7 @@ private:
                     for (DWORD i = 0; i < aia->cAccDescr; ++i) {
                         auto& ad = aia->rgAccDescr[i];
                         if (ad.AccessLocation.dwAltNameChoice == CERT_ALT_NAME_URL) {
-                            std::string method = ad.pszAccessMethod;
+                            std::string method = ad.pszAccessMethod ? ad.pszAccessMethod : "";
                             std::string url = WideToUtf8(ad.AccessLocation.pwszURL);
 
                             if (method == szOID_PKIX_OCSP) {
@@ -1971,11 +2341,13 @@ private:
             }
         }
 
-        // Store extension
+        // Store extension metadata
         CertificateExtension certExt;
         certExt.oid = oid;
         certExt.critical = ext.fCritical != FALSE;
-        certExt.value.assign(ext.Value.pbData, ext.Value.pbData + ext.Value.cbData);
+        if (ext.Value.pbData && ext.Value.cbData > 0) {
+            certExt.value.assign(ext.Value.pbData, ext.Value.pbData + ext.Value.cbData);
+        }
         info.extensions.push_back(certExt);
     }
 
@@ -2098,19 +2470,28 @@ private:
 
     [[nodiscard]] bool VerifyHostname(const CertificateInfo& cert,
                                        const std::string& hostname) const {
-        // Check CN
-        if (MatchHostname(cert.subject.commonName, hostname)) {
-            return true;
-        }
-
-        // Check SANs
-        for (const auto& dns : cert.subjectAltName.dnsNames) {
-            if (MatchHostname(dns, hostname)) {
-                return true;
+        // RFC 6125: If SANs are present, CN MUST NOT be used.
+        // Only fall back to CN if no SANs exist at all.
+        if (!cert.subjectAltName.dnsNames.empty() ||
+            !cert.subjectAltName.ipAddresses.empty()) {
+            // Check DNS SANs
+            for (const auto& dns : cert.subjectAltName.dnsNames) {
+                if (MatchHostname(dns, hostname)) {
+                    return true;
+                }
             }
+            // Check IP SANs (for IP literal hostnames)
+            for (const auto& ip : cert.subjectAltName.ipAddresses) {
+                if (_stricmp(ip.c_str(), hostname.c_str()) == 0) {
+                    return true;
+                }
+            }
+            // SANs present but none matched
+            return false;
         }
 
-        return false;
+        // No SANs present - fall back to CN (legacy behavior)
+        return MatchHostname(cert.subject.commonName, hostname);
     }
 
     [[nodiscard]] bool MatchHostname(const std::string& pattern,
@@ -2145,23 +2526,34 @@ private:
             return RevocationStatus::Unknown;
         }
 
-        // Prefer OCSP if enabled
+        // Build chain to find the issuer cert for revocation checking
+        CertificateInfo issuerCert;
+        if (!cert.rawData.empty() && !cert.isSelfSigned) {
+            auto chain = BuildChainWithOptions(cert, ValidationOptions{});
+            if (chain && chain->size() >= 2) {
+                issuerCert = (*chain)[1];
+            }
+        }
+
+        // Prefer OCSP if enabled and issuer is available
         if (m_config.enableOCSP && m_config.preferOCSP && !cert.ocspUrls.empty()) {
-            CertificateInfo dummyIssuer;  // Would need real issuer
-            auto status = CheckOCSP(cert, dummyIssuer);
-            if (status != RevocationStatus::OCSPNotAvailable &&
-                status != RevocationStatus::Unknown) {
-                return status;
+            if (!issuerCert.rawData.empty()) {
+                auto status = CheckOCSP(cert, issuerCert);
+                if (status != RevocationStatus::OCSPNotAvailable &&
+                    status != RevocationStatus::Unknown) {
+                    return status;
+                }
             }
         }
 
         // Fall back to CRL
         if (m_config.enableCRL && !cert.crlDistributionPoints.empty()) {
-            CertificateInfo dummyIssuer;
-            auto status = CheckCRL(cert, dummyIssuer);
-            if (status != RevocationStatus::CRLNotAvailable &&
-                status != RevocationStatus::Unknown) {
-                return status;
+            if (!issuerCert.rawData.empty()) {
+                auto status = CheckCRL(cert, issuerCert);
+                if (status != RevocationStatus::CRLNotAvailable &&
+                    status != RevocationStatus::Unknown) {
+                    return status;
+                }
             }
         }
 
@@ -2177,14 +2569,18 @@ private:
             }
         }
 
-        // Check system root store
+        // Check system root store using SHA1 thumbprint
         if (m_rootStore && m_rootStore->IsValid()) {
+            CRYPT_HASH_BLOB hashBlob;
+            hashBlob.pbData = const_cast<BYTE*>(cert.sha1Thumbprint.data());
+            hashBlob.cbData = static_cast<DWORD>(cert.sha1Thumbprint.size());
+
             CertContextPtr found(CertFindCertificateInStore(
                 m_rootStore->Get(),
                 X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
                 0,
                 CERT_FIND_SHA1_HASH,
-                &cert.sha1Thumbprint,
+                &hashBlob,
                 nullptr));
 
             if (found) {
@@ -2572,12 +2968,15 @@ void CertificateValidator::ResetStatistics() {
 }
 
 [[nodiscard]] std::string CertificateValidator::GetVersionString() noexcept {
-    std::ostringstream oss;
-    oss << "ShadowStrike CertificateValidator v"
-        << CertificateConstants::VERSION_MAJOR << "."
-        << CertificateConstants::VERSION_MINOR << "."
-        << CertificateConstants::VERSION_PATCH;
-    return oss.str();
+    // Use a fixed-size buffer to avoid potential exceptions from ostringstream in noexcept
+    try {
+        return "ShadowStrike CertificateValidator v"
+            + std::to_string(CertificateConstants::VERSION_MAJOR) + "."
+            + std::to_string(CertificateConstants::VERSION_MINOR) + "."
+            + std::to_string(CertificateConstants::VERSION_PATCH);
+    } catch (...) {
+        return "ShadowStrike CertificateValidator v?.?.?";
+    }
 }
 
 // ============================================================================

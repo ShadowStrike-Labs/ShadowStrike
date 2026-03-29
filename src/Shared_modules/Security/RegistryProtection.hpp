@@ -235,7 +235,7 @@ namespace RegistryProtectionConstants {
     // DEFAULT PROTECTED KEYS
     // ========================================================================
     
-    inline constexpr std::array<std::wstring_view, 10> DEFAULT_PROTECTED_KEYS = {
+    inline constexpr std::array<std::wstring_view, 13> DEFAULT_PROTECTED_KEYS = {
         L"HKLM\\SOFTWARE\\ShadowStrike",
         L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikeService",
         L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikeDriver",
@@ -245,7 +245,10 @@ namespace RegistryProtectionConstants {
         L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Minimal\\ShadowStrikeService",
         L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Network\\ShadowStrikeService",
         L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-        L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System"
+        L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\ShadowStrikeService.exe",
+        L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\ShadowStrikeUI.exe",
+        L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\ShadowStrikeUpdater.exe"
     };
 
 }  // namespace RegistryProtectionConstants
@@ -525,8 +528,8 @@ struct ProtectedKey {
     /// @brief Last verified timestamp
     TimePoint lastVerified;
     
-    /// @brief Blocked operation count
-    std::atomic<uint64_t> blockedOperations_{0};
+    /// @brief Blocked operation count (mutex-protected, no atomic needed)
+    uint64_t blockedOperationCount{0};
     
     /// @brief Has snapshot
     bool hasSnapshot = false;
@@ -780,6 +783,13 @@ struct RegistryProtectionStatistics {
     
     /// @brief Last event time
     TimePoint lastEventTime;
+
+    RegistryProtectionStatistics() = default;
+    ~RegistryProtectionStatistics() = default;
+
+    /// Explicit copy to load atomics safely
+    RegistryProtectionStatistics(const RegistryProtectionStatistics& other) noexcept;
+    RegistryProtectionStatistics& operator=(const RegistryProtectionStatistics& other) noexcept;
     
     /**
      * @brief Reset statistics
@@ -963,6 +973,24 @@ public:
      * @brief Protect startup entries
      */
     [[nodiscard]] bool ProtectStartupEntries();
+
+    /**
+     * @brief Protect IFEO (Image File Execution Options) debugger keys
+     *        for ShadowStrike executables to prevent debugger-based evasion
+     */
+    [[nodiscard]] bool ProtectIFEOKeys();
+
+    /**
+     * @brief Harden DACL on a protected registry key to deny
+     *        unauthorized write access
+     */
+    [[nodiscard]] bool HardenKeyDACL(std::wstring_view keyPath);
+
+    /**
+     * @brief Generate a cryptographically valid authorization token
+     *        for privileged operations. Only call from trusted code paths.
+     */
+    [[nodiscard]] std::string GenerateAuthorizationToken() const;
     
     // ========================================================================
     // VALUE PROTECTION

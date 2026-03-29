@@ -501,13 +501,7 @@
     <ClCompile Include="src\Shared_modules\Performance\DiskMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Shared_modules\Performance\MemoryProfiler.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="src\Shared_modules\Performance\NetworkPerformanceMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Shared_modules\Performance\PerformanceProfiler.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\Products\PhantomHome\Privacy\CookieManager.cpp">
@@ -643,9 +637,6 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\Shared_modules\Service\AntivirusService.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Shared_modules\Service\PerformanceProfiler.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\Shared_modules\Service\ServiceCommunicator.cpp">
@@ -1635,6 +1626,81 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\Shared_modules\PEParser\SafeReader.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RansomwareProtection\BackupProtector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RansomwareProtection\FileBackupManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RansomwareProtection\HoneypotManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RansomwareProtection\LockyDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RansomwareProtection\RansomwareDecryptor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RansomwareProtection\RansomwareDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RansomwareProtection\ShadowCopyProtector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RansomwareProtection\VolumeSnapshotService.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RansomwareProtection\WannaCryDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Scripts\AMSIIntegration.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Scripts\JavaScriptScanner.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Scripts\MacroDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Scripts\PowerShellScanner.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Scripts\PythonScriptScanner.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Scripts\VBScriptScanner.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Security\AntiDebug.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Security\CertificateValidator.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Security\CryptoManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Security\DigitalSignatureValidator.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Security\FileProtection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Security\MemoryProtection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Security\ProcessProtection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Security\RegistryProtection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Security\SelfDefense.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Security\TamperProtection.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

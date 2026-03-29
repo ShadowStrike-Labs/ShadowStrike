@@ -879,6 +879,13 @@ public:
             return AmsiResult::Unknown;
         }
 
+        // Validate input size before UTF-8 conversion to prevent unbounded allocation
+        if (content.size() > AMSIConstants::MAX_SCAN_CONTENT_SIZE / sizeof(wchar_t)) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"Wide string too large for scan: %zu wchars", content.size());
+            return AmsiResult::Unknown;
+        }
+
         // Convert wide string to UTF-8 bytes
         std::string utf8Content = Utils::StringUtils::ToNarrow(content);
 
@@ -1143,9 +1150,9 @@ public:
             auto pFunc = GetProcAddress(hAmsi, funcName);
             if (pFunc == nullptr) continue;
 
-            // FIX 2: Hold single shared_lock scope through compare-and-repair
-            // to close the TOCTOU window between reading expected bytes and restoring.
-            std::shared_lock readLock(m_mutex);
+            // FIX 2: Hold unique_lock through compare-and-repair to close the
+            // TOCTOU window AND serialize concurrent repairs on the same prologue.
+            std::unique_lock repairLock(m_mutex);
             auto it = m_expectedPrologues.find(funcName);
             if (it == m_expectedPrologues.end()) continue;
 
@@ -1170,7 +1177,7 @@ public:
             VirtualProtect(target, expectedBytes.size(), oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), target, expectedBytes.size());
 
-            readLock.unlock();
+            repairLock.unlock();
 
             anyRepaired = true;
             SS_LOG_INFO(LOG_CATEGORY, L"Restored %hs prologue", funcName);

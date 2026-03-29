@@ -95,12 +95,10 @@ typedef NTSTATUS(NTAPI* RtlSetProcessIsCritical_t)(
     BOOLEAN bNeedScmPermission
 );
 
-// Process information classes
-constexpr PROCESSINFOCLASS ProcessBreakOnTermination = static_cast<PROCESSINFOCLASS>(29);
-constexpr PROCESSINFOCLASS ProcessProtectionInformation = static_cast<PROCESSINFOCLASS>(61);
-
-// Thread information class
-constexpr THREADINFOCLASS ThreadHideFromDebugger = static_cast<THREADINFOCLASS>(17);
+// Process/thread information class values not in the public SDK headers
+constexpr auto SS_ProcessBreakOnTermination = static_cast<PROCESSINFOCLASS>(29);
+constexpr auto SS_ProcessProtectionInformation = static_cast<PROCESSINFOCLASS>(61);
+constexpr auto SS_ThreadHideFromDebugger = static_cast<THREADINFOCLASS>(17);
 
 // PS_PROTECTION structure
 #pragma pack(push, 1)
@@ -221,7 +219,7 @@ namespace {
     if (a.size() != b.size()) return false;
 
     for (size_t i = 0; i < a.size(); ++i) {
-        if (std::towlower(a[i]) != std::towlower(b[i])) {
+        if (::towlower(static_cast<wint_t>(a[i])) != ::towlower(static_cast<wint_t>(b[i]))) {
             return false;
         }
     }
@@ -229,12 +227,15 @@ namespace {
 }
 
 /**
- * @brief Verify authorization token
+ * @brief Constant-time string comparison to prevent timing attacks
  */
-[[nodiscard]] bool VerifyAuthToken(std::string_view token) {
-    // In production, this would verify against a secure token store
-    // For now, accept internal tokens
-    return token.find("SS_INTERNAL_") == 0 || token.find("SS_AUTH_") == 0;
+[[nodiscard]] bool ConstantTimeCompare(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    volatile uint8_t result = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        result |= static_cast<uint8_t>(a[i]) ^ static_cast<uint8_t>(b[i]);
+    }
+    return result == 0;
 }
 
 /**
@@ -490,6 +491,9 @@ public:
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] bool VerifyProcessIntegrity(uint32_t processId);
 
+    /// @brief Get the internal auth token for trusted callers
+    [[nodiscard]] const std::string& GetInternalAuthToken() const noexcept { return m_internalAuthToken; }
+
 private:
     // ========================================================================
     // INTERNAL HELPERS
@@ -510,6 +514,8 @@ private:
     [[nodiscard]] std::vector<uint32_t> EnumerateThreadIds(uint32_t processId) const;
     [[nodiscard]] bool IsOwnProcess(uint32_t processId) const;
     [[nodiscard]] bool IsShadowStrikeComponent(uint32_t processId) const;
+    [[nodiscard]] bool VerifyAuthToken(std::string_view token) const;
+    void CloseProtectedHandles();
 
     // ========================================================================
     // MEMBER VARIABLES
@@ -668,7 +674,7 @@ bool ProcessProtectionImpl::Initialize(const ProcessProtectionConfiguration& con
 }
 
 void ProcessProtectionImpl::Shutdown(std::string_view authorizationToken) {
-    if (!VerifyAuthToken(authorizationToken) && authorizationToken != m_internalAuthToken) {
+    if (!VerifyAuthToken(authorizationToken)) {
         Utils::Logger::Warn("[ProcessProtection] Shutdown rejected - invalid authorization");
         return;
     }
@@ -686,9 +692,9 @@ void ProcessProtectionImpl::Shutdown(std::string_view authorizationToken) {
     StopMonitoringThread();
     lock.lock();
 
-    // Clear protected processes and threads
-    m_protectedProcesses.clear();
-    m_protectedThreads.clear();
+    // Close all process handles before clearing
+    CloseProtectedHandles();
+
     m_whitelistedCallers.clear();
 
     m_initialized.store(false, std::memory_order_release);
@@ -792,7 +798,7 @@ ProtectionLevel ProcessProtectionImpl::GetProtectionLevel(uint32_t processId) {
     PS_PROTECTION protection = {};
     NTSTATUS status = m_pNtQueryInformationProcess(
         hProcess,
-        ProcessProtectionInformation,
+        SS_ProcessProtectionInformation,
         &protection,
         sizeof(protection),
         nullptr
@@ -884,23 +890,28 @@ bool ProcessProtectionImpl::ProtectProcess(uint32_t processId) {
     // Store protected process info
     m_protectedProcesses[processId] = info;
 
+    // Snapshot config flags before unlocking
+    const bool handleFilteringEnabled = m_config.enableHandleFiltering;
+    const bool setCritical = m_config.setCriticalProcess;
+    const bool threadProtEnabled = m_config.enableThreadProtection;
+
     // Unlock before calling other methods
     lock.unlock();
 
     // Apply restrictive security descriptor
-    if (m_config.enableHandleFiltering) {
+    if (handleFilteringEnabled) {
         if (!ApplyRestrictiveSecurityDescriptor(processId)) {
             Utils::Logger::Warn("[ProcessProtection] Failed to apply security descriptor to process {}", processId);
         }
     }
 
     // Set critical process if configured
-    if (m_config.setCriticalProcess) {
-        SetCriticalProcess(processId, true);
+    if (setCritical) {
+        (void)SetCriticalProcess(processId, true);
     }
 
     // Protect all threads
-    if (m_config.enableThreadProtection) {
+    if (threadProtEnabled) {
         size_t threadCount = ProtectAllThreads(processId);
 
         lock.lock();
@@ -910,7 +921,11 @@ bool ProcessProtectionImpl::ProtectProcess(uint32_t processId) {
         lock.unlock();
     }
 
-    m_stats.totalProtectedProcesses.store(m_protectedProcesses.size(), std::memory_order_relaxed);
+    // Update stats under lock to safely read map size
+    {
+        std::shared_lock slock(m_mutex);
+        m_stats.totalProtectedProcesses.store(m_protectedProcesses.size(), std::memory_order_relaxed);
+    }
 
     Utils::Logger::Info("[ProcessProtection] Protected process {} ({}) - status: {}",
                        processId, WideToNarrow(info.processName),
@@ -924,7 +939,7 @@ bool ProcessProtectionImpl::ProtectProcess(uint32_t processId) {
 
 bool ProcessProtectionImpl::UnprotectProcess(uint32_t processId, std::string_view authorizationToken) {
     if (!VerifyAuthToken(authorizationToken)) {
-        Utils::Logger::Warn("[ProcessProtection] Unprotect rejected - invalid authorization");
+        Utils::Logger::Warn("[ProcessProtection] Unprotect rejected for PID {} - invalid authorization", processId);
         return false;
     }
 
@@ -973,7 +988,9 @@ std::optional<ProtectedProcessInfo> ProcessProtectionImpl::GetProtectedProcessIn
 
     auto it = m_protectedProcesses.find(processId);
     if (it != m_protectedProcesses.end()) {
-        return it->second;
+        ProtectedProcessInfo copy = it->second;
+        copy.processHandle = nullptr;  // Never expose raw handles to callers
+        return copy;
     }
 
     return std::nullopt;
@@ -986,7 +1003,9 @@ std::vector<ProtectedProcessInfo> ProcessProtectionImpl::GetAllProtectedProcesse
     result.reserve(m_protectedProcesses.size());
 
     for (const auto& [pid, info] : m_protectedProcesses) {
-        result.push_back(info);
+        ProtectedProcessInfo copy = info;
+        copy.processHandle = nullptr;  // Never expose raw handles to callers
+        result.push_back(std::move(copy));
     }
 
     return result;
@@ -1012,7 +1031,7 @@ bool ProcessProtectionImpl::SetCriticalProcess(uint32_t processId, bool critical
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
-    if (!::LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &tp.Privileges[0].Luid)) {
+    if (!::LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &tp.Privileges[0].Luid)) {
         ::CloseHandle(hToken);
         return false;
     }
@@ -1116,7 +1135,7 @@ bool ProcessProtectionImpl::ProtectThread(uint32_t threadId) {
 
     // Hide from debugger if configured
     if (m_config.enableAntiInjection) {
-        HideThreadFromDebugger(threadId);
+        (void)HideThreadFromDebugger(threadId);
     }
 
     return true;
@@ -1138,6 +1157,7 @@ size_t ProcessProtectionImpl::ProtectAllThreads(uint32_t processId) {
 
 bool ProcessProtectionImpl::UnprotectThread(uint32_t threadId, std::string_view authorizationToken) {
     if (!VerifyAuthToken(authorizationToken)) {
+        Utils::Logger::Warn("[ProcessProtection] Unprotect thread rejected for TID {} - invalid authorization", threadId);
         return false;
     }
 
@@ -1170,7 +1190,9 @@ std::optional<ProtectedThreadInfo> ProcessProtectionImpl::GetProtectedThreadInfo
 
     auto it = m_protectedThreads.find(threadId);
     if (it != m_protectedThreads.end()) {
-        return it->second;
+        ProtectedThreadInfo copy = it->second;
+        copy.threadHandle = nullptr;  // Never expose raw handles to callers
+        return copy;
     }
 
     return std::nullopt;
@@ -1182,7 +1204,9 @@ std::vector<ProtectedThreadInfo> ProcessProtectionImpl::GetProtectedThreads(uint
     std::vector<ProtectedThreadInfo> result;
     for (const auto& [tid, info] : m_protectedThreads) {
         if (info.processId == processId) {
-            result.push_back(info);
+            ProtectedThreadInfo copy = info;
+            copy.threadHandle = nullptr;  // Never expose raw handles to callers
+            result.push_back(std::move(copy));
         }
     }
 
@@ -1208,7 +1232,7 @@ bool ProcessProtectionImpl::HideThreadFromDebugger(uint32_t threadId) {
 
     NTSTATUS status = m_pNtSetInformationThread(
         hThread,
-        ThreadHideFromDebugger,
+        SS_ThreadHideFromDebugger,
         nullptr,
         0
     );
@@ -1253,6 +1277,14 @@ AccessDecisionResult ProcessProtectionImpl::FilterAccessRequest(const AccessRequ
     result.decision = AccessDecision::Allow;
     result.grantedAccess = request.desiredAccess;
 
+    m_stats.totalAccessRequests.fetch_add(1, std::memory_order_relaxed);
+
+    // Self-access is always allowed (a process accessing itself)
+    if (request.callerProcessId == request.targetProcessId) {
+        result.reason = "Self-access permitted";
+        return result;
+    }
+
     // Check if target is protected
     bool isTargetProtected = IsProcessProtected(request.targetProcessId);
     if (!isTargetProtected) {
@@ -1265,16 +1297,26 @@ AccessDecisionResult ProcessProtectionImpl::FilterAccessRequest(const AccessRequ
         return result;
     }
 
-    // Check if caller is a ShadowStrike component
+    // Check if caller is a verified ShadowStrike component (path + name)
     if (IsShadowStrikeComponent(request.callerProcessId)) {
-        result.reason = "Caller is ShadowStrike component";
+        result.reason = "Caller is verified ShadowStrike component";
         return result;
     }
 
-    // Check if caller is SYSTEM
+    // SYSTEM processes are generally trusted, but only for non-destructive access.
+    // Even SYSTEM should not terminate/inject into EDR without going through
+    // the kernel driver path.
     if (IsSystemProcess(request.callerProcessId)) {
-        result.reason = "Caller is SYSTEM";
-        return result;
+        uint32_t destructiveAccess = request.desiredAccess &
+            (PROCESS_TERMINATE | PROCESS_SUSPEND_RESUME | PROCESS_CREATE_THREAD |
+             PROCESS_VM_WRITE | PROCESS_VM_OPERATION);
+        if (destructiveAccess == 0) {
+            result.reason = "Caller is SYSTEM (non-destructive access)";
+            return result;
+        }
+        // SYSTEM requesting destructive access is suspicious - log but allow reduced
+        Utils::Logger::Warn("[ProcessProtection] SYSTEM process {} requesting destructive access 0x{:08X} on protected PID {}",
+                           request.callerProcessId, request.desiredAccess, request.targetProcessId);
     }
 
     // Check if caller has higher or equal protection level
@@ -1298,9 +1340,15 @@ AccessDecisionResult ProcessProtectionImpl::FilterAccessRequest(const AccessRequ
     ThreatAction threatAction = ClassifyAccessRequest(request);
 
     // Check for dangerous access
-    uint32_t dangerousAccess = request.desiredAccess &
-        (request.type == AccessRequestType::ThreadOpen ?
-         m_config.blockedThreadAccess : m_config.blockedProcessAccess);
+    uint32_t blockedMask;
+    {
+        std::shared_lock lock(m_mutex);
+        blockedMask = (request.type == AccessRequestType::ThreadOpen ||
+                       request.type == AccessRequestType::ThreadDuplicate)
+            ? m_config.blockedThreadAccess : m_config.blockedProcessAccess;
+    }
+
+    uint32_t dangerousAccess = request.desiredAccess & blockedMask;
 
     if (dangerousAccess != 0) {
         // Strip dangerous access rights
@@ -1313,10 +1361,11 @@ AccessDecisionResult ProcessProtectionImpl::FilterAccessRequest(const AccessRequ
         } else {
             result.decision = AccessDecision::AllowReduced;
             result.reason = "Dangerous access stripped";
+            m_stats.totalAccessReduced.fetch_add(1, std::memory_order_relaxed);
         }
 
         result.shouldLog = true;
-        result.shouldAlert = (dangerousAccess & PROCESS_TERMINATE) != 0;
+        result.shouldAlert = (dangerousAccess & (PROCESS_TERMINATE | PROCESS_CREATE_THREAD)) != 0;
 
         // Update statistics
         m_stats.totalAccessBlocked.fetch_add(1, std::memory_order_relaxed);
@@ -1324,11 +1373,24 @@ AccessDecisionResult ProcessProtectionImpl::FilterAccessRequest(const AccessRequ
         if (dangerousAccess & PROCESS_TERMINATE) {
             m_stats.processTerminationBlocked.fetch_add(1, std::memory_order_relaxed);
         }
+        if (dangerousAccess & PROCESS_SUSPEND_RESUME) {
+            // Track suspension attempts too
+        }
         if (dangerousAccess & PROCESS_VM_WRITE) {
             m_stats.memoryWriteBlocked.fetch_add(1, std::memory_order_relaxed);
         }
         if (dangerousAccess & PROCESS_CREATE_THREAD) {
             m_stats.threadCreationBlocked.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (dangerousAccess & PROCESS_DUP_HANDLE) {
+            m_stats.handleDuplicationBlocked.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (dangerousAccess & THREAD_TERMINATE) {
+            m_stats.threadTerminationBlocked.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        if (request.type == AccessRequestType::APCQueue) {
+            m_stats.apcInjectionBlocked.fetch_add(1, std::memory_order_relaxed);
         }
 
         // Create blocked access event
@@ -1344,11 +1406,10 @@ AccessDecisionResult ProcessProtectionImpl::FilterAccessRequest(const AccessRequ
         NotifyBlockedAccess(event);
         NotifyThreat(threatAction, request);
 
-        Utils::Logger::Warn("[ProcessProtection] Blocked access: caller={}, target={}, access=0x{:08X}",
-                           request.callerProcessId, request.targetProcessId, dangerousAccess);
+        Utils::Logger::Warn("[ProcessProtection] Blocked access: caller={}, target={}, stripped=0x{:08X}, threat={}",
+                           request.callerProcessId, request.targetProcessId, dangerousAccess,
+                           std::string(GetThreatActionName(threatAction)));
     }
-
-    m_stats.totalAccessRequests.fetch_add(1, std::memory_order_relaxed);
 
     // Query custom callbacks for override
     std::vector<AccessDecisionCallback> callbacks;
@@ -1365,8 +1426,10 @@ AccessDecisionResult ProcessProtectionImpl::FilterAccessRequest(const AccessRequ
             if (override.has_value()) {
                 return *override;
             }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("[ProcessProtection] Access callback threw: {}", e.what());
         } catch (...) {
-            // Ignore callback errors
+            Utils::Logger::Error("[ProcessProtection] Access callback threw unknown exception");
         }
     }
 
@@ -1405,16 +1468,19 @@ bool ProcessProtectionImpl::ApplyRestrictiveSecurityDescriptor(uint32_t processI
     // Create a restrictive DACL
     // Allow: SYSTEM (full), Administrators (limited), Owner (query only)
     // Deny: Everyone else
+    // Best practice: Deny ACEs before Allow ACEs in DACL ordering
 
     PSECURITY_DESCRIPTOR pSD = nullptr;
     PACL pDacl = nullptr;
 
-    // SDDL string for restrictive access
+    // SDDL string for restrictive access (deny-first ordering)
     // D: DACL
-    // (A;;GA;;;SY) - Allow Generic All for SYSTEM
-    // (A;;GRGX;;;BA) - Allow Read/Execute for Administrators
-    // (D;;WPDTSD;;;WD) - Deny Write, Process/Thread dangerous ops for Everyone
-    LPCWSTR sddl = L"D:(A;;GA;;;SY)(A;;GRGX;;;BA)(D;;0x0001F1FF;;;WD)";
+    // (D;;0x0016FBFF;;;WD) - Deny dangerous rights for Everyone (TERMINATE|SUSPEND|VM_WRITE|VM_OP|CREATE_THREAD|SET_INFO|DUP_HANDLE)
+    // (A;;GA;;;SY)         - Allow Generic All for SYSTEM (overrides deny for SY by order in access check)
+    // (A;;GRGX;;;BA)       - Allow Read/Execute for Administrators
+    // Note: Explicit allow ACEs for SY/BA come after deny-for-all, but access check grants SY first.
+    // Protected DACL flag (P) prevents inheritance from overriding.
+    LPCWSTR sddl = L"D:P(D;;0x0016FBFF;;;WD)(A;;GA;;;SY)(A;;GRGX;;;BA)";
 
     if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl, SDDL_REVISION_1, &pSD, nullptr)) {
@@ -1717,6 +1783,7 @@ ProcessProtectionStatistics ProcessProtectionImpl::GetStatistics() const {
 
 void ProcessProtectionImpl::ResetStatistics(std::string_view authorizationToken) {
     if (!VerifyAuthToken(authorizationToken)) {
+        Utils::Logger::Warn("[ProcessProtection] Reset statistics rejected - invalid authorization");
         return;
     }
 
@@ -1740,6 +1807,7 @@ std::vector<BlockedAccessEvent> ProcessProtectionImpl::GetBlockedAccessHistory(s
 
 void ProcessProtectionImpl::ClearBlockedAccessHistory(std::string_view authorizationToken) {
     if (!VerifyAuthToken(authorizationToken)) {
+        Utils::Logger::Warn("[ProcessProtection] Clear history rejected - invalid authorization");
         return;
     }
 
@@ -1820,28 +1888,60 @@ bool ProcessProtectionImpl::SelfTest() {
 }
 
 bool ProcessProtectionImpl::VerifyProcessIntegrity(uint32_t processId) {
-    std::shared_lock lock(m_mutex);
-
-    auto it = m_protectedProcesses.find(processId);
-    if (it == m_protectedProcesses.end()) {
-        return false;
-    }
+    // NOTE: This method must NOT acquire m_mutex since it may be called
+    // from MonitoringThreadFunc which already holds a lock on m_mutex.
+    // Callers must ensure proper synchronization.
 
     // Verify process is still running
 #ifdef _WIN32
-    if (it->second.processHandle) {
+    HANDLE hProcess = nullptr;
+    {
+        std::shared_lock lock(m_mutex);
+        auto it = m_protectedProcesses.find(processId);
+        if (it == m_protectedProcesses.end()) {
+            return false;
+        }
+        hProcess = it->second.processHandle;
+    }
+
+    if (hProcess) {
         DWORD exitCode = 0;
-        if (::GetExitCodeProcess(it->second.processHandle, &exitCode)) {
+        if (::GetExitCodeProcess(hProcess, &exitCode)) {
             if (exitCode != STILL_ACTIVE) {
-                Utils::Logger::Warn("[ProcessProtection] Process {} has terminated", processId);
+                Utils::Logger::Warn("[ProcessProtection] Process {} has terminated (exit code: {})",
+                                   processId, exitCode);
                 return false;
             }
+        }
+    } else {
+        // No handle stored - check by trying to open the process
+        HANDLE hCheck = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+        if (!hCheck) {
+            Utils::Logger::Warn("[ProcessProtection] Process {} no longer accessible (error: 0x{:08X})",
+                               processId, ::GetLastError());
+            return false;
+        }
+        DWORD exitCode = 0;
+        bool alive = true;
+        if (::GetExitCodeProcess(hCheck, &exitCode) && exitCode != STILL_ACTIVE) {
+            alive = false;
+        }
+        ::CloseHandle(hCheck);
+        if (!alive) {
+            Utils::Logger::Warn("[ProcessProtection] Process {} has terminated", processId);
+            return false;
         }
     }
 #endif
 
     // Update last verified time
-    const_cast<ProtectedProcessInfo&>(it->second).lastVerified = Clock::now();
+    {
+        std::unique_lock lock(m_mutex);
+        auto it = m_protectedProcesses.find(processId);
+        if (it != m_protectedProcesses.end()) {
+            it->second.lastVerified = Clock::now();
+        }
+    }
 
     return true;
 }
@@ -1898,15 +1998,21 @@ void ProcessProtectionImpl::MonitoringThreadFunc() {
             break;
         }
 
-        // Verify all protected processes are still alive
-        std::vector<uint32_t> deadProcesses;
-
+        // Snapshot protected PIDs to avoid holding lock during verification
+        std::vector<uint32_t> protectedPids;
         {
             std::shared_lock lock(m_mutex);
+            protectedPids.reserve(m_protectedProcesses.size());
             for (const auto& [pid, info] : m_protectedProcesses) {
-                if (!VerifyProcessIntegrity(pid)) {
-                    deadProcesses.push_back(pid);
-                }
+                protectedPids.push_back(pid);
+            }
+        }
+
+        // Verify all protected processes are still alive (no lock held)
+        std::vector<uint32_t> deadProcesses;
+        for (uint32_t pid : protectedPids) {
+            if (!VerifyProcessIntegrity(pid)) {
+                deadProcesses.push_back(pid);
             }
         }
 
@@ -1917,12 +2023,25 @@ void ProcessProtectionImpl::MonitoringThreadFunc() {
         }
 
         // Check for new threads in protected processes
-        if (m_config.enableThreadProtection) {
+        bool threadProtEnabled;
+        {
             std::shared_lock lock(m_mutex);
-            for (const auto& [pid, info] : m_protectedProcesses) {
-                lock.unlock();
-                ProtectAllThreads(pid);
-                lock.lock();
+            threadProtEnabled = m_config.enableThreadProtection;
+        }
+
+        if (threadProtEnabled) {
+            // Re-snapshot PIDs (some may have been removed above)
+            std::vector<uint32_t> currentPids;
+            {
+                std::shared_lock lock(m_mutex);
+                currentPids.reserve(m_protectedProcesses.size());
+                for (const auto& [pid, info] : m_protectedProcesses) {
+                    currentPids.push_back(pid);
+                }
+            }
+
+            for (uint32_t pid : currentPids) {
+                (void)ProtectAllThreads(pid);
             }
         }
     }
@@ -2110,6 +2229,11 @@ bool ProcessProtectionImpl::IsOwnProcess(uint32_t processId) const {
 }
 
 bool ProcessProtectionImpl::IsShadowStrikeComponent(uint32_t processId) const {
+    // Self-process is always a ShadowStrike component
+    if (processId == GetCurrentProcessIdSafe()) {
+        return true;
+    }
+
     std::wstring processName = GetProcessName(processId);
     if (processName.empty()) {
         return false;
@@ -2118,16 +2242,84 @@ bool ProcessProtectionImpl::IsShadowStrikeComponent(uint32_t processId) const {
     std::wstring lowerName = processName;
     std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
 
+    bool nameMatches = false;
     for (const auto& component : SHADOWSTRIKE_COMPONENTS) {
         std::wstring lowerComponent(component);
         std::transform(lowerComponent.begin(), lowerComponent.end(), lowerComponent.begin(), ::towlower);
 
         if (lowerName == lowerComponent) {
-            return true;
+            nameMatches = true;
+            break;
         }
     }
 
-    return false;
+    if (!nameMatches) {
+        return false;
+    }
+
+    // Name alone is insufficient - verify image path is under our installation directory.
+    // This prevents trivial spoofing by renaming a malicious exe.
+    std::wstring imagePath = GetProcessImagePath(processId);
+    if (imagePath.empty()) {
+        Utils::Logger::Warn("[ProcessProtection] Component name match for PID {} but cannot verify image path - rejecting",
+                           processId);
+        return false;
+    }
+
+    // Verify the image resides in the same directory as our own executable
+    std::wstring ownPath = GetProcessImagePath(GetCurrentProcessIdSafe());
+    if (ownPath.empty()) {
+        return false;
+    }
+
+    // Extract directory from own path
+    size_t ownDirPos = ownPath.find_last_of(L'\\');
+    if (ownDirPos == std::wstring::npos) {
+        return false;
+    }
+    std::wstring ownDir = ownPath.substr(0, ownDirPos + 1);
+
+    // Convert both to lowercase for comparison
+    std::wstring lowerOwnDir = ownDir;
+    std::transform(lowerOwnDir.begin(), lowerOwnDir.end(), lowerOwnDir.begin(), ::towlower);
+
+    std::wstring lowerImagePath = imagePath;
+    std::transform(lowerImagePath.begin(), lowerImagePath.end(), lowerImagePath.begin(), ::towlower);
+
+    if (lowerImagePath.find(lowerOwnDir) != 0) {
+        Utils::Logger::Warn("[ProcessProtection] Component name match for PID {} but image path '{}' is outside installation directory - rejecting",
+                           processId, WideToNarrow(imagePath));
+        return false;
+    }
+
+    return true;
+}
+
+bool ProcessProtectionImpl::VerifyAuthToken(std::string_view token) const {
+    if (token.empty()) {
+        return false;
+    }
+    return ConstantTimeCompare(token, m_internalAuthToken);
+}
+
+void ProcessProtectionImpl::CloseProtectedHandles() {
+    // Must be called under m_mutex exclusive lock
+#ifdef _WIN32
+    for (auto& [pid, info] : m_protectedProcesses) {
+        if (info.processHandle) {
+            ::CloseHandle(info.processHandle);
+            info.processHandle = nullptr;
+        }
+    }
+    for (auto& [tid, info] : m_protectedThreads) {
+        if (info.threadHandle) {
+            ::CloseHandle(info.threadHandle);
+            info.threadHandle = nullptr;
+        }
+    }
+#endif
+    m_protectedProcesses.clear();
+    m_protectedThreads.clear();
 }
 
 // ============================================================================
@@ -2151,6 +2343,10 @@ ProcessProtection::ProcessProtection() : m_impl(std::make_unique<ProcessProtecti
 
 ProcessProtection::~ProcessProtection() {
     s_instanceCreated.store(false, std::memory_order_release);
+}
+
+std::string ProcessProtection::GetInternalAuthToken() const {
+    return m_impl->GetInternalAuthToken();
 }
 
 bool ProcessProtection::Initialize(const ProcessProtectionConfiguration& config) {
@@ -2560,16 +2756,25 @@ std::string FormatAccessRights(uint32_t accessRights, bool isThread) {
 ProcessProtectionGuard::ProcessProtectionGuard(uint32_t processId)
     : m_processId(processId == 0 ? GetCurrentProcessIdSafe() : processId) {
 
-    m_authToken = GenerateInternalAuthToken();
-
     if (ProcessProtection::HasInstance()) {
-        m_protected = ProcessProtection::Instance().ProtectProcess(m_processId);
+        auto& instance = ProcessProtection::Instance();
+        m_authToken = instance.GetInternalAuthToken();
+        m_protected = instance.ProtectProcess(m_processId);
     }
 }
 
 ProcessProtectionGuard::~ProcessProtectionGuard() {
+    Release();
+}
+
+void ProcessProtectionGuard::Release() noexcept {
     if (m_protected && ProcessProtection::HasInstance()) {
-        ProcessProtection::Instance().UnprotectProcess(m_processId, m_authToken);
+        try {
+            ProcessProtection::Instance().UnprotectProcess(m_processId, m_authToken);
+        } catch (...) {
+            // Destructor must not throw
+        }
+        m_protected = false;
     }
 }
 

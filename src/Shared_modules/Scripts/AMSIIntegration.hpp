@@ -135,7 +135,7 @@
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/MemoryUtils.hpp"
 #include "../Utils/HashUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
+// ThreatIntel and Whitelist are forward-declared; full includes live in .cpp only (PIMPL).
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -155,26 +155,36 @@ namespace Scripts {
 namespace AMSIConstants {
 
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
     /// @brief Maximum content size for scanning
     inline constexpr size_t MAX_SCAN_CONTENT_SIZE = 64 * 1024 * 1024;  // 64MB
-    
+
     /// @brief Maximum sessions to track
     inline constexpr size_t MAX_SESSIONS = 4096;
-    
+
     /// @brief Integrity check interval (ms)
     inline constexpr uint32_t INTEGRITY_CHECK_INTERVAL_MS = 5000;
-    
+
     /// @brief AMSI function bytes to verify (AmsiScanBuffer prologue)
     inline constexpr size_t AMSI_PROLOGUE_SIZE = 16;
-    
+
+    /// @brief Maximum bypass events retained in ring buffer
+    inline constexpr size_t MAX_BYPASS_EVENTS = 1000;
+
+    /// @brief Maximum scan cache entries (hash → verdict)
+    inline constexpr size_t MAX_SCAN_CACHE_ENTRIES = 8192;
+
+    /// @brief Scan cache entry TTL
+    inline constexpr uint32_t SCAN_CACHE_TTL_SECONDS = 300;
+
     /// @brief Provider name
     inline constexpr const wchar_t* PROVIDER_NAME = L"ShadowStrike AMSI Provider";
-    
-    /// @brief Provider GUID (example)
-    inline constexpr const wchar_t* PROVIDER_GUID = L"{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}";
+
+    // GUID generated via UUIDv5(DNS, "shadowstrike.amsi.provider")
+    // {7F3A29B1-C4D8-5E6F-A091-2B3C4D5E6F70}
+    inline constexpr const wchar_t* PROVIDER_GUID = L"{7F3A29B1-C4D8-5E6F-A091-2B3C4D5E6F70}";
 
 }  // namespace AMSIConstants
 
@@ -494,7 +504,7 @@ struct AmsiIntegrityReport {
 };
 
 /**
- * @brief Statistics
+ * @brief Statistics (internal, atomic counters)
  */
 struct AMSIStatistics {
     std::atomic<uint64_t> totalScans{0};
@@ -506,10 +516,32 @@ struct AMSIStatistics {
     std::atomic<uint64_t> integrityChecks{0};
     std::atomic<uint64_t> integrityFailures{0};
     std::atomic<uint64_t> totalBytesScanned{0};
+    std::atomic<uint64_t> cacheHits{0};
+    std::atomic<uint64_t> cacheMisses{0};
     std::array<std::atomic<uint64_t>, 16> byContentType{};
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+};
+
+/**
+ * @brief Statistics snapshot (copyable, for public API)
+ */
+struct AMSIStatisticsSnapshot {
+    uint64_t totalScans = 0;
+    uint64_t maliciousDetected = 0;
+    uint64_t cleanResults = 0;
+    uint64_t sessionsCreated = 0;
+    uint64_t bypassAttemptsDetected = 0;
+    uint64_t bypassesRepaired = 0;
+    uint64_t integrityChecks = 0;
+    uint64_t integrityFailures = 0;
+    uint64_t totalBytesScanned = 0;
+    uint64_t cacheHits = 0;
+    uint64_t cacheMisses = 0;
+    std::array<uint64_t, 16> byContentType{};
+    TimePoint startTime{};
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -686,12 +718,54 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] AMSIStatistics GetStatistics() const;
+    [[nodiscard]] AMSIStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     [[nodiscard]] std::vector<AmsiBypassEvent> GetRecentBypassEvents(size_t maxCount = 100) const;
     
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL BRIDGE — bidirectional kernel↔AMSI integration
+    // ========================================================================
+
+    /// @brief Called when kernel notifies of a new process (script host detection)
+    /// Checks if the process is a script host (powershell, cscript, wscript, mshta)
+    /// and starts AMSI integrity monitoring for it.
+    void OnKernelProcessNotify(uint32_t processId,
+                               std::wstring_view imagePath,
+                               std::wstring_view commandLine,
+                               bool isCreate);
+
+    /// @brief Called when kernel notifies of an image load (amsi.dll load detection)
+    /// Detects amsi.dll loading and triggers immediate integrity baseline capture.
+    void OnKernelImageLoad(uint32_t processId,
+                           std::wstring_view imagePath,
+                           uint64_t imageBase,
+                           size_t imageSize);
+
+    /// @brief Request the kernel driver to block a process (via IPC)
+    /// Used when repeated AMSI bypass is detected and terminateOnRepeatedBypass is enabled.
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
+                                                  const std::wstring& reason);
+
+    // ========================================================================
+    // CROSS-MODULE INTEGRATION
+    // ========================================================================
+
+    /// @brief Report AMSI bypass to BehaviorAnalyzer for threat scoring
+    void ReportBypassToBehaviorAnalyzer(const AmsiBypassEvent& event);
+
+    /// @brief Report AMSI bypass to AlertSystem for SOC notification
+    void ReportBypassToAlertSystem(const AmsiBypassEvent& event);
+
+    /// @brief Query ThreatIntel for content hash reputation
+    [[nodiscard]] bool QueryThreatIntel(const std::string& sha256Hash,
+                                         double& outRiskScore,
+                                         std::string& outThreatName) const;
+
+    /// @brief Check Whitelist before scanning (fast-path skip)
+    [[nodiscard]] bool IsWhitelisted(const std::string& sha256Hash) const;
 
 private:
     AMSIIntegration();

@@ -55,6 +55,8 @@
 #include <iomanip>
 #include <random>
 #include <format>
+#include <utility>
+#include <cwctype>
 
 namespace ShadowStrike {
 namespace Security {
@@ -153,8 +155,8 @@ namespace {
 
     /// @brief Format timestamp for JSON
     [[nodiscard]] std::string FormatTimestamp(TimePoint tp) {
-        const auto sysTime = std::chrono::system_clock::now() +
-            (tp - Clock::now());
+        const auto sysTime = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+            std::chrono::system_clock::now() + (tp - Clock::now()));
         const auto time_t_val = std::chrono::system_clock::to_time_t(sysTime);
         std::tm tm_val{};
         gmtime_s(&tm_val, &time_t_val);
@@ -241,6 +243,17 @@ public:
             return false;
         }
 
+        // Generate cryptographic session secret for auth token verification
+        {
+            Utils::CryptoUtils::SecureRandom rng;
+            m_sessionSecret.resize(32);
+            if (!rng.Generate(m_sessionSecret.data(), m_sessionSecret.size())) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to generate session secret");
+                m_status = ModuleStatus::Error;
+                return false;
+            }
+        }
+
         // Store configuration
         m_config = config;
         m_mode = config.mode;
@@ -305,8 +318,10 @@ public:
         m_status = ModuleStatus::Stopping;
         SS_LOG_INFO(LOG_CATEGORY, L"Shutting down registry protection...");
 
-        // Stop monitoring thread
+        // Stop monitoring thread (release lock first - StopMonitoring joins thread)
+        lock.unlock();
         StopMonitoring();
+        lock.lock();
 
         // Clear protected keys
         m_protectedKeys.clear();
@@ -318,6 +333,12 @@ public:
         m_integrityCallbacks.clear();
         m_valueChangeCallbacks.clear();
         m_decisionCallback = nullptr;
+
+        // Securely wipe session secret
+        if (!m_sessionSecret.empty()) {
+            SecureZeroMemory(m_sessionSecret.data(), m_sessionSecret.size());
+            m_sessionSecret.clear();
+        }
 
         m_status = ModuleStatus::Stopped;
         SS_LOG_INFO(LOG_CATEGORY, L"Registry protection shutdown complete");
@@ -342,13 +363,16 @@ public:
         }
 
         std::unique_lock lock(m_mutex);
+
+        // Capture old interval BEFORE overwriting config
+        const auto oldPollingInterval = m_config.pollingIntervalMs;
+
         m_config = config;
         m_mode = config.mode;
 
         // Update monitoring interval if changed
         if (m_monitoringActive &&
-            config.pollingIntervalMs != m_config.pollingIntervalMs) {
-            // Restart monitoring with new interval
+            config.pollingIntervalMs != oldPollingInterval) {
             StopMonitoring();
             StartMonitoring();
         }
@@ -506,6 +530,115 @@ public:
         return success;
     }
 
+    [[nodiscard]] bool ProtectIFEOKeys() {
+        SS_LOG_INFO(LOG_CATEGORY, L"Protecting IFEO (Image File Execution Options) keys...");
+
+        bool success = true;
+
+        // IFEO debugger keys for ShadowStrike executables - critical EDR evasion vector
+        static constexpr std::array<std::wstring_view, 3> kExecutables = {
+            L"ShadowStrikeService.exe",
+            L"ShadowStrikeUI.exe",
+            L"ShadowStrikeUpdater.exe"
+        };
+
+        constexpr std::wstring_view kIFEOBase =
+            L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
+            L"\\Image File Execution Options\\";
+
+        for (const auto& exe : kExecutables) {
+            const std::wstring ifeoPath = std::wstring(kIFEOBase) + std::wstring(exe);
+            success &= ProtectKey(ifeoPath, KeyProtectionType::Full, true);
+        }
+
+        if (success) {
+            SS_LOG_INFO(LOG_CATEGORY, L"IFEO keys protected successfully");
+        } else {
+            SS_LOG_WARN(LOG_CATEGORY, L"Some IFEO keys failed to protect");
+        }
+
+        return success;
+    }
+
+    [[nodiscard]] bool HardenKeyDACL(std::wstring_view keyPath) {
+        const auto normalized = NormalizeKeyPath(keyPath);
+
+        HKEY rootKey = nullptr;
+        std::wstring subKey;
+        if (!Utils::RegistryUtils::SplitPath(normalized, rootKey, subKey)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"HardenKeyDACL: Invalid key path: %ls",
+                normalized.c_str());
+            return false;
+        }
+
+        // Open key with WRITE_DAC access to modify its security
+        Utils::RegistryUtils::RegistryKey regKey;
+        Utils::RegistryUtils::OpenOptions opts;
+        opts.access = WRITE_DAC | READ_CONTROL;
+
+        if (!regKey.Open(rootKey, subKey, opts)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"HardenKeyDACL: Cannot open key: %ls",
+                normalized.c_str());
+            return false;
+        }
+
+        // Build a restrictive SDDL security descriptor:
+        //  Owner: SYSTEM
+        //  DACL:
+        //    Allow Full Control to SYSTEM (SY)
+        //    Allow Full Control to Administrators (BA)
+        //    Allow Read to Authenticated Users (AU)
+        //    Deny Write/Delete to Everyone (WO) except SYSTEM/Admins
+        constexpr const wchar_t* kSddl =
+            L"D:P"
+            L"(A;;KA;;;SY)"      // SYSTEM: full control
+            L"(A;;KA;;;BA)"      // Builtin Administrators: full control
+            L"(A;;KR;;;AU)"      // Authenticated Users: read only
+            L"(D;;WDWOSDDTKAWP;;;WD)";  // Everyone: deny write/delete/take-ownership/change-perms
+
+        PSECURITY_DESCRIPTOR pSD = nullptr;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                kSddl, SDDL_REVISION_1, &pSD, nullptr)) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"HardenKeyDACL: Failed to parse SDDL (error=%lu)", GetLastError());
+            return false;
+        }
+
+        // RAII cleanup for the security descriptor
+        struct SDDeleter {
+            void operator()(void* p) const noexcept { if (p) LocalFree(p); }
+        };
+        std::unique_ptr<void, SDDeleter> sdGuard(pSD);
+
+        // Extract DACL from security descriptor
+        BOOL daclPresent = FALSE;
+        PACL pDacl = nullptr;
+        BOOL daclDefaulted = FALSE;
+        if (!GetSecurityDescriptorDacl(pSD, &daclPresent, &pDacl, &daclDefaulted)
+            || !daclPresent || !pDacl) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"HardenKeyDACL: Failed to extract DACL");
+            return false;
+        }
+
+        // Apply DACL to the registry key
+        const DWORD result = RegSetKeySecurity(regKey.Handle(),
+            DACL_SECURITY_INFORMATION, pSD);
+
+        if (result != ERROR_SUCCESS) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"HardenKeyDACL: RegSetKeySecurity failed (error=%lu) on: %ls",
+                result, normalized.c_str());
+            return false;
+        }
+
+        SS_LOG_INFO(LOG_CATEGORY, L"DACL hardened for: %ls", normalized.c_str());
+        return true;
+    }
+
+    [[nodiscard]] std::string GenerateAuthorizationToken() const {
+        return ComputeAuthToken();
+    }
+
     // ========================================================================
     // VALUE PROTECTION
     // ========================================================================
@@ -630,7 +763,10 @@ public:
             return result;
         }
 
-        // Check custom decision callback
+        // Check custom decision callback and protected keys under one lock scope
+        std::shared_lock lock(m_mutex);
+
+        // Check custom decision callback (now safely under lock)
         if (m_decisionCallback) {
             auto customResult = m_decisionCallback(request);
             if (customResult.has_value()) {
@@ -639,8 +775,6 @@ public:
         }
 
         // Check if key is protected
-        std::shared_lock lock(m_mutex);
-
         if (!IsKeyProtectedInternal(request.keyPath)) {
             return result;
         }
@@ -682,7 +816,7 @@ public:
 
             m_stats.totalBlocked++;
 
-            // Fire event
+            // Release lock before firing callbacks to avoid deadlock
             lock.unlock();
             FireBlockedOperationEvent(request, result);
         } else if (m_mode == RegistryProtectionMode::Monitor) {
@@ -938,6 +1072,15 @@ public:
         bool success = true;
         for (size_t i = 0; i < snapshotToRestore->values.size(); ++i) {
             const auto& [name, data] = snapshotToRestore->values[i];
+
+            // Bounds check: valueTypes must be parallel to values
+            if (i >= snapshotToRestore->valueTypes.size()) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Snapshot corrupt: valueTypes shorter than values at index %zu", i);
+                success = false;
+                break;
+            }
+
             const auto type = snapshotToRestore->valueTypes[i].second;
 
             const LSTATUS st = RegSetValueExW(regKey.Handle(), name.c_str(), 0,
@@ -1067,7 +1210,12 @@ public:
 
     [[nodiscard]] bool IsWhitelisted(std::wstring_view processName) const {
         std::shared_lock lock(m_mutex);
-        return m_whitelistedProcesses.contains(std::wstring(processName));
+        for (const auto& whitelisted : m_whitelistedProcesses) {
+            if (Utils::StringUtils::IEquals(processName, whitelisted)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     [[nodiscard]] bool IsWhitelisted(uint32_t processId) const {
@@ -1130,8 +1278,23 @@ public:
     // ========================================================================
 
     [[nodiscard]] RegistryProtectionStatistics GetStatistics() const {
-        // Statistics are already atomic, no lock needed for reading
-        return m_stats;
+        // Atomics are thread-safe, but TimePoints need lock protection
+        RegistryProtectionStatistics result;
+        result.totalProtectedKeys.store(m_stats.totalProtectedKeys.load(std::memory_order_relaxed));
+        result.totalProtectedValues.store(m_stats.totalProtectedValues.load(std::memory_order_relaxed));
+        result.totalOperations.store(m_stats.totalOperations.load(std::memory_order_relaxed));
+        result.totalBlocked.store(m_stats.totalBlocked.load(std::memory_order_relaxed));
+        result.totalRollbacks.store(m_stats.totalRollbacks.load(std::memory_order_relaxed));
+        result.totalIntegrityChecks.store(m_stats.totalIntegrityChecks.load(std::memory_order_relaxed));
+        result.integrityViolations.store(m_stats.integrityViolations.load(std::memory_order_relaxed));
+        result.snapshotsCreated.store(m_stats.snapshotsCreated.load(std::memory_order_relaxed));
+        result.snapshotsRestored.store(m_stats.snapshotsRestored.load(std::memory_order_relaxed));
+        {
+            std::shared_lock lock(m_mutex);
+            result.startTime = m_stats.startTime;
+            result.lastEventTime = m_stats.lastEventTime;
+        }
+        return result;
     }
 
     void ResetStatistics(std::string_view authorizationToken) {
@@ -1254,17 +1417,29 @@ public:
     [[nodiscard]] static std::wstring NormalizeKeyPath(std::wstring_view keyPath) {
         std::wstring result(keyPath);
 
-        // Convert to uppercase for first segment
-        if (result.starts_with(L"HKEY_LOCAL_MACHINE") || result.starts_with(L"hkey_local_machine")) {
-            result.replace(0, 18, L"HKLM");
-        } else if (result.starts_with(L"HKEY_CURRENT_USER") || result.starts_with(L"hkey_current_user")) {
-            result.replace(0, 17, L"HKCU");
-        } else if (result.starts_with(L"HKEY_CLASSES_ROOT") || result.starts_with(L"hkey_classes_root")) {
-            result.replace(0, 17, L"HKCR");
-        } else if (result.starts_with(L"HKEY_USERS") || result.starts_with(L"hkey_users")) {
-            result.replace(0, 10, L"HKU");
-        } else if (result.starts_with(L"HKEY_CURRENT_CONFIG") || result.starts_with(L"hkey_current_config")) {
-            result.replace(0, 19, L"HKCC");
+        // Case-insensitive root key normalization
+        // Extract root segment (everything before first backslash)
+        const auto slashPos = result.find(L'\\');
+        std::wstring rootSegment = (slashPos != std::wstring::npos)
+            ? result.substr(0, slashPos)
+            : result;
+
+        // Convert root segment to uppercase for comparison
+        std::wstring rootUpper = rootSegment;
+        for (auto& ch : rootUpper) {
+            ch = static_cast<wchar_t>(towupper(ch));
+        }
+
+        if (rootUpper == L"HKEY_LOCAL_MACHINE" || rootUpper == L"HKLM") {
+            result.replace(0, rootSegment.size(), L"HKLM");
+        } else if (rootUpper == L"HKEY_CURRENT_USER" || rootUpper == L"HKCU") {
+            result.replace(0, rootSegment.size(), L"HKCU");
+        } else if (rootUpper == L"HKEY_CLASSES_ROOT" || rootUpper == L"HKCR") {
+            result.replace(0, rootSegment.size(), L"HKCR");
+        } else if (rootUpper == L"HKEY_USERS" || rootUpper == L"HKU") {
+            result.replace(0, rootSegment.size(), L"HKU");
+        } else if (rootUpper == L"HKEY_CURRENT_CONFIG" || rootUpper == L"HKCC") {
+            result.replace(0, rootSegment.size(), L"HKCC");
         }
 
         // Remove trailing backslash
@@ -1276,19 +1451,21 @@ public:
     }
 
     [[nodiscard]] static HKEY ParseRootKey(std::wstring_view keyPath) {
-        if (keyPath.starts_with(L"HKLM\\") || keyPath.starts_with(L"HKEY_LOCAL_MACHINE\\")) {
+        // Normalize first for consistent comparison
+        const auto normalized = NormalizeKeyPath(keyPath);
+        if (normalized.starts_with(L"HKLM\\") || normalized == L"HKLM") {
             return HKEY_LOCAL_MACHINE;
         }
-        if (keyPath.starts_with(L"HKCU\\") || keyPath.starts_with(L"HKEY_CURRENT_USER\\")) {
+        if (normalized.starts_with(L"HKCU\\") || normalized == L"HKCU") {
             return HKEY_CURRENT_USER;
         }
-        if (keyPath.starts_with(L"HKCR\\") || keyPath.starts_with(L"HKEY_CLASSES_ROOT\\")) {
+        if (normalized.starts_with(L"HKCR\\") || normalized == L"HKCR") {
             return HKEY_CLASSES_ROOT;
         }
-        if (keyPath.starts_with(L"HKU\\") || keyPath.starts_with(L"HKEY_USERS\\")) {
+        if (normalized.starts_with(L"HKU\\") || normalized == L"HKU") {
             return HKEY_USERS;
         }
-        if (keyPath.starts_with(L"HKCC\\") || keyPath.starts_with(L"HKEY_CURRENT_CONFIG\\")) {
+        if (normalized.starts_with(L"HKCC\\") || normalized == L"HKCC") {
             return HKEY_CURRENT_CONFIG;
         }
         return nullptr;
@@ -1442,20 +1619,21 @@ private:
             snapshot.subkeys = std::move(subKeys);
         }
 
-        // Set version number
+        // Set version number using monotonic counter (survives pruning)
         auto& snapshots = m_snapshots[normalized];
-        snapshot.version = static_cast<uint32_t>(snapshots.size() + 1);
+        snapshot.version = ++m_nextSnapshotVersion;
 
         // Limit snapshot count
         while (snapshots.size() >= m_config.maxSnapshotsPerKey) {
             snapshots.erase(snapshots.begin());
         }
 
+        const auto savedVersion = snapshot.version;
         snapshots.push_back(std::move(snapshot));
         m_stats.snapshotsCreated++;
 
         SS_LOG_DEBUG(LOG_CATEGORY, L"Snapshot created for: %ls (version=%u)",
-            normalized.c_str(), snapshot.version);
+            normalized.c_str(), savedVersion);
 
         return true;
     }
@@ -1497,17 +1675,33 @@ private:
     }
 
     [[nodiscard]] bool IsProcessWhitelisted(uint32_t processId) const {
-        const auto processName = GetProcessNameFromPid(processId);
-        if (processName.empty()) {
+        const auto processInfo = GetProcessInfoFromPid(processId);
+        if (processInfo.first.empty()) {
             return false;
         }
 
         std::shared_lock lock(m_mutex);
-        return m_whitelistedProcesses.contains(processName);
+
+        // Case-insensitive name comparison against whitelist
+        for (const auto& whitelisted : m_whitelistedProcesses) {
+            if (Utils::StringUtils::IEquals(processInfo.first, whitelisted)) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    [[nodiscard]] static std::wstring GetProcessNameFromPid(uint32_t processId) {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    /// @brief Returns {processName, fullPath} from PID with RAII handle management
+    [[nodiscard]] static std::pair<std::wstring, std::wstring> GetProcessInfoFromPid(
+        uint32_t processId) {
+        // RAII handle wrapper - automatically closes on all exit paths
+        struct HandleCloser {
+            void operator()(HANDLE h) const noexcept {
+                if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            }
+        };
+        std::unique_ptr<void, HandleCloser> hProcess(
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId));
         if (!hProcess) {
             return {};
         }
@@ -1515,31 +1709,68 @@ private:
         wchar_t path[MAX_PATH] = {};
         DWORD size = MAX_PATH;
 
-        std::wstring result;
-        if (QueryFullProcessImageNameW(hProcess, 0, path, &size)) {
-            // Extract filename from path
-            const std::wstring fullPath(path);
-            const auto pos = fullPath.rfind(L'\\');
-            if (pos != std::wstring::npos) {
-                result = fullPath.substr(pos + 1);
-            } else {
-                result = fullPath;
-            }
+        if (!QueryFullProcessImageNameW(hProcess.get(), 0, path, &size)) {
+            return {};
         }
 
-        CloseHandle(hProcess);
-        return result;
+        const std::wstring fullPath(path, size);
+        const auto pos = fullPath.rfind(L'\\');
+        std::wstring name = (pos != std::wstring::npos)
+            ? fullPath.substr(pos + 1) : fullPath;
+
+        return {std::move(name), fullPath};
+    }
+
+    /// @brief Legacy API adapter
+    [[nodiscard]] static std::wstring GetProcessNameFromPid(uint32_t processId) {
+        return GetProcessInfoFromPid(processId).first;
     }
 
     [[nodiscard]] bool VerifyAuthToken(std::string_view token) const {
-        // Simple token validation - in production, use cryptographic verification
-        if (token.empty()) {
+        if (token.empty() || m_sessionSecret.empty()) {
             return false;
         }
         if (!token.starts_with(AUTH_TOKEN_PREFIX)) {
             return false;
         }
-        return true;
+
+        // Compute expected token using HMAC-SHA256(sessionSecret, purpose)
+        const std::string expected = ComputeAuthToken();
+        if (expected.empty()) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to compute expected auth token for verification");
+            return false;
+        }
+
+        // Constant-time comparison to prevent timing side-channels
+        if (token.size() != expected.size()) {
+            return false;
+        }
+        return Utils::HashUtils::Equal(
+            reinterpret_cast<const uint8_t*>(token.data()),
+            reinterpret_cast<const uint8_t*>(expected.data()),
+            token.size());
+    }
+
+    [[nodiscard]] std::string ComputeAuthToken() const {
+        if (m_sessionSecret.empty()) {
+            return {};
+        }
+
+        static constexpr std::string_view kPurpose = "ShadowStrike_Registry_Auth";
+
+        Utils::HashUtils::Hmac hmac(Utils::HashUtils::Algorithm::SHA256);
+        if (!hmac.Init(m_sessionSecret.data(), m_sessionSecret.size())) {
+            return {};
+        }
+        if (!hmac.Update(kPurpose.data(), kPurpose.size())) {
+            return {};
+        }
+        std::string hexOut;
+        if (!hmac.FinalHex(hexOut, false)) {
+            return {};
+        }
+
+        return std::string(AUTH_TOKEN_PREFIX) + hexOut;
     }
 
     void StartMonitoring() {
@@ -1592,18 +1823,24 @@ private:
     }
 
     void PerformIntegrityCheck() {
-        // Get keys to check
+        // Get keys and values to check
         std::vector<std::wstring> keysToCheck;
+        std::vector<std::pair<std::wstring, std::wstring>> valuesToCheck;
         {
             std::shared_lock lock(m_mutex);
             keysToCheck.reserve(m_protectedKeys.size());
             for (const auto& [path, key] : m_protectedKeys) {
                 keysToCheck.push_back(path);
             }
+            valuesToCheck.reserve(m_protectedValues.size());
+            for (const auto& [compositeKey, pv] : m_protectedValues) {
+                valuesToCheck.emplace_back(pv.keyPath, pv.valueName);
+            }
         }
 
+        // Check key integrity
         for (const auto& keyPath : keysToCheck) {
-            if (m_stopMonitoring) break;
+            if (m_stopMonitoring) return;
 
             const auto status = VerifyKeyIntegrity(keyPath);
             if (status != IntegrityStatus::Valid && status != IntegrityStatus::Unknown) {
@@ -1613,6 +1850,25 @@ private:
                 if (m_config.enableAutoRollback && m_mode == RegistryProtectionMode::Rollback) {
                     if (RollbackKey(keyPath)) {
                         SS_LOG_INFO(LOG_CATEGORY, L"Key auto-restored: %ls", keyPath.c_str());
+                    }
+                }
+            }
+        }
+
+        // Check value integrity
+        for (const auto& [keyPath, valueName] : valuesToCheck) {
+            if (m_stopMonitoring) return;
+
+            const auto status = VerifyValueIntegrity(keyPath, valueName);
+            if (status == IntegrityStatus::Modified || status == IntegrityStatus::Missing) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Value integrity violation: %ls\\%ls (status=%hs)",
+                    keyPath.c_str(), valueName.c_str(),
+                    std::string(GetIntegrityStatusName(status)).c_str());
+
+                if (m_config.enableAutoRollback && m_mode == RegistryProtectionMode::Rollback) {
+                    if (RollbackValue(keyPath, valueName)) {
+                        SS_LOG_INFO(LOG_CATEGORY, L"Value auto-restored: %ls\\%ls",
+                            keyPath.c_str(), valueName.c_str());
                     }
                 }
             }
@@ -1642,9 +1898,9 @@ private:
             while (m_eventHistory.size() > MAX_EVENT_HISTORY) {
                 m_eventHistory.erase(m_eventHistory.begin());
             }
+            // Update lastEventTime under lock to avoid data race on TimePoint
+            m_stats.lastEventTime = event.timestamp;
         }
-
-        m_stats.lastEventTime = event.timestamp;
 
         // Fire callbacks
         std::vector<RegistryEventCallback> callbacks;
@@ -1743,6 +1999,12 @@ private:
     std::thread m_monitorThread;
     std::atomic<bool> m_monitoringActive{false};
     std::atomic<bool> m_stopMonitoring{false};
+
+    // Cryptographic session secret for auth token verification
+    std::vector<uint8_t> m_sessionSecret;
+
+    // Monotonic snapshot version counter (survives snapshot pruning)
+    uint32_t m_nextSnapshotVersion{0};
 };
 
 // ============================================================================
@@ -1837,6 +2099,18 @@ bool RegistryProtection::ProtectServiceKeys() {
 
 bool RegistryProtection::ProtectStartupEntries() {
     return m_impl->ProtectStartupEntries();
+}
+
+bool RegistryProtection::ProtectIFEOKeys() {
+    return m_impl->ProtectIFEOKeys();
+}
+
+bool RegistryProtection::HardenKeyDACL(std::wstring_view keyPath) {
+    return m_impl->HardenKeyDACL(keyPath);
+}
+
+std::string RegistryProtection::GenerateAuthorizationToken() const {
+    return m_impl->GenerateAuthorizationToken();
 }
 
 bool RegistryProtection::ProtectValue(std::wstring_view keyPath, std::wstring_view valueName) {
@@ -2120,6 +2394,58 @@ std::string RegistryProtectionEvent::ToJson() const {
     return json.str();
 }
 
+RegistryProtectionStatistics::RegistryProtectionStatistics(
+    const RegistryProtectionStatistics& other) noexcept
+    : startTime(other.startTime)
+    , lastEventTime(other.lastEventTime)
+{
+    totalProtectedKeys.store(other.totalProtectedKeys.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+    totalProtectedValues.store(other.totalProtectedValues.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+    totalOperations.store(other.totalOperations.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+    totalBlocked.store(other.totalBlocked.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+    totalRollbacks.store(other.totalRollbacks.load(std::memory_order_relaxed),
+                         std::memory_order_relaxed);
+    totalIntegrityChecks.store(other.totalIntegrityChecks.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+    integrityViolations.store(other.integrityViolations.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+    snapshotsCreated.store(other.snapshotsCreated.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+    snapshotsRestored.store(other.snapshotsRestored.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+}
+
+RegistryProtectionStatistics& RegistryProtectionStatistics::operator=(
+    const RegistryProtectionStatistics& other) noexcept {
+    if (this != &other) {
+        totalProtectedKeys.store(other.totalProtectedKeys.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+        totalProtectedValues.store(other.totalProtectedValues.load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+        totalOperations.store(other.totalOperations.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+        totalBlocked.store(other.totalBlocked.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+        totalRollbacks.store(other.totalRollbacks.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+        totalIntegrityChecks.store(other.totalIntegrityChecks.load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+        integrityViolations.store(other.integrityViolations.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+        snapshotsCreated.store(other.snapshotsCreated.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        snapshotsRestored.store(other.snapshotsRestored.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+        startTime = other.startTime;
+        lastEventTime = other.lastEventTime;
+    }
+    return *this;
+}
+
 void RegistryProtectionStatistics::Reset() noexcept {
     totalProtectedKeys = 0;
     totalProtectedValues = 0;
@@ -2261,7 +2587,7 @@ std::string FormatRegistryOperation(RegistryOperation operation) {
 RegistryProtectionGuard::RegistryProtectionGuard(std::wstring_view keyPath, KeyProtectionType type)
     : m_keyPath(keyPath)
     , m_protected(false)
-    , m_authToken(std::string(AUTH_TOKEN_PREFIX) + GenerateUniqueId())
+    , m_authToken(RegistryProtection::Instance().GenerateAuthorizationToken())
 {
     m_protected = RegistryProtection::Instance().ProtectKey(keyPath, type, true);
     if (m_protected) {

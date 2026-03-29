@@ -162,7 +162,10 @@ namespace {
                 BCryptDestroyKey(m_handle);
                 m_handle = nullptr;
             }
-            m_keyObject.clear();
+            if (!m_keyObject.empty()) {
+                SecureZeroMemory(m_keyObject.data(), m_keyObject.size());
+                m_keyObject.clear();
+            }
         }
 
         [[nodiscard]] BCRYPT_KEY_HANDLE Get() const noexcept { return m_handle; }
@@ -206,7 +209,10 @@ namespace {
                 BCryptDestroyHash(m_handle);
                 m_handle = nullptr;
             }
-            m_hashObject.clear();
+            if (!m_hashObject.empty()) {
+                SecureZeroMemory(m_hashObject.data(), m_hashObject.size());
+                m_hashObject.clear();
+            }
         }
 
         [[nodiscard]] BCRYPT_HASH_HANDLE Get() const noexcept { return m_handle; }
@@ -269,6 +275,21 @@ namespace {
         return oss.str();
     }
 
+    /**
+     * @brief RAII wrapper for Win32 file handles (prevents handle leaks on exceptions/early returns)
+     */
+    class ScopedFileHandle {
+    public:
+        explicit ScopedFileHandle(HANDLE h = INVALID_HANDLE_VALUE) noexcept : m_handle(h) {}
+        ~ScopedFileHandle() { if (m_handle != INVALID_HANDLE_VALUE) CloseHandle(m_handle); }
+        ScopedFileHandle(const ScopedFileHandle&) = delete;
+        ScopedFileHandle& operator=(const ScopedFileHandle&) = delete;
+        [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
+        [[nodiscard]] bool IsValid() const noexcept { return m_handle != INVALID_HANDLE_VALUE; }
+    private:
+        HANDLE m_handle;
+    };
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -305,10 +326,17 @@ struct ManagedKey {
         , protectedData(std::move(other.protectedData))
         , ncryptHandle(other.ncryptHandle) {
         other.ncryptHandle = 0;
+        if (!other.keyData.empty()) {
+            SecureZeroMemory(other.keyData.data(), other.keyData.size());
+            other.keyData.clear();
+        }
     }
 
     ManagedKey& operator=(ManagedKey&& other) noexcept {
         if (this != &other) {
+            if (!keyData.empty()) {
+                SecureZeroMemory(keyData.data(), keyData.size());
+            }
             if (ncryptHandle) {
                 NCryptFreeObject(ncryptHandle);
             }
@@ -318,6 +346,10 @@ struct ManagedKey {
             protectedData = std::move(other.protectedData);
             ncryptHandle = other.ncryptHandle;
             other.ncryptHandle = 0;
+            if (!other.keyData.empty()) {
+                SecureZeroMemory(other.keyData.data(), other.keyData.size());
+                other.keyData.clear();
+            }
         }
         return *this;
     }
@@ -505,7 +537,7 @@ public:
     void SecureZero(void* ptr, size_t size);
     [[nodiscard]] bool ConstantTimeCompare(
         std::span<const uint8_t> a,
-        std::span<const uint8_t> b);
+        std::span<const uint8_t> b) noexcept;
 
     [[nodiscard]] bool IsHardwareAccelerationAvailable() const;
     [[nodiscard]] bool IsFIPSModeEnabled() const;
@@ -540,6 +572,7 @@ private:
 
     std::atomic<bool> m_tpmAvailable{false};
     NCRYPT_PROV_HANDLE m_tpmProvider = 0;
+    NCRYPT_KEY_HANDLE m_tpmSealKey = 0;
 
     mutable std::shared_mutex m_callbackMutex;
     KeyRotationCallback m_keyRotationCallback;
@@ -962,7 +995,7 @@ void CryptoManager::SecureZero(void* ptr, size_t size) {
 
 bool CryptoManager::ConstantTimeCompare(
     std::span<const uint8_t> a,
-    std::span<const uint8_t> b) {
+    std::span<const uint8_t> b) noexcept {
     return m_impl->ConstantTimeCompare(a, b);
 }
 
@@ -999,11 +1032,16 @@ bool CryptoManager::SelfTest() {
 }
 
 std::string CryptoManager::GetVersionString() noexcept {
-    std::ostringstream oss;
-    oss << CryptoConstants::VERSION_MAJOR << "."
-        << CryptoConstants::VERSION_MINOR << "."
-        << CryptoConstants::VERSION_PATCH;
-    return oss.str();
+    try {
+        char buf[32]{};
+        snprintf(buf, sizeof(buf), "%u.%u.%u",
+                 CryptoConstants::VERSION_MAJOR,
+                 CryptoConstants::VERSION_MINOR,
+                 CryptoConstants::VERSION_PATCH);
+        return std::string(buf);
+    } catch (...) {
+        return "3.0.0";
+    }
 }
 
 // ============================================================================
@@ -1096,6 +1134,10 @@ void CryptoManagerImpl::Shutdown() {
         m_ecdhP256Alg.Close();
     }
 
+    if (m_tpmSealKey) {
+        NCryptFreeObject(m_tpmSealKey);
+        m_tpmSealKey = 0;
+    }
     if (m_tpmProvider) {
         NCryptFreeObject(m_tpmProvider);
         m_tpmProvider = 0;
@@ -1152,6 +1194,12 @@ EncryptionResult CryptoManagerImpl::Encrypt(
     std::span<const uint8_t> aad) {
 
     EncryptionResult result;
+
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        result.result = CryptoResult::InternalError;
+        result.errorMessage = "CryptoManager not initialized";
+        return result;
+    }
 
     if (plaintext.empty()) {
         result.result = CryptoResult::InvalidData;
@@ -1240,6 +1288,12 @@ DecryptionResult CryptoManagerImpl::Decrypt(
     std::span<const uint8_t> aad) {
 
     DecryptionResult result;
+
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        result.result = CryptoResult::InternalError;
+        result.errorMessage = "CryptoManager not initialized";
+        return result;
+    }
 
     if (ciphertext.empty()) {
         result.result = CryptoResult::InvalidData;
@@ -1720,23 +1774,36 @@ DecryptionResult CryptoManagerImpl::DecryptAESCBC(
 
     result.plaintext.resize(plaintextSize);
 
-    // Remove PKCS7 padding
-    if (!result.plaintext.empty()) {
-        uint8_t paddingValue = result.plaintext.back();
-        if (paddingValue > 0 && paddingValue <= 16) {
-            bool validPadding = true;
-            for (size_t i = result.plaintext.size() - paddingValue; i < result.plaintext.size(); ++i) {
-                if (result.plaintext[i] != paddingValue) {
-                    validPadding = false;
-                    break;
-                }
-            }
-            if (validPadding) {
-                result.plaintext.resize(result.plaintext.size() - paddingValue);
-            }
-        }
+    // Constant-time PKCS7 padding validation (mitigates padding oracle attacks)
+    if (result.plaintext.empty()) {
+        result.result = CryptoResult::InvalidData;
+        result.errorMessage = "Empty decryption output";
+        return result;
     }
 
+    const uint8_t paddingValue = result.plaintext.back();
+    if (paddingValue == 0 || paddingValue > 16 ||
+        static_cast<size_t>(paddingValue) > result.plaintext.size()) {
+        SecureZeroMemory(result.plaintext.data(), result.plaintext.size());
+        result.result = CryptoResult::AuthenticationFailed;
+        result.errorMessage = "Decryption failed";
+        return result;
+    }
+
+    // Constant-time validation of all padding bytes
+    volatile uint8_t paddingError = 0;
+    for (size_t i = result.plaintext.size() - paddingValue; i < result.plaintext.size(); ++i) {
+        paddingError |= result.plaintext[i] ^ paddingValue;
+    }
+
+    if (paddingError != 0) {
+        SecureZeroMemory(result.plaintext.data(), result.plaintext.size());
+        result.result = CryptoResult::AuthenticationFailed;
+        result.errorMessage = "Decryption failed";
+        return result;
+    }
+
+    result.plaintext.resize(result.plaintext.size() - paddingValue);
     result.result = CryptoResult::Success;
     return result;
 }
@@ -1747,42 +1814,70 @@ CryptoResult CryptoManagerImpl::EncryptFile(
     std::span<const uint8_t> key,
     SymmetricAlgorithm algorithm) {
 
-    std::string content;
-    Utils::FileUtils::Error err;
-    if (!Utils::FileUtils::ReadAllTextUtf8(std::wstring(inputPath), content, &err)) {
-        SS_LOG_ERROR(LOG_CATEGORY, L"Failed to read input file: %ls", inputPath.data());
+    const std::wstring inputPathStr(inputPath);
+    const std::wstring outputPathStr(outputPath);
+
+    ScopedFileHandle hInput(CreateFileW(
+        inputPathStr.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr));
+
+    if (!hInput.IsValid()) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"Failed to open input file for encryption: %ls", inputPathStr.c_str());
         return CryptoResult::InvalidData;
     }
 
-    std::span<const uint8_t> plaintext(
-        reinterpret_cast<const uint8_t*>(content.data()),
-        content.size());
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(hInput.Get(), &fileSize)) {
+        return CryptoResult::InvalidData;
+    }
 
-    auto result = Encrypt(plaintext, key, algorithm, {}, {});
+    if (fileSize.QuadPart < 0 ||
+        static_cast<uint64_t>(fileSize.QuadPart) > CryptoConstants::MAX_ENCRYPTION_SIZE) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"File too large for encryption: %ls", inputPathStr.c_str());
+        return CryptoResult::InvalidData;
+    }
+
+    const auto readSize = static_cast<size_t>(fileSize.QuadPart);
+    std::vector<uint8_t> fileContent(readSize);
+    DWORD bytesRead = 0;
+    if (readSize > 0 && !ReadFile(hInput.Get(), fileContent.data(),
+                                   static_cast<DWORD>(readSize), &bytesRead, nullptr)) {
+        return CryptoResult::InvalidData;
+    }
+    fileContent.resize(bytesRead);
+
+    auto result = Encrypt(fileContent, key, algorithm, {}, {});
+    SecureZeroMemory(fileContent.data(), fileContent.capacity());
+
     if (!result.IsSuccess()) {
         return result.result;
     }
 
     auto combined = result.GetCombinedOutput();
-    HANDLE hFile = CreateFileW(
-        outputPath.data(),
+
+    ScopedFileHandle hOutput(CreateFileW(
+        outputPathStr.c_str(),
         GENERIC_WRITE,
         0,
         nullptr,
         CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
-        nullptr);
+        nullptr));
 
-    if (hFile == INVALID_HANDLE_VALUE) {
+    if (!hOutput.IsValid()) {
         return CryptoResult::InternalError;
     }
 
     DWORD written = 0;
-    BOOL success = WriteFile(hFile, combined.data(),
+    BOOL success = WriteFile(hOutput.Get(), combined.data(),
                              static_cast<DWORD>(combined.size()), &written, nullptr);
-    CloseHandle(hFile);
 
-    if (!success || written != combined.size()) {
+    if (!success || written != static_cast<DWORD>(combined.size())) {
         return CryptoResult::InternalError;
     }
 
@@ -1795,35 +1890,44 @@ CryptoResult CryptoManagerImpl::DecryptFile(
     std::span<const uint8_t> key,
     SymmetricAlgorithm algorithm) {
 
-    HANDLE hFile = CreateFileW(
-        inputPath.data(),
+    const std::wstring inputPathStr(inputPath);
+    const std::wstring outputPathStr(outputPath);
+
+    ScopedFileHandle hInput(CreateFileW(
+        inputPathStr.c_str(),
         GENERIC_READ,
         FILE_SHARE_READ,
         nullptr,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
-        nullptr);
+        nullptr));
 
-    if (hFile == INVALID_HANDLE_VALUE) {
+    if (!hInput.IsValid()) {
         return CryptoResult::InvalidData;
     }
 
-    LARGE_INTEGER fileSize;
-    if (!GetFileSizeEx(hFile, &fileSize)) {
-        CloseHandle(hFile);
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(hInput.Get(), &fileSize)) {
         return CryptoResult::InvalidData;
     }
 
-    std::vector<uint8_t> ciphertext(static_cast<size_t>(fileSize.QuadPart));
-    DWORD read = 0;
-    if (!ReadFile(hFile, ciphertext.data(), static_cast<DWORD>(ciphertext.size()), &read, nullptr)) {
-        CloseHandle(hFile);
+    if (fileSize.QuadPart < 0 ||
+        static_cast<uint64_t>(fileSize.QuadPart) > CryptoConstants::MAX_ENCRYPTION_SIZE) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"Encrypted file too large: %ls", inputPathStr.c_str());
         return CryptoResult::InvalidData;
     }
-    CloseHandle(hFile);
 
-    size_t ivSize = GetIVSize(algorithm);
-    size_t tagSize = GetTagSize(algorithm);
+    const auto readSize = static_cast<size_t>(fileSize.QuadPart);
+    std::vector<uint8_t> ciphertext(readSize);
+    DWORD bytesRead = 0;
+    if (readSize > 0 && !ReadFile(hInput.Get(), ciphertext.data(),
+                                   static_cast<DWORD>(readSize), &bytesRead, nullptr)) {
+        return CryptoResult::InvalidData;
+    }
+    ciphertext.resize(bytesRead);
+
+    const size_t ivSize = GetIVSize(algorithm);
+    const size_t tagSize = GetTagSize(algorithm);
 
     if (ciphertext.size() < ivSize + tagSize) {
         return CryptoResult::InvalidData;
@@ -1842,25 +1946,26 @@ CryptoResult CryptoManagerImpl::DecryptFile(
         return result.result;
     }
 
-    hFile = CreateFileW(
-        outputPath.data(),
+    ScopedFileHandle hOutput(CreateFileW(
+        outputPathStr.c_str(),
         GENERIC_WRITE,
         0,
         nullptr,
         CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
-        nullptr);
+        nullptr));
 
-    if (hFile == INVALID_HANDLE_VALUE) {
+    if (!hOutput.IsValid()) {
+        SecureZeroMemory(result.plaintext.data(), result.plaintext.size());
         return CryptoResult::InternalError;
     }
 
     DWORD written = 0;
-    BOOL success = WriteFile(hFile, result.plaintext.data(),
+    BOOL success = WriteFile(hOutput.Get(), result.plaintext.data(),
                              static_cast<DWORD>(result.plaintext.size()), &written, nullptr);
-    CloseHandle(hFile);
+    SecureZeroMemory(result.plaintext.data(), result.plaintext.size());
 
-    if (!success || written != result.plaintext.size()) {
+    if (!success || written != static_cast<DWORD>(result.plaintext.size())) {
         return CryptoResult::InternalError;
     }
 
@@ -2171,28 +2276,28 @@ std::optional<std::vector<uint8_t>> CryptoManagerImpl::HashFile(
     std::wstring_view filePath,
     HashAlgorithm algorithm) {
 
-    HANDLE hFile = CreateFileW(
-        filePath.data(),
+    const std::wstring filePathStr(filePath);
+
+    ScopedFileHandle hFile(CreateFileW(
+        filePathStr.c_str(),
         GENERIC_READ,
         FILE_SHARE_READ,
         nullptr,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-        nullptr);
+        nullptr));
 
-    if (hFile == INVALID_HANDLE_VALUE) {
+    if (!hFile.IsValid()) {
         return std::nullopt;
     }
 
     LPCWSTR algId = GetBCryptHashAlgorithm(algorithm);
     if (!algId) {
-        CloseHandle(hFile);
         return std::nullopt;
     }
 
     BCryptAlgorithmHandle alg;
     if (!alg.Open(algId)) {
-        CloseHandle(hFile);
         return std::nullopt;
     }
 
@@ -2218,23 +2323,19 @@ std::optional<std::vector<uint8_t>> CryptoManagerImpl::HashFile(
         0);
 
     if (!NT_SUCCESS(status)) {
-        CloseHandle(hFile);
         return std::nullopt;
     }
 
     std::vector<uint8_t> buffer(FILE_CHUNK_SIZE);
     DWORD bytesRead = 0;
 
-    while (ReadFile(hFile, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr)
+    while (ReadFile(hFile.Get(), buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr)
            && bytesRead > 0) {
         status = BCryptHashData(hashHandle.Get(), buffer.data(), bytesRead, 0);
         if (!NT_SUCCESS(status)) {
-            CloseHandle(hFile);
             return std::nullopt;
         }
     }
-
-    CloseHandle(hFile);
 
     std::vector<uint8_t> result(hashSize);
     status = BCryptFinishHash(hashHandle.Get(),
@@ -2253,6 +2354,11 @@ std::optional<std::vector<uint8_t>> CryptoManagerImpl::HashFile(
 // ============================================================================
 
 std::vector<uint8_t> CryptoManagerImpl::GenerateRandomBytes(size_t length) {
+    if (length == 0 || length > CryptoConstants::MAX_ENCRYPTION_SIZE) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"Invalid random byte length requested: %zu", length);
+        return {};
+    }
+
     std::vector<uint8_t> result(length);
 
     std::shared_lock algLock(m_algMutex);
@@ -2268,6 +2374,7 @@ std::vector<uint8_t> CryptoManagerImpl::GenerateRandomBytes(size_t length) {
         0);
 
     if (!NT_SUCCESS(status)) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"BCryptGenRandom failed with NTSTATUS 0x%08lX", status);
         return {};
     }
 
@@ -2641,10 +2748,13 @@ std::vector<uint8_t> CryptoManagerImpl::DeriveKey(
         case KDFAlgorithm::Argon2id:
         case KDFAlgorithm::Argon2i:
         case KDFAlgorithm::Argon2d: {
-            // Fallback to PBKDF2
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"Argon2 not available in Windows CNG - falling back to PBKDF2-SHA256 "
+                L"with %u iterations. Consider using PBKDF2 explicitly.",
+                CryptoConstants::DEFAULT_PBKDF2_ITERATIONS);
             KDFParameters pbkdf2Params;
             pbkdf2Params.algorithm = KDFAlgorithm::PBKDF2_SHA256;
-            pbkdf2Params.iterations = params.iterations;
+            pbkdf2Params.iterations = CryptoConstants::DEFAULT_PBKDF2_ITERATIONS;
             pbkdf2Params.outputLength = params.outputLength;
             return DeriveKey(password, salt, pbkdf2Params);
         }
@@ -2674,9 +2784,16 @@ std::vector<uint8_t> CryptoManagerImpl::ComputeHKDF(
         return result;
     }
 
-    // HKDF Expand
+    // HKDF Expand (RFC 5869: N must not exceed 255)
     size_t hashLen = GetHashSize(algorithm);
+    if (hashLen == 0) {
+        return result;
+    }
     size_t n = (outputLength + hashLen - 1) / hashLen;
+    if (n > 255) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"HKDF output length exceeds RFC 5869 limit (255 * HashLen)");
+        return result;
+    }
 
     result.reserve(n * hashLen);
     std::vector<uint8_t> t;
@@ -2825,6 +2942,11 @@ std::string CryptoManagerImpl::StoreKey(
 
     {
         std::unique_lock lock(m_keyStoreMutex);
+        if (m_keyStore.size() >= CryptoConstants::MAX_KEY_COUNT) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Key store capacity limit reached (%zu keys)",
+                         CryptoConstants::MAX_KEY_COUNT);
+            return "";
+        }
         m_keyStore[keyId] = std::move(managedKey);
         m_stats.activeKeys.store(m_keyStore.size(), std::memory_order_relaxed);
     }
@@ -2838,9 +2960,11 @@ std::optional<std::vector<uint8_t>> CryptoManagerImpl::RetrieveKey(const std::st
         return std::nullopt;
     }
 
-    std::shared_lock lock(m_keyStoreMutex);
+    // Exclusive lock required: we mutate usageCount and lastUsed
+    std::unique_lock lock(m_keyStoreMutex);
     auto it = m_keyStore.find(keyId);
     if (it == m_keyStore.end()) {
+        lock.unlock();
         NotifyAudit("RetrieveKey", keyId, false);
         return std::nullopt;
     }
@@ -2849,13 +2973,17 @@ std::optional<std::vector<uint8_t>> CryptoManagerImpl::RetrieveKey(const std::st
     managedKey->metadata.usageCount++;
     managedKey->metadata.lastUsed = Clock::now();
 
+    std::optional<std::vector<uint8_t>> result;
+
     switch (managedKey->metadata.storage) {
         case KeyStorage::Memory:
-            NotifyAudit("RetrieveKey", keyId, true);
-            return managedKey->keyData;
+            result = managedKey->keyData;
+            break;
 
         case KeyStorage::DPAPI: {
-            auto unprotected = DPAPIUnprotect(managedKey->protectedData, {});
+            auto protectedCopy = managedKey->protectedData;
+            lock.unlock();
+            auto unprotected = DPAPIUnprotect(protectedCopy, {});
             if (!unprotected) {
                 NotifyAudit("RetrieveKey", keyId, false);
                 return std::nullopt;
@@ -2865,9 +2993,13 @@ std::optional<std::vector<uint8_t>> CryptoManagerImpl::RetrieveKey(const std::st
         }
 
         default:
-            NotifyAudit("RetrieveKey", keyId, true);
-            return managedKey->keyData;
+            result = managedKey->keyData;
+            break;
     }
+
+    lock.unlock();
+    NotifyAudit("RetrieveKey", keyId, true);
+    return result;
 }
 
 bool CryptoManagerImpl::DeleteKey(const std::string& keyId) {
@@ -2916,6 +3048,10 @@ std::vector<KeyMetadata> CryptoManagerImpl::ListKeys() const {
 }
 
 std::string CryptoManagerImpl::RotateKey(const std::string& oldKeyId) {
+    if (oldKeyId.empty()) {
+        return "";
+    }
+
     auto oldKeyData = RetrieveKey(oldKeyId);
     if (!oldKeyData) {
         return "";
@@ -2923,15 +3059,20 @@ std::string CryptoManagerImpl::RotateKey(const std::string& oldKeyId) {
 
     auto oldMeta = GetKeyMetadata(oldKeyId);
     if (!oldMeta) {
+        SecureZeroMemory(oldKeyData->data(), oldKeyData->size());
         return "";
     }
 
     auto newKeyData = GenerateRandomBytes(oldKeyData->size());
+    SecureZeroMemory(oldKeyData->data(), oldKeyData->size());
+
     if (newKeyData.empty()) {
         return "";
     }
 
     std::string newKeyId = StoreKey(newKeyData, oldMeta->type, oldMeta->storage, oldMeta->description);
+    SecureZeroMemory(newKeyData.data(), newKeyData.size());
+
     if (newKeyId.empty()) {
         return "";
     }
@@ -3090,24 +3231,240 @@ bool CryptoManagerImpl::IsTPMAvailable() const {
 }
 
 std::string CryptoManagerImpl::CreateTPMKey(KeyType type) {
-    if (!m_tpmAvailable.load(std::memory_order_acquire)) {
+    if (!m_tpmAvailable.load(std::memory_order_acquire) || !m_tpmProvider) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"TPM not available for key creation");
         return "";
     }
-    return "";
+
+    LPCWSTR algId = nullptr;
+    DWORD keyLength = 0;
+
+    switch (type) {
+        case KeyType::RSAPrivate:
+            algId = NCRYPT_RSA_ALGORITHM;
+            keyLength = CryptoConstants::RSA_2048_KEY_BITS;
+            break;
+        case KeyType::ECDSAPrivate:
+            algId = NCRYPT_ECDSA_P256_ALGORITHM;
+            keyLength = 256;
+            break;
+        case KeyType::Symmetric:
+            algId = NCRYPT_AES_ALGORITHM;
+            keyLength = 256;
+            break;
+        default:
+            SS_LOG_ERROR(LOG_CATEGORY, L"Unsupported key type for TPM creation");
+            return "";
+    }
+
+    std::string keyId = GenerateKeyId();
+    if (keyId.empty()) {
+        return "";
+    }
+
+    std::wstring keyName(keyId.begin(), keyId.end());
+
+    NCRYPT_KEY_HANDLE keyHandle = 0;
+    SECURITY_STATUS status = NCryptCreatePersistedKey(
+        m_tpmProvider,
+        &keyHandle,
+        algId,
+        keyName.c_str(),
+        0,
+        NCRYPT_OVERWRITE_KEY_FLAG);
+
+    if (status != ERROR_SUCCESS) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"NCryptCreatePersistedKey failed: 0x%08lX", status);
+        return "";
+    }
+
+    if (type == KeyType::RSAPrivate) {
+        status = NCryptSetProperty(keyHandle, NCRYPT_LENGTH_PROPERTY,
+            reinterpret_cast<PBYTE>(&keyLength), sizeof(keyLength), 0);
+        if (status != ERROR_SUCCESS) {
+            NCryptFreeObject(keyHandle);
+            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to set TPM key length: 0x%08lX", status);
+            return "";
+        }
+    }
+
+    status = NCryptFinalizeKey(keyHandle, 0);
+    if (status != ERROR_SUCCESS) {
+        NCryptFreeObject(keyHandle);
+        SS_LOG_ERROR(LOG_CATEGORY, L"NCryptFinalizeKey failed: 0x%08lX", status);
+        return "";
+    }
+
+    auto managedKey = std::make_unique<ManagedKey>();
+    managedKey->id = keyId;
+    managedKey->ncryptHandle = keyHandle;
+    managedKey->metadata.id = keyId;
+    managedKey->metadata.type = type;
+    managedKey->metadata.storage = KeyStorage::TPM;
+    managedKey->metadata.keySizeBits = keyLength;
+    managedKey->metadata.createdAt = std::chrono::system_clock::now();
+    managedKey->metadata.description = "TPM-protected key";
+
+    {
+        std::unique_lock lock(m_keyStoreMutex);
+        if (m_keyStore.size() >= CryptoConstants::MAX_KEY_COUNT) {
+            NCryptDeleteKey(keyHandle, 0);
+            SS_LOG_ERROR(LOG_CATEGORY, L"Key store limit reached, cannot create TPM key");
+            return "";
+        }
+        m_keyStore[keyId] = std::move(managedKey);
+        m_stats.activeKeys.store(m_keyStore.size(), std::memory_order_relaxed);
+    }
+
+    m_stats.tpmOperations.fetch_add(1, std::memory_order_relaxed);
+    NotifyAudit("CreateTPMKey", keyId, true);
+    SS_LOG_INFO(LOG_CATEGORY, L"Created TPM key: %hs", keyId.c_str());
+    return keyId;
 }
 
 std::optional<std::vector<uint8_t>> CryptoManagerImpl::TPMSeal(std::span<const uint8_t> data) {
-    if (!m_tpmAvailable.load(std::memory_order_acquire)) {
+    if (!m_tpmAvailable.load(std::memory_order_acquire) || !m_tpmSealKey) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"TPM seal key not available");
         return std::nullopt;
     }
-    return std::nullopt;
+
+    if (data.empty() || data.size() > CryptoConstants::MAX_ENCRYPTION_SIZE) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"Invalid data size for TPM seal");
+        return std::nullopt;
+    }
+
+    // Hybrid encryption: AES-256-GCM for data, TPM RSA-OAEP for AES key
+    auto aesKey = GenerateRandomBytes(CryptoConstants::AES_256_KEY_SIZE);
+    if (aesKey.size() != CryptoConstants::AES_256_KEY_SIZE) {
+        return std::nullopt;
+    }
+
+    auto encResult = Encrypt(data, aesKey, SymmetricAlgorithm::AES_256_GCM, {}, {});
+    if (!encResult.IsSuccess()) {
+        SecureZeroMemory(aesKey.data(), aesKey.size());
+        return std::nullopt;
+    }
+
+    // Seal the AES key with TPM RSA key
+    BCRYPT_OAEP_PADDING_INFO oaepInfo{};
+    oaepInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM;
+
+    DWORD sealedKeySize = 0;
+    SECURITY_STATUS status = NCryptEncrypt(m_tpmSealKey,
+        aesKey.data(), static_cast<DWORD>(aesKey.size()),
+        &oaepInfo, nullptr, 0, &sealedKeySize, NCRYPT_PAD_OAEP_FLAG);
+
+    if (status != ERROR_SUCCESS) {
+        SecureZeroMemory(aesKey.data(), aesKey.size());
+        SS_LOG_ERROR(LOG_CATEGORY, L"TPMSeal: NCryptEncrypt size query failed: 0x%08lX", status);
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> sealedKey(sealedKeySize);
+    status = NCryptEncrypt(m_tpmSealKey,
+        aesKey.data(), static_cast<DWORD>(aesKey.size()),
+        &oaepInfo, sealedKey.data(), sealedKeySize, &sealedKeySize, NCRYPT_PAD_OAEP_FLAG);
+
+    SecureZeroMemory(aesKey.data(), aesKey.size());
+
+    if (status != ERROR_SUCCESS) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"TPMSeal: NCryptEncrypt failed: 0x%08lX", status);
+        return std::nullopt;
+    }
+    sealedKey.resize(sealedKeySize);
+
+    // Output: [4 bytes: sealed key len][sealed key][IV][ciphertext][tag]
+    auto combined = encResult.GetCombinedOutput();
+    const uint32_t skLen = static_cast<uint32_t>(sealedKey.size());
+
+    std::vector<uint8_t> output;
+    output.reserve(sizeof(skLen) + sealedKey.size() + combined.size());
+    output.insert(output.end(),
+                  reinterpret_cast<const uint8_t*>(&skLen),
+                  reinterpret_cast<const uint8_t*>(&skLen) + sizeof(skLen));
+    output.insert(output.end(), sealedKey.begin(), sealedKey.end());
+    output.insert(output.end(), combined.begin(), combined.end());
+
+    m_stats.tpmOperations.fetch_add(1, std::memory_order_relaxed);
+    return output;
 }
 
 std::optional<std::vector<uint8_t>> CryptoManagerImpl::TPMUnseal(std::span<const uint8_t> sealedData) {
-    if (!m_tpmAvailable.load(std::memory_order_acquire)) {
+    if (!m_tpmAvailable.load(std::memory_order_acquire) || !m_tpmSealKey) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"TPM seal key not available");
         return std::nullopt;
     }
-    return std::nullopt;
+
+    // Parse: [4 bytes: sealed key len][sealed key][IV(12)][ciphertext][tag(16)]
+    constexpr size_t kHeaderSize = sizeof(uint32_t);
+    if (sealedData.size() < kHeaderSize) {
+        return std::nullopt;
+    }
+
+    uint32_t sealedKeyLen = 0;
+    std::memcpy(&sealedKeyLen, sealedData.data(), sizeof(sealedKeyLen));
+
+    if (sealedKeyLen == 0 || sealedKeyLen > 1024 ||
+        sealedData.size() < kHeaderSize + sealedKeyLen +
+        CryptoConstants::AES_GCM_NONCE_SIZE + CryptoConstants::AES_GCM_TAG_SIZE) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"TPMUnseal: Invalid sealed data format");
+        return std::nullopt;
+    }
+
+    std::span<const uint8_t> sealedKey(
+        sealedData.data() + kHeaderSize, sealedKeyLen);
+    std::span<const uint8_t> encPayload(
+        sealedData.data() + kHeaderSize + sealedKeyLen,
+        sealedData.size() - kHeaderSize - sealedKeyLen);
+
+    // Unseal the AES key with TPM RSA key
+    BCRYPT_OAEP_PADDING_INFO oaepInfo{};
+    oaepInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM;
+
+    DWORD aesKeySize = 0;
+    SECURITY_STATUS status = NCryptDecrypt(m_tpmSealKey,
+        const_cast<PBYTE>(sealedKey.data()), static_cast<DWORD>(sealedKey.size()),
+        &oaepInfo, nullptr, 0, &aesKeySize, NCRYPT_PAD_OAEP_FLAG);
+
+    if (status != ERROR_SUCCESS) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"TPMUnseal: NCryptDecrypt size query failed: 0x%08lX", status);
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> aesKey(aesKeySize);
+    status = NCryptDecrypt(m_tpmSealKey,
+        const_cast<PBYTE>(sealedKey.data()), static_cast<DWORD>(sealedKey.size()),
+        &oaepInfo, aesKey.data(), aesKeySize, &aesKeySize, NCRYPT_PAD_OAEP_FLAG);
+
+    if (status != ERROR_SUCCESS) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"TPMUnseal: NCryptDecrypt failed: 0x%08lX", status);
+        return std::nullopt;
+    }
+    aesKey.resize(aesKeySize);
+
+    // Parse IV + ciphertext + tag from encPayload
+    if (encPayload.size() < CryptoConstants::AES_GCM_NONCE_SIZE + CryptoConstants::AES_GCM_TAG_SIZE) {
+        SecureZeroMemory(aesKey.data(), aesKey.size());
+        return std::nullopt;
+    }
+
+    std::span<const uint8_t> iv(encPayload.data(), CryptoConstants::AES_GCM_NONCE_SIZE);
+    std::span<const uint8_t> tag(
+        encPayload.data() + encPayload.size() - CryptoConstants::AES_GCM_TAG_SIZE,
+        CryptoConstants::AES_GCM_TAG_SIZE);
+    std::span<const uint8_t> ct(
+        encPayload.data() + CryptoConstants::AES_GCM_NONCE_SIZE,
+        encPayload.size() - CryptoConstants::AES_GCM_NONCE_SIZE - CryptoConstants::AES_GCM_TAG_SIZE);
+
+    auto decResult = Decrypt(ct, aesKey, SymmetricAlgorithm::AES_256_GCM, iv, tag, {});
+    SecureZeroMemory(aesKey.data(), aesKey.size());
+
+    if (!decResult.IsSuccess()) {
+        return std::nullopt;
+    }
+
+    m_stats.tpmOperations.fetch_add(1, std::memory_order_relaxed);
+    return decResult.plaintext;
 }
 
 // ============================================================================
@@ -3115,9 +3472,15 @@ std::optional<std::vector<uint8_t>> CryptoManagerImpl::TPMUnseal(std::span<const
 // ============================================================================
 
 void* CryptoManagerImpl::SecureAlloc(size_t size) {
+    if (size == 0 || size > CryptoConstants::MAX_ENCRYPTION_SIZE) {
+        return nullptr;
+    }
     void* ptr = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (ptr) {
-        VirtualLock(ptr, size);
+        if (!VirtualLock(ptr, size)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"VirtualLock failed for secure allocation of %zu bytes "
+                        L"(working set limit may be reached)", size);
+        }
     }
     return ptr;
 }
@@ -3138,7 +3501,7 @@ void CryptoManagerImpl::SecureZero(void* ptr, size_t size) {
 
 bool CryptoManagerImpl::ConstantTimeCompare(
     std::span<const uint8_t> a,
-    std::span<const uint8_t> b) {
+    std::span<const uint8_t> b) noexcept {
 
     if (a.size() != b.size()) {
         return false;
@@ -3188,8 +3551,24 @@ SignatureResult CryptoManagerImpl::Sign(
         algId = BCRYPT_RSA_ALGORITHM;
         blobType = BCRYPT_RSAFULLPRIVATE_BLOB;
     } else if (keyMeta->type == KeyType::ECDSAPrivate) {
-        algId = BCRYPT_ECDSA_P256_ALGORITHM;
         blobType = BCRYPT_ECCPRIVATE_BLOB;
+        // Select correct curve algorithm from key metadata
+        if (auto* asymAlg = std::get_if<AsymmetricAlgorithm>(&keyMeta->algorithm)) {
+            switch (*asymAlg) {
+                case AsymmetricAlgorithm::ECDSA_P384:
+                    algId = BCRYPT_ECDSA_P384_ALGORITHM;
+                    break;
+                case AsymmetricAlgorithm::ECDSA_P521:
+                    algId = BCRYPT_ECDSA_P521_ALGORITHM;
+                    break;
+                case AsymmetricAlgorithm::ECDSA_P256:
+                default:
+                    algId = BCRYPT_ECDSA_P256_ALGORITHM;
+                    break;
+            }
+        } else {
+            algId = BCRYPT_ECDSA_P256_ALGORITHM;
+        }
     } else {
         result.result = CryptoResult::InvalidKey;
         return result;
@@ -3609,13 +3988,44 @@ bool CryptoManagerImpl::InitializeTPM() {
     SECURITY_STATUS status = NCryptOpenStorageProvider(&m_tpmProvider,
         MS_PLATFORM_CRYPTO_PROVIDER, 0);
 
-    if (status == ERROR_SUCCESS) {
-        m_tpmAvailable.store(true, std::memory_order_release);
-        SS_LOG_INFO(LOG_CATEGORY, L"TPM initialized successfully");
-        return true;
+    if (status != ERROR_SUCCESS) {
+        SS_LOG_WARN(LOG_CATEGORY, L"TPM provider not available: 0x%08lX", status);
+        return false;
     }
 
-    return false;
+    // Create or open a persistent RSA sealing key for TPMSeal/TPMUnseal
+    status = NCryptOpenKey(m_tpmProvider, &m_tpmSealKey,
+                           L"SS_TPM_SEAL_KEY", 0, 0);
+
+    if (status != ERROR_SUCCESS) {
+        // Key doesn't exist yet, create it
+        status = NCryptCreatePersistedKey(m_tpmProvider, &m_tpmSealKey,
+                                          NCRYPT_RSA_ALGORITHM,
+                                          L"SS_TPM_SEAL_KEY", 0, 0);
+        if (status != ERROR_SUCCESS) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Failed to create TPM seal key: 0x%08lX", status);
+            m_tpmAvailable.store(true, std::memory_order_release);
+            m_tpmSealKey = 0;
+            SS_LOG_INFO(LOG_CATEGORY, L"TPM initialized (seal key unavailable)");
+            return true;
+        }
+
+        DWORD keyLen = CryptoConstants::RSA_2048_KEY_BITS;
+        NCryptSetProperty(m_tpmSealKey, NCRYPT_LENGTH_PROPERTY,
+                          reinterpret_cast<PBYTE>(&keyLen), sizeof(keyLen), 0);
+
+        status = NCryptFinalizeKey(m_tpmSealKey, 0);
+        if (status != ERROR_SUCCESS) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Failed to finalize TPM seal key: 0x%08lX", status);
+            NCryptFreeObject(m_tpmSealKey);
+            m_tpmSealKey = 0;
+        }
+    }
+
+    m_tpmAvailable.store(true, std::memory_order_release);
+    SS_LOG_INFO(LOG_CATEGORY, L"TPM initialized successfully (seal key: %ls)",
+                m_tpmSealKey ? L"available" : L"unavailable");
+    return true;
 }
 
 bool CryptoManagerImpl::DetectHardwareCapabilities() {

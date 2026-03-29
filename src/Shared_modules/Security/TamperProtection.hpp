@@ -296,6 +296,13 @@ namespace TamperProtectionConstants {
     /// @brief Alert aggregation window (seconds)
     inline constexpr uint32_t ALERT_AGGREGATION_WINDOW_SECONDS = 60;
 
+    // ========================================================================
+    // EVENT HISTORY
+    // ========================================================================
+    
+    /// @brief Maximum event history entries
+    inline constexpr size_t MAX_EVENT_HISTORY = 1000;
+
 }  // namespace TamperProtectionConstants
 
 // ============================================================================
@@ -968,9 +975,9 @@ public:
     
     /**
      * @brief Shutdown tamper protection
-     * @param authorizationToken Security token
+     * @param authorizationToken Security token (empty triggers INTERNAL_SHUTDOWN for RAII dtor)
      */
-    void Shutdown(std::string_view authorizationToken);
+    void Shutdown(std::string_view authorizationToken = {});
     
     /**
      * @brief Check if initialized
@@ -1327,6 +1334,7 @@ public:
     
     /**
      * @brief Register tamper event callback
+     * @return Callback ID for unregistration
      */
     [[nodiscard]] uint64_t RegisterEventCallback(TamperEventCallback callback);
     
@@ -1337,6 +1345,7 @@ public:
     
     /**
      * @brief Register verification callback
+     * @return Callback ID for unregistration
      */
     [[nodiscard]] uint64_t RegisterVerificationCallback(VerificationCallback callback);
     
@@ -1347,6 +1356,7 @@ public:
     
     /**
      * @brief Register repair callback
+     * @return Callback ID for unregistration
      */
     [[nodiscard]] uint64_t RegisterRepairCallback(RepairCallback callback);
     
@@ -1357,6 +1367,7 @@ public:
     
     /**
      * @brief Register subsystem status callback
+     * @return Callback ID for unregistration
      */
     [[nodiscard]] uint64_t RegisterStatusCallback(SubsystemStatusCallback callback);
     
@@ -1364,6 +1375,11 @@ public:
      * @brief Unregister status callback
      */
     void UnregisterStatusCallback(uint64_t callbackId);
+    
+    /**
+     * @brief Unregister all callbacks at once
+     */
+    void UnregisterAllCallbacks();
     
     /**
      * @brief Set custom response handler
@@ -1508,6 +1524,7 @@ public:
     [[nodiscard]] bool IsPaused() const noexcept { return m_paused; }
 
 private:
+    std::string m_authToken;
     bool m_paused = false;
 };
 
@@ -1517,7 +1534,8 @@ private:
  */
 class ResourceProtectionGuard final {
 public:
-    ResourceProtectionGuard(std::wstring_view path, ProtectedResourceType type);
+    ResourceProtectionGuard(std::wstring_view resourcePath, ProtectedResourceType type,
+                            std::string_view authToken = {});
     ~ResourceProtectionGuard();
     
     ResourceProtectionGuard(const ResourceProtectionGuard&) = delete;
@@ -1526,10 +1544,10 @@ public:
     [[nodiscard]] bool IsProtected() const noexcept { return m_protected; }
 
 private:
-    std::wstring m_path;
+    std::wstring m_resourcePath;
     ProtectedResourceType m_type;
-    bool m_protected = false;
     std::string m_authToken;
+    bool m_protected = false;
 };
 
 }  // namespace Security

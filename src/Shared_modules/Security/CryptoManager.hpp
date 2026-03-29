@@ -1215,7 +1215,7 @@ public:
      * @brief Compare in constant time
      */
     [[nodiscard]] bool ConstantTimeCompare(std::span<const uint8_t> a, 
-                                           std::span<const uint8_t> b);
+                                           std::span<const uint8_t> b) noexcept;
     
     // ========================================================================
     // CALLBACKS
@@ -1350,11 +1350,11 @@ template<size_t Size>
 class SecureBuffer final {
 public:
     SecureBuffer() { 
-        CryptoManager::Instance().SecureZero(m_data.data(), Size);
+        SecureZeroMemory(m_data.data(), Size);
     }
     
     ~SecureBuffer() {
-        CryptoManager::Instance().SecureZero(m_data.data(), Size);
+        SecureZeroMemory(m_data.data(), Size);
     }
     
     SecureBuffer(const SecureBuffer&) = delete;

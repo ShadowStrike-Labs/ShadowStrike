@@ -277,6 +277,83 @@ namespace {
     constexpr const char* WSF_SCRIPT_TAG     = "<script";
     constexpr const char* HTA_APP_TAG        = "<hta:application";
 
+    /// Maximum replacements during deobfuscation to prevent infinite loops
+    constexpr size_t MAX_DEOBFUSCATION_REPLACEMENTS = 256;
+
+    /// WSE (Windows Script Encoder) pick table — determines which of the 3
+    /// substitution tables to use for each encoded character position.
+    constexpr uint8_t kWsePick[64] = {
+        1,2,0,1,2,0,2,0,0,2,0,2,1,0,2,0,
+        1,0,2,0,1,1,2,0,0,2,1,0,2,0,0,2,
+        1,1,0,2,0,2,0,1,0,1,1,2,0,1,0,2,
+        1,0,2,0,1,1,2,0,0,1,1,2,0,1,0,2
+    };
+
+    /// WSE substitution tables — map encoded byte → decoded byte.
+    /// Only printable ASCII (0x21-0x7E) is substituted; all other bytes
+    /// pass through unchanged.  Derived from the well-known scrdec18
+    /// algorithm (public domain).
+    constexpr uint8_t kWseDecode[3][128] = {
+        // Table 0
+        {
+            0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,
+            0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F,
+            0x20,0x79,0x22,0x23,0x24,0x25,0x26,0x60,0x5F,0x28,0x2A,0x2B,0x7E,0x2D,0x7C,0x41,
+            0x5E,0x30,0x5C,0x27,0x5B,0x3E,0x2C,0x36,0x3A,0x3D,0x29,0x75,0x3C,0x49,0x34,0x2E,
+            0x37,0x32,0x21,0x2F,0x38,0x35,0x5A,0x52,0x59,0x56,0x57,0x4E,0x4B,0x50,0x4D,0x55,
+            0x4C,0x54,0x45,0x39,0x33,0x53,0x46,0x31,0x47,0x51,0x58,0x44,0x48,0x42,0x43,0x3F,
+            0x40,0x70,0x74,0x67,0x64,0x6D,0x6A,0x7A,0x78,0x61,0x65,0x6B,0x6E,0x71,0x62,0x6F,
+            0x72,0x66,0x73,0x68,0x3B,0x69,0x77,0x63,0x76,0x6C,0x7B,0x5D,0x4F,0x7D,0x4A,0x7F
+        },
+        // Table 1
+        {
+            0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,
+            0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F,
+            0x20,0x6E,0x22,0x23,0x24,0x25,0x26,0x35,0x75,0x28,0x2A,0x2B,0x40,0x2D,0x5D,0x30,
+            0x43,0x45,0x29,0x78,0x2C,0x4C,0x5E,0x32,0x7C,0x27,0x5F,0x7A,0x3C,0x47,0x60,0x2E,
+            0x2F,0x4B,0x21,0x39,0x62,0x53,0x56,0x4D,0x5C,0x73,0x67,0x36,0x33,0x6B,0x7E,0x52,
+            0x58,0x4F,0x71,0x51,0x55,0x5B,0x50,0x46,0x4E,0x34,0x5A,0x3F,0x3D,0x74,0x57,0x31,
+            0x42,0x37,0x41,0x38,0x7B,0x70,0x76,0x61,0x3B,0x7D,0x6D,0x64,0x69,0x3E,0x66,0x6F,
+            0x48,0x65,0x6C,0x49,0x68,0x3A,0x44,0x54,0x72,0x4A,0x6A,0x63,0x59,0x79,0x77,0x7F
+        },
+        // Table 2
+        {
+            0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,
+            0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F,
+            0x20,0x65,0x22,0x23,0x24,0x25,0x26,0x41,0x77,0x28,0x2A,0x2B,0x2F,0x2D,0x4F,0x42,
+            0x67,0x2C,0x5F,0x34,0x64,0x5C,0x7E,0x60,0x4C,0x70,0x5E,0x37,0x3C,0x53,0x40,0x2E,
+            0x73,0x38,0x21,0x30,0x6A,0x3D,0x29,0x4B,0x6E,0x72,0x44,0x6B,0x4E,0x79,0x39,0x7B,
+            0x46,0x35,0x4A,0x63,0x7C,0x56,0x6D,0x3E,0x7A,0x4D,0x45,0x27,0x55,0x3F,0x32,0x31,
+            0x36,0x6F,0x71,0x3A,0x69,0x75,0x43,0x57,0x3B,0x68,0x7D,0x74,0x6C,0x62,0x5A,0x61,
+            0x78,0x76,0x5D,0x50,0x5B,0x58,0x59,0x48,0x51,0x52,0x66,0x49,0x47,0x54,0x33,0x7F
+        }
+    };
+
+    /// JSON-escape a string for safe embedding in JSON values.
+    [[nodiscard]] std::string JsonEscape(std::string_view str) {
+        std::string out;
+        out.reserve(str.size() + 16);
+        for (const char c : str) {
+            switch (c) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        char buf[8];
+                        std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                      static_cast<unsigned>(static_cast<unsigned char>(c)));
+                        out += buf;
+                    } else {
+                        out += c;
+                    }
+            }
+        }
+        return out;
+    }
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -518,11 +595,16 @@ bool JavaScriptScanner::SelfTest() {
 }
 
 std::string JavaScriptScanner::GetVersionString() noexcept {
-    std::ostringstream oss;
-    oss << JSConstants::VERSION_MAJOR << "."
-        << JSConstants::VERSION_MINOR << "."
-        << JSConstants::VERSION_PATCH;
-    return oss.str();
+    try {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%u.%u.%u",
+                      JSConstants::VERSION_MAJOR,
+                      JSConstants::VERSION_MINOR,
+                      JSConstants::VERSION_PATCH);
+        return std::string(buf);
+    } catch (...) {
+        return "0.0.0";
+    }
 }
 
 // ============================================================================
@@ -736,13 +818,79 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
             return result;
         }
 
+        // Establish scan deadline to prevent ReDoS / long hangs
+        const auto deadline = startTime +
+            std::chrono::milliseconds(config.scanTimeoutMs);
+
         // Compute content hash
         result.sha256 = ComputeContentHash(content);
 
+        // Whitelist check by hash
+        if (!result.sha256.empty()) {
+            try {
+                auto& wls = Whitelist::WhiteListStore::Instance();
+                if (wls.IsHashWhitelisted(result.sha256)) {
+                    result.status = JSScanStatus::SkippedWhitelisted;
+                    result.description = "Content hash whitelisted";
+                    SS_LOG_DEBUG(LOG_CATEGORY, L"Hash whitelisted: %hs",
+                                 result.sha256.c_str());
+                    return result;
+                }
+            } catch (...) {
+                SS_LOG_DEBUG(LOG_CATEGORY, L"WhitelistStore unavailable, skipping check");
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // JSE / WSF / HTA pre-processing
+        // ---------------------------------------------------------------
+        std::string workingContent;
+
+        if (IsJSEContent(content)) {
+            // JSE-encoded content detected
+            if (config.blockEncodedScripts) {
+                result.status = JSScanStatus::Malicious;
+                result.isMalicious = true;
+                result.riskScore = 100;
+                result.category = JSThreatCategory::Dropper;
+                result.threatName = "JS/Encoded.Suspicious";
+                result.description = "JScript.Encode detected — blocked by policy";
+                m_stats.maliciousDetected.fetch_add(1, std::memory_order_relaxed);
+                NotifyCallbacks(result);
+                result.scanDuration = std::chrono::duration_cast<
+                    std::chrono::microseconds>(Clock::now() - startTime);
+                return result;
+            }
+            // Attempt decode for further analysis
+            workingContent = DecodeJSE(content);
+            content = workingContent;
+        } else if (IsWSFContent(content)) {
+            workingContent = ExtractScriptFromWSF(content);
+            if (!workingContent.empty()) {
+                content = workingContent;
+            }
+        } else if (IsHTAContent(content)) {
+            workingContent = ExtractScriptFromHTA(content);
+            if (!workingContent.empty()) {
+                content = workingContent;
+            }
+        }
+
         // Detect engine type
         result.targetEngine = DetectEngineType(content);
-        m_stats.byEngine[static_cast<size_t>(result.targetEngine)].fetch_add(
-            1, std::memory_order_relaxed);
+        {
+            const auto idx = static_cast<size_t>(result.targetEngine);
+            if (idx < m_stats.byEngine.size()) {
+                m_stats.byEngine[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        if (IsDeadlineExceeded(deadline)) {
+            result.status = JSScanStatus::ErrorTimeout;
+            result.description = "Scan deadline exceeded during engine detection";
+            m_stats.timeouts.fetch_add(1, std::memory_order_relaxed);
+            return result;
+        }
 
         // Analyze obfuscation
         if (config.enableDeobfuscation) {
@@ -750,6 +898,13 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
             if (result.obfuscation.primaryType != JSObfuscationType::None) {
                 m_stats.obfuscatedDetected.fetch_add(1, std::memory_order_relaxed);
             }
+        }
+
+        if (IsDeadlineExceeded(deadline)) {
+            result.status = JSScanStatus::ErrorTimeout;
+            result.description = "Scan deadline exceeded during obfuscation analysis";
+            m_stats.timeouts.fetch_add(1, std::memory_order_relaxed);
+            return result;
         }
 
         // Detect ActiveX usage
@@ -769,6 +924,13 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
         // Detect network activity
         result.networkActivity = DetectNetworkActivity(content);
 
+        if (IsDeadlineExceeded(deadline)) {
+            result.status = JSScanStatus::ErrorTimeout;
+            result.description = "Scan deadline exceeded during pattern analysis";
+            m_stats.timeouts.fetch_add(1, std::memory_order_relaxed);
+            return result;
+        }
+
         // Extract IOCs
         result.extractedIOCs = ExtractIOCs(content);
 
@@ -783,6 +945,13 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
             result.detectedFamily = familyName;
         }
 
+        if (IsDeadlineExceeded(deadline)) {
+            result.status = JSScanStatus::ErrorTimeout;
+            result.description = "Scan deadline exceeded during family detection";
+            m_stats.timeouts.fetch_add(1, std::memory_order_relaxed);
+            return result;
+        }
+
         // Calculate risk score
         result.riskScore = CalculateRiskScore(
             result.activeXUsage,
@@ -791,10 +960,23 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
             content);
         result.riskScore += familyRiskBoost;
 
-        // Cap risk score at 100
-        if (result.riskScore > 100) {
-            result.riskScore = 100;
+        // Apply blocking policies as additive risk
+        if (config.blockActiveX) {
+            for (const auto& ax : result.activeXUsage) {
+                if (ax.isSuspicious) {
+                    result.riskScore += 30;
+                    break;
+                }
+            }
         }
+
+        if (config.blockObfuscatedScripts &&
+            result.obfuscation.confidence >= 60.0) {
+            result.riskScore += 40;
+        }
+
+        // Cap risk score at 100
+        result.riskScore = std::min(result.riskScore, 100);
 
         // Determine final status
         if (result.riskScore >= RISK_THRESHOLD_MALICIOUS) {
@@ -822,23 +1004,27 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
 
         // Check for downloader characteristics
         if (!result.networkActivity.empty() && !result.activeXUsage.empty()) {
+            bool hasSuspiciousAX = false;
+            bool hasTarget = false;
             for (const auto& ax : result.activeXUsage) {
-                if (ax.isSuspicious) {
-                    for (const auto& net : result.networkActivity) {
-                        if (!net.target.empty()) {
-                            result.category = JSThreatCategory::Downloader;
-                            m_stats.downloadersDetected.fetch_add(1, std::memory_order_relaxed);
-                            break;
-                        }
-                    }
-                    break;
-                }
+                if (ax.isSuspicious) { hasSuspiciousAX = true; break; }
+            }
+            for (const auto& net : result.networkActivity) {
+                if (!net.target.empty()) { hasTarget = true; break; }
+            }
+            if (hasSuspiciousAX && hasTarget) {
+                result.category = JSThreatCategory::Downloader;
+                m_stats.downloadersDetected.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
-        // Update category statistics
-        m_stats.byCategory[static_cast<size_t>(result.category)].fetch_add(
-            1, std::memory_order_relaxed);
+        // Update category statistics (bounds-checked)
+        {
+            const auto catIdx = static_cast<size_t>(result.category);
+            if (catIdx < m_stats.byCategory.size()) {
+                m_stats.byCategory[catIdx].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
 
         // Generate description
         if (result.isMalicious) {
@@ -926,14 +1112,26 @@ JSEngineType JavaScriptScannerImpl::DetectEngineType(std::string_view content) {
 JSObfuscationDetails JavaScriptScannerImpl::AnalyzeObfuscation(std::string_view content) {
     JSObfuscationDetails details;
 
-    const std::string lower = ToLower(content);
-    const double entropy = CalculateEntropy(content);
+    // Cap content for expensive operations (entropy + regex)
+    const auto cappedSize = std::min(content.size(), JSConstants::MAX_REGEX_CONTENT_SIZE);
+    const std::string lower = ToLower(content.substr(0, cappedSize));
+    const double entropy = CalculateEntropy(content.substr(0, cappedSize));
     details.entropyScore = entropy;
+
+    // Track which technique types we've already added to avoid duplicates
+    std::unordered_set<uint8_t> seenTypes;
+
+    auto addTechnique = [&](JSObfuscationType t) {
+        const auto key = static_cast<uint8_t>(t);
+        if (seenTypes.insert(key).second) {
+            details.detectedTechniques.push_back(t);
+        }
+    };
 
     // Check for obfuscation patterns
     for (const auto& [pattern, type] : OBFUSCATION_PATTERNS) {
         if (lower.find(pattern) != std::string::npos) {
-            details.detectedTechniques.push_back(type);
+            addTechnique(type);
         }
     }
 
@@ -953,13 +1151,20 @@ JSObfuscationDetails JavaScriptScannerImpl::AnalyzeObfuscation(std::string_view 
         pos += 3;
     }
 
-    // Check for suspicious variable naming patterns
+    // Check for suspicious variable naming patterns (capped content, thread_local regex)
     size_t shortVarCount = 0;
-    std::regex shortVarPattern(R"(\b[a-z_$][a-z0-9_$]?\s*=)", std::regex::icase);
-    std::string contentStr(content);
-    auto begin = std::sregex_iterator(contentStr.begin(), contentStr.end(), shortVarPattern);
-    auto end = std::sregex_iterator();
-    shortVarCount = std::distance(begin, end);
+    if (cappedSize > 0) {
+        try {
+            thread_local const std::regex shortVarPattern(
+                R"(\b[a-z_$][a-z0-9_$]?\s*=)", std::regex::icase | std::regex::optimize);
+            std::string cappedStr(content.substr(0, cappedSize));
+            auto begin = std::sregex_iterator(cappedStr.begin(), cappedStr.end(), shortVarPattern);
+            auto end = std::sregex_iterator();
+            shortVarCount = static_cast<size_t>(std::distance(begin, end));
+        } catch (const std::regex_error&) {
+            // Regex failure is not fatal — continue without this heuristic
+        }
+    }
 
     // Calculate obfuscation confidence
     details.confidence = 0.0;
@@ -972,23 +1177,21 @@ JSObfuscationDetails JavaScriptScannerImpl::AnalyzeObfuscation(std::string_view 
 
     if (evalCount > 3) {
         details.confidence += 20.0;
-        details.detectedTechniques.push_back(JSObfuscationType::EvalChain);
+        addTechnique(JSObfuscationType::EvalChain);
     }
 
     if (concatCount > 10) {
         details.confidence += 15.0;
-        details.detectedTechniques.push_back(JSObfuscationType::StringSplitting);
+        addTechnique(JSObfuscationType::StringSplitting);
     }
 
     if (shortVarCount > 20 && content.size() > 500) {
         details.confidence += 10.0;
-        details.detectedTechniques.push_back(JSObfuscationType::VariableRenaming);
+        addTechnique(JSObfuscationType::VariableRenaming);
     }
 
     // Cap confidence at 100
-    if (details.confidence > 100.0) {
-        details.confidence = 100.0;
-    }
+    details.confidence = std::min(details.confidence, 100.0);
 
     details.suspiciousTokenCount = evalCount + concatCount;
 
@@ -1029,24 +1232,33 @@ std::string JavaScriptScannerImpl::Deobfuscate(std::string_view content, size_t 
 
 std::vector<std::string> JavaScriptScannerImpl::ExtractIOCs(std::string_view content) {
     std::vector<std::string> iocs;
-    std::string contentStr(content);
+
+    // Cap content for regex operations to avoid catastrophic backtracking
+    const auto cappedSize = std::min(content.size(), JSConstants::MAX_REGEX_CONTENT_SIZE);
+    std::string contentStr(content.substr(0, cappedSize));
 
     try {
-        // Extract URLs
-        std::sregex_iterator urlBegin(contentStr.begin(), contentStr.end(), URL_REGEX);
-        std::sregex_iterator urlEnd;
-        for (auto it = urlBegin; it != urlEnd && iocs.size() < MAX_EXTRACTED_IOCS; ++it) {
-            iocs.push_back(it->str());
+        // Extract URLs using thread-safe regex
+        {
+            const auto& urlRe = GetURLRegex();
+            std::sregex_iterator urlBegin(contentStr.begin(), contentStr.end(), urlRe);
+            std::sregex_iterator urlEnd;
+            for (auto it = urlBegin; it != urlEnd && iocs.size() < MAX_EXTRACTED_IOCS; ++it) {
+                iocs.push_back(it->str());
+            }
         }
 
         // Extract IP addresses
-        std::sregex_iterator ipBegin(contentStr.begin(), contentStr.end(), IP_REGEX);
-        std::sregex_iterator ipEnd;
-        for (auto it = ipBegin; it != ipEnd && iocs.size() < MAX_EXTRACTED_IOCS; ++it) {
-            std::string ip = it->str();
-            // Filter out common false positives (version numbers)
-            if (ip.find("0.0.0") != 0 && ip.find("127.0.0") != 0) {
-                iocs.push_back(ip);
+        {
+            const auto& ipRe = GetIPRegex();
+            std::sregex_iterator ipBegin(contentStr.begin(), contentStr.end(), ipRe);
+            std::sregex_iterator ipEnd;
+            for (auto it = ipBegin; it != ipEnd && iocs.size() < MAX_EXTRACTED_IOCS; ++it) {
+                std::string ip = it->str();
+                // Filter out common false positives (version numbers, loopback)
+                if (ip.find("0.0.0") != 0 && ip.find("127.0.0") != 0) {
+                    iocs.push_back(std::move(ip));
+                }
             }
         }
 
@@ -1063,27 +1275,27 @@ std::vector<std::string> JavaScriptScannerImpl::ExtractIOCs(std::string_view con
 
 std::vector<ActiveXUsage> JavaScriptScannerImpl::DetectActiveXUsage(std::string_view content) {
     std::vector<ActiveXUsage> usages;
-    const std::string lower = ToLower(content);
 
-    // Find ActiveXObject or CreateObject patterns
-    std::regex activeXPattern(
-        R"((new\s+activexobject|createobject|getobject)\s*\(\s*[\"']([^\"']+)[\"'])",
-        std::regex::icase | std::regex::optimize
-    );
+    // Cap content for regex operations
+    const auto cappedSize = std::min(content.size(), JSConstants::MAX_REGEX_CONTENT_SIZE);
+    std::string contentStr(content.substr(0, cappedSize));
 
-    std::string contentStr(content);
+    // Use the thread-safe, thread_local regex from the anonymous namespace
+    const auto& activeXPattern = GetActiveXRegex();
+
     auto begin = std::sregex_iterator(contentStr.begin(), contentStr.end(), activeXPattern);
     auto end = std::sregex_iterator();
 
-    size_t lineNumber = 1;
     for (auto it = begin; it != end; ++it) {
         ActiveXUsage usage;
         usage.objectName = (*it)[2].str();
 
         // Calculate approximate line number
-        size_t pos = it->position();
-        lineNumber = 1 + std::count(contentStr.begin(), contentStr.begin() + pos, '\n');
-        usage.lineNumber = lineNumber;
+        const size_t pos = static_cast<size_t>(it->position());
+        usage.lineNumber = 1 + static_cast<size_t>(
+            std::count(contentStr.begin(),
+                       contentStr.begin() + static_cast<ptrdiff_t>(pos),
+                       '\n'));
 
         // Check if suspicious
         std::string lowerObj = ToLower(usage.objectName);
@@ -1107,24 +1319,33 @@ std::vector<JSNetworkActivity> JavaScriptScannerImpl::DetectNetworkActivity(
     std::vector<JSNetworkActivity> activities;
     const std::string lower = ToLower(content);
 
+    // Extract IOCs once — shared across all matched network patterns
+    std::vector<std::string> iocs;
+    bool iocsExtracted = false;
+
+    // Detect HTTP method once
+    std::string detectedMethod;
+    if (lower.find("\"get\"") != std::string::npos ||
+        lower.find("'get'") != std::string::npos) {
+        detectedMethod = "GET";
+    } else if (lower.find("\"post\"") != std::string::npos ||
+               lower.find("'post'") != std::string::npos) {
+        detectedMethod = "POST";
+    }
+
     for (const auto& pattern : NETWORK_PATTERNS) {
         if (lower.find(pattern) != std::string::npos) {
             JSNetworkActivity activity;
             activity.apiUsed = pattern;
+            activity.method = detectedMethod;
 
-            // Try to extract target URL
-            auto iocs = ExtractIOCs(content);
+            // Lazy-extract IOCs on first network pattern hit
+            if (!iocsExtracted) {
+                iocs = ExtractIOCs(content);
+                iocsExtracted = true;
+            }
             if (!iocs.empty()) {
                 activity.target = iocs[0];
-            }
-
-            // Check for HTTP methods
-            if (lower.find("\"get\"") != std::string::npos ||
-                lower.find("'get'") != std::string::npos) {
-                activity.method = "GET";
-            } else if (lower.find("\"post\"") != std::string::npos ||
-                       lower.find("'post'") != std::string::npos) {
-                activity.method = "POST";
             }
 
             activities.push_back(std::move(activity));
@@ -1355,14 +1576,25 @@ int JavaScriptScannerImpl::CalculateRiskScore(
         }
     }
 
-    // Check for PowerShell invocation
-    if (ContainsIgnoreCase(lower, "powershell")) {
-        score += 25;
+    // LOLbin patterns (Living Off the Land Binary abuse)
+    for (const auto& [pattern, risk] : LOLBIN_PATTERNS) {
+        if (lower.find(pattern) != std::string::npos) {
+            score += risk;
+        }
     }
 
-    // Check for command execution patterns
-    if (ContainsIgnoreCase(lower, "cmd.exe") || ContainsIgnoreCase(lower, "cmd /c")) {
-        score += 20;
+    // Sandbox / VM evasion indicators
+    for (const auto& [pattern, risk] : SANDBOX_EVASION_PATTERNS) {
+        if (lower.find(pattern) != std::string::npos) {
+            score += risk;
+        }
+    }
+
+    // Persistence indicators
+    for (const auto& [pattern, risk] : PERSISTENCE_PATTERNS) {
+        if (lower.find(pattern) != std::string::npos) {
+            score += risk;
+        }
     }
 
     return score;
@@ -1483,28 +1715,36 @@ bool JavaScriptScannerImpl::ContainsIgnoreCase(
 std::string JavaScriptScannerImpl::DecodeBase64Segments(std::string_view content) const {
     std::string result(content);
 
-    // Find atob("...") patterns and decode
-    std::regex atobPattern(R"(atob\s*\(\s*[\"']([A-Za-z0-9+/=]+)[\"']\s*\))",
-                           std::regex::optimize);
+    // Find atob("...") patterns and decode.
+    // After each replacement the string is mutated, so we restart the search
+    // from the beginning each time.  MAX_DEOBFUSCATION_REPLACEMENTS prevents
+    // infinite loops if decoded text itself contains atob().
+    thread_local const std::regex atobPattern(
+        R"(atob\s*\(\s*[\"']([A-Za-z0-9+/=]+)[\"']\s*\))",
+        std::regex::optimize);
 
-    std::string::const_iterator searchStart = result.cbegin();
-    std::smatch match;
+    for (size_t n = 0; n < MAX_DEOBFUSCATION_REPLACEMENTS; ++n) {
+        std::smatch match;
+        if (!std::regex_search(result, match, atobPattern)) {
+            break;
+        }
 
-    while (std::regex_search(searchStart, result.cend(), match, atobPattern)) {
         try {
-            std::string encoded = match[1].str();
+            const std::string encoded = match[1].str();
             std::vector<uint8_t> decoded;
 
-            if (Utils::Base64Utils::Decode(encoded, decoded)) {
+            if (Utils::Base64Decode(encoded, decoded)) {
                 std::string decodedStr(decoded.begin(), decoded.end());
-                // Replace the atob(...) with decoded content
-                size_t pos = match.position() + std::distance(result.cbegin(), searchStart);
-                result.replace(pos, match.length(), "\"" + decodedStr + "\"");
+                result.replace(
+                    static_cast<size_t>(match.position()),
+                    static_cast<size_t>(match.length()),
+                    "\"" + decodedStr + "\"");
+            } else {
+                break;  // can't decode → stop
             }
         } catch (...) {
-            // Ignore decode errors
+            break;
         }
-        searchStart = match.suffix().first;
     }
 
     return result;
@@ -1513,43 +1753,57 @@ std::string JavaScriptScannerImpl::DecodeBase64Segments(std::string_view content
 std::string JavaScriptScannerImpl::DecodeCharCodeSequences(std::string_view content) const {
     std::string result(content);
 
-    // Find String.fromCharCode(nn, nn, ...) patterns
-    std::regex charCodePattern(
+    // Find String.fromCharCode(nn, nn, ...) patterns.
+    // Restart search from the beginning after each replacement to avoid
+    // iterator invalidation.
+    thread_local const std::regex charCodePattern(
         R"(String\.fromCharCode\s*\(([0-9,\s]+)\))",
         std::regex::icase | std::regex::optimize);
 
-    std::string::const_iterator searchStart = result.cbegin();
-    std::smatch match;
+    for (size_t n = 0; n < MAX_DEOBFUSCATION_REPLACEMENTS; ++n) {
+        std::smatch match;
+        if (!std::regex_search(result, match, charCodePattern)) {
+            break;
+        }
 
-    while (std::regex_search(searchStart, result.cend(), match, charCodePattern)) {
         try {
-            std::string codes = match[1].str();
+            const std::string codes = match[1].str();
             std::string decoded;
 
             // Parse comma-separated numbers
             std::istringstream iss(codes);
             std::string token;
+            bool valid = true;
             while (std::getline(iss, token, ',')) {
                 // Trim whitespace
                 token.erase(0, token.find_first_not_of(" \t"));
                 token.erase(token.find_last_not_of(" \t") + 1);
 
                 if (!token.empty()) {
-                    int code = std::stoi(token);
-                    if (code >= 0 && code <= 255) {
-                        decoded += static_cast<char>(code);
+                    const int code = std::stoi(token);
+                    if (code >= 0 && code <= 0xFFFF) {
+                        // Accept full BMP; only emit single-byte for ASCII range
+                        if (code <= 127) {
+                            decoded += static_cast<char>(code);
+                        }
+                    } else {
+                        valid = false;
+                        break;
                     }
                 }
             }
 
-            if (!decoded.empty()) {
-                size_t pos = match.position() + std::distance(result.cbegin(), searchStart);
-                result.replace(pos, match.length(), "\"" + decoded + "\"");
+            if (valid && !decoded.empty()) {
+                result.replace(
+                    static_cast<size_t>(match.position()),
+                    static_cast<size_t>(match.length()),
+                    "\"" + decoded + "\"");
+            } else {
+                break;
             }
         } catch (...) {
-            // Ignore parse errors
+            break;
         }
-        searchStart = match.suffix().first;
     }
 
     return result;
@@ -1601,6 +1855,152 @@ std::string JavaScriptScannerImpl::DecodeUnicodeEscapes(std::string_view content
 }
 
 // ============================================================================
+// JAVASCRIPTSCANNERIMPL - JSE / WSF / HTA SUPPORT & DEADLINE
+// ============================================================================
+
+bool JavaScriptScannerImpl::IsJSEContent(std::string_view content) const noexcept {
+    return content.size() >= 12 &&
+           content.find(JSE_START_MARKER) != std::string_view::npos;
+}
+
+std::string JavaScriptScannerImpl::DecodeJSE(std::string_view content) const {
+    const auto startMarker = content.find(JSE_START_MARKER);
+    if (startMarker == std::string_view::npos) return std::string(content);
+
+    const auto endMarker = content.find("^#~@", startMarker + 4);
+    if (endMarker == std::string_view::npos) return std::string(content);
+
+    // After #@~^ there is an encoded length block ending with ==
+    const size_t afterStart = startMarker + 4;
+    const auto eqSep = content.find("==", afterStart);
+    if (eqSep == std::string_view::npos || eqSep >= endMarker) {
+        return std::string(content);
+    }
+    const size_t payloadStart = eqSep + 2;
+
+    // Payload ends before the trailing 6-byte checksum + optional == + ^#~@
+    size_t payloadEnd = endMarker;
+    if (payloadEnd >= 2 && content[payloadEnd - 1] == '=' && content[payloadEnd - 2] == '=') {
+        payloadEnd -= 2;
+    }
+    if (payloadEnd >= payloadStart + 6) {
+        payloadEnd -= 6;
+    }
+
+    if (payloadStart >= payloadEnd) return std::string(content);
+
+    constexpr size_t MAX_JSE_PAYLOAD = 5 * 1024 * 1024;
+    if (payloadEnd - payloadStart > MAX_JSE_PAYLOAD) {
+        SS_LOG_WARN(LOG_CATEGORY, L"JSE payload exceeds decode size limit (%zu bytes)",
+                    payloadEnd - payloadStart);
+        return std::string(content);
+    }
+
+    const std::string_view payload = content.substr(payloadStart, payloadEnd - payloadStart);
+
+    std::string decoded;
+    decoded.reserve(payload.size());
+    size_t encIndex = 0;
+
+    for (size_t i = 0; i < payload.size(); ++i) {
+        const uint8_t ch = static_cast<uint8_t>(payload[i]);
+
+        // WSE escape sequences: @X -> special character
+        if (ch == '@' && i + 1 < payload.size()) {
+            switch (payload[i + 1]) {
+                case '#': decoded += '\r'; ++i; continue;
+                case '&': decoded += '\n'; ++i; continue;
+                case '!': decoded += '<';  ++i; continue;
+                case '*': decoded += '>';  ++i; continue;
+                case '$': decoded += '@';  ++i; continue;
+                default: break;
+            }
+        }
+
+        // Non-printable / whitespace pass through unchanged
+        if (ch <= 0x20 || ch >= 0x7F) {
+            decoded += static_cast<char>(ch);
+            continue;
+        }
+
+        // Substitution via the rotating decode tables
+        const uint8_t tableIdx = kWsePick[encIndex % 64];
+        decoded += static_cast<char>(kWseDecode[tableIdx][ch]);
+        ++encIndex;
+    }
+
+    return decoded;
+}
+
+bool JavaScriptScannerImpl::IsWSFContent(std::string_view content) const noexcept {
+    const auto probe = content.substr(0, std::min(content.size(), size_t(4096)));
+    return ContainsIgnoreCase(probe, WSF_JOB_TAG) ||
+           ContainsIgnoreCase(probe, WSF_PACKAGE_TAG);
+}
+
+std::string JavaScriptScannerImpl::ExtractScriptFromWSF(std::string_view content) const {
+    std::string result;
+    result.reserve(content.size() / 2);
+
+    size_t pos = 0;
+    while (pos < content.size()) {
+        // Case-insensitive search for <script
+        size_t tagStart = std::string::npos;
+        for (size_t i = pos; i + 7 < content.size(); ++i) {
+            if (content[i] == '<' &&
+                (content[i+1] == 's' || content[i+1] == 'S') &&
+                (content[i+2] == 'c' || content[i+2] == 'C') &&
+                (content[i+3] == 'r' || content[i+3] == 'R') &&
+                (content[i+4] == 'i' || content[i+4] == 'I') &&
+                (content[i+5] == 'p' || content[i+5] == 'P') &&
+                (content[i+6] == 't' || content[i+6] == 'T')) {
+                tagStart = i;
+                break;
+            }
+        }
+        if (tagStart == std::string::npos) break;
+
+        const auto tagClose = content.find('>', tagStart + 7);
+        if (tagClose == std::string::npos) break;
+
+        // Case-insensitive search for </script
+        size_t endTag = std::string::npos;
+        for (size_t i = tagClose + 1; i + 8 < content.size(); ++i) {
+            if (content[i] == '<' && content[i+1] == '/' &&
+                (content[i+2] == 's' || content[i+2] == 'S') &&
+                (content[i+3] == 'c' || content[i+3] == 'C') &&
+                (content[i+4] == 'r' || content[i+4] == 'R') &&
+                (content[i+5] == 'i' || content[i+5] == 'I') &&
+                (content[i+6] == 'p' || content[i+6] == 'P') &&
+                (content[i+7] == 't' || content[i+7] == 'T')) {
+                endTag = i;
+                break;
+            }
+        }
+        if (endTag == std::string::npos) break;
+
+        if (!result.empty()) result += '\n';
+        result += content.substr(tagClose + 1, endTag - tagClose - 1);
+        pos = endTag + 9;
+    }
+
+    return result;
+}
+
+bool JavaScriptScannerImpl::IsHTAContent(std::string_view content) const noexcept {
+    const auto probe = content.substr(0, std::min(content.size(), size_t(4096)));
+    return ContainsIgnoreCase(probe, HTA_APP_TAG);
+}
+
+std::string JavaScriptScannerImpl::ExtractScriptFromHTA(std::string_view content) const {
+    return ExtractScriptFromWSF(content);
+}
+
+bool JavaScriptScannerImpl::IsDeadlineExceeded(TimePoint deadline) const noexcept {
+    return Clock::now() > deadline;
+}
+
+// ============================================================================
 // STRUCTURE IMPLEMENTATIONS
 // ============================================================================
 
@@ -1646,6 +2046,12 @@ bool JSScanConfig::IsValid() const noexcept {
         return false;
     }
     if (emulationTimeoutMs == 0 || emulationTimeoutMs > 60000) {
+        return false;
+    }
+    if (scanTimeoutMs == 0 || scanTimeoutMs > 120000) {
+        return false;
+    }
+    if (maxDeobfuscationDepth == 0 || maxDeobfuscationDepth > 256) {
         return false;
     }
     return true;

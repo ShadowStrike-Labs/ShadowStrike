@@ -145,7 +145,6 @@
 #include "../Utils/FileUtils.hpp"
 #include "../PatternStore/PatternStore.hpp"
 #include "../SignatureStore/SignatureStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
