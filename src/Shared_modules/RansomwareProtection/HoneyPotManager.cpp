@@ -24,13 +24,14 @@
  * @brief Implementation of enterprise-grade decoy file management system
  *
  * Implements the PIMPL class for HoneypotManager, handling:
- * - Strategic deployment of decoy files
- * - Fast lock-free/shared-lock lookups for trap detection
- * - Real-time monitoring and alert generation
- * - Automatic regeneration of compromised traps
+ * - Strategic deployment of decoy files with APT-resistant naming
+ * - Cryptographically secure random content generation
+ * - Kernel minifilter integration for instant detection
+ * - Process whitelisting and false-positive prevention
+ * - Atomic file creation and integrity monitoring
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -39,7 +40,7 @@
  */
 
 #include "pch.h"
-#include "HoneyPotManager.hpp"
+#include "HoneypotManager.hpp"
 
 #include <algorithm>
 #include <random>
@@ -64,12 +65,18 @@
 #ifdef _WIN32
 #include <shlobj.h>
 #include <knownfolders.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 #endif
 
 namespace ShadowStrike {
 namespace Ransomware {
 
+// Pull Utils into scope for readability
+using namespace ShadowStrike::Utils;
 namespace fs = std::filesystem;
+
+static constexpr const wchar_t* kLogCategory = L"Honeypot";
 
 // ============================================================================
 // INTERNAL HELPERS
@@ -78,24 +85,34 @@ namespace fs = std::filesystem;
 namespace {
 
     /**
-     * @brief Generate random bytes
+     * @brief Generate cryptographically secure random bytes via BCryptGenRandom.
      */
-    std::vector<uint8_t> GenerateRandomBytes(size_t size) {
-        std::vector<uint8_t> buffer(size);
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        std::uniform_int_distribution<uint16_t> dis(0, 255);
+    [[nodiscard]] bool CryptoRandomBytes(uint8_t* buffer, size_t size) noexcept {
+        if (!buffer || size == 0) return false;
+#ifdef _WIN32
+        NTSTATUS status = BCryptGenRandom(
+            nullptr, buffer, static_cast<ULONG>(size),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        return BCRYPT_SUCCESS(status);
+#else
+        return false;
+#endif
+    }
 
-        for (size_t i = 0; i < size; ++i) {
-            buffer[i] = static_cast<uint8_t>(dis(gen));
+    [[nodiscard]] std::vector<uint8_t> GenerateRandomBytes(size_t size) {
+        if (size == 0 || size > HoneypotConstants::MAX_HONEYPOT_SIZE) return {};
+        std::vector<uint8_t> buffer(size);
+        if (!CryptoRandomBytes(buffer.data(), size)) {
+            SS_LOG_ERROR(kLogCategory, L"BCryptGenRandom failed for %zu bytes", size);
+            buffer.clear();
         }
         return buffer;
     }
 
     /**
-     * @brief Get standard location path
+     * @brief Get standard location path via SHGetKnownFolderPath.
      */
-    std::wstring GetLocationPath(LocationType type) {
+    [[nodiscard]] std::wstring GetLocationPath(LocationType type) {
 #ifdef _WIN32
         PWSTR path = nullptr;
         HRESULT hr = E_FAIL;
@@ -113,15 +130,13 @@ namespace {
             case LocationType::UserDownloads:
                 hr = SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &path);
                 break;
-            case LocationType::RootDrive:
-                // Usually C:\, but safer to query system drive
-                {
-                    wchar_t sysPath[MAX_PATH];
-                    if (GetSystemDirectoryW(sysPath, MAX_PATH)) {
-                        return std::wstring(sysPath).substr(0, 3); // "C:\"
-                    }
-                    return L"C:\\";
+            case LocationType::RootDrive: {
+                wchar_t sysPath[MAX_PATH]{};
+                if (GetSystemDirectoryW(sysPath, MAX_PATH)) {
+                    return std::wstring(sysPath).substr(0, 3);
                 }
+                return L"C:\\";
+            }
             default:
                 break;
         }
@@ -131,20 +146,35 @@ namespace {
             CoTaskMemFree(path);
             return result;
         }
+        if (path) CoTaskMemFree(path);
 #endif
         return L"";
     }
 
     /**
-     * @brief Generate random ID
+     * @brief Generate a unique hex ID from CSPRNG.
      */
-    std::string GenerateId() {
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        std::uniform_int_distribution<uint64_t> dis;
-        std::stringstream ss;
-        ss << std::hex << dis(gen) << dis(gen);
-        return ss.str();
+    [[nodiscard]] std::string GenerateId() {
+        uint8_t raw[16]{};
+        if (!CryptoRandomBytes(raw, sizeof(raw))) {
+            std::random_device rd;
+            std::mt19937_64 gen(rd());
+            std::uniform_int_distribution<uint64_t> dis;
+            auto v1 = dis(gen), v2 = dis(gen);
+            std::memcpy(raw, &v1, 8);
+            std::memcpy(raw + 8, &v2, 8);
+        }
+        return HashUtils::ToHexLower(raw, sizeof(raw));
+    }
+
+    /**
+     * @brief Pick a random index in [0, upperBound) using CSPRNG.
+     */
+    [[nodiscard]] size_t SecureRandomIndex(size_t upperBound) {
+        if (upperBound <= 1) return 0;
+        uint64_t raw = 0;
+        CryptoRandomBytes(reinterpret_cast<uint8_t*>(&raw), sizeof(raw));
+        return static_cast<size_t>(raw % upperBound);
     }
 
 } // anonymous namespace
@@ -188,6 +218,9 @@ public:
 
     // Access Handling
     void OnHoneypotAccessed(std::wstring_view path, uint32_t pid, HoneypotAccessType accessType);
+    bool ProcessKernelNotification(std::wstring_view path, uint32_t pid,
+                                   uint32_t threadId, HoneypotAccessType accessType);
+    bool IsProcessWhitelisted(uint32_t pid) const;
     void ReportFalsePositive(uint64_t eventId, const std::string& reason);
     std::vector<HoneypotAccessEvent> GetRecentAccessEvents(size_t maxCount) const;
 
@@ -210,33 +243,31 @@ public:
     bool SelfTest();
 
 private:
-    // Internal methods
     void CreateHoneypotFile(const HoneypotTemplate& tmpl, const std::wstring& path);
     void NotifyAccess(const HoneypotAccessEvent& event);
     void NotifyStatus(const HoneyFile& file, HoneypotStatus status);
+    void HandleDetectedAccess(std::wstring_view path, uint32_t pid,
+                              HoneypotAccessType accessType);
+    void ApplyFileAttributes(const std::wstring& path) const;
+    void RandomizeTimestamps(const std::wstring& path) const;
 
-    // Member variables
     mutable std::shared_mutex m_mutex;
     std::atomic<bool> m_initialized{false};
     std::atomic<ModuleStatus> m_status{ModuleStatus::Uninitialized};
     HoneypotManagerConfiguration m_config;
 
-    // Data storage
-    std::unordered_map<std::string, HoneyFile> m_honeypots; // ID -> HoneyFile
-    std::unordered_map<std::wstring, std::string> m_pathIndex; // Path -> ID
+    std::unordered_map<std::string, HoneyFile> m_honeypots;
+    std::unordered_map<std::wstring, std::string> m_pathIndex;
     std::vector<HoneypotTemplate> m_templates;
 
-    // Access logs
     mutable std::mutex m_eventMutex;
     std::deque<HoneypotAccessEvent> m_recentEvents;
     std::atomic<uint64_t> m_eventCounter{1};
 
-    // Callbacks
     mutable std::mutex m_callbackMutex;
     HoneypotAccessCallback m_accessCallback;
     HoneypotStatusCallback m_statusCallback;
 
-    // Statistics
     mutable HoneypotStatistics m_stats;
 };
 
@@ -245,19 +276,19 @@ private:
 // ============================================================================
 
 HoneypotManagerImpl::HoneypotManagerImpl() {
-    Logger::Info("[HoneypotManager] Instance created");
+    SS_LOG_INFO(kLogCategory, L"Instance created");
 }
 
 HoneypotManagerImpl::~HoneypotManagerImpl() {
     Shutdown();
-    Logger::Info("[HoneypotManager] Instance destroyed");
+    SS_LOG_INFO(kLogCategory, L"Instance destroyed");
 }
 
 bool HoneypotManagerImpl::Initialize(const HoneypotManagerConfiguration& config) {
     std::unique_lock lock(m_mutex);
 
     if (m_initialized.load(std::memory_order_acquire)) {
-        Logger::Warn("[HoneypotManager] Already initialized");
+        SS_LOG_WARN(kLogCategory, L"Already initialized");
         return true;
     }
 
@@ -265,46 +296,40 @@ bool HoneypotManagerImpl::Initialize(const HoneypotManagerConfiguration& config)
         m_status.store(ModuleStatus::Initializing, std::memory_order_release);
 
         if (!config.IsValid()) {
-            Logger::Error("[HoneypotManager] Invalid configuration");
+            SS_LOG_ERROR(kLogCategory, L"Invalid configuration supplied");
             m_status.store(ModuleStatus::Error, std::memory_order_release);
             return false;
         }
 
         m_config = config;
 
-        // Load templates
         if (m_config.templates.empty()) {
-            // Load defaults if none provided
-            // In a real impl, this would call m_config.LoadDefaultTemplates()
-            // Here we ensure at least one template exists for safety
-            HoneypotTemplate defaultTmpl = GetDefaultTemplate(HoneypotFileType::Document);
-            m_templates.push_back(defaultTmpl);
+            m_config.LoadDefaultTemplates();
+            m_templates = m_config.templates;
         } else {
             m_templates = m_config.templates;
         }
 
-        // Initialize locations if empty
         if (m_config.locations.empty()) {
-            // m_config.LoadDefaultLocations() would be called here
+            m_config.LoadDefaultLocations();
         }
 
-        // Reset stats
         m_stats.Reset();
 
         m_initialized.store(true, std::memory_order_release);
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-        Logger::Info("[HoneypotManager] Initialized successfully with {} templates", m_templates.size());
+        SS_LOG_INFO(kLogCategory, L"Initialized with %zu templates, %zu locations",
+                    m_templates.size(), m_config.locations.size());
 
         if (m_config.autoDeployOnStartup) {
-            // Need to release lock before deploying as it might re-acquire or take time
             lock.unlock();
             DeployTraps();
         }
 
         return true;
     } catch (const std::exception& e) {
-        Logger::Critical("[HoneypotManager] Initialization failed: {}", e.what());
+        SS_LOG_FATAL(kLogCategory, L"Initialization failed: %hs", e.what());
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     }
@@ -319,8 +344,6 @@ void HoneypotManagerImpl::Shutdown() {
 
     m_status.store(ModuleStatus::Stopping, std::memory_order_release);
 
-    // Optionally cleanup traps if configured, but usually persistent
-    // For now, we just clear internal state
     m_honeypots.clear();
     m_pathIndex.clear();
     m_templates.clear();
@@ -328,20 +351,18 @@ void HoneypotManagerImpl::Shutdown() {
     m_initialized.store(false, std::memory_order_release);
     m_status.store(ModuleStatus::Stopped, std::memory_order_release);
 
-    Logger::Info("[HoneypotManager] Shutdown complete");
+    SS_LOG_INFO(kLogCategory, L"Shutdown complete");
 }
 
 bool HoneypotManagerImpl::DeployTraps() {
     if (!m_initialized.load(std::memory_order_acquire)) return false;
 
-    // Use a copy of locations to avoid holding the lock while deploying
     std::vector<DeploymentLocation> locations;
     {
         std::shared_lock lock(m_mutex);
         locations = m_config.locations;
     }
 
-    // Sort by priority (higher first)
     std::sort(locations.begin(), locations.end(),
         [](const DeploymentLocation& a, const DeploymentLocation& b) {
             return a.priority > b.priority;
@@ -356,7 +377,7 @@ bool HoneypotManagerImpl::DeployTraps() {
         }
     }
 
-    Logger::Info("[HoneypotManager] Deployment cycle complete. Deployed traps in {} locations", deployedCount);
+    SS_LOG_INFO(kLogCategory, L"Deployment cycle complete: %zu locations seeded", deployedCount);
     return true;
 }
 
@@ -368,31 +389,31 @@ bool HoneypotManagerImpl::DeployToLocation(const DeploymentLocation& location) {
         basePath = location.path;
     }
 
-    if (basePath.empty() || !fs::exists(basePath)) {
-        Logger::Warn("[HoneypotManager] Skipping invalid location path: {}", StringUtils::WStringToString(basePath));
+    if (basePath.empty()) {
+        SS_LOG_WARN(kLogCategory, L"Empty location path for type %d",
+                    static_cast<int>(location.type));
         return false;
     }
 
-    // Determine how many traps to deploy
-    size_t trapsToDeploy = location.maxHoneypots;
+    std::error_code fsec;
+    if (!fs::exists(basePath, fsec)) {
+        SS_LOG_WARN(kLogCategory, L"Location path does not exist: %ls", basePath.c_str());
+        return false;
+    }
 
-    // We need to pick templates
+    const size_t trapsToDeploy = location.maxHoneypots;
     std::vector<HoneypotTemplate> availableTemplates = GetTemplates();
     if (availableTemplates.empty()) return false;
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<size_t> dist(0, availableTemplates.size() - 1);
-
     size_t successCount = 0;
     for (size_t i = 0; i < trapsToDeploy; ++i) {
-        // Check global limit
         if (GetHoneypotCount() >= m_config.maxTotalHoneypots) {
-            Logger::Info("[HoneypotManager] Max global honeypot limit reached");
+            SS_LOG_INFO(kLogCategory, L"Global honeypot limit (%zu) reached",
+                        m_config.maxTotalHoneypots);
             break;
         }
 
-        const auto& tmpl = availableTemplates[dist(gen)];
+        const auto& tmpl = availableTemplates[SecureRandomIndex(availableTemplates.size())];
         if (DeployHoneypot(basePath, tmpl)) {
             successCount++;
         }
@@ -406,84 +427,140 @@ std::optional<std::string> HoneypotManagerImpl::DeployHoneypot(
     const HoneypotTemplate& tmpl) {
 
     try {
-        // Generate realistic filename
         std::wstring filename = GenerateHoneypotFilename(tmpl.fileType);
 
-        // If template has specific patterns, use one
         if (!tmpl.filenamePatterns.empty()) {
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_int_distribution<size_t> dist(0, tmpl.filenamePatterns.size() - 1);
-            filename = tmpl.filenamePatterns[dist(gen)];
-
-            // Append extension if missing
-            if (!tmpl.extension.empty() && filename.find(tmpl.extension) == std::wstring::npos) {
+            filename = tmpl.filenamePatterns[SecureRandomIndex(tmpl.filenamePatterns.size())];
+            if (!tmpl.extension.empty() &&
+                filename.find(tmpl.extension) == std::wstring::npos) {
                 filename += tmpl.extension;
             }
         }
 
         fs::path fullPath = fs::path(directory) / filename;
 
-        // Check if file already exists
+        // Collision avoidance with CSPRNG suffix
         if (fs::exists(fullPath)) {
-            // Append random suffix
+            uint32_t suffix = 0;
+            CryptoRandomBytes(reinterpret_cast<uint8_t*>(&suffix), sizeof(suffix));
+            suffix %= 10000u;
             std::wstring stem = fullPath.stem().wstring();
-            std::wstring ext = fullPath.extension().wstring();
-            fullPath = fs::path(directory) / (stem + L"_" + std::to_wstring(rand() % 1000) + ext);
+            std::wstring ext  = fullPath.extension().wstring();
+            fullPath = fs::path(directory) / (stem + L"_" + std::to_wstring(suffix) + ext);
         }
 
-        // Create the file
+        // Validate path doesn't escape target directory (use security-hardened API)
+        FileUtils::Error pathErr;
+        if (!FileUtils::IsPathUnderRoot(fullPath.wstring(), directory, true, &pathErr)) {
+            SS_LOG_ERROR(kLogCategory, L"Path traversal blocked: %ls", fullPath.c_str());
+            return std::nullopt;
+        }
+
+        // Create the honeypot file
         CreateHoneypotFile(tmpl, fullPath.wstring());
 
-        // Register honeypot
+        // Build honeypot record
         HoneyFile honeyFile;
-        honeyFile.honeypotId = GenerateId();
-        honeyFile.path = fullPath.wstring();
-        honeyFile.originalName = filename;
-        honeyFile.type = HoneypotType::File;
-        honeyFile.fileType = tmpl.fileType;
-        honeyFile.status = HoneypotStatus::Active;
-        honeyFile.fileSize = fs::file_size(fullPath);
-        honeyFile.creationTime = std::chrono::system_clock::now();
-        honeyFile.lastVerified = Clock::now();
-        honeyFile.isHidden = m_config.hideFiles;
-        honeyFile.isSystem = m_config.makeSystemFiles;
+        honeyFile.honeypotId    = GenerateId();
+        honeyFile.path          = fullPath.wstring();
+        honeyFile.originalName  = filename;
+        honeyFile.type          = HoneypotType::File;
+        honeyFile.fileType      = tmpl.fileType;
+        honeyFile.status        = HoneypotStatus::Active;
+        honeyFile.creationTime  = std::chrono::system_clock::now();
+        honeyFile.lastVerified  = Clock::now();
+        honeyFile.isHidden      = m_config.hideFiles;
+        honeyFile.isSystem      = m_config.makeSystemFiles;
         honeyFile.autoRegenerate = m_config.autoRegenerate;
 
-        // Calculate hash for integrity monitoring
-        auto hashBytes = HashUtils::CalculateSHA256(fullPath);
-        std::memcpy(honeyFile.contentHash.data(), hashBytes.data(), 32);
+        std::error_code ec;
+        honeyFile.fileSize = fs::file_size(fullPath, ec);
+        if (ec) honeyFile.fileSize = 0;
 
-        // Apply attributes
-        if (m_config.hideFiles || m_config.makeSystemFiles) {
-#ifdef _WIN32
-            DWORD attrs = GetFileAttributesW(fullPath.c_str());
-            if (attrs != INVALID_FILE_ATTRIBUTES) {
-                if (m_config.hideFiles) attrs |= FILE_ATTRIBUTE_HIDDEN;
-                if (m_config.makeSystemFiles) attrs |= FILE_ATTRIBUTE_SYSTEM;
-                SetFileAttributesW(fullPath.c_str(), attrs);
-            }
-#endif
+        // Integrity hash
+        FileUtils::Error hashErr;
+        if (!FileUtils::ComputeFileSHA256(fullPath.wstring(), honeyFile.contentHash, &hashErr)) {
+            SS_LOG_WARN(kLogCategory, L"Hash failed for %ls", fullPath.c_str());
         }
 
-        // Store
+        // Stealth: randomize timestamps and set attributes
+        ApplyFileAttributes(fullPath.wstring());
+        RandomizeTimestamps(fullPath.wstring());
+
+        // Register under lock
         {
             std::unique_lock lock(m_mutex);
-            m_pathIndex[StringUtils::ToLowerW(honeyFile.path)] = honeyFile.honeypotId;
+            std::wstring lowerPath = StringUtils::ToLowerCopy(honeyFile.path);
+            m_pathIndex[lowerPath] = honeyFile.honeypotId;
             m_honeypots[honeyFile.honeypotId] = honeyFile;
         }
 
-        m_stats.totalDeployed++;
-        m_stats.currentlyActive++;
+        m_stats.totalDeployed.fetch_add(1, std::memory_order_relaxed);
+        m_stats.currentlyActive.fetch_add(1, std::memory_order_relaxed);
 
-        Logger::Info("[HoneypotManager] Deployed trap: {}", StringUtils::WStringToString(honeyFile.path));
-
+        SS_LOG_DEBUG(kLogCategory, L"Deployed trap: %ls", fullPath.c_str());
         return honeyFile.honeypotId;
 
     } catch (const std::exception& e) {
-        Logger::Error("[HoneypotManager] Failed to deploy honeypot: {}", e.what());
+        SS_LOG_ERROR(kLogCategory, L"Deployment failed: %hs", e.what());
         return std::nullopt;
     }
+}
+
+void HoneypotManagerImpl::ApplyFileAttributes(const std::wstring& path) const {
+#ifdef _WIN32
+    if (!m_config.hideFiles && !m_config.makeSystemFiles) return;
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return;
+    if (m_config.hideFiles)       attrs |= FILE_ATTRIBUTE_HIDDEN;
+    if (m_config.makeSystemFiles) attrs |= FILE_ATTRIBUTE_SYSTEM;
+    SetFileAttributesW(path.c_str(), attrs);
+#endif
+}
+
+void HoneypotManagerImpl::RandomizeTimestamps(const std::wstring& path) const {
+#ifdef _WIN32
+    HANDLE hFile = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING,
+                               FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        SS_LOG_DEBUG(kLogCategory, L"Cannot open %ls for timestamp randomization", path.c_str());
+        return;
+    }
+
+    // Offset creation time 30-180 days into the past
+    uint32_t daysBack = 0;
+    CryptoRandomBytes(reinterpret_cast<uint8_t*>(&daysBack), sizeof(daysBack));
+    daysBack = 30 + (daysBack % 151);
+
+    FILETIME ft{};
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER uli;
+    uli.LowPart  = ft.dwLowDateTime;
+    uli.HighPart = ft.dwHighDateTime;
+    uli.QuadPart -= static_cast<uint64_t>(daysBack) * 864000000000ULL;
+    ft.dwLowDateTime  = uli.LowPart;
+    ft.dwHighDateTime = uli.HighPart;
+
+    // Last-write 2 hours to 30 days in the past
+    FILETIME ftWrite{};
+    GetSystemTimeAsFileTime(&ftWrite);
+    ULARGE_INTEGER uliW;
+    uliW.LowPart  = ftWrite.dwLowDateTime;
+    uliW.HighPart = ftWrite.dwHighDateTime;
+    uint32_t hoursBack = 0;
+    CryptoRandomBytes(reinterpret_cast<uint8_t*>(&hoursBack), sizeof(hoursBack));
+    hoursBack = 2 + (hoursBack % 720);
+    uliW.QuadPart -= static_cast<uint64_t>(hoursBack) * 36000000000ULL;
+    ftWrite.dwLowDateTime  = uliW.LowPart;
+    ftWrite.dwHighDateTime = uliW.HighPart;
+
+    if (!SetFileTime(hFile, &ft, nullptr, &ftWrite)) {
+        SS_LOG_DEBUG(kLogCategory, L"SetFileTime failed on %ls", path.c_str());
+    }
+    CloseHandle(hFile);
+#endif
 }
 
 void HoneypotManagerImpl::RemoveTraps() {
@@ -491,44 +568,59 @@ void HoneypotManagerImpl::RemoveTraps() {
 
     for (const auto& [id, file] : m_honeypots) {
         try {
-            if (fs::exists(file.path)) {
-                // Remove attributes first
-                FileUtils::SetFileAttributes(file.path, false, false); // Unhide
-                fs::remove(file.path);
+#ifdef _WIN32
+            DWORD attrs = GetFileAttributesW(file.path.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES) {
+                attrs &= ~(FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+                SetFileAttributesW(file.path.c_str(), attrs);
             }
-        } catch (...) {
-            // Ignore errors during cleanup
+#endif
+            std::error_code ec;
+            fs::remove(file.path, ec);
+            if (ec) {
+                SS_LOG_WARN(kLogCategory, L"Failed to remove trap %ls: %hs",
+                            file.path.c_str(), ec.message().c_str());
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_WARN(kLogCategory, L"Exception removing trap %ls: %hs",
+                        file.path.c_str(), e.what());
         }
     }
 
     m_honeypots.clear();
     m_pathIndex.clear();
-    m_stats.currentlyActive = 0;
-    Logger::Info("[HoneypotManager] All traps removed");
+    m_stats.currentlyActive.store(0, std::memory_order_relaxed);
+    SS_LOG_INFO(kLogCategory, L"All traps removed");
 }
 
 void HoneypotManagerImpl::RemoveHoneypot(const std::string& honeypotId) {
     std::unique_lock lock(m_mutex);
 
     auto it = m_honeypots.find(honeypotId);
-    if (it != m_honeypots.end()) {
-        try {
-            if (fs::exists(it->second.path)) {
-                FileUtils::SetFileAttributes(it->second.path, false, false);
-                fs::remove(it->second.path);
-            }
-        } catch (...) {}
+    if (it == m_honeypots.end()) return;
 
-        m_pathIndex.erase(StringUtils::ToLowerW(it->second.path));
-        m_honeypots.erase(it);
-        m_stats.currentlyActive--;
-    }
+    const auto& filePath = it->second.path;
+    try {
+#ifdef _WIN32
+        DWORD attrs = GetFileAttributesW(filePath.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES) {
+            attrs &= ~(FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+            SetFileAttributesW(filePath.c_str(), attrs);
+        }
+#endif
+        std::error_code ec;
+        fs::remove(filePath, ec);
+    } catch (...) {}
+
+    m_pathIndex.erase(StringUtils::ToLowerCopy(filePath));
+    m_honeypots.erase(it);
+    if (m_stats.currentlyActive.load(std::memory_order_relaxed) > 0)
+        m_stats.currentlyActive.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void HoneypotManagerImpl::RemoveHoneypotByPath(std::wstring_view path) {
-    std::wstring lowerPath = StringUtils::ToLowerW(std::wstring(path));
+    std::wstring lowerPath = StringUtils::ToLowerCopy(std::wstring(path));
     std::string id;
-
     {
         std::shared_lock lock(m_mutex);
         auto it = m_pathIndex.find(lowerPath);
@@ -536,7 +628,6 @@ void HoneypotManagerImpl::RemoveHoneypotByPath(std::wstring_view path) {
             id = it->second;
         }
     }
-
     if (!id.empty()) {
         RemoveHoneypot(id);
     }
@@ -544,16 +635,13 @@ void HoneypotManagerImpl::RemoveHoneypotByPath(std::wstring_view path) {
 
 bool HoneypotManagerImpl::IsTrap(const std::wstring& filePath) const {
     if (filePath.empty()) return false;
-
     std::shared_lock lock(m_mutex);
-    // Use lower case for case-insensitive Windows paths
-    return m_pathIndex.find(StringUtils::ToLowerW(filePath)) != m_pathIndex.end();
+    return m_pathIndex.contains(StringUtils::ToLowerCopy(filePath));
 }
 
 std::optional<HoneyFile> HoneypotManagerImpl::GetHoneypot(std::wstring_view path) const {
     std::shared_lock lock(m_mutex);
-
-    auto it = m_pathIndex.find(StringUtils::ToLowerW(std::wstring(path)));
+    auto it = m_pathIndex.find(StringUtils::ToLowerCopy(std::wstring(path)));
     if (it != m_pathIndex.end()) {
         auto fileIt = m_honeypots.find(it->second);
         if (fileIt != m_honeypots.end()) {
@@ -576,7 +664,6 @@ std::vector<HoneyFile> HoneypotManagerImpl::GetActiveHoneypots() const {
     std::shared_lock lock(m_mutex);
     std::vector<HoneyFile> result;
     result.reserve(m_honeypots.size());
-
     for (const auto& [id, file] : m_honeypots) {
         if (file.status == HoneypotStatus::Active) {
             result.push_back(file);
@@ -588,15 +675,14 @@ std::vector<HoneyFile> HoneypotManagerImpl::GetActiveHoneypots() const {
 std::vector<HoneyFile> HoneypotManagerImpl::GetHoneypotsInDirectory(std::wstring_view directory) const {
     std::shared_lock lock(m_mutex);
     std::vector<HoneyFile> result;
-    std::wstring dirLower = StringUtils::ToLowerW(std::wstring(directory));
+    std::wstring dirLower = StringUtils::ToLowerCopy(std::wstring(directory));
 
-    // Ensure trailing slash for prefix matching
-    if (dirLower.back() != L'\\' && dirLower.back() != L'/') {
+    if (!dirLower.empty() && dirLower.back() != L'\\' && dirLower.back() != L'/') {
         dirLower += L'\\';
     }
 
-    for (const auto& [path, id] : m_pathIndex) {
-        if (path.find(dirLower) == 0) {
+    for (const auto& [lpath, id] : m_pathIndex) {
+        if (lpath.starts_with(dirLower)) {
             auto it = m_honeypots.find(id);
             if (it != m_honeypots.end()) {
                 result.push_back(it->second);
@@ -610,47 +696,48 @@ void HoneypotManagerImpl::RegenerateTrap(const std::wstring& filePath) {
     if (!m_config.autoRegenerate) return;
 
     auto honeypot = GetHoneypot(filePath);
-    if (honeypot && honeypot->autoRegenerate) {
-        // Simple regeneration: recreate file content
-        HoneypotTemplate tmpl = GetDefaultTemplate(honeypot->fileType);
+    if (!honeypot || !honeypot->autoRegenerate) return;
 
-        try {
-            CreateHoneypotFile(tmpl, honeypot->path);
+    HoneypotTemplate tmpl = GetDefaultTemplate(honeypot->fileType);
 
-            // Re-apply attributes
-            if (honeypot->isHidden || honeypot->isSystem) {
-                FileUtils::SetFileAttributes(honeypot->path, honeypot->isHidden, honeypot->isSystem);
+    try {
+        CreateHoneypotFile(tmpl, honeypot->path);
+        ApplyFileAttributes(honeypot->path);
+        RandomizeTimestamps(honeypot->path);
+
+        {
+            std::unique_lock lock(m_mutex);
+            auto it = m_honeypots.find(honeypot->honeypotId);
+            if (it != m_honeypots.end()) {
+                it->second.status = HoneypotStatus::Active;
+                it->second.lastVerified = Clock::now();
+                FileUtils::Error err;
+                FileUtils::ComputeFileSHA256(it->second.path, it->second.contentHash, &err);
             }
-
-            // Update status
-            {
-                std::unique_lock lock(m_mutex);
-                m_honeypots[honeypot->honeypotId].status = HoneypotStatus::Active;
-            }
-
-            m_stats.regenerations++;
-            Logger::Info("[HoneypotManager] Regenerated trap: {}", StringUtils::WStringToString(honeypot->path));
-
-        } catch (const std::exception& e) {
-            Logger::Error("[HoneypotManager] Failed to regenerate trap: {}", e.what());
         }
+
+        m_stats.regenerations.fetch_add(1, std::memory_order_relaxed);
+        SS_LOG_INFO(kLogCategory, L"Regenerated trap: %ls", honeypot->path.c_str());
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(kLogCategory, L"Regeneration failed for %ls: %hs",
+                     honeypot->path.c_str(), e.what());
     }
 }
 
 void HoneypotManagerImpl::RegenerateAllMissing() {
     std::vector<std::wstring> missingPaths;
-
     {
         std::shared_lock lock(m_mutex);
         for (const auto& [id, file] : m_honeypots) {
-            if (!fs::exists(file.path) && file.autoRegenerate) {
+            std::error_code ec;
+            if (!fs::exists(file.path, ec) && file.autoRegenerate) {
                 missingPaths.push_back(file.path);
             }
         }
     }
-
-    for (const auto& path : missingPaths) {
-        RegenerateTrap(path);
+    for (const auto& p : missingPaths) {
+        RegenerateTrap(p);
     }
 }
 
@@ -662,27 +749,29 @@ bool HoneypotManagerImpl::VerifyHoneypot(const std::string& honeypotId) {
     HoneyFile& file = it->second;
     file.lastVerified = Clock::now();
 
-    if (!fs::exists(file.path)) {
+    std::error_code ec;
+    if (!fs::exists(file.path, ec)) {
         file.status = HoneypotStatus::Missing;
-        Logger::Warn("[HoneypotManager] Trap missing: {}", StringUtils::WStringToString(file.path));
+        SS_LOG_WARN(kLogCategory, L"Trap missing: %ls", file.path.c_str());
         return false;
     }
 
     try {
-        // Verify hash
-        auto currentHashBytes = HashUtils::CalculateSHA256(file.path);
-        Hash256 currentHash;
-        std::memcpy(currentHash.data(), currentHashBytes.data(), 32);
+        Hash256 currentHash{};
+        FileUtils::Error hashErr;
+        if (!FileUtils::ComputeFileSHA256(file.path, currentHash, &hashErr)) {
+            file.status = HoneypotStatus::Error;
+            return false;
+        }
 
         if (currentHash != file.contentHash) {
             file.status = HoneypotStatus::Modified;
-            Logger::Warn("[HoneypotManager] Trap modified (integrity failure): {}", StringUtils::WStringToString(file.path));
+            SS_LOG_WARN(kLogCategory, L"Integrity failure on trap: %ls", file.path.c_str());
             return false;
         }
 
         file.status = HoneypotStatus::Active;
         return true;
-
     } catch (...) {
         file.status = HoneypotStatus::Error;
         return false;
@@ -692,28 +781,25 @@ bool HoneypotManagerImpl::VerifyHoneypot(const std::string& honeypotId) {
 std::vector<std::string> HoneypotManagerImpl::VerifyAllHoneypots() {
     std::vector<std::string> failedIds;
     std::vector<std::string> allIds;
-
     {
         std::shared_lock lock(m_mutex);
+        allIds.reserve(m_honeypots.size());
         for (const auto& [id, _] : m_honeypots) {
             allIds.push_back(id);
         }
     }
-
     for (const auto& id : allIds) {
         if (!VerifyHoneypot(id)) {
             failedIds.push_back(id);
         }
     }
-
     return failedIds;
 }
 
 void HoneypotManagerImpl::RunHealthCheck() {
     auto failed = VerifyAllHoneypots();
     if (!failed.empty()) {
-        Logger::Warn("[HoneypotManager] Health check found {} compromised traps", failed.size());
-
+        SS_LOG_WARN(kLogCategory, L"Health check: %zu compromised traps", failed.size());
         if (m_config.autoRegenerate) {
             for (const auto& id : failed) {
                 auto h = GetHoneypotById(id);
@@ -721,93 +807,181 @@ void HoneypotManagerImpl::RunHealthCheck() {
             }
         }
     } else {
-        Logger::Info("[HoneypotManager] Health check passed ({} active traps)", m_stats.currentlyActive.load());
+        SS_LOG_DEBUG(kLogCategory, L"Health check passed (%llu active)",
+                     m_stats.currentlyActive.load(std::memory_order_relaxed));
     }
 }
 
-void HoneypotManagerImpl::OnHoneypotAccessed(std::wstring_view path, uint32_t pid, HoneypotAccessType accessType) {
-    // Only process known traps
-    if (!IsTrap(std::wstring(path))) return;
+// ============================================================================
+// ACCESS HANDLING — CRITICAL DETECTION HOT-PATH
+// ============================================================================
 
-    // Ignore self-access (if we had a PID)
-    if (pid == GetCurrentProcessId()) return;
+bool HoneypotManagerImpl::IsProcessWhitelisted(uint32_t pid) const {
+    if (pid == 0 || pid == 4) return true;  // System/Idle
+    if (pid == GetCurrentProcessId()) return true;  // Self
 
-    m_stats.accessEvents++;
-
-    // Update type stats
-    if (static_cast<size_t>(accessType) < m_stats.eventsByType.size()) {
-        m_stats.eventsByType[static_cast<size_t>(accessType)]++;
+    // Check configured whitelists
+    std::optional<std::wstring> procName;
+    std::optional<std::wstring> procPath;
+    {
+        ProcessUtils::Error err;
+        procName = ProcessUtils::GetProcessName(static_cast<ProcessUtils::ProcessId>(pid), &err);
+        procPath = ProcessUtils::GetProcessPath(static_cast<ProcessUtils::ProcessId>(pid), &err);
     }
 
+    std::shared_lock lock(m_mutex);
+
+    if (procName) {
+        for (const auto& wl : m_config.whitelistedProcessNames) {
+            if (StringUtils::IEquals(*procName, wl)) return true;
+        }
+    }
+
+    if (procPath) {
+        for (const auto& wl : m_config.whitelistedProcessPaths) {
+            if (StringUtils::IEquals(*procPath, wl)) return true;
+        }
+    }
+
+    return false;
+}
+
+void HoneypotManagerImpl::HandleDetectedAccess(
+    std::wstring_view path, uint32_t pid, HoneypotAccessType accessType) {
+
+    m_stats.accessEvents.fetch_add(1, std::memory_order_relaxed);
+    if (static_cast<size_t>(accessType) < m_stats.eventsByType.size()) {
+        m_stats.eventsByType[static_cast<size_t>(accessType)].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Build access event
     HoneypotAccessEvent event;
-    event.eventId = m_eventCounter.fetch_add(1);
+    event.eventId   = m_eventCounter.fetch_add(1, std::memory_order_relaxed);
     event.timestamp = std::chrono::system_clock::now();
     event.honeypotPath = std::wstring(path);
-    event.processId = pid;
-    event.accessType = accessType;
-    event.isSuspicious = true; // By default, any access to a honeypot is suspicious
+    event.processId    = pid;
+    event.accessType   = accessType;
+    event.isSuspicious = true;
 
-    // Gather process info
-    try {
-        event.processName = ProcessUtils::GetProcessName(pid);
-        event.processPath = ProcessUtils::GetProcessImagePath(pid);
-        event.commandLine = ProcessUtils::GetProcessCommandLine(pid);
-        event.parentPid = ProcessUtils::GetParentProcessId(pid);
-    } catch (...) {
-        event.details = L"Failed to gather complete process info";
+    // Gather process forensics
+    {
+        ProcessUtils::Error err;
+        auto name = ProcessUtils::GetProcessName(static_cast<ProcessUtils::ProcessId>(pid), &err);
+        if (name) event.processName = *name;
+
+        auto ppath = ProcessUtils::GetProcessPath(static_cast<ProcessUtils::ProcessId>(pid), &err);
+        if (ppath) event.processPath = *ppath;
+
+        auto cmdline = ProcessUtils::GetProcessCommandLine(static_cast<ProcessUtils::ProcessId>(pid), &err);
+        if (cmdline) event.commandLine = *cmdline;
+
+        auto ppid = ProcessUtils::GetParentProcessId(static_cast<ProcessUtils::ProcessId>(pid), &err);
+        if (ppid) event.parentPid = static_cast<uint32_t>(*ppid);
     }
 
-    // Lookup honeypot ID
-    auto honeypot = GetHoneypot(path);
-    if (honeypot) {
-        event.honeypotId = honeypot->honeypotId;
-
-        // Update honeypot status
-        {
-            std::unique_lock lock(m_mutex);
-            m_honeypots[honeypot->honeypotId].status = HoneypotStatus::Compromised;
+    // Resolve honeypot ID and mark compromised (single lock acquisition)
+    {
+        std::unique_lock lock(m_mutex);
+        auto pathIt = m_pathIndex.find(StringUtils::ToLowerCopy(std::wstring(path)));
+        if (pathIt != m_pathIndex.end()) {
+            event.honeypotId = pathIt->second;
+            auto fileIt = m_honeypots.find(pathIt->second);
+            if (fileIt != m_honeypots.end()) {
+                fileIt->second.status = HoneypotStatus::Compromised;
+            }
         }
     }
 
-    // Take action
-    if (m_config.killOnAccess && event.processId > 4) { // Don't kill system (PID 0/4)
-        Logger::Critical("[HoneypotManager] RANSOMWARE DETECTED! Process {} ({}) touched trap {}",
-            StringUtils::WStringToString(event.processName), pid, StringUtils::WStringToString(event.honeypotPath));
+    // Determine response action
+    bool shouldKill = m_config.killOnAccess &&
+                      (accessType == HoneypotAccessType::Write ||
+                       accessType == HoneypotAccessType::Delete ||
+                       accessType == HoneypotAccessType::Rename);
 
-        if (ProcessUtils::KillProcess(pid)) {
+    if (shouldKill && pid > 4) {
+        SS_LOG_FATAL(kLogCategory,
+            L"RANSOMWARE DETECTED! PID %u (%ls) touched trap %ls [%ls]",
+            pid, event.processName.c_str(), event.honeypotPath.c_str(),
+            StringUtils::ToWide(std::string(GetAccessTypeName(accessType))).c_str());
+
+        ProcessUtils::Error killErr;
+        if (ProcessUtils::TerminateProcess(static_cast<ProcessUtils::ProcessId>(pid), 1, &killErr)) {
             event.actionTaken = "Process Terminated";
-            m_stats.processesKilled++;
-            Logger::Info("[HoneypotManager] Terminated malicious process {}", pid);
+            m_stats.processesKilled.fetch_add(1, std::memory_order_relaxed);
+            SS_LOG_INFO(kLogCategory, L"Terminated malicious process %u", pid);
         } else {
             event.actionTaken = "Termination Failed";
-            Logger::Error("[HoneypotManager] Failed to terminate process {}", pid);
+            SS_LOG_ERROR(kLogCategory, L"Failed to terminate PID %u", pid);
         }
-    } else {
+    } else if (accessType == HoneypotAccessType::Read) {
+        SS_LOG_WARN(kLogCategory, L"READ alert: PID %u (%ls) read trap %ls",
+                    pid, event.processName.c_str(), event.honeypotPath.c_str());
         event.actionTaken = "Alert Only";
-        Logger::Warn("[HoneypotManager] Alert: Process {} ({}) accessed trap",
-            StringUtils::WStringToString(event.processName), pid);
+    } else {
+        SS_LOG_WARN(kLogCategory, L"Access alert: PID %u (%ls) accessed trap %ls",
+                    pid, event.processName.c_str(), event.honeypotPath.c_str());
+        event.actionTaken = "Alert Only";
     }
 
     // Store event
     {
         std::lock_guard lock(m_eventMutex);
-        m_recentEvents.push_back(event);
-        if (m_recentEvents.size() > 100) m_recentEvents.pop_front();
+        m_recentEvents.push_back(std::move(event));
+        while (m_recentEvents.size() > 1000) m_recentEvents.pop_front();
     }
 
-    // Notify callback
-    NotifyAccess(event);
+    // Notify callback (copy event since we moved it)
+    {
+        std::lock_guard lock(m_eventMutex);
+        if (!m_recentEvents.empty()) {
+            NotifyAccess(m_recentEvents.back());
+        }
+    }
+}
+
+void HoneypotManagerImpl::OnHoneypotAccessed(
+    std::wstring_view path, uint32_t pid, HoneypotAccessType accessType) {
+
+    if (!IsTrap(std::wstring(path))) return;
+    if (IsProcessWhitelisted(pid)) return;
+
+    HandleDetectedAccess(path, pid, accessType);
+}
+
+bool HoneypotManagerImpl::ProcessKernelNotification(
+    std::wstring_view path, uint32_t pid, uint32_t threadId,
+    HoneypotAccessType accessType) {
+
+    // Kernel minifilter sends pre-operation notifications here.
+    // Return true = BLOCK the operation at kernel level.
+    if (!IsTrap(std::wstring(path))) return false;
+    if (IsProcessWhitelisted(pid)) return false;
+
+    SS_LOG_INFO(kLogCategory,
+        L"Kernel notification: PID %u TID %u type %d on %ls",
+        pid, threadId, static_cast<int>(accessType), std::wstring(path).c_str());
+
+    HandleDetectedAccess(path, pid, accessType);
+
+    // Write/Delete/Rename/SetInfo on a honeypot = BLOCK immediately
+    if (accessType != HoneypotAccessType::Read &&
+        accessType != HoneypotAccessType::Enumerate) {
+        return true;  // Instruct minifilter to deny the IRP
+    }
+
+    // Reads generate an alert but are allowed (to let the ransomware
+    // reveal itself before it attempts the write)
+    return false;
 }
 
 void HoneypotManagerImpl::ReportFalsePositive(uint64_t eventId, const std::string& reason) {
     std::lock_guard lock(m_eventMutex);
-
     for (auto& event : m_recentEvents) {
         if (event.eventId == eventId) {
             event.isSuspicious = false;
-            event.details = StringUtils::StringToWString("False Positive: " + reason);
-            m_stats.falsePositives++;
-            Logger::Info("[HoneypotManager] Event {} marked as false positive", eventId);
+            event.details = StringUtils::ToWide("False Positive: " + reason);
+            m_stats.falsePositives.fetch_add(1, std::memory_order_relaxed);
+            SS_LOG_INFO(kLogCategory, L"Event %llu marked as false positive", eventId);
             break;
         }
     }
@@ -816,12 +990,12 @@ void HoneypotManagerImpl::ReportFalsePositive(uint64_t eventId, const std::strin
 std::vector<HoneypotAccessEvent> HoneypotManagerImpl::GetRecentAccessEvents(size_t maxCount) const {
     std::lock_guard lock(m_eventMutex);
     std::vector<HoneypotAccessEvent> result;
-
     size_t count = std::min(maxCount, m_recentEvents.size());
-    for (auto it = m_recentEvents.rbegin(); it != m_recentEvents.rbegin() + count; ++it) {
+    result.reserve(count);
+    for (auto it = m_recentEvents.rbegin();
+         it != m_recentEvents.rend() && result.size() < count; ++it) {
         result.push_back(*it);
     }
-
     return result;
 }
 
@@ -849,7 +1023,7 @@ size_t HoneypotManagerImpl::GetHoneypotCount() const noexcept {
 }
 
 size_t HoneypotManagerImpl::GetActiveHoneypotCount() const noexcept {
-    return m_stats.currentlyActive.load();
+    return m_stats.currentlyActive.load(std::memory_order_relaxed);
 }
 
 void HoneypotManagerImpl::AddTemplate(const HoneypotTemplate& tmpl) {
@@ -859,10 +1033,8 @@ void HoneypotManagerImpl::AddTemplate(const HoneypotTemplate& tmpl) {
 
 void HoneypotManagerImpl::RemoveTemplate(const std::string& templateName) {
     std::unique_lock lock(m_mutex);
-    m_templates.erase(
-        std::remove_if(m_templates.begin(), m_templates.end(),
-            [&](const HoneypotTemplate& t) { return t.templateName == templateName; }),
-        m_templates.end());
+    std::erase_if(m_templates,
+        [&](const HoneypotTemplate& t) { return t.templateName == templateName; });
 }
 
 std::vector<HoneypotTemplate> HoneypotManagerImpl::GetTemplates() const {
@@ -875,41 +1047,67 @@ void HoneypotManagerImpl::CreateDecoyFile(std::wstring_view path, HoneypotFileTy
     CreateHoneypotFile(tmpl, std::wstring(path));
 }
 
-void HoneypotManagerImpl::CreateHoneypotFile(const HoneypotTemplate& tmpl, const std::wstring& path) {
-    std::ofstream file(path, std::ios::binary);
-    if (!file) {
-        throw std::runtime_error("Cannot create file: " + StringUtils::WStringToString(path));
-    }
+// ============================================================================
+// FILE CREATION — APT-RESISTANT CONTENT GENERATION
+// ============================================================================
 
-    // Write magic bytes
+void HoneypotManagerImpl::CreateHoneypotFile(
+    const HoneypotTemplate& tmpl, const std::wstring& filePath) {
+
+    // Determine target size
+    size_t targetSize = tmpl.minSize;
+    if (tmpl.maxSize > tmpl.minSize) {
+        uint32_t r = 0;
+        CryptoRandomBytes(reinterpret_cast<uint8_t*>(&r), sizeof(r));
+        targetSize = tmpl.minSize + (r % (tmpl.maxSize - tmpl.minSize + 1));
+    }
+    targetSize = std::clamp(targetSize,
+                            HoneypotConstants::MIN_HONEYPOT_SIZE,
+                            HoneypotConstants::MAX_HONEYPOT_SIZE);
+
+    // Build content buffer
+    std::vector<uint8_t> content;
+    content.reserve(targetSize);
+
+    // 1. Write magic bytes (file header)
     if (!tmpl.magicBytes.empty()) {
-        file.write(reinterpret_cast<const char*>(tmpl.magicBytes.data()), tmpl.magicBytes.size());
+        content.insert(content.end(), tmpl.magicBytes.begin(), tmpl.magicBytes.end());
     }
 
-    // Write content
+    // 2. Write explicit template content
     if (!tmpl.contentTemplate.empty()) {
-        file.write(reinterpret_cast<const char*>(tmpl.contentTemplate.data()), tmpl.contentTemplate.size());
-    } else if (tmpl.randomizeContent) {
-        // Determine size
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        std::uniform_int_distribution<size_t> dist(tmpl.minSize, tmpl.maxSize);
-        size_t size = dist(gen);
-
-        // Write random chunks to be efficient
-        const size_t chunkSize = 4096;
-        std::vector<uint8_t> chunk = GenerateRandomBytes(chunkSize);
-
-        size_t written = 0;
-        while (written < size) {
-            size_t toWrite = std::min(chunkSize, size - written);
-            file.write(reinterpret_cast<const char*>(chunk.data()), toWrite);
-            written += toWrite;
-        }
+        size_t space = targetSize - content.size();
+        size_t toWrite = std::min(tmpl.contentTemplate.size(), space);
+        content.insert(content.end(),
+                       tmpl.contentTemplate.begin(),
+                       tmpl.contentTemplate.begin() + toWrite);
     }
 
-    file.flush();
-    file.close();
+    // 3. Fill remaining with varied random chunks (each chunk uniquely generated)
+    while (content.size() < targetSize) {
+        size_t remaining = targetSize - content.size();
+        size_t chunkSize = std::min<size_t>(4096, remaining);
+        auto chunk = GenerateRandomBytes(chunkSize);
+        if (chunk.empty()) {
+            SS_LOG_ERROR(kLogCategory, L"Random generation failed during file creation");
+            break;
+        }
+        content.insert(content.end(), chunk.begin(), chunk.end());
+    }
+
+    if (content.size() > targetSize) {
+        content.resize(targetSize);
+    }
+
+    // Atomic write via FileUtils
+    FileUtils::Error writeErr;
+    if (!FileUtils::WriteAllBytesAtomic(
+            filePath,
+            reinterpret_cast<const std::byte*>(content.data()),
+            content.size(), &writeErr)) {
+        throw std::runtime_error(
+            "Atomic write failed for: " + StringUtils::ToNarrow(filePath));
+    }
 }
 
 void HoneypotManagerImpl::NotifyAccess(const HoneypotAccessEvent& event) {
@@ -917,7 +1115,9 @@ void HoneypotManagerImpl::NotifyAccess(const HoneypotAccessEvent& event) {
     if (m_accessCallback) {
         try {
             m_accessCallback(event);
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(kLogCategory, L"Access callback threw: %hs", e.what());
+        }
     }
 }
 
@@ -926,44 +1126,60 @@ void HoneypotManagerImpl::NotifyStatus(const HoneyFile& file, HoneypotStatus sta
     if (m_statusCallback) {
         try {
             m_statusCallback(file, status);
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(kLogCategory, L"Status callback threw: %hs", e.what());
+        }
     }
 }
 
 bool HoneypotManagerImpl::SelfTest() {
-    Logger::Info("[HoneypotManager] Running self-test...");
+    SS_LOG_INFO(kLogCategory, L"Running self-test...");
 
     try {
-        fs::path tempPath = fs::temp_directory_path() / L"ShadowStrike_Honeypot_Test.dat";
-
-        // Test 1: Creation
-        HoneypotTemplate tmpl;
-        tmpl.templateName = "Test";
-        tmpl.fileType = HoneypotFileType::Text;
-        tmpl.minSize = 100;
-        tmpl.maxSize = 200;
-        tmpl.randomizeContent = true;
-
-        CreateHoneypotFile(tmpl, tempPath.wstring());
-
-        if (!fs::exists(tempPath)) {
-            Logger::Error("[HoneypotManager] Self-test failed: File creation");
+        // Use agent's own data directory for test artifacts
+        fs::path testDir = fs::temp_directory_path() / L"ShadowStrike_SelfTest";
+        std::error_code ec;
+        fs::create_directories(testDir, ec);
+        if (ec) {
+            SS_LOG_ERROR(kLogCategory, L"Cannot create self-test directory");
             return false;
         }
 
-        // Test 2: Attributes
-        FileUtils::SetFileAttributes(tempPath.wstring(), true, false); // Hide
-        // Verification omitted for brevity/portability but implied
+        fs::path testFile = testDir / L"selftest_honeypot.dat";
 
-        // Clean up
-        FileUtils::SetFileAttributes(tempPath.wstring(), false, false);
-        fs::remove(tempPath);
+        HoneypotTemplate tmpl;
+        tmpl.templateName = "SelfTest";
+        tmpl.fileType = HoneypotFileType::Text;
+        tmpl.minSize = 512;
+        tmpl.maxSize = 1024;
+        tmpl.randomizeContent = true;
 
-        Logger::Info("[HoneypotManager] Self-test PASSED");
+        CreateHoneypotFile(tmpl, testFile.wstring());
+
+        if (!fs::exists(testFile, ec)) {
+            SS_LOG_ERROR(kLogCategory, L"Self-test failed: file not created");
+            return false;
+        }
+
+        // Verify integrity round-trip
+        Hash256 hash{};
+        FileUtils::Error hashErr;
+        if (!FileUtils::ComputeFileSHA256(testFile.wstring(), hash, &hashErr)) {
+            SS_LOG_ERROR(kLogCategory, L"Self-test failed: hash computation");
+            fs::remove(testFile, ec);
+            fs::remove(testDir, ec);
+            return false;
+        }
+
+        // Cleanup
+        fs::remove(testFile, ec);
+        fs::remove(testDir, ec);
+
+        SS_LOG_INFO(kLogCategory, L"Self-test PASSED");
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[HoneypotManager] Self-test exception: {}", e.what());
+        SS_LOG_ERROR(kLogCategory, L"Self-test exception: %hs", e.what());
         return false;
     }
 }
@@ -1014,7 +1230,8 @@ bool HoneypotManager::DeployToLocation(const DeploymentLocation& location) {
     return m_impl->DeployToLocation(location);
 }
 
-std::optional<std::string> HoneypotManager::DeployHoneypot(std::wstring_view directory, const HoneypotTemplate& tmpl) {
+std::optional<std::string> HoneypotManager::DeployHoneypot(
+    std::wstring_view directory, const HoneypotTemplate& tmpl) {
     return m_impl->DeployHoneypot(directory, tmpl);
 }
 
@@ -1079,8 +1296,19 @@ void HoneypotManager::RunHealthCheck() {
     m_impl->RunHealthCheck();
 }
 
-void HoneypotManager::OnHoneypotAccessed(std::wstring_view path, uint32_t pid, HoneypotAccessType accessType) {
+void HoneypotManager::OnHoneypotAccessed(
+    std::wstring_view path, uint32_t pid, HoneypotAccessType accessType) {
     m_impl->OnHoneypotAccessed(path, pid, accessType);
+}
+
+bool HoneypotManager::ProcessKernelNotification(
+    std::wstring_view path, uint32_t pid, uint32_t threadId,
+    HoneypotAccessType accessType) {
+    return m_impl->ProcessKernelNotification(path, pid, threadId, accessType);
+}
+
+bool HoneypotManager::IsProcessWhitelisted(uint32_t pid) const {
+    return m_impl->IsProcessWhitelisted(pid);
 }
 
 void HoneypotManager::ReportFalsePositive(uint64_t eventId, const std::string& reason) {
@@ -1186,6 +1414,7 @@ std::string_view GetAccessTypeName(HoneypotAccessType type) noexcept {
         case HoneypotAccessType::Delete: return "Delete";
         case HoneypotAccessType::Rename: return "Rename";
         case HoneypotAccessType::Enumerate: return "Enumerate";
+        case HoneypotAccessType::SetInfo: return "SetInfo";
         default: return "Unknown";
     }
 }
@@ -1206,33 +1435,51 @@ HoneypotTemplate GetDefaultTemplate(HoneypotFileType type) {
     HoneypotTemplate tmpl;
     tmpl.fileType = type;
     tmpl.randomizeContent = true;
-    tmpl.minSize = 1024;
-    tmpl.maxSize = 10240;
+    tmpl.minSize = 2048;
+    tmpl.maxSize = 65536;
 
     switch (type) {
         case HoneypotFileType::Document:
             tmpl.templateName = "Word Doc";
             tmpl.extension = L".docx";
-            tmpl.magicBytes = {0x50, 0x4B, 0x03, 0x04}; // PK zip header
+            // PK ZIP header (Office Open XML)
+            tmpl.magicBytes = {0x50, 0x4B, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00};
             break;
         case HoneypotFileType::Spreadsheet:
             tmpl.templateName = "Excel Sheet";
             tmpl.extension = L".xlsx";
-            tmpl.magicBytes = {0x50, 0x4B, 0x03, 0x04};
+            tmpl.magicBytes = {0x50, 0x4B, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00};
+            break;
+        case HoneypotFileType::Presentation:
+            tmpl.templateName = "PowerPoint";
+            tmpl.extension = L".pptx";
+            tmpl.magicBytes = {0x50, 0x4B, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00};
             break;
         case HoneypotFileType::PDF:
             tmpl.templateName = "PDF Document";
             tmpl.extension = L".pdf";
-            tmpl.magicBytes = {0x25, 0x50, 0x44, 0x46}; // %PDF
+            // Full PDF header with version
+            tmpl.magicBytes = {0x25, 0x50, 0x44, 0x46, 0x2D, 0x31, 0x2E, 0x37};
             break;
         case HoneypotFileType::Image:
             tmpl.templateName = "JPEG Image";
             tmpl.extension = L".jpg";
-            tmpl.magicBytes = {0xFF, 0xD8, 0xFF};
+            // JFIF header
+            tmpl.magicBytes = {0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46,
+                               0x49, 0x46, 0x00, 0x01};
             break;
         case HoneypotFileType::Crypto:
             tmpl.templateName = "Wallet";
             tmpl.extension = L".dat";
+            tmpl.minSize = 4096;
+            tmpl.maxSize = 131072;
+            break;
+        case HoneypotFileType::Database:
+            tmpl.templateName = "SQLite DB";
+            tmpl.extension = L".db";
+            // SQLite header
+            tmpl.magicBytes = {0x53, 0x51, 0x4C, 0x69, 0x74, 0x65, 0x20, 0x66,
+                               0x6F, 0x72, 0x6D, 0x61, 0x74, 0x20, 0x33, 0x00};
             break;
         default:
             tmpl.templateName = "Text File";
@@ -1243,44 +1490,52 @@ HoneypotTemplate GetDefaultTemplate(HoneypotFileType type) {
 }
 
 std::wstring GenerateHoneypotFilename(HoneypotFileType type) {
-    // In production, this would pick from a large dictionary of realistic names
-    // Here we use a simple selection
-    const wchar_t* names[] = {
-        L"Passwords", L"Accounts", L"Financial", L"Private", L"Backup",
-        L"Keys", L"Login", L"Secret", L"Wallet", L"Tax"
-    };
+    // Pick from realistic business document name stems
+    const size_t idx = SecureRandomIndex(HoneypotConstants::DECOY_NAME_STEM_COUNT);
+    std::wstring name = HoneypotConstants::DECOY_NAME_STEMS[idx];
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<size_t> dist(0, 9);
-
-    std::wstring name = names[dist(gen)];
-
-    // Add extension if not handled by template logic
-    if (type == HoneypotFileType::Document) name += L".docx";
-    else if (type == HoneypotFileType::PDF) name += L".pdf";
-    else if (type == HoneypotFileType::Spreadsheet) name += L".xlsx";
-    else name += L".txt";
+    // Append type-appropriate extension
+    switch (type) {
+        case HoneypotFileType::Document:     name += L".docx"; break;
+        case HoneypotFileType::Spreadsheet:  name += L".xlsx"; break;
+        case HoneypotFileType::Presentation: name += L".pptx"; break;
+        case HoneypotFileType::PDF:          name += L".pdf";  break;
+        case HoneypotFileType::Image:        name += L".jpg";  break;
+        case HoneypotFileType::Database:     name += L".db";   break;
+        case HoneypotFileType::Archive:      name += L".zip";  break;
+        default:                             name += L".txt";  break;
+    }
 
     return name;
 }
 
+// ============================================================================
+// SERIALIZATION
+// ============================================================================
+
 std::string HoneyFile::ToJson() const {
     nlohmann::json j;
     j["id"] = honeypotId;
-    j["path"] = StringUtils::WStringToString(path);
+    j["path"] = StringUtils::ToNarrow(path);
     j["status"] = static_cast<int>(status);
     j["fileType"] = static_cast<int>(fileType);
+    j["fileSize"] = fileSize;
+    j["isHidden"] = isHidden;
+    j["autoRegenerate"] = autoRegenerate;
     return j.dump();
 }
 
 std::string HoneypotAccessEvent::ToJson() const {
     nlohmann::json j;
     j["eventId"] = eventId;
-    j["honeypotPath"] = StringUtils::WStringToString(honeypotPath);
+    j["honeypotPath"] = StringUtils::ToNarrow(honeypotPath);
     j["processId"] = processId;
-    j["processName"] = StringUtils::WStringToString(processName);
+    j["processName"] = StringUtils::ToNarrow(processName);
+    j["processPath"] = StringUtils::ToNarrow(processPath);
+    j["accessType"] = static_cast<int>(accessType);
     j["action"] = actionTaken;
+    j["isSuspicious"] = isSuspicious;
+    j["parentPid"] = parentPid;
     return j.dump();
 }
 
@@ -1300,30 +1555,46 @@ void HoneypotManagerConfiguration::LoadDefaultLocations() {
     desktop.isEnabled = true;
     desktop.priority = 8;
     locations.push_back(desktop);
+
+    DeploymentLocation downloads;
+    downloads.type = LocationType::UserDownloads;
+    downloads.isEnabled = true;
+    downloads.priority = 7;
+    locations.push_back(downloads);
+
+    DeploymentLocation pictures;
+    pictures.type = LocationType::UserPictures;
+    pictures.isEnabled = true;
+    pictures.priority = 5;
+    locations.push_back(pictures);
 }
 
 void HoneypotManagerConfiguration::LoadDefaultTemplates() {
     templates.push_back(GetDefaultTemplate(HoneypotFileType::Document));
     templates.push_back(GetDefaultTemplate(HoneypotFileType::PDF));
     templates.push_back(GetDefaultTemplate(HoneypotFileType::Spreadsheet));
+    templates.push_back(GetDefaultTemplate(HoneypotFileType::Image));
 }
 
 void HoneypotStatistics::Reset() noexcept {
-    totalDeployed = 0;
-    currentlyActive = 0;
-    accessEvents = 0;
-    processesKilled = 0;
-    regenerations = 0;
-    falsePositives = 0;
-    for (auto& e : eventsByType) e = 0;
+    totalDeployed.store(0, std::memory_order_relaxed);
+    currentlyActive.store(0, std::memory_order_relaxed);
+    accessEvents.store(0, std::memory_order_relaxed);
+    processesKilled.store(0, std::memory_order_relaxed);
+    regenerations.store(0, std::memory_order_relaxed);
+    falsePositives.store(0, std::memory_order_relaxed);
+    for (auto& e : eventsByType) e.store(0, std::memory_order_relaxed);
     startTime = Clock::now();
 }
 
 std::string HoneypotStatistics::ToJson() const {
     nlohmann::json j;
-    j["active"] = currentlyActive.load();
-    j["events"] = accessEvents.load();
-    j["killed"] = processesKilled.load();
+    j["totalDeployed"] = totalDeployed.load(std::memory_order_relaxed);
+    j["active"] = currentlyActive.load(std::memory_order_relaxed);
+    j["events"] = accessEvents.load(std::memory_order_relaxed);
+    j["killed"] = processesKilled.load(std::memory_order_relaxed);
+    j["regenerations"] = regenerations.load(std::memory_order_relaxed);
+    j["falsePositives"] = falsePositives.load(std::memory_order_relaxed);
     return j.dump();
 }
 

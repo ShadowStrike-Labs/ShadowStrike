@@ -329,6 +329,28 @@ enum class ModuleStatus : uint8_t {
     Error           = 7
 };
 
+/**
+ * @brief Recovery method for file restoration
+ */
+enum class RecoveryMethod : uint8_t {
+    Auto            = 0,    ///< Best available method (VSS > Backup > Key)
+    VSSRestore      = 1,    ///< Volume Shadow Copy restoration
+    BackupRestore   = 2,    ///< FileBackupManager restoration
+    KeyDecryption   = 3,    ///< Key-based decryption
+    PartialRecovery = 4     ///< Best-effort partial recovery
+};
+
+/**
+ * @brief Recovery priority level for triage ordering
+ */
+enum class RecoveryPriority : uint8_t {
+    Critical    = 0,    ///< System files, databases
+    High        = 1,    ///< Documents, source code
+    Medium      = 2,    ///< Media, archives
+    Low         = 3,    ///< Temp files, caches
+    Background  = 4     ///< Everything else
+};
+
 // ============================================================================
 // STRUCTURES
 // ============================================================================
@@ -421,7 +443,26 @@ struct DecryptionKey {
     
     /// @brief Notes
     std::string notes;
-    
+
+    /// @brief Secure destructor - zeroes all key material
+    ~DecryptionKey() {
+        if (!keyData.empty()) {
+            ::SecureZeroMemory(keyData.data(), keyData.size());
+        }
+        if (!iv.empty()) {
+            ::SecureZeroMemory(iv.data(), iv.size());
+        }
+        if (!rsaPrivateKey.empty()) {
+            ::SecureZeroMemory(rsaPrivateKey.data(), rsaPrivateKey.size());
+        }
+    }
+
+    DecryptionKey() = default;
+    DecryptionKey(const DecryptionKey& other) = default;
+    DecryptionKey& operator=(const DecryptionKey& other) = default;
+    DecryptionKey(DecryptionKey&& other) noexcept = default;
+    DecryptionKey& operator=(DecryptionKey&& other) noexcept = default;
+
     /**
      * @brief Check if key is valid for file
      */
@@ -507,6 +548,69 @@ struct BatchDecryptionResult {
     /// @brief Overall success rate
     [[nodiscard]] double GetSuccessRate() const noexcept;
     
+    /**
+     * @brief Serialize to JSON
+     */
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Recovery options for file restoration
+ */
+struct RecoveryOptions {
+    /// @brief Preferred recovery method
+    RecoveryMethod method = RecoveryMethod::Auto;
+
+    /// @brief Ransomware process ID (must be verified terminated before recovery)
+    uint32_t ransomwarePid = 0;
+
+    /// @brief Verify file integrity after recovery (SHA-256 against backup hash)
+    bool verifyIntegrity = true;
+
+    /// @brief Preserve encrypted copy for forensic analysis
+    bool preserveForensicCopy = true;
+
+    /// @brief Forensic evidence directory
+    std::wstring forensicDirectory;
+
+    /// @brief Use atomic file replacement (temp + rename)
+    bool atomicReplace = true;
+
+    /// @brief Specific VSS snapshot ID to restore from (empty = most recent)
+    std::wstring vssSnapshotId;
+};
+
+/**
+ * @brief Result of a file recovery operation
+ */
+struct RecoveryResult {
+    /// @brief Original encrypted file path
+    std::wstring encryptedPath;
+
+    /// @brief Recovered file path
+    std::wstring recoveredPath;
+
+    /// @brief Forensic copy path (if preserved)
+    std::wstring forensicCopyPath;
+
+    /// @brief Recovery method used
+    RecoveryMethod methodUsed = RecoveryMethod::Auto;
+
+    /// @brief Status
+    DecryptionStatus status = DecryptionStatus::Failed;
+
+    /// @brief Duration (milliseconds)
+    uint64_t durationMs = 0;
+
+    /// @brief Recovered file size
+    uint64_t recoveredSize = 0;
+
+    /// @brief Integrity verification passed
+    bool integrityVerified = false;
+
+    /// @brief Error message
+    std::string errorMessage;
+
     /**
      * @brief Serialize to JSON
      */
@@ -756,7 +860,75 @@ public:
      * @brief Cancel ongoing decryption
      */
     void CancelDecryption();
-    
+
+    // ========================================================================
+    // RECOVERY OPERATIONS
+    // ========================================================================
+
+    /**
+     * @brief Recover a file using the best available method
+     * @details Tries VSS first, then FileBackupManager, then key-based decryption.
+     *          Verifies ransomware process is terminated before recovery.
+     *          Uses atomic file replacement and integrity verification.
+     * @param filePath Path to the encrypted/damaged file
+     * @param options Recovery options
+     * @return Recovery result with status, method used, and forensic info
+     */
+    [[nodiscard]] RecoveryResult RecoverFile(std::wstring_view filePath,
+                                             const RecoveryOptions& options = {});
+
+    /**
+     * @brief Recover all files in a directory
+     * @details Prioritizes files by type and recency. Uses best-effort approach.
+     */
+    [[nodiscard]] std::vector<RecoveryResult> RecoverDirectory(
+        std::wstring_view dirPath, const RecoveryOptions& options = {});
+
+    /**
+     * @brief Recover a file specifically from a Volume Shadow Copy
+     * @param filePath Original file path
+     * @param snapshotId Specific snapshot ID (empty = most recent pre-infection)
+     */
+    [[nodiscard]] RecoveryResult RecoverFromVSS(std::wstring_view filePath,
+                                                 std::wstring_view snapshotId = L"");
+
+    /**
+     * @brief Recover a file from FileBackupManager JIT backups
+     * @param filePath Original file path
+     * @param ransomwarePid The ransomware process PID (for backup lookup)
+     */
+    [[nodiscard]] RecoveryResult RecoverFromBackup(std::wstring_view filePath,
+                                                    uint32_t ransomwarePid);
+
+    /**
+     * @brief Verify that a ransomware process has been terminated
+     * @details MUST be called before any recovery operation. If the process is
+     *          still running, recovered files will be re-encrypted immediately.
+     * @param pid Process ID of the suspected ransomware
+     * @return True if process is confirmed terminated or does not exist
+     */
+    [[nodiscard]] bool VerifyRansomwareTerminated(uint32_t pid) const;
+
+    /**
+     * @brief Verify recovered file integrity against a known hash
+     * @param filePath Path to the recovered file
+     * @param expectedHash SHA-256 hash of the original pre-encryption content
+     * @return True if hash matches
+     */
+    [[nodiscard]] bool VerifyFileIntegrity(std::wstring_view filePath,
+                                           std::span<const uint8_t> expectedHash) const;
+
+    /**
+     * @brief Preserve encrypted file for forensic analysis
+     * @details Copies the encrypted file to a forensic evidence directory
+     *          before any recovery operation modifies or removes it.
+     * @param encryptedFilePath Path to the encrypted file
+     * @param forensicDirectory Destination directory for forensic copies
+     * @return True if forensic copy was successfully created
+     */
+    [[nodiscard]] bool PreserveForensicCopy(std::wstring_view encryptedFilePath,
+                                             std::wstring_view forensicDirectory);
+
     // ========================================================================
     // FAMILY IDENTIFICATION
     // ========================================================================

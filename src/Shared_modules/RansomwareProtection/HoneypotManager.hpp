@@ -141,6 +141,8 @@
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/HashUtils.hpp"
+#include "../Utils/StringUtils.hpp"
+#include "../Utils/SystemUtils.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -198,29 +200,49 @@ namespace HoneypotConstants {
     // FILE NAMES
     // ========================================================================
     
-    /// @brief Default honeypot names
-    inline constexpr const wchar_t* DEFAULT_NAMES[] = {
-        L"Passwords.txt",
-        L"Banking_Info.xlsx",
-        L"Tax_Return_2025.pdf",
-        L"Private_Keys.txt",
-        L"Bitcoin_Wallet.dat",
-        L"Family_Photos",
-        L"Confidential_Report.docx",
-        L"Medical_Records.pdf",
-        L"SSN_Documents.docx"
+    /// @brief Realistic document name stems (paired with extensions at runtime)
+    inline constexpr const wchar_t* DECOY_NAME_STEMS[] = {
+        L"Q4_Board_Presentation",
+        L"Meeting_Notes_2025-03-14",
+        L"Annual_Budget_FY2026",
+        L"Employee_Onboarding_Checklist",
+        L"Project_Milestone_Tracker",
+        L"Vendor_Contract_Draft",
+        L"Marketing_Campaign_Results",
+        L"Insurance_Claim_Ref4871",
+        L"Client_Proposal_v3",
+        L"Site_Inspection_Report",
+        L"Quarterly_Expense_Summary",
+        L"Performance_Review_Template",
+        L"Travel_Itinerary_April",
+        L"Product_Roadmap_2026",
+        L"Invoice_8834_Acme_Corp",
+        L"Lease_Agreement_Renewal",
+        L"Workshop_Slides_Final",
+        L"Safety_Compliance_Audit",
+        L"Research_Notes_Draft",
+        L"Holiday_Schedule_2026"
     };
+
+    /// @brief Count of name stems
+    inline constexpr size_t DECOY_NAME_STEM_COUNT =
+        sizeof(DECOY_NAME_STEMS) / sizeof(DECOY_NAME_STEMS[0]);
 
 }  // namespace HoneypotConstants
 
 // ============================================================================
-// TYPE ALIASES
+// TYPE ALIASES (guarded to avoid ODR conflict with RansomwareDetector.hpp)
 // ============================================================================
+
+#ifndef SHADOWSTRIKE_RANSOMWARE_TYPES_DEFINED
+#define SHADOWSTRIKE_RANSOMWARE_TYPES_DEFINED
 
 using Clock = std::chrono::steady_clock;
 using TimePoint = std::chrono::steady_clock::time_point;
 using SystemTimePoint = std::chrono::system_clock::time_point;
 using Hash256 = std::array<uint8_t, 32>;
+
+#endif // SHADOWSTRIKE_RANSOMWARE_TYPES_DEFINED
 
 // ============================================================================
 // ENUMERATIONS
@@ -295,8 +317,10 @@ enum class HoneypotStatus : uint8_t {
 };
 
 /**
- * @brief Module status
+ * @brief Module status (guarded – shared with RansomwareDetector)
  */
+#ifndef SHADOWSTRIKE_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -307,6 +331,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 6,
     Error           = 7
 };
+#endif // SHADOWSTRIKE_MODULE_STATUS_DEFINED
 
 // ============================================================================
 // STRUCTURES
@@ -529,6 +554,12 @@ struct HoneypotManagerConfiguration {
     /// @brief Verbose logging
     bool verboseLogging = false;
     
+    /// @brief Process names whitelisted from honeypot detection
+    std::vector<std::wstring> whitelistedProcessNames;
+    
+    /// @brief Whitelisted process paths (full image path)
+    std::vector<std::wstring> whitelistedProcessPaths;
+    
     /**
      * @brief Validate configuration
      */
@@ -546,7 +577,7 @@ struct HoneypotManagerConfiguration {
 };
 
 /**
- * @brief Honeypot statistics
+ * @brief Honeypot statistics (thread-safe, explicitly copyable)
  */
 struct HoneypotStatistics {
     /// @brief Total honeypots deployed
@@ -573,6 +604,37 @@ struct HoneypotStatistics {
     /// @brief Start time
     TimePoint startTime = Clock::now();
     
+    HoneypotStatistics() = default;
+
+    HoneypotStatistics(const HoneypotStatistics& o) noexcept
+        : totalDeployed(o.totalDeployed.load(std::memory_order_relaxed))
+        , currentlyActive(o.currentlyActive.load(std::memory_order_relaxed))
+        , accessEvents(o.accessEvents.load(std::memory_order_relaxed))
+        , processesKilled(o.processesKilled.load(std::memory_order_relaxed))
+        , regenerations(o.regenerations.load(std::memory_order_relaxed))
+        , falsePositives(o.falsePositives.load(std::memory_order_relaxed))
+        , startTime(o.startTime) {
+        for (size_t i = 0; i < eventsByType.size(); ++i)
+            eventsByType[i].store(o.eventsByType[i].load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+    }
+
+    HoneypotStatistics& operator=(const HoneypotStatistics& o) noexcept {
+        if (this != &o) {
+            totalDeployed.store(o.totalDeployed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            currentlyActive.store(o.currentlyActive.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            accessEvents.store(o.accessEvents.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            processesKilled.store(o.processesKilled.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            regenerations.store(o.regenerations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            falsePositives.store(o.falsePositives.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < eventsByType.size(); ++i)
+                eventsByType[i].store(o.eventsByType[i].load(std::memory_order_relaxed),
+                                      std::memory_order_relaxed);
+            startTime = o.startTime;
+        }
+        return *this;
+    }
+
     /**
      * @brief Reset statistics
      */
@@ -781,9 +843,34 @@ public:
     
     /**
      * @brief Called when honeypot is accessed
+     * @param path  Honeypot file path
+     * @param pid   Accessing process ID
+     * @param accessType  Type of access (read/write/delete/rename)
      */
     void OnHoneypotAccessed(std::wstring_view path, uint32_t pid,
                            HoneypotAccessType accessType);
+    
+    /**
+     * @brief Process a kernel minifilter notification for a honeypot path.
+     *
+     * Called by the IOCTL message handler when the minifilter detects
+     * IRP_MJ_READ, IRP_MJ_WRITE, or IRP_MJ_SET_INFORMATION on a
+     * registered honeypot path.  This is the primary detection hot-path.
+     *
+     * @param path        NT path from kernel notification
+     * @param pid         Originating process ID
+     * @param threadId    Originating thread ID
+     * @param accessType  Kernel-determined access type
+     * @return true if the operation should be BLOCKED by the minifilter
+     */
+    [[nodiscard]] bool ProcessKernelNotification(
+        std::wstring_view path, uint32_t pid, uint32_t threadId,
+        HoneypotAccessType accessType);
+    
+    /**
+     * @brief Check whether a process is whitelisted from honeypot detection
+     */
+    [[nodiscard]] bool IsProcessWhitelisted(uint32_t pid) const;
     
     /**
      * @brief Report false positive
