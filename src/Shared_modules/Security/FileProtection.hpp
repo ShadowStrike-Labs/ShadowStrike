@@ -553,8 +553,8 @@ struct ProtectedFile {
     /// @brief Last verified timestamp
     TimePoint lastVerified;
     
-    /// @brief Blocked operation count
-    std::atomic<uint64_t> blockedOperations_{0};
+    /// @brief Blocked operation count (protected by module-level shared_mutex)
+    uint64_t blockedCount = 0;
     
     /// @brief Backup path (if backed up)
     std::wstring backupPath;
@@ -594,8 +594,8 @@ struct ProtectedDirectory {
     /// @brief File count
     size_t fileCount = 0;
     
-    /// @brief Blocked operation count
-    std::atomic<uint64_t> blockedOperations_{0};
+    /// @brief Blocked operation count (protected by module-level shared_mutex)
+    uint64_t blockedCount = 0;
 };
 
 /**

@@ -46,7 +46,9 @@
  * ============================================================================
  */
 
+#include "pch.h"
 #include "FileProtection.hpp"
+#include "../Utils/PE_sig_verf.hpp"
 
 // Standard library includes
 #include <algorithm>
@@ -595,25 +597,35 @@ FileProtectionImpl::~FileProtectionImpl() {
 }
 
 void FileProtectionImpl::Shutdown(std::string_view authorizationToken) {
-    std::unique_lock lock(m_mutex);
+    // Require valid token for non-destructor callers
+    if (!authorizationToken.empty() && !VerifyAuthorizationToken(authorizationToken)) {
+        SS_LOG_WARN(L"FileProtection", L"Unauthorized shutdown attempt blocked");
+        return;
+    }
 
-    if (!m_initialized.load()) {
+    // Atomically mark as uninitialized; only one caller proceeds
+    bool wasInitialized = m_initialized.exchange(false);
+    if (!wasInitialized) {
         return;
     }
 
     m_status.store(ModuleStatus::Stopping);
     m_shutdownRequested.store(true);
 
-    // Stop monitoring threads
+    // Stop monitoring threads BEFORE taking the lock.
+    // Threads acquire shared_lock internally; joining under our unique_lock
+    // would deadlock.
     StopMonitoringThreads();
 
-    // Clear callbacks
-    m_eventCallbacks.clear();
-    m_integrityCallbacks.clear();
-    m_decisionCallback = nullptr;
-    m_ransomwareCallback = nullptr;
+    // Now safe to take exclusive lock for state cleanup
+    {
+        std::unique_lock lock(m_mutex);
+        m_eventCallbacks.clear();
+        m_integrityCallbacks.clear();
+        m_decisionCallback = nullptr;
+        m_ransomwareCallback = nullptr;
+    }
 
-    m_initialized.store(false);
     m_status.store(ModuleStatus::Stopped);
 
     SS_LOG_INFO(L"FileProtection", L"Shutdown complete");
@@ -633,16 +645,27 @@ void FileProtectionImpl::Shutdown(std::string_view authorizationToken) {
         return false;
     }
 
-    std::unique_lock lock(m_mutex);
+    bool needStartMonitoring = false;
+    bool needStopMonitoring = false;
 
-    bool wasRealTimeEnabled = m_config.enableRealTimeMonitoring;
-    m_config = config;
+    {
+        std::unique_lock lock(m_mutex);
+        bool wasRealTimeEnabled = m_config.enableRealTimeMonitoring;
+        m_config = config;
 
-    // Handle real-time monitoring changes
-    if (config.enableRealTimeMonitoring && !wasRealTimeEnabled) {
-        StartMonitoringThreads();
-    } else if (!config.enableRealTimeMonitoring && wasRealTimeEnabled) {
+        if (config.enableRealTimeMonitoring && !wasRealTimeEnabled) {
+            needStartMonitoring = true;
+        } else if (!config.enableRealTimeMonitoring && wasRealTimeEnabled) {
+            needStopMonitoring = true;
+        }
+    }
+
+    // Thread join/launch outside lock to avoid deadlock — monitoring threads
+    // acquire shared_lock internally.
+    if (needStopMonitoring) {
         StopMonitoringThreads();
+    } else if (needStartMonitoring) {
+        StartMonitoringThreads();
     }
 
     SS_LOG_INFO(L"FileProtection", L"Configuration updated");
@@ -662,6 +685,7 @@ void FileProtectionImpl::SetProtectionMode(FileProtectionMode mode) {
 }
 
 [[nodiscard]] FileProtectionMode FileProtectionImpl::GetProtectionMode() const noexcept {
+    std::shared_lock lock(m_mutex);
     return m_config.mode;
 }
 
@@ -726,7 +750,7 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
     m_protectedDirectories[normalizedPath] = protDir;
     m_stats.totalProtectedDirectories++;
 
-    SS_LOG_INFO(L"FileProtection", L"Protected directory: %ls (type: %hs, subdirs: %s)",
+    SS_LOG_INFO(L"FileProtection", L"Protected directory: %ls (type: %hs, subdirs: %hs)",
                 normalizedPath.c_str(),
                 std::string(GetProtectionTypeName(type)).c_str(),
                 includeSubdirs ? "yes" : "no");
@@ -848,7 +872,7 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
         }
     }
 
-    SS_LOG_INFO(L"FileProtection", L"Installation directory protection %s",
+    SS_LOG_INFO(L"FileProtection", L"Installation directory protection %ls",
                 success ? L"enabled" : L"partially enabled");
 
     return success;
@@ -1052,10 +1076,6 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
 
 [[nodiscard]] bool FileProtectionImpl::IsOperationAllowed(const std::wstring& path,
                                                            uint32_t desiredAccess) {
-    if (m_config.mode == FileProtectionMode::Disabled) {
-        return true;
-    }
-
     FileOperationRequest request;
     request.filePath = path;
     request.desiredAccess = desiredAccess;
@@ -1076,65 +1096,85 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
     result.decision = OperationDecision::Allow;
     m_stats.totalOperations++;
 
-    // Check if protection is disabled
-    if (m_config.mode == FileProtectionMode::Disabled) {
-        return result;
-    }
-
     std::wstring normalizedPath = NormalizePath(request.filePath);
 
-    // Check if caller is whitelisted
-    if (IsWhitelisted(request.processId) || request.hasShadowStrikeSignature) {
-        result.decision = OperationDecision::Allow;
-        result.reason = "Whitelisted process";
-        return result;
-    }
-
-    // Check custom decision callback first
-    if (m_decisionCallback) {
-        auto customResult = m_decisionCallback(request);
-        if (customResult.has_value()) {
-            return *customResult;
-        }
-    }
-
-    // Check if file is protected
-    std::shared_lock lock(m_mutex);
-
+    // Snapshot all shared state under a single lock acquisition to avoid
+    // multiple lock cycles and data-race on m_config / m_decisionCallback.
+    FileProtectionMode currentMode;
+    OperationDecisionCallback callbackCopy;
+    bool isWhitelisted = false;
     bool isProtected = false;
     FileOperation blockedOps = FileOperation::None;
 
-    // Check direct file protection
-    auto fileIt = m_protectedFiles.find(normalizedPath);
-    if (fileIt != m_protectedFiles.end()) {
-        isProtected = true;
-        blockedOps = fileIt->second.blockedOperations;
-    }
+    {
+        std::shared_lock lock(m_mutex);
 
-    // Check directory protection
-    if (!isProtected) {
-        for (const auto& [dirPath, dir] : m_protectedDirectories) {
-            if (IsPathUnderDirectory(normalizedPath, dirPath)) {
-                isProtected = true;
-                blockedOps = dir.blockedOperations;
-                break;
+        currentMode = m_config.mode;
+        if (currentMode == FileProtectionMode::Disabled) {
+            return result;
+        }
+
+        // Whitelist check — inline to avoid recursive lock
+        if (request.hasShadowStrikeSignature) {
+            isWhitelisted = true;
+        } else if (m_whitelistedPids.count(request.processId) > 0) {
+            isWhitelisted = true;
+        } else if (!request.processName.empty() &&
+                   m_whitelistedProcesses.count(request.processName) > 0) {
+            isWhitelisted = true;
+        }
+
+        if (isWhitelisted) {
+            result.reason = "Whitelisted process";
+            return result;
+        }
+
+        // Snapshot callback
+        callbackCopy = m_decisionCallback;
+
+        // Check direct file protection
+        auto fileIt = m_protectedFiles.find(normalizedPath);
+        if (fileIt != m_protectedFiles.end()) {
+            isProtected = true;
+            blockedOps = fileIt->second.blockedOperations;
+        }
+
+        // Check directory protection
+        if (!isProtected) {
+            for (const auto& [dirPath, dir] : m_protectedDirectories) {
+                if (IsPathUnderDirectory(normalizedPath, dirPath)) {
+                    isProtected = true;
+                    blockedOps = dir.blockedOperations;
+                    break;
+                }
             }
         }
-    }
 
-    // Check pattern protection
-    if (!isProtected) {
-        for (const auto& [pattern, type] : m_protectedPatterns) {
-            if (MatchesPattern(normalizedPath, pattern)) {
-                isProtected = true;
-                // Use default blocking for patterns
-                blockedOps = FileOperation::AllWrite;
-                break;
+        // Check pattern protection
+        if (!isProtected) {
+            for (const auto& [pattern, type] : m_protectedPatterns) {
+                if (MatchesPattern(normalizedPath, pattern)) {
+                    isProtected = true;
+                    blockedOps = FileOperation::AllWrite;
+                    break;
+                }
             }
         }
-    }
+    } // shared_lock released
 
-    lock.unlock();
+    // Custom decision callback invoked outside lock to avoid holding lock
+    // during potentially long user callback.
+    if (callbackCopy) {
+        try {
+            auto customResult = callbackCopy(request);
+            if (customResult.has_value()) {
+                return *customResult;
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"FileProtection",
+                         L"Decision callback threw exception: %hs", e.what());
+        }
+    }
 
     if (!isProtected) {
         return result;
@@ -1142,7 +1182,7 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
 
     // Check if operation is blocked
     if (IsOperationBlocked(request.operation, blockedOps)) {
-        if (m_config.mode == FileProtectionMode::Monitor) {
+        if (currentMode == FileProtectionMode::Monitor) {
             result.decision = OperationDecision::AllowLogged;
             result.shouldLog = true;
             result.reason = "Operation logged (monitor mode)";
@@ -1268,8 +1308,21 @@ void FileProtectionImpl::ClearDecisionCallback() {
 
 [[nodiscard]] std::wstring FileProtectionImpl::GetFileSigner(std::wstring_view path) {
 #ifdef _WIN32
-    // This would use CryptQueryObject and related APIs
-    // Simplified implementation
+    Utils::pe_sig_utils::PEFileSignatureVerifier verifier;
+    Utils::pe_sig_utils::SignatureInfo sigInfo;
+    Utils::pe_sig_utils::Error sigErr;
+
+    if (verifier.VerifyPESignature(path, sigInfo, &sigErr) && sigInfo.isSigned) {
+        return sigInfo.signerName;
+    }
+
+    // If embedded signature verification failed, try catalog-based lookup
+    if (verifier.VerifyEmbeddedSignature(path, sigInfo, &sigErr) && sigInfo.isSigned) {
+        return sigInfo.signerName;
+    }
+
+    SS_LOG_DEBUG(L"FileProtection", L"No signer found for: %ls (error: %ls)",
+                 std::wstring(path).c_str(), sigErr.message.c_str());
     return L"";
 #else
     return L"";
@@ -1277,10 +1330,25 @@ void FileProtectionImpl::ClearDecisionCallback() {
 }
 
 [[nodiscard]] bool FileProtectionImpl::VerifyFileCatalog(std::wstring_view path) {
-    // Verify file against Windows catalog
-    // Implementation would use CryptCATAdminCalcHashFromFileHandle, etc.
-    return VerifyFileSignature(path) != SignatureStatus::Invalid &&
-           VerifyFileSignature(path) != SignatureStatus::Unsigned;
+#ifdef _WIN32
+    Utils::pe_sig_utils::PEFileSignatureVerifier verifier;
+    Utils::pe_sig_utils::SignatureInfo sigInfo;
+    Utils::pe_sig_utils::Error sigErr;
+
+    // First try direct embedded signature
+    if (verifier.VerifyPESignature(path, sigInfo, &sigErr)) {
+        return sigInfo.isSigned && sigInfo.isVerified && sigInfo.isChainTrusted;
+    }
+
+    // Fall back to embedded-only check (catalog-backed files)
+    if (verifier.VerifyEmbeddedSignature(path, sigInfo, &sigErr)) {
+        return sigInfo.isSigned && sigInfo.isVerified;
+    }
+
+    return false;
+#else
+    return false;
+#endif
 }
 
 [[nodiscard]] IntegrityStatus FileProtectionImpl::VerifyFileIntegrity(std::wstring_view path) {
@@ -1294,37 +1362,52 @@ void FileProtectionImpl::ClearDecisionCallback() {
         return IntegrityStatus::Missing;
     }
 
-    std::shared_lock lock(m_mutex);
+    // Copy expected hash under lock; iterator is invalid after unlock
+    Hash256 expectedHash{};
+    bool found = false;
+    {
+        std::shared_lock lock(m_mutex);
+        auto it = m_protectedFiles.find(normalizedPath);
+        if (it != m_protectedFiles.end()) {
+            expectedHash = it->second.expectedHash;
+            found = true;
+        }
+    }
 
-    auto it = m_protectedFiles.find(normalizedPath);
-    if (it == m_protectedFiles.end()) {
+    if (!found) {
         return IntegrityStatus::Unknown;
     }
 
-    lock.unlock();
-
-    // Compute current hash
+    // Compute current hash (I/O-heavy — done outside lock)
     Hash256 currentHash = ComputeFileHash(normalizedPath);
 
-    // Compare with expected hash
-    if (currentHash == it->second.expectedHash) {
+    if (currentHash == expectedHash) {
         return IntegrityStatus::Valid;
     }
 
     m_stats.integrityViolations++;
 
-    // Create event
+    // Create and record event
     FileProtectionEvent event;
     event.eventId = m_nextEventId++;
     event.type = ProtectionEventType::IntegrityViolation;
     event.timestamp = Clock::now();
     event.filePath = normalizedPath;
-    event.previousHash = it->second.expectedHash;
+    event.previousHash = expectedHash;
     event.newHash = currentHash;
     event.description = "File integrity violation detected";
 
     RecordEvent(event);
     NotifyEvent(event);
+
+    // Notify integrity callbacks with current file state
+    {
+        std::shared_lock lock(m_mutex);
+        auto it = m_protectedFiles.find(normalizedPath);
+        if (it != m_protectedFiles.end()) {
+            NotifyIntegrityViolation(it->second);
+        }
+    }
 
     return IntegrityStatus::Modified;
 }
@@ -1418,10 +1501,11 @@ void FileProtectionImpl::ForceIntegrityCheck() {
     // Generate backup filename
     auto now = std::chrono::system_clock::now();
     auto nowTime = std::chrono::system_clock::to_time_t(now);
-    std::tm* tmPtr = std::localtime(&nowTime);
+    std::tm tmBuf{};
+    localtime_s(&tmBuf, &nowTime);
 
     std::wostringstream woss;
-    woss << std::put_time(tmPtr, L"%Y%m%d_%H%M%S");
+    woss << std::put_time(&tmBuf, L"%Y%m%d_%H%M%S");
 
     std::filesystem::path originalPath(normalizedPath);
     std::wstring backupName = originalPath.stem().wstring() + L"_" +
@@ -1563,15 +1647,20 @@ void FileProtectionImpl::CleanupOldBackups() {
             // Remove oldest backup
             try {
                 std::filesystem::remove(backups.front().backupPath);
-            } catch (...) {}
+            } catch (const std::exception& e) {
+                SS_LOG_WARN(L"FileProtection",
+                            L"Failed to remove old backup '%ls': %hs",
+                            backups.front().backupPath.c_str(), e.what());
+            }
             backups.erase(backups.begin());
         }
     }
 
-    SS_LOG_INFO(L"FileProtection", L"Cleaned up old backups");
+    SS_LOG_DEBUG(L"FileProtection", L"Cleaned up old backups");
 }
 
 [[nodiscard]] std::wstring FileProtectionImpl::GetBackupStoragePath() const {
+    std::shared_lock lock(m_mutex);
     return m_backupStoragePath;
 }
 
@@ -1582,7 +1671,10 @@ void FileProtectionImpl::CleanupOldBackups() {
 
     try {
         std::filesystem::create_directories(path);
+
+        std::unique_lock lock(m_mutex);
         m_backupStoragePath = path;
+
         SS_LOG_INFO(L"FileProtection", L"Backup storage path set to: %ls",
                     m_backupStoragePath.c_str());
         return true;
@@ -1668,8 +1760,18 @@ void FileProtectionImpl::SetRansomwareCallback(RansomwareCallback callback) {
         return true;
     }
 
-    // Get process name and check against whitelist
-    // This would use Utils::ProcessUtils in production
+    // Resolve process name and check against name whitelist
+    auto nameOpt = Utils::ProcessUtils::GetProcessName(
+        static_cast<Utils::ProcessUtils::ProcessId>(processId));
+    if (nameOpt.has_value()) {
+        std::wstring nameLower = *nameOpt;
+        std::transform(nameLower.begin(), nameLower.end(),
+                       nameLower.begin(), ::towlower);
+        if (m_whitelistedProcesses.count(nameLower) > 0) {
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -1748,10 +1850,10 @@ void FileProtectionImpl::ClearEventHistory(std::string_view authorizationToken) 
         << FileProtectionConstants::VERSION_MINOR << "."
         << FileProtectionConstants::VERSION_PATCH << "\",\n";
     oss << "  \"status\": \"" << static_cast<int>(m_status.load()) << "\",\n";
-    oss << "  \"mode\": \"" << GetProtectionModeName(m_config.mode) << "\",\n";
-    oss << "  \"statistics\": " << m_stats.ToJson() << ",\n";
 
     std::shared_lock lock(m_mutex);
+    oss << "  \"mode\": \"" << GetProtectionModeName(m_config.mode) << "\",\n";
+    oss << "  \"statistics\": " << m_stats.ToJson() << ",\n";
     oss << "  \"protectedFilesCount\": " << m_protectedFiles.size() << ",\n";
     oss << "  \"protectedDirectoriesCount\": " << m_protectedDirectories.size() << ",\n";
     oss << "  \"whitelistedProcessesCount\": " << m_whitelistedProcesses.size() << ",\n";
@@ -1835,20 +1937,34 @@ void FileProtectionImpl::ClearEventHistory(std::string_view authorizationToken) 
         return L"";
     }
 
+    // Validate path length
+    if (path.size() > FileProtectionConstants::MAX_PATH_LENGTH) {
+        SS_LOG_WARN(L"FileProtection", L"Path exceeds maximum length (%zu)", path.size());
+        return L"";
+    }
+
     std::wstring result(path);
 
-    // Convert to lowercase
+    // Strip NTFS Alternate Data Streams to prevent protection bypass via
+    // paths like "file.exe:evil_stream". Skip the drive-letter colon.
+    size_t adsSearchStart = (result.size() >= 2 && result[1] == L':') ? 2 : 0;
+    auto adsPos = result.find(L':', adsSearchStart);
+    if (adsPos != std::wstring::npos) {
+        result.erase(adsPos);
+    }
+
+    // Convert to lowercase for case-insensitive matching
     std::transform(result.begin(), result.end(), result.begin(), ::towlower);
 
     // Replace forward slashes with backslashes
     std::replace(result.begin(), result.end(), L'/', L'\\');
 
-    // Remove trailing backslash
-    while (!result.empty() && result.back() == L'\\') {
+    // Remove trailing backslash but preserve drive root (e.g. "C:\")
+    while (result.size() > 3 && result.back() == L'\\') {
         result.pop_back();
     }
 
-    // Try to get absolute path
+    // Resolve relative segments (.., .) via filesystem
     try {
         std::filesystem::path fsPath(result);
         if (fsPath.is_relative()) {
@@ -1856,8 +1972,13 @@ void FileProtectionImpl::ClearEventHistory(std::string_view authorizationToken) 
         }
         result = fsPath.lexically_normal().wstring();
         std::transform(result.begin(), result.end(), result.begin(), ::towlower);
+
+        // lexically_normal may re-add trailing separator
+        while (result.size() > 3 && result.back() == L'\\') {
+            result.pop_back();
+        }
     } catch (...) {
-        // Keep original on error
+        // Keep current result on error
     }
 
     return result;
@@ -1920,9 +2041,7 @@ void FileProtectionImpl::ClearEventHistory(std::string_view authorizationToken) 
 
 [[nodiscard]] std::string FileProtectionImpl::GenerateFileId(std::wstring_view path) const {
     std::string narrowPath = Utils::StringUtils::ToNarrow(std::wstring(path));
-    std::array<uint8_t, 32> hash;
 
-    // Simple hash generation
     std::hash<std::string> hasher;
     size_t h = hasher(narrowPath);
 
@@ -1942,8 +2061,10 @@ void FileProtectionImpl::ClearEventHistory(std::string_view authorizationToken) 
     if (desiredAccess & GENERIC_EXECUTE) result |= static_cast<uint32_t>(FileOperation::Execute);
     if (desiredAccess & FILE_WRITE_ATTRIBUTES)
         result |= static_cast<uint32_t>(FileOperation::SetAttributes);
-    if (desiredAccess & WRITE_DAC || desiredAccess & WRITE_OWNER)
+    if (desiredAccess & WRITE_DAC)
         result |= static_cast<uint32_t>(FileOperation::SetSecurity);
+    if (desiredAccess & WRITE_OWNER)
+        result |= static_cast<uint32_t>(FileOperation::SetOwner);
 
     return static_cast<FileOperation>(result);
 }
@@ -1982,9 +2103,15 @@ void FileProtectionImpl::NotifyIntegrityViolation(const ProtectedFile& file) {
 }
 
 void FileProtectionImpl::NotifyRansomware(const RansomwareDetection& detection) {
-    if (m_ransomwareCallback) {
+    RansomwareCallback callbackCopy;
+    {
+        std::shared_lock lock(m_mutex);
+        callbackCopy = m_ransomwareCallback;
+    }
+
+    if (callbackCopy) {
         try {
-            m_ransomwareCallback(detection);
+            callbackCopy(detection);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"FileProtection", L"Ransomware callback exception: %hs", e.what());
         }
@@ -1995,24 +2122,20 @@ void FileProtectionImpl::IntegrityMonitorThread() {
     SS_LOG_INFO(L"FileProtection", L"Integrity monitor thread started");
 
     while (m_monitoringActive.load() && !m_shutdownRequested.load()) {
-        // Wait for interval
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(m_config.integrityCheckIntervalMs));
-
-        if (!m_monitoringActive.load()) break;
-
-        // Perform integrity check
-        auto results = VerifyAllIntegrity();
-
-        for (const auto& [path, status] : results) {
-            if (status == IntegrityStatus::Modified || status == IntegrityStatus::Missing) {
-                std::shared_lock lock(m_mutex);
-                auto it = m_protectedFiles.find(path);
-                if (it != m_protectedFiles.end()) {
-                    NotifyIntegrityViolation(it->second);
-                }
-            }
+        // Read interval under lock to avoid data race on m_config
+        uint32_t intervalMs;
+        {
+            std::shared_lock lock(m_mutex);
+            intervalMs = m_config.integrityCheckIntervalMs;
         }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+
+        if (!m_monitoringActive.load() || m_shutdownRequested.load()) break;
+
+        // VerifyAllIntegrity -> VerifyFileIntegrity already records events
+        // and calls NotifyIntegrityViolation, so no extra notification needed.
+        VerifyAllIntegrity();
     }
 
     SS_LOG_INFO(L"FileProtection", L"Integrity monitor thread stopped");
@@ -2026,56 +2149,68 @@ void FileProtectionImpl::RansomwareMonitorThread() {
 
         if (!m_monitoringActive.load() || !m_ransomwareProtectionEnabled.load()) continue;
 
-        // Check modification tracking for ransomware behavior
-        std::unique_lock lock(m_mutex);
-        auto now = Clock::now();
+        // Collect detections under lock, then notify outside lock
+        std::vector<RansomwareDetection> pendingDetections;
 
-        for (auto it = m_modificationTracking.begin(); it != m_modificationTracking.end();) {
-            uint32_t pid = it->first;
-            auto& modifications = it->second;
+        {
+            std::unique_lock lock(m_mutex);
+            auto now = Clock::now();
 
-            // Remove old entries
-            modifications.erase(
-                std::remove_if(modifications.begin(), modifications.end(),
-                              [now](const auto& entry) {
-                                  return std::chrono::duration_cast<std::chrono::milliseconds>(
-                                             now - entry.first).count() >
-                                         FileProtectionConstants::RANSOMWARE_DETECTION_WINDOW_MS;
-                              }),
-                modifications.end());
+            for (auto it = m_modificationTracking.begin();
+                 it != m_modificationTracking.end();) {
 
-            // Check threshold
-            if (modifications.size() >= FileProtectionConstants::RANSOMWARE_MODIFICATION_THRESHOLD) {
-                RansomwareDetection detection;
-                detection.timestamp = now;
-                detection.processId = pid;
-                detection.modificationCount = static_cast<uint32_t>(modifications.size());
-                detection.confidence = std::min(100u,
-                    static_cast<uint32_t>(modifications.size()) * 10);
+                uint32_t pid = it->first;
+                auto& modifications = it->second;
 
-                for (const auto& mod : modifications) {
-                    detection.affectedFiles.push_back(mod.second);
+                // Remove old entries outside detection window
+                modifications.erase(
+                    std::remove_if(modifications.begin(), modifications.end(),
+                                  [now](const auto& entry) {
+                                      return std::chrono::duration_cast<Milliseconds>(
+                                                 now - entry.first).count() >
+                                             static_cast<int64_t>(
+                                                 FileProtectionConstants::RANSOMWARE_DETECTION_WINDOW_MS);
+                                  }),
+                    modifications.end());
+
+                // Check threshold
+                if (modifications.size() >=
+                    FileProtectionConstants::RANSOMWARE_MODIFICATION_THRESHOLD) {
+
+                    RansomwareDetection detection;
+                    detection.timestamp = now;
+                    detection.processId = pid;
+                    detection.modificationCount =
+                        static_cast<uint32_t>(modifications.size());
+                    detection.confidence = std::min(
+                        100u, static_cast<uint32_t>(modifications.size()) * 10);
+
+                    for (const auto& mod : modifications) {
+                        detection.affectedFiles.push_back(mod.second);
+                    }
+
+                    m_ransomwareDetections.push_back(detection);
+                    m_stats.ransomwareDetections++;
+                    pendingDetections.push_back(std::move(detection));
+
+                    modifications.clear();
+
+                    SS_LOG_WARN(L"FileProtection",
+                                L"Ransomware behavior detected from PID %u (%u mods)",
+                                pid, pendingDetections.back().modificationCount);
                 }
 
-                m_ransomwareDetections.push_back(detection);
-                m_stats.ransomwareDetections++;
-
-                lock.unlock();
-                NotifyRansomware(detection);
-                lock.lock();
-
-                modifications.clear();
-
-                SS_LOG_WARN(L"FileProtection",
-                            L"Ransomware behavior detected from PID %u (%u modifications)",
-                            pid, detection.modificationCount);
+                if (modifications.empty()) {
+                    it = m_modificationTracking.erase(it);
+                } else {
+                    ++it;
+                }
             }
+        } // lock released
 
-            if (modifications.empty()) {
-                it = m_modificationTracking.erase(it);
-            } else {
-                ++it;
-            }
+        // Notify callbacks outside lock to avoid deadlock
+        for (const auto& det : pendingDetections) {
+            NotifyRansomware(det);
         }
     }
 
