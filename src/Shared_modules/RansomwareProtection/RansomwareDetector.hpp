@@ -215,6 +215,21 @@ namespace RansomwareConstants {
     /// @brief Cooldown after block (seconds)
     inline constexpr uint32_t BLOCK_COOLDOWN_SECS = 30;
 
+    /// @brief Detection score expiry — indicators older than this decay to zero
+    inline constexpr uint32_t SCORE_EXPIRY_SECS = 60;
+
+    /// @brief Maximum recent detection events retained
+    inline constexpr size_t MAX_RECENT_DETECTIONS = 1000;
+
+    /// @brief Maximum registered family signatures
+    inline constexpr size_t MAX_FAMILY_SIGNATURES = 64;
+
+    /// @brief Composite score threshold to fire an alert
+    inline constexpr double ALERT_SCORE_THRESHOLD = 50.0;
+
+    /// @brief Composite score threshold to block + kill
+    inline constexpr double BLOCK_SCORE_THRESHOLD = 75.0;
+
     // ========================================================================
     // LIMITS
     // ========================================================================
@@ -474,9 +489,16 @@ struct IOStats {
     /// @brief Has been blocked
     bool isBlocked = false;
     
-    /// @brief Mutex for thread-safe access
+    /// @brief Mutex for thread-safe access to non-atomic fields
     mutable std::mutex mutex;
-    
+
+    // Explicit constructors — atomics and mutex require manual copy
+    IOStats() noexcept;
+    explicit IOStats(const IOStats& other);
+    IOStats& operator=(const IOStats&) = delete;
+    IOStats(IOStats&&) = delete;
+    IOStats& operator=(IOStats&&) = delete;
+
     /**
      * @brief Reset statistics
      */
@@ -706,6 +728,26 @@ using PreWriteCallback = std::function<DetectionAction(
     uint32_t pid, const std::wstring& path, std::span<const uint8_t> data)>;
 
 // ============================================================================
+// EMERGENCY RESPONSE CALLBACKS (wired by application startup code)
+// ============================================================================
+
+/// @brief Emergency backup all tracked files for a process
+using EmergencyBackupCallback = std::function<bool(uint32_t pid)>;
+
+/// @brief Create emergency volume snapshot on all drives
+using EmergencySnapshotCallback = std::function<bool()>;
+
+/// @brief Enter kernel-enforced lockdown (block all non-agent writes)
+using LockdownCallback = std::function<void()>;
+
+/// @brief Trigger decryptor recovery workflow for a ransomware family
+using RecoveryCallback = std::function<void(uint32_t pid, RansomwareFamily family)>;
+
+/// @brief Sub-detector indicator — feeds into the orchestrator score
+using SubDetectorIndicatorCallback = std::function<void(
+    uint32_t pid, double score, std::wstring_view detail)>;
+
+// ============================================================================
 // RANSOMWARE DETECTOR CLASS
 // ============================================================================
 
@@ -866,6 +908,40 @@ public:
     [[nodiscard]] bool IsHoneypot(std::wstring_view filePath) const;
     
     // ========================================================================
+    // KERNEL EVENT HANDLERS
+    // ========================================================================
+    
+    /**
+     * @brief Process creation event from kernel driver
+     * Routes to BackupProtector, ShadowCopyProtector, LockyDetector, WannaCryDetector
+     */
+    void OnProcessCreated(uint32_t pid, std::wstring_view imagePath,
+                          std::wstring_view commandLine);
+
+    /**
+     * @brief Network event from kernel driver
+     * Routes to WannaCryDetector (SMB/EternalBlue), LockyDetector (DGA/C2)
+     */
+    void OnNetworkEvent(uint32_t pid, std::string_view srcIP,
+                        std::string_view dstIP, uint16_t dstPort,
+                        std::span<const uint8_t> payload);
+
+    /**
+     * @brief Registry event from kernel driver
+     * Routes to LockyDetector (persistence), WannaCryDetector (service install)
+     */
+    void OnRegistryEvent(uint32_t pid, std::wstring_view keyPath,
+                         std::wstring_view valueName, uint32_t operation);
+
+    /**
+     * @brief Sub-detector indicator callback — fed from LockyDetector/WannaCryDetector
+     * Accumulates into composite score; triggers response pipeline at threshold.
+     */
+    void OnSubDetectorIndicator(uint32_t pid, double score,
+                                RansomwareFamily family,
+                                std::wstring_view detail);
+
+    // ========================================================================
     // PROCESS MANAGEMENT
     // ========================================================================
     
@@ -968,6 +1044,61 @@ public:
      */
     void SetPreWriteCallback(PreWriteCallback callback);
     
+    /**
+     * @brief Set emergency backup callback (wired by startup to FileBackupManager)
+     */
+    void SetEmergencyBackupCallback(EmergencyBackupCallback callback);
+
+    /**
+     * @brief Set emergency snapshot callback (wired by startup to VolumeSnapshotService)
+     */
+    void SetEmergencySnapshotCallback(EmergencySnapshotCallback callback);
+
+    /**
+     * @brief Set lockdown callback (wired by startup to ShadowCopyProtector)
+     */
+    void SetLockdownCallback(LockdownCallback callback);
+
+    /**
+     * @brief Set recovery callback (wired by startup to RansomwareDecryptor)
+     */
+    void SetRecoveryCallback(RecoveryCallback callback);
+
+    // ========================================================================
+    // CONTAINMENT MODE
+    // ========================================================================
+
+    /**
+     * @brief Enter ransomware containment — emergency lockdown
+     * Blocks all non-agent file writes via kernel driver IOCTL
+     */
+    void EnterContainmentMode();
+
+    /**
+     * @brief Exit containment mode
+     */
+    void ExitContainmentMode();
+
+    /**
+     * @brief Check if containment mode is active
+     */
+    [[nodiscard]] bool IsInContainmentMode() const noexcept;
+
+    /**
+     * @brief Mark process as recovery (decryptor I/O) — exempted from detection
+     */
+    void RegisterRecoveryProcess(uint32_t pid);
+
+    /**
+     * @brief Remove recovery process exemption
+     */
+    void UnregisterRecoveryProcess(uint32_t pid);
+
+    /**
+     * @brief Check if a process is a recovery process
+     */
+    [[nodiscard]] bool IsRecoveryProcess(uint32_t pid) const;
+
     // ========================================================================
     // STATISTICS
     // ========================================================================
